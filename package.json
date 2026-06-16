@@ -9,10 +9,11 @@
     "dev:all": "concurrently \"npm run server:dev\" \"npm run dev\"",
     "build": "vite build",
     "build:all": "npm run build && npm run server:build",
-    "server:dev": "node server/node_modules/tsx/dist/cli.mjs watch server/src/index.ts",
+    "server:dev": "node node_modules/tsx/dist/cli.mjs watch server/src/index.ts",
     "server:build": "npm run build --prefix server",
     "server:start": "node server/dist/index.js",
-    "electron:build": "esbuild electron/main.ts electron/preload.ts --bundle --platform=node --format=cjs --external:electron --outdir=dist-electron --entry-names=[name] --out-extension:.js=.cjs",
+    "electron:build": "esbuild electron/main.ts electron/preload.ts --bundle --platform=node --format=cjs --external:electron --external:../server/dist/index.js --outdir=dist-electron --entry-names=[name] --out-extension:.js=.cjs --banner:js=\"var __dirname = require('path').dirname(__filename);\"",
+    "electron:dev": "cross-env NODE_ENV=development electron .",
     "desktop:dist:win:x64": "node scripts/build-desktop-target.cjs --platform win32 --arch x64",
     "desktop:dist:mac:x64": "node scripts/build-desktop-target.cjs --platform darwin --arch x64",
     "desktop:dist:mac:arm64": "node scripts/build-desktop-target.cjs --platform darwin --arch arm64"
@@ -28,6 +29,7 @@
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
+    "@electron/rebuild": "^4.0.4",
     "@tailwindcss/vite": "^4.1.12",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.15.0",
@@ -35,6 +37,7 @@
     "@types/react-dom": "^19.1.8",
     "@vitejs/plugin-react": "^4.7.0",
     "concurrently": "^9.2.1",
+    "cross-env": "^10.1.0",
     "electron": "^31.7.7",
     "electron-builder": "^26.8.1",
     "esbuild": "^0.28.0",

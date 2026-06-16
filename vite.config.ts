@@ -28,6 +28,7 @@ function parseBackendPort(rawValue: string | undefined): number {
 const devProxyTarget = `http://127.0.0.1:${parseBackendPort(process.env.BACKEND_PORT)}`
 
 export default defineConfig({
+  base: './',
   plugins: [
     react(),
     tailwindcss(),

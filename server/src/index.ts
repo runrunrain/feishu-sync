@@ -51,6 +51,8 @@ export interface StartedServer {
 // ============================================================================
 
 export async function buildServer(options: CreateServerOptions = {}) {
+  console.info('[server] buildServer started');
+
   const {
     desktopMode = false,
     desktopToken: providedDesktopToken,
@@ -59,14 +61,23 @@ export async function buildServer(options: CreateServerOptions = {}) {
 
   // Generate or use provided desktop token
   const desktopToken = providedDesktopToken || crypto.randomBytes(32).toString('base64url');
+  console.info('[server] Desktop token generated');
 
   // Note: desktopToken is passed to auth middleware via c.env, not used here directly
   void desktopToken; // Suppress unused variable warning
 
   // Initialize dependencies
+  console.info('[server] Initializing ConfigManager');
   const configManager = new ConfigManager(configPath);
+  console.info('[server] ConfigManager initialized');
+
+  console.info('[server] Initializing LocalMapStore');
   const dbPath = path.join(os.homedir(), '.feishu-sync', 'feishu-sync.db');
+  console.info('[server] Database path:', dbPath);
   const localMapStore = new LocalMapStore(dbPath);
+  console.info('[server] LocalMapStore initialized');
+
+  console.info('[server] Initializing LarkCliClient');
   const defaultLarkCliConfig: LarkCliConfig = {
     requiredScopes: [
       'wiki:node:retrieve',
@@ -79,21 +90,30 @@ export async function buildServer(options: CreateServerOptions = {}) {
     timeout: 30000,
   };
   const larkCliClient = new LarkCliClient(defaultLarkCliConfig);
+  console.info('[server] LarkCliClient initialized');
 
   // Initialize database schema
+  console.info('[server] Initializing database schema');
   localMapStore.initialize();
+  console.info('[server] Database schema initialized');
 
   // Load config for validation (will throw if not exists)
+  console.info('[server] Loading config');
   await configManager.load();
+  console.info('[server] Config loaded');
 
   // Initialize ChangeDetector
+  console.info('[server] Initializing ChangeDetector');
   const changeDetector = new ChangeDetector(
     larkCliClient,
     localMapStore
   );
+  console.info('[server] ChangeDetector initialized');
 
   // Create Hono app
+  console.info('[server] Creating Hono app');
   const app = new Hono();
+  console.info('[server] Hono app created');
 
   // ============================================================================
   // Middleware Registration Order Matters
@@ -101,6 +121,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
 
   // CORS (desktop mode or dev mode)
   app.use('*', corsMiddleware());
+  console.info('[server] CORS middleware registered');
 
   // ============================================================================
   // Inject Dependencies via Middleware (must run before auth)
@@ -120,16 +141,19 @@ export async function buildServer(options: CreateServerOptions = {}) {
 
     await next();
   });
+  console.info('[server] Dependency injection middleware registered');
 
   // ============================================================================
   // Register Public Routes (no auth required)
   // ============================================================================
 
   app.route('/', healthRoutes); // Health check is always public (must be before auth middleware)
+  console.info('[server] Health routes registered');
 
   // Token authentication (desktop mode only, must run after dependency injection)
   if (desktopMode) {
     app.use('*', authMiddleware());
+    console.info('[server] Auth middleware registered');
   }
 
   // ============================================================================
@@ -140,6 +164,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
   app.route('/', detectRoutes);
   app.route('/', syncRoutes);
   app.route('/', feishuRoutes);
+  console.info('[server] Protected routes registered');
 
   // ============================================================================
   // Error Handling
@@ -157,6 +182,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
     return c.json({ error: 'Not found', path: c.req.path }, 404);
   });
 
+  console.info('[server] buildServer completed');
   return app;
 }
 
@@ -167,27 +193,37 @@ export async function startServer(options: CreateServerOptions & {
   const port = options.port || DEFAULT_PORT;
   const hostname = options.hostname || '127.0.0.1';
 
+  console.info(`[server] Building server with options:`, options);
   const app = await buildServer(options);
+  console.info(`[server] Server built, starting HTTP server on port ${port}`);
 
   const started = await new Promise<{ server: ServerType; port: number }>((resolve, reject) => {
     let settled = false;
-    const server = serve(
-      {
-        fetch: app.fetch,
-        port,
-        hostname,
-      },
-      (info) => {
-        if (!settled) {
-          settled = true;
-          // @hono/node-server v1.x callback info structure: { port: number }
-          resolve({ server, port: info.port || port });
+    try {
+      const server = serve(
+        {
+          fetch: app.fetch,
+          port,
+          hostname,
+        },
+        (info) => {
+          console.info(`[server] HTTP server callback invoked, info:`, info);
+          if (!settled) {
+            settled = true;
+            // @hono/node-server v1.x callback info structure: { port: number }
+            resolve({ server, port: info.port || port });
+          }
         }
-      }
-    );
-    server.once('error', (error) => {
-      if (!settled) reject(error);
-    });
+      );
+      server.once('error', (error) => {
+        console.error('[server] HTTP server error:', error);
+        if (!settled) reject(error);
+      });
+      console.info('[server] serve() called, waiting for callback');
+    } catch (error) {
+      console.error('[server] serve() threw error:', error);
+      reject(error);
+    }
   });
 
   const actualPort = started.port;

@@ -10,9 +10,11 @@
 import { app, BrowserWindow, dialog, ipcMain, session, shell, globalShortcut } from 'electron';
 import crypto from 'node:crypto';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { pathToFileURL } from 'node:url';
 import fs from 'node:fs';
+
+// Type declaration for CJS __dirname provided by Node.js runtime
+declare const __dirname: string;
 
 import { getDesktopPlatformCapabilities } from './platform-capabilities.js';
 import { QuitCoordinator } from './quit-coordinator.js';
@@ -31,8 +33,6 @@ const LOOPBACK_HOST = '127.0.0.1';
 const DESKTOP_TOKEN_HEADER = 'X-Desktop-Token';
 const HEALTH_TIMEOUT_MS = 15_000;
 const HEALTH_POLL_INTERVAL_MS = 250;
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ============================================================================
 // State Management
@@ -70,16 +70,43 @@ function sanitizeDesktopError(error: unknown): string {
 // ============================================================================
 
 function resolveServerEntryPath() {
-  // A 段产物：server/dist/index.js 是编译后的 CommonJS 模块
-  return path.resolve(__dirname, '../server/dist/index.js');
+  // 打包后，server 在 app.asar.unpacked/server/dist/index.js
+  // 开发环境，server 在 ../server/dist/index.js
+  if (process.env.NODE_ENV === 'development') {
+    const devPath = path.resolve(__dirname, '../server/dist/index.js');
+    console.info('[Electron] Development mode, server path:', devPath);
+    return devPath;
+  }
+  // 生产环境：app.asar.unpacked 与 app.asar 同级
+  const appPath = app.getAppPath(); // resources/app.asar
+  const asarUnpacked = path.join(path.dirname(appPath), 'app.asar.unpacked');
+  const prodPath = path.join(asarUnpacked, 'server', 'dist', 'index.js');
+  console.info('[Electron] Production mode, appPath:', appPath, ', server path:', prodPath);
+  return prodPath;
 }
 
 async function startEmbeddedServer(token: string) {
   const serverEntryPath = resolveServerEntryPath();
 
-  // 动态 import 编译后的 server 模块
+  console.info('[Electron] Loading server module from:', serverEntryPath);
+
+  // Verify file exists before import
+  if (!fs.existsSync(serverEntryPath)) {
+    throw new Error(`Server entry file not found: ${serverEntryPath}`);
+  }
+
+  // 动态 import server 模块（ESM）
   const serverModuleUrl = pathToFileURL(serverEntryPath).href;
-  const serverModule = await import(serverModuleUrl);
+  console.info('[Electron] Server module URL:', serverModuleUrl);
+
+  let serverModule: any;
+  try {
+    serverModule = await import(serverModuleUrl);
+    console.info('[Electron] Server module loaded successfully, exports:', Object.keys(serverModule));
+  } catch (error) {
+    console.error('[Electron] Failed to load server module:', error);
+    throw new Error(`Server module import failed: ${sanitizeDesktopError(error)}`);
+  }
 
   // A 段契约：buildServer(options: CreateServerOptions) 返回 Hono app
   // 但我们需要 startServer 来获取实际启动的 server with url/close
@@ -88,6 +115,7 @@ async function startEmbeddedServer(token: string) {
     throw new Error('Server module contract failed: startServer export is missing');
   }
 
+  console.info('[Electron] Starting server with options:', { desktopMode: true, hostname: LOOPBACK_HOST, port: 0 });
   const started = await serverModule.startServer({
     desktopMode: true,
     desktopToken: token,

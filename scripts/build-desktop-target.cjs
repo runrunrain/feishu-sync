@@ -67,6 +67,7 @@ console.log(`\n========== Building feishu-sync Desktop [${platform} ${arch}] ===
 
 const rootDir = path.resolve(__dirname, '..');
 const appDir = path.resolve(rootDir); // App directory (same as root)
+// Use fixed directory (no timestamp) to ensure consistent delivery path
 const outputDir = path.resolve(rootDir, `dist-desktop/${platform}-${arch}`);
 
 // Set environment variables for electron-builder.config.js
