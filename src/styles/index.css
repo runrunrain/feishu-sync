@@ -1,0 +1,15 @@
+@import './theme.css';
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html {
+    @apply scroll-smooth;
+  }
+
+  body {
+    @apply min-h-screen;
+  }
+}

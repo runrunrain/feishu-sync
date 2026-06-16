@@ -1,0 +1,105 @@
+:root {
+  /* Colors - 深色主题，参考蓝本但调整为适合工具应用的冷色调 */
+  --color-bg-base: #0f1419;
+  --color-bg-elevated: #1a1f26;
+  --color-bg-sunken: #090c10;
+  --color-bg-surface: #242a33;
+  --color-bg-hover: #2d343e;
+  --color-bg-active: #363e4a;
+  --color-border: #3a4149;
+  --color-border-subtle: #2a3037;
+  --color-border-focus: #4a9eff;
+  --color-text-primary: #e8eaed;
+  --color-text-secondary: #9aa0a8;
+  --color-text-tertiary: #6a7078;
+  --color-text-inverse: #0f1419;
+  --color-accent: #4a9eff;
+  --color-accent-hover: #5aaeff;
+  --color-accent-active: #3a8eef;
+  --color-accent-muted: rgba(74, 158, 255, 0.12);
+  --color-accent-subtle: rgba(74, 158, 255, 0.06);
+  --color-success: #3d9e8f;
+  --color-success-muted: rgba(61, 158, 143, 0.12);
+  --color-warning: #d4a030;
+  --color-warning-muted: rgba(212, 160, 48, 0.12);
+  --color-error: #d44848;
+  --color-error-muted: rgba(212, 72, 72, 0.12);
+
+  /* Typography */
+  --font-display: "Inter", system-ui, sans-serif;
+  --font-body: "Inter", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "Source Code Pro", monospace;
+
+  /* Font Sizes */
+  --text-2xl: 28px;
+  --text-xl: 20px;
+  --text-lg: 16px;
+  --text-md: 14px;
+  --text-sm: 12px;
+  --text-xs: 11px;
+
+  /* Spacing */
+  --space-2xs: 2px;
+  --space-xs: 4px;
+  --space-sm: 8px;
+  --space-md: 12px;
+  --space-lg: 16px;
+  --space-xl: 24px;
+  --space-2xl: 32px;
+
+  /* Radius */
+  --radius-xs: 2px;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 12px;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 3px rgba(0,0,0,0.4);
+  --shadow-md: 0 4px 16px rgba(0,0,0,0.5);
+  --shadow-lg: 0 8px 32px rgba(0,0,0,0.6);
+
+  /* Transitions */
+  --duration-fast: 160ms;
+  --duration-normal: 240ms;
+  --easing-default: cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* Reset */
+  --background: var(--color-bg-base);
+  --foreground: var(--color-text-primary);
+  color-scheme: dark;
+}
+
+@theme inline {
+  --color-bg-base: var(--color-bg-base);
+  --color-bg-elevated: var(--color-bg-elevated);
+  --color-bg-sunken: var(--color-bg-sunken);
+  --color-bg-surface: var(--color-bg-surface);
+  --color-bg-hover: var(--color-bg-hover);
+  --color-bg-active: var(--color-bg-active);
+
+  --color-border: var(--color-border);
+  --color-border-subtle: var(--color-border-subtle);
+  --color-border-focus: var(--color-border-focus);
+
+  --color-text-primary: var(--color-text-primary);
+  --color-text-secondary: var(--color-text-secondary);
+  --color-text-tertiary: var(--color-text-tertiary);
+
+  --color-accent: var(--color-accent);
+  --color-accent-hover: var(--color-accent-hover);
+  --color-accent-muted: var(--color-accent-muted);
+
+  --color-success: var(--color-success);
+  --color-warning: var(--color-warning);
+  --color-error: var(--color-error);
+
+  --font-display: var(--font-display);
+  --font-body: var(--font-body);
+}
+
+@layer base {
+  body {
+    @apply bg-bg-base text-text-primary font-body antialiased;
+  }
+}
