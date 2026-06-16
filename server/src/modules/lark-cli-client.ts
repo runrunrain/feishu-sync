@@ -45,8 +45,9 @@ export class LarkCliClient {
         return { ready: false, error: `认证身份不是 user，当前身份: ${statusResult.data.identity}` };
       }
 
-      // 3. Check required scopes
-      const currentScopes = statusResult.data.scopes || [];
+      // 3. Check required scopes (scopes are space-separated string in identities.user.scope)
+      const scopesString = statusResult.data.identities?.user?.scope || '';
+      const currentScopes = scopesString.split(' ').filter((s: string) => s.length > 0);
       const missingScopes = this.config.requiredScopes.filter((s) => !currentScopes.includes(s));
       if (missingScopes.length > 0) {
         return { ready: false, error: `缺少权限：${missingScopes.join(', ')}，请执行 lark-cli auth login --scope` };
@@ -60,6 +61,8 @@ export class LarkCliClient {
 
   /**
    * List wiki subtree nodes (supporting pagination and recursion)
+   * Uses --page-all with ndjson format to handle large knowledge bases
+   * Returns flat array of all nodes under the parent
    */
   async listWikiNodes(options: {
     spaceId?: string;
@@ -68,13 +71,16 @@ export class LarkCliClient {
   }): Promise<LarkCliNodeInfo[]> {
     await this.throttle('wiki');
 
-    const args = ['wiki', '+node-list', '--format', 'json', '--page-all'];
+    const args = ['wiki', '+node-list', '--format', 'ndjson', '--page-all'];
     if (options.spaceId) args.push('--space-id', options.spaceId);
     if (options.parentNodeToken) args.push('--parent-node-token', options.parentNodeToken);
     if (options.pageSize) args.push('--page-size', String(options.pageSize));
 
     const result = await this.execLarkCli(args);
-    return result.data?.items || [];
+
+    // ndjson format: returns { data: { has_more, nodes: [...] } } wrapped in ok: true
+    // The nodes array is already in result.data.nodes
+    return result.data?.nodes || [];
   }
 
   /**

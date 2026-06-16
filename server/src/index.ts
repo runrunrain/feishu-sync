@@ -18,6 +18,7 @@ import os from 'node:os';
 import { ConfigManager } from './modules/config-manager.js';
 import { LarkCliClient } from './modules/lark-cli-client.js';
 import { LocalMapStore } from './modules/local-map-store.js';
+import { ChangeDetector } from './modules/change-detector.js';
 import { authMiddleware } from './middleware/auth.js';
 import { corsMiddleware } from './middleware/cors.js';
 import { healthRoutes } from './routes/health.js';
@@ -32,7 +33,6 @@ import type { LarkCliConfig } from './types/index.js';
 // ============================================================================
 
 const DEFAULT_PORT = 3001;
-const DEFAULT_DESKTOP_ORIGIN = 'app://feishu-sync.local';
 
 export interface CreateServerOptions {
   desktopMode?: boolean;
@@ -50,7 +50,7 @@ export interface StartedServer {
 // Server Factory
 // ============================================================================
 
-export function buildServer(options: CreateServerOptions = {}) {
+export async function buildServer(options: CreateServerOptions = {}) {
   const {
     desktopMode = false,
     desktopToken: providedDesktopToken,
@@ -71,7 +71,7 @@ export function buildServer(options: CreateServerOptions = {}) {
     requiredScopes: [
       'wiki:node:retrieve',
       'wiki:space:retrieve',
-      'docs:document:read',
+      'docs:document.content:read',
       'sheets:spreadsheet:read',
       'docx:document:readonly',
       'drive:drive.metadata:readonly',
@@ -83,6 +83,15 @@ export function buildServer(options: CreateServerOptions = {}) {
   // Initialize database schema
   localMapStore.initialize();
 
+  // Load config for validation (will throw if not exists)
+  await configManager.load();
+
+  // Initialize ChangeDetector
+  const changeDetector = new ChangeDetector(
+    larkCliClient,
+    localMapStore
+  );
+
   // Create Hono app
   const app = new Hono();
 
@@ -91,10 +100,7 @@ export function buildServer(options: CreateServerOptions = {}) {
   // ============================================================================
 
   // CORS (desktop mode or dev mode)
-  app.use('*', corsMiddleware({
-    expectedOrigin: DEFAULT_DESKTOP_ORIGIN,
-    devMode: !desktopMode,
-  }));
+  app.use('*', corsMiddleware());
 
   // ============================================================================
   // Inject Dependencies via Middleware (must run before auth)
@@ -105,6 +111,7 @@ export function buildServer(options: CreateServerOptions = {}) {
     (c as any).configManager = configManager;
     (c as any).larkCliClient = larkCliClient;
     (c as any).localMapStore = localMapStore;
+    (c as any).changeDetector = changeDetector;
 
     // Inject desktopToken for auth middleware via context property
     if (desktopMode) {
@@ -161,7 +168,7 @@ export async function startServer(options: CreateServerOptions & {
   const port = options.port || DEFAULT_PORT;
   const hostname = options.hostname || '127.0.0.1';
 
-  const app = buildServer(options);
+  const app = await buildServer(options);
 
   const started = await new Promise<{ server: ServerType; port: number }>((resolve, reject) => {
     let settled = false;

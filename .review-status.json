@@ -1,30 +1,29 @@
 {
-  "task_id": "feishu-sync-m0-recheck",
-  "status": "passed",
-  "reviewedAt": "2026-06-16T12:55:00Z",
-  "reviewer": "diting",
+  "task_id": "feishu-sync-m1-review",
+  "status": "PASS",
   "criticalIssues": 0,
-  "majorIssues": 5,
-  "minorIssues": 4,
-  "reportPath": "D:/WorkPace/projects-memory/projects/feishu-sync/agent-outputs/diting/20260616-m0-recheck/recheck-report.md",
+  "majorIssues": 0,
+  "minorIssues": 3,
+  "reviewer": "diting",
+  "reviewedAt": "2026-06-16T05:10:00.000Z",
+  "artifactPath": "D:/WorkPace/projects-memory/projects/feishu-sync/agent-outputs/diting/20260616-m1-review/review-report.md",
   "previousReview": {
-    "task_id": "feishu-sync-m0-review",
-    "status": "conditional",
-    "criticalIssues": 4,
-    "reportPath": "D:/WorkPace/projects-memory/projects/feishu-sync/agent-outputs/diting/20260616-m0-review/review-report.md"
+    "task_id": "feishu-sync-m0-recheck",
+    "status": "passed",
+    "criticalIssues": 0,
+    "majorIssues": 5,
+    "reportPath": "D:/WorkPace/projects-memory/projects/feishu-sync/agent-outputs/diting/20260616-m0-recheck/recheck-report.md"
   },
-  "fixedIssues": [
-    "C1: 独立模式 auth 中间件已启用",
-    "C2: parseJsonOutput 正确解析无 ok 字段 JSON",
-    "C3: timingSafeEqual 验证脚本 5/5 通过",
-    "C4: dev mode CORS origin 白名单已收紧"
-  ],
   "changedFiles": [
+    "server/src/modules/change-detector.ts",
+    "server/src/modules/polling-scheduler.ts",
+    "server/src/routes/detect.ts",
     "server/src/index.ts",
-    "server/src/modules/lark-cli-client.ts",
-    "server/src/middleware/auth.ts",
-    "server/src/middleware/cors.ts",
-    "server/scripts/verify-timing-safe.cjs"
+    "server/scripts/verify-m1-detection.ts",
+    "src/components/ChangeList.tsx",
+    "src/hooks/useChanges.ts",
+    "src/App.tsx"
   ],
-  "nextSteps": "M0 通过，建议交太白金星（taibai）提交 M0 后进入 M1"
+  "nextSteps": "M1 通过（有条件），建议立即进入 M2 同步引擎实现。Minor 问题（硬编码端口/URL）可在后续 Phase 清理。",
+  "notes": "真实检测验证通过（31 节点），红线复核无飞书 token 残留。前端 Browser 验证因环境限制未完成，代码走查通过，建议 M4 补做。"
 }

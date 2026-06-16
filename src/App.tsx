@@ -39,6 +39,11 @@ const navItems: NavItem[] = [
 
 function App() {
   const [currentView, setCurrentView] = useState<ViewType>('config');
+  const [selectedTokens, setSelectedTokens] = useState<string[]>([]);
+
+  const handleSelectionChange = (tokens: string[]) => {
+    setSelectedTokens(tokens);
+  };
 
   const renderView = () => {
     switch (currentView) {
@@ -46,7 +51,10 @@ function App() {
         return (
           <div className="space-y-4">
             <AuthStatus />
-            <ChangeList />
+            <ChangeList
+              selectedTokens={selectedTokens}
+              onSelectionChange={handleSelectionChange}
+            />
           </div>
         );
       case 'sync':
