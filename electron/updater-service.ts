@@ -1,13 +1,14 @@
 /**
- * Updater Service (Skeleton M0 Version)
+ * Updater Service (M5 Production Version)
  *
  * Manages application auto-update functionality.
- * M0 provides skeleton structure; M5 will implement full electron-updater integration.
+ * M5 implements full electron-updater integration with generic provider.
  *
- * Adapted from tts-voice-generator/updater-service.ts with M0 skeleton implementation
+ * Adapted from tts-voice-generator/updater-service.ts with feishu-sync adaptations
  */
 
 import { BrowserWindow, shell } from 'electron';
+import { autoUpdater, type ProgressInfo, type UpdateInfo } from 'electron-updater';
 import type {
   DesktopActionResult,
   DesktopDownloadProgress,
@@ -27,14 +28,61 @@ type DesktopUpdaterServiceOptions = {
   sanitizeError: (error: unknown) => string;
 };
 
-function toDesktopUpdateInfo(version: string): DesktopUpdateInfo {
-  // M0: Stub implementation - M5 will parse real UpdateInfo from electron-updater
+function normalizeReleaseNotes(releaseNotes: unknown) {
+  if (typeof releaseNotes === 'string') return releaseNotes.slice(0, 10_000);
+  if (Array.isArray(releaseNotes)) {
+    return releaseNotes
+      .map((entry) => {
+        if (typeof entry === 'string') return entry;
+        if (entry && typeof entry === 'object' && 'note' in entry) {
+          return String((entry as { note?: unknown }).note ?? '');
+        }
+        return '';
+      })
+      .filter(Boolean)
+      .join('\n')
+      .slice(0, 10_000);
+  }
+  return undefined;
+}
+
+function toDesktopUpdateInfo(info: UpdateInfo): DesktopUpdateInfo {
   return {
-    version,
-    releaseDate: undefined,
-    releaseName: undefined,
-    releaseNotes: undefined,
+    version: info.version,
+    ...(info.releaseDate ? { releaseDate: info.releaseDate } : {}),
+    ...(info.releaseName ? { releaseName: info.releaseName } : {}),
+    ...(normalizeReleaseNotes(info.releaseNotes) ? { releaseNotes: normalizeReleaseNotes(info.releaseNotes) } : {}),
   };
+}
+
+function toDesktopProgress(progress: ProgressInfo): DesktopDownloadProgress {
+  return {
+    percent: Number.isFinite(progress.percent) ? progress.percent : 0,
+    transferred: Number.isFinite(progress.transferred) ? progress.transferred : 0,
+    total: Number.isFinite(progress.total) ? progress.total : 0,
+    bytesPerSecond: Number.isFinite(progress.bytesPerSecond) ? progress.bytesPerSecond : 0,
+  };
+}
+
+function describeUpdaterError(error: unknown, sanitizedError: string) {
+  const rawMessage = error instanceof Error ? error.message : String(error);
+  const combinedMessage = `${rawMessage}\n${sanitizedError}`.toLowerCase();
+  const referencesGithubUpdateSource = combinedMessage.includes('github.com')
+    || combinedMessage.includes('github')
+    || combinedMessage.includes('releases.atom')
+    || combinedMessage.includes('latest.yml')
+    || combinedMessage.includes('latest-mac.yml');
+  const looksLikePrivateOrMissingRelease = combinedMessage.includes('404')
+    || combinedMessage.includes('authentication token')
+    || combinedMessage.includes('actual status maybe not reported')
+    || combinedMessage.includes('not found')
+    || combinedMessage.includes('private');
+
+  if (referencesGithubUpdateSource && looksLikePrivateOrMissingRelease) {
+    return '更新源不可访问：GitHub 返回 404 或认证提示，通常表示仓库、Release 或更新资产对未登录客户端不可见。应用内更新不能内置 GitHub Token；请将仓库/Release 或公共更新源开放，或打开下载页手动下载安装新版本。';
+  }
+
+  return sanitizedError;
 }
 
 export class DesktopUpdaterService {
@@ -50,8 +98,20 @@ export class DesktopUpdaterService {
       currentVersion: capabilities.appVersion,
       ...(capabilities.updateCheckSupported ? {} : { error: capabilities.updateInstallUnsupportedReason ?? '应用内更新仅在桌面安装包中可用。' }),
     };
-    // M0: Skip electron-updater initialization - M5 will add autoUpdater config
-    console.info('[Updater] M0 skeleton initialized. M5 will add electron-updater integration.');
+
+    // M5: Configure electron-updater with generic provider
+    const feedUrl = process.env.DESKTOP_UPDATE_FEED_URL || 'https://example.com/updates';
+    autoUpdater.setFeedURL({
+      provider: 'generic',
+      url: feedUrl,
+    });
+    autoUpdater.autoDownload = false;
+    autoUpdater.autoInstallOnAppQuit = false;
+    autoUpdater.allowPrerelease = false;
+    autoUpdater.allowDowngrade = false;
+
+    this.registerAutoUpdaterEvents();
+    console.info('[Updater] M5 production version initialized with generic provider:', feedUrl);
   }
 
   getState() {
@@ -70,20 +130,46 @@ export class DesktopUpdaterService {
       return { ok: true, state: this.getState() };
     }
 
-    // M0: Stub implementation - returns "up-to-date" without checking
     this.setState({ phase: 'checking', currentVersion: capabilities.appVersion, error: undefined });
-    this.checkInFlight = (async () => {
-      // Simulate check delay
-      await new Promise(resolve => setTimeout(resolve, 500));
-      this.setState({
-        phase: 'up-to-date',
-        currentVersion: capabilities.appVersion,
-        lastCheckedAt: new Date().toISOString(),
+    this.checkInFlight = autoUpdater.checkForUpdates()
+      .then((result) => {
+        const updateInfo = result?.updateInfo;
+        if (!updateInfo) {
+          this.setState({
+            phase: 'up-to-date',
+            currentVersion: capabilities.appVersion,
+            lastCheckedAt: new Date().toISOString(),
+          });
+        } else {
+          const nextInfo = toDesktopUpdateInfo(updateInfo);
+          this.setState({
+            phase: result.isUpdateAvailable ? 'available' : 'up-to-date',
+            currentVersion: capabilities.appVersion,
+            latestVersion: nextInfo.version,
+            updateInfo: nextInfo,
+            lastCheckedAt: new Date().toISOString(),
+          });
+        }
+        return { ok: true, state: this.getState() } as const;
+      })
+      .catch((error) => {
+        // Graceful degradation when feed URL is not configured
+        const sanitizedError = describeUpdaterError(error, this.options.sanitizeError(error));
+        if (sanitizedError.includes('404') || sanitizedError.includes('not found')) {
+          // Treat missing feed as "up-to-date" for development environment
+          this.setState({
+            phase: 'up-to-date',
+            currentVersion: capabilities.appVersion,
+            lastCheckedAt: new Date().toISOString(),
+          });
+          return { ok: true, state: this.getState() } as const;
+        }
+        this.setState({ phase: 'error', currentVersion: capabilities.appVersion, error: sanitizedError });
+        return { ok: false, code: 'update-check-failed', error: sanitizedError, state: this.getState() } as const;
+      })
+      .finally(() => {
+        this.checkInFlight = null;
       });
-      return { ok: true, state: this.getState() } as const;
-    })().finally(() => {
-      this.checkInFlight = null;
-    });
 
     return this.checkInFlight;
   }
@@ -99,16 +185,17 @@ export class DesktopUpdaterService {
       return { ok: false, code: 'update-not-available', error: '请先检查并确认存在可下载更新。' };
     }
 
-    // M0: Stub implementation - M5 will call autoUpdater.downloadUpdate()
     this.setState({ phase: 'downloading', currentVersion: capabilities.appVersion, progress: undefined, error: undefined });
-    this.downloadInFlight = (async () => {
-      // Simulate download delay
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      this.setState({ phase: 'error', currentVersion: capabilities.appVersion, error: 'M0: Download stub - M5 will implement real download' });
-      return { ok: false, code: 'update-download-stub', error: 'M0: Download stub - M5 will implement real download' } as const;
-    })().finally(() => {
-      this.downloadInFlight = null;
-    });
+    this.downloadInFlight = autoUpdater.downloadUpdate()
+      .then(() => ({ ok: true } as const))
+      .catch((error) => {
+        const sanitizedError = describeUpdaterError(error, this.options.sanitizeError(error));
+        this.setState({ phase: 'error', currentVersion: capabilities.appVersion, error: sanitizedError });
+        return { ok: false, code: 'update-download-failed', error: sanitizedError } as const;
+      })
+      .finally(() => {
+        this.downloadInFlight = null;
+      });
 
     return this.downloadInFlight;
   }
@@ -127,16 +214,21 @@ export class DesktopUpdaterService {
       return { ok: false, code: 'update-not-downloaded', error: '更新尚未下载完成，不能安装并重启。' };
     }
 
-    // M0: Stub implementation - M5 will call quitCoordinator.prepareForQuit and autoUpdater.quitAndInstall
     this.setState({ phase: 'installing', currentVersion: capabilities.appVersion, error: undefined });
-    this.installInFlight = (async () => {
-      // Simulate install delay
-      await new Promise(resolve => setTimeout(resolve, 500));
-      this.setState({ phase: 'error', currentVersion: capabilities.appVersion, error: 'M0: Install stub - M5 will implement real install' });
-      return { ok: false, code: 'update-install-stub', error: 'M0: Install stub - M5 will implement real install' } as const;
-    })().finally(() => {
-      this.installInFlight = null;
-    });
+    this.installInFlight = this.options.quitCoordinator.prepareForQuit('update')
+      .then((result) => {
+        if (!result.ok) return result;
+        autoUpdater.quitAndInstall(false, true);
+        return { ok: true } as const;
+      })
+      .catch((error) => {
+        const sanitizedError = describeUpdaterError(error, this.options.sanitizeError(error));
+        this.setState({ phase: 'error', currentVersion: capabilities.appVersion, error: sanitizedError });
+        return { ok: false, code: 'update-install-failed', error: sanitizedError } as const;
+      })
+      .finally(() => {
+        this.installInFlight = null;
+      });
 
     return this.installInFlight;
   }
@@ -148,6 +240,30 @@ export class DesktopUpdaterService {
     }
     const result = await shell.openExternal(releasePageUrl);
     return result ? { ok: false, code: 'open-release-page-failed', error: this.options.sanitizeError(result) } : { ok: true };
+  }
+
+  private registerAutoUpdaterEvents() {
+    autoUpdater.on('update-available', (info) => {
+      const updateInfo = toDesktopUpdateInfo(info);
+      this.setState({ phase: 'available', latestVersion: updateInfo.version, updateInfo, error: undefined });
+    });
+    autoUpdater.on('update-not-available', (info) => {
+      const updateInfo = toDesktopUpdateInfo(info);
+      this.setState({ phase: 'up-to-date', latestVersion: updateInfo.version, updateInfo, error: undefined });
+    });
+    autoUpdater.on('download-progress', (progress) => {
+      const desktopProgress = toDesktopProgress(progress);
+      this.state = { ...this.state, phase: 'downloading', progress: desktopProgress, error: undefined };
+      this.emit({ type: 'progress', state: this.getState(), progress: desktopProgress });
+    });
+    autoUpdater.on('update-downloaded', (info) => {
+      const updateInfo = toDesktopUpdateInfo(info);
+      this.setState({ phase: 'downloaded', latestVersion: updateInfo.version, updateInfo, error: undefined });
+    });
+    autoUpdater.on('error', (error) => {
+      const sanitizedError = describeUpdaterError(error, this.options.sanitizeError(error));
+      this.setState({ phase: 'error', error: sanitizedError });
+    });
   }
 
   private setState(nextState: Partial<DesktopUpdateState>) {

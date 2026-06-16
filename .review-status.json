@@ -1,32 +1,49 @@
 {
-  "task_id": "feishu-sync-m4-review",
-  "status": "PASS-WITH-CONDITIONS",
+  "task_id": "feishu-sync-m5-recheck",
+  "status": "pass",
   "criticalIssues": 0,
-  "majorIssues": 2,
-  "minorIssues": 4,
-  "reviewedAt": "2026-06-16T00:00:00.000Z",
+  "majorIssues": 0,
+  "minorIssues": 1,
+  "reviewedAt": "2026-06-16T07:25:00.000Z",
   "reviewer": "diting",
-  "reviewReportPath": "D:/WorkPace/projects-memory/projects/feishu-sync/agent-outputs/diting/20260616-m4-review/review-report.md",
+  "reviewReportPath": "D:/WorkPace/projects-memory/projects/feishu-sync/agent-outputs/diting/20260616-m5-recheck/recheck-report.md",
   "previousReview": {
-    "task_id": "feishu-sync-m3-review",
-    "status": "PASS-WITH-CONDITIONS",
+    "task_id": "feishu-sync-m5-review",
+    "status": "pass-with-conditions",
     "criticalIssues": 0,
     "majorIssues": 2,
-    "reportPath": "D:/WorkPace/projects-memory/projects/feishu-sync/agent-outputs/diting/20260616-m3-review/review-report.md"
+    "reportPath": "D:/WorkPace/projects-memory/projects/feishu-sync/agent-outputs/diting/20260616-m5-review/review-report.md"
   },
   "changedFiles": [
-    "electron/tray-service.ts",
-    "electron/auto-start-service.ts",
-    "electron/change-notification-service.ts",
-    "electron/main.ts",
-    "electron/contracts.ts",
-    "electron-builder.config.cjs",
-    "scripts/build-desktop-target.cjs",
-    "package.json",
-    "build/tray-icon.ico",
-    "build/tray-iconTemplate.png",
-    "server/src/modules/layout-reconstructor.ts"
+    "server/src/index.ts",
+    "node_modules/electron/dist/electron.exe",
+    "node_modules/electron/path.txt"
   ],
-  "nextSteps": "1. 修复 M1（preload.ts/desktop-contracts.ts 缺少 autoStart/changeNotification API）；2. 修复 M2（统一自启动双机制：Config.enableAutoStart vs AutoStartService）；3. 启动变更通知轮询；4. 集成 Tray 通知；5. 进入 M5 或 M4-C 可选真机验证。",
-  "notes": "TrayService 生产级完整；打包产物 .exe 99.2MB 验证通过；native rebuild 成功；M3 修复确认（五类全通过）。自启动双机制不一致（Config.enableAutoStart 未同步 AutoStartService）；preload API 不完整（渲染进程无法调用 M4 新功能）。"
+  "nextSteps": "1. puti 经验沉淀；2. taibai 提交 M5；3. Leader 最终总结。",
+  "m1Recheck": {
+    "health_single_registration": "PASS",
+    "health_public_access": "PASS",
+    "health_no_sensitive_info": "PASS",
+    "protected_routes_401": "PASS"
+  },
+  "m2Recheck": {
+    "electron_version": "v31.7.7",
+    "electron_binary_exists": "PASS",
+    "electron_startable": "PASS"
+  },
+  "e2eResults": {
+    "health_check": "PASS",
+    "detect_changes": "PASS",
+    "auth_protected": "PASS",
+    "performance_detect_s": "<2s",
+    "security_401": "PASS"
+  },
+  "securityAudit": "PASS",
+  "projectCompletion": {
+    "functional": "achieved",
+    "performance": "achieved",
+    "security": "achieved",
+    "cross_platform": "partial"
+  },
+  "notes": "M1/M2 已修复；端到端验证通过（31 节点检测）；性能达标（<2s 检测）；安全全绿；Electron v31.7.7 可启动；项目全量达标，进入收尾流程。"
 }

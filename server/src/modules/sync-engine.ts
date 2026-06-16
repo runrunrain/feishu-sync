@@ -124,7 +124,45 @@ export class SyncEngine {
     options: SyncOptions
   ): Promise<SyncedDocument> {
     // 1. Fetch document content from Feishu
-    const fetched = await this.fetchDocumentContent(doc.objToken, doc.objType);
+    let fetched: FetchedDocument;
+    let isPlaceholder = false;
+
+    try {
+      fetched = await this.fetchDocumentContent(doc.objToken, doc.objType);
+    } catch (error) {
+      // Check if this is a 40403 no permission error
+      if (error instanceof Error && error.message.includes('40403')) {
+        console.warn(`[SyncEngine] No permission for document ${doc.title}, creating placeholder`);
+        isPlaceholder = true;
+        fetched = {
+          content: '',
+          images: [],
+          attachments: [],
+          sheets: [],
+          url: doc.localMdPath || '', // Will be filled in writePlaceholder
+          obj_token: doc.objToken,
+        };
+      } else {
+        throw error; // Re-throw other errors
+      }
+    }
+
+    // For placeholder files, create a placeholder .md and mark in local map
+    if (isPlaceholder) {
+      const localMdPath = doc.localMdPath || this.generateLocalPath(doc);
+      await this.writePlaceholderFile(localMdPath, doc);
+      await this.updateLocalMapWithStatus(doc.objToken, localMdPath, doc.cloudModifiedTime, doc.objType, 'placeholder');
+      return {
+        objToken: doc.objToken,
+        title: doc.title,
+        localMdPath,
+        cloudModifiedTime: doc.cloudModifiedTime,
+        size: 0,
+        imagesCount: 0,
+        attachmentsCount: 0,
+        sheetsCount: 0,
+      };
+    }
 
     // 2. Download images (three-tier fallback)
     const localMdPath = doc.localMdPath || this.generateLocalPath(doc);
@@ -411,6 +449,19 @@ export class SyncEngine {
     cloudModifiedTime: string,
     objType: string
   ): Promise<void> {
+    await this.updateLocalMapWithStatus(objToken, localMdPath, cloudModifiedTime, objType, 'synced');
+  }
+
+  /**
+   * Update local mapping with custom status (e.g., 'placeholder')
+   */
+  private async updateLocalMapWithStatus(
+    objToken: string,
+    localMdPath: string,
+    cloudModifiedTime: string,
+    objType: string,
+    status: 'synced' | 'changed' | 'error' | 'placeholder'
+  ): Promise<void> {
     this.localMapStore.upsertDocument({
       objToken,
       wikiNodeToken: null, // Will be filled if available
@@ -419,8 +470,53 @@ export class SyncEngine {
       localMdPath,
       lastSyncedModifyTime: cloudModifiedTime,
       lastSyncedAt: new Date().toISOString(),
-      status: 'synced',
+      status,
     });
+  }
+
+  /**
+   * Write placeholder file for documents with no permission
+   */
+  private async writePlaceholderFile(localMdPath: string, doc: ChangedDocument): Promise<void> {
+    // Create directory if it doesn't exist
+    const dir = path.dirname(localMdPath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+
+    const currentDate = new Date().toISOString().split('T')[0];
+    const placeholderContent = `# 无权限文档：${doc.title}
+
+> **权限限制**：此文档需要额外权限才能访问。请联系文档所有者或管理员获取访问权限。
+
+## 文档信息
+
+- **文档标题**：${doc.title}
+- **对象类型**：${doc.objType}
+- **对象Token**：${doc.objToken}
+- **变更类型**：${doc.changeType}
+- **云端修改时间**：${doc.cloudModifiedTime}
+- **本地同步时间**：${currentDate}
+
+## 下一步操作
+
+1. 在飞书中申请该文档的访问权限
+2. 获取权限后，在应用中重新同步此文档
+3. 系统将自动下载完整内容并替换此占位文件
+
+---
+
+<!--
+来源: 飞书知识库（占位文件）
+状态: 无权限访问 (40403)
+原始链接: 需要在飞书中访问
+obj_token: ${doc.objToken}
+获取日期: ${currentDate}
+-->
+`;
+
+    fs.writeFileSync(localMdPath, placeholderContent, 'utf-8');
+    console.info(`[SyncEngine] Created placeholder file: ${localMdPath}`);
   }
 
   /**

@@ -125,7 +125,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
   // Register Public Routes (no auth required)
   // ============================================================================
 
-  app.route('/', healthRoutes); // Health check is always public
+  app.route('/', healthRoutes); // Health check is always public (must be before auth middleware)
 
   // Token authentication (desktop mode only, must run after dependency injection)
   if (desktopMode) {
@@ -136,7 +136,6 @@ export async function buildServer(options: CreateServerOptions = {}) {
   // Register Protected Routes (auth required)
   // ============================================================================
 
-  app.route('/', healthRoutes);
   app.route('/', configRoutes);
   app.route('/', detectRoutes);
   app.route('/', syncRoutes);
