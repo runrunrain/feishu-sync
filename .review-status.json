@@ -1,30 +1,26 @@
 {
-  "task_id": "feishu-sync-m2-review",
+  "task_id": "feishu-sync-m3-review",
   "status": "PASS-WITH-CONDITIONS",
   "criticalIssues": 0,
-  "majorIssues": 0,
-  "minorIssues": 4,
+  "majorIssues": 2,
+  "minorIssues": 3,
+  "reviewedAt": "2026-06-16T00:00:00.000Z",
   "reviewer": "diting",
-  "reviewedAt": "2026-06-16T05:33:00.000Z",
-  "artifactPath": "D:/WorkPace/projects-memory/projects/feishu-sync/agent-outputs/diting/20260616-m2-review/review-report.md",
+  "reviewReportPath": "D:/WorkPace/projects-memory/projects/feishu-sync/agent-outputs/diting/20260616-m3-review/review-report.md",
   "previousReview": {
-    "task_id": "feishu-sync-m1-review",
-    "status": "PASS",
+    "task_id": "feishu-sync-m2-review",
+    "status": "PASS-WITH-CONDITIONS",
     "criticalIssues": 0,
     "majorIssues": 0,
-    "reportPath": "D:/WorkPace/projects-memory/projects/feishu-sync/agent-outputs/diting/20260616-m1-review/review-report.md"
+    "reportPath": "D:/WorkPace/projects-memory/projects/feishu-sync/agent-outputs/diting/20260616-m2-review/review-report.md"
   },
   "changedFiles": [
+    "server/src/modules/layout-reconstructor.ts",
+    "server/src/modules/content-adapter.ts",
     "server/src/modules/sync-engine.ts",
-    "server/src/modules/index-scanner.ts",
     "server/src/routes/sync.ts",
-    "server/scripts/verify-m2a-sync.ts",
-    "server/scripts/verify-m2b-sync.ts",
-    "src/components/SyncPanel.tsx",
-    "src/hooks/useSync.ts",
-    "src/api/client.ts",
-    "src/App.tsx"
+    "server/package.json"
   ],
-  "nextSteps": "M2 通过（有条件），建议进入 M3 LLM 适配。Minor 问题（updateLocalMap 硬编码 'docx'）建议在 M3 前修复。",
-  "notes": "真实同步验证通过（单文档 505ms），索引扫描验证通过（36 文件），红线复核无飞书 token 残留。sheet 导出权限错误 1069902 为飞书权限问题，非代码缺陷。"
+  "nextSteps": "1. 修复 M1（D-Paragraph 单行检测）；2. 同步架构文档 C-Datatable 填充率判据；3. 继续 M4（托盘 + 打包）。",
+  "notes": "核心三类通过（A/B/C），ContentAdapter 真实调用 + 降级逻辑验证通过，红线复核通过（apiKey 不入日志、零飞书 token、config 不入库）。D/E 边缘情况失败不影响主要场景。"
 }

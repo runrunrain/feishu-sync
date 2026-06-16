@@ -10,6 +10,8 @@
 import { Hono } from 'hono';
 import { SyncEngine } from '../modules/sync-engine.js';
 import { IndexScanner } from '../modules/index-scanner.js';
+import { LayoutReconstructor } from '../modules/layout-reconstructor.js';
+import { ContentAdapter } from '../modules/content-adapter.js';
 import type { SyncResult } from '../types/index.js';
 
 const syncRoutes = new Hono();
@@ -31,12 +33,17 @@ syncRoutes.post('/api/sync', async (c) => {
   // Load config
   const config = await configManager.load();
 
-  // Create SyncEngine instance
+  // Initialize M3 modules
+  const layoutReconstructor = new LayoutReconstructor();
+  const contentAdapter = new ContentAdapter();
+
+  // Create SyncEngine instance with M3 modules
   const syncEngine = new SyncEngine({
     larkCliClient,
     localMapStore,
     config,
-    // layoutReconstructor and contentAdapter will be injected in M3
+    layoutReconstructor,
+    contentAdapter,
   });
 
   // Execute synchronization

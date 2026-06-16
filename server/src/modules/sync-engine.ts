@@ -144,11 +144,25 @@ export class SyncEngine {
       sheets.push(...exportedSheets);
     }
 
-    // 6. Table reconstruction (M3 - optional injection)
+    // 6. Table reconstruction (M3 - apply to exported sheets)
     let finalContent = expandedContent;
     if (this.layoutReconstructor && sheets.length > 0) {
-      // TODO-M3: Apply table reconstruction to exported sheets
-      console.info('[SyncEngine] Table reconstruction not yet implemented');
+      // Reconstruct each sheet and append to content
+      const reconstructedSheets: string[] = [];
+      for (const sheet of sheets) {
+        try {
+          const reconstructedMarkdown = await this.layoutReconstructor.reconstructToMarkdown(sheet.csvPath);
+          reconstructedSheets.push(`## ${sheet.title}\n\n${reconstructedMarkdown}`);
+          console.info(`[SyncEngine] Reconstructed sheet "${sheet.title}" from ${sheet.csvPath}`);
+        } catch (error) {
+          console.warn(`[SyncEngine] Failed to reconstruct sheet "${sheet.title}":`, error);
+          // Continue with other sheets on failure
+        }
+      }
+      // Append reconstructed sheets to content
+      if (reconstructedSheets.length > 0) {
+        finalContent = expandedContent + '\n\n' + reconstructedSheets.join('\n\n---\n\n');
+      }
     }
 
     // 7. LLM adaptation (M3 - optional injection)
@@ -171,7 +185,7 @@ export class SyncEngine {
     await this.writeLocalMarkdown(localMdPath, finalContent, fetched);
 
     // 9. Update local mapping
-    await this.updateLocalMap(doc.objToken, localMdPath, doc.cloudModifiedTime);
+    await this.updateLocalMap(doc.objToken, localMdPath, doc.cloudModifiedTime, doc.objType);
 
     return {
       objToken: doc.objToken,
@@ -394,15 +408,13 @@ export class SyncEngine {
   private async updateLocalMap(
     objToken: string,
     localMdPath: string,
-    cloudModifiedTime: string
+    cloudModifiedTime: string,
+    objType: string
   ): Promise<void> {
-    // Suppress unused parameter warning
-    void objToken;
-
     this.localMapStore.upsertDocument({
       objToken,
       wikiNodeToken: null, // Will be filled if available
-      objType: 'docx', // TODO: Detect from objType
+      objType, // Use actual objType from document
       title: path.basename(localMdPath, '.md'),
       localMdPath,
       lastSyncedModifyTime: cloudModifiedTime,
