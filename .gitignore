@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+server/node_modules/
+
+# Build output
+dist/
+dist-electron/
+server/dist/
+release/
+release-builds/
+
+# Native modules
+*.node
+
+# Logs
+*.log
+npm-debug.log*
+logs/
+
+# Env
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Local data (用户运行时数据不入库)
+*.db
+*.db-journal
+csv-data/
