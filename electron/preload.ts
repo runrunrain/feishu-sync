@@ -14,6 +14,8 @@ import type {
   DesktopUpdateCheckResult,
   DesktopUpdateEvent,
   DesktopUpdateState,
+  AutoStartStatus,
+  ChangeDetectionResult,
 } from './contracts.js';
 import type { DesktopAPI } from './desktop-contracts.js';
 
@@ -56,6 +58,27 @@ const desktopApi: DesktopAPI = {
 
   openConfigFile: async (): Promise<DesktopActionResult> => {
     return ipcRenderer.invoke('desktop:open-config-file');
+  },
+
+  autoStart: {
+    getStatus: async (): Promise<AutoStartStatus> => {
+      return ipcRenderer.invoke('desktop:auto-start:get-status');
+    },
+    setEnabled: async (enabled: boolean): Promise<DesktopActionResult> => {
+      return ipcRenderer.invoke('desktop:auto-start:set-enabled', enabled);
+    },
+  },
+
+  changeNotification: {
+    start: async (pollIntervalMinutes?: number): Promise<DesktopActionResult> => {
+      return ipcRenderer.invoke('desktop:change-notification:start', pollIntervalMinutes);
+    },
+    stop: async (): Promise<DesktopActionResult> => {
+      return ipcRenderer.invoke('desktop:change-notification:stop');
+    },
+    manualCheck: async (): Promise<ChangeDetectionResult> => {
+      return ipcRenderer.invoke('desktop:change-notification:manual-check');
+    },
   },
 };
 

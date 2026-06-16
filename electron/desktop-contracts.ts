@@ -10,6 +10,8 @@ import type {
   DesktopUpdateCheckResult,
   DesktopUpdateEvent,
   DesktopUpdateState,
+  AutoStartStatus,
+  ChangeDetectionResult,
 } from './contracts.js';
 
 export interface DesktopAPI {
@@ -66,4 +68,41 @@ export interface DesktopAPI {
    * Open application configuration file in default editor
    */
   openConfigFile: () => Promise<DesktopActionResult>;
+
+  /**
+   * Auto-start operations namespace (M4)
+   */
+  autoStart: {
+    /**
+     * Get current auto-start status
+     */
+    getStatus: () => Promise<AutoStartStatus>;
+
+    /**
+     * Enable or disable auto-start
+     * @param enabled - Whether to enable auto-start on OS login
+     */
+    setEnabled: (enabled: boolean) => Promise<DesktopActionResult>;
+  };
+
+  /**
+   * Change notification operations namespace (M4)
+   */
+  changeNotification: {
+    /**
+     * Start polling for changes
+     * @param pollIntervalMinutes - Polling interval in minutes (default: 30)
+     */
+    start: (pollIntervalMinutes?: number) => Promise<DesktopActionResult>;
+
+    /**
+     * Stop polling for changes
+     */
+    stop: () => Promise<DesktopActionResult>;
+
+    /**
+     * Manually trigger a change detection check
+     */
+    manualCheck: () => Promise<ChangeDetectionResult>;
+  };
 }

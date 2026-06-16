@@ -17,6 +17,11 @@ export const IPC_CHANNELS = {
   UPDATE_INSTALL_AND_RESTART: 'desktop:update:install-and-restart',
   OPEN_DATA_DIRECTORY: 'desktop:open-data-directory',
   OPEN_CONFIG_FILE: 'desktop:open-config-file',
+  AUTO_START_GET_STATUS: 'desktop:auto-start:get-status',
+  AUTO_START_SET_ENABLED: 'desktop:auto-start:set-enabled',
+  CHANGE_NOTIFICATION_START: 'desktop:change-notification:start',
+  CHANGE_NOTIFICATION_STOP: 'desktop:change-notification:stop',
+  CHANGE_NOTIFICATION_MANUAL_CHECK: 'desktop:change-notification:manual-check',
 } as const;
 
 // ============================================================================
@@ -92,3 +97,29 @@ export type DesktopUpdateCheckResult =
 export type DesktopUpdateEvent =
   | { type: "state"; state: DesktopUpdateState }
   | { type: "progress"; state: DesktopUpdateState; progress: DesktopDownloadProgress };
+
+// ============================================================================
+// Auto-Start Types (M4)
+// ============================================================================
+
+export type AutoStartStatus = {
+  enabled: boolean;
+  willOpenAsHidden: boolean;
+};
+
+// ============================================================================
+// Change Notification Types (M4)
+// ============================================================================
+
+export type ChangedDocument = {
+  objToken: string;
+  title: string;
+  changeType: 'modified' | 'added' | 'deleted';
+};
+
+export type ChangeDetectionResult = {
+  changed: boolean;
+  changedDocuments: ChangedDocument[];
+  checkedAt: string;
+  totalNodes: number;
+};

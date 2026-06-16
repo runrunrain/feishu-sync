@@ -1,26 +1,32 @@
 {
-  "task_id": "feishu-sync-m3-review",
+  "task_id": "feishu-sync-m4-review",
   "status": "PASS-WITH-CONDITIONS",
   "criticalIssues": 0,
   "majorIssues": 2,
-  "minorIssues": 3,
+  "minorIssues": 4,
   "reviewedAt": "2026-06-16T00:00:00.000Z",
   "reviewer": "diting",
-  "reviewReportPath": "D:/WorkPace/projects-memory/projects/feishu-sync/agent-outputs/diting/20260616-m3-review/review-report.md",
+  "reviewReportPath": "D:/WorkPace/projects-memory/projects/feishu-sync/agent-outputs/diting/20260616-m4-review/review-report.md",
   "previousReview": {
-    "task_id": "feishu-sync-m2-review",
+    "task_id": "feishu-sync-m3-review",
     "status": "PASS-WITH-CONDITIONS",
     "criticalIssues": 0,
-    "majorIssues": 0,
-    "reportPath": "D:/WorkPace/projects-memory/projects/feishu-sync/agent-outputs/diting/20260616-m2-review/review-report.md"
+    "majorIssues": 2,
+    "reportPath": "D:/WorkPace/projects-memory/projects/feishu-sync/agent-outputs/diting/20260616-m3-review/review-report.md"
   },
   "changedFiles": [
-    "server/src/modules/layout-reconstructor.ts",
-    "server/src/modules/content-adapter.ts",
-    "server/src/modules/sync-engine.ts",
-    "server/src/routes/sync.ts",
-    "server/package.json"
+    "electron/tray-service.ts",
+    "electron/auto-start-service.ts",
+    "electron/change-notification-service.ts",
+    "electron/main.ts",
+    "electron/contracts.ts",
+    "electron-builder.config.cjs",
+    "scripts/build-desktop-target.cjs",
+    "package.json",
+    "build/tray-icon.ico",
+    "build/tray-iconTemplate.png",
+    "server/src/modules/layout-reconstructor.ts"
   ],
-  "nextSteps": "1. 修复 M1（D-Paragraph 单行检测）；2. 同步架构文档 C-Datatable 填充率判据；3. 继续 M4（托盘 + 打包）。",
-  "notes": "核心三类通过（A/B/C），ContentAdapter 真实调用 + 降级逻辑验证通过，红线复核通过（apiKey 不入日志、零飞书 token、config 不入库）。D/E 边缘情况失败不影响主要场景。"
+  "nextSteps": "1. 修复 M1（preload.ts/desktop-contracts.ts 缺少 autoStart/changeNotification API）；2. 修复 M2（统一自启动双机制：Config.enableAutoStart vs AutoStartService）；3. 启动变更通知轮询；4. 集成 Tray 通知；5. 进入 M5 或 M4-C 可选真机验证。",
+  "notes": "TrayService 生产级完整；打包产物 .exe 99.2MB 验证通过；native rebuild 成功；M3 修复确认（五类全通过）。自启动双机制不一致（Config.enableAutoStart 未同步 AutoStartService）；preload API 不完整（渲染进程无法调用 M4 新功能）。"
 }
