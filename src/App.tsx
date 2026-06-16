@@ -3,7 +3,7 @@
  * Layout shell with sidebar navigation and content views
  */
 
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
 import {
   FileSearch,
   RefreshCw,
@@ -20,6 +20,7 @@ import { ChangeList } from './components/ChangeList';
 import { SyncPanel } from './components/SyncPanel';
 import { LogViewer } from './components/LogViewer';
 import { UpdatePanel } from './components/UpdatePanel';
+import { useChanges } from './hooks/useChanges';
 
 type ViewType = 'changes' | 'sync' | 'config' | 'logs' | 'updates';
 
@@ -41,6 +42,14 @@ function App() {
   const [currentView, setCurrentView] = useState<ViewType>('config');
   const [selectedTokens, setSelectedTokens] = useState<string[]>([]);
 
+  // Use changes hook to get available documents
+  const { changes } = useChanges();
+
+  // Get selected documents for sync based on selected tokens
+  const selectedDocuments = useMemo(() => {
+    return changes.filter(doc => selectedTokens.includes(doc.objToken));
+  }, [selectedTokens, changes]);
+
   const handleSelectionChange = (tokens: string[]) => {
     setSelectedTokens(tokens);
   };
@@ -58,7 +67,7 @@ function App() {
           </div>
         );
       case 'sync':
-        return <SyncPanel />;
+        return <SyncPanel selectedDocuments={selectedDocuments} />;
       case 'config':
         return <ConfigPanel />;
       case 'logs':

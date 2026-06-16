@@ -3,7 +3,7 @@
  * All requests include X-Desktop-Token header from window.desktop
  */
 
-import type { Config, AuthStatus, ChangeDetectionResult, SyncResult, ServerHealth } from '../types';
+import type { Config, AuthStatus, ChangeDetectionResult, SyncResult, ServerHealth, ChangedDocument } from '../types';
 
 class APIError extends Error {
   constructor(
@@ -133,7 +133,7 @@ export async function detectChanges(rootUrl: string): Promise<ChangeDetectionRes
  */
 export async function syncDocs(
   options: {
-    objTokens: string[];
+    documents: ChangedDocument[];
     enableLLM: boolean;
     fullSync: boolean;
   }
@@ -141,6 +141,24 @@ export async function syncDocs(
   return request<SyncResult>('/api/sync', {
     method: 'POST',
     body: JSON.stringify(options),
+  });
+}
+
+/**
+ * Sync index - scan local knowledge base and build initial index
+ */
+export async function syncIndex(options?: {
+  rootDir?: string;
+}): Promise<{
+  scanned: number;
+  indexed: number;
+  skipped: number;
+  failed: number;
+  errors?: string[];
+}> {
+  return request('/api/sync/index', {
+    method: 'POST',
+    body: JSON.stringify(options || {}),
   });
 }
 

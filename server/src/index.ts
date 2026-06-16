@@ -233,7 +233,7 @@ if (isMainModule) {
   startServer({
     desktopMode: true, // Enable auth middleware in standalone mode
     desktopToken: standaloneToken,
-    port: 3002, // Use alternative port for verification
+    port: 3001, // Use default port to align with vite proxy
     hostname: '127.0.0.1', // Bind to localhost only in standalone mode
   }).catch((error) => {
     console.error('[server] Failed to start:', error);

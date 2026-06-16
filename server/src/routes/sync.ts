@@ -2,14 +2,14 @@
  * Sync Routes - Document synchronization endpoints
  *
  * POST /api/sync - Synchronize selected documents
+ * POST /api/sync/index - Trigger initial full index scan
  *
- * NOTE: This is a placeholder implementation returning a stub structure.
- * Full implementation will be completed in M2 milestone.
- *
- * TODO-M2: Implement SyncEngine integration with LarkCliClient, LayoutReconstructor, ContentAdapter
+ * Implements the complete synchronization pipeline with SyncEngine integration
  */
 
 import { Hono } from 'hono';
+import { SyncEngine } from '../modules/sync-engine.js';
+import { IndexScanner } from '../modules/index-scanner.js';
 import type { SyncResult } from '../types/index.js';
 
 const syncRoutes = new Hono();
@@ -23,28 +23,59 @@ const syncRoutes = new Hono();
 syncRoutes.post('/api/sync', async (c) => {
   const { documents, options } = await c.req.json();
 
-  // Suppress unused variable warnings
-  void documents;
-  void options;
+  // Get dependencies from context (injected by middleware)
+  const larkCliClient = (c as any).larkCliClient;
+  const localMapStore = (c as any).localMapStore;
+  const configManager = (c as any).configManager;
 
-  // TODO-M2: Implement actual sync logic
-  // This will be completed in M2 milestone with:
-  // - SyncEngine.syncDocuments() orchestration
-  // - LarkCliClient for content fetching (docs +fetch, media-download)
-  // - LayoutReconstructor for table reconstruction
-  // - ContentAdapter for LLM-based content adaptation
-  // - LocalMapStore for mapping updates
+  // Load config
+  const config = await configManager.load();
 
-  const stubResult: SyncResult = {
-    success: false,
-    syncedDocuments: [],
-    failedDocuments: [],
-    startedAt: new Date().toISOString(),
-    completedAt: new Date().toISOString(),
-    duration: 0,
-  };
+  // Create SyncEngine instance
+  const syncEngine = new SyncEngine({
+    larkCliClient,
+    localMapStore,
+    config,
+    // layoutReconstructor and contentAdapter will be injected in M3
+  });
 
-  return c.json(stubResult);
+  // Execute synchronization
+  const result: SyncResult = await syncEngine.syncDocuments(documents, options);
+
+  return c.json(result);
+});
+
+/**
+ * POST /api/sync/index - Trigger initial full index scan
+ *
+ * Request body: { rootDir?: string }  // Optional, defaults to config.knowledgeBaseRoot
+ * Response: IndexResult
+ */
+syncRoutes.post('/api/sync/index', async (c) => {
+  const { rootDir } = await c.req.json();
+
+  // Get dependencies from context
+  const larkCliClient = (c as any).larkCliClient;
+  const localMapStore = (c as any).localMapStore;
+  const configManager = (c as any).configManager;
+
+  // Load config
+  const config = await configManager.load();
+
+  // Use provided rootDir or default to config
+  const scanRoot = rootDir || config.knowledgeBaseRoot;
+
+  // Create IndexScanner instance
+  const indexScanner = new IndexScanner({
+    localMapStore,
+    larkCliClient,
+    config,
+  });
+
+  // Execute scan
+  const result = await indexScanner.scanKnowledgeBase(scanRoot);
+
+  return c.json(result);
 });
 
 export { syncRoutes };

@@ -1,47 +1,96 @@
 /**
  * Hook for document synchronization
- * Skeleton for M2 - basic structure with empty state
+ * M2: Full implementation with syncDocuments and syncIndex
  */
 
 import { useState, useCallback } from 'react';
-import type { SyncResult } from '../types';
+import type { SyncResult, ChangedDocument } from '../types';
+import { syncDocs, syncIndex as apiSyncIndex } from '../api/client';
+
+interface IndexResult {
+  scanned: number;
+  indexed: number;
+  skipped: number;
+  failed: number;
+  errors?: string[];
+}
 
 interface UseSyncResult {
   syncing: boolean;
-  progress: number;
+  indexing: boolean;
+  syncResult: SyncResult | null;
+  indexResult: IndexResult | null;
   error: string | null;
-  result: SyncResult | null;
-  sync: (objTokens: string[], enableLLM?: boolean, fullSync?: boolean) => Promise<void>;
+  syncDocuments: (documents: ChangedDocument[], options?: { enableLLM?: boolean; fullSync?: boolean }) => Promise<void>;
+  syncIndex: (rootDir?: string) => Promise<void>;
   clear: () => void;
 }
 
 export function useSync(): UseSyncResult {
   const [syncing, setSyncing] = useState(false);
-  const [progress, setProgress] = useState(0);
+  const [indexing, setIndexing] = useState(false);
+  const [syncResult, setSyncResult] = useState<SyncResult | null>(null);
+  const [indexResult, setIndexResult] = useState<IndexResult | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<SyncResult | null>(null);
 
-  const sync = useCallback(async (
-    objTokens: string[],
-    enableLLM: boolean = false,
-    fullSync: boolean = false
+  const syncDocuments = useCallback(async (
+    documents: ChangedDocument[],
+    options: { enableLLM?: boolean; fullSync?: boolean } = {}
   ) => {
-    // M2 skeleton - this will be implemented in M2
-    setError('Document synchronization will be enabled in M2');
+    if (documents.length === 0) {
+      setError('No documents selected for sync');
+      return;
+    }
+
+    setSyncing(true);
+    setError(null);
+    setSyncResult(null);
+
+    try {
+      const result = await syncDocs({
+        documents,
+        enableLLM: options.enableLLM ?? false,
+        fullSync: options.fullSync ?? false,
+      });
+      setSyncResult(result);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Sync failed';
+      setError(message);
+    } finally {
+      setSyncing(false);
+    }
+  }, []);
+
+  const syncIndex = useCallback(async (rootDir?: string) => {
+    setIndexing(true);
+    setError(null);
+    setIndexResult(null);
+
+    try {
+      const result = await apiSyncIndex({ rootDir });
+      setIndexResult(result);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Index scan failed';
+      setError(message);
+    } finally {
+      setIndexing(false);
+    }
   }, []);
 
   const clear = useCallback(() => {
-    setProgress(0);
+    setSyncResult(null);
+    setIndexResult(null);
     setError(null);
-    setResult(null);
   }, []);
 
   return {
     syncing,
-    progress,
+    indexing,
+    syncResult,
+    indexResult,
     error,
-    result,
-    sync,
+    syncDocuments,
+    syncIndex,
     clear,
   };
 }

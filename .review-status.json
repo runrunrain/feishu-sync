@@ -1,29 +1,30 @@
 {
-  "task_id": "feishu-sync-m1-review",
-  "status": "PASS",
+  "task_id": "feishu-sync-m2-review",
+  "status": "PASS-WITH-CONDITIONS",
   "criticalIssues": 0,
   "majorIssues": 0,
-  "minorIssues": 3,
+  "minorIssues": 4,
   "reviewer": "diting",
-  "reviewedAt": "2026-06-16T05:10:00.000Z",
-  "artifactPath": "D:/WorkPace/projects-memory/projects/feishu-sync/agent-outputs/diting/20260616-m1-review/review-report.md",
+  "reviewedAt": "2026-06-16T05:33:00.000Z",
+  "artifactPath": "D:/WorkPace/projects-memory/projects/feishu-sync/agent-outputs/diting/20260616-m2-review/review-report.md",
   "previousReview": {
-    "task_id": "feishu-sync-m0-recheck",
-    "status": "passed",
+    "task_id": "feishu-sync-m1-review",
+    "status": "PASS",
     "criticalIssues": 0,
-    "majorIssues": 5,
-    "reportPath": "D:/WorkPace/projects-memory/projects/feishu-sync/agent-outputs/diting/20260616-m0-recheck/recheck-report.md"
+    "majorIssues": 0,
+    "reportPath": "D:/WorkPace/projects-memory/projects/feishu-sync/agent-outputs/diting/20260616-m1-review/review-report.md"
   },
   "changedFiles": [
-    "server/src/modules/change-detector.ts",
-    "server/src/modules/polling-scheduler.ts",
-    "server/src/routes/detect.ts",
-    "server/src/index.ts",
-    "server/scripts/verify-m1-detection.ts",
-    "src/components/ChangeList.tsx",
-    "src/hooks/useChanges.ts",
+    "server/src/modules/sync-engine.ts",
+    "server/src/modules/index-scanner.ts",
+    "server/src/routes/sync.ts",
+    "server/scripts/verify-m2a-sync.ts",
+    "server/scripts/verify-m2b-sync.ts",
+    "src/components/SyncPanel.tsx",
+    "src/hooks/useSync.ts",
+    "src/api/client.ts",
     "src/App.tsx"
   ],
-  "nextSteps": "M1 通过（有条件），建议立即进入 M2 同步引擎实现。Minor 问题（硬编码端口/URL）可在后续 Phase 清理。",
-  "notes": "真实检测验证通过（31 节点），红线复核无飞书 token 残留。前端 Browser 验证因环境限制未完成，代码走查通过，建议 M4 补做。"
+  "nextSteps": "M2 通过（有条件），建议进入 M3 LLM 适配。Minor 问题（updateLocalMap 硬编码 'docx'）建议在 M3 前修复。",
+  "notes": "真实同步验证通过（单文档 505ms），索引扫描验证通过（36 文件），红线复核无飞书 token 残留。sheet 导出权限错误 1069902 为飞书权限问题，非代码缺陷。"
 }
