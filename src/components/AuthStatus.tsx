@@ -44,11 +44,11 @@ export function AuthStatus() {
   };
 
   return (
-    <Card>
+    <Card variant="elevated">
       <CardHeader className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-3">
           {getStatusIcon()}
-          <h2 className="text-lg font-medium">Feishu Authentication</h2>
+          <h2 className="text-lg font-display font-medium text-text-primary">Feishu Authentication</h2>
         </div>
         <Button
           variant="ghost"
@@ -60,33 +60,33 @@ export function AuthStatus() {
         </Button>
       </CardHeader>
       <CardBody>
-        <div className="space-y-4">
-          <div className="flex items-center justify-between">
+        <div className="space-y-5">
+          <div className="flex items-center justify-between py-2 border-b border-border-subtle">
             <span className="text-sm text-text-secondary">Status</span>
-            <StatusBadge status={loading ? 'loading' : ready ? 'success' : 'error'}>
+            <StatusBadge status={loading ? 'loading' : ready ? 'success' : 'error'} size="md">
               {loading ? 'Checking...' : ready ? 'Ready' : 'Not Ready'}
             </StatusBadge>
           </div>
 
           {authStatus?.larkCliVersion && ready && (
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between py-2 border-b border-border-subtle">
               <span className="text-sm text-text-secondary">lark-cli version</span>
-              <span className="text-sm text-text-primary font-mono">{authStatus.larkCliVersion}</span>
+              <span className="text-sm font-mono text-accent bg-accent/10 px-2 py-0.5 rounded">{authStatus.larkCliVersion}</span>
             </div>
           )}
 
-          <div className="pt-2 border-t border-border-subtle">
-            <p className="text-sm text-text-primary">{getHelpText()}</p>
+          <div className="p-3 bg-bg-canvas rounded-md border border-border-subtle">
+            <p className="text-sm text-text-primary leading-relaxed">{getHelpText()}</p>
           </div>
 
           {authStatus?.currentScopes && authStatus.currentScopes.length > 0 && (
-            <div className="pt-2 border-t border-border-subtle">
-              <p className="text-xs text-text-secondary mb-1">Granted scopes:</p>
-              <div className="flex flex-wrap gap-1">
+            <div>
+              <p className="text-xs text-text-secondary mb-2 uppercase tracking-wide">Granted Scopes</p>
+              <div className="flex flex-wrap gap-2">
                 {authStatus.currentScopes.map(scope => (
                   <span
                     key={scope}
-                    className="px-2 py-0.5 text-xs bg-bg-surface text-text-secondary rounded"
+                    className="px-2.5 py-1 text-xs bg-success/10 text-success border border-success/20 rounded-md font-mono"
                   >
                     {scope}
                   </span>
@@ -96,13 +96,13 @@ export function AuthStatus() {
           )}
 
           {authStatus?.missingScopes && authStatus.missingScopes.length > 0 && (
-            <div className="pt-2 border-t border-border-subtle">
-              <p className="text-xs text-error mb-1">Missing required scopes:</p>
-              <div className="flex flex-wrap gap-1">
+            <div>
+              <p className="text-xs text-danger mb-2 uppercase tracking-wide">Missing Required Scopes</p>
+              <div className="flex flex-wrap gap-2">
                 {authStatus.missingScopes.map(scope => (
                   <span
                     key={scope}
-                    className="px-2 py-0.5 text-xs bg-error/10 text-error rounded"
+                    className="px-2.5 py-1 text-xs bg-danger/10 text-danger border border-danger/20 rounded-md font-mono"
                   >
                     {scope}
                   </span>

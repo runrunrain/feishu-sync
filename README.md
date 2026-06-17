@@ -121,7 +121,13 @@ npm run server:start
 ### 开发态快速启动（非打包）
 
 ```bash
-# 一键启动（vite + electron 内嵌 server，无需打包）
+# Windows：双击 start-dev.bat 或命令行执行
+start-dev.bat
+
+# Git Bash / macOS / Linux：
+./start-dev.sh
+
+# 或直接使用 npm 命令
 npm run dev:desktop
 
 # 链路说明：

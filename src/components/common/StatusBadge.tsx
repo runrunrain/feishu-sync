@@ -1,36 +1,50 @@
 /**
- * Status badge component
- * Displays status with color coding
+ * Status badge component - 中国风水墨徽标
+ * 统一状态视觉：success/warning/error/loading/seal
+ * 水墨青为主，朱红印章色为强调
  */
 
 interface StatusBadgeProps {
-  status: 'success' | 'warning' | 'error' | 'neutral' | 'loading';
+  status: 'success' | 'warning' | 'error' | 'neutral' | 'loading' | 'seal';
   children: React.ReactNode;
   className?: string;
+  size?: 'sm' | 'md';
 }
 
-export function StatusBadge({ status, children, className = '' }: StatusBadgeProps) {
-  const baseClasses = 'inline-flex items-center gap-1.5 px-2 py-1 rounded-md text-xs font-medium';
+export function StatusBadge({ status, children, className = '', size = 'md' }: StatusBadgeProps) {
+  const sizeClasses = {
+    sm: 'px-2 py-0.5 text-xs gap-1',
+    md: 'px-2.5 py-1 text-xs gap-1.5',
+  };
+
+  const dotSize = {
+    sm: 'w-1 h-1',
+    md: 'w-1.5 h-1.5',
+  };
+
+  const baseClasses = `inline-flex items-center rounded-md font-serif border ${sizeClasses[size]}`;
 
   const statusClasses = {
-    success: 'bg-success/10 text-success border border-success/20',
-    warning: 'bg-warning/10 text-warning border border-warning/20',
-    error: 'bg-error/10 text-error border border-error/20',
-    neutral: 'bg-bg-surface text-text-secondary border border-border-subtle',
-    loading: 'bg-accent/10 text-accent border border-accent/20',
+    success: 'bg-jade/10 text-jade border-jade/20',
+    warning: 'bg-seal/10 text-seal border-seal/20',
+    error: 'bg-seal-2/10 text-seal-2 border-seal-2/20',
+    neutral: 'bg-paper text-ink-faint border-line',
+    loading: 'bg-jade/10 text-jade border-jade/20',
+    seal: 'bg-seal/10 text-seal border-seal/20',
   };
 
   const dotColor = {
-    success: 'bg-success',
-    warning: 'bg-warning',
-    error: 'bg-error',
-    neutral: 'bg-text-tertiary',
-    loading: 'bg-accent animate-pulse',
+    success: 'bg-jade',
+    warning: 'bg-seal',
+    error: 'bg-seal-2',
+    neutral: 'bg-ink-faint',
+    loading: 'bg-jade animate-pulse',
+    seal: 'bg-seal animate-pulse-seal',
   };
 
   return (
     <span className={`${baseClasses} ${statusClasses[status]} ${className}`}>
-      <span className={`w-1.5 h-1.5 rounded-full ${dotColor[status]}`} />
+      <span className={`rounded-sm ${dotSize[size]} ${dotColor[status]}`} />
       {children}
     </span>
   );

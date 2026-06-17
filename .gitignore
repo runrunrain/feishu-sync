@@ -43,3 +43,8 @@ dev-pid.txt
 # TypeScript incremental cache
 *.tsbuildinfo
 server/tsconfig.tsbuildinfo
+# Verification screenshots (不入库)
+*.png
+*.jpg
+*.jpeg
+*.gif

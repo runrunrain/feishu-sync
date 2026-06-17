@@ -1,12 +1,13 @@
 /**
- * Configuration Panel
- * Full configuration form for all settings
+ * Configuration Panel - 按设计系统重新设计
+ * 卡片化表单，分组显示，定制输入框样式
  */
 
 import { useState, useEffect } from 'react';
 import { useConfig } from '../hooks/useConfig';
 import { Button } from './common/Button';
 import { Card, CardHeader, CardBody, CardFooter } from './common/Card';
+import { Input, Select, Toggle, Range } from './common/Input';
 import type { Config } from '../types';
 
 export function ConfigPanel() {
@@ -80,61 +81,42 @@ export function ConfigPanel() {
         <CardHeader>
           <h2 className="text-lg font-medium">LLM Settings</h2>
         </CardHeader>
-        <CardBody className="space-y-4">
-          <div>
-            <label className="block text-sm font-medium text-text-secondary mb-1">
-              Base URL
-            </label>
-            <input
-              type="url"
-              value={currentConfig.llm.baseUrl}
-              onChange={(e) => handleChange('llm', { ...currentConfig.llm, baseUrl: e.target.value })}
-              className="w-full px-3 py-2 bg-bg-surface border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-accent/40"
-              placeholder="https://api.deepseek.com"
-            />
-          </div>
+        <CardBody className="space-y-5">
+          <Input
+            label="Base URL"
+            type="url"
+            value={currentConfig.llm.baseUrl}
+            onChange={(e) => handleChange('llm', { ...currentConfig.llm, baseUrl: e.target.value })}
+            placeholder="https://api.deepseek.com"
+          />
 
-          <div>
-            <label className="block text-sm font-medium text-text-secondary mb-1">
-              API Key
-            </label>
-            <input
-              type="password"
-              value={currentConfig.llm.apiKey}
-              onChange={(e) => handleChange('llm', { ...currentConfig.llm, apiKey: e.target.value })}
-              className="w-full px-3 py-2 bg-bg-surface border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-accent/40"
-              placeholder="sk-..."
-            />
-          </div>
+          <Input
+            label="API Key"
+            type="password"
+            value={currentConfig.llm.apiKey}
+            onChange={(e) => handleChange('llm', { ...currentConfig.llm, apiKey: e.target.value })}
+            placeholder="sk-..."
+          />
 
-          <div>
-            <label className="block text-sm font-medium text-text-secondary mb-1">
-              Model
-            </label>
-            <select
-              value={currentConfig.llm.model}
-              onChange={(e) => handleChange('llm', { ...currentConfig.llm, model: e.target.value as 'deepseek-chat' | 'deepseek-reasoner' })}
-              className="w-full px-3 py-2 bg-bg-surface border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-accent/40"
-            >
-              <option value="deepseek-chat">deepseek-chat</option>
-              <option value="deepseek-reasoner">deepseek-reasoner</option>
-            </select>
-          </div>
+          <Select
+            label="Model"
+            value={currentConfig.llm.model}
+            onChange={(e) => handleChange('llm', { ...currentConfig.llm, model: e.target.value as 'deepseek-chat' | 'deepseek-reasoner' })}
+            options={[
+              { value: 'deepseek-chat', label: 'deepseek-chat' },
+              { value: 'deepseek-reasoner', label: 'deepseek-reasoner' },
+            ]}
+          />
 
-          <div>
-            <label className="block text-sm font-medium text-text-secondary mb-1">
-              Temperature: {currentConfig.llm.temperature}
-            </label>
-            <input
-              type="range"
-              min="0"
-              max="1"
-              step="0.1"
-              value={currentConfig.llm.temperature}
-              onChange={(e) => handleChange('llm', { ...currentConfig.llm, temperature: parseFloat(e.target.value) })}
-              className="w-full h-2 bg-bg-surface rounded-lg appearance-none cursor-pointer"
-            />
-          </div>
+          <Range
+            label="Temperature"
+            min="0"
+            max="1"
+            step="0.1"
+            value={currentConfig.llm.temperature}
+            onChange={(e) => handleChange('llm', { ...currentConfig.llm, temperature: parseFloat(e.target.value) })}
+            helperText="Lower = more focused, Higher = more creative"
+          />
         </CardBody>
       </Card>
 
@@ -143,37 +125,32 @@ export function ConfigPanel() {
         <CardHeader>
           <h2 className="text-lg font-medium">Sync Settings</h2>
         </CardHeader>
-        <CardBody className="space-y-4">
-          <div>
-            <label className="block text-sm font-medium text-text-secondary mb-1">
-              Poll Interval (minutes): {currentConfig.pollIntervalMinutes}
-            </label>
-            <input
-              type="number"
-              min="5"
-              max="1440"
-              value={currentConfig.pollIntervalMinutes}
-              onChange={(e) => handleChange('pollIntervalMinutes', parseInt(e.target.value) || 30)}
-              className="w-full px-3 py-2 bg-bg-surface border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-accent/40"
-            />
-            <p className="text-xs text-text-tertiary mt-1">Between 5 and 1440 minutes</p>
-          </div>
+        <CardBody className="space-y-5">
+          <Input
+            label="Poll Interval (minutes)"
+            type="number"
+            min="5"
+            max="1440"
+            value={currentConfig.pollIntervalMinutes}
+            onChange={(e) => handleChange('pollIntervalMinutes', parseInt(e.target.value) || 30)}
+            helperText="Between 5 and 1440 minutes"
+          />
 
           <div>
-            <label className="block text-sm font-medium text-text-secondary mb-1">
+            <label className="block text-sm font-medium text-text-secondary mb-1.5">
               Knowledge Base Root
             </label>
             <div className="flex gap-2">
-              <input
+              <Input
+                fullWidth
                 type="text"
                 value={currentConfig.knowledgeBaseRoot}
                 onChange={(e) => handleChange('knowledgeBaseRoot', e.target.value)}
-                className="flex-1 px-3 py-2 bg-bg-surface border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-accent/40"
                 placeholder="D:\WorkPace\公司知识库"
               />
               <Button
                 variant="secondary"
-                size="sm"
+                size="md"
                 onClick={handleOpenDataDirectory}
               >
                 Open
@@ -182,13 +159,14 @@ export function ConfigPanel() {
           </div>
 
           <div>
-            <label className="block text-sm font-medium text-text-secondary mb-1">
+            <label className="block text-sm font-medium text-text-secondary mb-1.5">
               Watched Root URLs
             </label>
             <div className="space-y-2">
               {currentConfig.watchedRootUrls.map((url, index) => (
                 <div key={index} className="flex gap-2">
-                  <input
+                  <Input
+                    fullWidth
                     type="url"
                     value={url}
                     onChange={(e) => {
@@ -196,12 +174,11 @@ export function ConfigPanel() {
                       newUrls[index] = e.target.value;
                       handleChange('watchedRootUrls', newUrls);
                     }}
-                    className="flex-1 px-3 py-2 bg-bg-surface border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-accent/40"
                     placeholder="https://..."
                   />
                   <Button
                     variant="ghost"
-                    size="sm"
+                    size="md"
                     onClick={() => {
                       const newUrls = currentConfig.watchedRootUrls.filter((_, i) => i !== index);
                       handleChange('watchedRootUrls', newUrls);
@@ -221,18 +198,13 @@ export function ConfigPanel() {
             </div>
           </div>
 
-          <div>
-            <label className="block text-sm font-medium text-text-secondary mb-1">
-              Lark CLI Path (optional)
-            </label>
-            <input
-              type="text"
-              value={currentConfig.larkCliPath || ''}
-              onChange={(e) => handleChange('larkCliPath', e.target.value || undefined)}
-              className="w-full px-3 py-2 bg-bg-surface border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-accent/40"
-              placeholder="Leave empty to use PATH"
-            />
-          </div>
+          <Input
+            label="Lark CLI Path (optional)"
+            type="text"
+            value={currentConfig.larkCliPath || ''}
+            onChange={(e) => handleChange('larkCliPath', e.target.value || undefined)}
+            placeholder="Leave empty to use PATH"
+          />
         </CardBody>
       </Card>
 
@@ -241,36 +213,20 @@ export function ConfigPanel() {
         <CardHeader>
           <h2 className="text-lg font-medium">Application</h2>
         </CardHeader>
-        <CardBody className="space-y-4">
-          <div className="flex items-center justify-between">
-            <div>
-              <label className="block text-sm font-medium text-text-primary">Auto Start</label>
-              <p className="text-xs text-text-tertiary">Start application on system boot</p>
-            </div>
-            <button
-              onClick={() => handleChange('enableAutoStart', !currentConfig.enableAutoStart)}
-              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${currentConfig.enableAutoStart ? 'bg-accent' : 'bg-bg-surface'}`}
-            >
-              <span
-                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${currentConfig.enableAutoStart ? 'translate-x-6' : 'translate-x-1'}`}
-              />
-            </button>
-          </div>
+        <CardBody className="space-y-5">
+          <Toggle
+            label="Auto Start"
+            checked={currentConfig.enableAutoStart}
+            onChange={(checked) => handleChange('enableAutoStart', checked)}
+            helperText="Start application on system boot"
+          />
 
-          <div className="flex items-center justify-between">
-            <div>
-              <label className="block text-sm font-medium text-text-primary">Notifications</label>
-              <p className="text-xs text-text-tertiary">Show notifications for sync events</p>
-            </div>
-            <button
-              onClick={() => handleChange('enableNotifications', !currentConfig.enableNotifications)}
-              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${currentConfig.enableNotifications ? 'bg-accent' : 'bg-bg-surface'}`}
-            >
-              <span
-                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${currentConfig.enableNotifications ? 'translate-x-6' : 'translate-x-1'}`}
-              />
-            </button>
-          </div>
+          <Toggle
+            label="Notifications"
+            checked={currentConfig.enableNotifications}
+            onChange={(checked) => handleChange('enableNotifications', checked)}
+            helperText="Show notifications for sync events"
+          />
         </CardBody>
         <CardFooter className="flex justify-between items-center">
           <div>

@@ -1,105 +1,252 @@
-:root {
-  /* Colors - 深色主题，参考蓝本但调整为适合工具应用的冷色调 */
-  --color-bg-base: #0f1419;
-  --color-bg-elevated: #1a1f26;
-  --color-bg-sunken: #090c10;
-  --color-bg-surface: #242a33;
-  --color-bg-hover: #2d343e;
-  --color-bg-active: #363e4a;
-  --color-border: #3a4149;
-  --color-border-subtle: #2a3037;
-  --color-border-focus: #4a9eff;
-  --color-text-primary: #e8eaed;
-  --color-text-secondary: #9aa0a8;
-  --color-text-tertiary: #6a7078;
-  --color-text-inverse: #0f1419;
-  --color-accent: #4a9eff;
-  --color-accent-hover: #5aaeff;
-  --color-accent-active: #3a8eef;
-  --color-accent-muted: rgba(74, 158, 255, 0.12);
-  --color-accent-subtle: rgba(74, 158, 255, 0.06);
-  --color-success: #3d9e8f;
-  --color-success-muted: rgba(61, 158, 143, 0.12);
-  --color-warning: #d4a030;
-  --color-warning-muted: rgba(212, 160, 48, 0.12);
-  --color-error: #d44848;
-  --color-error-muted: rgba(212, 72, 72, 0.12);
+/**
+ * 中国风水墨设计系统
+ * 宣纸米白 + 朱红印章 + 水墨青 + 墨色
+ * 纯系统字体，断网可读
+ */
+
+@theme inline {
+  /* Color System */
+  --color-bg-base: var(--paper);
+  --color-bg-elevated: var(--card-bg);
+  --color-bg-surface: var(--paper-2);
+  --color-bg-hover: var(--paper);
+  --color-bg-active: var(--paper);
+
+  /* Border Colors */
+  --color-border: var(--line);
+  --color-border-subtle: #e6ddc8;
+  --color-border-focus: var(--seal);
+
+  /* Text Colors */
+  --color-text-primary: var(--ink);
+  --color-text-secondary: var(--ink-soft);
+  --color-text-tertiary: var(--ink-faint);
+  --color-text-inverse: #fff;
+
+  /* Brand Colors */
+  --color-accent: var(--seal);
+  --color-accent-hover: var(--seal-2);
+  --color-accent-muted: rgba(158, 43, 37, 0.1);
+  --color-accent-subtle: rgba(158, 43, 37, 0.05);
+
+  /* Status Colors */
+  --color-success: var(--jade);
+  --color-success-muted: rgba(107, 142, 138, 0.1);
+  --color-warning: var(--seal);
+  --color-warning-muted: rgba(158, 43, 37, 0.1);
+  --color-error: var(--seal-2);
+  --color-error-muted: rgba(192, 57, 43, 0.1);
+
+  /* Sync Color - 朱红印章 */
+  --color-sync: var(--seal);
+  --color-sync-muted: rgba(158, 43, 37, 0.1);
+  --color-sync-subtle: rgba(158, 43, 37, 0.05);
 
   /* Typography */
-  --font-display: "Inter", system-ui, sans-serif;
-  --font-body: "Inter", system-ui, sans-serif;
-  --font-mono: "JetBrains Mono", "Source Code Pro", monospace;
+  --font-display: var(--kai);
+  --font-body: var(--serif);
+  --font-mono: "Consolas", "SF Mono", "Source Code Pro", monospace;
+}
+
+:root {
+  /* Paper & Ink Colors */
+  --paper: #f5f1e6;       /* 宣纸米白底 */
+  --paper-2: #efe9da;     /* 次级纸色 */
+  --card-bg: #fffdf7;     /* 内容卡片白 */
+  --ink: #2b2b2b;         /* 主墨色 */
+  --ink-soft: #4f4b44;    /* 次要文字 */
+  --ink-faint: #7d7668;   /* 辅助/注释 */
+
+  /* Seal Red - 印章朱红 */
+  --seal: #9e2b25;         /* 印章朱红 */
+  --seal-2: #c0392b;       /* 亮朱红 */
+
+  /* Jade Green - 水墨青 */
+  --jade: #6b8e8a;         /* 水墨青 */
+  --jade-soft: #9bb3ad;    /* 浅青 */
+
+  /* Line & Dark */
+  --line: #cabfa6;         /* 分隔线 */
+  --dark: #34322e;         /* 深色卡片底 */
+
+  /* Shadows */
+  --shadow-card: 0 6px 28px rgba(40, 34, 24, 0.14);
+  --shadow-sm: 0 2px 8px rgba(40, 34, 24, 0.08);
+  --shadow-md: 0 4px 16px rgba(40, 34, 24, 0.12);
+
+  /* Typography System */
+  /* 纯系统字体，无网络依赖 */
+  --serif: "Noto Serif SC", "Source Han Serif SC", "Songti SC", STSong, "SimSun", serif;
+  --kai: "KaiTi", "STKaiti", "Kaiti SC", "Songti SC", STSong, serif;
 
   /* Font Sizes */
-  --text-2xl: 28px;
-  --text-xl: 20px;
-  --text-lg: 16px;
-  --text-md: 14px;
-  --text-sm: 12px;
   --text-xs: 11px;
+  --text-sm: 12px;
+  --text-md: 14px;
+  --text-lg: 16px;
+  --text-xl: 18px;
+  --text-2xl: 20px;
+  --text-display-sm: 24px;
+  --text-display-md: 28px;
 
-  /* Spacing */
-  --space-2xs: 2px;
-  --space-xs: 4px;
-  --space-sm: 8px;
-  --space-md: 12px;
-  --space-lg: 16px;
-  --space-xl: 24px;
-  --space-2xl: 32px;
+  /* Line Heights */
+  --leading-tight: 1.4;
+  --leading-normal: 1.85;
+  --leading-relaxed: 2;
 
-  /* Radius */
+  /* Font Weights */
+  --font-normal: 400;
+  --font-medium: 500;
+  --font-semibold: 600;
+
+  /* Spacing Scale */
+  --space-0: 0;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+  --space-16: 64px;
+
+  /* Border Radius */
   --radius-xs: 2px;
   --radius-sm: 4px;
   --radius-md: 6px;
   --radius-lg: 8px;
   --radius-xl: 12px;
 
-  /* Shadows */
-  --shadow-sm: 0 1px 3px rgba(0,0,0,0.4);
-  --shadow-md: 0 4px 16px rgba(0,0,0,0.5);
-  --shadow-lg: 0 8px 32px rgba(0,0,0,0.6);
-
   /* Transitions */
-  --duration-fast: 160ms;
-  --duration-normal: 240ms;
+  --duration-instant: 100ms;
+  --duration-fast: 150ms;
+  --duration-normal: 250ms;
   --easing-default: cubic-bezier(0.4, 0, 0.2, 1);
 
-  /* Reset */
-  --background: var(--color-bg-base);
-  --foreground: var(--color-text-primary);
-  color-scheme: dark;
-}
+  /* Z-Index Scale */
+  --z-base: 0;
+  --z-dropdown: 100;
+  --z-sticky: 200;
+  --z-modal: 300;
 
-@theme inline {
-  --color-bg-base: var(--color-bg-base);
-  --color-bg-elevated: var(--color-bg-elevated);
-  --color-bg-sunken: var(--color-bg-sunken);
-  --color-bg-surface: var(--color-bg-surface);
-  --color-bg-hover: var(--color-bg-hover);
-  --color-bg-active: var(--color-bg-active);
-
-  --color-border: var(--color-border);
-  --color-border-subtle: var(--color-border-subtle);
-  --color-border-focus: var(--color-border-focus);
-
-  --color-text-primary: var(--color-text-primary);
-  --color-text-secondary: var(--color-text-secondary);
-  --color-text-tertiary: var(--color-text-tertiary);
-
-  --color-accent: var(--color-accent);
-  --color-accent-hover: var(--color-accent-hover);
-  --color-accent-muted: var(--color-accent-muted);
-
-  --color-success: var(--color-success);
-  --color-warning: var(--color-warning);
-  --color-error: var(--color-error);
-
-  --font-display: var(--font-display);
-  --font-body: var(--font-body);
+  /* Component Specific */
+  --sidebar-width: 56px;
+  --sync-pulse-height: 48px;
+  --content-max-width: 1200px;
 }
 
 @layer base {
+  * {
+    border-color: var(--line);
+  }
+
   body {
-    @apply bg-bg-base text-text-primary font-body antialiased;
+    background-color: var(--paper);
+    color: var(--ink);
+    font-family: var(--serif);
+    line-height: var(--leading-normal);
+    /* 水墨晕染背景 */
+    background:
+      radial-gradient(circle at 18% 12%, rgba(107, 142, 138, 0.18), transparent 42%),
+      radial-gradient(circle at 86% 88%, rgba(158, 43, 37, 0.10), transparent 46%),
+      var(--paper);
+    background-attachment: fixed;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* 标题用楷体 */
+  h1, h2, h3, h4, h5, h6 {
+    font-family: var(--kai);
+    font-weight: var(--font-medium);
+    color: var(--ink);
+  }
+
+  /* Mono font for code/data */
+  code, kbd, samp, .font-mono {
+    font-family: var(--font-mono);
+  }
+
+  /* Reduced motion respect */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+@layer utilities {
+  /* 朱红印章脉动动画 */
+  @keyframes pulse-seal {
+    0%, 100% {
+      opacity: 1;
+      transform: scale(1);
+    }
+    50% {
+      opacity: 0.75;
+      transform: scale(1.05);
+    }
+  }
+
+  .animate-pulse-seal {
+    animation: pulse-seal 2s ease-in-out infinite;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .animate-pulse-seal {
+      animation: none;
+    }
+  }
+
+  /* 朱红晕染效果 */
+  .glow-seal {
+    box-shadow: 0 0 12px rgba(158, 43, 37, 0.35);
+  }
+
+  /* 印章效果 */
+  .seal-stamp {
+    background: var(--seal);
+    color: #fff;
+    border-radius: 4px;
+    font-family: var(--kai);
+    letter-spacing: 2px;
+  }
+
+  /* Focus visible improvements */
+  .focus-ring {
+    outline: none;
+  }
+  .focus-ring:focus {
+    box-shadow: 0 0 0 2px var(--seal);
+  }
+
+  /* Custom scrollbar - 中国风格 */
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: var(--line) var(--paper);
+  }
+
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-track {
+    background: var(--paper);
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background-color: var(--line);
+    border-radius: 3px;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-thumb:hover {
+    background-color: var(--ink-soft);
   }
 }
