@@ -118,6 +118,25 @@ npm run server:start
 
 **访问地址**：前端 `http://localhost:5173`，server `http://127.0.0.1:3001`（Desktop Token 鉴权）
 
+### 开发态快速启动（非打包）
+
+```bash
+# 一键启动（vite + electron 内嵌 server，无需打包）
+npm run dev:desktop
+
+# 链路说明：
+# 1. 预编译 server/dist + dist-electron/main.cjs
+# 2. concurrently 并行启动 vite（5173）+ electron（内嵌 server）
+# 3. Electron 主进程内跑 server（better-sqlite3 ABI 115 一致，无冲突）
+# 4. 开发态 loadURL localhost:5173，自动打开 DevTools
+```
+
+**优势**：无需 electron-builder 打包（~99MB），快速验证前端 + 内嵌 server 链路。
+
+**热更新**：
+- 前端改：vite HMR 即时生效
+- server/main 改：重新 `npm run server:build && npm run electron:build` 后重启 dev:desktop
+
 ### 构建与打包
 
 ```bash

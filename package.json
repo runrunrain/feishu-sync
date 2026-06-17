@@ -14,6 +14,7 @@
     "server:start": "node server/dist/index.js",
     "electron:build": "esbuild electron/main.ts electron/preload.ts --bundle --platform=node --format=cjs --external:electron --external:../server/dist/index.js --outdir=dist-electron --entry-names=[name] --out-extension:.js=.cjs --banner:js=\"var __dirname = require('path').dirname(__filename);\"",
     "electron:dev": "cross-env NODE_ENV=development electron .",
+    "dev:desktop": "npm run server:build && npm run electron:build && concurrently -k -n VITE,ELECTRON \"npm run dev\" \"npm run electron:dev\"",
     "desktop:dist:win:x64": "node scripts/build-desktop-target.cjs --platform win32 --arch x64",
     "desktop:dist:mac:x64": "node scripts/build-desktop-target.cjs --platform darwin --arch x64",
     "desktop:dist:mac:arm64": "node scripts/build-desktop-target.cjs --platform darwin --arch arm64"
