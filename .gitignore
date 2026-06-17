@@ -35,3 +35,11 @@ Thumbs.db
 *.db
 *.db-journal
 csv-data/
+
+# Runtime PIDs
+*-pid.txt
+dev-pid.txt
+
+# TypeScript incremental cache
+*.tsbuildinfo
+server/tsconfig.tsbuildinfo
