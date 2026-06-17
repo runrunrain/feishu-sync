@@ -12,6 +12,10 @@ import {
   Cloud,
   Home,
   Activity,
+  GitCompare,
+  ScrollText,
+  SlidersHorizontal,
+  DownloadCloud,
 } from 'lucide-react';
 
 // Views
@@ -37,11 +41,11 @@ interface NavItem {
 
 const navItems: NavItem[] = [
   { id: 'home', label: 'Home', labelZh: '首页', icon: Home, shortcut: 'H' },
-  { id: 'changes', label: 'Changes', labelZh: '变更', icon: FileSearch, shortcut: 'C' },
+  { id: 'changes', label: 'Changes', labelZh: '变更', icon: GitCompare, shortcut: 'C' },
   { id: 'sync', label: 'Sync', labelZh: '同步', icon: RefreshCw, shortcut: 'S' },
-  { id: 'config', label: 'Config', labelZh: '配置', icon: Settings, shortcut: ',' },
-  { id: 'logs', label: 'Logs', labelZh: '日志', icon: FileText, shortcut: 'L' },
-  { id: 'updates', label: 'Updates', labelZh: '更新', icon: Cloud, shortcut: 'U' },
+  { id: 'config', label: 'Config', labelZh: '配置', icon: SlidersHorizontal, shortcut: ',' },
+  { id: 'logs', label: 'Logs', labelZh: '日志', icon: ScrollText, shortcut: 'L' },
+  { id: 'updates', label: 'Updates', labelZh: '更新', icon: DownloadCloud, shortcut: 'U' },
 ];
 
 // 楷体序号
@@ -123,16 +127,19 @@ function App() {
 
       {/* Main Layout */}
       <div className="flex-1 flex overflow-hidden">
-        {/* Icon Navigation - 56px */}
-        <nav className="w-[56px] bg-card-bg border-r border-line flex flex-col items-center py-3 gap-2 flex-shrink-0">
+        {/* Icon Navigation - 168px icon + 中文标签直接显示 */}
+        <nav className="w-[168px] bg-card-bg border-r border-line flex flex-col py-3 gap-1 flex-shrink-0">
           {/* Logo area */}
-          <div className="w-10 h-10 mb-2 flex items-center justify-center rounded-lg bg-paper border border-line">
-            <Activity className="w-5 h-5 text-seal" strokeWidth={2.5} />
+          <div className="px-3 mb-3 flex items-center gap-2">
+            <div className="w-8 h-8 flex items-center justify-center rounded-lg bg-paper border border-line">
+              <Activity className="w-4 h-4 text-seal" strokeWidth={2.5} />
+            </div>
+            <span className="text-sm font-semibold font-kai text-ink">飞书同步</span>
           </div>
 
-          <div className="w-8 h-px bg-line opacity-60 mb-2" />
+          <div className="px-3 mb-3 h-px bg-line opacity-60" />
 
-          {/* Navigation items */}
+          {/* Navigation items - icon + 中文标签直接显示 */}
           {navItems.map((item, index) => {
             const Icon = item.icon;
             const isActive = currentView === item.id;
@@ -143,49 +150,41 @@ function App() {
                 key={item.id}
                 onClick={() => setCurrentView(item.id)}
                 className={`
-                  w-10 h-10 rounded-lg flex items-center justify-center transition-all duration-fast relative group
+                  mx-2 h-10 px-3 rounded-lg flex items-center gap-2 transition-all duration-fast relative
                   ${isActive
-                    ? 'text-seal'
-                    : 'text-ink-faint hover:text-ink-soft'
+                    ? 'text-seal border-l-4 border-l-seal'
+                    : 'text-ink-soft hover:bg-paper hover:text-ink'
                   }
                 `}
-                title={`${item.labelZh} ${item.label}${item.shortcut ? ` (${item.shortcut})` : ''}`}
+                style={isActive ? { backgroundColor: 'rgba(158, 43, 37, 0.05)' } : undefined}
               >
-                <Icon className="w-5 h-5" />
-                {/* Active indicator - 朱红左边框 */}
-                {isActive && (
-                  <div className="absolute left-0 top-1/2 -translate-y-1/2 w-1 h-5 bg-seal rounded-r-full" />
-                )}
-                {/* Tooltip */}
-                <div className="absolute left-full ml-3 px-3 py-2 bg-card-bg border border-line rounded-md shadow-sm opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap z-50">
-                  <div className="flex items-center gap-2">
-                    {/* 楷体序号 */}
-                    <span className="text-seal font-kai text-sm">{navNum}</span>
-                    <span className="text-ink text-sm">{item.labelZh}</span>
-                  </div>
-                  {item.shortcut && <span className="text-ink-faint text-xs ml-4">[{item.shortcut}]</span>}
-                </div>
+                {/* 楷体序号（朱红小字） */}
+                <span className={`text-xs font-kai ${isActive ? 'text-seal' : 'text-ink-faint'}`}>
+                  {navNum}
+                </span>
+                <Icon className="w-4 h-4 flex-shrink-0" />
+                {/* 中文标签（宋体） */}
+                <span className="text-sm font-serif">{item.labelZh}</span>
+                {/* Active indicator - 朱红左边框已通过 border-l 实现 */}
               </button>
             );
           })}
 
           <div className="flex-1" />
 
-          {/* Settings at bottom */}
+          {/* Settings at bottom - icon + 标签 */}
           <button
             onClick={() => setCurrentView('config')}
-            className={`w-10 h-10 rounded-lg flex items-center justify-center transition-all duration-fast relative group
+            className={`mx-2 mb-2 h-10 px-3 rounded-lg flex items-center gap-2 transition-all duration-fast relative
               ${currentView === 'config'
-                ? 'text-seal'
-                : 'text-ink-faint hover:text-ink-soft'
+                ? 'text-seal border-l-4 border-l-seal'
+                : 'text-ink-soft hover:bg-paper hover:text-ink'
               }
             `}
-            title="配置"
+            style={currentView === 'config' ? { backgroundColor: 'rgba(158, 43, 37, 0.05)' } : undefined}
           >
-            <Settings className="w-5 h-5" />
-            {currentView === 'config' && (
-              <div className="absolute left-0 top-1/2 -translate-y-1/2 w-1 h-5 bg-seal rounded-r-full" />
-            )}
+            <SlidersHorizontal className="w-4 h-4 flex-shrink-0" />
+            <span className="text-sm font-serif">配置</span>
           </button>
         </nav>
 
