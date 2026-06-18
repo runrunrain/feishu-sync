@@ -37,6 +37,32 @@ export interface DocumentRecord {
   lastSyncedModifyTime: string;
   lastSyncedAt: string;
   status: 'synced' | 'changed' | 'error' | 'placeholder';
+  /**
+   * v0.2.0 mapping-expansion fields (all optional for backward compat with
+   * rows written by v0.1.0 code paths; SQLite ALTER ADD COLUMN yields NULL
+   * for existing rows, which we surface as null here).
+   */
+  parentNodeToken?: string | null;
+  spaceId?: string | null;
+  objEditTime?: number | null;
+  cloudDeleted?: number; // 0 | 1
+  lastSeenAt?: string | null;
+  localSortOrder?: number | null;
+}
+
+/**
+ * Sub-sheet granularity mapping (sheet_sheets table).
+ * A single feishu workbook (sheet) holds multiple sub-sheets, each tracked
+ * independently for finer-grained change detection.
+ */
+export interface SheetSheetRecord {
+  sheetObjToken: string;
+  sheetId: string;
+  sheetTitle: string;
+  localCsvPath: string;
+  localMdPath?: string | null;
+  lastSyncedModifyTime?: string | null;
+  status: 'synced' | 'changed' | 'error' | 'placeholder';
 }
 
 export interface ChangedDocument {

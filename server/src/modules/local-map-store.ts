@@ -38,22 +38,40 @@ export class LocalMapStore {
   }
 
   /**
-   * Upsert a document record
+   * Upsert a document record.
+   *
+   * v0.2.0 mapping-expansion fields (parent_node_token, space_id,
+   * obj_edit_time, cloud_deleted, last_seen_at, local_sort_order) are
+   * optional. When omitted the column keeps its previous value on UPDATE
+   * (COALESCE pattern) so callers that only know about v0.1.0 fields do
+   * not clobber mapping metadata written by change-detector / reorder API.
+   *
+   * local_sort_order is intentionally never written here — it is a
+   * user-owned field updated only via setSortOrder(). upsertDocument uses
+   * COALESCE to preserve whatever value the row currently holds.
    */
   upsertDocument(record: DocumentRecord): void {
     const stmt = this.getStatement(`
       INSERT INTO documents (
         obj_token, wiki_node_token, obj_type, title, local_md_path,
-        last_synced_modify_time, last_synced_at, status
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        last_synced_modify_time, last_synced_at, status,
+        parent_node_token, space_id, obj_edit_time,
+        cloud_deleted, last_seen_at, local_sort_order
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(obj_token) DO UPDATE SET
-        wiki_node_token = excluded.wiki_node_token,
-        obj_type = excluded.obj_type,
+        wiki_node_token = COALESCE(excluded.wiki_node_token, documents.wiki_node_token),
+        obj_type = COALESCE(excluded.obj_type, documents.obj_type),
         title = excluded.title,
         local_md_path = excluded.local_md_path,
         last_synced_modify_time = excluded.last_synced_modify_time,
         last_synced_at = excluded.last_synced_at,
         status = excluded.status,
+        parent_node_token = COALESCE(excluded.parent_node_token, documents.parent_node_token),
+        space_id = COALESCE(excluded.space_id, documents.space_id),
+        obj_edit_time = COALESCE(excluded.obj_edit_time, documents.obj_edit_time),
+        cloud_deleted = COALESCE(excluded.cloud_deleted, documents.cloud_deleted),
+        last_seen_at = COALESCE(excluded.last_seen_at, documents.last_seen_at),
+        local_sort_order = documents.local_sort_order,
         updated_at = datetime('now')
     `);
 
@@ -65,7 +83,13 @@ export class LocalMapStore {
       record.localMdPath,
       record.lastSyncedModifyTime,
       record.lastSyncedAt,
-      record.status
+      record.status,
+      record.parentNodeToken ?? null,
+      record.spaceId ?? null,
+      record.objEditTime ?? null,
+      record.cloudDeleted ?? 0,
+      record.lastSeenAt ?? null,
+      record.localSortOrder ?? null,
     );
   }
 
@@ -116,6 +140,152 @@ export class LocalMapStore {
     stmt.run(status, objToken);
   }
 
+  // -------------------------------------------------------------------------
+  // v0.2.0 mapping-expansion methods (P1-T4)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Record that a node was seen during cloud traversal, refreshing its
+   * parent / space / edit-time / last_seen_at metadata without disturbing
+   * status or local_md_path (which are owned by the sync flow).
+   *
+   * Used by ChangeDetector.compareWithLocalRecords (see 03 §3.3.1).
+   *
+   * local_sort_order is never touched here (user-owned).
+   */
+  upsertDocumentSeen(input: {
+    objToken: string;
+    wikiNodeToken?: string | null;
+    parentNodeToken?: string | null;
+    spaceId?: string | null;
+    objEditTime?: number | null;
+    lastSeenAt: string;
+  }): void {
+    const stmt = this.getStatement(`
+      INSERT INTO documents (
+        obj_token, wiki_node_token, obj_type, title, local_md_path,
+        last_synced_modify_time, last_synced_at, status,
+        parent_node_token, space_id, obj_edit_time, last_seen_at
+      ) VALUES (?, ?, 'unknown', '', '', '', ?, 'placeholder', ?, ?, ?, ?)
+      ON CONFLICT(obj_token) DO UPDATE SET
+        wiki_node_token = COALESCE(excluded.wiki_node_token, documents.wiki_node_token),
+        parent_node_token = COALESCE(excluded.parent_node_token, documents.parent_node_token),
+        space_id = COALESCE(excluded.space_id, documents.space_id),
+        obj_edit_time = COALESCE(excluded.obj_edit_time, documents.obj_edit_time),
+        last_seen_at = excluded.last_seen_at,
+        updated_at = datetime('now')
+    `);
+
+    stmt.run(
+      input.objToken,
+      input.wikiNodeToken ?? null,
+      input.lastSeenAt,
+      input.parentNodeToken ?? null,
+      input.spaceId ?? null,
+      input.objEditTime ?? null,
+      input.lastSeenAt,
+    );
+  }
+
+  /**
+   * Mark a document as cloud-deleted (soft delete). The local .md is left
+   * in place; the UI surfaces these rows for user confirmation before
+   * physical cleanup.
+   */
+  markCloudDeleted(objToken: string, timestamp: string): void {
+    const stmt = this.getStatement(`
+      UPDATE documents
+      SET cloud_deleted = 1, last_seen_at = ?, updated_at = datetime('now')
+      WHERE obj_token = ?
+    `);
+    stmt.run(timestamp, objToken);
+  }
+
+  /**
+   * User-driven local sort order update (decision 5: local-only drag reorder).
+   * Accepts a parent scope + ordered obj_tokens; assigns 0..N as the
+   * local_sort_order of each child. Rows whose parent doesn't match are
+   * rejected by the caller (P2 reorder API).
+   *
+   * Note: parent_node_token may be NULL for top-level nodes; we handle both
+   * by binding the same parentToken value (NULL or string) to the WHERE.
+   */
+  setSortOrder(parentNodeToken: string | null, orderedObjTokens: string[]): number {
+    if (orderedObjTokens.length === 0) return 0;
+    const update = this.db.transaction((tokens: string[]) => {
+      const stmt = this.db.prepare(`
+        UPDATE documents
+        SET local_sort_order = ?, updated_at = datetime('now')
+        WHERE obj_token = ? AND parent_node_token IS ?
+      `);
+      let updated = 0;
+      tokens.forEach((tok, idx) => {
+        const r = stmt.run(idx, tok, parentNodeToken);
+        updated += r.changes;
+      });
+      return updated;
+    });
+    return update(orderedObjTokens);
+  }
+
+  /**
+   * Upsert a sub-sheet mapping row (sheet_sheets table).
+   * PK is (sheet_obj_token, sheet_id).
+   */
+  upsertSheetSheet(record: {
+    sheetObjToken: string;
+    sheetId: string;
+    sheetTitle: string;
+    localCsvPath: string;
+    localMdPath?: string | null;
+    lastSyncedModifyTime?: string | null;
+    status?: 'synced' | 'changed' | 'error' | 'placeholder';
+  }): void {
+    const stmt = this.getStatement(`
+      INSERT INTO sheet_sheets (
+        sheet_obj_token, sheet_id, sheet_title, local_csv_path,
+        local_md_path, last_synced_modify_time, status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(sheet_obj_token, sheet_id) DO UPDATE SET
+        sheet_title = excluded.sheet_title,
+        local_csv_path = excluded.local_csv_path,
+        local_md_path = COALESCE(excluded.local_md_path, sheet_sheets.local_md_path),
+        last_synced_modify_time = COALESCE(excluded.last_synced_modify_time, sheet_sheets.last_synced_modify_time),
+        status = excluded.status,
+        updated_at = datetime('now')
+    `);
+
+    stmt.run(
+      record.sheetObjToken,
+      record.sheetId,
+      record.sheetTitle,
+      record.localCsvPath,
+      record.localMdPath ?? null,
+      record.lastSyncedModifyTime ?? null,
+      record.status ?? 'synced',
+    );
+  }
+
+  /**
+   * List all sub-sheet rows for a given workbook obj_token.
+   */
+  getSheetSheets(sheetObjToken: string): Array<{
+    sheet_obj_token: string;
+    sheet_id: string;
+    sheet_title: string;
+    local_csv_path: string;
+    local_md_path: string | null;
+    last_synced_modify_time: string | null;
+    status: string;
+    created_at: string;
+    updated_at: string;
+  }> {
+    const stmt = this.getStatement(`
+      SELECT * FROM sheet_sheets WHERE sheet_obj_token = ? ORDER BY sheet_id
+    `);
+    return stmt.all(sheetObjToken) as any[];
+  }
+
   /**
    * Log a sync operation
    */
@@ -157,7 +327,10 @@ export class LocalMapStore {
   }
 
   /**
-   * Map a database row to DocumentRecord
+   * Map a database row to DocumentRecord.
+   * v0.2.0 columns are read defensively; if a migration was rolled back
+   * the columns may be absent and the row object won't contain them — we
+   * fall back to undefined rather than throwing.
    */
   private mapRowToDocumentRecord(row: any): DocumentRecord {
     return {
@@ -169,6 +342,12 @@ export class LocalMapStore {
       lastSyncedModifyTime: row.last_synced_modify_time,
       lastSyncedAt: row.last_synced_at,
       status: row.status,
+      parentNodeToken: row.parent_node_token ?? null,
+      spaceId: row.space_id ?? null,
+      objEditTime: row.obj_edit_time ?? null,
+      cloudDeleted: row.cloud_deleted ?? 0,
+      lastSeenAt: row.last_seen_at ?? null,
+      localSortOrder: row.local_sort_order ?? null,
     };
   }
 

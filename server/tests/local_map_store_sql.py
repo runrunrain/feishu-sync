@@ -1,0 +1,411 @@
+#!/usr/bin/env python3
+"""
+SQL-equivalence test for LocalMapStore v0.2.0 methods.
+
+Context: the project's better-sqlite3 native binding is compiled for
+Electron 31 (NODE_MODULE_VERSION 125), so it cannot be loaded from plain
+`node` v24 (NODE_MODULE_VERSION 137) which is what vitest uses. Running
+`electron-rebuild` to fix this would break the desktop runtime.
+
+This script mirrors the SQL emitted by LocalMapStore's v0.2.0 methods
+against an in-memory SQLite DB (Python builtin sqlite3) and asserts the
+same behavioral contracts the TS test would have. The actual TS code is
+covered by `tsc --noEmit`; the SQL strings it sends are reproduced
+verbatim here so the test exercises the real queries.
+
+Run: python3 server/tests/local_map_store_sql.py
+Exit 0 = all pass.
+"""
+from __future__ import annotations
+
+import sqlite3
+import sys
+
+
+def fresh_db() -> sqlite3.Connection:
+    """Schema mirroring post-migration-v2 state."""
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE documents (
+          obj_token TEXT PRIMARY KEY,
+          wiki_node_token TEXT,
+          obj_type TEXT NOT NULL CHECK(obj_type IN ('docx','sheet','slides','unknown')),
+          title TEXT NOT NULL,
+          local_md_path TEXT NOT NULL,
+          last_synced_modify_time TEXT NOT NULL,
+          last_synced_at TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'synced' CHECK(status IN ('synced','changed','error','placeholder')),
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+          parent_node_token TEXT,
+          space_id TEXT,
+          obj_edit_time INTEGER,
+          cloud_deleted INTEGER NOT NULL DEFAULT 0,
+          last_seen_at TEXT,
+          local_sort_order INTEGER
+        );
+        CREATE TABLE sheet_sheets (
+          sheet_obj_token TEXT NOT NULL,
+          sheet_id        TEXT NOT NULL,
+          sheet_title     TEXT NOT NULL,
+          local_csv_path  TEXT NOT NULL,
+          local_md_path   TEXT,
+          last_synced_modify_time TEXT,
+          status          TEXT NOT NULL DEFAULT 'synced' CHECK(status IN ('synced','changed','error','placeholder')),
+          created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+          PRIMARY KEY (sheet_obj_token, sheet_id),
+          FOREIGN KEY (sheet_obj_token) REFERENCES documents(obj_token) ON DELETE CASCADE
+        );
+        CREATE TABLE sync_log (
+          sync_id TEXT PRIMARY KEY,
+          started_at TEXT NOT NULL,
+          completed_at TEXT,
+          success_count INTEGER NOT NULL DEFAULT 0,
+          error_count INTEGER NOT NULL DEFAULT 0,
+          duration INTEGER,
+          context TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE run_log (
+          log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+          level TEXT NOT NULL CHECK(level IN ('debug','info','warn','error')),
+          message TEXT NOT NULL,
+          context TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        """
+    )
+    return conn
+
+
+def assert_eq(label: str, got, expected) -> None:
+    if got != expected:
+        print(f"FAIL {label}\n  expected: {expected!r}\n  got:      {got!r}")
+        sys.exit(1)
+    print(f"PASS {label}")
+
+
+def test_upsert_roundtrip():
+    conn = fresh_db()
+    upsert_document(conn, dict(
+        objToken="TOK1", wikiNodeToken="WNT1", objType="docx",
+        title="doc1", localMdPath="/d/doc1.md",
+        lastSyncedModifyTime="2026-06-18T00:00:00Z",
+        lastSyncedAt="2026-06-18T00:00:00Z", status="synced",
+        parentNodeToken="PARENT_A", spaceId="SPACE_X",
+        objEditTime=1718700000, cloudDeleted=0,
+        lastSeenAt="2026-06-18T00:00:00Z", localSortOrder=3,
+    ))
+    row = conn.execute(
+        "SELECT parent_node_token, space_id, obj_edit_time, cloud_deleted, last_seen_at, local_sort_order FROM documents WHERE obj_token='TOK1'"
+    ).fetchone()
+    assert_eq("upsert roundtrip parent", row[0], "PARENT_A")
+    assert_eq("upsert roundtrip space", row[1], "SPACE_X")
+    assert_eq("upsert roundtrip obj_edit_time", row[2], 1718700000)
+    assert_eq("upsert roundtrip cloud_deleted", row[3], 0)
+    assert_eq("upsert roundtrip local_sort_order", row[5], 3)
+
+
+def test_partial_update_preserves_mapping():
+    conn = fresh_db()
+    upsert_document(conn, dict(
+        objToken="TOK2", wikiNodeToken="WNT2", objType="docx",
+        title="orig", localMdPath="/d/orig.md",
+        lastSyncedModifyTime="2026-06-18T00:00:00Z",
+        lastSyncedAt="2026-06-18T00:00:00Z", status="synced",
+        parentNodeToken="PARENT_B", spaceId="SPACE_Y",
+        objEditTime=1718800000,
+    ))
+    # Subsequent write with only v0.1.0 fields (NULL parentNodeToken etc.)
+    upsert_document(conn, dict(
+        objToken="TOK2", wikiNodeToken=None, objType="docx",
+        title="updated title", localMdPath="/d/updated.md",
+        lastSyncedModifyTime="2026-06-18T01:00:00Z",
+        lastSyncedAt="2026-06-18T01:00:00Z", status="synced",
+        parentNodeToken=None, spaceId=None, objEditTime=None,
+        cloudDeleted=None, lastSeenAt=None, localSortOrder=None,
+    ))
+    row = conn.execute(
+        "SELECT title, local_md_path, parent_node_token, space_id, obj_edit_time FROM documents WHERE obj_token='TOK2'"
+    ).fetchone()
+    assert_eq("partial update title", row[0], "updated title")
+    assert_eq("partial update local_md_path", row[1], "/d/updated.md")
+    assert_eq("partial update parent preserved", row[2], "PARENT_B")
+    assert_eq("partial update space preserved", row[3], "SPACE_Y")
+    assert_eq("partial update obj_edit_time preserved", row[4], 1718800000)
+
+
+def test_upsert_document_seen_inserts_placeholder():
+    conn = fresh_db()
+    upsert_document_seen(conn, dict(
+        objToken="NEW", wikiNodeToken="WNT_NEW",
+        parentNodeToken="PARENT_NEW", spaceId="SPACE_NEW",
+        objEditTime=1718900000, lastSeenAt="2026-06-18T02:00:00Z",
+    ))
+    row = conn.execute(
+        "SELECT parent_node_token, space_id, obj_edit_time, last_seen_at, status FROM documents WHERE obj_token='NEW'"
+    ).fetchone()
+    assert_eq("upsert seen parent", row[0], "PARENT_NEW")
+    assert_eq("upsert seen status placeholder", row[4], "placeholder")
+
+
+def test_upsert_document_seen_preserves_sync_fields():
+    conn = fresh_db()
+    upsert_document(conn, dict(
+        objToken="EX", wikiNodeToken=None, objType="docx",
+        title="real", localMdPath="/d/real.md",
+        lastSyncedModifyTime="2026-06-18T00:00:00Z",
+        lastSyncedAt="2026-06-18T00:00:00Z", status="synced",
+    ))
+    upsert_document_seen(conn, dict(
+        objToken="EX", wikiNodeToken="WNT_REAL",
+        parentNodeToken="PARENT_REAL", spaceId="SPACE_REAL",
+        objEditTime=1719000000, lastSeenAt="2026-06-18T03:00:00Z",
+    ))
+    row = conn.execute(
+        "SELECT title, local_md_path, status, parent_node_token, obj_edit_time, wiki_node_token FROM documents WHERE obj_token='EX'"
+    ).fetchone()
+    assert_eq("seen preserves title", row[0], "real")
+    assert_eq("seen preserves local_md_path", row[1], "/d/real.md")
+    assert_eq("seen preserves status", row[2], "synced")
+    assert_eq("seen updates parent", row[3], "PARENT_REAL")
+    assert_eq("seen updates obj_edit_time", row[4], 1719000000)
+    assert_eq("seen updates wiki_node_token", row[5], "WNT_REAL")
+
+
+def test_mark_cloud_deleted():
+    conn = fresh_db()
+    upsert_document(conn, dict(
+        objToken="DOOMED", wikiNodeToken=None, objType="docx",
+        title="d", localMdPath="/d/d.md",
+        lastSyncedModifyTime="2026-06-18T00:00:00Z",
+        lastSyncedAt="2026-06-18T00:00:00Z", status="synced",
+    ))
+    conn.execute(
+        "UPDATE documents SET cloud_deleted=1, last_seen_at=?, updated_at=datetime('now') WHERE obj_token=?",
+        ("2026-06-18T04:00:00Z", "DOOMED"),
+    )
+    row = conn.execute(
+        "SELECT cloud_deleted, last_seen_at FROM documents WHERE obj_token='DOOMED'"
+    ).fetchone()
+    assert_eq("mark cloud_deleted=1", row[0], 1)
+    assert_eq("mark last_seen_at", row[1], "2026-06-18T04:00:00Z")
+
+
+def test_sheet_sheets_upsert_and_get():
+    conn = fresh_db()
+    upsert_document(conn, dict(
+        objToken="SHP", wikiNodeToken=None, objType="sheet",
+        title="parent", localMdPath="/d/p.md",
+        lastSyncedModifyTime="2026-06-18T00:00:00Z",
+        lastSyncedAt="2026-06-18T00:00:00Z", status="synced",
+    ))
+    upsert_sheet_sheet(conn, dict(
+        sheetObjToken="SHP", sheetId="sub1", sheetTitle="Sub 1",
+        localCsvPath="/d/sub1.csv", localMdPath="/d/sub1.md",
+    ))
+    upsert_sheet_sheet(conn, dict(
+        sheetObjToken="SHP", sheetId="sub2", sheetTitle="Sub 2",
+        localCsvPath="/d/sub2.csv",
+    ))
+    rows = conn.execute(
+        "SELECT sheet_id FROM sheet_sheets WHERE sheet_obj_token='SHP' ORDER BY sheet_id"
+    ).fetchall()
+    assert_eq("sheet_sheets count", len(rows), 2)
+    assert_eq("sheet_sheets sub1", rows[0][0], "sub1")
+    assert_eq("sheet_sheets sub2", rows[1][0], "sub2")
+
+
+def test_sheet_sheets_upsert_preserves_md_path():
+    conn = fresh_db()
+    upsert_document(conn, dict(
+        objToken="SH2", wikiNodeToken=None, objType="sheet",
+        title="p2", localMdPath="/d/p2.md",
+        lastSyncedModifyTime="2026-06-18T00:00:00Z",
+        lastSyncedAt="2026-06-18T00:00:00Z", status="synced",
+    ))
+    upsert_sheet_sheet(conn, dict(
+        sheetObjToken="SH2", sheetId="a", sheetTitle="A",
+        localCsvPath="/d/a.csv", localMdPath="/d/a.md",
+    ))
+    upsert_sheet_sheet(conn, dict(
+        sheetObjToken="SH2", sheetId="a", sheetTitle="A (renamed)",
+        localCsvPath="/d/a.csv",
+    ))
+    row = conn.execute(
+        "SELECT sheet_title, local_md_path FROM sheet_sheets WHERE sheet_obj_token='SH2' AND sheet_id='a'"
+    ).fetchone()
+    assert_eq("sheet_sheets title renamed", row[0], "A (renamed)")
+    assert_eq("sheet_sheets md_path preserved", row[1], "/d/a.md")
+
+
+def test_set_sort_order_scoped_by_parent():
+    conn = fresh_db()
+    for tok, parent in [("C1", "PX"), ("C2", "PX"), ("C3", "PX"), ("D1", "PY")]:
+        upsert_document(conn, dict(
+            objToken=tok, wikiNodeToken=None, objType="docx",
+            title=tok, localMdPath=f"/d/{tok}.md",
+            lastSyncedModifyTime="2026-06-18T00:00:00Z",
+            lastSyncedAt="2026-06-18T00:00:00Z", status="synced",
+            parentNodeToken=parent,
+        ))
+    updated = set_sort_order(conn, "PX", ["C3", "C1", "C2"])
+    assert_eq("set_sort_order updated count", updated, 3)
+    so = {r[0]: r[1] for r in conn.execute(
+        "SELECT obj_token, local_sort_order FROM documents WHERE obj_token IN ('C1','C2','C3','D1')"
+    ).fetchall()}
+    assert_eq("sort C3 first", so["C3"], 0)
+    assert_eq("sort C1 second", so["C1"], 1)
+    assert_eq("sort C2 third", so["C2"], 2)
+    assert_eq("sort D1 untouched", so["D1"], None)
+
+
+def test_set_sort_order_rejects_cross_parent():
+    conn = fresh_db()
+    upsert_document(conn, dict(
+        objToken="ORPHAN", wikiNodeToken=None, objType="docx",
+        title="orphan", localMdPath="/d/o.md",
+        lastSyncedModifyTime="2026-06-18T00:00:00Z",
+        lastSyncedAt="2026-06-18T00:00:00Z", status="synced",
+        parentNodeToken="PX",
+    ))
+    updated = set_sort_order(conn, "PNONEXIST", ["ORPHAN"])
+    assert_eq("cross-parent rejected", updated, 0)
+    row = conn.execute(
+        "SELECT local_sort_order FROM documents WHERE obj_token='ORPHAN'"
+    ).fetchone()
+    assert_eq("cross-parent no write", row[0], None)
+
+
+# ---------------------------------------------------------------------------
+# SQL mirrors of LocalMapStore methods (verbatim from src code)
+# ---------------------------------------------------------------------------
+
+UPSERT_DOCUMENT_SQL = """
+INSERT INTO documents (
+  obj_token, wiki_node_token, obj_type, title, local_md_path,
+  last_synced_modify_time, last_synced_at, status,
+  parent_node_token, space_id, obj_edit_time,
+  cloud_deleted, last_seen_at, local_sort_order
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(obj_token) DO UPDATE SET
+  wiki_node_token = COALESCE(excluded.wiki_node_token, documents.wiki_node_token),
+  obj_type = COALESCE(excluded.obj_type, documents.obj_type),
+  title = excluded.title,
+  local_md_path = excluded.local_md_path,
+  last_synced_modify_time = excluded.last_synced_modify_time,
+  last_synced_at = excluded.last_synced_at,
+  status = excluded.status,
+  parent_node_token = COALESCE(excluded.parent_node_token, documents.parent_node_token),
+  space_id = COALESCE(excluded.space_id, documents.space_id),
+  obj_edit_time = COALESCE(excluded.obj_edit_time, documents.obj_edit_time),
+  cloud_deleted = COALESCE(excluded.cloud_deleted, documents.cloud_deleted),
+  last_seen_at = COALESCE(excluded.last_seen_at, documents.last_seen_at),
+  local_sort_order = documents.local_sort_order,
+  updated_at = datetime('now')
+"""
+
+UPSERT_DOCUMENT_SEEN_SQL = """
+INSERT INTO documents (
+  obj_token, wiki_node_token, obj_type, title, local_md_path,
+  last_synced_modify_time, last_synced_at, status,
+  parent_node_token, space_id, obj_edit_time, last_seen_at
+) VALUES (?, ?, 'unknown', '', '', '', ?, 'placeholder', ?, ?, ?, ?)
+ON CONFLICT(obj_token) DO UPDATE SET
+  wiki_node_token = COALESCE(excluded.wiki_node_token, documents.wiki_node_token),
+  parent_node_token = COALESCE(excluded.parent_node_token, documents.parent_node_token),
+  space_id = COALESCE(excluded.space_id, documents.space_id),
+  obj_edit_time = COALESCE(excluded.obj_edit_time, documents.obj_edit_time),
+  last_seen_at = excluded.last_seen_at,
+  updated_at = datetime('now')
+"""
+
+UPSERT_SHEET_SHEET_SQL = """
+INSERT INTO sheet_sheets (
+  sheet_obj_token, sheet_id, sheet_title, local_csv_path,
+  local_md_path, last_synced_modify_time, status
+) VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(sheet_obj_token, sheet_id) DO UPDATE SET
+  sheet_title = excluded.sheet_title,
+  local_csv_path = excluded.local_csv_path,
+  local_md_path = COALESCE(excluded.local_md_path, sheet_sheets.local_md_path),
+  last_synced_modify_time = COALESCE(excluded.last_synced_modify_time, sheet_sheets.last_synced_modify_time),
+  status = excluded.status,
+  updated_at = datetime('now')
+"""
+
+SET_SORT_ORDER_SQL = """
+UPDATE documents
+SET local_sort_order = ?, updated_at = datetime('now')
+WHERE obj_token = ? AND parent_node_token IS ?
+"""
+
+
+def upsert_document(conn, r):
+    conn.execute(
+        UPSERT_DOCUMENT_SQL,
+        (
+            r["objToken"], r.get("wikiNodeToken"), r["objType"], r["title"],
+            r["localMdPath"], r["lastSyncedModifyTime"], r["lastSyncedAt"],
+            r["status"], r.get("parentNodeToken"), r.get("spaceId"),
+            r.get("objEditTime"), r.get("cloudDeleted", 0) or 0,
+            r.get("lastSeenAt"), r.get("localSortOrder"),
+        ),
+    )
+
+
+def upsert_document_seen(conn, r):
+    conn.execute(
+        UPSERT_DOCUMENT_SEEN_SQL,
+        (
+            r["objToken"], r.get("wikiNodeToken"), r["lastSeenAt"],
+            r.get("parentNodeToken"), r.get("spaceId"), r.get("objEditTime"),
+            r["lastSeenAt"],
+        ),
+    )
+
+
+def upsert_sheet_sheet(conn, r):
+    conn.execute(
+        UPSERT_SHEET_SHEET_SQL,
+        (
+            r["sheetObjToken"], r["sheetId"], r["sheetTitle"],
+            r["localCsvPath"], r.get("localMdPath"),
+            r.get("lastSyncedModifyTime"),
+            r.get("status", "synced"),
+        ),
+    )
+
+
+def set_sort_order(conn, parent, ordered):
+    updated = 0
+    for idx, tok in enumerate(ordered):
+        cur = conn.execute(SET_SORT_ORDER_SQL, (idx, tok, parent))
+        updated += cur.rowcount
+    return updated
+
+
+def main():
+    print("=" * 60)
+    print("LocalMapStore v0.2.0 SQL-equivalence tests")
+    print("=" * 60)
+    test_upsert_roundtrip()
+    test_partial_update_preserves_mapping()
+    test_upsert_document_seen_inserts_placeholder()
+    test_upsert_document_seen_preserves_sync_fields()
+    test_mark_cloud_deleted()
+    test_sheet_sheets_upsert_and_get()
+    test_sheet_sheets_upsert_preserves_md_path()
+    test_set_sort_order_scoped_by_parent()
+    test_set_sort_order_rejects_cross_parent()
+    print("=" * 60)
+    print("All LocalMapStore SQL-equivalence tests passed.")
+    print("=" * 60)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
