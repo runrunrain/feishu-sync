@@ -3,7 +3,19 @@
  * All requests include X-Desktop-Token header from window.desktop
  */
 
-import type { Config, AuthStatus, ChangeDetectionResult, SyncResult, ServerHealth, ChangedDocument } from '../types';
+import type {
+  Config,
+  AuthStatus,
+  ChangeDetectionResult,
+  SyncResult,
+  ServerHealth,
+  ChangedDocument,
+  MappingNode,
+  DiffReport,
+  IndexSnapshot,
+  ReorderRequest,
+  ReorderResponse,
+} from '../types';
 
 class APIError extends Error {
   constructor(
@@ -159,6 +171,65 @@ export async function syncIndex(options?: {
   return request('/api/sync/index', {
     method: 'POST',
     body: JSON.stringify(options || {}),
+  });
+}
+
+// ============================================================================
+// Mapping API (v0.2.0 P2-T5/T6/T7/T10, consumed by P4 frontend)
+// ============================================================================
+
+/**
+ * GET /api/mapping/tree — flat MappingNode[] for client-side tree rebuild.
+ */
+export async function getMappingTree(): Promise<MappingNode[]> {
+  const data = await request<{ nodes: MappingNode[] }>('/api/mapping/tree');
+  return data.nodes ?? [];
+}
+
+/**
+ * GET /api/mapping/diff — DiffReport grouped by added/modified/deleted.
+ */
+export async function getMappingDiff(rootUrl: string): Promise<DiffReport> {
+  const qs = new URLSearchParams({ rootUrl });
+  return request<DiffReport>(`/api/mapping/diff?${qs.toString()}`);
+}
+
+/**
+ * GET /api/mapping/index — current _index.json snapshot (no regen).
+ * Returns 404 if the snapshot has not been generated yet; caller handles.
+ */
+export async function getMappingIndex(): Promise<IndexSnapshot | null> {
+  try {
+    return await request<IndexSnapshot>('/api/mapping/index');
+  } catch (err) {
+    // 404 → snapshot not generated yet; surface as null (not an error).
+    if (err instanceof APIError && err.statusCode === 404) return null;
+    throw err;
+  }
+}
+
+/**
+ * POST /api/mapping/refresh-index — force-regenerate _index.json.
+ */
+export async function refreshMappingIndex(): Promise<{
+  generated_at: string;
+  node_count: number;
+  orphan_count: number;
+  top_level_dirs: Array<{ dir: string; node_count: number }>;
+}> {
+  return request('/api/mapping/refresh-index', { method: 'POST' });
+}
+
+/**
+ * POST /api/mapping/reorder — local-only drag reorder (decision 5).
+ * Backend rejects cross-parent reorders with 400.
+ */
+export async function reorderMapping(
+  body: ReorderRequest,
+): Promise<ReorderResponse> {
+  return request<ReorderResponse>('/api/mapping/reorder', {
+    method: 'POST',
+    body: JSON.stringify(body),
   });
 }
 

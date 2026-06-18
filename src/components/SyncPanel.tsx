@@ -16,6 +16,7 @@ import {
   Paperclip,
   Table,
   Settings,
+  Activity,
 } from 'lucide-react';
 import { Card, CardHeader, CardBody } from './common/Card';
 import { Button } from './common/Button';
@@ -262,7 +263,7 @@ export function SyncPanel({
 
             <Button
               size="sm"
-              variant="sync"
+              variant="seal"
               onClick={handleSync}
               disabled={selectedDocuments.length === 0 || syncing}
             >

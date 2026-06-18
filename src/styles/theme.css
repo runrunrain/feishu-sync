@@ -42,10 +42,20 @@
   --color-sync-muted: rgba(158, 43, 37, 0.1);
   --color-sync-subtle: rgba(158, 43, 37, 0.05);
 
+  /* T5 R2.3 / 04 §6.1.2: change-state semantic colors (added/modified/deleted) */
+  --state-added: var(--jade);
+  --state-modified: var(--seal);
+  --state-deleted: var(--ink-faint);
+  --state-added-bg: rgba(107, 142, 138, 0.08);
+  --state-modified-bg: rgba(158, 43, 37, 0.06);
+  --state-deleted-bg: rgba(125, 118, 104, 0.08);
+
   /* Typography */
   --font-display: var(--kai);
   --font-body: var(--serif);
   --font-mono: "Consolas", "SF Mono", "Source Code Pro", monospace;
+  /* T5/04 §6.2: sans for badges/buttons/state text — clearer at small sizes than serif */
+  --font-sans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
 }
 
 :root {
@@ -69,10 +79,10 @@
   --line: #cabfa6;         /* 分隔线 */
   --dark: #34322e;         /* 深色卡片底 */
 
-  /* Shadows */
-  --shadow-card: 0 6px 28px rgba(40, 34, 24, 0.14);
-  --shadow-sm: 0 2px 8px rgba(40, 34, 24, 0.08);
-  --shadow-md: 0 4px 16px rgba(40, 34, 24, 0.12);
+  /* Shadows (T1 R2.5-AC2: softened, corner-blur removed) */
+  --shadow-sm: 0 1px 4px rgba(40, 34, 24, 0.06);
+  --shadow-md: 0 2px 8px rgba(40, 34, 24, 0.10);
+  --shadow-lg: 0 4px 16px rgba(40, 34, 24, 0.14);
 
   /* Typography System */
   /* 纯系统字体，无网络依赖 */
@@ -112,12 +122,12 @@
   --space-12: 48px;
   --space-16: 64px;
 
-  /* Border Radius */
+  /* Border Radius (T1 R2.5-AC2: unified 6px max, radius-xl deprecated) */
   --radius-xs: 2px;
   --radius-sm: 4px;
   --radius-md: 6px;
   --radius-lg: 8px;
-  --radius-xl: 12px;
+  /* radius-xl 12px intentionally removed (R2.5-AC2) */
 
   /* Transitions */
   --duration-instant: 100ms;
@@ -147,11 +157,8 @@
     color: var(--ink);
     font-family: var(--serif);
     line-height: var(--leading-normal);
-    /* 水墨晕染背景 */
-    background:
-      radial-gradient(circle at 18% 12%, rgba(107, 142, 138, 0.18), transparent 42%),
-      radial-gradient(circle at 86% 88%, rgba(158, 43, 37, 0.10), transparent 46%),
-      var(--paper);
+    /* T1 R2.5-AC1: removed radial-gradient double halo; solid paper background */
+    background: var(--paper);
     background-attachment: fixed;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
@@ -249,4 +256,52 @@
   .scrollbar-thin::-webkit-scrollbar-thumb:hover {
     background-color: var(--ink-soft);
   }
+
+  /* T5: change-state utility classes (added/modified/deleted) */
+  .state-added-fg { color: var(--state-added); }
+  .state-modified-fg { color: var(--state-modified); }
+  .state-deleted-fg { color: var(--state-deleted); }
+  .state-added-bg { background-color: var(--state-added-bg); }
+  .state-modified-bg { background-color: var(--state-modified-bg); }
+  .state-deleted-bg { background-color: var(--state-deleted-bg); }
+
+  /* Sans utility for badges/buttons/state text (04 §6.2) */
+  .font-sans-ui { font-family: var(--font-sans); }
+
+  /* T3 R2.2bis: drag-and-drop helpers (decision 5, same-level reorder only) */
+  .tree-node--dragging {
+    opacity: 0.5;
+    outline: 1px solid var(--seal);
+    outline-offset: -1px;
+  }
+  .tree-drop-indicator {
+    height: 2px;
+    background: var(--jade);
+    border-radius: 1px;
+    margin: 1px 0;
+  }
+
+  /* T9: Toast slide-in / Drawer slide-in (right side) */
+  @keyframes toast-in {
+    from { transform: translateX(16px); opacity: 0; }
+    to   { transform: translateX(0);    opacity: 1; }
+  }
+  .animate-toast-in { animation: toast-in 180ms ease-out; }
+
+  @keyframes drawer-in {
+    from { transform: translateX(100%); }
+    to   { transform: translateX(0); }
+  }
+  .animate-drawer-in { animation: drawer-in 220ms ease-out; }
+
+  @keyframes fade-in {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+  }
+  .animate-fade-in { animation: fade-in 220ms ease-out; }
+
+  /* Change-list row backgrounds by state (subtle, 04 §5.1) */
+  .row-state-added { background-color: var(--state-added-bg); }
+  .row-state-modified { background-color: var(--state-modified-bg); }
+  .row-state-deleted { background-color: var(--state-deleted-bg); }
 }

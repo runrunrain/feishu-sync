@@ -1,6 +1,7 @@
 /**
  * Card component - 宣纸风格卡片
- * 饱满布局，水墨风格，柔和阴影
+ * T1 R2.5-AC1/AC2: corner-blur decoration removed; rounded-md (6px) unified;
+ * softened shadows (theme.css shadow-sm/md/lg).
  */
 
 interface CardProps {
@@ -17,11 +18,7 @@ export function Card({ children, className = '', variant = 'default' }: CardProp
   };
 
   return (
-    <div className={`${variantClasses[variant]} rounded-lg ${className} relative overflow-hidden`}>
-      {/* 角落水墨晕染装饰（仅在 elevated 时显示） */}
-      {variant === 'elevated' && (
-        <div className="absolute -top-12 -left-12 w-24 h-24 bg-jade/8 rounded-full blur-xl pointer-events-none" />
-      )}
+    <div className={`${variantClasses[variant]} rounded-md ${className}`}>
       {children}
     </div>
   );

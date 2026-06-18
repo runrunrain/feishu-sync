@@ -4,7 +4,7 @@
  * 左：logo + 版本 | 中：朱红印章同步指示 | 右：主操作
  */
 
-import { Clock, Activity, CheckCircle, AlertCircle, RefreshCw, Wifi, WifiOff } from 'lucide-react';
+import { Clock, Activity, CheckCircle, RefreshCw, Wifi, WifiOff } from 'lucide-react';
 import { useSyncStatus } from '../hooks/useSyncStatus';
 
 interface SyncPulseProps {
@@ -40,9 +40,10 @@ export function SyncPulse({ onDetectNow, onSyncAll, authReady = false }: SyncPul
     return `${Math.floor(diff / 3600)} 小时后`;
   };
 
-  const pendingText = pendingCount > 0
+  const _pendingText = pendingCount > 0
     ? `${pendingCount} 篇待同步`
     : '全部已同步';
+  void _pendingText;
 
   return (
     <div className="h-[48px] bg-card-bg border-b border-line flex items-center justify-between px-4 relative">
