@@ -1,16 +1,20 @@
 /**
- * SettingsView - 设置主区（T2，04 §4.3）
+ * SettingsView - 设置主区（T2/T7/T8，04 §4.3）
  *
- * 本 Task（P4-1）：建占位框架 = AuthSettingsCard（复用现有 AuthStatus）+
- * AppUpdateCard（复用现有 UpdatePanel）+ 占位卡片。完整 KnowledgeSettingsCard /
- * LLMChannelSwitcher（P3 集成）/ ChannelConnectivityTester 留 P4-2。
+ * P4-2 完整版：四张子卡。
+ *   - KnowledgeSettingsCard（知识库 + 轮询 + lark-cli 路径，B4 配合）
+ *   - LLMChannelSwitcher（bigmodel 通道切换 + 共用配置 + 通道连通性测试）
+ *   - AuthSettingsCard（lark-cli 状态 + scope 列表 + 重检）
+ *   - AppUpdateCard（版本号 + 检查更新 + 自启动 + 通知开关）
  *
- * 文案中文化（T14）：复用现有组件，但本视图标题与子卡标题统一中文。
+ * 旧的 ConfigPanel/AuthStatus/UpdatePanel 三个组件被本视图的四张子卡取代。
+ * 旧组件文件暂留（避免删依赖），不再被 SettingsView 引用。
  */
 
-import { ConfigPanel } from '../components/ConfigPanel';
-import { AuthStatus } from '../components/AuthStatus';
-import { UpdatePanel } from '../components/UpdatePanel';
+import { KnowledgeSettingsCard } from '../components/KnowledgeSettingsCard';
+import { LLMChannelSwitcher } from '../components/LLMChannelSwitcher';
+import { AuthSettingsCard } from '../components/AuthSettingsCard';
+import { AppUpdateCard } from '../components/AppUpdateCard';
 import { Card, CardBody } from '../components/common/Card';
 
 export function SettingsView() {
@@ -25,14 +29,10 @@ export function SettingsView() {
         </CardBody>
       </Card>
 
-      {/* Knowledge + LLM (P3 集成未完，复用现有 ConfigPanel 占位) */}
-      <ConfigPanel />
-
-      {/* Auth */}
-      <AuthStatus />
-
-      {/* Update */}
-      <UpdatePanel />
+      <KnowledgeSettingsCard />
+      <LLMChannelSwitcher />
+      <AuthSettingsCard />
+      <AppUpdateCard />
     </div>
   );
 }

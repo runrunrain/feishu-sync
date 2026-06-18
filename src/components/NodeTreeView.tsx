@@ -10,7 +10,8 @@
  * 决策1：业务标记 [T][D][R] 作为独立小标签展示（不嵌入标题）。
  *
  * 搜索：标题模糊匹配；命中节点高亮 + 自动展开父级路径。
- * 过滤：全部 / 仅变更 / 仅错误 / 仅孤儿（孤儿基于 local_path 解析）。
+ * 过滤：全部 / 仅变更 / 仅错误 / 仅孤儿（孤儿基于 _index.json.orphan_files，
+ *       由父组件通过 orphanPaths prop 注入；详见 P1-1 修复说明）。
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -40,6 +41,18 @@ interface NodeTreeViewProps {
   onRefreshed?: () => void;
   /** Business marks keyed by obj_token (e.g. parsed from title or rules). */
   businessMarksByToken?: Record<string, string[]>;
+  /**
+   * P1-1 fix (谛听): set of local_path strings that are orphans per
+   * `_index.json.orphan_files`. The "仅孤儿" filter now matches this set
+   * instead of the unreliable `local_path.includes('orphan')` heuristic
+   * (MappingNode has no orphan marker field, and `/api/mapping/tree`
+   * excludes true orphans because they have no obj_token).
+   *
+   * When empty, the "仅孤儿" filter renders an empty list (which is
+   * accurate: no orphans found). The OrphanFileAlert (T11) is the
+   * dedicated UI surface for surfacing orphan_files.
+   */
+  orphanPaths?: Set<string>;
   /** ClassName override for embedding in narrow layouts. */
   className?: string;
 }
@@ -87,6 +100,7 @@ export function NodeTreeView({
   onSelect,
   onRefreshed,
   businessMarksByToken,
+  orphanPaths,
   className = '',
 }: NodeTreeViewProps) {
   const [nodes, setNodes] = useState<MappingNode[]>(nodesProp ?? []);
@@ -168,7 +182,17 @@ export function NodeTreeView({
       // Filter
       if (filter === 'changed' && !(n.status === 'changed' || n.cloud_deleted === 1)) continue;
       if (filter === 'error' && n.status !== 'error') continue;
-      if (filter === 'orphan' && !(n.local_path.includes('orphan') || n.status === 'placeholder')) continue;
+      // P1-1 fix: orphan filter previously matched `local_path.includes('orphan')`
+      // or `status === 'placeholder'`, both unreliable. The true source of truth
+      // is `_index.json.orphan_files` (surfaced via the OrphanFileAlert component
+      // and passed in here as `orphanPaths`). Nodes in the tree generally have a
+      // valid obj_token (orphans are excluded from /api/mapping/tree), so this
+      // filter is mostly informational; the dedicated OrphanFileAlert is the
+      // authoritative UI for listing orphan files.
+      if (filter === 'orphan') {
+        if (!orphanPaths || orphanPaths.size === 0) continue;
+        if (!orphanPaths.has(n.local_path)) continue;
+      }
       // Search
       if (q && !n.title.toLowerCase().includes(q)) continue;
       result.add(n.obj_token);
@@ -182,7 +206,7 @@ export function NodeTreeView({
       }
     }
     return result;
-  }, [nodes, filter, search, tree]);
+  }, [nodes, filter, search, tree, orphanPaths]);
 
   useEffect(() => {
     if (search.trim()) {

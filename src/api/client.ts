@@ -15,6 +15,9 @@ import type {
   IndexSnapshot,
   ReorderRequest,
   ReorderResponse,
+  TrashedDoc,
+  ChannelTestRequest,
+  ChannelTestResult,
 } from '../types';
 
 class APIError extends Error {
@@ -228,6 +231,76 @@ export async function reorderMapping(
   body: ReorderRequest,
 ): Promise<ReorderResponse> {
   return request<ReorderResponse>('/api/mapping/reorder', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+// ============================================================================
+// Trash / Soft-Delete API (T10, decision 2)
+// ============================================================================
+//
+// NOTE: backend routes (GET /api/trash, POST /api/trash/restore,
+// DELETE /api/trash/purge) are NOT implemented as of HEAD 43121ef. The
+// client functions below target the intended contract; a 404 from the
+// server surfaces to the caller as an APIError, which the UI handles by
+// showing the empty state + a Toast hint that the endpoint is missing.
+
+/**
+ * GET /api/trash — list soft-deleted documents (cloud_deleted=1).
+ * Returns 404 if the backend has not implemented trash routes yet; caller
+ * handles by surfacing the empty drawer state.
+ */
+export async function listTrashedDocs(): Promise<TrashedDoc[]> {
+  try {
+    const data = await request<{ items: TrashedDoc[] } | TrashedDoc[]>('/api/trash');
+    return Array.isArray(data) ? data : (data.items ?? []);
+  } catch (err) {
+    if (err instanceof APIError && (err.statusCode === 404 || err.statusCode === 405)) return [];
+    throw err;
+  }
+}
+
+/**
+ * POST /api/trash/restore — restore a soft-deleted document (clears
+ * cloud_deleted flag and moves the file back to its original path).
+ */
+export async function restoreTrashedDoc(objToken: string): Promise<{ ok: true }> {
+  return request<{ ok: true }>('/api/trash/restore', {
+    method: 'POST',
+    body: JSON.stringify({ obj_token: objToken }),
+  });
+}
+
+/**
+ * DELETE /api/trash/purge — permanently delete a soft-deleted document
+ * (fs.unlink the local .md copy). Pass { all: true } to clear all trashed.
+ */
+export async function purgeTrashedDoc(objToken: string): Promise<{ purged: number }> {
+  return request<{ purged: number }>(`/api/trash/purge?obj_token=${encodeURIComponent(objToken)}`, {
+    method: 'DELETE',
+  });
+}
+
+export async function clearTrash(): Promise<{ purged: number }> {
+  return request<{ purged: number }>('/api/trash/purge?all=1', { method: 'DELETE' });
+}
+
+// ============================================================================
+// Channel Connectivity Test (T7, decision 3 real bigmodel call)
+// ============================================================================
+
+/**
+ * POST /api/llm/test-channel — real connectivity test against the currently
+ * selected channel (claude-cli or direct). Server sends a tiny hello prompt
+ * with a 3s timeout and returns the result without surfacing the stack to
+ * the UI (full detail lives in server logs).
+ *
+ * NOTE: this endpoint is part of the P4-2 contract; if 鲁班 has not added it
+ * yet, callers will receive an APIError (404) and should surface a Toast.
+ */
+export async function testLlmChannel(body: ChannelTestRequest): Promise<ChannelTestResult> {
+  return request<ChannelTestResult>('/api/llm/test-channel', {
     method: 'POST',
     body: JSON.stringify(body),
   });

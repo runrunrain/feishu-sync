@@ -7,7 +7,7 @@
 // For development, we define them here for type safety
 
 export interface Config {
-  llm: LLMConfig;
+  llm: LlmConfig;
   pollIntervalMinutes: number;
   knowledgeBaseRoot: string;
   watchedRootUrls: string[];
@@ -17,10 +17,55 @@ export interface Config {
   enableNotifications: boolean;
 }
 
-export interface LLMConfig {
+/**
+ * v0.2.0 P3/P4 — channel-agnostic LLM provider config (bigmodel 认知修正).
+ *
+ * Cognitive correction (2026-06-18): there is ONE provider (bigmodel GLM by
+ * default). `claude -p` (Anthropic-protocol adapter) and the OpenAI SDK 直连
+ * (OpenAI-protocol adapter) are TWO CHANNELS sharing ONE `LlmConfig`.
+ *
+ * Frontend type mirrors server/src/types/index.ts LlmConfig. The legacy
+ * flat shape `{ baseUrl, apiKey, model, temperature }` is auto-migrated by
+ * ConfigManager; UI never shows the legacy form.
+ */
+export interface LlmConfig {
+  /** OpenAI-protocol adapter base URL (DirectChannel/OpenAI SDK). */
+  openAiCompatBaseUrl: string;
+  /** Anthropic-protocol adapter base URL (ClaudeCliChannel env-inject). */
+  claudeCompatBaseUrl: string;
+  /** Single API key shared by both channels. */
+  apiKey: string;
+  /** Default model alias used by both channels when no per-channel override. */
+  model: string;
+  /** Optional per-channel model alias override (bigmodel dual-protocol alias spaces). */
+  directModel?: string;
+  claudeCliModel?: string;
+  /** Sampling temperature 0.0-1.0. Default 0.2. */
+  temperature: number;
+  /** ClaudeCliChannel process control. */
+  claudeCli?: {
+    claudePath?: string;
+    extraArgs?: string[];
+  };
+  /** Primary channel name. Default 'claude-cli'. */
+  primaryChannel: 'claude-cli' | 'direct';
+  /** On primary failure, retry via the other channel. Default true. */
+  fallbackOnFailure: boolean;
+}
+
+/**
+ * Backward-compat alias for v0.1.0 readers. New code should use `LlmConfig`.
+ */
+export type LLMConfig = LlmConfig;
+
+/**
+ * Legacy flat config shape (auto-migrated on load; UI never edits this form).
+ * Retained for migration typing only.
+ */
+export interface LegacyLLMConfig {
   baseUrl: string;
   apiKey: string;
-  model: 'deepseek-chat' | 'deepseek-reasoner';
+  model: string;
   temperature: number;
 }
 
@@ -190,6 +235,66 @@ export interface ToastMessage {
 export interface ServerHealth {
   status: string;
   timestamp: number;
+}
+
+// ============================================================================
+// Trash / Soft-Delete Types (T10, decision 2)
+// ============================================================================
+//
+// P4-2 NOTE: backend trash endpoints (GET /api/trash, POST /api/trash/restore,
+// DELETE /api/trash/purge) are NOT yet implemented on the server side as of
+// 2026-06-18 (HEAD 43121ef). The frontend implements the UI + client calls
+// against the intended contract; missing endpoints surface as Toast errors
+// and the drawer still renders the empty state. Leader should dispatch a
+// follow-up task to 鲁班 to add the trash routes.
+
+/**
+ * Soft-deleted document entry (cloud_deleted=1, retained locally).
+ * Mirrors the intended backend contract; field naming may be tuned when
+ * 鲁班 implements the routes.
+ */
+export interface TrashedDoc {
+  obj_token: string;
+  title: string;
+  local_path: string;
+  /** ISO timestamp the row was marked cloud_deleted (best-effort). */
+  deleted_at: string | null;
+  /** Optional reason: 'cloud_deleted' | 'user_trashed' | 'orphan'. */
+  reason?: string;
+}
+
+// ============================================================================
+// Channel Connectivity Test (T7, decision 3 real call)
+// ============================================================================
+
+export type ChannelName = 'claude-cli' | 'direct';
+
+/**
+ * Connectivity test request body for POST /api/llm/test-channel.
+ *
+ * Backend contract (to be implemented by 鲁班 P5):
+ *   - channel='claude-cli': spawn `claude -p "hello"` with bigmodel Anthropic
+ *     env injection (ANTHROPIC_BASE_URL/API_KEY/MODEL), 3s timeout.
+ *   - channel='direct':    POST bigmodel paas/v4 chat/completions with a
+ *     tiny hello prompt, 3s timeout.
+ * Both channels share the same `llm.apiKey`.
+ */
+export interface ChannelTestRequest {
+  channel: ChannelName;
+  llm: Pick<LlmConfig, 'openAiCompatBaseUrl' | 'claudeCompatBaseUrl' | 'apiKey' | 'model' | 'directModel' | 'claudeCliModel' | 'temperature'>;
+  claudeCli?: { claudePath?: string; extraArgs?: string[] };
+}
+
+export interface ChannelTestResult {
+  success: boolean;
+  /** Wall-clock duration in ms. */
+  durationMs: number;
+  /** Tokens reported by provider (best-effort). */
+  tokensUsed?: number;
+  /** Effective model alias used. */
+  model: string;
+  /** One-line error summary (no stack). Full detail in server logs. */
+  error?: string;
 }
 
 // Desktop API types (from desktop-contracts.ts)

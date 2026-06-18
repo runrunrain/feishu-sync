@@ -9,7 +9,7 @@
  * 受控：通过 props 注入 selectedTokens + onSelectionChange。
  */
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { RefreshCw, CheckSquare, AlertCircle, Inbox } from 'lucide-react';
 import { Card, CardHeader, CardBody } from './common/Card';
 import { Button } from './common/Button';
@@ -38,6 +38,12 @@ interface ChangeListPanelProps {
   /** Initial diff (from parent). If absent, panel fetches its own. */
   initialDiff?: DiffReport | null;
   onRefresh?: () => void;
+  /**
+   * P4-2: notifies the parent whenever the diff updates (including the first
+   * fetch). The parent uses this to resolve selected documents for the sync
+   * payload without re-implementing the diff fetch.
+   */
+  onDiffChange?: (diff: DiffReport | null) => void;
   /** Deleted-state action stubs (TrashDrawer wiring lands in P4-2). */
   onTrash?: (objToken: string) => void;
   onPurge?: (objToken: string) => void;
@@ -50,6 +56,7 @@ export function ChangeListPanel({
   onSelectionChange,
   initialDiff,
   onRefresh,
+  onDiffChange,
   onTrash,
   onPurge,
 }: ChangeListPanelProps) {
@@ -68,6 +75,7 @@ export function ChangeListPanel({
       const report = await getMappingDiff(rootUrl);
       setDiff(report);
       onRefresh?.();
+      onDiffChange?.(report);
     } catch (err) {
       const msg = err instanceof Error ? err.message : '检测失败';
       setError(msg);
@@ -82,13 +90,19 @@ export function ChangeListPanel({
     }
   };
 
-  // First-load behaviour: prefer parent-supplied diff; else fetch when rootUrl ready.
-  useMemo(() => {
-    if (!diff && rootUrl && !loading && !error) {
+  // First-load behaviour: prefer parent-supplied diff; else fetch once when
+  // rootUrl becomes ready. P1-2 (谛听): previously a useMemo with a fetch side
+  // effect — useMemo is not guaranteed to run once (React 18 StrictMode may
+  // double-invoke), which could trigger duplicate fetches. Moved to useEffect
+  // with a guard ref so the initial fetch fires exactly once per rootUrl.
+  const initialFetchDoneFor = useRef<string | null>(null);
+  useEffect(() => {
+    if (!diff && rootUrl && !loading && !error && initialFetchDoneFor.current !== rootUrl) {
+      initialFetchDoneFor.current = rootUrl;
       void fetchDiff();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [diff, rootUrl]);
+  }, [diff, rootUrl, loading, error]);
 
   const grouped = useMemo(() => {
     if (!diff) return { added: [], modified: [], deleted: [] as ChangedDocument[] };
