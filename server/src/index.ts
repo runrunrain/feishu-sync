@@ -41,6 +41,21 @@ export interface CreateServerOptions {
   desktopMode?: boolean;
   desktopToken?: string;
   configPath?: string;
+  /**
+   * P0-bug-1 fix (v0.2.0 P5): independently control the CORS dev gate.
+   *
+   * desktopMode alone cannot distinguish "real Electron (origin app://,
+   * same-origin, browser never involved)" from "standalone dev:all
+   * (vite at http://localhost:5173 making cross-origin requests to
+   * http://127.0.0.1:3001)" — both run with desktopMode=true. So the
+   * CORS dev gate is now driven by this explicit flag instead.
+   *
+   *   - Electron production (electron/main.ts) → leave undefined / false
+   *     → CORS enforces expectedOrigin `app://feishu-sync.local`
+   *   - Standalone dev:all (isMainModule entry below) → set true
+   *     → CORS allows http://localhost:5173 + http://127.0.0.1:5173
+   */
+  corsDevMode?: boolean;
 }
 
 export interface StartedServer {
@@ -60,6 +75,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
     desktopMode = false,
     desktopToken: providedDesktopToken,
     configPath,
+    corsDevMode = false,
   } = options;
 
   // Generate or use provided desktop token
@@ -123,8 +139,20 @@ export async function buildServer(options: CreateServerOptions = {}) {
   // ============================================================================
 
   // CORS (desktop mode or dev mode)
-  app.use('*', corsMiddleware());
-  console.info('[server] CORS middleware registered');
+  //
+  // P0-bug-1 fix: in standalone dev:all (vite 5173 + server 3001) the
+  // browser sends cross-origin requests from http://localhost:5173 to
+  // http://127.0.0.1:3001. Without devMode the CORS origin gate rejects
+  // them (expectedOrigin defaults to the Electron app:// scheme), which
+  // makes the entire frontend unable to reach the API in dev:all.
+  //
+  // desktopMode alone cannot tell standalone-dev:all apart from real
+  // Electron production (both set desktopMode=true), so we drive the
+  // CORS dev gate from an explicit `corsDevMode` option:
+  //   - Electron production (electron/main.ts) → leaves it false
+  //   - Standalone isMainModule entry → sets it true
+  app.use('*', corsMiddleware({ devMode: corsDevMode }));
+  console.info(`[server] CORS middleware registered (devMode=${corsDevMode})`);
 
   // ============================================================================
   // Inject Dependencies via Middleware (must run before auth)
@@ -274,6 +302,7 @@ if (isMainModule) {
   startServer({
     desktopMode: true, // Enable auth middleware in standalone mode
     desktopToken: standaloneToken,
+    corsDevMode: true, // P0-bug-1 fix: standalone always serves a browser client (vite 5173 cross-origin)
     port: 3001, // Use default port to align with vite proxy
     hostname: '127.0.0.1', // Bind to localhost only in standalone mode
   }).catch((error) => {

@@ -224,6 +224,42 @@ export async function refreshMappingIndex(): Promise<{
 }
 
 /**
+ * POST /api/index/rebuild — rescan the local knowledge base and rebuild the
+ * documents table (fixes P0-bug-2: refresh-index only regenerated the
+ * snapshot from the existing DB rows; this endpoint actually re-runs
+ * IndexScanner.scanAllFiles to repopulate titles/status for every .md).
+ *
+ * Contract with backend (鲁班 implements in parallel):
+ *   request:  {}
+ *   response: {
+ *     rebuilt: number,            // count of documents upserted by the scan
+ *     refreshed_index: boolean,   // whether _index.json was regenerated
+ *     failed: Array<{ path: string; error: string }>
+ *   }
+ *
+ * NOTE: endpoint is implemented server-side in parallel by 鲁班 in the same
+ * Phase. If the endpoint is missing the call surfaces an APIError (404) and
+ * the caller shows a Toast — no silent failure.
+ */
+export interface RebuildIndexFailure {
+  path: string;
+  error: string;
+}
+
+export interface RebuildIndexResponse {
+  rebuilt: number;
+  refreshed_index: boolean;
+  failed: RebuildIndexFailure[];
+}
+
+export async function rebuildIndex(): Promise<RebuildIndexResponse> {
+  return request<RebuildIndexResponse>('/api/index/rebuild', {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
+/**
  * POST /api/mapping/reorder — local-only drag reorder (decision 5).
  * Backend rejects cross-parent reorders with 400.
  */

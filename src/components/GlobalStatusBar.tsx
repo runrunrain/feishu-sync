@@ -15,7 +15,7 @@ import { useConfig } from '../hooks/useConfig';
 import { useChanges } from '../hooks/useChanges';
 import { useToast } from './common/Toast';
 import { appLogger } from '../utils/appLogger';
-import { refreshMappingIndex } from '../api/client';
+import { refreshMappingIndex, rebuildIndex } from '../api/client';
 import { isUsableWikiUrl, pickFirstValidWikiUrl } from '../utils/wikiUrl';
 import { useState } from 'react';
 
@@ -62,17 +62,44 @@ export function GlobalStatusBar() {
 
   const handleRefreshIndex = async () => {
     setRefreshing(true);
+    // P0-bug-2 修复：先 rebuild documents（重新扫描本地 KB 写入真实
+    // title/status），再 refresh snapshot（投影 _index.json）。rebuild 期间
+    // 显示 loading + "正在重建索引..."，完成后按数量提示。
+    toast.push({ type: 'info', message: '正在重建索引…', hint: '重新扫描本地知识库' });
     try {
-      const r = await refreshMappingIndex();
-      appLogger.info('global-status', 'refresh-index ok', r);
-      toast.push({
-        type: 'success',
-        message: `索引已刷新 · ${r.node_count} 节点`,
-      });
+      const rebuilt = await rebuildIndex();
+      appLogger.info('global-status', 'rebuild-index ok', rebuilt);
+      // 后端按契约已刷新 _index.json；这里再拉一次 snapshot 保证 UI 与文件
+      // 系统同步，并取到 node_count 用于提示。
+      let nodeCount: number | undefined;
+      try {
+        const snap = await refreshMappingIndex();
+        nodeCount = snap.node_count;
+        appLogger.info('global-status', 'refresh-index ok after rebuild', snap);
+      } catch (snapErr) {
+        // snapshot 刷新失败不致命，rebuild 已成功
+        appLogger.warn('global-status', 'refresh-index failed after rebuild (non-fatal)', snapErr);
+      }
+      const failedCount = Array.isArray(rebuilt.failed) ? rebuilt.failed.length : 0;
+      const countText = typeof nodeCount === 'number'
+        ? `${nodeCount} 节点`
+        : `${rebuilt.rebuilt} 文档`;
+      if (failedCount > 0) {
+        toast.push({
+          type: 'warning',
+          message: `索引重建完成 · ${countText}（${failedCount} 项失败）`,
+          hint: '失败详情见日志',
+        });
+      } else {
+        toast.push({
+          type: 'success',
+          message: `索引重建完成 · ${countText}`,
+        });
+      }
     } catch (err) {
-      const msg = err instanceof Error ? err.message : '刷新索引失败';
-      appLogger.error('global-status', 'refresh-index failed', err);
-      toast.push({ type: 'error', message: '刷新索引失败', hint: msg });
+      const msg = err instanceof Error ? err.message : '索引重建失败';
+      appLogger.error('global-status', 'rebuild-index failed', err);
+      toast.push({ type: 'error', message: '索引重建失败', hint: msg });
     } finally {
       setRefreshing(false);
     }
@@ -142,11 +169,11 @@ export function GlobalStatusBar() {
           type="button"
           onClick={handleRefreshIndex}
           disabled={refreshing}
-          title="强制刷新本地索引快照"
+          title="重新扫描本地知识库并重建 documents 索引"
           className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-ink-soft border border-line rounded-md bg-paper hover:bg-paper-2 font-sans-ui transition-colors disabled:opacity-50"
         >
-          <Database className="w-3.5 h-3.5" />
-          {refreshing ? '刷新中' : '刷新索引'}
+          <Database className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
+          {refreshing ? '重建中' : '重建索引'}
         </button>
         <button
           type="button"

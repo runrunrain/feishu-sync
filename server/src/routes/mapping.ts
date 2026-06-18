@@ -182,6 +182,96 @@ mappingRoutes.post('/api/mapping/refresh-index', async (c) => {
 });
 
 // ---------------------------------------------------------------------------
+// POST /api/index/rebuild  (P0-bug-2 fix, v0.2.0 P5)
+// ---------------------------------------------------------------------------
+//
+// Forces a full re-scan of the knowledge base via IndexScanner so every
+// .md file gets its real title + status='synced' written back into the
+// documents table. This is the missing "first index / repair index"
+// entry point called out in wukong P5 §5.1 P0-bug-2: the existing
+// refresh-index only re-projects SQLite into _index.json, so rows that
+// were written as placeholder by upsertDocumentSeen (title='', never
+// updated by change-detector) surfaced as empty titles in the tree.
+//
+// Contract (agreed with 洛神 frontend):
+//   Request body: {} (optional, ignored)
+//   Response 200: {
+//     rebuilt: number,             // count of .md files successfully indexed
+//     scanned: number,             // total .md files seen
+//     refreshed_index: boolean,    // whether _index.json was regenerated
+//     failed: Array<{ file: string; error: string }>
+//   }
+//   Response 400: knowledgeBaseRoot not configured
+//   Response 500: unexpected error
+//
+// Idempotent + read-only on the knowledge base: IndexScanner reads .md
+// files but never writes them; it only upserts into SQLite.
+
+mappingRoutes.post('/api/index/rebuild', async (c) => {
+  try {
+    const configManager: any = (c as any).configManager;
+    const config = configManager?.getConfig();
+    if (!config?.knowledgeBaseRoot) {
+      return c.json(
+        { error: 'knowledgeBaseRoot not configured', rebuilt: 0, refreshed_index: false, failed: [] },
+        400,
+      );
+    }
+
+    const localMapStore: any = (c as any).localMapStore;
+    const larkCliClient: any = (c as any).larkCliClient;
+    if (!localMapStore || !larkCliClient) {
+      return c.json(
+        { error: 'required_dependencies_not_injected', rebuilt: 0, refreshed_index: false, failed: [] },
+        500,
+      );
+    }
+
+    const indexScanner = new IndexScanner({
+      localMapStore,
+      larkCliClient,
+      config,
+    });
+
+    const scanResult = await indexScanner.scanKnowledgeBase(config.knowledgeBaseRoot);
+
+    // After re-indexing, regenerate the _index.json snapshot so the UI
+    // immediately sees the refreshed titles. Reuse the SnapshotService
+    // built by getMappingService so the orphan-detection / top-level-dir
+    // aggregation stays consistent with the GET /api/mapping/index path.
+    let refreshed = false;
+    try {
+      const snap = getSnapshotService(c);
+      snap.generate();
+      refreshed = true;
+    } catch (snapErr) {
+      // Snapshot regen must not fail the whole rebuild — the SQLite write
+      // already succeeded. Log and surface refreshed_index=false.
+      console.warn('[mapping] index rebuild: snapshot regen skipped', snapErr);
+    }
+
+    return c.json({
+      rebuilt: scanResult.indexed,
+      scanned: scanResult.scanned,
+      refreshed_index: refreshed,
+      failed: scanResult.errors,
+    });
+  } catch (error) {
+    console.error('[mapping] index rebuild failed:', error);
+    return c.json(
+      {
+        error: 'rebuild_failed',
+        message: error instanceof Error ? error.message : String(error),
+        rebuilt: 0,
+        refreshed_index: false,
+        failed: [],
+      },
+      500,
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
 // POST /api/mapping/reorder  (P2-T10, R2.2bis-AC1/AC2/AC3/AC4)
 // ---------------------------------------------------------------------------
 

@@ -7,7 +7,7 @@
  */
 
 import { useEffect, useState } from 'react';
-import { Download, RefreshCw, CheckCircle } from 'lucide-react';
+import { Download, RefreshCw, CheckCircle, MonitorOff } from 'lucide-react';
 import { Card, CardHeader, CardBody } from './common/Card';
 import { StatusBadge } from './common/StatusBadge';
 import { Button } from './common/Button';
@@ -19,25 +19,50 @@ import type { DesktopUpdateState } from '../types';
 
 const APP_VERSION = 'v0.2.0';
 
+/**
+ * 检查桌面更新 API 是否可用。
+ *
+ * dev:all 模式（vite 浏览器 / 无 Electron preload）下 `window.desktop`
+ * 或 `window.desktop.update` 可能为 undefined；本卡片必须在此场景下
+ * 优雅降级为只读占位，绝不触发渲染期异常导致设置区整体 ErrorBoundary
+ * 降级（P1-bug-1）。
+ *
+ * 注意：返回值不能用 `as` 断言成恒真，否则会触发恒定条件 ESLint/TS 报错，
+ * 因此返回一个真实布尔表达式。
+ */
+function isDesktopUpdateAvailable(): boolean {
+  return (
+    typeof window !== 'undefined' &&
+    !!window.desktop &&
+    !!window.desktop.update &&
+    typeof window.desktop.update.getState === 'function'
+  );
+}
+
 export function AppUpdateCard() {
   const { config, updateConfig } = useConfig();
   const toast = useToast();
   const [updateState, setUpdateState] = useState<DesktopUpdateState | null>(null);
   const [loading, setLoading] = useState(false);
 
+  const updateAvailable = isDesktopUpdateAvailable();
+
   useEffect(() => {
-    if (typeof window !== 'undefined' && window.desktop) {
-      window.desktop.update.getState().then(setUpdateState).catch((err) => {
-        appLogger.warn('app-update', 'getState failed (non-fatal)', err);
-      });
-    }
+    if (!isDesktopUpdateAvailable()) return;
+    const updateApi = window.desktop!.update;
+    updateApi.getState().then(setUpdateState).catch((err) => {
+      appLogger.warn('app-update', 'getState failed (non-fatal)', err);
+    });
   }, []);
 
   const handleCheck = async () => {
-    if (!window.desktop) return;
+    if (!isDesktopUpdateAvailable()) {
+      toast.push({ type: 'warning', message: '桌面环境不可用，更新功能仅在桌面端可用' });
+      return;
+    }
     setLoading(true);
     try {
-      const result = await window.desktop.update.check();
+      const result = await window.desktop!.update.check();
       if (result.available) {
         setUpdateState({ state: 'available', version: result.version });
         toast.push({ type: 'info', message: `发现新版本 ${result.version}`, hint: result.releaseNotes?.slice(0, 80) });
@@ -54,10 +79,10 @@ export function AppUpdateCard() {
   };
 
   const handleDownload = async () => {
-    if (!window.desktop) return;
+    if (!isDesktopUpdateAvailable()) return;
     setLoading(true);
     try {
-      await window.desktop.update.download();
+      await window.desktop!.update.download();
       setUpdateState({ state: 'downloaded' });
     } catch (err) {
       appLogger.error('app-update', 'download failed', err);
@@ -68,9 +93,9 @@ export function AppUpdateCard() {
   };
 
   const handleInstall = async () => {
-    if (!window.desktop) return;
+    if (!isDesktopUpdateAvailable()) return;
     try {
-      await window.desktop.update.installAndRestart();
+      await window.desktop!.update.installAndRestart();
     } catch (err) {
       appLogger.error('app-update', 'install failed', err);
       toast.push({ type: 'error', message: '安装失败', hint: err instanceof Error ? err.message : '' });
@@ -113,21 +138,35 @@ export function AppUpdateCard() {
           <span className="text-sm font-mono text-seal">{APP_VERSION}</span>
         </div>
 
-        {updateState?.state === 'available' && (
+        {!updateAvailable && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="flex items-start gap-2 p-3 text-xs text-ink-faint bg-paper-2 border border-line rounded-md font-sans-ui"
+          >
+            <MonitorOff className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+            <span>
+              桌面更新服务不可用。更新与版本检查仅在桌面端（Electron）可用；
+              当前运行在浏览器或 preload 未就绪的环境下，相关功能已只读降级。
+            </span>
+          </div>
+        )}
+
+        {updateAvailable && updateState?.state === 'available' && (
           <Button onClick={handleDownload} loading={loading} size="sm">
             <Download className="w-4 h-4" />
             下载更新
           </Button>
         )}
 
-        {updateState?.state === 'downloaded' && (
+        {updateAvailable && updateState?.state === 'downloaded' && (
           <Button onClick={handleInstall} size="sm">
             <CheckCircle className="w-4 h-4" />
             安装并重启
           </Button>
         )}
 
-        {updateState?.state === 'downloading' && (
+        {updateAvailable && updateState?.state === 'downloading' && (
           <div className="space-y-1.5">
             <div className="w-full bg-paper-2 rounded-full h-2 overflow-hidden">
               <div
@@ -139,7 +178,7 @@ export function AppUpdateCard() {
           </div>
         )}
 
-        {(updateState?.state === 'idle' || !updateState) && (
+        {updateAvailable && (updateState?.state === 'idle' || !updateState) && (
           <Button variant="secondary" onClick={handleCheck} loading={loading} size="sm">
             <RefreshCw className="w-4 h-4" />
             检查更新
