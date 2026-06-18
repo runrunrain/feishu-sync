@@ -1,4 +1,12 @@
 /**
+ * @deprecated v0.2.0 P3: ContentAdapter now requires a ContentBackendRegistry
+ *   in its constructor (channel-agnostic orchestration). This script
+ *   uses the pre-P3 `new ContentAdapter()` shape and will no longer
+ *   compile. The replacement is:
+ *     server/scripts/llm-channels-connectivity.ts (real bigmodel calls)
+ *     server/tests/content-backend.test.ts (algorithm-layer mocks)
+ *   Kept for historical reference; do NOT invoke without rewriting.
+ *
  * Test script for ContentAdapter fallback behavior
  *
  * Constructs failure scenarios to verify that adaptContent:

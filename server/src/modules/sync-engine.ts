@@ -210,19 +210,67 @@ export class SyncEngine {
       }
     }
 
-    // 7. LLM adaptation (M3 - optional injection)
+    // 7. LLM adaptation (M3 + v0.2.0 P3 B6 修正)
+    //
+    //    v0.2.0 P3 flow chain (03 §4.4.1):
+    //      LayoutReconstructor (必跑, 前置, step 6 above)
+    //        -> ContentAdapter (optional, enableLLM=true)
+    //           primary channel: ClaudeCliChannel (default) or DirectChannel
+    //           on failure: fallback channel (single layer)
+    //        -> B6 deterministic fallback: reconstructedMarkdown
+    //
+    //    B6 修正 (content-adapter.ts:95-104 旧缺陷): LLM 失败时不再
+    //    返回 rawContent，而是保留 step 6 的 finalContent
+    //    （LayoutReconstructor 的 reconstructedMarkdown）。这是确定性
+    //    算法的产物，比 rawContent 可读性更好且稳定可重现。
+    //
+    //    finalContent 在 LLM 调用前已经持有 reconstructedMarkdown
+    //    （sheet 重构结果拼接），LLM 失败时直接保留即可。
     if (this.contentAdapter && options.enableLLM && doc.localMdPath) {
       try {
         const localOldContent = await this.readLocalMarkdown(doc.localMdPath);
+        // P3 新接口: ContentAdapter.adaptContent(rawContent, localOld,
+        // { channel?, adapt: { temperature, enableStreaming, onProgress,
+        //                       timeoutMs } }). ContentAdapter 内部根据
+        // registry 的 primaryChannel 选择通道并自动 fallback。
         const adapted = await this.contentAdapter.adaptContent(
           finalContent,
           localOldContent,
-          this.config.llm
+          {
+            adapt: {
+              temperature: this.config.llm.temperature ?? 0.2,
+              enableStreaming: false,
+              timeoutMs: 60_000,
+            },
+          }
         );
-        finalContent = adapted.adaptedMarkdown;
+        if (
+          (adapted.finishReason === 'stop' || adapted.finishReason === 'length') &&
+          adapted.adaptedMarkdown.trim().length > 0
+        ) {
+          finalContent = adapted.adaptedMarkdown;
+          console.info(
+            `[SyncEngine] LLM adaptation succeeded via ${adapted.channelName} ` +
+              `(${adapted.durationMs}ms, ${adapted.tokensUsed ?? 0} tokens) for ${doc.title}`
+          );
+        } else {
+          // B6 deterministic fallback: keep finalContent = reconstructedMarkdown.
+          console.warn(
+            `[SyncEngine] LLM adaptation failed for ${doc.title} ` +
+              `(finishReason=${adapted.finishReason ?? 'unknown'}, ` +
+              `error=${adapted.errorMessage ?? '<none>'}); ` +
+              `using LayoutReconstructor deterministic fallback.`
+          );
+        }
       } catch (error) {
-        console.warn(`[SyncEngine] LLM adaptation failed for ${doc.title}, using original content:`, error);
-        // Continue with original content on LLM failure
+        // Defensive: ContentAdapter contract says it never throws on
+        // channel errors, but if it does (e.g. registry misconfig),
+        // keep finalContent as the reconstructed fallback.
+        console.warn(
+          `[SyncEngine] LLM adaptation threw for ${doc.title}, ` +
+            `using LayoutReconstructor deterministic fallback:`,
+          error instanceof Error ? error.message : String(error)
+        );
       }
     }
 

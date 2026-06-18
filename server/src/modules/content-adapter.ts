@@ -1,144 +1,130 @@
 /**
- * ContentAdapter - LLM-driven content adaptation
+ * ContentAdapter - channel-agnostic LLM orchestration (v0.2.0 P3)
  *
- * Implements the design from 架构设计文档 §6.4 and 技术实现文档 §十:
- * - adaptContent(): Main orchestration (buildFewShotPrompt -> callDeepseek)
- * - buildFewShotPrompt(): Build prompt with local example + Feishu content + format rules
- * - callDeepseek(): OpenAI SDK streaming call to deepseek API
- * - Fallback strategy: Return original content on LLM failure (no throw, pure deterministic)
+ * Implements 03 §4.1.3. This class no longer imports the OpenAI SDK;
+ * SDK calls live inside DirectChannel. ContentAdapter's job is:
+ *   1. Resolve the primary channel from the registry.
+ *   2. Call adapt(); on failure (timeout/error), consult the registry's
+ *      fallback and try the OTHER channel.
+ *   3. Return the result; on full failure, return the LAST result so
+ *      the caller (sync-engine) can apply the deterministic B6 fallback
+ *      (use LayoutReconstructor's reconstructedMarkdown instead of
+ *      rawContent).
  *
- * Features:
- * - Temperature 0.2 for low randomness
- * - Streaming with onProgress callback
- * - Fallback to original content on any error
- * - API key never logged
+ * The orchestrator NEVER throws on channel failures; it surfaces them
+ * as AdaptOutput with finishReason='error'/'timeout'. This lets the
+ * sync pipeline stay deterministic and rely on B6 fallback.
+ *
+ * Streaming: only honored when the selected channel reports
+ * supportsStreaming=true (i.e. DirectChannel). ClaudeCliChannel is
+ * non-streaming; the orchestrator skips the onProgress path for it.
  */
 
-import OpenAI from 'openai';
+import type {
+  AdaptOptions,
+  AdaptOutput,
+  ChannelName,
+} from './content-backend.js';
+import type { ContentBackendRegistry } from './content-backend-registry.js';
 
-interface AdaptOptions {
-  baseUrl: string;
-  apiKey: string;
-  model: 'deepseek-chat' | 'deepseek-reasoner';
-  temperature: number;
-  enableStreaming: boolean;
-  onProgress?: (chunk: string) => void;
-}
-
-interface AdaptResult {
-  adaptedMarkdown: string;
-  tokensUsed: number;
-  duration: number;
-  model: string;
+export interface ContentAdapterCallOptions {
+  /** Override the registry's primary channel for this call. */
+  channel?: ChannelName;
+  /** Per-call adapt options (temperature/timeout/streaming/onProgress). */
+  adapt: AdaptOptions;
 }
 
 export class ContentAdapter {
+  constructor(private readonly registry: ContentBackendRegistry) {}
+
   /**
-   * Adapt content to local style using LLM
+   * Adapt raw markdown through the primary channel; on failure, try
+   * the fallback channel. Returns the final result (success OR the
+   * last failure). Never throws on channel errors.
    */
   async adaptContent(
     rawContent: string,
     localOldContent: string | null,
-    options: AdaptOptions
-  ): Promise<AdaptResult> {
-    const startTime = Date.now();
+    options: ContentAdapterCallOptions
+  ): Promise<AdaptOutput> {
+    const primary = this.registry.get(options.channel);
+    const primaryOptions = this.applyStreamingConstraint(primary.supportsStreaming, options.adapt);
 
-    try {
-      // 1. Build prompt
-      const prompt = this.buildFewShotPrompt(localOldContent, rawContent);
+    const primaryResult = await primary.adapt({
+      rawContent,
+      localOldContent,
+      options: primaryOptions,
+    });
 
-      // 2. Call deepseek
-      const client = new OpenAI({
-        apiKey: options.apiKey,
-        baseURL: options.baseUrl,
-      });
-
-      let adaptedMarkdown = '';
-      let tokensUsed = 0;
-
-      if (options.enableStreaming) {
-        // Streaming mode
-        const stream = await client.chat.completions.create({
-          model: options.model,
-          messages: [{ role: 'user', content: prompt }],
-          temperature: options.temperature,
-          stream: true,
-        });
-
-        for await (const chunk of stream) {
-          const content = chunk.choices[0]?.delta?.content || '';
-          adaptedMarkdown += content;
-          tokensUsed += content.length;
-          options.onProgress?.(content);
-        }
-      } else {
-        // Non-streaming mode
-        const response = await client.chat.completions.create({
-          model: options.model,
-          messages: [{ role: 'user', content: prompt }],
-          temperature: options.temperature,
-          stream: false,
-        });
-
-        adaptedMarkdown = response.choices[0]?.message?.content || '';
-        tokensUsed = response.usage?.total_tokens || 0;
-      }
-
-      const duration = Date.now() - startTime;
-
-      return {
-        adaptedMarkdown,
-        tokensUsed,
-        duration,
-        model: options.model,
-      };
-    } catch (error) {
-      // Fallback: Return original content on any error
-      console.warn('[ContentAdapter] LLM adaptation failed, using original content:', error instanceof Error ? error.message : String(error));
-      return {
-        adaptedMarkdown: rawContent,
-        tokensUsed: 0,
-        duration: Date.now() - startTime,
-        model: options.model,
-      };
+    if (this.isOk(primaryResult)) {
+      return primaryResult;
     }
+
+    const fallback = this.registry.getFallback(primary.name);
+    if (!fallback) {
+      // Fallback disabled in config, or no alternative registered.
+      return primaryResult;
+    }
+
+    console.warn(
+      `[ContentAdapter] primary channel "${primary.name}" failed ` +
+        `(finishReason=${primaryResult.finishReason}, ` +
+        `error=${primaryResult.errorMessage ?? '<none>'}); ` +
+        `falling back to "${fallback.name}".`
+    );
+
+    const fallbackOptions = this.applyStreamingConstraint(
+      fallback.supportsStreaming,
+      options.adapt
+    );
+    const fallbackResult = await fallback.adapt({
+      rawContent,
+      localOldContent,
+      options: fallbackOptions,
+    });
+
+    if (this.isOk(fallbackResult)) {
+      return fallbackResult;
+    }
+
+    console.warn(
+      `[ContentAdapter] fallback channel "${fallback.name}" also failed ` +
+        `(finishReason=${fallbackResult.finishReason}, ` +
+        `error=${fallbackResult.errorMessage ?? '<none>'}); ` +
+        `caller should apply deterministic B6 fallback.`
+    );
+
+    // Return the FALLBACK result (the last attempt) so the caller can
+    // inspect finishReason and decide whether to use rawContent or
+    // reconstructedMarkdown as the deterministic fallback.
+    return fallbackResult;
   }
 
   /**
-   * Build few-shot prompt with local example + format rules
+   * If the selected channel doesn't support streaming, strip the
+   * onProgress/enableStreaming flags to avoid confusing channel
+   * implementations (which should already ignore them, but be safe).
    */
-  private buildFewShotPrompt(localExample: string | null, rawContent: string): string {
-    const exampleSection = localExample
-      ? `=== 风格示例 ===\n${localExample}\n\n`
-      : '';
+  private applyStreamingConstraint(
+    supportsStreaming: boolean,
+    options: AdaptOptions
+  ): AdaptOptions {
+    if (supportsStreaming) return options;
+    const { onProgress: _drop, enableStreaming: _drop2, ...rest } = options;
+    void _drop;
+    void _drop2;
+    return rest;
+  }
 
-    return `# 任务指令
-
-你是一个飞书文档到本地 Markdown 格式转换专家。请根据飞书原始内容和本地风格示例，生成符合本地规范的 Markdown 文档。
-
-## 输入格式
-
-${exampleSection}=== 飞书新内容 ===
-${rawContent}
-
-## 输出要求
-
-1. **保持格式一致性**：遵循示例中的标题层级、表格布局、段落结构
-2. **表格重构规则**：
-   - 将表格数据转换为 | 分隔的 Markdown 表格
-   - 表头使用 | Title | Column1 | Column2 |
-   - 数据行使用 | content | data | value |
-   - 保持列对齐，每行末尾保留空格
-3. **层级处理**：
-   - A 列内容作为 H1 标题
-   - B 列内容作为 H2 标题（如果非空）
-   - C 列作为表格标题（如果符合表格特征）
-   - D 列作为段落内容
-4. **稀疏宽表处理**：低填充率列转换为段落，高填充率列保持表格格式
-
-## 输出格式
-
-请直接输出转换后的 Markdown 内容，不要包含任何额外说明。
-`;
+  /**
+   * A channel call is OK if the model produced non-empty output and
+   * stopped normally. Empty output with finishReason='stop' is treated
+   * as failure (likely a parse glitch) to give the fallback a chance.
+   */
+  private isOk(result: AdaptOutput): boolean {
+    if (result.finishReason !== 'stop' && result.finishReason !== 'length') {
+      return false;
+    }
+    return result.adaptedMarkdown.trim().length > 0;
   }
 }

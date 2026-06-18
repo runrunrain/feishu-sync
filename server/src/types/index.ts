@@ -7,7 +7,16 @@
 // ============================================================================
 
 export interface Config {
-  llm: LLMConfig;
+  /**
+   * v0.2.0 P3: channel-agnostic LLM config. The legacy flat
+   * `{ baseUrl, apiKey, model, temperature }` form is auto-migrated
+   * to the new `LlmConfig` shape by ConfigManager on first load
+   * (see migrateLegacyLlmConfig).
+   *
+   * For backward compatibility with v0.1.0 readers we keep the field
+   * name `llm` but its type widens to the new shape.
+   */
+  llm: LlmConfig;
   pollIntervalMinutes: number;
   knowledgeBaseRoot: string;
   watchedRootUrls: string[];
@@ -17,12 +26,86 @@ export interface Config {
   enableNotifications: boolean;
 }
 
-export interface LLMConfig {
+// ============================================================================
+// LLM Channel Configuration (v0.2.0 P3)
+// ============================================================================
+
+/**
+ * Shared LLM provider configuration consumed by BOTH channels.
+ *
+ * Cognitive correction (2026-06-18): there is ONE provider (bigmodel
+ * GLM by default). `claude -p` (Anthropic-protocol adapter) and the
+ * OpenAI SDK 直连 (OpenAI-protocol adapter) are two CHANNELS sharing
+ * ONE `LlmConfig`.
+ *
+ * `openAiCompatBaseUrl` and `claudeCompatBaseUrl` are kept separate
+ * because bigmodel (and similar dual-protocol providers) expose two
+ * distinct endpoints. The same `apiKey` is accepted at both.
+ *
+ * `claudeCli`, `primaryChannel`, and `fallbackOnFailure` control
+ * channel selection and fallback policy.
+ */
+export interface LlmConfig {
+  /** OpenAI-protocol adapter base URL (DirectChannel/OpenAI SDK). */
+  openAiCompatBaseUrl: string;
+  /** Anthropic-protocol adapter base URL (ClaudeCliChannel env-inject). */
+  claudeCompatBaseUrl: string;
+  /** Single API key shared by both channels. */
+  apiKey: string;
+  /** Model alias used by both channels (e.g. glm-4-flash). */
+  model: string;
+  /**
+   * Optional per-channel model overrides. Bigmodel's two endpoints use
+   * different alias spaces (paas/v4 accepts glm-4-flash, /api/anthropic
+   * accepts glm-5.2[1m]); these let users fill different aliases when
+   * a single name is not valid at both endpoints.
+   */
+  directModel?: string;
+  claudeCliModel?: string;
+  /** Sampling temperature 0.0-1.0. Default 0.2. */
+  temperature: number;
+  /** ClaudeCliChannel process control (path + extra args). */
+  claudeCli?: {
+    claudePath?: string;
+    extraArgs?: string[];
+  };
+  /** Primary channel name. Default 'claude-cli'. */
+  primaryChannel: 'claude-cli' | 'direct';
+  /** On primary failure, retry via the other channel. Default true. */
+  fallbackOnFailure: boolean;
+}
+
+/**
+ * Legacy v0.1.0 flat LLM config shape. Retained for migration logic;
+ * new code MUST use `LlmConfig`.
+ */
+export interface LegacyLLMConfig {
   baseUrl: string;
   apiKey: string;
-  model: 'deepseek-chat' | 'deepseek-reasoner';
+  model: string;
   temperature: number;
 }
+
+/**
+ * Type guard: returns true if the value looks like a legacy flat config.
+ * Used by ConfigManager.migrateLegacyLlmConfig.
+ */
+export function isLegacyLlmConfig(value: unknown): value is LegacyLLMConfig {
+  if (!value || typeof value !== 'object') return false;
+  const v = value as Record<string, unknown>;
+  // Legacy shape has `baseUrl` and no `openAiCompatBaseUrl`.
+  return (
+    typeof v.baseUrl === 'string' &&
+    v.openAiCompatBaseUrl === undefined &&
+    v.primaryChannel === undefined
+  );
+}
+
+/**
+ * Backward-compat alias kept for old type references (e.g. AdaptOptions
+ * in this same file). New code should prefer `LlmConfig`.
+ */
+export type LLMConfig = LlmConfig;
 
 // ============================================================================
 // Document Types
@@ -242,15 +325,21 @@ export interface ReconstructedBlock {
   markdown: string;
 }
 
+/**
+ * @deprecated v0.2.0 P3: use `AdaptOptions`/`AdaptOutput` from
+ * `modules/content-backend.js`. This type is retained only for type
+ * compatibility with code that has not yet been migrated.
+ */
 export interface AdaptOptions {
-  baseUrl: string;
-  apiKey: string;
-  model: 'deepseek-chat' | 'deepseek-reasoner';
-  temperature: number;
-  enableStreaming: boolean;
+  baseUrl?: string;
+  apiKey?: string;
+  model?: string;
+  temperature?: number;
+  enableStreaming?: boolean;
   onProgress?: (chunk: string) => void;
 }
 
+/** @deprecated v0.2.0 P3: use AdaptOutput from content-backend.js. */
 export interface AdaptResult {
   adaptedMarkdown: string;
   tokensUsed: number;

@@ -12,6 +12,8 @@ import { SyncEngine } from '../modules/sync-engine.js';
 import { IndexScanner } from '../modules/index-scanner.js';
 import { LayoutReconstructor } from '../modules/layout-reconstructor.js';
 import { ContentAdapter } from '../modules/content-adapter.js';
+import { ContentBackendRegistry } from '../modules/content-backend-registry.js';
+import type { ChannelConfig } from '../modules/content-backend.js';
 import type { SyncResult } from '../types/index.js';
 
 const syncRoutes = new Hono();
@@ -33,9 +35,23 @@ syncRoutes.post('/api/sync', async (c) => {
   // Load config
   const config = await configManager.load();
 
-  // Initialize M3 modules
+  // Initialize M3 modules + v0.2.0 P3 channel-agnostic LLM stack.
+  //
+  // P3 flow chain (03 §4.4.1):
+  //   LayoutReconstructor (必跑, 前置)
+  //     -> ContentAdapter (optional, enableLLM=true)
+  //       primary channel: ClaudeCliChannel (default) or DirectChannel
+  //       on failure: fallback channel (single layer)
+  //     -> B6 deterministic fallback: reconstructedMarkdown (sync-engine)
   const layoutReconstructor = new LayoutReconstructor();
-  const contentAdapter = new ContentAdapter();
+  const channelConfig: ChannelConfig = {
+    llm: config.llm,
+    claudeCli: config.llm.claudeCli,
+    primaryChannel: config.llm.primaryChannel,
+    fallbackOnFailure: config.llm.fallbackOnFailure,
+  };
+  const registry = new ContentBackendRegistry(channelConfig);
+  const contentAdapter = new ContentAdapter(registry);
 
   // Create SyncEngine instance with M3 modules
   const syncEngine = new SyncEngine({
