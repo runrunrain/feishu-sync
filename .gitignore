@@ -5,6 +5,7 @@ server/node_modules/
 # Build output
 dist/
 dist-desktop/
+dist-desktop-v*/
 dist-electron/
 server/dist/
 release/
