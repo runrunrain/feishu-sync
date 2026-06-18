@@ -27,6 +27,8 @@ import { detectRoutes } from './routes/detect.js';
 import { syncRoutes } from './routes/sync.js';
 import { feishuRoutes } from './routes/feishu.js';
 import { mappingRoutes } from './routes/mapping.js';
+import { trashRoutes } from './routes/trash.js';
+import { llmRoutes } from './routes/llm.js';
 import type { LarkCliConfig } from './types/index.js';
 
 // ============================================================================
@@ -166,6 +168,8 @@ export async function buildServer(options: CreateServerOptions = {}) {
   app.route('/', syncRoutes);
   app.route('/', feishuRoutes);
   app.route('/', mappingRoutes);
+  app.route('/', trashRoutes);
+  app.route('/', llmRoutes);
   console.info('[server] Protected routes registered');
 
   // ============================================================================
