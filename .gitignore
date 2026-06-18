@@ -49,3 +49,6 @@ server/tsconfig.tsbuildinfo
 *.jpg
 *.jpeg
 *.gif
+
+# Claude Code / Amagi runtime artifacts
+.claude/

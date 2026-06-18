@@ -20,6 +20,8 @@ import { StatusBadge } from './common/StatusBadge';
 import { Button } from './common/Button';
 import { EmptyState } from './common/EmptyState';
 import { useChanges } from '../hooks/useChanges';
+import { useConfig } from '../hooks/useConfig';
+import { isUsableWikiUrl, pickFirstValidWikiUrl } from '../utils/wikiUrl';
 import type { ChangedDocument } from '../types';
 
 interface ChangeListProps {
@@ -31,10 +33,17 @@ export function ChangeList({
   selectedTokens = [],
   onSelectionChange,
 }: ChangeListProps) {
-  // Default root URL - will be replaced with config in M2
-  const [rootUrl] = useState<string>(
-    'https://qcnbafdrjx7n.feishu.cn/wiki/Wramw1XxRihIgnkCrhqcdEbRnHb'
-  );
+  // Root URL sourced from config.watchedRootUrls (B4 fix, replaces M1 hardcode).
+  // Falls back to null when unconfigured or invalid; detection is gated on validity.
+  const { config } = useConfig();
+  const rootUrl = pickFirstValidWikiUrl(config?.watchedRootUrls);
+  const rootUrlError =
+    !rootUrl && (config?.watchedRootUrls?.length ?? 0) > 0
+      ? '配置的飞书根 URL 格式无效，请在设置中改为形如 https://xxx.feishu.cn/wiki/<token> 的地址'
+      : !rootUrl
+        ? '请先在设置中配置飞书根 URL（形如 https://xxx.feishu.cn/wiki/<token>）'
+        : null;
+
   const [selectAll, setSelectAll] = useState(false);
 
   const {
@@ -72,8 +81,9 @@ export function ChangeList({
     }
   }, [selectedTokens, changes.length]);
 
-  // Handle detect button click
+  // Handle detect button click — gated on a valid Feishu wiki root URL.
   const handleDetect = () => {
+    if (!isUsableWikiUrl(rootUrl)) return;
     detect(rootUrl);
   };
 
@@ -118,6 +128,26 @@ export function ChangeList({
         return { status: 'neutral' as const, label: 'Unknown' };
     }
   };
+
+  // Unconfigured / invalid root URL state — detection cannot proceed.
+  // Shown in preference to the loading / empty states so the user immediately
+  // understands why the Detect button is disabled.
+  if (rootUrlError) {
+    return (
+      <Card variant="elevated">
+        <CardHeader>
+          <h2 className="text-lg font-display font-medium text-text-primary">Changed Documents</h2>
+        </CardHeader>
+        <CardBody>
+          <EmptyState
+            icon={<AlertCircle className="w-10 h-10 text-warning" />}
+            title="尚未配置飞书根 URL"
+            description={rootUrlError}
+          />
+        </CardBody>
+      </Card>
+    );
+  }
 
   // Loading state
   if (loading) {

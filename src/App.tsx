@@ -28,6 +28,8 @@ import { UpdatePanel } from './components/UpdatePanel';
 import { useChanges } from './hooks/useChanges';
 import { useAuthStatus } from './hooks/useAuthStatus';
 import { useSyncStatus } from './hooks/useSyncStatus';
+import { useConfig } from './hooks/useConfig';
+import { isUsableWikiUrl, isValidFeishuWikiUrl, pickFirstValidWikiUrl } from './utils/wikiUrl';
 
 type ViewType = 'home' | 'changes' | 'sync' | 'config' | 'logs' | 'updates';
 
@@ -59,6 +61,18 @@ function App() {
   const { changes, detect } = useChanges();
   const { ready: authReady } = useAuthStatus();
   const { pendingCount, lastSyncTime, nextCheckTime, isDetecting } = useSyncStatus();
+  // B4 fix: drive top-bar 立即检测 off the configured watched root URL.
+  const { config } = useConfig();
+  const activeRootUrl = pickFirstValidWikiUrl(config?.watchedRootUrls);
+  const rootUrlUnconfigured =
+    !activeRootUrl && (config?.watchedRootUrls?.length ?? 0) === 0;
+  const rootUrlInvalid =
+    !activeRootUrl && (config?.watchedRootUrls?.length ?? 0) > 0;
+  const detectTooltip = rootUrlUnconfigured
+    ? '请先在设置中配置飞书根 URL（形如 https://xxx.feishu.cn/wiki/<token>）'
+    : rootUrlInvalid
+      ? '配置的飞书根 URL 格式无效，请在设置中改为形如 https://xxx.feishu.cn/wiki/<token> 的地址'
+      : '';
 
   // Get selected documents for sync based on selected tokens
   const selectedDocuments = useMemo(() => {
@@ -70,7 +84,10 @@ function App() {
   };
 
   const handleDetectNow = () => {
-    detect('');
+    // B4 fix: never invoke detect(''); fall through silently when URL is
+    // missing/invalid because the button itself is disabled.
+    if (!isUsableWikiUrl(activeRootUrl)) return;
+    detect(activeRootUrl);
   };
 
   const handleSyncAll = () => {
@@ -209,10 +226,11 @@ function App() {
             )}
           </div>
 
-          {/* 立即检测按钮（朱红边框） */}
+          {/* 立即检测按钮（朱红边框）—— B4 fix: 禁用当根 URL 未配置或格式无效 */}
           <button
             onClick={handleDetectNow}
-            disabled={isDetecting}
+            disabled={isDetecting || !isValidFeishuWikiUrl(activeRootUrl)}
+            title={detectTooltip}
             className="px-4 py-2 text-xs font-medium rounded-md transition-all duration-fast focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed
               bg-paper text-seal border border-seal hover:bg-seal/5 active:bg-seal/10
               shadow-sm font-serif whitespace-nowrap"
