@@ -175,10 +175,11 @@ export class SyncEngine {
     // 4. Expand synced blocks (M2-B - placeholder for now)
     const expandedContent = await this.expandSyncedBlocks(fetched.content);
 
-    // 5. Export sheets if applicable
+    // 5. Export sheets if applicable (v0.2.0: also map sub-sheets to
+    //    the sheet_sheets table for finer-grained change detection)
     const sheets: Array<{ sheetId: string; title: string; csvPath: string }> = [];
     if (doc.objType === 'sheet') {
-      const exportedSheets = await this.exportSheets(doc.objToken, saveDir);
+      const exportedSheets = await this.exportSheetsAndMap(doc.objToken, saveDir);
       sheets.push(...exportedSheets);
     }
 
@@ -663,10 +664,28 @@ obj_token: ${fetched.obj_token}
   }
 
   /**
-   * Export spreadsheet sheets to CSV files
-   * Uses lark-cli sheets +workbook-info to list sheets and +workbook-export to export each
+   * Export spreadsheet sub-sheets to CSV files AND map each sub-sheet to
+   * the sheet_sheets table (03 §3.5). Workbook-level obj_edit_time is
+   * shared across all sub-sheets on the Feishu side, so per-sub-sheet
+   * change detection is performed by ChangeDetector.detectSheetSubChanges
+   * via set differences against this mapping.
+   *
+   * The local CSV directory follows the existing project convention of
+   * a single `csv-data/` directory under the doc save dir (NOT the
+   * `<docname>.csv-data/` form mandated by the fetch-feishu-doc skill).
+   * Q6 (白泽调研) flagged this as pre-existing tech debt — correcting it
+   * would force a mass path migration and is out of P2 scope; we
+   * preserve the existing layout and record the deviation in the
+   * implementation report.
+   *
+   * Sub-sheet rows are upserted with COALESCE on local_md_path so a
+   * later reconstruction pass can fill in the per-sub-sheet .md path
+   * without this method needing to know about reconstruction.
    */
-  private async exportSheets(sheetToken: string, saveDir: string): Promise<Array<{ sheetId: string; title: string; csvPath: string }>> {
+  private async exportSheetsAndMap(
+    sheetToken: string,
+    saveDir: string
+  ): Promise<Array<{ sheetId: string; title: string; csvPath: string }>> {
     const csvDataDir = path.join(saveDir, 'csv-data');
 
     // Create csv-data directory if it doesn't exist
@@ -677,7 +696,7 @@ obj_token: ${fetched.obj_token}
     const exports: Array<{ sheetId: string; title: string; csvPath: string }> = [];
 
     try {
-      // 1. List all sheets in the workbook
+      // 1. List all sub-sheets in the workbook
       const workbookInfo = await this.execLarkCli([
         'sheets',
         '+workbook-info',
@@ -685,9 +704,15 @@ obj_token: ${fetched.obj_token}
         '--format', 'json',
       ]);
 
-      const sheetsList = workbookInfo.data?.sheets || [];
+      const sheetsList = (workbookInfo.data?.sheets || []) as Array<{
+        sheet_id: string;
+        sheet_name: string;
+        index?: number;
+      }>;
 
-      // 2. Export each sheet to CSV
+      const nowIso = new Date().toISOString();
+
+      // 2. Export each sub-sheet to CSV + upsert sheet_sheets row
       for (const sheet of sheetsList) {
         const csvPath = path.join(csvDataDir, `${sheet.sheet_name}.csv`);
 
@@ -705,6 +730,17 @@ obj_token: ${fetched.obj_token}
             sheetId: sheet.sheet_id,
             title: sheet.sheet_name,
             csvPath,
+          });
+
+          // Map this sub-sheet to the sheet_sheets table for future
+          // change detection (detectSheetSubChanges reads this).
+          this.localMapStore.upsertSheetSheet({
+            sheetObjToken: sheetToken,
+            sheetId: sheet.sheet_id,
+            sheetTitle: sheet.sheet_name,
+            localCsvPath: csvPath,
+            lastSyncedModifyTime: nowIso,
+            status: 'synced',
           });
 
           console.info(`[SyncEngine] Exported sheet "${sheet.sheet_name}" to ${csvPath}`);

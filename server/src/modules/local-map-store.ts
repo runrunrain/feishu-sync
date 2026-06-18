@@ -202,6 +202,50 @@ export class LocalMapStore {
   }
 
   /**
+   * Restore a previously cloud-deleted document: clear the soft-delete
+   * flag so the row is treated as live again. Used by the trash-bin UI
+   * when the user chooses to keep a doc locally (e.g. the cloud delete
+   * was a mistake).
+   */
+  restoreCloudDeleted(objToken: string): void {
+    const stmt = this.getStatement(`
+      UPDATE documents
+      SET cloud_deleted = 0, updated_at = datetime('now')
+      WHERE obj_token = ?
+    `);
+    stmt.run(objToken);
+  }
+
+  /**
+   * Hard-delete a document row from SQLite. Used by the trash-bin UI
+   * when the user chooses permanent cleanup; the caller is responsible
+   * for fs.unlink'ing the local .md (and optionally moving it to
+   * .trash-bin/ first). Cascade deletes associated sheet_sheets rows
+   * via the FK constraint declared in migration_v2.sql.
+   */
+  purgeCloudDeleted(objToken: string): void {
+    const stmt = this.getStatement(`
+      DELETE FROM documents WHERE obj_token = ?
+    `);
+    stmt.run(objToken);
+  }
+
+  /**
+   * List all cloud-deleted documents (for the trash-bin UI panel).
+   * Ordered by last_seen_at desc so the most-recently-flagged items
+   * surface first.
+   */
+  listCloudDeleted(): DocumentRecord[] {
+    const stmt = this.getStatement(`
+      SELECT * FROM documents
+      WHERE cloud_deleted = 1
+      ORDER BY last_seen_at DESC, updated_at DESC
+    `);
+    const rows = stmt.all() as any[];
+    return rows.map((row) => this.mapRowToDocumentRecord(row));
+  }
+
+  /**
    * User-driven local sort order update (decision 5: local-only drag reorder).
    * Accepts a parent scope + ordered obj_tokens; assigns 0..N as the
    * local_sort_order of each child. Rows whose parent doesn't match are

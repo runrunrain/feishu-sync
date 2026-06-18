@@ -280,6 +280,85 @@ def test_set_sort_order_rejects_cross_parent():
     assert_eq("cross-parent no write", row[0], None)
 
 
+# --- P2-T3 trash-bin methods (restore / purge / list) ----------------------
+
+def test_restore_cloud_deleted_clears_flag():
+    """restoreCloudDeleted should clear cloud_deleted back to 0 so the
+    row is treated as live again. Mirrors TS source."""
+    conn = fresh_db()
+    upsert_document(conn, dict(
+        objToken="RES", wikiNodeToken=None, objType="docx",
+        title="res", localMdPath="/d/res.md",
+        lastSyncedModifyTime="2026-06-18T00:00:00Z",
+        lastSyncedAt="2026-06-18T00:00:00Z", status="synced",
+    ))
+    # Mark soft-deleted first
+    mark_cloud_deleted(conn, "RES", "2026-06-18T04:00:00Z")
+    assert_eq("pre-restore cloud_deleted=1",
+              conn.execute("SELECT cloud_deleted FROM documents WHERE obj_token='RES'").fetchone()[0], 1)
+    restore_cloud_deleted(conn, "RES")
+    assert_eq("post-restore cloud_deleted=0",
+              conn.execute("SELECT cloud_deleted FROM documents WHERE obj_token='RES'").fetchone()[0], 0)
+
+
+def test_purge_cloud_deleted_removes_row_and_cascades():
+    """purgeCloudDeleted hard-deletes the documents row; FK ON DELETE
+    CASCADE drops associated sheet_sheets rows."""
+    conn = fresh_db()
+    # Enable FK enforcement (off by default in sqlite3 CLI).
+    conn.execute("PRAGMA foreign_keys = ON")
+    upsert_document(conn, dict(
+        objToken="PURGE", wikiNodeToken=None, objType="sheet",
+        title="p", localMdPath="/d/p.md",
+        lastSyncedModifyTime="2026-06-18T00:00:00Z",
+        lastSyncedAt="2026-06-18T00:00:00Z", status="synced",
+    ))
+    upsert_sheet_sheet(conn, dict(
+        sheetObjToken="PURGE", sheetId="s1", sheetTitle="S1",
+        localCsvPath="/d/s1.csv",
+    ))
+    upsert_sheet_sheet(conn, dict(
+        sheetObjToken="PURGE", sheetId="s2", sheetTitle="S2",
+        localCsvPath="/d/s2.csv",
+    ))
+    assert_eq("pre-purge sheet_sheets count",
+              conn.execute("SELECT COUNT(*) FROM sheet_sheets WHERE sheet_obj_token='PURGE'").fetchone()[0], 2)
+    purge_cloud_deleted(conn, "PURGE")
+    assert_eq("post-purge documents row gone",
+              conn.execute("SELECT COUNT(*) FROM documents WHERE obj_token='PURGE'").fetchone()[0], 0)
+    assert_eq("post-purge sheet_sheets cascade dropped",
+              conn.execute("SELECT COUNT(*) FROM sheet_sheets WHERE sheet_obj_token='PURGE'").fetchone()[0], 0)
+
+
+def test_list_cloud_deleted_returns_only_soft_deleted_ordered():
+    """listCloudDeleted returns rows where cloud_deleted=1, ordered by
+    last_seen_at desc then updated_at desc."""
+    conn = fresh_db()
+    for tok, seen in [("A", "2026-06-01T00:00:00Z"),
+                      ("B", "2026-06-18T10:00:00Z"),
+                      ("C", "2026-06-15T00:00:00Z")]:
+        upsert_document(conn, dict(
+            objToken=tok, wikiNodeToken=None, objType="docx",
+            title=tok, localMdPath=f"/d/{tok}.md",
+            lastSyncedModifyTime="2026-06-01T00:00:00Z",
+            lastSyncedAt="2026-06-01T00:00:00Z", status="synced",
+        ))
+        mark_cloud_deleted(conn, tok, seen)
+    # Add a live row that must NOT appear in the trash listing.
+    upsert_document(conn, dict(
+        objToken="LIVE", wikiNodeToken=None, objType="docx",
+        title="live", localMdPath="/d/live.md",
+        lastSyncedModifyTime="2026-06-01T00:00:00Z",
+        lastSyncedAt="2026-06-01T00:00:00Z", status="synced",
+    ))
+    rows = list_cloud_deleted(conn)
+    tokens = [r[0] for r in rows]
+    assert_eq("trash excludes live rows", "LIVE" in tokens, False)
+    assert_eq("trash contains 3 soft-deleted", len(tokens), 3)
+    # Ordered by last_seen_at desc: B (06-18) > C (06-15) > A (06-01)
+    assert_eq("trash newest first", tokens, ["B", "C", "A"])
+
+
 # ---------------------------------------------------------------------------
 # SQL mirrors of LocalMapStore methods (verbatim from src code)
 # ---------------------------------------------------------------------------
@@ -343,6 +422,29 @@ SET local_sort_order = ?, updated_at = datetime('now')
 WHERE obj_token = ? AND parent_node_token IS ?
 """
 
+# P2-T3 trash-bin methods (verbatim from server/src/modules/local-map-store.ts)
+MARK_CLOUD_DELETED_SQL = """
+UPDATE documents
+SET cloud_deleted = 1, last_seen_at = ?, updated_at = datetime('now')
+WHERE obj_token = ?
+"""
+
+RESTORE_CLOUD_DELETED_SQL = """
+UPDATE documents
+SET cloud_deleted = 0, updated_at = datetime('now')
+WHERE obj_token = ?
+"""
+
+PURGE_CLOUD_DELETED_SQL = """
+DELETE FROM documents WHERE obj_token = ?
+"""
+
+LIST_CLOUD_DELETED_SQL = """
+SELECT * FROM documents
+WHERE cloud_deleted = 1
+ORDER BY last_seen_at DESC, updated_at DESC
+"""
+
 
 def upsert_document(conn, r):
     conn.execute(
@@ -388,6 +490,22 @@ def set_sort_order(conn, parent, ordered):
     return updated
 
 
+def mark_cloud_deleted(conn, obj_token, timestamp):
+    conn.execute(MARK_CLOUD_DELETED_SQL, (timestamp, obj_token))
+
+
+def restore_cloud_deleted(conn, obj_token):
+    conn.execute(RESTORE_CLOUD_DELETED_SQL, (obj_token,))
+
+
+def purge_cloud_deleted(conn, obj_token):
+    conn.execute(PURGE_CLOUD_DELETED_SQL, (obj_token,))
+
+
+def list_cloud_deleted(conn):
+    return conn.execute(LIST_CLOUD_DELETED_SQL).fetchall()
+
+
 def main():
     print("=" * 60)
     print("LocalMapStore v0.2.0 SQL-equivalence tests")
@@ -401,6 +519,9 @@ def main():
     test_sheet_sheets_upsert_preserves_md_path()
     test_set_sort_order_scoped_by_parent()
     test_set_sort_order_rejects_cross_parent()
+    test_restore_cloud_deleted_clears_flag()
+    test_purge_cloud_deleted_removes_row_and_cascades()
+    test_list_cloud_deleted_returns_only_soft_deleted_ordered()
     print("=" * 60)
     print("All LocalMapStore SQL-equivalence tests passed.")
     print("=" * 60)

@@ -130,6 +130,13 @@ export interface LarkCliNodeInfo {
   space_id: string;
   obj_edit_time: number; // Unix seconds
   has_child: boolean;
+  /**
+   * v0.2.0: parent_node_token is returned by both `wiki +node-list`
+   * (P0-Q2 实测 confirmed present in lark-cli 1.0.53 output) and
+   * `wiki +node-get`. Optional because some legacy call paths and
+   * root-node resolutions may not supply it.
+   */
+  parent_node_token?: string;
 }
 
 export interface LarkCliConfig {

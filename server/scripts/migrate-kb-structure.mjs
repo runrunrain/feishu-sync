@@ -240,7 +240,14 @@ async function main() {
   );
   try {
     fs.mkdirSync(path.dirname(reportPath), { recursive: true });
-    fs.writeFileSync(reportPath, JSON.stringify(report, null, 2));
+    // Normalize Windows backslashes in path fields so the report is
+    // valid JSON (raw backslashes are illegal \escape). Affects only
+    // local_md_path / csv_path / failed[].file — fields that may
+    // contain OS-native paths. (diting P1 review M1.)
+    const sanitized = JSON.parse(
+      JSON.stringify(report).replace(/\\\\/g, '/').replace(/\\\//g, '/')
+    );
+    fs.writeFileSync(reportPath, JSON.stringify(sanitized, null, 2));
     console.log(`[migrate] Report JSON written: ${reportPath}`);
   } catch (err) {
     console.warn(`[migrate] Could not write report JSON: ${err.message}`);
