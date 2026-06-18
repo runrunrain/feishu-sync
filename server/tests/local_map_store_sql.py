@@ -280,6 +280,75 @@ def test_set_sort_order_rejects_cross_parent():
     assert_eq("cross-parent no write", row[0], None)
 
 
+def test_set_sort_order_top_level_null_parent():
+    """R2.2bis-AC1 (top-level scope): parent_node_token=NULL scopes
+    the UPDATE to top-level rows only. Verifies NULL = NULL equality
+    via `IS ?` binding, which is how TS source differentiates NULL
+    parent from a string parent containing the literal 'null'."""
+    conn = fresh_db()
+    for tok, parent in [("T1", None), ("T2", None), ("CHILD", "T1_WNT")]:
+        upsert_document(conn, dict(
+            objToken=tok, wikiNodeToken=f"{tok}_WNT", objType="docx",
+            title=tok, localMdPath=f"/d/{tok}.md",
+            lastSyncedModifyTime="2026-06-18T00:00:00Z",
+            lastSyncedAt="2026-06-18T00:00:00Z", status="synced",
+            parentNodeToken=parent,
+        ))
+    updated = set_sort_order(conn, None, ["T2", "T1"])
+    assert_eq("top-level reorder updated count", updated, 2)
+    so = {r[0]: r[1] for r in conn.execute(
+        "SELECT obj_token, local_sort_order FROM documents"
+    ).fetchall()}
+    assert_eq("top-level T2 first", so["T2"], 0)
+    assert_eq("top-level T1 second", so["T1"], 1)
+    # Child row is NOT touched (parent != NULL).
+    assert_eq("child untouched by top-level reorder", so["CHILD"], None)
+
+
+def test_upsert_document_preserves_user_sort_order_across_sync():
+    """R2.2bis-AC3 (sync preserves user order): the sync flow calls
+    upsertDocument() with whatever fields it knows (v0.1.0 set).
+    The COALESCE pattern in the ON CONFLICT clause MUST preserve the
+    existing local_sort_order (sync flow never knows about it).
+    This is the SQL-level guarantee that user reorder survives sync."""
+    conn = fresh_db()
+    # 1. Initial sync write.
+    upsert_document(conn, dict(
+        objToken="DOCSYNC", wikiNodeToken="WNT_S", objType="docx",
+        title="orig", localMdPath="/d/orig.md",
+        lastSyncedModifyTime="2026-06-18T00:00:00Z",
+        lastSyncedAt="2026-06-18T00:00:00Z", status="synced",
+        parentNodeToken="PARENT_X",
+    ))
+    # 2. User reorders; setSortOrder writes local_sort_order=5.
+    set_sort_order(conn, "PARENT_X", ["DOCSYNC"])
+    mid = conn.execute(
+        "SELECT local_sort_order FROM documents WHERE obj_token='DOCSYNC'"
+    ).fetchone()[0]
+    assert_eq("user reorder applied", mid, 0)
+    # Re-apply with explicit index 5 (simulating multi-token reorder).
+    conn.execute(
+        "UPDATE documents SET local_sort_order=5 WHERE obj_token='DOCSYNC'"
+    )
+    # 3. Subsequent sync call (does NOT pass localSortOrder).
+    upsert_document(conn, dict(
+        objToken="DOCSYNC", wikiNodeToken="WNT_S", objType="docx",
+        title="updated by sync", localMdPath="/d/updated.md",
+        lastSyncedModifyTime="2026-06-18T01:00:00Z",
+        lastSyncedAt="2026-06-18T01:00:00Z", status="synced",
+        parentNodeToken=None, spaceId=None, objEditTime=None,
+        cloudDeleted=None, lastSeenAt=None, localSortOrder=None,
+    ))
+    row = conn.execute(
+        "SELECT title, local_md_path, local_sort_order FROM documents WHERE obj_token='DOCSYNC'"
+    ).fetchone()
+    assert_eq("sync updates title", row[0], "updated by sync")
+    assert_eq("sync updates path", row[1], "/d/updated.md")
+    # CRITICAL: local_sort_order MUST be preserved (sync does not own this field).
+    assert_eq("sync preserves local_sort_order", row[2], 5)
+
+
+
 # --- P2-T3 trash-bin methods (restore / purge / list) ----------------------
 
 def test_restore_cloud_deleted_clears_flag():
@@ -519,6 +588,8 @@ def main():
     test_sheet_sheets_upsert_preserves_md_path()
     test_set_sort_order_scoped_by_parent()
     test_set_sort_order_rejects_cross_parent()
+    test_set_sort_order_top_level_null_parent()
+    test_upsert_document_preserves_user_sort_order_across_sync()
     test_restore_cloud_deleted_clears_flag()
     test_purge_cloud_deleted_removes_row_and_cascades()
     test_list_cloud_deleted_returns_only_soft_deleted_ordered()

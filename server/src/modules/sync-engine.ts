@@ -10,8 +10,11 @@
  * - writeLocalMarkdown(): HTML comment header + .md.bak backup
  * - updateLocalMap(): LocalMapStore upsert with status=synced
  *
- * IMPORTANT: This module does NOT implement expandSyncedBlocks (M2-B) or
- * table reconstruction/LLM adaptation (M3) - these are optional injections.
+ * P0-Q3 实测 confirmed Feishu markdown export contains NO
+ * <synced_reference> tags in this deployment, so synced-block drilling
+ * (R3.9 / M2-B / 03 §3.4) is intentionally NOT implemented (per diting
+ * P2-core review Mi-3, dead-code cleanup). Table reconstruction / LLM
+ * adaptation (M3) are optional injections.
  */
 
 import { execFile } from 'child_process';
@@ -172,8 +175,11 @@ export class SyncEngine {
     // 3. Download attachments
     const attachments = await this.downloadAttachments(fetched, saveDir);
 
-    // 4. Expand synced blocks (M2-B - placeholder for now)
-    const expandedContent = await this.expandSyncedBlocks(fetched.content);
+    // 4. Synced-block expansion (R3.9 / M2-B): NOT implemented.
+    //    P0-Q3 实测 confirmed Feishu markdown export contains no
+    //    <synced_reference> tags in this deployment, so this step is a
+    //    no-op (content flows through unchanged).
+    const expandedContent = fetched.content;
 
     // 5. Export sheets if applicable (v0.2.0: also map sub-sheets to
     //    the sheet_sheets table for finer-grained change detection)
@@ -347,66 +353,6 @@ export class SyncEngine {
     }
 
     return attachments;
-  }
-
-  /**
-   * Expand synced blocks recursively
-   * Parses <synced_reference src-token="..."> tags and fetches remote content
-   * Implements cycle detection (visited tokens + depth limit)
-   */
-  private async expandSyncedBlocks(content: string): Promise<string> {
-    const MAX_DEPTH = 5;
-    const visitedTokens = new Set<string>();
-
-    const expand = async (markdown: string, depth: number): Promise<string> => {
-      if (depth > MAX_DEPTH) {
-        console.warn('[SyncEngine] Max recursion depth reached, stopping expansion');
-        return markdown;
-      }
-
-      // Parse <synced_reference src-token="..."> tags
-      const regex = /<synced_reference\s+src-token="([^"]+)">/g;
-      const matches = [...markdown.matchAll(regex)];
-
-      if (matches.length === 0) {
-        return markdown;
-      }
-
-      let expanded = markdown;
-
-      for (const match of matches) {
-        const srcToken = match[1];
-
-        // Skip already visited tokens (cycle detection)
-        if (visitedTokens.has(srcToken)) {
-          console.warn(`[SyncEngine] Cycle detected, skipping already visited token: ${srcToken}`);
-          expanded = expanded.replace(match[0], `[Cycle detected: ${srcToken}]`);
-          continue;
-        }
-
-        visitedTokens.add(srcToken);
-
-        try {
-          // Fetch remote content
-          const fetched = await this.fetchDocumentContent(srcToken, 'docx');
-          const remoteContent = fetched.content;
-
-          // Recursively expand nested synced blocks
-          const nestedExpanded = await expand(remoteContent, depth + 1);
-
-          // Replace the synced_reference tag with the expanded content
-          expanded = expanded.replace(match[0], nestedExpanded);
-        } catch (error) {
-          console.warn(`[SyncEngine] Failed to expand synced block for token ${srcToken}:`, error);
-          // Keep original tag on failure
-          expanded = expanded.replace(match[0], `[Failed to expand: ${srcToken}]`);
-        }
-      }
-
-      return expanded;
-    };
-
-    return await expand(content, 0);
   }
 
   /**

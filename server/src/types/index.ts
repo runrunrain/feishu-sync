@@ -119,6 +119,88 @@ export interface ChangeDetectionResult {
 }
 
 // ============================================================================
+// Mapping API Types (P2-T5/T6/T7/T10, v0.2.0 mapping-core)
+// ============================================================================
+
+/**
+ * DiffReport returned by GET /api/mapping/diff (03 §3.6.2).
+ * Groups changed documents by state + summary statistics for the UI.
+ * `unchanged` is a count (not an array) since surfacing every unchanged
+ * node to the UI would be noisy; the array form is available via the
+ * tree API when needed.
+ */
+export interface DiffReport {
+  added: ChangedDocument[];
+  modified: ChangedDocument[];
+  deleted: ChangedDocument[];
+  unchanged: number;
+  totalCloud: number;
+  totalLocal: number;
+  checkedAt: string;
+}
+
+/**
+ * Flattened node entry in the _index.json snapshot and the
+ * GET /api/mapping/tree response (03 §2.4.1 + §3.6.4 + §3.8).
+ *
+ * The frontend rebuilds the tree client-side using parent_node_token;
+ * we keep the array flat to avoid recursion / depth limits in transport
+ * and let the UI decide on lazy expansion strategy.
+ *
+ * sortOrder mirrors documents.local_sort_order (decision 5): null means
+ * "user has not reordered, display in Feishu's original order"; non-null
+ * is a 0-based weight applied within the same parent scope.
+ */
+export interface MappingNode {
+  obj_token: string;
+  wiki_node_token: string | null;
+  space_id: string | null;
+  obj_type: 'docx' | 'sheet' | 'slides' | 'unknown';
+  title: string;
+  local_path: string;
+  parent_node_token: string | null;
+  has_child: boolean;
+  obj_edit_time: number | null;
+  last_synced_modify_time: string;
+  last_synced_at: string;
+  last_seen_at: string | null;
+  status: 'synced' | 'changed' | 'error' | 'placeholder';
+  cloud_deleted: number; // 0 | 1
+  sortOrder: number | null;
+}
+
+/**
+ * Full _index.json snapshot structure (03 §2.4.1).
+ * Written to knowledge_base_root/_index.json as a read-only cache;
+ * SQLite remains the write source of truth.
+ */
+export interface IndexSnapshot {
+  version: string;
+  generated_at: string;
+  knowledge_base_root: string;
+  watched_root_urls: string[];
+  top_level_dirs: Array<{ dir: string; node_count: number }>;
+  nodes: MappingNode[];
+  orphan_files: Array<{ path: string; reason: string }>;
+}
+
+/**
+ * Request body for POST /api/mapping/reorder (03 §3.6.5.3, decision 5).
+ * parent_node_token is null when reordering top-level nodes.
+ * ordered_obj_tokens is the COMPLETE new ordering of the sibling set
+ * under that parent; backend assigns 0..N as local_sort_order.
+ */
+export interface ReorderRequest {
+  parent_node_token: string | null;
+  ordered_obj_tokens: string[];
+}
+
+export interface ReorderResponse {
+  updated: number;
+  refreshed_index: boolean;
+}
+
+// ============================================================================
 // LarkCli Types
 // ============================================================================
 

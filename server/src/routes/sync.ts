@@ -49,6 +49,18 @@ syncRoutes.post('/api/sync', async (c) => {
   // Execute synchronization
   const result: SyncResult = await syncEngine.syncDocuments(documents, options);
 
+  // Refresh _index.json snapshot (03 §2.4.1 生成时机: 同步完成后).
+  // Best-effort: snapshot failure must not invalidate an otherwise
+  // successful sync. The next manual refresh-index call will recover.
+  try {
+    const { SnapshotService } = await import('../modules/snapshot-service.js');
+    const indexScanner = new IndexScanner({ localMapStore, larkCliClient, config });
+    const snapshotService = new SnapshotService(localMapStore, configManager, indexScanner);
+    snapshotService.generate();
+  } catch (snapshotError) {
+    console.warn('[sync] _index.json refresh after sync failed (non-fatal):', snapshotError);
+  }
+
   return c.json(result);
 });
 
@@ -81,6 +93,17 @@ syncRoutes.post('/api/sync/index', async (c) => {
 
   // Execute scan
   const result = await indexScanner.scanKnowledgeBase(scanRoot);
+
+  // Refresh _index.json snapshot (03 §2.4.1 生成时机: 首次索引完成后).
+  // Best-effort: snapshot failure must not invalidate an otherwise
+  // successful index scan.
+  try {
+    const { SnapshotService } = await import('../modules/snapshot-service.js');
+    const snapshotService = new SnapshotService(localMapStore, configManager, indexScanner);
+    snapshotService.generate();
+  } catch (snapshotError) {
+    console.warn('[sync] _index.json refresh after index failed (non-fatal):', snapshotError);
+  }
 
   return c.json(result);
 });

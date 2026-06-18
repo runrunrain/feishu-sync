@@ -30,11 +30,16 @@
  * (parent_node_token/space_id actually persisted).
  *
  * The obj_edit_time fetching uses a fingerprint short-circuit (03 §3.3.2
- * 情况 B): if a node's (has_child + title + obj_token) signature is
- * unchanged AND the local row already has a non-null obj_edit_time, we
- * skip the per-node node-get call and reuse the cached value. This
- * bounds the worst-case extra requests to "nodes that actually changed
- * shape" instead of all nodes on every poll.
+ * 情况 B): if a node's (title + obj_token) signature is unchanged AND
+ * the local row already has a non-null obj_edit_time, we skip the
+ * per-node node-get call and reuse the cached value. has_child is NOT
+ * part of the fingerprint because the documents table does not persist
+ * it (03 §3.1 declares has_child too volatile to be worth storing);
+ * title+obj_token equality is sufficient since a renamed doc keeps its
+ * obj_token (triggering a refresh, which is correct) and a different
+ * obj_token means a different doc entirely. This bounds the worst-case
+ * extra requests to "nodes that actually changed identity" instead of
+ * all nodes on every poll.
  */
 
 import type { LarkCliClient } from './lark-cli-client.js';
@@ -270,10 +275,12 @@ export class ChangeDetector {
   /**
    * Fingerprint equality check (03 §3.3.2 情况 B optimization).
    *
-   * "Unchanged" means the (title, has_child, obj_token) triple from
-   * +node-list matches what's stored locally. When unchanged AND the
-   * local row has a non-null obj_edit_time, we skip the per-node
-   * node-get and trust the cache. Any field mismatch forces a refresh.
+   * "Unchanged" means the (title, obj_token) pair from +node-list
+   * matches what's stored locally. has_child is intentionally NOT part
+   * of the fingerprint (documents table does not persist it; see file
+   * header + 03 §3.1). When title+obj_token match AND the local row
+   * has a non-null obj_edit_time, we skip the per-node node-get and
+   * trust the cache. Any field mismatch forces a refresh.
    */
   private isFingerprintUnchanged(
     raw: RawListNode,
