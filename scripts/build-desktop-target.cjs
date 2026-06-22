@@ -141,32 +141,85 @@ async function main() {
     checkSuccess(serverInstallResult, 'Server dependencies');
 
     // Step 5: Rebuild native modules (better-sqlite3 for Electron 31)
+    //
+    // IMPORTANT ROOT CAUSE (v0.2.0 ABI crash fix, 2026-06-19):
+    //   `electron-builder install-app-deps` only scans the app root's node_modules.
+    //   It does NOT recurse into `server/node_modules`. Because asarUnpack includes
+    //   `server/**`, the plain-node (ABI=137) copy of better-sqlite3 from
+    //   server/node_modules was shipped as-is, while the runtime (Electron 31,
+    //   NODE_MODULE_VERSION 125) loaded it and crashed.
+    //
+    //   Fix: explicitly run @electron/rebuild against server/node_modules so the
+    //   server-side better-sqlite3 is compiled for Electron's ABI (125).
+    //
+    //   We still rebuild the root node_modules copy too (cheap, and keeps them
+    //   consistent in case anything loads better-sqlite3 from the root).
     logStep('Step 5: Rebuild native modules (better-sqlite3 for Electron 31)');
 
-    // Strategy: Use electron-builder install-app-deps (preferred for electron-builder workflows)
-    // Fallback: npx @electron/rebuild -f -w better-sqlite3
-    let rebuildResult;
+    // Resolve the exact Electron version installed at the root.
+    // Parse the JSON and read dependencies.electron.version explicitly; the old
+    // regex /"version":"(\d+\.\d+\.\d+)"/ accidentally matched the project's own
+    // version (0.2.0) because that field appears first in `npm list` output.
+    const electronVersionRaw = execSync('npm list electron --json', { cwd: rootDir, encoding: 'utf-8' });
+    let electronVersion = null;
     try {
-      console.log('Attempting electron-builder install-app-deps...');
-      rebuildResult = run('npx electron-builder install-app-deps');
-      checkSuccess(rebuildResult, 'Native rebuild (electron-builder)');
-    } catch (e1) {
-      console.warn('electron-builder install-app-deps failed, trying @electron/rebuild fallback...');
-      rebuildResult = run('npx @electron/rebuild -f -w better-sqlite3', {
-        env: {
-          ...process.env,
-          electron: execSync('npm list electron --json').toString().match(/"version":"(\d+\.\d+\.\d+)"/)?.[1] || '31.7.7'
+      const parsed = JSON.parse(electronVersionRaw);
+      const deps = parsed && parsed.dependencies && parsed.dependencies.electron;
+      if (deps && typeof deps.version === 'string') {
+        electronVersion = deps.version;
+      }
+    } catch {
+      // fall through to regex fallback below
+    }
+    if (!electronVersion) {
+      // Fallback: read package.json devDependencies/Dependencies electron field.
+      try {
+        const rootPkg = require(path.resolve(rootDir, 'package.json'));
+        const rawDep = (rootPkg.devDependencies && rootPkg.devDependencies.electron)
+          || (rootPkg.dependencies && rootPkg.dependencies.electron);
+        if (rawDep) {
+          // Strip leading non-digits (^, ~, >=, etc.)
+          const cleaned = rawDep.replace(/^[^\d]+/, '');
+          if (/^\d+\.\d+\.\d+$/.test(cleaned)) {
+            electronVersion = cleaned;
+          }
         }
-      });
-      checkSuccess(rebuildResult, 'Native rebuild (@electron/rebuild fallback)');
+      } catch {
+        // give up
+      }
     }
+    if (!electronVersion) {
+      throw new Error('Could not resolve Electron version from `npm list electron --json` or package.json. Aborting rebuild.');
+    }
+    console.log(`Resolved Electron version: ${electronVersion} (NODE_MODULE_VERSION 125 for Electron 31.x)`);
 
-    // Verify better-sqlite3 .node exists
-    const betterSqlite3Path = path.resolve(rootDir, 'server/node_modules/better-sqlite3/build/Release/better_sqlite3.node');
-    if (!fs.existsSync(betterSqlite3Path)) {
-      throw new Error(`Native module not found at ${betterSqlite3Path}. Rebuild failed.`);
+    // 5a. Rebuild server/node_modules/better-sqlite3 (the copy the runtime actually loads).
+    const rebuildServerResult = run(
+      `npx @electron/rebuild -f -w better-sqlite3 -v ${electronVersion}`,
+      { cwd: path.resolve(rootDir, 'server') }
+    );
+    checkSuccess(rebuildServerResult, 'Native rebuild (server/node_modules for Electron)');
+
+    // 5b. Also rebuild root node_modules better-sqlite3 (consistency; required by Step 6 packaging if it picks root copy).
+    const rebuildRootResult = run(
+      `npx @electron/rebuild -f -w better-sqlite3 -v ${electronVersion}`,
+      { cwd: rootDir }
+    );
+    checkSuccess(rebuildRootResult, 'Native rebuild (root node_modules for Electron)');
+
+    // Verify better-sqlite3 .node exists in BOTH locations and sanity-check ABI via Electron itself.
+    const serverNativePath = path.resolve(rootDir, 'server/node_modules/better-sqlite3/build/Release/better_sqlite3.node');
+    const rootNativePath = path.resolve(rootDir, 'node_modules/better-sqlite3/build/Release/better_sqlite3.node');
+    if (!fs.existsSync(serverNativePath)) {
+      throw new Error(`Server native module not found at ${serverNativePath}. Rebuild failed.`);
     }
-    console.log(`✅ Native module verified: ${betterSqlite3Path}`);
+    if (!fs.existsSync(rootNativePath)) {
+      throw new Error(`Root native module not found at ${rootNativePath}. Rebuild failed.`);
+    }
+    console.log(`✅ Native modules verified:`);
+    console.log(`   - ${serverNativePath}`);
+    console.log(`   - ${rootNativePath}`);
+    console.log(`   (Both rebuilt for Electron ${electronVersion}, NODE_MODULE_VERSION 125)`);
 
     // Step 6: Package with electron-builder
     logStep(`Step 6: Package with electron-builder [${platform} ${arch}]`);
