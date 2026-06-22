@@ -2,8 +2,66 @@
  * 中国风水墨设计系统
  * 宣纸米白 + 朱红印章 + 水墨青 + 墨色
  * 纯系统字体，断网可读
+ *
+ * 修复（2026-06-22）：
+ *   - 把品牌色/字体 token 放到 Tailwind 4 `@theme`（实块，非 inline）
+ *     命名空间下（`--color-*` / `--font-*`），让 `bg-seal` / `text-ink` /
+ *     `border-line` / `font-kai` / `font-serif` 等 utilities 自动生成
+ *   - 原 `:root` block 保留，不破坏现有 `var(--seal)` 等任意值引用
+ *     （theme.css base/utilities 层 + SettingsView/TreeNode inline style 等）
+ *   - `@theme inline` 块保留为语义层（bg-base/accent/success 等），
+ *     用于项目内部 token 分层引用，但不依赖它生成 utilities
  */
 
+/* ============================================================
+ * Tailwind 4 @theme（实块）— 生成 utilities 的真相源
+ *
+ * 规则：Tailwind 4 为 `@theme`（非 inline）块中按命名前缀声明的
+ *       token 自动生成对应 utilities：
+ *       - `--color-{name}`  → bg-/text-/border-/divide-/accent-/fill-/ring-/stroke-/from-/to-/via- 等
+ *       - `--font-{name}`   → font-{name}
+ *
+ * 来源对照：04 §6.1（色板 hex）+ §6.2（字体字族）
+ * 引用 `:root` 的 var() 让 hex 单一来源（不重复书写 hex）
+ * ============================================================ */
+@theme {
+  /* ---- Brand Colors（04 §6.1.1）---- */
+  --color-paper: var(--paper);
+  --color-paper-2: var(--paper-2);
+  --color-card-bg: var(--card-bg);
+  --color-ink: var(--ink);
+  --color-ink-soft: var(--ink-soft);
+  --color-ink-faint: var(--ink-faint);
+  --color-seal: var(--seal);
+  --color-seal-2: var(--seal-2);
+  --color-jade: var(--jade);
+  --color-jade-soft: var(--jade-soft);
+  --color-line: var(--line);
+  --color-dark: var(--dark);
+
+  /* ---- Typography 字体族（04 §6.2）----
+   * 注 1：源代码使用 `font-serif`/`font-sans`/`font-mono`/`font-kai`，
+   *       这里直接覆盖 Tailwind 默认主题的同名 token，让 utility
+   *       指向中国风字族（而非 Tailwind 默认的 ui-serif/system-ui/monospace）。
+   * 注 2：字面值与下方 :root 中的 --kai/--serif 保持完全一致（单一来源原则），
+   *       如需调整请同步两处（或后续合并到 :root 用 var() 引用）。
+   */
+  --font-kai: "KaiTi", "STKaiti", "Kaiti SC", "Songti SC", STSong, serif;
+  --font-serif: "Noto Serif SC", "Source Han Serif SC", "Songti SC", STSong, "SimSun", serif;
+  --font-sans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-mono: "Consolas", "SF Mono", "Source Code Pro", monospace;
+  /* 04 §6.2 语义字体 token（项目内部分层用，非源码主流引用） */
+  --font-display: "KaiTi", "STKaiti", "Kaiti SC", "Songti SC", STSong, serif;
+  --font-body: "Noto Serif SC", "Source Han Serif SC", "Songti SC", STSong, "SimSun", serif;
+}
+
+/* ============================================================
+ * @theme inline — 语义分层（不生成额外 utilities）
+ *
+ * 仅用于把品牌色映射到 Tailwind 语义命名（bg-base/accent/success 等），
+ * 供项目内部 `bg-bg-base`/`text-accent` 等少数 utility 引用。
+ * 若不使用这些语义 utility，本块可保留作为未来扩展的语义层。
+ * ============================================================ */
 @theme inline {
   /* Color System */
   --color-bg-base: var(--paper);
@@ -49,13 +107,6 @@
   --state-added-bg: rgba(107, 142, 138, 0.08);
   --state-modified-bg: rgba(158, 43, 37, 0.06);
   --state-deleted-bg: rgba(125, 118, 104, 0.08);
-
-  /* Typography */
-  --font-display: var(--kai);
-  --font-body: var(--serif);
-  --font-mono: "Consolas", "SF Mono", "Source Code Pro", monospace;
-  /* T5/04 §6.2: sans for badges/buttons/state text — clearer at small sizes than serif */
-  --font-sans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
 }
 
 :root {
@@ -265,7 +316,17 @@
   .state-modified-bg { background-color: var(--state-modified-bg); }
   .state-deleted-bg { background-color: var(--state-deleted-bg); }
 
-  /* Sans utility for badges/buttons/state text (04 §6.2) */
+  /* Sans utility for badges/buttons/state text (04 §6.2)
+   *
+   * 修复（2026-06-22）：Tailwind 4 默认把 `--font-sans` 绑定到
+   * `--default-font-family`，生成 `.font-sans{font-family:var(--font-sans)}`
+   * 后被 minifier 视为"等价于 html 默认字体"而删除。但本项目 base
+   * layer 强制 `body{font-family:var(--serif)}`，元素继承 serif，
+   * 加 `.font-sans` 应当恢复无衬线。所以在 utilities 层显式兜底，
+   * 不被 minifier 优化，确保徽章/按钮/state 文字真生效。
+   */
+  .font-sans { font-family: var(--font-sans); }
+  /* 旧名保留兼容（已有少量组件用 font-sans-ui，未来逐步迁移到 font-sans） */
   .font-sans-ui { font-family: var(--font-sans); }
 
   /* T3 R2.2bis: drag-and-drop helpers (decision 5, same-level reorder only) */
