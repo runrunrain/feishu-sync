@@ -117,13 +117,71 @@ export async function getConfig(): Promise<Config> {
 }
 
 /**
- * Save configuration
+ * Save configuration.
+ *
+ * Server (server/src/routes/config.ts PUT /api/config) wraps the updated
+ * config in `{ success: true, config: <Config> }`. Earlier callers assumed
+ * the response was the bare `Config`, which caused useConfig to store the
+ * wrapper as config — subsequent renders then read `config.watchedRootUrls`
+ * as undefined and KnowledgeSettingsCard crashed inside the ErrorBoundary,
+ * hiding the entire settings area. This helper unwraps both shapes so the
+ * UI is robust to either response style.
+ *
+ * The server also sanitizes `llm.apiKey` to `'***'` on GET (see GET
+ * /api/config). Callers MUST NOT send `llm.apiKey` back unless they have
+ * the real value; otherwise the literal `'***'` is persisted, destroying
+ * the user's key. `saveConfig` therefore drops `llm.apiKey` from the
+ * outbound payload when it still looks masked.
  */
 export async function saveConfig(config: Partial<Config>): Promise<Config> {
-  return request<Config>('/api/config', {
+  const outbound = sanitizeOutboundConfig(config);
+  const data = await request<unknown>('/api/config', {
     method: 'PUT',
-    body: JSON.stringify(config),
+    body: JSON.stringify(outbound),
   });
+  return unwrapConfigResponse(data);
+}
+
+/**
+ * Internal: shape of the outbound body. `llm` may be partial because we
+ * strip the masked `apiKey` before sending (see sanitizeOutboundConfig).
+ * The server merges with `{...currentConfig, ...partialConfig}` so any
+ * missing field is retained.
+ */
+type OutboundConfigBody = Omit<Partial<Config>, 'llm'> & {
+  llm?: Partial<NonNullable<Config['llm']>>;
+};
+
+/**
+ * Unwrap either `{success, config}` (current server shape) or a bare Config.
+ * Returns the input untouched if it does not look like the wrapper shape so
+ * the type stays honest at the call site.
+ */
+function unwrapConfigResponse(data: unknown): Config {
+  if (data && typeof data === 'object') {
+    const maybe = data as { success?: unknown; config?: Config };
+    if (maybe && typeof maybe.success === 'boolean' && maybe.config) {
+      return maybe.config;
+    }
+  }
+  return data as Config;
+}
+
+/**
+ * Drop fields the server has masked so we never persist the mask back over
+ * the real value. Currently this means `llm.apiKey === '***'`.
+ */
+function sanitizeOutboundConfig(config: Partial<Config>): OutboundConfigBody {
+  if (!config.llm) return config;
+  const llm = { ...config.llm };
+  // If the apiKey field still holds the server's mask sentinel, drop only
+  // that one field so the backend keeps its stored value. Other llm fields
+  // (baseUrl/model/temperature/...) stay intact.
+  if (typeof llm.apiKey === 'string' && llm.apiKey.trim() === '***') {
+    const { apiKey: _drop, ...rest } = llm;
+    return { ...config, llm: rest };
+  }
+  return { ...config, llm };
 }
 
 /**

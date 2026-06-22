@@ -46,7 +46,15 @@ export function useConfig(): UseConfigResult {
     setSaveError(null);
     try {
       const updated = await saveConfig(updates);
-      setConfig(updated);
+      // Defensive: client.saveConfig already unwraps `{success, config}`,
+      // but guard against regression so a bad server response cannot crash
+      // KnowledgeSettingsCard / LLMChannelSwitcher via setConfig of bad shape.
+      if (updated && typeof updated === 'object' && 'config' in updated && 'success' in updated) {
+        const wrapped = updated as unknown as { success: boolean; config: Config };
+        setConfig(wrapped.config);
+      } else {
+        setConfig(updated);
+      }
     } catch (err) {
       const message = err instanceof APIError ? err.message : 'Failed to save configuration';
       setSaveError(message);
