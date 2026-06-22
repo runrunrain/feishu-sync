@@ -279,6 +279,13 @@ export class LocalMapStore {
     objEditTime?: number | null;
     lastSeenAt: string;
   }): void {
+    // v0.2.0 detect-traverse-fix: when a node reappears in cloud traversal
+    // after a previous soft-delete (cloud_deleted=1), the row must be
+    // restored to cloud_deleted=0 so the UI stops surfacing it as trash.
+    // The previous ON CONFLICT clause omitted cloud_deleted from the
+    // UPDATE set, which prevented automatic revival — detect on
+    // watchedRoot A then detect on watchedRoot B would leave B's nodes
+    // permanently flagged as deleted even after they reappear.
     const stmt = this.getStatement(`
       INSERT INTO documents (
         obj_token, wiki_node_token, obj_type, title, local_md_path,
@@ -291,6 +298,7 @@ export class LocalMapStore {
         space_id = COALESCE(excluded.space_id, documents.space_id),
         obj_edit_time = COALESCE(excluded.obj_edit_time, documents.obj_edit_time),
         last_seen_at = excluded.last_seen_at,
+        cloud_deleted = 0,
         updated_at = datetime('now')
     `);
 

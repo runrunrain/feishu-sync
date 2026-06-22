@@ -136,7 +136,12 @@ function makeLocal(
     lastSyncedModifyTime: '',
     lastSyncedAt: '2026-06-01T00:00:00Z',
     status: 'synced',
-    parentNodeToken: null,
+    // v0.2.0 detect-traverse-fix: default parent_node_token to 'rootA'
+    // so seeded local rows are considered members of the default
+    // subtree under test. Without this, Pass 2 (subtree-scoped deleted
+    // detection) would treat every seeded row as out-of-subtree and
+    // never report it as deleted.
+    parentNodeToken: 'rootA',
     spaceId: 'space-1',
     objEditTime: 1000,
     cloudDeleted: 0,
@@ -148,12 +153,14 @@ function makeLocal(
 
 // CompareWithLocalRecords is private; access via cast for unit tests.
 type Comparator = (
-  cloudNodes: LarkCliNodeInfo[]
+  cloudNodes: LarkCliNodeInfo[],
+  rootToken: string
 ) => Promise<ReturnType<ChangeDetector['detectChanges']>>;
 
 async function runCompare(
   store: MockLocalMapStore,
-  cloudNodes: LarkCliNodeInfo[]
+  cloudNodes: LarkCliNodeInfo[],
+  rootToken = 'rootA'
 ) {
   const detector = new ChangeDetector(
     new MockLarkCliClient() as any,
@@ -161,7 +168,7 @@ async function runCompare(
   );
   const fn = (detector as unknown as { compareWithLocalRecords: Comparator })
     .compareWithLocalRecords;
-  return await fn.call(detector, cloudNodes);
+  return await fn.call(detector, cloudNodes, rootToken);
 }
 
 // ----- Tests -------------------------------------------------------------
@@ -342,6 +349,59 @@ describe('ChangeDetector.compareWithLocalRecords (P2-T1 three-state)', () => {
     expect(byType.get('added')).toBe('A');
     expect(byType.get('modified')).toBe('B');
     expect(byType.get('deleted')).toBe('D');
+  });
+
+  // v0.2.0 detect-traverse-fix: regression test for the multi-watchedRoot
+  // false-delete bug. Running detect on rootA must NOT flag rows belonging
+  // to rootB (different subtree) as deleted, even when those rows are
+  // absent from rootA's cloud traversal.
+  it('does NOT flag rows belonging to a different watchedRoot as deleted (detect-traverse-fix)', async () => {
+    // rootB-local row: wiki_node_token and parent_node_token both outside
+    // rootA's traversal set.
+    store.rows.set(
+      'X',
+      makeLocal({
+        objToken: 'X',
+        wikiNodeToken: 'nX-rootB',
+        parentNodeToken: 'rootB',
+        objEditTime: 1000,
+        status: 'synced',
+      })
+    );
+    // Local-only README (no wiki_node_token, parent not in any traversal).
+    store.rows.set(
+      'Y',
+      makeLocal({
+        objToken: 'Y',
+        wikiNodeToken: null,
+        parentNodeToken: null,
+        objEditTime: 1000,
+        status: 'synced',
+      })
+    );
+    // rootA row that IS legitimately absent → should be flagged deleted.
+    store.rows.set(
+      'Z',
+      makeLocal({
+        objToken: 'Z',
+        wikiNodeToken: 'nZ-rootA',
+        parentNodeToken: 'rootA',
+        objEditTime: 1000,
+        status: 'synced',
+      })
+    );
+
+    // Detect on rootA: cloud returns nothing (all rows absent).
+    const out = await runCompare(store, [], 'rootA');
+
+    // Only Z is in rootA's subtree (via parent_node_token='rootA'); X and Y
+    // must NOT be reported as deleted.
+    const deleted = out.filter((c) => c.changeType === 'deleted');
+    expect(deleted).toHaveLength(1);
+    expect(deleted[0].objToken).toBe('Z');
+    expect(store.markCalls).toEqual([
+      { objToken: 'Z', timestamp: expect.any(String) },
+    ]);
   });
 
   it('upsertDocumentSeen preserves status/local_md_path on existing rows', async () => {

@@ -29,6 +29,21 @@
  * obj_edit_time instead of new Date().toISOString() placeholder), B8
  * (parent_node_token/space_id actually persisted).
  *
+ * v0.2.0 detect-traverse-fix (2026-06-22):
+ *   - Pass rootToken into compareWithLocalRecords; Pass 2 now restricts
+ *     deleted detection to rows whose wiki_node_token or parent_node_token
+ *     is in the current traversal. Without this, multi-watchedRoot detect
+ *     runs marked every out-of-subtree row as cloud_deleted=1 (baize
+ *     structure-align-survey §6.2 问题 B; reproducible: detect 技术-Dev
+ *     wiped all 策划-Designer rows).
+ *   - Pass 1 added nodes now also call upsertDocumentSeen so the node is
+ *     persisted as a placeholder row. Previously added nodes stayed out
+ *     of the documents table, so the next detect re-reported them and
+ *     the UI never saw them (baize §4.1: 技术-Dev 6 子节点 0 入库).
+ *   - upsertDocumentSeen now clears cloud_deleted=0 on conflict so a
+ *     node that reappears in cloud (after being wrongly flagged) is
+ *     automatically restored.
+ *
  * The obj_edit_time fetching uses a fingerprint short-circuit (03 §3.3.2
  * 情况 B): if a node's (title + obj_token) signature is unchanged AND
  * the local row already has a non-null obj_edit_time, we skip the
@@ -103,8 +118,28 @@ export class ChangeDetector {
     // 2. Traverse entire subtree and collect all nodes (with real obj_edit_time)
     const cloudNodes = await this.traverseWikiSubtree(spaceId, rootToken);
 
+    // 2a. Include the root node itself in the comparison set. The traversal
+    // function only returns DESCENDANTS (BFS over children of rootToken);
+    // the root row was being flagged as deleted on every detect because it
+    // never appeared in seenObjTokens. Root is part of the subtree, so we
+    // prepend it to cloudNodes here (deduped via the seen-set in Pass 1).
+    cloudNodes.unshift({
+      node_token: rootInfo.node_token,
+      obj_token: rootInfo.obj_token,
+      obj_type: rootInfo.obj_type,
+      title: rootInfo.title,
+      space_id: rootInfo.space_id,
+      obj_edit_time: rootInfo.obj_edit_time,
+      has_child: rootInfo.has_child,
+      parent_node_token: rootInfo.parent_node_token ?? undefined,
+    });
+
     // 3. Compare with local SQLite records (three-state)
-    const changedDocuments = await this.compareWithLocalRecords(cloudNodes);
+    // Pass rootToken so Pass 2 (deleted detection) only considers rows that
+    // belong to THIS subtree — without it, detecting rootA would mark every
+    // rootB row as deleted (multi-watchedRoot scenario, see baize
+    // structure-align-survey and detect-traverse-fix report).
+    const changedDocuments = await this.compareWithLocalRecords(cloudNodes, rootToken);
 
     return {
       changed: changedDocuments.length > 0,
@@ -318,15 +353,23 @@ export class ChangeDetector {
    * cloud_deleted via upsertDocument (not change-detector's job).
    */
   private async compareWithLocalRecords(
-    cloudNodes: LarkCliNodeInfo[]
+    cloudNodes: LarkCliNodeInfo[],
+    rootToken: string
   ): Promise<ChangedDocument[]> {
     const changedDocuments: ChangedDocument[] = [];
     const seenObjTokens = new Set<string>();
+    // Track which wiki_node_tokens and parent_node_tokens are part of THIS
+    // subtree (by traversal). Used by Pass 2 to decide whether a local row
+    // belongs to this rootUrl (and therefore absence == deleted) or to a
+    // different rootUrl (and therefore absence is expected, not a delete).
+    const traversedNodeTokens = new Set<string>([rootToken]);
     const now = new Date().toISOString();
 
     // Pass 1: cloud → local
     for (const node of cloudNodes) {
       seenObjTokens.add(node.obj_token);
+      if (node.node_token) traversedNodeTokens.add(node.node_token);
+      if (node.parent_node_token) traversedNodeTokens.add(node.parent_node_token);
 
       try {
         const localRecord = await this.localMapStore.getDocumentByObjToken(
@@ -367,6 +410,11 @@ export class ChangeDetector {
 
         // Always refresh mapping metadata (B8 fix: actually persist
         // parent_node_token / space_id / obj_edit_time / last_seen_at).
+        // For added nodes this also creates a placeholder row so that
+        // subsequent detects see the node as "already known" instead of
+        // re-reporting it as added every poll (see detect-traverse-fix
+        // report: previously added nodes were never persisted, causing
+        // baize survey to observe 技术-Dev 6 子节点 0 入库).
         await this.localMapStore.upsertDocumentSeen({
           objToken: node.obj_token,
           wikiNodeToken: node.node_token,
@@ -386,6 +434,25 @@ export class ChangeDetector {
     }
 
     // Pass 2: local orphans → deleted (soft)
+    //
+    // v0.2.0 detect-traverse-fix: the previous implementation enumerated
+    // ALL local documents and flagged any absent-from-cloud row as
+    // deleted. Because detect is per-subtree (one rootUrl per call),
+    // running detect on watchedRoot A marked every row belonging to
+    // watchedRoot B (and every wiki_node_token=NULL local README) as
+    // cloud_deleted=1. This silently destroyed mapping data on every
+    // multi-root poll (see baize structure-align-survey §6.2 问题 B and
+    // detect-traverse-fix report §3 for the reproducible evidence).
+    //
+    // Fix: only consider rows that plausibly belong to THIS subtree. A
+    // row belongs to this subtree if ANY of the following holds:
+    //   (a) its wiki_node_token is in traversedNodeTokens (direct member)
+    //   (b) its parent_node_token is in traversedNodeTokens (direct child
+    //       of a traversed node — covers rows whose own wiki_node_token
+    //       is missing but whose parent is known to be in-subtree)
+    // Rows with wiki_node_token=NULL are local-only READMEs written by
+    // IndexScanner; they have no cloud counterpart by construction and
+    // must never be reported as cloud-deleted.
     try {
       const allLocal = await this.localMapStore.getAllDocuments();
       for (const local of allLocal) {
@@ -395,6 +462,16 @@ export class ChangeDetector {
         if (local.status === 'placeholder') continue;
         // Skip rows already soft-deleted (don't re-report).
         if (local.cloudDeleted === 1) continue;
+        // Skip local-only rows (no wiki_node_token and no parent in the
+        // current traversal). These are either hand-written READMEs or
+        // rows belonging to a different watchedRoot.
+        const inSubtreeByNodeToken =
+          local.wikiNodeToken != null && traversedNodeTokens.has(local.wikiNodeToken);
+        const inSubtreeByParentToken =
+          local.parentNodeToken != null &&
+          local.parentNodeToken !== '' &&
+          traversedNodeTokens.has(local.parentNodeToken);
+        if (!inSubtreeByNodeToken && !inSubtreeByParentToken) continue;
 
         await this.localMapStore.markCloudDeleted(local.objToken, now);
         changedDocuments.push({
