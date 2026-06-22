@@ -45,8 +45,14 @@ function AppShell() {
         authReady={authReady}
         pendingCount={pendingCount}
       />
+      {/*
+        主内容区布局重构（2026-06-19）：
+        - max-w-7xl (1280px) 居中（04 §11.3），原 max-w-6xl 略窄
+        - px-8 py-6 四周留白（原 p-5 太挤），呼吸感
+        - 不同主区可按需调整 max-width（SettingsView/Dashboard 在视图内部控制）
+      */}
       <main className="flex-1 overflow-auto scrollbar-thin">
-        <div className="max-w-6xl mx-auto p-5">{renderArea()}</div>
+        <div className="max-w-7xl mx-auto px-6 py-6 lg:px-8">{renderArea()}</div>
       </main>
     </div>
   );

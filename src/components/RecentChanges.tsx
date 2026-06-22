@@ -60,10 +60,10 @@ export function RecentChanges({
           </button>
         </div>
       </CardHeader>
-      <CardBody className="space-y-1.5">
+      <CardBody className="space-y-1">
         {visible.length === 0 ? (
-          <div className="flex flex-col items-center py-8 text-center">
-            <Inbox className="w-8 h-8 text-ink-faint mb-2" />
+          <div className="flex flex-col items-center py-10 text-center">
+            <Inbox className="w-10 h-10 text-ink-faint mb-3" />
             <p className="text-sm text-ink-soft">暂无变更</p>
             <p className="text-xs text-ink-faint mt-1">一切就绪</p>
           </div>
@@ -73,12 +73,12 @@ export function RecentChanges({
             return (
               <div
                 key={c.objToken}
-                className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-paper-2 cursor-pointer"
+                className="flex items-center gap-2.5 px-2.5 py-2 rounded hover:bg-paper-2 cursor-pointer"
                 onClick={onJumpToSync}
                 role="button"
                 tabIndex={0}
               >
-                <TypeIcon className="w-3.5 h-3.5 text-ink-soft shrink-0" />
+                <TypeIcon className="w-4 h-4 text-ink-soft shrink-0" />
                 <span className="flex-1 truncate text-sm text-ink">{c.title}</span>
                 <StatusBadge status={c.changeType} size="sm">
                   {STATE_LABEL[c.changeType]}

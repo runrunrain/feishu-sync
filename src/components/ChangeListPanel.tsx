@@ -276,9 +276,15 @@ export function ChangeListPanel({
           </div>
         </div>
       </CardHeader>
-      <CardBody className="space-y-3">
+      <CardBody className="space-y-4">
+        {/*
+          变更列表内部布局重构（2026-06-19）：
+          - space-y-3→space-y-4：卡片内部建立清晰的"次级 16px 节奏"
+          - Tab 按钮 px-3 py-1→px-3.5 py-1.5 + gap-1.5→gap-2：状态切换更舒展
+          - 列表项 space-y-2→space-y-2.5 + 空态 py-12→py-14
+        */}
         {/* Tabs */}
-        <div className="flex items-center gap-1.5 border-b border-line pb-2">
+        <div className="flex items-center gap-2 border-b border-line pb-3">
           {(['all', 'added', 'modified', 'deleted'] as Tab[]).map((t) => {
             const count = t === 'all' ? totalChanges : grouped[t].length;
             return (
@@ -286,7 +292,7 @@ export function ChangeListPanel({
                 key={t}
                 type="button"
                 onClick={() => setTab(t)}
-                className={`px-3 py-1 rounded text-xs font-sans-ui border transition-colors ${
+                className={`px-3.5 py-1.5 rounded text-xs font-sans-ui border transition-colors ${
                   tab === t
                     ? 'bg-seal/10 text-seal border-seal/30'
                     : 'bg-paper text-ink-soft border-line hover:bg-paper-2'
@@ -311,12 +317,12 @@ export function ChangeListPanel({
 
         {/* List */}
         {visibleChanges.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-12 text-center">
-            <Inbox className="w-10 h-10 text-ink-faint mb-2" />
+          <div className="flex flex-col items-center justify-center py-14 text-center">
+            <Inbox className="w-12 h-12 text-ink-faint mb-3" />
             <p className="text-sm text-ink-soft">当前筛选下无变更</p>
           </div>
         ) : (
-          <div className="space-y-2">
+          <div className="space-y-2.5">
             {visibleChanges.map((change) => (
               <ChangeItem
                 key={change.objToken}

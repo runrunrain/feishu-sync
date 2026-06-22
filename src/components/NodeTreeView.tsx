@@ -390,7 +390,7 @@ export function NodeTreeView({
         <div className="max-h-full overflow-auto scrollbar-thin pr-1">
           {roots.map((r) => renderNode(r, 0))}
         </div>
-        <div className="mt-2 pt-2 border-t border-line text-[11px] text-ink-faint font-sans-ui flex items-center justify-between">
+        <div className="mt-3 pt-3 border-t border-line text-xs text-ink-faint font-sans-ui flex items-center justify-between">
           <span>{nodes.length} 节点 · {roots.length} 顶层 · {changedCount} 变更</span>
           <button
             type="button"
@@ -401,7 +401,7 @@ export function NodeTreeView({
             刷新
           </button>
         </div>
-        <p className="mt-1 text-[11px] text-ink-faint font-sans-ui">
+        <p className="mt-1.5 text-[11px] text-ink-faint font-sans-ui">
           同级拖拽仅调整本地展示顺序 · 不影响飞书结构
         </p>
       </>
@@ -410,9 +410,14 @@ export function NodeTreeView({
 
   return (
     <Card variant="default" className={`flex flex-col ${className}`}>
-      {/* Search + filter */}
-      <div className="px-3 py-2 border-b border-line flex items-center gap-2">
-        <div className="flex-1 flex items-center gap-1.5 px-2 py-1 rounded-md border border-line bg-paper focus-within:border-seal">
+      {/*
+        节点树容器布局重构（2026-06-19）：
+        - 搜索栏 px-3 py-2→px-4 py-3，与 Card 内边距一致
+        - 搜索栏内部 gap-2→gap-2.5，搜索框与过滤器拉开
+        - CardBody flex-1 + overflow，保持节点滚动而不挤压头部
+      */}
+      <div className="px-4 py-3 border-b border-line flex items-center gap-2.5">
+        <div className="flex-1 flex items-center gap-2 px-2.5 py-1.5 rounded-md border border-line bg-paper focus-within:border-seal">
           <Search className="w-3.5 h-3.5 text-ink-faint" />
           <input
             type="text"
@@ -422,12 +427,12 @@ export function NodeTreeView({
             className="flex-1 bg-transparent text-sm text-ink placeholder:text-ink-faint focus:outline-none font-sans-ui"
           />
         </div>
-        <div className="flex items-center gap-1">
+        <div className="flex items-center gap-1.5">
           <Filter className="w-3.5 h-3.5 text-ink-faint" />
           <select
             value={filter}
             onChange={(e) => setFilter(e.target.value as TreeFilter)}
-            className="text-xs text-ink-soft bg-paper border border-line rounded-md px-1.5 py-1 font-sans-ui focus:outline-none focus:border-seal"
+            className="text-xs text-ink-soft bg-paper border border-line rounded-md px-2 py-1.5 font-sans-ui focus:outline-none focus:border-seal"
           >
             {(Object.keys(FILTER_LABEL) as TreeFilter[]).map((f) => (
               <option key={f} value={f}>{FILTER_LABEL[f]}</option>

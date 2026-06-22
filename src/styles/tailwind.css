@@ -1,4 +1,14 @@
-@import 'tailwindcss' source(none);
-@source '../**/*.{js,ts,jsx,tsx}';
+/*
+ * tailwind.css - Tailwind 4 入口
+ *
+ * 关键修复（2026-06-19）：
+ *   - Tailwind 4 推荐 `@import "tailwindcss"`，默认会自动扫描项目源码
+ *   - 显式 @source 声明 src 下的文件，确保 utilities 都被生成
+ *   - 之前 `source(none)` 让 Tailwind 不扫描任何文件，导致 CSS bundle 仅 5KB，
+ *     无任何 utilities（.flex .p-6 .gap-6 等），所有 className 失效
+ *   - tw-animate-css 包不存在，import 失败已被注释掉
+ */
+@import "tailwindcss";
 
-@import 'tw-animate-css';
+@source "../../src/**/*.{js,ts,jsx,tsx}";
+@source "../../index.html";

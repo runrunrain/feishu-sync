@@ -87,9 +87,16 @@ export function TreeNode({
       className={`relative group ${isDragging ? 'tree-node--dragging' : ''}`}
       style={{ paddingLeft: 0 }}
     >
+      {/*
+        TreeNode 布局重构（2026-06-19）：
+        - 行高 28px→32px：4px 增量大幅改善节点之间的呼吸（04 §3.2 原为 28px，
+          实际渲染时元素密集导致视觉拥挤；32px 在保持紧凑的同时提供视觉缓冲）
+        - 内部 gap-1.5→gap-2，图标与文字之间不再挤压
+        - 缩进 14px/级 保持（与原设计一致）
+      */}
       {isDropTargetBefore && <div className="tree-drop-indicator" />}
       <div
-        className={`flex items-center gap-1.5 h-7 pr-2 rounded-sm cursor-pointer transition-colors ${
+        className={`flex items-center gap-2 h-8 pr-2.5 rounded-sm cursor-pointer transition-colors ${
           selected
             ? 'bg-[rgba(158,43,37,0.04)]'
             : 'hover:bg-paper-2'
@@ -119,7 +126,7 @@ export function TreeNode({
         </span>
 
         {/* Collapse/expand arrow (only when has children) */}
-        <span className="shrink-0 w-3">
+        <span className="shrink-0 w-3.5">
           {hasChildren ? (
             <button
               type="button"
@@ -131,14 +138,14 @@ export function TreeNode({
               className="text-ink-faint hover:text-ink"
             >
               <ChevronRight
-                className={`w-3 h-3 transition-transform ${expanded ? 'rotate-90' : ''}`}
+                className={`w-3.5 h-3.5 transition-transform ${expanded ? 'rotate-90' : ''}`}
               />
             </button>
           ) : null}
         </span>
 
         {/* Type icon */}
-        <TypeIcon className="w-3.5 h-3.5 text-ink-soft shrink-0" />
+        <TypeIcon className="w-4 h-4 text-ink-soft shrink-0" />
 
         {/* Business marks (independent tag, decision 1) */}
         {businessMarks && businessMarks.length > 0 && (

@@ -29,20 +29,26 @@ const NAV_ITEMS: { id: MainArea; ordinal: string; label: string }[] = [
 
 export function TopBar({ currentArea, onAreaChange, authReady, pendingCount }: TopBarProps) {
   return (
-    <header className="h-[52px] shrink-0 bg-card-bg border-b border-line flex items-center justify-between px-4">
+    <header className="h-[56px] shrink-0 bg-card-bg border-b border-line flex items-center justify-between px-6 lg:px-8">
+      {/*
+        布局重构（2026-06-19）：
+        - 高度 52→56px：logo 32px + 内容呼吸，避免与 12px 楷体序号挤压
+        - 左右 padding 16→24/32px（lg），主区导航不再贴边
+        - nav gap-1→gap-2，主区按钮之间留呼吸
+      */}
       {/* Left: seal logo + title */}
-      <div className="flex items-center gap-2.5 min-w-[140px]">
-        <div className="w-8 h-8 rounded-sm bg-seal flex items-center justify-center shadow-sm">
-          <span className="text-white font-kai text-sm font-medium">飞</span>
+      <div className="flex items-center gap-3 min-w-[160px]">
+        <div className="w-9 h-9 rounded-sm bg-seal flex items-center justify-center shadow-sm">
+          <span className="text-white font-kai text-base font-medium leading-none">飞</span>
         </div>
-        <div className="flex flex-col leading-tight">
+        <div className="flex flex-col leading-tight gap-0.5">
           <span className="text-sm font-semibold font-kai text-ink">飞书同步</span>
           <span className="text-[10px] text-ink-faint font-mono">v0.2.0</span>
         </div>
       </div>
 
       {/* Center: 3 main areas */}
-      <nav className="flex items-center gap-1">
+      <nav className="flex items-center gap-1.5">
         {NAV_ITEMS.map((item) => {
           const isActive = currentArea === item.id;
           return (
@@ -50,7 +56,7 @@ export function TopBar({ currentArea, onAreaChange, authReady, pendingCount }: T
               key={item.id}
               type="button"
               onClick={() => onAreaChange(item.id)}
-              className={`relative h-9 px-4 rounded-md flex items-center gap-2 transition-colors ${
+              className={`relative h-10 px-5 rounded-md flex items-center gap-2 transition-colors ${
                 isActive
                   ? 'text-seal bg-[rgba(158,43,37,0.06)]'
                   : 'text-ink-soft hover:bg-paper hover:text-ink'
@@ -58,7 +64,7 @@ export function TopBar({ currentArea, onAreaChange, authReady, pendingCount }: T
               aria-current={isActive ? 'page' : undefined}
             >
               <span
-                className={`text-xs font-kai ${isActive ? 'text-seal' : 'text-ink-faint'}`}
+                className={`text-sm font-kai ${isActive ? 'text-seal' : 'text-ink-faint'}`}
               >
                 {item.ordinal}
               </span>
@@ -66,7 +72,7 @@ export function TopBar({ currentArea, onAreaChange, authReady, pendingCount }: T
               {isActive && (
                 <span
                   aria-hidden
-                  className="absolute -bottom-[1px] left-2 right-2 h-[2px] bg-seal rounded-full"
+                  className="absolute -bottom-[1px] left-3 right-3 h-[2px] bg-seal rounded-full"
                 />
               )}
             </button>
@@ -75,14 +81,14 @@ export function TopBar({ currentArea, onAreaChange, authReady, pendingCount }: T
       </nav>
 
       {/* Right: auth + pending badges */}
-      <div className="flex items-center gap-2 min-w-[200px] justify-end">
+      <div className="flex items-center gap-3 min-w-[220px] justify-end">
         {pendingCount > 0 && (
-          <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-seal/10 border border-seal/20">
+          <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-seal/10 border border-seal/20">
             <span className="w-1.5 h-1.5 rounded-full bg-seal animate-pulse-seal" />
             <span className="text-xs font-sans-ui text-seal font-medium">待同步 {pendingCount}</span>
           </div>
         )}
-        <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-paper border border-line">
+        <div className="flex items-center gap-2 px-3 py-1.5 rounded-md bg-paper border border-line">
           {authReady ? (
             <>
               <Wifi className="w-3.5 h-3.5 text-jade" />

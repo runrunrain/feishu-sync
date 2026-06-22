@@ -40,19 +40,25 @@ export function SyncControlPanel({
 
   return (
     <Card variant="elevated">
-      <CardBody className="space-y-3">
+      <CardBody className="space-y-5">
+        {/*
+          同步操作面板内部布局重构（2026-06-19）：
+          - space-y-3→space-y-5：标题/toggles/action 三组之间 20px 节奏
+          - 内部 toggle 行保持 gap-2.5
+          - action 行 pt-1→pt-2 + 加 mt-1，与上方内容拉开
+        */}
         <div className="flex items-center justify-between">
           <div>
             <h3 className="text-base font-kai font-medium text-ink">同步操作</h3>
-            <p className="text-xs text-ink-faint mt-0.5">
+            <p className="text-xs text-ink-faint mt-1">
               即将同步 <span className="text-seal font-sans-ui">{selectedCount}</span> 项文档
             </p>
           </div>
         </div>
 
         {/* Toggles */}
-        <div className="space-y-2.5">
-          <label className="flex items-start gap-2.5 cursor-pointer select-none">
+        <div className="space-y-3">
+          <label className="flex items-start gap-3 cursor-pointer select-none">
             <span
               className={`mt-0.5 shrink-0 w-4 h-4 rounded border flex items-center justify-center transition-colors ${
                 enableLLM
@@ -84,7 +90,7 @@ export function SyncControlPanel({
             </span>
           </label>
 
-          <label className="flex items-start gap-2.5 cursor-pointer select-none">
+          <label className="flex items-start gap-3 cursor-pointer select-none">
             <span
               className={`mt-0.5 shrink-0 w-4 h-4 rounded border flex items-center justify-center transition-colors ${
                 fullSync
@@ -118,7 +124,7 @@ export function SyncControlPanel({
         </div>
 
         {/* Action row */}
-        <div className="flex items-center justify-end gap-2 pt-1 border-t border-line">
+        <div className="flex items-center justify-end gap-2 pt-3 mt-1 border-t border-line">
           {syncing ? (
             <Button variant="ghost" onClick={onCancel}>
               <X className="w-4 h-4" />

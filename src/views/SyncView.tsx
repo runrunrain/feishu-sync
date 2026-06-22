@@ -150,7 +150,12 @@ export function SyncView() {
   }, [sync.syncResult]);
 
   return (
-    <div className="space-y-3">
+    <div className="space-y-6">
+      {/*
+        同步区布局重构（2026-06-19）：
+        - space-y-3→space-y-6：变更列表 / 同步操作 / 进度 / 结果 之间建立主区级别 24px 节奏
+        - 底部入口按钮 pt-1→pt-2 + gap-2→gap-3，与同步操作面板拉开间距
+      */}
       <ChangeListPanel
         rootUrl={memoRootUrl}
         rootUrlError={rootUrlError}
@@ -180,7 +185,7 @@ export function SyncView() {
       />
 
       {sync.error && (
-        <div className="p-3 rounded-md border border-seal-2/40 bg-seal-2/5 text-sm text-seal-2">
+        <div className="p-4 rounded-md border border-seal-2/40 bg-seal-2/5 text-sm text-seal-2">
           同步错误：{sync.error}
         </div>
       )}
@@ -195,11 +200,11 @@ export function SyncView() {
       )}
 
       {/* Bottom entry row: trash + log */}
-      <div className="flex items-center justify-end gap-2 pt-1">
+      <div className="flex items-center justify-end gap-3 pt-2">
         <button
           type="button"
           onClick={() => setTrashOpen(true)}
-          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs text-ink-soft border border-line rounded-md bg-card-bg hover:bg-paper-2 font-sans-ui transition-colors"
+          className="inline-flex items-center gap-2 px-3.5 py-2 text-xs text-ink-soft border border-line rounded-md bg-card-bg hover:bg-paper-2 font-sans-ui transition-colors"
         >
           <Trash2 className="w-3.5 h-3.5" />
           回收站
@@ -207,7 +212,7 @@ export function SyncView() {
         <button
           type="button"
           onClick={() => setLogOpen(true)}
-          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs text-ink-soft border border-line rounded-md bg-card-bg hover:bg-paper-2 font-sans-ui transition-colors"
+          className="inline-flex items-center gap-2 px-3.5 py-2 text-xs text-ink-soft border border-line rounded-md bg-card-bg hover:bg-paper-2 font-sans-ui transition-colors"
         >
           <ScrollText className="w-3.5 h-3.5" />
           查看完整日志

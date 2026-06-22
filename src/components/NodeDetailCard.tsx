@@ -52,8 +52,8 @@ export function NodeDetailCard({
     return (
       <Card variant="default">
         <CardBody>
-          <div className="flex flex-col items-center justify-center py-8 text-center">
-            <FileText className="w-8 h-8 text-ink-faint mb-2" />
+          <div className="flex flex-col items-center justify-center py-10 text-center">
+            <FileText className="w-10 h-10 text-ink-faint mb-3" />
             <p className="text-sm text-ink-soft">未选中节点</p>
             <p className="text-xs text-ink-faint mt-1">
               点击左侧节点树查看详情
@@ -88,8 +88,8 @@ export function NodeDetailCard({
 
   return (
     <Card variant="default">
-      <CardBody className="space-y-3">
-        <div className="flex items-start gap-2">
+      <CardBody className="space-y-4">
+        <div className="flex items-start gap-2.5">
           <TypeIcon className="w-4 h-4 text-ink-soft shrink-0 mt-0.5" />
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2 flex-wrap">
@@ -100,7 +100,7 @@ export function NodeDetailCard({
                 <BusinessTag marks={businessMarks} />
               )}
             </div>
-            <div className="flex items-center gap-2 mt-1 flex-wrap">
+            <div className="flex items-center gap-2 mt-1.5 flex-wrap">
               <StatusBadge
                 status={
                   node.cloud_deleted === 1
@@ -128,7 +128,7 @@ export function NodeDetailCard({
           </div>
         </div>
 
-        <dl className="grid grid-cols-3 gap-x-2 gap-y-1 text-xs">
+        <dl className="grid grid-cols-3 gap-x-3 gap-y-2 text-xs pt-1">
           <dt className="text-ink-faint font-sans-ui col-span-1">路径</dt>
           <dd className="text-ink-soft font-mono col-span-2 break-all">
             {node.local_path || '（未同步）'}
@@ -145,7 +145,7 @@ export function NodeDetailCard({
           </dd>
         </dl>
 
-        <div className="flex items-center gap-2 pt-1">
+        <div className="flex items-center gap-2.5 pt-1">
           <button
             type="button"
             onClick={handleSync}

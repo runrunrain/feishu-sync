@@ -24,11 +24,11 @@ export function OrphanFileAlert({ orphans }: OrphanFileAlertProps) {
 
   return (
     <Card variant="default" className="border-seal/30">
-      <CardBody className="py-3">
+      <CardBody>
         <button
           type="button"
           onClick={() => setExpanded((v) => !v)}
-          className="w-full flex items-center gap-2 text-left"
+          className="w-full flex items-center gap-2.5 text-left"
           aria-expanded={expanded}
         >
           <AlertTriangle className="w-4 h-4 text-seal shrink-0" />
@@ -46,12 +46,12 @@ export function OrphanFileAlert({ orphans }: OrphanFileAlertProps) {
         </button>
 
         {expanded && (
-          <ul className="mt-3 space-y-1.5 border-t border-line pt-3">
+          <ul className="mt-3 space-y-2 border-t border-line pt-3">
             {orphans.map((o, idx) => (
               <li key={`${o.path}-${idx}`} className="text-xs">
                 <p className="font-mono text-ink-soft break-all">{o.path}</p>
                 {o.reason && (
-                  <p className="text-ink-faint mt-0.5">原因：{o.reason}</p>
+                  <p className="text-ink-faint mt-1">原因：{o.reason}</p>
                 )}
               </li>
             ))}

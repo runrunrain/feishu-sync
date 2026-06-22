@@ -15,19 +15,24 @@ import { KnowledgeSettingsCard } from '../components/KnowledgeSettingsCard';
 import { LLMChannelSwitcher } from '../components/LLMChannelSwitcher';
 import { AuthSettingsCard } from '../components/AuthSettingsCard';
 import { AppUpdateCard } from '../components/AppUpdateCard';
-import { Card, CardBody } from '../components/common/Card';
 
 export function SettingsView() {
   return (
-    <div className="space-y-3">
-      <Card variant="default">
-        <CardBody>
-          <h2 className="text-base font-kai font-medium text-ink mb-1">设置</h2>
-          <p className="text-xs text-ink-soft">
-            知识库 · 轮询 · LLM 通道 · 认证 · 应用更新
-          </p>
-        </CardBody>
-      </Card>
+    <div className="space-y-6 max-w-5xl">
+      {/*
+        设置区布局重构（2026-06-19）：
+        - space-y-3→space-y-6：四张卡片之间建立 24px 主区节奏
+        - max-w-5xl (1024px)：设置区是表单型，比 Dashboard/SyncView 更窄更聚焦
+          （04 §11.3：设置区单列卡片 max-w-4xl；这里取 1024px 兼顾卡片内部 grid）
+        - 顶部介绍卡去掉冗余 Card 包装（与 KnowledgeSettingsCard 重复卡片），改用
+          纯文字标题区，作为整个设置区的一个清晰的视觉锚点
+      */}
+      <div className="pb-3 border-b border-line">
+        <h1 className="text-xl text-ink leading-tight" style={{ fontFamily: 'var(--kai)', fontWeight: 500 }}>设置</h1>
+        <p className="mt-2 text-sm text-ink-soft">
+          知识库 · 轮询 · LLM 通道 · 认证 · 应用更新
+        </p>
+      </div>
 
       <KnowledgeSettingsCard />
       <LLMChannelSwitcher />

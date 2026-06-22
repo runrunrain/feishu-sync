@@ -103,7 +103,7 @@ export function ChangeItem({
       }`}
     >
       <div
-        className="flex items-center gap-3 px-3 py-2.5 cursor-pointer"
+        className="flex items-center gap-3 px-4 py-3 cursor-pointer"
         onClick={() => onToggleSelect(change.objToken)}
         role="button"
         tabIndex={0}
@@ -180,7 +180,7 @@ export function ChangeItem({
 
       {/* Deleted-state action row (not batch-syncable) */}
       {isDeleted && (
-        <div className="flex items-center gap-2 px-3 pb-2.5 -mt-1">
+        <div className="flex items-center gap-2 px-4 pb-3 -mt-0.5">
           <span className="inline-flex items-center gap-1 text-[11px] text-ink-faint">
             <Archive className="w-3 h-3" />
             云端已删除 · 本地副本保留
@@ -193,7 +193,7 @@ export function ChangeItem({
                 e.stopPropagation();
                 onTrash(change.objToken);
               }}
-              className="inline-flex items-center gap-1 px-2 py-1 text-[11px] text-ink-soft border border-line rounded bg-card-bg hover:bg-paper-2 font-sans-ui"
+              className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] text-ink-soft border border-line rounded bg-card-bg hover:bg-paper-2 font-sans-ui"
             >
               移入回收站
             </button>
@@ -205,7 +205,7 @@ export function ChangeItem({
                 e.stopPropagation();
                 onPurge(change.objToken);
               }}
-              className="inline-flex items-center gap-1 px-2 py-1 text-[11px] text-seal-2 border border-seal-2/40 rounded bg-card-bg hover:bg-seal-2/5 font-sans-ui"
+              className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] text-seal-2 border border-seal-2/40 rounded bg-card-bg hover:bg-seal-2/5 font-sans-ui"
             >
               <Trash2 className="w-3 h-3" />
               永久清理
@@ -216,7 +216,7 @@ export function ChangeItem({
 
       {/* Sheet sub-tables (expanded) */}
       {change.objType === 'sheet' && expanded && sheets && sheets.length > 0 && (
-        <div className="px-3 pb-2.5">
+        <div className="px-4 pb-3">
           <SheetSubTableList sheets={sheets} onSyncSub={onSyncSub} />
         </div>
       )}

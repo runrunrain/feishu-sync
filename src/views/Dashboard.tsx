@@ -97,12 +97,19 @@ export function Dashboard({ onJumpToSync }: DashboardProps) {
   }, [nodes]);
 
   return (
-    <div className="space-y-3">
+    <div className="space-y-6">
+      {/*
+        总览布局重构（2026-06-19）：
+        - space-y-3→space-y-6：主区级别 24px 节奏（04 §6.3.1 space-6）
+        - 双栏 gap-3→gap-6：节点树与右栏之间留呼吸
+        - 右栏内部 space-y-3→space-y-5：卡片之间 20px，比主区节奏略紧半级
+        - 节点树栏高 calc(100vh-220px)：留足顶部条(56) + 状态条(48) + py-6*2 + space-6
+      */}
       <GlobalStatusBar />
 
-      <div className="grid grid-cols-1 lg:grid-cols-[260px_1fr] gap-3">
+      <div className="grid grid-cols-1 lg:grid-cols-[280px_1fr] gap-6">
         {/* Left: node tree */}
-        <div className="lg:h-[calc(100vh-180px)] min-h-[320px]">
+        <div className="lg:h-[calc(100vh-220px)] min-h-[360px]">
           <NodeTreeView
             nodes={nodes}
             selectedToken={selectedToken}
@@ -114,7 +121,7 @@ export function Dashboard({ onJumpToSync }: DashboardProps) {
         </div>
 
         {/* Right: orphan alert + recent + detail */}
-        <div className="space-y-3">
+        <div className="space-y-5">
           <OrphanFileAlert orphans={orphans} />
           <RecentChanges changes={changes} onJumpToSync={onJumpToSync} />
           <NodeDetailCard
