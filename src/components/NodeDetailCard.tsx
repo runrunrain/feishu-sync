@@ -6,21 +6,56 @@
  *
  * v0.2.0 cloud-link-coverage: 新增「飞书原文」可点击链接 + 「云匹配」徽章
  * （已对应 / 权限受限 / 未分类），让每个本地文档与飞书云的对应关系明确可见。
+ *
+ * v0.2.0 structure-align Phase D (D3): 增强「归属根 / 父节点 / 子节点」三行。
+ *   - 归属根：watched_root_url 反查 watchedRoots，显示 displayName
+ *   - 父节点：parent_node_token 反查 nodes 找父节点（可点击跳转）
+ *   - 子节点：filter nodes by parent_node_token === current.wiki_node_token
+ *
+ * 双视图通用（飞书视图 / 本地视图选中文件节点都显示同样的字段）。
  */
 
 import type { JSX } from 'react';
-import { FileText, Table, FileType, FolderOpen, RefreshCw, ExternalLink, CloudOff, HelpCircle } from 'lucide-react';
+import {
+  FileText,
+  Table,
+  FileType,
+  FolderOpen,
+  RefreshCw,
+  ExternalLink,
+  CloudOff,
+  HelpCircle,
+  ArrowUpRight,
+  CornerDownRight,
+} from 'lucide-react';
 import { Card, CardBody } from './common/Card';
 import { StatusBadge } from './common/StatusBadge';
 import { BusinessTag } from './common/BusinessTag';
 import { useToast } from './common/Toast';
-import type { MappingNode } from '../types';
+import type { MappingNode, WatchedRoot } from '../types';
 
 interface NodeDetailCardProps {
   node: MappingNode | null;
   businessMarks?: string[];
   onSyncNode?: (objToken: string) => void;
   onOpenFolder?: (localPath: string) => void;
+  /**
+   * v0.2.0 structure-align Phase D (D3): full node list so we can resolve
+   * parent_node_token → parent node and find children. When absent the
+   * 父节点/子节点 rows are hidden (graceful degradation for callers that
+   * haven't migrated yet).
+   */
+  allNodes?: MappingNode[];
+  /**
+   * v0.2.0 structure-align Phase D (D3): watchedRoots list so we can
+   * resolve watched_root_url → displayName for the 归属根 row.
+   */
+  watchedRoots?: WatchedRoot[];
+  /**
+   * Fired when the user clicks the parent node link or a child node link.
+   * Caller updates its selectedToken; this card re-renders with the new node.
+   */
+  onSelectNode?: (objToken: string) => void;
 }
 
 const TYPE_ICON = {
@@ -49,6 +84,9 @@ export function NodeDetailCard({
   businessMarks,
   onSyncNode,
   onOpenFolder,
+  allNodes,
+  watchedRoots,
+  onSelectNode,
 }: NodeDetailCardProps) {
   const toast = useToast();
 
@@ -73,6 +111,23 @@ export function NodeDetailCard({
   // (synced), best-effort guess (restricted, permission-denied), or
   // unclassified legacy (unknown — suggests a rebuild is needed).
   const cloudMatchBadge = renderCloudMatchBadge(node);
+
+  // v0.2.0 structure-align Phase D (D3): resolve parent / children / watchedRoot.
+  const nodeAny = node as MappingNode & { watched_root_url?: string | null };
+  const watchedRootUrl = nodeAny.watched_root_url ?? null;
+  const watchedRoot = watchedRoots && watchedRootUrl
+    ? watchedRoots.find((wr) => wr.url === watchedRootUrl) ?? null
+    : null;
+  const parentToken = node.parent_node_token ?? null;
+  const parentNode = parentToken && allNodes
+    ? allNodes.find((n) => n.wiki_node_token === parentToken) ?? null
+    : null;
+  const childNodes = allNodes && node.wiki_node_token
+    ? allNodes.filter((n) => n.parent_node_token === node.wiki_node_token)
+    : [];
+  // Cap the inline children list to keep the card scannable; "查看全部" not
+  // needed because clicking any child selects it and the card re-renders.
+  const MAX_INLINE_CHILDREN = 5;
 
   const TypeIcon = TYPE_ICON[node.obj_type] ?? FileText;
   const changed = node.status === 'changed' || node.cloud_deleted === 1;
@@ -173,6 +228,89 @@ export function NodeDetailCard({
           <dd className="text-ink-soft font-mono col-span-2">
             {node.last_synced_at ? formatTime(node.last_synced_at) : '尚未同步'}
           </dd>
+          {/* v0.2.0 structure-align Phase D (D3): 归属根 row */}
+          {watchedRoot && (
+            <>
+              <dt className="text-ink-faint font-sans-ui col-span-1">归属根</dt>
+              <dd className="col-span-2">
+                <span className="inline-flex items-center gap-1.5 text-xs text-ink-soft font-sans-ui">
+                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-seal" />
+                  {watchedRoot.displayName || watchedRoot.title || watchedRoot.localDir}
+                  <a
+                    href={watchedRoot.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-jade hover:text-jade-2"
+                    title={`飞书 wiki token: ${watchedRoot.nodeToken}`}
+                  >
+                    <ExternalLink className="w-3 h-3" />
+                  </a>
+                </span>
+              </dd>
+            </>
+          )}
+          {/* v0.2.0 structure-align Phase D (D3): 父节点 row (only when resolvable) */}
+          {allNodes && parentToken && (
+            <>
+              <dt className="text-ink-faint font-sans-ui col-span-1">父节点</dt>
+              <dd className="col-span-2">
+                {parentNode ? (
+                  <button
+                    type="button"
+                    onClick={() => onSelectNode?.(parentNode.obj_token)}
+                    className="inline-flex items-center gap-1 text-xs text-jade hover:text-jade-2 font-sans-ui text-left"
+                    title={parentNode.local_path || parentNode.obj_token}
+                  >
+                    <ArrowUpRight className="w-3 h-3 shrink-0" />
+                    <span className="truncate max-w-[260px]">{parentNode.title}</span>
+                  </button>
+                ) : (
+                  <span className="text-xs text-ink-faint font-sans-ui">
+                    {parentToken.slice(0, 12)}…（未在节点表中）
+                  </span>
+                )}
+              </dd>
+            </>
+          )}
+          {/* v0.2.0 structure-align Phase D (D3): 子节点 list (only when allNodes provided) */}
+          {allNodes && (
+            <>
+              <dt className="text-ink-faint font-sans-ui col-span-1">
+                子节点{childNodes.length > 0 ? ` (${childNodes.length})` : ''}
+              </dt>
+              <dd className="col-span-2">
+                {childNodes.length === 0 ? (
+                  <span className="text-xs text-ink-faint font-sans-ui">无</span>
+                ) : (
+                  <ul className="space-y-1">
+                    {childNodes.slice(0, MAX_INLINE_CHILDREN).map((c) => (
+                      <li key={c.obj_token}>
+                        <button
+                          type="button"
+                          onClick={() => onSelectNode?.(c.obj_token)}
+                          className="inline-flex items-center gap-1 text-xs text-ink-soft hover:text-seal font-sans-ui text-left"
+                          title={c.local_path || c.obj_token}
+                        >
+                          <CornerDownRight className="w-3 h-3 shrink-0 text-ink-faint" />
+                          <span className="truncate max-w-[260px]">{c.title}</span>
+                          {c.status === 'changed' && (
+                            <span className="ml-1 inline-block px-1 rounded-sm text-[10px] bg-seal/10 text-seal">
+                              变更
+                            </span>
+                          )}
+                        </button>
+                      </li>
+                    ))}
+                    {childNodes.length > MAX_INLINE_CHILDREN && (
+                      <li className="text-[11px] text-ink-faint font-sans-ui pl-4">
+                        还有 {childNodes.length - MAX_INLINE_CHILDREN} 项，请通过节点树展开查看
+                      </li>
+                    )}
+                  </ul>
+                )}
+              </dd>
+            </>
+          )}
         </dl>
 
         <div className="flex items-center gap-2.5 pt-1">

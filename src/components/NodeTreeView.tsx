@@ -12,17 +12,28 @@
  * 搜索：标题模糊匹配；命中节点高亮 + 自动展开父级路径。
  * 过滤：全部 / 仅变更 / 仅错误 / 仅孤儿（孤儿基于 _index.json.orphan_files，
  *       由父组件通过 orphanPaths prop 注入；详见 P1-1 修复说明）。
+ *
+ * v0.2.0 structure-align Phase D（D1）：
+ *   - 新增 view toggle「飞书视图 / 本地视图」（伏羲 S1 + S5）。
+ *   - 飞书视图：按 watchedRoot 分组顶层节点（filter wiki_node_token != null）。
+ *     由父组件通过 `watchedRoots` + `nodes`（已经过 server-side filter）注入。
+ *   - 本地视图：由父组件改为渲染 LocalDirTreeView（本组件不再兼任）；
+ *     `view`/`onViewChange` 由父组件管理，NodeTreeView 仅渲染 toggle + 飞书树体。
+ *   - 默认飞书视图（C5）。
+ *
+ * 向后兼容：未传 view/onViewChange 时退化为单视图（不渲染 toggle），
+ *           行为与 P4 完全一致，避免破坏其他调用点。
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Search, Filter, RefreshCw, AlertTriangle } from 'lucide-react';
+import { Search, Filter, RefreshCw, AlertTriangle, Cloud, FolderTree } from 'lucide-react';
 import { Card, CardBody } from './common/Card';
 import { TreeNode } from './TreeNode';
 import { EmptyState } from './common/EmptyState';
 import { useToast } from './common/Toast';
 import { appLogger } from '../utils/appLogger';
 import { getMappingTree, reorderMapping } from '../api/client';
-import type { MappingNode } from '../types';
+import type { MappingNode, WatchedRoot } from '../types';
 
 type TreeFilter = 'all' | 'changed' | 'error' | 'orphan';
 
@@ -55,18 +66,47 @@ interface NodeTreeViewProps {
   orphanPaths?: Set<string>;
   /** ClassName override for embedding in narrow layouts. */
   className?: string;
+  /**
+   * v0.2.0 structure-align Phase D (D1): when provided, the tree renders a
+   * 「飞书视图 / 本地视图」toggle at the top. The parent owns the state
+   * and swaps NodeTreeView ↔ LocalDirTreeView on change.
+   */
+  view?: 'feishu' | 'local';
+  onViewChange?: (view: 'feishu' | 'local') => void;
+  /**
+   * v0.2.0 structure-align Phase D (D1): watchedRoots for top-level
+   * grouping. When provided, roots without parent_node_token are grouped
+   * under their watchedRoot's display_name; when absent, the legacy flat
+   * root list is used.
+   */
+  watchedRoots?: WatchedRoot[];
 }
 
 interface TreeBucket {
-  // obj_token → children sorted by sortOrder/title.
+  // parent_node_token (wiki_node_token form) → children sorted by sortOrder/title.
+  // 飞书节点的 parent_node_token 指向父节点的 wiki_node_token（非 obj_token），
+  // 因此 childrenByParent 的 key 必须按 parent_node_token 聚合，renderNode
+  // 查子节点时也必须用 wiki_node_token 查（而非 obj_token）。
   childrenByParent: Map<string | null, MappingNode[]>;
-  // obj_token → node (lookup)
+  // obj_token → node (lookup)。供 DnD / expanded / selectedToken 等
+  // 以 obj_token 为标识的查找使用（这些场景不依赖父子关系）。
   nodeByToken: Map<string, MappingNode>;
+  // wiki_node_token → node (lookup)。飞书父子链专用索引：
+  // parent_node_token 指向的就是父节点的 wiki_node_token。
+  // 本地节点（wiki_node_token=null）不入此索引，其父子关系
+  // 在飞书视图中无意义（飞书视图 server 已 filter wiki_node_token IS NOT NULL）。
+  nodeByWikiToken: Map<string, MappingNode>;
 }
 
 function buildTree(nodes: MappingNode[]): TreeBucket {
   const nodeByToken = new Map<string, MappingNode>();
-  for (const n of nodes) nodeByToken.set(n.obj_token, n);
+  const nodeByWikiToken = new Map<string, MappingNode>();
+  for (const n of nodes) {
+    nodeByToken.set(n.obj_token, n);
+    if (n.wiki_node_token != null) {
+      nodeByWikiToken.set(n.wiki_node_token, n);
+    }
+  }
 
   const childrenByParent = new Map<string | null, MappingNode[]>();
   for (const n of nodes) {
@@ -91,7 +131,7 @@ function buildTree(nodes: MappingNode[]): TreeBucket {
     });
     childrenByParent.set(k, arr);
   }
-  return { childrenByParent, nodeByToken };
+  return { childrenByParent, nodeByToken, nodeByWikiToken };
 }
 
 export function NodeTreeView({
@@ -102,6 +142,9 @@ export function NodeTreeView({
   businessMarksByToken,
   orphanPaths,
   className = '',
+  view,
+  onViewChange,
+  watchedRoots,
 }: NodeTreeViewProps) {
   const [nodes, setNodes] = useState<MappingNode[]>(nodesProp ?? []);
   const [loading, setLoading] = useState<boolean>(!nodesProp);
@@ -158,14 +201,22 @@ export function NodeTreeView({
       // Also expand parents that contain changed/error children.
       for (const n of nodes) {
         if (n.status === 'changed' || n.status === 'error' || n.cloud_deleted === 1) {
-          // expand the immediate parent
+          // expand the immediate parent.
+          // parent_node_token is the parent's wiki_node_token (feishu form),
+          // so look up via nodeByWikiToken. Fall back to nodeByToken for
+          // legacy callers that still pass obj_token as parent identifier.
           let p = n.parent_node_token;
           // walk up two levels max
           let depth = 0;
           while (p && depth < 2) {
-            next.add(p);
-            const parent = tree.nodeByToken.get(p);
-            p = parent?.parent_node_token ?? null;
+            const parent = tree.nodeByWikiToken.get(p) ?? tree.nodeByToken.get(p);
+            if (!parent) break;
+            // expanded set is keyed by obj_token (see renderNode), so add
+            // the parent's obj_token — NOT its wiki_node_token. Earlier code
+            // added the raw parent_node_token (wiki form), which never
+            // matched expanded.has(node.obj_token) and silently no-op'd.
+            next.add(parent.obj_token);
+            p = parent.parent_node_token ?? null;
             depth++;
           }
         }
@@ -200,8 +251,12 @@ export function NodeTreeView({
       if (q) {
         let p = n.parent_node_token;
         while (p) {
-          result.add(`__expand__${p}`);
-          p = tree.nodeByToken.get(p)?.parent_node_token ?? null;
+          // parent_node_token is wiki_node_token form; resolve to the actual
+          // parent node to add its obj_token (expanded set is keyed by obj_token).
+          const parent = tree.nodeByWikiToken.get(p) ?? tree.nodeByToken.get(p);
+          if (!parent) break;
+          result.add(`__expand__${parent.obj_token}`);
+          p = parent.parent_node_token ?? null;
         }
       }
     }
@@ -322,7 +377,12 @@ export function NodeTreeView({
 
   // ---- Recursive render ----
   const renderNode = (node: MappingNode, level: number): React.ReactNode => {
-    const children = tree.childrenByParent.get(node.obj_token) ?? [];
+    // Feishu parent-child chain uses wiki_node_token as the key:
+    // a child's parent_node_token points to the parent's wiki_node_token
+    // (NOT obj_token). For local-only nodes (wiki_node_token null), there
+    // is no feishu-side parent linkage, so they can only be roots.
+    const childKey = node.wiki_node_token ?? null;
+    const children = tree.childrenByParent.get(childKey) ?? [];
     const hasChildren = node.has_child || children.length > 0;
     const isExpanded = expanded.has(node.obj_token);
     const marks = businessMarksByToken?.[node.obj_token];
@@ -354,6 +414,35 @@ export function NodeTreeView({
   };
 
   const roots = tree.childrenByParent.get(null) ?? [];
+
+  // v0.2.0 structure-align Phase D (D1): group roots by watchedRoot when
+  // watchedRoots are provided. Roots that have a watched_root_url are
+  // rendered under their watchedRoot's display_name header; roots without
+  // a watched_root_url fall through to an "未分类" group at the end.
+  const groupedRoots = useMemo(() => {
+    if (!watchedRoots || watchedRoots.length === 0) {
+      return null;
+    }
+    const byUrl = new Map<string, MappingNode[]>();
+    const unclassified: MappingNode[] = [];
+    for (const r of roots) {
+      const url = (r as MappingNode & { watched_root_url?: string | null }).watched_root_url;
+      if (url) {
+        const arr = byUrl.get(url) ?? [];
+        arr.push(r);
+        byUrl.set(url, arr);
+      } else {
+        unclassified.push(r);
+      }
+    }
+    const groups = watchedRoots
+      .map((wr) => ({
+        watchedRoot: wr,
+        nodes: byUrl.get(wr.url) ?? [],
+      }))
+      .filter((g) => g.nodes.length > 0);
+    return { groups, unclassified };
+  }, [roots, watchedRoots]);
 
   // ----- Loading / error / empty states -----
   let body: React.ReactNode;
@@ -388,7 +477,38 @@ export function NodeTreeView({
     body = (
       <>
         <div className="max-h-full overflow-auto scrollbar-thin pr-1">
-          {roots.map((r) => renderNode(r, 0))}
+          {groupedRoots ? (
+            <>
+              {groupedRoots.groups.map((g) => (
+                <div key={g.watchedRoot.url} className="mb-2">
+                  <div className="sticky top-0 z-10 bg-card-bg/95 backdrop-blur-sm px-2 py-1.5 border-b border-line/60 flex items-center gap-2">
+                    <Cloud className="w-3.5 h-3.5 text-seal shrink-0" />
+                    <span
+                      className="text-xs font-medium text-ink truncate"
+                      style={{ fontFamily: 'var(--kai)' }}
+                      title={g.watchedRoot.url}
+                    >
+                      {g.watchedRoot.displayName || g.watchedRoot.title || g.watchedRoot.localDir}
+                    </span>
+                    <span className="ml-auto text-[10px] text-ink-faint font-sans-ui shrink-0">
+                      {g.nodes.length} 项
+                    </span>
+                  </div>
+                  {g.nodes.map((r) => renderNode(r, 0))}
+                </div>
+              ))}
+              {groupedRoots.unclassified.length > 0 && (
+                <div className="mt-3">
+                  <div className="px-2 py-1.5 text-[11px] text-ink-faint font-sans-ui border-b border-line/40">
+                    未分类（未绑定 watchedRoot）
+                  </div>
+                  {groupedRoots.unclassified.map((r) => renderNode(r, 0))}
+                </div>
+              )}
+            </>
+          ) : (
+            roots.map((r) => renderNode(r, 0))
+          )}
         </div>
         <div className="mt-3 pt-3 border-t border-line text-xs text-ink-faint font-sans-ui flex items-center justify-between">
           <span>{nodes.length} 节点 · {roots.length} 顶层 · {changedCount} 变更</span>
@@ -415,7 +535,51 @@ export function NodeTreeView({
         - 搜索栏 px-3 py-2→px-4 py-3，与 Card 内边距一致
         - 搜索栏内部 gap-2→gap-2.5，搜索框与过滤器拉开
         - CardBody flex-1 + overflow，保持节点滚动而不挤压头部
+        - v0.2.0 structure-align Phase D (D1)：view toggle 嵌入搜索栏之上
       */}
+      {view && onViewChange && (
+        <div className="px-4 pt-3 pb-2 border-b border-line">
+          <div
+            role="tablist"
+            aria-label="节点树视图"
+            className="inline-flex items-center rounded-md border border-line bg-paper p-0.5 text-xs font-sans-ui"
+          >
+            <button
+              type="button"
+              role="tab"
+              aria-selected={view === 'feishu'}
+              onClick={() => onViewChange('feishu')}
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-[5px] transition-colors ${
+                view === 'feishu'
+                  ? 'bg-seal text-white shadow-sm'
+                  : 'text-ink-soft hover:text-ink'
+              }`}
+            >
+              <Cloud className="w-3.5 h-3.5" />
+              飞书视图
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={view === 'local'}
+              onClick={() => onViewChange('local')}
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-[5px] transition-colors ${
+                view === 'local'
+                  ? 'bg-seal text-white shadow-sm'
+                  : 'text-ink-soft hover:text-ink'
+              }`}
+            >
+              <FolderTree className="w-3.5 h-3.5" />
+              本地视图
+            </button>
+          </div>
+          <p className="mt-1.5 text-[11px] text-ink-faint font-sans-ui">
+            {view === 'feishu'
+              ? '按飞书节点结构组织（过滤本地独有文件）'
+              : '按本地文件系统路径组织（含本地独有）'}
+          </p>
+        </div>
+      )}
       <div className="px-4 py-3 border-b border-line flex items-center gap-2.5">
         <div className="flex-1 flex items-center gap-2 px-2.5 py-1.5 rounded-md border border-line bg-paper focus-within:border-seal">
           <Search className="w-3.5 h-3.5 text-ink-faint" />

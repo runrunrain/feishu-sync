@@ -155,6 +155,99 @@ export interface MappingNode {
    */
   original_link: string | null;
   cloud_match: 'synced' | 'restricted' | 'unknown';
+  /**
+   * v0.2.0 structure-align Phase B: the watchedRoot URL that owns this node.
+   * Used by the cloud view to group top-level nodes by watchedRoot.
+   * Null for local-only or unclassified rows.
+   */
+  watched_root_url?: string | null;
+}
+
+// ============================================================================
+// v0.2.0 structure-align Phase B: watchedRoots + TreeResponse envelope
+// ============================================================================
+
+/**
+ * Materialized watchedRoot record (mirrors server/src/types/index.ts).
+ *
+ * Derived from config.watchedRootUrls + the documents table; one row per
+ * configured root. The frontend uses this for:
+ *   - Cloud view: top-level grouping of MappingNode by watched_root_url.
+ *   - Settings panel: surface child count + status per watchedRoot.
+ *
+ * `status`:
+ *   - 'synced'         : watchedRoot is configured + at least one doc maps to it.
+ *   - 'missing_in_db'  : watchedRoot is configured but no doc references it
+ *                        (typical when detect hasn't run yet or the root has
+ *                        no local .md files under its local_dir).
+ *   - 'error'          : detect attempted and failed (lark-cli error etc);
+ *                        `diagnostic` holds the failure reason.
+ */
+export interface WatchedRoot {
+  url: string;
+  nodeToken: string;
+  title: string;
+  displayName: string;
+  localDir: string;
+  trackMode: 'tracked' | 'mounted';
+  status: 'synced' | 'missing_in_db' | 'error';
+  lastDetectedAt: string | null;
+  childCount: number;
+  diagnostic?: string;
+}
+
+/**
+ * v0.2.0 structure-align Phase B: response envelope returned by
+ * GET /api/mapping/tree?view=feishu|local. Mirrors server TreeResponse.
+ *
+ * - `view`: echoes the requested view.
+ * - `nodes`: filtered MappingNode[] (feishu view → wiki_node_token != null).
+ * - `watched_roots`: top-level grouping metadata.
+ * - `orphan_files`: included in local view; empty array in feishu view.
+ * - `stats`: summary counts for the status bar.
+ */
+export interface TreeResponse {
+  view: 'feishu' | 'local';
+  nodes: MappingNode[];
+  watched_roots: WatchedRoot[];
+  orphan_files: Array<{ path: string; reason: string; cloud_match: 'local_only' }>;
+  stats: {
+    total_nodes: number;
+    watched_root_count: number;
+    cloud_match_distribution: Record<string, number>;
+  };
+}
+
+/**
+ * Local directory tree node used by LocalDirTreeView (D2).
+ *
+ * Built client-side by splitting `local_path` on '/' and reassembling the
+ * directory tree. The shape is intentionally recursive so the React
+ * component can render with a single recursive function.
+ */
+export interface LocalDirTreeNode {
+  type: 'dir' | 'file';
+  name: string;
+  /** POSIX-style relative path (knowledgeBaseRoot-relative). */
+  path: string;
+  children?: LocalDirTreeNode[];
+  /** Present on file nodes that map to a documents row. */
+  docRecord?: MappingNode;
+  /** cloud_match from docRecord or orphan_files entry. */
+  cloud_match?: 'synced' | 'restricted' | 'unknown' | 'local_only';
+  original_link?: string | null;
+  watched_root_url?: string | null;
+  /** True if the entry comes from orphan_files (not a documents row). */
+  is_orphan?: boolean;
+}
+
+/**
+ * v0.2.0 structure-align Phase B: mounted_dirs entry (local-only top-level
+ * directories that exist on disk but are not bound to any watchedRoot).
+ */
+export interface MountedDir {
+  local_dir: string;
+  reason: string;
 }
 
 /**
@@ -202,6 +295,18 @@ export interface IndexSnapshot {
   top_level_dirs: TopLevelDir[];
   nodes: MappingNode[];
   orphan_files: OrphanFile[];
+  /**
+   * v0.2.0 structure-align Phase B: materialized watchedRoots array
+   * (one entry per configured watchedRoot). Frontend uses this for
+   * top-level grouping in cloud view + status display in settings.
+   */
+  watched_roots?: WatchedRoot[];
+  /**
+   * v0.2.0 structure-align Phase B: local-only directories (e.g. _reports/,
+   * attachments/) that exist on disk but are not tracked against any
+   * watchedRoot. Surfaced in local view under "未绑定 watchedRoot" group.
+   */
+  mounted_dirs?: MountedDir[];
 }
 
 /**

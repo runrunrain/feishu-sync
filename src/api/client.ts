@@ -18,6 +18,7 @@ import type {
   TrashedDoc,
   ChannelTestRequest,
   ChannelTestResult,
+  TreeResponse,
 } from '../types';
 
 class APIError extends Error {
@@ -245,6 +246,24 @@ export async function syncIndex(options?: {
 export async function getMappingTree(): Promise<MappingNode[]> {
   const data = await request<{ nodes: MappingNode[] }>('/api/mapping/tree');
   return data.nodes ?? [];
+}
+
+/**
+ * GET /api/mapping/tree?view=feishu|local — full TreeResponse envelope
+ * (v0.2.0 structure-align Phase B). Returns nodes + watched_roots +
+ * orphan_files + stats in one round-trip so the frontend has everything
+ * it needs to render a grouped cloud tree or a local directory tree.
+ *
+ * Legacy callers that omit `view` should keep using getMappingTree(); the
+ * server returns the bare `{ nodes }` shape for backward compat.
+ */
+export async function getMappingTreeDetailed(
+  view: 'feishu' | 'local',
+  options: { includeOrphans?: boolean } = {},
+): Promise<TreeResponse> {
+  const qs = new URLSearchParams({ view });
+  if (options.includeOrphans === false) qs.set('include_orphans', 'false');
+  return request<TreeResponse>(`/api/mapping/tree?${qs.toString()}`);
 }
 
 /**
