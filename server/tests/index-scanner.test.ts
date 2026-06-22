@@ -273,3 +273,96 @@ This file has no feishu header at all.
     expect(meta).toBeNull();
   });
 });
+
+describe('IndexScanner.parseMetadata — format 4: bold key-value header', () => {
+  it('parses full bold_kv header with markdown link + obj token + date', () => {
+    // Real-world form from 技术-Dev tree (most common variant).
+    const content = `# 1.1.面向数据
+
+**来源**: [飞书 Wiki](https://qcnbafdrjx7n.feishu.cn/wiki/QGzqwvUuZive33kl350c95Son6g)
+**Obj Token**: TuKOdlvPfoOBfYx1aM7cu4Pdnxq
+**获取日期**: 2026-06-16
+
+---
+
+### 设计原则
+`;
+    const meta = scanner.parseMetadata(content);
+    expect(meta).not.toBeNull();
+    expect(meta!.header_format).toBe('bold_kv');
+    expect(meta!.obj_token).toBe('TuKOdlvPfoOBfYx1aM7cu4Pdnxq');
+    expect(meta!.original_link).toBe(
+      'https://qcnbafdrjx7n.feishu.cn/wiki/QGzqwvUuZive33kl350c95Son6g',
+    );
+    expect(meta!.fetch_date).toBe('2026-06-16');
+  });
+
+  it('parses bare URL (no markdown link wrapper) in 来源 field', () => {
+    // Some files use a bare URL instead of `[text](URL)`.
+    const content = `# Sample
+
+**来源**: https://qcnbafdrjx7n.feishu.cn/wiki/BareUrlToken123
+**Obj Token**: BareTokABCdef
+`;
+    const meta = scanner.parseMetadata(content);
+    expect(meta).not.toBeNull();
+    expect(meta!.header_format).toBe('bold_kv');
+    expect(meta!.obj_token).toBe('BareTokABCdef');
+    expect(meta!.original_link).toBe(
+      'https://qcnbafdrjx7n.feishu.cn/wiki/BareUrlToken123',
+    );
+  });
+
+  it('parses Chinese full-width colon in field separators', () => {
+    // Real-world files often mix ASCII ':' and full-width '：'.
+    const content = `# 标题
+
+**来源**：[飞书 Wiki](https://qcnbafdrjx7n.feishu.cn/wiki/FullWidthToken)
+**Obj Token**：FullWidthTok
+**获取日期**：2026-06-16
+`;
+    const meta = scanner.parseMetadata(content);
+    expect(meta).not.toBeNull();
+    expect(meta!.header_format).toBe('bold_kv');
+    expect(meta!.obj_token).toBe('FullWidthTok');
+    expect(meta!.original_link).toBe(
+      'https://qcnbafdrjx7n.feishu.cn/wiki/FullWidthToken',
+    );
+    expect(meta!.fetch_date).toBe('2026-06-16');
+  });
+
+  it('parses header with only original_link (no obj_token) — still indexable via getNode fallback', () => {
+    const content = `# Doc With Link Only
+
+**来源**: [飞书 Wiki](https://qcnbafdrjx7n.feishu.cn/wiki/LinkOnlyToken)
+`;
+    const meta = scanner.parseMetadata(content);
+    expect(meta).not.toBeNull();
+    expect(meta!.header_format).toBe('bold_kv');
+    expect(meta!.obj_token).toBeUndefined();
+    expect(meta!.original_link).toBe(
+      'https://qcnbafdrjx7n.feishu.cn/wiki/LinkOnlyToken',
+    );
+  });
+
+  it('returns null when bold markers present but no feishu field', () => {
+    // Bold prose like "**重要**：请注意" must NOT trigger a false positive.
+    const content = `# Plain
+
+**重要**：请注意这条规则。
+**警告**：另一条普通强调。
+`;
+    const meta = scanner.parseMetadata(content);
+    expect(meta).toBeNull();
+  });
+
+  it('returns null when only 获取日期 present (no obj_token/link)', () => {
+    // Defensive: a date alone is insufficient to index.
+    const content = `# Sample
+
+**获取日期**: 2026-06-16
+`;
+    const meta = scanner.parseMetadata(content);
+    expect(meta).toBeNull();
+  });
+});

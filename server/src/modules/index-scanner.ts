@@ -3,15 +3,17 @@
  *
  * Implements the design from 架构设计文档 §8.1 + 迭代架构设计 §2.2:
  * - Scan local .md files recursively
- * - Parse metadata headers in three formats (priority order):
+ * - Parse metadata headers in four formats (priority order):
  *   1) YAML-in-comment new spec (feishu_sync: ...)
  *   2) Legacy Chinese-key HTML comment header (来源/节点/obj_token/原始链接/获取日期)
  *   3) Legacy blockquote header (after optional leading # title, with 文档链接/document_id/obj_token lines)
+ *   4) Bold key-value header (`**来源**: ...\n**Obj Token**: ...\n**获取日期**: ...`)
  * - Fallback to lark-cli getNode for files with original_link but no obj_token
  * - Bulk upsert to SQLite
  *
- * Backward compatibility: legacy Chinese HTML headers and blockquote headers
- * continue to parse correctly so existing local copies remain indexable.
+ * Backward compatibility: legacy Chinese HTML headers, blockquote headers,
+ * and bold key-value headers all continue to parse correctly so existing
+ * local copies remain indexable.
  */
 
 import fs from 'node:fs';
@@ -45,7 +47,7 @@ export interface ParsedMetadata {
   fetch_date?: string;
   last_synced_modify_time?: string;
   /** Which header format was matched. Exposed for diagnostics + migration. */
-  header_format: 'yaml_html' | 'legacy_html_zh' | 'blockquote' | 'none';
+  header_format: 'yaml_html' | 'legacy_html_zh' | 'blockquote' | 'bold_kv' | 'none';
 }
 
 export class IndexScanner {
@@ -196,6 +198,12 @@ export class IndexScanner {
     const blockquote = this.parseBlockquoteHeader(content);
     if (blockquote && (blockquote.obj_token || blockquote.original_link)) {
       return blockquote;
+    }
+
+    // 4. Bold key-value header (**来源** / **Obj Token** / **获取日期**)
+    const boldKv = this.parseBoldKvHeader(content);
+    if (boldKv && (boldKv.obj_token || boldKv.original_link)) {
+      return boldKv;
     }
 
     // No recognizable header
@@ -364,6 +372,80 @@ export class IndexScanner {
     }
 
     return null;
+  }
+
+  /**
+   * Format 4: Bold key-value header (markdown bold KV)
+   *
+   * Real-world form (most files under `技术 - Dev/`):
+   *
+   *   # 1.1.面向数据
+   *
+   *   **来源**: [飞书 Wiki](https://qcnbafdrjx7n.feishu.cn/wiki/<TOKEN>)
+   *   **Obj Token**: <TOKEN>
+   *   **获取日期**: 2026-06-16
+   *
+   *   ---
+   *
+   * Field labels seen in the wild (case-insensitive):
+   *   - 来源 / 原始链接 / 文档链接 / original_link (URL may be wrapped in
+   *     `[text](URL)` markdown link syntax, or be bare)
+   *   - Obj Token / obj_token / document_id (token, no type qualifier)
+   *   - 获取日期 (YYYY-MM-DD)
+   *
+   * The header is recognized only when at least one of {obj_token,
+   * original_link} is present, matching the contract of the other formats.
+   *
+   * Scan window: first 4 KiB (consistent with parseBlockquoteHeader).
+   */
+  private parseBoldKvHeader(content: string): ParsedMetadata | null {
+    const window = content.slice(0, 4096);
+
+    // Must contain the bold-marker prefix to qualify. We anchor on
+    // `**` followed by a known field label to avoid matching ordinary
+    // bold prose (e.g. emphasis like "**重要**").
+    if (!/\*\*\s*(?:来源|原始链接|文档链接|original_link|Obj\s*Token|obj_token|document_id)/i.test(window)) {
+      return null;
+    }
+
+    const result: ParsedMetadata = { header_format: 'bold_kv' };
+
+    // Obj Token: <TOKEN>
+    // Allow optional whitespace, support both English and Chinese colons.
+    // Token charset = [A-Za-z0-9_]+ (matches feishu token format).
+    const objMatch = window.match(
+      /\*\*\s*Obj\s*Token\s*\*\*\s*[:：]\s*([A-Za-z0-9_]+)/i,
+    );
+    if (objMatch) {
+      result.obj_token = objMatch[1];
+    }
+
+    // document_id: <TOKEN> (rare in bold_kv but tolerated for forward compat)
+    if (!result.obj_token) {
+      const docIdMatch = window.match(
+        /\*\*\s*document_id\s*\*\*\s*[:：]\s*([A-Za-z0-9_]+)/i,
+      );
+      if (docIdMatch) result.obj_token = docIdMatch[1];
+    }
+
+    // Source / link: URL may be inside `[text](URL)` or bare.
+    const linkMatch = window.match(
+      /\*\*\s*(?:来源|原始链接|文档链接|original_link)\s*\*\*\s*[:：]\s*(?:\[[^\]]*\]\(([^)\s]+)\)|([^)\s]+))/i,
+    );
+    if (linkMatch) {
+      const url = linkMatch[1] ?? linkMatch[2];
+      if (url) result.original_link = url.trim();
+    }
+
+    // Fetch date: YYYY-MM-DD
+    const dateMatch = window.match(
+      /\*\*\s*获取日期\s*\*\*\s*[:：]\s*(\d{4}-\d{2}-\d{2})/,
+    );
+    if (dateMatch) {
+      result.fetch_date = dateMatch[1];
+    }
+
+    return result;
   }
 
   /**
