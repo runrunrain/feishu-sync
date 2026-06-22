@@ -5,6 +5,20 @@
  * Integrates with server-side ChangeDetector via IPC.
  *
  * Architecture reference: §6.1 ChangeDetector / §6.6 TrayService
+ *
+ * Contract: POST /api/detect/changes expects body { rootUrl: string }
+ * (singular). An earlier revision sent { rootUrls: [] } which left
+ * rootUrl undefined on the server side; detect.ts destructured
+ * { rootUrl } and passed undefined to changeDetector → getNode →
+ * lark-cli `--node-token undefined --format json`, which (via
+ * Node execFile shell:true concatenation) made lark-cli 1.0.53
+ * interpret "json" as a positional argument and reject with
+ * `positional arguments are not supported (got ["json"])`.
+ * The fix is two-sided:
+ *   1. Caller (this file) sends the correct field name with the
+ *      first valid watched root URL pulled from config.
+ *   2. detect.ts validates rootUrl and 400s on missing/invalid so
+ *      future contract drift fails fast instead of leaking to lark-cli.
  */
 
 import type { BrowserWindow } from 'electron';
@@ -16,6 +30,12 @@ type ChangeNotificationServiceOptions = {
   getApiToken: () => string | null;
   sanitizeError: (error: unknown) => string;
   trayService: () => DesktopTrayService | null;
+  /**
+   * Returns the first usable watched root URL from config, or null
+   * when none is configured/valid. Used to populate the detect
+   * endpoint's required rootUrl field.
+   */
+  getWatchedRootUrl: () => string | null;
 };
 
 interface ChangeDetectionResult {
@@ -81,18 +101,27 @@ export class ChangeNotificationService {
       return;
     }
 
+    const rootUrl = this.options.getWatchedRootUrl();
+    if (!rootUrl) {
+      // No valid watched root URL configured — nothing to detect.
+      // Not an error; log once per poll so the trace is visible.
+      console.info('[ChangeNotification] No watched root URL configured, skipping detect poll');
+      return;
+    }
+
     try {
-      // Call server-side change detection API
+      // Call server-side change detection API.
+      // Body field name MUST be `rootUrl` (singular) per server detect.ts
+      // contract. Sending `rootUrls` (plural) or omitting the field leaves
+      // rootUrl undefined and triggers the lark-cli positional-arg error
+      // (see file header).
       const response = await fetch(`${serverUrl}/api/detect/changes`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'X-Desktop-Token': apiToken,
         },
-        body: JSON.stringify({
-          // Root URLs should come from config
-          rootUrls: [], // TODO: Get from config
-        }),
+        body: JSON.stringify({ rootUrl }),
       });
 
       if (!response.ok) {

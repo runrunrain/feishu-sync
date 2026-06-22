@@ -86,8 +86,24 @@ export class LarkCliClient {
   /**
    * Get node details (supports URL/node_token/obj_token)
    * Returns space_id, obj_token, obj_edit_time, has_child, etc.
+   *
+   * v0.2.0 defensive guard: reject non-string/empty input at the
+   * boundary. Previously, an undefined rootUrl from the detect
+   * endpoint flowed here and was passed to execFile with shell:true,
+   * which collapsed `['--node-token', undefined, '--format', 'json']`
+   * into a command line that lark-cli parsed as a positional arg
+   * "json" (see detect.ts header + change-notification-service.ts
+   * header). Throwing here gives a clear, attributable error instead
+   * of the misleading upstream message. This guard touches only the
+   * public getNode signature; the auth/QPS/execLarkCli surface
+   * (architecture red line I1) is unchanged.
    */
   async getNode(nodeTokenOrUrl: string): Promise<LarkCliNodeInfo> {
+    if (typeof nodeTokenOrUrl !== 'string' || nodeTokenOrUrl.trim().length === 0) {
+      throw new Error(
+        `getNode requires a non-empty string (URL or token); received: ${String(nodeTokenOrUrl)}`
+      );
+    }
     await this.throttle('wiki');
 
     const args = ['wiki', '+node-get', '--node-token', nodeTokenOrUrl, '--format', 'json'];

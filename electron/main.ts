@@ -65,6 +65,56 @@ function sanitizeDesktopError(error: unknown): string {
     .slice(0, 300);
 }
 
+/**
+ * Minimal Feishu wiki URL validator (electron-side mirror of
+ * src/utils/feishu-url.ts). We intentionally inline rather than import
+ * the client util to avoid coupling the electron main process to React
+ * bundling. The accepted shape: https://<subdomain>.feishu.cn/wiki/<token>,
+ * matching server-side change-detector expectations.
+ */
+const FEISHU_WIKI_URL_PATTERN =
+  /^https:\/\/[a-z0-9-]+\.feishu\.cn\/wiki\/[A-Za-z0-9]+/i;
+
+function isValidFeishuWikiUrl(url: string | null | undefined): url is string {
+  return typeof url === 'string' && FEISHU_WIKI_URL_PATTERN.test(url);
+}
+
+/**
+ * Returns the first usable watched root URL from the latest config, or
+ * null when none is configured or all entries are malformed. Reads
+ * configManager on each call so runtime config updates are respected.
+ *
+ * Used by ChangeNotificationService.getWatchedRootUrl to populate the
+ * detect endpoint's required rootUrl field (singular; see
+ * change-notification-service.ts header for the contract rationale).
+ */
+function readFirstValidWatchedRootUrl(): string | null {
+  if (!configManager) return null;
+  // Synchronous read would be cleaner, but ConfigManager.load() is async.
+  // Return a cached snapshot instead — see refreshWatchedRootUrlSnapshot()
+  // which is invoked on boot and on every config save via the IPC handler.
+  return currentWatchedRootUrlSnapshot;
+}
+
+// Latest known first-valid watched root URL. Refreshed at boot and on
+// config save. Default null until the first refresh.
+let currentWatchedRootUrlSnapshot: string | null = null;
+
+async function refreshWatchedRootUrlSnapshot(): Promise<void> {
+  if (!configManager) {
+    currentWatchedRootUrlSnapshot = null;
+    return;
+  }
+  try {
+    const config = await configManager.load();
+    const urls = Array.isArray(config.watchedRootUrls) ? config.watchedRootUrls : [];
+    currentWatchedRootUrlSnapshot = urls.find(isValidFeishuWikiUrl) ?? null;
+  } catch (error) {
+    console.warn('[Config] Failed to refresh watched root URL snapshot:', sanitizeDesktopError(error));
+    currentWatchedRootUrlSnapshot = null;
+  }
+}
+
 // ============================================================================
 // Server Startup
 // ============================================================================
@@ -442,19 +492,39 @@ async function boot() {
     sanitizeError: sanitizeDesktopError,
   });
 
-  // Initialize change notification service (M4 new)
-  changeNotificationService = new ChangeNotificationService({
-    getWindow: () => mainWindow,
-    getServerUrl: () => startedServer?.url ?? null,
-    getApiToken: () => desktopApiToken,
-    sanitizeError: sanitizeDesktopError,
-    trayService: () => trayService,
-  });
-
-  // Load config and apply settings
+  // Load config BEFORE constructing ChangeNotificationService so we can
+  // inject a getWatchedRootUrl callback that reads the latest config.
+  // Previous order constructed the service first and passed a hardcoded
+  // { rootUrls: [] } body, which caused the detect endpoint to receive
+  // rootUrl=undefined and leak into lark-cli as a positional-arg error.
   try {
     configManager = new ConfigManager();
     const config = await configManager.load();
+
+    // Populate the watched root URL snapshot BEFORE constructing the
+    // ChangeNotificationService. The service's start() triggers an
+    // immediate first poll (see change-notification-service.ts start()),
+    // and if the snapshot were null at that moment the poll would no-op
+    // with "No watched root URL configured" instead of doing real work.
+    // Seeding the snapshot synchronously here, against the freshly loaded
+    // config, guarantees the first poll observes a real URL.
+    await refreshWatchedRootUrlSnapshot();
+
+    // Initialize change notification service (M4 new) with a live
+    // getWatchedRootUrl callback that reads the snapshot. The snapshot
+    // is refreshed on boot (here) and whenever the IPC config-save
+    // handler runs; runtime config edits without an IPC round-trip
+    // require an app restart to be picked up by the poller. This is
+    // an architectural constraint, not a bug — settings UI saves via
+    // the IPC handler so the common path is covered.
+    changeNotificationService = new ChangeNotificationService({
+      getWindow: () => mainWindow,
+      getServerUrl: () => startedServer?.url ?? null,
+      getApiToken: () => desktopApiToken,
+      sanitizeError: sanitizeDesktopError,
+      trayService: () => trayService,
+      getWatchedRootUrl: () => readFirstValidWatchedRootUrl(),
+    });
 
     // Apply auto-start setting from config (single source of truth)
     if (config.enableAutoStart && autoStartService) {
