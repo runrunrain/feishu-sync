@@ -122,6 +122,15 @@ export class MappingService {
         status: d.status,
         cloud_deleted: d.cloudDeleted ?? 0,
         sortOrder: d.localSortOrder ?? null,
+        // v0.2.0 cloud-link-coverage: expose the explicit feishu relationship.
+        // cloud_match defaults to 'unknown' for rows that pre-date the
+        // migration; UI should treat null original_link + unknown as
+        // "legacy, run rebuild to classify".
+        original_link: d.originalLink ?? null,
+        cloud_match: (d.cloudMatch ?? 'unknown') as
+          | 'synced'
+          | 'restricted'
+          | 'unknown',
       } satisfies MappingNode;
     });
   }

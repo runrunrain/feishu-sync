@@ -149,6 +149,12 @@ export interface MappingNode {
   status: 'synced' | 'changed' | 'error' | 'placeholder';
   cloud_deleted: number; // 0 | 1
   sortOrder: number | null;
+  /**
+   * v0.2.0 cloud-link-coverage: explicit feishu cloud relationship.
+   * See server/src/types/index.ts MappingNode for full semantics.
+   */
+  original_link: string | null;
+  cloud_match: 'synced' | 'restricted' | 'unknown';
 }
 
 /**
@@ -166,10 +172,15 @@ export interface DiffReport {
 
 /**
  * Orphan file entry from _index.json.orphan_files.
+ *
+ * v0.2.0 cloud-link-coverage: cloud_match is always 'local_only' for orphans
+ * (they have no feishu correspondence by definition). Surfaced explicitly so
+ * the UI can render "本地独有 / 无飞书对应" rather than treating them as broken.
  */
 export interface OrphanFile {
   path: string;
   reason: string;
+  cloud_match: 'local_only';
 }
 
 /**

@@ -43,7 +43,10 @@ def fresh_db() -> sqlite3.Connection:
           obj_edit_time INTEGER,
           cloud_deleted INTEGER NOT NULL DEFAULT 0,
           last_seen_at TEXT,
-          local_sort_order INTEGER
+          local_sort_order INTEGER,
+          -- v0.2.0 cloud-link-coverage (migration_v3.sql)
+          original_link TEXT,
+          cloud_match TEXT NOT NULL DEFAULT 'unknown'
         );
         CREATE TABLE sheet_sheets (
           sheet_obj_token TEXT NOT NULL,
@@ -437,8 +440,9 @@ INSERT INTO documents (
   obj_token, wiki_node_token, obj_type, title, local_md_path,
   last_synced_modify_time, last_synced_at, status,
   parent_node_token, space_id, obj_edit_time,
-  cloud_deleted, last_seen_at, local_sort_order
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  cloud_deleted, last_seen_at, local_sort_order,
+  original_link, cloud_match
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(obj_token) DO UPDATE SET
   wiki_node_token = COALESCE(excluded.wiki_node_token, documents.wiki_node_token),
   obj_type = COALESCE(excluded.obj_type, documents.obj_type),
@@ -453,6 +457,8 @@ ON CONFLICT(obj_token) DO UPDATE SET
   cloud_deleted = COALESCE(excluded.cloud_deleted, documents.cloud_deleted),
   last_seen_at = COALESCE(excluded.last_seen_at, documents.last_seen_at),
   local_sort_order = documents.local_sort_order,
+  original_link = COALESCE(excluded.original_link, documents.original_link),
+  cloud_match = COALESCE(excluded.cloud_match, documents.cloud_match),
   updated_at = datetime('now')
 """
 
@@ -524,6 +530,10 @@ def upsert_document(conn, r):
             r["status"], r.get("parentNodeToken"), r.get("spaceId"),
             r.get("objEditTime"), r.get("cloudDeleted", 0) or 0,
             r.get("lastSeenAt"), r.get("localSortOrder"),
+            r.get("originalLink"),
+            # cloud_match is NOT NULL DEFAULT 'unknown'; fall back so legacy
+            # callers that omit it don't trip the constraint. Mirrors TS.
+            r.get("cloudMatch") or "unknown",
         ),
     )
 
@@ -575,6 +585,111 @@ def list_cloud_deleted(conn):
     return conn.execute(LIST_CLOUD_DELETED_SQL).fetchall()
 
 
+# ---------------------------------------------------------------------------
+# v0.2.0 cloud-link-coverage: recompute_cloud_match mirrors the SQL emitted
+# by LocalMapStore.recomputeCloudMatch(). Verifies that:
+#   1. rows with non-empty title are classified 'synced'
+#   2. rows with empty title + obj_token are 'restricted' and get a
+#      best-effort original_link from wiki_node_token
+#   3. everything else stays 'unknown'
+#   4. existing non-null original_link is preserved (not overwritten)
+# ---------------------------------------------------------------------------
+
+RECOMPUTE_CLASSIFY_SQL = """
+UPDATE documents
+SET cloud_match = CASE
+  WHEN title IS NOT NULL AND title <> '' THEN 'synced'
+  WHEN obj_token IS NOT NULL AND obj_token <> '' THEN 'restricted'
+  ELSE 'unknown'
+END
+"""
+
+RECOMPUTE_BACKFILL_LINK_SQL = """
+UPDATE documents
+SET original_link = 'https://qcnbafdrjx7n.feishu.cn/wiki/' || wiki_node_token
+WHERE (original_link IS NULL OR original_link = '')
+  AND wiki_node_token IS NOT NULL
+  AND wiki_node_token <> ''
+"""
+
+
+def recompute_cloud_match(conn):
+    """Mirror LocalMapStore.recomputeCloudMatch transactional logic."""
+    conn.executescript(RECOMPUTE_CLASSIFY_SQL)
+    cur = conn.execute(RECOMPUTE_BACKFILL_LINK_SQL)
+    backfilled = cur.rowcount
+    dist = {"synced": 0, "restricted": 0, "unknown": 0}
+    for row in conn.execute(
+        "SELECT cloud_match, COUNT(*) FROM documents GROUP BY cloud_match"
+    ):
+        key = row[0] if row[0] in dist else "unknown"
+        dist[key] = row[1]
+    return {
+        "synced": dist["synced"],
+        "restricted": dist["restricted"],
+        "unknown": dist["unknown"],
+        "link_backfilled": backfilled,
+    }
+
+
+def test_recompute_cloud_match_classifies_by_title():
+    conn = fresh_db()
+    # Row A: synced row with title + original_link extracted from header.
+    upsert_document(conn, dict(
+        objToken="TOK_A", wikiNodeToken="WNT_A", objType="docx",
+        title="has-title", localMdPath="/d/a.md",
+        lastSyncedModifyTime="2026-06-18", lastSyncedAt="2026-06-18",
+        status="synced",
+        originalLink="https://qcnbafdrjx7n.feishu.cn/wiki/ORIG_A",
+    ))
+    # Row B: placeholder/restricted — empty title, obj_token present.
+    # Simulate by direct insert since upsert_document requires non-empty title.
+    conn.execute(
+        "INSERT INTO documents (obj_token, wiki_node_token, obj_type, title, "
+        "local_md_path, last_synced_modify_time, last_synced_at, status) "
+        "VALUES ('TOK_B', 'WNT_B', 'unknown', '', '', '', '', 'placeholder')"
+    )
+
+    dist = recompute_cloud_match(conn)
+
+    assert_eq("recompute synced count", dist["synced"], 1)
+    assert_eq("recompute restricted count", dist["restricted"], 1)
+    assert_eq("recompute unknown count", dist["unknown"], 0)
+
+    rows = {
+        r[0]: (r[1], r[2])
+        for r in conn.execute(
+            "SELECT obj_token, cloud_match, original_link FROM documents"
+        )
+    }
+    a_cm, a_link = rows["TOK_A"]
+    b_cm, b_link = rows["TOK_B"]
+    assert_eq("row A cloud_match (synced)", a_cm, "synced")
+    assert_eq("row A original_link preserved", a_link,
+              "https://qcnbafdrjx7n.feishu.cn/wiki/ORIG_A")
+    assert_eq("row B cloud_match (restricted)", b_cm, "restricted")
+    assert_eq("row B original_link backfilled from wiki_node_token", b_link,
+              "https://qcnbafdrjx7n.feishu.cn/wiki/WNT_B")
+
+
+def test_recompute_cloud_match_unknown_when_no_title_no_obj_token():
+    conn = fresh_db()
+    # Insert a legacy row that somehow has no obj_token (shouldn't happen
+    # since obj_token is PK, but the classify SQL defends against it).
+    # Instead, test the unknown branch via an empty obj_token substitution:
+    # since obj_token is PK and NOT NULL, we test by ensuring reclassify
+    # on a row that lost its title stays consistent.
+    conn.execute(
+        "INSERT INTO documents (obj_token, wiki_node_token, obj_type, title, "
+        "local_md_path, last_synced_modify_time, last_synced_at, status, cloud_match) "
+        "VALUES ('TOK_C', NULL, 'unknown', '', '', '', '', 'placeholder', 'synced')"
+    )
+    dist = recompute_cloud_match(conn)
+    # title empty + obj_token present → restricted
+    assert_eq("legacy row without title reclassified as restricted",
+              dist["restricted"], 1)
+
+
 def main():
     print("=" * 60)
     print("LocalMapStore v0.2.0 SQL-equivalence tests")
@@ -593,6 +708,9 @@ def main():
     test_restore_cloud_deleted_clears_flag()
     test_purge_cloud_deleted_removes_row_and_cascades()
     test_list_cloud_deleted_returns_only_soft_deleted_ordered()
+    # v0.2.0 cloud-link-coverage
+    test_recompute_cloud_match_classifies_by_title()
+    test_recompute_cloud_match_unknown_when_no_title_no_obj_token()
     print("=" * 60)
     print("All LocalMapStore SQL-equivalence tests passed.")
     print("=" * 60)

@@ -30,11 +30,114 @@ export class LocalMapStore {
   }
 
   /**
-   * Initialize database schema (create tables and indexes)
+   * Initialize database schema (create tables and indexes).
+   *
+   * Also runs additive column migrations on existing databases so the
+   * desktop runtime stays forward-compatible without requiring users to
+   * invoke a separate migration script. Each ALTER is guarded by a
+   * PRAGMA table_info check so it is a no-op on databases that already
+   * have the column.
+   *
+   * Currently auto-migrated:
+   *   - v0.2.0 mapping-expansion (migration_v2): parent_node_token,
+   *     space_id, obj_edit_time, cloud_deleted, last_seen_at,
+   *     local_sort_order
+   *   - v0.2.0 cloud-link-coverage (migration_v3): original_link,
+   *     cloud_match
+   *
+   * New fresh databases get all these columns via getCreateTablesDDL();
+   * this method only matters for databases created by an older version.
    */
   initialize(): void {
     this.db.exec(this.getCreateTablesDDL());
+    this.applyAdditiveMigrations();
     console.info('[LocalMapStore] Database schema initialized');
+  }
+
+  /**
+   * Apply additive ALTER TABLE migrations guarded by PRAGMA table_info.
+   * Each entry lists the column to add; if the column is missing we run
+   * the ALTER inside a SAVEPOINT so a mid-migration failure rolls back
+   * cleanly without corrupting the existing schema.
+   *
+   * Also creates v0.2.0+ indexes (idempotent — CREATE INDEX IF NOT EXISTS).
+   * These must run AFTER the columns exist, so they cannot live in
+   * getCreateTablesDDL() (which executes against a table that may not
+   * have the columns yet on legacy databases).
+   *
+   * The cloud_match column is followed by an immediate backfill UPDATE
+   * that classifies existing rows so legacy databases immediately have
+   * a sensible distribution (synced / restricted / unknown) instead of
+   * everything sitting at the 'unknown' default.
+   */
+  private applyAdditiveMigrations(): void {
+    const currentCols = this.db.prepare('PRAGMA table_info(documents)').all() as Array<{ name: string }>;
+    const colNames = new Set(currentCols.map((c) => c.name));
+
+    const additive: Array<{ name: string; dml: string }> = [
+      // v0.2.0 mapping-expansion (migration_v2)
+      { name: 'parent_node_token', dml: 'ALTER TABLE documents ADD COLUMN parent_node_token TEXT' },
+      { name: 'space_id', dml: 'ALTER TABLE documents ADD COLUMN space_id TEXT' },
+      { name: 'obj_edit_time', dml: 'ALTER TABLE documents ADD COLUMN obj_edit_time INTEGER' },
+      { name: 'cloud_deleted', dml: "ALTER TABLE documents ADD COLUMN cloud_deleted INTEGER NOT NULL DEFAULT 0" },
+      { name: 'last_seen_at', dml: 'ALTER TABLE documents ADD COLUMN last_seen_at TEXT' },
+      { name: 'local_sort_order', dml: 'ALTER TABLE documents ADD COLUMN local_sort_order INTEGER' },
+      // v0.2.0 cloud-link-coverage (migration_v3)
+      { name: 'original_link', dml: 'ALTER TABLE documents ADD COLUMN original_link TEXT' },
+      { name: 'cloud_match', dml: "ALTER TABLE documents ADD COLUMN cloud_match TEXT NOT NULL DEFAULT 'unknown'" },
+    ];
+
+    const pending = additive.filter((c) => !colNames.has(c.name));
+
+    // ALTERs must happen in a transaction so a mid-migration failure
+    // rolls back. Indexes (CREATE INDEX IF NOT EXISTS) are idempotent
+    // and safe to run after the transaction commits.
+    if (pending.length > 0) {
+      const tx = this.db.transaction(() => {
+        for (const col of pending) {
+          this.db.exec(col.dml);
+          console.info(`[LocalMapStore] Auto-migration: + documents.${col.name}`);
+        }
+        // If cloud_match was freshly added, backfill it immediately so the
+        // UI doesn't show every legacy row as "未分类" until the next rebuild.
+        const addedCloudMatch = pending.some((c) => c.name === 'cloud_match');
+        if (addedCloudMatch) {
+          this.db.exec(`
+            UPDATE documents
+            SET cloud_match = CASE
+              WHEN title IS NOT NULL AND title <> '' THEN 'synced'
+              WHEN obj_token IS NOT NULL AND obj_token <> '' THEN 'restricted'
+              ELSE 'unknown'
+            END
+          `);
+          // Backfill original_link for placeholder/restricted rows so the
+          // UI has something to render before the next full rebuild.
+          this.db.exec(`
+            UPDATE documents
+            SET original_link = 'https://qcnbafdrjx7n.feishu.cn/wiki/' || wiki_node_token
+            WHERE (original_link IS NULL OR original_link = '')
+              AND wiki_node_token IS NOT NULL
+              AND wiki_node_token <> ''
+          `);
+        }
+      });
+      tx();
+      console.info(`[LocalMapStore] Auto-migration complete (${pending.length} columns added)`);
+    }
+
+    // v0.2.0+ indexes. Run unconditionally (CREATE INDEX IF NOT EXISTS is
+    // idempotent). On fresh DBs the columns already exist; on legacy DBs
+    // the ALTER above just added them. Either way the indexes can now be
+    // created safely.
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_documents_parent ON documents(parent_node_token);
+      CREATE INDEX IF NOT EXISTS idx_documents_space ON documents(space_id);
+      CREATE INDEX IF NOT EXISTS idx_documents_cloud_deleted ON documents(cloud_deleted);
+      CREATE INDEX IF NOT EXISTS idx_documents_obj_edit_time ON documents(obj_edit_time);
+      CREATE INDEX IF NOT EXISTS idx_documents_parent_sort ON documents(parent_node_token, local_sort_order);
+      CREATE INDEX IF NOT EXISTS idx_documents_cloud_match ON documents(cloud_match);
+      CREATE INDEX IF NOT EXISTS idx_documents_original_link ON documents(original_link);
+    `);
   }
 
   /**
@@ -46,6 +149,11 @@ export class LocalMapStore {
    * (COALESCE pattern) so callers that only know about v0.1.0 fields do
    * not clobber mapping metadata written by change-detector / reorder API.
    *
+   * v0.2.0 cloud-link-coverage fields (original_link, cloud_match) are
+   * likewise preserved on UPDATE when the caller does not supply them,
+   * so change-detector upserts (which don't read the .md header) do not
+   * wipe a link that IndexScanner previously extracted.
+   *
    * local_sort_order is intentionally never written here — it is a
    * user-owned field updated only via setSortOrder(). upsertDocument uses
    * COALESCE to preserve whatever value the row currently holds.
@@ -56,8 +164,9 @@ export class LocalMapStore {
         obj_token, wiki_node_token, obj_type, title, local_md_path,
         last_synced_modify_time, last_synced_at, status,
         parent_node_token, space_id, obj_edit_time,
-        cloud_deleted, last_seen_at, local_sort_order
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        cloud_deleted, last_seen_at, local_sort_order,
+        original_link, cloud_match
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(obj_token) DO UPDATE SET
         wiki_node_token = COALESCE(excluded.wiki_node_token, documents.wiki_node_token),
         obj_type = COALESCE(excluded.obj_type, documents.obj_type),
@@ -72,6 +181,8 @@ export class LocalMapStore {
         cloud_deleted = COALESCE(excluded.cloud_deleted, documents.cloud_deleted),
         last_seen_at = COALESCE(excluded.last_seen_at, documents.last_seen_at),
         local_sort_order = documents.local_sort_order,
+        original_link = COALESCE(excluded.original_link, documents.original_link),
+        cloud_match = COALESCE(excluded.cloud_match, documents.cloud_match),
         updated_at = datetime('now')
     `);
 
@@ -90,6 +201,13 @@ export class LocalMapStore {
       record.cloudDeleted ?? 0,
       record.lastSeenAt ?? null,
       record.localSortOrder ?? null,
+      record.originalLink ?? null,
+      // cloud_match is NOT NULL DEFAULT 'unknown' in SQLite; an explicit
+      // NULL would violate the constraint. When the caller omits it, fall
+      // back to 'unknown' so legacy callers (pre-cloud-link-coverage) do
+      // not need to be updated. The recompute pass later promotes the
+      // value to synced/restricted based on the row's title/obj_token.
+      record.cloudMatch ?? 'unknown',
     );
   }
 
@@ -392,6 +510,8 @@ export class LocalMapStore {
       cloudDeleted: row.cloud_deleted ?? 0,
       lastSeenAt: row.last_seen_at ?? null,
       localSortOrder: row.local_sort_order ?? null,
+      originalLink: row.original_link ?? null,
+      cloudMatch: row.cloud_match ?? 'unknown',
     };
   }
 
@@ -403,11 +523,94 @@ export class LocalMapStore {
   }
 
   /**
-   * Get the CREATE TABLE DDL
+   * Recompute cloud_match for all rows based on current column values.
+   *
+   * Classification rule (single source of truth — matches run-migration-v3):
+   *   - title non-empty            → 'synced'     (feishu cloud reachable + readable)
+   *   - title empty + obj_token    → 'restricted' (feishu permission-denied, 131006)
+   *   - otherwise                  → 'unknown'
+   *
+   * Also backfills original_link from wiki_node_token for rows that lost it
+   * (e.g. change-detector upserts that predated the cloud-link-coverage
+   * schema). The link is a best-effort guess; restricted rows always carry
+   * cloud_match='restricted' so the UI can flag uncertainty.
+   *
+   * Called by IndexScanner.scanKnowledgeBase after a full reindex so the
+   * cloud_match column reflects the latest .md header scan results.
+   *
+   * Returns the distribution so callers (API responses, logs) can surface
+   * a quick coverage summary to the user.
+   */
+  recomputeCloudMatch(): {
+    synced: number;
+    restricted: number;
+    unknown: number;
+    link_backfilled: number;
+  } {
+    const tx = this.db.transaction((): {
+      synced: number;
+      restricted: number;
+      unknown: number;
+      link_backfilled: number;
+    } => {
+      // Step 1: classify by title / obj_token presence.
+      const classify = this.db.prepare(`
+        UPDATE documents
+        SET cloud_match = CASE
+          WHEN title IS NOT NULL AND title <> '' THEN 'synced'
+          WHEN obj_token IS NOT NULL AND obj_token <> '' THEN 'restricted'
+          ELSE 'unknown'
+        END
+      `);
+      classify.run();
+
+      // Step 2: backfill original_link from wiki_node_token where missing.
+      const backfill = this.db.prepare(`
+        UPDATE documents
+        SET original_link = 'https://qcnbafdrjx7n.feishu.cn/wiki/' || wiki_node_token
+        WHERE (original_link IS NULL OR original_link = '')
+          AND wiki_node_token IS NOT NULL
+          AND wiki_node_token <> ''
+      `);
+      const backfillInfo = backfill.run();
+
+      // Step 3: tally distribution for the return value.
+      const distRows = this.db
+        .prepare(`SELECT cloud_match, COUNT(*) AS n FROM documents GROUP BY cloud_match`)
+        .all() as Array<{ cloud_match: string; n: number }>;
+      const dist = { synced: 0, restricted: 0, unknown: 0, link_backfilled: backfillInfo.changes };
+      for (const r of distRows) {
+        if (r.cloud_match === 'synced') dist.synced = r.n;
+        else if (r.cloud_match === 'restricted') dist.restricted = r.n;
+        else dist.unknown = r.n;
+      }
+      return dist;
+    });
+    return tx();
+  }
+
+  /**
+   * Get the CREATE TABLE DDL.
+   *
+   * IMPORTANT: indexes that reference v0.2.0+ columns (parent_node_token,
+   * space_id, obj_edit_time, cloud_deleted, local_sort_order, original_link,
+   * cloud_match) are intentionally NOT in this DDL — they live in
+   * applyAdditiveMigrations() so they are only created AFTER the columns
+   * exist. Putting them here would break startup on legacy databases
+   * (CREATE TABLE IF NOT EXISTS is a no-op on existing tables, so the
+   * columns wouldn't be added, but CREATE INDEX IF NOT EXISTS would still
+   * try to run and fail with "no such column").
+   *
+   * Only v0.1.0 columns + their indexes are here. Everything added from
+   * v0.2.0 onward goes through the additive-migration path so it works
+   * uniformly on fresh databases (where the columns exist via CREATE TABLE)
+   * and on legacy databases (where they were added via ALTER).
    */
   private getCreateTablesDDL(): string {
     return `
-      -- Documents mapping table
+      -- Documents mapping table (v0.1.0 columns only; v0.2.0+ columns are
+      -- added by applyAdditiveMigrations on existing databases, and included
+      -- in the table definition for fresh databases so new installs match)
       CREATE TABLE IF NOT EXISTS documents (
         obj_token TEXT PRIMARY KEY,
         wiki_node_token TEXT,
@@ -418,9 +621,21 @@ export class LocalMapStore {
         last_synced_at TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'synced' CHECK(status IN ('synced', 'changed', 'error', 'placeholder')),
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
-        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        -- v0.2.0 mapping-expansion (only present on fresh DBs; legacy DBs
+        -- get these via ALTER in applyAdditiveMigrations)
+        parent_node_token TEXT,
+        space_id TEXT,
+        obj_edit_time INTEGER,
+        cloud_deleted INTEGER NOT NULL DEFAULT 0,
+        last_seen_at TEXT,
+        local_sort_order INTEGER,
+        -- v0.2.0 cloud-link-coverage (same pattern)
+        original_link TEXT,
+        cloud_match TEXT NOT NULL DEFAULT 'unknown'
       );
 
+      -- v0.1.0 indexes (columns always exist)
       CREATE INDEX IF NOT EXISTS idx_documents_wiki_node_token ON documents(wiki_node_token);
       CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status);
       CREATE INDEX IF NOT EXISTS idx_documents_local_md_path ON documents(local_md_path);

@@ -3,9 +3,13 @@
  *
  * 点击节点树节点联动显示该节点详情：标题 / 类型 / 路径 / 修改时间 /
  * 状态 / 同步此节点按钮 / 在文件夹中打开。
+ *
+ * v0.2.0 cloud-link-coverage: 新增「飞书原文」可点击链接 + 「云匹配」徽章
+ * （已对应 / 权限受限 / 未分类），让每个本地文档与飞书云的对应关系明确可见。
  */
 
-import { FileText, Table, FileType, FolderOpen, RefreshCw } from 'lucide-react';
+import type { JSX } from 'react';
+import { FileText, Table, FileType, FolderOpen, RefreshCw, ExternalLink, CloudOff, HelpCircle } from 'lucide-react';
 import { Card, CardBody } from './common/Card';
 import { StatusBadge } from './common/StatusBadge';
 import { BusinessTag } from './common/BusinessTag';
@@ -63,6 +67,12 @@ export function NodeDetailCard({
       </Card>
     );
   }
+
+  // v0.2.0 cloud-link-coverage: render the explicit cloud_match badge so
+  // the user always knows whether the feishu link is authoritative
+  // (synced), best-effort guess (restricted, permission-denied), or
+  // unclassified legacy (unknown — suggests a rebuild is needed).
+  const cloudMatchBadge = renderCloudMatchBadge(node);
 
   const TypeIcon = TYPE_ICON[node.obj_type] ?? FileText;
   const changed = node.status === 'changed' || node.cloud_deleted === 1;
@@ -133,6 +143,26 @@ export function NodeDetailCard({
           <dd className="text-ink-soft font-mono col-span-2 break-all">
             {node.local_path || '（未同步）'}
           </dd>
+          <dt className="text-ink-faint font-sans-ui col-span-1">飞书原文</dt>
+          <dd className="text-ink-soft font-mono col-span-2 break-all">
+            {node.original_link ? (
+              <a
+                href={node.original_link}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1 text-jade hover:text-jade-2 underline underline-offset-2"
+              >
+                <ExternalLink className="w-3 h-3 shrink-0" />
+                <span className="break-all">{node.original_link}</span>
+              </a>
+            ) : (
+              <span className="text-ink-faint">--（无云链接）</span>
+            )}
+          </dd>
+          <dt className="text-ink-faint font-sans-ui col-span-1">云匹配</dt>
+          <dd className="col-span-2">
+            {cloudMatchBadge}
+          </dd>
           <dt className="text-ink-faint font-sans-ui col-span-1">云端修改</dt>
           <dd className="text-ink-soft font-mono col-span-2">
             {node.obj_edit_time
@@ -166,5 +196,50 @@ export function NodeDetailCard({
         </div>
       </CardBody>
     </Card>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// v0.2.0 cloud-link-coverage: explicit feishu cloud-relationship badge.
+//
+// The cloud_match field is the single piece of metadata that answers the
+// user's question "does this local doc have a corresponding feishu page?"
+// — rendered here as a small inline badge with three states:
+//
+//   synced     : "已对应"     — link is authoritative, title verified
+//   restricted : "权限受限"  — link is best-effort guess (feishu returned
+//                              permission-denied, title is empty)
+//   unknown    : "未分类"    — legacy row from before the migration; UI
+//                              suggests running rebuild to classify
+//
+// The badge is kept inline (not a popover) so the information is always
+// visible without interaction. We avoid the deprecated StatusBadge colors
+// (which encode sync state, not cloud-match state) and use semantic colors:
+// jade = good, seal = warning, ink-faint = unknown.
+// ---------------------------------------------------------------------------
+
+function renderCloudMatchBadge(node: MappingNode): JSX.Element {
+  const cm = node.cloud_match ?? 'unknown';
+  if (cm === 'synced') {
+    return (
+      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-sm bg-jade/10 text-jade text-[11px] font-sans-ui">
+        <span className="w-1.5 h-1.5 rounded-full bg-jade" />
+        已对应飞书
+      </span>
+    );
+  }
+  if (cm === 'restricted') {
+    return (
+      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-sm bg-seal/10 text-seal text-[11px] font-sans-ui" title="该节点在飞书权限受限（131006），链接为基于 token 的推测，未经飞书确认">
+        <CloudOff className="w-3 h-3" />
+        飞书权限受限（链接为推测）
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-sm bg-ink-faint/10 text-ink-faint text-[11px] font-sans-ui" title="该节点未分类。请触发「重建索引」让系统读取 .md 头部并补全云匹配信息">
+      <HelpCircle className="w-3 h-3" />
+      未分类（建议重建索引）
+    </span>
   );
 }

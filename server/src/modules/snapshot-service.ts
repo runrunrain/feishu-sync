@@ -204,6 +204,13 @@ export class SnapshotService {
       status: d.status,
       cloud_deleted: d.cloudDeleted ?? 0,
       sortOrder: d.localSortOrder ?? null,
+      // v0.2.0 cloud-link-coverage: surface feishu link + cloud_match so the
+      // UI can render "飞书原文" link or "权限受限/无对应" badge.
+      original_link: d.originalLink ?? null,
+      cloud_match: (d.cloudMatch ?? 'unknown') as
+        | 'synced'
+        | 'restricted'
+        | 'unknown',
     };
   }
 
@@ -235,8 +242,8 @@ export class SnapshotService {
   private scanOrphanFiles(
     kbRoot: string,
     knownLocalPaths: Set<string>,
-  ): Array<{ path: string; reason: string }> {
-    const orphans: Array<{ path: string; reason: string }> = [];
+  ): Array<{ path: string; reason: string; cloud_match: 'local_only' }> {
+    const orphans: Array<{ path: string; reason: string; cloud_match: 'local_only' }> = [];
 
     if (!fs.existsSync(kbRoot)) {
       console.warn(
@@ -270,6 +277,10 @@ export class SnapshotService {
         orphans.push({
           path: path.relative(kbRoot, mdPath).split(path.sep).join('/'),
           reason: 'no_obj_token_in_header',
+          // v0.2.0 cloud-link-coverage: explicit marker — this file has
+          // no feishu correspondence, it is local-only (curated/added by
+          // the user). The UI surfaces this distinctly from synced/restricted.
+          cloud_match: 'local_only',
         });
       }
     }

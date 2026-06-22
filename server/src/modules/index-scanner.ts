@@ -107,6 +107,25 @@ export class IndexScanner {
       `[IndexScanner] Scan completed: ${result.indexed} indexed, ${result.skipped} skipped, ${result.failed} failed`,
     );
 
+    // v0.2.0 cloud-link-coverage: after a full reindex, recompute the
+    // cloud_match column so rows freshly updated from .md headers get
+    // promoted from 'restricted'/'unknown' to 'synced', and any remaining
+    // title-less rows get 'restricted' (with best-effort original_link
+    // constructed from wiki_node_token). Also backfills original_link for
+    // rows that lost it.
+    if (typeof this.localMapStore.recomputeCloudMatch === 'function') {
+      try {
+        const dist = this.localMapStore.recomputeCloudMatch();
+        console.info(
+          `[IndexScanner] cloud_match recompute: synced=${dist.synced} restricted=${dist.restricted} unknown=${dist.unknown} link_backfilled=${dist.link_backfilled}`,
+        );
+      } catch (err) {
+        // Don't fail the whole scan if cloud_match recompute breaks —
+        // the index data itself is still valid.
+        console.warn('[IndexScanner] cloud_match recompute failed:', err);
+      }
+    }
+
     return result;
   }
 
@@ -152,6 +171,13 @@ export class IndexScanner {
     }
 
     // Upsert to SQLite
+    // v0.2.0 cloud-link-coverage: persist original_link extracted from the
+    // header (we may have obtained it even when obj_token had to be resolved
+    // via getNode). cloud_match is classified by LocalMapStore.recomputeCloudMatch
+    // after the full scan, so we don't set it here — but if this row was
+    // previously classified as 'restricted' (e.g. placeholder from change-
+    // detector), a successful reindex with a real title promotes it to
+    // 'synced' on the next recompute pass.
     this.localMapStore.upsertDocument({
       objToken,
       wikiNodeToken: header.wiki_node_token ?? null,
@@ -162,6 +188,7 @@ export class IndexScanner {
         header.fetch_date || new Date().toISOString().split('T')[0],
       lastSyncedAt: new Date().toISOString(),
       status: 'synced',
+      originalLink: header.original_link ?? null,
     });
 
     console.info(`[IndexScanner] Indexed ${mdPath} (obj_token: ${objToken})`);

@@ -131,6 +131,23 @@ export interface DocumentRecord {
   cloudDeleted?: number; // 0 | 1
   lastSeenAt?: string | null;
   localSortOrder?: number | null;
+  /**
+   * v0.2.0 cloud-link-coverage fields.
+   *
+   * originalLink is the feishu wiki URL associated with this document.
+   * For synced rows it is extracted from the .md header; for restricted
+   * rows it is best-effort constructed from wiki_node_token.
+   *
+   * cloudMatch classifies the row's relationship with the feishu cloud:
+   *   - 'synced'     : title verified from feishu (cloud reachable + readable)
+   *   - 'restricted' : has obj_token but feishu returned permission-denied,
+   *                    title is empty; link is a best-effort guess
+   *   - 'unknown'    : default for legacy rows not yet classified by rebuild
+   *   - 'local_only' : not used on documents rows (only on orphan_files entries);
+   *                    included here for type completeness when unions form
+   */
+  originalLink?: string | null;
+  cloudMatch?: 'synced' | 'restricted' | 'unknown' | 'local_only';
 }
 
 /**
@@ -250,12 +267,29 @@ export interface MappingNode {
   status: 'synced' | 'changed' | 'error' | 'placeholder';
   cloud_deleted: number; // 0 | 1
   sortOrder: number | null;
+  /**
+   * v0.2.0 cloud-link-coverage: explicit feishu cloud relationship.
+   *
+   * original_link: feishu wiki URL (clickable). null only when truly
+   * unknown (legacy rows); always present for rows indexed from a .md
+   * header (which always carries the URL or wiki_node_token).
+   *
+   * cloud_match: 'synced' | 'restricted' | 'unknown'. The UI uses this
+   * to render the appropriate badge and decide whether to render the
+   * link as authoritative or as a best-effort guess.
+   */
+  original_link: string | null;
+  cloud_match: 'synced' | 'restricted' | 'unknown';
 }
 
 /**
  * Full _index.json snapshot structure (03 §2.4.1).
  * Written to knowledge_base_root/_index.json as a read-only cache;
  * SQLite remains the write source of truth.
+ *
+ * v0.2.0 cloud-link-coverage: orphan_files entries carry an explicit
+ * cloud_match marker so the UI can distinguish "no feishu correspondence"
+ * from a transient parsing failure.
  */
 export interface IndexSnapshot {
   version: string;
@@ -264,7 +298,7 @@ export interface IndexSnapshot {
   watched_root_urls: string[];
   top_level_dirs: Array<{ dir: string; node_count: number }>;
   nodes: MappingNode[];
-  orphan_files: Array<{ path: string; reason: string }>;
+  orphan_files: Array<{ path: string; reason: string; cloud_match: 'local_only' }>;
 }
 
 /**
