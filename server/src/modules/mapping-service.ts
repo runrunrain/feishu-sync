@@ -25,11 +25,14 @@
 import type { ChangeDetector } from './change-detector.js';
 import type { LocalMapStore } from './local-map-store.js';
 import type { SnapshotService } from './snapshot-service.js';
+import type { ConfigManager } from './config-manager.js';
 import type {
   DiffReport,
   MappingNode,
   ReorderRequest,
   ReorderResponse,
+  TreeResponse,
+  WatchedRoot,
 } from '../types/index.js';
 
 export class MappingService {
@@ -37,6 +40,13 @@ export class MappingService {
     private changeDetector: ChangeDetector,
     private localMapStore: LocalMapStore,
     private snapshotService: SnapshotService,
+    /**
+     * v0.2.0 structure-align Phase B: configManager is needed to read the
+     * current watchedRootUrls for the tree API response envelope. Kept
+     * optional for backward compatibility with tests that construct the
+     * service with the old 3-arg signature.
+     */
+    private configManager?: ConfigManager,
   ) {}
 
   /**
@@ -92,6 +102,15 @@ export class MappingService {
    * cloud_deleted rows are EXCLUDED: the trash-bin UI surfaces them
    * via a separate path (LocalMapStore.listCloudDeleted), so the tree
    * only shows live nodes.
+   *
+   * v0.2.0 structure-align Phase B: this legacy overload returns the
+   * cloud-view (wiki_node_token != null) projection WITHOUT the
+   * watched_roots envelope. New callers should prefer
+   * getTreeDetailed({view}) which returns the TreeResponse envelope
+   * with watched_roots + orphan_files + stats. The thin `/api/mapping/tree`
+   * route still calls this overload for backward compatibility with
+   * existing clients; the new `?view=` query param routes to
+   * getTreeDetailed instead.
    */
   getTree(): MappingNode[] {
     const documents = this.localMapStore.getAllDocuments();
@@ -103,36 +122,141 @@ export class MappingService {
       if (d.parentNodeToken) parentSet.add(d.parentNodeToken);
     }
 
-    return live.map((d) => {
-      const wikiNodeToken = d.wikiNodeToken ?? null;
-      const hasChild = wikiNodeToken != null && parentSet.has(wikiNodeToken);
-      return {
-        obj_token: d.objToken,
-        wiki_node_token: wikiNodeToken,
-        space_id: d.spaceId ?? null,
-        obj_type: d.objType ?? 'unknown',
-        title: d.title,
-        local_path: d.localMdPath,
-        parent_node_token: d.parentNodeToken ?? null,
-        has_child: hasChild,
-        obj_edit_time: d.objEditTime ?? null,
-        last_synced_modify_time: d.lastSyncedModifyTime,
-        last_synced_at: d.lastSyncedAt,
-        last_seen_at: d.lastSeenAt ?? null,
-        status: d.status,
-        cloud_deleted: d.cloudDeleted ?? 0,
-        sortOrder: d.localSortOrder ?? null,
-        // v0.2.0 cloud-link-coverage: expose the explicit feishu relationship.
-        // cloud_match defaults to 'unknown' for rows that pre-date the
-        // migration; UI should treat null original_link + unknown as
-        // "legacy, run rebuild to classify".
-        original_link: d.originalLink ?? null,
-        cloud_match: (d.cloudMatch ?? 'unknown') as
-          | 'synced'
-          | 'restricted'
-          | 'unknown',
-      } satisfies MappingNode;
-    });
+    return live.map((d) => this.projectNode(d, parentSet));
+  }
+
+  /**
+   * v0.2.0 structure-align Phase B: dual-view tree response.
+   *
+   * The view parameter controls how the flat node list is filtered:
+   *
+   *   - view='feishu' (default): only rows with wiki_node_token IS NOT NULL
+   *     are returned. These are the rows that correspond to actual
+   *     feishu nodes; the frontend rebuilds the cloud tree from
+   *     parent_node_token. Top-level nodes (parent_node_token NULL)
+   *     should be grouped under their watched_root_url by the frontend.
+   *
+   *   - view='local': ALL rows are returned (including wiki_node_token NULL
+   *     local-only files). The frontend rebuilds the directory tree
+   *     from local_path. orphan_files are also included so the UI can
+   *     show files that exist on disk but were never mapped in SQLite.
+   *
+   * The response always carries:
+   *   - watched_roots: array of materialized WatchedRoot records (for
+   *     top-level grouping + status display)
+   *   - orphan_files: only populated when view='local'
+   *   - stats: total_nodes + watched_root_count + cloud_match distribution
+   *
+   * `view='feishu'` is the default to keep the legacy shape backward
+   * compatible: a client that adds `?view=feishu` to an existing URL
+   * should see the exact same nodes it saw before (with the extra
+   * watched_root_url field per node).
+   */
+  getTreeDetailed(options: { view: 'feishu' | 'local'; includeOrphans?: boolean } = { view: 'feishu' }): TreeResponse {
+    const view = options.view === 'local' ? 'local' : 'feishu';
+    const includeOrphans = options.includeOrphans ?? (view === 'local');
+
+    const documents = this.localMapStore.getAllDocuments();
+    const live = documents.filter((d) => (d.cloudDeleted ?? 0) === 0);
+
+    // Precompute parent->child presence once for O(N) has_child.
+    const parentSet = new Set<string>();
+    for (const d of live) {
+      if (d.parentNodeToken) parentSet.add(d.parentNodeToken);
+    }
+
+    let nodes: MappingNode[];
+    if (view === 'feishu') {
+      // Cloud view: only rows with a feishu node identity.
+      nodes = live
+        .filter(
+          (d) => d.wikiNodeToken != null && d.wikiNodeToken !== '',
+        )
+        .map((d) => this.projectNode(d, parentSet));
+    } else {
+      // Local view: all rows (including local-only README/index).
+      nodes = live.map((d) => this.projectNode(d, parentSet));
+    }
+
+    // watched_roots envelope (always present).
+    const configuredUrls = this.configManager?.getConfig()?.watchedRootUrls ?? [];
+    const watchedRoots: WatchedRoot[] =
+      typeof (this.localMapStore as any).getWatchedRoots === 'function'
+        ? (this.localMapStore as any).getWatchedRoots(configuredUrls)
+        : [];
+
+    // orphan_files only meaningful in local view.
+    let orphanFiles: TreeResponse['orphan_files'] = [];
+    if (includeOrphans) {
+      try {
+        const config = this.configManager?.getConfig();
+        if (config?.knowledgeBaseRoot) {
+          const snap = this.snapshotService.readExisting(config.knowledgeBaseRoot);
+          if (snap?.orphan_files) {
+            orphanFiles = snap.orphan_files;
+          }
+        }
+      } catch (err) {
+        // Reading orphans is best-effort; never fail the whole tree call.
+        console.warn('[MappingService] orphan_files lookup failed:', err);
+      }
+    }
+
+    // Distribution stats.
+    const dist: Record<string, number> = {};
+    for (const n of nodes) {
+      const k = n.cloud_match ?? 'unknown';
+      dist[k] = (dist[k] ?? 0) + 1;
+    }
+
+    return {
+      view,
+      nodes,
+      watched_roots: watchedRoots,
+      orphan_files: orphanFiles,
+      stats: {
+        total_nodes: nodes.length,
+        watched_root_count: watchedRoots.length,
+        cloud_match_distribution: dist,
+      },
+    };
+  }
+
+  /**
+   * Project a single DocumentRecord into the MappingNode shape shared
+   * by getTree + getTreeDetailed. v0.2.0 structure-align Phase B adds
+   * watched_root_url to the projection so the frontend can group
+   * top-level entries.
+   */
+  private projectNode(d: any, parentSet: Set<string>): MappingNode {
+    const wikiNodeToken = d.wikiNodeToken ?? null;
+    const hasChild = wikiNodeToken != null && parentSet.has(wikiNodeToken);
+    return {
+      obj_token: d.objToken,
+      wiki_node_token: wikiNodeToken,
+      space_id: d.spaceId ?? null,
+      obj_type: d.objType ?? 'unknown',
+      title: d.title,
+      local_path: d.localMdPath,
+      parent_node_token: d.parentNodeToken ?? null,
+      has_child: hasChild,
+      obj_edit_time: d.objEditTime ?? null,
+      last_synced_modify_time: d.lastSyncedModifyTime,
+      last_synced_at: d.lastSyncedAt,
+      last_seen_at: d.lastSeenAt ?? null,
+      status: d.status,
+      cloud_deleted: d.cloudDeleted ?? 0,
+      sortOrder: d.localSortOrder ?? null,
+      // v0.2.0 cloud-link-coverage: expose the explicit feishu relationship.
+      original_link: d.originalLink ?? null,
+      cloud_match: (d.cloudMatch ?? 'unknown') as
+        | 'synced'
+        | 'restricted'
+        | 'unknown',
+      // v0.2.0 structure-align Phase B: surface the watchedRoot that owns
+      // this node so the frontend can group top-level entries.
+      watched_root_url: d.watchedRootUrl ?? null,
+    } satisfies MappingNode;
   }
 
   /**

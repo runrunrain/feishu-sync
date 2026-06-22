@@ -148,6 +148,57 @@ export interface DocumentRecord {
    */
   originalLink?: string | null;
   cloudMatch?: 'synced' | 'restricted' | 'unknown' | 'local_only';
+  /**
+   * v0.2.0 structure-align Phase B fields.
+   *
+   * watchedRootUrl is the feishu wiki URL of the watchedRoot that owns
+   * this row. Source of truth is the application config (watchedRootUrls);
+   * rows whose local_md_path top-level directory maps to a watchedRoot
+   * are tagged by IndexScanner during rebuild. Rows that live under a
+   * local-only directory (no watchedRoot tracking) keep this NULL.
+   */
+  watchedRootUrl?: string | null;
+}
+
+/**
+ * v0.2.0 structure-align Phase B: local_dirs table row shape.
+ *
+ * Each row maps a local directory (relative to knowledgeBaseRoot) to its
+ * feishu counterpart (or marks the directory as local-only when no
+ * feishu node exists). Used by LocalDirTreeView + NodeDetailCard.
+ */
+export interface LocalDirRecord {
+  localPath: string;          // PK, POSIX-style relative path
+  title: string;
+  parentPath: string | null;
+  watchedRootUrl: string | null;
+  mappedWikiNodeToken: string | null;
+  mappedObjToken: string | null;
+  cloudMatch: 'synced' | 'restricted' | 'unknown' | 'local_only';
+  autoDetected: number;       // 0 | 1
+  sortOrder: number | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * v0.2.0 structure-align Phase B: watchedRoots top-level structure.
+ *
+ * Materialized both in SQLite (derived from config + documents table) and
+ * in _index.json.watched_roots. The SQLite form carries extra fields for
+ * diagnostics (status, lastDetectedAt, childCount, diagnostic).
+ */
+export interface WatchedRoot {
+  url: string;
+  nodeToken: string;
+  title: string;
+  displayName: string;
+  localDir: string;
+  trackMode: 'tracked' | 'mounted';
+  status: 'synced' | 'missing_in_db' | 'error';
+  lastDetectedAt: string | null;
+  childCount: number;
+  diagnostic?: string;
 }
 
 /**
@@ -280,6 +331,37 @@ export interface MappingNode {
    */
   original_link: string | null;
   cloud_match: 'synced' | 'restricted' | 'unknown';
+  /**
+   * v0.2.0 structure-align Phase B: the watchedRoot that owns this node.
+   *
+   * Derived from documents.watched_root_url; present when the row's
+   * local_md_path lives under a tracked watchedRoot directory. The
+   * frontend uses this to group top-level nodes by watchedRoot in the
+   * cloud view. Null when the row is local-only or unclassified.
+   */
+  watched_root_url: string | null;
+}
+
+/**
+ * v0.2.0 structure-align Phase B: response envelope for
+ * GET /api/mapping/tree?view=feishu|local.
+ *
+ * The legacy GET /api/mapping/tree returned `{ nodes: MappingNode[] }`.
+ * The new endpoint wraps that shape with view metadata + watched_roots
+ * so the frontend has everything it needs to render a grouped tree in
+ * one round-trip. Backward compat: clients that only read `.nodes` see
+ * the same shape as before (with extra per-node fields).
+ */
+export interface TreeResponse {
+  view: 'feishu' | 'local';
+  nodes: MappingNode[];
+  watched_roots: WatchedRoot[];
+  orphan_files: Array<{ path: string; reason: string; cloud_match: 'local_only' }>;
+  stats: {
+    total_nodes: number;
+    watched_root_count: number;
+    cloud_match_distribution: Record<string, number>;
+  };
 }
 
 /**
@@ -290,12 +372,31 @@ export interface MappingNode {
  * v0.2.0 cloud-link-coverage: orphan_files entries carry an explicit
  * cloud_match marker so the UI can distinguish "no feishu correspondence"
  * from a transient parsing failure.
+ *
+ * v0.2.0 structure-align Phase B: adds `watched_roots` top-level array
+ * (one entry per configured watchedRoot) + `mounted_dirs` for local-only
+ * directories that exist on disk but are not tracked against any
+ * watchedRoot (e.g. _reports/, attachments/).
  */
 export interface IndexSnapshot {
   version: string;
   generated_at: string;
   knowledge_base_root: string;
   watched_root_urls: string[];
+  /**
+   * v0.2.0 structure-align Phase B: materialized watchedRoot records.
+   * Built from the configured watchedRootUrls + documents table state.
+   * Each entry includes display_name + status + child_count for the
+   * frontend to render top-level groupings without a second round-trip.
+   */
+  watched_roots: WatchedRoot[];
+  /**
+   * v0.2.0 structure-align Phase B: local-only directories that exist
+   * on disk but are not bound to any watchedRoot. Used by the local
+   * view to surface "mounted" top-level entries distinctly from
+   * tracked watchedRoots.
+   */
+  mounted_dirs: Array<{ local_dir: string; reason: string }>;
   top_level_dirs: Array<{ dir: string; node_count: number }>;
   nodes: MappingNode[];
   orphan_files: Array<{ path: string; reason: string; cloud_match: 'local_only' }>;

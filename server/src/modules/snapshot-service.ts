@@ -32,6 +32,7 @@ import { IndexScanner } from './index-scanner.js';
 import type {
   IndexSnapshot,
   MappingNode,
+  WatchedRoot,
 } from '../types/index.js';
 
 const SNAPSHOT_VERSION = '1.0';
@@ -52,6 +53,7 @@ export class SnapshotService {
     private configManager: ConfigManager,
     indexScannerDeps: { larkCliClient: any; config: any } | IndexScanner,
   ) {
+    this.watchedRootsVersion = 0;
     if (indexScannerDeps instanceof IndexScanner) {
       this.indexScanner = indexScannerDeps;
     } else {
@@ -62,6 +64,70 @@ export class SnapshotService {
       });
     }
   }
+
+  /**
+   * Build a derived watched_roots array for the current snapshot.
+   *
+   * v0.2.0 structure-align Phase B: combines the configured watchedRootUrls
+   * with SQLite state to produce one entry per watchedRoot. Each entry
+   * carries display_name + status + child_count so the frontend can
+   * render the top-level groupings without a second round-trip.
+   */
+  private buildWatchedRoots(): WatchedRoot[] {
+    const config = this.configManager.getConfig();
+    const urls = config?.watchedRootUrls ?? [];
+    if (urls.length === 0) return [];
+    if (typeof (this.localMapStore as any).getWatchedRoots !== 'function') {
+      return [];
+    }
+    return (this.localMapStore as any).getWatchedRoots(urls) as WatchedRoot[];
+  }
+
+  /**
+   * Scan kbRoot for directories that exist on disk but are NOT bound
+   * to any configured watchedRoot. These are surfaced as mounted_dirs
+   * in _index.json so the local view can show them distinctly from
+   * tracked watchedRoots.
+   *
+   * A directory is "mounted" when:
+   *   - it exists directly under kbRoot
+   *   - its name does not match any watchedRoot.localDir
+   *
+   * Examples: _reports/, attachments/, .trash-bin/ (dot-dirs skipped).
+   */
+  private scanMountedDirs(
+    kbRoot: string,
+    watchedRoots: WatchedRoot[],
+  ): Array<{ local_dir: string; reason: string }> {
+    const tracked = new Set(
+      watchedRoots.map((wr) => wr.localDir).filter((d) => d.length > 0),
+    );
+    const mounted: Array<{ local_dir: string; reason: string }> = [];
+    if (!fs.existsSync(kbRoot)) return mounted;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(kbRoot, { withFileTypes: true });
+    } catch {
+      return mounted;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      if (entry.name.startsWith('.')) continue;
+      if (tracked.has(entry.name)) continue;
+      mounted.push({
+        local_dir: entry.name,
+        reason: 'local_only_no_feishu_node',
+      });
+    }
+    return mounted.sort((a, b) => a.local_dir.localeCompare(b.local_dir));
+  }
+
+  /**
+   * Cache for the watched_roots value so we don't re-query SQLite on
+   * every snapshot refresh. Bumped by SnapshotService.generate() so
+   * the cache is per-snapshot-fresh.
+   */
+  private watchedRootsVersion: number;
 
   /**
    * Generate (or regenerate) the _index.json snapshot under the
@@ -91,12 +157,17 @@ export class SnapshotService {
     const nodes = documents.map((d) => this.projectDocument(d));
     const orphanFiles = this.scanOrphanFiles(kbRoot, new Set(documents.map((d) => d.localMdPath)));
     const topLevelDirs = this.aggregateTopLevelDirs(nodes, kbRoot);
+    const watchedRoots = this.buildWatchedRoots();
+    const mountedDirs = this.scanMountedDirs(kbRoot, watchedRoots);
+    this.watchedRootsVersion += 1;
 
     const snapshot: IndexSnapshot = {
       version: SNAPSHOT_VERSION,
       generated_at: new Date().toISOString(),
       knowledge_base_root: kbRoot,
       watched_root_urls: watchedRootUrls,
+      watched_roots: watchedRoots,
+      mounted_dirs: mountedDirs,
       top_level_dirs: topLevelDirs,
       nodes,
       orphan_files: orphanFiles,
@@ -135,12 +206,17 @@ export class SnapshotService {
     const previous = this.readExisting(kbRoot);
     const documents = this.localMapStore.getAllDocuments();
     const nodes = documents.map((d) => this.projectDocument(d));
+    const watchedRoots = this.buildWatchedRoots();
+    const mountedDirs = previous?.mounted_dirs ?? this.scanMountedDirs(kbRoot, watchedRoots);
+    this.watchedRootsVersion += 1;
 
     const snapshot: IndexSnapshot = {
       version: SNAPSHOT_VERSION,
       generated_at: new Date().toISOString(),
       knowledge_base_root: kbRoot,
       watched_root_urls: previous?.watched_root_urls ?? config.watchedRootUrls ?? [],
+      watched_roots: watchedRoots,
+      mounted_dirs: mountedDirs,
       top_level_dirs: previous?.top_level_dirs ?? this.aggregateTopLevelDirs(nodes, kbRoot),
       nodes,
       // Preserve orphan list from prior snapshot to skip the FS scan.
@@ -211,6 +287,9 @@ export class SnapshotService {
         | 'synced'
         | 'restricted'
         | 'unknown',
+      // v0.2.0 structure-align Phase B: surface the watchedRoot that owns
+      // this node so the frontend can group top-level entries.
+      watched_root_url: d.watchedRootUrl ?? null,
     };
   }
 

@@ -55,7 +55,12 @@ function getMappingService(c: any): MappingService {
       config: configManager.getConfig() ?? {},
     });
     const snapshotService = new SnapshotService(localMapStore, configManager, indexScanner);
-    c.__mappingService = new MappingService(changeDetector, localMapStore, snapshotService);
+    c.__mappingService = new MappingService(
+      changeDetector,
+      localMapStore,
+      snapshotService,
+      configManager,
+    );
     c.__snapshotService = snapshotService;
   }
   return c.__mappingService as MappingService;
@@ -105,16 +110,43 @@ mappingRoutes.get('/api/mapping/diff', async (c) => {
 // ---------------------------------------------------------------------------
 
 /**
- * Response: { nodes: MappingNode[] }
+ * Response: { nodes: MappingNode[] } | TreeResponse (when ?view= is set)
  *
- * Returns a flat array; the frontend rebuilds the tree via
- * parent_node_token (Q5: structure mirrors Feishu L1/L2, not local dirs).
+ * Query params:
+ *   view (optional) - 'feishu' | 'local'. When present, returns the
+ *     full TreeResponse envelope (view + watched_roots + orphan_files
+ *     + stats). When absent, returns the legacy { nodes } shape for
+ *     backward compatibility with clients that consume only that field.
+ *
+ *   view='feishu' (default when ?view= is present): only rows with
+ *     wiki_node_token != null are returned. The frontend rebuilds the
+ *     cloud tree from parent_node_token.
+ *
+ *   view='local': ALL rows are returned (including local-only README).
+ *     The frontend rebuilds the directory tree from local_path.
+ *     orphan_files are also included.
+ *
+ * Legacy contract: clients that omit ?view= continue to receive
+ * { nodes: MappingNode[] } and can use the cloud-view semantics
+ * implicitly (the legacy overload filters out cloud_deleted but does
+ * not filter wiki_node_token=NULL — the new view='feishu' filter is
+ * stricter, so existing clients may see slightly fewer nodes if they
+ * opt-in to the new query param).
  */
 mappingRoutes.get('/api/mapping/tree', async (c) => {
   try {
     const svc = getMappingService(c);
-    const nodes = svc.getTree();
-    return c.json({ nodes });
+    const rawView = c.req.query('view');
+    // Treat absent / empty / unknown view as "legacy" so existing callers
+    // keep seeing the unchanged { nodes } response shape.
+    if (rawView === undefined || rawView === '') {
+      const nodes = svc.getTree();
+      return c.json({ nodes });
+    }
+    const view = rawView === 'local' ? 'local' : 'feishu';
+    const includeOrphans = c.req.query('include_orphans') !== 'false';
+    const envelope = svc.getTreeDetailed({ view, includeOrphans });
+    return c.json(envelope);
   } catch (error) {
     console.error('[mapping] getTree failed:', error);
     return c.json(

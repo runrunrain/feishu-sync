@@ -78,6 +78,8 @@ class MockChangeDetector {
 class MockSnapshotService {
   generateCalls = 0;
   refreshCalls = 0;
+  /** v0.2.0 structure-align Phase B: stub returns no prior snapshot. */
+  readExistingResult: any = null;
 
   generate(): any {
     this.generateCalls++;
@@ -87,6 +89,10 @@ class MockSnapshotService {
   refreshSortOrder(): any {
     this.refreshCalls++;
     return { version: '1.0', generated_at: new Date().toISOString() };
+  }
+
+  readExisting(_kbRoot: string): any {
+    return this.readExistingResult;
   }
 }
 
@@ -270,6 +276,212 @@ describe('MappingService.getTree', () => {
     const userDoc = nodes.find((n) => n.obj_token === 'USER')!;
     expect(newDoc.sortOrder).toBeNull();
     expect(userDoc.sortOrder).toBe(5);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.2.0 structure-align Phase B: dual-view (B4) + watched_root projection
+// ---------------------------------------------------------------------------
+
+/**
+ * Mock that also implements the v4 methods used by getTreeDetailed.
+ * Extends MockLocalMapStore so the existing tests keep working unchanged.
+ */
+class MockLocalMapStoreV4 extends MockLocalMapStore {
+  watchedRootsResult: any[] = [];
+
+  getWatchedRoots(_urls: string[]): any[] {
+    return this.watchedRootsResult;
+  }
+}
+
+class MockConfigManager {
+  config: any;
+  constructor(config: any) {
+    this.config = config;
+  }
+  getConfig(): any {
+    return this.config;
+  }
+}
+
+describe('MappingService.getTreeDetailed (v0.2.0 structure-align Phase B)', () => {
+  let store: MockLocalMapStoreV4;
+  let snap: MockSnapshotService;
+  let cfg: MockConfigManager;
+  let svc: MappingService;
+
+  const ROOT_A = 'https://qcnbafdrjx7n.feishu.cn/wiki/Wramw1XxRihIgnkCrhqcdEbRnHb';
+  const ROOT_B = 'https://qcnbafdrjx7n.feishu.cn/wiki/QdZpwOmgBi25JVkAUmYcBiMinIf';
+
+  beforeEach(() => {
+    store = new MockLocalMapStoreV4();
+    snap = new MockSnapshotService();
+    cfg = new MockConfigManager({
+      watchedRootUrls: [ROOT_A, ROOT_B],
+      knowledgeBaseRoot: '/tmp/kb',
+    });
+    svc = new MappingService(
+      new MockChangeDetector() as any,
+      store as any,
+      snap as any,
+      cfg as any,
+    );
+  });
+
+  it('feishu view filters out wiki_node_token=NULL rows', () => {
+    // 3 rows: 2 with wiki_node_token, 1 local-only README (NULL token)
+    store.rows.set(
+      'CLOUD1',
+      makeDoc({ objToken: 'CLOUD1', wikiNodeToken: 'WNT_1', title: 'cloud1' }),
+    );
+    store.rows.set(
+      'CLOUD2',
+      makeDoc({ objToken: 'CLOUD2', wikiNodeToken: 'WNT_2', title: 'cloud2' }),
+    );
+    store.rows.set(
+      'LOCAL',
+      makeDoc({ objToken: 'LOCAL', wikiNodeToken: null, title: 'README' }),
+    );
+
+    const env = svc.getTreeDetailed({ view: 'feishu' });
+
+    expect(env.view).toBe('feishu');
+    expect(env.nodes).toHaveLength(2);
+    expect(env.nodes.map((n) => n.obj_token).sort()).toEqual(['CLOUD1', 'CLOUD2']);
+    // Each node carries watched_root_url (null here since no backfill ran)
+    for (const n of env.nodes) {
+      expect(n).toHaveProperty('watched_root_url');
+    }
+  });
+
+  it('local view returns all rows including wiki_node_token=NULL', () => {
+    store.rows.set(
+      'CLOUD1',
+      makeDoc({ objToken: 'CLOUD1', wikiNodeToken: 'WNT_1', title: 'cloud1' }),
+    );
+    store.rows.set(
+      'LOCAL1',
+      makeDoc({ objToken: 'LOCAL1', wikiNodeToken: null, title: 'README' }),
+    );
+
+    const env = svc.getTreeDetailed({ view: 'local', includeOrphans: false });
+
+    expect(env.view).toBe('local');
+    expect(env.nodes).toHaveLength(2);
+    // orphan_files empty because includeOrphans=false
+    expect(env.orphan_files).toEqual([]);
+  });
+
+  it('watched_roots envelope reflects LocalMapStore.getWatchedRoots output', () => {
+    store.watchedRootsResult = [
+      {
+        url: ROOT_A,
+        nodeToken: 'Wramw1',
+        title: '策划-Designer',
+        displayName: '[策划] 策划设计',
+        localDir: '策划 - Designer',
+        trackMode: 'tracked',
+        status: 'synced',
+        lastDetectedAt: null,
+        childCount: 5,
+      },
+      {
+        url: ROOT_B,
+        nodeToken: 'QdZpw',
+        title: '技术-Dev',
+        displayName: '[技术] 技术开发',
+        localDir: '技术 - Dev',
+        trackMode: 'tracked',
+        status: 'missing_in_db',
+        lastDetectedAt: null,
+        childCount: 0,
+      },
+    ];
+
+    const env = svc.getTreeDetailed({ view: 'feishu' });
+
+    expect(env.watched_roots).toHaveLength(2);
+    expect(env.watched_roots[0].displayName).toBe('[策划] 策划设计');
+    expect(env.watched_roots[1].status).toBe('missing_in_db');
+    expect(env.stats.watched_root_count).toBe(2);
+  });
+
+  it('stats.cloud_match_distribution counts the projected nodes', () => {
+    store.rows.set(
+      'S1',
+      makeDoc({ objToken: 'S1', wikiNodeToken: 'W1', title: 'synced', cloudMatch: 'synced' }),
+    );
+    store.rows.set(
+      'S2',
+      makeDoc({ objToken: 'S2', wikiNodeToken: 'W2', title: 'synced2', cloudMatch: 'synced' }),
+    );
+    store.rows.set(
+      'R1',
+      makeDoc({ objToken: 'R1', wikiNodeToken: 'W3', title: '', cloudMatch: 'restricted' }),
+    );
+    // Local-only: filtered out of feishu view, but counted in local view.
+    store.rows.set(
+      'L1',
+      makeDoc({ objToken: 'L1', wikiNodeToken: null, title: 'README', cloudMatch: 'unknown' }),
+    );
+
+    const feishu = svc.getTreeDetailed({ view: 'feishu' });
+    expect(feishu.stats.total_nodes).toBe(3);
+    expect(feishu.stats.cloud_match_distribution).toEqual({
+      synced: 2,
+      restricted: 1,
+    });
+
+    const local = svc.getTreeDetailed({ view: 'local' });
+    expect(local.stats.total_nodes).toBe(4);
+    expect(local.stats.cloud_match_distribution).toEqual({
+      synced: 2,
+      restricted: 1,
+      unknown: 1,
+    });
+  });
+
+  it('watched_root_url is projected from DocumentRecord.watchedRootUrl', () => {
+    store.rows.set(
+      'W1',
+      makeDoc({
+        objToken: 'W1',
+        wikiNodeToken: 'WN1',
+        title: 'w1',
+        watchedRootUrl: ROOT_A,
+      }),
+    );
+
+    const env = svc.getTreeDetailed({ view: 'feishu' });
+    expect(env.nodes[0].watched_root_url).toBe(ROOT_A);
+  });
+
+  it('legacy getTree() still returns MappingNode[] (not envelope)', () => {
+    store.rows.set(
+      'A',
+      makeDoc({ objToken: 'A', wikiNodeToken: 'WA', title: 'a' }),
+    );
+    const nodes = svc.getTree();
+    expect(Array.isArray(nodes)).toBe(true);
+    // Each node carries the new watched_root_url field
+    expect(nodes[0]).toHaveProperty('watched_root_url');
+  });
+
+  it('default option (no view) falls back to feishu view', () => {
+    store.rows.set(
+      'CLOUD1',
+      makeDoc({ objToken: 'CLOUD1', wikiNodeToken: 'WNT_1', title: 'cloud1' }),
+    );
+    store.rows.set(
+      'LOCAL1',
+      makeDoc({ objToken: 'LOCAL1', wikiNodeToken: null, title: 'README' }),
+    );
+
+    // Call without options — should default to feishu
+    const env = (svc as any).getTreeDetailed() as any;
+    expect(env.view).toBe('feishu');
+    expect(env.nodes.map((n: any) => n.obj_token)).toEqual(['CLOUD1']);
   });
 });
 

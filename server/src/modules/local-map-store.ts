@@ -44,6 +44,8 @@ export class LocalMapStore {
    *     local_sort_order
    *   - v0.2.0 cloud-link-coverage (migration_v3): original_link,
    *     cloud_match
+   *   - v0.2.0 structure-align Phase B (migration_v4): watched_root_url
+   *     + local_dirs table
    *
    * New fresh databases get all these columns via getCreateTablesDDL();
    * this method only matters for databases created by an older version.
@@ -85,6 +87,8 @@ export class LocalMapStore {
       // v0.2.0 cloud-link-coverage (migration_v3)
       { name: 'original_link', dml: 'ALTER TABLE documents ADD COLUMN original_link TEXT' },
       { name: 'cloud_match', dml: "ALTER TABLE documents ADD COLUMN cloud_match TEXT NOT NULL DEFAULT 'unknown'" },
+      // v0.2.0 structure-align Phase B (migration_v4)
+      { name: 'watched_root_url', dml: 'ALTER TABLE documents ADD COLUMN watched_root_url TEXT' },
     ];
 
     const pending = additive.filter((c) => !colNames.has(c.name));
@@ -137,7 +141,32 @@ export class LocalMapStore {
       CREATE INDEX IF NOT EXISTS idx_documents_parent_sort ON documents(parent_node_token, local_sort_order);
       CREATE INDEX IF NOT EXISTS idx_documents_cloud_match ON documents(cloud_match);
       CREATE INDEX IF NOT EXISTS idx_documents_original_link ON documents(original_link);
+      CREATE INDEX IF NOT EXISTS idx_documents_watched_root ON documents(watched_root_url);
     `);
+
+    // v0.2.0 structure-align Phase B: local_dirs table.
+    // CREATE TABLE IF NOT EXISTS is idempotent, safe to run on every boot.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS localDirs (
+        local_path TEXT PRIMARY KEY,
+        title TEXT NOT NULL DEFAULT '',
+        parent_path TEXT,
+        watched_root_url TEXT,
+        mapped_wiki_node_token TEXT,
+        mapped_obj_token TEXT,
+        cloud_match TEXT NOT NULL DEFAULT 'unknown'
+                      CHECK(cloud_match IN ('synced','restricted','unknown','local_only')),
+        auto_detected INTEGER NOT NULL DEFAULT 0,
+        sort_order INTEGER,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_local_dirs_watched_root ON localDirs(watched_root_url);
+      CREATE INDEX IF NOT EXISTS idx_local_dirs_wiki_node    ON localDirs(mapped_wiki_node_token);
+      CREATE INDEX IF NOT EXISTS idx_local_dirs_cloud_match  ON localDirs(cloud_match);
+      CREATE INDEX IF NOT EXISTS idx_local_dirs_parent       ON localDirs(parent_path);
+    `);
+    console.info('[LocalMapStore] localDirs table ready (v4 structure-align)');
   }
 
   /**
@@ -165,8 +194,8 @@ export class LocalMapStore {
         last_synced_modify_time, last_synced_at, status,
         parent_node_token, space_id, obj_edit_time,
         cloud_deleted, last_seen_at, local_sort_order,
-        original_link, cloud_match
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        original_link, cloud_match, watched_root_url
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(obj_token) DO UPDATE SET
         wiki_node_token = COALESCE(excluded.wiki_node_token, documents.wiki_node_token),
         obj_type = COALESCE(excluded.obj_type, documents.obj_type),
@@ -183,6 +212,7 @@ export class LocalMapStore {
         local_sort_order = documents.local_sort_order,
         original_link = COALESCE(excluded.original_link, documents.original_link),
         cloud_match = COALESCE(excluded.cloud_match, documents.cloud_match),
+        watched_root_url = COALESCE(excluded.watched_root_url, documents.watched_root_url),
         updated_at = datetime('now')
     `);
 
@@ -208,6 +238,7 @@ export class LocalMapStore {
       // not need to be updated. The recompute pass later promotes the
       // value to synced/restricted based on the row's title/obj_token.
       record.cloudMatch ?? 'unknown',
+      record.watchedRootUrl ?? null,
     );
   }
 
@@ -520,6 +551,7 @@ export class LocalMapStore {
       localSortOrder: row.local_sort_order ?? null,
       originalLink: row.original_link ?? null,
       cloudMatch: row.cloud_match ?? 'unknown',
+      watchedRootUrl: row.watched_root_url ?? null,
     };
   }
 
@@ -597,6 +629,255 @@ export class LocalMapStore {
     return tx();
   }
 
+  // -------------------------------------------------------------------------
+  // v0.2.0 structure-align Phase B: watched_root_url + localDirs
+  // -------------------------------------------------------------------------
+
+  /**
+   * Update a single document's watched_root_url. Used by IndexScanner
+   * during a rebuild when the directory containing the .md file maps
+   * to a configured watchedRoot.
+   *
+   * Idempotent: re-running with the same value is a no-op.
+   */
+  setWatchedRootUrl(objToken: string, watchedRootUrl: string | null): void {
+    const stmt = this.getStatement(`
+      UPDATE documents
+      SET watched_root_url = ?, updated_at = datetime('now')
+      WHERE obj_token = ?
+    `);
+    stmt.run(watchedRootUrl, objToken);
+  }
+
+  /**
+   * Bulk classify watched_root_url for existing rows based on a
+   * directory-prefix map. Called by IndexScanner after a rebuild.
+   *
+   * The map is keyed by the POSIX-style top-level directory name (e.g.
+   * "策划 - Designer") and the value is the watchedRoot URL. Rows whose
+   * local_md_path lives under one of these directories get tagged;
+   * rows under any other top-level directory get watched_root_url=NULL.
+   *
+   * Returns the number of rows updated (touched) for diagnostics.
+   *
+   * Implementation note: we deliberately do a full UPDATE pass keyed
+   * on `local_md_path LIKE ?||'/%'` rather than parsing paths in JS —
+   * SQLite LIKE with a trailing / is SARGable for the directory prefix
+   * and avoids N+1 round-trips.
+   */
+  backfillWatchedRootUrls(
+    dirToUrl: Map<string, string>,
+    kbRoot: string,
+  ): { scanned: number; tagged: number; untagged: number } {
+    if (dirToUrl.size === 0) {
+      return { scanned: 0, tagged: 0, untagged: 0 };
+    }
+
+    const tx = this.db.transaction((): {
+      scanned: number;
+      tagged: number;
+      untagged: number;
+    } => {
+      // Reset all rows to NULL first so stale tags from a previous config
+      // (e.g. a watchedRoot that was removed) don't linger. The fresh
+      // pass below re-tags the ones still owned by a tracked root.
+      this.db.exec(`UPDATE documents SET watched_root_url = NULL`);
+
+      let tagged = 0;
+      for (const [dirName, url] of dirToUrl.entries()) {
+        // Match both absolute (kbRoot/dirName/...) and relative
+        // (dirName/...) paths. Windows uses \ but SQLite LIKE needs /
+        // — we use a permissive pattern that matches both separators
+        // via ESCAPE on the literal segments. The simplest portable
+        // form is to compute the normalized prefix once.
+        const segs = this.normalizePathForLike(`${kbRoot}/${dirName}/`);
+        const relSegs = this.normalizePathForLike(`${dirName}/`);
+        const winRoot = kbRoot.replace(/\//g, '\\');
+        const winSegs = this.normalizePathForLike(`${winRoot}\\${dirName}\\`);
+
+        // LIKE patterns. Use LOWER() comparison for case-insensitive
+        // matching (Windows filesystem is case-insensitive; harmless on
+        // case-sensitive filesystems where users always use the exact
+        // casing anyway).
+        const res = this.db
+          .prepare(
+            `UPDATE documents
+             SET watched_root_url = ?
+             WHERE LOWER(local_md_path) LIKE ? ESCAPE '\\'
+                OR LOWER(local_md_path) LIKE ? ESCAPE '\\'
+                OR LOWER(local_md_path) LIKE ? ESCAPE '\\'`,
+          )
+          .run(
+            url,
+            `%${segs}%`,
+            `%${relSegs}%`,
+            `%${winSegs}%`,
+          );
+        tagged += res.changes;
+      }
+
+      const total = (
+        this.db.prepare('SELECT COUNT(*) AS n FROM documents').get() as {
+          n: number;
+        }
+      ).n;
+      return {
+        scanned: total,
+        tagged,
+        untagged: total - tagged,
+      };
+    });
+    return tx();
+  }
+
+  /**
+   * Escape LIKE special characters (%, _, \) in a path so the literal
+   * string can be used inside LIKE. Also normalizes separator chars
+   * so we don't double-escape them.
+   */
+  private normalizePathForLike(p: string): string {
+    return p.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+  }
+
+  /**
+   * Build the watched_roots projection consumed by the tree API +
+   * _index.json. For each configured watchedRoot URL, derive:
+   *   - nodeToken (parsed from URL)
+   *   - title (best-effort: derived from local directory mapping)
+   *   - displayName (business-prefix UI label)
+   *   - localDir (the local directory that backs this watchedRoot)
+   *   - trackMode ('tracked' — all configured URLs are tracked)
+   *   - status (synced when >=1 row references it; missing_in_db otherwise)
+   *   - lastDetectedAt (max last_seen_at among children)
+   *   - childCount (number of cloud_deleted=0 rows with this watched_root_url)
+   *
+   * The mapping is derived from the URL's nodeToken → directory name,
+   * using a small static map that mirrors the local knowledge base
+   * layout. This avoids a runtime round-trip to lark-cli getNode
+   * (which is async and may fail) — the desktop runtime refreshes
+   * this via SnapshotService.generate() once detection completes.
+   */
+  getWatchedRoots(configuredUrls: string[]): import('../types/index.js').WatchedRoot[] {
+    if (configuredUrls.length === 0) return [];
+
+    // Aggregate current state from SQLite in one query per URL.
+    const statsByChild = this.db
+      .prepare(
+        `SELECT
+           watched_root_url AS url,
+           COUNT(*) AS child_count,
+           MAX(last_seen_at) AS last_seen
+         FROM documents
+         WHERE watched_root_url IS NOT NULL AND cloud_deleted = 0
+         GROUP BY watched_root_url`,
+      )
+      .all() as Array<{ url: string; child_count: number; last_seen: string | null }>;
+    const statsMap = new Map(statsByChild.map((s) => [s.url, s]));
+
+    return configuredUrls.map((url) => {
+      const nodeToken = parseNodeTokenFromUrl(url);
+      const meta = inferWatchedRootMeta(nodeToken);
+      const stat = statsMap.get(url);
+      const childCount = stat?.child_count ?? 0;
+      const lastSeen = stat?.last_seen ?? null;
+      return {
+        url,
+        nodeToken,
+        title: meta.title,
+        displayName: meta.displayName,
+        localDir: meta.localDir,
+        trackMode: 'tracked' as const,
+        status: (childCount > 0 ? 'synced' : 'missing_in_db') as
+          | 'synced'
+          | 'missing_in_db',
+        lastDetectedAt: lastSeen,
+        childCount,
+      };
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // localDirs table (v0.2.0 structure-align Phase B)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Upsert a localDirs row. PK is local_path (relative to kbRoot).
+   *
+   * On UPDATE we preserve created_at, auto_detected (unless explicitly
+   * toggled), and sort_order. COALESCE keeps the previous value when
+   * the caller omits a field — same pattern as upsertDocument.
+   */
+  upsertLocalDir(record: {
+    localPath: string;
+    title?: string;
+    parentPath?: string | null;
+    watchedRootUrl?: string | null;
+    mappedWikiNodeToken?: string | null;
+    mappedObjToken?: string | null;
+    cloudMatch?: 'synced' | 'restricted' | 'unknown' | 'local_only';
+    autoDetected?: number;
+    sortOrder?: number | null;
+  }): void {
+    const stmt = this.getStatement(`
+      INSERT INTO localDirs (
+        local_path, title, parent_path, watched_root_url,
+        mapped_wiki_node_token, mapped_obj_token, cloud_match,
+        auto_detected, sort_order
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(local_path) DO UPDATE SET
+        title = COALESCE(excluded.title, localDirs.title),
+        parent_path = COALESCE(excluded.parent_path, localDirs.parent_path),
+        watched_root_url = COALESCE(excluded.watched_root_url, localDirs.watched_root_url),
+        mapped_wiki_node_token = COALESCE(excluded.mapped_wiki_node_token, localDirs.mapped_wiki_node_token),
+        mapped_obj_token = COALESCE(excluded.mapped_obj_token, localDirs.mapped_obj_token),
+        cloud_match = COALESCE(excluded.cloud_match, localDirs.cloud_match),
+        auto_detected = COALESCE(excluded.auto_detected, localDirs.auto_detected),
+        sort_order = COALESCE(excluded.sort_order, localDirs.sort_order),
+        updated_at = datetime('now')
+    `);
+    stmt.run(
+      record.localPath,
+      record.title ?? '',
+      record.parentPath ?? null,
+      record.watchedRootUrl ?? null,
+      record.mappedWikiNodeToken ?? null,
+      record.mappedObjToken ?? null,
+      record.cloudMatch ?? 'unknown',
+      record.autoDetected ?? 1,
+      record.sortOrder ?? null,
+    );
+  }
+
+  /**
+   * Return all localDirs rows, ordered for UI consumption:
+   *   1. parent_path IS NULL (top-level) first
+   *   2. then sort_order asc, then title
+   *   3. then deeper paths after their parent (lexicographic on local_path)
+   */
+  getAllLocalDirs(): import('../types/index.js').LocalDirRecord[] {
+    const stmt = this.getStatement(`
+      SELECT * FROM localDirs
+      ORDER BY
+        CASE WHEN parent_path IS NULL THEN 0 ELSE 1 END,
+        sort_order ASC NULLS LAST,
+        local_path ASC
+    `);
+    const rows = stmt.all() as any[];
+    return rows.map((row) => ({
+      localPath: row.local_path,
+      title: row.title,
+      parentPath: row.parent_path ?? null,
+      watchedRootUrl: row.watched_root_url ?? null,
+      mappedWikiNodeToken: row.mapped_wiki_node_token ?? null,
+      mappedObjToken: row.mapped_obj_token ?? null,
+      cloudMatch: row.cloud_match ?? 'unknown',
+      autoDetected: row.auto_detected ?? 0,
+      sortOrder: row.sort_order ?? null,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    }));
+  }
+
   /**
    * Get the CREATE TABLE DDL.
    *
@@ -640,13 +921,35 @@ export class LocalMapStore {
         local_sort_order INTEGER,
         -- v0.2.0 cloud-link-coverage (same pattern)
         original_link TEXT,
-        cloud_match TEXT NOT NULL DEFAULT 'unknown'
+        cloud_match TEXT NOT NULL DEFAULT 'unknown',
+        -- v0.2.0 structure-align Phase B (same pattern)
+        watched_root_url TEXT
       );
 
       -- v0.1.0 indexes (columns always exist)
       CREATE INDEX IF NOT EXISTS idx_documents_wiki_node_token ON documents(wiki_node_token);
       CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status);
       CREATE INDEX IF NOT EXISTS idx_documents_local_md_path ON documents(local_md_path);
+
+      -- v0.2.0 structure-align Phase B: local_dirs table (local directory ↔ feishu node mapping)
+      CREATE TABLE IF NOT EXISTS localDirs (
+        local_path TEXT PRIMARY KEY,
+        title TEXT NOT NULL DEFAULT '',
+        parent_path TEXT,
+        watched_root_url TEXT,
+        mapped_wiki_node_token TEXT,
+        mapped_obj_token TEXT,
+        cloud_match TEXT NOT NULL DEFAULT 'unknown'
+                      CHECK(cloud_match IN ('synced','restricted','unknown','local_only')),
+        auto_detected INTEGER NOT NULL DEFAULT 0,
+        sort_order INTEGER,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_local_dirs_watched_root ON localDirs(watched_root_url);
+      CREATE INDEX IF NOT EXISTS idx_local_dirs_wiki_node    ON localDirs(mapped_wiki_node_token);
+      CREATE INDEX IF NOT EXISTS idx_local_dirs_cloud_match  ON localDirs(cloud_match);
+      CREATE INDEX IF NOT EXISTS idx_local_dirs_parent       ON localDirs(parent_path);
 
       -- Sync log table
       CREATE TABLE IF NOT EXISTS sync_log (
@@ -674,4 +977,80 @@ export class LocalMapStore {
       CREATE INDEX IF NOT EXISTS idx_run_log_level ON run_log(level);
     `;
   }
+}
+
+// ===========================================================================
+// Module-level helpers (no class state, safe to share across instances)
+// ===========================================================================
+
+/**
+ * Extract the feishu wiki node token from a wiki URL.
+ *
+ *   https://qcnbafdrjx7n.feishu.cn/wiki/<token>
+ *
+ * Returns the empty string when the URL does not match the expected
+ * shape. Callers should treat empty as "unknown".
+ */
+function parseNodeTokenFromUrl(url: string): string {
+  const m = url.match(/\/wiki\/([A-Za-z0-9]+)/);
+  return m ? m[1] : '';
+}
+
+/**
+ * Static metadata map for the four configured watchedRoots.
+ *
+ * Mirrors the project's local knowledge base layout (see 白泽 structure-align
+ * survey §3.1). Each entry maps a feishu nodeToken → display-friendly
+ * metadata (title / displayName / localDir) used by the UI to render
+ * top-level groupings.
+ *
+ * The map is intentionally a static literal: the local directory names
+ * are stable and do not change with the user's config. If a watchedRoot
+ * is added that is not in this map, we fall back to a generic shape
+ * derived from the URL itself.
+ */
+function inferWatchedRootMeta(nodeToken: string): {
+  title: string;
+  displayName: string;
+  localDir: string;
+} {
+  const KNOWN: Record<
+    string,
+    { title: string; displayName: string; localDir: string }
+  > = {
+    // 策划
+    Wramw1XxRihIgnkCrhqcdEbRnHb: {
+      title: '策划-Designer',
+      displayName: '[策划] 策划设计',
+      localDir: '策划 - Designer',
+    },
+    // 技术
+    QdZpwOmgBi25JVkAUmYcBiMinIf: {
+      title: '技术-Dev',
+      displayName: '[技术] 技术开发',
+      localDir: '技术 - Dev',
+    },
+    // [必读]研发规范
+    NudewPkE9inlGhkEDA1c9FSsnkb: {
+      title: '[必读]研发规范',
+      displayName: '[规范] 研发规范',
+      localDir: '[必读] 研发规范',
+    },
+    // 开发环境指引
+    FEaww3vUHieIumk6FdIc92WHnyh: {
+      title: '开发环境指引',
+      displayName: '[指引] 开发环境指引',
+      localDir: '开发环境指引',
+    },
+  };
+
+  if (nodeToken && KNOWN[nodeToken]) {
+    return KNOWN[nodeToken];
+  }
+  // Fallback: use the node token as the title; displayName mirrors it.
+  return {
+    title: nodeToken || '(unknown)',
+    displayName: nodeToken ? `[根] ${nodeToken.slice(0, 8)}` : '(unknown)',
+    localDir: '',
+  };
 }
