@@ -247,7 +247,14 @@ export class SyncEngine {
             adapt: {
               temperature: this.config.llm.temperature ?? 0.2,
               enableStreaming: false,
-              timeoutMs: 60_000,
+              // Surface the LLM timeout as a config knob (LlmConfig.timeoutMs,
+              // default 600000ms = 10 min). The previous hard-coded 60s was
+              // too aggressive for bigmodel glm-5.2[1m] under load; raising
+              // the ceiling here lets the primary channel finish instead of
+              // prematurely aborting to the fallback. Channels still clamp
+              // this value via their own resolveOptions when the caller
+              // omits it.
+              timeoutMs: this.config.llm.timeoutMs ?? 600_000,
             },
           }
         );

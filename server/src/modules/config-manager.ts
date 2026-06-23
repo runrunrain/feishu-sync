@@ -66,6 +66,16 @@ const DEFAULT_CLAUDE_COMPAT_BASE_URL = 'https://open.bigmodel.cn/api/anthropic';
  */
 const DEFAULT_DIRECT_MODEL = 'glm-4-flash';
 const DEFAULT_CLAUDE_CLI_MODEL = 'glm-5.2[1m]';
+/**
+ * Per-call LLM adaptation timeout, in milliseconds.
+ *
+ * 10 minutes gives bigmodel glm-5.2[1m] (the Anthropic-compat alias
+ * used by the claude-cli primary channel) enough headroom to finish
+ * under transient 529 over-load retries without making the user wait
+ * unbounded. The previous hard-coded 60s value aborted the primary
+ * channel too aggressively and forced a fall-back to DirectChannel.
+ */
+const DEFAULT_LLM_TIMEOUT_MS = 600_000;
 
 /**
  * Set of known non-bigmodel OpenAI-compat base URLs whose providers do
@@ -198,6 +208,10 @@ function buildDefaultLlmConfig(): LlmConfig {
     model: claudeModel,
     directModel: DEFAULT_DIRECT_MODEL,
     temperature: 0.2,
+    // 10-minute default. See LlmConfig.timeoutMs rationale in
+    // types/index.ts — the previous 60s ceiling was too tight for
+    // bigmodel glm-5.2[1m] under load.
+    timeoutMs: DEFAULT_LLM_TIMEOUT_MS,
     claudeCli: {
       claudePath: undefined,
       extraArgs: [],
@@ -487,6 +501,10 @@ export class ConfigManager {
       // endpoint model. Users on a different provider can override via UI.
       directModel: DEFAULT_DIRECT_MODEL,
       temperature: typeof legacy.temperature === 'number' ? legacy.temperature : 0.2,
+      // Legacy flat configs had no timeout field; surface the new 10-min
+      // default so the timeout config knob is usable immediately after
+      // migration.
+      timeoutMs: DEFAULT_LLM_TIMEOUT_MS,
       claudeCli: {
         claudePath: undefined,
         extraArgs: [],
@@ -517,6 +535,13 @@ export class ConfigManager {
       directModel: partial.directModel ?? base.directModel,
       claudeCliModel: partial.claudeCliModel ?? base.claudeCliModel,
       temperature: typeof partial.temperature === 'number' ? partial.temperature : 0.2,
+      // Persisted configs written before v0.2.0 sync-state-timeout-fix lack
+      // this field. Fall back to the explicit default; preserve user-provided
+      // values verbatim (including 0 / small numbers — the user set them on
+      // purpose and the channel will clamp to a sane minimum at call time).
+      timeoutMs: typeof partial.timeoutMs === 'number'
+        ? partial.timeoutMs
+        : DEFAULT_LLM_TIMEOUT_MS,
       claudeCli: {
         claudePath: partial.claudeCli?.claudePath ?? base.claudeCli?.claudePath,
         extraArgs: partial.claudeCli?.extraArgs ?? base.claudeCli?.extraArgs,

@@ -39,25 +39,51 @@ function formatNextCheck(timestamp: number | null): string {
 
 export function GlobalStatusBar() {
   const { ready: authReady, authStatus } = useAuthStatus();
-  const { pendingCount, lastSyncTime, nextCheckTime, isDetecting } = useSyncStatus();
+  const [refreshTick, setRefreshTick] = useState(0);
+  const { pendingCount, lastSyncTime, nextCheckTime, isDetecting } = useSyncStatus({ refreshTick });
   const { config } = useConfig();
-  const { detect } = useChanges();
+  const { detect, detectAll } = useChanges();
   const toast = useToast();
   const [refreshing, setRefreshing] = useState(false);
+  const [detecting, setDetecting] = useState(false);
 
   const activeRootUrl = pickFirstValidWikiUrl(config?.watchedRootUrls);
   const urlUnconfigured = !activeRootUrl && (config?.watchedRootUrls?.length ?? 0) === 0;
   const urlInvalid = !activeRootUrl && (config?.watchedRootUrls?.length ?? 0) > 0;
-  const detectDisabled = isDetecting || !isUsableWikiUrl(activeRootUrl);
+  const detectDisabled = detecting || !isUsableWikiUrl(activeRootUrl);
   const detectTooltip = urlUnconfigured
     ? '请先在设置中配置飞书根 URL'
     : urlInvalid
       ? '配置的飞书根 URL 格式无效'
       : '';
 
-  const handleDetect = () => {
+  const handleDetect = async () => {
     if (!isUsableWikiUrl(activeRootUrl)) return;
-    detect(activeRootUrl);
+    setDetecting(true);
+    try {
+      // v0.2.0 sync-state-timeout-fix: the status bar's detect button
+      // used to fire detectChanges(firstRootUrl), which only refreshed
+      // ONE watched subtree. With 4 watchedRoots configured the other
+      // three subtrees stayed stale, so the user saw "no changes" in
+      // the panel while pending edits silently existed in the other
+      // roots. detectChangesAll() iterates every watchedRoot on the
+      // server side (POST /api/detect/changes-all) and aggregates the
+      // results, giving a single click the expected full-refresh
+      // semantics. Per-root detect stays available via `detect(rootUrl)`
+      // for callers that need it.
+      const rootCount = config?.watchedRootUrls?.length ?? 0;
+      if (rootCount > 1) {
+        await detectAll();
+      } else {
+        await detect(activeRootUrl);
+      }
+      // Bump refreshTick so useSyncStatus re-pulls the real pendingCount
+      // immediately after a detect completes; this is what keeps the
+      // status-bar counter in lockstep with ChangeListPanel's diff.
+      setRefreshTick((n) => n + 1);
+    } finally {
+      setDetecting(false);
+    }
   };
 
   const handleRefreshIndex = async () => {
@@ -96,6 +122,9 @@ export function GlobalStatusBar() {
           message: `索引重建完成 · ${countText}`,
         });
       }
+      // After rebuild the pendingCount may have changed (rows flipped between
+      // placeholder/synced); bump the refresh tick so useSyncStatus re-pulls.
+      setRefreshTick((n) => n + 1);
     } catch (err) {
       const msg = err instanceof Error ? err.message : '索引重建失败';
       appLogger.error('global-status', 'rebuild-index failed', err);
@@ -188,8 +217,8 @@ export function GlobalStatusBar() {
           title={detectTooltip}
           className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs text-seal border border-seal rounded-md bg-paper hover:bg-seal/5 font-sans-ui transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
         >
-          <RefreshCw className={`w-3.5 h-3.5 ${isDetecting ? 'animate-spin' : ''}`} />
-          {isDetecting ? '检测中' : '立即检测'}
+          <RefreshCw className={`w-3.5 h-3.5 ${detecting || isDetecting ? 'animate-spin' : ''}`} />
+          {detecting || isDetecting ? '检测中' : '立即检测'}
         </button>
       </div>
     </div>

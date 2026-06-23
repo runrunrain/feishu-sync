@@ -537,3 +537,107 @@ describe('ChangeDetector.detectSheetSubChanges (P2-T4)', () => {
     expect(out).toHaveLength(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// v0.2.0 sync-state-timeout-fix: detect-result cache (QPS burst collapse)
+//
+// These tests pin the behavior of ChangeDetector.detectChanges's short-lived
+// result cache, added to prevent the post-detect UI burst (useSyncStatus +
+// ChangeListPanel + polling) from triggering 5 concurrent lark-cli detect
+// calls that exceed the upstream QPS limit and 500-out the diff endpoint.
+// ---------------------------------------------------------------------------
+
+class TrackingLarkCliClient {
+  // Counter exercises the cache: each uncached detect call should bump
+  // getNode invocations exactly once.
+  getNodeCalls = 0;
+  listCalls = 0;
+  async getNode(_url: string): Promise<LarkCliNodeInfo> {
+    this.getNodeCalls++;
+    return {
+      obj_token: 'rootObj',
+      node_token: 'rootA',
+      obj_type: 'docx',
+      title: 'root',
+      space_id: 'space-1',
+      obj_edit_time: 1000,
+      has_child: false,
+      parent_node_token: undefined,
+    };
+  }
+  async listWikiNodes(_opts: any): Promise<any[]> {
+    this.listCalls++;
+    // No children: root is the only node. This keeps the test focused on
+    // the cache (not three-state algorithm coverage, which is exercised
+    // above).
+    return [];
+  }
+}
+
+describe('ChangeDetector.detectChanges result cache (sync-state-timeout-fix)', () => {
+  it('serves a second call within TTL from cache (no extra lark-cli calls)', async () => {
+    const lark = new TrackingLarkCliClient();
+    const store = new MockLocalMapStore();
+    const detector = new ChangeDetector(lark as any, store as any);
+
+    const url = 'https://qcnbafdrjx7n.feishu.cn/wiki/rootA';
+    const r1 = await detector.detectChanges(url);
+    const firstCalls = lark.getNodeCalls;
+    expect(firstCalls).toBeGreaterThanOrEqual(1);
+
+    const r2 = await detector.detectChanges(url);
+    // Same result reference (cache hit returns the stored object).
+    expect(r2).toBe(r1);
+    // No additional getNode calls were issued.
+    expect(lark.getNodeCalls).toBe(firstCalls);
+  });
+
+  it('forceFresh=true bypasses the cache and re-invokes lark-cli', async () => {
+    const lark = new TrackingLarkCliClient();
+    const store = new MockLocalMapStore();
+    const detector = new ChangeDetector(lark as any, store as any);
+
+    const url = 'https://qcnbafdrjx7n.feishu.cn/wiki/rootA';
+    await detector.detectChanges(url);
+    const callsAfterFirst = lark.getNodeCalls;
+
+    // bypassCooldown is required in tests because the production cooldown
+    // would otherwise suppress the second traversal (see DETECT_COOLDOWN_MS
+    // rationale). Production code paths do NOT set this flag.
+    await detector.detectChanges(url, { forceFresh: true, bypassCooldown: true });
+    expect(lark.getNodeCalls).toBeGreaterThan(callsAfterFirst);
+  });
+
+  it('forceFresh respects the per-root cooldown: a second detect within cooldown returns cached result (§问题2 fix)', async () => {
+    const lark = new TrackingLarkCliClient();
+    const store = new MockLocalMapStore();
+    const detector = new ChangeDetector(lark as any, store as any);
+
+    const url = 'https://qcnbafdrjx7n.feishu.cn/wiki/rootA';
+    const r1 = await detector.detectChanges(url, { forceFresh: true });
+    const callsAfterFirst = lark.getNodeCalls;
+
+    // Second detect immediately after — must NOT re-traverse. This is the
+    // behavior that prevents the user's double-click from blowing past the
+    // lark-cli QPS budget ("第二次检测失败" root cause).
+    const r2 = await detector.detectChanges(url, { forceFresh: true });
+    expect(r2).toBe(r1);
+    expect(lark.getNodeCalls).toBe(callsAfterFirst);
+  });
+
+  it('uses a different cache slot per rootUrl (no cross-root leakage)', async () => {
+    const lark = new TrackingLarkCliClient();
+    const store = new MockLocalMapStore();
+    const detector = new ChangeDetector(lark as any, store as any);
+
+    const urlA = 'https://qcnbafdrjx7n.feishu.cn/wiki/rootA';
+    const urlB = 'https://qcnbafdrjx7n.feishu.cn/wiki/rootB';
+
+    await detector.detectChanges(urlA);
+    const callsAfterA = lark.getNodeCalls;
+
+    // Different root: cache miss, must invoke lark-cli again.
+    await detector.detectChanges(urlB);
+    expect(lark.getNodeCalls).toBeGreaterThan(callsAfterA);
+  });
+});

@@ -75,7 +75,10 @@ export class ClaudeCliChannel implements ContentBackend {
 
   async adapt(input: AdaptInput): Promise<AdaptOutput> {
     const startedAt = Date.now();
-    const timeoutMs = input.options.timeoutMs ?? 60_000;
+    // Default timeout is the LlmConfig.timeoutMs (10 minutes by default);
+    // callers can still override per-call via AdaptOptions.timeoutMs.
+    // See LlmConfig.timeoutMs rationale in types/index.ts.
+    const timeoutMs = input.options.timeoutMs ?? this.llm.timeoutMs ?? 600_000;
     const temperature = input.options.temperature ?? this.llm.temperature ?? 0.2;
 
     // Fail fast on misconfiguration so the orchestrator can cleanly

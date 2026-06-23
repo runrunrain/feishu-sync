@@ -203,6 +203,43 @@ export async function detectChanges(rootUrl: string): Promise<ChangeDetectionRes
 }
 
 /**
+ * Multi-root detect result envelope returned by POST /api/detect/changes-all.
+ *
+ * Mirrors the server-side `MultiRootDetectionResult` interface declared in
+ * server/src/routes/detect.ts. Kept here (not in types/index.ts) because the
+ * shape is an HTTP response contract, not a domain model — matching the
+ * existing detect.ts style.
+ */
+export interface MultiRootDetectionResult {
+  changed: boolean;
+  totalNodes: number;
+  changedDocuments: ChangedDocument[];
+  checkedAt: string;
+  results: Array<{
+    rootUrl: string;
+    status: 'ok' | 'error';
+    result?: ChangeDetectionResult;
+    error?: string;
+  }>;
+}
+
+/**
+ * Detect changes across ALL configured watchedRootUrls.
+ *
+ * The backend iterates `config.watchedRootUrls` sequentially, aggregates
+ * per-root results, and lets a single failed root degrade gracefully
+ * (status='error' in `results[i]` without aborting the batch). This is the
+ * correct detect entry point when the user has more than one watchedRoot,
+ * which is the default in v0.2.0.
+ */
+export async function detectChangesAll(): Promise<MultiRootDetectionResult> {
+  return request<MultiRootDetectionResult>('/api/detect/changes-all', {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
+/**
  * Sync documents
  */
 export async function syncDocs(

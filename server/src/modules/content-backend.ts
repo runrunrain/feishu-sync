@@ -94,6 +94,13 @@ export interface LlmConfig {
   claudeCliModel?: string;
   /** Sampling temperature, 0.0-1.0. Default 0.2. */
   temperature?: number;
+  /**
+   * Per-call adaptation timeout in milliseconds. Default 600000 (10
+   * minutes). See `LlmConfig.timeoutMs` in types/index.ts for the full
+   * rationale on why this default was raised from the previous 60s
+   * hard-coded value.
+   */
+  timeoutMs?: number;
 }
 
 /**

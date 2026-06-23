@@ -4,7 +4,7 @@
  */
 
 import { useState, useCallback } from 'react';
-import { detectChanges } from '../api/client';
+import { detectChanges, detectChangesAll } from '../api/client';
 import type { ChangeDetectionResult, ChangedDocument } from '../types';
 
 interface UseChangesResult {
@@ -15,6 +15,15 @@ interface UseChangesResult {
   lastCheckedAt: string | null;
   totalNodes: number;
   detect: (rootUrl: string) => Promise<void>;
+  /**
+   * Multi-root detect. Runs POST /api/detect/changes-all on the server side
+   * (iterates every watchedRootUrl sequentially). This is the correct
+   * entry point when the user has more than one watchedRoot configured —
+   * the singular `detect(rootUrl)` only refreshes ONE subtree, so changes
+   * in the other roots stay invisible to the change list and the status
+   * counter.
+   */
+  detectAll: () => Promise<void>;
   refresh: (rootUrl: string) => Promise<void>;
   clear: () => void;
 }
@@ -32,6 +41,26 @@ export function useChanges(): UseChangesResult {
 
     try {
       const result: ChangeDetectionResult = await detectChanges(rootUrl);
+      setChanges(result.changedDocuments);
+      setLastCheckedAt(result.checkedAt);
+      setTotalNodes(result.totalNodes);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to detect changes';
+      setError(message);
+      setChanges([]);
+      setLastCheckedAt(null);
+      setTotalNodes(0);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const detectAll = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+
+    try {
+      const result = await detectChangesAll();
       setChanges(result.changedDocuments);
       setLastCheckedAt(result.checkedAt);
       setTotalNodes(result.totalNodes);
@@ -68,6 +97,7 @@ export function useChanges(): UseChangesResult {
     lastCheckedAt,
     totalNodes,
     detect,
+    detectAll,
     refresh,
     clear,
   };

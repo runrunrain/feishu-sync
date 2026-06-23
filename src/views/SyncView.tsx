@@ -164,6 +164,7 @@ export function SyncView() {
         onDiffChange={setDiff}
         onTrash={handleTrash}
         onPurge={handlePurge}
+        watchedRootUrls={config?.watchedRootUrls}
       />
 
       <SyncControlPanel

@@ -76,7 +76,7 @@ export class DirectChannel implements ContentBackend {
     const controller = new AbortController();
     const timeoutHandle = setTimeout(
       () => controller.abort(),
-      options.timeoutMs ?? 60_000
+      options.timeoutMs ?? this.llm.timeoutMs ?? 600_000
     );
 
     try {
@@ -138,7 +138,7 @@ export class DirectChannel implements ContentBackend {
     } catch (error) {
       if (this.isAbortError(error)) {
         return this.buildErrorOutput(
-          `DirectChannel: timed out after ${options.timeoutMs ?? 60_000}ms`,
+          `DirectChannel: timed out after ${options.timeoutMs ?? this.llm.timeoutMs ?? 600_000}ms`,
           startedAt,
           'timeout'
         );
@@ -163,7 +163,10 @@ export class DirectChannel implements ContentBackend {
   } {
     return {
       temperature: options.temperature ?? this.llm.temperature ?? 0.2,
-      timeoutMs: options.timeoutMs ?? 60_000,
+      // Default timeout is LlmConfig.timeoutMs (10 minutes); raises the
+      // previous 60s ceiling so bigmodel glm-5.2[1m] has enough headroom
+      // to complete under load without prematurely aborting to fallback.
+      timeoutMs: options.timeoutMs ?? this.llm.timeoutMs ?? 600_000,
       enableStreaming: options.enableStreaming,
       onProgress: options.onProgress,
     };

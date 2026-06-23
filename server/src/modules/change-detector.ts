@@ -94,9 +94,72 @@ export interface SheetSubChange {
   changeType: 'added' | 'deleted' | 'may-be-modified';
 }
 
+/**
+ * Detect-result cache TTL. See ChangeDetector.detectResultCache docs for
+ * the rationale.
+ *
+ * 120 seconds is the sweet spot:
+ *   - Long enough to cover the post-detect UI burst. A 4-root detect-all
+ *     takes 40-45s end-to-end (root 1 ~10s, root 2 ~29s, roots 3-4 ~1s
+ *     each), so by the time detect-all RETURNS the root-1 cache entry is
+ *     already ~40s old. The useSyncStatus hook then fires 4 diff calls
+ *     within ~1s of detect-all returning; ChangeListPanel fires one more
+ *     a few ms later. All five must hit the cache, which requires TTL >>
+ *     the detect duration. 120s gives 80s of headroom.
+ *   - Short enough that a manual re-detect click 2+ minutes later still
+ *     re-hits the cloud (the user expects fresh results after consciously
+ *     waiting and clicking detect again). The detect routes pass
+ *     `forceFresh=true` to bypass the cache regardless, so even a click
+ *     immediately after always re-traverses.
+ */
+const DTECT_RESULT_TTL_MS = 120_000;
+
+/**
+ * Per-root detect cooldown for the `forceFresh=true` path. See
+ * ChangeDetector.detectChanges docs: a second detect invocation on the
+ * same rootUrl within this window returns the cached result instead of
+ * re-hitting lark-cli, fixing §问题2 ("第二次检测失败"). 60s matches
+ * the typical lark-cli QPS recovery window observed on this account.
+ */
+const DETECT_COOLDOWN_MS = 60_000;
+
 export class ChangeDetector {
   // space_id cache: rootUrl -> space_id (avoid repeated getNode calls)
   private spaceIdCache = new Map<string, string>();
+  /**
+   * Short-lived detect-result cache (rootUrl -> { result, expiresAt }).
+   *
+   * Rationale: in v0.2.0 the UI fires several concurrent detect-derived
+   * calls right after the user clicks 立即检测:
+   *   - GlobalStatusBar's useSyncStatus pulls GET /api/mapping/diff for
+   *     every watchedRoot (4 calls)
+   *   - ChangeListPanel's first-load effect pulls GET /api/mapping/diff
+   *     for the active root (1 call)
+   *   - The polling scheduler may also kick off a detect in the same window
+   *
+   * Each `/api/mapping/diff` invocation delegates to `computeDiff`, which
+   * calls `detectChanges` and therefore traverses the cloud subtree via
+   * lark-cli. Even though lark-cli-client.ts throttles per-request QPS
+   * (architecture red line I1, untouched here), a tight burst of 5 detect
+   * calls against the same root pushes the aggregate lark-cli rate over
+   * the upstream limit and the user gets HTTP 500 'QPS 限流' responses
+   * from the diff endpoint — which then surfaces as an empty change list
+   * while the status bar (previously hard-coded to 3) showed a stale
+   * number. That mismatch is the root cause of v0.2.0
+   * sync-state-timeout-fix §问题1.
+   *
+   * This cache deduplicates detect calls that happen within
+   * `DETECT_RESULT_TTL_MS` of each other for the SAME rootUrl. The TTL is
+   * intentionally short (120s): long enough to collapse the post-click
+   * burst, short enough that a real second detect (manual refresh 3min
+   * later) still re-hits the cloud. Callers can pass `forceFresh=true` to
+   * bypass (used by the explicit "立即检测" button so the user always
+   * sees fresh results when they consciously click detect).
+   */
+  private detectResultCache = new Map<
+    string,
+    { result: ChangeDetectionResult; expiresAt: number }
+  >();
 
   constructor(
     private larkCliClient: LarkCliClient,
@@ -105,8 +168,66 @@ export class ChangeDetector {
 
   /**
    * Main entry point: detect changes in a wiki subtree.
+   *
+   * `forceFresh=true` skips the short-lived result cache. The cache exists
+   * to collapse concurrent detect-derived calls (mapping/diff fan-out +
+   * ChangeListPanel + polling) into a single cloud traversal, preventing
+   * lark-cli QPS 限流 (reported in sync-state-timeout-fix §问题1).
+   *
+   * Even with `forceFresh=true`, the detector enforces a per-root cooldown
+   * (DETECT_COOLDOWN_MS): a second detect invocation on the SAME rootUrl
+   * inside the cooldown window returns the last result instead of hitting
+   * lark-cli again. This is the root-cause fix for §问题2 ("第二次检测失败"):
+   * the user clicks 立即检测 twice in quick succession (or the polling
+   * scheduler fires right after a manual click), and the second detect
+   * pushes lark-cli past its QPS budget, returning 500 'QPS 限流' for
+   * every root. The cooldown deduplicates the second click to a cached
+   * response so the user sees consistent success.
+   *
+   * Callers that need to force an unconditional re-traverse (e.g. tests)
+   * can pass `bypassCooldown: true`; production code paths should NOT use
+   * this flag, since bypassing the cooldown reintroduces the QPS race.
+   *
+   * @visibleForTesting `bypassCooldown` is intended exclusively for unit
+   * tests; production callers must omit it.
    */
-  async detectChanges(rootUrl: string): Promise<ChangeDetectionResult> {
+  async detectChanges(
+    rootUrl: string,
+    options: { forceFresh?: boolean; bypassCooldown?: boolean } = {}
+  ): Promise<ChangeDetectionResult> {
+    const forceFresh = options.forceFresh === true;
+    const bypassCooldown = options.bypassCooldown === true;
+    if (!forceFresh) {
+      const cached = this.detectResultCache.get(rootUrl);
+      if (cached && cached.expiresAt > Date.now()) {
+        return cached.result;
+      }
+    } else if (!bypassCooldown) {
+      // forceFresh path: still respect the cooldown. If a detect on this
+      // root completed less than DETECT_COOLDOWN_MS ago, return the last
+      // result instead of re-traversing. This is the §问题2 fix.
+      const cached = this.detectResultCache.get(rootUrl);
+      if (cached) {
+        const sinceCompleted = Date.now() - (cached.expiresAt - DTECT_RESULT_TTL_MS);
+        if (sinceCompleted < DETECT_COOLDOWN_MS) {
+          return cached.result;
+        }
+      }
+    }
+    const result = await this.detectChangesUncached(rootUrl);
+    this.detectResultCache.set(rootUrl, {
+      result,
+      expiresAt: Date.now() + DTECT_RESULT_TTL_MS,
+    });
+    return result;
+  }
+
+  /**
+   * Uncached detect implementation. Split out so `detectChanges` can wrap
+   * it with the short-lived result cache without changing the original
+   * traversal/comparison logic.
+   */
+  private async detectChangesUncached(rootUrl: string): Promise<ChangeDetectionResult> {
     // 1. Get root node info (space_id + root_token + obj_edit_time)
     const rootInfo = await this.larkCliClient.getNode(rootUrl);
     const spaceId = rootInfo.space_id;

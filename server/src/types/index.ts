@@ -64,6 +64,25 @@ export interface LlmConfig {
   claudeCliModel?: string;
   /** Sampling temperature 0.0-1.0. Default 0.2. */
   temperature: number;
+  /**
+   * Per-call LLM adaptation timeout in milliseconds.
+   *
+   * Default 600000 (10 minutes). The claude-cli channel (bigmodel
+   * glm-5.2[1m] via the Anthropic-compat adapter) routinely takes 1-3
+   * minutes for a single feishu doc adaptation under load, and the
+   * bigmodel endpoint occasionally returns transient 529 over-load
+   * responses that the SDK retries internally. A 60s timeout (the
+   * previous hard-coded value) was too aggressive and caused the
+   * primary channel to abort and fall back to DirectChannel even when
+   * the model would have produced output if given another minute or
+   * two. The 10-minute default gives the model ample headroom while
+   * still bounding worst-case latency; users on a fast local model
+   * can lower this via the UI / config.json.
+   *
+   * Used by sync-engine when calling ContentAdapter.adaptContent.
+   * Per-call AdaptOptions.timeoutMs still overrides this value.
+   */
+  timeoutMs?: number;
   /** ClaudeCliChannel process control (path + extra args). */
   claudeCli?: {
     claudePath?: string;

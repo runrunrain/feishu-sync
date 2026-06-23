@@ -20,6 +20,7 @@ import { useToast } from './common/Toast';
 import { appLogger } from '../utils/appLogger';
 import { getMappingDiff } from '../api/client';
 import type { ChangedDocument, DiffReport, SheetSub } from '../types';
+import { isUsableWikiUrl } from '../utils/wikiUrl';
 
 type Tab = 'all' | 'added' | 'modified' | 'deleted';
 
@@ -47,6 +48,74 @@ interface ChangeListPanelProps {
   /** Deleted-state action stubs (TrashDrawer wiring lands in P4-2). */
   onTrash?: (objToken: string) => void;
   onPurge?: (objToken: string) => void;
+  /**
+   * v0.2.0 sync-state-timeout-fix §问题1: when more than one watchedRoot is
+   * configured the singular `rootUrl` only reflects the FIRST valid root,
+   * so changes that live in other subtrees never appear in the panel even
+   * though the status-bar counter (also fed by mapping/diff in the fixed
+   * useSyncStatus) reports them. Passing the full list enables multi-root
+   * aggregation here so the change list matches the pending counter.
+   *
+   * When omitted or containing a single URL, the panel keeps the legacy
+   * single-root behaviour (one getMappingDiff call).
+   */
+  watchedRootUrls?: string[];
+}
+
+/**
+ * Aggregate multiple per-root DiffReports into a single DiffReport-shaped
+ * view model. The server-side `/api/mapping/diff` is per-root, so we fan
+ * out client-side and merge:
+ *   - added/modified/deleted arrays are concatenated
+ *   - unchanged/totalCloud/totalLocal are summed (counts)
+ *   - checkedAt is the latest (max) timestamp across roots so the UI shows
+ *     "checked at <most recent root>"
+ *
+ * Per-root failures degrade gracefully: a root whose diff call failed is
+ * counted with zero changes and surfaced via a non-fatal warning toast
+ * rather than aborting the whole panel.
+ */
+async function fetchMultiRootDiff(
+  rootUrls: string[],
+): Promise<{ report: DiffReport; failedRoots: string[] }> {
+  const added: ChangedDocument[] = [];
+  const modified: ChangedDocument[] = [];
+  const deleted: ChangedDocument[] = [];
+  let unchanged = 0;
+  let totalCloud = 0;
+  let totalLocal = 0;
+  let checkedAt = '';
+  const failedRoots: string[] = [];
+
+  for (const url of rootUrls) {
+    if (!isUsableWikiUrl(url)) continue;
+    try {
+      const r = await getMappingDiff(url);
+      added.push(...r.added);
+      modified.push(...r.modified);
+      deleted.push(...r.deleted);
+      unchanged += r.unchanged ?? 0;
+      totalCloud += r.totalCloud ?? 0;
+      totalLocal += r.totalLocal ?? 0;
+      if (r.checkedAt && r.checkedAt > checkedAt) checkedAt = r.checkedAt;
+    } catch (err) {
+      appLogger.warn('change-list', 'getMappingDiff failed for root', { url, err });
+      failedRoots.push(url);
+    }
+  }
+
+  return {
+    report: {
+      added,
+      modified,
+      deleted,
+      unchanged,
+      totalCloud,
+      totalLocal,
+      checkedAt: checkedAt || new Date().toISOString(),
+    },
+    failedRoots,
+  };
 }
 
 export function ChangeListPanel({
@@ -59,6 +128,7 @@ export function ChangeListPanel({
   onDiffChange,
   onTrash,
   onPurge,
+  watchedRootUrls,
 }: ChangeListPanelProps) {
   const [tab, setTab] = useState<Tab>('all');
   const [diff, setDiff] = useState<DiffReport | null>(initialDiff ?? null);
@@ -67,12 +137,38 @@ export function ChangeListPanel({
   const [sheetSubs] = useState<Record<string, SheetSub[]>>({});
   const toast = useToast();
 
+  // Effective root set for diff fetching. Multi-root aggregation only kicks
+  // in when the caller provides MORE THAN ONE valid URL; otherwise we fall
+  // back to the legacy single-root path so existing behaviour is unchanged.
+  const multiRootUrls = useMemo(() => {
+    const valid = Array.isArray(watchedRootUrls)
+      ? watchedRootUrls.filter((u): u is string => isUsableWikiUrl(u))
+      : [];
+    return valid.length > 1 ? valid : null;
+  }, [watchedRootUrls]);
+
   const fetchDiff = async () => {
-    if (!rootUrl) return;
     setLoading(true);
     setError(null);
     try {
-      const report = await getMappingDiff(rootUrl);
+      let report: DiffReport;
+      if (multiRootUrls) {
+        const { report: aggregated, failedRoots } = await fetchMultiRootDiff(multiRootUrls);
+        report = aggregated;
+        if (failedRoots.length > 0) {
+          toast.push({
+            type: 'warning',
+            message: `${failedRoots.length} 个子树检测失败`,
+            hint: failedRoots.map((u) => u.split('/').pop() ?? u).join(', '),
+          });
+        }
+      } else {
+        if (!rootUrl) {
+          setLoading(false);
+          return;
+        }
+        report = await getMappingDiff(rootUrl);
+      }
       setDiff(report);
       onRefresh?.();
       onDiffChange?.(report);
@@ -95,14 +191,19 @@ export function ChangeListPanel({
   // effect — useMemo is not guaranteed to run once (React 18 StrictMode may
   // double-invoke), which could trigger duplicate fetches. Moved to useEffect
   // with a guard ref so the initial fetch fires exactly once per rootUrl.
+  //
+  // v0.2.0 sync-state-timeout-fix: the guard key now also reflects the
+  // multi-root list signature, so adding/removing a watchedRoot re-triggers
+  // the diff fetch as expected.
   const initialFetchDoneFor = useRef<string | null>(null);
+  const guardKey = multiRootUrls ? `multi:${multiRootUrls.join('|')}` : (rootUrl ?? '');
   useEffect(() => {
-    if (!diff && rootUrl && !loading && !error && initialFetchDoneFor.current !== rootUrl) {
-      initialFetchDoneFor.current = rootUrl;
+    if (!diff && guardKey && !loading && !error && initialFetchDoneFor.current !== guardKey) {
+      initialFetchDoneFor.current = guardKey;
       void fetchDiff();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [diff, rootUrl, loading, error]);
+  }, [diff, guardKey, loading, error]);
 
   const grouped = useMemo(() => {
     if (!diff) return { added: [], modified: [], deleted: [] as ChangedDocument[] };

@@ -87,7 +87,11 @@ detectRoutes.post('/api/detect/changes', async (c) => {
   }
 
   try {
-    const result = await changeDetector.detectChanges(rootUrl);
+    // forceFresh=true: the singular detect endpoint is the user-driven
+    // detect button (and the polling scheduler's per-root entry point).
+    // Bypass the ChangeDetector result cache so a manual refresh always
+    // reflects the current cloud state.
+    const result = await changeDetector.detectChanges(rootUrl, { forceFresh: true });
     return c.json(result);
   } catch (error) {
     console.error('[DetectRoutes] Change detection failed:', error);
@@ -181,7 +185,12 @@ detectRoutes.post('/api/detect/changes-all', async (c) => {
 
   for (const rootUrl of watchedRootUrls) {
     try {
-      const result = await changeDetector.detectChanges(rootUrl);
+      // forceFresh=true: this endpoint is the user-facing 立即检测 button
+      // (and the polling scheduler's full refresh). A conscious detect
+      // click must always re-hit the cloud; the ChangeDetector's
+      // short-lived result cache is bypassed here so stale results from
+      // a previous /api/mapping/diff burst don't shadow the manual click.
+      const result = await changeDetector.detectChanges(rootUrl, { forceFresh: true });
       results.push({ rootUrl, status: 'ok', result });
       aggregatedTotalNodes += result.totalNodes ?? 0;
       if (result.changedDocuments?.length) {
