@@ -68,6 +68,108 @@ const DEFAULT_DIRECT_MODEL = 'glm-4-flash';
 const DEFAULT_CLAUDE_CLI_MODEL = 'glm-5.2[1m]';
 
 /**
+ * Set of known non-bigmodel OpenAI-compat base URLs whose providers do
+ * NOT accept a bigmodel apiKey. When the persisted config still points
+ * at one of these (a known P3 migration side-effect: legacy deepseek
+ * `baseUrl` was carried over as `openAiCompatBaseUrl`) but the apiKey
+ * has since been replaced with a bigmodel `<id>.<secret>` key, the
+ * bigmodel paas/v4 endpoint MUST be substituted — otherwise DirectChannel
+ * sends a bigmodel Bearer key to deepseek and gets 401.
+ *
+ * This list is intentionally narrow (exact host match on the known
+ * legacy providers). Custom OpenAI-compat gateways are left untouched.
+ */
+const KNOWN_NON_BIGMODEL_OPENAI_HOSTS = new Set<string>([
+  'api.deepseek.com',
+  'api.openai.com',
+]);
+
+/**
+ * Detect a bigmodel (zhipu) API key by its `<id>.<secret>` shape.
+ *
+ * Both segments are base62-ish (alphanumeric, no `sk-` prefix, no
+ * underscores). bigmodel does not contract a stable segment length, so
+ * the regex is intentionally permissive but anchored — the id segment
+ * matches `[A-Za-z0-9]{6,64}` and the secret segment matches
+ * `[A-Za-z0-9]{6,80}`. This keeps the detector from breaking on minor
+ * future format tweaks while still rejecting OpenAI/Anthropic keys
+ * (which typically start with `sk-` / `sk-ant-` and contain dashes).
+ *
+ * Reference: https://open.bigmodel.cn/dev/api#nosdk
+ *
+ * Exported for unit tests (config-manager.test.ts).
+ */
+export function looksLikeBigmodelKey(apiKey: string | undefined | null): boolean {
+  if (!apiKey || typeof apiKey !== 'string') return false;
+  // bigmodel keys are `<id>.<secret>` where both halves are alphanumeric
+  // (no `sk-` prefix, no underscores); id matches {6,64}, secret {6,80}.
+  return /^[A-Za-z0-9]{6,64}\.[A-Za-z0-9]{6,80}$/.test(apiKey);
+}
+
+/**
+ * Returns true when host(u) is one of the known non-bigmodel OpenAI-compat
+ * hosts (deepseek / openai.com) that must be replaced when paired with a
+ * bigmodel apiKey. Unknown custom gateways are left as-is.
+ */
+function isKnownNonBigmodelOpenAiHost(url: string | undefined | null): boolean {
+  if (!url || typeof url !== 'string') return false;
+  try {
+    const host = new URL(url).host.toLowerCase();
+    return KNOWN_NON_BIGMODEL_OPENAI_HOSTS.has(host);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Normalize the OpenAI-compat base URL for DirectChannel when the apiKey
+ * is a bigmodel key but the URL still points at a non-bigmodel host
+ * (deepseek / openai.com). This is the root-cause fix for the direct
+ * channel 401 reported in the 2026-06-19 e2e-sync report: P3 migration
+ * preserved the legacy deepseek `baseUrl` as `openAiCompatBaseUrl`, but
+ * the persisted `apiKey` had already been swapped to a bigmodel key.
+ *
+ * Behavior:
+ *   - bigmodel key + non-bigmodel host -> DEFAULT_OPENAI_COMPAT_BASE_URL
+ *   - bigmodel key + (already) bigmodel host -> unchanged
+ *   - non-bigmodel key -> unchanged (respect user's custom gateway)
+ *
+ * Exported for unit tests (config-manager.test.ts).
+ */
+export function reconcileOpenAiCompatBaseUrl(
+  url: string | undefined | null,
+  apiKey: string | undefined | null,
+): string {
+  if (looksLikeBigmodelKey(apiKey) && isKnownNonBigmodelOpenAiHost(url)) {
+    return DEFAULT_OPENAI_COMPAT_BASE_URL;
+  }
+  return url || DEFAULT_OPENAI_COMPAT_BASE_URL;
+}
+
+/**
+ * bigmodel keys do NOT support `deepseek-chat` / `deepseek-reasoner` /
+ * generic OpenAI aliases on paas/v4. When the persisted `model` field
+ * still carries a deepseek alias but the apiKey is bigmodel, reset it
+ * to the Anthropic-adapter alias (the primary-channel default).
+ *
+ * Exported for unit tests (config-manager.test.ts).
+ */
+export function reconcileModelAlias(
+  model: string | undefined | null,
+  apiKey: string | undefined | null,
+): string {
+  if (!model) return DEFAULT_CLAUDE_CLI_MODEL;
+  const deepseekAliases = ['deepseek-chat', 'deepseek-reasoner', 'deepseek-coder'];
+  if (
+    looksLikeBigmodelKey(apiKey) &&
+    deepseekAliases.includes(model.toLowerCase())
+  ) {
+    return DEFAULT_CLAUDE_CLI_MODEL;
+  }
+  return model;
+}
+
+/**
  * Build the default LLM config. Prefers local ANTHROPIC_* env vars
  * (open-box: if the machine already runs claude CLI, feishu-sync can
  * reuse the same credentials without re-prompting). Falls back to
@@ -364,9 +466,17 @@ export class ConfigManager {
    */
   private migrateLegacyLlmConfig(legacy: LegacyLLMConfig): LlmConfig {
     const anthropicBaseUrl = process.env.ANTHROPIC_BASE_URL || DEFAULT_CLAUDE_COMPAT_BASE_URL;
-    const openAiBaseUrl = legacy.baseUrl || deriveOpenAiCompatBaseUrl(anthropicBaseUrl);
     const apiKey = legacy.apiKey || process.env.ANTHROPIC_API_KEY || '';
-    const claudeModel = legacy.model || process.env.ANTHROPIC_MODEL || DEFAULT_CLAUDE_CLI_MODEL;
+    // Root-cause fix for 2026-06-19 e2e-sync direct 401: when the legacy
+    // deepseek `baseUrl` is carried over but the apiKey is a bigmodel
+    // key, force the OpenAI-compat endpoint to bigmodel paas/v4.
+    // Otherwise deepseek receives a bigmodel Bearer key and returns 401.
+    const legacyOpenAiBaseUrl = legacy.baseUrl || deriveOpenAiCompatBaseUrl(anthropicBaseUrl);
+    const openAiBaseUrl = reconcileOpenAiCompatBaseUrl(legacyOpenAiBaseUrl, apiKey);
+    // Same correction for the model alias: bigmodel paas/v4 does not
+    // accept `deepseek-chat`; reset to the Anthropic-adapter alias.
+    const legacyModel = legacy.model || process.env.ANTHROPIC_MODEL || DEFAULT_CLAUDE_CLI_MODEL;
+    const claudeModel = reconcileModelAlias(legacyModel, apiKey);
 
     return {
       openAiCompatBaseUrl: openAiBaseUrl,
@@ -392,11 +502,18 @@ export class ConfigManager {
    */
   private normalizeLlmConfig(partial: Partial<LlmConfig>): LlmConfig {
     const base = buildDefaultLlmConfig();
+    const apiKey = partial.apiKey ?? base.apiKey;
+    // Root-cause fix for 2026-06-19 e2e-sync direct 401: persisted new-shape
+    // configs may still carry the legacy deepseek `openAiCompatBaseUrl`
+    // (P3 migration preserved it verbatim). When the apiKey is a bigmodel
+    // key but the host is deepseek/openai, substitute bigmodel paas/v4.
+    const rawOpenAiBaseUrl = partial.openAiCompatBaseUrl ?? base.openAiCompatBaseUrl;
+    const rawModel = partial.model ?? base.model;
     return {
-      openAiCompatBaseUrl: partial.openAiCompatBaseUrl ?? base.openAiCompatBaseUrl,
+      openAiCompatBaseUrl: reconcileOpenAiCompatBaseUrl(rawOpenAiBaseUrl, apiKey),
       claudeCompatBaseUrl: partial.claudeCompatBaseUrl ?? base.claudeCompatBaseUrl,
-      apiKey: partial.apiKey ?? base.apiKey,
-      model: partial.model ?? base.model,
+      apiKey,
+      model: reconcileModelAlias(rawModel, apiKey),
       directModel: partial.directModel ?? base.directModel,
       claudeCliModel: partial.claudeCliModel ?? base.claudeCliModel,
       temperature: typeof partial.temperature === 'number' ? partial.temperature : 0.2,
