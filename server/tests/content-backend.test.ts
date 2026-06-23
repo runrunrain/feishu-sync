@@ -408,24 +408,44 @@ function makeFakeSpawn(opts: {
 }) {
   const spawned: Array<{
     child: any;
+    cmd: string;
     args: string[];
-    env: NodeJS.ProcessEnv;
+    options: { env: NodeJS.ProcessEnv; shell?: boolean };
+    stdinWrites: string[];
+    stdinEnded: boolean;
   }> = [];
 
-  const spawnMock = vi.fn((cmd: string, args: string[], options: { env: NodeJS.ProcessEnv }) => {
-    const child = new EventEmitter() as any;
-    child.stdin = {
-      end: vi.fn(() => {
-        opts.onStdin?.(child);
-      }),
-      on: vi.fn(),
-    };
-    child.stdout = { on: vi.fn() };
-    child.stderr = { on: vi.fn() };
-    child.kill = vi.fn();
-    spawned.push({ child, args, env: options.env });
-    return child;
-  });
+  const spawnMock = vi.fn(
+    (cmd: string, args: string[], options: { env: NodeJS.ProcessEnv; shell?: boolean }) => {
+      const child = new EventEmitter() as any;
+      const record = {
+        child,
+        cmd,
+        args,
+        options,
+        stdinWrites: [] as string[],
+        stdinEnded: false,
+      };
+      child.stdin = {
+        write: vi.fn((chunk: string | Buffer) => {
+          // Capture the chunk verbatim so tests can assert the prompt
+          // is delivered unmodified (no shell escaping applied).
+          record.stdinWrites.push(typeof chunk === 'string' ? chunk : chunk.toString('utf-8'));
+          return true;
+        }),
+        end: vi.fn(() => {
+          record.stdinEnded = true;
+          opts.onStdin?.(child);
+        }),
+        on: vi.fn(),
+      };
+      child.stdout = { on: vi.fn() };
+      child.stderr = { on: vi.fn() };
+      child.kill = vi.fn();
+      spawned.push(record);
+      return child;
+    }
+  );
 
   return { spawnMock, spawned };
 }
@@ -625,7 +645,7 @@ describe('ClaudeCliChannel', () => {
 
     await Promise.resolve();
     expect(spawned.length).toBe(1);
-    const env = spawned[0].env;
+    const env = spawned[0].options.env;
     expect(env.ANTHROPIC_BASE_URL).toBe('https://open.bigmodel.cn/api/anthropic');
     expect(env.ANTHROPIC_API_KEY).toBe('bigmodel-key');
     expect(env.ANTHROPIC_MODEL).toBe('glm-4-flash');
@@ -641,7 +661,7 @@ describe('ClaudeCliChannel', () => {
     await promise;
   });
 
-  it('passes --dangerously-skip-permissions and --max-turns 1 in args', async () => {
+  it('passes --dangerously-skip-permissions and --max-turns 1 in args (NO prompt in argv)', async () => {
     vi.resetModules();
     const { spawnMock, spawned } = makeFakeSpawn({});
     vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
@@ -649,7 +669,7 @@ describe('ClaudeCliChannel', () => {
     const { ClaudeCliChannel } = await import('../src/modules/claude-cli-channel.js');
     const ch = new ClaudeCliChannel(buildTestLlm());
     const promise = ch.adapt({
-      rawContent: 'raw',
+      rawContent: 'ADVERSARIAL-raw-|inject-attempt',
       localOldContent: null,
       options: { temperature: 0.2 },
     });
@@ -662,8 +682,144 @@ describe('ClaudeCliChannel', () => {
     expect(args).toContain('1');
     expect(args).toContain('--dangerously-skip-permissions');
 
+    // v020-r2 prompt-injection hardening: the prompt MUST NOT appear in
+    // argv (it must travel via stdin). Even an adversarial rawContent
+    // containing cmd.exe metacharacters must never enter the command line.
+    for (const a of args) {
+      expect(a).not.toContain('ADVERSARIAL');
+      expect(a).not.toMatch(/raw-\|inject-attempt/);
+    }
+
     spawned[0].child.emit('close', 0);
     await promise;
+  });
+
+  it('delivers the prompt via stdin.write verbatim and half-closes stdin', async () => {
+    vi.resetModules();
+    const { spawnMock, spawned } = makeFakeSpawn({});
+    vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
+
+    const { ClaudeCliChannel } = await import('../src/modules/claude-cli-channel.js');
+    const ch = new ClaudeCliChannel(buildTestLlm());
+    const promise = ch.adapt({
+      // Adversarial prompt: every cmd.exe metacharacter is present.
+      // Under shell:true + argv passing these would corrupt the prompt;
+      // via stdin they must round-trip verbatim.
+      rawContent: 'line1 | line2\nline3 "quoted" `backtick` $HOME > out < in & bg',
+      localOldContent: null,
+      options: { temperature: 0.2 },
+    });
+
+    await Promise.resolve();
+    expect(spawned.length).toBe(1);
+    expect(spawned[0].stdinWrites.length).toBe(1);
+
+    const delivered = spawned[0].stdinWrites[0];
+    // Every metacharacter survives unmodified.
+    expect(delivered).toContain('|');
+    expect(delivered).toContain('\n');
+    expect(delivered).toContain('"');
+    expect(delivered).toContain('`');
+    expect(delivered).toContain('$');
+    expect(delivered).toContain('>');
+    expect(delivered).toContain('<');
+    expect(delivered).toContain('&');
+    expect(delivered).toContain('line1');
+    expect(delivered).toContain('line3');
+    expect(delivered).toContain('backtick');
+    expect(delivered).toContain('HOME');
+
+    // stdin was half-closed (EOF) so claude CLI does not wait 3s.
+    expect(spawned[0].stdinEnded).toBe(true);
+
+    spawned[0].child.emit('close', 0);
+    await promise;
+  });
+
+  describe('resolveClaudeExecutable precedence (unit, no real spawn)', () => {
+    // We instantiate ClaudeCliChannel and call adapt() with a fake spawn
+    // to inspect the `cmd` and `options.shell` for each precedence tier.
+    // Each tier is isolated by clearing env / config before the test.
+
+    beforeEach(() => {
+      delete process.env.CLAUDE_CODE_EXECPATH;
+    });
+
+    it('tier 1: claudeCli.claudePath wins and uses shell:false', async () => {
+      vi.resetModules();
+      const { spawnMock, spawned } = makeFakeSpawn({});
+      vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
+      process.env.CLAUDE_CODE_EXECPATH = 'C:\\should-be-shadowed.exe';
+
+      const { ClaudeCliChannel } = await import('../src/modules/claude-cli-channel.js');
+      // claudeCli is a constructor arg (2nd), not part of LlmConfig.
+      const ch = new ClaudeCliChannel(buildTestLlm(), {
+        claudePath: 'D:\\explicit\\claude.exe',
+      });
+      const promise = ch.adapt({
+        rawContent: 'raw',
+        localOldContent: null,
+        options: { temperature: 0.2 },
+      });
+      await Promise.resolve();
+
+      expect(spawned[0].cmd).toBe('D:\\explicit\\claude.exe');
+      expect(spawned[0].options.shell).toBeUndefined();
+
+      spawned[0].child.emit('close', 0);
+      await promise;
+    });
+
+    it('tier 2: CLAUDE_CODE_EXECPATH used with shell:false', async () => {
+      vi.resetModules();
+      const { spawnMock, spawned } = makeFakeSpawn({});
+      vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
+      process.env.CLAUDE_CODE_EXECPATH = 'C:\\Users\\u\\claude.exe';
+
+      const { ClaudeCliChannel } = await import('../src/modules/claude-cli-channel.js');
+      const ch = new ClaudeCliChannel(buildTestLlm());
+      const promise = ch.adapt({
+        rawContent: 'raw',
+        localOldContent: null,
+        options: { temperature: 0.2 },
+      });
+      await Promise.resolve();
+
+      expect(spawned[0].cmd).toBe('C:\\Users\\u\\claude.exe');
+      expect(spawned[0].options.shell).toBeUndefined();
+
+      spawned[0].child.emit('close', 0);
+      await promise;
+    });
+
+    it('tier 3 win: falls back to claude.cmd + shell:true when no override and platform is win32', async () => {
+      vi.resetModules();
+      const { spawnMock, spawned } = makeFakeSpawn({});
+      vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
+      // Force win32 path even when the test runner is unix so the branch
+      // coverage does not depend on the host OS.
+      const originalPlatform = process.platform;
+      Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+
+      try {
+        const { ClaudeCliChannel } = await import('../src/modules/claude-cli-channel.js');
+        const ch = new ClaudeCliChannel(buildTestLlm());
+        const promise = ch.adapt({
+          rawContent: 'raw',
+          localOldContent: null,
+          options: { temperature: 0.2 },
+        });
+        await Promise.resolve();
+
+        expect(spawned[0].cmd).toBe('claude.cmd');
+        expect(spawned[0].options.shell).toBe(true);
+
+        spawned[0].child.emit('close', 0);
+        await promise;
+      } finally {
+        Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true });
+      }
+    });
   });
 });
 

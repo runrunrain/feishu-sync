@@ -4,9 +4,24 @@
  * Implements 03 §4.2. This is the PRIMARY channel; on its failure the
  * orchestrator falls back to DirectChannel.
  *
- * Channel contract (P0-Q4 实测 confirmed):
- *   Invocation: `claude -p "<prompt>" --output-format json --max-turns 1
- *                --dangerously-skip-permissions`
+ * Channel contract (P0-Q4 实测 confirmed + v020-r2 stdin-prompt hardening):
+ *   Invocation: `claude -p --output-format json --max-turns 1
+ *                --dangerously-skip-permissions`  (no prompt positional arg)
+ *   Prompt delivery: STDIN — `child.stdin.write(prompt); child.stdin.end();`
+ *     claude CLI reads the prompt from stdin when no positional prompt is
+ *     supplied on the command line. Verified 2026-06-23: stdin prompt
+ *     round-trips through claude CLI to bigmodel and returns
+ *     is_error=false, stop_reason=end_turn.
+ *   Why STDIN instead of positional argv:
+ *     Node `spawn(cmd, args, { shell: true })` on Windows concatenates
+ *     args into the cmd.exe command line WITHOUT escaping (Node DEP0190).
+ *     A prompt containing `|`, `&`, `>`, `<`, backtick, `$`, `"` or `'`
+ *     would be interpreted by cmd.exe as shell metacharacters, breaking
+ *     the prompt and creating an injection surface (rawContent is
+ *     user-controlled feishu doc content). Passing the prompt via stdin
+ *     bypasses cmd.exe argv parsing entirely — the prompt never enters
+ *     the command line, so shell metacharacters are inert. This makes
+ *     BOTH the .exe path AND the .cmd+shell:true fallback path safe.
  *   Env injection (drives claude CLI's upstream LLM):
  *     ANTHROPIC_BASE_URL = LlmConfig.claudeCompatBaseUrl
  *         (bigmodel Anthropic-protocol path; for bigmodel:
@@ -22,9 +37,10 @@
  * single JSON object after completion; UI shows "运行中..." (caller
  * responsibility). The orchestrator's enableStreaming flag is ignored.
  *
- * stdin: P0-Q4 实测 found claude CLI waits 3s on stdin and prints a
- * warning when no data arrives. We immediately close stdin (end()) to
- * avoid the 3s delay.
+ * stdin lifecycle: prompt is written to stdin immediately after spawn
+ * and stdin is closed (end()) right after the write. This both feeds
+ * the prompt AND signals EOF, so claude CLI never enters its 3-second
+ * "no stdin data" wait (P0-Q4 §2.4.3).
  *
  * Error classification (maps to AdaptFinishReason):
  *   - spawn error / non-zero exit / api_error_status != null / is_error
@@ -42,7 +58,7 @@
  * LlmConfig drives both channels.
  */
 
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { spawn, type ChildProcessWithoutNullStreams, type SpawnOptions } from 'node:child_process';
 import type {
   AdaptFinishReason,
   AdaptInput,
@@ -58,11 +74,26 @@ import type {
 const STOP_REASON_END_TURN = 'end_turn';
 const STOP_REASON_MAX_TOKENS = 'max_tokens';
 
-// Stdin drain delay observed in P0-Q4 实测. claude prints
-// "Warning: no stdin data received in 3s, proceeding without it"
-// when stdin stays open without input; we close stdin immediately
-// instead of feeding /dev/null.
-const STDIN_CLOSE_IMMEDIATE = true;
+/**
+ * Resolved claude executable descriptor.
+ *
+ * `command`  - what to pass to spawn()
+ * `useShell` - whether spawn() must set `shell: true`.
+ *
+ * On Windows, the claude code CLI is typically shipped as a `.cmd`
+ * npm shim (C:\Users\<u>\AppData\Roaming\npm\claude.cmd). Node's
+ * child_process.spawn() REFUSES to launch `.cmd`/`.bat` shims without
+ * `shell: true` since the CVE-2024-27980 mitigation; doing so throws
+ * EINVAL synchronously. The fix prefers a real `.exe` path (set by
+ * the claude code launcher in CLAUDE_CODE_EXECPATH) so we can spawn
+ * directly without a shell — that keeps the prompt safely in argv
+ * (no cmd.exe injection surface). If no `.exe` is available, we fall
+ * back to spawning the `.cmd` shim with `shell: true`.
+ */
+interface ClaudeExecutable {
+  command: string;
+  useShell: boolean;
+}
 
 export class ClaudeCliChannel implements ContentBackend {
   readonly name = 'claude-cli' as const;
@@ -99,9 +130,16 @@ export class ClaudeCliChannel implements ContentBackend {
     }
 
     const prompt = this.buildPrompt(input.rawContent, input.localOldContent, temperature);
+    // Prompt is delivered via STDIN, not argv. Args carry only flags.
+    // This is the v020-r2 prompt-injection hardening: when spawn runs
+    // with shell:true (Windows .cmd fallback), Node concatenates args
+    // into the cmd.exe command line WITHOUT escaping (Node DEP0190),
+    // so any `|`, `&`, `$`, backtick, or quote inside the prompt would
+    // be interpreted by cmd.exe. By keeping the prompt out of argv we
+    // eliminate the shell-injection surface for BOTH the .exe path and
+    // the .cmd+shell:true fallback path. See report §3.3 for details.
     const args = [
       '-p',
-      prompt,
       '--output-format',
       'json',
       '--max-turns',
@@ -115,11 +153,26 @@ export class ClaudeCliChannel implements ContentBackend {
     return new Promise<AdaptOutput>((resolve) => {
       let child: ChildProcessWithoutNullStreams;
       try {
-        child = spawn(this.claudePath(), args, {
+        const executable = this.resolveClaudeExecutable();
+        const spawnOptions: SpawnOptions = {
           env: childEnv,
           stdio: ['pipe', 'pipe', 'pipe'],
           windowsHide: true,
-        });
+        };
+        if (executable.useShell) {
+          // Required for launching .cmd/.bat npm shims on Windows.
+          // SAFE because the prompt is delivered via stdin, not argv:
+          // cmd.exe never sees the prompt, so its metacharacters
+          // (`|`, `&`, `$`, backtick, quotes, newlines) are inert.
+          // Only the hard-coded flag list passes through argv, and
+          // every flag is a non-undefined string literal.
+          spawnOptions.shell = true;
+        }
+        child = spawn(executable.command, args, spawnOptions) as ChildProcessWithoutNullStreams;
+        // We always set stdio: ['pipe','pipe','pipe'] above (even when
+        // shell:true), so stdin/stdout/stderr are guaranteed non-null
+        // at runtime despite SpawnOptions' wider ChildProcess return
+        // type. The cast narrows the type for ergonomic .stdin.end().
       } catch (spawnError) {
         const message = spawnError instanceof Error ? spawnError.message : String(spawnError);
         resolve(
@@ -137,14 +190,26 @@ export class ClaudeCliChannel implements ContentBackend {
       let timedOut = false;
       let settled = false;
 
-      // Per P0-Q4 §2.4.3: close stdin immediately to avoid the 3s
-      // "no stdin data" warning delay.
-      if (STDIN_CLOSE_IMMEDIATE) {
-        try {
-          child.stdin.end();
-        } catch {
-          // Ignore EPIPE if the child already closed stdin.
-        }
+      // Feed the prompt via stdin and immediately half-close so claude
+      // CLI sees EOF and does not enter its 3s "no stdin data" wait
+      // (P0-Q4 §2.4.3). Writing happens AFTER spawn succeeds; if spawn
+      // threw EINVAL it was caught above and we never reach here.
+      //
+      // Why stdin.write + end instead of just end():
+      //   - The prompt is the actual task payload; without it claude has
+      //     no task to run. We write then end to deliver prompt + EOF.
+      // Why not worry about backpressure:
+      //   - Prompts are < 100KB (typical <10KB); OS pipe buffer is 64KB+
+      //     so a single write() drains synchronously into the kernel.
+      //   - For pathological prompt sizes the write still completes; the
+      //     'drain' event would only matter for sustained streaming.
+      try {
+        child.stdin.write(prompt);
+        child.stdin.end();
+      } catch {
+        // Ignore EPIPE if the child already closed stdin before we wrote.
+        // The child will still emit 'close' with a non-zero code that
+        // surfaces as an error finishReason.
       }
 
       const settle = (output: AdaptOutput) => {
@@ -270,15 +335,56 @@ export class ClaudeCliChannel implements ContentBackend {
   }
 
   /**
-   * Resolve the claude executable path. Precedence:
-   *   1. claudeCli.claudePath (explicit override)
-   *   2. process.env.CLAUDE_CODE_EXECPATH (set by claude code on Windows)
-   *   3. PATH lookup of bare 'claude' / 'claude.cmd' on Windows
+   * Resolve the claude executable descriptor. Precedence:
+   *   1. claudeCli.claudePath (explicit user override; used as-is, no
+   *      shell — caller is responsible for pointing at a real binary)
+   *   2. process.env.CLAUDE_CODE_EXECPATH (claude code sets this to the
+   *      actual .exe when feishu-sync is launched from within claude
+   *      code; .exe can be spawned directly without shell)
+   *   3. Windows: 'claude.cmd' (npm shim) with shell:true
+   *      Other platforms: 'claude' (no shell)
+   *
+   * Why prefer .exe over .cmd: Node refuses to spawn .cmd/.bat without
+   * shell:true (CVE-2024-27980 mitigation), which throws EINVAL. The
+   * .exe path is the true binary, immune to EINVAL and free of cmd.exe
+   * argv-parsing quirks.
+   *
+   * Why the .cmd + shell:true fallback is now safe (v020-r2):
+   *   Node `spawn(cmd, args, { shell: true })` on Windows CONCATENATES
+   *   args into the cmd.exe command line WITHOUT escaping (per Node
+   *   DEP0190). If we passed the prompt as an argv element, its
+   *   markdown `|`, newlines, quotes, backticks, `$` would be
+   *   interpreted by cmd.exe, corrupting the prompt and creating an
+   *   injection surface (rawContent is user-controlled feishu content).
+   *   We therefore deliver the prompt via STDIN (`child.stdin.write`)
+   *   and pass only flags in argv. Because the prompt never enters the
+   *   command line, shell metacharacters are inert. This makes both
+   *   the .exe path and the .cmd+shell:true fallback path safe; the
+   *   useShell flag now only affects HOW claude is launched, not
+   *   whether the prompt is safe.
+   *   See detect-arg-fix MEMORY for the related "undefined argv
+   *   collapses to positional" trap — all argv entries here are
+   *   guaranteed non-undefined strings (hard-coded flag list + typed
+   *   extraArgs: string[]).
    */
-  private claudePath(): string {
-    if (this.claudeCli?.claudePath) return this.claudeCli.claudePath;
-    if (process.env.CLAUDE_CODE_EXECPATH) return process.env.CLAUDE_CODE_EXECPATH;
-    return process.platform === 'win32' ? 'claude.cmd' : 'claude';
+  private resolveClaudeExecutable(): ClaudeExecutable {
+    // 1. Explicit user override.
+    if (this.claudeCli?.claudePath) {
+      return { command: this.claudeCli.claudePath, useShell: false };
+    }
+    // 2. claude code launcher exposes the .exe via this env var.
+    //    Verified on main上's machine: points to
+    //    C:\Users\<u>\AppData\Roaming\npm\node_modules\@anthropic-ai\
+    //    claude-code\bin\claude.exe (real PE binary, spawn-safe).
+    if (process.env.CLAUDE_CODE_EXECPATH) {
+      return { command: process.env.CLAUDE_CODE_EXECPATH, useShell: false };
+    }
+    // 3. Fallback: PATH lookup. On Windows the global npm shim is
+    //    `claude.cmd`; spawning it without shell:true throws EINVAL.
+    if (process.platform === 'win32') {
+      return { command: 'claude.cmd', useShell: true };
+    }
+    return { command: 'claude', useShell: false };
   }
 
   /**
