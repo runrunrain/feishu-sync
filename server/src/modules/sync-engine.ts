@@ -226,9 +226,16 @@ export class SyncEngine {
     //
     //    finalContent 在 LLM 调用前已经持有 reconstructedMarkdown
     //    （sheet 重构结果拼接），LLM 失败时直接保留即可。
-    if (this.contentAdapter && options.enableLLM && doc.localMdPath) {
+    // P3 fix: original condition `doc.localMdPath` skipped LLM for added
+    // documents (detect-all does not populate localMdPath for added nodes).
+    // Use the locally-resolved `localMdPath` (step 2) so the LLM stage runs
+    // for added documents as well. For modified documents both values are
+    // equal. Reading the local old content for an added doc returns '' from
+    // readLocalMarkdown (file does not exist yet), which is the correct
+    // "no prior version" signal for the adapter.
+    if (this.contentAdapter && options.enableLLM && localMdPath) {
       try {
-        const localOldContent = await this.readLocalMarkdown(doc.localMdPath);
+        const localOldContent = await this.readLocalMarkdown(localMdPath);
         // P3 新接口: ContentAdapter.adaptContent(rawContent, localOld,
         // { channel?, adapt: { temperature, enableStreaming, onProgress,
         //                       timeoutMs } }). ContentAdapter 内部根据
