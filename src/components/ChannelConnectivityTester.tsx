@@ -2,7 +2,7 @@
  * ChannelConnectivityTester - 当前通道连通性测试（T7，决策3：真实调 bigmodel）
  *
  * 测试当前选中通道（claude-cli / direct），发送极短 hello 请求，
- * 3s 超时，结果 Toast 反馈（成功 jade / 失败 seal-2，详情入日志不展开堆栈）。
+ * 30s 超时，结果 Toast 反馈（成功 jade / 失败 seal-2，详情入日志不展开堆栈）。
  *
  * 调用 POST /api/llm/test-channel，后端真实执行：
  *   - claude-cli 通道：spawn `claude -p "hello"`，env 注入 bigmodel Anthropic
@@ -120,7 +120,7 @@ export function ChannelConnectivityTester({ channel, llm, claudeCli }: ChannelCo
         <div>
           <p className="text-sm font-medium text-ink-soft font-serif">测试当前通道连通性</p>
           <p className="text-[11px] text-ink-faint mt-0.5">
-            真实发送极短 hello 请求（约 1k token，3s 超时）验证连通。
+            真实发送极短 hello 请求（约 1k token，30s 超时）验证连通。
             当前通道：<span className="text-seal font-sans-ui">{CHANNEL_TEXT[channel]}</span>
           </p>
         </div>

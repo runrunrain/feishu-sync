@@ -390,9 +390,9 @@ export type ChannelName = 'claude-cli' | 'direct';
  *
  * Backend contract (to be implemented by 鲁班 P5):
  *   - channel='claude-cli': spawn `claude -p "hello"` with bigmodel Anthropic
- *     env injection (ANTHROPIC_BASE_URL/API_KEY/MODEL), 3s timeout.
+ *     env injection (ANTHROPIC_BASE_URL/API_KEY/MODEL), 30s timeout.
  *   - channel='direct':    POST bigmodel paas/v4 chat/completions with a
- *     tiny hello prompt, 3s timeout.
+ *     tiny hello prompt, 30s timeout.
  * Both channels share the same `llm.apiKey`.
  */
 export interface ChannelTestRequest {

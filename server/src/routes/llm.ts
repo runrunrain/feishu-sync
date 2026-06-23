@@ -15,9 +15,9 @@
  * demand; this lets the UI test a config the user has NOT yet saved
  * (e.g. mid-edit), without persisting anything.
  *
- * Default timeout is 3s as required by Task Contract. claude-cli cold
- * start realistically takes longer, so we cap at 10s and surface
- * timeouts as a structured `success=false` (not a 500).
+ * Default timeout is 30s. claude-cli cold start (spawn claude + bigmodel
+ * upstream round-trip) realistically takes 10-60s, so we cap at 60s and
+ * surface timeouts as a structured `success=false` (not a 500).
  */
 
 import { Hono } from 'hono';
@@ -31,8 +31,8 @@ import type {
 
 const llmRoutes = new Hono();
 
-const DEFAULT_TIMEOUT_MS = 3_000;
-const MAX_TIMEOUT_MS = 10_000;
+const DEFAULT_TIMEOUT_MS = 30_000;
+const MAX_TIMEOUT_MS = 60_000;
 const TEST_PROMPT = '请回复：ok';
 
 /**
@@ -138,7 +138,7 @@ llmRoutes.post('/api/llm/test-channel', async (c) => {
         }
       : undefined;
 
-  // Default 3s; honor caller override up to MAX_TIMEOUT_MS.
+  // Default 30s; honor caller override up to MAX_TIMEOUT_MS.
   const requestedTimeout =
     typeof body.timeoutMs === 'number' ? body.timeoutMs : DEFAULT_TIMEOUT_MS;
   const timeoutMs = Math.max(500, Math.min(requestedTimeout, MAX_TIMEOUT_MS));

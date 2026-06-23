@@ -443,7 +443,7 @@ export async function clearTrash(): Promise<{ purged: number }> {
 /**
  * POST /api/llm/test-channel — real connectivity test against the currently
  * selected channel (claude-cli or direct). Server sends a tiny hello prompt
- * with a 3s timeout and returns the result without surfacing the stack to
+ * with a 30s timeout and returns the result without surfacing the stack to
  * the UI (full detail lives in server logs).
  *
  * NOTE: this endpoint is part of the P4-2 contract; if 鲁班 has not added it
