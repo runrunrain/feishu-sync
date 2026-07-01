@@ -127,26 +127,49 @@ export class SyncEngine {
     options: SyncOptions
   ): Promise<SyncedDocument> {
     // 1. Fetch document content from Feishu
+    //
+    //    P1 修复 (feishu-sync-troop-sync-20260701):
+    //      sheet 类型走 docs+fetch 会报 lark-cli code 3380002
+    //      ("Unsupported document type 'sheet'. Only docx is supported.").
+    //      对 sheet 文档，主内容由 exportSheetsAndMap + LayoutReconstructor
+    //      合成，无需调用 docs+fetch（fetchDocumentContent 是 docx-only）。
+    //      此处构造空 content 的 FetchedDocument，后续 step 5/6 由
+    //      sheet 子表的 CSV 经 LayoutReconstructor 重构生成 markdown。
     let fetched: FetchedDocument;
     let isPlaceholder = false;
 
-    try {
-      fetched = await this.fetchDocumentContent(doc.objToken, doc.objType);
-    } catch (error) {
-      // Check if this is a 40403 no permission error
-      if (error instanceof Error && error.message.includes('40403')) {
-        console.warn(`[SyncEngine] No permission for document ${doc.title}, creating placeholder`);
-        isPlaceholder = true;
-        fetched = {
-          content: '',
-          images: [],
-          attachments: [],
-          sheets: [],
-          url: doc.localMdPath || '', // Will be filled in writePlaceholder
-          obj_token: doc.objToken,
-        };
-      } else {
-        throw error; // Re-throw other errors
+    if (doc.objType === 'sheet') {
+      console.info(
+        `[SyncEngine] objType=sheet, skipping docs+fetch (sheet content ` +
+        `is synthesized from sub-sheet CSVs via LayoutReconstructor)`
+      );
+      fetched = {
+        content: '',
+        images: [],
+        attachments: [],
+        sheets: [{ token: doc.objToken, title: doc.title }],
+        url: '',
+        obj_token: doc.objToken,
+      };
+    } else {
+      try {
+        fetched = await this.fetchDocumentContent(doc.objToken, doc.objType);
+      } catch (error) {
+        // Check if this is a 40403 no permission error
+        if (error instanceof Error && error.message.includes('40403')) {
+          console.warn(`[SyncEngine] No permission for document ${doc.title}, creating placeholder`);
+          isPlaceholder = true;
+          fetched = {
+            content: '',
+            images: [],
+            attachments: [],
+            sheets: [],
+            url: doc.localMdPath || '', // Will be filled in writePlaceholder
+            obj_token: doc.objToken,
+          };
+        } else {
+          throw error; // Re-throw other errors
+        }
       }
     }
 
@@ -185,7 +208,12 @@ export class SyncEngine {
     //    the sheet_sheets table for finer-grained change detection)
     const sheets: Array<{ sheetId: string; title: string; csvPath: string }> = [];
     if (doc.objType === 'sheet') {
-      const exportedSheets = await this.exportSheetsAndMap(doc.objToken, saveDir);
+      // P1 修复: csvDataDir 约定 = `{docname}.csv-data/`（与 fetch-feishu-doc
+      // skill 约定对齐，根治旧 `csv-data/` 单目录的 tech debt）。docname
+      // 来自 localMdPath 去扩展名（与 generateHtmlHeader / upsertDocument
+      // 的 title 字段语义一致）。
+      const docname = path.basename(localMdPath, '.md');
+      const exportedSheets = await this.exportSheetsAndMap(doc.objToken, saveDir, docname);
       sheets.push(...exportedSheets);
     }
 
@@ -678,13 +706,12 @@ obj_token: ${fetched.obj_token}
    * change detection is performed by ChangeDetector.detectSheetSubChanges
    * via set differences against this mapping.
    *
-   * The local CSV directory follows the existing project convention of
-   * a single `csv-data/` directory under the doc save dir (NOT the
-   * `<docname>.csv-data/` form mandated by the fetch-feishu-doc skill).
-   * Q6 (白泽调研) flagged this as pre-existing tech debt — correcting it
-   * would force a mass path migration and is out of P2 scope; we
-   * preserve the existing layout and record the deviation in the
-   * implementation report.
+   * P1 修复 (feishu-sync-troop-sync-20260701):
+   *   1. CSV 通道: `workbook-export` 在部分 sheet 上返回 1069902 no
+   *      permission（参考 200-042 报告 D1），改用 `sheets +csv-get`。
+   *      csv-get 返回 `data.annotated_csv`（纯 CSV 文本），直接落盘。
+   *   2. 目录约定: 从旧 `csv-data/` 单目录改为 `{docname}.csv-data/`，
+   *      与 fetch-feishu-doc skill 约定对齐，根治 tech debt。
    *
    * Sub-sheet rows are upserted with COALESCE on local_md_path so a
    * later reconstruction pass can fill in the per-sub-sheet .md path
@@ -692,9 +719,11 @@ obj_token: ${fetched.obj_token}
    */
   private async exportSheetsAndMap(
     sheetToken: string,
-    saveDir: string
+    saveDir: string,
+    docname: string
   ): Promise<Array<{ sheetId: string; title: string; csvPath: string }>> {
-    const csvDataDir = path.join(saveDir, 'csv-data');
+    // P1: csvDataDir 对齐 fetch-feishu-doc skill 约定 = {docname}.csv-data/
+    const csvDataDir = path.join(saveDir, `${docname}.csv-data`);
 
     // Create csv-data directory if it doesn't exist
     if (!fs.existsSync(csvDataDir)) {
@@ -715,24 +744,49 @@ obj_token: ${fetched.obj_token}
       const sheetsList = (workbookInfo.data?.sheets || []) as Array<{
         sheet_id: string;
         sheet_name: string;
+        row_count?: number;
+        column_count?: number;
         index?: number;
       }>;
 
       const nowIso = new Date().toISOString();
 
-      // 2. Export each sub-sheet to CSV + upsert sheet_sheets row
+      // 2. Export each sub-sheet to CSV + upsert sheet_sheets row.
+      //    P1: 改用 csv-get（workbook-export 在该类 sheet 上 1069902 no permission）。
       for (const sheet of sheetsList) {
         const csvPath = path.join(csvDataDir, `${sheet.sheet_name}.csv`);
 
         try {
-          await this.execLarkCli([
+          // csv-get 需要 A1 形式 range，根据 workbook-info 报告的
+          // row_count × column_count 构造。多拉无害（空白单元不影响下游）。
+          const rows = sheet.row_count ?? 200;
+          const cols = sheet.column_count ?? 20;
+          const range = `A1:${colToLetter(cols)}${rows}`;
+
+          // --include-row-prefix=false 必须作为单个 arg 传入（带 `=`）。
+          // execFile + shell=true 下若拆成 `--include-row-prefix` + `false`
+          // 两个独立 arg，lark-cli 会把 `false` 当成 positional 参数报错
+          // "positional arguments are not supported"。
+          // --format json 取 data.annotated_csv 字段（纯 CSV 文本）。
+          const csvResult = await this.execLarkCli([
             'sheets',
-            '+workbook-export',
+            '+csv-get',
             '--spreadsheet-token', sheetToken,
-            '--file-extension', 'csv',
             '--sheet-id', sheet.sheet_id,
-            '--output-path', csvPath,
+            '--range', range,
+            '--include-row-prefix=false',
+            '--format', 'json',
           ]);
+
+          // annotated_csv 是纯 CSV 字符串（含可能的 \r\n、UTF-8 BOM 等）
+          const csvText = csvResult?.data?.annotated_csv ?? '';
+          if (!csvText || csvText.trim().length === 0) {
+            console.warn(
+              `[SyncEngine] csv-get returned empty content for sheet ` +
+              `"${sheet.sheet_name}" (range ${range})`
+            );
+          }
+          fs.writeFileSync(csvPath, csvText, 'utf-8');
 
           exports.push({
             sheetId: sheet.sheet_id,
@@ -764,4 +818,19 @@ obj_token: ${fetched.obj_token}
 
     return exports;
   }
+}
+
+/**
+ * 列号（1-based）转 Excel 列字母（A、Z、AA、AZ、BE...）。
+ * 用于 csv-get range 构造（A1 形式）。
+ */
+function colToLetter(n: number): string {
+  let s = '';
+  let x = Math.max(1, Math.floor(n));
+  while (x > 0) {
+    const mod = (x - 1) % 26;
+    s = String.fromCharCode(65 + mod) + s;
+    x = Math.floor((x - mod) / 26);
+  }
+  return s;
 }
