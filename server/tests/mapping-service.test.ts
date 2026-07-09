@@ -416,9 +416,12 @@ describe('MappingService.getTreeDetailed (v0.2.0 structure-align Phase B)', () =
       'S2',
       makeDoc({ objToken: 'S2', wikiNodeToken: 'W2', title: 'synced2', cloudMatch: 'synced' }),
     );
+    // Restricted but titled: a real restricted node whose title was
+    // back-filled. Feishu view keeps it (only empty-title placeholders
+    // are filtered — see "filters out placeholder nodes" test below).
     store.rows.set(
       'R1',
-      makeDoc({ objToken: 'R1', wikiNodeToken: 'W3', title: '', cloudMatch: 'restricted' }),
+      makeDoc({ objToken: 'R1', wikiNodeToken: 'W3', title: 'restricted-doc', cloudMatch: 'restricted' }),
     );
     // Local-only: filtered out of feishu view, but counted in local view.
     store.rows.set(
@@ -440,6 +443,50 @@ describe('MappingService.getTreeDetailed (v0.2.0 structure-align Phase B)', () =
       restricted: 1,
       unknown: 1,
     });
+  });
+
+  it('feishu view filters out placeholder nodes (empty title with wiki_node_token)', () => {
+    // Placeholder rows come from change-detector.upsertDocumentSeen's
+    // permission-restricted branch: they have a non-empty wiki_node_token
+    // (so they pass the first filter) but title='' / local_path=''.
+    // Without the empty-title filter they would render as blank rows in
+    // NodeTreeView. This test pins the fix.
+    store.rows.set(
+      'GOOD',
+      makeDoc({ objToken: 'GOOD', wikiNodeToken: 'W_GOOD', title: 'real doc' }),
+    );
+    store.rows.set(
+      'PH1',
+      makeDoc({
+        objToken: 'PH1',
+        wikiNodeToken: 'W_PH1',
+        title: '',
+        status: 'placeholder',
+        cloudMatch: 'restricted',
+      }),
+    );
+    store.rows.set(
+      'PH2',
+      makeDoc({
+        objToken: 'PH2',
+        wikiNodeToken: 'W_PH2',
+        title: '   ',
+        status: 'placeholder',
+        cloudMatch: 'restricted',
+      }),
+    );
+
+    const feishu = svc.getTreeDetailed({ view: 'feishu' });
+
+    // Only the titled node survives in feishu view.
+    expect(feishu.nodes.map((n) => n.obj_token)).toEqual(['GOOD']);
+    expect(feishu.stats.total_nodes).toBe(1);
+
+    // Local view keeps ALL rows (placeholder rows have local_path=''
+    // and are naturally skipped by LocalDirTreeView's splitPath, so
+    // keeping them here is correct and does not produce blank UI rows).
+    const local = svc.getTreeDetailed({ view: 'local' });
+    expect(local.nodes.map((n) => n.obj_token).sort()).toEqual(['GOOD', 'PH1', 'PH2']);
   });
 
   it('watched_root_url is projected from DocumentRecord.watchedRootUrl', () => {

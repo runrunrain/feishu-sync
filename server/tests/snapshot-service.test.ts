@@ -167,6 +167,35 @@ describe('SnapshotService.generate', () => {
     expect(snap.orphan_files).toHaveLength(0);
   });
 
+  it('skips INDEX.md during orphan scan (hand-curated navigation, no Feishu node)', () => {
+    // INDEX.md files are local-only navigation aids (e.g. 技术 - Dev/INDEX.md).
+    // They have no obj_token header by design and must not be flagged as
+    // orphans, otherwise OrphanFileAlert would surface intentional local
+    // artifacts as actionable warnings.
+    fs.mkdirSync(tmpDir, { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'INDEX.md'), '# Navigation Index');
+    const snap = svc.generate();
+    expect(snap.orphan_files).toHaveLength(0);
+  });
+
+  it('skips the _reports directory during orphan scan (local-only agent reports)', () => {
+    // The _reports directory holds sync/agent reports under kbRoot for
+    // convenience but has no Feishu correspondence. Every .md inside would
+    // be flagged orphan if collectMarkdownFiles recursed into it.
+    fs.mkdirSync(path.join(tmpDir, '_reports'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, '_reports', 'luban-report.md'), '# sync report');
+    fs.writeFileSync(path.join(tmpDir, '_reports', 'diting-audit.md'), '# audit report');
+    // A real orphan outside _reports should still be surfaced.
+    fs.writeFileSync(path.join(tmpDir, 'real-orphan.md'), '# no header here');
+
+    const snap = svc.generate();
+
+    const orphanPaths = snap.orphan_files.map((o) => o.path);
+    expect(orphanPaths).toContain('real-orphan.md');
+    // Nothing under _reports/ should appear.
+    expect(orphanPaths.some((p) => p.startsWith('_reports/'))).toBe(false);
+  });
+
   it('writes _index.json atomically and can re-read it', () => {
     store.rows = [
       makeDoc({ objToken: 'X', localMdPath: path.join(tmpDir, 'x.md') }),

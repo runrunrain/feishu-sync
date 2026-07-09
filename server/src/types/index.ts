@@ -447,7 +447,12 @@ export interface LarkCliNodeInfo {
   obj_type: 'docx' | 'sheet' | 'slides' | 'bitable' | 'mindnote' | 'file' | 'unknown';
   title: string;
   space_id: string;
-  obj_edit_time: number; // Unix seconds
+  // Unix seconds. null when lark-cli returns a non-numeric value (empty
+  // string / undefined for permission-restricted or missing fields). The
+  // NaN-defense coercion lives in lark-cli-client.getNode; upstream
+  // consumers (change-detector.compareWithLocalRecords) treat null as
+  // "unknown" and skip the modified branch (see diagnosis §2.2 根因 D).
+  obj_edit_time: number | null;
   has_child: boolean;
   /**
    * v0.2.0: parent_node_token is returned by both `wiki +node-list`

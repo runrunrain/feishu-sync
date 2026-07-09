@@ -109,6 +109,17 @@ export class LarkCliClient {
     const args = ['wiki', '+node-get', '--node-token', nodeTokenOrUrl, '--format', 'json'];
     const result = await this.execLarkCli(args);
 
+    // obj_edit_time NaN defense (diagnosis §2.2 根因 D): lark-cli returns an
+    // empty string or undefined for permission-restricted / missing fields.
+    // parseInt on those inputs yields NaN, which used to propagate as toxic
+    // data — `NaN > localTime` is always false, silently turning "cloud
+    // edited" into "no change reported". Coerce non-finite results to null
+    // so the upstream compareWithLocalRecords treats them as "unknown" and
+    // skips the modified branch (consistent with the existing
+    // `node.obj_edit_time || null` coercion at change-detector.ts:516).
+    const parsedEditTime = parseInt(result.data.obj_edit_time, 10);
+    const objEditTime = Number.isFinite(parsedEditTime) ? parsedEditTime : null;
+
     // Map fields based on actual lark-cli output (validated by 实测)
     return {
       node_token: result.data.node_token,
@@ -116,7 +127,7 @@ export class LarkCliClient {
       obj_type: result.data.obj_type,
       title: result.data.title,
       space_id: result.data.space_id,
-      obj_edit_time: parseInt(result.data.obj_edit_time, 10),
+      obj_edit_time: objEditTime,
       has_child: result.data.has_child,
     };
   }

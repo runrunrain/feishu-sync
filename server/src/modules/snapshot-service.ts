@@ -336,6 +336,11 @@ export class SnapshotService {
       // Skip the generated README.md (it has no header by design).
       const base = path.basename(mdPath);
       if (base === 'README.md') continue;
+      // Skip hand-curated INDEX.md navigation files. These are local-only
+      // navigation aids (e.g. 技术 - Dev/INDEX.md) with no corresponding
+      // Feishu node and no obj_token header; treating them as orphans
+      // would noise up OrphanFileAlert with intentional local artifacts.
+      if (base === 'INDEX.md') continue;
 
       // Skip if already mapped.
       if (knownLocalPaths.has(mdPath)) continue;
@@ -412,6 +417,11 @@ export class SnapshotService {
       // Skip dot-dirs (.trash-bin, .assets handled separately as they
       // don't typically contain docs; .git etc).
       if (entry.name.startsWith('.')) continue;
+      // Skip the _reports directory (agent-outputs / sync reports). These
+      // are local-only artifacts that live under kbRoot for convenience
+      // but have no Feishu correspondence; recursing into them would list
+      // every report as an orphan file and pollute OrphanFileAlert.
+      if (entry.isDirectory() && entry.name === '_reports') continue;
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) {
         out.push(...this.collectMarkdownFiles(full));

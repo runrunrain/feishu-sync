@@ -46,15 +46,24 @@
  *
  * The obj_edit_time fetching uses a fingerprint short-circuit (03 §3.3.2
  * 情况 B): if a node's (title + obj_token) signature is unchanged AND
- * the local row already has a non-null obj_edit_time, we skip the
- * per-node node-get call and reuse the cached value. has_child is NOT
- * part of the fingerprint because the documents table does not persist
- * it (03 §3.1 declares has_child too volatile to be worth storing);
- * title+obj_token equality is sufficient since a renamed doc keeps its
- * obj_token (triggering a refresh, which is correct) and a different
- * obj_token means a different doc entirely. This bounds the worst-case
- * extra requests to "nodes that actually changed identity" instead of
- * all nodes on every poll.
+ * the local row already has a non-null obj_edit_time, we reuse the
+ * cached value. has_child is NOT part of the fingerprint because the
+ * documents table does not persist it (03 §3.1 declares has_child too
+ * volatile to be worth storing); title+obj_token equality is sufficient
+ * since a renamed doc keeps its obj_token (triggering a refresh, which
+ * is correct) and a different obj_token means a different doc entirely.
+ *
+ * v0.2.0 change-detection-ttl (diagnosis §2.2 根因 A): the original
+ * short-circuit reused the local obj_edit_time indefinitely, so content-
+ * only edits (title unchanged) silently leaked — cloudTime > localTime
+ * was always false because cloudTime WAS the stale local value. The
+ * short-circuit is now bounded by OBJ_EDIT_TIME_REFRESH_TTL_MS: even on
+ * a fingerprint hit we re-fetch the real cloud obj_edit_time via
+ * wiki +node-get once per TTL window (in-memory tracker, see
+ * lastObjEditTimeRefreshAt). Worst-case extra requests are now bounded
+ * by "nodes that changed identity OR fingerprint-hit nodes whose TTL
+ * expired" — on steady state that is roughly nodesCount / (TTL/pollInterval)
+ * node-get calls per poll, which is a fraction of the full subtree.
  */
 
 import type { LarkCliClient } from './lark-cli-client.js';
@@ -123,6 +132,26 @@ const DTECT_RESULT_TTL_MS = 120_000;
  */
 const DETECT_COOLDOWN_MS = 60_000;
 
+/**
+ * TTL for the fingerprint short-circuit's reuse of the cached
+ * obj_edit_time (diagnosis §2.2 根因 A fix).
+ *
+ * The short-circuit previously reused the local obj_edit_time
+ * indefinitely whenever (title, obj_token) matched, so content-only
+ * edits (title unchanged) silently leaked: cloudTime > localTime was
+ * always false because cloudTime was the stale local value. Now even on
+ * a fingerprint hit we periodically re-fetch the real cloud obj_edit_time
+ * via wiki +node-get once per TTL window.
+ *
+ * Default 1h balances detection latency against the per-poll wiki QPS
+ * budget: with a 30-min poll interval, the worst-case staleness is 1h
+ * (2 polls) before a content-only edit is surfaced. Process restart
+ * empties the in-memory tracker, so the first detect after boot treats
+ * every fingerprint-hit node as TTL-expired and re-fetches once (bounded
+ * burst), then steady state resumes. See ChangeDetector.lastObjEditTimeRefreshAt.
+ */
+const OBJ_EDIT_TIME_REFRESH_TTL_MS = 60 * 60 * 1000;
+
 export class ChangeDetector {
   // space_id cache: rootUrl -> space_id (avoid repeated getNode calls)
   private spaceIdCache = new Map<string, string>();
@@ -160,6 +189,25 @@ export class ChangeDetector {
     string,
     { result: ChangeDetectionResult; expiresAt: number }
   >();
+
+  /**
+   * In-memory TTL tracker for the fingerprint short-circuit (diagnosis
+   * §2.2 根因 A fix). Maps obj_token → epoch ms of the last wiki +node-get
+   * we issued to refresh its obj_edit_time. Used together with
+   * OBJ_EDIT_TIME_REFRESH_TTL_MS so that even when a node's title hasn't
+   * changed, we periodically re-check the real cloud obj_edit_time
+   * instead of reusing the local cached value indefinitely.
+   *
+   * Process-restart semantics: empty on boot ⇒ the first detect treats
+   * every fingerprint-hit node as TTL-expired and re-fetches once
+   * (bounded burst = node count of the subtree), then steady state
+   * resumes. Persistence would require a documents-table schema migration
+   * (last_obj_edit_time_refresh_at column); the in-memory approach is
+   * chosen because restarts are rare and the cost is a one-off QPS spike
+   * that is fully absorbed by the existing lark-cli throttle. See impl
+   * report §3 for the full trade-off analysis.
+   */
+  private lastObjEditTimeRefreshAt = new Map<string, number>();
 
   constructor(
     private larkCliClient: LarkCliClient,
@@ -280,11 +328,14 @@ export class ChangeDetector {
    *         (lark-cli 1.0.53 infers obj_type from the typed wiki URL,
    *          avoiding the --obj-type requirement).
    *
-   * Fingerprint short-circuit: if the local row already has a non-null
-   * obj_edit_time AND (title, has_child, obj_token) are unchanged, we
-   * trust the cached value and skip the node-get. This is the
-   * optimization mandated by 03 §3.3.2 for the situation-B performance
-   * penalty.
+   * Fingerprint short-circuit with TTL: if the local row already has a
+   * non-null obj_edit_time AND (title, obj_token) are unchanged AND the
+   * TTL window has not expired (see OBJ_EDIT_TIME_REFRESH_TTL_MS), we
+   * trust the cached value and skip the node-get. The TTL bound is the
+   * v0.2.0 change-detection-ttl fix (diagnosis §2.2 根因 A): without it,
+   * content-only edits with unchanged title were silently missed. Outside
+   * the TTL window we re-fetch even on a fingerprint hit, trading one
+   * node-get per node per TTL window for correct modification detection.
    */
   private async traverseWikiSubtree(
     spaceId: string,
@@ -300,12 +351,31 @@ export class ChangeDetector {
       let objEditTime: number | null;
       let parentNodeToken = raw.parent_node_token ?? null;
 
-      if (fingerprintUnchanged && cached?.objEditTime != null) {
-        // Fingerprint hit: reuse cached obj_edit_time, skip node-get
+      // TTL guard for the fingerprint short-circuit (diagnosis §2.2 根因 A
+      // fix). The original short-circuit reused the local obj_edit_time
+      // indefinitely on a fingerprint hit, so content-only edits (title
+      // unchanged) were silently missed. Now a fingerprint hit is only
+      // honored when the cached obj_edit_time was refreshed within the
+      // last OBJ_EDIT_TIME_REFRESH_TTL_MS; otherwise we re-fetch via
+      // wiki +node-get. The tracker is in-memory (lastObjEditTimeRefreshAt),
+      // so a process restart loses the map and the first detect becomes a
+      // full refresh — see OBJ_EDIT_TIME_REFRESH_TTL_MS doc.
+      const now = Date.now();
+      const lastRefresh = this.lastObjEditTimeRefreshAt.get(raw.obj_token) ?? 0;
+      const ttlExpired = now - lastRefresh > OBJ_EDIT_TIME_REFRESH_TTL_MS;
+
+      if (fingerprintUnchanged && cached?.objEditTime != null && !ttlExpired) {
+        // Fingerprint hit AND TTL fresh: reuse cached obj_edit_time, skip node-get.
         objEditTime = cached.objEditTime;
       } else {
-        // Fingerprint miss or no cache: fetch fresh obj_edit_time
+        // Fingerprint miss OR TTL expired OR no cache: fetch fresh obj_edit_time.
         const nodeDetail = await this.fetchNodeDetail(spaceId, raw.node_token);
+        // Record the refresh attempt regardless of success. A failed
+        // node-get (permission/timeout → null) must not become an infinite
+        // retry on every poll: the next TTL window will retry naturally,
+        // and meanwhile compareWithLocalRecords safely treats null as
+        // "unknown" (no modified report).
+        this.lastObjEditTimeRefreshAt.set(raw.obj_token, now);
         if (nodeDetail) {
           objEditTime = nodeDetail.obj_edit_time;
           // Prefer freshly-fetched parent_node_token (more authoritative

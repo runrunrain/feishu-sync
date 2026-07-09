@@ -33,7 +33,9 @@ export function SyncView() {
   const sync = useSync();
 
   const [selectedTokens, setSelectedTokens] = useState<string[]>([]);
-  const [enableLLM, setEnableLLM] = useState(true);
+  // 暂时屏蔽 LLM：默认关闭，仅做云端原始内容→本地同步（主上 2026-07-08 要求）
+  // 保留 setEnableLLM，UI 复选框仍可手动开启，但默认不启用 LLM 适配。
+  const [enableLLM, setEnableLLM] = useState(false);
   const [fullSync, setFullSync] = useState(false);
   const [logOpen, setLogOpen] = useState(false);
   const [trashOpen, setTrashOpen] = useState(false);

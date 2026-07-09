@@ -2,23 +2,25 @@
  * Change Notification Service
  *
  * Polls for document changes and displays tray notifications.
- * Integrates with server-side ChangeDetector via IPC.
+ * Integrates with server-side ChangeDetector via HTTP.
  *
  * Architecture reference: §6.1 ChangeDetector / §6.6 TrayService
  *
- * Contract: POST /api/detect/changes expects body { rootUrl: string }
- * (singular). An earlier revision sent { rootUrls: [] } which left
- * rootUrl undefined on the server side; detect.ts destructured
- * { rootUrl } and passed undefined to changeDetector → getNode →
- * lark-cli `--node-token undefined --format json`, which (via
- * Node execFile shell:true concatenation) made lark-cli 1.0.53
- * interpret "json" as a positional argument and reject with
- * `positional arguments are not supported (got ["json"])`.
- * The fix is two-sided:
- *   1. Caller (this file) sends the correct field name with the
- *      first valid watched root URL pulled from config.
- *   2. detect.ts validates rootUrl and 400s on missing/invalid so
- *      future contract drift fails fast instead of leaking to lark-cli.
+ * Multi-root contract: this service POSTs to /api/detect/changes-all,
+ * the same multi-root endpoint the frontend 立即检测 button uses. The
+ * server iterates config.watchedRootUrls and runs detectChanges per
+ * root, aggregating changedDocuments across ALL roots. This is a
+ * deliberate change from the earlier single-root design which POSTed
+ * /api/detect/changes { rootUrl } with only the FIRST valid watched
+ * root URL — leaving roots [1..N] never auto-detected (diagnosis
+ * 2026-07-08 §2.2 root cause B).
+ *
+ * Historical note (kept to prevent regression): an even earlier
+ * revision sent { rootUrls: [] } to the singular endpoint, leaving
+ * rootUrl undefined on the server and triggering a lark-cli positional-
+ * arg error. The lesson — always match the endpoint's actual contract
+ * — still applies; changes-all is config-driven (body ignored), so an
+ * empty {} is the correct body here.
  */
 
 import type { BrowserWindow } from 'electron';
@@ -31,11 +33,13 @@ type ChangeNotificationServiceOptions = {
   sanitizeError: (error: unknown) => string;
   trayService: () => DesktopTrayService | null;
   /**
-   * Returns the first usable watched root URL from config, or null
-   * when none is configured/valid. Used to populate the detect
-   * endpoint's required rootUrl field.
+   * Returns ALL valid watched root URLs from config (empty array when
+   * none is configured/valid). Used (a) to skip the detect poll when no
+   * roots are configured, and (b) to log root coverage; the actual root
+   * iteration happens server-side inside /api/detect/changes-all, so the
+   * caller does not need to loop over these URLs itself.
    */
-  getWatchedRootUrl: () => string | null;
+  getWatchedRootUrls: () => string[];
 };
 
 interface ChangeDetectionResult {
@@ -90,7 +94,13 @@ export class ChangeNotificationService {
   }
 
   /**
-   * Check for changes and notify if found
+   * Check for changes and notify if found.
+   *
+   * Polls the multi-root /api/detect/changes-all endpoint so every
+   * configured watched root is auto-detected each cycle. The server
+   * aggregates results across roots; any root reporting changes raises
+   * the tray notification (notification semantics are unchanged from
+   * the single-root era — only coverage expanded to all roots).
    */
   private async checkChanges(): Promise<void> {
     const serverUrl = this.options.getServerUrl();
@@ -101,27 +111,30 @@ export class ChangeNotificationService {
       return;
     }
 
-    const rootUrl = this.options.getWatchedRootUrl();
-    if (!rootUrl) {
+    const rootUrls = this.options.getWatchedRootUrls();
+    if (rootUrls.length === 0) {
       // No valid watched root URL configured — nothing to detect.
       // Not an error; log once per poll so the trace is visible.
-      console.info('[ChangeNotification] No watched root URL configured, skipping detect poll');
+      console.info('[ChangeNotification] No watched root URLs configured, skipping detect poll');
       return;
     }
 
     try {
-      // Call server-side change detection API.
-      // Body field name MUST be `rootUrl` (singular) per server detect.ts
-      // contract. Sending `rootUrls` (plural) or omitting the field leaves
-      // rootUrl undefined and triggers the lark-cli positional-arg error
-      // (see file header).
-      const response = await fetch(`${serverUrl}/api/detect/changes`, {
+      // Drive the multi-root detect endpoint so EVERY configured root is
+      // polled automatically. The server iterates config.watchedRootUrls
+      // internally and aggregates changedDocuments across roots; the body
+      // is config-driven (ignored), so {} is correct. Response shape:
+      //   { changed, changedDocuments, totalNodes, checkedAt, results[] }
+      // — the shared fields match ChangeDetectionResult, so the existing
+      // notification logic works unchanged; results[] (per-root status)
+      // is simply unused by the poller.
+      const response = await fetch(`${serverUrl}/api/detect/changes-all`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'X-Desktop-Token': apiToken,
         },
-        body: JSON.stringify({ rootUrl }),
+        body: JSON.stringify({}),
       });
 
       if (!response.ok) {
@@ -142,7 +155,9 @@ export class ChangeNotificationService {
         }
       }
 
-      console.info(`[ChangeNotification] Checked ${result.totalNodes} nodes, ${result.changedDocuments.length} changed`);
+      console.info(
+        `[ChangeNotification] Checked ${result.totalNodes} nodes across ${rootUrls.length} root(s), ${result.changedDocuments.length} changed`,
+      );
     } catch (error) {
       console.error('[ChangeNotification] Change detection failed:', this.options.sanitizeError(error));
     }

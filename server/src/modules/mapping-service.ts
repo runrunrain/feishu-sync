@@ -168,10 +168,22 @@ export class MappingService {
     let nodes: MappingNode[];
     if (view === 'feishu') {
       // Cloud view: only rows with a feishu node identity.
+      // The second filter drops placeholder nodes — rows with a non-empty
+      // wiki_node_token but an empty title/local_path. These come from
+      // change-detector.upsertDocumentSeen's permission-restricted branch
+      // (cloud_match='restricted', status='placeholder'); they carry no
+      // user-visible information and would otherwise render as blank rows
+      // in NodeTreeView. A non-empty title is the signal that the row has
+      // been back-filled with real metadata (synced or a titled restricted
+      // node). Note this filter is intentionally feishu-view-only: the
+      // local view must keep every row so LocalDirTreeView can show all
+      // on-disk files (placeholder rows have local_path='' and are
+      // naturally skipped by splitPath anyway).
       nodes = live
         .filter(
           (d) => d.wikiNodeToken != null && d.wikiNodeToken !== '',
         )
+        .filter((d) => (d.title ?? '').trim().length > 0)
         .map((d) => this.projectNode(d, parentSet));
     } else {
       // Local view: all rows (including local-only README/index).

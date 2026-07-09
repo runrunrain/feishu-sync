@@ -641,3 +641,259 @@ describe('ChangeDetector.detectChanges result cache (sync-state-timeout-fix)', (
     expect(lark.getNodeCalls).toBeGreaterThan(callsAfterA);
   });
 });
+
+// ---------------------------------------------------------------------------
+// v0.2.0 change-detection-ttl: fingerprint short-circuit TTL (diagnosis §2.2
+// 根因 A fix)
+//
+// Pins the behavior of the TTL bound added to traverseWikiSubtree's
+// fingerprint short-circuit. Without the TTL, a node whose (title,
+// obj_token) fingerprint matched the local row reused the local
+// obj_edit_time indefinitely, so content-only edits (title unchanged)
+// were silently missed. The TTL forces a periodic wiki +node-get refresh
+// even on fingerprint hits.
+//
+// The mock client distinguishes root traversal from per-node node-get by
+// the URL suffix, and records every getNode URL so tests can assert
+// exactly which calls fired.
+// ---------------------------------------------------------------------------
+
+class TtlTrackingLarkCliClient {
+  getNodeUrls: string[] = [];
+
+  async getNode(url: string): Promise<LarkCliNodeInfo> {
+    this.getNodeUrls.push(url);
+    if (url.endsWith('/wiki/rootA')) {
+      // Root of the subtree under test.
+      return {
+        node_token: 'rootA',
+        obj_token: 'rootObj',
+        obj_type: 'docx',
+        title: 'root-title',
+        space_id: 'space-1',
+        obj_edit_time: 1000,
+        has_child: true,
+        parent_node_token: undefined,
+      };
+    }
+    // fetchNodeDetail URL pattern: https://...feishu.cn/wiki/<nodeToken>.
+    // Return a "cloud advanced" edit time so a fingerprint-miss / TTL-
+    // expired refresh surfaces a modified event against the seeded local
+    // row (obj_edit_time=1000).
+    const token = url.substring(url.lastIndexOf('/') + 1);
+    return {
+      node_token: token,
+      obj_token: 'obj-' + token,
+      obj_type: 'docx',
+      title: 'child-title',
+      space_id: 'space-1',
+      obj_edit_time: 5000,
+      has_child: false,
+    };
+  }
+
+  async listWikiNodes(_opts: any): Promise<any[]> {
+    // Single child whose fingerprint (title+obj_token) matches the seeded
+    // local row when the test sets title='child-title'.
+    return [
+      {
+        node_token: 'childN1',
+        obj_token: 'obj-childN1',
+        obj_type: 'docx',
+        title: 'child-title',
+        has_child: false,
+        parent_node_token: 'rootA',
+        space_id: 'space-1',
+      },
+    ];
+  }
+}
+
+const TTL_ROOT_URL = 'https://qcnbafdrjx7n.feishu.cn/wiki/rootA';
+const TTL_CHILD_NODE_GET_URL =
+  'https://qcnbafdrjx7n.feishu.cn/wiki/childN1';
+
+describe('ChangeDetector fingerprint short-circuit TTL (change-detection-ttl, §2.2 根因 A fix)', () => {
+  it('fingerprint hit + TTL fresh → reuses cached obj_edit_time, skips node-get', async () => {
+    const lark = new TtlTrackingLarkCliClient();
+    const store = new MockLocalMapStore();
+    // Local row matches cloud fingerprint (title+obj_token) and carries a
+    // stale obj_edit_time (1000 vs cloud's real 5000). Without the TTL
+    // guard this is exactly the silent-miss scenario.
+    store.rows.set(
+      'obj-childN1',
+      makeLocal({
+        objToken: 'obj-childN1',
+        wikiNodeToken: 'childN1',
+        title: 'child-title',
+        objEditTime: 1000,
+        parentNodeToken: 'rootA',
+      })
+    );
+
+    const detector = new ChangeDetector(lark as any, store as any);
+    // Pretend the TTL was refreshed moments ago → short-circuit should fire.
+    (detector as any).lastObjEditTimeRefreshAt.set('obj-childN1', Date.now());
+
+    const result = await detector.detectChanges(TTL_ROOT_URL, {
+      forceFresh: true,
+      bypassCooldown: true,
+    });
+
+    // Only the root getNode call happened — no per-node node-get.
+    expect(lark.getNodeUrls).toEqual([TTL_ROOT_URL]);
+    // Because cloud time was reused as the stale local 1000, no modified
+    // event fires for obj-childN1 (this is the cost of the optimization,
+    // accepted within one TTL window).
+    const modified = result.changedDocuments.filter(
+      (c) => c.objToken === 'obj-childN1' && c.changeType === 'modified'
+    );
+    expect(modified).toHaveLength(0);
+  });
+
+  it('fingerprint hit + TTL expired → fires node-get and reports modified', async () => {
+    const lark = new TtlTrackingLarkCliClient();
+    const store = new MockLocalMapStore();
+    store.rows.set(
+      'obj-childN1',
+      makeLocal({
+        objToken: 'obj-childN1',
+        wikiNodeToken: 'childN1',
+        title: 'child-title',
+        objEditTime: 1000, // local stale; cloud returns 5000
+        parentNodeToken: 'rootA',
+      })
+    );
+
+    const detector = new ChangeDetector(lark as any, store as any);
+    // TTL expired 2h ago → fingerprint hit must NOT short-circuit.
+    (detector as any).lastObjEditTimeRefreshAt.set(
+      'obj-childN1',
+      Date.now() - 2 * 60 * 60 * 1000
+    );
+
+    const result = await detector.detectChanges(TTL_ROOT_URL, {
+      forceFresh: true,
+      bypassCooldown: true,
+    });
+
+    // Root + one node-get for childN1.
+    expect(lark.getNodeUrls).toEqual([TTL_ROOT_URL, TTL_CHILD_NODE_GET_URL]);
+    // CloudTime 5000 > localTime 1000 → modified reported. This is the
+    // core regression assertion: before the TTL fix this branch never
+    // fired for content-only edits.
+    const modified = result.changedDocuments.filter(
+      (c) => c.objToken === 'obj-childN1' && c.changeType === 'modified'
+    );
+    expect(modified).toHaveLength(1);
+  });
+
+  it('fingerprint miss (title changed) → fires node-get regardless of TTL freshness', async () => {
+    const lark = new TtlTrackingLarkCliClient();
+    const store = new MockLocalMapStore();
+    // Local title differs from cloud's 'child-title' → fingerprint miss.
+    store.rows.set(
+      'obj-childN1',
+      makeLocal({
+        objToken: 'obj-childN1',
+        wikiNodeToken: 'childN1',
+        title: 'OLD-title',
+        objEditTime: 1000,
+        parentNodeToken: 'rootA',
+      })
+    );
+
+    const detector = new ChangeDetector(lark as any, store as any);
+    // Even with a fresh TTL, fingerprint miss must trigger node-get.
+    (detector as any).lastObjEditTimeRefreshAt.set('obj-childN1', Date.now());
+
+    await detector.detectChanges(TTL_ROOT_URL, {
+      forceFresh: true,
+      bypassCooldown: true,
+    });
+
+    expect(lark.getNodeUrls).toEqual([TTL_ROOT_URL, TTL_CHILD_NODE_GET_URL]);
+  });
+
+  it('process-restart semantics: empty tracker → first detect fires node-get (bounded burst)', async () => {
+    const lark = new TtlTrackingLarkCliClient();
+    const store = new MockLocalMapStore();
+    store.rows.set(
+      'obj-childN1',
+      makeLocal({
+        objToken: 'obj-childN1',
+        wikiNodeToken: 'childN1',
+        title: 'child-title',
+        objEditTime: 1000,
+        parentNodeToken: 'rootA',
+      })
+    );
+
+    const detector = new ChangeDetector(lark as any, store as any);
+    // Do NOT pre-seed lastObjEditTimeRefreshAt — simulates a fresh boot.
+
+    await detector.detectChanges(TTL_ROOT_URL, {
+      forceFresh: true,
+      bypassCooldown: true,
+    });
+
+    // Empty tracker ⇒ lastRefresh=0 ⇒ ttlExpired=true ⇒ node-get fires.
+    // This pins the documented "first detect after restart is a full
+    // refresh" behavior (acceptable QPS burst — see OBJ_EDIT_TIME_REFRESH_TTL_MS
+    // header comment for the rationale).
+    expect(lark.getNodeUrls).toEqual([TTL_ROOT_URL, TTL_CHILD_NODE_GET_URL]);
+  });
+
+  it('refresh attempt is recorded even when node-get fails, preventing retry storms', async () => {
+    // A failing node-get must still stamp lastObjEditTimeRefreshAt so the
+    // next poll within the same TTL window doesn't re-attempt (which would
+    // multiply QPS without unblocking the failure).
+    const failingLark = new (class extends TtlTrackingLarkCliClient {
+      async getNode(url: string): Promise<LarkCliNodeInfo> {
+        this.getNodeUrls.push(url);
+        if (url.endsWith('/wiki/rootA')) {
+          return {
+            node_token: 'rootA',
+            obj_token: 'rootObj',
+            obj_type: 'docx',
+            title: 'root-title',
+            space_id: 'space-1',
+            obj_edit_time: 1000,
+            has_child: true,
+            parent_node_token: undefined,
+          };
+        }
+        // Per-node node-get always fails (e.g. permission revoked).
+        throw new Error('无权限访问该节点');
+      }
+    })();
+    const store = new MockLocalMapStore();
+    store.rows.set(
+      'obj-childN1',
+      makeLocal({
+        objToken: 'obj-childN1',
+        wikiNodeToken: 'childN1',
+        title: 'child-title',
+        objEditTime: 1000,
+        parentNodeToken: 'rootA',
+      })
+    );
+
+    const detector = new ChangeDetector(failingLark as any, store as any);
+
+    // First detect: TTL expired (empty tracker) → attempt node-get → fails.
+    await detector.detectChanges(TTL_ROOT_URL, {
+      forceFresh: true,
+      bypassCooldown: true,
+    });
+    expect(failingLark.getNodeUrls).toEqual([TTL_ROOT_URL, TTL_CHILD_NODE_GET_URL]);
+    // Failure still recorded → next call within TTL must NOT re-attempt.
+    failingLark.getNodeUrls = [];
+
+    await detector.detectChanges(TTL_ROOT_URL, {
+      forceFresh: true,
+      bypassCooldown: true,
+    });
+    expect(failingLark.getNodeUrls).toEqual([TTL_ROOT_URL]);
+  });
+});

@@ -21,6 +21,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import path from 'node:path';
 import fs from 'node:fs';
+import os from 'node:os';
 import type {
   ChangedDocument,
   SyncResult,
@@ -38,6 +39,39 @@ interface FetchedDocument {
   sheets: Array<{ token: string; title: string }>;
   url: string;
   obj_token: string;
+}
+
+/**
+ * Normalized metadata consumed by generateHtmlHeader to emit the
+ * YAML-in-comment header (header_format = yaml_html, see
+ * index-scanner.ts parseYamlHtmlHeader).
+ *
+ * Field sourcing (no fabrication — every value comes from the live
+ * sync context):
+ *   - objToken / objType / lastSyncedModifyTime: straight off the
+ *     ChangedDocument (populated by ChangeDetector from lark-cli).
+ *   - fetchDate: current wall clock.
+ *   - wikiNodeToken / spaceId: read from SQLite via getDocumentByObjToken.
+ *     ChangeDetector.upsertDocumentSeen (change-detector.ts:609-616)
+ *     persists BOTH for added and modified docs before the sync pipeline
+ *     runs, so even a brand-new added sheet has these available without
+ *     an extra lark-cli round-trip in SyncEngine.
+ *   - originalLink: resolved by resolveHeaderMeta with precedence
+ *     fetched.url → SQLite.original_link → constructed from
+ *     wiki_node_token + feishu host.
+ *
+ * Nullable fields are OMITTED from the YAML block by generateHtmlHeader
+ * (never written as empty strings) so IndexScanner.extractYamlFields is
+ * never fed empty values.
+ */
+interface HeaderMeta {
+  objToken: string;
+  objType: 'docx' | 'sheet' | 'slides' | 'unknown';
+  wikiNodeToken: string | null;
+  spaceId: string | null;
+  originalLink: string | null;
+  fetchDate: string;
+  lastSyncedModifyTime: string;
 }
 
 interface Image {
@@ -87,10 +121,24 @@ export class SyncEngine {
         const result = await this.syncSingleDocument(doc, options);
         syncedDocuments.push(result);
       } catch (error) {
+        const errMsg = error instanceof Error ? error.message : String(error);
+        const errStack = error instanceof Error && error.stack ? error.stack : '';
+        // 同步失败日志落盘（诊断报告 §4.3）：当前无任何磁盘日志，失败根因
+        // 只能静态推测。这里把单文档失败的堆栈追加到
+        // ~/.feishu-sync/sync-errors.log，便于事后回溯。
+        // 用 try/catch 包住：日志写入失败不能影响同步主流程。
+        try {
+          const logPath = path.join(os.homedir(), '.feishu-sync', 'sync-errors.log');
+          const header = `[${new Date().toISOString()}] ${doc.objToken} (${doc.title})\n`;
+          const body = errStack ? `${errMsg}\n${errStack}\n` : `${errMsg}\n`;
+          fs.appendFileSync(logPath, `${header}${body}---\n`);
+        } catch (logError) {
+          console.error('[SyncEngine] failed to append sync-errors.log:', logError);
+        }
         failedDocuments.push({
           objToken: doc.objToken,
           title: doc.title,
-          error: error instanceof Error ? error.message : String(error),
+          error: errMsg,
           retryable: true,
         });
       }
@@ -317,7 +365,13 @@ export class SyncEngine {
     }
 
     // 8. Write local markdown file
-    await this.writeLocalMarkdown(localMdPath, finalContent, fetched);
+    //    Resolve header metadata BEFORE writing so the YAML header
+    //    carries wiki_node_token / space_id / original_link even for the
+    //    sheet path (where fetched.url is empty — see resolveHeaderMeta
+    //    for the SQLite-fallback + host-construction that fixes the
+    //    historic `节点: unknown` / `原始链接:` empty defect).
+    const headerMeta = this.resolveHeaderMeta(doc, fetched);
+    await this.writeLocalMarkdown(localMdPath, finalContent, headerMeta);
 
     // 9. Update local mapping
     await this.updateLocalMap(doc.objToken, localMdPath, doc.cloudModifiedTime, doc.objType);
@@ -451,7 +505,7 @@ export class SyncEngine {
   private async writeLocalMarkdown(
     localMdPath: string,
     content: string,
-    fetched: FetchedDocument
+    meta: HeaderMeta
   ): Promise<void> {
     // Create directory if it doesn't exist
     const dir = path.dirname(localMdPath);
@@ -470,8 +524,8 @@ export class SyncEngine {
       }
     }
 
-    // Generate HTML comment header
-    const header = this.generateHtmlHeader(fetched);
+    // Generate HTML comment header (YAML-in-comment new spec).
+    const header = this.generateHtmlHeader(meta);
 
     // Write file with header + content
     fs.writeFileSync(localMdPath, header + content, 'utf-8');
@@ -522,7 +576,28 @@ export class SyncEngine {
     }
 
     const currentDate = new Date().toISOString().split('T')[0];
-    const placeholderContent = `# 无权限文档：${doc.title}
+
+    // Header: reuse the canonical YAML-in-comment pipeline so placeholders
+    // carry the same obj_token / wiki_node_token / space_id / obj_type /
+    // original_link metadata as regular synced docs (规范 §5.3). The
+    // placeholder's FetchedDocument.url is intentionally empty —
+    // resolveHeaderMeta backfills original_link from SQLite (or constructs
+    // it from wiki_node_token + the configured feishu host). obj_type
+    // 'unknown' is omitted by generateHtmlHeader so IndexScanner falls back
+    // to its default 'docx' classification rather than persisting a fake
+    // type (规范 §5.3 / red line 7: 不伪造字段).
+    const placeholderFetched: FetchedDocument = {
+      content: '',
+      images: [],
+      attachments: [],
+      sheets: [],
+      url: '',
+      obj_token: doc.objToken,
+    };
+    const meta = this.resolveHeaderMeta(doc, placeholderFetched);
+    const header = this.generateHtmlHeader(meta);
+
+    const body = `# 无权限文档：${doc.title}
 
 > **权限限制**：此文档需要额外权限才能访问。请联系文档所有者或管理员获取访问权限。
 
@@ -542,17 +617,9 @@ export class SyncEngine {
 3. 系统将自动下载完整内容并替换此占位文件
 
 ---
-
-<!--
-来源: 飞书知识库（占位文件）
-状态: 无权限访问 (40403)
-原始链接: 需要在飞书中访问
-obj_token: ${doc.objToken}
-获取日期: ${currentDate}
--->
 `;
 
-    fs.writeFileSync(localMdPath, placeholderContent, 'utf-8');
+    fs.writeFileSync(localMdPath, header + body, 'utf-8');
     console.info(`[SyncEngine] Created placeholder file: ${localMdPath}`);
   }
 
@@ -673,20 +740,176 @@ obj_token: ${doc.objToken}
   }
 
   /**
-   * Generate HTML comment header
+   * Generate the YAML-in-comment HTML header (header_format = yaml_html).
+   *
+   * Emits the new-spec format that IndexScanner parses FIRST and most
+   * completely (parseYamlHtmlHeader + extractYamlFields). Replaces the
+   * legacy Chinese-key block (来源/节点/原始链接/obj_token/获取日期) which
+   * carried no wiki_node_token / space_id / obj_type and produced
+   * `节点: unknown` + empty `原始链接:` on the sheet path.
+   *
+   * Field emission rules:
+   *   - obj_token, fetch_date are always emitted (always available).
+   *   - obj_type emitted only when docx/sheet/slides (the concrete types
+   *     parseYamlHtmlHeader recognizes). 'unknown' is omitted so the
+   *     parser falls back to its default 'docx' classification rather
+   *     than persisting 'unknown'.
+   *   - wiki_node_token / space_id / original_link / last_synced_modify_time
+   *     are emitted only when non-null/non-empty (never fabricated).
+   *
+   * Output shape (matches 规范 §5.3 docx/sheet target samples):
+   *
+   *   <!--
+   *   feishu_sync:
+   *     obj_token: "..."
+   *     wiki_node_token: "..."
+   *     space_id: "..."
+   *     obj_type: "docx"
+   *     original_link: "https://..."
+   *     fetch_date: "2026-07-08T..."
+   *     last_synced_modify_time: "2026-07-08T..."
+   *   -->
    */
-  private generateHtmlHeader(fetched: FetchedDocument): string {
-    const currentDate = new Date().toISOString().split('T')[0];
+  private generateHtmlHeader(meta: HeaderMeta): string {
+    const lines: string[] = ['<!--', 'feishu_sync:'];
 
-    return `<!--
-来源: 飞书知识库
-节点: ${path.basename(fetched.url).split('/').pop() || 'unknown'}
-原始链接: ${fetched.url}
-obj_token: ${fetched.obj_token}
-获取日期: ${currentDate}
--->
+    // obj_token is always present (it is the SQLite PK + the document's
+    // identity). Without it IndexScanner.parseMetadata cannot index the
+    // file, so we always emit it.
+    lines.push(`  obj_token: ${this.yamlScalar(meta.objToken)}`);
 
-`;
+    if (meta.wikiNodeToken) {
+      lines.push(`  wiki_node_token: ${this.yamlScalar(meta.wikiNodeToken)}`);
+    }
+    if (meta.spaceId) {
+      lines.push(`  space_id: ${this.yamlScalar(meta.spaceId)}`);
+    }
+
+    // obj_type: emit only concrete recognized types. 'unknown' (e.g. a
+    // placeholder that slipped through) is omitted so the parser's
+    // default 'docx' classification (index-scanner.ts:208) takes effect.
+    if (meta.objType === 'docx' || meta.objType === 'sheet' || meta.objType === 'slides') {
+      lines.push(`  obj_type: ${this.yamlScalar(meta.objType)}`);
+    }
+
+    if (meta.originalLink) {
+      lines.push(`  original_link: ${this.yamlScalar(meta.originalLink)}`);
+    }
+
+    lines.push(`  fetch_date: ${this.yamlScalar(meta.fetchDate)}`);
+
+    // last_synced_modify_time comes from ChangedDocument.cloudModifiedTime
+    // (ChangeDetector.formatUnixSeconds → ISO8601). It may be '' for the
+    // 0/NULL branch; emit only when non-empty.
+    if (meta.lastSyncedModifyTime && meta.lastSyncedModifyTime.length > 0) {
+      lines.push(`  last_synced_modify_time: ${this.yamlScalar(meta.lastSyncedModifyTime)}`);
+    }
+
+    lines.push('-->');
+    // Trailing blank line separates the header from the document body,
+    // matching the original generateHtmlHeader contract.
+    return lines.join('\n') + '\n\n';
+  }
+
+  /**
+   * Wrap a scalar value in double quotes for the YAML-in-comment header.
+   *
+   * IndexScanner.extractYamlFields strips a single matching leading /
+   * trailing quote via `/^["']|["']$/g` (index-scanner.ts:564), so
+   * double-quoting every value is round-trip safe. Feishu tokens /
+   * URLs / ISO8601 timestamps never contain double quotes, so no
+   * escape sequence is needed.
+   */
+  private yamlScalar(value: string): string {
+    return `"${value}"`;
+  }
+
+  /**
+   * Resolve the metadata block for the YAML file header.
+   *
+   * This is the core of the sheet-header fix (规范 §5.4): the sheet
+   * path constructs FetchedDocument with `url: ''` because sheet content
+   * is synthesized from CSVs via LayoutReconstructor and never goes
+   * through `docs +fetch`. The legacy generateHtmlHeader then wrote
+   * `节点: unknown` / `原始链接:` empty. resolveHeaderMeta sources the
+   * wiki-layer fields from SQLite instead of fetched.url.
+   *
+   * Why SQLite is reliable here for BOTH added and modified docs:
+   *   ChangeDetector.upsertDocumentSeen (change-detector.ts:609-616)
+   *   runs for every cloud node during detect and persists
+   *   wiki_node_token (= node.node_token) + space_id BEFORE the sync
+   *   pipeline is dispatched. So by the time SyncEngine writes the .md,
+   *   getDocumentByObjToken returns a row carrying both fields even for
+   *   a brand-new added sheet.
+   *
+   * original_link precedence (no fabrication):
+   *   (1) fetched.url — docx path's authoritative feishu URL from
+   *       `docs +fetch`.
+   *   (2) SQLite documents.original_link — populated for previously
+   *       synced docs and by recomputeCloudMatch's best-effort
+   *       construction from wiki_node_token.
+   *   (3) Constructed as `https://{host}/wiki/{wiki_node_token}` where
+   *       host is derived from the first configured watchedRootUrl —
+   *       this branch is what fills the sheet gap when (1) and (2) are
+   *       both empty.
+   *
+   * If all three fail AND wikiNodeToken is null, originalLink stays
+   * null and generateHtmlHeader omits the line. obj_token is always
+   * present so the file remains indexable.
+   */
+  private resolveHeaderMeta(
+    doc: ChangedDocument,
+    fetched: FetchedDocument
+  ): HeaderMeta {
+    // getDocumentByObjToken is a synchronous SQLite lookup. For both
+    // added and modified docs a row exists at this point because
+    // ChangeDetector.upsertDocumentSeen wrote it during detect.
+    const record = this.localMapStore.getDocumentByObjToken(doc.objToken);
+
+    const wikiNodeToken = record?.wikiNodeToken ?? null;
+    const spaceId = record?.spaceId ?? null;
+
+    let originalLink: string | null = null;
+    if (fetched.url && fetched.url.trim().length > 0) {
+      originalLink = fetched.url.trim();
+    } else if (record?.originalLink && record.originalLink.trim().length > 0) {
+      originalLink = record.originalLink.trim();
+    } else if (wikiNodeToken) {
+      const host = this.extractFeishuHost();
+      if (host) {
+        originalLink = `https://${host}/wiki/${wikiNodeToken}`;
+      }
+    }
+
+    return {
+      objToken: doc.objToken,
+      objType: doc.objType,
+      wikiNodeToken,
+      spaceId,
+      originalLink,
+      fetchDate: new Date().toISOString(),
+      lastSyncedModifyTime: doc.cloudModifiedTime,
+    };
+  }
+
+  /**
+   * Extract the feishu wiki host (e.g. `qcnbafdrjx7n.feishu.cn`) from
+   * the first configured watchedRootUrl. Used to construct an
+   * original_link for sheets (whose fetched.url is empty) from
+   * wiki_node_token. Returns null when no URL is configured or the URL
+   * is unparseable; the caller then leaves original_link null rather
+   * than fabricating a host.
+   */
+  private extractFeishuHost(): string | null {
+    const urls: unknown = this.config?.watchedRootUrls;
+    if (!Array.isArray(urls) || urls.length === 0) return null;
+    const first = urls[0];
+    if (typeof first !== 'string' || first.length === 0) return null;
+    try {
+      return new URL(first).host;
+    } catch {
+      return null;
+    }
   }
 
   /**

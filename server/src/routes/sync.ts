@@ -52,14 +52,23 @@ syncRoutes.post('/api/sync', async (c) => {
   };
   const registry = new ContentBackendRegistry(channelConfig);
   const contentAdapter = new ContentAdapter(registry);
+  // contentAdapter 暂不注入 SyncEngine（LLM 屏蔽期，见下方 contentAdapter: undefined）。
+  // 保留构造以保证 LLM 代码路径可逆 + ContentAdapter/ContentBackendRegistry 的
+  // import 仍被引用（满足 tsc noUnusedLocals）。恢复 LLM 时删掉此行 + 把
+  // 下方 contentAdapter: undefined 改回 contentAdapter 即可。
+  void contentAdapter;
 
   // Create SyncEngine instance with M3 modules
+  // 暂时屏蔽 LLM：不注入 contentAdapter，sync-engine Step 7 条件
+  // (this.contentAdapter && options.enableLLM && localMdPath) 因 contentAdapter
+  // 为 undefined 永远 false，绝不调用 LLM。仅做云端原始内容→本地同步。
+  // 上方 ContentBackendRegistry/ContentAdapter 构造保留不动（删了影响测试、不可逆）。
   const syncEngine = new SyncEngine({
     larkCliClient,
     localMapStore,
     config,
     layoutReconstructor,
-    contentAdapter,
+    contentAdapter: undefined,
   });
 
   // Execute synchronization
