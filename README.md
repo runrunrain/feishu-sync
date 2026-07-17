@@ -71,14 +71,14 @@ cd ..
 工具依赖 lark-cli user 认证态，启动自动检测就绪状态：
 
 ```bash
-# 认证登录（首次使用需登录飞书账号）
-lark-cli auth login --scope=wiki:doc:readOnly,sheets:spreadsheet:readOnly
+# 认证登录（最小只读同步边界；scope 空格或逗号分隔）
+lark-cli auth login --scope="wiki:node:retrieve wiki:space:retrieve docs:document.content:read sheets:spreadsheet:read docx:document:readonly drive:drive.metadata:readonly docs:document.media:download slides:presentation:read offline_access"
 
-# 确认认证状态（需显示 user valid 且含 requiredScopes）
+# 确认认证状态（需显示 user ready + token valid）
 lark-cli auth status
 ```
 
-**认证就绪条件**：user valid + scope 覆盖 `wiki:doc:readOnly,sheets:spreadsheet:readOnly`
+**认证就绪条件**：user ready + 覆盖上表 9 个 scope（与 `ConfigManager` 默认 `requiredScopes` 一致）
 
 ### 配置 deepseek 与本地知识库
 
@@ -96,7 +96,17 @@ lark-cli auth status
   "knowledgeBaseRoot": "D:/WorkPace/Database/03-项目交付",
   "watchedRootUrls": ["https://feishu.cn/wiki/Wramw1XxRihIgnkCrhqcdEbRnHb"],
   "larkCliPath": "lark-cli",
-  "requiredScopes": ["wiki:doc:readOnly", "sheets:spreadsheet:readOnly"],
+  "requiredScopes": [
+    "wiki:node:retrieve",
+    "wiki:space:retrieve",
+    "docs:document.content:read",
+    "sheets:spreadsheet:read",
+    "docx:document:readonly",
+    "drive:drive.metadata:readonly",
+    "docs:document.media:download",
+    "slides:presentation:read",
+    "offline_access"
+  ],
   "enableAutoStart": true,
   "enableNotifications": true
 }

@@ -35,13 +35,17 @@ import type {
 import { getEnabledWatchedRootUrls, isLegacyLlmConfig } from '../types/index.js';
 
 const DEFAULT_CONFIG_PATH = path.join(os.homedir(), '.feishu-sync', 'config.json');
+/** Minimal user scopes for read-only wiki sync (must match lark-cli auth login). */
 const DEFAULT_REQUIRED_SCOPES = [
   'wiki:node:retrieve',
   'wiki:space:retrieve',
-  'docs:document:read',
+  'docs:document.content:read',
   'sheets:spreadsheet:read',
   'docx:document:readonly',
   'drive:drive.metadata:readonly',
+  'docs:document.media:download',
+  'slides:presentation:read',
+  'offline_access',
 ];
 
 /**

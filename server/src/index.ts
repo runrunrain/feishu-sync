@@ -98,6 +98,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
 
   console.info('[server] Initializing LarkCliClient');
   const defaultLarkCliConfig: LarkCliConfig = {
+    // Keep aligned with ConfigManager DEFAULT_REQUIRED_SCOPES (min sync boundary).
     requiredScopes: [
       'wiki:node:retrieve',
       'wiki:space:retrieve',
@@ -105,6 +106,9 @@ export async function buildServer(options: CreateServerOptions = {}) {
       'sheets:spreadsheet:read',
       'docx:document:readonly',
       'drive:drive.metadata:readonly',
+      'docs:document.media:download',
+      'slides:presentation:read',
+      'offline_access',
     ],
     timeout: 30000,
   };
