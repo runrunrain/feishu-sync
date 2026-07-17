@@ -77,7 +77,23 @@ export interface ChangedDocument {
   cloudModifiedTime: string;
   localSyncedTime: string | null;
   localMdPath: string | null;
+  wikiNodeToken?: string | null;
+  parentNodeToken?: string | null;
+  spaceId?: string | null;
+  watchedRootId?: string | null;
+  hasChild?: boolean;
+  observedObjEditTime?: number | null;
+  syncState?: SyncState;
 }
+
+export type SyncState =
+  | 'pending_added'
+  | 'pending_modified'
+  | 'synced'
+  | 'restricted'
+  | 'error'
+  | 'missing_candidate'
+  | 'deleted_confirmed';
 
 export interface SyncedDocument {
   objToken: string;
@@ -128,6 +144,9 @@ export interface ChangeDetectionResult {
   changedDocuments: ChangedDocument[];
   checkedAt: string;
   totalNodes: number;
+  traversalComplete?: boolean;
+  failedNodeTokens?: string[];
+  missingCandidates?: number;
 }
 
 export interface AuthStatus {

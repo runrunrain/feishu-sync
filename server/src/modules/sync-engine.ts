@@ -17,8 +17,6 @@
  * adaptation (M3) are optional injections.
  */
 
-import { execFile } from 'child_process';
-import { promisify } from 'util';
 import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -37,8 +35,6 @@ import {
   resolveSyncMode,
   writeOperationManifest,
 } from './operation-manifest.js';
-
-const execFileAsync = promisify(execFile);
 
 interface FetchedDocument {
   content: string;
@@ -101,16 +97,26 @@ interface SyncEngineDeps {
 }
 
 export class SyncEngine {
+  private larkCliClient: any;
   private localMapStore: any;
   private config: any;
   private layoutReconstructor?: any;
   private contentAdapter?: any;
 
   constructor(deps: SyncEngineDeps) {
+    this.larkCliClient = deps.larkCliClient;
     this.localMapStore = deps.localMapStore;
     this.config = deps.config;
     this.layoutReconstructor = deps.layoutReconstructor;
     this.contentAdapter = deps.contentAdapter;
+  }
+
+  /** All Feishu subprocess work is delegated to the injected client. */
+  private requireLarkCliClient(): any {
+    if (!this.larkCliClient) {
+      throw new Error('LarkCliClient 未注入：无法执行飞书读取或资源导出');
+    }
+    return this.larkCliClient;
   }
 
   /**
@@ -315,7 +321,7 @@ export class SyncEngine {
     if (isPlaceholder) {
       const localMdPath = doc.localMdPath || this.generateLocalPath(doc);
       await this.writePlaceholderFile(localMdPath, doc);
-      await this.updateLocalMapWithStatus(doc.objToken, localMdPath, doc.cloudModifiedTime, doc.objType, 'placeholder');
+      await this.updateLocalMapWithStatus(doc, localMdPath, 'placeholder');
       return {
         objToken: doc.objToken,
         title: doc.title,
@@ -464,7 +470,7 @@ export class SyncEngine {
     await this.writeLocalMarkdown(localMdPath, finalContent, headerMeta);
 
     // 9. Update local mapping
-    await this.updateLocalMap(doc.objToken, localMdPath, doc.cloudModifiedTime, doc.objType);
+    await this.updateLocalMap(doc, localMdPath);
 
     return {
       objToken: doc.objToken,
@@ -487,16 +493,7 @@ export class SyncEngine {
   ): Promise<FetchedDocument> {
     // Suppress unused parameter warning
     void objType;
-    const args = [
-      'docs',
-      '+fetch',
-      '--api-version', 'v2',
-      '--doc', objToken,
-      '--doc-format', 'markdown',
-      '--detail', 'simple',
-    ];
-
-    const result = await this.execLarkCli(args);
+    const result = await this.requireLarkCliClient().fetchDocumentMarkdown(objToken);
 
     return {
       content: result.data.document?.content || '',
@@ -625,34 +622,44 @@ export class SyncEngine {
    * Update local mapping in database
    */
   private async updateLocalMap(
-    objToken: string,
+    doc: ChangedDocument,
     localMdPath: string,
-    cloudModifiedTime: string,
-    objType: string
   ): Promise<void> {
-    await this.updateLocalMapWithStatus(objToken, localMdPath, cloudModifiedTime, objType, 'synced');
+    await this.updateLocalMapWithStatus(doc, localMdPath, 'synced');
   }
 
   /**
    * Update local mapping with custom status (e.g., 'placeholder')
    */
   private async updateLocalMapWithStatus(
-    objToken: string,
+    doc: ChangedDocument,
     localMdPath: string,
-    cloudModifiedTime: string,
-    objType: string,
     status: 'synced' | 'changed' | 'error' | 'placeholder'
   ): Promise<void> {
     this.localMapStore.upsertDocument({
-      objToken,
+      objToken: doc.objToken,
       wikiNodeToken: null, // Will be filled if available
-      objType, // Use actual objType from document
+      objType: doc.objType,
       title: path.basename(localMdPath, '.md'),
       localMdPath,
-      lastSyncedModifyTime: cloudModifiedTime,
+      lastSyncedModifyTime: doc.cloudModifiedTime,
       lastSyncedAt: new Date().toISOString(),
       status,
     });
+
+    // This is the only write path that advances the v5 synced baseline.
+    // P0 keeps apply closed until P3 wraps the surrounding file work in one
+    // atomic transaction; when that coordinator opens the gate, this call is
+    // made only after the staged file commit has succeeded.
+    if (status === 'synced' && typeof this.localMapStore.markDocumentSynced === 'function') {
+      this.localMapStore.markDocumentSynced({
+        objToken: doc.objToken,
+        syncedObjEditTime: doc.observedObjEditTime ?? null,
+        localMdPath,
+        lastSyncedModifyTime: doc.cloudModifiedTime,
+        lastSyncedAt: new Date().toISOString(),
+      });
+    }
   }
 
   /**
@@ -731,29 +738,6 @@ export class SyncEngine {
   }
 
   /**
-   * Execute lark-cli command
-   */
-  private async execLarkCli(args: string[]): Promise<any> {
-    const larkCliPath = this.config.larkCliPath || this.getDefaultLarkCliPath();
-    const timeout = 30000;
-
-    try {
-      const { stdout } = await execFileAsync(larkCliPath, args, {
-        timeout,
-        encoding: 'utf-8',
-        shell: process.platform === 'win32',
-      });
-
-      return this.parseJsonOutput(stdout);
-    } catch (error: any) {
-      if (error.killed && error.signal === 'SIGTERM') {
-        throw new Error('lark-cli 执行超时');
-      }
-      throw new Error(`lark-cli 执行失败：${error.stderr || error.message}`);
-    }
-  }
-
-  /**
    * Execute curl to download image
    */
   private async execCurl(filepath: string, url: string): Promise<void> {
@@ -770,62 +754,14 @@ export class SyncEngine {
    * Execute media-download command
    */
   private async execMediaDownload(filepath: string, token: string): Promise<void> {
-    const args = [
-      'docs',
-      '+media-download',
-      '--token', token,
-      '--output', filepath,
-    ];
-
-    await this.execLarkCli(args);
+    await this.requireLarkCliClient().downloadMedia(token, filepath);
   }
 
   /**
    * Execute media-preview command (fallback)
    */
   private async execMediaPreview(filepath: string, token: string): Promise<void> {
-    const args = [
-      'docs',
-      '+media-preview',
-      '--token', token,
-      '--output', filepath,
-    ];
-
-    await this.execLarkCli(args);
-  }
-
-  /**
-   * Parse JSON output from lark-cli
-   */
-  private parseJsonOutput(stdout: string): any {
-    // Remove BOM and ANSI codes
-    const cleaned = stdout
-      .replace(/^﻿/, '')
-      .replace(/\x1b\[[0-9;]*m/g, '')
-      .trim();
-
-    if (!cleaned.startsWith('{')) {
-      return { ok: true, data: { version: cleaned } };
-    }
-
-    // Extract JSON fragment
-    const firstBrace = cleaned.indexOf('{');
-    const lastBrace = cleaned.lastIndexOf('}');
-    if (firstBrace === -1 || lastBrace === -1 || firstBrace > lastBrace) {
-      throw new Error(`解析 lark-cli 输出失败：未找到有效 JSON 结构\n原始输出：${stdout}`);
-    }
-
-    const jsonStr = cleaned.substring(firstBrace, lastBrace + 1);
-
-    try {
-      const json = JSON.parse(jsonStr);
-      if ('ok' in json && json.ok === false) {
-        throw new Error(`lark-cli 返回错误：${json.msg || '未知错误'}`);
-      }
-      return 'ok' in json ? json : { ok: true, data: json };
-    } catch (error) {
-      throw new Error(`解析 lark-cli 输出失败：${error instanceof Error ? error.message : String(error)}\n原始输出：${stdout}`);
-    }
+    await this.requireLarkCliClient().previewMedia(token, filepath);
   }
 
   /**
@@ -1002,16 +938,6 @@ export class SyncEngine {
   }
 
   /**
-   * Get default lark-cli executable path
-   */
-  private getDefaultLarkCliPath(): string {
-    if (process.platform === 'win32') {
-      return 'lark-cli.cmd';
-    }
-    return 'lark-cli';
-  }
-
-  /**
    * Export spreadsheet sub-sheets to CSV files AND map each sub-sheet to
    * the sheet_sheets table (03 §3.5). Workbook-level obj_edit_time is
    * shared across all sub-sheets on the Feishu side, so per-sub-sheet
@@ -1046,12 +972,7 @@ export class SyncEngine {
 
     try {
       // 1. List all sub-sheets in the workbook
-      const workbookInfo = await this.execLarkCli([
-        'sheets',
-        '+workbook-info',
-        '--spreadsheet-token', sheetToken,
-        '--format', 'json',
-      ]);
+      const workbookInfo = await this.requireLarkCliClient().getWorkbookInfo(sheetToken);
 
       const sheetsList = (workbookInfo.data?.sheets || []) as Array<{
         sheet_id: string;
@@ -1075,20 +996,13 @@ export class SyncEngine {
           const cols = sheet.column_count ?? 20;
           const range = `A1:${colToLetter(cols)}${rows}`;
 
-          // --include-row-prefix=false 必须作为单个 arg 传入（带 `=`）。
-          // execFile + shell=true 下若拆成 `--include-row-prefix` + `false`
-          // 两个独立 arg，lark-cli 会把 `false` 当成 positional 参数报错
-          // "positional arguments are not supported"。
-          // --format json 取 data.annotated_csv 字段（纯 CSV 文本）。
-          const csvResult = await this.execLarkCli([
-            'sheets',
-            '+csv-get',
-            '--spreadsheet-token', sheetToken,
-            '--sheet-id', sheet.sheet_id,
-            '--range', range,
-            '--include-row-prefix=false',
-            '--format', 'json',
-          ]);
+          // LarkCliClient owns argument construction, rate limiting,
+          // timeout/error classification and NDJSON/JSON parsing.
+          const csvResult = await this.requireLarkCliClient().getSheetCsv({
+            spreadsheetToken: sheetToken,
+            sheetId: sheet.sheet_id,
+            range,
+          });
 
           // annotated_csv 是纯 CSV 字符串（含可能的 \r\n、UTF-8 BOM 等）
           const csvText = csvResult?.data?.annotated_csv ?? '';

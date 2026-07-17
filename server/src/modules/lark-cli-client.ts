@@ -19,10 +19,79 @@ import type { LarkCliNodeInfo, LarkCliConfig } from '../types/index.js';
 
 const execFileAsync = promisify(execFile);
 
+export type LarkCliErrorCode =
+  | 'auth'
+  | 'permission'
+  | 'rate_limited'
+  | 'timeout'
+  | 'parse'
+  | 'upstream';
+
+/** Structured error surfaced consistently by every lark-cli command path. */
+export class LarkCliError extends Error {
+  constructor(
+    message: string,
+    public readonly code: LarkCliErrorCode,
+    public readonly retryable: boolean,
+    public readonly upstreamCode?: string,
+  ) {
+    super(message);
+    this.name = 'LarkCliError';
+  }
+}
+
 export class LarkCliClient {
   private qpsLimiter: Map<string, number[]> = new Map();
 
   constructor(private config: LarkCliConfig) {}
+
+  /**
+   * Execute a command through the sole subprocess/timeout/parser/error path.
+   * Higher-level helpers below are intentionally thin wrappers so callers
+   * never duplicate lark-cli invocation policy.
+   */
+  async execute(args: string[], apiType: 'wiki' | 'docx' | 'sheets' = 'wiki'): Promise<any> {
+    await this.throttle(apiType);
+    return this.execLarkCli(args);
+  }
+
+  async fetchDocumentMarkdown(objToken: string): Promise<any> {
+    return this.execute([
+      'docs', '+fetch', '--api-version', 'v2', '--doc', objToken,
+      '--doc-format', 'markdown', '--detail', 'simple',
+    ], 'docx');
+  }
+
+  async downloadMedia(token: string, outputPath: string): Promise<void> {
+    await this.execute([
+      'docs', '+media-download', '--token', token, '--output', outputPath,
+    ], 'docx');
+  }
+
+  async previewMedia(token: string, outputPath: string): Promise<void> {
+    await this.execute([
+      'docs', '+media-preview', '--token', token, '--output', outputPath,
+    ], 'docx');
+  }
+
+  async getWorkbookInfo(spreadsheetToken: string): Promise<any> {
+    return this.execute([
+      'sheets', '+workbook-info', '--spreadsheet-token', spreadsheetToken,
+      '--format', 'json',
+    ], 'sheets');
+  }
+
+  async getSheetCsv(options: {
+    spreadsheetToken: string;
+    sheetId: string;
+    range: string;
+  }): Promise<any> {
+    return this.execute([
+      'sheets', '+csv-get', '--spreadsheet-token', options.spreadsheetToken,
+      '--sheet-id', options.sheetId, '--range', options.range,
+      '--include-row-prefix=false', '--format', 'json',
+    ], 'sheets');
+  }
 
   /**
    * Check if lark-cli is ready (version + authentication + scope validation)
@@ -69,14 +138,12 @@ export class LarkCliClient {
     parentNodeToken?: string;
     pageSize?: number;
   }): Promise<LarkCliNodeInfo[]> {
-    await this.throttle('wiki');
-
     const args = ['wiki', '+node-list', '--format', 'ndjson', '--page-all'];
     if (options.spaceId) args.push('--space-id', options.spaceId);
     if (options.parentNodeToken) args.push('--parent-node-token', options.parentNodeToken);
     if (options.pageSize) args.push('--page-size', String(options.pageSize));
 
-    const result = await this.execLarkCli(args);
+    const result = await this.execute(args, 'wiki');
 
     // ndjson format: returns { data: { has_more, nodes: [...] } } wrapped in ok: true
     // The nodes array is already in result.data.nodes
@@ -104,10 +171,8 @@ export class LarkCliClient {
         `getNode requires a non-empty string (URL or token); received: ${String(nodeTokenOrUrl)}`
       );
     }
-    await this.throttle('wiki');
-
     const args = ['wiki', '+node-get', '--node-token', nodeTokenOrUrl, '--format', 'json'];
-    const result = await this.execLarkCli(args);
+    const result = await this.execute(args, 'wiki');
 
     // obj_edit_time NaN defense (diagnosis §2.2 根因 D): lark-cli returns an
     // empty string or undefined for permission-restricted / missing fields.
@@ -145,7 +210,7 @@ export class LarkCliClient {
     if (options?.params) args.push('--params', JSON.stringify(options.params));
     if (options?.data) args.push('--data', JSON.stringify(options.data));
 
-    return this.execLarkCli(args);
+    return this.execute(args, 'wiki');
   }
 
   /**
@@ -164,30 +229,26 @@ export class LarkCliClient {
 
       // Detect authentication errors
       if (this.detectAuthError(stderr)) {
-        throw new Error('认证失效，请执行 lark-cli auth login');
+        throw new LarkCliError('认证失效，请执行 lark-cli auth login', 'auth', false);
       }
 
       return this.parseJsonOutput(stdout);
     } catch (error: any) {
-      // Classify errors
-      const errorStderr = error.stderr || '';
-      if (error.killed && error.signal === 'SIGTERM') {
-        throw new Error('lark-cli 执行超时');
+      if (error instanceof LarkCliError) throw error;
+      const errorStderr = typeof error?.stderr === 'string' ? error.stderr : '';
+      const rawMessage = `${errorStderr}\n${error?.message ?? ''}`.trim();
+      if (error?.killed && error?.signal === 'SIGTERM') {
+        throw new LarkCliError('lark-cli 执行超时', 'timeout', true);
       }
-      if (errorStderr?.includes?.('99991400')) {
-        throw new Error('QPS 限频，请稍后重试');
-      }
-      if (errorStderr?.includes?.('40403')) {
-        throw new Error('无权限访问该节点');
-      }
-      throw new Error(`lark-cli 执行失败：${errorStderr || error.message}`);
+      throw this.classifyError(rawMessage || '未知 lark-cli 错误');
     }
   }
 
   /**
    * Parse lark-cli JSON output with robust error handling
    * - Strips BOM, ANSI codes, and surrounding whitespace
-   * - Extracts JSON fragment from first { to last } (tolerates log lines)
+   * - Extracts complete JSON values from log-prefixed output
+   * - Merges multi-line NDJSON pages (not just the first/last brace span)
    * - Preserves original output in error message for debugging
    * - Handles both ok-result format (from api commands) and direct data format (from auth/wiki commands)
    */
@@ -198,37 +259,138 @@ export class LarkCliClient {
       .replace(/\x1b\[[0-9;]*m/g, '') // ANSI escape codes
       .trim();
 
-    // Handle non-JSON output (e.g., version command)
-    if (!cleaned.startsWith('{')) {
+    // Handle non-JSON output (e.g., version command). Log-prefixed JSON is
+    // handled below by extractJsonValues rather than being mistaken for text.
+    if (!cleaned.includes('{') && !cleaned.includes('[')) {
       return {
         ok: true,
         data: { version: cleaned },
       };
     }
 
-    // Extract JSON fragment (from first { to last })
-    const firstBrace = cleaned.indexOf('{');
-    const lastBrace = cleaned.lastIndexOf('}');
-    if (firstBrace === -1 || lastBrace === -1 || firstBrace > lastBrace) {
-      throw new Error(`解析 lark-cli 输出失败：未找到有效 JSON 结构\n原始输出：${stdout}`);
+    const values = this.extractJsonValues(cleaned);
+    if (values.length === 0) {
+      throw new LarkCliError('解析 lark-cli 输出失败：未找到有效 JSON 结构', 'parse', false);
     }
 
-    const jsonStr = cleaned.substring(firstBrace, lastBrace + 1);
-
-    try {
-      const json = JSON.parse(jsonStr);
-
-      // Handle api command responses with ok field
-      if ('ok' in json && json.ok === false) {
-        throw new Error(`lark-cli 返回错误：${json.msg || '未知错误'}`);
+    const parsed: any[] = [];
+    for (const value of values) {
+      try {
+        parsed.push(JSON.parse(value));
+      } catch {
+        // A log line may contain braces that are not JSON. Continue looking
+        // for valid complete values; fail only when none are valid.
       }
-
-      // For direct data responses (auth status, wiki nodes), return as-is
-      // Wrap in ok: true for consistency
-      return 'ok' in json ? json : { ok: true, data: json };
-    } catch (error) {
-      throw new Error(`解析 lark-cli 输出失败：${error instanceof Error ? error.message : String(error)}\n原始输出：${stdout}`);
     }
+    if (parsed.length === 0) {
+      throw new LarkCliError('解析 lark-cli 输出失败：JSON 格式无效', 'parse', false);
+    }
+
+    const normalized = parsed.map((value) => this.normalizeJsonResult(value));
+    if (normalized.length === 1) return normalized[0];
+
+    // NDJSON `--page-all` can emit a record per page. Preserve every array
+    // field (notably data.nodes) and keep the latest scalar metadata.
+    const mergedData: Record<string, unknown> = {};
+    for (const result of normalized) {
+      const data = result.data;
+      if (!data || typeof data !== 'object' || Array.isArray(data)) continue;
+      for (const [key, value] of Object.entries(data)) {
+        if (Array.isArray(value)) {
+          const prior = Array.isArray(mergedData[key]) ? mergedData[key] : [];
+          mergedData[key] = [...prior, ...value];
+        } else if (key === 'has_more' && typeof value === 'boolean') {
+          // Pagination state is a scalar from the latest page; OR-ing would
+          // incorrectly report true after a final page says false.
+          mergedData[key] = value;
+        } else {
+          mergedData[key] = value;
+        }
+      }
+    }
+    return { ok: true, data: mergedData };
+  }
+
+  private normalizeJsonResult(value: any): { ok: true; data: any } {
+    if (!value || typeof value !== 'object') {
+      throw new LarkCliError('lark-cli 返回了非对象 JSON', 'parse', false);
+    }
+    if (value.ok === false || (typeof value.code === 'number' && value.code !== 0)) {
+      const message = String(value.msg ?? value.message ?? value.error ?? 'lark-cli 返回错误');
+      const upstreamCode = value.code == null ? undefined : String(value.code);
+      throw this.classifyError(`${upstreamCode ?? ''} ${message}`.trim(), upstreamCode);
+    }
+    if (value.ok === true) return value;
+    // Some lark-cli commands emit `{ data: ... }` without an `ok` wrapper;
+    // normalize that shape without introducing the historic `data.data`
+    // nesting. Raw command payloads (e.g. `{ nodes: [...] }`) still become
+    // the data object directly.
+    if ('data' in value) return { ok: true, data: value.data };
+    return { ok: true, data: value };
+  }
+
+  /**
+   * Extract balanced JSON object/array values while respecting quoted braces.
+   * This safely handles ANSI-stripped logs before/after JSON and NDJSON pages.
+   */
+  private extractJsonValues(input: string): string[] {
+    const values: string[] = [];
+    let start = -1;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    let opening = '';
+
+    for (let index = 0; index < input.length; index += 1) {
+      const char = input[index];
+      if (start < 0) {
+        if (char === '{' || char === '[') {
+          start = index;
+          depth = 1;
+          opening = char;
+          inString = false;
+          escaped = false;
+        }
+        continue;
+      }
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (char === '\\') escaped = true;
+        else if (char === '"') inString = false;
+        continue;
+      }
+      if (char === '"') {
+        inString = true;
+      } else if (char === '{' || char === '[') {
+        depth += 1;
+      } else if (char === '}' || char === ']') {
+        depth -= 1;
+        if (depth === 0) {
+          const expectedEnd = opening === '{' ? '}' : ']';
+          if (char === expectedEnd) values.push(input.slice(start, index + 1));
+          start = -1;
+          opening = '';
+        }
+      }
+    }
+    return values;
+  }
+
+  private classifyError(message: string, upstreamCode?: string): LarkCliError {
+    const normalized = message.toLowerCase();
+    if (/(?:99991400|rate limit|qps|限频|限流)/i.test(message)) {
+      return new LarkCliError('QPS 限频，请稍后重试', 'rate_limited', true, upstreamCode ?? '99991400');
+    }
+    if (/(?:40403|131006|permission|forbidden|access denied|无权限)/i.test(message)) {
+      return new LarkCliError('无权限访问该节点', 'permission', false, upstreamCode);
+    }
+    if (/(?:not authenticated|token expired|unauthorized|认证)/i.test(normalized)) {
+      return new LarkCliError('认证失效，请执行 lark-cli auth login', 'auth', false, upstreamCode);
+    }
+    if (/(?:timeout|timed out|超时)/i.test(normalized)) {
+      return new LarkCliError('lark-cli 执行超时', 'timeout', true, upstreamCode);
+    }
+    return new LarkCliError(`lark-cli 执行失败：${message}`, 'upstream', true, upstreamCode);
   }
 
   /**

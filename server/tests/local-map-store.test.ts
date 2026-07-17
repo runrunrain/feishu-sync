@@ -93,4 +93,97 @@ describe('LocalMapStore runtime schema', () => {
     ]);
     store.close();
   });
+
+  it('keeps observed and synced baselines separate through pending and deletion-candidate transitions', () => {
+    const dbPath = createDatabasePath();
+    const store = new LocalMapStore(dbPath);
+    store.initialize();
+
+    const first = store.recordCloudObservation({
+      objToken: 'doc-1',
+      wikiNodeToken: 'node-1',
+      objType: 'docx',
+      title: '文档一',
+      spaceId: 'space-1',
+      parentNodeToken: 'root-1',
+      watchedRootId: 'root-1',
+      watchedRootUrl: 'https://tenant.feishu.cn/wiki/root-1',
+      observedObjEditTime: 100,
+      hasChild: false,
+      observationStatus: 'available',
+      lastSeenAt: '2026-07-17T00:00:00.000Z',
+    });
+    expect(first).toMatchObject({
+      syncState: 'pending_added',
+      observedObjEditTime: 100,
+      syncedObjEditTime: null,
+      watchedRootId: 'root-1',
+    });
+
+    // A repeated poll does not acknowledge the change.
+    const repeated = store.recordCloudObservation({
+      objToken: 'doc-1',
+      wikiNodeToken: 'node-1',
+      objType: 'docx',
+      title: '文档一',
+      spaceId: 'space-1',
+      parentNodeToken: 'root-1',
+      watchedRootId: 'root-1',
+      watchedRootUrl: 'https://tenant.feishu.cn/wiki/root-1',
+      observedObjEditTime: 100,
+      hasChild: false,
+      observationStatus: 'available',
+      lastSeenAt: '2026-07-17T00:01:00.000Z',
+    });
+    expect(repeated).toMatchObject({ syncState: 'pending_added', syncedObjEditTime: null });
+
+    store.markDocumentSynced({
+      objToken: 'doc-1',
+      syncedObjEditTime: 100,
+      localMdPath: '/tmp/doc-1.md',
+      localRelPath: '文档一.md',
+      lastSyncedAt: '2026-07-17T00:02:00.000Z',
+    });
+    expect(store.getDocumentByObjToken('doc-1')).toMatchObject({
+      syncState: 'synced',
+      observedObjEditTime: 100,
+      syncedObjEditTime: 100,
+    });
+
+    const changed = store.recordCloudObservation({
+      objToken: 'doc-1',
+      wikiNodeToken: 'node-1',
+      objType: 'docx',
+      title: '文档一（已更新）',
+      spaceId: 'space-1',
+      parentNodeToken: 'root-1',
+      watchedRootId: 'root-1',
+      watchedRootUrl: 'https://tenant.feishu.cn/wiki/root-1',
+      observedObjEditTime: 200,
+      hasChild: false,
+      observationStatus: 'available',
+      lastSeenAt: '2026-07-17T00:03:00.000Z',
+    });
+    expect(changed).toMatchObject({
+      syncState: 'pending_modified',
+      observedObjEditTime: 200,
+      syncedObjEditTime: 100,
+    });
+
+    store.recordCompleteTraversalMiss('doc-1', '2026-07-17T00:04:00.000Z');
+    expect(store.getDocumentByObjToken('doc-1')).toMatchObject({
+      syncState: 'pending_modified',
+      missingCompleteCount: 1,
+      cloudDeleted: 0,
+    });
+    store.recordCompleteTraversalMiss('doc-1', '2026-07-17T00:05:00.000Z');
+    expect(store.listMissingCandidates()).toHaveLength(1);
+    expect(store.confirmMissingCandidateDeletion('doc-1', '2026-07-17T00:06:00.000Z')).toBe(true);
+    expect(store.getDocumentByObjToken('doc-1')).toMatchObject({
+      syncState: 'deleted_confirmed',
+      cloudDeleted: 1,
+    });
+    expect(store.confirmMissingCandidateDeletion('doc-1', '2026-07-17T00:07:00.000Z')).toBe(false);
+    store.close();
+  });
 });

@@ -130,6 +130,47 @@ export type LLMConfig = LlmConfig;
 // Document Types
 // ============================================================================
 
+/**
+ * Runtime synchronization state introduced by the v5 schema.
+ *
+ * `status` remains on DocumentRecord as a legacy/UI compatibility field;
+ * this state is the authoritative answer to whether a cloud observation has
+ * been committed to the local knowledge base. In particular, detection may
+ * advance `observedObjEditTime`, but only a successful atomic sync commit may
+ * advance `syncedObjEditTime` and transition a document to `synced`.
+ */
+export type SyncState =
+  | 'pending_added'
+  | 'pending_modified'
+  | 'synced'
+  | 'restricted'
+  | 'error'
+  | 'missing_candidate'
+  | 'deleted_confirmed';
+
+/**
+ * A lossless cloud-side observation collected during wiki traversal.
+ *
+ * This is intentionally separate from DocumentRecord: it describes what the
+ * current traversal saw, whereas DocumentRecord describes the persisted local
+ * sync baseline. Keeping the two concepts distinct prevents a poll from
+ * accidentally acknowledging a change before its file transaction succeeds.
+ */
+export interface CloudNodeObservation {
+  objToken: string;
+  wikiNodeToken: string;
+  objType: 'docx' | 'sheet' | 'slides' | 'unknown';
+  title: string;
+  spaceId: string | null;
+  parentNodeToken: string | null;
+  watchedRootId: string;
+  watchedRootUrl: string | null;
+  observedObjEditTime: number | null;
+  hasChild: boolean;
+  /** Whether detail lookup succeeded, was permission-restricted, or failed transiently. */
+  observationStatus: 'available' | 'restricted' | 'unavailable';
+}
+
 export interface DocumentRecord {
   objToken: string;
   wikiNodeToken: string | null;
@@ -146,6 +187,11 @@ export interface DocumentRecord {
    */
   parentNodeToken?: string | null;
   spaceId?: string | null;
+  /**
+   * Legacy alias for the most recently observed cloud edit time. New code
+   * should use observedObjEditTime; keeping this field avoids breaking v2-v4
+   * readers while databases are upgraded in place.
+   */
   objEditTime?: number | null;
   cloudDeleted?: number; // 0 | 1
   lastSeenAt?: string | null;
@@ -177,6 +223,16 @@ export interface DocumentRecord {
    * local-only directory (no watchedRoot tracking) keep this NULL.
    */
   watchedRootUrl?: string | null;
+  /** v5 runtime-state fields. */
+  observedObjEditTime?: number | null;
+  syncedObjEditTime?: number | null;
+  syncState?: SyncState;
+  watchedRootId?: string | null;
+  /** Portable, POSIX-style path. P2 owns its full backfill. */
+  localRelPath?: string | null;
+  missingCompleteCount?: number;
+  lastSyncErrorCode?: string | null;
+  hasChild?: boolean;
 }
 
 /**
@@ -243,6 +299,14 @@ export interface ChangedDocument {
   cloudModifiedTime: string;
   localSyncedTime: string | null;
   localMdPath: string | null;
+  /** v5 observation identity, carried end-to-end without re-querying cloud. */
+  wikiNodeToken?: string | null;
+  parentNodeToken?: string | null;
+  spaceId?: string | null;
+  watchedRootId?: string | null;
+  hasChild?: boolean;
+  observedObjEditTime?: number | null;
+  syncState?: SyncState;
 }
 
 export interface SyncedDocument {
@@ -313,6 +377,10 @@ export interface ChangeDetectionResult {
   changedDocuments: ChangedDocument[];
   checkedAt: string;
   totalNodes: number;
+  /** A partial traversal is observational only and can never create deletion candidates. */
+  traversalComplete?: boolean;
+  failedNodeTokens?: string[];
+  missingCandidates?: number;
 }
 
 // ============================================================================

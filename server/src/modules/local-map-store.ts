@@ -13,7 +13,14 @@
 import Database from 'better-sqlite3';
 import path from 'node:path';
 import fs from 'node:fs';
-import type { DocumentRecord, SyncResult } from '../types/index.js';
+import type {
+  CloudNodeObservation,
+  DocumentRecord,
+  SyncResult,
+  SyncState,
+} from '../types/index.js';
+
+const V5_RUNTIME_SCHEMA_VERSION = 'v5_runtime_state';
 
 export class LocalMapStore {
   private db: Database.Database;
@@ -46,6 +53,8 @@ export class LocalMapStore {
    *     cloud_match
    *   - v0.2.0 structure-align Phase B (migration_v4): watched_root_url
    *     + local_dirs table
+   *   - v5 runtime state: observed/synced timestamps, state-machine fields,
+   *     watched-root identity and traversal-missing counter
    *
    * New fresh databases get all these columns via getCreateTablesDDL();
    * this method only matters for databases created by an older version.
@@ -89,6 +98,16 @@ export class LocalMapStore {
       { name: 'cloud_match', dml: "ALTER TABLE documents ADD COLUMN cloud_match TEXT NOT NULL DEFAULT 'unknown'" },
       // v0.2.0 structure-align Phase B (migration_v4)
       { name: 'watched_root_url', dml: 'ALTER TABLE documents ADD COLUMN watched_root_url TEXT' },
+      // v5 runtime state. `status` and `obj_edit_time` remain for legacy
+      // compatibility; these fields are now the authoritative sync model.
+      { name: 'observed_obj_edit_time', dml: 'ALTER TABLE documents ADD COLUMN observed_obj_edit_time INTEGER' },
+      { name: 'synced_obj_edit_time', dml: 'ALTER TABLE documents ADD COLUMN synced_obj_edit_time INTEGER' },
+      { name: 'sync_state', dml: "ALTER TABLE documents ADD COLUMN sync_state TEXT NOT NULL DEFAULT 'pending_added'" },
+      { name: 'watched_root_id', dml: 'ALTER TABLE documents ADD COLUMN watched_root_id TEXT' },
+      { name: 'local_rel_path', dml: 'ALTER TABLE documents ADD COLUMN local_rel_path TEXT' },
+      { name: 'missing_complete_count', dml: 'ALTER TABLE documents ADD COLUMN missing_complete_count INTEGER NOT NULL DEFAULT 0' },
+      { name: 'last_sync_error_code', dml: 'ALTER TABLE documents ADD COLUMN last_sync_error_code TEXT' },
+      { name: 'has_child', dml: 'ALTER TABLE documents ADD COLUMN has_child INTEGER NOT NULL DEFAULT 0' },
     ];
 
     const pending = additive.filter((c) => !colNames.has(c.name));
@@ -142,7 +161,12 @@ export class LocalMapStore {
       CREATE INDEX IF NOT EXISTS idx_documents_cloud_match ON documents(cloud_match);
       CREATE INDEX IF NOT EXISTS idx_documents_original_link ON documents(original_link);
       CREATE INDEX IF NOT EXISTS idx_documents_watched_root ON documents(watched_root_url);
+      CREATE INDEX IF NOT EXISTS idx_documents_sync_state ON documents(sync_state);
+      CREATE INDEX IF NOT EXISTS idx_documents_watched_root_id ON documents(watched_root_id);
+      CREATE INDEX IF NOT EXISTS idx_documents_missing_complete ON documents(missing_complete_count);
     `);
+
+    this.applyV5RuntimeStateBackfill();
 
     // v0.2.0 structure-align Phase B: local_dirs table.
     // CREATE TABLE IF NOT EXISTS is idempotent, safe to run on every boot.
@@ -170,6 +194,113 @@ export class LocalMapStore {
   }
 
   /**
+   * One-time v5 data migration. The schema changes above are additive, but
+   * existing rows still need a conservative state interpretation. We only
+   * trust a legacy `synced` row when its local file exists at migration time;
+   * otherwise it becomes pending so a later dry-run can review it instead of
+   * silently acknowledging an unverifiable baseline.
+   *
+   * Historic `cloud_deleted=1` is deliberately demoted to
+   * `missing_candidate` and unhidden. Older detectors could mark deletion
+   * after partial traversal, so there is no reliable proof that such a row
+   * was manually confirmed. This migration chooses recoverability over an
+   * irreversible hidden/deleted interpretation.
+   */
+  private applyV5RuntimeStateBackfill(): void {
+    const existing = this.db
+      .prepare('SELECT version FROM schema_migrations WHERE version = ?')
+      .get(V5_RUNTIME_SCHEMA_VERSION) as { version?: string } | undefined;
+    if (existing?.version) return;
+
+    const rows = this.db.prepare(`
+      SELECT
+        obj_token,
+        status,
+        cloud_match,
+        cloud_deleted,
+        local_md_path,
+        obj_edit_time,
+        observed_obj_edit_time,
+        watched_root_url,
+        watched_root_id
+      FROM documents
+    `).all() as Array<{
+      obj_token: string;
+      status: string;
+      cloud_match: string | null;
+      cloud_deleted: number | null;
+      local_md_path: string | null;
+      obj_edit_time: number | null;
+      observed_obj_edit_time: number | null;
+      watched_root_url: string | null;
+      watched_root_id: string | null;
+    }>;
+
+    const update = this.db.prepare(`
+      UPDATE documents
+      SET
+        observed_obj_edit_time = ?,
+        synced_obj_edit_time = ?,
+        sync_state = ?,
+        watched_root_id = ?,
+        missing_complete_count = ?,
+        cloud_deleted = ?,
+        updated_at = datetime('now')
+      WHERE obj_token = ?
+    `);
+    const recordMigration = this.db.prepare(
+      'INSERT OR IGNORE INTO schema_migrations(version) VALUES (?)',
+    );
+
+    const tx = this.db.transaction(() => {
+      for (const row of rows) {
+        const observed = row.observed_obj_edit_time ?? row.obj_edit_time ?? null;
+        const localPath = row.local_md_path?.trim() ?? '';
+        // `local_md_path` in the legacy schema was an absolute-path field.
+        // A relative value has no trustworthy base after a database is moved,
+        // so never let the process working directory accidentally prove a
+        // synced baseline during migration.
+        const localFileExists = path.isAbsolute(localPath) && fs.existsSync(localPath);
+        const wasLegacyDelete = (row.cloud_deleted ?? 0) === 1;
+
+        let state: SyncState;
+        let synced: number | null = null;
+        let missingCount = 0;
+        let cloudDeleted = 0;
+
+        if (wasLegacyDelete) {
+          state = 'missing_candidate';
+          missingCount = 2;
+        } else if (row.status === 'error') {
+          state = 'error';
+        } else if (row.status === 'placeholder' && row.cloud_match === 'restricted') {
+          state = 'restricted';
+        } else if (row.status === 'synced' && localFileExists) {
+          state = 'synced';
+          synced = observed;
+        } else if (row.status === 'changed' || (row.status === 'synced' && localPath.length > 0)) {
+          state = 'pending_modified';
+        } else {
+          state = 'pending_added';
+        }
+
+        update.run(
+          observed,
+          synced,
+          state,
+          row.watched_root_id ?? row.watched_root_url ?? null,
+          missingCount,
+          cloudDeleted,
+          row.obj_token,
+        );
+      }
+      recordMigration.run(V5_RUNTIME_SCHEMA_VERSION);
+    });
+    tx();
+    console.info(`[LocalMapStore] v5 runtime-state migration complete (${rows.length} rows evaluated)`);
+  }
+
+  /**
    * Upsert a document record.
    *
    * v0.2.0 mapping-expansion fields (parent_node_token, space_id,
@@ -194,8 +325,9 @@ export class LocalMapStore {
         last_synced_modify_time, last_synced_at, status,
         parent_node_token, space_id, obj_edit_time,
         cloud_deleted, last_seen_at, local_sort_order,
-        original_link, cloud_match, watched_root_url
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        original_link, cloud_match, watched_root_url,
+        observed_obj_edit_time, watched_root_id, local_rel_path, has_child
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 0))
       ON CONFLICT(obj_token) DO UPDATE SET
         wiki_node_token = COALESCE(excluded.wiki_node_token, documents.wiki_node_token),
         obj_type = COALESCE(excluded.obj_type, documents.obj_type),
@@ -207,12 +339,15 @@ export class LocalMapStore {
         parent_node_token = COALESCE(excluded.parent_node_token, documents.parent_node_token),
         space_id = COALESCE(excluded.space_id, documents.space_id),
         obj_edit_time = COALESCE(excluded.obj_edit_time, documents.obj_edit_time),
-        cloud_deleted = COALESCE(excluded.cloud_deleted, documents.cloud_deleted),
+        observed_obj_edit_time = COALESCE(excluded.observed_obj_edit_time, documents.observed_obj_edit_time),
+        cloud_deleted = documents.cloud_deleted,
         last_seen_at = COALESCE(excluded.last_seen_at, documents.last_seen_at),
         local_sort_order = documents.local_sort_order,
         original_link = COALESCE(excluded.original_link, documents.original_link),
         cloud_match = COALESCE(excluded.cloud_match, documents.cloud_match),
         watched_root_url = COALESCE(excluded.watched_root_url, documents.watched_root_url),
+        watched_root_id = COALESCE(excluded.watched_root_id, documents.watched_root_id),
+        local_rel_path = COALESCE(excluded.local_rel_path, documents.local_rel_path),
         updated_at = datetime('now')
     `);
 
@@ -239,6 +374,10 @@ export class LocalMapStore {
       // value to synced/restricted based on the row's title/obj_token.
       record.cloudMatch ?? 'unknown',
       record.watchedRootUrl ?? null,
+      record.observedObjEditTime ?? record.objEditTime ?? null,
+      record.watchedRootId ?? null,
+      record.localRelPath ?? null,
+      record.hasChild == null ? null : record.hasChild ? 1 : 0,
     );
   }
 
@@ -294,13 +433,77 @@ export class LocalMapStore {
   // -------------------------------------------------------------------------
 
   /**
-   * Record that a node was seen during cloud traversal, refreshing its
-   * parent / space / edit-time / last_seen_at metadata without disturbing
-   * status or local_md_path (which are owned by the sync flow).
+   * Persist one traversal observation without advancing the synced baseline.
    *
-   * Used by ChangeDetector.compareWithLocalRecords (see 03 §3.3.1).
-   *
-   * local_sort_order is never touched here (user-owned).
+   * This is the v5 replacement for `upsertDocumentSeen`. It writes the full
+   * cloud identity (including title/type/root/parent/hasChild) and only ever
+   * changes `observed_obj_edit_time`. The transition function preserves an
+   * existing pending/error state across polls, so ten identical detections
+   * cannot make a pending change disappear.
+   */
+  recordCloudObservation(observation: CloudNodeObservation & { lastSeenAt: string }): DocumentRecord {
+    const current = this.getDocumentByObjToken(observation.objToken);
+    const nextState = this.nextStateForObservation(current, observation);
+    const legacyStatus = this.legacyStatusForSyncState(nextState);
+
+    const stmt = this.getStatement(`
+      INSERT INTO documents (
+        obj_token, wiki_node_token, obj_type, title, local_md_path,
+        last_synced_modify_time, last_synced_at, status,
+        parent_node_token, space_id, obj_edit_time,
+        cloud_deleted, last_seen_at, observed_obj_edit_time,
+        sync_state, watched_root_id, watched_root_url,
+        missing_complete_count, last_sync_error_code, has_child
+      ) VALUES (?, ?, ?, ?, '', '', '', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 0, NULL, ?)
+      ON CONFLICT(obj_token) DO UPDATE SET
+        wiki_node_token = COALESCE(excluded.wiki_node_token, documents.wiki_node_token),
+        obj_type = COALESCE(excluded.obj_type, documents.obj_type),
+        title = CASE WHEN excluded.title <> '' THEN excluded.title ELSE documents.title END,
+        parent_node_token = COALESCE(excluded.parent_node_token, documents.parent_node_token),
+        space_id = COALESCE(excluded.space_id, documents.space_id),
+        obj_edit_time = COALESCE(excluded.obj_edit_time, documents.obj_edit_time),
+        observed_obj_edit_time = COALESCE(excluded.observed_obj_edit_time, documents.observed_obj_edit_time),
+        sync_state = excluded.sync_state,
+        status = excluded.status,
+        watched_root_id = COALESCE(excluded.watched_root_id, documents.watched_root_id),
+        watched_root_url = COALESCE(excluded.watched_root_url, documents.watched_root_url),
+        has_child = excluded.has_child,
+        last_seen_at = excluded.last_seen_at,
+        missing_complete_count = 0,
+        cloud_deleted = 0,
+        last_sync_error_code = CASE
+          WHEN excluded.sync_state = 'error' THEN documents.last_sync_error_code
+          ELSE NULL
+        END,
+        updated_at = datetime('now')
+    `);
+
+    const observed = observation.observedObjEditTime ?? null;
+    stmt.run(
+      observation.objToken,
+      observation.wikiNodeToken || null,
+      observation.objType,
+      observation.title ?? '',
+      legacyStatus,
+      observation.parentNodeToken ?? null,
+      observation.spaceId ?? null,
+      observed,
+      observation.lastSeenAt,
+      observed,
+      nextState,
+      observation.watchedRootId || null,
+      observation.watchedRootUrl ?? null,
+      observation.hasChild ? 1 : 0,
+    );
+
+    // The row was inserted/updated in the same synchronous connection, so a
+    // follow-up lookup is stable and gives callers the exact resulting state.
+    return this.getDocumentByObjToken(observation.objToken)!;
+  }
+
+  /**
+   * Compatibility shim for v2-v4 callers. New code must call
+   * recordCloudObservation so it cannot lose title/type/root metadata.
    */
   upsertDocumentSeen(input: {
     objToken: string;
@@ -310,49 +513,135 @@ export class LocalMapStore {
     objEditTime?: number | null;
     lastSeenAt: string;
   }): void {
-    // v0.2.0 detect-traverse-fix: when a node reappears in cloud traversal
-    // after a previous soft-delete (cloud_deleted=1), the row must be
-    // restored to cloud_deleted=0 so the UI stops surfacing it as trash.
-    // The previous ON CONFLICT clause omitted cloud_deleted from the
-    // UPDATE set, which prevented automatic revival — detect on
-    // watchedRoot A then detect on watchedRoot B would leave B's nodes
-    // permanently flagged as deleted even after they reappear.
-    const stmt = this.getStatement(`
-      INSERT INTO documents (
-        obj_token, wiki_node_token, obj_type, title, local_md_path,
-        last_synced_modify_time, last_synced_at, status,
-        parent_node_token, space_id, obj_edit_time, last_seen_at
-      ) VALUES (?, ?, 'unknown', '', '', '', ?, 'placeholder', ?, ?, ?, ?)
-      ON CONFLICT(obj_token) DO UPDATE SET
-        wiki_node_token = COALESCE(excluded.wiki_node_token, documents.wiki_node_token),
-        parent_node_token = COALESCE(excluded.parent_node_token, documents.parent_node_token),
-        space_id = COALESCE(excluded.space_id, documents.space_id),
-        obj_edit_time = COALESCE(excluded.obj_edit_time, documents.obj_edit_time),
-        last_seen_at = excluded.last_seen_at,
-        cloud_deleted = 0,
-        updated_at = datetime('now')
-    `);
-
-    stmt.run(
-      input.objToken,
-      input.wikiNodeToken ?? null,
-      input.lastSeenAt,
-      input.parentNodeToken ?? null,
-      input.spaceId ?? null,
-      input.objEditTime ?? null,
-      input.lastSeenAt,
-    );
+    this.recordCloudObservation({
+      objToken: input.objToken,
+      wikiNodeToken: input.wikiNodeToken ?? '',
+      objType: 'unknown',
+      title: '',
+      spaceId: input.spaceId ?? null,
+      parentNodeToken: input.parentNodeToken ?? null,
+      watchedRootId: '',
+      watchedRootUrl: null,
+      observedObjEditTime: input.objEditTime ?? null,
+      hasChild: false,
+      observationStatus: 'unavailable',
+      lastSeenAt: input.lastSeenAt,
+    });
   }
 
   /**
-   * Mark a document as cloud-deleted (soft delete). The local .md is left
-   * in place; the UI surfaces these rows for user confirmation before
-   * physical cleanup.
+   * Commit the local sync baseline after the file transaction has succeeded.
+   * P3's atomic coordinator owns the call site; keeping this operation
+   * separate is what prevents detection from acknowledging unsaved content.
+   */
+  markDocumentSynced(input: {
+    objToken: string;
+    syncedObjEditTime: number | null;
+    localMdPath?: string | null;
+    localRelPath?: string | null;
+    lastSyncedModifyTime?: string | null;
+    lastSyncedAt?: string;
+  }): void {
+    const stmt = this.getStatement(`
+      UPDATE documents
+      SET
+        synced_obj_edit_time = ?,
+        sync_state = 'synced',
+        status = 'synced',
+        local_md_path = COALESCE(?, local_md_path),
+        local_rel_path = COALESCE(?, local_rel_path),
+        last_synced_modify_time = COALESCE(?, last_synced_modify_time),
+        last_synced_at = COALESCE(?, last_synced_at),
+        missing_complete_count = 0,
+        cloud_deleted = 0,
+        last_sync_error_code = NULL,
+        updated_at = datetime('now')
+      WHERE obj_token = ?
+    `);
+    stmt.run(
+      input.syncedObjEditTime,
+      input.localMdPath ?? null,
+      input.localRelPath ?? null,
+      input.lastSyncedModifyTime ?? null,
+      input.lastSyncedAt ?? new Date().toISOString(),
+      input.objToken,
+    );
+  }
+
+  /** Mark a failed write while preserving the last known synced baseline. */
+  markDocumentSyncError(objToken: string, errorCode: string): void {
+    const stmt = this.getStatement(`
+      UPDATE documents
+      SET sync_state = 'error', status = 'error', last_sync_error_code = ?,
+          updated_at = datetime('now')
+      WHERE obj_token = ?
+    `);
+    stmt.run(errorCode, objToken);
+  }
+
+  /**
+   * Record a single absence after a COMPLETE traversal. The first complete
+   * miss is intentionally observational; only the second becomes a deletion
+   * candidate. Nothing here performs a delete or hides the local document.
+   */
+  recordCompleteTraversalMiss(objToken: string, timestamp: string): DocumentRecord | null {
+    const current = this.getDocumentByObjToken(objToken);
+    if (!current) return null;
+    const state = current.syncState ?? this.legacyStateFromRecord(current);
+    if (
+      state === 'pending_added' ||
+      state === 'restricted' ||
+      state === 'deleted_confirmed'
+    ) {
+      return current;
+    }
+
+    const nextCount = (current.missingCompleteCount ?? 0) + 1;
+    const nextState: SyncState = nextCount >= 2 ? 'missing_candidate' : state;
+    const stmt = this.getStatement(`
+      UPDATE documents
+      SET missing_complete_count = ?, sync_state = ?, status = ?,
+          last_seen_at = ?, updated_at = datetime('now')
+      WHERE obj_token = ?
+    `);
+    stmt.run(nextCount, nextState, this.legacyStatusForSyncState(nextState), timestamp, objToken);
+    return this.getDocumentByObjToken(objToken);
+  }
+
+  listMissingCandidates(): DocumentRecord[] {
+    const rows = this.getStatement(`
+      SELECT * FROM documents
+      WHERE sync_state = 'missing_candidate'
+      ORDER BY last_seen_at ASC, title ASC
+    `).all() as any[];
+    return rows.map((row) => this.mapRowToDocumentRecord(row));
+  }
+
+  /**
+   * Finalize a deletion candidate only after an explicit user/API confirmation.
+   * Returns false when the record is not currently a candidate, making the
+   * transition idempotent and preventing a stale UI from deleting a revived
+   * document.
+   */
+  confirmMissingCandidateDeletion(objToken: string, timestamp: string): boolean {
+    const result = this.getStatement(`
+      UPDATE documents
+      SET sync_state = 'deleted_confirmed', cloud_deleted = 1,
+          last_seen_at = ?, updated_at = datetime('now')
+      WHERE obj_token = ? AND sync_state = 'missing_candidate'
+    `).run(timestamp, objToken);
+    return result.changes === 1;
+  }
+
+  /**
+   * Legacy/manual soft-delete helper. Traversal code must use
+   * recordCompleteTraversalMiss + confirmMissingCandidateDeletion instead.
    */
   markCloudDeleted(objToken: string, timestamp: string): void {
     const stmt = this.getStatement(`
       UPDATE documents
-      SET cloud_deleted = 1, last_seen_at = ?, updated_at = datetime('now')
+      SET cloud_deleted = 1, sync_state = 'deleted_confirmed',
+          status = 'changed', last_seen_at = ?, updated_at = datetime('now')
       WHERE obj_token = ?
     `);
     stmt.run(timestamp, objToken);
@@ -367,7 +656,12 @@ export class LocalMapStore {
   restoreCloudDeleted(objToken: string): void {
     const stmt = this.getStatement(`
       UPDATE documents
-      SET cloud_deleted = 0, updated_at = datetime('now')
+      SET cloud_deleted = 0,
+          sync_state = CASE
+            WHEN sync_state = 'deleted_confirmed' THEN 'missing_candidate'
+            ELSE sync_state
+          END,
+          updated_at = datetime('now')
       WHERE obj_token = ?
     `);
     stmt.run(objToken);
@@ -382,7 +676,8 @@ export class LocalMapStore {
    */
   purgeCloudDeleted(objToken: string): void {
     const stmt = this.getStatement(`
-      DELETE FROM documents WHERE obj_token = ?
+      DELETE FROM documents
+      WHERE obj_token = ? AND sync_state = 'deleted_confirmed'
     `);
     stmt.run(objToken);
   }
@@ -527,6 +822,88 @@ export class LocalMapStore {
     return this.statements.get(sql)!;
   }
 
+  /** Map v5 state to the legacy constrained status column. */
+  private legacyStatusForSyncState(state: SyncState): DocumentRecord['status'] {
+    switch (state) {
+      case 'synced':
+        return 'synced';
+      case 'restricted':
+        return 'placeholder';
+      case 'error':
+        return 'error';
+      case 'pending_added':
+      case 'pending_modified':
+      case 'missing_candidate':
+      case 'deleted_confirmed':
+        return 'changed';
+    }
+  }
+
+  /** Conservative interpretation used only when reading a pre-v5-like row. */
+  private legacyStateFromRecord(record: DocumentRecord): SyncState {
+    if (record.cloudDeleted === 1) return 'missing_candidate';
+    if (record.status === 'error') return 'error';
+    if (record.status === 'placeholder') {
+      return record.cloudMatch === 'restricted' ? 'restricted' : 'pending_added';
+    }
+    if (record.status === 'changed') return 'pending_modified';
+    return 'synced';
+  }
+
+  /**
+   * State transition for an observation. It deliberately never changes
+   * syncedObjEditTime; that field belongs to markDocumentSynced only.
+   */
+  private nextStateForObservation(
+    current: DocumentRecord | null,
+    observation: CloudNodeObservation,
+  ): SyncState {
+    if (!current) {
+      return observation.observationStatus === 'restricted'
+        ? 'restricted'
+        : 'pending_added';
+    }
+
+    const currentState = current.syncState ?? this.legacyStateFromRecord(current);
+    if (observation.observationStatus === 'restricted') {
+      return 'restricted';
+    }
+
+    // A transient detail failure still refreshes visible hierarchy metadata,
+    // but it must not acknowledge, downgrade or fabricate a sync result.
+    if (observation.observationStatus === 'unavailable') {
+      return currentState;
+    }
+
+    if (currentState === 'pending_added' || currentState === 'pending_modified' || currentState === 'error') {
+      return currentState;
+    }
+
+    const observed = observation.observedObjEditTime;
+    const synced = current.syncedObjEditTime ?? null;
+    const hasLocalContent = current.localMdPath.trim().length > 0;
+
+    if (currentState === 'restricted') {
+      if (!hasLocalContent) return 'pending_added';
+      if (observed == null || synced == null || observed > synced) return 'pending_modified';
+      return 'synced';
+    }
+
+    if (currentState === 'missing_candidate' || currentState === 'deleted_confirmed') {
+      if (!hasLocalContent) return 'pending_added';
+      if (observed == null || synced == null || observed > synced) return 'pending_modified';
+      return 'synced';
+    }
+
+    // synced state: a null baseline is intentionally not treated as equal.
+    // The legacy migration only assigns a baseline when it verified the file,
+    // so a missing baseline needs a conservative pending review.
+    if (synced == null || (observed != null && observed > synced)) {
+      return hasLocalContent ? 'pending_modified' : 'pending_added';
+    }
+    return 'synced';
+  }
+
   /**
    * Map a database row to DocumentRecord.
    * v0.2.0 columns are read defensively; if a migration was rolled back
@@ -545,13 +922,32 @@ export class LocalMapStore {
       status: row.status,
       parentNodeToken: row.parent_node_token ?? null,
       spaceId: row.space_id ?? null,
-      objEditTime: row.obj_edit_time ?? null,
+      objEditTime: row.observed_obj_edit_time ?? row.obj_edit_time ?? null,
       cloudDeleted: row.cloud_deleted ?? 0,
       lastSeenAt: row.last_seen_at ?? null,
       localSortOrder: row.local_sort_order ?? null,
       originalLink: row.original_link ?? null,
       cloudMatch: row.cloud_match ?? 'unknown',
       watchedRootUrl: row.watched_root_url ?? null,
+      observedObjEditTime: row.observed_obj_edit_time ?? row.obj_edit_time ?? null,
+      syncedObjEditTime: row.synced_obj_edit_time ?? null,
+      syncState: row.sync_state ?? this.legacyStateFromRecord({
+        objToken: row.obj_token,
+        wikiNodeToken: row.wiki_node_token ?? null,
+        objType: row.obj_type,
+        title: row.title,
+        localMdPath: row.local_md_path,
+        lastSyncedModifyTime: row.last_synced_modify_time,
+        lastSyncedAt: row.last_synced_at,
+        status: row.status,
+        cloudDeleted: row.cloud_deleted ?? 0,
+        cloudMatch: row.cloud_match ?? 'unknown',
+      }),
+      watchedRootId: row.watched_root_id ?? null,
+      localRelPath: row.local_rel_path ?? null,
+      missingCompleteCount: row.missing_complete_count ?? 0,
+      lastSyncErrorCode: row.last_sync_error_code ?? null,
+      hasChild: (row.has_child ?? 0) === 1,
     };
   }
 
@@ -923,7 +1319,18 @@ export class LocalMapStore {
         original_link TEXT,
         cloud_match TEXT NOT NULL DEFAULT 'unknown',
         -- v0.2.0 structure-align Phase B (same pattern)
-        watched_root_url TEXT
+        watched_root_url TEXT,
+        -- v5 runtime state. The legacy status/obj_edit_time fields above
+        -- remain readable during the staged migration, but new detection
+        -- logic treats these columns as authoritative.
+        observed_obj_edit_time INTEGER,
+        synced_obj_edit_time INTEGER,
+        sync_state TEXT NOT NULL DEFAULT 'pending_added',
+        watched_root_id TEXT,
+        local_rel_path TEXT,
+        missing_complete_count INTEGER NOT NULL DEFAULT 0,
+        last_sync_error_code TEXT,
+        has_child INTEGER NOT NULL DEFAULT 0
       );
 
       -- v0.1.0 indexes (columns always exist)

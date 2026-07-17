@@ -73,6 +73,20 @@ function getSnapshotService(c: any): SnapshotService {
   return c.__snapshotService as SnapshotService;
 }
 
+/** The deletion-candidate endpoints only need the state store. */
+function getLocalMapStore(c: any): {
+  listMissingCandidates: () => unknown[];
+  confirmMissingCandidateDeletion: (objToken: string, confirmedAt: string) => boolean;
+} {
+  const localMapStore = c.localMapStore;
+  if (!localMapStore
+    || typeof localMapStore.listMissingCandidates !== 'function'
+    || typeof localMapStore.confirmMissingCandidateDeletion !== 'function') {
+    throw new Error('[mapping] localMapStore is not injected');
+  }
+  return localMapStore;
+}
+
 // ---------------------------------------------------------------------------
 // GET /api/mapping/diff  (P2-T5, R3.6-AC1)
 // ---------------------------------------------------------------------------
@@ -98,6 +112,77 @@ mappingRoutes.get('/api/mapping/diff', async (c) => {
     return c.json(
       {
         error: 'diff_failed',
+        message: error instanceof Error ? error.message : String(error),
+      },
+      500,
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Missing/deletion candidates (v5 state model)
+// ---------------------------------------------------------------------------
+//
+// Traversal itself never soft-deletes a row. After two complete misses it
+// marks a record as `missing_candidate`; this small API makes the candidate
+// visible to a future UI and requires a literal confirmation before it can
+// move into the existing trash/cleanup flow.
+
+mappingRoutes.get('/api/mapping/missing-candidates', (c) => {
+  try {
+    const localMapStore = getLocalMapStore(c);
+    return c.json({ candidates: localMapStore.listMissingCandidates() });
+  } catch (error) {
+    console.error('[mapping] list missing candidates failed:', error);
+    return c.json(
+      {
+        error: 'missing_candidates_failed',
+        message: error instanceof Error ? error.message : String(error),
+      },
+      500,
+    );
+  }
+});
+
+mappingRoutes.post('/api/mapping/missing-candidates/:objToken/confirm', async (c) => {
+  let body: { confirmation?: unknown };
+  try {
+    body = await c.req.json() as { confirmation?: unknown };
+  } catch {
+    return c.json({ error: 'invalid_json' }, 400);
+  }
+  if (body?.confirmation !== 'DELETE') {
+    return c.json(
+      {
+        error: 'confirmation_required',
+        message: '请在请求体中提供 confirmation: "DELETE" 以确认已核对删除候选。',
+      },
+      400,
+    );
+  }
+
+  try {
+    const localMapStore = getLocalMapStore(c);
+    const objToken = c.req.param('objToken');
+    const confirmed = localMapStore.confirmMissingCandidateDeletion(
+      objToken,
+      new Date().toISOString(),
+    );
+    if (!confirmed) {
+      return c.json(
+        {
+          error: 'candidate_not_found_or_stale',
+          message: '该文档当前不是可确认的缺失候选；请重新检测后再操作。',
+        },
+        409,
+      );
+    }
+    return c.json({ confirmed: true, objToken });
+  } catch (error) {
+    console.error('[mapping] confirm missing candidate failed:', error);
+    return c.json(
+      {
+        error: 'confirm_missing_candidate_failed',
         message: error instanceof Error ? error.message : String(error),
       },
       500,

@@ -71,6 +71,7 @@ import type { LocalMapStore } from './local-map-store.js';
 import type {
   ChangeDetectionResult,
   ChangedDocument,
+  CloudNodeObservation,
   LarkCliNodeInfo,
   DocumentRecord,
 } from '../types/index.js';
@@ -87,6 +88,29 @@ interface RawListNode {
   has_child: boolean;
   parent_node_token?: string;
   space_id?: string;
+}
+
+interface TraversalResult {
+  nodes: CloudNodeObservation[];
+  complete: boolean;
+  failedNodeTokens: string[];
+}
+
+interface RawTraversalResult {
+  nodes: RawListNode[];
+  complete: boolean;
+  failedNodeTokens: string[];
+}
+
+interface NodeDetailLookup {
+  node: LarkCliNodeInfo | null;
+  observationStatus: CloudNodeObservation['observationStatus'];
+}
+
+interface ComparisonOptions {
+  rootToken: string;
+  watchedRootUrl?: string | null;
+  traversalComplete?: boolean;
 }
 
 /**
@@ -284,8 +308,12 @@ export class ChangeDetector {
     // Cache space_id for future calls
     this.spaceIdCache.set(rootUrl, spaceId);
 
-    // 2. Traverse entire subtree and collect all nodes (with real obj_edit_time)
-    const cloudNodes = await this.traverseWikiSubtree(spaceId, rootToken);
+    // 2. Traverse entire subtree and collect all nodes (with real
+    // obj_edit_time plus an explicit completeness signal). A partial tree is
+    // still useful for observational/pending updates, but it is never safe
+    // evidence for a deletion candidate.
+    const traversal = await this.traverseWikiSubtree(spaceId, rootToken, rootUrl);
+    const cloudNodes = traversal.nodes;
 
     // 2a. Include the root node itself in the comparison set. The traversal
     // function only returns DESCENDANTS (BFS over children of rootToken);
@@ -293,14 +321,17 @@ export class ChangeDetector {
     // never appeared in seenObjTokens. Root is part of the subtree, so we
     // prepend it to cloudNodes here (deduped via the seen-set in Pass 1).
     cloudNodes.unshift({
-      node_token: rootInfo.node_token,
-      obj_token: rootInfo.obj_token,
-      obj_type: rootInfo.obj_type,
+      wikiNodeToken: rootInfo.node_token,
+      objToken: rootInfo.obj_token,
+      objType: this.normalizeObjType(rootInfo.obj_type),
       title: rootInfo.title,
-      space_id: rootInfo.space_id,
-      obj_edit_time: rootInfo.obj_edit_time,
-      has_child: rootInfo.has_child,
-      parent_node_token: rootInfo.parent_node_token ?? undefined,
+      spaceId: rootInfo.space_id ?? null,
+      observedObjEditTime: rootInfo.obj_edit_time ?? null,
+      hasChild: rootInfo.has_child,
+      parentNodeToken: rootInfo.parent_node_token ?? null,
+      watchedRootId: rootToken,
+      watchedRootUrl: rootUrl,
+      observationStatus: 'available',
     });
 
     // 3. Compare with local SQLite records (three-state)
@@ -308,13 +339,26 @@ export class ChangeDetector {
     // belong to THIS subtree — without it, detecting rootA would mark every
     // rootB row as deleted (multi-watchedRoot scenario, see baize
     // structure-align-survey and detect-traverse-fix report).
-    const changedDocuments = await this.compareWithLocalRecords(cloudNodes, rootToken);
+    const changedDocuments = await this.compareWithLocalRecords(cloudNodes, {
+      rootToken,
+      watchedRootUrl: rootUrl,
+      traversalComplete: traversal.complete,
+    });
+
+    const missingCandidates = this.localMapStore.listMissingCandidates
+      ? this.localMapStore.listMissingCandidates().filter(
+          (record: DocumentRecord) => record.watchedRootId === rootToken,
+        ).length
+      : 0;
 
     return {
       changed: changedDocuments.length > 0,
       changedDocuments,
       checkedAt: new Date().toISOString(),
       totalNodes: cloudNodes.length,
+      traversalComplete: traversal.complete,
+      failedNodeTokens: traversal.failedNodeTokens,
+      missingCandidates,
     };
   }
 
@@ -339,17 +383,19 @@ export class ChangeDetector {
    */
   private async traverseWikiSubtree(
     spaceId: string,
-    rootToken: string
-  ): Promise<LarkCliNodeInfo[]> {
-    const rawNodes = await this.bfsCollectRawNodes(spaceId, rootToken);
-    const enriched: LarkCliNodeInfo[] = [];
+    rootToken: string,
+    watchedRootUrl: string,
+  ): Promise<TraversalResult> {
+    const rawTraversal = await this.bfsCollectRawNodes(spaceId, rootToken);
+    const enriched: CloudNodeObservation[] = [];
 
-    for (const raw of rawNodes) {
+    for (const raw of rawTraversal.nodes) {
       const cached = this.localMapStore.getDocumentByObjToken(raw.obj_token);
       const fingerprintUnchanged = this.isFingerprintUnchanged(raw, cached);
 
       let objEditTime: number | null;
       let parentNodeToken = raw.parent_node_token ?? null;
+      let observationStatus: CloudNodeObservation['observationStatus'] = 'available';
 
       // TTL guard for the fingerprint short-circuit (diagnosis §2.2 根因 A
       // fix). The original short-circuit reused the local obj_edit_time
@@ -369,54 +415,65 @@ export class ChangeDetector {
         objEditTime = cached.objEditTime;
       } else {
         // Fingerprint miss OR TTL expired OR no cache: fetch fresh obj_edit_time.
-        const nodeDetail = await this.fetchNodeDetail(spaceId, raw.node_token);
+        const detail = await this.fetchNodeDetail(spaceId, raw.node_token, watchedRootUrl);
         // Record the refresh attempt regardless of success. A failed
         // node-get (permission/timeout → null) must not become an infinite
         // retry on every poll: the next TTL window will retry naturally,
         // and meanwhile compareWithLocalRecords safely treats null as
         // "unknown" (no modified report).
         this.lastObjEditTimeRefreshAt.set(raw.obj_token, now);
-        if (nodeDetail) {
-          objEditTime = nodeDetail.obj_edit_time;
+        if (detail.node) {
+          objEditTime = detail.node.obj_edit_time;
           // Prefer freshly-fetched parent_node_token (more authoritative
           // than +node-list, in case of recent moves) when present.
-          if (nodeDetail.parent_node_token) {
-            parentNodeToken = nodeDetail.parent_node_token;
+          if (detail.node.parent_node_token) {
+            parentNodeToken = detail.node.parent_node_token;
           }
         } else {
           // node-get failed (permission/timeout): treat obj_edit_time as
           // unknown (NULL). compareWithLocalRecords handles NULL safely
           // (does not report modified).
           objEditTime = null;
+          observationStatus = detail.observationStatus;
         }
       }
 
       enriched.push({
-        node_token: raw.node_token,
-        obj_token: raw.obj_token,
-        obj_type: raw.obj_type,
+        wikiNodeToken: raw.node_token,
+        objToken: raw.obj_token,
+        objType: this.normalizeObjType(raw.obj_type),
         title: raw.title,
-        space_id: raw.space_id ?? spaceId,
-        obj_edit_time: objEditTime ?? 0,
-        has_child: raw.has_child,
-        parent_node_token: parentNodeToken ?? undefined,
+        spaceId: raw.space_id ?? spaceId,
+        observedObjEditTime: objEditTime,
+        hasChild: raw.has_child,
+        parentNodeToken,
+        watchedRootId: rootToken,
+        watchedRootUrl,
+        observationStatus,
       });
     }
 
-    return enriched;
+    return {
+      nodes: enriched,
+      complete: rawTraversal.complete,
+      failedNodeTokens: rawTraversal.failedNodeTokens,
+    };
   }
 
   /**
    * BFS traversal using `wiki +node-list`. Returns the raw node set
-   * WITHOUT obj_edit_time (situation B). Single-level failures are
-   * logged and skipped so a partial outage does not abort the entire
-   * traversal.
+   * WITHOUT obj_edit_time (situation B), plus a completeness signal. A
+   * failed level is still logged/skipped so users can see fresh data from
+   * healthy branches, but the caller must treat the result as unsafe for
+   * deletion inference.
    */
   private async bfsCollectRawNodes(
     spaceId: string,
     rootToken: string
-  ): Promise<RawListNode[]> {
+  ): Promise<RawTraversalResult> {
     const all: RawListNode[] = [];
+    const failedNodeTokens: string[] = [];
+    let complete = true;
     const queue: string[] = [rootToken];
     const visited = new Set<string>([rootToken]);
 
@@ -450,7 +507,11 @@ export class ChangeDetector {
           }
         }
       } catch (error) {
-        // Single level failure should not interrupt entire traversal
+        // Single level failure should not interrupt the observational pass,
+        // but must be carried all the way to compareWithLocalRecords so it
+        // cannot produce an absence/deletion conclusion.
+        complete = false;
+        failedNodeTokens.push(currentToken);
         console.error(
           `[ChangeDetector] Failed to list nodes for token ${currentToken}:`,
           error
@@ -459,7 +520,7 @@ export class ChangeDetector {
       }
     }
 
-    return all;
+    return { nodes: all, complete, failedNodeTokens };
   }
 
   /**
@@ -477,25 +538,43 @@ export class ChangeDetector {
    */
   private async fetchNodeDetail(
     spaceId: string,
-    nodeToken: string
-  ): Promise<LarkCliNodeInfo | null> {
-    // The host is config-driven in production; we infer it from the
-    // spaceId cache key when possible. For now we use the canonical
-    // qcnbafdrjx7n.feishu.cn host which is the only knowledge space
-    // configured in this deployment. If future spaces need different
-    // hosts, expose a host resolver in config.
-    const wikiUrl = `https://qcnbafdrjx7n.feishu.cn/wiki/${nodeToken}`;
-    void spaceId; // kept for future host resolution; not used today
+    nodeToken: string,
+    watchedRootUrl: string,
+  ): Promise<NodeDetailLookup> {
+    // The root URL is the only trustworthy source of the tenant host. Do not
+    // hard-code a deployment-specific feishu domain: a second tenant/root
+    // would otherwise silently query the wrong workspace.
+    let nodeReference = nodeToken;
+    try {
+      const root = new URL(watchedRootUrl);
+      nodeReference = `${root.origin}/wiki/${nodeToken}`;
+    } catch {
+      // getNode also accepts a raw token. It is a safer fallback than
+      // inventing a host when a caller supplied malformed configuration.
+      nodeReference = nodeToken;
+    }
+    void spaceId; // kept in the signature for callers/cache diagnostics.
 
     try {
-      return await this.larkCliClient.getNode(wikiUrl);
+      return {
+        node: await this.larkCliClient.getNode(nodeReference),
+        observationStatus: 'available',
+      };
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
       console.warn(
         `[ChangeDetector] node-get failed for ${nodeToken}, treating obj_edit_time as NULL:`,
         error
       );
-      return null;
+      return {
+        node: null,
+        observationStatus: this.isPermissionError(message) ? 'restricted' : 'unavailable',
+      };
     }
+  }
+
+  private isPermissionError(message: string): boolean {
+    return /(?:40403|131006|无权限|permission|forbidden|access denied)/i.test(message);
   }
 
   /**
@@ -523,163 +602,145 @@ export class ChangeDetector {
   }
 
   /**
-   * Three-state comparison (03 §3.3.1).
-   *
-   * Pass 1 (cloud → local):
-   *   - no local record           → added
-   *   - cloud obj_edit_time > local.obj_edit_time → modified
-   *     (NULL on either side is treated as "unknown, do not report
-   *      modified" — handles the 3 permission-restricted docs from
-   *      diting P1 review §五)
-   *   - always upsertDocumentSeen to refresh parent/space/edit-time/
-   *     last_seen_at metadata
-   *
-   * Pass 2 (local orphans):
-   *   - local record present but not seen in cloud traversal
-   *     AND status !== 'placeholder' → deleted (soft)
-   *   - markCloudDeleted invoked; caller (UI) decides physical cleanup
-   *
-   * Reused-placeholders: a row previously soft-deleted (cloud_deleted=1)
-   * that re-appears in cloud is left as-is for the sync flow to clear
-   * cloud_deleted via upsertDocument (not change-detector's job).
+   * Compare a traversal with the local baseline without conflating observed
+   * and synced time. The legacy LarkCliNodeInfo input remains accepted for
+   * unit/API compatibility; production traversal passes CloudNodeObservation.
    */
   private async compareWithLocalRecords(
-    cloudNodes: LarkCliNodeInfo[],
-    rootToken: string
+    cloudNodes: Array<CloudNodeObservation | LarkCliNodeInfo>,
+    rootOrOptions: string | ComparisonOptions,
   ): Promise<ChangedDocument[]> {
+    const options: ComparisonOptions = typeof rootOrOptions === 'string'
+      ? { rootToken: rootOrOptions, traversalComplete: true }
+      : rootOrOptions;
+    const traversalComplete = options.traversalComplete !== false;
+    const rootToken = options.rootToken;
     const changedDocuments: ChangedDocument[] = [];
     const seenObjTokens = new Set<string>();
-    // Track which wiki_node_tokens and parent_node_tokens are part of THIS
-    // subtree (by traversal). Used by Pass 2 to decide whether a local row
-    // belongs to this rootUrl (and therefore absence == deleted) or to a
-    // different rootUrl (and therefore absence is expected, not a delete).
     const traversedNodeTokens = new Set<string>([rootToken]);
     const now = new Date().toISOString();
 
-    // Pass 1: cloud → local
-    for (const node of cloudNodes) {
-      seenObjTokens.add(node.obj_token);
-      if (node.node_token) traversedNodeTokens.add(node.node_token);
-      if (node.parent_node_token) traversedNodeTokens.add(node.parent_node_token);
+    const observations = cloudNodes.map((node): CloudNodeObservation => {
+      if ('objToken' in node) return node;
+      return {
+        objToken: node.obj_token,
+        wikiNodeToken: node.node_token,
+        objType: this.normalizeObjType(node.obj_type),
+        title: node.title,
+        spaceId: node.space_id ?? null,
+        parentNodeToken: node.parent_node_token ?? null,
+        watchedRootId: rootToken,
+        watchedRootUrl: options.watchedRootUrl ?? null,
+        observedObjEditTime: node.obj_edit_time ?? null,
+        hasChild: node.has_child,
+        observationStatus: node.obj_edit_time == null ? 'unavailable' : 'available',
+      };
+    });
+
+    // Pass 1: cloud observation -> persistent state machine. This is the
+    // only code path that updates observed time; it never writes the synced
+    // baseline, so pending additions/modifications remain visible on every
+    // subsequent poll until the P3 file/DB commit succeeds.
+    for (const observation of observations) {
+      seenObjTokens.add(observation.objToken);
+      if (observation.wikiNodeToken) traversedNodeTokens.add(observation.wikiNodeToken);
+      if (observation.parentNodeToken) traversedNodeTokens.add(observation.parentNodeToken);
 
       try {
-        const localRecord = await this.localMapStore.getDocumentByObjToken(
-          node.obj_token
-        );
-
-        if (!localRecord) {
-          // New node (added)
-          changedDocuments.push({
-            objToken: node.obj_token,
-            objType: this.normalizeObjType(node.obj_type),
-            title: node.title,
-            changeType: 'added',
-            cloudModifiedTime: this.formatUnixSeconds(node.obj_edit_time),
-            localSyncedTime: null,
-            localMdPath: null,
-          });
-        } else {
-          // Compare obj_edit_time as Unix-second integers (no timezone
-          // ambiguity). NULL on either side ⇒ "unknown" ⇒ do not report
-          // modified (see diting P1 review §五 for the 3 permission-
-          // restricted docs case).
-          const cloudTime = node.obj_edit_time || null;
-          const localTime = localRecord.objEditTime ?? null;
-
-          if (cloudTime != null && localTime != null && cloudTime > localTime) {
-            changedDocuments.push({
-              objToken: node.obj_token,
-              objType: this.normalizeObjType(node.obj_type),
-              title: node.title,
-              changeType: 'modified',
-              cloudModifiedTime: this.formatUnixSeconds(cloudTime),
-              localSyncedTime: localRecord.lastSyncedAt,
-              localMdPath: localRecord.localMdPath,
-            });
-          }
-        }
-
-        // Always refresh mapping metadata (B8 fix: actually persist
-        // parent_node_token / space_id / obj_edit_time / last_seen_at).
-        // For added nodes this also creates a placeholder row so that
-        // subsequent detects see the node as "already known" instead of
-        // re-reporting it as added every poll (see detect-traverse-fix
-        // report: previously added nodes were never persisted, causing
-        // baize survey to observe 技术-Dev 6 子节点 0 入库).
-        await this.localMapStore.upsertDocumentSeen({
-          objToken: node.obj_token,
-          wikiNodeToken: node.node_token,
-          parentNodeToken: node.parent_node_token ?? null,
-          spaceId: node.space_id,
-          objEditTime: node.obj_edit_time || null,
+        const record = this.localMapStore.recordCloudObservation({
+          ...observation,
+          watchedRootId: observation.watchedRootId || rootToken,
+          watchedRootUrl: observation.watchedRootUrl ?? options.watchedRootUrl ?? null,
           lastSeenAt: now,
-        });
+        }) as DocumentRecord;
+
+        if (record.syncState === 'pending_added') {
+          changedDocuments.push(this.toChangedDocument(observation, record, 'added'));
+        } else if (record.syncState === 'pending_modified') {
+          changedDocuments.push(this.toChangedDocument(observation, record, 'modified'));
+        }
+        // restricted rows remain visible in the mapping/tree projection with
+        // their title and hierarchy, but are intentionally not batch-syncable
+        // until P4 exposes an explicit restricted-state UI.
       } catch (error) {
-        // Single comparison failure should not interrupt entire process
         console.error(
-          `[ChangeDetector] Failed to compare node ${node.obj_token}:`,
-          error
+          `[ChangeDetector] Failed to record observation for ${observation.objToken}:`,
+          error,
         );
-        continue;
       }
     }
 
-    // Pass 2: local orphans → deleted (soft)
-    //
-    // v0.2.0 detect-traverse-fix: the previous implementation enumerated
-    // ALL local documents and flagged any absent-from-cloud row as
-    // deleted. Because detect is per-subtree (one rootUrl per call),
-    // running detect on watchedRoot A marked every row belonging to
-    // watchedRoot B (and every wiki_node_token=NULL local README) as
-    // cloud_deleted=1. This silently destroyed mapping data on every
-    // multi-root poll (see baize structure-align-survey §6.2 问题 B and
-    // detect-traverse-fix report §3 for the reproducible evidence).
-    //
-    // Fix: only consider rows that plausibly belong to THIS subtree. A
-    // row belongs to this subtree if ANY of the following holds:
-    //   (a) its wiki_node_token is in traversedNodeTokens (direct member)
-    //   (b) its parent_node_token is in traversedNodeTokens (direct child
-    //       of a traversed node — covers rows whose own wiki_node_token
-    //       is missing but whose parent is known to be in-subtree)
-    // Rows with wiki_node_token=NULL are local-only READMEs written by
-    // IndexScanner; they have no cloud counterpart by construction and
-    // must never be reported as cloud-deleted.
+    // An incomplete traversal never enters the absence pass. The resulting
+    // observations are useful, but a single rate-limited BFS page must not be
+    // interpreted as cloud deletion for any local document.
+    if (!traversalComplete) {
+      return changedDocuments;
+    }
+
     try {
-      const allLocal = await this.localMapStore.getAllDocuments();
+      const allLocal = this.localMapStore.getAllDocuments() as DocumentRecord[];
       for (const local of allLocal) {
         if (seenObjTokens.has(local.objToken)) continue;
-        // Skip placeholders (no-permission docs) — they may simply be
-        // temporarily untraversable, not truly deleted.
-        if (local.status === 'placeholder') continue;
-        // Skip rows already soft-deleted (don't re-report).
-        if (local.cloudDeleted === 1) continue;
-        // Skip local-only rows (no wiki_node_token and no parent in the
-        // current traversal). These are either hand-written READMEs or
-        // rows belonging to a different watchedRoot.
-        const inSubtreeByNodeToken =
-          local.wikiNodeToken != null && traversedNodeTokens.has(local.wikiNodeToken);
-        const inSubtreeByParentToken =
-          local.parentNodeToken != null &&
-          local.parentNodeToken !== '' &&
-          traversedNodeTokens.has(local.parentNodeToken);
-        if (!inSubtreeByNodeToken && !inSubtreeByParentToken) continue;
+        const state = local.syncState ?? this.legacyStateFromDocument(local);
+        if (
+          state === 'pending_added' ||
+          state === 'restricted' ||
+          state === 'deleted_confirmed' ||
+          local.cloudDeleted === 1
+        ) {
+          continue;
+        }
 
-        await this.localMapStore.markCloudDeleted(local.objToken, now);
-        changedDocuments.push({
-          objToken: local.objToken,
-          objType: local.objType,
-          title: local.title,
-          changeType: 'deleted',
-          cloudModifiedTime: '',
-          localSyncedTime: local.lastSyncedAt,
-          localMdPath: local.localMdPath,
-        });
+        // v5 rows own a stable root identity. For legacy records without it,
+        // retain the conservative v4 subtree-membership fallback.
+        const belongsToRoot = local.watchedRootId
+          ? local.watchedRootId === rootToken
+          : (
+            (local.wikiNodeToken != null && traversedNodeTokens.has(local.wikiNodeToken)) ||
+            (local.parentNodeToken != null && local.parentNodeToken !== '' && traversedNodeTokens.has(local.parentNodeToken))
+          );
+        if (!belongsToRoot) continue;
+
+        this.localMapStore.recordCompleteTraversalMiss(local.objToken, now);
       }
     } catch (error) {
-      console.error('[ChangeDetector] Failed to enumerate local documents:', error);
+      console.error('[ChangeDetector] Failed to evaluate traversal absences:', error);
     }
 
     return changedDocuments;
+  }
+
+  private toChangedDocument(
+    observation: CloudNodeObservation,
+    record: DocumentRecord,
+    changeType: ChangedDocument['changeType'],
+  ): ChangedDocument {
+    return {
+      objToken: observation.objToken,
+      objType: observation.objType,
+      title: observation.title,
+      changeType,
+      cloudModifiedTime: this.formatUnixSeconds(observation.observedObjEditTime),
+      localSyncedTime: record.lastSyncedAt || null,
+      localMdPath: record.localMdPath || null,
+      wikiNodeToken: observation.wikiNodeToken,
+      parentNodeToken: observation.parentNodeToken,
+      spaceId: observation.spaceId,
+      watchedRootId: observation.watchedRootId,
+      hasChild: observation.hasChild,
+      observedObjEditTime: observation.observedObjEditTime,
+      syncState: record.syncState,
+    };
+  }
+
+  private legacyStateFromDocument(document: DocumentRecord): NonNullable<DocumentRecord['syncState']> {
+    if (document.cloudDeleted === 1) return 'missing_candidate';
+    if (document.status === 'error') return 'error';
+    if (document.status === 'placeholder') {
+      return document.cloudMatch === 'restricted' ? 'restricted' : 'pending_added';
+    }
+    if (document.status === 'changed') return 'pending_modified';
+    return 'synced';
   }
 
   /**
@@ -707,8 +768,8 @@ export class ChangeDetector {
 
     const workbookChanged =
       cloudEditTime != null &&
-      parentDoc?.objEditTime != null &&
-      cloudEditTime > parentDoc.objEditTime;
+      parentDoc?.syncedObjEditTime != null &&
+      cloudEditTime > parentDoc.syncedObjEditTime;
 
     const localIds = new Set(localSubs.map((s) => s.sheet_id));
     const cloudIds = new Set(cloudSheets.map((s) => s.sheet_id));
