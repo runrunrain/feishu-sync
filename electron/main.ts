@@ -111,7 +111,9 @@ async function refreshWatchedRootUrlsSnapshot(): Promise<void> {
   }
   try {
     const config = await configManager.load();
-    const urls = Array.isArray(config.watchedRootUrls) ? config.watchedRootUrls : [];
+    const urls = Array.isArray(config.watchedRoots)
+      ? config.watchedRoots.filter((root) => root.enabled).map((root) => root.url)
+      : [];
     currentValidWatchedRootUrlsSnapshot = urls.filter(isValidFeishuWikiUrl);
   } catch (error) {
     console.warn('[Config] Failed to refresh watched root URLs snapshot:', sanitizeDesktopError(error));
@@ -415,12 +417,7 @@ ipcMain.handle('desktop:auto-start:set-enabled', async (_event, enabled: boolean
   // Sync with config (single source of truth)
   if (result.ok && configManager) {
     try {
-      const currentConfig = await configManager.load();
-      const updatedConfig = {
-        ...currentConfig,
-        enableAutoStart: enabled,
-      };
-      await configManager.save(updatedConfig);
+      await configManager.updateConfig({ enableAutoStart: enabled });
       console.info(`[AutoStart] Synced config.enableAutoStart = ${enabled}`);
     } catch (error) {
       console.error('[AutoStart] Failed to sync config:', error);

@@ -42,7 +42,7 @@ export class MappingService {
     private snapshotService: SnapshotService,
     /**
      * v0.2.0 structure-align Phase B: configManager is needed to read the
-     * current watchedRootUrls for the tree API response envelope. Kept
+     * current structured watchedRoots for the tree API response envelope. Kept
      * optional for backward compatibility with tests that construct the
      * service with the old 3-arg signature.
      */
@@ -191,10 +191,10 @@ export class MappingService {
     }
 
     // watched_roots envelope (always present).
-    const configuredUrls = this.configManager?.getConfig()?.watchedRootUrls ?? [];
+    const configuredRoots = this.configManager?.getConfig()?.watchedRoots ?? [];
     const watchedRoots: WatchedRoot[] =
       typeof (this.localMapStore as any).getWatchedRoots === 'function'
-        ? (this.localMapStore as any).getWatchedRoots(configuredUrls)
+        ? (this.localMapStore as any).getWatchedRoots(configuredRoots)
         : [];
 
     // orphan_files only meaningful in local view.

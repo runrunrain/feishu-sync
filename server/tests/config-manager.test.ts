@@ -7,13 +7,20 @@
  * legacy.baseUrl verbatim) produced a 401 when DirectChannel sent a
  * bigmodel Bearer key to the deepseek host.
  *
- * Strategy: pure-function unit tests on the exported reconcile helpers.
- * No fs, no real ConfigManager instance — just the decision logic.
+ * Also covers P2 structured watched-root migration and validation. These
+ * cases use an isolated temporary config file; no real user config is read.
  */
 
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {
+  canonicalizeWatchedRootUrl,
+  ConfigManager,
   looksLikeBigmodelKey,
+  normalizeWatchedRootConfig,
+  normalizeWatchedRootLocalDir,
   reconcileOpenAiCompatBaseUrl,
   reconcileModelAlias,
 } from '../src/modules/config-manager.js';
@@ -21,6 +28,24 @@ import {
 const BIGMODEL_KEY = '80ca91e556484dfb9126672d6fbaae8c.65LWXDL6NvRyb9RN';
 const BIGMODEL_PAAS_V4 = 'https://open.bigmodel.cn/api/paas/v4';
 const DEEPSEEK_URL = 'https://api.deepseek.com';
+const ROOT_A = 'https://qcnbafdrjx7n.feishu.cn/wiki/Wramw1XxRihIgnkCrhqcdEbRnHb';
+const ROOT_B = 'https://qcnbafdrjx7n.feishu.cn/wiki/QdZpwOmgBi25JVkAUmYcBiMinIf';
+const ROOT_C = 'https://qcnbafdrjx7n.feishu.cn/wiki/NudewPkE9inlGhkEDA1c9FSsnkb';
+const ROOT_D = 'https://qcnbafdrjx7n.feishu.cn/wiki/FEaww3vUHieIumk6FdIc92WHnyh';
+const tempConfigDirs: string[] = [];
+
+function createTempConfigPath(): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-sync-config-'));
+  tempConfigDirs.push(dir);
+  return path.join(dir, 'config.json');
+}
+
+afterEach(() => {
+  while (tempConfigDirs.length > 0) {
+    const dir = tempConfigDirs.pop();
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 describe('looksLikeBigmodelKey', () => {
   it('accepts a real bigmodel <id>.<secret> key', () => {
@@ -131,5 +156,150 @@ describe('reconcileModelAlias', () => {
   it('defaults to bigmodel Anthropic alias when model is empty', () => {
     expect(reconcileModelAlias('', BIGMODEL_KEY)).toBe('glm-5.2[1m]');
     expect(reconcileModelAlias(null, BIGMODEL_KEY)).toBe('glm-5.2[1m]');
+  });
+});
+
+describe('P2 watchedRoots configuration contract', () => {
+  it('canonicalizes only HTTPS Feishu wiki-root URLs', () => {
+    expect(canonicalizeWatchedRootUrl(`${ROOT_A}/?from=copy`)).toEqual({
+      id: 'Wramw1XxRihIgnkCrhqcdEbRnHb',
+      url: ROOT_A,
+    });
+    expect(canonicalizeWatchedRootUrl('http://qcnbafdrjx7n.feishu.cn/wiki/root')).toBeNull();
+    expect(canonicalizeWatchedRootUrl('https://qcnbafdrjx7n.feishu.cn:8443/wiki/root')).toBeNull();
+    expect(canonicalizeWatchedRootUrl('https://qcnbafdrjx7n.feishu.cn/wiki/root/child')).toBeNull();
+  });
+
+  it('rejects non-portable root-relative local directories', () => {
+    expect(normalizeWatchedRootLocalDir('技术 - Dev/服务端')).toBe('技术 - Dev/服务端');
+    expect(normalizeWatchedRootLocalDir('/absolute/path')).toBeNull();
+    expect(normalizeWatchedRootLocalDir('D:\\knowledge-base')).toBeNull();
+    expect(normalizeWatchedRootLocalDir('../escape')).toBeNull();
+    expect(normalizeWatchedRootLocalDir('safe/../escape')).toBeNull();
+    expect(normalizeWatchedRootLocalDir('CON')).toBeNull();
+    expect(normalizeWatchedRootLocalDir('unsafe:name')).toBeNull();
+  });
+
+  it('requires root id to equal the wiki token in its URL', () => {
+    expect(() => normalizeWatchedRootConfig({
+      id: 'different-token',
+      url: ROOT_A,
+      localDir: '策划 - Designer',
+      layoutProfile: 'mirror-title-file',
+      enabled: true,
+    })).toThrow(/id/);
+  });
+
+  it('migrates legacy URLs to structured roots and persists no legacy URL list', async () => {
+    const configPath = createTempConfigPath();
+    fs.writeFileSync(configPath, JSON.stringify({ watchedRootUrls: [ROOT_A, ROOT_B, ROOT_C, ROOT_D] }), 'utf-8');
+    const manager = new ConfigManager(configPath);
+
+    const config = await manager.load();
+
+    expect(config.watchedRoots).toEqual([
+      expect.objectContaining({
+        id: 'Wramw1XxRihIgnkCrhqcdEbRnHb',
+        url: ROOT_A,
+        localDir: '策划 - Designer',
+        layoutProfile: 'mirror-title-file',
+        enabled: true,
+      }),
+      expect.objectContaining({
+        id: 'QdZpwOmgBi25JVkAUmYcBiMinIf',
+        url: ROOT_B,
+        localDir: '技术 - Dev',
+        layoutProfile: 'directory-readme',
+        enabled: true,
+      }),
+      expect.objectContaining({
+        id: 'NudewPkE9inlGhkEDA1c9FSsnkb',
+        url: ROOT_C,
+        localDir: '[必读] 研发规范',
+        layoutProfile: 'directory-readme',
+        enabled: true,
+      }),
+      expect.objectContaining({
+        id: 'FEaww3vUHieIumk6FdIc92WHnyh',
+        url: ROOT_D,
+        localDir: '开发环境指引',
+        layoutProfile: 'directory-readme',
+        enabled: true,
+      }),
+    ]);
+    expect(config.watchedRootUrls).toEqual([ROOT_A, ROOT_B, ROOT_C, ROOT_D]);
+
+    const persisted = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    expect(persisted.watchedRootUrls).toBeUndefined();
+    expect(persisted.watchedRoots).toHaveLength(4);
+  });
+
+  it('does not drop legacy URLs when a transitional config also has an empty structured array', async () => {
+    const configPath = createTempConfigPath();
+    fs.writeFileSync(configPath, JSON.stringify({ watchedRoots: [], watchedRootUrls: [ROOT_A] }), 'utf-8');
+
+    const config = await new ConfigManager(configPath).load();
+
+    expect(config.watchedRoots).toEqual([
+      expect.objectContaining({ id: 'Wramw1XxRihIgnkCrhqcdEbRnHb', url: ROOT_A }),
+    ]);
+  });
+
+  it('keeps disabled roots visible in structured config but excludes them from runtime URL consumers', async () => {
+    const configPath = createTempConfigPath();
+    const manager = new ConfigManager(configPath);
+    await manager.load();
+
+    const saved = await manager.updateConfig({
+      watchedRoots: [
+        {
+          id: 'Wramw1XxRihIgnkCrhqcdEbRnHb',
+          url: ROOT_A,
+          localDir: '策划 - Designer',
+          layoutProfile: 'mirror-title-file',
+          enabled: true,
+        },
+        {
+          id: 'QdZpwOmgBi25JVkAUmYcBiMinIf',
+          url: ROOT_B,
+          localDir: '技术 - Dev',
+          layoutProfile: 'directory-readme',
+          enabled: false,
+        },
+      ],
+    });
+
+    expect(saved.watchedRoots).toHaveLength(2);
+    expect(saved.watchedRootUrls).toEqual([ROOT_A]);
+    expect(JSON.parse(fs.readFileSync(configPath, 'utf-8')).watchedRootUrls).toBeUndefined();
+  });
+
+  it('rejects invalid structured updates without changing the saved root authority', async () => {
+    const configPath = createTempConfigPath();
+    const manager = new ConfigManager(configPath);
+    await manager.load();
+    await manager.updateConfig({
+      watchedRoots: [{
+        id: 'Wramw1XxRihIgnkCrhqcdEbRnHb',
+        url: ROOT_A,
+        localDir: '策划 - Designer',
+        layoutProfile: 'mirror-title-file',
+        enabled: true,
+      }],
+    });
+
+    await expect(manager.updateConfig({
+      watchedRoots: [{
+        id: 'Wramw1XxRihIgnkCrhqcdEbRnHb',
+        url: ROOT_A,
+        localDir: '../unsafe',
+        layoutProfile: 'mirror-title-file',
+        enabled: true,
+      }],
+    })).rejects.toThrow(/localDir/);
+
+    expect((await manager.load()).watchedRoots).toEqual([
+      expect.objectContaining({ id: 'Wramw1XxRihIgnkCrhqcdEbRnHb', localDir: '策划 - Designer' }),
+    ]);
   });
 });

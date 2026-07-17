@@ -290,7 +290,7 @@ describe('MappingService.getTree', () => {
 class MockLocalMapStoreV4 extends MockLocalMapStore {
   watchedRootsResult: any[] = [];
 
-  getWatchedRoots(_urls: string[]): any[] {
+  getWatchedRoots(_roots: any[]): any[] {
     return this.watchedRootsResult;
   }
 }
@@ -318,7 +318,22 @@ describe('MappingService.getTreeDetailed (v0.2.0 structure-align Phase B)', () =
     store = new MockLocalMapStoreV4();
     snap = new MockSnapshotService();
     cfg = new MockConfigManager({
-      watchedRootUrls: [ROOT_A, ROOT_B],
+      watchedRoots: [
+        {
+          id: 'Wramw1XxRihIgnkCrhqcdEbRnHb',
+          url: ROOT_A,
+          localDir: '策划 - Designer',
+          layoutProfile: 'mirror-title-file',
+          enabled: true,
+        },
+        {
+          id: 'QdZpwOmgBi25JVkAUmYcBiMinIf',
+          url: ROOT_B,
+          localDir: '技术 - Dev',
+          layoutProfile: 'directory-readme',
+          enabled: true,
+        },
+      ],
       knowledgeBaseRoot: '/tmp/kb',
     });
     svc = new MappingService(

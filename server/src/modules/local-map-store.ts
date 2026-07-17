@@ -18,6 +18,7 @@ import type {
   DocumentRecord,
   SyncResult,
   SyncState,
+  WatchedRootConfig,
 } from '../types/index.js';
 
 const V5_RUNTIME_SCHEMA_VERSION = 'v5_runtime_state';
@@ -1046,26 +1047,16 @@ export class LocalMapStore {
   }
 
   /**
-   * Bulk classify watched_root_url for existing rows based on a
-   * directory-prefix map. Called by IndexScanner after a rebuild.
-   *
-   * The map is keyed by the POSIX-style top-level directory name (e.g.
-   * "策划 - Designer") and the value is the watchedRoot URL. Rows whose
-   * local_md_path lives under one of these directories get tagged;
-   * rows under any other top-level directory get watched_root_url=NULL.
-   *
-   * Returns the number of rows updated (touched) for diagnostics.
-   *
-   * Implementation note: we deliberately do a full UPDATE pass keyed
-   * on `local_md_path LIKE ?||'/%'` rather than parsing paths in JS —
-   * SQLite LIKE with a trailing / is SARGable for the directory prefix
-   * and avoids N+1 round-trips.
+   * Classify local rows from the configured watched-root authority. Both the
+   * stable token id and the URL are recorded; state-machine ownership uses
+   * the former so a tenant host change cannot orphan existing rows.
    */
-  backfillWatchedRootUrls(
-    dirToUrl: Map<string, string>,
+  backfillWatchedRoots(
+    roots: Array<Pick<WatchedRootConfig, 'id' | 'url' | 'localDir'>>,
     kbRoot: string,
   ): { scanned: number; tagged: number; untagged: number } {
-    if (dirToUrl.size === 0) {
+    const configuredRoots = roots.filter((root) => root.id && root.url && root.localDir);
+    if (configuredRoots.length === 0) {
       return { scanned: 0, tagged: 0, untagged: 0 };
     }
 
@@ -1074,13 +1065,18 @@ export class LocalMapStore {
       tagged: number;
       untagged: number;
     } => {
-      // Reset all rows to NULL first so stale tags from a previous config
-      // (e.g. a watchedRoot that was removed) don't linger. The fresh
-      // pass below re-tags the ones still owned by a tracked root.
-      this.db.exec(`UPDATE documents SET watched_root_url = NULL`);
+      // Reset only local-path URL tags. Do not clear watched_root_id: P1 may
+      // have observed a pending cloud node before it has a verified local
+      // file, and that identity remains authoritative for deletion safety.
+      this.db.exec(`
+        UPDATE documents
+        SET watched_root_url = NULL
+        WHERE COALESCE(local_md_path, '') <> ''
+      `);
 
       let tagged = 0;
-      for (const [dirName, url] of dirToUrl.entries()) {
+      for (const root of configuredRoots) {
+        const dirName = root.localDir;
         // Match both absolute (kbRoot/dirName/...) and relative
         // (dirName/...) paths. Windows uses \ but SQLite LIKE needs /
         // — we use a permissive pattern that matches both separators
@@ -1097,14 +1093,15 @@ export class LocalMapStore {
         // casing anyway).
         const res = this.db
           .prepare(
-            `UPDATE documents
-             SET watched_root_url = ?
+          `UPDATE documents
+             SET watched_root_url = ?, watched_root_id = ?, updated_at = datetime('now')
              WHERE LOWER(local_md_path) LIKE ? ESCAPE '\\'
                 OR LOWER(local_md_path) LIKE ? ESCAPE '\\'
                 OR LOWER(local_md_path) LIKE ? ESCAPE '\\'`,
           )
           .run(
-            url,
+            root.url,
+            root.id,
             `%${segs}%`,
             `%${relSegs}%`,
             `%${winSegs}%`,
@@ -1126,6 +1123,21 @@ export class LocalMapStore {
     return tx();
   }
 
+  /** @deprecated P2 callers should pass structured roots to backfillWatchedRoots(). */
+  backfillWatchedRootUrls(
+    dirToUrl: Map<string, string>,
+    kbRoot: string,
+  ): { scanned: number; tagged: number; untagged: number } {
+    return this.backfillWatchedRoots(
+      Array.from(dirToUrl.entries()).map(([localDir, url]) => ({
+        id: parseNodeTokenFromUrl(url),
+        url,
+        localDir,
+      })),
+      kbRoot,
+    );
+  }
+
   /**
    * Escape LIKE special characters (%, _, \) in a path so the literal
    * string can be used inside LIKE. Also normalizes separator chars
@@ -1136,28 +1148,25 @@ export class LocalMapStore {
   }
 
   /**
-   * Build the watched_roots projection consumed by the tree API +
-   * _index.json. For each configured watchedRoot URL, derive:
-   *   - nodeToken (parsed from URL)
-   *   - title (best-effort: derived from local directory mapping)
-   *   - displayName (business-prefix UI label)
-   *   - localDir (the local directory that backs this watchedRoot)
-   *   - trackMode ('tracked' — all configured URLs are tracked)
-   *   - status (synced when >=1 row references it; missing_in_db otherwise)
-   *   - lastDetectedAt (max last_seen_at among children)
-   *   - childCount (number of cloud_deleted=0 rows with this watched_root_url)
-   *
-   * The mapping is derived from the URL's nodeToken → directory name,
-   * using a small static map that mirrors the local knowledge base
-   * layout. This avoids a runtime round-trip to lark-cli getNode
-   * (which is async and may fail) — the desktop runtime refreshes
-   * this via SnapshotService.generate() once detection completes.
+   * Build the watched_roots projection from structured configuration. Root
+   * token ids are the primary join key; URL is retained for legacy snapshots
+   * and display, so a tenant-host change does not sever state ownership.
    */
-  getWatchedRoots(configuredUrls: string[]): import('../types/index.js').WatchedRoot[] {
-    if (configuredUrls.length === 0) return [];
+  getWatchedRoots(configuredRoots: WatchedRootConfig[]): import('../types/index.js').WatchedRoot[] {
+    if (configuredRoots.length === 0) return [];
 
-    // Aggregate current state from SQLite in one query per URL.
-    const statsByChild = this.db
+    const statsById = this.db
+      .prepare(
+        `SELECT
+           watched_root_id AS id,
+           COUNT(*) AS child_count,
+           MAX(last_seen_at) AS last_seen
+         FROM documents
+         WHERE watched_root_id IS NOT NULL AND cloud_deleted = 0
+         GROUP BY watched_root_id`,
+      )
+      .all() as Array<{ id: string; child_count: number; last_seen: string | null }>;
+    const statsByUrl = this.db
       .prepare(
         `SELECT
            watched_root_url AS url,
@@ -1168,20 +1177,19 @@ export class LocalMapStore {
          GROUP BY watched_root_url`,
       )
       .all() as Array<{ url: string; child_count: number; last_seen: string | null }>;
-    const statsMap = new Map(statsByChild.map((s) => [s.url, s]));
+    const statsByIdMap = new Map(statsById.map((stat) => [stat.id, stat]));
+    const statsByUrlMap = new Map(statsByUrl.map((stat) => [stat.url, stat]));
 
-    return configuredUrls.map((url) => {
-      const nodeToken = parseNodeTokenFromUrl(url);
-      const meta = inferWatchedRootMeta(nodeToken);
-      const stat = statsMap.get(url);
+    return configuredRoots.map((root) => {
+      const stat = statsByIdMap.get(root.id) ?? statsByUrlMap.get(root.url);
       const childCount = stat?.child_count ?? 0;
       const lastSeen = stat?.last_seen ?? null;
       return {
-        url,
-        nodeToken,
-        title: meta.title,
-        displayName: meta.displayName,
-        localDir: meta.localDir,
+        url: root.url,
+        nodeToken: root.id,
+        title: root.localDir,
+        displayName: root.enabled ? root.localDir : `[已停用] ${root.localDir}`,
+        localDir: root.localDir,
         trackMode: 'tracked' as const,
         status: (childCount > 0 ? 'synced' : 'missing_in_db') as
           | 'synced'
@@ -1429,63 +1437,4 @@ export class LocalMapStore {
 function parseNodeTokenFromUrl(url: string): string {
   const m = url.match(/\/wiki\/([A-Za-z0-9]+)/);
   return m ? m[1] : '';
-}
-
-/**
- * Static metadata map for the four configured watchedRoots.
- *
- * Mirrors the project's local knowledge base layout (see 白泽 structure-align
- * survey §3.1). Each entry maps a feishu nodeToken → display-friendly
- * metadata (title / displayName / localDir) used by the UI to render
- * top-level groupings.
- *
- * The map is intentionally a static literal: the local directory names
- * are stable and do not change with the user's config. If a watchedRoot
- * is added that is not in this map, we fall back to a generic shape
- * derived from the URL itself.
- */
-function inferWatchedRootMeta(nodeToken: string): {
-  title: string;
-  displayName: string;
-  localDir: string;
-} {
-  const KNOWN: Record<
-    string,
-    { title: string; displayName: string; localDir: string }
-  > = {
-    // 策划
-    Wramw1XxRihIgnkCrhqcdEbRnHb: {
-      title: '策划-Designer',
-      displayName: '[策划] 策划设计',
-      localDir: '策划 - Designer',
-    },
-    // 技术
-    QdZpwOmgBi25JVkAUmYcBiMinIf: {
-      title: '技术-Dev',
-      displayName: '[技术] 技术开发',
-      localDir: '技术 - Dev',
-    },
-    // [必读]研发规范
-    NudewPkE9inlGhkEDA1c9FSsnkb: {
-      title: '[必读]研发规范',
-      displayName: '[规范] 研发规范',
-      localDir: '[必读] 研发规范',
-    },
-    // 开发环境指引
-    FEaww3vUHieIumk6FdIc92WHnyh: {
-      title: '开发环境指引',
-      displayName: '[指引] 开发环境指引',
-      localDir: '开发环境指引',
-    },
-  };
-
-  if (nodeToken && KNOWN[nodeToken]) {
-    return KNOWN[nodeToken];
-  }
-  // Fallback: use the node token as the title; displayName mirrors it.
-  return {
-    title: nodeToken || '(unknown)',
-    displayName: nodeToken ? `[根] ${nodeToken.slice(0, 8)}` : '(unknown)',
-    localDir: '',
-  };
 }

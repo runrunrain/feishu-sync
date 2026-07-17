@@ -68,12 +68,18 @@ function makePerRootStub(perRoot: Record<string, any>) {
   };
 }
 
-/**
- * Minimal ConfigManager stub exposing only getConfig().watchedRootUrls.
- */
-function makeStubConfig(watchedRootUrls: string[]) {
+/** Minimal ConfigManager stub exposing structured watchedRoots. */
+function makeStubConfig(watchedRootUrls: string[], disabledUrls: string[] = []) {
   return {
-    getConfig: () => ({ watchedRootUrls }),
+    getConfig: () => ({
+      watchedRoots: watchedRootUrls.map((url) => ({
+        id: url.split('/').pop(),
+        url,
+        localDir: `test/${url.split('/').pop()}`,
+        layoutProfile: 'directory-readme' as const,
+        enabled: !disabledUrls.includes(url),
+      })),
+    }),
   };
 }
 
@@ -339,7 +345,7 @@ describe('POST /api/detect/changes-all', () => {
     expect(body.error).toBe('ConfigManager not initialized');
   });
 
-  it('returns 400 no_watched_roots when config.watchedRootUrls is empty', async () => {
+  it('returns 400 no_watched_roots when no structured root is enabled', async () => {
     const stub = makeStubDetector({ changed: false, changedDocuments: [] });
     const app = buildApp({
       changeDetector: stub.instance,
@@ -422,6 +428,27 @@ describe('POST /api/detect/changes-all', () => {
     expect(body.results.every((r: any) => r.status === 'ok')).toBe(true);
     expect(stub.calls.length).toBe(4);
     expect(stub.calls.map((c) => c.rootUrl)).toEqual([ROOT_A, ROOT_B, ROOT_C, ROOT_D]);
+  });
+
+  it('skips disabled roots without invoking cloud traversal', async () => {
+    const stub = makePerRootStub({
+      [ROOT_A]: { result: { changed: false, changedDocuments: [], totalNodes: 1 } },
+      [ROOT_B]: { result: { changed: true, changedDocuments: [], totalNodes: 99 } },
+    });
+    const app = buildApp({
+      changeDetector: stub.instance,
+      configManager: makeStubConfig([ROOT_A, ROOT_B], [ROOT_B]),
+    });
+
+    const res = await app.fetch(new Request('http://x/api/detect/changes-all', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    }));
+
+    expect(res.status).toBe(200);
+    expect(stub.calls.map((call) => call.rootUrl)).toEqual([ROOT_A]);
+    expect((await res.json()).results).toHaveLength(1);
   });
 
   it('captures per-root failures without aborting the batch', async () => {

@@ -6,10 +6,25 @@
 // Re-export shared types from server (will be available in production build)
 // For development, we define them here for type safety
 
+export type LayoutProfile = 'directory-readme' | 'mirror-title-file';
+
+/** Authoritative local layout configuration for one Feishu wiki root. */
+export interface WatchedRootConfig {
+  /** Canonical wiki root node token; matches server `watched_root_id`. */
+  id: string;
+  url: string;
+  /** POSIX-style path relative to `knowledgeBaseRoot`. */
+  localDir: string;
+  layoutProfile: LayoutProfile;
+  enabled: boolean;
+}
+
 export interface Config {
   llm: LlmConfig;
   pollIntervalMinutes: number;
   knowledgeBaseRoot: string;
+  watchedRoots: WatchedRootConfig[];
+  /** Compatibility projection derived by the server; not persisted by P2+. */
   watchedRootUrls: string[];
   larkCliPath?: string;
   requiredScopes: string[];

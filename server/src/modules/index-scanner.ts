@@ -18,6 +18,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { getEnabledWatchedRoots } from '../types/index.js';
 import type { DocumentRecord } from '../types/index.js';
 import { ScanPolicy } from './scan-policy.js';
 
@@ -26,24 +27,6 @@ interface IndexScannerDeps {
   larkCliClient: any; // LarkCliClient
   config: any; // Config
 }
-
-/**
- * v0.2.0 structure-align Phase B: mapping from a configured watchedRoot
- * URL to the local top-level directory name that backs it. Used by
- * IndexScanner to classify existing rows by their local_md_path.
- *
- * The mapping mirrors the static layout in local-map-store's
- * inferWatchedRootMeta — both must stay in sync.
- *
- * A directory is considered "owned" by a watchedRoot when its top-level
- * segment matches one of the keys below (case-insensitive on Windows).
- */
-const WATCHED_ROOT_DIR_MAP: Record<string, string> = {
-  'https://qcnbafdrjx7n.feishu.cn/wiki/Wramw1XxRihIgnkCrhqcdEbRnHb': '策划 - Designer',
-  'https://qcnbafdrjx7n.feishu.cn/wiki/QdZpwOmgBi25JVkAUmYcBiMinIf': '技术 - Dev',
-  'https://qcnbafdrjx7n.feishu.cn/wiki/NudewPkE9inlGhkEDA1c9FSsnkb': '[必读] 研发规范',
-  'https://qcnbafdrjx7n.feishu.cn/wiki/FEaww3vUHieIumk6FdIc92WHnyh': '开发环境指引',
-};
 
 interface IndexResult {
   scanned: number;
@@ -73,10 +56,9 @@ export class IndexScanner {
   private localMapStore: any;
   private larkCliClient: any;
   /**
-   * v0.2.0 structure-align Phase B: cached config reference. Used by
-   * scanKnowledgeBase to read the configured watchedRootUrls when
-   * backfilling documents.watched_root_url. The reference is read-only;
-   * mutations through this.config are not allowed.
+   * P2 config authority used by scanKnowledgeBase to backfill document root
+   * identity. The reference is read-only; mutations through this.config are
+   * not allowed.
    */
   private config: any;
 
@@ -153,35 +135,19 @@ export class IndexScanner {
       }
     }
 
-    // v0.2.0 structure-align Phase B: backfill watched_root_url based on
-    // the local_md_path top-level directory. We map each configured
-    // watchedRoot URL → its backing local directory, then bulk-tag rows
-    // via LocalMapStore.backfillWatchedRootUrls. Rows under any other
-    // directory get watched_root_url=NULL (mounted/local-only).
+    // P2: backfill ownership from structured configuration, never from a
+    // static token->directory map. The store records both URL compatibility
+    // metadata and the stable root-token id used by P1 state transitions.
     try {
-      const configuredUrls: string[] = Array.isArray(this.config?.watchedRootUrls)
-        ? this.config.watchedRootUrls
-        : [];
-      const dirToUrl = new Map<string, string>();
-      for (const url of configuredUrls) {
-        // Static known layout.
-        if (WATCHED_ROOT_DIR_MAP[url]) {
-          dirToUrl.set(WATCHED_ROOT_DIR_MAP[url], url);
-          continue;
-        }
-        // Unknown URL: derive the directory name from the watchedRoot's
-        // title via lark-cli. We skip this here (no async round-trip at
-        // scan time) and let the user populate it via the configuration
-        // panel once the runtime has resolved the title.
-      }
+      const configuredRoots = getEnabledWatchedRoots(this.config);
       if (
-        dirToUrl.size > 0 &&
-        typeof this.localMapStore.backfillWatchedRootUrls === 'function'
+        configuredRoots.length > 0 &&
+        typeof this.localMapStore.backfillWatchedRoots === 'function'
       ) {
         const kbRoot = this.config?.knowledgeBaseRoot ?? '';
-        const stats = this.localMapStore.backfillWatchedRootUrls(dirToUrl, kbRoot);
+        const stats = this.localMapStore.backfillWatchedRoots(configuredRoots, kbRoot);
         console.info(
-          `[IndexScanner] watched_root_url backfill: scanned=${stats.scanned} tagged=${stats.tagged} untagged=${stats.untagged}`,
+          `[IndexScanner] watchedRoot backfill: scanned=${stats.scanned} tagged=${stats.tagged} untagged=${stats.untagged}`,
         );
       }
     } catch (err) {

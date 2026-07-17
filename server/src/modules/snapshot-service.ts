@@ -30,6 +30,7 @@ import type { LocalMapStore } from './local-map-store.js';
 import type { ConfigManager } from './config-manager.js';
 import { IndexScanner } from './index-scanner.js';
 import { ScanPolicy } from './scan-policy.js';
+import { getEnabledWatchedRootUrls } from '../types/index.js';
 import type {
   IndexSnapshot,
   MappingNode,
@@ -69,19 +70,19 @@ export class SnapshotService {
   /**
    * Build a derived watched_roots array for the current snapshot.
    *
-   * v0.2.0 structure-align Phase B: combines the configured watchedRootUrls
+   * v0.2.0 structure-align Phase B: combines the configured watchedRoots
    * with SQLite state to produce one entry per watchedRoot. Each entry
    * carries display_name + status + child_count so the frontend can
    * render the top-level groupings without a second round-trip.
    */
   private buildWatchedRoots(): WatchedRoot[] {
     const config = this.configManager.getConfig();
-    const urls = config?.watchedRootUrls ?? [];
-    if (urls.length === 0) return [];
+    const roots = config?.watchedRoots ?? [];
+    if (roots.length === 0) return [];
     if (typeof (this.localMapStore as any).getWatchedRoots !== 'function') {
       return [];
     }
-    return (this.localMapStore as any).getWatchedRoots(urls) as WatchedRoot[];
+    return (this.localMapStore as any).getWatchedRoots(roots) as WatchedRoot[];
   }
 
   /**
@@ -146,7 +147,7 @@ export class SnapshotService {
       );
     }
     const kbRoot = config.knowledgeBaseRoot;
-    const watchedRootUrls = config.watchedRootUrls ?? [];
+    const watchedRootUrls = getEnabledWatchedRootUrls(config);
 
     if (!kbRoot) {
       throw new Error(
@@ -215,7 +216,7 @@ export class SnapshotService {
       version: SNAPSHOT_VERSION,
       generated_at: new Date().toISOString(),
       knowledge_base_root: kbRoot,
-      watched_root_urls: previous?.watched_root_urls ?? config.watchedRootUrls ?? [],
+      watched_root_urls: getEnabledWatchedRootUrls(config),
       watched_roots: watchedRoots,
       mounted_dirs: mountedDirs,
       top_level_dirs: previous?.top_level_dirs ?? this.aggregateTopLevelDirs(nodes, kbRoot),

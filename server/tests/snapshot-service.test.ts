@@ -85,7 +85,13 @@ describe('SnapshotService.generate', () => {
     store = new MockLocalMapStore();
     configMgr = new MockConfigManager({
       knowledgeBaseRoot: tmpDir,
-      watchedRootUrls: ['https://x.feishu.cn/wiki/root'],
+      watchedRoots: [{
+        id: 'root',
+        url: 'https://x.feishu.cn/wiki/root',
+        localDir: '根目录',
+        layoutProfile: 'directory-readme',
+        enabled: true,
+      }],
     });
     svc = new SnapshotService(store as any, configMgr as any, new StubIndexScanner());
   });

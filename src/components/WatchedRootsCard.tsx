@@ -1,27 +1,10 @@
 /**
- * WatchedRootsCard - watchedRoots 配置面板（D4，伏羲 §3.2 + 04 §4.3）
+ * WatchedRootsCard - P2 结构化 watchedRoots 配置面板。
  *
- * 与 KnowledgeSettingsCard 的关系：
- *   - KnowledgeSettingsCard 仍管理 knowledgeBaseRoot / 轮询 / lark-cli 路径
- *     以及 watchedRootUrls 输入框列表（URL 字符串）。
- *   - 本卡片是 watchedRoots 的"状态面板"：读取 _index.json.watched_roots
- *     显示每个 URL 对应的 displayName / localDir / status / childCount。
- *   - 主上可在此添加 / 编辑 / 删除 4 个 watchedRoot（策划 / 技术 / 规范 / 开发指引），
- *     与 KnowledgeSettingsCard 的 URL 列表双向同步（共享 useConfig）。
- *
- * 视觉：
- *   - 每行显示：状态点（synced=jade / missing_in_db=ink-faint / error=seal）+
- *     displayName + URL（截断 + tooltip）+ localDir + childCount。
- *   - 顶部摘要：「N 个 watchedRoot · X 已同步 · Y 待检测」。
- *
- * 数据来源：
- *   - 配置：useConfig().config.watchedRootUrls（写入到后端 config）。
- *   - 状态：getMappingIndex() 返回的 IndexSnapshot.watched_roots（最近一次索引快照）。
- *
- * 状态 vs 配置的区别：
- *   - 配置是用户写在 watchedRootUrls 中的 URL 字符串数组（"应该追踪哪些"）。
- *   - 状态是后端从 documents 表派生的 watchedRoots 结构（"实际追踪到了什么"）。
- *   - 两者解耦：用户可以先配置 URL，等下次 detect / rebuild 后才看到状态。
+ * A root is an explicit sync authority: wiki token, canonical URL, local
+ * directory, layout profile and enabled state travel together. URL-only
+ * editing is deliberately kept out of this card so path planning never has
+ * to infer a local layout from a remote link.
  */
 
 import { useEffect, useMemo, useState } from 'react';
@@ -37,13 +20,19 @@ import {
 } from 'lucide-react';
 import { Card, CardHeader, CardBody } from './common/Card';
 import { Button } from './common/Button';
-import { Input } from './common/Input';
+import { Input, Select, Toggle } from './common/Input';
 import { useToast } from './common/Toast';
 import { useConfig } from '../hooks/useConfig';
 import { getMappingIndex } from '../api/client';
-import { normalizeFeishuUrl, normalizeFeishuUrlList } from '../utils/feishu-url';
+import { normalizeFeishuUrl } from '../utils/feishu-url';
 import { appLogger } from '../utils/appLogger';
-import type { Config, IndexSnapshot, WatchedRoot } from '../types';
+import type {
+  Config,
+  IndexSnapshot,
+  LayoutProfile,
+  WatchedRoot,
+  WatchedRootConfig,
+} from '../types';
 
 const DEFAULT_PLACEHOLDER = 'https://xxx.feishu.cn/wiki/<token>';
 
@@ -73,50 +62,81 @@ const STATUS_META: Record<
   },
 };
 
-/**
- * Merge configured URLs with snapshot-derived watchedRoots so every
- * configured URL gets a row, even when the backend hasn't materialised
- * a watchedRoot record for it yet (typical right after first save).
- */
-function mergeConfigWithSnapshot(
-  configured: string[],
-  snapshot: WatchedRoot[] | undefined,
-): Array<{ url: string; status: WatchedRootStatus | 'pending'; watchedRoot?: WatchedRoot }> {
-  const byUrl = new Map<string, WatchedRoot>();
-  if (snapshot) for (const wr of snapshot) byUrl.set(wr.url, wr);
-  const seen = new Set<string>();
-  const rows: Array<{ url: string; status: WatchedRootStatus | 'pending'; watchedRoot?: WatchedRoot }> = [];
-  for (const url of configured) {
-    if (!url) continue;
-    if (seen.has(url)) continue;
-    seen.add(url);
-    const wr = byUrl.get(url);
-    rows.push({ url, status: wr ? wr.status : 'pending', watchedRoot: wr });
+const LAYOUT_OPTIONS = [
+  { value: 'directory-readme', label: '目录 + README.md' },
+  { value: 'mirror-title-file', label: '镜像标题文件' },
+];
+
+function createEmptyRoot(): WatchedRootConfig {
+  return {
+    id: '',
+    url: '',
+    localDir: '',
+    layoutProfile: 'directory-readme',
+    enabled: true,
+  };
+}
+
+function extractRootId(url: string): string | null {
+  try {
+    const parsed = new URL(url);
+    const match = parsed.pathname.match(/^\/wiki\/([A-Za-z0-9]+)$/);
+    if (parsed.protocol !== 'https:' || !/\.feishu\.cn$/i.test(parsed.hostname) || !match) {
+      return null;
+    }
+    return match[1];
+  } catch {
+    return null;
   }
-  return rows;
+}
+
+type RootRow = {
+  root: WatchedRootConfig;
+  status: WatchedRootStatus | 'pending';
+  watchedRoot?: WatchedRoot;
+};
+
+/** Join config roots to snapshot status by stable root id first, then URL. */
+function mergeConfigWithSnapshot(
+  configured: WatchedRootConfig[],
+  snapshot: WatchedRoot[] | undefined,
+): RootRow[] {
+  const byId = new Map<string, WatchedRoot>();
+  const byUrl = new Map<string, WatchedRoot>();
+  for (const root of snapshot ?? []) {
+    byId.set(root.nodeToken, root);
+    byUrl.set(root.url, root);
+  }
+  return configured.map((root) => {
+    const watchedRoot = byId.get(root.id) ?? byUrl.get(root.url);
+    return {
+      root,
+      status: watchedRoot?.status ?? 'pending',
+      watchedRoot,
+    };
+  });
 }
 
 export function WatchedRootsCard() {
   const { config, saving, updateConfig } = useConfig();
   const toast = useToast();
-  const [localUrls, setLocalUrls] = useState<string[]>([]);
+  const [localRoots, setLocalRoots] = useState<WatchedRootConfig[]>([]);
   const [snapshot, setSnapshot] = useState<IndexSnapshot | null>(null);
   const [loadingSnapshot, setLoadingSnapshot] = useState(false);
 
   useEffect(() => {
     if (config) {
-      const urls = (config.watchedRootUrls ?? []).filter(Boolean);
-      setLocalUrls(urls.length > 0 ? urls : ['']);
+      const roots = config.watchedRoots ?? [];
+      setLocalRoots(roots.length > 0 ? roots : [createEmptyRoot()]);
     }
   }, [config]);
 
   const fetchSnapshot = async () => {
     setLoadingSnapshot(true);
     try {
-      const snap = await getMappingIndex();
-      setSnapshot(snap);
+      setSnapshot(await getMappingIndex());
     } catch (err) {
-      // 404 → snapshot not generated yet; not an error worth surfacing.
+      // Snapshot is generated after detection/indexing; absent on first run.
       appLogger.warn('watched-roots', 'getMappingIndex failed (non-fatal)', err);
       setSnapshot(null);
     } finally {
@@ -129,53 +149,96 @@ export function WatchedRootsCard() {
   }, []);
 
   const rows = useMemo(
-    () => mergeConfigWithSnapshot(localUrls.filter(Boolean), snapshot?.watched_roots),
-    [localUrls, snapshot],
+    () => mergeConfigWithSnapshot(localRoots, snapshot?.watched_roots),
+    [localRoots, snapshot],
   );
 
   const summary = useMemo(() => {
-    const synced = rows.filter((r) => r.status === 'synced').length;
-    const missing = rows.filter((r) => r.status === 'missing_in_db' || r.status === 'pending').length;
-    const errored = rows.filter((r) => r.status === 'error').length;
-    return { total: rows.length, synced, missing, errored };
+    const configured = rows.filter((row) => row.root.url.trim().length > 0);
+    const synced = configured.filter((row) => row.status === 'synced' && row.root.enabled).length;
+    const missing = configured.filter(
+      (row) => row.root.enabled && (row.status === 'missing_in_db' || row.status === 'pending'),
+    ).length;
+    const disabled = configured.filter((row) => !row.root.enabled).length;
+    const errored = configured.filter((row) => row.status === 'error' && row.root.enabled).length;
+    return { total: configured.length, synced, missing, disabled, errored };
   }, [rows]);
 
-  const setUrl = (idx: number, value: string) => {
-    setLocalUrls((prev) => {
-      const next = [...prev];
-      next[idx] = value;
-      return next;
+  const updateRoot = (index: number, patch: Partial<WatchedRootConfig>) => {
+    setLocalRoots((previous) => previous.map((root, currentIndex) => (
+      currentIndex === index ? { ...root, ...patch } : root
+    )));
+  };
+
+  const addRoot = () => setLocalRoots((previous) => [...previous, createEmptyRoot()]);
+
+  const removeRoot = (index: number) => {
+    setLocalRoots((previous) => {
+      const next = previous.filter((_, currentIndex) => currentIndex !== index);
+      return next.length > 0 ? next : [createEmptyRoot()];
     });
   };
 
-  const addUrl = () => {
-    setLocalUrls((prev) => [...prev, '']);
-  };
-
-  const removeUrl = (idx: number) => {
-    setLocalUrls((prev) => prev.filter((_, i) => i !== idx));
+  const handleBlur = (index: number, value: string) => {
+    if (!value.trim()) return;
+    const { canonical, wasModified, isValid } = normalizeFeishuUrl(value);
+    if (wasModified && isValid) {
+      updateRoot(index, { url: canonical });
+      toast.push({ type: 'info', message: 'URL 已规范化', hint: canonical });
+    }
   };
 
   const handleSave = async () => {
-    const normalized = normalizeFeishuUrlList(localUrls);
-    if (normalized.length === 0) {
-      toast.push({
-        type: 'warning',
-        message: '请至少填写一个飞书根 URL',
-        hint: '可在飞书知识空间复制链接后粘贴到此处',
+    const draftRoots = localRoots.filter((root) => root.url.trim() || root.localDir.trim());
+    const normalizedRoots: WatchedRootConfig[] = [];
+    const ids = new Set<string>();
+
+    for (const root of draftRoots) {
+      const normalizedUrl = normalizeFeishuUrl(root.url);
+      const id = normalizedUrl.isValid ? extractRootId(normalizedUrl.canonical) : null;
+      const localDir = root.localDir.trim().replace(/\\/g, '/').replace(/\/+$/g, '');
+      if (!id) {
+        toast.push({
+          type: 'warning',
+          message: '存在无效的飞书根 URL',
+          hint: '必须是 https://<租户>.feishu.cn/wiki/<token>，且每行都需要有效 URL。',
+        });
+        return;
+      }
+      if (!localDir || localDir.startsWith('/') || /^[A-Za-z]:\//.test(localDir) || localDir.split('/').some(
+        (segment) => !segment || segment === '.' || segment === '..',
+      )) {
+        toast.push({
+          type: 'warning',
+          message: '本地目录必须是知识库根目录下的相对路径',
+          hint: '例如“技术 - Dev”；不能使用绝对路径或 ..。',
+        });
+        return;
+      }
+      if (ids.has(id)) {
+        toast.push({ type: 'warning', message: '同一个飞书根目录不能重复配置', hint: id });
+        return;
+      }
+      ids.add(id);
+      normalizedRoots.push({
+        id,
+        url: normalizedUrl.canonical,
+        localDir,
+        layoutProfile: root.layoutProfile as LayoutProfile,
+        enabled: root.enabled,
       });
-      return;
     }
+
     try {
-      // Only send watchedRootUrls; rest of config untouched. NEVER send llm
-      // (useConfig.updateConfig merges into existing config; the merge layer
-      // already drops masked apiKey — but we additionally skip llm here).
-      const patch: Partial<Config> = { watchedRootUrls: normalized };
+      // Never resend `llm`: GET returns a masked api key. Structured roots
+      // are validated again by ConfigManager before anything is persisted.
+      const patch: Partial<Config> = { watchedRoots: normalizedRoots };
       await updateConfig(patch);
+      setLocalRoots(normalizedRoots.length > 0 ? normalizedRoots : [createEmptyRoot()]);
       toast.push({
         type: 'success',
-        message: `已保存（${normalized.length} 个 watchedRoot）`,
-        hint: '下次「立即检测」或「刷新索引」后状态会更新',
+        message: `已保存（${normalizedRoots.length} 个 watchedRoot）`,
+        hint: '启用的根目录会在下次「立即检测」或轮询时参与同步。',
       });
     } catch (err) {
       toast.push({
@@ -186,117 +249,100 @@ export function WatchedRootsCard() {
     }
   };
 
-  const handleBlur = (idx: number, value: string) => {
-    if (!value.trim()) return;
-    const { canonical, wasModified, isValid } = normalizeFeishuUrl(value);
-    if (wasModified && isValid) {
-      setUrl(idx, canonical);
-      toast.push({
-        type: 'info',
-        message: 'URL 已规范化',
-        hint: canonical,
-      });
-    } else if (!isValid) {
-      toast.push({
-        type: 'warning',
-        message: '看起来不是有效的飞书 wiki URL',
-        hint: '需要包含 /wiki/<token> 片段',
-      });
-    }
-  };
-
   return (
     <Card variant="elevated">
       <CardHeader>
         <div className="flex items-center gap-2.5">
           <Database className="w-4 h-4 text-seal" />
-          <h2 className="text-base font-kai font-medium text-ink">watchedRoots 配置</h2>
+          <h2 className="text-base font-kai font-medium text-ink">同步根目录与布局</h2>
           <span className="ml-auto text-xs text-ink-faint font-sans-ui">
             {summary.total} 个 · {summary.synced} 已同步 · {summary.missing} 待检测
+            {summary.disabled > 0 && ` · ${summary.disabled} 已停用`}
             {summary.errored > 0 && ` · ${summary.errored} 错误`}
           </span>
         </div>
       </CardHeader>
       <CardBody className="space-y-4">
         <p className="text-xs text-ink-faint font-sans-ui">
-          飞书知识空间的根节点 URL。每个 URL 在飞书视图中作为一个顶层分组，
-          下次「立即检测」或「刷新索引」后状态会更新。
+          每个同步根目录同时声明飞书节点、本地目录和目录布局。停用后会保留历史映射与状态，但不会参与检测、轮询或同步。
         </p>
 
-        <div className="space-y-2.5">
-          {rows.length === 0 && (
-            <div className="text-xs text-ink-faint font-sans-ui italic">
-              （尚未配置任何 watchedRoot）
-            </div>
-          )}
-          {rows.map((row, idx) => {
-            const statusMeta = row.status !== 'pending'
-              ? STATUS_META[row.status]
-              : { icon: Circle, label: '尚未检测', dotCls: 'bg-ink-faint/40', iconCls: 'text-ink-faint' };
+        <div className="space-y-3">
+          {rows.map((row, index) => {
+            const statusMeta = !row.root.enabled
+              ? { icon: CloudOff, label: '已停用', dotCls: 'bg-ink-faint/40', iconCls: 'text-ink-faint' }
+              : row.status !== 'pending'
+                ? STATUS_META[row.status]
+                : { icon: Circle, label: '尚未检测', dotCls: 'bg-ink-faint/40', iconCls: 'text-ink-faint' };
             const StatusIcon = statusMeta.icon;
-            const wr = row.watchedRoot;
-            const displayName = wr?.displayName || wr?.title || wr?.localDir;
+            const watchedRoot = row.watchedRoot;
+            const displayName = watchedRoot?.displayName || watchedRoot?.title || row.root.localDir;
             return (
               <div
-                key={`${idx}-${row.url}`}
-                className="rounded-md border border-line bg-paper p-3 space-y-2"
+                key={`${row.root.id || 'new'}-${index}`}
+                className="rounded-md border border-line bg-paper p-3 space-y-3"
               >
                 <div className="flex items-start gap-2">
                   <span className={`mt-1.5 inline-block w-2 h-2 rounded-full ${statusMeta.dotCls} shrink-0`} />
-                  <div className="flex-1 min-w-0 space-y-1">
-                    {displayName && (
-                      <div className="flex items-center gap-2 flex-wrap">
-                        <span
-                          className="text-sm font-medium text-ink"
-                          style={{ fontFamily: 'var(--kai)' }}
-                        >
-                          {displayName}
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-sm font-medium text-ink" style={{ fontFamily: 'var(--kai)' }}>
+                        {displayName || '新的同步根目录'}
+                      </span>
+                      <span className={`inline-flex items-center gap-1 text-[11px] font-sans-ui ${statusMeta.iconCls}`}>
+                        <StatusIcon className="w-3 h-3" />
+                        {statusMeta.label}
+                      </span>
+                      {watchedRoot && watchedRoot.childCount > 0 && (
+                        <span className="text-[11px] text-ink-faint font-sans-ui">{watchedRoot.childCount} 子节点</span>
+                      )}
+                      {watchedRoot?.diagnostic && (
+                        <span className="inline-flex items-center gap-1 text-[11px] text-seal-2 font-sans-ui" title={watchedRoot.diagnostic}>
+                          <AlertCircle className="w-3 h-3" />
+                          {watchedRoot.diagnostic}
                         </span>
-                        {wr?.localDir && (
-                          <span className="text-[11px] text-ink-faint font-mono">
-                            {wr.localDir}
-                          </span>
-                        )}
-                        <span
-                          className={`inline-flex items-center gap-1 text-[11px] font-sans-ui ${statusMeta.iconCls}`}
-                        >
-                          <StatusIcon className="w-3 h-3" />
-                          {statusMeta.label}
-                        </span>
-                        {wr && wr.childCount > 0 && (
-                          <span className="text-[11px] text-ink-faint font-sans-ui">
-                            {wr.childCount} 子节点
-                          </span>
-                        )}
-                        {wr?.diagnostic && (
-                          <span
-                            className="inline-flex items-center gap-1 text-[11px] text-seal-2 font-sans-ui"
-                            title={wr.diagnostic}
-                          >
-                            <CloudOff className="w-3 h-3" />
-                            {wr.diagnostic}
-                          </span>
-                        )}
-                      </div>
-                    )}
-                    <Input
-                      fullWidth
-                      type="url"
-                      value={localUrls[idx] ?? row.url}
-                      onChange={(e) => setUrl(idx, e.target.value)}
-                      onBlur={(e) => handleBlur(idx, e.target.value)}
-                      placeholder={DEFAULT_PLACEHOLDER}
-                    />
+                      )}
+                    </div>
+                    {row.root.id && <p className="mt-1 text-[11px] text-ink-faint font-mono">根节点：{row.root.id}</p>}
                   </div>
-                  <Button
-                    variant="ghost"
-                    size="md"
-                    onClick={() => removeUrl(idx)}
-                    title="删除此 watchedRoot"
-                    disabled={rows.length === 1}
-                  >
+                  <Button variant="ghost" size="md" onClick={() => removeRoot(index)} title="删除此同步根目录">
                     <Trash2 className="w-4 h-4" />
                   </Button>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  <Input
+                    label="飞书根 URL"
+                    fullWidth
+                    type="url"
+                    value={row.root.url}
+                    onChange={(event) => updateRoot(index, { url: event.target.value })}
+                    onBlur={(event) => handleBlur(index, event.target.value)}
+                    placeholder={DEFAULT_PLACEHOLDER}
+                  />
+                  <Input
+                    label="本地目录（相对知识库根目录）"
+                    fullWidth
+                    value={row.root.localDir}
+                    onChange={(event) => updateRoot(index, { localDir: event.target.value })}
+                    placeholder="例如：技术 - Dev"
+                  />
+                  <Select
+                    label="目录布局"
+                    value={row.root.layoutProfile}
+                    options={LAYOUT_OPTIONS}
+                    onChange={(event) => updateRoot(index, {
+                      layoutProfile: event.target.value as LayoutProfile,
+                    })}
+                  />
+                  <div className="self-end rounded-md border border-line bg-card-bg px-3 py-2">
+                    <Toggle
+                      label="启用此同步根目录"
+                      checked={row.root.enabled}
+                      onChange={(enabled) => updateRoot(index, { enabled })}
+                      helperText="停用后不遍历、不检测，也不写入本地文件。"
+                    />
+                  </div>
                 </div>
               </div>
             );
@@ -304,29 +350,24 @@ export function WatchedRootsCard() {
         </div>
 
         <div className="flex items-center gap-2">
-          <Button variant="secondary" size="sm" onClick={addUrl}>
+          <Button variant="secondary" size="sm" onClick={addRoot}>
             <Plus className="w-3.5 h-3.5" />
-            添加 watchedRoot
+            添加同步根目录
           </Button>
           <Button
             variant="ghost"
             size="sm"
             onClick={() => void fetchSnapshot()}
             loading={loadingSnapshot}
-            title="从 _index.json 重新读取 watchedRoots 状态"
+            title="从 _index.json 重新读取状态"
           >
             <RefreshCw className="w-3.5 h-3.5" />
             刷新状态
           </Button>
-          <span className="ml-auto text-xs text-ink-faint font-sans-ui">
-            建议 4 个：[规范] 研发规范 · [指引] 开发环境指引 · [技术] 技术开发 · [策划] 策划设计
-          </span>
         </div>
 
         <div className="flex justify-end pt-3 border-t border-line">
-          <Button onClick={handleSave} loading={saving}>
-            保存 watchedRoots
-          </Button>
+          <Button onClick={handleSave} loading={saving}>保存同步根目录</Button>
         </div>
       </CardBody>
     </Card>

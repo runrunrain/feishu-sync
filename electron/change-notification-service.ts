@@ -8,7 +8,7 @@
  *
  * Multi-root contract: this service POSTs to /api/detect/changes-all,
  * the same multi-root endpoint the frontend 立即检测 button uses. The
- * server iterates config.watchedRootUrls and runs detectChanges per
+ * server iterates enabled config.watchedRoots and runs detectChanges per
  * root, aggregating changedDocuments across ALL roots. This is a
  * deliberate change from the earlier single-root design which POSTed
  * /api/detect/changes { rootUrl } with only the FIRST valid watched
@@ -121,7 +121,7 @@ export class ChangeNotificationService {
 
     try {
       // Drive the multi-root detect endpoint so EVERY configured root is
-      // polled automatically. The server iterates config.watchedRootUrls
+      // polled automatically. The server iterates enabled config.watchedRoots
       // internally and aggregates changedDocuments across roots; the body
       // is config-driven (ignored), so {} is correct. Response shape:
       //   { changed, changedDocuments, totalNodes, checkedAt, results[] }

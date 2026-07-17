@@ -20,7 +20,7 @@
  *
  * v0.2.0 multi-root-detect (2026-06-22):
  *   New POST /api/detect/changes-all traverses every URL in
- *   config.watchedRootUrls sequentially. detect-traverse-fix already
+ *   enabled config.watchedRoots sequentially. detect-traverse-fix already
  *   guarantees per-subtree filtering (compareWithLocalRecords Pass 2
  *   restricts deleted detection to rows whose wiki_node_token or
  *   parent_node_token is in the CURRENT traversal), so detecting
@@ -37,6 +37,7 @@ import type {
   ChangeDetectionResult,
   ChangedDocument,
 } from '../types/index.js';
+import { getEnabledWatchedRootUrls } from '../types/index.js';
 
 const detectRoutes = new Hono();
 
@@ -108,7 +109,7 @@ detectRoutes.post('/api/detect/changes', async (c) => {
 /**
  * Multi-root result envelope.
  *
- * `results[]` preserves the configured watchedRootUrls order so the UI
+ * `results[]` preserves the enabled watchedRoots order so the UI
  * can map outcomes back to display groups. Each entry carries either a
  * `result` (success) or an `error` message (failure); both shapes are
  * explicit so the client can render partial-failure states without
@@ -132,7 +133,7 @@ interface MultiRootDetectionResult {
 /**
  * POST /api/detect/changes-all - Detect changes across ALL configured watchedRoots.
  *
- * Reads `watchedRootUrls` from ConfigManager and runs detectChanges
+ * Reads enabled `watchedRoots` from ConfigManager and runs detectChanges
  * sequentially for each URL. Sequential ordering is deliberate:
  *
  *   1. lark-cli has a QPS budget (architecture red line I1 delegates
@@ -167,13 +168,13 @@ detectRoutes.post('/api/detect/changes-all', async (c) => {
   }
 
   const config = configManager.getConfig();
-  const watchedRootUrls: string[] = config?.watchedRootUrls ?? [];
+  const watchedRootUrls = getEnabledWatchedRootUrls(config);
   if (watchedRootUrls.length === 0) {
     return c.json(
       {
         error: 'no_watched_roots',
         message:
-          'config.watchedRootUrls is empty. Add at least one Feishu wiki URL via the config panel before calling detect-all.',
+          '没有启用的 watchedRoots。请在配置面板中添加并启用至少一个飞书知识库根目录后再执行检测。',
       },
       400
     );

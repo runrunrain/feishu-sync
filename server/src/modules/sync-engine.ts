@@ -26,6 +26,7 @@ import type {
   SyncOptions,
   SyncedDocument,
   FailedDocument,
+  WatchedRootConfig,
 } from '../types/index.js';
 import {
   completeOperationManifest,
@@ -900,7 +901,7 @@ export class SyncEngine {
     } else if (record?.originalLink && record.originalLink.trim().length > 0) {
       originalLink = record.originalLink.trim();
     } else if (wikiNodeToken) {
-      const host = this.extractFeishuHost();
+      const host = this.extractFeishuHost(record?.watchedRootId, record?.watchedRootUrl);
       if (host) {
         originalLink = `https://${host}/wiki/${wikiNodeToken}`;
       }
@@ -919,19 +920,30 @@ export class SyncEngine {
 
   /**
    * Extract the feishu wiki host (e.g. `qcnbafdrjx7n.feishu.cn`) from
-   * the first configured watchedRootUrl. Used to construct an
+   * the document's configured watched root. Used to construct an
    * original_link for sheets (whose fetched.url is empty) from
    * wiki_node_token. Returns null when no URL is configured or the URL
    * is unparseable; the caller then leaves original_link null rather
    * than fabricating a host.
    */
-  private extractFeishuHost(): string | null {
-    const urls: unknown = this.config?.watchedRootUrls;
-    if (!Array.isArray(urls) || urls.length === 0) return null;
-    const first = urls[0];
-    if (typeof first !== 'string' || first.length === 0) return null;
+  private extractFeishuHost(
+    watchedRootId: string | null | undefined,
+    watchedRootUrl: string | null | undefined,
+  ): string | null {
+    const roots: WatchedRootConfig[] = Array.isArray(this.config?.watchedRoots)
+      ? this.config.watchedRoots as WatchedRootConfig[]
+      : [];
+    const selected = roots.find((root) => root.id === watchedRootId)
+      ?? roots.find((root) => root.url === watchedRootUrl)
+      ?? roots.find((root) => root.enabled);
+    // Keep a narrow legacy fallback for callers that construct SyncEngine
+    // with a pre-P2 in-memory config. Persisted config always has roots.
+    const candidate = selected?.url
+      ?? (typeof watchedRootUrl === 'string' ? watchedRootUrl : null)
+      ?? (Array.isArray(this.config?.watchedRootUrls) ? this.config.watchedRootUrls[0] : null);
+    if (typeof candidate !== 'string' || candidate.length === 0) return null;
     try {
-      return new URL(first).host;
+      return new URL(candidate).host;
     } catch {
       return null;
     }

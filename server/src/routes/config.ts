@@ -10,6 +10,16 @@ import type { Config } from '../types/index.js';
 
 const configRoutes = new Hono();
 
+function sanitizeConfig(config: Config): Config {
+  return {
+    ...config,
+    llm: {
+      ...config.llm,
+      apiKey: config.llm.apiKey ? '***' : '',
+    },
+  };
+}
+
 // Make configManager available via middleware
 configRoutes.use('*', async (c, next) => {
   const configManager = (c as any).configManager;
@@ -27,15 +37,7 @@ configRoutes.get('/api/config', async (c) => {
   const config = await configManager.load();
 
   // Don't expose sensitive fields like apiKey in production
-  const sanitizedConfig: Config = {
-    ...config,
-    llm: {
-      ...config.llm,
-      apiKey: config.llm.apiKey ? '***' : '',
-    },
-  };
-
-  return c.json(sanitizedConfig);
+  return c.json(sanitizeConfig(config));
 });
 
 /**
@@ -43,18 +45,25 @@ configRoutes.get('/api/config', async (c) => {
  */
 configRoutes.put('/api/config', async (c) => {
   const configManager = (c as any).configManager;
-  const partialConfig = await c.req.json();
+  let partialConfig: Partial<Config>;
+  try {
+    partialConfig = await c.req.json() as Partial<Config>;
+  } catch {
+    return c.json({ error: 'invalid_json' }, 400);
+  }
 
-  // Load current config and merge with updates
-  const currentConfig = await configManager.load();
-  const updatedConfig: Config = {
-    ...currentConfig,
-    ...partialConfig,
-  };
-
-  await configManager.save(updatedConfig);
-
-  return c.json({ success: true, config: updatedConfig });
+  try {
+    const updatedConfig = await configManager.updateConfig(partialConfig);
+    return c.json({ success: true, config: sanitizeConfig(updatedConfig) });
+  } catch (error) {
+    return c.json(
+      {
+        error: 'config_validation_failed',
+        message: error instanceof Error ? error.message : String(error),
+      },
+      400,
+    );
+  }
 });
 
 export { configRoutes };

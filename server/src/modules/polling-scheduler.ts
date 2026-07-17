@@ -10,6 +10,7 @@
  */
 
 import type { ChangeDetector } from './change-detector.js';
+import { getEnabledWatchedRootUrls } from '../types/index.js';
 import type { Config, ChangeDetectionResult } from '../types/index.js';
 
 interface PollingSchedulerOptions {
@@ -96,7 +97,7 @@ export class PollingScheduler {
   private async executeDetection(): Promise<void> {
     console.info('[PollingScheduler] Executing change detection...');
 
-    const rootUrls = this.options.config.watchedRootUrls || [];
+    const rootUrls = getEnabledWatchedRootUrls(this.options.config);
 
     for (const rootUrl of rootUrls) {
       try {

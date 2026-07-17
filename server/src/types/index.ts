@@ -6,6 +6,25 @@
 // Configuration Types
 // ============================================================================
 
+/** The on-disk layout contract for one configured Feishu wiki root. */
+export type LayoutProfile = 'directory-readme' | 'mirror-title-file';
+
+/**
+ * Configuration authority for a watched root.
+ *
+ * `id` is the canonical wiki root node token. It deliberately matches the
+ * P1 `documents.watched_root_id` value, rather than a user-editable display
+ * name, so root ownership remains stable across title/host changes.
+ */
+export interface WatchedRootConfig {
+  id: string;
+  url: string;
+  /** POSIX-style path relative to `knowledgeBaseRoot`. */
+  localDir: string;
+  layoutProfile: LayoutProfile;
+  enabled: boolean;
+}
+
 export interface Config {
   /**
    * v0.2.0 P3: channel-agnostic LLM config. The legacy flat
@@ -19,11 +38,33 @@ export interface Config {
   llm: LlmConfig;
   pollIntervalMinutes: number;
   knowledgeBaseRoot: string;
+  /** Authoritative P2 root configuration. */
+  watchedRoots: WatchedRootConfig[];
+  /**
+   * Compatibility projection for pre-P2 callers. ConfigManager derives this
+   * from `watchedRoots` in memory and no longer persists it to disk.
+   */
   watchedRootUrls: string[];
   larkCliPath?: string;
   requiredScopes: string[];
   enableAutoStart: boolean;
   enableNotifications: boolean;
+}
+
+/** Return only roots whose explicit configuration enables traversal/sync. */
+export function getEnabledWatchedRoots(
+  config: { watchedRoots?: WatchedRootConfig[] } | null | undefined,
+): WatchedRootConfig[] {
+  return Array.isArray(config?.watchedRoots)
+    ? config.watchedRoots.filter((root) => root.enabled)
+    : [];
+}
+
+/** Compatibility selector for call sites that only need canonical URLs. */
+export function getEnabledWatchedRootUrls(
+  config: { watchedRoots?: WatchedRootConfig[] } | null | undefined,
+): string[] {
+  return getEnabledWatchedRoots(config).map((root) => root.url);
 }
 
 // ============================================================================
@@ -217,7 +258,7 @@ export interface DocumentRecord {
    * v0.2.0 structure-align Phase B fields.
    *
    * watchedRootUrl is the feishu wiki URL of the watchedRoot that owns
-   * this row. Source of truth is the application config (watchedRootUrls);
+   * this row. Source of truth is the application config (watchedRoots);
    * rows whose local_md_path top-level directory maps to a watchedRoot
    * are tagged by IndexScanner during rebuild. Rows that live under a
    * local-only directory (no watchedRoot tracking) keep this NULL.
@@ -499,7 +540,7 @@ export interface IndexSnapshot {
   watched_root_urls: string[];
   /**
    * v0.2.0 structure-align Phase B: materialized watchedRoot records.
-   * Built from the configured watchedRootUrls + documents table state.
+   * Built from the configured watchedRoots + documents table state.
    * Each entry includes display_name + status + child_count for the
    * frontend to render top-level groupings without a second round-trip.
    */

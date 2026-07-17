@@ -186,4 +186,62 @@ describe('LocalMapStore runtime schema', () => {
     expect(store.confirmMissingCandidateDeletion('doc-1', '2026-07-17T00:07:00.000Z')).toBe(false);
     store.close();
   });
+
+  it('backfills local records from structured root authority without erasing cloud-only ownership', () => {
+    const dbPath = createDatabasePath();
+    const kbRoot = path.join(path.dirname(dbPath), '知识库');
+    const techUrl = 'https://tenant.feishu.cn/wiki/tech-root';
+    const store = new LocalMapStore(dbPath);
+    store.initialize();
+    store.upsertDocument(makeDocument({
+      objToken: 'local-tech-doc',
+      localMdPath: path.join(kbRoot, '技术 - Dev', 'README.md'),
+      watchedRootId: 'stale-root',
+      watchedRootUrl: 'https://tenant.feishu.cn/wiki/stale-root',
+    }));
+    store.upsertDocument(makeDocument({
+      objToken: 'cloud-only-doc',
+      localMdPath: '',
+      watchedRootId: 'remote-root',
+      watchedRootUrl: 'https://tenant.feishu.cn/wiki/remote-root',
+    }));
+
+    const result = store.backfillWatchedRoots([{
+      id: 'tech-root',
+      url: techUrl,
+      localDir: '技术 - Dev',
+    }], kbRoot);
+
+    expect(result).toMatchObject({ scanned: 2, tagged: 1, untagged: 1 });
+    expect(store.getDocumentByObjToken('local-tech-doc')).toMatchObject({
+      watchedRootId: 'tech-root',
+      watchedRootUrl: techUrl,
+    });
+    expect(store.getDocumentByObjToken('cloud-only-doc')).toMatchObject({
+      watchedRootId: 'remote-root',
+      watchedRootUrl: 'https://tenant.feishu.cn/wiki/remote-root',
+    });
+
+    const roots = store.getWatchedRoots([
+      {
+        id: 'tech-root',
+        url: techUrl,
+        localDir: '技术 - Dev',
+        layoutProfile: 'directory-readme',
+        enabled: true,
+      },
+      {
+        id: 'disabled-root',
+        url: 'https://tenant.feishu.cn/wiki/disabled-root',
+        localDir: '已停用',
+        layoutProfile: 'directory-readme',
+        enabled: false,
+      },
+    ]);
+    expect(roots).toEqual(expect.arrayContaining([
+      expect.objectContaining({ nodeToken: 'tech-root', childCount: 1, displayName: '技术 - Dev' }),
+      expect.objectContaining({ nodeToken: 'disabled-root', childCount: 0, displayName: '[已停用] 已停用' }),
+    ]));
+    store.close();
+  });
 });
