@@ -39,9 +39,14 @@ import {
 import {
   resolveAbsolute,
   resolveLocalTarget,
+  toPortableRelative,
 } from './path-resolver.js';
 import { commitDocumentContent } from './content-commit.js';
 import type { DocumentIR } from './document-ir.js';
+import {
+  createAtomicCommitWorkspace,
+  rollbackAtomicPlan,
+} from './atomic-commit.js';
 
 interface FetchedDocument {
   content: string;
@@ -95,12 +100,23 @@ interface Attachment {
   path: string;
 }
 
+/** Test-only fault injection for Gate 3 SyncEngine apply path. */
+export interface SyncEngineTestHooks {
+  /** Fail after atomic file commit, before DB mark — must restore files. */
+  failAfterFileCommit?: boolean;
+  /** Fail before atomic file commit — KB must stay untouched. */
+  failBeforeCommit?: boolean;
+  /** After first successful sub-sheet CSV fetch, fail remaining sheets. */
+  failSheetAfterFirst?: boolean;
+}
+
 interface SyncEngineDeps {
   larkCliClient: any; // LarkCliClient
   localMapStore: any; // LocalMapStore
   config: any; // Config
   layoutReconstructor?: any; // Optional M3 injection
   contentAdapter?: any; // Optional M3 injection
+  testHooks?: SyncEngineTestHooks;
 }
 
 export class SyncEngine {
@@ -109,6 +125,7 @@ export class SyncEngine {
   private config: any;
   private layoutReconstructor?: any;
   private contentAdapter?: any;
+  private testHooks: SyncEngineTestHooks;
 
   constructor(deps: SyncEngineDeps) {
     this.larkCliClient = deps.larkCliClient;
@@ -116,6 +133,7 @@ export class SyncEngine {
     this.config = deps.config;
     this.layoutReconstructor = deps.layoutReconstructor;
     this.contentAdapter = deps.contentAdapter;
+    this.testHooks = deps.testHooks ?? {};
   }
 
   /** All Feishu subprocess work is delegated to the injected client. */
@@ -337,51 +355,62 @@ export class SyncEngine {
       };
     }
 
-    // 2. Download images (three-tier fallback)
+    // 2–5. Prepare content entirely outside the knowledge base.
+    // Media and CSV land only under operation staging / OS temp until the
+    // atomic commit swaps them into the final target (Gate 3 all-or-nothing).
     const localMdPath = doc.localMdPath || this.generateLocalPath(doc);
-    const saveDir = path.dirname(localMdPath);
-    const images = await this.downloadImages(fetched, saveDir);
+    const operationDirectory = resolveOperationDirectory(
+      this.config.knowledgeBaseRoot,
+      this.config.operationManifestDir,
+    );
+    const operationId = `doc-${doc.objToken.slice(0, 12)}-${Date.now()}`;
+    const { stagingRoot } = createAtomicCommitWorkspace({
+      operationId,
+      knowledgeBaseRoot: this.config.knowledgeBaseRoot,
+      operationDirectory,
+    });
+    const relativeMd =
+      toPortableRelative(this.config.knowledgeBaseRoot, localMdPath) ||
+      path.basename(localMdPath);
+    const relativeDir = relativeMd.includes('/')
+      ? relativeMd.slice(0, relativeMd.lastIndexOf('/'))
+      : '';
+    const stagingDocDir = relativeDir
+      ? path.join(stagingRoot, ...relativeDir.split('/'))
+      : stagingRoot;
+    fs.mkdirSync(stagingDocDir, { recursive: true });
 
-    // 3. Download attachments
-    const attachments = await this.downloadAttachments(fetched, saveDir);
+    const images = await this.downloadImages(fetched, stagingDocDir);
+    const attachments = await this.downloadAttachments(fetched, stagingDocDir);
 
-    // 4. Synced-block expansion (R3.9 / M2-B): NOT implemented.
-    //    P0-Q3 实测 confirmed Feishu markdown export contains no
-    //    <synced_reference> tags in this deployment, so this step is a
-    //    no-op (content flows through unchanged).
     const expandedContent = fetched.content;
 
-    // 5. Export sheets if applicable (v0.2.0: also map sub-sheets to
-    //    the sheet_sheets table for finer-grained change detection)
-    const sheets: Array<{ sheetId: string; title: string; csvPath: string }> = [];
+    const sheets: Array<{ sheetId: string; title: string; csvPath: string; csvRel: string }> = [];
     if (doc.objType === 'sheet') {
-      // P1 修复: csvDataDir 约定 = `{docname}.csv-data/`（与 fetch-feishu-doc
-      // skill 约定对齐，根治旧 `csv-data/` 单目录的 tech debt）。docname
-      // 来自 localMdPath 去扩展名（与 generateHtmlHeader / upsertDocument
-      // 的 title 字段语义一致）。
       const docname = path.basename(localMdPath, '.md');
-      const exportedSheets = await this.exportSheetsAndMap(doc.objToken, saveDir, docname);
+      const exportedSheets = await this.exportSheetsToStaging(
+        doc.objToken,
+        stagingDocDir,
+        docname,
+      );
       sheets.push(...exportedSheets);
     }
 
-    // 6. Table reconstruction (M3 - apply to exported sheets)
+    // 6. Table reconstruction — any sub-sheet failure aborts the document.
     let finalContent = expandedContent;
     if (this.layoutReconstructor && sheets.length > 0) {
-      // Reconstruct each sheet and append to content
       const reconstructedSheets: string[] = [];
       for (const sheet of sheets) {
-        try {
-          const reconstructedMarkdown = await this.layoutReconstructor.reconstructToMarkdown(sheet.csvPath);
-          reconstructedSheets.push(`## ${sheet.title}\n\n${reconstructedMarkdown}`);
-          console.info(`[SyncEngine] Reconstructed sheet "${sheet.title}" from ${sheet.csvPath}`);
-        } catch (error) {
-          console.warn(`[SyncEngine] Failed to reconstruct sheet "${sheet.title}":`, error);
-          // Continue with other sheets on failure
-        }
+        const reconstructedMarkdown = await this.layoutReconstructor.reconstructToMarkdown(
+          sheet.csvPath,
+        );
+        reconstructedSheets.push(
+          `## 子表: ${sheet.title}\n\n[CSV 原始数据](${sheet.csvRel})\n\n${reconstructedMarkdown}`,
+        );
+        console.info(`[SyncEngine] Reconstructed sheet "${sheet.title}" from ${sheet.csvPath}`);
       }
-      // Append reconstructed sheets to content
       if (reconstructedSheets.length > 0) {
-        finalContent = expandedContent + '\n\n' + reconstructedSheets.join('\n\n---\n\n');
+        finalContent = reconstructedSheets.join('\n\n---\n\n');
       }
     }
 
@@ -463,16 +492,12 @@ export class SyncEngine {
       }
     }
 
-    // 8. Atomic content commit (P3). Staging + validate + rename; DB after.
-    //    Legacy writeLocalMarkdown remains for emergency FEISHU_SYNC_LEGACY_WRITE=1.
+    // 8. Atomic content commit: only this step mutates knowledge-base files.
     const headerMeta = this.resolveHeaderMeta(doc, fetched);
     if (process.env.FEISHU_SYNC_LEGACY_WRITE === '1') {
       await this.writeLocalMarkdown(localMdPath, finalContent, headerMeta);
+      await this.updateLocalMap(doc, localMdPath);
     } else {
-      const operationDirectory = resolveOperationDirectory(
-        this.config.knowledgeBaseRoot,
-        this.config.operationManifestDir,
-      );
       const ir: DocumentIR = {
         objToken: doc.objToken,
         wikiNodeToken: headerMeta.wikiNodeToken,
@@ -482,8 +507,8 @@ export class SyncEngine {
         originalLink: headerMeta.originalLink,
         observedObjEditTime: doc.observedObjEditTime ?? null,
         bodyMarkdown: finalContent,
-        images: images.map((img, index) => ({
-          relativePath: `images/${String(index + 1).padStart(2, '0')}-${img.token}.png`,
+        images: images.map((img) => ({
+          relativePath: `images/${path.basename(img.path)}`,
           token: img.token,
         })),
         attachments: attachments.map((att) => ({
@@ -494,47 +519,73 @@ export class SyncEngine {
         sheets: sheets.map((sheet) => ({
           sheetId: sheet.sheetId,
           title: sheet.title,
-          csvRelativePath: `${path.basename(localMdPath, '.md')}.csv-data/${path.basename(sheet.csvPath)}`,
-          csvContent: fs.existsSync(sheet.csvPath)
-            ? fs.readFileSync(sheet.csvPath, 'utf-8')
-            : '',
+          csvRelativePath: sheet.csvRel,
+          csvContent: fs.readFileSync(sheet.csvPath, 'utf-8'),
         })),
       };
-      const mdRelBase = (() => {
-        const rel = path.relative(this.config.knowledgeBaseRoot, path.dirname(localMdPath));
-        if (!rel || rel.startsWith('..')) return '';
-        return rel.split(path.sep).join('/');
-      })();
       const extraFiles: Array<{ relativePath: string; absoluteSource: string }> = [];
       for (const img of images) {
         const name = path.basename(img.path);
         extraFiles.push({
-          relativePath: mdRelBase ? `${mdRelBase}/images/${name}` : `images/${name}`,
+          relativePath: relativeDir ? `${relativeDir}/images/${name}` : `images/${name}`,
           absoluteSource: img.path,
         });
       }
       for (const att of attachments) {
         const name = path.basename(att.path);
         extraFiles.push({
-          relativePath: mdRelBase ? `${mdRelBase}/attachments/${name}` : `attachments/${name}`,
+          relativePath: relativeDir
+            ? `${relativeDir}/attachments/${name}`
+            : `attachments/${name}`,
           absoluteSource: att.path,
         });
       }
+
       const commit = commitDocumentContent({
-        operationId: `doc-${doc.objToken.slice(0, 12)}-${Date.now()}`,
+        operationId,
         knowledgeBaseRoot: this.config.knowledgeBaseRoot,
         operationDirectory,
         localMdPath,
         ir,
         extraFiles,
+        failBeforeCommit: this.testHooks.failBeforeCommit === true,
+        // failAfterFileCommit is handled here so DB linkage can roll files back.
       });
       if (!commit.ok) {
         throw new Error(commit.error || '原子内容提交失败');
       }
-    }
 
-    // 9. Update local mapping only after successful file write
-    await this.updateLocalMap(doc, localMdPath);
+      // 9. DB baseline + sheet_sheets only after files are committed.
+      //    Any DB-stage failure restores prior file bytes from the commit plan.
+      try {
+        if (this.testHooks.failAfterFileCommit) {
+          throw new Error('注入失败：文件提交后数据库事务失败');
+        }
+        await this.updateLocalMap(doc, localMdPath);
+        const nowIso = new Date().toISOString();
+        for (const sheet of sheets) {
+          const finalCsv = path.join(
+            path.dirname(localMdPath),
+            ...sheet.csvRel.split('/'),
+          );
+          if (typeof this.localMapStore.upsertSheetSheet === 'function') {
+            this.localMapStore.upsertSheetSheet({
+              sheetObjToken: doc.objToken,
+              sheetId: sheet.sheetId,
+              sheetTitle: sheet.title,
+              localCsvPath: finalCsv,
+              lastSyncedModifyTime: nowIso,
+              status: 'synced',
+            });
+          }
+        }
+      } catch (dbError) {
+        rollbackAtomicPlan(commit.plan);
+        throw dbError instanceof Error
+          ? dbError
+          : new Error(String(dbError));
+      }
+    }
 
     return {
       objToken: doc.objToken,
@@ -1048,111 +1099,70 @@ export class SyncEngine {
   }
 
   /**
-   * Export spreadsheet sub-sheets to CSV files AND map each sub-sheet to
-   * the sheet_sheets table (03 §3.5). Workbook-level obj_edit_time is
-   * shared across all sub-sheets on the Feishu side, so per-sub-sheet
-   * change detection is performed by ChangeDetector.detectSheetSubChanges
-   * via set differences against this mapping.
-   *
-   * P1 修复 (feishu-sync-troop-sync-20260701):
-   *   1. CSV 通道: `workbook-export` 在部分 sheet 上返回 1069902 no
-   *      permission（参考 200-042 报告 D1），改用 `sheets +csv-get`。
-   *      csv-get 返回 `data.annotated_csv`（纯 CSV 文本），直接落盘。
-   *   2. 目录约定: 从旧 `csv-data/` 单目录改为 `{docname}.csv-data/`，
-   *      与 fetch-feishu-doc skill 约定对齐，根治 tech debt。
-   *
-   * Sub-sheet rows are upserted with COALESCE on local_md_path so a
-   * later reconstruction pass can fill in the per-sub-sheet .md path
-   * without this method needing to know about reconstruction.
+   * Export every sub-sheet CSV into a staging directory only.
+   * Does NOT write into the knowledge base and does NOT touch sheet_sheets —
+   * those DB rows are written only after atomic file commit succeeds.
    */
-  private async exportSheetsAndMap(
+  private async exportSheetsToStaging(
     sheetToken: string,
-    saveDir: string,
-    docname: string
-  ): Promise<Array<{ sheetId: string; title: string; csvPath: string }>> {
-    // P1: csvDataDir 对齐 fetch-feishu-doc skill 约定 = {docname}.csv-data/
-    const csvDataDir = path.join(saveDir, `${docname}.csv-data`);
+    stagingDocDir: string,
+    docname: string,
+  ): Promise<Array<{ sheetId: string; title: string; csvPath: string; csvRel: string }>> {
+    const csvDataDir = path.join(stagingDocDir, `${docname}.csv-data`);
+    fs.mkdirSync(csvDataDir, { recursive: true });
 
-    // Create csv-data directory if it doesn't exist
-    if (!fs.existsSync(csvDataDir)) {
-      fs.mkdirSync(csvDataDir, { recursive: true });
+    const exports: Array<{
+      sheetId: string;
+      title: string;
+      csvPath: string;
+      csvRel: string;
+    }> = [];
+
+    const workbookInfo = await this.requireLarkCliClient().getWorkbookInfo(sheetToken);
+    const sheetsList = (workbookInfo.data?.sheets || []) as Array<{
+      sheet_id: string;
+      sheet_name: string;
+      row_count?: number;
+      column_count?: number;
+    }>;
+
+    if (sheetsList.length === 0) {
+      throw new Error(`workbook 无子表: ${sheetToken}`);
     }
 
-    const exports: Array<{ sheetId: string; title: string; csvPath: string }> = [];
-
-    try {
-      // 1. List all sub-sheets in the workbook
-      const workbookInfo = await this.requireLarkCliClient().getWorkbookInfo(sheetToken);
-
-      const sheetsList = (workbookInfo.data?.sheets || []) as Array<{
-        sheet_id: string;
-        sheet_name: string;
-        row_count?: number;
-        column_count?: number;
-        index?: number;
-      }>;
-
-      const nowIso = new Date().toISOString();
-
-      // 2. Export each sub-sheet to CSV + upsert sheet_sheets row.
-      //    P1: 改用 csv-get（workbook-export 在该类 sheet 上 1069902 no permission）。
-      for (const sheet of sheetsList) {
-        const csvPath = path.join(csvDataDir, `${sheet.sheet_name}.csv`);
-
-        try {
-          // csv-get 需要 A1 形式 range，根据 workbook-info 报告的
-          // row_count × column_count 构造。多拉无害（空白单元不影响下游）。
-          const rows = sheet.row_count ?? 200;
-          const cols = sheet.column_count ?? 20;
-          const range = `A1:${colToLetter(cols)}${rows}`;
-
-          // LarkCliClient owns argument construction, rate limiting,
-          // timeout/error classification and NDJSON/JSON parsing.
-          const csvResult = await this.requireLarkCliClient().getSheetCsv({
-            spreadsheetToken: sheetToken,
-            sheetId: sheet.sheet_id,
-            range,
-          });
-
-          // annotated_csv 是纯 CSV 字符串（含可能的 \r\n、UTF-8 BOM 等）
-          const csvText = csvResult?.data?.annotated_csv ?? '';
-          if (!csvText || csvText.trim().length === 0) {
-            throw new Error(
-              `csv-get 返回空内容: sheet="${sheet.sheet_name}" range=${range}`,
-            );
-          }
-          fs.writeFileSync(csvPath, csvText, 'utf-8');
-          exports.push({
-            sheetId: sheet.sheet_id,
-            title: sheet.sheet_name,
-            csvPath,
-          });
-          console.info(`[SyncEngine] Exported sheet "${sheet.sheet_name}" to ${csvPath}`);
-        } catch (error) {
-          throw error instanceof Error
-            ? error
-            : new Error(`导出子表失败: ${sheet.sheet_name}: ${String(error)}`);
-        }
+    for (let index = 0; index < sheetsList.length; index += 1) {
+      const sheet = sheetsList[index];
+      if (this.testHooks.failSheetAfterFirst && index > 0) {
+        throw new Error(`注入失败：子表导出中止于 ${sheet.sheet_name}`);
       }
 
-      for (const item of exports) {
-        this.localMapStore.upsertSheetSheet({
-          sheetObjToken: sheetToken,
-          sheetId: item.sheetId,
-          sheetTitle: item.title,
-          localCsvPath: item.csvPath,
-          lastSyncedModifyTime: nowIso,
-          status: 'synced',
-        });
+      const safeTitle = sheet.sheet_name.replace(/[<>:"/\\|?*\u0000-\u001F]/g, '_');
+      const csvPath = path.join(csvDataDir, `${safeTitle}.csv`);
+      const rows = sheet.row_count ?? 200;
+      const cols = sheet.column_count ?? 20;
+      const range = `A1:${colToLetter(cols)}${rows}`;
+
+      const csvResult = await this.requireLarkCliClient().getSheetCsv({
+        spreadsheetToken: sheetToken,
+        sheetId: sheet.sheet_id,
+        range,
+      });
+      const csvText = csvResult?.data?.annotated_csv ?? '';
+      if (!csvText || csvText.trim().length === 0) {
+        throw new Error(
+          `csv-get 返回空内容: sheet="${sheet.sheet_name}" range=${range}`,
+        );
       }
-    } catch (error) {
-      console.error(`[SyncEngine] Failed to list sheets for ${sheetToken}:`, error);
-      throw error;
+      fs.writeFileSync(csvPath, csvText, 'utf-8');
+      exports.push({
+        sheetId: sheet.sheet_id,
+        title: sheet.sheet_name,
+        csvPath,
+        csvRel: `${docname}.csv-data/${safeTitle}.csv`,
+      });
+      console.info(`[SyncEngine] Staged sheet "${sheet.sheet_name}" at ${csvPath}`);
     }
 
-    if (exports.length === 0) {
-      throw new Error(`workbook 无成功导出的子表: ${sheetToken}`);
-    }
     return exports;
   }
 }
