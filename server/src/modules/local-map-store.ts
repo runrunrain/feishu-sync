@@ -804,6 +804,16 @@ export class LocalMapStore {
   }
 
   /**
+   * Run a group of writes in one SQLite transaction.
+   * Used by SyncEngine so sheet_sheets + markDocumentSynced either both
+   * commit or both roll back (Gate 3 file/DB linkage).
+   */
+  withTransaction<T>(fn: () => T): T {
+    const tx = this.db.transaction(fn);
+    return tx();
+  }
+
+  /**
    * Close database connection
    */
   close(): void {

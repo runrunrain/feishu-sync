@@ -164,6 +164,76 @@ describe('SyncEngine atomic apply path', () => {
     expect(row?.syncState).toBe('synced');
   });
 
+  it('mid-DB failure after markDocumentSynced rolls back synced baseline and files', async () => {
+    const { kb, store, config } = makeWorkspace();
+    const mdPath = path.join(kb, '策划 - Designer', '表格.md');
+    fs.mkdirSync(path.dirname(mdPath), { recursive: true });
+    fs.writeFileSync(mdPath, '# prior sheet body\n');
+
+    store.upsertDocument({
+      objToken: 'tok-sheet',
+      wikiNodeToken: 'node-sheet',
+      objType: 'sheet',
+      title: '表格',
+      localMdPath: mdPath,
+      lastSyncedModifyTime: 'old',
+      lastSyncedAt: '2026-01-01T00:00:00.000Z',
+      status: 'synced',
+      localRelPath: '策划 - Designer/表格.md',
+      watchedRootId: 'designer',
+      syncedObjEditTime: 999,
+      observedObjEditTime: 999,
+      syncState: 'synced',
+    } as any);
+    store.markDocumentSynced({
+      objToken: 'tok-sheet',
+      syncedObjEditTime: 999,
+      localMdPath: mdPath,
+      lastSyncedModifyTime: 'old',
+      lastSyncedAt: '2026-01-01T00:00:00.000Z',
+    });
+
+    const engine = new SyncEngine({
+      larkCliClient: {
+        getWorkbookInfo: async () => ({
+          data: {
+            sheets: [
+              { sheet_id: 's1', sheet_name: '主表', row_count: 2, column_count: 2 },
+            ],
+          },
+        }),
+        getSheetCsv: async () => ({ data: { annotated_csv: 'a,b\n1,2\n' } }),
+      },
+      localMapStore: store,
+      config,
+      // Throw after markDocumentSynced inside the same SQLite transaction.
+      testHooks: { failAfterMarkDocumentSynced: true },
+    });
+
+    const result = await engine.syncDocuments(
+      [
+        makeDoc({
+          objToken: 'tok-sheet',
+          objType: 'sheet',
+          title: '表格',
+          localMdPath: mdPath,
+          localRelPath: '策划 - Designer/表格.md',
+          watchedRootId: 'designer',
+          observedObjEditTime: 1_111,
+        }),
+      ],
+      { enableLLM: false, fullSync: false, apply: true, confirmation: 'APPLY' },
+    );
+
+    expect(result.success).toBe(false);
+    // Files restored to prior body.
+    expect(fs.readFileSync(mdPath, 'utf-8')).toBe('# prior sheet body\n');
+    // Criterion 3: synced baseline must NOT advance when DB stage aborts.
+    const row = store.getDocumentByObjToken('tok-sheet');
+    expect(row?.syncedObjEditTime).toBe(999);
+    expect(row?.syncState).toBe('synced');
+  });
+
   it('DB-stage failure after file commit restores prior markdown bytes', async () => {
     const { kb, ops, store, config } = makeWorkspace();
     const mdPath = path.join(kb, '技术 - Dev', '原子文档', 'README.md');

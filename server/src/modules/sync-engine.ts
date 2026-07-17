@@ -102,8 +102,14 @@ interface Attachment {
 
 /** Test-only fault injection for Gate 3 SyncEngine apply path. */
 export interface SyncEngineTestHooks {
-  /** Fail after atomic file commit, before DB mark — must restore files. */
+  /** Fail after atomic file commit, before any DB write — must restore files. */
   failAfterFileCommit?: boolean;
+  /**
+   * Fail after markDocumentSynced inside the DB transaction (e.g. after
+   * sheet_sheets upsert). Transaction must abort so synced baseline stays put
+   * and files must be restored.
+   */
+  failAfterMarkDocumentSynced?: boolean;
   /** Fail before atomic file commit — KB must stay untouched. */
   failBeforeCommit?: boolean;
   /** After first successful sub-sheet CSV fetch, fail remaining sheets. */
@@ -556,28 +562,68 @@ export class SyncEngine {
       }
 
       // 9. DB baseline + sheet_sheets only after files are committed.
-      //    Any DB-stage failure restores prior file bytes from the commit plan.
+      //    All DB writes run in one SQLite transaction so a mid-DB failure
+      //    cannot advance synced_obj_edit_time while leaving sheet_sheets
+      //    half-written (or vice versa). Any failure also restores prior files.
       try {
         if (this.testHooks.failAfterFileCommit) {
           throw new Error('注入失败：文件提交后数据库事务失败');
         }
-        await this.updateLocalMap(doc, localMdPath);
-        const nowIso = new Date().toISOString();
-        for (const sheet of sheets) {
-          const finalCsv = path.join(
-            path.dirname(localMdPath),
-            ...sheet.csvRel.split('/'),
-          );
-          if (typeof this.localMapStore.upsertSheetSheet === 'function') {
-            this.localMapStore.upsertSheetSheet({
-              sheetObjToken: doc.objToken,
-              sheetId: sheet.sheetId,
-              sheetTitle: sheet.title,
-              localCsvPath: finalCsv,
-              lastSyncedModifyTime: nowIso,
-              status: 'synced',
+
+        const applyDbWrites = (): void => {
+          const nowIso = new Date().toISOString();
+          // Sheet rows first; synced baseline is the final commit marker.
+          for (const sheet of sheets) {
+            const finalCsv = path.join(
+              path.dirname(localMdPath),
+              ...sheet.csvRel.split('/'),
+            );
+            if (typeof this.localMapStore.upsertSheetSheet === 'function') {
+              this.localMapStore.upsertSheetSheet({
+                sheetObjToken: doc.objToken,
+                sheetId: sheet.sheetId,
+                sheetTitle: sheet.title,
+                localCsvPath: finalCsv,
+                lastSyncedModifyTime: nowIso,
+                status: 'synced',
+              });
+            }
+          }
+          // Synchronous DB writes only — must stay inside the SQLite transaction.
+          this.localMapStore.upsertDocument({
+            objToken: doc.objToken,
+            wikiNodeToken: doc.wikiNodeToken ?? null,
+            objType: doc.objType,
+            title: doc.title,
+            localMdPath,
+            lastSyncedModifyTime: doc.cloudModifiedTime,
+            lastSyncedAt: nowIso,
+            status: 'synced',
+            localRelPath:
+              toPortableRelative(this.config.knowledgeBaseRoot, localMdPath) ??
+              null,
+            watchedRootId: doc.watchedRootId ?? null,
+          });
+          if (typeof this.localMapStore.markDocumentSynced === 'function') {
+            this.localMapStore.markDocumentSynced({
+              objToken: doc.objToken,
+              syncedObjEditTime: doc.observedObjEditTime ?? null,
+              localMdPath,
+              lastSyncedModifyTime: doc.cloudModifiedTime,
+              lastSyncedAt: nowIso,
             });
           }
+          if (this.testHooks.failAfterMarkDocumentSynced) {
+            throw new Error(
+              '注入失败：markDocumentSynced 之后 sheet/DB 事务中止',
+            );
+          }
+        };
+
+        if (typeof this.localMapStore.withTransaction === 'function') {
+          this.localMapStore.withTransaction(applyDbWrites);
+        } else {
+          applyDbWrites();
         }
       } catch (dbError) {
         rollbackAtomicPlan(commit.plan);
