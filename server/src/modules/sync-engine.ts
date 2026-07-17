@@ -322,6 +322,23 @@ export class SyncEngine {
         url: '',
         obj_token: doc.objToken,
       };
+    } else if (doc.objType === 'slides') {
+      // docs+fetch only supports docx (API 3380002). Keep a deterministic
+      // markdown placeholder body; media still downloads when tokens exist.
+      console.info(
+        `[SyncEngine] objType=slides, skipping docs+fetch (unsupported by docs+fetch)`,
+      );
+      fetched = {
+        content:
+          `# ${doc.title}\n\n` +
+          `> 飞书幻灯片（slides）。当前 lark-cli \`docs +fetch\` 不支持 slides，` +
+          `已同步元数据占位；完整页面内容请在飞书中查看。\n`,
+        images: [],
+        attachments: [],
+        sheets: [],
+        url: '',
+        obj_token: doc.objToken,
+      };
     } else {
       try {
         fetched = await this.fetchDocumentContent(doc.objToken, doc.objType);
@@ -336,6 +353,23 @@ export class SyncEngine {
             attachments: [],
             sheets: [],
             url: doc.localMdPath || '', // Will be filled in writePlaceholder
+            obj_token: doc.objToken,
+          };
+        } else if (
+          error instanceof Error &&
+          (error.message.includes('3380002') || error.message.includes('Unsupported document type'))
+        ) {
+          console.warn(
+            `[SyncEngine] Unsupported fetch type for ${doc.title}, writing metadata body`,
+          );
+          fetched = {
+            content:
+              `# ${doc.title}\n\n` +
+              `> 云端类型 \`${doc.objType}\` 无法用 docs+fetch 导出正文，已保留元数据占位。\n`,
+            images: [],
+            attachments: [],
+            sheets: [],
+            url: '',
             obj_token: doc.objToken,
           };
         } else {
