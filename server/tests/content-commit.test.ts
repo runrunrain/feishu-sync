@@ -6,7 +6,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { commitDocumentContent } from '../src/modules/content-commit.js';
-import type { DocumentIR } from '../src/modules/document-ir.js';
+import {
+  renderDocumentMarkdown,
+  type DocumentIR,
+} from '../src/modules/document-ir.js';
 import Database from 'better-sqlite3';
 
 function makeIr(overrides: Partial<DocumentIR> = {}): DocumentIR {
@@ -52,6 +55,18 @@ describe('commitDocumentContent', () => {
     expect(body).toContain('obj_token: "tok-doc"');
     expect(body).toContain('# 示例文档');
     expect(body).toContain('正文段落');
+  });
+
+  it('renders live Feishu Unix-second edit times as a real ISO timestamp', () => {
+    const rendered = renderDocumentMarkdown(
+      makeIr({ observedObjEditTime: 1_783_589_445 }),
+      { fetchDate: '2026-07-17' },
+    );
+
+    expect(rendered.markdown).toContain(
+      'last_synced_modify_time: "2026-07-09T09:30:45.000Z"',
+    );
+    expect(rendered.markdown).not.toContain('1970-01-21');
   });
 
   it('sheet all-or-nothing: empty CSV aborts and does not replace prior body', () => {

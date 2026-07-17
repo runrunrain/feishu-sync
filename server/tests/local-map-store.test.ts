@@ -187,6 +187,58 @@ describe('LocalMapStore runtime schema', () => {
     store.close();
   });
 
+  it('requeues a legacy millisecond synced baseline instead of hiding it as synced', () => {
+    const dbPath = createDatabasePath();
+    const store = new LocalMapStore(dbPath);
+    store.initialize();
+    const observedSeconds = 1_783_050_076;
+
+    store.recordCloudObservation({
+      objToken: 'legacy-slides',
+      wikiNodeToken: 'slides-node',
+      objType: 'slides',
+      title: '历史 Slides 占位',
+      spaceId: 'space-1',
+      parentNodeToken: 'root-1',
+      watchedRootId: 'root-1',
+      watchedRootUrl: 'https://tenant.feishu.cn/wiki/root-1',
+      observedObjEditTime: observedSeconds,
+      hasChild: false,
+      observationStatus: 'available',
+      lastSeenAt: '2026-07-17T00:00:00.000Z',
+    });
+    store.markDocumentSynced({
+      objToken: 'legacy-slides',
+      // Legacy code incorrectly persisted a local millisecond timestamp.
+      syncedObjEditTime: 1_784_285_402_271,
+      localMdPath: '/tmp/legacy-slides.md',
+      localRelPath: '历史 Slides 占位.md',
+      lastSyncedAt: '2026-07-17T00:01:00.000Z',
+    });
+
+    const observedAgain = store.recordCloudObservation({
+      objToken: 'legacy-slides',
+      wikiNodeToken: 'slides-node',
+      objType: 'slides',
+      title: '历史 Slides 占位',
+      spaceId: 'space-1',
+      parentNodeToken: 'root-1',
+      watchedRootId: 'root-1',
+      watchedRootUrl: 'https://tenant.feishu.cn/wiki/root-1',
+      observedObjEditTime: observedSeconds,
+      hasChild: false,
+      observationStatus: 'available',
+      lastSeenAt: '2026-07-17T00:02:00.000Z',
+    });
+
+    expect(observedAgain).toMatchObject({
+      syncState: 'pending_modified',
+      observedObjEditTime: observedSeconds,
+      syncedObjEditTime: 1_784_285_402_271,
+    });
+    store.close();
+  });
+
   it('backfills local records from structured root authority without erasing cloud-only ownership', () => {
     const dbPath = createDatabasePath();
     const kbRoot = path.join(path.dirname(dbPath), '知识库');

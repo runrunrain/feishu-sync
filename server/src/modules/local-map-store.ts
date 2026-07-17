@@ -894,6 +894,17 @@ export class LocalMapStore {
     const synced = current.syncedObjEditTime ?? null;
     const hasLocalContent = current.localMdPath.trim().length > 0;
 
+    // A historical writer stored the local wall-clock timestamp in
+    // synced_obj_edit_time for at least one failed Slides export, while the
+    // upstream wiki API supplies Unix seconds.  That makes the local baseline
+    // roughly 1000x newer than the cloud observation and can permanently hide
+    // an old metadata placeholder as "synced".  A baseline may never be that
+    // far ahead of the exact cloud version it acknowledges, so fail closed and
+    // require a new atomic export instead of normalizing it in place.
+    if (this.hasLegacyTimestampUnitMismatch(observed, synced)) {
+      return hasLocalContent ? 'pending_modified' : 'pending_added';
+    }
+
     if (currentState === 'restricted') {
       if (!hasLocalContent) return 'pending_added';
       if (observed == null || synced == null || observed > synced) return 'pending_modified';
@@ -913,6 +924,21 @@ export class LocalMapStore {
       return hasLocalContent ? 'pending_modified' : 'pending_added';
     }
     return 'synced';
+  }
+
+  /** Detect the known seconds-vs-milliseconds legacy baseline corruption. */
+  private hasLegacyTimestampUnitMismatch(
+    observed: number | null,
+    synced: number | null,
+  ): boolean {
+    return (
+      observed != null &&
+      synced != null &&
+      Number.isFinite(observed) &&
+      Number.isFinite(synced) &&
+      observed > 0 &&
+      synced > observed * 100
+    );
   }
 
   /**

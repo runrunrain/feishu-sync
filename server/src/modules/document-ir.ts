@@ -39,6 +39,10 @@ export interface DocumentIR {
   objType: DocumentObjType;
   title: string;
   originalLink: string | null;
+  /**
+   * Feishu supplies Unix seconds.  The renderer also accepts historical
+   * millisecond values so an existing local map can be repaired safely.
+   */
   observedObjEditTime: number | null;
   /** Body markdown without the feishu_sync HTML header. */
   bodyMarkdown: string;
@@ -61,6 +65,7 @@ export function renderDocumentMarkdown(ir: DocumentIR, options?: {
   fetchDate?: string;
 }): RenderedDocument {
   const fetchDate = options?.fetchDate ?? new Date().toISOString().slice(0, 10);
+  const observedEditIso = toIso8601FromObservedEditTime(ir.observedObjEditTime);
   const header = [
     '<!--',
     'feishu_sync:',
@@ -70,8 +75,8 @@ export function renderDocumentMarkdown(ir: DocumentIR, options?: {
     `  obj_type: "${ir.objType}"`,
     ir.originalLink ? `  original_link: "${ir.originalLink}"` : null,
     `  fetch_date: "${fetchDate}"`,
-    ir.observedObjEditTime != null
-      ? `  last_synced_modify_time: "${new Date(ir.observedObjEditTime).toISOString()}"`
+    observedEditIso
+      ? `  last_synced_modify_time: "${observedEditIso}"`
       : null,
     '-->',
     '',
@@ -112,6 +117,17 @@ export function renderDocumentMarkdown(ir: DocumentIR, options?: {
     markdown: header + body,
     requiredRelativePaths,
   };
+}
+
+/** Render current seconds and legacy millisecond edit times as ISO-8601. */
+function toIso8601FromObservedEditTime(value: number | null): string | null {
+  if (value == null || !Number.isFinite(value) || value <= 0) return null;
+  // Contemporary Feishu wiki obj_edit_time values are Unix seconds (10
+  // digits).  Older local fixtures and persisted rows may carry milliseconds
+  // (13 digits), which must remain readable during recovery.
+  const milliseconds = value < 100_000_000_000 ? value * 1000 : value;
+  const date = new Date(milliseconds);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
 }
 
 /** Fail if any required relative path is missing or empty under baseDir. */
