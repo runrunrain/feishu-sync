@@ -493,9 +493,11 @@ describe('MappingService.getTreeDetailed (v0.2.0 structure-align Phase B)', () =
 
     const feishu = svc.getTreeDetailed({ view: 'feishu' });
 
-    // Only the titled node survives in feishu view.
-    expect(feishu.nodes.map((n) => n.obj_token)).toEqual(['GOOD']);
-    expect(feishu.stats.total_nodes).toBe(1);
+    // P2 Gate 2: placeholders remain visible with diagnostic titles.
+    expect(feishu.nodes.map((n) => n.obj_token).sort()).toEqual(['GOOD', 'PH1', 'PH2']);
+    expect(feishu.stats.total_nodes).toBe(3);
+    const placeholders = feishu.nodes.filter((n) => n.obj_token.startsWith('PH'));
+    expect(placeholders.every((n) => n.title.includes('权限受限') || n.title.length > 0)).toBe(true);
 
     // Local view keeps ALL rows (placeholder rows have local_path=''
     // and are naturally skipped by LocalDirTreeView's splitPath, so

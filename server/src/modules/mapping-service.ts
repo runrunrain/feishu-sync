@@ -179,12 +179,31 @@ export class MappingService {
       // local view must keep every row so LocalDirTreeView can show all
       // on-disk files (placeholder rows have local_path='' and are
       // naturally skipped by splitPath anyway).
+      // P2 Gate 2: keep restricted/pending placeholders visible even when
+      // title is empty — project a diagnostic display title instead of dropping.
       nodes = live
         .filter(
           (d) => d.wikiNodeToken != null && d.wikiNodeToken !== '',
         )
-        .filter((d) => (d.title ?? '').trim().length > 0)
-        .map((d) => this.projectNode(d, parentSet));
+        .map((d) => {
+          const node = this.projectNode(d, parentSet);
+          if (!(d.title ?? '').trim()) {
+            const state = d.syncState ?? d.status;
+            if (state === 'restricted' || d.cloudMatch === 'restricted' || d.status === 'placeholder') {
+              node.title = '(权限受限·占位)';
+              node.cloud_match = 'restricted';
+            } else if (
+              state === 'pending_added' ||
+              state === 'pending_modified' ||
+              state === 'missing_candidate'
+            ) {
+              node.title = node.title || `(${state})`;
+            } else {
+              node.title = node.title || '(未命名)';
+            }
+          }
+          return node;
+        });
     } else {
       // Local view: all rows (including local-only README/index).
       nodes = live.map((d) => this.projectNode(d, parentSet));

@@ -47,6 +47,40 @@ afterEach(() => {
   }
 });
 
+describe('config secret retain semantics (P4)', () => {
+  it('retains apiKey when partial update sends masked ***', async () => {
+    const configPath = createTempConfigPath();
+    fs.writeFileSync(configPath, JSON.stringify({
+      llm: {
+        openAiCompatBaseUrl: BIGMODEL_PAAS_V4,
+        claudeCompatBaseUrl: 'https://open.bigmodel.cn/api/anthropic',
+        apiKey: BIGMODEL_KEY,
+        model: 'glm-4-flash',
+        temperature: 0.2,
+        primaryChannel: 'claude-cli',
+        fallbackOnFailure: true,
+        claudeCli: { extraArgs: [] },
+      },
+      pollIntervalMinutes: 30,
+      knowledgeBaseRoot: '/tmp/kb',
+      watchedRoots: [],
+      requiredScopes: [],
+      enableAutoStart: true,
+      enableNotifications: true,
+    }, null, 2));
+    const mgr = new ConfigManager(configPath);
+    await mgr.load();
+    await mgr.updateConfig({
+      llm: {
+        model: 'glm-4-flash',
+        apiKey: '***',
+      } as any,
+    });
+    const reloaded = await mgr.load();
+    expect(reloaded.llm.apiKey).toBe(BIGMODEL_KEY);
+  });
+});
+
 describe('looksLikeBigmodelKey', () => {
   it('accepts a real bigmodel <id>.<secret> key', () => {
     expect(looksLikeBigmodelKey(BIGMODEL_KEY)).toBe(true);

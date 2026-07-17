@@ -40,6 +40,8 @@ import {
   resolveAbsolute,
   resolveLocalTarget,
 } from './path-resolver.js';
+import { commitDocumentContent } from './content-commit.js';
+import type { DocumentIR } from './document-ir.js';
 
 interface FetchedDocument {
   content: string;
@@ -133,14 +135,7 @@ export class SyncEngine {
   ): Promise<SyncResult> {
     const startedAt = new Date().toISOString();
     const requestedMode = resolveSyncMode(options);
-    // P0 only establishes the safety boundary. The existing write pipeline
-    // still lacks P3 staging, resource completeness checks and DB/file
-    // rollback, so even an explicitly acknowledged apply must remain closed.
-    // Keeping this guard in the engine prevents non-HTTP callers from
-    // bypassing the route-level product gate.
-    if (requestedMode === 'apply') {
-      throw new Error('正式写入尚未启用：请先完成 P3 原子提交与回滚验证');
-    }
+    // P3: apply goes through commitDocumentContent (staging + atomic rename).
     const mode = requestedMode;
     const manifest = createOperationManifest({
       knowledgeBaseRoot: this.config.knowledgeBaseRoot,
@@ -468,16 +463,77 @@ export class SyncEngine {
       }
     }
 
-    // 8. Write local markdown file
-    //    Resolve header metadata BEFORE writing so the YAML header
-    //    carries wiki_node_token / space_id / original_link even for the
-    //    sheet path (where fetched.url is empty — see resolveHeaderMeta
-    //    for the SQLite-fallback + host-construction that fixes the
-    //    historic `节点: unknown` / `原始链接:` empty defect).
+    // 8. Atomic content commit (P3). Staging + validate + rename; DB after.
+    //    Legacy writeLocalMarkdown remains for emergency FEISHU_SYNC_LEGACY_WRITE=1.
     const headerMeta = this.resolveHeaderMeta(doc, fetched);
-    await this.writeLocalMarkdown(localMdPath, finalContent, headerMeta);
+    if (process.env.FEISHU_SYNC_LEGACY_WRITE === '1') {
+      await this.writeLocalMarkdown(localMdPath, finalContent, headerMeta);
+    } else {
+      const operationDirectory = resolveOperationDirectory(
+        this.config.knowledgeBaseRoot,
+        this.config.operationManifestDir,
+      );
+      const ir: DocumentIR = {
+        objToken: doc.objToken,
+        wikiNodeToken: headerMeta.wikiNodeToken,
+        spaceId: headerMeta.spaceId,
+        objType: doc.objType,
+        title: doc.title,
+        originalLink: headerMeta.originalLink,
+        observedObjEditTime: doc.observedObjEditTime ?? null,
+        bodyMarkdown: finalContent,
+        images: images.map((img, index) => ({
+          relativePath: `images/${String(index + 1).padStart(2, '0')}-${img.token}.png`,
+          token: img.token,
+        })),
+        attachments: attachments.map((att) => ({
+          relativePath: `attachments/${path.basename(att.path)}`,
+          name: path.basename(att.path),
+          token: att.token,
+        })),
+        sheets: sheets.map((sheet) => ({
+          sheetId: sheet.sheetId,
+          title: sheet.title,
+          csvRelativePath: `${path.basename(localMdPath, '.md')}.csv-data/${path.basename(sheet.csvPath)}`,
+          csvContent: fs.existsSync(sheet.csvPath)
+            ? fs.readFileSync(sheet.csvPath, 'utf-8')
+            : '',
+        })),
+      };
+      const mdRelBase = (() => {
+        const rel = path.relative(this.config.knowledgeBaseRoot, path.dirname(localMdPath));
+        if (!rel || rel.startsWith('..')) return '';
+        return rel.split(path.sep).join('/');
+      })();
+      const extraFiles: Array<{ relativePath: string; absoluteSource: string }> = [];
+      for (const img of images) {
+        const name = path.basename(img.path);
+        extraFiles.push({
+          relativePath: mdRelBase ? `${mdRelBase}/images/${name}` : `images/${name}`,
+          absoluteSource: img.path,
+        });
+      }
+      for (const att of attachments) {
+        const name = path.basename(att.path);
+        extraFiles.push({
+          relativePath: mdRelBase ? `${mdRelBase}/attachments/${name}` : `attachments/${name}`,
+          absoluteSource: att.path,
+        });
+      }
+      const commit = commitDocumentContent({
+        operationId: `doc-${doc.objToken.slice(0, 12)}-${Date.now()}`,
+        knowledgeBaseRoot: this.config.knowledgeBaseRoot,
+        operationDirectory,
+        localMdPath,
+        ir,
+        extraFiles,
+      });
+      if (!commit.ok) {
+        throw new Error(commit.error || '原子内容提交失败');
+      }
+    }
 
-    // 9. Update local mapping
+    // 9. Update local mapping only after successful file write
     await this.updateLocalMap(doc, localMdPath);
 
     return {
@@ -538,25 +594,29 @@ export class SyncEngine {
 
       try {
         if (img.url) {
-          // Tier 1: Download with curl if URL is available
-          await this.execCurl(filepath, img.url);
+          await this.downloadUrlToFile(filepath, img.url);
         } else {
-          // Tier 2: Use media-download if only token is available
           await this.execMediaDownload(filepath, img.token);
+        }
+        if (!fs.existsSync(filepath) || fs.statSync(filepath).size <= 0) {
+          throw new Error(`图片为空: ${img.token}`);
         }
         images.push({ token: img.token, path: filepath });
       } catch (error) {
-        // Tier 3: Fallback to media-preview if media-download fails
         try {
           if (!img.url) {
             await this.execMediaPreview(filepath, img.token);
+            if (!fs.existsSync(filepath) || fs.statSync(filepath).size <= 0) {
+              throw new Error(`media-preview 空文件: ${img.token}`);
+            }
             images.push({ token: img.token, path: filepath });
           } else {
-            throw error; // Re-throw if curl failed
+            throw error;
           }
         } catch (previewError) {
-          console.warn(`[SyncEngine] Failed to download image ${img.token}:`, previewError);
-          // Continue with other images on failure
+          throw previewError instanceof Error
+            ? previewError
+            : new Error(String(previewError));
         }
       }
     }
@@ -582,13 +642,11 @@ export class SyncEngine {
     for (const attachment of doc.attachments) {
       const filepath = path.join(attachmentsDir, attachment.name);
 
-      try {
-        await this.execMediaDownload(filepath, attachment.token);
-        attachments.push({ token: attachment.token, path: filepath });
-      } catch (error) {
-        console.warn(`[SyncEngine] Failed to download attachment ${attachment.token}:`, error);
-        // Continue with other attachments on failure
+      await this.execMediaDownload(filepath, attachment.token);
+      if (!fs.existsSync(filepath) || fs.statSync(filepath).size <= 0) {
+        throw new Error(`附件下载失败或为空: ${attachment.token}`);
       }
+      attachments.push({ token: attachment.token, path: filepath });
     }
 
     return attachments;
@@ -777,17 +835,18 @@ export class SyncEngine {
     return fs.readFileSync(localMdPath, 'utf-8');
   }
 
-  /**
-   * Execute curl to download image
-   */
-  private async execCurl(filepath: string, url: string): Promise<void> {
-    const { exec } = require('child_process');
-    return new Promise((resolve, reject) => {
-      exec(`curl -sSL -o "${filepath}" "${url}"`, (error: any) => {
-        if (error) reject(error);
-        else resolve();
-      });
-    });
+  /** Download a URL with fetch — no shell, no string interpolation. */
+  private async downloadUrlToFile(filepath: string, url: string): Promise<void> {
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`URL 下载失败 HTTP ${response.status}`);
+    }
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.length === 0) {
+      throw new Error('URL 下载内容为空');
+    }
+    fs.mkdirSync(path.dirname(filepath), { recursive: true });
+    fs.writeFileSync(filepath, buffer);
   }
 
   /**
@@ -1058,41 +1117,42 @@ export class SyncEngine {
           // annotated_csv 是纯 CSV 字符串（含可能的 \r\n、UTF-8 BOM 等）
           const csvText = csvResult?.data?.annotated_csv ?? '';
           if (!csvText || csvText.trim().length === 0) {
-            console.warn(
-              `[SyncEngine] csv-get returned empty content for sheet ` +
-              `"${sheet.sheet_name}" (range ${range})`
+            throw new Error(
+              `csv-get 返回空内容: sheet="${sheet.sheet_name}" range=${range}`,
             );
           }
           fs.writeFileSync(csvPath, csvText, 'utf-8');
-
           exports.push({
             sheetId: sheet.sheet_id,
             title: sheet.sheet_name,
             csvPath,
           });
-
-          // Map this sub-sheet to the sheet_sheets table for future
-          // change detection (detectSheetSubChanges reads this).
-          this.localMapStore.upsertSheetSheet({
-            sheetObjToken: sheetToken,
-            sheetId: sheet.sheet_id,
-            sheetTitle: sheet.sheet_name,
-            localCsvPath: csvPath,
-            lastSyncedModifyTime: nowIso,
-            status: 'synced',
-          });
-
           console.info(`[SyncEngine] Exported sheet "${sheet.sheet_name}" to ${csvPath}`);
         } catch (error) {
-          console.warn(`[SyncEngine] Failed to export sheet "${sheet.sheet_name}":`, error);
-          // Continue with other sheets on failure
+          throw error instanceof Error
+            ? error
+            : new Error(`导出子表失败: ${sheet.sheet_name}: ${String(error)}`);
         }
+      }
+
+      for (const item of exports) {
+        this.localMapStore.upsertSheetSheet({
+          sheetObjToken: sheetToken,
+          sheetId: item.sheetId,
+          sheetTitle: item.title,
+          localCsvPath: item.csvPath,
+          lastSyncedModifyTime: nowIso,
+          status: 'synced',
+        });
       }
     } catch (error) {
       console.error(`[SyncEngine] Failed to list sheets for ${sheetToken}:`, error);
       throw error;
     }
 
+    if (exports.length === 0) {
+      throw new Error(`workbook 无成功导出的子表: ${sheetToken}`);
+    }
     return exports;
   }
 }

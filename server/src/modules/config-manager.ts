@@ -560,18 +560,43 @@ export class ConfigManager {
       watchedRoots,
       watchedRootUrls: getEnabledWatchedRootUrls({ watchedRoots }),
       llm: partial.llm
-        ? {
-            ...currentConfig.llm,
-            ...partial.llm,
-            claudeCli: {
-              ...(currentConfig.llm.claudeCli ?? {}),
-              ...(partial.llm.claudeCli ?? {}),
-            },
-          }
+        ? this.mergeLlmPartial(currentConfig.llm, partial.llm)
         : currentConfig.llm,
     };
     await this.save(updatedConfig);
     return this.config!;
+  }
+
+  /**
+   * LLM partial update semantics for secrets:
+   *   - omit apiKey        → retain
+   *   - apiKey === '***'   → retain (masked UI echo)
+   *   - apiKey === ''      → clear
+   *   - any other string   → replace
+   */
+  private mergeLlmPartial(
+    current: LlmConfig,
+    partial: Partial<LlmConfig>,
+  ): LlmConfig {
+    const next: LlmConfig = {
+      ...current,
+      ...partial,
+      claudeCli: {
+        ...(current.claudeCli ?? {}),
+        ...(partial.claudeCli ?? {}),
+      },
+    };
+    if (Object.prototype.hasOwnProperty.call(partial, 'apiKey')) {
+      const incoming = partial.apiKey;
+      if (incoming === undefined || incoming === '***') {
+        next.apiKey = current.apiKey;
+      } else {
+        next.apiKey = incoming;
+      }
+    } else {
+      next.apiKey = current.apiKey;
+    }
+    return next;
   }
 
   /**

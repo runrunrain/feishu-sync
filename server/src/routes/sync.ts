@@ -57,12 +57,8 @@ syncRoutes.post('/api/sync', async (c) => {
       message: '正式写入需要 options.apply=true 且 options.confirmation="APPLY"',
     }, 400);
   }
-  if (options.apply) {
-    return c.json({
-      error: 'apply_not_available',
-      message: '正式写入尚未启用：请先完成 P3 原子提交与回滚验证',
-    }, 409);
-  }
+  // P3: apply is available when confirmation=APPLY; SyncEngine commits via
+  // staging + atomic rename and only then advances the synced baseline.
   const documents = payload.documents as ChangedDocument[];
 
   // Get dependencies from context (injected by middleware)

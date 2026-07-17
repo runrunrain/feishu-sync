@@ -9,6 +9,7 @@
 
 import { app, BrowserWindow, dialog, ipcMain, session, shell, globalShortcut } from 'electron';
 import crypto from 'node:crypto';
+import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import fs from 'node:fs';
@@ -352,8 +353,11 @@ ipcMain.handle('desktop:open-data-directory', async () => {
 });
 
 ipcMain.handle('desktop:open-config-file', async () => {
-  // M0: Stub implementation - config file path will be determined in M1-M3
-  const configPath = path.join(app.getPath('userData'), 'config.json');
+  // P4: server and desktop share ~/.feishu-sync (not Electron userData).
+  const configPath = path.join(
+    process.env.FEISHU_SYNC_HOME || path.join(os.homedir(), '.feishu-sync'),
+    'config.json',
+  );
   const result = await shell.openPath(configPath);
   return result ? { ok: false, code: 'open-config-file-failed', error: sanitizeDesktopError(result) } : { ok: true };
 });
@@ -466,7 +470,9 @@ async function boot() {
 
   // Generate desktop API token
   desktopApiToken = crypto.randomBytes(32).toString('base64url');
-  desktopDataDir = app.getPath('userData');
+  // P4: align desktop data dir with server (~/.feishu-sync), not Electron userData.
+  desktopDataDir = process.env.FEISHU_SYNC_HOME || path.join(os.homedir(), '.feishu-sync');
+  fs.mkdirSync(desktopDataDir, { recursive: true, mode: 0o700 });
   console.info('[Electron] Desktop API token generated, data directory:', desktopDataDir);
 
   // Start embedded server
