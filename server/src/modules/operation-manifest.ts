@@ -334,6 +334,20 @@ function planDocument(
     });
   }
 
+  // The wiki traversal intentionally preserves an `unknown` object type so
+  // it can be reported instead of silently disappearing.  It is not,
+  // however, a supported export contract.  In particular, routing it through
+  // docs+fetch would turn an unsupported file (for example a .pptx) into a
+  // late apply failure.  Block it before any target path is considered so a
+  // dry-run never advertises it as writable.
+  if (document.objType === 'unknown') {
+    return blockedPlan(document, {
+      reasonCode: 'unsupported_type',
+      reason: '云端对象类型未知或当前不支持导出，拒绝生成可写同步计划',
+      suggestedResolution: '确认飞书对象类型并实现对应导出适配器后，再重新生成同步计划。',
+    });
+  }
+
   const watchedRoot = findWatchedRoot(document, watchedRoots);
   if (watchedRoots.length > 0 && !watchedRoot) {
     return blockedPlan(document, {

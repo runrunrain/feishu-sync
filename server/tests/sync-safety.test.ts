@@ -120,6 +120,40 @@ describe('P0 sync write safety', () => {
     expect(calls.logSync).toBe(0);
   });
 
+  it('blocks unknown cloud object types before they are advertised as writable', async () => {
+    const temporaryRoot = makeTempDirectory('feishu-sync-unsupported-type-');
+    const knowledgeBaseRoot = path.join(temporaryRoot, 'knowledge-base');
+    const operationDirectory = path.join(temporaryRoot, 'operations');
+    const { engine, calls } = makeEngine(knowledgeBaseRoot, operationDirectory);
+
+    const result = await engine.syncDocuments([
+      makeDocument({
+        objToken: 'unknown-pptx-token',
+        objType: 'unknown',
+        title: '未适配的演示文件.pptx',
+      }),
+    ], {
+      enableLLM: false,
+      fullSync: false,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.syncedDocuments).toEqual([]);
+    expect(result.plannedDocuments).toEqual([
+      expect.objectContaining({
+        objToken: 'unknown-pptx-token',
+        action: 'blocked',
+        reasonCode: 'unsupported_type',
+        localMdPath: null,
+      }),
+    ]);
+    expect(result.failedDocuments).toEqual([
+      expect.objectContaining({ objToken: 'unknown-pptx-token', retryable: false }),
+    ]);
+    expect(calls.logSync).toBe(0);
+    expect(fs.existsSync(knowledgeBaseRoot)).toBe(false);
+  });
+
   it('blocks every document that collides with another planned target', async () => {
     const temporaryRoot = makeTempDirectory('feishu-sync-path-conflict-');
     const knowledgeBaseRoot = path.join(temporaryRoot, 'knowledge-base');
