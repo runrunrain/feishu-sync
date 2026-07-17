@@ -47,12 +47,28 @@ import {
   createAtomicCommitWorkspace,
   rollbackAtomicPlan,
 } from './atomic-commit.js';
+import {
+  extractFeishuMediaReferences,
+  rewriteFeishuMediaReferences,
+} from './media-reference.js';
+import { adaptSlidesXmlToMarkdown } from './slides-xml-adapter.js';
 
 interface FetchedDocument {
   content: string;
-  images: Array<{ token: string; url?: string }>;
+  images: Array<{
+    token: string;
+    url?: string;
+    name?: string;
+    kind: 'image' | 'whiteboard';
+  }>;
   attachments: Array<{ token: string; name: string }>;
   sheets: Array<{ token: string; title: string }>;
+  /** Slides XML media belongs to a page rather than a docs +fetch body span. */
+  slideMedia?: Array<{
+    token: string;
+    kind: 'image' | 'whiteboard';
+    slideNumber: number;
+  }>;
   url: string;
   obj_token: string;
 }
@@ -93,11 +109,13 @@ interface HeaderMeta {
 interface Image {
   token: string;
   path: string;
+  kind: 'image' | 'whiteboard';
 }
 
 interface Attachment {
   token: string;
   path: string;
+  name: string;
 }
 
 /** Test-only fault injection for Gate 3 SyncEngine apply path. */
@@ -183,11 +201,15 @@ export class SyncEngine {
 
     if (mode === 'dry-run') {
       for (const planned of manifest.documents) {
-        if (planned.action === 'blocked') {
+        if (planned.action === 'blocked' || planned.action === 'move') {
           failedDocuments.push({
             objToken: planned.objToken,
             title: planned.title,
-            error: planned.reason || '同步计划被安全策略阻止',
+            error:
+              planned.reason ||
+              (planned.action === 'move'
+                ? '计划涉及路径移动，需通过独立迁移流程确认'
+                : '同步计划被安全策略阻止'),
             retryable: false,
           });
         }
@@ -216,11 +238,17 @@ export class SyncEngine {
     for (let index = 0; index < documents.length; index += 1) {
       const doc = documents[index];
       const planned = manifest.documents[index];
-      if (planned.action === 'blocked' || !planned.localMdPath) {
+      // A move is evidence for a separate, explicitly confirmed migration;
+      // ordinary sync may only create or replace a reviewed body.
+      if (planned.action === 'blocked' || planned.action === 'move' || !planned.localMdPath) {
         failedDocuments.push({
           objToken: doc.objToken,
           title: doc.title,
-          error: planned.reason || '同步计划被安全策略阻止',
+          error:
+            planned.reason ||
+            (planned.action === 'move'
+              ? '计划涉及路径移动，需通过独立迁移流程确认'
+              : '同步计划被安全策略阻止'),
           retryable: false,
         });
         continue;
@@ -323,22 +351,10 @@ export class SyncEngine {
         obj_token: doc.objToken,
       };
     } else if (doc.objType === 'slides') {
-      // docs+fetch only supports docx (API 3380002). Keep a deterministic
-      // markdown placeholder body; media still downloads when tokens exist.
-      console.info(
-        `[SyncEngine] objType=slides, skipping docs+fetch (unsupported by docs+fetch)`,
-      );
-      fetched = {
-        content:
-          `# ${doc.title}\n\n` +
-          `> 飞书幻灯片（slides）。当前 lark-cli \`docs +fetch\` 不支持 slides，` +
-          `已同步元数据占位；完整页面内容请在飞书中查看。\n`,
-        images: [],
-        attachments: [],
-        sheets: [],
-        url: '',
-        obj_token: doc.objToken,
-      };
+      // docs +fetch is docx-only. Slides must use the dedicated XML API; a
+      // read/export failure is surfaced as a failed sync instead of being
+      // recorded as a successful metadata placeholder.
+      fetched = await this.fetchSlidesContent(doc.objToken, doc.title);
     } else {
       try {
         fetched = await this.fetchDocumentContent(doc.objToken, doc.objType);
@@ -423,7 +439,23 @@ export class SyncEngine {
     const images = await this.downloadImages(fetched, stagingDocDir);
     const attachments = await this.downloadAttachments(fetched, stagingDocDir);
 
-    const expandedContent = fetched.content;
+    const localMediaReferences = new Map<string, string>();
+    for (const image of images) {
+      localMediaReferences.set(image.token, `images/${path.basename(image.path)}`);
+    }
+    for (const attachment of attachments) {
+      localMediaReferences.set(attachment.token, `attachments/${path.basename(attachment.path)}`);
+    }
+    let expandedContent = this.renderLocalizedMediaReferences(
+      rewriteFeishuMediaReferences(fetched.content, localMediaReferences),
+    );
+    if (fetched.slideMedia && fetched.slideMedia.length > 0) {
+      expandedContent = this.appendSlidesMediaReferences(
+        expandedContent,
+        fetched.slideMedia,
+        localMediaReferences,
+      );
+    }
 
     const sheets: Array<{ sheetId: string; title: string; csvPath: string; csvRel: string }> = [];
     if (doc.objType === 'sheet') {
@@ -553,7 +585,7 @@ export class SyncEngine {
         })),
         attachments: attachments.map((att) => ({
           relativePath: `attachments/${path.basename(att.path)}`,
-          name: path.basename(att.path),
+          name: att.name,
           token: att.token,
         })),
         sheets: sheets.map((sheet) => ({
@@ -689,22 +721,80 @@ export class SyncEngine {
     // Suppress unused parameter warning
     void objType;
     const result = await this.requireLarkCliClient().fetchDocumentMarkdown(objToken);
+    const document = result.data.document ?? {};
+    const content = typeof document.content === 'string' ? document.content : '';
+    const mediaReferences = extractFeishuMediaReferences(content);
 
     return {
-      content: result.data.document?.content || '',
-      images: result.data.document?.images || [],
-      attachments: result.data.document?.attachments || [],
-      sheets: result.data.document?.sheets || [],
-      url: result.data.document?.url || '',
+      content,
+      // docs +fetch v2 returns content/document_id/revision_id, not the
+      // legacy images/attachments arrays. Derive the media plan from the
+      // authoritative Markdown/XML body so every downloaded resource can be
+      // rewritten to its committed local path.
+      images: mediaReferences
+        .filter((reference) => reference.kind === 'image' || reference.kind === 'whiteboard')
+        .map((reference) => ({
+          token: reference.token,
+          url: reference.sourceUrl ?? undefined,
+          name: reference.filename ?? undefined,
+          kind: reference.kind === 'whiteboard' ? 'whiteboard' : 'image',
+        })),
+      attachments: mediaReferences
+        .filter((reference) => reference.kind === 'attachment')
+        .map((reference) => ({
+          token: reference.token,
+          name: reference.filename || reference.token,
+        })),
+      sheets: Array.isArray(document.sheets) ? document.sheets : [],
+      url: typeof document.url === 'string' ? document.url : '',
+      obj_token: objToken,
+    };
+  }
+
+  /** Fetch Slides XML and project it to Markdown without a metadata fallback. */
+  private async fetchSlidesContent(
+    objToken: string,
+    title: string,
+  ): Promise<FetchedDocument> {
+    const result = await this.requireLarkCliClient().fetchSlidesXml(objToken);
+    const xml = result?.data?.xml_presentation?.content;
+    if (typeof xml !== 'string' || xml.trim().length === 0) {
+      throw new Error('Slides API 未返回 presentation XML，拒绝写入占位正文');
+    }
+
+    const adapted = adaptSlidesXmlToMarkdown(xml, title);
+    const tokenPattern = /^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/;
+    const slideMedia = adapted.mediaReferences.filter((reference) => {
+      if (tokenPattern.test(reference.token)) return true;
+      console.warn(
+        `[SyncEngine] Ignoring non-token Slides ${reference.kind} reference on slide ${reference.slideNumber}`,
+      );
+      return false;
+    });
+
+    return {
+      content: adapted.markdown,
+      images: [
+        ...adapted.imageTokens
+          .filter((token) => tokenPattern.test(token))
+          .map((token) => ({ token, kind: 'image' as const })),
+        ...adapted.whiteboardTokens
+          .filter((token) => tokenPattern.test(token))
+          .map((token) => ({ token, kind: 'whiteboard' as const })),
+      ],
+      attachments: [],
+      sheets: [],
+      slideMedia,
+      url: '',
       obj_token: objToken,
     };
   }
 
   /**
-   * Download images with three-tier fallback strategy
-   * Tier 1: If image has URL, use curl
-   * Tier 2: If only token, use media-download
-   * Tier 3: If cross-origin 403, fallback to media-preview
+   * Download image/whiteboard resources into staging. Feishu currently
+   * returns HTTP 403 from media-download for some normal image tokens while
+   * media-preview succeeds; whiteboards are the inverse special case and
+   * must use media-download --type whiteboard.
    */
   private async downloadImages(
     doc: FetchedDocument,
@@ -720,34 +810,45 @@ export class SyncEngine {
 
     for (let i = 0; i < doc.images.length; i++) {
       const img = doc.images[i];
-      const filename = `${String(i + 1).padStart(2, '0')}-${img.token}.png`;
-      const filepath = path.join(imagesDir, filename);
+      // Deliberately omit an extension. lark-cli derives the correct suffix
+      // from Content-Type and returns saved_path; hard-coding .png previously
+      // mislabeled JPEG whiteboards and made absolute --output invalid.
+      const outputStem = path.join(
+        imagesDir,
+        `${String(i + 1).padStart(2, '0')}-${img.token}`,
+      );
 
       try {
-        if (img.url) {
-          await this.downloadUrlToFile(filepath, img.url);
-        } else {
-          await this.execMediaDownload(filepath, img.token);
+        const filepath = await this.execMediaDownload(
+          outputStem,
+          img.token,
+          img.kind === 'whiteboard' ? 'whiteboard' : 'media',
+        );
+        this.assertDownloadedMedia(filepath, img.token);
+        images.push({ token: img.token, path: filepath, kind: img.kind });
+      } catch (downloadError) {
+        if (img.kind === 'whiteboard') {
+          throw downloadError instanceof Error
+            ? downloadError
+            : new Error(String(downloadError));
         }
-        if (!fs.existsSync(filepath) || fs.statSync(filepath).size <= 0) {
-          throw new Error(`图片为空: ${img.token}`);
-        }
-        images.push({ token: img.token, path: filepath });
-      } catch (error) {
         try {
-          if (!img.url) {
-            await this.execMediaPreview(filepath, img.token);
-            if (!fs.existsSync(filepath) || fs.statSync(filepath).size <= 0) {
-              throw new Error(`media-preview 空文件: ${img.token}`);
-            }
-            images.push({ token: img.token, path: filepath });
-          } else {
-            throw error;
-          }
+          const filepath = await this.execMediaPreview(outputStem, img.token);
+          this.assertDownloadedMedia(filepath, img.token);
+          images.push({ token: img.token, path: filepath, kind: img.kind });
         } catch (previewError) {
-          throw previewError instanceof Error
-            ? previewError
-            : new Error(String(previewError));
+          // A direct Feishu URL is optional metadata, not our primary
+          // transport. It is retained as the last fallback for deployments
+          // where both CLI shortcuts reject an otherwise readable resource.
+          if (img.url) {
+            const filepath = await this.downloadUrlToFile(outputStem, img.url);
+            this.assertDownloadedMedia(filepath, img.token);
+            images.push({ token: img.token, path: filepath, kind: img.kind });
+          } else {
+            throw previewError instanceof Error
+              ? previewError
+              : new Error(String(previewError));
+          }
         }
       }
     }
@@ -756,7 +857,9 @@ export class SyncEngine {
   }
 
   /**
-   * Download attachments using media-download
+   * Download attachments into staging. The same 403 -> preview fallback is
+   * used for normal media; filenames from cloud content are never used as a
+   * destination path, preventing traversal and collision hazards.
    */
   private async downloadAttachments(
     doc: FetchedDocument,
@@ -770,14 +873,25 @@ export class SyncEngine {
       fs.mkdirSync(attachmentsDir, { recursive: true });
     }
 
-    for (const attachment of doc.attachments) {
-      const filepath = path.join(attachmentsDir, attachment.name);
+    for (let index = 0; index < doc.attachments.length; index += 1) {
+      const attachment = doc.attachments[index];
+      const outputStem = path.join(
+        attachmentsDir,
+        `${String(index + 1).padStart(2, '0')}-${attachment.token}`,
+      );
 
-      await this.execMediaDownload(filepath, attachment.token);
-      if (!fs.existsSync(filepath) || fs.statSync(filepath).size <= 0) {
-        throw new Error(`附件下载失败或为空: ${attachment.token}`);
+      let filepath: string;
+      try {
+        filepath = await this.execMediaDownload(outputStem, attachment.token, 'media');
+      } catch {
+        filepath = await this.execMediaPreview(outputStem, attachment.token);
       }
-      attachments.push({ token: attachment.token, path: filepath });
+      this.assertDownloadedMedia(filepath, attachment.token);
+      attachments.push({
+        token: attachment.token,
+        path: filepath,
+        name: attachment.name,
+      });
     }
 
     return attachments;
@@ -967,7 +1081,7 @@ export class SyncEngine {
   }
 
   /** Download a URL with fetch — no shell, no string interpolation. */
-  private async downloadUrlToFile(filepath: string, url: string): Promise<void> {
+  private async downloadUrlToFile(filepath: string, url: string): Promise<string> {
     const response = await fetch(url);
     if (!response.ok) {
       throw new Error(`URL 下载失败 HTTP ${response.status}`);
@@ -976,22 +1090,120 @@ export class SyncEngine {
     if (buffer.length === 0) {
       throw new Error('URL 下载内容为空');
     }
-    fs.mkdirSync(path.dirname(filepath), { recursive: true });
-    fs.writeFileSync(filepath, buffer);
+    const contentType = response.headers.get('content-type')?.split(';', 1)[0]?.toLowerCase() ?? '';
+    const extension = this.mediaExtensionForContentType(contentType);
+    const targetPath = path.extname(filepath) ? filepath : `${filepath}${extension}`;
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    fs.writeFileSync(targetPath, buffer);
+    return targetPath;
   }
 
   /**
    * Execute media-download command
    */
-  private async execMediaDownload(filepath: string, token: string): Promise<void> {
-    await this.requireLarkCliClient().downloadMedia(token, filepath);
+  private async execMediaDownload(
+    filepath: string,
+    token: string,
+    type: 'media' | 'whiteboard',
+  ): Promise<string> {
+    const result = await this.requireLarkCliClient().downloadMedia(token, filepath, type);
+    return this.resolveStagedMediaPath(filepath, result);
   }
 
   /**
    * Execute media-preview command (fallback)
    */
-  private async execMediaPreview(filepath: string, token: string): Promise<void> {
-    await this.requireLarkCliClient().previewMedia(token, filepath);
+  private async execMediaPreview(filepath: string, token: string): Promise<string> {
+    const result = await this.requireLarkCliClient().previewMedia(token, filepath);
+    return this.resolveStagedMediaPath(filepath, result);
+  }
+
+  /** Resolve a CLI-reported auto-extension, retaining test-double support. */
+  private resolveStagedMediaPath(requestedPath: string, reportedPath: unknown): string {
+    const directory = path.dirname(requestedPath);
+    const canonical = (candidate: string): string => {
+      try {
+        return fs.realpathSync.native(candidate);
+      } catch {
+        return path.resolve(candidate);
+      }
+    };
+    const isInsideDirectory = (candidate: string): boolean => {
+      const relative = path.relative(canonical(directory), canonical(candidate));
+      return relative !== '' && !relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative);
+    };
+
+    if (typeof reportedPath === 'string' && reportedPath.length > 0) {
+      const resolved = path.resolve(reportedPath);
+      if (!isInsideDirectory(resolved)) {
+        throw new Error(`媒体下载器返回了 staging 目录外路径: ${resolved}`);
+      }
+      return resolved;
+    }
+
+    // Existing unit-test doubles write to the requested stem and predate the
+    // CLI's saved_path response. Accept that exact path, or one deterministic
+    // auto-extension sibling produced by the real shortcut.
+    if (fs.existsSync(requestedPath)) return requestedPath;
+    const stem = path.basename(requestedPath);
+    const candidates = fs.existsSync(directory)
+      ? fs.readdirSync(directory)
+        .filter((name) => name.startsWith(`${stem}.`))
+        .sort()
+      : [];
+    if (candidates.length === 1) return path.join(directory, candidates[0]);
+    throw new Error(`媒体下载未产生可定位文件: ${stem}`);
+  }
+
+  private assertDownloadedMedia(filepath: string, token: string): void {
+    if (!fs.existsSync(filepath) || !fs.statSync(filepath).isFile() || fs.statSync(filepath).size <= 0) {
+      throw new Error(`媒体下载失败或为空: ${token}`);
+    }
+  }
+
+  private mediaExtensionForContentType(contentType: string): string {
+    const extensions: Record<string, string> = {
+      'image/jpeg': '.jpg',
+      'image/png': '.png',
+      'image/gif': '.gif',
+      'image/webp': '.webp',
+      'image/svg+xml': '.svg',
+      'application/pdf': '.pdf',
+      'application/zip': '.zip',
+    };
+    return extensions[contentType] ?? '.bin';
+  }
+
+  /** Render downloaded whiteboard previews as portable local Markdown images. */
+  private renderLocalizedMediaReferences(content: string): string {
+    const whiteboards = content.replace(
+      /<whiteboard\b[^>]*\btoken=(['"])(images\/[^'"]+)\1[^>]*>(?:\s*<\/whiteboard>)?/gi,
+      (_whole, _quote: string, localPath: string) => `![飞书白板](${localPath})`,
+    );
+    return whiteboards.replace(
+      /<(?:file|source)\b[^>]*\btoken=(['"])(attachments\/[^'"]+)\1[^>]*\/?>(?:\s*<\/(?:file|source)>)?/gi,
+      (_whole, _quote: string, localPath: string) =>
+        `[${path.basename(localPath)}](${localPath})`,
+    );
+  }
+
+  /** Append page-addressable local media links to a Slides Markdown export. */
+  private appendSlidesMediaReferences(
+    content: string,
+    references: NonNullable<FetchedDocument['slideMedia']>,
+    localReferences: ReadonlyMap<string, string>,
+  ): string {
+    const rendered = references
+      .map((reference) => {
+        const localPath = localReferences.get(reference.token);
+        if (!localPath) return null;
+        const label = reference.kind === 'whiteboard' ? '白板预览' : '图片';
+        return `- 幻灯片 ${reference.slideNumber} ${label}：![${label}](${localPath})`;
+      })
+      .filter((line): line is string => line !== null);
+
+    if (rendered.length === 0) return content;
+    return `${content.trimEnd()}\n\n## 媒体资源\n\n${rendered.join('\n')}\n`;
   }
 
   /**

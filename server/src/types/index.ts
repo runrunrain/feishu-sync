@@ -393,10 +393,30 @@ export interface PlannedSyncDocument {
   /** Portable POSIX path relative to knowledgeBaseRoot. */
   localRelPath?: string | null;
   previousSha256: string | null;
+  /** Stable category for an intentionally non-writable or review-only plan. */
+  reasonCode?: SyncPlanReasonCode;
   reason?: string;
+  /** Cloud identity and hierarchy retained for auditable triage. */
+  watchedRootId?: string | null;
+  wikiNodeToken?: string | null;
+  parentChainTitles?: string[] | null;
+  /** Candidate profile path when a safe write was intentionally blocked. */
+  candidateLocalRelPath?: string | null;
+  suggestedResolution?: string;
   plannedMoveFrom?: string | null;
   pathSource?: 'existing-mapping' | 'layout-profile' | 'legacy-fallback';
 }
+
+export type SyncPlanReasonCode =
+  | 'deleted_requires_confirmation'
+  | 'missing_parent_chain'
+  | 'unknown_watched_root'
+  | 'path_conflict'
+  | 'unsafe_path'
+  | 'planned_move'
+  | 'unsupported_type'
+  | 'restricted'
+  | 'unknown';
 
 export type SyncMode = 'dry-run' | 'apply';
 

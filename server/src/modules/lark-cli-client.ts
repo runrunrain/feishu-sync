@@ -14,6 +14,8 @@
  */
 
 import { execFile } from 'child_process';
+import fs from 'node:fs';
+import path from 'node:path';
 import { promisify } from 'util';
 import type { LarkCliNodeInfo, LarkCliConfig } from '../types/index.js';
 
@@ -40,6 +42,53 @@ export class LarkCliError extends Error {
   }
 }
 
+export interface LarkCliExecutionOptions {
+  /**
+   * A controlled working directory for shortcuts whose file arguments must
+   * be relative (notably docs +media-download / +media-preview).
+   */
+  cwd?: string;
+}
+
+export interface MediaOutputTarget {
+  directory: string;
+  outputName: string;
+  requestedPath: string;
+}
+
+/**
+ * lark-cli refuses absolute --output values. Convert a caller's absolute
+ * staging path into a safe cwd + basename pair without allowing `..` to
+ * escape that staging directory.
+ */
+export function resolveMediaOutputTarget(outputPath: string): MediaOutputTarget {
+  if (typeof outputPath !== 'string' || outputPath.trim().length === 0) {
+    throw new Error('媒体输出路径不能为空');
+  }
+  const requestedPath = path.resolve(outputPath);
+  const directory = path.dirname(requestedPath);
+  const outputName = path.basename(requestedPath);
+  if (!outputName || outputName === '.' || outputName === path.sep) {
+    throw new Error(`媒体输出文件名无效: ${outputPath}`);
+  }
+  return { directory, outputName, requestedPath };
+}
+
+function isPathInsideDirectory(directory: string, candidate: string): boolean {
+  // macOS reports many temp paths through /private even when the caller used
+  // /var or /tmp. Canonicalize existing paths before enforcing containment so
+  // a valid lark-cli saved_path is not mistaken for an escape.
+  const canonical = (value: string): string => {
+    try {
+      return fs.realpathSync.native(value);
+    } catch {
+      return path.resolve(value);
+    }
+  };
+  const relative = path.relative(canonical(directory), canonical(candidate));
+  return relative !== '' && !relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative);
+}
+
 export class LarkCliClient {
   private qpsLimiter: Map<string, number[]> = new Map();
 
@@ -50,9 +99,13 @@ export class LarkCliClient {
    * Higher-level helpers below are intentionally thin wrappers so callers
    * never duplicate lark-cli invocation policy.
    */
-  async execute(args: string[], apiType: 'wiki' | 'docx' | 'sheets' = 'wiki'): Promise<any> {
+  async execute(
+    args: string[],
+    apiType: 'wiki' | 'docx' | 'sheets' = 'wiki',
+    executionOptions?: LarkCliExecutionOptions,
+  ): Promise<any> {
     await this.throttle(apiType);
-    return this.execLarkCli(args);
+    return this.execLarkCli(args, executionOptions);
   }
 
   async fetchDocumentMarkdown(objToken: string): Promise<any> {
@@ -62,16 +115,60 @@ export class LarkCliClient {
     ], 'docx');
   }
 
-  async downloadMedia(token: string, outputPath: string): Promise<void> {
-    await this.execute([
-      'docs', '+media-download', '--token', token, '--output', outputPath,
+  /** Read the authoritative XML presentation body for a Slides object. */
+  async fetchSlidesXml(xmlPresentationId: string): Promise<any> {
+    return this.execute([
+      'slides', 'xml_presentations', 'get', '--as', 'user',
+      '--params', JSON.stringify({
+        xml_presentation_id: xmlPresentationId,
+        revision_id: -1,
+      }),
+      '--format', 'json',
     ], 'docx');
   }
 
-  async previewMedia(token: string, outputPath: string): Promise<void> {
-    await this.execute([
-      'docs', '+media-preview', '--token', token, '--output', outputPath,
-    ], 'docx');
+  async downloadMedia(
+    token: string,
+    outputPath: string,
+    type: 'media' | 'whiteboard' = 'media',
+  ): Promise<string> {
+    return this.fetchMediaToPath('download', token, outputPath, type);
+  }
+
+  async previewMedia(token: string, outputPath: string): Promise<string> {
+    return this.fetchMediaToPath('preview', token, outputPath, 'media');
+  }
+
+  private async fetchMediaToPath(
+    operation: 'download' | 'preview',
+    token: string,
+    outputPath: string,
+    type: 'media' | 'whiteboard',
+  ): Promise<string> {
+    const target = resolveMediaOutputTarget(outputPath);
+    const args = [
+      'docs',
+      operation === 'download' ? '+media-download' : '+media-preview',
+      '--token',
+      token,
+      '--output',
+      target.outputName,
+    ];
+    if (operation === 'download' && type === 'whiteboard') {
+      args.push('--type', 'whiteboard');
+    }
+    const result = await this.execute(args, 'docx', { cwd: target.directory });
+    const reportedPath = typeof result?.data?.saved_path === 'string'
+      ? path.resolve(result.data.saved_path)
+      : target.requestedPath;
+    if (!isPathInsideDirectory(target.directory, reportedPath)) {
+      throw new LarkCliError(
+        `lark-cli 返回了输出目录外的媒体路径: ${reportedPath}`,
+        'upstream',
+        false,
+      );
+    }
+    return reportedPath;
   }
 
   async getWorkbookInfo(spreadsheetToken: string): Promise<any> {
@@ -216,7 +313,10 @@ export class LarkCliClient {
   /**
    * Execute lark-cli subprocess (core encapsulation)
    */
-  private async execLarkCli(args: string[]): Promise<any> {
+  private async execLarkCli(
+    args: string[],
+    executionOptions?: LarkCliExecutionOptions,
+  ): Promise<any> {
     const larkCliPath = this.config.larkCliPath || this.getDefaultLarkCliPath();
     const timeout = this.config.timeout || 30000;
 
@@ -225,6 +325,7 @@ export class LarkCliClient {
         timeout,
         encoding: 'utf-8',
         shell: process.platform === 'win32', // Use shell on Windows for .cmd files
+        ...(executionOptions?.cwd ? { cwd: executionOptions.cwd } : {}),
       });
 
       // Detect authentication errors
@@ -236,7 +337,8 @@ export class LarkCliClient {
     } catch (error: any) {
       if (error instanceof LarkCliError) throw error;
       const errorStderr = typeof error?.stderr === 'string' ? error.stderr : '';
-      const rawMessage = `${errorStderr}\n${error?.message ?? ''}`.trim();
+      const errorStdout = typeof error?.stdout === 'string' ? error.stdout : '';
+      const rawMessage = `${errorStderr}\n${errorStdout}\n${error?.message ?? ''}`.trim();
       if (error?.killed && error?.signal === 'SIGTERM') {
         throw new LarkCliError('lark-cli 执行超时', 'timeout', true);
       }
@@ -316,8 +418,15 @@ export class LarkCliClient {
       throw new LarkCliError('lark-cli 返回了非对象 JSON', 'parse', false);
     }
     if (value.ok === false || (typeof value.code === 'number' && value.code !== 0)) {
-      const message = String(value.msg ?? value.message ?? value.error ?? 'lark-cli 返回错误');
-      const upstreamCode = value.code == null ? undefined : String(value.code);
+      const nestedError = value.error && typeof value.error === 'object'
+        ? value.error as Record<string, unknown>
+        : null;
+      const message = String(
+        value.msg ?? value.message ?? nestedError?.message ?? value.error ?? 'lark-cli 返回错误',
+      );
+      const upstreamCode = value.code == null
+        ? (nestedError?.code == null ? undefined : String(nestedError.code))
+        : String(value.code);
       throw this.classifyError(`${upstreamCode ?? ''} ${message}`.trim(), upstreamCode);
     }
     if (value.ok === true) return value;

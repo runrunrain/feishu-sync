@@ -429,4 +429,144 @@ describe('SyncEngine atomic apply path', () => {
     expect(fs.readFileSync(mdPath, 'utf-8')).toBe('keep-me\n');
     expect(fs.existsSync(path.join(kb, '技术 - Dev', '原子文档', 'images'))).toBe(false);
   });
+
+  it('extracts docs +fetch media from body, falls back from 403 preview, and commits local references atomically', async () => {
+    const { kb, store, config } = makeWorkspace();
+    const mdPath = path.join(kb, '技术 - Dev', '媒体文档', 'README.md');
+    const imageToken = 'ImageToken1234567890';
+    const whiteboardToken = 'WhiteboardToken1234567890';
+    const attachmentToken = 'AttachmentToken1234567890';
+    const downloadCalls: Array<{ token: string; type: string }> = [];
+    const previewCalls: string[] = [];
+
+    const engine = new SyncEngine({
+      larkCliClient: {
+        fetchDocumentMarkdown: async () => ({
+          data: {
+            document: {
+              content: [
+                `正文 <img alt="示例" src="${imageToken}"/>`,
+                `<whiteboard token="${whiteboardToken}"></whiteboard>`,
+                `<file token="${attachmentToken}" name="../../unsafe-name.pdf"/>`,
+              ].join('\n\n'),
+            },
+          },
+        }),
+        downloadMedia: async (token: string, outputPath: string, type: string) => {
+          downloadCalls.push({ token, type });
+          if (token === imageToken) throw new Error('HTTP 403');
+          const suffix = type === 'whiteboard' ? '.jpg' : '.pdf';
+          const saved = `${outputPath}${suffix}`;
+          fs.mkdirSync(path.dirname(saved), { recursive: true });
+          fs.writeFileSync(saved, `${type}-${token}`);
+          return saved;
+        },
+        previewMedia: async (token: string, outputPath: string) => {
+          previewCalls.push(token);
+          const saved = `${outputPath}.png`;
+          fs.mkdirSync(path.dirname(saved), { recursive: true });
+          fs.writeFileSync(saved, `preview-${token}`);
+          return saved;
+        },
+      },
+      localMapStore: store,
+      config,
+    });
+
+    const result = await engine.syncDocuments(
+      [makeDoc({
+        localMdPath: mdPath,
+        localRelPath: '技术 - Dev/媒体文档/README.md',
+      })],
+      { enableLLM: false, fullSync: false, apply: true, confirmation: 'APPLY' },
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.syncedDocuments[0]).toMatchObject({ imagesCount: 2, attachmentsCount: 1 });
+    expect(downloadCalls).toEqual(expect.arrayContaining([
+      { token: imageToken, type: 'media' },
+      { token: whiteboardToken, type: 'whiteboard' },
+      { token: attachmentToken, type: 'media' },
+    ]));
+    expect(previewCalls).toEqual([imageToken]);
+
+    const markdown = fs.readFileSync(mdPath, 'utf-8');
+    expect(markdown).toContain(`src="images/01-${imageToken}.png"`);
+    expect(markdown).toContain(`![飞书白板](images/02-${whiteboardToken}.jpg)`);
+    expect(markdown).toContain(
+      `[01-${attachmentToken}.pdf](attachments/01-${attachmentToken}.pdf)`,
+    );
+    expect(markdown).not.toContain('../../unsafe-name.pdf');
+    expect(fs.readFileSync(path.join(path.dirname(mdPath), 'images', `01-${imageToken}.png`), 'utf-8'))
+      .toBe(`preview-${imageToken}`);
+    expect(fs.readFileSync(path.join(path.dirname(mdPath), 'images', `02-${whiteboardToken}.jpg`), 'utf-8'))
+      .toBe(`whiteboard-${whiteboardToken}`);
+    expect(fs.readFileSync(path.join(path.dirname(mdPath), 'attachments', `01-${attachmentToken}.pdf`), 'utf-8'))
+      .toBe(`media-${attachmentToken}`);
+  });
+
+  it('exports Slides XML as Markdown with local image and whiteboard references instead of a metadata placeholder', async () => {
+    const { kb, store, config } = makeWorkspace();
+    const mdPath = path.join(kb, '技术 - Dev', '演示文稿', 'README.md');
+    const imageToken = 'SlideImageToken123456789';
+    const whiteboardToken = 'SlideWhiteboardToken123456789';
+    const calls: Array<{ token: string; type: string }> = [];
+
+    const engine = new SyncEngine({
+      larkCliClient: {
+        fetchSlidesXml: async () => ({
+          data: {
+            xml_presentation: {
+              content: [
+                '<presentation>',
+                '<slides>',
+                '<slide id="slide-1"><content><p>第一页内容</p></content>',
+                `<img src="${imageToken}"/><whiteboard token="${whiteboardToken}"/>`,
+                '</slide>',
+                '<slide id="slide-2"><content><p>第二页内容</p></content></slide>',
+                '</slides>',
+                '</presentation>',
+              ].join(''),
+            },
+          },
+        }),
+        downloadMedia: async (token: string, outputPath: string, type: string) => {
+          calls.push({ token, type });
+          const saved = `${outputPath}${type === 'whiteboard' ? '.jpg' : '.png'}`;
+          fs.mkdirSync(path.dirname(saved), { recursive: true });
+          fs.writeFileSync(saved, `${type}-${token}`);
+          return saved;
+        },
+      },
+      localMapStore: store,
+      config,
+    });
+
+    const result = await engine.syncDocuments(
+      [makeDoc({
+        objType: 'slides',
+        title: '演示文稿',
+        localMdPath: mdPath,
+        localRelPath: '技术 - Dev/演示文稿/README.md',
+      })],
+      { enableLLM: false, fullSync: false, apply: true, confirmation: 'APPLY' },
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.syncedDocuments[0]).toMatchObject({ imagesCount: 2, attachmentsCount: 0 });
+    expect(calls).toEqual(expect.arrayContaining([
+      { token: imageToken, type: 'media' },
+      { token: whiteboardToken, type: 'whiteboard' },
+    ]));
+
+    const markdown = fs.readFileSync(mdPath, 'utf-8');
+    expect(markdown).toContain('# 演示文稿');
+    expect(markdown).toContain('## 幻灯片 1');
+    expect(markdown).toContain('第一页内容');
+    expect(markdown).toContain('## 幻灯片 2');
+    expect(markdown).toContain('第二页内容');
+    expect(markdown).toContain(`![图片](images/01-${imageToken}.png)`);
+    expect(markdown).toContain(`![白板预览](images/02-${whiteboardToken}.jpg)`);
+    expect(markdown).not.toContain('完整页面内容请在飞书中查看');
+  });
 });

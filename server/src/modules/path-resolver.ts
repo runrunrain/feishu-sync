@@ -38,7 +38,9 @@ export type PathConflictKind =
   | 'existing-file'
   | 'duplicate-target'
   | 'invalid-segment'
-  | 'missing-root';
+  | 'missing-root'
+  /** A non-root node cannot be safely placed without its cloud ancestor chain. */
+  | 'missing-parent-chain';
 
 export interface PathConflict {
   kind: PathConflictKind;
@@ -65,13 +67,11 @@ export interface PathResolveInput {
   hasChild: boolean;
   /**
    * Titles of ancestors from the watched root (exclusive) down to the
-   * immediate parent (inclusive). Empty means this node IS the root body.
+   * immediate parent (inclusive). An empty array means a direct child of the
+   * watched root; only `isWatchedRootNode: true` denotes the root body.
    */
   parentChainTitles?: string[];
-  /**
-   * True when this node is the watched root itself. When omitted, an empty
-   * parent chain is treated as the root node.
-   */
+  /** True when this node is the watched root itself. */
   isWatchedRootNode?: boolean;
   /** Portable relative path already stored in the database, if any. */
   existingLocalRelPath?: string | null;
@@ -222,16 +222,21 @@ export function deriveProfileRelativePath(input: {
     return { relativePath: null, conflicts };
   }
 
-  const isRoot =
-    input.isWatchedRootNode === true ||
-    (input.isWatchedRootNode !== false &&
-      (!input.parentChainTitles || input.parentChainTitles.length === 0));
+  const isRoot = input.isWatchedRootNode === true;
 
   if (isRoot) {
     return {
       relativePath: joinRelative(...localDirSegments, 'README.md'),
       conflicts,
     };
+  }
+
+  if (!Array.isArray(input.parentChainTitles)) {
+    conflicts.push({
+      kind: 'missing-parent-chain',
+      message: '非根节点缺少完整云端父链，拒绝推导到根 README.md',
+    });
+    return { relativePath: null, conflicts };
   }
 
   const parentSegments: string[] = [];

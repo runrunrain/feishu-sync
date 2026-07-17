@@ -395,6 +395,69 @@ describe('ChangeDetector.compareWithLocalRecords (P2-T1 three-state)', () => {
     });
   });
 
+  it('projects root, direct-child, and deep-node parent chains from the current traversal', async () => {
+    const cloud = [
+      makeCloud({
+        obj_token: 'ROOT',
+        node_token: 'rootA',
+        title: '根目录',
+        parent_node_token: undefined,
+      }),
+      makeCloud({
+        obj_token: 'DIRECT',
+        node_token: 'direct-node',
+        title: '直接子节点',
+        parent_node_token: 'rootA',
+      }),
+      makeCloud({
+        obj_token: 'DEEP',
+        node_token: 'deep-node',
+        title: '深层节点',
+        parent_node_token: 'direct-node',
+      }),
+    ];
+
+    const out = await runCompare(store, cloud, 'rootA');
+    const byToken = new Map(out.map((document) => [document.objToken, document]));
+
+    expect(byToken.get('ROOT')).toMatchObject({
+      isWatchedRootNode: true,
+      parentChainTitles: [],
+    });
+    expect(byToken.get('DIRECT')).toMatchObject({
+      isWatchedRootNode: false,
+      parentChainTitles: [],
+    });
+    expect(byToken.get('DEEP')).toMatchObject({
+      isWatchedRootNode: false,
+      parentChainTitles: ['直接子节点'],
+    });
+  });
+
+  it('leaves hierarchy absent when a node parent is missing from the current traversal', async () => {
+    const cloud = [
+      makeCloud({
+        obj_token: 'ROOT',
+        node_token: 'rootA',
+        title: '根目录',
+        parent_node_token: undefined,
+      }),
+      makeCloud({
+        obj_token: 'ORPHAN',
+        node_token: 'orphan-node',
+        title: '孤立节点',
+        parent_node_token: 'missing-parent',
+      }),
+    ];
+
+    const out = await runCompare(store, cloud, 'rootA');
+    const orphan = out.find((document) => document.objToken === 'ORPHAN');
+
+    expect(orphan).toBeDefined();
+    expect(orphan?.isWatchedRootNode).toBeUndefined();
+    expect(orphan?.parentChainTitles).toBeUndefined();
+  });
+
   it('handles a mixed batch: added + modified + unchanged + deleted', async () => {
     // Seed: B synced at 1000 (will be modified), C synced (unchanged),
     // D synced (one complete miss only — not a deletion candidate yet).

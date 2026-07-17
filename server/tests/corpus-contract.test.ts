@@ -93,6 +93,7 @@ describe('desensitized corpus contract fixture', () => {
         title: '服务器架构',
         hasChild: false,
         isWatchedRootNode: false,
+        parentChainTitles: [],
       }).relativePath,
     ).toBe('技术 - Dev/服务器架构/README.md');
 
@@ -103,6 +104,7 @@ describe('desensitized corpus contract fixture', () => {
         title: '战斗设计',
         hasChild: true,
         isWatchedRootNode: false,
+        parentChainTitles: [],
       }).relativePath,
     ).toBe('策划 - Designer/战斗设计/战斗设计.md');
 

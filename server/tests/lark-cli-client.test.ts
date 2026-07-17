@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { LarkCliClient, LarkCliError } from '../src/modules/lark-cli-client.js';
+import path from 'node:path';
+import {
+  LarkCliClient,
+  LarkCliError,
+  resolveMediaOutputTarget,
+} from '../src/modules/lark-cli-client.js';
 
 type ClientInternals = {
   parseJsonOutput(stdout: string): any;
@@ -63,6 +68,43 @@ describe('LarkCliClient output parsing and classification', () => {
     expect(internals(client).parseJsonOutput('lark-cli 1.0.53\n')).toEqual({
       ok: true,
       data: { version: 'lark-cli 1.0.53' },
+    });
+  });
+
+  it('turns an absolute staging path into relative media output with a controlled cwd', async () => {
+    const client = createClient();
+    const stagingDirectory = path.join('/tmp', 'feishu-sync-media-test');
+    const requested = path.join(stagingDirectory, 'image-stem');
+    const calls: Array<{ args: string[]; options: unknown }> = [];
+    (client as any).execute = async (args: string[], _apiType: string, options: unknown) => {
+      calls.push({ args, options });
+      return { data: { saved_path: path.join(stagingDirectory, 'image-stem.jpg') } };
+    };
+
+    await expect(client.downloadMedia('MediaToken1234567890', requested, 'whiteboard'))
+      .resolves.toBe(path.join(stagingDirectory, 'image-stem.jpg'));
+    expect(calls).toEqual([
+      {
+        args: [
+          'docs', '+media-download', '--token', 'MediaToken1234567890',
+          '--output', 'image-stem', '--type', 'whiteboard',
+        ],
+        options: { cwd: stagingDirectory },
+      },
+    ]);
+  });
+
+  it('rejects a media shortcut path that escapes its staging directory', async () => {
+    const client = createClient();
+    (client as any).execute = async () => ({ data: { saved_path: '/tmp/outside.jpg' } });
+
+    await expect(
+      client.previewMedia('MediaToken1234567890', '/tmp/inside/preview-stem'),
+    ).rejects.toThrow('输出目录外');
+    expect(resolveMediaOutputTarget('/tmp/inside/preview-stem')).toEqual({
+      directory: '/tmp/inside',
+      outputName: 'preview-stem',
+      requestedPath: '/tmp/inside/preview-stem',
     });
   });
 });

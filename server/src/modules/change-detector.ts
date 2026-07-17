@@ -113,6 +113,11 @@ interface ComparisonOptions {
   traversalComplete?: boolean;
 }
 
+interface ParentChainProjection {
+  parentChainTitles: string[];
+  isWatchedRootNode: boolean;
+}
+
 /**
  * Per-workbook sub-sheet change (03 §3.5). Feishu workbooks share one
  * obj_edit_time across all sub-sheets, so per-sub-sheet modification
@@ -636,6 +641,7 @@ export class ChangeDetector {
         observationStatus: node.obj_edit_time == null ? 'unavailable' : 'available',
       };
     });
+    const parentChains = this.projectParentChains(observations, rootToken);
 
     // Pass 1: cloud observation -> persistent state machine. This is the
     // only code path that updates observed time; it never writes the synced
@@ -655,9 +661,23 @@ export class ChangeDetector {
         }) as DocumentRecord;
 
         if (record.syncState === 'pending_added') {
-          changedDocuments.push(this.toChangedDocument(observation, record, 'added'));
+          changedDocuments.push(
+            this.toChangedDocument(
+              observation,
+              record,
+              'added',
+              parentChains.get(observation.wikiNodeToken) ?? null,
+            ),
+          );
         } else if (record.syncState === 'pending_modified') {
-          changedDocuments.push(this.toChangedDocument(observation, record, 'modified'));
+          changedDocuments.push(
+            this.toChangedDocument(
+              observation,
+              record,
+              'modified',
+              parentChains.get(observation.wikiNodeToken) ?? null,
+            ),
+          );
         }
         // restricted rows remain visible in the mapping/tree projection with
         // their title and hierarchy, but are intentionally not batch-syncable
@@ -714,6 +734,7 @@ export class ChangeDetector {
     observation: CloudNodeObservation,
     record: DocumentRecord,
     changeType: ChangedDocument['changeType'],
+    hierarchy: ParentChainProjection | null,
   ): ChangedDocument {
     return {
       objToken: observation.objToken,
@@ -730,7 +751,88 @@ export class ChangeDetector {
       hasChild: observation.hasChild,
       observedObjEditTime: observation.observedObjEditTime,
       syncState: record.syncState,
+      parentChainTitles: hierarchy?.parentChainTitles,
+      isWatchedRootNode: hierarchy?.isWatchedRootNode,
+      localRelPath: record.localRelPath ?? null,
     };
+  }
+
+  /**
+   * Derive path-planning hierarchy solely from the current complete cloud
+   * traversal. SQLite may describe an old topology, so it must never be used
+   * to invent a path for a new or moved node.
+   *
+   * A null projection deliberately reaches PathResolver as an absent chain,
+   * which is fail-closed (`missing-parent-chain`) rather than being mistaken
+   * for the watched root body.
+   */
+  private projectParentChains(
+    observations: CloudNodeObservation[],
+    rootToken: string,
+  ): Map<string, ParentChainProjection | null> {
+    const byNodeToken = new Map<string, CloudNodeObservation>();
+    const duplicateTokens = new Set<string>();
+    for (const observation of observations) {
+      if (byNodeToken.has(observation.wikiNodeToken)) {
+        duplicateTokens.add(observation.wikiNodeToken);
+      }
+      byNodeToken.set(observation.wikiNodeToken, observation);
+    }
+
+    const memo = new Map<string, ParentChainProjection | null>();
+    const visiting = new Set<string>();
+
+    const resolve = (nodeToken: string): ParentChainProjection | null => {
+      if (memo.has(nodeToken)) return memo.get(nodeToken) ?? null;
+      if (duplicateTokens.has(nodeToken) || visiting.has(nodeToken)) {
+        memo.set(nodeToken, null);
+        return null;
+      }
+      if (nodeToken === rootToken) {
+        const root = {
+          parentChainTitles: [],
+          isWatchedRootNode: true,
+        };
+        memo.set(nodeToken, root);
+        return root;
+      }
+
+      const node = byNodeToken.get(nodeToken);
+      const parentToken = node?.parentNodeToken ?? null;
+      if (!node || !parentToken || !byNodeToken.has(parentToken)) {
+        memo.set(nodeToken, null);
+        return null;
+      }
+
+      visiting.add(nodeToken);
+      const parent = resolve(parentToken);
+      visiting.delete(nodeToken);
+      if (!parent) {
+        memo.set(nodeToken, null);
+        return null;
+      }
+
+      const parentNode = byNodeToken.get(parentToken);
+      if (parentToken !== rootToken && (!parentNode || !parentNode.title.trim())) {
+        memo.set(nodeToken, null);
+        return null;
+      }
+
+      const projection = {
+        parentChainTitles:
+          parentToken === rootToken
+            ? []
+            : [...parent.parentChainTitles, parentNode!.title],
+        isWatchedRootNode: false,
+      };
+      memo.set(nodeToken, projection);
+      return projection;
+    };
+
+    for (const nodeToken of byNodeToken.keys()) {
+      resolve(nodeToken);
+    }
+    return memo;
   }
 
   private legacyStateFromDocument(document: DocumentRecord): NonNullable<DocumentRecord['syncState']> {

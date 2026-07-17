@@ -81,6 +81,21 @@ describe('deriveProfileRelativePath — directory-readme', () => {
     expect(result.relativePath?.endsWith('.md')).toBe(true);
     expect(result.relativePath).not.toBe('技术 - Dev/服务器架构.md');
   });
+
+  it('fails closed when a non-root node has no parent-chain projection', () => {
+    const result = deriveProfileRelativePath({
+      localDir,
+      layoutProfile: 'directory-readme',
+      title: '未知层级节点',
+      hasChild: false,
+      isWatchedRootNode: false,
+    });
+
+    expect(result.relativePath).toBeNull();
+    expect(result.conflicts).toEqual([
+      expect.objectContaining({ kind: 'missing-parent-chain' }),
+    ]);
+  });
 });
 
 describe('deriveProfileRelativePath — mirror-title-file', () => {
@@ -205,6 +220,7 @@ describe('resolveLocalTarget', () => {
       watchedRoot: watched,
       title: '表格配置',
       hasChild: false,
+      parentChainTitles: [],
       isWatchedRootNode: false,
       objType: 'sheet',
     });
@@ -225,6 +241,7 @@ describe('resolveLocalTarget', () => {
       watchedRoot: watched,
       title: 'Server',
       hasChild: false,
+      parentChainTitles: [],
       isWatchedRootNode: false,
       rejectExistingFiles: false,
       occupiedRelPaths: ['Dev/server/README.md'],
@@ -246,6 +263,7 @@ describe('resolveLocalTarget', () => {
       watchedRoot: watched,
       title: '服务器架构',
       hasChild: false,
+      parentChainTitles: [],
       isWatchedRootNode: false,
       existingLocalRelPath: '技术 - Dev/old-server.md',
       preferProfilePath: true,
@@ -272,27 +290,18 @@ describe('resolveLocalTarget', () => {
       watchedRoot: watched,
       title: 'x',
       hasChild: false,
-      existingLocalRelPath: '../outside.md',
-      rejectExistingFiles: false,
-    });
-
-    // Falls back to profile after rejecting escape; profile for non-root empty chain
-    // with isWatchedRootNode undefined and empty parent → treated as root body.
-    // Provide explicit non-root:
-    const result2 = resolveLocalTarget({
-      knowledgeBaseRoot: tmpRoot,
-      watchedRoot: watched,
-      title: '安全节点',
-      hasChild: false,
+      parentChainTitles: [],
       isWatchedRootNode: false,
       existingLocalRelPath: '../outside.md',
       rejectExistingFiles: false,
     });
-    expect(result2.ok).toBe(true);
-    expect(result2.target?.relativeMarkdownPath).toBe(
-      '技术 - Dev/安全节点/README.md',
+
+    // A verified direct-child hierarchy lets the resolver fall back to the
+    // profile path after rejecting the unsafe existing mapping.
+    expect(result.ok).toBe(true);
+    expect(result.target?.relativeMarkdownPath).toBe(
+      '技术 - Dev/x/README.md',
     );
-    expect(result.ok || result2.ok).toBe(true);
   });
 });
 
@@ -310,6 +319,7 @@ describe('planDocumentPaths', () => {
           watchedRoot: watched,
           title: '同名',
           hasChild: false,
+          parentChainTitles: [],
           isWatchedRootNode: false,
           rejectExistingFiles: false,
         },
@@ -318,6 +328,7 @@ describe('planDocumentPaths', () => {
           watchedRoot: watched,
           title: '同名',
           hasChild: false,
+          parentChainTitles: [],
           isWatchedRootNode: false,
           rejectExistingFiles: false,
         },

@@ -13,6 +13,7 @@ import path from 'node:path';
 import type {
   ChangedDocument,
   PlannedSyncDocument,
+  SyncPlanReasonCode,
   SyncMode,
   WatchedRootConfig,
 } from '../types/index.js';
@@ -258,13 +259,65 @@ function findWatchedRoot(
 ): WatchedRootConfig | null {
   if (!watchedRoots.length) return null;
   if (document.watchedRootId) {
-    const byId = watchedRoots.find((root) => root.id === document.watchedRootId);
-    if (byId) return byId;
+    // A claimed root that is no longer configured is not an invitation to
+    // silently place a document under another root, even if only one happens
+    // to be enabled today.
+    return watchedRoots.find((root) => root.id === document.watchedRootId) ?? null;
   }
   // Single enabled root: unambiguous default for fixtures.
   const enabled = watchedRoots.filter((root) => root.enabled);
   if (enabled.length === 1) return enabled[0];
   return null;
+}
+
+function documentPlanContext(document: ChangedDocument): Pick<
+  PlannedSyncDocument,
+  'watchedRootId' | 'wikiNodeToken' | 'parentChainTitles'
+> {
+  return {
+    watchedRootId: document.watchedRootId ?? null,
+    wikiNodeToken: document.wikiNodeToken ?? null,
+    parentChainTitles: document.parentChainTitles ?? null,
+  };
+}
+
+function blockedPlan(
+  document: ChangedDocument,
+  details: {
+    reasonCode: SyncPlanReasonCode;
+    reason: string;
+    localRelPath?: string | null;
+    candidateLocalRelPath?: string | null;
+    suggestedResolution?: string;
+  },
+): PlannedSyncDocument {
+  return {
+    objToken: document.objToken,
+    title: document.title,
+    objType: document.objType,
+    changeType: document.changeType,
+    action: 'blocked',
+    localMdPath: null,
+    localRelPath: details.localRelPath ?? null,
+    previousSha256: null,
+    ...documentPlanContext(document),
+    reasonCode: details.reasonCode,
+    reason: details.reason,
+    candidateLocalRelPath: details.candidateLocalRelPath ?? null,
+    suggestedResolution: details.suggestedResolution,
+  };
+}
+
+function reasonCodeForPathConflicts(
+  conflicts: Array<{ kind: string }>,
+): SyncPlanReasonCode {
+  if (conflicts.some((conflict) => conflict.kind === 'missing-parent-chain')) {
+    return 'missing_parent_chain';
+  }
+  if (conflicts.some((conflict) => conflict.kind === 'escape-root')) {
+    return 'unsafe_path';
+  }
+  return 'path_conflict';
 }
 
 function planDocument(
@@ -274,20 +327,22 @@ function planDocument(
   occupied: Set<string>,
 ): PlannedSyncDocument {
   if (document.changeType === 'deleted') {
-    return {
-      objToken: document.objToken,
-      title: document.title,
-      objType: document.objType,
-      changeType: document.changeType,
-      action: 'blocked',
-      localMdPath: null,
-      localRelPath: null,
-      previousSha256: null,
+    return blockedPlan(document, {
+      reasonCode: 'deleted_requires_confirmation',
       reason: '删除需要独立的人工确认流程，当前同步操作不会删除本地文件',
-    };
+      suggestedResolution: '通过独立删除确认流程复核后再执行。',
+    });
   }
 
   const watchedRoot = findWatchedRoot(document, watchedRoots);
+  if (watchedRoots.length > 0 && !watchedRoot) {
+    return blockedPlan(document, {
+      reasonCode: 'unknown_watched_root',
+      reason: '文档的 watchedRootId 未匹配到当前启用配置，拒绝跨根或根目录回退',
+      suggestedResolution: '核对 watchedRootId 与当前配置，再重新生成同步计划。',
+    });
+  }
+
   if (watchedRoot) {
     const resolved = resolveLocalTarget({
       knowledgeBaseRoot: root,
@@ -307,50 +362,42 @@ function planDocument(
     });
 
     if (!resolved.ok || !resolved.target) {
-      return {
-        objToken: document.objToken,
-        title: document.title,
-        objType: document.objType,
-        changeType: document.changeType,
-        action: 'blocked',
-        localMdPath: null,
-        localRelPath: null,
-        previousSha256: null,
+      const candidateLocalRelPath =
+        resolved.conflicts.find((conflict) => conflict.relativePath)?.relativePath ?? null;
+      const reasonCode = reasonCodeForPathConflicts(resolved.conflicts);
+      return blockedPlan(document, {
+        reasonCode,
         reason:
           resolved.conflicts.map((item) => item.message).join('; ') ||
           'PathResolver 无法解析目标路径',
-      };
+        candidateLocalRelPath,
+        suggestedResolution:
+          reasonCode === 'missing_parent_chain'
+            ? '重新完成该 watched root 的云端遍历，补齐父链后再生成计划。'
+            : '根据候选路径和冲突详情修正映射或布局后再生成计划。',
+      });
     }
 
     const candidate = resolveAbsolute(root, resolved.target.relativeMarkdownPath);
     const unsafeReason = unsafePathReason(root, candidate);
     if (unsafeReason) {
-      return {
-        objToken: document.objToken,
-        title: document.title,
-        objType: document.objType,
-        changeType: document.changeType,
-        action: 'blocked',
-        localMdPath: null,
-        localRelPath: null,
-        previousSha256: null,
+      return blockedPlan(document, {
+        reasonCode: 'unsafe_path',
         reason: unsafeReason,
-      };
+        candidateLocalRelPath: resolved.target.relativeMarkdownPath,
+        suggestedResolution: '修正映射或符号链接后重新生成计划。',
+      });
     }
 
     const exists = fs.existsSync(candidate);
     if (exists && !fs.statSync(candidate).isFile()) {
-      return {
-        objToken: document.objToken,
-        title: document.title,
-        objType: document.objType,
-        changeType: document.changeType,
-        action: 'blocked',
-        localMdPath: null,
-        localRelPath: resolved.target.relativeMarkdownPath,
-        previousSha256: null,
+      return blockedPlan(document, {
+        reasonCode: 'path_conflict',
         reason: '目标路径存在但不是普通文件',
-      };
+        localRelPath: resolved.target.relativeMarkdownPath,
+        candidateLocalRelPath: resolved.target.relativeMarkdownPath,
+        suggestedResolution: '人工处理同名目录或文件后重新生成计划。',
+      });
     }
 
     const action = resolved.target.plannedMoveFrom
@@ -368,10 +415,15 @@ function planDocument(
       localMdPath: candidate,
       localRelPath: resolved.target.relativeMarkdownPath,
       previousSha256: exists ? sha256File(candidate) : null,
+      ...documentPlanContext(document),
       plannedMoveFrom: resolved.target.plannedMoveFrom ?? null,
       pathSource: resolved.target.source,
+      reasonCode: resolved.target.plannedMoveFrom ? 'planned_move' : undefined,
       reason: resolved.target.plannedMoveFrom
         ? `计划从 ${resolved.target.plannedMoveFrom} 迁移到规范路径`
+        : undefined,
+      suggestedResolution: resolved.target.plannedMoveFrom
+        ? '通过独立迁移流程复核旧路径与新路径后再执行。'
         : undefined,
     };
   }
@@ -382,32 +434,21 @@ function planDocument(
   const unsafeReason = unsafePathReason(root, candidate);
 
   if (unsafeReason) {
-    return {
-      objToken: document.objToken,
-      title: document.title,
-      objType: document.objType,
-      changeType: document.changeType,
-      action: 'blocked',
-      localMdPath: null,
-      localRelPath: null,
-      previousSha256: null,
+    return blockedPlan(document, {
+      reasonCode: 'unsafe_path',
       reason: unsafeReason,
-    };
+      suggestedResolution: '修正映射后重新生成计划。',
+    });
   }
 
   const exists = fs.existsSync(candidate);
   if (exists && !fs.statSync(candidate).isFile()) {
-    return {
-      objToken: document.objToken,
-      title: document.title,
-      objType: document.objType,
-      changeType: document.changeType,
-      action: 'blocked',
-      localMdPath: null,
-      localRelPath: null,
-      previousSha256: null,
+    return blockedPlan(document, {
+      reasonCode: 'path_conflict',
       reason: '计划目标不是常规文件，拒绝覆盖',
-    };
+      candidateLocalRelPath: toPortableRelative(root, candidate),
+      suggestedResolution: '人工处理同名目录或文件后重新生成计划。',
+    });
   }
 
   return {
@@ -419,6 +460,7 @@ function planDocument(
     localMdPath: candidate,
     localRelPath: toPortableRelative(root, candidate),
     previousSha256: exists ? sha256File(candidate) : null,
+    ...documentPlanContext(document),
     pathSource: 'legacy-fallback',
   };
 }
@@ -445,11 +487,17 @@ function blockConflictingTargets(documents: PlannedSyncDocument[]): void {
     previous.action = 'blocked';
     previous.localMdPath = null;
     previous.previousSha256 = null;
+    previous.reasonCode = 'path_conflict';
     previous.reason = reason;
+    previous.candidateLocalRelPath = previous.localRelPath ?? null;
+    previous.suggestedResolution = '为每个云端文档建立唯一映射后重新生成计划。';
     document.action = 'blocked';
     document.localMdPath = null;
     document.previousSha256 = null;
+    document.reasonCode = 'path_conflict';
     document.reason = reason;
+    document.candidateLocalRelPath = document.localRelPath ?? null;
+    document.suggestedResolution = '为每个云端文档建立唯一映射后重新生成计划。';
   }
 }
 
