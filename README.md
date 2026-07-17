@@ -2,14 +2,14 @@
 
 **跨平台桌面应用**：自动检测飞书知识库子树变更并选择性同步到本地，保持本地重构后的 Markdown 内容结构（表格布局、层级格式），支持 LLM 驱动的内容适配。
 
-**状态**：M0-M5 全量完成（v0.1.0），谛听审核通过。
+**状态**：正式同步交付版（2026-07-17）。正式回填默认只生成计划；只有显式 apply 才会写入知识库，路径冲突、移动、删除和未知类型均不会自动执行。
 
 ---
 
 ## 功能特性
 
 - **变更检测**：定时轮询飞书知识库子树，托盘通知变更数量（支持工作时间高频检测）
-- **同步引擎**：单篇/批量同步，图片/附件/sheet 块下钻，表格导出为本地重构版 Markdown
+- **同步引擎**：单篇/批量同步，docx、sheet、slides 分型读取；正文图片、附件和可下载白板资源会落盘并改写为本地引用
 - **表格重构**：A/B/C/D/E 五类块自动识别与重构（metadata/hierarchy/datatable/paragraph/sparse）
 - **LLM 适配**：deepseek few-shot 风格对齐，支持流式输出与降级策略
 - **系统托盘**：常驻托盘，快捷键（CmdOrCtrl+Shift+F）显示窗口，支持开机自启
@@ -24,7 +24,7 @@
 - **后端**：Hono 4 + @hono/node-server（内嵌同进程）
 - **数据**：better-sqlite3 9（SQLite，documents/sync_log/run_log 三表）
 - **LLM**：OpenAI SDK → deepseek（OpenAI 兼容）
-- **飞书**：lark-cli 1.0.53（认证+变更检测+内容获取统一入口，工具零飞书 token）
+- **飞书**：lark-cli 1.0.55（认证、变更检测、内容读取、媒体下载统一入口；工具不保存飞书 token）
 - **开发**：TypeScript 5 + esbuild 0.28
 
 ---
@@ -37,7 +37,7 @@
 
 - **LarkCliClient**：lark-cli 子进程封装，QPS 节流，错误分类（99991400 指数退避）
 - **ChangeDetector**：wiki 子树变更检测（obj_edit_time 对比本地 SQLite）
-- **SyncEngine**：内容获取 → 媒体下载 → 同步块下钻 → 表格导出 → 重构 → LLM 适配 → 写本地
+- **SyncEngine**：内容分型读取 → 媒体引用解析/下载 → 本地引用重写 → staged 原子提交 → SQLite 基线推进
 - **LayoutReconstructor**：A/B/C/D/E 五类块识别的表格重构引擎
 - **ContentAdapter**：deepseek few-shot 风格对齐（temperature 0.2）
 - **LocalMapStore**：SQLite 映射与状态库（首次索引扫描 < 10s）
@@ -111,6 +111,20 @@ lark-cli auth status
   "enableNotifications": true
 }
 ```
+
+### 正式知识库回填
+
+正式回填脚本位于 server/scripts/sync-latest.ts。它会以当前用户配置为权威：已有配置只读加载，除非显式传入 --persist-config；默认不会改写密钥、模型或其他用户字段。
+
+    cd server
+    npx tsx scripts/sync-latest.ts --skip-index
+    npx tsx scripts/sync-latest.ts --skip-index --apply
+
+第一条命令只生成 operation manifest 和汇总报告。第二条命令仅执行 create / replace；move、delete、路径冲突、父链不完整、未知对象类型与无权限对象会保留为带 reasonCode 的 blocker，绝不自动覆盖本地文件。
+
+提交前会先把正文、图片、附件、白板缩略图和 sheet CSV 写入 staging。任一资源缺失、媒体下载失败或提交异常时，不推进 SQLite 的 synced 基线。正式运维还应保留 operation manifest 与备份；恢复时同时还原知识库、SQLite 和配置。
+
+当前已知限制：没有可信飞书标识的历史本地文件不会被自动认领；需要先核对内容和路径，再通过独立迁移回填映射。当前无法导出的未知对象类型同样保留为 blocker，而不是写入占位成功记录。
 
 ### 开发模式
 
