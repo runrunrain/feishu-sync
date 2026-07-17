@@ -36,6 +36,10 @@ import {
   resolveSyncMode,
   writeOperationManifest,
 } from './operation-manifest.js';
+import {
+  resolveAbsolute,
+  resolveLocalTarget,
+} from './path-resolver.js';
 
 interface FetchedDocument {
   content: string;
@@ -142,6 +146,9 @@ export class SyncEngine {
       knowledgeBaseRoot: this.config.knowledgeBaseRoot,
       documents,
       mode,
+      watchedRoots: Array.isArray(this.config?.watchedRoots)
+        ? this.config.watchedRoots
+        : [],
     });
     const operationDirectory = resolveOperationDirectory(
       this.config.knowledgeBaseRoot,
@@ -722,9 +729,41 @@ export class SyncEngine {
   }
 
   /**
-   * Generate local file path from document title
+   * Generate local file path via PathResolver when a watched root is known;
+   * otherwise fall back to the legacy root-level title.md plan (blocked in
+   * dry-run when multi-root config is present without watchedRootId).
    */
   private generateLocalPath(doc: ChangedDocument): string {
+    const roots = Array.isArray(this.config?.watchedRoots)
+      ? this.config.watchedRoots
+      : [];
+    const rootConfig = doc.watchedRootId
+      ? roots.find((item: { id: string }) => item.id === doc.watchedRootId)
+      : roots.length === 1
+        ? roots[0]
+        : null;
+
+    if (rootConfig) {
+      const planned = resolveLocalTarget({
+        knowledgeBaseRoot: this.config.knowledgeBaseRoot,
+        watchedRoot: rootConfig,
+        title: doc.title,
+        hasChild: doc.hasChild === true,
+        parentChainTitles: doc.parentChainTitles,
+        isWatchedRootNode: doc.isWatchedRootNode,
+        existingLocalRelPath: doc.localRelPath ?? null,
+        existingLocalMdPath: doc.localMdPath,
+        objType: doc.objType,
+        rejectExistingFiles: false,
+      });
+      if (planned.ok && planned.target) {
+        return resolveAbsolute(
+          this.config.knowledgeBaseRoot,
+          planned.target.relativeMarkdownPath,
+        );
+      }
+    }
+
     return fallbackMarkdownTarget(this.config.knowledgeBaseRoot, doc.title);
   }
 

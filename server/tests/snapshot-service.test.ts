@@ -164,24 +164,55 @@ describe('SnapshotService.generate', () => {
     // Reason tag matches 03 §2.4.1 spec wording.
     const orphan = snap.orphan_files.find((o) => o.path === 'orphan.md')!;
     expect(orphan.reason).toBe('no_obj_token_in_header');
+    expect(orphan.classification).toBe('local_only_confirmed');
   });
 
-  it('skips README.md during orphan scan (auto-generated, no header by design)', () => {
+  it('classifies headerless README as missing_metadata (no longer hidden)', () => {
+    // P2-05: README without feishu identity must be diagnosable, not skipped.
     fs.mkdirSync(tmpDir, { recursive: true });
     fs.writeFileSync(path.join(tmpDir, 'README.md'), '# Knowledge Base Overview');
     const snap = svc.generate();
-    expect(snap.orphan_files).toHaveLength(0);
+    expect(snap.orphan_files).toHaveLength(1);
+    expect(snap.orphan_files[0]).toMatchObject({
+      path: 'README.md',
+      classification: 'missing_metadata',
+      reason: 'readme_missing_feishu_metadata',
+    });
   });
 
-  it('skips INDEX.md during orphan scan (hand-curated navigation, no Feishu node)', () => {
-    // INDEX.md files are local-only navigation aids (e.g. 技术 - Dev/INDEX.md).
-    // They have no obj_token header by design and must not be flagged as
-    // orphans, otherwise OrphanFileAlert would surface intentional local
-    // artifacts as actionable warnings.
+  it('classifies INDEX.md as ignored_artifact (navigation, not actionable orphan)', () => {
+    // INDEX.md is a local navigation aid. P2-05 still records it, but with
+    // ignored_artifact so UI can filter it out of destructive workflows.
     fs.mkdirSync(tmpDir, { recursive: true });
     fs.writeFileSync(path.join(tmpDir, 'INDEX.md'), '# Navigation Index');
     const snap = svc.generate();
-    expect(snap.orphan_files).toHaveLength(0);
+    expect(snap.orphan_files).toHaveLength(1);
+    expect(snap.orphan_files[0]).toMatchObject({
+      path: 'INDEX.md',
+      classification: 'ignored_artifact',
+      reason: 'navigation_index',
+    });
+  });
+
+  it('emits portable relative local_path and never absolute device paths', () => {
+    store.rows = [
+      makeDoc({
+        objToken: 'REL',
+        title: '相对路径节点',
+        localMdPath: path.join(tmpDir, '技术 - Dev', 'README.md'),
+        localRelPath: '技术 - Dev/README.md',
+      }),
+    ];
+    fs.mkdirSync(path.join(tmpDir, '技术 - Dev'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, '技术 - Dev', 'README.md'),
+      '<!--\nfeishu_sync:\n  obj_token: REL\n-->\n# 标题\n',
+    );
+
+    const snap = svc.generate();
+    expect(snap.nodes[0].local_path).toBe('技术 - Dev/README.md');
+    expect(snap.nodes[0].local_path).not.toMatch(/^[A-Za-z]:/);
+    expect(path.isAbsolute(snap.nodes[0].local_path)).toBe(false);
   });
 
   it('skips ScanPolicy operational directories during orphan scan', () => {

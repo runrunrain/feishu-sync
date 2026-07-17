@@ -261,7 +261,7 @@ export interface TreeResponse {
   view: 'feishu' | 'local';
   nodes: MappingNode[];
   watched_roots: WatchedRoot[];
-  orphan_files: Array<{ path: string; reason: string; cloud_match: 'local_only' }>;
+  orphan_files: OrphanFile[];
   stats: {
     total_nodes: number;
     watched_root_count: number;
@@ -317,14 +317,21 @@ export interface DiffReport {
 /**
  * Orphan file entry from _index.json.orphan_files.
  *
- * v0.2.0 cloud-link-coverage: cloud_match is always 'local_only' for orphans
- * (they have no feishu correspondence by definition). Surfaced explicitly so
- * the UI can render "本地独有 / 无飞书对应" rather than treating them as broken.
+ * P2-05: classification distinguishes missing metadata, ambiguous cloud
+ * matches, confirmed local-only files, and ignored navigation artifacts.
+ * cloud_match remains for backward-compatible badge rendering.
  */
+export type OrphanClassification =
+  | 'missing_metadata'
+  | 'cloud_match_ambiguous'
+  | 'local_only_confirmed'
+  | 'ignored_artifact';
+
 export interface OrphanFile {
   path: string;
   reason: string;
-  cloud_match: 'local_only';
+  classification?: OrphanClassification;
+  cloud_match: 'local_only' | 'unknown';
 }
 
 /**

@@ -36,7 +36,7 @@ import { EmptyState } from './common/EmptyState';
 import { useToast } from './common/Toast';
 import { appLogger } from '../utils/appLogger';
 import { getMappingTreeDetailed } from '../api/client';
-import type { LocalDirTreeNode, MappingNode, TreeResponse } from '../types';
+import type { LocalDirTreeNode, MappingNode, OrphanFile, TreeResponse } from '../types';
 
 interface LocalDirTreeViewProps {
   /** Optional pre-fetched envelope. When undefined the component fetches. */
@@ -44,7 +44,7 @@ interface LocalDirTreeViewProps {
   /** Pre-fetched nodes (alternative to envelope). */
   nodes?: MappingNode[];
   /** Pre-fetched orphans (alternative to envelope). */
-  orphans?: Array<{ path: string; reason: string; cloud_match: 'local_only' }>;
+  orphans?: OrphanFile[];
   /** Selected obj_token (file node). */
   selectedToken: string | null;
   /** Fired when a file node is clicked; parent shows NodeDetailCard. */
@@ -78,7 +78,7 @@ function splitPath(path: string): string[] {
  */
 function buildLocalTree(
   docs: MappingNode[],
-  orphans: Array<{ path: string; reason: string; cloud_match: 'local_only' }>,
+  orphans: OrphanFile[],
 ): LocalDirTreeNode[] {
   const root: LocalDirTreeNode = { type: 'dir', name: '', path: '', children: [] };
   const dirMap = new Map<string, LocalDirTreeNode>();
@@ -145,7 +145,7 @@ function buildLocalTree(
       type: 'file',
       name: fileName,
       path: orphan.path,
-      cloud_match: 'local_only',
+      cloud_match: orphan.cloud_match === 'unknown' ? 'unknown' : 'local_only',
       is_orphan: true,
     });
   }

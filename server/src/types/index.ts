@@ -348,6 +348,15 @@ export interface ChangedDocument {
   hasChild?: boolean;
   observedObjEditTime?: number | null;
   syncState?: SyncState;
+  /**
+   * Titles of ancestors under the watched root (exclusive of the root and
+   * of this node). Used by PathResolver when no existing mapping is present.
+   */
+  parentChainTitles?: string[];
+  /** True when this document is the watched root body itself. */
+  isWatchedRootNode?: boolean;
+  /** Portable relative path already stored in the database, if any. */
+  localRelPath?: string | null;
 }
 
 export interface SyncedDocument {
@@ -379,10 +388,14 @@ export interface PlannedSyncDocument {
   title: string;
   objType: 'docx' | 'sheet' | 'slides' | 'unknown';
   changeType: 'modified' | 'added' | 'deleted';
-  action: 'create' | 'replace' | 'blocked';
+  action: 'create' | 'replace' | 'blocked' | 'move';
   localMdPath: string | null;
+  /** Portable POSIX path relative to knowledgeBaseRoot. */
+  localRelPath?: string | null;
   previousSha256: string | null;
   reason?: string;
+  plannedMoveFrom?: string | null;
+  pathSource?: 'existing-mapping' | 'layout-profile' | 'legacy-fallback';
 }
 
 export type SyncMode = 'dry-run' | 'apply';
@@ -457,12 +470,35 @@ export interface DiffReport {
  * "user has not reordered, display in Feishu's original order"; non-null
  * is a 0-based weight applied within the same parent scope.
  */
+/** Classification for local files that are not (yet) uniquely mapped. */
+export type OrphanClassification =
+  | 'missing_metadata'
+  | 'cloud_match_ambiguous'
+  | 'local_only_confirmed'
+  | 'ignored_artifact';
+
+export interface OrphanFileEntry {
+  /** Portable POSIX path relative to knowledge_base_root. */
+  path: string;
+  reason: string;
+  classification: OrphanClassification;
+  /**
+   * Legacy cloud_match marker retained for older UI clients.
+   * Prefer `classification` for new code.
+   */
+  cloud_match: 'local_only' | 'unknown';
+}
+
 export interface MappingNode {
   obj_token: string;
   wiki_node_token: string | null;
   space_id: string | null;
   obj_type: 'docx' | 'sheet' | 'slides' | 'unknown';
   title: string;
+  /**
+   * Portable POSIX path relative to knowledge_base_root.
+   * Absolute device paths must not appear here (P2-05).
+   */
   local_path: string;
   parent_node_token: string | null;
   has_child: boolean;
@@ -511,7 +547,7 @@ export interface TreeResponse {
   view: 'feishu' | 'local';
   nodes: MappingNode[];
   watched_roots: WatchedRoot[];
-  orphan_files: Array<{ path: string; reason: string; cloud_match: 'local_only' }>;
+  orphan_files: OrphanFileEntry[];
   stats: {
     total_nodes: number;
     watched_root_count: number;
@@ -554,7 +590,7 @@ export interface IndexSnapshot {
   mounted_dirs: Array<{ local_dir: string; reason: string }>;
   top_level_dirs: Array<{ dir: string; node_count: number }>;
   nodes: MappingNode[];
-  orphan_files: Array<{ path: string; reason: string; cloud_match: 'local_only' }>;
+  orphan_files: OrphanFileEntry[];
 }
 
 /**

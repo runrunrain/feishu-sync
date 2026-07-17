@@ -20,7 +20,93 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { getEnabledWatchedRoots } from '../types/index.js';
 import type { DocumentRecord } from '../types/index.js';
+import { toPortableRelative } from './path-resolver.js';
 import { ScanPolicy } from './scan-policy.js';
+
+/**
+ * Resolve the display title used when indexing a local markdown file.
+ *
+ * - README.md: first ATX H1 after front-matter / header comments, else the
+ *   parent directory name, else the literal `"README"`.
+ * - Other .md files: filename without extension.
+ *
+ * Exported for unit tests and callers that need the same identity rule.
+ */
+export function resolveDocumentTitle(mdPath: string, content: string): string {
+  const baseName = path.basename(mdPath);
+  const stem = path.basename(mdPath, path.extname(mdPath));
+
+  if (baseName.toLowerCase() !== 'readme.md') {
+    return stem;
+  }
+
+  const h1 = extractFirstAtxH1(content);
+  if (h1) return h1;
+
+  const parentName = path.basename(path.dirname(path.resolve(mdPath)));
+  if (
+    parentName &&
+    parentName !== '.' &&
+    parentName !== path.sep &&
+    // Windows drive root / POSIX root edge cases
+    !/^[A-Za-z]:\\?$/.test(parentName) &&
+    parentName !== '/'
+  ) {
+    return parentName;
+  }
+
+  return 'README';
+}
+
+/**
+ * Strip leading HTML comments and YAML front-matter, then return the first
+ * ATX H1 (`# title`). Setext headings and H2+ are ignored.
+ */
+function extractFirstAtxH1(content: string): string | null {
+  let rest = content;
+  let progressed = true;
+
+  while (progressed) {
+    progressed = false;
+    // Leading blank lines / BOM-ish whitespace
+    const trimmed = rest.replace(/^\uFEFF?[\t ]*(?:\r?\n)+/, '').replace(/^\uFEFF/, '');
+    if (trimmed !== rest) {
+      rest = trimmed;
+      progressed = true;
+    }
+
+    // HTML comment block (feishu_sync / legacy header comments)
+    const htmlMatch = rest.match(/^<!--[\s\S]*?-->/);
+    if (htmlMatch) {
+      rest = rest.slice(htmlMatch[0].length);
+      progressed = true;
+      continue;
+    }
+
+    // YAML front-matter --- ... ---
+    const fmMatch = rest.match(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/);
+    if (fmMatch) {
+      rest = rest.slice(fmMatch[0].length);
+      progressed = true;
+      continue;
+    }
+  }
+
+  // Drop remaining leading whitespace/newlines before scanning headings
+  rest = rest.replace(/^\s+/, '');
+
+  for (const line of rest.split(/\r?\n/)) {
+    // Single-hash ATX H1 only (not ## / ###)
+    if (!line.startsWith('#') || line.startsWith('##')) continue;
+    const m = line.match(/^#\s+(.+?)\s*$/);
+    if (m) {
+      const title = m[1].trim();
+      if (title.length > 0) return title;
+    }
+  }
+
+  return null;
+}
 
 interface IndexScannerDeps {
   localMapStore: any; // LocalMapStore
@@ -206,17 +292,32 @@ export class IndexScanner {
     // previously classified as 'restricted' (e.g. placeholder from change-
     // detector), a successful reindex with a real title promotes it to
     // 'synced' on the next recompute pass.
+    //
+    // P2-04: title comes from resolveDocumentTitle (README → H1 / parent dir);
+    // space_id + last_synced_modify_time are forwarded; localRelPath is the
+    // POSIX path relative to knowledgeBaseRoot when that config is available.
+    const today = new Date().toISOString().split('T')[0];
+    const title = resolveDocumentTitle(mdPath, content);
+    const kbRoot =
+      typeof this.config?.knowledgeBaseRoot === 'string'
+        ? this.config.knowledgeBaseRoot
+        : '';
+    const localRelPath =
+      kbRoot.length > 0 ? toPortableRelative(kbRoot, mdPath) : null;
+
     this.localMapStore.upsertDocument({
       objToken,
       wikiNodeToken: header.wiki_node_token ?? null,
       objType: objType as DocumentRecord['objType'],
-      title: path.basename(mdPath, '.md'),
+      title,
       localMdPath: mdPath,
       lastSyncedModifyTime:
-        header.fetch_date || new Date().toISOString().split('T')[0],
+        header.last_synced_modify_time || header.fetch_date || today,
       lastSyncedAt: new Date().toISOString(),
       status: 'synced',
       originalLink: header.original_link ?? null,
+      spaceId: header.space_id ?? null,
+      ...(localRelPath != null ? { localRelPath } : {}),
     });
 
     console.info(`[IndexScanner] Indexed ${mdPath} (obj_token: ${objToken})`);

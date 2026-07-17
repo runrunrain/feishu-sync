@@ -14,8 +14,15 @@ import type {
   ChangedDocument,
   PlannedSyncDocument,
   SyncMode,
+  WatchedRootConfig,
 } from '../types/index.js';
 import { ScanPolicy } from './scan-policy.js';
+import {
+  resolveAbsolute,
+  resolveLocalTarget,
+  sanitizePathSegment as sanitizeResolverSegment,
+  toPortableRelative,
+} from './path-resolver.js';
 
 export interface OperationManifest {
   schemaVersion: 1;
@@ -43,6 +50,8 @@ export interface CreateOperationManifestOptions {
   knowledgeBaseRoot: string;
   documents: ChangedDocument[];
   mode: SyncMode;
+  /** When provided, dry-run planning uses profile-aware PathResolver. */
+  watchedRoots?: WatchedRootConfig[];
 }
 
 export interface KnowledgeBaseAudit {
@@ -106,7 +115,15 @@ export function createOperationManifest(
   }
 
   const root = path.resolve(options.knowledgeBaseRoot);
-  const documents = options.documents.map((document) => planDocument(root, document));
+  const watchedRoots = options.watchedRoots ?? [];
+  const occupied = new Set<string>();
+  const documents = options.documents.map((document) => {
+    const planned = planDocument(root, document, watchedRoots, occupied);
+    if (planned.localRelPath) {
+      occupied.add(planned.localRelPath);
+    }
+    return planned;
+  });
   blockConflictingTargets(documents);
 
   return {
@@ -226,16 +243,36 @@ export function writeKnowledgeBaseAudit(
 }
 
 /**
- * A single fallback target is retained temporarily for legacy callers.  P2's
- * PathResolver will replace it with profile-aware planning; keeping it here
- * prevents the dry-run plan and apply path from diverging in the meantime.
+ * Legacy fallback when no watchedRoot can be resolved for a document.
+ * Prefer PathResolver via watchedRoots; this keeps dry-run callable without
+ * configuration during unit tests.
  */
 export function fallbackMarkdownTarget(root: string, title: string): string {
-  const safeTitle = sanitizePathSegment(title) || 'untitled';
+  const safeTitle = sanitizeResolverSegment(title) || sanitizePathSegment(title) || 'untitled';
   return path.join(root, `${safeTitle}.md`);
 }
 
-function planDocument(root: string, document: ChangedDocument): PlannedSyncDocument {
+function findWatchedRoot(
+  document: ChangedDocument,
+  watchedRoots: WatchedRootConfig[],
+): WatchedRootConfig | null {
+  if (!watchedRoots.length) return null;
+  if (document.watchedRootId) {
+    const byId = watchedRoots.find((root) => root.id === document.watchedRootId);
+    if (byId) return byId;
+  }
+  // Single enabled root: unambiguous default for fixtures.
+  const enabled = watchedRoots.filter((root) => root.enabled);
+  if (enabled.length === 1) return enabled[0];
+  return null;
+}
+
+function planDocument(
+  root: string,
+  document: ChangedDocument,
+  watchedRoots: WatchedRootConfig[],
+  occupied: Set<string>,
+): PlannedSyncDocument {
   if (document.changeType === 'deleted') {
     return {
       objToken: document.objToken,
@@ -244,8 +281,98 @@ function planDocument(root: string, document: ChangedDocument): PlannedSyncDocum
       changeType: document.changeType,
       action: 'blocked',
       localMdPath: null,
+      localRelPath: null,
       previousSha256: null,
       reason: '删除需要独立的人工确认流程，当前同步操作不会删除本地文件',
+    };
+  }
+
+  const watchedRoot = findWatchedRoot(document, watchedRoots);
+  if (watchedRoot) {
+    const resolved = resolveLocalTarget({
+      knowledgeBaseRoot: root,
+      watchedRoot,
+      title: document.title,
+      hasChild: document.hasChild === true,
+      parentChainTitles: document.parentChainTitles,
+      isWatchedRootNode: document.isWatchedRootNode,
+      existingLocalRelPath: document.localRelPath ?? null,
+      existingLocalMdPath: document.localMdPath,
+      objType: document.objType,
+      occupiedRelPaths: occupied,
+      // Existing localMdPath that already points at a file is a replace, not
+      // an overwrite of a foreign body — PathResolver handles this via
+      // existing-mapping preference.
+      rejectExistingFiles: !document.localMdPath && !document.localRelPath,
+    });
+
+    if (!resolved.ok || !resolved.target) {
+      return {
+        objToken: document.objToken,
+        title: document.title,
+        objType: document.objType,
+        changeType: document.changeType,
+        action: 'blocked',
+        localMdPath: null,
+        localRelPath: null,
+        previousSha256: null,
+        reason:
+          resolved.conflicts.map((item) => item.message).join('; ') ||
+          'PathResolver 无法解析目标路径',
+      };
+    }
+
+    const candidate = resolveAbsolute(root, resolved.target.relativeMarkdownPath);
+    const unsafeReason = unsafePathReason(root, candidate);
+    if (unsafeReason) {
+      return {
+        objToken: document.objToken,
+        title: document.title,
+        objType: document.objType,
+        changeType: document.changeType,
+        action: 'blocked',
+        localMdPath: null,
+        localRelPath: null,
+        previousSha256: null,
+        reason: unsafeReason,
+      };
+    }
+
+    const exists = fs.existsSync(candidate);
+    if (exists && !fs.statSync(candidate).isFile()) {
+      return {
+        objToken: document.objToken,
+        title: document.title,
+        objType: document.objType,
+        changeType: document.changeType,
+        action: 'blocked',
+        localMdPath: null,
+        localRelPath: resolved.target.relativeMarkdownPath,
+        previousSha256: null,
+        reason: '目标路径存在但不是普通文件',
+      };
+    }
+
+    const action = resolved.target.plannedMoveFrom
+      ? 'move'
+      : exists
+        ? 'replace'
+        : 'create';
+
+    return {
+      objToken: document.objToken,
+      title: document.title,
+      objType: document.objType,
+      changeType: document.changeType,
+      action,
+      localMdPath: candidate,
+      localRelPath: resolved.target.relativeMarkdownPath,
+      previousSha256: exists ? sha256File(candidate) : null,
+      plannedMoveFrom: resolved.target.plannedMoveFrom ?? null,
+      pathSource: resolved.target.source,
+      reason: resolved.target.plannedMoveFrom
+        ? `计划从 ${resolved.target.plannedMoveFrom} 迁移到规范路径`
+        : undefined,
     };
   }
 
@@ -262,6 +389,7 @@ function planDocument(root: string, document: ChangedDocument): PlannedSyncDocum
       changeType: document.changeType,
       action: 'blocked',
       localMdPath: null,
+      localRelPath: null,
       previousSha256: null,
       reason: unsafeReason,
     };
@@ -276,6 +404,7 @@ function planDocument(root: string, document: ChangedDocument): PlannedSyncDocum
       changeType: document.changeType,
       action: 'blocked',
       localMdPath: null,
+      localRelPath: null,
       previousSha256: null,
       reason: '计划目标不是常规文件，拒绝覆盖',
     };
@@ -288,7 +417,9 @@ function planDocument(root: string, document: ChangedDocument): PlannedSyncDocum
     changeType: document.changeType,
     action: exists ? 'replace' : 'create',
     localMdPath: candidate,
+    localRelPath: toPortableRelative(root, candidate),
     previousSha256: exists ? sha256File(candidate) : null,
+    pathSource: 'legacy-fallback',
   };
 }
 
