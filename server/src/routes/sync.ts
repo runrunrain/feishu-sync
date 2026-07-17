@@ -14,7 +14,7 @@ import { LayoutReconstructor } from '../modules/layout-reconstructor.js';
 import { ContentAdapter } from '../modules/content-adapter.js';
 import { ContentBackendRegistry } from '../modules/content-backend-registry.js';
 import type { ChannelConfig } from '../modules/content-backend.js';
-import type { SyncResult } from '../types/index.js';
+import type { ChangedDocument, SyncOptions, SyncResult } from '../types/index.js';
 
 const syncRoutes = new Hono();
 
@@ -25,7 +25,39 @@ const syncRoutes = new Hono();
  * Response: SyncResult
  */
 syncRoutes.post('/api/sync', async (c) => {
-  const { documents, options } = await c.req.json();
+  let payload: Record<string, unknown>;
+  try {
+    payload = await c.req.json<Record<string, unknown>>();
+  } catch {
+    return c.json({ error: 'invalid_json', message: '同步请求必须是 JSON 对象' }, 400);
+  }
+
+  if (!Array.isArray(payload.documents)) {
+    return c.json({ error: 'invalid_documents', message: 'documents 必须是数组' }, 400);
+  }
+
+  const rawOptions = payload.options;
+  const rawOptionsObject = rawOptions && typeof rawOptions === 'object'
+    ? rawOptions as Record<string, unknown>
+    : {};
+  const options: SyncOptions = {
+    enableLLM: false,
+    fullSync: false,
+    apply: rawOptionsObject.apply === true,
+    confirmation: typeof rawOptionsObject.confirmation === 'string'
+      ? rawOptionsObject.confirmation
+      : undefined,
+  };
+
+  // A truthy apply flag is never enough on its own. This rejects accidental
+  // compatibility callers instead of silently mutating a real knowledge base.
+  if (options.apply && options.confirmation !== 'APPLY') {
+    return c.json({
+      error: 'apply_confirmation_required',
+      message: '正式写入需要 options.apply=true 且 options.confirmation="APPLY"',
+    }, 400);
+  }
+  const documents = payload.documents as ChangedDocument[];
 
   // Get dependencies from context (injected by middleware)
   const larkCliClient = (c as any).larkCliClient;
@@ -74,16 +106,18 @@ syncRoutes.post('/api/sync', async (c) => {
   // Execute synchronization
   const result: SyncResult = await syncEngine.syncDocuments(documents, options);
 
-  // Refresh _index.json snapshot (03 §2.4.1 生成时机: 同步完成后).
-  // Best-effort: snapshot failure must not invalidate an otherwise
-  // successful sync. The next manual refresh-index call will recover.
-  try {
-    const { SnapshotService } = await import('../modules/snapshot-service.js');
-    const indexScanner = new IndexScanner({ localMapStore, larkCliClient, config });
-    const snapshotService = new SnapshotService(localMapStore, configManager, indexScanner);
-    snapshotService.generate();
-  } catch (snapshotError) {
-    console.warn('[sync] _index.json refresh after sync failed (non-fatal):', snapshotError);
+  // A dry-run must not refresh _index.json: that file lives in the formal
+  // knowledge base and would turn an ostensibly read-only operation into a
+  // write. Snapshot refresh remains an apply-only best-effort side effect.
+  if (result.mode === 'apply') {
+    try {
+      const { SnapshotService } = await import('../modules/snapshot-service.js');
+      const indexScanner = new IndexScanner({ localMapStore, larkCliClient, config });
+      const snapshotService = new SnapshotService(localMapStore, configManager, indexScanner);
+      snapshotService.generate();
+    } catch (snapshotError) {
+      console.warn('[sync] _index.json refresh after sync failed (non-fatal):', snapshotError);
+    }
   }
 
   return c.json(result);

@@ -178,13 +178,24 @@ describe('SnapshotService.generate', () => {
     expect(snap.orphan_files).toHaveLength(0);
   });
 
-  it('skips the _reports directory during orphan scan (local-only agent reports)', () => {
-    // The _reports directory holds sync/agent reports under kbRoot for
-    // convenience but has no Feishu correspondence. Every .md inside would
-    // be flagged orphan if collectMarkdownFiles recursed into it.
-    fs.mkdirSync(path.join(tmpDir, '_reports'), { recursive: true });
-    fs.writeFileSync(path.join(tmpDir, '_reports', 'luban-report.md'), '# sync report');
-    fs.writeFileSync(path.join(tmpDir, '_reports', 'diting-audit.md'), '# audit report');
+  it('skips ScanPolicy operational directories during orphan scan', () => {
+    // These directories contain reports, trash, staging output, or recovery
+    // material. They must not be surfaced as user-actionable orphan files.
+    const ignoredDirs = [
+      '_reports',
+      '.trash-bin',
+      '.staging',
+      '_staging',
+      '.recovery',
+      '_recovery',
+      '.restore',
+      '_restore',
+    ];
+    for (const dir of ignoredDirs) {
+      const artifactDir = path.join(tmpDir, dir);
+      fs.mkdirSync(artifactDir, { recursive: true });
+      fs.writeFileSync(path.join(artifactDir, 'artifact.md'), '# local artifact');
+    }
     // A real orphan outside _reports should still be surfaced.
     fs.writeFileSync(path.join(tmpDir, 'real-orphan.md'), '# no header here');
 
@@ -192,8 +203,9 @@ describe('SnapshotService.generate', () => {
 
     const orphanPaths = snap.orphan_files.map((o) => o.path);
     expect(orphanPaths).toContain('real-orphan.md');
-    // Nothing under _reports/ should appear.
-    expect(orphanPaths.some((p) => p.startsWith('_reports/'))).toBe(false);
+    for (const dir of ignoredDirs) {
+      expect(orphanPaths.some((p) => p.startsWith(`${dir}/`))).toBe(false);
+    }
   });
 
   it('writes _index.json atomically and can re-read it', () => {

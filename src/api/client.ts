@@ -240,18 +240,23 @@ export async function detectChangesAll(): Promise<MultiRootDetectionResult> {
 }
 
 /**
- * Sync documents
+ * Run a dry-run for selected documents.
+ *
+ * `fullSync`, LLM adaptation and apply are deliberately not caller-facing
+ * options. Their current backend implementations do not provide reliable
+ * product semantics, so the client locks them off until that changes.
  */
-export async function syncDocs(
-  options: {
-    documents: ChangedDocument[];
-    enableLLM: boolean;
-    fullSync: boolean;
-  }
-): Promise<SyncResult> {
+export async function syncDocs(documents: ChangedDocument[]): Promise<SyncResult> {
   return request<SyncResult>('/api/sync', {
     method: 'POST',
-    body: JSON.stringify(options),
+    body: JSON.stringify({
+      documents,
+      options: {
+        enableLLM: false,
+        fullSync: false,
+        apply: false,
+      },
+    }),
   });
 }
 

@@ -19,6 +19,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { DocumentRecord } from '../types/index.js';
+import { ScanPolicy } from './scan-policy.js';
 
 interface IndexScannerDeps {
   localMapStore: any; // LocalMapStore
@@ -619,9 +620,14 @@ export class IndexScanner {
       const fullPath = path.join(dir, entry.name);
 
       if (entry.isDirectory()) {
+        if (ScanPolicy.shouldSkipDirectory(entry.name)) continue;
         // Recursively scan subdirectories
         mdFiles.push(...this.findMarkdownFiles(fullPath));
-      } else if (entry.isFile() && entry.name.endsWith('.md')) {
+      } else if (
+        entry.isFile() &&
+        !ScanPolicy.shouldSkipFile(entry.name) &&
+        entry.name.endsWith('.md')
+      ) {
         mdFiles.push(fullPath);
       }
     }

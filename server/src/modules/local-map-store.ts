@@ -951,6 +951,34 @@ export class LocalMapStore {
       CREATE INDEX IF NOT EXISTS idx_local_dirs_cloud_match  ON localDirs(cloud_match);
       CREATE INDEX IF NOT EXISTS idx_local_dirs_parent       ON localDirs(parent_path);
 
+      -- Sub-sheet mapping is a runtime dependency of SyncEngine, not an
+      -- optional migration-script add-on. New installs must be able to sync
+      -- a workbook before any manual migration has ever been run.
+      CREATE TABLE IF NOT EXISTS sheet_sheets (
+        sheet_obj_token TEXT NOT NULL,
+        sheet_id TEXT NOT NULL,
+        sheet_title TEXT NOT NULL,
+        local_csv_path TEXT NOT NULL,
+        local_md_path TEXT,
+        last_synced_modify_time TEXT,
+        status TEXT NOT NULL DEFAULT 'synced'
+               CHECK(status IN ('synced', 'changed', 'error', 'placeholder')),
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (sheet_obj_token, sheet_id),
+        FOREIGN KEY (sheet_obj_token) REFERENCES documents(obj_token) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_sheet_sheets_sheet_obj ON sheet_sheets(sheet_obj_token);
+      CREATE INDEX IF NOT EXISTS idx_sheet_sheets_status ON sheet_sheets(status);
+
+      -- Keep the runtime schema self-describing. Historic migration scripts
+      -- may record their own version rows; table creation itself is
+      -- idempotent and intentionally does not pretend those scripts ran.
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        version TEXT PRIMARY KEY,
+        applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
       -- Sync log table
       CREATE TABLE IF NOT EXISTS sync_log (
         sync_id TEXT PRIMARY KEY,

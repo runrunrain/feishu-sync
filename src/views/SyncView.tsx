@@ -3,13 +3,14 @@
  *
  * P4-2 完整版：
  *   - ChangeListPanel（三状态）
- *   - SyncControlPanel（选中数 + enableLLM + fullSync + 开始同步/取消）
+ *   - SyncControlPanel（选中数 + 选中项 dry-run）
  *   - SyncProgress（同步中显示）
  *   - SyncResultList（同步结果分组）
  *   - TrashDrawer（决策2 抽屉形态，入口在底部"回收站"按钮）
  *   - LogDrawer（入口在底部"查看完整日志"按钮）
  *
- * selectedTokens + enableLLM + fullSync 由本视图持有（G2.5 props 钻取修正）。
+ * P0-06 保护模式：本视图只保留已选文档的 dry-run 入口；full sync、LLM
+ * 适配和取消在获得可靠的后端语义前不显示为可用控件。
  */
 
 import { useEffect, useMemo, useState } from 'react';
@@ -33,10 +34,6 @@ export function SyncView() {
   const sync = useSync();
 
   const [selectedTokens, setSelectedTokens] = useState<string[]>([]);
-  // 暂时屏蔽 LLM：默认关闭，仅做云端原始内容→本地同步（主上 2026-07-08 要求）
-  // 保留 setEnableLLM，UI 复选框仍可手动开启，但默认不启用 LLM 适配。
-  const [enableLLM, setEnableLLM] = useState(false);
-  const [fullSync, setFullSync] = useState(false);
   const [logOpen, setLogOpen] = useState(false);
   const [trashOpen, setTrashOpen] = useState(false);
   const [diff, setDiff] = useState<DiffReport | null>(null);
@@ -64,12 +61,6 @@ export function SyncView() {
       .filter((c): c is ChangedDocument => c != null);
   }, [allChanges, selectedTokens]);
 
-  // Channel label from config.llm.primaryChannel
-  const channelLabel = (() => {
-    const ch = config?.llm?.primaryChannel;
-    return ch === 'direct' ? 'direct 通道（bigmodel paas/v4）' : 'claude CLI 通道（bigmodel Anthropic 端点）';
-  })();
-
   // Recover syncing state for SyncProgress from useSync
   const syncing = sync.syncing;
 
@@ -78,27 +69,24 @@ export function SyncView() {
       toast.push({ type: 'warning', message: '请先选择要同步的文档' });
       return;
     }
-    appLogger.info('sync-view', 'starting sync', { count: selectedDocs.length, enableLLM, fullSync });
-    await sync.syncDocuments(selectedDocs, { enableLLM, fullSync });
-    if (sync.syncResult) {
-      const ok = sync.syncResult.success && sync.syncResult.failedDocuments.length === 0;
+    appLogger.info('sync-view', 'starting selected-document dry-run', { count: selectedDocs.length });
+    const result = await sync.syncDocuments(selectedDocs);
+    if (result) {
+      const isDryRun = result.mode === 'dry-run';
+      const plannedCount = isDryRun
+        ? (result.plannedDocuments ?? []).filter((document) => document.action !== 'blocked').length
+        : result.syncedDocuments.length;
+      const ok = result.success && result.failedDocuments.length === 0;
       toast.push({
         type: ok ? 'success' : 'warning',
-        message: ok ? '同步完成' : '同步完成（含失败项）',
-        hint: `${sync.syncResult.syncedDocuments.length} 成功 / ${sync.syncResult.failedDocuments.length} 失败`,
+        message: isDryRun
+          ? (ok ? '核验计划已生成' : '核验计划已生成（含阻止项）')
+          : (ok ? '同步完成' : '同步完成（含失败项）'),
+        hint: isDryRun
+          ? `${plannedCount} 待写入 / ${result.failedDocuments.length} 阻止`
+          : `${plannedCount} 成功 / ${result.failedDocuments.length} 失败`,
       });
     }
-  };
-
-  const handleCancel = () => {
-    // useSync.syncDocuments is a single POST; no real cancel channel exists.
-    // Document intent + log; full cancel requires P5 server SSE/SSE channel.
-    toast.push({
-      type: 'info',
-      message: '取消请求已记录',
-      hint: '当前后端为整批同步，取消能力将在 P5 SSE 改造后生效',
-    });
-    appLogger.warn('sync-view', 'cancel requested (server not streaming)');
   };
 
   const handleRetry = async (failed: FailedDocument[]) => {
@@ -120,7 +108,7 @@ export function SyncView() {
       toast.push({ type: 'warning', message: '无原始文档信息可重试' });
       return;
     }
-    await sync.syncDocuments(retryDocs, { enableLLM, fullSync });
+    await sync.syncDocuments(retryDocs);
   };
 
   const handleOpenMd = (localMdPath: string) => {
@@ -146,7 +134,7 @@ export function SyncView() {
 
   // Reset selection when a fresh sync result arrives.
   useEffect(() => {
-    if (sync.syncResult && sync.syncResult.success) {
+    if (sync.syncResult && sync.syncResult.mode !== 'dry-run' && sync.syncResult.success) {
       setSelectedTokens([]);
     }
   }, [sync.syncResult]);
@@ -171,14 +159,8 @@ export function SyncView() {
 
       <SyncControlPanel
         selectedCount={selectedDocs.length}
-        enableLLM={enableLLM}
-        fullSync={fullSync}
         syncing={syncing}
-        channelLabel={channelLabel}
-        onEnableLLMChange={setEnableLLM}
-        onFullSyncChange={setFullSync}
         onStart={handleStart}
-        onCancel={handleCancel}
       />
 
       <SyncProgress

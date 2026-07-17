@@ -1,7 +1,8 @@
 /**
  * SyncResultList - 同步结果分组（T6，04 §4.2.2 / §7.2 #14）
  *
- * 消费 useSync.syncResult。成功/失败分组，每项含「打开」「重试」。
+ * 消费 useSync.syncResult。当前保护模式中将其呈现为 dry-run 计划预览，
+ * 清楚区分“待写入”与被安全策略阻止的项，避免把未发生的写入说成成功。
  * 重试 = 重新调起 useSync.syncDocuments 传入失败项。
  */
 
@@ -23,9 +24,13 @@ function formatDuration(ms: number): string {
 }
 
 export function SyncResultList({ result, onRetry, onOpen, onClear }: SyncResultListProps) {
+  const isDryRun = result.mode === 'dry-run';
   const ok = result.success && result.failedDocuments.length === 0;
   const failedCount = result.failedDocuments.length;
-  const successCount = result.syncedDocuments.length;
+  const plannedDocuments = result.plannedDocuments ?? [];
+  const writablePlans = plannedDocuments.filter((document) => document.action !== 'blocked');
+  const successCount = isDryRun ? writablePlans.length : result.syncedDocuments.length;
+  const issueLabel = isDryRun ? '阻止' : '失败';
 
   return (
     <Card variant={ok ? 'default' : 'elevated'} className={ok ? 'border-jade/30' : 'border-seal/30'}>
@@ -38,15 +43,43 @@ export function SyncResultList({ result, onRetry, onOpen, onClear }: SyncResultL
             <XCircle className="w-4 h-4 text-seal-2" />
           )}
           <span className="text-sm text-ink font-medium">
-            {ok ? '同步完成' : '同步完成（含失败项）'}
+            {isDryRun
+              ? (ok ? '核验计划已生成' : '核验计划已生成（含阻止项）')
+              : (ok ? '同步完成' : '同步完成（含失败项）')}
           </span>
           <span className="text-xs text-ink-faint font-sans-ui">
-            {successCount} 成功 / {failedCount} 失败 · 用时 {formatDuration(result.duration)}
+            {isDryRun
+              ? `${successCount} 待写入 / ${failedCount} ${issueLabel}`
+              : `${successCount} 成功 / ${failedCount} ${issueLabel}`}
+            {' · 用时 '}{formatDuration(result.duration)}
           </span>
         </div>
 
-        {/* Success list */}
-        {successCount > 0 && (
+        {/* Dry-run plan */}
+        {isDryRun && writablePlans.length > 0 && (
+          <div>
+            <p className="text-[11px] text-ink-faint uppercase tracking-wide mb-1.5">
+              待明确 apply 的写入计划 ({writablePlans.length})
+            </p>
+            <ul className="space-y-1">
+              {writablePlans.map((document) => (
+                <li
+                  key={document.objToken}
+                  className="flex items-center gap-2 px-2 py-1.5 rounded bg-paper-2/50"
+                >
+                  <CheckCircle2 className="w-3.5 h-3.5 text-jade shrink-0" />
+                  <span className="flex-1 text-sm text-ink truncate">{document.title}</span>
+                  <span className="text-[11px] text-ink-faint font-sans-ui">
+                    {document.action === 'create' ? '新增' : '替换'}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {/* Completed apply results */}
+        {!isDryRun && successCount > 0 && (
           <div>
             <p className="text-[11px] text-ink-faint uppercase tracking-wide mb-1.5">
               成功 ({successCount})
@@ -84,7 +117,7 @@ export function SyncResultList({ result, onRetry, onOpen, onClear }: SyncResultL
         {failedCount > 0 && (
           <div>
             <p className="text-[11px] text-seal-2 uppercase tracking-wide mb-1.5">
-              失败 ({failedCount})
+              {issueLabel} ({failedCount})
             </p>
             <ul className="space-y-1">
               {result.failedDocuments.map((d) => (

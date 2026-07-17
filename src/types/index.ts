@@ -97,6 +97,19 @@ export interface FailedDocument {
   retryable: boolean;
 }
 
+export interface PlannedSyncDocument {
+  objToken: string;
+  title: string;
+  objType: 'docx' | 'sheet' | 'slides' | 'unknown';
+  changeType: 'modified' | 'added' | 'deleted';
+  action: 'create' | 'replace' | 'blocked';
+  localMdPath: string | null;
+  previousSha256: string | null;
+  reason?: string;
+}
+
+export type SyncMode = 'dry-run' | 'apply';
+
 export interface SyncResult {
   success: boolean;
   syncedDocuments: SyncedDocument[];
@@ -104,6 +117,10 @@ export interface SyncResult {
   startedAt: string;
   completedAt: string;
   duration: number;
+  mode?: SyncMode;
+  operationId?: string;
+  manifestPath?: string;
+  plannedDocuments?: PlannedSyncDocument[];
 }
 
 export interface ChangeDetectionResult {

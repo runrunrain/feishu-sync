@@ -29,6 +29,7 @@ import path from 'node:path';
 import type { LocalMapStore } from './local-map-store.js';
 import type { ConfigManager } from './config-manager.js';
 import { IndexScanner } from './index-scanner.js';
+import { ScanPolicy } from './scan-policy.js';
 import type {
   IndexSnapshot,
   MappingNode,
@@ -401,8 +402,8 @@ export class SnapshotService {
   }
 
   /**
-   * Recursive .md file enumeration. Skips the snapshot file itself
-   * and known generated artifacts.
+   * Recursive .md file enumeration. Skips the snapshot file itself and
+   * operational artifacts according to the shared ScanPolicy.
    */
   private collectMarkdownFiles(dir: string): string[] {
     const out: string[] = [];
@@ -414,18 +415,24 @@ export class SnapshotService {
     }
 
     for (const entry of entries) {
-      // Skip dot-dirs (.trash-bin, .assets handled separately as they
-      // don't typically contain docs; .git etc).
-      if (entry.name.startsWith('.')) continue;
-      // Skip the _reports directory (agent-outputs / sync reports). These
-      // are local-only artifacts that live under kbRoot for convenience
-      // but have no Feishu correspondence; recursing into them would list
-      // every report as an orphan file and pollute OrphanFileAlert.
-      if (entry.isDirectory() && entry.name === '_reports') continue;
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) {
+        // Preserve the existing broad hidden-directory guard for snapshot
+        // generation, then apply the shared named-artifact exclusions used
+        // by every knowledge-base scanner.
+        if (
+          ScanPolicy.shouldSkipDirectory(entry.name) ||
+          entry.name.startsWith('.')
+        ) {
+          continue;
+        }
         out.push(...this.collectMarkdownFiles(full));
-      } else if (entry.isFile() && entry.name.endsWith('.md') && entry.name !== SNAPSHOT_FILENAME) {
+      } else if (
+        entry.isFile() &&
+        !ScanPolicy.shouldSkipFile(entry.name) &&
+        entry.name.endsWith('.md') &&
+        entry.name !== SNAPSHOT_FILENAME
+      ) {
         out.push(full);
       }
     }

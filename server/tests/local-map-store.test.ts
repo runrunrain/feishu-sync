@@ -1,26 +1,96 @@
 /**
- * Integration tests for LocalMapStore v0.2.0 mapping-expansion methods.
+ * Runtime SQLite integration tests.
  *
- * NOTE: These tests are SKIPPED in vitest because the project's
- * better-sqlite3 native binding is compiled against Electron 31
- * (NODE_MODULE_VERSION 125) and cannot be loaded from the plain Node.js
- * runtime (NODE_MODULE_VERSION 137) that vitest uses. The same SQL is
- * covered by the Python-equivalent suite in `local_map_store_sql.py`,
- * which mirrors the verbatim SQL emitted by these methods and runs against
- * CPython's built-in sqlite3. This file is kept so `tsc --noEmit` keeps
- * type-checking the test surfaces and so we can flip them on once a
- * node-compatible better-sqlite3 build is in place (or vitest is run
- * inside Electron).
- *
- * To run the actual SQL assertions:
- *   python3 server/tests/local_map_store_sql.py
+ * These intentionally use the same better-sqlite3 binding as production.
+ * A Python SQL mirror cannot prove that LocalMapStore.initialize() creates
+ * every table its TypeScript methods require on a fresh installation.
  */
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
+import Database from 'better-sqlite3';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { LocalMapStore } from '../src/modules/local-map-store.js';
+import type { DocumentRecord } from '../src/types/index.js';
 
-// Single no-op test that always passes. Documents the skip reason in
-// vitest output.
-describe('LocalMapStore v0.2.0 SQL (skipped in vitest, run via Python)', () => {
-  it('defers to local_map_store_sql.py due to better-sqlite3 ABI mismatch', () => {
-    expect(true).toBe(true);
+const temporaryDirectories: string[] = [];
+
+function createDatabasePath(): string {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-sync-local-map-'));
+  temporaryDirectories.push(directory);
+  return path.join(directory, 'feishu-sync.db');
+}
+
+afterEach(() => {
+  while (temporaryDirectories.length > 0) {
+    const directory = temporaryDirectories.pop();
+    if (directory) fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+function makeDocument(overrides: Partial<DocumentRecord> = {}): DocumentRecord {
+  return {
+    objToken: 'sheet-object-token',
+    wikiNodeToken: 'wiki-node-token',
+    objType: 'sheet',
+    title: '工作簿',
+    localMdPath: '/tmp/工作簿.md',
+    lastSyncedModifyTime: '2026-07-17T00:00:00.000Z',
+    lastSyncedAt: '2026-07-17T00:00:00.000Z',
+    status: 'synced',
+    ...overrides,
+  };
+}
+
+describe('LocalMapStore runtime schema', () => {
+  it('creates every runtime table on a fresh database and initializes idempotently', () => {
+    const dbPath = createDatabasePath();
+    const store = new LocalMapStore(dbPath);
+    store.initialize();
+    store.initialize();
+    store.close();
+
+    const database = new Database(dbPath, { readonly: true });
+    const tables = new Set(
+      (database.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+        .map((row) => row.name),
+    );
+    database.close();
+
+    expect([...tables]).toEqual(expect.arrayContaining([
+      'documents',
+      'localDirs',
+      'sheet_sheets',
+      'schema_migrations',
+      'sync_log',
+      'run_log',
+    ]));
+  });
+
+  it('supports sub-sheet upserts immediately after fresh initialization', () => {
+    const dbPath = createDatabasePath();
+    const store = new LocalMapStore(dbPath);
+    store.initialize();
+    store.upsertDocument(makeDocument());
+
+    store.upsertSheetSheet({
+      sheetObjToken: 'sheet-object-token',
+      sheetId: 'sheet-1',
+      sheetTitle: '第一页',
+      localCsvPath: '/tmp/工作簿.csv-data/第一页.csv',
+      localMdPath: '/tmp/工作簿.md',
+      lastSyncedModifyTime: '2026-07-17T00:00:00.000Z',
+      status: 'synced',
+    });
+
+    expect(store.getSheetSheets('sheet-object-token')).toEqual([
+      expect.objectContaining({
+        sheet_obj_token: 'sheet-object-token',
+        sheet_id: 'sheet-1',
+        sheet_title: '第一页',
+        status: 'synced',
+      }),
+    ]);
+    store.close();
   });
 });

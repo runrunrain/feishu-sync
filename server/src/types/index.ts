@@ -263,6 +263,25 @@ export interface FailedDocument {
   retryable: boolean;
 }
 
+/**
+ * A filesystem change planned by the synchronizer before any cloud content
+ * is fetched or local state is changed. `blocked` entries are deliberately
+ * kept in the manifest so an unsafe path can be reviewed rather than silently
+ * falling back to a different target.
+ */
+export interface PlannedSyncDocument {
+  objToken: string;
+  title: string;
+  objType: 'docx' | 'sheet' | 'slides' | 'unknown';
+  changeType: 'modified' | 'added' | 'deleted';
+  action: 'create' | 'replace' | 'blocked';
+  localMdPath: string | null;
+  previousSha256: string | null;
+  reason?: string;
+}
+
+export type SyncMode = 'dry-run' | 'apply';
+
 // ============================================================================
 // Sync Types
 // ============================================================================
@@ -274,11 +293,19 @@ export interface SyncResult {
   startedAt: string;
   completedAt: string;
   duration: number;
+  /** P0 safety gate: requests are dry-runs unless apply is explicitly confirmed. */
+  mode?: SyncMode;
+  operationId?: string;
+  manifestPath?: string;
+  plannedDocuments?: PlannedSyncDocument[];
 }
 
 export interface SyncOptions {
   enableLLM: boolean;
   fullSync: boolean;
+  /** Must be accompanied by confirmation: 'APPLY'; absent/false always dry-runs. */
+  apply?: boolean;
+  confirmation?: string;
 }
 
 export interface ChangeDetectionResult {

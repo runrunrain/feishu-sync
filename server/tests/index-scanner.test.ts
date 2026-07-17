@@ -4,7 +4,10 @@
  * Covers R1.1-AC1/AC2 from 02-迭代需求分析.md and the B5 fix described in
  * 01-现状与差距分析.md §3.1 (G1.1) and 03-迭代架构设计.md §2.2.2.
  */
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { IndexScanner } from '../src/modules/index-scanner.js';
 
 // The scanner only needs parseMetadata for these tests. Construct with
@@ -364,5 +367,56 @@ describe('IndexScanner.parseMetadata — format 4: bold key-value header', () =>
 `;
     const meta = scanner.parseMetadata(content);
     expect(meta).toBeNull();
+  });
+});
+
+describe('IndexScanner scan policy', () => {
+  const temporaryRoots: string[] = [];
+
+  afterEach(() => {
+    for (const root of temporaryRoots.splice(0)) {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not index markdown in reserved operational directories', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'index-scan-policy-'));
+    temporaryRoots.push(root);
+    const indexed: Array<{ objToken: string; localMdPath: string }> = [];
+    const writeMappedFile = (relativePath: string, token: string) => {
+      const target = path.join(root, relativePath);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, `<!--\nobj_token: ${token}\n-->\n# ${token}\n`);
+      return target;
+    };
+
+    const included = writeMappedFile('docs/included.md', 'INCLUDED');
+    for (const [dir, token] of [
+      ['_reports', 'REPORT'],
+      ['.trash-bin', 'TRASH'],
+      ['.staging', 'DOT_STAGING'],
+      ['_staging', 'UNDERSCORE_STAGING'],
+      ['.recovery', 'DOT_RECOVERY'],
+      ['_recovery', 'UNDERSCORE_RECOVERY'],
+      ['.restore', 'DOT_RESTORE'],
+      ['_restore', 'UNDERSCORE_RESTORE'],
+    ]) {
+      writeMappedFile(`${dir}/${token}.md`, token);
+    }
+
+    const indexScanner = new IndexScanner({
+      localMapStore: {
+        upsertDocument: (document: { objToken: string; localMdPath: string }) => indexed.push(document),
+      },
+      larkCliClient: {},
+      config: {},
+    });
+
+    const result = await indexScanner.scanKnowledgeBase(root);
+
+    expect(result.scanned).toBe(1);
+    expect(result.indexed).toBe(1);
+    expect(indexed).toHaveLength(1);
+    expect(indexed[0]).toMatchObject({ objToken: 'INCLUDED', localMdPath: included });
   });
 });

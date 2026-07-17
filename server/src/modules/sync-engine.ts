@@ -29,6 +29,14 @@ import type {
   SyncedDocument,
   FailedDocument,
 } from '../types/index.js';
+import {
+  completeOperationManifest,
+  createOperationManifest,
+  fallbackMarkdownTarget,
+  resolveOperationDirectory,
+  resolveSyncMode,
+  writeOperationManifest,
+} from './operation-manifest.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -113,12 +121,76 @@ export class SyncEngine {
     options: SyncOptions
   ): Promise<SyncResult> {
     const startedAt = new Date().toISOString();
+    const mode = resolveSyncMode(options);
+    const manifest = createOperationManifest({
+      knowledgeBaseRoot: this.config.knowledgeBaseRoot,
+      documents,
+      mode,
+    });
+    const operationDirectory = resolveOperationDirectory(
+      this.config.knowledgeBaseRoot,
+      this.config.operationManifestDir,
+    );
+    // Creating this record is deliberately the first observable side effect
+    // of an operation. A failed manifest write blocks apply rather than
+    // allowing an untraceable filesystem mutation.
+    const manifestPath = writeOperationManifest(manifest, operationDirectory);
+
     const syncedDocuments: SyncedDocument[] = [];
     const failedDocuments: FailedDocument[] = [];
 
-    for (const doc of documents) {
+    if (mode === 'dry-run') {
+      for (const planned of manifest.documents) {
+        if (planned.action === 'blocked') {
+          failedDocuments.push({
+            objToken: planned.objToken,
+            title: planned.title,
+            error: planned.reason || '同步计划被安全策略阻止',
+            retryable: false,
+          });
+        }
+      }
+
+      const completedAt = new Date().toISOString();
+      const result: SyncResult = {
+        success: failedDocuments.length === 0,
+        syncedDocuments,
+        failedDocuments,
+        startedAt,
+        completedAt,
+        duration: new Date(completedAt).getTime() - new Date(startedAt).getTime(),
+        mode,
+        operationId: manifest.operationId,
+        manifestPath,
+        plannedDocuments: manifest.documents,
+      };
+      completeOperationManifest(manifest, manifestPath, {
+        succeeded: 0,
+        failed: failedDocuments.length,
+      });
+      return result;
+    }
+
+    for (let index = 0; index < documents.length; index += 1) {
+      const doc = documents[index];
+      const planned = manifest.documents[index];
+      if (planned.action === 'blocked' || !planned.localMdPath) {
+        failedDocuments.push({
+          objToken: doc.objToken,
+          title: doc.title,
+          error: planned.reason || '同步计划被安全策略阻止',
+          retryable: false,
+        });
+        continue;
+      }
+
       try {
-        const result = await this.syncSingleDocument(doc, options);
+        // Apply uses exactly the target that was independently reviewed in
+        // the manifest; it must not recompute a potentially different path.
+        const result = await this.syncSingleDocument(
+          { ...doc, localMdPath: planned.localMdPath },
+          options,
+        );
         syncedDocuments.push(result);
       } catch (error) {
         const errMsg = error instanceof Error ? error.message : String(error);
@@ -147,24 +219,33 @@ export class SyncEngine {
     const completedAt = new Date().toISOString();
     const duration = new Date(completedAt).getTime() - new Date(startedAt).getTime();
 
-    // Log sync operation
-    this.localMapStore.logSync({
+    const result: SyncResult = {
       success: failedDocuments.length === 0,
       syncedDocuments,
       failedDocuments,
       startedAt,
       completedAt,
       duration,
+      mode,
+      operationId: manifest.operationId,
+      manifestPath,
+      plannedDocuments: manifest.documents,
+    };
+
+    // Logging is not part of the content transaction. Do not turn a
+    // successful write into an API error merely because observability is
+    // degraded; the operation manifest remains the recovery record.
+    try {
+      this.localMapStore.logSync(result);
+    } catch (error) {
+      console.error('[SyncEngine] failed to write sync log:', error);
+    }
+    completeOperationManifest(manifest, manifestPath, {
+      succeeded: syncedDocuments.length,
+      failed: failedDocuments.length,
     });
 
-    return {
-      success: failedDocuments.length === 0,
-      syncedDocuments,
-      failedDocuments,
-      startedAt,
-      completedAt,
-      duration,
-    };
+    return result;
   }
 
   /**
@@ -627,8 +708,7 @@ export class SyncEngine {
    * Generate local file path from document title
    */
   private generateLocalPath(doc: ChangedDocument): string {
-    const sanitizedTitle = doc.title.replace(/[<>:"/\\|?*]/g, '_');
-    return path.join(this.config.knowledgeBaseRoot, `${sanitizedTitle}.md`);
+    return fallbackMarkdownTarget(this.config.knowledgeBaseRoot, doc.title);
   }
 
   /**
