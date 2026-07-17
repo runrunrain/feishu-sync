@@ -93,6 +93,18 @@ describe('P0 sync write safety', () => {
     expect(resolveSyncMode({ apply: true })).toBe('dry-run');
     expect(resolveSyncMode({ apply: true, confirmation: 'confirm' })).toBe('dry-run');
     expect(resolveSyncMode({ apply: true, confirmation: 'APPLY' })).toBe('apply');
+
+    const temporaryRoot = makeTempDirectory('feishu-sync-apply-closed-');
+    const { engine } = makeEngine(
+      path.join(temporaryRoot, 'knowledge-base'),
+      path.join(temporaryRoot, 'operations'),
+    );
+    await expect(engine.syncDocuments([makeDocument()], {
+      enableLLM: false,
+      fullSync: false,
+      apply: true,
+      confirmation: 'APPLY',
+    })).rejects.toThrow('正式写入尚未启用');
   });
 
   it('records unsafe local paths as blocked rather than falling back to a new target', async () => {

@@ -121,7 +121,16 @@ export class SyncEngine {
     options: SyncOptions
   ): Promise<SyncResult> {
     const startedAt = new Date().toISOString();
-    const mode = resolveSyncMode(options);
+    const requestedMode = resolveSyncMode(options);
+    // P0 only establishes the safety boundary. The existing write pipeline
+    // still lacks P3 staging, resource completeness checks and DB/file
+    // rollback, so even an explicitly acknowledged apply must remain closed.
+    // Keeping this guard in the engine prevents non-HTTP callers from
+    // bypassing the route-level product gate.
+    if (requestedMode === 'apply') {
+      throw new Error('正式写入尚未启用：请先完成 P3 原子提交与回滚验证');
+    }
+    const mode = requestedMode;
     const manifest = createOperationManifest({
       knowledgeBaseRoot: this.config.knowledgeBaseRoot,
       documents,

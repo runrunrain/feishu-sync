@@ -10,7 +10,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "audit:corpus": "tsx scripts/audit-knowledge-base.ts"
+    "audit:corpus": "tsx scripts/audit-knowledge-base.ts",
+    "backup:state": "tsx scripts/backup-operation-state.ts"
   },
   "dependencies": {
     "@hono/node-server": "^1.14.0",

@@ -112,4 +112,28 @@ describe('POST /api/sync P0 safety gate', () => {
     expect((await response.json()).error).toBe('apply_confirmation_required');
     expect(fs.existsSync(operationManifestDir)).toBe(false);
   });
+
+  it('keeps apply closed even when the acknowledgement is supplied', async () => {
+    const temporaryRoot = createTempDirectory('feishu-sync-route-apply-closed-');
+    const knowledgeBaseRoot = path.join(temporaryRoot, 'knowledge-base');
+    const operationManifestDir = path.join(temporaryRoot, 'operations');
+    const app = buildApp({
+      configManager: { load: async () => makeConfig(knowledgeBaseRoot, operationManifestDir) },
+      larkCliClient: {},
+      localMapStore: {},
+    });
+
+    const response = await app.fetch(new Request('http://x/api/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        documents: [document],
+        options: { apply: true, confirmation: 'APPLY' },
+      }),
+    }));
+
+    expect(response.status).toBe(409);
+    expect((await response.json()).error).toBe('apply_not_available');
+    expect(fs.existsSync(operationManifestDir)).toBe(false);
+  });
 });

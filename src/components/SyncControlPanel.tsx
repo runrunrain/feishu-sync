@@ -55,7 +55,7 @@ export function SyncControlPanel({
             全量同步、LLM 内容适配和取消尚无可靠后端语义，已暂停，不会作为可操作控件显示。
           </p>
           <p className="mt-1 leading-5">
-            此操作仅用于核验同步结果；正式写入须经服务端明确的 apply 安全闸门确认。
+            此操作仅用于核验同步结果；P3 原子提交与回滚完成前，正式写入当前不可用。
           </p>
         </div>
 
