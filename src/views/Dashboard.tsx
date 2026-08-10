@@ -31,7 +31,7 @@ import { OrphanFileAlert } from '../components/OrphanFileAlert';
 import { useConfig } from '../hooks/useConfig';
 import { useToast } from '../components/common/Toast';
 import {
-  getMappingDiff,
+  getStoredMappingDiff,
   getMappingIndex,
   getMappingTreeDetailed,
 } from '../api/client';
@@ -119,12 +119,12 @@ export function Dashboard({ onJumpToSync }: DashboardProps) {
     if (!rootUrl) return;
     (async () => {
       try {
-        const diff: DiffReport = await getMappingDiff(rootUrl);
+        const diff: DiffReport = await getStoredMappingDiff(rootUrl);
         if (cancelled) return;
         setChanges([...diff.added, ...diff.modified, ...diff.deleted]);
       } catch (err) {
         // diff may legitimately 400 if rootUrl is invalid; log + soft warning.
-        appLogger.warn('dashboard', 'getMappingDiff failed (non-fatal)', err);
+        appLogger.warn('dashboard', 'getStoredMappingDiff failed (non-fatal)', err);
       }
       try {
         const snap = await getMappingIndex();
@@ -185,9 +185,9 @@ export function Dashboard({ onJumpToSync }: DashboardProps) {
     <div className="space-y-6">
       <GlobalStatusBar />
 
-      <div className="grid grid-cols-1 lg:grid-cols-[280px_1fr] gap-6">
+      <div className="grid min-w-0 grid-cols-1 gap-4 lg:grid-cols-[minmax(0,280px)_minmax(0,1fr)] lg:gap-6">
         {/* Left: node tree (feishu or local) */}
-        <div className="lg:h-[calc(100vh-220px)] min-h-[360px]">
+        <div className="min-w-0 min-h-[360px] lg:h-[calc(100vh-220px)]">
           {view === 'feishu' ? (
             <NodeTreeView
               nodes={feishuEnv?.nodes}
@@ -207,13 +207,15 @@ export function Dashboard({ onJumpToSync }: DashboardProps) {
               selectedToken={selectedToken}
               onSelect={setSelectedToken}
               onRefreshed={loadLocal}
+              view={view}
+              onViewChange={handleViewChange}
               className="h-full"
             />
           )}
         </div>
 
         {/* Right: orphan alert + recent + detail */}
-        <div className="space-y-5">
+        <div className="min-w-0 space-y-5">
           <OrphanFileAlert orphans={orphans} />
           <RecentChanges changes={changes} onJumpToSync={onJumpToSync} />
           <NodeDetailCard

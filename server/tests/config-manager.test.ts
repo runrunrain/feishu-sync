@@ -79,6 +79,66 @@ describe('config secret retain semantics (P4)', () => {
     const reloaded = await mgr.load();
     expect(reloaded.llm.apiKey).toBe(BIGMODEL_KEY);
   });
+
+  it('retains a masked provider API key while saving a preset edit', async () => {
+    const configPath = createTempConfigPath();
+    fs.writeFileSync(configPath, JSON.stringify({
+      llm: {
+        openAiCompatBaseUrl: BIGMODEL_PAAS_V4,
+        claudeCompatBaseUrl: 'https://open.bigmodel.cn/api/anthropic',
+        apiKey: BIGMODEL_KEY,
+        model: 'glm-5.2[1m]',
+        directModel: 'glm-4-flash',
+        claudeCliModel: 'glm-5.2[1m]',
+        temperature: 0.2,
+        primaryChannel: 'claude-cli',
+        fallbackOnFailure: true,
+        providers: [{
+          id: 'glm',
+          name: '智谱 GLM',
+          enabled: true,
+          apiKey: 'provider-secret-must-survive',
+          openAiCompatBaseUrl: BIGMODEL_PAAS_V4,
+          claudeCompatBaseUrl: 'https://open.bigmodel.cn/api/anthropic',
+          defaultModelId: 'default',
+          models: [{
+            id: 'default',
+            name: 'GLM 默认',
+            openAiModel: 'glm-4-flash',
+            claudeCliModel: 'glm-5.2[1m]',
+            enabled: true,
+          }],
+        }],
+        activeProviderId: 'glm',
+        activeModelId: 'default',
+      },
+      watchedRoots: [],
+      requiredScopes: [],
+    }, null, 2));
+
+    const mgr = new ConfigManager(configPath);
+    const loaded = await mgr.load();
+    await mgr.updateConfig({
+      llm: {
+        ...loaded.llm,
+        providers: loaded.llm.providers?.map((provider) => ({
+          ...provider,
+          apiKey: '***',
+          models: provider.models.map((model) => ({
+            ...model,
+            name: 'GLM 默认（已编辑）',
+          })),
+        })),
+      },
+    });
+
+    const reloaded = await mgr.load();
+    expect(reloaded.llm.providers?.[0]?.apiKey).toBe('provider-secret-must-survive');
+    expect(reloaded.llm.providers?.[0]?.models[0]?.name).toBe('GLM 默认（已编辑）');
+    expect(reloaded.llm.model).toBe('glm-5.2');
+    expect(reloaded.llm.claudeCliModel).toBe('glm-5.2');
+    expect(reloaded.llm.providers?.[0]?.models[0]?.claudeCliModel).toBe('glm-5.2');
+  });
 });
 
 describe('looksLikeBigmodelKey', () => {
@@ -165,18 +225,18 @@ describe('reconcileOpenAiCompatBaseUrl', () => {
 describe('reconcileModelAlias', () => {
   it('resets deepseek-chat to bigmodel Anthropic alias when key is bigmodel', () => {
     expect(reconcileModelAlias('deepseek-chat', BIGMODEL_KEY)).toBe(
-      'glm-5.2[1m]',
+      'glm-4.7',
     );
   });
 
   it('resets deepseek-reasoner to bigmodel Anthropic alias when key is bigmodel', () => {
     expect(reconcileModelAlias('deepseek-reasoner', BIGMODEL_KEY)).toBe(
-      'glm-5.2[1m]',
+      'glm-4.7',
     );
   });
 
-  it('leaves bigmodel alias unchanged when key is bigmodel', () => {
-    expect(reconcileModelAlias('glm-5.2[1m]', BIGMODEL_KEY)).toBe('glm-5.2[1m]');
+  it('canonicalizes capacity labels in GLM model names', () => {
+    expect(reconcileModelAlias('glm-5.2[1m]', BIGMODEL_KEY)).toBe('glm-5.2');
     expect(reconcileModelAlias('glm-4-flash', BIGMODEL_KEY)).toBe('glm-4-flash');
   });
 
@@ -188,8 +248,8 @@ describe('reconcileModelAlias', () => {
   });
 
   it('defaults to bigmodel Anthropic alias when model is empty', () => {
-    expect(reconcileModelAlias('', BIGMODEL_KEY)).toBe('glm-5.2[1m]');
-    expect(reconcileModelAlias(null, BIGMODEL_KEY)).toBe('glm-5.2[1m]');
+    expect(reconcileModelAlias('', BIGMODEL_KEY)).toBe('glm-4.7');
+    expect(reconcileModelAlias(null, BIGMODEL_KEY)).toBe('glm-4.7');
   });
 });
 

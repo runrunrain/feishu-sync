@@ -26,6 +26,7 @@ import { StatusBadge } from './common/StatusBadge';
 import { BusinessTag } from './common/BusinessTag';
 import { SheetSubTableList } from './SheetSubTableList';
 import type { ChangedDocument, SheetSub } from '../types';
+import { formatCloudModifiedTime } from '../utils/cloudTime';
 
 interface ChangeItemProps {
   change: ChangedDocument;
@@ -59,18 +60,6 @@ const STATE_LABEL = {
   modified: '已修改',
   deleted: '已删除',
 };
-
-function formatRelativeTime(unixSecondsStr: string): string {
-  const t = parseInt(unixSecondsStr, 10);
-  if (!Number.isFinite(t)) return '';
-  const now = Math.floor(Date.now() / 1000);
-  const diff = Math.max(0, now - t);
-  if (diff < 3600) return `${Math.max(1, Math.floor(diff / 60))} 分钟前`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`;
-  if (diff < 86400 * 30) return `${Math.floor(diff / 86400)} 天前`;
-  const d = new Date(t * 1000);
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-}
 
 export function ChangeItem({
   change,
@@ -159,7 +148,7 @@ export function ChangeItem({
         {/* Time */}
         <div className="shrink-0 flex items-center gap-1 text-[11px] text-ink-faint font-mono">
           <Clock className="w-3 h-3" />
-          {formatRelativeTime(change.cloudModifiedTime) || '--'}
+          {formatCloudModifiedTime(change.cloudModifiedTime)}
         </div>
 
         {/* Expand chevron (sheet has sub-tables) */}

@@ -458,6 +458,52 @@ describe('ChangeDetector.compareWithLocalRecords (P2-T1 three-state)', () => {
     expect(orphan?.parentChainTitles).toBeUndefined();
   });
 
+  it('repairs a missing current parent through node detail without trusting stale SQLite topology', async () => {
+    const detailLookups: string[] = [];
+    const lark = {
+      async getNode(reference: string): Promise<LarkCliNodeInfo> {
+        detailLookups.push(reference);
+        return {
+          node_token: 'missing-parent',
+          obj_token: 'parent-obj',
+          obj_type: 'docx',
+          title: '当前云端父节点',
+          space_id: 'space-1',
+          obj_edit_time: 1710000000,
+          has_child: true,
+          parent_node_token: 'rootA',
+        };
+      },
+    };
+    const detector = new ChangeDetector(lark as any, store as any);
+    const out = await (detector as any).compareWithLocalRecords([
+      makeCloud({
+        obj_token: 'ROOT',
+        node_token: 'rootA',
+        title: '根目录',
+        parent_node_token: undefined,
+      }),
+      makeCloud({
+        obj_token: 'CHILD',
+        node_token: 'child-node',
+        title: '子节点',
+        parent_node_token: 'missing-parent',
+      }),
+    ], {
+      rootToken: 'rootA',
+      watchedRootUrl: 'https://tenant.feishu.cn/wiki/rootA',
+      traversalComplete: true,
+    });
+
+    const child = out.find((document: any) => document.objToken === 'CHILD');
+    expect(child).toMatchObject({ parentChainTitles: ['当前云端父节点'] });
+    expect(detailLookups).toEqual(['https://tenant.feishu.cn/wiki/missing-parent']);
+    // Only the original cloud observations are persisted; hierarchy repair
+    // must not manufacture a changed document for the parent itself.
+    expect(store.observationCalls.map((observation) => observation.objToken))
+      .toEqual(['ROOT', 'CHILD']);
+  });
+
   it('handles a mixed batch: added + modified + unchanged + deleted', async () => {
     // Seed: B synced at 1000 (will be modified), C synced (unchanged),
     // D synced (one complete miss only — not a deletion candidate yet).
@@ -849,8 +895,10 @@ class TrackingLarkCliClient {
   // getNode invocations exactly once.
   getNodeCalls = 0;
   listCalls = 0;
+  getNodeGate: Promise<void> | null = null;
   async getNode(_url: string): Promise<LarkCliNodeInfo> {
     this.getNodeCalls++;
+    await this.getNodeGate;
     return {
       obj_token: 'rootObj',
       node_token: 'rootA',
@@ -872,6 +920,174 @@ class TrackingLarkCliClient {
 }
 
 describe('ChangeDetector.detectChanges result cache (sync-state-timeout-fix)', () => {
+  it('uses one Drive metadata batch for a mapped document in fast mode', async () => {
+    const store = new MockLocalMapStore();
+    const rootUrl = 'https://qcnbafdrjx7n.feishu.cn/wiki/rootA';
+    store.rows.set('doc-A', makeLocal({
+      objToken: 'doc-A',
+      wikiNodeToken: 'node-A',
+      watchedRootId: 'rootA',
+      watchedRootUrl: rootUrl,
+      objEditTime: 100,
+      observedObjEditTime: 100,
+      syncedObjEditTime: 100,
+      localMdPath: '/kb/A.md',
+    }));
+    const lark = {
+      getNodeCalls: 0,
+      metaRequests: [] as Array<Array<{ docToken: string; docType: string }>>,
+      async getNode() {
+        this.getNodeCalls += 1;
+        throw new Error('fast mode must not resolve individual wiki nodes');
+      },
+      async getDocumentMetas(requests: Array<{ docToken: string; docType: string }>) {
+        this.metaRequests.push(requests);
+        return {
+          metas: [{
+            docToken: 'doc-A',
+            docType: 'docx',
+            latestModifyTime: 200,
+            title: 'A renamed in cloud',
+          }],
+          failed: [],
+        };
+      },
+    };
+    const detector = new ChangeDetector(lark as any, store as any);
+
+    const result = await detector.detectChanges(rootUrl, {
+      forceFresh: true,
+      bypassCooldown: true,
+      mode: 'fast',
+    });
+
+    expect(lark.getNodeCalls).toBe(0);
+    expect(lark.metaRequests).toEqual([[{ docToken: 'doc-A', docType: 'docx' }]]);
+    expect(result).toMatchObject({
+      changed: true,
+      totalNodes: 1,
+      traversalComplete: false,
+    });
+    expect(result.changedDocuments).toEqual([
+      expect.objectContaining({ objToken: 'doc-A', changeType: 'modified' }),
+    ]);
+    expect(store.rows.get('doc-A')).toMatchObject({
+      title: 'A renamed in cloud',
+      observedObjEditTime: 200,
+      syncState: 'pending_modified',
+    });
+  });
+
+  it('uses at most one Wiki detail fallback for a metadata exception', async () => {
+    const store = new MockLocalMapStore();
+    const rootUrl = 'https://qcnbafdrjx7n.feishu.cn/wiki/rootA';
+    store.rows.set('doc-A', makeLocal({
+      objToken: 'doc-A',
+      wikiNodeToken: 'node-A',
+      watchedRootId: 'rootA',
+      watchedRootUrl: rootUrl,
+      objEditTime: 100,
+      observedObjEditTime: 100,
+      syncedObjEditTime: 100,
+      localMdPath: '/kb/A.md',
+    }));
+    const lark = {
+      getNodeUrls: [] as string[],
+      async getDocumentMetas() {
+        return {
+          metas: [],
+          failed: [{ docToken: 'doc-A', code: 970003 }],
+        };
+      },
+      async getNode(url: string): Promise<LarkCliNodeInfo> {
+        this.getNodeUrls.push(url);
+        return {
+          node_token: 'node-A',
+          obj_token: 'doc-A',
+          obj_type: 'docx',
+          title: 'A',
+          space_id: 'space-1',
+          obj_edit_time: 200,
+          has_child: false,
+          parent_node_token: 'rootA',
+        };
+      },
+    };
+    const detector = new ChangeDetector(lark as any, store as any);
+
+    const result = await detector.detectChanges(rootUrl, {
+      forceFresh: true,
+      bypassCooldown: true,
+      mode: 'fast',
+    });
+
+    expect(lark.getNodeUrls).toEqual(['https://qcnbafdrjx7n.feishu.cn/wiki/node-A']);
+    expect(result.failedNodeTokens).toEqual([]);
+    expect(result.changedDocuments).toEqual([
+      expect.objectContaining({ objToken: 'doc-A', changeType: 'modified' }),
+    ]);
+  });
+
+  it('negative-caches a failed metadata fallback between fast polls', async () => {
+    const store = new MockLocalMapStore();
+    const rootUrl = 'https://qcnbafdrjx7n.feishu.cn/wiki/rootA';
+    store.rows.set('doc-A', makeLocal({
+      objToken: 'doc-A',
+      wikiNodeToken: 'node-A',
+      watchedRootId: 'rootA',
+      watchedRootUrl: rootUrl,
+    }));
+    const lark = {
+      detailCalls: 0,
+      async getDocumentMetas() {
+        return { metas: [], failed: [{ docToken: 'doc-A', code: 970003 }] };
+      },
+      async getNode(): Promise<LarkCliNodeInfo> {
+        this.detailCalls += 1;
+        throw new Error('无权限访问该节点');
+      },
+    };
+    const detector = new ChangeDetector(lark as any, store as any);
+
+    await detector.detectChanges(rootUrl, {
+      forceFresh: true,
+      bypassCooldown: true,
+      mode: 'fast',
+    });
+    await detector.detectChanges(rootUrl, {
+      forceFresh: true,
+      bypassCooldown: true,
+      mode: 'fast',
+    });
+
+    // The metadata batch may be retried, but a permanently failing node-get
+    // must not add a second detail request until its retry cooldown expires.
+    expect(lark.detailCalls).toBe(1);
+  });
+
+  it('joins concurrent calls before the completed-result cache is populated', async () => {
+    const lark = new TrackingLarkCliClient();
+    const store = new MockLocalMapStore();
+    const detector = new ChangeDetector(lark as any, store as any);
+    const url = 'https://qcnbafdrjx7n.feishu.cn/wiki/rootA';
+
+    let releaseTraversal: (() => void) | undefined;
+    lark.getNodeGate = new Promise<void>((resolve) => {
+      releaseTraversal = resolve;
+    });
+
+    const first = detector.detectChanges(url);
+    // The explicit detect button uses forceFresh. It must still join a
+    // traversal that is already running instead of doubling cloud QPS.
+    const second = detector.detectChanges(url, { forceFresh: true, bypassCooldown: true });
+    expect(lark.getNodeCalls).toBe(1);
+
+    releaseTraversal?.();
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+    expect(secondResult).toBe(firstResult);
+    expect(lark.getNodeCalls).toBe(1);
+  });
+
   it('serves a second call within TTL from cache (no extra lark-cli calls)', async () => {
     const lark = new TrackingLarkCliClient();
     const store = new MockLocalMapStore();

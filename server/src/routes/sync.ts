@@ -3,6 +3,8 @@
  *
  * POST /api/sync - Synchronize selected documents
  * POST /api/sync/index - Trigger initial full index scan
+ * GET  /api/sync/feishu-pending - Read Feishu-side repair queue
+ * POST /api/sync/feishu-pending/recheck - Permit an explicit recovery scan
  *
  * Implements the complete synchronization pipeline with SyncEngine integration
  */
@@ -17,6 +19,80 @@ import type { ChannelConfig } from '../modules/content-backend.js';
 import type { ChangedDocument, SyncOptions, SyncResult } from '../types/index.js';
 
 const syncRoutes = new Hono();
+
+/** The durable operator queue has a deliberately small route-facing contract. */
+function getFeishuPendingStore(c: any): {
+  listFeishuPending: (watchedRootIds?: string[]) => unknown[];
+  requestFeishuPendingRecheck: (watchedRootIds?: string[]) => number;
+} {
+  const localMapStore = c.localMapStore;
+  if (!localMapStore
+    || typeof localMapStore.listFeishuPending !== 'function'
+    || typeof localMapStore.requestFeishuPendingRecheck !== 'function') {
+    throw new Error('[sync] Feishu-side pending store is not injected');
+  }
+  return localMapStore;
+}
+
+function parseWatchedRootIds(value: unknown): string[] | undefined {
+  if (value == null) return undefined;
+  if (!Array.isArray(value) || value.length > 200) {
+    throw new Error('watchedRootIds 必须是不超过 200 项的字符串数组');
+  }
+  const ids = value
+    .filter((item): item is string => typeof item === 'string')
+    .map((item) => item.trim())
+    .filter(Boolean);
+  if (ids.length !== value.length) {
+    throw new Error('watchedRootIds 只能包含非空字符串');
+  }
+  return [...new Set(ids)];
+}
+
+/**
+ * Read issues that need a human action in Feishu. They are intentionally
+ * separate from mapping/diff so normal polling never turns them into a new
+ * pending cloud change again.
+ */
+syncRoutes.get('/api/sync/feishu-pending', (c) => {
+  try {
+    return c.json({ items: getFeishuPendingStore(c).listFeishuPending() });
+  } catch (error) {
+    console.error('[sync] list Feishu-side pending items failed:', error);
+    return c.json({
+      error: 'feishu_pending_list_failed',
+      message: error instanceof Error ? error.message : String(error),
+    }, 500);
+  }
+});
+
+/**
+ * The user has completed a cloud-side repair and explicitly permits one full
+ * recheck. This never grants permissions or mutates Feishu; it only releases
+ * local suppression once a later traversal can actually read the node.
+ */
+syncRoutes.post('/api/sync/feishu-pending/recheck', async (c) => {
+  let payload: Record<string, unknown>;
+  try {
+    payload = await c.req.json<Record<string, unknown>>();
+  } catch {
+    return c.json({ error: 'invalid_json', message: '重新检测请求必须是 JSON 对象' }, 400);
+  }
+
+  try {
+    const watchedRootIds = parseWatchedRootIds(payload.watchedRootIds);
+    const requested = getFeishuPendingStore(c).requestFeishuPendingRecheck(watchedRootIds);
+    return c.json({ requested });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const invalid = message.includes('watchedRootIds');
+    if (!invalid) console.error('[sync] request Feishu-side pending recheck failed:', error);
+    return c.json({
+      error: invalid ? 'invalid_watched_root_ids' : 'feishu_pending_recheck_failed',
+      message,
+    }, invalid ? 400 : 500);
+  }
+});
 
 /**
  * POST /api/sync - Synchronize documents
@@ -41,7 +117,14 @@ syncRoutes.post('/api/sync', async (c) => {
     ? rawOptions as Record<string, unknown>
     : {};
   const options: SyncOptions = {
-    enableLLM: false,
+    // Final enablement is gated by persisted configuration after it is
+    // loaded below. A request alone can never turn document reorganisation
+    // on, which prevents stale/malicious callers from changing bodies.
+    enableLLM: rawOptionsObject.enableLLM === true,
+    // This recovery flag is only meaningful together with formal apply
+    // confirmation. SyncEngine still accepts a file only after matching its
+    // canonical profile path and its Markdown title to the cloud document.
+    adoptExistingProfileTargets: rawOptionsObject.adoptExistingProfileTargets === true,
     fullSync: false,
     apply: rawOptionsObject.apply === true,
     confirmation: typeof rawOptionsObject.confirmation === 'string'
@@ -81,28 +164,24 @@ syncRoutes.post('/api/sync', async (c) => {
   const channelConfig: ChannelConfig = {
     llm: config.llm,
     claudeCli: config.llm.claudeCli,
+    opencode: config.llm.opencode,
     primaryChannel: config.llm.primaryChannel,
     fallbackOnFailure: config.llm.fallbackOnFailure,
   };
   const registry = new ContentBackendRegistry(channelConfig);
   const contentAdapter = new ContentAdapter(registry);
-  // contentAdapter 暂不注入 SyncEngine（LLM 屏蔽期，见下方 contentAdapter: undefined）。
-  // 保留构造以保证 LLM 代码路径可逆 + ContentAdapter/ContentBackendRegistry 的
-  // import 仍被引用（满足 tsc noUnusedLocals）。恢复 LLM 时删掉此行 + 把
-  // 下方 contentAdapter: undefined 改回 contentAdapter 即可。
-  void contentAdapter;
+  // Both the current request AND the saved explicit opt-in are required.
+  // This preserves a safe default even if a legacy frontend sends
+  // enableLLM=true unexpectedly.
+  options.enableLLM = options.enableLLM && config.llm.contentAdaptationEnabled === true;
 
   // Create SyncEngine instance with M3 modules
-  // 暂时屏蔽 LLM：不注入 contentAdapter，sync-engine Step 7 条件
-  // (this.contentAdapter && options.enableLLM && localMdPath) 因 contentAdapter
-  // 为 undefined 永远 false，绝不调用 LLM。仅做云端原始内容→本地同步。
-  // 上方 ContentBackendRegistry/ContentAdapter 构造保留不动（删了影响测试、不可逆）。
   const syncEngine = new SyncEngine({
     larkCliClient,
     localMapStore,
     config,
     layoutReconstructor,
-    contentAdapter: undefined,
+    contentAdapter,
   });
 
   // Execute synchronization

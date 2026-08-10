@@ -2,13 +2,13 @@
  * Hook for document synchronization
  * M2: Full implementation with syncDocuments and syncIndex.
  *
- * P0-06: syncDocuments intentionally exposes only selected documents. The
- * API client fixes unsupported fullSync/LLM options to false and requests a
- * dry-run, so callers cannot accidentally present those pseudo-features.
+ * syncDocuments intentionally exposes only selected documents. The API client
+ * requests a confirmed apply; the Sync view owns the user-facing confirmation
+ * and the backend remains the final safety gate for every planned write.
  */
 
 import { useState, useCallback } from 'react';
-import type { SyncResult, ChangedDocument } from '../types';
+import type { SyncResult, ChangedDocument, SyncDocumentOptions } from '../types';
 import { syncDocs, syncIndex as apiSyncIndex } from '../api/client';
 
 interface IndexResult {
@@ -25,7 +25,10 @@ interface UseSyncResult {
   syncResult: SyncResult | null;
   indexResult: IndexResult | null;
   error: string | null;
-  syncDocuments: (documents: ChangedDocument[]) => Promise<SyncResult | null>;
+  syncDocuments: (
+    documents: ChangedDocument[],
+    options?: SyncDocumentOptions,
+  ) => Promise<SyncResult | null>;
   syncIndex: (rootDir?: string) => Promise<void>;
   clear: () => void;
 }
@@ -38,7 +41,8 @@ export function useSync(): UseSyncResult {
   const [error, setError] = useState<string | null>(null);
 
   const syncDocuments = useCallback(async (
-    documents: ChangedDocument[]
+    documents: ChangedDocument[],
+    options: SyncDocumentOptions = {},
   ) => {
     if (documents.length === 0) {
       setError('No documents selected for sync');
@@ -50,7 +54,7 @@ export function useSync(): UseSyncResult {
     setSyncResult(null);
 
     try {
-      const result = await syncDocs(documents);
+      const result = await syncDocs(documents, options);
       setSyncResult(result);
       return result;
     } catch (err) {

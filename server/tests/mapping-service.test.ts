@@ -58,14 +58,16 @@ class MockLocalMapStore {
 
 class MockChangeDetector {
   lastRootUrl: string | null = null;
+  lastOptions: unknown = null;
   nextResult: {
     changedDocuments: ChangedDocument[];
     totalNodes: number;
     checkedAt: string;
   } = { changedDocuments: [], totalNodes: 0, checkedAt: '' };
 
-  async detectChanges(rootUrl: string) {
+  async detectChanges(rootUrl: string, options?: unknown) {
     this.lastRootUrl = rootUrl;
+    this.lastOptions = options ?? null;
     return {
       changed: this.nextResult.changedDocuments.length > 0,
       changedDocuments: this.nextResult.changedDocuments,
@@ -154,6 +156,7 @@ describe('MappingService.computeDiff', () => {
     const report = await svc.computeDiff('https://example/wiki/root');
 
     expect(detector.lastRootUrl).toBe('https://example/wiki/root');
+    expect(detector.lastOptions).toEqual({ mode: 'fast' });
     expect(report.added).toHaveLength(1);
     expect(report.modified).toHaveLength(1);
     expect(report.deleted).toHaveLength(1);
@@ -205,6 +208,122 @@ describe('MappingService.computeDiff', () => {
     const report = await svc.computeDiff('r');
     expect(report.unchanged).toBe(5); // 5 - 0 added/modified
     expect(report.deleted).toHaveLength(2);
+  });
+
+  it('reads a persisted diff without starting another cloud detection', () => {
+    const rootUrl = 'https://example.feishu.cn/wiki/rootA';
+    store.rows.set('A', makeDoc({
+      objToken: 'A',
+      watchedRootUrl: rootUrl,
+      watchedRootId: 'rootA',
+      syncState: 'pending_added',
+      observedObjEditTime: 200,
+      lastSeenAt: '2026-07-21T01:00:00.000Z',
+    }));
+    store.rows.set('B', makeDoc({
+      objToken: 'B',
+      watchedRootUrl: rootUrl,
+      watchedRootId: 'rootA',
+      syncState: 'pending_modified',
+      observedObjEditTime: 300,
+      lastSeenAt: '2026-07-21T02:00:00.000Z',
+    }));
+    store.rows.set('OTHER', makeDoc({
+      objToken: 'OTHER',
+      watchedRootUrl: 'https://example.feishu.cn/wiki/rootB',
+      watchedRootId: 'rootB',
+      syncState: 'pending_modified',
+    }));
+
+    const report = svc.getStoredDiff(rootUrl);
+
+    expect(detector.lastRootUrl).toBeNull();
+    expect(report.added.map((item) => item.objToken)).toEqual(['A']);
+    expect(report.modified.map((item) => item.objToken)).toEqual(['B']);
+    expect(report.totalCloud).toBe(2);
+    expect(report.checkedAt).toBe('2026-07-21T02:00:00.000Z');
+  });
+
+  it('excludes Feishu-side pending items from the recent-change diff', () => {
+    const rootUrl = 'https://example.feishu.cn/wiki/rootA';
+    store.rows.set('WAITING_FOR_ACCESS', makeDoc({
+      objToken: 'WAITING_FOR_ACCESS',
+      title: '等待飞书授权',
+      watchedRootUrl: rootUrl,
+      watchedRootId: 'rootA',
+      syncState: 'feishu_pending',
+      status: 'error',
+      observedObjEditTime: 200,
+      lastSeenAt: '2026-07-21T03:00:00.000Z',
+    }));
+
+    const report = svc.getStoredDiff(rootUrl);
+
+    expect(report.added).toHaveLength(0);
+    expect(report.modified).toHaveLength(0);
+    expect(report.deleted).toHaveLength(0);
+    expect(report.unchanged).toBe(1);
+  });
+
+  it('reconstructs a safe parent chain from persisted full-traversal topology', () => {
+    const rootUrl = 'https://example.feishu.cn/wiki/rootA';
+    store.rows.set('ROOT', makeDoc({
+      objToken: 'ROOT',
+      wikiNodeToken: 'rootA',
+      title: '根目录',
+      watchedRootUrl: rootUrl,
+      watchedRootId: 'rootA',
+      parentNodeToken: null,
+      syncState: 'synced',
+    }));
+    store.rows.set('SECTION', makeDoc({
+      objToken: 'SECTION',
+      wikiNodeToken: 'sectionA',
+      title: '200-系统设计',
+      watchedRootUrl: rootUrl,
+      watchedRootId: 'rootA',
+      parentNodeToken: 'rootA',
+      syncState: 'synced',
+    }));
+    store.rows.set('LEAF', makeDoc({
+      objToken: 'LEAF',
+      wikiNodeToken: 'leafA',
+      title: '200-01-地图数据结构',
+      watchedRootUrl: rootUrl,
+      watchedRootId: 'rootA',
+      parentNodeToken: 'sectionA',
+      syncState: 'pending_added',
+      observedObjEditTime: 300,
+    }));
+
+    const report = svc.getStoredDiff(rootUrl);
+
+    expect(report.added).toEqual([
+      expect.objectContaining({
+        objToken: 'LEAF',
+        parentChainTitles: ['200-系统设计'],
+        isWatchedRootNode: false,
+      }),
+    ]);
+  });
+
+  it('keeps a pending node hierarchy undefined when an ancestor is absent', () => {
+    const rootUrl = 'https://example.feishu.cn/wiki/rootA';
+    store.rows.set('LEAF', makeDoc({
+      objToken: 'LEAF',
+      wikiNodeToken: 'leafA',
+      title: '缺失父链文档',
+      watchedRootUrl: rootUrl,
+      watchedRootId: 'rootA',
+      parentNodeToken: 'missing-parent',
+      syncState: 'pending_added',
+    }));
+
+    const report = svc.getStoredDiff(rootUrl);
+
+    expect(report.added[0]).toMatchObject({ objToken: 'LEAF' });
+    expect(report.added[0]?.parentChainTitles).toBeUndefined();
+    expect(report.added[0]?.isWatchedRootNode).toBeUndefined();
   });
 });
 

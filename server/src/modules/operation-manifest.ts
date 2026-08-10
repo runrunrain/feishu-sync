@@ -53,6 +53,12 @@ export interface CreateOperationManifestOptions {
   mode: SyncMode;
   /** When provided, dry-run planning uses profile-aware PathResolver. */
   watchedRoots?: WatchedRootConfig[];
+  /**
+   * Explicit recovery-only opt-in. Enables adoption of a pre-existing local
+   * profile target only when its Markdown title exactly matches the cloud
+   * title; it never turns arbitrary same-path content into an overwrite.
+   */
+  adoptExistingProfileTargets?: boolean;
 }
 
 export interface KnowledgeBaseAudit {
@@ -119,7 +125,13 @@ export function createOperationManifest(
   const watchedRoots = options.watchedRoots ?? [];
   const occupied = new Set<string>();
   const documents = options.documents.map((document) => {
-    const planned = planDocument(root, document, watchedRoots, occupied);
+    const planned = planDocument(
+      root,
+      document,
+      watchedRoots,
+      occupied,
+      options.adoptExistingProfileTargets === true,
+    );
     if (planned.localRelPath) {
       occupied.add(planned.localRelPath);
     }
@@ -325,6 +337,7 @@ function planDocument(
   document: ChangedDocument,
   watchedRoots: WatchedRootConfig[],
   occupied: Set<string>,
+  adoptExistingProfileTargets = false,
 ): PlannedSyncDocument {
   if (document.changeType === 'deleted') {
     return blockedPlan(document, {
@@ -372,13 +385,17 @@ function planDocument(
       // Existing localMdPath that already points at a file is a replace, not
       // an overwrite of a foreign body — PathResolver handles this via
       // existing-mapping preference.
-      rejectExistingFiles: !document.localMdPath && !document.localRelPath,
+      rejectExistingFiles:
+        !document.localMdPath
+        && !document.localRelPath
+        && !adoptExistingProfileTargets,
     });
 
     if (!resolved.ok || !resolved.target) {
       const candidateLocalRelPath =
         resolved.conflicts.find((conflict) => conflict.relativePath)?.relativePath ?? null;
       const reasonCode = reasonCodeForPathConflicts(resolved.conflicts);
+      const hasExistingFile = resolved.conflicts.some((conflict) => conflict.kind === 'existing-file');
       return blockedPlan(document, {
         reasonCode,
         reason:
@@ -388,6 +405,8 @@ function planDocument(
         suggestedResolution:
           reasonCode === 'missing_parent_chain'
             ? '重新完成该 watched root 的云端遍历，补齐父链后再生成计划。'
+            : hasExistingFile
+              ? '若该文件是同名飞书文档的旧同步版本，可点击“认领本地旧文件并同步”。系统会先校验 Markdown 标题一致，不能校验则仍拒绝覆盖。'
             : '根据候选路径和冲突详情修正映射或布局后再生成计划。',
       });
     }
@@ -412,6 +431,33 @@ function planDocument(
         candidateLocalRelPath: resolved.target.relativeMarkdownPath,
         suggestedResolution: '人工处理同名目录或文件后重新生成计划。',
       });
+    }
+
+    const isUnmappedProfileTarget =
+      resolved.target.source === 'layout-profile'
+      && !document.localMdPath
+      && !document.localRelPath;
+    if (exists && isUnmappedProfileTarget) {
+      if (!adoptExistingProfileTargets) {
+        return blockedPlan(document, {
+          reasonCode: 'path_conflict',
+          reason: `目标路径已有文件，拒绝自动覆盖: ${resolved.target.relativeMarkdownPath}`,
+          localRelPath: resolved.target.relativeMarkdownPath,
+          candidateLocalRelPath: resolved.target.relativeMarkdownPath,
+          suggestedResolution:
+            '若该文件是同名飞书文档的旧同步版本，可点击“认领本地旧文件并同步”。系统会先校验 Markdown 标题一致，不能校验则仍拒绝覆盖。',
+        });
+      }
+      if (!isAdoptableExistingProfileTarget(candidate, document.title)) {
+        return blockedPlan(document, {
+          reasonCode: 'path_conflict',
+          reason: `目标路径已有文件，但未找到与云端标题一致的 Markdown 标题，拒绝自动认领: ${resolved.target.relativeMarkdownPath}`,
+          localRelPath: resolved.target.relativeMarkdownPath,
+          candidateLocalRelPath: resolved.target.relativeMarkdownPath,
+          suggestedResolution:
+            '请人工核对或移动同名本地文件；为避免覆盖个人内容，自动认领仅接受标题与云端完全一致的旧导出。',
+        });
+      }
     }
 
     const action = resolved.target.plannedMoveFrom
@@ -477,6 +523,26 @@ function planDocument(
     ...documentPlanContext(document),
     pathSource: 'legacy-fallback',
   };
+}
+
+/**
+ * A legacy export may predate the YAML identity header. For explicit recovery
+ * we accept it only when its first Markdown heading exactly matches the cloud
+ * title. This is intentionally narrow: a path collision alone is never proof
+ * that the file belongs to the cloud object.
+ */
+function isAdoptableExistingProfileTarget(filePath: string, cloudTitle: string): boolean {
+  try {
+    const sample = fs.readFileSync(filePath, 'utf8').slice(0, 64 * 1024);
+    const expected = cloudTitle.trim();
+    if (!expected) return false;
+    return sample
+      .split(/\r?\n/)
+      .slice(0, 160)
+      .some((line) => line.replace(/^\s{0,3}#\s+/, '').trim() === expected);
+  } catch {
+    return false;
+  }
 }
 
 /**

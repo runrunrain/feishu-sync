@@ -25,6 +25,24 @@ function makeConfig() {
       temperature: 0.2,
       timeoutMs: 10_000,
       claudeCli: { extraArgs: [] },
+      providers: [{
+        id: 'example',
+        name: 'Example provider',
+        enabled: true,
+        apiKey: 'provider-secret-must-not-leak',
+        openAiCompatBaseUrl: 'https://example.test/openai',
+        claudeCompatBaseUrl: 'https://example.test/anthropic',
+        defaultModelId: 'default',
+        models: [{
+          id: 'default',
+          name: 'Default',
+          openAiModel: 'direct-model',
+          claudeCliModel: 'cli-model',
+          enabled: true,
+        }],
+      }],
+      activeProviderId: 'example',
+      activeModelId: 'default',
       primaryChannel: 'claude-cli' as const,
       fallbackOnFailure: true,
     },
@@ -58,7 +76,37 @@ describe('config routes', () => {
     expect(response.status).toBe(200);
     const body = await response.json();
     expect(body.llm.apiKey).toBe('***');
+    expect(body.llm.providers[0].apiKey).toBe('***');
     expect(body.watchedRoots).toEqual([ROOT]);
+  });
+
+  it('reveals a provider key only through the explicit POST action', async () => {
+    const config = makeConfig();
+    const app = buildApp({ load: vi.fn(async () => config) });
+
+    const response = await app.fetch(new Request('http://x/api/config/reveal-provider-key', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ providerId: 'example' }),
+    }));
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('cache-control')).toContain('no-store');
+    expect(await response.json()).toEqual({ apiKey: 'provider-secret-must-not-leak' });
+  });
+
+  it('does not reveal a missing provider key', async () => {
+    const config = makeConfig();
+    const app = buildApp({ load: vi.fn(async () => config) });
+
+    const response = await app.fetch(new Request('http://x/api/config/reveal-provider-key', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ providerId: 'does-not-exist' }),
+    }));
+
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({ error: 'provider_not_found' });
   });
 
   it('delegates PUT validation and persistence to ConfigManager.updateConfig', async () => {

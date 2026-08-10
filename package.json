@@ -19,7 +19,9 @@
     "dev:desktop": "npm run server:build && npm run electron:build && concurrently -k -n VITE,ELECTRON \"npm run dev\" \"npm run electron:dev\"",
     "desktop:dist:win:x64": "node scripts/build-desktop-target.cjs --platform win32 --arch x64",
     "desktop:dist:mac:x64": "node scripts/build-desktop-target.cjs --platform darwin --arch x64",
-    "desktop:dist:mac:arm64": "node scripts/build-desktop-target.cjs --platform darwin --arch arm64"
+    "desktop:dist:mac:arm64": "node scripts/build-desktop-target.cjs --platform darwin --arch arm64",
+    "desktop:dist:mac:x64:release": "cross-env DESKTOP_MAC_SIGNING=release node scripts/build-desktop-target.cjs --platform darwin --arch x64",
+    "desktop:dist:mac:arm64:release": "cross-env DESKTOP_MAC_SIGNING=release node scripts/build-desktop-target.cjs --platform darwin --arch arm64"
   },
   "dependencies": {
     "@hono/node-server": "^1.14.0",

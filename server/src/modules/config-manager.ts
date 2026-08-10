@@ -30,6 +30,8 @@ import type {
   LayoutProfile,
   LegacyLLMConfig,
   LlmConfig,
+  LlmModelPreset,
+  LlmProviderConfig,
   WatchedRootConfig,
 } from '../types/index.js';
 import { getEnabledWatchedRootUrls, isLegacyLlmConfig } from '../types/index.js';
@@ -63,19 +65,18 @@ const DEFAULT_CLAUDE_COMPAT_BASE_URL = 'https://open.bigmodel.cn/api/anthropic';
 /**
  * bigmodel dual-alias (P3 实测):
  *   - paas/v4 (OpenAI) accepts `glm-4-flash` (free tier)
- *   - /api/anthropic accepts `glm-5.2[1m]` (the alias claude code
- *     CLI uses on this machine)
+ *   - Z.AI Claude Code uses the documented `glm-4.7` tier mapping
  * The two aliases share ONE apiKey; only the model name differs across
  * the two protocol adapters. `DEFAULT_DIRECT_MODEL` is used as
  * `directModel` override when the user-provided `model` (or env) only
  * works on one endpoint.
  */
 const DEFAULT_DIRECT_MODEL = 'glm-4-flash';
-const DEFAULT_CLAUDE_CLI_MODEL = 'glm-5.2[1m]';
+const DEFAULT_CLAUDE_CLI_MODEL = 'glm-4.7';
 /**
  * Per-call LLM adaptation timeout, in milliseconds.
  *
- * 10 minutes gives bigmodel glm-5.2[1m] (the Anthropic-compat alias
+ * 10 minutes gives bigmodel glm-4.7 (the Anthropic-compat model
  * used by the claude-cli primary channel) enough headroom to finish
  * under transient 529 over-load retries without making the user wait
  * unbounded. The previous hard-coded 60s value aborted the primary
@@ -174,15 +175,178 @@ export function reconcileModelAlias(
   model: string | undefined | null,
   apiKey: string | undefined | null,
 ): string {
-  if (!model) return DEFAULT_CLAUDE_CLI_MODEL;
+  const canonicalModel = canonicalizeGlmModelAlias(model);
+  if (!canonicalModel) return DEFAULT_CLAUDE_CLI_MODEL;
   const deepseekAliases = ['deepseek-chat', 'deepseek-reasoner', 'deepseek-coder'];
   if (
     looksLikeBigmodelKey(apiKey) &&
-    deepseekAliases.includes(model.toLowerCase())
+    deepseekAliases.includes(canonicalModel.toLowerCase())
   ) {
     return DEFAULT_CLAUDE_CLI_MODEL;
   }
-  return model;
+  return canonicalModel;
+}
+
+const CONFIG_ENTITY_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
+
+function stringValue(value: unknown, fallback = ''): string {
+  return typeof value === 'string' ? value.trim() : fallback;
+}
+
+/**
+ * Z.AI / BigModel API model identifiers do not include capacity labels such
+ * as `[1m]`. That label can appear in UI plan names or old local settings,
+ * but sending it as the API `model` returns a misleading "model not found"
+ * response. Normalize only GLM names so custom-provider model IDs remain
+ * untouched.
+ */
+function canonicalizeGlmModelAlias(value: string | undefined | null): string {
+  const model = stringValue(value);
+  const match = /^(glm-[^\s\[\]]+)\s*\[[^\]]+\]$/i.exec(model);
+  return match ? match[1] : model;
+}
+
+function uniqueConfigId(value: unknown, fallback: string, used: Set<string>): string {
+  const raw = stringValue(value).toLowerCase();
+  const base = CONFIG_ENTITY_ID.test(raw) ? raw : fallback;
+  let candidate = base;
+  let suffix = 2;
+  while (used.has(candidate)) {
+    candidate = `${base}-${suffix}`;
+    suffix += 1;
+  }
+  used.add(candidate);
+  return candidate;
+}
+
+function inferLegacyProviderName(
+  openAiCompatBaseUrl: string,
+  claudeCompatBaseUrl: string,
+  apiKey: string,
+): string {
+  const looksLikeBigmodelEndpoint = /(?:^|\.)bigmodel\.cn/i.test(openAiCompatBaseUrl)
+    || /(?:^|\.)bigmodel\.cn/i.test(claudeCompatBaseUrl);
+  return looksLikeBigmodelEndpoint || looksLikeBigmodelKey(apiKey)
+    ? '智谱 GLM（BigModel）'
+    : '默认提供商';
+}
+
+interface LegacyProviderProjection {
+  openAiCompatBaseUrl: string;
+  claudeCompatBaseUrl: string;
+  apiKey: string;
+  model: string;
+  directModel?: string;
+  claudeCliModel?: string;
+}
+
+function makeLegacyProviderProfile(legacy: LegacyProviderProjection): LlmProviderConfig {
+  const directModel = canonicalizeGlmModelAlias(legacy.directModel)
+    || canonicalizeGlmModelAlias(legacy.model);
+  const claudeCliModel = canonicalizeGlmModelAlias(legacy.claudeCliModel)
+    || canonicalizeGlmModelAlias(legacy.model);
+  return {
+    id: 'bigmodel',
+    name: inferLegacyProviderName(
+      legacy.openAiCompatBaseUrl,
+      legacy.claudeCompatBaseUrl,
+      legacy.apiKey,
+    ),
+    enabled: true,
+    apiKey: legacy.apiKey,
+    openAiCompatBaseUrl: legacy.openAiCompatBaseUrl,
+    claudeCompatBaseUrl: legacy.claudeCompatBaseUrl,
+    defaultModelId: 'default',
+    models: [{
+      id: 'default',
+      name: '默认模型',
+      openAiModel: directModel,
+      claudeCliModel,
+      enabled: true,
+    }],
+  };
+}
+
+function normalizeModelPresets(
+  value: unknown,
+  fallback: Pick<LlmModelPreset, 'openAiModel' | 'claudeCliModel'>,
+): LlmModelPreset[] {
+  const rawPresets = Array.isArray(value) ? value : [];
+  const usedIds = new Set<string>();
+  const presets: LlmModelPreset[] = [];
+
+  rawPresets.forEach((candidate, index) => {
+    if (!candidate || typeof candidate !== 'object') return;
+    const raw = candidate as Partial<LlmModelPreset>;
+    const id = uniqueConfigId(raw.id, `model-${index + 1}`, usedIds);
+    presets.push({
+      id,
+      name: stringValue(raw.name, `模型 ${index + 1}`) || `模型 ${index + 1}`,
+      openAiModel: canonicalizeGlmModelAlias(raw.openAiModel),
+      claudeCliModel: canonicalizeGlmModelAlias(raw.claudeCliModel),
+      enabled: typeof raw.enabled === 'boolean' ? raw.enabled : true,
+    });
+  });
+
+  if (presets.length === 0) {
+    presets.push({
+      id: 'default',
+      name: '默认模型',
+      openAiModel: canonicalizeGlmModelAlias(fallback.openAiModel),
+      claudeCliModel: canonicalizeGlmModelAlias(fallback.claudeCliModel),
+      enabled: true,
+    });
+  }
+  return presets;
+}
+
+/**
+ * Normalize provider profiles without interpreting a custom endpoint as a
+ * particular vendor. This is intentionally independent from bigmodel's
+ * legacy reconciliation: users may configure OpenAI, a gateway, or any
+ * provider exposing either compatible protocol.
+ */
+function normalizeProviderProfiles(
+  value: unknown,
+  legacy: LegacyProviderProjection,
+): LlmProviderConfig[] {
+  // Missing profile data means an existing flat configuration is being
+  // migrated. An explicitly empty array is preserved so a local-OpenCode-only
+  // setup can opt out of remote profiles.
+  if (!Array.isArray(value)) {
+    return [makeLegacyProviderProfile(legacy)];
+  }
+
+  const usedIds = new Set<string>();
+  const providers: LlmProviderConfig[] = [];
+  value.forEach((candidate, index) => {
+    if (!candidate || typeof candidate !== 'object') return;
+    const raw = candidate as Partial<LlmProviderConfig>;
+    const id = uniqueConfigId(raw.id, `provider-${index + 1}`, usedIds);
+    const models = normalizeModelPresets(raw.models, {
+      openAiModel: canonicalizeGlmModelAlias(legacy.directModel)
+        || canonicalizeGlmModelAlias(legacy.model),
+      claudeCliModel: canonicalizeGlmModelAlias(legacy.claudeCliModel)
+        || canonicalizeGlmModelAlias(legacy.model),
+    });
+    const requestedDefault = stringValue(raw.defaultModelId);
+    const defaultModel = models.find((model) => model.id === requestedDefault && model.enabled)
+      ?? models.find((model) => model.enabled)
+      ?? models[0];
+
+    providers.push({
+      id,
+      name: stringValue(raw.name, `提供商 ${index + 1}`) || `提供商 ${index + 1}`,
+      enabled: typeof raw.enabled === 'boolean' ? raw.enabled : true,
+      apiKey: stringValue(raw.apiKey),
+      openAiCompatBaseUrl: stringValue(raw.openAiCompatBaseUrl),
+      claudeCompatBaseUrl: stringValue(raw.claudeCompatBaseUrl),
+      defaultModelId: defaultModel?.id,
+      models,
+    });
+  });
+
+  return providers;
 }
 
 /**
@@ -201,7 +365,17 @@ function buildDefaultLlmConfig(): LlmConfig {
   const anthropicBaseUrl = process.env.ANTHROPIC_BASE_URL || DEFAULT_CLAUDE_COMPAT_BASE_URL;
   const openAiBaseUrl = deriveOpenAiCompatBaseUrl(anthropicBaseUrl);
   const apiKey = process.env.ANTHROPIC_API_KEY || '';
-  const claudeModel = process.env.ANTHROPIC_MODEL || DEFAULT_CLAUDE_CLI_MODEL;
+  const claudeModel = canonicalizeGlmModelAlias(process.env.ANTHROPIC_MODEL)
+    || DEFAULT_CLAUDE_CLI_MODEL;
+  const legacyProjection: LegacyProviderProjection = {
+    openAiCompatBaseUrl: openAiBaseUrl,
+    claudeCompatBaseUrl: anthropicBaseUrl,
+    apiKey,
+    model: claudeModel,
+    directModel: DEFAULT_DIRECT_MODEL,
+    claudeCliModel: claudeModel,
+  };
+  const defaultProvider = makeLegacyProviderProfile(legacyProjection);
 
   return {
     openAiCompatBaseUrl: openAiBaseUrl,
@@ -213,15 +387,32 @@ function buildDefaultLlmConfig(): LlmConfig {
     // paas/v4 actually accepts.
     model: claudeModel,
     directModel: DEFAULT_DIRECT_MODEL,
+    // Keep the Claude Code path explicit as well. Existing configurations
+    // created before this field was persisted often still carry
+    // `model: glm-4-flash`; that OpenAI alias is not a reliable choice for
+    // the Anthropic-compatible GLM endpoint.
+    claudeCliModel: claudeModel,
     temperature: 0.2,
+    providers: [defaultProvider],
+    activeProviderId: defaultProvider.id,
+    activeModelId: defaultProvider.defaultModelId,
     // 10-minute default. See LlmConfig.timeoutMs rationale in
     // types/index.ts — the previous 60s ceiling was too tight for
-    // bigmodel glm-5.2[1m] under load.
+    // bigmodel glm-4.7 under load.
     timeoutMs: DEFAULT_LLM_TIMEOUT_MS,
     claudeCli: {
       claudePath: undefined,
       extraArgs: [],
     },
+    opencode: {
+      executablePath: undefined,
+      model: undefined,
+      agent: undefined,
+      timeoutMs: undefined,
+    },
+    // Document body organisation is opt-in. Selecting a channel only
+    // changes the future execution path after the user also enables this.
+    contentAdaptationEnabled: false,
     primaryChannel: 'claude-cli',
     fallbackOnFailure: true,
   };
@@ -417,8 +608,8 @@ function migrateLegacyWatchedRootUrls(value: unknown): WatchedRootConfig[] {
  * as a `_warning` field so any human opening the file sees it.
  */
 const API_KEY_PLAINTEXT_WARNING =
-  'SECURITY WARNING: this file contains a plaintext LLM API key under ' +
-  '`llm.apiKey`. Do NOT commit this file to a public repository. ' +
+  'SECURITY WARNING: this file contains plaintext LLM API keys under ' +
+  '`llm.apiKey` and/or `llm.providers[].apiKey`. Do NOT commit this file to a public repository. ' +
   'Encryption (keytar) is on the roadmap; until then, treat the key ' +
   'with the same care as a password.';
 
@@ -522,15 +713,7 @@ export class ConfigManager {
    */
   async updateLLMConfig(llm: Partial<LlmConfig>): Promise<void> {
     const currentConfig = await this.load();
-    const updatedLlm: LlmConfig = {
-      ...currentConfig.llm,
-      ...llm,
-      // Nested merge for claudeCli sub-object.
-      claudeCli: {
-        ...(currentConfig.llm.claudeCli ?? {}),
-        ...(llm.claudeCli ?? {}),
-      },
-    };
+    const updatedLlm = this.mergeLlmPartial(currentConfig.llm, llm);
     const updatedConfig: Config = {
       ...currentConfig,
       llm: updatedLlm,
@@ -577,17 +760,27 @@ export class ConfigManager {
    *   - apiKey === '***'   → retain (masked UI echo)
    *   - apiKey === ''      → clear
    *   - any other string   → replace
+   * The same semantics apply independently to every
+   * `providers[].apiKey`, matched by stable provider id.
    */
   private mergeLlmPartial(
     current: LlmConfig,
     partial: Partial<LlmConfig>,
   ): LlmConfig {
+    const hasProviders = Object.prototype.hasOwnProperty.call(partial, 'providers');
     const next: LlmConfig = {
       ...current,
       ...partial,
+      providers: hasProviders
+        ? this.mergeProviderProfiles(current.providers, partial.providers)
+        : current.providers,
       claudeCli: {
         ...(current.claudeCli ?? {}),
         ...(partial.claudeCli ?? {}),
+      },
+      opencode: {
+        ...(current.opencode ?? {}),
+        ...(partial.opencode ?? {}),
       },
     };
     if (Object.prototype.hasOwnProperty.call(partial, 'apiKey')) {
@@ -600,7 +793,35 @@ export class ConfigManager {
     } else {
       next.apiKey = current.apiKey;
     }
-    return next;
+    return this.normalizeLlmConfig(next);
+  }
+
+  /**
+   * A config GET masks provider keys as `***`. Settings sends the complete
+   * provider list back on save, so merge each profile by id and retain only
+   * the masked/missing secret while still allowing deliberate key clearing.
+   */
+  private mergeProviderProfiles(
+    current: LlmProviderConfig[] | undefined,
+    incoming: LlmProviderConfig[] | undefined,
+  ): LlmProviderConfig[] | undefined {
+    if (!Array.isArray(incoming)) return current;
+    const existingById = new Map((current ?? []).map((provider) => [provider.id, provider]));
+
+    return incoming.map((provider) => {
+      const previous = existingById.get(provider.id);
+      const incomingKey = provider.apiKey;
+      return {
+        ...(previous ?? {}),
+        ...provider,
+        // A model-list field is authoritative when present; an omitted one
+        // (older clients) retains the stored list.
+        models: Array.isArray(provider.models) ? provider.models : (previous?.models ?? []),
+        apiKey: incomingKey === undefined || incomingKey === '***'
+          ? (previous?.apiKey ?? '')
+          : incomingKey,
+      } as LlmProviderConfig;
+    });
   }
 
   /**
@@ -827,7 +1048,7 @@ export class ConfigManager {
     const legacyModel = legacy.model || process.env.ANTHROPIC_MODEL || DEFAULT_CLAUDE_CLI_MODEL;
     const claudeModel = reconcileModelAlias(legacyModel, apiKey);
 
-    return {
+    return this.normalizeLlmConfig({
       openAiCompatBaseUrl: openAiBaseUrl,
       claudeCompatBaseUrl: anthropicBaseUrl,
       apiKey,
@@ -835,6 +1056,7 @@ export class ConfigManager {
       // Default the DirectChannel alias to bigmodel's free OpenAI
       // endpoint model. Users on a different provider can override via UI.
       directModel: DEFAULT_DIRECT_MODEL,
+      claudeCliModel: DEFAULT_CLAUDE_CLI_MODEL,
       temperature: typeof legacy.temperature === 'number' ? legacy.temperature : 0.2,
       // Legacy flat configs had no timeout field; surface the new 10-min
       // default so the timeout config knob is usable immediately after
@@ -844,9 +1066,16 @@ export class ConfigManager {
         claudePath: undefined,
         extraArgs: [],
       },
+      opencode: {
+        executablePath: undefined,
+        model: undefined,
+        agent: undefined,
+        timeoutMs: undefined,
+      },
+      contentAdaptationEnabled: false,
       primaryChannel: 'claude-cli',
       fallbackOnFailure: true,
-    };
+    });
   }
 
   /**
@@ -862,14 +1091,37 @@ export class ConfigManager {
     // key but the host is deepseek/openai, substitute bigmodel paas/v4.
     const rawOpenAiBaseUrl = partial.openAiCompatBaseUrl ?? base.openAiCompatBaseUrl;
     const rawModel = partial.model ?? base.model;
-    return {
+    const normalizedFlat = {
       openAiCompatBaseUrl: reconcileOpenAiCompatBaseUrl(rawOpenAiBaseUrl, apiKey),
       claudeCompatBaseUrl: partial.claudeCompatBaseUrl ?? base.claudeCompatBaseUrl,
       apiKey,
       model: reconcileModelAlias(rawModel, apiKey),
-      directModel: partial.directModel ?? base.directModel,
-      claudeCliModel: partial.claudeCliModel ?? base.claudeCliModel,
+      directModel: canonicalizeGlmModelAlias(partial.directModel ?? base.directModel),
+      claudeCliModel: canonicalizeGlmModelAlias(partial.claudeCliModel ?? base.claudeCliModel),
+    };
+    const providers = normalizeProviderProfiles(partial.providers, normalizedFlat);
+    const requestedProviderId = stringValue(partial.activeProviderId);
+    const activeProvider = providers.find((provider) => (
+      provider.id === requestedProviderId && provider.enabled
+    ))
+      ?? providers.find((provider) => provider.enabled)
+      ?? providers[0];
+    const requestedModelId = stringValue(partial.activeModelId);
+    const activeModel = activeProvider?.models.find((model) => (
+      model.id === requestedModelId && model.enabled
+    ))
+      ?? activeProvider?.models.find((model) => (
+        model.id === activeProvider.defaultModelId && model.enabled
+      ))
+      ?? activeProvider?.models.find((model) => model.enabled)
+      ?? activeProvider?.models[0];
+
+    return {
+      ...normalizedFlat,
       temperature: typeof partial.temperature === 'number' ? partial.temperature : 0.2,
+      providers,
+      activeProviderId: activeProvider?.id,
+      activeModelId: activeModel?.id,
       // Persisted configs written before v0.2.0 sync-state-timeout-fix lack
       // this field. Fall back to the explicit default; preserve user-provided
       // values verbatim (including 0 / small numbers — the user set them on
@@ -881,7 +1133,22 @@ export class ConfigManager {
         claudePath: partial.claudeCli?.claudePath ?? base.claudeCli?.claudePath,
         extraArgs: partial.claudeCli?.extraArgs ?? base.claudeCli?.extraArgs,
       },
-      primaryChannel: partial.primaryChannel ?? 'claude-cli',
+      opencode: {
+        executablePath: partial.opencode?.executablePath ?? base.opencode?.executablePath,
+        model: partial.opencode?.model ?? base.opencode?.model,
+        agent: partial.opencode?.agent ?? base.opencode?.agent,
+        timeoutMs: typeof partial.opencode?.timeoutMs === 'number'
+          ? partial.opencode.timeoutMs
+          : base.opencode?.timeoutMs,
+      },
+      contentAdaptationEnabled: typeof partial.contentAdaptationEnabled === 'boolean'
+        ? partial.contentAdaptationEnabled
+        : false,
+      primaryChannel: partial.primaryChannel === 'claude-cli'
+        || partial.primaryChannel === 'direct'
+        || partial.primaryChannel === 'opencode'
+        ? partial.primaryChannel
+        : 'claude-cli',
       fallbackOnFailure: typeof partial.fallbackOnFailure === 'boolean'
         ? partial.fallbackOnFailure
         : true,
@@ -899,7 +1166,9 @@ export class ConfigManager {
     return (
       typeof v.openAiCompatBaseUrl === 'string' ||
       typeof v.claudeCompatBaseUrl === 'string' ||
-      typeof v.primaryChannel === 'string'
+      typeof v.primaryChannel === 'string' ||
+      Array.isArray(v.providers) ||
+      typeof v.activeProviderId === 'string'
     );
   }
 }

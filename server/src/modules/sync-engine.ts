@@ -26,6 +26,9 @@ import type {
   SyncOptions,
   SyncedDocument,
   FailedDocument,
+  PlannedSyncDocument,
+  SyncFailureReasonCode,
+  SyncRepairAction,
   WatchedRootConfig,
 } from '../types/index.js';
 import {
@@ -52,6 +55,7 @@ import {
   rewriteFeishuMediaReferences,
 } from './media-reference.js';
 import { adaptSlidesXmlToMarkdown } from './slides-xml-adapter.js';
+import { LarkCliError } from './lark-cli-client.js';
 
 interface FetchedDocument {
   content: string;
@@ -143,6 +147,143 @@ interface SyncEngineDeps {
   testHooks?: SyncEngineTestHooks;
 }
 
+interface ClassifiedSyncFailure {
+  message: string;
+  retryable: boolean;
+  reasonCode: SyncFailureReasonCode;
+  suggestedResolution: string;
+  repairAction: SyncRepairAction;
+}
+
+/**
+ * A retry button is useful only for transient failures. Permission denial and
+ * a remotely deleted page require a user action in Feishu, so presenting them
+ * as endlessly retryable made the sync-result screen misleading.
+ */
+export function classifySyncFailure(error: unknown): ClassifiedSyncFailure {
+  if (error instanceof LarkCliError) {
+    if (error.code === 'permission') {
+      return {
+        message: '无权限访问该节点。请在飞书中将当前 lark-cli 用户加入该节点及其父级的可访问范围后重新检测。',
+        retryable: false,
+        reasonCode: 'permission_denied',
+        suggestedResolution: '请在飞书中把当前 lark-cli user 加入该节点及所有父级的可访问范围；授权后点击“立即检测”，再重试同步。',
+        repairAction: 'grant_access',
+      };
+    }
+    if (error.code === 'deleted') {
+      return {
+        message: '云端文档已删除或不再可编辑。请在飞书中选择有效节点后重新检测；此项不能通过重试恢复。',
+        retryable: false,
+        reasonCode: 'cloud_deleted',
+        suggestedResolution: '此云端页面已删除。请在飞书恢复或替换为有效页面；若确认删除，可在本地回收站保留或清理旧副本。',
+        repairAction: 'review_deleted',
+      };
+    }
+    if (error.code === 'rate_limited') {
+      return {
+        message: '飞书接口正在限流，已停止本次请求以避免继续放大流量。',
+        retryable: true,
+        reasonCode: 'rate_limited',
+        suggestedResolution: '等待短暂冷却后重试；应用会串行、低速执行请求，避免并发重放。',
+        repairAction: 'retry',
+      };
+    }
+    return {
+      message: error.message,
+      retryable: error.retryable,
+      reasonCode: 'upstream_error',
+      suggestedResolution: error.retryable
+        ? '可在网络或飞书服务恢复后重试；重试会串行执行，不会并发放大请求。'
+        : '请根据错误详情修正配置或云端状态后重新检测。',
+      repairAction: error.retryable ? 'retry' : 'manual_review',
+    };
+  }
+
+  const message = error instanceof Error ? error.message : String(error);
+  if (/(?:3380003|document page has been deleted|page can no longer be edited|文档.*已删除)/i.test(message)) {
+    return {
+      message: '云端文档已删除或不再可编辑。请在飞书中选择有效节点后重新检测；此项不能通过重试恢复。',
+      retryable: false,
+      reasonCode: 'cloud_deleted',
+      suggestedResolution: '此云端页面已删除。请在飞书恢复或替换为有效页面；若确认删除，可在本地回收站保留或清理旧副本。',
+      repairAction: 'review_deleted',
+    };
+  }
+  if (/(?:40403|131006|无权限|permission|forbidden|access denied)/i.test(message)) {
+    return {
+      message: '无权限访问该节点。请在飞书中将当前 lark-cli 用户加入该节点及其父级的可访问范围后重新检测。',
+      retryable: false,
+      reasonCode: 'permission_denied',
+      suggestedResolution: '请在飞书中把当前 lark-cli user 加入该节点及所有父级的可访问范围；授权后点击“立即检测”，再重试同步。',
+      repairAction: 'grant_access',
+    };
+  }
+  if (/(?:99991400|rate limit|qps|限频|限流)/i.test(message)) {
+    return {
+      message: '飞书接口正在限流，已停止本次请求以避免继续放大流量。',
+      retryable: true,
+      reasonCode: 'rate_limited',
+      suggestedResolution: '等待短暂冷却后重试；应用会串行、低速执行请求，避免并发重放。',
+      repairAction: 'retry',
+    };
+  }
+  return {
+    message,
+    retryable: true,
+    reasonCode: 'upstream_error',
+    suggestedResolution: '可在网络或飞书服务恢复后重试；重试会串行执行，不会并发放大请求。',
+    repairAction: 'retry',
+  };
+}
+
+/**
+ * These failures cannot be repaired by retrying local work.  They are queued
+ * separately so a detector poll does not keep surfacing them as new changes
+ * until an operator has acted in Feishu and explicitly requested a recheck.
+ */
+export function requiresFeishuSideAction(failure: Pick<FailedDocument, 'repairAction'>): boolean {
+  return failure.repairAction === 'grant_access'
+    || failure.repairAction === 'review_deleted'
+    || failure.repairAction === 'enable_export_adapter';
+}
+
+/** Convert a planning guard into the same actionable result contract as a runtime failure. */
+function plannedFailure(planned: PlannedSyncDocument): FailedDocument {
+  const reasonCode = planned.reasonCode ?? 'unknown';
+  const isAdoptableProfileCollision = reasonCode === 'path_conflict'
+    && /目标路径已有文件，拒绝自动覆盖/i.test(planned.reason ?? '');
+  const repairAction: SyncRepairAction = reasonCode === 'missing_parent_chain'
+    ? 'rebuild_parent_chain'
+    : isAdoptableProfileCollision
+      ? 'adopt_existing_file'
+      : reasonCode === 'unsupported_type'
+        ? 'enable_export_adapter'
+        : reasonCode === 'deleted_requires_confirmation'
+          ? 'review_deleted'
+          : 'manual_review';
+  const fallbackMessage = planned.action === 'move'
+    ? '计划涉及路径移动，需通过独立迁移流程确认'
+    : '同步计划被安全策略阻止';
+  const fallbackResolution = reasonCode === 'missing_parent_chain'
+    ? '可使用“自动补齐结构并重试”：应用会完整遍历受影响根目录，补齐父链后仅重试这些文档。'
+    : isAdoptableProfileCollision
+      ? '若该文件确为同名飞书文档的旧同步版本，可点击“认领本地旧文件并同步”。系统会校验 Markdown 标题完全一致后才会覆盖。'
+    : reasonCode === 'unsupported_type'
+      ? '当前对象类型没有可用导出适配器。请转换为支持的飞书文档、表格或幻灯片，或启用对应导出适配器后再同步。'
+      : '请按路径冲突或云端状态提示处理后，再重新生成同步计划。';
+  return {
+    objToken: planned.objToken,
+    title: planned.title,
+    error: planned.reason || fallbackMessage,
+    retryable: false,
+    reasonCode,
+    suggestedResolution: planned.suggestedResolution || fallbackResolution,
+    repairAction,
+    watchedRootId: planned.watchedRootId ?? null,
+  };
+}
+
 export class SyncEngine {
   private larkCliClient: any;
   private localMapStore: any;
@@ -186,6 +327,7 @@ export class SyncEngine {
       watchedRoots: Array.isArray(this.config?.watchedRoots)
         ? this.config.watchedRoots
         : [],
+      adoptExistingProfileTargets: options.adoptExistingProfileTargets === true,
     });
     const operationDirectory = resolveOperationDirectory(
       this.config.knowledgeBaseRoot,
@@ -202,16 +344,7 @@ export class SyncEngine {
     if (mode === 'dry-run') {
       for (const planned of manifest.documents) {
         if (planned.action === 'blocked' || planned.action === 'move') {
-          failedDocuments.push({
-            objToken: planned.objToken,
-            title: planned.title,
-            error:
-              planned.reason ||
-              (planned.action === 'move'
-                ? '计划涉及路径移动，需通过独立迁移流程确认'
-                : '同步计划被安全策略阻止'),
-            retryable: false,
-          });
+          failedDocuments.push(plannedFailure(planned));
         }
       }
 
@@ -241,16 +374,9 @@ export class SyncEngine {
       // A move is evidence for a separate, explicitly confirmed migration;
       // ordinary sync may only create or replace a reviewed body.
       if (planned.action === 'blocked' || planned.action === 'move' || !planned.localMdPath) {
-        failedDocuments.push({
-          objToken: doc.objToken,
-          title: doc.title,
-          error:
-            planned.reason ||
-            (planned.action === 'move'
-              ? '计划涉及路径移动，需通过独立迁移流程确认'
-              : '同步计划被安全策略阻止'),
-          retryable: false,
-        });
+        const failure = plannedFailure(planned);
+        failedDocuments.push(failure);
+        this.queueFeishuSideFailure(failure);
         continue;
       }
 
@@ -263,7 +389,8 @@ export class SyncEngine {
         );
         syncedDocuments.push(result);
       } catch (error) {
-        const errMsg = error instanceof Error ? error.message : String(error);
+        const failure = classifySyncFailure(error);
+        const errMsg = failure.message;
         const errStack = error instanceof Error && error.stack ? error.stack : '';
         // 同步失败日志落盘（诊断报告 §4.3）：当前无任何磁盘日志，失败根因
         // 只能静态推测。这里把单文档失败的堆栈追加到
@@ -277,12 +404,18 @@ export class SyncEngine {
         } catch (logError) {
           console.error('[SyncEngine] failed to append sync-errors.log:', logError);
         }
-        failedDocuments.push({
+        const failedDocument: FailedDocument = {
           objToken: doc.objToken,
           title: doc.title,
           error: errMsg,
-          retryable: true,
-        });
+          retryable: failure.retryable,
+          reasonCode: failure.reasonCode,
+          suggestedResolution: failure.suggestedResolution,
+          repairAction: failure.repairAction,
+          watchedRootId: doc.watchedRootId ?? planned.watchedRootId ?? null,
+        };
+        failedDocuments.push(failedDocument);
+        this.queueFeishuSideFailure(failedDocument);
       }
     }
 
@@ -318,6 +451,25 @@ export class SyncEngine {
     return result;
   }
 
+  /** Best-effort queue write; a database diagnostic failure must not mask the original sync error. */
+  private queueFeishuSideFailure(failure: FailedDocument): void {
+    if (!requiresFeishuSideAction(failure)) return;
+    if (typeof this.localMapStore?.recordFeishuPending !== 'function') return;
+    try {
+      this.localMapStore.recordFeishuPending({
+        objToken: failure.objToken,
+        title: failure.title,
+        watchedRootId: failure.watchedRootId ?? null,
+        reasonCode: failure.reasonCode ?? 'unknown',
+        error: failure.error,
+        suggestedResolution: failure.suggestedResolution ?? '请完成飞书侧处理后点击“处理后重新检测”。',
+        repairAction: failure.repairAction ?? 'manual_review',
+      });
+    } catch (error) {
+      console.warn('[SyncEngine] failed to record Feishu-side pending item:', error);
+    }
+  }
+
   /**
    * Synchronize a single document through the complete pipeline
    */
@@ -335,7 +487,6 @@ export class SyncEngine {
     //      此处构造空 content 的 FetchedDocument，后续 step 5/6 由
     //      sheet 子表的 CSV 经 LayoutReconstructor 重构生成 markdown。
     let fetched: FetchedDocument;
-    let isPlaceholder = false;
 
     if (doc.objType === 'sheet') {
       console.info(
@@ -359,18 +510,11 @@ export class SyncEngine {
       try {
         fetched = await this.fetchDocumentContent(doc.objToken, doc.objType);
       } catch (error) {
-        // Check if this is a 40403 no permission error
-        if (error instanceof Error && error.message.includes('40403')) {
-          console.warn(`[SyncEngine] No permission for document ${doc.title}, creating placeholder`);
-          isPlaceholder = true;
-          fetched = {
-            content: '',
-            images: [],
-            attachments: [],
-            sheets: [],
-            url: doc.localMdPath || '', // Will be filled in writePlaceholder
-            obj_token: doc.objToken,
-          };
+        // A permission failure is actionable only in Feishu.  Do not create
+        // an empty placeholder and falsely report the document as synced;
+        // the outer batch classifier moves it into the durable Feishu queue.
+        if (error instanceof Error && /(?:40403|131006|无权限|permission|forbidden|access denied)/i.test(error.message)) {
+          throw error;
         } else if (
           error instanceof Error &&
           (error.message.includes('3380002') || error.message.includes('Unsupported document type'))
@@ -392,23 +536,6 @@ export class SyncEngine {
           throw error; // Re-throw other errors
         }
       }
-    }
-
-    // For placeholder files, create a placeholder .md and mark in local map
-    if (isPlaceholder) {
-      const localMdPath = doc.localMdPath || this.generateLocalPath(doc);
-      await this.writePlaceholderFile(localMdPath, doc);
-      await this.updateLocalMapWithStatus(doc, localMdPath, 'placeholder');
-      return {
-        objToken: doc.objToken,
-        title: doc.title,
-        localMdPath,
-        cloudModifiedTime: doc.cloudModifiedTime,
-        size: 0,
-        imagesCount: 0,
-        attachmentsCount: 0,
-        sheetsCount: 0,
-      };
     }
 
     // 2–5. Prepare content entirely outside the knowledge base.
@@ -525,12 +652,14 @@ export class SyncEngine {
               enableStreaming: false,
               // Surface the LLM timeout as a config knob (LlmConfig.timeoutMs,
               // default 600000ms = 10 min). The previous hard-coded 60s was
-              // too aggressive for bigmodel glm-5.2[1m] under load; raising
+              // too aggressive for bigmodel glm-5.2 under load; raising
               // the ceiling here lets the primary channel finish instead of
               // prematurely aborting to the fallback. Channels still clamp
               // this value via their own resolveOptions when the caller
               // omits it.
-              timeoutMs: this.config.llm.timeoutMs ?? 600_000,
+              timeoutMs: this.config.llm.primaryChannel === 'opencode'
+                ? this.config.llm.opencode?.timeoutMs ?? this.config.llm.timeoutMs ?? 600_000
+                : this.config.llm.timeoutMs ?? 600_000,
             },
           }
         );
@@ -971,64 +1100,6 @@ export class SyncEngine {
         lastSyncedAt: new Date().toISOString(),
       });
     }
-  }
-
-  /**
-   * Write placeholder file for documents with no permission
-   */
-  private async writePlaceholderFile(localMdPath: string, doc: ChangedDocument): Promise<void> {
-    // Create directory if it doesn't exist
-    const dir = path.dirname(localMdPath);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-
-    const currentDate = new Date().toISOString().split('T')[0];
-
-    // Header: reuse the canonical YAML-in-comment pipeline so placeholders
-    // carry the same obj_token / wiki_node_token / space_id / obj_type /
-    // original_link metadata as regular synced docs (规范 §5.3). The
-    // placeholder's FetchedDocument.url is intentionally empty —
-    // resolveHeaderMeta backfills original_link from SQLite (or constructs
-    // it from wiki_node_token + the configured feishu host). obj_type
-    // 'unknown' is omitted by generateHtmlHeader so IndexScanner falls back
-    // to its default 'docx' classification rather than persisting a fake
-    // type (规范 §5.3 / red line 7: 不伪造字段).
-    const placeholderFetched: FetchedDocument = {
-      content: '',
-      images: [],
-      attachments: [],
-      sheets: [],
-      url: '',
-      obj_token: doc.objToken,
-    };
-    const meta = this.resolveHeaderMeta(doc, placeholderFetched);
-    const header = this.generateHtmlHeader(meta);
-
-    const body = `# 无权限文档：${doc.title}
-
-> **权限限制**：此文档需要额外权限才能访问。请联系文档所有者或管理员获取访问权限。
-
-## 文档信息
-
-- **文档标题**：${doc.title}
-- **对象类型**：${doc.objType}
-- **对象Token**：${doc.objToken}
-- **变更类型**：${doc.changeType}
-- **云端修改时间**：${doc.cloudModifiedTime}
-- **本地同步时间**：${currentDate}
-
-## 下一步操作
-
-1. 在飞书中申请该文档的访问权限
-2. 获取权限后，在应用中重新同步此文档
-3. 系统将自动下载完整内容并替换此占位文件
-
----
-`;
-
-    fs.writeFileSync(localMdPath, header + body, 'utf-8');
-    console.info(`[SyncEngine] Created placeholder file: ${localMdPath}`);
   }
 
   /**

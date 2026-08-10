@@ -1,8 +1,12 @@
 import { describe, expect, it } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import {
+  buildLarkCliEnvironment,
   LarkCliClient,
   LarkCliError,
+  resolveLarkCliExecutable,
   resolveMediaOutputTarget,
 } from '../src/modules/lark-cli-client.js';
 
@@ -24,6 +28,28 @@ function internals(client: LarkCliClient): ClientInternals {
 }
 
 describe('LarkCliClient output parsing and classification', () => {
+  it('discovers the common local Node installation and preserves its bin directory for script shims', () => {
+    const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-sync-lark-cli-'));
+    try {
+      const binDir = path.join(homeDir, '.local', 'node', 'bin');
+      const executable = path.join(binDir, 'lark-cli');
+      fs.mkdirSync(binDir, { recursive: true });
+      fs.writeFileSync(executable, '#!/usr/bin/env node\n', { mode: 0o755 });
+
+      const resolved = resolveLarkCliExecutable(undefined, {
+        homeDir,
+        platform: 'darwin',
+        env: { PATH: '/usr/bin:/bin' },
+      });
+
+      expect(resolved).toBe(executable);
+      expect(buildLarkCliEnvironment(resolved, { PATH: '/usr/bin:/bin' }).PATH)
+        .toBe(`${binDir}${path.delimiter}/usr/bin${path.delimiter}/bin`);
+    } finally {
+      fs.rmSync(homeDir, { recursive: true, force: true });
+    }
+  });
+
   it('merges log-prefixed ANSI NDJSON pages without losing nodes', () => {
     const client = createClient();
     const result = internals(client).parseJsonOutput(
@@ -63,12 +89,91 @@ describe('LarkCliClient output parsing and classification', () => {
     }
   });
 
+  it('classifies a deleted document page as non-retryable', () => {
+    const client = createClient();
+    try {
+      internals(client).parseJsonOutput(
+        '{"ok":false,"code":3380003,"message":"Document page has been deleted. This page can no longer be edited"}',
+      );
+      throw new Error('expected parseJsonOutput to throw');
+    } catch (error) {
+      expect(error).toBeInstanceOf(LarkCliError);
+      expect(error).toMatchObject({ code: 'deleted', retryable: false, upstreamCode: '3380003' });
+    }
+  });
+
+  it('retains parent_node_token from wiki node detail', async () => {
+    const client = createClient();
+    (client as any).execute = async () => ({
+      data: {
+        node_token: 'child',
+        obj_token: 'obj-child',
+        obj_type: 'docx',
+        title: '子节点',
+        space_id: 'space-1',
+        obj_edit_time: '1710000000',
+        has_child: false,
+        parent_node_token: 'parent',
+      },
+    });
+
+    await expect(client.getNode('child')).resolves.toMatchObject({
+      node_token: 'child',
+      parent_node_token: 'parent',
+      obj_edit_time: 1710000000,
+    });
+  });
+
   it('does not treat ordinary text as malformed JSON (version output)', () => {
     const client = createClient();
     expect(internals(client).parseJsonOutput('lark-cli 1.0.53\n')).toEqual({
       ok: true,
       data: { version: 'lark-cli 1.0.53' },
     });
+  });
+
+  it('normalizes a Drive metadata batch without fetching document content', async () => {
+    const client = createClient();
+    const calls: Array<{ args: string[]; apiType: string }> = [];
+    (client as any).execute = async (args: string[], apiType: string) => {
+      calls.push({ args, apiType });
+      return {
+        data: {
+          metas: [{
+            doc_token: 'docx-A',
+            doc_type: 'docx',
+            latest_modify_time: '1710000000',
+            title: 'A',
+          }],
+          failed_list: [{ token: 'docx-B', code: 970005 }],
+        },
+      };
+    };
+
+    await expect(client.getDocumentMetas([
+      { docToken: 'docx-A', docType: 'docx' },
+      { docToken: 'docx-B', docType: 'docx' },
+    ])).resolves.toEqual({
+      metas: [{
+        docToken: 'docx-A',
+        docType: 'docx',
+        latestModifyTime: 1710000000,
+        title: 'A',
+      }],
+      failed: [{ docToken: 'docx-B', code: 970005 }],
+    });
+    expect(calls).toEqual([{
+      apiType: 'drive',
+      args: [
+        'drive', 'metas', 'batch_query', '--format', 'json', '--data',
+        JSON.stringify({
+          request_docs: [
+            { doc_token: 'docx-A', doc_type: 'docx' },
+            { doc_token: 'docx-B', doc_type: 'docx' },
+          ],
+        }),
+      ],
+    }]);
   });
 
   it('turns an absolute staging path into relative media output with a controlled cwd', async () => {

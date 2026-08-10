@@ -16,7 +16,10 @@ import fs from 'node:fs';
 import type {
   CloudNodeObservation,
   DocumentRecord,
+  FeishuPendingItem,
   SyncResult,
+  SyncFailureReasonCode,
+  SyncRepairAction,
   SyncState,
   WatchedRootConfig,
 } from '../types/index.js';
@@ -190,6 +193,7 @@ export class LocalMapStore {
       CREATE INDEX IF NOT EXISTS idx_local_dirs_wiki_node    ON localDirs(mapped_wiki_node_token);
       CREATE INDEX IF NOT EXISTS idx_local_dirs_cloud_match  ON localDirs(cloud_match);
       CREATE INDEX IF NOT EXISTS idx_local_dirs_parent       ON localDirs(parent_path);
+
     `);
     console.info('[LocalMapStore] localDirs table ready (v4 structure-align)');
   }
@@ -444,7 +448,18 @@ export class LocalMapStore {
    */
   recordCloudObservation(observation: CloudNodeObservation & { lastSeenAt: string }): DocumentRecord {
     const current = this.getDocumentByObjToken(observation.objToken);
-    const nextState = this.nextStateForObservation(current, observation);
+    const pending = this.getFeishuPendingByObjToken(observation.objToken);
+    // A Feishu-side repair is opt-in: routine polls keep the queue entry and
+    // its suppression state intact.  After the user clicks “处理后重新检测”,
+    // only a readable observation releases it; permission/unavailable states
+    // stay queued and do not become a fresh pending change again.
+    const keepFeishuPending = !!pending && !(
+      pending.recheckRequestedAt != null && observation.observationStatus === 'available'
+    );
+    if (pending && !keepFeishuPending) this.removeFeishuPending(observation.objToken);
+    const nextState: SyncState = keepFeishuPending
+      ? 'feishu_pending'
+      : this.nextStateForObservation(current, observation);
     const legacyStatus = this.legacyStatusForSyncState(nextState);
 
     const stmt = this.getStatement(`
@@ -473,7 +488,7 @@ export class LocalMapStore {
         missing_complete_count = 0,
         cloud_deleted = 0,
         last_sync_error_code = CASE
-          WHEN excluded.sync_state = 'error' THEN documents.last_sync_error_code
+          WHEN excluded.sync_state IN ('error', 'feishu_pending') THEN documents.last_sync_error_code
           ELSE NULL
         END,
         updated_at = datetime('now')
@@ -581,6 +596,105 @@ export class LocalMapStore {
   }
 
   /**
+   * Move a non-retryable cloud-side issue into the durable Feishu queue.
+   * This is intentionally a local state transition only: the application
+   * never attempts to grant itself access, revive a deleted cloud page, or
+   * change a cloud object's type.
+   */
+  recordFeishuPending(input: {
+    objToken: string;
+    title: string;
+    watchedRootId?: string | null;
+    reasonCode: SyncFailureReasonCode;
+    error: string;
+    suggestedResolution: string;
+    repairAction: SyncRepairAction;
+  }): void {
+    const now = new Date().toISOString();
+    const insertPending = this.getStatement(`
+      INSERT INTO feishu_pending_items (
+        obj_token, title, watched_root_id, reason_code, error,
+        suggested_resolution, repair_action, created_at, updated_at,
+        recheck_requested_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+      ON CONFLICT(obj_token) DO UPDATE SET
+        title = CASE WHEN excluded.title <> '' THEN excluded.title ELSE feishu_pending_items.title END,
+        watched_root_id = COALESCE(excluded.watched_root_id, feishu_pending_items.watched_root_id),
+        reason_code = excluded.reason_code,
+        error = excluded.error,
+        suggested_resolution = excluded.suggested_resolution,
+        repair_action = excluded.repair_action,
+        updated_at = excluded.updated_at,
+        recheck_requested_at = NULL
+    `);
+    const markDocument = this.getStatement(`
+      UPDATE documents
+      SET sync_state = 'feishu_pending', status = 'error',
+          last_sync_error_code = ?, updated_at = datetime('now')
+      WHERE obj_token = ?
+    `);
+    const tx = this.db.transaction(() => {
+      insertPending.run(
+        input.objToken,
+        input.title,
+        input.watchedRootId ?? null,
+        input.reasonCode,
+        input.error,
+        input.suggestedResolution,
+        input.repairAction,
+        now,
+        now,
+      );
+      markDocument.run(input.reasonCode, input.objToken);
+    });
+    tx();
+  }
+
+  /** Read the queue used by the Sync view's “飞书侧待处理” panel. */
+  listFeishuPending(watchedRootIds?: string[]): FeishuPendingItem[] {
+    const ids = (watchedRootIds ?? []).filter((id) => typeof id === 'string' && id.trim());
+    const where = ids.length > 0
+      ? `WHERE watched_root_id IN (${ids.map(() => '?').join(', ')})`
+      : '';
+    const rows = this.db.prepare(`
+      SELECT * FROM feishu_pending_items
+      ${where}
+      ORDER BY updated_at DESC, title COLLATE NOCASE ASC
+    `).all(...ids) as Array<Record<string, unknown>>;
+    return rows.map((row) => this.mapRowToFeishuPendingItem(row));
+  }
+
+  /**
+   * Explicitly permit one recovery traversal.  The rows remain queued until
+   * a later observation is actually readable; a still-restricted/deleted
+   * document therefore does not fall back into the recurring change list.
+   */
+  requestFeishuPendingRecheck(watchedRootIds?: string[]): number {
+    const ids = (watchedRootIds ?? []).filter((id) => typeof id === 'string' && id.trim());
+    const now = new Date().toISOString();
+    const where = ids.length > 0
+      ? `WHERE watched_root_id IN (${ids.map(() => '?').join(', ')})`
+      : '';
+    const result = this.db.prepare(`
+      UPDATE feishu_pending_items
+      SET recheck_requested_at = ?, updated_at = ?
+      ${where}
+    `).run(now, now, ...ids);
+    return result.changes;
+  }
+
+  private getFeishuPendingByObjToken(objToken: string): FeishuPendingItem | null {
+    const row = this.getStatement(`
+      SELECT * FROM feishu_pending_items WHERE obj_token = ?
+    `).get(objToken) as Record<string, unknown> | undefined;
+    return row ? this.mapRowToFeishuPendingItem(row) : null;
+  }
+
+  private removeFeishuPending(objToken: string): void {
+    this.getStatement('DELETE FROM feishu_pending_items WHERE obj_token = ?').run(objToken);
+  }
+
+  /**
    * Record a single absence after a COMPLETE traversal. The first complete
    * miss is intentionally observational; only the second becomes a deletion
    * candidate. Nothing here performs a delete or hides the local document.
@@ -592,6 +706,7 @@ export class LocalMapStore {
     if (
       state === 'pending_added' ||
       state === 'restricted' ||
+      state === 'feishu_pending' ||
       state === 'deleted_confirmed'
     ) {
       return current;
@@ -840,6 +955,8 @@ export class LocalMapStore {
         return 'synced';
       case 'restricted':
         return 'placeholder';
+      case 'feishu_pending':
+        return 'error';
       case 'error':
         return 'error';
       case 'pending_added':
@@ -894,6 +1011,16 @@ export class LocalMapStore {
     const synced = current.syncedObjEditTime ?? null;
     const hasLocalContent = current.localMdPath.trim().length > 0;
 
+    // A queue row is normally handled before this method. This fallback
+    // covers an interrupted migration/manual database repair: once no queue
+    // row remains, the next readable observation safely derives a normal
+    // pending/synced state from the unchanged baseline.
+    if (currentState === 'feishu_pending') {
+      if (!hasLocalContent) return 'pending_added';
+      if (observed == null || synced == null || observed > synced) return 'pending_modified';
+      return 'synced';
+    }
+
     // A historical writer stored the local wall-clock timestamp in
     // synced_obj_edit_time for at least one failed Slides export, while the
     // upstream wiki API supplies Unix seconds.  That makes the local baseline
@@ -939,6 +1066,25 @@ export class LocalMapStore {
       observed > 0 &&
       synced > observed * 100
     );
+  }
+
+  private mapRowToFeishuPendingItem(row: Record<string, unknown>): FeishuPendingItem {
+    return {
+      objToken: String(row.obj_token ?? ''),
+      title: String(row.title ?? ''),
+      watchedRootId: typeof row.watched_root_id === 'string' && row.watched_root_id
+        ? row.watched_root_id
+        : null,
+      reasonCode: String(row.reason_code ?? 'unknown') as SyncFailureReasonCode,
+      error: String(row.error ?? ''),
+      suggestedResolution: String(row.suggested_resolution ?? ''),
+      repairAction: String(row.repair_action ?? 'manual_review') as SyncRepairAction,
+      createdAt: String(row.created_at ?? ''),
+      updatedAt: String(row.updated_at ?? ''),
+      recheckRequestedAt: typeof row.recheck_requested_at === 'string' && row.recheck_requested_at
+        ? row.recheck_requested_at
+        : null,
+    };
   }
 
   /**
@@ -1401,6 +1547,24 @@ export class LocalMapStore {
       CREATE INDEX IF NOT EXISTS idx_local_dirs_wiki_node    ON localDirs(mapped_wiki_node_token);
       CREATE INDEX IF NOT EXISTS idx_local_dirs_cloud_match  ON localDirs(cloud_match);
       CREATE INDEX IF NOT EXISTS idx_local_dirs_parent       ON localDirs(parent_path);
+
+      -- Operator-owned Feishu-side repair queue. These rows deliberately do
+      -- not participate in the normal added/modified diff until the user has
+      -- finished the cloud-side action and explicitly asks for a recheck.
+      CREATE TABLE IF NOT EXISTS feishu_pending_items (
+        obj_token TEXT PRIMARY KEY,
+        title TEXT NOT NULL DEFAULT '',
+        watched_root_id TEXT,
+        reason_code TEXT NOT NULL,
+        error TEXT NOT NULL,
+        suggested_resolution TEXT NOT NULL DEFAULT '',
+        repair_action TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        recheck_requested_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_feishu_pending_root ON feishu_pending_items(watched_root_id);
+      CREATE INDEX IF NOT EXISTS idx_feishu_pending_recheck ON feishu_pending_items(recheck_requested_at);
 
       -- Sub-sheet mapping is a runtime dependency of SyncEngine, not an
       -- optional migration-script add-on. New installs must be able to sync

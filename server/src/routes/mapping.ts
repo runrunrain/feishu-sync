@@ -94,6 +94,9 @@ function getLocalMapStore(c: any): {
 /**
  * Query params:
  *   rootUrl (required) - Feishu wiki URL to diff against
+ *   cached=1 (optional) - read the last persisted detection result only;
+ *                         never starts a cloud request. UI callers use this
+ *                         mode so rendering cannot trigger a traversal.
  *
  * Response: DiffReport
  */
@@ -105,7 +108,9 @@ mappingRoutes.get('/api/mapping/diff', async (c) => {
 
   try {
     const svc = getMappingService(c);
-    const report = await svc.computeDiff(rootUrl);
+    const report = c.req.query('cached') === '1'
+      ? svc.getStoredDiff(rootUrl)
+      : await svc.computeDiff(rootUrl);
     return c.json(report);
   } catch (error) {
     console.error('[mapping] computeDiff failed:', error);

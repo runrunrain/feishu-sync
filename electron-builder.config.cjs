@@ -5,6 +5,8 @@ const targetPlatform = process.env.DESKTOP_TARGET_PLATFORM;
 const targetArch = process.env.DESKTOP_TARGET_ARCH;
 const appDir = process.env.DESKTOP_APP_DIR;
 const outputDir = process.env.DESKTOP_OUTPUT_DIR;
+const macSigningMode = (process.env.DESKTOP_MAC_SIGNING || "adhoc").trim().toLowerCase();
+const isMacRelease = targetPlatform === "darwin" && macSigningMode === "release";
 const defaultRepository = "yourcompany/feishu-sync";
 const repository = process.env.GITHUB_REPOSITORY || defaultRepository;
 const [rawGithubOwner, rawGithubRepo] = repository.split("/");
@@ -44,9 +46,14 @@ if (!["x64", "arm64"].includes(targetArch)) {
   throw new Error(`Unsupported DESKTOP_TARGET_ARCH: ${targetArch}`);
 }
 
+if (!["adhoc", "release"].includes(macSigningMode)) {
+  throw new Error(`Unsupported DESKTOP_MAC_SIGNING: ${macSigningMode}. Expected "adhoc" or "release".`);
+}
+
 module.exports = {
   appId: "com.yourcompany.feishu-sync",
   productName: "Feishu Sync",
+  forceCodeSigning: isMacRelease,
   directories: {
     app: path.resolve(appDir),
     output: path.resolve(outputDir),
@@ -99,11 +106,19 @@ module.exports = {
     ],
     category: "public.app-category.productivity",
     artifactName: "FeishuSync-${version}-${arch}.${ext}",
-    hardenedRuntime: false,
+    // Local builds are fully ad-hoc signed so macOS sees one internally
+    // consistent bundle instead of the partially signed Electron template.
+    // Release builds let electron-builder select/import a Developer ID
+    // Application certificate and are notarized when Apple credentials exist.
+    identity: isMacRelease ? undefined : "-",
+    hardenedRuntime: true,
     gatekeeperAssess: false,
+    entitlements: "build/entitlements.mac.plist",
+    entitlementsInherit: "build/entitlements.mac.plist",
+    notarize: isMacRelease ? undefined : false,
   } : undefined,
   dmg: {
-    sign: false,
+    sign: isMacRelease,
   },
   win: targetPlatform === "win32" ? {
     target: [{ target: "nsis", arch: [targetArch] }],

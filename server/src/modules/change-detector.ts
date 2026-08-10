@@ -66,7 +66,10 @@
  * node-get calls per poll, which is a fraction of the full subtree.
  */
 
-import type { LarkCliClient } from './lark-cli-client.js';
+import type {
+  LarkCliClient,
+  LarkCliDocumentMetaRequest,
+} from './lark-cli-client.js';
 import type { LocalMapStore } from './local-map-store.js';
 import type {
   ChangeDetectionResult,
@@ -116,6 +119,21 @@ interface ComparisonOptions {
 interface ParentChainProjection {
   parentChainTitles: string[];
   isWatchedRootNode: boolean;
+}
+
+/**
+ * `fast` checks only documents already mapped to the local knowledge base.
+ * It intentionally does not discover brand-new/moved/deleted Wiki nodes,
+ * which is what lets a normal poll stay O(documents / 200) instead of making
+ * one Wiki detail request per node. `full` retains the topology-reconcile
+ * path for bootstrap and explicit recovery operations.
+ */
+export type ChangeDetectionMode = 'fast' | 'full';
+
+export interface DetectChangesOptions {
+  forceFresh?: boolean;
+  bypassCooldown?: boolean;
+  mode?: ChangeDetectionMode;
 }
 
 /**
@@ -181,6 +199,32 @@ const DETECT_COOLDOWN_MS = 60_000;
  */
 const OBJ_EDIT_TIME_REFRESH_TTL_MS = 60 * 60 * 1000;
 
+/** Drive's batch metadata endpoint accepts at most 200 document references. */
+const FAST_META_BATCH_SIZE = 200;
+
+/**
+ * A handful of legacy/restricted records cannot be read through Drive's
+ * metadata endpoint. Resolve only this small exceptional set through Wiki
+ * detail lookup; never turn a failed batch into N individual requests.
+ */
+const FAST_DETAIL_FALLBACK_MAX = 8;
+
+/**
+ * Do not retry a known unsupported/restricted detail fallback on every
+ * scheduled poll. A successful batch metadata result clears this in-memory
+ * negative cache immediately; failures are retried later in case access was
+ * granted or the legacy mapping was repaired.
+ */
+const FAST_DETAIL_FALLBACK_RETRY_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * A malformed/partial wiki node-list response may omit an intermediate
+ * parent even though a child is visible. Repair only those missing ancestors
+ * with node-get; never fall back to stale SQLite topology. The hard cap keeps
+ * a pathological tree from turning a normal detect into a QPS burst.
+ */
+const MAX_PARENT_CHAIN_REPAIRS = 24;
+
 export class ChangeDetector {
   // space_id cache: rootUrl -> space_id (avoid repeated getNode calls)
   private spaceIdCache = new Map<string, string>();
@@ -206,18 +250,29 @@ export class ChangeDetector {
    * number. That mismatch is the root cause of v0.2.0
    * sync-state-timeout-fix §问题1.
    *
-   * This cache deduplicates detect calls that happen within
-   * `DETECT_RESULT_TTL_MS` of each other for the SAME rootUrl. The TTL is
-   * intentionally short (120s): long enough to collapse the post-click
-   * burst, short enough that a real second detect (manual refresh 3min
-   * later) still re-hits the cloud. Callers can pass `forceFresh=true` to
-   * bypass (used by the explicit "立即检测" button so the user always
-   * sees fresh results when they consciously click detect).
+   * This cache serves completed detect calls that happen within
+   * `DETECT_RESULT_TTL_MS` of each other for the SAME rootUrl. Requests
+   * that arrive before the first traversal completes are deduplicated by
+   * `inFlightDetections` below. The TTL is intentionally short (120s):
+   * long enough to collapse the post-click burst, short enough that a real
+   * second detect (manual refresh 3min later) still re-hits the cloud.
+   * Callers can pass `forceFresh=true` to bypass this completed-result
+   * cache (used by the explicit "立即检测" button so the user always sees
+   * fresh results when they consciously click detect).
    */
   private detectResultCache = new Map<
     string,
     { result: ChangeDetectionResult; expiresAt: number }
   >();
+
+  /**
+   * Traversals currently running per root URL. A result cache can only
+   * collapse calls that start after the first traversal finishes; the UI
+   * sends several mapping/diff requests in the same render pass, so they
+   * otherwise all miss that cache and race lark-cli concurrently. Joining
+   * the promise here guarantees one cloud traversal per root at a time.
+   */
+  private inFlightDetections = new Map<string, Promise<ChangeDetectionResult>>();
 
   /**
    * In-memory TTL tracker for the fingerprint short-circuit (diagnosis
@@ -237,6 +292,13 @@ export class ChangeDetector {
    * report §3 for the full trade-off analysis.
    */
   private lastObjEditTimeRefreshAt = new Map<string, number>();
+
+  /**
+   * Negative cache for the exceptional fast-path Wiki fallback. Without this
+   * guard, a handful of permanently restricted/deleted legacy rows would
+   * add the same node-get calls to every 30-minute poll.
+   */
+  private fastFallbackRetryAt = new Map<string, number>();
 
   constructor(
     private larkCliClient: LarkCliClient,
@@ -270,12 +332,16 @@ export class ChangeDetector {
    */
   async detectChanges(
     rootUrl: string,
-    options: { forceFresh?: boolean; bypassCooldown?: boolean } = {}
+    options: DetectChangesOptions = {}
   ): Promise<ChangeDetectionResult> {
     const forceFresh = options.forceFresh === true;
     const bypassCooldown = options.bypassCooldown === true;
+    const mode = options.mode ?? 'full';
+    // A full topology reconciliation and a fast metadata poll have different
+    // freshness guarantees, so they must never share a cached result.
+    const cacheKey = `${mode}\u0000${rootUrl}`;
     if (!forceFresh) {
-      const cached = this.detectResultCache.get(rootUrl);
+      const cached = this.detectResultCache.get(cacheKey);
       if (cached && cached.expiresAt > Date.now()) {
         return cached.result;
       }
@@ -283,7 +349,7 @@ export class ChangeDetector {
       // forceFresh path: still respect the cooldown. If a detect on this
       // root completed less than DETECT_COOLDOWN_MS ago, return the last
       // result instead of re-traversing. This is the §问题2 fix.
-      const cached = this.detectResultCache.get(rootUrl);
+      const cached = this.detectResultCache.get(cacheKey);
       if (cached) {
         const sinceCompleted = Date.now() - (cached.expiresAt - DTECT_RESULT_TTL_MS);
         if (sinceCompleted < DETECT_COOLDOWN_MS) {
@@ -291,12 +357,37 @@ export class ChangeDetector {
         }
       }
     }
-    const result = await this.detectChangesUncached(rootUrl);
-    this.detectResultCache.set(rootUrl, {
-      result,
-      expiresAt: Date.now() + DTECT_RESULT_TTL_MS,
+    // A completed-result cache cannot prevent callers that arrive during
+    // the first traversal from racing each other. Always join an existing
+    // traversal, including forceFresh callers: it is already a fresh cloud
+    // read and starting another one would only increase the upstream QPS.
+    const inFlight = this.inFlightDetections.get(cacheKey);
+    if (inFlight) return inFlight;
+
+    const detector = mode === 'fast'
+      ? this.detectMappedDocumentChanges(rootUrl)
+      : this.detectChangesUncached(rootUrl);
+    const pending = detector.then((result) => {
+      this.detectResultCache.set(cacheKey, {
+        result,
+        expiresAt: Date.now() + DTECT_RESULT_TTL_MS,
+      });
+      return result;
     });
-    return result;
+    this.inFlightDetections.set(cacheKey, pending);
+
+    const clearInFlight = () => {
+      // Do not remove a newer traversal if one has been registered after
+      // this promise settled.
+      if (this.inFlightDetections.get(cacheKey) === pending) {
+        this.inFlightDetections.delete(cacheKey);
+      }
+    };
+    // Attach both branches so a failed traversal is also cleared without
+    // creating an unhandled rejected promise from `finally`.
+    void pending.then(clearInFlight, clearInFlight);
+
+    return pending;
   }
 
   /**
@@ -365,6 +456,211 @@ export class ChangeDetector {
       failedNodeTokens: traversal.failedNodeTokens,
       missingCandidates,
     };
+  }
+
+  /**
+   * Fast path for routine polling. It asks Drive for the metadata of every
+   * document we already map locally, in batches of at most 200, and compares
+   * `latest_modify_time` with the local synced baseline. No document body is
+   * downloaded. A Wiki detail lookup is used only for at most eight
+   * documents that the batch endpoint explicitly cannot resolve.
+   *
+   * Structural reconciliation is deliberately excluded: a metadata batch
+   * cannot prove whether a brand-new or moved Wiki node belongs beneath this
+   * root. If the local database has no ownership baseline at all, we fall
+   * back once to the full scanner so later polls can be fast and safe.
+   */
+  private async detectMappedDocumentChanges(rootUrl: string): Promise<ChangeDetectionResult> {
+    const rootToken = this.rootTokenFromUrl(rootUrl);
+    const tracked = (this.localMapStore.getAllDocuments() as DocumentRecord[])
+      .filter((record) => {
+        if (record.cloudDeleted === 1 || !record.objToken) return false;
+        return record.watchedRootUrl === rootUrl || record.watchedRootId === rootToken;
+      });
+
+    if (tracked.length === 0) {
+      console.info(
+        '[ChangeDetector] Fast check has no local baseline; using one full topology reconciliation',
+      );
+      return this.detectChangesUncached(rootUrl);
+    }
+
+    const recordsByToken = new Map<string, DocumentRecord>();
+    const requests: LarkCliDocumentMetaRequest[] = [];
+    const failedTokens = new Set<string>();
+    const fallbackTokens = new Set<string>();
+    for (const record of tracked) {
+      // A document may be referenced by more than one legacy row. The
+      // metadata endpoint wants unique tokens and the documents table's
+      // primary key means a single observation is authoritative here.
+      if (recordsByToken.has(record.objToken)) continue;
+      recordsByToken.set(record.objToken, record);
+
+      const docType = this.toDriveMetaDocType(record.objType);
+      if (!docType) {
+        failedTokens.add(record.objToken);
+        fallbackTokens.add(record.objToken);
+        continue;
+      }
+      requests.push({ docToken: record.objToken, docType });
+    }
+
+    const observations: CloudNodeObservation[] = [];
+    for (let offset = 0; offset < requests.length; offset += FAST_META_BATCH_SIZE) {
+      const batch = requests.slice(offset, offset + FAST_META_BATCH_SIZE);
+      try {
+        const result = await this.larkCliClient.getDocumentMetas(batch);
+        const returnedTokens = new Set<string>();
+        for (const meta of result.metas) {
+          const record = recordsByToken.get(meta.docToken);
+          if (!record) continue;
+          returnedTokens.add(meta.docToken);
+          // A successful response without a modification timestamp still
+          // cannot answer the only question this fast check is responsible
+          // for. Put it through the same tightly bounded fallback path.
+          if (meta.latestModifyTime == null) {
+            failedTokens.add(meta.docToken);
+            fallbackTokens.add(meta.docToken);
+            continue;
+          }
+          // Drive recovered (or access was granted) — do not retain a stale
+          // negative-cache entry from an earlier detail fallback failure.
+          this.fastFallbackRetryAt.delete(meta.docToken);
+          observations.push({
+            wikiNodeToken: record.wikiNodeToken ?? '',
+            objToken: record.objToken,
+            objType: this.normalizeObjType(meta.docType as LarkCliNodeInfo['obj_type']),
+            title: meta.title || record.title,
+            spaceId: record.spaceId ?? null,
+            parentNodeToken: record.parentNodeToken ?? null,
+            watchedRootId: record.watchedRootId || rootToken,
+            watchedRootUrl: record.watchedRootUrl ?? rootUrl,
+            observedObjEditTime: meta.latestModifyTime,
+            hasChild: record.hasChild === true,
+            observationStatus: 'available',
+          });
+        }
+        for (const failed of result.failed) {
+          if (!returnedTokens.has(failed.docToken)) {
+            failedTokens.add(failed.docToken);
+            fallbackTokens.add(failed.docToken);
+          }
+        }
+        // A missing response entry has no safe deletion meaning. Keep it out
+        // of the comparison and expose it as incomplete instead.
+        for (const request of batch) {
+          if (!returnedTokens.has(request.docToken)) {
+            failedTokens.add(request.docToken);
+            fallbackTokens.add(request.docToken);
+          }
+        }
+      } catch (error) {
+        console.warn(
+          `[ChangeDetector] Fast metadata batch failed for ${batch.length} document(s):`,
+          error,
+        );
+        for (const request of batch) failedTokens.add(request.docToken);
+      }
+    }
+
+    // Drive can reject individual documents for permission or legacy-type
+    // reasons even while the rest of the batch succeeds. A bounded Wiki
+    // fallback retains useful coverage for those exceptions without
+    // recreating the former one-request-per-document scan. A complete batch
+    // failure deliberately does not enter this loop: retrying all 200 nodes
+    // individually after a rate-limit/outage would make the incident worse.
+    const fallbackNow = Date.now();
+    const fallbackList = Array.from(fallbackTokens).filter((objToken) => {
+      const retryAt = this.fastFallbackRetryAt.get(objToken) ?? 0;
+      return retryAt <= fallbackNow;
+    });
+    const cooldownSkipped = fallbackTokens.size - fallbackList.length;
+    if (fallbackList.length > FAST_DETAIL_FALLBACK_MAX) {
+      console.warn(
+        `[ChangeDetector] Fast check has ${fallbackList.length} metadata exceptions; ` +
+        `Wiki fallback is capped at ${FAST_DETAIL_FALLBACK_MAX}, leaving the rest incomplete.`,
+      );
+    }
+    if (cooldownSkipped > 0) {
+      console.info(
+        `[ChangeDetector] Skipping ${cooldownSkipped} known-unavailable metadata fallback(s) until retry cooldown expires.`,
+      );
+    }
+    for (const objToken of fallbackList.slice(0, FAST_DETAIL_FALLBACK_MAX)) {
+      const record = recordsByToken.get(objToken);
+      if (!record) continue;
+      const detail = await this.fetchNodeDetail(
+        record.spaceId ?? '',
+        record.wikiNodeToken || record.objToken,
+        rootUrl,
+      );
+      if (!detail.node) {
+        this.fastFallbackRetryAt.set(objToken, fallbackNow + FAST_DETAIL_FALLBACK_RETRY_MS);
+        continue;
+      }
+
+      const observedObjEditTime = detail.node.obj_edit_time ?? null;
+      observations.push({
+        wikiNodeToken: record.wikiNodeToken ?? detail.node.node_token,
+        objToken: record.objToken,
+        objType: this.normalizeObjType(detail.node.obj_type),
+        title: detail.node.title || record.title,
+        spaceId: detail.node.space_id ?? record.spaceId ?? null,
+        parentNodeToken: detail.node.parent_node_token ?? record.parentNodeToken ?? null,
+        watchedRootId: record.watchedRootId || rootToken,
+        watchedRootUrl: record.watchedRootUrl ?? rootUrl,
+        observedObjEditTime,
+        hasChild: detail.node.has_child ?? (record.hasChild === true),
+        observationStatus: observedObjEditTime == null ? 'unavailable' : 'available',
+      });
+      if (observedObjEditTime != null) {
+        failedTokens.delete(objToken);
+        this.fastFallbackRetryAt.delete(objToken);
+      } else {
+        this.fastFallbackRetryAt.set(objToken, fallbackNow + FAST_DETAIL_FALLBACK_RETRY_MS);
+      }
+    }
+
+    const changedDocuments = await this.compareWithLocalRecords(observations, {
+      rootToken,
+      watchedRootUrl: rootUrl,
+      // The fast path checks known documents only. It must never use an
+      // absent metadata entry as evidence that a Wiki node was deleted.
+      traversalComplete: false,
+    });
+    const missingCandidates = this.localMapStore.listMissingCandidates
+      ? this.localMapStore.listMissingCandidates().filter(
+          (record: DocumentRecord) =>
+            record.watchedRootUrl === rootUrl || record.watchedRootId === rootToken,
+        ).length
+      : 0;
+
+    return {
+      changed: changedDocuments.length > 0,
+      changedDocuments,
+      checkedAt: new Date().toISOString(),
+      totalNodes: tracked.length,
+      traversalComplete: false,
+      failedNodeTokens: Array.from(failedTokens),
+      missingCandidates,
+    };
+  }
+
+  private rootTokenFromUrl(rootUrl: string): string {
+    try {
+      const pathname = new URL(rootUrl).pathname;
+      const token = pathname.split('/').filter(Boolean).pop();
+      return token || rootUrl;
+    } catch {
+      return rootUrl;
+    }
+  }
+
+  private toDriveMetaDocType(objType: DocumentRecord['objType']): string | null {
+    return ['doc', 'docx', 'sheet', 'bitable', 'mindnote', 'file', 'wiki', 'folder', 'slides']
+      .includes(objType)
+      ? objType
+      : null;
   }
 
   /**
@@ -641,7 +937,11 @@ export class ChangeDetector {
         observationStatus: node.obj_edit_time == null ? 'unavailable' : 'available',
       };
     });
-    const parentChains = this.projectParentChains(observations, rootToken);
+    const parentChains = await this.projectParentChains(
+      observations,
+      rootToken,
+      options.watchedRootUrl ?? null,
+    );
 
     // Pass 1: cloud observation -> persistent state machine. This is the
     // only code path that updates observed time; it never writes the synced
@@ -705,6 +1005,7 @@ export class ChangeDetector {
         if (
           state === 'pending_added' ||
           state === 'restricted' ||
+          state === 'feishu_pending' ||
           state === 'deleted_confirmed' ||
           local.cloudDeleted === 1
         ) {
@@ -766,13 +1067,26 @@ export class ChangeDetector {
    * which is fail-closed (`missing-parent-chain`) rather than being mistaken
    * for the watched root body.
    */
-  private projectParentChains(
+  private async projectParentChains(
     observations: CloudNodeObservation[],
     rootToken: string,
-  ): Map<string, ParentChainProjection | null> {
+    watchedRootUrl: string | null,
+  ): Promise<Map<string, ParentChainProjection | null>> {
+    // `wiki +node-list` normally contains every ancestor, but the observed
+    // failures show it can stop at a branch whose `has_child` is missing or
+    // stale. Query only parent tokens referenced by the CURRENT traversal;
+    // using SQLite here would fabricate an old path after a cloud move.
+    const hierarchyNodes = await this.hydrateMissingParentObservations(
+      observations,
+      rootToken,
+      watchedRootUrl,
+    );
+    const hierarchyObservations = hierarchyNodes.length > 0
+      ? [...observations, ...hierarchyNodes]
+      : observations;
     const byNodeToken = new Map<string, CloudNodeObservation>();
     const duplicateTokens = new Set<string>();
-    for (const observation of observations) {
+    for (const observation of hierarchyObservations) {
       if (byNodeToken.has(observation.wikiNodeToken)) {
         duplicateTokens.add(observation.wikiNodeToken);
       }
@@ -833,6 +1147,79 @@ export class ChangeDetector {
       resolve(nodeToken);
     }
     return memo;
+  }
+
+  /**
+   * Recover only absent ancestors needed for local path planning.
+   *
+   * Recovered nodes are deliberately NOT sent through recordCloudObservation:
+   * they are hierarchy evidence for this detect, not a replacement for the
+   * node-list traversal's membership set. That separation prevents a partial
+   * repair from affecting deletion inference or creating a phantom changed
+   * document.
+   */
+  private async hydrateMissingParentObservations(
+    observations: CloudNodeObservation[],
+    rootToken: string,
+    watchedRootUrl: string | null,
+  ): Promise<CloudNodeObservation[]> {
+    if (!watchedRootUrl) return [];
+
+    const known = new Map<string, CloudNodeObservation>();
+    for (const observation of observations) {
+      if (observation.wikiNodeToken) known.set(observation.wikiNodeToken, observation);
+    }
+
+    const queue: string[] = [];
+    const queued = new Set<string>();
+    const enqueue = (token: string | null | undefined) => {
+      if (!token || token === rootToken || known.has(token) || queued.has(token)) return;
+      queued.add(token);
+      queue.push(token);
+    };
+    for (const observation of observations) enqueue(observation.parentNodeToken);
+
+    const recovered: CloudNodeObservation[] = [];
+    let attempts = 0;
+    const fallbackSpaceId = observations.find((observation) => observation.spaceId)?.spaceId ?? '';
+
+    while (queue.length > 0 && attempts < MAX_PARENT_CHAIN_REPAIRS) {
+      const requestedToken = queue.shift()!;
+      attempts += 1;
+      const detail = await this.fetchNodeDetail(fallbackSpaceId ?? '', requestedToken, watchedRootUrl);
+      if (!detail.node) continue;
+
+      const nodeToken = detail.node.node_token || requestedToken;
+      if (!nodeToken || known.has(nodeToken)) continue;
+      // A title and an object identity are the minimum trustworthy evidence
+      // needed to turn a remote node into a local directory segment.
+      if (!detail.node.obj_token || !detail.node.title?.trim()) continue;
+
+      const recoveredObservation: CloudNodeObservation = {
+        wikiNodeToken: nodeToken,
+        objToken: detail.node.obj_token,
+        objType: this.normalizeObjType(detail.node.obj_type),
+        title: detail.node.title,
+        spaceId: detail.node.space_id || fallbackSpaceId || null,
+        observedObjEditTime: detail.node.obj_edit_time ?? null,
+        hasChild: !!detail.node.has_child,
+        parentNodeToken: detail.node.parent_node_token ?? null,
+        watchedRootId: rootToken,
+        watchedRootUrl,
+        observationStatus: detail.observationStatus,
+      };
+      known.set(nodeToken, recoveredObservation);
+      recovered.push(recoveredObservation);
+      enqueue(recoveredObservation.parentNodeToken);
+    }
+
+    if (queue.length > 0) {
+      console.warn(
+        `[ChangeDetector] Parent-chain repair reached its ${MAX_PARENT_CHAIN_REPAIRS}-node cap; ` +
+        'remaining affected nodes stay safely blocked.',
+      );
+    }
+    return recovered;
   }
 
   private legacyStateFromDocument(document: DocumentRecord): NonNullable<DocumentRecord['syncState']> {

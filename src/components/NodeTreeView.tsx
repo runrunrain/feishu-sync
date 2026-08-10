@@ -26,10 +26,11 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Search, Filter, RefreshCw, AlertTriangle, Cloud, FolderTree } from 'lucide-react';
+import { Search, Filter, RefreshCw, AlertTriangle, Cloud } from 'lucide-react';
 import { Card, CardBody } from './common/Card';
 import { TreeNode } from './TreeNode';
 import { EmptyState } from './common/EmptyState';
+import { TreeViewModeToggle } from './TreeViewModeToggle';
 import { useToast } from './common/Toast';
 import { appLogger } from '../utils/appLogger';
 import { getMappingTree, reorderMapping } from '../api/client';
@@ -98,6 +99,19 @@ interface TreeBucket {
   nodeByWikiToken: Map<string, MappingNode>;
 }
 
+function compareTreeNodes(a: MappingNode, b: MappingNode): number {
+  const sa = a.sortOrder;
+  const sb = b.sortOrder;
+  if (sa != null && sb != null) return sa - sb;
+  if (sa != null) return -1;
+  if (sb != null) return 1;
+  // Fallback: obj_edit_time desc as approximation of Feishu order.
+  const ta = a.obj_edit_time ?? 0;
+  const tb = b.obj_edit_time ?? 0;
+  if (ta !== tb) return tb - ta;
+  return a.title.localeCompare(b.title, 'zh-CN');
+}
+
 function buildTree(nodes: MappingNode[]): TreeBucket {
   const nodeByToken = new Map<string, MappingNode>();
   const nodeByWikiToken = new Map<string, MappingNode>();
@@ -117,21 +131,30 @@ function buildTree(nodes: MappingNode[]): TreeBucket {
   }
   // Sort: sortOrder asc (non-null first), fallback by title.
   for (const [k, arr] of childrenByParent) {
-    arr.sort((a, b) => {
-      const sa = a.sortOrder;
-      const sb = b.sortOrder;
-      if (sa != null && sb != null) return sa - sb;
-      if (sa != null) return -1;
-      if (sb != null) return 1;
-      // Fallback: obj_edit_time desc as approximation of Feishu order
-      const ta = a.obj_edit_time ?? 0;
-      const tb = b.obj_edit_time ?? 0;
-      if (ta !== tb) return tb - ta;
-      return a.title.localeCompare(b.title, 'zh-CN');
-    });
+    arr.sort(compareTreeNodes);
     childrenByParent.set(k, arr);
   }
   return { childrenByParent, nodeByToken, nodeByWikiToken };
+}
+
+/**
+ * A configured watched root can itself have a parent outside the subtree
+ * returned by the API. Rendering only `parent_node_token === null` silently
+ * hid that entire root and all its descendants. Treat an unavailable parent
+ * as a logical root while preserving normal in-subtree hierarchy.
+ */
+export function findRenderableRoots(nodes: MappingNode[]): MappingNode[] {
+  const knownWikiNodeTokens = new Set(
+    nodes
+      .map((node) => node.wiki_node_token)
+      .filter((token): token is string => Boolean(token)),
+  );
+  return nodes
+    .filter((node) => {
+      const parentToken = node.parent_node_token;
+      return !parentToken || !knownWikiNodeTokens.has(parentToken);
+    })
+    .sort(compareTreeNodes);
 }
 
 export function NodeTreeView({
@@ -187,14 +210,14 @@ export function NodeTreeView({
   }, [nodesProp]);
 
   const tree = useMemo(() => buildTree(nodes), [nodes]);
+  const roots = useMemo(() => findRenderableRoots(nodes), [nodes]);
 
-  // Default expand root level (parent_node_token null) and any node with
-  // changed/error status up to depth 2 so changed nodes are visible.
+  // Default expand logical roots and any node with changed/error status up to
+  // depth 2 so changed nodes are visible.
   useEffect(() => {
     setExpanded((prev) => {
       if (prev.size > 0) return prev; // user already toggled; don't override
       const next = new Set<string>();
-      const roots = tree.childrenByParent.get(null) ?? [];
       for (const r of roots) {
         if (r.has_child) next.add(r.obj_token);
       }
@@ -413,8 +436,6 @@ export function NodeTreeView({
     );
   };
 
-  const roots = tree.childrenByParent.get(null) ?? [];
-
   // v0.2.0 structure-align Phase D (D1): group roots by watchedRoot when
   // watchedRoots are provided. Roots that have a watched_root_url are
   // rendered under their watchedRoot's display_name header; roots without
@@ -476,15 +497,15 @@ export function NodeTreeView({
     ).length;
     body = (
       <>
-        <div className="max-h-full overflow-auto scrollbar-thin pr-1">
+        <div className="max-h-full overflow-x-hidden overflow-y-auto scrollbar-thin pr-1">
           {groupedRoots ? (
             <>
               {groupedRoots.groups.map((g) => (
                 <div key={g.watchedRoot.url} className="mb-2">
-                  <div className="sticky top-0 z-10 bg-card-bg/95 backdrop-blur-sm px-2 py-1.5 border-b border-line/60 flex items-center gap-2">
+                  <div className="sticky top-0 z-10 min-w-0 bg-card-bg/95 backdrop-blur-sm px-2 py-1.5 border-b border-line/60 flex items-center gap-2">
                     <Cloud className="w-3.5 h-3.5 text-seal shrink-0" />
                     <span
-                      className="text-xs font-medium text-ink truncate"
+                      className="min-w-0 flex-1 text-xs font-medium text-ink truncate"
                       style={{ fontFamily: 'var(--kai)' }}
                       title={g.watchedRoot.url}
                     >
@@ -510,8 +531,8 @@ export function NodeTreeView({
             roots.map((r) => renderNode(r, 0))
           )}
         </div>
-        <div className="mt-3 pt-3 border-t border-line text-xs text-ink-faint font-sans-ui flex items-center justify-between">
-          <span>{nodes.length} 节点 · {roots.length} 顶层 · {changedCount} 变更</span>
+        <div className="mt-3 pt-3 border-t border-line text-xs text-ink-faint font-sans-ui flex min-w-0 items-center justify-between gap-2">
+          <span className="min-w-0 truncate">{nodes.length} 节点 · {roots.length} 顶层 · {changedCount} 变更</span>
           <button
             type="button"
             onClick={fetchTree}
@@ -529,7 +550,7 @@ export function NodeTreeView({
   }
 
   return (
-    <Card variant="default" className={`flex flex-col ${className}`}>
+    <Card variant="default" className={`min-w-0 flex flex-col ${className}`}>
       {/*
         节点树容器布局重构（2026-06-19）：
         - 搜索栏 px-3 py-2→px-4 py-3，与 Card 内边距一致
@@ -539,40 +560,7 @@ export function NodeTreeView({
       */}
       {view && onViewChange && (
         <div className="px-4 pt-3 pb-2 border-b border-line">
-          <div
-            role="tablist"
-            aria-label="节点树视图"
-            className="inline-flex items-center rounded-md border border-line bg-paper p-0.5 text-xs font-sans-ui"
-          >
-            <button
-              type="button"
-              role="tab"
-              aria-selected={view === 'feishu'}
-              onClick={() => onViewChange('feishu')}
-              className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-[5px] transition-colors ${
-                view === 'feishu'
-                  ? 'bg-seal text-white shadow-sm'
-                  : 'text-ink-soft hover:text-ink'
-              }`}
-            >
-              <Cloud className="w-3.5 h-3.5" />
-              飞书视图
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={view === 'local'}
-              onClick={() => onViewChange('local')}
-              className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-[5px] transition-colors ${
-                view === 'local'
-                  ? 'bg-seal text-white shadow-sm'
-                  : 'text-ink-soft hover:text-ink'
-              }`}
-            >
-              <FolderTree className="w-3.5 h-3.5" />
-              本地视图
-            </button>
-          </div>
+          <TreeViewModeToggle view={view} onViewChange={onViewChange} />
           <p className="mt-1.5 text-[11px] text-ink-faint font-sans-ui">
             {view === 'feishu'
               ? '按飞书节点结构组织（过滤本地独有文件）'
@@ -580,23 +568,23 @@ export function NodeTreeView({
           </p>
         </div>
       )}
-      <div className="px-4 py-3 border-b border-line flex items-center gap-2.5">
-        <div className="flex-1 flex items-center gap-2 px-2.5 py-1.5 rounded-md border border-line bg-paper focus-within:border-seal">
+      <div className="flex flex-wrap items-center gap-2 border-b border-line px-4 py-3">
+        <div className="flex min-w-0 flex-1 basis-[120px] items-center gap-2 rounded-md border border-line bg-paper px-2.5 py-1.5 focus-within:border-seal">
           <Search className="w-3.5 h-3.5 text-ink-faint" />
           <input
             type="text"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder="搜索节点…"
-            className="flex-1 bg-transparent text-sm text-ink placeholder:text-ink-faint focus:outline-none font-sans-ui"
+            className="min-w-0 flex-1 bg-transparent text-sm text-ink placeholder:text-ink-faint focus:outline-none font-sans-ui"
           />
         </div>
-        <div className="flex items-center gap-1.5">
+        <div className="flex shrink-0 items-center gap-1.5">
           <Filter className="w-3.5 h-3.5 text-ink-faint" />
           <select
             value={filter}
             onChange={(e) => setFilter(e.target.value as TreeFilter)}
-            className="text-xs text-ink-soft bg-paper border border-line rounded-md px-2 py-1.5 font-sans-ui focus:outline-none focus:border-seal"
+            className="max-w-[72px] text-xs text-ink-soft bg-paper border border-line rounded-md px-2 py-1.5 font-sans-ui focus:outline-none focus:border-seal"
           >
             {(Object.keys(FILTER_LABEL) as TreeFilter[]).map((f) => (
               <option key={f} value={f}>{FILTER_LABEL[f]}</option>

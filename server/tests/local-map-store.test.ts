@@ -60,6 +60,7 @@ describe('LocalMapStore runtime schema', () => {
     expect([...tables]).toEqual(expect.arrayContaining([
       'documents',
       'localDirs',
+      'feishu_pending_items',
       'sheet_sheets',
       'schema_migrations',
       'sync_log',
@@ -184,6 +185,72 @@ describe('LocalMapStore runtime schema', () => {
       cloudDeleted: 1,
     });
     expect(store.confirmMissingCandidateDeletion('doc-1', '2026-07-17T00:07:00.000Z')).toBe(false);
+    store.close();
+  });
+
+  it('keeps Feishu-side failures out of normal state transitions until an explicit recheck succeeds', () => {
+    const dbPath = createDatabasePath();
+    const store = new LocalMapStore(dbPath);
+    store.initialize();
+
+    const observation = {
+      objToken: 'restricted-doc',
+      wikiNodeToken: 'restricted-node',
+      objType: 'docx' as const,
+      title: '需要授权的文档',
+      spaceId: 'space-1',
+      parentNodeToken: 'root-1',
+      watchedRootId: 'root-1',
+      watchedRootUrl: 'https://tenant.feishu.cn/wiki/root-1',
+      observedObjEditTime: 100,
+      hasChild: false,
+      observationStatus: 'available' as const,
+    };
+
+    store.recordCloudObservation({ ...observation, lastSeenAt: '2026-07-17T00:00:00.000Z' });
+    store.markDocumentSynced({
+      objToken: observation.objToken,
+      syncedObjEditTime: 100,
+      localMdPath: '/tmp/restricted-doc.md',
+      localRelPath: '需要授权的文档.md',
+    });
+    store.recordFeishuPending({
+      objToken: observation.objToken,
+      title: observation.title,
+      watchedRootId: observation.watchedRootId,
+      reasonCode: 'permission_denied',
+      error: '无权限访问该节点',
+      suggestedResolution: '请在飞书中授予当前 lark-cli 用户访问权限。',
+      repairAction: 'grant_access',
+    });
+
+    expect(store.listFeishuPending()).toEqual([
+      expect.objectContaining({
+        objToken: observation.objToken,
+        reasonCode: 'permission_denied',
+        repairAction: 'grant_access',
+        recheckRequestedAt: null,
+      }),
+    ]);
+    expect(store.getDocumentByObjToken(observation.objToken)).toMatchObject({
+      syncState: 'feishu_pending',
+      status: 'error',
+    });
+
+    // Normal polls keep the issue suppressed; they cannot turn it back into a
+    // recurring added/modified change.
+    expect(store.recordCloudObservation({
+      ...observation,
+      lastSeenAt: '2026-07-17T00:01:00.000Z',
+    })).toMatchObject({ syncState: 'feishu_pending' });
+    expect(store.listFeishuPending()).toHaveLength(1);
+
+    expect(store.requestFeishuPendingRecheck(['root-1'])).toBe(1);
+    expect(store.recordCloudObservation({
+      ...observation,
+      lastSeenAt: '2026-07-17T00:02:00.000Z',
+    })).toMatchObject({ syncState: 'synced' });
+    expect(store.listFeishuPending()).toHaveLength(0);
     store.close();
   });
 

@@ -182,7 +182,27 @@ npm run desktop:dist:win:x64
 # macOS 打包（需 macOS 环境）
 npm run desktop:dist:mac:x64    # Intel
 npm run desktop:dist:mac:arm64  # Apple Silicon
+
+# 可分发正式包（Developer ID 签名 + Apple 公证）
+npm run desktop:dist:mac:x64:release
+npm run desktop:dist:mac:arm64:release
 ```
+
+普通 macOS 命令生成完整的 ad-hoc 签名包，适合在构建机本地测试。对外分发必须使用
+`:release` 命令，并提前配置 Developer ID Application 证书和 Apple 公证凭据。
+正式构建会强制检查签名、Gatekeeper 评估和 DMG 公证票据，任一步失败都会让构建失败，
+避免发布 macOS 会拦截的产物。
+
+推荐使用 App Store Connect API Key 配置公证：
+
+```bash
+export APPLE_API_KEY="/absolute/path/to/AuthKey_XXXXXXXXXX.p8"
+export APPLE_API_KEY_ID="XXXXXXXXXX"
+export APPLE_API_ISSUER="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+```
+
+签名证书可安装到当前钥匙串，或通过 electron-builder 支持的
+`CSC_LINK` / `CSC_KEY_PASSWORD` 提供。
 
 **打包产物**：`dist/FeishuSync-Setup-0.1.0-x64.exe`（Windows NSIS，~99MB）
 

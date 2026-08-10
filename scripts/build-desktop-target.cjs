@@ -17,7 +17,7 @@
  *   node scripts/build-desktop-target.js --platform darwin --arch arm64
  */
 
-const { execSync } = require('node:child_process');
+const { execFileSync, execSync } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
 
@@ -42,9 +42,12 @@ function parseArgs() {
 }
 
 const params = parseArgs();
-const skipServerDeps = params.skipServerDeps || process.env.DESKTOP_SKIP_SERVER_DEPS;
+const skipServerDeps = params.skipServerDeps || params['skip-server-deps'] || process.env.DESKTOP_SKIP_SERVER_DEPS;
 const platform = params.platform || process.env.DESKTOP_TARGET_PLATFORM;
 const arch = params.arch || process.env.DESKTOP_TARGET_ARCH;
+const macSigningMode = String(
+  params.macSigning || params['mac-signing'] || process.env.DESKTOP_MAC_SIGNING || 'adhoc'
+).toLowerCase();
 
 if (!platform || !arch) {
   console.error('Usage: node build-desktop-target.js --platform <win32|darwin> --arch <x64|arm64>');
@@ -58,6 +61,11 @@ if (!['win32', 'darwin'].includes(platform)) {
 
 if (!['x64', 'arm64'].includes(arch)) {
   console.error(`Unsupported arch: ${arch}`);
+  process.exit(1);
+}
+
+if (!['adhoc', 'release'].includes(macSigningMode)) {
+  console.error(`Unsupported macOS signing mode: ${macSigningMode}. Expected "adhoc" or "release".`);
   process.exit(1);
 }
 
@@ -75,6 +83,7 @@ process.env.DESKTOP_TARGET_PLATFORM = platform;
 process.env.DESKTOP_TARGET_ARCH = arch;
 process.env.DESKTOP_APP_DIR = appDir;
 process.env.DESKTOP_OUTPUT_DIR = outputDir;
+process.env.DESKTOP_MAC_SIGNING = macSigningMode;
 
 // ========== Utility Functions ==========
 
@@ -107,12 +116,90 @@ function checkSuccess(result, stepName) {
   console.log(`\n✅ ${stepName} completed`);
 }
 
+function hasCompleteNotarizationCredentials() {
+  const env = process.env;
+  return Boolean(
+    (env.APPLE_API_KEY && env.APPLE_API_KEY_ID && env.APPLE_API_ISSUER)
+      || (env.APPLE_ID && env.APPLE_APP_SPECIFIC_PASSWORD && env.APPLE_TEAM_ID)
+      || env.APPLE_KEYCHAIN_PROFILE
+  );
+}
+
+function hasCodeSigningIdentity() {
+  if (process.env.CSC_LINK) {
+    return true;
+  }
+
+  try {
+    const output = execFileSync(
+      'security',
+      ['find-identity', '-v', '-p', 'codesigning'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }
+    );
+    return /Developer ID Application:/.test(output);
+  } catch {
+    return false;
+  }
+}
+
+function verifyMacPackage() {
+  const appPath = path.resolve(outputDir, `mac-${arch}`, 'Feishu Sync.app');
+  if (!fs.existsSync(appPath)) {
+    throw new Error(`Packaged macOS app not found: ${appPath}`);
+  }
+
+  execFileSync(
+    'codesign',
+    ['--verify', '--deep', '--strict', '--verbose=2', appPath],
+    { stdio: 'inherit' }
+  );
+  console.log(`✅ macOS bundle signature is internally valid (${macSigningMode})`);
+
+  if (macSigningMode !== 'release') {
+    console.log('ℹ️  This is an ad-hoc signed local build. Use a :release script for distribution.');
+    return;
+  }
+
+  execFileSync(
+    'spctl',
+    ['--assess', '--type', 'execute', '--verbose=2', appPath],
+    { stdio: 'inherit' }
+  );
+
+  execFileSync(
+    'xcrun',
+    ['stapler', 'validate', appPath],
+    { stdio: 'inherit' }
+  );
+  console.log('✅ Developer ID signature, Gatekeeper assessment and app notarization ticket verified');
+}
+
 // ========== Build Steps ==========
 
 async function main() {
   const startTime = Date.now();
 
   try {
+    if (platform === 'darwin') {
+      console.log(`macOS signing mode: ${macSigningMode}`);
+      if (macSigningMode === 'release') {
+        if (!hasCodeSigningIdentity()) {
+          throw new Error(
+            'Release build requires a Developer ID Application certificate '
+            + 'in the keychain or CSC_LINK/CSC_KEY_PASSWORD.'
+          );
+        }
+        if (!hasCompleteNotarizationCredentials()) {
+          throw new Error(
+            'Release build requires Apple notarization credentials. Configure '
+            + 'APPLE_API_KEY + APPLE_API_KEY_ID + APPLE_API_ISSUER (recommended), '
+            + 'APPLE_ID + APPLE_APP_SPECIFIC_PASSWORD + APPLE_TEAM_ID, '
+            + 'or APPLE_KEYCHAIN_PROFILE.'
+          );
+        }
+      }
+    }
+
     // Step 1: Build frontend + server
     logStep('Step 1: Build frontend (vite) + server (tsc)');
     const buildAllResult = run('npm run build:all');
@@ -264,6 +351,10 @@ async function main() {
         const stats = fs.statSync(fpath);
         console.log(`   - ${f} (${(stats.size / 1024 / 1024).toFixed(2)} MB)`);
       }
+    }
+
+    if (platform === 'darwin') {
+      verifyMacPackage();
     }
 
     // Verify extraResources (icons)

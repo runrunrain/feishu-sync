@@ -29,6 +29,10 @@ import { feishuRoutes } from './routes/feishu.js';
 import { mappingRoutes } from './routes/mapping.js';
 import { trashRoutes } from './routes/trash.js';
 import { llmRoutes } from './routes/llm.js';
+import { opencodeRoutes } from './routes/opencode.js';
+import { OpenCodeCliService } from './modules/opencode-cli-service.js';
+import { claudeRoutes } from './routes/claude.js';
+import { ClaudeCliService } from './modules/claude-cli-service.js';
 import type { LarkCliConfig } from './types/index.js';
 
 // ============================================================================
@@ -90,6 +94,14 @@ export async function buildServer(options: CreateServerOptions = {}) {
   const configManager = new ConfigManager(configPath);
   console.info('[server] ConfigManager initialized');
 
+  // Load the user configuration before constructing LarkCliClient. The
+  // previous order constructed the client from hard-coded defaults and never
+  // passed through config.larkCliPath, so the setting shown in the desktop UI
+  // had no effect in the packaged application.
+  console.info('[server] Loading config');
+  const config = await configManager.load();
+  console.info('[server] Config loaded');
+
   console.info('[server] Initializing LocalMapStore');
   const dbPath = path.join(os.homedir(), '.feishu-sync', 'feishu-sync.db');
   console.info('[server] Database path:', dbPath);
@@ -97,9 +109,9 @@ export async function buildServer(options: CreateServerOptions = {}) {
   console.info('[server] LocalMapStore initialized');
 
   console.info('[server] Initializing LarkCliClient');
-  const defaultLarkCliConfig: LarkCliConfig = {
+  const larkCliConfig: LarkCliConfig = {
     // Keep aligned with ConfigManager DEFAULT_REQUIRED_SCOPES (min sync boundary).
-    requiredScopes: [
+    requiredScopes: config.requiredScopes.length > 0 ? config.requiredScopes : [
       'wiki:node:retrieve',
       'wiki:space:retrieve',
       'docs:document.content:read',
@@ -111,19 +123,20 @@ export async function buildServer(options: CreateServerOptions = {}) {
       'offline_access',
     ],
     timeout: 30000,
+    larkCliPath: config.larkCliPath,
   };
-  const larkCliClient = new LarkCliClient(defaultLarkCliConfig);
+  const larkCliClient = new LarkCliClient(larkCliConfig);
   console.info('[server] LarkCliClient initialized');
+
+  // Keep a single service instance so explicit global installation is
+  // serialized even when the settings button is clicked repeatedly.
+  const openCodeCliService = new OpenCodeCliService();
+  const claudeCliService = new ClaudeCliService();
 
   // Initialize database schema
   console.info('[server] Initializing database schema');
   localMapStore.initialize();
   console.info('[server] Database schema initialized');
-
-  // Load config for validation (will throw if not exists)
-  console.info('[server] Loading config');
-  await configManager.load();
-  console.info('[server] Config loaded');
 
   // Initialize ChangeDetector
   console.info('[server] Initializing ChangeDetector');
@@ -168,6 +181,8 @@ export async function buildServer(options: CreateServerOptions = {}) {
     (c as any).larkCliClient = larkCliClient;
     (c as any).localMapStore = localMapStore;
     (c as any).changeDetector = changeDetector;
+    (c as any).openCodeCliService = openCodeCliService;
+    (c as any).claudeCliService = claudeCliService;
 
     // Inject desktopToken for auth middleware via context property
     if (desktopMode) {
@@ -202,6 +217,8 @@ export async function buildServer(options: CreateServerOptions = {}) {
   app.route('/', mappingRoutes);
   app.route('/', trashRoutes);
   app.route('/', llmRoutes);
+  app.route('/', opencodeRoutes);
+  app.route('/', claudeRoutes);
   console.info('[server] Protected routes registered');
 
   // ============================================================================

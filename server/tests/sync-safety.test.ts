@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { SyncEngine } from '../src/modules/sync-engine.js';
 import {
+  createOperationManifest,
   createKnowledgeBaseAudit,
   fallbackMarkdownTarget,
   resolveOperationDirectory,
@@ -148,7 +149,12 @@ describe('P0 sync write safety', () => {
       }),
     ]);
     expect(result.failedDocuments).toEqual([
-      expect.objectContaining({ objToken: 'unknown-pptx-token', retryable: false }),
+      expect.objectContaining({
+        objToken: 'unknown-pptx-token',
+        retryable: false,
+        reasonCode: 'unsupported_type',
+        repairAction: 'enable_export_adapter',
+      }),
     ]);
     expect(calls.logSync).toBe(0);
     expect(fs.existsSync(knowledgeBaseRoot)).toBe(false);
@@ -174,6 +180,83 @@ describe('P0 sync write safety', () => {
       expect.objectContaining({ objToken: 'doc-b', action: 'blocked', localMdPath: null }),
     ]);
     expect(result.failedDocuments).toHaveLength(2);
+  });
+
+  it('requires an explicit, title-verified recovery action before adopting a legacy profile file', () => {
+    const temporaryRoot = makeTempDirectory('feishu-sync-adopt-legacy-');
+    const knowledgeBaseRoot = path.join(temporaryRoot, 'knowledge-base');
+    const localDir = path.join(knowledgeBaseRoot, '资料');
+    const legacyFile = path.join(localDir, '旧同步文档.md');
+    fs.mkdirSync(localDir, { recursive: true });
+    fs.writeFileSync(legacyFile, '<!-- 来源：飞书文档 -->\n\n# 旧同步文档\n\n历史内容\n', 'utf-8');
+
+    const options = {
+      knowledgeBaseRoot,
+      mode: 'dry-run' as const,
+      watchedRoots: [{
+        id: 'watched-root',
+        url: 'https://example.feishu.cn/wiki/watched-root',
+        localDir: '资料',
+        layoutProfile: 'mirror-title-file' as const,
+        enabled: true,
+      }],
+      documents: [makeDocument({
+        watchedRootId: 'watched-root',
+        parentChainTitles: [],
+        title: '旧同步文档',
+      })],
+    };
+
+    const safeDefault = createOperationManifest(options);
+    expect(safeDefault.documents[0]).toMatchObject({
+      action: 'blocked',
+      reasonCode: 'path_conflict',
+      localMdPath: null,
+    });
+
+    const recoveryPlan = createOperationManifest({
+      ...options,
+      adoptExistingProfileTargets: true,
+    });
+    expect(recoveryPlan.documents[0]).toMatchObject({
+      action: 'replace',
+      localMdPath: legacyFile,
+      localRelPath: '资料/旧同步文档.md',
+      pathSource: 'layout-profile',
+    });
+  });
+
+  it('does not adopt a title-mismatched local file even in explicit recovery mode', () => {
+    const temporaryRoot = makeTempDirectory('feishu-sync-reject-adopt-');
+    const knowledgeBaseRoot = path.join(temporaryRoot, 'knowledge-base');
+    const localDir = path.join(knowledgeBaseRoot, '资料');
+    fs.mkdirSync(localDir, { recursive: true });
+    fs.writeFileSync(path.join(localDir, '云端标题.md'), '# 私人草稿\n', 'utf-8');
+
+    const plan = createOperationManifest({
+      knowledgeBaseRoot,
+      mode: 'dry-run',
+      adoptExistingProfileTargets: true,
+      watchedRoots: [{
+        id: 'watched-root',
+        url: 'https://example.feishu.cn/wiki/watched-root',
+        localDir: '资料',
+        layoutProfile: 'mirror-title-file',
+        enabled: true,
+      }],
+      documents: [makeDocument({
+        watchedRootId: 'watched-root',
+        parentChainTitles: [],
+        title: '云端标题',
+      })],
+    });
+
+    expect(plan.documents[0]).toMatchObject({
+      action: 'blocked',
+      reasonCode: 'path_conflict',
+      localMdPath: null,
+    });
+    expect(plan.documents[0]?.reason).toContain('未找到与云端标题一致');
   });
 
   it('refuses to store operation artefacts inside the knowledge base', () => {

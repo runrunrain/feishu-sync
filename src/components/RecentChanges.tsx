@@ -8,6 +8,7 @@ import { FileText, Table, FileType, ArrowRight, Clock, Inbox } from 'lucide-reac
 import { Card, CardHeader, CardBody } from './common/Card';
 import { StatusBadge } from './common/StatusBadge';
 import type { ChangedDocument } from '../types';
+import { formatCloudModifiedTime } from '../utils/cloudTime';
 
 interface RecentChangesProps {
   changes: ChangedDocument[];
@@ -27,16 +28,6 @@ const STATE_LABEL = {
   modified: '已修改',
   deleted: '已删除',
 };
-
-function formatRelativeTime(unixSecondsStr: string): string {
-  const t = parseInt(unixSecondsStr, 10);
-  if (!Number.isFinite(t)) return '--';
-  const diff = Math.max(0, Math.floor(Date.now() / 1000) - t);
-  if (diff < 3600) return `${Math.max(1, Math.floor(diff / 60))} 分钟前`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`;
-  if (diff < 86400 * 30) return `${Math.floor(diff / 86400)} 天前`;
-  return new Date(t * 1000).toISOString().slice(0, 10);
-}
 
 export function RecentChanges({
   changes,
@@ -85,7 +76,7 @@ export function RecentChanges({
                 </StatusBadge>
                 <span className="shrink-0 flex items-center gap-1 text-[11px] text-ink-faint font-mono">
                   <Clock className="w-3 h-3" />
-                  {formatRelativeTime(c.cloudModifiedTime)}
+                  {formatCloudModifiedTime(c.cloudModifiedTime)}
                 </span>
               </div>
             );

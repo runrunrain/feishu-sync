@@ -27,6 +27,8 @@ import type { LocalMapStore } from './local-map-store.js';
 import type { SnapshotService } from './snapshot-service.js';
 import type { ConfigManager } from './config-manager.js';
 import type {
+  ChangedDocument,
+  DocumentRecord,
   DiffReport,
   MappingNode,
   ReorderRequest,
@@ -34,6 +36,16 @@ import type {
   TreeResponse,
   WatchedRoot,
 } from '../types/index.js';
+
+/**
+ * The hierarchy evidence a persisted row needs before it may be planned as a
+ * new local file.  `null` deliberately means "unknown", not an empty chain:
+ * an empty chain is valid only for a direct child of the watched root.
+ */
+interface StoredParentChainProjection {
+  parentChainTitles: string[];
+  isWatchedRootNode: boolean;
+}
 
 export class MappingService {
   constructor(
@@ -53,7 +65,7 @@ export class MappingService {
    * Compute a full DiffReport for a wiki subtree (03 §3.6.2).
    *
    * Flow:
-   *   1. Delegate cloud traversal + three-state comparison to
+   *   1. Delegate a fast cloud metadata check + three-state comparison to
    *      ChangeDetector.detectChanges (which already upserts
    *      parent/space/obj_edit_time/last_seen_at metadata).
    *   2. Bucket changed documents by changeType.
@@ -64,9 +76,13 @@ export class MappingService {
    * did not enter the changed list (i.e. added/modified). deleted
    * nodes are local-side orphans and are NOT subtracted from
    * unchanged — they are surfaced in their own bucket per 03 §3.6.1.
-   */
+  */
   async computeDiff(rootUrl: string): Promise<DiffReport> {
-    const result = await this.changeDetector.detectChanges(rootUrl);
+    // Keep the legacy non-cached endpoint safe for older clients too: a
+    // diff is about whether known mapped files changed, not a request to
+    // rediscover the entire Wiki topology. Full reconciliation remains an
+    // explicit detect route mode.
+    const result = await this.changeDetector.detectChanges(rootUrl, { mode: 'fast' });
     const changed = result.changedDocuments;
 
     const added = changed.filter((c) => c.changeType === 'added');
@@ -89,6 +105,209 @@ export class MappingService {
       totalLocal,
       checkedAt: result.checkedAt,
     };
+  }
+
+  /**
+   * Return the last known diff from SQLite without contacting Feishu.
+   *
+   * UI rendering must never be the thing that starts a cloud traversal:
+   * Dashboard, status badges and the change list can all mount together.
+   * Detection is instead owned by the explicit detect endpoint / tray poller,
+   * which writes these persistent states first. This method is intentionally
+   * read-only and completes in constant local-DB time.
+   */
+  getStoredDiff(rootUrl: string): DiffReport {
+    const rootToken = this.rootTokenFromUrl(rootUrl);
+    const documents = this.localMapStore.getAllDocuments()
+      .filter((document) =>
+        document.watchedRootUrl === rootUrl || document.watchedRootId === rootToken,
+      );
+    // A previous implementation returned only flat document rows here. That
+    // discarded the parent-chain projection supplied by a successful full
+    // detect, so the ordinary UI flow (detect → cached diff → sync) lost the
+    // hierarchy and PathResolver correctly blocked every newly discovered
+    // non-root document as `missing_parent_chain`.
+    //
+    // Rebuild the chain from the authoritative persisted wiki topology. The
+    // resolver is deliberately fail-closed: a missing ancestor, duplicate
+    // wiki-node token, wrong root, or cycle yields null rather than a guessed
+    // root README path. An explicit full recovery still remains available for
+    // genuinely incomplete topology.
+    const hierarchyByObjToken = this.projectStoredParentChains(documents, rootToken);
+    const added: ChangedDocument[] = [];
+    const modified: ChangedDocument[] = [];
+    const deleted: ChangedDocument[] = [];
+    let checkedAt = '';
+
+    for (const document of documents) {
+      if (document.lastSeenAt && document.lastSeenAt > checkedAt) {
+        checkedAt = document.lastSeenAt;
+      }
+
+      const state = this.storedSyncState(document);
+      if (state === 'pending_added') {
+        added.push(this.toStoredChangedDocument(
+          document,
+          'added',
+          hierarchyByObjToken.get(document.objToken) ?? null,
+        ));
+      } else if (state === 'pending_modified') {
+        modified.push(this.toStoredChangedDocument(
+          document,
+          'modified',
+          hierarchyByObjToken.get(document.objToken) ?? null,
+        ));
+      } else if (
+        state === 'missing_candidate' ||
+        state === 'deleted_confirmed' ||
+        document.cloudDeleted === 1
+      ) {
+        deleted.push(this.toStoredChangedDocument(
+          document,
+          'deleted',
+          hierarchyByObjToken.get(document.objToken) ?? null,
+        ));
+      }
+    }
+
+    const liveCount = documents.filter((document) => document.cloudDeleted !== 1).length;
+    return {
+      added,
+      modified,
+      deleted,
+      unchanged: Math.max(0, liveCount - added.length - modified.length),
+      totalCloud: liveCount,
+      totalLocal: documents.length,
+      checkedAt,
+    };
+  }
+
+  private rootTokenFromUrl(rootUrl: string): string {
+    try {
+      return new URL(rootUrl).pathname.split('/').filter(Boolean).pop() || rootUrl;
+    } catch {
+      return rootUrl;
+    }
+  }
+
+  private storedSyncState(document: DocumentRecord): NonNullable<DocumentRecord['syncState']> {
+    if (document.syncState) return document.syncState;
+    if (document.cloudDeleted === 1) return 'missing_candidate';
+    if (document.status === 'error') return 'error';
+    if (document.status === 'placeholder') {
+      return document.cloudMatch === 'restricted' ? 'restricted' : 'pending_added';
+    }
+    return document.status === 'changed' ? 'pending_modified' : 'synced';
+  }
+
+  private toStoredChangedDocument(
+    document: DocumentRecord,
+    changeType: ChangedDocument['changeType'],
+    hierarchy: StoredParentChainProjection | null,
+  ): ChangedDocument {
+    const observed = document.observedObjEditTime ?? document.objEditTime ?? null;
+    const milliseconds = observed != null && observed < 100_000_000_000
+      ? observed * 1000
+      : observed;
+    return {
+      objToken: document.objToken,
+      objType: document.objType,
+      title: document.title,
+      changeType,
+      cloudModifiedTime: milliseconds != null && milliseconds > 0
+        ? new Date(milliseconds).toISOString()
+        : '',
+      localSyncedTime: document.lastSyncedAt || null,
+      localMdPath: document.localMdPath || null,
+      wikiNodeToken: document.wikiNodeToken ?? null,
+      parentNodeToken: document.parentNodeToken ?? null,
+      spaceId: document.spaceId ?? null,
+      watchedRootId: document.watchedRootId ?? null,
+      hasChild: document.hasChild ?? false,
+      observedObjEditTime: observed,
+      syncState: this.storedSyncState(document),
+      parentChainTitles: hierarchy?.parentChainTitles,
+      isWatchedRootNode: hierarchy?.isWatchedRootNode,
+      localRelPath: document.localRelPath ?? null,
+    };
+  }
+
+  /**
+   * Reconstruct parent chains for one watched root from persisted traversal
+   * observations. This performs no cloud requests and never invents a path
+   * from a local filename, which keeps cached-diff rendering safe.
+   */
+  private projectStoredParentChains(
+    documents: DocumentRecord[],
+    rootToken: string,
+  ): Map<string, StoredParentChainProjection | null> {
+    const byWikiNodeToken = new Map<string, DocumentRecord>();
+    const duplicateTokens = new Set<string>();
+    for (const document of documents) {
+      const token = document.wikiNodeToken?.trim();
+      if (!token) continue;
+      if (byWikiNodeToken.has(token)) duplicateTokens.add(token);
+      byWikiNodeToken.set(token, document);
+    }
+
+    const memo = new Map<string, StoredParentChainProjection | null>();
+    const visiting = new Set<string>();
+
+    const resolve = (document: DocumentRecord): StoredParentChainProjection | null => {
+      if (memo.has(document.objToken)) return memo.get(document.objToken) ?? null;
+      const nodeToken = document.wikiNodeToken?.trim();
+      const watchedRootId = document.watchedRootId ?? rootToken;
+      if (!nodeToken || !watchedRootId || duplicateTokens.has(nodeToken)) {
+        memo.set(document.objToken, null);
+        return null;
+      }
+      if (nodeToken === watchedRootId) {
+        const root = { parentChainTitles: [], isWatchedRootNode: true };
+        memo.set(document.objToken, root);
+        return root;
+      }
+      if (visiting.has(document.objToken)) {
+        memo.set(document.objToken, null);
+        return null;
+      }
+
+      const parentToken = document.parentNodeToken?.trim();
+      // A direct child needs no parent row: the configured root token itself
+      // is already sufficient proof that its ancestor chain is empty.
+      if (parentToken === watchedRootId) {
+        const directChild = { parentChainTitles: [], isWatchedRootNode: false };
+        memo.set(document.objToken, directChild);
+        return directChild;
+      }
+      if (!parentToken || duplicateTokens.has(parentToken)) {
+        memo.set(document.objToken, null);
+        return null;
+      }
+
+      const parent = byWikiNodeToken.get(parentToken);
+      if (!parent || (parent.watchedRootId ?? rootToken) !== watchedRootId || !parent.title.trim()) {
+        memo.set(document.objToken, null);
+        return null;
+      }
+
+      visiting.add(document.objToken);
+      const parentProjection = resolve(parent);
+      visiting.delete(document.objToken);
+      if (!parentProjection) {
+        memo.set(document.objToken, null);
+        return null;
+      }
+
+      const projection = {
+        parentChainTitles: [...parentProjection.parentChainTitles, parent.title],
+        isWatchedRootNode: false,
+      };
+      memo.set(document.objToken, projection);
+      return projection;
+    };
+
+    for (const document of documents) resolve(document);
+    return memo;
   }
 
   /**

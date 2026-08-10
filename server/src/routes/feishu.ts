@@ -27,11 +27,7 @@ feishuRoutes.get('/api/feishu/auth-status', async (c) => {
 
   try {
     const result = await larkCliClient.checkAuthReady();
-
-    return c.json({
-      ready: result.ready,
-      error: result.error || null,
-    });
+    return c.json(result);
   } catch (error) {
     return c.json({
       ready: false,

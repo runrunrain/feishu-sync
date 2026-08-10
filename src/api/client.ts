@@ -18,6 +18,10 @@ import type {
   TrashedDoc,
   ChannelTestRequest,
   ChannelTestResult,
+  OpenCodeInstallResult,
+  OpenCodeStatus,
+  ClaudeCliStatus,
+  FeishuPendingItem,
   TreeResponse,
 } from '../types';
 
@@ -128,19 +132,39 @@ export async function getConfig(): Promise<Config> {
  * hiding the entire settings area. This helper unwraps both shapes so the
  * UI is robust to either response style.
  *
- * The server also sanitizes `llm.apiKey` to `'***'` on GET (see GET
- * /api/config). Callers MUST NOT send `llm.apiKey` back unless they have
- * the real value; otherwise the literal `'***'` is persisted, destroying
- * the user's key. `saveConfig` therefore drops `llm.apiKey` from the
- * outbound payload when it still looks masked.
+ * The server sanitizes `llm.apiKey` to `'***'` on GET (see GET
+ * /api/config). `saveConfig` drops that legacy mask from the outbound
+ * payload; provider-profile masks are retained and matched by profile id on
+ * the server so a profile edit never needs to expose its plaintext key.
  */
-export async function saveConfig(config: Partial<Config>): Promise<Config> {
+export type ConfigUpdate = Omit<Partial<Config>, 'llm'> & {
+  /** LLM settings are independently owned by Settings sub-cards. */
+  llm?: Partial<Config['llm']>;
+};
+
+export async function saveConfig(config: ConfigUpdate): Promise<Config> {
   const outbound = sanitizeOutboundConfig(config);
   const data = await request<unknown>('/api/config', {
     method: 'PUT',
     body: JSON.stringify(outbound),
   });
   return unwrapConfigResponse(data);
+}
+
+/**
+ * Explicit, user-initiated reveal for one saved provider credential.
+ * Normal configuration reads remain redacted; callers must never invoke
+ * this in a background refresh or log the returned value.
+ */
+export async function revealProviderApiKey(providerId: string): Promise<string> {
+  const data = await request<{ apiKey?: unknown }>('/api/config/reveal-provider-key', {
+    method: 'POST',
+    body: JSON.stringify({ providerId }),
+  });
+  if (typeof data.apiKey !== 'string') {
+    throw new Error('服务器未返回可显示的 API Key');
+  }
+  return data.apiKey;
 }
 
 /**
@@ -169,10 +193,13 @@ function unwrapConfigResponse(data: unknown): Config {
 }
 
 /**
- * Drop fields the server has masked so we never persist the mask back over
- * the real value. Currently this means `llm.apiKey === '***'`.
+ * Drop the legacy flat field the server has masked so we never persist its
+ * sentinel over the real value. Provider-profile keys intentionally remain
+ * in the payload as `***`: ConfigManager merges each profile by id and keeps
+ * the corresponding stored secret, allowing Settings to save provider/model
+ * edits without ever receiving a plaintext key from GET /api/config.
  */
-function sanitizeOutboundConfig(config: Partial<Config>): OutboundConfigBody {
+function sanitizeOutboundConfig(config: ConfigUpdate): OutboundConfigBody {
   if (!config.llm) return config;
   const llm = { ...config.llm };
   // If the apiKey field still holds the server's mask sentinel, drop only
@@ -195,10 +222,20 @@ export async function getAuthStatus(): Promise<AuthStatus> {
 /**
  * Detect changes in watched URLs
  */
-export async function detectChanges(rootUrl: string): Promise<ChangeDetectionResult> {
+export type DetectionMode = 'fast' | 'full';
+
+/**
+ * `fast` is the normal metadata-only check. `full` is intentionally opt-in
+ * and used only by the structural-repair action, where parent hierarchy must
+ * be reconciled before a new local path can be planned safely.
+ */
+export async function detectChanges(
+  rootUrl: string,
+  options: { mode?: DetectionMode } = {},
+): Promise<ChangeDetectionResult> {
   return request<ChangeDetectionResult>('/api/detect/changes', {
     method: 'POST',
-    body: JSON.stringify({ rootUrl }),
+    body: JSON.stringify({ rootUrl, ...(options.mode ? { mode: options.mode } : {}) }),
   });
 }
 
@@ -232,31 +269,58 @@ export interface MultiRootDetectionResult {
  * correct detect entry point when the user has more than one watchedRoot,
  * which is the default in v0.2.0.
  */
-export async function detectChangesAll(): Promise<MultiRootDetectionResult> {
+export async function detectChangesAll(
+  options: { mode?: DetectionMode } = {},
+): Promise<MultiRootDetectionResult> {
   return request<MultiRootDetectionResult>('/api/detect/changes-all', {
     method: 'POST',
-    body: JSON.stringify({}),
+    body: JSON.stringify(options.mode ? { mode: options.mode } : {}),
   });
 }
 
 /**
- * Run a dry-run for selected documents.
+ * Synchronize explicitly selected documents to the local knowledge base.
  *
- * `fullSync`, LLM adaptation and apply are deliberately not caller-facing
- * options. Their current backend implementations do not provide reliable
- * product semantics, so the client locks them off until that changes.
+ * The server rejects writes unless both `apply` and the literal confirmation
+ * are present. This client is only called after the Sync view has shown the
+ * user a write confirmation, while the server still plans and blocks unsafe
+ * paths (for example, an existing local file with no cloud mapping).
  */
-export async function syncDocs(documents: ChangedDocument[]): Promise<SyncResult> {
+export async function syncDocs(
+  documents: ChangedDocument[],
+  options: { enableLLM?: boolean; adoptExistingProfileTargets?: boolean } = {},
+): Promise<SyncResult> {
   return request<SyncResult>('/api/sync', {
     method: 'POST',
     body: JSON.stringify({
       documents,
       options: {
-        enableLLM: false,
+        enableLLM: options.enableLLM === true,
+        adoptExistingProfileTargets: options.adoptExistingProfileTargets === true,
         fullSync: false,
-        apply: false,
+        apply: true,
+        confirmation: 'APPLY',
       },
     }),
+  });
+}
+
+/** Read durable issues that must be repaired in Feishu before syncing can continue. */
+export async function listFeishuPending(): Promise<FeishuPendingItem[]> {
+  const data = await request<{ items?: FeishuPendingItem[] } | FeishuPendingItem[]>('/api/sync/feishu-pending');
+  return Array.isArray(data) ? data : (data.items ?? []);
+}
+
+/**
+ * Permit one recovery scan after the user has repaired sharing/deletion/type
+ * state in Feishu. This is local bookkeeping only; it never changes Feishu.
+ */
+export async function requestFeishuPendingRecheck(
+  watchedRootIds?: string[],
+): Promise<{ requested: number }> {
+  return request<{ requested: number }>('/api/sync/feishu-pending/recheck', {
+    method: 'POST',
+    body: JSON.stringify(watchedRootIds ? { watchedRootIds } : {}),
   });
 }
 
@@ -313,6 +377,16 @@ export async function getMappingTreeDetailed(
  */
 export async function getMappingDiff(rootUrl: string): Promise<DiffReport> {
   const qs = new URLSearchParams({ rootUrl });
+  return request<DiffReport>(`/api/mapping/diff?${qs.toString()}`);
+}
+
+/**
+ * Read the most recently persisted change state without triggering cloud
+ * detection. Dashboard/status/list views use this so mounting UI components
+ * cannot fan out into Feishu requests; explicit detect actions own refresh.
+ */
+export async function getStoredMappingDiff(rootUrl: string): Promise<DiffReport> {
+  const qs = new URLSearchParams({ rootUrl, cached: '1' });
   return request<DiffReport>(`/api/mapping/diff?${qs.toString()}`);
 }
 
@@ -459,6 +533,27 @@ export async function testLlmChannel(body: ChannelTestRequest): Promise<ChannelT
     method: 'POST',
     body: JSON.stringify(body),
   });
+}
+
+/** Read-only OpenCode discovery/version check for the desktop settings page. */
+export async function getOpenCodeStatus(): Promise<OpenCodeStatus> {
+  return request<OpenCodeStatus>('/api/opencode/status');
+}
+
+/**
+ * Explicitly install the official global npm package. The UI asks for native
+ * confirmation before calling this mutating endpoint.
+ */
+export async function installOpenCode(): Promise<OpenCodeInstallResult> {
+  return request<OpenCodeInstallResult>('/api/opencode/install', {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
+/** Read-only Claude Code discovery/version check for the desktop settings page. */
+export async function getClaudeCliStatus(): Promise<ClaudeCliStatus> {
+  return request<ClaudeCliStatus>('/api/claude/status');
 }
 
 export { APIError };

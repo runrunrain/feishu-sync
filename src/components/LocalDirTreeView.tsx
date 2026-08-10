@@ -33,6 +33,7 @@ import {
 } from 'lucide-react';
 import { Card, CardBody } from './common/Card';
 import { EmptyState } from './common/EmptyState';
+import { TreeViewModeToggle, type TreeViewMode } from './TreeViewModeToggle';
 import { useToast } from './common/Toast';
 import { appLogger } from '../utils/appLogger';
 import { getMappingTreeDetailed } from '../api/client';
@@ -51,6 +52,9 @@ interface LocalDirTreeViewProps {
   onSelect: (objToken: string) => void;
   /** Notify parent after a successful refresh. */
   onRefreshed?: () => void;
+  /** Dashboard-owned selector; shown here too so local mode is not a dead end. */
+  view?: TreeViewMode;
+  onViewChange?: (view: TreeViewMode) => void;
   className?: string;
 }
 
@@ -234,12 +238,12 @@ function LocalNodeRenderer({
         role="treeitem"
         aria-expanded={isDir ? isExpanded : undefined}
         aria-selected={!isDir && doc ? selectedToken === doc.obj_token : undefined}
-        className={`relative group flex items-center gap-2 h-8 pr-2.5 rounded-sm cursor-pointer transition-colors ${
+        className={`relative group flex min-w-0 items-center gap-2 h-8 overflow-hidden pr-2.5 rounded-sm cursor-pointer transition-colors ${
           !isDir && doc && selectedToken === doc.obj_token
             ? 'bg-[rgba(158,43,37,0.04)] before:absolute before:left-0 before:top-0 before:bottom-0 before:w-0.5 before:bg-seal'
             : 'hover:bg-paper-2'
         }`}
-        style={{ paddingLeft: 8 + level * 14 }}
+        style={{ paddingLeft: Math.min(8 + level * 10, 48) }}
         onClick={() => {
           if (isDir) onToggle(node.path);
           else if (doc) onSelect(doc.obj_token);
@@ -255,7 +259,7 @@ function LocalNodeRenderer({
         </span>
         <Icon className={`w-4 h-4 shrink-0 ${isDir ? 'text-ink-soft' : 'text-ink-soft'}`} />
         <span
-          className={`flex-1 truncate text-[13px] ${
+          className={`min-w-0 flex-1 truncate text-[13px] ${
             doc?.cloud_deleted === 1 ? 'text-ink-faint line-through' : 'text-ink'
           }`}
           style={{ fontFamily: 'var(--serif)' }}
@@ -307,6 +311,8 @@ export function LocalDirTreeView({
   selectedToken,
   onSelect,
   onRefreshed,
+  view,
+  onViewChange,
   className = '',
 }: LocalDirTreeViewProps) {
   const [internalEnv, setInternalEnv] = useState<TreeResponse | null>(envelope ?? null);
@@ -455,7 +461,7 @@ export function LocalDirTreeView({
   } else {
     body = (
       <>
-        <div className="max-h-full overflow-auto scrollbar-thin pr-1">
+        <div className="max-h-full overflow-x-hidden overflow-y-auto scrollbar-thin pr-1">
           {forest.map((r) => (
             <LocalNodeRenderer
               key={r.path}
@@ -469,8 +475,8 @@ export function LocalDirTreeView({
             />
           ))}
         </div>
-        <div className="mt-3 pt-3 border-t border-line text-xs text-ink-faint font-sans-ui flex items-center justify-between">
-          <span>
+        <div className="mt-3 pt-3 border-t border-line text-xs text-ink-faint font-sans-ui flex min-w-0 items-center justify-between gap-2">
+          <span className="min-w-0 truncate">
             {fileCount} 文档 · {orphanCount} 本地独有 · {forest.length} 顶层
           </span>
           <button
@@ -490,16 +496,24 @@ export function LocalDirTreeView({
   }
 
   return (
-    <Card variant="default" className={`flex flex-col ${className}`}>
-      <div className="px-4 py-3 border-b border-line flex items-center gap-2.5">
-        <div className="flex-1 flex items-center gap-2 px-2.5 py-1.5 rounded-md border border-line bg-paper focus-within:border-seal">
+    <Card variant="default" className={`min-w-0 flex flex-col ${className}`}>
+      {view && onViewChange && (
+        <div className="px-4 pt-3 pb-2 border-b border-line">
+          <TreeViewModeToggle view={view} onViewChange={onViewChange} />
+          <p className="mt-1.5 text-[11px] text-ink-faint font-sans-ui">
+            按本地文件系统路径组织（含本地独有）
+          </p>
+        </div>
+      )}
+      <div className="flex items-center gap-2.5 border-b border-line px-4 py-3">
+        <div className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-line bg-paper px-2.5 py-1.5 focus-within:border-seal">
           <Search className="w-3.5 h-3.5 text-ink-faint" />
           <input
             type="text"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder="搜索本地路径…"
-            className="flex-1 bg-transparent text-sm text-ink placeholder:text-ink-faint focus:outline-none font-sans-ui"
+            className="min-w-0 flex-1 bg-transparent text-sm text-ink placeholder:text-ink-faint focus:outline-none font-sans-ui"
           />
         </div>
       </div>

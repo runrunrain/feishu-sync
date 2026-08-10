@@ -32,16 +32,33 @@ export interface Config {
   enableNotifications: boolean;
 }
 
+/** One model preset inside a provider's OpenAI/Anthropic-compatible routes. */
+export interface LlmModelPreset {
+  id: string;
+  name: string;
+  openAiModel: string;
+  claudeCliModel: string;
+  enabled: boolean;
+}
+
+/** A remotely hosted model provider configured in Settings. */
+export interface LlmProviderConfig {
+  id: string;
+  name: string;
+  enabled: boolean;
+  apiKey: string;
+  openAiCompatBaseUrl: string;
+  claudeCompatBaseUrl: string;
+  defaultModelId?: string;
+  models: LlmModelPreset[];
+}
+
 /**
- * v0.2.0 P3/P4 — channel-agnostic LLM provider config (bigmodel 认知修正).
+ * v0.2.0 — remote-provider profiles plus local execution-channel controls.
  *
- * Cognitive correction (2026-06-18): there is ONE provider (bigmodel GLM by
- * default). `claude -p` (Anthropic-protocol adapter) and the OpenAI SDK 直连
- * (OpenAI-protocol adapter) are TWO CHANNELS sharing ONE `LlmConfig`.
- *
- * Frontend type mirrors server/src/types/index.ts LlmConfig. The legacy
- * flat shape `{ baseUrl, apiKey, model, temperature }` is auto-migrated by
- * ConfigManager; UI never shows the legacy form.
+ * `providers` is used by the remote direct and Claude Code channels. The
+ * flat endpoint/key/model fields remain for migration and older callers; the
+ * server resolves the selected provider/model before a remote request.
  */
 export interface LlmConfig {
   /** OpenAI-protocol adapter base URL (DirectChannel/OpenAI SDK). */
@@ -57,13 +74,35 @@ export interface LlmConfig {
   claudeCliModel?: string;
   /** Sampling temperature 0.0-1.0. Default 0.2. */
   temperature: number;
+  /** User-configured remote model providers. */
+  providers?: LlmProviderConfig[];
+  /** Currently selected remote provider for direct / Claude Code. */
+  activeProviderId?: string;
+  /** Currently selected model preset within the active provider. */
+  activeModelId?: string;
+  /** Optional shared timeout used by remote channels (milliseconds). */
+  timeoutMs?: number;
   /** ClaudeCliChannel process control. */
   claudeCli?: {
     claudePath?: string;
     extraArgs?: string[];
   };
+  /**
+   * Local OpenCode process controls. When the active provider has a key, the
+   * app passes it to OpenCode only for that child process; it is never written
+   * to OpenCode's config file. Without an active key OpenCode uses its own
+   * local configuration.
+   */
+  opencode?: {
+    executablePath?: string;
+    model?: string;
+    agent?: string;
+    timeoutMs?: number;
+  };
+  /** Explicit opt-in: reorganise Markdown bodies during sync. */
+  contentAdaptationEnabled?: boolean;
   /** Primary channel name. Default 'claude-cli'. */
-  primaryChannel: 'claude-cli' | 'direct';
+  primaryChannel: 'claude-cli' | 'direct' | 'opencode';
   /** On primary failure, retry via the other channel. Default true. */
   fallbackOnFailure: boolean;
 }
@@ -99,6 +138,16 @@ export interface ChangedDocument {
   hasChild?: boolean;
   observedObjEditTime?: number | null;
   syncState?: SyncState;
+  /**
+   * Ancestor titles from the configured watched root (exclusive) to the
+   * immediate parent.  An empty array is valid for a direct child; undefined
+   * means the hierarchy is not safe to plan yet.
+   */
+  parentChainTitles?: string[];
+  /** True only for the body of the configured watched-root node itself. */
+  isWatchedRootNode?: boolean;
+  /** Portable relative path from a verified existing mapping, if any. */
+  localRelPath?: string | null;
 }
 
 export type SyncState =
@@ -106,6 +155,7 @@ export type SyncState =
   | 'pending_modified'
   | 'synced'
   | 'restricted'
+  | 'feishu_pending'
   | 'error'
   | 'missing_candidate'
   | 'deleted_confirmed';
@@ -126,6 +176,51 @@ export interface FailedDocument {
   title: string;
   error: string;
   retryable: boolean;
+  reasonCode?: SyncFailureReasonCode;
+  suggestedResolution?: string;
+  repairAction?: SyncRepairAction;
+  watchedRootId?: string | null;
+}
+
+export type SyncPlanReasonCode =
+  | 'deleted_requires_confirmation'
+  | 'missing_parent_chain'
+  | 'unknown_watched_root'
+  | 'path_conflict'
+  | 'unsafe_path'
+  | 'planned_move'
+  | 'unsupported_type'
+  | 'restricted'
+  | 'unknown';
+
+export type SyncFailureReasonCode =
+  | SyncPlanReasonCode
+  | 'permission_denied'
+  | 'cloud_deleted'
+  | 'rate_limited'
+  | 'upstream_error';
+
+export type SyncRepairAction =
+  | 'rebuild_parent_chain'
+  | 'adopt_existing_file'
+  | 'retry'
+  | 'grant_access'
+  | 'review_deleted'
+  | 'enable_export_adapter'
+  | 'manual_review';
+
+/** Persistent issues that require an operator to act in Feishu before sync can resume. */
+export interface FeishuPendingItem {
+  objToken: string;
+  title: string;
+  watchedRootId: string | null;
+  reasonCode: SyncFailureReasonCode;
+  error: string;
+  suggestedResolution: string;
+  repairAction: SyncRepairAction;
+  createdAt: string;
+  updatedAt: string;
+  recheckRequestedAt: string | null;
 }
 
 export interface PlannedSyncDocument {
@@ -152,6 +247,12 @@ export interface SyncResult {
   operationId?: string;
   manifestPath?: string;
   plannedDocuments?: PlannedSyncDocument[];
+}
+
+export interface SyncDocumentOptions {
+  enableLLM?: boolean;
+  /** Explicitly adopt only title-verified legacy exports at profile paths. */
+  adoptExistingProfileTargets?: boolean;
 }
 
 export interface ChangeDetectionResult {
@@ -441,7 +542,7 @@ export interface TrashedDoc {
 // Channel Connectivity Test (T7, decision 3 real call)
 // ============================================================================
 
-export type ChannelName = 'claude-cli' | 'direct';
+export type ChannelName = 'claude-cli' | 'direct' | 'opencode';
 
 /**
  * Connectivity test request body for POST /api/llm/test-channel.
@@ -455,8 +556,21 @@ export type ChannelName = 'claude-cli' | 'direct';
  */
 export interface ChannelTestRequest {
   channel: ChannelName;
-  llm: Pick<LlmConfig, 'openAiCompatBaseUrl' | 'claudeCompatBaseUrl' | 'apiKey' | 'model' | 'directModel' | 'claudeCliModel' | 'temperature'>;
+  llm: Pick<
+    LlmConfig,
+    | 'openAiCompatBaseUrl'
+    | 'claudeCompatBaseUrl'
+    | 'apiKey'
+    | 'model'
+    | 'directModel'
+    | 'claudeCliModel'
+    | 'temperature'
+    | 'providers'
+    | 'activeProviderId'
+    | 'activeModelId'
+  >;
   claudeCli?: { claudePath?: string; extraArgs?: string[] };
+  opencode?: LlmConfig['opencode'];
 }
 
 export interface ChannelTestResult {
@@ -468,6 +582,31 @@ export interface ChannelTestResult {
   /** Effective model alias used. */
   model: string;
   /** One-line error summary (no stack). Full detail in server logs. */
+  error?: string;
+}
+
+export interface OpenCodeStatus {
+  installed: boolean;
+  executablePath: string | null;
+  version: string | null;
+  source: 'configured' | 'path' | 'login-shell' | 'npm-global-prefix' | 'npm-global-root' | 'missing';
+  executable: boolean;
+  error?: string;
+}
+
+export interface OpenCodeInstallResult {
+  success: boolean;
+  status: OpenCodeStatus;
+  message: string;
+}
+
+/** Read-only availability result for the local Claude Code executable. */
+export interface ClaudeCliStatus {
+  installed: boolean;
+  executablePath: string | null;
+  version: string | null;
+  source: 'configured' | 'environment' | 'path' | 'known-location' | 'missing';
+  executable: boolean;
   error?: string;
 }
 

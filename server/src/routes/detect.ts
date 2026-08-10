@@ -28,6 +28,11 @@
  *   Sequential (not parallel) to respect lark-cli QPS and keep the
  *   standalone server's stdout log readable. Per-root failures are
  *   captured into results[] without aborting the whole batch.
+ *
+ * Routine UI and tray checks use ChangeDetector's `fast` mode: it batches
+ * metadata for already-mapped documents and intentionally avoids a full Wiki
+ * topology scan. Callers may explicitly send `{ mode: "full" }` when they
+ * need structural reconciliation (new/moved/deleted nodes).
  */
 
 import { Hono } from 'hono';
@@ -50,6 +55,7 @@ const detectRoutes = new Hono();
 detectRoutes.post('/api/detect/changes', async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const rootUrl = typeof body?.rootUrl === 'string' ? body.rootUrl.trim() : '';
+  const mode = body?.mode === 'full' ? 'full' : 'fast';
 
   if (!rootUrl) {
     return c.json(
@@ -88,11 +94,10 @@ detectRoutes.post('/api/detect/changes', async (c) => {
   }
 
   try {
-    // forceFresh=true: the singular detect endpoint is the user-driven
-    // detect button (and the polling scheduler's per-root entry point).
-    // Bypass the ChangeDetector result cache so a manual refresh always
-    // reflects the current cloud state.
-    const result = await changeDetector.detectChanges(rootUrl, { forceFresh: true });
+    // The normal detect action checks only already-mapped cloud files via
+    // Drive metadata batches. It does not download content or traverse every
+    // node detail; full topology reconciliation remains opt-in through body.mode.
+    const result = await changeDetector.detectChanges(rootUrl, { forceFresh: true, mode });
     return c.json(result);
   } catch (error) {
     console.error('[DetectRoutes] Change detection failed:', error);
@@ -154,9 +159,12 @@ interface MultiRootDetectionResult {
  * `changedDocuments` is the concatenation in configured order;
  * `totalNodes` is the sum across successful roots.
  *
- * Request body: ignored (config-driven). An empty `{}` is fine.
+ * Request body: config-driven; an empty `{}` uses fast mode. Send
+ * `{ mode: "full" }` only for an explicit topology reconciliation.
  */
 detectRoutes.post('/api/detect/changes-all', async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const mode = body?.mode === 'full' ? 'full' : 'fast';
   const changeDetector = (c as any).changeDetector as ChangeDetector | undefined;
   const configManager = (c as any).configManager as ConfigManager | undefined;
 
@@ -186,12 +194,10 @@ detectRoutes.post('/api/detect/changes-all', async (c) => {
 
   for (const rootUrl of watchedRootUrls) {
     try {
-      // forceFresh=true: this endpoint is the user-facing 立即检测 button
-      // (and the polling scheduler's full refresh). A conscious detect
-      // click must always re-hit the cloud; the ChangeDetector's
-      // short-lived result cache is bypassed here so stale results from
-      // a previous /api/mapping/diff burst don't shadow the manual click.
-      const result = await changeDetector.detectChanges(rootUrl, { forceFresh: true });
+      // Use the same lightweight batched metadata check for both the tray
+      // scheduler and the visible "立即检测" action. Roots remain serial to
+      // bound aggregate QPS; `mode: full` is reserved for explicit recovery.
+      const result = await changeDetector.detectChanges(rootUrl, { forceFresh: true, mode });
       results.push({ rootUrl, status: 'ok', result });
       aggregatedTotalNodes += result.totalNodes ?? 0;
       if (result.changedDocuments?.length) {

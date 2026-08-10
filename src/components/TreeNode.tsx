@@ -54,8 +54,10 @@ function formatRelative(unixSeconds: number | null): string {
   const diff = Math.max(0, now - unixSeconds);
   if (diff < 3600) return `${Math.max(1, Math.floor(diff / 60))}h`;
   if (diff < 86400) return `${Math.floor(diff / 3600)}h`;
-  if (diff < 86400 * 30) return `${Math.floor(diff / 86400)}d`;
-  return new Date(unixSeconds * 1000).toISOString().slice(0, 10);
+  // The tree is deliberately compact. An ISO date (10 characters) can push
+  // the title completely out of a narrow sidebar at deep nesting levels;
+  // day counts remain precise enough for this at-a-glance indicator.
+  return `${Math.floor(diff / 86400)}d`;
 }
 
 export function TreeNode({
@@ -96,12 +98,12 @@ export function TreeNode({
       */}
       {isDropTargetBefore && <div className="tree-drop-indicator" />}
       <div
-        className={`flex items-center gap-2 h-8 pr-2.5 rounded-sm cursor-pointer transition-colors ${
+        className={`flex min-w-0 items-center gap-2 h-8 overflow-hidden pr-2.5 rounded-sm cursor-pointer transition-colors ${
           selected
             ? 'bg-[rgba(158,43,37,0.04)]'
             : 'hover:bg-paper-2'
         } ${selected ? 'before:absolute before:left-0 before:top-0 before:bottom-0 before:w-0.5 before:bg-seal' : ''}`}
-        style={{ paddingLeft: 8 + level * 14 }}
+        style={{ paddingLeft: Math.min(8 + level * 10, 48) }}
         onClick={() => onSelect(node.obj_token)}
         draggable
         onDragStart={(e) => onDragStart(e, node)}
@@ -109,10 +111,11 @@ export function TreeNode({
         onDragLeave={(e) => onDragLeave(e, node)}
         onDrop={(e) => onDrop(e, node)}
       >
-        {/* Drag handle (visible on hover) */}
+        {/* The entire row remains draggable. Hiding the handle keeps deep
+            nodes usable inside the compact 280px sidebar. */}
         <span
           aria-hidden
-          className="shrink-0 w-3 text-ink-faint/40 group-hover:text-ink-faint cursor-grab active:cursor-grabbing select-none"
+          className="hidden shrink-0 w-3 text-ink-faint/40 group-hover:text-ink-faint cursor-grab active:cursor-grabbing select-none"
           title="拖拽以调整同级顺序"
         >
           <svg viewBox="0 0 6 12" className="w-1.5 h-3 fill-current">
@@ -154,7 +157,7 @@ export function TreeNode({
 
         {/* Title */}
         <span
-          className={`flex-1 truncate text-[13px] ${
+          className={`min-w-0 flex-1 truncate text-[13px] ${
             node.cloud_deleted === 1 ? 'text-ink-faint line-through' : 'text-ink'
           }`}
           style={{ fontFamily: 'var(--serif)' }}

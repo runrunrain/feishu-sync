@@ -38,7 +38,7 @@ function AppShell() {
   };
 
   return (
-    <div className="h-screen w-screen overflow-hidden flex flex-col bg-paper">
+    <div className="h-[100dvh] min-h-screen w-full overflow-hidden flex flex-col bg-paper">
       <TopBar
         currentArea={currentArea}
         onAreaChange={setCurrentArea}
@@ -52,7 +52,7 @@ function AppShell() {
         - 不同主区可按需调整 max-width（SettingsView/Dashboard 在视图内部控制）
       */}
       <main className="flex-1 overflow-auto scrollbar-thin">
-        <div className="max-w-7xl mx-auto px-6 py-6 lg:px-8">{renderArea()}</div>
+        <div className="max-w-7xl mx-auto px-4 py-4 sm:px-6 sm:py-6 lg:px-8">{renderArea()}</div>
       </main>
     </div>
   );

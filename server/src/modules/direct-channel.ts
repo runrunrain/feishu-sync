@@ -38,6 +38,7 @@ import type {
   ContentBackend,
   LlmConfig,
 } from './content-backend.js';
+import { resolveActiveLlmConfig } from './content-backend.js';
 
 export class DirectChannel implements ContentBackend {
   readonly name = 'direct' as const;
@@ -51,7 +52,14 @@ export class DirectChannel implements ContentBackend {
   private cachedKey: string | null = null;
   private cachedBaseUrl: string | null = null;
 
-  constructor(private readonly llm: LlmConfig) {}
+  private readonly llm: LlmConfig;
+
+  constructor(llm: LlmConfig) {
+    // Provider profiles are resolved once per channel instance. Registries
+    // are rebuilt for each sync, so this is both deterministic and avoids a
+    // document in the same batch switching provider halfway through.
+    this.llm = resolveActiveLlmConfig(llm);
+  }
 
   async adapt(input: AdaptInput): Promise<AdaptOutput> {
     const startedAt = Date.now();
@@ -71,6 +79,14 @@ export class DirectChannel implements ContentBackend {
         'error'
       );
     }
+    const model = this.llm.directModel || this.llm.model;
+    if (!model) {
+      return this.buildErrorOutput(
+        'DirectChannel: no OpenAI-compatible model is selected for the active provider',
+        startedAt,
+        'error',
+      );
+    }
 
     const client = this.getClient();
     const controller = new AbortController();
@@ -84,8 +100,6 @@ export class DirectChannel implements ContentBackend {
       // Channel-specific model override takes precedence (bigmodel's
       // OpenAI-compat endpoint uses a different alias space than the
       // Anthropic-compat one).
-      const model = this.llm.directModel || this.llm.model;
-
       let adaptedMarkdown = '';
       let tokensUsed = 0;
       let finishReason: AdaptFinishReason = 'stop';
@@ -132,7 +146,7 @@ export class DirectChannel implements ContentBackend {
         tokensUsed,
         durationMs: Date.now() - startedAt,
         channelName: this.name,
-        model: this.llm.directModel || this.llm.model,
+        model,
         finishReason,
       };
     } catch (error) {
@@ -164,7 +178,7 @@ export class DirectChannel implements ContentBackend {
     return {
       temperature: options.temperature ?? this.llm.temperature ?? 0.2,
       // Default timeout is LlmConfig.timeoutMs (10 minutes); raises the
-      // previous 60s ceiling so bigmodel glm-5.2[1m] has enough headroom
+      // previous 60s ceiling so bigmodel glm-5.2 has enough headroom
       // to complete under load without prematurely aborting to fallback.
       timeoutMs: options.timeoutMs ?? this.llm.timeoutMs ?? 600_000,
       enableStreaming: options.enableStreaming,
@@ -235,13 +249,14 @@ ${rawContent}
   private buildErrorOutput(
     errorMessage: string,
     startedAt: number,
-    finishReason: AdaptFinishReason
+    finishReason: AdaptFinishReason,
+    model = this.llm.directModel || this.llm.model,
   ): AdaptOutput {
     return {
       adaptedMarkdown: '',
       durationMs: Date.now() - startedAt,
       channelName: this.name,
-      model: this.llm.directModel || this.llm.model,
+      model,
       finishReason,
       errorMessage,
     };

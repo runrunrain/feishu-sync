@@ -72,19 +72,61 @@ export function getEnabledWatchedRootUrls(
 // ============================================================================
 
 /**
- * Shared LLM provider configuration consumed by BOTH channels.
+ * A model preset belonging to one remote provider.
  *
- * Cognitive correction (2026-06-18): there is ONE provider (bigmodel
- * GLM by default). `claude -p` (Anthropic-protocol adapter) and the
- * OpenAI SDK 直连 (OpenAI-protocol adapter) are two CHANNELS sharing
- * ONE `LlmConfig`.
+ * The two headless execution paths speak different protocols: direct uses an
+ * OpenAI-compatible endpoint, while Claude Code uses an
+ * Anthropic-compatible endpoint. Providers such as GLM can expose different
+ * model aliases on those endpoints, so a preset stores both aliases instead
+ * of forcing users to duplicate a provider just to select a model.
+ */
+export interface LlmModelPreset {
+  /** Stable local identifier; unique within the provider. */
+  id: string;
+  /** Human-readable label shown in Settings. */
+  name: string;
+  /** Model passed to the direct/OpenAI-compatible channel. */
+  openAiModel: string;
+  /** Model passed to the Claude Code/Anthropic-compatible channel. */
+  claudeCliModel: string;
+  /** Disabled presets remain saved but cannot be selected at runtime. */
+  enabled: boolean;
+}
+
+/**
+ * A remotely hosted model provider and its model presets.
  *
- * `openAiCompatBaseUrl` and `claudeCompatBaseUrl` are kept separate
- * because bigmodel (and similar dual-protocol providers) expose two
- * distinct endpoints. The same `apiKey` is accepted at both.
+ * Keys remain local to this application. They are redacted by GET
+ * /api/config and retain the same plaintext-on-disk warning as the legacy
+ * `llm.apiKey` field until secure-storage support is introduced.
+ */
+export interface LlmProviderConfig {
+  /** Stable local identifier; unique across providers. */
+  id: string;
+  /** Human-readable provider name, for example "智谱 GLM". */
+  name: string;
+  /** Disabled providers remain editable but are never chosen at runtime. */
+  enabled: boolean;
+  /** Credential accepted by this provider's configured endpoints. */
+  apiKey: string;
+  /** OpenAI-compatible base URL used by the direct channel. */
+  openAiCompatBaseUrl: string;
+  /** Anthropic-compatible base URL injected into Claude Code. */
+  claudeCompatBaseUrl: string;
+  /** Preferred preset within this provider when no explicit active preset exists. */
+  defaultModelId?: string;
+  /** Provider-owned model aliases. */
+  models: LlmModelPreset[];
+}
+
+/**
+ * Shared LLM channel configuration.
  *
- * `claudeCli`, `primaryChannel`, and `fallbackOnFailure` control
- * channel selection and fallback policy.
+ * `providers` is the authoritative multi-provider configuration. The flat
+ * endpoint/key/model fields are intentionally retained as a backward-
+ * compatible projection for existing config files and integrations. Runtime
+ * channels resolve the active provider/preset first, then use these legacy
+ * values only when no provider profile is configured.
  */
 export interface LlmConfig {
   /** OpenAI-protocol adapter base URL (DirectChannel/OpenAI SDK). */
@@ -97,19 +139,26 @@ export interface LlmConfig {
   model: string;
   /**
    * Optional per-channel model overrides. Bigmodel's two endpoints use
-   * different alias spaces (paas/v4 accepts glm-4-flash, /api/anthropic
-   * accepts glm-5.2[1m]); these let users fill different aliases when
+   * different alias spaces (paas/v4 accepts glm-5.2, while Z.AI Claude
+   * Code uses the documented glm-4.7 tier mapping); these let users fill
+   * different aliases when
    * a single name is not valid at both endpoints.
    */
   directModel?: string;
   claudeCliModel?: string;
   /** Sampling temperature 0.0-1.0. Default 0.2. */
   temperature: number;
+  /** Saved remote providers. Existing flat configs are migrated to GLM here. */
+  providers?: LlmProviderConfig[];
+  /** The remote provider currently used by direct and Claude Code channels. */
+  activeProviderId?: string;
+  /** The model preset currently used within `activeProviderId`. */
+  activeModelId?: string;
   /**
    * Per-call LLM adaptation timeout in milliseconds.
    *
    * Default 600000 (10 minutes). The claude-cli channel (bigmodel
-   * glm-5.2[1m] via the Anthropic-compat adapter) routinely takes 1-3
+   * glm-4.7 via the Anthropic-compat adapter) routinely takes 1-3
    * minutes for a single feishu doc adaptation under load, and the
    * bigmodel endpoint occasionally returns transient 529 over-load
    * responses that the SDK retries internally. A 60s timeout (the
@@ -129,8 +178,25 @@ export interface LlmConfig {
     claudePath?: string;
     extraArgs?: string[];
   };
+  /**
+   * Local OpenCode process controls. The active app provider credential is
+   * supplied only as a one-process OpenCode runtime overlay; it is never
+   * written to OpenCode's local configuration.
+   */
+  opencode?: {
+    executablePath?: string;
+    model?: string;
+    agent?: string;
+    timeoutMs?: number;
+  };
+  /**
+   * Explicit opt-in for document organisation during sync. Keeping this
+   * separate from primaryChannel prevents a saved LLM setting from silently
+   * changing document bodies on a later sync.
+   */
+  contentAdaptationEnabled?: boolean;
   /** Primary channel name. Default 'claude-cli'. */
-  primaryChannel: 'claude-cli' | 'direct';
+  primaryChannel: 'claude-cli' | 'direct' | 'opencode';
   /** On primary failure, retry via the other channel. Default true. */
   fallbackOnFailure: boolean;
 }
@@ -185,6 +251,8 @@ export type SyncState =
   | 'pending_modified'
   | 'synced'
   | 'restricted'
+  /** Blocked until the operator explicitly rechecks a Feishu-side repair. */
+  | 'feishu_pending'
   | 'error'
   | 'missing_candidate'
   | 'deleted_confirmed';
@@ -375,6 +443,58 @@ export interface FailedDocument {
   title: string;
   error: string;
   retryable: boolean;
+  /**
+   * Stable failure category shown by the result UI.  Planning failures reuse
+   * SyncPlanReasonCode; runtime failures add the small operational set below.
+   */
+  reasonCode?: SyncFailureReasonCode;
+  /** A user-facing next step; never expose an upstream stack trace here. */
+  suggestedResolution?: string;
+  /** Whether the application can safely perform the next step itself. */
+  repairAction?: SyncRepairAction;
+  /** Retained so a structural repair can re-traverse only the affected root. */
+  watchedRootId?: string | null;
+}
+
+export type SyncFailureReasonCode =
+  | SyncPlanReasonCode
+  | 'permission_denied'
+  | 'cloud_deleted'
+  | 'rate_limited'
+  | 'upstream_error';
+
+/**
+ * Explicitly distinguishes actions that can be automated from those that
+ * require a person with Feishu sharing authority.  In particular, the client
+ * must never pretend it can grant itself access to a protected wiki node.
+ */
+export type SyncRepairAction =
+  | 'rebuild_parent_chain'
+  | 'adopt_existing_file'
+  | 'retry'
+  | 'grant_access'
+  | 'review_deleted'
+  | 'enable_export_adapter'
+  | 'manual_review';
+
+/**
+ * A durable, operator-owned queue entry.  These items are deliberately kept
+ * outside the normal added/modified diff so an unresolved Feishu permission,
+ * deleted page, or unsupported cloud type cannot appear as a fresh change on
+ * every detector poll.
+ */
+export interface FeishuPendingItem {
+  objToken: string;
+  title: string;
+  watchedRootId: string | null;
+  reasonCode: SyncFailureReasonCode;
+  error: string;
+  suggestedResolution: string;
+  repairAction: SyncRepairAction;
+  createdAt: string;
+  updatedAt: string;
+  /** Set only after the user clicks “处理后重新检测”. */
+  recheckRequestedAt: string | null;
 }
 
 /**
@@ -441,6 +561,13 @@ export interface SyncResult {
 export interface SyncOptions {
   enableLLM: boolean;
   fullSync: boolean;
+  /**
+   * Explicit recovery-only opt-in. When a canonical profile path already
+   * contains a recognisable older export of the same titled cloud document,
+   * adopt that file as its mapping and atomically replace it. Never enables a
+   * blind overwrite of arbitrary local content.
+   */
+  adoptExistingProfileTargets?: boolean;
   /** Must be accompanied by confirmation: 'APPLY'; absent/false always dry-runs. */
   apply?: boolean;
   confirmation?: string;

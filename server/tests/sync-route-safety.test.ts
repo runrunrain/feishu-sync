@@ -58,6 +58,34 @@ const document = {
 };
 
 describe('POST /api/sync P0 safety gate', () => {
+  it('reads and explicitly releases the durable Feishu-side pending queue', async () => {
+    const requested: string[][] = [];
+    const app = buildApp({
+      localMapStore: {
+        listFeishuPending: () => [{ objToken: 'restricted-doc', title: '待授权文档' }],
+        requestFeishuPendingRecheck: (rootIds?: string[]) => {
+          requested.push(rootIds ?? []);
+          return 1;
+        },
+      },
+    });
+
+    const listResponse = await app.fetch(new Request('http://x/api/sync/feishu-pending'));
+    expect(listResponse.status).toBe(200);
+    expect(await listResponse.json()).toEqual({
+      items: [{ objToken: 'restricted-doc', title: '待授权文档' }],
+    });
+
+    const recheckResponse = await app.fetch(new Request('http://x/api/sync/feishu-pending/recheck', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ watchedRootIds: ['root-1', 'root-1'] }),
+    }));
+    expect(recheckResponse.status).toBe(200);
+    expect(await recheckResponse.json()).toEqual({ requested: 1 });
+    expect(requested).toEqual([['root-1']]);
+  });
+
   it('treats apply:false as dry-run and does not refresh the knowledge-base snapshot', async () => {
     const temporaryRoot = createTempDirectory('feishu-sync-route-safety-');
     const knowledgeBaseRoot = path.join(temporaryRoot, 'knowledge-base');

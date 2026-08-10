@@ -29,7 +29,7 @@ const NAV_ITEMS: { id: MainArea; ordinal: string; label: string }[] = [
 
 export function TopBar({ currentArea, onAreaChange, authReady, pendingCount }: TopBarProps) {
   return (
-    <header className="h-[56px] shrink-0 bg-card-bg border-b border-line flex items-center justify-between px-6 lg:px-8">
+    <header className="h-[56px] shrink-0 min-w-0 bg-card-bg border-b border-line flex items-center justify-between gap-3 px-4 lg:px-8">
       {/*
         布局重构（2026-06-19）：
         - 高度 52→56px：logo 32px + 内容呼吸，避免与 12px 楷体序号挤压
@@ -37,18 +37,18 @@ export function TopBar({ currentArea, onAreaChange, authReady, pendingCount }: T
         - nav gap-1→gap-2，主区按钮之间留呼吸
       */}
       {/* Left: seal logo + title */}
-      <div className="flex items-center gap-3 min-w-[160px]">
+      <div className="flex min-w-0 items-center gap-3 lg:min-w-[160px]">
         <div className="w-9 h-9 rounded-sm bg-seal flex items-center justify-center shadow-sm">
           <span className="text-white font-kai text-base font-medium leading-none">飞</span>
         </div>
-        <div className="flex flex-col leading-tight gap-0.5">
-          <span className="text-sm font-semibold font-kai text-ink">飞书同步</span>
-          <span className="text-[10px] text-ink-faint font-mono">v0.2.0</span>
+        <div className="flex min-w-0 flex-col leading-tight gap-0.5">
+          <span className="truncate text-sm font-semibold font-kai text-ink">飞书同步</span>
+          <span className="hidden text-[10px] text-ink-faint font-mono lg:block">v0.2.0</span>
         </div>
       </div>
 
       {/* Center: 3 main areas */}
-      <nav className="flex items-center gap-1.5">
+      <nav className="flex shrink-0 items-center gap-0.5 lg:gap-1.5">
         {NAV_ITEMS.map((item) => {
           const isActive = currentArea === item.id;
           return (
@@ -56,7 +56,7 @@ export function TopBar({ currentArea, onAreaChange, authReady, pendingCount }: T
               key={item.id}
               type="button"
               onClick={() => onAreaChange(item.id)}
-              className={`relative h-10 px-5 rounded-md flex items-center gap-2 transition-colors ${
+              className={`relative h-10 px-2.5 sm:px-3 lg:px-5 rounded-md flex items-center gap-1.5 lg:gap-2 transition-colors ${
                 isActive
                   ? 'text-seal bg-[rgba(158,43,37,0.06)]'
                   : 'text-ink-soft hover:bg-paper hover:text-ink'
@@ -64,11 +64,11 @@ export function TopBar({ currentArea, onAreaChange, authReady, pendingCount }: T
               aria-current={isActive ? 'page' : undefined}
             >
               <span
-                className={`text-sm font-kai ${isActive ? 'text-seal' : 'text-ink-faint'}`}
+                className={`hidden text-sm font-kai lg:inline ${isActive ? 'text-seal' : 'text-ink-faint'}`}
               >
                 {item.ordinal}
               </span>
-              <span className="text-sm font-sans-ui">{item.label}</span>
+              <span className="whitespace-nowrap text-sm font-sans-ui">{item.label}</span>
               {isActive && (
                 <span
                   aria-hidden
@@ -81,24 +81,24 @@ export function TopBar({ currentArea, onAreaChange, authReady, pendingCount }: T
       </nav>
 
       {/* Right: auth + pending badges */}
-      <div className="flex items-center gap-3 min-w-[220px] justify-end">
+      <div className="flex min-w-0 shrink-0 items-center justify-end gap-2 lg:min-w-[220px] lg:gap-3">
         {pendingCount > 0 && (
-          <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-seal/10 border border-seal/20">
+          <div className="hidden items-center gap-1.5 px-2.5 py-1 rounded-full bg-seal/10 border border-seal/20 lg:flex">
             <span className="w-1.5 h-1.5 rounded-full bg-seal animate-pulse-seal" />
             <span className="text-xs font-sans-ui text-seal font-medium">待同步 {pendingCount}</span>
           </div>
         )}
-        <div className="flex items-center gap-2 px-3 py-1.5 rounded-md bg-paper border border-line">
+        <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-md bg-paper border border-line lg:px-3">
           {authReady ? (
             <>
               <Wifi className="w-3.5 h-3.5 text-jade" />
-              <span className="text-xs text-ink-soft font-sans-ui">已认证</span>
+              <span className="hidden text-xs text-ink-soft font-sans-ui sm:inline">已认证</span>
             </>
           ) : (
             <>
               <span className="w-1.5 h-1.5 rounded-full bg-seal animate-pulse-seal" />
               <WifiOff className="w-3.5 h-3.5 text-seal" />
-              <span className="text-xs text-seal font-sans-ui">未认证</span>
+              <span className="hidden text-xs text-seal font-sans-ui sm:inline">未认证</span>
             </>
           )}
         </div>
