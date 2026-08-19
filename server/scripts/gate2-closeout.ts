@@ -96,6 +96,7 @@ async function main(): Promise<void> {
   const report = buildReconciliationReport({
     knowledgeBaseRoot: kb,
     watchedRoots: roots,
+    dbPath,
   });
   const apply = await applyReconciliation({
     knowledgeBaseRoot: kb,

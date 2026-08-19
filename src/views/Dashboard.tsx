@@ -28,18 +28,21 @@ import { LocalDirTreeView } from '../components/LocalDirTreeView';
 import { RecentChanges } from '../components/RecentChanges';
 import { NodeDetailCard } from '../components/NodeDetailCard';
 import { OrphanFileAlert } from '../components/OrphanFileAlert';
+import { QuickAddDocDialog } from '../components/QuickAddDocDialog';
 import { useConfig } from '../hooks/useConfig';
 import { useToast } from '../components/common/Toast';
 import {
   getStoredMappingDiff,
   getMappingIndex,
   getMappingTreeDetailed,
+  listCustomFolders,
 } from '../api/client';
 import { appLogger } from '../utils/appLogger';
 import { pickFirstValidWikiUrl } from '../utils/wikiUrl';
 import type {
   MappingNode,
   ChangedDocument,
+  CustomFolder,
   DiffReport,
   OrphanFile,
   TreeResponse,
@@ -67,6 +70,10 @@ export function Dashboard({ onJumpToSync }: DashboardProps) {
     | null
   >(null);
   const [selectedToken, setSelectedToken] = useState<string | null>(null);
+  // 自定义归档文件夹（GET /api/custom-folders）；快捷添加对话框的显隐。
+  const [customFolders, setCustomFolders] = useState<CustomFolder[]>([]);
+  const [customFoldersLoading, setCustomFoldersLoading] = useState(true);
+  const [quickAddOpen, setQuickAddOpen] = useState(false);
   const toast = useToast();
 
   // Load diff + snapshot once root URL is ready.
@@ -113,6 +120,29 @@ export function Dashboard({ onJumpToSync }: DashboardProps) {
     }
   }, [view, localEnv, rootUrl, loadLocal]);
 
+  // 自定义归档文件夹列表：挂载即加载（与 watchedRoot 配置无关，
+  // 归档文档 watched_root_url 为 NULL，天然不在结构检测范围内）。
+  const loadCustomFolders = useCallback(async () => {
+    setCustomFoldersLoading(true);
+    try {
+      const folders = await listCustomFolders();
+      setCustomFolders(folders);
+    } catch (err) {
+      appLogger.error('dashboard', 'listCustomFolders failed', err);
+      toast.push({
+        type: 'error',
+        message: '自定义归档加载失败',
+        hint: err instanceof Error ? err.message : '',
+      });
+    } finally {
+      setCustomFoldersLoading(false);
+    }
+  }, [toast]);
+
+  useEffect(() => {
+    void loadCustomFolders();
+  }, [loadCustomFolders]);
+
   // diff + snapshot always loaded (shared across views).
   useEffect(() => {
     let cancelled = false;
@@ -152,9 +182,43 @@ export function Dashboard({ onJumpToSync }: DashboardProps) {
     [feishuEnv, snapshot],
   );
 
+  // 自定义归档文档 → 伪 MappingNode，用于点击归档文档时联动详情卡。
+  // 归档文档不在飞书结构树内（watched_root_url 为 NULL），不进 NodeTreeView
+  // 的 nodes 数组，仅作详情卡解析用；字段按 documents 表约定填充
+  // （sync_state/cloud_match/status 均为 synced）。
+  const customDocNodes: MappingNode[] = useMemo(
+    () =>
+      customFolders.flatMap((f) =>
+        f.docs.map((d) => ({
+          obj_token: d.objToken,
+          wiki_node_token: null,
+          space_id: null,
+          obj_type: (d.objType as MappingNode['obj_type']) || 'unknown',
+          title: d.title,
+          local_path: d.localRelPath,
+          parent_node_token: null,
+          has_child: false,
+          obj_edit_time: null,
+          last_synced_modify_time: '',
+          last_synced_at: '',
+          last_seen_at: null,
+          status: 'synced' as const,
+          cloud_deleted: 0,
+          sortOrder: null,
+          original_link: d.originalLink,
+          cloud_match: 'synced' as const,
+          watched_root_url: null,
+        })),
+      ),
+    [customFolders],
+  );
+
   const selectedNode = useMemo(
-    () => activeNodes.find((n) => n.obj_token === selectedToken) ?? null,
-    [activeNodes, selectedToken],
+    () =>
+      activeNodes.find((n) => n.obj_token === selectedToken) ??
+      customDocNodes.find((n) => n.obj_token === selectedToken) ??
+      null,
+    [activeNodes, customDocNodes, selectedToken],
   );
 
   // Build a set of orphan local paths to drive NodeTreeView's "仅孤儿" filter.
@@ -185,7 +249,7 @@ export function Dashboard({ onJumpToSync }: DashboardProps) {
     <div className="space-y-6">
       <GlobalStatusBar />
 
-      <div className="grid min-w-0 grid-cols-1 gap-4 lg:grid-cols-[minmax(0,280px)_minmax(0,1fr)] lg:gap-6">
+      <div className="grid min-w-0 grid-cols-1 gap-4 lg:grid-cols-[minmax(0,340px)_minmax(0,1fr)] lg:gap-6">
         {/* Left: node tree (feishu or local) */}
         <div className="min-w-0 min-h-[360px] lg:h-[calc(100vh-220px)]">
           {view === 'feishu' ? (
@@ -198,6 +262,8 @@ export function Dashboard({ onJumpToSync }: DashboardProps) {
               view={view}
               onViewChange={handleViewChange}
               watchedRoots={watchedRoots}
+              customFolders={customFolders}
+              onQuickAdd={() => setQuickAddOpen(true)}
               onRefreshed={loadFeishu}
               className="h-full"
             />
@@ -241,6 +307,17 @@ export function Dashboard({ onJumpToSync }: DashboardProps) {
           />
         </div>
       </div>
+
+      <QuickAddDocDialog
+        open={quickAddOpen}
+        onClose={() => setQuickAddOpen(false)}
+        folders={customFolders}
+        foldersLoading={customFoldersLoading}
+        onChanged={() => {
+          void loadCustomFolders();
+          void loadFeishu();
+        }}
+      />
     </div>
   );
 }

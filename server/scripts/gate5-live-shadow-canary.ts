@@ -113,9 +113,13 @@ async function main(): Promise<void> {
   }
 
   // --- 1) Formal reconcile dry-run ---
+  // Point at the standard feishu-sync DB so custom-folder prefixes are
+  // auto-excluded; the canary DB below is per-run and holds no custom folders.
+  const formalDbPath = path.join(os.homedir(), '.feishu-sync', 'feishu-sync.db');
   const reconcile = buildReconciliationReport({
     knowledgeBaseRoot: FORMAL_KB,
     watchedRoots: ROOTS,
+    dbPath: fs.existsSync(formalDbPath) ? formalDbPath : undefined,
   });
   const reconcilePath = path.join(outDir, 'formal-reconcile.json');
   fs.writeFileSync(reconcilePath, `${JSON.stringify(reconcile, null, 2)}\n`);

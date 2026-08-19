@@ -80,6 +80,8 @@ export function TreeNode({
   const TypeIcon = hasChildren ? Folder : (TYPE_ICON[node.obj_type] ?? FileType);
   const showChangedBadge =
     node.status === 'changed' || node.cloud_deleted === 1;
+  // v0.2.5 层级视觉：顶层节点（level 0）文字/图标大于深层；深层不再与顶层同尺寸。
+  const isRootLevel = level === 0;
 
   return (
     <div
@@ -94,7 +96,8 @@ export function TreeNode({
         - 行高 28px→32px：4px 增量大幅改善节点之间的呼吸（04 §3.2 原为 28px，
           实际渲染时元素密集导致视觉拥挤；32px 在保持紧凑的同时提供视觉缓冲）
         - 内部 gap-1.5→gap-2，图标与文字之间不再挤压
-        - 缩进 14px/级 保持（与原设计一致）
+        - 缩进 8px/级、上限 40px（2026-06-20 由 10px/级、上限 48px 收紧，
+          把空间让给标题，深层节点标题可读性优先）
       */}
       {isDropTargetBefore && <div className="tree-drop-indicator" />}
       <div
@@ -103,7 +106,7 @@ export function TreeNode({
             ? 'bg-[rgba(158,43,37,0.04)]'
             : 'hover:bg-paper-2'
         } ${selected ? 'before:absolute before:left-0 before:top-0 before:bottom-0 before:w-0.5 before:bg-seal' : ''}`}
-        style={{ paddingLeft: Math.min(8 + level * 10, 48) }}
+        style={{ paddingLeft: Math.min(8 + level * 8, 40) }}
         onClick={() => onSelect(node.obj_token)}
         draggable
         onDragStart={(e) => onDragStart(e, node)}
@@ -148,7 +151,7 @@ export function TreeNode({
         </span>
 
         {/* Type icon */}
-        <TypeIcon className="w-4 h-4 text-ink-soft shrink-0" />
+        <TypeIcon className={`${isRootLevel ? 'w-4 h-4' : 'w-3.5 h-3.5'} text-ink-soft shrink-0`} />
 
         {/* Business marks (independent tag, decision 1) */}
         {businessMarks && businessMarks.length > 0 && (
@@ -157,10 +160,11 @@ export function TreeNode({
 
         {/* Title */}
         <span
-          className={`min-w-0 flex-1 truncate text-[13px] ${
+          className={`min-w-0 flex-1 truncate ${isRootLevel ? 'text-[13px]' : 'text-[12px]'} ${
             node.cloud_deleted === 1 ? 'text-ink-faint line-through' : 'text-ink'
           }`}
           style={{ fontFamily: 'var(--serif)' }}
+          title={node.title}
         >
           {node.title}
         </span>

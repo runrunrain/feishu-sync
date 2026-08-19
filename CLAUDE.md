@@ -66,7 +66,7 @@ npx tsx scripts/sync-latest.ts --skip-index --apply    # 真正写盘，仅 crea
 
 ### Hono 依赖注入
 
-`server/src/index.ts` `buildServer()` 实例化所有模块后，用一个 `app.use('*')` 中间件把它们塞进 `c.env`（`configManager` / `larkCliClient` / `localMapStore` / `changeDetector`，以及 `desktopToken`）。**该中间件必须挂在 auth 之前**。路由文件（`routes/*.ts`）从 `c.env` 取依赖，不要 `new` 新实例。路由用 `app.route('/', xxxRoutes)` 挂载（前缀在路由文件内写死）。
+`server/src/index.ts` `buildServer()` 实例化所有模块后，用一个 `app.use('*')` 中间件把它们塞进 `c.env`（`configManager` / `larkCliClient` / `localMapStore` / `changeDetector` / `claudeCliService` / `openCodeCliService`，以及 `desktopToken`）。**该中间件必须挂在 auth 之前**。路由文件（`routes/*.ts`）从 `c.env` 取依赖，不要 `new` 新实例。路由用 `app.route('/', xxxRoutes)` 挂载（前缀在路由文件内写死）。
 
 ### 核心同步流水线
 
@@ -80,14 +80,16 @@ npx tsx scripts/sync-latest.ts --skip-index --apply    # 真正写盘，仅 crea
 - `SyncOptions.apply` 默认 false（dry-run）；写盘需要 `apply:true` + `confirmation:'APPLY'`。move/delete/路径冲突/父链不完整/未知类型/无权限 → 保留为带 `reasonCode` 的 **blocker**，绝不自动覆盖。
 - `atomic-commit.ts`：所有写入先进**库外** staging 目录，校验后 rename 入位；失败从 rollback 快照恢复；`assertInsideRoot` 拒绝路径逃逸。改写盘逻辑必须保持「staging → 校验 → rename → DB 事务」顺序，文件已提交但 DB 失败时用 `SyncEngineTestHooks` 验证回滚。
 
-### LLM 双通道（一个 provider，两个 channel）
+### LLM 通道（一个 provider，三个 channel）
 
-`content-backend.ts` + `content-backend-registry.ts` + `claude-cli-channel.ts` + `direct-channel.ts`：
+`content-backend.ts` + `content-backend-registry.ts` + `claude-cli-channel.ts` + `direct-channel.ts` + `opencode-cli-channel.ts`：
 
-- **单 `LlmConfig`，两 channel 共享**：`claude-cli`（主，spawn `claude -p`，env 注入 `ANTHROPIC_BASE_URL`/`ANTHROPIC_API_KEY`/`ANTHROPIC_MODEL` 指向 bigmodel 的 Anthropic-protocol 端点）和 `direct`（备，OpenAI SDK 打 bigmodel OpenAI-protocol 端点）。默认 provider 是智谱 bigmodel（GLM），非 deepseek——`README` 里的 deepseek 是历史描述。
-- bigmodel 两个端点用不同 model 别名空间（`glm-4-flash` vs `glm-5.2[1m]`），故 `LlmConfig` 带 `openAiCompatBaseUrl` + `claudeCompatBaseUrl` 两个 URL 和可选 `directModel`/`claudeCliModel` 覆盖。
-- Registry 只支持**单层** fallback（`claude-cli <-> direct`），无链式重试。channel 失败不抛异常，返回 `finishReason='error'/'timeout'`，由 orchestrator 决定是否降级。
+- **三 channel 注册**（`ChannelName = 'claude-cli' | 'direct' | 'opencode'`）：`claude-cli`（远程，spawn `claude -p`，env 注入 `ANTHROPIC_BASE_URL`/`ANTHROPIC_API_KEY`/`ANTHROPIC_MODEL` 指向 bigmodel 的 Anthropic-protocol 端点）、`direct`（远程，OpenAI SDK 打 bigmodel OpenAI-protocol 端点）、`opencode`（本地，spawn `opencode --pure run --format json`）。默认 provider 是智谱 bigmodel（GLM），非 deepseek——`README` 里的 deepseek 是历史描述。
+- bigmodel 两个远程端点用不同 model 别名空间（`glm-4-flash` vs `glm-5.2[1m]`），故 `LlmConfig` 带 `openAiCompatBaseUrl` + `claudeCompatBaseUrl` 两个 URL 和可选 `directModel`/`claudeCliModel` 覆盖。
+- **opencode 是本地通道**：凭据来自 OpenCode 自己的本地 provider 配置，不经 `LlmConfig` 注入；每篇文档在私有临时目录运行，正文写入 attachment 文件而非 argv/stdin（防飞书内容被解释为 shell 参数）；故意不带 `--auto`——模型权限请求在非交互模式被拒绝而非静默批准；`--pure` 排除外部插件。进程控制配置在 `ChannelConfig.opencode`。
+- Registry 只支持**单层** fallback（失败时换另一个已注册 channel），无链式重试。channel 失败不抛异常，返回 `finishReason='error'/'timeout'`，由 orchestrator 决定是否降级。
 - 默认超时 `timeoutMs = 600_000`（10 分钟）——bigmodel 在过载 529 时 SDK 内部重试，旧 60s 会误判超时。
+- **CLI 发现服务**：`claude-cli-service.ts` / `opencode-cli-service.ts` 负责可执行发现与（OpenCode 的）显式安装，`/api/claude/status`、`/api/opencode/*` 路由供设置页读取。Finder 启动的 Electron 继承最小 PATH，Terminal 里可用的裸 `claude` 在生产环境会 ENOENT——发现逻辑必须扫 npm 常见安装位置；安装/认证仍是显式用户动作（会改动账户/系统状态）。
 
 ### 数据层
 
@@ -120,6 +122,8 @@ feishu_sync:
 ## 原生模块 ABI（better-sqlite3）
 
 打包/跑 Electron 时 better-sqlite3 的 `.node` 二进制必须匹配 Electron ABI，否则启动崩。`scripts/build-desktop-target.cjs` 在 `build:all → electron:build` 后会跑 `@electron/rebuild`。验证用 `scripts/verify-abi.cjs`。开发态 `dev:desktop` 与 standalone server 用同一份 server/dist，ABI 必须一致。
+
+**实测坑**：node_modules 被 `@electron/rebuild` 编译成 Electron ABI 后，直接用系统 Node 跑 vitest 会报 `NODE_MODULE_VERSION` 不匹配，横跨所有直连 better-sqlite3 的测试（20+ 用例）。切回系统 Node ABI：`cd server && npm rebuild better-sqlite3`。跑桌面构建后再跑测试时按此切换。
 
 ## 代码约定
 

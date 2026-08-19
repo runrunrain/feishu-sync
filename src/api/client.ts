@@ -23,6 +23,8 @@ import type {
   ClaudeCliStatus,
   FeishuPendingItem,
   TreeResponse,
+  CustomFolder,
+  AddLinkToFolderResult,
 } from '../types';
 
 class APIError extends Error {
@@ -554,6 +556,64 @@ export async function installOpenCode(): Promise<OpenCodeInstallResult> {
 /** Read-only Claude Code discovery/version check for the desktop settings page. */
 export async function getClaudeCliStatus(): Promise<ClaudeCliStatus> {
   return request<ClaudeCliStatus>('/api/claude/status');
+}
+
+// ============================================================================
+// Custom Folders API (快捷添加云链接 + 自定义文件夹归档)
+// ============================================================================
+//
+// 契约见 src/types/index.ts 的 Custom Folder 区块注释。字段名（camelCase）
+// 前后端共同遵守，勿改。写失败语义：400 invalid_name / 409 duplicate_name /
+// 逐条 error.code 分类均由调用方转为用户可读文案。
+
+/** GET /api/custom-folders — 列出全部自定义归档文件夹（含各自文档）。 */
+export async function listCustomFolders(): Promise<CustomFolder[]> {
+  const data = await request<{ folders: CustomFolder[] }>('/api/custom-folders');
+  return data.folders ?? [];
+}
+
+/**
+ * POST /api/custom-folders — 新建文件夹。
+ * 400 invalid_name（空 / 超长 / 含非法字符）；409 duplicate_name（同名）。
+ */
+export async function createCustomFolder(name: string): Promise<CustomFolder> {
+  const data = await request<{ folder: CustomFolder }>('/api/custom-folders', {
+    method: 'POST',
+    body: JSON.stringify({ name }),
+  });
+  return data.folder;
+}
+
+/** PATCH /api/custom-folders/:id — 仅改 name 标签，localRelPath 不变，不做文件移动。 */
+export async function renameCustomFolder(id: string, name: string): Promise<CustomFolder> {
+  const data = await request<{ folder: CustomFolder }>(
+    `/api/custom-folders/${encodeURIComponent(id)}`,
+    { method: 'PATCH', body: JSON.stringify({ name }) },
+  );
+  return data.folder;
+}
+
+/** DELETE /api/custom-folders/:id — 文件夹下文档置空归档归属，本地文件保留。 */
+export async function deleteCustomFolder(id: string): Promise<{ ok: true }> {
+  return request<{ ok: true }>(`/api/custom-folders/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  });
+}
+
+/**
+ * POST /api/custom-folders/:id/docs — 批量添加云链接（≤20 条/次，调用方负责前端校验）。
+ * 返回逐条结果；error.code ∈ parse_failed | already_exists | unsupported_type |
+ * fetch_failed | permission_denied，already_exists 附已有归属。
+ */
+export async function addLinksToFolder(
+  folderId: string,
+  links: string[],
+): Promise<AddLinkToFolderResult[]> {
+  const data = await request<{ results: AddLinkToFolderResult[] }>(
+    `/api/custom-folders/${encodeURIComponent(folderId)}/docs`,
+    { method: 'POST', body: JSON.stringify({ links }) },
+  );
+  return data.results ?? [];
 }
 
 export { APIError };

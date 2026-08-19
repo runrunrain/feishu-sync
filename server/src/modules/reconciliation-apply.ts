@@ -32,6 +32,8 @@ export interface ReconciliationApplyOptions {
   operationDirectory?: string;
   /** Pre-built dry-run report; if omitted, one is generated first. */
   report?: ReconciliationReport;
+  /** Custom-folder prefixes to exclude from the generated report. */
+  customFolderRelPaths?: string[];
 }
 
 export interface ReconciliationApplyResult {
@@ -88,6 +90,8 @@ export async function applyReconciliation(
     buildReconciliationReport({
       knowledgeBaseRoot: root,
       watchedRoots: options.watchedRoots,
+      customFolderRelPaths: options.customFolderRelPaths,
+      dbPath: options.dbPath,
     });
 
   const operationId = `reconcile-apply-${new Date().toISOString().replace(/[:.]/g, '-')}`;

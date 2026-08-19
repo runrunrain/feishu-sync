@@ -342,6 +342,13 @@ export interface DocumentRecord {
   missingCompleteCount?: number;
   lastSyncErrorCode?: string | null;
   hasChild?: boolean;
+  /**
+   * Custom-folder archive: when non-null, this document was added via the
+   * quick-add flow into a custom folder (custom_folders.id). Such rows keep
+   * watched_root_url/watched_root_id NULL because they are not part of any
+   * synced structure tree.
+   */
+  customFolderId?: string | null;
 }
 
 /**
@@ -425,6 +432,13 @@ export interface ChangedDocument {
   isWatchedRootNode?: boolean;
   /** Portable relative path already stored in the database, if any. */
   localRelPath?: string | null;
+  /**
+   * Custom-folder archive: when non-null, this document belongs to a user-
+   * created custom folder and is NOT part of any synced watched-root tree.
+   * The sync planner bypasses watchedRoot validation for such docs and
+   * reuses their existing _custom/ local path.
+   */
+  customFolderId?: string | null;
 }
 
 export interface SyncedDocument {

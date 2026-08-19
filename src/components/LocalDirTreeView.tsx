@@ -243,7 +243,7 @@ function LocalNodeRenderer({
             ? 'bg-[rgba(158,43,37,0.04)] before:absolute before:left-0 before:top-0 before:bottom-0 before:w-0.5 before:bg-seal'
             : 'hover:bg-paper-2'
         }`}
-        style={{ paddingLeft: Math.min(8 + level * 10, 48) }}
+        style={{ paddingLeft: Math.min(8 + level * 8, 40) }}
         onClick={() => {
           if (isDir) onToggle(node.path);
           else if (doc) onSelect(doc.obj_token);
@@ -257,9 +257,9 @@ function LocalNodeRenderer({
             />
           ) : null}
         </span>
-        <Icon className={`w-4 h-4 shrink-0 ${isDir ? 'text-ink-soft' : 'text-ink-soft'}`} />
+        <Icon className={`${level === 0 ? 'w-4 h-4' : 'w-3.5 h-3.5'} shrink-0 ${isDir ? 'text-ink-soft' : 'text-ink-soft'}`} />
         <span
-          className={`min-w-0 flex-1 truncate text-[13px] ${
+          className={`min-w-0 flex-1 truncate ${level === 0 ? 'text-[13px]' : 'text-[12px]'} ${
             doc?.cloud_deleted === 1 ? 'text-ink-faint line-through' : 'text-ink'
           }`}
           style={{ fontFamily: 'var(--serif)' }}

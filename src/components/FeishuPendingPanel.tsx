@@ -6,9 +6,9 @@
  */
 
 import { useEffect, useState } from 'react';
-import { AlertTriangle, Cloud, RotateCw } from 'lucide-react';
+import { AlertTriangle, ChevronDown, Cloud, RotateCw } from 'lucide-react';
 import { listFeishuPending } from '../api/client';
-import { Card, CardBody, CardHeader } from './common/Card';
+import { Card, CardBody } from './common/Card';
 import { Button } from './common/Button';
 import type { FeishuPendingItem } from '../types';
 
@@ -40,6 +40,8 @@ export function FeishuPendingPanel({
   const [items, setItems] = useState<FeishuPendingItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // 默认收起：点击标题行才展开完整列表（收起时仅保留标题 + 数量徽标）
+  const [collapsed, setCollapsed] = useState(true);
 
   useEffect(() => {
     let cancelled = false;
@@ -64,32 +66,56 @@ export function FeishuPendingPanel({
 
   if (!loading && !error && items.length === 0) return null;
 
+  const toggleCollapsed = () => setCollapsed((value) => !value);
+
   return (
     <Card variant="sunken" className="border-amber-700/30">
-      <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+      {/* 可点击标题行（复刻 CardHeader 的内边距/边框样式，收起时去掉底部分隔线） */}
+      <div
+        role="button"
+        tabIndex={0}
+        aria-expanded={!collapsed}
+        onClick={toggleCollapsed}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            toggleCollapsed();
+          }
+        }}
+        className={`px-6 py-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between cursor-pointer select-none ${
+          collapsed ? '' : 'border-b border-line'
+        }`}
+      >
         <div className="min-w-0">
           <div className="flex items-center gap-2 text-ink">
             <Cloud className="h-4 w-4 text-seal shrink-0" />
             <h2 className="text-base font-medium">飞书侧待处理{items.length > 0 ? `（${items.length}）` : ''}</h2>
+            <ChevronDown
+              className={`h-4 w-4 shrink-0 text-ink-faint transition-transform ${collapsed ? '' : 'rotate-180'}`}
+            />
           </div>
           <p className="mt-1 text-xs leading-5 text-ink-faint">
             这些项目已暂停自动检测提示，不会再出现在最近变更；完成飞书侧处理后再重新检测。
           </p>
         </div>
-        {items.length > 0 && (
+        {!collapsed && items.length > 0 && (
           <Button
             size="sm"
             variant="secondary"
             loading={rechecking}
-            onClick={() => onRecheck(items)}
+            onClick={(event) => {
+              event.stopPropagation();
+              onRecheck(items);
+            }}
             className="shrink-0"
           >
             <RotateCw className="h-3.5 w-3.5" />
             {rechecking ? '正在重新检测…' : '处理后重新检测'}
           </Button>
         )}
-      </CardHeader>
-      <CardBody className="space-y-3">
+      </div>
+      {!collapsed && (
+        <CardBody className="space-y-3">
         {loading && items.length === 0 && (
           <p className="text-sm text-ink-faint">正在读取待处理项…</p>
         )}
@@ -113,7 +139,8 @@ export function FeishuPendingPanel({
             )}
           </article>
         ))}
-      </CardBody>
+        </CardBody>
+      )}
     </Card>
   );
 }

@@ -41,6 +41,9 @@ function makeStubDetector(result: any, shouldThrow = false) {
         }
         return result;
       },
+      async detectCustomFolderChanges() {
+        return { checked: 0, changed: 0, errors: 0, changedDocuments: [] };
+      },
     },
     calls,
   };
@@ -62,6 +65,9 @@ function makePerRootStub(perRoot: Record<string, any>) {
           throw new Error(entry.throw);
         }
         return entry?.result ?? { changed: false, changedDocuments: [], totalNodes: 0 };
+      },
+      async detectCustomFolderChanges() {
+        return { checked: 0, changed: 0, errors: 0, changedDocuments: [] };
       },
     },
     calls,

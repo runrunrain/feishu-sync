@@ -634,6 +634,8 @@ export interface DesktopUpdateState {
   state: 'idle' | 'checking' | 'available' | 'downloading' | 'downloaded' | 'installing';
   version?: string;
   progress?: number;
+  /** 当前应用真实版本（Electron app.getVersion，桌面端存在）；与 electron/contracts.ts 对齐。 */
+  currentVersion?: string;
 }
 
 export interface DesktopUpdateCheckResult {
@@ -647,6 +649,64 @@ export interface DesktopUpdateEvent {
   state?: DesktopUpdateState['state'];
   progress?: number;
   error?: string;
+}
+
+// ============================================================================
+// Custom Folders (快捷添加云链接 + 自定义文件夹归档)
+// ============================================================================
+//
+// API 契约（前后端共同遵守，字段名勿改）：
+//   GET    /api/custom-folders           → { folders: CustomFolder[] }
+//   POST   /api/custom-folders { name }  → 201 { folder }；400 invalid_name；409 duplicate_name
+//   PATCH  /api/custom-folders/:id { name } → { folder }（仅改 name，localRelPath 不变）
+//   DELETE /api/custom-folders/:id       → { ok: true }（文档 custom_folder_id 置空，文件保留）
+//   POST   /api/custom-folders/:id/docs { links: string[] }（≤20 条/次）
+//          → { results: AddLinkToFolderResult[] }
+
+/** 自定义归档文件夹下的单篇云文档。 */
+export interface CustomFolderDoc {
+  objToken: string;
+  title: string;
+  objType: 'docx' | 'sheet' | 'slides' | string;
+  originalLink: string;
+  /** 相对知识库根的 POSIX 路径（<folderRelPath>/<title>.<ext>）。 */
+  localRelPath: string;
+}
+
+export interface CustomFolder {
+  id: string;
+  name: string;
+  /** 相对知识库根的 POSIX 路径，默认 `_custom/<sanitized-name>`。 */
+  localRelPath: string;
+  createdAt: string;
+  docs: CustomFolderDoc[];
+}
+
+/** POST /docs 逐条错误分类（契约固定枚举）。 */
+export type AddLinkErrorCode =
+  | 'parse_failed'
+  | 'already_exists'
+  | 'unsupported_type'
+  | 'fetch_failed'
+  | 'permission_denied';
+
+export interface AddLinkResultError {
+  code: AddLinkErrorCode | string;
+  message?: string;
+  /** already_exists 时附已有归属（结构树 / 归档文件夹名）。
+   * 真实后端字段名为 existingLocation；owner 为兼容别名。 */
+  owner?: string;
+  existingLocation?: string;
+}
+
+/** POST /api/custom-folders/:id/docs 的逐条结果。 */
+export interface AddLinkToFolderResult {
+  link: string;
+  ok: boolean;
+  objToken?: string;
+  title?: string;
+  objType?: string;
+  error?: AddLinkResultError;
 }
 
 declare global {

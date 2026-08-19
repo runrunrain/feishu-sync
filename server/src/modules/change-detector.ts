@@ -391,6 +391,131 @@ export class ChangeDetector {
   }
 
   /**
+   * Detect content modifications for custom-folder archive documents.
+   *
+   * Custom-folder docs (custom_folder_id non-null, watched_root_url NULL)
+   * are quick-added snapshots that originally lived outside the sync/detect
+   * pipeline. This method brings them into the modification-detection loop:
+   *
+   *   1. Read all custom-folder rows from SQLite.
+   *   2. For each, call getNode(originalLink) to fetch the current cloud
+   *      obj_edit_time.
+   *   3. Feed the observation through recordCloudObservation so the existing
+   *      state machine (nextStateForObservation) decides pending_modified vs
+   *      synced. This reuses the exact same comparison logic as watched-root
+   *      detection (NaN-safe, preserves synced baseline).
+   *   4. Collect rows that became pending_modified into changedDocuments.
+   *
+   * Design decisions for v1:
+   *   - **No deletion detection.** A getNode failure (131005, permission
+   *     revoked, rate limit) does NOT mark the row as deleted — it may be a
+   *     transient permission issue. Failed lookups are counted as errors and
+   *     skipped; only successful lookups that show cloud edit time > synced
+   *     baseline are reported as modified.
+   *   - **No added detection.** Custom docs are always created via the
+   *     quick-add flow with sync_state='synced'; a brand-new node cannot
+   *     appear in this set.
+   *   - getNode is called via originalLink (the full feishu wiki URL stored
+   *     at quick-add time). Docs without originalLink or wikiNodeToken are
+   *     skipped (cannot re-check identity).
+   */
+  async detectCustomFolderChanges(): Promise<{
+    checked: number;
+    changed: number;
+    errors: number;
+    changedDocuments: ChangedDocument[];
+  }> {
+    const customDocs = this.localMapStore.listAllCustomFolderDocs();
+    if (customDocs.length === 0) {
+      return { checked: 0, changed: 0, errors: 0, changedDocuments: [] };
+    }
+
+    const now = new Date().toISOString();
+    const changedDocuments: ChangedDocument[] = [];
+    let errors = 0;
+
+    for (const doc of customDocs) {
+      // Resolve a feishu reference for getNode. Prefer originalLink (full
+      // wiki URL); fall back to wikiNodeToken. Skip if neither is available
+      // — we cannot safely re-query cloud identity without one.
+      const reference =
+        doc.originalLink?.trim() || doc.wikiNodeToken?.trim() || '';
+      if (!reference) {
+        errors += 1;
+        continue;
+      }
+
+      let cloudEditTime: number | null;
+      let cloudTitle: string;
+      let cloudSpaceId: string | null;
+      let cloudObjType: ChangedDocument['objType'];
+
+      try {
+        const nodeInfo = await this.larkCliClient.getNode(reference);
+        cloudEditTime = nodeInfo.obj_edit_time ?? null;
+        cloudTitle = nodeInfo.title || doc.title;
+        cloudSpaceId = nodeInfo.space_id ?? doc.spaceId ?? null;
+        cloudObjType = this.normalizeObjType(nodeInfo.obj_type);
+      } catch (error) {
+        // getNode failed: do NOT infer deletion (131005 may be transient
+        // permission). Count as error and skip this doc.
+        errors += 1;
+        console.warn(
+          `[ChangeDetector] detectCustomFolderChanges: getNode failed for ${doc.objToken}, skipping:`,
+          error instanceof Error ? error.message : String(error),
+        );
+        continue;
+      }
+
+      // Build a CloudNodeObservation and feed it through the standard state
+      // machine. watchedRootId/watchedRootUrl are null for custom docs;
+      // recordCloudObservation's COALESCE conflict clause preserves the
+      // existing (NULL) values and never touches custom_folder_id.
+      const observation: CloudNodeObservation = {
+        objToken: doc.objToken,
+        wikiNodeToken: doc.wikiNodeToken ?? '',
+        objType: cloudObjType,
+        title: cloudTitle,
+        spaceId: cloudSpaceId,
+        parentNodeToken: doc.parentNodeToken ?? null,
+        watchedRootId: doc.watchedRootId ?? '',
+        watchedRootUrl: doc.watchedRootUrl ?? null,
+        observedObjEditTime: cloudEditTime,
+        hasChild: doc.hasChild ?? false,
+        observationStatus: cloudEditTime == null ? 'unavailable' : 'available',
+      };
+
+      let updatedRecord: DocumentRecord;
+      try {
+        updatedRecord = this.localMapStore.recordCloudObservation({
+          ...observation,
+          lastSeenAt: now,
+        }) as DocumentRecord;
+      } catch (recordError) {
+        errors += 1;
+        console.error(
+          `[ChangeDetector] detectCustomFolderChanges: recordCloudObservation failed for ${doc.objToken}:`,
+          recordError,
+        );
+        continue;
+      }
+
+      if (updatedRecord.syncState === 'pending_modified') {
+        changedDocuments.push(
+          this.toChangedDocument(observation, updatedRecord, 'modified', null),
+        );
+      }
+    }
+
+    return {
+      checked: customDocs.length,
+      changed: changedDocuments.length,
+      errors,
+      changedDocuments,
+    };
+  }
+
+  /**
    * Uncached detect implementation. Split out so `detectChanges` can wrap
    * it with the short-lived result cache without changing the original
    * traversal/comparison logic.
@@ -1055,6 +1180,7 @@ export class ChangeDetector {
       parentChainTitles: hierarchy?.parentChainTitles,
       isWatchedRootNode: hierarchy?.isWatchedRootNode,
       localRelPath: record.localRelPath ?? null,
+      customFolderId: record.customFolderId ?? null,
     };
   }
 

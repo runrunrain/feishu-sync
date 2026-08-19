@@ -177,12 +177,17 @@ detectRoutes.post('/api/detect/changes-all', async (c) => {
 
   const config = configManager.getConfig();
   const watchedRootUrls = getEnabledWatchedRootUrls(config);
-  if (watchedRootUrls.length === 0) {
+
+  // Custom-folder detection runs unconditionally (even with zero watched
+  // roots) so quick-added archive docs are always checked for cloud edits.
+  const customResult = await changeDetector.detectCustomFolderChanges();
+
+  if (watchedRootUrls.length === 0 && customResult.checked === 0) {
     return c.json(
       {
         error: 'no_watched_roots',
         message:
-          '没有启用的 watchedRoots。请在配置面板中添加并启用至少一个飞书知识库根目录后再执行检测。',
+          '没有启用的 watchedRoots，也没有归档文档。请在配置面板中添加并启用至少一个飞书知识库根目录，或通过快捷添加归档文档后再执行检测。',
       },
       400
     );
@@ -212,6 +217,12 @@ detectRoutes.post('/api/detect/changes-all', async (c) => {
       results.push({ rootUrl, status: 'error', error: message });
     }
   }
+
+  // Merge custom-folder modified docs into the aggregated response.
+  if (customResult.changedDocuments.length) {
+    aggregatedChangedDocuments.push(...customResult.changedDocuments);
+  }
+  aggregatedTotalNodes += customResult.checked;
 
   const response: MultiRootDetectionResult = {
     changed: aggregatedChangedDocuments.length > 0,

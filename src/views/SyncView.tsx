@@ -399,7 +399,7 @@ export function SyncView() {
 
       <SyncProgress
         syncing={syncing}
-        total={selectedDocs.length}
+        total={sync.total > 0 ? sync.total : selectedDocs.length}
         done={sync.syncResult ? sync.syncResult.syncedDocuments.length + sync.syncResult.failedDocuments.length : 0}
       />
 

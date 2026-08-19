@@ -321,7 +321,18 @@ function getQuitCoordinator() {
       closeServer,
       sanitizeError: sanitizeDesktopError,
       onBeforeQuit: (reason: QuitReason) => {
+        // 退出前先切断所有指向内嵌 server 的连接来源：停掉主进程的
+        // 变更检测轮询、销毁渲染窗口——渲染层每 30s 轮询鉴权状态会
+        // 持续维持 keep-alive 连接，让 server.close() 永远等不完。
+        // destroy() 会绕过 window.on('close') 里的“隐藏到托盘”拦截，
+        // 且保证触发 closed 事件完成 mainWindow 清理。
+        changeNotificationService?.stop();
         trayService?.dispose();
+        for (const win of BrowserWindow.getAllWindows()) {
+          if (!win.isDestroyed()) {
+            win.destroy();
+          }
+        }
       },
     });
   }
@@ -579,6 +590,20 @@ app.on('activate', () => {
 
 app.on('before-quit', (event) => {
   getQuitCoordinator().handleBeforeQuit(event);
+});
+
+// 把 SIGTERM/SIGINT 纳入统一的退出流程（内部带 5s 强制退出兜底）。
+// 此前默认 SIGTERM 被 Electron 转入 quit 流程后，会卡死在
+// before-quit 的 preventDefault + server.close() 上，信号被吞掉，
+// 表现为 kill 无效、只能 kill -9。
+process.on('SIGTERM', () => {
+  console.info('[Electron] SIGTERM received, initiating quit');
+  void getQuitCoordinator().requestQuit('system');
+});
+
+process.on('SIGINT', () => {
+  console.info('[Electron] SIGINT received, initiating quit');
+  void getQuitCoordinator().requestQuit('system');
 });
 
 // Global shortcut for showing window

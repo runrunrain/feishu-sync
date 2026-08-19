@@ -362,7 +362,12 @@ function planDocument(
   }
 
   const watchedRoot = findWatchedRoot(document, watchedRoots);
-  if (watchedRoots.length > 0 && !watchedRoot) {
+  // Custom-folder docs (quick-added archive) have no watched-root identity.
+  // They always reuse their existing _custom/ localMdPath, so they must
+  // bypass the watchedRoot validation that would otherwise block them as
+  // 'unknown_watched_root'.
+  const isCustomFolderDoc = !!document.customFolderId;
+  if (!isCustomFolderDoc && watchedRoots.length > 0 && !watchedRoot) {
     return blockedPlan(document, {
       reasonCode: 'unknown_watched_root',
       reason: '文档的 watchedRootId 未匹配到当前启用配置，拒绝跨根或根目录回退',
@@ -370,7 +375,7 @@ function planDocument(
     });
   }
 
-  if (watchedRoot) {
+  if (!isCustomFolderDoc && watchedRoot) {
     const resolved = resolveLocalTarget({
       knowledgeBaseRoot: root,
       watchedRoot,

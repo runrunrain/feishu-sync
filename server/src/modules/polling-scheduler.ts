@@ -92,20 +92,44 @@ export class PollingScheduler {
   }
 
   /**
-   * Execute detection for all watched root URLs
+   * Execute detection for all watched root URLs, then check custom-folder
+   * archive documents for cloud-side modifications.
    */
   private async executeDetection(): Promise<void> {
     console.info('[PollingScheduler] Executing change detection...');
 
     const rootUrls = getEnabledWatchedRootUrls(this.options.config);
 
+    let anyChanged = false;
+    const allChangedDocuments: import('../types/index.js').ChangedDocument[] = [];
+
     for (const rootUrl of rootUrls) {
       try {
         const result = await this.options.changeDetector.detectChanges(rootUrl);
-        this.options.onChange(result);
+        if (result.changed) anyChanged = true;
+        if (result.changedDocuments?.length) allChangedDocuments.push(...result.changedDocuments);
       } catch (error) {
         console.error(`[PollingScheduler] Detection failed for ${rootUrl}:`, error);
       }
+    }
+
+    // Custom-folder docs live outside watched-root trees; check them once
+    // per poll cycle so quick-added archive docs surface cloud edits.
+    try {
+      const customResult = await this.options.changeDetector.detectCustomFolderChanges();
+      if (customResult.changed > 0) anyChanged = true;
+      if (customResult.changedDocuments.length) allChangedDocuments.push(...customResult.changedDocuments);
+    } catch (error) {
+      console.error('[PollingScheduler] Custom-folder detection failed:', error);
+    }
+
+    if (anyChanged || allChangedDocuments.length > 0) {
+      this.options.onChange({
+        changed: anyChanged,
+        changedDocuments: allChangedDocuments,
+        checkedAt: new Date().toISOString(),
+        totalNodes: 0,
+      });
     }
   }
 }

@@ -17,7 +17,8 @@ import { useToast } from './common/Toast';
 import { appLogger } from '../utils/appLogger';
 import type { DesktopUpdateState } from '../types';
 
-const APP_VERSION = 'v0.2.0';
+// 构建时由 vite 注入（package.json version）；桌面端优先使用 Electron 返回的真实版本。
+declare const __APP_VERSION__: string;
 
 /**
  * 检查桌面更新 API 是否可用。
@@ -46,6 +47,9 @@ export function AppUpdateCard() {
   const [loading, setLoading] = useState(false);
 
   const updateAvailable = isDesktopUpdateAvailable();
+
+  // 显示版本：优先 Electron 真实版本（app.getVersion），否则构建注入版本（dev/浏览器）。
+  const displayVersion = `v${updateState?.currentVersion || __APP_VERSION__ || '0.0.0'}`;
 
   useEffect(() => {
     if (!isDesktopUpdateAvailable()) return;
@@ -135,7 +139,7 @@ export function AppUpdateCard() {
       <CardBody className="space-y-4">
         <div className="flex items-center justify-between">
           <span className="text-sm text-ink-soft">当前版本</span>
-          <span className="text-sm font-mono text-seal">{APP_VERSION}</span>
+          <span className="text-sm font-mono text-seal">{displayVersion}</span>
         </div>
 
         {!updateAvailable && (

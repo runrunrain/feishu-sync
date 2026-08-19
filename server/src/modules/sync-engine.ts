@@ -415,7 +415,13 @@ export class SyncEngine {
           watchedRootId: doc.watchedRootId ?? planned.watchedRootId ?? null,
         };
         failedDocuments.push(failedDocument);
-        this.queueFeishuSideFailure(failedDocument);
+        // Custom-folder docs are not tied to a watched root. The feishu_pending
+        // queue is filtered by watched_root_id in the UI, so entries with a
+        // NULL watched_root_id would be invisible. Keep custom doc failures
+        // as normal error-classified failures instead of enqueuing them.
+        if (!doc.customFolderId) {
+          this.queueFeishuSideFailure(failedDocument);
+        }
       }
     }
 

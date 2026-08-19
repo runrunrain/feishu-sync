@@ -83,6 +83,22 @@ async function fetchMultiRootDiff(
   const added: ChangedDocument[] = [];
   const modified: ChangedDocument[] = [];
   const deleted: ChangedDocument[] = [];
+  // Dedup by objToken: custom-folder (归档) docs are intentionally merged
+  // into EVERY root's stored diff server-side, so a naive concat repeats
+  // them once per watchedRoot (4 roots -> 4 identical rows).
+  const seen = { added: new Set<string>(), modified: new Set<string>(), deleted: new Set<string>() };
+  const pushUnique = (
+    bucket: ChangedDocument[],
+    seenTokens: Set<string>,
+    docs: ChangedDocument[],
+  ) => {
+    for (const doc of docs) {
+      const key = doc.objToken ?? `${doc.title}:${doc.localMdPath ?? ''}`;
+      if (seenTokens.has(key)) continue;
+      seenTokens.add(key);
+      bucket.push(doc);
+    }
+  };
   let unchanged = 0;
   let totalCloud = 0;
   let totalLocal = 0;
@@ -93,9 +109,9 @@ async function fetchMultiRootDiff(
     if (!isUsableWikiUrl(url)) continue;
     try {
       const r = await getStoredMappingDiff(url);
-      added.push(...r.added);
-      modified.push(...r.modified);
-      deleted.push(...r.deleted);
+      pushUnique(added, seen.added, r.added);
+      pushUnique(modified, seen.modified, r.modified);
+      pushUnique(deleted, seen.deleted, r.deleted);
       unchanged += r.unchanged ?? 0;
       totalCloud += r.totalCloud ?? 0;
       totalLocal += r.totalLocal ?? 0;

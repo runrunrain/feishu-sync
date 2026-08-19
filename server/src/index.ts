@@ -14,6 +14,7 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import os from 'node:os';
+import type { Server as HttpServer } from 'node:http';
 
 import { ConfigManager } from './modules/config-manager.js';
 import { LarkCliClient } from './modules/lark-cli-client.js';
@@ -28,6 +29,7 @@ import { syncRoutes } from './routes/sync.js';
 import { feishuRoutes } from './routes/feishu.js';
 import { mappingRoutes } from './routes/mapping.js';
 import { trashRoutes } from './routes/trash.js';
+import { customFolderRoutes } from './routes/custom-folders.js';
 import { llmRoutes } from './routes/llm.js';
 import { opencodeRoutes } from './routes/opencode.js';
 import { OpenCodeCliService } from './modules/opencode-cli-service.js';
@@ -40,6 +42,8 @@ import type { LarkCliConfig } from './types/index.js';
 // ============================================================================
 
 const DEFAULT_PORT = 3001;
+/** server.close() 等待活跃连接收尾的宽限期，超时后强制销毁全部连接。 */
+const SHUTDOWN_GRACE_MS = 3_000;
 
 export interface CreateServerOptions {
   desktopMode?: boolean;
@@ -216,6 +220,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
   app.route('/', feishuRoutes);
   app.route('/', mappingRoutes);
   app.route('/', trashRoutes);
+  app.route('/', customFolderRoutes);
   app.route('/', llmRoutes);
   app.route('/', opencodeRoutes);
   app.route('/', claudeRoutes);
@@ -290,11 +295,42 @@ export async function startServer(options: CreateServerOptions & {
   const close = async () => {
     if (closed) return;
     closed = true;
-    await new Promise<void>((resolve, reject) => {
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+
+      // 桌面端卡死根因：Node 的 server.close() 回调要等所有连接（包括
+      // keep-alive 空闲连接）全部断开才触发。渲染进程每 30s 轮询
+      // /api/auth/status、主进程变更检测也走 fetch，这些连接会让回调
+      // 永远不触发，quit 流程随之挂死。先踢掉空闲连接，活跃连接再等
+      // 一个宽限期，超时后全部销毁——close() 保证会 resolve。
+      // ServerType 联合类型含 Http2Server（无这两个方法），但 serve()
+      // 无 TLS 选项时返回的就是 node:http Server，收窄后按特性调用。
+      const nodeServer = started.server as HttpServer;
+      if (typeof nodeServer.closeIdleConnections === 'function') {
+        nodeServer.closeIdleConnections();
+      }
       started.server.close((error?: Error) => {
-        if (error) reject(error);
-        else resolve();
+        // 关闭出错（如 server 已不在运行）也不能让 quit 流程卡死或
+        // reject——调用方据此决定是否继续退出。
+        if (error) {
+          console.warn('[server] HTTP server close reported an error (continuing shutdown):', error.message);
+        }
+        finish();
       });
+      const graceTimer = setTimeout(() => {
+        console.warn('[server] Graceful close timed out, destroying remaining connections');
+        if (typeof nodeServer.closeAllConnections === 'function') {
+          nodeServer.closeAllConnections();
+        }
+        finish();
+      }, SHUTDOWN_GRACE_MS);
+      // 宽限期计时器不能阻止独立 server 进程自然退出。
+      graceTimer.unref?.();
     });
   };
 

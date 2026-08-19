@@ -112,6 +112,8 @@ export class LocalMapStore {
       { name: 'missing_complete_count', dml: 'ALTER TABLE documents ADD COLUMN missing_complete_count INTEGER NOT NULL DEFAULT 0' },
       { name: 'last_sync_error_code', dml: 'ALTER TABLE documents ADD COLUMN last_sync_error_code TEXT' },
       { name: 'has_child', dml: 'ALTER TABLE documents ADD COLUMN has_child INTEGER NOT NULL DEFAULT 0' },
+      // custom-folder archive (quick-add): links a document to custom_folders.id
+      { name: 'custom_folder_id', dml: 'ALTER TABLE documents ADD COLUMN custom_folder_id TEXT' },
     ];
 
     const pending = additive.filter((c) => !colNames.has(c.name));
@@ -168,6 +170,7 @@ export class LocalMapStore {
       CREATE INDEX IF NOT EXISTS idx_documents_sync_state ON documents(sync_state);
       CREATE INDEX IF NOT EXISTS idx_documents_watched_root_id ON documents(watched_root_id);
       CREATE INDEX IF NOT EXISTS idx_documents_missing_complete ON documents(missing_complete_count);
+      CREATE INDEX IF NOT EXISTS idx_documents_custom_folder ON documents(custom_folder_id);
     `);
 
     this.applyV5RuntimeStateBackfill();
@@ -1131,6 +1134,7 @@ export class LocalMapStore {
       missingCompleteCount: row.missing_complete_count ?? 0,
       lastSyncErrorCode: row.last_sync_error_code ?? null,
       hasChild: (row.has_child ?? 0) === 1,
+      customFolderId: row.custom_folder_id ?? null,
     };
   }
 
@@ -1139,6 +1143,275 @@ export class LocalMapStore {
    */
   private generateSyncId(): string {
     return `sync-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
+  }
+
+  // -------------------------------------------------------------------------
+  // Custom-folder archive (quick-add flow)
+  // -------------------------------------------------------------------------
+
+  /** Return all custom folders ordered by name. */
+  listCustomFolders(): Array<{
+    id: string;
+    name: string;
+    localRelPath: string;
+    createdAt: string;
+  }> {
+    const rows = this.getStatement(`
+      SELECT id, name, local_rel_path, created_at
+      FROM custom_folders
+      ORDER BY name COLLATE NOCASE ASC, created_at ASC
+    `).all() as Array<{
+      id: string;
+      name: string;
+      local_rel_path: string;
+      created_at: string;
+    }>;
+    return rows.map((row) => ({
+      id: row.id,
+      name: row.name,
+      localRelPath: row.local_rel_path,
+      createdAt: row.created_at,
+    }));
+  }
+
+  /** Get a single folder by id, or null when it does not exist. */
+  getCustomFolder(id: string): {
+    id: string;
+    name: string;
+    localRelPath: string;
+    createdAt: string;
+  } | null {
+    const row = this.getStatement(`
+      SELECT id, name, local_rel_path, created_at
+      FROM custom_folders WHERE id = ?
+    `).get(id) as
+      | {
+          id: string;
+          name: string;
+          local_rel_path: string;
+          created_at: string;
+        }
+      | undefined;
+    return row
+      ? {
+          id: row.id,
+          name: row.name,
+          localRelPath: row.local_rel_path,
+          createdAt: row.created_at,
+        }
+      : null;
+  }
+
+  /** Find a folder by display name (case-sensitive, exact match). */
+  getCustomFolderByName(name: string): {
+    id: string;
+    name: string;
+    local_rel_path: string;
+  } | null {
+    const row = this.getStatement(`
+      SELECT id, name, local_rel_path FROM custom_folders WHERE name = ?
+    `).get(name) as
+      | { id: string; name: string; local_rel_path: string }
+      | undefined;
+    return row ?? null;
+  }
+
+  /** Find a folder whose local_rel_path matches exactly. */
+  getCustomFolderByLocalRelPath(localRelPath: string): { id: string } | null {
+    const row = this.getStatement(`
+      SELECT id FROM custom_folders WHERE local_rel_path = ?
+    `).get(localRelPath) as { id: string } | undefined;
+    return row ?? null;
+  }
+
+  /** Insert a new custom folder. localRelPath must be unique (caller checks). */
+  createCustomFolder(input: {
+    id: string;
+    name: string;
+    localRelPath: string;
+  }): { id: string; name: string; localRelPath: string; createdAt: string } {
+    this.getStatement(`
+      INSERT INTO custom_folders (id, name, local_rel_path)
+      VALUES (?, ?, ?)
+    `).run(input.id, input.name, input.localRelPath);
+    return this.getCustomFolder(input.id)!;
+  }
+
+  /** Rename a folder. Only the display label changes; localRelPath is fixed. */
+  renameCustomFolder(id: string, name: string): void {
+    this.getStatement(`
+      UPDATE custom_folders SET name = ? WHERE id = ?
+    `).run(name, id);
+  }
+
+  /** Delete a folder row. Associated documents are unlinked by the caller. */
+  deleteCustomFolder(id: string): void {
+    this.getStatement(`DELETE FROM custom_folders WHERE id = ?`).run(id);
+  }
+
+  /** Set documents.custom_folder_id = NULL for every doc in this folder. */
+  clearDocumentsCustomFolder(folderId: string): number {
+    const result = this.getStatement(`
+      UPDATE documents SET custom_folder_id = NULL WHERE custom_folder_id = ?
+    `).run(folderId);
+    return result.changes;
+  }
+
+  /**
+   * List documents belonging to a custom folder, ordered by title.
+   * Used by GET /api/custom-folders to compose the docs array per folder.
+   */
+  listCustomFolderDocs(folderId: string): Array<{
+    objToken: string;
+    title: string;
+    objType: string;
+    originalLink: string | null;
+    localRelPath: string | null;
+  }> {
+    const rows = this.getStatement(`
+      SELECT obj_token, title, obj_type, original_link, local_rel_path
+      FROM documents
+      WHERE custom_folder_id = ?
+      ORDER BY title COLLATE NOCASE ASC
+    `).all(folderId) as Array<{
+      obj_token: string;
+      title: string;
+      obj_type: string;
+      original_link: string | null;
+      local_rel_path: string | null;
+    }>;
+    return rows.map((row) => ({
+      objToken: row.obj_token,
+      title: row.title,
+      objType: row.obj_type,
+      originalLink: row.original_link,
+      localRelPath: row.local_rel_path,
+    }));
+  }
+
+  /**
+   * Link a document row to a custom folder and stamp the archive-specific
+   * fields. This is the write performed after a successful file commit for a
+   * quick-added docx. Returns { applied: false } (a no-op) when a row for the
+   * obj_token already exists as a structure-tree member (watched_root_id or
+   * wiki_node_token set) — a race the route's earlier already_exists dup-check
+   * cannot cover — so the caller can roll back its files and report
+   * already_exists instead of clobbering the structure fields.
+   */
+  setDocumentCustomFolder(input: {
+    objToken: string;
+    folderId: string;
+    wikiNodeToken: string | null;
+    objType: 'docx' | 'sheet' | 'slides' | 'unknown';
+    title: string;
+    localMdPath: string;
+    localRelPath: string;
+    originalLink: string | null;
+    objEditTime: number | null;
+    spaceId: string | null;
+    lastSyncedAt?: string;
+  }): { applied: boolean } {
+    const nowIso = input.lastSyncedAt ?? new Date().toISOString();
+    // INSERT the documents row with the archive contract: watched_root_* NULL,
+    // custom_folder_id set, sync_state='synced', cloud_match='synced'.
+    //
+    // Ownership guard: the conflict update only applies to rows that are NOT
+    // structure-tree members (watched_root_id AND wiki_node_token both NULL).
+    // If the structure-sync engine inserted this obj_token between the route's
+    // already_exists dup-check and this write, the WHERE is false → the row is
+    // left untouched → changes=0 → the caller sees applied=false and rolls
+    // back its files. This prevents an unconditional upsert from nulling the
+    // structure fields and silently archiving a doc the user still wants in
+    // the tree.
+    const stmt = this.getStatement(`
+      INSERT INTO documents (
+        obj_token, wiki_node_token, obj_type, title, local_md_path,
+        last_synced_modify_time, last_synced_at, status,
+        original_link, cloud_match, watched_root_url,
+        observed_obj_edit_time, synced_obj_edit_time, sync_state,
+        watched_root_id, local_rel_path, space_id,
+        missing_complete_count, has_child, custom_folder_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'synced', ?, 'synced', NULL, ?, ?, 'synced', NULL, ?, ?, 0, 0, ?)
+      ON CONFLICT(obj_token) DO UPDATE SET
+        obj_type = excluded.obj_type,
+        title = excluded.title,
+        local_md_path = excluded.local_md_path,
+        last_synced_at = excluded.last_synced_at,
+        status = 'synced',
+        original_link = COALESCE(excluded.original_link, documents.original_link),
+        cloud_match = 'synced',
+        observed_obj_edit_time = COALESCE(excluded.observed_obj_edit_time, documents.observed_obj_edit_time),
+        synced_obj_edit_time = COALESCE(excluded.synced_obj_edit_time, documents.synced_obj_edit_time),
+        sync_state = 'synced',
+        wiki_node_token = excluded.wiki_node_token,
+        watched_root_url = NULL,
+        watched_root_id = NULL,
+        local_rel_path = excluded.local_rel_path,
+        space_id = COALESCE(excluded.space_id, documents.space_id),
+        custom_folder_id = excluded.custom_folder_id,
+        cloud_deleted = 0,
+        missing_complete_count = 0,
+        last_sync_error_code = NULL,
+        updated_at = datetime('now')
+      WHERE documents.watched_root_id IS NULL
+        AND documents.wiki_node_token IS NULL
+    `);
+    const info = stmt.run(
+      input.objToken,
+      input.wikiNodeToken,
+      input.objType,
+      input.title,
+      input.localMdPath,
+      input.objEditTime != null ? String(input.objEditTime) : '',
+      nowIso,
+      input.originalLink,
+      input.objEditTime,
+      input.objEditTime,
+      input.localRelPath,
+      input.spaceId,
+      input.folderId,
+    );
+    return { applied: info.changes > 0 };
+  }
+
+  /**
+   * List ALL documents that belong to ANY custom folder (custom_folder_id
+   * IS NOT NULL AND watched_root_url IS NULL). Used by ChangeDetector's
+   * detectCustomFolderChanges to check cloud edits for quick-added archive
+   * docs that live outside the synced structure tree.
+   *
+   * Note: listCustomFolderDocs(folderId) returns display fields for a single
+   * folder; this method returns full DocumentRecord rows for ALL folders.
+   */
+  listAllCustomFolderDocs(): DocumentRecord[] {
+    const rows = this.getStatement(`
+      SELECT * FROM documents
+      WHERE custom_folder_id IS NOT NULL
+        AND watched_root_url IS NULL
+        AND cloud_deleted = 0
+      ORDER BY title COLLATE NOCASE ASC
+    `).all() as any[];
+    return rows.map((row) => this.mapRowToDocumentRecord(row));
+  }
+
+  /** All custom-folder local_rel_path prefixes, for orphan-exclusion guards. */
+  getCustomFolderRelPaths(): string[] {
+    const rows = this.getStatement(`
+      SELECT local_rel_path FROM custom_folders
+    `).all() as Array<{ local_rel_path: string }>;
+    return rows.map((row) => row.local_rel_path).filter((p) => p && p.length > 0);
+  }
+
+  /**
+   * Look up the owner obj_token of a documents row by its local_rel_path.
+   * Used by the custom-folder archive flow to detect title collisions so two
+   * same-title docs never share one file (each DB row maps to a unique file).
+   */
+  getDocumentByLocalRelPath(localRelPath: string): { obj_token: string } | null {
+    const row = this.getStatement(`
+      SELECT obj_token FROM documents WHERE local_rel_path = ? LIMIT 1
+    `).get(localRelPath) as { obj_token: string } | undefined;
+    return row ?? null;
   }
 
   /**
@@ -1520,7 +1793,8 @@ export class LocalMapStore {
         local_rel_path TEXT,
         missing_complete_count INTEGER NOT NULL DEFAULT 0,
         last_sync_error_code TEXT,
-        has_child INTEGER NOT NULL DEFAULT 0
+        has_child INTEGER NOT NULL DEFAULT 0,
+        custom_folder_id TEXT
       );
 
       -- v0.1.0 indexes (columns always exist)
@@ -1605,6 +1879,17 @@ export class LocalMapStore {
         context TEXT,
         created_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
+
+      -- Custom-folder archive (quick-add flow). Each row is a user-created
+      -- folder that collects scattered cloud docs under a local directory
+      -- (_custom/<sanitized-name>). Documents link back via custom_folder_id.
+      CREATE TABLE IF NOT EXISTS custom_folders (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        local_rel_path TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_custom_folders_local_rel_path ON custom_folders(local_rel_path);
 
       -- Run log table
       CREATE TABLE IF NOT EXISTS run_log (

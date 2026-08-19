@@ -22,15 +22,18 @@ import type { LayoutProfile, WatchedRootConfig } from '../src/types/index.js';
 function parseArgs(argv: string[]): {
   root: string;
   reportDir: string;
+  db: string;
 } {
   let root = '';
+  let db = '';
   let reportDir = path.join(os.homedir(), '.feishu-sync', 'operations');
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--root') root = argv[++i] ?? '';
+    else if (arg === '--db') db = argv[++i] ?? '';
     else if (arg === '--report') reportDir = argv[++i] ?? reportDir;
     else if (arg === '--help' || arg === '-h') {
-      console.log(`Usage: reconcile-knowledge-base --root <kb> [--report <dir>]`);
+      console.log(`Usage: reconcile-knowledge-base --root <kb> [--db <sqlite>] [--report <dir>]`);
       process.exit(0);
     }
   }
@@ -38,7 +41,12 @@ function parseArgs(argv: string[]): {
     console.error('缺少 --root <knowledgeBaseRoot>');
     process.exit(1);
   }
-  return { root: path.resolve(root), reportDir: path.resolve(reportDir) };
+  // Default to the standard feishu-sync DB so custom-folder prefixes are
+  // auto-excluded even when the caller omits --db.
+  if (!db) {
+    db = path.join(os.homedir(), '.feishu-sync', 'feishu-sync.db');
+  }
+  return { root: path.resolve(root), reportDir: path.resolve(reportDir), db: path.resolve(db) };
 }
 
 /** Default four roots from the formal 飞书同步知识库 layout. */
@@ -82,7 +90,7 @@ function defaultWatchedRoots(kbRoot: string): WatchedRootConfig[] {
 }
 
 function main(): void {
-  const { root, reportDir } = parseArgs(process.argv.slice(2));
+  const { root, reportDir, db } = parseArgs(process.argv.slice(2));
   if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) {
     console.error(`知识库根不可读: ${root}`);
     process.exit(1);
@@ -96,6 +104,9 @@ function main(): void {
   const report = buildReconciliationReport({
     knowledgeBaseRoot: root,
     watchedRoots,
+    // Pass the DB so custom-folder prefixes are read automatically and
+    // _custom files are never misclassified as outside_watched_roots.
+    dbPath: fs.existsSync(db) ? db : undefined,
   });
 
   fs.mkdirSync(reportDir, { recursive: true, mode: 0o700 });

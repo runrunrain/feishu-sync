@@ -26,7 +26,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Search, Filter, RefreshCw, AlertTriangle, Cloud } from 'lucide-react';
+import { Search, Filter, RefreshCw, AlertTriangle, Cloud, ChevronRight, Plus, FolderArchive, Folder, FileText, Table, FileType } from 'lucide-react';
 import { Card, CardBody } from './common/Card';
 import { TreeNode } from './TreeNode';
 import { EmptyState } from './common/EmptyState';
@@ -34,9 +34,12 @@ import { TreeViewModeToggle } from './TreeViewModeToggle';
 import { useToast } from './common/Toast';
 import { appLogger } from '../utils/appLogger';
 import { getMappingTree, reorderMapping } from '../api/client';
-import type { MappingNode, WatchedRoot } from '../types';
+import type { CustomFolder, MappingNode, WatchedRoot } from '../types';
 
 type TreeFilter = 'all' | 'changed' | 'error' | 'orphan';
+
+/** 未分类分组的折叠 key（不与任何 watchedRoot.url 冲突）。 */
+const UNCLASSIFIED_KEY = '__unclassified__';
 
 const FILTER_LABEL: Record<TreeFilter, string> = {
   all: '全部',
@@ -81,6 +84,15 @@ interface NodeTreeViewProps {
    * root list is used.
    */
   watchedRoots?: WatchedRoot[];
+  /**
+   * 自定义归档文件夹（数据源 GET /api/custom-folders，由父组件注入）。
+   * 渲染在 watchedRoot 分组下方「自定义归档」区块：每个文件夹可收起/展开
+   * （复用 watchedRoot 分组折叠交互），其下渲染文档行，点击 onSelect(objToken)
+   * 联动详情卡。
+   */
+  customFolders?: CustomFolder[];
+  /** 提供时在搜索行旁渲染「快捷添加云文档」+ 按钮（由父组件打开对话框）。 */
+  onQuickAdd?: () => void;
 }
 
 interface TreeBucket {
@@ -168,6 +180,8 @@ export function NodeTreeView({
   view,
   onViewChange,
   watchedRoots,
+  customFolders,
+  onQuickAdd,
 }: NodeTreeViewProps) {
   const [nodes, setNodes] = useState<MappingNode[]>(nodesProp ?? []);
   const [loading, setLoading] = useState<boolean>(!nodesProp);
@@ -175,6 +189,8 @@ export function NodeTreeView({
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState<TreeFilter>('all');
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  // v0.2.4: watchedRoot 分组（根目录）可收起；key 为 watchedRoot.url。默认展开，点击分组标题切换。
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
   const toast = useToast();
   const dragState = useRef<{ dragged: MappingNode | null }>({ dragged: null });
   const [dragOver, setDragOver] = useState<{ objToken: string; position: 'before' | 'after' } | null>(null);
@@ -465,7 +481,128 @@ export function NodeTreeView({
     return { groups, unclassified };
   }, [roots, watchedRoots]);
 
+  // 自定义归档文档行的类型图标（与 TreeNode 同一映射，视觉一致）。
+  const CUSTOM_DOC_ICON: Record<string, typeof FileText> = {
+    docx: FileText,
+    sheet: Table,
+    slides: FileType,
+    unknown: FileType,
+  };
+
+  // 自定义归档分组：按搜索词过滤文档（与树搜索行为一致）。
+  const customQuery = search.trim().toLowerCase();
+  const renderCustomArchive = () => {
+    if (!customFolders || customFolders.length === 0) return null;
+    return (
+      <div className="mt-3">
+        <div className="px-2 py-1.5 text-[11px] text-ink-faint font-sans-ui border-b border-line/40 flex items-center gap-1.5">
+          <FolderArchive className="w-3 h-3 text-ink-faint shrink-0" />
+          自定义归档
+        </div>
+        {customFolders.map((folder) => {
+          const groupKey = `custom:${folder.id}`;
+          const groupCollapsed = collapsedGroups.has(groupKey);
+          const visibleDocs = customQuery
+            ? folder.docs.filter((d) => d.title.toLowerCase().includes(customQuery))
+            : folder.docs;
+          return (
+            <div key={folder.id} className="mb-1">
+              <div
+                role="button"
+                tabIndex={0}
+                aria-expanded={!groupCollapsed}
+                onClick={() => toggleGroup(groupKey)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    toggleGroup(groupKey);
+                  }
+                }}
+                className="px-2 py-1.5 border-b border-line/40 flex items-center gap-2 cursor-pointer select-none hover:bg-paper-2/60"
+              >
+                <ChevronRight
+                  className={`w-3.5 h-3.5 text-ink-faint shrink-0 transition-transform ${groupCollapsed ? '' : 'rotate-90'}`}
+                />
+                <Folder className="w-4 h-4 text-seal shrink-0" />
+                <span
+                  className="min-w-0 flex-1 text-sm font-medium text-ink truncate"
+                  style={{ fontFamily: 'var(--kai)' }}
+                  title={folder.localRelPath}
+                >
+                  {folder.name}
+                </span>
+                <span className="ml-auto text-[10px] text-ink-faint font-sans-ui shrink-0">
+                  {folder.docs.length} 篇
+                </span>
+              </div>
+              {!groupCollapsed && (
+                <div>
+                  {visibleDocs.length === 0 ? (
+                    <p className="px-8 py-1.5 text-[11px] text-ink-faint font-sans-ui">
+                      {customQuery ? '无匹配文档' : '（空文件夹）'}
+                    </p>
+                  ) : (
+                    visibleDocs.map((doc) => {
+                      const TypeIcon = CUSTOM_DOC_ICON[doc.objType] ?? FileType;
+                      const selected = selectedToken === doc.objToken;
+                      return (
+                        <div
+                          key={doc.objToken}
+                          role="treeitem"
+                          aria-selected={selected}
+                          tabIndex={0}
+                          onClick={() => onSelect(doc.objToken)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' || e.key === ' ') {
+                              e.preventDefault();
+                              onSelect(doc.objToken);
+                            }
+                          }}
+                          className={`relative flex min-w-0 items-center gap-2 h-8 overflow-hidden pr-2.5 rounded-sm cursor-pointer transition-colors ${
+                            selected ? 'bg-[rgba(158,43,37,0.04)]' : 'hover:bg-paper-2'
+                          } focus:outline-none focus-visible:ring-1 focus-visible:ring-seal/50 ${selected ? 'before:absolute before:left-0 before:top-0 before:bottom-0 before:w-0.5 before:bg-seal' : ''}`}
+                          style={{ paddingLeft: 16 }}
+                        >
+                          <TypeIcon className="w-3.5 h-3.5 text-ink-soft shrink-0" />
+                          <span
+                            className="min-w-0 flex-1 truncate text-[12px] text-ink"
+                            style={{ fontFamily: 'var(--serif)' }}
+                            title={doc.title}
+                          >
+                            {doc.title}
+                          </span>
+                          <a
+                            href={doc.originalLink}
+                            target="_blank"
+                            rel="noreferrer"
+                            onClick={(e) => e.stopPropagation()}
+                            aria-label="在飞书中打开"
+                            className="shrink-0 text-[10px] text-ink-faint hover:text-seal font-sans-ui"
+                          >
+                            原文
+                          </a>
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
+
   // ----- Loading / error / empty states -----
+  const toggleGroup = (key: string) => {
+    setCollapsedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
   let body: React.ReactNode;
   if (loading && nodes.length === 0) {
     body = (
@@ -483,7 +620,7 @@ export function NodeTreeView({
         action={{ label: '重试', onClick: fetchTree }}
       />
     );
-  } else if (roots.length === 0) {
+  } else if (roots.length === 0 && (!customFolders || customFolders.length === 0)) {
     body = (
       <EmptyState
         icon={<AlertTriangle className="w-8 h-8 text-ink-faint" />}
@@ -500,36 +637,72 @@ export function NodeTreeView({
         <div className="max-h-full overflow-x-hidden overflow-y-auto scrollbar-thin pr-1">
           {groupedRoots ? (
             <>
-              {groupedRoots.groups.map((g) => (
-                <div key={g.watchedRoot.url} className="mb-2">
-                  <div className="sticky top-0 z-10 min-w-0 bg-card-bg/95 backdrop-blur-sm px-2 py-1.5 border-b border-line/60 flex items-center gap-2">
-                    <Cloud className="w-3.5 h-3.5 text-seal shrink-0" />
-                    <span
-                      className="min-w-0 flex-1 text-xs font-medium text-ink truncate"
-                      style={{ fontFamily: 'var(--kai)' }}
-                      title={g.watchedRoot.url}
+              {groupedRoots.groups.map((g) => {
+                const groupKey = g.watchedRoot.url;
+                const groupCollapsed = collapsedGroups.has(groupKey);
+                return (
+                  <div key={groupKey} className="mb-2">
+                    <div
+                      role="button"
+                      tabIndex={0}
+                      aria-expanded={!groupCollapsed}
+                      onClick={() => toggleGroup(groupKey)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault();
+                          toggleGroup(groupKey);
+                        }
+                      }}
+                      className="sticky top-0 z-10 min-w-0 bg-card-bg/95 backdrop-blur-sm px-2 py-1.5 border-b border-line/60 flex items-center gap-2 cursor-pointer select-none"
                     >
-                      {g.watchedRoot.displayName || g.watchedRoot.title || g.watchedRoot.localDir}
-                    </span>
-                    <span className="ml-auto text-[10px] text-ink-faint font-sans-ui shrink-0">
-                      {g.nodes.length} 项
-                    </span>
+                      <ChevronRight
+                        className={`w-3.5 h-3.5 text-ink-faint shrink-0 transition-transform ${groupCollapsed ? '' : 'rotate-90'}`}
+                      />
+                      <Cloud className="w-4 h-4 text-seal shrink-0" />
+                      <span
+                        className="min-w-0 flex-1 text-sm font-medium text-ink truncate"
+                        style={{ fontFamily: 'var(--kai)' }}
+                        title={g.watchedRoot.url}
+                      >
+                        {g.watchedRoot.displayName || g.watchedRoot.title || g.watchedRoot.localDir}
+                      </span>
+                      <span className="ml-auto text-[10px] text-ink-faint font-sans-ui shrink-0">
+                        {g.nodes.length} 项
+                      </span>
+                    </div>
+                    {!groupCollapsed && g.nodes.map((r) => renderNode(r, 0))}
                   </div>
-                  {g.nodes.map((r) => renderNode(r, 0))}
-                </div>
-              ))}
+                );
+              })}
               {groupedRoots.unclassified.length > 0 && (
                 <div className="mt-3">
-                  <div className="px-2 py-1.5 text-[11px] text-ink-faint font-sans-ui border-b border-line/40">
+                  <div
+                    role="button"
+                    tabIndex={0}
+                    aria-expanded={!collapsedGroups.has(UNCLASSIFIED_KEY)}
+                    onClick={() => toggleGroup(UNCLASSIFIED_KEY)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        toggleGroup(UNCLASSIFIED_KEY);
+                      }
+                    }}
+                    className="px-2 py-1.5 text-[11px] text-ink-faint font-sans-ui border-b border-line/40 flex items-center gap-1.5 cursor-pointer select-none"
+                  >
+                    <ChevronRight
+                      className={`w-3 h-3 text-ink-faint shrink-0 transition-transform ${collapsedGroups.has(UNCLASSIFIED_KEY) ? '' : 'rotate-90'}`}
+                    />
                     未分类（未绑定 watchedRoot）
                   </div>
-                  {groupedRoots.unclassified.map((r) => renderNode(r, 0))}
+                  {!collapsedGroups.has(UNCLASSIFIED_KEY) &&
+                    groupedRoots.unclassified.map((r) => renderNode(r, 0))}
                 </div>
               )}
             </>
           ) : (
             roots.map((r) => renderNode(r, 0))
           )}
+          {renderCustomArchive()}
         </div>
         <div className="mt-3 pt-3 border-t border-line text-xs text-ink-faint font-sans-ui flex min-w-0 items-center justify-between gap-2">
           <span className="min-w-0 truncate">{nodes.length} 节点 · {roots.length} 顶层 · {changedCount} 变更</span>
@@ -590,6 +763,18 @@ export function NodeTreeView({
               <option key={f} value={f}>{FILTER_LABEL[f]}</option>
             ))}
           </select>
+          {onQuickAdd && (
+            <button
+              type="button"
+              onClick={onQuickAdd}
+              aria-label="快捷添加云文档"
+              title="快捷添加云文档到自定义归档"
+              className="inline-flex items-center gap-1 text-xs text-seal bg-paper border border-seal/40 rounded-md px-2 py-1.5 font-sans-ui hover:bg-seal hover:text-white transition-colors"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              添加
+            </button>
+          )}
         </div>
       </div>
       <CardBody className="flex-1 overflow-hidden flex flex-col">{body}</CardBody>

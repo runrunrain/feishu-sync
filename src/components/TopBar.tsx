@@ -12,6 +12,9 @@
 
 import { Wifi, WifiOff } from 'lucide-react';
 
+// 构建时由 vite 注入（package.json version），顶部栏版本徽标与「关于与更新」保持一致。
+declare const __APP_VERSION__: string;
+
 export type MainArea = 'overview' | 'sync' | 'settings';
 
 interface TopBarProps {
@@ -43,7 +46,7 @@ export function TopBar({ currentArea, onAreaChange, authReady, pendingCount }: T
         </div>
         <div className="flex min-w-0 flex-col leading-tight gap-0.5">
           <span className="truncate text-sm font-semibold font-kai text-ink">飞书同步</span>
-          <span className="hidden text-[10px] text-ink-faint font-mono lg:block">v0.2.0</span>
+          <span className="hidden text-[10px] text-ink-faint font-mono lg:block">v{__APP_VERSION__}</span>
         </div>
       </div>
 

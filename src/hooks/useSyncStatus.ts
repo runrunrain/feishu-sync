@@ -92,12 +92,17 @@ export function useSyncStatus(options: UseSyncStatusOptions = {}): SyncStatusDat
       return;
     }
     try {
-      let pending = 0;
+      // Dedup by objToken across roots: custom-folder (归档) docs are
+      // merged into every root's stored diff server-side, so summing
+      // per-root counts would multiply them by the number of watchedRoots.
+      const pendingTokens = new Set<string>();
       let latestCheckedAt = '';
       for (const url of validUrls) {
         try {
           const report = await getStoredMappingDiff(url);
-          pending += report.added.length + report.modified.length;
+          for (const doc of [...report.added, ...report.modified]) {
+            pendingTokens.add(doc.objToken ?? `${doc.title}:${doc.localMdPath ?? ''}`);
+          }
           if (report.checkedAt && report.checkedAt > latestCheckedAt) {
             latestCheckedAt = report.checkedAt;
           }
@@ -114,7 +119,7 @@ export function useSyncStatus(options: UseSyncStatusOptions = {}): SyncStatusDat
       const intervalMs = Math.max(1, pollIntervalMinutes) * 60 * 1000;
       const nextCheckTime = lastSyncTime ? lastSyncTime + intervalMs : null;
       setStatus({
-        pendingCount: pending,
+        pendingCount: pendingTokens.size,
         lastSyncTime,
         nextCheckTime,
         isDetecting: false,

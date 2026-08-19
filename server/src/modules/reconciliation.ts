@@ -8,6 +8,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { createRequire } from 'node:module';
 import {
   IndexScanner,
   resolveDocumentTitle,
@@ -68,6 +69,23 @@ export interface ReconciliationOptions {
   watchedRoots: WatchedRootConfig[];
   /** Optional existing token → relative path map from SQLite. */
   tokenToRelPath?: Map<string, string>;
+  /**
+   * Custom-folder local_rel_path prefixes to exclude from orphan/local-only
+   * classification. Files under these directories have a cloud identity but
+   * live outside the watched-root structure tree.
+   *
+   * When omitted, the prefixes are read automatically from the SQLite DB at
+   * {@link dbPath} (custom_folders.local_rel_path) so every formal entry point
+   * stays correct without each caller remembering to pass this list.
+   */
+  customFolderRelPaths?: string[];
+  /**
+   * Path to the feishu-sync SQLite DB. Used to auto-load custom-folder
+   * prefixes when {@link customFolderRelPaths} is not supplied, so the report
+   * never misclassifies _custom files as outside_watched_roots just because a
+   * caller forgot the optional argument.
+   */
+  dbPath?: string;
 }
 
 /**
@@ -194,6 +212,13 @@ export function buildReconciliationReport(
   options: ReconciliationOptions,
 ): ReconciliationReport {
   const root = path.resolve(options.knowledgeBaseRoot);
+  // Resolve the custom-folder prefixes once: prefer the explicit argument,
+  // otherwise auto-load from SQLite so a caller that omits the optional list
+  // (every formal script entry point) still excludes _custom files correctly.
+  const customFolderRelPaths =
+    options.customFolderRelPaths && options.customFolderRelPaths.length > 0
+      ? options.customFolderRelPaths
+      : readCustomFolderRelPathsFromDb(options.dbPath);
   const scanner = new IndexScanner({
     localMapStore: { upsertDocument() {} },
     larkCliClient: {},
@@ -213,6 +238,10 @@ export function buildReconciliationReport(
   for (const absolute of files) {
     const relative = toPortableRelative(root, absolute);
     if (!relative) continue;
+    // Custom-folder archive files have a cloud identity but live outside
+    // the watched-root structure tree; exclude them from the report so they
+    // are never flagged as outside_watched_roots / local_only orphans.
+    if (isUnderCustomFolder(relative, customFolderRelPaths)) continue;
     let content = '';
     try {
       content = fs.readFileSync(absolute, 'utf-8');
@@ -447,3 +476,67 @@ export function formatReconciliationMarkdown(report: ReconciliationReport): stri
 }
 
 export type { OrphanClassification };
+
+/**
+ * Return true when a POSIX relative path equals or sits under one of the
+ * custom-folder local_rel_path prefixes.
+ */
+function isUnderCustomFolder(
+  relativePath: string,
+  prefixes: string[] | undefined,
+): boolean {
+  if (!prefixes || prefixes.length === 0) return false;
+  const normalized = relativePath.replace(/\\/g, '/');
+  for (const raw of prefixes) {
+    const prefix = raw.replace(/\\/g, '/').replace(/\/+$/, '');
+    if (!prefix) continue;
+    if (normalized === prefix || normalized.startsWith(`${prefix}/`)) return true;
+  }
+  return false;
+}
+
+/**
+ * Read custom_folders.local_rel_path values directly from a SQLite DB without
+ * pulling in the full LocalMapStore. Returns [] when the DB or table is absent
+ * so the reconciliation report degrades to "no custom folders known" rather
+ * than crashing. Lazy-loads better-sqlite3 to keep dry-run-only callers (no
+ * dbPath) free of the native dependency.
+ */
+export function readCustomFolderRelPathsFromDb(dbPath?: string): string[] {
+  if (!dbPath || !fs.existsSync(dbPath)) return [];
+  // Use createRequire so this ESM module can load the CommonJS better-sqlite3
+  // binding on demand without making every dry-run caller pay for it.
+  const requireModule = createRequire(import.meta.url);
+  let Database: typeof import('better-sqlite3');
+  try {
+    Database = requireModule('better-sqlite3');
+  } catch {
+    return [];
+  }
+  let db: import('better-sqlite3').Database | null = null;
+  try {
+    db = new Database(dbPath, { readonly: true });
+    const table = db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='custom_folders' LIMIT 1",
+      )
+      .get() as { name: string } | undefined;
+    if (!table) return [];
+    const rows = db.prepare('SELECT local_rel_path FROM custom_folders').all() as Array<{
+      local_rel_path: string;
+    }>;
+    return rows
+      .map((row) => row.local_rel_path)
+      .filter((p) => typeof p === 'string' && p.length > 0);
+  } catch {
+    return [];
+  } finally {
+    if (db) {
+      try {
+        db.close();
+      } catch {
+        // ignore
+      }
+    }
+  }
+}

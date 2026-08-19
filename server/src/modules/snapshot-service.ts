@@ -159,7 +159,12 @@ export class SnapshotService {
 
     const documents = this.localMapStore.getAllDocuments();
     const nodes = documents.map((d) => this.projectDocument(d));
-    const orphanFiles = this.scanOrphanFiles(kbRoot, new Set(documents.map((d) => d.localMdPath)));
+    const customFolderPrefixes = this.collectCustomFolderPrefixes();
+    const orphanFiles = this.scanOrphanFiles(
+      kbRoot,
+      new Set(documents.map((d) => d.localMdPath)),
+      customFolderPrefixes,
+    );
     const topLevelDirs = this.aggregateTopLevelDirs(nodes, kbRoot);
     const watchedRoots = this.buildWatchedRoots();
     const mountedDirs = this.scanMountedDirs(kbRoot, watchedRoots);
@@ -341,9 +346,24 @@ export class SnapshotService {
    * mapped in SQLite even if their header parsing is currently broken
    * (defensive: avoids double-listing a file as both mapped and orphan).
    */
+  /**
+   * Collect custom-folder local_rel_path prefixes from SQLite so orphan
+   * detection can exclude files that have a cloud identity but live outside
+   * the watched-root structure tree.
+   */
+  private collectCustomFolderPrefixes(): string[] {
+    try {
+      if (typeof this.localMapStore.getCustomFolderRelPaths !== 'function') return [];
+      return this.localMapStore.getCustomFolderRelPaths();
+    } catch {
+      return [];
+    }
+  }
+
   private scanOrphanFiles(
     kbRoot: string,
     knownLocalPaths: Set<string>,
+    customFolderPrefixes: string[] = [],
   ): OrphanFileEntry[] {
     const orphans: OrphanFileEntry[] = [];
 
@@ -374,6 +394,13 @@ export class SnapshotService {
 
       // Already mapped in SQLite — not an orphan.
       if (knownAbsolute.has(path.resolve(mdPath)) || knownRelative.has(relative)) {
+        continue;
+      }
+
+      // Custom-folder archive files carry a cloud identity (obj_token) but
+      // live outside every watched-root structure tree. They must never be
+      // reported as orphans just because their directory is untracked.
+      if (isUnderAnyPrefix(relative, customFolderPrefixes)) {
         continue;
       }
 
@@ -514,4 +541,19 @@ export class SnapshotService {
     fs.renameSync(tmp, target);
     console.info(`[SnapshotService] _index.json refreshed at ${target} (${snapshot.nodes.length} nodes, ${snapshot.orphan_files.length} orphans)`);
   }
+}
+
+/**
+ * Return true when a POSIX relative path equals or sits under one of the
+ * given prefixes (each prefix normalized to POSIX without a trailing slash).
+ */
+function isUnderAnyPrefix(relativePath: string, prefixes: string[]): boolean {
+  if (prefixes.length === 0) return false;
+  const normalized = relativePath.replace(/\\/g, '/');
+  for (const raw of prefixes) {
+    const prefix = raw.replace(/\\/g, '/').replace(/\/+$/, '');
+    if (!prefix) continue;
+    if (normalized === prefix || normalized.startsWith(`${prefix}/`)) return true;
+  }
+  return false;
 }

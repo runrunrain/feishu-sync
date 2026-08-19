@@ -89,19 +89,24 @@ export class MappingService {
     const modified = changed.filter((c) => c.changeType === 'modified');
     const deleted = changed.filter((c) => c.changeType === 'deleted');
 
+    // Custom-folder archive docs are not tied to any watched root, so they
+    // are read from SQLite (where detectCustomFolderChanges already wrote
+    // pending_modified state) and appended to the modified bucket.
+    const customModified = this.getCustomFolderModifiedDocs();
+
     // changed-in-cloud counts only added + modified (deleted are local
     // side orphans, not cloud-traversed nodes).
-    const changedInCloud = added.length + modified.length;
+    const changedInCloud = added.length + modified.length + customModified.length;
     const unchanged = Math.max(0, result.totalNodes - changedInCloud);
 
     const totalLocal = this.localMapStore.getAllDocuments().length;
 
     return {
       added,
-      modified,
+      modified: [...modified, ...customModified],
       deleted,
       unchanged,
-      totalCloud: result.totalNodes,
+      totalCloud: result.totalNodes + customModified.length,
       totalLocal,
       checkedAt: result.checkedAt,
     };
@@ -171,13 +176,20 @@ export class MappingService {
     }
 
     const liveCount = documents.filter((document) => document.cloudDeleted !== 1).length;
+
+    // Custom-folder archive docs are not scoped to any watched root. They
+    // are read globally and appended to the modified bucket (only
+    // pending_modified surfaces; added/deleted are not applicable to custom
+    // docs per the v1 design).
+    const customModified = this.getCustomFolderModifiedDocs();
+
     return {
       added,
-      modified,
+      modified: [...modified, ...customModified],
       deleted,
       unchanged: Math.max(0, liveCount - added.length - modified.length),
-      totalCloud: liveCount,
-      totalLocal: documents.length,
+      totalCloud: liveCount + customModified.length,
+      totalLocal: documents.length + customModified.length,
       checkedAt,
     };
   }
@@ -229,6 +241,53 @@ export class MappingService {
       parentChainTitles: hierarchy?.parentChainTitles,
       isWatchedRootNode: hierarchy?.isWatchedRootNode,
       localRelPath: document.localRelPath ?? null,
+      customFolderId: document.customFolderId ?? null,
+    };
+  }
+
+  /**
+   * Read custom-folder documents that are currently pending_modified from
+   * SQLite and project them into ChangedDocument entries for the diff
+   * response. This is a pure local read — it never triggers cloud detection.
+   *
+   * Custom docs have no watched-root hierarchy, so parentChainTitles and
+   * isWatchedRootNode are left undefined. watchedRootId is null.
+   */
+  private getCustomFolderModifiedDocs(): ChangedDocument[] {
+    const docs = this.localMapStore.listAllCustomFolderDocs();
+    return docs
+      .filter((doc) => doc.syncState === 'pending_modified')
+      .map((doc) => this.toCustomChangedDocument(doc));
+  }
+
+  /**
+   * Project a custom-folder DocumentRecord into a ChangedDocument for the
+   * diff response. Only used for pending_modified docs.
+   */
+  private toCustomChangedDocument(doc: DocumentRecord): ChangedDocument {
+    const observed = doc.observedObjEditTime ?? doc.objEditTime ?? null;
+    const milliseconds = observed != null && observed < 100_000_000_000
+      ? observed * 1000
+      : observed;
+    return {
+      objToken: doc.objToken,
+      objType: doc.objType,
+      title: doc.title,
+      changeType: 'modified',
+      cloudModifiedTime: milliseconds != null && milliseconds > 0
+        ? new Date(milliseconds).toISOString()
+        : '',
+      localSyncedTime: doc.lastSyncedAt || null,
+      localMdPath: doc.localMdPath || null,
+      wikiNodeToken: doc.wikiNodeToken ?? null,
+      parentNodeToken: doc.parentNodeToken ?? null,
+      spaceId: doc.spaceId ?? null,
+      watchedRootId: null,
+      hasChild: doc.hasChild ?? false,
+      observedObjEditTime: observed,
+      syncState: doc.syncState,
+      localRelPath: doc.localRelPath ?? null,
+      customFolderId: doc.customFolderId ?? null,
     };
   }
 

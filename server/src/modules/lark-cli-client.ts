@@ -639,7 +639,20 @@ export class LarkCliClient {
       if (error?.killed && error?.signal === 'SIGTERM') {
         throw new LarkCliError('lark-cli 执行超时', 'timeout', true);
       }
-      throw this.classifyError(rawMessage || '未知 lark-cli 错误');
+      // Real lark-cli API failures (e.g. `wiki +node-get` on a pure cloud
+      // document returns 131005 "document is not in wiki") exit non-zero but
+      // still honor `--format json`, writing the structured error to the
+      // process output before it fails. 实测 confirmed: the JSON error body
+      // lands on stderr (stdout empty) with exit code 1. execFile surfaces
+      // captured stderr/stdout on `error.stderr`/`error.stdout`, which we
+      // folded into rawMessage above; recover the numeric code here so it
+      // reaches LarkCliError.upstreamCode. Without this, classifyError was
+      // called with only the raw text and the code was lost, so downstream
+      // guards keying on `upstreamCode === '131005'` (custom-folders
+      // pure-docx fallback) could never fire (P0: pure /docx/ cloud links
+      // failed to archive).
+      const upstreamCode = this.extractUpstreamCode(rawMessage);
+      throw this.classifyError(rawMessage || '未知 lark-cli 错误', upstreamCode);
     }
   }
 
@@ -780,6 +793,51 @@ export class LarkCliClient {
       }
     }
     return values;
+  }
+
+  /**
+   * Recover the upstream numeric error code from a non-zero-exit error blob.
+   *
+   * When lark-cli exits non-zero on an API error, it still honors
+   * `--format json` and writes the structured error (实测: to stderr, e.g.
+   * `{"ok":false,"error":{"code":131005,...}}`, with stdout empty and exit
+   * code 1) before the process fails. Node's execFile surfaces the captured
+   * stderr/stdout on `error.stderr`/`error.stdout`, which execLarkCli folds
+   * into rawMessage. This restores the code so it reaches
+   * LarkCliError.upstreamCode, by:
+   *   1. parsing the JSON error body honoring --format json (precise path),
+   *      reusing extractJsonValues so log-prefixed / NDJSON output is handled;
+   *   2. falling back to a regex over the known lark/feishu API code set that
+   *      this module already classifies, to avoid false positives from
+   *      PIDs/ports/byte counts in stderr log lines.
+   */
+  private extractUpstreamCode(rawMessage: string): string | undefined {
+    // 1. Structured path: lark-cli --format json emits the error as JSON.
+    try {
+      for (const text of this.extractJsonValues(rawMessage)) {
+        let value: any;
+        try {
+          value = JSON.parse(text);
+        } catch {
+          continue;
+        }
+        if (value && typeof value === 'object') {
+          const nested = value.error && typeof value.error === 'object'
+            ? value.error as Record<string, unknown>
+            : null;
+          const code = value.code ?? nested?.code;
+          if (typeof code === 'number' || (typeof code === 'string' && code.trim() !== '')) {
+            return String(code);
+          }
+        }
+      }
+    } catch {
+      // extractJsonValues is itself defensive; fall through to the regex.
+    }
+    // 2. Textual fallback: match a known API code embedded in stderr text.
+    //    \b boundaries prevent matching inside longer digit runs (e.g. a PID).
+    const known = rawMessage.match(/\b(131005|131006|40403|3380003|99991400)\b/);
+    return known ? known[1] : undefined;
   }
 
   private classifyError(message: string, upstreamCode?: string): LarkCliError {

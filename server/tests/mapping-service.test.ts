@@ -54,6 +54,12 @@ class MockLocalMapStore {
     });
     return updated;
   }
+
+  listAllCustomFolderDocs(): DocumentRecord[] {
+    return Array.from(this.rows.values()).filter(
+      (r) => r.customFolderId != null && r.watchedRootUrl == null,
+    );
+  }
 }
 
 class MockChangeDetector {
