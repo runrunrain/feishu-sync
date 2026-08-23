@@ -28,6 +28,7 @@ import { detectRoutes } from './routes/detect.js';
 import { syncRoutes } from './routes/sync.js';
 import { feishuRoutes } from './routes/feishu.js';
 import { mappingRoutes } from './routes/mapping.js';
+import { contentRoutes } from './routes/content.js';
 import { trashRoutes } from './routes/trash.js';
 import { customFolderRoutes } from './routes/custom-folders.js';
 import { llmRoutes } from './routes/llm.js';
@@ -219,6 +220,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
   app.route('/', syncRoutes);
   app.route('/', feishuRoutes);
   app.route('/', mappingRoutes);
+  app.route('/', contentRoutes);
   app.route('/', trashRoutes);
   app.route('/', customFolderRoutes);
   app.route('/', llmRoutes);

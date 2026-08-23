@@ -371,6 +371,31 @@ export interface TreeResponse {
 }
 
 /**
+ * GET /api/mapping/content/:objToken 响应（v0.2.8 布局重构 批次1）。
+ * mdContent 为 null 表示索引引用了文件但磁盘上不存在（尚未同步）；
+ * sheet 文档的原始表格在 csvTables 中（`<stem>.csv-data/*.csv`）。
+ */
+export interface DocumentContent {
+  objToken: string;
+  title: string;
+  objType: string;
+  /** 知识库根目录相对的 POSIX 路径；索引中无路径时为 null。 */
+  mdPath: string | null;
+  mdContent: string | null;
+  mdTruncated: boolean;
+  csvTables: DocumentCsvTable[];
+}
+
+export interface DocumentCsvTable {
+  /** 去扩展名的表名（sheet 子表名）。 */
+  name: string;
+  /** 知识库根目录相对的 POSIX 路径。 */
+  path: string;
+  content: string;
+  truncated: boolean;
+}
+
+/**
  * Local directory tree node used by LocalDirTreeView (D2).
  *
  * Built client-side by splitting `local_path` on '/' and reassembling the
@@ -565,6 +590,7 @@ export interface ChannelTestRequest {
     | 'directModel'
     | 'claudeCliModel'
     | 'temperature'
+    | 'timeoutMs'
     | 'providers'
     | 'activeProviderId'
     | 'activeModelId'

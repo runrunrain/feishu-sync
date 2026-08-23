@@ -25,6 +25,7 @@ import type {
   TreeResponse,
   CustomFolder,
   AddLinkToFolderResult,
+  DocumentContent,
 } from '../types';
 
 class APIError extends Error {
@@ -372,6 +373,16 @@ export async function getMappingTreeDetailed(
   const qs = new URLSearchParams({ view });
   if (options.includeOrphans === false) qs.set('include_orphans', 'false');
   return request<TreeResponse>(`/api/mapping/tree?${qs.toString()}`);
+}
+
+/**
+ * GET /api/mapping/content/:objToken — 本地文档内容（v0.2.8 预览面板）。
+ * 返回 Markdown 全文 + sheet 伴随 CSV 表格列表；文件缺失时 mdContent 为 null。
+ */
+export async function getDocumentContent(objToken: string): Promise<DocumentContent> {
+  return request<DocumentContent>(
+    `/api/mapping/content/${encodeURIComponent(objToken)}`,
+  );
 }
 
 /**
