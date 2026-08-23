@@ -192,37 +192,43 @@ export function DocPreviewPanel({ node, className = '' }: DocPreviewPanelProps) 
           )}
         </div>
 
-        {/* 格式页签：MD / CSV */}
+        {/* 格式页签：MD / CSV（下划线常驻渲染 + scaleX 过渡，与 TopBar 一致） */}
         <div className="mt-2.5 flex items-center gap-4">
           <button
             type="button"
             onClick={() => setFormatTab('md')}
             disabled={!hasMd && !loading}
-            className={`relative pb-2 text-xs font-sans-ui transition-colors ${
+            className={`relative pb-2 text-xs font-sans-ui transition-colors duration-150 ${
               formatTab === 'md'
                 ? 'text-seal font-medium'
                 : 'text-ink-faint hover:text-ink-soft disabled:opacity-40 disabled:cursor-not-allowed'
             }`}
           >
             Markdown
-            {formatTab === 'md' && (
-              <span className="absolute bottom-0 left-0 right-0 h-[2px] bg-seal rounded-full" />
-            )}
+            <span
+              aria-hidden
+              className={`absolute bottom-0 left-0 right-0 h-[2px] bg-seal rounded-full transition-transform duration-200 ${
+                formatTab === 'md' ? 'scale-x-100' : 'scale-x-0'
+              }`}
+            />
           </button>
           <button
             type="button"
             onClick={() => setFormatTab('csv')}
             disabled={csvTables.length === 0}
-            className={`relative pb-2 text-xs font-sans-ui transition-colors ${
+            className={`relative pb-2 text-xs font-sans-ui transition-colors duration-150 ${
               formatTab === 'csv'
                 ? 'text-seal font-medium'
                 : 'text-ink-faint hover:text-ink-soft disabled:opacity-40 disabled:cursor-not-allowed'
             }`}
           >
             CSV{csvTables.length > 0 ? ` (${csvTables.length})` : ''}
-            {formatTab === 'csv' && (
-              <span className="absolute bottom-0 left-0 right-0 h-[2px] bg-seal rounded-full" />
-            )}
+            <span
+              aria-hidden
+              className={`absolute bottom-0 left-0 right-0 h-[2px] bg-seal rounded-full transition-transform duration-200 ${
+                formatTab === 'csv' ? 'scale-x-100' : 'scale-x-0'
+              }`}
+            />
           </button>
         </div>
       </div>
@@ -249,9 +255,14 @@ export function DocPreviewPanel({ node, className = '' }: DocPreviewPanelProps) 
           </div>
         ) : formatTab === 'md' ? (
           hasMd && mdMode === 'rendered' ? (
-            <MarkdownView content={content!.mdContent!} />
+            <div key={`${objToken}-md-r`} className="animate-fade-in">
+              <MarkdownView content={content!.mdContent!} />
+            </div>
           ) : hasMd ? (
-            <pre className="px-5 py-4 text-xs leading-relaxed text-ink-soft font-mono whitespace-pre-wrap break-words">
+            <pre
+              key={`${objToken}-md-s`}
+              className="animate-fade-in px-5 py-4 text-xs leading-relaxed text-ink-soft font-mono whitespace-pre-wrap break-words"
+            >
               {content!.mdContent}
             </pre>
           ) : (
@@ -260,7 +271,7 @@ export function DocPreviewPanel({ node, className = '' }: DocPreviewPanelProps) 
             </div>
           )
         ) : activeCsv ? (
-          <div className="flex h-full min-h-0 flex-col">
+          <div key={`${objToken}-csv-${csvIndex}`} className="animate-fade-in flex h-full min-h-0 flex-col">
             {/* 多子表切换 */}
             {csvTables.length > 1 && (
               <div className="shrink-0 flex flex-wrap gap-1.5 border-b border-line/50 bg-paper/50 px-3 py-2">

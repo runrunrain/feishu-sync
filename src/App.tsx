@@ -54,7 +54,8 @@ function AppShell() {
       */}
       <main className="flex-1 overflow-auto scrollbar-thin">
         <div
-          className={`px-4 py-4 sm:px-6 lg:px-8 ${
+          key={currentArea}
+          className={`animate-fade-in px-4 py-4 sm:px-6 lg:px-8 ${
             currentArea === 'settings' ? 'mx-auto max-w-[1440px]' : 'w-full'
           }`}
         >

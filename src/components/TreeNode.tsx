@@ -101,11 +101,11 @@ export function TreeNode({
       */}
       {isDropTargetBefore && <div className="tree-drop-indicator" />}
       <div
-        className={`flex min-w-0 items-center gap-2 h-8 overflow-hidden pr-2.5 rounded-sm cursor-pointer transition-colors ${
+        className={`flex min-w-0 items-center gap-2 h-8 overflow-hidden pr-2.5 rounded-sm cursor-pointer transition-all duration-150 ${
           selected
-            ? 'bg-[rgba(158,43,37,0.04)]'
-            : 'hover:bg-paper-2'
-        } ${selected ? 'before:absolute before:left-0 before:top-0 before:bottom-0 before:w-0.5 before:bg-seal' : ''}`}
+            ? 'bg-seal/[0.08] shadow-[inset_0_0_0_1px_rgba(158,43,37,0.12)]'
+            : 'hover:bg-paper-2 active:bg-paper-2/70'
+        } ${selected ? 'before:absolute before:left-0 before:top-1 before:bottom-1 before:w-[3px] before:rounded-full before:bg-seal' : ''}`}
         style={{ paddingLeft: Math.min(8 + level * 8, 40) }}
         onClick={() => onSelect(node.obj_token)}
         draggable
@@ -151,7 +151,7 @@ export function TreeNode({
         </span>
 
         {/* Type icon */}
-        <TypeIcon className={`${isRootLevel ? 'w-4 h-4' : 'w-3.5 h-3.5'} text-ink-soft shrink-0`} />
+        <TypeIcon className={`${isRootLevel ? 'w-4 h-4' : 'w-3.5 h-3.5'} shrink-0 transition-colors ${selected ? 'text-seal' : 'text-ink-soft'}`} />
 
         {/* Business marks (independent tag, decision 1) */}
         {businessMarks && businessMarks.length > 0 && (
@@ -161,7 +161,11 @@ export function TreeNode({
         {/* Title */}
         <span
           className={`min-w-0 flex-1 truncate ${isRootLevel ? 'text-[13px]' : 'text-[12px]'} ${
-            node.cloud_deleted === 1 ? 'text-ink-faint line-through' : 'text-ink'
+            node.cloud_deleted === 1
+              ? 'text-ink-faint line-through'
+              : selected
+                ? 'text-seal font-medium'
+                : 'text-ink'
           }`}
           style={{ fontFamily: 'var(--serif)' }}
           title={node.title}

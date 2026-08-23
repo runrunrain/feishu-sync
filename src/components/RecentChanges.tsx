@@ -64,7 +64,7 @@ export function RecentChanges({
             return (
               <div
                 key={c.objToken}
-                className="flex items-center gap-2.5 px-2.5 py-2 rounded hover:bg-paper-2 cursor-pointer"
+                className="flex items-center gap-2.5 px-2.5 py-2 rounded transition-colors duration-150 hover:bg-paper-2 cursor-pointer"
                 onClick={onJumpToSync}
                 role="button"
                 tabIndex={0}

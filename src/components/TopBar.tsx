@@ -41,7 +41,7 @@ export function TopBar({ currentArea, onAreaChange, authReady, pendingCount }: T
       */}
       {/* Left: seal logo + title */}
       <div className="flex min-w-0 items-center gap-3 lg:min-w-[160px]">
-        <div className="w-9 h-9 rounded-sm bg-seal flex items-center justify-center shadow-sm">
+        <div className="w-9 h-9 rounded-sm bg-seal flex items-center justify-center shadow-sm transition-transform duration-200 hover:scale-105 hover:shadow-md">
           <span className="text-white font-kai text-base font-medium leading-none">飞</span>
         </div>
         <div className="flex min-w-0 flex-col leading-tight gap-0.5">
@@ -59,25 +59,26 @@ export function TopBar({ currentArea, onAreaChange, authReady, pendingCount }: T
               key={item.id}
               type="button"
               onClick={() => onAreaChange(item.id)}
-              className={`relative h-10 px-2.5 sm:px-3 lg:px-5 rounded-md flex items-center gap-1.5 lg:gap-2 transition-colors ${
+              className={`relative h-10 px-2.5 sm:px-3 lg:px-5 rounded-md flex items-center gap-1.5 lg:gap-2 transition-colors duration-150 ${
                 isActive
                   ? 'text-seal bg-[rgba(158,43,37,0.06)]'
-                  : 'text-ink-soft hover:bg-paper hover:text-ink'
+                  : 'text-ink-soft hover:bg-paper hover:text-ink active:bg-paper-2'
               }`}
               aria-current={isActive ? 'page' : undefined}
             >
               <span
-                className={`hidden text-sm font-kai lg:inline ${isActive ? 'text-seal' : 'text-ink-faint'}`}
+                className={`hidden text-sm font-kai lg:inline transition-colors ${isActive ? 'text-seal' : 'text-ink-faint'}`}
               >
                 {item.ordinal}
               </span>
               <span className="whitespace-nowrap text-sm font-sans-ui">{item.label}</span>
-              {isActive && (
-                <span
-                  aria-hidden
-                  className="absolute -bottom-[1px] left-3 right-3 h-[2px] bg-seal rounded-full"
-                />
-              )}
+              {/* 激活下划线常驻渲染，用 scaleX 做过渡，切换主区时平滑滑入 */}
+              <span
+                aria-hidden
+                className={`absolute -bottom-[1px] left-3 right-3 h-[2px] bg-seal rounded-full transition-transform duration-200 origin-center ${
+                  isActive ? 'scale-x-100' : 'scale-x-0'
+                }`}
+              />
             </button>
           );
         })}
