@@ -23,16 +23,20 @@ import {
   CloudOff,
   Code2,
   BookOpen,
+  FolderOpen,
 } from 'lucide-react';
 import { Card } from './common/Card';
 import { MarkdownView } from './preview/MarkdownView';
 import { CsvTableView } from './preview/CsvTableView';
 import { getDocumentContent } from '../api/client';
 import { appLogger } from '../utils/appLogger';
+import { useToast } from './common/Toast';
 import type { DocumentContent, MappingNode } from '../types';
 
 interface DocPreviewPanelProps {
   node: MappingNode | null;
+  /** 与 NodeDetailCard 同一约定：点击后在系统文件管理器中打开本地文件。 */
+  onOpenFolder?: (localPath: string) => void;
   className?: string;
 }
 
@@ -72,15 +76,24 @@ function LoadingSkeleton() {
   );
 }
 
-export function DocPreviewPanel({ node, className = '' }: DocPreviewPanelProps) {
+export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPreviewPanelProps) {
   const [content, setContent] = useState<DocumentContent | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [formatTab, setFormatTab] = useState<FormatTab>('md');
   const [mdMode, setMdMode] = useState<MdMode>('rendered');
   const [csvIndex, setCsvIndex] = useState(0);
+  const toast = useToast();
 
   const objToken = node?.obj_token ?? null;
+
+  const handleOpenFolder = () => {
+    if (!node?.local_path) {
+      toast.push({ type: 'warning', message: '该节点尚未同步到本地' });
+      return;
+    }
+    onOpenFolder?.(node.local_path);
+  };
 
   useEffect(() => {
     if (!objToken) {
@@ -190,6 +203,18 @@ export function DocPreviewPanel({ node, className = '' }: DocPreviewPanelProps) 
               ))}
             </div>
           )}
+
+          {/* 在系统文件管理器中打开本地文件 */}
+          <button
+            type="button"
+            onClick={handleOpenFolder}
+            disabled={!node.local_path}
+            title={node.local_path ? '在文件夹中打开' : '该节点尚未同步到本地'}
+            className="inline-flex shrink-0 items-center gap-1 rounded-md border border-line bg-paper px-2 py-1.5 text-[11px] text-ink-soft font-sans-ui transition-colors hover:bg-paper-2 hover:text-ink disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            <FolderOpen className="w-3 h-3" />
+            <span className="hidden xl:inline">打开</span>
+          </button>
         </div>
 
         {/* 格式页签：MD / CSV（下划线常驻渲染 + scaleX 过渡，与 TopBar 一致） */}

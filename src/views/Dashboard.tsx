@@ -246,6 +246,14 @@ export function Dashboard({ onJumpToSync }: DashboardProps) {
     setSelectedToken(null);
   };
 
+  const handleOpenFolder = () => {
+    if (typeof window !== 'undefined' && window.desktop) {
+      window.desktop.openDataDirectory().catch((err) => {
+        appLogger.error('dashboard', 'openDataDirectory failed', err);
+      });
+    }
+  };
+
   return (
     <div className="flex flex-col gap-4">
       <GlobalStatusBar />
@@ -291,7 +299,11 @@ export function Dashboard({ onJumpToSync }: DashboardProps) {
 
         {/* Center: document preview (primary content area) */}
         <div className="min-w-0 min-h-[420px] lg:min-h-0 lg:h-full">
-          <DocPreviewPanel node={selectedNode} className="h-full" />
+          <DocPreviewPanel
+            node={selectedNode}
+            onOpenFolder={handleOpenFolder}
+            className="h-full"
+          />
         </div>
 
         {/* Right: detail sidebar (orphan alert + node detail + recent changes) */}
@@ -310,13 +322,7 @@ export function Dashboard({ onJumpToSync }: DashboardProps) {
               });
               onJumpToSync();
             }}
-            onOpenFolder={() => {
-              if (typeof window !== 'undefined' && window.desktop) {
-                window.desktop.openDataDirectory().catch((err) => {
-                  appLogger.error('dashboard', 'openDataDirectory failed', err);
-                });
-              }
-            }}
+            onOpenFolder={handleOpenFolder}
           />
           <RecentChanges changes={changes} onJumpToSync={onJumpToSync} />
         </div>

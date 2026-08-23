@@ -101,6 +101,7 @@ export function TreeNode({
       */}
       {isDropTargetBefore && <div className="tree-drop-indicator" />}
       <div
+        data-node-token={node.obj_token}
         className={`flex min-w-0 items-center gap-2 h-8 overflow-hidden pr-2.5 rounded-sm cursor-pointer transition-all duration-150 ${
           selected
             ? 'bg-seal/[0.08] shadow-[inset_0_0_0_1px_rgba(158,43,37,0.12)]'

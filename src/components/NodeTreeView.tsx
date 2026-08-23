@@ -287,7 +287,10 @@ export function NodeTreeView({
       if (q && !n.title.toLowerCase().includes(q)) continue;
       result.add(n.obj_token);
       // Auto-expand ancestor path on search match.
-      if (q) {
+      // 过滤态（包括仅过滤器、无搜索词）同样记录祖先链（__expand__ 前缀），
+      // 供下方 visibleTokens 渲染层级路径；自动展开 effect 仍以 search 非空
+      // 为门槛，因此「搜索命中自动展开祖先」的现有行为不变。
+      if (q || filter !== 'all') {
         let p = n.parent_node_token;
         while (p) {
           // parent_node_token is wiki_node_token form; resolve to the actual
@@ -301,6 +304,34 @@ export function NodeTreeView({
     }
     return result;
   }, [nodes, filter, search, tree, orphanPaths]);
+
+  // 是否处于过滤态：搜索词非空，或选择了非「全部」过滤器。
+  const isFiltering = search.trim() !== '' || filter !== 'all';
+
+  // 可见性集合（renderNode / watchedRoot 分组渲染 / 底部统计行共用的唯一
+  // 可见性判定；后续键盘上下键导航也应以此计算可见节点）：
+  // - 返回 null：未处于过滤态（search 为空且 filter==='all'），所有节点可见；
+  // - 否则为「匹配节点 + 其祖先链」的 obj_token 集合。matchedTokens 中无前缀
+  //   条目为匹配节点，`__expand__` 前缀条目为匹配节点的祖先（祖先仅用于
+  //   展示层级路径）。不在集合中的节点整行跳过，其子树一并隐藏。
+  const visibleTokens = useMemo<Set<string> | null>(() => {
+    if (!isFiltering) return null;
+    const set = new Set<string>();
+    for (const t of matchedTokens) {
+      set.add(t.startsWith('__expand__') ? t.slice('__expand__'.length) : t);
+    }
+    return set;
+  }, [isFiltering, matchedTokens]);
+
+  // 过滤态下的匹配节点数（不含祖先链），用于底部统计行。
+  const matchCount = useMemo(() => {
+    if (!isFiltering) return nodes.length;
+    let count = 0;
+    for (const t of matchedTokens) {
+      if (!t.startsWith('__expand__')) count++;
+    }
+    return count;
+  }, [isFiltering, matchedTokens, nodes.length]);
 
   useEffect(() => {
     if (search.trim()) {
@@ -416,13 +447,26 @@ export function NodeTreeView({
 
   // ---- Recursive render ----
   const renderNode = (node: MappingNode, level: number): React.ReactNode => {
+    // 过滤态：不在可见集合（匹配节点 + 祖先链）中的节点整行跳过，
+    // 其子树也不再渲染（可见子级过滤见下方 visibleChildren）。
+    if (visibleTokens !== null && !visibleTokens.has(node.obj_token)) return null;
     // Feishu parent-child chain uses wiki_node_token as the key:
     // a child's parent_node_token points to the parent's wiki_node_token
     // (NOT obj_token). For local-only nodes (wiki_node_token null), there
     // is no feishu-side parent linkage, so they can only be roots.
     const childKey = node.wiki_node_token ?? null;
     const children = tree.childrenByParent.get(childKey) ?? [];
-    const hasChildren = node.has_child || children.length > 0;
+    // 过滤态下只递归可见子级；非过滤态与原逻辑一致（渲染全部子级）。
+    const visibleChildren =
+      visibleTokens === null
+        ? children
+        : children.filter((c) => visibleTokens.has(c.obj_token));
+    // 过滤态下以可见子级数决定展开箭头，避免出现「展开后为空」的误导；
+    // 非过滤态保持原判定（node.has_child || children.length > 0）。
+    const hasChildren =
+      visibleTokens === null
+        ? node.has_child || children.length > 0
+        : visibleChildren.length > 0;
     const isExpanded = expanded.has(node.obj_token);
     const marks = businessMarksByToken?.[node.obj_token];
 
@@ -446,7 +490,7 @@ export function NodeTreeView({
           isDropTargetAfter={dragOver?.objToken === node.obj_token && dragOver.position === 'after'}
         />
         {hasChildren && isExpanded && (
-          <div>{children.map((c) => renderNode(c, level + 1))}</div>
+          <div>{visibleChildren.map((c) => renderNode(c, level + 1))}</div>
         )}
       </div>
     );
@@ -480,6 +524,78 @@ export function NodeTreeView({
       .filter((g) => g.nodes.length > 0);
     return { groups, unclassified };
   }, [roots, watchedRoots]);
+
+  // ------------------------------------------------------------------
+  // 键盘上下键导航（v0.2.8）：按渲染顺序前序 DFS 收集「当前可见且已
+  // 渲染」的节点行（折叠节点的后代、被 visibleTokens 隐藏的节点都跳过），
+  // ArrowUp/ArrowDown 在其中移动选中项，选中变化联动中部预览面板。
+  // 自定义归档文档行不在导航序列内（其 DOM 在树之后、数据源不同）。
+  // ------------------------------------------------------------------
+  const navigableTokens = useMemo(() => {
+    const out: string[] = [];
+    const isVisible = (n: MappingNode) =>
+      visibleTokens === null || visibleTokens.has(n.obj_token);
+    const walk = (n: MappingNode) => {
+      if (!isVisible(n)) return;
+      out.push(n.obj_token);
+      if (!expanded.has(n.obj_token)) return;
+      const childKey = n.wiki_node_token ?? null;
+      const children = tree.childrenByParent.get(childKey) ?? [];
+      for (const c of children) walk(c);
+    };
+    if (groupedRoots) {
+      for (const g of groupedRoots.groups) {
+        if (collapsedGroups.has(g.watchedRoot.url)) continue;
+        for (const r of g.nodes) walk(r);
+      }
+      if (!collapsedGroups.has(UNCLASSIFIED_KEY)) {
+        for (const r of groupedRoots.unclassified) walk(r);
+      }
+    } else {
+      for (const r of roots) walk(r);
+    }
+    return out;
+  }, [groupedRoots, roots, tree, expanded, collapsedGroups, visibleTokens]);
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+      // 输入框 / 下拉框 / 可编辑区域内不劫持方向键。
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      if (navigableTokens.length === 0) return;
+      e.preventDefault();
+      const idx = selectedToken ? navigableTokens.indexOf(selectedToken) : -1;
+      const nextIdx =
+        e.key === 'ArrowDown'
+          ? idx < 0
+            ? 0
+            : Math.min(idx + 1, navigableTokens.length - 1)
+          : idx < 0
+            ? 0
+            : Math.max(idx - 1, 0);
+      const token = navigableTokens[nextIdx];
+      if (token && token !== selectedToken) {
+        onSelect(token);
+        // 等选中态渲染后把目标行滚入可视区。
+        requestAnimationFrame(() => {
+          document
+            .querySelector(`[data-node-token="${CSS.escape(token)}"]`)
+            ?.scrollIntoView({ block: 'nearest' });
+        });
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [navigableTokens, selectedToken, onSelect]);
 
   // 自定义归档文档行的类型图标（与 TreeNode 同一映射，视觉一致）。
   const CUSTOM_DOC_ICON: Record<string, typeof FileText> = {
@@ -632,14 +748,32 @@ export function NodeTreeView({
     const changedCount = nodes.filter(
       (n) => n.status === 'changed' || n.cloud_deleted === 1,
     ).length;
+    // 过滤态下，「未分类」区块同样只保留可见根节点（无可见节点则整体隐藏）；
+    // 非过滤态为 groupedRoots.unclassified 原数组，行为不变。
+    const visibleUnclassified =
+      groupedRoots === null || visibleTokens === null
+        ? (groupedRoots?.unclassified ?? [])
+        : groupedRoots.unclassified.filter((r) => visibleTokens.has(r.obj_token));
     body = (
       <>
         <div className="max-h-full overflow-x-hidden overflow-y-auto scrollbar-thin pr-1">
+          {isFiltering && matchCount === 0 && (
+            <p className="px-2 py-6 text-center text-xs text-ink-faint font-sans-ui">
+              无匹配节点
+            </p>
+          )}
           {groupedRoots ? (
             <>
               {groupedRoots.groups.map((g) => {
                 const groupKey = g.watchedRoot.url;
                 const groupCollapsed = collapsedGroups.has(groupKey);
+                // 过滤态下只保留可见根节点（匹配节点 + 祖先链）；
+                // 无任何可见节点的分组整体隐藏，避免空分组误导。
+                const visibleGroupNodes =
+                  visibleTokens === null
+                    ? g.nodes
+                    : g.nodes.filter((r) => visibleTokens.has(r.obj_token));
+                if (visibleGroupNodes.length === 0) return null;
                 return (
                   <div key={groupKey} className="mb-2">
                     <div
@@ -667,14 +801,14 @@ export function NodeTreeView({
                         {g.watchedRoot.displayName || g.watchedRoot.title || g.watchedRoot.localDir}
                       </span>
                       <span className="ml-auto text-[10px] text-ink-faint font-sans-ui shrink-0">
-                        {g.nodes.length} 项
+                        {visibleGroupNodes.length} 项
                       </span>
                     </div>
-                    {!groupCollapsed && g.nodes.map((r) => renderNode(r, 0))}
+                    {!groupCollapsed && visibleGroupNodes.map((r) => renderNode(r, 0))}
                   </div>
                 );
               })}
-              {groupedRoots.unclassified.length > 0 && (
+              {visibleUnclassified.length > 0 && (
                 <div className="mt-3">
                   <div
                     role="button"
@@ -695,7 +829,7 @@ export function NodeTreeView({
                     未分类（未绑定 watchedRoot）
                   </div>
                   {!collapsedGroups.has(UNCLASSIFIED_KEY) &&
-                    groupedRoots.unclassified.map((r) => renderNode(r, 0))}
+                    visibleUnclassified.map((r) => renderNode(r, 0))}
                 </div>
               )}
             </>
@@ -705,7 +839,11 @@ export function NodeTreeView({
           {renderCustomArchive()}
         </div>
         <div className="mt-3 pt-3 border-t border-line text-xs text-ink-faint font-sans-ui flex min-w-0 items-center justify-between gap-2">
-          <span className="min-w-0 truncate">{nodes.length} 节点 · {roots.length} 顶层 · {changedCount} 变更</span>
+          <span className="min-w-0 truncate">
+            {isFiltering
+              ? `匹配 ${matchCount} / ${nodes.length} 节点 · ${changedCount} 变更`
+              : `${nodes.length} 节点 · ${roots.length} 顶层 · ${changedCount} 变更`}
+          </span>
           <button
             type="button"
             onClick={fetchTree}
@@ -716,7 +854,7 @@ export function NodeTreeView({
           </button>
         </div>
         <p className="mt-1.5 text-[11px] text-ink-faint font-sans-ui">
-          同级拖拽仅调整本地展示顺序 · 不影响飞书结构
+          同级拖拽仅调整本地展示顺序 · 不影响飞书结构 · ↑↓ 键切换节点并预览
         </p>
       </>
     );
