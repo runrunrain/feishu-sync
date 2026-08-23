@@ -27,6 +27,7 @@ import { NodeTreeView } from '../components/NodeTreeView';
 import { LocalDirTreeView } from '../components/LocalDirTreeView';
 import { RecentChanges } from '../components/RecentChanges';
 import { NodeDetailCard } from '../components/NodeDetailCard';
+import { DocPreviewPanel } from '../components/DocPreviewPanel';
 import { OrphanFileAlert } from '../components/OrphanFileAlert';
 import { QuickAddDocDialog } from '../components/QuickAddDocDialog';
 import { useConfig } from '../hooks/useConfig';
@@ -246,12 +247,20 @@ export function Dashboard({ onJumpToSync }: DashboardProps) {
   };
 
   return (
-    <div className="space-y-6">
+    <div className="flex flex-col gap-4">
       <GlobalStatusBar />
 
-      <div className="grid min-w-0 grid-cols-1 gap-4 lg:grid-cols-[minmax(0,340px)_minmax(0,1fr)] lg:gap-6">
+      {/*
+        v0.2.8 三栏布局（替代原"左树 340px + 右栏纵向堆叠"）：
+        - 左栏 300/320px：节点树（飞书/本地），主导航
+        - 中栏 flex-1：DocPreviewPanel 文档预览（主内容区，占最大面积）
+        - 右栏 320/340px：详情侧栏（孤儿提醒 + 节点详情 + 最近变更）
+        lg 及以上三栏等高（100dvh - TopBar56 - main padding32 - 状态条约56 - 间距），
+        各栏内部独立滚动；窄屏退化为纵向堆叠。
+      */}
+      <div className="grid min-w-0 grid-cols-1 gap-4 lg:h-[calc(100dvh-196px)] lg:min-h-[480px] lg:grid-cols-[minmax(0,300px)_minmax(0,1fr)_minmax(0,320px)] xl:grid-cols-[minmax(0,320px)_minmax(0,1fr)_minmax(0,340px)]">
         {/* Left: node tree (feishu or local) */}
-        <div className="min-w-0 min-h-[360px] lg:h-[calc(100vh-220px)]">
+        <div className="min-w-0 min-h-[360px] lg:min-h-0 lg:h-full">
           {view === 'feishu' ? (
             <NodeTreeView
               nodes={feishuEnv?.nodes}
@@ -280,10 +289,14 @@ export function Dashboard({ onJumpToSync }: DashboardProps) {
           )}
         </div>
 
-        {/* Right: orphan alert + recent + detail */}
-        <div className="min-w-0 space-y-5">
+        {/* Center: document preview (primary content area) */}
+        <div className="min-w-0 min-h-[420px] lg:min-h-0 lg:h-full">
+          <DocPreviewPanel node={selectedNode} className="h-full" />
+        </div>
+
+        {/* Right: detail sidebar (orphan alert + node detail + recent changes) */}
+        <div className="min-w-0 space-y-4 lg:min-h-0 lg:h-full lg:overflow-y-auto lg:scrollbar-thin lg:pr-1">
           <OrphanFileAlert orphans={orphans} />
-          <RecentChanges changes={changes} onJumpToSync={onJumpToSync} />
           <NodeDetailCard
             node={selectedNode}
             businessMarks={selectedNode ? businessMarksByToken[selectedNode.obj_token] : undefined}
@@ -305,6 +318,7 @@ export function Dashboard({ onJumpToSync }: DashboardProps) {
               }
             }}
           />
+          <RecentChanges changes={changes} onJumpToSync={onJumpToSync} />
         </div>
       </div>
 
