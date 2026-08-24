@@ -1,0 +1,86 @@
+# Release 构建工作流（v0.2.8 引入）
+#
+# 触发：推送 v* 标签（发布）或手动 workflow_dispatch（试构建，不发 release）。
+# 产物：macOS dmg + zip（arm64 / x64 两个矩阵 job），附加 latest-mac.yml
+#       （electron-updater 的 generic provider 指向 releases/latest/download/，
+#       因此 yml 必须与安装包同名上传到同一 release）。
+#
+# 签名：CI 没有 Developer ID 证书，走 DESKTOP_MAC_SIGNING=adhoc（electron-builder
+#       identity: "-"）。下载安装后需 `xattr -dr com.apple.quarantine` 解除隔离。
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag（仅试构建时用作产物名后缀，不创建 release）"
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-mac:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, x64]
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            server/package-lock.json
+
+      # 依赖装两份：根目录（前端 + electron + 打包）和 server/（业务）
+      - name: Install dependencies
+        run: |
+          npm ci
+          npm ci --prefix server
+
+      # 复用本地同一打包脚本：build:all → electron:build → 原生模块按
+      # Electron ABI 重建 → electron-builder（dmg + zip）
+      - name: Build desktop app (macOS ${{ matrix.arch }})
+        run: node scripts/build-desktop-target.cjs --platform darwin --arch ${{ matrix.arch }}
+        env:
+          DESKTOP_MAC_SIGNING: adhoc
+          # CI 无证书，禁止 electron-builder 探测钥匙串
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+      - name: Upload artifacts to workflow run
+        uses: actions/upload-artifact@v4
+        with:
+          name: feishu-sync-mac-${{ matrix.arch }}
+          path: |
+            dist-desktop/darwin-${{ matrix.arch }}/*.dmg
+            dist-desktop/darwin-${{ matrix.arch }}/*.zip
+            dist-desktop/darwin-${{ matrix.arch }}/latest-mac.yml
+          if-no-files-found: error
+
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          DIR="dist-desktop/darwin-${{ matrix.arch }}"
+          # 第一个到达的矩阵 job 创建 release，另一个 job 复用（--clobber 幂等）。
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" \
+              --title "Feishu Sync ${TAG}" \
+              --generate-notes \
+              --draft=false
+          gh release upload "$TAG" \
+            "$DIR"/*.dmg "$DIR"/*.zip "$DIR"/latest-mac.yml \
+            --clobber
