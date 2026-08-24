@@ -1,7 +1,13 @@
 import { defineConfig } from 'vite'
 import path from 'path'
+import { readFileSync } from 'node:fs'
 import tailwindcss from '@tailwindcss/vite'
 import react from '@vitejs/plugin-react'
+
+// 构建时注入 package.json version，供 UI「关于与更新」显示真实版本（桌面端还会被 Electron 真实版本覆盖）。
+const pkg = JSON.parse(readFileSync(path.resolve(__dirname, './package.json'), 'utf-8')) as {
+  version: string
+}
 
 const DEFAULT_BACKEND_PORT = 3001
 
@@ -29,6 +35,9 @@ const devProxyTarget = `http://127.0.0.1:${parseBackendPort(process.env.BACKEND_
 
 export default defineConfig({
   base: './',
+  define: {
+    __APP_VERSION__: JSON.stringify(pkg.version),
+  },
   plugins: [
     react(),
     tailwindcss(),

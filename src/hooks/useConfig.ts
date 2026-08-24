@@ -4,7 +4,7 @@
  */
 
 import { useState, useCallback, useEffect } from 'react';
-import { getConfig, saveConfig, APIError } from '../api/client';
+import { getConfig, saveConfig, APIError, type ConfigUpdate } from '../api/client';
 import type { Config } from '../types';
 
 interface UseConfigResult {
@@ -14,7 +14,7 @@ interface UseConfigResult {
   saving: boolean;
   saveError: string | null;
   loadConfig: () => Promise<void>;
-  updateConfig: (updates: Partial<Config>) => Promise<void>;
+  updateConfig: (updates: ConfigUpdate) => Promise<void>;
   refresh: () => Promise<void>;
 }
 
@@ -39,7 +39,7 @@ export function useConfig(): UseConfigResult {
     }
   }, []);
 
-  const updateConfig = useCallback(async (updates: Partial<Config>) => {
+  const updateConfig = useCallback(async (updates: ConfigUpdate) => {
     if (!config) return;
 
     setSaving(true);

@@ -18,31 +18,101 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { getEnabledWatchedRoots } from '../types/index.js';
 import type { DocumentRecord } from '../types/index.js';
+import { toPortableRelative } from './path-resolver.js';
+import { ScanPolicy } from './scan-policy.js';
+
+/**
+ * Resolve the display title used when indexing a local markdown file.
+ *
+ * - README.md: first ATX H1 after front-matter / header comments, else the
+ *   parent directory name, else the literal `"README"`.
+ * - Other .md files: filename without extension.
+ *
+ * Exported for unit tests and callers that need the same identity rule.
+ */
+export function resolveDocumentTitle(mdPath: string, content: string): string {
+  const baseName = path.basename(mdPath);
+  const stem = path.basename(mdPath, path.extname(mdPath));
+
+  if (baseName.toLowerCase() !== 'readme.md') {
+    return stem;
+  }
+
+  const h1 = extractFirstAtxH1(content);
+  if (h1) return h1;
+
+  const parentName = path.basename(path.dirname(path.resolve(mdPath)));
+  if (
+    parentName &&
+    parentName !== '.' &&
+    parentName !== path.sep &&
+    // Windows drive root / POSIX root edge cases
+    !/^[A-Za-z]:\\?$/.test(parentName) &&
+    parentName !== '/'
+  ) {
+    return parentName;
+  }
+
+  return 'README';
+}
+
+/**
+ * Strip leading HTML comments and YAML front-matter, then return the first
+ * ATX H1 (`# title`). Setext headings and H2+ are ignored.
+ */
+function extractFirstAtxH1(content: string): string | null {
+  let rest = content;
+  let progressed = true;
+
+  while (progressed) {
+    progressed = false;
+    // Leading blank lines / BOM-ish whitespace
+    const trimmed = rest.replace(/^\uFEFF?[\t ]*(?:\r?\n)+/, '').replace(/^\uFEFF/, '');
+    if (trimmed !== rest) {
+      rest = trimmed;
+      progressed = true;
+    }
+
+    // HTML comment block (feishu_sync / legacy header comments)
+    const htmlMatch = rest.match(/^<!--[\s\S]*?-->/);
+    if (htmlMatch) {
+      rest = rest.slice(htmlMatch[0].length);
+      progressed = true;
+      continue;
+    }
+
+    // YAML front-matter --- ... ---
+    const fmMatch = rest.match(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/);
+    if (fmMatch) {
+      rest = rest.slice(fmMatch[0].length);
+      progressed = true;
+      continue;
+    }
+  }
+
+  // Drop remaining leading whitespace/newlines before scanning headings
+  rest = rest.replace(/^\s+/, '');
+
+  for (const line of rest.split(/\r?\n/)) {
+    // Single-hash ATX H1 only (not ## / ###)
+    if (!line.startsWith('#') || line.startsWith('##')) continue;
+    const m = line.match(/^#\s+(.+?)\s*$/);
+    if (m) {
+      const title = m[1].trim();
+      if (title.length > 0) return title;
+    }
+  }
+
+  return null;
+}
 
 interface IndexScannerDeps {
   localMapStore: any; // LocalMapStore
   larkCliClient: any; // LarkCliClient
   config: any; // Config
 }
-
-/**
- * v0.2.0 structure-align Phase B: mapping from a configured watchedRoot
- * URL to the local top-level directory name that backs it. Used by
- * IndexScanner to classify existing rows by their local_md_path.
- *
- * The mapping mirrors the static layout in local-map-store's
- * inferWatchedRootMeta — both must stay in sync.
- *
- * A directory is considered "owned" by a watchedRoot when its top-level
- * segment matches one of the keys below (case-insensitive on Windows).
- */
-const WATCHED_ROOT_DIR_MAP: Record<string, string> = {
-  'https://qcnbafdrjx7n.feishu.cn/wiki/Wramw1XxRihIgnkCrhqcdEbRnHb': '策划 - Designer',
-  'https://qcnbafdrjx7n.feishu.cn/wiki/QdZpwOmgBi25JVkAUmYcBiMinIf': '技术 - Dev',
-  'https://qcnbafdrjx7n.feishu.cn/wiki/NudewPkE9inlGhkEDA1c9FSsnkb': '[必读] 研发规范',
-  'https://qcnbafdrjx7n.feishu.cn/wiki/FEaww3vUHieIumk6FdIc92WHnyh': '开发环境指引',
-};
 
 interface IndexResult {
   scanned: number;
@@ -72,10 +142,9 @@ export class IndexScanner {
   private localMapStore: any;
   private larkCliClient: any;
   /**
-   * v0.2.0 structure-align Phase B: cached config reference. Used by
-   * scanKnowledgeBase to read the configured watchedRootUrls when
-   * backfilling documents.watched_root_url. The reference is read-only;
-   * mutations through this.config are not allowed.
+   * P2 config authority used by scanKnowledgeBase to backfill document root
+   * identity. The reference is read-only; mutations through this.config are
+   * not allowed.
    */
   private config: any;
 
@@ -152,35 +221,19 @@ export class IndexScanner {
       }
     }
 
-    // v0.2.0 structure-align Phase B: backfill watched_root_url based on
-    // the local_md_path top-level directory. We map each configured
-    // watchedRoot URL → its backing local directory, then bulk-tag rows
-    // via LocalMapStore.backfillWatchedRootUrls. Rows under any other
-    // directory get watched_root_url=NULL (mounted/local-only).
+    // P2: backfill ownership from structured configuration, never from a
+    // static token->directory map. The store records both URL compatibility
+    // metadata and the stable root-token id used by P1 state transitions.
     try {
-      const configuredUrls: string[] = Array.isArray(this.config?.watchedRootUrls)
-        ? this.config.watchedRootUrls
-        : [];
-      const dirToUrl = new Map<string, string>();
-      for (const url of configuredUrls) {
-        // Static known layout.
-        if (WATCHED_ROOT_DIR_MAP[url]) {
-          dirToUrl.set(WATCHED_ROOT_DIR_MAP[url], url);
-          continue;
-        }
-        // Unknown URL: derive the directory name from the watchedRoot's
-        // title via lark-cli. We skip this here (no async round-trip at
-        // scan time) and let the user populate it via the configuration
-        // panel once the runtime has resolved the title.
-      }
+      const configuredRoots = getEnabledWatchedRoots(this.config);
       if (
-        dirToUrl.size > 0 &&
-        typeof this.localMapStore.backfillWatchedRootUrls === 'function'
+        configuredRoots.length > 0 &&
+        typeof this.localMapStore.backfillWatchedRoots === 'function'
       ) {
         const kbRoot = this.config?.knowledgeBaseRoot ?? '';
-        const stats = this.localMapStore.backfillWatchedRootUrls(dirToUrl, kbRoot);
+        const stats = this.localMapStore.backfillWatchedRoots(configuredRoots, kbRoot);
         console.info(
-          `[IndexScanner] watched_root_url backfill: scanned=${stats.scanned} tagged=${stats.tagged} untagged=${stats.untagged}`,
+          `[IndexScanner] watchedRoot backfill: scanned=${stats.scanned} tagged=${stats.tagged} untagged=${stats.untagged}`,
         );
       }
     } catch (err) {
@@ -239,17 +292,32 @@ export class IndexScanner {
     // previously classified as 'restricted' (e.g. placeholder from change-
     // detector), a successful reindex with a real title promotes it to
     // 'synced' on the next recompute pass.
+    //
+    // P2-04: title comes from resolveDocumentTitle (README → H1 / parent dir);
+    // space_id + last_synced_modify_time are forwarded; localRelPath is the
+    // POSIX path relative to knowledgeBaseRoot when that config is available.
+    const today = new Date().toISOString().split('T')[0];
+    const title = resolveDocumentTitle(mdPath, content);
+    const kbRoot =
+      typeof this.config?.knowledgeBaseRoot === 'string'
+        ? this.config.knowledgeBaseRoot
+        : '';
+    const localRelPath =
+      kbRoot.length > 0 ? toPortableRelative(kbRoot, mdPath) : null;
+
     this.localMapStore.upsertDocument({
       objToken,
       wikiNodeToken: header.wiki_node_token ?? null,
       objType: objType as DocumentRecord['objType'],
-      title: path.basename(mdPath, '.md'),
+      title,
       localMdPath: mdPath,
       lastSyncedModifyTime:
-        header.fetch_date || new Date().toISOString().split('T')[0],
+        header.last_synced_modify_time || header.fetch_date || today,
       lastSyncedAt: new Date().toISOString(),
       status: 'synced',
       originalLink: header.original_link ?? null,
+      spaceId: header.space_id ?? null,
+      ...(localRelPath != null ? { localRelPath } : {}),
     });
 
     console.info(`[IndexScanner] Indexed ${mdPath} (obj_token: ${objToken})`);
@@ -619,9 +687,14 @@ export class IndexScanner {
       const fullPath = path.join(dir, entry.name);
 
       if (entry.isDirectory()) {
+        if (ScanPolicy.shouldSkipDirectory(entry.name)) continue;
         // Recursively scan subdirectories
         mdFiles.push(...this.findMarkdownFiles(fullPath));
-      } else if (entry.isFile() && entry.name.endsWith('.md')) {
+      } else if (
+        entry.isFile() &&
+        !ScanPolicy.shouldSkipFile(entry.name) &&
+        entry.name.endsWith('.md')
+      ) {
         mdFiles.push(fullPath);
       }
     }

@@ -9,7 +9,13 @@
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "audit:corpus": "tsx scripts/audit-knowledge-base.ts",
+    "backup:state": "tsx scripts/backup-operation-state.ts",
+    "reconcile:dry-run": "tsx scripts/reconcile-knowledge-base.ts",
+    "reconcile:apply": "tsx scripts/reconcile-apply.ts",
+    "migrate:v5": "tsx scripts/run-migration-v5.ts",
+    "test:migrations": "vitest run tests/migration-v5.test.ts"
   },
   "dependencies": {
     "@hono/node-server": "^1.14.0",

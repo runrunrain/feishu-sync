@@ -6,10 +6,25 @@
 // Re-export shared types from server (will be available in production build)
 // For development, we define them here for type safety
 
+export type LayoutProfile = 'directory-readme' | 'mirror-title-file';
+
+/** Authoritative local layout configuration for one Feishu wiki root. */
+export interface WatchedRootConfig {
+  /** Canonical wiki root node token; matches server `watched_root_id`. */
+  id: string;
+  url: string;
+  /** POSIX-style path relative to `knowledgeBaseRoot`. */
+  localDir: string;
+  layoutProfile: LayoutProfile;
+  enabled: boolean;
+}
+
 export interface Config {
   llm: LlmConfig;
   pollIntervalMinutes: number;
   knowledgeBaseRoot: string;
+  watchedRoots: WatchedRootConfig[];
+  /** Compatibility projection derived by the server; not persisted by P2+. */
   watchedRootUrls: string[];
   larkCliPath?: string;
   requiredScopes: string[];
@@ -17,16 +32,33 @@ export interface Config {
   enableNotifications: boolean;
 }
 
+/** One model preset inside a provider's OpenAI/Anthropic-compatible routes. */
+export interface LlmModelPreset {
+  id: string;
+  name: string;
+  openAiModel: string;
+  claudeCliModel: string;
+  enabled: boolean;
+}
+
+/** A remotely hosted model provider configured in Settings. */
+export interface LlmProviderConfig {
+  id: string;
+  name: string;
+  enabled: boolean;
+  apiKey: string;
+  openAiCompatBaseUrl: string;
+  claudeCompatBaseUrl: string;
+  defaultModelId?: string;
+  models: LlmModelPreset[];
+}
+
 /**
- * v0.2.0 P3/P4 — channel-agnostic LLM provider config (bigmodel 认知修正).
+ * v0.2.0 — remote-provider profiles plus local execution-channel controls.
  *
- * Cognitive correction (2026-06-18): there is ONE provider (bigmodel GLM by
- * default). `claude -p` (Anthropic-protocol adapter) and the OpenAI SDK 直连
- * (OpenAI-protocol adapter) are TWO CHANNELS sharing ONE `LlmConfig`.
- *
- * Frontend type mirrors server/src/types/index.ts LlmConfig. The legacy
- * flat shape `{ baseUrl, apiKey, model, temperature }` is auto-migrated by
- * ConfigManager; UI never shows the legacy form.
+ * `providers` is used by the remote direct and Claude Code channels. The
+ * flat endpoint/key/model fields remain for migration and older callers; the
+ * server resolves the selected provider/model before a remote request.
  */
 export interface LlmConfig {
   /** OpenAI-protocol adapter base URL (DirectChannel/OpenAI SDK). */
@@ -42,13 +74,35 @@ export interface LlmConfig {
   claudeCliModel?: string;
   /** Sampling temperature 0.0-1.0. Default 0.2. */
   temperature: number;
+  /** User-configured remote model providers. */
+  providers?: LlmProviderConfig[];
+  /** Currently selected remote provider for direct / Claude Code. */
+  activeProviderId?: string;
+  /** Currently selected model preset within the active provider. */
+  activeModelId?: string;
+  /** Optional shared timeout used by remote channels (milliseconds). */
+  timeoutMs?: number;
   /** ClaudeCliChannel process control. */
   claudeCli?: {
     claudePath?: string;
     extraArgs?: string[];
   };
+  /**
+   * Local OpenCode process controls. When the active provider has a key, the
+   * app passes it to OpenCode only for that child process; it is never written
+   * to OpenCode's config file. Without an active key OpenCode uses its own
+   * local configuration.
+   */
+  opencode?: {
+    executablePath?: string;
+    model?: string;
+    agent?: string;
+    timeoutMs?: number;
+  };
+  /** Explicit opt-in: reorganise Markdown bodies during sync. */
+  contentAdaptationEnabled?: boolean;
   /** Primary channel name. Default 'claude-cli'. */
-  primaryChannel: 'claude-cli' | 'direct';
+  primaryChannel: 'claude-cli' | 'direct' | 'opencode';
   /** On primary failure, retry via the other channel. Default true. */
   fallbackOnFailure: boolean;
 }
@@ -77,7 +131,34 @@ export interface ChangedDocument {
   cloudModifiedTime: string;
   localSyncedTime: string | null;
   localMdPath: string | null;
+  wikiNodeToken?: string | null;
+  parentNodeToken?: string | null;
+  spaceId?: string | null;
+  watchedRootId?: string | null;
+  hasChild?: boolean;
+  observedObjEditTime?: number | null;
+  syncState?: SyncState;
+  /**
+   * Ancestor titles from the configured watched root (exclusive) to the
+   * immediate parent.  An empty array is valid for a direct child; undefined
+   * means the hierarchy is not safe to plan yet.
+   */
+  parentChainTitles?: string[];
+  /** True only for the body of the configured watched-root node itself. */
+  isWatchedRootNode?: boolean;
+  /** Portable relative path from a verified existing mapping, if any. */
+  localRelPath?: string | null;
 }
+
+export type SyncState =
+  | 'pending_added'
+  | 'pending_modified'
+  | 'synced'
+  | 'restricted'
+  | 'feishu_pending'
+  | 'error'
+  | 'missing_candidate'
+  | 'deleted_confirmed';
 
 export interface SyncedDocument {
   objToken: string;
@@ -95,7 +176,65 @@ export interface FailedDocument {
   title: string;
   error: string;
   retryable: boolean;
+  reasonCode?: SyncFailureReasonCode;
+  suggestedResolution?: string;
+  repairAction?: SyncRepairAction;
+  watchedRootId?: string | null;
 }
+
+export type SyncPlanReasonCode =
+  | 'deleted_requires_confirmation'
+  | 'missing_parent_chain'
+  | 'unknown_watched_root'
+  | 'path_conflict'
+  | 'unsafe_path'
+  | 'planned_move'
+  | 'unsupported_type'
+  | 'restricted'
+  | 'unknown';
+
+export type SyncFailureReasonCode =
+  | SyncPlanReasonCode
+  | 'permission_denied'
+  | 'cloud_deleted'
+  | 'rate_limited'
+  | 'upstream_error';
+
+export type SyncRepairAction =
+  | 'rebuild_parent_chain'
+  | 'adopt_existing_file'
+  | 'retry'
+  | 'grant_access'
+  | 'review_deleted'
+  | 'enable_export_adapter'
+  | 'manual_review';
+
+/** Persistent issues that require an operator to act in Feishu before sync can resume. */
+export interface FeishuPendingItem {
+  objToken: string;
+  title: string;
+  watchedRootId: string | null;
+  reasonCode: SyncFailureReasonCode;
+  error: string;
+  suggestedResolution: string;
+  repairAction: SyncRepairAction;
+  createdAt: string;
+  updatedAt: string;
+  recheckRequestedAt: string | null;
+}
+
+export interface PlannedSyncDocument {
+  objToken: string;
+  title: string;
+  objType: 'docx' | 'sheet' | 'slides' | 'unknown';
+  changeType: 'modified' | 'added' | 'deleted';
+  action: 'create' | 'replace' | 'blocked';
+  localMdPath: string | null;
+  previousSha256: string | null;
+  reason?: string;
+}
+
+export type SyncMode = 'dry-run' | 'apply';
 
 export interface SyncResult {
   success: boolean;
@@ -104,6 +243,16 @@ export interface SyncResult {
   startedAt: string;
   completedAt: string;
   duration: number;
+  mode?: SyncMode;
+  operationId?: string;
+  manifestPath?: string;
+  plannedDocuments?: PlannedSyncDocument[];
+}
+
+export interface SyncDocumentOptions {
+  enableLLM?: boolean;
+  /** Explicitly adopt only title-verified legacy exports at profile paths. */
+  adoptExistingProfileTargets?: boolean;
 }
 
 export interface ChangeDetectionResult {
@@ -111,6 +260,9 @@ export interface ChangeDetectionResult {
   changedDocuments: ChangedDocument[];
   checkedAt: string;
   totalNodes: number;
+  traversalComplete?: boolean;
+  failedNodeTokens?: string[];
+  missingCandidates?: number;
 }
 
 export interface AuthStatus {
@@ -210,12 +362,37 @@ export interface TreeResponse {
   view: 'feishu' | 'local';
   nodes: MappingNode[];
   watched_roots: WatchedRoot[];
-  orphan_files: Array<{ path: string; reason: string; cloud_match: 'local_only' }>;
+  orphan_files: OrphanFile[];
   stats: {
     total_nodes: number;
     watched_root_count: number;
     cloud_match_distribution: Record<string, number>;
   };
+}
+
+/**
+ * GET /api/mapping/content/:objToken 响应（v0.2.8 布局重构 批次1）。
+ * mdContent 为 null 表示索引引用了文件但磁盘上不存在（尚未同步）；
+ * sheet 文档的原始表格在 csvTables 中（`<stem>.csv-data/*.csv`）。
+ */
+export interface DocumentContent {
+  objToken: string;
+  title: string;
+  objType: string;
+  /** 知识库根目录相对的 POSIX 路径；索引中无路径时为 null。 */
+  mdPath: string | null;
+  mdContent: string | null;
+  mdTruncated: boolean;
+  csvTables: DocumentCsvTable[];
+}
+
+export interface DocumentCsvTable {
+  /** 去扩展名的表名（sheet 子表名）。 */
+  name: string;
+  /** 知识库根目录相对的 POSIX 路径。 */
+  path: string;
+  content: string;
+  truncated: boolean;
 }
 
 /**
@@ -266,14 +443,21 @@ export interface DiffReport {
 /**
  * Orphan file entry from _index.json.orphan_files.
  *
- * v0.2.0 cloud-link-coverage: cloud_match is always 'local_only' for orphans
- * (they have no feishu correspondence by definition). Surfaced explicitly so
- * the UI can render "本地独有 / 无飞书对应" rather than treating them as broken.
+ * P2-05: classification distinguishes missing metadata, ambiguous cloud
+ * matches, confirmed local-only files, and ignored navigation artifacts.
+ * cloud_match remains for backward-compatible badge rendering.
  */
+export type OrphanClassification =
+  | 'missing_metadata'
+  | 'cloud_match_ambiguous'
+  | 'local_only_confirmed'
+  | 'ignored_artifact';
+
 export interface OrphanFile {
   path: string;
   reason: string;
-  cloud_match: 'local_only';
+  classification?: OrphanClassification;
+  cloud_match: 'local_only' | 'unknown';
 }
 
 /**
@@ -383,7 +567,7 @@ export interface TrashedDoc {
 // Channel Connectivity Test (T7, decision 3 real call)
 // ============================================================================
 
-export type ChannelName = 'claude-cli' | 'direct';
+export type ChannelName = 'claude-cli' | 'direct' | 'opencode';
 
 /**
  * Connectivity test request body for POST /api/llm/test-channel.
@@ -397,8 +581,22 @@ export type ChannelName = 'claude-cli' | 'direct';
  */
 export interface ChannelTestRequest {
   channel: ChannelName;
-  llm: Pick<LlmConfig, 'openAiCompatBaseUrl' | 'claudeCompatBaseUrl' | 'apiKey' | 'model' | 'directModel' | 'claudeCliModel' | 'temperature'>;
+  llm: Pick<
+    LlmConfig,
+    | 'openAiCompatBaseUrl'
+    | 'claudeCompatBaseUrl'
+    | 'apiKey'
+    | 'model'
+    | 'directModel'
+    | 'claudeCliModel'
+    | 'temperature'
+    | 'timeoutMs'
+    | 'providers'
+    | 'activeProviderId'
+    | 'activeModelId'
+  >;
   claudeCli?: { claudePath?: string; extraArgs?: string[] };
+  opencode?: LlmConfig['opencode'];
 }
 
 export interface ChannelTestResult {
@@ -410,6 +608,31 @@ export interface ChannelTestResult {
   /** Effective model alias used. */
   model: string;
   /** One-line error summary (no stack). Full detail in server logs. */
+  error?: string;
+}
+
+export interface OpenCodeStatus {
+  installed: boolean;
+  executablePath: string | null;
+  version: string | null;
+  source: 'configured' | 'path' | 'login-shell' | 'npm-global-prefix' | 'npm-global-root' | 'missing';
+  executable: boolean;
+  error?: string;
+}
+
+export interface OpenCodeInstallResult {
+  success: boolean;
+  status: OpenCodeStatus;
+  message: string;
+}
+
+/** Read-only availability result for the local Claude Code executable. */
+export interface ClaudeCliStatus {
+  installed: boolean;
+  executablePath: string | null;
+  version: string | null;
+  source: 'configured' | 'environment' | 'path' | 'known-location' | 'missing';
+  executable: boolean;
   error?: string;
 }
 
@@ -437,6 +660,8 @@ export interface DesktopUpdateState {
   state: 'idle' | 'checking' | 'available' | 'downloading' | 'downloaded' | 'installing';
   version?: string;
   progress?: number;
+  /** 当前应用真实版本（Electron app.getVersion，桌面端存在）；与 electron/contracts.ts 对齐。 */
+  currentVersion?: string;
 }
 
 export interface DesktopUpdateCheckResult {
@@ -450,6 +675,64 @@ export interface DesktopUpdateEvent {
   state?: DesktopUpdateState['state'];
   progress?: number;
   error?: string;
+}
+
+// ============================================================================
+// Custom Folders (快捷添加云链接 + 自定义文件夹归档)
+// ============================================================================
+//
+// API 契约（前后端共同遵守，字段名勿改）：
+//   GET    /api/custom-folders           → { folders: CustomFolder[] }
+//   POST   /api/custom-folders { name }  → 201 { folder }；400 invalid_name；409 duplicate_name
+//   PATCH  /api/custom-folders/:id { name } → { folder }（仅改 name，localRelPath 不变）
+//   DELETE /api/custom-folders/:id       → { ok: true }（文档 custom_folder_id 置空，文件保留）
+//   POST   /api/custom-folders/:id/docs { links: string[] }（≤20 条/次）
+//          → { results: AddLinkToFolderResult[] }
+
+/** 自定义归档文件夹下的单篇云文档。 */
+export interface CustomFolderDoc {
+  objToken: string;
+  title: string;
+  objType: 'docx' | 'sheet' | 'slides' | string;
+  originalLink: string;
+  /** 相对知识库根的 POSIX 路径（<folderRelPath>/<title>.<ext>）。 */
+  localRelPath: string;
+}
+
+export interface CustomFolder {
+  id: string;
+  name: string;
+  /** 相对知识库根的 POSIX 路径，默认 `_custom/<sanitized-name>`。 */
+  localRelPath: string;
+  createdAt: string;
+  docs: CustomFolderDoc[];
+}
+
+/** POST /docs 逐条错误分类（契约固定枚举）。 */
+export type AddLinkErrorCode =
+  | 'parse_failed'
+  | 'already_exists'
+  | 'unsupported_type'
+  | 'fetch_failed'
+  | 'permission_denied';
+
+export interface AddLinkResultError {
+  code: AddLinkErrorCode | string;
+  message?: string;
+  /** already_exists 时附已有归属（结构树 / 归档文件夹名）。
+   * 真实后端字段名为 existingLocation；owner 为兼容别名。 */
+  owner?: string;
+  existingLocation?: string;
+}
+
+/** POST /api/custom-folders/:id/docs 的逐条结果。 */
+export interface AddLinkToFolderResult {
+  link: string;
+  ok: boolean;
+  objToken?: string;
+  title?: string;
+  objType?: string;
+  error?: AddLinkResultError;
 }
 
 declare global {

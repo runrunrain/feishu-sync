@@ -54,8 +54,10 @@ function formatRelative(unixSeconds: number | null): string {
   const diff = Math.max(0, now - unixSeconds);
   if (diff < 3600) return `${Math.max(1, Math.floor(diff / 60))}h`;
   if (diff < 86400) return `${Math.floor(diff / 3600)}h`;
-  if (diff < 86400 * 30) return `${Math.floor(diff / 86400)}d`;
-  return new Date(unixSeconds * 1000).toISOString().slice(0, 10);
+  // The tree is deliberately compact. An ISO date (10 characters) can push
+  // the title completely out of a narrow sidebar at deep nesting levels;
+  // day counts remain precise enough for this at-a-glance indicator.
+  return `${Math.floor(diff / 86400)}d`;
 }
 
 export function TreeNode({
@@ -78,6 +80,8 @@ export function TreeNode({
   const TypeIcon = hasChildren ? Folder : (TYPE_ICON[node.obj_type] ?? FileType);
   const showChangedBadge =
     node.status === 'changed' || node.cloud_deleted === 1;
+  // v0.2.5 层级视觉：顶层节点（level 0）文字/图标大于深层；深层不再与顶层同尺寸。
+  const isRootLevel = level === 0;
 
   return (
     <div
@@ -92,16 +96,18 @@ export function TreeNode({
         - 行高 28px→32px：4px 增量大幅改善节点之间的呼吸（04 §3.2 原为 28px，
           实际渲染时元素密集导致视觉拥挤；32px 在保持紧凑的同时提供视觉缓冲）
         - 内部 gap-1.5→gap-2，图标与文字之间不再挤压
-        - 缩进 14px/级 保持（与原设计一致）
+        - 缩进 8px/级、上限 40px（2026-06-20 由 10px/级、上限 48px 收紧，
+          把空间让给标题，深层节点标题可读性优先）
       */}
       {isDropTargetBefore && <div className="tree-drop-indicator" />}
       <div
-        className={`flex items-center gap-2 h-8 pr-2.5 rounded-sm cursor-pointer transition-colors ${
+        data-node-token={node.obj_token}
+        className={`flex min-w-0 items-center gap-2 h-8 overflow-hidden pr-2.5 rounded-sm cursor-pointer transition-all duration-150 ${
           selected
-            ? 'bg-[rgba(158,43,37,0.04)]'
-            : 'hover:bg-paper-2'
-        } ${selected ? 'before:absolute before:left-0 before:top-0 before:bottom-0 before:w-0.5 before:bg-seal' : ''}`}
-        style={{ paddingLeft: 8 + level * 14 }}
+            ? 'bg-seal/[0.08] shadow-[inset_0_0_0_1px_rgba(158,43,37,0.12)]'
+            : 'hover:bg-paper-2 active:bg-paper-2/70'
+        } ${selected ? 'before:absolute before:left-0 before:top-1 before:bottom-1 before:w-[3px] before:rounded-full before:bg-seal' : ''}`}
+        style={{ paddingLeft: Math.min(8 + level * 8, 40) }}
         onClick={() => onSelect(node.obj_token)}
         draggable
         onDragStart={(e) => onDragStart(e, node)}
@@ -109,10 +115,11 @@ export function TreeNode({
         onDragLeave={(e) => onDragLeave(e, node)}
         onDrop={(e) => onDrop(e, node)}
       >
-        {/* Drag handle (visible on hover) */}
+        {/* The entire row remains draggable. Hiding the handle keeps deep
+            nodes usable inside the compact 280px sidebar. */}
         <span
           aria-hidden
-          className="shrink-0 w-3 text-ink-faint/40 group-hover:text-ink-faint cursor-grab active:cursor-grabbing select-none"
+          className="hidden shrink-0 w-3 text-ink-faint/40 group-hover:text-ink-faint cursor-grab active:cursor-grabbing select-none"
           title="拖拽以调整同级顺序"
         >
           <svg viewBox="0 0 6 12" className="w-1.5 h-3 fill-current">
@@ -145,7 +152,7 @@ export function TreeNode({
         </span>
 
         {/* Type icon */}
-        <TypeIcon className="w-4 h-4 text-ink-soft shrink-0" />
+        <TypeIcon className={`${isRootLevel ? 'w-4 h-4' : 'w-3.5 h-3.5'} shrink-0 transition-colors ${selected ? 'text-seal' : 'text-ink-soft'}`} />
 
         {/* Business marks (independent tag, decision 1) */}
         {businessMarks && businessMarks.length > 0 && (
@@ -154,10 +161,15 @@ export function TreeNode({
 
         {/* Title */}
         <span
-          className={`flex-1 truncate text-[13px] ${
-            node.cloud_deleted === 1 ? 'text-ink-faint line-through' : 'text-ink'
+          className={`min-w-0 flex-1 truncate ${isRootLevel ? 'text-[13px]' : 'text-[12px]'} ${
+            node.cloud_deleted === 1
+              ? 'text-ink-faint line-through'
+              : selected
+                ? 'text-seal font-medium'
+                : 'text-ink'
           }`}
           style={{ fontFamily: 'var(--serif)' }}
+          title={node.title}
         >
           {node.title}
         </span>

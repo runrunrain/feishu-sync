@@ -18,6 +18,7 @@ import { SyncView } from './views/SyncView';
 import { SettingsView } from './views/SettingsView';
 import { useAuthStatus } from './hooks/useAuthStatus';
 import { useSyncStatus } from './hooks/useSyncStatus';
+import { SyncProvider } from './hooks/useSync';
 
 function AppShell() {
   const [currentArea, setCurrentArea] = useState<MainArea>('overview');
@@ -38,7 +39,7 @@ function AppShell() {
   };
 
   return (
-    <div className="h-screen w-screen overflow-hidden flex flex-col bg-paper">
+    <div className="h-[100dvh] min-h-screen w-full overflow-hidden flex flex-col bg-paper">
       <TopBar
         currentArea={currentArea}
         onAreaChange={setCurrentArea}
@@ -46,13 +47,20 @@ function AppShell() {
         pendingCount={pendingCount}
       />
       {/*
-        主内容区布局重构（2026-06-19）：
-        - max-w-7xl (1280px) 居中（04 §11.3），原 max-w-6xl 略窄
-        - px-8 py-6 四周留白（原 p-5 太挤），呼吸感
-        - 不同主区可按需调整 max-width（SettingsView/Dashboard 在视图内部控制）
+        主内容区布局重构（v0.2.8）：
+        - 取消 max-w-* 居中限制：宽屏下两侧大空白被取消，总览/同步区全宽铺开，
+          空间让给节点树 + 文档预览主内容；设置区保留 1440px 上限维持表单可读性
+        - 总览区高度收敛：Dashboard 内部按 100dvh-88px 自管三栏等高布局
       */}
       <main className="flex-1 overflow-auto scrollbar-thin">
-        <div className="max-w-7xl mx-auto px-6 py-6 lg:px-8">{renderArea()}</div>
+        <div
+          key={currentArea}
+          className={`animate-fade-in px-4 py-4 sm:px-6 lg:px-8 ${
+            currentArea === 'settings' ? 'mx-auto max-w-[1440px]' : 'w-full'
+          }`}
+        >
+          {renderArea()}
+        </div>
       </main>
     </div>
   );
@@ -62,7 +70,10 @@ export default function App() {
   return (
     <ErrorBoundary>
       <ToastProvider>
-        <AppShell />
+        {/* 同步状态提升到全局，切换主区卸载 SyncView 后不丢失（后台同步继续） */}
+        <SyncProvider>
+          <AppShell />
+        </SyncProvider>
       </ToastProvider>
     </ErrorBoundary>
   );

@@ -8,7 +8,7 @@
  *
  * Multi-root contract: this service POSTs to /api/detect/changes-all,
  * the same multi-root endpoint the frontend 立即检测 button uses. The
- * server iterates config.watchedRootUrls and runs detectChanges per
+ * server iterates enabled config.watchedRoots and runs detectChanges per
  * root, aggregating changedDocuments across ALL roots. This is a
  * deliberate change from the earlier single-root design which POSTed
  * /api/detect/changes { rootUrl } with only the FIRST valid watched
@@ -19,8 +19,8 @@
  * revision sent { rootUrls: [] } to the singular endpoint, leaving
  * rootUrl undefined on the server and triggering a lark-cli positional-
  * arg error. The lesson — always match the endpoint's actual contract
- * — still applies; changes-all is config-driven (body ignored), so an
- * empty {} is the correct body here.
+ * — still applies; changes-all is config-driven and defaults to fast mode,
+ * so an empty {} is the correct body here.
  */
 
 import type { BrowserWindow } from 'electron';
@@ -55,6 +55,8 @@ interface ChangeDetectionResult {
 
 export class ChangeNotificationService {
   private pollTimer: NodeJS.Timeout | null = null;
+  /** A manual click, boot check and interval tick must share one poll. */
+  private inFlightCheck: Promise<ChangeDetectionResult | null> | null = null;
   private lastNotificationTime: number = 0;
   private lastChangedCount: number = 0;
 
@@ -102,13 +104,30 @@ export class ChangeNotificationService {
    * the tray notification (notification semantics are unchanged from
    * the single-root era — only coverage expanded to all roots).
    */
-  private async checkChanges(): Promise<void> {
+  private checkChanges(): Promise<ChangeDetectionResult | null> {
+    if (this.inFlightCheck) {
+      console.info('[ChangeNotification] Joining the in-flight change check');
+      return this.inFlightCheck;
+    }
+
+    const pending = this.performCheck();
+    this.inFlightCheck = pending;
+    const clearInFlight = () => {
+      if (this.inFlightCheck === pending) this.inFlightCheck = null;
+    };
+    // Clear after success and failure without introducing an unhandled
+    // rejection from Promise.finally().
+    void pending.then(clearInFlight, clearInFlight);
+    return pending;
+  }
+
+  private async performCheck(): Promise<ChangeDetectionResult | null> {
     const serverUrl = this.options.getServerUrl();
     const apiToken = this.options.getApiToken();
 
     if (!serverUrl || !apiToken) {
       console.warn('[ChangeNotification] Server not ready, skipping check');
-      return;
+      return null;
     }
 
     const rootUrls = this.options.getWatchedRootUrls();
@@ -116,12 +135,12 @@ export class ChangeNotificationService {
       // No valid watched root URL configured — nothing to detect.
       // Not an error; log once per poll so the trace is visible.
       console.info('[ChangeNotification] No watched root URLs configured, skipping detect poll');
-      return;
+      return null;
     }
 
     try {
       // Drive the multi-root detect endpoint so EVERY configured root is
-      // polled automatically. The server iterates config.watchedRootUrls
+      // polled automatically. The server iterates enabled config.watchedRoots
       // internally and aggregates changedDocuments across roots; the body
       // is config-driven (ignored), so {} is correct. Response shape:
       //   { changed, changedDocuments, totalNodes, checkedAt, results[] }
@@ -158,8 +177,10 @@ export class ChangeNotificationService {
       console.info(
         `[ChangeNotification] Checked ${result.totalNodes} nodes across ${rootUrls.length} root(s), ${result.changedDocuments.length} changed`,
       );
+      return result;
     } catch (error) {
       console.error('[ChangeNotification] Change detection failed:', this.options.sanitizeError(error));
+      return null;
     }
   }
 
@@ -188,14 +209,7 @@ export class ChangeNotificationService {
    */
   async manualCheck(): Promise<ChangeDetectionResult | null> {
     try {
-      await this.checkChanges();
-      // Return a summary - in real implementation would return actual result
-      return {
-        changed: this.lastChangedCount > 0,
-        changedDocuments: [],
-        checkedAt: new Date().toISOString(),
-        totalNodes: 0,
-      };
+      return await this.checkChanges();
     } catch (error) {
       console.error('[ChangeNotification] Manual check failed:', error);
       return null;

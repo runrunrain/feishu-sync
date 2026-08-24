@@ -8,7 +8,7 @@
  * (reported in v0.2.0 sync-state-timeout-fix §问题1).
  *
  * Data source contract:
- *   GET /api/mapping/diff?rootUrl=<watchedRoot>  (per-root)
+ *   GET /api/mapping/diff?rootUrl=<watchedRoot>&cached=1  (per-root)
  *   -> DiffReport { added, modified, deleted, ... }
  *
  * Multi-root aggregation: when `config.watchedRootUrls` contains more
@@ -35,12 +35,12 @@
  * `lastSyncTime` is derived from the latest (max) diff.checkedAt across
  * roots, and `nextCheckTime` is projected from `pollIntervalMinutes` in
  * the config — both are now REAL signals instead of fabricated timestamps.
- * `isDetecting` stays a local boolean flipped around the fetch so the
- * status-bar spinner reflects in-flight requests.
+ * This is a local-state reader, not a cloud detector. The status bar's
+ * explicit detect action owns the real detection spinner.
  */
 
 import { useState, useEffect, useCallback } from 'react';
-import { getMappingDiff } from '../api/client';
+import { getStoredMappingDiff } from '../api/client';
 import { appLogger } from '../utils/appLogger';
 import { isUsableWikiUrl } from '../utils/wikiUrl';
 import { useConfig } from './useConfig';
@@ -91,14 +91,18 @@ export function useSyncStatus(options: UseSyncStatusOptions = {}): SyncStatusDat
       });
       return;
     }
-    setStatus((prev) => ({ ...prev, isDetecting: true }));
     try {
-      let pending = 0;
+      // Dedup by objToken across roots: custom-folder (归档) docs are
+      // merged into every root's stored diff server-side, so summing
+      // per-root counts would multiply them by the number of watchedRoots.
+      const pendingTokens = new Set<string>();
       let latestCheckedAt = '';
       for (const url of validUrls) {
         try {
-          const report = await getMappingDiff(url);
-          pending += report.added.length + report.modified.length;
+          const report = await getStoredMappingDiff(url);
+          for (const doc of [...report.added, ...report.modified]) {
+            pendingTokens.add(doc.objToken ?? `${doc.title}:${doc.localMdPath ?? ''}`);
+          }
           if (report.checkedAt && report.checkedAt > latestCheckedAt) {
             latestCheckedAt = report.checkedAt;
           }
@@ -106,7 +110,7 @@ export function useSyncStatus(options: UseSyncStatusOptions = {}): SyncStatusDat
           // Per-root failures degrade gracefully — the status bar shows the
           // partial sum rather than blocking on a single broken root.
           // ChangeListPanel surfaces the error via toast.
-          appLogger.warn('useSyncStatus', 'getMappingDiff failed for root', { url, err });
+          appLogger.warn('useSyncStatus', 'getStoredMappingDiff failed for root', { url, err });
         }
       }
       const lastSyncTime = latestCheckedAt
@@ -115,7 +119,7 @@ export function useSyncStatus(options: UseSyncStatusOptions = {}): SyncStatusDat
       const intervalMs = Math.max(1, pollIntervalMinutes) * 60 * 1000;
       const nextCheckTime = lastSyncTime ? lastSyncTime + intervalMs : null;
       setStatus({
-        pendingCount: pending,
+        pendingCount: pendingTokens.size,
         lastSyncTime,
         nextCheckTime,
         isDetecting: false,

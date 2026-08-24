@@ -106,6 +106,7 @@ async function main() {
   const channelConfig: ChannelConfig = {
     llm: config.llm,
     claudeCli: config.llm.claudeCli,
+    opencode: config.llm.opencode,
     primaryChannel: config.llm.primaryChannel,
     fallbackOnFailure: config.llm.fallbackOnFailure,
   };

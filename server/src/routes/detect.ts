@@ -20,7 +20,7 @@
  *
  * v0.2.0 multi-root-detect (2026-06-22):
  *   New POST /api/detect/changes-all traverses every URL in
- *   config.watchedRootUrls sequentially. detect-traverse-fix already
+ *   enabled config.watchedRoots sequentially. detect-traverse-fix already
  *   guarantees per-subtree filtering (compareWithLocalRecords Pass 2
  *   restricts deleted detection to rows whose wiki_node_token or
  *   parent_node_token is in the CURRENT traversal), so detecting
@@ -28,6 +28,11 @@
  *   Sequential (not parallel) to respect lark-cli QPS and keep the
  *   standalone server's stdout log readable. Per-root failures are
  *   captured into results[] without aborting the whole batch.
+ *
+ * Routine UI and tray checks use ChangeDetector's `fast` mode: it batches
+ * metadata for already-mapped documents and intentionally avoids a full Wiki
+ * topology scan. Callers may explicitly send `{ mode: "full" }` when they
+ * need structural reconciliation (new/moved/deleted nodes).
  */
 
 import { Hono } from 'hono';
@@ -37,6 +42,7 @@ import type {
   ChangeDetectionResult,
   ChangedDocument,
 } from '../types/index.js';
+import { getEnabledWatchedRootUrls } from '../types/index.js';
 
 const detectRoutes = new Hono();
 
@@ -49,6 +55,7 @@ const detectRoutes = new Hono();
 detectRoutes.post('/api/detect/changes', async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const rootUrl = typeof body?.rootUrl === 'string' ? body.rootUrl.trim() : '';
+  const mode = body?.mode === 'full' ? 'full' : 'fast';
 
   if (!rootUrl) {
     return c.json(
@@ -87,11 +94,10 @@ detectRoutes.post('/api/detect/changes', async (c) => {
   }
 
   try {
-    // forceFresh=true: the singular detect endpoint is the user-driven
-    // detect button (and the polling scheduler's per-root entry point).
-    // Bypass the ChangeDetector result cache so a manual refresh always
-    // reflects the current cloud state.
-    const result = await changeDetector.detectChanges(rootUrl, { forceFresh: true });
+    // The normal detect action checks only already-mapped cloud files via
+    // Drive metadata batches. It does not download content or traverse every
+    // node detail; full topology reconciliation remains opt-in through body.mode.
+    const result = await changeDetector.detectChanges(rootUrl, { forceFresh: true, mode });
     return c.json(result);
   } catch (error) {
     console.error('[DetectRoutes] Change detection failed:', error);
@@ -108,7 +114,7 @@ detectRoutes.post('/api/detect/changes', async (c) => {
 /**
  * Multi-root result envelope.
  *
- * `results[]` preserves the configured watchedRootUrls order so the UI
+ * `results[]` preserves the enabled watchedRoots order so the UI
  * can map outcomes back to display groups. Each entry carries either a
  * `result` (success) or an `error` message (failure); both shapes are
  * explicit so the client can render partial-failure states without
@@ -132,7 +138,7 @@ interface MultiRootDetectionResult {
 /**
  * POST /api/detect/changes-all - Detect changes across ALL configured watchedRoots.
  *
- * Reads `watchedRootUrls` from ConfigManager and runs detectChanges
+ * Reads enabled `watchedRoots` from ConfigManager and runs detectChanges
  * sequentially for each URL. Sequential ordering is deliberate:
  *
  *   1. lark-cli has a QPS budget (architecture red line I1 delegates
@@ -153,9 +159,12 @@ interface MultiRootDetectionResult {
  * `changedDocuments` is the concatenation in configured order;
  * `totalNodes` is the sum across successful roots.
  *
- * Request body: ignored (config-driven). An empty `{}` is fine.
+ * Request body: config-driven; an empty `{}` uses fast mode. Send
+ * `{ mode: "full" }` only for an explicit topology reconciliation.
  */
 detectRoutes.post('/api/detect/changes-all', async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const mode = body?.mode === 'full' ? 'full' : 'fast';
   const changeDetector = (c as any).changeDetector as ChangeDetector | undefined;
   const configManager = (c as any).configManager as ConfigManager | undefined;
 
@@ -167,13 +176,18 @@ detectRoutes.post('/api/detect/changes-all', async (c) => {
   }
 
   const config = configManager.getConfig();
-  const watchedRootUrls: string[] = config?.watchedRootUrls ?? [];
-  if (watchedRootUrls.length === 0) {
+  const watchedRootUrls = getEnabledWatchedRootUrls(config);
+
+  // Custom-folder detection runs unconditionally (even with zero watched
+  // roots) so quick-added archive docs are always checked for cloud edits.
+  const customResult = await changeDetector.detectCustomFolderChanges();
+
+  if (watchedRootUrls.length === 0 && customResult.checked === 0) {
     return c.json(
       {
         error: 'no_watched_roots',
         message:
-          'config.watchedRootUrls is empty. Add at least one Feishu wiki URL via the config panel before calling detect-all.',
+          '没有启用的 watchedRoots，也没有归档文档。请在配置面板中添加并启用至少一个飞书知识库根目录，或通过快捷添加归档文档后再执行检测。',
       },
       400
     );
@@ -185,12 +199,10 @@ detectRoutes.post('/api/detect/changes-all', async (c) => {
 
   for (const rootUrl of watchedRootUrls) {
     try {
-      // forceFresh=true: this endpoint is the user-facing 立即检测 button
-      // (and the polling scheduler's full refresh). A conscious detect
-      // click must always re-hit the cloud; the ChangeDetector's
-      // short-lived result cache is bypassed here so stale results from
-      // a previous /api/mapping/diff burst don't shadow the manual click.
-      const result = await changeDetector.detectChanges(rootUrl, { forceFresh: true });
+      // Use the same lightweight batched metadata check for both the tray
+      // scheduler and the visible "立即检测" action. Roots remain serial to
+      // bound aggregate QPS; `mode: full` is reserved for explicit recovery.
+      const result = await changeDetector.detectChanges(rootUrl, { forceFresh: true, mode });
       results.push({ rootUrl, status: 'ok', result });
       aggregatedTotalNodes += result.totalNodes ?? 0;
       if (result.changedDocuments?.length) {
@@ -205,6 +217,12 @@ detectRoutes.post('/api/detect/changes-all', async (c) => {
       results.push({ rootUrl, status: 'error', error: message });
     }
   }
+
+  // Merge custom-folder modified docs into the aggregated response.
+  if (customResult.changedDocuments.length) {
+    aggregatedChangedDocuments.push(...customResult.changedDocuments);
+  }
+  aggregatedTotalNodes += customResult.checked;
 
   const response: MultiRootDetectionResult = {
     changed: aggregatedChangedDocuments.length > 0,

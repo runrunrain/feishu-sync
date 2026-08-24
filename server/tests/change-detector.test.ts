@@ -12,14 +12,20 @@
  *      better-sqlite3 ABI match).
  *
  * The mock LocalMapStore implements only the methods ChangeDetector
- * touches: getDocumentByObjToken / getAllDocuments / upsertDocumentSeen
- * / markCloudDeleted. State is kept in plain Maps so test cases are
+ * touches: getDocumentByObjToken / getAllDocuments /
+ * recordCloudObservation / recordCompleteTraversalMiss. State is kept in
+ * plain Maps so test cases are
  * deterministic and inspectable.
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { ChangeDetector } from '../src/modules/change-detector.js';
-import type { LarkCliNodeInfo, DocumentRecord } from '../src/types/index.js';
+import type {
+  CloudNodeObservation,
+  LarkCliNodeInfo,
+  DocumentRecord,
+  SyncState,
+} from '../src/types/index.js';
 
 // ----- In-memory mock LocalMapStore -------------------------------------
 
@@ -29,8 +35,8 @@ interface MockRow extends DocumentRecord {
 
 class MockLocalMapStore {
   rows = new Map<string, MockRow>();
-  seenCalls: any[] = [];
-  markCalls: Array<{ objToken: string; timestamp: string }> = [];
+  observationCalls: Array<CloudNodeObservation & { lastSeenAt: string }> = [];
+  missCalls: Array<{ objToken: string; timestamp: string }> = [];
 
   getDocumentByObjToken(objToken: string): DocumentRecord | null {
     return this.rows.get(objToken) ?? null;
@@ -40,58 +46,106 @@ class MockLocalMapStore {
     return Array.from(this.rows.values());
   }
 
-  upsertDocumentSeen(input: {
-    objToken: string;
-    wikiNodeToken?: string | null;
-    parentNodeToken?: string | null;
-    spaceId?: string | null;
-    objEditTime?: number | null;
-    lastSeenAt: string;
-  }): void {
-    this.seenCalls.push(input);
+  recordCloudObservation(input: CloudNodeObservation & { lastSeenAt: string }): DocumentRecord {
+    this.observationCalls.push(input);
     const existing = this.rows.get(input.objToken);
-    if (existing) {
-      // Mimic COALESCE: only refresh mapping fields, preserve
-      // status/local_md_path/title.
-      this.rows.set(input.objToken, {
-        ...existing,
-        wikiNodeToken: input.wikiNodeToken ?? existing.wikiNodeToken,
-        parentNodeToken: input.parentNodeToken ?? existing.parentNodeToken,
-        spaceId: input.spaceId ?? existing.spaceId,
-        objEditTime: input.objEditTime ?? existing.objEditTime,
-        lastSeenAt: input.lastSeenAt,
-      });
+    const previousState = existing?.syncState ?? this.legacyState(existing);
+    let nextState: SyncState;
+
+    if (!existing) {
+      nextState = input.observationStatus === 'restricted' ? 'restricted' : 'pending_added';
+    } else if (input.observationStatus === 'restricted') {
+      nextState = 'restricted';
+    } else if (input.observationStatus === 'unavailable') {
+      nextState = previousState;
+    } else if (
+      previousState === 'pending_added' ||
+      previousState === 'pending_modified' ||
+      previousState === 'error'
+    ) {
+      nextState = previousState;
     } else {
-      // Mimic INSERT placeholder row.
-      this.rows.set(input.objToken, {
-        objToken: input.objToken,
-        wikiNodeToken: input.wikiNodeToken ?? null,
-        objType: 'unknown',
-        title: '',
-        localMdPath: '',
-        lastSyncedModifyTime: '',
-        lastSyncedAt: input.lastSeenAt,
-        status: 'placeholder',
-        parentNodeToken: input.parentNodeToken ?? null,
-        spaceId: input.spaceId ?? null,
-        objEditTime: input.objEditTime ?? null,
-        cloudDeleted: 0,
-        lastSeenAt: input.lastSeenAt,
-        localSortOrder: null,
-      });
+      const synced = existing.syncedObjEditTime ?? null;
+      const hasLocalContent = existing.localMdPath.length > 0;
+      if (previousState === 'restricted' || previousState === 'missing_candidate' || previousState === 'deleted_confirmed') {
+        if (!hasLocalContent) nextState = 'pending_added';
+        else if (synced == null || input.observedObjEditTime == null || input.observedObjEditTime > synced) nextState = 'pending_modified';
+        else nextState = 'synced';
+      } else if (synced == null || (input.observedObjEditTime != null && input.observedObjEditTime > synced)) {
+        nextState = hasLocalContent ? 'pending_modified' : 'pending_added';
+      } else {
+        nextState = 'synced';
+      }
     }
+
+    const row: MockRow = {
+      objToken: input.objToken,
+      wikiNodeToken: input.wikiNodeToken || existing?.wikiNodeToken || null,
+      objType: input.objType,
+      title: input.title || existing?.title || '',
+      localMdPath: existing?.localMdPath ?? '',
+      lastSyncedModifyTime: existing?.lastSyncedModifyTime ?? '',
+      lastSyncedAt: existing?.lastSyncedAt ?? '',
+      status: this.legacyStatus(nextState),
+      parentNodeToken: input.parentNodeToken ?? existing?.parentNodeToken ?? null,
+      spaceId: input.spaceId ?? existing?.spaceId ?? null,
+      objEditTime: input.observedObjEditTime ?? existing?.objEditTime ?? null,
+      observedObjEditTime: input.observedObjEditTime ?? existing?.observedObjEditTime ?? existing?.objEditTime ?? null,
+      syncedObjEditTime: existing?.syncedObjEditTime ?? null,
+      syncState: nextState,
+      watchedRootId: input.watchedRootId || existing?.watchedRootId || null,
+      watchedRootUrl: input.watchedRootUrl ?? existing?.watchedRootUrl ?? null,
+      hasChild: input.hasChild,
+      cloudDeleted: 0,
+      lastSeenAt: input.lastSeenAt,
+      localSortOrder: existing?.localSortOrder ?? null,
+      missingCompleteCount: 0,
+      cloudMatch: existing?.cloudMatch ?? 'unknown',
+      originalLink: existing?.originalLink ?? null,
+      localRelPath: existing?.localRelPath ?? null,
+      lastSyncErrorCode: existing?.lastSyncErrorCode ?? null,
+    };
+    this.rows.set(input.objToken, row);
+    return row;
   }
 
-  markCloudDeleted(objToken: string, timestamp: string): void {
-    this.markCalls.push({ objToken, timestamp });
+  recordCompleteTraversalMiss(objToken: string, timestamp: string): DocumentRecord | null {
+    this.missCalls.push({ objToken, timestamp });
     const existing = this.rows.get(objToken);
-    if (existing) {
-      this.rows.set(objToken, {
-        ...existing,
-        cloudDeleted: 1,
-        lastSeenAt: timestamp,
-      });
-    }
+    if (!existing) return null;
+    const state = existing.syncState ?? this.legacyState(existing);
+    if (state === 'pending_added' || state === 'restricted' || state === 'deleted_confirmed') return existing;
+    const count = (existing.missingCompleteCount ?? 0) + 1;
+    const nextState: SyncState = count >= 2 ? 'missing_candidate' : state;
+    const row = {
+      ...existing,
+      missingCompleteCount: count,
+      syncState: nextState,
+      status: this.legacyStatus(nextState),
+      lastSeenAt: timestamp,
+    };
+    this.rows.set(objToken, row);
+    return row;
+  }
+
+  listMissingCandidates(): DocumentRecord[] {
+    return Array.from(this.rows.values()).filter((row) => row.syncState === 'missing_candidate');
+  }
+
+  private legacyStatus(state: SyncState): DocumentRecord['status'] {
+    if (state === 'synced') return 'synced';
+    if (state === 'restricted') return 'placeholder';
+    if (state === 'error') return 'error';
+    return 'changed';
+  }
+
+  private legacyState(row?: DocumentRecord): SyncState {
+    if (!row) return 'pending_added';
+    if (row.cloudDeleted === 1) return 'missing_candidate';
+    if (row.status === 'error') return 'error';
+    if (row.status === 'placeholder') return row.cloudMatch === 'restricted' ? 'restricted' : 'pending_added';
+    if (row.status === 'changed') return 'pending_modified';
+    return 'synced';
   }
 }
 
@@ -128,6 +182,15 @@ function makeCloud(
 function makeLocal(
   overrides: Partial<DocumentRecord> & Pick<DocumentRecord, 'objToken'>
 ): DocumentRecord {
+  const hasOwn = (key: keyof DocumentRecord) =>
+    Object.prototype.hasOwnProperty.call(overrides, key);
+  const objEditTime = hasOwn('objEditTime') ? overrides.objEditTime ?? null : 1000;
+  const syncedObjEditTime = hasOwn('syncedObjEditTime')
+    ? overrides.syncedObjEditTime ?? null
+    : objEditTime;
+  const observedObjEditTime = hasOwn('observedObjEditTime')
+    ? overrides.observedObjEditTime ?? null
+    : objEditTime;
   return {
     wikiNodeToken: null,
     objType: 'docx',
@@ -148,19 +211,22 @@ function makeLocal(
     lastSeenAt: '2026-06-01T00:00:00Z',
     localSortOrder: null,
     ...overrides,
+    observedObjEditTime,
+    syncedObjEditTime,
+    syncState: overrides.syncState ?? 'synced',
   };
 }
 
 // CompareWithLocalRecords is private; access via cast for unit tests.
 type Comparator = (
-  cloudNodes: LarkCliNodeInfo[],
-  rootToken: string
+  cloudNodes: Array<LarkCliNodeInfo | CloudNodeObservation>,
+  rootToken: string | { rootToken: string; traversalComplete?: boolean }
 ) => Promise<ReturnType<ChangeDetector['detectChanges']>>;
 
 async function runCompare(
   store: MockLocalMapStore,
-  cloudNodes: LarkCliNodeInfo[],
-  rootToken = 'rootA'
+  cloudNodes: Array<LarkCliNodeInfo | CloudNodeObservation>,
+  rootToken: string | { rootToken: string; traversalComplete?: boolean } = 'rootA'
 ) {
   const detector = new ChangeDetector(
     new MockLarkCliClient() as any,
@@ -242,7 +308,7 @@ describe('ChangeDetector.compareWithLocalRecords (P2-T1 three-state)', () => {
     expect(out).toHaveLength(0);
   });
 
-  it('treats NULL local obj_edit_time as "unknown" — no modified report', async () => {
+  it('treats a missing synced baseline as pending_modified, never as already synced', async () => {
     store.rows.set(
       'A',
       makeLocal({ objToken: 'A', objEditTime: null as unknown as number })
@@ -251,32 +317,41 @@ describe('ChangeDetector.compareWithLocalRecords (P2-T1 three-state)', () => {
       makeCloud({ obj_token: 'A', node_token: 'nA', obj_edit_time: 5000 }),
     ];
     const out = await runCompare(store, cloud);
-    expect(out).toHaveLength(0);
+    expect(out).toHaveLength(1);
+    expect(out[0].changeType).toBe('modified');
+    expect(store.rows.get('A')?.syncState).toBe('pending_modified');
   });
 
-  it('identifies a deleted node when local exists but cloud does not surface it', async () => {
+  it('requires two complete misses before creating a non-destructive deletion candidate', async () => {
     store.rows.set(
       'A',
       makeLocal({ objToken: 'A', objEditTime: 1000, status: 'synced' })
     );
-    // Cloud traversal returns nothing for A.
-    const out = await runCompare(store, []);
-    expect(out).toHaveLength(1);
-    expect(out[0].changeType).toBe('deleted');
-    expect(out[0].objToken).toBe('A');
-    expect(store.markCalls).toEqual([
-      { objToken: 'A', timestamp: expect.any(String) },
-    ]);
+    // Cloud traversal returns nothing for A. The first complete miss is
+    // intentionally not surfaced as a delete and never hides local content.
+    expect(await runCompare(store, [])).toHaveLength(0);
+    expect(store.rows.get('A')).toMatchObject({
+      missingCompleteCount: 1,
+      syncState: 'synced',
+      cloudDeleted: 0,
+    });
+
+    expect(await runCompare(store, [])).toHaveLength(0);
+    expect(store.rows.get('A')).toMatchObject({
+      missingCompleteCount: 2,
+      syncState: 'missing_candidate',
+      cloudDeleted: 0,
+    });
   });
 
   it('does NOT report placeholder rows as deleted (B1 special-case)', async () => {
     store.rows.set(
       'A',
-      makeLocal({ objToken: 'A', status: 'placeholder' })
+      makeLocal({ objToken: 'A', status: 'placeholder', syncState: 'restricted' })
     );
     const out = await runCompare(store, []);
     expect(out).toHaveLength(0);
-    expect(store.markCalls).toHaveLength(0);
+    expect(store.missCalls).toHaveLength(0);
   });
 
   it('does NOT re-report already-soft-deleted rows on subsequent runs', async () => {
@@ -288,7 +363,7 @@ describe('ChangeDetector.compareWithLocalRecords (P2-T1 three-state)', () => {
     expect(out).toHaveLength(0);
   });
 
-  it('persists mapping metadata via upsertDocumentSeen for every cloud node', async () => {
+  it('persists full observation metadata for every cloud node', async () => {
     const cloud = [
       makeCloud({
         obj_token: 'A',
@@ -304,23 +379,134 @@ describe('ChangeDetector.compareWithLocalRecords (P2-T1 three-state)', () => {
       }),
     ];
     await runCompare(store, cloud);
-    expect(store.seenCalls).toHaveLength(2);
-    expect(store.seenCalls[0]).toMatchObject({
+    expect(store.observationCalls).toHaveLength(2);
+    expect(store.observationCalls[0]).toMatchObject({
       objToken: 'A',
       wikiNodeToken: 'nA',
       parentNodeToken: 'parentA',
-      objEditTime: 100,
+      observedObjEditTime: 100,
+      watchedRootId: 'rootA',
     });
-    expect(store.seenCalls[1]).toMatchObject({
+    expect(store.observationCalls[1]).toMatchObject({
       objToken: 'B',
       parentNodeToken: 'parentB',
-      objEditTime: 200,
+      observedObjEditTime: 200,
+      watchedRootId: 'rootA',
     });
+  });
+
+  it('projects root, direct-child, and deep-node parent chains from the current traversal', async () => {
+    const cloud = [
+      makeCloud({
+        obj_token: 'ROOT',
+        node_token: 'rootA',
+        title: '根目录',
+        parent_node_token: undefined,
+      }),
+      makeCloud({
+        obj_token: 'DIRECT',
+        node_token: 'direct-node',
+        title: '直接子节点',
+        parent_node_token: 'rootA',
+      }),
+      makeCloud({
+        obj_token: 'DEEP',
+        node_token: 'deep-node',
+        title: '深层节点',
+        parent_node_token: 'direct-node',
+      }),
+    ];
+
+    const out = await runCompare(store, cloud, 'rootA');
+    const byToken = new Map(out.map((document) => [document.objToken, document]));
+
+    expect(byToken.get('ROOT')).toMatchObject({
+      isWatchedRootNode: true,
+      parentChainTitles: [],
+    });
+    expect(byToken.get('DIRECT')).toMatchObject({
+      isWatchedRootNode: false,
+      parentChainTitles: [],
+    });
+    expect(byToken.get('DEEP')).toMatchObject({
+      isWatchedRootNode: false,
+      parentChainTitles: ['直接子节点'],
+    });
+  });
+
+  it('leaves hierarchy absent when a node parent is missing from the current traversal', async () => {
+    const cloud = [
+      makeCloud({
+        obj_token: 'ROOT',
+        node_token: 'rootA',
+        title: '根目录',
+        parent_node_token: undefined,
+      }),
+      makeCloud({
+        obj_token: 'ORPHAN',
+        node_token: 'orphan-node',
+        title: '孤立节点',
+        parent_node_token: 'missing-parent',
+      }),
+    ];
+
+    const out = await runCompare(store, cloud, 'rootA');
+    const orphan = out.find((document) => document.objToken === 'ORPHAN');
+
+    expect(orphan).toBeDefined();
+    expect(orphan?.isWatchedRootNode).toBeUndefined();
+    expect(orphan?.parentChainTitles).toBeUndefined();
+  });
+
+  it('repairs a missing current parent through node detail without trusting stale SQLite topology', async () => {
+    const detailLookups: string[] = [];
+    const lark = {
+      async getNode(reference: string): Promise<LarkCliNodeInfo> {
+        detailLookups.push(reference);
+        return {
+          node_token: 'missing-parent',
+          obj_token: 'parent-obj',
+          obj_type: 'docx',
+          title: '当前云端父节点',
+          space_id: 'space-1',
+          obj_edit_time: 1710000000,
+          has_child: true,
+          parent_node_token: 'rootA',
+        };
+      },
+    };
+    const detector = new ChangeDetector(lark as any, store as any);
+    const out = await (detector as any).compareWithLocalRecords([
+      makeCloud({
+        obj_token: 'ROOT',
+        node_token: 'rootA',
+        title: '根目录',
+        parent_node_token: undefined,
+      }),
+      makeCloud({
+        obj_token: 'CHILD',
+        node_token: 'child-node',
+        title: '子节点',
+        parent_node_token: 'missing-parent',
+      }),
+    ], {
+      rootToken: 'rootA',
+      watchedRootUrl: 'https://tenant.feishu.cn/wiki/rootA',
+      traversalComplete: true,
+    });
+
+    const child = out.find((document: any) => document.objToken === 'CHILD');
+    expect(child).toMatchObject({ parentChainTitles: ['当前云端父节点'] });
+    expect(detailLookups).toEqual(['https://tenant.feishu.cn/wiki/missing-parent']);
+    // Only the original cloud observations are persisted; hierarchy repair
+    // must not manufacture a changed document for the parent itself.
+    expect(store.observationCalls.map((observation) => observation.objToken))
+      .toEqual(['ROOT', 'CHILD']);
   });
 
   it('handles a mixed batch: added + modified + unchanged + deleted', async () => {
     // Seed: B synced at 1000 (will be modified), C synced (unchanged),
-    // D synced (deleted — not in cloud).
+    // D synced (one complete miss only — not a deletion candidate yet).
     store.rows.set('B', makeLocal({ objToken: 'B', objEditTime: 1000 }));
     store.rows.set('C', makeLocal({ objToken: 'C', objEditTime: 5000 }));
     store.rows.set('D', makeLocal({ objToken: 'D', objEditTime: 100 }));
@@ -342,20 +528,22 @@ describe('ChangeDetector.compareWithLocalRecords (P2-T1 three-state)', () => {
     const out = await runCompare(store, cloud);
     expect(out.map((c) => c.changeType).sort()).toEqual([
       'added',
-      'deleted',
       'modified',
     ]);
     const byType = new Map(out.map((c) => [c.changeType, c.objToken]));
     expect(byType.get('added')).toBe('A');
     expect(byType.get('modified')).toBe('B');
-    expect(byType.get('deleted')).toBe('D');
+    expect(store.rows.get('D')).toMatchObject({
+      missingCompleteCount: 1,
+      syncState: 'synced',
+    });
   });
 
   // v0.2.0 detect-traverse-fix: regression test for the multi-watchedRoot
   // false-delete bug. Running detect on rootA must NOT flag rows belonging
   // to rootB (different subtree) as deleted, even when those rows are
   // absent from rootA's cloud traversal.
-  it('does NOT flag rows belonging to a different watchedRoot as deleted (detect-traverse-fix)', async () => {
+  it('only records a miss for rows belonging to this watchedRoot (detect-traverse-fix)', async () => {
     // rootB-local row: wiki_node_token and parent_node_token both outside
     // rootA's traversal set.
     store.rows.set(
@@ -379,7 +567,7 @@ describe('ChangeDetector.compareWithLocalRecords (P2-T1 three-state)', () => {
         status: 'synced',
       })
     );
-    // rootA row that IS legitimately absent → should be flagged deleted.
+    // rootA row that IS legitimately absent → receives one safe miss.
     store.rows.set(
       'Z',
       makeLocal({
@@ -395,16 +583,13 @@ describe('ChangeDetector.compareWithLocalRecords (P2-T1 three-state)', () => {
     const out = await runCompare(store, [], 'rootA');
 
     // Only Z is in rootA's subtree (via parent_node_token='rootA'); X and Y
-    // must NOT be reported as deleted.
-    const deleted = out.filter((c) => c.changeType === 'deleted');
-    expect(deleted).toHaveLength(1);
-    expect(deleted[0].objToken).toBe('Z');
-    expect(store.markCalls).toEqual([
-      { objToken: 'Z', timestamp: expect.any(String) },
-    ]);
+    // must NOT receive a miss or deletion candidate.
+    expect(out).toHaveLength(0);
+    expect(store.missCalls.map((entry) => entry.objToken)).toEqual(['Z']);
+    expect(store.rows.get('Z')).toMatchObject({ missingCompleteCount: 1 });
   });
 
-  it('upsertDocumentSeen preserves status/local_md_path on existing rows', async () => {
+  it('observation refresh preserves local content but updates visible cloud metadata', async () => {
     store.rows.set(
       'A',
       makeLocal({
@@ -424,12 +609,170 @@ describe('ChangeDetector.compareWithLocalRecords (P2-T1 three-state)', () => {
       }),
     ];
     await runCompare(store, cloud);
-    // Title and localMdPath must survive the seen refresh.
+    // Local content survives, while title/time become current cloud
+    // observation metadata and the pending state remains visible.
     const row = store.rows.get('A')!;
     expect(row.localMdPath).toBe('/keep/me.md');
-    expect(row.status).toBe('synced');
-    expect(row.title).toBe('original-title');
-    expect(row.objEditTime).toBe(1500); // refreshed
+    expect(row.status).toBe('changed');
+    expect(row.title).toBe('cloud-title');
+    expect(row.observedObjEditTime).toBe(1500);
+    expect(row.syncedObjEditTime).toBe(1000);
+    expect(row.syncState).toBe('pending_modified');
+  });
+
+  it('keeps an added document pending across ten identical detections', async () => {
+    const cloud = [makeCloud({ obj_token: 'PENDING', node_token: 'nPending', obj_edit_time: 1234 })];
+    for (let i = 0; i < 10; i += 1) {
+      const out = await runCompare(store, cloud);
+      expect(out).toHaveLength(1);
+      expect(out[0]).toMatchObject({ objToken: 'PENDING', changeType: 'added' });
+      expect(store.rows.get('PENDING')).toMatchObject({
+        syncState: 'pending_added',
+        syncedObjEditTime: null,
+        observedObjEditTime: 1234,
+      });
+    }
+  });
+
+  it('keeps a modified document pending across ten identical detections', async () => {
+    store.rows.set('MODIFIED', makeLocal({
+      objToken: 'MODIFIED',
+      wikiNodeToken: 'nModified',
+      objEditTime: 100,
+      syncedObjEditTime: 100,
+      localMdPath: '/keep/modified.md',
+    }));
+    const cloud = [makeCloud({ obj_token: 'MODIFIED', node_token: 'nModified', obj_edit_time: 200 })];
+
+    for (let i = 0; i < 10; i += 1) {
+      const out = await runCompare(store, cloud);
+      expect(out).toHaveLength(1);
+      expect(out[0]).toMatchObject({ objToken: 'MODIFIED', changeType: 'modified' });
+      expect(store.rows.get('MODIFIED')).toMatchObject({
+        syncState: 'pending_modified',
+        syncedObjEditTime: 100,
+        observedObjEditTime: 200,
+      });
+    }
+  });
+
+  it('never creates a missing candidate from an incomplete traversal', async () => {
+    store.rows.set('A', makeLocal({ objToken: 'A', watchedRootId: 'rootA' }));
+    const out = await runCompare(store, [], { rootToken: 'rootA', traversalComplete: false });
+    expect(out).toHaveLength(0);
+    expect(store.missCalls).toHaveLength(0);
+    expect(store.rows.get('A')?.missingCompleteCount ?? 0).toBe(0);
+    expect(store.rows.get('A')?.syncState).toBe('synced');
+  });
+
+  it('restores a missing candidate when it reappears at the synced baseline', async () => {
+    store.rows.set('A', makeLocal({
+      objToken: 'A',
+      wikiNodeToken: 'nA',
+      watchedRootId: 'rootA',
+      objEditTime: 1000,
+      syncedObjEditTime: 1000,
+      missingCompleteCount: 2,
+      syncState: 'missing_candidate',
+    }));
+    const out = await runCompare(store, [
+      makeCloud({ obj_token: 'A', node_token: 'nA', obj_edit_time: 1000 }),
+    ]);
+    expect(out).toHaveLength(0);
+    expect(store.rows.get('A')).toMatchObject({
+      syncState: 'synced',
+      missingCompleteCount: 0,
+      cloudDeleted: 0,
+    });
+  });
+
+  it('keeps a permission-restricted node visible without overwriting local content', async () => {
+    store.rows.set('A', makeLocal({
+      objToken: 'A',
+      title: '旧标题',
+      localMdPath: '/keep/A.md',
+      syncedObjEditTime: 1000,
+    }));
+    const restricted: CloudNodeObservation = {
+      objToken: 'A',
+      wikiNodeToken: 'nA',
+      objType: 'docx',
+      title: '可见的受限标题',
+      spaceId: 'space-1',
+      parentNodeToken: 'rootA',
+      watchedRootId: 'rootA',
+      watchedRootUrl: 'https://tenant.feishu.cn/wiki/rootA',
+      observedObjEditTime: null,
+      hasChild: false,
+      observationStatus: 'restricted',
+    };
+    const out = await runCompare(store, [restricted]);
+    expect(out).toHaveLength(0);
+    expect(store.rows.get('A')).toMatchObject({
+      title: '可见的受限标题',
+      localMdPath: '/keep/A.md',
+      syncState: 'restricted',
+      syncedObjEditTime: 1000,
+    });
+  });
+});
+
+// ----- traversal completeness / tenant host tests (P1) -------------------
+
+describe('ChangeDetector traversal completeness (P1)', () => {
+  it('marks a partial BFS incomplete and never records a deletion miss', async () => {
+    const store = new MockLocalMapStore();
+    store.rows.set('GONE', makeLocal({
+      objToken: 'GONE',
+      wikiNodeToken: 'gone-node',
+      parentNodeToken: 'rootA',
+      watchedRootId: 'rootA',
+    }));
+    const getNodeUrls: string[] = [];
+    const lark = {
+      async getNode(url: string): Promise<LarkCliNodeInfo> {
+        getNodeUrls.push(url);
+        if (url.endsWith('/wiki/rootA')) {
+          return {
+            node_token: 'rootA', obj_token: 'root-obj', obj_type: 'docx',
+            title: '根', space_id: 'space-1', obj_edit_time: 1000,
+            has_child: true,
+          };
+        }
+        return {
+          node_token: 'branchA', obj_token: 'branch-obj', obj_type: 'docx',
+          title: '分支', space_id: 'space-1', obj_edit_time: 1000,
+          has_child: true, parent_node_token: 'rootA',
+        };
+      },
+      async listWikiNodes(options: { parentNodeToken: string }): Promise<LarkCliNodeInfo[]> {
+        if (options.parentNodeToken === 'rootA') {
+          return [{
+            node_token: 'branchA', obj_token: 'branch-obj', obj_type: 'docx',
+            title: '分支', space_id: 'space-1', obj_edit_time: null,
+            has_child: true, parent_node_token: 'rootA',
+          }];
+        }
+        throw new Error('QPS 限频，请稍后重试');
+      },
+    };
+    const detector = new ChangeDetector(lark as any, store as any);
+    const tenantRoot = 'https://custom-tenant.feishu.cn/wiki/rootA';
+    const result = await detector.detectChanges(tenantRoot, {
+      forceFresh: true,
+      bypassCooldown: true,
+    });
+
+    expect(result.traversalComplete).toBe(false);
+    expect(result.failedNodeTokens).toEqual(['branchA']);
+    expect(result.missingCandidates).toBe(0);
+    expect(store.missCalls).toHaveLength(0);
+    expect(store.rows.get('GONE')?.syncState).toBe('synced');
+    expect(store.rows.get('GONE')?.missingCompleteCount ?? 0).toBe(0);
+    expect(store.rows.get('GONE')?.cloudDeleted).toBe(0);
+    // Child detail lookup uses the supplied tenant/root host, never the old
+    // deployment-specific hard-coded Feishu domain.
+    expect(getNodeUrls).toContain('https://custom-tenant.feishu.cn/wiki/branchA');
   });
 });
 
@@ -552,8 +895,10 @@ class TrackingLarkCliClient {
   // getNode invocations exactly once.
   getNodeCalls = 0;
   listCalls = 0;
+  getNodeGate: Promise<void> | null = null;
   async getNode(_url: string): Promise<LarkCliNodeInfo> {
     this.getNodeCalls++;
+    await this.getNodeGate;
     return {
       obj_token: 'rootObj',
       node_token: 'rootA',
@@ -575,6 +920,174 @@ class TrackingLarkCliClient {
 }
 
 describe('ChangeDetector.detectChanges result cache (sync-state-timeout-fix)', () => {
+  it('uses one Drive metadata batch for a mapped document in fast mode', async () => {
+    const store = new MockLocalMapStore();
+    const rootUrl = 'https://qcnbafdrjx7n.feishu.cn/wiki/rootA';
+    store.rows.set('doc-A', makeLocal({
+      objToken: 'doc-A',
+      wikiNodeToken: 'node-A',
+      watchedRootId: 'rootA',
+      watchedRootUrl: rootUrl,
+      objEditTime: 100,
+      observedObjEditTime: 100,
+      syncedObjEditTime: 100,
+      localMdPath: '/kb/A.md',
+    }));
+    const lark = {
+      getNodeCalls: 0,
+      metaRequests: [] as Array<Array<{ docToken: string; docType: string }>>,
+      async getNode() {
+        this.getNodeCalls += 1;
+        throw new Error('fast mode must not resolve individual wiki nodes');
+      },
+      async getDocumentMetas(requests: Array<{ docToken: string; docType: string }>) {
+        this.metaRequests.push(requests);
+        return {
+          metas: [{
+            docToken: 'doc-A',
+            docType: 'docx',
+            latestModifyTime: 200,
+            title: 'A renamed in cloud',
+          }],
+          failed: [],
+        };
+      },
+    };
+    const detector = new ChangeDetector(lark as any, store as any);
+
+    const result = await detector.detectChanges(rootUrl, {
+      forceFresh: true,
+      bypassCooldown: true,
+      mode: 'fast',
+    });
+
+    expect(lark.getNodeCalls).toBe(0);
+    expect(lark.metaRequests).toEqual([[{ docToken: 'doc-A', docType: 'docx' }]]);
+    expect(result).toMatchObject({
+      changed: true,
+      totalNodes: 1,
+      traversalComplete: false,
+    });
+    expect(result.changedDocuments).toEqual([
+      expect.objectContaining({ objToken: 'doc-A', changeType: 'modified' }),
+    ]);
+    expect(store.rows.get('doc-A')).toMatchObject({
+      title: 'A renamed in cloud',
+      observedObjEditTime: 200,
+      syncState: 'pending_modified',
+    });
+  });
+
+  it('uses at most one Wiki detail fallback for a metadata exception', async () => {
+    const store = new MockLocalMapStore();
+    const rootUrl = 'https://qcnbafdrjx7n.feishu.cn/wiki/rootA';
+    store.rows.set('doc-A', makeLocal({
+      objToken: 'doc-A',
+      wikiNodeToken: 'node-A',
+      watchedRootId: 'rootA',
+      watchedRootUrl: rootUrl,
+      objEditTime: 100,
+      observedObjEditTime: 100,
+      syncedObjEditTime: 100,
+      localMdPath: '/kb/A.md',
+    }));
+    const lark = {
+      getNodeUrls: [] as string[],
+      async getDocumentMetas() {
+        return {
+          metas: [],
+          failed: [{ docToken: 'doc-A', code: 970003 }],
+        };
+      },
+      async getNode(url: string): Promise<LarkCliNodeInfo> {
+        this.getNodeUrls.push(url);
+        return {
+          node_token: 'node-A',
+          obj_token: 'doc-A',
+          obj_type: 'docx',
+          title: 'A',
+          space_id: 'space-1',
+          obj_edit_time: 200,
+          has_child: false,
+          parent_node_token: 'rootA',
+        };
+      },
+    };
+    const detector = new ChangeDetector(lark as any, store as any);
+
+    const result = await detector.detectChanges(rootUrl, {
+      forceFresh: true,
+      bypassCooldown: true,
+      mode: 'fast',
+    });
+
+    expect(lark.getNodeUrls).toEqual(['https://qcnbafdrjx7n.feishu.cn/wiki/node-A']);
+    expect(result.failedNodeTokens).toEqual([]);
+    expect(result.changedDocuments).toEqual([
+      expect.objectContaining({ objToken: 'doc-A', changeType: 'modified' }),
+    ]);
+  });
+
+  it('negative-caches a failed metadata fallback between fast polls', async () => {
+    const store = new MockLocalMapStore();
+    const rootUrl = 'https://qcnbafdrjx7n.feishu.cn/wiki/rootA';
+    store.rows.set('doc-A', makeLocal({
+      objToken: 'doc-A',
+      wikiNodeToken: 'node-A',
+      watchedRootId: 'rootA',
+      watchedRootUrl: rootUrl,
+    }));
+    const lark = {
+      detailCalls: 0,
+      async getDocumentMetas() {
+        return { metas: [], failed: [{ docToken: 'doc-A', code: 970003 }] };
+      },
+      async getNode(): Promise<LarkCliNodeInfo> {
+        this.detailCalls += 1;
+        throw new Error('无权限访问该节点');
+      },
+    };
+    const detector = new ChangeDetector(lark as any, store as any);
+
+    await detector.detectChanges(rootUrl, {
+      forceFresh: true,
+      bypassCooldown: true,
+      mode: 'fast',
+    });
+    await detector.detectChanges(rootUrl, {
+      forceFresh: true,
+      bypassCooldown: true,
+      mode: 'fast',
+    });
+
+    // The metadata batch may be retried, but a permanently failing node-get
+    // must not add a second detail request until its retry cooldown expires.
+    expect(lark.detailCalls).toBe(1);
+  });
+
+  it('joins concurrent calls before the completed-result cache is populated', async () => {
+    const lark = new TrackingLarkCliClient();
+    const store = new MockLocalMapStore();
+    const detector = new ChangeDetector(lark as any, store as any);
+    const url = 'https://qcnbafdrjx7n.feishu.cn/wiki/rootA';
+
+    let releaseTraversal: (() => void) | undefined;
+    lark.getNodeGate = new Promise<void>((resolve) => {
+      releaseTraversal = resolve;
+    });
+
+    const first = detector.detectChanges(url);
+    // The explicit detect button uses forceFresh. It must still join a
+    // traversal that is already running instead of doubling cloud QPS.
+    const second = detector.detectChanges(url, { forceFresh: true, bypassCooldown: true });
+    expect(lark.getNodeCalls).toBe(1);
+
+    releaseTraversal?.();
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+    expect(secondResult).toBe(firstResult);
+    expect(lark.getNodeCalls).toBe(1);
+  });
+
   it('serves a second call within TTL from cache (no extra lark-cli calls)', async () => {
     const lark = new TrackingLarkCliClient();
     const store = new MockLocalMapStore();

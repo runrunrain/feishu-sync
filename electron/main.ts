@@ -9,6 +9,7 @@
 
 import { app, BrowserWindow, dialog, ipcMain, session, shell, globalShortcut } from 'electron';
 import crypto from 'node:crypto';
+import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import fs from 'node:fs';
@@ -111,7 +112,9 @@ async function refreshWatchedRootUrlsSnapshot(): Promise<void> {
   }
   try {
     const config = await configManager.load();
-    const urls = Array.isArray(config.watchedRootUrls) ? config.watchedRootUrls : [];
+    const urls = Array.isArray(config.watchedRoots)
+      ? config.watchedRoots.filter((root) => root.enabled).map((root) => root.url)
+      : [];
     currentValidWatchedRootUrlsSnapshot = urls.filter(isValidFeishuWikiUrl);
   } catch (error) {
     console.warn('[Config] Failed to refresh watched root URLs snapshot:', sanitizeDesktopError(error));
@@ -318,7 +321,18 @@ function getQuitCoordinator() {
       closeServer,
       sanitizeError: sanitizeDesktopError,
       onBeforeQuit: (reason: QuitReason) => {
+        // 退出前先切断所有指向内嵌 server 的连接来源：停掉主进程的
+        // 变更检测轮询、销毁渲染窗口——渲染层每 30s 轮询鉴权状态会
+        // 持续维持 keep-alive 连接，让 server.close() 永远等不完。
+        // destroy() 会绕过 window.on('close') 里的“隐藏到托盘”拦截，
+        // 且保证触发 closed 事件完成 mainWindow 清理。
+        changeNotificationService?.stop();
         trayService?.dispose();
+        for (const win of BrowserWindow.getAllWindows()) {
+          if (!win.isDestroyed()) {
+            win.destroy();
+          }
+        }
       },
     });
   }
@@ -350,8 +364,11 @@ ipcMain.handle('desktop:open-data-directory', async () => {
 });
 
 ipcMain.handle('desktop:open-config-file', async () => {
-  // M0: Stub implementation - config file path will be determined in M1-M3
-  const configPath = path.join(app.getPath('userData'), 'config.json');
+  // P4: server and desktop share ~/.feishu-sync (not Electron userData).
+  const configPath = path.join(
+    process.env.FEISHU_SYNC_HOME || path.join(os.homedir(), '.feishu-sync'),
+    'config.json',
+  );
   const result = await shell.openPath(configPath);
   return result ? { ok: false, code: 'open-config-file-failed', error: sanitizeDesktopError(result) } : { ok: true };
 });
@@ -415,12 +432,7 @@ ipcMain.handle('desktop:auto-start:set-enabled', async (_event, enabled: boolean
   // Sync with config (single source of truth)
   if (result.ok && configManager) {
     try {
-      const currentConfig = await configManager.load();
-      const updatedConfig = {
-        ...currentConfig,
-        enableAutoStart: enabled,
-      };
-      await configManager.save(updatedConfig);
+      await configManager.updateConfig({ enableAutoStart: enabled });
       console.info(`[AutoStart] Synced config.enableAutoStart = ${enabled}`);
     } catch (error) {
       console.error('[AutoStart] Failed to sync config:', error);
@@ -469,7 +481,9 @@ async function boot() {
 
   // Generate desktop API token
   desktopApiToken = crypto.randomBytes(32).toString('base64url');
-  desktopDataDir = app.getPath('userData');
+  // P4: align desktop data dir with server (~/.feishu-sync), not Electron userData.
+  desktopDataDir = process.env.FEISHU_SYNC_HOME || path.join(os.homedir(), '.feishu-sync');
+  fs.mkdirSync(desktopDataDir, { recursive: true, mode: 0o700 });
   console.info('[Electron] Desktop API token generated, data directory:', desktopDataDir);
 
   // Start embedded server
@@ -576,6 +590,20 @@ app.on('activate', () => {
 
 app.on('before-quit', (event) => {
   getQuitCoordinator().handleBeforeQuit(event);
+});
+
+// 把 SIGTERM/SIGINT 纳入统一的退出流程（内部带 5s 强制退出兜底）。
+// 此前默认 SIGTERM 被 Electron 转入 quit 流程后，会卡死在
+// before-quit 的 preventDefault + server.close() 上，信号被吞掉，
+// 表现为 kill 无效、只能 kill -9。
+process.on('SIGTERM', () => {
+  console.info('[Electron] SIGTERM received, initiating quit');
+  void getQuitCoordinator().requestQuit('system');
+});
+
+process.on('SIGINT', () => {
+  console.info('[Electron] SIGINT received, initiating quit');
+  void getQuitCoordinator().requestQuit('system');
 });
 
 // Global shortcut for showing window

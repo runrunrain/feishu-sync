@@ -27,19 +27,27 @@ import path from 'node:path';
 import os from 'node:os';
 import type {
   Config,
+  LayoutProfile,
   LegacyLLMConfig,
   LlmConfig,
+  LlmModelPreset,
+  LlmProviderConfig,
+  WatchedRootConfig,
 } from '../types/index.js';
-import { isLegacyLlmConfig } from '../types/index.js';
+import { getEnabledWatchedRootUrls, isLegacyLlmConfig } from '../types/index.js';
 
 const DEFAULT_CONFIG_PATH = path.join(os.homedir(), '.feishu-sync', 'config.json');
+/** Minimal user scopes for read-only wiki sync (must match lark-cli auth login). */
 const DEFAULT_REQUIRED_SCOPES = [
   'wiki:node:retrieve',
   'wiki:space:retrieve',
-  'docs:document:read',
+  'docs:document.content:read',
   'sheets:spreadsheet:read',
   'docx:document:readonly',
   'drive:drive.metadata:readonly',
+  'docs:document.media:download',
+  'slides:presentation:read',
+  'offline_access',
 ];
 
 /**
@@ -57,19 +65,18 @@ const DEFAULT_CLAUDE_COMPAT_BASE_URL = 'https://open.bigmodel.cn/api/anthropic';
 /**
  * bigmodel dual-alias (P3 实测):
  *   - paas/v4 (OpenAI) accepts `glm-4-flash` (free tier)
- *   - /api/anthropic accepts `glm-5.2[1m]` (the alias claude code
- *     CLI uses on this machine)
+ *   - Z.AI Claude Code uses the documented `glm-4.7` tier mapping
  * The two aliases share ONE apiKey; only the model name differs across
  * the two protocol adapters. `DEFAULT_DIRECT_MODEL` is used as
  * `directModel` override when the user-provided `model` (or env) only
  * works on one endpoint.
  */
 const DEFAULT_DIRECT_MODEL = 'glm-4-flash';
-const DEFAULT_CLAUDE_CLI_MODEL = 'glm-5.2[1m]';
+const DEFAULT_CLAUDE_CLI_MODEL = 'glm-4.7';
 /**
  * Per-call LLM adaptation timeout, in milliseconds.
  *
- * 10 minutes gives bigmodel glm-5.2[1m] (the Anthropic-compat alias
+ * 10 minutes gives bigmodel glm-4.7 (the Anthropic-compat model
  * used by the claude-cli primary channel) enough headroom to finish
  * under transient 529 over-load retries without making the user wait
  * unbounded. The previous hard-coded 60s value aborted the primary
@@ -168,15 +175,178 @@ export function reconcileModelAlias(
   model: string | undefined | null,
   apiKey: string | undefined | null,
 ): string {
-  if (!model) return DEFAULT_CLAUDE_CLI_MODEL;
+  const canonicalModel = canonicalizeGlmModelAlias(model);
+  if (!canonicalModel) return DEFAULT_CLAUDE_CLI_MODEL;
   const deepseekAliases = ['deepseek-chat', 'deepseek-reasoner', 'deepseek-coder'];
   if (
     looksLikeBigmodelKey(apiKey) &&
-    deepseekAliases.includes(model.toLowerCase())
+    deepseekAliases.includes(canonicalModel.toLowerCase())
   ) {
     return DEFAULT_CLAUDE_CLI_MODEL;
   }
-  return model;
+  return canonicalModel;
+}
+
+const CONFIG_ENTITY_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
+
+function stringValue(value: unknown, fallback = ''): string {
+  return typeof value === 'string' ? value.trim() : fallback;
+}
+
+/**
+ * Z.AI / BigModel API model identifiers do not include capacity labels such
+ * as `[1m]`. That label can appear in UI plan names or old local settings,
+ * but sending it as the API `model` returns a misleading "model not found"
+ * response. Normalize only GLM names so custom-provider model IDs remain
+ * untouched.
+ */
+function canonicalizeGlmModelAlias(value: string | undefined | null): string {
+  const model = stringValue(value);
+  const match = /^(glm-[^\s\[\]]+)\s*\[[^\]]+\]$/i.exec(model);
+  return match ? match[1] : model;
+}
+
+function uniqueConfigId(value: unknown, fallback: string, used: Set<string>): string {
+  const raw = stringValue(value).toLowerCase();
+  const base = CONFIG_ENTITY_ID.test(raw) ? raw : fallback;
+  let candidate = base;
+  let suffix = 2;
+  while (used.has(candidate)) {
+    candidate = `${base}-${suffix}`;
+    suffix += 1;
+  }
+  used.add(candidate);
+  return candidate;
+}
+
+function inferLegacyProviderName(
+  openAiCompatBaseUrl: string,
+  claudeCompatBaseUrl: string,
+  apiKey: string,
+): string {
+  const looksLikeBigmodelEndpoint = /(?:^|\.)bigmodel\.cn/i.test(openAiCompatBaseUrl)
+    || /(?:^|\.)bigmodel\.cn/i.test(claudeCompatBaseUrl);
+  return looksLikeBigmodelEndpoint || looksLikeBigmodelKey(apiKey)
+    ? '智谱 GLM（BigModel）'
+    : '默认提供商';
+}
+
+interface LegacyProviderProjection {
+  openAiCompatBaseUrl: string;
+  claudeCompatBaseUrl: string;
+  apiKey: string;
+  model: string;
+  directModel?: string;
+  claudeCliModel?: string;
+}
+
+function makeLegacyProviderProfile(legacy: LegacyProviderProjection): LlmProviderConfig {
+  const directModel = canonicalizeGlmModelAlias(legacy.directModel)
+    || canonicalizeGlmModelAlias(legacy.model);
+  const claudeCliModel = canonicalizeGlmModelAlias(legacy.claudeCliModel)
+    || canonicalizeGlmModelAlias(legacy.model);
+  return {
+    id: 'bigmodel',
+    name: inferLegacyProviderName(
+      legacy.openAiCompatBaseUrl,
+      legacy.claudeCompatBaseUrl,
+      legacy.apiKey,
+    ),
+    enabled: true,
+    apiKey: legacy.apiKey,
+    openAiCompatBaseUrl: legacy.openAiCompatBaseUrl,
+    claudeCompatBaseUrl: legacy.claudeCompatBaseUrl,
+    defaultModelId: 'default',
+    models: [{
+      id: 'default',
+      name: '默认模型',
+      openAiModel: directModel,
+      claudeCliModel,
+      enabled: true,
+    }],
+  };
+}
+
+function normalizeModelPresets(
+  value: unknown,
+  fallback: Pick<LlmModelPreset, 'openAiModel' | 'claudeCliModel'>,
+): LlmModelPreset[] {
+  const rawPresets = Array.isArray(value) ? value : [];
+  const usedIds = new Set<string>();
+  const presets: LlmModelPreset[] = [];
+
+  rawPresets.forEach((candidate, index) => {
+    if (!candidate || typeof candidate !== 'object') return;
+    const raw = candidate as Partial<LlmModelPreset>;
+    const id = uniqueConfigId(raw.id, `model-${index + 1}`, usedIds);
+    presets.push({
+      id,
+      name: stringValue(raw.name, `模型 ${index + 1}`) || `模型 ${index + 1}`,
+      openAiModel: canonicalizeGlmModelAlias(raw.openAiModel),
+      claudeCliModel: canonicalizeGlmModelAlias(raw.claudeCliModel),
+      enabled: typeof raw.enabled === 'boolean' ? raw.enabled : true,
+    });
+  });
+
+  if (presets.length === 0) {
+    presets.push({
+      id: 'default',
+      name: '默认模型',
+      openAiModel: canonicalizeGlmModelAlias(fallback.openAiModel),
+      claudeCliModel: canonicalizeGlmModelAlias(fallback.claudeCliModel),
+      enabled: true,
+    });
+  }
+  return presets;
+}
+
+/**
+ * Normalize provider profiles without interpreting a custom endpoint as a
+ * particular vendor. This is intentionally independent from bigmodel's
+ * legacy reconciliation: users may configure OpenAI, a gateway, or any
+ * provider exposing either compatible protocol.
+ */
+function normalizeProviderProfiles(
+  value: unknown,
+  legacy: LegacyProviderProjection,
+): LlmProviderConfig[] {
+  // Missing profile data means an existing flat configuration is being
+  // migrated. An explicitly empty array is preserved so a local-OpenCode-only
+  // setup can opt out of remote profiles.
+  if (!Array.isArray(value)) {
+    return [makeLegacyProviderProfile(legacy)];
+  }
+
+  const usedIds = new Set<string>();
+  const providers: LlmProviderConfig[] = [];
+  value.forEach((candidate, index) => {
+    if (!candidate || typeof candidate !== 'object') return;
+    const raw = candidate as Partial<LlmProviderConfig>;
+    const id = uniqueConfigId(raw.id, `provider-${index + 1}`, usedIds);
+    const models = normalizeModelPresets(raw.models, {
+      openAiModel: canonicalizeGlmModelAlias(legacy.directModel)
+        || canonicalizeGlmModelAlias(legacy.model),
+      claudeCliModel: canonicalizeGlmModelAlias(legacy.claudeCliModel)
+        || canonicalizeGlmModelAlias(legacy.model),
+    });
+    const requestedDefault = stringValue(raw.defaultModelId);
+    const defaultModel = models.find((model) => model.id === requestedDefault && model.enabled)
+      ?? models.find((model) => model.enabled)
+      ?? models[0];
+
+    providers.push({
+      id,
+      name: stringValue(raw.name, `提供商 ${index + 1}`) || `提供商 ${index + 1}`,
+      enabled: typeof raw.enabled === 'boolean' ? raw.enabled : true,
+      apiKey: stringValue(raw.apiKey),
+      openAiCompatBaseUrl: stringValue(raw.openAiCompatBaseUrl),
+      claudeCompatBaseUrl: stringValue(raw.claudeCompatBaseUrl),
+      defaultModelId: defaultModel?.id,
+      models,
+    });
+  });
+
+  return providers;
 }
 
 /**
@@ -195,7 +365,17 @@ function buildDefaultLlmConfig(): LlmConfig {
   const anthropicBaseUrl = process.env.ANTHROPIC_BASE_URL || DEFAULT_CLAUDE_COMPAT_BASE_URL;
   const openAiBaseUrl = deriveOpenAiCompatBaseUrl(anthropicBaseUrl);
   const apiKey = process.env.ANTHROPIC_API_KEY || '';
-  const claudeModel = process.env.ANTHROPIC_MODEL || DEFAULT_CLAUDE_CLI_MODEL;
+  const claudeModel = canonicalizeGlmModelAlias(process.env.ANTHROPIC_MODEL)
+    || DEFAULT_CLAUDE_CLI_MODEL;
+  const legacyProjection: LegacyProviderProjection = {
+    openAiCompatBaseUrl: openAiBaseUrl,
+    claudeCompatBaseUrl: anthropicBaseUrl,
+    apiKey,
+    model: claudeModel,
+    directModel: DEFAULT_DIRECT_MODEL,
+    claudeCliModel: claudeModel,
+  };
+  const defaultProvider = makeLegacyProviderProfile(legacyProjection);
 
   return {
     openAiCompatBaseUrl: openAiBaseUrl,
@@ -207,15 +387,32 @@ function buildDefaultLlmConfig(): LlmConfig {
     // paas/v4 actually accepts.
     model: claudeModel,
     directModel: DEFAULT_DIRECT_MODEL,
+    // Keep the Claude Code path explicit as well. Existing configurations
+    // created before this field was persisted often still carry
+    // `model: glm-4-flash`; that OpenAI alias is not a reliable choice for
+    // the Anthropic-compatible GLM endpoint.
+    claudeCliModel: claudeModel,
     temperature: 0.2,
+    providers: [defaultProvider],
+    activeProviderId: defaultProvider.id,
+    activeModelId: defaultProvider.defaultModelId,
     // 10-minute default. See LlmConfig.timeoutMs rationale in
     // types/index.ts — the previous 60s ceiling was too tight for
-    // bigmodel glm-5.2[1m] under load.
+    // bigmodel glm-4.7 under load.
     timeoutMs: DEFAULT_LLM_TIMEOUT_MS,
     claudeCli: {
       claudePath: undefined,
       extraArgs: [],
     },
+    opencode: {
+      executablePath: undefined,
+      model: undefined,
+      agent: undefined,
+      timeoutMs: undefined,
+    },
+    // Document body organisation is opt-in. Selecting a channel only
+    // changes the future execution path after the user also enables this.
+    contentAdaptationEnabled: false,
     primaryChannel: 'claude-cli',
     fallbackOnFailure: true,
   };
@@ -239,6 +436,7 @@ const DEFAULT_CONFIG: Config = {
   llm: buildDefaultLlmConfig(),
   pollIntervalMinutes: 30,
   knowledgeBaseRoot: '',
+  watchedRoots: [],
   watchedRootUrls: [],
   larkCliPath: undefined,
   requiredScopes: DEFAULT_REQUIRED_SCOPES,
@@ -247,12 +445,171 @@ const DEFAULT_CONFIG: Config = {
 };
 
 /**
+ * One-time compatibility presets for the four roots already present in the
+ * checked-in knowledge-base corpus. Runtime mapping must consume the saved
+ * `watchedRoots` objects rather than this table. Unknown legacy URLs are
+ * intentionally disabled and placed under a non-existent safe directory so
+ * path planning cannot guess where to write.
+ */
+const LEGACY_ROOT_PRESETS: Record<string, Pick<WatchedRootConfig, 'localDir' | 'layoutProfile'>> = {
+  Wramw1XxRihIgnkCrhqcdEbRnHb: {
+    localDir: '策划 - Designer',
+    layoutProfile: 'mirror-title-file',
+  },
+  QdZpwOmgBi25JVkAUmYcBiMinIf: {
+    localDir: '技术 - Dev',
+    layoutProfile: 'directory-readme',
+  },
+  NudewPkE9inlGhkEDA1c9FSsnkb: {
+    localDir: '[必读] 研发规范',
+    layoutProfile: 'directory-readme',
+  },
+  FEaww3vUHieIumk6FdIc92WHnyh: {
+    localDir: '开发环境指引',
+    layoutProfile: 'directory-readme',
+  },
+};
+
+const VALID_LAYOUT_PROFILES = new Set<LayoutProfile>([
+  'directory-readme',
+  'mirror-title-file',
+]);
+const WINDOWS_RESERVED_SEGMENTS = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i;
+const UNSAFE_PATH_SEGMENT_CHARS = /[\u0000-\u001f<>:"|?*]/;
+
+interface CanonicalWatchedRootUrl {
+  id: string;
+  url: string;
+}
+
+/** Parse and canonicalize an HTTPS Feishu wiki root URL. */
+export function canonicalizeWatchedRootUrl(value: unknown): CanonicalWatchedRootUrl | null {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  try {
+    const parsed = new URL(value.trim());
+    if (
+      parsed.protocol !== 'https:'
+      || !/\.feishu\.cn$/i.test(parsed.hostname)
+      || parsed.port
+      || parsed.username
+      || parsed.password
+    ) return null;
+    const match = parsed.pathname.match(/^\/wiki\/([A-Za-z0-9]+)\/?$/);
+    if (!match) return null;
+    return {
+      id: match[1],
+      url: `${parsed.origin}/wiki/${match[1]}`,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Validate a portable root-relative POSIX directory. */
+export function normalizeWatchedRootLocalDir(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim().replace(/\\/g, '/').replace(/\/+$/g, '');
+  if (!normalized || normalized.startsWith('/') || /^[A-Za-z]:\//.test(normalized)) return null;
+  const segments = normalized.split('/');
+  if (segments.some((segment) => (
+    !segment
+    || segment !== segment.trim()
+    || segment === '.'
+    || segment === '..'
+    || segment.endsWith('.')
+    || UNSAFE_PATH_SEGMENT_CHARS.test(segment)
+    || WINDOWS_RESERVED_SEGMENTS.test(segment)
+  ))) {
+    return null;
+  }
+  return normalized;
+}
+
+/** Strictly normalize user-supplied structured root configuration. */
+export function normalizeWatchedRootConfig(value: unknown): WatchedRootConfig {
+  if (!value || typeof value !== 'object') {
+    throw new Error('watchedRoot 必须是对象');
+  }
+  const candidate = value as Partial<WatchedRootConfig>;
+  const canonical = canonicalizeWatchedRootUrl(candidate.url);
+  if (!canonical) {
+    throw new Error('watchedRoot.url 必须是规范的 https://<tenant>.feishu.cn/wiki/<token> 地址');
+  }
+  if (candidate.id !== canonical.id) {
+    throw new Error('watchedRoot.id 必须等于 URL 中的 wiki 根 token');
+  }
+  const localDir = normalizeWatchedRootLocalDir(candidate.localDir);
+  if (!localDir) {
+    throw new Error('watchedRoot.localDir 必须是非空、不可越界的根相对 POSIX 路径');
+  }
+  if (!VALID_LAYOUT_PROFILES.has(candidate.layoutProfile as LayoutProfile)) {
+    throw new Error('watchedRoot.layoutProfile 必须是 directory-readme 或 mirror-title-file');
+  }
+  if (typeof candidate.enabled !== 'boolean') {
+    throw new Error('watchedRoot.enabled 必须是布尔值');
+  }
+  return {
+    id: canonical.id,
+    url: canonical.url,
+    localDir,
+    layoutProfile: candidate.layoutProfile as LayoutProfile,
+    enabled: candidate.enabled,
+  };
+}
+
+function normalizeWatchedRootList(value: unknown): WatchedRootConfig[] {
+  if (!Array.isArray(value)) {
+    throw new Error('watchedRoots 必须是数组');
+  }
+  const roots = value.map((root) => normalizeWatchedRootConfig(root));
+  const ids = new Set<string>();
+  const urls = new Set<string>();
+  for (const root of roots) {
+    if (ids.has(root.id) || urls.has(root.url)) {
+      throw new Error(`watchedRoots 存在重复根：${root.id}`);
+    }
+    ids.add(root.id);
+    urls.add(root.url);
+  }
+  return roots;
+}
+
+function legacyWatchedRoot(url: unknown): WatchedRootConfig | null {
+  const canonical = canonicalizeWatchedRootUrl(url);
+  if (!canonical) return null;
+  const preset = LEGACY_ROOT_PRESETS[canonical.id];
+  if (preset) {
+    return { ...canonical, ...preset, enabled: true };
+  }
+  return {
+    ...canonical,
+    localDir: `__unmapped__/${canonical.id}`,
+    layoutProfile: 'directory-readme',
+    enabled: false,
+  };
+}
+
+function migrateLegacyWatchedRootUrls(value: unknown): WatchedRootConfig[] {
+  if (!Array.isArray(value)) return [];
+  const roots: WatchedRootConfig[] = [];
+  const ids = new Set<string>();
+  for (const url of value) {
+    const root = legacyWatchedRoot(url);
+    if (root && !ids.has(root.id)) {
+      roots.push(root);
+      ids.add(root.id);
+    }
+  }
+  return roots;
+}
+
+/**
  * Visible-at-top-of-file security warning. Written into config.json
  * as a `_warning` field so any human opening the file sees it.
  */
 const API_KEY_PLAINTEXT_WARNING =
-  'SECURITY WARNING: this file contains a plaintext LLM API key under ' +
-  '`llm.apiKey`. Do NOT commit this file to a public repository. ' +
+  'SECURITY WARNING: this file contains plaintext LLM API keys under ' +
+  '`llm.apiKey` and/or `llm.providers[].apiKey`. Do NOT commit this file to a public repository. ' +
   'Encryption (keytar) is on the roadmap; until then, treat the key ' +
   'with the same care as a password.';
 
@@ -322,17 +679,27 @@ export class ConfigManager {
         fs.mkdirSync(configDir, { recursive: true });
       }
 
+      const watchedRoots = normalizeWatchedRootList(config.watchedRoots);
+      // `watchedRootUrls` remains available to old in-memory callers for one
+      // release, but new config files carry only the structured authority.
+      const runtimeConfig: Config = {
+        ...config,
+        watchedRoots,
+        watchedRootUrls: getEnabledWatchedRootUrls({ watchedRoots }),
+      };
+      const { watchedRootUrls: _legacyWatchedRootUrls, ...persistentConfig } = runtimeConfig;
+
       // SECURITY (decision 3 / B3 plan B): plaintext key + prominent
       // warning. The warning is a JSON field (not a real JSON comment,
       // which JSON does not support). Tools reading the file MUST
       // ignore unknown keys, per JSON spec.
       const withWarning = {
         _warning: API_KEY_PLAINTEXT_WARNING,
-        ...config,
+        ...persistentConfig,
       };
 
       fs.writeFileSync(this.configPath, JSON.stringify(withWarning, null, 2), 'utf-8');
-      this.config = config;
+      this.config = runtimeConfig;
       console.info(`[ConfigManager] Saved config to ${this.configPath}`);
     } catch (error) {
       console.error('[ConfigManager] Failed to save config:', error);
@@ -346,20 +713,115 @@ export class ConfigManager {
    */
   async updateLLMConfig(llm: Partial<LlmConfig>): Promise<void> {
     const currentConfig = await this.load();
-    const updatedLlm: LlmConfig = {
-      ...currentConfig.llm,
-      ...llm,
-      // Nested merge for claudeCli sub-object.
-      claudeCli: {
-        ...(currentConfig.llm.claudeCli ?? {}),
-        ...(llm.claudeCli ?? {}),
-      },
-    };
+    const updatedLlm = this.mergeLlmPartial(currentConfig.llm, llm);
     const updatedConfig: Config = {
       ...currentConfig,
       llm: updatedLlm,
     };
     await this.save(updatedConfig);
+  }
+
+  /**
+   * Apply a partial configuration update through the same normalization path
+   * as load/save. This prevents HTTP callers from bypassing v5 root
+   * validation with a shallow object merge.
+   */
+  async updateConfig(partial: Partial<Config>): Promise<Config> {
+    const currentConfig = await this.load();
+    const hasStructuredRoots = Object.prototype.hasOwnProperty.call(partial, 'watchedRoots');
+    const hasLegacyUrls = Object.prototype.hasOwnProperty.call(partial, 'watchedRootUrls');
+
+    let watchedRoots = currentConfig.watchedRoots;
+    if (hasStructuredRoots) {
+      watchedRoots = normalizeWatchedRootList(partial.watchedRoots);
+    } else if (hasLegacyUrls) {
+      watchedRoots = this.mergeLegacyWatchedRootUrls(
+        currentConfig.watchedRoots,
+        partial.watchedRootUrls,
+      );
+    }
+
+    const updatedConfig: Config = {
+      ...currentConfig,
+      ...partial,
+      watchedRoots,
+      watchedRootUrls: getEnabledWatchedRootUrls({ watchedRoots }),
+      llm: partial.llm
+        ? this.mergeLlmPartial(currentConfig.llm, partial.llm)
+        : currentConfig.llm,
+    };
+    await this.save(updatedConfig);
+    return this.config!;
+  }
+
+  /**
+   * LLM partial update semantics for secrets:
+   *   - omit apiKey        → retain
+   *   - apiKey === '***'   → retain (masked UI echo)
+   *   - apiKey === ''      → clear
+   *   - any other string   → replace
+   * The same semantics apply independently to every
+   * `providers[].apiKey`, matched by stable provider id.
+   */
+  private mergeLlmPartial(
+    current: LlmConfig,
+    partial: Partial<LlmConfig>,
+  ): LlmConfig {
+    const hasProviders = Object.prototype.hasOwnProperty.call(partial, 'providers');
+    const next: LlmConfig = {
+      ...current,
+      ...partial,
+      providers: hasProviders
+        ? this.mergeProviderProfiles(current.providers, partial.providers)
+        : current.providers,
+      claudeCli: {
+        ...(current.claudeCli ?? {}),
+        ...(partial.claudeCli ?? {}),
+      },
+      opencode: {
+        ...(current.opencode ?? {}),
+        ...(partial.opencode ?? {}),
+      },
+    };
+    if (Object.prototype.hasOwnProperty.call(partial, 'apiKey')) {
+      const incoming = partial.apiKey;
+      if (incoming === undefined || incoming === '***') {
+        next.apiKey = current.apiKey;
+      } else {
+        next.apiKey = incoming;
+      }
+    } else {
+      next.apiKey = current.apiKey;
+    }
+    return this.normalizeLlmConfig(next);
+  }
+
+  /**
+   * A config GET masks provider keys as `***`. Settings sends the complete
+   * provider list back on save, so merge each profile by id and retain only
+   * the masked/missing secret while still allowing deliberate key clearing.
+   */
+  private mergeProviderProfiles(
+    current: LlmProviderConfig[] | undefined,
+    incoming: LlmProviderConfig[] | undefined,
+  ): LlmProviderConfig[] | undefined {
+    if (!Array.isArray(incoming)) return current;
+    const existingById = new Map((current ?? []).map((provider) => [provider.id, provider]));
+
+    return incoming.map((provider) => {
+      const previous = existingById.get(provider.id);
+      const incomingKey = provider.apiKey;
+      return {
+        ...(previous ?? {}),
+        ...provider,
+        // A model-list field is authoritative when present; an omitted one
+        // (older clients) retains the stored list.
+        models: Array.isArray(provider.models) ? provider.models : (previous?.models ?? []),
+        apiKey: incomingKey === undefined || incomingKey === '***'
+          ? (previous?.apiKey ?? '')
+          : incomingKey,
+      } as LlmProviderConfig;
+    });
   }
 
   /**
@@ -379,12 +841,14 @@ export class ConfigManager {
    */
   async addWatchedUrl(url: string): Promise<void> {
     const currentConfig = await this.load();
-    if (!currentConfig.watchedRootUrls.includes(url)) {
-      const updatedConfig = {
-        ...currentConfig,
-        watchedRootUrls: [...currentConfig.watchedRootUrls, url],
-      };
-      await this.save(updatedConfig);
+    const canonical = canonicalizeWatchedRootUrl(url);
+    if (!canonical) {
+      throw new Error('watchedRoot URL 无效');
+    }
+    if (!currentConfig.watchedRoots.some((root) => root.id === canonical.id)) {
+      await this.updateConfig({
+        watchedRootUrls: [...currentConfig.watchedRootUrls, canonical.url],
+      });
     }
   }
 
@@ -393,11 +857,11 @@ export class ConfigManager {
    */
   async removeWatchedUrl(url: string): Promise<void> {
     const currentConfig = await this.load();
-    const updatedConfig = {
-      ...currentConfig,
-      watchedRootUrls: currentConfig.watchedRootUrls.filter((u) => u !== url),
-    };
-    await this.save(updatedConfig);
+    const canonical = canonicalizeWatchedRootUrl(url);
+    if (!canonical) return;
+    await this.updateConfig({
+      watchedRootUrls: currentConfig.watchedRootUrls.filter((item) => item !== canonical.url),
+    });
   }
 
   /**
@@ -434,11 +898,42 @@ export class ConfigManager {
     } else if (this.isPartialLlmConfig(llmRaw)) {
       // Already new shape but possibly missing fields; normalize.
       llm = this.normalizeLlmConfig(llmRaw as Partial<LlmConfig>);
-      migrated = true;
+      // Avoid rewriting config.json on every load once the normalized shape
+      // has already been persisted. JSON property order is stable because
+      // save() writes this normalized object verbatim.
+      migrated = JSON.stringify(llm) !== JSON.stringify(llmRaw);
     } else {
       // No llm field at all (shouldn't happen in practice); use defaults.
       llm = buildDefaultLlmConfig();
       migrated = true;
+    }
+
+    let watchedRoots: WatchedRootConfig[];
+    if (Array.isArray(raw.watchedRoots)) {
+      const normalized = this.normalizeStoredWatchedRoots(raw.watchedRoots);
+      watchedRoots = normalized.roots;
+      // A short-lived transition build may have written an empty structured
+      // array alongside an older URL list. Preserve URL-only roots that do
+      // not already have a structured owner; otherwise a config upgrade
+      // could silently drop an existing sync root. Structured entries win on
+      // id collisions, and unknown legacy roots stay explicitly disabled.
+      const legacyRoots = migrateLegacyWatchedRootUrls(raw.watchedRootUrls);
+      const knownIds = new Set(watchedRoots.map((root) => root.id));
+      for (const legacyRoot of legacyRoots) {
+        if (!knownIds.has(legacyRoot.id)) {
+          watchedRoots.push(legacyRoot);
+          knownIds.add(legacyRoot.id);
+        }
+      }
+      // A file containing both shapes is rewritten to the canonical P2
+      // shape. Invalid stored entries are retained only as disabled,
+      // explicitly-unmapped roots so no path is guessed on the user's behalf.
+      migrated = migrated
+        || normalized.hadInvalid
+        || Object.prototype.hasOwnProperty.call(raw, 'watchedRootUrls');
+    } else {
+      watchedRoots = migrateLegacyWatchedRootUrls(raw.watchedRootUrls);
+      migrated = migrated || Array.isArray(raw.watchedRootUrls);
     }
 
     const config: Config = {
@@ -449,9 +944,10 @@ export class ConfigManager {
       knowledgeBaseRoot: typeof raw.knowledgeBaseRoot === 'string'
         ? raw.knowledgeBaseRoot
         : '',
-      watchedRootUrls: Array.isArray(raw.watchedRootUrls)
-        ? raw.watchedRootUrls
-        : [],
+      watchedRoots,
+      // In-memory compatibility projection only; save() deliberately omits
+      // this legacy field from the on-disk schema.
+      watchedRootUrls: getEnabledWatchedRootUrls({ watchedRoots }),
       larkCliPath: typeof raw.larkCliPath === 'string' ? raw.larkCliPath : undefined,
       requiredScopes: Array.isArray(raw.requiredScopes) && raw.requiredScopes.length > 0
         ? raw.requiredScopes
@@ -465,6 +961,66 @@ export class ConfigManager {
     };
 
     return migrated ? { ...config, _migrated: true } : config;
+  }
+
+  /**
+   * Load-time normalization is deliberately tolerant: corrupt or incomplete
+   * stored roots become disabled `__unmapped__` records instead of causing
+   * ConfigManager to discard the entire configuration file.
+   */
+  private normalizeStoredWatchedRoots(value: unknown[]): {
+    roots: WatchedRootConfig[];
+    hadInvalid: boolean;
+  } {
+    const roots: WatchedRootConfig[] = [];
+    const ids = new Set<string>();
+    let hadInvalid = false;
+    for (const candidate of value) {
+      try {
+        const root = normalizeWatchedRootConfig(candidate);
+        if (ids.has(root.id)) {
+          hadInvalid = true;
+          continue;
+        }
+        roots.push(root);
+        ids.add(root.id);
+      } catch {
+        hadInvalid = true;
+        const rawUrl = candidate && typeof candidate === 'object'
+          ? (candidate as { url?: unknown }).url
+          : undefined;
+        const fallback = legacyWatchedRoot(rawUrl);
+        if (fallback && !ids.has(fallback.id)) {
+          roots.push({ ...fallback, enabled: false });
+          ids.add(fallback.id);
+        }
+      }
+    }
+    return { roots, hadInvalid };
+  }
+
+  /** Convert legacy URL-only edits while preserving existing root layouts. */
+  private mergeLegacyWatchedRootUrls(
+    currentRoots: WatchedRootConfig[],
+    value: unknown,
+  ): WatchedRootConfig[] {
+    if (!Array.isArray(value)) {
+      throw new Error('watchedRootUrls 必须是数组');
+    }
+    const existingById = new Map(currentRoots.map((root) => [root.id, root]));
+    const roots: WatchedRootConfig[] = [];
+    const ids = new Set<string>();
+    for (const rawUrl of value) {
+      const canonical = canonicalizeWatchedRootUrl(rawUrl);
+      if (!canonical) {
+        throw new Error('watchedRootUrls 包含无效的飞书 wiki URL');
+      }
+      if (ids.has(canonical.id)) continue;
+      const existing = existingById.get(canonical.id);
+      roots.push(existing ? { ...existing, url: canonical.url } : legacyWatchedRoot(canonical.url)!);
+      ids.add(canonical.id);
+    }
+    return roots;
   }
 
   /**
@@ -492,7 +1048,7 @@ export class ConfigManager {
     const legacyModel = legacy.model || process.env.ANTHROPIC_MODEL || DEFAULT_CLAUDE_CLI_MODEL;
     const claudeModel = reconcileModelAlias(legacyModel, apiKey);
 
-    return {
+    return this.normalizeLlmConfig({
       openAiCompatBaseUrl: openAiBaseUrl,
       claudeCompatBaseUrl: anthropicBaseUrl,
       apiKey,
@@ -500,6 +1056,7 @@ export class ConfigManager {
       // Default the DirectChannel alias to bigmodel's free OpenAI
       // endpoint model. Users on a different provider can override via UI.
       directModel: DEFAULT_DIRECT_MODEL,
+      claudeCliModel: DEFAULT_CLAUDE_CLI_MODEL,
       temperature: typeof legacy.temperature === 'number' ? legacy.temperature : 0.2,
       // Legacy flat configs had no timeout field; surface the new 10-min
       // default so the timeout config knob is usable immediately after
@@ -509,9 +1066,16 @@ export class ConfigManager {
         claudePath: undefined,
         extraArgs: [],
       },
+      opencode: {
+        executablePath: undefined,
+        model: undefined,
+        agent: undefined,
+        timeoutMs: undefined,
+      },
+      contentAdaptationEnabled: false,
       primaryChannel: 'claude-cli',
       fallbackOnFailure: true,
-    };
+    });
   }
 
   /**
@@ -527,14 +1091,37 @@ export class ConfigManager {
     // key but the host is deepseek/openai, substitute bigmodel paas/v4.
     const rawOpenAiBaseUrl = partial.openAiCompatBaseUrl ?? base.openAiCompatBaseUrl;
     const rawModel = partial.model ?? base.model;
-    return {
+    const normalizedFlat = {
       openAiCompatBaseUrl: reconcileOpenAiCompatBaseUrl(rawOpenAiBaseUrl, apiKey),
       claudeCompatBaseUrl: partial.claudeCompatBaseUrl ?? base.claudeCompatBaseUrl,
       apiKey,
       model: reconcileModelAlias(rawModel, apiKey),
-      directModel: partial.directModel ?? base.directModel,
-      claudeCliModel: partial.claudeCliModel ?? base.claudeCliModel,
+      directModel: canonicalizeGlmModelAlias(partial.directModel ?? base.directModel),
+      claudeCliModel: canonicalizeGlmModelAlias(partial.claudeCliModel ?? base.claudeCliModel),
+    };
+    const providers = normalizeProviderProfiles(partial.providers, normalizedFlat);
+    const requestedProviderId = stringValue(partial.activeProviderId);
+    const activeProvider = providers.find((provider) => (
+      provider.id === requestedProviderId && provider.enabled
+    ))
+      ?? providers.find((provider) => provider.enabled)
+      ?? providers[0];
+    const requestedModelId = stringValue(partial.activeModelId);
+    const activeModel = activeProvider?.models.find((model) => (
+      model.id === requestedModelId && model.enabled
+    ))
+      ?? activeProvider?.models.find((model) => (
+        model.id === activeProvider.defaultModelId && model.enabled
+      ))
+      ?? activeProvider?.models.find((model) => model.enabled)
+      ?? activeProvider?.models[0];
+
+    return {
+      ...normalizedFlat,
       temperature: typeof partial.temperature === 'number' ? partial.temperature : 0.2,
+      providers,
+      activeProviderId: activeProvider?.id,
+      activeModelId: activeModel?.id,
       // Persisted configs written before v0.2.0 sync-state-timeout-fix lack
       // this field. Fall back to the explicit default; preserve user-provided
       // values verbatim (including 0 / small numbers — the user set them on
@@ -546,7 +1133,22 @@ export class ConfigManager {
         claudePath: partial.claudeCli?.claudePath ?? base.claudeCli?.claudePath,
         extraArgs: partial.claudeCli?.extraArgs ?? base.claudeCli?.extraArgs,
       },
-      primaryChannel: partial.primaryChannel ?? 'claude-cli',
+      opencode: {
+        executablePath: partial.opencode?.executablePath ?? base.opencode?.executablePath,
+        model: partial.opencode?.model ?? base.opencode?.model,
+        agent: partial.opencode?.agent ?? base.opencode?.agent,
+        timeoutMs: typeof partial.opencode?.timeoutMs === 'number'
+          ? partial.opencode.timeoutMs
+          : base.opencode?.timeoutMs,
+      },
+      contentAdaptationEnabled: typeof partial.contentAdaptationEnabled === 'boolean'
+        ? partial.contentAdaptationEnabled
+        : false,
+      primaryChannel: partial.primaryChannel === 'claude-cli'
+        || partial.primaryChannel === 'direct'
+        || partial.primaryChannel === 'opencode'
+        ? partial.primaryChannel
+        : 'claude-cli',
       fallbackOnFailure: typeof partial.fallbackOnFailure === 'boolean'
         ? partial.fallbackOnFailure
         : true,
@@ -564,7 +1166,9 @@ export class ConfigManager {
     return (
       typeof v.openAiCompatBaseUrl === 'string' ||
       typeof v.claudeCompatBaseUrl === 'string' ||
-      typeof v.primaryChannel === 'string'
+      typeof v.primaryChannel === 'string' ||
+      Array.isArray(v.providers) ||
+      typeof v.activeProviderId === 'string'
     );
   }
 }

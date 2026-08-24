@@ -5,8 +5,11 @@
  * orchestrator falls back to DirectChannel.
  *
  * Channel contract (P0-Q4 实测 confirmed + v020-r2 stdin-prompt hardening):
- *   Invocation: `claude -p --output-format json --max-turns 1
- *                --dangerously-skip-permissions`  (no prompt positional arg)
+ *   Invocation: `claude -p --output-format json --max-turns 1`.
+ *     Generic Anthropic-compatible providers run in `--bare` mode. Z.AI's
+ *     Coding Plan uses `ANTHROPIC_AUTH_TOKEN`, which Claude Code deliberately
+ *     excludes in `--bare`; it instead runs in a private empty cwd/config
+ *     directory with tools disabled and no session persistence.
  *   Prompt delivery: STDIN — `child.stdin.write(prompt); child.stdin.end();`
  *     claude CLI reads the prompt from stdin when no positional prompt is
  *     supplied on the command line. Verified 2026-06-23: stdin prompt
@@ -23,11 +26,9 @@
  *     the command line, so shell metacharacters are inert. This makes
  *     BOTH the .exe path AND the .cmd+shell:true fallback path safe.
  *   Env injection (drives claude CLI's upstream LLM):
- *     ANTHROPIC_BASE_URL = LlmConfig.claudeCompatBaseUrl
- *         (bigmodel Anthropic-protocol path; for bigmodel:
- *          https://open.bigmodel.cn/api/anthropic)
- *     ANTHROPIC_API_KEY  = LlmConfig.apiKey  (shared with DirectChannel)
- *     ANTHROPIC_MODEL    = LlmConfig.model
+ *     Generic providers: ANTHROPIC_API_KEY + ANTHROPIC_MODEL.
+ *     Z.AI Coding Plan: ANTHROPIC_AUTH_TOKEN + current
+ *       https://api.z.ai/api/anthropic endpoint and tier mappings.
  *     ANTHROPIC_STREAM   = 'false'           (we need full JSON, not stream)
  *   stdout: single JSON object (see Q4 §2.4.2). Fields consumed:
  *     result, is_error, stop_reason, terminal_reason,
@@ -59,6 +60,9 @@
  */
 
 import { spawn, type ChildProcessWithoutNullStreams, type SpawnOptions } from 'node:child_process';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import type {
   AdaptFinishReason,
   AdaptInput,
@@ -67,12 +71,56 @@ import type {
   ContentBackend,
   LlmConfig,
 } from './content-backend.js';
+import { resolveActiveLlmConfig } from './content-backend.js';
+import {
+  buildClaudeCliEnvironment,
+  resolveClaudeCliInvocation,
+  type ClaudeCliInvocation,
+} from './claude-cli-service.js';
 
 // Q4 实测: claude CLI sets stop_reason='end_turn' on normal completion.
 // Other stop reasons (max_tokens -> 'max_tokens', tool_use interruptions)
 // are surfaced as 'length' to enable fallback-to-deterministic logic.
 const STOP_REASON_END_TURN = 'end_turn';
 const STOP_REASON_MAX_TOKENS = 'max_tokens';
+
+interface ClaudeRuntime {
+  model: string;
+  baseUrl: string;
+  /** Z.AI Coding Plan requires AUTH_TOKEN, which `--bare` intentionally excludes. */
+  usesZaiCodingAuth: boolean;
+}
+
+interface ClaudeWorkspace {
+  root: string;
+  configDir: string;
+}
+
+function isZaiAnthropicEndpoint(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return /(?:^|\.)(?:bigmodel\.cn|z\.ai)$/i.test(url.hostname);
+  } catch {
+    return /(?:^|\.)(?:bigmodel\.cn|z\.ai)(?:[/:]|$)/i.test(value);
+  }
+}
+
+/** Z.AI's current Claude Code endpoint; old BigModel hostnames remain input-compatible. */
+function canonicalZaiAnthropicEndpoint(value: string): string {
+  return isZaiAnthropicEndpoint(value)
+    ? 'https://api.z.ai/api/anthropic'
+    : value.trim();
+}
+
+/**
+ * GLM-5.2 is available through the OpenAI-compatible coding endpoint but is
+ * not a documented Claude Code tier mapping. Use the current stable Claude
+ * Code mapping for the Z.AI gateway; direct/OpenCode retain their own model.
+ */
+function resolveZaiClaudeCodeModel(value: string): string {
+  const model = value.trim().replace(/\[[^\]]+\]$/, '');
+  return /^glm-5\.2$/i.test(model) ? 'glm-4.7' : model;
+}
 
 /**
  * Resolved claude executable descriptor.
@@ -90,19 +138,21 @@ const STOP_REASON_MAX_TOKENS = 'max_tokens';
  * (no cmd.exe injection surface). If no `.exe` is available, we fall
  * back to spawning the `.cmd` shim with `shell: true`.
  */
-interface ClaudeExecutable {
-  command: string;
-  useShell: boolean;
-}
+type ClaudeExecutable = ClaudeCliInvocation;
 
 export class ClaudeCliChannel implements ContentBackend {
   readonly name = 'claude-cli' as const;
   readonly supportsStreaming = false;
+  private readonly llm: LlmConfig;
 
   constructor(
-    private readonly llm: LlmConfig,
+    llm: LlmConfig,
     private readonly claudeCli?: ClaudeCliConfig
-  ) {}
+  ) {
+    // See resolveActiveLlmConfig: a selected provider/preset must drive the
+    // env injected into Claude Code, not merely appear as Settings metadata.
+    this.llm = resolveActiveLlmConfig(llm);
+  }
 
   async adapt(input: AdaptInput): Promise<AdaptOutput> {
     const startedAt = Date.now();
@@ -111,21 +161,35 @@ export class ClaudeCliChannel implements ContentBackend {
     // See LlmConfig.timeoutMs rationale in types/index.ts.
     const timeoutMs = input.options.timeoutMs ?? this.llm.timeoutMs ?? 600_000;
     const temperature = input.options.temperature ?? this.llm.temperature ?? 0.2;
+    const runtime = this.resolveRuntime();
 
     // Fail fast on misconfiguration so the orchestrator can cleanly
     // fall back to DirectChannel instead of spawning a doomed process.
     if (!this.llm.apiKey) {
       return this.buildErrorOutput(
-        'ClaudeCliChannel: apiKey is empty (cannot inject ANTHROPIC_API_KEY)',
+        'ClaudeCliChannel: apiKey is empty (cannot inject provider credential)',
         startedAt,
-        'error'
+        'error',
+        undefined,
+        runtime.model,
       );
     }
-    if (!this.llm.claudeCompatBaseUrl) {
+    if (!runtime.baseUrl) {
       return this.buildErrorOutput(
         'ClaudeCliChannel: claudeCompatBaseUrl is empty (cannot inject ANTHROPIC_BASE_URL)',
         startedAt,
-        'error'
+        'error',
+        undefined,
+        runtime.model,
+      );
+    }
+    if (!runtime.model) {
+      return this.buildErrorOutput(
+        'ClaudeCliChannel: no Anthropic-compatible model is selected for the active provider',
+        startedAt,
+        'error',
+        undefined,
+        runtime.model,
       );
     }
 
@@ -138,27 +202,76 @@ export class ClaudeCliChannel implements ContentBackend {
     // be interpreted by cmd.exe. By keeping the prompt out of argv we
     // eliminate the shell-injection surface for BOTH the .exe path and
     // the .cmd+shell:true fallback path. See report §3.3 for details.
-    const args = [
-      '-p',
+    const extraArgs = this.claudeCli?.extraArgs ?? [];
+    const invalidExtraArg = this.validateExtraArgs(extraArgs);
+    if (invalidExtraArg) {
+      return this.buildErrorOutput(invalidExtraArg, startedAt, 'error', undefined, runtime.model);
+    }
+
+    const args = ['-p'];
+    // Claude Code's `--bare` intentionally ignores ANTHROPIC_AUTH_TOKEN.
+    // Z.AI Coding Plan therefore uses an isolated empty workspace/config
+    // instead; generic API-key providers retain the stricter bare mode.
+    if (!runtime.usesZaiCodingAuth) args.push('--bare');
+    args.push(
+      '--no-session-persistence',
       '--output-format',
       'json',
       '--max-turns',
       '1',
-      '--dangerously-skip-permissions',
-      ...(this.claudeCli?.extraArgs ?? []),
-    ];
+      // The task is a pure text transformation. Disabling tools keeps the
+      // headless process from reading/writing the local machine or making an
+      // unrelated network/tool call while formatting a synced document.
+      '--tools',
+      '',
+      ...extraArgs,
+    );
 
-    const childEnv = this.buildChildEnv();
+    const executable = this.resolveClaudeExecutable();
+    if (!executable) {
+      return this.buildErrorOutput(
+        'Claude Code 未检测到。请安装 Claude Code，或在设置中填写其可执行文件绝对路径。',
+        startedAt,
+        'error',
+        undefined,
+        runtime.model,
+      );
+    }
+
+    let workspace: ClaudeWorkspace | undefined;
+    if (runtime.usesZaiCodingAuth) {
+      try {
+        workspace = await this.createIsolatedWorkspace();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return this.buildErrorOutput(
+          `ClaudeCliChannel: failed to create isolated workspace - ${message}`,
+          startedAt,
+          'error',
+          undefined,
+          runtime.model,
+        );
+      }
+    }
+    const childEnv = this.buildChildEnv(executable, runtime, workspace?.configDir, timeoutMs);
 
     return new Promise<AdaptOutput>((resolve) => {
       let child: ChildProcessWithoutNullStreams;
       try {
-        const executable = this.resolveClaudeExecutable();
         const spawnOptions: SpawnOptions = {
           env: childEnv,
           stdio: ['pipe', 'pipe', 'pipe'],
           windowsHide: true,
+          ...(workspace ? { cwd: workspace.root } : {}),
         };
+        // A failed Claude request can leave a helper/session descendant alive
+        // after it has already written its JSON envelope. Give the job a
+        // dedicated POSIX process group so the timeout/early-completion path
+        // can clean up the whole invocation rather than leaking a headless
+        // process in the desktop app.
+        if (process.platform !== 'win32') {
+          spawnOptions.detached = true;
+        }
         if (executable.useShell) {
           // Required for launching .cmd/.bat npm shims on Windows.
           // SAFE because the prompt is delivered via stdin, not argv:
@@ -179,9 +292,12 @@ export class ClaudeCliChannel implements ContentBackend {
           this.buildErrorOutput(
             `ClaudeCliChannel: failed to spawn claude - ${message}`,
             startedAt,
-            'error'
+            'error',
+            undefined,
+            runtime.model,
           )
         );
+        void this.cleanupWorkspace(workspace);
         return;
       }
 
@@ -221,23 +337,25 @@ export class ClaudeCliChannel implements ContentBackend {
 
       const timeoutHandle = setTimeout(() => {
         timedOut = true;
-        try {
-          child.kill('SIGTERM');
-        } catch {
-          // Process may have exited between timeout fire and kill; ignore.
-        }
+        this.terminateChild(child, 'SIGTERM');
         // Hard kill if SIGTERM didn't take effect within 5s.
         setTimeout(() => {
-          try {
-            child.kill('SIGKILL');
-          } catch {
-            // Best effort.
-          }
+          this.terminateChild(child, 'SIGKILL');
         }, 5_000).unref();
       }, timeoutMs);
 
       child.stdout.on('data', (chunk: Buffer | string) => {
         stdout += typeof chunk === 'string' ? chunk : chunk.toString('utf-8');
+        // Claude may write a complete JSON result but keep a helper process
+        // alive. Do not make Settings/sync wait for that unrelated teardown:
+        // once we have a complete envelope, return it and terminate the job
+        // process group. This also exposes upstream API errors immediately.
+        const parsed = this.tryParseJson(stdout);
+        if (parsed && this.isClaudeEnvelope(parsed)) {
+          const output = this.outputFromEnvelope(parsed, startedAt, undefined, stderr, runtime.model);
+          this.terminateChild(child, 'SIGTERM');
+          settle(output);
+        }
       });
       child.stderr.on('data', (chunk: Buffer | string) => {
         stderr += typeof chunk === 'string' ? chunk : chunk.toString('utf-8');
@@ -248,12 +366,16 @@ export class ClaudeCliChannel implements ContentBackend {
           this.buildErrorOutput(
             `ClaudeCliChannel: spawn error - ${err.message}`,
             startedAt,
-            'error'
+            'error',
+            undefined,
+            runtime.model,
           )
         );
+        void this.cleanupWorkspace(workspace);
       });
 
       child.on('close', (code: number | null) => {
+        void this.cleanupWorkspace(workspace);
         const durationMs = Date.now() - startedAt;
 
         if (timedOut) {
@@ -261,7 +383,7 @@ export class ClaudeCliChannel implements ContentBackend {
             adaptedMarkdown: '',
             durationMs,
             channelName: this.name,
-            model: this.llm.claudeCliModel || this.llm.model,
+            model: runtime.model,
             finishReason: 'timeout',
             errorMessage: `ClaudeCliChannel: timed out after ${timeoutMs}ms`,
           });
@@ -274,7 +396,9 @@ export class ClaudeCliChannel implements ContentBackend {
               `ClaudeCliChannel: claude exited with code ${code}` +
                 (stderr ? ` - ${stderr.trim().slice(0, 500)}` : ''),
               startedAt,
-              'error'
+              'error',
+              undefined,
+              runtime.model,
             )
           );
           return;
@@ -288,7 +412,7 @@ export class ClaudeCliChannel implements ContentBackend {
             adaptedMarkdown: stdout || '',
             durationMs,
             channelName: this.name,
-            model: this.llm.claudeCliModel || this.llm.model,
+            model: runtime.model,
             finishReason: stdout ? 'stop' : 'error',
             errorMessage: stdout
               ? undefined
@@ -297,39 +421,7 @@ export class ClaudeCliChannel implements ContentBackend {
           return;
         }
 
-        // API-level failure (claude returned JSON but flagged an error).
-        if (parsed.is_error === true || parsed.api_error_status !== null) {
-          const apiErr =
-            typeof parsed.api_error_status === 'object' && parsed.api_error_status
-              ? JSON.stringify(parsed.api_error_status)
-              : String(parsed.api_error_status ?? '');
-          settle(
-            this.buildErrorOutput(
-              `ClaudeCliChannel: claude reported API error - ${apiErr || 'unknown'}`,
-              startedAt,
-              'error'
-            )
-          );
-          return;
-        }
-
-        const finishReason = this.mapStopReason(parsed.stop_reason);
-        const usage = (parsed.usage ?? {}) as {
-          input_tokens?: number;
-          output_tokens?: number;
-        };
-        const tokensUsed =
-          (typeof usage.input_tokens === 'number' ? usage.input_tokens : 0) +
-          (typeof usage.output_tokens === 'number' ? usage.output_tokens : 0);
-
-        settle({
-          adaptedMarkdown: typeof parsed.result === 'string' ? parsed.result : '',
-          tokensUsed,
-          durationMs,
-          channelName: this.name,
-          model: this.llm.claudeCliModel || this.llm.model,
-          finishReason,
-        });
+        settle(this.outputFromEnvelope(parsed, startedAt, durationMs, stderr, runtime.model));
       });
     });
   }
@@ -367,24 +459,129 @@ export class ClaudeCliChannel implements ContentBackend {
    *   guaranteed non-undefined strings (hard-coded flag list + typed
    *   extraArgs: string[]).
    */
-  private resolveClaudeExecutable(): ClaudeExecutable {
-    // 1. Explicit user override.
-    if (this.claudeCli?.claudePath) {
-      return { command: this.claudeCli.claudePath, useShell: false };
+  private resolveClaudeExecutable(): ClaudeExecutable | null {
+    return resolveClaudeCliInvocation(this.claudeCli?.claudePath);
+  }
+
+  private resolveRuntime(): ClaudeRuntime {
+    const requestedModel = this.llm.claudeCliModel || this.llm.model;
+    const usesZaiCodingAuth = isZaiAnthropicEndpoint(this.llm.claudeCompatBaseUrl);
+    return {
+      model: usesZaiCodingAuth
+        ? resolveZaiClaudeCodeModel(requestedModel)
+        : requestedModel,
+      baseUrl: usesZaiCodingAuth
+        ? canonicalZaiAnthropicEndpoint(this.llm.claudeCompatBaseUrl)
+        : this.llm.claudeCompatBaseUrl.trim(),
+      usesZaiCodingAuth,
+    };
+  }
+
+  /**
+   * `--bare` rejects ANTHROPIC_AUTH_TOKEN, so Z.AI jobs need non-bare mode.
+   * Run that mode in an empty private cwd and a private CLAUDE_CONFIG_DIR to
+   * retain the same no-hooks/no-user-config isolation without mutating the
+   * user's Claude files.
+   */
+  private async createIsolatedWorkspace(): Promise<ClaudeWorkspace> {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'feishu-sync-claude-'));
+    const configDir = path.join(root, 'config');
+    await fs.chmod(root, 0o700).catch(() => undefined);
+    await fs.mkdir(configDir, { recursive: true, mode: 0o700 });
+    return { root, configDir };
+  }
+
+  private async cleanupWorkspace(workspace: ClaudeWorkspace | undefined): Promise<void> {
+    if (!workspace) return;
+    await fs.rm(workspace.root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
+      .catch(() => undefined);
+  }
+
+  /** Kill the dedicated POSIX process group, falling back to the child. */
+  private terminateChild(child: ChildProcessWithoutNullStreams, signal: NodeJS.Signals): void {
+    if (process.platform !== 'win32' && typeof child.pid === 'number') {
+      try {
+        process.kill(-child.pid, signal);
+        return;
+      } catch {
+        // The process may already have exited or platform policy may reject
+        // a group signal. Fall through to the direct child best effort.
+      }
     }
-    // 2. claude code launcher exposes the .exe via this env var.
-    //    Verified on main上's machine: points to
-    //    C:\Users\<u>\AppData\Roaming\npm\node_modules\@anthropic-ai\
-    //    claude-code\bin\claude.exe (real PE binary, spawn-safe).
-    if (process.env.CLAUDE_CODE_EXECPATH) {
-      return { command: process.env.CLAUDE_CODE_EXECPATH, useShell: false };
+    try {
+      child.kill(signal);
+    } catch {
+      // Best effort.
     }
-    // 3. Fallback: PATH lookup. On Windows the global npm shim is
-    //    `claude.cmd`; spawning it without shell:true throws EINVAL.
-    if (process.platform === 'win32') {
-      return { command: 'claude.cmd', useShell: true };
+  }
+
+  private isClaudeEnvelope(parsed: Record<string, unknown>): boolean {
+    return Object.prototype.hasOwnProperty.call(parsed, 'result')
+      || Object.prototype.hasOwnProperty.call(parsed, 'is_error')
+      || Object.prototype.hasOwnProperty.call(parsed, 'api_error_status')
+      || Object.prototype.hasOwnProperty.call(parsed, 'stop_reason');
+  }
+
+  /** Convert Claude's terminal JSON into a safe channel result. */
+  private outputFromEnvelope(
+    parsed: Record<string, unknown>,
+    startedAt: number,
+    durationMs = Date.now() - startedAt,
+    stderr = '',
+    model = this.resolveRuntime().model,
+  ): AdaptOutput {
+    // `undefined !== null` used to classify ordinary envelopes that omit the
+    // optional field as errors. Only a non-null value is a provider failure.
+    if (parsed.is_error === true || parsed.api_error_status != null) {
+      const apiErr = this.safeProviderDiagnostic(
+        parsed.api_error_status
+          ?? parsed.error
+          ?? parsed.errors
+          ?? parsed.message
+          ?? parsed.result
+          ?? stderr,
+      );
+      return this.buildErrorOutput(
+        `ClaudeCliChannel: claude reported API error - ${apiErr || 'unknown'}`,
+        startedAt,
+        'error',
+        durationMs,
+        model,
+      );
     }
-    return { command: 'claude', useShell: false };
+
+    const finishReason = this.mapStopReason(parsed.stop_reason);
+    const usage = (parsed.usage ?? {}) as {
+      input_tokens?: number;
+      output_tokens?: number;
+    };
+    const tokensUsed =
+      (typeof usage.input_tokens === 'number' ? usage.input_tokens : 0) +
+      (typeof usage.output_tokens === 'number' ? usage.output_tokens : 0);
+    return {
+      adaptedMarkdown: typeof parsed.result === 'string' ? parsed.result : '',
+      tokensUsed,
+      durationMs,
+      channelName: this.name,
+      model,
+      finishReason,
+    };
+  }
+
+  /** Provider payloads can echo credentials; keep only a short redacted hint. */
+  private safeProviderDiagnostic(value: unknown): string {
+    const raw = typeof value === 'string'
+      ? value
+      : value == null
+        ? ''
+        : JSON.stringify(value);
+    return raw
+      .replace(/Bearer\s+\S+/gi, 'Bearer [REDACTED]')
+      .replace(/\b(?:sk|ak|api)[-_][A-Za-z0-9._-]{8,}\b/gi, '[REDACTED]')
+      .replace(/(["']?(?:api[_-]?key|authorization|token)["']?\s*[:=]\s*["']?)[^\s,"'}]+/gi, '$1[REDACTED]')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 400);
   }
 
   /**
@@ -396,30 +593,73 @@ export class ClaudeCliChannel implements ContentBackend {
    * parse the final JSON result; enabling streaming would corrupt the
    * JSON envelope on stdout.
    */
-  private buildChildEnv(): NodeJS.ProcessEnv {
-    const env: NodeJS.ProcessEnv = { ...process.env };
-    // Channel-specific override (bigmodel's Anthropic adapter may
-    // accept a different alias than the OpenAI adapter).
-    const model = this.llm.claudeCliModel || this.llm.model;
-    env.ANTHROPIC_BASE_URL = this.llm.claudeCompatBaseUrl;
-    env.ANTHROPIC_API_KEY = this.llm.apiKey;
-    env.ANTHROPIC_MODEL = model;
-    // Pin all tier aliases to the same model so any internal claude
-    // tier routing hits the same provider/model.
-    env.ANTHROPIC_DEFAULT_SONNET_MODEL = model;
-    env.ANTHROPIC_DEFAULT_OPUS_MODEL = model;
-    env.ANTHROPIC_DEFAULT_HAIKU_MODEL = model;
+  private buildChildEnv(
+    executable: ClaudeExecutable,
+    runtime: ClaudeRuntime,
+    configDir: string | undefined,
+    timeoutMs: number,
+  ): NodeJS.ProcessEnv {
+    // The resolver's environment helper ensures a script-style global npm
+    // shim can locate its sibling Node runtime even when Electron was opened
+    // from Finder with a minimal PATH.
+    const env = buildClaudeCliEnvironment(executable);
+    env.ANTHROPIC_BASE_URL = runtime.baseUrl;
+    // Never inherit an unrelated credential from the Electron parent.
+    delete env.ANTHROPIC_API_KEY;
+    delete env.ANTHROPIC_AUTH_TOKEN;
+
+    if (runtime.usesZaiCodingAuth) {
+      // Z.AI's documented Claude Code integration authenticates with this
+      // token variable. `--bare` is intentionally omitted for this mode and
+      // adapt() supplies an empty private config/cwd instead.
+      env.ANTHROPIC_AUTH_TOKEN = this.llm.apiKey;
+      delete env.ANTHROPIC_MODEL;
+      if (configDir) env.CLAUDE_CONFIG_DIR = configDir;
+      env.ANTHROPIC_DEFAULT_SONNET_MODEL = runtime.model;
+      env.ANTHROPIC_DEFAULT_OPUS_MODEL = runtime.model;
+      env.ANTHROPIC_DEFAULT_HAIKU_MODEL = runtime.model;
+      env.API_TIMEOUT_MS = String(Math.max(180_000, timeoutMs));
+      // These generic Anthropic tuning variables are not part of Z.AI's
+      // documented Claude Code integration; omit inherited values.
+      delete env.ANTHROPIC_MAX_TOKENS;
+      delete env.ANTHROPIC_DO_SAMPLE;
+    } else {
+      env.ANTHROPIC_API_KEY = this.llm.apiKey;
+      env.ANTHROPIC_MODEL = runtime.model;
+      // Pin all tier aliases to the same model so any internal claude
+      // tier routing hits the same provider/model.
+      env.ANTHROPIC_DEFAULT_SONNET_MODEL = runtime.model;
+      env.ANTHROPIC_DEFAULT_OPUS_MODEL = runtime.model;
+      env.ANTHROPIC_DEFAULT_HAIKU_MODEL = runtime.model;
+      // Keep max tokens at the provider default if unset; otherwise allow it.
+      if (env.ANTHROPIC_MAX_TOKENS === undefined) {
+        env.ANTHROPIC_MAX_TOKENS = '8192';
+      }
+      // Sampling: honor LlmConfig.temperature when provided.
+      env.ANTHROPIC_DO_SAMPLE = this.llm.temperature !== undefined && this.llm.temperature < 1 ? 'true' : 'false';
+    }
     // Disable streaming so stdout is a single JSON envelope.
     env.ANTHROPIC_STREAM = 'false';
     // Disable extended thinking for deterministic, fast single-turn output.
     env.ANTHROPIC_THINKING = '{"type":"disabled"}';
-    // Keep max tokens at the provider default if unset; otherwise allow it.
-    if (env.ANTHROPIC_MAX_TOKENS === undefined) {
-      env.ANTHROPIC_MAX_TOKENS = '8192';
-    }
-    // Sampling: honor LlmConfig.temperature when provided.
-    env.ANTHROPIC_DO_SAMPLE = this.llm.temperature !== undefined && this.llm.temperature < 1 ? 'true' : 'false';
     return env;
+  }
+
+  /**
+   * Extra arguments are a user-facing escape hatch, not part of the document
+   * protocol. Reject flags that could change prompt/output/auth/tool safety
+   * invariants; ordinary diagnostic flags remain usable.
+   */
+  private validateExtraArgs(extraArgs: string[]): string | null {
+    for (const arg of extraArgs) {
+      if (typeof arg !== 'string' || /[\r\n]/.test(arg)) {
+        return 'claude CLI 附加参数包含无效换行';
+      }
+      if (/^(?:-p|--print|--output-format(?:=|$)|--model(?:=|$)|--tools(?:=|$)|--allowed-tools(?:=|$)|--disallowed-tools(?:=|$)|--bare|--dangerously-skip-permissions|--permission-mode(?:=|$))$/i.test(arg)) {
+        return `claude CLI 附加参数不允许覆盖受控安全参数：${arg}`;
+      }
+    }
+    return null;
   }
 
   private mapStopReason(raw: unknown): AdaptFinishReason {
@@ -456,13 +696,15 @@ export class ClaudeCliChannel implements ContentBackend {
   private buildErrorOutput(
     errorMessage: string,
     startedAt: number,
-    finishReason: AdaptFinishReason
+    finishReason: AdaptFinishReason,
+    durationMs = Date.now() - startedAt,
+    model = this.resolveRuntime().model,
   ): AdaptOutput {
     return {
       adaptedMarkdown: '',
-      durationMs: Date.now() - startedAt,
+      durationMs,
       channelName: this.name,
-      model: this.llm.claudeCliModel || this.llm.model,
+      model,
       finishReason,
       errorMessage,
     };

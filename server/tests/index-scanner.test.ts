@@ -4,8 +4,11 @@
  * Covers R1.1-AC1/AC2 from 02-迭代需求分析.md and the B5 fix described in
  * 01-现状与差距分析.md §3.1 (G1.1) and 03-迭代架构设计.md §2.2.2.
  */
-import { describe, it, expect } from 'vitest';
-import { IndexScanner } from '../src/modules/index-scanner.js';
+import { afterEach, describe, expect, it } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { IndexScanner, resolveDocumentTitle } from '../src/modules/index-scanner.js';
 
 // The scanner only needs parseMetadata for these tests. Construct with
 // stub dependencies — they are never invoked in unit-level parsing tests.
@@ -364,5 +367,298 @@ describe('IndexScanner.parseMetadata — format 4: bold key-value header', () =>
 `;
     const meta = scanner.parseMetadata(content);
     expect(meta).toBeNull();
+  });
+});
+
+describe('resolveDocumentTitle', () => {
+  it('uses the first ATX H1 for README.md after feishu_sync header comment', () => {
+    const content = `<!--
+feishu_sync:
+  obj_token: TOK123
+-->
+
+# 服务器架构
+
+body
+`;
+    const title = resolveDocumentTitle(
+      path.join('知识库', '技术 - Dev', '服务器架构', 'README.md'),
+      content,
+    );
+    expect(title).toBe('服务器架构');
+  });
+
+  it('skips YAML front-matter and HTML comments before the H1', () => {
+    const content = `---
+title: ignored
+---
+<!--
+feishu_sync:
+  obj_token: TOK
+-->
+
+# Real Title From H1
+`;
+    expect(resolveDocumentTitle('/kb/node/README.md', content)).toBe(
+      'Real Title From H1',
+    );
+  });
+
+  it('falls back to parent directory name when README has no H1', () => {
+    const content = `<!--
+feishu_sync:
+  obj_token: TOK
+-->
+
+Just prose, no heading.
+`;
+    const title = resolveDocumentTitle(
+      path.join('/kb', '技术 - Dev', '数据层', 'README.md'),
+      content,
+    );
+    expect(title).toBe('数据层');
+  });
+
+  it('falls back to "README" when parent name is unusable (filesystem root)', () => {
+    // path.dirname('/README.md') === '/' → basename is empty → final fallback.
+    const content = 'no heading here\n';
+    const atRoot = path.join(path.parse(process.cwd()).root, 'README.md');
+    expect(resolveDocumentTitle(atRoot, content)).toBe('README');
+  });
+
+  it('uses filename stem for ordinary non-README markdown', () => {
+    const content = `# This H1 is ignored for non-README
+
+body
+`;
+    expect(
+      resolveDocumentTitle(path.join('/kb', 'docs', '1.1.面向数据.md'), content),
+    ).toBe('1.1.面向数据');
+  });
+
+  it('does not treat H2 as the README title', () => {
+    const content = `<!--
+feishu_sync:
+  obj_token: TOK
+-->
+
+## Not an H1
+
+More text.
+`;
+    expect(
+      resolveDocumentTitle(path.join('/kb', '父节点', 'README.md'), content),
+    ).toBe('父节点');
+  });
+});
+
+describe('IndexScanner scan policy', () => {
+  const temporaryRoots: string[] = [];
+
+  afterEach(() => {
+    for (const root of temporaryRoots.splice(0)) {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not index markdown in reserved operational directories', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'index-scan-policy-'));
+    temporaryRoots.push(root);
+    const indexed: Array<{ objToken: string; localMdPath: string }> = [];
+    const writeMappedFile = (relativePath: string, token: string) => {
+      const target = path.join(root, relativePath);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, `<!--\nobj_token: ${token}\n-->\n# ${token}\n`);
+      return target;
+    };
+
+    const included = writeMappedFile('docs/included.md', 'INCLUDED');
+    for (const [dir, token] of [
+      ['_reports', 'REPORT'],
+      ['.trash-bin', 'TRASH'],
+      ['.staging', 'DOT_STAGING'],
+      ['_staging', 'UNDERSCORE_STAGING'],
+      ['.recovery', 'DOT_RECOVERY'],
+      ['_recovery', 'UNDERSCORE_RECOVERY'],
+      ['.restore', 'DOT_RESTORE'],
+      ['_restore', 'UNDERSCORE_RESTORE'],
+    ]) {
+      writeMappedFile(`${dir}/${token}.md`, token);
+    }
+
+    const indexScanner = new IndexScanner({
+      localMapStore: {
+        upsertDocument: (document: { objToken: string; localMdPath: string }) => indexed.push(document),
+      },
+      larkCliClient: {},
+      config: {},
+    });
+
+    const result = await indexScanner.scanKnowledgeBase(root);
+
+    expect(result.scanned).toBe(1);
+    expect(result.indexed).toBe(1);
+    expect(indexed).toHaveLength(1);
+    expect(indexed[0]).toMatchObject({ objToken: 'INCLUDED', localMdPath: included });
+  });
+
+  it('indexes README with H1 title and forwards identity fields to upsert', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'index-scan-identity-'));
+    temporaryRoots.push(root);
+
+    const readmeDir = path.join(root, '技术 - Dev', '服务器架构');
+    fs.mkdirSync(readmeDir, { recursive: true });
+    const readmePath = path.join(readmeDir, 'README.md');
+    fs.writeFileSync(
+      readmePath,
+      `<!--
+feishu_sync:
+  obj_token: HmhRdCs3goAlVNxXmBhcX3Uknng
+  wiki_node_token: PUMawWxe7iGYIMkCpZscvXImnNe
+  space_id: ODIxNjUxNTc
+  obj_type: docx
+  original_link: https://qcnbafdrjx7n.feishu.cn/wiki/PUMawWxe7iGYIMkCpZscvXImnNe
+  fetch_date: 2026-06-18
+  last_synced_modify_time: 2026-06-15T10:30:00Z
+-->
+
+# 服务器架构
+
+body
+`,
+    );
+
+    const plainPath = path.join(root, '技术 - Dev', '1.1.面向数据.md');
+    fs.writeFileSync(
+      plainPath,
+      `<!--
+feishu_sync:
+  obj_token: PlainTokABC
+  wiki_node_token: PlainNodeABC
+  space_id: SpaceXYZ
+  obj_type: docx
+  original_link: https://example.feishu.cn/wiki/PlainNodeABC
+  fetch_date: 2026-06-16
+-->
+
+# H1 that must not become title for non-README
+`,
+    );
+
+    // README without H1 → parent dir title
+    const noH1Dir = path.join(root, '技术 - Dev', '数据层');
+    fs.mkdirSync(noH1Dir, { recursive: true });
+    const noH1Path = path.join(noH1Dir, 'README.md');
+    fs.writeFileSync(
+      noH1Path,
+      `<!--
+feishu_sync:
+  obj_token: NoH1Tok
+  wiki_node_token: NoH1Node
+  space_id: SpaceNoH1
+  original_link: https://example.feishu.cn/wiki/NoH1Node
+  fetch_date: 2026-06-17
+-->
+
+prose only
+`,
+    );
+
+    type UpsertArg = {
+      objToken: string;
+      title: string;
+      wikiNodeToken: string | null;
+      spaceId: string | null;
+      originalLink: string | null;
+      lastSyncedModifyTime: string;
+      localMdPath: string;
+      localRelPath?: string | null;
+      status: string;
+    };
+    const indexed: UpsertArg[] = [];
+
+    const indexScanner = new IndexScanner({
+      localMapStore: {
+        upsertDocument: (document: UpsertArg) => indexed.push(document),
+      },
+      larkCliClient: {},
+      config: { knowledgeBaseRoot: root },
+    });
+
+    const result = await indexScanner.scanKnowledgeBase(root);
+
+    expect(result.scanned).toBe(3);
+    expect(result.indexed).toBe(3);
+    expect(indexed).toHaveLength(3);
+
+    const byToken = Object.fromEntries(indexed.map((d) => [d.objToken, d]));
+
+    // README with H1
+    expect(byToken['HmhRdCs3goAlVNxXmBhcX3Uknng']).toMatchObject({
+      title: '服务器架构',
+      wikiNodeToken: 'PUMawWxe7iGYIMkCpZscvXImnNe',
+      spaceId: 'ODIxNjUxNTc',
+      originalLink:
+        'https://qcnbafdrjx7n.feishu.cn/wiki/PUMawWxe7iGYIMkCpZscvXImnNe',
+      lastSyncedModifyTime: '2026-06-15T10:30:00Z',
+      localMdPath: readmePath,
+      localRelPath: '技术 - Dev/服务器架构/README.md',
+      status: 'synced',
+    });
+
+    // Ordinary .md → filename stem (not H1)
+    expect(byToken['PlainTokABC']).toMatchObject({
+      title: '1.1.面向数据',
+      wikiNodeToken: 'PlainNodeABC',
+      spaceId: 'SpaceXYZ',
+      originalLink: 'https://example.feishu.cn/wiki/PlainNodeABC',
+      lastSyncedModifyTime: '2026-06-16',
+      localMdPath: plainPath,
+      localRelPath: '技术 - Dev/1.1.面向数据.md',
+      status: 'synced',
+    });
+
+    // README without H1 → parent directory name; fetch_date used when no last_synced_modify_time
+    expect(byToken['NoH1Tok']).toMatchObject({
+      title: '数据层',
+      wikiNodeToken: 'NoH1Node',
+      spaceId: 'SpaceNoH1',
+      originalLink: 'https://example.feishu.cn/wiki/NoH1Node',
+      lastSyncedModifyTime: '2026-06-17',
+      localMdPath: noH1Path,
+      localRelPath: '技术 - Dev/数据层/README.md',
+      status: 'synced',
+    });
+  });
+
+  it('omits localRelPath when knowledgeBaseRoot is not configured', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'index-scan-norel-'));
+    temporaryRoots.push(root);
+    const mdPath = path.join(root, 'doc.md');
+    fs.writeFileSync(
+      mdPath,
+      `<!--
+feishu_sync:
+  obj_token: NoRelTok
+  original_link: https://example.feishu.cn/wiki/NoRel
+-->
+# Doc
+`,
+    );
+
+    const indexed: Array<Record<string, unknown>> = [];
+    const indexScanner = new IndexScanner({
+      localMapStore: {
+        upsertDocument: (document: Record<string, unknown>) => indexed.push(document),
+      },
+      larkCliClient: {},
+      config: {},
+    });
+
+    await indexScanner.scanKnowledgeBase(root);
+
+    expect(indexed).toHaveLength(1);
+    expect(indexed[0].objToken).toBe('NoRelTok');
+    expect(indexed[0]).not.toHaveProperty('localRelPath');
   });
 });

@@ -386,7 +386,38 @@ describe('llm test-channel route', () => {
     const body = await res.json();
     expect(body.success).toBe(false);
     expect(typeof body.error).toBe('string');
-    expect(body.error.toLowerCase()).toContain('apikey');
+    expect(body.error).toMatch(/api\s*key/i);
+  });
+
+  it('uses the persisted key when Settings sends the GET-mask sentinel', async () => {
+    const app = buildLlmDiApp({
+      configManager: {
+        load: async () => ({ llm: { apiKey: 'saved-key-must-not-leak' } }),
+      },
+    });
+    const res = await app.fetch(
+      new Request('http://x/api/llm/test-channel', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          channel: 'direct',
+          // A refused local endpoint avoids any real provider call. If the
+          // route treated `***` as the credential, this test would still
+          // leak the sentinel into a provider request; the implementation
+          // instead resolves it only in memory from ConfigManager.
+          llm: {
+            ...validLlm,
+            apiKey: '***',
+            openAiCompatBaseUrl: 'http://127.0.0.1:1/v1',
+          },
+          timeoutMs: 800,
+        }),
+      }),
+    );
+    const body = await res.json();
+    expect(body.success).toBe(false);
+    expect(body.error).not.toMatch(/apiKey is empty/i);
+    expect(JSON.stringify(body)).not.toContain('saved-key-must-not-leak');
   });
 
   it('direct channel with unreachable endpoint returns success=false (timeout/error), no apiKey in response', async () => {

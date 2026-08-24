@@ -27,6 +27,8 @@ import type { LocalMapStore } from './local-map-store.js';
 import type { SnapshotService } from './snapshot-service.js';
 import type { ConfigManager } from './config-manager.js';
 import type {
+  ChangedDocument,
+  DocumentRecord,
   DiffReport,
   MappingNode,
   ReorderRequest,
@@ -35,6 +37,16 @@ import type {
   WatchedRoot,
 } from '../types/index.js';
 
+/**
+ * The hierarchy evidence a persisted row needs before it may be planned as a
+ * new local file.  `null` deliberately means "unknown", not an empty chain:
+ * an empty chain is valid only for a direct child of the watched root.
+ */
+interface StoredParentChainProjection {
+  parentChainTitles: string[];
+  isWatchedRootNode: boolean;
+}
+
 export class MappingService {
   constructor(
     private changeDetector: ChangeDetector,
@@ -42,7 +54,7 @@ export class MappingService {
     private snapshotService: SnapshotService,
     /**
      * v0.2.0 structure-align Phase B: configManager is needed to read the
-     * current watchedRootUrls for the tree API response envelope. Kept
+     * current structured watchedRoots for the tree API response envelope. Kept
      * optional for backward compatibility with tests that construct the
      * service with the old 3-arg signature.
      */
@@ -53,7 +65,7 @@ export class MappingService {
    * Compute a full DiffReport for a wiki subtree (03 §3.6.2).
    *
    * Flow:
-   *   1. Delegate cloud traversal + three-state comparison to
+   *   1. Delegate a fast cloud metadata check + three-state comparison to
    *      ChangeDetector.detectChanges (which already upserts
    *      parent/space/obj_edit_time/last_seen_at metadata).
    *   2. Bucket changed documents by changeType.
@@ -64,31 +76,297 @@ export class MappingService {
    * did not enter the changed list (i.e. added/modified). deleted
    * nodes are local-side orphans and are NOT subtracted from
    * unchanged — they are surfaced in their own bucket per 03 §3.6.1.
-   */
+  */
   async computeDiff(rootUrl: string): Promise<DiffReport> {
-    const result = await this.changeDetector.detectChanges(rootUrl);
+    // Keep the legacy non-cached endpoint safe for older clients too: a
+    // diff is about whether known mapped files changed, not a request to
+    // rediscover the entire Wiki topology. Full reconciliation remains an
+    // explicit detect route mode.
+    const result = await this.changeDetector.detectChanges(rootUrl, { mode: 'fast' });
     const changed = result.changedDocuments;
 
     const added = changed.filter((c) => c.changeType === 'added');
     const modified = changed.filter((c) => c.changeType === 'modified');
     const deleted = changed.filter((c) => c.changeType === 'deleted');
 
+    // Custom-folder archive docs are not tied to any watched root, so they
+    // are read from SQLite (where detectCustomFolderChanges already wrote
+    // pending_modified state) and appended to the modified bucket.
+    const customModified = this.getCustomFolderModifiedDocs();
+
     // changed-in-cloud counts only added + modified (deleted are local
     // side orphans, not cloud-traversed nodes).
-    const changedInCloud = added.length + modified.length;
+    const changedInCloud = added.length + modified.length + customModified.length;
     const unchanged = Math.max(0, result.totalNodes - changedInCloud);
 
     const totalLocal = this.localMapStore.getAllDocuments().length;
 
     return {
       added,
-      modified,
+      modified: [...modified, ...customModified],
       deleted,
       unchanged,
-      totalCloud: result.totalNodes,
+      totalCloud: result.totalNodes + customModified.length,
       totalLocal,
       checkedAt: result.checkedAt,
     };
+  }
+
+  /**
+   * Return the last known diff from SQLite without contacting Feishu.
+   *
+   * UI rendering must never be the thing that starts a cloud traversal:
+   * Dashboard, status badges and the change list can all mount together.
+   * Detection is instead owned by the explicit detect endpoint / tray poller,
+   * which writes these persistent states first. This method is intentionally
+   * read-only and completes in constant local-DB time.
+   */
+  getStoredDiff(rootUrl: string): DiffReport {
+    const rootToken = this.rootTokenFromUrl(rootUrl);
+    const documents = this.localMapStore.getAllDocuments()
+      .filter((document) =>
+        document.watchedRootUrl === rootUrl || document.watchedRootId === rootToken,
+      );
+    // A previous implementation returned only flat document rows here. That
+    // discarded the parent-chain projection supplied by a successful full
+    // detect, so the ordinary UI flow (detect → cached diff → sync) lost the
+    // hierarchy and PathResolver correctly blocked every newly discovered
+    // non-root document as `missing_parent_chain`.
+    //
+    // Rebuild the chain from the authoritative persisted wiki topology. The
+    // resolver is deliberately fail-closed: a missing ancestor, duplicate
+    // wiki-node token, wrong root, or cycle yields null rather than a guessed
+    // root README path. An explicit full recovery still remains available for
+    // genuinely incomplete topology.
+    const hierarchyByObjToken = this.projectStoredParentChains(documents, rootToken);
+    const added: ChangedDocument[] = [];
+    const modified: ChangedDocument[] = [];
+    const deleted: ChangedDocument[] = [];
+    let checkedAt = '';
+
+    for (const document of documents) {
+      if (document.lastSeenAt && document.lastSeenAt > checkedAt) {
+        checkedAt = document.lastSeenAt;
+      }
+
+      const state = this.storedSyncState(document);
+      if (state === 'pending_added') {
+        added.push(this.toStoredChangedDocument(
+          document,
+          'added',
+          hierarchyByObjToken.get(document.objToken) ?? null,
+        ));
+      } else if (state === 'pending_modified') {
+        modified.push(this.toStoredChangedDocument(
+          document,
+          'modified',
+          hierarchyByObjToken.get(document.objToken) ?? null,
+        ));
+      } else if (
+        state === 'missing_candidate' ||
+        state === 'deleted_confirmed' ||
+        document.cloudDeleted === 1
+      ) {
+        deleted.push(this.toStoredChangedDocument(
+          document,
+          'deleted',
+          hierarchyByObjToken.get(document.objToken) ?? null,
+        ));
+      }
+    }
+
+    const liveCount = documents.filter((document) => document.cloudDeleted !== 1).length;
+
+    // Custom-folder archive docs are not scoped to any watched root. They
+    // are read globally and appended to the modified bucket (only
+    // pending_modified surfaces; added/deleted are not applicable to custom
+    // docs per the v1 design).
+    const customModified = this.getCustomFolderModifiedDocs();
+
+    return {
+      added,
+      modified: [...modified, ...customModified],
+      deleted,
+      unchanged: Math.max(0, liveCount - added.length - modified.length),
+      totalCloud: liveCount + customModified.length,
+      totalLocal: documents.length + customModified.length,
+      checkedAt,
+    };
+  }
+
+  private rootTokenFromUrl(rootUrl: string): string {
+    try {
+      return new URL(rootUrl).pathname.split('/').filter(Boolean).pop() || rootUrl;
+    } catch {
+      return rootUrl;
+    }
+  }
+
+  private storedSyncState(document: DocumentRecord): NonNullable<DocumentRecord['syncState']> {
+    if (document.syncState) return document.syncState;
+    if (document.cloudDeleted === 1) return 'missing_candidate';
+    if (document.status === 'error') return 'error';
+    if (document.status === 'placeholder') {
+      return document.cloudMatch === 'restricted' ? 'restricted' : 'pending_added';
+    }
+    return document.status === 'changed' ? 'pending_modified' : 'synced';
+  }
+
+  private toStoredChangedDocument(
+    document: DocumentRecord,
+    changeType: ChangedDocument['changeType'],
+    hierarchy: StoredParentChainProjection | null,
+  ): ChangedDocument {
+    const observed = document.observedObjEditTime ?? document.objEditTime ?? null;
+    const milliseconds = observed != null && observed < 100_000_000_000
+      ? observed * 1000
+      : observed;
+    return {
+      objToken: document.objToken,
+      objType: document.objType,
+      title: document.title,
+      changeType,
+      cloudModifiedTime: milliseconds != null && milliseconds > 0
+        ? new Date(milliseconds).toISOString()
+        : '',
+      localSyncedTime: document.lastSyncedAt || null,
+      localMdPath: document.localMdPath || null,
+      wikiNodeToken: document.wikiNodeToken ?? null,
+      parentNodeToken: document.parentNodeToken ?? null,
+      spaceId: document.spaceId ?? null,
+      watchedRootId: document.watchedRootId ?? null,
+      hasChild: document.hasChild ?? false,
+      observedObjEditTime: observed,
+      syncState: this.storedSyncState(document),
+      parentChainTitles: hierarchy?.parentChainTitles,
+      isWatchedRootNode: hierarchy?.isWatchedRootNode,
+      localRelPath: document.localRelPath ?? null,
+      customFolderId: document.customFolderId ?? null,
+    };
+  }
+
+  /**
+   * Read custom-folder documents that are currently pending_modified from
+   * SQLite and project them into ChangedDocument entries for the diff
+   * response. This is a pure local read — it never triggers cloud detection.
+   *
+   * Custom docs have no watched-root hierarchy, so parentChainTitles and
+   * isWatchedRootNode are left undefined. watchedRootId is null.
+   */
+  private getCustomFolderModifiedDocs(): ChangedDocument[] {
+    const docs = this.localMapStore.listAllCustomFolderDocs();
+    return docs
+      .filter((doc) => doc.syncState === 'pending_modified')
+      .map((doc) => this.toCustomChangedDocument(doc));
+  }
+
+  /**
+   * Project a custom-folder DocumentRecord into a ChangedDocument for the
+   * diff response. Only used for pending_modified docs.
+   */
+  private toCustomChangedDocument(doc: DocumentRecord): ChangedDocument {
+    const observed = doc.observedObjEditTime ?? doc.objEditTime ?? null;
+    const milliseconds = observed != null && observed < 100_000_000_000
+      ? observed * 1000
+      : observed;
+    return {
+      objToken: doc.objToken,
+      objType: doc.objType,
+      title: doc.title,
+      changeType: 'modified',
+      cloudModifiedTime: milliseconds != null && milliseconds > 0
+        ? new Date(milliseconds).toISOString()
+        : '',
+      localSyncedTime: doc.lastSyncedAt || null,
+      localMdPath: doc.localMdPath || null,
+      wikiNodeToken: doc.wikiNodeToken ?? null,
+      parentNodeToken: doc.parentNodeToken ?? null,
+      spaceId: doc.spaceId ?? null,
+      watchedRootId: null,
+      hasChild: doc.hasChild ?? false,
+      observedObjEditTime: observed,
+      syncState: doc.syncState,
+      localRelPath: doc.localRelPath ?? null,
+      customFolderId: doc.customFolderId ?? null,
+    };
+  }
+
+  /**
+   * Reconstruct parent chains for one watched root from persisted traversal
+   * observations. This performs no cloud requests and never invents a path
+   * from a local filename, which keeps cached-diff rendering safe.
+   */
+  private projectStoredParentChains(
+    documents: DocumentRecord[],
+    rootToken: string,
+  ): Map<string, StoredParentChainProjection | null> {
+    const byWikiNodeToken = new Map<string, DocumentRecord>();
+    const duplicateTokens = new Set<string>();
+    for (const document of documents) {
+      const token = document.wikiNodeToken?.trim();
+      if (!token) continue;
+      if (byWikiNodeToken.has(token)) duplicateTokens.add(token);
+      byWikiNodeToken.set(token, document);
+    }
+
+    const memo = new Map<string, StoredParentChainProjection | null>();
+    const visiting = new Set<string>();
+
+    const resolve = (document: DocumentRecord): StoredParentChainProjection | null => {
+      if (memo.has(document.objToken)) return memo.get(document.objToken) ?? null;
+      const nodeToken = document.wikiNodeToken?.trim();
+      const watchedRootId = document.watchedRootId ?? rootToken;
+      if (!nodeToken || !watchedRootId || duplicateTokens.has(nodeToken)) {
+        memo.set(document.objToken, null);
+        return null;
+      }
+      if (nodeToken === watchedRootId) {
+        const root = { parentChainTitles: [], isWatchedRootNode: true };
+        memo.set(document.objToken, root);
+        return root;
+      }
+      if (visiting.has(document.objToken)) {
+        memo.set(document.objToken, null);
+        return null;
+      }
+
+      const parentToken = document.parentNodeToken?.trim();
+      // A direct child needs no parent row: the configured root token itself
+      // is already sufficient proof that its ancestor chain is empty.
+      if (parentToken === watchedRootId) {
+        const directChild = { parentChainTitles: [], isWatchedRootNode: false };
+        memo.set(document.objToken, directChild);
+        return directChild;
+      }
+      if (!parentToken || duplicateTokens.has(parentToken)) {
+        memo.set(document.objToken, null);
+        return null;
+      }
+
+      const parent = byWikiNodeToken.get(parentToken);
+      if (!parent || (parent.watchedRootId ?? rootToken) !== watchedRootId || !parent.title.trim()) {
+        memo.set(document.objToken, null);
+        return null;
+      }
+
+      visiting.add(document.objToken);
+      const parentProjection = resolve(parent);
+      visiting.delete(document.objToken);
+      if (!parentProjection) {
+        memo.set(document.objToken, null);
+        return null;
+      }
+
+      const projection = {
+        parentChainTitles: [...parentProjection.parentChainTitles, parent.title],
+        isWatchedRootNode: false,
+      };
+      memo.set(document.objToken, projection);
+      return projection;
+    };
+
+    for (const document of documents) resolve(document);
+    return memo;
   }
 
   /**
@@ -179,22 +457,41 @@ export class MappingService {
       // local view must keep every row so LocalDirTreeView can show all
       // on-disk files (placeholder rows have local_path='' and are
       // naturally skipped by splitPath anyway).
+      // P2 Gate 2: keep restricted/pending placeholders visible even when
+      // title is empty — project a diagnostic display title instead of dropping.
       nodes = live
         .filter(
           (d) => d.wikiNodeToken != null && d.wikiNodeToken !== '',
         )
-        .filter((d) => (d.title ?? '').trim().length > 0)
-        .map((d) => this.projectNode(d, parentSet));
+        .map((d) => {
+          const node = this.projectNode(d, parentSet);
+          if (!(d.title ?? '').trim()) {
+            const state = d.syncState ?? d.status;
+            if (state === 'restricted' || d.cloudMatch === 'restricted' || d.status === 'placeholder') {
+              node.title = '(权限受限·占位)';
+              node.cloud_match = 'restricted';
+            } else if (
+              state === 'pending_added' ||
+              state === 'pending_modified' ||
+              state === 'missing_candidate'
+            ) {
+              node.title = node.title || `(${state})`;
+            } else {
+              node.title = node.title || '(未命名)';
+            }
+          }
+          return node;
+        });
     } else {
       // Local view: all rows (including local-only README/index).
       nodes = live.map((d) => this.projectNode(d, parentSet));
     }
 
     // watched_roots envelope (always present).
-    const configuredUrls = this.configManager?.getConfig()?.watchedRootUrls ?? [];
+    const configuredRoots = this.configManager?.getConfig()?.watchedRoots ?? [];
     const watchedRoots: WatchedRoot[] =
       typeof (this.localMapStore as any).getWatchedRoots === 'function'
-        ? (this.localMapStore as any).getWatchedRoots(configuredUrls)
+        ? (this.localMapStore as any).getWatchedRoots(configuredRoots)
         : [];
 
     // orphan_files only meaningful in local view.

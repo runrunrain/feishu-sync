@@ -2,7 +2,7 @@
  * ChangeListPanel - 变更列表三状态（T4 R2.3-AC1/AC2，04 §5）
  *
  * 4 tab：全部 / 新增 / 已修改 / 已删除。
- * 数据源 GET /api/mapping/diff（P2-T5 已有），按 changeType 分组。
+ * 数据源为已持久化的 GET /api/mapping/diff?cached=1，按 changeType 分组。
  * 删除项不进批量同步，单独显示「移入回收站 / 永久清理」。
  *
  * 选中状态由父组件持有（避免与 SyncView 之间重复定义），本组件
@@ -18,7 +18,7 @@ import { ChangeItem } from './ChangeItem';
 import { BatchActionBar } from './BatchActionBar';
 import { useToast } from './common/Toast';
 import { appLogger } from '../utils/appLogger';
-import { getMappingDiff } from '../api/client';
+import { getStoredMappingDiff } from '../api/client';
 import type { ChangedDocument, DiffReport, SheetSub } from '../types';
 import { isUsableWikiUrl } from '../utils/wikiUrl';
 
@@ -57,14 +57,16 @@ interface ChangeListPanelProps {
    * aggregation here so the change list matches the pending counter.
    *
    * When omitted or containing a single URL, the panel keeps the legacy
-   * single-root behaviour (one getMappingDiff call).
+   * single-root behaviour (one stored-diff call).
    */
   watchedRootUrls?: string[];
+  /** Incremented by SyncView after a structural repair or sync completes. */
+  reloadSignal?: number;
 }
 
 /**
  * Aggregate multiple per-root DiffReports into a single DiffReport-shaped
- * view model. The server-side `/api/mapping/diff` is per-root, so we fan
+ * view model. The server-side cached `/api/mapping/diff` is per-root, so we fan
  * out client-side and merge:
  *   - added/modified/deleted arrays are concatenated
  *   - unchanged/totalCloud/totalLocal are summed (counts)
@@ -81,6 +83,22 @@ async function fetchMultiRootDiff(
   const added: ChangedDocument[] = [];
   const modified: ChangedDocument[] = [];
   const deleted: ChangedDocument[] = [];
+  // Dedup by objToken: custom-folder (归档) docs are intentionally merged
+  // into EVERY root's stored diff server-side, so a naive concat repeats
+  // them once per watchedRoot (4 roots -> 4 identical rows).
+  const seen = { added: new Set<string>(), modified: new Set<string>(), deleted: new Set<string>() };
+  const pushUnique = (
+    bucket: ChangedDocument[],
+    seenTokens: Set<string>,
+    docs: ChangedDocument[],
+  ) => {
+    for (const doc of docs) {
+      const key = doc.objToken ?? `${doc.title}:${doc.localMdPath ?? ''}`;
+      if (seenTokens.has(key)) continue;
+      seenTokens.add(key);
+      bucket.push(doc);
+    }
+  };
   let unchanged = 0;
   let totalCloud = 0;
   let totalLocal = 0;
@@ -90,16 +108,16 @@ async function fetchMultiRootDiff(
   for (const url of rootUrls) {
     if (!isUsableWikiUrl(url)) continue;
     try {
-      const r = await getMappingDiff(url);
-      added.push(...r.added);
-      modified.push(...r.modified);
-      deleted.push(...r.deleted);
+      const r = await getStoredMappingDiff(url);
+      pushUnique(added, seen.added, r.added);
+      pushUnique(modified, seen.modified, r.modified);
+      pushUnique(deleted, seen.deleted, r.deleted);
       unchanged += r.unchanged ?? 0;
       totalCloud += r.totalCloud ?? 0;
       totalLocal += r.totalLocal ?? 0;
       if (r.checkedAt && r.checkedAt > checkedAt) checkedAt = r.checkedAt;
     } catch (err) {
-      appLogger.warn('change-list', 'getMappingDiff failed for root', { url, err });
+      appLogger.warn('change-list', 'getStoredMappingDiff failed for root', { url, err });
       failedRoots.push(url);
     }
   }
@@ -129,6 +147,7 @@ export function ChangeListPanel({
   onTrash,
   onPurge,
   watchedRootUrls,
+  reloadSignal = 0,
 }: ChangeListPanelProps) {
   const [tab, setTab] = useState<Tab>('all');
   const [diff, setDiff] = useState<DiffReport | null>(initialDiff ?? null);
@@ -167,7 +186,7 @@ export function ChangeListPanel({
           setLoading(false);
           return;
         }
-        report = await getMappingDiff(rootUrl);
+        report = await getStoredMappingDiff(rootUrl);
       }
       setDiff(report);
       onRefresh?.();
@@ -175,7 +194,7 @@ export function ChangeListPanel({
     } catch (err) {
       const msg = err instanceof Error ? err.message : '检测失败';
       setError(msg);
-      appLogger.error('change-list', 'getMappingDiff failed', err);
+      appLogger.error('change-list', 'getStoredMappingDiff failed', err);
       toast.push({
         type: 'error',
         message: '检测失败',
@@ -204,6 +223,20 @@ export function ChangeListPanel({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [diff, guardKey, loading, error]);
+
+  // A structural repair writes fresh topology into SQLite before the sync
+  // retry begins. Re-read the cached diff when the parent explicitly signals
+  // that update; rendering itself still never starts a cloud traversal.
+  const lastReloadSignal = useRef(reloadSignal);
+  useEffect(() => {
+    if (lastReloadSignal.current === reloadSignal) return;
+    lastReloadSignal.current = reloadSignal;
+    if (guardKey && !loading) {
+      void fetchDiff();
+    }
+    // fetchDiff intentionally closes over the current root configuration.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reloadSignal, guardKey]);
 
   const grouped = useMemo(() => {
     if (!diff) return { added: [], modified: [], deleted: [] as ChangedDocument[] };

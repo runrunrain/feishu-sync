@@ -17,8 +17,6 @@
  * adaptation (M3) are optional injections.
  */
 
-import { execFile } from 'child_process';
-import { promisify } from 'util';
 import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -28,15 +26,53 @@ import type {
   SyncOptions,
   SyncedDocument,
   FailedDocument,
+  PlannedSyncDocument,
+  SyncFailureReasonCode,
+  SyncRepairAction,
+  WatchedRootConfig,
 } from '../types/index.js';
-
-const execFileAsync = promisify(execFile);
+import {
+  completeOperationManifest,
+  createOperationManifest,
+  fallbackMarkdownTarget,
+  resolveOperationDirectory,
+  resolveSyncMode,
+  writeOperationManifest,
+} from './operation-manifest.js';
+import {
+  resolveAbsolute,
+  resolveLocalTarget,
+  toPortableRelative,
+} from './path-resolver.js';
+import { commitDocumentContent } from './content-commit.js';
+import type { DocumentIR } from './document-ir.js';
+import {
+  createAtomicCommitWorkspace,
+  rollbackAtomicPlan,
+} from './atomic-commit.js';
+import {
+  extractFeishuMediaReferences,
+  rewriteFeishuMediaReferences,
+} from './media-reference.js';
+import { adaptSlidesXmlToMarkdown } from './slides-xml-adapter.js';
+import { LarkCliError } from './lark-cli-client.js';
 
 interface FetchedDocument {
   content: string;
-  images: Array<{ token: string; url?: string }>;
+  images: Array<{
+    token: string;
+    url?: string;
+    name?: string;
+    kind: 'image' | 'whiteboard';
+  }>;
   attachments: Array<{ token: string; name: string }>;
   sheets: Array<{ token: string; title: string }>;
+  /** Slides XML media belongs to a page rather than a docs +fetch body span. */
+  slideMedia?: Array<{
+    token: string;
+    kind: 'image' | 'whiteboard';
+    slideNumber: number;
+  }>;
   url: string;
   obj_token: string;
 }
@@ -77,11 +113,29 @@ interface HeaderMeta {
 interface Image {
   token: string;
   path: string;
+  kind: 'image' | 'whiteboard';
 }
 
 interface Attachment {
   token: string;
   path: string;
+  name: string;
+}
+
+/** Test-only fault injection for Gate 3 SyncEngine apply path. */
+export interface SyncEngineTestHooks {
+  /** Fail after atomic file commit, before any DB write — must restore files. */
+  failAfterFileCommit?: boolean;
+  /**
+   * Fail after markDocumentSynced inside the DB transaction (e.g. after
+   * sheet_sheets upsert). Transaction must abort so synced baseline stays put
+   * and files must be restored.
+   */
+  failAfterMarkDocumentSynced?: boolean;
+  /** Fail before atomic file commit — KB must stay untouched. */
+  failBeforeCommit?: boolean;
+  /** After first successful sub-sheet CSV fetch, fail remaining sheets. */
+  failSheetAfterFirst?: boolean;
 }
 
 interface SyncEngineDeps {
@@ -90,19 +144,169 @@ interface SyncEngineDeps {
   config: any; // Config
   layoutReconstructor?: any; // Optional M3 injection
   contentAdapter?: any; // Optional M3 injection
+  testHooks?: SyncEngineTestHooks;
+}
+
+interface ClassifiedSyncFailure {
+  message: string;
+  retryable: boolean;
+  reasonCode: SyncFailureReasonCode;
+  suggestedResolution: string;
+  repairAction: SyncRepairAction;
+}
+
+/**
+ * A retry button is useful only for transient failures. Permission denial and
+ * a remotely deleted page require a user action in Feishu, so presenting them
+ * as endlessly retryable made the sync-result screen misleading.
+ */
+export function classifySyncFailure(error: unknown): ClassifiedSyncFailure {
+  if (error instanceof LarkCliError) {
+    if (error.code === 'permission') {
+      return {
+        message: '无权限访问该节点。请在飞书中将当前 lark-cli 用户加入该节点及其父级的可访问范围后重新检测。',
+        retryable: false,
+        reasonCode: 'permission_denied',
+        suggestedResolution: '请在飞书中把当前 lark-cli user 加入该节点及所有父级的可访问范围；授权后点击“立即检测”，再重试同步。',
+        repairAction: 'grant_access',
+      };
+    }
+    if (error.code === 'deleted') {
+      return {
+        message: '云端文档已删除或不再可编辑。请在飞书中选择有效节点后重新检测；此项不能通过重试恢复。',
+        retryable: false,
+        reasonCode: 'cloud_deleted',
+        suggestedResolution: '此云端页面已删除。请在飞书恢复或替换为有效页面；若确认删除，可在本地回收站保留或清理旧副本。',
+        repairAction: 'review_deleted',
+      };
+    }
+    if (error.code === 'rate_limited') {
+      return {
+        message: '飞书接口正在限流，已停止本次请求以避免继续放大流量。',
+        retryable: true,
+        reasonCode: 'rate_limited',
+        suggestedResolution: '等待短暂冷却后重试；应用会串行、低速执行请求，避免并发重放。',
+        repairAction: 'retry',
+      };
+    }
+    return {
+      message: error.message,
+      retryable: error.retryable,
+      reasonCode: 'upstream_error',
+      suggestedResolution: error.retryable
+        ? '可在网络或飞书服务恢复后重试；重试会串行执行，不会并发放大请求。'
+        : '请根据错误详情修正配置或云端状态后重新检测。',
+      repairAction: error.retryable ? 'retry' : 'manual_review',
+    };
+  }
+
+  const message = error instanceof Error ? error.message : String(error);
+  if (/(?:3380003|document page has been deleted|page can no longer be edited|文档.*已删除)/i.test(message)) {
+    return {
+      message: '云端文档已删除或不再可编辑。请在飞书中选择有效节点后重新检测；此项不能通过重试恢复。',
+      retryable: false,
+      reasonCode: 'cloud_deleted',
+      suggestedResolution: '此云端页面已删除。请在飞书恢复或替换为有效页面；若确认删除，可在本地回收站保留或清理旧副本。',
+      repairAction: 'review_deleted',
+    };
+  }
+  if (/(?:40403|131006|无权限|permission|forbidden|access denied)/i.test(message)) {
+    return {
+      message: '无权限访问该节点。请在飞书中将当前 lark-cli 用户加入该节点及其父级的可访问范围后重新检测。',
+      retryable: false,
+      reasonCode: 'permission_denied',
+      suggestedResolution: '请在飞书中把当前 lark-cli user 加入该节点及所有父级的可访问范围；授权后点击“立即检测”，再重试同步。',
+      repairAction: 'grant_access',
+    };
+  }
+  if (/(?:99991400|rate limit|qps|限频|限流)/i.test(message)) {
+    return {
+      message: '飞书接口正在限流，已停止本次请求以避免继续放大流量。',
+      retryable: true,
+      reasonCode: 'rate_limited',
+      suggestedResolution: '等待短暂冷却后重试；应用会串行、低速执行请求，避免并发重放。',
+      repairAction: 'retry',
+    };
+  }
+  return {
+    message,
+    retryable: true,
+    reasonCode: 'upstream_error',
+    suggestedResolution: '可在网络或飞书服务恢复后重试；重试会串行执行，不会并发放大请求。',
+    repairAction: 'retry',
+  };
+}
+
+/**
+ * These failures cannot be repaired by retrying local work.  They are queued
+ * separately so a detector poll does not keep surfacing them as new changes
+ * until an operator has acted in Feishu and explicitly requested a recheck.
+ */
+export function requiresFeishuSideAction(failure: Pick<FailedDocument, 'repairAction'>): boolean {
+  return failure.repairAction === 'grant_access'
+    || failure.repairAction === 'review_deleted'
+    || failure.repairAction === 'enable_export_adapter';
+}
+
+/** Convert a planning guard into the same actionable result contract as a runtime failure. */
+function plannedFailure(planned: PlannedSyncDocument): FailedDocument {
+  const reasonCode = planned.reasonCode ?? 'unknown';
+  const isAdoptableProfileCollision = reasonCode === 'path_conflict'
+    && /目标路径已有文件，拒绝自动覆盖/i.test(planned.reason ?? '');
+  const repairAction: SyncRepairAction = reasonCode === 'missing_parent_chain'
+    ? 'rebuild_parent_chain'
+    : isAdoptableProfileCollision
+      ? 'adopt_existing_file'
+      : reasonCode === 'unsupported_type'
+        ? 'enable_export_adapter'
+        : reasonCode === 'deleted_requires_confirmation'
+          ? 'review_deleted'
+          : 'manual_review';
+  const fallbackMessage = planned.action === 'move'
+    ? '计划涉及路径移动，需通过独立迁移流程确认'
+    : '同步计划被安全策略阻止';
+  const fallbackResolution = reasonCode === 'missing_parent_chain'
+    ? '可使用“自动补齐结构并重试”：应用会完整遍历受影响根目录，补齐父链后仅重试这些文档。'
+    : isAdoptableProfileCollision
+      ? '若该文件确为同名飞书文档的旧同步版本，可点击“认领本地旧文件并同步”。系统会校验 Markdown 标题完全一致后才会覆盖。'
+    : reasonCode === 'unsupported_type'
+      ? '当前对象类型没有可用导出适配器。请转换为支持的飞书文档、表格或幻灯片，或启用对应导出适配器后再同步。'
+      : '请按路径冲突或云端状态提示处理后，再重新生成同步计划。';
+  return {
+    objToken: planned.objToken,
+    title: planned.title,
+    error: planned.reason || fallbackMessage,
+    retryable: false,
+    reasonCode,
+    suggestedResolution: planned.suggestedResolution || fallbackResolution,
+    repairAction,
+    watchedRootId: planned.watchedRootId ?? null,
+  };
 }
 
 export class SyncEngine {
+  private larkCliClient: any;
   private localMapStore: any;
   private config: any;
   private layoutReconstructor?: any;
   private contentAdapter?: any;
+  private testHooks: SyncEngineTestHooks;
 
   constructor(deps: SyncEngineDeps) {
+    this.larkCliClient = deps.larkCliClient;
     this.localMapStore = deps.localMapStore;
     this.config = deps.config;
     this.layoutReconstructor = deps.layoutReconstructor;
     this.contentAdapter = deps.contentAdapter;
+    this.testHooks = deps.testHooks ?? {};
+  }
+
+  /** All Feishu subprocess work is delegated to the injected client. */
+  private requireLarkCliClient(): any {
+    if (!this.larkCliClient) {
+      throw new Error('LarkCliClient 未注入：无法执行飞书读取或资源导出');
+    }
+    return this.larkCliClient;
   }
 
   /**
@@ -113,15 +317,80 @@ export class SyncEngine {
     options: SyncOptions
   ): Promise<SyncResult> {
     const startedAt = new Date().toISOString();
+    const requestedMode = resolveSyncMode(options);
+    // P3: apply goes through commitDocumentContent (staging + atomic rename).
+    const mode = requestedMode;
+    const manifest = createOperationManifest({
+      knowledgeBaseRoot: this.config.knowledgeBaseRoot,
+      documents,
+      mode,
+      watchedRoots: Array.isArray(this.config?.watchedRoots)
+        ? this.config.watchedRoots
+        : [],
+      adoptExistingProfileTargets: options.adoptExistingProfileTargets === true,
+    });
+    const operationDirectory = resolveOperationDirectory(
+      this.config.knowledgeBaseRoot,
+      this.config.operationManifestDir,
+    );
+    // Creating this record is deliberately the first observable side effect
+    // of an operation. A failed manifest write blocks apply rather than
+    // allowing an untraceable filesystem mutation.
+    const manifestPath = writeOperationManifest(manifest, operationDirectory);
+
     const syncedDocuments: SyncedDocument[] = [];
     const failedDocuments: FailedDocument[] = [];
 
-    for (const doc of documents) {
+    if (mode === 'dry-run') {
+      for (const planned of manifest.documents) {
+        if (planned.action === 'blocked' || planned.action === 'move') {
+          failedDocuments.push(plannedFailure(planned));
+        }
+      }
+
+      const completedAt = new Date().toISOString();
+      const result: SyncResult = {
+        success: failedDocuments.length === 0,
+        syncedDocuments,
+        failedDocuments,
+        startedAt,
+        completedAt,
+        duration: new Date(completedAt).getTime() - new Date(startedAt).getTime(),
+        mode,
+        operationId: manifest.operationId,
+        manifestPath,
+        plannedDocuments: manifest.documents,
+      };
+      completeOperationManifest(manifest, manifestPath, {
+        succeeded: 0,
+        failed: failedDocuments.length,
+      });
+      return result;
+    }
+
+    for (let index = 0; index < documents.length; index += 1) {
+      const doc = documents[index];
+      const planned = manifest.documents[index];
+      // A move is evidence for a separate, explicitly confirmed migration;
+      // ordinary sync may only create or replace a reviewed body.
+      if (planned.action === 'blocked' || planned.action === 'move' || !planned.localMdPath) {
+        const failure = plannedFailure(planned);
+        failedDocuments.push(failure);
+        this.queueFeishuSideFailure(failure);
+        continue;
+      }
+
       try {
-        const result = await this.syncSingleDocument(doc, options);
+        // Apply uses exactly the target that was independently reviewed in
+        // the manifest; it must not recompute a potentially different path.
+        const result = await this.syncSingleDocument(
+          { ...doc, localMdPath: planned.localMdPath },
+          options,
+        );
         syncedDocuments.push(result);
       } catch (error) {
-        const errMsg = error instanceof Error ? error.message : String(error);
+        const failure = classifySyncFailure(error);
+        const errMsg = failure.message;
         const errStack = error instanceof Error && error.stack ? error.stack : '';
         // 同步失败日志落盘（诊断报告 §4.3）：当前无任何磁盘日志，失败根因
         // 只能静态推测。这里把单文档失败的堆栈追加到
@@ -135,36 +404,76 @@ export class SyncEngine {
         } catch (logError) {
           console.error('[SyncEngine] failed to append sync-errors.log:', logError);
         }
-        failedDocuments.push({
+        const failedDocument: FailedDocument = {
           objToken: doc.objToken,
           title: doc.title,
           error: errMsg,
-          retryable: true,
-        });
+          retryable: failure.retryable,
+          reasonCode: failure.reasonCode,
+          suggestedResolution: failure.suggestedResolution,
+          repairAction: failure.repairAction,
+          watchedRootId: doc.watchedRootId ?? planned.watchedRootId ?? null,
+        };
+        failedDocuments.push(failedDocument);
+        // Custom-folder docs are not tied to a watched root. The feishu_pending
+        // queue is filtered by watched_root_id in the UI, so entries with a
+        // NULL watched_root_id would be invisible. Keep custom doc failures
+        // as normal error-classified failures instead of enqueuing them.
+        if (!doc.customFolderId) {
+          this.queueFeishuSideFailure(failedDocument);
+        }
       }
     }
 
     const completedAt = new Date().toISOString();
     const duration = new Date(completedAt).getTime() - new Date(startedAt).getTime();
 
-    // Log sync operation
-    this.localMapStore.logSync({
+    const result: SyncResult = {
       success: failedDocuments.length === 0,
       syncedDocuments,
       failedDocuments,
       startedAt,
       completedAt,
       duration,
+      mode,
+      operationId: manifest.operationId,
+      manifestPath,
+      plannedDocuments: manifest.documents,
+    };
+
+    // Logging is not part of the content transaction. Do not turn a
+    // successful write into an API error merely because observability is
+    // degraded; the operation manifest remains the recovery record.
+    try {
+      this.localMapStore.logSync(result);
+    } catch (error) {
+      console.error('[SyncEngine] failed to write sync log:', error);
+    }
+    completeOperationManifest(manifest, manifestPath, {
+      succeeded: syncedDocuments.length,
+      failed: failedDocuments.length,
     });
 
-    return {
-      success: failedDocuments.length === 0,
-      syncedDocuments,
-      failedDocuments,
-      startedAt,
-      completedAt,
-      duration,
-    };
+    return result;
+  }
+
+  /** Best-effort queue write; a database diagnostic failure must not mask the original sync error. */
+  private queueFeishuSideFailure(failure: FailedDocument): void {
+    if (!requiresFeishuSideAction(failure)) return;
+    if (typeof this.localMapStore?.recordFeishuPending !== 'function') return;
+    try {
+      this.localMapStore.recordFeishuPending({
+        objToken: failure.objToken,
+        title: failure.title,
+        watchedRootId: failure.watchedRootId ?? null,
+        reasonCode: failure.reasonCode ?? 'unknown',
+        error: failure.error,
+        suggestedResolution: failure.suggestedResolution ?? '请完成飞书侧处理后点击“处理后重新检测”。',
+        repairAction: failure.repairAction ?? 'manual_review',
+      });
+    } catch (error) {
+      console.warn('[SyncEngine] failed to record Feishu-side pending item:', error);
+    }
   }
 
   /**
@@ -184,7 +493,6 @@ export class SyncEngine {
     //      此处构造空 content 的 FetchedDocument，后续 step 5/6 由
     //      sheet 子表的 CSV 经 LayoutReconstructor 重构生成 markdown。
     let fetched: FetchedDocument;
-    let isPlaceholder = false;
 
     if (doc.objType === 'sheet') {
       console.info(
@@ -199,20 +507,35 @@ export class SyncEngine {
         url: '',
         obj_token: doc.objToken,
       };
+    } else if (doc.objType === 'slides') {
+      // docs +fetch is docx-only. Slides must use the dedicated XML API; a
+      // read/export failure is surfaced as a failed sync instead of being
+      // recorded as a successful metadata placeholder.
+      fetched = await this.fetchSlidesContent(doc.objToken, doc.title);
     } else {
       try {
         fetched = await this.fetchDocumentContent(doc.objToken, doc.objType);
       } catch (error) {
-        // Check if this is a 40403 no permission error
-        if (error instanceof Error && error.message.includes('40403')) {
-          console.warn(`[SyncEngine] No permission for document ${doc.title}, creating placeholder`);
-          isPlaceholder = true;
+        // A permission failure is actionable only in Feishu.  Do not create
+        // an empty placeholder and falsely report the document as synced;
+        // the outer batch classifier moves it into the durable Feishu queue.
+        if (error instanceof Error && /(?:40403|131006|无权限|permission|forbidden|access denied)/i.test(error.message)) {
+          throw error;
+        } else if (
+          error instanceof Error &&
+          (error.message.includes('3380002') || error.message.includes('Unsupported document type'))
+        ) {
+          console.warn(
+            `[SyncEngine] Unsupported fetch type for ${doc.title}, writing metadata body`,
+          );
           fetched = {
-            content: '',
+            content:
+              `# ${doc.title}\n\n` +
+              `> 云端类型 \`${doc.objType}\` 无法用 docs+fetch 导出正文，已保留元数据占位。\n`,
             images: [],
             attachments: [],
             sheets: [],
-            url: doc.localMdPath || '', // Will be filled in writePlaceholder
+            url: '',
             obj_token: doc.objToken,
           };
         } else {
@@ -221,68 +544,78 @@ export class SyncEngine {
       }
     }
 
-    // For placeholder files, create a placeholder .md and mark in local map
-    if (isPlaceholder) {
-      const localMdPath = doc.localMdPath || this.generateLocalPath(doc);
-      await this.writePlaceholderFile(localMdPath, doc);
-      await this.updateLocalMapWithStatus(doc.objToken, localMdPath, doc.cloudModifiedTime, doc.objType, 'placeholder');
-      return {
-        objToken: doc.objToken,
-        title: doc.title,
-        localMdPath,
-        cloudModifiedTime: doc.cloudModifiedTime,
-        size: 0,
-        imagesCount: 0,
-        attachmentsCount: 0,
-        sheetsCount: 0,
-      };
+    // 2–5. Prepare content entirely outside the knowledge base.
+    // Media and CSV land only under operation staging / OS temp until the
+    // atomic commit swaps them into the final target (Gate 3 all-or-nothing).
+    const localMdPath = doc.localMdPath || this.generateLocalPath(doc);
+    const operationDirectory = resolveOperationDirectory(
+      this.config.knowledgeBaseRoot,
+      this.config.operationManifestDir,
+    );
+    const operationId = `doc-${doc.objToken.slice(0, 12)}-${Date.now()}`;
+    const { stagingRoot } = createAtomicCommitWorkspace({
+      operationId,
+      knowledgeBaseRoot: this.config.knowledgeBaseRoot,
+      operationDirectory,
+    });
+    const relativeMd =
+      toPortableRelative(this.config.knowledgeBaseRoot, localMdPath) ||
+      path.basename(localMdPath);
+    const relativeDir = relativeMd.includes('/')
+      ? relativeMd.slice(0, relativeMd.lastIndexOf('/'))
+      : '';
+    const stagingDocDir = relativeDir
+      ? path.join(stagingRoot, ...relativeDir.split('/'))
+      : stagingRoot;
+    fs.mkdirSync(stagingDocDir, { recursive: true });
+
+    const images = await this.downloadImages(fetched, stagingDocDir);
+    const attachments = await this.downloadAttachments(fetched, stagingDocDir);
+
+    const localMediaReferences = new Map<string, string>();
+    for (const image of images) {
+      localMediaReferences.set(image.token, `images/${path.basename(image.path)}`);
+    }
+    for (const attachment of attachments) {
+      localMediaReferences.set(attachment.token, `attachments/${path.basename(attachment.path)}`);
+    }
+    let expandedContent = this.renderLocalizedMediaReferences(
+      rewriteFeishuMediaReferences(fetched.content, localMediaReferences),
+    );
+    if (fetched.slideMedia && fetched.slideMedia.length > 0) {
+      expandedContent = this.appendSlidesMediaReferences(
+        expandedContent,
+        fetched.slideMedia,
+        localMediaReferences,
+      );
     }
 
-    // 2. Download images (three-tier fallback)
-    const localMdPath = doc.localMdPath || this.generateLocalPath(doc);
-    const saveDir = path.dirname(localMdPath);
-    const images = await this.downloadImages(fetched, saveDir);
-
-    // 3. Download attachments
-    const attachments = await this.downloadAttachments(fetched, saveDir);
-
-    // 4. Synced-block expansion (R3.9 / M2-B): NOT implemented.
-    //    P0-Q3 实测 confirmed Feishu markdown export contains no
-    //    <synced_reference> tags in this deployment, so this step is a
-    //    no-op (content flows through unchanged).
-    const expandedContent = fetched.content;
-
-    // 5. Export sheets if applicable (v0.2.0: also map sub-sheets to
-    //    the sheet_sheets table for finer-grained change detection)
-    const sheets: Array<{ sheetId: string; title: string; csvPath: string }> = [];
+    const sheets: Array<{ sheetId: string; title: string; csvPath: string; csvRel: string }> = [];
     if (doc.objType === 'sheet') {
-      // P1 修复: csvDataDir 约定 = `{docname}.csv-data/`（与 fetch-feishu-doc
-      // skill 约定对齐，根治旧 `csv-data/` 单目录的 tech debt）。docname
-      // 来自 localMdPath 去扩展名（与 generateHtmlHeader / upsertDocument
-      // 的 title 字段语义一致）。
       const docname = path.basename(localMdPath, '.md');
-      const exportedSheets = await this.exportSheetsAndMap(doc.objToken, saveDir, docname);
+      const exportedSheets = await this.exportSheetsToStaging(
+        doc.objToken,
+        stagingDocDir,
+        docname,
+      );
       sheets.push(...exportedSheets);
     }
 
-    // 6. Table reconstruction (M3 - apply to exported sheets)
+    // 6. Table reconstruction — any sub-sheet failure aborts the document.
     let finalContent = expandedContent;
     if (this.layoutReconstructor && sheets.length > 0) {
-      // Reconstruct each sheet and append to content
       const reconstructedSheets: string[] = [];
       for (const sheet of sheets) {
-        try {
-          const reconstructedMarkdown = await this.layoutReconstructor.reconstructToMarkdown(sheet.csvPath);
-          reconstructedSheets.push(`## ${sheet.title}\n\n${reconstructedMarkdown}`);
-          console.info(`[SyncEngine] Reconstructed sheet "${sheet.title}" from ${sheet.csvPath}`);
-        } catch (error) {
-          console.warn(`[SyncEngine] Failed to reconstruct sheet "${sheet.title}":`, error);
-          // Continue with other sheets on failure
-        }
+        const reconstructedMarkdown = await this.layoutReconstructor.reconstructToMarkdown(
+          sheet.csvPath,
+        );
+        reconstructedSheets.push(
+          `## 子表: ${sheet.title}\n\n[CSV 原始数据](${sheet.csvRel})\n\n${reconstructedMarkdown}`,
+        );
+        console.info(`[SyncEngine] Reconstructed sheet "${sheet.title}" from ${sheet.csvPath}`);
       }
-      // Append reconstructed sheets to content
       if (reconstructedSheets.length > 0) {
-        finalContent = expandedContent + '\n\n' + reconstructedSheets.join('\n\n---\n\n');
+        finalContent = reconstructedSheets.join('\n\n---\n\n');
       }
     }
 
@@ -325,12 +658,14 @@ export class SyncEngine {
               enableStreaming: false,
               // Surface the LLM timeout as a config knob (LlmConfig.timeoutMs,
               // default 600000ms = 10 min). The previous hard-coded 60s was
-              // too aggressive for bigmodel glm-5.2[1m] under load; raising
+              // too aggressive for bigmodel glm-5.2 under load; raising
               // the ceiling here lets the primary channel finish instead of
               // prematurely aborting to the fallback. Channels still clamp
               // this value via their own resolveOptions when the caller
               // omits it.
-              timeoutMs: this.config.llm.timeoutMs ?? 600_000,
+              timeoutMs: this.config.llm.primaryChannel === 'opencode'
+                ? this.config.llm.opencode?.timeoutMs ?? this.config.llm.timeoutMs ?? 600_000
+                : this.config.llm.timeoutMs ?? 600_000,
             },
           }
         );
@@ -364,17 +699,140 @@ export class SyncEngine {
       }
     }
 
-    // 8. Write local markdown file
-    //    Resolve header metadata BEFORE writing so the YAML header
-    //    carries wiki_node_token / space_id / original_link even for the
-    //    sheet path (where fetched.url is empty — see resolveHeaderMeta
-    //    for the SQLite-fallback + host-construction that fixes the
-    //    historic `节点: unknown` / `原始链接:` empty defect).
+    // 8. Atomic content commit: only this step mutates knowledge-base files.
     const headerMeta = this.resolveHeaderMeta(doc, fetched);
-    await this.writeLocalMarkdown(localMdPath, finalContent, headerMeta);
+    if (process.env.FEISHU_SYNC_LEGACY_WRITE === '1') {
+      await this.writeLocalMarkdown(localMdPath, finalContent, headerMeta);
+      await this.updateLocalMap(doc, localMdPath);
+    } else {
+      const ir: DocumentIR = {
+        objToken: doc.objToken,
+        wikiNodeToken: headerMeta.wikiNodeToken,
+        spaceId: headerMeta.spaceId,
+        objType: doc.objType,
+        title: doc.title,
+        originalLink: headerMeta.originalLink,
+        observedObjEditTime: doc.observedObjEditTime ?? null,
+        bodyMarkdown: finalContent,
+        images: images.map((img) => ({
+          relativePath: `images/${path.basename(img.path)}`,
+          token: img.token,
+        })),
+        attachments: attachments.map((att) => ({
+          relativePath: `attachments/${path.basename(att.path)}`,
+          name: att.name,
+          token: att.token,
+        })),
+        sheets: sheets.map((sheet) => ({
+          sheetId: sheet.sheetId,
+          title: sheet.title,
+          csvRelativePath: sheet.csvRel,
+          csvContent: fs.readFileSync(sheet.csvPath, 'utf-8'),
+        })),
+      };
+      const extraFiles: Array<{ relativePath: string; absoluteSource: string }> = [];
+      for (const img of images) {
+        const name = path.basename(img.path);
+        extraFiles.push({
+          relativePath: relativeDir ? `${relativeDir}/images/${name}` : `images/${name}`,
+          absoluteSource: img.path,
+        });
+      }
+      for (const att of attachments) {
+        const name = path.basename(att.path);
+        extraFiles.push({
+          relativePath: relativeDir
+            ? `${relativeDir}/attachments/${name}`
+            : `attachments/${name}`,
+          absoluteSource: att.path,
+        });
+      }
 
-    // 9. Update local mapping
-    await this.updateLocalMap(doc.objToken, localMdPath, doc.cloudModifiedTime, doc.objType);
+      const commit = commitDocumentContent({
+        operationId,
+        knowledgeBaseRoot: this.config.knowledgeBaseRoot,
+        operationDirectory,
+        localMdPath,
+        ir,
+        extraFiles,
+        failBeforeCommit: this.testHooks.failBeforeCommit === true,
+        // failAfterFileCommit is handled here so DB linkage can roll files back.
+      });
+      if (!commit.ok) {
+        throw new Error(commit.error || '原子内容提交失败');
+      }
+
+      // 9. DB baseline + sheet_sheets only after files are committed.
+      //    All DB writes run in one SQLite transaction so a mid-DB failure
+      //    cannot advance synced_obj_edit_time while leaving sheet_sheets
+      //    half-written (or vice versa). Any failure also restores prior files.
+      try {
+        if (this.testHooks.failAfterFileCommit) {
+          throw new Error('注入失败：文件提交后数据库事务失败');
+        }
+
+        const applyDbWrites = (): void => {
+          const nowIso = new Date().toISOString();
+          // Sheet rows first; synced baseline is the final commit marker.
+          for (const sheet of sheets) {
+            const finalCsv = path.join(
+              path.dirname(localMdPath),
+              ...sheet.csvRel.split('/'),
+            );
+            if (typeof this.localMapStore.upsertSheetSheet === 'function') {
+              this.localMapStore.upsertSheetSheet({
+                sheetObjToken: doc.objToken,
+                sheetId: sheet.sheetId,
+                sheetTitle: sheet.title,
+                localCsvPath: finalCsv,
+                lastSyncedModifyTime: nowIso,
+                status: 'synced',
+              });
+            }
+          }
+          // Synchronous DB writes only — must stay inside the SQLite transaction.
+          this.localMapStore.upsertDocument({
+            objToken: doc.objToken,
+            wikiNodeToken: doc.wikiNodeToken ?? null,
+            objType: doc.objType,
+            title: doc.title,
+            localMdPath,
+            lastSyncedModifyTime: doc.cloudModifiedTime,
+            lastSyncedAt: nowIso,
+            status: 'synced',
+            localRelPath:
+              toPortableRelative(this.config.knowledgeBaseRoot, localMdPath) ??
+              null,
+            watchedRootId: doc.watchedRootId ?? null,
+          });
+          if (typeof this.localMapStore.markDocumentSynced === 'function') {
+            this.localMapStore.markDocumentSynced({
+              objToken: doc.objToken,
+              syncedObjEditTime: doc.observedObjEditTime ?? null,
+              localMdPath,
+              lastSyncedModifyTime: doc.cloudModifiedTime,
+              lastSyncedAt: nowIso,
+            });
+          }
+          if (this.testHooks.failAfterMarkDocumentSynced) {
+            throw new Error(
+              '注入失败：markDocumentSynced 之后 sheet/DB 事务中止',
+            );
+          }
+        };
+
+        if (typeof this.localMapStore.withTransaction === 'function') {
+          this.localMapStore.withTransaction(applyDbWrites);
+        } else {
+          applyDbWrites();
+        }
+      } catch (dbError) {
+        rollbackAtomicPlan(commit.plan);
+        throw dbError instanceof Error
+          ? dbError
+          : new Error(String(dbError));
+      }
+    }
 
     return {
       objToken: doc.objToken,
@@ -397,32 +855,81 @@ export class SyncEngine {
   ): Promise<FetchedDocument> {
     // Suppress unused parameter warning
     void objType;
-    const args = [
-      'docs',
-      '+fetch',
-      '--api-version', 'v2',
-      '--doc', objToken,
-      '--doc-format', 'markdown',
-      '--detail', 'simple',
-    ];
-
-    const result = await this.execLarkCli(args);
+    const result = await this.requireLarkCliClient().fetchDocumentMarkdown(objToken);
+    const document = result.data.document ?? {};
+    const content = typeof document.content === 'string' ? document.content : '';
+    const mediaReferences = extractFeishuMediaReferences(content);
 
     return {
-      content: result.data.document?.content || '',
-      images: result.data.document?.images || [],
-      attachments: result.data.document?.attachments || [],
-      sheets: result.data.document?.sheets || [],
-      url: result.data.document?.url || '',
+      content,
+      // docs +fetch v2 returns content/document_id/revision_id, not the
+      // legacy images/attachments arrays. Derive the media plan from the
+      // authoritative Markdown/XML body so every downloaded resource can be
+      // rewritten to its committed local path.
+      images: mediaReferences
+        .filter((reference) => reference.kind === 'image' || reference.kind === 'whiteboard')
+        .map((reference) => ({
+          token: reference.token,
+          url: reference.sourceUrl ?? undefined,
+          name: reference.filename ?? undefined,
+          kind: reference.kind === 'whiteboard' ? 'whiteboard' : 'image',
+        })),
+      attachments: mediaReferences
+        .filter((reference) => reference.kind === 'attachment')
+        .map((reference) => ({
+          token: reference.token,
+          name: reference.filename || reference.token,
+        })),
+      sheets: Array.isArray(document.sheets) ? document.sheets : [],
+      url: typeof document.url === 'string' ? document.url : '',
+      obj_token: objToken,
+    };
+  }
+
+  /** Fetch Slides XML and project it to Markdown without a metadata fallback. */
+  private async fetchSlidesContent(
+    objToken: string,
+    title: string,
+  ): Promise<FetchedDocument> {
+    const result = await this.requireLarkCliClient().fetchSlidesXml(objToken);
+    const xml = result?.data?.xml_presentation?.content;
+    if (typeof xml !== 'string' || xml.trim().length === 0) {
+      throw new Error('Slides API 未返回 presentation XML，拒绝写入占位正文');
+    }
+
+    const adapted = adaptSlidesXmlToMarkdown(xml, title);
+    const tokenPattern = /^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/;
+    const slideMedia = adapted.mediaReferences.filter((reference) => {
+      if (tokenPattern.test(reference.token)) return true;
+      console.warn(
+        `[SyncEngine] Ignoring non-token Slides ${reference.kind} reference on slide ${reference.slideNumber}`,
+      );
+      return false;
+    });
+
+    return {
+      content: adapted.markdown,
+      images: [
+        ...adapted.imageTokens
+          .filter((token) => tokenPattern.test(token))
+          .map((token) => ({ token, kind: 'image' as const })),
+        ...adapted.whiteboardTokens
+          .filter((token) => tokenPattern.test(token))
+          .map((token) => ({ token, kind: 'whiteboard' as const })),
+      ],
+      attachments: [],
+      sheets: [],
+      slideMedia,
+      url: '',
       obj_token: objToken,
     };
   }
 
   /**
-   * Download images with three-tier fallback strategy
-   * Tier 1: If image has URL, use curl
-   * Tier 2: If only token, use media-download
-   * Tier 3: If cross-origin 403, fallback to media-preview
+   * Download image/whiteboard resources into staging. Feishu currently
+   * returns HTTP 403 from media-download for some normal image tokens while
+   * media-preview succeeds; whiteboards are the inverse special case and
+   * must use media-download --type whiteboard.
    */
   private async downloadImages(
     doc: FetchedDocument,
@@ -438,30 +945,45 @@ export class SyncEngine {
 
     for (let i = 0; i < doc.images.length; i++) {
       const img = doc.images[i];
-      const filename = `${String(i + 1).padStart(2, '0')}-${img.token}.png`;
-      const filepath = path.join(imagesDir, filename);
+      // Deliberately omit an extension. lark-cli derives the correct suffix
+      // from Content-Type and returns saved_path; hard-coding .png previously
+      // mislabeled JPEG whiteboards and made absolute --output invalid.
+      const outputStem = path.join(
+        imagesDir,
+        `${String(i + 1).padStart(2, '0')}-${img.token}`,
+      );
 
       try {
-        if (img.url) {
-          // Tier 1: Download with curl if URL is available
-          await this.execCurl(filepath, img.url);
-        } else {
-          // Tier 2: Use media-download if only token is available
-          await this.execMediaDownload(filepath, img.token);
+        const filepath = await this.execMediaDownload(
+          outputStem,
+          img.token,
+          img.kind === 'whiteboard' ? 'whiteboard' : 'media',
+        );
+        this.assertDownloadedMedia(filepath, img.token);
+        images.push({ token: img.token, path: filepath, kind: img.kind });
+      } catch (downloadError) {
+        if (img.kind === 'whiteboard') {
+          throw downloadError instanceof Error
+            ? downloadError
+            : new Error(String(downloadError));
         }
-        images.push({ token: img.token, path: filepath });
-      } catch (error) {
-        // Tier 3: Fallback to media-preview if media-download fails
         try {
-          if (!img.url) {
-            await this.execMediaPreview(filepath, img.token);
-            images.push({ token: img.token, path: filepath });
-          } else {
-            throw error; // Re-throw if curl failed
-          }
+          const filepath = await this.execMediaPreview(outputStem, img.token);
+          this.assertDownloadedMedia(filepath, img.token);
+          images.push({ token: img.token, path: filepath, kind: img.kind });
         } catch (previewError) {
-          console.warn(`[SyncEngine] Failed to download image ${img.token}:`, previewError);
-          // Continue with other images on failure
+          // A direct Feishu URL is optional metadata, not our primary
+          // transport. It is retained as the last fallback for deployments
+          // where both CLI shortcuts reject an otherwise readable resource.
+          if (img.url) {
+            const filepath = await this.downloadUrlToFile(outputStem, img.url);
+            this.assertDownloadedMedia(filepath, img.token);
+            images.push({ token: img.token, path: filepath, kind: img.kind });
+          } else {
+            throw previewError instanceof Error
+              ? previewError
+              : new Error(String(previewError));
+          }
         }
       }
     }
@@ -470,7 +992,9 @@ export class SyncEngine {
   }
 
   /**
-   * Download attachments using media-download
+   * Download attachments into staging. The same 403 -> preview fallback is
+   * used for normal media; filenames from cloud content are never used as a
+   * destination path, preventing traversal and collision hazards.
    */
   private async downloadAttachments(
     doc: FetchedDocument,
@@ -484,16 +1008,25 @@ export class SyncEngine {
       fs.mkdirSync(attachmentsDir, { recursive: true });
     }
 
-    for (const attachment of doc.attachments) {
-      const filepath = path.join(attachmentsDir, attachment.name);
+    for (let index = 0; index < doc.attachments.length; index += 1) {
+      const attachment = doc.attachments[index];
+      const outputStem = path.join(
+        attachmentsDir,
+        `${String(index + 1).padStart(2, '0')}-${attachment.token}`,
+      );
 
+      let filepath: string;
       try {
-        await this.execMediaDownload(filepath, attachment.token);
-        attachments.push({ token: attachment.token, path: filepath });
-      } catch (error) {
-        console.warn(`[SyncEngine] Failed to download attachment ${attachment.token}:`, error);
-        // Continue with other attachments on failure
+        filepath = await this.execMediaDownload(outputStem, attachment.token, 'media');
+      } catch {
+        filepath = await this.execMediaPreview(outputStem, attachment.token);
       }
+      this.assertDownloadedMedia(filepath, attachment.token);
+      attachments.push({
+        token: attachment.token,
+        path: filepath,
+        name: attachment.name,
+      });
     }
 
     return attachments;
@@ -535,100 +1068,83 @@ export class SyncEngine {
    * Update local mapping in database
    */
   private async updateLocalMap(
-    objToken: string,
+    doc: ChangedDocument,
     localMdPath: string,
-    cloudModifiedTime: string,
-    objType: string
   ): Promise<void> {
-    await this.updateLocalMapWithStatus(objToken, localMdPath, cloudModifiedTime, objType, 'synced');
+    await this.updateLocalMapWithStatus(doc, localMdPath, 'synced');
   }
 
   /**
    * Update local mapping with custom status (e.g., 'placeholder')
    */
   private async updateLocalMapWithStatus(
-    objToken: string,
+    doc: ChangedDocument,
     localMdPath: string,
-    cloudModifiedTime: string,
-    objType: string,
     status: 'synced' | 'changed' | 'error' | 'placeholder'
   ): Promise<void> {
     this.localMapStore.upsertDocument({
-      objToken,
+      objToken: doc.objToken,
       wikiNodeToken: null, // Will be filled if available
-      objType, // Use actual objType from document
+      objType: doc.objType,
       title: path.basename(localMdPath, '.md'),
       localMdPath,
-      lastSyncedModifyTime: cloudModifiedTime,
+      lastSyncedModifyTime: doc.cloudModifiedTime,
       lastSyncedAt: new Date().toISOString(),
       status,
     });
-  }
 
-  /**
-   * Write placeholder file for documents with no permission
-   */
-  private async writePlaceholderFile(localMdPath: string, doc: ChangedDocument): Promise<void> {
-    // Create directory if it doesn't exist
-    const dir = path.dirname(localMdPath);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
+    // This is the only write path that advances the v5 synced baseline.
+    // P0 keeps apply closed until P3 wraps the surrounding file work in one
+    // atomic transaction; when that coordinator opens the gate, this call is
+    // made only after the staged file commit has succeeded.
+    if (status === 'synced' && typeof this.localMapStore.markDocumentSynced === 'function') {
+      this.localMapStore.markDocumentSynced({
+        objToken: doc.objToken,
+        syncedObjEditTime: doc.observedObjEditTime ?? null,
+        localMdPath,
+        lastSyncedModifyTime: doc.cloudModifiedTime,
+        lastSyncedAt: new Date().toISOString(),
+      });
     }
-
-    const currentDate = new Date().toISOString().split('T')[0];
-
-    // Header: reuse the canonical YAML-in-comment pipeline so placeholders
-    // carry the same obj_token / wiki_node_token / space_id / obj_type /
-    // original_link metadata as regular synced docs (规范 §5.3). The
-    // placeholder's FetchedDocument.url is intentionally empty —
-    // resolveHeaderMeta backfills original_link from SQLite (or constructs
-    // it from wiki_node_token + the configured feishu host). obj_type
-    // 'unknown' is omitted by generateHtmlHeader so IndexScanner falls back
-    // to its default 'docx' classification rather than persisting a fake
-    // type (规范 §5.3 / red line 7: 不伪造字段).
-    const placeholderFetched: FetchedDocument = {
-      content: '',
-      images: [],
-      attachments: [],
-      sheets: [],
-      url: '',
-      obj_token: doc.objToken,
-    };
-    const meta = this.resolveHeaderMeta(doc, placeholderFetched);
-    const header = this.generateHtmlHeader(meta);
-
-    const body = `# 无权限文档：${doc.title}
-
-> **权限限制**：此文档需要额外权限才能访问。请联系文档所有者或管理员获取访问权限。
-
-## 文档信息
-
-- **文档标题**：${doc.title}
-- **对象类型**：${doc.objType}
-- **对象Token**：${doc.objToken}
-- **变更类型**：${doc.changeType}
-- **云端修改时间**：${doc.cloudModifiedTime}
-- **本地同步时间**：${currentDate}
-
-## 下一步操作
-
-1. 在飞书中申请该文档的访问权限
-2. 获取权限后，在应用中重新同步此文档
-3. 系统将自动下载完整内容并替换此占位文件
-
----
-`;
-
-    fs.writeFileSync(localMdPath, header + body, 'utf-8');
-    console.info(`[SyncEngine] Created placeholder file: ${localMdPath}`);
   }
 
   /**
-   * Generate local file path from document title
+   * Generate local file path via PathResolver when a watched root is known;
+   * otherwise fall back to the legacy root-level title.md plan (blocked in
+   * dry-run when multi-root config is present without watchedRootId).
    */
   private generateLocalPath(doc: ChangedDocument): string {
-    const sanitizedTitle = doc.title.replace(/[<>:"/\\|?*]/g, '_');
-    return path.join(this.config.knowledgeBaseRoot, `${sanitizedTitle}.md`);
+    const roots = Array.isArray(this.config?.watchedRoots)
+      ? this.config.watchedRoots
+      : [];
+    const rootConfig = doc.watchedRootId
+      ? roots.find((item: { id: string }) => item.id === doc.watchedRootId)
+      : roots.length === 1
+        ? roots[0]
+        : null;
+
+    if (rootConfig) {
+      const planned = resolveLocalTarget({
+        knowledgeBaseRoot: this.config.knowledgeBaseRoot,
+        watchedRoot: rootConfig,
+        title: doc.title,
+        hasChild: doc.hasChild === true,
+        parentChainTitles: doc.parentChainTitles,
+        isWatchedRootNode: doc.isWatchedRootNode,
+        existingLocalRelPath: doc.localRelPath ?? null,
+        existingLocalMdPath: doc.localMdPath,
+        objType: doc.objType,
+        rejectExistingFiles: false,
+      });
+      if (planned.ok && planned.target) {
+        return resolveAbsolute(
+          this.config.knowledgeBaseRoot,
+          planned.target.relativeMarkdownPath,
+        );
+      }
+    }
+
+    return fallbackMarkdownTarget(this.config.knowledgeBaseRoot, doc.title);
   }
 
   /**
@@ -641,102 +1157,130 @@ export class SyncEngine {
     return fs.readFileSync(localMdPath, 'utf-8');
   }
 
-  /**
-   * Execute lark-cli command
-   */
-  private async execLarkCli(args: string[]): Promise<any> {
-    const larkCliPath = this.config.larkCliPath || this.getDefaultLarkCliPath();
-    const timeout = 30000;
-
-    try {
-      const { stdout } = await execFileAsync(larkCliPath, args, {
-        timeout,
-        encoding: 'utf-8',
-        shell: process.platform === 'win32',
-      });
-
-      return this.parseJsonOutput(stdout);
-    } catch (error: any) {
-      if (error.killed && error.signal === 'SIGTERM') {
-        throw new Error('lark-cli 执行超时');
-      }
-      throw new Error(`lark-cli 执行失败：${error.stderr || error.message}`);
+  /** Download a URL with fetch — no shell, no string interpolation. */
+  private async downloadUrlToFile(filepath: string, url: string): Promise<string> {
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`URL 下载失败 HTTP ${response.status}`);
     }
-  }
-
-  /**
-   * Execute curl to download image
-   */
-  private async execCurl(filepath: string, url: string): Promise<void> {
-    const { exec } = require('child_process');
-    return new Promise((resolve, reject) => {
-      exec(`curl -sSL -o "${filepath}" "${url}"`, (error: any) => {
-        if (error) reject(error);
-        else resolve();
-      });
-    });
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.length === 0) {
+      throw new Error('URL 下载内容为空');
+    }
+    const contentType = response.headers.get('content-type')?.split(';', 1)[0]?.toLowerCase() ?? '';
+    const extension = this.mediaExtensionForContentType(contentType);
+    const targetPath = path.extname(filepath) ? filepath : `${filepath}${extension}`;
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    fs.writeFileSync(targetPath, buffer);
+    return targetPath;
   }
 
   /**
    * Execute media-download command
    */
-  private async execMediaDownload(filepath: string, token: string): Promise<void> {
-    const args = [
-      'docs',
-      '+media-download',
-      '--token', token,
-      '--output', filepath,
-    ];
-
-    await this.execLarkCli(args);
+  private async execMediaDownload(
+    filepath: string,
+    token: string,
+    type: 'media' | 'whiteboard',
+  ): Promise<string> {
+    const result = await this.requireLarkCliClient().downloadMedia(token, filepath, type);
+    return this.resolveStagedMediaPath(filepath, result);
   }
 
   /**
    * Execute media-preview command (fallback)
    */
-  private async execMediaPreview(filepath: string, token: string): Promise<void> {
-    const args = [
-      'docs',
-      '+media-preview',
-      '--token', token,
-      '--output', filepath,
-    ];
-
-    await this.execLarkCli(args);
+  private async execMediaPreview(filepath: string, token: string): Promise<string> {
+    const result = await this.requireLarkCliClient().previewMedia(token, filepath);
+    return this.resolveStagedMediaPath(filepath, result);
   }
 
-  /**
-   * Parse JSON output from lark-cli
-   */
-  private parseJsonOutput(stdout: string): any {
-    // Remove BOM and ANSI codes
-    const cleaned = stdout
-      .replace(/^﻿/, '')
-      .replace(/\x1b\[[0-9;]*m/g, '')
-      .trim();
-
-    if (!cleaned.startsWith('{')) {
-      return { ok: true, data: { version: cleaned } };
-    }
-
-    // Extract JSON fragment
-    const firstBrace = cleaned.indexOf('{');
-    const lastBrace = cleaned.lastIndexOf('}');
-    if (firstBrace === -1 || lastBrace === -1 || firstBrace > lastBrace) {
-      throw new Error(`解析 lark-cli 输出失败：未找到有效 JSON 结构\n原始输出：${stdout}`);
-    }
-
-    const jsonStr = cleaned.substring(firstBrace, lastBrace + 1);
-
-    try {
-      const json = JSON.parse(jsonStr);
-      if ('ok' in json && json.ok === false) {
-        throw new Error(`lark-cli 返回错误：${json.msg || '未知错误'}`);
+  /** Resolve a CLI-reported auto-extension, retaining test-double support. */
+  private resolveStagedMediaPath(requestedPath: string, reportedPath: unknown): string {
+    const directory = path.dirname(requestedPath);
+    const canonical = (candidate: string): string => {
+      try {
+        return fs.realpathSync.native(candidate);
+      } catch {
+        return path.resolve(candidate);
       }
-      return 'ok' in json ? json : { ok: true, data: json };
-    } catch (error) {
-      throw new Error(`解析 lark-cli 输出失败：${error instanceof Error ? error.message : String(error)}\n原始输出：${stdout}`);
+    };
+    const isInsideDirectory = (candidate: string): boolean => {
+      const relative = path.relative(canonical(directory), canonical(candidate));
+      return relative !== '' && !relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative);
+    };
+
+    if (typeof reportedPath === 'string' && reportedPath.length > 0) {
+      const resolved = path.resolve(reportedPath);
+      if (!isInsideDirectory(resolved)) {
+        throw new Error(`媒体下载器返回了 staging 目录外路径: ${resolved}`);
+      }
+      return resolved;
     }
+
+    // Existing unit-test doubles write to the requested stem and predate the
+    // CLI's saved_path response. Accept that exact path, or one deterministic
+    // auto-extension sibling produced by the real shortcut.
+    if (fs.existsSync(requestedPath)) return requestedPath;
+    const stem = path.basename(requestedPath);
+    const candidates = fs.existsSync(directory)
+      ? fs.readdirSync(directory)
+        .filter((name) => name.startsWith(`${stem}.`))
+        .sort()
+      : [];
+    if (candidates.length === 1) return path.join(directory, candidates[0]);
+    throw new Error(`媒体下载未产生可定位文件: ${stem}`);
+  }
+
+  private assertDownloadedMedia(filepath: string, token: string): void {
+    if (!fs.existsSync(filepath) || !fs.statSync(filepath).isFile() || fs.statSync(filepath).size <= 0) {
+      throw new Error(`媒体下载失败或为空: ${token}`);
+    }
+  }
+
+  private mediaExtensionForContentType(contentType: string): string {
+    const extensions: Record<string, string> = {
+      'image/jpeg': '.jpg',
+      'image/png': '.png',
+      'image/gif': '.gif',
+      'image/webp': '.webp',
+      'image/svg+xml': '.svg',
+      'application/pdf': '.pdf',
+      'application/zip': '.zip',
+    };
+    return extensions[contentType] ?? '.bin';
+  }
+
+  /** Render downloaded whiteboard previews as portable local Markdown images. */
+  private renderLocalizedMediaReferences(content: string): string {
+    const whiteboards = content.replace(
+      /<whiteboard\b[^>]*\btoken=(['"])(images\/[^'"]+)\1[^>]*>(?:\s*<\/whiteboard>)?/gi,
+      (_whole, _quote: string, localPath: string) => `![飞书白板](${localPath})`,
+    );
+    return whiteboards.replace(
+      /<(?:file|source)\b[^>]*\btoken=(['"])(attachments\/[^'"]+)\1[^>]*\/?>(?:\s*<\/(?:file|source)>)?/gi,
+      (_whole, _quote: string, localPath: string) =>
+        `[${path.basename(localPath)}](${localPath})`,
+    );
+  }
+
+  /** Append page-addressable local media links to a Slides Markdown export. */
+  private appendSlidesMediaReferences(
+    content: string,
+    references: NonNullable<FetchedDocument['slideMedia']>,
+    localReferences: ReadonlyMap<string, string>,
+  ): string {
+    const rendered = references
+      .map((reference) => {
+        const localPath = localReferences.get(reference.token);
+        if (!localPath) return null;
+        const label = reference.kind === 'whiteboard' ? '白板预览' : '图片';
+        return `- 幻灯片 ${reference.slideNumber} ${label}：![${label}](${localPath})`;
+      })
+      .filter((line): line is string => line !== null);
+
+    if (rendered.length === 0) return content;
+    return `${content.trimEnd()}\n\n## 媒体资源\n\n${rendered.join('\n')}\n`;
   }
 
   /**
@@ -875,7 +1419,7 @@ export class SyncEngine {
     } else if (record?.originalLink && record.originalLink.trim().length > 0) {
       originalLink = record.originalLink.trim();
     } else if (wikiNodeToken) {
-      const host = this.extractFeishuHost();
+      const host = this.extractFeishuHost(record?.watchedRootId, record?.watchedRootUrl);
       if (host) {
         originalLink = `https://${host}/wiki/${wikiNodeToken}`;
       }
@@ -894,149 +1438,98 @@ export class SyncEngine {
 
   /**
    * Extract the feishu wiki host (e.g. `qcnbafdrjx7n.feishu.cn`) from
-   * the first configured watchedRootUrl. Used to construct an
+   * the document's configured watched root. Used to construct an
    * original_link for sheets (whose fetched.url is empty) from
    * wiki_node_token. Returns null when no URL is configured or the URL
    * is unparseable; the caller then leaves original_link null rather
    * than fabricating a host.
    */
-  private extractFeishuHost(): string | null {
-    const urls: unknown = this.config?.watchedRootUrls;
-    if (!Array.isArray(urls) || urls.length === 0) return null;
-    const first = urls[0];
-    if (typeof first !== 'string' || first.length === 0) return null;
+  private extractFeishuHost(
+    watchedRootId: string | null | undefined,
+    watchedRootUrl: string | null | undefined,
+  ): string | null {
+    const roots: WatchedRootConfig[] = Array.isArray(this.config?.watchedRoots)
+      ? this.config.watchedRoots as WatchedRootConfig[]
+      : [];
+    const selected = roots.find((root) => root.id === watchedRootId)
+      ?? roots.find((root) => root.url === watchedRootUrl)
+      ?? roots.find((root) => root.enabled);
+    // Keep a narrow legacy fallback for callers that construct SyncEngine
+    // with a pre-P2 in-memory config. Persisted config always has roots.
+    const candidate = selected?.url
+      ?? (typeof watchedRootUrl === 'string' ? watchedRootUrl : null)
+      ?? (Array.isArray(this.config?.watchedRootUrls) ? this.config.watchedRootUrls[0] : null);
+    if (typeof candidate !== 'string' || candidate.length === 0) return null;
     try {
-      return new URL(first).host;
+      return new URL(candidate).host;
     } catch {
       return null;
     }
   }
 
   /**
-   * Get default lark-cli executable path
+   * Export every sub-sheet CSV into a staging directory only.
+   * Does NOT write into the knowledge base and does NOT touch sheet_sheets —
+   * those DB rows are written only after atomic file commit succeeds.
    */
-  private getDefaultLarkCliPath(): string {
-    if (process.platform === 'win32') {
-      return 'lark-cli.cmd';
-    }
-    return 'lark-cli';
-  }
-
-  /**
-   * Export spreadsheet sub-sheets to CSV files AND map each sub-sheet to
-   * the sheet_sheets table (03 §3.5). Workbook-level obj_edit_time is
-   * shared across all sub-sheets on the Feishu side, so per-sub-sheet
-   * change detection is performed by ChangeDetector.detectSheetSubChanges
-   * via set differences against this mapping.
-   *
-   * P1 修复 (feishu-sync-troop-sync-20260701):
-   *   1. CSV 通道: `workbook-export` 在部分 sheet 上返回 1069902 no
-   *      permission（参考 200-042 报告 D1），改用 `sheets +csv-get`。
-   *      csv-get 返回 `data.annotated_csv`（纯 CSV 文本），直接落盘。
-   *   2. 目录约定: 从旧 `csv-data/` 单目录改为 `{docname}.csv-data/`，
-   *      与 fetch-feishu-doc skill 约定对齐，根治 tech debt。
-   *
-   * Sub-sheet rows are upserted with COALESCE on local_md_path so a
-   * later reconstruction pass can fill in the per-sub-sheet .md path
-   * without this method needing to know about reconstruction.
-   */
-  private async exportSheetsAndMap(
+  private async exportSheetsToStaging(
     sheetToken: string,
-    saveDir: string,
-    docname: string
-  ): Promise<Array<{ sheetId: string; title: string; csvPath: string }>> {
-    // P1: csvDataDir 对齐 fetch-feishu-doc skill 约定 = {docname}.csv-data/
-    const csvDataDir = path.join(saveDir, `${docname}.csv-data`);
+    stagingDocDir: string,
+    docname: string,
+  ): Promise<Array<{ sheetId: string; title: string; csvPath: string; csvRel: string }>> {
+    const csvDataDir = path.join(stagingDocDir, `${docname}.csv-data`);
+    fs.mkdirSync(csvDataDir, { recursive: true });
 
-    // Create csv-data directory if it doesn't exist
-    if (!fs.existsSync(csvDataDir)) {
-      fs.mkdirSync(csvDataDir, { recursive: true });
+    const exports: Array<{
+      sheetId: string;
+      title: string;
+      csvPath: string;
+      csvRel: string;
+    }> = [];
+
+    const workbookInfo = await this.requireLarkCliClient().getWorkbookInfo(sheetToken);
+    const sheetsList = (workbookInfo.data?.sheets || []) as Array<{
+      sheet_id: string;
+      sheet_name: string;
+      row_count?: number;
+      column_count?: number;
+    }>;
+
+    if (sheetsList.length === 0) {
+      throw new Error(`workbook 无子表: ${sheetToken}`);
     }
 
-    const exports: Array<{ sheetId: string; title: string; csvPath: string }> = [];
-
-    try {
-      // 1. List all sub-sheets in the workbook
-      const workbookInfo = await this.execLarkCli([
-        'sheets',
-        '+workbook-info',
-        '--spreadsheet-token', sheetToken,
-        '--format', 'json',
-      ]);
-
-      const sheetsList = (workbookInfo.data?.sheets || []) as Array<{
-        sheet_id: string;
-        sheet_name: string;
-        row_count?: number;
-        column_count?: number;
-        index?: number;
-      }>;
-
-      const nowIso = new Date().toISOString();
-
-      // 2. Export each sub-sheet to CSV + upsert sheet_sheets row.
-      //    P1: 改用 csv-get（workbook-export 在该类 sheet 上 1069902 no permission）。
-      for (const sheet of sheetsList) {
-        const csvPath = path.join(csvDataDir, `${sheet.sheet_name}.csv`);
-
-        try {
-          // csv-get 需要 A1 形式 range，根据 workbook-info 报告的
-          // row_count × column_count 构造。多拉无害（空白单元不影响下游）。
-          const rows = sheet.row_count ?? 200;
-          const cols = sheet.column_count ?? 20;
-          const range = `A1:${colToLetter(cols)}${rows}`;
-
-          // --include-row-prefix=false 必须作为单个 arg 传入（带 `=`）。
-          // execFile + shell=true 下若拆成 `--include-row-prefix` + `false`
-          // 两个独立 arg，lark-cli 会把 `false` 当成 positional 参数报错
-          // "positional arguments are not supported"。
-          // --format json 取 data.annotated_csv 字段（纯 CSV 文本）。
-          const csvResult = await this.execLarkCli([
-            'sheets',
-            '+csv-get',
-            '--spreadsheet-token', sheetToken,
-            '--sheet-id', sheet.sheet_id,
-            '--range', range,
-            '--include-row-prefix=false',
-            '--format', 'json',
-          ]);
-
-          // annotated_csv 是纯 CSV 字符串（含可能的 \r\n、UTF-8 BOM 等）
-          const csvText = csvResult?.data?.annotated_csv ?? '';
-          if (!csvText || csvText.trim().length === 0) {
-            console.warn(
-              `[SyncEngine] csv-get returned empty content for sheet ` +
-              `"${sheet.sheet_name}" (range ${range})`
-            );
-          }
-          fs.writeFileSync(csvPath, csvText, 'utf-8');
-
-          exports.push({
-            sheetId: sheet.sheet_id,
-            title: sheet.sheet_name,
-            csvPath,
-          });
-
-          // Map this sub-sheet to the sheet_sheets table for future
-          // change detection (detectSheetSubChanges reads this).
-          this.localMapStore.upsertSheetSheet({
-            sheetObjToken: sheetToken,
-            sheetId: sheet.sheet_id,
-            sheetTitle: sheet.sheet_name,
-            localCsvPath: csvPath,
-            lastSyncedModifyTime: nowIso,
-            status: 'synced',
-          });
-
-          console.info(`[SyncEngine] Exported sheet "${sheet.sheet_name}" to ${csvPath}`);
-        } catch (error) {
-          console.warn(`[SyncEngine] Failed to export sheet "${sheet.sheet_name}":`, error);
-          // Continue with other sheets on failure
-        }
+    for (let index = 0; index < sheetsList.length; index += 1) {
+      const sheet = sheetsList[index];
+      if (this.testHooks.failSheetAfterFirst && index > 0) {
+        throw new Error(`注入失败：子表导出中止于 ${sheet.sheet_name}`);
       }
-    } catch (error) {
-      console.error(`[SyncEngine] Failed to list sheets for ${sheetToken}:`, error);
-      throw error;
+
+      const safeTitle = sheet.sheet_name.replace(/[<>:"/\\|?*\u0000-\u001F]/g, '_');
+      const csvPath = path.join(csvDataDir, `${safeTitle}.csv`);
+      const rows = sheet.row_count ?? 200;
+      const cols = sheet.column_count ?? 20;
+      const range = `A1:${colToLetter(cols)}${rows}`;
+
+      const csvResult = await this.requireLarkCliClient().getSheetCsv({
+        spreadsheetToken: sheetToken,
+        sheetId: sheet.sheet_id,
+        range,
+      });
+      const csvText = csvResult?.data?.annotated_csv ?? '';
+      if (!csvText || csvText.trim().length === 0) {
+        throw new Error(
+          `csv-get 返回空内容: sheet="${sheet.sheet_name}" range=${range}`,
+        );
+      }
+      fs.writeFileSync(csvPath, csvText, 'utf-8');
+      exports.push({
+        sheetId: sheet.sheet_id,
+        title: sheet.sheet_name,
+        csvPath,
+        csvRel: `${docname}.csv-data/${safeTitle}.csv`,
+      });
+      console.info(`[SyncEngine] Staged sheet "${sheet.sheet_name}" at ${csvPath}`);
     }
 
     return exports;

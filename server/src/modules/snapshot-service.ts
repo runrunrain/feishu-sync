@@ -29,9 +29,13 @@ import path from 'node:path';
 import type { LocalMapStore } from './local-map-store.js';
 import type { ConfigManager } from './config-manager.js';
 import { IndexScanner } from './index-scanner.js';
+import { ScanPolicy } from './scan-policy.js';
+import { toPortableRelative } from './path-resolver.js';
+import { getEnabledWatchedRootUrls } from '../types/index.js';
 import type {
   IndexSnapshot,
   MappingNode,
+  OrphanFileEntry,
   WatchedRoot,
 } from '../types/index.js';
 
@@ -68,19 +72,19 @@ export class SnapshotService {
   /**
    * Build a derived watched_roots array for the current snapshot.
    *
-   * v0.2.0 structure-align Phase B: combines the configured watchedRootUrls
+   * v0.2.0 structure-align Phase B: combines the configured watchedRoots
    * with SQLite state to produce one entry per watchedRoot. Each entry
    * carries display_name + status + child_count so the frontend can
    * render the top-level groupings without a second round-trip.
    */
   private buildWatchedRoots(): WatchedRoot[] {
     const config = this.configManager.getConfig();
-    const urls = config?.watchedRootUrls ?? [];
-    if (urls.length === 0) return [];
+    const roots = config?.watchedRoots ?? [];
+    if (roots.length === 0) return [];
     if (typeof (this.localMapStore as any).getWatchedRoots !== 'function') {
       return [];
     }
-    return (this.localMapStore as any).getWatchedRoots(urls) as WatchedRoot[];
+    return (this.localMapStore as any).getWatchedRoots(roots) as WatchedRoot[];
   }
 
   /**
@@ -145,7 +149,7 @@ export class SnapshotService {
       );
     }
     const kbRoot = config.knowledgeBaseRoot;
-    const watchedRootUrls = config.watchedRootUrls ?? [];
+    const watchedRootUrls = getEnabledWatchedRootUrls(config);
 
     if (!kbRoot) {
       throw new Error(
@@ -155,7 +159,12 @@ export class SnapshotService {
 
     const documents = this.localMapStore.getAllDocuments();
     const nodes = documents.map((d) => this.projectDocument(d));
-    const orphanFiles = this.scanOrphanFiles(kbRoot, new Set(documents.map((d) => d.localMdPath)));
+    const customFolderPrefixes = this.collectCustomFolderPrefixes();
+    const orphanFiles = this.scanOrphanFiles(
+      kbRoot,
+      new Set(documents.map((d) => d.localMdPath)),
+      customFolderPrefixes,
+    );
     const topLevelDirs = this.aggregateTopLevelDirs(nodes, kbRoot);
     const watchedRoots = this.buildWatchedRoots();
     const mountedDirs = this.scanMountedDirs(kbRoot, watchedRoots);
@@ -214,7 +223,7 @@ export class SnapshotService {
       version: SNAPSHOT_VERSION,
       generated_at: new Date().toISOString(),
       knowledge_base_root: kbRoot,
-      watched_root_urls: previous?.watched_root_urls ?? config.watchedRootUrls ?? [],
+      watched_root_urls: getEnabledWatchedRootUrls(config),
       watched_roots: watchedRoots,
       mounted_dirs: mountedDirs,
       top_level_dirs: previous?.top_level_dirs ?? this.aggregateTopLevelDirs(nodes, kbRoot),
@@ -260,9 +269,28 @@ export class SnapshotService {
    */
   private projectDocument(d: any): MappingNode {
     const wikiNodeToken = d.wikiNodeToken ?? null;
-    const hasChild = wikiNodeToken
-      ? this.localMapStoreHasChildOf(wikiNodeToken)
-      : false;
+    const hasChild =
+      typeof d.hasChild === 'boolean'
+        ? d.hasChild
+        : wikiNodeToken
+          ? this.localMapStoreHasChildOf(wikiNodeToken)
+          : false;
+
+    const config = this.configManager.getConfig();
+    const kbRoot = config?.knowledgeBaseRoot ?? '';
+    const portablePath =
+      (typeof d.localRelPath === 'string' && d.localRelPath.length > 0
+        ? d.localRelPath.replace(/\\/g, '/')
+        : null) ??
+      (kbRoot && d.localMdPath
+        ? toPortableRelative(kbRoot, d.localMdPath)
+        : null) ??
+      // Last resort: if already relative-looking, keep; never emit Windows drive paths.
+      (typeof d.localMdPath === 'string' &&
+      !path.isAbsolute(d.localMdPath) &&
+      !/^[A-Za-z]:[\\/]/.test(d.localMdPath)
+        ? d.localMdPath.replace(/\\/g, '/')
+        : '');
 
     return {
       obj_token: d.objToken,
@@ -270,10 +298,10 @@ export class SnapshotService {
       space_id: d.spaceId ?? null,
       obj_type: d.objType ?? 'unknown',
       title: d.title,
-      local_path: d.localMdPath,
+      local_path: portablePath,
       parent_node_token: d.parentNodeToken ?? null,
       has_child: hasChild,
-      obj_edit_time: d.objEditTime ?? null,
+      obj_edit_time: d.objEditTime ?? d.observedObjEditTime ?? null,
       last_synced_modify_time: d.lastSyncedModifyTime,
       last_synced_at: d.lastSyncedAt,
       last_seen_at: d.lastSeenAt ?? null,
@@ -318,11 +346,26 @@ export class SnapshotService {
    * mapped in SQLite even if their header parsing is currently broken
    * (defensive: avoids double-listing a file as both mapped and orphan).
    */
+  /**
+   * Collect custom-folder local_rel_path prefixes from SQLite so orphan
+   * detection can exclude files that have a cloud identity but live outside
+   * the watched-root structure tree.
+   */
+  private collectCustomFolderPrefixes(): string[] {
+    try {
+      if (typeof this.localMapStore.getCustomFolderRelPaths !== 'function') return [];
+      return this.localMapStore.getCustomFolderRelPaths();
+    } catch {
+      return [];
+    }
+  }
+
   private scanOrphanFiles(
     kbRoot: string,
     knownLocalPaths: Set<string>,
-  ): Array<{ path: string; reason: string; cloud_match: 'local_only' }> {
-    const orphans: Array<{ path: string; reason: string; cloud_match: 'local_only' }> = [];
+    customFolderPrefixes: string[] = [],
+  ): OrphanFileEntry[] {
+    const orphans: OrphanFileEntry[] = [];
 
     if (!fs.existsSync(kbRoot)) {
       console.warn(
@@ -331,40 +374,82 @@ export class SnapshotService {
       return orphans;
     }
 
+    // Normalize known paths to absolute + portable relative for membership checks.
+    const knownAbsolute = new Set<string>();
+    const knownRelative = new Set<string>();
+    for (const known of knownLocalPaths) {
+      if (!known) continue;
+      const absolute = path.isAbsolute(known)
+        ? path.resolve(known)
+        : path.resolve(kbRoot, known);
+      knownAbsolute.add(absolute);
+      const rel = toPortableRelative(kbRoot, absolute);
+      if (rel) knownRelative.add(rel);
+    }
+
     const mdFiles = this.collectMarkdownFiles(kbRoot);
     for (const mdPath of mdFiles) {
-      // Skip the generated README.md (it has no header by design).
       const base = path.basename(mdPath);
-      if (base === 'README.md') continue;
-      // Skip hand-curated INDEX.md navigation files. These are local-only
-      // navigation aids (e.g. 技术 - Dev/INDEX.md) with no corresponding
-      // Feishu node and no obj_token header; treating them as orphans
-      // would noise up OrphanFileAlert with intentional local artifacts.
-      if (base === 'INDEX.md') continue;
+      const relative = path.relative(kbRoot, mdPath).split(path.sep).join('/');
 
-      // Skip if already mapped.
-      if (knownLocalPaths.has(mdPath)) continue;
+      // Already mapped in SQLite — not an orphan.
+      if (knownAbsolute.has(path.resolve(mdPath)) || knownRelative.has(relative)) {
+        continue;
+      }
 
-      // Parse header; orphan = no obj_token AND no original_link.
+      // Custom-folder archive files carry a cloud identity (obj_token) but
+      // live outside every watched-root structure tree. They must never be
+      // reported as orphans just because their directory is untracked.
+      if (isUnderAnyPrefix(relative, customFolderPrefixes)) {
+        continue;
+      }
+
+      // Navigation / operational artefacts — classified, not hidden.
+      if (base === 'INDEX.md') {
+        orphans.push({
+          path: relative,
+          reason: 'navigation_index',
+          classification: 'ignored_artifact',
+          cloud_match: 'local_only',
+        });
+        continue;
+      }
+
       let content: string;
       try {
         content = fs.readFileSync(mdPath, 'utf-8');
       } catch {
-        continue; // unreadable file; skip silently
+        continue;
       }
 
       const parsed = this.indexScanner.parseMetadata(content);
       const hasObjToken = !!parsed?.obj_token;
       const hasOriginalLink = !!parsed?.original_link;
 
-      if (!hasObjToken && !hasOriginalLink) {
+      // README without identity is a diagnostic (missing_metadata), not skipped.
+      if (base === 'README.md' && !hasObjToken && !hasOriginalLink) {
         orphans.push({
-          path: path.relative(kbRoot, mdPath).split(path.sep).join('/'),
-          reason: 'no_obj_token_in_header',
-          // v0.2.0 cloud-link-coverage: explicit marker — this file has
-          // no feishu correspondence, it is local-only (curated/added by
-          // the user). The UI surfaces this distinctly from synced/restricted.
-          cloud_match: 'local_only',
+          path: relative,
+          reason: 'readme_missing_feishu_metadata',
+          classification: 'missing_metadata',
+          cloud_match: 'unknown',
+        });
+        continue;
+      }
+
+      if (!hasObjToken && !hasOriginalLink) {
+        // Sheet-style source markers without tokens are ambiguous, not local-only.
+        const looksLikeSheetExport =
+          /飞书电子表格|feishu\s*sheet|lark\s*sheet/i.test(content.slice(0, 500));
+        orphans.push({
+          path: relative,
+          reason: looksLikeSheetExport
+            ? 'sheet_export_without_token'
+            : 'no_obj_token_in_header',
+          classification: looksLikeSheetExport
+            ? 'cloud_match_ambiguous'
+            : 'local_only_confirmed',
+          cloud_match: looksLikeSheetExport ? 'unknown' : 'local_only',
         });
       }
     }
@@ -386,13 +471,17 @@ export class SnapshotService {
     const counts = new Map<string, number>();
     for (const node of nodes) {
       if (!node.local_path) continue;
-      const abs = path.isAbsolute(node.local_path)
-        ? node.local_path
-        : path.join(kbRoot, node.local_path);
-      const rel = path.relative(kbRoot, abs);
-      if (rel.startsWith('..') || path.isAbsolute(rel)) continue; // outside kbRoot
-      const topSegment = rel.split(path.sep)[0];
-      if (!topSegment) continue;
+      // local_path is portable relative after P2-05; still tolerate legacy abs.
+      let rel = node.local_path.replace(/\\/g, '/');
+      if (path.isAbsolute(node.local_path) || /^[A-Za-z]:[\\/]/.test(node.local_path)) {
+        const portable = toPortableRelative(kbRoot, node.local_path);
+        if (!portable) continue;
+        rel = portable;
+      }
+      if (rel.startsWith('..') || path.isAbsolute(rel)) continue;
+      const topSegment = rel.split('/')[0];
+      // Only count real top-level directories, not root-level loose files.
+      if (!topSegment || !rel.includes('/')) continue;
       counts.set(topSegment, (counts.get(topSegment) ?? 0) + 1);
     }
     return Array.from(counts.entries())
@@ -401,8 +490,8 @@ export class SnapshotService {
   }
 
   /**
-   * Recursive .md file enumeration. Skips the snapshot file itself
-   * and known generated artifacts.
+   * Recursive .md file enumeration. Skips the snapshot file itself and
+   * operational artifacts according to the shared ScanPolicy.
    */
   private collectMarkdownFiles(dir: string): string[] {
     const out: string[] = [];
@@ -414,18 +503,24 @@ export class SnapshotService {
     }
 
     for (const entry of entries) {
-      // Skip dot-dirs (.trash-bin, .assets handled separately as they
-      // don't typically contain docs; .git etc).
-      if (entry.name.startsWith('.')) continue;
-      // Skip the _reports directory (agent-outputs / sync reports). These
-      // are local-only artifacts that live under kbRoot for convenience
-      // but have no Feishu correspondence; recursing into them would list
-      // every report as an orphan file and pollute OrphanFileAlert.
-      if (entry.isDirectory() && entry.name === '_reports') continue;
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) {
+        // Preserve the existing broad hidden-directory guard for snapshot
+        // generation, then apply the shared named-artifact exclusions used
+        // by every knowledge-base scanner.
+        if (
+          ScanPolicy.shouldSkipDirectory(entry.name) ||
+          entry.name.startsWith('.')
+        ) {
+          continue;
+        }
         out.push(...this.collectMarkdownFiles(full));
-      } else if (entry.isFile() && entry.name.endsWith('.md') && entry.name !== SNAPSHOT_FILENAME) {
+      } else if (
+        entry.isFile() &&
+        !ScanPolicy.shouldSkipFile(entry.name) &&
+        entry.name.endsWith('.md') &&
+        entry.name !== SNAPSHOT_FILENAME
+      ) {
         out.push(full);
       }
     }
@@ -446,4 +541,19 @@ export class SnapshotService {
     fs.renameSync(tmp, target);
     console.info(`[SnapshotService] _index.json refreshed at ${target} (${snapshot.nodes.length} nodes, ${snapshot.orphan_files.length} orphans)`);
   }
+}
+
+/**
+ * Return true when a POSIX relative path equals or sits under one of the
+ * given prefixes (each prefix normalized to POSIX without a trailing slash).
+ */
+function isUnderAnyPrefix(relativePath: string, prefixes: string[]): boolean {
+  if (prefixes.length === 0) return false;
+  const normalized = relativePath.replace(/\\/g, '/');
+  for (const raw of prefixes) {
+    const prefix = raw.replace(/\\/g, '/').replace(/\/+$/, '');
+    if (!prefix) continue;
+    if (normalized === prefix || normalized.startsWith(`${prefix}/`)) return true;
+  }
+  return false;
 }

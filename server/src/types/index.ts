@@ -6,6 +6,25 @@
 // Configuration Types
 // ============================================================================
 
+/** The on-disk layout contract for one configured Feishu wiki root. */
+export type LayoutProfile = 'directory-readme' | 'mirror-title-file';
+
+/**
+ * Configuration authority for a watched root.
+ *
+ * `id` is the canonical wiki root node token. It deliberately matches the
+ * P1 `documents.watched_root_id` value, rather than a user-editable display
+ * name, so root ownership remains stable across title/host changes.
+ */
+export interface WatchedRootConfig {
+  id: string;
+  url: string;
+  /** POSIX-style path relative to `knowledgeBaseRoot`. */
+  localDir: string;
+  layoutProfile: LayoutProfile;
+  enabled: boolean;
+}
+
 export interface Config {
   /**
    * v0.2.0 P3: channel-agnostic LLM config. The legacy flat
@@ -19,6 +38,12 @@ export interface Config {
   llm: LlmConfig;
   pollIntervalMinutes: number;
   knowledgeBaseRoot: string;
+  /** Authoritative P2 root configuration. */
+  watchedRoots: WatchedRootConfig[];
+  /**
+   * Compatibility projection for pre-P2 callers. ConfigManager derives this
+   * from `watchedRoots` in memory and no longer persists it to disk.
+   */
   watchedRootUrls: string[];
   larkCliPath?: string;
   requiredScopes: string[];
@@ -26,24 +51,82 @@ export interface Config {
   enableNotifications: boolean;
 }
 
+/** Return only roots whose explicit configuration enables traversal/sync. */
+export function getEnabledWatchedRoots(
+  config: { watchedRoots?: WatchedRootConfig[] } | null | undefined,
+): WatchedRootConfig[] {
+  return Array.isArray(config?.watchedRoots)
+    ? config.watchedRoots.filter((root) => root.enabled)
+    : [];
+}
+
+/** Compatibility selector for call sites that only need canonical URLs. */
+export function getEnabledWatchedRootUrls(
+  config: { watchedRoots?: WatchedRootConfig[] } | null | undefined,
+): string[] {
+  return getEnabledWatchedRoots(config).map((root) => root.url);
+}
+
 // ============================================================================
 // LLM Channel Configuration (v0.2.0 P3)
 // ============================================================================
 
 /**
- * Shared LLM provider configuration consumed by BOTH channels.
+ * A model preset belonging to one remote provider.
  *
- * Cognitive correction (2026-06-18): there is ONE provider (bigmodel
- * GLM by default). `claude -p` (Anthropic-protocol adapter) and the
- * OpenAI SDK 直连 (OpenAI-protocol adapter) are two CHANNELS sharing
- * ONE `LlmConfig`.
+ * The two headless execution paths speak different protocols: direct uses an
+ * OpenAI-compatible endpoint, while Claude Code uses an
+ * Anthropic-compatible endpoint. Providers such as GLM can expose different
+ * model aliases on those endpoints, so a preset stores both aliases instead
+ * of forcing users to duplicate a provider just to select a model.
+ */
+export interface LlmModelPreset {
+  /** Stable local identifier; unique within the provider. */
+  id: string;
+  /** Human-readable label shown in Settings. */
+  name: string;
+  /** Model passed to the direct/OpenAI-compatible channel. */
+  openAiModel: string;
+  /** Model passed to the Claude Code/Anthropic-compatible channel. */
+  claudeCliModel: string;
+  /** Disabled presets remain saved but cannot be selected at runtime. */
+  enabled: boolean;
+}
+
+/**
+ * A remotely hosted model provider and its model presets.
  *
- * `openAiCompatBaseUrl` and `claudeCompatBaseUrl` are kept separate
- * because bigmodel (and similar dual-protocol providers) expose two
- * distinct endpoints. The same `apiKey` is accepted at both.
+ * Keys remain local to this application. They are redacted by GET
+ * /api/config and retain the same plaintext-on-disk warning as the legacy
+ * `llm.apiKey` field until secure-storage support is introduced.
+ */
+export interface LlmProviderConfig {
+  /** Stable local identifier; unique across providers. */
+  id: string;
+  /** Human-readable provider name, for example "智谱 GLM". */
+  name: string;
+  /** Disabled providers remain editable but are never chosen at runtime. */
+  enabled: boolean;
+  /** Credential accepted by this provider's configured endpoints. */
+  apiKey: string;
+  /** OpenAI-compatible base URL used by the direct channel. */
+  openAiCompatBaseUrl: string;
+  /** Anthropic-compatible base URL injected into Claude Code. */
+  claudeCompatBaseUrl: string;
+  /** Preferred preset within this provider when no explicit active preset exists. */
+  defaultModelId?: string;
+  /** Provider-owned model aliases. */
+  models: LlmModelPreset[];
+}
+
+/**
+ * Shared LLM channel configuration.
  *
- * `claudeCli`, `primaryChannel`, and `fallbackOnFailure` control
- * channel selection and fallback policy.
+ * `providers` is the authoritative multi-provider configuration. The flat
+ * endpoint/key/model fields are intentionally retained as a backward-
+ * compatible projection for existing config files and integrations. Runtime
+ * channels resolve the active provider/preset first, then use these legacy
+ * values only when no provider profile is configured.
  */
 export interface LlmConfig {
   /** OpenAI-protocol adapter base URL (DirectChannel/OpenAI SDK). */
@@ -56,19 +139,26 @@ export interface LlmConfig {
   model: string;
   /**
    * Optional per-channel model overrides. Bigmodel's two endpoints use
-   * different alias spaces (paas/v4 accepts glm-4-flash, /api/anthropic
-   * accepts glm-5.2[1m]); these let users fill different aliases when
+   * different alias spaces (paas/v4 accepts glm-5.2, while Z.AI Claude
+   * Code uses the documented glm-4.7 tier mapping); these let users fill
+   * different aliases when
    * a single name is not valid at both endpoints.
    */
   directModel?: string;
   claudeCliModel?: string;
   /** Sampling temperature 0.0-1.0. Default 0.2. */
   temperature: number;
+  /** Saved remote providers. Existing flat configs are migrated to GLM here. */
+  providers?: LlmProviderConfig[];
+  /** The remote provider currently used by direct and Claude Code channels. */
+  activeProviderId?: string;
+  /** The model preset currently used within `activeProviderId`. */
+  activeModelId?: string;
   /**
    * Per-call LLM adaptation timeout in milliseconds.
    *
    * Default 600000 (10 minutes). The claude-cli channel (bigmodel
-   * glm-5.2[1m] via the Anthropic-compat adapter) routinely takes 1-3
+   * glm-4.7 via the Anthropic-compat adapter) routinely takes 1-3
    * minutes for a single feishu doc adaptation under load, and the
    * bigmodel endpoint occasionally returns transient 529 over-load
    * responses that the SDK retries internally. A 60s timeout (the
@@ -88,8 +178,25 @@ export interface LlmConfig {
     claudePath?: string;
     extraArgs?: string[];
   };
+  /**
+   * Local OpenCode process controls. The active app provider credential is
+   * supplied only as a one-process OpenCode runtime overlay; it is never
+   * written to OpenCode's local configuration.
+   */
+  opencode?: {
+    executablePath?: string;
+    model?: string;
+    agent?: string;
+    timeoutMs?: number;
+  };
+  /**
+   * Explicit opt-in for document organisation during sync. Keeping this
+   * separate from primaryChannel prevents a saved LLM setting from silently
+   * changing document bodies on a later sync.
+   */
+  contentAdaptationEnabled?: boolean;
   /** Primary channel name. Default 'claude-cli'. */
-  primaryChannel: 'claude-cli' | 'direct';
+  primaryChannel: 'claude-cli' | 'direct' | 'opencode';
   /** On primary failure, retry via the other channel. Default true. */
   fallbackOnFailure: boolean;
 }
@@ -130,6 +237,49 @@ export type LLMConfig = LlmConfig;
 // Document Types
 // ============================================================================
 
+/**
+ * Runtime synchronization state introduced by the v5 schema.
+ *
+ * `status` remains on DocumentRecord as a legacy/UI compatibility field;
+ * this state is the authoritative answer to whether a cloud observation has
+ * been committed to the local knowledge base. In particular, detection may
+ * advance `observedObjEditTime`, but only a successful atomic sync commit may
+ * advance `syncedObjEditTime` and transition a document to `synced`.
+ */
+export type SyncState =
+  | 'pending_added'
+  | 'pending_modified'
+  | 'synced'
+  | 'restricted'
+  /** Blocked until the operator explicitly rechecks a Feishu-side repair. */
+  | 'feishu_pending'
+  | 'error'
+  | 'missing_candidate'
+  | 'deleted_confirmed';
+
+/**
+ * A lossless cloud-side observation collected during wiki traversal.
+ *
+ * This is intentionally separate from DocumentRecord: it describes what the
+ * current traversal saw, whereas DocumentRecord describes the persisted local
+ * sync baseline. Keeping the two concepts distinct prevents a poll from
+ * accidentally acknowledging a change before its file transaction succeeds.
+ */
+export interface CloudNodeObservation {
+  objToken: string;
+  wikiNodeToken: string;
+  objType: 'docx' | 'sheet' | 'slides' | 'unknown';
+  title: string;
+  spaceId: string | null;
+  parentNodeToken: string | null;
+  watchedRootId: string;
+  watchedRootUrl: string | null;
+  observedObjEditTime: number | null;
+  hasChild: boolean;
+  /** Whether detail lookup succeeded, was permission-restricted, or failed transiently. */
+  observationStatus: 'available' | 'restricted' | 'unavailable';
+}
+
 export interface DocumentRecord {
   objToken: string;
   wikiNodeToken: string | null;
@@ -146,6 +296,11 @@ export interface DocumentRecord {
    */
   parentNodeToken?: string | null;
   spaceId?: string | null;
+  /**
+   * Legacy alias for the most recently observed cloud edit time. New code
+   * should use observedObjEditTime; keeping this field avoids breaking v2-v4
+   * readers while databases are upgraded in place.
+   */
   objEditTime?: number | null;
   cloudDeleted?: number; // 0 | 1
   lastSeenAt?: string | null;
@@ -171,12 +326,29 @@ export interface DocumentRecord {
    * v0.2.0 structure-align Phase B fields.
    *
    * watchedRootUrl is the feishu wiki URL of the watchedRoot that owns
-   * this row. Source of truth is the application config (watchedRootUrls);
+   * this row. Source of truth is the application config (watchedRoots);
    * rows whose local_md_path top-level directory maps to a watchedRoot
    * are tagged by IndexScanner during rebuild. Rows that live under a
    * local-only directory (no watchedRoot tracking) keep this NULL.
    */
   watchedRootUrl?: string | null;
+  /** v5 runtime-state fields. */
+  observedObjEditTime?: number | null;
+  syncedObjEditTime?: number | null;
+  syncState?: SyncState;
+  watchedRootId?: string | null;
+  /** Portable, POSIX-style path. P2 owns its full backfill. */
+  localRelPath?: string | null;
+  missingCompleteCount?: number;
+  lastSyncErrorCode?: string | null;
+  hasChild?: boolean;
+  /**
+   * Custom-folder archive: when non-null, this document was added via the
+   * quick-add flow into a custom folder (custom_folders.id). Such rows keep
+   * watched_root_url/watched_root_id NULL because they are not part of any
+   * synced structure tree.
+   */
+  customFolderId?: string | null;
 }
 
 /**
@@ -243,6 +415,30 @@ export interface ChangedDocument {
   cloudModifiedTime: string;
   localSyncedTime: string | null;
   localMdPath: string | null;
+  /** v5 observation identity, carried end-to-end without re-querying cloud. */
+  wikiNodeToken?: string | null;
+  parentNodeToken?: string | null;
+  spaceId?: string | null;
+  watchedRootId?: string | null;
+  hasChild?: boolean;
+  observedObjEditTime?: number | null;
+  syncState?: SyncState;
+  /**
+   * Titles of ancestors under the watched root (exclusive of the root and
+   * of this node). Used by PathResolver when no existing mapping is present.
+   */
+  parentChainTitles?: string[];
+  /** True when this document is the watched root body itself. */
+  isWatchedRootNode?: boolean;
+  /** Portable relative path already stored in the database, if any. */
+  localRelPath?: string | null;
+  /**
+   * Custom-folder archive: when non-null, this document belongs to a user-
+   * created custom folder and is NOT part of any synced watched-root tree.
+   * The sync planner bypasses watchedRoot validation for such docs and
+   * reuses their existing _custom/ local path.
+   */
+  customFolderId?: string | null;
 }
 
 export interface SyncedDocument {
@@ -261,7 +457,102 @@ export interface FailedDocument {
   title: string;
   error: string;
   retryable: boolean;
+  /**
+   * Stable failure category shown by the result UI.  Planning failures reuse
+   * SyncPlanReasonCode; runtime failures add the small operational set below.
+   */
+  reasonCode?: SyncFailureReasonCode;
+  /** A user-facing next step; never expose an upstream stack trace here. */
+  suggestedResolution?: string;
+  /** Whether the application can safely perform the next step itself. */
+  repairAction?: SyncRepairAction;
+  /** Retained so a structural repair can re-traverse only the affected root. */
+  watchedRootId?: string | null;
 }
+
+export type SyncFailureReasonCode =
+  | SyncPlanReasonCode
+  | 'permission_denied'
+  | 'cloud_deleted'
+  | 'rate_limited'
+  | 'upstream_error';
+
+/**
+ * Explicitly distinguishes actions that can be automated from those that
+ * require a person with Feishu sharing authority.  In particular, the client
+ * must never pretend it can grant itself access to a protected wiki node.
+ */
+export type SyncRepairAction =
+  | 'rebuild_parent_chain'
+  | 'adopt_existing_file'
+  | 'retry'
+  | 'grant_access'
+  | 'review_deleted'
+  | 'enable_export_adapter'
+  | 'manual_review';
+
+/**
+ * A durable, operator-owned queue entry.  These items are deliberately kept
+ * outside the normal added/modified diff so an unresolved Feishu permission,
+ * deleted page, or unsupported cloud type cannot appear as a fresh change on
+ * every detector poll.
+ */
+export interface FeishuPendingItem {
+  objToken: string;
+  title: string;
+  watchedRootId: string | null;
+  reasonCode: SyncFailureReasonCode;
+  error: string;
+  suggestedResolution: string;
+  repairAction: SyncRepairAction;
+  createdAt: string;
+  updatedAt: string;
+  /** Set only after the user clicks “处理后重新检测”. */
+  recheckRequestedAt: string | null;
+}
+
+/**
+ * A filesystem change planned by the synchronizer before any cloud content
+ * is fetched or local state is changed. `blocked` entries are deliberately
+ * kept in the manifest so an unsafe path can be reviewed rather than silently
+ * falling back to a different target.
+ */
+export interface PlannedSyncDocument {
+  objToken: string;
+  title: string;
+  objType: 'docx' | 'sheet' | 'slides' | 'unknown';
+  changeType: 'modified' | 'added' | 'deleted';
+  action: 'create' | 'replace' | 'blocked' | 'move';
+  localMdPath: string | null;
+  /** Portable POSIX path relative to knowledgeBaseRoot. */
+  localRelPath?: string | null;
+  previousSha256: string | null;
+  /** Stable category for an intentionally non-writable or review-only plan. */
+  reasonCode?: SyncPlanReasonCode;
+  reason?: string;
+  /** Cloud identity and hierarchy retained for auditable triage. */
+  watchedRootId?: string | null;
+  wikiNodeToken?: string | null;
+  parentChainTitles?: string[] | null;
+  /** Candidate profile path when a safe write was intentionally blocked. */
+  candidateLocalRelPath?: string | null;
+  suggestedResolution?: string;
+  plannedMoveFrom?: string | null;
+  pathSource?: 'existing-mapping' | 'layout-profile' | 'legacy-fallback';
+}
+
+export type SyncPlanReasonCode =
+  | 'deleted_requires_confirmation'
+  | 'missing_parent_chain'
+  | 'unknown_watched_root'
+  | 'path_conflict'
+  | 'unsafe_path'
+  | 'planned_move'
+  | 'unsupported_type'
+  | 'restricted'
+  | 'unknown';
+
+export type SyncMode = 'dry-run' | 'apply';
 
 // ============================================================================
 // Sync Types
@@ -274,11 +565,26 @@ export interface SyncResult {
   startedAt: string;
   completedAt: string;
   duration: number;
+  /** P0 safety gate: requests are dry-runs unless apply is explicitly confirmed. */
+  mode?: SyncMode;
+  operationId?: string;
+  manifestPath?: string;
+  plannedDocuments?: PlannedSyncDocument[];
 }
 
 export interface SyncOptions {
   enableLLM: boolean;
   fullSync: boolean;
+  /**
+   * Explicit recovery-only opt-in. When a canonical profile path already
+   * contains a recognisable older export of the same titled cloud document,
+   * adopt that file as its mapping and atomically replace it. Never enables a
+   * blind overwrite of arbitrary local content.
+   */
+  adoptExistingProfileTargets?: boolean;
+  /** Must be accompanied by confirmation: 'APPLY'; absent/false always dry-runs. */
+  apply?: boolean;
+  confirmation?: string;
 }
 
 export interface ChangeDetectionResult {
@@ -286,6 +592,10 @@ export interface ChangeDetectionResult {
   changedDocuments: ChangedDocument[];
   checkedAt: string;
   totalNodes: number;
+  /** A partial traversal is observational only and can never create deletion candidates. */
+  traversalComplete?: boolean;
+  failedNodeTokens?: string[];
+  missingCandidates?: number;
 }
 
 // ============================================================================
@@ -321,12 +631,35 @@ export interface DiffReport {
  * "user has not reordered, display in Feishu's original order"; non-null
  * is a 0-based weight applied within the same parent scope.
  */
+/** Classification for local files that are not (yet) uniquely mapped. */
+export type OrphanClassification =
+  | 'missing_metadata'
+  | 'cloud_match_ambiguous'
+  | 'local_only_confirmed'
+  | 'ignored_artifact';
+
+export interface OrphanFileEntry {
+  /** Portable POSIX path relative to knowledge_base_root. */
+  path: string;
+  reason: string;
+  classification: OrphanClassification;
+  /**
+   * Legacy cloud_match marker retained for older UI clients.
+   * Prefer `classification` for new code.
+   */
+  cloud_match: 'local_only' | 'unknown';
+}
+
 export interface MappingNode {
   obj_token: string;
   wiki_node_token: string | null;
   space_id: string | null;
   obj_type: 'docx' | 'sheet' | 'slides' | 'unknown';
   title: string;
+  /**
+   * Portable POSIX path relative to knowledge_base_root.
+   * Absolute device paths must not appear here (P2-05).
+   */
   local_path: string;
   parent_node_token: string | null;
   has_child: boolean;
@@ -375,7 +708,7 @@ export interface TreeResponse {
   view: 'feishu' | 'local';
   nodes: MappingNode[];
   watched_roots: WatchedRoot[];
-  orphan_files: Array<{ path: string; reason: string; cloud_match: 'local_only' }>;
+  orphan_files: OrphanFileEntry[];
   stats: {
     total_nodes: number;
     watched_root_count: number;
@@ -404,7 +737,7 @@ export interface IndexSnapshot {
   watched_root_urls: string[];
   /**
    * v0.2.0 structure-align Phase B: materialized watchedRoot records.
-   * Built from the configured watchedRootUrls + documents table state.
+   * Built from the configured watchedRoots + documents table state.
    * Each entry includes display_name + status + child_count for the
    * frontend to render top-level groupings without a second round-trip.
    */
@@ -418,7 +751,7 @@ export interface IndexSnapshot {
   mounted_dirs: Array<{ local_dir: string; reason: string }>;
   top_level_dirs: Array<{ dir: string; node_count: number }>;
   nodes: MappingNode[];
-  orphan_files: Array<{ path: string; reason: string; cloud_match: 'local_only' }>;
+  orphan_files: OrphanFileEntry[];
 }
 
 /**

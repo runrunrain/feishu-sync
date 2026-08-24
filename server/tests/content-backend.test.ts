@@ -451,6 +451,13 @@ function makeFakeSpawn(opts: {
 }
 
 describe('ClaudeCliChannel', () => {
+  beforeEach(() => {
+    // The production resolver intentionally returns a friendly missing-CLI
+    // error when Claude Code is absent. These channel tests exercise spawn
+    // behavior, so provide a deterministic executable descriptor instead.
+    process.env.CLAUDE_CODE_EXECPATH = '/test/claude';
+  });
+
   afterEach(() => {
     vi.restoreAllMocks();
     vi.resetModules();
@@ -624,7 +631,7 @@ describe('ClaudeCliChannel', () => {
     expect(spawned[0].child.kill).toHaveBeenCalledWith('SIGTERM');
   });
 
-  it('env-injects bigmodel Anthropic vars into the child environment', async () => {
+  it('uses Z.AI token auth and an isolated non-bare runtime for BigModel endpoints', async () => {
     vi.resetModules();
     const { spawnMock, spawned } = makeFakeSpawn({});
     vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
@@ -634,7 +641,7 @@ describe('ClaudeCliChannel', () => {
       buildTestLlm({
         apiKey: 'bigmodel-key',
         claudeCompatBaseUrl: 'https://open.bigmodel.cn/api/anthropic',
-        model: 'glm-4-flash',
+        model: 'glm-5.2',
       })
     );
     const promise = ch.adapt({
@@ -643,25 +650,28 @@ describe('ClaudeCliChannel', () => {
       options: { temperature: 0.2 },
     });
 
-    await Promise.resolve();
-    expect(spawned.length).toBe(1);
+    await vi.waitFor(() => expect(spawned.length).toBe(1));
     const env = spawned[0].options.env;
-    expect(env.ANTHROPIC_BASE_URL).toBe('https://open.bigmodel.cn/api/anthropic');
-    expect(env.ANTHROPIC_API_KEY).toBe('bigmodel-key');
-    expect(env.ANTHROPIC_MODEL).toBe('glm-4-flash');
+    expect(env.ANTHROPIC_BASE_URL).toBe('https://api.z.ai/api/anthropic');
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe('bigmodel-key');
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(env.ANTHROPIC_MODEL).toBeUndefined();
+    expect(env.CLAUDE_CONFIG_DIR).toBeTruthy();
     // Streaming must be disabled so stdout stays a single JSON envelope.
     expect(env.ANTHROPIC_STREAM).toBe('false');
-    // Tier aliases pinned to the same model.
-    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('glm-4-flash');
-    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('glm-4-flash');
-    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('glm-4-flash');
+    // GLM-5.2 is direct/OpenCode-only here; Claude Code uses its verified
+    // Z.AI tier mapping.
+    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('glm-4.7');
+    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('glm-4.7');
+    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('glm-4.7');
+    expect(spawned[0].args).not.toContain('--bare');
 
     // Close the child to settle the promise.
     spawned[0].child.emit('close', 0);
     await promise;
   });
 
-  it('passes --dangerously-skip-permissions and --max-turns 1 in args (NO prompt in argv)', async () => {
+  it('runs in bare tool-free mode with --max-turns 1 (NO prompt in argv)', async () => {
     vi.resetModules();
     const { spawnMock, spawned } = makeFakeSpawn({});
     vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
@@ -680,7 +690,10 @@ describe('ClaudeCliChannel', () => {
     expect(args).toContain('--output-format');
     expect(args).toContain('--max-turns');
     expect(args).toContain('1');
-    expect(args).toContain('--dangerously-skip-permissions');
+    expect(args).toContain('--bare');
+    expect(args).toContain('--no-session-persistence');
+    expect(args).toContain('--tools');
+    expect(args).not.toContain('--dangerously-skip-permissions');
 
     // v020-r2 prompt-injection hardening: the prompt MUST NOT appear in
     // argv (it must travel via stdin). Even an adversarial rawContent
@@ -742,7 +755,9 @@ describe('ClaudeCliChannel', () => {
     // Each tier is isolated by clearing env / config before the test.
 
     beforeEach(() => {
-      delete process.env.CLAUDE_CODE_EXECPATH;
+      // Keep subprocess assertions deterministic even on a developer
+      // machine that has Claude Code in a desktop-discovery directory.
+      process.env.CLAUDE_CODE_EXECPATH = '/test/claude';
     });
 
     it('tier 1: claudeCli.claudePath wins and uses shell:false', async () => {
@@ -792,7 +807,7 @@ describe('ClaudeCliChannel', () => {
       await promise;
     });
 
-    it('tier 3 win: falls back to claude.cmd + shell:true when no override and platform is win32', async () => {
+    it('uses shell:true for an explicit Windows .cmd npm shim', async () => {
       vi.resetModules();
       const { spawnMock, spawned } = makeFakeSpawn({});
       vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
@@ -803,7 +818,9 @@ describe('ClaudeCliChannel', () => {
 
       try {
         const { ClaudeCliChannel } = await import('../src/modules/claude-cli-channel.js');
-        const ch = new ClaudeCliChannel(buildTestLlm());
+        const ch = new ClaudeCliChannel(buildTestLlm(), {
+          claudePath: '/tmp/claude.cmd',
+        });
         const promise = ch.adapt({
           rawContent: 'raw',
           localOldContent: null,
@@ -811,7 +828,7 @@ describe('ClaudeCliChannel', () => {
         });
         await Promise.resolve();
 
-        expect(spawned[0].cmd).toBe('claude.cmd');
+        expect(spawned[0].cmd).toBe('/tmp/claude.cmd');
         expect(spawned[0].options.shell).toBe(true);
 
         spawned[0].child.emit('close', 0);

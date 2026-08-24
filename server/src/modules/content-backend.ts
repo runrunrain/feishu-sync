@@ -1,29 +1,32 @@
 /**
  * ContentBackend - LLM channel abstraction (v0.2.0 P3)
  *
- * Implements 03 §4.1.1 (双通道抽象层). Cognitive correction
- * (2026-06-18): there is ONE LLM provider (智谱 bigmodel GLM);
- * `claude -p` and OpenAI SDK 直连 are two CHANNELS of the same
- * provider, sharing ONE `LlmConfig`. `name` is a channel name
- * ('claude-cli' | 'direct'), NOT a model name.
+ * Implements 03 §4.1.1 (双通道抽象层). `claude -p` and OpenAI SDK 直连
+ * are two CHANNELS of the selected remote provider/model preset. OpenCode
+ * is a third, local CLI channel which deliberately uses the user's existing
+ * OpenCode provider configuration instead of this application's remote
+ * credentials.
  *
  * Architectural invariants:
  *   - ContentAdapter is channel-agnostic (only编排; no SDK import).
  *   - Registry exposes primaryChannel + getFallback() (single-layer
  *     fallback, claude-cli <-> direct).
- *   - Both channels consume the SAME `LlmConfig` (one apiKey/baseUrl/model).
- *   - ClaudeCliChannel env-injects bigmodel's Anthropic-compat endpoint
- *     (ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY / ANTHROPIC_MODEL); the
- *     P0-Q4 实测 confirmed these three env var names drive claude CLI.
- *   - DirectChannel hits bigmodel's OpenAI-compat endpoint
- *     (https://open.bigmodel.cn/api/paas/v4) via OpenAI SDK.
+ *   - Both remote channels resolve the SAME active provider/model preset.
+ *   - ClaudeCliChannel env-injects an Anthropic-compatible endpoint. Z.AI
+ *     Coding Plan uses ANTHROPIC_AUTH_TOKEN; generic providers use
+ *     ANTHROPIC_API_KEY / ANTHROPIC_MODEL.
+ *   - DirectChannel hits an OpenAI-compatible endpoint via OpenAI SDK.
  *
  * The two endpoints differ (one Anthropic-protocol, one OpenAI-protocol)
  * so LlmConfig carries BOTH urls explicitly rather than deriving one
  * from the other. This is documented in the type and surfaced in the
- * settings UI so the user understands they point to the same provider
- * via two protocol adapters.
+ * settings UI so the user can configure both protocol adapters for a
+ * provider when needed.
  */
+
+import type { LlmModelPreset, LlmProviderConfig } from '../types/index.js';
+
+export type { LlmModelPreset, LlmProviderConfig } from '../types/index.js';
 
 // ============================================================================
 // Channel Names
@@ -31,22 +34,21 @@
 
 /**
  * Channel identifier. A channel is a CALL MECHANISM, not a model.
- * - 'claude-cli': spawn `claude -p` subprocess, env-inject bigmodel
- *   Anthropic-compat credentials (main channel).
- * - 'direct': OpenAI SDK 直连 bigmodel OpenAI-compat endpoint
- *   (fallback channel).
+ * - 'claude-cli': spawn `claude -p` subprocess, env-inject an
+ *   Anthropic-compatible credential (main channel).
+ * - 'direct': OpenAI SDK 直连 an OpenAI-compatible endpoint (fallback).
  */
-export type ChannelName = 'claude-cli' | 'direct';
+export type ChannelName = 'claude-cli' | 'direct' | 'opencode';
 
 // ============================================================================
 // Shared Configuration Types (one config, two channels share it)
 // ============================================================================
 
 /**
- * Single LLM provider configuration shared by both channels.
+ * Flat compatibility projection shared by both remote channels.
  *
  * NOTE on dual baseUrl:
- *   bigmodel exposes TWO protocol adapters:
+ *   a provider may expose TWO protocol adapters:
  *     - `claudeCompatBaseUrl`: Anthropic-protocol path (e.g.
  *       `https://open.bigmodel.cn/api/anthropic`), consumed by claude
  *       CLI via ANTHROPIC_BASE_URL env var. Claude CLI itself does NOT
@@ -54,14 +56,13 @@ export type ChannelName = 'claude-cli' | 'direct';
  *     - `openAiCompatBaseUrl`: OpenAI-protocol path (e.g.
  *       `https://open.bigmodel.cn/api/paas/v4`), consumed by the OpenAI
  *       SDK. The SDK does NOT accept an Anthropic-protocol URL.
- *   For providers that expose BOTH adapters (like bigmodel), users fill
+ *   For providers that expose BOTH adapters (like GLM), users fill
  *   both. For a hypothetical provider that only has one adapter, leave
  *   the other blank and disable the corresponding channel.
  *
- * `apiKey` is a single credential accepted by BOTH endpoints (verified
- * by P3 实测: bigmodel accepts the same `<id>.<secret>` key as
- * `Authorization: Bearer <key>` on paas/v4 and as the ANTHROPIC_API_KEY
- * env var for claude CLI).
+ * `apiKey` is a shared provider credential. The OpenAI endpoint uses a
+ * bearer key; Z.AI's Claude Code compatibility path consumes it as
+ * `ANTHROPIC_AUTH_TOKEN`.
  */
 export interface LlmConfig {
   /** OpenAI-compat base URL for DirectChannel (OpenAI SDK baseURL). */
@@ -82,13 +83,10 @@ export interface LlmConfig {
    */
   model: string;
   /**
-   * OPTIONAL per-channel model overrides. Bigmodel's two endpoints
-   * (paas/v4 OpenAI-compat vs /api/anthropic) use different alias
-   * spaces; e.g. `glm-5.2[1m]` is valid only at the Anthropic
-   * endpoint, while `glm-4-flash` is valid only at the OpenAI
-   * endpoint. When `directModel` / `claudeCliModel` are set they
-   * take precedence over the shared `model` for the respective
-   * channel. Otherwise both channels fall back to `model`.
+ * OPTIONAL per-channel model overrides. A provider can expose different
+ * aliases per protocol. When `directModel` / `claudeCliModel` are set they
+ * take precedence over the shared `model` for the respective channel.
+ * Otherwise both channels fall back to `model`.
    */
   directModel?: string;
   claudeCliModel?: string;
@@ -101,6 +99,88 @@ export interface LlmConfig {
    * hard-coded value.
    */
   timeoutMs?: number;
+  /** Remote-provider profiles. When present, the active profile wins over legacy fields. */
+  providers?: LlmProviderConfig[];
+  /** Selected provider id for the remote direct / Claude Code channels. */
+  activeProviderId?: string;
+  /** Selected model-preset id within the active provider. */
+  activeModelId?: string;
+}
+
+/**
+ * Resolve a user-selected provider/model preset into the legacy flat shape
+ * consumed by the two remote channel implementations.
+ *
+ * Keeping this boundary here makes provider profiles operational rather than
+ * merely UI metadata: DirectChannel and ClaudeCliChannel always receive the
+ * selected provider's key, endpoint and protocol-specific model aliases.
+ * Empty endpoint/key/model values are preserved deliberately so the channel
+ * can fail fast with its existing friendly configuration error instead of
+ * accidentally falling back to a different provider's legacy credentials.
+ */
+export function resolveActiveLlmConfig(llm: LlmConfig): LlmConfig {
+  const profiles = Array.isArray(llm.providers)
+    ? llm.providers.filter((profile): profile is LlmProviderConfig => (
+      !!profile
+      && typeof profile === 'object'
+      && profile.enabled !== false
+      && typeof profile.id === 'string'
+    ))
+    : [];
+  const provider = profiles.find((profile) => profile.id === llm.activeProviderId)
+    ?? profiles[0];
+
+  if (!provider) return llm;
+
+  const presets = Array.isArray(provider.models)
+    ? provider.models.filter((preset): preset is LlmModelPreset => (
+      !!preset
+      && typeof preset === 'object'
+      && preset.enabled !== false
+      && typeof preset.id === 'string'
+    ))
+    : [];
+  const preset = presets.find((item) => item.id === llm.activeModelId)
+    ?? presets.find((item) => item.id === provider.defaultModelId)
+    ?? presets[0];
+
+  // A provider without an enabled model remains a valid saved draft. Its
+  // endpoint/key still become effective, while blank model aliases surface a
+  // deterministic channel-side configuration error rather than calling a
+  // previously selected provider by accident.
+  const openAiModel = preset && typeof preset.openAiModel === 'string'
+    ? preset.openAiModel
+    : '';
+  const claudeCliModel = preset && typeof preset.claudeCliModel === 'string'
+    ? preset.claudeCliModel
+    : '';
+  const isZai = /(?:^|\.)bigmodel\.cn|(?:^|\.)z\.ai/i.test(provider.openAiCompatBaseUrl)
+    || /(?:^|\.)bigmodel\.cn|(?:^|\.)z\.ai/i.test(provider.claudeCompatBaseUrl);
+  // GLM's current API model identifier is e.g. `glm-5.2`. Older config
+  // examples sometimes stored a capacity display suffix (`glm-5.2[1m]`),
+  // which the OpenAI-compatible endpoint rejects as an unknown model. Keep
+  // the saved display value intact but use the canonical runtime identifier.
+  const normalizeZaiModel = (value: string) => (
+    isZai ? value.trim().replace(/\[[^\]]+\]$/, '') : value
+  );
+  const resolvedOpenAiModel = normalizeZaiModel(openAiModel);
+  const resolvedClaudeCliModel = normalizeZaiModel(claudeCliModel);
+
+  return {
+    ...llm,
+    openAiCompatBaseUrl: typeof provider.openAiCompatBaseUrl === 'string'
+      ? provider.openAiCompatBaseUrl
+      : '',
+    claudeCompatBaseUrl: typeof provider.claudeCompatBaseUrl === 'string'
+      ? provider.claudeCompatBaseUrl
+      : '',
+    apiKey: typeof provider.apiKey === 'string' ? provider.apiKey : '',
+    // `model` is kept meaningful for logs and old callers. Individual
+    // channels use their protocol-specific override below.
+    model: resolvedClaudeCliModel || resolvedOpenAiModel || '',
+    directModel: resolvedOpenAiModel,
+    claudeCliModel: resolvedClaudeCliModel,
+  };
 }
 
 /**
@@ -117,6 +197,24 @@ export interface ClaudeCliConfig {
 }
 
 /**
+ * OpenCode process control. Credentials themselves are never persisted in
+ * this object: when the active app provider has a key, OpenCode receives a
+ * one-process `OPENCODE_CONFIG_CONTENT` overlay; otherwise it falls back to
+ * the user's own OpenCode configuration (for example
+ * ~/.config/opencode/opencode.json). All fields are optional.
+ */
+export interface OpenCodeCliConfig {
+  /** Optional absolute executable path; otherwise the app resolves PATH/npm globals. */
+  executablePath?: string;
+  /** Optional OpenCode model in `provider/model` form. */
+  model?: string;
+  /** Optional OpenCode agent name. */
+  agent?: string;
+  /** Per-document process timeout. Defaults to LlmConfig.timeoutMs / 10 minutes. */
+  timeoutMs?: number;
+}
+
+/**
  * Channel selection and fallback policy.
  */
 export interface ChannelConfig {
@@ -124,6 +222,8 @@ export interface ChannelConfig {
   llm: LlmConfig;
   /** ClaudeCliChannel-only control fields. */
   claudeCli?: ClaudeCliConfig;
+  /** OpenCode-specific process controls. */
+  opencode?: OpenCodeCliConfig;
   /** Primary channel used first. Default 'claude-cli'. */
   primaryChannel: ChannelName;
   /**

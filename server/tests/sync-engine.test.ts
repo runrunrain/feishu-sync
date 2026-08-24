@@ -60,7 +60,7 @@ interface FetchedLike {
 type SyncEngineInternals = {
   generateHtmlHeader(meta: HeaderMetaLike): string;
   resolveHeaderMeta(doc: ChangedDocument, fetched: FetchedLike): HeaderMetaLike;
-  extractFeishuHost(): string | null;
+  extractFeishuHost(watchedRootId?: string | null, watchedRootUrl?: string | null): string | null;
   yamlScalar(value: string): string;
   writeLocalMarkdown(
     localMdPath: string,
@@ -123,14 +123,25 @@ function makeRecord(overrides: Partial<DocumentRecord> = {}): DocumentRecord {
 }
 
 function makeEngine(opts: {
-  watchedRootUrls?: string[];
+  watchedRoots?: Array<{
+    id: string;
+    url: string;
+    localDir: string;
+    layoutProfile: 'directory-readme' | 'mirror-title-file';
+    enabled: boolean;
+  }>;
+  legacyWatchedRootUrls?: string[];
 } = {}): { engine: SyncEngine; store: MockLocalMapStore } {
   const store = new MockLocalMapStore();
   const config = {
-    watchedRootUrls:
-      opts.watchedRootUrls ??
-      // Real configured host for this deployment.
-      ['https://qcnbafdrjx7n.feishu.cn/wiki/Wramw1XxRihIgnkCrhqcdEbRnHb'],
+    watchedRoots: opts.watchedRoots ?? [{
+      id: 'Wramw1XxRihIgnkCrhqcdEbRnHb',
+      url: 'https://qcnbafdrjx7n.feishu.cn/wiki/Wramw1XxRihIgnkCrhqcdEbRnHb',
+      localDir: '策划 - Designer',
+      layoutProfile: 'mirror-title-file' as const,
+      enabled: true,
+    }],
+    watchedRootUrls: opts.legacyWatchedRootUrls ?? [],
     knowledgeBaseRoot: os.tmpdir(),
   };
   const engine = new SyncEngine({
@@ -374,7 +385,7 @@ describe('SyncEngine.resolveHeaderMeta — field sourcing (no fabrication)', () 
       wikiNodeToken: 'nodeTok',
       originalLink: null,
     });
-    const { engine, store } = makeEngine({ watchedRootUrls: [] });
+    const { engine, store } = makeEngine({ watchedRoots: [] });
     store.records.set(doc.objToken, record);
 
     const meta = internals(engine).resolveHeaderMeta(doc, fetched);
@@ -424,36 +435,61 @@ describe('SyncEngine.resolveHeaderMeta — field sourcing (no fabrication)', () 
 // extractFeishuHost — host derivation from config
 // =========================================================================
 describe('SyncEngine.extractFeishuHost — config host derivation', () => {
-  it('returns the host of the first configured watchedRootUrl', () => {
+  it('selects the host belonging to the document watchedRootId', () => {
     const { engine } = makeEngine({
-      watchedRootUrls: [
-        'https://qcnbafdrjx7n.feishu.cn/wiki/Wramw1XxRihIgnkCrhqcdEbRnHb',
+      watchedRoots: [
+        {
+          id: 'root-a',
+          url: 'https://tenant-a.feishu.cn/wiki/root-a',
+          localDir: 'A',
+          layoutProfile: 'directory-readme',
+          enabled: true,
+        },
+        {
+          id: 'root-b',
+          url: 'https://tenant-b.feishu.cn/wiki/root-b',
+          localDir: 'B',
+          layoutProfile: 'directory-readme',
+          enabled: true,
+        },
       ],
     });
-    expect(internals(engine).extractFeishuHost()).toBe(
-      'qcnbafdrjx7n.feishu.cn',
-    );
+    expect(internals(engine).extractFeishuHost('root-b')).toBe('tenant-b.feishu.cn');
   });
 
-  it('returns null when watchedRootUrls is empty', () => {
-    const { engine } = makeEngine({ watchedRootUrls: [] });
-    expect(internals(engine).extractFeishuHost()).toBeNull();
-  });
-
-  it('returns null when watchedRootUrls is not an array', () => {
+  it('falls back to the first enabled root only when no document owner is known', () => {
     const { engine } = makeEngine();
-    // Sabotage config to the non-array branch.
-    (engine as any).config.watchedRootUrls = undefined;
+    expect(internals(engine).extractFeishuHost()).toBe('qcnbafdrjx7n.feishu.cn');
+  });
+
+  it('returns null when no structured root or legacy fallback is configured', () => {
+    const { engine } = makeEngine({ watchedRoots: [] });
     expect(internals(engine).extractFeishuHost()).toBeNull();
   });
 
-  it('returns null when the first URL is an empty string', () => {
-    const { engine } = makeEngine({ watchedRootUrls: [''] });
+  it('returns null when all structured roots are disabled', () => {
+    const { engine } = makeEngine({
+      watchedRoots: [{
+        id: 'root-a',
+        url: 'https://tenant-a.feishu.cn/wiki/root-a',
+        localDir: 'A',
+        layoutProfile: 'directory-readme',
+        enabled: false,
+      }],
+    });
     expect(internals(engine).extractFeishuHost()).toBeNull();
   });
 
-  it('returns null when the first URL is unparseable (does not throw)', () => {
-    const { engine } = makeEngine({ watchedRootUrls: ['not-a-valid-url'] });
+  it('returns null when the selected URL is unparseable (does not throw)', () => {
+    const { engine } = makeEngine({
+      watchedRoots: [{
+        id: 'root-a',
+        url: 'not-a-valid-url',
+        localDir: 'A',
+        layoutProfile: 'directory-readme',
+        enabled: true,
+      }],
+    });
     expect(internals(engine).extractFeishuHost()).toBeNull();
   });
 });

@@ -16,6 +16,7 @@
 import type { ChannelConfig, ChannelName, ContentBackend } from './content-backend.js';
 import { ClaudeCliChannel } from './claude-cli-channel.js';
 import { DirectChannel } from './direct-channel.js';
+import { OpenCodeCliChannel } from './opencode-cli-channel.js';
 
 export class ContentBackendRegistry {
   private readonly channels = new Map<ChannelName, ContentBackend>();
@@ -23,9 +24,12 @@ export class ContentBackendRegistry {
   private readonly fallbackOnFailure: boolean;
 
   constructor(config: ChannelConfig) {
-    // Register both channels sharing the single LlmConfig.
+    // Register the remote channels plus the local OpenCode CLI channel.
+    // OpenCode reads provider credentials from its own local config; its
+    // process controls live under config.opencode.
     this.register(new DirectChannel(config.llm));
     this.register(new ClaudeCliChannel(config.llm, config.claudeCli));
+    this.register(new OpenCodeCliChannel(config.llm, config.opencode));
 
     this.primaryName = config.primaryChannel;
     this.fallbackOnFailure = config.fallbackOnFailure;
@@ -65,9 +69,13 @@ export class ContentBackendRegistry {
    * fallback is disabled or no alternative is registered.
    *
    * Only single-layer fallback is supported: claude-cli <-> direct.
+   * OpenCode deliberately has no automatic remote fallback: a user who chose
+   * local OpenCode must not have document content silently sent to a remote
+   * provider after a local CLI error.
    */
   getFallback(tried: ChannelName): ContentBackend | null {
     if (!this.fallbackOnFailure) return null;
+    if (tried === 'opencode') return null;
     const fallbackName: ChannelName = tried === 'claude-cli' ? 'direct' : 'claude-cli';
     return this.channels.get(fallbackName) ?? null;
   }

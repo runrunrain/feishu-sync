@@ -135,14 +135,14 @@ export function GlobalStatusBar() {
   };
 
   return (
-    <div className="flex items-center justify-between gap-6 px-5 py-3 bg-card-bg border border-line rounded-md shadow-sm">
+    <div className="flex flex-col gap-3 px-4 py-3 bg-card-bg border border-line rounded-md shadow-sm lg:flex-row lg:items-center lg:justify-between lg:gap-6 lg:px-5">
       {/*
         状态条布局重构（2026-06-19）：
         - px-4→px-5、py-2.5→py-3：内边距匹配 Card 内边距节奏
         - gap-4→gap-6：左右两个分组之间留呼吸
         - 内部分组 gap-1.5→gap-2.5：图标与文字间距更舒展
       */}
-      <div className="flex items-center gap-5 min-w-0 flex-1">
+      <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2 lg:flex-1 lg:gap-x-5">
         {/* Auth */}
         <div className="flex items-center gap-2 shrink-0">
           {authReady ? (
@@ -199,7 +199,7 @@ export function GlobalStatusBar() {
         </div>
       </div>
 
-      <div className="flex items-center gap-2.5 shrink-0">
+      <div className="flex flex-wrap items-center gap-2.5 lg:shrink-0">
         <button
           type="button"
           onClick={handleRefreshIndex}

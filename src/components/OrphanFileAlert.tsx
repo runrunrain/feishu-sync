@@ -23,9 +23,30 @@ interface OrphanFileAlertProps {
   orphans: OrphanFile[];
 }
 
+function classificationLabel(orphan: OrphanFile): string {
+  switch (orphan.classification) {
+    case 'missing_metadata':
+      return '缺少元数据（需补 token / 链接）';
+    case 'cloud_match_ambiguous':
+      return '疑似云端导出，匹配多义';
+    case 'ignored_artifact':
+      return '导航/忽略资产';
+    case 'local_only_confirmed':
+      return '本地独有';
+    default:
+      return orphan.cloud_match === 'unknown'
+        ? '待分类'
+        : '本地独有（cloud_match: local_only）';
+  }
+}
+
 export function OrphanFileAlert({ orphans }: OrphanFileAlertProps) {
   const [expanded, setExpanded] = useState(false);
-  if (orphans.length === 0) return null;
+  // Navigation artifacts are informational; keep them out of the badge count.
+  const actionable = orphans.filter(
+    (item) => item.classification !== 'ignored_artifact',
+  );
+  if (actionable.length === 0) return null;
 
   return (
     <Card variant="default" className="border-seal/30">
@@ -38,10 +59,10 @@ export function OrphanFileAlert({ orphans }: OrphanFileAlertProps) {
         >
           <AlertTriangle className="w-4 h-4 text-seal shrink-0" />
           <span className="text-sm text-ink font-medium">
-            发现 {orphans.length} 个本地独有文件
+            发现 {actionable.length} 个待处理本地文件
           </span>
           <span className="text-xs text-ink-faint flex-1 truncate">
-            无飞书云文档对应（如 INDEX / README / 手写笔记）
+            含缺元数据 / 多义匹配 / 本地独有等分类
           </span>
           {expanded ? (
             <ChevronDown className="w-3.5 h-3.5 text-ink-faint" />
@@ -52,7 +73,7 @@ export function OrphanFileAlert({ orphans }: OrphanFileAlertProps) {
 
         {expanded && (
           <ul className="mt-3 space-y-2 border-t border-line pt-3">
-            {orphans.map((o, idx) => (
+            {actionable.map((o, idx) => (
               <li key={`${o.path}-${idx}`} className="text-xs">
                 <div className="flex items-start gap-1.5">
                   <FileQuestion className="w-3.5 h-3.5 text-ink-faint shrink-0 mt-0.5" />
@@ -61,7 +82,7 @@ export function OrphanFileAlert({ orphans }: OrphanFileAlertProps) {
                     <p className="text-ink-faint mt-0.5">
                       <span className="inline-flex items-center gap-1">
                         <span className="inline-block w-1.5 h-1.5 rounded-full bg-ink-faint" />
-                        本地独有（cloud_match: local_only）
+                        {classificationLabel(o)}
                       </span>
                       {o.reason && (
                         <span className="ml-2 text-ink-faint/70">· {o.reason}</span>
