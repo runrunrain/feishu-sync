@@ -71,7 +71,7 @@ export function BatchActionBar({
               onClick={onBatchSkip}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs text-ink-soft border border-line rounded bg-card-bg hover:bg-paper font-sans-ui transition-colors"
             >
-              批量跳过
+              清空选择
             </button>
             <button
               type="button"

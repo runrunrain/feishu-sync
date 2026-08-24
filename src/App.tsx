@@ -25,19 +25,6 @@ function AppShell() {
   const { ready: authReady } = useAuthStatus();
   const { pendingCount } = useSyncStatus();
 
-  const renderArea = () => {
-    switch (currentArea) {
-      case 'overview':
-        return <Dashboard onJumpToSync={() => setCurrentArea('sync')} />;
-      case 'sync':
-        return <SyncView />;
-      case 'settings':
-        return <SettingsView />;
-      default:
-        return <Dashboard onJumpToSync={() => setCurrentArea('sync')} />;
-    }
-  };
-
   return (
     <div className="h-[100dvh] min-h-screen w-full overflow-hidden flex flex-col bg-paper">
       <TopBar
@@ -47,19 +34,31 @@ function AppShell() {
         pendingCount={pendingCount}
       />
       {/*
-        主内容区布局重构（v0.2.8）：
-        - 取消 max-w-* 居中限制：宽屏下两侧大空白被取消，总览/同步区全宽铺开，
-          空间让给节点树 + 文档预览主内容；设置区保留 1440px 上限维持表单可读性
-        - 总览区高度收敛：Dashboard 内部按 100dvh-88px 自管三栏等高布局
+        主内容区布局（v0.2.9 常驻挂载重构）：
+        - 三个主区全部常驻挂载，切换仅 hidden 隐藏、不卸载——此前切走再切回
+          会丢失 SyncView 本地状态（diff 列表、勾选项、同步进度/结果的前端
+          展示），同步虽在后台继续（SyncProvider 全局态），界面却被重置；
+          常驻后同步过程的进度条、结果报告在往返切换后原样保留
+        - 取消 max-w-* 居中限制：宽屏下两侧大空白被取消；设置区保留
+          1440px 上限维持表单可读性
+        - 注意：隐藏主区的 window 级交互（如 NodeTreeView 的 ↑/↓ 键盘
+          导航）需各自以 offsetParent 可见性门控，避免后台响应按键
       */}
       <main className="flex-1 overflow-auto scrollbar-thin">
         <div
-          key={currentArea}
-          className={`animate-fade-in px-4 py-4 sm:px-6 lg:px-8 ${
+          className={`px-4 py-4 sm:px-6 lg:px-8 ${
             currentArea === 'settings' ? 'mx-auto max-w-[1440px]' : 'w-full'
           }`}
         >
-          {renderArea()}
+          <div className={currentArea === 'overview' ? 'animate-fade-in' : 'hidden'}>
+            <Dashboard onJumpToSync={() => setCurrentArea('sync')} />
+          </div>
+          <div className={currentArea === 'sync' ? 'animate-fade-in' : 'hidden'}>
+            <SyncView />
+          </div>
+          <div className={currentArea === 'settings' ? 'animate-fade-in' : 'hidden'}>
+            <SettingsView />
+          </div>
         </div>
       </main>
     </div>

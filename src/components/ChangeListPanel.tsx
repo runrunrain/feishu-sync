@@ -62,6 +62,12 @@ interface ChangeListPanelProps {
   watchedRootUrls?: string[];
   /** Incremented by SyncView after a structural repair or sync completes. */
   reloadSignal?: number;
+  /**
+   * v0.2.9：批量同步真正入口。此前「批量同步」按钮只 toast 提示用户去
+   * 同步操作面板（意义不明）；现在由 SyncView 注入与「开始同步」完全
+   * 相同的确认 + 同步流程。缺省时保留旧提示行为（向后兼容）。
+   */
+  onBatchSync?: () => void;
 }
 
 /**
@@ -148,6 +154,7 @@ export function ChangeListPanel({
   onPurge,
   watchedRootUrls,
   reloadSignal = 0,
+  onBatchSync,
 }: ChangeListPanelProps) {
   const [tab, setTab] = useState<Tab>('all');
   const [diff, setDiff] = useState<DiffReport | null>(initialDiff ?? null);
@@ -287,13 +294,18 @@ export function ChangeListPanel({
 
   const handleBatchSync = () => {
     if (selectedTokens.length === 0) return;
-    // Actual sync invocation lives in SyncControlPanel (T6, P4-2). Here we
-    // surface a hint and log intent — full sync wiring lands with SyncView.
+    // v0.2.9：批量同步直接复用 SyncView 注入的「开始同步」流程（确认 +
+    // 原子写入），不再只提示用户去别处操作。
+    if (onBatchSync) {
+      appLogger.info('change-list', 'batch sync requested', { count: selectedTokens.length });
+      onBatchSync();
+      return;
+    }
     toast.push({
       type: 'info',
       message: `已选择 ${selectedTokens.length} 项，请在「同步操作面板」中开始同步`,
     });
-    appLogger.info('change-list', 'batch sync requested', { count: selectedTokens.length });
+    appLogger.info('change-list', 'batch sync requested (no handler)', { count: selectedTokens.length });
   };
 
   const handleBatchSkip = () => {

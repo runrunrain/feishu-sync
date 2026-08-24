@@ -193,6 +193,8 @@ export function NodeTreeView({
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
   const toast = useToast();
   const dragState = useRef<{ dragged: MappingNode | null }>({ dragged: null });
+  // v0.2.9：常驻挂载可见性门控用的根元素引用（见键盘导航 effect）。
+  const rootRef = useRef<HTMLDivElement>(null);
   const [dragOver, setDragOver] = useState<{ objToken: string; position: 'before' | 'after' } | null>(null);
   const [draggingToken, setDraggingToken] = useState<string | null>(null);
 
@@ -560,6 +562,9 @@ export function NodeTreeView({
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+      // v0.2.9 常驻挂载门控：主区切换后本组件只是被 hidden（不卸载），
+      // 隐藏状态下 offsetParent 为 null，此时不得后台响应方向键。
+      if (rootRef.current && rootRef.current.offsetParent === null) return;
       // 输入框 / 下拉框 / 可编辑区域内不劫持方向键。
       const target = e.target as HTMLElement | null;
       if (
@@ -861,7 +866,8 @@ export function NodeTreeView({
   }
 
   return (
-    <Card variant="default" className={`min-w-0 flex flex-col ${className}`}>
+    <div ref={rootRef} className="min-h-0 min-w-0 h-full">
+      <Card variant="default" className={`min-w-0 flex flex-col ${className}`}>
       {/*
         节点树容器布局重构（2026-06-19）：
         - 搜索栏 px-3 py-2→px-4 py-3，与 Card 内边距一致
@@ -916,6 +922,7 @@ export function NodeTreeView({
         </div>
       </div>
       <CardBody className="flex-1 overflow-hidden flex flex-col">{body}</CardBody>
-    </Card>
+      </Card>
+    </div>
   );
 }
