@@ -1,20 +1,143 @@
 /**
- * MarkdownView - 轻量 Markdown 渲染器（v0.2.8 预览面板）
+ * MarkdownView - 轻量 Markdown 渲染器（v0.2.8 预览面板，v0.2.9 完善图片/表格）
  *
  * 设计约束：项目要求断网可读、零运行时依赖，因此不引入 react-markdown，
  * 自研覆盖同步产物的常见语法子集：
  *   - ATX 标题（# ~ ######）
  *   - ``` 围栏代码块（保留语言标记展示）
- *   - GFM 管道表格
+ *   - GFM 管道表格（对齐行 `:---` / `:---:` / `---:`、转义 `\|`、缺列自动补齐）
+ *   - 图片：相对路径经 `baseDir` 解析为 kbRoot 相对路径，走鉴权 fetch →
+ *     blob → objectURL 渲染（<img> 无法携带 X-Desktop-Token）；远程 URL
+ *     直接渲染；加载/失败均有占位态
  *   - 无序/有序列表（按缩进支持嵌套）
  *   - 引用块、水平线、段落
- *   - 行内：**粗体** / *斜体* / ~~删除线~~ / `行内码` / [链接](url) / 图片占位
+ *   - 行内：**粗体** / *斜体* / ~~删除线~~ / `行内码` / [链接](url) / 图片
  *
- * 纯函数解析 + React 渲染，只读预览不做编辑。样式沿用宣纸/墨色设计 token。
+ * 同步产物适配（media-reference.ts 的改写约定）：
+ *   - 剥掉 `<synced-source>...</synced-source>` 包裹标签
+ *   - `<whiteboard token="images/a.jpg"/>` 等已被改写为本地路径的 XML
+ *     媒体标签转换为 Markdown 图片语法再解析
  */
 
-import { Fragment, type JSX, type ReactNode } from 'react';
-import { ImageIcon } from 'lucide-react';
+import { Fragment, useEffect, useState, type JSX, type ReactNode } from 'react';
+import { ImageIcon, Loader2 } from 'lucide-react';
+import { getMediaBlobUrl } from '../../api/client';
+
+// ---------------------------------------------------------------------------
+// 同步产物预处理
+// ---------------------------------------------------------------------------
+
+/** 已被改写为本地相对路径的 XML 媒体标签（whiteboard/image/img/file/source）。 */
+const XML_MEDIA_RE =
+  /<(whiteboard|image|img|file|source)\b[^>]*?(?:token|src)="([^"]+)"[^>]*?\/?>/g;
+
+function isRemoteUrl(src: string): boolean {
+  return /^https?:\/\//i.test(src);
+}
+
+function looksLikeLocalMedia(src: string): boolean {
+  return (
+    !isRemoteUrl(src) &&
+    !src.includes('://') &&
+    /\.(png|jpe?g|gif|webp|svg|avif|bmp)$/i.test(src)
+  );
+}
+
+function preprocess(markdown: string): string {
+  let out = markdown;
+  // 1) XML 媒体标签 → Markdown 图片（仅当属性值已是本地相对路径；
+  //    仍是飞书 token 的保留原文，避免渲染出坏图）。
+  out = out.replace(XML_MEDIA_RE, (whole, _tag, target: string) =>
+    looksLikeLocalMedia(target) ? `![媒体](${target})` : whole,
+  );
+  // 2) 剥掉 <synced-source> 包裹标签（保留内部内容）。
+  out = out.replace(/<\/?synced-source>/g, '');
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// 鉴权图片组件
+// ---------------------------------------------------------------------------
+
+interface AuthImageProps {
+  /** Markdown 中的原始 src（相对 md 文件目录或远程 URL）。 */
+  src: string;
+  alt: string;
+  /** md 文件所在目录（kbRoot 相对），用于解析相对 src。 */
+  baseDir: string;
+}
+
+function resolveMediaPath(src: string, baseDir: string): string {
+  const cleaned = src.replace(/^\.\//, '');
+  const segments = [...baseDir.split('/').filter(Boolean), ...cleaned.split('/')];
+  // 归一化 ..（图片引用可能指向上级目录）
+  const stack: string[] = [];
+  for (const seg of segments) {
+    if (!seg || seg === '.') continue;
+    if (seg === '..') stack.pop();
+    else stack.push(seg);
+  }
+  return stack.join('/');
+}
+
+function AuthImage({ src, alt, baseDir }: AuthImageProps) {
+  const [blobUrl, setBlobUrl] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    if (isRemoteUrl(src)) {
+      setBlobUrl(src);
+      return;
+    }
+    let cancelled = false;
+    let objectUrl: string | null = null;
+    getMediaBlobUrl(resolveMediaPath(src, baseDir))
+      .then((url) => {
+        if (cancelled) {
+          URL.revokeObjectURL(url);
+          return;
+        }
+        objectUrl = url;
+        setBlobUrl(url);
+      })
+      .catch(() => {
+        if (!cancelled) setFailed(true);
+      });
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [src, baseDir]);
+
+  if (failed) {
+    return (
+      <span
+        className="my-2 flex items-center gap-2 rounded-md border border-dashed border-line bg-paper-2/50 px-4 py-6 text-xs text-ink-faint"
+        title={src}
+      >
+        <ImageIcon className="w-4 h-4 shrink-0" />
+        图片加载失败：{alt || src}
+      </span>
+    );
+  }
+  if (!blobUrl) {
+    return (
+      <span className="my-2 flex items-center justify-center gap-2 rounded-md border border-line/60 bg-paper-2/40 px-4 py-8 text-xs text-ink-faint">
+        <Loader2 className="w-4 h-4 animate-spin" />
+        图片加载中…
+      </span>
+    );
+  }
+  return (
+    <img
+      src={blobUrl}
+      alt={alt}
+      title={alt || src}
+      className="my-2 max-w-full rounded-md border border-line/60 shadow-sm"
+      loading="lazy"
+    />
+  );
+}
 
 // ---------------------------------------------------------------------------
 // 行内解析
@@ -23,7 +146,11 @@ import { ImageIcon } from 'lucide-react';
 const INLINE_RE =
   /(!\[[^\]]*\]\([^)]*\))|(\[[^\]]*\]\([^)]*\))|(\*\*[^*]+\*\*)|(\*[^*\n]+\*)|(~~[^~]+~~)|(`[^`]+`)/g;
 
-function renderInline(text: string, keyPrefix: string): ReactNode[] {
+interface InlineContext {
+  baseDir: string;
+}
+
+function renderInline(text: string, keyPrefix: string, ctx: InlineContext): ReactNode[] {
   const out: ReactNode[] = [];
   let last = 0;
   let i = 0;
@@ -33,18 +160,10 @@ function renderInline(text: string, keyPrefix: string): ReactNode[] {
     const token = m[0];
     const key = `${keyPrefix}-${i++}`;
     if (token.startsWith('![')) {
-      // 图片：本地相对路径无法直接渲染，显示占位徽章
-      const alt = token.slice(2, token.indexOf(']'));
-      out.push(
-        <span
-          key={key}
-          className="inline-flex items-center gap-1 px-1.5 py-0.5 mx-0.5 rounded-sm bg-paper-2 border border-line text-[11px] text-ink-faint align-middle"
-          title={token}
-        >
-          <ImageIcon className="w-3 h-3" />
-          {alt || '图片'}
-        </span>,
-      );
+      const close = token.indexOf('](');
+      const alt = token.slice(2, close);
+      const src = token.slice(close + 2, -1);
+      out.push(<AuthImage key={key} src={src} alt={alt} baseDir={ctx.baseDir} />);
     } else if (token.startsWith('[')) {
       const close = token.indexOf('](');
       const label = token.slice(1, close);
@@ -99,22 +218,52 @@ function renderInline(text: string, keyPrefix: string): ReactNode[] {
 // 块级解析
 // ---------------------------------------------------------------------------
 
+type TableAlign = 'left' | 'center' | 'right';
+
 type Block =
   | { type: 'heading'; level: number; text: string }
   | { type: 'code'; lang: string; lines: string[] }
-  | { type: 'table'; header: string[]; rows: string[][] }
+  | { type: 'table'; header: string[]; aligns: TableAlign[]; rows: string[][] }
   | { type: 'list'; ordered: boolean; items: { indent: number; text: string }[] }
   | { type: 'quote'; lines: string[] }
   | { type: 'hr' }
   | { type: 'paragraph'; text: string };
 
+/** 按未转义的 | 切分单元格（`\|` 是字面竖线，不是分隔符）。 */
 function splitTableRow(line: string): string[] {
   const trimmed = line.trim().replace(/^\|/, '').replace(/\|$/, '');
-  return trimmed.split('|').map((cell) => cell.trim());
+  const cells: string[] = [];
+  let current = '';
+  for (let i = 0; i < trimmed.length; i++) {
+    const ch = trimmed[i];
+    if (ch === '\\' && trimmed[i + 1] === '|') {
+      current += '|';
+      i++;
+    } else if (ch === '|') {
+      cells.push(current.trim());
+      current = '';
+    } else {
+      current += ch;
+    }
+  }
+  cells.push(current.trim());
+  return cells;
 }
 
-function isTableSeparator(line: string): boolean {
-  return /^\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$/.test(line.trim());
+/** 判断是否为 GFM 表格分隔行，并解析各列对齐方式。 */
+function parseTableSeparator(line: string): TableAlign[] | null {
+  const trimmed = line.trim().replace(/^\|/, '').replace(/\|$/, '');
+  if (!trimmed.includes('-')) return null;
+  const parts = trimmed.split('|').map((p) => p.trim());
+  if (parts.length === 0) return null;
+  const aligns: TableAlign[] = [];
+  for (const part of parts) {
+    if (!/^:?-{2,}:?$/.test(part)) return null;
+    const left = part.startsWith(':');
+    const right = part.endsWith(':');
+    aligns.push(left && right ? 'center' : right ? 'right' : 'left');
+  }
+  return aligns;
 }
 
 function parseBlocks(markdown: string): Block[] {
@@ -164,25 +313,31 @@ function parseBlocks(markdown: string): Block[] {
       continue;
     }
 
-    // 表格：当前行含 | 且下一行是分隔行
-    if (
-      line.includes('|') &&
-      i + 1 < lines.length &&
-      isTableSeparator(lines[i + 1])
-    ) {
-      const header = splitTableRow(line);
-      const rows: string[][] = [];
-      i += 2;
-      while (
-        i < lines.length &&
-        lines[i].includes('|') &&
-        lines[i].trim() !== ''
-      ) {
-        rows.push(splitTableRow(lines[i]));
-        i++;
+    // 表格：当前行含 | 且下一行是合法分隔行
+    if (line.includes('|') && i + 1 < lines.length) {
+      const aligns = parseTableSeparator(lines[i + 1]);
+      if (aligns) {
+        const header = splitTableRow(line);
+        const rows: string[][] = [];
+        i += 2;
+        while (
+          i < lines.length &&
+          lines[i].includes('|') &&
+          lines[i].trim() !== ''
+        ) {
+          rows.push(splitTableRow(lines[i]));
+          i++;
+        }
+        // 缺列补齐到表头宽度，避免渲染错列
+        const width = Math.max(header.length, aligns.length);
+        while (header.length < width) header.push('');
+        while (aligns.length < width) aligns.push('left');
+        for (const row of rows) {
+          while (row.length < width) row.push('');
+        }
+        blocks.push({ type: 'table', header, aligns, rows });
+        continue;
       }
-      blocks.push({ type: 'table', header, rows });
-      continue;
     }
 
     // 列表（按缩进嵌套）
@@ -221,7 +376,7 @@ function parseBlocks(markdown: string): Block[] {
       !(
         lines[i].includes('|') &&
         i + 1 < lines.length &&
-        isTableSeparator(lines[i + 1])
+        parseTableSeparator(lines[i + 1]) !== null
       ) &&
       !/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(lines[i])
     ) {
@@ -247,19 +402,18 @@ const HEADING_CLASS: Record<number, string> = {
   6: 'text-xs font-medium text-ink-faint mt-2 mb-1 first:mt-0',
 };
 
+const ALIGN_CLASS: Record<TableAlign, string> = {
+  left: 'text-left',
+  center: 'text-center',
+  right: 'text-right',
+};
+
 function renderList(
   block: Extract<Block, { type: 'list' }>,
   keyPrefix: string,
+  ctx: InlineContext,
 ): JSX.Element {
-  // 按 indent 分层：indent === 基准值 为一层；更大缩进归入子层。
   const baseIndent = Math.min(...block.items.map((it) => it.indent));
-  const levels: { indent: number; text: string }[][] = [];
-  for (const item of block.items) {
-    const depth = Math.round((item.indent - baseIndent) / 2);
-    if (!levels[depth]) levels[depth] = [];
-    levels[depth].push(item);
-  }
-  // 简化渲染：一层列表 + 缩进 padding 表示嵌套，避免复杂递归树。
   const ListTag = block.ordered ? 'ol' : 'ul';
   return (
     <ListTag
@@ -273,20 +427,20 @@ function renderList(
           style={{ marginLeft: `${16 + Math.max(0, item.indent - baseIndent) * 1.5}px` }}
           className="pl-1 marker:text-jade"
         >
-          {renderInline(item.text, `${keyPrefix}-${idx}`)}
+          {renderInline(item.text, `${keyPrefix}-${idx}`, ctx)}
         </li>
       ))}
     </ListTag>
   );
 }
 
-function renderBlock(block: Block, index: number): ReactNode {
+function renderBlock(block: Block, index: number, ctx: InlineContext): ReactNode {
   const key = `b-${index}`;
   switch (block.type) {
     case 'heading':
       return (
         <div key={key} className={HEADING_CLASS[block.level] ?? HEADING_CLASS[6]}>
-          {renderInline(block.text, key)}
+          {renderInline(block.text, key, ctx)}
         </div>
       );
     case 'code':
@@ -311,9 +465,11 @@ function renderBlock(block: Block, index: number): ReactNode {
                 {block.header.map((cell, ci) => (
                   <th
                     key={ci}
-                    className="px-3 py-2 text-left font-medium text-ink border-b border-line whitespace-nowrap"
+                    className={`px-3 py-2 font-medium text-ink border-b border-line whitespace-nowrap ${
+                      ALIGN_CLASS[block.aligns[ci] ?? 'left']
+                    }`}
                   >
-                    {renderInline(cell, `${key}-h${ci}`)}
+                    {renderInline(cell, `${key}-h${ci}`, ctx)}
                   </th>
                 ))}
               </tr>
@@ -324,9 +480,11 @@ function renderBlock(block: Block, index: number): ReactNode {
                   {row.map((cell, ci) => (
                     <td
                       key={ci}
-                      className="px-3 py-1.5 text-ink-soft border-b border-line/40 align-top"
+                      className={`px-3 py-1.5 text-ink-soft border-b border-line/40 align-top ${
+                        ALIGN_CLASS[block.aligns[ci] ?? 'left']
+                      }`}
                     >
-                      {renderInline(cell, `${key}-r${ri}c${ci}`)}
+                      {renderInline(cell, `${key}-r${ri}c${ci}`, ctx)}
                     </td>
                   ))}
                 </tr>
@@ -336,7 +494,7 @@ function renderBlock(block: Block, index: number): ReactNode {
         </div>
       );
     case 'list':
-      return renderList(block, key);
+      return renderList(block, key, ctx);
     case 'quote':
       return (
         <blockquote
@@ -344,7 +502,7 @@ function renderBlock(block: Block, index: number): ReactNode {
           className="my-3 pl-3 border-l-2 border-jade/60 text-sm text-ink-soft italic space-y-1"
         >
           {block.lines.map((l, li) => (
-            <p key={li}>{renderInline(l, `${key}-q${li}`)}</p>
+            <p key={li}>{renderInline(l, `${key}-q${li}`, ctx)}</p>
           ))}
         </blockquote>
       );
@@ -353,7 +511,7 @@ function renderBlock(block: Block, index: number): ReactNode {
     case 'paragraph':
       return (
         <p key={key} className="my-2 text-sm leading-relaxed text-ink-soft">
-          {renderInline(block.text, key)}
+          {renderInline(block.text, key, ctx)}
         </p>
       );
     default:
@@ -365,12 +523,19 @@ function renderBlock(block: Block, index: number): ReactNode {
 // 组件出口
 // ---------------------------------------------------------------------------
 
-export function MarkdownView({ content }: { content: string }) {
-  const blocks = parseBlocks(content);
+export interface MarkdownViewProps {
+  content: string;
+  /** md 文件所在目录（kbRoot 相对 POSIX 路径），用于解析相对图片路径。 */
+  baseDir?: string;
+}
+
+export function MarkdownView({ content, baseDir = '' }: MarkdownViewProps) {
+  const blocks = parseBlocks(preprocess(content));
+  const ctx: InlineContext = { baseDir };
   return (
     <div className="px-5 py-4">
       {blocks.map((b, i) => (
-        <Fragment key={i}>{renderBlock(b, i)}</Fragment>
+        <Fragment key={i}>{renderBlock(b, i, ctx)}</Fragment>
       ))}
     </div>
   );

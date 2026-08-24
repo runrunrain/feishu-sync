@@ -78,6 +78,82 @@ function readTextCapped(
 
 export const contentRoutes = new Hono();
 
+/**
+ * GET /api/mapping/media?path=<kbRoot 相对路径>（v0.2.9 预览图片支持）
+ *
+ * 同步产物中的 Markdown 以相对路径引用图片（`<文档目录>/images/xx.jpg`），
+ * 前端把相对 src 解析为 kbRoot 相对路径后调此接口取二进制。路径经
+ * resolveAbsolute + isPathInsideRoot 双重收敛，只允许图片扩展名，25MB 上限。
+ * 仍走 X-Desktop-Token 鉴权（前端 fetch → blob → objectURL 渲染）。
+ */
+const MEDIA_MIME: Record<string, string> = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.svg': 'image/svg+xml',
+  '.avif': 'image/avif',
+  '.bmp': 'image/bmp',
+};
+const MAX_MEDIA_BYTES = 25 * 1024 * 1024;
+
+contentRoutes.get('/api/mapping/media', async (c) => {
+  const relPath = c.req.query('path');
+  if (!relPath) {
+    return c.json({ error: 'path query parameter is required' }, 400);
+  }
+  try {
+    const { configManager } = getDeps(c);
+    const config = configManager.getConfig();
+    const knowledgeBaseRoot = config?.knowledgeBaseRoot;
+    if (!knowledgeBaseRoot) {
+      return c.json({ error: 'knowledgeBaseRoot not configured' }, 400);
+    }
+
+    const rel = toPortableRelative(knowledgeBaseRoot, relPath);
+    if (!rel) {
+      return c.json({ error: 'path_outside_root' }, 403);
+    }
+    const ext = path.extname(rel).toLowerCase();
+    const mime = MEDIA_MIME[ext];
+    if (!mime) {
+      return c.json({ error: 'unsupported_media_type' }, 415);
+    }
+    const abs = resolveAbsolute(knowledgeBaseRoot, rel);
+    if (!isPathInsideRoot(knowledgeBaseRoot, abs)) {
+      return c.json({ error: 'path_outside_root' }, 403);
+    }
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(abs);
+    } catch {
+      return c.json({ error: 'media_not_found' }, 404);
+    }
+    if (!stat.isFile() || stat.size > MAX_MEDIA_BYTES) {
+      return c.json({ error: 'media_not_found_or_too_large' }, 404);
+    }
+    const buffer = fs.readFileSync(abs);
+    return new Response(new Uint8Array(buffer), {
+      status: 200,
+      headers: {
+        'Content-Type': mime,
+        'Content-Length': String(stat.size),
+        'Cache-Control': 'private, max-age=300',
+      },
+    });
+  } catch (error) {
+    console.error('[content] read media failed:', error);
+    return c.json(
+      {
+        error: 'media_read_failed',
+        message: error instanceof Error ? error.message : String(error),
+      },
+      500,
+    );
+  }
+});
+
 contentRoutes.get('/api/mapping/content/:objToken', async (c) => {
   const objToken = c.req.param('objToken');
   if (!objToken) {

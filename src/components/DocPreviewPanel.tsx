@@ -136,6 +136,13 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
   const activeCsv = csvTables[Math.min(csvIndex, csvTables.length - 1)] ?? null;
   const fileMissing =
     content != null && content.mdContent == null && csvTables.length === 0;
+  // md 文件所在目录（kbRoot 相对），MarkdownView 用它解析相对图片路径。
+  const mdBaseDir = useMemo(() => {
+    const p = content?.mdPath;
+    if (!p) return '';
+    const idx = p.lastIndexOf('/');
+    return idx >= 0 ? p.slice(0, idx) : '';
+  }, [content?.mdPath]);
 
   // ---- 空态 1：未选中 ----
   if (!node) {
@@ -281,7 +288,7 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
         ) : formatTab === 'md' ? (
           hasMd && mdMode === 'rendered' ? (
             <div key={`${objToken}-md-r`} className="animate-fade-in">
-              <MarkdownView content={content!.mdContent!} />
+              <MarkdownView content={content!.mdContent!} baseDir={mdBaseDir} />
             </div>
           ) : hasMd ? (
             <pre

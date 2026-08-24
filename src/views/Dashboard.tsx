@@ -21,13 +21,15 @@
  * GlobalStatusBar 内部已处理 B4 修复（立即检测取 watchedRootUrls[0]）。
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState, type CSSProperties } from 'react';
+import { PanelRightClose, PanelRightOpen } from 'lucide-react';
 import { GlobalStatusBar } from '../components/GlobalStatusBar';
 import { NodeTreeView } from '../components/NodeTreeView';
 import { LocalDirTreeView } from '../components/LocalDirTreeView';
 import { RecentChanges } from '../components/RecentChanges';
 import { NodeDetailCard } from '../components/NodeDetailCard';
 import { DocPreviewPanel } from '../components/DocPreviewPanel';
+import { ColumnResizer } from '../components/ColumnResizer';
 import { OrphanFileAlert } from '../components/OrphanFileAlert';
 import { QuickAddDocDialog } from '../components/QuickAddDocDialog';
 import { useConfig } from '../hooks/useConfig';
@@ -56,6 +58,23 @@ interface DashboardProps {
 
 type NodeView = 'feishu' | 'local';
 
+// v0.2.9 布局偏好：左栏拖拽宽度 / 右栏收起状态，localStorage 持久化。
+const DEFAULT_LEFT_WIDTH = 320;
+const LEFT_WIDTH_KEY = 'feishu.layout.leftWidth';
+const RIGHT_COLLAPSED_KEY = 'feishu.layout.rightCollapsed';
+
+function readLeftWidth(): number {
+  try {
+    const raw = localStorage.getItem(LEFT_WIDTH_KEY);
+    const value = raw ? Number(raw) : NaN;
+    return Number.isFinite(value) && value >= 240 && value <= 560
+      ? value
+      : DEFAULT_LEFT_WIDTH;
+  } catch {
+    return DEFAULT_LEFT_WIDTH;
+  }
+}
+
 export function Dashboard({ onJumpToSync }: DashboardProps) {
   const { config } = useConfig();
   // Single envelope per view; refreshed on view switch or manual refresh.
@@ -76,6 +95,32 @@ export function Dashboard({ onJumpToSync }: DashboardProps) {
   const [customFoldersLoading, setCustomFoldersLoading] = useState(true);
   const [quickAddOpen, setQuickAddOpen] = useState(false);
   const toast = useToast();
+
+  // v0.2.9 布局偏好：左栏可拖拽宽度 + 右栏可收起（localStorage 持久化）。
+  const [leftWidth, setLeftWidth] = useState<number>(readLeftWidth);
+  const [rightCollapsed, setRightCollapsed] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(RIGHT_COLLAPSED_KEY) === '1';
+    } catch {
+      return false;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(LEFT_WIDTH_KEY, String(leftWidth));
+    } catch {
+      /* localStorage 不可用时静默降级 */
+    }
+  }, [leftWidth]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(RIGHT_COLLAPSED_KEY, rightCollapsed ? '1' : '0');
+    } catch {
+      /* 同上 */
+    }
+  }, [rightCollapsed]);
 
   // Load diff + snapshot once root URL is ready.
   const rootUrl = pickFirstValidWikiUrl(config?.watchedRootUrls);
@@ -259,16 +304,20 @@ export function Dashboard({ onJumpToSync }: DashboardProps) {
       <GlobalStatusBar />
 
       {/*
-        v0.2.8 三栏布局（替代原"左树 340px + 右栏纵向堆叠"）：
-        - 左栏 300/320px：节点树（飞书/本地），主导航
-        - 中栏 flex-1：DocPreviewPanel 文档预览（主内容区，占最大面积）
-        - 右栏 320/340px：详情侧栏（孤儿提醒 + 节点详情 + 最近变更）
+        v0.2.9 三栏布局增强（在 v0.2.8 三栏基础上）：
+        - 左栏宽度可拖拽调整（ColumnResizer，240-560px，双击复位，localStorage 持久化）；
+          通过 CSS 变量 --tree-w 驱动，仅 lg 及以上生效，窄屏仍纵向堆叠
+        - 右栏可点击收起为 36px 竖条（PanelRightClose/Open，localStorage 持久化），
+          把空间让给中部预览主区域
         lg 及以上三栏等高（100dvh - TopBar56 - main padding32 - 状态条约56 - 间距），
-        各栏内部独立滚动；窄屏退化为纵向堆叠。
+        各栏内部独立滚动。
       */}
-      <div className="grid min-w-0 grid-cols-1 gap-4 lg:h-[calc(100dvh-196px)] lg:min-h-[480px] lg:grid-cols-[minmax(0,300px)_minmax(0,1fr)_minmax(0,320px)] xl:grid-cols-[minmax(0,320px)_minmax(0,1fr)_minmax(0,340px)]">
-        {/* Left: node tree (feishu or local) */}
-        <div className="min-w-0 min-h-[360px] lg:min-h-0 lg:h-full">
+      <div className="flex min-w-0 flex-col gap-4 lg:h-[calc(100dvh-196px)] lg:min-h-[480px] lg:flex-row lg:gap-0">
+        {/* Left: node tree (feishu or local) — width adjustable via resizer */}
+        <div
+          className="min-w-0 min-h-[360px] lg:min-h-0 lg:h-full lg:shrink-0 lg:w-[var(--tree-w)]"
+          style={{ '--tree-w': `${leftWidth}px` } as CSSProperties}
+        >
           {view === 'feishu' ? (
             <NodeTreeView
               nodes={feishuEnv?.nodes}
@@ -297,8 +346,15 @@ export function Dashboard({ onJumpToSync }: DashboardProps) {
           )}
         </div>
 
+        {/* Divider: drag to adjust left/center width ratio */}
+        <ColumnResizer
+          width={leftWidth}
+          defaultWidth={DEFAULT_LEFT_WIDTH}
+          onResize={setLeftWidth}
+        />
+
         {/* Center: document preview (primary content area) */}
-        <div className="min-w-0 min-h-[420px] lg:min-h-0 lg:h-full">
+        <div className="min-w-0 min-h-[420px] lg:min-h-0 lg:h-full lg:ml-1 flex-1">
           <DocPreviewPanel
             node={selectedNode}
             onOpenFolder={handleOpenFolder}
@@ -306,26 +362,54 @@ export function Dashboard({ onJumpToSync }: DashboardProps) {
           />
         </div>
 
-        {/* Right: detail sidebar (orphan alert + node detail + recent changes) */}
-        <div className="min-w-0 space-y-4 lg:min-h-0 lg:h-full lg:overflow-y-auto lg:scrollbar-thin lg:pr-1">
-          <OrphanFileAlert orphans={orphans} />
-          <NodeDetailCard
-            node={selectedNode}
-            businessMarks={selectedNode ? businessMarksByToken[selectedNode.obj_token] : undefined}
-            allNodes={activeNodes}
-            watchedRoots={watchedRoots}
-            onSelectNode={setSelectedToken}
-            onSyncNode={() => {
-              toast.push({
-                type: 'info',
-                message: '请前往「贰 同步」主区同步该节点',
-              });
-              onJumpToSync();
-            }}
-            onOpenFolder={handleOpenFolder}
-          />
-          <RecentChanges changes={changes} onJumpToSync={onJumpToSync} />
-        </div>
+        {/* Right: collapsible detail sidebar */}
+        {rightCollapsed ? (
+          <div className="hidden lg:flex lg:ml-4 lg:w-9 lg:shrink-0 flex-col items-center gap-2 rounded-md border border-line bg-card-bg py-2 shadow-sm">
+            <button
+              type="button"
+              onClick={() => setRightCollapsed(false)}
+              title="展开详情栏"
+              aria-label="展开详情栏"
+              className="rounded-sm p-1.5 text-ink-faint transition-colors hover:bg-paper-2 hover:text-seal"
+            >
+              <PanelRightOpen className="w-4 h-4" />
+            </button>
+            <span className="text-[10px] text-ink-faint font-sans-ui [writing-mode:vertical-lr] select-none">
+              详情
+            </span>
+          </div>
+        ) : (
+          <div className="min-w-0 space-y-3 lg:ml-4 lg:min-h-0 lg:h-full lg:w-[320px] lg:shrink-0 lg:overflow-y-auto lg:scrollbar-thin lg:pr-1 xl:w-[340px]">
+            <div className="hidden lg:flex justify-end">
+              <button
+                type="button"
+                onClick={() => setRightCollapsed(true)}
+                title="收起详情栏"
+                aria-label="收起详情栏"
+                className="rounded-sm p-1 text-ink-faint transition-colors hover:bg-paper-2 hover:text-seal"
+              >
+                <PanelRightClose className="w-4 h-4" />
+              </button>
+            </div>
+            <OrphanFileAlert orphans={orphans} />
+            <NodeDetailCard
+              node={selectedNode}
+              businessMarks={selectedNode ? businessMarksByToken[selectedNode.obj_token] : undefined}
+              allNodes={activeNodes}
+              watchedRoots={watchedRoots}
+              onSelectNode={setSelectedToken}
+              onSyncNode={() => {
+                toast.push({
+                  type: 'info',
+                  message: '请前往「贰 同步」主区同步该节点',
+                });
+                onJumpToSync();
+              }}
+              onOpenFolder={handleOpenFolder}
+            />
+            <RecentChanges changes={changes} onJumpToSync={onJumpToSync} />
+          </div>
+        )}
       </div>
 
       <QuickAddDocDialog

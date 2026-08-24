@@ -386,6 +386,25 @@ export async function getDocumentContent(objToken: string): Promise<DocumentCont
 }
 
 /**
+ * GET /api/mapping/media?path=... — 图片二进制（v0.2.9 预览图片支持）。
+ * <img> 标签无法携带 X-Desktop-Token，因此走 fetch → blob → objectURL；
+ * 调用方负责在组件卸载时 URL.revokeObjectURL()。
+ */
+export async function getMediaBlobUrl(relPath: string): Promise<string> {
+  const headers = await getApiHeaders();
+  const baseUrl = await getBaseUrl();
+  const qs = new URLSearchParams({ path: relPath });
+  const response = await fetch(`${baseUrl}/api/mapping/media?${qs.toString()}`, {
+    headers: { ...headers },
+  });
+  if (!response.ok) {
+    throw new APIError(`media ${response.status}`, response.status);
+  }
+  const blob = await response.blob();
+  return URL.createObjectURL(blob);
+}
+
+/**
  * GET /api/mapping/diff — DiffReport grouped by added/modified/deleted.
  */
 export async function getMappingDiff(rootUrl: string): Promise<DiffReport> {
