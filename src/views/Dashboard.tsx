@@ -21,7 +21,7 @@
  * GlobalStatusBar 内部已处理 B4 修复（立即检测取 watchedRootUrls[0]）。
  */
 
-import { useCallback, useEffect, useMemo, useState, type CSSProperties } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { PanelRightClose, PanelRightOpen } from 'lucide-react';
 import { GlobalStatusBar } from '../components/GlobalStatusBar';
 import { NodeTreeView } from '../components/NodeTreeView';
@@ -49,6 +49,7 @@ import type {
   DiffReport,
   OrphanFile,
   TreeResponse,
+  TreeNavTarget,
   WatchedRoot,
 } from '../types';
 
@@ -94,17 +95,73 @@ export function Dashboard({ onJumpToSync }: DashboardProps) {
   const [customFolders, setCustomFolders] = useState<CustomFolder[]>([]);
   const [customFoldersLoading, setCustomFoldersLoading] = useState(true);
   const [quickAddOpen, setQuickAddOpen] = useState(false);
+  // 跳转导航请求（快捷添加/归档管理的「跳转查看」）：nonce 变化触发 NodeTreeView 定位。
+  const [focusRequest, setFocusRequest] = useState<
+    (TreeNavTarget & { nonce: number }) | null
+  >(null);
+  const navigateTree = (target: TreeNavTarget) => {
+    // 自定义归档/分组树均在飞书视图下渲染，导航前确保视图正确。
+    if (view !== 'feishu') setView('feishu');
+    setFocusRequest({ ...target, nonce: Date.now() });
+  };
   const toast = useToast();
 
   // v0.2.9 布局偏好：左栏可拖拽宽度 + 右栏可收起（localStorage 持久化）。
   const [leftWidth, setLeftWidth] = useState<number>(readLeftWidth);
   const [rightCollapsed, setRightCollapsed] = useState<boolean>(() => {
     try {
-      return localStorage.getItem(RIGHT_COLLAPSED_KEY) === '1';
+      const raw = localStorage.getItem(RIGHT_COLLAPSED_KEY);
+      // 默认收起（2026-08 需求）：未表达过偏好时收起右栏，把空间让给预览主区；
+      // 一旦用户手动展开/收起，仍以 localStorage 偏好为准。
+      return raw === null ? true : raw === '1';
     } catch {
-      return false;
+      return true;
     }
   });
+
+  // 右栏展开时左/中栏等比例压缩（2026-08 需求）：左栏保持其在「右栏之外
+  // 可用宽度」中的占比，而不是右栏宽度全由中部 flex-1 独自吸收。
+  // 以行容器实测宽度换算；仅 lg+ 横向布局生效。
+  const rowRef = useRef<HTMLDivElement>(null);
+  const [rowWidth, setRowWidth] = useState(0);
+  useEffect(() => {
+    const el = rowRef.current;
+    if (!el) return;
+    const observer = new ResizeObserver((entries) => {
+      setRowWidth(entries[0].contentRect.width);
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+  // 右栏展开宽度与 xl 断点联动（lg:w-[320px] xl:w-[340px]），用 matchMedia 保持一致。
+  const [isXl, setIsXl] = useState<boolean>(() =>
+    typeof window !== 'undefined'
+      ? window.matchMedia('(min-width: 1280px)').matches
+      : false,
+  );
+  useEffect(() => {
+    const mq = window.matchMedia('(min-width: 1280px)');
+    const onChange = () => setIsXl(mq.matches);
+    mq.addEventListener('change', onChange);
+    return () => mq.removeEventListener('change', onChange);
+  }, []);
+
+  // 布局常量与下方 JSX 类名保持一致：resizer w-3(12) + 中部 ml-1(4) + 右栏 ml-4(16)。
+  const RESIZER_AND_GAP = 16;
+  const RIGHT_MARGIN = 16;
+  const RIGHT_STRIP_W = 36; // 收起态竖条 w-9
+  const rightOpenW = isXl ? 340 : 320;
+  let effectiveLeftWidth = leftWidth;
+  if (!rightCollapsed && rowWidth >= 1024) {
+    const closedAvail = rowWidth - RIGHT_STRIP_W - RIGHT_MARGIN - RESIZER_AND_GAP;
+    const openAvail = rowWidth - rightOpenW - RIGHT_MARGIN - RESIZER_AND_GAP;
+    if (closedAvail > 0 && openAvail > 0) {
+      effectiveLeftWidth = Math.max(
+        220,
+        Math.min(560, Math.round((leftWidth / closedAvail) * openAvail)),
+      );
+    }
+  }
 
   useEffect(() => {
     try {
@@ -312,11 +369,12 @@ export function Dashboard({ onJumpToSync }: DashboardProps) {
         lg 及以上三栏等高（100dvh - TopBar56 - main padding32 - 状态条约56 - 间距），
         各栏内部独立滚动。
       */}
-      <div className="flex min-w-0 flex-col gap-4 lg:h-[calc(100dvh-196px)] lg:min-h-[480px] lg:flex-row lg:gap-0">
-        {/* Left: node tree (feishu or local) — width adjustable via resizer */}
+      <div ref={rowRef} className="flex min-w-0 flex-col gap-4 lg:h-[calc(100dvh-196px)] lg:min-h-[480px] lg:flex-row lg:gap-0">
+        {/* Left: node tree (feishu or local) — width adjustable via resizer；
+            右栏展开时按等比例压缩后的 effectiveLeftWidth 渲染 */}
         <div
           className="min-w-0 min-h-[360px] lg:min-h-0 lg:h-full lg:shrink-0 lg:w-[var(--tree-w)]"
-          style={{ '--tree-w': `${leftWidth}px` } as CSSProperties}
+          style={{ '--tree-w': `${effectiveLeftWidth}px` } as CSSProperties}
         >
           {view === 'feishu' ? (
             <NodeTreeView
@@ -330,6 +388,7 @@ export function Dashboard({ onJumpToSync }: DashboardProps) {
               watchedRoots={watchedRoots}
               customFolders={customFolders}
               onQuickAdd={() => setQuickAddOpen(true)}
+              focusRequest={focusRequest}
               onRefreshed={loadFeishu}
               className="h-full"
             />
@@ -415,6 +474,10 @@ export function Dashboard({ onJumpToSync }: DashboardProps) {
       <QuickAddDocDialog
         open={quickAddOpen}
         onClose={() => setQuickAddOpen(false)}
+        onNavigate={(target) => {
+          setQuickAddOpen(false);
+          navigateTree(target);
+        }}
         folders={customFolders}
         foldersLoading={customFoldersLoading}
         onChanged={() => {

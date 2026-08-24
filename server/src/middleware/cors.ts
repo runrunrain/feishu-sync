@@ -33,13 +33,14 @@ export function corsMiddleware(options: CorsOptions = {}): MiddlewareHandler {
         return null;
       }
 
-      // Allow only specific localhost origins in dev mode
-      const allowedOrigins = [
-        'http://localhost:5173',
-        'http://127.0.0.1:5173',
-      ];
+      // Allow localhost/127.0.0.1 origins on any port in dev mode
+      // （本机常有多项目并行开发，5173 可能被占用导致 vite 端口漂移；
+      // dev gate 仅限 loopback，生产 desktop 仍走 expectedOrigin 严格校验）。
+      if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+        return origin;
+      }
 
-      return allowedOrigins.includes(origin) ? origin : null;
+      return null;
     },
     allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowHeaders: ['Content-Type', 'Authorization', 'X-Desktop-Token'],

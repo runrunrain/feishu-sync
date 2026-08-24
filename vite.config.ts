@@ -33,6 +33,11 @@ function parseBackendPort(rawValue: string | undefined): number {
 
 const devProxyTarget = `http://127.0.0.1:${parseBackendPort(process.env.BACKEND_PORT)}`
 
+// 浏览器 dev:all 免 Electron：server standalone 用 FEISHU_SYNC_DEV_TOKEN 固定
+// token 时，vite proxy 自动注入 X-Desktop-Token（浏览器侧 window.desktop 不
+// 存在，拿不到 token）。仅开发态生效，生产构建不走 proxy。
+const devToken = process.env.FEISHU_SYNC_DEV_TOKEN?.trim()
+
 export default defineConfig({
   base: './',
   define: {
@@ -52,6 +57,9 @@ export default defineConfig({
       '/api': {
         target: devProxyTarget,
         changeOrigin: true,
+        ...(devToken
+          ? { headers: { 'X-Desktop-Token': devToken } }
+          : {}),
       },
     },
   },

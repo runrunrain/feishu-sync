@@ -75,3 +75,20 @@ export function normalizeFeishuUrlList(urls: string[]): string[] {
   }
   return out;
 }
+
+/**
+ * 从 canonical wiki URL 提取根节点 token（watchedRoots.id）。
+ * 非合法 https://<租户>.feishu.cn/wiki/<token> 形式返回 null。
+ */
+export function extractWikiRootId(url: string): string | null {
+  try {
+    const parsed = new URL(url);
+    const match = parsed.pathname.match(/^\/wiki\/([A-Za-z0-9]+)$/);
+    if (parsed.protocol !== 'https:' || !/\.feishu\.cn$/i.test(parsed.hostname) || !match) {
+      return null;
+    }
+    return match[1];
+  } catch {
+    return null;
+  }
+}

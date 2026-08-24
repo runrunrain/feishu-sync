@@ -34,7 +34,7 @@ import { TreeViewModeToggle } from './TreeViewModeToggle';
 import { useToast } from './common/Toast';
 import { appLogger } from '../utils/appLogger';
 import { getMappingTree, reorderMapping } from '../api/client';
-import type { CustomFolder, MappingNode, WatchedRoot } from '../types';
+import type { CustomFolder, MappingNode, TreeNavTarget, WatchedRoot } from '../types';
 
 type TreeFilter = 'all' | 'changed' | 'error' | 'orphan';
 
@@ -94,6 +94,12 @@ interface NodeTreeViewProps {
   customFolders?: CustomFolder[];
   /** 提供时在搜索行旁渲染「快捷添加云文档」+ 按钮（由父组件打开对话框）。 */
   onQuickAdd?: () => void;
+  /**
+   * 外部跳转导航请求（快捷添加/设置管理的「跳转查看」）。以 nonce 变化为
+   * 触发信号；激活目标分组/自定义归档、展开并滚动定位，custom-doc 还会
+   * 联动 onSelect 选中该文档。
+   */
+  focusRequest?: (TreeNavTarget & { nonce: number }) | null;
 }
 
 interface TreeBucket {
@@ -183,6 +189,7 @@ export function NodeTreeView({
   watchedRoots,
   customFolders,
   onQuickAdd,
+  focusRequest,
 }: NodeTreeViewProps) {
   const [nodes, setNodes] = useState<MappingNode[]>(nodesProp ?? []);
   const [loading, setLoading] = useState<boolean>(!nodesProp);
@@ -192,6 +199,10 @@ export function NodeTreeView({
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   // v0.2.4: watchedRoot 分组（根目录）可收起；key 为 watchedRoot.url。默认展开，点击分组标题切换。
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
+  // 书签条分组过滤（2026-08）：key 为 watchedRoot.url / UNCLASSIFIED_KEY /
+  // CUSTOM_ARCHIVE_KEY；null = 显示全部。选中后树体只渲染该分组内容，
+  // 再次点击同一书签恢复全部。
+  const [activeGroupKey, setActiveGroupKey] = useState<string | null>(null);
   const toast = useToast();
   const dragState = useRef<{ dragged: MappingNode | null }>({ dragged: null });
   // v0.2.9：常驻挂载可见性门控用的根元素引用（见键盘导航 effect）。
@@ -233,9 +244,15 @@ export function NodeTreeView({
 
   // Default expand logical roots and any node with changed/error status up to
   // depth 2 so changed nodes are visible.
+  // 仅首载应用一次（didInitExpandRef）：此后用户主动收起/切换分组时清空
+  // expanded 后，节点刷新（nodes/tree 变化）不得再触发默认展开，否则
+  // 「只看一级」会被静默覆盖（2026-08 实测问题）。
+  const didInitExpandRef = useRef(false);
   useEffect(() => {
-    setExpanded((prev) => {
-      if (prev.size > 0) return prev; // user already toggled; don't override
+    if (didInitExpandRef.current) return;
+    if (nodes.length === 0) return;
+    didInitExpandRef.current = true;
+    setExpanded(() => {
       const next = new Set<string>();
       for (const r of roots) {
         if (r.has_child) next.add(r.obj_token);
@@ -520,13 +537,24 @@ export function NodeTreeView({
       }
     }
     const groups = watchedRoots
-      .map((wr) => ({
-        watchedRoot: wr,
-        nodes: byUrl.get(wr.url) ?? [],
-      }))
+      .map((wr) => {
+        const raw = byUrl.get(wr.url) ?? [];
+        // 根 URL 层级不显示（2026-08 需求）：分组内若含 watched root 节点自身
+        // （wiki_node_token === wr.nodeToken，与分组头同名重复）且其有子节点，
+        // 隐藏该层级、把子节点提升为分组顶层；无子节点的根节点本身就是文档
+        // （如 [必读] 研发规范 README），保留显示，否则分组会空。
+        const displayNodes = raw.flatMap((n) => {
+          if (n.wiki_node_token && n.wiki_node_token === wr.nodeToken) {
+            const kids = tree.childrenByParent.get(n.wiki_node_token) ?? [];
+            if (kids.length > 0) return kids;
+          }
+          return [n];
+        });
+        return { watchedRoot: wr, nodes: raw, displayNodes };
+      })
       .filter((g) => g.nodes.length > 0);
     return { groups, unclassified };
-  }, [roots, watchedRoots]);
+  }, [roots, watchedRoots, tree]);
 
   // ------------------------------------------------------------------
   // 键盘上下键导航（v0.2.8）：按渲染顺序前序 DFS 收集「当前可见且已
@@ -548,17 +576,22 @@ export function NodeTreeView({
     };
     if (groupedRoots) {
       for (const g of groupedRoots.groups) {
+        // 分组过滤态下非选中分组不参与键盘导航（与树体渲染口径一致）。
+        if (activeGroupKey && g.watchedRoot.url !== activeGroupKey) continue;
         if (collapsedGroups.has(g.watchedRoot.url)) continue;
-        for (const r of g.nodes) walk(r);
+        for (const r of g.displayNodes) walk(r);
       }
-      if (!collapsedGroups.has(UNCLASSIFIED_KEY)) {
+      if (
+        (!activeGroupKey || activeGroupKey === UNCLASSIFIED_KEY) &&
+        !collapsedGroups.has(UNCLASSIFIED_KEY)
+      ) {
         for (const r of groupedRoots.unclassified) walk(r);
       }
     } else {
       for (const r of roots) walk(r);
     }
     return out;
-  }, [groupedRoots, roots, tree, expanded, collapsedGroups, visibleTokens]);
+  }, [groupedRoots, roots, tree, expanded, collapsedGroups, visibleTokens, activeGroupKey]);
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -670,6 +703,7 @@ export function NodeTreeView({
                       return (
                         <div
                           key={doc.objToken}
+                          data-doc-token={doc.objToken}
                           role="treeitem"
                           aria-selected={selected}
                           tabIndex={0}
@@ -716,6 +750,48 @@ export function NodeTreeView({
     );
   };
 
+  // 外部跳转导航请求：nonce 变化即触发一次。目标分组不存在（如新添加的
+  // 根 URL 尚未检测到内容）时不切分组过滤，避免把树体清空。
+  useEffect(() => {
+    if (!focusRequest) return;
+    if (focusRequest.kind === 'group') {
+      const key = focusRequest.key;
+      const exists =
+        key === CUSTOM_ARCHIVE_KEY ||
+        key === UNCLASSIFIED_KEY ||
+        (groupedRoots?.groups.some((g) => g.watchedRoot.url === key) ?? false);
+      if (exists) {
+        setActiveGroupKey(key);
+        setCollapsedGroups((prev) => {
+          const next = new Set(prev);
+          next.delete(key);
+          return next;
+        });
+      }
+      requestAnimationFrame(() => {
+        document
+          .querySelector(`[data-group-header="${CSS.escape(key)}"]`)
+          ?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+      });
+      return;
+    }
+    // custom-doc：切到自定义归档分组、展开目标文件夹、选中并滚动定位。
+    setActiveGroupKey(CUSTOM_ARCHIVE_KEY);
+    setCollapsedGroups((prev) => {
+      const next = new Set(prev);
+      next.delete(`custom:${focusRequest.folderId}`);
+      return next;
+    });
+    onSelect?.(focusRequest.objToken);
+    requestAnimationFrame(() => {
+      document
+        .querySelector(`[data-doc-token="${CSS.escape(focusRequest.objToken)}"]`)
+        ?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    });
+    // 仅以 nonce 为触发信号；groupedRoots/onSelect 读最新渲染轮的值即可。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusRequest?.nonce]);
+
   // ----- Loading / error / empty states -----
   const toggleGroup = (key: string) => {
     setCollapsedGroups((prev) => {
@@ -726,9 +802,23 @@ export function NodeTreeView({
     });
   };
 
-  // 根目录锚点条：点击书签 → 展开该分组（若已收起）并平滑滚动到其分组头。
-  const jumpToGroup = (key: string) => {
-    if (collapsedGroups.has(key)) toggleGroup(key);
+  // 根目录书签条：点击书签 → 只看该分组（再次点击同一书签恢复全部）。
+  // 切换时收敛到一级视图（2026-08 需求）：
+  // - 节点展开态清空——各分组只展示顶层节点（根 URL 下一级），下级不自动展开；
+  // - 分组区块保持展开（保证顶层节点可见）；
+  // - 自定义归档只展示一级目录（文件夹全部收起）。
+  const selectGroup = (key: string) => {
+    const next = activeGroupKey === key ? null : key;
+    setActiveGroupKey(next);
+    setExpanded(new Set());
+    setCollapsedGroups((prev) => {
+      const nextSet = new Set(prev);
+      for (const g of groupedRoots?.groups ?? []) nextSet.delete(g.watchedRoot.url);
+      nextSet.delete(UNCLASSIFIED_KEY);
+      for (const f of customFolders ?? []) nextSet.add(`custom:${f.id}`);
+      return nextSet;
+    });
+    if (next === null) return;
     requestAnimationFrame(() => {
       document
         .querySelector(`[data-group-header="${CSS.escape(key)}"]`)
@@ -780,15 +870,20 @@ export function NodeTreeView({
           )}
           {groupedRoots ? (
             <>
-              {groupedRoots.groups.map((g) => {
+              {(activeGroupKey
+                ? groupedRoots.groups.filter(
+                    (g) => g.watchedRoot.url === activeGroupKey,
+                  )
+                : groupedRoots.groups
+              ).map((g) => {
                 const groupKey = g.watchedRoot.url;
                 const groupCollapsed = collapsedGroups.has(groupKey);
                 // 过滤态下只保留可见根节点（匹配节点 + 祖先链）；
                 // 无任何可见节点的分组整体隐藏，避免空分组误导。
                 const visibleGroupNodes =
                   visibleTokens === null
-                    ? g.nodes
-                    : g.nodes.filter((r) => visibleTokens.has(r.obj_token));
+                    ? g.displayNodes
+                    : g.displayNodes.filter((r) => visibleTokens.has(r.obj_token));
                 if (visibleGroupNodes.length === 0) return null;
                 return (
                   <div key={groupKey} className="mb-2">
@@ -825,7 +920,8 @@ export function NodeTreeView({
                   </div>
                 );
               })}
-              {visibleUnclassified.length > 0 && (
+              {visibleUnclassified.length > 0 &&
+                (!activeGroupKey || activeGroupKey === UNCLASSIFIED_KEY) && (
                 <div className="mt-3">
                   <div
                     role="button"
@@ -854,7 +950,8 @@ export function NodeTreeView({
           ) : (
             roots.map((r) => renderNode(r, 0))
           )}
-          {renderCustomArchive()}
+          {(!activeGroupKey || activeGroupKey === CUSTOM_ARCHIVE_KEY) &&
+            renderCustomArchive()}
         </div>
         <div className="mt-3 pt-3 border-t border-line text-xs text-ink-faint font-sans-ui flex min-w-0 items-center justify-between gap-2">
           <span className="min-w-0 truncate">
@@ -935,58 +1032,79 @@ export function NodeTreeView({
         </div>
       </div>
       {/*
-        根目录锚点条（v0.3.0 方案 A 落地版）：分组头的永久可见书签栏。
-        树内容滚动时它固定在搜索栏之下，不再被展开的分组内容挤掉；
-        点击书签展开（若已收起）并平滑滚动到对应分组头。
+        根目录书签条（2026-08 行为调整）：分组头的永久可见书签栏。
+        点击书签 → 树体只显示该分组内容（再点同一书签或「全部」恢复）；
+        书签条本身吸顶常驻，不被展开的分组内容挤掉。
         仅在存在 watchedRoot 分组或自定义归档时渲染。
       */}
       {groupedRoots && (groupedRoots.groups.length > 0 || (customFolders?.length ?? 0) > 0) && (
         <div className="flex flex-wrap items-center gap-1.5 border-b border-line bg-paper/60 px-3 py-2">
+          {activeGroupKey !== null && (
+            <button
+              type="button"
+              onClick={() => selectGroup(activeGroupKey)}
+              title="恢复显示全部分组"
+              className="inline-flex items-center gap-1.5 rounded-full border border-seal/60 bg-seal/10 px-2.5 py-1 text-[11px] text-seal font-sans-ui transition-colors hover:bg-seal/20"
+            >
+              全部
+            </button>
+          )}
           {groupedRoots.groups.map((g) => {
             const key = g.watchedRoot.url;
             const collapsed = collapsedGroups.has(key);
+            const active = activeGroupKey === key;
             return (
               <button
                 key={key}
                 type="button"
-                onClick={() => jumpToGroup(key)}
-                title={g.watchedRoot.url}
+                onClick={() => selectGroup(key)}
+                title={`${g.watchedRoot.url}\n点击只看该分组；再次点击恢复全部`}
                 className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-sans-ui transition-colors ${
-                  collapsed
-                    ? 'border-dashed border-line text-ink-faint hover:border-seal/40 hover:text-seal'
-                    : 'border-line bg-card-bg text-ink-soft hover:border-seal/40 hover:text-seal'
+                  active
+                    ? 'border-seal/60 bg-seal/10 text-seal'
+                    : collapsed
+                      ? 'border-dashed border-line text-ink-faint hover:border-seal/40 hover:text-seal'
+                      : 'border-line bg-card-bg text-ink-soft hover:border-seal/40 hover:text-seal'
                 }`}
               >
-                <Cloud className={`w-3 h-3 shrink-0 ${collapsed ? '' : 'text-seal'}`} />
+                <Cloud className={`w-3 h-3 shrink-0 ${collapsed && !active ? '' : 'text-seal'}`} />
                 <span className="max-w-[96px] truncate">
                   {g.watchedRoot.displayName || g.watchedRoot.title || g.watchedRoot.localDir}
                 </span>
-                <span className="text-ink-faint">{g.nodes.length}</span>
+                <span className={active ? 'text-seal/70' : 'text-ink-faint'}>{g.displayNodes.length}</span>
               </button>
             );
           })}
           {groupedRoots.unclassified.length > 0 && (
             <button
               type="button"
-              onClick={() => jumpToGroup(UNCLASSIFIED_KEY)}
-              title="未绑定 watchedRoot 的节点"
-              className="inline-flex items-center gap-1.5 rounded-full border border-line bg-card-bg px-2.5 py-1 text-[11px] text-ink-soft font-sans-ui transition-colors hover:border-seal/40 hover:text-seal"
+              onClick={() => selectGroup(UNCLASSIFIED_KEY)}
+              title="未绑定 watchedRoot 的节点\n点击只看该分组；再次点击恢复全部"
+              className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-sans-ui transition-colors ${
+                activeGroupKey === UNCLASSIFIED_KEY
+                  ? 'border-seal/60 bg-seal/10 text-seal'
+                  : 'border-line bg-card-bg text-ink-soft hover:border-seal/40 hover:text-seal'
+              }`}
             >
               <span className="inline-block w-1.5 h-1.5 rounded-full bg-ink-faint" />
               未分类
-              <span className="text-ink-faint">{groupedRoots.unclassified.length}</span>
+              <span className={activeGroupKey === UNCLASSIFIED_KEY ? 'text-seal/70' : 'text-ink-faint'}>{groupedRoots.unclassified.length}</span>
             </button>
           )}
           {(customFolders?.length ?? 0) > 0 && (
             <button
               type="button"
-              onClick={() => jumpToGroup(CUSTOM_ARCHIVE_KEY)}
-              title="自定义归档"
-              className="inline-flex items-center gap-1.5 rounded-full border border-line bg-card-bg px-2.5 py-1 text-[11px] text-ink-soft font-sans-ui transition-colors hover:border-seal/40 hover:text-seal"
+              onClick={() => selectGroup(CUSTOM_ARCHIVE_KEY)}
+              title="自定义归档\n点击只看该分组；再次点击恢复全部"
+              className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-sans-ui transition-colors ${
+                activeGroupKey === CUSTOM_ARCHIVE_KEY
+                  ? 'border-seal/60 bg-seal/10 text-seal'
+                  : 'border-line bg-card-bg text-ink-soft hover:border-seal/40 hover:text-seal'
+              }`}
             >
               <FolderArchive className="w-3 h-3 shrink-0 text-seal" />
               自定义归档
-              <span className="text-ink-faint">{customFolders!.length}</span>
+              <span className={activeGroupKey === CUSTOM_ARCHIVE_KEY ? 'text-seal/70' : 'text-ink-faint'}>{customFolders!.length}</span>
             </button>
           )}
         </div>

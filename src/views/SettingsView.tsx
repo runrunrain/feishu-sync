@@ -17,6 +17,7 @@ import type { LucideIcon } from 'lucide-react';
 import {
   BookOpen,
   Database,
+  FolderArchive,
   FolderTree,
   Info,
   KeyRound,
@@ -27,6 +28,7 @@ import {
 } from 'lucide-react';
 import { KnowledgeSettingsCard } from '../components/KnowledgeSettingsCard';
 import { WatchedRootsCard } from '../components/WatchedRootsCard';
+import { CustomArchiveSettingsCard } from '../components/CustomArchiveSettingsCard';
 import { ModelProviderSettings } from '../components/ModelProviderSettings';
 import { AuthSettingsCard } from '../components/AuthSettingsCard';
 import { AppUpdateCard } from '../components/AppUpdateCard';
@@ -71,6 +73,13 @@ const SETTINGS_TABS: SettingsTabMeta[] = [
         description: '飞书同步根 URL、本地目录与布局',
         icon: FolderTree,
         render: () => <WatchedRootsCard />,
+      },
+      {
+        id: 'kb-custom-archive',
+        label: '自定义归档',
+        description: '快捷添加的零散云文档与分类文件夹管理',
+        icon: FolderArchive,
+        render: () => <CustomArchiveSettingsCard />,
       },
     ],
   },

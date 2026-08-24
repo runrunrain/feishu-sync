@@ -399,6 +399,30 @@ customFolderRoutes.delete('/api/custom-folders/:id', async (c) => {
 });
 
 // ---------------------------------------------------------------------------
+// DELETE /api/custom-folders/:id/docs/:objToken
+// ---------------------------------------------------------------------------
+
+// 从归档移出单篇文档（custom_folder_id → NULL）。本地文件与同步基线保留——
+// 文档仅从归档列表消失；后续重新加入时走 already_exists 分支再归档。
+customFolderRoutes.delete('/api/custom-folders/:id/docs/:objToken', async (c) => {
+  const folderId = c.req.param('id');
+  const objToken = c.req.param('objToken');
+  try {
+    const { localMapStore } = await resolveConfig(c);
+    if (!localMapStore.getCustomFolder(folderId)) {
+      return c.json({ error: 'not_found', message: '文件夹不存在' }, 404);
+    }
+    const changed = localMapStore.clearDocumentCustomFolder(objToken, folderId);
+    if (changed === 0) {
+      return c.json({ error: 'not_found', message: '文档不在该文件夹中' }, 404);
+    }
+    return c.json({ ok: true });
+  } catch (error) {
+    return errorResponse(c, 'custom_folder_doc_remove_failed', error);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // POST /api/custom-folders/:id/docs
 // ---------------------------------------------------------------------------
 

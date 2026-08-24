@@ -272,7 +272,10 @@ function createMainWindow() {
 
   // Load frontend based on environment
   if (process.env.NODE_ENV === 'development') {
-    window.loadURL('http://localhost:5173').catch((error) => {
+    // VITE_DEV_SERVER_URL：本机 5173 被其他项目占用时可用环境变量指向别的
+    // vite 端口（需与 server dev CORS 白名单口径一致，见 cors.ts）。
+    const devUrl = process.env.VITE_DEV_SERVER_URL || 'http://localhost:5173';
+    window.loadURL(devUrl).catch((error) => {
       console.error('[Electron] Failed to load dev server:', error);
     });
     window.webContents.openDevTools();

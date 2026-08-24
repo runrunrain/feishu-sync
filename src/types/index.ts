@@ -652,6 +652,15 @@ export interface CustomFolder {
   docs: CustomFolderDoc[];
 }
 
+/**
+ * 左侧树跳转导航目标（快捷添加 / 设置管理「跳转查看」用）。
+ * - group：激活书签条对应分组（key 为 watchedRoot.url / 内置分组 key）；
+ * - custom-doc：切到自定义归档分组、展开目标文件夹、滚动定位并选中该文档。
+ */
+export type TreeNavTarget =
+  | { kind: 'group'; key: string }
+  | { kind: 'custom-doc'; folderId: string; objToken: string };
+
 /** POST /docs 逐条错误分类（契约固定枚举）。 */
 export type AddLinkErrorCode =
   | 'parse_failed'

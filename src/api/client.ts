@@ -622,4 +622,18 @@ export async function addLinksToFolder(
   return data.results ?? [];
 }
 
+/**
+ * DELETE /api/custom-folders/:id/docs/:objToken — 把单篇文档移出归档
+ * （custom_folder_id 置空，本地文件与同步基线保留）。404：文件夹不存在或文档不在其中。
+ */
+export async function removeDocFromFolder(
+  folderId: string,
+  objToken: string,
+): Promise<{ ok: true }> {
+  return request<{ ok: true }>(
+    `/api/custom-folders/${encodeURIComponent(folderId)}/docs/${encodeURIComponent(objToken)}`,
+    { method: 'DELETE' },
+  );
+}
+
 export { APIError };

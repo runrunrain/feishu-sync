@@ -28,7 +28,7 @@ import { Input, Select, Toggle } from './common/Input';
 import { useToast } from './common/Toast';
 import { useConfig } from '../hooks/useConfig';
 import { getMappingIndex } from '../api/client';
-import { normalizeFeishuUrl } from '../utils/feishu-url';
+import { normalizeFeishuUrl, extractWikiRootId } from '../utils/feishu-url';
 import { appLogger } from '../utils/appLogger';
 import type {
   Config,
@@ -66,7 +66,7 @@ const STATUS_META: Record<
   },
 };
 
-const LAYOUT_OPTIONS = [
+export const LAYOUT_OPTIONS = [
   { value: 'directory-readme', label: '目录 + README.md' },
   { value: 'mirror-title-file', label: '镜像标题文件' },
 ];
@@ -79,19 +79,6 @@ function createEmptyRoot(): WatchedRootConfig {
     layoutProfile: 'directory-readme',
     enabled: true,
   };
-}
-
-function extractRootId(url: string): string | null {
-  try {
-    const parsed = new URL(url);
-    const match = parsed.pathname.match(/^\/wiki\/([A-Za-z0-9]+)$/);
-    if (parsed.protocol !== 'https:' || !/\.feishu\.cn$/i.test(parsed.hostname) || !match) {
-      return null;
-    }
-    return match[1];
-  } catch {
-    return null;
-  }
 }
 
 type RootRow = {
@@ -235,7 +222,7 @@ export function WatchedRootsCard() {
 
     for (const root of draftRoots) {
       const normalizedUrl = normalizeFeishuUrl(root.url);
-      const id = normalizedUrl.isValid ? extractRootId(normalizedUrl.canonical) : null;
+      const id = normalizedUrl.isValid ? extractWikiRootId(normalizedUrl.canonical) : null;
       const localDir = root.localDir.trim().replace(/\\/g, '/').replace(/\/+$/g, '');
       if (!id) {
         toast.push({

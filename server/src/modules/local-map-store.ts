@@ -1257,6 +1257,16 @@ export class LocalMapStore {
     return result.changes;
   }
 
+  /** Set documents.custom_folder_id = NULL for one doc currently in the folder
+   *  （从归档移出单篇；本地文件与同步基线保留）。Returns affected row count. */
+  clearDocumentCustomFolder(objToken: string, folderId: string): number {
+    const result = this.getStatement(`
+      UPDATE documents SET custom_folder_id = NULL
+      WHERE obj_token = ? AND custom_folder_id = ?
+    `).run(objToken, folderId);
+    return result.changes;
+  }
+
   /**
    * List documents belonging to a custom folder, ordered by title.
    * Used by GET /api/custom-folders to compose the docs array per folder.

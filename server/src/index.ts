@@ -344,16 +344,23 @@ const isMainModule = process.argv[1]
 
 if (isMainModule) {
   // Start server in standalone mode (for development/testing)
-  // SECURITY: Generate a temporary token and log to console for access
-  const standaloneToken = crypto.randomBytes(32).toString('base64url');
+  // SECURITY: Generate a temporary token and log to console for access.
+  // 开发便利：FEISHU_SYNC_DEV_TOKEN 可固定 token（配合 vite proxy 注入实现
+  // 浏览器 dev:all 免 Electron）；缺省仍为每次随机。
+  const standaloneToken =
+    process.env.FEISHU_SYNC_DEV_TOKEN?.trim() ||
+    crypto.randomBytes(32).toString('base64url');
   console.info(`[server] Standalone mode token: ${standaloneToken}`);
   console.info('[server] Use this token via X-Desktop-Token header to access protected routes');
+
+  // FEISHU_SYNC_PORT：本机 3001 被其他项目占用时的避让出口（默认 3001）。
+  const standalonePort = Number(process.env.FEISHU_SYNC_PORT) || 3001;
 
   startServer({
     desktopMode: true, // Enable auth middleware in standalone mode
     desktopToken: standaloneToken,
     corsDevMode: true, // P0-bug-1 fix: standalone always serves a browser client (vite 5173 cross-origin)
-    port: 3001, // Use default port to align with vite proxy
+    port: standalonePort,
     hostname: '127.0.0.1', // Bind to localhost only in standalone mode
   }).catch((error) => {
     console.error('[server] Failed to start:', error);

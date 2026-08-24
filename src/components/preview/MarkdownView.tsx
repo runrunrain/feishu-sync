@@ -52,6 +52,11 @@ function preprocess(markdown: string): string {
   );
   // 2) 剥掉 <synced-source> 包裹标签（保留内部内容）。
   out = out.replace(/<\/?synced-source>/g, '');
+  // 3) 剥掉 HTML 注释（含文件首部的 feishu_sync YAML-in-comment 头，
+  //    真实 Markdown 渲染器同样不展示注释）。
+  out = out.replace(/<!--[\s\S]*?-->/g, '');
+  // 4) 剥掉飞书导出的 <callout> 包裹标签（保留内部内容按普通块渲染）。
+  out = out.replace(/<\/?callout\b[^>]*>/g, '');
   return out;
 }
 
@@ -135,6 +140,9 @@ function AuthImage({ src, alt, baseDir }: AuthImageProps) {
       title={alt || src}
       className="my-2 max-w-full rounded-md border border-line/60 shadow-sm"
       loading="lazy"
+      // 远程 URL（如未被同步改写的飞书链接）加载失败时走统一失败占位，
+      // 否则浏览器只显示破图图标，无法辨认原图地址。
+      onError={() => setFailed(true)}
     />
   );
 }
@@ -143,8 +151,15 @@ function AuthImage({ src, alt, baseDir }: AuthImageProps) {
 // 行内解析
 // ---------------------------------------------------------------------------
 
+// 图片/链接：alt 文本里可能含 `]`（飞书导出的长描述常见），用非贪婪匹配
+// 到第一个 `](` 为止；粗体/斜体/删除线允许转义字符（如 `\~`）出现。
 const INLINE_RE =
-  /(!\[[^\]]*\]\([^)]*\))|(\[[^\]]*\]\([^)]*\))|(\*\*[^*]+\*\*)|(\*[^*\n]+\*)|(~~[^~]+~~)|(`[^`]+`)/g;
+  /(!\[.*?\]\([^)\n]*\))|(\[.*?\]\([^)\n]*\))|(\*\*(?:\\.|[^*\\\n])+\*\*)|(\*(?:\\.|[^*\\\n])+\*)|(~~(?:\\.|[^~\\])+~~)|(`[^`]+`)/g;
+
+/** 还原 GFM 反斜杠转义（`\~` → `~` 等），只作用于展示文本，不动代码/URL。 */
+function unescapeInline(s: string): string {
+  return s.replace(/\\([!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~])/g, '$1');
+}
 
 interface InlineContext {
   baseDir: string;
@@ -156,17 +171,17 @@ function renderInline(text: string, keyPrefix: string, ctx: InlineContext): Reac
   let i = 0;
   for (const m of text.matchAll(INLINE_RE)) {
     const idx = m.index ?? 0;
-    if (idx > last) out.push(text.slice(last, idx));
+    if (idx > last) out.push(unescapeInline(text.slice(last, idx)));
     const token = m[0];
     const key = `${keyPrefix}-${i++}`;
     if (token.startsWith('![')) {
       const close = token.indexOf('](');
-      const alt = token.slice(2, close);
+      const alt = unescapeInline(token.slice(2, close));
       const src = token.slice(close + 2, -1);
       out.push(<AuthImage key={key} src={src} alt={alt} baseDir={ctx.baseDir} />);
     } else if (token.startsWith('[')) {
       const close = token.indexOf('](');
-      const label = token.slice(1, close);
+      const label = unescapeInline(token.slice(1, close));
       const href = token.slice(close + 2, -1);
       out.push(
         <a
@@ -182,13 +197,13 @@ function renderInline(text: string, keyPrefix: string, ctx: InlineContext): Reac
     } else if (token.startsWith('**')) {
       out.push(
         <strong key={key} className="font-semibold text-ink">
-          {token.slice(2, -2)}
+          {unescapeInline(token.slice(2, -2))}
         </strong>,
       );
     } else if (token.startsWith('~~')) {
       out.push(
         <del key={key} className="text-ink-faint">
-          {token.slice(2, -2)}
+          {unescapeInline(token.slice(2, -2))}
         </del>,
       );
     } else if (token.startsWith('`')) {
@@ -204,13 +219,13 @@ function renderInline(text: string, keyPrefix: string, ctx: InlineContext): Reac
       // *斜体*
       out.push(
         <em key={key} className="text-ink-soft">
-          {token.slice(1, -1)}
+          {unescapeInline(token.slice(1, -1))}
         </em>,
       );
     }
     last = idx + token.length;
   }
-  if (last < text.length) out.push(text.slice(last));
+  if (last < text.length) out.push(unescapeInline(text.slice(last)));
   return out;
 }
 
@@ -258,7 +273,9 @@ function parseTableSeparator(line: string): TableAlign[] | null {
   if (parts.length === 0) return null;
   const aligns: TableAlign[] = [];
   for (const part of parts) {
-    if (!/^:?-{2,}:?$/.test(part)) return null;
+    // GFM 允许 1 个及以上连字符（飞书导出常见 `|-|`），旧正则 `-{2,}`
+    // 会把这类表格漏判为普通段落。
+    if (!/^:?-+:?$/.test(part)) return null;
     const left = part.startsWith(':');
     const right = part.endsWith(':');
     aligns.push(left && right ? 'center' : right ? 'right' : 'left');
