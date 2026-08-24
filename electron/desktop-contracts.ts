@@ -70,6 +70,12 @@ export interface DesktopAPI {
   openConfigFile: () => Promise<DesktopActionResult>;
 
   /**
+   * Open an external URL in the default browser.
+   * Only http:/https: URLs are accepted; other protocols are rejected.
+   */
+  openExternal: (url: string) => Promise<DesktopActionResult>;
+
+  /**
    * Auto-start operations namespace (M4)
    */
   autoStart: {

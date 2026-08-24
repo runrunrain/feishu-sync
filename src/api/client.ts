@@ -219,6 +219,81 @@ export async function getAuthStatus(): Promise<AuthStatus> {
   return request<AuthStatus>('/api/feishu/auth-status');
 }
 
+// ============================================================================
+// Lark-cli Onboarding API（新用户引导：安装/更新/设备授权）
+// ============================================================================
+
+/** GET /api/feishu/lark-cli/status —— 安装/认证/npm 组合状态。 */
+export interface LarkCliToolStatus {
+  larkCliInstalled: boolean;
+  larkCliVersion?: string;
+  authReady: boolean;
+  missingScopes?: string[];
+  error?: string;
+  npmAvailable: boolean;
+  npmPath: string | null;
+}
+
+/** POST /api/feishu/lark-cli/install —— 幂等安装/更新结果。 */
+export interface LarkCliInstallResult {
+  ok: boolean;
+  reason?: 'npm_not_found' | 'npm_failed' | 'verify_failed' | string;
+  output: string;
+  version?: string;
+  error?: string;
+}
+
+/** POST /api/feishu/auth/device/start —— 立即返回的设备授权会话。 */
+export interface DeviceAuthStartResult {
+  verificationUrl: string;
+  deviceCode: string;
+  /** 秒；lark-cli 契约默认 600。 */
+  expiresIn: number;
+}
+
+/** POST /api/feishu/auth/device/complete —— 阻塞等待授权后的最终状态。 */
+export interface DeviceAuthCompleteResult {
+  ok: boolean;
+  ready: boolean;
+  larkCliVersion?: string;
+  currentScopes?: string[];
+  missingScopes?: string[];
+  identity?: string;
+  error?: string;
+}
+
+export async function getLarkCliStatus(): Promise<LarkCliToolStatus> {
+  return request<LarkCliToolStatus>('/api/feishu/lark-cli/status');
+}
+
+export async function installLarkCli(): Promise<LarkCliInstallResult> {
+  return request<LarkCliInstallResult>('/api/feishu/lark-cli/install', {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
+export async function startDeviceAuth(): Promise<DeviceAuthStartResult> {
+  return request<DeviceAuthStartResult>('/api/feishu/auth/device/start', {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
+/**
+ * 阻塞等待浏览器授权完成（服务端最长约 11 分钟）。signal 用于前端取消
+ * 等待；默认不设短超时，由调用方控制 AbortController（12 分钟）。 */
+export async function completeDeviceAuth(
+  deviceCode: string,
+  options: { signal?: AbortSignal } = {},
+): Promise<DeviceAuthCompleteResult> {
+  return request<DeviceAuthCompleteResult>('/api/feishu/auth/device/complete', {
+    method: 'POST',
+    body: JSON.stringify({ deviceCode }),
+    ...(options.signal ? { signal: options.signal } : {}),
+  });
+}
+
 /**
  * Detect changes in watched URLs
  */

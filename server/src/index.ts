@@ -18,6 +18,7 @@ import type { Server as HttpServer } from 'node:http';
 
 import { ConfigManager } from './modules/config-manager.js';
 import { LarkCliClient } from './modules/lark-cli-client.js';
+import { LarkCliManager } from './modules/lark-cli-manager.js';
 import { LocalMapStore } from './modules/local-map-store.js';
 import { ChangeDetector } from './modules/change-detector.js';
 import { authMiddleware } from './middleware/auth.js';
@@ -129,6 +130,11 @@ export async function buildServer(options: CreateServerOptions = {}) {
   const larkCliClient = new LarkCliClient(larkCliConfig);
   console.info('[server] LarkCliClient initialized');
 
+  // Initialize LarkCliManager (in-app lark-cli install/update + device auth onboarding)
+  console.info('[server] Initializing LarkCliManager');
+  const larkCliManager = new LarkCliManager(larkCliClient, configManager);
+  console.info('[server] LarkCliManager initialized');
+
   // Initialize database schema
   console.info('[server] Initializing database schema');
   localMapStore.initialize();
@@ -175,6 +181,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
     // Inject dependencies for downstream routes
     (c as any).configManager = configManager;
     (c as any).larkCliClient = larkCliClient;
+    (c as any).larkCliManager = larkCliManager;
     (c as any).localMapStore = localMapStore;
     (c as any).changeDetector = changeDetector;
 

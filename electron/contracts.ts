@@ -17,6 +17,7 @@ export const IPC_CHANNELS = {
   UPDATE_INSTALL_AND_RESTART: 'desktop:update:install-and-restart',
   OPEN_DATA_DIRECTORY: 'desktop:open-data-directory',
   OPEN_CONFIG_FILE: 'desktop:open-config-file',
+  OPEN_EXTERNAL: 'desktop:open-external',
   AUTO_START_GET_STATUS: 'desktop:auto-start:get-status',
   AUTO_START_SET_ENABLED: 'desktop:auto-start:set-enabled',
   CHANGE_NOTIFICATION_START: 'desktop:change-notification:start',

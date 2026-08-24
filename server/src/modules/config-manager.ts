@@ -37,8 +37,12 @@ import type {
 import { getEnabledWatchedRootUrls, isLegacyLlmConfig } from '../types/index.js';
 
 const DEFAULT_CONFIG_PATH = path.join(os.homedir(), '.feishu-sync', 'config.json');
-/** Minimal user scopes for read-only wiki sync (must match lark-cli auth login). */
-const DEFAULT_REQUIRED_SCOPES = [
+/**
+ * Minimal user scopes for read-only wiki sync (must match lark-cli auth login).
+ * Exported so LarkCliManager's device-flow scope assembly shares the same
+ * default source instead of drifting into a third copy of the list.
+ */
+export const DEFAULT_REQUIRED_SCOPES = [
   'wiki:node:retrieve',
   'wiki:space:retrieve',
   'docs:document.content:read',

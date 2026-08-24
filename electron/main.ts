@@ -376,6 +376,29 @@ ipcMain.handle('desktop:open-config-file', async () => {
   return result ? { ok: false, code: 'open-config-file-failed', error: sanitizeDesktopError(result) } : { ok: true };
 });
 
+ipcMain.handle('desktop:open-external', async (_event, url: unknown) => {
+  // 白名单：仅 http:/https: 可打开，拒绝 file:/javascript: 等任意协议
+  // （渲染进程被攻破时也不能借 openExternal 触达系统处理器）。
+  if (typeof url !== 'string' || url.length === 0) {
+    return { ok: false, code: 'invalid-url', error: 'URL must be a non-empty string' };
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return { ok: false, code: 'invalid-url', error: sanitizeDesktopError(url) };
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    return { ok: false, code: 'protocol-not-allowed', error: `Protocol not allowed: ${parsed.protocol}` };
+  }
+  try {
+    await shell.openExternal(parsed.href);
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, code: 'open-external-failed', error: sanitizeDesktopError(error) };
+  }
+});
+
 ipcMain.handle('desktop:update:get-state', () => {
   if (updaterService) return updaterService.getState();
   const capabilities = getDesktopPlatformCapabilities();

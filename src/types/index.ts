@@ -593,6 +593,8 @@ export interface DesktopAPI {
   };
   openDataDirectory: () => Promise<DesktopActionResult>;
   openConfigFile: () => Promise<DesktopActionResult>;
+  /** 在系统默认浏览器打开外部 URL（仅 http/https，与 electron/main.ts 白名单对应）。 */
+  openExternal: (url: string) => Promise<DesktopActionResult>;
 }
 
 export interface DesktopActionResult {

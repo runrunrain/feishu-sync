@@ -125,7 +125,14 @@ function isExecutable(candidate: string): boolean {
   }
 }
 
-function findExecutableOnPath(
+/**
+ * Locate the first executable matching `names` within a PATH-style value.
+ * Exported for reuse by LarkCliManager's npm discovery, which mirrors the
+ * same desktop-PATH discovery problem (Finder-launched apps lack the user's
+ * shell PATH). Splitting on path.delimiter makes it equally usable for a
+ * synthesized directory list.
+ */
+export function findExecutableOnPath(
   names: string[],
   pathValue: string | undefined,
 ): string | null {

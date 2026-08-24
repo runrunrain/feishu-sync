@@ -60,6 +60,10 @@ const desktopApi: DesktopAPI = {
     return ipcRenderer.invoke('desktop:open-config-file');
   },
 
+  openExternal: async (url: string): Promise<DesktopActionResult> => {
+    return ipcRenderer.invoke('desktop:open-external', url);
+  },
+
   autoStart: {
     getStatus: async (): Promise<AutoStartStatus> => {
       return ipcRenderer.invoke('desktop:auto-start:get-status');
