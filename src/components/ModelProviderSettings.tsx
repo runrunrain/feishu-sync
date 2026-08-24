@@ -275,7 +275,7 @@ export function ModelProviderSettings() {
             <div>
               <h2 className="text-base font-kai font-medium text-ink">模型提供商与预设</h2>
               <p className="mt-0.5 text-xs text-ink-faint">
-                按提供商保存端点、密钥与模型别名；可在“执行通道”选择当前生效的预设。
+                按提供商保存端点、密钥与模型别名；当前选中的提供商与预设即文档整理的调用目标。
               </p>
             </div>
           </div>
