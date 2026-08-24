@@ -40,6 +40,7 @@ type TreeFilter = 'all' | 'changed' | 'error' | 'orphan';
 
 /** 未分类分组的折叠 key（不与任何 watchedRoot.url 冲突）。 */
 const UNCLASSIFIED_KEY = '__unclassified__';
+const CUSTOM_ARCHIVE_KEY = '__custom_archive__';
 
 const FILTER_LABEL: Record<TreeFilter, string> = {
   all: '全部',
@@ -615,7 +616,7 @@ export function NodeTreeView({
   const renderCustomArchive = () => {
     if (!customFolders || customFolders.length === 0) return null;
     return (
-      <div className="mt-3">
+      <div className="mt-3" data-group-header={CUSTOM_ARCHIVE_KEY}>
         <div className="px-2 py-1.5 text-[11px] text-ink-faint font-sans-ui border-b border-line/40 flex items-center gap-1.5">
           <FolderArchive className="w-3 h-3 text-ink-faint shrink-0" />
           自定义归档
@@ -724,6 +725,16 @@ export function NodeTreeView({
       return next;
     });
   };
+
+  // 根目录锚点条：点击书签 → 展开该分组（若已收起）并平滑滚动到其分组头。
+  const jumpToGroup = (key: string) => {
+    if (collapsedGroups.has(key)) toggleGroup(key);
+    requestAnimationFrame(() => {
+      document
+        .querySelector(`[data-group-header="${CSS.escape(key)}"]`)
+        ?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    });
+  };
   let body: React.ReactNode;
   if (loading && nodes.length === 0) {
     body = (
@@ -793,6 +804,7 @@ export function NodeTreeView({
                         }
                       }}
                       className="sticky top-0 z-10 min-w-0 bg-card-bg/95 backdrop-blur-sm px-2 py-1.5 border-b border-line/60 flex items-center gap-2 cursor-pointer select-none"
+                      data-group-header={groupKey}
                     >
                       <ChevronRight
                         className={`w-3.5 h-3.5 text-ink-faint shrink-0 transition-transform ${groupCollapsed ? '' : 'rotate-90'}`}
@@ -827,6 +839,7 @@ export function NodeTreeView({
                       }
                     }}
                     className="px-2 py-1.5 text-[11px] text-ink-faint font-sans-ui border-b border-line/40 flex items-center gap-1.5 cursor-pointer select-none"
+                    data-group-header={UNCLASSIFIED_KEY}
                   >
                     <ChevronRight
                       className={`w-3 h-3 text-ink-faint shrink-0 transition-transform ${collapsedGroups.has(UNCLASSIFIED_KEY) ? '' : 'rotate-90'}`}
@@ -921,6 +934,63 @@ export function NodeTreeView({
           )}
         </div>
       </div>
+      {/*
+        根目录锚点条（v0.3.0 方案 A 落地版）：分组头的永久可见书签栏。
+        树内容滚动时它固定在搜索栏之下，不再被展开的分组内容挤掉；
+        点击书签展开（若已收起）并平滑滚动到对应分组头。
+        仅在存在 watchedRoot 分组或自定义归档时渲染。
+      */}
+      {groupedRoots && (groupedRoots.groups.length > 0 || (customFolders?.length ?? 0) > 0) && (
+        <div className="flex flex-wrap items-center gap-1.5 border-b border-line bg-paper/60 px-3 py-2">
+          {groupedRoots.groups.map((g) => {
+            const key = g.watchedRoot.url;
+            const collapsed = collapsedGroups.has(key);
+            return (
+              <button
+                key={key}
+                type="button"
+                onClick={() => jumpToGroup(key)}
+                title={g.watchedRoot.url}
+                className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-sans-ui transition-colors ${
+                  collapsed
+                    ? 'border-dashed border-line text-ink-faint hover:border-seal/40 hover:text-seal'
+                    : 'border-line bg-card-bg text-ink-soft hover:border-seal/40 hover:text-seal'
+                }`}
+              >
+                <Cloud className={`w-3 h-3 shrink-0 ${collapsed ? '' : 'text-seal'}`} />
+                <span className="max-w-[96px] truncate">
+                  {g.watchedRoot.displayName || g.watchedRoot.title || g.watchedRoot.localDir}
+                </span>
+                <span className="text-ink-faint">{g.nodes.length}</span>
+              </button>
+            );
+          })}
+          {groupedRoots.unclassified.length > 0 && (
+            <button
+              type="button"
+              onClick={() => jumpToGroup(UNCLASSIFIED_KEY)}
+              title="未绑定 watchedRoot 的节点"
+              className="inline-flex items-center gap-1.5 rounded-full border border-line bg-card-bg px-2.5 py-1 text-[11px] text-ink-soft font-sans-ui transition-colors hover:border-seal/40 hover:text-seal"
+            >
+              <span className="inline-block w-1.5 h-1.5 rounded-full bg-ink-faint" />
+              未分类
+              <span className="text-ink-faint">{groupedRoots.unclassified.length}</span>
+            </button>
+          )}
+          {(customFolders?.length ?? 0) > 0 && (
+            <button
+              type="button"
+              onClick={() => jumpToGroup(CUSTOM_ARCHIVE_KEY)}
+              title="自定义归档"
+              className="inline-flex items-center gap-1.5 rounded-full border border-line bg-card-bg px-2.5 py-1 text-[11px] text-ink-soft font-sans-ui transition-colors hover:border-seal/40 hover:text-seal"
+            >
+              <FolderArchive className="w-3 h-3 shrink-0 text-seal" />
+              自定义归档
+              <span className="text-ink-faint">{customFolders!.length}</span>
+            </button>
+          )}
+        </div>
+      )}
       <CardBody className="flex-1 overflow-hidden flex flex-col">{body}</CardBody>
       </Card>
     </div>
