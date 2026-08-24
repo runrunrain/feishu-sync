@@ -136,8 +136,9 @@ describe('config secret retain semantics (P4)', () => {
     expect(reloaded.llm.providers?.[0]?.apiKey).toBe('provider-secret-must-survive');
     expect(reloaded.llm.providers?.[0]?.models[0]?.name).toBe('GLM 默认（已编辑）');
     expect(reloaded.llm.model).toBe('glm-5.2');
-    expect(reloaded.llm.claudeCliModel).toBe('glm-5.2');
-    expect(reloaded.llm.providers?.[0]?.models[0]?.claudeCliModel).toBe('glm-5.2');
+    expect(reloaded.llm.providers?.[0]?.models[0]?.openAiModel).toBe('glm-4-flash');
+    // v0.2.9：旧配置中的 claude 通道字段（primaryChannel 等）读取时归一。
+    expect(reloaded.llm.primaryChannel).toBe('direct');
   });
 });
 
@@ -223,15 +224,15 @@ describe('reconcileOpenAiCompatBaseUrl', () => {
 });
 
 describe('reconcileModelAlias', () => {
-  it('resets deepseek-chat to bigmodel Anthropic alias when key is bigmodel', () => {
+  it('resets deepseek-chat to bigmodel OpenAI default alias when key is bigmodel', () => {
     expect(reconcileModelAlias('deepseek-chat', BIGMODEL_KEY)).toBe(
-      'glm-4.7',
+      'glm-4-flash',
     );
   });
 
-  it('resets deepseek-reasoner to bigmodel Anthropic alias when key is bigmodel', () => {
+  it('resets deepseek-reasoner to bigmodel OpenAI default alias when key is bigmodel', () => {
     expect(reconcileModelAlias('deepseek-reasoner', BIGMODEL_KEY)).toBe(
-      'glm-4.7',
+      'glm-4-flash',
     );
   });
 
@@ -247,9 +248,9 @@ describe('reconcileModelAlias', () => {
     );
   });
 
-  it('defaults to bigmodel Anthropic alias when model is empty', () => {
-    expect(reconcileModelAlias('', BIGMODEL_KEY)).toBe('glm-4.7');
-    expect(reconcileModelAlias(null, BIGMODEL_KEY)).toBe('glm-4.7');
+  it('defaults to bigmodel OpenAI alias when model is empty', () => {
+    expect(reconcileModelAlias('', BIGMODEL_KEY)).toBe('glm-4-flash');
+    expect(reconcileModelAlias(null, BIGMODEL_KEY)).toBe('glm-4-flash');
   });
 });
 

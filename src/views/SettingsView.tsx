@@ -28,7 +28,6 @@ import {
 import { KnowledgeSettingsCard } from '../components/KnowledgeSettingsCard';
 import { WatchedRootsCard } from '../components/WatchedRootsCard';
 import { ModelProviderSettings } from '../components/ModelProviderSettings';
-import { LLMChannelSwitcher } from '../components/LLMChannelSwitcher';
 import { AuthSettingsCard } from '../components/AuthSettingsCard';
 import { AppUpdateCard } from '../components/AppUpdateCard';
 
@@ -77,23 +76,16 @@ const SETTINGS_TABS: SettingsTabMeta[] = [
   },
   {
     id: 'models',
-    label: '模型与通道',
-    description: '提供商、模型预设与无头执行器',
+    label: '模型与整理',
+    description: '提供商、模型预设与文档整理',
     icon: Sparkles,
     items: [
       {
         id: 'md-provider',
         label: '模型提供商与预设',
-        description: 'direct / Claude Code 两套端点与模型别名',
+        description: 'OpenAI 兼容端点、密钥与模型别名',
         icon: Server,
         render: () => <ModelProviderSettings />,
-      },
-      {
-        id: 'md-channel',
-        label: '文档整理通道',
-        description: '通道切换、远程模型与无头执行器',
-        icon: Sparkles,
-        render: () => <LLMChannelSwitcher />,
       },
     ],
   },

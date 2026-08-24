@@ -61,18 +61,11 @@ const DEFAULT_REQUIRED_SCOPES = [
  * pin all tiers to LlmConfig.model).
  */
 const DEFAULT_OPENAI_COMPAT_BASE_URL = 'https://open.bigmodel.cn/api/paas/v4';
-const DEFAULT_CLAUDE_COMPAT_BASE_URL = 'https://open.bigmodel.cn/api/anthropic';
 /**
- * bigmodel dual-alias (P3 实测):
- *   - paas/v4 (OpenAI) accepts `glm-4-flash` (free tier)
- *   - Z.AI Claude Code uses the documented `glm-4.7` tier mapping
- * The two aliases share ONE apiKey; only the model name differs across
- * the two protocol adapters. `DEFAULT_DIRECT_MODEL` is used as
- * `directModel` override when the user-provided `model` (or env) only
- * works on one endpoint.
+ * 默认模型别名（bigmodel paas/v4 免费档）。
+ * v0.2.9 起 claude-cli / opencode 通道移除，仅剩 direct 通道，单一默认。
  */
 const DEFAULT_DIRECT_MODEL = 'glm-4-flash';
-const DEFAULT_CLAUDE_CLI_MODEL = 'glm-4.7';
 /**
  * Per-call LLM adaptation timeout, in milliseconds.
  *
@@ -176,13 +169,13 @@ export function reconcileModelAlias(
   apiKey: string | undefined | null,
 ): string {
   const canonicalModel = canonicalizeGlmModelAlias(model);
-  if (!canonicalModel) return DEFAULT_CLAUDE_CLI_MODEL;
+  if (!canonicalModel) return DEFAULT_DIRECT_MODEL;
   const deepseekAliases = ['deepseek-chat', 'deepseek-reasoner', 'deepseek-coder'];
   if (
     looksLikeBigmodelKey(apiKey) &&
     deepseekAliases.includes(canonicalModel.toLowerCase())
   ) {
-    return DEFAULT_CLAUDE_CLI_MODEL;
+    return DEFAULT_DIRECT_MODEL;
   }
   return canonicalModel;
 }
@@ -221,11 +214,9 @@ function uniqueConfigId(value: unknown, fallback: string, used: Set<string>): st
 
 function inferLegacyProviderName(
   openAiCompatBaseUrl: string,
-  claudeCompatBaseUrl: string,
   apiKey: string,
 ): string {
-  const looksLikeBigmodelEndpoint = /(?:^|\.)bigmodel\.cn/i.test(openAiCompatBaseUrl)
-    || /(?:^|\.)bigmodel\.cn/i.test(claudeCompatBaseUrl);
+  const looksLikeBigmodelEndpoint = /(?:^|\.)bigmodel\.cn/i.test(openAiCompatBaseUrl);
   return looksLikeBigmodelEndpoint || looksLikeBigmodelKey(apiKey)
     ? '智谱 GLM（BigModel）'
     : '默认提供商';
@@ -233,35 +224,28 @@ function inferLegacyProviderName(
 
 interface LegacyProviderProjection {
   openAiCompatBaseUrl: string;
-  claudeCompatBaseUrl: string;
   apiKey: string;
   model: string;
   directModel?: string;
-  claudeCliModel?: string;
 }
 
 function makeLegacyProviderProfile(legacy: LegacyProviderProjection): LlmProviderConfig {
   const directModel = canonicalizeGlmModelAlias(legacy.directModel)
     || canonicalizeGlmModelAlias(legacy.model);
-  const claudeCliModel = canonicalizeGlmModelAlias(legacy.claudeCliModel)
-    || canonicalizeGlmModelAlias(legacy.model);
   return {
     id: 'bigmodel',
     name: inferLegacyProviderName(
       legacy.openAiCompatBaseUrl,
-      legacy.claudeCompatBaseUrl,
       legacy.apiKey,
     ),
     enabled: true,
     apiKey: legacy.apiKey,
     openAiCompatBaseUrl: legacy.openAiCompatBaseUrl,
-    claudeCompatBaseUrl: legacy.claudeCompatBaseUrl,
     defaultModelId: 'default',
     models: [{
       id: 'default',
       name: '默认模型',
       openAiModel: directModel,
-      claudeCliModel,
       enabled: true,
     }],
   };
@@ -269,7 +253,7 @@ function makeLegacyProviderProfile(legacy: LegacyProviderProjection): LlmProvide
 
 function normalizeModelPresets(
   value: unknown,
-  fallback: Pick<LlmModelPreset, 'openAiModel' | 'claudeCliModel'>,
+  fallback: Pick<LlmModelPreset, 'openAiModel'>,
 ): LlmModelPreset[] {
   const rawPresets = Array.isArray(value) ? value : [];
   const usedIds = new Set<string>();
@@ -283,7 +267,6 @@ function normalizeModelPresets(
       id,
       name: stringValue(raw.name, `模型 ${index + 1}`) || `模型 ${index + 1}`,
       openAiModel: canonicalizeGlmModelAlias(raw.openAiModel),
-      claudeCliModel: canonicalizeGlmModelAlias(raw.claudeCliModel),
       enabled: typeof raw.enabled === 'boolean' ? raw.enabled : true,
     });
   });
@@ -293,7 +276,6 @@ function normalizeModelPresets(
       id: 'default',
       name: '默认模型',
       openAiModel: canonicalizeGlmModelAlias(fallback.openAiModel),
-      claudeCliModel: canonicalizeGlmModelAlias(fallback.claudeCliModel),
       enabled: true,
     });
   }
@@ -326,8 +308,6 @@ function normalizeProviderProfiles(
     const models = normalizeModelPresets(raw.models, {
       openAiModel: canonicalizeGlmModelAlias(legacy.directModel)
         || canonicalizeGlmModelAlias(legacy.model),
-      claudeCliModel: canonicalizeGlmModelAlias(legacy.claudeCliModel)
-        || canonicalizeGlmModelAlias(legacy.model),
     });
     const requestedDefault = stringValue(raw.defaultModelId);
     const defaultModel = models.find((model) => model.id === requestedDefault && model.enabled)
@@ -340,7 +320,6 @@ function normalizeProviderProfiles(
       enabled: typeof raw.enabled === 'boolean' ? raw.enabled : true,
       apiKey: stringValue(raw.apiKey),
       openAiCompatBaseUrl: stringValue(raw.openAiCompatBaseUrl),
-      claudeCompatBaseUrl: stringValue(raw.claudeCompatBaseUrl),
       defaultModelId: defaultModel?.id,
       models,
     });
@@ -350,86 +329,36 @@ function normalizeProviderProfiles(
 }
 
 /**
- * Build the default LLM config. Prefers local ANTHROPIC_* env vars
- * (open-box: if the machine already runs claude CLI, feishu-sync can
- * reuse the same credentials without re-prompting). Falls back to
- * empty apiKey (user must fill in via UI).
- *
- * When ANTHROPIC_BASE_URL is set, we infer the OpenAI-compat sibling
- * by replacing `/api/anthropic` with `/api/paas/v4`; this matches
- * bigmodel's published URL structure and keeps the dual endpoints
- * consistent if the user is on a non-bigmodel provider that exposes
- * the same dual-protocol pattern.
+ * Build the default LLM config（v0.2.9 单通道精简版）。
+ * 仅保留 direct 通道字段：默认 bigmodel paas/v4 端点 + 空 apiKey（用户
+ * 在设置页填写）；不再读取 ANTHROPIC_* 环境变量（那是 claude CLI 时代
+ * 的开箱约定）。
  */
 function buildDefaultLlmConfig(): LlmConfig {
-  const anthropicBaseUrl = process.env.ANTHROPIC_BASE_URL || DEFAULT_CLAUDE_COMPAT_BASE_URL;
-  const openAiBaseUrl = deriveOpenAiCompatBaseUrl(anthropicBaseUrl);
-  const apiKey = process.env.ANTHROPIC_API_KEY || '';
-  const claudeModel = canonicalizeGlmModelAlias(process.env.ANTHROPIC_MODEL)
-    || DEFAULT_CLAUDE_CLI_MODEL;
   const legacyProjection: LegacyProviderProjection = {
-    openAiCompatBaseUrl: openAiBaseUrl,
-    claudeCompatBaseUrl: anthropicBaseUrl,
-    apiKey,
-    model: claudeModel,
+    openAiCompatBaseUrl: DEFAULT_OPENAI_COMPAT_BASE_URL,
+    apiKey: '',
+    model: DEFAULT_DIRECT_MODEL,
     directModel: DEFAULT_DIRECT_MODEL,
-    claudeCliModel: claudeModel,
   };
   const defaultProvider = makeLegacyProviderProfile(legacyProjection);
 
   return {
-    openAiCompatBaseUrl: openAiBaseUrl,
-    claudeCompatBaseUrl: anthropicBaseUrl,
-    apiKey,
-    // Default `model` is the Anthropic-adapter alias (since claude CLI
-    // is the primary channel and this is what most users set first).
-    // `directModel` overrides the OpenAI endpoint to the alias that
-    // paas/v4 actually accepts.
-    model: claudeModel,
+    openAiCompatBaseUrl: DEFAULT_OPENAI_COMPAT_BASE_URL,
+    apiKey: '',
+    model: DEFAULT_DIRECT_MODEL,
     directModel: DEFAULT_DIRECT_MODEL,
-    // Keep the Claude Code path explicit as well. Existing configurations
-    // created before this field was persisted often still carry
-    // `model: glm-4-flash`; that OpenAI alias is not a reliable choice for
-    // the Anthropic-compatible GLM endpoint.
-    claudeCliModel: claudeModel,
     temperature: 0.2,
     providers: [defaultProvider],
     activeProviderId: defaultProvider.id,
     activeModelId: defaultProvider.defaultModelId,
-    // 10-minute default. See LlmConfig.timeoutMs rationale in
-    // types/index.ts — the previous 60s ceiling was too tight for
-    // bigmodel glm-4.7 under load.
+    // 10-minute default. See LlmConfig.timeoutMs rationale in types/index.ts.
     timeoutMs: DEFAULT_LLM_TIMEOUT_MS,
-    claudeCli: {
-      claudePath: undefined,
-      extraArgs: [],
-    },
-    opencode: {
-      executablePath: undefined,
-      model: undefined,
-      agent: undefined,
-      timeoutMs: undefined,
-    },
-    // Document body organisation is opt-in. Selecting a channel only
-    // changes the future execution path after the user also enables this.
+    // Document body organisation is opt-in.
     contentAdaptationEnabled: false,
-    primaryChannel: 'claude-cli',
-    fallbackOnFailure: true,
+    primaryChannel: 'direct',
+    fallbackOnFailure: false,
   };
-}
-
-/**
- * Derive the OpenAI-compat base URL from an Anthropic-compat base URL.
- *   https://open.bigmodel.cn/api/anthropic -> https://open.bigmodel.cn/api/paas/v4
- * For unknown providers, fall back to the input unchanged (the user
- * will fix it in the UI).
- */
-function deriveOpenAiCompatBaseUrl(anthropicBaseUrl: string): string {
-  if (!anthropicBaseUrl) return DEFAULT_OPENAI_COMPAT_BASE_URL;
-  if (/\/api\/anthropic\/?$/i.test(anthropicBaseUrl)) {
-    return anthropicBaseUrl.replace(/\/api\/anthropic\/?$/i, '/api/paas/v4');
-  }
-  return DEFAULT_OPENAI_COMPAT_BASE_URL;
 }
 
 const DEFAULT_CONFIG: Config = {
@@ -774,14 +703,6 @@ export class ConfigManager {
       providers: hasProviders
         ? this.mergeProviderProfiles(current.providers, partial.providers)
         : current.providers,
-      claudeCli: {
-        ...(current.claudeCli ?? {}),
-        ...(partial.claudeCli ?? {}),
-      },
-      opencode: {
-        ...(current.opencode ?? {}),
-        ...(partial.opencode ?? {}),
-      },
     };
     if (Object.prototype.hasOwnProperty.call(partial, 'apiKey')) {
       const incoming = partial.apiKey;
@@ -1035,46 +956,27 @@ export class ConfigManager {
    * the legacy baseUrl.
    */
   private migrateLegacyLlmConfig(legacy: LegacyLLMConfig): LlmConfig {
-    const anthropicBaseUrl = process.env.ANTHROPIC_BASE_URL || DEFAULT_CLAUDE_COMPAT_BASE_URL;
-    const apiKey = legacy.apiKey || process.env.ANTHROPIC_API_KEY || '';
+    const apiKey = legacy.apiKey || '';
     // Root-cause fix for 2026-06-19 e2e-sync direct 401: when the legacy
     // deepseek `baseUrl` is carried over but the apiKey is a bigmodel
     // key, force the OpenAI-compat endpoint to bigmodel paas/v4.
     // Otherwise deepseek receives a bigmodel Bearer key and returns 401.
-    const legacyOpenAiBaseUrl = legacy.baseUrl || deriveOpenAiCompatBaseUrl(anthropicBaseUrl);
-    const openAiBaseUrl = reconcileOpenAiCompatBaseUrl(legacyOpenAiBaseUrl, apiKey);
-    // Same correction for the model alias: bigmodel paas/v4 does not
-    // accept `deepseek-chat`; reset to the Anthropic-adapter alias.
-    const legacyModel = legacy.model || process.env.ANTHROPIC_MODEL || DEFAULT_CLAUDE_CLI_MODEL;
-    const claudeModel = reconcileModelAlias(legacyModel, apiKey);
+    const openAiBaseUrl = reconcileOpenAiCompatBaseUrl(legacy.baseUrl, apiKey);
+    const model = reconcileModelAlias(legacy.model, apiKey);
 
     return this.normalizeLlmConfig({
       openAiCompatBaseUrl: openAiBaseUrl,
-      claudeCompatBaseUrl: anthropicBaseUrl,
       apiKey,
-      model: claudeModel,
-      // Default the DirectChannel alias to bigmodel's free OpenAI
-      // endpoint model. Users on a different provider can override via UI.
-      directModel: DEFAULT_DIRECT_MODEL,
-      claudeCliModel: DEFAULT_CLAUDE_CLI_MODEL,
+      model,
+      directModel: model || DEFAULT_DIRECT_MODEL,
       temperature: typeof legacy.temperature === 'number' ? legacy.temperature : 0.2,
-      // Legacy flat configs had no timeout field; surface the new 10-min
+      // Legacy flat configs had no timeout field; surface the 10-min
       // default so the timeout config knob is usable immediately after
       // migration.
       timeoutMs: DEFAULT_LLM_TIMEOUT_MS,
-      claudeCli: {
-        claudePath: undefined,
-        extraArgs: [],
-      },
-      opencode: {
-        executablePath: undefined,
-        model: undefined,
-        agent: undefined,
-        timeoutMs: undefined,
-      },
       contentAdaptationEnabled: false,
-      primaryChannel: 'claude-cli',
-      fallbackOnFailure: true,
+      primaryChannel: 'direct',
+      fallbackOnFailure: false,
     });
   }
 
@@ -1093,11 +995,9 @@ export class ConfigManager {
     const rawModel = partial.model ?? base.model;
     const normalizedFlat = {
       openAiCompatBaseUrl: reconcileOpenAiCompatBaseUrl(rawOpenAiBaseUrl, apiKey),
-      claudeCompatBaseUrl: partial.claudeCompatBaseUrl ?? base.claudeCompatBaseUrl,
       apiKey,
       model: reconcileModelAlias(rawModel, apiKey),
       directModel: canonicalizeGlmModelAlias(partial.directModel ?? base.directModel),
-      claudeCliModel: canonicalizeGlmModelAlias(partial.claudeCliModel ?? base.claudeCliModel),
     };
     const providers = normalizeProviderProfiles(partial.providers, normalizedFlat);
     const requestedProviderId = stringValue(partial.activeProviderId);
@@ -1129,29 +1029,14 @@ export class ConfigManager {
       timeoutMs: typeof partial.timeoutMs === 'number'
         ? partial.timeoutMs
         : DEFAULT_LLM_TIMEOUT_MS,
-      claudeCli: {
-        claudePath: partial.claudeCli?.claudePath ?? base.claudeCli?.claudePath,
-        extraArgs: partial.claudeCli?.extraArgs ?? base.claudeCli?.extraArgs,
-      },
-      opencode: {
-        executablePath: partial.opencode?.executablePath ?? base.opencode?.executablePath,
-        model: partial.opencode?.model ?? base.opencode?.model,
-        agent: partial.opencode?.agent ?? base.opencode?.agent,
-        timeoutMs: typeof partial.opencode?.timeoutMs === 'number'
-          ? partial.opencode.timeoutMs
-          : base.opencode?.timeoutMs,
-      },
       contentAdaptationEnabled: typeof partial.contentAdaptationEnabled === 'boolean'
         ? partial.contentAdaptationEnabled
         : false,
-      primaryChannel: partial.primaryChannel === 'claude-cli'
-        || partial.primaryChannel === 'direct'
-        || partial.primaryChannel === 'opencode'
-        ? partial.primaryChannel
-        : 'claude-cli',
-      fallbackOnFailure: typeof partial.fallbackOnFailure === 'boolean'
-        ? partial.fallbackOnFailure
-        : true,
+      // v0.2.9：claude-cli / opencode 通道已移除；旧配置中的其他取值
+      // 一律归一为 direct。
+      primaryChannel: 'direct',
+      // 单通道时代无回退；字段保留仅为旧配置兼容。
+      fallbackOnFailure: false,
     };
   }
 

@@ -18,9 +18,6 @@ import type {
   TrashedDoc,
   ChannelTestRequest,
   ChannelTestResult,
-  OpenCodeInstallResult,
-  OpenCodeStatus,
-  ClaudeCliStatus,
   FeishuPendingItem,
   TreeResponse,
   CustomFolder,
@@ -552,10 +549,10 @@ export async function clearTrash(): Promise<{ purged: number }> {
 // ============================================================================
 
 /**
- * POST /api/llm/test-channel — real connectivity test against the currently
- * selected channel (claude-cli or direct). Server sends a tiny hello prompt
- * with a 30s timeout and returns the result without surfacing the stack to
- * the UI (full detail lives in server logs).
+ * POST /api/llm/test-channel — real connectivity test against the direct
+ * channel (OpenAI-compatible endpoint). Server sends a tiny hello prompt
+ * and returns the result without surfacing the stack to the UI (full
+ * detail lives in server logs).
  *
  * NOTE: this endpoint is part of the P4-2 contract; if 鲁班 has not added it
  * yet, callers will receive an APIError (404) and should surface a Toast.
@@ -565,27 +562,6 @@ export async function testLlmChannel(body: ChannelTestRequest): Promise<ChannelT
     method: 'POST',
     body: JSON.stringify(body),
   });
-}
-
-/** Read-only OpenCode discovery/version check for the desktop settings page. */
-export async function getOpenCodeStatus(): Promise<OpenCodeStatus> {
-  return request<OpenCodeStatus>('/api/opencode/status');
-}
-
-/**
- * Explicitly install the official global npm package. The UI asks for native
- * confirmation before calling this mutating endpoint.
- */
-export async function installOpenCode(): Promise<OpenCodeInstallResult> {
-  return request<OpenCodeInstallResult>('/api/opencode/install', {
-    method: 'POST',
-    body: JSON.stringify({}),
-  });
-}
-
-/** Read-only Claude Code discovery/version check for the desktop settings page. */
-export async function getClaudeCliStatus(): Promise<ClaudeCliStatus> {
-  return request<ClaudeCliStatus>('/api/claude/status');
 }
 
 // ============================================================================

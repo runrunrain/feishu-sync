@@ -1,25 +1,19 @@
 /**
- * ContentBackend P3 algorithm-layer tests.
+ * ContentBackend tests（v0.2.9 单通道版）
  *
- * Strategy (per execution-plan P3 + diting P1 testing-pattern):
- *   1. Algorithm layer (this file): vitest with mocks for
- *      child_process.spawn and the OpenAI SDK. No real network or
- *      subprocess calls. Validates:
- *        - Registry primary/fallback resolution
- *        - DirectChannel success / timeout / error classification
- *        - ClaudeCliChannel JSON parse / non-JSON graceful / exit-code
- *          error / timeout / api_error_status / is_error
- *        - ContentAdapter primary-success path, primary-failure ->
- *          fallback-success path, both-fail path
- *        - Legacy config migration (flat -> LlmConfig)
- *   2. Integration layer: real bigmodel connectivity for both channels
- *      is exercised separately by tests/llm-channels-connectivity.test.ts
- *      (gated behind BIGMODEL_INTEGRATION=1 to avoid CI cost).
+ * v0.2.9 清理：claude-cli / opencode 本地无头通道移除，仅保留
+ * DirectChannel。本文件相应保留：
+ *   - Registry 单通道注册/查找/无回退
+ *   - ContentAdapter 编排（单通道：成功路径、失败直返、空内容视为失败）
+ *   - DirectChannel 成功/错误分类（OpenAI SDK mocked）
+ *   - isSuccess 谓词与 isLegacyLlmConfig 类型守卫
+ *
+ * Integration layer: real bigmodel connectivity is exercised separately by
+ * tests/llm-channels-connectivity.test.ts (gated behind
+ * BIGMODEL_INTEGRATION=1 to avoid CI cost).
  */
 
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-import { EventEmitter } from 'node:events';
-import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import {
   isSuccess,
   type AdaptFinishReason,
@@ -31,11 +25,11 @@ import { ContentAdapter } from '../src/modules/content-adapter.js';
 import { isLegacyLlmConfig } from '../src/types/index.js';
 
 // ============================================================================
-// Helpers: fake channels for orchestrator tests
+// Helpers: fake channel for orchestrator tests
 // ============================================================================
 
 class FakeChannel {
-  readonly name: string;
+  readonly name = 'direct' as const;
   readonly supportsStreaming: boolean;
   nextResult: { adaptedMarkdown: string; finishReason: AdaptFinishReason; errorMessage?: string } = {
     adaptedMarkdown: '',
@@ -43,8 +37,7 @@ class FakeChannel {
   };
   adaptCalls = 0;
 
-  constructor(name: 'claude-cli' | 'direct', supportsStreaming: boolean) {
-    this.name = name;
+  constructor(supportsStreaming: boolean) {
     this.supportsStreaming = supportsStreaming;
   }
 
@@ -68,68 +61,29 @@ class FakeChannel {
 function buildTestLlm(overrides: Partial<LlmConfig> = {}): LlmConfig {
   return {
     openAiCompatBaseUrl: 'https://example.test/api/paas/v4',
-    claudeCompatBaseUrl: 'https://example.test/api/anthropic',
     apiKey: 'test-key',
     model: 'test-model',
     temperature: 0.2,
-    primaryChannel: 'claude-cli',
-    fallbackOnFailure: true,
     ...overrides,
   };
 }
 
 describe('ContentBackendRegistry', () => {
-  it('registers both channels and resolves primary by default', () => {
-    const cfg: ChannelConfig = {
-      llm: buildTestLlm(),
-      primaryChannel: 'claude-cli',
-      fallbackOnFailure: true,
-    };
+  it('registers the direct channel and resolves it by default', () => {
+    const cfg: ChannelConfig = { llm: buildTestLlm() };
     const reg = new ContentBackendRegistry(cfg);
-    expect(reg.get().name).toBe('claude-cli');
-    expect(reg.get('direct').name).toBe('direct');
-    expect(reg.get('claude-cli').name).toBe('claude-cli');
-  });
-
-  it('switches primary to direct when configured', () => {
-    const cfg: ChannelConfig = {
-      llm: buildTestLlm(),
-      primaryChannel: 'direct',
-      fallbackOnFailure: true,
-    };
-    const reg = new ContentBackendRegistry(cfg);
-    expect(reg.primaryChannelName).toBe('direct');
     expect(reg.get().name).toBe('direct');
+    expect(reg.get('direct').name).toBe('direct');
+    expect(reg.primaryChannelName).toBe('direct');
   });
 
-  it('getFallback returns the OTHER channel when fallback enabled', () => {
-    const cfg: ChannelConfig = {
-      llm: buildTestLlm(),
-      primaryChannel: 'claude-cli',
-      fallbackOnFailure: true,
-    };
-    const reg = new ContentBackendRegistry(cfg);
-    expect(reg.getFallback('claude-cli')?.name).toBe('direct');
-    expect(reg.getFallback('direct')?.name).toBe('claude-cli');
-  });
-
-  it('getFallback returns null when fallback disabled', () => {
-    const cfg: ChannelConfig = {
-      llm: buildTestLlm(),
-      primaryChannel: 'claude-cli',
-      fallbackOnFailure: false,
-    };
-    const reg = new ContentBackendRegistry(cfg);
-    expect(reg.getFallback('claude-cli')).toBeNull();
+  it('getFallback always returns null (single-channel era)', () => {
+    const reg = new ContentBackendRegistry({ llm: buildTestLlm() });
+    expect(reg.getFallback('direct')).toBeNull();
   });
 
   it('throws on unknown channel name', () => {
-    const cfg: ChannelConfig = {
-      llm: buildTestLlm(),
-      primaryChannel: 'claude-cli',
-      fallbackOnFailure: true,
-    };
-    const reg = new ContentBackendRegistry(cfg);
+    const reg = new ContentBackendRegistry({ llm: buildTestLlm() });
     expect(() => reg.get('garbage' as any)).toThrow(/unknown channel/);
   });
 });
@@ -139,38 +93,23 @@ describe('ContentBackendRegistry', () => {
 // ============================================================================
 
 /**
- * Custom registry that lets tests inject FakeChannel instances and
- * control fallback behavior. We bypass the real ContentBackendRegistry
- * constructor (which would instantiate real channels) and feed the
- * registry via reflection on the private map.
+ * Custom registry that lets tests inject FakeChannel instances. We bypass
+ * the real channel by replacing the private channels map after construction.
  */
 class TestableRegistry extends ContentBackendRegistry {
-  constructor(
-    channels: Array<FakeChannel>,
-    primaryName: 'claude-cli' | 'direct',
-    fallbackOnFailure: boolean
-  ) {
-    // Pass a valid config; we override channels afterwards.
-    super({
-      llm: buildTestLlm(),
-      primaryChannel: primaryName,
-      fallbackOnFailure,
-    });
-    // Replace the real channels with our fakes.
+  constructor(channels: Array<FakeChannel>) {
+    super({ llm: buildTestLlm() });
+    // Replace the real channel with our fakes.
     (this as any).channels = new Map(channels.map((ch) => [ch.name, ch]));
-    (this as any).primaryName = primaryName;
-    (this as any).fallbackOnFailure = fallbackOnFailure;
   }
 }
 
 describe('ContentAdapter orchestration', () => {
-  it('returns primary result on success (no fallback invoked)', async () => {
-    const primary = new FakeChannel('claude-cli', false);
+  it('returns primary result on success', async () => {
+    const primary = new FakeChannel(false);
     primary.nextResult = { adaptedMarkdown: 'PRIMARY-OK', finishReason: 'stop' };
-    const fallback = new FakeChannel('direct', true);
-    fallback.nextResult = { adaptedMarkdown: 'FALLBACK-OK', finishReason: 'stop' };
 
-    const reg = new TestableRegistry([primary, fallback], 'claude-cli', true);
+    const reg = new TestableRegistry([primary]);
     const adapter = new ContentAdapter(reg);
 
     const result = await adapter.adaptContent('raw', null, {
@@ -178,49 +117,19 @@ describe('ContentAdapter orchestration', () => {
     });
 
     expect(result.adaptedMarkdown).toBe('PRIMARY-OK');
-    expect(result.channelName).toBe('claude-cli');
-    expect(primary.adaptCalls).toBe(1);
-    expect(fallback.adaptCalls).toBe(0);
-  });
-
-  it('falls back to the other channel on primary timeout', async () => {
-    const primary = new FakeChannel('claude-cli', false);
-    primary.nextResult = {
-      adaptedMarkdown: '',
-      finishReason: 'timeout',
-      errorMessage: 'timed out',
-    };
-    const fallback = new FakeChannel('direct', true);
-    fallback.nextResult = { adaptedMarkdown: 'FALLBACK-OK', finishReason: 'stop' };
-
-    const reg = new TestableRegistry([primary, fallback], 'claude-cli', true);
-    const adapter = new ContentAdapter(reg);
-
-    const result = await adapter.adaptContent('raw', null, {
-      adapt: { temperature: 0.2 },
-    });
-
-    expect(result.adaptedMarkdown).toBe('FALLBACK-OK');
     expect(result.channelName).toBe('direct');
     expect(primary.adaptCalls).toBe(1);
-    expect(fallback.adaptCalls).toBe(1);
   });
 
-  it('returns last failure when both channels fail (caller applies B6)', async () => {
-    const primary = new FakeChannel('claude-cli', false);
+  it('returns the failure directly when the only channel fails (caller applies B6)', async () => {
+    const primary = new FakeChannel(false);
     primary.nextResult = {
       adaptedMarkdown: '',
       finishReason: 'error',
       errorMessage: 'primary boom',
     };
-    const fallback = new FakeChannel('direct', true);
-    fallback.nextResult = {
-      adaptedMarkdown: '',
-      finishReason: 'error',
-      errorMessage: 'fallback boom',
-    };
 
-    const reg = new TestableRegistry([primary, fallback], 'claude-cli', true);
+    const reg = new TestableRegistry([primary]);
     const adapter = new ContentAdapter(reg);
 
     const result = await adapter.adaptContent('raw', null, {
@@ -228,52 +137,50 @@ describe('ContentAdapter orchestration', () => {
     });
 
     expect(result.finishReason).toBe('error');
-    expect(result.errorMessage).toContain('fallback boom');
+    expect(result.errorMessage).toContain('primary boom');
     expect(primary.adaptCalls).toBe(1);
-    expect(fallback.adaptCalls).toBe(1);
   });
 
-  it('does NOT call fallback when fallbackOnFailure=false', async () => {
-    const primary = new FakeChannel('claude-cli', false);
-    primary.nextResult = { adaptedMarkdown: '', finishReason: 'error' };
-    const fallback = new FakeChannel('direct', true);
-    fallback.nextResult = { adaptedMarkdown: 'FALLBACK-OK', finishReason: 'stop' };
+  it('returns timeout failure directly when the only channel times out', async () => {
+    const primary = new FakeChannel(false);
+    primary.nextResult = {
+      adaptedMarkdown: '',
+      finishReason: 'timeout',
+      errorMessage: 'timed out',
+    };
 
-    const reg = new TestableRegistry([primary, fallback], 'claude-cli', false);
+    const reg = new TestableRegistry([primary]);
     const adapter = new ContentAdapter(reg);
 
     const result = await adapter.adaptContent('raw', null, {
       adapt: { temperature: 0.2 },
     });
 
-    expect(result.finishReason).toBe('error');
-    expect(fallback.adaptCalls).toBe(0);
+    expect(result.finishReason).toBe('timeout');
+    expect(primary.adaptCalls).toBe(1);
   });
 
   it('treats empty adaptedMarkdown with finishReason=stop as failure', async () => {
-    // Edge case: claude returned JSON but result was empty string.
-    // We treat that as failure so the fallback gets a chance.
-    const primary = new FakeChannel('claude-cli', false);
+    const primary = new FakeChannel(false);
     primary.nextResult = { adaptedMarkdown: '   ', finishReason: 'stop' };
-    const fallback = new FakeChannel('direct', true);
-    fallback.nextResult = { adaptedMarkdown: 'FALLBACK-OK', finishReason: 'stop' };
 
-    const reg = new TestableRegistry([primary, fallback], 'claude-cli', true);
+    const reg = new TestableRegistry([primary]);
     const adapter = new ContentAdapter(reg);
 
     const result = await adapter.adaptContent('raw', null, {
       adapt: { temperature: 0.2 },
     });
 
-    expect(result.adaptedMarkdown).toBe('FALLBACK-OK');
-    expect(fallback.adaptCalls).toBe(1);
+    // 单通道无回退：空内容视为失败结果直返（调用方落确定性结果）。
+    expect(result.adaptedMarkdown.trim()).toBe('');
+    expect(primary.adaptCalls).toBe(1);
   });
 
   it('strips onProgress/enableStreaming for non-streaming channels', async () => {
-    const primary = new FakeChannel('claude-cli', false);
+    const primary = new FakeChannel(false);
     primary.nextResult = { adaptedMarkdown: 'PRIMARY-OK', finishReason: 'stop' };
 
-    const reg = new TestableRegistry([primary], 'claude-cli', true);
+    const reg = new TestableRegistry([primary]);
     const adapter = new ContentAdapter(reg);
 
     const onProgress = vi.fn();
@@ -345,14 +252,8 @@ describe('DirectChannel', () => {
   });
 
   it('parses a successful non-streaming SDK response', async () => {
-    // Use vi.mock at top-level scope by importing a fresh module copy
-    // that swaps OpenAI with a controllable fake. We can't easily use
-    // hoisted vi.mock here without restructuring the file; instead we
-    // exercise DirectChannel against a real fetch mock (OpenAI SDK
-    // falls back to fetch when no Node http overrides are set).
-    //
-    // The OpenAI SDK posts to `${baseURL}/chat/completions`. We mock
-    // global fetch to return a standard OpenAI Chat Completion shape.
+    // The OpenAI SDK posts to `${baseURL}/chat/completions`. We mock the
+    // constructor to return a standard OpenAI Chat Completion shape.
     const createMock = vi.fn().mockResolvedValue({
       choices: [
         {
@@ -392,451 +293,6 @@ describe('DirectChannel', () => {
 
     vi.doUnmock('openai');
     vi.resetModules();
-  });
-});
-
-// ============================================================================
-// ClaudeCliChannel tests (child_process.spawn mocked)
-// ============================================================================
-
-/**
- * Build a fake child_process.spawn that returns an EventEmitter
- * mimicking a real child process. Caller triggers 'close' later.
- */
-function makeFakeSpawn(opts: {
-  onStdin?: (child: any) => void;
-}) {
-  const spawned: Array<{
-    child: any;
-    cmd: string;
-    args: string[];
-    options: { env: NodeJS.ProcessEnv; shell?: boolean };
-    stdinWrites: string[];
-    stdinEnded: boolean;
-  }> = [];
-
-  const spawnMock = vi.fn(
-    (cmd: string, args: string[], options: { env: NodeJS.ProcessEnv; shell?: boolean }) => {
-      const child = new EventEmitter() as any;
-      const record = {
-        child,
-        cmd,
-        args,
-        options,
-        stdinWrites: [] as string[],
-        stdinEnded: false,
-      };
-      child.stdin = {
-        write: vi.fn((chunk: string | Buffer) => {
-          // Capture the chunk verbatim so tests can assert the prompt
-          // is delivered unmodified (no shell escaping applied).
-          record.stdinWrites.push(typeof chunk === 'string' ? chunk : chunk.toString('utf-8'));
-          return true;
-        }),
-        end: vi.fn(() => {
-          record.stdinEnded = true;
-          opts.onStdin?.(child);
-        }),
-        on: vi.fn(),
-      };
-      child.stdout = { on: vi.fn() };
-      child.stderr = { on: vi.fn() };
-      child.kill = vi.fn();
-      spawned.push(record);
-      return child;
-    }
-  );
-
-  return { spawnMock, spawned };
-}
-
-describe('ClaudeCliChannel', () => {
-  beforeEach(() => {
-    // The production resolver intentionally returns a friendly missing-CLI
-    // error when Claude Code is absent. These channel tests exercise spawn
-    // behavior, so provide a deterministic executable descriptor instead.
-    process.env.CLAUDE_CODE_EXECPATH = '/test/claude';
-  });
-
-  afterEach(() => {
-    vi.restoreAllMocks();
-    vi.resetModules();
-    // Clear env vars we might have leaked through tests.
-    delete process.env.ANTHROPIC_BASE_URL;
-    delete process.env.ANTHROPIC_API_KEY;
-    delete process.env.ANTHROPIC_MODEL;
-  });
-
-  it('returns error when apiKey is empty', async () => {
-    vi.resetModules();
-    const { ClaudeCliChannel } = await import('../src/modules/claude-cli-channel.js');
-    const ch = new ClaudeCliChannel(buildTestLlm({ apiKey: '' }));
-    const result = await ch.adapt({
-      rawContent: 'raw',
-      localOldContent: null,
-      options: { temperature: 0.2 },
-    });
-    expect(result.finishReason).toBe('error');
-    expect(result.errorMessage).toMatch(/apiKey is empty/);
-  });
-
-  it('parses a successful claude -p JSON envelope', async () => {
-    vi.resetModules();
-    const { spawnMock, spawned } = makeFakeSpawn({});
-    vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
-
-    const { ClaudeCliChannel } = await import('../src/modules/claude-cli-channel.js');
-    const ch = new ClaudeCliChannel(buildTestLlm());
-    const promise = ch.adapt({
-      rawContent: 'raw',
-      localOldContent: null,
-      options: { temperature: 0.2 },
-    });
-
-    // Drain microtasks so spawn() runs.
-    await Promise.resolve();
-    expect(spawned.length).toBe(1);
-
-    // Simulate claude writing JSON to stdout then closing with code 0.
-    const stdoutHandler = spawned[0].child.stdout.on.mock.calls.find(
-      (c: any[]) => c[0] === 'data'
-    )![1];
-    stdoutHandler(
-      Buffer.from(
-        JSON.stringify({
-          result: 'CLAUDE-OUTPUT',
-          is_error: false,
-          stop_reason: 'end_turn',
-          api_error_status: null,
-          usage: { input_tokens: 100, output_tokens: 50 },
-        })
-      )
-    );
-    spawned[0].child.emit('close', 0);
-
-    const result = await promise;
-
-    expect(result.finishReason).toBe('stop');
-    expect(result.adaptedMarkdown).toBe('CLAUDE-OUTPUT');
-    expect(result.tokensUsed).toBe(150);
-    expect(result.channelName).toBe('claude-cli');
-  });
-
-  it('classifies non-zero exit code as error', async () => {
-    vi.resetModules();
-    const { spawnMock, spawned } = makeFakeSpawn({});
-    vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
-
-    const { ClaudeCliChannel } = await import('../src/modules/claude-cli-channel.js');
-    const ch = new ClaudeCliChannel(buildTestLlm());
-    const promise = ch.adapt({
-      rawContent: 'raw',
-      localOldContent: null,
-      options: { temperature: 0.2 },
-    });
-
-    await Promise.resolve();
-    const stderrHandler = spawned[0].child.stderr.on.mock.calls.find(
-      (c: any[]) => c[0] === 'data'
-    )![1];
-    stderrHandler(Buffer.from('claude: command not found'));
-    spawned[0].child.emit('close', 127);
-
-    const result = await promise;
-    expect(result.finishReason).toBe('error');
-    expect(result.errorMessage).toMatch(/exited with code 127/);
-  });
-
-  it('classifies api_error_status != null as error', async () => {
-    vi.resetModules();
-    const { spawnMock, spawned } = makeFakeSpawn({});
-    vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
-
-    const { ClaudeCliChannel } = await import('../src/modules/claude-cli-channel.js');
-    const ch = new ClaudeCliChannel(buildTestLlm());
-    const promise = ch.adapt({
-      rawContent: 'raw',
-      localOldContent: null,
-      options: { temperature: 0.2 },
-    });
-
-    await Promise.resolve();
-    const stdoutHandler = spawned[0].child.stdout.on.mock.calls.find(
-      (c: any[]) => c[0] === 'data'
-    )![1];
-    stdoutHandler(
-      Buffer.from(
-        JSON.stringify({
-          result: '',
-          is_error: true,
-          stop_reason: 'end_turn',
-          api_error_status: { message: '余额不足' },
-        })
-      )
-    );
-    spawned[0].child.emit('close', 0);
-
-    const result = await promise;
-    expect(result.finishReason).toBe('error');
-    expect(result.errorMessage).toMatch(/API error/);
-  });
-
-  it('gracefully degrades non-JSON stdout to markdown', async () => {
-    vi.resetModules();
-    const { spawnMock, spawned } = makeFakeSpawn({});
-    vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
-
-    const { ClaudeCliChannel } = await import('../src/modules/claude-cli-channel.js');
-    const ch = new ClaudeCliChannel(buildTestLlm());
-    const promise = ch.adapt({
-      rawContent: 'raw',
-      localOldContent: null,
-      options: { temperature: 0.2 },
-    });
-
-    await Promise.resolve();
-    const stdoutHandler = spawned[0].child.stdout.on.mock.calls.find(
-      (c: any[]) => c[0] === 'data'
-    )![1];
-    stdoutHandler(Buffer.from('# plain markdown\n\nnot JSON'));
-    spawned[0].child.emit('close', 0);
-
-    const result = await promise;
-    expect(result.finishReason).toBe('stop');
-    expect(result.adaptedMarkdown).toContain('# plain markdown');
-  });
-
-  it('classifies timeout as timeout (SIGTERM + 5s SIGKILL)', async () => {
-    vi.resetModules();
-    const { spawnMock, spawned } = makeFakeSpawn({});
-    vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
-
-    const { ClaudeCliChannel } = await import('../src/modules/claude-cli-channel.js');
-    const ch = new ClaudeCliChannel(buildTestLlm());
-    const promise = ch.adapt({
-      rawContent: 'raw',
-      localOldContent: null,
-      options: { temperature: 0.2, timeoutMs: 50 },
-    });
-
-    // Wait for the 50ms timeout to fire, then simulate claude being
-    // killed (close event after SIGTERM).
-    await new Promise((r) => setTimeout(r, 100));
-    spawned[0].child.emit('close', null);
-
-    const result = await promise;
-    expect(result.finishReason).toBe('timeout');
-    expect(result.errorMessage).toMatch(/timed out/);
-    // SIGTERM was issued on the child.
-    expect(spawned[0].child.kill).toHaveBeenCalledWith('SIGTERM');
-  });
-
-  it('uses Z.AI token auth and an isolated non-bare runtime for BigModel endpoints', async () => {
-    vi.resetModules();
-    const { spawnMock, spawned } = makeFakeSpawn({});
-    vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
-
-    const { ClaudeCliChannel } = await import('../src/modules/claude-cli-channel.js');
-    const ch = new ClaudeCliChannel(
-      buildTestLlm({
-        apiKey: 'bigmodel-key',
-        claudeCompatBaseUrl: 'https://open.bigmodel.cn/api/anthropic',
-        model: 'glm-5.2',
-      })
-    );
-    const promise = ch.adapt({
-      rawContent: 'raw',
-      localOldContent: null,
-      options: { temperature: 0.2 },
-    });
-
-    await vi.waitFor(() => expect(spawned.length).toBe(1));
-    const env = spawned[0].options.env;
-    expect(env.ANTHROPIC_BASE_URL).toBe('https://api.z.ai/api/anthropic');
-    expect(env.ANTHROPIC_AUTH_TOKEN).toBe('bigmodel-key');
-    expect(env.ANTHROPIC_API_KEY).toBeUndefined();
-    expect(env.ANTHROPIC_MODEL).toBeUndefined();
-    expect(env.CLAUDE_CONFIG_DIR).toBeTruthy();
-    // Streaming must be disabled so stdout stays a single JSON envelope.
-    expect(env.ANTHROPIC_STREAM).toBe('false');
-    // GLM-5.2 is direct/OpenCode-only here; Claude Code uses its verified
-    // Z.AI tier mapping.
-    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('glm-4.7');
-    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('glm-4.7');
-    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('glm-4.7');
-    expect(spawned[0].args).not.toContain('--bare');
-
-    // Close the child to settle the promise.
-    spawned[0].child.emit('close', 0);
-    await promise;
-  });
-
-  it('runs in bare tool-free mode with --max-turns 1 (NO prompt in argv)', async () => {
-    vi.resetModules();
-    const { spawnMock, spawned } = makeFakeSpawn({});
-    vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
-
-    const { ClaudeCliChannel } = await import('../src/modules/claude-cli-channel.js');
-    const ch = new ClaudeCliChannel(buildTestLlm());
-    const promise = ch.adapt({
-      rawContent: 'ADVERSARIAL-raw-|inject-attempt',
-      localOldContent: null,
-      options: { temperature: 0.2 },
-    });
-
-    await Promise.resolve();
-    const args = spawned[0].args;
-    expect(args).toContain('-p');
-    expect(args).toContain('--output-format');
-    expect(args).toContain('--max-turns');
-    expect(args).toContain('1');
-    expect(args).toContain('--bare');
-    expect(args).toContain('--no-session-persistence');
-    expect(args).toContain('--tools');
-    expect(args).not.toContain('--dangerously-skip-permissions');
-
-    // v020-r2 prompt-injection hardening: the prompt MUST NOT appear in
-    // argv (it must travel via stdin). Even an adversarial rawContent
-    // containing cmd.exe metacharacters must never enter the command line.
-    for (const a of args) {
-      expect(a).not.toContain('ADVERSARIAL');
-      expect(a).not.toMatch(/raw-\|inject-attempt/);
-    }
-
-    spawned[0].child.emit('close', 0);
-    await promise;
-  });
-
-  it('delivers the prompt via stdin.write verbatim and half-closes stdin', async () => {
-    vi.resetModules();
-    const { spawnMock, spawned } = makeFakeSpawn({});
-    vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
-
-    const { ClaudeCliChannel } = await import('../src/modules/claude-cli-channel.js');
-    const ch = new ClaudeCliChannel(buildTestLlm());
-    const promise = ch.adapt({
-      // Adversarial prompt: every cmd.exe metacharacter is present.
-      // Under shell:true + argv passing these would corrupt the prompt;
-      // via stdin they must round-trip verbatim.
-      rawContent: 'line1 | line2\nline3 "quoted" `backtick` $HOME > out < in & bg',
-      localOldContent: null,
-      options: { temperature: 0.2 },
-    });
-
-    await Promise.resolve();
-    expect(spawned.length).toBe(1);
-    expect(spawned[0].stdinWrites.length).toBe(1);
-
-    const delivered = spawned[0].stdinWrites[0];
-    // Every metacharacter survives unmodified.
-    expect(delivered).toContain('|');
-    expect(delivered).toContain('\n');
-    expect(delivered).toContain('"');
-    expect(delivered).toContain('`');
-    expect(delivered).toContain('$');
-    expect(delivered).toContain('>');
-    expect(delivered).toContain('<');
-    expect(delivered).toContain('&');
-    expect(delivered).toContain('line1');
-    expect(delivered).toContain('line3');
-    expect(delivered).toContain('backtick');
-    expect(delivered).toContain('HOME');
-
-    // stdin was half-closed (EOF) so claude CLI does not wait 3s.
-    expect(spawned[0].stdinEnded).toBe(true);
-
-    spawned[0].child.emit('close', 0);
-    await promise;
-  });
-
-  describe('resolveClaudeExecutable precedence (unit, no real spawn)', () => {
-    // We instantiate ClaudeCliChannel and call adapt() with a fake spawn
-    // to inspect the `cmd` and `options.shell` for each precedence tier.
-    // Each tier is isolated by clearing env / config before the test.
-
-    beforeEach(() => {
-      // Keep subprocess assertions deterministic even on a developer
-      // machine that has Claude Code in a desktop-discovery directory.
-      process.env.CLAUDE_CODE_EXECPATH = '/test/claude';
-    });
-
-    it('tier 1: claudeCli.claudePath wins and uses shell:false', async () => {
-      vi.resetModules();
-      const { spawnMock, spawned } = makeFakeSpawn({});
-      vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
-      process.env.CLAUDE_CODE_EXECPATH = 'C:\\should-be-shadowed.exe';
-
-      const { ClaudeCliChannel } = await import('../src/modules/claude-cli-channel.js');
-      // claudeCli is a constructor arg (2nd), not part of LlmConfig.
-      const ch = new ClaudeCliChannel(buildTestLlm(), {
-        claudePath: 'D:\\explicit\\claude.exe',
-      });
-      const promise = ch.adapt({
-        rawContent: 'raw',
-        localOldContent: null,
-        options: { temperature: 0.2 },
-      });
-      await Promise.resolve();
-
-      expect(spawned[0].cmd).toBe('D:\\explicit\\claude.exe');
-      expect(spawned[0].options.shell).toBeUndefined();
-
-      spawned[0].child.emit('close', 0);
-      await promise;
-    });
-
-    it('tier 2: CLAUDE_CODE_EXECPATH used with shell:false', async () => {
-      vi.resetModules();
-      const { spawnMock, spawned } = makeFakeSpawn({});
-      vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
-      process.env.CLAUDE_CODE_EXECPATH = 'C:\\Users\\u\\claude.exe';
-
-      const { ClaudeCliChannel } = await import('../src/modules/claude-cli-channel.js');
-      const ch = new ClaudeCliChannel(buildTestLlm());
-      const promise = ch.adapt({
-        rawContent: 'raw',
-        localOldContent: null,
-        options: { temperature: 0.2 },
-      });
-      await Promise.resolve();
-
-      expect(spawned[0].cmd).toBe('C:\\Users\\u\\claude.exe');
-      expect(spawned[0].options.shell).toBeUndefined();
-
-      spawned[0].child.emit('close', 0);
-      await promise;
-    });
-
-    it('uses shell:true for an explicit Windows .cmd npm shim', async () => {
-      vi.resetModules();
-      const { spawnMock, spawned } = makeFakeSpawn({});
-      vi.doMock('node:child_process', () => ({ spawn: spawnMock }));
-      // Force win32 path even when the test runner is unix so the branch
-      // coverage does not depend on the host OS.
-      const originalPlatform = process.platform;
-      Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
-
-      try {
-        const { ClaudeCliChannel } = await import('../src/modules/claude-cli-channel.js');
-        const ch = new ClaudeCliChannel(buildTestLlm(), {
-          claudePath: '/tmp/claude.cmd',
-        });
-        const promise = ch.adapt({
-          rawContent: 'raw',
-          localOldContent: null,
-          options: { temperature: 0.2 },
-        });
-        await Promise.resolve();
-
-        expect(spawned[0].cmd).toBe('/tmp/claude.cmd');
-        expect(spawned[0].options.shell).toBe(true);
-
-        spawned[0].child.emit('close', 0);
-        await promise;
-      } finally {
-        Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true });
-      }
-    });
   });
 });
 

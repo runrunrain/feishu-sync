@@ -152,21 +152,16 @@ syncRoutes.post('/api/sync', async (c) => {
   // Load config
   const config = await configManager.load();
 
-  // Initialize M3 modules + v0.2.0 P3 channel-agnostic LLM stack.
+  // Initialize M3 modules + v0.2.9 单通道 LLM stack.
   //
-  // P3 flow chain (03 §4.4.1):
+  // Flow chain:
   //   LayoutReconstructor (必跑, 前置)
   //     -> ContentAdapter (optional, enableLLM=true)
-  //       primary channel: ClaudeCliChannel (default) or DirectChannel
-  //       on failure: fallback channel (single layer)
+  //       channel: DirectChannel（claude-cli / opencode 已移除）
   //     -> B6 deterministic fallback: reconstructedMarkdown (sync-engine)
   const layoutReconstructor = new LayoutReconstructor();
   const channelConfig: ChannelConfig = {
     llm: config.llm,
-    claudeCli: config.llm.claudeCli,
-    opencode: config.llm.opencode,
-    primaryChannel: config.llm.primaryChannel,
-    fallbackOnFailure: config.llm.fallbackOnFailure,
   };
   const registry = new ContentBackendRegistry(channelConfig);
   const contentAdapter = new ContentAdapter(registry);

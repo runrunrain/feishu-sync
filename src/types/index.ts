@@ -32,12 +32,11 @@ export interface Config {
   enableNotifications: boolean;
 }
 
-/** One model preset inside a provider's OpenAI/Anthropic-compatible routes. */
+/** One model preset inside a provider's OpenAI-compatible route. */
 export interface LlmModelPreset {
   id: string;
   name: string;
   openAiModel: string;
-  claudeCliModel: string;
   enabled: boolean;
 }
 
@@ -48,62 +47,40 @@ export interface LlmProviderConfig {
   enabled: boolean;
   apiKey: string;
   openAiCompatBaseUrl: string;
-  claudeCompatBaseUrl: string;
   defaultModelId?: string;
   models: LlmModelPreset[];
 }
 
 /**
- * v0.2.0 — remote-provider profiles plus local execution-channel controls.
+ * 远程模型提供商配置（v0.2.9 起仅 direct 通道）。
  *
- * `providers` is used by the remote direct and Claude Code channels. The
- * flat endpoint/key/model fields remain for migration and older callers; the
- * server resolves the selected provider/model before a remote request.
+ * claude-cli / opencode 本地无头通道已移除；`providers` 是权威配置，
+ * flat endpoint/key/model 字段为旧配置文件与旧调用方保留的兼容投影。
  */
 export interface LlmConfig {
   /** OpenAI-protocol adapter base URL (DirectChannel/OpenAI SDK). */
   openAiCompatBaseUrl: string;
-  /** Anthropic-protocol adapter base URL (ClaudeCliChannel env-inject). */
-  claudeCompatBaseUrl: string;
-  /** Single API key shared by both channels. */
+  /** Provider credential (bearer key). */
   apiKey: string;
-  /** Default model alias used by both channels when no per-channel override. */
+  /** Model alias valid at the OpenAI-compat endpoint. */
   model: string;
-  /** Optional per-channel model alias override (bigmodel dual-protocol alias spaces). */
+  /** Optional per-channel model alias override for the direct channel. */
   directModel?: string;
-  claudeCliModel?: string;
   /** Sampling temperature 0.0-1.0. Default 0.2. */
   temperature: number;
   /** User-configured remote model providers. */
   providers?: LlmProviderConfig[];
-  /** Currently selected remote provider for direct / Claude Code. */
+  /** Currently selected remote provider for the direct channel. */
   activeProviderId?: string;
   /** Currently selected model preset within the active provider. */
   activeModelId?: string;
   /** Optional shared timeout used by remote channels (milliseconds). */
   timeoutMs?: number;
-  /** ClaudeCliChannel process control. */
-  claudeCli?: {
-    claudePath?: string;
-    extraArgs?: string[];
-  };
-  /**
-   * Local OpenCode process controls. When the active provider has a key, the
-   * app passes it to OpenCode only for that child process; it is never written
-   * to OpenCode's config file. Without an active key OpenCode uses its own
-   * local configuration.
-   */
-  opencode?: {
-    executablePath?: string;
-    model?: string;
-    agent?: string;
-    timeoutMs?: number;
-  };
   /** Explicit opt-in: reorganise Markdown bodies during sync. */
   contentAdaptationEnabled?: boolean;
-  /** Primary channel name. Default 'claude-cli'. */
-  primaryChannel: 'claude-cli' | 'direct' | 'opencode';
-  /** On primary failure, retry via the other channel. Default true. */
+  /** v0.2.9 起恒为 'direct'（旧取值由服务端读取时归一）。 */
+  primaryChannel: 'direct';
+  /** @deprecated 单通道时代无效果，仅为旧配置兼容保留。 */
   fallbackOnFailure: boolean;
 }
 
@@ -567,36 +544,28 @@ export interface TrashedDoc {
 // Channel Connectivity Test (T7, decision 3 real call)
 // ============================================================================
 
-export type ChannelName = 'claude-cli' | 'direct' | 'opencode';
+export type ChannelName = 'direct';
 
 /**
  * Connectivity test request body for POST /api/llm/test-channel.
  *
- * Backend contract (to be implemented by 鲁班 P5):
- *   - channel='claude-cli': spawn `claude -p "hello"` with bigmodel Anthropic
- *     env injection (ANTHROPIC_BASE_URL/API_KEY/MODEL), 30s timeout.
- *   - channel='direct':    POST bigmodel paas/v4 chat/completions with a
- *     tiny hello prompt, 30s timeout.
- * Both channels share the same `llm.apiKey`.
+ * Backend contract（v0.2.9 单通道）：channel='direct'，向 OpenAI 兼容端点
+ * 发送一条 tiny hello prompt（默认 10 分钟容忍，超时结构化返回）。
  */
 export interface ChannelTestRequest {
   channel: ChannelName;
   llm: Pick<
     LlmConfig,
     | 'openAiCompatBaseUrl'
-    | 'claudeCompatBaseUrl'
     | 'apiKey'
     | 'model'
     | 'directModel'
-    | 'claudeCliModel'
     | 'temperature'
     | 'timeoutMs'
     | 'providers'
     | 'activeProviderId'
     | 'activeModelId'
   >;
-  claudeCli?: { claudePath?: string; extraArgs?: string[] };
-  opencode?: LlmConfig['opencode'];
 }
 
 export interface ChannelTestResult {
@@ -608,31 +577,6 @@ export interface ChannelTestResult {
   /** Effective model alias used. */
   model: string;
   /** One-line error summary (no stack). Full detail in server logs. */
-  error?: string;
-}
-
-export interface OpenCodeStatus {
-  installed: boolean;
-  executablePath: string | null;
-  version: string | null;
-  source: 'configured' | 'path' | 'login-shell' | 'npm-global-prefix' | 'npm-global-root' | 'missing';
-  executable: boolean;
-  error?: string;
-}
-
-export interface OpenCodeInstallResult {
-  success: boolean;
-  status: OpenCodeStatus;
-  message: string;
-}
-
-/** Read-only availability result for the local Claude Code executable. */
-export interface ClaudeCliStatus {
-  installed: boolean;
-  executablePath: string | null;
-  version: string | null;
-  source: 'configured' | 'environment' | 'path' | 'known-location' | 'missing';
-  executable: boolean;
   error?: string;
 }
 

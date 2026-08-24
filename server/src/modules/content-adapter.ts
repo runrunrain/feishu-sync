@@ -16,8 +16,10 @@
  * sync pipeline stay deterministic and rely on B6 fallback.
  *
  * Streaming: only honored when the selected channel reports
- * supportsStreaming=true (i.e. DirectChannel). ClaudeCliChannel is
- * non-streaming; the orchestrator skips the onProgress path for it.
+ * supportsStreaming=true (i.e. DirectChannel)。
+ *
+ * v0.2.9：claude-cli / opencode 本地无头通道已移除，registry 仅注册
+ * DirectChannel，getFallback() 恒为 null；整理失败由调用方落确定性结果。
  */
 
 import type {

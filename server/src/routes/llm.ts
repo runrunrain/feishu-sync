@@ -3,36 +3,26 @@
  *
  *   POST /api/llm/test-channel - Real LLM round-trip with a tiny prompt.
  *
- * Wraps the P3 ContentBackend channels (ClaudeCliChannel + DirectChannel)
- * with a short timeout and returns a structured, stack-scrubbed result.
+ * v0.2.9 清理：claude-cli / opencode 本地无头通道移除，仅保留
+ * DirectChannel（OpenAI 兼容远程端点）。请求体 channel 只接受 'direct'。
+ *
  * The endpoint NEVER leaks `llm.apiKey`: errors are stringified, the
  * response shape omits the key, and the channel outputs only expose
  * `finishReason`/`durationMs`/`tokensUsed`/`model` to the caller.
  *
- * Contract mirrors src/api/client.ts (洛神 P4-2 ChannelTestRequest /
- * ChannelTestResult). The route accepts the full ChannelTestRequest body
- * (channel + llm + optional claudeCli) and constructs the channel on
- * demand; this lets the UI test a config the user has NOT yet saved
- * (e.g. mid-edit), without persisting anything.
- *
  * A real model round-trip may spend several minutes in a provider queue or
- * reasoning pass, especially for a large coding model. Channel checks use
- * the same configured per-document tolerance as sync work (10 minutes by
- * default), bounded at fifteen minutes for a responsive desktop recovery
- * path. Timeouts are always returned as structured `success=false`, never as
- * a 500.
+ * reasoning pass. Channel checks use the same configured per-document
+ * tolerance as sync work (10 minutes by default), bounded at fifteen minutes.
+ * Timeouts are always returned as structured `success=false`, never as a 500.
  */
 
 import { Hono } from 'hono';
-import { ClaudeCliChannel } from '../modules/claude-cli-channel.js';
 import { DirectChannel } from '../modules/direct-channel.js';
-import { OpenCodeCliChannel } from '../modules/opencode-cli-channel.js';
 import { isSuccess, resolveActiveLlmConfig } from '../modules/content-backend.js';
 import type {
   ChannelName,
   ContentBackend,
   LlmConfig,
-  OpenCodeCliConfig,
 } from '../modules/content-backend.js';
 
 const llmRoutes = new Hono();
@@ -60,21 +50,11 @@ function scrubError(err: unknown): string {
 function buildChannel(
   name: ChannelName,
   llm: LlmConfig,
-  claudeCli?: { claudePath?: string; extraArgs?: string[] },
-  opencode?: OpenCodeCliConfig,
 ): { channel: ContentBackend; model: string } {
   const effectiveLlm = resolveActiveLlmConfig(llm);
-  if (name === 'claude-cli') {
-    const model = effectiveLlm.claudeCliModel || effectiveLlm.model;
-    return { channel: new ClaudeCliChannel(llm, claudeCli), model };
-  }
   if (name === 'direct') {
     const model = effectiveLlm.directModel || effectiveLlm.model;
     return { channel: new DirectChannel(llm), model };
-  }
-  if (name === 'opencode') {
-    const model = opencode?.model || 'OpenCode 默认模型';
-    return { channel: new OpenCodeCliChannel(llm, opencode), model };
   }
   throw new Error(`unknown channel: ${name}`);
 }
@@ -140,11 +120,11 @@ llmRoutes.post('/api/llm/test-channel', async (c) => {
   }
 
   const channel: ChannelName | undefined = body.channel;
-  if (channel !== 'claude-cli' && channel !== 'direct' && channel !== 'opencode') {
+  if (channel !== 'direct') {
     return c.json(
       {
         error: 'invalid_body',
-        message: "channel must be 'claude-cli', 'direct', or 'opencode'",
+        message: "channel must be 'direct'（claude-cli / opencode 通道已移除）",
       },
       400,
     );
@@ -164,12 +144,9 @@ llmRoutes.post('/api/llm/test-channel', async (c) => {
   // sees a complete object even if the UI omitted optional fields.
   const llmConfig: LlmConfig = {
     openAiCompatBaseUrl: String(llm.openAiCompatBaseUrl ?? ''),
-    claudeCompatBaseUrl: String(llm.claudeCompatBaseUrl ?? ''),
     apiKey: typeof llm.apiKey === 'string' ? llm.apiKey : '',
     model: String(llm.model ?? ''),
     directModel: typeof llm.directModel === 'string' ? llm.directModel : undefined,
-    claudeCliModel:
-      typeof llm.claudeCliModel === 'string' ? llm.claudeCliModel : undefined,
     temperature:
       typeof llm.temperature === 'number' ? llm.temperature : 0.2,
     timeoutMs: typeof llm.timeoutMs === 'number' ? llm.timeoutMs : undefined,
@@ -188,7 +165,7 @@ llmRoutes.post('/api/llm/test-channel', async (c) => {
   // Validate the effective config, not just the legacy flat fields. A
   // selected provider can have its own masked API key which was restored
   // above only for this in-memory test request.
-  if (channel !== 'opencode' && effectiveLlm.apiKey.length === 0) {
+  if (effectiveLlm.apiKey.length === 0) {
     return c.json(
       {
         success: false,
@@ -202,55 +179,24 @@ llmRoutes.post('/api/llm/test-channel', async (c) => {
     );
   }
 
-  const claudeCli =
-    body.claudeCli && typeof body.claudeCli === 'object'
-      ? {
-          claudePath:
-            typeof body.claudeCli.claudePath === 'string'
-              ? body.claudeCli.claudePath
-              : undefined,
-          extraArgs: Array.isArray(body.claudeCli.extraArgs)
-            ? body.claudeCli.extraArgs.filter((a: unknown) => typeof a === 'string')
-            : [],
-        }
-      : undefined;
-
-  const opencode =
-    body.opencode && typeof body.opencode === 'object'
-      ? {
-          executablePath: typeof body.opencode.executablePath === 'string'
-            ? body.opencode.executablePath
-            : undefined,
-          model: typeof body.opencode.model === 'string' ? body.opencode.model : undefined,
-          agent: typeof body.opencode.agent === 'string' ? body.opencode.agent : undefined,
-          timeoutMs: typeof body.opencode.timeoutMs === 'number'
-            ? body.opencode.timeoutMs
-            : undefined,
-        }
-      : undefined;
-
   // Treat connectivity testing as a real small model job, rather than a
-  // browser-style ping.  A provider queue/large reasoning model can exceed
-  // the old 30s (or Claude-only 180s) ceiling while still being healthy.
-  // Respect the saved per-document tolerance, allow an explicit one-off
-  // override, and keep OpenCode's own optional process timeout meaningful.
+  // browser-style ping. Respect the saved per-document tolerance and allow
+  // an explicit one-off override.
   const requestedTimeout =
     typeof body.timeoutMs === 'number'
       ? body.timeoutMs
-      : channel === 'opencode' && typeof opencode?.timeoutMs === 'number'
-        ? opencode.timeoutMs
-        : typeof llmConfig.timeoutMs === 'number'
-          ? llmConfig.timeoutMs
-          : DEFAULT_TIMEOUT_MS;
+      : typeof llmConfig.timeoutMs === 'number'
+        ? llmConfig.timeoutMs
+        : DEFAULT_TIMEOUT_MS;
   const timeoutMs = Math.max(500, Math.min(requestedTimeout, MAX_TIMEOUT_MS));
 
   try {
-    const { channel: backend, model } = buildChannel(channel, llmConfig, claudeCli, opencode);
+    const { channel: backend, model } = buildChannel(channel, llmConfig);
     const startedAt = Date.now();
 
     // Race the channel call against a hard timeout. Channels already
     // implement their own timeoutMs, but we add an outer guard so a
-    // hung spawn can never block the request indefinitely.
+    // hung request can never block the route indefinitely.
     const result = await Promise.race([
       backend.adapt({
         rawContent: TEST_PROMPT,

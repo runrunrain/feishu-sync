@@ -32,10 +32,6 @@ import { contentRoutes } from './routes/content.js';
 import { trashRoutes } from './routes/trash.js';
 import { customFolderRoutes } from './routes/custom-folders.js';
 import { llmRoutes } from './routes/llm.js';
-import { opencodeRoutes } from './routes/opencode.js';
-import { OpenCodeCliService } from './modules/opencode-cli-service.js';
-import { claudeRoutes } from './routes/claude.js';
-import { ClaudeCliService } from './modules/claude-cli-service.js';
 import type { LarkCliConfig } from './types/index.js';
 
 // ============================================================================
@@ -133,11 +129,6 @@ export async function buildServer(options: CreateServerOptions = {}) {
   const larkCliClient = new LarkCliClient(larkCliConfig);
   console.info('[server] LarkCliClient initialized');
 
-  // Keep a single service instance so explicit global installation is
-  // serialized even when the settings button is clicked repeatedly.
-  const openCodeCliService = new OpenCodeCliService();
-  const claudeCliService = new ClaudeCliService();
-
   // Initialize database schema
   console.info('[server] Initializing database schema');
   localMapStore.initialize();
@@ -186,8 +177,6 @@ export async function buildServer(options: CreateServerOptions = {}) {
     (c as any).larkCliClient = larkCliClient;
     (c as any).localMapStore = localMapStore;
     (c as any).changeDetector = changeDetector;
-    (c as any).openCodeCliService = openCodeCliService;
-    (c as any).claudeCliService = claudeCliService;
 
     // Inject desktopToken for auth middleware via context property
     if (desktopMode) {
@@ -224,8 +213,6 @@ export async function buildServer(options: CreateServerOptions = {}) {
   app.route('/', trashRoutes);
   app.route('/', customFolderRoutes);
   app.route('/', llmRoutes);
-  app.route('/', opencodeRoutes);
-  app.route('/', claudeRoutes);
   console.info('[server] Protected routes registered');
 
   // ============================================================================

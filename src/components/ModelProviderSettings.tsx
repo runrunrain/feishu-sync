@@ -1,14 +1,9 @@
 /**
  * ModelProviderSettings
  *
- * Provider + preset editor inspired by amagi-codebox's provider centre, but
- * deliberately scoped to this app's two remote execution protocols:
- * - direct: OpenAI-compatible endpoint/model alias
- * - Claude Code: Anthropic-compatible endpoint/model alias
- *
- * OpenCode is configured in the execution-channel card. When an active
- * profile has a key, the backend passes it to OpenCode only for the current
- * headless child process; the key is never written to OpenCode's local file.
+ * Provider + preset editor（v0.2.9 单通道版）：每个提供商一个 OpenAI 兼容
+ * 端点 + 密钥 + 若干模型别名预设；文档整理经 direct 通道调用当前选中的
+ * 提供商/预设。claude-cli / opencode 本地无头通道已移除。
  */
 
 import { useEffect, useState } from 'react';
@@ -61,13 +56,11 @@ function makeProvider(existing: LlmProviderConfig[]): LlmProviderConfig {
     enabled: true,
     apiKey: '',
     openAiCompatBaseUrl: '',
-    claudeCompatBaseUrl: '',
     defaultModelId: modelId,
     models: [{
       id: modelId,
       name: '默认模型',
       openAiModel: '',
-      claudeCliModel: '',
       enabled: true,
     }],
   };
@@ -179,7 +172,7 @@ export function ModelProviderSettings() {
       toast.push({
         type: 'warning',
         message: '请至少保留一个提供商',
-        hint: '如果只使用 OpenCode，可关闭该提供商而无需删除。',
+        hint: '可关闭该提供商而无需删除。',
       });
       return;
     }
@@ -207,7 +200,6 @@ export function ModelProviderSettings() {
       id: uniqueId('model', provider.models.map((item) => item.id)),
       name: `模型 ${provider.models.length + 1}`,
       openAiModel: '',
-      claudeCliModel: '',
       enabled: true,
     };
     updateProvider(provider.id, (current) => ({
@@ -297,8 +289,8 @@ export function ModelProviderSettings() {
       <CardBody className="space-y-4">
         <div className="rounded-md border border-jade/30 bg-jade/5 px-3 py-2.5 text-xs text-ink-soft">
           <p>
-            direct 使用 OpenAI 兼容端点与模型；Claude Code 无头模式使用 Anthropic 兼容端点与模型。
-            同一提供商可为两条协议填写不同模型别名。Z.AI / BigModel 的 Claude Code 无头模式建议使用 glm-4.7；若旧配置仍填写 glm-5.2，应用会仅在 Claude Code 调用时自动映射为 glm-4.7。OpenCode 会在本次无头调用中临时使用当前提供商的密钥（不会写入 OpenCode 配置文件）；未配置密钥时才回退到 OpenCode 本机配置。
+            文档整理通过当前选中的提供商与模型预设，经 OpenAI 兼容端点调用。
+            GLM（Z.AI / BigModel）容量显示后缀（如 glm-5.2[1m]）会在运行时自动归一为标准模型代码。
           </p>
         </div>
 
@@ -306,7 +298,7 @@ export function ModelProviderSettings() {
           <div className="rounded-md border border-dashed border-line p-6 text-center">
             <Server className="mx-auto h-6 w-6 text-ink-faint" />
             <p className="mt-2 text-sm text-ink-soft">尚未配置远程模型提供商</p>
-            <p className="mt-1 text-xs text-ink-faint">添加后即可为 direct 或 Claude Code 选择模型。</p>
+            <p className="mt-1 text-xs text-ink-faint">添加后即可为文档整理选择模型。</p>
             <Button className="mt-4" size="sm" onClick={addProvider}>
               <Plus className="w-3.5 h-3.5" />
               添加第一个提供商
@@ -384,9 +376,9 @@ export function ModelProviderSettings() {
                 />
               </div>
 
-              <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+              <div className="grid grid-cols-1 gap-3">
                 <Input
-                  label="direct Base URL（OpenAI 兼容）"
+                  label="Base URL（OpenAI 兼容）"
                   type="url"
                   value={selectedProvider.openAiCompatBaseUrl}
                   onChange={(event) => updateProvider(selectedProvider.id, (provider) => ({
@@ -394,18 +386,7 @@ export function ModelProviderSettings() {
                     openAiCompatBaseUrl: event.target.value,
                   }))}
                   placeholder="https://api.example.com/v1"
-                  helperText="选择 direct 通道时使用"
-                />
-                <Input
-                  label="Claude Code Base URL（Anthropic 兼容）"
-                  type="url"
-                  value={selectedProvider.claudeCompatBaseUrl}
-                  onChange={(event) => updateProvider(selectedProvider.id, (provider) => ({
-                    ...provider,
-                    claudeCompatBaseUrl: event.target.value,
-                  }))}
-                  placeholder="https://api.example.com/anthropic"
-                  helperText="选择 Claude Code 无头模式时使用"
+                  helperText="文档整理经此 OpenAI 兼容端点调用"
                 />
               </div>
 
@@ -496,7 +477,7 @@ export function ModelProviderSettings() {
                           </button>
                         </div>
                       </div>
-                      <div className="grid grid-cols-1 gap-3 lg:grid-cols-3">
+                      <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
                         <Input
                           label="预设名称"
                           value={model.name}
@@ -504,25 +485,13 @@ export function ModelProviderSettings() {
                           placeholder="例如：GLM 5.2"
                         />
                         <Input
-                          label="direct 模型"
+                          label="模型别名"
                           value={model.openAiModel}
                           onChange={(event) => updateModel(selectedProvider, model.id, { openAiModel: event.target.value })}
                           placeholder="glm-4-flash"
                           helperText={/\bglm-[^\s\[]+\[[^\]]+\]/i.test(model.openAiModel)
                             ? 'GLM API 请填写标准模型代码（例如 glm-5.2）；容量显示后缀会在运行时自动移除。'
                             : undefined}
-                        />
-                        <Input
-                          label="Claude Code 模型"
-                          value={model.claudeCliModel}
-                          onChange={(event) => updateModel(selectedProvider, model.id, { claudeCliModel: event.target.value })}
-                          placeholder="glm-4.7"
-                          helperText={/\bglm-[^\s\[]+\[[^\]]+\]/i.test(model.claudeCliModel)
-                            ? 'GLM API 请填写标准模型代码（例如 glm-4.7）；容量显示后缀会在运行时自动移除。'
-                            : /(?:^|[/.])(?:bigmodel\.cn|z\.ai)(?:[/:]|$)/i.test(`${selectedProvider.openAiCompatBaseUrl} ${selectedProvider.claudeCompatBaseUrl}`)
-                              && /^glm-5\.2$/i.test(model.claudeCliModel.trim())
-                              ? 'Z.AI Claude Code 通道当前会将 glm-5.2 映射为已验证的 glm-4.7；direct 与 OpenCode 不受影响。'
-                              : undefined}
                         />
                       </div>
                     </div>

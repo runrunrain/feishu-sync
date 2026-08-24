@@ -74,11 +74,8 @@ export function getEnabledWatchedRootUrls(
 /**
  * A model preset belonging to one remote provider.
  *
- * The two headless execution paths speak different protocols: direct uses an
- * OpenAI-compatible endpoint, while Claude Code uses an
- * Anthropic-compatible endpoint. Providers such as GLM can expose different
- * model aliases on those endpoints, so a preset stores both aliases instead
- * of forcing users to duplicate a provider just to select a model.
+ * v0.2.9 起仅保留 direct（OpenAI 兼容端点）通道；每个 preset 只存该端点
+ * 可用的模型别名。
  */
 export interface LlmModelPreset {
   /** Stable local identifier; unique within the provider. */
@@ -87,8 +84,6 @@ export interface LlmModelPreset {
   name: string;
   /** Model passed to the direct/OpenAI-compatible channel. */
   openAiModel: string;
-  /** Model passed to the Claude Code/Anthropic-compatible channel. */
-  claudeCliModel: string;
   /** Disabled presets remain saved but cannot be selected at runtime. */
   enabled: boolean;
 }
@@ -111,8 +106,6 @@ export interface LlmProviderConfig {
   apiKey: string;
   /** OpenAI-compatible base URL used by the direct channel. */
   openAiCompatBaseUrl: string;
-  /** Anthropic-compatible base URL injected into Claude Code. */
-  claudeCompatBaseUrl: string;
   /** Preferred preset within this provider when no explicit active preset exists. */
   defaultModelId?: string;
   /** Provider-owned model aliases. */
@@ -131,73 +124,48 @@ export interface LlmProviderConfig {
 export interface LlmConfig {
   /** OpenAI-protocol adapter base URL (DirectChannel/OpenAI SDK). */
   openAiCompatBaseUrl: string;
-  /** Anthropic-protocol adapter base URL (ClaudeCliChannel env-inject). */
-  claudeCompatBaseUrl: string;
-  /** Single API key shared by both channels. */
+  /** Provider credential (bearer key). */
   apiKey: string;
-  /** Model alias used by both channels (e.g. glm-4-flash). */
+  /** Model alias used at the OpenAI-compat endpoint (e.g. glm-4-flash). */
   model: string;
-  /**
-   * Optional per-channel model overrides. Bigmodel's two endpoints use
-   * different alias spaces (paas/v4 accepts glm-5.2, while Z.AI Claude
-   * Code uses the documented glm-4.7 tier mapping); these let users fill
-   * different aliases when
-   * a single name is not valid at both endpoints.
-   */
+  /** Optional per-channel model override for the direct channel. */
   directModel?: string;
-  claudeCliModel?: string;
   /** Sampling temperature 0.0-1.0. Default 0.2. */
   temperature: number;
   /** Saved remote providers. Existing flat configs are migrated to GLM here. */
   providers?: LlmProviderConfig[];
-  /** The remote provider currently used by direct and Claude Code channels. */
+  /** The remote provider currently used by the direct channel. */
   activeProviderId?: string;
   /** The model preset currently used within `activeProviderId`. */
   activeModelId?: string;
   /**
    * Per-call LLM adaptation timeout in milliseconds.
    *
-   * Default 600000 (10 minutes). The claude-cli channel (bigmodel
-   * glm-4.7 via the Anthropic-compat adapter) routinely takes 1-3
-   * minutes for a single feishu doc adaptation under load, and the
-   * bigmodel endpoint occasionally returns transient 529 over-load
-   * responses that the SDK retries internally. A 60s timeout (the
-   * previous hard-coded value) was too aggressive and caused the
-   * primary channel to abort and fall back to DirectChannel even when
-   * the model would have produced output if given another minute or
-   * two. The 10-minute default gives the model ample headroom while
-   * still bounding worst-case latency; users on a fast local model
-   * can lower this via the UI / config.json.
+   * Default 600000 (10 minutes). Remote models routinely take 1-3 minutes
+   * for a single feishu doc adaptation under load, and endpoints
+   * occasionally return transient over-load responses that the SDK retries
+   * internally. A 60s timeout was too aggressive; the 10-minute default
+   * gives the model ample headroom while still bounding worst-case latency.
    *
    * Used by sync-engine when calling ContentAdapter.adaptContent.
    * Per-call AdaptOptions.timeoutMs still overrides this value.
    */
   timeoutMs?: number;
-  /** ClaudeCliChannel process control (path + extra args). */
-  claudeCli?: {
-    claudePath?: string;
-    extraArgs?: string[];
-  };
-  /**
-   * Local OpenCode process controls. The active app provider credential is
-   * supplied only as a one-process OpenCode runtime overlay; it is never
-   * written to OpenCode's local configuration.
-   */
-  opencode?: {
-    executablePath?: string;
-    model?: string;
-    agent?: string;
-    timeoutMs?: number;
-  };
   /**
    * Explicit opt-in for document organisation during sync. Keeping this
-   * separate from primaryChannel prevents a saved LLM setting from silently
-   * changing document bodies on a later sync.
+   * separate from the channel selection prevents a saved LLM setting from
+   * silently changing document bodies on a later sync.
    */
   contentAdaptationEnabled?: boolean;
-  /** Primary channel name. Default 'claude-cli'. */
-  primaryChannel: 'claude-cli' | 'direct' | 'opencode';
-  /** On primary failure, retry via the other channel. Default true. */
+  /**
+   * v0.2.9 起 claude-cli / opencode 通道已移除，恒为 'direct'。
+   * 旧配置中的其他取值由 config-manager 读取时归一为 'direct'。
+   */
+  primaryChannel: 'direct';
+  /**
+   * v0.2.9 起无第二通道可回退，字段保留仅为旧配置兼容（读取后忽略）。
+   * @deprecated 单通道时代无效果。
+   */
   fallbackOnFailure: boolean;
 }
 

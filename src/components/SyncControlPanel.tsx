@@ -18,7 +18,6 @@ interface SyncControlPanelProps {
   selectedCount: number;
   syncing: boolean;
   contentAdaptationEnabled: boolean;
-  organisationChannel: 'claude-cli' | 'direct' | 'opencode';
   onStart: () => void;
 }
 
@@ -26,7 +25,6 @@ export function SyncControlPanel({
   selectedCount,
   syncing,
   contentAdaptationEnabled,
-  organisationChannel,
   onStart,
 }: SyncControlPanelProps) {
   const startDisabled = selectedCount === 0 || syncing;
@@ -66,8 +64,7 @@ export function SyncControlPanel({
           >
             <p className="font-medium text-ink">文档整理已启用</p>
             <p className="mt-1 leading-5">
-              本次会先完成确定性格式重建，再通过
-              {' '}{organisationChannel === 'opencode' ? '本机 OpenCode 无头模式' : '当前 LLM 通道'}整理正文。
+              本次会先完成确定性格式重建，再通过当前 LLM 通道整理正文。
               整理失败时会自动保留确定性结果，不会中断安全写入。
             </p>
           </div>

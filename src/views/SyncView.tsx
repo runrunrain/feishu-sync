@@ -35,7 +35,6 @@ export function SyncView() {
   const toast = useToast();
   const sync = useSync();
   const contentAdaptationEnabled = config?.llm.contentAdaptationEnabled === true;
-  const organisationChannel = config?.llm.primaryChannel ?? 'claude-cli';
 
   const [selectedTokens, setSelectedTokens] = useState<string[]>([]);
   const [logOpen, setLogOpen] = useState(false);
@@ -85,7 +84,7 @@ export function SyncView() {
       `将把 ${selectedDocs.length} 项已选文档写入本地知识库。\n\n` +
       '已有映射的文件会原子替换；同名但未映射的本地文件不会被覆盖。' +
       (contentAdaptationEnabled
-        ? `\n\n已启用文档整理：会通过 ${organisationChannel === 'opencode' ? '本机 OpenCode' : '当前 LLM 通道'} 处理正文；失败时保留确定性原始转换结果。`
+        ? `\n\n已启用文档整理：会通过当前 LLM 通道处理正文；失败时保留确定性原始转换结果。`
         : '') +
       '\n\n是否继续？',
     );
@@ -407,7 +406,6 @@ export function SyncView() {
             selectedCount={selectedDocs.length}
             syncing={syncing}
             contentAdaptationEnabled={contentAdaptationEnabled}
-            organisationChannel={organisationChannel}
             onStart={handleStart}
           />
 
