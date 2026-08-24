@@ -143,9 +143,18 @@ function hasCodeSigningIdentity() {
 }
 
 function verifyMacPackage() {
-  const appPath = path.resolve(outputDir, `mac-${arch}`, 'Feishu Sync.app');
-  if (!fs.existsSync(appPath)) {
-    throw new Error(`Packaged macOS app not found: ${appPath}`);
+  // electron-builder 的 appOutDir 仅在「构建架构 ≠ 运行机架构」或显式指定时
+  // 带 -<arch> 后缀：Apple Silicon 上构建 x64 时输出在 mac/ 而非 mac-x64/，
+  // 因此按候选目录逐一探测，取第一个真实存在的 .app 路径。
+  const candidates = [
+    path.resolve(outputDir, `mac-${arch}`, 'Feishu Sync.app'),
+    path.resolve(outputDir, 'mac', 'Feishu Sync.app'),
+    path.resolve(outputDir, 'mac-arm64', 'Feishu Sync.app'),
+    path.resolve(outputDir, 'mac-x64', 'Feishu Sync.app'),
+  ];
+  const appPath = candidates.find((p) => fs.existsSync(p));
+  if (!appPath) {
+    throw new Error(`Packaged macOS app not found in any of: ${candidates.join(', ')}`);
   }
 
   execFileSync(

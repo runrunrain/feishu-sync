@@ -58,16 +58,8 @@ jobs:
           # CI 无证书，禁止 electron-builder 探测钥匙串
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
 
-      - name: Upload artifacts to workflow run
-        uses: actions/upload-artifact@v4
-        with:
-          name: feishu-sync-mac-${{ matrix.arch }}
-          path: |
-            dist-desktop/darwin-${{ matrix.arch }}/*.dmg
-            dist-desktop/darwin-${{ matrix.arch }}/*.zip
-            dist-desktop/darwin-${{ matrix.arch }}/latest-mac.yml
-          if-no-files-found: error
-
+      # 注意：不上传 workflow artifacts——该账户 Actions artifact 存储配额
+      # 已满会阻塞 job；release assets 走独立存储，不受影响。
       - name: Publish to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         shell: bash
