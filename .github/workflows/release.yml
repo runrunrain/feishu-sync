@@ -1,9 +1,11 @@
 # Release 构建工作流（v0.2.8 引入）
 #
-# 触发：推送 v* 标签（发布）或手动 workflow_dispatch（试构建，不发 release）。
-# 产物：macOS dmg + zip（arm64 / x64 两个矩阵 job），附加 latest-mac.yml
-#       （electron-updater 的 generic provider 指向 releases/latest/download/，
-#       因此 yml 必须与安装包同名上传到同一 release）。
+# 触发：推送 v* 标签（发布）或手动 workflow_dispatch（试构建，不发 release；
+#       若 dispatch 时填写 tag input，则产物上传到该 tag 对应的既有 release，
+#       用于给已发布版本补产物）。
+# 产物：macOS dmg + zip（arm64 / x64 矩阵）+ Windows NSIS exe（x64），
+#       附加 latest-mac.yml / latest.yml（electron-updater 的 generic provider
+#       指向 releases/latest/download/，因此 yml 必须与安装包同名上传到同一 release）。
 #
 # 签名：CI 没有 Developer ID 证书，走 DESKTOP_MAC_SIGNING=adhoc（electron-builder
 #       identity: "-"）。下载安装后需 `xattr -dr com.apple.quarantine` 解除隔离。
@@ -60,14 +62,17 @@ jobs:
 
       # 注意：不上传 workflow artifacts——该账户 Actions artifact 存储配额
       # 已满会阻塞 job；release assets 走独立存储，不受影响。
+      # tag push 发布；dispatch 填了 tag 则补传到该既有 release；都不满足则仅试构建。
       - name: Publish to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: >-
+          startsWith(github.ref, 'refs/tags/') ||
+          (github.event_name == 'workflow_dispatch' && inputs.tag != '')
         shell: bash
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"
+          TAG="${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || inputs.tag }}"
           DIR="dist-desktop/darwin-${{ matrix.arch }}"
-          # 第一个到达的矩阵 job 创建 release，另一个 job 复用（--clobber 幂等）。
+          # 第一个到达的矩阵 job 创建 release，其他 job 复用（--clobber 幂等）。
           gh release view "$TAG" >/dev/null 2>&1 || \
             gh release create "$TAG" \
               --title "Feishu Sync ${TAG}" \
@@ -76,3 +81,57 @@ jobs:
           gh release upload "$TAG" \
             "$DIR"/*.dmg "$DIR"/*.zip "$DIR"/latest-mac.yml \
             --clobber
+
+  build-win:
+    runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            server/package-lock.json
+
+      # 依赖装两份：根目录（前端 + electron + 打包）和 server/（业务）
+      - name: Install dependencies
+        shell: bash
+        run: |
+          npm ci
+          npm ci --prefix server
+
+      # 复用本地同一打包脚本：build:all → electron:build → 原生模块按
+      # Electron ABI 重建 → electron-builder（NSIS oneClick=false）
+      - name: Build desktop app (Windows x64)
+        shell: bash
+        run: node scripts/build-desktop-target.cjs --platform win32 --arch x64
+
+      # 与 mac job 同一发布口径：tag push 发布、dispatch 补传、仅试构建不上传。
+      # Windows 产物 = NSIS exe + latest.yml（+ 若启用差分更新则 blockmap）。
+      - name: Publish to GitHub Release
+        if: >-
+          startsWith(github.ref, 'refs/tags/') ||
+          (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || inputs.tag }}"
+          DIR="dist-desktop/win32-x64"
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" \
+              --title "Feishu Sync ${TAG}" \
+              --generate-notes \
+              --draft=false
+          gh release upload "$TAG" \
+            "$DIR"/*.exe "$DIR"/latest.yml \
+            --clobber
+          # blockmap 非必选产物（NSIS 差分更新启用时生成）；存在则一并上传
+          shopt -s nullglob
+          BLOCKMAPS=("$DIR"/*.blockmap)
+          if [ ${#BLOCKMAPS[@]} -gt 0 ]; then
+            gh release upload "$TAG" "${BLOCKMAPS[@]}" --clobber
+          fi
