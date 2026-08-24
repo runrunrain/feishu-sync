@@ -9,6 +9,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { IndexScanner, resolveDocumentTitle } from '../src/modules/index-scanner.js';
+import { LocalMapStore } from '../src/modules/local-map-store.js';
 
 // The scanner only needs parseMetadata for these tests. Construct with
 // stub dependencies — they are never invoked in unit-level parsing tests.
@@ -660,5 +661,131 @@ feishu_sync:
     expect(indexed).toHaveLength(1);
     expect(indexed[0].objToken).toBe('NoRelTok');
     expect(indexed[0]).not.toHaveProperty('localRelPath');
+  });
+});
+
+describe('IndexScanner custom-folder auto-adoption (scanKnowledgeBase reconcile)', () => {
+  // Uses the same real better-sqlite3 binding as production, mirroring the
+  // local-map-store.test.ts pattern: the reconcile step is a cross-layer
+  // (filesystem → custom_folders → documents) flow that only proves itself
+  // against the real store.
+  const temporaryRoots: string[] = [];
+  const temporaryDbDirs: string[] = [];
+
+  afterEach(() => {
+    for (const root of temporaryRoots.splice(0)) {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+    for (const dir of temporaryDbDirs.splice(0)) {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  function createStore(): { store: LocalMapStore; dbPath: string } {
+    const dbDir = fs.mkdtempSync(path.join(os.tmpdir(), 'index-scan-custom-db-'));
+    temporaryDbDirs.push(dbDir);
+    const dbPath = path.join(dbDir, 'feishu-sync.db');
+    const store = new LocalMapStore(dbPath);
+    store.initialize();
+    return { store, dbPath };
+  }
+
+  function writeMappedMd(root: string, relativePath: string, objToken: string, wikiNodeToken: string) {
+    const target = path.join(root, relativePath);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(
+      target,
+      `<!--
+feishu_sync:
+  obj_token: ${objToken}
+  wiki_node_token: ${wikiNodeToken}
+  obj_type: docx
+  original_link: https://example.feishu.cn/wiki/${wikiNodeToken}
+-->
+
+# ${objToken}
+`,
+    );
+    return target;
+  }
+
+  it('adopts unregistered _custom subdirectories, binds rows, and stays idempotent on re-scan', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'index-scan-custom-'));
+    temporaryRoots.push(root);
+    const { store } = createStore();
+
+    // Pre-registered folder with a hand-dropped md (the production scenario:
+    // row gets upserted with custom_folder_id NULL after a rebuild).
+    store.createCustomFolder({ id: 'folder-archived', name: '已归档', localRelPath: '_custom/已归档' });
+    writeMappedMd(root, '_custom/已归档/arch-a.md', 'CustomTokA', 'NodeA');
+
+    // Unregistered folder containing md → must be auto-adopted.
+    writeMappedMd(root, '_custom/新文件夹/x.md', 'CustomTokX', 'NodeX');
+
+    // Assets-only directory → must NOT be registered.
+    fs.mkdirSync(path.join(root, '_custom', 'images'));
+    fs.writeFileSync(path.join(root, '_custom', 'images', 'cover.png'), 'binary');
+
+    // Loose md directly under _custom/ → no container, never adopted/bound.
+    writeMappedMd(root, '_custom/散档.md', 'LooseTok', 'LooseNode');
+
+    const indexScanner = new IndexScanner({
+      localMapStore: store,
+      larkCliClient: {},
+      config: { knowledgeBaseRoot: root },
+    });
+
+    const first = await indexScanner.scanKnowledgeBase(root);
+
+    // One folder registered (新文件夹), two rows bound (CustomTokA + CustomTokX).
+    expect(first.customFolderBackfill).toEqual({ registered: 1, bound: 2 });
+
+    const adopted = store.getCustomFolderByLocalRelPath('_custom/新文件夹');
+    expect(adopted).not.toBeNull();
+    expect(store.getCustomFolder(adopted!.id)).toMatchObject({ name: '新文件夹' });
+    expect(store.getCustomFolderByLocalRelPath('_custom/images')).toBeNull();
+
+    // Rows bound to the right owner; wiki identity preserved by design.
+    expect(store.getDocumentByObjToken('CustomTokA')).toMatchObject({
+      customFolderId: 'folder-archived',
+      wikiNodeToken: 'NodeA',
+    });
+    expect(store.getDocumentByObjToken('CustomTokX')).toMatchObject({
+      customFolderId: adopted!.id,
+      wikiNodeToken: 'NodeX',
+    });
+    expect(store.getDocumentByObjToken('LooseTok')?.customFolderId ?? null).toBeNull();
+
+    // Second scan: nothing new to register or bind (idempotent).
+    const second = await indexScanner.scanKnowledgeBase(root);
+    expect(second.customFolderBackfill).toEqual({ registered: 0, bound: 0 });
+    expect(store.listCustomFolders().map((f) => f.localRelPath).sort()).toEqual([
+      '_custom/已归档',
+      '_custom/新文件夹',
+    ]);
+
+    store.close();
+  });
+
+  it('returns zero stats when the knowledge base has no _custom directory', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'index-scan-nocustom-'));
+    temporaryRoots.push(root);
+    const { store } = createStore();
+
+    writeMappedMd(root, '技术 - Dev/README.md', 'TreeTok', 'TreeNode');
+
+    const indexScanner = new IndexScanner({
+      localMapStore: store,
+      larkCliClient: {},
+      config: { knowledgeBaseRoot: root },
+    });
+
+    const result = await indexScanner.scanKnowledgeBase(root);
+
+    expect(result.customFolderBackfill).toEqual({ registered: 0, bound: 0 });
+    expect(store.listCustomFolders()).toEqual([]);
+    expect(store.getDocumentByObjToken('TreeTok')?.customFolderId ?? null).toBeNull();
+
+    store.close();
   });
 });

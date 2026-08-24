@@ -364,3 +364,75 @@ describe('LocalMapStore runtime schema', () => {
     store.close();
   });
 });
+
+describe('LocalMapStore.backfillCustomFolders', () => {
+  it('binds unbound rows by longest folder prefix and skips ineligible rows', () => {
+    const dbPath = createDatabasePath();
+    const store = new LocalMapStore(dbPath);
+    store.initialize();
+
+    // Nested registrations: `_custom/a` is a prefix of `_custom/a/b`.
+    store.createCustomFolder({ id: 'folder-a', name: 'a', localRelPath: '_custom/a' });
+    store.createCustomFolder({ id: 'folder-ab', name: 'ab', localRelPath: '_custom/a/b' });
+
+    // Unbound, watched_root NULL rows under archive paths → candidates.
+    // wiki_node_token is kept non-null: this mirrors the real scenario where
+    // a rebuild re-parses the .md header and writes the token back.
+    store.upsertDocument(makeDocument({
+      objToken: 'doc-deep',
+      wikiNodeToken: 'node-deep',
+      localMdPath: '/kb/_custom/a/b/x.md',
+      localRelPath: '_custom/a/b/x.md',
+    }));
+    store.upsertDocument(makeDocument({
+      objToken: 'doc-shallow',
+      wikiNodeToken: 'node-shallow',
+      localMdPath: '/kb/_custom/a/y.md',
+      localRelPath: '_custom/a/y.md',
+    }));
+    // Path outside every registered folder → untouched.
+    store.upsertDocument(makeDocument({
+      objToken: 'doc-tree',
+      localMdPath: '/kb/技术 - Dev/doc.md',
+      localRelPath: '技术 - Dev/doc.md',
+    }));
+    // watched_root-owning row → excluded from candidates (tree ownership wins).
+    store.upsertDocument(makeDocument({
+      objToken: 'doc-owned',
+      localMdPath: '/kb/_custom/a/w.md',
+      localRelPath: '_custom/a/w.md',
+      watchedRootUrl: 'https://tenant.feishu.cn/wiki/tech-root',
+    }));
+    // Already-bound row → must not be rebound (WHERE custom_folder_id IS NULL).
+    store.setDocumentCustomFolder({
+      objToken: 'doc-bound',
+      folderId: 'folder-ab',
+      wikiNodeToken: null,
+      objType: 'docx',
+      title: '已绑定',
+      localMdPath: '/kb/_custom/a/b/bound.md',
+      localRelPath: '_custom/a/b/bound.md',
+      originalLink: null,
+      objEditTime: null,
+      spaceId: null,
+    });
+
+    const stats = store.backfillCustomFolders();
+    expect(stats).toEqual({ bound: 2 });
+
+    // Longest prefix wins: `_custom/a/b/x.md` binds to folder-ab, not folder-a.
+    expect(store.getDocumentByObjToken('doc-deep')).toMatchObject({ customFolderId: 'folder-ab' });
+    expect(store.getDocumentByObjToken('doc-shallow')).toMatchObject({ customFolderId: 'folder-a' });
+    // wiki identity is preserved by design (see backfillCustomFolders docs).
+    expect(store.getDocumentByObjToken('doc-deep')).toMatchObject({ wikiNodeToken: 'node-deep' });
+
+    expect(store.getDocumentByObjToken('doc-tree')?.customFolderId ?? null).toBeNull();
+    expect(store.getDocumentByObjToken('doc-owned')?.customFolderId ?? null).toBeNull();
+    // Existing binding untouched (still folder-ab, not re-matched).
+    expect(store.getDocumentByObjToken('doc-bound')).toMatchObject({ customFolderId: 'folder-ab' });
+
+    // Idempotent: second run finds no candidates.
+    expect(store.backfillCustomFolders()).toEqual({ bound: 0 });
+    store.close();
+  });
+});

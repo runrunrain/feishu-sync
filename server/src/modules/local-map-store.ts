@@ -1425,6 +1425,93 @@ export class LocalMapStore {
   }
 
   /**
+   * Backfill documents.custom_folder_id for rows that live under a
+   * registered custom folder's local_rel_path but carry no archive binding
+   * (e.g. the user hand-dropped a feishu-sync .md into _custom/<name>/ and a
+   * rebuild upserted the row with custom_folder_id NULL, watched_root_url
+   * NULL). Symmetric to backfillWatchedRoots(), but driven by longest-prefix
+   * matching against registered folder paths instead of config.
+   *
+   * Candidates: custom_folder_id NULL + watched_root_url NULL +
+   * cloud_deleted = 0 + non-empty local_rel_path. watchedRoot-owned rows are
+   * excluded because structure-tree ownership wins over archive ownership.
+   *
+   * Matching: longest prefix on folder localRelPath — the row must live
+   * strictly INSIDE the folder (relPath === folderRelPath + '/' + rest);
+   * when both `_custom/a` and `_custom/a/b` are registered, a file at
+   * `_custom/a/b/x.md` binds to `_custom/a/b`, never to `_custom/a`.
+   *
+   * Design decision — only custom_folder_id is written; wiki_node_token is
+   * deliberately NOT cleared:
+   *   a) upsertDocument's ON CONFLICT uses COALESCE(excluded, existing) for
+   *      wiki_node_token, so the next reindex writes the header-parsed token
+   *      right back — clearing it is wasted work;
+   *   b) custom_folder_id is the single source of truth for archive identity:
+   *      both the frontend tree filter (MappingService feishu view) and
+   *      detectCustomFolderChanges() (custom_folder_id IS NOT NULL) branch
+   *      on it alone;
+   *   c) keeping the wiki identity benefits detectCustomFolderChanges, whose
+   *      skip conditions treat an empty wikiNodeToken as a skip signal.
+   *
+   * Idempotent and concurrency-safe: the UPDATE guards on
+   * `AND custom_folder_id IS NULL` so a concurrent setDocumentCustomFolder()
+   * write is never clobbered.
+   *
+   * Returns { bound } — the number of rows newly linked to a folder.
+   */
+  backfillCustomFolders(): { bound: number } {
+    const folders = (
+      this.getStatement(`SELECT id, local_rel_path FROM custom_folders`).all() as Array<{
+        id: string;
+        local_rel_path: string;
+      }>
+    ).filter((folder) => folder.local_rel_path && folder.local_rel_path.length > 0);
+
+    const tx = this.db.transaction((): { bound: number } => {
+      const candidates = this.db
+        .prepare(
+          `SELECT obj_token, local_rel_path FROM documents
+           WHERE custom_folder_id IS NULL
+             AND watched_root_url IS NULL
+             AND cloud_deleted = 0
+             AND local_rel_path IS NOT NULL
+             AND local_rel_path != ''`,
+        )
+        .all() as Array<{ obj_token: string; local_rel_path: string }>;
+
+      const bind = this.db.prepare(`
+        UPDATE documents
+        SET custom_folder_id = ?, updated_at = datetime('now')
+        WHERE obj_token = ? AND custom_folder_id IS NULL
+      `);
+
+      let bound = 0;
+      for (const row of candidates) {
+        // Longest-prefix match over folder localRelPath. The trailing '/'
+        // forces a strict containment test (exact equality is not a match —
+        // a file path is never a folder path).
+        let best: { id: string; local_rel_path: string } | null = null;
+        for (const folder of folders) {
+          const prefix = folder.local_rel_path.endsWith('/')
+            ? folder.local_rel_path
+            : folder.local_rel_path + '/';
+          if (
+            row.local_rel_path.startsWith(prefix) &&
+            (!best || folder.local_rel_path.length > best.local_rel_path.length)
+          ) {
+            best = folder;
+          }
+        }
+        if (best) {
+          bound += bind.run(best.id, row.obj_token).changes;
+        }
+      }
+      return { bound };
+    });
+    return tx();
+  }
+
+  /**
    * Recompute cloud_match for all rows based on current column values.
    *
    * Classification rule (single source of truth — matches run-migration-v3):

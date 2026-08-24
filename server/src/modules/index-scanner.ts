@@ -17,6 +17,7 @@
  */
 
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import { getEnabledWatchedRoots } from '../types/index.js';
 import type { DocumentRecord } from '../types/index.js';
@@ -120,6 +121,16 @@ interface IndexResult {
   skipped: number;
   failed: number;
   errors: Array<{ file: string; error: string }>;
+  /**
+   * Custom-folder reconcile stats (additive, optional so existing callers
+   * of this internal interface keep compiling). Populated whenever the scan
+   * ran the _custom/ auto-adoption + binding step:
+   *   - registered: previously-unregistered _custom/<dir>/ subdirectories
+   *     (containing .md files) that were added to custom_folders
+   *   - bound: document rows newly linked to a folder via
+   *     backfillCustomFolders()
+   */
+  customFolderBackfill?: { registered: number; bound: number };
 }
 
 /**
@@ -240,7 +251,82 @@ export class IndexScanner {
       console.warn('[IndexScanner] watched_root_url backfill failed:', err);
     }
 
+    // Custom-folder reconcile: auto-adopt unregistered _custom/<dir>/
+    // subdirectories that contain .md files (e.g. user hand-dropped archive
+    // docs), then bind candidate rows to their owning folder via
+    // backfillCustomFolders(). Guarded so mock stores without the method
+    // (unit tests) skip the step silently.
+    try {
+      if (typeof this.localMapStore.backfillCustomFolders === 'function') {
+        const stats = this.reconcileCustomFolders(rootDir);
+        result.customFolderBackfill = stats;
+        console.info(
+          `[IndexScanner] customFolder reconcile: registered=${stats.registered} bound=${stats.bound}`,
+        );
+      }
+    } catch (err) {
+      // Don't fail the whole scan if the reconcile step breaks — the
+      // reindex data itself is still valid.
+      console.warn('[IndexScanner] custom folder reconcile failed:', err);
+    }
+
     return result;
+  }
+
+  /**
+   * Custom-folder reconciliation, run at the end of a full reindex.
+   *
+   * Step 1 (auto-adopt): scan the FIRST-LEVEL subdirectories of
+   * `<rootDir>/_custom/`. A subdirectory that (recursively) contains at
+   * least one .md file but has no custom_folders row is registered with
+   * the on-disk directory name as folder name and `_custom/<dir>` as
+   * localRelPath (verbatim disk name — no re-sanitizing, so the folder
+   * always mirrors what the user actually created). Subdirectories without
+   * .md files (e.g. `_custom/images/`) and reserved operational directories
+   * (ScanPolicy.shouldSkipDirectory, e.g. `.staging`) are skipped. Loose
+   * .md files directly under `_custom/` are NOT adopted — the product
+   * contract requires archive docs to live inside a named folder container.
+   *
+   * Step 2 (bind): backfillCustomFolders() links custom_folder_id-NULL,
+   * watched_root-NULL document rows to the folder owning their
+   * local_rel_path (longest prefix match).
+   *
+   * Idempotent: registered folders are skipped by the exact-localRelPath
+   * lookup, and backfillCustomFolders only touches unbound rows.
+   *
+   * Returns { registered, bound } for the IndexResult stats + logging.
+   */
+  private reconcileCustomFolders(rootDir: string): { registered: number; bound: number } {
+    const customDir = path.join(rootDir, '_custom');
+    if (!fs.existsSync(customDir)) {
+      return { registered: 0, bound: 0 };
+    }
+
+    let registered = 0;
+    const entries = fs.readdirSync(customDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      if (ScanPolicy.shouldSkipDirectory(entry.name)) continue;
+
+      const localRelPath = `_custom/${entry.name}`;
+      if (this.localMapStore.getCustomFolderByLocalRelPath(localRelPath)) continue;
+
+      // Adopt only directories that actually hold markdown content — an
+      // assets dir like _custom/images/ is not a folder container.
+      const hasMarkdown =
+        this.findMarkdownFiles(path.join(customDir, entry.name)).length > 0;
+      if (!hasMarkdown) continue;
+
+      this.localMapStore.createCustomFolder({
+        id: crypto.randomUUID(),
+        name: entry.name,
+        localRelPath,
+      });
+      registered++;
+    }
+
+    const { bound } = this.localMapStore.backfillCustomFolders();
+    return { registered, bound };
   }
 
   /**

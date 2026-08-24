@@ -672,6 +672,36 @@ describe('MappingService.getTreeDetailed (v0.2.0 structure-align Phase B)', () =
     expect(env.view).toBe('feishu');
     expect(env.nodes.map((n: any) => n.obj_token)).toEqual(['CLOUD1']);
   });
+
+  it('excludes custom-folder archive docs from feishu view and legacy getTree', () => {
+    // An archived doc still carries a non-empty wiki_node_token (reindex
+    // writes the header-parsed token back; the custom_folder_id backfill
+    // deliberately keeps it). custom_folder_id must gate it out of the
+    // structure tree — the 自定义归档 section renders it instead.
+    store.rows.set(
+      'ARCHIVE',
+      makeDoc({
+        objToken: 'ARCHIVE',
+        wikiNodeToken: 'WNT_ARCHIVE',
+        title: 'archived doc',
+        customFolderId: 'folder-1',
+      }),
+    );
+    store.rows.set(
+      'TREE',
+      makeDoc({ objToken: 'TREE', wikiNodeToken: 'WNT_TREE', title: 'tree doc' }),
+    );
+
+    const feishu = svc.getTreeDetailed({ view: 'feishu' });
+    expect(feishu.nodes.map((n) => n.obj_token)).toEqual(['TREE']);
+
+    // Local view keeps every live row.
+    const local = svc.getTreeDetailed({ view: 'local', includeOrphans: false });
+    expect(local.nodes.map((n) => n.obj_token).sort()).toEqual(['ARCHIVE', 'TREE']);
+
+    const legacy = svc.getTree();
+    expect(legacy.map((n) => n.obj_token)).toEqual(['TREE']);
+  });
 });
 
 describe('MappingService.updateSortOrder', () => {

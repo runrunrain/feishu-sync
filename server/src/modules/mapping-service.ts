@@ -392,7 +392,15 @@ export class MappingService {
    */
   getTree(): MappingNode[] {
     const documents = this.localMapStore.getAllDocuments();
-    const live = documents.filter((d) => (d.cloudDeleted ?? 0) === 0);
+    // Cloud-view projection: cloud_deleted rows go to the trash-bin UI, and
+    // custom-folder archive docs (custom_folder_id set) are rendered by the
+    // 自定义归档 section (GET /api/custom-folders) — neither belongs in the
+    // structure tree. Archive rows may still carry a non-empty
+    // wiki_node_token (backfill deliberately does not clear it), so
+    // custom_folder_id is the exclusion signal.
+    const live = documents.filter(
+      (d) => (d.cloudDeleted ?? 0) === 0 && d.customFolderId == null,
+    );
 
     // Precompute wiki_node_token -> has_child once for O(N) total.
     const parentSet = new Set<string>();
@@ -461,7 +469,15 @@ export class MappingService {
       // title is empty — project a diagnostic display title instead of dropping.
       nodes = live
         .filter(
-          (d) => d.wikiNodeToken != null && d.wikiNodeToken !== '',
+          (d) =>
+            d.wikiNodeToken != null &&
+            d.wikiNodeToken !== '' &&
+            // Custom-folder archive docs are excluded from the cloud view:
+            // they are rendered by the 自定义归档 section instead. They can
+            // carry a non-empty wiki_node_token (parsed from the .md header
+            // on reindex; the custom_folder_id backfill deliberately keeps
+            // it), so wiki identity alone cannot gate them out.
+            d.customFolderId == null,
         )
         .map((d) => {
           const node = this.projectNode(d, parentSet);
