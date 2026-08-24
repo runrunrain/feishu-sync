@@ -6,6 +6,22 @@
 
 ---
 
+## [0.3.4] - 2026-08-24
+
+### 概要
+v0.3.4：发布链路跨平台补全——GitHub Actions 新增 Windows x64 构建，Release 产物覆盖 macOS（arm64/x64）+ Windows（x64）三平台。
+
+### Added（ci）
+
+- **Windows x64 官方构建**：Release 工作流新增 `build-win` 任务（windows-latest / NSIS），产出 `FeishuSync-Setup-<版本>-x64.exe` 安装包与 `latest.yml` 更新馈送，Windows 端接入 electron-updater 自动更新链路。
+- **既有 Release 补传能力**：`workflow_dispatch` 手动触发支持指定 `tag`，向已发布版本补传缺失产物（不新建 release）。
+
+### Fixed（ci）
+
+- **发布资产上传竞态**：多矩阵任务并发上传同名资产（如 `latest-mac.yml`）时 `--clobber` 先删后传存在竞态窗口，实测曾导致 422 与资产短暂丢失；改为「存在即跳过 + 并发兜底重查」，彻底消除覆盖与丢失风险。
+
+---
+
 ## [0.3.3] - 2026-08-24
 
 ### 概要
