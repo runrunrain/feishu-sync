@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-跨平台桌面应用，定时检测飞书知识库子树变更并选择性同步到本地，把飞书导出内容重构为本地偏好的 Markdown 结构（表格 A/B/C/D/E 分型、层级格式），可选 LLM 风格对齐。详见 `README.md`。
+跨平台桌面应用，定时检测飞书知识库子树变更并选择性同步到本地，把飞书导出内容重构为本地偏好的 Markdown 结构（表格 A/B/C/D/E 分型、层级格式），可选 LLM 风格对齐。结构树之外的零散云文档可快捷归档到 `_custom/<文件夹>/`（自定义归档，见下）。详见 `README.md`。
 
 三层同进程架构：**Electron 主进程内嵌 Hono server**（不是独立进程）→ 业务模块 → SQLite，React 前端通过 preload bridge 调 server。better-sqlite3 是原生模块，其 ABI 必须与运行它的 Electron/Node ABI 一致（见下「原生模块 ABI」）。
 
@@ -75,22 +75,31 @@ npx tsx scripts/sync-latest.ts --skip-index --apply    # 真正写盘，仅 crea
 - **检测** `ChangeDetector`（`server/src/modules/change-detector.ts`）：遍历 wiki 子树，对比本地 SQLite 的 `observed_obj_edit_time`。检测**只推进 observed 字段**。
 - **同步** `SyncEngine`（`sync-engine.ts`，1475 行，最核心）：`分型读取(docx/sheet/slides) → 媒体引用解析/下载 → 本地引用重写 → staged 原子提交 → 推进 synced 基线`。**只有原子提交成功才推进 `synced_obj_edit_time` 并置 `synced`**——这是不可破的契约，资源缺失/下载失败/提交异常一律不推进。
 
+### 自定义归档与双身份契约
+
+文档归属有两条**互斥**身份通道，`custom_folder_id` 与 `watched_root_*` 不得并存，归属冲突时结构树所有权优先：
+
+- **结构树成员**：`watched_root_url/id` 绑定 watchedRoot，走检测→同步全链路。
+- **归档文档**：`custom_folder_id` 绑定 `custom_folders` 表，本地文件在 `_custom/<文件夹名>/`；常规写入点是快捷添加 API（`POST /api/custom-folders/:id/docs` → `setDocumentCustomFolder`，带结构树竞态守卫）。
+- **动态纳管**：手工放进 `_custom/` 的带 `feishu_sync` 头文件由全量重建兜底——`IndexScanner.reconcileCustomFolders` 自动注册含 md 的一级子目录（`ScanPolicy` 保留目录除外；`_custom/` 根下散档不纳管），`LocalMapStore.backfillCustomFolders` 按 `local_rel_path` 最长前缀回填 `custom_folder_id`（候选行须 watched_root 为空；与 `backfillWatchedRoots` 对称）。
+- **契约细节**：回填**不清** `wiki_node_token`——upsert 的 COALESCE 会把头部解析出的 wiki 身份写回，且 `detectCustomFolderChanges` 依赖它做云端身份校验；因此飞书树两个出口（`getTreeDetailed` feishu 视图 + legacy `getTree`）都必须按 `customFolderId IS NULL` 过滤归档行，wiki 身份单独不能作为排除依据。归档变更检测只报 modified（无新增/删除语义）。
+
 ### 安全写盘：dry-run 默认 + 原子提交
 
 - `SyncOptions.apply` 默认 false（dry-run）；写盘需要 `apply:true` + `confirmation:'APPLY'`。move/delete/路径冲突/父链不完整/未知类型/无权限 → 保留为带 `reasonCode` 的 **blocker**，绝不自动覆盖。
 - `atomic-commit.ts`：所有写入先进**库外** staging 目录，校验后 rename 入位；失败从 rollback 快照恢复；`assertInsideRoot` 拒绝路径逃逸。改写盘逻辑必须保持「staging → 校验 → rename → DB 事务」顺序，文件已提交但 DB 失败时用 `SyncEngineTestHooks` 验证回滚。
 
-### LLM 通道（v0.2.9 起：direct 单通道）
+### LLM 通道（direct 单通道）
 
 `content-backend.ts` + `content-backend-registry.ts` + `direct-channel.ts`：
 
-- **单 channel 注册**（`ChannelName = 'direct'`）：OpenAI SDK 打 OpenAI 兼容远程端点（默认智谱 bigmodel GLM）。claude-cli / opencode 两个本地无头 CLI 通道已在 v0.2.9 整体移除（含 `claude-cli-channel.ts`、`opencode-cli-channel.ts`、两个 CLI 发现服务、`/api/claude/*`、`/api/opencode/*` 路由与设置页对应卡片）。
+- **单 channel 注册**（`ChannelName = 'direct'`）：OpenAI SDK 打 OpenAI 兼容远程端点（默认智谱 bigmodel GLM），无本地 CLI 通道。
 - Registry 的 `getFallback()` 恒为 null——整理失败由 sync-engine 的确定性 B6 结果兜底。channel 失败不抛异常，返回 `finishReason='error'/'timeout'`。
 - 默认超时 `timeoutMs = 600_000`（10 分钟）——远程模型过载时 SDK 内部重试，旧 60s 会误判超时。
 
 ### 数据层
 
-- SQLite 在 `~/.feishu-sync/feishu-sync.db`，config 在 `~/.feishu-sync/config.json`；环境变量 `FEISHU_SYNC_HOME` 可整体改根目录（server 与 desktop 共享，**不是** Electron userData）。
+- SQLite 在 `~/.feishu-sync/feishu-sync.db`，config 在 `~/.feishu-sync/config.json`；环境变量 `FEISHU_SYNC_HOME` 可整体改根目录（server 与 desktop 共享，**不是** Electron userData）。除 documents/sync_log/run_log 主表外还有 localDirs/custom_folders/sheet_sheets/feishu_pending_items 等辅助表，全部经 additive 迁移演进。
 - `LocalMapStore`（`local-map-store.ts`）用 better-sqlite3 **同步** API + 预编译语句。`initialize()` 每次启动跑 `applyAdditiveMigrations()`：每条 `ALTER TABLE ADD COLUMN` 用 `PRAGMA table_info` 守卫，旧库原地升级。新列加到该数组 + `getCreateTablesDDL()` 两处。
 - 历史迁移脚本（`server/scripts/migration_v2..v5`）是文件级参考；线上升级靠上面的 additive 自动迁移，不再手工跑。
 - **`watchedRoots`（`WatchedRootConfig[]`）是真相源**，`watchedRootUrls` 是 ConfigManager 内存派生、不落盘的兼容投影。

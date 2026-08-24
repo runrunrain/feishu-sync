@@ -2,7 +2,7 @@
 
 **跨平台桌面应用**：自动检测飞书知识库子树变更并选择性同步到本地，保持本地重构后的 Markdown 内容结构（表格布局、层级格式），支持 LLM 驱动的内容适配。
 
-**状态**：正式同步交付版（2026-07-17）。正式回填默认只生成计划；只有显式 apply 才会写入知识库，路径冲突、移动、删除和未知类型均不会自动执行。
+**状态**：v0.3.3，正式同步 + 自定义归档交付版。正式回填默认只生成计划；只有显式 apply 才会写入知识库，路径冲突、移动、删除和未知类型均不会自动执行。
 
 ---
 
@@ -11,7 +11,9 @@
 - **变更检测**：定时轮询飞书知识库子树，托盘通知变更数量（支持工作时间高频检测）
 - **同步引擎**：单篇/批量同步，docx、sheet、slides 分型读取；正文图片、附件和可下载白板资源会落盘并改写为本地引用
 - **表格重构**：A/B/C/D/E 五类块自动识别与重构（metadata/hierarchy/datatable/paragraph/sparse）
-- **LLM 适配**：deepseek few-shot 风格对齐，支持流式输出与降级策略
+- **LLM 适配**：direct 单通道（OpenAI SDK，默认智谱 bigmodel GLM，`glm-4-flash` 免费档起步），风格对齐失败时回退确定性结果
+- **自定义归档**：结构树之外的零散云文档快捷归档到 `_custom/<文件夹>/`，支持云端变更检测；手工放入的文件在全量重建时自动纳管并回填归属
+- **双视图与预览**：节点树支持飞书结构视图 / 本地目录视图，内置 Markdown 文档预览面板
 - **系统托盘**：常驻托盘，快捷键（CmdOrCtrl+Shift+F）显示窗口，支持开机自启
 - **自动更新**：electron-updater 集成，支持检查/下载/安装更新流程
 
@@ -22,9 +24,9 @@
 - **桌面**：Electron 31 + electron-builder 24 + electron-updater 6
 - **前端**：React 18 + Vite 6 + Tailwind CSS 4
 - **后端**：Hono 4 + @hono/node-server（内嵌同进程）
-- **数据**：better-sqlite3 9（SQLite，documents/sync_log/run_log 三表）
-- **LLM**：OpenAI SDK → deepseek（OpenAI 兼容）
-- **飞书**：lark-cli 1.0.55（认证、变更检测、内容读取、媒体下载统一入口；工具不保存飞书 token）
+- **数据**：better-sqlite3 9（SQLite，documents/sync_log/run_log 主表 + localDirs/custom_folders 等辅助表，启动时 additive 迁移原地升级）
+- **LLM**：OpenAI SDK → 智谱 bigmodel GLM（OpenAI 兼容端点，默认 `glm-4-flash`）
+- **飞书**：lark-cli（实测 1.0.89；认证、变更检测、内容读取、媒体下载统一入口；工具不保存飞书 token）
 - **开发**：TypeScript 5 + esbuild 0.28
 
 ---
@@ -39,8 +41,8 @@
 - **ChangeDetector**：wiki 子树变更检测（obj_edit_time 对比本地 SQLite）
 - **SyncEngine**：内容分型读取 → 媒体引用解析/下载 → 本地引用重写 → staged 原子提交 → SQLite 基线推进
 - **LayoutReconstructor**：A/B/C/D/E 五类块识别的表格重构引擎
-- **ContentAdapter**：deepseek few-shot 风格对齐（temperature 0.2）
-- **LocalMapStore**：SQLite 映射与状态库（首次索引扫描 < 10s）
+- **ContentAdapter**：direct 通道（bigmodel GLM）few-shot 风格对齐（temperature 0.2）
+- **LocalMapStore**：SQLite 映射与状态库（首次索引扫描 < 10s；watchedRoot/自定义归档双身份回填）
 - **TrayService**：系统托盘常驻与变更通知
 - **UpdaterService**：electron-updater 集成（autoDownload=false，autoInstallOnAppQuit=false）
 
@@ -51,8 +53,8 @@
 ### 环境要求
 
 - Node.js 18+（实测 v24.16.0）
-- lark-cli 1.0.53（全局安装：`npm install -g lark-cli`）
-- Windows 11（打包目标含 macOS x64/arm64，需 macOS 环境验证）
+- lark-cli 1.0.89+（全局安装：`npm install -g lark-cli`）
+- Windows 11 / macOS（打包目标含 macOS x64/arm64，跨平台打包需目标平台环境）
 
 ### 安装依赖
 
@@ -80,21 +82,31 @@ lark-cli auth status
 
 **认证就绪条件**：user ready + 覆盖上表 9 个 scope（与 `ConfigManager` 默认 `requiredScopes` 一致）
 
-### 配置 deepseek 与本地知识库
+### 配置 LLM 与本地知识库
 
-编辑 `config.json`（首次运行自动生成）：
+编辑 `config.json`（首次运行自动生成，`watchedRoots` 为监听根配置真相源）：
 
 ```json
 {
   "llm": {
-    "baseUrl": "https://api.deepseek.com/v1",
-    "apiKey": "YOUR_DEEPSEEK_API_KEY",
-    "model": "deepseek-chat",
-    "temperature": 0.2
+    "primaryChannel": "direct",
+    "openAiCompatBaseUrl": "https://open.bigmodel.cn/api/paas/v4",
+    "apiKey": "YOUR_BIGMODEL_API_KEY",
+    "directModel": "glm-4-flash",
+    "temperature": 0.2,
+    "timeoutMs": 600000
   },
   "pollIntervalMinutes": 30,
   "knowledgeBaseRoot": "D:/WorkPace/Database/03-项目交付",
-  "watchedRootUrls": ["https://feishu.cn/wiki/Wramw1XxRihIgnkCrhqcdEbRnHb"],
+  "watchedRoots": [
+    {
+      "id": "root-1",
+      "url": "https://feishu.cn/wiki/Wramw1XxRihIgnkCrhqcdEbRnHb",
+      "localDir": "",
+      "layoutProfile": "default",
+      "enabled": true
+    }
+  ],
   "larkCliPath": "lark-cli",
   "requiredScopes": [
     "wiki:node:retrieve",
@@ -204,12 +216,12 @@ export APPLE_API_ISSUER="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 签名证书可安装到当前钥匙串，或通过 electron-builder 支持的
 `CSC_LINK` / `CSC_KEY_PASSWORD` 提供。
 
-**打包产物**：`dist/FeishuSync-Setup-0.1.0-x64.exe`（Windows NSIS，~99MB）
+**打包产物**：`dist/FeishuSync-Setup-<version>-x64.exe`（Windows NSIS，当前 0.3.3，~99MB）
 
 ### 首次使用流程
 
-1. **启动应用**：双击 `FeishuSync-Setup-0.1.0-x64.exe` 安装后启动
-2. **配置面板**：设置知识库根路径 + 飞书根 URL + deepseek API Key
+1. **启动应用**：安装 `FeishuSync-Setup-<version>-x64.exe` 后启动
+2. **配置面板**：设置知识库根路径 + 飞书根 URL + LLM API Key（默认 bigmodel GLM）
 3. **认证确认**：检查认证状态是否就绪（lark-cli auth status）
 4. **首次索引**：工具自动扫描本地已有 `.md` 文件（< 10s，35 节点）
 5. **变更检测**：定时轮询（默认 30min），托盘通知变更数量
@@ -241,15 +253,16 @@ export APPLE_API_ISSUER="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 
 | 字段 | 类型 | 示例值 | 说明 |
 |------|------|--------|------|
-| `llm.baseUrl` | string | `"https://api.deepseek.com/v1"` | deepseek API 地址 |
-| `llm.apiKey` | string | `"sk-xxxx"` | deepseek API Key（加密存储，不入库） |
-| `llm.model` | string | `"deepseek-chat"` | LLM 模型 |
+| `llm.openAiCompatBaseUrl` | string | `"https://open.bigmodel.cn/api/paas/v4"` | OpenAI 兼容端点（默认智谱 bigmodel） |
+| `llm.apiKey` | string | `"sk-xxxx"` | LLM API Key（当前明文存储，配 `_warning` 字段提醒勿提交；加密 deferred） |
+| `llm.directModel` | string | `"glm-4-flash"` | direct 通道模型（bigmodel 免费档默认） |
+| `llm.timeoutMs` | number | `600000` | 通道超时（远程模型过载时依赖 SDK 内部重试） |
 | `llm.temperature` | number | `0.2` | 温度参数（风格对齐） |
 | `pollIntervalMinutes` | number | `30` | 基础轮询间隔（分钟） |
 | `knowledgeBaseRoot` | string | `"D:/WorkPace/Database"` | 本地知识库根路径 |
-| `watchedRootUrls` | string[] | `["https://..."]` | 飞书知识库根 URL 列表 |
+| `watchedRoots` | object[] | `[{ id, url, localDir, layoutProfile, enabled }]` | 监听根配置（真相源） |
 | `larkCliPath` | string | `"lark-cli"` | lark-cli 命令路径（Win/Mac 自动适配） |
-| `requiredScopes` | string[] | `["wiki:doc:readOnly"]` | 必需权限范围 |
+| `requiredScopes` | string[] | `["wiki:node:retrieve", ...]` | 必需权限范围（共 9 项） |
 | `enableAutoStart` | boolean | `true` | 开机自启 |
 | `enableNotifications` | boolean | `true` | 托盘通知开关 |
 
@@ -259,7 +272,7 @@ export APPLE_API_ISSUER="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 
 - **零飞书 token**：工具代码禁止任何飞书 token 变量，全委托 lark-cli user 认证态
 - **本地鉴权**：Server Token（crypto.randomBytes(32)）+ Origin/Referer 校验，防止外部调用
-- **加密存储**：deepseek apiKey 不明文写入 config.json，启动时内存解密
+- **加密存储**：LLM apiKey 当前明文存 config.json（架构决策，含 `_warning` 字段提醒勿提交；加密 deferred）；代码零飞书 token
 - **安全红线**：禁止 app_id/app_secret；禁止硬编码 token；前端必须浏览器交互验证
 
 ---
@@ -286,6 +299,8 @@ feishu-sync/
 
 ## 开发文档导航
 
+以下为外部交付路径（原始 Windows 开发环境），仓库内不含 docs/ 目录：
+
 | 文档 | 路径 | 内容 |
 |------|------|------|
 | 架构设计文档 | `D:/WorkPace/Database/03-项目交付/03-项目工具/知识库本地同步管理工具/架构设计文档.md` | 总体架构、模块设计、接口签名、数据模型、关键流程 |
@@ -296,13 +311,7 @@ feishu-sync/
 
 ## 当前状态与已知限制
 
-**当前状态**：M0-M5 全量完成（v0.1.0），谛听最终重审 PASS。
-
-**验收证据**：
-- 功能验收：变更检测（31 节点）、单篇 docx 同步、表格重构、deepseek LLM 适配
-- 性能验收：增量检测 ~2s（< 5s 达标），单篇 docx < 1s（< 30s 达标）
-- 安全验收：Token 鉴权、Origin 校验、零飞书 token、加密存储全绿
-- 跨平台验收：Electron v31.7.7 可启动，开机自启动配置已实现
+**当前状态**：v0.3.3 交付版。核心链路均已落地：定时变更检测 → 分型同步（docx/sheet/slides）→ 表格重构与 LLM 风格对齐 → staged 原子提交；自定义归档（快捷添加 + 手工文件动态纳管）；主区双视图与 Markdown 预览；托盘常驻与自动更新。
 
 **已知限制**：
 - macOS 打包需 macOS 环境（Windows 上无法生成 macOS DMG）
