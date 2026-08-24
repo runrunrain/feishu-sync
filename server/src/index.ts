@@ -252,7 +252,11 @@ export async function startServer(options: CreateServerOptions & {
   port?: number;
   hostname?: string;
 } = {}): Promise<StartedServer> {
-  const port = options.port || DEFAULT_PORT;
+  // P0 修复（v0.2.9，EADDRINUSE 127.0.0.1:3001）：此前用 `options.port ||
+  // DEFAULT_PORT`，Electron 传入 port: 0（系统自动分配）被 || 当作 falsy
+  // 回退到 3001——打包应用始终强占 3001，与本机其他服务（如占用该端口的
+  // 开发服务器）冲突时内嵌 server 启动失败。必须用 ?? 只在未传时回退。
+  const port = options.port ?? DEFAULT_PORT;
   const hostname = options.hostname || '127.0.0.1';
 
   console.info(`[server] Building server with options:`, options);
