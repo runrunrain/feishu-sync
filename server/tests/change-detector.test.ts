@@ -940,6 +940,10 @@ describe('ChangeDetector.detectChanges result cache (sync-state-timeout-fix)', (
         this.getNodeCalls += 1;
         throw new Error('fast mode must not resolve individual wiki nodes');
       },
+      async listWikiNodes() {
+        // fast-added-fix: raw topology BFS returns no new nodes here.
+        return [];
+      },
       async getDocumentMetas(requests: Array<{ docToken: string; docType: string }>) {
         this.metaRequests.push(requests);
         return {
@@ -993,6 +997,9 @@ describe('ChangeDetector.detectChanges result cache (sync-state-timeout-fix)', (
     }));
     const lark = {
       getNodeUrls: [] as string[],
+      async listWikiNodes() {
+        return [];
+      },
       async getDocumentMetas() {
         return {
           metas: [],
@@ -1039,6 +1046,9 @@ describe('ChangeDetector.detectChanges result cache (sync-state-timeout-fix)', (
     }));
     const lark = {
       detailCalls: 0,
+      async listWikiNodes() {
+        return [];
+      },
       async getDocumentMetas() {
         return { metas: [], failed: [{ docToken: 'doc-A', code: 970003 }] };
       },
@@ -1063,6 +1073,142 @@ describe('ChangeDetector.detectChanges result cache (sync-state-timeout-fix)', (
     // The metadata batch may be retried, but a permanently failing node-get
     // must not add a second detail request until its retry cooldown expires.
     expect(lark.detailCalls).toBe(1);
+  });
+
+  it('discovers brand-new wiki nodes as pending additions in fast mode (fast-added-fix)', async () => {
+    const store = new MockLocalMapStore();
+    const rootUrl = 'https://qcnbafdrjx7n.feishu.cn/wiki/rootA';
+    store.rows.set('doc-A', makeLocal({
+      objToken: 'doc-A',
+      wikiNodeToken: 'node-A',
+      watchedRootId: 'rootA',
+      watchedRootUrl: rootUrl,
+      objEditTime: 100,
+      observedObjEditTime: 100,
+      syncedObjEditTime: 100,
+      localMdPath: '/kb/A.md',
+    }));
+    const lark = {
+      listCalls: [] as string[],
+      detailUrls: [] as string[],
+      async getDocumentMetas(requests: Array<{ docToken: string; docType: string }>) {
+        // doc-A unchanged on the Drive side: the only change below must be
+        // the newly added node, discovered via the topology BFS.
+        return {
+          metas: requests.map((r) => ({
+            docToken: r.docToken,
+            docType: r.docType,
+            latestModifyTime: 100,
+            title: 't-doc-A',
+          })),
+          failed: [],
+        };
+      },
+      async listWikiNodes(opts: { spaceId: string; parentNodeToken: string }) {
+        this.listCalls.push(opts.parentNodeToken);
+        if (opts.parentNodeToken === 'rootA') {
+          return [
+            { node_token: 'node-A', obj_token: 'doc-A', obj_type: 'docx', title: 't-doc-A', has_child: false, parent_node_token: 'rootA', space_id: opts.spaceId },
+            { node_token: 'node-NEW', obj_token: 'doc-NEW', obj_type: 'docx', title: 'New doc', has_child: false, parent_node_token: 'rootA', space_id: opts.spaceId },
+          ];
+        }
+        return [];
+      },
+      async getNode(url: string): Promise<LarkCliNodeInfo> {
+        this.detailUrls.push(url);
+        if (url.endsWith('/wiki/node-NEW')) {
+          return {
+            node_token: 'node-NEW',
+            obj_token: 'doc-NEW',
+            obj_type: 'docx',
+            title: 'New doc',
+            space_id: 'space-1',
+            obj_edit_time: 500,
+            has_child: false,
+            parent_node_token: 'rootA',
+          };
+        }
+        throw new Error('unexpected getNode call: ' + url);
+      },
+    };
+    const detector = new ChangeDetector(lark as any, store as any);
+
+    const result = await detector.detectChanges(rootUrl, {
+      forceFresh: true,
+      bypassCooldown: true,
+      mode: 'fast',
+    });
+
+    // Topology BFS started from the watched root token.
+    expect(lark.listCalls).toEqual(['rootA']);
+    // Exactly one node-get for the brand-new node — the mapped doc-A is
+    // served by the metadata batch and must not fall back to wiki details.
+    expect(lark.detailUrls).toEqual(['https://qcnbafdrjx7n.feishu.cn/wiki/node-NEW']);
+    expect(result.changed).toBe(true);
+    expect(result.changedDocuments).toEqual([
+      expect.objectContaining({
+        objToken: 'doc-NEW',
+        changeType: 'added',
+        syncState: 'pending_added',
+        title: 'New doc',
+        // Direct child of the watched root resolves without a root
+        // observation (projectParentChains rootToken special case).
+        parentChainTitles: [],
+        isWatchedRootNode: false,
+      }),
+    ]);
+    expect(store.rows.get('doc-NEW')).toMatchObject({
+      syncState: 'pending_added',
+      watchedRootId: 'rootA',
+      watchedRootUrl: rootUrl,
+      observedObjEditTime: 500,
+    });
+    // doc-A stays synced: no false positive from the discovery pass.
+    expect(store.rows.get('doc-A')).toMatchObject({ syncState: 'synced' });
+  });
+
+  it('skips fast added-discovery when the topology BFS is incomplete (fail-closed)', async () => {
+    const store = new MockLocalMapStore();
+    const rootUrl = 'https://qcnbafdrjx7n.feishu.cn/wiki/rootA';
+    store.rows.set('doc-A', makeLocal({
+      objToken: 'doc-A',
+      wikiNodeToken: 'node-A',
+      watchedRootId: 'rootA',
+      watchedRootUrl: rootUrl,
+    }));
+    const lark = {
+      async getDocumentMetas(requests: Array<{ docToken: string; docType: string }>) {
+        return {
+          metas: requests.map((r) => ({
+            docToken: r.docToken,
+            docType: r.docType,
+            latestModifyTime: 1000,
+            title: 't-doc-A',
+          })),
+          failed: [],
+        };
+      },
+      async listWikiNodes() {
+        // A failed level marks the traversal incomplete.
+        throw new Error('node-list 99991400');
+      },
+      async getNode(): Promise<LarkCliNodeInfo> {
+        throw new Error('unexpected getNode when discovery is skipped');
+      },
+    };
+    const detector = new ChangeDetector(lark as any, store as any);
+
+    const result = await detector.detectChanges(rootUrl, {
+      forceFresh: true,
+      bypassCooldown: true,
+      mode: 'fast',
+    });
+
+    // The metadata pass still worked (makeLocal seeds synced=1000 and the
+    // Drive batch returned the same time -> no change), and the failed
+    // topology pass produced no phantom additions.
+    expect(result.changed).toBe(false);
+    expect(result.changedDocuments).toEqual([]);
   });
 
   it('joins concurrent calls before the completed-result cache is populated', async () => {

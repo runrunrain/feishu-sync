@@ -30,9 +30,10 @@
  *   captured into results[] without aborting the whole batch.
  *
  * Routine UI and tray checks use ChangeDetector's `fast` mode: it batches
- * metadata for already-mapped documents and intentionally avoids a full Wiki
- * topology scan. Callers may explicitly send `{ mode: "full" }` when they
- * need structural reconciliation (new/moved/deleted nodes).
+ * metadata for already-mapped documents and, since fast-added-fix, also runs
+ * a raw topology BFS to surface brand-new nodes as pending additions.
+ * Callers may explicitly send `{ mode: "full" }` when they need structural
+ * reconciliation (moved/deleted nodes, per-node detail refresh).
  */
 
 import { Hono } from 'hono';
@@ -94,9 +95,11 @@ detectRoutes.post('/api/detect/changes', async (c) => {
   }
 
   try {
-    // The normal detect action checks only already-mapped cloud files via
-    // Drive metadata batches. It does not download content or traverse every
-    // node detail; full topology reconciliation remains opt-in through body.mode.
+    // The normal detect action checks already-mapped cloud files via Drive
+    // metadata batches and discovers brand-new wiki nodes via one raw
+    // node-list BFS (fast-added-fix). It does not download content or fetch
+    // every node detail; full topology reconciliation remains opt-in through
+    // body.mode.
     const result = await changeDetector.detectChanges(rootUrl, { forceFresh: true, mode });
     return c.json(result);
   } catch (error) {
@@ -159,8 +162,9 @@ interface MultiRootDetectionResult {
  * `changedDocuments` is the concatenation in configured order;
  * `totalNodes` is the sum across successful roots.
  *
- * Request body: config-driven; an empty `{}` uses fast mode. Send
- * `{ mode: "full" }` only for an explicit topology reconciliation.
+ * Request body: config-driven; an empty `{}` uses fast mode (metadata batch
+ * + new-node discovery). Send `{ mode: "full" }` for an explicit topology
+ * reconciliation (deletion inference, moved-node handling).
  */
 detectRoutes.post('/api/detect/changes-all', async (c) => {
   const body = await c.req.json().catch(() => ({}));
