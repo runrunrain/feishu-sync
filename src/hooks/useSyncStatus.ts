@@ -41,6 +41,7 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import { getStoredMappingDiff } from '../api/client';
+import { onDiffChanged } from '../utils/syncEvents';
 import { appLogger } from '../utils/appLogger';
 import { isUsableWikiUrl } from '../utils/wikiUrl';
 import { useConfig } from './useConfig';
@@ -138,6 +139,18 @@ export function useSyncStatus(options: UseSyncStatusOptions = {}): SyncStatusDat
   useEffect(() => {
     void refresh();
   }, [refresh, refreshTick]);
+
+  // 跨视图实时刷新（2026-06 修复）：同步/检测/回收站等写路径完成后，
+  // client.ts 会广播 diff-changed 事件。订阅后，同步完成时总览的
+  // 「待同步 N」徽标与状态栏计数立即重拉 cached diff，不再等到下一次
+  // 手动检测或重挂载。refresh 引用随 watchedRoots/pollInterval 变化重建，
+  // 订阅也随之重绑；refreshTick 机制保留（调用方仍可主动 bump）。
+  useEffect(() => {
+    return onDiffChanged((source) => {
+      appLogger.info('useSyncStatus', 'diff store changed; re-pulling pending count', { source });
+      void refresh();
+    });
+  }, [refresh]);
 
   return status;
 }

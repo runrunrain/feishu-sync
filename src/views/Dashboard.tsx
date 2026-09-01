@@ -41,6 +41,7 @@ import {
   listCustomFolders,
 } from '../api/client';
 import { appLogger } from '../utils/appLogger';
+import { onDiffChanged } from '../utils/syncEvents';
 import { pickFirstValidWikiUrl } from '../utils/wikiUrl';
 import type {
   MappingNode,
@@ -247,32 +248,43 @@ export function Dashboard({ onJumpToSync }: DashboardProps) {
   }, [loadCustomFolders]);
 
   // diff + snapshot always loaded (shared across views).
-  useEffect(() => {
-    let cancelled = false;
+  // 跨视图实时刷新（2026-06 修复）：抽出为可重入 loader，除挂载时外，
+  // 还在全局 diff-changed 事件（同步/检测/回收站等写路径完成）时重拉，
+  // 让总览的「最近变更」与待同步状态不再停留在旧快照。
+  const loadDiffAndSnapshot = useCallback(async (signal?: { cancelled: boolean }) => {
     if (!rootUrl) return;
-    (async () => {
-      try {
-        const diff: DiffReport = await getStoredMappingDiff(rootUrl);
-        if (cancelled) return;
-        setChanges([...diff.added, ...diff.modified, ...diff.deleted]);
-      } catch (err) {
-        // diff may legitimately 400 if rootUrl is invalid; log + soft warning.
-        appLogger.warn('dashboard', 'getStoredMappingDiff failed (non-fatal)', err);
-      }
-      try {
-        const snap = await getMappingIndex();
-        if (cancelled) return;
-        setOrphans(snap?.orphan_files ?? []);
-        setSnapshot(snap ?? null);
-      } catch (err) {
-        // 404 when snapshot not generated yet; soft-log only.
-        appLogger.warn('dashboard', 'getMappingIndex failed (non-fatal)', err);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
+    try {
+      const diff: DiffReport = await getStoredMappingDiff(rootUrl);
+      if (signal?.cancelled) return;
+      setChanges([...diff.added, ...diff.modified, ...diff.deleted]);
+    } catch (err) {
+      // diff may legitimately 400 if rootUrl is invalid; log + soft warning.
+      appLogger.warn('dashboard', 'getStoredMappingDiff failed (non-fatal)', err);
+    }
+    try {
+      const snap = await getMappingIndex();
+      if (signal?.cancelled) return;
+      setOrphans(snap?.orphan_files ?? []);
+      setSnapshot(snap ?? null);
+    } catch (err) {
+      // 404 when snapshot not generated yet; soft-log only.
+      appLogger.warn('dashboard', 'getMappingIndex failed (non-fatal)', err);
+    }
   }, [rootUrl]);
+
+  useEffect(() => {
+    const signal = { cancelled: false };
+    void loadDiffAndSnapshot(signal);
+    return () => {
+      signal.cancelled = true;
+    };
+  }, [loadDiffAndSnapshot]);
+
+  useEffect(() => {
+    return onDiffChanged(() => {
+      void loadDiffAndSnapshot();
+    });
+  }, [loadDiffAndSnapshot]);
 
   // The active node list depends on the view.
   const activeNodes: MappingNode[] = useMemo(() => {

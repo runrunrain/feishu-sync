@@ -18,6 +18,7 @@ import { ChangeItem } from './ChangeItem';
 import { BatchActionBar } from './BatchActionBar';
 import { useToast } from './common/Toast';
 import { appLogger } from '../utils/appLogger';
+import { onDiffChanged } from '../utils/syncEvents';
 import { getStoredMappingDiff } from '../api/client';
 import type { ChangedDocument, DiffReport, SheetSub } from '../types';
 import { isUsableWikiUrl } from '../utils/wikiUrl';
@@ -244,6 +245,22 @@ export function ChangeListPanel({
     // fetchDiff intentionally closes over the current root configuration.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reloadSignal, guardKey]);
+
+  // 跨视图实时刷新（2026-06 修复）：同步页常驻挂载（v0.2.9），初始
+  // fetch 之后若在总览侧点了「立即检测」或完成了一次同步，本面板不会
+  // 自动重读已持久化的 diff，用户只能手动点本面板的「立即检测」。订阅
+  // 全局 diff-changed 事件后，任何位置的写路径完成都会让本列表重拉
+  // cached diff（本地读，无云遍历）。与 reloadSignal 语义一致：加载中
+  // 到达的事件被合并跳过（in-flight fetch 返回后即包含最新状态）。
+  useEffect(() => {
+    return onDiffChanged((source) => {
+      if (!guardKey || loading) return;
+      appLogger.info('change-list', 'diff store changed; reloading list', { source });
+      void fetchDiff();
+    });
+    // fetchDiff intentionally closes over the current root configuration.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [guardKey, loading]);
 
   const grouped = useMemo(() => {
     if (!diff) return { added: [], modified: [], deleted: [] as ChangedDocument[] };

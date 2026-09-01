@@ -30,7 +30,12 @@ import { isUsableWikiUrl, pickFirstValidWikiUrl } from '../utils/wikiUrl';
 import { detectChanges, requestFeishuPendingRecheck } from '../api/client';
 import type { ChangedDocument, DiffReport, FailedDocument, FeishuPendingItem } from '../types';
 
-export function SyncView() {
+interface SyncViewProps {
+  /** 当前主区是否可见（App 常驻挂载三主区，切换仅 hidden）。 */
+  active?: boolean;
+}
+
+export function SyncView({ active = true }: SyncViewProps) {
   const { config } = useConfig();
   const toast = useToast();
   const sync = useSync();
@@ -47,6 +52,18 @@ export function SyncView() {
   // State updates are asynchronous; keep an immediate lock so two rapid
   // clicks cannot launch duplicate full traversals against Feishu.
   const feishuRecheckInFlight = useRef(false);
+
+  // 可见性刷新（2026-06 跨视图实时修复）：同步区常驻挂载，从总览切回
+  // 来时重读一次后端持久化 diff——服务端 PollingScheduler 的定时检测
+  // 没有客户端事件，变更列表/飞书待处理可能已过期；此前用户必须手动
+  // 点本页「立即检测」才能看到最新列表。cached 读不触发云遍历。
+  const wasActive = useRef(active);
+  useEffect(() => {
+    if (active && !wasActive.current) {
+      setDiffRefreshSignal((value) => value + 1);
+    }
+    wasActive.current = active;
+  }, [active]);
 
   const activeRootUrl = pickFirstValidWikiUrl(config?.watchedRootUrls);
   const rootUrlError = !activeRootUrl
@@ -461,8 +478,9 @@ export function SyncView() {
         open={trashOpen}
         onClose={() => setTrashOpen(false)}
         onChanged={() => {
-          // After a restore/purge, the change list could refresh.
-          appLogger.info('sync-view', 'trash changed; change list may need refresh');
+          // 回收站恢复/清理会经 client.ts 广播 diff-changed 事件，变更列表
+          // 与待同步计数自动重拉（旧 TODO：此处曾只能打日志提醒手动刷新）。
+          appLogger.info('sync-view', 'trash changed; diff views refresh via syncEvents');
         }}
       />
     </div>

@@ -24,6 +24,7 @@ import type {
   AddLinkToFolderResult,
   DocumentContent,
 } from '../types';
+import { emitDiffChanged } from '../utils/syncEvents';
 
 class APIError extends Error {
   constructor(
@@ -308,10 +309,14 @@ export async function detectChanges(
   rootUrl: string,
   options: { mode?: DetectionMode } = {},
 ): Promise<ChangeDetectionResult> {
-  return request<ChangeDetectionResult>('/api/detect/changes', {
+  const result = await request<ChangeDetectionResult>('/api/detect/changes', {
     method: 'POST',
     body: JSON.stringify({ rootUrl, ...(options.mode ? { mode: options.mode } : {}) }),
   });
+  // 检测会推进 observed 基线并重写持久化 diff：广播事件让所有持有
+  // diff 快照的视图（状态栏计数/变更列表/最近变更）重拉 cached diff。
+  emitDiffChanged('detect');
+  return result;
 }
 
 /**
@@ -347,10 +352,12 @@ export interface MultiRootDetectionResult {
 export async function detectChangesAll(
   options: { mode?: DetectionMode } = {},
 ): Promise<MultiRootDetectionResult> {
-  return request<MultiRootDetectionResult>('/api/detect/changes-all', {
+  const result = await request<MultiRootDetectionResult>('/api/detect/changes-all', {
     method: 'POST',
     body: JSON.stringify(options.mode ? { mode: options.mode } : {}),
   });
+  emitDiffChanged('detect-all');
+  return result;
 }
 
 /**
@@ -365,7 +372,7 @@ export async function syncDocs(
   documents: ChangedDocument[],
   options: { enableLLM?: boolean; adoptExistingProfileTargets?: boolean } = {},
 ): Promise<SyncResult> {
-  return request<SyncResult>('/api/sync', {
+  const result = await request<SyncResult>('/api/sync', {
     method: 'POST',
     body: JSON.stringify({
       documents,
@@ -378,6 +385,12 @@ export async function syncDocs(
       },
     }),
   });
+  // 同步成功推进 synced 基线，已同步项会从 diff 中消失：广播事件让
+  // 总览待同步计数/最近变更/变更列表等所有视图同步刷新（修复同步
+  // 完成后总览计数不更新的问题）。dry-run 结果也会走这里，重拉 cached
+  // diff 无副作用。
+  emitDiffChanged('sync');
+  return result;
 }
 
 /** Read durable issues that must be repaired in Feishu before syncing can continue. */
@@ -481,7 +494,10 @@ export async function getMediaBlobUrl(relPath: string): Promise<string> {
  */
 export async function getMappingDiff(rootUrl: string): Promise<DiffReport> {
   const qs = new URLSearchParams({ rootUrl });
-  return request<DiffReport>(`/api/mapping/diff?${qs.toString()}`);
+  const report = await request<DiffReport>(`/api/mapping/diff?${qs.toString()}`);
+  // 无 cached 参数的调用会在服务端触发一次云检测并推进持久化 diff。
+  emitDiffChanged('mapping-diff');
+  return report;
 }
 
 /**
@@ -550,10 +566,13 @@ export interface RebuildIndexResponse {
 }
 
 export async function rebuildIndex(): Promise<RebuildIndexResponse> {
-  return request<RebuildIndexResponse>('/api/index/rebuild', {
+  const result = await request<RebuildIndexResponse>('/api/index/rebuild', {
     method: 'POST',
     body: JSON.stringify({}),
   });
+  // 重建会重扫本地知识库并翻转 placeholder/synced 等状态，diff 可能变化。
+  emitDiffChanged('rebuild-index');
+  return result;
 }
 
 /**
@@ -599,10 +618,12 @@ export async function listTrashedDocs(): Promise<TrashedDoc[]> {
  * cloud_deleted flag and moves the file back to its original path).
  */
 export async function restoreTrashedDoc(objToken: string): Promise<{ ok: true }> {
-  return request<{ ok: true }>('/api/trash/restore', {
+  const result = await request<{ ok: true }>('/api/trash/restore', {
     method: 'POST',
     body: JSON.stringify({ obj_token: objToken }),
   });
+  emitDiffChanged('trash-restore');
+  return result;
 }
 
 /**
@@ -610,13 +631,17 @@ export async function restoreTrashedDoc(objToken: string): Promise<{ ok: true }>
  * (fs.unlink the local .md copy). Pass { all: true } to clear all trashed.
  */
 export async function purgeTrashedDoc(objToken: string): Promise<{ purged: number }> {
-  return request<{ purged: number }>(`/api/trash/purge?obj_token=${encodeURIComponent(objToken)}`, {
+  const result = await request<{ purged: number }>(`/api/trash/purge?obj_token=${encodeURIComponent(objToken)}`, {
     method: 'DELETE',
   });
+  emitDiffChanged('trash-purge');
+  return result;
 }
 
 export async function clearTrash(): Promise<{ purged: number }> {
-  return request<{ purged: number }>('/api/trash/purge?all=1', { method: 'DELETE' });
+  const result = await request<{ purged: number }>('/api/trash/purge?all=1', { method: 'DELETE' });
+  emitDiffChanged('trash-purge-all');
+  return result;
 }
 
 // ============================================================================
@@ -694,6 +719,8 @@ export async function addLinksToFolder(
     `/api/custom-folders/${encodeURIComponent(folderId)}/docs`,
     { method: 'POST', body: JSON.stringify({ links }) },
   );
+  // 归档文档脱离结构树（watched_root 清空），结构树 diff 成员随之变化。
+  emitDiffChanged('custom-folder-add');
   return data.results ?? [];
 }
 
@@ -705,10 +732,12 @@ export async function removeDocFromFolder(
   folderId: string,
   objToken: string,
 ): Promise<{ ok: true }> {
-  return request<{ ok: true }>(
+  const result = await request<{ ok: true }>(
     `/api/custom-folders/${encodeURIComponent(folderId)}/docs/${encodeURIComponent(objToken)}`,
     { method: 'DELETE' },
   );
+  emitDiffChanged('custom-folder-remove');
+  return result;
 }
 
 export { APIError };
