@@ -18,12 +18,15 @@ import { SyncView } from './views/SyncView';
 import { SettingsView } from './views/SettingsView';
 import { useAuthStatus } from './hooks/useAuthStatus';
 import { useSyncStatus } from './hooks/useSyncStatus';
+import { useDesktopUpdateBadge } from './hooks/useDesktopUpdate';
 import { SyncProvider } from './hooks/useSync';
 
 function AppShell() {
   const [currentArea, setCurrentArea] = useState<MainArea>('overview');
   const { ready: authReady } = useAuthStatus();
   const { pendingCount } = useSyncStatus();
+  // 全局新版本徽标（仅桌面端；启动时主进程会静默检查一次更新）。
+  const { availableVersion } = useDesktopUpdateBadge();
 
   return (
     <div className="h-[100dvh] min-h-screen w-full overflow-hidden flex flex-col bg-paper">
@@ -32,6 +35,7 @@ function AppShell() {
         onAreaChange={setCurrentArea}
         authReady={authReady}
         pendingCount={pendingCount}
+        updateVersion={availableVersion}
       />
       {/*
         主内容区布局（v0.2.9 常驻挂载重构）：
@@ -60,7 +64,8 @@ function AppShell() {
             <SyncView active={currentArea === 'sync'} />
           </div>
           <div className={currentArea === 'settings' ? 'animate-fade-in' : 'hidden'}>
-            <SettingsView />
+            {/* focusTabId：点 TopBar「新版本」徽标时直达「应用 · 关于与更新」 */}
+            <SettingsView focusTabId={availableVersion ? 'application' : undefined} />
           </div>
         </div>
       </main>

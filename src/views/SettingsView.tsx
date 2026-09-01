@@ -130,9 +130,21 @@ const SETTINGS_TABS: SettingsTabMeta[] = [
   },
 ];
 
-export function SettingsView() {
+interface SettingsViewProps {
+  /**
+   * 请求聚焦到指定分组（如 TopBar「新版本」徽标 → 'application'）。
+   * 仅在值变化时生效一次：不持续锁定，用户随后可自由切换。
+   */
+  focusTabId?: SettingsTab;
+}
+
+export function SettingsView({ focusTabId }: SettingsViewProps) {
   const [activeTab, setActiveTab] = useState<SettingsTab>('knowledge');
   const currentTabMeta = SETTINGS_TABS.find((tab) => tab.id === activeTab) ?? SETTINGS_TABS[0];
+
+  useEffect(() => {
+    if (focusTabId) setActiveTab(focusTabId);
+  }, [focusTabId]);
 
   // 第二层导航：当前选中的侧栏项。切 tab 时重置为该分组的第一项。
   const [activeSubId, setActiveSubId] = useState<string>(currentTabMeta.items[0].id);

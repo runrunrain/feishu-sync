@@ -80,11 +80,14 @@ export function KnowledgeSettingsCard() {
     if (typeof window !== 'undefined' && window.desktop?.openDataDirectory) {
       try {
         const res = await window.desktop.openDataDirectory();
-        if (!res.success) {
+        // 2026-09：DesktopActionResult 对齐为 electron 真实形状 {ok, code?, error?}。
+        // 旧代码读 res.success（旧前端类型的字段，主进程从未返回过），
+        // 导致每次打开目录成功也会弹「打开目录失败」警告。
+        if (!res.ok) {
           toast.push({
             type: 'warning',
             message: '打开目录失败',
-            hint: res.error || '请检查路径是否已配置',
+            hint: res.ok === false ? res.error : '请检查路径是否已配置',
           });
         }
       } catch (err) {

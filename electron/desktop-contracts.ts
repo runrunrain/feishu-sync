@@ -7,6 +7,7 @@
 
 import type {
   DesktopActionResult,
+  DesktopPlatformCapabilities,
   DesktopUpdateCheckResult,
   DesktopUpdateEvent,
   DesktopUpdateState,
@@ -28,6 +29,12 @@ export interface DesktopAPI {
   getServerStatus: () => Promise<{ running: boolean; port: number | null }>;
 
   /**
+   * 平台能力与真实应用版本（打包状态、更新支持、GitHub 发布页地址等）。
+   * 2026-09 新增：渲染层「关于与更新」卡片据此渲染降级文案与发布页入口。
+   */
+  getPlatformCapabilities: () => Promise<DesktopPlatformCapabilities>;
+
+  /**
    * Update operations namespace
    */
   update: {
@@ -37,7 +44,9 @@ export interface DesktopAPI {
     getState: () => Promise<DesktopUpdateState>;
 
     /**
-     * Check for available updates
+     * Check for available updates. The renderer subscribes via onEvent to
+     * observe state transitions; the returned check result carries the
+     * authoritative post-check state (phase available / up-to-date / error).
      */
     check: () => Promise<DesktopUpdateCheckResult>;
 

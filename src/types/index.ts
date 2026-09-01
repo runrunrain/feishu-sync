@@ -584,6 +584,8 @@ export interface ChannelTestResult {
 export interface DesktopAPI {
   getApiHeaders: () => Promise<{ 'X-Desktop-Token': string }>;
   getServerStatus: () => Promise<{ running: boolean; port: number | null }>;
+  /** 平台能力与真实应用版本（electron/main.ts desktop:get-platform-capabilities）。 */
+  getPlatformCapabilities: () => Promise<DesktopPlatformCapabilities>;
   update: {
     getState: () => Promise<DesktopUpdateState>;
     check: () => Promise<DesktopUpdateCheckResult>;
@@ -597,31 +599,77 @@ export interface DesktopAPI {
   openExternal: (url: string) => Promise<DesktopActionResult>;
 }
 
-export interface DesktopActionResult {
-  success: boolean;
-  error?: string;
+/**
+ * 2026-09 对齐修复：以下 DesktopUpdate 系列与 DesktopActionResult 类型此前
+ * 与 electron/contracts.ts 分叉（前端用 state、version、available，主进程实际
+ * 返回 phase、latestVersion、{ok,state}），导致「关于与更新」卡片永远读不到
+ * 真实更新状态。现在与主进程契约逐字段对齐；修改任一侧时必须同步另一侧
+ * （electron/contracts.ts + desktop-contracts.ts + 此处）。
+ */
+export type DesktopActionResult =
+  | { ok: true }
+  | { ok: false; code: string; error: string };
+
+/** 平台能力快照（electron app.isPackaged / app.getVersion / 发布页地址等）。 */
+export interface DesktopPlatformCapabilities {
+  platform: string;
+  arch: string;
+  appVersion: string;
+  packaged: boolean;
+  systemTraySupported: boolean;
+  hideOnCloseSupported: boolean;
+  backgroundResidentSupported: boolean;
+  singleInstanceSupported: boolean;
+  updateCheckSupported: boolean;
+  updateDownloadSupported: boolean;
+  updateInstallSupported: boolean;
+  updateInstallUnsupportedReason?: string;
+  updateProvider: 'generic';
+  releasePageUrl: string;
 }
 
-export interface DesktopUpdateState {
-  state: 'idle' | 'checking' | 'available' | 'downloading' | 'downloaded' | 'installing';
-  version?: string;
-  progress?: number;
-  /** 当前应用真实版本（Electron app.getVersion，桌面端存在）；与 electron/contracts.ts 对齐。 */
-  currentVersion?: string;
-}
+export type DesktopUpdatePhase =
+  | 'idle'
+  | 'checking'
+  | 'available'
+  | 'downloading'
+  | 'downloaded'
+  | 'installing'
+  | 'up-to-date'
+  | 'error'
+  | 'unsupported';
 
-export interface DesktopUpdateCheckResult {
-  available: boolean;
-  version?: string;
+export interface DesktopUpdateInfo {
+  version: string;
+  releaseDate?: string;
+  releaseName?: string;
   releaseNotes?: string;
 }
 
-export interface DesktopUpdateEvent {
-  type: 'progress' | 'state-change' | 'error';
-  state?: DesktopUpdateState['state'];
-  progress?: number;
-  error?: string;
+export interface DesktopDownloadProgress {
+  percent: number;
+  transferred: number;
+  total: number;
+  bytesPerSecond: number;
 }
+
+export interface DesktopUpdateState {
+  phase: DesktopUpdatePhase;
+  currentVersion?: string;
+  latestVersion?: string;
+  updateInfo?: DesktopUpdateInfo;
+  progress?: DesktopDownloadProgress;
+  error?: string;
+  lastCheckedAt?: string;
+}
+
+export type DesktopUpdateCheckResult =
+  | { ok: true; state: DesktopUpdateState }
+  | { ok: false; code: string; error: string; state: DesktopUpdateState };
+
+export type DesktopUpdateEvent =
+  | { type: 'state'; state: DesktopUpdateState }
+  | { type: 'progress'; state: DesktopUpdateState; progress: DesktopDownloadProgress };
 
 // ============================================================================
 // Custom Folders (快捷添加云链接 + 自定义文件夹归档)

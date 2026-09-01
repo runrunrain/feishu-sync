@@ -11,6 +11,7 @@
 export const IPC_CHANNELS = {
   GET_API_HEADERS: 'desktop:get-api-headers',
   GET_SERVER_STATUS: 'desktop:get-server-status',
+  GET_PLATFORM_CAPABILITIES: 'desktop:get-platform-capabilities',
   UPDATE_GET_STATE: 'desktop:update:get-state',
   UPDATE_CHECK: 'desktop:update:check',
   UPDATE_DOWNLOAD: 'desktop:update:download',

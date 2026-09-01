@@ -26,6 +26,41 @@ export function getReleasePageUrl() {
   return `https://github.com/${owner}/${repo}/releases/latest`;
 }
 
+/**
+ * electron-updater generic provider 的运行时 feed 地址。
+ *
+ * 与 electron-builder.config.cjs 的 resolveUpdateFeedUrl 保持同一解析规则：
+ *   1. 显式 DESKTOP_UPDATE_FEED_URL 覆盖（自建更新源/内网镜像）；
+ *   2. 缺省指向 GitHub Releases 最新版的稳定下载入口
+ *      https://github.com/<owner>/<repo>/releases/latest/download/，
+ *      该路径 302 到最新（非 draft、非 prerelease）release 的同名资产，
+ *      与 release.yml 上传的 latest.yml / latest-mac.yml 及安装包配套。
+ *
+ * 构建侧差异：builder 在非法覆盖时直接抛错（打包应当尽早失败）；
+ * 运行时非法配置不应导致应用启动崩溃，这里回退到 GitHub 缺省地址
+ * 并告警（此前该处是 example.com 占位符，应用内更新从未真正可用）。
+ */
+export function getUpdateFeedUrl() {
+  const { owner, repo } = resolveGitHubRepository();
+  const defaultFeedUrl = `https://github.com/${owner}/${repo}/releases/latest/download/`;
+  const configured = process.env.DESKTOP_UPDATE_FEED_URL?.trim();
+  if (!configured) return defaultFeedUrl;
+  try {
+    const parsed = new URL(configured);
+    if (parsed.protocol !== 'https:') throw new Error('必须使用 https://');
+    if (parsed.username || parsed.password || parsed.search || parsed.hash) {
+      throw new Error('不允许携带凭据、查询串或片段');
+    }
+    return parsed.href.endsWith('/') ? parsed.href : `${parsed.href}/`;
+  } catch (error) {
+    console.warn(
+      '[PlatformCapabilities] Invalid DESKTOP_UPDATE_FEED_URL, falling back to GitHub releases feed:',
+      error instanceof Error ? error.message : error,
+    );
+    return defaultFeedUrl;
+  }
+}
+
 function isSupportedDesktopPlatform(platform: NodeJS.Platform) {
   return platform === 'darwin' || platform === 'win32';
 }

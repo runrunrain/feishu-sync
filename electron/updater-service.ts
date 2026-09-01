@@ -19,7 +19,7 @@ import type {
   DesktopUpdateState,
 } from './contracts.js';
 import type { QuitCoordinator } from './quit-coordinator.js';
-import { getReleasePageUrl, isTrustedReleasePageUrl } from './platform-capabilities.js';
+import { getReleasePageUrl, getUpdateFeedUrl, isTrustedReleasePageUrl } from './platform-capabilities.js';
 
 type DesktopUpdaterServiceOptions = {
   getWindow: () => BrowserWindow | null;
@@ -99,8 +99,13 @@ export class DesktopUpdaterService {
       ...(capabilities.updateCheckSupported ? {} : { error: capabilities.updateInstallUnsupportedReason ?? '应用内更新仅在桌面安装包中可用。' }),
     };
 
-    // M5: Configure electron-updater with generic provider
-    const feedUrl = process.env.DESKTOP_UPDATE_FEED_URL || 'https://example.com/updates';
+    // M5: Configure electron-updater with generic provider.
+    // 2026-09 修复：此前运行时 feed 是 example.com 占位符，打包后的应用内
+    // 「检查更新」永远拿不到真实版本信息；现在与 electron-builder 的 publish
+    // 配置同源解析（GitHub Releases latest/download，可用
+    // DESKTOP_UPDATE_FEED_URL 覆盖），release.yml 上传的 latest*.yml 与安装包
+    // 就在同一目录下，generic provider 可直接发现。
+    const feedUrl = getUpdateFeedUrl();
     autoUpdater.setFeedURL({
       provider: 'generic',
       url: feedUrl,
@@ -153,17 +158,12 @@ export class DesktopUpdaterService {
         return { ok: true, state: this.getState() } as const;
       })
       .catch((error) => {
-        // Graceful degradation when feed URL is not configured
+        // 2026-09 修复：不再把 404 静默降级为「已是最新」。此前 feed 是
+        // example.com 占位符，404→up-to-date 是为了开发环境不报错；现在
+        // feed 指向真实 GitHub Releases，404 意味着发布资产缺失/仓库私有
+        // 等真实故障，谎报「已是最新」会掩盖问题。describeUpdaterError 已
+        // 针对 GitHub 404 生成带修复指引的中文描述。
         const sanitizedError = describeUpdaterError(error, this.options.sanitizeError(error));
-        if (sanitizedError.includes('404') || sanitizedError.includes('not found')) {
-          // Treat missing feed as "up-to-date" for development environment
-          this.setState({
-            phase: 'up-to-date',
-            currentVersion: capabilities.appVersion,
-            lastCheckedAt: new Date().toISOString(),
-          });
-          return { ok: true, state: this.getState() } as const;
-        }
         this.setState({ phase: 'error', currentVersion: capabilities.appVersion, error: sanitizedError });
         return { ok: false, code: 'update-check-failed', error: sanitizedError, state: this.getState() } as const;
       })
@@ -238,8 +238,14 @@ export class DesktopUpdaterService {
     if (!isTrustedReleasePageUrl(releasePageUrl)) {
       return { ok: false, code: 'untrusted-release-url', error: 'Release 页面地址未通过安全校验。' };
     }
-    const result = await shell.openExternal(releasePageUrl);
-    return result ? { ok: false, code: 'open-release-page-failed', error: this.options.sanitizeError(result) } : { ok: true };
+    // shell.openExternal 返回 Promise<void>（拒绝即失败）：旧代码对 void
+    // 做真值测试，语义上碰巧能跑但类型不成立；改为 try/catch 明确化。
+    try {
+      await shell.openExternal(releasePageUrl);
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, code: 'open-release-page-failed', error: this.options.sanitizeError(error) };
+    }
   }
 
   private registerAutoUpdaterEvents() {

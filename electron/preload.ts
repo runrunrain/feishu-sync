@@ -28,6 +28,10 @@ const desktopApi: DesktopAPI = {
     return ipcRenderer.invoke('desktop:get-server-status');
   },
 
+  getPlatformCapabilities: async (): Promise<DesktopPlatformCapabilities> => {
+    return ipcRenderer.invoke('desktop:get-platform-capabilities');
+  },
+
   update: {
     getState: async (): Promise<DesktopUpdateState> => {
       return ipcRenderer.invoke('desktop:update:get-state');

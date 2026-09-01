@@ -10,7 +10,7 @@
  * 更新→设置区子卡。立即检测/同步全部迁入主区上下文操作（GlobalStatusBar / SyncView）。
  */
 
-import { Wifi, WifiOff } from 'lucide-react';
+import { Wifi, WifiOff, ArrowUpCircle } from 'lucide-react';
 
 // 构建时由 vite 注入（package.json version），顶部栏版本徽标与「关于与更新」保持一致。
 declare const __APP_VERSION__: string;
@@ -22,6 +22,8 @@ interface TopBarProps {
   onAreaChange: (area: MainArea) => void;
   authReady: boolean;
   pendingCount: number;
+  /** 有新版本时（phase === 'available' 的 latestVersion），渲染可点击的「新版本」徽标（2026-09 内置更新）。 */
+  updateVersion?: string | null;
 }
 
 const NAV_ITEMS: { id: MainArea; ordinal: string; label: string }[] = [
@@ -30,7 +32,7 @@ const NAV_ITEMS: { id: MainArea; ordinal: string; label: string }[] = [
   { id: 'settings', ordinal: '叁', label: '设置' },
 ];
 
-export function TopBar({ currentArea, onAreaChange, authReady, pendingCount }: TopBarProps) {
+export function TopBar({ currentArea, onAreaChange, authReady, pendingCount, updateVersion }: TopBarProps) {
   return (
     <header className="h-[56px] shrink-0 min-w-0 bg-card-bg border-b border-line flex items-center justify-between gap-3 px-4 lg:px-8">
       {/*
@@ -86,6 +88,17 @@ export function TopBar({ currentArea, onAreaChange, authReady, pendingCount }: T
 
       {/* Right: auth + pending badges */}
       <div className="flex min-w-0 shrink-0 items-center justify-end gap-2 lg:min-w-[220px] lg:gap-3">
+        {updateVersion && (
+          <button
+            type="button"
+            onClick={() => onAreaChange('settings')}
+            title="发现新版本，点击前往设置查看"
+            className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-jade/10 border border-jade/25 hover:bg-jade/20 transition-colors"
+          >
+            <ArrowUpCircle className="w-3.5 h-3.5 text-jade" />
+            <span className="text-xs font-sans-ui text-jade font-medium">新版本 v{updateVersion}</span>
+          </button>
+        )}
         {pendingCount > 0 && (
           <div className="hidden items-center gap-1.5 px-2.5 py-1 rounded-full bg-seal/10 border border-seal/20 lg:flex">
             <span className="w-1.5 h-1.5 rounded-full bg-seal animate-pulse-seal" />

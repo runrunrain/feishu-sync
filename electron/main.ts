@@ -399,6 +399,12 @@ ipcMain.handle('desktop:open-external', async (_event, url: unknown) => {
   }
 });
 
+ipcMain.handle('desktop:get-platform-capabilities', () => {
+  // 2026-09 新增：渲染进程需要 capabilities（真实版本号 / releasePageUrl /
+  // 平台更新能力）来渲染「关于与更新」卡片，避免在前端重复维护仓库地址。
+  return getDesktopPlatformCapabilities();
+});
+
 ipcMain.handle('desktop:update:get-state', () => {
   if (updaterService) return updaterService.getState();
   const capabilities = getDesktopPlatformCapabilities();
@@ -535,6 +541,18 @@ async function boot() {
     quitCoordinator: getQuitCoordinator(),
     sanitizeError: sanitizeDesktopError,
   });
+
+  // 2026-09 新增：启动后台静默检查一次更新（仅打包环境生效，未打包/
+  // 不支持平台在 check() 内部被能力门控拦下并置 unsupported 状态，不会
+  // 发起网络请求）。延迟 15s：让内嵌 server 启动、健康检查与窗口渲染
+  // 先行完成，避免更新检查与首屏竞争；结果只推进状态机并通过
+  // desktop:update:event 广播——渲染层 TopBar 徽标凭 available 相位亮起，
+  // 失败仅落在更新卡片里，不打断用户。
+  setTimeout(() => {
+    updaterService?.check().catch((error) => {
+      console.warn('[Updater] startup silent check failed:', error);
+    });
+  }, 15_000);
 
   // Initialize auto-start service (M4 new)
   autoStartService = new AutoStartService({
