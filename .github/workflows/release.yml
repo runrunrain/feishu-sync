@@ -103,7 +103,11 @@ jobs:
             fi
           }
 
-          for f in "$DIR"/*.dmg "$DIR"/*.zip "$DIR"/latest-mac.yml; do
+          # 2026-09 修复：mac 双架构的更新馈送分离。arm64 构建的 channel 为
+          # latest-arm64，产出 latest-arm64-mac.yml；x64 保持 latest-mac.yml。
+          # 此前两个架构各自生成同名 latest-mac.yml 竞速上传，输者条目丢失，
+          # 导致自动更新可能拿到错误架构的安装包。glob 改为 latest*.yml。
+          for f in "$DIR"/*.dmg "$DIR"/*.zip "$DIR"/latest*.yml; do
             [ -e "$f" ] || continue
             upload_asset "$f"
           done

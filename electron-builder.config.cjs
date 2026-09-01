@@ -91,6 +91,16 @@ module.exports = {
     {
       provider: "generic",
       url: updateFeedUrl,
+      // 2026-09 修复：mac 双架构自动更新馈送分离。electron-updater 在 macOS
+      // 不按架构区分渠道文件（固定读 <channel>-mac.yml，且不携带 arch 后缀），
+      // 双架构构建若共用 latest 通道，latest-mac.yml 会同名竞速上传，只有
+      // 先到者的架构条目存活——另一架构的应用后续自动更新会拿到错误架构
+      // 的安装包。arm64 改用 latest-arm64 通道（app-update.yml 烘焙进包，
+      // 运行时读 latest-arm64-mac.yml）；x64 保持缺省 latest-mac.yml。Windows
+      // 仅构建 x64，无冲突。Linux 渠道自带 arch 后缀，不受影响。
+      ...(targetPlatform === "darwin" && targetArch === "arm64"
+        ? { channel: "latest-arm64" }
+        : {}),
     },
   ],
   npmRebuild: false,
