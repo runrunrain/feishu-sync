@@ -571,9 +571,16 @@ export class LarkCliClient {
 
     const result = await this.execute(args, 'wiki');
 
-    // ndjson format: returns { data: { has_more, nodes: [...] } } wrapped in ok: true
-    // The nodes array is already in result.data.nodes
-    return result.data?.nodes || [];
+    // Two ndjson generations must both resolve to a node array:
+    // - ≤1.0.72 page shape: `{ ok, data: { has_more, nodes: [...] } }` per page,
+    //   merged by parseJsonOutput's page-merger into data.nodes.
+    // - ≥1.0.89 bare entity stream: parseJsonOutput aggregates it into
+    //   data.records (see the incident note there).
+    const data = result?.data;
+    if (Array.isArray(data?.records) && !Array.isArray(data?.nodes)) {
+      return data.records as LarkCliNodeInfo[];
+    }
+    return data?.nodes || [];
   }
 
   /**
@@ -795,6 +802,27 @@ export class LarkCliClient {
 
     const normalized = parsed.map((value) => this.normalizeJsonResult(value));
     if (normalized.length === 1) return normalized[0];
+
+    // lark-cli ≥1.0.89 `--format ndjson` emits a BARE entity stream: one raw
+    // entity object per line with no `ok`/`data` wrapper and no page shape
+    // (`{has_more, nodes}` per page in ≤1.0.72). normalizeJsonResult maps each
+    // line to {ok, data:<entity>}; the page-merger below would then collapse
+    // the stream into the LAST entity's scalar fields, silently losing every
+    // other record (2026-09 real incident: BFS saw an empty tree while
+    // `complete=true`, mass-marking 146 synced documents as missing_candidate
+    // deletion candidates). Detect the bare-entity shape up front and
+    // aggregate every record under `data.records`.
+    const allBareEntities = parsed.every((value) =>
+      value
+      && typeof value === 'object'
+      && !Array.isArray(value)
+      && !('ok' in value)
+      && !('data' in value)
+      && !Object.values(value).some((field) => Array.isArray(field))
+    );
+    if (allBareEntities) {
+      return { ok: true, data: { records: normalized.map((entry) => entry.data) } };
+    }
 
     // NDJSON `--page-all` can emit a record per page. Preserve every array
     // field (notably data.nodes) and keep the latest scalar metadata.

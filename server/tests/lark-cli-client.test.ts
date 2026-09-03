@@ -68,6 +68,31 @@ describe('LarkCliClient output parsing and classification', () => {
     });
   });
 
+  it('aggregates lark-cli >=1.0.89 bare-entity ndjson streams into data.records', () => {
+    // 2026-09 real incident shape: `wiki +node-list --format ndjson --page-all`
+    // on lark-cli 1.0.89 emits `Found N node(s)` plus one bare node object per
+    // line (no ok/data wrapper). Without bare-stream aggregation the page
+    // merger collapsed the stream into the LAST node's scalars, so BFS saw an
+    // empty tree with complete=true and 146 synced documents were mass-marked
+    // missing_candidate.
+    const client = createClient();
+    const result = internals(client).parseJsonOutput(
+      'Found 2 node(s)\n' +
+      '{"node_token":"A","obj_token":"oa","obj_type":"docx","has_child":true,"title":"甲"}\n' +
+      '{"node_token":"B","obj_token":"ob","obj_type":"sheet","has_child":false,"title":"乙"}\n',
+    );
+
+    expect(result).toEqual({
+      ok: true,
+      data: {
+        records: [
+          { node_token: 'A', obj_token: 'oa', obj_type: 'docx', has_child: true, title: '甲' },
+          { node_token: 'B', obj_token: 'ob', obj_type: 'sheet', has_child: false, title: '乙' },
+        ],
+      },
+    });
+  });
+
   it('handles braces inside JSON strings while extracting a log-prefixed value', () => {
     const client = createClient();
     const values = internals(client).extractJsonValues(

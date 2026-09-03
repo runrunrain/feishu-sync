@@ -99,8 +99,12 @@ detectRoutes.post('/api/detect/changes', async (c) => {
     // metadata batches and discovers brand-new wiki nodes via one raw
     // node-list BFS (fast-added-fix). It does not download content or fetch
     // every node detail; full topology reconciliation remains opt-in through
-    // body.mode.
-    const result = await changeDetector.detectChanges(rootUrl, { forceFresh: true, mode });
+    // body.mode. 媒体核对与 changes-all 同策略：主动检测默认全量。
+    const result = await changeDetector.detectChanges(rootUrl, {
+      forceFresh: true,
+      mode,
+      mediaGapScope: body?.mediaGapScope === 'local-only' ? 'local-only' : 'full',
+    });
     return c.json(result);
   } catch (error) {
     console.error('[DetectRoutes] Change detection failed:', error);
@@ -169,6 +173,10 @@ interface MultiRootDetectionResult {
 detectRoutes.post('/api/detect/changes-all', async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const mode = body?.mode === 'full' ? 'full' : 'fast';
+  // 用户主动「立即检测」：媒体完整性核对升级为全量（含 sheet 云端图片
+  // 清单核对，串行约 10-30 秒）。轮询路径不传该参数，默认 local-only
+  // 零额外 API，两层隔离避免叠加触发飞书账号级限流。
+  const mediaGapScope = body?.mediaGapScope === 'local-only' ? 'local-only' : 'full';
   const changeDetector = (c as any).changeDetector as ChangeDetector | undefined;
   const configManager = (c as any).configManager as ConfigManager | undefined;
 
@@ -184,7 +192,7 @@ detectRoutes.post('/api/detect/changes-all', async (c) => {
 
   // Custom-folder detection runs unconditionally (even with zero watched
   // roots) so quick-added archive docs are always checked for cloud edits.
-  const customResult = await changeDetector.detectCustomFolderChanges();
+  const customResult = await changeDetector.detectCustomFolderChanges({ mediaGapScope });
 
   if (watchedRootUrls.length === 0 && customResult.checked === 0) {
     return c.json(
@@ -206,7 +214,11 @@ detectRoutes.post('/api/detect/changes-all', async (c) => {
       // Use the same lightweight batched metadata check for both the tray
       // scheduler and the visible "立即检测" action. Roots remain serial to
       // bound aggregate QPS; `mode: full` is reserved for explicit recovery.
-      const result = await changeDetector.detectChanges(rootUrl, { forceFresh: true, mode });
+      const result = await changeDetector.detectChanges(rootUrl, {
+        forceFresh: true,
+        mode,
+        mediaGapScope,
+      });
       results.push({ rootUrl, status: 'ok', result });
       aggregatedTotalNodes += result.totalNodes ?? 0;
       if (result.changedDocuments?.length) {

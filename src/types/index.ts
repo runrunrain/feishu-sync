@@ -112,6 +112,7 @@ export interface ChangedDocument {
   parentNodeToken?: string | null;
   spaceId?: string | null;
   watchedRootId?: string | null;
+  watchedRootUrl?: string | null;
   hasChild?: boolean;
   observedObjEditTime?: number | null;
   syncState?: SyncState;
@@ -125,6 +126,8 @@ export interface ChangedDocument {
   isWatchedRootNode?: boolean;
   /** Portable relative path from a verified existing mapping, if any. */
   localRelPath?: string | null;
+  /** 媒体完整性核对产出的补齐信号，非云端编辑。 */
+  mediaGapReason?: 'local_placeholder_tags' | 'sheet_cloud_images_missing';
 }
 
 export type SyncState =

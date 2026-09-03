@@ -124,6 +124,11 @@ export function ChangeItem({
             <span className={`text-sm truncate ${isDeleted ? 'text-ink-faint line-through' : 'text-ink'}`}>
               {change.title}
             </span>
+            {change.mediaGapReason && (
+              <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-sans-ui bg-jade/10 text-jade border border-jade/30 shrink-0">
+                图片补齐
+              </span>
+            )}
             {businessMarks && businessMarks.length > 0 && (
               <BusinessTag marks={businessMarks} />
             )}

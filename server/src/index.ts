@@ -144,7 +144,10 @@ export async function buildServer(options: CreateServerOptions = {}) {
   console.info('[server] Initializing ChangeDetector');
   const changeDetector = new ChangeDetector(
     larkCliClient,
-    localMapStore
+    localMapStore,
+    {
+      knowledgeBaseRoot: config.knowledgeBaseRoot,
+    }
   );
   console.info('[server] ChangeDetector initialized');
 

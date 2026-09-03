@@ -18,7 +18,10 @@
  * deterministic and inspectable.
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
 import { ChangeDetector } from '../src/modules/change-detector.js';
 import type {
   CloudNodeObservation,
@@ -44,6 +47,12 @@ class MockLocalMapStore {
 
   getAllDocuments(): DocumentRecord[] {
     return Array.from(this.rows.values());
+  }
+
+  listAllCustomFolderDocs(): DocumentRecord[] {
+    return Array.from(this.rows.values()).filter(
+      (r) => r.customFolderId != null && !r.watchedRootUrl && r.cloudDeleted !== 1,
+    );
   }
 
   recordCloudObservation(input: CloudNodeObservation & { lastSeenAt: string }): DocumentRecord {
@@ -1554,5 +1563,389 @@ describe('ChangeDetector fingerprint short-circuit TTL (change-detection-ttl, §
       bypassCooldown: true,
     });
     expect(failingLark.getNodeUrls).toEqual([TTL_ROOT_URL]);
+  });
+});
+
+// ============================================================================
+// Media Gap Detection Integration
+// ============================================================================
+
+describe('ChangeDetector media gap detection integration', () => {
+  let tmpKbRoot: string;
+  const ROOT_URL = 'https://feishu.cn/wiki/rootA';
+
+  beforeEach(() => {
+    tmpKbRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cd-media-gap-kb-'));
+  });
+
+  afterEach(() => {
+    try {
+      fs.rmSync(tmpKbRoot, { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+  });
+
+  class MediaGapLarkClient {
+    workbookInfoHandler?: (spreadsheetToken: string) => Promise<any>;
+    childNodeGetHandler?: (nodeToken: string) => Partial<LarkCliNodeInfo>;
+    childNodes: any[] = [];
+
+    async getNode(url: string): Promise<LarkCliNodeInfo> {
+      if (url === ROOT_URL || url.endsWith('/wiki/rootA')) {
+        return {
+          node_token: 'rootA',
+          obj_token: 'rootObj',
+          obj_type: 'docx',
+          title: 'Root Doc',
+          space_id: 'space-1',
+          obj_edit_time: 1000,
+          has_child: this.childNodes.length > 0,
+        };
+      }
+      const token = url.substring(url.lastIndexOf('/') + 1);
+      const custom = this.childNodeGetHandler ? this.childNodeGetHandler(token) : {};
+      return {
+        node_token: token,
+        obj_token: custom.obj_token || 'tok_' + token,
+        obj_type: custom.obj_type || 'docx',
+        title: custom.title || 'Title ' + token,
+        space_id: 'space-1',
+        obj_edit_time: custom.obj_edit_time ?? 1000,
+        has_child: false,
+      };
+    }
+
+    async listWikiNodes(_opts: any): Promise<any[]> {
+      return this.childNodes;
+    }
+
+    async getWorkbookInfo(spreadsheetToken: string): Promise<any> {
+      if (this.workbookInfoHandler) {
+        return this.workbookInfoHandler(spreadsheetToken);
+      }
+      return { data: { sheets: [] } };
+    }
+  }
+
+  it('a) docx residual placeholder tags -> changedDocuments contains token with mediaGapReason and store has no write calls for it', async () => {
+    const mdPath = path.join(tmpKbRoot, 'Doc1.md');
+    fs.writeFileSync(
+      mdPath,
+      `<!--
+feishu_sync:
+  obj_token: "tok_docx_1"
+-->
+# 正文
+<whiteboard token="SPb7wKhdzhscrubfoMOcRiYanrc"></whiteboard>
+`,
+      'utf-8',
+    );
+
+    const store = new MockLocalMapStore();
+    store.rows.set(
+      'tok_docx_1',
+      makeLocal({
+        objToken: 'tok_docx_1',
+        wikiNodeToken: 'node_docx_1',
+        objType: 'docx',
+        title: 'Doc 1',
+        localMdPath: mdPath,
+        status: 'synced',
+        syncState: 'synced',
+        watchedRootId: 'rootA',
+        watchedRootUrl: ROOT_URL,
+        syncedObjEditTime: 1000,
+        observedObjEditTime: 1000,
+      }),
+    );
+
+    const lark = new MediaGapLarkClient();
+    const detector = new ChangeDetector(lark as any, store as any, {
+      knowledgeBaseRoot: tmpKbRoot,
+    });
+
+    const recordObsSpy = vi.spyOn(store, 'recordCloudObservation');
+
+    const result = await detector.detectChanges(ROOT_URL, {
+      forceFresh: true,
+      bypassCooldown: true,
+    });
+
+    const gapDoc = result.changedDocuments.find((d) => d.objToken === 'tok_docx_1');
+    expect(gapDoc).toBeDefined();
+    expect(gapDoc?.changeType).toBe('modified');
+    expect(gapDoc?.mediaGapReason).toBe('local_placeholder_tags');
+    expect(result.changed).toBe(true);
+
+    // Assert that store.recordCloudObservation was NEVER called for the media gap doc
+    const gapDocObservationCalls = recordObsSpy.mock.calls.filter(
+      (args) => args[0]?.objToken === 'tok_docx_1',
+    );
+    expect(gapDocObservationCalls).toHaveLength(0);
+  });
+
+  it('b) sheet cloud 2 images vs local 0 images -> pending changedDocument with sheet_cloud_images_missing', async () => {
+    const sheetDir = path.join(tmpKbRoot, 'Sheet1');
+    fs.mkdirSync(sheetDir, { recursive: true });
+    const mdPath = path.join(sheetDir, 'Sheet1.md');
+    fs.writeFileSync(
+      mdPath,
+      `<!--
+feishu_sync:
+  obj_token: "tok_sheet_1"
+-->
+# 表格无图
+`,
+      'utf-8',
+    );
+
+    const store = new MockLocalMapStore();
+    store.rows.set(
+      'tok_sheet_1',
+      makeLocal({
+        objToken: 'tok_sheet_1',
+        wikiNodeToken: 'node_sheet_1',
+        objType: 'sheet',
+        title: 'Sheet 1',
+        localMdPath: mdPath,
+        status: 'synced',
+        syncState: 'synced',
+        watchedRootId: 'rootA',
+        watchedRootUrl: ROOT_URL,
+        syncedObjEditTime: 1000,
+        observedObjEditTime: 1000,
+      }),
+    );
+
+    const lark = new MediaGapLarkClient();
+    lark.workbookInfoHandler = async () => ({
+      data: {
+        sheets: [
+          { sheet_id: 'sub1', float_image_count: 2 },
+        ],
+      },
+    });
+
+    const detector = new ChangeDetector(lark as any, store as any, {
+      knowledgeBaseRoot: tmpKbRoot,
+    });
+
+    const result = await detector.detectChanges(ROOT_URL, {
+      forceFresh: true,
+      bypassCooldown: true,
+      mediaGapScope: 'full',
+    });
+
+    const sheetDoc = result.changedDocuments.find((d) => d.objToken === 'tok_sheet_1');
+    expect(sheetDoc).toBeDefined();
+    expect(sheetDoc?.changeType).toBe('modified');
+    expect(sheetDoc?.mediaGapReason).toBe('sheet_cloud_images_missing');
+    expect(result.changed).toBe(true);
+  });
+
+  it('b2) default local-only scope skips sheet cloud checks (polling-safe: zero workbook-info calls)', async () => {
+    const sheetDir = path.join(tmpKbRoot, 'Sheet1b');
+    fs.mkdirSync(sheetDir, { recursive: true });
+    const mdPath = path.join(sheetDir, 'Sheet1b.md');
+    fs.writeFileSync(
+      mdPath,
+      `<!--
+feishu_sync:
+  obj_token: "tok_sheet_1b"
+-->
+# 表格无图
+`,
+      'utf-8',
+    );
+
+    const store = new MockLocalMapStore();
+    store.rows.set(
+      'tok_sheet_1b',
+      makeLocal({
+        objToken: 'tok_sheet_1b',
+        wikiNodeToken: 'node_sheet_1b',
+        objType: 'sheet',
+        title: 'Sheet 1b',
+        localMdPath: mdPath,
+        status: 'synced',
+        syncState: 'synced',
+        watchedRootId: 'rootA',
+        watchedRootUrl: ROOT_URL,
+        syncedObjEditTime: 1000,
+        observedObjEditTime: 1000,
+      }),
+    );
+
+    let workbookCalls = 0;
+    const lark = new MediaGapLarkClient();
+    lark.workbookInfoHandler = async () => {
+      workbookCalls += 1;
+      return { data: { sheets: [{ float_image_count: 5 }] } };
+    };
+
+    const detector = new ChangeDetector(lark as any, store as any, {
+      knowledgeBaseRoot: tmpKbRoot,
+    });
+
+    const result = await detector.detectChanges(ROOT_URL, {
+      forceFresh: true,
+      bypassCooldown: true,
+      // 不传 mediaGapScope：默认 local-only
+    });
+
+    expect(workbookCalls).toBe(0);
+    const sheetDoc = result.changedDocuments.find((d) => d.objToken === 'tok_sheet_1b');
+    expect(sheetDoc).toBeUndefined();
+  });
+
+  it('c) tokens already in changedDocuments from cloud traversal are not duplicated', async () => {
+    const mdPath = path.join(tmpKbRoot, 'ModDoc.md');
+    fs.writeFileSync(
+      mdPath,
+      `<!--
+feishu_sync:
+  obj_token: "tok_mod_1"
+-->
+# 已在云端修改
+<whiteboard token="wb_raw"></whiteboard>
+`,
+      'utf-8',
+    );
+
+    const store = new MockLocalMapStore();
+    store.rows.set(
+      'tok_mod_1',
+      makeLocal({
+        objToken: 'tok_mod_1',
+        wikiNodeToken: 'node_mod_1',
+        objType: 'docx',
+        title: 'Mod Doc',
+        localMdPath: mdPath,
+        status: 'synced',
+        syncState: 'synced',
+        watchedRootId: 'rootA',
+        watchedRootUrl: ROOT_URL,
+        syncedObjEditTime: 1000,
+        observedObjEditTime: 1000,
+      }),
+    );
+
+    const lark = new MediaGapLarkClient();
+    // Cloud traversal returns node_mod_1 with advanced edit time (2000 > 1000)
+    lark.childNodes = [
+      {
+        node_token: 'node_mod_1',
+        obj_token: 'tok_mod_1',
+        obj_type: 'docx',
+        title: 'Mod Doc Cloud',
+        has_child: false,
+        parent_node_token: 'rootA',
+        space_id: 'space-1',
+      },
+    ];
+    lark.childNodeGetHandler = () => ({
+      obj_token: 'tok_mod_1',
+      obj_edit_time: 2000,
+    });
+
+    const detector = new ChangeDetector(lark as any, store as any, {
+      knowledgeBaseRoot: tmpKbRoot,
+    });
+
+    const result = await detector.detectChanges(ROOT_URL, {
+      forceFresh: true,
+      bypassCooldown: true,
+    });
+
+    const occurrences = result.changedDocuments.filter((d) => d.objToken === 'tok_mod_1');
+    expect(occurrences).toHaveLength(1);
+  });
+
+  it('d) media gap pass throw does not abort the main detection result', async () => {
+    const mdPath = path.join(tmpKbRoot, 'ErrDoc.md');
+    fs.writeFileSync(mdPath, '# 正常文档\n', 'utf-8');
+
+    const store = new MockLocalMapStore();
+    store.rows.set(
+      'tok_err',
+      makeLocal({
+        objToken: 'tok_err',
+        wikiNodeToken: 'node_err',
+        objType: 'sheet',
+        title: 'Sheet Error',
+        localMdPath: mdPath,
+        status: 'synced',
+        syncState: 'synced',
+        watchedRootId: 'rootA',
+        watchedRootUrl: ROOT_URL,
+        syncedObjEditTime: 1000,
+        observedObjEditTime: 1000,
+      }),
+    );
+
+    const lark = new MediaGapLarkClient();
+    lark.workbookInfoHandler = async () => {
+      throw new Error('Upstream catastrophic failure');
+    };
+
+    const detector = new ChangeDetector(lark as any, store as any, {
+      knowledgeBaseRoot: tmpKbRoot,
+    });
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    // Must not throw
+    const result = await detector.detectChanges(ROOT_URL, {
+      forceFresh: true,
+      bypassCooldown: true,
+    });
+
+    expect(result).toBeDefined();
+    expect(result.traversalComplete).toBe(true);
+    warnSpy.mockRestore();
+  });
+
+  it('e) detects sheet media gaps in custom folder archives via detectCustomFolderChanges', async () => {
+    const sheetDir = path.join(tmpKbRoot, '_custom', '表格归档');
+    fs.mkdirSync(sheetDir, { recursive: true });
+    const mdPath = path.join(sheetDir, 'CustomSheet.md');
+    fs.writeFileSync(mdPath, '# 自定义表格\n', 'utf-8');
+
+    const store = new MockLocalMapStore();
+    store.rows.set(
+      'tok_custom_sheet',
+      makeLocal({
+        objToken: 'tok_custom_sheet',
+        wikiNodeToken: 'node_custom_sheet',
+        objType: 'sheet',
+        title: 'Custom Sheet',
+        localMdPath: mdPath,
+        status: 'synced',
+        syncState: 'synced',
+        watchedRootId: null,
+        watchedRootUrl: null,
+        customFolderId: 'folder_123',
+        originalLink: 'https://feishu.cn/wiki/node_custom_sheet',
+        syncedObjEditTime: 1000,
+        observedObjEditTime: 1000,
+      }),
+    );
+
+    const lark = new MediaGapLarkClient();
+    lark.workbookInfoHandler = async () => ({
+      data: {
+        sheets: [{ sheet_id: 'sub', float_image_count: 3 }],
+      },
+    });
+
+    const detector = new ChangeDetector(lark as any, store as any, {
+      knowledgeBaseRoot: tmpKbRoot,
+    });
+
+    const customResult = await detector.detectCustomFolderChanges({ mediaGapScope: 'full' });
+    expect(customResult.changedDocuments.some((d) => d.objToken === 'tok_custom_sheet')).toBe(true);
+    const customDoc = customResult.changedDocuments.find((d) => d.objToken === 'tok_custom_sheet');
+    expect(customDoc?.mediaGapReason).toBe('sheet_cloud_images_missing');
   });
 });

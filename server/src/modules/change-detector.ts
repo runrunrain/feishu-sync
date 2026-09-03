@@ -71,6 +71,7 @@ import type {
   LarkCliDocumentMetaRequest,
 } from './lark-cli-client.js';
 import type { LocalMapStore } from './local-map-store.js';
+import { detectMediaGaps, type MediaGapApiScope } from './media-gap.js';
 import type {
   ChangeDetectionResult,
   ChangedDocument,
@@ -116,6 +117,13 @@ interface ComparisonOptions {
   traversalComplete?: boolean;
 }
 
+export interface ChangeDetectorOptions {
+  knowledgeBaseRoot?: string;
+  mediaGap?: {
+    enabled?: boolean;
+  };
+}
+
 interface ParentChainProjection {
   parentChainTitles: string[];
   isWatchedRootNode: boolean;
@@ -134,6 +142,15 @@ export interface DetectChangesOptions {
   forceFresh?: boolean;
   bypassCooldown?: boolean;
   mode?: ChangeDetectionMode;
+  /**
+   * 媒体完整性核对的 API 作用域（2026-09 分层限流防护）：
+   * - 'local-only'（默认）：仅本地文件扫描，零云端调用。轮询等高频路径
+   *   安全；docx 白板残留标签仍可检出，sheet 云端图片缺口不产出。
+   * - 'full'：追加 sheet workbook-info 云端清单核对（~每文档 1 次调用，
+   *   串行约 10-30 秒）。仅供用户主动「立即检测」等低频入口使用；
+   *   实测背靠背全量核对会触发飞书账号级限流，干扰主检测。
+   */
+  mediaGapScope?: MediaGapApiScope;
 }
 
 /**
@@ -300,10 +317,18 @@ export class ChangeDetector {
    */
   private fastFallbackRetryAt = new Map<string, number>();
 
+  private knowledgeBaseRoot?: string;
+  private mediaGapEnabled: boolean;
+  private hasLoggedMissingKbRoot = false;
+
   constructor(
     private larkCliClient: LarkCliClient,
-    private localMapStore: LocalMapStore
-  ) {}
+    private localMapStore: LocalMapStore,
+    options: ChangeDetectorOptions = {}
+  ) {
+    this.knowledgeBaseRoot = options.knowledgeBaseRoot;
+    this.mediaGapEnabled = options.mediaGap?.enabled ?? true;
+  }
 
   /**
    * Main entry point: detect changes in a wiki subtree.
@@ -337,6 +362,7 @@ export class ChangeDetector {
     const forceFresh = options.forceFresh === true;
     const bypassCooldown = options.bypassCooldown === true;
     const mode = options.mode ?? 'full';
+    const mediaGapScope = options.mediaGapScope ?? 'local-only';
     // A full topology reconciliation and a fast metadata poll have different
     // freshness guarantees, so they must never share a cached result.
     const cacheKey = `${mode}\u0000${rootUrl}`;
@@ -365,8 +391,8 @@ export class ChangeDetector {
     if (inFlight) return inFlight;
 
     const detector = mode === 'fast'
-      ? this.detectMappedDocumentChanges(rootUrl)
-      : this.detectChangesUncached(rootUrl);
+      ? this.detectMappedDocumentChanges(rootUrl, mediaGapScope)
+      : this.detectChangesUncached(rootUrl, mediaGapScope);
     const pending = detector.then((result) => {
       this.detectResultCache.set(cacheKey, {
         result,
@@ -419,7 +445,7 @@ export class ChangeDetector {
    *     at quick-add time). Docs without originalLink or wikiNodeToken are
    *     skipped (cannot re-check identity).
    */
-  async detectCustomFolderChanges(): Promise<{
+  async detectCustomFolderChanges(options: { mediaGapScope?: MediaGapApiScope } = {}): Promise<{
     checked: number;
     changed: number;
     errors: number;
@@ -507,12 +533,19 @@ export class ChangeDetector {
       }
     }
 
-    return {
+    const result = {
       checked: customDocs.length,
       changed: changedDocuments.length,
       errors,
       changedDocuments,
     };
+
+    const syncedCustomSheets = customDocs.filter(
+      (doc) => doc.objType === 'sheet' && (doc.status === 'synced' || doc.syncState === 'synced'),
+    );
+    await this.appendMediaGapPending(result, syncedCustomSheets, options.mediaGapScope ?? 'local-only');
+
+    return result;
   }
 
   /**
@@ -520,7 +553,10 @@ export class ChangeDetector {
    * it with the short-lived result cache without changing the original
    * traversal/comparison logic.
    */
-  private async detectChangesUncached(rootUrl: string): Promise<ChangeDetectionResult> {
+  private async detectChangesUncached(
+    rootUrl: string,
+    mediaGapScope: MediaGapApiScope = 'local-only',
+  ): Promise<ChangeDetectionResult> {
     // 1. Get root node info (space_id + root_token + obj_edit_time)
     const rootInfo = await this.larkCliClient.getNode(rootUrl);
     const spaceId = rootInfo.space_id;
@@ -572,7 +608,7 @@ export class ChangeDetector {
         ).length
       : 0;
 
-    return {
+    const result: ChangeDetectionResult = {
       changed: changedDocuments.length > 0,
       changedDocuments,
       checkedAt: new Date().toISOString(),
@@ -581,6 +617,10 @@ export class ChangeDetector {
       failedNodeTokens: traversal.failedNodeTokens,
       missingCandidates,
     };
+
+    await this.appendMediaGapPending(result, rootUrl, mediaGapScope);
+
+    return result;
   }
 
   /**
@@ -605,7 +645,10 @@ export class ChangeDetector {
    * `wiki +node-get`. Deletion inference remains a full-mode-only concern:
    * the fast path keeps traversalComplete=false for compareWithLocalRecords.
    */
-  private async detectMappedDocumentChanges(rootUrl: string): Promise<ChangeDetectionResult> {
+  private async detectMappedDocumentChanges(
+    rootUrl: string,
+    mediaGapScope: MediaGapApiScope = 'local-only',
+  ): Promise<ChangeDetectionResult> {
     const rootToken = this.rootTokenFromUrl(rootUrl);
     const tracked = (this.localMapStore.getAllDocuments() as DocumentRecord[])
       .filter((record) => {
@@ -780,7 +823,7 @@ export class ChangeDetector {
         ).length
       : 0;
 
-    return {
+    const result: ChangeDetectionResult = {
       changed: changedDocuments.length > 0,
       changedDocuments,
       checkedAt: new Date().toISOString(),
@@ -789,6 +832,10 @@ export class ChangeDetector {
       failedNodeTokens: Array.from(failedTokens),
       missingCandidates,
     };
+
+    await this.appendMediaGapPending(result, rootUrl, mediaGapScope);
+
+    return result;
   }
 
   /**
@@ -1570,5 +1617,119 @@ export class ChangeDetector {
   private formatUnixSeconds(unixSeconds: number | null | undefined): string {
     if (!unixSeconds || unixSeconds <= 0) return '';
     return new Date(unixSeconds * 1000).toISOString();
+  }
+
+  /**
+   * Append documents with media gaps (residual tags or missing sheet images)
+   * as pending modified changes so historical synced documents can be re-synced.
+   *
+   * Pure read-only inspection: does NOT advance observed/synced baselines or
+   * touch SQLite. Soft-fails on error to protect the main detect result.
+   */
+  private async appendMediaGapPending(
+    result: { changed: boolean | number; changedDocuments: ChangedDocument[] },
+    target: string | DocumentRecord[],
+    mediaGapScope: MediaGapApiScope = 'local-only',
+  ): Promise<void> {
+    if (this.mediaGapEnabled === false) {
+      return;
+    }
+    if (!this.knowledgeBaseRoot) {
+      if (!this.hasLoggedMissingKbRoot) {
+        this.hasLoggedMissingKbRoot = true;
+        console.info(
+          '[ChangeDetector] knowledgeBaseRoot is not configured; skipping media gap detection',
+        );
+      }
+      return;
+    }
+
+    try {
+      let candidateRecords: DocumentRecord[];
+      if (typeof target === 'string') {
+        const rootUrl = target;
+        const rootToken = this.rootTokenFromUrl(rootUrl);
+        const allDocs = this.localMapStore.getAllDocuments() as DocumentRecord[];
+        candidateRecords = allDocs.filter((r) => {
+          if (r.cloudDeleted === 1 || !r.objToken) return false;
+          if (r.customFolderId) return false;
+          const matchesRoot =
+            r.watchedRootUrl === rootUrl || r.watchedRootId === rootToken;
+          if (!matchesRoot) return false;
+          return r.status === 'synced' || r.syncState === 'synced';
+        });
+      } else {
+        candidateRecords = target;
+      }
+
+      if (candidateRecords.length === 0) {
+        return;
+      }
+
+      const gaps = await detectMediaGaps({
+        records: candidateRecords,
+        knowledgeBaseRoot: this.knowledgeBaseRoot,
+        larkCliClient: this.larkCliClient,
+        apiScope: mediaGapScope,
+      });
+
+      if (gaps.length === 0) {
+        return;
+      }
+
+      const existingTokens = new Set(
+        result.changedDocuments.map((doc) => doc.objToken),
+      );
+      const recordMap = new Map<string, DocumentRecord>();
+      for (const r of candidateRecords) {
+        recordMap.set(r.objToken, r);
+      }
+
+      for (const gap of gaps) {
+        if (existingTokens.has(gap.objToken)) {
+          continue;
+        }
+        const record = recordMap.get(gap.objToken);
+        if (!record) continue;
+
+        existingTokens.add(gap.objToken);
+        const cloudModifiedTime =
+          record.lastSyncedModifyTime ||
+          this.formatUnixSeconds(record.observedObjEditTime) ||
+          new Date().toISOString();
+
+        result.changedDocuments.push({
+          objToken: record.objToken,
+          objType: record.objType,
+          title: record.title,
+          changeType: 'modified',
+          mediaGapReason: gap.reason,
+          cloudModifiedTime,
+          localSyncedTime: record.lastSyncedModifyTime || null,
+          localMdPath: record.localMdPath || null,
+          localRelPath: record.localRelPath ?? null,
+          watchedRootId: record.watchedRootId ?? null,
+          watchedRootUrl: record.watchedRootUrl ?? null,
+          wikiNodeToken: record.wikiNodeToken ?? null,
+          parentNodeToken: record.parentNodeToken ?? null,
+          spaceId: record.spaceId ?? null,
+          customFolderId: record.customFolderId ?? null,
+          hasChild: record.hasChild ?? false,
+          observedObjEditTime: record.observedObjEditTime ?? null,
+          syncState: record.syncState,
+        });
+      }
+
+      if (typeof result.changed === 'boolean') {
+        result.changed = result.changedDocuments.length > 0;
+      } else if (typeof result.changed === 'number') {
+        result.changed = result.changedDocuments.length;
+      }
+    } catch (err) {
+      console.warn(
+        '[ChangeDetector] appendMediaGapPending failed:',
+        err instanceof Error ? err.message : String(err),
+      );
+    }
   }
 }
