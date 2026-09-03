@@ -10,6 +10,15 @@
 
 ---
 
+## [0.3.26] - 2026-09-03
+
+### Fixed（fix）
+
+- **预览页 HTML 表格渲染失败**：同步产物 md 中块级 `<table>`（飞书表格导出产物，含 colspan/rowspan 合并、vertical-align 属性）此前被自研渲染器当纯文本输出。现识别为受控 React 表格渲染：保留合并单元格语义，白名单剥除 script/on*/javascript: 等危险内容，样式与管道表格一致；新增 src/utils/html-table.ts 纯函数模块 + 单测。
+- **飞书 cite 引用渲染为可点击超链接**：`<cite doc-id="…" title="…">` 现渲染为行内超链接（文本取 title，悬停显示完整 URL），点击经 openExternal 在系统浏览器打开对应飞书 wiki 页面；租户域名从 watchedRoots 配置解析；浏览器 dev 环境降级 window.open；异常属性优雅降级纯文本。新增 src/utils/feishu-cite.ts + 单测。
+
+---
+
 ## [0.3.25] - 2026-09-03
 
 ### Changed（ui）

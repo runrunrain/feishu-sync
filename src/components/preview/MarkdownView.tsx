@@ -1,17 +1,20 @@
 /**
- * MarkdownView - 轻量 Markdown 渲染器（v0.2.8 预览面板，v0.2.9 完善图片/表格）
+ * MarkdownView - 轻量 Markdown 渲染器（v0.2.8 预览面板，v0.2.9 完善图片/表格，v0.3.0 受控 HTML 表格与飞书 cite 引用）
  *
  * 设计约束：项目要求断网可读、零运行时依赖，因此不引入 react-markdown，
  * 自研覆盖同步产物的常见语法子集：
  *   - ATX 标题（# ~ ######）
  *   - ``` 围栏代码块（保留语言标记展示）
  *   - GFM 管道表格（对齐行 `:---` / `:---:` / `---:`、转义 `\|`、缺列自动补齐）
+ *   - 块级受控 HTML 表格（保留 colspan / rowspan 合并、vertical-align、内部行内标签、安全白名单）
  *   - 图片：相对路径经 `baseDir` 解析为 kbRoot 相对路径，走鉴权 fetch →
  *     blob → objectURL 渲染（<img> 无法携带 X-Desktop-Token）；远程 URL
  *     直接渲染；加载/失败均有占位态
  *   - 无序/有序列表（按缩进支持嵌套）
  *   - 引用块、水平线、段落
  *   - 行内：**粗体** / *斜体* / ~~删除线~~ / `行内码` / [链接](url) / 图片
+ *   - 飞书 cite 引用超链接（`<cite doc-id="..." title="...">` 打开外部 wiki）
+ *   - 行内常见 HTML 标记（`<b>`, `<i>`, `<br>`, `<a>`, `<span>` 等）
  *
  * 同步产物适配（media-reference.ts 的改写约定）：
  *   - 剥掉 `<synced-source>...</synced-source>` 包裹标签
@@ -22,6 +25,13 @@
 import { Fragment, useEffect, useState, type JSX, type ReactNode } from 'react';
 import { ImageIcon, Loader2 } from 'lucide-react';
 import { getMediaBlobUrl } from '../../api/client';
+import {
+  decodeHtmlEntities,
+  extractHtmlTableBlocks,
+  parseHtmlTable,
+  type HtmlTableBlock,
+} from '../../utils/html-table';
+import { openExternalUrl, parseCiteTag } from '../../utils/feishu-cite';
 
 // ---------------------------------------------------------------------------
 // 同步产物预处理
@@ -57,6 +67,9 @@ function preprocess(markdown: string): string {
   out = out.replace(/<!--[\s\S]*?-->/g, '');
   // 4) 剥掉飞书导出的 <callout> 包裹标签（保留内部内容按普通块渲染）。
   out = out.replace(/<\/?callout\b[^>]*>/g, '');
+  // 5) 为紧贴其它行内或块级内容的 <table> 标签注入独立段落换行，避免被段落粘连
+  out = out.replace(/([^\n])\s*(<table[\s>])/gi, '$1\n\n$2');
+  out = out.replace(/(<\/table>)\s*([^\n])/gi, '$1\n\n$2');
   return out;
 }
 
@@ -140,8 +153,6 @@ function AuthImage({ src, alt, baseDir }: AuthImageProps) {
       title={alt || src}
       className="my-2 max-w-full rounded-md border border-line/60 shadow-sm"
       loading="lazy"
-      // 远程 URL（如未被同步改写的飞书链接）加载失败时走统一失败占位，
-      // 否则浏览器只显示破图图标，无法辨认原图地址。
       onError={() => setFailed(true)}
     />
   );
@@ -151,36 +162,41 @@ function AuthImage({ src, alt, baseDir }: AuthImageProps) {
 // 行内解析
 // ---------------------------------------------------------------------------
 
-// 图片/链接：alt 文本里可能含 `]`（飞书导出的长描述常见），用非贪婪匹配
-// 到第一个 `](` 为止；粗体/斜体/删除线允许转义字符（如 `\~`）出现。
+// 支持 Markdown 原生标记 + 飞书 cite 标签 + 常用行内 HTML (b/i/br/del/code/a/span)
 const INLINE_RE =
-  /(!\[.*?\]\([^)\n]*\))|(\[.*?\]\([^)\n]*\))|(\*\*(?:\\.|[^*\\\n])+\*\*)|(\*(?:\\.|[^*\\\n])+\*)|(~~(?:\\.|[^~\\])+~~)|(`[^`]+`)/g;
+  /(!\[.*?\]\([^)\n]*\))|(\[.*?\]\([^)\n]*\))|(\*\*(?:\\.|[^*\\\n])+\*\*)|(\*(?:\\.|[^*\\\n])+\*)|(~~(?:\\.|[^~\\])+~~)|(`[^`]+`)|(<cite\b[^>]*>(?:[\s\S]*?<\/cite>)?|<cite\b[^>]*\/>)|(<(?:b|strong)\b[^>]*>[\s\S]*?<\/(?:b|strong)>)|(<(?:i|em)\b[^>]*>[\s\S]*?<\/(?:i|em)>)|(<br\s*\/?>)|(<(?:del|s)\b[^>]*>[\s\S]*?<\/(?:del|s)>)|(<code\b[^>]*>[\s\S]*?<\/code>)|(<a\b[^>]*>[\s\S]*?<\/a>)|(<span\b[^>]*>[\s\S]*?<\/span>)/gi;
 
-/** 还原 GFM 反斜杠转义（`\~` → `~` 等），只作用于展示文本，不动代码/URL。 */
+/** 还原 GFM 反斜杠转义与 HTML 实体，只作用于展示文本 */
 function unescapeInline(s: string): string {
-  return s.replace(/\\([!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~])/g, '$1');
+  const unescaped = s.replace(/\\([!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~])/g, '$1');
+  return decodeHtmlEntities(unescaped);
 }
 
 interface InlineContext {
   baseDir: string;
   onNavigateCsv?: (href: string) => boolean;
+  feishuHost?: string;
 }
 
-function renderInline(text: string, keyPrefix: string, ctx: InlineContext): ReactNode[] {
+export function renderInline(text: string, keyPrefix: string, ctx: InlineContext): ReactNode[] {
   const out: ReactNode[] = [];
   let last = 0;
   let i = 0;
+
   for (const m of text.matchAll(INLINE_RE)) {
     const idx = m.index ?? 0;
     if (idx > last) out.push(unescapeInline(text.slice(last, idx)));
     const token = m[0];
     const key = `${keyPrefix}-${i++}`;
+
     if (token.startsWith('![')) {
+      // 1. Markdown 图片
       const close = token.indexOf('](');
       const alt = unescapeInline(token.slice(2, close));
       const src = token.slice(close + 2, -1);
       out.push(<AuthImage key={key} src={src} alt={alt} baseDir={ctx.baseDir} />);
     } else if (token.startsWith('[')) {
+      // 2. Markdown 链接
       const close = token.indexOf('](');
       const label = unescapeInline(token.slice(1, close));
       const href = token.slice(close + 2, -1);
@@ -206,18 +222,21 @@ function renderInline(text: string, keyPrefix: string, ctx: InlineContext): Reac
         </a>,
       );
     } else if (token.startsWith('**')) {
+      // 3. Markdown 粗体
       out.push(
         <strong key={key} className="font-semibold text-ink">
           {unescapeInline(token.slice(2, -2))}
         </strong>,
       );
     } else if (token.startsWith('~~')) {
+      // 4. Markdown 删除线
       out.push(
         <del key={key} className="text-ink-faint">
           {unescapeInline(token.slice(2, -2))}
         </del>,
       );
     } else if (token.startsWith('`')) {
+      // 5. Markdown 行内代码
       out.push(
         <code
           key={key}
@@ -226,8 +245,106 @@ function renderInline(text: string, keyPrefix: string, ctx: InlineContext): Reac
           {token.slice(1, -1)}
         </code>,
       );
+    } else if (/^<cite\b/i.test(token)) {
+      // 6. 飞书 cite 标签（需求 2）
+      const parsedCite = parseCiteTag(token, ctx.feishuHost);
+      if (parsedCite.url) {
+        out.push(
+          <a
+            key={key}
+            href={parsedCite.url}
+            title={parsedCite.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              openExternalUrl(parsedCite.url!);
+            }}
+            className="text-blue-600 hover:text-blue-700 underline underline-offset-2 decoration-blue-300 hover:decoration-blue-500 cursor-pointer transition-colors"
+          >
+            {parsedCite.displayText}
+          </a>,
+        );
+      } else if (parsedCite.displayText) {
+        out.push(
+          <span key={key} className="text-ink-soft">
+            {parsedCite.displayText}
+          </span>,
+        );
+      }
+    } else if (/^<(?:b|strong)\b/i.test(token)) {
+      // 7. HTML 粗体
+      const inner = token.replace(/^<(?:b|strong)\b[^>]*>/i, '').replace(/<\/(?:b|strong)>$/i, '');
+      out.push(
+        <strong key={key} className="font-semibold text-ink">
+          {renderInline(inner, `${key}-b`, ctx)}
+        </strong>,
+      );
+    } else if (/^<(?:i|em)\b/i.test(token)) {
+      // 8. HTML 斜体
+      const inner = token.replace(/^<(?:i|em)\b[^>]*>/i, '').replace(/<\/(?:i|em)>$/i, '');
+      out.push(
+        <em key={key} className="text-ink-soft">
+          {renderInline(inner, `${key}-i`, ctx)}
+        </em>,
+      );
+    } else if (/^<br\s*\/?>/i.test(token)) {
+      // 9. HTML 换行
+      out.push(<br key={key} />);
+    } else if (/^<(?:del|s)\b/i.test(token)) {
+      // 10. HTML 删除线
+      const inner = token.replace(/^<(?:del|s)\b[^>]*>/i, '').replace(/<\/(?:del|s)>$/i, '');
+      out.push(
+        <del key={key} className="text-ink-faint">
+          {renderInline(inner, `${key}-d`, ctx)}
+        </del>,
+      );
+    } else if (/^<code\b/i.test(token)) {
+      // 11. HTML <code>
+      const inner = token.replace(/^<code\b[^>]*>/i, '').replace(/<\/code>$/i, '');
+      out.push(
+        <code
+          key={key}
+          className="px-1 py-0.5 mx-0.5 rounded-sm bg-paper-2 border border-line/60 text-[0.85em] text-seal font-mono"
+        >
+          {decodeHtmlEntities(inner)}
+        </code>,
+      );
+    } else if (/^<a\b/i.test(token)) {
+      // 12. HTML 链接
+      const hrefM = token.match(/\bhref=(?:"([^"]*)"|'([^']*)'|([^\\s>]+))/i);
+      const rawHref = hrefM ? hrefM[1] ?? hrefM[2] ?? hrefM[3] ?? '' : '';
+      const href = decodeHtmlEntities(rawHref);
+      const safeHref = /^javascript:/i.test(href.trim()) ? '#' : href;
+      const isCsv = !isRemoteUrl(safeHref) && safeHref.split(/[?#]/)[0].toLowerCase().endsWith('.csv');
+      const inner = token.replace(/^<a\b[^>]*>/i, '').replace(/<\/a>$/i, '');
+      out.push(
+        <a
+          key={key}
+          href={safeHref}
+          target={isCsv ? undefined : '_blank'}
+          rel={isCsv ? undefined : 'noopener noreferrer'}
+          onClick={(e) => {
+            if (isCsv && ctx.onNavigateCsv) {
+              const handled = ctx.onNavigateCsv(safeHref);
+              if (handled) {
+                e.preventDefault();
+                e.stopPropagation();
+              }
+            }
+          }}
+          className="text-jade hover:text-seal underline underline-offset-2 decoration-line hover:decoration-seal transition-colors cursor-pointer"
+        >
+          {renderInline(inner, `${key}-a`, ctx)}
+        </a>,
+      );
+    } else if (/^<span\b/i.test(token)) {
+      // 13. HTML span
+      const inner = token.replace(/^<span\b[^>]*>/i, '').replace(/<\/span>$/i, '');
+      out.push(<span key={key}>{renderInline(inner, `${key}-sp`, ctx)}</span>);
     } else {
-      // *斜体*
+      // 14. Markdown *斜体*
       out.push(
         <em key={key} className="text-ink-soft">
           {unescapeInline(token.slice(1, -1))}
@@ -236,6 +353,7 @@ function renderInline(text: string, keyPrefix: string, ctx: InlineContext): Reac
     }
     last = idx + token.length;
   }
+
   if (last < text.length) out.push(unescapeInline(text.slice(last)));
   return out;
 }
@@ -246,10 +364,11 @@ function renderInline(text: string, keyPrefix: string, ctx: InlineContext): Reac
 
 type TableAlign = 'left' | 'center' | 'right';
 
-type Block =
+export type Block =
   | { type: 'heading'; level: number; text: string }
   | { type: 'code'; lang: string; lines: string[] }
   | { type: 'table'; header: string[]; aligns: TableAlign[]; rows: string[][] }
+  | HtmlTableBlock
   | { type: 'list'; ordered: boolean; items: { indent: number; text: string }[] }
   | { type: 'quote'; lines: string[] }
   | { type: 'hr' }
@@ -284,8 +403,6 @@ function parseTableSeparator(line: string): TableAlign[] | null {
   if (parts.length === 0) return null;
   const aligns: TableAlign[] = [];
   for (const part of parts) {
-    // GFM 允许 1 个及以上连字符（飞书导出常见 `|-|`），旧正则 `-{2,}`
-    // 会把这类表格漏判为普通段落。
     if (!/^:?-+:?$/.test(part)) return null;
     const left = part.startsWith(':');
     const right = part.endsWith(':');
@@ -294,7 +411,7 @@ function parseTableSeparator(line: string): TableAlign[] | null {
   return aligns;
 }
 
-function parseBlocks(markdown: string): Block[] {
+export function parseBlocks(markdown: string): Block[] {
   const lines = markdown.replace(/\r\n/g, '\n').split('\n');
   const blocks: Block[] = [];
   let i = 0;
@@ -341,7 +458,27 @@ function parseBlocks(markdown: string): Block[] {
       continue;
     }
 
-    // 表格：当前行含 | 且下一行是合法分隔行
+    // 块级 HTML 表格（需求 1）
+    if (/^\s*<table[\s>]/i.test(line)) {
+      const tableLines: string[] = [line];
+      let closed = /<\/table>/i.test(line);
+      i++;
+      while (!closed && i < lines.length) {
+        tableLines.push(lines[i]);
+        if (/<\/table>/i.test(lines[i])) {
+          closed = true;
+        }
+        i++;
+      }
+      const rawHtml = tableLines.join('\n');
+      const tableBlock = parseHtmlTable(rawHtml);
+      if (tableBlock) {
+        blocks.push(tableBlock);
+        continue;
+      }
+    }
+
+    // GFM 管道表格：当前行含 | 且下一行是合法分隔行
     if (line.includes('|') && i + 1 < lines.length) {
       const aligns = parseTableSeparator(lines[i + 1]);
       if (aligns) {
@@ -356,7 +493,6 @@ function parseBlocks(markdown: string): Block[] {
           rows.push(splitTableRow(lines[i]));
           i++;
         }
-        // 缺列补齐到表头宽度，避免渲染错列
         const width = Math.max(header.length, aligns.length);
         while (header.length < width) header.push('');
         while (aligns.length < width) aligns.push('left');
@@ -394,7 +530,7 @@ function parseBlocks(markdown: string): Block[] {
       continue;
     }
 
-    // 段落：合并连续普通行
+    // 段落：合并连续普通行（遇到标题、代码块、引用、列表、分隔线、HTML 表格停止）
     const buf: string[] = [line];
     i++;
     while (
@@ -406,12 +542,27 @@ function parseBlocks(markdown: string): Block[] {
         i + 1 < lines.length &&
         parseTableSeparator(lines[i + 1]) !== null
       ) &&
-      !/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(lines[i])
+      !/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(lines[i]) &&
+      !/^\s*<table[\s>]/i.test(lines[i])
     ) {
       buf.push(lines[i]);
       i++;
     }
-    blocks.push({ type: 'paragraph', text: buf.join(' ') });
+
+    const paragraphText = buf.join(' ');
+    // 容错提取：若段落中仍嵌有块级 HTML 表格，将其切分独立
+    const segments = extractHtmlTableBlocks(paragraphText);
+    if (segments.length > 1 || (segments.length === 1 && segments[0].type === 'table')) {
+      for (const seg of segments) {
+        if (seg.type === 'table') {
+          blocks.push(seg.block);
+        } else if (seg.content.trim()) {
+          blocks.push({ type: 'paragraph', text: seg.content.trim() });
+        }
+      }
+    } else {
+      blocks.push({ type: 'paragraph', text: paragraphText });
+    }
   }
 
   return blocks;
@@ -521,6 +672,71 @@ function renderBlock(block: Block, index: number, ctx: InlineContext): ReactNode
           </table>
         </div>
       );
+    case 'html_table':
+      // 需求 1：受控 HTML 表格渲染，保留 colspan/rowspan，样式与 Markdown 表格一致
+      return (
+        <div key={key} className="my-3 overflow-x-auto scrollbar-thin rounded-md border border-line/70">
+          <table className="w-full text-xs border-collapse">
+            {block.colgroup && (
+              <colgroup>
+                {block.colgroup.map((col, ci) => (
+                  <col
+                    key={ci}
+                    span={col.span}
+                    style={col.width ? { width: col.width } : undefined}
+                  />
+                ))}
+              </colgroup>
+            )}
+            {block.headRows.length > 0 && (
+              <thead>
+                {block.headRows.map((row, ri) => (
+                  <tr key={ri} className="bg-paper-2">
+                    {row.cells.map((cell, ci) => (
+                      <th
+                        key={ci}
+                        colSpan={cell.colspan}
+                        rowSpan={cell.rowspan}
+                        style={{
+                          verticalAlign: cell.valign || 'top',
+                          ...(cell.style || {}),
+                        }}
+                        className={`px-3 py-2 font-medium text-ink border-b border-line ${
+                          cell.align ? ALIGN_CLASS[cell.align] : 'text-left'
+                        }`}
+                      >
+                        {renderInline(cell.content, `${key}-h${ri}c${ci}`, ctx)}
+                      </th>
+                    ))}
+                  </tr>
+                ))}
+              </thead>
+            )}
+            <tbody>
+              {block.bodyRows.map((row, ri) => (
+                <tr key={ri} className={ri % 2 === 1 ? 'bg-paper/60' : 'bg-card-bg'}>
+                  {row.cells.map((cell, ci) => (
+                    <td
+                      key={ci}
+                      colSpan={cell.colspan}
+                      rowSpan={cell.rowspan}
+                      style={{
+                        verticalAlign: cell.valign || 'top',
+                        ...(cell.style || {}),
+                      }}
+                      className={`px-3 py-1.5 text-ink-soft border-b border-line/40 ${
+                        cell.align ? ALIGN_CLASS[cell.align] : 'text-left'
+                      }`}
+                    >
+                      {renderInline(cell.content, `${key}-r${ri}c${ci}`, ctx)}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
     case 'list':
       return renderList(block, key, ctx);
     case 'quote':
@@ -557,11 +773,18 @@ export interface MarkdownViewProps {
   baseDir?: string;
   /** 点击相对 .csv 链接时的拦截处理器：返回 true 表示已命中本地子表并阻止浏览器默认跳转。 */
   onNavigateCsv?: (href: string) => boolean;
+  /** 飞书租户域名（如 "qcnbafdrjx7n.feishu.cn"），用于生成并打开 wiki 超链接。 */
+  feishuHost?: string;
 }
 
-export function MarkdownView({ content, baseDir = '', onNavigateCsv }: MarkdownViewProps) {
+export function MarkdownView({
+  content,
+  baseDir = '',
+  onNavigateCsv,
+  feishuHost,
+}: MarkdownViewProps) {
   const blocks = parseBlocks(preprocess(content));
-  const ctx: InlineContext = { baseDir, onNavigateCsv };
+  const ctx: InlineContext = { baseDir, onNavigateCsv, feishuHost };
   return (
     <div className="px-5 py-4">
       {blocks.map((b, i) => (

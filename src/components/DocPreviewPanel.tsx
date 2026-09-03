@@ -31,6 +31,8 @@ import { CsvTableView } from './preview/CsvTableView';
 import { getDocumentContent } from '../api/client';
 import { appLogger } from '../utils/appLogger';
 import { useToast } from './common/Toast';
+import { useConfig } from '../hooks/useConfig';
+import { resolveFeishuTenantHost } from '../utils/feishu-url';
 import type { DocumentContent, MappingNode } from '../types';
 
 interface DocPreviewPanelProps {
@@ -84,6 +86,11 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
   const [mdMode, setMdMode] = useState<MdMode>('rendered');
   const [csvIndex, setCsvIndex] = useState(0);
   const toast = useToast();
+  const { config } = useConfig();
+
+  const feishuHost = useMemo(() => {
+    return resolveFeishuTenantHost(config?.watchedRootUrls, config?.watchedRoots);
+  }, [config?.watchedRootUrls, config?.watchedRoots]);
 
   const objToken = node?.obj_token ?? null;
 
@@ -334,6 +341,7 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
                 content={content!.mdContent!}
                 baseDir={mdBaseDir}
                 onNavigateCsv={handleNavigateCsv}
+                feishuHost={feishuHost}
               />
             </div>
           ) : hasMd ? (

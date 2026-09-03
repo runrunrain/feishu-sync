@@ -92,3 +92,49 @@ export function extractWikiRootId(url: string): string | null {
     return null;
   }
 }
+
+/**
+ * 从飞书 URL 提取租户域名（host / domain）。
+ * 例如从 "https://qcnbafdrjx7n.feishu.cn/wiki/xxx" 提取 "qcnbafdrjx7n.feishu.cn"。
+ * 非合法飞书域名返回 null。
+ */
+export function extractFeishuTenantHost(url: string | null | undefined): string | null {
+  if (!url || typeof url !== 'string') return null;
+  const trimmed = url.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol === 'https:' && /\.feishu\.cn$/i.test(parsed.hostname)) {
+      return parsed.host;
+    }
+  } catch {
+    // 容错降级正则
+    const match = trimmed.match(/^https?:\/\/([a-z0-9-]+\.feishu\.cn)/i);
+    if (match) return match[1];
+  }
+  return null;
+}
+
+/**
+ * 从配置中的 watchedRootUrls 或 watchedRoots 列表中解析出租户域名。
+ * 返回首个有效租户 host，若均无有效地址则返回空字符串。
+ */
+export function resolveFeishuTenantHost(
+  watchedRootUrls?: string[] | null,
+  roots?: Array<{ url: string }> | null,
+): string {
+  if (Array.isArray(watchedRootUrls)) {
+    for (const u of watchedRootUrls) {
+      const host = extractFeishuTenantHost(u);
+      if (host) return host;
+    }
+  }
+  if (Array.isArray(roots)) {
+    for (const r of roots) {
+      const host = extractFeishuTenantHost(r?.url);
+      if (host) return host;
+    }
+  }
+  return '';
+}
+
