@@ -19,7 +19,7 @@ import { BatchActionBar } from './BatchActionBar';
 import { useToast } from './common/Toast';
 import { appLogger } from '../utils/appLogger';
 import { onDiffChanged } from '../utils/syncEvents';
-import { getStoredMappingDiff } from '../api/client';
+import { detectChanges, detectChangesAll, getStoredMappingDiff } from '../api/client';
 import type { ChangedDocument, DiffReport, SheetSub } from '../types';
 import { isUsableWikiUrl } from '../utils/wikiUrl';
 
@@ -180,6 +180,11 @@ export function ChangeListPanel({
     try {
       let report: DiffReport;
       if (multiRootUrls) {
+        // 2026-09 修复：「立即检测」此前只重读 cached 存量 diff（cached=1
+        // 从不触发云遍历），按钮名不副实——Win 用户轮询不频繁时感知为
+        // 「失效」。现在先发真实检测（changes-all 服务端跑元数据比对 +
+        // 媒体完整性核对 full 作用域），完成后再读持久化结果。
+        await detectChangesAll();
         const { report: aggregated, failedRoots } = await fetchMultiRootDiff(multiRootUrls);
         report = aggregated;
         if (failedRoots.length > 0) {
@@ -194,6 +199,7 @@ export function ChangeListPanel({
           setLoading(false);
           return;
         }
+        await detectChanges(rootUrl);
         report = await getStoredMappingDiff(rootUrl);
       }
       setDiff(report);
