@@ -39,6 +39,13 @@ import {
   rewriteFeishuMediaReferences,
   type MediaReference,
 } from './media-reference.js';
+import {
+  annotateCsvWithImages,
+  downloadSheetMedia,
+  probeSheetFloatImages,
+  renderSheetMediaAppendix,
+  type SheetMediaItem,
+} from './sheet-media.js';
 import type { DocumentIR } from './document-ir.js';
 import { LarkCliError } from './lark-cli-client.js';
 
@@ -100,6 +107,15 @@ export interface SyncSheetToCustomFolderInput {
       sheetId: string;
       range: string;
     }): Promise<any>;
+    /** Optional: float-image probing; older clients / test doubles without
+     * it simply skip sheet-image enrichment (probeSheetFloatImages guards). */
+    getSheetFloatImages?(options: {
+      spreadsheetToken: string;
+      sheetId: string;
+    }): Promise<any>;
+    /** Used by sheet float-image three-tier download. */
+    downloadMedia(token: string, outputPath: string, type?: 'media' | 'whiteboard'): Promise<string>;
+    previewMedia(token: string, outputPath: string): Promise<string>;
   };
   knowledgeBaseRoot: string;
   /** Optional operation staging root override; defaults to ~/.feishu-sync/operations. */
@@ -120,6 +136,8 @@ export interface SyncSheetResult {
   localMdPath: string;
   localRelPath: string;
   sheetsCount: number;
+  /** Float images downloaded and committed alongside the CSV data. */
+  imagesCount: number;
   /** See SyncDocxResult.committedFiles. */
   committedFiles: string[];
   /** See SyncDocxResult.commitPlan. */
@@ -307,6 +325,9 @@ export async function syncSheetToCustomFolder(
   const relativeMd =
     toPortableRelative(root, input.localMdPath) ?? path.basename(input.localMdPath);
   const docname = path.basename(input.localMdPath, '.md');
+  const docDirRel = relativeMd.includes('/')
+    ? relativeMd.slice(0, relativeMd.lastIndexOf('/'))
+    : '';
 
   // 1. List the workbook's sub-sheets. An empty workbook cannot produce a
   // body, so refuse instead of writing a metadata-only placeholder.
@@ -333,6 +354,7 @@ export async function syncSheetToCustomFolder(
       title: string;
       csvPath: string;
       csvRel: string;
+      images: SheetMediaItem[];
     }> = [];
     for (const sheet of sheetsList) {
       const safeTitle = sheet.sheet_name.replace(/[<>:"/\\|?*\u0000-\u001F]/g, '_');
@@ -352,12 +374,31 @@ export async function syncSheetToCustomFolder(
           `csv-get 返回空内容: sheet="${sheet.sheet_name}" range=${range}`,
         );
       }
-      fs.writeFileSync(csvPath, csvText, 'utf-8');
+
+      // Float-image enrichment mirrors SyncEngine's sheet path: probe
+      // metadata (soft-fail), three-tier download into the temp images/ dir,
+      // then inject local references into the CSV cells.
+      const floatImages = await probeSheetFloatImages(input.larkCliClient, {
+        spreadsheetToken: input.objToken,
+        sheetId: sheet.sheet_id,
+        sheetTitle: sheet.sheet_name,
+      });
+      const sheetImages = floatImages.length > 0
+        ? await downloadSheetMedia({
+            client: input.larkCliClient,
+            floatImages,
+            imagesDir: path.join(csvTemp, 'images'),
+            subSheetTitle: sheet.sheet_name,
+          })
+        : [];
+
+      fs.writeFileSync(csvPath, annotateCsvWithImages(csvText, sheetImages), 'utf-8');
       exported.push({
         sheetId: sheet.sheet_id,
         title: sheet.sheet_name,
         csvPath,
         csvRel: `${docname}.csv-data/${safeTitle}.csv`,
+        images: sheetImages,
       });
     }
 
@@ -368,14 +409,18 @@ export async function syncSheetToCustomFolder(
     const sections: string[] = [];
     for (const sheet of exported) {
       const reconstructed = await reconstructor.reconstructToMarkdown(sheet.csvPath);
-      sections.push(
-        `## 子表: ${sheet.title}\n\n[CSV 原始数据](${sheet.csvRel})\n\n${reconstructed}`,
-      );
+      let section = `## 子表: ${sheet.title}\n\n[CSV 原始数据](${sheet.csvRel})\n\n${reconstructed}`;
+      if (sheet.images.length > 0) {
+        section += `\n\n${renderSheetMediaAppendix(sheet.title, sheet.images)}`;
+      }
+      sections.push(section);
     }
     const bodyMarkdown = sections.join('\n\n---\n\n');
 
     // 4. Build the DocumentIR and commit atomically. content-commit stages
-    // each ir.sheets[].csvContent itself, so no extraFiles are needed.
+    // each ir.sheets[].csvContent itself; float images ride the extraFiles
+    // channel (same as docx media) so the atomic commit covers them.
+    const sheetMediaImages = exported.flatMap((sheet) => sheet.images);
     const ir: DocumentIR = {
       objToken: input.objToken,
       wikiNodeToken: input.wikiNodeToken,
@@ -385,7 +430,10 @@ export async function syncSheetToCustomFolder(
       originalLink: input.originalLink,
       observedObjEditTime: input.objEditTime,
       bodyMarkdown,
-      images: [],
+      images: sheetMediaImages.map((image) => ({
+        relativePath: image.localRelPath,
+        token: image.token,
+      })),
       attachments: [],
       sheets: exported.map((sheet) => ({
         sheetId: sheet.sheetId,
@@ -394,6 +442,16 @@ export async function syncSheetToCustomFolder(
         csvContent: fs.readFileSync(sheet.csvPath, 'utf-8'),
       })),
     };
+
+    const extraFiles: Array<{ relativePath: string; absoluteSource: string }> = [];
+    for (const image of sheetMediaImages) {
+      extraFiles.push({
+        relativePath: docDirRel
+          ? `${docDirRel}/${image.localRelPath}`
+          : image.localRelPath,
+        absoluteSource: image.localPath,
+      });
+    }
 
     const operationDirectory = resolveOperationDirectory(
       root,
@@ -407,6 +465,7 @@ export async function syncSheetToCustomFolder(
       operationDirectory,
       localMdPath: input.localMdPath,
       ir,
+      extraFiles,
     });
     if (!commit.ok) {
       throw new Error(commit.error || '自定义归档表格写入失败');
@@ -416,11 +475,17 @@ export async function syncSheetToCustomFolder(
     for (const sheet of exported) {
       committedFiles.push(path.join(path.dirname(input.localMdPath), ...sheet.csvRel.split('/')));
     }
+    for (const image of sheetMediaImages) {
+      committedFiles.push(
+        path.join(path.dirname(input.localMdPath), ...image.localRelPath.split('/')),
+      );
+    }
 
     return {
       localMdPath: input.localMdPath,
       localRelPath: relativeMd,
       sheetsCount: exported.length,
+      imagesCount: sheetMediaImages.length,
       committedFiles,
       commitPlan: commit.plan,
     };

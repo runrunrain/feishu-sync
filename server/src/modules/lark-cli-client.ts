@@ -148,6 +148,89 @@ export function findExecutableOnPath(
 }
 
 /**
+ * 获取 Node/npm/lark-cli 的全平台全版本管理器候选目录。
+ * 覆盖现代 Node 环境：fnm, nvm, volta, pnpm, asdf, Homebrew, ~/.local/bin, ~/.npm-global/bin 等。
+ */
+export function getNodeRuntimeCandidateDirectories(
+  homeDir: string = os.homedir(),
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string[] {
+  if (platform === 'win32') {
+    return [
+      env.APPDATA ? path.join(env.APPDATA, 'npm') : '',
+      env.LOCALAPPDATA ? path.join(env.LOCALAPPDATA, 'npm') : '',
+      path.join(homeDir, 'AppData', 'Roaming', 'npm'),
+      path.join(homeDir, '.volta', 'bin'),
+      path.join(homeDir, 'AppData', 'Local', 'pnpm'),
+    ].filter(Boolean);
+  }
+
+  const dirs: string[] = [];
+
+  // 1. fnm (Fast Node Manager) - current、multishells 与已安装版本
+  dirs.push(path.join(homeDir, '.local', 'share', 'fnm', 'current', 'bin'));
+  try {
+    const fnmVersionsDir = path.join(homeDir, '.local', 'share', 'fnm', 'node-versions');
+    if (fs.existsSync(fnmVersionsDir)) {
+      const versions = fs.readdirSync(fnmVersionsDir).sort().reverse();
+      for (const v of versions) {
+        dirs.push(path.join(fnmVersionsDir, v, 'installation', 'bin'));
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  try {
+    const fnmMultiDir = path.join(homeDir, '.local', 'state', 'fnm_multishells');
+    if (fs.existsSync(fnmMultiDir)) {
+      const shells = fs.readdirSync(fnmMultiDir);
+      for (const s of shells) {
+        dirs.push(path.join(fnmMultiDir, s, 'bin'));
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+
+  // 2. nvm - versions 目录与 current
+  dirs.push(path.join(homeDir, '.nvm', 'current', 'bin'));
+  try {
+    const nvmVersionsDir = path.join(homeDir, '.nvm', 'versions', 'node');
+    if (fs.existsSync(nvmVersionsDir)) {
+      const versions = fs.readdirSync(nvmVersionsDir).sort().reverse();
+      for (const v of versions) {
+        dirs.push(path.join(nvmVersionsDir, v, 'bin'));
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+
+  // 3. volta
+  dirs.push(path.join(homeDir, '.volta', 'bin'));
+
+  // 4. pnpm
+  dirs.push(path.join(homeDir, 'Library', 'pnpm'));
+  dirs.push(path.join(homeDir, '.local', 'share', 'pnpm'));
+
+  // 5. asdf
+  dirs.push(path.join(homeDir, '.asdf', 'shims'));
+  dirs.push(path.join(homeDir, '.asdf', 'bin'));
+
+  // 6. Homebrew / 系统全局
+  dirs.push('/opt/homebrew/bin');
+  dirs.push('/usr/local/bin');
+
+  // 7. 用户本地免权限目录及标准位置
+  dirs.push(path.join(homeDir, '.local', 'node', 'bin'));
+  dirs.push(path.join(homeDir, '.local', 'bin'));
+  dirs.push(path.join(homeDir, '.npm-global', 'bin'));
+
+  return dirs.filter(Boolean);
+}
+
+/**
  * Resolve lark-cli without assuming Electron inherited the user's shell PATH.
  *
  * A macOS app launched from Finder normally receives only the system PATH,
@@ -183,19 +266,7 @@ export function resolveLarkCliExecutable(
   const fromPath = findExecutableOnPath(executableNames, env.PATH ?? env.Path);
   if (fromPath) return fromPath;
 
-  const candidateDirectories = platform === 'win32'
-    ? [
-        env.APPDATA ? path.join(env.APPDATA, 'npm') : '',
-        env.LOCALAPPDATA ? path.join(env.LOCALAPPDATA, 'npm') : '',
-        path.join(homeDir, 'AppData', 'Roaming', 'npm'),
-      ]
-    : [
-        path.join(homeDir, '.local', 'node', 'bin'),
-        path.join(homeDir, '.local', 'bin'),
-        path.join(homeDir, '.npm-global', 'bin'),
-        '/opt/homebrew/bin',
-        '/usr/local/bin',
-      ];
+  const candidateDirectories = getNodeRuntimeCandidateDirectories(homeDir, env, platform);
 
   for (const directory of candidateDirectories) {
     if (!directory) continue;
@@ -395,6 +466,23 @@ export class LarkCliClient {
       'sheets', '+csv-get', '--spreadsheet-token', options.spreadsheetToken,
       '--sheet-id', options.sheetId, '--range', options.range,
       '--include-row-prefix=false', '--format', 'json',
+    ], 'sheets');
+  }
+
+  /**
+   * List a sub-sheet's floating images (sheets +float-image-list).
+   * Returns the raw response; sheet-media.parseSheetFloatImages does the
+   * tolerant normalization (snake/camel keys, missing sheets wrap, etc.).
+   */
+  async getSheetFloatImages(options: {
+    spreadsheetToken: string;
+    sheetId: string;
+  }): Promise<any> {
+    return this.execute([
+      'sheets', '+float-image-list',
+      '--spreadsheet-token', options.spreadsheetToken,
+      '--sheet-id', options.sheetId,
+      '--format', 'json',
     ], 'sheets');
   }
 

@@ -54,6 +54,13 @@ import {
   extractFeishuMediaReferences,
   rewriteFeishuMediaReferences,
 } from './media-reference.js';
+import {
+  annotateCsvWithImages,
+  downloadSheetMedia,
+  probeSheetFloatImages,
+  renderSheetMediaAppendix,
+  type SheetMediaItem,
+} from './sheet-media.js';
 import { adaptSlidesXmlToMarkdown } from './slides-xml-adapter.js';
 import { LarkCliError } from './lark-cli-client.js';
 
@@ -590,7 +597,13 @@ export class SyncEngine {
       );
     }
 
-    const sheets: Array<{ sheetId: string; title: string; csvPath: string; csvRel: string }> = [];
+    const sheets: Array<{
+      sheetId: string;
+      title: string;
+      csvPath: string;
+      csvRel: string;
+      images: SheetMediaItem[];
+    }> = [];
     if (doc.objType === 'sheet') {
       const docname = path.basename(localMdPath, '.md');
       const exportedSheets = await this.exportSheetsToStaging(
@@ -600,6 +613,9 @@ export class SyncEngine {
       );
       sheets.push(...exportedSheets);
     }
+    // Sheet float images flow through the same images/extraFiles channel as
+    // docx media so commitDocumentContent + atomic-commit cover them.
+    const sheetMediaImages: SheetMediaItem[] = sheets.flatMap((sheet) => sheet.images);
 
     // 6. Table reconstruction — any sub-sheet failure aborts the document.
     let finalContent = expandedContent;
@@ -609,9 +625,14 @@ export class SyncEngine {
         const reconstructedMarkdown = await this.layoutReconstructor.reconstructToMarkdown(
           sheet.csvPath,
         );
-        reconstructedSheets.push(
-          `## 子表: ${sheet.title}\n\n[CSV 原始数据](${sheet.csvRel})\n\n${reconstructedMarkdown}`,
-        );
+        let section =
+          `## 子表: ${sheet.title}\n\n[CSV 原始数据](${sheet.csvRel})\n\n${reconstructedMarkdown}`;
+        // 浮动图片大图展示区：CSV 单元格内的引用之外，追加不依赖 CSV
+        // 渲染的完整尺寸展示区块，保证表格图片在阅读器中可见。
+        if (sheet.images.length > 0) {
+          section += `\n\n${renderSheetMediaAppendix(sheet.title, sheet.images)}`;
+        }
+        reconstructedSheets.push(section);
         console.info(`[SyncEngine] Reconstructed sheet "${sheet.title}" from ${sheet.csvPath}`);
       }
       if (reconstructedSheets.length > 0) {
@@ -708,10 +729,18 @@ export class SyncEngine {
         originalLink: headerMeta.originalLink,
         observedObjEditTime: doc.observedObjEditTime ?? null,
         bodyMarkdown: finalContent,
-        images: images.map((img) => ({
-          relativePath: `images/${path.basename(img.path)}`,
-          token: img.token,
-        })),
+        images: [
+          ...images.map((img) => ({
+            relativePath: `images/${path.basename(img.path)}`,
+            token: img.token,
+          })),
+          // Sheet float images join ir.images so renderDocumentMarkdown's
+          // requiredRelativePaths validation and the atomic commit cover them.
+          ...sheetMediaImages.map((img) => ({
+            relativePath: img.localRelPath,
+            token: img.token,
+          })),
+        ],
         attachments: attachments.map((att) => ({
           relativePath: `attachments/${path.basename(att.path)}`,
           name: att.name,
@@ -730,6 +759,13 @@ export class SyncEngine {
         extraFiles.push({
           relativePath: relativeDir ? `${relativeDir}/images/${name}` : `images/${name}`,
           absoluteSource: img.path,
+        });
+      }
+      for (const img of sheetMediaImages) {
+        const name = path.basename(img.localPath);
+        extraFiles.push({
+          relativePath: relativeDir ? `${relativeDir}/images/${name}` : `images/${name}`,
+          absoluteSource: img.localPath,
         });
       }
       for (const att of attachments) {
@@ -834,7 +870,7 @@ export class SyncEngine {
       localMdPath,
       cloudModifiedTime: doc.cloudModifiedTime,
       size: finalContent.length,
-      imagesCount: images.length,
+      imagesCount: images.length + sheetMediaImages.length,
       attachmentsCount: attachments.length,
       sheetsCount: sheets.length,
     };
@@ -1465,12 +1501,25 @@ export class SyncEngine {
    * Export every sub-sheet CSV into a staging directory only.
    * Does NOT write into the knowledge base and does NOT touch sheet_sheets —
    * those DB rows are written only after atomic file commit succeeds.
+   *
+   * Per sub-sheet float-image handling: probe metadata (soft-fail, see
+   * sheet-media.probeSheetFloatImages), three-tier download into
+   * stagingDocDir/images/, then enrich the CSV cells with local image links.
+   * A download failure (listed but undownloadable) throws and aborts the
+   * document — same contract as docx media: never advance the synced
+   * baseline while resources are missing.
    */
   private async exportSheetsToStaging(
     sheetToken: string,
     stagingDocDir: string,
     docname: string,
-  ): Promise<Array<{ sheetId: string; title: string; csvPath: string; csvRel: string }>> {
+  ): Promise<Array<{
+    sheetId: string;
+    title: string;
+    csvPath: string;
+    csvRel: string;
+    images: SheetMediaItem[];
+  }>> {
     const csvDataDir = path.join(stagingDocDir, `${docname}.csv-data`);
     fs.mkdirSync(csvDataDir, { recursive: true });
 
@@ -1479,6 +1528,7 @@ export class SyncEngine {
       title: string;
       csvPath: string;
       csvRel: string;
+      images: SheetMediaItem[];
     }> = [];
 
     const workbookInfo = await this.requireLarkCliClient().getWorkbookInfo(sheetToken);
@@ -1516,14 +1566,36 @@ export class SyncEngine {
           `csv-get 返回空内容: sheet="${sheet.sheet_name}" range=${range}`,
         );
       }
-      fs.writeFileSync(csvPath, csvText, 'utf-8');
+
+      // Float-image discovery + three-tier download into staging images/,
+      // then inject local references into the staged CSV cells.
+      const client = this.requireLarkCliClient();
+      const floatImages = await probeSheetFloatImages(client, {
+        spreadsheetToken: sheetToken,
+        sheetId: sheet.sheet_id,
+        sheetTitle: sheet.sheet_name,
+      });
+      const sheetImages = floatImages.length > 0
+        ? await downloadSheetMedia({
+            client,
+            floatImages,
+            imagesDir: path.join(stagingDocDir, 'images'),
+            subSheetTitle: sheet.sheet_name,
+          })
+        : [];
+
+      fs.writeFileSync(csvPath, annotateCsvWithImages(csvText, sheetImages), 'utf-8');
       exports.push({
         sheetId: sheet.sheet_id,
         title: sheet.sheet_name,
         csvPath,
         csvRel: `${docname}.csv-data/${safeTitle}.csv`,
+        images: sheetImages,
       });
-      console.info(`[SyncEngine] Staged sheet "${sheet.sheet_name}" at ${csvPath}`);
+      console.info(
+        `[SyncEngine] Staged sheet "${sheet.sheet_name}" at ${csvPath}` +
+          (sheetImages.length > 0 ? ` (+${sheetImages.length} float images)` : ''),
+      );
     }
 
     return exports;

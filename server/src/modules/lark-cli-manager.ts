@@ -29,6 +29,7 @@ import { promisify } from 'util';
 import {
   buildLarkCliEnvironment,
   findExecutableOnPath,
+  getNodeRuntimeCandidateDirectories,
   resolveLarkCliExecutable,
   type LarkCliAuthReadiness,
 } from './lark-cli-client.js';
@@ -141,6 +142,30 @@ function execErrorOutput(error: unknown): string {
 }
 
 /**
+ * 为 npm install 提供完备的 Node 运行时环境变量。
+ * 将 npm 所在目录及全平台 Node 候选目录（fnm, nvm, volta, pnpm, Homebrew 等）
+ * 注入到 PATH 中，确保即使在 Finder 启动的精简环境下，npm 内部调用 `node` 脚本也能顺利执行。
+ */
+function buildNpmExecutionEnvironment(
+  npmPath: string,
+  env: NodeJS.ProcessEnv = process.env,
+  homeDir: string = os.homedir(),
+  platform: NodeJS.Platform = process.platform,
+): NodeJS.ProcessEnv {
+  const pathKey = platform === 'win32' && env.Path ? 'Path' : 'PATH';
+  const currentPath = env[pathKey] ?? env.PATH ?? env.Path ?? '';
+  const entries = currentPath.split(path.delimiter).filter(Boolean);
+  const npmDir = path.dirname(path.resolve(npmPath));
+  const candidateDirs = getNodeRuntimeCandidateDirectories(homeDir, env, platform);
+
+  const nextPath = Array.from(
+    new Set([npmDir, ...entries, ...candidateDirs]),
+  ).join(path.delimiter);
+
+  return { ...env, [pathKey]: nextPath };
+}
+
+/**
  * 容错解析 device flow 的 `--no-wait --json` 输出。
  * 输出可能混有非 JSON 行（日志、ANSI）：截取首个 `{` 到末尾后 JSON.parse；
  * 失败再退一步截到末个 `}`，兼容 JSON 之后尾随日志行的情况。
@@ -224,19 +249,7 @@ export class LarkCliManager {
     const fromPath = findExecutableOnPath(names, env.PATH ?? env.Path);
     if (fromPath) return { available: true, path: fromPath };
 
-    const candidateDirectories = platform === 'win32'
-      ? [
-          env.APPDATA ? path.join(env.APPDATA, 'npm') : '',
-          env.LOCALAPPDATA ? path.join(env.LOCALAPPDATA, 'npm') : '',
-          path.join(homeDir, 'AppData', 'Roaming', 'npm'),
-        ].filter(Boolean)
-      : [
-          path.join(homeDir, '.local', 'node', 'bin'),
-          path.join(homeDir, '.local', 'bin'),
-          path.join(homeDir, '.npm-global', 'bin'),
-          '/opt/homebrew/bin',
-          '/usr/local/bin',
-        ];
+    const candidateDirectories = getNodeRuntimeCandidateDirectories(homeDir, env, platform);
     const fromCandidates = findExecutableOnPath(names, candidateDirectories.join(path.delimiter));
     if (fromCandidates) return { available: true, path: fromCandidates };
 
@@ -247,6 +260,13 @@ export class LarkCliManager {
    * 一键安装/更新（install 与 update 同命令，幂等）。全程 execFile + 参数
    * 数组；Windows 上 npm.cmd 需要经 shell 启动（与 execLarkCli 的
    * `.cmd` 处理一致），参数均为固定字面量，无注入面。
+   *
+   * 2026-09 鲁棒性增强：
+   * 1. 注入完整的 Node 运行时环境（buildLarkCliEnvironment），解决从 Finder
+   *    启动时 PATH 贫瘠导致 npm 找不到 `node` 的问题；
+   * 2. 权限不足（EACCES/EPERM）时自动回退到用户免权限目录 `~/.npm-global`；
+   * 3. 网络超时（ETIMEDOUT/fetch failed）时自动切换国内官方镜像重试；
+   * 4. 输出诊断信息细化，彻底消除无因 `npm_failed`。
    */
   async installOrUpdateLarkCli(): Promise<LarkCliInstallResult> {
     const npm = this.findNpm();
@@ -258,7 +278,16 @@ export class LarkCliManager {
       };
     }
 
+    const homeDir = this.discovery.homeDir ?? os.homedir();
+    const platform = this.discovery.platform ?? process.platform;
+    const execEnv = buildNpmExecutionEnvironment(
+      npm.path,
+      this.discovery.env ?? process.env,
+      homeDir,
+      platform,
+    );
     let rawOutput = '';
+
     try {
       const { stdout, stderr } = await execFileAsync(
         npm.path,
@@ -268,16 +297,71 @@ export class LarkCliManager {
           encoding: 'utf-8',
           windowsHide: true,
           shell: process.platform === 'win32',
+          env: execEnv,
         },
       );
       rawOutput = `${stdout}\n${stderr}`.trim();
-    } catch (error) {
-      return {
-        ok: false,
-        reason: 'npm_failed',
-        output: tailLines(execErrorOutput(error), INSTALL_OUTPUT_TAIL_LINES),
-        error: errorText(error),
-      };
+    } catch (firstError) {
+      const errOut = execErrorOutput(firstError);
+      const isPermissionDenied = /EACCES|EPERM|permission denied/i.test(errOut);
+      const isNetworkTimeout = /ETIMEDOUT|fetch failed|ECONNRESET|ENOTFOUND/i.test(errOut);
+
+      if (isNetworkTimeout) {
+        // 网络问题：尝试国内官方镜像源重试一次
+        try {
+          const { stdout, stderr } = await execFileAsync(
+            npm.path,
+            ['install', '-g', 'lark-cli@latest', '--registry=https://registry.npmmirror.com'],
+            {
+              timeout: NPM_INSTALL_TIMEOUT_MS,
+              encoding: 'utf-8',
+              windowsHide: true,
+              shell: process.platform === 'win32',
+              env: execEnv,
+            },
+          );
+          rawOutput = `${stdout}\n${stderr}`.trim();
+        } catch (mirrorError) {
+          return {
+            ok: false,
+            reason: 'npm_failed',
+            output: tailLines(execErrorOutput(mirrorError), INSTALL_OUTPUT_TAIL_LINES),
+            error: `npm 网络连接超时（尝试官方源与镜像源均失败）：${errorText(firstError)}`,
+          };
+        }
+      } else if (isPermissionDenied) {
+        // 权限问题：尝试安装至用户免权限目录 ~/.npm-global
+        const homeDir = this.discovery.homeDir ?? os.homedir();
+        const userPrefix = path.join(homeDir, '.npm-global');
+        try {
+          const { stdout, stderr } = await execFileAsync(
+            npm.path,
+            ['install', '-g', '--prefix', userPrefix, 'lark-cli@latest'],
+            {
+              timeout: NPM_INSTALL_TIMEOUT_MS,
+              encoding: 'utf-8',
+              windowsHide: true,
+              shell: process.platform === 'win32',
+              env: execEnv,
+            },
+          );
+          rawOutput = `${stdout}\n${stderr}\n(已自动切换至免权限目录: ${userPrefix})`.trim();
+        } catch (prefixError) {
+          return {
+            ok: false,
+            reason: 'npm_failed',
+            output: tailLines(execErrorOutput(prefixError), INSTALL_OUTPUT_TAIL_LINES),
+            error: `npm 全局安装权限不足（EACCES/EPERM），建议检查目录权限：${errorText(firstError)}`,
+          };
+        }
+      } else {
+        return {
+          ok: false,
+          reason: 'npm_failed',
+          output: tailLines(errOut, INSTALL_OUTPUT_TAIL_LINES),
+          error: errorText(firstError),
+        };
+      }
     }
 
     // 装完必须验证：npm 成功但 lark-cli 不可执行（PATH 缺失/损坏安装）

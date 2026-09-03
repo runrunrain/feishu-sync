@@ -59,6 +59,7 @@ module.exports = {
     output: path.resolve(outputDir),
     buildResources: "build",
   },
+  compression: "maximum",
   files: [
     "package.json",
     "dist/**",
@@ -66,8 +67,26 @@ module.exports = {
     "server/package.json",
     "server/dist/**",
     "server/node_modules/**",
+    "!node_modules/**",
     "!server/src/**",
     "!server/__tests__/**",
+    "!server/tests/**",
+    "!server/node_modules/better-sqlite3/deps/**",
+    "!server/node_modules/better-sqlite3/src/**",
+    "!server/node_modules/better-sqlite3/build/Release/obj/**",
+    "!server/node_modules/better-sqlite3/build/Release/obj.target/**",
+    "!server/node_modules/better-sqlite3/build/Release/*.a",
+    "!server/node_modules/better-sqlite3/build/*.target.mk",
+    "!server/node_modules/openai/src/**",
+    "!server/node_modules/**/*.md",
+    "!server/node_modules/**/*.d.ts",
+    "!server/node_modules/**/*.d.ts.map",
+    "!server/node_modules/**/*.js.map",
+    "!server/node_modules/**/test/**",
+    "!server/node_modules/**/tests/**",
+    "!server/node_modules/**/example/**",
+    "!server/node_modules/**/examples/**",
+    "!server/node_modules/**/docs/**",
     "!**/.env",
     "!**/.env.*",
     "!**/*.map",
@@ -78,7 +97,6 @@ module.exports = {
   asar: true,
   asarUnpack: [
     "server/**",
-    "**/*.node",
   ],
   extraResources: [
     {
@@ -116,6 +134,7 @@ module.exports = {
     ],
     category: "public.app-category.productivity",
     artifactName: "FeishuSync-${version}-${arch}.${ext}",
+    electronLanguages: ["zh_CN", "zh_TW", "en"],
     // Local builds are fully ad-hoc signed so macOS sees one internally
     // consistent bundle instead of the partially signed Electron template.
     // Release builds let electron-builder select/import a Developer ID

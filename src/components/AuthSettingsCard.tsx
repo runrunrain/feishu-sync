@@ -289,17 +289,23 @@ export function AuthSettingsCard() {
         {/* ── 更新结果反馈（已就绪态的「更新 lark-cli」） ──────────── */}
         {ready && setup.installResult && !setup.installing && (
           <div
-            className={`p-3 rounded-md border ${
+            className={`p-3 rounded-md border space-y-2 ${
               setup.installResult.ok
                 ? 'border-jade/30 bg-jade/5 text-jade'
                 : 'border-seal-2/30 bg-seal-2/5 text-seal-2'
             }`}
           >
-            <p className="text-sm">
+            <p className="text-sm font-medium">
               {setup.installResult.ok
                 ? `lark-cli 已更新到 ${setup.installResult.version || '最新版本'}`
                 : `更新失败（${setup.installResult.reason ?? '未知原因'}），可稍后重试`}
             </p>
+            {!setup.installResult.ok && (setup.installResult.error || setup.installResult.output) && (
+              <pre className="max-h-32 overflow-auto text-[11px] font-mono text-ink-faint bg-paper border border-line rounded p-2 whitespace-pre-wrap">
+                {setup.installResult.error ? `${setup.installResult.error}\n` : ''}
+                {setup.installResult.output}
+              </pre>
+            )}
           </div>
         )}
 
