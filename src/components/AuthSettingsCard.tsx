@@ -155,7 +155,7 @@ export function AuthSettingsCard() {
         {authStatus?.larkCliVersion && (
           <div className="flex items-center justify-between py-1.5 border-b border-line">
             <span className="text-sm text-ink-soft">lark-cli 版本</span>
-            <span className="text-sm font-mono text-seal bg-seal/10 px-2 py-0.5 rounded">
+            <span className="text-sm font-mono text-jade bg-jade/10 px-2 py-0.5 rounded">
               {authStatus.larkCliVersion}
             </span>
           </div>
