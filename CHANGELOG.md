@@ -6,6 +6,14 @@
 
 ---
 
+## [0.3.11] - 2026-09-03
+
+### Fixed（fix）
+
+- **零散归档文档补全覆盖**：custom folder（_custom/）媒体核对候选集从仅 sheet 扩展为全部 synced 归档文档——零散 docx/slides 的白板与媒体残留占位标签现在也参与本地扫描（local-only 即生效，零 API）；sheet 云端清单核对仍限「立即检测」full 作用域。检测→落库 pending_modified→变更列表→归档同步的完整闭环对全类型零散文档生效。
+
+---
+
 ## [0.3.10] - 2026-09-03
 
 ### Fixed（fix）
