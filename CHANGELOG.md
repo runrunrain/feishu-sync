@@ -6,6 +6,27 @@
 
 ---
 
+## [0.3.9] - 2026-09-03
+
+### 概要
+v0.3.9：媒体完整性核对（media-gap）落地与分层限流防护，修复 lark-cli 1.0.89 ndjson 契约断裂导致的检测㐫疾，历史欠账图片一次性补齐。
+
+### Added（feat）
+
+- **媒体完整性核对（media-gap 检测通道）**：变更检测不再纯依赖 obj_edit_time——本地扫描 docx 白板/媒体残留占位标签（零 API），主动检测时核对 sheet 云端浮动图片清单与本地引用，历史欠账文档重新进入同步管线；前端变更列表新增「图片补齐」徽标。
+- **分层限流防护**：轮询默认 local-only（零云端调用）；「立即检测」显式 full 作用域；workbook-info 结果 5 分钟缓存，消除背靠背核对触发飞书账号级 99991400 限流的问题。
+- **媒体补齐运维脚本**：server/scripts/verify-media-gap.ts（只读核查）与 repair-media-gaps.ts（dry-run/apply 补齐）。
+
+### Fixed（fix）
+
+- **lark-cli ≥1.0.89 ndjson 裸实体流解析缺陷（真实事故）**：wiki +node-list 的裸节点流被页合并器坍缩，BFS 返回空树却报 complete=true，导致 146 个 synced 文档被误标删除候选（missing_candidate）。解析层新增裸实体流聚合（data.records），listWikiNodes 双代际输出兼容；missing_candidate 状态机自动恢复验证通过。
+
+### Optimized（ui）
+
+- **版本号按钮合并至左上角**：移除总览页状态栏冗余版本胶囊，应用标题下方常驻紧凑版本按钮（新版本提醒/下载进度/一键检查更新），顶部导航更简洁。
+
+---
+
 ## [0.3.8] - 2026-09-03
 
 ### 概要
