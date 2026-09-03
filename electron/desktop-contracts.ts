@@ -84,6 +84,13 @@ export interface DesktopAPI {
    */
   openExternal: (url: string) => Promise<DesktopActionResult>;
 
+  /** 在系统文件管理器中定位并选中文件（绝对路径；父目录则直接打开）。 */
+  revealInFolder: (absolutePath: string) => Promise<DesktopActionResult>;
+
+  /** 界面缩放（zoomLevel，夹在 -3..3）；高分屏文本模糊时微调。 */
+  setZoomLevel: (level: number) => void;
+  getZoomLevel: () => number;
+
   /**
    * Auto-start operations namespace (M4)
    */

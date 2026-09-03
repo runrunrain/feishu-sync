@@ -387,6 +387,9 @@ ipcMain.handle('desktop:reveal-in-folder', async (_event, targetPath: unknown) =
   // 2026-09 修复：「在文件夹中打开」此前误用 open-data-directory（打开
   // 数据目录而非文档所在目录）。showItemInFolder 在 Win 资源管理器/
   // mac Finder 中定位并选中文件；传父目录则直接打开。
+  // 2026-09 二次修复：Electron showItemInFolder 对不存在路径**静默无动作**
+  // （不抛错），用户表现为「按钮无效」。现在显式校验存在性：文件在→定位
+  // 选中；文件不在但目录在→打开目录；都不在→返回明确错误供前端 toast。
   if (typeof targetPath !== 'string' || targetPath.length === 0) {
     return { ok: false, code: 'invalid-path', error: 'Path must be a non-empty string' };
   }
@@ -394,8 +397,32 @@ ipcMain.handle('desktop:reveal-in-folder', async (_event, targetPath: unknown) =
     return { ok: false, code: 'invalid-path', error: 'Path must be absolute' };
   }
   try {
-    shell.showItemInFolder(targetPath);
-    return { ok: true };
+    const normalized = path.resolve(targetPath);
+    if (fs.existsSync(normalized)) {
+      const stat = fs.statSync(normalized);
+      if (stat.isFile()) {
+        shell.showItemInFolder(normalized);
+      } else {
+        // 目录：直接打开
+        const result = await shell.openPath(normalized);
+        if (result) {
+          return { ok: false, code: 'reveal-in-folder-failed', error: sanitizeDesktopError(result) };
+        }
+      }
+      return { ok: true };
+    }
+    // 文件不在但父目录在：打开父目录（同步后文件被移走/改名时的友好降级）
+    const parent = path.dirname(normalized);
+    if (fs.existsSync(parent)) {
+      const result = await shell.openPath(parent);
+      if (!result) return { ok: true, code: 'fallback-parent' };
+      return { ok: false, code: 'reveal-in-folder-failed', error: sanitizeDesktopError(result) };
+    }
+    return {
+      ok: false,
+      code: 'path-not-found',
+      error: `文件或目录不存在：${normalized}`,
+    };
   } catch (error) {
     return { ok: false, code: 'reveal-in-folder-failed', error: sanitizeDesktopError(error) };
   }

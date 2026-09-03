@@ -388,22 +388,32 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
     setSelectedToken(null);
   };
 
-  const handleOpenFolder = (localPath: string) => {
+  const handleOpenFolder = async (localPath: string) => {
     // 2026-09 修复：此前误调 openDataDirectory（打开数据目录而非文档所在
     // 目录）。现在把相对 local_path 拼上 knowledgeBaseRoot 得绝对路径，
     // 走 reveal-in-folder（Win 资源管理器 / mac Finder 定位选中）。
+    // 二次修复：local_path 存在 legacy 绝对路径形态（snapshot P2-05 前的
+    // 旧库），绝对时直接用不再拼前缀；后端返回错误时明确 toast，不再
+    // 静默无反馈。
     if (typeof window !== 'undefined' && window.desktop?.revealInFolder) {
-      const kbRoot = (config?.knowledgeBaseRoot ?? '').replace(/[\\/]+$/, '');
-      if (!kbRoot) {
+      const isAbsolute = /^(?:[A-Za-z]:[\\/]|\\\\|\/)/.test(localPath);
+      const abs = isAbsolute
+        ? localPath
+        : `${(config?.knowledgeBaseRoot ?? '').replace(/[\\/]+$/, '')}/${localPath.replace(/^[\\/]+/, '')}`;
+      if (!isAbsolute && !config?.knowledgeBaseRoot) {
         toast.push({ type: 'warning', message: '本地根目录未配置' });
         return;
       }
-      // Win/mac 资源管理器都接受正斜杠；local_path 是相对 kbRoot 的 POSIX 风格路径。
-      const abs = `${kbRoot}/${localPath.replace(/^[\\/]+/, '')}`;
-      window.desktop.revealInFolder(abs).catch((err) => {
+      try {
+        const res = await window.desktop.revealInFolder(abs);
+        if (!res.ok) {
+          appLogger.error('dashboard', 'revealInFolder rejected', res);
+          toast.push({ type: 'error', message: '打开文件夹失败', hint: res.error });
+        }
+      } catch (err) {
         appLogger.error('dashboard', 'revealInFolder failed', err);
         toast.push({ type: 'error', message: '打开文件夹失败' });
-      });
+      }
       return;
     }
     // 非 desktop 环境（浏览器 dev）退化为提示。
