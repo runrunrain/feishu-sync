@@ -23,12 +23,13 @@ import { detectChanges, detectChangesAll, getStoredMappingDiff } from '../api/cl
 import type { ChangedDocument, DiffReport, SheetSub } from '../types';
 import { isUsableWikiUrl } from '../utils/wikiUrl';
 
-type Tab = 'all' | 'added' | 'modified' | 'deleted';
+type Tab = 'all' | 'added' | 'modified' | 'mediaGap' | 'deleted';
 
 const TAB_LABEL: Record<Tab, string> = {
   all: '全部',
   added: '新增',
   modified: '已修改',
+  mediaGap: '图片缺失待修复',
   deleted: '已删除',
 };
 
@@ -160,9 +161,12 @@ export function ChangeListPanel({
   const [tab, setTab] = useState<Tab>('all');
   const [diff, setDiff] = useState<DiffReport | null>(initialDiff ?? null);
   const [loading, setLoading] = useState(false);
+  const [detecting, setDetecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [sheetSubs] = useState<Record<string, SheetSub[]>>({});
   const toast = useToast();
+  const inFlightDetect = useRef(false);
+  const inFlightStored = useRef(false);
 
   // Effective root set for diff fetching. Multi-root aggregation only kicks
   // in when the caller provides MORE THAN ONE valid URL; otherwise we fall
@@ -174,16 +178,59 @@ export function ChangeListPanel({
     return valid.length > 1 ? valid : null;
   }, [watchedRootUrls]);
 
-  const fetchDiff = async () => {
+  /**
+   * 读取本地 SQLite 持久化的存量 diff，快速返回，不触发云端全量遍历。
+   * 用于初次挂载、切页激活（reloadSignal）以及数据变更广播（onDiffChanged）。
+   */
+  const loadStoredDiff = async () => {
+    if (inFlightStored.current) return;
+    inFlightStored.current = true;
     setLoading(true);
     setError(null);
     try {
       let report: DiffReport;
       if (multiRootUrls) {
-        // 2026-09 修复：「立即检测」此前只重读 cached 存量 diff（cached=1
-        // 从不触发云遍历），按钮名不副实——Win 用户轮询不频繁时感知为
-        // 「失效」。现在先发真实检测（changes-all 服务端跑元数据比对 +
-        // 媒体完整性核对 full 作用域），完成后再读持久化结果。
+        const { report: aggregated, failedRoots } = await fetchMultiRootDiff(multiRootUrls);
+        report = aggregated;
+        if (failedRoots.length > 0) {
+          toast.push({
+            type: 'warning',
+            message: `${failedRoots.length} 个子树读取存量差异失败`,
+            hint: failedRoots.map((u) => u.split('/').pop() ?? u).join(', '),
+          });
+        }
+      } else {
+        if (!rootUrl) {
+          setLoading(false);
+          return;
+        }
+        report = await getStoredMappingDiff(rootUrl);
+      }
+      setDiff(report);
+      onRefresh?.();
+      onDiffChange?.(report);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '加载差异失败';
+      setError(msg);
+      appLogger.error('change-list', 'loadStoredDiff failed', err);
+    } finally {
+      setLoading(false);
+      inFlightStored.current = false;
+    }
+  };
+
+  /**
+   * 主动触发变更检测（点击「立即检测」）：发起真实云端遍历（changes-all / detectChanges），
+   * 包含元数据比对与媒体完整性核对。期间按钮显示检测中状态并防止并发重复触发。
+   */
+  const handleDetect = async () => {
+    if (inFlightDetect.current) return;
+    inFlightDetect.current = true;
+    setDetecting(true);
+    setError(null);
+    try {
+      let report: DiffReport;
+      if (multiRootUrls) {
         await detectChangesAll();
         const { report: aggregated, failedRoots } = await fetchMultiRootDiff(multiRootUrls);
         report = aggregated;
@@ -193,14 +240,24 @@ export function ChangeListPanel({
             message: `${failedRoots.length} 个子树检测失败`,
             hint: failedRoots.map((u) => u.split('/').pop() ?? u).join(', '),
           });
+        } else {
+          toast.push({
+            type: 'success',
+            message: '变更检测完成',
+          });
         }
       } else {
         if (!rootUrl) {
-          setLoading(false);
+          setDetecting(false);
+          inFlightDetect.current = false;
           return;
         }
         await detectChanges(rootUrl);
         report = await getStoredMappingDiff(rootUrl);
+        toast.push({
+          type: 'success',
+          message: '变更检测完成',
+        });
       }
       setDiff(report);
       onRefresh?.();
@@ -208,32 +265,26 @@ export function ChangeListPanel({
     } catch (err) {
       const msg = err instanceof Error ? err.message : '检测失败';
       setError(msg);
-      appLogger.error('change-list', 'getStoredMappingDiff failed', err);
+      appLogger.error('change-list', 'handleDetect failed', err);
       toast.push({
         type: 'error',
         message: '检测失败',
         hint: msg,
       });
     } finally {
-      setLoading(false);
+      setDetecting(false);
+      inFlightDetect.current = false;
     }
   };
 
   // First-load behaviour: prefer parent-supplied diff; else fetch once when
-  // rootUrl becomes ready. P1-2 (谛听): previously a useMemo with a fetch side
-  // effect — useMemo is not guaranteed to run once (React 18 StrictMode may
-  // double-invoke), which could trigger duplicate fetches. Moved to useEffect
-  // with a guard ref so the initial fetch fires exactly once per rootUrl.
-  //
-  // v0.2.0 sync-state-timeout-fix: the guard key now also reflects the
-  // multi-root list signature, so adding/removing a watchedRoot re-triggers
-  // the diff fetch as expected.
+  // rootUrl becomes ready.
   const initialFetchDoneFor = useRef<string | null>(null);
   const guardKey = multiRootUrls ? `multi:${multiRootUrls.join('|')}` : (rootUrl ?? '');
   useEffect(() => {
     if (!diff && guardKey && !loading && !error && initialFetchDoneFor.current !== guardKey) {
       initialFetchDoneFor.current = guardKey;
-      void fetchDiff();
+      void loadStoredDiff();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [diff, guardKey, loading, error]);
@@ -245,53 +296,77 @@ export function ChangeListPanel({
   useEffect(() => {
     if (lastReloadSignal.current === reloadSignal) return;
     lastReloadSignal.current = reloadSignal;
-    if (guardKey && !loading) {
-      void fetchDiff();
+    if (guardKey && !loading && !detecting) {
+      void loadStoredDiff();
     }
-    // fetchDiff intentionally closes over the current root configuration.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [reloadSignal, guardKey]);
+  }, [reloadSignal, guardKey, loading, detecting]);
 
-  // 跨视图实时刷新（2026-06 修复）：同步页常驻挂载（v0.2.9），初始
-  // fetch 之后若在总览侧点了「立即检测」或完成了一次同步，本面板不会
-  // 自动重读已持久化的 diff，用户只能手动点本面板的「立即检测」。订阅
-  // 全局 diff-changed 事件后，任何位置的写路径完成都会让本列表重拉
-  // cached diff（本地读，无云遍历）。与 reloadSignal 语义一致：加载中
-  // 到达的事件被合并跳过（in-flight fetch 返回后即包含最新状态）。
+  // 跨视图实时刷新：仅拉取 SQLite 存量缓存 diff（本地读，绝不触发云端遍历）。
+  // 彻底阻断 detectChangesAll -> emitDiffChanged -> 递归云端全量检测的循环死锁。
   useEffect(() => {
     return onDiffChanged((source) => {
-      if (!guardKey || loading) return;
-      appLogger.info('change-list', 'diff store changed; reloading list', { source });
-      void fetchDiff();
+      if (!guardKey || loading || detecting) return;
+      appLogger.info('change-list', 'diff store changed; reloading stored list', { source });
+      void loadStoredDiff();
     });
-    // fetchDiff intentionally closes over the current root configuration.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [guardKey, loading]);
+  }, [guardKey, loading, detecting]);
 
   const grouped = useMemo(() => {
-    if (!diff) return { added: [], modified: [], deleted: [] as ChangedDocument[] };
+    if (!diff) {
+      return {
+        added: [],
+        modified: [],
+        mediaGap: [],
+        deleted: [] as ChangedDocument[],
+      };
+    }
+    const modifiedList: ChangedDocument[] = [];
+    const mediaGapList: ChangedDocument[] = [];
+    for (const doc of diff.modified) {
+      if (doc.mediaGapReason) {
+        mediaGapList.push(doc);
+      } else {
+        modifiedList.push(doc);
+      }
+    }
     return {
       added: diff.added,
-      modified: diff.modified,
+      modified: modifiedList,
+      mediaGap: mediaGapList,
       deleted: diff.deleted,
     };
   }, [diff]);
 
   const visibleChanges = useMemo(() => {
     if (tab === 'all') {
-      return [...grouped.added, ...grouped.modified, ...grouped.deleted];
+      return [...grouped.added, ...grouped.modified, ...grouped.mediaGap, ...grouped.deleted];
     }
     return grouped[tab];
   }, [tab, grouped]);
 
-  const selectableChanges = useMemo(
-    () => [...grouped.added, ...grouped.modified],
-    [grouped],
-  );
+  // 本批需求契约：「全选」默认不勾选「图片缺失待修复」组；该组有自己的组内全选。
+  const currentSelectable = useMemo(() => {
+    if (tab === 'mediaGap') {
+      return grouped.mediaGap;
+    }
+    if (tab === 'added') {
+      return grouped.added;
+    }
+    if (tab === 'modified') {
+      return grouped.modified;
+    }
+    if (tab === 'deleted') {
+      return [];
+    }
+    // tab === 'all': 全选默认仅勾选 added + modified，不含 mediaGap
+    return [...grouped.added, ...grouped.modified];
+  }, [tab, grouped]);
 
   const allSelected =
-    selectableChanges.length > 0 &&
-    selectableChanges.every((c) => selectedTokens.includes(c.objToken));
+    currentSelectable.length > 0 &&
+    currentSelectable.every((c) => selectedTokens.includes(c.objToken));
 
   const handleToggle = (objToken: string) => {
     const next = selectedTokens.includes(objToken)
@@ -301,18 +376,23 @@ export function ChangeListPanel({
   };
 
   const handleSelectAll = () => {
+    const selectableTokens = currentSelectable.map((c) => c.objToken);
     if (allSelected) {
-      onSelectionChange([]);
+      onSelectionChange(selectedTokens.filter((t) => !selectableTokens.includes(t)));
     } else {
-      onSelectionChange(selectableChanges.map((c) => c.objToken));
+      onSelectionChange(Array.from(new Set([...selectedTokens, ...selectableTokens])));
     }
   };
 
   const handleInvert = () => {
-    const inverted = selectableChanges
-      .map((c) => c.objToken)
-      .filter((t) => !selectedTokens.includes(t));
-    onSelectionChange(inverted);
+    const selectableTokens = currentSelectable.map((c) => c.objToken);
+    const next = selectedTokens.filter((t) => !selectableTokens.includes(t));
+    for (const t of selectableTokens) {
+      if (!selectedTokens.includes(t)) {
+        next.push(t);
+      }
+    }
+    onSelectionChange(next);
   };
 
   const handleBatchSync = () => {
@@ -372,7 +452,7 @@ export function ChangeListPanel({
         <CardBody>
           <div className="flex flex-col items-center gap-3 py-14">
             <RefreshCw className="w-8 h-8 text-seal animate-spin" />
-            <p className="text-sm text-ink-soft">扫描文档中…</p>
+            <p className="text-sm text-ink-soft">加载存量变更中…</p>
           </div>
         </CardBody>
       </Card>
@@ -391,7 +471,7 @@ export function ChangeListPanel({
             icon={<AlertCircle className="w-10 h-10 text-seal-2" />}
             title="检测失败"
             description={error}
-            action={{ label: '重试', onClick: fetchDiff }}
+            action={{ label: '重试', onClick: loadStoredDiff }}
           />
         </CardBody>
       </Card>
@@ -400,25 +480,41 @@ export function ChangeListPanel({
 
   // ----- Empty state -----
   const totalChanges =
-    grouped.added.length + grouped.modified.length + grouped.deleted.length;
+    grouped.added.length +
+    grouped.modified.length +
+    grouped.mediaGap.length +
+    grouped.deleted.length;
   if (totalChanges === 0) {
     return (
       <Card variant="elevated">
         <CardHeader>
           <div className="flex items-center justify-between">
             <h2 className="text-lg font-kai font-medium text-ink">变更列表</h2>
-            <Button size="sm" variant="secondary" onClick={fetchDiff} loading={loading}>
-              <RefreshCw className="w-4 h-4" />
-              立即检测
-            </Button>
+            <div className="flex items-center gap-2">
+              {detecting && (
+                <span className="text-xs text-seal font-sans-ui animate-pulse">
+                  检测中，首次全量检测可能需要几分钟…
+                </span>
+              )}
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={handleDetect}
+                loading={detecting}
+                title={detecting ? '检测中，首次全量检测可能需要几分钟' : '立即检测飞书知识库变更'}
+              >
+                <RefreshCw className={`w-4 h-4 ${detecting ? 'animate-spin' : ''}`} />
+                {detecting ? '检测中…' : '立即检测'}
+              </Button>
+            </div>
           </div>
         </CardHeader>
         <CardBody>
           <EmptyState
             icon={<CheckSquare className="w-10 h-10 text-jade" />}
             title="一切就绪"
-            description="无未同步变更。所有文档均为最新。"
-            action={{ label: '立即检测', onClick: fetchDiff }}
+            description={detecting ? '正在扫描飞书知识库变更，请稍候…' : '无未同步变更。所有文档均为最新。'}
+            action={{ label: detecting ? '检测中…' : '立即检测', onClick: handleDetect }}
           />
         </CardBody>
       </Card>
@@ -432,36 +528,41 @@ export function ChangeListPanel({
         <div className="flex items-center justify-between gap-3">
           <h2 className="text-lg font-kai font-medium text-ink">变更列表</h2>
           <div className="flex items-center gap-2">
+            {detecting && (
+              <span className="text-xs text-seal font-sans-ui animate-pulse">
+                检测中，首次全量检测可能需要几分钟…
+              </span>
+            )}
             <span className="text-xs text-ink-faint font-sans-ui">
               共 {totalChanges} 项变更
               {diff && diff.checkedAt && (
                 <> · {new Date(diff.checkedAt).toLocaleString('zh-CN', { hour12: false })}</>
               )}
             </span>
-            <Button size="sm" variant="secondary" onClick={fetchDiff} loading={loading}>
-              <RefreshCw className="w-4 h-4" />
-              立即检测
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={handleDetect}
+              loading={detecting}
+              title={detecting ? '检测中，首次全量检测可能需要几分钟' : '立即检测飞书知识库变更'}
+            >
+              <RefreshCw className={`w-4 h-4 ${detecting ? 'animate-spin' : ''}`} />
+              {detecting ? '检测中…' : '立即检测'}
             </Button>
           </div>
         </div>
       </CardHeader>
       <CardBody className="space-y-4">
-        {/*
-          变更列表内部布局重构（2026-06-19）：
-          - space-y-3→space-y-4：卡片内部建立清晰的"次级 16px 节奏"
-          - Tab 按钮 px-3 py-1→px-3.5 py-1.5 + gap-1.5→gap-2：状态切换更舒展
-          - 列表项 space-y-2→space-y-2.5 + 空态 py-12→py-14
-        */}
         {/* Tabs */}
-        <div className="flex items-center gap-2 border-b border-line pb-3">
-          {(['all', 'added', 'modified', 'deleted'] as Tab[]).map((t) => {
+        <div className="flex items-center gap-2 border-b border-line pb-3 overflow-x-auto">
+          {(['all', 'added', 'modified', 'mediaGap', 'deleted'] as Tab[]).map((t) => {
             const count = t === 'all' ? totalChanges : grouped[t].length;
             return (
               <button
                 key={t}
                 type="button"
                 onClick={() => setTab(t)}
-                className={`px-3.5 py-1.5 rounded text-xs font-sans-ui border transition-colors ${
+                className={`px-3.5 py-1.5 rounded text-xs font-sans-ui border transition-colors whitespace-nowrap ${
                   tab === t
                     ? 'bg-seal/10 text-seal border-seal/30'
                     : 'bg-paper text-ink-soft border-line hover:bg-paper-2'
@@ -475,7 +576,7 @@ export function ChangeListPanel({
 
         <BatchActionBar
           selectedCount={selectedTokens.length}
-          totalSelectable={selectableChanges.length}
+          totalSelectable={currentSelectable.length}
           hasDeleted={grouped.deleted.length > 0 && tab !== 'deleted'}
           onSelectAll={handleSelectAll}
           onInvert={handleInvert}
@@ -483,6 +584,42 @@ export function ChangeListPanel({
           onBatchSkip={handleBatchSkip}
           allSelected={allSelected}
         />
+
+        {/* 提示条：当全部 tab 包含图片缺失项时，提示用户并提供快速组内全选入口 */}
+        {grouped.mediaGap.length > 0 && tab === 'all' && (
+          <div className="flex items-center justify-between px-3.5 py-2 rounded border border-seal/20 bg-seal/5 text-xs font-sans-ui text-ink-soft">
+            <div className="flex items-center gap-2">
+              <span className="w-1.5 h-1.5 rounded-full bg-seal shrink-0" />
+              <span>检测到 {grouped.mediaGap.length} 项「图片缺失待修复」文档（默认不随「全选」勾选）</span>
+            </div>
+            <div className="flex items-center gap-2.5">
+              <button
+                type="button"
+                onClick={() => {
+                  const mediaGapTokens = grouped.mediaGap.map((d) => d.objToken);
+                  const allMediaGapSelected = mediaGapTokens.every((t) => selectedTokens.includes(t));
+                  if (allMediaGapSelected) {
+                    onSelectionChange(selectedTokens.filter((t) => !mediaGapTokens.includes(t)));
+                  } else {
+                    onSelectionChange(Array.from(new Set([...selectedTokens, ...mediaGapTokens])));
+                  }
+                }}
+                className="text-seal hover:text-seal-2 font-medium underline underline-offset-2 transition-colors cursor-pointer"
+              >
+                {grouped.mediaGap.every((d) => selectedTokens.includes(d.objToken))
+                  ? '取消勾选该组'
+                  : '勾选图片缺失组'}
+              </button>
+              <button
+                type="button"
+                onClick={() => setTab('mediaGap')}
+                className="text-ink-soft hover:text-ink transition-colors cursor-pointer"
+              >
+                查看
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* List */}
         {visibleChanges.length === 0 ? (

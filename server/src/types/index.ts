@@ -304,6 +304,18 @@ export interface DocumentRecord {
   observedObjEditTime?: number | null;
   syncedObjEditTime?: number | null;
   syncState?: SyncState;
+  /**
+   * Why a pending_modified row is pending, when the reason is NOT a cloud
+   * edit. Currently only media-gap detection writes this (values are the
+   * concrete MediaGapReason: 'local_placeholder_tags' |
+   * 'sheet_cloud_images_missing'). Semantics:
+   *   - polling (observed == synced) must NOT wash the row back to synced;
+   *   - a genuine cloud edit (observed > synced), a successful sync
+   *     (markDocumentSynced) or a custom-folder ownership move clears it;
+   *   - stored diff / detect responses project it as ChangedDocument
+   *     .mediaGapReason so the UI can group media-gap docs separately.
+   */
+  pendingReason?: string | null;
   watchedRootId?: string | null;
   /** Portable, POSIX-style path. P2 owns its full backfill. */
   localRelPath?: string | null;
@@ -410,6 +422,17 @@ export interface ChangedDocument {
   customFolderId?: string | null;
   /** 媒体完整性核对产出的补齐信号，非云端编辑。 */
   mediaGapReason?: 'local_placeholder_tags' | 'sheet_cloud_images_missing';
+}
+
+/**
+ * Discriminant for DocumentRecord.pendingReason values that describe a
+ * media-gap repair pending. Guards projections so any future non-media
+ * pending_reason value can never be mis-badged as a media-gap doc.
+ */
+export function isMediaGapReason(
+  value: unknown,
+): value is NonNullable<ChangedDocument['mediaGapReason']> {
+  return value === 'local_placeholder_tags' || value === 'sheet_cloud_images_missing';
 }
 
 export interface SyncedDocument {

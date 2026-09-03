@@ -250,6 +250,50 @@ describe('MappingService.computeDiff', () => {
     expect(report.checkedAt).toBe('2026-07-21T02:00:00.000Z');
   });
 
+  it('projects mediaGapReason for pending_reason rows in the stored diff (media-gap grouping survives rebuild)', () => {
+    const rootUrl = 'https://example.feishu.cn/wiki/rootA';
+    store.rows.set('GAP', makeDoc({
+      objToken: 'GAP',
+      title: '图片缺失文档',
+      watchedRootUrl: rootUrl,
+      watchedRootId: 'rootA',
+      syncState: 'pending_modified',
+      status: 'changed',
+      pendingReason: 'local_placeholder_tags',
+      observedObjEditTime: 300,
+      lastSeenAt: '2026-09-01T01:00:00.000Z',
+    }));
+    store.rows.set('NORMAL', makeDoc({
+      objToken: 'NORMAL',
+      watchedRootUrl: rootUrl,
+      watchedRootId: 'rootA',
+      syncState: 'pending_modified',
+      observedObjEditTime: 400,
+      lastSeenAt: '2026-09-01T02:00:00.000Z',
+    }));
+    store.rows.set('CUSTOM_GAP', makeDoc({
+      objToken: 'CUSTOM_GAP',
+      title: '归档图片缺失文档',
+      syncState: 'pending_modified',
+      status: 'changed',
+      pendingReason: 'sheet_cloud_images_missing',
+      customFolderId: 'folder-1',
+    }));
+
+    const report = svc.getStoredDiff(rootUrl);
+
+    const gap = report.modified.find((item) => item.objToken === 'GAP');
+    const customGap = report.modified.find((item) => item.objToken === 'CUSTOM_GAP');
+    const normal = report.modified.find((item) => item.objToken === 'NORMAL');
+    expect(gap?.changeType).toBe('modified');
+    expect(gap?.mediaGapReason).toBe('local_placeholder_tags');
+    expect(customGap?.changeType).toBe('modified');
+    expect(customGap?.customFolderId).toBe('folder-1');
+    expect(customGap?.mediaGapReason).toBe('sheet_cloud_images_missing');
+    // Rows without the marker keep grouping gracefully as ordinary modified.
+    expect(normal?.mediaGapReason).toBeUndefined();
+  });
+
   it('excludes Feishu-side pending items from the recent-change diff', () => {
     const rootUrl = 'https://example.feishu.cn/wiki/rootA';
     store.rows.set('WAITING_FOR_ACCESS', makeDoc({

@@ -74,38 +74,76 @@ async function getBaseUrl(): Promise<string> {
   return '';
 }
 
+export interface RequestOptions extends RequestInit {
+  timeoutMs?: number;
+}
+
 /**
  * Make an authenticated API request
  */
 async function request<T>(
   endpoint: string,
-  options: RequestInit = {}
+  options: RequestOptions = {}
 ): Promise<T> {
+  const { timeoutMs, signal: userSignal, ...fetchOptions } = options;
   const headers = await getApiHeaders();
   const baseUrl = await getBaseUrl();
   const url = `${baseUrl}${endpoint}`;
 
-  const response = await fetch(url, {
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      ...headers,
-      ...options.headers,
-    },
-  });
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  let signal: AbortSignal | undefined = userSignal ?? undefined;
 
-  if (!response.ok) {
-    let errorMessage = `HTTP ${response.status}: ${response.statusText}`;
-    try {
-      const errorData = await response.json();
-      errorMessage = errorData.error || errorMessage;
-    } catch {
-      // Ignore JSON parse errors
+  if (timeoutMs && timeoutMs > 0) {
+    const controller = new AbortController();
+    if (userSignal) {
+      if (userSignal.aborted) {
+        controller.abort(userSignal.reason);
+      } else {
+        userSignal.addEventListener('abort', () => controller.abort(userSignal.reason), { once: true });
+      }
     }
-    throw new APIError(errorMessage, response.status);
+    timeoutId = setTimeout(() => {
+      controller.abort(new DOMException(`请求超时（超过 ${Math.round(timeoutMs / 1000)} 秒）`, 'TimeoutError'));
+    }, timeoutMs);
+    signal = controller.signal;
   }
 
-  return response.json();
+  try {
+    const response = await fetch(url, {
+      ...fetchOptions,
+      signal,
+      headers: {
+        'Content-Type': 'application/json',
+        ...headers,
+        ...fetchOptions.headers,
+      },
+    });
+
+    if (!response.ok) {
+      let errorMessage = `HTTP ${response.status}: ${response.statusText}`;
+      try {
+        const errorData = await response.json();
+        errorMessage = errorData.error || errorMessage;
+      } catch {
+        // Ignore JSON parse errors
+      }
+      throw new APIError(errorMessage, response.status);
+    }
+
+    return await response.json();
+  } catch (err: any) {
+    if (
+      err?.name === 'TimeoutError' ||
+      (err instanceof DOMException && err.name === 'TimeoutError') ||
+      (signal?.aborted && !userSignal?.aborted)
+    ) {
+      const msg = err?.message || '请求超时';
+      throw new APIError(msg.includes('超时') ? msg : '请求超时，请检查网络或服务状态');
+    }
+    throw err;
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
 }
 
 /**
@@ -302,6 +340,12 @@ export async function completeDeviceAuth(
  */
 export type DetectionMode = 'fast' | 'full';
 
+export interface DetectChangesOptions {
+  mode?: DetectionMode;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}
+
 /**
  * `fast` is the normal metadata-only check. `full` is intentionally opt-in
  * and used only by the structural-repair action, where parent hierarchy must
@@ -309,11 +353,14 @@ export type DetectionMode = 'fast' | 'full';
  */
 export async function detectChanges(
   rootUrl: string,
-  options: { mode?: DetectionMode } = {},
+  options: DetectChangesOptions = {},
 ): Promise<ChangeDetectionResult> {
+  const { timeoutMs = 300_000, signal, mode } = options;
   const result = await request<ChangeDetectionResult>('/api/detect/changes', {
     method: 'POST',
-    body: JSON.stringify({ rootUrl, ...(options.mode ? { mode: options.mode } : {}) }),
+    body: JSON.stringify({ rootUrl, ...(mode ? { mode } : {}) }),
+    timeoutMs,
+    signal,
   });
   // 检测会推进 observed 基线并重写持久化 diff：广播事件让所有持有
   // diff 快照的视图（状态栏计数/变更列表/最近变更）重拉 cached diff。
@@ -352,11 +399,14 @@ export interface MultiRootDetectionResult {
  * which is the default in v0.2.0.
  */
 export async function detectChangesAll(
-  options: { mode?: DetectionMode } = {},
+  options: DetectChangesOptions = {},
 ): Promise<MultiRootDetectionResult> {
+  const { timeoutMs = 300_000, signal, mode } = options;
   const result = await request<MultiRootDetectionResult>('/api/detect/changes-all', {
     method: 'POST',
-    body: JSON.stringify(options.mode ? { mode: options.mode } : {}),
+    body: JSON.stringify(mode ? { mode } : {}),
+    timeoutMs,
+    signal,
   });
   emitDiffChanged('detect-all');
   return result;

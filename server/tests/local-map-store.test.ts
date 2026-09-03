@@ -365,6 +365,157 @@ describe('LocalMapStore runtime schema', () => {
   });
 });
 
+describe('LocalMapStore media-gap pending 持久标记（pending_reason）', () => {
+  const observe = (store: LocalMapStore, editTime: number | null, at: string) =>
+    store.recordCloudObservation({
+      objToken: 'doc-gap',
+      wikiNodeToken: 'node-gap',
+      objType: 'docx',
+      title: '媒体欠账文档',
+      spaceId: 'space-1',
+      parentNodeToken: 'root-1',
+      watchedRootId: 'root-1',
+      watchedRootUrl: 'https://tenant.feishu.cn/wiki/root-1',
+      observedObjEditTime: editTime,
+      hasChild: false,
+      observationStatus: 'available',
+      lastSeenAt: at,
+    });
+
+  it('creates the pending_reason column on fresh databases (DDL and additive migration agree)', () => {
+    const dbPath = createDatabasePath();
+    const store = new LocalMapStore(dbPath);
+    store.initialize();
+    store.close();
+
+    const database = new Database(dbPath, { readonly: true });
+    const columns = (database.prepare('PRAGMA table_info(documents)').all() as Array<{ name: string }>)
+      .map((row) => row.name);
+    database.close();
+    expect(columns).toContain('pending_reason');
+  });
+
+  it('keeps a media-gap pending row pending across baseline-equal polls and clears the marker on sync commit', () => {
+    const dbPath = createDatabasePath();
+    const store = new LocalMapStore(dbPath);
+    store.initialize();
+
+    // Seed a fully synced doc (observed == synced baseline).
+    observe(store, 100, '2026-09-01T00:00:00.000Z');
+    store.markDocumentSynced({
+      objToken: 'doc-gap',
+      syncedObjEditTime: 100,
+      localMdPath: '/tmp/doc-gap.md',
+      lastSyncedAt: '2026-09-01T00:01:00.000Z',
+    });
+
+    // Media-gap detection re-opens the row as pending_modified with a
+    // persistent reason marker.
+    store.markDocumentPendingModifiedForMediaGap('doc-gap', 'local_placeholder_tags');
+    expect(store.getDocumentByObjToken('doc-gap')).toMatchObject({
+      syncState: 'pending_modified',
+      status: 'changed',
+      pendingReason: 'local_placeholder_tags',
+      syncedObjEditTime: 100,
+    });
+
+    // Baseline-equal routine polls must NOT wash the row back to synced
+    // and must NOT drop the grouping identity.
+    for (let i = 0; i < 3; i += 1) {
+      const polled = observe(store, 100, `2026-09-01T00:1${i}:00.000Z`);
+      expect(polled).toMatchObject({
+        syncState: 'pending_modified',
+        pendingReason: 'local_placeholder_tags',
+        syncedObjEditTime: 100,
+      });
+    }
+
+    // A successful sync commit resolves the row and clears the marker.
+    store.markDocumentSynced({
+      objToken: 'doc-gap',
+      syncedObjEditTime: 100,
+      localMdPath: '/tmp/doc-gap.md',
+      lastSyncedAt: '2026-09-01T00:20:00.000Z',
+    });
+    expect(store.getDocumentByObjToken('doc-gap')).toMatchObject({
+      syncState: 'synced',
+      status: 'synced',
+      pendingReason: null,
+    });
+    store.close();
+  });
+
+  it('clears pending_reason when a genuine cloud edit arrives (observed > synced)', () => {
+    const dbPath = createDatabasePath();
+    const store = new LocalMapStore(dbPath);
+    store.initialize();
+
+    observe(store, 100, '2026-09-01T00:00:00.000Z');
+    store.markDocumentSynced({
+      objToken: 'doc-gap',
+      syncedObjEditTime: 100,
+      localMdPath: '/tmp/doc-gap.md',
+      lastSyncedAt: '2026-09-01T00:01:00.000Z',
+    });
+    store.markDocumentPendingModifiedForMediaGap('doc-gap', 'sheet_cloud_images_missing');
+
+    // A real cloud edit makes this a normal pending_modified: the media-gap
+    // marker is cleared so the row no longer groups as 图片缺失待修复.
+    const edited = observe(store, 300, '2026-09-01T00:30:00.000Z');
+    expect(edited).toMatchObject({
+      syncState: 'pending_modified',
+      pendingReason: null,
+      observedObjEditTime: 300,
+      syncedObjEditTime: 100,
+    });
+    store.close();
+  });
+
+  it('holds a media-gap marker through restricted-state recovery instead of washing to synced', () => {
+    const dbPath = createDatabasePath();
+    const store = new LocalMapStore(dbPath);
+    store.initialize();
+
+    observe(store, 100, '2026-09-01T00:00:00.000Z');
+    store.markDocumentSynced({
+      objToken: 'doc-gap',
+      syncedObjEditTime: 100,
+      localMdPath: '/tmp/doc-gap.md',
+      lastSyncedAt: '2026-09-01T00:01:00.000Z',
+    });
+    store.markDocumentPendingModifiedForMediaGap('doc-gap', 'local_placeholder_tags');
+
+    // Simulate the row's state being moved out of pending by another writer
+    // while the marker survives (restricted observation), then a readable
+    // baseline-equal observation arrives — the hold guard must keep it
+    // pending_modified instead of washing back to synced.
+    const restricted = store.recordCloudObservation({
+      objToken: 'doc-gap',
+      wikiNodeToken: 'node-gap',
+      objType: 'docx',
+      title: '媒体欠账文档',
+      spaceId: 'space-1',
+      parentNodeToken: 'root-1',
+      watchedRootId: 'root-1',
+      watchedRootUrl: 'https://tenant.feishu.cn/wiki/root-1',
+      observedObjEditTime: null,
+      hasChild: false,
+      observationStatus: 'restricted',
+      lastSeenAt: '2026-09-01T00:30:00.000Z',
+    });
+    expect(restricted).toMatchObject({
+      syncState: 'restricted',
+      pendingReason: 'local_placeholder_tags',
+    });
+    const recovered = observe(store, 100, '2026-09-01T00:40:00.000Z');
+    expect(recovered).toMatchObject({
+      syncState: 'pending_modified',
+      pendingReason: 'local_placeholder_tags',
+    });
+    store.close();
+  });
+});
+
 describe('LocalMapStore.backfillCustomFolders', () => {
   it('binds unbound rows by longest folder prefix and skips ineligible rows', () => {
     const dbPath = createDatabasePath();

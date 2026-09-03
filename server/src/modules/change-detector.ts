@@ -72,6 +72,7 @@ import type {
 } from './lark-cli-client.js';
 import type { LocalMapStore } from './local-map-store.js';
 import { detectMediaGaps, type MediaGapApiScope } from './media-gap.js';
+import { isMediaGapReason } from '../types/index.js';
 import type {
   ChangeDetectionResult,
   ChangedDocument,
@@ -1341,6 +1342,11 @@ export class ChangeDetector {
       hasChild: observation.hasChild,
       observedObjEditTime: observation.observedObjEditTime,
       syncState: record.syncState,
+      // pending_reason 持久标记（media-gap 落库后由轮询 Pass 1 重建）：
+      // 轮询刷新的变更列表必须保留分组身份，不能退化为普通 modified。
+      mediaGapReason: isMediaGapReason(record.pendingReason)
+        ? record.pendingReason
+        : undefined,
       parentChainTitles: hierarchy?.parentChainTitles,
       isWatchedRootNode: hierarchy?.isWatchedRootNode,
       localRelPath: record.localRelPath ?? null,
@@ -1699,10 +1705,15 @@ export class ChangeDetector {
         // 落库为 pending_modified：stored diff（变更列表，getStoredDiff 从
         // SQLite 状态重建）必须能看到它，否则检测响应里的 media-gap 项
         // 会在前端重拉 cached diff 时消失，用户无法勾选同步（2026-09
-        // 实际用户反馈的断链）。同步成功后 markDocumentSynced 收敛回
-        // synced；未同步时轮询会洗回 synced，等待下次主动检测重检。
+        // 实际用户反馈的断链）。pending_reason 持久标记具体补齐原因：
+        // 轮询（observed == synced）不洗回 synced、不丢分组身份；同步成功
+        // （markDocumentSynced）或云端真实新编辑才清空（见
+        // local-map-store 的 pending_reason hold 语义）。
         try {
-          this.localMapStore.markDocumentPendingModifiedForMediaGap(gap.objToken);
+          this.localMapStore.markDocumentPendingModifiedForMediaGap(
+            gap.objToken,
+            gap.reason,
+          );
         } catch (markError) {
           console.warn(
             `[ChangeDetector] markDocumentPendingModifiedForMediaGap failed for ${gap.objToken}:`,

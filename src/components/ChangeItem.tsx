@@ -125,8 +125,8 @@ export function ChangeItem({
               {change.title}
             </span>
             {change.mediaGapReason && (
-              <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-sans-ui bg-jade/10 text-jade border border-jade/30 shrink-0">
-                图片补齐
+              <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-sans-ui bg-seal/10 text-seal border border-seal/30 shrink-0">
+                图片缺失待修复
               </span>
             )}
             {businessMarks && businessMarks.length > 0 && (

@@ -114,6 +114,11 @@ export class LocalMapStore {
       { name: 'has_child', dml: 'ALTER TABLE documents ADD COLUMN has_child INTEGER NOT NULL DEFAULT 0' },
       // custom-folder archive (quick-add): links a document to custom_folders.id
       { name: 'custom_folder_id', dml: 'ALTER TABLE documents ADD COLUMN custom_folder_id TEXT' },
+      // media-gap repair pending: WHY a pending_modified row is pending when
+      // it is not a cloud edit ('local_placeholder_tags' |
+      // 'sheet_cloud_images_missing'). Lets polling keep the row pending and
+      // lets stored diff rebuild the mediaGapReason grouping signal.
+      { name: 'pending_reason', dml: 'ALTER TABLE documents ADD COLUMN pending_reason TEXT' },
     ];
 
     const pending = additive.filter((c) => !colNames.has(c.name));
@@ -455,18 +460,20 @@ export class LocalMapStore {
    *
    * 与 recordCloudObservation 的区别：不触碰 observed_obj_edit_time /
    * synced_obj_edit_time 基线，也不重写身份字段——这不是一次云端编辑，
-   * 只是本地媒体欠账的补齐信号。同步成功后 markDocumentSynced 照常
-   * 收敛回 synced；若用户未同步，下一次常规轮询观测（observed ==
-   * synced）会把它洗回 synced，直到再次「立即检测」重新检出（预期语义：
-   * sheet 云端清单核对仅主动检测触发）。
+   * 只是本地媒体欠账的补齐信号。同步成功后 markDocumentSynced 收敛回
+   * synced；未同步时 pending_reason 持久标记保证常规轮询（observed ==
+   * synced）不会把它洗回 synced，也不会丢失 media-gap 分组身份，直到
+   * 用户同步修复或云端出现真实新编辑（后者清空标记，按普通 modified
+   * 处理）。
    */
-  markDocumentPendingModifiedForMediaGap(objToken: string): void {
+  markDocumentPendingModifiedForMediaGap(objToken: string, reason: string): void {
     this.getStatement(`
       UPDATE documents
       SET sync_state = 'pending_modified', status = 'changed',
+          pending_reason = ?,
           updated_at = datetime('now')
       WHERE obj_token = ?
-    `).run(objToken);
+    `).run(reason, objToken);
   }
 
   recordCloudObservation(observation: CloudNodeObservation & { lastSeenAt: string }): DocumentRecord {
@@ -513,6 +520,13 @@ export class LocalMapStore {
         last_sync_error_code = CASE
           WHEN excluded.sync_state IN ('error', 'feishu_pending') THEN documents.last_sync_error_code
           ELSE NULL
+        END,
+        pending_reason = CASE
+          WHEN excluded.sync_state = 'synced' THEN NULL
+          WHEN excluded.observed_obj_edit_time IS NOT NULL
+               AND documents.synced_obj_edit_time IS NOT NULL
+               AND excluded.observed_obj_edit_time > documents.synced_obj_edit_time THEN NULL
+          ELSE documents.pending_reason
         END,
         updated_at = datetime('now')
     `);
@@ -594,6 +608,7 @@ export class LocalMapStore {
         missing_complete_count = 0,
         cloud_deleted = 0,
         last_sync_error_code = NULL,
+        pending_reason = NULL,
         updated_at = datetime('now')
       WHERE obj_token = ?
     `);
@@ -1088,6 +1103,15 @@ export class LocalMapStore {
     const synced = current.syncedObjEditTime ?? null;
     const hasLocalContent = current.localMdPath.trim().length > 0;
 
+    // pending_reason hold（media-gap 持久标记）：带 pending_reason 的行是
+    // 因本地补齐信号（而非云端编辑）而 pending 的。基线相等的常规轮询
+    // 观测不得把它洗回 synced；只有同步提交（markDocumentSynced）、
+    // 真实新云端编辑或归档所有权变更会清空标记。正常 pending 行在上方
+    // sticky 分支已提前返回，这里的守卫覆盖状态被其他写入点
+    // （error/restricted/feishu_pending 恢复路径）移走后标记仍然存活的行。
+    const hasNewerCloudEdit = observed != null && synced != null && observed > synced;
+    const holdPendingReason = current.pendingReason != null && !hasNewerCloudEdit;
+
     // A queue row is normally handled before this method. This fallback
     // covers an interrupted migration/manual database repair: once no queue
     // row remains, the next readable observation safely derives a normal
@@ -1095,7 +1119,7 @@ export class LocalMapStore {
     if (currentState === 'feishu_pending') {
       if (!hasLocalContent) return 'pending_added';
       if (observed == null || synced == null || observed > synced) return 'pending_modified';
-      return 'synced';
+      return holdPendingReason ? 'pending_modified' : 'synced';
     }
 
     // A historical writer stored the local wall-clock timestamp in
@@ -1112,13 +1136,13 @@ export class LocalMapStore {
     if (currentState === 'restricted') {
       if (!hasLocalContent) return 'pending_added';
       if (observed == null || synced == null || observed > synced) return 'pending_modified';
-      return 'synced';
+      return holdPendingReason ? 'pending_modified' : 'synced';
     }
 
     if (currentState === 'missing_candidate' || currentState === 'deleted_confirmed') {
       if (!hasLocalContent) return 'pending_added';
       if (observed == null || synced == null || observed > synced) return 'pending_modified';
-      return 'synced';
+      return holdPendingReason ? 'pending_modified' : 'synced';
     }
 
     // synced state: a null baseline is intentionally not treated as equal.
@@ -1127,7 +1151,7 @@ export class LocalMapStore {
     if (synced == null || (observed != null && observed > synced)) {
       return hasLocalContent ? 'pending_modified' : 'pending_added';
     }
-    return 'synced';
+    return holdPendingReason ? 'pending_modified' : 'synced';
   }
 
   /** Detect the known seconds-vs-milliseconds legacy baseline corruption. */
@@ -1203,6 +1227,7 @@ export class LocalMapStore {
         cloudDeleted: row.cloud_deleted ?? 0,
         cloudMatch: row.cloud_match ?? 'unknown',
       }),
+      pendingReason: row.pending_reason ?? null,
       watchedRootId: row.watched_root_id ?? null,
       localRelPath: row.local_rel_path ?? null,
       missingCompleteCount: row.missing_complete_count ?? 0,
@@ -1436,6 +1461,7 @@ export class LocalMapStore {
         cloud_deleted = 0,
         missing_complete_count = 0,
         last_sync_error_code = NULL,
+        pending_reason = NULL,
         updated_at = datetime('now')
       WHERE documents.watched_root_id IS NULL
         AND documents.wiki_node_token IS NULL
@@ -1960,6 +1986,7 @@ export class LocalMapStore {
         observed_obj_edit_time INTEGER,
         synced_obj_edit_time INTEGER,
         sync_state TEXT NOT NULL DEFAULT 'pending_added',
+        pending_reason TEXT,
         watched_root_id TEXT,
         local_rel_path TEXT,
         missing_complete_count INTEGER NOT NULL DEFAULT 0,

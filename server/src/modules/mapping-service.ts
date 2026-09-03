@@ -36,6 +36,7 @@ import type {
   TreeResponse,
   WatchedRoot,
 } from '../types/index.js';
+import { isMediaGapReason } from '../types/index.js';
 
 /**
  * The hierarchy evidence a persisted row needs before it may be planned as a
@@ -238,6 +239,11 @@ export class MappingService {
       hasChild: document.hasChild ?? false,
       observedObjEditTime: observed,
       syncState: this.storedSyncState(document),
+      // pending_reason 持久标记：media-gap 项在 cached diff 重建时保留
+      // 分组身份（前端「图片缺失待修复」分组），不退化为普通 modified。
+      mediaGapReason: isMediaGapReason(document.pendingReason)
+        ? document.pendingReason
+        : undefined,
       parentChainTitles: hierarchy?.parentChainTitles,
       isWatchedRootNode: hierarchy?.isWatchedRootNode,
       localRelPath: document.localRelPath ?? null,
@@ -286,6 +292,7 @@ export class MappingService {
       hasChild: doc.hasChild ?? false,
       observedObjEditTime: observed,
       syncState: doc.syncState,
+      mediaGapReason: isMediaGapReason(doc.pendingReason) ? doc.pendingReason : undefined,
       localRelPath: doc.localRelPath ?? null,
       customFolderId: doc.customFolderId ?? null,
     };

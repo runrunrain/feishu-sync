@@ -10,6 +10,20 @@
 
 ---
 
+## [0.3.24] - 2026-09-03
+
+### Fixed（fix）
+
+- **同步页「立即检测」永久转圈**：根因是云端全量检测与存量 diff 读取混在同一 fetchDiff——挂载/切页/数据广播都触发耗时数分钟的云端遍历，且无超时控制。现分离 loadStoredDiff（毫秒级本地读取）与 handleDetect（用户主动点击才真检测），防重入锁 + 「检测中…」态，切页不中断；请求层增加 AbortController 超时（检测 5 分钟），超时/异常明确 toast 并复位状态。
+- **media-gap 标记被轮询洗掉**（图片缺失文档与普通变更混组）：documents 新增 pending_reason 持久列（additive 迁移），markDocumentPendingModifiedForMediaGap 记录具体原因，常规轮询 hold 守卫保持 pending_modified 不洗回；真实云端新编辑/同步成功/归档移动时自动清空；stored diff 与检测响应均投影 mediaGapReason。
+
+### Changed（ui）
+
+- **「图片缺失待修复」独立分组**：变更列表新增独立 Tab（独立计数徽标），「全选」默认不勾选该组（有提示条与快捷入口），组内可单独全选——避免批量同步时全量消耗 tool 请求；同步判断仍按修改时间基线，原子提交成功后才推进 synced 基线。
+- **预览页 CSV 链接跳转**：Markdown 预览内指向 .csv 子表的相对链接现在拦截点击并切换到对应表格预览（按文件名/表名/路径匹配，未命中回退原行为）。
+
+---
+
 ## [0.3.23] - 2026-09-03
 
 ### Fixed（fix）

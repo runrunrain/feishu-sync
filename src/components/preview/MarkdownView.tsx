@@ -72,7 +72,7 @@ interface AuthImageProps {
   baseDir: string;
 }
 
-function resolveMediaPath(src: string, baseDir: string): string {
+export function resolveMediaPath(src: string, baseDir: string): string {
   const cleaned = src.replace(/^\.\//, '');
   const segments = [...baseDir.split('/').filter(Boolean), ...cleaned.split('/')];
   // 归一化 ..（图片引用可能指向上级目录）
@@ -163,6 +163,7 @@ function unescapeInline(s: string): string {
 
 interface InlineContext {
   baseDir: string;
+  onNavigateCsv?: (href: string) => boolean;
 }
 
 function renderInline(text: string, keyPrefix: string, ctx: InlineContext): ReactNode[] {
@@ -183,13 +184,23 @@ function renderInline(text: string, keyPrefix: string, ctx: InlineContext): Reac
       const close = token.indexOf('](');
       const label = unescapeInline(token.slice(1, close));
       const href = token.slice(close + 2, -1);
+      const isCsv = !isRemoteUrl(href) && href.split(/[?#]/)[0].toLowerCase().endsWith('.csv');
       out.push(
         <a
           key={key}
           href={href}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="text-jade hover:text-seal underline underline-offset-2 decoration-line hover:decoration-seal transition-colors"
+          target={isCsv ? undefined : '_blank'}
+          rel={isCsv ? undefined : 'noopener noreferrer'}
+          onClick={(e) => {
+            if (isCsv && ctx.onNavigateCsv) {
+              const handled = ctx.onNavigateCsv(href);
+              if (handled) {
+                e.preventDefault();
+                e.stopPropagation();
+              }
+            }
+          }}
+          className="text-jade hover:text-seal underline underline-offset-2 decoration-line hover:decoration-seal transition-colors cursor-pointer"
         >
           {label}
         </a>,
@@ -544,11 +555,13 @@ export interface MarkdownViewProps {
   content: string;
   /** md 文件所在目录（kbRoot 相对 POSIX 路径），用于解析相对图片路径。 */
   baseDir?: string;
+  /** 点击相对 .csv 链接时的拦截处理器：返回 true 表示已命中本地子表并阻止浏览器默认跳转。 */
+  onNavigateCsv?: (href: string) => boolean;
 }
 
-export function MarkdownView({ content, baseDir = '' }: MarkdownViewProps) {
+export function MarkdownView({ content, baseDir = '', onNavigateCsv }: MarkdownViewProps) {
   const blocks = parseBlocks(preprocess(content));
-  const ctx: InlineContext = { baseDir };
+  const ctx: InlineContext = { baseDir, onNavigateCsv };
   return (
     <div className="px-5 py-4">
       {blocks.map((b, i) => (

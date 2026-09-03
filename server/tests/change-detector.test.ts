@@ -42,12 +42,13 @@ class MockLocalMapStore {
   missCalls: Array<{ objToken: string; timestamp: string }> = [];
   mediaGapMarkCalls: string[] = [];
 
-  markDocumentPendingModifiedForMediaGap(objToken: string): void {
+  markDocumentPendingModifiedForMediaGap(objToken: string, reason?: string): void {
     this.mediaGapMarkCalls.push(objToken);
     const row = this.rows.get(objToken);
     if (row) {
       row.syncState = 'pending_modified';
       row.status = 'changed';
+      row.pendingReason = reason ?? null;
     }
   }
 
@@ -112,6 +113,15 @@ class MockLocalMapStore {
       observedObjEditTime: input.observedObjEditTime ?? existing?.observedObjEditTime ?? existing?.objEditTime ?? null,
       syncedObjEditTime: existing?.syncedObjEditTime ?? null,
       syncState: nextState,
+      // Mirror the real store's pending_reason semantics: keep the marker
+      // on sticky/hold transitions, clear it on a genuine newer cloud edit
+      // (or a synced resolution, which never happens through observations).
+      pendingReason:
+        input.observedObjEditTime != null &&
+        existing?.syncedObjEditTime != null &&
+        input.observedObjEditTime > existing.syncedObjEditTime
+          ? null
+          : existing?.pendingReason ?? null,
       watchedRootId: input.watchedRootId || existing?.watchedRootId || null,
       watchedRootUrl: input.watchedRootUrl ?? existing?.watchedRootUrl ?? null,
       hasChild: input.hasChild,
@@ -1697,7 +1707,87 @@ feishu_sync:
 
     // 2026-09 stored-diff 断链修复：media-gap 项必须落库 pending_modified，
     // 否则变更列表（getStoredDiff 从 SQLite 状态重建）看不到它。
-    expect(mediaGapMarkSpy).toHaveBeenCalledWith('tok_docx_1');
+    expect(mediaGapMarkSpy).toHaveBeenCalledWith('tok_docx_1', 'local_placeholder_tags');
+  });
+
+  it('a2) routine poll after the media-gap mark keeps pending_modified and the mediaGapReason identity', async () => {
+    const mdPath = path.join(tmpKbRoot, 'Doc1.md');
+    fs.writeFileSync(
+      mdPath,
+      `<!--
+feishu_sync:
+  obj_token: "tok_docx_1"
+-->
+# 正文
+<whiteboard token="SPb7wKhdzhscrubfoMOcRiYanrc"></whiteboard>
+`,
+      'utf-8',
+    );
+
+    const store = new MockLocalMapStore();
+    store.rows.set(
+      'tok_docx_1',
+      makeLocal({
+        objToken: 'tok_docx_1',
+        wikiNodeToken: 'node_docx_1',
+        objType: 'docx',
+        title: 'Doc 1',
+        localMdPath: mdPath,
+        status: 'synced',
+        syncState: 'synced',
+        watchedRootId: 'rootA',
+        watchedRootUrl: ROOT_URL,
+        syncedObjEditTime: 1000,
+        observedObjEditTime: 1000,
+      }),
+    );
+
+    const lark = new MediaGapLarkClient();
+    // The doc node IS part of the cloud traversal (with a baseline-equal edit
+    // time): this is what a routine poll observes after the media-gap mark.
+    lark.childNodes = [
+      {
+        node_token: 'node_docx_1',
+        obj_token: 'tok_docx_1',
+        obj_type: 'docx',
+        title: 'Doc 1',
+        has_child: false,
+        parent_node_token: 'rootA',
+        space_id: 'space-1',
+      },
+    ];
+    lark.childNodeGetHandler = () => ({
+      obj_token: 'tok_docx_1',
+      obj_edit_time: 1000,
+    });
+
+    const detector = new ChangeDetector(lark as any, store as any, {
+      knowledgeBaseRoot: tmpKbRoot,
+    });
+
+    const first = await detector.detectChanges(ROOT_URL, {
+      forceFresh: true,
+      bypassCooldown: true,
+    });
+    const firstGap = first.changedDocuments.find((d) => d.objToken === 'tok_docx_1');
+    expect(firstGap?.changeType).toBe('modified');
+    expect(firstGap?.mediaGapReason).toBe('local_placeholder_tags');
+
+    // Second detect = routine poll refresh: Pass 1 records the baseline-equal
+    // observation. pending_reason 持久标记保证行不被洗回 synced，且
+    // toChangedDocument 投影的分组身份不退化为普通 modified。
+    const second = await detector.detectChanges(ROOT_URL, {
+      forceFresh: true,
+      bypassCooldown: true,
+    });
+    const occurrences = second.changedDocuments.filter((d) => d.objToken === 'tok_docx_1');
+    expect(occurrences).toHaveLength(1);
+    expect(occurrences[0]?.changeType).toBe('modified');
+    expect(occurrences[0]?.mediaGapReason).toBe('local_placeholder_tags');
+    expect(store.rows.get('tok_docx_1')).toMatchObject({
+      syncState: 'pending_modified',
+      pendingReason: 'local_placeholder_tags',
+    });
   });
 
   it('b) sheet cloud 2 images vs local 0 images -> pending changedDocument with sheet_cloud_images_missing', async () => {

@@ -26,7 +26,7 @@ import {
   FolderOpen,
 } from 'lucide-react';
 import { Card } from './common/Card';
-import { MarkdownView } from './preview/MarkdownView';
+import { MarkdownView, resolveMediaPath } from './preview/MarkdownView';
 import { CsvTableView } from './preview/CsvTableView';
 import { getDocumentContent } from '../api/client';
 import { appLogger } from '../utils/appLogger';
@@ -143,6 +143,48 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
     const idx = p.lastIndexOf('/');
     return idx >= 0 ? p.slice(0, idx) : '';
   }, [content?.mdPath]);
+
+  // 点击相对 .csv 链接拦截：匹配当前文档关联的 csvTables，命中则切至对应 CSV 表格
+  const handleNavigateCsv = (href: string): boolean => {
+    if (!csvTables || csvTables.length === 0) return false;
+
+    const rawPath = href.split(/[?#]/)[0];
+    let decodedHref: string;
+    try {
+      decodedHref = decodeURIComponent(rawPath);
+    } catch {
+      decodedHref = rawPath;
+    }
+
+    const cleanedHref = decodedHref.replace(/^\.\//, '');
+    const targetFileName = cleanedHref.split('/').pop() ?? '';
+    const targetNameWithoutExt = targetFileName.replace(/\.csv$/i, '');
+
+    const resolvedPath = mdBaseDir ? resolveMediaPath(cleanedHref, mdBaseDir) : cleanedHref;
+
+    const matchIndex = csvTables.findIndex((table) => {
+      // 1. 完整 POSIX 路径精确匹配
+      if (table.path === resolvedPath || table.path === cleanedHref) return true;
+      // 2. 相对路径后缀匹配
+      if (table.path.endsWith(cleanedHref)) return true;
+      // 3. 文件名（带 .csv）匹配
+      const tableFileName = table.path.split('/').pop() ?? '';
+      const tableNameWithoutExt = tableFileName.replace(/\.csv$/i, '');
+      if (targetFileName && targetFileName.toLowerCase() === tableFileName.toLowerCase()) return true;
+      // 4. 子表名称（不带 .csv）匹配
+      if (targetNameWithoutExt && targetNameWithoutExt.toLowerCase() === table.name.toLowerCase()) return true;
+      if (targetNameWithoutExt && targetNameWithoutExt.toLowerCase() === tableNameWithoutExt.toLowerCase()) return true;
+      return false;
+    });
+
+    if (matchIndex >= 0) {
+      setFormatTab('csv');
+      setCsvIndex(matchIndex);
+      return true;
+    }
+
+    return false;
+  };
 
   // ---- 空态 1：未选中 ----
   if (!node) {
@@ -288,7 +330,11 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
         ) : formatTab === 'md' ? (
           hasMd && mdMode === 'rendered' ? (
             <div key={`${objToken}-md-r`} className="animate-fade-in">
-              <MarkdownView content={content!.mdContent!} baseDir={mdBaseDir} />
+              <MarkdownView
+                content={content!.mdContent!}
+                baseDir={mdBaseDir}
+                onNavigateCsv={handleNavigateCsv}
+              />
             </div>
           ) : hasMd ? (
             <pre
