@@ -155,9 +155,27 @@ export function AuthSettingsCard() {
         {authStatus?.larkCliVersion && (
           <div className="flex items-center justify-between py-1.5 border-b border-line">
             <span className="text-sm text-ink-soft">lark-cli 版本</span>
-            <span className="text-sm font-mono text-jade bg-jade/10 px-2 py-0.5 rounded">
-              {authStatus.larkCliVersion}
-            </span>
+            {(() => {
+              // 版本对比着色（2026-09）：最新=绿 / 落后=琥珀+可更新 / 无最新信息=中性。
+              const current = authStatus.larkCliVersion!.replace(/^lark-cli version\s*/i, '').replace(/^v/, '');
+              const latest = setup.toolStatus?.latestLarkCliVersion?.replace(/^v/, '');
+              const upToDate = latest != null && current === latest;
+              const outdated = latest != null && current !== latest;
+              const colorCls = upToDate
+                ? 'text-jade bg-jade/10'
+                : outdated
+                  ? 'text-amber-700 bg-amber-500/10'
+                  : 'text-ink-soft bg-paper-2';
+              return (
+                <span className={`text-sm font-mono px-2 py-0.5 rounded ${colorCls}`}>
+                  {current}
+                  {upToDate && <span className="ml-1.5 text-[11px]">已最新</span>}
+                  {outdated && (
+                    <span className="ml-1.5 text-[11px]">可更新至 {latest}</span>
+                  )}
+                </span>
+              );
+            })()}
           </div>
         )}
 

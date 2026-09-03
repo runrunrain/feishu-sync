@@ -43,6 +43,8 @@ const execFileAsync = promisify(execFile);
 const NPM_INSTALL_TIMEOUT_MS = 5 * 60_000;
 /** `--version` 验证命令超时。 */
 const VERSION_CHECK_TIMEOUT_MS = 30_000;
+/** `npm view lark-cli version`（registry 元数据）的最长等待。 */
+const LATEST_VERSION_CHECK_TIMEOUT_MS = 15_000;
 /** `auth login --no-wait` 立即返回，给足 CLI 冷启动余量。 */
 const DEVICE_AUTH_START_TIMEOUT_MS = 60_000;
 /**
@@ -70,6 +72,8 @@ export class LarkCliManagerError extends Error {
 export interface LarkCliToolStatus {
   larkCliInstalled: boolean;
   larkCliVersion?: string;
+  /** registry 最新版（npm view，查询失败时缺省）；前端据其做版本对比着色。 */
+  latestLarkCliVersion?: string;
   authReady: boolean;
   missingScopes?: string[];
   error?: string;
@@ -255,7 +259,43 @@ export class LarkCliManager {
       error: auth.error,
       npmAvailable: npm.available,
       npmPath: npm.path,
+      // 最新版本对比（2026-09）：绿色只应留给真正最新的安装；落后时前端
+      // 以琥珀色提示「可更新」。查询失败静默缺省，不影响状态卡片。
+      latestLarkCliVersion: await this.queryLatestLarkCliVersion(npm),
     };
+  }
+
+  /**
+   * `npm view lark-cli version` 查询 registry 最新版（10s 超时，软失败）。
+   * 输出形如 `"1.0.93\n"`（npm --json 下的字符串）或裸 `1.0.93`。
+   */
+  private async queryLatestLarkCliVersion(
+    npm: { available: boolean; path: string | null },
+  ): Promise<string | undefined> {
+    if (!npm.available || !npm.path) return undefined;
+    try {
+      const { stdout } = await execFileAsync(
+        quoteWindowsExecutablePath(npm.path, this.discovery.platform ?? process.platform),
+        ['view', 'lark-cli', 'version'],
+        {
+          timeout: LATEST_VERSION_CHECK_TIMEOUT_MS,
+          encoding: 'utf-8',
+          windowsHide: true,
+          shell: process.platform === 'win32',
+          env: buildNpmExecutionEnvironment(
+            npm.path,
+            this.discovery.env ?? process.env,
+            this.discovery.homeDir ?? os.homedir(),
+            this.discovery.platform ?? process.platform,
+          ),
+        },
+      );
+      const match = /[0-9]+\.[0-9]+\.[0-9]+/.exec(stdout);
+      return match ? match[0] : undefined;
+    } catch {
+      // 网络不通/registry 拒绝：最新版本信息缺席，前端退化为中性展示。
+      return undefined;
+    }
   }
 
   /**

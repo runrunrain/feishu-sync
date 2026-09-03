@@ -114,6 +114,49 @@ function createManager(options: {
   return { manager, client, configManager };
 }
 
+describe('getToolStatus latest version query', () => {
+  it('surfaces latestLarkCliVersion from npm view and soft-fails to undefined', async () => {
+    const binDir = makeBinDir(true);
+    const client = {
+      checkAuthReady: vi.fn(async () => ({
+        ready: true,
+        larkCliVersion: 'lark-cli version 1.0.89',
+      })),
+    };
+    const configManager = {
+      getConfig: vi.fn(() => ({ requiredScopes: ['offline_access'] })),
+      load: vi.fn(async () => ({ requiredScopes: ['offline_access'] })),
+    };
+    const manager = new LarkCliManager(client, configManager, {
+      platform: 'darwin',
+      env: { PATH: binDir },
+      homeDir: tmpRoot,
+    });
+
+    // 1. npm view 成功：输出裸版本号
+    setExecHandler((file, args) => {
+      if (args.includes('view')) return { stdout: '1.0.93\n', stderr: '' };
+      throw new Error(`unexpected call: ${file} ${args.join(' ')}`);
+    });
+    const ok = await manager.getToolStatus();
+    expect(ok.larkCliVersion).toBe('lark-cli version 1.0.89');
+    expect(ok.latestLarkCliVersion).toBe('1.0.93');
+
+    // 2. npm view 失败（网络/registry）：软缺省，不影响状态
+    setExecHandler((file, args) => {
+      if (args.includes('view')) {
+        const error = new Error('Command failed: npm view') as Error & { stderr: string };
+        error.stderr = 'network unreachable';
+        return { error };
+      }
+      throw new Error(`unexpected call: ${file} ${args.join(' ')}`);
+    });
+    const degraded = await manager.getToolStatus();
+    expect(degraded.latestLarkCliVersion).toBeUndefined();
+    expect(degraded.larkCliInstalled).toBe(true);
+  });
+});
+
 const DEVICE_AUTH_JSON =
   '{"device_code":"dc-123","expires_in":600,"verification_url":"https://open.feishu.cn/device-verify?dc=dc-123","hint":"agent instructions, ignore"}';
 

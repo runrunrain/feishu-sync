@@ -228,6 +228,8 @@ export async function getAuthStatus(): Promise<AuthStatus> {
 export interface LarkCliToolStatus {
   larkCliInstalled: boolean;
   larkCliVersion?: string;
+  /** registry 最新版（npm view，查询失败时缺省）。 */
+  latestLarkCliVersion?: string;
   authReady: boolean;
   missingScopes?: string[];
   error?: string;
