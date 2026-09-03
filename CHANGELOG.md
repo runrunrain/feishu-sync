@@ -10,6 +10,16 @@
 
 ---
 
+## [0.3.22] - 2026-09-03
+
+### Fixed（fix）
+
+- **Win「在文件夹中打开」失效（根因）**：按钮此前误调 openDataDirectory（打开的是数据目录而非文档所在目录）。新增 desktop:reveal-in-folder IPC（shell.showItemInFolder，Win 资源管理器/mac Finder 定位选中文件），前端以 knowledgeBaseRoot + local_path 拼绝对路径调用；浏览器环境退化为提示。
+- **表格浮动图片下载全挂（根因：cmd 元字符未加引号）**：`--output ①idea-点子&印象_A1_…` 等文件名含 `&`，execFile(shell:true) 把参数数组裸拼接交 cmd.exe，`&` 被当命令分隔符 → 后半段被当作命令执行（「不是内部或外部命令」），三层下载全部失败。新增 quoteWindowsShellArguments：win32 下对含 cmd 元字符（空格 & | < > ^ ( ) 等）的参数包裹双引号，JSON 类含引号参数维持现状；统一应用于 execLarkCli 全部命令。
+- **高分辨率屏文本模糊（Win）**：主进程在 app ready 前显式声明 `high-dpi-aware`（per-monitor DPI 感知）+ `force-color-profile=srgb`，避免 Windows 对未感知进程做位图拉伸导致 125%/150% 缩放下发虚。
+
+---
+
 ## [0.3.21] - 2026-09-03
 
 ### Added（feat）

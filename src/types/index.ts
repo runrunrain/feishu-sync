@@ -600,6 +600,8 @@ export interface DesktopAPI {
   openConfigFile: () => Promise<DesktopActionResult>;
   /** 在系统默认浏览器打开外部 URL（仅 http/https，与 electron/main.ts 白名单对应）。 */
   openExternal: (url: string) => Promise<DesktopActionResult>;
+  /** 在系统文件管理器中定位并选中文件（绝对路径；父目录则直接打开）。 */
+  revealInFolder: (absolutePath: string) => Promise<DesktopActionResult>;
 }
 
 /**

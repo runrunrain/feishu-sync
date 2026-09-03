@@ -35,6 +35,28 @@ export function quoteWindowsExecutablePath(
   if (file.length >= 2 && file.startsWith('"') && file.endsWith('"')) return file;
   return `"${file}"`;
 }
+
+/**
+ * Windows shell 参数引号包裹（2026-09 实测事故：表格浮动图片下载的
+ * `--output ①idea-点子&印象_A1_…` 含 `&`，execFile(shell:true) 把 args
+ * 数组裸 join 后整条交 cmd.exe，`&` 是命令分隔符 → 后半段被当作命令执行
+ * → 「不是内部或外部命令」，三层下载全挂）。对含 cmd 元字符（空格 & | < >
+ * ^ ( ) ; , ' ` =）的参数包裹双引号；已含双引号的参数（如 --data JSON）
+ * 不动——cmd /s 模式下引号对的传递已验证可工作，再包一层反而破坏 JSON。
+ * 非 Win 原样返回（无 shell，args 数组直接传递）。
+ */
+export function quoteWindowsShellArguments(
+  args: string[],
+  platform: NodeJS.Platform = process.platform,
+): string[] {
+  if (platform !== 'win32') return args;
+  return args.map((arg) => {
+    if (arg.includes('"')) return arg; // JSON 类参数，维持现状行为
+    if (!/[\s&|<>^();,'`=]/.test(arg)) return arg;
+    if (arg.length >= 2 && arg.startsWith('"') && arg.endsWith('"')) return arg;
+    return `"${arg}"`;
+  });
+}
 import type { LarkCliNodeInfo, LarkCliConfig } from '../types/index.js';
 
 const execFileAsync = promisify(execFile);
@@ -772,7 +794,7 @@ export class LarkCliClient {
     try {
       const { stdout, stderr } = await execFileAsync(
         quoteWindowsExecutablePath(larkCliPath),
-        args,
+        quoteWindowsShellArguments(args),
         {
           timeout,
           encoding: 'utf-8',

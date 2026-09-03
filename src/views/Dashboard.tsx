@@ -388,12 +388,26 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
     setSelectedToken(null);
   };
 
-  const handleOpenFolder = () => {
-    if (typeof window !== 'undefined' && window.desktop) {
-      window.desktop.openDataDirectory().catch((err) => {
-        appLogger.error('dashboard', 'openDataDirectory failed', err);
+  const handleOpenFolder = (localPath: string) => {
+    // 2026-09 修复：此前误调 openDataDirectory（打开数据目录而非文档所在
+    // 目录）。现在把相对 local_path 拼上 knowledgeBaseRoot 得绝对路径，
+    // 走 reveal-in-folder（Win 资源管理器 / mac Finder 定位选中）。
+    if (typeof window !== 'undefined' && window.desktop?.revealInFolder) {
+      const kbRoot = (config?.knowledgeBaseRoot ?? '').replace(/[\\/]+$/, '');
+      if (!kbRoot) {
+        toast.push({ type: 'warning', message: '本地根目录未配置' });
+        return;
+      }
+      // Win/mac 资源管理器都接受正斜杠；local_path 是相对 kbRoot 的 POSIX 风格路径。
+      const abs = `${kbRoot}/${localPath.replace(/^[\\/]+/, '')}`;
+      window.desktop.revealInFolder(abs).catch((err) => {
+        appLogger.error('dashboard', 'revealInFolder failed', err);
+        toast.push({ type: 'error', message: '打开文件夹失败' });
       });
+      return;
     }
+    // 非 desktop 环境（浏览器 dev）退化为提示。
+    toast.push({ type: 'warning', message: '仅桌面端支持打开本地文件夹' });
   };
 
   return (

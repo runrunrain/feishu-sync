@@ -6,6 +6,7 @@ import {
   buildLarkCliEnvironment,
   LarkCliClient,
   LarkCliError,
+  quoteWindowsShellArguments,
   resolveLarkCliExecutable,
   resolveMediaOutputTarget,
 } from '../src/modules/lark-cli-client.js';
@@ -297,5 +298,30 @@ describe('LarkCliClient output parsing and classification', () => {
       outputName: 'preview-stem',
       requestedPath: '/tmp/inside/preview-stem',
     });
+  });
+});
+
+describe('quoteWindowsShellArguments — Win cmd 元字符参数引号包裹', () => {
+  it('wraps args containing cmd metacharacters (&, spaces, parens, unicode) and leaves plain/JSON args intact', () => {
+    const q = (args: string[]) => quoteWindowsShellArguments(args, 'win32');
+    // 2026-09 实测事故样本：浮动图片文件名含 & 与中文/① → cmd 拆命令
+    expect(
+      q(['docs', '+media-preview', '--token', 'GvF6b', '--output', '①idea-点子&印象_A1_tF4t6mwsfd']),
+    ).toEqual(['docs', '+media-preview', '--token', 'GvF6b', '--output', '"①idea-点子&印象_A1_tF4t6mwsfd"']);
+    // 空格/括号/管道等元字符同样包裹
+    expect(q(['--output', '策划 (草案) v2.md'])).toEqual(['--output', '"策划 (草案) v2.md"']);
+    // 纯净参数不动
+    expect(q(['wiki', '+node-list', '--format', 'json'])).toEqual(['wiki', '+node-list', '--format', 'json']);
+    // 含双引号的 JSON 参数维持现状（cmd /s 下已验证可工作）
+    const json = '{"request_docs":[{"doc_token":"x"}]}';
+    expect(q(['--data', json])).toEqual(['--data', json]);
+    // 已包裹的不重复包
+    expect(q(['"a b"'])).toEqual(['"a b"']);
+  });
+
+  it('is a no-op on non-win32 platforms', () => {
+    expect(
+      quoteWindowsShellArguments(['--output', 'a b&c'], 'darwin'),
+    ).toEqual(['--output', 'a b&c']);
   });
 });

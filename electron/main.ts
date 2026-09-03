@@ -56,6 +56,13 @@ let autoStartService: AutoStartService | null = null;
 let changeNotificationService: ChangeNotificationService | null = null;
 let configManager: ConfigManager | null = null;
 
+// 2026-09 HiDPI 修复（Win）：显式声明 per-monitor DPI 感知。未声明时
+// Windows 会对进程做位图拉伸模拟缩放，高分辨率屏（125%/150% 缩放）上
+// 文本发虚。必须在 app ready 之前设置。
+app.commandLine.appendSwitch('high-dpi-aware', '1');
+// 禁用字体亚像素合成在部分 HiDPI 驱动上的模糊路径，保持色彩一致。
+app.commandLine.appendSwitch('force-color-profile', 'srgb');
+
 // ============================================================================
 // Utility Functions
 // ============================================================================
@@ -374,6 +381,24 @@ ipcMain.handle('desktop:open-config-file', async () => {
   );
   const result = await shell.openPath(configPath);
   return result ? { ok: false, code: 'open-config-file-failed', error: sanitizeDesktopError(result) } : { ok: true };
+});
+
+ipcMain.handle('desktop:reveal-in-folder', async (_event, targetPath: unknown) => {
+  // 2026-09 修复：「在文件夹中打开」此前误用 open-data-directory（打开
+  // 数据目录而非文档所在目录）。showItemInFolder 在 Win 资源管理器/
+  // mac Finder 中定位并选中文件；传父目录则直接打开。
+  if (typeof targetPath !== 'string' || targetPath.length === 0) {
+    return { ok: false, code: 'invalid-path', error: 'Path must be a non-empty string' };
+  }
+  if (!path.isAbsolute(targetPath)) {
+    return { ok: false, code: 'invalid-path', error: 'Path must be absolute' };
+  }
+  try {
+    shell.showItemInFolder(targetPath);
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, code: 'reveal-in-folder-failed', error: sanitizeDesktopError(error) };
+  }
 });
 
 ipcMain.handle('desktop:open-external', async (_event, url: unknown) => {

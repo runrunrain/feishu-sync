@@ -68,6 +68,10 @@ const desktopApi: DesktopAPI = {
     return ipcRenderer.invoke('desktop:open-external', url);
   },
 
+  revealInFolder: async (absolutePath: string): Promise<DesktopActionResult> => {
+    return ipcRenderer.invoke('desktop:reveal-in-folder', absolutePath);
+  },
+
   autoStart: {
     getStatus: async (): Promise<AutoStartStatus> => {
       return ipcRenderer.invoke('desktop:auto-start:get-status');
