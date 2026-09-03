@@ -373,7 +373,7 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
   return (
     <div className="flex flex-col gap-4">
       <VersionUpdateAlert onJumpToSettings={onJumpToSettings} />
-      <GlobalStatusBar onJumpToSettings={onJumpToSettings} />
+      <GlobalStatusBar />
 
       {/*
         v0.2.9 三栏布局增强（在 v0.2.8 三栏基础上）：

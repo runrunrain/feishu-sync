@@ -11,6 +11,7 @@
  */
 
 import { Wifi, WifiOff, ArrowUpCircle } from 'lucide-react';
+import { AppVersionButton } from './AppVersionButton';
 
 // 构建时由 vite 注入（package.json version），顶部栏版本徽标与「关于与更新」保持一致。
 declare const __APP_VERSION__: string;
@@ -41,14 +42,16 @@ export function TopBar({ currentArea, onAreaChange, authReady, pendingCount, upd
         - 左右 padding 16→24/32px（lg），主区导航不再贴边
         - nav gap-1→gap-2，主区按钮之间留呼吸
       */}
-      {/* Left: seal logo + title */}
-      <div className="flex min-w-0 items-center gap-3 lg:min-w-[160px]">
-        <div className="w-9 h-9 rounded-sm bg-seal flex items-center justify-center shadow-sm transition-transform duration-200 hover:scale-105 hover:shadow-md">
+      {/* Left: seal logo + title + version button */}
+      <div className="flex min-w-0 items-center gap-3 lg:min-w-[170px]">
+        <div className="w-9 h-9 rounded-sm bg-seal flex items-center justify-center shadow-sm transition-transform duration-200 hover:scale-105 hover:shadow-md shrink-0">
           <span className="text-white font-kai text-base font-medium leading-none">飞</span>
         </div>
-        <div className="flex min-w-0 flex-col leading-tight gap-0.5">
+        <div className="flex min-w-0 flex-col leading-tight gap-0.5 justify-center">
           <span className="truncate text-sm font-semibold font-kai text-ink">飞书同步</span>
-          <span className="hidden text-[10px] text-ink-faint font-mono lg:block">v{__APP_VERSION__}</span>
+          <div className="flex items-center">
+            <AppVersionButton onJumpToSettings={() => onAreaChange('settings')} />
+          </div>
         </div>
       </div>
 

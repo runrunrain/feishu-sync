@@ -1,12 +1,13 @@
 /**
- * VersionStatusBarItem - 总览页状态栏版本更新快捷入口
+ * AppVersionButton - 左上角版本号快捷操作按钮
  *
- * 挂载在 GlobalStatusBar 中：
- *   - 常驻显示当前版本号（如 v0.3.7）
- *   - 根据版本号对比与更新状态机动态演变：
- *     - 发现新版本：亮起印章色徽标，提示「可更新至 v0.3.8」，点击直达设置更新页
- *     - 下载中/已就绪：实时提示进度与就绪状态
- *     - 最新/空闲：点击触发快速检查更新，并根据版本号状态弹出 Toast 提示
+ * 嵌入在 TopBar 左上角应用标题下方：
+ *   - 平时为紧凑精致的版本号标签（如 v0.3.8），hover 轻微高亮并提示状态与检查更新；
+ *   - 点击时：
+ *     - 若有新版本或下载中：一键直达设置更新页；
+ *     - 若已下载就绪：一键提示安装重启；
+ *     - 若已是最新/空闲：快速触发一次云端检查更新并弹出 Toast 反馈；
+ *   - 新版本可用时：亮起印章色徽标与呼吸点，提示「可更新至 v0.3.9」。
  */
 
 import { useState } from 'react';
@@ -15,21 +16,19 @@ import {
   CheckCircle,
   Download,
   RefreshCw,
-  Tag,
-  AlertCircle,
   ShieldCheck,
+  AlertCircle,
 } from 'lucide-react';
 import { useDesktopUpdate } from '../hooks/useDesktopUpdate';
 import { useToast } from './common/Toast';
 import { appLogger } from '../utils/appLogger';
 
-interface VersionStatusBarItemProps {
-  /** 点击跳转到设置区对应 tab（通常为 'application'） */
+interface AppVersionButtonProps {
   onJumpToSettings?: (tab?: 'application') => void;
   className?: string;
 }
 
-export function VersionStatusBarItem({ onJumpToSettings, className = '' }: VersionStatusBarItemProps) {
+export function AppVersionButton({ onJumpToSettings, className = '' }: AppVersionButtonProps) {
   const toast = useToast();
   const {
     currentVersion,
@@ -46,7 +45,7 @@ export function VersionStatusBarItem({ onJumpToSettings, className = '' }: Versi
   const [localChecking, setLocalChecking] = useState(false);
 
   const handleClick = async () => {
-    // 1. 如果已下载就绪，支持直接在总览页一键安装并重启
+    // 1. 若已下载就绪，支持直接一键安装重启
     if (phase === 'downloaded') {
       try {
         toast.push({
@@ -64,19 +63,19 @@ export function VersionStatusBarItem({ onJumpToSettings, className = '' }: Versi
           onJumpToSettings?.('application');
         }
       } catch (err) {
-        appLogger.error('version-status-bar', 'installAndRestart failed', err);
+        appLogger.error('app-version-btn', 'installAndRestart failed', err);
         onJumpToSettings?.('application');
       }
       return;
     }
 
-    // 2. 如果检测到了新版本或正在下载，快捷跳转到设置页「关于与更新」查看详情与操作
+    // 2. 若检测到了新版本或正在下载，快捷直达设置页更新卡片
     if (phase === 'available' || phase === 'downloading') {
       onJumpToSettings?.('application');
       return;
     }
 
-    // 3. 如果不支持应用内更新（如浏览器开发环境或未打包构建）
+    // 3. 若环境不支持应用内更新（如未打包或开发浏览器环境）
     if (!isSupported) {
       toast.push({
         type: 'info',
@@ -87,7 +86,7 @@ export function VersionStatusBarItem({ onJumpToSettings, className = '' }: Versi
       return;
     }
 
-    // 4. 其他情况（idle / up-to-date / error）：快捷触发一次检查更新
+    // 4. 其他状态（idle / up-to-date / error）：快捷触发检查更新
     setLocalChecking(true);
     toast.push({
       type: 'info',
@@ -129,7 +128,7 @@ export function VersionStatusBarItem({ onJumpToSettings, className = '' }: Versi
         });
       }
     } catch (err) {
-      appLogger.error('version-status-bar', 'manual check failed', err);
+      appLogger.error('app-version-btn', 'manual check failed', err);
       toast.push({
         type: 'error',
         message: '检查更新发生异常',
@@ -142,44 +141,44 @@ export function VersionStatusBarItem({ onJumpToSettings, className = '' }: Versi
 
   const busy = isChecking || localChecking || isDownloading || isInstalling;
 
-  // 渲染图标
+  // 图标
   const renderIcon = () => {
     if (busy || phase === 'checking') {
-      return <RefreshCw className="w-3.5 h-3.5 text-seal animate-spin shrink-0" />;
+      return <RefreshCw className="w-2.5 h-2.5 text-seal animate-spin shrink-0" />;
     }
     if (phase === 'downloading') {
-      return <Download className="w-3.5 h-3.5 text-seal animate-bounce shrink-0" />;
+      return <Download className="w-2.5 h-2.5 text-seal animate-bounce shrink-0" />;
     }
     if (phase === 'downloaded') {
-      return <CheckCircle className="w-3.5 h-3.5 text-jade shrink-0" />;
+      return <CheckCircle className="w-2.5 h-2.5 text-jade shrink-0" />;
     }
     if (phase === 'available') {
-      return <ArrowUpCircle className="w-3.5 h-3.5 text-seal animate-pulse-seal shrink-0" />;
+      return <ArrowUpCircle className="w-2.5 h-2.5 text-seal animate-pulse-seal shrink-0" />;
     }
     if (phase === 'error') {
-      return <AlertCircle className="w-3.5 h-3.5 text-seal-2 shrink-0" />;
+      return <AlertCircle className="w-2.5 h-2.5 text-seal-2 shrink-0" />;
     }
     if (phase === 'up-to-date') {
-      return <ShieldCheck className="w-3.5 h-3.5 text-jade shrink-0" />;
+      return <ShieldCheck className="w-2.5 h-2.5 text-jade/70 shrink-0" />;
     }
-    return <Tag className="w-3.5 h-3.5 text-ink-faint group-hover:text-seal shrink-0 transition-colors" />;
+    return null;
   };
 
   // 样式微调
-  const getContainerStyle = () => {
+  const getStyle = () => {
     if (phase === 'available') {
-      return 'border-seal/40 bg-seal/5 hover:bg-seal/10 text-seal font-medium shadow-xs';
+      return 'border-seal/40 bg-seal/10 text-seal hover:bg-seal/15 font-medium shadow-xs';
     }
     if (phase === 'downloaded') {
-      return 'border-jade/40 bg-jade/5 hover:bg-jade/10 text-jade font-medium shadow-xs';
+      return 'border-jade/40 bg-jade/10 text-jade hover:bg-jade/15 font-medium shadow-xs';
     }
     if (phase === 'downloading') {
-      return 'border-seal/30 bg-paper-2 hover:bg-paper text-seal font-medium';
+      return 'border-seal/30 bg-seal/5 text-seal hover:bg-seal/10';
     }
     if (phase === 'error') {
-      return 'border-seal-2/30 bg-seal-2/5 hover:bg-seal-2/10 text-ink-soft';
+      return 'border-seal-2/30 bg-seal-2/5 text-seal-2 hover:bg-seal-2/10';
     }
-    return 'border-line/70 bg-paper hover:bg-paper-2 text-ink-soft hover:border-line hover:text-ink';
+    return 'border-transparent text-ink-faint hover:text-seal hover:bg-paper-2 hover:border-line';
   };
 
   return (
@@ -187,29 +186,21 @@ export function VersionStatusBarItem({ onJumpToSettings, className = '' }: Versi
       type="button"
       onClick={handleClick}
       disabled={busy && phase !== 'downloading'}
-      title={versionTip.tooltip}
-      aria-label={`版本与更新：${versionTip.statusText}`}
-      className={`group relative inline-flex items-center gap-1.5 px-2.5 py-1 text-xs rounded-md border font-sans-ui transition-all select-none cursor-pointer disabled:cursor-not-allowed ${getContainerStyle()} ${className}`}
+      title={`${versionTip.tooltip}\n（点击检查更新或查看详情）`}
+      aria-label={`版本号及更新状态：${versionTip.statusText}`}
+      className={`group relative inline-flex items-center gap-1 px-1.5 py-0.5 text-[11px] font-mono leading-none rounded border transition-all select-none cursor-pointer disabled:cursor-not-allowed ${getStyle()} ${className}`}
     >
       {renderIcon()}
-
-      <span className="font-mono text-xs tracking-tight">
-        {versionTip.shortLabel}
+      <span className="tracking-tight">
+        {phase === 'available'
+          ? `可更新至 ${versionTip.displayLatestVersion}`
+          : versionTip.displayCurrentVersion}
       </span>
-
-      {/* 新版本呼吸小红点 */}
       {phase === 'available' && (
         <span
           aria-hidden="true"
-          className="w-1.5 h-1.5 rounded-full bg-seal animate-pulse-seal"
+          className="w-1.5 h-1.5 rounded-full bg-seal animate-pulse-seal ml-0.5"
         />
-      )}
-
-      {/* 升级类型小标签（如功能更新/修复补丁） */}
-      {phase === 'available' && versionTip.upgradeKindLabel && (
-        <span className="hidden sm:inline-block ml-0.5 rounded px-1 py-0.2 text-[10px] bg-seal/15 text-seal">
-          {versionTip.upgradeKindLabel}
-        </span>
       )}
     </button>
   );

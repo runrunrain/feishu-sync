@@ -18,7 +18,6 @@ import { useToast } from './common/Toast';
 import { appLogger } from '../utils/appLogger';
 import { refreshMappingIndex, rebuildIndex } from '../api/client';
 import { isUsableWikiUrl, pickFirstValidWikiUrl } from '../utils/wikiUrl';
-import { VersionStatusBarItem } from './VersionStatusBarItem';
 
 function formatRelativeTime(timestamp: number | null): string {
   if (!timestamp) return '--';
@@ -38,11 +37,7 @@ function formatNextCheck(timestamp: number | null): string {
   return `${Math.floor(diff / 3600)} 小时后`;
 }
 
-interface GlobalStatusBarProps {
-  onJumpToSettings?: (tab?: 'application') => void;
-}
-
-export function GlobalStatusBar({ onJumpToSettings }: GlobalStatusBarProps = {}) {
+export function GlobalStatusBar() {
   const { ready: authReady, authStatus } = useAuthStatus();
   const [refreshTick, setRefreshTick] = useState(0);
   const { pendingCount, lastSyncTime, nextCheckTime, isDetecting } = useSyncStatus({ refreshTick });
@@ -201,13 +196,6 @@ export function GlobalStatusBar({ onJumpToSettings }: GlobalStatusBarProps = {})
               检测中
             </span>
           )}
-        </div>
-
-        <span className="w-px h-4 bg-line shrink-0" />
-
-        {/* Version & Update Quick Entry */}
-        <div className="flex items-center shrink-0">
-          <VersionStatusBarItem onJumpToSettings={onJumpToSettings} />
         </div>
       </div>
 
