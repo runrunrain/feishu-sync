@@ -37,6 +37,12 @@ interface UseSyncResult {
   error: string | null;
   /** 本次（或最近一次）syncDocuments 提交的文档总数；0 表示尚未发起同步。 */
   total: number;
+  /** 已完成（成功+失败）的文档数——逐文档串行提交驱动，真实进度。 */
+  done: number;
+  /** 当前正在同步的文档标题（串行提交中实时更新；空闲时 null）。 */
+  currentTitle: string | null;
+  /** 本次已失败文档数（实时）。 */
+  failedCount: number;
   syncDocuments: (
     documents: ChangedDocument[],
     options?: SyncDocumentOptions,
@@ -54,6 +60,9 @@ export function SyncProvider({ children }: { children: ReactNode }) {
   const [indexResult, setIndexResult] = useState<IndexResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [total, setTotal] = useState(0);
+  const [done, setDone] = useState(0);
+  const [currentTitle, setCurrentTitle] = useState<string | null>(null);
+  const [failedCount, setFailedCount] = useState(0);
 
   const syncDocuments = useCallback(async (
     documents: ChangedDocument[],
@@ -68,17 +77,66 @@ export function SyncProvider({ children }: { children: ReactNode }) {
     setError(null);
     setSyncResult(null);
     setTotal(documents.length);
+    setDone(0);
+    setFailedCount(0);
+    setCurrentTitle(documents[0]?.title ?? null);
+
+    // 2026-09 真实进度修复：改为逐文档串行提交（后端本就按文档独立原子
+    // 提交，语义等价；本地 HTTP 开销可忽略）。每完成一个文档即推进
+    // done / currentTitle / failedCount，SyncProgress 得以展示真实百分比
+    // 与当前正在同步的文档名。结果聚合成单份 SyncResult 供报告面板使用。
+    const syncedAcc: SyncResult['syncedDocuments'] = [];
+    const failedAcc: SyncResult['failedDocuments'] = [];
+    let lastResult: SyncResult | null = null;
+    let firstStartedAt = '';
+    let durationMs = 0;
 
     try {
-      const result = await syncDocs(documents, options);
-      setSyncResult(result);
-      return result;
+      for (let i = 0; i < documents.length; i += 1) {
+        const doc = documents[i];
+        setCurrentTitle(doc.title);
+        try {
+          const result = await syncDocs([doc], options);
+          lastResult = result;
+          if (!firstStartedAt && result.startedAt) firstStartedAt = result.startedAt;
+          durationMs += result.duration ?? 0;
+          syncedAcc.push(...(result.syncedDocuments ?? []));
+          failedAcc.push(...(result.failedDocuments ?? []));
+          setFailedCount(failedAcc.length);
+        } catch (docErr) {
+          // 单文档网络层失败：记入 failed 并继续后续文档，错误详情在
+          // 结果报告中可见。
+          const message = docErr instanceof Error ? docErr.message : 'Sync failed';
+          failedAcc.push({
+            objToken: doc.objToken,
+            title: doc.title,
+            error: message,
+            retryable: true,
+          });
+          setFailedCount(failedAcc.length);
+        }
+        setDone(i + 1);
+      }
+
+      const completedAt = new Date().toISOString();
+      const aggregated: SyncResult = {
+        ...(lastResult as SyncResult),
+        success: failedAcc.length === 0,
+        syncedDocuments: syncedAcc,
+        failedDocuments: failedAcc,
+        startedAt: firstStartedAt || completedAt,
+        completedAt,
+        duration: durationMs,
+      };
+      setSyncResult(aggregated);
+      return aggregated;
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Sync failed';
       setError(message);
       return null;
     } finally {
       setSyncing(false);
+      setCurrentTitle(null);
     }
   }, []);
 
@@ -112,10 +170,13 @@ export function SyncProvider({ children }: { children: ReactNode }) {
     indexResult,
     error,
     total,
+    done,
+    currentTitle,
+    failedCount,
     syncDocuments,
     syncIndex,
     clear,
-  }), [syncing, indexing, syncResult, indexResult, error, total, syncDocuments, syncIndex, clear]);
+  }), [syncing, indexing, syncResult, indexResult, error, total, done, currentTitle, failedCount, syncDocuments, syncIndex, clear]);
 
   return (
     <SyncContext.Provider value={value}>

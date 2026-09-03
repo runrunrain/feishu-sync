@@ -382,6 +382,16 @@ export function SyncView({ active = true }: SyncViewProps) {
 
   return (
     <div className="space-y-5">
+      {/* 2026-09：同步进度常驻顶部（sticky），滚动中始终可见，
+          展示真实百分比与当前正在同步的文档名。 */}
+      <SyncProgress
+        syncing={syncing}
+        total={sync.total > 0 ? sync.total : selectedDocs.length}
+        done={sync.done}
+        currentTitle={sync.currentTitle}
+        failedCount={sync.failedCount}
+      />
+
       {/*
         同步区布局重构（v0.2.9）：
         原单列长堆叠（变更列表 → 操作面板 → 进度 → 结果）在全宽主区下
@@ -424,12 +434,6 @@ export function SyncView({ active = true }: SyncViewProps) {
             syncing={syncing}
             contentAdaptationEnabled={contentAdaptationEnabled}
             onStart={handleStart}
-          />
-
-          <SyncProgress
-            syncing={syncing}
-            total={sync.total > 0 ? sync.total : selectedDocs.length}
-            done={sync.syncResult ? sync.syncResult.syncedDocuments.length + sync.syncResult.failedDocuments.length : 0}
           />
 
           {sync.error && (
