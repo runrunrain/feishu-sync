@@ -276,7 +276,9 @@ describe('device auth flow', () => {
     const scopeArg = execFileMock.mock.calls[0][1].at(-1) as string;
     expect(scopeArg.split(' ')).toContain('wiki:node:retrieve');
     expect(scopeArg.split(' ')).toContain('offline_access');
-    expect(scopeArg.split(' ')).toHaveLength(9);
+    // 2026-09：DEFAULT 新增 docs:document:read（新版飞书 docx 读取 scope 名）。
+    expect(scopeArg.split(' ')).toContain('docs:document:read');
+    expect(scopeArg.split(' ')).toHaveLength(10);
   });
 
   it('rejects a second start while a flow is pending (409), and clears after complete', async () => {

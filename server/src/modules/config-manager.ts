@@ -41,6 +41,11 @@ const DEFAULT_CONFIG_PATH = path.join(os.homedir(), '.feishu-sync', 'config.json
  * Minimal user scopes for read-only wiki sync (must match lark-cli auth login).
  * Exported so LarkCliManager's device-flow scope assembly shares the same
  * default source instead of drifting into a third copy of the list.
+ *
+ * 2026-09 补充 docs:document:read：lark-cli ≥1.0.8x 的 docs 命令族在新版
+ * 飞书 scope 体系中依赖该新名（与旧名 docx:document:readonly 并存）。
+ * 旧授权只持有旧名时，checkAuthReady 的别名等价表（见 lark-cli-client）
+ * 会将其视为已满足，不强迫用户重新授权。
  */
 export const DEFAULT_REQUIRED_SCOPES = [
   'wiki:node:retrieve',
@@ -48,10 +53,20 @@ export const DEFAULT_REQUIRED_SCOPES = [
   'docs:document.content:read',
   'sheets:spreadsheet:read',
   'docx:document:readonly',
+  'docs:document:read',
   'drive:drive.metadata:readonly',
   'docs:document.media:download',
   'slides:presentation:read',
   'offline_access',
+];
+
+/**
+ * 飞书 scope 新旧名等价组：授权端可能只授予其中一个名字。比对
+ * requiredScopes 时组内任一命中即视为满足，避免新名/旧名交替期的误报
+ * 「缺少权限」阻断认证。
+ */
+export const SCOPE_ALIAS_GROUPS: ReadonlyArray<readonly string[]> = [
+  ['docx:document:readonly', 'docs:document:read'],
 ];
 
 /**
@@ -874,9 +889,14 @@ export class ConfigManager {
       // this legacy field from the on-disk schema.
       watchedRootUrls: getEnabledWatchedRootUrls({ watchedRoots }),
       larkCliPath: typeof raw.larkCliPath === 'string' ? raw.larkCliPath : undefined,
-      requiredScopes: Array.isArray(raw.requiredScopes) && raw.requiredScopes.length > 0
-        ? raw.requiredScopes
-        : DEFAULT_REQUIRED_SCOPES,
+      // Additive scope migration (2026-09)：旧配置补齐新版飞书 scope 名
+      // docs:document:read（lark-cli ≥1.0.8x docs 命令族依赖；授权端新旧名
+      // 只授其一时由 checkAuthReady 的 SCOPE_ALIAS_GROUPS 等价兑底）。
+      requiredScopes: this.migrateRequiredScopes(
+        Array.isArray(raw.requiredScopes) && raw.requiredScopes.length > 0
+          ? raw.requiredScopes
+          : DEFAULT_REQUIRED_SCOPES,
+      ),
       enableAutoStart: typeof raw.enableAutoStart === 'boolean'
         ? raw.enableAutoStart
         : true,
@@ -886,6 +906,19 @@ export class ConfigManager {
     };
 
     return migrated ? { ...config, _migrated: true } : config;
+  }
+
+  /**
+   * Additive scope migration：把 DEFAULT 中新增的、旧配置缺失的 scope
+   * 追加到用户列表末尾（不删除用户自定义项，不重排）。仅迁移已知的新增
+   * 项，避免未来 DEFAULT 演进时意外改写用户显式裁剪过的列表。
+   */
+  private migrateRequiredScopes(scopes: string[]): string[] {
+    const ADDITIVE = ['docs:document:read'];
+    const owned = new Set(scopes);
+    const additions = ADDITIVE.filter((s) => !owned.has(s));
+    if (additions.length === 0) return scopes;
+    return [...scopes, ...additions];
   }
 
   /**

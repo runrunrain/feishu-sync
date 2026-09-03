@@ -127,6 +127,67 @@ describe('LarkCliClient output parsing and classification', () => {
     }
   });
 
+  it('scope alias equivalence: docs:document:read satisfied by legacy docx:document:readonly grant', async () => {
+    // 2026-09 实测事故：旧授权只持有旧名 docx:document:readonly，新 DEFAULT
+    // 要求 docs:document:read 时被误报「缺少权限」阻断认证。别名组内任一
+    // 命中即视为满足。
+    const client = new LarkCliClient({
+      requiredScopes: [
+        'wiki:node:retrieve',
+        'docx:document:readonly',
+        'docs:document:read',
+        'offline_access',
+      ],
+      timeout: 1_000,
+      larkCliPath: 'unused',
+    });
+    let call = 0;
+    (client as any).execute = async () => {
+      call += 1;
+      if (call === 1) return { ok: true, data: { version: 'lark-cli 1.0.89' } };
+      return {
+        ok: true,
+        data: {
+          identity: 'user',
+          identities: {
+            user: {
+              scope: 'wiki:node:retrieve docx:document:readonly offline_access',
+            },
+          },
+        },
+      };
+    };
+
+    const readiness = await client.checkAuthReady();
+    expect(readiness.ready).toBe(true);
+    expect(readiness.missingScopes).toEqual([]);
+  });
+
+  it('still reports genuinely missing scopes beyond the alias groups', async () => {
+    const client = new LarkCliClient({
+      requiredScopes: ['docs:document:read', 'slides:presentation:read'],
+      timeout: 1_000,
+      larkCliPath: 'unused',
+    });
+    let call = 0;
+    (client as any).execute = async () => {
+      call += 1;
+      if (call === 1) return { ok: true, data: { version: 'lark-cli 1.0.89' } };
+      return {
+        ok: true,
+        data: {
+          identity: 'user',
+          identities: { user: { scope: 'docx:document:readonly' } },
+        },
+      };
+    };
+
+    const readiness = await client.checkAuthReady();
+    expect(readiness.ready).toBe(false);
+    expect(readiness.missingScopes).toEqual(['slides:presentation:read']);
+    expect(readiness.error).toContain('开始飞书认证');
+  });
+
   it('retains parent_node_token from wiki node detail', async () => {
     const client = createClient();
     (client as any).execute = async () => ({

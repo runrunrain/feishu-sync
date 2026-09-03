@@ -18,6 +18,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'util';
+import { SCOPE_ALIAS_GROUPS } from './config-manager.js';
 import type { LarkCliNodeInfo, LarkCliConfig } from '../types/index.js';
 
 const execFileAsync = promisify(execFile);
@@ -524,14 +525,25 @@ export class LarkCliClient {
         };
       }
 
-      // 3. Check required scopes (scopes are space-separated string in identities.user.scope)
+      // 3. Check required scopes (scopes are space-separated string in identities.user.scope).
+      //    SCOPE_ALIAS_GROUPS：飞书新旧 scope 名交替期，授权端可能只授予组内
+      //    某一个名字（如旧 docx:document:readonly vs 新 docs:document:read）。
+      //    组内任一命中即视为满足，避免对新名的误报阻断认证（2026-09 实测
+      //    「缺少权限：docs:document:read」即旧授权只持旧名触发）。
       const scopesString = statusResult.data.identities?.user?.scope || '';
       const currentScopes = scopesString.split(' ').filter((s: string) => s.length > 0);
-      const missingScopes = this.config.requiredScopes.filter((s) => !currentScopes.includes(s));
+      const currentScopeSet = new Set(currentScopes);
+      const isScopeSatisfied = (scope: string): boolean => {
+        if (currentScopeSet.has(scope)) return true;
+        return SCOPE_ALIAS_GROUPS.some(
+          (group) => group.includes(scope) && group.some((alias) => currentScopeSet.has(alias)),
+        );
+      };
+      const missingScopes = this.config.requiredScopes.filter((s) => !isScopeSatisfied(s));
       if (missingScopes.length > 0) {
         return {
           ready: false,
-          error: `缺少权限：${missingScopes.join(', ')}，请执行 lark-cli auth login --scope`,
+          error: `缺少权限：${missingScopes.join(', ')}。请在应用内点击「开始飞书认证」重新授权补齐（或执行 lark-cli auth login --scope）`,
           larkCliVersion,
           currentScopes,
           missingScopes,
