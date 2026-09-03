@@ -16,8 +16,6 @@ import { TopBar, MainArea } from './components/TopBar';
 import { Dashboard } from './views/Dashboard';
 import { SyncView } from './views/SyncView';
 import { SettingsView } from './views/SettingsView';
-import { useAuthStatus } from './hooks/useAuthStatus';
-import { useSyncStatus } from './hooks/useSyncStatus';
 import { useDesktopUpdateBadge } from './hooks/useDesktopUpdate';
 import { SyncProvider } from './hooks/useSync';
 
@@ -25,8 +23,6 @@ function AppShell() {
   const [currentArea, setCurrentArea] = useState<MainArea>('overview');
   const [settingsFocusTab, setSettingsFocusTab] = useState<'application' | undefined>(undefined);
   const [settingsFocusNonce, setSettingsFocusNonce] = useState(0);
-  const { ready: authReady } = useAuthStatus();
-  const { pendingCount } = useSyncStatus();
   // 全局新版本徽标（仅桌面端；启动时主进程会静默检查一次更新）。
   const { availableVersion } = useDesktopUpdateBadge();
 
@@ -49,8 +45,6 @@ function AppShell() {
           }
           setCurrentArea(area);
         }}
-        authReady={authReady}
-        pendingCount={pendingCount}
         updateVersion={availableVersion}
       />
       {/*
@@ -64,13 +58,13 @@ function AppShell() {
         - 注意：隐藏主区的 window 级交互（如 NodeTreeView 的 ↑/↓ 键盘
           导航）需各自以 offsetParent 可见性门控，避免后台响应按键
       */}
-      <main className="flex-1 overflow-auto scrollbar-thin">
+      <main className="flex-1 min-h-0 overflow-auto scrollbar-thin flex flex-col">
         <div
-          className={`px-4 py-4 sm:px-6 lg:px-8 ${
-            currentArea === 'settings' ? 'mx-auto max-w-[1440px]' : 'w-full'
+          className={`flex-1 min-h-0 flex flex-col px-4 py-3 sm:px-6 lg:px-8 ${
+            currentArea === 'settings' ? 'mx-auto max-w-[1440px] w-full' : 'w-full'
           }`}
         >
-          <div className={currentArea === 'overview' ? 'animate-fade-in' : 'hidden'}>
+          <div className={currentArea === 'overview' ? 'flex-1 min-h-0 flex flex-col animate-fade-in' : 'hidden'}>
             <Dashboard
               onJumpToSync={() => setCurrentArea('sync')}
               onJumpToSettings={handleJumpToSettings}

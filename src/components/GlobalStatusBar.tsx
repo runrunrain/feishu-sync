@@ -140,54 +140,54 @@ export function GlobalStatusBar() {
   };
 
   return (
-    <div className="flex flex-col gap-3 px-4 py-3 bg-card-bg border border-line rounded-md shadow-sm lg:flex-row lg:items-center lg:justify-between lg:gap-6 lg:px-5">
+    <div className="flex flex-wrap items-center gap-x-3.5 gap-y-1.5 px-3 py-1.5 sm:px-3.5 bg-card-bg border border-line rounded-md shadow-sm min-h-[38px]">
       {/*
-        状态条布局重构（2026-06-19）：
-        - px-4→px-5、py-2.5→py-3：内边距匹配 Card 内边距节奏
-        - gap-4→gap-6：左右两个分组之间留呼吸
-        - 内部分组 gap-1.5→gap-2.5：图标与文字间距更舒展
+        状态条紧凑化（~38-40px 级，分组左聚）：
+        - 承载全部全局状态徽标（认证、待同步篇数、检测时间）
+        - 压缩 gap 与 padding，消除空旷留白
+        - 操作按钮紧随状态信息左聚展示，彻底消除宽屏下 600px+ 空洞
       */}
-      <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2 lg:flex-1 lg:gap-x-5">
+      <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 sm:gap-x-3.5">
         {/* Auth */}
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex items-center gap-1.5 shrink-0">
           {authReady ? (
             <>
               <span className="w-1.5 h-1.5 rounded-full bg-jade" />
-              <Wifi className="w-4 h-4 text-jade" />
-              <span className="text-sm text-ink-soft font-sans-ui">
+              <Wifi className="w-3.5 h-3.5 text-jade" />
+              <span className="text-xs text-ink-soft font-sans-ui">
                 已认证{lauthVersion(authStatus?.larkCliVersion)}
               </span>
             </>
           ) : (
             <>
               <span className="w-1.5 h-1.5 rounded-full bg-seal animate-pulse-seal" />
-              <WifiOff className="w-4 h-4 text-seal" />
-              <span className="text-sm text-seal font-sans-ui">未认证</span>
+              <WifiOff className="w-3.5 h-3.5 text-seal" />
+              <span className="text-xs text-seal font-sans-ui">未认证</span>
             </>
           )}
         </div>
 
-        <span className="w-px h-4 bg-line shrink-0" />
+        <span className="w-px h-3.5 bg-line shrink-0" />
 
         {/* Pending count */}
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex items-center gap-1.5 shrink-0">
           <span
-            className={`text-base font-kai leading-none ${
+            className={`text-sm font-kai font-semibold leading-none ${
               pendingCount > 0 ? 'text-seal' : 'text-jade'
             }`}
           >
             {pendingCount}
           </span>
-          <span className="text-sm text-ink-soft font-sans-ui">
+          <span className="text-xs text-ink-soft font-sans-ui">
             {pendingCount > 0 ? '篇待同步' : '已就绪'}
           </span>
         </div>
 
-        <span className="w-px h-4 bg-line shrink-0" />
+        <span className="w-px h-3.5 bg-line shrink-0" />
 
         {/* Last/next detect */}
-        <div className="flex items-center gap-2 text-xs text-ink-faint font-sans-ui shrink-0">
-          <Clock className="w-3.5 h-3.5" />
+        <div className="flex items-center gap-1.5 text-xs text-ink-faint font-sans-ui shrink-0">
+          <Clock className="w-3 h-3" />
           <span>上次 {formatRelativeTime(lastSyncTime)}</span>
           {!isDetecting && nextCheckTime && (
             <>
@@ -204,15 +204,18 @@ export function GlobalStatusBar() {
         </div>
       </div>
 
-      <div className="flex flex-wrap items-center gap-2.5 lg:shrink-0">
+      <span className="w-px h-3.5 bg-line shrink-0 hidden sm:inline-block" />
+
+      {/* 操作按钮组：紧随状态指示左聚 */}
+      <div className="flex items-center gap-2 shrink-0">
         <button
           type="button"
           onClick={handleRefreshIndex}
           disabled={refreshing}
           title="重新扫描本地知识库并重建 documents 索引"
-          className="inline-flex items-center gap-1.5 px-3 py-2 text-xs text-ink-soft border border-line rounded-md bg-paper hover:bg-paper-2 font-sans-ui transition-colors disabled:opacity-50"
+          className="inline-flex items-center gap-1 px-2.5 py-1 text-xs text-ink-soft border border-line rounded bg-paper hover:bg-paper-2 font-sans-ui transition-colors disabled:opacity-50"
         >
-          <Database className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
+          <Database className={`w-3 h-3 ${refreshing ? 'animate-spin' : ''}`} />
           {refreshing ? '重建中' : '重建索引'}
         </button>
         <button
@@ -220,9 +223,9 @@ export function GlobalStatusBar() {
           onClick={handleDetect}
           disabled={detectDisabled}
           title={detectTooltip}
-          className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs text-seal border border-seal rounded-md bg-paper hover:bg-seal/5 font-sans-ui transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          className="inline-flex items-center gap-1 px-3 py-1 text-xs text-seal border border-seal rounded bg-paper hover:bg-seal/5 font-sans-ui transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
         >
-          <RefreshCw className={`w-3.5 h-3.5 ${detecting || isDetecting ? 'animate-spin' : ''}`} />
+          <RefreshCw className={`w-3 h-3 ${detecting || isDetecting ? 'animate-spin' : ''}`} />
           {detecting || isDetecting ? '检测中' : '立即检测'}
         </button>
       </div>

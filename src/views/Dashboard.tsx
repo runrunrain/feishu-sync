@@ -3,15 +3,12 @@
  *
  * 结构：
  *   - 顶部 GlobalStatusBar（认证/上次/下次/立即检测/刷新索引）
- *   - 左 260px：NodeTreeView（飞书视图）或 LocalDirTreeView（本地视图）
- *     + D1 view toggle（伏羲 S1/S5，默认飞书）
- *   - 右 flex：OrphanFileAlert（仅 orphan_files.length>0 渲染）+ RecentChanges
- *     + NodeDetailCard（点击联动，D3 增强）
+ *   - 左 ~320px：NodeTreeView（固定飞书视图，支持拖拽调整 280-560px）
+ *   - 中 flex：DocPreviewPanel（本地文档内容预览 Markdown/CSV）
+ *   - 右 320-340px：可收起详情栏（OrphanFileAlert + NodeDetailCard + RecentChanges）
  *
- * v0.2.0 structure-align Phase D (D1/D2/D3)：
- *   - view 状态由 Dashboard 管理，切换时重新拉对应 API
- *   - 飞书视图：GET /api/mapping/tree?view=feishu → watchedRoots 分组 + filter
- *   - 本地视图：GET /api/mapping/tree?view=local  → LocalDirTreeView 重建目录
+ * 视图与同步：
+ *   - 固定飞书视图：GET /api/mapping/tree?view=feishu → watchedRoots 分组 + filter
  *   - NodeDetailCard.allNodes 传入完整 nodes 数组以解析父节点/子节点
  *
  * P1-1 修复：孤儿数据从 _index.json.orphan_files 拉取，同时驱动：
@@ -26,7 +23,6 @@ import { PanelRightClose, PanelRightOpen } from 'lucide-react';
 import { GlobalStatusBar } from '../components/GlobalStatusBar';
 import { VersionUpdateAlert } from '../components/VersionUpdateAlert';
 import { NodeTreeView } from '../components/NodeTreeView';
-import { LocalDirTreeView } from '../components/LocalDirTreeView';
 import { RecentChanges } from '../components/RecentChanges';
 import { NodeDetailCard } from '../components/NodeDetailCard';
 import { DocPreviewPanel } from '../components/DocPreviewPanel';
@@ -61,9 +57,8 @@ interface DashboardProps {
   onJumpToSettings?: (tab?: 'application') => void;
 }
 
-type NodeView = 'feishu' | 'local';
-
 // v0.2.9 布局偏好：左栏拖拽宽度 / 右栏收起状态，localStorage 持久化。
+// 需求 1：左侧树默认宽度加宽为 320px。
 const DEFAULT_LEFT_WIDTH = 320;
 const LEFT_WIDTH_KEY = 'feishu.layout.leftWidth';
 const RIGHT_COLLAPSED_KEY = 'feishu.layout.rightCollapsed';
@@ -72,7 +67,7 @@ function readLeftWidth(): number {
   try {
     const raw = localStorage.getItem(LEFT_WIDTH_KEY);
     const value = raw ? Number(raw) : NaN;
-    return Number.isFinite(value) && value >= 240 && value <= 560
+    return Number.isFinite(value) && value >= 280 && value <= 560
       ? value
       : DEFAULT_LEFT_WIDTH;
   } catch {
@@ -82,10 +77,8 @@ function readLeftWidth(): number {
 
 export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
   const { config } = useConfig();
-  // Single envelope per view; refreshed on view switch or manual refresh.
-  const [view, setView] = useState<NodeView>('feishu');
+  // 始终固定飞书视图（移除本地视图切换）
   const [feishuEnv, setFeishuEnv] = useState<TreeResponse | null>(null);
-  const [localEnv, setLocalEnv] = useState<TreeResponse | null>(null);
   const [changes, setChanges] = useState<ChangedDocument[]>([]);
   const [orphans, setOrphans] = useState<OrphanFile[]>([]);
   const [snapshot, setSnapshot] = useState<
@@ -104,8 +97,6 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
     (TreeNavTarget & { nonce: number }) | null
   >(null);
   const navigateTree = (target: TreeNavTarget) => {
-    // 自定义归档/分组树均在飞书视图下渲染，导航前确保视图正确。
-    if (view !== 'feishu') setView('feishu');
     setFocusRequest({ ...target, nonce: Date.now() });
   };
   const toast = useToast();
@@ -161,7 +152,7 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
     const openAvail = rowWidth - rightOpenW - RIGHT_MARGIN - RESIZER_AND_GAP;
     if (closedAvail > 0 && openAvail > 0) {
       effectiveLeftWidth = Math.max(
-        220,
+        280,
         Math.min(560, Math.round((leftWidth / closedAvail) * openAvail)),
       );
     }
@@ -225,32 +216,11 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
     }
   }, [loadFeishu, toast]);
 
-  const loadLocal = useCallback(async () => {
-    try {
-      const env = await getMappingTreeDetailed('local', { includeOrphans: true });
-      setLocalEnv(env);
-    } catch (err) {
-      appLogger.error('dashboard', 'getMappingTreeDetailed(local) failed', err);
-      toast.push({
-        type: 'error',
-        message: '本地视图加载失败',
-        hint: err instanceof Error ? err.message : '',
-      });
-    }
-  }, [toast]);
-
   // Load feishu view by default.
   useEffect(() => {
     if (!rootUrl) return;
     void loadFeishu();
   }, [rootUrl, loadFeishu]);
-
-  // Lazy-load local view on first switch (D1).
-  useEffect(() => {
-    if (view === 'local' && !localEnv && rootUrl) {
-      void loadLocal();
-    }
-  }, [view, localEnv, rootUrl, loadLocal]);
 
   // 自定义归档文件夹列表：挂载即加载（与 watchedRoot 配置无关，
   // 归档文档 watched_root_url 为 NULL，天然不在结构检测范围内）。
@@ -314,11 +284,10 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
     });
   }, [loadDiffAndSnapshot]);
 
-  // The active node list depends on the view.
+  // The active node list (feishu view only).
   const activeNodes: MappingNode[] = useMemo(() => {
-    if (view === 'local') return localEnv?.nodes ?? [];
     return feishuEnv?.nodes ?? [];
-  }, [view, feishuEnv, localEnv]);
+  }, [feishuEnv]);
 
   const watchedRoots: WatchedRoot[] = useMemo(
     () => feishuEnv?.watched_roots ?? snapshot?.watched_roots ?? [],
@@ -380,14 +349,6 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
     return map;
   }, [activeNodes]);
 
-  const handleViewChange = (next: NodeView) => {
-    if (next === view) return;
-    setView(next);
-    // Reset selection when switching views so the detail card doesn't show
-    // a stale node that may not exist in the other view.
-    setSelectedToken(null);
-  };
-
   const handleOpenFolder = async (localPath: string) => {
     // 2026-09 修复：此前误调 openDataDirectory（打开数据目录而非文档所在
     // 目录）。现在把相对 local_path 拼上 knowledgeBaseRoot 得绝对路径，
@@ -421,59 +382,45 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
   };
 
   return (
-    <div className="flex flex-col gap-4">
+    <div className="flex-1 min-h-0 flex flex-col gap-2.5">
       <VersionUpdateAlert onJumpToSettings={onJumpToSettings} />
       <GlobalStatusBar />
 
       {/*
-        v0.2.9 三栏布局增强（在 v0.2.8 三栏基础上）：
-        - 左栏宽度可拖拽调整（ColumnResizer，240-560px，双击复位，localStorage 持久化）；
+        三栏布局（总览主区）：
+        - 左栏宽度可拖拽调整（ColumnResizer，280-560px，双击复位，localStorage 持久化）；
           通过 CSS 变量 --tree-w 驱动，仅 lg 及以上生效，窄屏仍纵向堆叠
         - 右栏可点击收起为 36px 竖条（PanelRightClose/Open，localStorage 持久化），
           把空间让给中部预览主区域
-        lg 及以上三栏等高（100dvh - TopBar56 - main padding32 - 状态条约56 - 间距），
-        各栏内部独立滚动。
+        - flex-1 min-h-0 吃满视口剩余高度，底部无多余空隙
       */}
-      <div ref={rowRef} className="flex min-w-0 flex-col gap-4 lg:h-[calc(100dvh-196px)] lg:min-h-[480px] lg:flex-row lg:gap-0">
-        {/* Left: node tree (feishu or local) — width adjustable via resizer；
+      <div ref={rowRef} className="flex min-w-0 flex-1 min-h-0 flex-col gap-3 lg:flex-row lg:gap-0">
+        {/* Left: node tree (feishu view only) — width adjustable via resizer；
             右栏展开时按等比例压缩后的 effectiveLeftWidth 渲染 */}
         <div
           className="min-w-0 min-h-[360px] lg:min-h-0 lg:h-full lg:shrink-0 lg:w-[var(--tree-w)]"
           style={{ '--tree-w': `${effectiveLeftWidth}px` } as CSSProperties}
         >
-          {view === 'feishu' ? (
-            <NodeTreeView
-              nodes={feishuEnv?.nodes}
-              selectedToken={selectedToken}
-              onSelect={setSelectedToken}
-              businessMarksByToken={businessMarksByToken}
-              orphanPaths={orphanPaths}
-              view={view}
-              onViewChange={handleViewChange}
-              watchedRoots={watchedRoots}
-              customFolders={customFolders}
-              onQuickAdd={() => setQuickAddOpen(true)}
-              focusRequest={focusRequest}
-              onRefreshed={loadFeishu}
-              onDeleteDoc={handleManualDeleteDoc}
-              className="h-full"
-            />
-          ) : (
-            <LocalDirTreeView
-              envelope={localEnv ?? undefined}
-              selectedToken={selectedToken}
-              onSelect={setSelectedToken}
-              onRefreshed={loadLocal}
-              view={view}
-              onViewChange={handleViewChange}
-              className="h-full"
-            />
-          )}
+          <NodeTreeView
+            nodes={feishuEnv?.nodes}
+            selectedToken={selectedToken}
+            onSelect={setSelectedToken}
+            businessMarksByToken={businessMarksByToken}
+            orphanPaths={orphanPaths}
+            watchedRoots={watchedRoots}
+            customFolders={customFolders}
+            onQuickAdd={() => setQuickAddOpen(true)}
+            focusRequest={focusRequest}
+            onRefreshed={loadFeishu}
+            onDeleteDoc={handleManualDeleteDoc}
+            className="h-full"
+          />
         </div>
 
         {/* Divider: drag to adjust left/center width ratio */}
         <ColumnResizer
           width={leftWidth}
+          min={280}
           defaultWidth={DEFAULT_LEFT_WIDTH}
           onResize={setLeftWidth}
         />
@@ -489,7 +436,7 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
 
         {/* Right: collapsible detail sidebar */}
         {rightCollapsed ? (
-          <div className="hidden lg:flex lg:ml-4 lg:w-9 lg:shrink-0 flex-col items-center gap-2 rounded-md border border-line bg-card-bg py-2 shadow-sm">
+          <div className="hidden lg:flex lg:ml-3 lg:w-9 lg:shrink-0 flex-col items-center gap-2 rounded-md border border-line bg-card-bg py-2 shadow-sm">
             <button
               type="button"
               onClick={() => setRightCollapsed(false)}
@@ -504,8 +451,8 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
             </span>
           </div>
         ) : (
-          <div className="min-w-0 space-y-3 lg:ml-4 lg:min-h-0 lg:h-full lg:w-[320px] lg:shrink-0 lg:overflow-y-auto lg:scrollbar-thin lg:pr-1 xl:w-[340px]">
-            <div className="hidden lg:flex justify-end">
+          <div className="min-w-0 space-y-3 lg:ml-3 lg:min-h-0 lg:h-full lg:w-[320px] lg:shrink-0 lg:overflow-y-auto lg:scrollbar-thin lg:pr-1 xl:w-[340px] flex flex-col">
+            <div className="hidden lg:flex justify-end shrink-0">
               <button
                 type="button"
                 onClick={() => setRightCollapsed(true)}
@@ -532,7 +479,7 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
               }}
               onOpenFolder={handleOpenFolder}
             />
-            <RecentChanges changes={changes} onJumpToSync={onJumpToSync} />
+            <RecentChanges changes={changes} onJumpToSync={onJumpToSync} className="flex-1 min-h-[220px]" />
           </div>
         )}
       </div>

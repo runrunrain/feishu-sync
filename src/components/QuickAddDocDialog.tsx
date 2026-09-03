@@ -26,7 +26,6 @@ import { APIError, addLinksToFolder, createCustomFolder } from '../api/client';
 import { appLogger } from '../utils/appLogger';
 import { useConfig } from '../hooks/useConfig';
 import { normalizeFeishuUrl, extractWikiRootId } from '../utils/feishu-url';
-import { LAYOUT_OPTIONS } from './WatchedRootsCard';
 import type { AddLinkToFolderResult, CustomFolder, LayoutProfile, TreeNavTarget } from '../types';
 
 const MAX_LINKS_PER_BATCH = 20;
@@ -108,7 +107,7 @@ export function QuickAddDocDialog({
   const { config, updateConfig } = useConfig();
   const [rootUrl, setRootUrl] = useState('');
   const [rootLocalDir, setRootLocalDir] = useState('');
-  const [rootLayout, setRootLayout] = useState<LayoutProfile>('directory-readme');
+  const rootLayout: LayoutProfile = 'mirror-title-file';
   const [rootSubmitting, setRootSubmitting] = useState(false);
   const [rootError, setRootError] = useState<string | null>(null);
   const [rootAdded, setRootAdded] = useState<{ url: string; localDir: string } | null>(null);
@@ -144,7 +143,6 @@ export function QuickAddDocDialog({
     setMode('docs');
     setRootUrl('');
     setRootLocalDir('');
-    setRootLayout('directory-readme');
     setRootError(null);
     setRootAdded(null);
     setRootSubmitting(false);
@@ -417,26 +415,6 @@ export function QuickAddDocDialog({
                   placeholder="例如：技术 - Dev"
                   className="w-full rounded-md border border-line bg-paper px-3 py-2 text-sm text-ink placeholder:text-ink-faint font-sans-ui focus:outline-none focus:border-seal focus:ring-2 focus:ring-seal/20 disabled:opacity-60"
                 />
-              </div>
-
-              <div>
-                <label htmlFor="quick-add-root-layout" className="block text-sm font-medium text-ink-soft mb-1.5 font-serif">
-                  目录布局
-                </label>
-                <select
-                  id="quick-add-root-layout"
-                  value={rootLayout}
-                  onChange={(e) => setRootLayout(e.target.value as LayoutProfile)}
-                  disabled={rootSubmitting}
-                  className="w-full text-sm text-ink bg-paper border border-line rounded-md px-3 py-2 font-sans-ui focus:outline-none focus:border-seal cursor-pointer disabled:opacity-60"
-                >
-                  {LAYOUT_OPTIONS.map((opt) => (
-                    <option key={opt.value} value={opt.value}>{opt.label}</option>
-                  ))}
-                </select>
-                <p className="mt-1.5 text-xs text-ink-faint font-sans-ui">
-                  与设置页「同步根目录与布局」同一契约；添加后执行「立即检测」即可在左侧树看到该分组。
-                </p>
               </div>
 
               {rootError && (

@@ -14,6 +14,7 @@ interface RecentChangesProps {
   changes: ChangedDocument[];
   maxItems?: number;
   onJumpToSync?: () => void;
+  className?: string;
 }
 
 const TYPE_ICON = {
@@ -33,12 +34,13 @@ export function RecentChanges({
   changes,
   maxItems = 10,
   onJumpToSync,
+  className = '',
 }: RecentChangesProps) {
   const visible = changes.slice(0, maxItems);
 
   return (
-    <Card variant="default">
-      <CardHeader>
+    <Card variant="default" className={`flex flex-col ${className}`}>
+      <CardHeader className="shrink-0">
         <div className="flex items-center justify-between">
           <h2 className="text-base font-kai font-medium text-ink">最近变更</h2>
           <button
@@ -51,7 +53,7 @@ export function RecentChanges({
           </button>
         </div>
       </CardHeader>
-      <CardBody className="space-y-1">
+      <CardBody className="space-y-1 flex-1 overflow-y-auto scrollbar-thin">
         {visible.length === 0 ? (
           <div className="flex flex-col items-center py-10 text-center">
             <Inbox className="w-10 h-10 text-ink-faint mb-3" />

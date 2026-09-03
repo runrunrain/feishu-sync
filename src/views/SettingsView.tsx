@@ -69,8 +69,8 @@ const SETTINGS_TABS: SettingsTabMeta[] = [
       },
       {
         id: 'kb-roots',
-        label: '同步根目录与布局',
-        description: '飞书同步根 URL、本地目录与布局',
+        label: '同步根目录',
+        description: '飞书同步根 URL 与本地目录',
         icon: FolderTree,
         render: () => <WatchedRootsCard />,
       },
@@ -130,6 +130,9 @@ const SETTINGS_TABS: SettingsTabMeta[] = [
   },
 ];
 
+/** 需求 4：隐藏未完善的「模型与整理」子页入口，保留代码与组件 */
+const VISIBLE_SETTINGS_TABS = SETTINGS_TABS.filter((tab) => tab.id !== 'models');
+
 interface SettingsViewProps {
   /**
    * 请求聚焦到指定分组（如 TopBar「新版本」徽标 → 'application'）。
@@ -142,10 +145,12 @@ interface SettingsViewProps {
 
 export function SettingsView({ focusTabId, focusNonce }: SettingsViewProps) {
   const [activeTab, setActiveTab] = useState<SettingsTab>('knowledge');
-  const currentTabMeta = SETTINGS_TABS.find((tab) => tab.id === activeTab) ?? SETTINGS_TABS[0];
+  const currentTabMeta = VISIBLE_SETTINGS_TABS.find((tab) => tab.id === activeTab) ?? VISIBLE_SETTINGS_TABS[0];
 
   useEffect(() => {
-    if (focusTabId) setActiveTab(focusTabId);
+    if (focusTabId && VISIBLE_SETTINGS_TABS.some((t) => t.id === focusTabId)) {
+      setActiveTab(focusTabId);
+    }
   }, [focusTabId, focusNonce]);
 
   // 第二层导航：当前选中的侧栏项。切 tab 时重置为该分组的第一项。
@@ -187,7 +192,7 @@ export function SettingsView({ focusTabId, focusNonce }: SettingsViewProps) {
         role="tablist"
         aria-label="设置分类"
       >
-        {SETTINGS_TABS.map((tab) => {
+        {VISIBLE_SETTINGS_TABS.map((tab) => {
           const Icon = tab.icon;
           const selected = tab.id === activeTab;
           return (

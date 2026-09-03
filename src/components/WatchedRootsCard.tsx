@@ -24,7 +24,7 @@ import {
 } from 'lucide-react';
 import { Card, CardHeader, CardBody } from './common/Card';
 import { Button } from './common/Button';
-import { Input, Select, Toggle } from './common/Input';
+import { Input, Toggle } from './common/Input';
 import { useToast } from './common/Toast';
 import { useConfig } from '../hooks/useConfig';
 import { getMappingIndex } from '../api/client';
@@ -33,7 +33,6 @@ import { appLogger } from '../utils/appLogger';
 import type {
   Config,
   IndexSnapshot,
-  LayoutProfile,
   WatchedRoot,
   WatchedRootConfig,
 } from '../types';
@@ -66,17 +65,12 @@ const STATUS_META: Record<
   },
 };
 
-export const LAYOUT_OPTIONS = [
-  { value: 'directory-readme', label: '目录 + README.md' },
-  { value: 'mirror-title-file', label: '镜像标题文件' },
-];
-
 function createEmptyRoot(): WatchedRootConfig {
   return {
     id: '',
     url: '',
     localDir: '',
-    layoutProfile: 'directory-readme',
+    layoutProfile: 'mirror-title-file',
     enabled: true,
   };
 }
@@ -251,7 +245,7 @@ export function WatchedRootsCard() {
         id,
         url: normalizedUrl.canonical,
         localDir,
-        layoutProfile: root.layoutProfile as LayoutProfile,
+        layoutProfile: 'mirror-title-file',
         enabled: root.enabled,
       });
     }
@@ -282,7 +276,7 @@ export function WatchedRootsCard() {
       <CardHeader>
         <div className="flex items-center gap-2.5">
           <Database className="w-4 h-4 text-seal" />
-          <h2 className="text-base font-kai font-medium text-ink">同步根目录与布局</h2>
+          <h2 className="text-base font-kai font-medium text-ink">同步根目录</h2>
           <span className="ml-auto text-xs text-ink-faint font-sans-ui">
             {summary.total} 个 · {summary.synced} 已同步 · {summary.missing} 待检测
             {summary.disabled > 0 && ` · ${summary.disabled} 已停用`}
@@ -292,7 +286,7 @@ export function WatchedRootsCard() {
       </CardHeader>
       <CardBody className="space-y-4">
         <p className="text-xs text-ink-faint font-sans-ui">
-          每个同步根目录同时声明飞书节点、本地目录和目录布局。停用后会保留历史映射与状态，但不会参与检测、轮询或同步。
+          每个同步根目录声明飞书根节点与本地对应目录（目录布局固定为镜像标题文件）。停用后会保留历史映射与状态，但不会参与检测、轮询或同步。
         </p>
 
         {/* 子页侧边栏模式：左根目录列表（动态增删）+ 右选中项编辑器 */}
@@ -418,15 +412,7 @@ export function WatchedRootsCard() {
                     onChange={(event) => updateRoot(clampedSelectedIndex, { localDir: event.target.value })}
                     placeholder="例如：技术 - Dev"
                   />
-                  <Select
-                    label="目录布局"
-                    value={selectedRow.root.layoutProfile}
-                    options={LAYOUT_OPTIONS}
-                    onChange={(event) => updateRoot(clampedSelectedIndex, {
-                      layoutProfile: event.target.value as LayoutProfile,
-                    })}
-                  />
-                  <div className="self-end rounded-md border border-line bg-card-bg px-3 py-2">
+                  <div className="rounded-md border border-line bg-card-bg px-3 py-2 md:col-span-2">
                     <Toggle
                       label="启用此同步根目录"
                       checked={selectedRow.root.enabled}

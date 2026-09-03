@@ -13,24 +13,18 @@
  * 过滤：全部 / 仅变更 / 仅错误 / 仅孤儿（孤儿基于 _index.json.orphan_files，
  *       由父组件通过 orphanPaths prop 注入；详见 P1-1 修复说明）。
  *
- * v0.2.0 structure-align Phase D（D1）：
- *   - 新增 view toggle「飞书视图 / 本地视图」（伏羲 S1 + S5）。
- *   - 飞书视图：按 watchedRoot 分组顶层节点（filter wiki_node_token != null）。
- *     由父组件通过 `watchedRoots` + `nodes`（已经过 server-side filter）注入。
- *   - 本地视图：由父组件改为渲染 LocalDirTreeView（本组件不再兼任）；
- *     `view`/`onViewChange` 由父组件管理，NodeTreeView 仅渲染 toggle + 飞书树体。
- *   - 默认飞书视图（C5）。
- *
- * 向后兼容：未传 view/onViewChange 时退化为单视图（不渲染 toggle），
- *           行为与 P4 完全一致，避免破坏其他调用点。
+ * 视图与分组：
+ *   - 飞书结构视图：按 watchedRoot 分组顶层节点（filter wiki_node_token != null）。
+ *     由父组件通过 `watchedRoots` + `nodes` 注入。
+ *   - 自定义归档：底部渲染快捷添加的零散云文档分组。
+ *   - 底部紧凑单行：统计与同级拖拽/键盘导航说明 Tooltip，空间利用最大化。
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Search, Filter, RefreshCw, AlertTriangle, Cloud, ChevronRight, Plus, FolderArchive, Folder, FileText, Table, FileType, Trash2 } from 'lucide-react';
+import { Search, Filter, RefreshCw, AlertTriangle, Cloud, ChevronRight, Plus, FolderArchive, Folder, FileText, Table, FileType, Trash2, HelpCircle } from 'lucide-react';
 import { Card, CardBody } from './common/Card';
 import { TreeNode } from './TreeNode';
 import { EmptyState } from './common/EmptyState';
-import { TreeViewModeToggle } from './TreeViewModeToggle';
 import { useToast } from './common/Toast';
 import { appLogger } from '../utils/appLogger';
 import { getMappingTree, reorderMapping } from '../api/client';
@@ -74,13 +68,6 @@ interface NodeTreeViewProps {
   orphanPaths?: Set<string>;
   /** ClassName override for embedding in narrow layouts. */
   className?: string;
-  /**
-   * v0.2.0 structure-align Phase D (D1): when provided, the tree renders a
-   * 「飞书视图 / 本地视图」toggle at the top. The parent owns the state
-   * and swaps NodeTreeView ↔ LocalDirTreeView on change.
-   */
-  view?: 'feishu' | 'local';
-  onViewChange?: (view: 'feishu' | 'local') => void;
   /**
    * v0.2.0 structure-align Phase D (D1): watchedRoots for top-level
    * grouping. When provided, roots without parent_node_token are grouped
@@ -187,8 +174,6 @@ export function NodeTreeView({
   businessMarksByToken,
   orphanPaths,
   className = '',
-  view,
-  onViewChange,
   watchedRoots,
   customFolders,
   onQuickAdd,
@@ -880,7 +865,7 @@ export function NodeTreeView({
         : groupedRoots.unclassified.filter((r) => visibleTokens.has(r.obj_token));
     body = (
       <>
-        <div className="max-h-full overflow-x-hidden overflow-y-auto scrollbar-thin pr-1">
+        <div className="flex-1 min-h-0 overflow-x-hidden overflow-y-auto scrollbar-thin pr-1">
           {isFiltering && matchCount === 0 && (
             <p className="px-2 py-6 text-center text-xs text-ink-faint font-sans-ui">
               无匹配节点
@@ -971,24 +956,36 @@ export function NodeTreeView({
           {(!activeGroupKey || activeGroupKey === CUSTOM_ARCHIVE_KEY) &&
             renderCustomArchive()}
         </div>
-        <div className="mt-3 pt-3 border-t border-line text-xs text-ink-faint font-sans-ui flex min-w-0 items-center justify-between gap-2">
-          <span className="min-w-0 truncate">
+        <div className="mt-2 pt-2 border-t border-line/70 text-[11px] text-ink-faint font-sans-ui flex min-w-0 items-center justify-between gap-2 shrink-0 select-none">
+          <span
+            className="min-w-0 truncate"
+            title={
+              isFiltering
+                ? `匹配 ${matchCount} / ${nodes.length} 节点 · ${changedCount} 变更\n同级拖拽仅调整本地展示顺序 · 不影响飞书结构 · ↑↓ 键切换节点并预览`
+                : `${nodes.length} 节点 · ${roots.length} 顶层 · ${changedCount} 变更\n同级拖拽仅调整本地展示顺序 · 不影响飞书结构 · ↑↓ 键切换节点并预览`
+            }
+          >
             {isFiltering
-              ? `匹配 ${matchCount} / ${nodes.length} 节点 · ${changedCount} 变更`
+              ? `匹配 ${matchCount} / ${nodes.length} · ${changedCount} 变更`
               : `${nodes.length} 节点 · ${roots.length} 顶层 · ${changedCount} 变更`}
           </span>
-          <button
-            type="button"
-            onClick={fetchTree}
-            className="inline-flex items-center gap-1 text-ink-soft hover:text-seal"
-          >
-            <RefreshCw className="w-3 h-3" />
-            刷新
-          </button>
+          <div className="flex items-center gap-1.5 shrink-0">
+            <span
+              className="cursor-help text-ink-faint hover:text-ink-soft transition-colors"
+              title="同级拖拽仅调整本地展示顺序 · 不影响飞书结构 · ↑↓ 键切换节点并预览"
+            >
+              <HelpCircle className="w-3.5 h-3.5" />
+            </span>
+            <button
+              type="button"
+              onClick={fetchTree}
+              className="inline-flex items-center gap-1 text-ink-soft hover:text-seal transition-colors"
+            >
+              <RefreshCw className="w-3 h-3" />
+              刷新
+            </button>
+          </div>
         </div>
-        <p className="mt-1.5 text-[11px] text-ink-faint font-sans-ui">
-          同级拖拽仅调整本地展示顺序 · 不影响飞书结构 · ↑↓ 键切换节点并预览
-        </p>
       </>
     );
   }
@@ -996,24 +993,7 @@ export function NodeTreeView({
   return (
     <div ref={rootRef} className="min-h-0 min-w-0 h-full">
       <Card variant="default" className={`min-w-0 flex flex-col ${className}`}>
-      {/*
-        节点树容器布局重构（2026-06-19）：
-        - 搜索栏 px-3 py-2→px-4 py-3，与 Card 内边距一致
-        - 搜索栏内部 gap-2→gap-2.5，搜索框与过滤器拉开
-        - CardBody flex-1 + overflow，保持节点滚动而不挤压头部
-        - v0.2.0 structure-align Phase D (D1)：view toggle 嵌入搜索栏之上
-      */}
-      {view && onViewChange && (
-        <div className="px-4 pt-3 pb-2 border-b border-line">
-          <TreeViewModeToggle view={view} onViewChange={onViewChange} />
-          <p className="mt-1.5 text-[11px] text-ink-faint font-sans-ui">
-            {view === 'feishu'
-              ? '按飞书节点结构组织（过滤本地独有文件）'
-              : '按本地文件系统路径组织（含本地独有）'}
-          </p>
-        </div>
-      )}
-      <div className="flex flex-wrap items-center gap-2 border-b border-line px-4 py-3">
+      <div className="flex flex-wrap items-center gap-2 border-b border-line px-3.5 py-2.5">
         <div className="flex min-w-0 flex-1 basis-[120px] items-center gap-2 rounded-md border border-line bg-paper px-2.5 py-1.5 focus-within:border-seal">
           <Search className="w-3.5 h-3.5 text-ink-faint" />
           <input
@@ -1056,7 +1036,7 @@ export function NodeTreeView({
         仅在存在 watchedRoot 分组或自定义归档时渲染。
       */}
       {groupedRoots && (groupedRoots.groups.length > 0 || (customFolders?.length ?? 0) > 0) && (
-        <div className="flex flex-wrap items-center gap-1.5 border-b border-line bg-paper/60 px-3 py-2">
+        <div className="flex flex-wrap items-center gap-1.5 border-b border-line bg-paper/60 px-3 py-1.5">
           {activeGroupKey !== null && (
             <button
               type="button"
@@ -1127,7 +1107,7 @@ export function NodeTreeView({
           )}
         </div>
       )}
-      <CardBody className="flex-1 overflow-hidden flex flex-col">{body}</CardBody>
+      <CardBody className="!p-3 flex-1 overflow-hidden flex flex-col">{body}</CardBody>
       </Card>
     </div>
   );
