@@ -110,16 +110,21 @@ export function GlobalStatusBar() {
       const countText = typeof nodeCount === 'number'
         ? `${nodeCount} 节点`
         : `${rebuilt.rebuilt} 文档`;
+      // 2026-09：手动删除的本地文件对应行已被清理——toast 提示消除疑虑，
+      // 并告知恢复途径（下次检测会作为本地缺失新增项重新出现）。
+      const prunedText = (rebuilt.pruned_local_missing ?? 0) > 0
+        ? `，已清理 ${rebuilt.pruned_local_missing} 个手动删除的残留记录`
+        : '';
       if (failedCount > 0) {
         toast.push({
           type: 'warning',
-          message: `索引重建完成 · ${countText}（${failedCount} 项失败）`,
+          message: `索引重建完成 · ${countText}（${failedCount} 项失败）${prunedText}`,
           hint: '失败详情见日志',
         });
       } else {
         toast.push({
           type: 'success',
-          message: `索引重建完成 · ${countText}`,
+          message: `索引重建完成 · ${countText}${prunedText}`,
         });
       }
       // After rebuild the pendingCount may have changed (rows flipped between

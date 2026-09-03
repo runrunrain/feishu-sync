@@ -40,6 +40,7 @@ import {
   getMappingIndex,
   getMappingTreeDetailed,
   listCustomFolders,
+  manualDeleteDoc,
 } from '../api/client';
 import { appLogger } from '../utils/appLogger';
 import { onDiffChanged } from '../utils/syncEvents';
@@ -198,6 +199,31 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
       });
     }
   }, [toast]);
+
+  // 手动删除节点（2026-09）：confirm 后调 manual-delete（文件移 .trash-bin
+  // 可找回，行硬删），刷新树与详情。云端仍在的节点下次检测会列为新增——
+  // 不勾选即不会同步回来，文案中向用户说明该后果。
+  const handleManualDeleteDoc = useCallback(async (doc: { objToken: string; title: string }) => {
+    const confirmed = window.confirm(
+      `删除节点「${doc.title}」？\n\n本地文件将移入 .trash-bin/（可找回），节点记录将被清除；云端仍存在的话，下次检测会将其列为新增——不勾选同步即不会回来。`,
+    );
+    if (!confirmed) return;
+    try {
+      const res = await manualDeleteDoc(doc.objToken);
+      toast.push({
+        type: 'success',
+        message: `已删除「${doc.title}」`,
+        hint: res.file_moved_to_trash ? '本地文件已移入 .trash-bin/' : undefined,
+      });
+      // 选中态指向已删节点时清空，避免详情卡悬挂
+      setSelectedToken((prev) => (prev === doc.objToken ? null : prev));
+      await loadFeishu();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '删除失败';
+      appLogger.error('dashboard', 'manual delete failed', err);
+      toast.push({ type: 'error', message: '删除失败', hint: msg });
+    }
+  }, [loadFeishu, toast]);
 
   const loadLocal = useCallback(async () => {
     try {
@@ -405,6 +431,7 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
               onQuickAdd={() => setQuickAddOpen(true)}
               focusRequest={focusRequest}
               onRefreshed={loadFeishu}
+              onDeleteDoc={handleManualDeleteDoc}
               className="h-full"
             />
           ) : (

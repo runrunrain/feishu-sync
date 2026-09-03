@@ -252,6 +252,94 @@ trashRoutes.post('/api/trash/restore', async (c) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// POST /api/trash/manual-delete — 手动删除节点（2026-09）
+// ---------------------------------------------------------------------------
+//
+// 用户在节点树上主动删除某个文档（典型：残留的非有效飞书节点）。
+// 与回收站 purge 的语义区分：
+//   - 回收站行（cloud_deleted=1）拒绝本入口 → 409，走回收站面板的恢复/
+//     清空，避免双语义交叉；
+//   - 活行：本地 .md 先移入 .trash-bin/（镜像相对路径，可手工找回），
+//     再硬删 documents + sheet_sheets（LocalMapStore.deleteDocumentByToken
+//     事务内级联）；文件不存在（已手动删）则直接删行。
+// 删除后果说明（前端 confirm 文案同步）：云端仍存在的节点在下次检测会
+// 作为本地缺失新增项重新出现在变更列表——不勾选即不会被同步回来。
+//
+trashRoutes.post('/api/trash/manual-delete', async (c) => {
+  let body: any;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: 'invalid_json' }, 400);
+  }
+
+  const objToken =
+    body && typeof body === 'object' && typeof body.obj_token === 'string'
+      ? body.obj_token
+      : null;
+  if (!objToken) {
+    return c.json(
+      { error: 'invalid_body', message: 'obj_token (string) is required' },
+      400,
+    );
+  }
+
+  try {
+    const store = (c as any).localMapStore;
+    const configManager = (c as any).configManager;
+    if (!store || !configManager) {
+      return c.json({ error: 'dependencies_not_injected' }, 500);
+    }
+
+    const doc = store.getDocumentByObjToken(objToken) as any;
+    if (!doc) {
+      // 幂等：行已不存在视为删除成功。
+      return c.json({ ok: true, file_moved_to_trash: false, already_gone: true });
+    }
+    if (doc.cloudDeleted === 1 || doc.cloudDeleted === true) {
+      return c.json(
+        {
+          error: 'trash_managed_row',
+          message: '该文档在回收站中，请在回收站面板里恢复或清空',
+        },
+        409,
+      );
+    }
+
+    const config = configManager.getConfig?.() ?? (await configManager.load?.());
+    const root: string | undefined = config?.knowledgeBaseRoot;
+    const localMdPath: string | undefined = doc.localMdPath;
+
+    let movedToTrash = false;
+    if (root && localMdPath) {
+      const originalAbs = safeResolve(root, localMdPath);
+      const trashAbs = computeTrashPath(root, localMdPath);
+      if (originalAbs && trashAbs && fs.existsSync(originalAbs)) {
+        ensureTrashBin(root);
+        movedToTrash = moveFileSafe(originalAbs, trashAbs);
+        // 移动失败（IO 异常）不阻断行删除：文件残留会被下一次刷新索引的
+        // prune 逻辑按「本地缺失行」重新收敉，不会复活视图节点。
+      }
+    }
+
+    const deleted = store.deleteDocumentByToken(objToken);
+    if (!deleted) {
+      return c.json({ error: 'not_found', message: 'document row vanished' }, 404);
+    }
+    return c.json({ ok: true, file_moved_to_trash: movedToTrash });
+  } catch (error) {
+    console.error('[trash] manual-delete failed:', error);
+    return c.json(
+      {
+        error: 'trash_manual_delete_failed',
+        message: error instanceof Error ? error.message : String(error),
+      },
+      500,
+    );
+  }
+});
+
 trashRoutes.delete('/api/trash/purge', async (c) => {
   const objToken = c.req.query('obj_token');
   const allFlag = c.req.query('all');

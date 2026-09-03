@@ -84,6 +84,13 @@ function makeFakeStore(docs: FakeDoc[]) {
       if (idx >= 0) rows.splice(idx, 1);
       list = rows.filter((r) => r.cloudDeleted === 1);
     },
+    deleteDocumentByToken: (tok: string) => {
+      const idx = rows.findIndex((r) => r.objToken === tok);
+      if (idx < 0) return false;
+      rows.splice(idx, 1);
+      list = rows.filter((r) => r.cloudDeleted === 1);
+      return true;
+    },
     _purged: () => purged.slice(),
     _restored: () => restored.slice(),
   };
@@ -328,6 +335,99 @@ describe('trash routes', () => {
       }),
     );
     expect(res.status).toBe(400);
+  });
+});
+
+// ============================================================================
+// manual-delete route tests（2026-09 手动删除节点）
+// ============================================================================
+
+describe('POST /api/trash/manual-delete', () => {
+  beforeEach(() => setupKb());
+  afterEach(() => teardownKb());
+
+  it('moves live doc file to .trash-bin and hard-deletes the row', async () => {
+    const original = path.join(tmpRoot, 'docs', 'sub', '残留节点.md');
+    fs.writeFileSync(original, '# 残留内容');
+    const store = makeFakeStore([
+      { objToken: 'residual-doc', title: '残留节点', localMdPath: 'docs/sub/残留节点.md', cloudDeleted: 0 },
+    ]);
+    const app = buildDiApp({ localMapStore: store, configManager: { getConfig: () => ({ knowledgeBaseRoot: tmpRoot }) } });
+
+    const res = await app.fetch(
+      new Request('http://x/api/trash/manual-delete', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ obj_token: 'residual-doc' }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(body.file_moved_to_trash).toBe(true);
+    // 文件进回收站目录（镜像相对路径），原位消失，行被硬删
+    expect(fs.existsSync(original)).toBe(false);
+    expect(fs.existsSync(path.join(tmpRoot, '.trash-bin', 'docs', 'sub', '残留节点.md'))).toBe(true);
+    expect(store.getDocumentByObjToken('residual-doc')).toBeNull();
+  });
+
+  it('deletes the row directly when local file already missing (手动删过文件)', async () => {
+    const store = makeFakeStore([
+      { objToken: 'ghost-doc', title: '无文件残留', localMdPath: 'docs/sub/ghost.md', cloudDeleted: 0 },
+    ]);
+    const app = buildDiApp({ localMapStore: store, configManager: { getConfig: () => ({ knowledgeBaseRoot: tmpRoot }) } });
+
+    const res = await app.fetch(
+      new Request('http://x/api/trash/manual-delete', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ obj_token: 'ghost-doc' }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(body.file_moved_to_trash).toBe(false);
+    expect(store.getDocumentByObjToken('ghost-doc')).toBeNull();
+  });
+
+  it('rejects trash-managed rows with 409 and is idempotent for missing rows', async () => {
+    const store = makeFakeStore([
+      { objToken: 'trashed-doc', title: '回收站行', localMdPath: 'docs/trashed.md', cloudDeleted: 1 },
+    ]);
+    const app = buildDiApp({ localMapStore: store, configManager: { getConfig: () => ({ knowledgeBaseRoot: tmpRoot }) } });
+
+    // 回收站行 → 409，避免与回收站面板双语义交叉
+    const res409 = await app.fetch(
+      new Request('http://x/api/trash/manual-delete', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ obj_token: 'trashed-doc' }),
+      }),
+    );
+    expect(res409.status).toBe(409);
+    expect(store.getDocumentByObjToken('trashed-doc')).not.toBeNull();
+
+    // 行不存在 → 幂等 ok + already_gone
+    const resGone = await app.fetch(
+      new Request('http://x/api/trash/manual-delete', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ obj_token: 'no-such-doc' }),
+      }),
+    );
+    expect(resGone.status).toBe(200);
+    expect((await resGone.json()).already_gone).toBe(true);
+
+    // 缺 obj_token → 400
+    const res400 = await app.fetch(
+      new Request('http://x/api/trash/manual-delete', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({}),
+      }),
+    );
+    expect(res400.status).toBe(400);
   });
 });
 

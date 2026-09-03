@@ -436,3 +436,63 @@ describe('LocalMapStore.backfillCustomFolders', () => {
     store.close();
   });
 });
+
+describe('LocalMapStore.pruneMissingLocalDocs — 手动删除残留清理', () => {
+  it('hard-deletes rows whose local file was manually removed, keeps trash/missing-file/blank rows and out-of-root data', () => {
+    const dbPath = createDatabasePath();
+    const kbRoot = path.join(path.dirname(dbPath), '知识库');
+    fs.mkdirSync(path.join(kbRoot, '技术 - Dev'), { recursive: true });
+    fs.writeFileSync(path.join(kbRoot, '技术 - Dev', 'README.md'), '# 存活文档');
+    // 模拟被用户手动删除：只在 DB 里留行，不建文件。
+
+    const store = new LocalMapStore(dbPath);
+    store.initialize();
+    // 1. 存活行：文件在 → 保留
+    store.upsertDocument(makeDocument({
+      objToken: 'alive-doc',
+      localMdPath: path.join(kbRoot, '技术 - Dev', 'README.md'),
+      localRelPath: '技术 - Dev/README.md',
+    }));
+    // 2. 手动删除行：local_rel_path 指向不存在的文件 → 硬删
+    store.upsertDocument(makeDocument({
+      objToken: 'deleted-doc',
+      localMdPath: path.join(kbRoot, '技术 - Dev', '已删除.md'),
+      localRelPath: '技术 - Dev/已删除.md',
+    }));
+    // 3. 回收站行：cloud_deleted=1（文件已被移入 .trash-bin，原路径不存在属正常）→ 保留
+    store.upsertDocument(makeDocument({
+      objToken: 'trash-doc',
+      localMdPath: path.join(kbRoot, '技术 - Dev', '回收中.md'),
+      localRelPath: '技术 - Dev/回收中.md',
+      cloudDeleted: 1,
+    }));
+    // 4. 空路径行：云端身份未落盘 → 保留
+    store.upsertDocument(makeDocument({
+      objToken: 'cloud-only-doc',
+      localMdPath: '',
+    }));
+    // 5. 越界异常数据：local_rel_path 指向库外 → 不动（防路径逃逸误删）
+    store.upsertDocument(makeDocument({
+      objToken: 'rogue-doc',
+      localMdPath: '/etc/passwd',
+      localRelPath: '../../etc/passwd',
+    }));
+
+    const stats = store.pruneMissingLocalDocs(kbRoot);
+    expect(stats.scanned).toBe(3); // 排除空路径行与回收站行（cloud_deleted=1）
+    expect(stats.pruned).toBe(1);
+    expect(stats.prunedTokens).toEqual(['deleted-doc']);
+
+    // 存活行、回收站行、空路径行、越界行均保留
+    expect(store.getDocumentByObjToken('alive-doc')).toBeTruthy();
+    expect(store.getDocumentByObjToken('trash-doc')).toBeTruthy();
+    expect(store.getDocumentByObjToken('cloud-only-doc')).toBeTruthy();
+    expect(store.getDocumentByObjToken('rogue-doc')).toBeTruthy();
+    // 手动删除行已消失（视图残留源头被拔除；store 删除后查询返回 null）
+    expect(store.getDocumentByObjToken('deleted-doc')).toBeNull();
+
+    // 幂等：再次扫描无新增清理
+    expect(store.pruneMissingLocalDocs(kbRoot).pruned).toBe(0);
+    store.close();
+  });
+});

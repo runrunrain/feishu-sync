@@ -565,6 +565,8 @@ export interface RebuildIndexResponse {
   rebuilt: number;
   refreshed_index: boolean;
   failed: RebuildIndexFailure[];
+  /** 手动删除清理：本地文件已不存在而被硬删的 documents 行数。 */
+  pruned_local_missing?: number;
 }
 
 export async function rebuildIndex(): Promise<RebuildIndexResponse> {
@@ -643,6 +645,28 @@ export async function purgeTrashedDoc(objToken: string): Promise<{ purged: numbe
 export async function clearTrash(): Promise<{ purged: number }> {
   const result = await request<{ purged: number }>('/api/trash/purge?all=1', { method: 'DELETE' });
   emitDiffChanged('trash-purge-all');
+  return result;
+}
+
+/**
+ * POST /api/trash/manual-delete — 手动删除任意活行节点（2026-09）：
+ * 本地 .md 移入 .trash-bin/（镜像路径可找回），documents + sheet_sheets
+ * 行硬删；回收站行（cloud_deleted=1）会 409，需走回收站面板。
+ */
+export async function manualDeleteDoc(objToken: string): Promise<{
+  ok: boolean;
+  file_moved_to_trash: boolean;
+  already_gone?: boolean;
+}> {
+  const result = await request<{
+    ok: boolean;
+    file_moved_to_trash: boolean;
+    already_gone?: boolean;
+  }>('/api/trash/manual-delete', {
+    method: 'POST',
+    body: JSON.stringify({ obj_token: objToken }),
+  });
+  emitDiffChanged('manual-delete');
   return result;
 }
 

@@ -377,6 +377,9 @@ mappingRoutes.post('/api/index/rebuild', async (c) => {
       scanned: scanResult.scanned,
       refreshed_index: refreshed,
       failed: scanResult.errors,
+      // 2026-09：手动删除清理统计——本地文件已不存在而被硬删的 documents
+      // 行数，前端 toast 提示用户视图残留已被清理。
+      pruned_local_missing: scanResult.prunedLocalMissing ?? 0,
     });
   } catch (error) {
     console.error('[mapping] index rebuild failed:', error);

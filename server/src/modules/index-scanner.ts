@@ -131,6 +131,11 @@ interface IndexResult {
    *     backfillCustomFolders()
    */
   customFolderBackfill?: { registered: number; bound: number };
+  /**
+   * 本地缺失行清理统计（2026-09）：手动删除的 .md 对应的 documents 行
+   * 在全量扫描时被硬删，消除视图残留。prunedLocalMissing 为删除行数。
+   */
+  prunedLocalMissing?: number;
 }
 
 /**
@@ -268,6 +273,27 @@ export class IndexScanner {
       // Don't fail the whole scan if the reconcile step breaks — the
       // reindex data itself is still valid.
       console.warn('[IndexScanner] custom folder reconcile failed:', err);
+    }
+
+    // 2026-09 手动删除清理：DB 中 local_rel_path 指向的文件已不存在
+    // 的活行（用户在文件系统直接删除），硬删以消除视图残留。回收站行
+    // 与未落盘身份的行不受影响（见 LocalMapStore.pruneMissingLocalDocs）。
+    // 结构树成员被清理后，下次检测会作为本地缺失新增项重新出现在
+    // 变更列表，可勾选重新同步恢复——闭环。
+    try {
+      if (typeof this.localMapStore.pruneMissingLocalDocs === 'function') {
+        const stats = this.localMapStore.pruneMissingLocalDocs(rootDir);
+        result.prunedLocalMissing = stats.pruned;
+        if (stats.pruned > 0) {
+          console.info(
+            `[IndexScanner] pruned ${stats.pruned} document row(s) whose local files were manually deleted`,
+          );
+        }
+      }
+    } catch (err) {
+      // Don't fail the whole scan if the prune step breaks — the
+      // reindex data itself is still valid.
+      console.warn('[IndexScanner] prune missing local docs failed:', err);
     }
 
     return result;

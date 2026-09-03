@@ -787,6 +787,60 @@ export class LocalMapStore {
   }
 
   /**
+   * 清理「本地文件已被手动删除」的残留行（2026-09）：
+   * 用户在文件系统直接删除 .md 后，documents 行仍在——视图树出现无法
+   * 消失的残留节点。全量扫描时对每行校验 local_rel_path 指向的文件
+   * 是否存在，不存在则硬删该行（sheet_sheets 随 FK 级联）。
+   *
+   * 边界约束：
+   * - 只处理 cloud_deleted=0 的活行——回收站（deleted_confirmed）行
+   *   的文件已被移入 .trash-bin/，不在原路径属正常，不得误删；
+   * - 只处理 local_rel_path 非空的行（云端身份未落盘的行不动）；
+   * - 路径必须仍在 rootDir 内（assertInsideRoot 语义，防异常数据越界）。
+   *
+   * 后续闭环：结构树成员被清理后，下一次检测会把云端节点判为本地缺失
+   * 的新增项报到变更列表，用户可勾选重新同步恢复；云端也已删除的则
+   * 永久干净。归档行同理从归档检测的已知集合消失。
+   */
+  pruneMissingLocalDocs(rootDir: string): { scanned: number; pruned: number; prunedTokens: string[] } {
+    const rows = this.db.prepare(`
+      SELECT obj_token, local_rel_path FROM documents
+      WHERE local_rel_path IS NOT NULL AND local_rel_path != ''
+        AND cloud_deleted = 0
+    `).all() as Array<{ obj_token: string; local_rel_path: string }>;
+
+    const resolvedRoot = path.resolve(rootDir);
+    const prunedTokens: string[] = []
+    const deleteStmt = this.getStatement('DELETE FROM documents WHERE obj_token = ?');
+    for (const row of rows) {
+      const abs = path.resolve(resolvedRoot, row.local_rel_path);
+      if (!abs.startsWith(resolvedRoot + path.sep)) continue; // 越界异常数据，跳过
+      if (!fs.existsSync(abs)) {
+        deleteStmt.run(row.obj_token);
+        prunedTokens.push(row.obj_token);
+      }
+    }
+    return { scanned: rows.length, pruned: prunedTokens.length, prunedTokens };
+  }
+
+  /**
+   * 手动删除节点（2026-09）：硬删任意 documents 行（不限制 sync_state），
+   * 并手动级联删除 sheet_sheets 子表——better-sqlite3 默认不启用 FK
+   * enforcement，不能依赖 migration_v2 的 FK 约束，显式删才可靠。
+   * 返回是否实际删除了行（false = 行本就不存在，幂等友好）。
+   */
+  deleteDocumentByToken(objToken: string): boolean {
+    const deleteSheets = this.getStatement('DELETE FROM sheet_sheets WHERE sheet_obj_token = ?');
+    const deleteDoc = this.getStatement('DELETE FROM documents WHERE obj_token = ?');
+    const tx = this.db.transaction(() => {
+      deleteSheets.run(objToken);
+      const info = deleteDoc.run(objToken);
+      return info.changes > 0;
+    });
+    return tx();
+  }
+
+  /**
    * Restore a previously cloud-deleted document: clear the soft-delete
    * flag so the row is treated as live again. Used by the trash-bin UI
    * when the user chooses to keep a doc locally (e.g. the cloud delete

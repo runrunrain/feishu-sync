@@ -26,7 +26,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Search, Filter, RefreshCw, AlertTriangle, Cloud, ChevronRight, Plus, FolderArchive, Folder, FileText, Table, FileType } from 'lucide-react';
+import { Search, Filter, RefreshCw, AlertTriangle, Cloud, ChevronRight, Plus, FolderArchive, Folder, FileText, Table, FileType, Trash2 } from 'lucide-react';
 import { Card, CardBody } from './common/Card';
 import { TreeNode } from './TreeNode';
 import { EmptyState } from './common/EmptyState';
@@ -55,6 +55,9 @@ interface NodeTreeViewProps {
   selectedToken: string | null;
   onSelect: (objToken: string) => void;
   onRefreshed?: () => void;
+  /** 手动删除节点（2026-09）：树行 hover 出现删除按钮，确认后由父层
+   * 调 manual-delete API（文件入 .trash-bin，行硬删）并刷新树。 */
+  onDeleteDoc?: (doc: { objToken: string; title: string }) => void;
   /** Business marks keyed by obj_token (e.g. parsed from title or rules). */
   businessMarksByToken?: Record<string, string[]>;
   /**
@@ -190,6 +193,7 @@ export function NodeTreeView({
   customFolders,
   onQuickAdd,
   focusRequest,
+  onDeleteDoc,
 }: NodeTreeViewProps) {
   const [nodes, setNodes] = useState<MappingNode[]>(nodesProp ?? []);
   const [loading, setLoading] = useState<boolean>(!nodesProp);
@@ -737,6 +741,20 @@ export function NodeTreeView({
                           >
                             原文
                           </a>
+                          {onDeleteDoc && (
+                            <button
+                              type="button"
+                              aria-label="删除本地节点"
+                              title="删除本地节点（文件移入 .trash-bin，可找回）"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onDeleteDoc({ objToken: doc.objToken, title: doc.title });
+                              }}
+                              className="shrink-0 text-ink-faint/70 hover:text-seal-2 transition-colors"
+                            >
+                              <Trash2 className="w-3 h-3" />
+                            </button>
+                          )}
                         </div>
                       );
                     })
