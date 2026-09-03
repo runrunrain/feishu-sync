@@ -1693,6 +1693,19 @@ export class ChangeDetector {
         if (!record) continue;
 
         existingTokens.add(gap.objToken);
+        // 落库为 pending_modified：stored diff（变更列表，getStoredDiff 从
+        // SQLite 状态重建）必须能看到它，否则检测响应里的 media-gap 项
+        // 会在前端重拉 cached diff 时消失，用户无法勾选同步（2026-09
+        // 实际用户反馈的断链）。同步成功后 markDocumentSynced 收敛回
+        // synced；未同步时轮询会洗回 synced，等待下次主动检测重检。
+        try {
+          this.localMapStore.markDocumentPendingModifiedForMediaGap(gap.objToken);
+        } catch (markError) {
+          console.warn(
+            `[ChangeDetector] markDocumentPendingModifiedForMediaGap failed for ${gap.objToken}:`,
+            markError,
+          );
+        }
         const cloudModifiedTime =
           record.lastSyncedModifyTime ||
           this.formatUnixSeconds(record.observedObjEditTime) ||

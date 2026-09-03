@@ -449,6 +449,26 @@ export class LocalMapStore {
    * existing pending/error state across polls, so ten identical detections
    * cannot make a pending change disappear.
    */
+  /**
+   * 媒体完整性核对（media-gap）专用：把一个 synced 文档重新置为
+   * pending_modified，使其出现在 stored diff（变更列表）中可被勾选同步。
+   *
+   * 与 recordCloudObservation 的区别：不触碰 observed_obj_edit_time /
+   * synced_obj_edit_time 基线，也不重写身份字段——这不是一次云端编辑，
+   * 只是本地媒体欠账的补齐信号。同步成功后 markDocumentSynced 照常
+   * 收敛回 synced；若用户未同步，下一次常规轮询观测（observed ==
+   * synced）会把它洗回 synced，直到再次「立即检测」重新检出（预期语义：
+   * sheet 云端清单核对仅主动检测触发）。
+   */
+  markDocumentPendingModifiedForMediaGap(objToken: string): void {
+    this.getStatement(`
+      UPDATE documents
+      SET sync_state = 'pending_modified', status = 'changed',
+          updated_at = datetime('now')
+      WHERE obj_token = ?
+    `).run(objToken);
+  }
+
   recordCloudObservation(observation: CloudNodeObservation & { lastSeenAt: string }): DocumentRecord {
     const current = this.getDocumentByObjToken(observation.objToken);
     const pending = this.getFeishuPendingByObjToken(observation.objToken);

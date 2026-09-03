@@ -40,6 +40,16 @@ class MockLocalMapStore {
   rows = new Map<string, MockRow>();
   observationCalls: Array<CloudNodeObservation & { lastSeenAt: string }> = [];
   missCalls: Array<{ objToken: string; timestamp: string }> = [];
+  mediaGapMarkCalls: string[] = [];
+
+  markDocumentPendingModifiedForMediaGap(objToken: string): void {
+    this.mediaGapMarkCalls.push(objToken);
+    const row = this.rows.get(objToken);
+    if (row) {
+      row.syncState = 'pending_modified';
+      row.status = 'changed';
+    }
+  }
 
   getDocumentByObjToken(objToken: string): DocumentRecord | null {
     return this.rows.get(objToken) ?? null;
@@ -1666,6 +1676,7 @@ feishu_sync:
     });
 
     const recordObsSpy = vi.spyOn(store, 'recordCloudObservation');
+    const mediaGapMarkSpy = vi.spyOn(store, 'markDocumentPendingModifiedForMediaGap');
 
     const result = await detector.detectChanges(ROOT_URL, {
       forceFresh: true,
@@ -1683,6 +1694,10 @@ feishu_sync:
       (args) => args[0]?.objToken === 'tok_docx_1',
     );
     expect(gapDocObservationCalls).toHaveLength(0);
+
+    // 2026-09 stored-diff 断链修复：media-gap 项必须落库 pending_modified，
+    // 否则变更列表（getStoredDiff 从 SQLite 状态重建）看不到它。
+    expect(mediaGapMarkSpy).toHaveBeenCalledWith('tok_docx_1');
   });
 
   it('b) sheet cloud 2 images vs local 0 images -> pending changedDocument with sheet_cloud_images_missing', async () => {
