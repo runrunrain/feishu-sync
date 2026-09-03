@@ -315,7 +315,7 @@ describe('installOrUpdateLarkCli', () => {
     // 安全红线：execFile + 参数数组（绝无 shell 字符串拼接）
     expect(execFileMock).toHaveBeenCalledWith(
       path.join(binDir, 'npm'),
-      ['install', '-g', 'lark-cli@latest'],
+      ['install', '-g', '@larksuite/cli@latest'],
       expect.objectContaining({ timeout: 5 * 60_000 }),
       expect.any(Function),
     );
@@ -328,7 +328,7 @@ describe('installOrUpdateLarkCli', () => {
     const failing = createManager({ binDir });
     setExecHandler((_file, args) => {
       if (args.includes('install')) {
-        const error = new Error('Command failed: npm install -g lark-cli@latest') as Error & {
+        const error = new Error('Command failed: npm install -g @larksuite/cli@latest') as Error & {
           stderr: string;
         };
         error.stderr = 'EACCES: permission denied';

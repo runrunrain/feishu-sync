@@ -3,7 +3,7 @@
  *
  * 新用户引导三层职责（新用户引导需求 §1）：
  * - getToolStatus()        组合 checkAuthReady() + npm 可用性检测
- * - installOrUpdateLarkCli()  execFile(npm install -g lark-cli@latest)，幂等
+ * - installOrUpdateLarkCli()  execFile(npm install -g @larksuite/cli@latest)，幂等
  * - startDeviceAuth()      `auth login --no-wait --json --scope <scopes>` 立即返回
  *                          { device_code, expires_in, 600, verification_url }（hint 忽略）
  * - completeDeviceAuth()   `auth login --device-code <code>` 阻塞直到浏览器授权/过期
@@ -43,7 +43,7 @@ const execFileAsync = promisify(execFile);
 const NPM_INSTALL_TIMEOUT_MS = 5 * 60_000;
 /** `--version` 验证命令超时。 */
 const VERSION_CHECK_TIMEOUT_MS = 30_000;
-/** `npm view lark-cli version`（registry 元数据）的最长等待。 */
+/** `npm view @larksuite/cli version`（registry 元数据）的最长等待。 */
 const LATEST_VERSION_CHECK_TIMEOUT_MS = 15_000;
 /** `auth login --no-wait` 立即返回，给足 CLI 冷启动余量。 */
 const DEVICE_AUTH_START_TIMEOUT_MS = 60_000;
@@ -266,7 +266,7 @@ export class LarkCliManager {
   }
 
   /**
-   * `npm view lark-cli version` 查询 registry 最新版（10s 超时，软失败）。
+   * `npm view @larksuite/cli version` 查询 registry 最新版（软失败）。
    * 输出形如 `"1.0.93\n"`（npm --json 下的字符串）或裸 `1.0.93`。
    */
   private async queryLatestLarkCliVersion(
@@ -276,7 +276,7 @@ export class LarkCliManager {
     try {
       const { stdout } = await execFileAsync(
         quoteWindowsExecutablePath(npm.path, this.discovery.platform ?? process.platform),
-        ['view', 'lark-cli', 'version'],
+        ['view', '@larksuite/cli', 'version'],
         {
           timeout: LATEST_VERSION_CHECK_TIMEOUT_MS,
           encoding: 'utf-8',
@@ -355,7 +355,10 @@ export class LarkCliManager {
     try {
       const { stdout, stderr } = await execFileAsync(
         quoteWindowsExecutablePath(npm.path, this.discovery.platform ?? process.platform),
-        ['install', '-g', 'lark-cli@latest'],
+        // 2026-09 包名修正：真正的 CLI 是 @larksuite/cli（registry 上的
+        // `lark-cli` 是无关的 0.1.0 占位包，此前装错了包——「更新失败/
+        // 可更新至 0.1.0」的根因）。
+        ['install', '-g', '@larksuite/cli@latest'],
         {
           timeout: NPM_INSTALL_TIMEOUT_MS,
           encoding: 'utf-8',
@@ -375,7 +378,7 @@ export class LarkCliManager {
         try {
           const { stdout, stderr } = await execFileAsync(
             quoteWindowsExecutablePath(npm.path, this.discovery.platform ?? process.platform),
-            ['install', '-g', 'lark-cli@latest', '--registry=https://registry.npmmirror.com'],
+            ['install', '-g', '@larksuite/cli@latest', '--registry=https://registry.npmmirror.com'],
             {
               timeout: NPM_INSTALL_TIMEOUT_MS,
               encoding: 'utf-8',
@@ -400,7 +403,7 @@ export class LarkCliManager {
         try {
           const { stdout, stderr } = await execFileAsync(
             quoteWindowsExecutablePath(npm.path, this.discovery.platform ?? process.platform),
-            ['install', '-g', '--prefix', userPrefix, 'lark-cli@latest'],
+            ['install', '-g', '--prefix', userPrefix, '@larksuite/cli@latest'],
             {
               timeout: NPM_INSTALL_TIMEOUT_MS,
               encoding: 'utf-8',
