@@ -136,15 +136,17 @@ interface SettingsViewProps {
    * 仅在值变化时生效一次：不持续锁定，用户随后可自由切换。
    */
   focusTabId?: SettingsTab;
+  /** 触发信号（时间戳或随机计数），支持在相同 tabId 下重复触发聚焦 */
+  focusNonce?: number;
 }
 
-export function SettingsView({ focusTabId }: SettingsViewProps) {
+export function SettingsView({ focusTabId, focusNonce }: SettingsViewProps) {
   const [activeTab, setActiveTab] = useState<SettingsTab>('knowledge');
   const currentTabMeta = SETTINGS_TABS.find((tab) => tab.id === activeTab) ?? SETTINGS_TABS[0];
 
   useEffect(() => {
     if (focusTabId) setActiveTab(focusTabId);
-  }, [focusTabId]);
+  }, [focusTabId, focusNonce]);
 
   // 第二层导航：当前选中的侧栏项。切 tab 时重置为该分组的第一项。
   const [activeSubId, setActiveSubId] = useState<string>(currentTabMeta.items[0].id);

@@ -24,6 +24,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { PanelRightClose, PanelRightOpen } from 'lucide-react';
 import { GlobalStatusBar } from '../components/GlobalStatusBar';
+import { VersionUpdateAlert } from '../components/VersionUpdateAlert';
 import { NodeTreeView } from '../components/NodeTreeView';
 import { LocalDirTreeView } from '../components/LocalDirTreeView';
 import { RecentChanges } from '../components/RecentChanges';
@@ -56,6 +57,7 @@ import type {
 
 interface DashboardProps {
   onJumpToSync: () => void;
+  onJumpToSettings?: (tab?: 'application') => void;
 }
 
 type NodeView = 'feishu' | 'local';
@@ -77,7 +79,7 @@ function readLeftWidth(): number {
   }
 }
 
-export function Dashboard({ onJumpToSync }: DashboardProps) {
+export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
   const { config } = useConfig();
   // Single envelope per view; refreshed on view switch or manual refresh.
   const [view, setView] = useState<NodeView>('feishu');
@@ -370,7 +372,8 @@ export function Dashboard({ onJumpToSync }: DashboardProps) {
 
   return (
     <div className="flex flex-col gap-4">
-      <GlobalStatusBar />
+      <VersionUpdateAlert onJumpToSettings={onJumpToSettings} />
+      <GlobalStatusBar onJumpToSettings={onJumpToSettings} />
 
       {/*
         v0.2.9 三栏布局增强（在 v0.2.8 三栏基础上）：

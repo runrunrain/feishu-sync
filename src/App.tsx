@@ -23,16 +23,32 @@ import { SyncProvider } from './hooks/useSync';
 
 function AppShell() {
   const [currentArea, setCurrentArea] = useState<MainArea>('overview');
+  const [settingsFocusTab, setSettingsFocusTab] = useState<'application' | undefined>(undefined);
+  const [settingsFocusNonce, setSettingsFocusNonce] = useState(0);
   const { ready: authReady } = useAuthStatus();
   const { pendingCount } = useSyncStatus();
   // 全局新版本徽标（仅桌面端；启动时主进程会静默检查一次更新）。
   const { availableVersion } = useDesktopUpdateBadge();
 
+  const handleJumpToSettings = (tab?: 'application') => {
+    if (tab) {
+      setSettingsFocusTab(tab);
+      setSettingsFocusNonce((n) => n + 1);
+    }
+    setCurrentArea('settings');
+  };
+
   return (
     <div className="h-[100dvh] min-h-screen w-full overflow-hidden flex flex-col bg-paper">
       <TopBar
         currentArea={currentArea}
-        onAreaChange={setCurrentArea}
+        onAreaChange={(area) => {
+          if (area === 'settings' && availableVersion) {
+            setSettingsFocusTab('application');
+            setSettingsFocusNonce((n) => n + 1);
+          }
+          setCurrentArea(area);
+        }}
         authReady={authReady}
         pendingCount={pendingCount}
         updateVersion={availableVersion}
@@ -55,7 +71,10 @@ function AppShell() {
           }`}
         >
           <div className={currentArea === 'overview' ? 'animate-fade-in' : 'hidden'}>
-            <Dashboard onJumpToSync={() => setCurrentArea('sync')} />
+            <Dashboard
+              onJumpToSync={() => setCurrentArea('sync')}
+              onJumpToSettings={handleJumpToSettings}
+            />
           </div>
           <div className={currentArea === 'sync' ? 'animate-fade-in' : 'hidden'}>
             {/* active 标记主区是否可见：同步区常驻挂载（v0.2.9），但变为
@@ -64,8 +83,11 @@ function AppShell() {
             <SyncView active={currentArea === 'sync'} />
           </div>
           <div className={currentArea === 'settings' ? 'animate-fade-in' : 'hidden'}>
-            {/* focusTabId：点 TopBar「新版本」徽标时直达「应用 · 关于与更新」 */}
-            <SettingsView focusTabId={availableVersion ? 'application' : undefined} />
+            {/* focusTabId：点 TopBar「新版本」徽标或总览页版本更新入口时直达「应用 · 关于与更新」 */}
+            <SettingsView
+              focusTabId={settingsFocusTab || (availableVersion ? 'application' : undefined)}
+              focusNonce={settingsFocusNonce}
+            />
           </div>
         </div>
       </main>
