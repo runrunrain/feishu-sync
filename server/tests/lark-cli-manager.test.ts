@@ -159,6 +159,56 @@ describe('parseLenientDeviceAuthJson', () => {
 // ---------------------------------------------------------------------------
 
 describe('installOrUpdateLarkCli', () => {
+  it('E2BIG 回归：fnm multishells 累积海量目录时 env PATH 受限且以 npm 目录开头', async () => {
+    // 2026-09 实测事故：重度用户机器上 fnm_multishells 累积 15 万个目录，
+    // 全量拼入 PATH → spawn E2BIG，npm 更新永远失败。
+    const binDir = makeBinDir(true);
+
+    // 伪造 200 个 multishell 目录 + 差异化 mtime（旧→新）。
+    const multiDir = path.join(tmpRoot, '.local', 'state', 'fnm_multishells');
+    fs.mkdirSync(multiDir, { recursive: true });
+    for (let i = 0; i < 200; i += 1) {
+      const shellDir = path.join(multiDir, `shell_${String(i).padStart(4, '0')}`);
+      fs.mkdirSync(shellDir, { recursive: true });
+      const stamp = new Date(Date.now() - (200 - i) * 60_000);
+      fs.utimesSync(shellDir, stamp, stamp);
+    }
+
+    const client = { checkAuthReady: vi.fn(async () => ({ ready: true })) };
+    const configManager = {
+      getConfig: vi.fn(() => ({ requiredScopes: ['offline_access'] })),
+      load: vi.fn(async () => ({ requiredScopes: ['offline_access'] })),
+    };
+    const manager = new LarkCliManager(client, configManager, {
+      platform: 'darwin',
+      env: { PATH: binDir },
+      homeDir: tmpRoot,
+    });
+
+    setExecHandler((_file, args) => {
+      if (args.includes('install')) return { stdout: 'added 1 package in 1s', stderr: '' };
+      if (args[0] === '--version') return { stdout: 'lark-cli/2.3.4\n' };
+      return { stdout: '' };
+    });
+
+    const result = await manager.installOrUpdateLarkCli();
+    expect(result.ok).toBe(true);
+
+    // 捕获 npm install 的 env：PATH 必须以 npm 所在目录开头且总长受限。
+    const installCall = execFileMock.mock.calls.find((call) =>
+      (call[1] as string[]).includes('install'),
+    ) as unknown as [string, string[], { env?: { PATH?: string } }] | undefined;
+    expect(installCall).toBeDefined();
+    const envPath = installCall![2]?.env?.PATH ?? '';
+    expect(envPath.startsWith(binDir)).toBe(true);
+    expect(envPath.length).toBeLessThan(5_000);
+    // 注入段绝不能包含海量 multishell：最多允许限量后的少数几个。
+    const multishellEntries = envPath
+      .split(path.delimiter)
+      .filter((entry) => entry.includes('fnm_multishells'));
+    expect(multishellEntries.length).toBeLessThanOrEqual(8);
+  });
+
   it('returns npm_not_found without spawning when npm is unavailable', async () => {
     const binDir = makeBinDir(false);
     const { manager } = createManager({ binDir });

@@ -151,7 +151,40 @@ export function findExecutableOnPath(
 /**
  * 获取 Node/npm/lark-cli 的全平台全版本管理器候选目录。
  * 覆盖现代 Node 环境：fnm, nvm, volta, pnpm, asdf, Homebrew, ~/.local/bin, ~/.npm-global/bin 等。
+ *
+ * 2026-09 E2BIG 修复：所有「按目录扫描」的候选均限量——multishell 是
+ * 会话级临时目录，只取 mtime 最近的 8 个（实测重度用户机器上有 15 万个
+ * 累积目录，全量拼入 PATH 会以 spawn E2BIG 炸掉子进程，且 readdirSync
+ * 15 万项本身就是性能炸弹）；已安装版本取最新 5 个。发现阶段的语义
+ * 不变：最近的 multishell / 最新的版本就是活跃可用的那份。
  */
+const FNM_MULTISHELL_SCAN_LIMIT = 8;
+const NODE_VERSION_SCAN_LIMIT = 5;
+
+function recentDirectoriesBy(dir: string, limit: number): string[] {
+  try {
+    if (!fs.existsSync(dir)) return [];
+    return fs
+      .readdirSync(dir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => {
+        const full = path.join(dir, entry.name);
+        let mtimeMs = 0;
+        try {
+          mtimeMs = fs.statSync(full).mtimeMs;
+        } catch {
+          /* raced deletion */
+        }
+        return { full, mtimeMs };
+      })
+      .sort((a, b) => b.mtimeMs - a.mtimeMs)
+      .slice(0, limit)
+      .map((entry) => entry.full);
+  } catch {
+    return [];
+  }
+}
+
 export function getNodeRuntimeCandidateDirectories(
   homeDir: string = os.homedir(),
   env: NodeJS.ProcessEnv = process.env,
@@ -169,12 +202,13 @@ export function getNodeRuntimeCandidateDirectories(
 
   const dirs: string[] = [];
 
-  // 1. fnm (Fast Node Manager) - current、multishells 与已安装版本
+  // 1. fnm (Fast Node Manager) - current、最近的 multishells 与最新版本
   dirs.push(path.join(homeDir, '.local', 'share', 'fnm', 'current', 'bin'));
   try {
     const fnmVersionsDir = path.join(homeDir, '.local', 'share', 'fnm', 'node-versions');
     if (fs.existsSync(fnmVersionsDir)) {
-      const versions = fs.readdirSync(fnmVersionsDir).sort().reverse();
+      const versions = fs.readdirSync(fnmVersionsDir).sort().reverse()
+        .slice(0, NODE_VERSION_SCAN_LIMIT);
       for (const v of versions) {
         dirs.push(path.join(fnmVersionsDir, v, 'installation', 'bin'));
       }
@@ -182,16 +216,11 @@ export function getNodeRuntimeCandidateDirectories(
   } catch {
     /* ignore */
   }
-  try {
-    const fnmMultiDir = path.join(homeDir, '.local', 'state', 'fnm_multishells');
-    if (fs.existsSync(fnmMultiDir)) {
-      const shells = fs.readdirSync(fnmMultiDir);
-      for (const s of shells) {
-        dirs.push(path.join(fnmMultiDir, s, 'bin'));
-      }
-    }
-  } catch {
-    /* ignore */
+  for (const shellDir of recentDirectoriesBy(
+    path.join(homeDir, '.local', 'state', 'fnm_multishells'),
+    FNM_MULTISHELL_SCAN_LIMIT,
+  )) {
+    dirs.push(path.join(shellDir, 'bin'));
   }
 
   // 2. nvm - versions 目录与 current
@@ -199,7 +228,8 @@ export function getNodeRuntimeCandidateDirectories(
   try {
     const nvmVersionsDir = path.join(homeDir, '.nvm', 'versions', 'node');
     if (fs.existsSync(nvmVersionsDir)) {
-      const versions = fs.readdirSync(nvmVersionsDir).sort().reverse();
+      const versions = fs.readdirSync(nvmVersionsDir).sort().reverse()
+        .slice(0, NODE_VERSION_SCAN_LIMIT);
       for (const v of versions) {
         dirs.push(path.join(nvmVersionsDir, v, 'bin'));
       }

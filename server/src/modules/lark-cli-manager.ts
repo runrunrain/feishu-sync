@@ -146,6 +146,12 @@ function execErrorOutput(error: unknown): string {
  * 将 npm 所在目录及全平台 Node 候选目录（fnm, nvm, volta, pnpm, Homebrew 等）
  * 注入到 PATH 中，确保即使在 Finder 启动的精简环境下，npm 内部调用 `node` 脚本也能顺利执行。
  */
+/**
+ * PATH 总长安全上限：Windows CreateProcess 的环境块上限 32,767 字符，
+ * 取保守余量 28,000；unix 虽 ARG_MAX 宽裕也守同值，避免病态环境。
+ */
+const PATH_SAFETY_LIMIT = 28_000;
+
 function buildNpmExecutionEnvironment(
   npmPath: string,
   env: NodeJS.ProcessEnv = process.env,
@@ -156,11 +162,28 @@ function buildNpmExecutionEnvironment(
   const currentPath = env[pathKey] ?? env.PATH ?? env.Path ?? '';
   const entries = currentPath.split(path.delimiter).filter(Boolean);
   const npmDir = path.dirname(path.resolve(npmPath));
-  const candidateDirs = getNodeRuntimeCandidateDirectories(homeDir, env, platform);
+
+  // 2026-09 E2BIG 修复：不再把全量版本管理器候选目录注入 PATH（重度
+  // 用户机器上候选可达 15 万条，全量拼接直接 spawn E2BIG）。npm 的 shim
+  // 只需要 `node` 可被 PATH 命中，而 node 与 npm 几乎总在同一目录——
+  // 只注入 npm 所在目录 + fnm current 兑底即可，候选集仅供发现阶段使用。
+  const minimalExtras = [
+    npmDir,
+    path.join(homeDir, '.local', 'share', 'fnm', 'current', 'bin'),
+  ].filter(Boolean);
 
   const nextPath = Array.from(
-    new Set([npmDir, ...entries, ...candidateDirs]),
+    new Set([...minimalExtras, ...entries]),
   ).join(path.delimiter);
+
+  if (nextPath.length > PATH_SAFETY_LIMIT) {
+    // 病态长 PATH（用户系统本身超长）：退化为最小注入，绝不让环境块爆掉。
+    const fallback = Array.from(new Set(minimalExtras)).join(path.delimiter);
+    console.warn(
+      `[lark-cli-manager] PATH exceeds safety limit (${nextPath.length} chars); using minimal injection`,
+    );
+    return { ...env, [pathKey]: fallback };
+  }
 
   return { ...env, [pathKey]: nextPath };
 }
