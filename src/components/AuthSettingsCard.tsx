@@ -5,7 +5,8 @@
  * - 未安装 lark-cli：「一键安装 lark-cli」；npm 不可用时引导安装 Node.js
  * - 已装未认证/缺 scope：「开始飞书认证」→ Device Flow（自动开浏览器，
  *   卡片内展示可点击/可复制的授权 URL + 等待态 + 完成后自动刷新）
- * - 已就绪：原有 scope/版本展示 + 「更新 lark-cli」次要按钮
+ * - 已就绪：原有 scope/版本展示 + 「更新 lark-cli」次要按钮（已安装即可见，
+ *   与认证状态解耦——认证未就绪时往往是用户最需要更新 CLI 的时刻）
  * 依赖 useAuthStatus（就绪态 + scope 列表）与 useLarkCliSetup（引导状态机）。
  */
 
@@ -127,7 +128,7 @@ export function AuthSettingsCard() {
           <h2 className="text-base font-kai font-medium text-ink">飞书认证</h2>
         </div>
         <div className="flex items-center gap-2">
-          {ready && (
+          {setup.toolStatus?.larkCliInstalled && (
             <Button variant="secondary" size="sm" onClick={handleUpdate} loading={setup.installing}>
               <RotateCcw className="w-3.5 h-3.5" />
               更新 lark-cli
