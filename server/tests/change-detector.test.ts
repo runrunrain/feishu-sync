@@ -1963,4 +1963,53 @@ feishu_sync:
     const customDoc = customResult.changedDocuments.find((d) => d.objToken === 'tok_custom_sheet');
     expect(customDoc?.mediaGapReason).toBe('sheet_cloud_images_missing');
   });
+
+  it('e2) custom-folder docx placeholder tags are scanned too (零散 docx 覆盖修复)', async () => {
+    const docxDir = path.join(tmpKbRoot, '_custom', '零散设计文档');
+    fs.mkdirSync(docxDir, { recursive: true });
+    const mdPath = path.join(docxDir, 'CustomDocx.md');
+    fs.writeFileSync(
+      mdPath,
+      `<!--
+feishu_sync:
+  obj_token: "tok_custom_docx"
+-->
+# 零散文档
+<synced-source><whiteboard token="WbCustomGap0000000000000X"></whiteboard></synced-source>
+`,
+      'utf-8',
+    );
+
+    const store = new MockLocalMapStore();
+    store.rows.set(
+      'tok_custom_docx',
+      makeLocal({
+        objToken: 'tok_custom_docx',
+        wikiNodeToken: 'node_custom_docx',
+        objType: 'docx',
+        title: 'Custom Docx',
+        localMdPath: mdPath,
+        status: 'synced',
+        syncState: 'synced',
+        watchedRootId: null,
+        watchedRootUrl: null,
+        customFolderId: 'folder_456',
+        originalLink: 'https://feishu.cn/wiki/node_custom_docx',
+        syncedObjEditTime: 1000,
+        observedObjEditTime: 1000,
+      }),
+    );
+
+    const lark = new MediaGapLarkClient();
+    const detector = new ChangeDetector(lark as any, store as any, {
+      knowledgeBaseRoot: tmpKbRoot,
+    });
+
+    // local-only 也必须覆盖 custom docx：零散文档的占位标签扫描零 API 成本。
+    const customResult = await detector.detectCustomFolderChanges({ mediaGapScope: 'local-only' });
+    const gapDoc = customResult.changedDocuments.find((d) => d.objToken === 'tok_custom_docx');
+    expect(gapDoc).toBeDefined();
+    expect(gapDoc?.mediaGapReason).toBe('local_placeholder_tags');
+    expect(store.mediaGapMarkCalls).toContain('tok_custom_docx');
+  });
 });

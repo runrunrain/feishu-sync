@@ -540,10 +540,13 @@ export class ChangeDetector {
       changedDocuments,
     };
 
-    const syncedCustomSheets = customDocs.filter(
-      (doc) => doc.objType === 'sheet' && (doc.status === 'synced' || doc.syncState === 'synced'),
+    // 全类型 synced 归档文档进入媒体核对：docx/slides 靠本地残留标签扫描
+    // （零散设计文档常携带未拉取的白板/图片占位），sheet 另需 full scope
+    // 才发 workbook-info 云端清单核对（detectMediaGaps 内部按 objType 分派）。
+    const syncedCustomDocs = customDocs.filter(
+      (doc) => doc.status === 'synced' || doc.syncState === 'synced',
     );
-    await this.appendMediaGapPending(result, syncedCustomSheets, options.mediaGapScope ?? 'local-only');
+    await this.appendMediaGapPending(result, syncedCustomDocs, options.mediaGapScope ?? 'local-only');
 
     return result;
   }
