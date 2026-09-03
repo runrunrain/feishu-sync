@@ -4,6 +4,18 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+### Fixed（fix）
+
+- **Win 更新 lark-cli 报「'C:\Program' 不是内部或外部命令」（npm_failed）**：`C:\Program Files\nodejs\npm.cmd` 含空格，spawn(shell:true) 裸拼可执行路径，cmd.exe 把 `C:\Program` 拆成命令。统一为全部子进程调用（npm 安装/镜像重试/免权限降级、设备授权发起/完成、版本验证、lark-cli 执行）引入 Windows 路径引号包裹。
+
+---
+
+## [0.3.16] - 2026-09-03
+
+### Added（ui）
+
+- **专属应用图标**：替换通用 Electron 图标为纸墨「飞」印章设计——宣纸纹理白底、朱红方印内白色楷书简体「飞」字、下方青玉色双向水墨弧线构成的同步意象；mac 使用全尺寸 icns，Windows 由 1024 源图自动转换多尺寸 ico，与应用内印章 logo 一脉相承。
+
 ---
 
 ## [0.3.15] - 2026-09-03

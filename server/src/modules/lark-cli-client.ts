@@ -19,6 +19,22 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'util';
 import { SCOPE_ALIAS_GROUPS } from './config-manager.js';
+
+/**
+ * Windows shell 引号包裹（2026-09 实测事故：`C:\Program Files\nodejs\npm.cmd`
+ * 含空格，spawn(shell:true) 把 file 裸拼进命令行，cmd.exe 把 `C:\Program`
+ * 当命令 → 「不是内部或外部命令」→ npm_failed）。仅在 win32 且路径含空格
+ * 时包裹双引号；已包裹/无空格/非 Win 原样返回。
+ */
+export function quoteWindowsExecutablePath(
+  file: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  if (platform !== 'win32') return file;
+  if (!/\s/.test(file)) return file;
+  if (file.length >= 2 && file.startsWith('"') && file.endsWith('"')) return file;
+  return `"${file}"`;
+}
 import type { LarkCliNodeInfo, LarkCliConfig } from '../types/index.js';
 
 const execFileAsync = promisify(execFile);
@@ -754,13 +770,17 @@ export class LarkCliClient {
     const timeout = this.config.timeout || 30000;
 
     try {
-      const { stdout, stderr } = await execFileAsync(larkCliPath, args, {
-        timeout,
-        encoding: 'utf-8',
-        shell: process.platform === 'win32', // Use shell on Windows for .cmd files
-        env: buildLarkCliEnvironment(larkCliPath),
-        ...(executionOptions?.cwd ? { cwd: executionOptions.cwd } : {}),
-      });
+      const { stdout, stderr } = await execFileAsync(
+        quoteWindowsExecutablePath(larkCliPath),
+        args,
+        {
+          timeout,
+          encoding: 'utf-8',
+          shell: process.platform === 'win32', // Use shell on Windows for .cmd files
+          env: buildLarkCliEnvironment(larkCliPath),
+          ...(executionOptions?.cwd ? { cwd: executionOptions.cwd } : {}),
+        },
+      );
 
       // Detect authentication errors
       if (this.detectAuthError(stderr)) {

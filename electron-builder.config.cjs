@@ -128,6 +128,8 @@ module.exports = {
     main: "dist-electron/main.cjs",
   },
   mac: targetPlatform === "darwin" ? {
+    // 纸墨「飞」印章应用图标（2026-09 定稿）；icns 由 1024 源图全尺寸生成。
+    icon: "build/icon.icns",
     target: [
       { target: "dmg", arch: [targetArch] },
       { target: "zip", arch: [targetArch] },
@@ -150,6 +152,8 @@ module.exports = {
     sign: isMacRelease,
   },
   win: targetPlatform === "win32" ? {
+    // Win 侧用 1024 png，electron-builder 自动转换为多尺寸 ico。
+    icon: "build/icon.png",
     target: [{ target: "nsis", arch: [targetArch] }],
     artifactName: "FeishuSync-Setup-${version}-${arch}.${ext}",
   } : undefined,

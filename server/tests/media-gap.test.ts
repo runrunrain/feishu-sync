@@ -24,7 +24,21 @@ import {
   detectMediaGaps,
   __resetWorkbookInfoCacheForTest,
 } from '../src/modules/media-gap.js';
+import { quoteWindowsExecutablePath } from '../src/modules/lark-cli-client.js';
 import type { DocumentRecord } from '../src/types/index.js';
+
+describe('quoteWindowsExecutablePath', () => {
+  it('quotes win32 paths containing spaces and leaves everything else untouched', () => {
+    expect(quoteWindowsExecutablePath('C:\\Program Files\\nodejs\\npm.cmd', 'win32'))
+      .toBe('"C:\\Program Files\\nodejs\\npm.cmd"');
+    expect(quoteWindowsExecutablePath('C:\\nodejs\\npm.cmd', 'win32'))
+      .toBe('C:\\nodejs\\npm.cmd');
+    expect(quoteWindowsExecutablePath('"C:\\Program Files\\nodejs\\npm.cmd"', 'win32'))
+      .toBe('"C:\\Program Files\\nodejs\\npm.cmd"');
+    expect(quoteWindowsExecutablePath('/usr/local/bin with space/npm', 'darwin'))
+      .toBe('/usr/local/bin with space/npm');
+  });
+});
 
 describe('media-gap unit tests', () => {
   let tmpDir: string;

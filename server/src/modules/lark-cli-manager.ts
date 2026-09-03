@@ -30,6 +30,7 @@ import {
   buildLarkCliEnvironment,
   findExecutableOnPath,
   getNodeRuntimeCandidateDirectories,
+  quoteWindowsExecutablePath,
   resolveLarkCliExecutable,
   type LarkCliAuthReadiness,
 } from './lark-cli-client.js';
@@ -313,7 +314,7 @@ export class LarkCliManager {
 
     try {
       const { stdout, stderr } = await execFileAsync(
-        npm.path,
+        quoteWindowsExecutablePath(npm.path, this.discovery.platform ?? process.platform),
         ['install', '-g', 'lark-cli@latest'],
         {
           timeout: NPM_INSTALL_TIMEOUT_MS,
@@ -333,7 +334,7 @@ export class LarkCliManager {
         // 网络问题：尝试国内官方镜像源重试一次
         try {
           const { stdout, stderr } = await execFileAsync(
-            npm.path,
+            quoteWindowsExecutablePath(npm.path, this.discovery.platform ?? process.platform),
             ['install', '-g', 'lark-cli@latest', '--registry=https://registry.npmmirror.com'],
             {
               timeout: NPM_INSTALL_TIMEOUT_MS,
@@ -358,7 +359,7 @@ export class LarkCliManager {
         const userPrefix = path.join(homeDir, '.npm-global');
         try {
           const { stdout, stderr } = await execFileAsync(
-            npm.path,
+            quoteWindowsExecutablePath(npm.path, this.discovery.platform ?? process.platform),
             ['install', '-g', '--prefix', userPrefix, 'lark-cli@latest'],
             {
               timeout: NPM_INSTALL_TIMEOUT_MS,
@@ -424,7 +425,7 @@ export class LarkCliManager {
     let raw = '';
     try {
       const { stdout, stderr } = await execFileAsync(
-        larkCliPath,
+        quoteWindowsExecutablePath(larkCliPath, this.discovery.platform ?? process.platform),
         ['auth', 'login', '--no-wait', '--json', '--scope', scopes.join(' ')],
         {
           timeout: DEVICE_AUTH_START_TIMEOUT_MS,
@@ -492,7 +493,7 @@ export class LarkCliManager {
     let flowError: string | undefined;
     try {
       await execFileAsync(
-        larkCliPath,
+        quoteWindowsExecutablePath(larkCliPath, this.discovery.platform ?? process.platform),
         ['auth', 'login', '--device-code', deviceCode],
         {
           timeout: DEVICE_AUTH_COMPLETE_TIMEOUT_MS,
@@ -555,7 +556,7 @@ export class LarkCliManager {
   /** `lark-cli --version` 验证（直连，30s 超时；失败抛错由调用方分类）。 */
   private async detectLarkCliVersion(): Promise<string> {
     const larkCliPath = this.resolveLarkCliPath();
-    const { stdout } = await execFileAsync(larkCliPath, ['--version'], {
+    const { stdout } = await execFileAsync(quoteWindowsExecutablePath(larkCliPath, this.discovery.platform ?? process.platform), ['--version'], {
       timeout: VERSION_CHECK_TIMEOUT_MS,
       encoding: 'utf-8',
       windowsHide: true,

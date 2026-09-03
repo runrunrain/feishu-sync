@@ -209,6 +209,41 @@ describe('installOrUpdateLarkCli', () => {
     expect(multishellEntries.length).toBeLessThanOrEqual(8);
   });
 
+  it('win32 regression: npm path with spaces is shell-quoted (C:\\Program\\...\\npm.cmd)', async () => {
+    // 2026-09 Win 实测：spawn(shell:true) 裸拼含空格路径，cmd.exe 把
+    // `C:\Program` 当命令 → 「不是内部或外部命令」→ npm_failed。
+    const spacedDir = path.join(tmpRoot, 'Program Files', 'nodejs');
+    fs.mkdirSync(spacedDir, { recursive: true });
+    fs.writeFileSync(path.join(spacedDir, 'npm.cmd'), '@echo off\n', { mode: 0o755 });
+
+    const client = { checkAuthReady: vi.fn(async () => ({ ready: true })) };
+    const configManager = {
+      getConfig: vi.fn(() => ({ requiredScopes: ['offline_access'] })),
+      load: vi.fn(async () => ({ requiredScopes: ['offline_access'] })),
+    };
+    const manager = new LarkCliManager(client, configManager, {
+      platform: 'win32',
+      env: { PATH: spacedDir },
+      homeDir: tmpRoot,
+    });
+
+    setExecHandler((_file, args) => {
+      if (args.includes('install')) return { stdout: 'added 1 package in 1s', stderr: '' };
+      if (args[0] === '--version') return { stdout: 'lark-cli/2.3.4\n' };
+      return { stdout: '' };
+    });
+
+    const result = await manager.installOrUpdateLarkCli();
+    expect(result.ok).toBe(true);
+
+    const installCall = execFileMock.mock.calls.find((call) =>
+      (call[1] as string[]).includes('install'),
+    ) as unknown as [string] | undefined;
+    expect(installCall).toBeDefined();
+    // 关键断言：file 已被双引号包裹，cmd.exe 不再把 `C:\Program` 拆成命令。
+    expect(installCall![0]).toBe(`"${path.join(spacedDir, 'npm.cmd')}"`);
+  });
+
   it('returns npm_not_found without spawning when npm is unavailable', async () => {
     const binDir = makeBinDir(false);
     const { manager } = createManager({ binDir });
