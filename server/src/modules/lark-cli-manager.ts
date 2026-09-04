@@ -34,7 +34,7 @@ import {
   resolveLarkCliExecutable,
   type LarkCliAuthReadiness,
 } from './lark-cli-client.js';
-import { DEFAULT_REQUIRED_SCOPES } from './config-manager.js';
+import { DEFAULT_REQUIRED_SCOPES, RETIRED_REQUEST_SCOPES } from './config-manager.js';
 import type { Config } from '../types/index.js';
 
 const execFileAsync = promisify(execFile);
@@ -576,10 +576,10 @@ export class LarkCliManager {
   }
 
   private resolveLarkCliPath(): string {
-    const config = this.configManager.getConfig();
-    // 复用 lark-cli-client 的 PATH/常见位置发现逻辑；configured path 来自
-    // 用户设置（config.larkCliPath），与 LarkCliClient 共用同一来源。
-    return resolveLarkCliExecutable(config?.larkCliPath, {
+    // 复用 lark-cli-client 的 PATH/常见位置发现逻辑。lark-cli 路径已不可
+    // 配置（2026-10 移除 config.larkCliPath）：与 LarkCliClient 一致，只走
+    // 发现链 + LARK_CLI_PATH 环境变量。
+    return resolveLarkCliExecutable(undefined, {
       env: this.discovery.env,
       homeDir: this.discovery.homeDir,
       platform: this.discovery.platform,
@@ -592,7 +592,14 @@ export class LarkCliManager {
       // getConfig 是内存缓存；buildServer 已 load 过，这里兜底再 load 一次。
       config = await this.configManager.load().catch(() => null);
     }
-    if (config?.requiredScopes?.length) return config.requiredScopes;
+    // 2026-10 兑底过滤：已在上游失效的 scope 名（如 docs:document:read）一旦
+    // 进入 `auth login --scope` 请求集，整单 device authorization 会被拒
+    // （实测：「The provided scope list contains invalid or malformed scopes」）。
+    // 加载迁移已清理存量配置，这里再拦手改配置/旧进程缓存回灌的漏网之鱼。
+    const retired = new Set(RETIRED_REQUEST_SCOPES);
+    if (config?.requiredScopes?.length) {
+      return config.requiredScopes.filter((s) => !retired.has(s));
+    }
     return DEFAULT_REQUIRED_SCOPES;
   }
 

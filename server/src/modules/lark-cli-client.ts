@@ -420,8 +420,8 @@ export class LarkCliClient {
 
   /**
    * Apply a configuration change without requiring the desktop process to
-   * restart. This is used after the Settings page saves larkCliPath or the
-   * required scope set.
+   * restart. This is used after the Settings page saves the required scope
+   * set. lark-cli 路径已不可配置（2026-10），不再经由该入口更新。
    */
   updateConfig(config: Partial<LarkCliConfig>): void {
     this.config = { ...this.config, ...config };
@@ -597,7 +597,8 @@ export class LarkCliClient {
       //    SCOPE_ALIAS_GROUPS：飞书新旧 scope 名交替期，授权端可能只授予组内
       //    某一个名字（如旧 docx:document:readonly vs 新 docs:document:read）。
       //    组内任一命中即视为满足，避免对新名的误报阻断认证（2026-09 实测
-      //    「缺少权限：docs:document:read」即旧授权只持旧名触发）。
+      //    「缺少权限：docs:document:read」即旧授权只持旧名触发；2026-10 起
+      //    默认需求集已不再要求该名，此兑底仅为手改配置/旧 token 兼容）。
       const scopesString = statusResult.data.identities?.user?.scope || '';
       const currentScopes = scopesString.split(' ').filter((s: string) => s.length > 0);
       const currentScopeSet = new Set(currentScopes);
@@ -788,6 +789,9 @@ export class LarkCliClient {
     args: string[],
     executionOptions?: LarkCliExecutionOptions,
   ): Promise<any> {
+    // larkCliPath 已不是用户配置项（2026-10）：生产链路不再从 Config 接线，
+    // this.config.larkCliPath 仅作为测试哨兵注入点存在（缺省 undefined →
+    // 走 PATH + 桌面发现目录解析）；LARK_CLI_PATH 环境变量仍可作部署级覆盖。
     const larkCliPath = resolveLarkCliExecutable(this.config.larkCliPath);
     const timeout = this.config.timeout || 30000;
 

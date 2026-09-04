@@ -172,7 +172,6 @@ configRoutes.put('/api/config', async (c) => {
     const larkCliClient = (c as any).larkCliClient;
     if (typeof larkCliClient?.updateConfig === 'function') {
       larkCliClient.updateConfig({
-        larkCliPath: updatedConfig.larkCliPath,
         requiredScopes: updatedConfig.requiredScopes,
       });
     }

@@ -3,7 +3,13 @@
  *
  * Follows the revised config schema from 飞书认证架构专项设计:
  * - REMOVED: app_id, app_secret, feishuAuthRef, feishuSpaceId
- * - ADDED: larkCliPath (optional), requiredScopes
+ * - REMOVED (2026-10): larkCliPath — 不再是可配置项。历史上该字段一旦被
+ *   填入错误路径便无法通过 UI 清空（undefined 在 JSON 序列化时丢键、
+ *   updateConfig 浅合并保留旧值），且错误路径会让 discovery 永远解析失败。
+ *   现在加载时主动剔除磁盘上的存量 larkCliPath 并写回清理后的文件；
+ *   lark-cli 解析只走 PATH + 桌面发现目录（lark-cli-client.ts），环境变量
+ *   LARK_CLI_PATH 仍可作为部署级逃生口。
+ * - ADDED: requiredScopes
  *
  * v0.2.0 P3: LLM config migrated to channel-agnostic shape
  * (LlmConfig). Both channels (ClaudeCliChannel + DirectChannel) share
@@ -42,10 +48,11 @@ const DEFAULT_CONFIG_PATH = path.join(os.homedir(), '.feishu-sync', 'config.json
  * Exported so LarkCliManager's device-flow scope assembly shares the same
  * default source instead of drifting into a third copy of the list.
  *
- * 2026-09 补充 docs:document:read：lark-cli ≥1.0.8x 的 docs 命令族在新版
- * 飞书 scope 体系中依赖该新名（与旧名 docx:document:readonly 并存）。
- * 旧授权只持有旧名时，checkAuthReady 的别名等价表（见 lark-cli-client）
- * 会将其视为已满足，不强迫用户重新授权。
+ * 2026-10 移除 docs:document:read：实测（lark-cli 1.0.93，OAuth 应用
+ * cli_aab83ada483cdcc0 启用清单 198 项中无此名）带上它发起 device flow
+ * 会被整单拒绝：「The provided scope list contains invalid or malformed
+ * scopes」。该名是 2026-09 曾短暂可用的交替名，上游已失效；旧名
+ * docx:document:readonly 始终有效，checkAuthReady 的别名等价表兼底。
  */
 export const DEFAULT_REQUIRED_SCOPES = [
   'wiki:node:retrieve',
@@ -53,7 +60,6 @@ export const DEFAULT_REQUIRED_SCOPES = [
   'docs:document.content:read',
   'sheets:spreadsheet:read',
   'docx:document:readonly',
-  'docs:document:read',
   'drive:drive.metadata:readonly',
   'docs:document.media:download',
   'slides:presentation:read',
@@ -61,9 +67,17 @@ export const DEFAULT_REQUIRED_SCOPES = [
 ];
 
 /**
+ * 已在上游失效的 scope 名：出现在 `auth login --scope` 请求集里会让整单
+ * device authorization 被拒（2026-10 实测 docs:document:read）。加载迁移
+ * 从存量配置剔除，device flow 发起前再兑底过滤一次（防手改配置回灌）。
+ */
+export const RETIRED_REQUEST_SCOPES: readonly string[] = ['docs:document:read'];
+
+/**
  * 飞书 scope 新旧名等价组：授权端可能只授予其中一个名字。比对
  * requiredScopes 时组内任一命中即视为满足，避免新名/旧名交替期的误报
- * 「缺少权限」阻断认证。
+ * 「缺少权限」阻断认证。docs:document:read 已于 2026-10 从默认需求集
+ * 退役，该组保留作为兑底：手改配置或未来上游回摆时仍不误报。
  */
 export const SCOPE_ALIAS_GROUPS: ReadonlyArray<readonly string[]> = [
   ['docx:document:readonly', 'docs:document:read'],
@@ -386,7 +400,6 @@ const DEFAULT_CONFIG: Config = {
   knowledgeBaseRoot: '',
   watchedRoots: [],
   watchedRootUrls: [],
-  larkCliPath: undefined,
   requiredScopes: DEFAULT_REQUIRED_SCOPES,
   enableAutoStart: true,
   enableNotifications: true,
@@ -619,7 +632,8 @@ export class ConfigManager {
           const { _migrated, ...persisted } = migrated;
           await this.save(persisted);
           console.info(
-            '[ConfigManager] v0.2.0 LLM config migration applied and persisted.'
+            '[ConfigManager] config migration applied and persisted ' +
+              '(LLM shape upgrade and/or legacy larkCliPath cleanup).'
           );
         } else {
           console.info(`[ConfigManager] Loaded config from ${this.configPath}`);
@@ -698,6 +712,12 @@ export class ConfigManager {
    * validation with a shallow object merge.
    */
   async updateConfig(partial: Partial<Config>): Promise<Config> {
+    // 2026-10 larkCliPath 下线：拒绝任何调用方把废弃键带回运行时/磁盘
+    // 配置（旧版前端缓存、第三方脚本可能仍回传）。解析链已不读该键，
+    // 但保持 config.json 干净可避免用户手工排查时被误导。
+    if (Object.prototype.hasOwnProperty.call(partial, 'larkCliPath')) {
+      delete (partial as Record<string, unknown>).larkCliPath;
+    }
     const currentConfig = await this.load();
     const hasStructuredRoots = Object.prototype.hasOwnProperty.call(partial, 'watchedRoots');
     const hasLegacyUrls = Object.prototype.hasOwnProperty.call(partial, 'watchedRootUrls');
@@ -899,6 +919,20 @@ export class ConfigManager {
       migrated = migrated || Array.isArray(raw.watchedRootUrls);
     }
 
+    // larkCliPath 已废弃（2026-10）：不再读入运行时配置。磁盘上若仍有存量
+    // 键（可能是指向不存在路径的错误值），触发一次迁移写回把它物理清除，
+    // 防止旧配置在版本更新后继续污染 lark-cli 解析。
+    migrated = migrated || Object.prototype.hasOwnProperty.call(raw, 'larkCliPath');
+
+    // 2026-10 scope 退役清理：2026-09 的 additive 迁移曾把 docs:document:read
+    // 追加进存量配置；该名现已在上游失效，带上它发起授权会被整单拒绝。
+    // 从存量列表剔除并触发写回，否则升级后 device flow 依旧发起失败。
+    const scopeSource = Array.isArray(raw.requiredScopes) && raw.requiredScopes.length > 0
+      ? raw.requiredScopes
+      : DEFAULT_REQUIRED_SCOPES;
+    const scopeMigration = this.migrateRequiredScopes(scopeSource);
+    migrated = migrated || scopeMigration.changed;
+
     const config: Config = {
       llm,
       pollIntervalMinutes: typeof raw.pollIntervalMinutes === 'number'
@@ -911,15 +945,10 @@ export class ConfigManager {
       // In-memory compatibility projection only; save() deliberately omits
       // this legacy field from the on-disk schema.
       watchedRootUrls: getEnabledWatchedRootUrls({ watchedRoots }),
-      larkCliPath: typeof raw.larkCliPath === 'string' ? raw.larkCliPath : undefined,
-      // Additive scope migration (2026-09)：旧配置补齐新版飞书 scope 名
-      // docs:document:read（lark-cli ≥1.0.8x docs 命令族依赖；授权端新旧名
-      // 只授其一时由 checkAuthReady 的 SCOPE_ALIAS_GROUPS 等价兑底）。
-      requiredScopes: this.migrateRequiredScopes(
-        Array.isArray(raw.requiredScopes) && raw.requiredScopes.length > 0
-          ? raw.requiredScopes
-          : DEFAULT_REQUIRED_SCOPES,
-      ),
+      // Scope 退役迁移（2026-10）：剔除已上游失效的名字，见上方
+      // scopeMigration 注释；checkAuthReady 的 SCOPE_ALIAS_GROUPS 仍作
+      // 旧 token / 手改配置的等价兑底。
+      requiredScopes: scopeMigration.scopes,
       enableAutoStart: typeof raw.enableAutoStart === 'boolean'
         ? raw.enableAutoStart
         : true,
@@ -932,16 +961,14 @@ export class ConfigManager {
   }
 
   /**
-   * Additive scope migration：把 DEFAULT 中新增的、旧配置缺失的 scope
-   * 追加到用户列表末尾（不删除用户自定义项，不重排）。仅迁移已知的新增
-   * 项，避免未来 DEFAULT 演进时意外改写用户显式裁剪过的列表。
+   * Scope 退役迁移（2026-10）：从存量列表剔除已在上游失效的 scope 名
+   * （docs:document:read —— 曾由 2026-09 additive 迁移写入，现会使
+   * `auth login --scope` 整单被拒）。返回是否发生变化供迁移写回判定。
    */
-  private migrateRequiredScopes(scopes: string[]): string[] {
-    const ADDITIVE = ['docs:document:read'];
-    const owned = new Set(scopes);
-    const additions = ADDITIVE.filter((s) => !owned.has(s));
-    if (additions.length === 0) return scopes;
-    return [...scopes, ...additions];
+  private migrateRequiredScopes(scopes: string[]): { scopes: string[]; changed: boolean } {
+    const retired = new Set(RETIRED_REQUEST_SCOPES);
+    const kept = scopes.filter((s) => !retired.has(s));
+    return { scopes: kept, changed: kept.length !== scopes.length };
   }
 
   /**

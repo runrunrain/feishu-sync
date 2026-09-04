@@ -45,7 +45,6 @@ export interface Config {
    * from `watchedRoots` in memory and no longer persists it to disk.
    */
   watchedRootUrls: string[];
-  larkCliPath?: string;
   requiredScopes: string[];
   enableAutoStart: boolean;
   enableNotifications: boolean;
@@ -791,6 +790,11 @@ export interface LarkCliNodeInfo {
 }
 
 export interface LarkCliConfig {
+  /**
+   * INTERNAL / TEST INJECTION ONLY (2026-10)：不再从用户配置（Config）接线，
+   * 仅作为测试哨兵注入点（确保单测绝不调起真实 lark-cli）。生产路径一律
+   * 走 PATH + 桌面发现目录解析；部署级逃生口用环境变量 LARK_CLI_PATH。
+   */
   larkCliPath?: string;
   requiredScopes: string[];
   timeout: number;

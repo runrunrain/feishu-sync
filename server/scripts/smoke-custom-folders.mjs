@@ -44,7 +44,6 @@ fs.writeFileSync(
       openAiCompatBaseUrl: '', claudeCompatBaseUrl: '', apiKey: '', model: '',
       temperature: 0.2, primaryChannel: 'claude-cli', fallbackOnFailure: false,
     },
-    larkCliPath: undefined,
   }),
 );
 

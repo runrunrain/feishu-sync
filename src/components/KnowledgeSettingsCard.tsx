@@ -4,7 +4,12 @@
  * 字段（与 server Config 对齐）：
  *   - knowledgeBaseRoot（本地根目录，B4 配合点）
  *   - pollIntervalMinutes（轮询间隔，5-1440）
- *   - larkCliPath（可选）
+ *
+ * 2026-10 larkCliPath 修复：lark-cli 路径不再是可配置项。历史版本该输入框
+ * 一旦填入错误路径便无法清空（清空后 undefined 在 JSON 序列化时丢键，
+ * 服务端浅合并保留旧值），且错误路径会让安装好的 lark-cli 也无法被发现。
+ * 已连 UI 一起移除；服务端 ConfigManager 加载时会物理剔除磁盘上的存量键，
+ * 升级后自动回到 PATH + 桌面发现目录解析。
  *
  * 修复要点（2026-06-22 settings-entry-fix）：
  *  1. config=null 时显示骨架占位（不再 return null），避免 API 401/加载中
@@ -12,7 +17,7 @@
  *  2. 本地根目录支持 Electron desktop.openDataDirectory 打开 userData 目录
  *     作为便捷跳转（不做文件夹选择 dialog——server/desktop API 未暴露该 IPC，
  *     避免误承诺，用户可粘贴绝对路径）。
- *  3. 保存仅传 knowledgeBaseRoot/pollIntervalMinutes/larkCliPath，绝不回传
+ *  3. 保存仅传 knowledgeBaseRoot/pollIntervalMinutes，绝不回传
  *     llm（避免把 server GET 时 mask 成 '***' 的 apiKey 写回）。同步根 URL、
  *     本地目录和布局统一由 WatchedRootsCard 管理。
  */
@@ -64,7 +69,6 @@ export function KnowledgeSettingsCard() {
       await updateConfig({
         knowledgeBaseRoot: (cur.knowledgeBaseRoot ?? '').trim(),
         pollIntervalMinutes: cur.pollIntervalMinutes,
-        larkCliPath: cur.larkCliPath?.trim() || undefined,
       });
       toast.push({ type: 'success', message: '已保存知识库设置' });
     } catch (err) {
@@ -211,14 +215,10 @@ export function KnowledgeSettingsCard() {
           helperText="范围 5-1440 分钟；默认 30 分钟"
         />
 
-        {/* lark-cli path */}
-        <Input
-          label="lark-cli 路径（可选）"
-          type="text"
-          value={cur.larkCliPath ?? ''}
-          onChange={(e) => set('larkCliPath', e.target.value || undefined)}
-          placeholder="留空则使用系统 PATH"
-        />
+        <div className="rounded-md border border-line bg-card-bg p-3 text-xs text-ink-faint font-serif">
+          lark-cli 由应用自动发现（系统 PATH 与常见安装位置），无需手动配置路径；
+          如需指定可启动前设置 LARK_CLI_PATH 环境变量。
+        </div>
 
         <div className="flex justify-end pt-3 border-t border-line">
           <Button onClick={handleSave} loading={saving}>

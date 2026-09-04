@@ -26,7 +26,6 @@ export interface Config {
   watchedRoots: WatchedRootConfig[];
   /** Compatibility projection derived by the server; not persisted by P2+. */
   watchedRootUrls: string[];
-  larkCliPath?: string;
   requiredScopes: string[];
   enableAutoStart: boolean;
   enableNotifications: boolean;

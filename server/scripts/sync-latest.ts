@@ -242,7 +242,6 @@ export function mergeRuntimeConfig(
     knowledgeBaseRoot: formalKb,
     watchedRoots: runtimeRoots,
     watchedRootUrls: runtimeRoots.map((root) => root.url),
-    larkCliPath: typeof rawConfig.larkCliPath === 'string' ? rawConfig.larkCliPath : undefined,
     requiredScopes: mergeRequiredScopes(rawConfig.requiredScopes),
     enableAutoStart: typeof rawConfig.enableAutoStart === 'boolean'
       ? rawConfig.enableAutoStart
@@ -536,7 +535,6 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   store.initialize();
 
   const lark = new LarkCliClient({
-    larkCliPath: config.larkCliPath,
     requiredScopes: config.requiredScopes,
     timeout: 120_000,
   });

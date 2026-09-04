@@ -18,6 +18,7 @@ import path from 'node:path';
 import {
   canonicalizeWatchedRootUrl,
   ConfigManager,
+  DEFAULT_REQUIRED_SCOPES,
   looksLikeBigmodelKey,
   normalizeWatchedRootConfig,
   normalizeWatchedRootLocalDir,
@@ -396,5 +397,124 @@ describe('P2 watchedRoots configuration contract', () => {
     expect((await manager.load()).watchedRoots).toEqual([
       expect.objectContaining({ id: 'Wramw1XxRihIgnkCrhqcdEbRnHb', localDir: '策划 - Designer' }),
     ]);
+  });
+});
+
+describe('larkCliPath removal (2026-10：路径不可配置 + 存量清理)', () => {
+  const baseConfig = {
+    llm: {
+      openAiCompatBaseUrl: BIGMODEL_PAAS_V4,
+      claudeCompatBaseUrl: 'https://open.bigmodel.cn/api/anthropic',
+      apiKey: BIGMODEL_KEY,
+      model: 'glm-4-flash',
+      temperature: 0.2,
+      primaryChannel: 'claude-cli',
+      fallbackOnFailure: false,
+    },
+    pollIntervalMinutes: 30,
+    knowledgeBaseRoot: '/tmp/kb',
+    watchedRoots: [],
+    requiredScopes: [],
+    enableAutoStart: true,
+    enableNotifications: true,
+  };
+
+  it('drops a stale larkCliPath on load and physically removes it from config.json', async () => {
+    const configPath = createTempConfigPath();
+    // 复现事故形态：用户填入错误路径后无法清空，错误值永久留在磁盘。
+    fs.writeFileSync(configPath, JSON.stringify({
+      ...baseConfig,
+      larkCliPath: '/nonexistent/wrong/lark-cli',
+    }), 'utf-8');
+    const manager = new ConfigManager(configPath);
+
+    const config = await manager.load();
+
+    // 运行时配置不再携带该键。
+    expect((config as Record<string, unknown>).larkCliPath).toBeUndefined();
+    // 一次性迁移写回后，磁盘上的废弃键被物理清除。
+    const persisted = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    expect(Object.prototype.hasOwnProperty.call(persisted, 'larkCliPath')).toBe(false);
+    // 其余字段不受迁移影响。
+    expect(persisted.knowledgeBaseRoot).toBe('/tmp/kb');
+    expect(persisted.llm.apiKey).toBe(BIGMODEL_KEY);
+  });
+
+  it('stops rewriting config.json after the one-time cleanup (no write loop)', async () => {
+    const configPath = createTempConfigPath();
+    fs.writeFileSync(configPath, JSON.stringify(baseConfig), 'utf-8');
+    const manager = new ConfigManager(configPath);
+    // 首次 load 可能因 llm 归一化/度弃键清理写回一次，这里只关心之后稳定。
+    await manager.load();
+    const before = fs.statSync(configPath).mtimeMs;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    await manager.load();
+
+    // 不再因迁移标记反复写盘，且不会重新长出废弃键。
+    expect(fs.statSync(configPath).mtimeMs).toBe(before);
+    const persisted = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    expect(Object.prototype.hasOwnProperty.call(persisted, 'larkCliPath')).toBe(false);
+  });
+
+  it('strips larkCliPath from partial updates (stale cached frontend cannot resurrect it)', async () => {
+    const configPath = createTempConfigPath();
+    fs.writeFileSync(configPath, JSON.stringify(baseConfig), 'utf-8');
+    const manager = new ConfigManager(configPath);
+    await manager.load();
+
+    // 旧版前端/第三方脚本仍回传废弃键的防御：合并点直接剔除。
+    await manager.updateConfig({
+      pollIntervalMinutes: 45,
+      larkCliPath: '/also/wrong',
+    } as Partial<Config> & { larkCliPath: string });
+
+    const reloaded = await manager.load();
+    expect(reloaded.pollIntervalMinutes).toBe(45);
+    expect((reloaded as Record<string, unknown>).larkCliPath).toBeUndefined();
+    const persisted = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    expect(Object.prototype.hasOwnProperty.call(persisted, 'larkCliPath')).toBe(false);
+  });
+});
+
+describe('retired scope cleanup (2026-10：docs:document:read 上游失效)', () => {
+  const baseConfig = {
+    llm: {},
+    pollIntervalMinutes: 30,
+    knowledgeBaseRoot: '/tmp/kb',
+    watchedRoots: [],
+    requiredScopes: [
+      'wiki:node:retrieve',
+      'wiki:space:retrieve',
+      'docs:document.content:read',
+      'sheets:spreadsheet:read',
+      'docx:document:readonly',
+      // 2026-09 additive 迁移写入的交替名，现已上游失效。
+      'docs:document:read',
+      'drive:drive.metadata:readonly',
+      'docs:document.media:download',
+      'slides:presentation:read',
+      'offline_access',
+    ],
+  };
+
+  it('removes the retired scope from stored config and persists the cleaned list', async () => {
+    const configPath = createTempConfigPath();
+    fs.writeFileSync(configPath, JSON.stringify(baseConfig), 'utf-8');
+    const manager = new ConfigManager(configPath);
+
+    const config = await manager.load();
+
+    expect(config.requiredScopes).not.toContain('docs:document:read');
+    expect(config.requiredScopes).toContain('docx:document:readonly');
+    expect(config.requiredScopes).toHaveLength(9);
+    const persisted = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    expect(persisted.requiredScopes).not.toContain('docs:document:read');
+  });
+
+  it('default required scopes exclude the retired name', () => {
+    expect(DEFAULT_REQUIRED_SCOPES).not.toContain('docs:document:read');
+    expect(DEFAULT_REQUIRED_SCOPES).toContain('docx:document:readonly');
+    expect(DEFAULT_REQUIRED_SCOPES).toHaveLength(9);
   });
 });

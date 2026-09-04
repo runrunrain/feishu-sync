@@ -99,7 +99,6 @@ function createManager(options: {
   };
   const config = {
     requiredScopes: ['wiki:node:retrieve', 'offline_access'],
-    larkCliPath: undefined,
     ...options.config,
   };
   const configManager = {
@@ -391,7 +390,7 @@ describe('device auth flow', () => {
     const binDir = makeBinDir(true);
     const { manager } = createManager({
       binDir,
-      config: { requiredScopes: [], larkCliPath: undefined },
+      config: { requiredScopes: [] },
     });
     // getConfig 返回空 scopes → load 同样空 → DEFAULT（9 项）
     setExecHandler((_file, args) => {
@@ -404,9 +403,31 @@ describe('device auth flow', () => {
     const scopeArg = execFileMock.mock.calls[0][1].at(-1) as string;
     expect(scopeArg.split(' ')).toContain('wiki:node:retrieve');
     expect(scopeArg.split(' ')).toContain('offline_access');
-    // 2026-09：DEFAULT 新增 docs:document:read（新版飞书 docx 读取 scope 名）。
-    expect(scopeArg.split(' ')).toContain('docs:document:read');
-    expect(scopeArg.split(' ')).toHaveLength(10);
+    // 2026-10：docs:document:read 已在上游失效（带上即整单被拒），从
+    // DEFAULT 需求集退役；docx:document:readonly 始终有效。
+    expect(scopeArg.split(' ')).not.toContain('docs:document:read');
+    expect(scopeArg.split(' ')).toContain('docx:document:readonly');
+    expect(scopeArg.split(' ')).toHaveLength(9);
+  });
+
+  it('filters retired scopes from a config that still carries them (2026-10 upstream invalidation)', async () => {
+    const binDir = makeBinDir(true);
+    // 手改配置/旧进程缓存回灌场景：requiredScopes 仍带已退役名字。
+    const { manager } = createManager({
+      binDir,
+      config: {
+        requiredScopes: ['wiki:node:retrieve', 'docs:document:read', 'offline_access'],
+      },
+    });
+    setExecHandler((_file, args) => {
+      if (args.includes('--no-wait')) return { stdout: DEVICE_AUTH_JSON };
+      return { error: new Error('unexpected') };
+    });
+
+    await manager.startDeviceAuth();
+
+    const scopeArg = execFileMock.mock.calls[0][1].at(-1) as string;
+    expect(scopeArg.split(' ')).toEqual(['wiki:node:retrieve', 'offline_access']);
   });
 
   it('rejects a second start while a flow is pending (409), and clears after complete', async () => {

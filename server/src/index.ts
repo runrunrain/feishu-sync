@@ -97,10 +97,10 @@ export async function buildServer(options: CreateServerOptions = {}) {
   const configManager = new ConfigManager(configPath);
   console.info('[server] ConfigManager initialized');
 
-  // Load the user configuration before constructing LarkCliClient. The
-  // previous order constructed the client from hard-coded defaults and never
-  // passed through config.larkCliPath, so the setting shown in the desktop UI
-  // had no effect in the packaged application.
+  // Load the user configuration before constructing LarkCliClient. lark-cli
+  // 可执行路径不再可配置（2026-10 移除 larkCliPath 设置项）：统一由
+  // LarkCliClient 内部的 PATH + 桌面发现目录解析，部署级逃生口是
+  // LARK_CLI_PATH 环境变量。
   console.info('[server] Loading config');
   const config = await configManager.load();
   console.info('[server] Config loaded');
@@ -126,7 +126,6 @@ export async function buildServer(options: CreateServerOptions = {}) {
       'offline_access',
     ],
     timeout: 30000,
-    larkCliPath: config.larkCliPath,
   };
   const larkCliClient = new LarkCliClient(larkCliConfig);
   console.info('[server] LarkCliClient initialized');

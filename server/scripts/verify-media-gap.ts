@@ -25,7 +25,7 @@ async function main() {
     path.join(os.homedir(), '.feishu-sync', 'feishu-sync.db'),
   );
   store.initialize();
-  const client = new LarkCliClient({ larkCliPath: config.larkCliPath });
+  const client = new LarkCliClient({ requiredScopes: [], timeout: 30_000 });
 
   const detector = new ChangeDetector(client, store, {
     knowledgeBaseRoot: config.knowledgeBaseRoot,
