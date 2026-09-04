@@ -112,7 +112,7 @@ describe('config routes', () => {
   it('delegates PUT validation and persistence to ConfigManager.updateConfig', async () => {
     const config = makeConfig();
     const updateConfig = vi.fn(async (partial: unknown) => ({ ...config, ...(partial as object) }));
-    const app = buildApp({ updateConfig });
+    const app = buildApp({ load: vi.fn(async () => config), updateConfig });
 
     const response = await app.fetch(new Request('http://x/api/config', {
       method: 'PUT',

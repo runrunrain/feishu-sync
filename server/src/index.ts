@@ -32,6 +32,7 @@ import { mappingRoutes } from './routes/mapping.js';
 import { contentRoutes } from './routes/content.js';
 import { trashRoutes } from './routes/trash.js';
 import { customFolderRoutes } from './routes/custom-folders.js';
+import { orphanFilesRoutes } from './routes/orphan-files.js';
 import { llmRoutes } from './routes/llm.js';
 import type { LarkCliConfig } from './types/index.js';
 
@@ -222,6 +223,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
   app.route('/', contentRoutes);
   app.route('/', trashRoutes);
   app.route('/', customFolderRoutes);
+  app.route('/', orphanFilesRoutes);
   app.route('/', llmRoutes);
   console.info('[server] Protected routes registered');
 

@@ -24,7 +24,7 @@ interface UseConfigResult {
   saving: boolean;
   saveError: string | null;
   loadConfig: () => Promise<void>;
-  updateConfig: (updates: ConfigUpdate) => Promise<void>;
+  updateConfig: (updates: ConfigUpdate) => Promise<Config | undefined>;
   refresh: () => Promise<void>;
 }
 
@@ -49,8 +49,8 @@ export function useConfig(): UseConfigResult {
     }
   }, []);
 
-  const updateConfig = useCallback(async (updates: ConfigUpdate) => {
-    if (!config) return;
+  const updateConfig = useCallback(async (updates: ConfigUpdate): Promise<Config | undefined> => {
+    if (!config) return undefined;
 
     setSaving(true);
     setSaveError(null);
@@ -61,12 +61,15 @@ export function useConfig(): UseConfigResult {
       // Defensive: client.saveConfig already unwraps `{success, config}`,
       // but guard against regression so a bad server response cannot crash
       // KnowledgeSettingsCard / LLMChannelSwitcher via setConfig of bad shape.
+      // 返回保存后的 config，供调用方回填服务端补全的字段
+      // （如 watchedRoots 的自动 localDir，2026-09-04）。
       if (updated && typeof updated === 'object' && 'config' in updated && 'success' in updated) {
         const wrapped = updated as unknown as { success: boolean; config: Config };
         setConfig(wrapped.config);
-      } else {
-        setConfig(updated);
+        return wrapped.config;
       }
+      setConfig(updated);
+      return updated;
     } catch (err) {
       const message = err instanceof APIError ? err.message : 'Failed to save configuration';
       setSaveError(message);

@@ -226,13 +226,13 @@ export function WatchedRootsCard() {
         });
         return;
       }
-      if (!localDir || localDir.startsWith('/') || /^[A-Za-z]:\//.test(localDir) || localDir.split('/').some(
-        (segment) => !segment || segment === '.' || segment === '..',
-      )) {
+      if (localDir && (localDir.startsWith('/') || /^[A-Za-z]:\//.test(localDir) || localDir.split('/').some(
+        (segment) => !segment || segment === '.' || segment === '..' || segment.endsWith('.'),
+      ))) {
         toast.push({
           type: 'warning',
           message: '本地目录必须是知识库根目录下的相对路径',
-          hint: '例如“技术 - Dev”；不能使用绝对路径或 ..。',
+          hint: '例如“技术 - Dev”；不能使用绝对路径或 ..。留空则按根节点标题自动命名。',
         });
         return;
       }
@@ -253,14 +253,21 @@ export function WatchedRootsCard() {
     try {
       // Never resend `llm`: GET returns a masked api key. Structured roots
       // are validated again by ConfigManager before anything is persisted.
+      // localDir 留空的 root 由服务端按根节点标题自动命名（2026-09-04），
+      // 保存后用服务端返回值回填表单，展示自动生成的目录名。
       const patch: Partial<Config> = { watchedRoots: normalizedRoots };
-      await updateConfig(patch);
-      setLocalRoots(normalizedRoots.length > 0 ? normalizedRoots : [createEmptyRoot()]);
+      const updated = await updateConfig(patch);
+      const savedRoots: WatchedRootConfig[] = updated?.watchedRoots ?? normalizedRoots;
+      setLocalRoots(savedRoots.length > 0 ? savedRoots : [createEmptyRoot()]);
       setSelectedIndex(0);
+      const autoNamed = savedRoots.filter((root) =>
+        !normalizedRoots.some((draft) => draft.id === root.id && draft.localDir));
       toast.push({
         type: 'success',
-        message: `已保存（${normalizedRoots.length} 个 watchedRoot）`,
-        hint: '启用的根目录会在下次「立即检测」或轮询时参与同步。',
+        message: `已保存（${savedRoots.length} 个 watchedRoot）`,
+        hint: autoNamed.length > 0
+          ? `自动命名目录：${autoNamed.map((r) => r.localDir).join('、')}`
+          : '启用的根目录会在下次「立即检测」或轮询时参与同步。',
       });
     } catch (err) {
       toast.push({
@@ -410,7 +417,7 @@ export function WatchedRootsCard() {
                     fullWidth
                     value={selectedRow.root.localDir}
                     onChange={(event) => updateRoot(clampedSelectedIndex, { localDir: event.target.value })}
-                    placeholder="例如：技术 - Dev"
+                    placeholder="留空自动按根节点标题命名，例如：技术 - Dev"
                   />
                   <div className="rounded-md border border-line bg-card-bg px-3 py-2 md:col-span-2">
                     <Toggle

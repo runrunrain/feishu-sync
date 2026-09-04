@@ -473,6 +473,29 @@ export function normalizeWatchedRootLocalDir(value: unknown): string | null {
   return normalized;
 }
 
+/**
+ * 2026-09-04 自动 localDir：watchedRoots 保存时 localDir 留空 → 按根节点
+ * 标题自动命名。标题 → 目录名 sanitize 规则（产出必须能通过上方
+ * normalizeWatchedRootLocalDir 校验，保证与手填路径同一安全边界）：
+ *   - 跨平台非法字符（控制符与 \\ / : * ? " < > |）替换为 '-'，压缩连续 '-'
+ *   - 去首尾空白/点/'-'，截断 64 字符
+ *   - 空/保留名/其他校验不过 → 回退 fallback（wiki 根 token 安全可用）
+ */
+export function sanitizeLocalDirName(title: unknown, fallback: string): string {
+  const raw = typeof title === 'string' ? title : '';
+  // eslint-disable-next-line no-control-regex
+  const cleaned = raw.replace(/[\u0000-\u001f\u007f\\/:*?"<>|]+/g, '-')
+    .replace(/-{2,}/g, '-')
+    .replace(/^[.\s-]+/, '')
+    .replace(/[.\s-]+$/, '')
+    .slice(0, 64)
+    .replace(/[.\s-]+$/, '');
+  if (cleaned && normalizeWatchedRootLocalDir(cleaned)) {
+    return cleaned;
+  }
+  return fallback;
+}
+
 /** Strictly normalize user-supplied structured root configuration. */
 export function normalizeWatchedRootConfig(value: unknown): WatchedRootConfig {
   if (!value || typeof value !== 'object') {

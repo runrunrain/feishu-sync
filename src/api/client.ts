@@ -817,3 +817,39 @@ export async function removeDocFromFolder(
 }
 
 export { APIError };
+
+/**
+ * GET /api/orphan-files — 孤立本地文件 dry-run 扫描（2026-09-04）。
+ * 列出知识库根目录下与任何 watchedRoot/custom_folder 无对应关系、
+ * 且被证实为同步产物（feishu_sync 头）的目录/散档。
+ */
+export interface OrphanFileItem {
+  relPath: string;
+  type: 'dir' | 'file';
+  evidence: string | null;
+}
+
+export async function scanOrphanFiles(): Promise<{ rootDir: string; items: OrphanFileItem[] }> {
+  return request<{ rootDir: string; items: OrphanFileItem[] }>('/api/orphan-files');
+}
+
+/**
+ * POST /api/orphan-files/cleanup — 清理孤立项到 <root>/.trash-bin/orphan-<ts>/
+ * （可恢复移动，非删除）。confirmation !== 'APPLY' 时服务端 dry-run 只回显。
+ */
+export async function cleanupOrphanFiles(
+  items: OrphanFileItem[],
+  confirmation: 'APPLY' | 'DRY_RUN' = 'APPLY',
+): Promise<{
+  success: boolean;
+  dryRun: boolean;
+  trashDir: string;
+  moved: Array<{ relPath: string }>;
+  failed: Array<{ relPath: string; error: string }>;
+  scannedTotal: number;
+}> {
+  return request('/api/orphan-files/cleanup', {
+    method: 'POST',
+    body: JSON.stringify({ items, confirmation }),
+  });
+}

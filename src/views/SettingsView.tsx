@@ -25,9 +25,11 @@ import {
   Settings,
   ShieldCheck,
   Sparkles,
+  Trash2,
 } from 'lucide-react';
 import { KnowledgeSettingsCard } from '../components/KnowledgeSettingsCard';
 import { WatchedRootsCard } from '../components/WatchedRootsCard';
+import { OrphanFilesCard } from '../components/OrphanFilesCard';
 import { CustomArchiveSettingsCard } from '../components/CustomArchiveSettingsCard';
 import { ModelProviderSettings } from '../components/ModelProviderSettings';
 import { AuthSettingsCard } from '../components/AuthSettingsCard';
@@ -73,6 +75,13 @@ const SETTINGS_TABS: SettingsTabMeta[] = [
         description: '飞书同步根 URL 与本地目录',
         icon: FolderTree,
         render: () => <WatchedRootsCard />,
+      },
+      {
+        id: 'kb-orphan-files',
+        label: '孤立文件清理',
+        description: '已移除同步根残留的本地同步产物，一键回收到 .trash-bin',
+        icon: Trash2,
+        render: () => <OrphanFilesCard />,
       },
       {
         id: 'kb-custom-archive',

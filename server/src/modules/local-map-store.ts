@@ -856,6 +856,44 @@ export class LocalMapStore {
   }
 
   /**
+   * 2026-09-04 watchedRoot 删除级联清理：同步根 URL 从配置移除后，其
+   * documents / sheet_sheets / feishu_pending_items / localDirs 数据全部
+   * 清除——否则树面板把这些残留行归到「未分类」组，无法清理
+   * （实测主上反馈）。事务内显式级联（不依赖 FK enforcement，理由同
+   * deleteDocumentByToken）。幂等：重复调用返回零计数。
+   *
+   * 注意：只清 DB，不动本地文件——磁盘上 <localDir>/ 的残留由
+   * 「孤立文件清理」（orphan-files）手动点击处理，避免静默删文件。
+   */
+  purgeWatchedRootData(watchedRootUrl: string, watchedRootId: string | null): {
+    documents: number;
+    sheets: number;
+    pendingItems: number;
+    localDirs: number;
+  } {
+    const deleteSheetsByRoot = this.getStatement(
+      'DELETE FROM sheet_sheets WHERE sheet_obj_token IN (SELECT obj_token FROM documents WHERE watched_root_url = ?)'
+    );
+    const deletePending = this.getStatement(
+      'DELETE FROM feishu_pending_items WHERE watched_root_id = ?'
+    );
+    const deleteDocs = this.getStatement('DELETE FROM documents WHERE watched_root_url = ?');
+    const deleteLocalDirs = this.getStatement('DELETE FROM localDirs WHERE watched_root_url = ?');
+
+    const tx = this.db.transaction(() => {
+      // 子查询依赖 documents 行尚未删除，必须先于 deleteDocs 执行。
+      const sheets = deleteSheetsByRoot.run(watchedRootUrl).changes;
+      const pendingItems = watchedRootId
+        ? deletePending.run(watchedRootId).changes
+        : 0;
+      const documents = deleteDocs.run(watchedRootUrl).changes;
+      const localDirs = deleteLocalDirs.run(watchedRootUrl).changes;
+      return { documents, sheets, pendingItems, localDirs };
+    });
+    return tx();
+  }
+
+  /**
    * Restore a previously cloud-deleted document: clear the soft-delete
    * flag so the row is treated as live again. Used by the trash-bin UI
    * when the user chooses to keep a doc locally (e.g. the cloud delete
