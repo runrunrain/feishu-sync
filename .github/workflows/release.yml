@@ -40,16 +40,33 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: |
-            package-lock.json
-            server/package-lock.json
 
-      # 依赖装两份：根目录（前端 + electron + 打包）和 server/（业务）
+      # 依赖缓存提速（2026-09-04）：v0.3.27 win 构建 npm ci 花了 12 分钟
+      # （上次同 key 仅 30s）——免费共享 runner 磁盘 IO 波动，458+ 包全量
+      # 解压是瓶颈，npm 下载缓存（~/.npm）命中也无济于事。改为缓存
+      # node_modules 本体：命中即跳过 npm ci，彻底绕开解压 IO；同时缓存
+      # Electron / electron-builder 二进制下载（build 步骤省 ~100MB 拉取）。
+      # key 绑定双 lock hash，依赖变更自动失效重建；mac 双架构分 key
+      # （原生模块 prebuilt 架构不同）。
+      - name: Cache dependencies (node_modules + electron)
+        id: deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            node_modules
+            server/node_modules
+            ~/Library/Caches/electron
+            ~/Library/Caches/electron-builder
+          key: deps-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('package-lock.json', 'server/package-lock.json') }}
+
+      # 依赖装两份：根目录（前端 + electron + 打包）和 server/（业务）。
+      # 缓存命中时跳过（node_modules 已就位）；--no-audit/--no-fund 砍掉
+      # registry 元数据往返，miss 时也更快。
       - name: Install dependencies
+        if: steps.deps.outputs.cache-hit != 'true'
         run: |
-          npm ci
-          npm ci --prefix server
+          npm ci --no-audit --no-fund
+          npm ci --prefix server --no-audit --no-fund
 
       # 复用本地同一打包脚本：build:all → electron:build → 原生模块按
       # Electron ABI 重建 → electron-builder（dmg + zip）
@@ -122,17 +139,29 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: |
-            package-lock.json
-            server/package-lock.json
 
-      # 依赖装两份：根目录（前端 + electron + 打包）和 server/（业务）
+      # 依赖缓存提速（2026-09-04）：同 mac job，win 是重灾区（npm ci 12m）。
+      # Windows 下 electron / electron-builder 缓存目录在 %LOCALAPPDATA%，
+      # ~ 展开由 actions/cache 处理。
+      - name: Cache dependencies (node_modules + electron)
+        id: deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            node_modules
+            server/node_modules
+            ~/AppData/Local/electron/Cache
+            ~/AppData/Local/electron-builder/Cache
+          key: deps-${{ runner.os }}-x64-${{ hashFiles('package-lock.json', 'server/package-lock.json') }}
+
+      # 依赖装两份：根目录（前端 + electron + 打包）和 server/（业务）。
+      # 缓存命中时跳过；--no-audit/--no-fund 砍 registry 往返。
       - name: Install dependencies
+        if: steps.deps.outputs.cache-hit != 'true'
         shell: bash
         run: |
-          npm ci
-          npm ci --prefix server
+          npm ci --no-audit --no-fund
+          npm ci --prefix server --no-audit --no-fund
 
       # 复用本地同一打包脚本：build:all → electron:build → 原生模块按
       # Electron ABI 重建 → electron-builder（NSIS oneClick=false）
