@@ -6,6 +6,15 @@
 
 ---
 
+## [0.3.29] - 2026-09-04
+
+### Fixed（fix）
+
+- **Win 双开报错弹窗（globalShortcut cannot be used before the app is ready）**：双击图标产生的第二实例在单实例锁失败后走 app.quit() 完整事件流，will-quit 清理中的 globalShortcut.unregisterAll() 在 app 未 ready 时抛错，弹出「A JavaScript error occurred in the main process」系统对话框。改为锁失败直接 app.exit(0) 短路（第二实例无已分配资源，无需优雅清理）；will-quit 清理加 app.isReady() 守卫 + try/catch 兜底其他 ready 前退出时序。
+- **添加飞书根 URL 后「立即检测」按钮持续不可点**：useConfig 为组件本地 state 且无跨实例同步，设置页 WatchedRootsCard 保存 watchedRoots 后，状态栏 GlobalStatusBar 仍持有 mount 时的旧 config（watchedRootUrls 为空 → detectDisabled 恒真），需重启应用才恢复。现任一 useConfig 实例 updateConfig 成功后广播 window 事件（feishu-sync:config-updated），全部实例监听并重新拉取服务端真相源。
+
+---
+
 ## [0.3.28] - 2026-09-04
 
 ### Fixed（fix）

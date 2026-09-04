@@ -710,8 +710,19 @@ app.whenReady().then(() => {
 });
 
 // Will-quit cleanup
+// 2026-09-04 Win 实测修复：第二实例（单实例锁失败路径）与 ready 前收到的
+// 退出信号会走到这里，此时 globalShortcut 尚不可用，unregisterAll 抛
+// 「globalShortcut cannot be used before the app is ready」并弹出系统级
+// 错误对话框。ready 前不可能注册过快捷键，跳过即可；try/catch 兜底
+// 防御其他非常规时序。
 app.on('will-quit', () => {
-  globalShortcut.unregisterAll();
+  if (app.isReady()) {
+    try {
+      globalShortcut.unregisterAll();
+    } catch (err) {
+      console.error('[Electron] globalShortcut.unregisterAll failed on will-quit:', err);
+    }
+  }
   void closeServer();
 });
 
@@ -722,7 +733,12 @@ app.on('will-quit', () => {
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 
 if (!gotSingleInstanceLock) {
-  app.quit();
+  // 2026-09-04 Win 实测修复：第二实例退出用 app.exit(0) 直接短路，
+  // 而非 app.quit()——后者会派发 before-quit/will-quit 事件流，触发
+  // QuitCoordinator 与 will-quit 清理逻辑，而第二实例从未 ready，
+  // globalShortcut 调用直接抛错弹「A JavaScript error occurred in the
+  // main process」。第二实例没有任何已分配资源，无需优雅清理。
+  app.exit(0);
 } else {
   app.on('second-instance', () => {
     showMainWindow();

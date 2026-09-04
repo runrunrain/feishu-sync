@@ -1,7 +1,7 @@
 {
   "name": "feishu-sync",
   "private": true,
-  "version": "0.3.28",
+  "version": "0.3.29",
   "type": "module",
   "main": "dist-electron/main.cjs",
   "scripts": {
