@@ -4,8 +4,13 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+---
+
+## [0.3.27] - 2026-09-04
+
 ### Fixed（fix）
 
+- **Windows 中文字体异常模糊（平台分栈修复）**：UI 默认宋体栈在 Windows 落到 SimSun/STSong，DirectWrite 下小字号发虚。现字体栈按平台分流——macOS 命中 Songti SC/Kaiti SC 保持中国风；Windows 移除 SimSun/STSong/KaiTi 等模糊源，找不到清晰宋体时自然兑底微软雅黑（serif 栈尾改 sans-serif 避免 Windows 通用 serif 族绕回 SimSun）；装了 Noto Serif SC/思源宋体的 Windows 仍可命中高质量矢量宋体。
 - **Win 更新 lark-cli 报「'C:\Program' 不是内部或外部命令」（npm_failed）**：`C:\Program Files\nodejs\npm.cmd` 含空格，spawn(shell:true) 裸拼可执行路径，cmd.exe 把 `C:\Program` 拆成命令。统一为全部子进程调用（npm 安装/镜像重试/免权限降级、设备授权发起/完成、版本验证、lark-cli 执行）引入 Windows 路径引号包裹。
 
 ---

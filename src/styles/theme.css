@@ -39,20 +39,26 @@
   --color-line: var(--line);
   --color-dark: var(--dark);
 
-  /* ---- Typography 字体族（04 §6.2）----
-   * 注 1：源代码使用 `font-serif`/`font-sans`/`font-mono`/`font-kai`，
-   *       这里直接覆盖 Tailwind 默认主题的同名 token，让 utility
-   *       指向中国风字族（而非 Tailwind 默认的 ui-serif/system-ui/monospace）。
-   * 注 2：字面值与下方 :root 中的 --kai/--serif 保持完全一致（单一来源原则），
-   *       如需调整请同步两处（或后续合并到 :root 用 var() 引用）。
+  /* ---- Typography 字体族（平台分栈：mac 宋/楷，win 兜底黑体）----
+   * 主上实测结论：macOS 宋体（Songti SC）渲染正常；Windows 的
+   * SimSun / STSong（及 Win 楷体 KaiTi）在 DirectWrite 下小字号
+   * 异常模糊。策略：栈中只保留各平台渲染清晰的字体，模糊源直接
+   * 移除——Windows 找不到宋/楷时自然落到微软雅黑（fallback 黑体），
+   * macOS 命中 Songti SC / Kaiti SC 保持中国风。
+   *   - serif 栈尾用 sans-serif 而非 serif：Windows 通用 serif
+   *     族默认解析 SimSun，会绕回模糊源，必须避开。
+   *   - Noto Serif SC / Source Han Serif SC 是高质量矢量宋体，
+   *     Windows 装了则命中且渲染清晰，符合“能清晰显示则用宋体”。
+   *   - Win 模糊源归档（勿加回）：STSong, "SimSun", "KaiTi",
+   *     "SimKai", "DFKai-SB"。
    */
-  --font-kai: "KaiTi", "STKaiti", "Kaiti SC", "Songti SC", STSong, serif;
-  --font-serif: "Noto Serif SC", "Source Han Serif SC", "Songti SC", STSong, "SimSun", serif;
+  --font-kai: "Kaiti SC", "STKaiti", "Microsoft YaHei", "PingFang SC", sans-serif;
+  --font-serif: "Noto Serif SC", "Source Han Serif SC", "Songti SC", "Microsoft YaHei", "PingFang SC", sans-serif;
   --font-sans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
   --font-mono: "Consolas", "SF Mono", "Source Code Pro", monospace;
-  /* 04 §6.2 语义字体 token（项目内部分层用，非源码主流引用） */
-  --font-display: "KaiTi", "STKaiti", "Kaiti SC", "Songti SC", STSong, serif;
-  --font-body: "Noto Serif SC", "Source Han Serif SC", "Songti SC", STSong, "SimSun", serif;
+  /* 语义字体 token（项目内部分层用，非源码主流引用），同平台分栈 */
+  --font-display: "Kaiti SC", "STKaiti", "Microsoft YaHei", "PingFang SC", sans-serif;
+  --font-body: "Noto Serif SC", "Source Han Serif SC", "Songti SC", "Microsoft YaHei", "PingFang SC", sans-serif;
 }
 
 /* ============================================================
@@ -136,9 +142,11 @@
   --shadow-lg: 0 4px 16px rgba(40, 34, 24, 0.14);
 
   /* Typography System */
-  /* 纯系统字体，无网络依赖 */
-  --serif: "Noto Serif SC", "Source Han Serif SC", "Songti SC", STSong, "SimSun", serif;
-  --kai: "KaiTi", "STKaiti", "Kaiti SC", "Songti SC", STSong, serif;
+  /* 平台分栈（与 @theme 字体块同一策略，字面值保持一致）：
+   * macOS → 宋/楷；Windows → 微软雅黑。Win 模糊源已移除，
+   * 详见 @theme 处注释。 */
+  --serif: "Noto Serif SC", "Source Han Serif SC", "Songti SC", "Microsoft YaHei", "PingFang SC", sans-serif;
+  --kai: "Kaiti SC", "STKaiti", "Microsoft YaHei", "PingFang SC", sans-serif;
 
   /* Font Sizes */
   --text-xs: 11px;
@@ -206,6 +214,10 @@
   body {
     background-color: var(--paper);
     color: var(--ink);
+    /* 默认字体平台分栈（主上实测：mac 宋体正常，win 宋体模糊）：
+     *   var(--serif) 在 macOS 命中 Songti SC（中国风宋体），
+     *   在 Windows 找不到宋体（模糊源已从栈中移除）落到微软雅黑。
+     *   栈详见 @theme / :root 的 --serif 定义。 */
     font-family: var(--serif);
     line-height: var(--leading-normal);
     /* T1 R2.5-AC1: removed radial-gradient double halo; solid paper background */
