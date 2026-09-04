@@ -56,6 +56,12 @@ const DEVICE_AUTH_COMPLETE_TIMEOUT_MS = 11 * 60_000;
 const INSTALL_OUTPUT_TAIL_LINES = 50;
 /** deviceCode 防注入上限。 */
 const MAX_DEVICE_CODE_LENGTH = 500;
+/**
+ * 上游「整单 scope 无效」拒绝特征（2026-10 实测：请求集里混入未在 OAuth
+ * 应用注册的 scope 名时，飞书 device authorization 直接拒绝整单）。命中
+ * 且本次用的是并集请求集时，降级为最小必需集重试。
+ */
+const INVALID_SCOPE_RE = /invalid or malformed scopes/i;
 
 /** Manager 级结构化错误：code 稳定，status 直接映射 HTTP 状态码。 */
 export class LarkCliManagerError extends Error {
@@ -228,6 +234,21 @@ export function parseLenientDeviceAuthJson(raw: string): Record<string, unknown>
       'parse_failed',
     );
   }
+}
+
+/**
+ * 提取 lark-cli 失败响应里的上游错误文本（`{ok:false,error:{message}}`
+ * 形态）。2026-09-04 实测：device authorization 被拒时 lark-cli 以 exit 0
+ * 返回结构化错误 JSON，不透传 message 用户就只能看到「缺少 device_code」
+ * 这类误导性兜底文案。
+ */
+export function extractUpstreamAuthErrorMessage(parsed: Record<string, unknown>): string {
+  const error = parsed.error as { message?: unknown } | undefined;
+  if (error && typeof error === 'object' && typeof error.message === 'string'
+    && error.message.trim().length > 0) {
+    return error.message.trim();
+  }
+  return '';
 }
 
 export class LarkCliManager {
@@ -453,6 +474,14 @@ export class LarkCliManager {
   /**
    * 发起 device flow。立即返回 { verificationUrl, deviceCode, expiresIn }；
    * 已有进行中流程时抛 409 语义错误。
+   *
+   * 2026-09-04 并集重授权策略（用户实测案例：`auth login --domain all`
+   * 被服务端静默丢弃部分 scope 且仍报成功；另一面，只带最小必需集重授权
+   * 会把 token 降级到仅 9 项，破坏用户在其他工作流里的 lark-cli 权限）。
+   * 因此请求集 = 已授权 scope ∪ 必需 scope（剔除已退役名）：既补齐缺失，
+   * 又不丢既有权限。若上游因请求集里混入个别失效名而整单拒绝
+   * （「The provided scope list contains invalid or malformed scopes」），
+   * 自动降级用纯必需集重试一次——保底能发起授权。
    */
   async startDeviceAuth(): Promise<DeviceAuthSession> {
     if (this.pendingDeviceAuth) {
@@ -463,11 +492,17 @@ export class LarkCliManager {
       );
     }
 
-    const scopes = await this.resolveRequiredScopes();
+    const required = await this.resolveRequiredScopes();
+    const granted = await this.readGrantedScopesSafe();
+    const retired = new Set(RETIRED_REQUEST_SCOPES);
+    const union = granted.length > 0
+      ? [...new Set([...granted, ...required])].filter((s) => !retired.has(s))
+      : required;
+    const augmented = union.length !== required.length || union.some((s, i) => required[i] !== s);
+
     const larkCliPath = this.resolveLarkCliPath();
-    let raw = '';
-    try {
-      const { stdout, stderr } = await execFileAsync(
+    const attempt = async (scopes: string[]): Promise<{ stdout: string; stderr: string }> => {
+      return await execFileAsync(
         quoteWindowsExecutablePath(larkCliPath, this.discovery.platform ?? process.platform),
         ['auth', 'login', '--no-wait', '--json', '--scope', scopes.join(' ')],
         {
@@ -478,14 +513,16 @@ export class LarkCliManager {
           env: buildLarkCliEnvironment(larkCliPath),
         },
       );
-      raw = `${stdout}\n${stderr}`;
-    } catch (error) {
-      throw new LarkCliManagerError(
-        `发起设备授权失败：${errorText(error)}`,
-        'device_auth_start_failed',
-        500,
+    };
+
+    let out = await attempt(union);
+    if (augmented && INVALID_SCOPE_RE.test(`${out.stdout}\n${out.stderr}`)) {
+      console.warn(
+        '[LarkCliManager] 并集 scope 请求被上游整单拒绝，降级为最小必需集重试',
       );
+      out = await attempt(required);
     }
+    const raw = `${out.stdout}\n${out.stderr}`;
 
     let parsed: Record<string, unknown>;
     try {
@@ -501,9 +538,13 @@ export class LarkCliManager {
       ? parsed.expires_in
       : 600;
     if (!deviceCode || !verificationUrl) {
+      // 2026-09-04：上游拒绝时 lark-cli 以 exit 0 + `{ok:false,error:{message}}`
+      // 返回，旧文案「缺少 device_code」会把真实原因吞掉——优先透传上游
+      // message，让用户看得到「为什么发起不了」。
+      const upstream = extractUpstreamAuthErrorMessage(parsed);
       throw new LarkCliManagerError(
-        '设备授权响应缺少 device_code 或 verification_url',
-        'parse_failed',
+        upstream ? `发起设备授权失败：${upstream}` : '设备授权响应缺少 device_code 或 verification_url',
+        upstream ? 'device_auth_start_failed' : 'parse_failed',
         502,
       );
     }
@@ -601,6 +642,20 @@ export class LarkCliManager {
       return config.requiredScopes.filter((s) => !retired.has(s));
     }
     return DEFAULT_REQUIRED_SCOPES;
+  }
+
+  /**
+   * 读取当前已授权 scope（未认证/探测失败返回空数组）。发起 device flow
+   * 前用千拼并集请求集：既补齐缺失权限，又不丢用户既有授权（2026-09-04
+   * 用户实测：最小必需集重授权会把 token 降级，破坏其他 lark-cli 工作流）。
+   */
+  private async readGrantedScopesSafe(): Promise<string[]> {
+    try {
+      const readiness = await this.larkCliClient.checkAuthReady();
+      return (readiness.currentScopes ?? []).filter((s) => s.trim().length > 0);
+    } catch {
+      return [];
+    }
   }
 
   /** `lark-cli --version` 验证（直连，30s 超时；失败抛错由调用方分类）。 */

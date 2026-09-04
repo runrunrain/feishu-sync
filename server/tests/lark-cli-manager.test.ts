@@ -430,6 +430,99 @@ describe('device auth flow', () => {
     expect(scopeArg.split(' ')).toEqual(['wiki:node:retrieve', 'offline_access']);
   });
 
+  it('requests the union of granted and required scopes (preserve existing grants, 2026-09-04)', async () => {
+    const binDir = makeBinDir(true);
+    // 用户案例：已授权 46 项里缺 sheets/slides；重授权必须并集而非最小集，
+    // 否则 token 被降级，破坏其他 lark-cli 工作流。
+    const { manager } = createManager({
+      binDir,
+      authReadiness: {
+        ready: false,
+        currentScopes: [
+          'im:chat:read',
+          'docx:document:readonly',
+          // 旧 token 里的已退役名：不能混进请求集，否则整单被拒。
+          'docs:document:read',
+          'wiki:node:retrieve',
+        ],
+        missingScopes: ['offline_access'],
+      },
+    });
+    setExecHandler((_file, args) => {
+      if (args.includes('--no-wait')) return { stdout: DEVICE_AUTH_JSON };
+      return { error: new Error('unexpected') };
+    });
+
+    await manager.startDeviceAuth();
+
+    const scopeArg = execFileMock.mock.calls[0][1].at(-1) as string;
+    expect(scopeArg.split(' ')).toEqual([
+      'im:chat:read',
+      'docx:document:readonly',
+      'wiki:node:retrieve',
+      'offline_access',
+    ]);
+    expect(scopeArg.split(' ')).not.toContain('docs:document:read');
+  });
+
+  it('falls back to the minimal required set when the union request is rejected as invalid scopes', async () => {
+    const binDir = makeBinDir(true);
+    const { manager } = createManager({
+      binDir,
+      authReadiness: {
+        ready: false,
+        currentScopes: ['im:chat:read'],
+        missingScopes: ['offline_access'],
+      },
+    });
+    setExecHandler((_file, args) => {
+      if (!args.includes('--no-wait')) return { error: new Error('unexpected') };
+      const scopeArg = args.at(-1) as string;
+      // 并集请求（含 im:chat:read）被上游整单拒绝：exit 0 + 错误 JSON。
+      if (scopeArg.includes('im:chat:read')) {
+        return {
+          stdout: JSON.stringify({
+            ok: false,
+            error: {
+              type: 'authentication',
+              message: 'device authorization failed: Device authorization failed: The provided scope list contains invalid or malformed scopes. Please ensure all scopes are valid.',
+            },
+          }),
+        };
+      }
+      return { stdout: DEVICE_AUTH_JSON };
+    });
+
+    const session = await manager.startDeviceAuth();
+
+    expect(session.deviceCode).toBe('dc-123');
+    expect(execFileMock).toHaveBeenCalledTimes(2);
+    const secondScopeArg = execFileMock.mock.calls[1][1].at(-1) as string;
+    expect(secondScopeArg).toBe('wiki:node:retrieve offline_access');
+  });
+
+  it('surfaces the upstream error message instead of the misleading missing-device_code fallback', async () => {
+    const binDir = makeBinDir(true);
+    const { manager } = createManager({ binDir });
+    setExecHandler((_file, args) => {
+      if (args.includes('--no-wait')) {
+        return {
+          stdout: JSON.stringify({
+            ok: false,
+            error: { type: 'authentication', message: 'device authorization failed: boom' },
+          }),
+        };
+      }
+      return { error: new Error('unexpected') };
+    });
+
+    await expect(manager.startDeviceAuth()).rejects.toMatchObject({
+      code: 'device_auth_start_failed',
+      message: expect.stringContaining('boom'),
+    });
+    expect(manager.hasPendingDeviceAuth()).toBe(false);
+  });
+
   it('rejects a second start while a flow is pending (409), and clears after complete', async () => {
     const { manager, client } = createManager();
     setExecHandler((_file, args) => {
@@ -493,6 +586,9 @@ describe('device auth flow', () => {
     });
 
     await manager.startDeviceAuth();
+    // startDeviceAuth 也会调一次 checkAuthReady（2026-09-04 并集重授权探测
+    // granted scope）；这里记录基线，验证 complete 只额外再核对一次。
+    const callsAfterStart = client.checkAuthReady.mock.calls.length;
     client.checkAuthReady.mockResolvedValue({
       ready: true,
       missingScopes: [],
@@ -509,7 +605,7 @@ describe('device auth flow', () => {
       expect.any(Function),
     );
     // 最终就绪状态经 checkAuthReady 汇报（含 missingScopes 如实返回）
-    expect(client.checkAuthReady).toHaveBeenCalledTimes(1);
+    expect(client.checkAuthReady).toHaveBeenCalledTimes(callsAfterStart + 1);
   });
 
   it('reports flow failure with the final readiness state and clears pending', async () => {
