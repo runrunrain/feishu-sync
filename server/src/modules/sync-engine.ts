@@ -604,8 +604,8 @@ export class SyncEngine {
       csvRel: string;
       images: SheetMediaItem[];
     }> = [];
+    const docname = path.basename(localMdPath, '.md');
     if (doc.objType === 'sheet') {
-      const docname = path.basename(localMdPath, '.md');
       const exportedSheets = await this.exportSheetsToStaging(
         doc.objToken,
         stagingDocDir,
@@ -615,7 +615,27 @@ export class SyncEngine {
     }
     // Sheet float images flow through the same images/extraFiles channel as
     // docx media so commitDocumentContent + atomic-commit cover them.
-    const sheetMediaImages: SheetMediaItem[] = sheets.flatMap((sheet) => sheet.images);
+    // docx 内嵌 <sheet> 标签展开（2026-09-04）：docx 正文中未被处理的
+    // <sheet sheet-id="..." token="..."></sheet> 引用此前原样落盘，预览
+    // 露裸 XML（实测：战斗系统 md 第 85 行）。这里逐标签导出子表并重构，
+    // 标签级替换为「## 子表:」段；任一子表失败 → 抛错不推进基线（对齐
+    // 「子表失败 aborts the document」契约）。
+    let inlineSheets: Array<{
+      sheetId: string;
+      title: string;
+      csvPath: string;
+      csvRel: string;
+      images: SheetMediaItem[];
+    }> = [];
+    if (doc.objType === 'docx') {
+      const expanded = await this.expandInlineSheetTags(expandedContent, stagingDocDir, docname);
+      expandedContent = expanded.content;
+      inlineSheets = expanded.sheets;
+    }
+    const sheetMediaImages: SheetMediaItem[] = [
+      ...sheets.flatMap((sheet) => sheet.images),
+      ...inlineSheets.flatMap((sheet) => sheet.images),
+    ];
 
     // 6. Table reconstruction — any sub-sheet failure aborts the document.
     let finalContent = expandedContent;
@@ -746,7 +766,7 @@ export class SyncEngine {
           name: att.name,
           token: att.token,
         })),
-        sheets: sheets.map((sheet) => ({
+        sheets: [...sheets, ...inlineSheets].map((sheet) => ({
           sheetId: sheet.sheetId,
           title: sheet.title,
           csvRelativePath: sheet.csvRel,
@@ -1509,6 +1529,79 @@ export class SyncEngine {
    * document — same contract as docx media: never advance the synced
    * baseline while resources are missing.
    */
+  /**
+   * docx 正文内嵌 <sheet> 标签展开（2026-09-04）。
+   *
+   * 飞书 docx 导出的 markdown 中，嵌入的电子表格以
+   * `<sheet sheet-id="..." token="..."></sheet>` 引用。历史链路只展开
+   * objType==='sheet' 的整文档型表格，docx 内嵌标签原样落盘，预览直接
+   * 显示裸 XML。这里逐标签：token → exportSheetsToStaging（csv + 浮动
+   * 图片全管道）→ LayoutReconstructor 重构 → 标签级替换为「## 子表:」
+   * 段（与整文档型同款段格式，含 CSV 链接与浮动图片附录）。
+   *
+   * 失败语义：任一标签导出/重构失败 → 抛错，文档同步中止、不推进
+   * synced 基线（与整文档型「子表失败 aborts the document」一致），
+   * 下次同步重试。
+   *
+   * 多标签同文档：每个 token 的 csv-data 目录以 `${docname}_${sheetId}`
+   * 命名，避免同名冲突。
+   */
+  private async expandInlineSheetTags(
+    content: string,
+    stagingDocDir: string,
+    docname: string,
+  ): Promise<{
+    content: string;
+    sheets: Array<{
+      sheetId: string;
+      title: string;
+      csvPath: string;
+      csvRel: string;
+      images: SheetMediaItem[];
+    }>;
+  }> {
+    const SHEET_TAG_RE = /<sheet\s+sheet-id="([^"]*)"\s+token="([A-Za-z0-9]+)"\s*>\s*<\/sheet>/g;
+    const tags = [...content.matchAll(SHEET_TAG_RE)];
+    if (tags.length === 0) return { content, sheets: [] };
+
+    const collected: Array<{
+      sheetId: string;
+      title: string;
+      csvPath: string;
+      csvRel: string;
+      images: SheetMediaItem[];
+    }> = [];
+
+    let out = content;
+    for (const tag of tags) {
+      const [whole, sheetId, token] = tag;
+      const stagingName = `${docname}_${sheetId || 'sheet'}`;
+      const exported = await this.exportSheetsToStaging(token, stagingDocDir, stagingName);
+      const sections: string[] = [];
+      for (const sheet of exported) {
+        let section =
+          `## 子表: ${sheet.title}\n\n[CSV 原始数据](${sheet.csvRel})\n\n`;
+        if (this.layoutReconstructor) {
+          section += await this.layoutReconstructor.reconstructToMarkdown(sheet.csvPath);
+        } else {
+          // 无重构器时退化为纯链接段（正常链路 layoutReconstructor 必在）
+          section += `原始数据见 CSV：${sheet.csvRel}`;
+        }
+        if (sheet.images.length > 0) {
+          section += `\n\n${renderSheetMediaAppendix(sheet.title, sheet.images)}`;
+        }
+        sections.push(section);
+        collected.push(sheet);
+      }
+      // 函数形式 replace：sections 内容含 $ 等特殊字符时避免被当作替换模式
+      out = out.replace(whole, () => sections.join('\n\n---\n\n'));
+      console.info(
+        `[SyncEngine] Expanded inline <sheet> tag ${token} into ${exported.length} subsection(s)`,
+      );
+    }
+    return { content: out, sheets: collected };
+  }
+
   private async exportSheetsToStaging(
     sheetToken: string,
     stagingDocDir: string,

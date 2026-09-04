@@ -145,10 +145,14 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
     content != null && content.mdContent == null && csvTables.length === 0;
   // md 文件所在目录（kbRoot 相对），MarkdownView 用它解析相对图片路径。
   const mdBaseDir = useMemo(() => {
-    const p = content?.mdPath;
+    const p = content?.mdPath ?? '';
     if (!p) return '';
-    const idx = p.lastIndexOf('/');
-    return idx >= 0 ? p.slice(0, idx) : '';
+    // Win 防御（2026-09-04）：mdPath 理论上始终是 POSIX 相对路径
+    // （server toPortableRelative 归一），但防御性兼容反斜杠分隔，
+    // 否则 lastIndexOf('/') 找不到分隔符时 baseDir 为空/错切。
+    const normalized = p.replace(/\\/g, '/');
+    const idx = normalized.lastIndexOf('/');
+    return idx >= 0 ? normalized.slice(0, idx) : '';
   }, [content?.mdPath]);
 
   // 点击相对 .csv 链接拦截：匹配当前文档关联的 csvTables，命中则切至对应 CSV 表格

@@ -70,6 +70,19 @@ function preprocess(markdown: string): string {
   // 5) 为紧贴其它行内或块级内容的 <table> 标签注入独立段落换行，避免被段落粘连
   out = out.replace(/([^\n])\s*(<table[\s>])/gi, '$1\n\n$2');
   out = out.replace(/(<\/table>)\s*([^\n])/gi, '$1\n\n$2');
+  // 6) 飞书内嵌 sheet 标签兜底（2026-09-04）：docx 正文中的
+  //    <sheet sheet-id="..." token="..."></sheet> 引用若未被同步链路
+  //    展开（历史产物 / 展开失败保留原标签），优雅降级为提示块而非
+  //    裸 XML。新同步产物已在服务端展开为「## 子表:」段（见
+  //    sync-engine expandInlineSheetTags）。
+  out = out.replace(
+    /<sheet\s+([^>]*?)\s*\/?>\s*(?:<\/sheet>)?/gi,
+    (_whole: string, attrs: string) => {
+      const sheetId = /sheet-id="([^"]*)"/.exec(attrs)?.[1] ?? '';
+      const token = /token="([^"]*)"/.exec(attrs)?.[1] ?? '';
+      return `\n\n> 【内嵌子表】sheet-id: ${sheetId || '未知'}${token ? ` · token: ${token}` : ''}。触发重新同步本文档可展开为完整表格。\n\n`;
+    },
+  );
   return out;
 }
 
@@ -86,8 +99,12 @@ interface AuthImageProps {
 }
 
 export function resolveMediaPath(src: string, baseDir: string): string {
-  const cleaned = src.replace(/^\.\//, '');
-  const segments = [...baseDir.split('/').filter(Boolean), ...cleaned.split('/')];
+  // Win 产物防御（2026-09-04 浮动图片修复）：历史/异构产物中图片引用
+  // 可能携带反斜杠分隔（`images\主表_A7.png`），先归一到 POSIX 再拼接，
+  // 否则 split('/') 会把整段当成单 segment，服务端 404。
+  const cleaned = src.replace(/^\.\//, '').replace(/\\/g, '/');
+  const normalizedBase = baseDir.replace(/\\/g, '/');
+  const segments = [...normalizedBase.split('/').filter(Boolean), ...cleaned.split('/')];
   // 归一化 ..（图片引用可能指向上级目录）
   const stack: string[] = [];
   for (const seg of segments) {
@@ -101,6 +118,7 @@ export function resolveMediaPath(src: string, baseDir: string): string {
 function AuthImage({ src, alt, baseDir }: AuthImageProps) {
   const [blobUrl, setBlobUrl] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
+  const [failureDetail, setFailureDetail] = useState<string>('');
 
   useEffect(() => {
     if (isRemoteUrl(src)) {
@@ -118,8 +136,15 @@ function AuthImage({ src, alt, baseDir }: AuthImageProps) {
         objectUrl = url;
         setBlobUrl(url);
       })
-      .catch(() => {
-        if (!cancelled) setFailed(true);
+      .catch((err: unknown) => {
+        if (!cancelled) {
+          setFailed(true);
+          // 失败可见化（win 浮动图片排查）：带出解析后的 kbRoot 相对路径
+          // 与 HTTP 状态，真机一眼定位是路径错位还是文件缺失。
+          setFailureDetail(
+            `${resolveMediaPath(src, baseDir)}（${err instanceof Error ? err.message : String(err)}）`,
+          );
+        }
       });
     return () => {
       cancelled = true;
@@ -131,10 +156,11 @@ function AuthImage({ src, alt, baseDir }: AuthImageProps) {
     return (
       <span
         className="my-2 flex items-center gap-2 rounded-md border border-dashed border-line bg-paper-2/50 px-4 py-6 text-xs text-ink-faint"
-        title={src}
+        title={failureDetail || src}
       >
         <ImageIcon className="w-4 h-4 shrink-0" />
         图片加载失败：{alt || src}
+        {failureDetail && <span className="text-[10px] font-mono">{failureDetail}</span>}
       </span>
     );
   }
@@ -163,8 +189,13 @@ function AuthImage({ src, alt, baseDir }: AuthImageProps) {
 // ---------------------------------------------------------------------------
 
 // 支持 Markdown 原生标记 + 飞书 cite 标签 + 常用行内 HTML (b/i/br/del/code/a/span)
+// URL 段允许一层成对括号嵌套（2026-09-04 浮动图片修复）：同步产物文件名
+// 可含半角括号（如 `③-1(Framwork)分析拆解（确定复杂度）_B63_x.png`），
+// 旧模式 [^)\n]* 会在文件名内首个 `)` 截断 src（mac/win 同现「图片加载
+// 失败：③-1(Framwork)…」实测）。嵌套组对齐 CommonMark 平衡括号规则；
+// 无括号 URL 行为不变。
 const INLINE_RE =
-  /(!\[.*?\]\([^)\n]*\))|(\[.*?\]\([^)\n]*\))|(\*\*(?:\\.|[^*\\\n])+\*\*)|(\*(?:\\.|[^*\\\n])+\*)|(~~(?:\\.|[^~\\])+~~)|(`[^`]+`)|(<cite\b[^>]*>(?:[\s\S]*?<\/cite>)?|<cite\b[^>]*\/>)|(<(?:b|strong)\b[^>]*>[\s\S]*?<\/(?:b|strong)>)|(<(?:i|em)\b[^>]*>[\s\S]*?<\/(?:i|em)>)|(<br\s*\/?>)|(<(?:del|s)\b[^>]*>[\s\S]*?<\/(?:del|s)>)|(<code\b[^>]*>[\s\S]*?<\/code>)|(<a\b[^>]*>[\s\S]*?<\/a>)|(<span\b[^>]*>[\s\S]*?<\/span>)/gi;
+  /(!\[.*?\]\((?:[^()\n]|\([^()\n]*\))*\))|(\[.*?\]\((?:[^()\n]|\([^()\n]*\))*\))|(\*\*(?:\\.|[^*\\\n])+\*\*)|(\*(?:\\.|[^*\\\n])+\*)|(~~(?:\\.|[^~\\])+~~)|(`[^`]+`)|(<cite\b[^>]*>(?:[\s\S]*?<\/cite>)?|<cite\b[^>]*\/>)|(<(?:b|strong)\b[^>]*>[\s\S]*?<\/(?:b|strong)>)|(<(?:i|em)\b[^>]*>[\s\S]*?<\/(?:i|em)>)|(<br\s*\/?>)|(<(?:del|s)\b[^>]*>[\s\S]*?<\/(?:del|s)>)|(<code\b[^>]*>[\s\S]*?<\/code>)|(<a\b[^>]*>[\s\S]*?<\/a>)|(<span\b[^>]*>[\s\S]*?<\/span>)/gi;
 
 /** 还原 GFM 反斜杠转义与 HTML 实体，只作用于展示文本 */
 function unescapeInline(s: string): string {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseBlocks, renderInline } from './MarkdownView';
+import { parseBlocks, renderInline, resolveMediaPath } from './MarkdownView';
 import type { HtmlTableBlock } from '../../utils/html-table';
 
 describe('MarkdownView parser and renderer', () => {
@@ -121,6 +121,48 @@ describe('MarkdownView parser and renderer', () => {
       expect((nodes[1] as any).type).toBe('br');
       expect((nodes[2] as any).type).toBe('em');
       expect(nodes[3]).toBe(' > 100');
+    });
+  });
+
+  describe('resolveMediaPath win-backslash normalization (2026-09-04 浮动图片修复)', () => {
+    it('normalizes backslash separators in both src and baseDir', () => {
+      expect(resolveMediaPath('images\\主表_A7_fip1.png', '技术 - Dev\\子目录')).toBe(
+        '技术 - Dev/子目录/images/主表_A7_fip1.png',
+      );
+    });
+
+    it('keeps POSIX behavior unchanged', () => {
+      expect(resolveMediaPath('images/a.png', '技术 - Dev')).toBe('技术 - Dev/images/a.png');
+      expect(resolveMediaPath('./images/../images/a.png', '技术 - Dev')).toBe('技术 - Dev/images/a.png');
+    });
+  });
+
+  describe('inline image src with half-width parentheses (2026-09-04 浮动图片修复)', () => {
+    const ctx = { baseDir: 'test' };
+
+    // 实测样本：同步产物文件名含半角括号，旧模式 [^)\n]* 在首个 ) 截断
+    it('keeps full src when filename contains paired parentheses', () => {
+      const line = '![③-1(Framwork)分析拆解（确定复杂度） B63 浮动图片](images/③-1(Framwork)分析拆解（确定复杂度）_B63_DbT4OWAt8s.png)';
+      const blocks = parseBlocks(line);
+      expect(blocks.length).toBeGreaterThan(0);
+      const paragraph = blocks[0] as { type: string; text?: string };
+      expect(paragraph.type).toBe('paragraph');
+      expect(paragraph.text).toBe(line);
+    });
+
+    it('keeps csv link href intact with paired parentheses', () => {
+      const line = '[CSV 原始数据](300-三观系统.csv-data/③-1(Framwork)分析拆解（确定复杂度）.csv)';
+      const nodes = renderInline(line, 't', ctx);
+      const link = nodes.find((n): n is { type: string; props: { href: string } } =>
+        typeof n === 'object' && n !== null && 'props' in (n as object) && 'href' in (n as { props: unknown }).props as object);
+      expect(link).toBeTruthy();
+      expect(link!.props.href).toBe('300-三观系统.csv-data/③-1(Framwork)分析拆解（确定复杂度）.csv');
+    });
+
+    it('still truncates safely on unpaired open paren (fallback behavior)', () => {
+      const nodes = renderInline('![alt](images/a(b.png)', 't', ctx);
+      // 未闭合括号：回退旧行为（在 ( 处截断），不崩溃、不丢整段
+      expect(nodes.length).toBeGreaterThan(0);
     });
   });
 });
