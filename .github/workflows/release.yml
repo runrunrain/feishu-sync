@@ -94,11 +94,29 @@ jobs:
           TAG="${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || inputs.tag }}"
           DIR="dist-desktop/darwin-${{ matrix.arch }}"
           # 第一个到达的 job 创建 release，后续 job 复用。
-          gh release view "$TAG" >/dev/null 2>&1 || \
-            gh release create "$TAG" \
-              --title "Feishu Sync ${TAG}" \
-              --generate-notes \
-              --draft=false
+          # 2026-09-04 修复：--generate-notes 在单 commit 无 PR 时只生成一行
+          # Full Changelog 链接，变更说明完全缺失（v0.3.27 实测）。改为从
+          # CHANGELOG.md 提取当前 tag 段落作 notes；无段落时回退自动生成。
+          NOTES_FILE="$(mktemp)"
+          awk -v ver="${TAG#v}" '
+            index($0, "## [" ver "]") == 1 { sec=1; next }
+            sec && /^## \[/ { exit }
+            sec { print }
+          ' CHANGELOG.md | sed '/^---$/d' > "$NOTES_FILE"
+          if [ -s "$NOTES_FILE" ]; then
+            gh release view "$TAG" >/dev/null 2>&1 || \
+              gh release create "$TAG" \
+                --title "Feishu Sync ${TAG}" \
+                --notes-file "$NOTES_FILE" \
+                --draft=false
+          else
+            echo "::warning::CHANGELOG.md 无 ${TAG} 段落，回退自动生成 notes"
+            gh release view "$TAG" >/dev/null 2>&1 || \
+              gh release create "$TAG" \
+                --title "Feishu Sync ${TAG}" \
+                --generate-notes \
+                --draft=false
+          fi
 
           upload_asset() {
             local f="$1" base
@@ -181,11 +199,28 @@ jobs:
           set -euo pipefail
           TAG="${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || inputs.tag }}"
           DIR="dist-desktop/win32-x64"
-          gh release view "$TAG" >/dev/null 2>&1 || \
-            gh release create "$TAG" \
-              --title "Feishu Sync ${TAG}" \
-              --generate-notes \
-              --draft=false
+          # 与 mac job 同源：CHANGELOG.md 提取 tag 段落作 notes（2026-09-04
+          # 修复变更说明缺失，详见 mac job 注释）；无段落回退自动生成。
+          NOTES_FILE="$(mktemp)"
+          awk -v ver="${TAG#v}" '
+            index($0, "## [" ver "]") == 1 { sec=1; next }
+            sec && /^## \[/ { exit }
+            sec { print }
+          ' CHANGELOG.md | sed '/^---$/d' > "$NOTES_FILE"
+          if [ -s "$NOTES_FILE" ]; then
+            gh release view "$TAG" >/dev/null 2>&1 || \
+              gh release create "$TAG" \
+                --title "Feishu Sync ${TAG}" \
+                --notes-file "$NOTES_FILE" \
+                --draft=false
+          else
+            echo "::warning::CHANGELOG.md 无 ${TAG} 段落，回退自动生成 notes"
+            gh release view "$TAG" >/dev/null 2>&1 || \
+              gh release create "$TAG" \
+                --title "Feishu Sync ${TAG}" \
+                --generate-notes \
+                --draft=false
+          fi
 
           upload_asset() {
             local f="$1" base

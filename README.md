@@ -1,8 +1,36 @@
 # 飞书知识库本地同步管理工具（feishu-sync）
 
+[![Release](https://img.shields.io/github/v/release/runrunrain/feishu-sync?style=flat-square&logo=github)](https://github.com/runrunrain/feishu-sync/releases)
+[![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](./LICENSE)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows-lightgrey?style=flat-square)](https://github.com/runrunrain/feishu-sync/releases/latest)
+[![Electron](https://img.shields.io/badge/Electron-31-9feaf9?style=flat-square&logo=electron&logoColor=47848f)](https://www.electronjs.org/)
+[![CI](https://img.shields.io/github/actions/workflow/status/runrunrain/feishu-sync/release.yml?style=flat-square&label=release%20ci)](https://github.com/runrunrain/feishu-sync/actions/workflows/release.yml)
+
 **跨平台桌面应用**：自动检测飞书知识库子树变更并选择性同步到本地，保持本地重构后的 Markdown 内容结构（表格布局、层级格式），支持 LLM 驱动的内容适配。
 
-**状态**：v0.3.3，正式同步 + 自定义归档交付版。正式回填默认只生成计划；只有显式 apply 才会写入知识库，路径冲突、移动、删除和未知类型均不会自动执行。
+**状态**：v0.3.28，正式同步 + 自定义归档交付版。正式回填默认只生成计划；只有显式 apply 才会写入知识库，路径冲突、移动、删除和未知类型均不会自动执行。变更记录见 [CHANGELOG.md](./CHANGELOG.md)。
+
+---
+
+## 下载与安装
+
+从 [GitHub Releases](https://github.com/runrunrain/feishu-sync/releases/latest) 下载对应平台安装包：
+
+| 平台 | 安装包 | 说明 |
+|------|--------|------|
+| macOS（Apple Silicon） | `FeishuSync-<version>-arm64.dmg` | 主力分发目标 |
+| macOS（Intel） | `FeishuSync-<version>.dmg` | x64 构建 |
+| Windows x64 | `FeishuSync-Setup-<version>-x64.exe` | NSIS 安装器 |
+
+> **macOS 首次启动提示无法验证开发者？** CI 构建产物为 ad-hoc 签名（无 Developer ID 证书），首次使用需解除隔离属性：
+>
+> ```bash
+> xattr -dr com.apple.quarantine "/Applications/Feishu Sync.app"
+> ```
+>
+> 亦可在「系统设置 → 隐私与安全性」中点击「仍要打开」。如需正式签名分发，参照下文[构建与打包](#构建与打包)的 `:release` 命令自行构建。
+
+安装后首次启动按引导完成：配置本地知识库根路径与飞书根 URL（或从配置面板导入 `config.json`）、确认 lark-cli 认证就绪，详见[首次使用流程](#首次使用流程)。
 
 ---
 
@@ -216,7 +244,7 @@ export APPLE_API_ISSUER="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 签名证书可安装到当前钥匙串，或通过 electron-builder 支持的
 `CSC_LINK` / `CSC_KEY_PASSWORD` 提供。
 
-**打包产物**：`dist/FeishuSync-Setup-<version>-x64.exe`（Windows NSIS，当前 0.3.3，~99MB）
+**打包产物**：`dist-desktop/win32-x64/FeishuSync-Setup-<version>-x64.exe`（Windows NSIS，~99MB）；CI 产物见 [Releases](https://github.com/runrunrain/feishu-sync/releases/latest)
 
 ### 首次使用流程
 
@@ -299,34 +327,35 @@ feishu-sync/
 
 ## 开发文档导航
 
-以下为外部交付路径（原始 Windows 开发环境），仓库内不含 docs/ 目录：
-
-| 文档 | 路径 | 内容 |
-|------|------|------|
-| 架构设计文档 | `D:/WorkPace/Database/03-项目交付/03-项目工具/知识库本地同步管理工具/架构设计文档.md` | 总体架构、模块设计、接口签名、数据模型、关键流程 |
-| 技术实现文档 | `D:/WorkPace/Database/03-项目交付/03-项目工具/知识库本地同步管理工具/技术实现文档.md` | 技术栈、工程结构、完整代码骨架、构建命令、测试策略 |
-| 飞书认证架构专项设计 | `D:/WorkPace/Database/03-项目交付/03-项目工具/知识库本地同步管理工具/飞书认证架构专项设计.md` | LarkCliClient 设计、Config schema 修订、认证就绪检查流程 |
+- [CHANGELOG.md](./CHANGELOG.md) —— 版本化变更记录（Release 说明同源）
+- [CLAUDE.md](./CLAUDE.md) —— 仓库工程约定（架构 gotcha、命令、安全红线、原生模块 ABI）
+- 各模块头部注释 —— 大量「P0-Qx 实测 / 实测 confirmed / 历史教训」标注记录设计动机
 
 ---
 
 ## 当前状态与已知限制
 
-**当前状态**：v0.3.3 交付版。核心链路均已落地：定时变更检测 → 分型同步（docx/sheet/slides）→ 表格重构与 LLM 风格对齐 → staged 原子提交；自定义归档（快捷添加 + 手工文件动态纳管）；主区双视图与 Markdown 预览；托盘常驻与自动更新。
+**当前状态**：v0.3.28。核心链路均已落地：定时变更检测 → 分型同步（docx/sheet/slides）→ 表格重构与 LLM 风格对齐 → staged 原子提交；自定义归档（快捷添加 + 手工文件动态纳管）；主区双视图与 Markdown 预览（含 HTML 表格受控渲染/CSV 跳转）；托盘常驻与自动更新；字体平台分栈（macOS 宋/楷中国风，Windows 微软雅黑兑底）。
 
 **已知限制**：
 - macOS 打包需 macOS 环境（Windows 上无法生成 macOS DMG）
-- 真实自动更新需配置生产 feed URL（当前为 generic provider）
+- 真实自动更新需配置生产 feed URL（当前为 generic provider 指向 GitHub Releases）
 - GUI 端到端交互需打包后真机验证
 - 端到端测试脚本端口硬编码（需改为环境变量读取）
 - sheet 导出可能遇飞书权限 1069902（需后台授权）
 
-**下一步计划**：
-- 配置生产 feed URL 实现真实自动更新
-- 在有权限限制的子树中实测 40403 占位文件逻辑
-- 修复端到端测试脚本端口硬编码（`server/scripts/e2e-integration-test.ts:11`）
+## 参与贡献
+
+欢迎 issue / PR。提交前请在 `server/` 下跑通测试与类型检查：
+
+```bash
+cd server && npm test && npm run typecheck
+```
+
+发布流程：提交合入 `main` 后按 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 在 `CHANGELOG.md` 顶部归档条目，`npm version <patch|minor> --no-git-tag-version` 后打 `v*` 标签推送，[Release workflow](.github/workflows/release.yml) 自动构建三平台产物并发布（Release 说明从 CHANGELOG 同步提取）。
 
 ---
 
 ## 许可证
 
-内部项目，专有许可证。
+[MIT](./LICENSE) © runrunrain

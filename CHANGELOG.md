@@ -6,6 +6,19 @@
 
 ---
 
+## [0.3.28] - 2026-09-04
+
+### Fixed（fix）
+
+- **Release 页变更说明缺失**：`--generate-notes` 在单 commit 无 PR 的 tag 上只生成一行 Full Changelog 链接，中文变更内容完全不进 Release 页（v0.3.27 实测）。现 Release workflow 改为从 CHANGELOG.md 提取对应 tag 段落作为说明正文（无段落时回退自动生成），发版说明与 CHANGELOG 同源。
+
+### Changed（chore）
+
+- **CI 依赖缓存提速**：免费共享 runner 磁盘 IO 波动导致 win 构建 npm ci 从 30s 涨到 12 分钟（v0.3.27 实测）。改为缓存 node_modules 本体 + Electron/electron-builder 二进制，命中即跳过 Install 步骤；npm ci 加 `--no-audit --no-fund` 砍 registry 往返。
+- **README 按 GitHub 开源规范重整**：顶部徽章（Release/License/平台/CI）；新增「下载与安装」章节（Releases 三平台产物表 + macOS ad-hoc 签名解除隔离指引）；「参与贡献」含测试与发布流程；开发文档导航改为仓库内文档（移除原始开发机本机路径）；状态更新至 v0.3.28；新增 MIT LICENSE。
+
+---
+
 ## [0.3.27] - 2026-09-04
 
 ### Fixed（fix）
