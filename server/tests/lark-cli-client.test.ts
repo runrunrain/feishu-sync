@@ -325,3 +325,106 @@ describe('quoteWindowsShellArguments — Win cmd 元字符参数引号包裹', (
     ).toEqual(['--output', 'a b&c']);
   });
 });
+
+describe('LarkCliClient.listBaseRecords — ndjson artifact 通道（v0.3.34 真机修复）', () => {
+  it('converts ndjson rows to {record_id, fields} and hoists manifest has_more', async () => {
+    const client = createClient();
+    let writtenFile = '';
+    const capturedArgs: string[] = [];
+    (client as any).execute = async (args: string[], apiType: string) => {
+      capturedArgs.push(...args);
+      expect(apiType).toBe('base');
+      const outputIdx = args.indexOf('--output');
+      writtenFile = args[outputIdx + 1];
+      // 模拟 lark-cli：写 ndjson artifact，stdout 返回 manifest（顶层 has_more）
+      fs.writeFileSync(writtenFile, [
+        JSON.stringify({ record_id: 'rec1', 名称: '甲', is_enabled: true }),
+        JSON.stringify({ record_id: 'rec2', 名称: '乙', is_enabled: false }),
+        '',
+      ].join('\n'), 'utf-8');
+      return { ok: true, data: {}, has_more: true, records_count: 2 };
+    };
+
+    const result = await client.listBaseRecords({
+      baseToken: 'basX', tableId: 'tblX', offset: 0, limit: 1000,
+    });
+
+    // 命令构造：ndjson + output，limit 钳在 2000 内
+    expect(capturedArgs).toContain('--format');
+    expect(capturedArgs[capturedArgs.indexOf('--format') + 1]).toBe('ndjson');
+    expect(capturedArgs).toContain(String(Math.min(1000, 2000)));
+    // 结构转换：record_id 剥离，其余作为 fields（原始值保留）
+    expect(result.items).toEqual([
+      { record_id: 'rec1', fields: { 名称: '甲', is_enabled: true } },
+      { record_id: 'rec2', fields: { 名称: '乙', is_enabled: false } },
+    ]);
+    expect(result.has_more).toBe(true);
+    // 临时 artifact 已清理
+    expect(fs.existsSync(writtenFile)).toBe(false);
+  });
+
+  it('hard-fails on unreadable or corrupt ndjson artifact, accepts legal empty file (diting Major)', async () => {
+    const client = createClient();
+    // 场景 1：lark-cli 声称成功但未落盘 artifact（版本 drift）→ 读取失败硬抛
+    (client as any).execute = async () => ({ ok: true, data: {}, has_more: false });
+    await expect(client.listBaseRecords({
+      baseToken: 'basX', tableId: 'tblX', offset: 0, limit: 100,
+    })).rejects.toThrow(/ndjson artifact 读取失败/);
+
+    // 场景 2：artifact 半截写入（行级 JSON 损坏）→ 硬抛，不静默空页
+    (client as any).execute = async (args: string[]) => {
+      const outputIdx = args.indexOf('--output');
+      fs.writeFileSync(args[outputIdx + 1],
+        JSON.stringify({ record_id: 'rec1', v: 1 }) + '\n{broken json\n', 'utf-8');
+      return { ok: true, data: {}, has_more: false };
+    };
+    await expect(client.listBaseRecords({
+      baseToken: 'basX', tableId: 'tblX', offset: 0, limit: 100,
+    })).rejects.toThrow(/行解析失败/);
+
+    // 场景 3：合法空文件（0 字节）→ 空页而非报错（兼容服务端怪异态）
+    (client as any).execute = async (args: string[]) => {
+      const outputIdx = args.indexOf('--output');
+      fs.writeFileSync(args[outputIdx + 1], '', 'utf-8');
+      return { ok: true, data: {}, has_more: false };
+    };
+    const empty = await client.listBaseRecords({
+      baseToken: 'basX', tableId: 'tblX', offset: 0, limit: 100,
+    });
+    expect(empty.items).toEqual([]);
+    expect(empty.has_more).toBe(false);
+  });
+
+  it('falls back to items>=limit when manifest omits has_more, and caps limit at 2000', async () => {
+    const client = createClient();
+    let writtenFile = '';
+    (client as any).execute = async (args: string[]) => {
+      const outputIdx = args.indexOf('--output');
+      writtenFile = args[outputIdx + 1];
+      const limitIdx = args.indexOf('--limit');
+      const limit = Number(args[limitIdx + 1]);
+      fs.writeFileSync(
+        writtenFile,
+        Array.from({ length: Math.min(limit, 5) }, (_, i) =>
+          JSON.stringify({ record_id: `rec${i}`, v: i })).join('\n'),
+        'utf-8',
+      );
+      return { ok: true, data: {} }; // 无 has_more（旧版 lark-cli）
+    };
+
+    // limit 超额被钳制为 2000
+    const full = await client.listBaseRecords({
+      baseToken: 'basX', tableId: 'tblX', offset: 0, limit: 99999,
+    });
+    expect(full.items.length).toBe(5);
+    expect(full.has_more).toBe(false); // 5 < 2000
+
+    // 满页（manifest 无 has_more）→ 保守认为还有更多
+    const page = await client.listBaseRecords({
+      baseToken: 'basX', tableId: 'tblX', offset: 0, limit: 3,
+    });
+    expect(page.items.length).toBe(3);
+    expect(page.has_more).toBe(true);
+    expect(fs.existsSync(writtenFile)).toBe(false);
+  });
+});

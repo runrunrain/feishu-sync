@@ -160,7 +160,7 @@ export interface BitableExportResult {
 const TABLES_PAGE_LIMIT = 100;
 const FIELDS_PAGE_LIMIT = 200;
 const VIEWS_PAGE_LIMIT = 200;
-const RECORDS_PAGE_LIMIT = 200;
+const RECORDS_PAGE_LIMIT = 1000; // ndjson 通道每页上限 2000，取 1000 平衡页数与内存
 const MAX_TABLES = 200;
 const MAX_FIELDS_PER_TABLE = 500;
 const MAX_VIEWS_PER_TABLE = 500;

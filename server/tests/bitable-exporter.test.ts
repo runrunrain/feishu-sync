@@ -289,12 +289,13 @@ describe('BitableExporter.exportBitable — full pipeline', () => {
     }
   });
 
-  it('paginates record-list with offset increments across 2 pages (250 records, page size 200)', async () => {
+  it('paginates record-list with offset increments across 2 pages (1500 records, page size 1000)', async () => {
     const staging = tmpStaging();
     try {
-      // 服务端语义：满页 200 返回 + has_more=true；第二页 50 条 +
-      // has_more=false。翻页器应恰好发两次调用（offset 0 / 200）。
-      const bigRecords = Array.from({ length: 250 }, (_, i) => ({
+      // 服务端语义（ndjson 通道，v0.3.34 真机实测）：满页 1000 返回 +
+      // has_more=true；第二页 500 条 + has_more=false。翻页器应恰好发
+      // 两次调用（offset 0 / 1000）。
+      const bigRecords = Array.from({ length: 1500 }, (_, i) => ({
         record_id: `recP${i}`,
         fields: { 名称: `条目${i}` },
       }));
@@ -316,10 +317,10 @@ describe('BitableExporter.exportBitable — full pipeline', () => {
       });
 
       expect(state.recordCalls.length).toBe(2);
-      expect(state.recordCalls[0]).toEqual({ tableId: 'tblP', offset: 0, limit: 200 });
-      expect(state.recordCalls[1]).toEqual({ tableId: 'tblP', offset: 200, limit: 200 });
-      expect(result.sections[0].recordCount).toBe(250);
-      expect(result.markdown).toContain('| recP249 | 条目249 |');
+      expect(state.recordCalls[0]).toEqual({ tableId: 'tblP', offset: 0, limit: 1000 });
+      expect(state.recordCalls[1]).toEqual({ tableId: 'tblP', offset: 1000, limit: 1000 });
+      expect(result.sections[0].recordCount).toBe(1500);
+      expect(result.markdown).toContain('| recP1499 | 条目1499 |');
 
       // 小表（1 条 < limit）单次调用即止
       const matrix = setupMatrixState();

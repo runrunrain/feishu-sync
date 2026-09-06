@@ -6,6 +6,15 @@
 
 ---
 
+## [0.3.35] - 2026-09-07
+
+### Fixed（fix）
+
+- **多维表格记录全部丢失（ndjson 保真通道）**：v0.3.34 真机实测暴露 +record-list --format json 实际返回渲染后的值矩阵（无 record_id、无字段名、无原始值），容错解析把它吞成空页 → 同步产物全表「（无记录）」。修复：切换到 ndjson artifact 通道（唯一保留原始字段值 + record_id 的出口，manifest 顶层 has_more/records_count 驱动翻页，每页上限 2000），真机验证 4 表 31 条记录全量落地；附带修复 lark-cli --output 路径白名单（仅 cwd / /tmp / ~/files，macOS DARWIN_USER_TEMP_DIR 被拒）——按可写性探测候选链 /tmp → ~/files → os.tmpdir() → cwd。
+- **ndjson artifact 解析失败硬失败（审核加固）**：artifact 读取失败/行级 JSON 损坏时抛 LarkCliError 硬失败（绝不静默退化为空页推进 synced 基线，违背「记录不完整绝不推进基线」契约）；合法空文件（0 字节）仍返回空页兼容服务端怪异态。
+
+---
+
 ## [0.3.34] - 2026-09-07
 
 ### Added（feat）

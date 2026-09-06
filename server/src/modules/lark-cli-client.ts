@@ -608,11 +608,15 @@ export class LarkCliClient {
   }
 
   /**
-   * List records of one data table (base +record-list --format json).
+   * List records of one data table (base +record-list，ndjson artifact 通道)。
    *
-   * 底层走 GET /open-apis/base/v3/bases/<T>/tables/<tbl>/records
-   * （json format 的 page size 上限 200）。不要用 markdown/ndjson
-   * format：md format 会丢失字段结构，无法确定性渲染。
+   * 底层走 GET /open-apis/base/v3/bases/<T>/tables/<tbl>/records。
+   * v0.3.34 真机实测：--format json 返回的是渲染后的值矩阵
+   * （data.data: [[...]]，无 record_id/字段名/原始值）不可用；markdown
+   * format 同样丢结构。ndjson artifact 是唯一保真通道：原始字段值 +
+   * record_id 落盘到 --output 文件，stdout 返回 manifest（顶层
+   * has_more/records_count/offset），每页上限 2000。注意区分 stdout 的
+   * ndjson 格式与 artifact 落盘（后者才保留原始值）。
    */
   async listBaseRecords(options: {
     baseToken: string;
@@ -620,14 +624,78 @@ export class LarkCliClient {
     offset: number;
     limit: number;
   }): Promise<any> {
-    return this.execute([
-      'base', '+record-list', '--base-token', options.baseToken,
-      '--table-id', options.tableId,
-      '--offset', String(options.offset), '--limit', String(options.limit),
-      '--format', 'json',
-    ], 'base');
+    // v0.3.34 真机实测（2026-09-07）：+record-list --format json 返回的是
+    // 渲染后的值矩阵（data.data: [[...]]，无 record_id、无原始字段对象，
+    // 字段名/schema 全部丢失），多维表格记录被上层解析为空页（同步产物
+    // 全表「无记录」）。ndjson artifact 是唯一保真通道：保留原始字段值
+    // + record_id，manifest 顶层携带 has_more/records_count/offset，翻页
+    // 语义与 --offset 一致（实测 page1 limit=3 + page2 offset=3 无重复）。
+    // ndjson 每页上限 2000（json 格式仅 200）。
+    //
+    // 真机坑二：lark-cli --output 有路径白名单（仅 cwd / /tmp / ~/files），
+    // macOS 的 os.tmpdir() 是 /var/folders/...（DARWIN_USER_TEMP_DIR）会被
+    // 「unsafe output path」拒绝。按可写性探测候选链落盘。
+    const outFile = resolveNdjsonArtifactPath();
+    try {
+      const manifest = await this.execute([
+        'base', '+record-list', '--base-token', options.baseToken,
+        '--table-id', options.tableId,
+        '--offset', String(options.offset),
+        '--limit', String(Math.min(options.limit, 2000)),
+        '--format', 'ndjson', '--output', outFile,
+      ], 'base');
+      // diting 2026-09 复核 Major：读取/解析失败绝不能静默退化为空页——
+      // 翻页器会把空页当合法终点，md 落 0 记录且推进 synced 基线，
+      // 违背「记录不完整绝不推进基线」契约（v0.3.34 根因正是容错解析把
+      // 异常 shape 吞成空页）。区分三类：①读文件失败/行级 JSON 解析
+      // 失败 → 硬抛（走 exporter 硬失败）；②合法空文件（0 字节）→
+      // 空页（兼容服务端怪异态，翻页器空页终止 + 保险丝仍生效）；
+      // ③正常行 → 转换统一结构。
+      let raw: string;
+      try {
+        raw = fs.readFileSync(outFile, 'utf-8');
+      } catch (error) {
+        throw new LarkCliError(
+          `ndjson artifact 读取失败（lark-cli 版本行为变化或落盘异常？）: ${outFile}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+          'parse',
+          false,
+        );
+      }
+      const rows: unknown[] = [];
+      for (const line of raw.split('\n')) {
+        if (line.trim().length === 0) continue;
+        try {
+          rows.push(JSON.parse(line));
+        } catch (error) {
+          throw new LarkCliError(
+            `ndjson artifact 行解析失败（半截写入/磁盘损坏？）: ${outFile}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+            'parse',
+            false,
+          );
+        }
+      }
+      const items = rows
+        .map((row) => {
+          if (!row || typeof row !== 'object') return null;
+          const record = row as Record<string, any>;
+          const { record_id: recordId, ...fields } = record;
+          return { record_id: recordId, fields };
+        })
+        .filter((item): item is { record_id: unknown; fields: Record<string, unknown> } => item !== null);
+      const effectiveLimit = Math.min(options.limit, 2000);
+      const hasMore = manifest?.has_more
+        ?? manifest?.data?.has_more
+        ?? manifest?.hasMore
+        ?? (items.length >= effectiveLimit);
+      return { items, has_more: hasMore };
+    } finally {
+      fs.rmSync(outFile, { force: true });
+    }
   }
-
   /**
    * Download one base attachment file (base +record-download-attachment).
    *
@@ -1241,5 +1309,34 @@ export class LarkCliClient {
       await new Promise((resolve) => setTimeout(resolve, waitTime));
     }
   }
-
 }
+
+/**
+ * 为 lark-cli ndjson artifact 选择可写的输出文件路径。
+ *
+ * lark-cli --output 内置白名单：cwd / /tmp / ~/files（真机实测 macos
+ * DARWIN_USER_TEMP_DIR 被拒「unsafe output path」）。按序探测可写性：
+ * /tmp → ~/files → os.tmpdir()（Windows TEMP 大概率被 Win 版接受）→
+ * cwd。全链失败退 os.tmpdir()，交由 lark-cli 校验错显式暴露（可诊断）。
+ */
+function resolveNdjsonArtifactPath(): string {
+  const fileName = `feishu-sync-bitable-records-${process.pid}-${Date.now()}-${
+    Math.random().toString(36).slice(2, 8)
+  }.ndjson`;
+  const candidates = [
+    '/tmp',
+    path.join(os.homedir(), 'files'),
+    os.tmpdir(),
+    process.cwd(),
+  ];
+  for (const root of candidates) {
+    try {
+      fs.accessSync(root, fs.constants.W_OK);
+      return path.join(root, fileName);
+    } catch {
+      // 候选根不可写（或不存在），试下一个
+    }
+  }
+  return path.join(os.tmpdir(), fileName);
+}
+
