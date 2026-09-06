@@ -61,6 +61,10 @@ import {
   renderSheetMediaAppendix,
   type SheetMediaItem,
 } from './sheet-media.js';
+import {
+  BitableExporter,
+  type BitableExportResult,
+} from './bitable-exporter.js';
 import { adaptSlidesXmlToMarkdown } from './slides-xml-adapter.js';
 import { LarkCliError } from './lark-cli-client.js';
 
@@ -109,7 +113,7 @@ interface FetchedDocument {
  */
 interface HeaderMeta {
   objToken: string;
-  objType: 'docx' | 'sheet' | 'slides' | 'unknown';
+  objType: 'docx' | 'sheet' | 'slides' | 'bitable' | 'unknown';
   wikiNodeToken: string | null;
   spaceId: string | null;
   originalLink: string | null;
@@ -501,7 +505,26 @@ export class SyncEngine {
     //      sheet 子表的 CSV 经 LayoutReconstructor 重构生成 markdown。
     let fetched: FetchedDocument;
 
-    if (doc.objType === 'sheet') {
+    if (doc.objType === 'bitable') {
+      // P0 决策（2026-10，同 sheet 3380002 教训）：bitable 走 docs+fetch 会被
+      // 飞书拒绝（code 3380002，Unsupported document type），历史链路把它折叠
+      // 为 unknown 后只产出元数据占位。这里与 sheet 同构：跳过 docs+fetch，
+      // 主内容由 BitableExporter 直接从 base API 确定性渲染（数据表/字段
+      // schema/全部记录/视图/附件/dashboard-workflow-form 元数据），见
+      // step 5 之后的导出调用。零 LLM、零 LayoutReconstructor。
+      console.info(
+        `[SyncEngine] objType=bitable, skipping docs+fetch (base content ` +
+        `is synthesized deterministically by BitableExporter)`
+      );
+      fetched = {
+        content: '',
+        images: [],
+        attachments: [],
+        sheets: [],
+        url: '',
+        obj_token: doc.objToken,
+      };
+    } else if (doc.objType === 'sheet') {
       console.info(
         `[SyncEngine] objType=sheet, skipping docs+fetch (sheet content ` +
         `is synthesized from sub-sheet CSVs via LayoutReconstructor)`
@@ -605,6 +628,27 @@ export class SyncEngine {
       images: SheetMediaItem[];
     }> = [];
     const docname = path.basename(localMdPath, '.md');
+    // bitable 确定性导出（P0 决策，见上方 fetched 构造处的 bitable 分支注
+    // 释）：staging workspace 已建好，导出器直接复用 stagingDocDir。CSV 落
+    // <docname>.csv-data/、base 元数据落 <docname>.base-meta/、附件落
+    // attachments/ ——目录约定与 sheet / docx 完全一致。任一硬失败（表清
+    // 单/字段/记录读取失败）在此抛出，同步中止不推进 synced 基线。
+    let bitableResult: BitableExportResult | null = null;
+    if (doc.objType === 'bitable') {
+      const exporter = new BitableExporter(this.requireLarkCliClient());
+      bitableResult = await exporter.exportBitable({
+        baseToken: doc.objToken,
+        title: doc.title,
+        stagingDocDir,
+        docname,
+      });
+      expandedContent = bitableResult.markdown;
+      console.info(
+        `[SyncEngine] Exported bitable "${doc.title}": ` +
+          `${bitableResult.sections.length} tables, ` +
+          `${bitableResult.attachments.length} attachments`
+      );
+    }
     if (doc.objType === 'sheet') {
       const exportedSheets = await this.exportSheetsToStaging(
         doc.objToken,
@@ -683,7 +727,9 @@ export class SyncEngine {
     // equal. Reading the local old content for an added doc returns '' from
     // readLocalMarkdown (file does not exist yet), which is the correct
     // "no prior version" signal for the adapter.
-    if (this.contentAdapter && options.enableLLM && localMdPath) {
+    //    bitable 跳过 LLM（P0 决策）：数据表格 LLM 重排有丢数据风险，
+    //    bitable 的 markdown 是 API 数据的确定性投影，必须逐字节可重现。
+    if (this.contentAdapter && options.enableLLM && localMdPath && doc.objType !== 'bitable') {
       try {
         const localOldContent = await this.readLocalMarkdown(localMdPath);
         // P3 新接口: ContentAdapter.adaptContent(rawContent, localOld,
@@ -761,11 +807,21 @@ export class SyncEngine {
             token: img.token,
           })),
         ],
-        attachments: attachments.map((att) => ({
-          relativePath: `attachments/${path.basename(att.path)}`,
-          name: att.name,
-          token: att.token,
-        })),
+        attachments: [
+          ...attachments.map((att) => ({
+            relativePath: `attachments/${path.basename(att.path)}`,
+            name: att.name,
+            token: att.token,
+          })),
+          // bitable 附件由 BitableExporter 落入同一个 staging attachments/
+          // 目录（同名约定），与 docx 附件共用 ir.attachments 校验通道；
+          // 下载失败的附件不会出现在这里（软降级仅 md 标注）。
+          ...(bitableResult?.attachments ?? []).map((att) => ({
+            relativePath: att.relativePath,
+            name: att.name,
+            token: att.token,
+          })),
+        ],
         sheets: [...sheets, ...inlineSheets].map((sheet) => ({
           sheetId: sheet.sheetId,
           title: sheet.title,
@@ -795,6 +851,22 @@ export class SyncEngine {
             ? `${relativeDir}/attachments/${name}`
             : `attachments/${name}`,
           absoluteSource: att.path,
+        });
+      }
+      // bitable 附属文件：每表 CSV（<docname>.csv-data/）与 base 元数据
+      // JSON（<docname>.base-meta/），均从 staging 经 extraFiles 原子提交
+      // （与 sheet CSV 同款相对链接约定，routes/content.ts 的 csv-data 读
+      // 取逻辑对 bitable 同样生效）。
+      for (const file of bitableResult?.commitFiles ?? []) {
+        extraFiles.push({
+          relativePath: relativeDir ? `${relativeDir}/${file.relativePath}` : file.relativePath,
+          absoluteSource: file.absolutePath,
+        });
+      }
+      for (const att of bitableResult?.attachments ?? []) {
+        extraFiles.push({
+          relativePath: relativeDir ? `${relativeDir}/${att.relativePath}` : att.relativePath,
+          absoluteSource: att.absolutePath,
         });
       }
 
@@ -891,7 +963,7 @@ export class SyncEngine {
       cloudModifiedTime: doc.cloudModifiedTime,
       size: finalContent.length,
       imagesCount: images.length + sheetMediaImages.length,
-      attachmentsCount: attachments.length,
+      attachmentsCount: attachments.length + (bitableResult?.attachments.length ?? 0),
       sheetsCount: sheets.length,
     };
   }
@@ -1382,7 +1454,14 @@ export class SyncEngine {
     // obj_type: emit only concrete recognized types. 'unknown' (e.g. a
     // placeholder that slipped through) is omitted so the parser's
     // default 'docx' classification (index-scanner.ts:208) takes effect.
-    if (meta.objType === 'docx' || meta.objType === 'sheet' || meta.objType === 'slides') {
+    // bitable（2026-10）：与 docx/sheet/slides 同为 IndexScanner
+    // parseYamlHtmlHeader 识别的具体类型，round-trip 必须闭环。
+    if (
+      meta.objType === 'docx'
+      || meta.objType === 'sheet'
+      || meta.objType === 'slides'
+      || meta.objType === 'bitable'
+    ) {
       lines.push(`  obj_type: ${this.yamlScalar(meta.objType)}`);
     }
 

@@ -146,7 +146,7 @@ export interface ParsedMetadata {
   obj_token?: string;
   wiki_node_token?: string;
   space_id?: string;
-  obj_type?: 'docx' | 'sheet' | 'slides' | 'unknown';
+  obj_type?: 'docx' | 'sheet' | 'slides' | 'bitable' | 'unknown';
   original_link?: string;
   fetch_date?: string;
   last_synced_modify_time?: string;
@@ -486,7 +486,7 @@ export class IndexScanner {
    *     obj_token: <TOKEN>
    *     wiki_node_token: <TOKEN>
    *     space_id: <ID>
-   *     obj_type: docx | sheet | slides
+   *     obj_type: docx | sheet | slides | bitable
    *     original_link: https://xxx.feishu.cn/wiki/<TOKEN>
    *     fetch_date: YYYY-MM-DD
    *     last_synced_modify_time: ISO8601
@@ -549,7 +549,12 @@ export class IndexScanner {
     if (objMatch) {
       result.obj_token = objMatch[1];
       const typeHint = objMatch[2]?.trim().toLowerCase();
-      if (typeHint === 'docx' || typeHint === 'sheet' || typeHint === 'slides') {
+      if (
+        typeHint === 'docx'
+        || typeHint === 'sheet'
+        || typeHint === 'slides'
+        || typeHint === 'bitable'
+      ) {
         result.obj_type = typeHint;
       }
     }
@@ -755,7 +760,12 @@ export class IndexScanner {
           result.space_id = val;
           break;
         case 'obj_type':
-          if (val === 'docx' || val === 'sheet' || val === 'slides') {
+          if (
+            val === 'docx'
+            || val === 'sheet'
+            || val === 'slides'
+            || val === 'bitable'
+          ) {
             result.obj_type = val;
           }
           break;

@@ -5,7 +5,7 @@
 
 import path from 'node:path';
 
-export type DocumentObjType = 'docx' | 'sheet' | 'slides' | 'unknown';
+export type DocumentObjType = 'docx' | 'sheet' | 'slides' | 'bitable' | 'unknown';
 
 export interface DocumentImageRef {
   /** Relative path from the markdown file's directory, e.g. images/01.png */

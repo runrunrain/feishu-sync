@@ -98,10 +98,11 @@ export interface PathResolveInput {
    */
   rejectExistingFiles?: boolean;
   /**
-   * Object type affects the companion `.csv-data` directory for sheets.
-   * Defaults to treating non-sheet as null csv dir.
+   * Object type affects the companion `.csv-data` directory for sheets
+   * and bitables (both export per-table raw CSVs beside the markdown).
+   * Defaults to treating non-sheet/non-bitable as null csv dir.
    */
-  objType?: 'docx' | 'sheet' | 'slides' | 'unknown';
+  objType?: 'docx' | 'sheet' | 'slides' | 'bitable' | 'unknown';
 }
 
 /** Windows + POSIX reserved basenames (case-insensitive). */
@@ -329,8 +330,11 @@ function companionDirs(
   const relativeAssetDir = joinRelative(dirname, 'images');
 
   let relativeCsvDataDir: string | null = null;
-  if (objType === 'sheet') {
-    // Convention: `<stem>.csv-data` beside the markdown file.
+  if (objType === 'sheet' || objType === 'bitable') {
+    // Convention: `<stem>.csv-data` beside the markdown file. sheet 与
+    // bitable（2026-10）同约定——BitableExporter 的每表 CSV 也落在
+    // `<stem>.csv-data/` 下，routes/content.ts 的表格预览因此对两种
+    // 类型都生效。
     relativeCsvDataDir = joinRelative(dirname, `${stem}.csv-data`);
   }
 

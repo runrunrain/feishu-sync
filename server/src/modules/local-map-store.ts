@@ -159,6 +159,11 @@ export class LocalMapStore {
       console.info(`[LocalMapStore] Auto-migration complete (${pending.length} columns added)`);
     }
 
+    // 2026-10 bitable 放行：documents.obj_type 的历史 CHECK 约束不含
+    // 'bitable'，检测/同步多维表格节点时 INSERT/UPDATE 会被 SQLite 直接
+    // 拒绝。SQLite 无法原地修改 CHECK，需一次性受控重建（见方法注释）。
+    this.migrateDocumentsObjTypeCheckForBitable();
+
     // v0.2.0+ indexes. Run unconditionally (CREATE INDEX IF NOT EXISTS is
     // idempotent). On fresh DBs the columns already exist; on legacy DBs
     // the ALTER above just added them. Either way the indexes can now be
@@ -204,6 +209,117 @@ export class LocalMapStore {
 
     `);
     console.info('[LocalMapStore] localDirs table ready (v4 structure-align)');
+  }
+
+  /**
+   * documents 表全部列（重建拷贝的显式列序，与 getCreateTablesDDL 一致）。
+   * 显式列名拷贝使重建对旧库的物理列序差异免疫（旧库 ALTER 追加序与
+   * 新库建表序不同，SELECT * 不可用）。
+   */
+  private static readonly DOCUMENTS_COLUMNS = [
+    'obj_token', 'wiki_node_token', 'obj_type', 'title', 'local_md_path',
+    'last_synced_modify_time', 'last_synced_at', 'status', 'created_at',
+    'updated_at', 'parent_node_token', 'space_id', 'obj_edit_time',
+    'cloud_deleted', 'last_seen_at', 'local_sort_order', 'original_link',
+    'cloud_match', 'watched_root_url', 'observed_obj_edit_time',
+    'synced_obj_edit_time', 'sync_state', 'pending_reason', 'watched_root_id',
+    'local_rel_path', 'missing_complete_count', 'last_sync_error_code',
+    'has_child', 'custom_folder_id',
+  ] as const;
+
+  /**
+   * 2026-10 bitable 放行：受控重建 documents 表的 obj_type CHECK。
+   *
+   * 背景：历史建表 DDL 的 `CHECK(obj_type IN ('docx','sheet','slides',
+   * 'unknown'))` 会拒绝 bitable 行（检测到多维表格节点时 INSERT/UPDATE
+   * 直接报 CHECK constraint failed）。SQLite 不支持原地修改 CHECK，唯一
+   * 路径是表重建。
+   *
+   * 流程（全部在一个事务内，失败回滚不动旧表）：
+   *   ① 读 sqlite_master 确认当前建表 SQL 未含 'bitable'（幂等守卫）；
+   *   ② 从 getCreateTablesDDL 提取 documents 建表语句建影子表
+   *     documents_bitable_rebuild（新 CHECK）；
+   *   ③ 显式列名 INSERT...SELECT 全量拷贝（对物理列序差异免疫）；
+   *   ④ DROP 旧表 → RENAME 影子表回 documents；
+   *   ⑤ 事务外重跑全量 DDL（CREATE INDEX IF NOT EXISTS 幂等）恢复被
+   *     DROP 连带删除的索引。
+   *
+   * 安全性：sheet_sheets 对 documents(obj_token) 的 FK 引用按表名解析，
+   * 本库未开启 PRAGMA foreign_keys（实测默认 OFF），重建期间不触发级联；
+   * RENAME 后引用自动恢复。prepared statement 缓存在 initialize 后才建，
+   * 不存在失效句柄。
+   */
+  private migrateDocumentsObjTypeCheckForBitable(): void {
+    const row = this.db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'documents'",
+    ).get() as { sql: string | null } | undefined;
+    const existingDdl = row?.sql ?? '';
+    if (!existingDdl) return; // 表不存在（不应发生，getCreateTablesDDL 已跑过）
+    // 已升级守卫：[^)]* 跨越 CHECK 列表内的逗号匹配到 'bitable'。
+    // 历史缺陷（diting 2026-10 审核 Major-1）：首版用 [^,]*，被
+    // ('docx', 'sheet', 'slides', 'bitable', ...) 的列表逗号阻断，对已升级
+    // 库永不匹配 → 每次启动重复整套重建 DDL，徒增 DROP 窗口风险。
+    if (/obj_type[^)]*'bitable'/.test(existingDdl)) return; // 已升级
+    if (!/CHECK\s*\(\s*obj_type/i.test(existingDdl)) return; // 无 CHECK 约束，无需重建
+
+    const columns = [...LocalMapStore.DOCUMENTS_COLUMNS];
+    const currentCols = this.db.prepare('PRAGMA table_info(documents)').all() as Array<{ name: string }>;
+    const colNames = new Set(currentCols.map((col) => col.name));
+    const missing = columns.filter((name) => !colNames.has(name));
+    if (missing.length > 0) {
+      // additive 迁移应已补齐全部列；缺失说明库状态异常，宁可保留旧表
+      // （bitable 写入会报 CHECK 错，可诊断）也不能在启动路径上冒险重建。
+      console.error(
+        `[LocalMapStore] documents 表缺少预期列，跳过 obj_type CHECK 重建: ${missing.join(', ')}`,
+      );
+      return;
+    }
+
+    const ddlMatch = this.getCreateTablesDDL().match(
+      /CREATE TABLE IF NOT EXISTS documents \(([\s\S]*?)\n      \);/,
+    );
+    if (!ddlMatch) {
+      console.error('[LocalMapStore] 无法从建表 DDL 提取 documents 定义，跳过 obj_type CHECK 重建');
+      return;
+    }
+    const shadowDdl = `CREATE TABLE documents_bitable_rebuild (${ddlMatch[1]});`;
+    const columnList = columns.join(', ');
+
+    // 重建前抢救 DDL 之外来源的 documents 索引（手工维护/历史脚本产物）：
+    // DROP TABLE 连带删除它们，重跑 DDL 只恢复 DDL 内定义的索引（diting
+    // 2026-10 Minor-2）。与 DDL 同名的跳过，避免重复定义报错。
+    const ddlIndexNames = new Set(
+      [...this.getCreateTablesDDL().matchAll(/CREATE (?:UNIQUE )?INDEX IF NOT EXISTS (\w+)/g)]
+        .map((m) => m[1]),
+    );
+    const extraIndexes = (
+      this.db.prepare(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'documents' AND sql IS NOT NULL",
+      ).all() as Array<{ name: string; sql: string }>
+    ).filter((idx) => !ddlIndexNames.has(idx.name));
+
+    const tx = this.db.transaction(() => {
+      this.db.exec('DROP TABLE IF EXISTS documents_bitable_rebuild;');
+      this.db.exec(shadowDdl);
+      this.db.exec(
+        `INSERT INTO documents_bitable_rebuild (${columnList}) SELECT ${columnList} FROM documents;`,
+      );
+      this.db.exec('DROP TABLE documents;');
+      this.db.exec('ALTER TABLE documents_bitable_rebuild RENAME TO documents;');
+    });
+    tx();
+
+    // DROP TABLE 连带删除了 documents 上的全部索引；重跑全量 DDL（全部
+    // IF NOT EXISTS，幂等）一次性恢复，随后重放 DDL 外索引。
+    this.db.exec(this.getCreateTablesDDL());
+    for (const idx of extraIndexes) {
+      try {
+        this.db.exec(idx.sql);
+      } catch (error) {
+        console.warn(`[LocalMapStore] 跳过无法重放的 documents 索引 ${idx.name}: ${error instanceof Error ? error.message : error}`);
+      }
+    }
+    console.info('[LocalMapStore] Auto-migration: documents.obj_type CHECK + bitable (table rebuilt)');
   }
 
   /**
@@ -1997,7 +2113,9 @@ export class LocalMapStore {
       CREATE TABLE IF NOT EXISTS documents (
         obj_token TEXT PRIMARY KEY,
         wiki_node_token TEXT,
-        obj_type TEXT NOT NULL CHECK(obj_type IN ('docx', 'sheet', 'slides', 'unknown')),
+        -- 2026-10：+ 'bitable'（多维表格完整同步）。旧库的 CHECK 不含该值，
+        -- 由 migrateDocumentsObjTypeCheckForBitable 受控重建升级。
+        obj_type TEXT NOT NULL CHECK(obj_type IN ('docx', 'sheet', 'slides', 'bitable', 'unknown')),
         title TEXT NOT NULL,
         local_md_path TEXT NOT NULL,
         last_synced_modify_time TEXT NOT NULL,

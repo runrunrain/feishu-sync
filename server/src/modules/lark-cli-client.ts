@@ -131,7 +131,7 @@ export interface LarkCliExecutableResolutionOptions {
   env?: NodeJS.ProcessEnv;
 }
 
-type LarkCliApiType = 'wiki' | 'docx' | 'sheets' | 'drive' | 'auth';
+type LarkCliApiType = 'wiki' | 'docx' | 'sheets' | 'base' | 'drive' | 'auth';
 
 // A Drive metadata request can describe 200 documents at once, so a low
 // command rate is still substantially faster than individual node-get calls.
@@ -143,6 +143,10 @@ const API_QPS_LIMITS: Record<LarkCliApiType, number> = {
   wiki: 3,
   docx: 2,
   sheets: 2,
+  // bitable (多维表格) read 端点。翻页导出（tables/fields/views/records）
+  // 每次同步会集中连续调用，保守 10：仍受全局 3 QPS 桶约束，实际聚合
+  // 速率不变，这里只决定 base 桶自身的上限。
+  base: 10,
   drive: 1,
   auth: 1,
 };
@@ -553,6 +557,127 @@ export class LarkCliClient {
       '--sheet-id', options.sheetId,
       '--format', 'json',
     ], 'sheets');
+  }
+
+  // -------------------------------------------------------------------------
+  // bitable (多维表格 / base) read 能力。
+  //
+  // 方法是单次调用的薄封装（与 getSheetCsv/getSheetFloatImages 同模式）：
+  // client 只负责 argv 组装与节流，翻页循环（offset 递增 + has_more 兜底）
+  // 在 BitableExporter 层完成。所有响应原样返回，宽容归一化
+  // （snake/camel key、包装层剥解）也在 exporter 层做。
+  // -------------------------------------------------------------------------
+
+  /** List data tables of a base (base +table-list, page size 1-100). */
+  async listBaseTables(appToken: string, offset: number, limit: number): Promise<any> {
+    return this.execute([
+      'base', '+table-list', '--base-token', appToken,
+      '--offset', String(offset), '--limit', String(limit),
+      '--format', 'json',
+    ], 'base');
+  }
+
+  /** List fields of one data table (base +field-list, page size 1-200). */
+  async listBaseFields(options: {
+    baseToken: string;
+    tableId: string;
+    offset: number;
+    limit: number;
+  }): Promise<any> {
+    return this.execute([
+      'base', '+field-list', '--base-token', options.baseToken,
+      '--table-id', options.tableId,
+      '--offset', String(options.offset), '--limit', String(options.limit),
+      '--format', 'json',
+    ], 'base');
+  }
+
+  /** List views of one data table (base +view-list). */
+  async listBaseViews(options: {
+    baseToken: string;
+    tableId: string;
+    offset: number;
+    limit: number;
+  }): Promise<any> {
+    return this.execute([
+      'base', '+view-list', '--base-token', options.baseToken,
+      '--table-id', options.tableId,
+      '--offset', String(options.offset), '--limit', String(options.limit),
+      '--format', 'json',
+    ], 'base');
+  }
+
+  /**
+   * List records of one data table (base +record-list --format json).
+   *
+   * 底层走 GET /open-apis/base/v3/bases/<T>/tables/<tbl>/records
+   * （json format 的 page size 上限 200）。不要用 markdown/ndjson
+   * format：md format 会丢失字段结构，无法确定性渲染。
+   */
+  async listBaseRecords(options: {
+    baseToken: string;
+    tableId: string;
+    offset: number;
+    limit: number;
+  }): Promise<any> {
+    return this.execute([
+      'base', '+record-list', '--base-token', options.baseToken,
+      '--table-id', options.tableId,
+      '--offset', String(options.offset), '--limit', String(options.limit),
+      '--format', 'json',
+    ], 'base');
+  }
+
+  /**
+   * Download one base attachment file (base +record-download-attachment).
+   *
+   * base 附件必须走此命令（drive media-download 不接受 base 附件 token）。
+   * --output 是目标目录（不是文件名），实际落盘文件名由 lark-cli 决定，
+   * 返回值里的 saved_path / 目录扫描由调用方（BitableExporter）解析。
+   */
+  async downloadBaseAttachment(options: {
+    baseToken: string;
+    tableId: string;
+    recordId: string;
+    fileToken: string;
+    outputDir: string;
+  }): Promise<any> {
+    return this.execute([
+      'base', '+record-download-attachment',
+      '--base-token', options.baseToken,
+      '--table-id', options.tableId,
+      '--record-id', options.recordId,
+      '--file-token', options.fileToken,
+      '--output', options.outputDir,
+    ], 'base');
+  }
+
+  /** List dashboards of a base (base +dashboard-list, raw response). */
+  async listBaseDashboards(baseToken: string): Promise<any> {
+    return this.execute([
+      'base', '+dashboard-list', '--base-token', baseToken,
+      '--format', 'json',
+    ], 'base');
+  }
+
+  /** List automations/workflows of a base (base +workflow-list, raw). */
+  async listBaseWorkflows(baseToken: string): Promise<any> {
+    return this.execute([
+      'base', '+workflow-list', '--base-token', baseToken,
+      '--format', 'json',
+    ], 'base');
+  }
+
+  /** List forms of one data table (base +form-list, raw response). */
+  async listBaseForms(options: {
+    baseToken: string;
+    tableId: string;
+  }): Promise<any> {
+    return this.execute([
+      'base', '+form-list', '--base-token', options.baseToken,
+      '--table-id', options.tableId,
+      '--format', 'json',
+    ], 'base');
   }
 
   /**

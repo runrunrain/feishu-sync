@@ -647,3 +647,147 @@ describe('LocalMapStore.pruneMissingLocalDocs — 手动删除残留清理', () 
     store.close();
   });
 });
+
+// =========================================================================
+// bitable 放行 — documents.obj_type CHECK 约束迁移（2026-10）
+//
+// 背景：历史建表 DDL 的 CHECK(obj_type IN ('docx','sheet','slides',
+// 'unknown')) 会拒绝 bitable 行。新库直接建新 CHECK；旧库由
+// migrateDocumentsObjTypeCheckForBitable 受控重建（影子表 + 显式列拷贝 +
+// DROP/RENAME + 索引重建）。
+// =========================================================================
+describe('LocalMapStore bitable obj_type CHECK migration', () => {
+  it('fresh database accepts bitable rows and the DDL carries the widened CHECK', () => {
+    const dbPath = createDatabasePath();
+    const store = new LocalMapStore(dbPath);
+    store.initialize();
+    store.upsertDocument(makeDocument({
+      objToken: 'bas3FreshBitable',
+      objType: 'bitable',
+      title: '多维表格',
+      localMdPath: '/tmp/多维表格.md',
+    }));
+    const record = store.getDocumentByObjToken('bas3FreshBitable');
+    expect(record?.objType).toBe('bitable');
+    store.close();
+
+    const database = new Database(dbPath, { readonly: true });
+    const ddl = (database.prepare(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'documents'",
+    ).get() as { sql: string }).sql;
+    database.close();
+    expect(ddl).toContain("'bitable'");
+    // 幂等：再次 initialize 不再触发重建（真断言：console.info 间谍拦截，
+    // 不得出现 rebuilt 日志 —— diting 2026-10 Major-1 首版守卫正则失效，
+    // 曾导致每次启动重复整套重建 DDL）
+    const rebuildLogs: string[] = [];
+    const originalInfo = console.info;
+    console.info = (...args: unknown[]) => {
+      rebuildLogs.push(args.map(String).join(' '));
+    };
+    try {
+      const store2 = new LocalMapStore(dbPath);
+      store2.initialize();
+      store2.upsertDocument(makeDocument({ objToken: 'bas3FreshBitable2', objType: 'bitable' }));
+      expect(store2.getDocumentByObjToken('bas3FreshBitable2')?.objType).toBe('bitable');
+      store2.close();
+    } finally {
+      console.info = originalInfo;
+    }
+    expect(rebuildLogs.join('\n')).not.toContain('table rebuilt');
+  });
+
+  it('rebuilds a legacy documents table (old CHECK) in place, preserving rows and accepting bitable', () => {
+    const dbPath = createDatabasePath();
+    // 构造 v0.1.0 旧库：旧 CHECK + 仅核心列（additive 迁移会补齐其余列，
+    // 随后触发受控重建）。
+    const legacy = new Database(dbPath);
+    legacy.exec(`
+      CREATE TABLE documents (
+        obj_token TEXT PRIMARY KEY,
+        wiki_node_token TEXT,
+        obj_type TEXT NOT NULL CHECK(obj_type IN ('docx', 'sheet', 'slides', 'unknown')),
+        title TEXT NOT NULL,
+        local_md_path TEXT NOT NULL,
+        last_synced_modify_time TEXT NOT NULL,
+        last_synced_at TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'synced' CHECK(status IN ('synced', 'changed', 'error', 'placeholder')),
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+    `);
+    legacy.prepare(
+      `INSERT INTO documents (obj_token, wiki_node_token, obj_type, title, local_md_path,
+         last_synced_modify_time, last_synced_at, status)
+       VALUES (?, ?, 'docx', '旧文档', '/tmp/旧文档.md', '2026-01-01T00:00:00.000Z',
+         '2026-01-01T00:00:00.000Z', 'synced')`,
+    ).run('doxcnLegacyRow', 'wikicnLegacyNode');
+    // DDL 之外来源的索引：重建必须抢救重放，不能静默丢失（diting Minor-2）
+    legacy.exec('CREATE INDEX idx_documents_title_extra ON documents(title);');
+    legacy.close();
+
+    const store = new LocalMapStore(dbPath);
+    store.initialize();
+
+    // 旧 CHECK 下这行写入会被拒；重建后必须成功
+    store.upsertDocument(makeDocument({
+      objToken: 'bas3MigratedBitable',
+      objType: 'bitable',
+      title: '迁移后的多维表格',
+      localMdPath: '/tmp/迁移后的多维表格.md',
+    }));
+    expect(store.getDocumentByObjToken('bas3MigratedBitable')?.objType).toBe('bitable');
+    // 旧行完整保留
+    const legacyRow = store.getDocumentByObjToken('doxcnLegacyRow');
+    expect(legacyRow?.title).toBe('旧文档');
+    expect(legacyRow?.objType).toBe('docx');
+
+    // 重建不破坏 sheet_sheets 的 FK 目标与索引
+    store.upsertSheetSheet({
+      sheetObjToken: 'doxcnLegacyRow',
+      sheetId: 'sheet1',
+      sheetTitle: '子表一',
+      localCsvPath: '/tmp/a.csv',
+      status: 'synced',
+    });
+    store.close();
+
+    const database = new Database(dbPath, { readonly: true });
+    const ddl = (database.prepare(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'documents'",
+    ).get() as { sql: string }).sql;
+    const indexes = (database.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'documents'",
+    ).all() as Array<{ name: string }>).map((row) => row.name);
+    database.close();
+    expect(ddl).toContain("'bitable'");
+    expect(indexes).toEqual(expect.arrayContaining([
+      'idx_documents_wiki_node_token',
+      'idx_documents_status',
+      'idx_documents_local_md_path',
+      'idx_documents_parent',
+      'idx_documents_sync_state',
+    ]));
+    // 影子表已清理
+    expect(ddl).not.toContain('documents_bitable_rebuild');
+    // DDL 外索引被抢救重放
+    expect(indexes).toContain('idx_documents_title_extra');
+
+    // 迁移后的库再次 initialize：守卫必须生效，不得二次重建（Major-1）
+    const secondRunLogs: string[] = [];
+    const originalInfo2 = console.info;
+    console.info = (...args: unknown[]) => {
+      secondRunLogs.push(args.map(String).join(' '));
+    };
+    try {
+      const store3 = new LocalMapStore(dbPath);
+      store3.initialize();
+      store3.upsertDocument(makeDocument({ objToken: 'bas3MigratedBitable2', objType: 'bitable' }));
+      expect(store3.getDocumentByObjToken('bas3MigratedBitable2')?.objType).toBe('bitable');
+      store3.close();
+    } finally {
+      console.info = originalInfo2;
+    }
+    expect(secondRunLogs.join('\n')).not.toContain('table rebuilt');
+  });
+});

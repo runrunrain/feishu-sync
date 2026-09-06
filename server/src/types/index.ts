@@ -235,7 +235,7 @@ export type SyncState =
 export interface CloudNodeObservation {
   objToken: string;
   wikiNodeToken: string;
-  objType: 'docx' | 'sheet' | 'slides' | 'unknown';
+  objType: 'docx' | 'sheet' | 'slides' | 'bitable' | 'unknown';
   title: string;
   spaceId: string | null;
   parentNodeToken: string | null;
@@ -250,7 +250,7 @@ export interface CloudNodeObservation {
 export interface DocumentRecord {
   objToken: string;
   wikiNodeToken: string | null;
-  objType: 'docx' | 'sheet' | 'slides' | 'unknown';
+  objType: 'docx' | 'sheet' | 'slides' | 'bitable' | 'unknown';
   title: string;
   localMdPath: string;
   lastSyncedModifyTime: string;
@@ -388,7 +388,7 @@ export interface SheetSheetRecord {
 
 export interface ChangedDocument {
   objToken: string;
-  objType: 'docx' | 'sheet' | 'slides' | 'unknown';
+  objType: 'docx' | 'sheet' | 'slides' | 'bitable' | 'unknown';
   title: string;
   changeType: 'modified' | 'added' | 'deleted';
   cloudModifiedTime: string;
@@ -513,7 +513,7 @@ export interface FeishuPendingItem {
 export interface PlannedSyncDocument {
   objToken: string;
   title: string;
-  objType: 'docx' | 'sheet' | 'slides' | 'unknown';
+  objType: 'docx' | 'sheet' | 'slides' | 'bitable' | 'unknown';
   changeType: 'modified' | 'added' | 'deleted';
   action: 'create' | 'replace' | 'blocked' | 'move';
   localMdPath: string | null;
@@ -647,7 +647,7 @@ export interface MappingNode {
   obj_token: string;
   wiki_node_token: string | null;
   space_id: string | null;
-  obj_type: 'docx' | 'sheet' | 'slides' | 'unknown';
+  obj_type: 'docx' | 'sheet' | 'slides' | 'bitable' | 'unknown';
   title: string;
   /**
    * Portable POSIX path relative to knowledge_base_root.

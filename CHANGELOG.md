@@ -6,6 +6,19 @@
 
 ---
 
+## [0.3.34] - 2026-09-07
+
+### Added（feat）
+
+- **多维表格（bitable）完整同步**：此前 bitable 文档被折叠为 unknown，同步产物仅元数据占位（docs+fetch 对非 docx 报 3380002）。现新增独立分型管线，100% 落地云端内容：数据表清单、字段 schema（select 全选项/date 格式/link 目标表）、全部记录（offset 翻页拉全，单表 5 万条保险丝 + 截断透明标注）、视图清单、附件文件（base 专用下载通道落 `attachments/`）、每表原始 CSV（`<doc名>.csv-data/`，与 sheet 同约定）、dashboard/workflow/form 元数据 JSON 存档（`<doc名>.base-meta/`）。确定性渲染零 LLM（数据保真优先），字段类型全矩阵覆盖（含 link 两遍解析为可读标题、附件软降级标注）。
+- **documents 表 CHECK 约束受控迁移**：存量库 `obj_type` CHECK 不含 bitable，SQLite 无法原地改 CHECK，启动时事务内受控重建（影子表 → 显式列拷贝 → DROP/RENAME → 索引恢复 + DDL 外索引抢救重放），幂等守卫 + 缺列安全跳过。
+
+### Security（fix）
+
+- **附件路径纵深防御**：附件名派生扩展名白名单校验（不合法退化 .bin）、fileToken 清洗后再拼接临时下载目录，杜绝云端恶意命名向 staging 外写盘。
+
+---
+
 ## [0.3.33] - 2026-09-04
 
 ### Fixed（fix）

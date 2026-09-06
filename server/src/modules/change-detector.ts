@@ -1609,12 +1609,18 @@ export class ChangeDetector {
 
   /**
    * Coerce lark-cli obj_type to the ChangedDocument-allowed union.
-   * Unknown / mindnote / file / bitable collapse to 'unknown'.
+   * Unknown / mindnote / file collapse to 'unknown'.
+   *
+   * bitable（2026-10）放行：多维表格由 BitableExporter 完整导出（数据
+   * 表/字段 schema/全部记录/视图/附件/自动化元数据）。历史行为是折叠为
+   * unknown → docs+fetch 被拒（code 3380002）→ 只落元数据占位。
    */
   private normalizeObjType(
     raw: LarkCliNodeInfo['obj_type']
   ): ChangedDocument['objType'] {
-    if (raw === 'docx' || raw === 'sheet' || raw === 'slides') return raw;
+    if (raw === 'docx' || raw === 'sheet' || raw === 'slides' || raw === 'bitable') {
+      return raw;
+    }
     return 'unknown';
   }
 

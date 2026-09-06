@@ -31,6 +31,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import { SyncEngine } from '../src/modules/sync-engine.js';
 import { IndexScanner } from '../src/modules/index-scanner.js';
+import { ChangeDetector } from '../src/modules/change-detector.js';
 import type { ChangedDocument, DocumentRecord } from '../src/types/index.js';
 
 // ----- Structural types mirroring SyncEngine's private interfaces -------
@@ -38,7 +39,7 @@ import type { ChangedDocument, DocumentRecord } from '../src/types/index.js';
 // mirror their shapes here so the typed cast below stays compile-checked.
 interface HeaderMetaLike {
   objToken: string;
-  objType: 'docx' | 'sheet' | 'slides' | 'unknown';
+  objType: 'docx' | 'sheet' | 'slides' | 'bitable' | 'unknown';
   wikiNodeToken: string | null;
   spaceId: string | null;
   originalLink: string | null;
@@ -748,3 +749,216 @@ describe('SyncEngine.generateHtmlHeader <-> IndexScanner.parseMetadata round tri
     }
   });
 });
+
+// =========================================================================
+// bitable (多维表格) 分型接入 — 2026-10 完整同步
+//
+// 覆盖验收项：
+//   (a) generateHtmlHeader emits obj_type: bitable（具体类型不再折叠）
+//   (b) header round-trips through the REAL IndexScanner.parseMetadata
+//   (c) syncDocuments(bitable) 不调 docs+fetch（mock 里 fetchDocumentMarkdown
+//       一旦被调用即抛错），走 BitableExporter 确定性导出，md/CSV/base-meta/
+//       附件全部原子提交，DB 基线推进
+//   (d) ChangeDetector.normalizeObjType 放行 bitable
+// =========================================================================
+describe('SyncEngine — bitable pipeline', () => {
+  it('generateHtmlHeader: emits obj_type: bitable and round-trips via IndexScanner.parseMetadata', () => {
+    const { engine } = makeEngine();
+    const header = internals(engine).generateHtmlHeader({
+      objToken: 'bas3cnRoundTrip',
+      objType: 'bitable',
+      wikiNodeToken: 'wikicnTest123',
+      spaceId: 'spaceTest456',
+      originalLink: 'https://qcnbafdrjx7n.feishu.cn/wiki/wikicnTest123',
+      fetchDate: '2026-10-08T09:00:00.000Z',
+      lastSyncedModifyTime: '2026-10-08T10:00:00.000Z',
+    });
+    expect(header).toContain('  obj_type: "bitable"');
+
+    const md = `${header}# 多维表格正文\n`;
+    const meta = scanner.parseMetadata(md);
+    expect(meta).not.toBeNull();
+    expect(meta!.header_format).toBe('yaml_html');
+    // round-trip：写出的 bitable 必须被扫描器读回 bitable（索引不降级）
+    expect(meta!.obj_type).toBe('bitable');
+    expect(meta!.obj_token).toBe('bas3cnRoundTrip');
+  });
+
+  it('syncDocuments(bitable): skips docs+fetch, exports deterministically, commits md+csv+meta+attachment, advances baseline', async () => {
+    const kbRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'sync-bitable-kb-'));
+    const opDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sync-bitable-ops-'));
+    try {
+      const store = new BitablePipelineStore();
+      // fetchDocumentMarkdown 被调用即炸：bitable 绝不能走 docs+fetch
+      // （历史 3380002 教训）。
+      const larkCliClient = new BitableMockClient();
+      const engine = new SyncEngine({
+        larkCliClient,
+        localMapStore: store,
+        config: {
+          knowledgeBaseRoot: kbRoot,
+          operationManifestDir: opDir,
+          watchedRoots: [],
+          watchedRootUrls: [],
+        },
+      } as any);
+
+      const doc: ChangedDocument = {
+        objToken: 'bas3cnPipeline1',
+        objType: 'bitable',
+        title: '多维表格测试',
+        changeType: 'added',
+        cloudModifiedTime: '2026-10-08T10:00:00.000Z',
+        localSyncedTime: null,
+        localMdPath: path.join(kbRoot, '多维表格测试.md'),
+        observedObjEditTime: 1759946400,
+      };
+
+      const result = await engine.syncDocuments([doc], {
+        enableLLM: false,
+        fullSync: false,
+        apply: true,
+        confirmation: 'APPLY',
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.failedDocuments.length).toBe(0);
+      expect(result.syncedDocuments.length).toBe(1);
+      // 附件计数来自 exporter（1 成功 / 1 失败软降级）
+      expect(result.syncedDocuments[0].attachmentsCount).toBe(1);
+
+      // docs+fetch 从未被调用（mock 内部 throw 会炸掉整个 sync）
+      expect(larkCliClient.fetchDocumentMarkdownCalls).toBe(0);
+
+      // md 落盘：header obj_type=bitable + 数据表章节 + CSV 链接
+      const mdPath = path.join(kbRoot, '多维表格测试.md');
+      expect(fs.existsSync(mdPath)).toBe(true);
+      const md = fs.readFileSync(mdPath, 'utf-8');
+      expect(md).toContain('obj_type: "bitable"');
+      expect(md).toContain('## 数据表: 主数据表');
+      expect(md).toContain('[CSV 原始数据](多维表格测试.csv-data/主数据表.csv)');
+
+      // round-trip：落盘 header 被 IndexScanner 读回 bitable
+      const parsed = scanner.parseMetadata(md);
+      expect(parsed!.obj_type).toBe('bitable');
+      expect(parsed!.obj_token).toBe('bas3cnPipeline1');
+
+      // CSV 与 base 元数据随 md 原子提交
+      const csvPath = path.join(kbRoot, '多维表格测试.csv-data', '主数据表.csv');
+      expect(fs.existsSync(csvPath)).toBe(true);
+      expect(fs.readFileSync(csvPath, 'utf-8')).toContain('recBT1');
+      const metaPath = path.join(kbRoot, '多维表格测试.base-meta', 'dashboards.json');
+      expect(fs.existsSync(metaPath)).toBe(true);
+
+      // 附件提交到 attachments/
+      const attPath = path.join(kbRoot, 'attachments', '01-说明图.png');
+      expect(fs.existsSync(attPath)).toBe(true);
+
+      // DB 基线推进
+      expect(store.upserted[0].objType).toBe('bitable');
+      expect(store.markSyncedCalls.length).toBe(1);
+      expect(store.markSyncedCalls[0].objToken).toBe('bas3cnPipeline1');
+      expect(store.markSyncedCalls[0].syncedObjEditTime).toBe(1759946400);
+    } finally {
+      fs.rmSync(kbRoot, { recursive: true, force: true });
+      fs.rmSync(opDir, { recursive: true, force: true });
+    }
+  });
+
+  it('ChangeDetector.normalizeObjType passes bitable through (no unknown collapse)', () => {
+    const detector = new ChangeDetector({} as any, {} as any);
+    const normalize = (detector as unknown as {
+      normalizeObjType(raw: string): string;
+    }).normalizeObjType.bind(detector);
+    expect(normalize('bitable')).toBe('bitable');
+    expect(normalize('docx')).toBe('docx');
+    expect(normalize('sheet')).toBe('sheet');
+    expect(normalize('slides')).toBe('slides');
+    // mindnote / file / 其他仍折叠 unknown（不支持导出的类型保持原行为）
+    expect(normalize('mindnote')).toBe('unknown');
+    expect(normalize('file')).toBe('unknown');
+  });
+});
+
+/** syncDocuments 全链路所需的最小 LocalMapStore 替身。 */
+class BitablePipelineStore extends MockLocalMapStore {
+  upserted: Array<Record<string, unknown>> = [];
+  markSyncedCalls: Array<Record<string, unknown>> = [];
+  upsertDocument(record: DocumentRecord): void {
+    this.upserted.push({ ...record });
+  }
+  markDocumentSynced(input: Record<string, unknown>): void {
+    this.markSyncedCalls.push({ ...input });
+  }
+  logSync(): void {
+    /* syncDocuments 收尾日志，无需落盘 */
+  }
+}
+
+/**
+ * bitable 全链路 mock：只实现 base 面；fetchDocumentMarkdown 一旦被调用
+ * 立即抛错并计数——它是「绝不能被调用」的哨兵。
+ */
+class BitableMockClient {
+  fetchDocumentMarkdownCalls = 0;
+
+  async fetchDocumentMarkdown(): Promise<never> {
+    this.fetchDocumentMarkdownCalls += 1;
+    throw new Error('bitable 绝不能走 docs+fetch（3380002）');
+  }
+
+  async listBaseTables() {
+    return { data: { items: [{ table_id: 'tblBT', name: '主数据表' }], has_more: false } };
+  }
+
+  async listBaseFields() {
+    return {
+      data: {
+        items: [
+          { field_id: 'fld_bt1', field_name: '名称', type: 'text', is_primary: true },
+          { field_id: 'fld_bt2', field_name: '附件', type: 'attachment' },
+        ],
+        has_more: false,
+      },
+    };
+  }
+
+  async listBaseViews() {
+    return { data: { views: [{ view_id: 'viwBT', view_name: '全部', view_type: 'grid' }], has_more: false } };
+  }
+
+  async listBaseRecords() {
+    return {
+      data: {
+        items: [
+          {
+            record_id: 'recBT1',
+            fields: {
+              名称: [{ type: 'text', text: '配置项 A' }],
+              附件: [{ file_token: 'btftok1', name: '说明图.png' }],
+            },
+          },
+        ],
+        has_more: false,
+      },
+    };
+  }
+
+  async downloadBaseAttachment(options: { fileToken: string; outputDir: string }) {
+    const target = path.join(options.outputDir, '说明图.png');
+    fs.writeFileSync(target, 'bitable-attachment-bytes', 'utf-8');
+    return { ok: true, data: { saved_path: target } };
+  }
+
+  async listBaseDashboards() {
+    return { data: { items: [{ id: 'dash1' }] } };
+  }
+
+  async listBaseWorkflows() {
+    return { data: { items: [] } };
+  }
+
+  async listBaseForms() {
+    return { data: { items: [] } };
+  }
+}
