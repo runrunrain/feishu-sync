@@ -17,6 +17,12 @@
  * slides-XML presentation adapter that the custom-folder flow does not own.
  * The route returns unsupported_type for it instead of degrading to a
  * metadata placeholder.
+ *
+ * Bitable (2026-11, mirrors SyncEngine's 2026-10 pipeline): the quick-add
+ * flow now archives multi-dimensional tables via BitableExporter — zero
+ * docs+fetch (lark-cli 3380002 rejects it), zero LLM, zero
+ * LayoutReconstructor; markdown/CSVs/base-meta/attachments are exported
+ * deterministically from the base APIs.
  */
 
 import fs from 'node:fs';
@@ -47,6 +53,7 @@ import {
   type SheetMediaItem,
 } from './sheet-media.js';
 import type { DocumentIR } from './document-ir.js';
+import { BitableExporter, type BitableClient } from './bitable-exporter.js';
 import { LarkCliError } from './lark-cli-client.js';
 
 export interface SyncDocxToCustomFolderInput {
@@ -493,6 +500,162 @@ export async function syncSheetToCustomFolder(
     // Best-effort cleanup of the temp csv dir; committed files live in the KB.
     try {
       fs.rmSync(csvTemp, { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+  }
+}
+
+export interface SyncBitableToCustomFolderInput {
+  /** LarkCliClient instance (public methods only; the BitableClient face). */
+  larkCliClient: BitableClient;
+  knowledgeBaseRoot: string;
+  /** Optional operation staging root override; defaults to ~/.feishu-sync/operations. */
+  operationDirectory?: string;
+  /** Absolute final markdown path inside the knowledge base. */
+  localMdPath: string;
+  objToken: string;
+  wikiNodeToken: string | null;
+  title: string;
+  originalLink: string | null;
+  objEditTime: number | null;
+  spaceId: string | null;
+}
+
+export interface SyncBitableResult {
+  localMdPath: string;
+  localRelPath: string;
+  tablesCount: number;
+  imagesCount: number;
+  attachmentsCount: number;
+  committedFiles: string[];
+  commitPlan: AtomicCommitPlan;
+}
+
+/**
+ * Export a bitable (multi-dimensional table) base into a temp staging area
+ * via BitableExporter, then commit the rendered markdown + per-table CSVs +
+ * base-meta JSON + attachments atomically into the knowledge base.
+ *
+ * Mirrors SyncEngine's bitable path: docs+fetch is never called (lark-cli
+ * code 3380002 rejects the type), the body markdown is BitableExporter's
+ * deterministic projection of the base APIs, and the export throws (never
+ * a partial archive) when table-list / field-list / record-list fail.
+ *
+ * Throws LarkCliError for Feishu-side failures (permission/upstream) so the
+ * caller can classify them; other errors map to fetch_failed.
+ */
+export async function syncBitableToCustomFolder(
+  input: SyncBitableToCustomFolderInput,
+): Promise<SyncBitableResult> {
+  const root = path.resolve(input.knowledgeBaseRoot);
+  const relativeMd =
+    toPortableRelative(root, input.localMdPath) ?? path.basename(input.localMdPath);
+  const docname = path.basename(input.localMdPath, '.md');
+  const docDirRel = relativeMd.includes('/')
+    ? relativeMd.slice(0, relativeMd.lastIndexOf('/'))
+    : '';
+
+  // 1. Deterministic full export into an OS temp dir (never the KB): the
+  //    exporter lays down markdown, <docname>.csv-data/*.csv,
+  //    <docname>.base-meta/*.json and attachments/ under stagingDocDir and
+  //    returns POSIX paths relative to it.
+  const stageTemp = fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-custom-bitable-'));
+  try {
+    const exporter = new BitableExporter(input.larkCliClient);
+    const exported = await exporter.exportBitable({
+      baseToken: input.objToken,
+      title: input.title,
+      stagingDocDir: stageTemp,
+      docname,
+    });
+
+    // 2. DocumentIR: the exporter markdown already carries the H1 title,
+    //    per-table sections and CSV/attachment relative links, so
+    //    renderDocumentMarkdown only prepends the feishu_sync header (the
+    //    objType=bitable branch skips sheet-section synthesis). Attachments
+    //    ride ir.attachments so the renderer's requiredRelativePaths
+    //    validation covers them; CSVs / base-meta JSON ride the extraFiles
+    //    channel, exactly like SyncEngine's bitable integration.
+    const ir: DocumentIR = {
+      objToken: input.objToken,
+      wikiNodeToken: input.wikiNodeToken,
+      spaceId: input.spaceId,
+      objType: 'bitable',
+      title: input.title,
+      originalLink: input.originalLink,
+      observedObjEditTime: input.objEditTime,
+      bodyMarkdown: exported.markdown,
+      images: [],
+      attachments: exported.attachments.map((att) => ({
+        relativePath: att.relativePath,
+        name: att.name,
+        token: att.token,
+      })),
+      sheets: [],
+    };
+
+    const extraFiles: Array<{ relativePath: string; absoluteSource: string }> = [];
+    for (const file of exported.commitFiles) {
+      extraFiles.push({
+        relativePath: docDirRel
+          ? `${docDirRel}/${file.relativePath}`
+          : file.relativePath,
+        absoluteSource: file.absolutePath,
+      });
+    }
+    for (const att of exported.attachments) {
+      extraFiles.push({
+        relativePath: docDirRel
+          ? `${docDirRel}/${att.relativePath}`
+          : att.relativePath,
+        absoluteSource: att.absolutePath,
+      });
+    }
+
+    const operationDirectory = resolveOperationDirectory(
+      root,
+      input.operationDirectory,
+    );
+    const operationId = `custom-${input.objToken.slice(0, 12)}-${Date.now()}`;
+
+    const commit = commitDocumentContent({
+      operationId,
+      knowledgeBaseRoot: root,
+      operationDirectory,
+      localMdPath: input.localMdPath,
+      ir,
+      extraFiles,
+    });
+    if (!commit.ok) {
+      throw new Error(commit.error || '自定义归档多维表格写入失败');
+    }
+
+    const committedFiles: string[] = [input.localMdPath];
+    for (const file of exported.commitFiles) {
+      committedFiles.push(
+        path.join(path.dirname(input.localMdPath), ...file.relativePath.split('/')),
+      );
+    }
+    for (const att of exported.attachments) {
+      committedFiles.push(
+        path.join(path.dirname(input.localMdPath), ...att.relativePath.split('/')),
+      );
+    }
+
+    return {
+      localMdPath: input.localMdPath,
+      localRelPath: relativeMd,
+      tablesCount: exported.sections.length,
+      imagesCount: 0,
+      attachmentsCount: exported.attachments.length,
+      committedFiles,
+      commitPlan: commit.plan,
+    };
+  } finally {
+    // Best-effort cleanup of the temp staging dir; committed files live in the KB.
+    try {
+      fs.rmSync(stageTemp, { recursive: true, force: true });
     } catch {
       // ignore
     }

@@ -794,10 +794,13 @@ export class BitableExporter {
       tableEntries = page.items;
       tablesTruncated = page.truncated;
     } catch (error) {
+      // cause 保留底层 LarkCliError（permission/upstream 分类），供调用方
+      // （如 custom-folders 快捷归档的 classifyLinkError）沿 cause 链识别。
       throw new Error(
         `bitable 数据表清单读取失败 (${baseToken}): ${
           error instanceof Error ? error.message : String(error)
         }`,
+        { cause: error },
       );
     }
     if (tablesTruncated) {
@@ -835,11 +838,13 @@ export class BitableExporter {
           .filter((field): field is BitableField => field !== null);
         if (page.truncated) warnings.push(`表 "${tableName}" 字段数达到上限，已截断`);
       } catch (error) {
-        // 字段 schema 是记录渲染的必要输入，缺失即数据不完整 → 硬失败。
+        // 字段 schema 是记录渲染的必要输入，缺失即数据不完整 → 硬失败
+        // （cause 保留底层 LarkCliError 分类，同上）。
         throw new Error(
           `bitable 字段读取失败: 表 "${tableName}" (${tableId}): ${
             error instanceof Error ? error.message : String(error)
           }`,
+          { cause: error },
         );
       }
 
@@ -880,11 +885,13 @@ export class BitableExporter {
           .filter((record): record is BitableRecord => record !== null);
         truncated = page.truncated;
       } catch (error) {
-        // 记录不完整绝不推进 synced 基线 → 硬失败。
+        // 记录不完整绝不推进 synced 基线 → 硬失败（cause 保留底层
+        // LarkCliError 分类，同上）。
         throw new Error(
           `bitable 记录读取失败: 表 "${tableName}" (${tableId}): ${
             error instanceof Error ? error.message : String(error)
           }`,
+          { cause: error },
         );
       }
       if (truncated) {

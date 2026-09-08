@@ -31,6 +31,7 @@ import { LarkCliError } from '../modules/lark-cli-client.js';
 import {
   syncDocxToCustomFolder,
   syncSheetToCustomFolder,
+  syncBitableToCustomFolder,
 } from '../modules/custom-doc-sync.js';
 import {
   rollbackAtomicPlan,
@@ -66,8 +67,12 @@ function serializeArchive<T>(fn: () => Promise<T>): Promise<T> {
 
 const MAX_FOLDER_NAME_LENGTH = 100;
 const MAX_LINKS_PER_REQUEST = 20;
-/** Quick-add archivable obj types: docx (docs+fetch) and sheet (workbook-info + csv-get + LayoutReconstructor, via custom-doc-sync). Slides is still rejected. */
-const SUPPORTED_DOC_TYPES = new Set<'docx' | 'sheet'>(['docx', 'sheet']);
+/**
+ * Quick-add archivable obj types: docx (docs+fetch), sheet (workbook-info +
+ * csv-get + LayoutReconstructor) and bitable (BitableExporter deterministic
+ * base export), all via custom-doc-sync. Slides is still rejected.
+ */
+const SUPPORTED_DOC_TYPES = new Set<'docx' | 'sheet' | 'bitable'>(['docx', 'sheet', 'bitable']);
 const STRUCTURE_TREE_LABEL = '已在同步结构树';
 
 // ---------------------------------------------------------------------------
@@ -186,14 +191,23 @@ function classifyLinkError(error: unknown): {
   code: 'parse_failed' | 'fetch_failed' | 'permission_denied';
   message: string;
 } {
-  if (error instanceof LarkCliError) {
-    if (error.code === 'permission') {
-      return { code: 'permission_denied', message: error.message };
+  // BitableExporter's hard failures wrap the underlying LarkCliError in a
+  // plain Error (message prefixed with the failing stage) while preserving
+  // it as `cause` — walk that chain so a permission/upstream classification
+  // survives instead of degrading to fetch_failed. Depth-capped to dodge
+  // pathological cause cycles.
+  let candidate: unknown = error;
+  for (let depth = 0; depth < 5 && candidate instanceof Error; depth += 1) {
+    if (candidate instanceof LarkCliError) {
+      if (candidate.code === 'permission') {
+        return { code: 'permission_denied', message: candidate.message };
+      }
+      if (candidate.code === 'parse') {
+        return { code: 'parse_failed', message: candidate.message };
+      }
+      return { code: 'fetch_failed', message: candidate.message };
     }
-    if (error.code === 'parse') {
-      return { code: 'parse_failed', message: error.message };
-    }
-    return { code: 'fetch_failed', message: error.message };
+    candidate = (candidate as { cause?: unknown }).cause;
   }
   const message = error instanceof Error ? error.message : String(error);
   return { code: 'fetch_failed', message };
@@ -228,21 +242,26 @@ function isAllowedFeishuHost(url: string): boolean {
  * identity, or null when the URL is not a recognizable cloud-doc link (wiki
  * links, bare tokens, unrelated URLs).
  *
- * sheets/slides are surfaced so the caller can emit a clearer
- * unsupported_type message; docx and sheet have export fallbacks (docx via
- * docs+fetch, sheet via workbook-info + csv-get), slides does not.
+ * sheets/slides/base are surfaced so the caller can emit a clearer
+ * unsupported_type message; docx, sheet and bitable have export fallbacks
+ * (docx via docs+fetch, sheet via workbook-info + csv-get, bitable via the
+ * BitableExporter base pipeline), slides does not.
  */
 function parseCloudDocUrl(url: string): {
   objToken: string;
-  objType: 'docx' | 'sheet' | 'slides';
+  objType: 'docx' | 'sheet' | 'slides' | 'bitable';
 } | null {
   const pathPart = url.split(/[?#]/)[0];
-  const match = pathPart.match(/\/(docx|sheets|slides)\/([A-Za-z0-9_-]+)/);
+  const match = pathPart.match(/\/(docx|sheets|slides|base)\/([A-Za-z0-9_-]+)/);
   if (!match) return null;
   const kind = match[1];
   const token = match[2];
   if (!token) return null;
-  const objType = kind === 'docx' ? 'docx' : kind === 'sheets' ? 'sheet' : 'slides';
+  const objType =
+    kind === 'docx' ? 'docx'
+      : kind === 'sheets' ? 'sheet'
+        : kind === 'base' ? 'bitable'
+          : 'slides';
   return { objToken: token, objType };
 }
 
@@ -255,7 +274,7 @@ function parseCloudDocUrl(url: string): {
  */
 function looksLikeCloudDocUrl(url: string): boolean {
   const pathPart = url.split(/[?#]/)[0];
-  return /\/(?:docx|sheets|slides)\//.test(pathPart);
+  return /\/(?:docx|sheets|slides|base)\//.test(pathPart);
 }
 
 /** Extract a human title from a docs+fetch result, if one is present. */
@@ -607,6 +626,22 @@ async function processOneLink(ctx: LinkContext): Promise<LinkResult> {
           obj_edit_time: null,
           has_child: false,
         };
+      } else if (parsed.objType === 'bitable') {
+        // Pure base URL (not in any wiki space). Same identity story as
+        // sheets: no wiki node to consult, docs+fetch would reject the type
+        // (3380002), and BitableExporter synthesizes the whole document from
+        // the base APIs, so a token-tail title is enough (readability is
+        // restored later by the shared rename flows). Existence/permission
+        // of the base surfaces at export time via the first table-list call.
+        node = {
+          obj_token: parsed.objToken,
+          obj_type: 'bitable',
+          title: tokenTail(parsed.objToken),
+          node_token: null,
+          space_id: null,
+          obj_edit_time: null,
+          has_child: false,
+        };
       } else {
         return {
           link: linkStr,
@@ -615,7 +650,7 @@ async function processOneLink(ctx: LinkContext): Promise<LinkResult> {
           objType: parsed.objType,
           error: {
             code: 'unsupported_type',
-            message: `暂不支持归档纯云文档类型 ${parsed.objType}，当前仅支持 docx / sheet`,
+            message: `暂不支持归档纯云文档类型 ${parsed.objType}，当前仅支持 docx / sheet / bitable`,
           },
         };
       }
@@ -674,7 +709,7 @@ async function processOneLink(ctx: LinkContext): Promise<LinkResult> {
     };
   }
 
-  // 3. Type gate: docx and sheet are supported by the quick-add pipeline.
+  // 3. Type gate: docx / sheet / bitable are supported by the quick-add pipeline.
   if (!SUPPORTED_DOC_TYPES.has(objType)) {
     return {
       link: linkStr,
@@ -684,7 +719,7 @@ async function processOneLink(ctx: LinkContext): Promise<LinkResult> {
       objType,
       error: {
         code: 'unsupported_type',
-        message: `暂不支持归档类型 ${objType}，当前仅支持 docx / sheet`,
+        message: `暂不支持归档类型 ${objType}，当前仅支持 docx / sheet / bitable（多维表格）`,
       },
     };
   }
@@ -721,6 +756,8 @@ async function processOneLink(ctx: LinkContext): Promise<LinkResult> {
   try {
     // sheet cannot go through docs+fetch (lark-cli 3380002 rejects it): its
     // body is synthesized from sub-sheet CSVs via the workbook pipeline.
+    // bitable likewise: BitableExporter renders it deterministically from
+    // the base APIs (custom-doc-sync mirrors SyncEngine's bitable path).
     const syncResult = objType === 'sheet'
       ? await syncSheetToCustomFolder({
           larkCliClient: ctx.larkCliClient,
@@ -734,6 +771,19 @@ async function processOneLink(ctx: LinkContext): Promise<LinkResult> {
           objEditTime: node.obj_edit_time ?? null,
           spaceId: node.space_id ?? null,
         })
+      : objType === 'bitable'
+        ? await syncBitableToCustomFolder({
+            larkCliClient: ctx.larkCliClient,
+            knowledgeBaseRoot: ctx.knowledgeBaseRoot,
+            operationDirectory: ctx.operationDirectory,
+            localMdPath,
+            objToken,
+            wikiNodeToken: null,
+            title,
+            originalLink: linkStr,
+            objEditTime: node.obj_edit_time ?? null,
+            spaceId: node.space_id ?? null,
+          })
       : await syncDocxToCustomFolder({
           larkCliClient: ctx.larkCliClient,
           knowledgeBaseRoot: ctx.knowledgeBaseRoot,

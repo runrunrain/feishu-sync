@@ -6,6 +6,17 @@
 
 ---
 
+## [0.3.36] - 2026-09-08
+
+### Added（feat）
+
+- **自定义归档支持多维表格（bitable）**：快捷添加文档支持归档飞书多维表格（bitable）。支持识别 `/base/` 纯云文档链接与包含 bitable 的 wiki 链接，基于 `BitableExporter` 确定性流水线全量导出数据表、字段定义、视图、全部记录（ndjson 保真通道）、每表 CSV 数据文件与附件，并以原子提交写入 `_custom/<文件夹>/`。
+- **跨视图共享「立即检测」运行态（状态互斥与防重入）**：总览 GlobalStatusBar 与同步页 ChangeListPanel 的「立即检测」是同一任务的两个入口（主视图常驻挂载、切换仅 hidden，两个按钮同时存活）。引入 `syncEvents` 跨视图共享的 `detect-running` 广播与 `useDetectRunning` hook：任一入口发起检测后，两个按钮同步置灰并显示检测中，点击回调内增加 `isDetectRunning()` 双保险互斥，杜绝并发云端遍历；同时优化 ChangeListPanel 的 reloadSignal 与 onDiffChanged 的 guard 判定（使用组件内部重入标记而非共享态），确保总览入口触发的广播能正常驱动列表刷新。
+- **归档错误识别透传底层原因**：BitableExporter 错误抛出保留底层 cause，`classifyLinkError` 沿 cause 链识别 LarkCliError 分类（权限不足、解析失败、网络错误），避免权限不足被误报为普通拉取失败。
+- **界面优化**：QuickAddDocDialog 快捷添加弹窗文案更新，支持 bitable 图标与多维表格链接提示；EmptyState 支持传入 `action.disabled`。
+
+---
+
 ## [0.3.35] - 2026-09-07
 
 ### Fixed（fix）

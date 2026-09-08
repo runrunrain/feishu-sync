@@ -50,6 +50,8 @@ interface SyncStatusData {
   pendingCount: number;
   lastSyncTime: number | null;
   nextCheckTime: number | null;
+  /** @deprecated 恒 false（本 hook 从不推进检测运行态）。跨视图共享的
+   *  「立即检测」运行态请用 hooks/useDetectRunning（syncEvents 广播）。 */
   isDetecting: boolean;
 }
 

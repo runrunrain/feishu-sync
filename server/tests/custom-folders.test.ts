@@ -87,6 +87,12 @@ interface FakeLarkCliOptions {
   sheetCsvFailIds?: Set<string>;
   /** objToken whose workbook-info should throw a permission error. */
   workbookPermissionTokens?: Set<string>;
+  /** objTokens accepted by the bitable base pipeline. When omitted every
+   * base token is accepted; when provided, any other token makes
+   * listBaseTables throw an upstream error. */
+  bitables?: Set<string>;
+  /** objTokens whose listBaseTables should throw a permission error. */
+  bitablePermissionTokens?: Set<string>;
 }
 
 function makeFakeLarkCli(options: FakeLarkCliOptions) {
@@ -155,6 +161,62 @@ function makeFakeLarkCli(options: FakeLarkCliOptions) {
       const target = `${outputPath}.png`;
       fs.writeFileSync(target, `fake-preview-${token}`);
       return target;
+    },
+    // bitable base 面：固定单表「主数据表」（1 字段 + 附件列 + 1 条记录），
+    // 形状对齐 BitableMockClient（sync-engine.test.ts）。
+    async listBaseTables(appToken: string): Promise<any> {
+      if (options.bitablePermissionTokens?.has(appToken)) {
+        throw new LarkCliError('无权限访问该多维表格', 'permission', false);
+      }
+      if (options.bitables && !options.bitables.has(appToken)) {
+        throw new LarkCliError('lark-cli 执行失败：网络错误', 'upstream', true);
+      }
+      return { data: { items: [{ table_id: 'tblCF', name: '主数据表' }], has_more: false } };
+    },
+    async listBaseFields(): Promise<any> {
+      return {
+        data: {
+          items: [
+            { field_id: 'fld_cf1', field_name: '名称', type: 'text', is_primary: true },
+            { field_id: 'fld_cf2', field_name: '附件', type: 'attachment' },
+          ],
+          has_more: false,
+        },
+      };
+    },
+    async listBaseViews(): Promise<any> {
+      return { data: { views: [{ view_id: 'viwCF', view_name: '全部', view_type: 'grid' }], has_more: false } };
+    },
+    async listBaseRecords(): Promise<any> {
+      return {
+        data: {
+          items: [
+            {
+              record_id: 'recCF1',
+              fields: {
+                名称: [{ type: 'text', text: '配置项 A' }],
+                附件: [{ file_token: 'cfattok1', name: '说明图.png' }],
+              },
+            },
+          ],
+          has_more: false,
+        },
+      };
+    },
+    async downloadBaseAttachment(dl: { fileToken: string; outputDir: string }): Promise<any> {
+      fs.mkdirSync(dl.outputDir, { recursive: true });
+      const target = path.join(dl.outputDir, '说明图.png');
+      fs.writeFileSync(target, 'cf-bitable-attachment-bytes', 'utf-8');
+      return { ok: true, data: { saved_path: target } };
+    },
+    async listBaseDashboards(): Promise<any> {
+      return { data: { items: [] } };
+    },
+    async listBaseWorkflows(): Promise<any> {
+      return { data: { items: [] } };
+    },
+    async listBaseForms(): Promise<any> {
+      return { data: { items: [] } };
     },
   };
 }
@@ -604,6 +666,80 @@ describe('custom-folder routes: add docs', () => {
     expect(row?.wikiNodeToken).toBeNull();
   });
 
+  it('archives a wiki bitable (multi-dimensional table): writes markdown + csv-data + attachment + bitable mapping row', async () => {
+    const folderId = await makeFolder('Archive');
+    const url = 'https://qcnbafdrjx7n.feishu.cn/wiki/IvDKwLt5eiH57bkw5J6cedPbnTh?table=tblxw63b95zhopVs&view=vew6GW3irX';
+    const larkCli = makeFakeLarkCli({
+      nodes: {
+        [url]: {
+          node_token: 'IvDKwLt5eiH57bkw5J6cedPbnTh',
+          obj_token: 'basCustomBase1',
+          obj_type: 'bitable',
+          title: '多维表格归档测试',
+          space_id: 'sp',
+          obj_edit_time: 1760000000,
+          has_child: false,
+        },
+      },
+      bitables: new Set(['basCustomBase1']),
+    });
+    const app = buildApp({ store, larkCli, knowledgeBaseRoot: kbRoot });
+    const res = await app.fetch(new Request(`http://x/api/custom-folders/${folderId}/docs`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ links: [url] }),
+    }));
+    const body = await res.json();
+    expect(body.results[0].ok).toBe(true);
+    expect(body.results[0].objToken).toBe('basCustomBase1');
+    expect(body.results[0].objType).toBe('bitable');
+    expect(body.results[0].title).toBe('多维表格归档测试');
+
+    // md 落盘：header obj_type=bitable（不再被拒为 unsupported_type），
+    // 正文含数据表章节与 CSV 相对链接。
+    const md = fs.readFileSync(path.join(kbRoot, '_custom/Archive/多维表格归档测试.md'), 'utf-8');
+    expect(md).toContain('obj_type: "bitable"');
+    expect(md).toContain('主数据表');
+    expect(md).toContain('多维表格归档测试.csv-data/主数据表.csv');
+    // 附属文件：每表 CSV + 附件（经 extraFiles 原子提交）。
+    expect(fs.existsSync(path.join(kbRoot, '_custom/Archive/多维表格归档测试.csv-data/主数据表.csv'))).toBe(true);
+    expect(fs.existsSync(path.join(kbRoot, '_custom/Archive/attachments/01-说明图.png'))).toBe(true);
+
+    // documents 行：objType=bitable，归档契约同 docx/sheet。
+    const row = store.getDocumentByObjToken('basCustomBase1');
+    expect(row?.objType).toBe('bitable');
+    expect(row?.customFolderId).toBe(folderId);
+    expect(row?.watchedRootUrl).toBeNull();
+    expect(row?.wikiNodeToken).toBeNull();
+    expect(row?.syncState).toBe('synced');
+    expect(row?.originalLink).toBe(url);
+  });
+
+  it('returns permission_denied when the bitable table-list rejects with permission', async () => {
+    const folderId = await makeFolder('Archive');
+    const larkCli = makeFakeLarkCli({
+      nodes: {
+        u: {
+          node_token: 'nBt', obj_token: 'basPermDenied', obj_type: 'bitable',
+          title: '无权 base', space_id: 's', obj_edit_time: 1, has_child: false,
+        },
+      },
+      bitablePermissionTokens: new Set(['basPermDenied']),
+    });
+    const app = buildApp({ store, larkCli, knowledgeBaseRoot: kbRoot });
+    const res = await app.fetch(new Request(`http://x/api/custom-folders/${folderId}/docs`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ links: ['u'] }),
+    }));
+    const body = await res.json();
+    expect(body.results[0].ok).toBe(false);
+    expect(body.results[0].error.code).toBe('permission_denied');
+    // 无部分归档落盘（目录仅随首次成功提交创建，失败路径下可不存在）。
+    const archiveDir = path.join(kbRoot, '_custom/Archive');
+    if (fs.existsSync(archiveDir)) {
+      expect(fs.readdirSync(archiveDir).length).toBe(0);
+    }
+  });
+
   it('a mid-workbook sheet export failure leaves no partial archive (fetch_failed, no files)', async () => {
     const folderId = await makeFolder('Archive');
     const larkCli = makeFakeLarkCli({
@@ -875,6 +1011,40 @@ describe('custom-folder routes: pure cloud-doc fallback', () => {
     expect(body.results[0].ok).toBe(false);
     expect(body.results[0].error.code).toBe('unsupported_type');
     expect(body.results[0].objType).toBe('slides');
+  });
+
+  it('archives a pure base URL (getNode 131005) via the BitableExporter pipeline, token-tail title', async () => {
+    const folderId = await makeFolder('Archive');
+    const objToken = 'bascnPureBase1';
+    const url = `https://feishu.cn/base/${objToken}`;
+    const larkCli = makeFakeLarkCli({
+      nodes: {},
+      nodeGetFailUrls: new Set([url]),
+      bitables: new Set([objToken]),
+    });
+    const app = buildApp({ store, larkCli, knowledgeBaseRoot: kbRoot });
+    const res = await app.fetch(new Request(`http://x/api/custom-folders/${folderId}/docs`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ links: [url] }),
+    }));
+    const body = await res.json();
+    expect(body.results[0].ok).toBe(true);
+    expect(body.results[0].objType).toBe('bitable');
+    expect(body.results[0].title).toBe(objToken.slice(-12));
+
+    const expected = path.join(kbRoot, '_custom/Archive', `${objToken.slice(-12)}.md`);
+    expect(fs.existsSync(expected)).toBe(true);
+    const written = fs.readFileSync(expected, 'utf-8');
+    expect(written).toContain('obj_type: "bitable"');
+    expect(written).toContain('主数据表');
+    // CSV 附属文件也随 base 流水线提交。
+    const csvDir = path.join(kbRoot, '_custom/Archive', `${objToken.slice(-12)}.csv-data`);
+    expect(fs.existsSync(path.join(csvDir, '主数据表.csv'))).toBe(true);
+
+    const row = store.getDocumentByObjToken(objToken);
+    expect(row?.objType).toBe('bitable');
+    expect(row?.customFolderId).toBe(folderId);
+    expect(row?.watchedRootUrl).toBeNull();
   });
 
   it('returns permission_denied when the pure-docx fetch rejects with permission', async () => {

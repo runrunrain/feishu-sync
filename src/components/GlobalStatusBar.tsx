@@ -14,9 +14,11 @@ import { useAuthStatus } from '../hooks/useAuthStatus';
 import { useSyncStatus } from '../hooks/useSyncStatus';
 import { useConfig } from '../hooks/useConfig';
 import { useChanges } from '../hooks/useChanges';
+import { useDetectRunning } from '../hooks/useDetectRunning';
 import { useToast } from './common/Toast';
 import { appLogger } from '../utils/appLogger';
 import { refreshMappingIndex, rebuildIndex } from '../api/client';
+import { isDetectRunning, setDetectRunning } from '../utils/syncEvents';
 import { isUsableWikiUrl, pickFirstValidWikiUrl } from '../utils/wikiUrl';
 
 function formatRelativeTime(timestamp: number | null): string {
@@ -40,12 +42,14 @@ function formatNextCheck(timestamp: number | null): string {
 export function GlobalStatusBar() {
   const { ready: authReady, authStatus } = useAuthStatus();
   const [refreshTick, setRefreshTick] = useState(0);
-  const { pendingCount, lastSyncTime, nextCheckTime, isDetecting } = useSyncStatus({ refreshTick });
+  const { pendingCount, lastSyncTime, nextCheckTime } = useSyncStatus({ refreshTick });
   const { config } = useConfig();
   const { detect, detectAll } = useChanges();
   const toast = useToast();
   const [refreshing, setRefreshing] = useState(false);
-  const [detecting, setDetecting] = useState(false);
+  // 跨视图共享运行态：与同步页 ChangeListPanel 的「立即检测」是同一任务
+  // 的两个入口，可点击状态必须同步（另一入口检测中时这里也置灰）。
+  const detecting = useDetectRunning();
 
   const activeRootUrl = pickFirstValidWikiUrl(config?.watchedRootUrls);
   const urlUnconfigured = !activeRootUrl && (config?.watchedRootUrls?.length ?? 0) === 0;
@@ -59,7 +63,11 @@ export function GlobalStatusBar() {
 
   const handleDetect = async () => {
     if (!isUsableWikiUrl(activeRootUrl)) return;
-    setDetecting(true);
+    // 跨入口互斥：同步页 ChangeListPanel 的「立即检测」与这里是同一任务
+    // 的两个入口；任一入口运行中时忽略本次点击（按钮已被共享态置灰，
+    // 这里是双保险，覆盖点击瞬间的竞态）。
+    if (isDetectRunning()) return;
+    setDetectRunning(true, 'global-status-bar');
     try {
       // v0.2.0 sync-state-timeout-fix: the status bar's detect button
       // used to fire detectChanges(firstRootUrl), which only refreshed
@@ -82,7 +90,7 @@ export function GlobalStatusBar() {
       // status-bar counter in lockstep with ChangeListPanel's diff.
       setRefreshTick((n) => n + 1);
     } finally {
-      setDetecting(false);
+      setDetectRunning(false, 'global-status-bar');
     }
   };
 
@@ -189,13 +197,13 @@ export function GlobalStatusBar() {
         <div className="flex items-center gap-1.5 text-xs text-ink-faint font-sans-ui shrink-0">
           <Clock className="w-3 h-3" />
           <span>上次 {formatRelativeTime(lastSyncTime)}</span>
-          {!isDetecting && nextCheckTime && (
+          {!detecting && nextCheckTime && (
             <>
               <span aria-hidden>·</span>
               <span>下次 {formatNextCheck(nextCheckTime)}</span>
             </>
           )}
-          {isDetecting && (
+          {detecting && (
             <span className="text-seal flex items-center gap-1">
               <RefreshCw className="w-3 h-3 animate-spin" />
               检测中
@@ -225,8 +233,8 @@ export function GlobalStatusBar() {
           title={detectTooltip}
           className="inline-flex items-center gap-1 px-3 py-1 text-xs text-seal border border-seal rounded bg-paper hover:bg-seal/5 font-sans-ui transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
         >
-          <RefreshCw className={`w-3 h-3 ${detecting || isDetecting ? 'animate-spin' : ''}`} />
-          {detecting || isDetecting ? '检测中' : '立即检测'}
+          <RefreshCw className={`w-3 h-3 ${detecting ? 'animate-spin' : ''}`} />
+          {detecting ? '检测中' : '立即检测'}
         </button>
       </div>
     </div>

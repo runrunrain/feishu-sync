@@ -4,7 +4,7 @@
  * 入口：Dashboard 左侧树区域顶部「+ 添加」按钮。
  *
  * 模式一「零散云文档」（原有能力）：
- *   1. 多行文本框粘贴飞书链接（每行一个，docx/sheet/slides/wiki 链接原样透传后端解析）
+ *   1. 多行文本框粘贴飞书链接（每行一个，docx/sheet/bitable/wiki 链接原样透传后端解析）
  *   2. 选择目标自定义文件夹，或切换「新建文件夹」输入名称（先 POST 创建再作为目标）
  *   3. 确认 → POST /api/custom-folders/:id/docs（前端先校验 ≤20 条）
  *   4. 逐条结果反馈：成功 / already_exists（附归属）/ unsupported_type /
@@ -40,7 +40,7 @@ const INVALID_NAME_CHARS = /[/\\:*?"<>|\u0000-\u001f]/;
 const LINK_ERROR_TEXT: Record<string, string> = {
   parse_failed: '链接无法解析，请确认是飞书云文档或知识库链接',
   already_exists: '文档已在库中',
-  unsupported_type: '暂不支持该类型的文档（当前支持 docx / sheet）',
+  unsupported_type: '暂不支持该类型的文档（当前支持 docx / sheet / bitable 多维表格）',
   fetch_failed: '拉取云端内容失败，请稍后重试',
   permission_denied: '无访问权限，请先在飞书中为该应用授权',
 };
@@ -49,6 +49,7 @@ const DOC_TYPE_ICON: Record<string, typeof FileText> = {
   docx: FileText,
   sheet: Table,
   slides: FileType,
+  bitable: Table,
 };
 
 interface QuickAddDocDialogProps {
@@ -458,7 +459,7 @@ export function QuickAddDocDialog({
               className="w-full rounded-md border border-line bg-paper px-3 py-2 text-sm text-ink placeholder:text-ink-faint font-mono focus:outline-none focus:border-seal focus:ring-2 focus:ring-seal/20 disabled:opacity-60 resize-y"
             />
             <p className="mt-1.5 text-xs text-ink-faint font-sans-ui">
-              支持 docx / sheet / slides 与知识库 wiki 链接，单次最多 {MAX_LINKS_PER_BATCH} 条
+              支持 docx / sheet / bitable（多维表格）与云文档/wiki 链接，单次最多 {MAX_LINKS_PER_BATCH} 条
               {links.length > 0 && `（当前 ${links.length} 条）`}
             </p>
           </div>

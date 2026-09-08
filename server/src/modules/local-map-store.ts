@@ -1565,7 +1565,7 @@ export class LocalMapStore {
     objToken: string;
     folderId: string;
     wikiNodeToken: string | null;
-    objType: 'docx' | 'sheet' | 'slides' | 'unknown';
+    objType: 'docx' | 'sheet' | 'slides' | 'bitable' | 'unknown';
     title: string;
     localMdPath: string;
     localRelPath: string;

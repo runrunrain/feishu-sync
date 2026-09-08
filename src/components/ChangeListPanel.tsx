@@ -18,7 +18,8 @@ import { ChangeItem } from './ChangeItem';
 import { BatchActionBar } from './BatchActionBar';
 import { useToast } from './common/Toast';
 import { appLogger } from '../utils/appLogger';
-import { onDiffChanged } from '../utils/syncEvents';
+import { onDiffChanged, isDetectRunning, setDetectRunning } from '../utils/syncEvents';
+import { useDetectRunning } from '../hooks/useDetectRunning';
 import { detectChanges, detectChangesAll, getStoredMappingDiff } from '../api/client';
 import type { ChangedDocument, DiffReport, SheetSub } from '../types';
 import { isUsableWikiUrl } from '../utils/wikiUrl';
@@ -161,7 +162,9 @@ export function ChangeListPanel({
   const [tab, setTab] = useState<Tab>('all');
   const [diff, setDiff] = useState<DiffReport | null>(initialDiff ?? null);
   const [loading, setLoading] = useState(false);
-  const [detecting, setDetecting] = useState(false);
+  // 跨视图共享运行态：与总览 GlobalStatusBar 的「立即检测」是同一任务的
+  // 两个入口，可点击状态必须同步（另一入口检测中时这里也置灰）。
+  const detecting = useDetectRunning();
   const [error, setError] = useState<string | null>(null);
   const [sheetSubs] = useState<Record<string, SheetSub[]>>({});
   const toast = useToast();
@@ -224,9 +227,12 @@ export function ChangeListPanel({
    * 包含元数据比对与媒体完整性核对。期间按钮显示检测中状态并防止并发重复触发。
    */
   const handleDetect = async () => {
-    if (inFlightDetect.current) return;
+    // 跨入口互斥：总览 GlobalStatusBar 的「立即检测」与这里是同一任务的
+    // 两个入口；inFlightDetect 只防自身重入，isDetectRunning() 覆盖另一
+    // 入口运行中的情形（按钮已被共享态置灰，这里是双保险）。
+    if (inFlightDetect.current || isDetectRunning()) return;
     inFlightDetect.current = true;
-    setDetecting(true);
+    setDetectRunning(true, 'change-list-panel');
     setError(null);
     try {
       let report: DiffReport;
@@ -248,8 +254,7 @@ export function ChangeListPanel({
         }
       } else {
         if (!rootUrl) {
-          setDetecting(false);
-          inFlightDetect.current = false;
+          // try 内 return 仍走 finally，运行态/重入标记由 finally 统一复位。
           return;
         }
         await detectChanges(rootUrl);
@@ -272,7 +277,7 @@ export function ChangeListPanel({
         hint: msg,
       });
     } finally {
-      setDetecting(false);
+      setDetectRunning(false, 'change-list-panel');
       inFlightDetect.current = false;
     }
   };
@@ -292,26 +297,34 @@ export function ChangeListPanel({
   // A structural repair writes fresh topology into SQLite before the sync
   // retry begins. Re-read the cached diff when the parent explicitly signals
   // that update; rendering itself still never starts a cloud traversal.
+  // guard 用 inFlightDetect（本面板自身检测中）而非共享 detecting：共享态
+  // 在另一入口（总览）检测中也为 true，会把这次一次性 reloadSignal 吞掉
+  // 且无补偿机制。
   const lastReloadSignal = useRef(reloadSignal);
   useEffect(() => {
     if (lastReloadSignal.current === reloadSignal) return;
     lastReloadSignal.current = reloadSignal;
-    if (guardKey && !loading && !detecting) {
+    if (guardKey && !loading && !inFlightDetect.current) {
       void loadStoredDiff();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [reloadSignal, guardKey, loading, detecting]);
+  }, [reloadSignal, guardKey, loading]);
 
   // 跨视图实时刷新：仅拉取 SQLite 存量缓存 diff（本地读，绝不触发云端遍历）。
-  // 彻底阻断 detectChangesAll -> emitDiffChanged -> 递归云端全量检测的循环死锁。
+  // 彻底阻断「本面板 detectChangesAll → emitDiffChanged → 自身重拉」的循环。
+  // guard 必须用 inFlightDetect（本面板重入标记）而非共享 detecting：总览
+  // 入口检测完成时的 emit 早于 setDetectRunning(false)（微任务链时序），
+  // 用共享态会把这次完成广播吞掉，回归「总览操作后同步页列表不更新」
+  // （2026-06 跨视图刷新修复的场景）。loadStoredDiff 是 cached 本地读且不
+  // emit，接受其他入口的广播无递归风险。
   useEffect(() => {
     return onDiffChanged((source) => {
-      if (!guardKey || loading || detecting) return;
+      if (!guardKey || loading || inFlightDetect.current) return;
       appLogger.info('change-list', 'diff store changed; reloading stored list', { source });
       void loadStoredDiff();
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [guardKey, loading, detecting]);
+  }, [guardKey, loading]);
 
   const grouped = useMemo(() => {
     if (!diff) {
@@ -514,7 +527,7 @@ export function ChangeListPanel({
             icon={<CheckSquare className="w-10 h-10 text-jade" />}
             title="一切就绪"
             description={detecting ? '正在扫描飞书知识库变更，请稍候…' : '无未同步变更。所有文档均为最新。'}
-            action={{ label: detecting ? '检测中…' : '立即检测', onClick: handleDetect }}
+            action={{ label: detecting ? '检测中…' : '立即检测', onClick: handleDetect, disabled: detecting }}
           />
         </CardBody>
       </Card>

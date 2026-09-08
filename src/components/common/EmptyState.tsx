@@ -12,6 +12,8 @@ interface EmptyStateProps {
   action?: {
     label: string;
     onClick: () => void;
+    /** 透传给 Button：动作不可用时置灰（如跨入口共享的检测运行态）。 */
+    disabled?: boolean;
   };
 }
 
@@ -32,6 +34,7 @@ export function EmptyState({ icon, title, description, action }: EmptyStateProps
           size="md"
           variant="secondary"
           onClick={action.onClick}
+          disabled={action.disabled}
         >
           {action.label}
         </Button>
