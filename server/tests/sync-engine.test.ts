@@ -962,3 +962,181 @@ class BitableMockClient {
     return { data: { items: [] } };
   }
 }
+
+// =========================================================================
+// docx 内嵌 <sheet> 标签展开 — 按标签 sheetId 过滤（2026-09-10 实测修复）
+//
+// 事故背景：同一 workbook 的多个子表在同一 docx 里各占一个 <sheet> 标签，
+// 旧逻辑对每个标签导出整个 workbook 全部子表：28 标签 × 30 子表 →
+// md 里 840 个「## 子表:」段（23KB→333KB）+ 28 个 csv-data 目录 × 30 份
+// CSV。回归断言：每标签只导 sheet_id 匹配的那一个子表；匹配不到回退全量。
+// =========================================================================
+
+/** docx 内嵌 sheet 展开全链路 mock：workbook 3 子表，仅 2 个被标签引用。 */
+class InlineSheetMockClient {
+  workbookCalls: string[] = [];
+  csvCalls: Array<{ token: string; sheetId: string }> = [];
+
+  async fetchDocumentMarkdown() {
+    return {
+      data: {
+        document: {
+          content:
+            '# 部队初始化\n\n' +
+            '<sheet sheet-id="aaaaaa" token="sswbkInline1"></sheet>\n\n' +
+            '<sheet sheet-id="bbbbbb" token="sswbkInline1"></sheet>\n\n' +
+            '## 结尾\n',
+        },
+      },
+    };
+  }
+
+  async getWorkbookInfo(token: string) {
+    this.workbookCalls.push(token);
+    return {
+      data: {
+        sheets: [
+          { sheet_id: 'aaaaaa', sheet_name: '阵型表', row_count: 2, column_count: 2 },
+          { sheet_id: 'bbbbbb', sheet_name: '装备表', row_count: 2, column_count: 2 },
+          { sheet_id: 'cccccc', sheet_name: '未引用表', row_count: 2, column_count: 2 },
+        ],
+      },
+    };
+  }
+
+  async getSheetCsv(options: { spreadsheetToken: string; sheetId: string }) {
+    this.csvCalls.push({ token: options.spreadsheetToken, sheetId: options.sheetId });
+    return { data: { annotated_csv: `text,val\nrow-${options.sheetId},1\n` } };
+  }
+
+  async getSheetFloatImages() {
+    return { data: {} };
+  }
+}
+
+describe('SyncEngine — docx inline <sheet> tag expansion (per-tag sheetId filter)', () => {
+  it('expands each tag to ONLY its referenced sub-sheet (no full-workbook fan-out)', async () => {
+    const kbRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'sync-inline-kb-'));
+    const opDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sync-inline-ops-'));
+    try {
+      const store = new BitablePipelineStore();
+      const larkCliClient = new InlineSheetMockClient();
+      const engine = new SyncEngine({
+        larkCliClient,
+        localMapStore: store,
+        config: {
+          knowledgeBaseRoot: kbRoot,
+          operationManifestDir: opDir,
+          watchedRoots: [],
+          watchedRootUrls: [],
+        },
+      } as any);
+
+      const doc: ChangedDocument = {
+        objToken: 'docxInline1',
+        objType: 'docx',
+        title: '部队初始化思路',
+        changeType: 'modified',
+        cloudModifiedTime: '2026-09-10T10:00:00.000Z',
+        localSyncedTime: '2026-09-09T10:00:00.000Z',
+        localMdPath: path.join(kbRoot, '部队初始化思路.md'),
+        observedObjEditTime: 1789000000,
+      };
+
+      const result = await engine.syncDocuments([doc], {
+        enableLLM: false,
+        fullSync: false,
+        apply: true,
+        confirmation: 'APPLY',
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.failedDocuments.length).toBe(0);
+
+      const mdPath = path.join(kbRoot, '部队初始化思路.md');
+      const md = fs.readFileSync(mdPath, 'utf-8');
+
+      // 2 个标签 → 恰好 2 段「## 子表:」（旧逻辑：2 标签 × 3 子表 = 6 段）
+      expect((md.match(/^## 子表: /gm) || []).length).toBe(2);
+      // 未引用的子表绝不出现
+      expect(md).not.toContain('未引用表');
+
+      // csv-get 只打引用过的 2 个 sheet_id，各一次
+      expect(larkCliClient.csvCalls.map((call) => call.sheetId).sort()).toEqual([
+        'aaaaaa',
+        'bbbbbb',
+      ]);
+
+      // 每个 csv-data 目录只含 1 份 CSV（docname_<sheetId> 命名约定不变）
+      const csvDirs = fs.readdirSync(kbRoot).filter((name) => name.includes('.csv-data'));
+      expect(csvDirs.sort()).toEqual([
+        '部队初始化思路_aaaaaa.csv-data',
+        '部队初始化思路_bbbbbb.csv-data',
+      ]);
+      for (const dir of csvDirs) {
+        const files = fs.readdirSync(path.join(kbRoot, dir));
+        expect(files.length).toBe(1);
+      }
+    } finally {
+      fs.rmSync(kbRoot, { recursive: true, force: true });
+      fs.rmSync(opDir, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back to full-workbook export when sheet-id is empty or unmatched', async () => {
+    const kbRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'sync-inline-fb-'));
+    const opDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sync-inline-fb-ops-'));
+    try {
+      const store = new BitablePipelineStore();
+      const client = new InlineSheetMockClient();
+      // 覆写正文：一个空 sheet-id 标签 + 一个指向已删除子表的标签
+      client.fetchDocumentMarkdown = async () => ({
+        data: {
+          document: {
+            content:
+              '# 回退场景\n\n' +
+              '<sheet sheet-id="" token="sswbkInline1"></sheet>\n\n' +
+              '<sheet sheet-id="zzzzzz" token="sswbkInline1"></sheet>\n',
+          },
+        },
+      });
+      const engine = new SyncEngine({
+        larkCliClient: client,
+        localMapStore: store,
+        config: {
+          knowledgeBaseRoot: kbRoot,
+          operationManifestDir: opDir,
+          watchedRoots: [],
+          watchedRootUrls: [],
+        },
+      } as any);
+
+      const doc: ChangedDocument = {
+        objToken: 'docxInlineFallback',
+        objType: 'docx',
+        title: '回退场景',
+        changeType: 'added',
+        cloudModifiedTime: '2026-09-10T10:00:00.000Z',
+        localSyncedTime: null,
+        localMdPath: path.join(kbRoot, '回退场景.md'),
+        observedObjEditTime: 1789000000,
+      };
+
+      const result = await engine.syncDocuments([doc], {
+        enableLLM: false,
+        fullSync: false,
+        apply: true,
+        confirmation: 'APPLY',
+      });
+      expect(result.success).toBe(true);
+
+      const md = fs.readFileSync(path.join(kbRoot, '回退场景.md'), 'utf-8');
+      // 每个回退标签各导出全部 3 子表：2 × 3 = 6 段
+      expect((md.match(/^## 子表: /gm) || []).length).toBe(6);
+      expect(md).toContain('未引用表');
+    } finally {
+      fs.rmSync(kbRoot, { recursive: true, force: true });
+      fs.rmSync(opDir, { recursive: true, force: true });
+    }
+  });
+});

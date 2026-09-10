@@ -155,6 +155,17 @@ const GLOBAL_QPS_LIMIT = 3;
 const GLOBAL_QPS_BUCKET = '__all_lark_cli_requests__';
 const MAX_DRIVE_META_BATCH_SIZE = 200;
 
+/**
+ * 截断 lark-cli 失败输出，防错误日志爆炸（2026-09 实测：maxBuffer/上游
+ * 失败时 error.stdout 可携带数 MB 表格内容，40 次失败写出 42MB
+ * sync-errors.log）。保留头部 2KB（上下文）+ 尾部 6KB（结构化错误体
+ * 与错误码通常在输出末尾，extractUpstreamCode 依赖它能命中）。
+ */
+function clipForLog(text: string): string {
+  if (text.length <= 8192) return text;
+  return `${text.slice(0, 2048)}\n...[截断，原长度 ${text.length} 字符]...\n${text.slice(-6144)}`;
+}
+
 function isExplicitExecutablePath(value: string): boolean {
   return path.isAbsolute(value) || value.includes('/') || value.includes('\\');
 }
@@ -994,6 +1005,12 @@ export class LarkCliClient {
         quoteWindowsShellArguments(args),
         {
           timeout,
+          // 大子表 csv-get 的 stdout 可达数 MB（实测：7400+ 行对白表），
+          // Node execFile 默认 1MB maxBuffer 会直接抛
+          // "stdout maxBuffer length exceeded" 并中止文档同步（2026-09 实测：
+          // 同一文档反复重试失败、synced 基线永不推进）。256MB 上限足够，
+          // 超限仍有 timeout 兜底。
+          maxBuffer: 256 * 1024 * 1024,
           encoding: 'utf-8',
           shell: process.platform === 'win32', // Use shell on Windows for .cmd files
           env: buildLarkCliEnvironment(larkCliPath),
@@ -1016,8 +1033,8 @@ export class LarkCliClient {
           false,
         );
       }
-      const errorStderr = typeof error?.stderr === 'string' ? error.stderr : '';
-      const errorStdout = typeof error?.stdout === 'string' ? error.stdout : '';
+      const errorStderr = typeof error?.stderr === 'string' ? clipForLog(error.stderr) : '';
+      const errorStdout = typeof error?.stdout === 'string' ? clipForLog(error.stdout) : '';
       const rawMessage = `${errorStderr}\n${errorStdout}\n${error?.message ?? ''}`.trim();
       if (error?.killed && error?.signal === 'SIGTERM') {
         throw new LarkCliError('lark-cli 执行超时', 'timeout', true);

@@ -1624,6 +1624,14 @@ export class SyncEngine {
    *
    * 多标签同文档：每个 token 的 csv-data 目录以 `${docname}_${sheetId}`
    * 命名，避免同名冲突。
+   *
+   * 按标签 sheetId 过滤（2026-09-10 实测修复）：飞书导出的 markdown 中，
+   * 同一 workbook 的多个子表在同一 docx 里各占一个 `<sheet>` 标签。
+   * 旧逻辑对每个标签都导出整个 workbook 的全部子表：28 标签 × 30 子表
+   * 写出 840 个「## 子表:」段（md 23KB→333KB）与 28 个目录 × 30
+   * 份 CSV。现在标签级只导 sheet_id 匹配的那一个子表；sheetId 为空或
+   * 在 workbook 中已不存在时回退全量导出（保持旧行为，子表被删后标签
+   * 仍能展开而不是报错卡死）。
    */
   private async expandInlineSheetTags(
     content: string,
@@ -1655,7 +1663,12 @@ export class SyncEngine {
     for (const tag of tags) {
       const [whole, sheetId, token] = tag;
       const stagingName = `${docname}_${sheetId || 'sheet'}`;
-      const exported = await this.exportSheetsToStaging(token, stagingDocDir, stagingName);
+      const exported = await this.exportSheetsToStaging(
+        token,
+        stagingDocDir,
+        stagingName,
+        sheetId || undefined,
+      );
       const sections: string[] = [];
       for (const sheet of exported) {
         let section =
@@ -1685,6 +1698,7 @@ export class SyncEngine {
     sheetToken: string,
     stagingDocDir: string,
     docname: string,
+    onlySheetId?: string,
   ): Promise<Array<{
     sheetId: string;
     title: string;
@@ -1704,7 +1718,7 @@ export class SyncEngine {
     }> = [];
 
     const workbookInfo = await this.requireLarkCliClient().getWorkbookInfo(sheetToken);
-    const sheetsList = (workbookInfo.data?.sheets || []) as Array<{
+    let sheetsList = (workbookInfo.data?.sheets || []) as Array<{
       sheet_id: string;
       sheet_name: string;
       row_count?: number;
@@ -1713,6 +1727,20 @@ export class SyncEngine {
 
     if (sheetsList.length === 0) {
       throw new Error(`workbook 无子表: ${sheetToken}`);
+    }
+
+    // docx 内嵌标签只导标签指向的那一个子表（见 expandInlineSheetTags
+    // 注释：旧全量导出导致多标签同 workbook 时内容/目录爆炸）。匹配不到
+    // 时不报错，回退全量，保持整文档型 sheet 与「子表已删」场景兼容。
+    if (onlySheetId) {
+      const matched = sheetsList.filter((sheet) => sheet.sheet_id === onlySheetId);
+      if (matched.length > 0) {
+        sheetsList = matched;
+      } else {
+        console.warn(
+          `[SyncEngine] sheet-id "${onlySheetId}" not found in workbook ${sheetToken}; falling back to all ${sheetsList.length} sheet(s)`,
+        );
+      }
     }
 
     for (let index = 0; index < sheetsList.length; index += 1) {

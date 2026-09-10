@@ -6,6 +6,20 @@
 
 ---
 
+## [0.3.37] - 2026-09-10
+
+### Fixed（fix）
+
+- **docx 内嵌电子表格标签全量导出爆炸**：同一 workbook 的多个子表在同一 docx 中各占一个 `<sheet sheet-id="..." token="...">` 标签，旧逻辑对每个标签都导出整个 workbook 的全部子表——实测事故文档 28 标签 × 30 子表写出 840 个「## 子表:」段（md 23KB→33KB）与 28 个 csv-data 目录 × 30 份重复 CSV。修复：`exportSheetsToStaging` 新增 `onlySheetId` 参数，内嵌标签只导标签指向的那一个子表；sheet-id 为空或指向已删除子表时回退全量导出（不报错卡死），附 2 个回归用例。
+- **大子表同步死循环（stdout maxBuffer）**：`execFile` 未设 `maxBuffer`（Node 默认 1MB），大子表 csv-get 输出数 MB 直接抛 `stdout maxBuffer length exceeded`，同步中止、synced 基线永不推进，文档卡在 pending_modified 反复重试（实测同一文档 40 次失败）。修复：`maxBuffer` 提升 256MB（超限仍有 timeout 兜底）。
+- **错误日志爆炸**：lark-cli 失败时错误消息内联完整 stdout（数 MB 表格内容，实测 40 次失败写出 42MB sync-errors.log）。新增 `clipForLog` 截断（头 2KB + 尾 6KB，末尾结构化错误体与错误码保留，upstreamCode 提取不受影响）。
+
+### Added（feat）
+
+- **单文档精准重同步脚本**（`server/scripts/resync-one-doc.ts`）：按 objToken 从 DB 取基线构造变更输入，单文档 dry-run/apply 重同步，事故善后不再依赖全量回填脚本。
+
+---
+
 ## [0.3.36] - 2026-09-08
 
 ### Added（feat）
