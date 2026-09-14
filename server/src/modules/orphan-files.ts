@@ -106,6 +106,23 @@ export function scanOrphanFiles(
     return { rootDir, items };
   }
 
+  // 纵深防御（2026-09-14）：历史 bug 中路由层把 camelCase 字段误映射成
+  // undefined 数组传入，下方 p.split('/') 直接抛 TypeError → 裸 500。
+  // 入口处过滤非法条目，任何上游字段错位都只降级为「排除集缺失」。
+  const validCustomRelPaths = (Array.isArray(customFolderRelPaths) ? customFolderRelPaths : []).filter(
+    (p): p is string => typeof p === 'string' && p.length > 0,
+  );
+  // custom_folders.local_rel_path 存的是完整前缀（如 `_custom/<名>`），
+  // 必须与目标相对路径做前缀匹配——历史实现用 split('/')[0] 取首段，
+  // 得到的是 `_custom` 本身，导致有归档记录的子目录从未被正确排除。
+  // 语义对齐 reconciliation.isUnderCustomFolder / snapshot-service.isUnderAnyPrefix。
+  const isOwnedCustomChild = (name: string): boolean => {
+    const target = `_custom/${name}`;
+    return validCustomRelPaths.some((raw) => {
+      const prefix = raw.replace(/\\/g, '/').replace(/\/+$/, '');
+      return prefix !== '' && (prefix === target || prefix.startsWith(`${target}/`));
+    });
+  };
   // 有主一级目录名集合：所有 watchedRoot（含停用，停用根的文件仍受保护）
   // 的 localDir 首段 + _custom + 系统保留名
   const ownedTopDirs = new Set<string>(['_custom']);
@@ -113,8 +130,6 @@ export function scanOrphanFiles(
     const first = root.localDir.split('/')[0];
     if (first) ownedTopDirs.add(first);
   }
-  const ownedCustomSet = new Set(customFolderRelPaths.map((p) => p.split('/')[0]));
-
   for (const entry of entries) {
     if (entry.isSymbolicLink()) continue;
     const full = path.join(rootDir, entry.name);
@@ -132,7 +147,7 @@ export function scanOrphanFiles(
         }
         for (const ce of customEntries) {
           if (!ce.isDirectory() || ScanPolicy.shouldSkipDirectory(ce.name)) continue;
-          if (ownedCustomSet.has(ce.name)) continue;
+          if (isOwnedCustomChild(ce.name)) continue;
           const sub = path.join(full, ce.name);
           const hasMd = fs.readdirSync(sub, { withFileTypes: true })
             .some((x) => x.isFile() && x.name.endsWith('.md'));

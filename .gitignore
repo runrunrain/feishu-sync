@@ -52,3 +52,4 @@ server/tsconfig.tsbuildinfo
 
 # Claude Code / Amagi runtime artifacts
 .claude/
+.amagi-reports/

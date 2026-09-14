@@ -28,8 +28,23 @@ orphanFilesRoutes.get('/api/orphan-files', async (c) => {
 
   const watchedRoots: WatchedRootConfig[] = config.watchedRoots ?? [];
   let customRelPaths: string[] = [];
-  if (typeof localMapStore?.listCustomFolders === 'function') {
-    customRelPaths = localMapStore.listCustomFolders().map((f: { local_rel_path: string }) => f.local_rel_path);
+  // 2026-09-14 修复：listCustomFolders() 返回 camelCase（{ localRelPath }），
+  // 此前误按 snake_case（f.local_rel_path）映射 → [undefined×N] →
+  // scanOrphanFiles 内 p.split('/') 抛 TypeError → 裸 500「Internal server
+  // error」（凡有归档文件夹的用户必现）。改用 LocalMapStore 现成的
+  // getCustomFolderRelPaths()（与 snapshot-service.collectCustomFolderPrefixes
+  // 同一数据源，已过滤空值）；辅助信息失败降级为空排除集，不阻断扫描。
+  try {
+    if (typeof localMapStore?.getCustomFolderRelPaths === 'function') {
+      customRelPaths = localMapStore.getCustomFolderRelPaths();
+    } else if (typeof localMapStore?.listCustomFolders === 'function') {
+      customRelPaths = localMapStore
+        .listCustomFolders()
+        .map((f: { localRelPath?: string }) => f.localRelPath)
+        .filter((p: string | undefined): p is string => typeof p === 'string' && p.length > 0);
+    }
+  } catch (err) {
+    console.error('[orphan-files] list custom-folder rel paths failed:', err);
   }
 
   const result = scanOrphanFiles(rootDir, watchedRoots, customRelPaths);
@@ -57,8 +72,18 @@ orphanFilesRoutes.post('/api/orphan-files/cleanup', async (c) => {
   // 请求构造的任意路径清理（TOCTOU 与路径注入双重防线）。
   const watchedRoots: WatchedRootConfig[] = config.watchedRoots ?? [];
   let customRelPaths: string[] = [];
-  if (typeof localMapStore?.listCustomFolders === 'function') {
-    customRelPaths = localMapStore.listCustomFolders().map((f: { local_rel_path: string }) => f.local_rel_path);
+  // 与 GET 同款修复：snake_case 字段误映射已收口到 getCustomFolderRelPaths()。
+  try {
+    if (typeof localMapStore?.getCustomFolderRelPaths === 'function') {
+      customRelPaths = localMapStore.getCustomFolderRelPaths();
+    } else if (typeof localMapStore?.listCustomFolders === 'function') {
+      customRelPaths = localMapStore
+        .listCustomFolders()
+        .map((f: { localRelPath?: string }) => f.localRelPath)
+        .filter((p: string | undefined): p is string => typeof p === 'string' && p.length > 0);
+    }
+  } catch (err) {
+    console.error('[orphan-files] list custom-folder rel paths failed:', err);
   }
   const current = scanOrphanFiles(rootDir, watchedRoots, customRelPaths);
   const requested = Array.isArray(body.items) ? body.items.map((i) => i.relPath) : null;

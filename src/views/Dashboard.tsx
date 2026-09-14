@@ -40,7 +40,7 @@ import {
 } from '../api/client';
 import { appLogger } from '../utils/appLogger';
 import { onDiffChanged } from '../utils/syncEvents';
-import { pickFirstValidWikiUrl } from '../utils/wikiUrl';
+import { isUsableWikiUrl, pickFirstValidWikiUrl } from '../utils/wikiUrl';
 import type {
   MappingNode,
   ChangedDocument,
@@ -249,15 +249,36 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
   // 跨视图实时刷新（2026-06 修复）：抽出为可重入 loader，除挂载时外，
   // 还在全局 diff-changed 事件（同步/检测/回收站等写路径完成）时重拉，
   // 让总览的「最近变更」与待同步状态不再停留在旧快照。
+  // 多 root 聚合（2026-11 修复）：此前只拉 pickFirstValidWikiUrl 的
+  // 第一个子树，多 watchedRoot 配置下其他子树的变更不出现在「最近
+  // 变更」，总览与同步页变更列表内容长期对不齐。与
+  // ChangeListPanel.fetchMultiRootDiff / useSyncStatus 同款去重：
+  // 归档文档会被服务端合并进每个 root 的 stored diff，朴素 concat
+  // 会按 watchedRoot 数重复；单 root 失败降级为跳过（不阻塞其余子树）。
   const loadDiffAndSnapshot = useCallback(async (signal?: { cancelled: boolean }) => {
-    if (!rootUrl) return;
+    const validUrls = (config?.watchedRootUrls ?? []).filter(isUsableWikiUrl);
+    if (validUrls.length === 0) return;
     try {
-      const diff: DiffReport = await getStoredMappingDiff(rootUrl);
+      const seen = new Set<string>();
+      const merged: ChangedDocument[] = [];
+      for (const url of validUrls) {
+        try {
+          const diff: DiffReport = await getStoredMappingDiff(url);
+          for (const doc of [...diff.added, ...diff.modified, ...diff.deleted]) {
+            const key = doc.objToken ?? `${doc.title}:${doc.localMdPath ?? ''}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            merged.push(doc);
+          }
+        } catch (err) {
+          // diff may legitimately 400 if rootUrl is invalid; log + soft warning.
+          appLogger.warn('dashboard', 'getStoredMappingDiff failed (non-fatal)', { url, err });
+        }
+      }
       if (signal?.cancelled) return;
-      setChanges([...diff.added, ...diff.modified, ...diff.deleted]);
+      setChanges(merged);
     } catch (err) {
-      // diff may legitimately 400 if rootUrl is invalid; log + soft warning.
-      appLogger.warn('dashboard', 'getStoredMappingDiff failed (non-fatal)', err);
+      appLogger.warn('dashboard', 'aggregate stored diffs failed (non-fatal)', err);
     }
     try {
       const snap = await getMappingIndex();
@@ -268,7 +289,7 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
       // 404 when snapshot not generated yet; soft-log only.
       appLogger.warn('dashboard', 'getMappingIndex failed (non-fatal)', err);
     }
-  }, [rootUrl]);
+  }, [config]);
 
   useEffect(() => {
     const signal = { cancelled: false };

@@ -6,6 +6,18 @@
 
 ---
 
+## [0.3.38] - 2026-09-14
+
+### Fixed（fix）
+
+- **孤立文件扫描接口 500（有归档文件夹用户必现）**：`/api/orphan-files` 路由把 `listCustomFolders()` 返回的 camelCase 字段（`localRelPath`）误按 snake_case（`local_rel_path`）映射，产生 `[undefined × N]` 传入扫描函数，`p.split('/')` 抛 TypeError → 裸 500「Internal server error」，凡配置过自定义归档文件夹的用户打开孤立文件清理页即刷屏报错。修复：改用 `LocalMapStore.getCustomFolderRelPaths()` 现成数据源；`scanOrphanFiles` 入口过滤非法条目（上游字段错位只降级为排除集缺失，不再炸 500）；补路由层回归测试。
+- **归档记录排除逻辑失效（同一修复带出的第二层缺陷）**：`custom_folders.local_rel_path` 存完整前缀（`_custom/<名>`），旧排除逻辑 `split('/')[0]` 取首段得到 `_custom` 本身，导致有归档记录的 `_custom` 子目录从未被正确排除、会被误判为孤立空壳。修复：改为与 `reconciliation.isUnderCustomFolder` / `snapshot-service.isUnderAnyPrefix` 一致的前缀匹配语义。
+
+### Changed（refactor/ui）
+
+- **同步页变更列表高密度重构**：卡片平铺（单条约 74px）改为行式表格布局（紧凑模式单行 34px），一屏可见条目数提升约 2.2 倍；新增「紧凑/舒适」密度切换（localStorage 持久化，紧凑为默认）；表头全选/半选联动与选中行高亮；行展开详情（本地路径复制/打开目录/sheet 子表/已删除项回收站操作）全部保留；提取 `groupDiffChanges` / `computeSelectableDocs` 纯函数并补 7 个契约回归测试。
+- **总览待同步数量实时性修复**：服务端 PollingScheduler 定时检测会重写持久化 diff 但无前端事件，总览「N 篇待同步」徽标此前只在手动检测/同步后刷新，长期滞后于同步页变更列表。修复：`useSyncStatus` 增加 60s 低频轮询兜底（本地 SQLite cached 读，无云遍历）+ 窗口可见性兜底重拉；总览「最近变更」同步修复为跨 watchedRoot 聚合（此前只显示第一个子树的变更）。
+
 ## [0.3.37] - 2026-09-10
 
 ### Fixed（fix）

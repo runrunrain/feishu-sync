@@ -154,5 +154,31 @@ export function useSyncStatus(options: UseSyncStatusOptions = {}): SyncStatusDat
     });
   }, [refresh]);
 
+  // 定时兜底（2026-11 修复「总览待同步数量总是滞后于变更列表」）：
+  // 服务端 PollingScheduler 的定时检测会重写持久化 diff，但运行在主进程
+  // 侧、不产生任何客户端事件（见 utils/syncEvents.ts 头注释）；本 hook
+  // 此前只依赖 diff-changed（仅前端写路径触发），用户停在总览页时徽标
+  // 与 lastSyncTime/nextCheckTime 一直停留在旧值，而同步页变更列表有
+  // 「切回该页重读」的可见性兜底会刷新——两端数字长期不一致。
+  // cached diff 读是本地 SQLite 读（无云遍历），60s 低频轮询即可把
+  // 滞后压到分钟级且无 QPS 压力。
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      void refresh();
+    }, 60_000);
+    return () => window.clearInterval(timer);
+  }, [refresh]);
+
+  // 可见性兜底：窗口从后台切回前台时立即重拉一次，与 SyncView 的
+  // active 兜底对称——Electron 最小化/浏览器切 tab 期间发生的定时
+  // 检测在回到总览的第一时间反映出来，不必等下一个 60s tick。
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') void refresh();
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', onVisibilityChange);
+  }, [refresh]);
+
   return status;
 }

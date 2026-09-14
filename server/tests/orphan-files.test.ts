@@ -164,3 +164,68 @@ describe('scanOrphanFiles / cleanupOrphanFiles', () => {
     expect(result.failed[0].error).toMatch(/escapes/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 2026-09-14 回归：孤立文件扫描路由 500 修复
+//
+// 历史根因：routes/orphan-files.ts 把 listCustomFolders() 的 camelCase 字段
+// （{ localRelPath }）误按 snake_case（f.local_rel_path）映射 →
+// [undefined×N] → scanOrphanFiles 内 p.split('/') 抛 TypeError → 裸 500
+// 「Internal server error」（凡有归档文件夹的用户必现）。
+// ---------------------------------------------------------------------------
+
+describe('orphan-files route: camelCase custom-folder mapping regression', () => {
+  it('GET /api/orphan-files 不因 listCustomFolders 的 camelCase 字段炸 500，且归档记录正确排除', async () => {
+    const { Hono } = await import('hono');
+    const { orphanFilesRoutes } = await import('../src/routes/orphan-files.js');
+
+    const kbRoot = createTempDir('feishu-orphan-route-');
+    // _custom 下无 .md 的空壳子目录：有归档记录 → 有主不列；
+    // 字段映射 broken（undefined 排除集）→ 会被误判孤立（或直接炸 500）。
+    fs.mkdirSync(path.join(kbRoot, '_custom', '空壳归档'), { recursive: true });
+    fs.mkdirSync(path.join(kbRoot, '技术 - Dev'), { recursive: true });
+    fs.writeFileSync(path.join(kbRoot, '技术 - Dev', 'doc.md'), SYNC_MD);
+
+    const configManager = {
+      load: async () => ({
+        knowledgeBaseRoot: kbRoot,
+        watchedRoots: [{ localDir: '技术 - Dev' }] as WatchedRootConfig[],
+      }),
+    };
+    // 与 LocalMapStore.listCustomFolders() 真实返回形状一致（camelCase）
+    const localMapStore = {
+      listCustomFolders() {
+        return [
+          { id: 'id-1', name: '空壳归档', localRelPath: '_custom/空壳归档', createdAt: '2026-08-12' },
+        ];
+      },
+    };
+
+    const app = new Hono();
+    app.use('*', async (c: any, next: any) => {
+      Object.assign(c, { configManager, localMapStore });
+      await next();
+    });
+    app.route('/', orphanFilesRoutes);
+
+    const res = await app.request('/api/orphan-files');
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { items: Array<{ relPath: string }> };
+    expect(body.items.map((i) => i.relPath)).not.toContain('_custom/空壳归档');
+  });
+
+  it('scanOrphanFiles 对含非法条目的 customFolderRelPaths 容错（纵深防御）', () => {
+    const kbRoot = createTempDir('feishu-orphan-guard-');
+    fs.mkdirSync(path.join(kbRoot, '_custom', '空壳归档'), { recursive: true });
+
+    // 历史故障形状：上游字段错位产生的 undefined/null 混入数组
+    const result = scanOrphanFiles(
+      kbRoot,
+      [{ localDir: '技术 - Dev' }] as WatchedRootConfig[],
+      [undefined as any, null as any, '_custom/空壳归档'],
+    );
+
+    // 合法前缀照常排除、非法条目被过滤，整体不抛异常
+    expect(result.items.map((i) => i.relPath)).not.toContain('_custom/空壳归档');
+  });
+});

@@ -418,6 +418,7 @@ export function SyncView({ active = true }: SyncViewProps) {
             onBatchSync={() => {
               void handleStart();
             }}
+            onOpenFolder={handleOpenMd}
           />
 
           <FeishuPendingPanel
