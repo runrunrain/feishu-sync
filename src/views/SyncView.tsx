@@ -381,9 +381,8 @@ export function SyncView({ active = true }: SyncViewProps) {
   }, [sync.syncResult]);
 
   return (
-    <div className="space-y-5">
-      {/* 2026-09：同步进度常驻顶部（sticky），滚动中始终可见，
-          展示真实百分比与当前正在同步的文档名。 */}
+    <div className="flex-1 min-h-0 flex flex-col gap-3">
+      {/* 2026-09：同步进度常驻顶部，展示真实百分比与当前正在同步的文档名。 */}
       <SyncProgress
         syncing={syncing}
         total={sync.total > 0 ? sync.total : selectedDocs.length}
@@ -393,18 +392,16 @@ export function SyncView({ active = true }: SyncViewProps) {
       />
 
       {/*
-        同步区布局重构（v0.2.9）：
-        原单列长堆叠（变更列表 → 操作面板 → 进度 → 结果）在全宽主区下
-        列表过宽、操作面板被挤到屏外。改为：
-        - 左栏（flex-1 主区域）：变更列表 + 飞书侧待处理
-        - 右栏（340px 操作侧栏，xl 起 sticky 跟随滚动）：同步操作面板 +
-          进度 + 回收站/日志入口，「开始同步」始终触手可及
-        - 同步结果报告出现时全宽展示在两栏之下（长报告需要横向空间）
-        「批量同步」按钮经 onBatchSync 直接复用本视图的 handleStart 流程。
+        同步工作区布局重构（2026-09 洛神）：
+        对齐总览页（Dashboard）全高等高左右工作区气质：
+        - 左栏（flex-1 min-w-0，lg:h-full）：变更列表面板主工作区，表格内部独立平滑滚动
+        - 右栏（320-340px，lg:h-full）：操作与辅助侧栏，集合「同步到本地」操作面板、
+          回收站与日志快捷入口、以及「飞书侧待处理」可收起队列
+        - 底部段（全宽展开，仅在同步结果存在时呈现）：长报告拥有横向空间，可滚动查看并一键清除
       */}
-      <div className="grid min-w-0 grid-cols-1 gap-5 xl:grid-cols-[minmax(0,1fr)_340px]">
-        {/* Left: change list + feishu pending */}
-        <div className="min-w-0 space-y-5">
+      <div className="flex min-w-0 flex-1 min-h-0 flex-col gap-3 lg:flex-row">
+        {/* Left: change list panel (primary workspace) */}
+        <div className="min-w-0 min-h-[420px] lg:min-h-0 lg:h-full flex-1 flex flex-col">
           <ChangeListPanel
             rootUrl={memoRootUrl}
             rootUrlError={rootUrlError}
@@ -419,17 +416,12 @@ export function SyncView({ active = true }: SyncViewProps) {
               void handleStart();
             }}
             onOpenFolder={handleOpenMd}
-          />
-
-          <FeishuPendingPanel
-            reloadSignal={diffRefreshSignal}
-            rechecking={recheckingFailures}
-            onRecheck={handleRecheckFeishuPending}
+            className="h-full"
           />
         </div>
 
-        {/* Right: sync operation sidebar (sticky on xl) */}
-        <div className="min-w-0 space-y-4 xl:sticky xl:top-4 xl:self-start">
+        {/* Right: sync operation and auxiliary sidebar */}
+        <div className="min-w-0 space-y-3 lg:w-[320px] xl:w-[340px] shrink-0 lg:min-h-0 lg:h-full lg:overflow-y-auto lg:scrollbar-thin lg:pr-1 flex flex-col">
           <SyncControlPanel
             selectedCount={selectedDocs.length}
             syncing={syncing}
@@ -438,17 +430,17 @@ export function SyncView({ active = true }: SyncViewProps) {
           />
 
           {sync.error && (
-            <div className="p-4 rounded-md border border-seal-2/40 bg-seal-2/5 text-sm text-seal-2">
+            <div className="p-3.5 rounded-md border border-seal-2/40 bg-seal-2/5 text-xs text-seal-2">
               同步错误：{sync.error}
             </div>
           )}
 
           {/* Trash + log entries live in the operation sidebar */}
-          <div className="flex items-center gap-3">
+          <div className="grid grid-cols-2 gap-2 shrink-0">
             <button
               type="button"
               onClick={() => setTrashOpen(true)}
-              className="inline-flex flex-1 items-center justify-center gap-2 px-3.5 py-2 text-xs text-ink-soft border border-line rounded-md bg-card-bg hover:bg-paper-2 font-sans-ui transition-colors"
+              className="inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs text-ink-soft border border-line rounded-md bg-card-bg hover:bg-paper font-sans-ui transition-colors shadow-xs cursor-pointer"
             >
               <Trash2 className="w-3.5 h-3.5" />
               回收站
@@ -456,26 +448,36 @@ export function SyncView({ active = true }: SyncViewProps) {
             <button
               type="button"
               onClick={() => setLogOpen(true)}
-              className="inline-flex flex-1 items-center justify-center gap-2 px-3.5 py-2 text-xs text-ink-soft border border-line rounded-md bg-card-bg hover:bg-paper-2 font-sans-ui transition-colors"
+              className="inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs text-ink-soft border border-line rounded-md bg-card-bg hover:bg-paper font-sans-ui transition-colors shadow-xs cursor-pointer"
             >
               <ScrollText className="w-3.5 h-3.5" />
               完整日志
             </button>
           </div>
+
+          {/* Feishu pending items queue */}
+          <FeishuPendingPanel
+            reloadSignal={diffRefreshSignal}
+            rechecking={recheckingFailures}
+            onRecheck={handleRecheckFeishuPending}
+          />
         </div>
       </div>
 
+      {/* Sync result report (full-width docked below workspace when present) */}
       {sync.syncResult && (
-        <SyncResultList
-          result={sync.syncResult}
-          onRetry={handleRetry}
-          onRepairParentChains={handleRepairParentChains}
-          repairingParentChains={repairingParentChains}
-          onAdoptExistingFiles={handleAdoptExistingFiles}
-          adoptingExistingFiles={adoptingExistingFiles}
-          onOpen={handleOpenMd}
-          onClear={handleClearResult}
-        />
+        <div className="shrink-0 max-h-[300px] overflow-y-auto scrollbar-thin animate-fade-in">
+          <SyncResultList
+            result={sync.syncResult}
+            onRetry={handleRetry}
+            onRepairParentChains={handleRepairParentChains}
+            repairingParentChains={repairingParentChains}
+            onAdoptExistingFiles={handleAdoptExistingFiles}
+            adoptingExistingFiles={adoptingExistingFiles}
+            onOpen={handleOpenMd}
+            onClear={handleClearResult}
+          />
+        </div>
       )}
 
       <LogDrawer open={logOpen} onClose={() => setLogOpen(false)} />

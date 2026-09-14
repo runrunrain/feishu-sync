@@ -82,7 +82,7 @@ export function FeishuPendingPanel({
             toggleCollapsed();
           }
         }}
-        className={`px-6 py-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between cursor-pointer select-none ${
+        className={`px-4 py-3 flex flex-col gap-2.5 sm:flex-row sm:items-center sm:justify-between cursor-pointer select-none ${
           collapsed ? '' : 'border-b border-line'
         }`}
       >
@@ -115,7 +115,7 @@ export function FeishuPendingPanel({
         )}
       </div>
       {!collapsed && (
-        <CardBody className="space-y-3">
+        <CardBody className="p-4 space-y-3">
         {loading && items.length === 0 && (
           <p className="text-sm text-ink-faint">正在读取待处理项…</p>
         )}

@@ -70,7 +70,7 @@ function AppShell() {
               onJumpToSettings={handleJumpToSettings}
             />
           </div>
-          <div className={currentArea === 'sync' ? 'animate-fade-in' : 'hidden'}>
+          <div className={currentArea === 'sync' ? 'flex-1 min-h-0 flex flex-col animate-fade-in' : 'hidden'}>
             {/* active 标记主区是否可见：同步区常驻挂载（v0.2.9），但变为
                 可见时需重读后端持久化 diff（服务端 PollingScheduler 定时
                 检测没有客户端事件，列表/待处理可能已过期） */}

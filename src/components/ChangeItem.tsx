@@ -1,8 +1,8 @@
 /**
- * ChangeItem - 变更列表项（高密度行式列表 / 表格视图）
+ * ChangeItem - 变更列表项（高密度紧凑行组件）
  *
  * 遵循水墨中国风设计系统（米白宣纸、印章朱红、水墨青、墨色），
- * 支持两种密度模式（compact 默认 ~32px / comfortable ~48px）。
+ * 固定紧凑单行模式（行高 34px），提供高密度高扫描效率展示。
  *
  * 三状态视觉编码（颜色+图标+文字三重）：
  *   - added    jade #6b8e8a  / Plus      / "新增"
@@ -51,8 +51,6 @@ export interface ChangeItemProps {
   /** Deleted-state actions. */
   onTrash?: (objToken: string) => void;
   onPurge?: (objToken: string) => void;
-  /** Density mode: 'compact' (default, ~32px-34px) or 'comfortable' (~48px) */
-  density?: 'compact' | 'comfortable';
   /** Optional handler to reveal/open document local folder */
   onOpenFolder?: (localMdPath: string) => void;
 }
@@ -98,7 +96,6 @@ export function ChangeItem({
   onSyncSub,
   onTrash,
   onPurge,
-  density = 'compact',
   onOpenFolder,
 }: ChangeItemProps) {
   const [expanded, setExpanded] = useState(false);
@@ -166,9 +163,6 @@ export function ChangeItem({
     onOpenFolder?.(change.localMdPath);
   };
 
-  // 紧凑模式 vs 舒适模式高度与内边距
-  const isCompact = density === 'compact';
-  const rowHeightClass = isCompact ? 'min-h-[34px] py-1.5' : 'min-h-[48px] py-2.5';
   const displayPath = getDisplayPath(change);
 
   return (
@@ -178,14 +172,14 @@ export function ChangeItem({
       }`}
     >
       <div
-        className={`flex items-center gap-2.5 px-3 cursor-pointer select-none focus:outline-none focus:bg-paper-2/80 ${rowHeightClass}`}
+        className="flex items-center gap-2.5 px-3 min-h-[34px] py-1.5 cursor-pointer select-none focus:outline-none focus:bg-paper-2/80"
         onClick={handleRowClick}
         onKeyDown={handleKeyDown}
         role="button"
         tabIndex={0}
         aria-label={`${change.title} - ${STATE_LABEL[change.changeType]}`}
       >
-        {/* Checkbox (40px 居中对齐，删除项禁用不可批量同步) */}
+        {/* Checkbox (32px 居中对齐，删除项禁用不可批量同步) */}
         <div
           className="shrink-0 w-8 flex items-center justify-center"
           onClick={(e) => {
@@ -224,79 +218,45 @@ export function ChangeItem({
 
         {/* Title + Path (主导弹性伸缩列) */}
         <div className="flex-1 min-w-0 pr-2">
-          {isCompact ? (
-            /* 紧凑模式：单行内联排布，标题为主导，路径紧凑跟随 */
-            <div className="flex items-center gap-2 min-w-0">
+          <div className="flex items-center gap-2 min-w-0">
+            <span
+              className={`text-xs font-medium truncate shrink-0 max-w-[55%] md:max-w-[65%] lg:max-w-[72%] ${
+                isDeleted ? 'text-ink-faint line-through' : 'text-ink'
+              }`}
+              title={change.title}
+            >
+              {change.title}
+            </span>
+
+            {/* 缺失修复徽章 */}
+            {change.mediaGapReason && (
               <span
-                className={`text-xs font-medium truncate shrink-0 max-w-[55%] md:max-w-[65%] lg:max-w-[72%] ${
-                  isDeleted ? 'text-ink-faint line-through' : 'text-ink'
-                }`}
-                title={change.title}
+                className="inline-flex items-center px-1 py-0.2 rounded text-[10px] font-sans-ui bg-seal/10 text-seal border border-seal/25 shrink-0"
+                title={`图片缺失待修复: ${change.mediaGapReason}`}
               >
-                {change.title}
+                图片缺失
               </span>
+            )}
 
-              {/* 缺失修复徽章 */}
-              {change.mediaGapReason && (
-                <span
-                  className="inline-flex items-center px-1 py-0.2 rounded text-[10px] font-sans-ui bg-seal/10 text-seal border border-seal/25 shrink-0"
-                  title={`图片缺失待修复: ${change.mediaGapReason}`}
-                >
-                  图片缺失
-                </span>
-              )}
-
-              {/* 业务标签 */}
-              {businessMarks && businessMarks.length > 0 && (
-                <div className="shrink-0">
-                  <BusinessTag marks={businessMarks} />
-                </div>
-              )}
-
-              {/* 次级路径（淡墨色等宽字体，超出截断） */}
-              <span
-                className="text-[11px] text-ink-faint font-mono truncate min-w-0 flex-1 hidden sm:inline-block"
-                title={change.localMdPath || change.localRelPath || '尚未同步'}
-              >
-                <span className="text-ink-faint/40 mr-1.5">/</span>
-                {displayPath}
-              </span>
-            </div>
-          ) : (
-            /* 舒适模式：双行规整排布 */
-            <div className="min-w-0">
-              <div className="flex items-center gap-2 flex-wrap min-w-0">
-                <span
-                  className={`text-sm truncate ${
-                    isDeleted ? 'text-ink-faint line-through' : 'text-ink'
-                  }`}
-                  title={change.title}
-                >
-                  {change.title}
-                </span>
-                {change.mediaGapReason && (
-                  <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-sans-ui bg-seal/10 text-seal border border-seal/30 shrink-0">
-                    图片缺失待修复
-                  </span>
-                )}
-                {businessMarks && businessMarks.length > 0 && (
-                  <BusinessTag marks={businessMarks} />
-                )}
+            {/* 业务标签 */}
+            {businessMarks && businessMarks.length > 0 && (
+              <div className="shrink-0">
+                <BusinessTag marks={businessMarks} />
               </div>
-              <div className="flex items-center gap-2 mt-0.5 text-[11px] text-ink-faint">
-                <span className="uppercase font-sans-ui text-[10px] tracking-wider px-1 rounded bg-paper-2/70 text-ink-soft">
-                  {change.objType}
-                </span>
-                <span aria-hidden className="text-ink-faint/40">/</span>
-                <span className="font-mono truncate max-w-[420px]" title={change.localMdPath || change.localRelPath || '尚未同步'}>
-                  {displayPath}
-                </span>
-              </div>
-            </div>
-          )}
+            )}
+
+            {/* 次级路径（淡墨色等宽字体，超出截断） */}
+            <span
+              className="text-[11px] text-ink-faint font-mono truncate min-w-0 flex-1 hidden sm:inline-block"
+              title={change.localMdPath || change.localRelPath || '尚未同步'}
+            >
+              <span className="text-ink-faint/40 mr-1.5">/</span>
+              {displayPath}
+            </span>
+          </div>
         </div>
 
-        {/* State badge 列（固定对齐宽约 90-100px） */}
+        {/* State badge 列（固定对齐宽约 96px~104px） */}
         <div className="shrink-0 w-22 sm:w-26 flex items-center justify-start">
           <StatusBadge status={change.changeType} size="sm" hideDot={false}>
             <span className="inline-flex items-center gap-1">
@@ -306,7 +266,7 @@ export function ChangeItem({
           </StatusBadge>
         </div>
 
-        {/* Time 列（固定对齐宽约 90-100px） */}
+        {/* Time 列（固定对齐宽约 96px~104px） */}
         <div
           className="shrink-0 w-22 sm:w-26 flex items-center justify-end gap-1 text-[11px] text-ink-faint font-mono"
           title={`云端更新: ${change.cloudModifiedTime || '未知'}`}
@@ -315,7 +275,7 @@ export function ChangeItem({
           <span className="truncate">{formatCloudModifiedTime(change.cloudModifiedTime)}</span>
         </div>
 
-        {/* Detail Expand Chevron 列（宽约 40px，居中） */}
+        {/* Detail Expand Chevron 列（宽约 36px，居中） */}
         <div className="shrink-0 w-9 flex items-center justify-center">
           <button
             type="button"

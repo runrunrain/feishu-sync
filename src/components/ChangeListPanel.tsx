@@ -1,5 +1,5 @@
 /**
- * ChangeListPanel - 变更列表高密度表格/行式主区（T4 R2.3-AC1/AC2，04 §5）
+ * ChangeListPanel - 变更列表高密度工作区（T4 R2.3-AC1/AC2，04 §5）
  *
  * 5 tab：全部 / 新增 / 已修改 / 图片缺失待修复 / 已删除。
  * 数据源为已持久化的 GET /api/mapping/diff?cached=1，按 changeType 分组。
@@ -8,17 +8,16 @@
  * 选中状态由父组件持有（避免与 SyncView 之间重复定义），本组件受控：
  * 通过 props 注入 selectedTokens + onSelectionChange。
  *
- * 高密度优化（2026-09 洛神重构）：
- * - 表格式连续行布局替代旧独立卡片平铺模式，消除多余外边距与卡片重叠边框
- * - 默认紧凑模式（行高 ~33px），一屏可见条目数相比旧卡片提升 ≥2 倍
- * - 支持「紧凑 / 舒适」密度切换并持久化本地偏好
- * - 提供表头列对齐（复选框、文档标题与路径、变更状态、云端修改时间、详情展开）
- * - 完整保留 tab 过滤、批量操作、子表展开与单文档操作
+ * 工作区布局与气质对齐（2026-09 洛神重构）：
+ * - 左右等高工作区主面板，占满视口高度（h-full + flex-1 min-h-0）
+ * - 统一紧凑单行模式（34px 行高），表格内部独立平滑滚动（scrollbar-thin）
+ * - 顶栏固定标题与检测、子工具栏固定 tab 与批量操作栏、表头列固定对齐
+ * - 底部固定汇总与操作指引栏，与总览页 NodeTreeView / DocPreviewPanel 气质高度一致
  */
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { RefreshCw, CheckSquare, AlertCircle, Inbox, AlignJustify, List } from 'lucide-react';
-import { Card, CardHeader, CardBody } from './common/Card';
+import { RefreshCw, CheckSquare, AlertCircle, Inbox } from 'lucide-react';
+import { Card, CardHeader } from './common/Card';
 import { Button } from './common/Button';
 import { EmptyState } from './common/EmptyState';
 import { ChangeItem } from './ChangeItem';
@@ -32,7 +31,6 @@ import type { ChangedDocument, DiffReport, SheetSub } from '../types';
 import { isUsableWikiUrl } from '../utils/wikiUrl';
 
 type Tab = 'all' | 'added' | 'modified' | 'mediaGap' | 'deleted';
-export type DensityMode = 'compact' | 'comfortable';
 
 const TAB_LABEL: Record<Tab, string> = {
   all: '全部',
@@ -41,8 +39,6 @@ const TAB_LABEL: Record<Tab, string> = {
   mediaGap: '图片缺失待修复',
   deleted: '已删除',
 };
-
-const DENSITY_STORAGE_KEY = 'feishu-sync:change-list-density';
 
 interface ChangeListPanelProps {
   rootUrl: string | null;
@@ -79,6 +75,8 @@ interface ChangeListPanelProps {
   onBatchSync?: () => void;
   /** 可选：定位/打开本地文档目录 */
   onOpenFolder?: (localMdPath: string) => void;
+  /** 自定义外层样式类（用于等高 flex 容器） */
+  className?: string;
 }
 
 /**
@@ -212,6 +210,7 @@ export function ChangeListPanel({
   reloadSignal = 0,
   onBatchSync,
   onOpenFolder,
+  className = '',
 }: ChangeListPanelProps) {
   const [tab, setTab] = useState<Tab>('all');
   const [diff, setDiff] = useState<DiffReport | null>(initialDiff ?? null);
@@ -222,30 +221,6 @@ export function ChangeListPanel({
   const toast = useToast();
   const inFlightDetect = useRef(false);
   const inFlightStored = useRef(false);
-
-  // 密度偏好状态管理（默认紧凑）
-  const [density, setDensity] = useState<DensityMode>(() => {
-    if (typeof window !== 'undefined') {
-      try {
-        const saved = localStorage.getItem(DENSITY_STORAGE_KEY);
-        if (saved === 'compact' || saved === 'comfortable') return saved;
-      } catch {
-        // ignore localStorage error
-      }
-    }
-    return 'compact';
-  });
-
-  const handleDensityToggle = (mode: DensityMode) => {
-    setDensity(mode);
-    if (typeof window !== 'undefined') {
-      try {
-        localStorage.setItem(DENSITY_STORAGE_KEY, mode);
-      } catch {
-        // ignore storage error
-      }
-    }
-  };
 
   const multiRootUrls = useMemo(() => {
     const valid = Array.isArray(watchedRootUrls)
@@ -450,17 +425,17 @@ export function ChangeListPanel({
   // ----- Unconfigured / invalid root URL state -----
   if (rootUrlError) {
     return (
-      <Card variant="elevated">
-        <CardHeader>
+      <Card variant="elevated" className={`min-w-0 flex flex-col h-full ${className}`}>
+        <CardHeader className="shrink-0">
           <h2 className="text-lg font-kai font-medium text-ink">变更列表</h2>
         </CardHeader>
-        <CardBody>
+        <div className="flex-1 flex items-center justify-center p-6">
           <EmptyState
             icon={<AlertCircle className="w-10 h-10 text-seal" />}
             title="尚未配置飞书根 URL"
             description={rootUrlError}
           />
-        </CardBody>
+        </div>
       </Card>
     );
   }
@@ -468,16 +443,14 @@ export function ChangeListPanel({
   // ----- Loading state -----
   if (loading && !diff) {
     return (
-      <Card variant="elevated">
-        <CardHeader>
+      <Card variant="elevated" className={`min-w-0 flex flex-col h-full ${className}`}>
+        <CardHeader className="shrink-0">
           <h2 className="text-lg font-kai font-medium text-ink">变更列表</h2>
         </CardHeader>
-        <CardBody>
-          <div className="flex flex-col items-center gap-3 py-14">
-            <RefreshCw className="w-8 h-8 text-seal animate-spin" />
-            <p className="text-sm text-ink-soft font-sans-ui">加载存量变更中…</p>
-          </div>
-        </CardBody>
+        <div className="flex-1 flex flex-col items-center justify-center gap-3 p-10">
+          <RefreshCw className="w-8 h-8 text-seal animate-spin" />
+          <p className="text-sm text-ink-soft font-sans-ui">加载存量变更中…</p>
+        </div>
       </Card>
     );
   }
@@ -485,18 +458,18 @@ export function ChangeListPanel({
   // ----- Error state -----
   if (error && !diff) {
     return (
-      <Card variant="elevated">
-        <CardHeader>
+      <Card variant="elevated" className={`min-w-0 flex flex-col h-full ${className}`}>
+        <CardHeader className="shrink-0">
           <h2 className="text-lg font-kai font-medium text-ink">变更列表</h2>
         </CardHeader>
-        <CardBody>
+        <div className="flex-1 flex items-center justify-center p-6">
           <EmptyState
             icon={<AlertCircle className="w-10 h-10 text-seal-2" />}
             title="检测失败"
             description={error}
             action={{ label: '重试', onClick: loadStoredDiff }}
           />
-        </CardBody>
+        </div>
       </Card>
     );
   }
@@ -510,8 +483,8 @@ export function ChangeListPanel({
 
   if (totalChanges === 0) {
     return (
-      <Card variant="elevated">
-        <CardHeader>
+      <Card variant="elevated" className={`min-w-0 flex flex-col h-full ${className}`}>
+        <CardHeader className="shrink-0">
           <div className="flex items-center justify-between">
             <h2 className="text-lg font-kai font-medium text-ink">变更列表</h2>
             <div className="flex items-center gap-2">
@@ -533,22 +506,23 @@ export function ChangeListPanel({
             </div>
           </div>
         </CardHeader>
-        <CardBody>
+        <div className="flex-1 flex items-center justify-center p-6">
           <EmptyState
             icon={<CheckSquare className="w-10 h-10 text-jade" />}
             title="一切就绪"
             description={detecting ? '正在扫描飞书知识库变更，请稍候…' : '无未同步变更。所有文档均为最新。'}
             action={{ label: detecting ? '检测中…' : '立即检测', onClick: handleDetect, disabled: detecting }}
           />
-        </CardBody>
+        </div>
       </Card>
     );
   }
 
   // ----- Success state with changes -----
   return (
-    <Card variant="elevated">
-      <CardHeader>
+    <Card variant="elevated" className={`min-w-0 flex flex-col h-full ${className}`}>
+      {/* 顶部标题栏（shrink-0） */}
+      <CardHeader className="shrink-0 px-4 py-3 sm:px-5 sm:py-3.5 border-b border-line">
         <div className="flex items-center justify-between gap-3">
           <div className="flex items-baseline gap-2.5">
             <h2 className="text-lg font-kai font-medium text-ink">变更列表</h2>
@@ -582,67 +556,35 @@ export function ChangeListPanel({
         </div>
       </CardHeader>
 
-      <CardBody className="space-y-3.5">
-        {/* Tab 栏 + 密度切换器 */}
-        <div className="flex items-center justify-between gap-2 border-b border-line pb-2.5">
-          {/* Tabs 过滤 */}
-          <div className="flex items-center gap-1.5 overflow-x-auto scrollbar-thin">
-            {(['all', 'added', 'modified', 'mediaGap', 'deleted'] as Tab[]).map((t) => {
-              const count = t === 'all' ? totalChanges : grouped[t].length;
-              const isActive = tab === t;
-              return (
-                <button
-                  key={t}
-                  type="button"
-                  onClick={() => setTab(t)}
-                  className={`inline-flex items-center gap-1.5 px-3 py-1 rounded text-xs font-sans-ui border transition-colors whitespace-nowrap cursor-pointer ${
-                    isActive
-                      ? 'bg-seal/10 text-seal border-seal/30 font-medium'
-                      : 'bg-paper text-ink-soft border-line hover:bg-paper-2'
+      {/* 过滤 Tab 栏与批量操作栏（shrink-0） */}
+      <div className="shrink-0 px-4 py-2.5 sm:px-5 border-b border-line bg-paper/40 space-y-2.5">
+        {/* Tabs 过滤 */}
+        <div className="flex items-center gap-1.5 overflow-x-auto scrollbar-thin">
+          {(['all', 'added', 'modified', 'mediaGap', 'deleted'] as Tab[]).map((t) => {
+            const count = t === 'all' ? totalChanges : grouped[t].length;
+            const isActive = tab === t;
+            return (
+              <button
+                key={t}
+                type="button"
+                onClick={() => setTab(t)}
+                className={`inline-flex items-center gap-1.5 px-3 py-1 rounded text-xs font-sans-ui border transition-colors whitespace-nowrap cursor-pointer ${
+                  isActive
+                    ? 'bg-seal/10 text-seal border-seal/30 font-medium'
+                    : 'bg-paper text-ink-soft border-line hover:bg-paper-2'
+                }`}
+              >
+                <span>{TAB_LABEL[t]}</span>
+                <span
+                  className={`text-[11px] px-1.5 py-0.2 rounded-full font-mono ${
+                    isActive ? 'bg-seal/15 text-seal' : 'bg-paper-2 text-ink-faint'
                   }`}
                 >
-                  <span>{TAB_LABEL[t]}</span>
-                  <span
-                    className={`text-[11px] px-1.5 py-0.2 rounded-full font-mono ${
-                      isActive ? 'bg-seal/15 text-seal' : 'bg-paper-2 text-ink-faint'
-                    }`}
-                  >
-                    {count}
-                  </span>
-                </button>
-              );
-            })}
-          </div>
-
-          {/* 密度切换器：紧凑 vs 舒适 */}
-          <div className="shrink-0 flex items-center bg-paper-2/80 rounded border border-line/60 p-0.5">
-            <button
-              type="button"
-              onClick={() => handleDensityToggle('compact')}
-              title="紧凑模式（高密度浏览，默认）"
-              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-sans-ui transition-colors cursor-pointer ${
-                density === 'compact'
-                  ? 'bg-card-bg text-seal shadow-xs font-medium'
-                  : 'text-ink-soft hover:text-ink'
-              }`}
-            >
-              <AlignJustify className="w-3 h-3" />
-              <span>紧凑</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => handleDensityToggle('comfortable')}
-              title="舒适模式（两行元数据，易于阅读）"
-              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-sans-ui transition-colors cursor-pointer ${
-                density === 'comfortable'
-                  ? 'bg-card-bg text-seal shadow-xs font-medium'
-                  : 'text-ink-soft hover:text-ink'
-              }`}
-            >
-              <List className="w-3 h-3" />
-              <span>舒适</span>
-            </button>
-          </div>
+                  {count}
+                </span>
+              </button>
+            );
+          })}
         </div>
 
         {/* 批量操作工具栏 */}
@@ -694,94 +636,103 @@ export function ChangeListPanel({
             </div>
           </div>
         )}
+      </div>
 
-        {/* 高密度列表 / 表格视图 */}
-        {visibleChanges.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-12 text-center rounded-md border border-line/60 bg-paper-2/30">
-            <Inbox className="w-10 h-10 text-ink-faint mb-2" />
-            <p className="text-sm text-ink-soft font-sans-ui">当前筛选下无变更</p>
-          </div>
-        ) : (
-          <div className="rounded-md border border-line bg-card-bg overflow-hidden shadow-xs">
-            {/* 表头 Header */}
-            <div className="flex items-center gap-2.5 px-3 py-1.5 bg-paper-2/80 border-b border-line text-[11px] font-sans-ui text-ink-faint select-none">
-              {/* 表头全选复选框 */}
-              <div className="shrink-0 w-8 flex items-center justify-center">
-                <button
-                  type="button"
-                  onClick={handleSelectAll}
-                  disabled={currentSelectable.length === 0}
-                  className={`w-3.5 h-3.5 rounded border flex items-center justify-center transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
-                    allSelected
-                      ? 'border-seal bg-seal text-white'
-                      : someSelected
-                        ? 'border-seal bg-seal/20 text-seal'
-                        : 'border-line bg-card-bg hover:border-seal/60'
-                  }`}
-                  aria-label={allSelected ? '取消全选' : '全选'}
-                  title={allSelected ? '取消全选' : '全选当前'}
+      {/* 高密度表格容器（flex-1 min-h-0，内部纵向滚动） */}
+      <div className="flex-1 min-h-0 flex flex-col bg-card-bg overflow-hidden">
+        {/* 表头 Header（固定吸顶） */}
+        <div className="shrink-0 flex items-center gap-2.5 px-3 py-1.5 bg-paper-2/80 border-b border-line text-[11px] font-sans-ui text-ink-faint select-none">
+          {/* 表头全选复选框 */}
+          <div className="shrink-0 w-8 flex items-center justify-center">
+            <button
+              type="button"
+              onClick={handleSelectAll}
+              disabled={currentSelectable.length === 0}
+              className={`w-3.5 h-3.5 rounded border flex items-center justify-center transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
+                allSelected
+                  ? 'border-seal bg-seal text-white'
+                  : someSelected
+                    ? 'border-seal bg-seal/20 text-seal'
+                    : 'border-line bg-card-bg hover:border-seal/60'
+              }`}
+              aria-label={allSelected ? '取消全选' : '全选'}
+              title={allSelected ? '取消全选' : '全选当前'}
+            >
+              {allSelected && (
+                <svg
+                  viewBox="0 0 12 12"
+                  className="w-2.5 h-2.5"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2.5"
                 >
-                  {allSelected && (
-                    <svg
-                      viewBox="0 0 12 12"
-                      className="w-2.5 h-2.5"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="2.5"
-                    >
-                      <path d="M2.5 6.5L5 9L9.5 3.5" strokeLinecap="round" strokeLinejoin="round" />
-                    </svg>
-                  )}
-                  {someSelected && (
-                    <span className="w-2 h-0.5 bg-seal rounded-full" />
-                  )}
-                </button>
-              </div>
-
-              {/* 类型与标题列 */}
-              <div className="flex-1 min-w-0 pr-2 flex items-center gap-1.5">
-                <span>文档与路径</span>
-                <span className="text-[10px] text-ink-faint/60 hidden sm:inline">
-                  ({visibleChanges.length} 条)
-                </span>
-              </div>
-
-              {/* 状态列 */}
-              <div className="shrink-0 w-22 sm:w-26 text-left">
-                <span>变更状态</span>
-              </div>
-
-              {/* 时间列 */}
-              <div className="shrink-0 w-22 sm:w-26 text-right">
-                <span>云端更新</span>
-              </div>
-
-              {/* 详情列 */}
-              <div className="shrink-0 w-9 text-center">
-                <span>详情</span>
-              </div>
-            </div>
-
-            {/* 表体 Rows */}
-            <div className="divide-y divide-line/30">
-              {visibleChanges.map((change) => (
-                <ChangeItem
-                  key={change.objToken}
-                  change={change}
-                  density={density}
-                  selected={selectedTokens.includes(change.objToken)}
-                  onToggleSelect={handleToggle}
-                  sheets={sheetSubs[change.objToken]}
-                  onSyncSub={handleSyncSub}
-                  onTrash={onTrash}
-                  onPurge={onPurge}
-                  onOpenFolder={onOpenFolder}
-                />
-              ))}
-            </div>
+                  <path d="M2.5 6.5L5 9L9.5 3.5" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              )}
+              {someSelected && (
+                <span className="w-2 h-0.5 bg-seal rounded-full" />
+              )}
+            </button>
           </div>
-        )}
-      </CardBody>
+
+          {/* 类型与标题列 */}
+          <div className="flex-1 min-w-0 pr-2 flex items-center gap-1.5">
+            <span>文档与路径</span>
+            <span className="text-[10px] text-ink-faint/60 hidden sm:inline">
+              ({visibleChanges.length} 条)
+            </span>
+          </div>
+
+          {/* 状态列 */}
+          <div className="shrink-0 w-22 sm:w-26 text-left">
+            <span>变更状态</span>
+          </div>
+
+          {/* 时间列 */}
+          <div className="shrink-0 w-22 sm:w-26 text-right">
+            <span>云端更新</span>
+          </div>
+
+          {/* 详情列 */}
+          <div className="shrink-0 w-9 text-center">
+            <span>详情</span>
+          </div>
+        </div>
+
+        {/* 表体 Rows（内部滚动区域） */}
+        <div className="flex-1 min-h-0 overflow-y-auto scrollbar-thin divide-y divide-line/30">
+          {visibleChanges.length === 0 ? (
+            <div className="flex flex-col items-center justify-center py-16 text-center">
+              <Inbox className="w-10 h-10 text-ink-faint mb-2" />
+              <p className="text-sm text-ink-soft font-sans-ui">当前筛选下无变更</p>
+            </div>
+          ) : (
+            visibleChanges.map((change) => (
+              <ChangeItem
+                key={change.objToken}
+                change={change}
+                selected={selectedTokens.includes(change.objToken)}
+                onToggleSelect={handleToggle}
+                sheets={sheetSubs[change.objToken]}
+                onSyncSub={handleSyncSub}
+                onTrash={onTrash}
+                onPurge={onPurge}
+                onOpenFolder={onOpenFolder}
+              />
+            ))
+          )}
+        </div>
+      </div>
+
+      {/* 底部信息栏（shrink-0） */}
+      <div className="shrink-0 px-4 py-2 border-t border-line/60 bg-paper/60 flex items-center justify-between text-[11px] text-ink-faint font-sans-ui">
+        <span>
+          当前显示 {visibleChanges.length} 项 · 已选 {selectedTokens.length} 项
+        </span>
+        <span className="hidden sm:inline text-ink-faint/70">
+          点击行勾选 · 点击详情展开完整路径与操作
+        </span>
+      </div>
     </Card>
   );
 }
