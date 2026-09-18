@@ -146,6 +146,13 @@ export class MappingService {
     let checkedAt = '';
 
     for (const document of documents) {
+      // 回收站行（cloud_deleted=1，含 deleted_confirmed）不进任何变更分组：
+      // 「已删除」分组只呈现待处理的删除候选（missing_candidate），由
+      // POST /api/trash/bulk-process 处理；已确认软删的行归回收站面板
+      // （GET /api/trash）管理。否则移入回收站后条目会回灌变更列表，
+      // 永远清不掉（2026-09 变更列表删除项修复）。
+      if (document.cloudDeleted === 1) continue;
+
       if (document.lastSeenAt && document.lastSeenAt > checkedAt) {
         checkedAt = document.lastSeenAt;
       }
@@ -163,11 +170,7 @@ export class MappingService {
           'modified',
           hierarchyByObjToken.get(document.objToken) ?? null,
         ));
-      } else if (
-        state === 'missing_candidate' ||
-        state === 'deleted_confirmed' ||
-        document.cloudDeleted === 1
-      ) {
+      } else if (state === 'missing_candidate') {
         deleted.push(this.toStoredChangedDocument(
           document,
           'deleted',

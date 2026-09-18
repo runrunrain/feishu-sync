@@ -720,6 +720,43 @@ export async function manualDeleteDoc(objToken: string): Promise<{
   return result;
 }
 
+/**
+ * POST /api/trash/bulk-process 批量处理结果（2026-09 变更列表修复）。
+ * failed 内 reason 常见值：not_deletion_candidate（活行非删除候选，拒删）、
+ * purge_failed（DB/IO 删除失败，详见服务端日志）、purge_noop_row_kept
+ * （行未被删除而残留，异常数据防御）。
+ * warnings：非阻断性缺陷，如 file_move_failed（软删成功但本地文件移入
+ * .trash-bin 失败；行已在回收站，可在回收站面板继续处理）。
+ */
+export interface BulkProcessDeletedResult {
+  requested: number;
+  trashed: number;
+  purged: number;
+  already_trashed: number;
+  gone: number;
+  failed: Array<{ obj_token: string; reason: string }>;
+  warnings: Array<{ obj_token: string; reason: string }>;
+}
+
+/**
+ * POST /api/trash/bulk-process — 批量处理变更列表删除候选（missing_candidate）：
+ *   - action='trash'：软删进回收站（cloud_deleted=1）+ 本地 .md 移入
+ *     .trash-bin/（可在回收站面板恢复/清理）；
+ *   - action='purge'：硬删（unlink 本地文件 + 删映射行），不可恢复。
+ * 服务端仅接受删除候选状态，活文档（synced/pending_*）会被拒（failed）。
+ */
+export async function bulkProcessDeletedDocs(
+  objTokens: string[],
+  action: 'trash' | 'purge',
+): Promise<BulkProcessDeletedResult> {
+  const result = await request<BulkProcessDeletedResult>('/api/trash/bulk-process', {
+    method: 'POST',
+    body: JSON.stringify({ obj_tokens: objTokens, action, confirmation: 'DELETE' }),
+  });
+  emitDiffChanged(`trash-bulk-${action}`);
+  return result;
+}
+
 // ============================================================================
 // Channel Connectivity Test (T7, decision 3 real bigmodel call)
 // ============================================================================

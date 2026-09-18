@@ -6,6 +6,14 @@
 
 ---
 
+## [0.3.40] - 2026-09-18
+
+### Fixed（fix/ui）
+
+- **变更列表「已删除」项批量处理落地（此前前端为 stub，删除候选永远清不掉）**：同步页删除分组此前只有 stub 未接后端，missing_candidate 堆积无法处置。新增 `POST /api/trash/bulk-process` 批量端点：`action='trash'` 软删进回收站（cloud_deleted=1 + deleted_confirmed）+ 本地 .md best-effort 移入 `.trash-bin/` 镜像路径；`action='purge'` 硬删（unlink 原路径与 .trash-bin 副本 + 删映射行，不可恢复）。防误删红线：仅接受 missing_candidate / deleted_confirmed 状态，活文档（synced/pending_*）一律记 failed 拒删，需 `confirmation:'DELETE'`。
+- **回收站行回灌变更列表修复**：`MappingService` 变更分组此前不过滤 `cloud_deleted=1` 行，移入回收站后条目立即回灌变更列表、永远清不掉。修复：回收站行（含 deleted_confirmed）不进任何变更分组，「已删除」分组只呈现待处理删除候选，已确认软删行归回收站面板管理。
+- **前端单条 + 批量接线**：删除项单条「移入回收站/彻底删除」与选中批量操作直连 bulk-process；结果按成功（done 数）/ 部分成功（warnings，如 file_move_failed）/ 失败（failed 原因去重）三级 toast 如实反馈，操作后刷新变更列表。补路由层回归测试（bulk trash/purge/跳过已删/文件丢失/活行拒删等）。
+
 ## [0.3.39] - 2026-09-14
 
 ### Changed（ui）

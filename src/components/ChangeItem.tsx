@@ -53,6 +53,8 @@ export interface ChangeItemProps {
   onPurge?: (objToken: string) => void;
   /** Optional handler to reveal/open document local folder */
   onOpenFolder?: (localMdPath: string) => void;
+  /** 批量处理进行中：禁用单条「移入回收站/永久清理」，防重复提交。 */
+  actionDisabled?: boolean;
 }
 
 const TYPE_ICON = {
@@ -97,6 +99,7 @@ export function ChangeItem({
   onTrash,
   onPurge,
   onOpenFolder,
+  actionDisabled = false,
 }: ChangeItemProps) {
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -374,11 +377,12 @@ export function ChangeItem({
                 {onTrash && (
                   <button
                     type="button"
+                    disabled={actionDisabled}
                     onClick={(e) => {
                       e.stopPropagation();
                       onTrash(change.objToken);
                     }}
-                    className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] text-ink-soft border border-line rounded bg-card-bg hover:bg-paper font-sans-ui transition-colors cursor-pointer"
+                    className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] text-ink-soft border border-line rounded bg-card-bg hover:bg-paper font-sans-ui transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     移入回收站
                   </button>
@@ -386,11 +390,12 @@ export function ChangeItem({
                 {onPurge && (
                   <button
                     type="button"
+                    disabled={actionDisabled}
                     onClick={(e) => {
                       e.stopPropagation();
                       onPurge(change.objToken);
                     }}
-                    className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] text-seal-2 border border-seal-2/40 rounded bg-card-bg hover:bg-seal-2/5 font-sans-ui transition-colors cursor-pointer"
+                    className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] text-seal-2 border border-seal-2/40 rounded bg-card-bg hover:bg-seal-2/5 font-sans-ui transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     <Trash2 className="w-3 h-3" />
                     永久清理

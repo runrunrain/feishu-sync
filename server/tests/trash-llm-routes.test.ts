@@ -39,6 +39,8 @@ interface FakeDoc {
   local_md_path?: string;
   cloudDeleted?: number;
   cloud_deleted?: number;
+  syncState?: string;
+  sync_state?: string;
   lastSeenAt?: string | null;
   last_seen_at?: string | null;
   updatedAt?: string;
@@ -54,6 +56,8 @@ function makeFakeStore(docs: FakeDoc[]) {
     local_md_path: d.localMdPath ?? d.local_md_path ?? '',
     cloudDeleted: d.cloudDeleted ?? d.cloud_deleted ?? 0,
     cloud_deleted: d.cloudDeleted ?? d.cloud_deleted ?? 0,
+    syncState: d.syncState ?? d.sync_state ?? null,
+    sync_state: d.syncState ?? d.sync_state ?? null,
     lastSeenAt: d.lastSeenAt ?? d.last_seen_at ?? null,
     last_seen_at: d.lastSeenAt ?? d.last_seen_at ?? null,
     updatedAt: d.updatedAt ?? d.updated_at ?? '2026-06-18T00:00:00Z',
@@ -63,6 +67,7 @@ function makeFakeStore(docs: FakeDoc[]) {
   let list = rows.filter((r) => r.cloudDeleted === 1);
   const purged: string[] = [];
   const restored: string[] = [];
+  const marked: string[] = [];
 
   return {
     listCloudDeleted: () => list.slice(),
@@ -74,6 +79,18 @@ function makeFakeStore(docs: FakeDoc[]) {
         if (r.objToken === tok) {
           r.cloudDeleted = 0;
           r.cloud_deleted = 0;
+        }
+      });
+      list = rows.filter((r) => r.cloudDeleted === 1);
+    },
+    markCloudDeleted: (tok: string, _ts: string) => {
+      marked.push(tok);
+      rows.forEach((r) => {
+        if (r.objToken === tok) {
+          r.cloudDeleted = 1;
+          r.cloud_deleted = 1;
+          r.syncState = 'deleted_confirmed';
+          r.sync_state = 'deleted_confirmed';
         }
       });
       list = rows.filter((r) => r.cloudDeleted === 1);
@@ -93,6 +110,8 @@ function makeFakeStore(docs: FakeDoc[]) {
     },
     _purged: () => purged.slice(),
     _restored: () => restored.slice(),
+    _marked: () => marked.slice(),
+    _rows: () => rows.slice(),
   };
 }
 
@@ -428,6 +447,119 @@ describe('POST /api/trash/manual-delete', () => {
       }),
     );
     expect(res400.status).toBe(400);
+  });
+});
+
+// ============================================================================
+// POST /api/trash/bulk-process tests (2026-09 变更列表删除候选批量处理)
+// ============================================================================
+
+describe('POST /api/trash/bulk-process', () => {
+  beforeEach(() => setupKb());
+  afterEach(() => teardownKb());
+
+  function buildApp(store: ReturnType<typeof makeFakeStore>) {
+    return buildDiApp({
+      localMapStore: store,
+      configManager: { getConfig: () => ({ knowledgeBaseRoot: tmpRoot }) },
+    });
+  }
+
+  function call(app: ReturnType<typeof buildDiApp>, payload: unknown) {
+    return app.fetch(
+      new Request('http://x/api/trash/bulk-process', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+    );
+  }
+
+  it('trash: marks candidates cloud_deleted, moves files into .trash-bin, skips already-trashed and gone rows', async () => {
+    // Candidate A has a live local file; candidate B's file is gone from disk.
+    const original = path.join(tmpRoot, 'docs', 'sub', 'a.md');
+    fs.writeFileSync(original, 'hello');
+
+    const store = makeFakeStore([
+      { objToken: 'AAA', title: 'A', localMdPath: 'docs/sub/a.md', syncState: 'missing_candidate' },
+      { objToken: 'BBB', title: 'B', localMdPath: 'docs/gone.md', syncState: 'missing_candidate' },
+      { objToken: 'CCC', title: 'C', localMdPath: 'docs/c.md', cloudDeleted: 1, syncState: 'deleted_confirmed' },
+      { objToken: 'ZZZ', title: 'Z', localMdPath: 'docs/z.md' },
+    ]);
+    const app = buildApp(store);
+
+    const res = await call(app, {
+      obj_tokens: ['AAA', 'BBB', 'CCC', 'ZZZ', 'GONE-ROW'],
+      action: 'trash',
+      confirmation: 'DELETE',
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    // Candidates trashed, trash-managed row skipped, vanished row counted gone.
+    expect(body.trashed).toBe(2);
+    expect(body.already_trashed).toBe(1);
+    expect(body.gone).toBe(1);
+    // Live synced row is refused (防误删红线).
+    expect(body.failed).toEqual([{ obj_token: 'ZZZ', reason: 'not_deletion_candidate' }]);
+    expect(body.warnings).toEqual([]); // 正常路径无 warning（move 失败才记）
+    expect(store._marked()).toEqual(['AAA', 'BBB']);
+
+    // File moved from original path into mirrored .trash-bin layout.
+    const staged = path.join(tmpRoot, '.trash-bin', 'docs', 'sub', 'a.md');
+    expect(fs.existsSync(original)).toBe(false);
+    expect(fs.existsSync(staged)).toBe(true);
+    // Missing file is non-fatal: row still soft-deleted.
+    expect(store.getDocumentByObjToken('BBB').cloudDeleted).toBe(1);
+  });
+
+  it('purge: hard-deletes candidate rows and both file copies', async () => {
+    const original = path.join(tmpRoot, 'docs', 'a.md');
+    fs.writeFileSync(original, 'hello');
+    const staged = path.join(tmpRoot, '.trash-bin', 'docs', 'a.md');
+    fs.mkdirSync(path.dirname(staged), { recursive: true });
+    fs.writeFileSync(staged, 'staged');
+
+    const store = makeFakeStore([
+      { objToken: 'AAA', title: 'A', localMdPath: 'docs/a.md', syncState: 'missing_candidate' },
+      // Trash-managed rows also purge via the same endpoint (回收站单条清理同语义).
+      { objToken: 'CCC', title: 'C', localMdPath: 'docs/c.md', cloudDeleted: 1, syncState: 'deleted_confirmed' },
+    ]);
+    const app = buildApp(store);
+
+    const res = await call(app, {
+      obj_tokens: ['AAA', 'CCC'],
+      action: 'purge',
+      confirmation: 'DELETE',
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.purged).toBe(2);
+    expect(body.failed).toEqual([]);
+    expect(body.warnings).toEqual([]);
+    // 行确认彻底消失（purge 后复查防御：purge_noop_row_kept 不得虚报 purged）。
+    expect(store.getDocumentByObjToken('AAA')).toBeNull();
+    expect(store.getDocumentByObjToken('CCC')).toBeNull();
+    expect(store._purged()).toEqual(['AAA', 'CCC']);
+    expect(store.getDocumentByObjToken('AAA')).toBeNull();
+    // Both the original path and the .trash-bin copy are unlinked.
+    expect(fs.existsSync(original)).toBe(false);
+    expect(fs.existsSync(staged)).toBe(false);
+  });
+
+  it('rejects missing confirmation / invalid action / empty tokens with 400', async () => {
+    const store = makeFakeStore([]);
+    const app = buildApp(store);
+
+    const noConfirm = await call(app, { obj_tokens: ['AAA'], action: 'trash' });
+    expect(noConfirm.status).toBe(400);
+    expect((await noConfirm.json()).error).toBe('confirmation_required');
+
+    const badAction = await call(app, { obj_tokens: ['AAA'], action: 'shred', confirmation: 'DELETE' });
+    expect(badAction.status).toBe(400);
+
+    const emptyTokens = await call(app, { obj_tokens: [], action: 'trash', confirmation: 'DELETE' });
+    expect(emptyTokens.status).toBe(400);
   });
 });
 

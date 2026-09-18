@@ -27,7 +27,7 @@ import { useSync } from '../hooks/useSync';
 import { useToast } from '../components/common/Toast';
 import { appLogger } from '../utils/appLogger';
 import { isUsableWikiUrl, pickFirstValidWikiUrl } from '../utils/wikiUrl';
-import { detectChanges, requestFeishuPendingRecheck } from '../api/client';
+import { detectChanges, requestFeishuPendingRecheck, bulkProcessDeletedDocs } from '../api/client';
 import type { ChangedDocument, DiffReport, FailedDocument, FeishuPendingItem } from '../types';
 
 interface SyncViewProps {
@@ -363,14 +363,69 @@ export function SyncView({ active = true }: SyncViewProps) {
 
   const handleClearResult = () => sync.clear();
 
-  // Trash / purge stubs (from ChangeItem) wired to TrashDrawer opener.
+  // 2026-09 修复：变更列表删除候选处理接线。此前这里是 stub——只打开
+  // 回收站抽屉，从未调用后端，导致单条/批量点击均无实际效果且回收站
+  // 始终为空。单条与批量统一走 POST /api/trash/bulk-process：
+  //   - trash：软删进回收站（文件移入 .trash-bin，可在抽屉里恢复）；
+  //   - purge：硬删本地文件与映射行，不可恢复，需 confirm（项目惯例）。
+  const [deletedProcessing, setDeletedProcessing] = useState(false);
+
+  const handleDeletedProcess = async (objTokens: string[], action: 'trash' | 'purge') => {
+    if (objTokens.length === 0 || deletedProcessing) return;
+    const label = action === 'trash' ? '移入回收站' : '永久清理';
+    if (action === 'purge') {
+      const confirmed = typeof window === 'undefined' || window.confirm(
+        `永久清理 ${objTokens.length} 项已删除文档？\n\n本地 .md 文件与映射记录将被彻底删除，该操作不可恢复。`,
+      );
+      if (!confirmed) return;
+    }
+    setDeletedProcessing(true);
+    try {
+      const res = await bulkProcessDeletedDocs(objTokens, action);
+      const done = action === 'trash' ? res.trashed : res.purged;
+      if (res.failed.length === 0 && res.warnings.length === 0) {
+        toast.push({
+          type: 'success',
+          message: `${label}完成：${done} 项${action === 'trash' ? '已进入回收站' : '已彻底删除'}`,
+          hint: action === 'trash'
+            ? '可在底部「回收站」中查看与恢复；云端若恢复文档，重新检测即可找回。'
+            : undefined,
+        });
+      } else if (res.failed.length === 0) {
+        // 非阻断性缺陷：主体成功但个别文件移动失败，如实提示（diting Minor#1）。
+        toast.push({
+          type: 'warning',
+          message: `${label}完成：${done} 项，但 ${res.warnings.length} 项文件移动失败`,
+          hint: '对应文档已进入回收站，但本地 .md 仍在原路径；可在回收站中恢复或清理。',
+        });
+      } else {
+        toast.push({
+          type: 'warning',
+          message: `${label}完成 ${done} 项，${res.failed.length} 项失败`,
+          hint: `失败原因：${[...new Set(res.failed.map((f) => f.reason))].join('、')}`,
+        });
+      }
+      appLogger.info('sync-view', 'bulk-process deleted docs done', {
+        action, requested: res.requested, done, failed: res.failed.length,
+      });
+      setDiffRefreshSignal((value) => value + 1);
+    } catch (error) {
+      appLogger.error('sync-view', 'bulk-process deleted docs failed', error);
+      toast.push({
+        type: 'error',
+        message: `${label}失败`,
+        hint: error instanceof Error ? error.message : '请查看服务端日志',
+      });
+    } finally {
+      setDeletedProcessing(false);
+    }
+  };
+
   const handleTrash = (objToken: string) => {
-    setTrashOpen(true);
-    appLogger.info('sync-view', 'trash requested (open drawer)', { objToken });
+    void handleDeletedProcess([objToken], 'trash');
   };
   const handlePurge = (objToken: string) => {
-    setTrashOpen(true);
-    appLogger.info('sync-view', 'purge requested (open drawer)', { objToken });
+    void handleDeletedProcess([objToken], 'purge');
   };
 
   // Reset selection when a fresh sync result arrives.
@@ -410,6 +465,9 @@ export function SyncView({ active = true }: SyncViewProps) {
             onDiffChange={setDiff}
             onTrash={handleTrash}
             onPurge={handlePurge}
+            onBatchTrash={(tokens) => { void handleDeletedProcess(tokens, 'trash'); }}
+            onBatchPurge={(tokens) => { void handleDeletedProcess(tokens, 'purge'); }}
+            deletedProcessing={deletedProcessing}
             watchedRootUrls={config?.watchedRootUrls}
             reloadSignal={diffRefreshSignal}
             onBatchSync={() => {

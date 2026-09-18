@@ -340,6 +340,169 @@ trashRoutes.post('/api/trash/manual-delete', async (c) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// POST /api/trash/bulk-process — 删除候选批量处理（2026-09 变更列表修复）
+// ---------------------------------------------------------------------------
+//
+// 背景：变更列表「已删除」分组来自检测器两次完整遍历未命中的
+// missing_candidate 行（cloud_deleted=0）。此前前端「移入回收站/永久清理」
+// 按钮只是打开回收站抽屉的 stub，从未调用任何写操作，导致：
+//   1) 单条点击无实际效果、回收站始终为空（用户报告 36 项删除候选）；
+//   2) 删除候选没有任何批量处理入口。
+//
+// 请求体：{ obj_tokens: string[], action: 'trash' | 'purge', confirmation: 'DELETE' }
+//
+// 语义（与既有端点的关系）：
+//   - action='trash'：候选行软删（cloud_deleted=1 + deleted_confirmed，进
+//     回收站面板）+ 本地 .md best-effort 移入 .trash-bin/ 镜像相对路径
+//     （恢复/清理复用既有 restore/purge 语义）。等价于逐条 confirm
+//     missing-candidate，但额外完成文件移动。
+//   - action='purge'：候选行先软删再硬删（unlink 原路径与 .trash-bin 副本
+//     + 删 documents 行），复用 purgeOne；不可恢复。
+//   - 已在回收站的行（cloud_deleted=1）：trash 记 already_trashed 跳过；
+//     purge 正常清理（与回收站面板单条清理同语义）。
+//   - 幂等：行不存在记 gone，不报错。
+//   - 防误删红线：活行（cloud_deleted=0）仅接受 missing_candidate /
+//     deleted_confirmed 状态，其余（synced/pending_*）记 failed——不允许
+//     借本端点删除云端仍存在或待同步的文档。
+//
+// 响应：{ requested, trashed, purged, already_trashed, gone,
+//         failed: [{ obj_token, reason }] }
+// ---------------------------------------------------------------------------
+trashRoutes.post('/api/trash/bulk-process', async (c) => {
+  let body: any;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: 'invalid_json' }, 400);
+  }
+
+  const action =
+    body && typeof body === 'object' && (body.action === 'trash' || body.action === 'purge')
+      ? body.action
+      : null;
+  const tokens: string[] | null =
+    body && typeof body === 'object' && Array.isArray(body.obj_tokens)
+      ? (body.obj_tokens as unknown[]).every((t) => typeof t === 'string')
+        ? (body.obj_tokens as string[])
+        : null
+      : null;
+
+  if (!action) {
+    return c.json(
+      { error: 'invalid_body', message: "action must be 'trash' or 'purge'" },
+      400,
+    );
+  }
+  if (!tokens || tokens.length === 0) {
+    return c.json(
+      { error: 'invalid_body', message: 'obj_tokens (string[]) is required and must be non-empty' },
+      400,
+    );
+  }
+  if (body?.confirmation !== 'DELETE') {
+    return c.json(
+      {
+        error: 'confirmation_required',
+        message: '请在请求体中提供 confirmation: "DELETE" 以确认批量处理删除候选。',
+      },
+      400,
+    );
+  }
+
+  try {
+    const store = (c as any).localMapStore;
+    const configManager = (c as any).configManager;
+    if (!store || !configManager) {
+      return c.json({ error: 'dependencies_not_injected' }, 500);
+    }
+
+    const config = configManager.getConfig?.() ?? (await configManager.load?.());
+    const root: string | undefined = config?.knowledgeBaseRoot;
+    if (root) ensureTrashBin(root);
+
+    const now = new Date().toISOString();
+    const counts = {
+      requested: tokens.length,
+      trashed: 0,
+      purged: 0,
+      already_trashed: 0,
+      gone: 0,
+    };
+    const failed: Array<{ obj_token: string; reason: string }> = [];
+    // 软删成功但文件移动失败（IO 异常）非阻断性缺陷：行已入回收站，
+    // restore/purge 均兼容「文件仍在原路径」，但必须上报而非静默吞掉
+    // （diting 审核 Minor#1：可观测性缺口）。
+    const warnings: Array<{ obj_token: string; reason: string }> = [];
+
+    for (const objToken of tokens) {
+      const doc = store.getDocumentByObjToken(objToken) as any;
+      if (!doc) {
+        counts.gone += 1;
+        continue;
+      }
+
+      const cloudDeleted = doc.cloudDeleted === 1 || doc.cloudDeleted === true;
+      if (!cloudDeleted) {
+        // 防误删：活行仅接受删除候选状态。
+        const syncState: string | undefined = doc.syncState ?? doc.sync_state;
+        if (syncState !== 'missing_candidate' && syncState !== 'deleted_confirmed') {
+          failed.push({ obj_token: objToken, reason: 'not_deletion_candidate' });
+          continue;
+        }
+      }
+
+      if (action === 'trash') {
+        if (cloudDeleted) {
+          counts.already_trashed += 1;
+          continue;
+        }
+        store.markCloudDeleted(objToken, now);
+        // 文件移动 best-effort：失败不回滚 DB 标记（restore/purge 均兼容
+        // 「行已软删但文件仍在原路径」的状态，见 restore 的 non-fatal 注释），
+        // 但记入 warnings 让前端可提示（diting 审核 Minor#1）。
+        const localMdPath: string | undefined = doc.localMdPath ?? doc.local_md_path;
+        if (root && localMdPath) {
+          const originalAbs = safeResolve(root, localMdPath);
+          const trashAbs = computeTrashPath(root, localMdPath);
+          if (originalAbs && trashAbs && fs.existsSync(originalAbs)) {
+            if (!moveFileSafe(originalAbs, trashAbs)) {
+              warnings.push({ obj_token: objToken, reason: 'file_move_failed' });
+            }
+          }
+        }
+        counts.trashed += 1;
+        continue;
+      }
+
+      // action === 'purge'
+      if (!cloudDeleted) store.markCloudDeleted(objToken, now);
+      const ok = purgeOne(store, root, objToken, doc);
+      // purgeOne 以异常为失败信号，但 purgeCloudDeleted 的 DELETE WHERE
+      // sync_state='deleted_confirmed' 不命中时既不抛错也不删行（零计数）。
+      // 复查行是否真的消失，残留时如实上报而非虚报 purged
+      // （diting 审核 Minor#2：预存缺陷在本批扩大暴露面的轻量防御）。
+      const rowStillPresent = store.getDocumentByObjToken(objToken) != null;
+      if (ok && !rowStillPresent) {
+        counts.purged += 1;
+      } else {
+        failed.push({ obj_token: objToken, reason: rowStillPresent ? 'purge_noop_row_kept' : 'purge_failed' });
+      }
+    }
+
+    return c.json({ ...counts, failed, warnings });
+  } catch (error) {
+    console.error('[trash] bulk-process failed:', error);
+    return c.json(
+      {
+        error: 'trash_bulk_process_failed',
+        message: error instanceof Error ? error.message : String(error),
+      },
+      500,
+    );
+  }
+});
+
 trashRoutes.delete('/api/trash/purge', async (c) => {
   const objToken = c.req.query('obj_token');
   const allFlag = c.req.query('all');

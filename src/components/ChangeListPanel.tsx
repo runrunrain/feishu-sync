@@ -54,9 +54,20 @@ interface ChangeListPanelProps {
    * payload without re-implementing the diff fetch.
    */
   onDiffChange?: (diff: DiffReport | null) => void;
-  /** Deleted-state action stubs (TrashDrawer wiring lands in P4-2). */
+  /**
+   * 删除候选单条处理（2026-09 修复后由 SyncView 接线到
+   * POST /api/trash/bulk-process：trash=软删进回收站，purge=硬删）。
+   */
   onTrash?: (objToken: string) => void;
   onPurge?: (objToken: string) => void;
+  /**
+   * 删除候选批量处理（2026-09 变更列表修复）：tokens 为全部删除候选的
+   * objToken 列表；未注入时隐藏批量入口，仅保留单条操作。
+   */
+  onBatchTrash?: (tokens: string[]) => void;
+  onBatchPurge?: (tokens: string[]) => void;
+  /** 批量处理进行中（禁用批量按钮，防止重复提交）。 */
+  deletedProcessing?: boolean;
   /**
    * v0.2.0 sync-state-timeout-fix §问题1: when more than one watchedRoot is
    * configured the singular `rootUrl` only reflects the FIRST valid root,
@@ -206,6 +217,9 @@ export function ChangeListPanel({
   onDiffChange,
   onTrash,
   onPurge,
+  onBatchTrash,
+  onBatchPurge,
+  deletedProcessing = false,
   watchedRootUrls,
   reloadSignal = 0,
   onBatchSync,
@@ -599,6 +613,50 @@ export function ChangeListPanel({
           allSelected={allSelected}
         />
 
+        {/* 提示条：删除候选批量处理入口（2026-09 修复）。
+            此前删除项没有任何批量入口，36+ 项只能逐条点开详情操作；
+            现在在「全部」与「已删除」两个视图下提供一键处理。 */}
+        {grouped.deleted.length > 0 && (tab === 'all' || tab === 'deleted') && onBatchTrash && onBatchPurge && (() => {
+          const deletedTokens = grouped.deleted.map((d) => d.objToken);
+          return (
+            <div className="flex items-center justify-between px-3 py-1.5 rounded border border-ink-faint/25 bg-paper-2/70 text-xs font-sans-ui text-ink-soft">
+              <div className="flex items-center gap-2">
+                <span className="w-1.5 h-1.5 rounded-full bg-ink-faint shrink-0" />
+                <span>
+                  检测到 {grouped.deleted.length} 项云端已删除文档（本地文件与映射仍在）
+                </span>
+              </div>
+              <div className="flex items-center gap-2.5">
+                <button
+                  type="button"
+                  disabled={deletedProcessing}
+                  onClick={() => onBatchTrash(deletedTokens)}
+                  className="px-2.5 py-1 rounded border border-line bg-card-bg text-ink-soft hover:bg-paper hover:text-ink transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  全部移入回收站
+                </button>
+                <button
+                  type="button"
+                  disabled={deletedProcessing}
+                  onClick={() => onBatchPurge(deletedTokens)}
+                  className="px-2.5 py-1 rounded border border-seal-2/40 bg-card-bg text-seal-2 hover:bg-seal-2/5 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  全部永久清理
+                </button>
+                {tab === 'all' && (
+                  <button
+                    type="button"
+                    onClick={() => setTab('deleted')}
+                    className="text-ink-soft hover:text-ink transition-colors cursor-pointer"
+                  >
+                    查看
+                  </button>
+                )}
+              </div>
+            </div>
+          );
+        })()}
+
         {/* 提示条：图片缺失待修复提示 */}
         {grouped.mediaGap.length > 0 && tab === 'all' && (
           <div className="flex items-center justify-between px-3 py-1.5 rounded border border-seal/20 bg-seal/5 text-xs font-sans-ui text-ink-soft">
@@ -717,6 +775,7 @@ export function ChangeListPanel({
                 onSyncSub={handleSyncSub}
                 onTrash={onTrash}
                 onPurge={onPurge}
+                actionDisabled={deletedProcessing}
                 onOpenFolder={onOpenFolder}
               />
             ))
