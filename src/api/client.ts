@@ -290,6 +290,8 @@ export interface DeviceAuthStartResult {
   deviceCode: string;
   /** 秒；lark-cli 契约默认 600。 */
   expiresIn: number;
+  /** 本次请求的 scope 集（2026-10 起服务端返回；旧版本无此字段）。 */
+  requestedScopes?: string[];
 }
 
 /** POST /api/feishu/auth/device/complete —— 阻塞等待授权后的最终状态。 */

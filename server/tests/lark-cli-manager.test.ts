@@ -376,6 +376,7 @@ describe('device auth flow', () => {
       deviceCode: 'dc-123',
       verificationUrl: 'https://open.feishu.cn/device-verify?dc=dc-123',
       expiresIn: 600,
+      requestedScopes: ['wiki:node:retrieve', 'offline_access'],
     });
     expect(execFileMock).toHaveBeenCalledWith(
       expect.any(String),
@@ -496,6 +497,9 @@ describe('device auth flow', () => {
     const session = await manager.startDeviceAuth();
 
     expect(session.deviceCode).toBe('dc-123');
+    // 降级后 requestedScopes 必须与实际发给 lark-cli 的最小必需集一致
+    // （diting 审查 F2：否则前端「本次申请 N 项」提示会虚报并集数量）。
+    expect(session.requestedScopes).toEqual(['wiki:node:retrieve', 'offline_access']);
     expect(execFileMock).toHaveBeenCalledTimes(2);
     const secondScopeArg = execFileMock.mock.calls[1][1].at(-1) as string;
     expect(secondScopeArg).toBe('wiki:node:retrieve offline_access');

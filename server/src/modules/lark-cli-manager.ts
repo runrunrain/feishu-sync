@@ -102,6 +102,11 @@ export interface DeviceAuthSession {
   deviceCode: string;
   /** 秒；lark-cli 契约默认 600。 */
   expiresIn: number;
+  /** 本次 device flow 实际请求的 scope 集（并集被整单拒绝降级后为最小必需集）。
+   * 供前端等待态提示「授权页需勾选全部 N 项权限」——2026-10 实测（新设备
+   * 全新授权案例 + 同事 9 月案例交叉证实）：飞书授权页存在权限勾选列表，
+   * 未勾选/未列出的 scope 会被服务端静默丢弃且流程仍报「授权成功」。 */
+  requestedScopes: string[];
 }
 
 export interface DeviceAuthCompleteResult {
@@ -515,12 +520,14 @@ export class LarkCliManager {
       );
     };
 
+    let requestedScopes = union;
     let out = await attempt(union);
     if (augmented && INVALID_SCOPE_RE.test(`${out.stdout}\n${out.stderr}`)) {
       console.warn(
         '[LarkCliManager] 并集 scope 请求被上游整单拒绝，降级为最小必需集重试',
       );
       out = await attempt(required);
+      requestedScopes = required;
     }
     const raw = `${out.stdout}\n${out.stderr}`;
 
@@ -550,7 +557,7 @@ export class LarkCliManager {
     }
 
     this.pendingDeviceAuth = { deviceCode, startedAt: Date.now() };
-    return { verificationUrl, deviceCode, expiresIn };
+    return { verificationUrl, deviceCode, expiresIn, requestedScopes };
   }
 
   /**

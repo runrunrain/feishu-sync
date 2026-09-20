@@ -152,10 +152,26 @@ export function useLarkCliSetup(
         onStatusChangedRef.current?.();
       } else {
         setAuthPhase('failed');
-        setAuthError(
-          result.error
-            || `授权后仍缺少权限：${result.missingScopes?.join('、') ?? '未知'}，可重试授权`,
-        );
+        const missingScopes = result.missingScopes ?? [];
+        if (result.ok && missingScopes.length > 0) {
+          // 授权流程已完成（用户点了同意、token 已写入）且携带缺失清单——
+          // 仅此场景才是「授权页勾选列表未勾全被服务端静默丢弃」（2026-10
+          // 实测）。missingScopes 为空的 ready:false（未认证/identity 非 user/
+          // 认证检查异常等，见 checkAuthReady 的其它 4 个分支）必须回退
+          // result.error，否则「0 项权限未被授予」误导且吞掉真实原因
+          // （diting 审查 F1）。
+          setAuthError(
+            `授权已完成，但本次申请的 ${missingScopes.length} 项权限未被授予（${missingScopes.join('、')}）。`
+              + '最常见原因：授权页的权限勾选列表未全部勾选。请点击「重试认证」，'
+              + '在打开的授权页中确认所有权限项均已勾选后再点「同意授权」；'
+              + '若勾选后仍缺失，多为 lark-cli 应用凭据未发布该权限，可先「更新 lark-cli」再重试。',
+          );
+        } else {
+          setAuthError(
+            result.error
+              || `授权后仍缺少权限：${missingScopes.join('、') || '未知'}，可重试授权`,
+          );
+        }
       }
     } catch (err) {
       if (controller.signal.aborted) {

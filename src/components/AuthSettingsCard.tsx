@@ -219,6 +219,13 @@ export function AuthSettingsCard() {
                 取消等待
               </Button>
             </div>
+            <p className="text-xs text-ink-soft leading-relaxed border-t border-seal/20 pt-2">
+              ⚠ 授权页会列出权限勾选列表
+              {setup.authSession.requestedScopes?.length
+                ? `（本次申请 ${setup.authSession.requestedScopes.length} 项权限）`
+                : ''}
+              ——请确认全部权限项已勾选后再点「同意授权」；未勾选的权限会被静默丢弃且不报错。
+            </p>
               </>
             )}
           </div>
