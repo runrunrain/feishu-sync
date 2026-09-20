@@ -230,11 +230,21 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
       const folders = await listCustomFolders();
       setCustomFolders(folders);
     } catch (err) {
+      // 首次配置前 knowledgeBaseRoot 为空是正常前置态，静默降级为空列表
+      // （2026-10 修复：此前 error toast 固定右下角，存活期内遮挡设置页
+      // 右下角的「保存设置」按钮，用户首次填本地根目录时无法保存）。
+      // 服务端已同步改为未配置返回空列表，这里兼底旧 server 混跑。
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('knowledge_base_root_not_configured')) {
+        appLogger.info('dashboard', 'custom folders skipped: knowledge base root not configured');
+        setCustomFolders([]);
+        return;
+      }
       appLogger.error('dashboard', 'listCustomFolders failed', err);
       toast.push({
         type: 'error',
         message: '自定义归档加载失败',
-        hint: err instanceof Error ? err.message : '',
+        hint: msg,
       });
     } finally {
       setCustomFoldersLoading(false);

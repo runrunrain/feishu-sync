@@ -30,7 +30,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
+import { resolveDataRoot } from './data-root.js';
 import type {
   Config,
   LayoutProfile,
@@ -42,7 +42,7 @@ import type {
 } from '../types/index.js';
 import { getEnabledWatchedRootUrls, isLegacyLlmConfig } from '../types/index.js';
 
-const DEFAULT_CONFIG_PATH = path.join(os.homedir(), '.feishu-sync', 'config.json');
+const DEFAULT_CONFIG_PATH = path.join(resolveDataRoot(), 'config.json');
 /**
  * Minimal user scopes for read-only wiki sync (must match lark-cli auth login).
  * Exported so LarkCliManager's device-flow scope assembly shares the same

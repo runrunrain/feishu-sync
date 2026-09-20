@@ -318,6 +318,14 @@ customFolderRoutes.get('/api/custom-folders', async (c) => {
     }));
     return c.json({ folders: result });
   } catch (error) {
+    // 2026-10 首次配置体验修复：knowledgeBaseRoot 未配置是首次使用的
+    // 正常前置态（列表语义就是空），返回空列表而非 500。此前 500 会触发
+    // 前端 Dashboard 挂载即弹「自定义归档加载失败」error toast，而 toast
+    // 固定在右下角且存活数秒，恰好遮挡设置页右下角的「保存设置」按钮——
+    // 用户首次填本地根目录时点击保存被 toast 拦截，感知为「无法保存」。
+    if (error instanceof Error && error.message === 'knowledge_base_root_not_configured') {
+      return c.json({ folders: [] });
+    }
     return errorResponse(c, 'custom_folders_list_failed', error);
   }
 });

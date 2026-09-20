@@ -8,7 +8,7 @@
 
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import os from 'node:os';
+import { resolveDataRoot } from './data-root.js';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 
@@ -44,7 +44,7 @@ export interface CreateOperationBackupOptions {
 /** Resolve the external recovery location used by all operation backups. */
 export function resolveRecoveryDirectory(configuredDirectory?: string): string {
   return path.resolve(
-    configuredDirectory || path.join(os.homedir(), '.feishu-sync', 'recovery'),
+    configuredDirectory || path.join(resolveDataRoot(), 'recovery'),
   );
 }
 

@@ -19,7 +19,7 @@
 
 import path from 'node:path';
 import fs from 'node:fs';
-import os from 'node:os';
+import { resolveDataRoot } from './data-root.js';
 import type {
   ChangedDocument,
   SyncResult,
@@ -408,7 +408,7 @@ export class SyncEngine {
         // ~/.feishu-sync/sync-errors.log，便于事后回溯。
         // 用 try/catch 包住：日志写入失败不能影响同步主流程。
         try {
-          const logPath = path.join(os.homedir(), '.feishu-sync', 'sync-errors.log');
+          const logPath = path.join(resolveDataRoot(), 'sync-errors.log');
           const header = `[${new Date().toISOString()}] ${doc.objToken} (${doc.title})\n`;
           const body = errStack ? `${errMsg}\n${errStack}\n` : `${errMsg}\n`;
           fs.appendFileSync(logPath, `${header}${body}---\n`);

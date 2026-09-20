@@ -66,6 +66,16 @@ export function CustomArchiveSettingsCard() {
       const list = await listCustomFolders();
       setFolders(list);
     } catch (e) {
+      // 首次配置前 knowledgeBaseRoot 为空是正常前置态，静默为空列表
+      // （2026-10 修复：error toast 右下角存活期内会遮挡设置页「保存」
+      // 按钮，详见 Dashboard.loadCustomFolders 同款处理）。服务端已同步
+      // 返回空列表，这里兼底旧 server。
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes('knowledge_base_root_not_configured')) {
+        appLogger.info('custom-archive-settings', 'list skipped: knowledge base root not configured');
+        setFolders([]);
+        return;
+      }
       appLogger.error('custom-archive-settings', 'list failed', e);
       toast.push({ type: 'error', message: '加载自定义归档失败' });
     } finally {

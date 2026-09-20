@@ -13,7 +13,7 @@ import type { ServerType } from '@hono/node-server';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import os from 'node:os';
+import { resolveDataRoot } from './modules/data-root.js';
 import type { Server as HttpServer } from 'node:http';
 
 import { ConfigManager } from './modules/config-manager.js';
@@ -106,7 +106,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
   console.info('[server] Config loaded');
 
   console.info('[server] Initializing LocalMapStore');
-  const dbPath = path.join(os.homedir(), '.feishu-sync', 'feishu-sync.db');
+  const dbPath = path.join(resolveDataRoot(), 'feishu-sync.db');
   console.info('[server] Database path:', dbPath);
   const localMapStore = new LocalMapStore(dbPath);
   console.info('[server] LocalMapStore initialized');

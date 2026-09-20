@@ -8,7 +8,7 @@
 
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import os from 'node:os';
+import { resolveDataRoot } from './data-root.js';
 import path from 'node:path';
 import type {
   ChangedDocument,
@@ -101,7 +101,7 @@ export function resolveOperationDirectory(
 ): string {
   const root = path.resolve(knowledgeBaseRoot);
   const directory = path.resolve(
-    configuredDirectory || path.join(os.homedir(), '.feishu-sync', 'operations'),
+    configuredDirectory || path.join(resolveDataRoot(), 'operations'),
   );
 
   if (isPathInside(root, directory) || root === directory) {
