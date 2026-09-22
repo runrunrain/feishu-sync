@@ -105,8 +105,20 @@ export function AuthSettingsCard() {
     if (!authStatus) return '无法检查认证状态';
 
     const msg = error || authStatus.error || '';
-    if (msg.includes('not installed') || msg.includes('not found')) {
-      return 'lark-cli 未安装。可点击上方按钮一键安装，或在终端执行：npm install -g lark-cli';
+    // 已安装但未配置：指向应用内初始化引导（面板在卡片下方）。
+    if (msg.includes('尚未完成初始配置')) {
+      return 'lark-cli 需要先完成一次初始配置（在浏览器中创建 CLI 应用授权），点击下方「初始化 lark-cli 配置」即可';
+    }
+    // 中英文都识别：服务端未安装/未找到文案是中文（未找到 lark-cli…），
+    // 只有英文关键词会漏掉并退化为裸错误文本。
+    if (
+      msg.includes('not installed')
+      || msg.includes('not found')
+      || msg.includes('未安装')
+      || msg.includes('未找到')
+    ) {
+      // 包名必须是 @larksuite/cli：registry 上的 `lark-cli` 是无关占位包。
+      return 'lark-cli 未安装。可点击上方按钮一键安装，或在终端执行：npm install -g @larksuite/cli';
     }
     if (msg.includes('not authenticated') || msg.includes('not logged in')) {
       return '尚未登录飞书。可点击上方按钮开始认证，或在终端执行：lark-cli auth login --scope';
@@ -292,11 +304,85 @@ export function AuthSettingsCard() {
           </div>
         )}
 
+        {/* ── 引导面板：已安装但未初始配置（not_configured） ────── */}
+        {/* 未配置时必须优先于认证引导：auth login 在未配置态会被上游拒绝。 */}
+        {!authActive && !larkCliMissing && setup.configInitNeeded && (
+          <div className="p-3 rounded-md border border-seal/30 bg-seal/5 space-y-3">
+            {['starting', 'waiting', 'completing'].includes(setup.configInitPhase) ? (
+              <>
+                <div className="flex items-center gap-2">
+                  <RefreshCw className="w-4 h-4 text-seal animate-spin" />
+                  <p className="text-sm text-ink font-medium">
+                    {setup.configInitPhase === 'starting' && '正在发起 lark-cli 初始化配置…'}
+                    {setup.configInitPhase === 'waiting' && '已在浏览器打开初始化页面，等待完成配置…（可能需数分钟）'}
+                    {setup.configInitPhase === 'completing' && '正在确认初始化结果…'}
+                  </p>
+                </div>
+                {setup.configInitUrl && (
+                  <div className="flex items-center gap-2">
+                    <a
+                      href={setup.configInitUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="flex-1 min-w-0 text-xs font-mono text-seal underline break-all"
+                    >
+                      {setup.configInitUrl}
+                    </a>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => void navigator.clipboard.writeText(setup.configInitUrl ?? '').catch(() => undefined)}
+                    >
+                      <Copy className="w-3.5 h-3.5" />
+                      复制
+                    </Button>
+                  </div>
+                )}
+                <p className="text-xs text-ink-faint">
+                  初始化会在飞书开放平台创建/绑定 CLI 应用；完成后将自动进入认证引导。
+                </p>
+                <Button variant="secondary" size="sm" onClick={setup.cancelConfigInit}>
+                  取消
+                </Button>
+              </>
+            ) : setup.configInitPhase === 'failed' ? (
+              <>
+                <div className="flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 text-seal-2 shrink-0" />
+                  <p className="text-sm text-ink">
+                    {setup.configInitError || '初始化配置失败，请重试。'}
+                  </p>
+                </div>
+                <Button variant="primary" size="sm" onClick={() => void setup.startConfigInit()}>
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  重试初始化
+                </Button>
+              </>
+            ) : (
+              <>
+                <p className="text-sm text-ink leading-relaxed">
+                  lark-cli 已安装但尚未完成初始配置（首次使用需在浏览器创建 CLI 应用授权）。
+                  点击下方按钮开始，配置完成后将自动进入认证引导。
+                </p>
+                <Button
+                  variant="primary"
+                  size="sm"
+                  onClick={() => void setup.startConfigInit()}
+                >
+                  <Globe className="w-3.5 h-3.5" />
+                  初始化 lark-cli 配置
+                </Button>
+              </>
+            )}
+          </div>
+        )}
+
         {/* ── 引导面板：已安装未认证/缺 scope ─────────────────────── */}
         {!authActive
           && setup.authPhase !== 'failed'
           && setup.authPhase !== 'success'
           && !larkCliMissing
+          && !setup.configInitNeeded
           && toolStatus != null
           && !toolStatus.authReady && (
           <div className="p-3 rounded-md border border-line bg-paper-2/60 space-y-3">

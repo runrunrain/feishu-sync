@@ -1,20 +1,24 @@
 /**
  * LarkCliManager + feishu device-auth routes tests
  *
- * 覆盖（需求 §5）：
+ * 覆盖（需求 §5 + 2026-10 闭环补齐）：
  * - npm 不可用分支（installOrUpdateLarkCli → npm_not_found，不 spawn）
  * - install 成功 + `--version` 验证；npm 失败分类
  * - startDeviceAuth JSON 容错解析（日志前缀 / 尾随杂行）
  * - completeDeviceAuth deviceCode 校验（不 spawn 子进程）
  * - 单例进行中标记：重复 start 返回 409 语义冲突；complete 后清除
  * - complete 绕过 LarkCliClient 串行队列（直接 execFile）+ 超时契约
- * - 路由层关键路径（status / install npm_not_found / start 409 / complete 400）
+ * - config init 通道（安装→配置→认证闭环的中间环）：URL 流式提取 /
+ *   单例 409 / 成功与失败退出 / 无进行中流程 400
+ * - 路由层关键路径（status / install npm_not_found / start 409 / complete 400 /
+ *   config-init 两端点）
  */
 
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { EventEmitter } from 'node:events';
 
 const { Hono } = require('hono');
 
@@ -56,7 +60,34 @@ const { execFileMock, setExecHandler } = vi.hoisted(() => {
   };
 });
 
-vi.mock('child_process', () => ({ execFile: execFileMock }));
+vi.mock('child_process', () => ({ execFile: execFileMock, spawn: spawnMock }));
+
+// ---------------------------------------------------------------------------
+// spawn mock：config init 通道用（流式 stdout/stderr + close 事件）。用
+// EventEmitter 模拟 ChildProcess 的最小面（manager 只用 .on('data')/
+// .on('close')/.kill）。
+// ---------------------------------------------------------------------------
+class FakeChild extends EventEmitter {
+  stdout = new EventEmitter();
+  stderr = new EventEmitter();
+  killed = false;
+  kill(): void {
+    this.killed = true;
+  }
+}
+
+const { spawnMock, setSpawnFactory } = vi.hoisted(() => {
+  type FakeLike = Record<string, unknown>;
+  let factory: () => FakeLike = () => {
+    throw new Error('spawn factory not configured');
+  };
+  return {
+    spawnMock: vi.fn(() => factory()),
+    setSpawnFactory: (next: () => FakeLike) => {
+      factory = next;
+    },
+  };
+});
 
 import {
   LarkCliManager,
@@ -739,5 +770,191 @@ describe('feishu lark-cli routes', () => {
 
     expect(response.status).toBe(500);
     expect(await response.json()).toEqual({ error: 'dependencies_not_injected' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// config init 通道（安装→配置→认证闭环的中间环，2026-10 补齐）
+// ---------------------------------------------------------------------------
+
+const CONFIG_INIT_URL =
+  'https://open.feishu.cn/app/cli_a0test/auth?q=test-verification-code';
+
+describe('config init flow', () => {
+  beforeEach(() => {
+    setSpawnFactory(() => new FakeChild() as unknown as Record<string, unknown>);
+    setExecHandler(() => ({ stdout: '' }));
+  });
+
+  function makeManagerWithLarkCli() {
+    const binDir = makeBinDir(true, true);
+    const { manager } = createManager({
+      binDir,
+      authReadiness: {
+        ready: false,
+        larkCliVersion: 'lark-cli version 1.0.95',
+        error: 'lark-cli 已安装但尚未完成初始配置：请在终端执行 lark-cli config init --new',
+      },
+    });
+    return manager;
+  }
+
+  it('startConfigInit streams the verification URL from lark-cli output', async () => {
+    const manager = makeManagerWithLarkCli();
+    const child = new FakeChild();
+    setSpawnFactory(() => child as unknown as Record<string, unknown>);
+
+    const pending = manager.startConfigInit();
+    // URL 分两个 chunk 到达（验证累积 buffer 重试匹配，防 chunk 边界切断）。
+    child.stdout.emit('data', Buffer.from('Open this URL: https://open.feishu.cn/app/cli_a0'));
+    child.stdout.emit('data', Buffer.from('test/auth?q=test-verification-code to continue\n'));
+    const result = await pending;
+
+    expect(result.verificationUrl).toBe(CONFIG_INIT_URL);
+    expect(manager.hasPendingConfigInit()).toBe(true);
+    // 子进程必须继续存活等待浏览器完成。
+    expect(child.killed).toBe(false);
+  });
+
+  it('startConfigInit rejects and clears state when the process exits before a URL', async () => {
+    const manager = makeManagerWithLarkCli();
+    const child = new FakeChild();
+    setSpawnFactory(() => child as unknown as Record<string, unknown>);
+
+    const pending = manager.startConfigInit();
+    pending.catch(() => undefined); // 防未处理拒绝
+    child.stderr.emit('data', Buffer.from('config init requires interactive mode\n'));
+    child.emit('close', 1);
+
+    await expect(pending).rejects.toMatchObject({ code: 'config_init_failed' });
+    expect(manager.hasPendingConfigInit()).toBe(false);
+  });
+
+  it('second concurrent startConfigInit is rejected as 409 in-progress', async () => {
+    const manager = makeManagerWithLarkCli();
+    const child = new FakeChild();
+    setSpawnFactory(() => child as unknown as Record<string, unknown>);
+
+    const first = manager.startConfigInit();
+    first.catch(() => undefined);
+    await expect(manager.startConfigInit()).rejects.toMatchObject({
+      code: 'config_init_in_progress',
+    });
+    // 结束第一条流程（提前退出），避免悬挂轮询。
+    child.emit('close', 1);
+    await expect(first).rejects.toMatchObject({ code: 'config_init_failed' });
+  });
+
+  it('completeConfigInit resolves ok on exit 0 and clears the pending state', async () => {
+    const manager = makeManagerWithLarkCli();
+    const child = new FakeChild();
+    setSpawnFactory(() => child as unknown as Record<string, unknown>);
+
+    const start = manager.startConfigInit();
+    child.stdout.emit('data', Buffer.from(CONFIG_INIT_URL));
+    await start;
+
+    const completing = manager.completeConfigInit();
+    child.emit('close', 0);
+    await expect(completing).resolves.toMatchObject({ ok: true });
+    expect(manager.hasPendingConfigInit()).toBe(false);
+  });
+
+  it('completeConfigInit surfaces the failing exit code and output tail', async () => {
+    const manager = makeManagerWithLarkCli();
+    const child = new FakeChild();
+    setSpawnFactory(() => child as unknown as Record<string, unknown>);
+
+    const start = manager.startConfigInit();
+    child.stdout.emit('data', Buffer.from(CONFIG_INIT_URL));
+    await start;
+
+    const completing = manager.completeConfigInit();
+    child.stderr.emit('data', Buffer.from('verification rejected\n'));
+    child.emit('close', 2);
+    const result = await completing;
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('exit 2');
+    expect(result.output).toContain('verification rejected');
+    expect(manager.hasPendingConfigInit()).toBe(false);
+  });
+
+  it('completeConfigInit without a pending flow is a 400 error', async () => {
+    const manager = makeManagerWithLarkCli();
+    await expect(manager.completeConfigInit()).rejects.toMatchObject({
+      code: 'config_init_not_in_progress',
+    });
+  });
+
+  it('startConfigInit fails fast when lark-cli is not resolvable (spawn error)', async () => {
+    // binDir 无 lark-cli：resolveLarkCliPath 返回裸名，spawn 立即 error+close。
+    const binDir = makeBinDir(true, false);
+    const { manager } = createManager({ binDir });
+    const child = new FakeChild();
+    setSpawnFactory(() => child as unknown as Record<string, unknown>);
+
+    const pending = manager.startConfigInit();
+    pending.catch(() => undefined);
+    child.emit('error', new Error('spawn lark-cli ENOENT'));
+    child.emit('close', null);
+
+    await expect(pending).rejects.toMatchObject({ code: 'config_init_spawn_failed' });
+    expect(manager.hasPendingConfigInit()).toBe(false);
+  });
+});
+
+describe('feishu config-init routes', () => {
+  it('POST /api/feishu/lark-cli/config-init/start returns the session shape', async () => {
+    const app = buildApp({
+      startConfigInit: vi.fn(async () => ({ verificationUrl: CONFIG_INIT_URL })),
+    });
+
+    const response = await app.fetch(
+      new Request('http://x/api/feishu/lark-cli/config-init/start', { method: 'POST' }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ verificationUrl: CONFIG_INIT_URL });
+  });
+
+  it('POST config-init/start maps manager 409 semantics through errorResponse', async () => {
+    const startConfigInit = vi.fn(async () => {
+      throw new LarkCliManagerError('配置初始化已在进行中', 'config_init_in_progress', 409);
+    });
+    const app = buildApp({ startConfigInit });
+
+    const response = await app.fetch(
+      new Request('http://x/api/feishu/lark-cli/config-init/start', { method: 'POST' }),
+    );
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ error: 'config_init_in_progress' });
+  });
+
+  it('POST /api/feishu/lark-cli/config-init/complete returns the result shape', async () => {
+    const app = buildApp({
+      completeConfigInit: vi.fn(async () => ({ ok: true })),
+    });
+
+    const response = await app.fetch(
+      new Request('http://x/api/feishu/lark-cli/config-init/complete', { method: 'POST' }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true });
+  });
+
+  it('POST config-init/complete without a pending flow returns 400', async () => {
+    const completeConfigInit = vi.fn(async () => {
+      throw new LarkCliManagerError('没有进行中的配置初始化流程', 'config_init_not_in_progress', 400);
+    });
+    const app = buildApp({ completeConfigInit });
+
+    const response = await app.fetch(
+      new Request('http://x/api/feishu/lark-cli/config-init/complete', { method: 'POST' }),
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: 'config_init_not_in_progress' });
   });
 });

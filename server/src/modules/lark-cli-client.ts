@@ -59,6 +59,25 @@ export function quoteWindowsShellArguments(
 }
 import type { LarkCliNodeInfo, LarkCliConfig } from '../types/index.js';
 
+/**
+ * 「lark-cli 未找到」的规范文案。getToolStatus（lark-cli-manager.ts）用
+ * `未找到|未安装` 正则识别未安装状态并点亮前端「一键安装」面板——两处
+ * 抛出点共享同一常量，防止文案漂移破坏该判定。
+ */
+export const LARK_CLI_NOT_FOUND_MESSAGE =
+  '未找到 lark-cli。请安装 lark-cli，或在「设置」中填写它的可执行文件路径。';
+
+/**
+ * 判断可执行名是否为「裸命令名」（不含任何路径分隔符）。
+ *
+ * resolveLarkCliExecutable 只有在 PATH 与全部桌面发现目录都未命中时才会
+ * 返回裸命令名（win32 缺省 'lark-cli.cmd'）——这是「全平台确定性未找到」
+ * 的信号：此时 spawn 注定失败。非裸（含 / 或 \）都是已解析的具体路径。
+ */
+export function isBareCommandName(executable: string): boolean {
+  return !executable.includes('/') && !executable.includes('\\');
+}
+
 const execFileAsync = promisify(execFile);
 
 export type LarkCliErrorCode =
@@ -763,16 +782,22 @@ export class LarkCliClient {
    * Check if lark-cli is ready (version + authentication + scope validation)
    */
   async checkAuthReady(): Promise<LarkCliAuthReadiness> {
+    // 提升作用域：auth status / scope 阶段抛错时 --version 已成功拿到
+    // 版本，不能随 catch 丢失（2026-10 实测：未 config init 的机器上
+    // getToolStatus 拿不到 larkCliVersion，前端无法显示已安装版本）。
+    let larkCliVersion: string | undefined;
     try {
       // 1. Check if lark-cli is installed
       const versionResult = await this.execute(['--version'], 'auth');
-      const larkCliVersion = typeof versionResult.data?.version === 'string'
+      larkCliVersion = typeof versionResult.data?.version === 'string'
         ? versionResult.data.version
         : undefined;
       if (!versionResult.ok) {
         return {
           ready: false,
-          error: 'lark-cli 未安装，请执行 npm install -g lark-cli',
+          // 包名必须是 @larksuite/cli：registry 上的 `lark-cli` 是无关的
+          // 0.1.0 占位包（见 lark-cli-manager.ts 的 2026-09 包名修正）。
+          error: 'lark-cli 未安装，请执行 npm install -g @larksuite/cli',
           larkCliVersion,
         };
       }
@@ -832,9 +857,16 @@ export class LarkCliClient {
         identity,
       };
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // 安装/配置类引导文案原样透传（不带「认证检查失败」前缀），让
+      // 文案直接指向下一步动作（一键安装 / config init）而非重新认证；
+      // 同时带回已拿到的版本，前端可显示「已安装 lark-cli x.y.z」。
+      const passthrough = message.startsWith('未找到 lark-cli')
+        || message.startsWith('lark-cli 已安装但尚未完成初始配置');
       return {
         ready: false,
-        error: `认证检查失败：${error instanceof Error ? error.message : String(error)}`,
+        error: passthrough ? message : `认证检查失败：${message}`,
+        larkCliVersion,
       };
     }
   }
@@ -999,6 +1031,18 @@ export class LarkCliClient {
     const larkCliPath = resolveLarkCliExecutable(this.config.larkCliPath);
     const timeout = this.config.timeout || 30000;
 
+    // P0-Win 修复（2026-10 实测事故）：未安装 lark-cli 的 Windows 机器上，
+    // execFile 以 shell:true 启动时 cmd.exe 自己 exit 1 并打印本地化文案
+    // （GBK 环境下还是乱码），Node 不会抛 ENOENT——下方 ENOENT 分支永远
+    // 不命中，错误落进 classifyError 通用分支变成「lark-cli 执行失败：…」
+    // 且 retryable=true，checkAuthReady 包成「认证检查失败：…」后
+    // getToolStatus 的未安装正则也匹配不到 → 前端「一键安装」面板永不出现。
+    // 裸命令名 = 解析阶段 PATH + 全部发现目录均已未命中（见
+    // isBareCommandName 注释），在 spawn 前确定性失败，不依赖本地化错误文本。
+    if (isBareCommandName(larkCliPath)) {
+      throw new LarkCliError(LARK_CLI_NOT_FOUND_MESSAGE, 'upstream', false);
+    }
+
     try {
       const { stdout, stderr } = await execFileAsync(
         quoteWindowsExecutablePath(larkCliPath),
@@ -1026,12 +1070,18 @@ export class LarkCliClient {
       return this.parseJsonOutput(stdout);
     } catch (error: any) {
       if (error instanceof LarkCliError) throw error;
-      if (error?.code === 'ENOENT') {
-        throw new LarkCliError(
-          '未找到 lark-cli。请安装 lark-cli，或在「设置」中填写它的可执行文件路径。',
-          'upstream',
-          false,
-        );
+      // P0-Win 兜底：win32 shell:true 下 ENOENT 不会触发，cmd.exe 的
+      // 「命令/路径未找到」只能靠文本识别（中文 Windows 为 GBK，可能乱码，
+      // 故同时匹配中英文与「系统找不到路径/文件」变体）。裸命令名场景已被
+      // 上方 fail-fast 确定性拦截，这里主要兜住「设置了显式路径但文件不存在」
+      // 等绕过 fail-fast 的情况。
+      const notFoundText = `${error?.stderr ?? ''}\n${error?.stdout ?? ''}\n${error?.message ?? ''}`;
+      const isShellCommandNotFound =
+        /is not recognized as an internal or external command/i.test(notFoundText)
+        || /不是内部或外部命令/.test(notFoundText)
+        || /(?:系统找不到指定的(?:路径|文件)|the system cannot find the (?:path|file) specified)/i.test(notFoundText);
+      if (error?.code === 'ENOENT' || isShellCommandNotFound) {
+        throw new LarkCliError(LARK_CLI_NOT_FOUND_MESSAGE, 'upstream', false);
       }
       const errorStderr = typeof error?.stderr === 'string' ? clipForLog(error.stderr) : '';
       const errorStdout = typeof error?.stdout === 'string' ? clipForLog(error.stdout) : '';
@@ -1263,6 +1313,19 @@ export class LarkCliClient {
 
   private classifyError(message: string, upstreamCode?: string): LarkCliError {
     const normalized = message.toLowerCase();
+    // lark-cli 已安装但未完成初始配置（2026-10 实测：新装机器上
+    // `auth status` 以非零退出 + JSON 错误体 {type:'config',
+    // subtype:'not_configured'} 报告，曾落进通用「执行失败」分支）。这是
+    // 可引导的安装后状态而非执行故障：归类为 auth（不可重试），文案指向
+    // config init，防止用户被「执行失败」吓到却得不到下一步指引。
+    if (/(?:not_configured|"type"\s*:\s*"config")/i.test(message)) {
+      return new LarkCliError(
+        'lark-cli 已安装但尚未完成初始配置：请在终端执行 lark-cli config init --new（它会输出一个验证 URL，在浏览器打开完成配置），然后回到应用重新检测并认证',
+        'auth',
+        false,
+        upstreamCode,
+      );
+    }
     if (
       upstreamCode === '3380003'
       || /(?:3380003|document page has been deleted|page can no longer be edited|文档.*已删除)/i.test(message)

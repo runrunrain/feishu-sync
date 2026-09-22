@@ -5,7 +5,9 @@
  * GET  /api/feishu/lark-cli/status        - lark-cli 安装/认证/npm 可用性组合状态
  * POST /api/feishu/lark-cli/install       - 一键安装/更新 lark-cli（npm -g，幂等）
  * POST /api/feishu/auth/device/start      - 发起 Device Flow（立即返回 verificationUrl 等）
- * POST /api/feishu/auth/device/complete   - 阻塞等待浏览器授权完成并返回最终就绪状态
+ * POST /api/feishu/auth/device/complete     - 阻塞等待浏览器授权完成并返回最终就绪状态
+ * POST /api/feishu/lark-cli/config-init/start    - 发起 lark-cli 初始化配置（立即返回验证 URL，进程后台等待）
+ * POST /api/feishu/lark-cli/config-init/complete - 阻塞等待浏览器完成初始化配置
  *
  * 新增端点的依赖经 c.env.larkCliManager 注入（buildServer 的 DI 中间件）；
  * 错误处理参照 custom-folders.ts 的 errorResponse 模式。
@@ -151,6 +153,34 @@ feishuRoutes.post('/api/feishu/auth/device/complete', async (c) => {
     return c.json(await manager.completeDeviceAuth(deviceCode));
   } catch (error) {
     return errorResponse(c, 'device_auth_complete_failed', error);
+  }
+});
+
+/**
+ * POST /api/feishu/lark-cli/config-init/start - 发起 lark-cli 初始化配置
+ * （全新机器安装后的 not_configured 态必经步骤，应用内闭环关键一环）。
+ * → { verificationUrl }；已有进行中流程时 409 config_init_in_progress。
+ */
+feishuRoutes.post('/api/feishu/lark-cli/config-init/start', async (c) => {
+  try {
+    const manager = requireLarkCliManager(c);
+    return c.json(await manager.startConfigInit());
+  } catch (error) {
+    return errorResponse(c, 'config_init_start_failed', error);
+  }
+});
+
+/**
+ * POST /api/feishu/lark-cli/config-init/complete - 阻塞等待浏览器完成初始化配置
+ * （最长约 12 分钟）。→ { ok, output?, error? }；无进行中流程时 400
+ * config_init_not_in_progress。
+ */
+feishuRoutes.post('/api/feishu/lark-cli/config-init/complete', async (c) => {
+  try {
+    const manager = requireLarkCliManager(c);
+    return c.json(await manager.completeConfigInit());
+  } catch (error) {
+    return errorResponse(c, 'config_init_complete_failed', error);
   }
 });
 

@@ -305,6 +305,19 @@ export interface DeviceAuthCompleteResult {
   error?: string;
 }
 
+/** POST /api/feishu/lark-cli/config-init/start —— 立即返回的初始化配置会话。 */
+export interface ConfigInitStartResult {
+  /** 浏览器完成 lark-cli 应用初始化的验证 URL（进程在服务端后台等待）。 */
+  verificationUrl: string;
+}
+
+/** POST /api/feishu/lark-cli/config-init/complete —— 阻塞等待初始化结果。 */
+export interface ConfigInitCompleteResult {
+  ok: boolean;
+  output?: string;
+  error?: string;
+}
+
 export async function getLarkCliStatus(): Promise<LarkCliToolStatus> {
   return request<LarkCliToolStatus>('/api/feishu/lark-cli/status');
 }
@@ -333,6 +346,25 @@ export async function completeDeviceAuth(
   return request<DeviceAuthCompleteResult>('/api/feishu/auth/device/complete', {
     method: 'POST',
     body: JSON.stringify({ deviceCode }),
+    ...(options.signal ? { signal: options.signal } : {}),
+  });
+}
+
+/** 发起 lark-cli 初始化配置（安装后 not_configured 态的应用内闭环步骤）。 */
+export async function startConfigInit(): Promise<ConfigInitStartResult> {
+  return request<ConfigInitStartResult>('/api/feishu/lark-cli/config-init/start', {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
+/** 阻塞等待浏览器完成初始化配置（服务端最长约 12 分钟；signal 用于取消）。 */
+export async function completeConfigInit(
+  options: { signal?: AbortSignal } = {},
+): Promise<ConfigInitCompleteResult> {
+  return request<ConfigInitCompleteResult>('/api/feishu/lark-cli/config-init/complete', {
+    method: 'POST',
+    body: JSON.stringify({}),
     ...(options.signal ? { signal: options.signal } : {}),
   });
 }

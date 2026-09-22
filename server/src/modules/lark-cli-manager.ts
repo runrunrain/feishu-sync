@@ -22,7 +22,7 @@
  *   语义错误；complete 成功/失败/超时后清除标记）。
  */
 
-import { execFile } from 'child_process';
+import { execFile, spawn, type ChildProcess } from 'child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'util';
@@ -56,6 +56,21 @@ const DEVICE_AUTH_COMPLETE_TIMEOUT_MS = 11 * 60_000;
 const INSTALL_OUTPUT_TAIL_LINES = 50;
 /** deviceCode 防注入上限。 */
 const MAX_DEVICE_CODE_LENGTH = 500;
+/**
+ * `config init --new` 输出验证 URL 的最长等待（CLI 冷启动 + 首次网络
+ * 往返；对齐 DEVICE_AUTH_START_TIMEOUT_MS 量级）。
+ */
+const CONFIG_INIT_URL_TIMEOUT_MS = 90_000;
+/** `config init --new` 阻塞等待浏览器完成配置的兑底超时（与 CLI 侧过期
+ * 对齐，取 12 分钟；CLI 正常情况下过期/完成后自行退出）。 */
+const CONFIG_INIT_COMPLETE_TIMEOUT_MS = 12 * 60_000;
+/**
+ * 从 `config init --new` 的流式输出中提取验证 URL。形状来自 lark-cli
+ * 二进制内嵌的自身提取正则（1.0.95 实测提取）：
+ * `https://open.feishu.cn/app/<app_id>/auth?q=<code>`（larksuite.com 域
+ * 为海外品牌变体）。不用 g 标志：每次对累积 buffer 重新匹配。
+ */
+const CONFIG_INIT_URL_RE = /https?:\/\/open\.(?:feishu\.cn|larksuite\.com)\/app\/[^/\s"']+\/auth\?q=[^\s"'<>]+/;
 /**
  * 上游「整单 scope 无效」拒绝特征（2026-10 实测：请求集里混入未在 OAuth
  * 应用注册的 scope 名时，飞书 device authorization 直接拒绝整单）。命中
@@ -118,6 +133,19 @@ export interface DeviceAuthCompleteResult {
   currentScopes?: string[];
   missingScopes?: string[];
   identity?: string;
+  error?: string;
+}
+
+export interface ConfigInitStartResult {
+  /** 浏览器完成 lark-cli 应用初始化配置的验证 URL（进程仍在后台阻塞等待）。 */
+  verificationUrl: string;
+}
+
+export interface ConfigInitCompleteResult {
+  /** `config init --new` 是否成功退出（用户在浏览器完成配置）。 */
+  ok: boolean;
+  /** 失败时的进程输出尾部（诊断用）。 */
+  output?: string;
   error?: string;
 }
 
@@ -259,6 +287,18 @@ export function extractUpstreamAuthErrorMessage(parsed: Record<string, unknown>)
 export class LarkCliManager {
   /** 单例进行中标记：未完成的 device flow 存在时拒绝再次 start。 */
   private pendingDeviceAuth: { deviceCode: string; startedAt: number } | null = null;
+
+  /**
+   * 进行中的 `config init --new` 子进程（应用内初始化配置引导）。URL
+   * 提取成功前 verificationUrl 为空串；失败/完成后清空。与 device flow
+   * 同理不进入 LarkCliClient 串行队列（阻塞最长十余分钟）。
+   */
+  private pendingConfigInit: {
+    child: ChildProcess;
+    verificationUrl: string;
+    startedAt: number;
+    exit: Promise<{ code: number | null; output: string }>;
+  } | null = null;
 
   constructor(
     private readonly larkCliClient: LarkCliClientLike,
@@ -621,6 +661,179 @@ export class LarkCliManager {
   /** 当前是否挂着未完成的 device flow（状态排查用）。 */
   hasPendingDeviceAuth(): boolean {
     return this.pendingDeviceAuth != null;
+  }
+
+  /** 当前是否挂着未完成的 config init（状态排查/测试用）。 */
+  hasPendingConfigInit(): boolean {
+    return this.pendingConfigInit != null;
+  }
+
+  /**
+   * 发起 `lark-cli config init --new` 并立即返回浏览器验证 URL（进程在
+   * 后台继续阻塞等待用户完成配置）。
+   *
+   * 为什么需要它（2026-10 实测链路）：全新机器上 lark-cli 装好后处于
+   * not_configured 态——`auth status`/`auth login` 都会拒绝，必须先经
+   * 浏览器完成应用初始化配置。此前应用内没有这一环，用户被逼去终端跑
+   * `config init --new`，安装→认证闭环断链。
+   *
+   * 实现约束（勿改）：
+   * - 用 spawn 而非 execFile：命令阻塞直到浏览器完成，要流式从输出中
+   * 撷取验证 URL 先返回给前端，进程继续等。
+   * - 与 device flow 同理【不进 LarkCliClient 串行队列】（阻塞十余分钟）。
+   * - 单例标记同步占位（spawn 后立即赋值），并发 start 直接 409。
+   * - URL 可能被 chunk 边界切断：轮询累积 buffer 重试匹配，而非逐 chunk
+   *   单独匹配。
+   */
+  async startConfigInit(): Promise<ConfigInitStartResult> {
+    if (this.pendingConfigInit) {
+      throw new LarkCliManagerError(
+        '配置初始化已在进行中，请等待完成或取消后重试',
+        'config_init_in_progress',
+        409,
+      );
+    }
+
+    const larkCliPath = this.resolveLarkCliPath();
+    const platform = this.discovery.platform ?? process.platform;
+    const child = spawn(
+      quoteWindowsExecutablePath(larkCliPath, platform),
+      ['config', 'init', '--new'],
+      {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+        shell: process.platform === 'win32',
+        env: buildLarkCliEnvironment(larkCliPath),
+      },
+    );
+
+    // 累积输出由闭包共享：URL 轮询与退出结果都用同一份 buffer。
+    let output = '';
+    const append = (chunk: unknown): void => {
+      output += typeof chunk === 'string' ? chunk : Buffer.from(chunk as Uint8Array).toString('utf-8');
+    };
+    child.stdout?.on('data', append);
+    child.stderr?.on('data', append);
+
+    const exit = new Promise<{ code: number | null; output: string }>((resolve) => {
+      child.on('close', (code) => resolve({ code, output }));
+    });
+
+    // 同步占位：并发 start 在任何 await 前就被 409 拦截。
+    this.pendingConfigInit = {
+      child,
+      verificationUrl: '',
+      startedAt: Date.now(),
+      exit,
+    };
+
+    try {
+      const verificationUrl = await this.waitForConfigInitUrl(child, () => output);
+      if (this.pendingConfigInit?.child === child) {
+        this.pendingConfigInit.verificationUrl = verificationUrl;
+      }
+      return { verificationUrl };
+    } catch (error) {
+      // URL 未出现（超时/提前退出/spawn 失败）：回收子进程与占位标记。
+      try { child.kill(); } catch { /* already exited */ }
+      if (this.pendingConfigInit?.child === child) {
+        this.pendingConfigInit = null;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * 轮询累积输出直到验证 URL 出现；超时/进程提前退出则拒绝。
+   * 导出为静态纯函数便于单测 URL 提取正则（lark-cli 输出形状实测）。
+   */
+  private waitForConfigInitUrl(
+    child: ChildProcess,
+    collectOutput: () => string,
+  ): Promise<string> {
+    return new Promise<string>((resolve, reject) => {
+      let settled = false;
+      const settle = (fn: () => void): void => {
+        if (settled) return;
+        settled = true;
+        clearInterval(pollTimer);
+        clearTimeout(urlTimer);
+        child.removeListener('close', onClose);
+        fn();
+      };
+      const tryExtract = (): void => {
+        const match = CONFIG_INIT_URL_RE.exec(collectOutput());
+        if (match) settle(() => resolve(match[0]));
+      };
+      const urlTimer = setTimeout(
+        () => settle(() => reject(new LarkCliManagerError(
+          `配置初始化超时：${CONFIG_INIT_URL_TIMEOUT_MS / 1000}s 内未输出验证 URL`,
+          'config_init_url_timeout',
+          504,
+        ))),
+        CONFIG_INIT_URL_TIMEOUT_MS,
+      );
+      const pollTimer = setInterval(tryExtract, 200);
+      const onClose = (code: number | null): void => {
+        const match = CONFIG_INIT_URL_RE.exec(collectOutput());
+        if (match) {
+          settle(() => resolve(match[0]));
+          return;
+        }
+        settle(() => reject(new LarkCliManagerError(
+          `配置初始化进程提前退出（exit ${code ?? 'unknown'}）：${tailLines(collectOutput(), INSTALL_OUTPUT_TAIL_LINES)}`,
+          'config_init_failed',
+          502,
+        )));
+      };
+      child.on('close', onClose);
+      // spawn 本身失败（如可执行不存在）：error 后通常紧跟 close，两者都
+      // 兜住，但 error 分支给出更直接的文案。
+      child.on('error', (err) => settle(() => reject(new LarkCliManagerError(
+        `启动 lark-cli config init 失败：${errorText(err)}`,
+        'config_init_spawn_failed',
+        500,
+      ))));
+      tryExtract();
+    });
+  }
+
+  /**
+   * 阻塞等待 `config init --new` 退出（用户浏览器完成/过期/超时）。
+   * 成功后 lark-cli 进入已配置态，后续 auth login device flow 可用；
+   * 调用方（路由/前端）据此衔接认证引导。
+   */
+  async completeConfigInit(): Promise<ConfigInitCompleteResult> {
+    const pending = this.pendingConfigInit;
+    if (!pending) {
+      throw new LarkCliManagerError(
+        '没有进行中的配置初始化流程，请先发起初始化',
+        'config_init_not_in_progress',
+        400,
+      );
+    }
+
+    const timeout = new Promise<'timeout'>((resolve) => {
+      setTimeout(() => resolve('timeout'), CONFIG_INIT_COMPLETE_TIMEOUT_MS).unref?.();
+    });
+    const result = await Promise.race([pending.exit, timeout]);
+
+    if (this.pendingConfigInit?.child === pending.child) {
+      this.pendingConfigInit = null;
+    }
+
+    if (result === 'timeout') {
+      try { pending.child.kill(); } catch { /* already exited */ }
+      return { ok: false, error: `等待浏览器完成配置超时（${CONFIG_INIT_COMPLETE_TIMEOUT_MS / 60_000} 分钟），请重新发起初始化` };
+    }
+    if (result.code === 0) {
+      return { ok: true };
+    }
+    return {
+      ok: false,
+      error: `配置初始化失败（exit ${result.code ?? 'unknown'}），请重试`,
+      output: tailLines(result.output, INSTALL_OUTPUT_TAIL_LINES),
+    };
   }
 
   private resolveLarkCliPath(): string {
