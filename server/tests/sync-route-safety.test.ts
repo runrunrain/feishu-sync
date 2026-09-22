@@ -175,3 +175,65 @@ describe('POST /api/sync P0 safety gate', () => {
     expect(response.status).not.toBe(409);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 知识库根目录前置校验（2026-10 首次配置引导）
+// ---------------------------------------------------------------------------
+
+describe('knowledge base root guard', () => {
+  it('POST /api/sync rejects with 400 knowledge_base_root_not_configured before touching the sync engine', async () => {
+    const tmpDir = createTempDirectory('feishu-sync-kb-guard-');
+    const app = buildApp({
+      configManager: { load: async () => makeConfig('', tmpDir) },
+      localMapStore: {},
+      larkCliClient: {},
+    });
+
+    const response = await app.fetch(new Request('http://x/api/sync', {
+      method: 'POST',
+      body: JSON.stringify({ documents: [document], options: { apply: false } }),
+    }));
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: 'knowledge_base_root_not_configured' });
+  });
+
+  it('POST /api/sync/index rejects likewise when neither body rootDir nor config root is set', async () => {
+    const tmpDir = createTempDirectory('feishu-sync-kb-guard-index-');
+    const app = buildApp({
+      configManager: { load: async () => makeConfig('  ', tmpDir) },
+      localMapStore: {},
+      larkCliClient: {},
+    });
+
+    const response = await app.fetch(new Request('http://x/api/sync/index', {
+      method: 'POST',
+      body: JSON.stringify({}),
+    }));
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: 'knowledge_base_root_not_configured' });
+  });
+
+  it('POST /api/sync/index still passes with an explicit body rootDir despite unset config', async () => {
+    // 显式 rootDir 一直是合法的覆盖入口（重建索引流程用），守卫不得拦截。
+    const tmpDir = createTempDirectory('feishu-sync-kb-guard-override-');
+    const app = buildApp({
+      configManager: { load: async () => makeConfig('', tmpDir) },
+      localMapStore: {
+        // IndexScanner 依赖面兜底：只要有知识库结构查询就会用到；这里给
+        // 空实现让请求继续走到 scanner 层（守卫已放行即为本用例断言点，
+        // scanner 内部行为不在本用例范围）。
+        listAllDocuments: () => [],
+      },
+      larkCliClient: {},
+    });
+
+    const response = await app.fetch(new Request('http://x/api/sync/index', {
+      method: 'POST',
+      body: JSON.stringify({ rootDir: tmpDir }),
+    }));
+
+    expect(response.status).not.toBe(400);
+  });
+});

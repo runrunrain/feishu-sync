@@ -9,9 +9,61 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { Hono } from 'hono';
 import type { Config, WatchedRootConfig } from '../types/index.js';
-import { sanitizeLocalDirName } from '../modules/config-manager.js';
+import { sanitizeLocalDirName, suggestKnowledgeRoot } from '../modules/config-manager.js';
 
 const configRoutes = new Hono();
+
+/**
+ * GET /api/config/knowledge-root-suggestion - 知识库根目录缺省建议（只算不建）。
+ * → { root }。首次配置引导弹窗展示用；采用需走 adopt 端点。
+ */
+configRoutes.get('/api/config/knowledge-root-suggestion', (c) => {
+  return c.json({ root: suggestKnowledgeRoot() });
+});
+
+/**
+ * POST /api/config/knowledge-root-suggestion/adopt - 采用缺省路径：
+ * mkdir(recursive) + 保存 knowledgeBaseRoot → { root }。
+ *
+ * 2026-10 首次配置引导：此前未设置路径直接同步会在写盘层炸出 ENOENT /
+ * 路径校验错误且无引导。前端同步入口弹窗「使用默认路径并继续」直接调
+ * 本端点：建目录 + 落盘一次完成，随后继续原同步动作。
+ *
+ * 目录创建失败（如 D 盘只读/被策略拦截）不吞错：返回 500 带原始信息，
+ * 前端弹窗展示并引导改用手动设置。
+ */
+configRoutes.post('/api/config/knowledge-root-suggestion/adopt', async (c) => {
+  const configManager = (c as any).configManager;
+  // body.root 可选：显式覆盖建议值（测试注入临时目录；也方便未来自定义
+  // 入口复用同一建目录+保存链路）。缺省走 suggestKnowledgeRoot()。
+  let requestedRoot: string | undefined;
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    if (typeof body?.root === 'string' && body.root.trim()) {
+      requestedRoot = body.root.trim();
+    }
+  } catch {
+    /* 空 body 合法：缺省建议值 */
+  }
+  const root = requestedRoot ?? suggestKnowledgeRoot();
+  try {
+    fs.mkdirSync(root, { recursive: true });
+  } catch (error) {
+    return c.json({
+      error: 'knowledge_root_create_failed',
+      message: `无法创建默认知识库目录 ${root}：${error instanceof Error ? error.message : String(error)}`,
+    }, 500);
+  }
+  try {
+    await configManager.updateConfig({ knowledgeBaseRoot: root } as Partial<Config>);
+    return c.json({ root });
+  } catch (error) {
+    return c.json({
+      error: 'knowledge_root_save_failed',
+      message: `目录已创建但保存配置失败：${error instanceof Error ? error.message : String(error)}`,
+    }, 500);
+  }
+});
 
 function sanitizeConfig(config: Config): Config {
   return {

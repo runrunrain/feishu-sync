@@ -152,6 +152,17 @@ syncRoutes.post('/api/sync', async (c) => {
   // Load config
   const config = await configManager.load();
 
+  // 2026-10 首次配置引导：未设置知识库根目录时提前 400（错误码对齐
+  // custom-folders 的 knowledge_base_root_not_configured），不再让空路径
+  // 穿透到写盘层炸出难以理解的 ENOENT/路径校验错误。前端同步入口有
+  // 弹窗引导（跳设置/采用默认路径），这里是 API 直调场景的保底。
+  if (!config.knowledgeBaseRoot || !config.knowledgeBaseRoot.trim()) {
+    return c.json({
+      error: 'knowledge_base_root_not_configured',
+      message: '知识库根目录未设置：请先在「设置 → 知识库」中配置本地根目录，或采用默认路径',
+    }, 400);
+  }
+
   // Initialize M3 modules + v0.2.9 单通道 LLM stack.
   //
   // Flow chain:
@@ -215,6 +226,16 @@ syncRoutes.post('/api/sync/index', async (c) => {
 
   // Load config
   const config = await configManager.load();
+
+  // 未设置根目录（且请求未显式携带 rootDir）时索引无意义，提前 400 引导
+  // 配置（与 POST /api/sync 的前置校验同源）。
+  if ((!rootDir || !String(rootDir).trim())
+    && (!config.knowledgeBaseRoot || !config.knowledgeBaseRoot.trim())) {
+    return c.json({
+      error: 'knowledge_base_root_not_configured',
+      message: '知识库根目录未设置：请先在「设置 → 知识库」中配置本地根目录，或采用默认路径',
+    }, 400);
+  }
 
   // Use provided rootDir or default to config
   const scanRoot = rootDir || config.knowledgeBaseRoot;

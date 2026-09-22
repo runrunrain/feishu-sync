@@ -22,7 +22,8 @@ import { SyncResultList } from '../components/SyncResultList';
 import { FeishuPendingPanel } from '../components/FeishuPendingPanel';
 import { LogDrawer } from '../components/LogDrawer';
 import { TrashDrawer } from '../components/TrashDrawer';
-import { useConfig } from '../hooks/useConfig';
+import { KnowledgeRootGuideModal } from '../components/KnowledgeRootGuideModal';
+import { useConfig, CONFIG_UPDATED_EVENT } from '../hooks/useConfig';
 import { useSync } from '../hooks/useSync';
 import { useToast } from '../components/common/Toast';
 import { appLogger } from '../utils/appLogger';
@@ -33,10 +34,12 @@ import type { ChangedDocument, DiffReport, FailedDocument, FeishuPendingItem } f
 interface SyncViewProps {
   /** 当前主区是否可见（App 常驻挂载三主区，切换仅 hidden）。 */
   active?: boolean;
+  /** 跳转设置区（知识库根目录未设置引导弹窗用，App.handleJumpToSettings）。 */
+  onJumpToSettings?: () => void;
 }
 
-export function SyncView({ active = true }: SyncViewProps) {
-  const { config } = useConfig();
+export function SyncView({ active = true, onJumpToSettings }: SyncViewProps) {
+  const { config, refresh: refreshConfig } = useConfig();
   const toast = useToast();
   const sync = useSync();
   const contentAdaptationEnabled = config?.llm.contentAdaptationEnabled === true;
@@ -91,11 +94,35 @@ export function SyncView({ active = true }: SyncViewProps) {
   // Recover syncing state for SyncProgress from useSync
   const syncing = sync.syncing;
 
+  // ── 知识库根目录守卫（2026-10 首次配置引导）──────────────────────
+  // 未设置路径时同步会穿透到写盘层炸出难懂的 ENOENT/路径错误；这里在
+  // 四个写盘动作入口前置拦截，弹窗引导「前往设置 / 采用默认路径并继续」。
+  //
+  // 【diting A-1 修复】不能用闭包里的 config 判空：pending action 重跑时
+  // 持有的仍是旧 render 快照（空 root），守卫永远放不了行 → 弹窗无限
+  // 重开。改用每 render 同步刷新的镜像 ref，adopt 成功后直接写入新值，
+  // 重跑动作时守卫读 ref 即放行。
+  const kbRootRef = useRef(config?.knowledgeBaseRoot);
+  kbRootRef.current = config?.knowledgeBaseRoot;
+  const [kbRootGuideOpen, setKbRootGuideOpen] = useState(false);
+  const pendingKbRootActionRef = useRef<(() => void | Promise<void>) | null>(null);
+
+  const ensureKnowledgeRoot = async (
+    action: () => void | Promise<void>,
+  ): Promise<boolean> => {
+    if (kbRootRef.current?.trim()) return true;
+    pendingKbRootActionRef.current = action;
+    setKbRootGuideOpen(true);
+    return false;
+  };
+
   const handleStart = async () => {
     if (selectedDocs.length === 0) {
       toast.push({ type: 'warning', message: '请先选择要同步的文档' });
       return;
     }
+
+    if (!(await ensureKnowledgeRoot(() => { void handleStart(); }))) return;
 
     const confirmed = typeof window === 'undefined' || window.confirm(
       `将把 ${selectedDocs.length} 项已选文档写入本地知识库。\n\n` +
@@ -148,6 +175,7 @@ export function SyncView({ active = true }: SyncViewProps) {
       toast.push({ type: 'warning', message: '无原始文档信息可重试' });
       return;
     }
+    if (!(await ensureKnowledgeRoot(() => { void handleRetry(failed); }))) return;
     await sync.syncDocuments(retryDocs, { enableLLM: contentAdaptationEnabled });
     setDiffRefreshSignal((value) => value + 1);
   };
@@ -162,6 +190,8 @@ export function SyncView({ active = true }: SyncViewProps) {
       item.repairAction === 'rebuild_parent_chain' || item.reasonCode === 'missing_parent_chain',
     );
     if (targets.length === 0 || repairingParentChains) return;
+
+    if (!(await ensureKnowledgeRoot(() => { void handleRepairParentChains(failed); }))) return;
 
     const confirmed = typeof window === 'undefined' || window.confirm(
       `将完整遍历 ${targets.length} 项所在的飞书知识库根目录，补齐父链后自动同步可安全写入的文档。\n\n` +
@@ -252,6 +282,9 @@ export function SyncView({ active = true }: SyncViewProps) {
 
   const handleAdoptExistingFiles = async (failed: FailedDocument[]) => {
     if (failed.length === 0 || adoptingExistingFiles) return;
+
+    if (!(await ensureKnowledgeRoot(() => { void handleAdoptExistingFiles(failed); }))) return;
+
     const confirmed = typeof window === 'undefined' || window.confirm(
       `将认领并同步 ${failed.length} 项本地旧文件。\n\n` +
       '系统仅会在文件位于规范路径且 Markdown 一级标题与飞书标题完全一致时覆盖；其他文件会保持不变。是否继续？',
@@ -546,6 +579,35 @@ export function SyncView({ active = true }: SyncViewProps) {
           // 回收站恢复/清理会经 client.ts 广播 diff-changed 事件，变更列表
           // 与待同步计数自动重拉（旧 TODO：此处曾只能打日志提醒手动刷新）。
           appLogger.info('sync-view', 'trash changed; diff views refresh via syncEvents');
+        }}
+      />
+
+      {/* 知识库根目录未设置引导（四个写盘动作入口共用） */}
+      <KnowledgeRootGuideModal
+        open={kbRootGuideOpen}
+        onClose={() => {
+          pendingKbRootActionRef.current = null;
+          setKbRootGuideOpen(false);
+        }}
+        onJumpToSettings={() => {
+          pendingKbRootActionRef.current = null;
+          setKbRootGuideOpen(false);
+          onJumpToSettings?.();
+        }}
+        onAdopted={async (root) => {
+          setKbRootGuideOpen(false);
+          await refreshConfig();
+          // 【diting A-1】镜像 ref 立即写入新值：pending action 闭包持旧
+          // render 快照，守卫读 ref 才能放行重跑。
+          kbRootRef.current = root;
+          // 【diting A-2】广播 CONFIG_UPDATED_EVENT：设置区常驻挂载的
+          // KnowledgeSettingsCard 等副本若不重拉，后续保存会回传旧空
+          // knowledgeBaseRoot 静默清空刚采用的路径（useConfig 跨实例
+          // 同步协议见 useConfig.ts 文件头）。
+          window.dispatchEvent(new CustomEvent(CONFIG_UPDATED_EVENT));
+          const action = pendingKbRootActionRef.current;
+          pendingKbRootActionRef.current = null;
+          if (action) await action();
         }}
       />
     </div>

@@ -958,3 +958,122 @@ describe('feishu config-init routes', () => {
     expect(await response.json()).toMatchObject({ error: 'config_init_not_in_progress' });
   });
 });
+
+// ---------------------------------------------------------------------------
+// config init 取消通道与超时分支（diting B-1/B-2/B-3 修复的回归锁定）
+// ---------------------------------------------------------------------------
+
+describe('config init cancel and timeout branches', () => {
+  beforeEach(() => {
+    setSpawnFactory(() => new FakeChild() as unknown as Record<string, unknown>);
+    setExecHandler(() => ({ stdout: '' }));
+  });
+
+  function makeManager() {
+    const binDir = makeBinDir(true, true);
+    const { manager } = createManager({ binDir });
+    return manager;
+  }
+
+  async function startWithUrl(manager: ReturnType<typeof makeManager>) {
+    const child = new FakeChild();
+    setSpawnFactory(() => child as unknown as Record<string, unknown>);
+    const start = manager.startConfigInit();
+    child.stdout.emit('data', Buffer.from(
+      'https://open.feishu.cn/app/cli_a0test/auth?q=cancel-case',
+    ));
+    await start;
+    return child;
+  }
+
+  it('cancelConfigInit kills the child, frees the pending slot, and is idempotent', async () => {
+    const manager = makeManager();
+    const child = await startWithUrl(manager);
+    expect(manager.hasPendingConfigInit()).toBe(true);
+
+    await expect(manager.cancelConfigInit()).resolves.toEqual({ cancelled: true });
+    expect(child.killed).toBe(true);
+    expect(manager.hasPendingConfigInit()).toBe(false);
+
+    // 幂等：无进行中流程不报错（服务端已自行回收后取消属正常时序）。
+    await expect(manager.cancelConfigInit()).resolves.toEqual({ cancelled: false });
+  });
+
+  it('cancel then immediate restart is NOT 409-locked (diting B-1 regression)', async () => {
+    const manager = makeManager();
+    await startWithUrl(manager);
+
+    await manager.cancelConfigInit();
+
+    const child2 = new FakeChild();
+    setSpawnFactory(() => child2 as unknown as Record<string, unknown>);
+    const restart = manager.startConfigInit();
+    child2.stdout.emit('data', Buffer.from(
+      'https://open.feishu.cn/app/cli_a0test/auth?q=after-cancel-restart',
+    ));
+    // 取消后立即可重发（旧实现 409 锁死最长 12 分钟）。
+    await expect(restart).resolves.toMatchObject({
+      verificationUrl: 'https://open.feishu.cn/app/cli_a0test/auth?q=after-cancel-restart',
+    });
+  });
+
+  it('orphaned pending self-recycles when the child exits without complete (diting B-2)', async () => {
+    const manager = makeManager();
+    const child = await startWithUrl(manager);
+    expect(manager.hasPendingConfigInit()).toBe(true);
+
+    // 用户搁置：子进程过期自行退出，无 complete 调用。
+    child.emit('close', 1);
+    // exit.then 回收是微任务级，flush 一轮微任务。
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(manager.hasPendingConfigInit()).toBe(false);
+  });
+
+  it('waitForConfigInitUrl rejects with url timeout when no URL ever appears (diting B-3)', async () => {
+    vi.useFakeTimers();
+    try {
+      const manager = makeManager();
+      const child = new FakeChild();
+      setSpawnFactory(() => child as unknown as Record<string, unknown>);
+
+      const pending = manager.startConfigInit();
+      pending.catch(() => undefined);
+      // 不发任何输出，推进到 90s URL 超时（200ms 轮询在 fake timers 内推进）。
+      await vi.advanceTimersByTimeAsync(90_500);
+
+      await expect(pending).rejects.toMatchObject({ code: 'config_init_url_timeout' });
+      expect(manager.hasPendingConfigInit()).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('completeConfigInit resolves the timeout branch and kills the child (diting B-3)', async () => {
+    vi.useFakeTimers();
+    try {
+      const manager = makeManager();
+      const child = new FakeChild();
+      setSpawnFactory(() => child as unknown as Record<string, unknown>);
+      // fake timers 下 URL 轮询（200ms interval）需手动推进才能提取。
+      const start = manager.startConfigInit();
+      child.stdout.emit('data', Buffer.from(
+        'https://open.feishu.cn/app/cli_a0test/auth?q=timeout-branch',
+      ));
+      await vi.advanceTimersByTimeAsync(300);
+      await start;
+
+      const completing = manager.completeConfigInit();
+      // 用户一直不完成浏览器操作：推进到 12 分钟服务端兜底超时。
+      await vi.advanceTimersByTimeAsync(12 * 60_000 + 500);
+
+      const result = await completing;
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain('超时');
+      expect(child.killed).toBe(true);
+      expect(manager.hasPendingConfigInit()).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

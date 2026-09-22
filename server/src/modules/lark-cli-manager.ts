@@ -688,7 +688,7 @@ export class LarkCliManager {
   async startConfigInit(): Promise<ConfigInitStartResult> {
     if (this.pendingConfigInit) {
       throw new LarkCliManagerError(
-        '配置初始化已在进行中，请等待完成或取消后重试',
+        '配置初始化已在进行中，请等待完成或点击取消后再重试',
         'config_init_in_progress',
         409,
       );
@@ -726,6 +726,16 @@ export class LarkCliManager {
       startedAt: Date.now(),
       exit,
     };
+
+    // 【diting B-2 修复】孤儿自动回收：start 成功后若用户从未调 complete
+    // （关闭页面/长时间搁置），子进程退出时（浏览器完成/过期/被 kill）
+    // 自动清占位标记，否则 409 锁死到服务重启。completeConfigInit 正在
+    // race 同一个 exit promise，本回收只是附带清理，不改变其结果。
+    void exit.then(() => {
+      if (this.pendingConfigInit?.child === child) {
+        this.pendingConfigInit = null;
+      }
+    });
 
     try {
       const verificationUrl = await this.waitForConfigInitUrl(child, () => output);
@@ -834,6 +844,32 @@ export class LarkCliManager {
       error: `配置初始化失败（exit ${result.code ?? 'unknown'}），请重试`,
       output: tailLines(result.output, INSTALL_OUTPUT_TAIL_LINES),
     };
+  }
+
+  /**
+   * 取消进行中的 config init（【diting B-1 修复】服务端取消通道）。
+   *
+   * 此前「取消」按钮纯前端 abort：服务端 pendingConfigInit 仍挂着，
+   * 重试 start 被 409 锁死最长约 12 分钟，且 409 文案指向不存在的取消
+   * 操作。现在 kill 子进程 + 清占位标记，重试立即可发。
+   *
+   * 幂等语义：无进行中流程不报错（返回 cancelled:false）——前端在
+   * 服务端已自行超时回收/重启后取消属正常时序，不应弹错。
+   */
+  async cancelConfigInit(): Promise<{ cancelled: boolean }> {
+    const pending = this.pendingConfigInit;
+    if (!pending) {
+      return { cancelled: false };
+    }
+    this.pendingConfigInit = null;
+    try {
+      pending.child.kill();
+    } catch {
+      /* already exited */
+    }
+    // 若 completeConfigInit 正在 race pending.exit：kill 触发 close 后
+    // 它会拿到非零/空退出码并如实返回失败，符合「用户已取消」语义。
+    return { cancelled: true };
   }
 
   private resolveLarkCliPath(): string {

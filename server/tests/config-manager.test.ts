@@ -24,6 +24,7 @@ import {
   normalizeWatchedRootLocalDir,
   reconcileOpenAiCompatBaseUrl,
   reconcileModelAlias,
+  suggestKnowledgeRoot,
 } from '../src/modules/config-manager.js';
 
 const BIGMODEL_KEY = '80ca91e556484dfb9126672d6fbaae8c.65LWXDL6NvRyb9RN';
@@ -516,5 +517,35 @@ describe('retired scope cleanup (2026-10：docs:document:read 上游失效)', ()
     expect(DEFAULT_REQUIRED_SCOPES).not.toContain('docs:document:read');
     expect(DEFAULT_REQUIRED_SCOPES).toContain('docx:document:readonly');
     expect(DEFAULT_REQUIRED_SCOPES).toHaveLength(9);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// suggestKnowledgeRoot（2026-10 首次配置引导：缺省知识库根目录规则）
+// ---------------------------------------------------------------------------
+
+describe('suggestKnowledgeRoot', () => {
+  it('prefers D:\\飞书知识库 on win32 when the D drive exists', () => {
+    expect(suggestKnowledgeRoot({
+      platform: 'win32',
+      homeDir: 'C:\\Users\\tester',
+      exists: (p) => p === 'D:\\',
+    })).toBe('D:\\飞书知识库');
+  });
+
+  it('falls back to ~/Documents/飞书知识库 on win32 without a D drive', () => {
+    expect(suggestKnowledgeRoot({
+      platform: 'win32',
+      homeDir: 'C:\\Users\\tester',
+      exists: () => false,
+    })).toBe('C:\\Users\\tester\\Documents\\飞书知识库');
+  });
+
+  it('uses ~/Documents/飞书知识库 on non-win32 platforms', () => {
+    expect(suggestKnowledgeRoot({
+      platform: 'darwin',
+      homeDir: '/Users/tester',
+      exists: () => true,
+    })).toBe('/Users/tester/Documents/飞书知识库');
   });
 });

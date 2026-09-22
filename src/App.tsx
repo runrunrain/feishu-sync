@@ -74,7 +74,10 @@ function AppShell() {
             {/* active 标记主区是否可见：同步区常驻挂载（v0.2.9），但变为
                 可见时需重读后端持久化 diff（服务端 PollingScheduler 定时
                 检测没有客户端事件，列表/待处理可能已过期） */}
-            <SyncView active={currentArea === 'sync'} />
+            <SyncView
+              active={currentArea === 'sync'}
+              onJumpToSettings={() => handleJumpToSettings()}
+            />
           </div>
           <div className={currentArea === 'settings' ? 'animate-fade-in' : 'hidden'}>
             {/* focusTabId：点 TopBar「新版本」徽标或总览页版本更新入口时直达「应用 · 关于与更新」 */}

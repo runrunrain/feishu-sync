@@ -1,6 +1,9 @@
 /** Route-level regression tests for structured watchedRoots updates. */
 
 import { describe, expect, it, vi } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 const { Hono } = require('hono');
 import { configRoutes } from '../src/routes/config.js';
@@ -155,5 +158,83 @@ describe('config routes', () => {
     expect(response.status).toBe(400);
     expect((await response.json()).error).toBe('invalid_json');
     expect(updateConfig).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 知识库根目录缺省建议 / 采用（2026-10 首次配置引导）
+// ---------------------------------------------------------------------------
+
+describe('knowledge root suggestion endpoints', () => {
+  it('GET /api/config/knowledge-root-suggestion returns the suggested root without touching disk', async () => {
+    const app = buildApp(null);
+    const response = await app.fetch(new Request('http://x/api/config/knowledge-root-suggestion'));
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    // 形状契约：非空字符串路径（具体值平台相关，纯函数单测覆盖）。
+    expect(typeof body.root).toBe('string');
+    expect(body.root.length).toBeGreaterThan(0);
+  });
+
+  it('POST adopt creates the directory and persists knowledgeBaseRoot', async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-sync-adopt-'));
+    const target = path.join(tmpRoot, 'nested', '飞书知识库');
+    const updateConfig = vi.fn(async (partial: any) => ({ ...makeConfig(), ...partial }));
+    const app = buildApp({ updateConfig });
+
+    try {
+      const response = await app.fetch(
+        new Request('http://x/api/config/knowledge-root-suggestion/adopt', {
+          method: 'POST',
+          body: JSON.stringify({ root: target }),
+        }),
+      );
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ root: target });
+      // 目录已实际创建（recursive）。
+      expect(fs.existsSync(target)).toBe(true);
+      // 配置已保存为采用路径。
+      expect(updateConfig).toHaveBeenCalledWith({ knowledgeBaseRoot: target });
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('POST adopt without body uses the platform suggestion', async () => {
+    const updateConfig = vi.fn(async (partial: any) => ({ ...makeConfig(), ...partial }));
+    const app = buildApp({ updateConfig });
+
+    const response = await app.fetch(
+      new Request('http://x/api/config/knowledge-root-suggestion/adopt', {
+        method: 'POST',
+        body: JSON.stringify({}),
+      }),
+    );
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(typeof body.root).toBe('string');
+    expect(updateConfig).toHaveBeenCalledWith({ knowledgeBaseRoot: body.root });
+  });
+
+  it('POST adopt surfaces mkdir failure instead of swallowing it', async () => {
+    // 用一个「文件占位路径」制造 ENOTDIR：target 的父级是普通文件。
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-sync-adopt-fail-'));
+    const blocker = path.join(tmpRoot, 'blocker');
+    fs.writeFileSync(blocker, 'x', 'utf-8');
+    const app = buildApp({ updateConfig: vi.fn() });
+
+    try {
+      const response = await app.fetch(
+        new Request('http://x/api/config/knowledge-root-suggestion/adopt', {
+          method: 'POST',
+          body: JSON.stringify({ root: path.join(blocker, 'sub', 'kb') }),
+        }),
+      );
+      expect(response.status).toBe(500);
+      const body = await response.json();
+      expect(body.error).toBe('knowledge_root_create_failed');
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
   });
 });

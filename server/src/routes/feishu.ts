@@ -184,4 +184,18 @@ feishuRoutes.post('/api/feishu/lark-cli/config-init/complete', async (c) => {
   }
 });
 
+/**
+ * POST /api/feishu/lark-cli/config-init/cancel - 取消进行中的初始化配置
+ * （【diting B-1】服务端取消通道：kill 子进程 + 回收占位标记，幂等）。
+ * → { cancelled: boolean }。
+ */
+feishuRoutes.post('/api/feishu/lark-cli/config-init/cancel', async (c) => {
+  try {
+    const manager = requireLarkCliManager(c);
+    return c.json(await manager.cancelConfigInit());
+  } catch (error) {
+    return errorResponse(c, 'config_init_cancel_failed', error);
+  }
+});
+
 export { feishuRoutes };

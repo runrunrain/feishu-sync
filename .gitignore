@@ -53,3 +53,6 @@ server/tsconfig.tsbuildinfo
 # Claude Code / Amagi runtime artifacts
 .claude/
 .amagi-reports/
+
+# 本地审查文档（diting 审查报告等，不入库）
+review/

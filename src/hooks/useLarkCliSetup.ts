@@ -12,6 +12,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  cancelConfigInitRemote,
   completeConfigInit,
   completeDeviceAuth,
   getLarkCliStatus,
@@ -189,9 +190,16 @@ export function useLarkCliSetup(
         setConfigInitError(result.error || result.output || '初始化配置失败，请重试');
       }
     } catch (err) {
+      // 【diting B-7 修复】APIError 携带服务端结构化 message（如 409
+      // config_init_in_progress）时优先展示，不再统一归为「超时或中断」。
+      const message = err instanceof Error ? err.message : '';
       const userCancelled = configInitCancelledRef.current;
       setConfigInitPhase(userCancelled ? 'idle' : 'failed');
-      setConfigInitError(userCancelled ? null : '等待浏览器完成配置超时或中断，请重试');
+      setConfigInitError(
+        userCancelled
+          ? null
+          : message || '等待浏览器完成配置超时或中断，请重试',
+      );
     } finally {
       clearTimeout(timer);
       if (configInitAbortRef.current === controller) configInitAbortRef.current = null;
@@ -219,6 +227,10 @@ export function useLarkCliSetup(
     configInitCancelledRef.current = true;
     configInitAbortRef.current?.abort();
     configInitAbortRef.current = null;
+    // 【diting B-1 修复】仅 abort 本地请求不解除服务端占位：重试会被
+    // 409 锁死最长约 12 分钟。同步通知服务端 kill 子进程 + 回收（幂等，
+    // 失败静默——服务端已自行超时回收/重启属正常时序）。
+    void cancelConfigInitRemote();
     setConfigInitUrl(null);
     setConfigInitError(null);
     setConfigInitPhase('idle');

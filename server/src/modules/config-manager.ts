@@ -29,6 +29,7 @@
  */
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { resolveDataRoot } from './data-root.js';
 import type {
@@ -72,6 +73,31 @@ export const DEFAULT_REQUIRED_SCOPES = [
  * 从存量配置剔除，device flow 发起前再兑底过滤一次（防手改配置回灌）。
  */
 export const RETIRED_REQUEST_SCOPES: readonly string[] = ['docs:document:read'];
+
+/**
+ * 计算知识库根目录的缺省建议值（2026-10 首次配置引导）。
+ *
+ * 规则（用户拍板）：Windows 且 D 盘存在 → `D:\飞书知识库`（国内同事机
+ * 器惯例，数据盘独立于系统盘）；其余（含无 D 盘的 Windows / macOS /
+ * Linux）→ `~/Documents/飞书知识库`。
+ *
+ * 仅计算不创建：预览端点直接返回；采用端点（adopt）才 mkdir + 落盘
+ * 保存，避免「看一眼建议」就往用户磁盘写目录。
+ */
+export function suggestKnowledgeRoot(
+  options: { platform?: NodeJS.Platform; homeDir?: string; exists?: (p: string) => boolean } = {},
+): string {
+  const platform = options.platform ?? process.platform;
+  const homeDir = options.homeDir ?? os.homedir();
+  const exists = options.exists ?? ((p: string) => fs.existsSync(p));
+  // 平台感知 join：注入 win32 语义时必须用 win32 分隔符（否则在
+  // macOS 宿主上测试/调用会得到 `C:\Users\x/Documents/…` 的混合分隔符）。
+  const join = platform === 'win32' ? path.win32.join : path.posix.join;
+  if (platform === 'win32' && exists('D:\\')) {
+    return 'D:\\飞书知识库';
+  }
+  return join(homeDir, 'Documents', '飞书知识库');
+}
 
 /**
  * 飞书 scope 新旧名等价组：授权端可能只授予其中一个名字。比对

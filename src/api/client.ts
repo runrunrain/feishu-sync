@@ -369,6 +369,18 @@ export async function completeConfigInit(
   });
 }
 
+/** 取消进行中的初始化配置（服务端 kill 子进程 + 回收，幂等；容错静默）。 */
+export async function cancelConfigInitRemote(): Promise<void> {
+  try {
+    await request<{ cancelled: boolean }>('/api/feishu/lark-cli/config-init/cancel', {
+      method: 'POST',
+      body: JSON.stringify({}),
+    });
+  } catch {
+    // 服务端已自行回收/重启属正常时序，取消失败不影响前端复位。
+  }
+}
+
 /**
  * Detect changes in watched URLs
  */
@@ -454,6 +466,24 @@ export async function detectChangesAll(
  * user a write confirmation, while the server still plans and blocks unsafe
  * paths (for example, an existing local file with no cloud mapping).
  */
+/** GET /api/config/knowledge-root-suggestion —— 缺省知识库根目录建议（只算不建）。 */
+export async function getKnowledgeRootSuggestion(): Promise<string> {
+  const data = await request<{ root: string }>('/api/config/knowledge-root-suggestion');
+  return data.root;
+}
+
+/**
+ * POST /api/config/knowledge-root-suggestion/adopt —— 采用缺省路径：
+ * 建目录 + 保存配置 → { root }。失败抛 APIError（message 已带可读原因）。
+ */
+export async function adoptKnowledgeRootSuggestion(): Promise<string> {
+  const data = await request<{ root: string }>(
+    '/api/config/knowledge-root-suggestion/adopt',
+    { method: 'POST', body: JSON.stringify({}) },
+  );
+  return data.root;
+}
+
 export async function syncDocs(
   documents: ChangedDocument[],
   options: { enableLLM?: boolean; adoptExistingProfileTargets?: boolean } = {},
