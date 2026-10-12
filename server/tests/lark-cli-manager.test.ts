@@ -116,6 +116,7 @@ function makeBinDir(withNpm: boolean, withLarkCli = false): string {
 
 function createManager(options: {
   binDir?: string;
+  platform?: NodeJS.Platform;
   authReadiness?: Record<string, unknown>;
   config?: Record<string, unknown>;
 } = {}) {
@@ -137,7 +138,7 @@ function createManager(options: {
     load: vi.fn(async () => config),
   };
   const manager = new LarkCliManager(client, configManager, {
-    platform: 'darwin',
+    platform: options.platform ?? 'darwin',
     env: { PATH: options.binDir ?? path.join(tmpRoot, 'empty-bin') },
     homeDir: tmpRoot,
   });
@@ -389,6 +390,40 @@ describe('installOrUpdateLarkCli', () => {
 // ---------------------------------------------------------------------------
 
 describe('device auth flow', () => {
+  it('keeps the full scope union in one Windows shell argument when reauthorizing', async () => {
+    // 截图中的三项权限位于已授权列表之后；shell:true 裸 join 会导致
+    // --scope 只收到 auth:user.id:read，其余变成 CLI 忽略的位置参数。
+    const granted = ['auth:user.id:read', 'wiki:node:retrieve', 'offline_access'];
+    const missing = ['wiki:space:retrieve', 'sheets:spreadsheet:read', 'slides:presentation:read'];
+    const { manager } = createManager({
+      platform: 'win32',
+      config: { requiredScopes: ['wiki:node:retrieve', ...missing, 'offline_access'] },
+      authReadiness: { ready: false, currentScopes: granted, missingScopes: missing },
+    });
+    setExecHandler(() => ({ stdout: DEVICE_AUTH_JSON }));
+
+    const session = await manager.startDeviceAuth();
+    const requested = [...granted, ...missing];
+    expect(session.requestedScopes).toEqual(requested);
+    const call = execFileMock.mock.calls[0];
+    expect(call[1]).toEqual(['auth', 'login', '--no-wait', '--json', '--scope', `"${requested.join(' ')}"`]);
+    expect((call[2] as { shell: boolean }).shell).toBe(true);
+  });
+
+  it('also quotes the Windows scope argument on the invalid-union fallback', async () => {
+    const { manager } = createManager({
+      platform: 'win32',
+      authReadiness: { ready: false, currentScopes: ['im:chat:read'] },
+    });
+    setExecHandler((_file, args) => args.at(-1)?.includes('im:chat:read')
+      ? { stdout: JSON.stringify({ ok: false, error: { message: 'invalid or malformed scopes' } }) }
+      : { stdout: DEVICE_AUTH_JSON });
+
+    const session = await manager.startDeviceAuth();
+    expect(session.requestedScopes).toEqual(['wiki:node:retrieve', 'offline_access']);
+    expect(execFileMock.mock.calls[1][1].at(-1)).toBe('"wiki:node:retrieve offline_access"');
+  });
+
   it('starts with configured scopes and parses the no-wait JSON leniently', async () => {
     const { manager } = createManager();
     setExecHandler((_file, args) => {
@@ -412,7 +447,7 @@ describe('device auth flow', () => {
     expect(execFileMock).toHaveBeenCalledWith(
       expect.any(String),
       ['auth', 'login', '--no-wait', '--json', '--scope', 'wiki:node:retrieve offline_access'],
-      expect.anything(),
+      expect.objectContaining({ shell: false }),
       expect.any(Function),
     );
     expect(manager.hasPendingDeviceAuth()).toBe(true);

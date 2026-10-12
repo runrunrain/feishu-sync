@@ -31,6 +31,7 @@ import {
   findExecutableOnPath,
   getNodeRuntimeCandidateDirectories,
   quoteWindowsExecutablePath,
+  quoteWindowsShellArguments,
   resolveLarkCliExecutable,
   type LarkCliAuthReadiness,
 } from './lark-cli-client.js';
@@ -546,15 +547,22 @@ export class LarkCliManager {
     const augmented = union.length !== required.length || union.some((s, i) => required[i] !== s);
 
     const larkCliPath = this.resolveLarkCliPath();
+    const platform = this.discovery.platform ?? process.platform;
     const attempt = async (scopes: string[]): Promise<{ stdout: string; stderr: string }> => {
       return await execFileAsync(
-        quoteWindowsExecutablePath(larkCliPath, this.discovery.platform ?? process.platform),
-        ['auth', 'login', '--no-wait', '--json', '--scope', scopes.join(' ')],
+        quoteWindowsExecutablePath(larkCliPath, platform),
+        // Windows 的 .cmd shim 需要 shell:true；Node 会裸 join args，
+        // 必须保护整个 scope 参数，否则 CLI 只收到第一项，后续补授权无效。
+        // 与同步命令共用编码规则；macOS/Linux 无 shell，不额外添加引号。
+        quoteWindowsShellArguments(
+          ['auth', 'login', '--no-wait', '--json', '--scope', scopes.join(' ')],
+          platform,
+        ),
         {
           timeout: DEVICE_AUTH_START_TIMEOUT_MS,
           encoding: 'utf-8',
           windowsHide: true,
-          shell: process.platform === 'win32',
+          shell: platform === 'win32',
           env: buildLarkCliEnvironment(larkCliPath),
         },
       );
@@ -620,17 +628,18 @@ export class LarkCliManager {
     }
 
     const larkCliPath = this.resolveLarkCliPath();
+    const platform = this.discovery.platform ?? process.platform;
     let flowOk = true;
     let flowError: string | undefined;
     try {
       await execFileAsync(
-        quoteWindowsExecutablePath(larkCliPath, this.discovery.platform ?? process.platform),
-        ['auth', 'login', '--device-code', deviceCode],
+        quoteWindowsExecutablePath(larkCliPath, platform),
+        quoteWindowsShellArguments(['auth', 'login', '--device-code', deviceCode], platform),
         {
           timeout: DEVICE_AUTH_COMPLETE_TIMEOUT_MS,
           encoding: 'utf-8',
           windowsHide: true,
-          shell: process.platform === 'win32',
+          shell: platform === 'win32',
           env: buildLarkCliEnvironment(larkCliPath),
         },
       );

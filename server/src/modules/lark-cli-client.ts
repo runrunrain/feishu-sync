@@ -841,7 +841,7 @@ export class LarkCliClient {
       if (missingScopes.length > 0) {
         return {
           ready: false,
-          error: `缺少权限：${missingScopes.join(', ')}。请在应用内点击「开始飞书认证」重新授权补齐；若重新授权后仍缺失，多为 lark-cli 版本过旧（应用凭据未发布该权限时授权端会静默丢弃不授），可尝试「更新 lark-cli」后重试`,
+          error: `缺少权限：${missingScopes.join(', ')}。请在应用内点击「开始飞书认证」重新授权补齐；若完成后仍缺失，请检查授权页是否包含并已勾选这些权限，以及飞书应用的权限是否已获管理员批准`,
           larkCliVersion,
           currentScopes,
           missingScopes,
