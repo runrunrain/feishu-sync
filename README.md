@@ -104,11 +104,15 @@ cd ..
 # 认证登录（最小只读同步边界；scope 空格或逗号分隔）
 lark-cli auth login --scope="wiki:node:retrieve wiki:space:retrieve docs:document.content:read sheets:spreadsheet:read docx:document:readonly drive:drive.metadata:readonly docs:document.media:download slides:presentation:read offline_access"
 
-# 确认认证状态（需显示 user ready + token valid）
-lark-cli auth status
+# 联网确认认证状态（需显示 user 可用且 verified=true）
+lark-cli auth status --verify --json
 ```
 
-**认证就绪条件**：user ready + 覆盖上表 9 个 scope（与 `ConfigManager` 默认 `requiredScopes` 一致）
+**认证就绪条件**：user 可用、通过飞书服务端联网验证、能够识别账号身份，并覆盖上表 9 个 scope（与 `ConfigManager` 默认 `requiredScopes` 一致）。网络不可用、账号授权失效或缺少验证信息时，应用不会判为就绪。
+
+旧账号被停用或撤权后，在「设置 → 飞书认证」点击「切换飞书账号」，在浏览器授权页选择新账号。换号仅请求同步必需权限；授权完成后，应用会核对本次授权账号与当前账号一致、且与原账号不同，再显示成功及账号名称。重新授权原账号则保留已有权限。取消认证会停止后台授权进程，可以立即重新发起。
+
+新账号需获准使用当前飞书应用，并单独获得目标知识库和文档的访问权限。若新账号属于另一组织，应先确认该组织的应用授权；应用被管理员停用或必需权限未获批准时，换号不能替代管理员授权。
 
 ### 配置 LLM 与本地知识库
 

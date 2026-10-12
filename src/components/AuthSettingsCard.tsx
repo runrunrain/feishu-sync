@@ -59,7 +59,8 @@ export function AuthSettingsCard() {
   const npmMissing =
     setup.installResult?.reason === 'npm_not_found'
     || (toolStatus != null && !toolStatus.npmAvailable);
-  const authActive = ['starting', 'waiting', 'completing'].includes(setup.authPhase);
+  const authActive = ['starting', 'waiting', 'completing', 'cancelling'].includes(setup.authPhase);
+  const configActive = ['starting', 'waiting', 'completing'].includes(setup.configInitPhase);
 
   const StatusIcon = loading
     ? null
@@ -155,7 +156,7 @@ export function AuthSettingsCard() {
 
       <CardBody className="space-y-4">
         <div className="flex items-center justify-between py-1.5 border-b border-line">
-          <span className="text-sm text-ink-soft">状态</span>
+          <span className="text-sm text-ink-soft">当前账号状态</span>
           <div className="flex items-center gap-2">
             {StatusIcon}
             <StatusBadge status={loading ? 'loading' : ready ? 'success' : 'error'} size="sm">
@@ -163,6 +164,28 @@ export function AuthSettingsCard() {
             </StatusBadge>
           </div>
         </div>
+
+        {authStatus?.account && (
+          <div className="space-y-1 py-1.5 border-b border-line">
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-sm text-ink-soft">当前账号</span>
+              <span className="text-sm text-ink">{authStatus.account.name || '飞书用户'}</span>
+            </div>
+            <p className="text-xs font-mono text-ink-faint break-all">{authStatus.account.id}</p>
+            <p className="text-xs text-ink-soft">{authStatus.verified ? '已通过联网验证' : '尚未通过联网验证'}</p>
+          </div>
+        )}
+        {toolStatus?.larkCliInstalled && !setup.configInitNeeded && (
+          <div className="flex flex-wrap items-center gap-2">
+            {ready && <Button variant="secondary" size="sm" disabled={authActive || configActive || setup.installing} onClick={handleStartAuth}>
+              重新授权
+            </Button>}
+            <Button variant="secondary" size="sm" disabled={authActive || configActive || setup.installing} onClick={() => void setup.startAuth('switch_account')}>
+              切换飞书账号
+            </Button>
+            <span className="text-xs text-ink-soft">旧账号被停用或撤权时，可使用获准访问的新账号重新授权。</span>
+          </div>
+        )}
 
         {authStatus?.larkCliVersion && (
           <div className="flex items-center justify-between py-1.5 border-b border-line">
@@ -200,10 +223,18 @@ export function AuthSettingsCard() {
                 {setup.authPhase === 'starting' && '正在发起飞书认证…'}
                 {setup.authPhase === 'waiting' && '等待浏览器授权确认…（约 10 分钟内有效）'}
                 {setup.authPhase === 'completing' && '正在确认授权结果…'}
+                {setup.authPhase === 'cancelling' && '正在取消认证…'}
               </p>
             </div>
             {setup.authSession && (
               <>
+            {setup.authMode === 'switch_account' && (
+              <p className="text-sm text-ink leading-relaxed">
+                请在浏览器授权页选择新飞书账号
+                {setup.authSession.previousAccount?.name ? `（原账号：${setup.authSession.previousAccount.name}）` : ''}。
+                本次仅申请同步所需权限。新账号须获准使用当前应用；若属于另一组织，请先确认该组织的应用授权。
+              </p>
+            )}
             <div className="flex items-center gap-2">
               <a
                 href={setup.authSession.verificationUrl}
@@ -227,8 +258,8 @@ export function AuthSettingsCard() {
                 <Globe className="w-3.5 h-3.5" />
                 重新打开授权页
               </Button>
-              <Button variant="ghost" size="sm" onClick={setup.cancelAuth}>
-                取消等待
+              <Button variant="ghost" size="sm" disabled={setup.authPhase === 'cancelling'} onClick={() => void setup.cancelAuth()}>
+                取消认证
               </Button>
             </div>
             <p className="text-xs text-ink-soft leading-relaxed border-t border-seal/20 pt-2">
@@ -246,11 +277,14 @@ export function AuthSettingsCard() {
         {/* ── 引导面板：Device Flow 失败/成功态 ───────────────────── */}
         {!authActive && setup.authPhase === 'failed' && (
           <div className="p-3 rounded-md border border-seal-2/30 bg-seal-2/5 space-y-2">
+            <p className="text-sm font-medium text-seal-2">
+              {setup.authMode === 'switch_account' ? '本次切换账号未完成' : '本次认证未完成'}
+            </p>
             <p className="text-sm text-seal-2">{setup.authError || '认证未完成'}</p>
             <div className="flex items-center gap-2">
-              <Button variant="primary" size="sm" onClick={handleStartAuth}>
+              <Button variant="primary" size="sm" onClick={() => void setup.startAuth(setup.authMode)}>
                 <RefreshCw className="w-3.5 h-3.5" />
-                重试认证
+                {setup.authMode === 'switch_account' ? '重试切换账号' : '重试认证'}
               </Button>
               <Button variant="ghost" size="sm" onClick={setup.resetAuth}>
                 返回
@@ -260,7 +294,11 @@ export function AuthSettingsCard() {
         )}
         {!authActive && setup.authPhase === 'success' && (
           <div className="p-3 rounded-md border border-jade/30 bg-jade/5">
-            <p className="text-sm text-jade">认证成功，已自动刷新就绪状态。</p>
+            <p className="text-sm text-jade">
+              {setup.authMode === 'switch_account' ? '账号切换成功' : '认证成功'}，
+              已联网验证 {setup.authAccount?.name || setup.authAccount?.id || '当前账号'}。
+            </p>
+            {setup.authMode === 'switch_account' && <p className="text-xs text-ink-soft mt-1">同步知识库还需要为新账号单独授予文档访问权限。</p>}
           </div>
         )}
 

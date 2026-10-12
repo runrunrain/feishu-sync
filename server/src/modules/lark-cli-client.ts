@@ -123,6 +123,8 @@ export interface LarkCliAuthReadiness {
   currentScopes?: string[];
   missingScopes?: string[];
   identity?: string;
+  verified?: boolean;
+  account?: { id: string; name?: string };
 }
 
 /** A document reference accepted by Drive's batch metadata endpoint. */
@@ -781,7 +783,7 @@ export class LarkCliClient {
   /**
    * Check if lark-cli is ready (version + authentication + scope validation)
    */
-  async checkAuthReady(): Promise<LarkCliAuthReadiness> {
+  async checkAuthReady(options: { verify?: boolean } = {}): Promise<LarkCliAuthReadiness> {
     // 提升作用域：auth status / scope 阶段抛错时 --version 已成功拿到
     // 版本，不能随 catch 丢失（2026-10 实测：未 config init 的机器上
     // getToolStatus 拿不到 larkCliVersion，前端无法显示已安装版本）。
@@ -803,7 +805,8 @@ export class LarkCliClient {
       }
 
       // 2. Check authentication status
-      const statusResult = await this.execute(['auth', 'status'], 'auth');
+      const verify = options.verify !== false;
+      const statusResult = await this.execute(['auth', 'status', '--json', ...(verify ? ['--verify'] : [])], 'auth');
       if (!statusResult.data || !statusResult.data.identity) {
         return {
           ready: false,
@@ -813,12 +816,28 @@ export class LarkCliClient {
       }
 
       const identity = statusResult.data.identity;
-      if (identity !== 'user') {
+      const user = statusResult.data.identities?.user;
+      const account = typeof user?.openId === 'string' && user.openId.trim()
+        ? { id: user.openId, name: typeof user.userName === 'string' ? user.userName : undefined }
+        : undefined;
+      const currentScopes: string[] = typeof user?.scope === 'string'
+        ? user.scope.split(/\s+/).filter(Boolean) : [];
+      const details = { larkCliVersion, identity, currentScopes, account, verified: user?.verified === true };
+      // --verify 失败时顶层 identity 可能回退为 bot，必须检查 user 本身。
+      // 即使缓存 scope 完整，也不能把已撤销/过期或无法联网核验的凭据判为就绪。
+      if (identity !== 'user' || user?.available !== true
+        || !['ready', 'needs_refresh'].includes(user?.status)) {
         return {
+          ...details,
           ready: false,
-          error: `认证身份不是 user，当前身份: ${identity}`,
-          larkCliVersion,
-          identity,
+          error: `当前账号认证不可用，请重新认证或切换账号。${user?.message || ''}`,
+        };
+      }
+      if (!verify || user?.verified !== true || !account) {
+        return {
+          ...details,
+          ready: false,
+          error: '尚未通过账号联网验证。请检查网络后重新检测，或重新认证；旧版 lark-cli 缺少验证信息时请先更新。',
         };
       }
 
@@ -828,8 +847,6 @@ export class LarkCliClient {
       //    组内任一命中即视为满足，避免对新名的误报阻断认证（2026-09 实测
       //    「缺少权限：docs:document:read」即旧授权只持旧名触发；2026-10 起
       //    默认需求集已不再要求该名，此兑底仅为手改配置/旧 token 兼容）。
-      const scopesString = statusResult.data.identities?.user?.scope || '';
-      const currentScopes = scopesString.split(' ').filter((s: string) => s.length > 0);
       const currentScopeSet = new Set(currentScopes);
       const isScopeSatisfied = (scope: string): boolean => {
         if (currentScopeSet.has(scope)) return true;
@@ -840,21 +857,17 @@ export class LarkCliClient {
       const missingScopes = this.config.requiredScopes.filter((s) => !isScopeSatisfied(s));
       if (missingScopes.length > 0) {
         return {
+          ...details,
           ready: false,
           error: `缺少权限：${missingScopes.join(', ')}。请在应用内点击「开始飞书认证」重新授权补齐；若完成后仍缺失，请检查授权页是否包含并已勾选这些权限，以及飞书应用的权限是否已获管理员批准`,
-          larkCliVersion,
-          currentScopes,
           missingScopes,
-          identity,
         };
       }
 
       return {
+        ...details,
         ready: true,
-        larkCliVersion,
-        currentScopes,
         missingScopes: [],
-        identity,
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

@@ -292,7 +292,11 @@ export interface DeviceAuthStartResult {
   expiresIn: number;
   /** 本次请求的 scope 集（2026-10 起服务端返回；旧版本无此字段）。 */
   requestedScopes?: string[];
+  mode: DeviceAuthMode;
+  previousAccount?: AuthStatus['account'];
 }
+
+export type DeviceAuthMode = 'reauthorize' | 'switch_account';
 
 /** POST /api/feishu/auth/device/complete —— 阻塞等待授权后的最终状态。 */
 export interface DeviceAuthCompleteResult {
@@ -303,6 +307,8 @@ export interface DeviceAuthCompleteResult {
   missingScopes?: string[];
   identity?: string;
   error?: string;
+  account?: AuthStatus['account'];
+  verified?: boolean;
 }
 
 /** POST /api/feishu/lark-cli/config-init/start —— 立即返回的初始化配置会话。 */
@@ -329,10 +335,16 @@ export async function installLarkCli(): Promise<LarkCliInstallResult> {
   });
 }
 
-export async function startDeviceAuth(): Promise<DeviceAuthStartResult> {
+export async function startDeviceAuth(mode: DeviceAuthMode = 'reauthorize'): Promise<DeviceAuthStartResult> {
   return request<DeviceAuthStartResult>('/api/feishu/auth/device/start', {
     method: 'POST',
-    body: JSON.stringify({}),
+    body: JSON.stringify({ mode }),
+  });
+}
+
+export async function cancelDeviceAuthRemote(deviceCode: string): Promise<{ cancelled: boolean }> {
+  return request('/api/feishu/auth/device/cancel', {
+    method: 'POST', body: JSON.stringify({ deviceCode }),
   });
 }
 

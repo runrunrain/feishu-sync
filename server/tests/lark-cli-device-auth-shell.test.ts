@@ -25,8 +25,8 @@ if (args.includes('--no-wait')) {
   assert.deepEqual(args, ['auth', 'login', '--no-wait', '--json', '--scope', ${JSON.stringify(requested.join(' '))}]);
   console.log(JSON.stringify({ device_code: ${JSON.stringify(deviceCode)}, expires_in: 600, verification_url: 'https://example.com/auth' }));
 } else {
-  assert.deepEqual(args, ['auth', 'login', '--device-code', ${JSON.stringify(deviceCode)}]);
-  console.log('authorized');
+  assert.deepEqual(args, ['auth', 'login', '--device-code', ${JSON.stringify(deviceCode)}, '--json']);
+  console.log(JSON.stringify({ event: 'authorization_complete', user_open_id: 'ou-test' }));
 }
 `);
       fs.writeFileSync(shim, process.platform === 'win32'
@@ -36,7 +36,7 @@ if (args.includes('--no-wait')) {
       let authorized = false;
       const client = {
         checkAuthReady: async () => ({
-          ready: authorized,
+          ready: authorized, verified: authorized, account: { id: 'ou-test' },
           identity: 'user',
           currentScopes: authorized ? requested : granted,
           missingScopes: authorized ? [] : missing,

@@ -251,6 +251,8 @@ export interface AuthStatus {
   missingScopes?: string[];
   error?: string;
   identity?: string;
+  verified?: boolean;
+  account?: { id: string; name?: string };
 }
 
 // ============================================================================

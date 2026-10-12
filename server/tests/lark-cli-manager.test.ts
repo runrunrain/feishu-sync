@@ -33,7 +33,7 @@ type ExecHandlerResult = {
 };
 
 const { execFileMock, setExecHandler } = vi.hoisted(() => {
-  type Handler = (file: string, args: string[]) => ExecHandlerResult;
+  type Handler = (file: string, args: string[]) => ExecHandlerResult | Promise<ExecHandlerResult>;
   let handler: Handler = () => ({ stdout: '' });
   return {
     execFileMock: vi.fn(
@@ -187,6 +187,8 @@ describe('getToolStatus latest version query', () => {
     expect(degraded.larkCliInstalled).toBe(true);
   });
 });
+
+const AUTH_COMPLETE_JSON = JSON.stringify({ event: 'authorization_complete', user_open_id: 'ou-new', user_name: '新账号' });
 
 const DEVICE_AUTH_JSON =
   '{"device_code":"dc-123","expires_in":600,"verification_url":"https://open.feishu.cn/device-verify?dc=dc-123","hint":"agent instructions, ignore"}';
@@ -390,6 +392,94 @@ describe('installOrUpdateLarkCli', () => {
 // ---------------------------------------------------------------------------
 
 describe('device auth flow', () => {
+  it('switches from a revoked account using only required scopes and verifies the new identity', async () => {
+    const { manager, client } = createManager({ authReadiness: {
+      ready: false, verified: false, account: { id: 'ou-old', name: '旧账号' },
+      currentScopes: ['im:message:send_as_user'],
+    } });
+    setExecHandler((_file, args) => ({ stdout: args.includes('--no-wait') ? DEVICE_AUTH_JSON : AUTH_COMPLETE_JSON }));
+    const session = await manager.startDeviceAuth('switch_account');
+    expect(session).toMatchObject({ mode: 'switch_account', previousAccount: { id: 'ou-old' }, requestedScopes: ['wiki:node:retrieve', 'offline_access'] });
+    expect(execFileMock.mock.calls[0][1].at(-1)).not.toContain('im:message');
+    client.checkAuthReady.mockResolvedValue({ ready: true, verified: true, account: { id: 'ou-new' } });
+    expect(await manager.completeDeviceAuth('dc-123')).toMatchObject({ ok: true, ready: true, account: { id: 'ou-new' } });
+    expect(client.checkAuthReady).toHaveBeenLastCalledWith({ verify: true });
+  });
+
+  it('rejects switching when the browser authorizes the old account again', async () => {
+    const { manager } = createManager({ authReadiness: { ready: true, verified: true, account: { id: 'ou-new' } } });
+    setExecHandler((_file, args) => ({ stdout: args.includes('--no-wait') ? DEVICE_AUTH_JSON : AUTH_COMPLETE_JSON }));
+    await manager.startDeviceAuth('switch_account');
+    expect(await manager.completeDeviceAuth('dc-123')).toMatchObject({ ok: false, ready: false, error: expect.stringContaining('原账号') });
+  });
+
+  it.each([
+    { stdout: '{"ok":false,"error":{"message":"access denied"}}' },
+    { stdout: 'authorized' },
+    { error: new Error('device-code secret expired') },
+  ])('does not report success from an old ready account after a failed flow: %j', async (completion) => {
+    const { manager, client } = createManager({ authReadiness: { ready: true, verified: true, account: { id: 'ou-old' } } });
+    setExecHandler((_file, args) => args.includes('--no-wait') ? { stdout: DEVICE_AUTH_JSON } : completion);
+    await manager.startDeviceAuth('switch_account');
+    expect(await manager.completeDeviceAuth('dc-123')).toMatchObject({ ok: false, ready: false });
+    expect(client.checkAuthReady).toHaveBeenCalledTimes(1);
+    expect(manager.hasPendingDeviceAuth()).toBe(false);
+  });
+
+  it.each([
+    { ready: true, verified: true, account: { id: 'ou-unrelated' } },
+    { ready: true, verified: false, account: { id: 'ou-new' } },
+    { ready: false, verified: true, account: { id: 'ou-new' }, missingScopes: ['offline_access'] },
+  ])('does not accept mismatched identity, unverified state or incomplete permissions: %j', async (readiness) => {
+    const { manager, client } = createManager();
+    setExecHandler((_file, args) => ({ stdout: args.includes('--no-wait') ? DEVICE_AUTH_JSON : AUTH_COMPLETE_JSON }));
+    await manager.startDeviceAuth();
+    client.checkAuthReady.mockResolvedValue(readiness);
+    expect((await manager.completeDeviceAuth('dc-123')).ready).toBe(false);
+  });
+
+  it('rejects stale completion and concurrent starts, and cancellation allows immediate retry', async () => {
+    const { manager } = createManager();
+    setExecHandler(() => ({ stdout: DEVICE_AUTH_JSON }));
+    const starting = manager.startDeviceAuth();
+    await expect(manager.startDeviceAuth('switch_account')).rejects.toMatchObject({ status: 409 });
+    await starting;
+    await expect(manager.completeDeviceAuth('stale-code')).rejects.toMatchObject({ code: 'device_auth_session_mismatch' });
+    expect(await manager.cancelDeviceAuth('stale-code')).toEqual({ cancelled: false });
+    expect(manager.hasPendingDeviceAuth()).toBe(true);
+    expect(await manager.cancelDeviceAuth('dc-123')).toEqual({ cancelled: true });
+    await expect(manager.startDeviceAuth('switch_account')).resolves.toMatchObject({ mode: 'switch_account' });
+    await manager.cancelDeviceAuth('dc-123');
+  });
+
+  it('expires an abandoned session so it cannot permanently block account switching', async () => {
+    vi.useFakeTimers();
+    try {
+      const { manager } = createManager();
+      setExecHandler(() => ({ stdout: DEVICE_AUTH_JSON }));
+      await manager.startDeviceAuth();
+      await vi.advanceTimersByTimeAsync(600_001);
+      expect(manager.hasPendingDeviceAuth()).toBe(false);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('waits for the cancelled poll to exit before allowing a new flow and ignores its late success', async () => {
+    let finish!: (result: ExecHandlerResult) => void;
+    const { manager, client } = createManager();
+    setExecHandler((_file, args) => args.includes('--no-wait') ? { stdout: DEVICE_AUTH_JSON }
+      : new Promise((resolve) => { finish = resolve; }));
+    await manager.startDeviceAuth('switch_account');
+    const completing = manager.completeDeviceAuth('dc-123');
+    await Promise.resolve();
+    const cancelling = manager.cancelDeviceAuth('dc-123');
+    await expect(manager.startDeviceAuth()).rejects.toMatchObject({ status: 409 });
+    client.checkAuthReady.mockResolvedValue({ ready: true, verified: true, account: { id: 'ou-new' } });
+    finish({ stdout: AUTH_COMPLETE_JSON });
+    expect(await completing).toMatchObject({ ok: false, ready: false });
+    await cancelling;
+    expect(manager.hasPendingDeviceAuth()).toBe(false);
+  });
+
   it('keeps the full scope union in one Windows shell argument when reauthorizing', async () => {
     // 截图中的三项权限位于已授权列表之后；shell:true 裸 join 会导致
     // --scope 只收到 auth:user.id:read，其余变成 CLI 忽略的位置参数。
@@ -439,6 +529,7 @@ describe('device auth flow', () => {
     const session = await manager.startDeviceAuth();
 
     expect(session).toEqual({
+      mode: 'reauthorize', previousAccount: undefined,
       deviceCode: 'dc-123',
       verificationUrl: 'https://open.feishu.cn/device-verify?dc=dc-123',
       expiresIn: 600,
@@ -597,7 +688,7 @@ describe('device auth flow', () => {
     const { manager, client } = createManager();
     setExecHandler((_file, args) => {
       if (args.includes('--no-wait')) return { stdout: DEVICE_AUTH_JSON };
-      if (args.includes('--device-code')) return { stdout: 'authorized' };
+      if (args.includes('--device-code')) return { stdout: AUTH_COMPLETE_JSON };
       return { error: new Error('unexpected') };
     });
 
@@ -613,7 +704,7 @@ describe('device auth flow', () => {
 
     // complete 成功 → 清除标记
     client.checkAuthReady.mockResolvedValue({
-      ready: true,
+      ready: true, verified: true, account: { id: 'ou-new', name: '新账号' },
       larkCliVersion: 'lark-cli/2.3.4',
       currentScopes: ['wiki:node:retrieve'],
       missingScopes: [],
@@ -651,7 +742,7 @@ describe('device auth flow', () => {
     void clientExecute;
     setExecHandler((_file, args) => {
       if (args.includes('--no-wait')) return { stdout: DEVICE_AUTH_JSON };
-      if (args.includes('--device-code')) return { stdout: 'authorized', stderr: '' };
+      if (args.includes('--device-code')) return { stdout: AUTH_COMPLETE_JSON, stderr: '' };
       return { error: new Error('unexpected') };
     });
 
@@ -660,7 +751,7 @@ describe('device auth flow', () => {
     // granted scope）；这里记录基线，验证 complete 只额外再核对一次。
     const callsAfterStart = client.checkAuthReady.mock.calls.length;
     client.checkAuthReady.mockResolvedValue({
-      ready: true,
+      ready: true, verified: true, account: { id: 'ou-new', name: '新账号' },
       missingScopes: [],
       currentScopes: ['wiki:node:retrieve', 'offline_access'],
     });
@@ -670,7 +761,7 @@ describe('device auth flow', () => {
     expect(result).toMatchObject({ ok: true, ready: true, missingScopes: [] });
     expect(execFileMock).toHaveBeenCalledWith(
       expect.any(String),
-      ['auth', 'login', '--device-code', 'dc-123'],
+      ['auth', 'login', '--device-code', 'dc-123', '--json'],
       expect.objectContaining({ timeout: 11 * 60_000 }),
       expect.any(Function),
     );
@@ -678,7 +769,7 @@ describe('device auth flow', () => {
     expect(client.checkAuthReady).toHaveBeenCalledTimes(callsAfterStart + 1);
   });
 
-  it('reports flow failure with the final readiness state and clears pending', async () => {
+  it('reports flow failure without borrowing old readiness and clears pending', async () => {
     const { manager, client } = createManager();
     setExecHandler((_file, args) => {
       if (args.includes('--no-wait')) return { stdout: DEVICE_AUTH_JSON };
@@ -701,8 +792,8 @@ describe('device auth flow', () => {
 
     expect(result.ok).toBe(false);
     expect(result.ready).toBe(false);
-    expect(result.error).toContain('expired');
-    expect(result.missingScopes).toEqual(['wiki:node:retrieve', 'offline_access']);
+    expect(result.error).toContain('授权');
+    expect(result.missingScopes).toBeUndefined();
     expect(manager.hasPendingDeviceAuth()).toBe(false);
   });
 });
@@ -723,6 +814,27 @@ function buildApp(manager: unknown) {
 }
 
 describe('feishu lark-cli routes', () => {
+  it('passes switch mode to the manager and rejects malformed auth requests', async () => {
+    const startDeviceAuth = vi.fn(async () => ({ mode: 'switch_account' }));
+    const app = buildApp({ startDeviceAuth });
+    const post = (body: string) => app.request('/api/feishu/auth/device/start', { method: 'POST', body });
+    expect((await post('{"mode":"switch_account"}')).status).toBe(200);
+    expect(startDeviceAuth).toHaveBeenCalledWith('switch_account');
+    for (const body of ['null', '[1]', '{', '{"mode":"unknown"}']) {
+      expect((await post(body)).status).toBe(400);
+    }
+    expect(startDeviceAuth).toHaveBeenCalledTimes(1);
+  });
+
+  it('cancels only the requested device session through the route', async () => {
+    const cancelDeviceAuth = vi.fn(async () => ({ cancelled: true }));
+    const app = buildApp({ cancelDeviceAuth });
+    const response = await app.request('/api/feishu/auth/device/cancel', { method: 'POST', body: '{"deviceCode":"dc-123"}' });
+    expect(await response.json()).toEqual({ cancelled: true });
+    expect(cancelDeviceAuth).toHaveBeenCalledWith('dc-123');
+    expect((await app.request('/api/feishu/auth/device/cancel', { method: 'POST', body: '{}' })).status).toBe(400);
+  });
+
   it('GET /api/feishu/lark-cli/status returns the composed tool status', async () => {
     const app = buildApp({
       getToolStatus: vi.fn(async () => ({

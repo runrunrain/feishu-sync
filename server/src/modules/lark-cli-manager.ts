@@ -6,7 +6,8 @@
  * - installOrUpdateLarkCli()  execFile(npm install -g @larksuite/cli@latest)，幂等
  * - startDeviceAuth()      `auth login --no-wait --json --scope <scopes>` 立即返回
  *                          { device_code, expires_in, 600, verification_url }（hint 忽略）
- * - completeDeviceAuth()   `auth login --device-code <code>` 阻塞直到浏览器授权/过期
+ * - completeDeviceAuth()   `auth login --device-code <code> --json` 等待授权并核对账号
+ * - cancelDeviceAuth()     停止后台授权进程后释放会话
  *
  * 关键实现约束（勿改）：
  * - device flow 两条命令都【不走 LarkCliClient 的串行调用队列】。该队列
@@ -123,6 +124,22 @@ export interface DeviceAuthSession {
    * 全新授权案例 + 同事 9 月案例交叉证实）：飞书授权页存在权限勾选列表，
    * 未勾选/未列出的 scope 会被服务端静默丢弃且流程仍报「授权成功」。 */
   requestedScopes: string[];
+  mode: DeviceAuthMode;
+  previousAccount?: LarkCliAuthReadiness['account'];
+}
+
+export type DeviceAuthMode = 'reauthorize' | 'switch_account';
+
+interface PendingDeviceAuth {
+  deviceCode: string;
+  mode: DeviceAuthMode;
+  previousAccount?: LarkCliAuthReadiness['account'];
+  controller: AbortController;
+  completing: boolean;
+  operation?: Promise<unknown>;
+  child?: ChildProcess;
+  expiryTimer?: ReturnType<typeof setTimeout>;
+  cancelling?: Promise<void>;
 }
 
 export interface DeviceAuthCompleteResult {
@@ -135,6 +152,8 @@ export interface DeviceAuthCompleteResult {
   missingScopes?: string[];
   identity?: string;
   error?: string;
+  account?: LarkCliAuthReadiness['account'];
+  verified?: boolean;
 }
 
 export interface ConfigInitStartResult {
@@ -159,7 +178,7 @@ export interface ExecDiscoveryOptions {
 
 /** LarkCliClient 的最小依赖面（结构化类型，便于测试注入假实现）。 */
 interface LarkCliClientLike {
-  checkAuthReady(): Promise<LarkCliAuthReadiness>;
+  checkAuthReady(options?: { verify?: boolean }): Promise<LarkCliAuthReadiness>;
 }
 
 /** ConfigManager 的最小依赖面。 */
@@ -287,7 +306,7 @@ export function extractUpstreamAuthErrorMessage(parsed: Record<string, unknown>)
 
 export class LarkCliManager {
   /** 单例进行中标记：未完成的 device flow 存在时拒绝再次 start。 */
-  private pendingDeviceAuth: { deviceCode: string; startedAt: number } | null = null;
+  private pendingDeviceAuth: PendingDeviceAuth | null = null;
 
   /**
    * 进行中的 `config init --new` 子进程（应用内初始化配置引导）。URL
@@ -517,154 +536,176 @@ export class LarkCliManager {
     }
   }
 
-  /**
-   * 发起 device flow。立即返回 { verificationUrl, deviceCode, expiresIn }；
-   * 已有进行中流程时抛 409 语义错误。
-   *
-   * 2026-09-04 并集重授权策略（用户实测案例：`auth login --domain all`
-   * 被服务端静默丢弃部分 scope 且仍报成功；另一面，只带最小必需集重授权
-   * 会把 token 降级到仅 9 项，破坏用户在其他工作流里的 lark-cli 权限）。
-   * 因此请求集 = 已授权 scope ∪ 必需 scope（剔除已退役名）：既补齐缺失，
-   * 又不丢既有权限。若上游因请求集里混入个别失效名而整单拒绝
-   * （「The provided scope list contains invalid or malformed scopes」），
-   * 自动降级用纯必需集重试一次——保底能发起授权。
-   */
-  async startDeviceAuth(): Promise<DeviceAuthSession> {
+  /** 同账号补授权保留并集；换号仅请求同步必需权限。流程不进入同步队列。 */
+  async startDeviceAuth(mode: DeviceAuthMode = 'reauthorize'): Promise<DeviceAuthSession> {
+    if (mode !== 'reauthorize' && mode !== 'switch_account') {
+      throw new LarkCliManagerError('未知认证模式', 'invalid_auth_mode', 400);
+    }
     if (this.pendingDeviceAuth) {
-      throw new LarkCliManagerError(
-        '已有进行中的设备授权流程，请先完成或等待其结束',
-        'device_auth_in_progress',
-        409,
-      );
+      throw new LarkCliManagerError('已有进行中的设备授权流程，请先完成或取消', 'device_auth_in_progress', 409);
     }
-
-    const required = await this.resolveRequiredScopes();
-    const granted = await this.readGrantedScopesSafe();
-    const retired = new Set(RETIRED_REQUEST_SCOPES);
-    const union = granted.length > 0
-      ? [...new Set([...granted, ...required])].filter((s) => !retired.has(s))
-      : required;
-    const augmented = union.length !== required.length || union.some((s, i) => required[i] !== s);
-
-    const larkCliPath = this.resolveLarkCliPath();
-    const platform = this.discovery.platform ?? process.platform;
-    const attempt = async (scopes: string[]): Promise<{ stdout: string; stderr: string }> => {
-      return await execFileAsync(
-        quoteWindowsExecutablePath(larkCliPath, platform),
-        // Windows 的 .cmd shim 需要 shell:true；Node 会裸 join args，
-        // 必须保护整个 scope 参数，否则 CLI 只收到第一项，后续补授权无效。
-        // 与同步命令共用编码规则；macOS/Linux 无 shell，不额外添加引号。
-        quoteWindowsShellArguments(
-          ['auth', 'login', '--no-wait', '--json', '--scope', scopes.join(' ')],
-          platform,
-        ),
-        {
-          timeout: DEVICE_AUTH_START_TIMEOUT_MS,
-          encoding: 'utf-8',
-          windowsHide: true,
-          shell: platform === 'win32',
-          env: buildLarkCliEnvironment(larkCliPath),
-        },
-      );
+    // await 前占位，防止双击产生两份同时改写 CLI 登录态的授权。
+    const pending: PendingDeviceAuth = {
+      deviceCode: '', mode, controller: new AbortController(), completing: false,
     };
-
-    let requestedScopes = union;
-    let out = await attempt(union);
-    if (augmented && INVALID_SCOPE_RE.test(`${out.stdout}\n${out.stderr}`)) {
-      console.warn(
-        '[LarkCliManager] 并集 scope 请求被上游整单拒绝，降级为最小必需集重试',
-      );
-      out = await attempt(required);
-      requestedScopes = required;
-    }
-    const raw = `${out.stdout}\n${out.stderr}`;
-
-    let parsed: Record<string, unknown>;
+    this.pendingDeviceAuth = pending;
     try {
-      parsed = parseLenientDeviceAuthJson(raw);
+      const required = await this.resolveRequiredScopes();
+      // 本地快照用于记录旧账号，不能把它当作通过联网验证的就绪状态。
+      const before = await this.larkCliClient.checkAuthReady({ verify: false });
+      pending.previousAccount = before.account;
+      const granted = mode === 'reauthorize' ? before.currentScopes ?? [] : [];
+      const retired = new Set(RETIRED_REQUEST_SCOPES);
+      const union = [...new Set([...granted, ...required])].filter((s) => s.trim() && !retired.has(s));
+      const attempt = async (scopes: string[]) => {
+        const args = ['auth', 'login', '--no-wait', '--json', '--scope', scopes.join(' ')];
+        try {
+          return await this.runDeviceAuthCommand(pending, args, DEVICE_AUTH_START_TIMEOUT_MS);
+        } catch (error) {
+          // 新 CLI 用非零退出码报告无效 scope；旧版用 exit 0 + JSON。
+          if (!pending.controller.signal.aborted && INVALID_SCOPE_RE.test(execErrorOutput(error))) {
+            const output = error as { stdout?: string; stderr?: string };
+            return { stdout: output.stdout || '', stderr: output.stderr || '' };
+          }
+          throw error;
+        }
+      };
+      let requestedScopes = union;
+      let out = await attempt(union);
+      if (union.some((s) => !required.includes(s)) && INVALID_SCOPE_RE.test(`${out.stdout}\n${out.stderr}`)) {
+        out = await attempt(required);
+        requestedScopes = required;
+      }
+      const parsed = parseLenientDeviceAuthJson(`${out.stdout}\n${out.stderr}`);
+      const deviceCode = typeof parsed.device_code === 'string' ? parsed.device_code : '';
+      const verificationUrl = typeof parsed.verification_url === 'string' ? parsed.verification_url : '';
+      const expiresIn = typeof parsed.expires_in === 'number' && parsed.expires_in > 0 ? parsed.expires_in : 600;
+      if (!deviceCode || !verificationUrl || parsed.ok === false) {
+        const upstream = extractUpstreamAuthErrorMessage(parsed);
+        throw new LarkCliManagerError(upstream ? `发起设备授权失败：${upstream}` : '设备授权响应缺少 device_code 或 verification_url', 'device_auth_start_failed', 502);
+      }
+      if (pending.controller.signal.aborted) throw new Error('认证已取消');
+      pending.deviceCode = deviceCode;
+      pending.expiryTimer = setTimeout(() => {
+        void this.cancelDeviceAuth(deviceCode).catch(() => undefined);
+      }, Math.min(expiresIn * 1000, DEVICE_AUTH_COMPLETE_TIMEOUT_MS));
+      pending.expiryTimer.unref?.();
+      return { verificationUrl, deviceCode, expiresIn, requestedScopes, mode, previousAccount: before.account };
     } catch (error) {
-      // parse 失败不落 pending 标记，用户可直接重试。
+      this.releaseDeviceAuth(pending);
       throw error;
     }
-
-    const deviceCode = typeof parsed.device_code === 'string' ? parsed.device_code : '';
-    const verificationUrl = typeof parsed.verification_url === 'string' ? parsed.verification_url : '';
-    const expiresIn = typeof parsed.expires_in === 'number' && parsed.expires_in > 0
-      ? parsed.expires_in
-      : 600;
-    if (!deviceCode || !verificationUrl) {
-      // 2026-09-04：上游拒绝时 lark-cli 以 exit 0 + `{ok:false,error:{message}}`
-      // 返回，旧文案「缺少 device_code」会把真实原因吞掉——优先透传上游
-      // message，让用户看得到「为什么发起不了」。
-      const upstream = extractUpstreamAuthErrorMessage(parsed);
-      throw new LarkCliManagerError(
-        upstream ? `发起设备授权失败：${upstream}` : '设备授权响应缺少 device_code 或 verification_url',
-        upstream ? 'device_auth_start_failed' : 'parse_failed',
-        502,
-      );
-    }
-
-    this.pendingDeviceAuth = { deviceCode, startedAt: Date.now() };
-    return { verificationUrl, deviceCode, expiresIn, requestedScopes };
   }
 
-  /**
-   * 阻塞等待浏览器授权完成。直接 execFile 绕过 LarkCliClient 串行队列
-   * （否则 device-code 阻塞 10 分钟会卡死所有 lark-cli 功能）；完成后经
-   * checkAuthReady() 如实返回最终就绪状态——device flow 只授予请求的
-   * scope，仍有缺失时 missingScopes 原样带出。
-   */
-  async completeDeviceAuth(deviceCode: string): Promise<DeviceAuthCompleteResult> {
-    if (
-      typeof deviceCode !== 'string'
-      || deviceCode.trim().length === 0
-      || deviceCode.length >= MAX_DEVICE_CODE_LENGTH
-    ) {
-      throw new LarkCliManagerError(
-        `deviceCode 必须是非空且长度小于 ${MAX_DEVICE_CODE_LENGTH} 的字符串`,
-        'invalid_device_code',
-        400,
-      );
-    }
-
-    const larkCliPath = this.resolveLarkCliPath();
+  private runDeviceAuthCommand(pending: PendingDeviceAuth, args: string[], timeout: number) {
+    if (pending.controller.signal.aborted) throw new Error('认证已取消');
+    const executable = this.resolveLarkCliPath();
     const platform = this.discovery.platform ?? process.platform;
-    let flowOk = true;
-    let flowError: string | undefined;
-    try {
-      await execFileAsync(
-        quoteWindowsExecutablePath(larkCliPath, platform),
-        quoteWindowsShellArguments(['auth', 'login', '--device-code', deviceCode], platform),
-        {
-          timeout: DEVICE_AUTH_COMPLETE_TIMEOUT_MS,
-          encoding: 'utf-8',
-          windowsHide: true,
-          shell: platform === 'win32',
-          env: buildLarkCliEnvironment(larkCliPath),
-        },
-      );
-    } catch (error) {
-      // 过期/拒绝/超时都走这里：不吞错，原始分类信息进入 flowError。
-      flowOk = false;
-      flowError = tailLines(execErrorOutput(error), 3) || errorText(error);
-    } finally {
-      // 仅当本次完成的就是挂起中的那个 device flow 才清除标记；不匹配的
-      // 杂散/过期旧码 complete 尝试不得中断真实进行中的会话（多窗口误触场景）。
-      if (this.pendingDeviceAuth?.deviceCode === deviceCode) {
-        this.pendingDeviceAuth = null;
-      }
-    }
+    const operation = execFileAsync(quoteWindowsExecutablePath(executable, platform),
+      quoteWindowsShellArguments(args, platform), {
+        timeout, encoding: 'utf-8', windowsHide: true,
+        shell: platform === 'win32',
+        signal: pending.controller.signal,
+        env: buildLarkCliEnvironment(executable),
+      });
+    pending.operation = operation;
+    pending.child = (operation as typeof operation & { child?: ChildProcess }).child;
+    return operation;
+  }
 
-    const readiness = await this.larkCliClient.checkAuthReady();
-    return {
-      ok: flowOk,
-      ready: readiness.ready,
-      larkCliVersion: readiness.larkCliVersion,
-      currentScopes: readiness.currentScopes,
-      missingScopes: readiness.missingScopes ?? [],
-      identity: readiness.identity,
-      error: flowError ?? readiness.error,
-    };
+  private releaseDeviceAuth(pending: PendingDeviceAuth): void {
+    clearTimeout(pending.expiryTimer);
+    if (this.pendingDeviceAuth === pending && !pending.cancelling) this.pendingDeviceAuth = null;
+  }
+
+  /** 取消并收回整个 CLI 进程树，结束前不允许新流程覆盖登录态。 */
+  async cancelDeviceAuth(deviceCode: string): Promise<{ cancelled: boolean }> {
+    const pending = this.pendingDeviceAuth;
+    if (!pending || pending.deviceCode !== deviceCode) return { cancelled: false };
+    if (!pending.cancelling) {
+      pending.cancelling = (async () => {
+        clearTimeout(pending.expiryTimer);
+        const child = pending.child;
+        if (child?.pid && child.exitCode == null && child.signalCode == null) {
+          if ((this.discovery.platform ?? process.platform) === 'win32') {
+            try {
+              await execFileAsync('taskkill', ['/pid', String(child.pid), '/t', '/f'], { windowsHide: true, timeout: 10_000 });
+            } catch (error) {
+              // Poll 可能恰好自行退出；已经退出的进程无需再终止。
+              if (child.exitCode == null && child.signalCode == null) throw error;
+            }
+          } else {
+            const { stdout } = await execFileAsync('/bin/ps', ['-A', '-o', 'pid=', '-o', 'ppid='], { encoding: 'utf-8', timeout: 5_000 });
+            const rows = stdout.trim().split('\n').map((line) => line.trim().split(/\s+/).map(Number));
+            const descendants = (pid: number): number[] => rows.filter(([, parent]) => parent === pid)
+              .flatMap(([id]) => [...descendants(id), id]);
+            for (const pid of [...descendants(child.pid), child.pid]) {
+              try { process.kill(pid, 'SIGTERM'); } catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+              }
+            }
+          }
+        }
+        pending.controller.abort();
+        await pending.operation?.catch(() => undefined);
+      })();
+    }
+    try {
+      await pending.cancelling;
+      if (this.pendingDeviceAuth === pending) this.pendingDeviceAuth = null;
+      return { cancelled: true };
+    } catch (error) {
+      pending.cancelling = undefined;
+      throw new LarkCliManagerError(`未能停止授权进程，请稍后重试取消：${errorText(error)}`, 'device_auth_cancel_failed');
+    }
+  }
+
+  async completeDeviceAuth(deviceCode: string): Promise<DeviceAuthCompleteResult> {
+    if (typeof deviceCode !== 'string' || !deviceCode.trim() || deviceCode.length >= MAX_DEVICE_CODE_LENGTH) {
+      throw new LarkCliManagerError('deviceCode 必须是非空且长度小于 500 的字符串', 'invalid_device_code', 400);
+    }
+    const pending = this.pendingDeviceAuth;
+    if (!pending || pending.deviceCode !== deviceCode) {
+      throw new LarkCliManagerError('授权会话已失效，请重新发起认证', 'device_auth_session_mismatch', 400);
+    }
+    if (pending.completing || pending.cancelling) {
+      throw new LarkCliManagerError('正在处理此授权会话', 'device_auth_in_progress', 409);
+    }
+    pending.completing = true;
+    try {
+      // 必须确认本次流程成功及其账号，不能借用此前缓存的 ready。
+      const { stdout } = await this.runDeviceAuthCommand(pending,
+        ['auth', 'login', '--device-code', deviceCode, '--json'], DEVICE_AUTH_COMPLETE_TIMEOUT_MS);
+      const parsed = parseLenientDeviceAuthJson(stdout);
+      if (parsed.ok === false || parsed.event !== 'authorization_complete'
+        || typeof parsed.user_open_id !== 'string' || !parsed.user_open_id.trim()) {
+        return { ok: false, ready: false, error: extractUpstreamAuthErrorMessage(parsed) || '未收到本次授权成功及账号信息，请重新认证' };
+      }
+      const readiness = await this.larkCliClient.checkAuthReady({ verify: true });
+      if (pending.controller.signal.aborted || pending.cancelling) {
+        return { ok: false, ready: false, error: '认证已取消' };
+      }
+      if (readiness.account?.id !== parsed.user_open_id) {
+        return { ...readiness, ok: false, ready: false, error: '当前账号与本次授权账号不一致，请重新认证' };
+      }
+      if (pending.mode === 'switch_account' && pending.previousAccount?.id === readiness.account.id) {
+        return { ...readiness, ok: false, ready: false, error: '仍然授权了原账号。请在浏览器切换到新飞书账号，再点击「重试切换账号」。' };
+      }
+      return { ...readiness, ok: true, ready: readiness.ready && readiness.verified === true };
+    } catch (error) {
+      // 不附加包含 deviceCode 的完整 Command failed 命令行。
+      let message = '本次授权未完成，请重新认证；若账号或应用被停用，请联系管理员。';
+      const output = error as { stdout?: string; stderr?: string };
+      try {
+        const parsed = parseLenientDeviceAuthJson(output.stdout || output.stderr || '');
+        const missing = Array.isArray(parsed.missing) ? parsed.missing.filter((s) => typeof s === 'string') : [];
+        message = extractUpstreamAuthErrorMessage(parsed)
+          || (missing.length ? `本次授权仍缺少权限：${missing.join('、')}。请检查授权页勾选项和管理员批准状态。` : message);
+      } catch { /* 保持不含敏感设备码的兜底文案 */ }
+      return { ok: false, ready: false, error: pending.controller.signal.aborted ? '认证已取消' : message };
+    } finally {
+      this.releaseDeviceAuth(pending);
+    }
   }
 
   /** 当前是否挂着未完成的 device flow（状态排查用）。 */
@@ -907,20 +948,6 @@ export class LarkCliManager {
       return config.requiredScopes.filter((s) => !retired.has(s));
     }
     return DEFAULT_REQUIRED_SCOPES;
-  }
-
-  /**
-   * 读取当前已授权 scope（未认证/探测失败返回空数组）。发起 device flow
-   * 前用千拼并集请求集：既补齐缺失权限，又不丢用户既有授权（2026-09-04
-   * 用户实测：最小必需集重授权会把 token 降级，破坏其他 lark-cli 工作流）。
-   */
-  private async readGrantedScopesSafe(): Promise<string[]> {
-    try {
-      const readiness = await this.larkCliClient.checkAuthReady();
-      return (readiness.currentScopes ?? []).filter((s) => s.trim().length > 0);
-    } catch {
-      return [];
-    }
   }
 
   /** `lark-cli --version` 验证（直连，30s 超时；失败抛错由调用方分类）。 */

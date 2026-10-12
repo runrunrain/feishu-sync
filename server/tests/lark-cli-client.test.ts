@@ -29,6 +29,39 @@ function internals(client: LarkCliClient): ClientInternals {
 }
 
 describe('LarkCliClient output parsing and classification', () => {
+  it.each([
+    { status: 'verify_failed', available: false, verified: false },
+    { status: 'missing', available: false, verified: false },
+    { status: 'ready', available: true, verified: undefined },
+  ])('rejects stale grants when user diagnostics are $status / verified=$verified', async (diagnostics) => {
+    const client = new LarkCliClient({ requiredScopes: ['wiki:node:retrieve'] });
+    const calls: string[][] = [];
+    (client as any).execute = async (args: string[]) => {
+      calls.push(args);
+      return args[0] === '--version' ? { ok: true, data: { version: '1.0.97' } } : {
+        ok: true, data: { identity: 'user', verified: true, identities: {
+          user: { ...diagnostics, scope: 'wiki:node:retrieve', openId: 'ou-revoked', userName: '旧账号' },
+        } },
+      };
+    };
+    const result = await client.checkAuthReady();
+    expect(calls[1]).toEqual(['auth', 'status', '--json', '--verify']);
+    expect(result.ready).toBe(false);
+    expect(result.account).toEqual({ id: 'ou-revoked', name: '旧账号' });
+  });
+
+  it('accepts a refreshed and server-verified user, independent of bot verification', async () => {
+    const client = new LarkCliClient({ requiredScopes: ['wiki:node:retrieve'] });
+    (client as any).execute = async (args: string[]) => args[0] === '--version'
+      ? { ok: true, data: { version: '1.0.97' } }
+      : { ok: true, data: { identity: 'user', identities: {
+        bot: { verified: false },
+        user: { status: 'needs_refresh', available: true, verified: true, openId: 'ou-new', scope: 'wiki:node:retrieve' },
+      } } };
+    expect(await client.checkAuthReady()).toMatchObject({ ready: true, verified: true, account: { id: 'ou-new' } });
+    expect(await client.checkAuthReady({ verify: false })).toMatchObject({ ready: false, account: { id: 'ou-new' } });
+  });
+
   it('discovers the common local Node installation and preserves its bin directory for script shims', () => {
     const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-sync-lark-cli-'));
     try {
@@ -152,6 +185,7 @@ describe('LarkCliClient output parsing and classification', () => {
           identity: 'user',
           identities: {
             user: {
+              status: 'ready', available: true, verified: true, openId: 'ou-test',
               scope: 'wiki:node:retrieve docx:document:readonly offline_access',
             },
           },
@@ -178,7 +212,7 @@ describe('LarkCliClient output parsing and classification', () => {
         ok: true,
         data: {
           identity: 'user',
-          identities: { user: { scope: 'docx:document:readonly' } },
+          identities: { user: { status: 'ready', available: true, verified: true, openId: 'ou-test', scope: 'docx:document:readonly' } },
         },
       };
     };

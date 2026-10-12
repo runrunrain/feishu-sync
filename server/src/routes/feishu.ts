@@ -6,6 +6,7 @@
  * POST /api/feishu/lark-cli/install       - 一键安装/更新 lark-cli（npm -g，幂等）
  * POST /api/feishu/auth/device/start      - 发起 Device Flow（立即返回 verificationUrl 等）
  * POST /api/feishu/auth/device/complete     - 阻塞等待浏览器授权完成并返回最终就绪状态
+ * POST /api/feishu/auth/device/cancel       - 停止指定会话的授权进程并释放会话
  * POST /api/feishu/lark-cli/config-init/start    - 发起 lark-cli 初始化配置（立即返回验证 URL，进程后台等待）
  * POST /api/feishu/lark-cli/config-init/complete - 阻塞等待浏览器完成初始化配置
  *
@@ -112,11 +113,36 @@ feishuRoutes.post('/api/feishu/lark-cli/install', async (c) => {
  * device_auth_in_progress。
  */
 feishuRoutes.post('/api/feishu/auth/device/start', async (c) => {
+  let body: { mode?: unknown };
+  try {
+    const text = await c.req.text();
+    body = text ? JSON.parse(text) : {};
+    if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('invalid body');
+  } catch {
+    return c.json({ error: 'invalid_json' }, 400);
+  }
+  const mode = body.mode ?? 'reauthorize';
+  if (mode !== 'reauthorize' && mode !== 'switch_account') {
+    return c.json({ error: 'invalid_auth_mode' }, 400);
+  }
   try {
     const manager = requireLarkCliManager(c);
-    return c.json(await manager.startDeviceAuth());
+    return c.json(await manager.startDeviceAuth(mode));
   } catch (error) {
     return errorResponse(c, 'device_auth_start_failed', error);
+  }
+});
+
+feishuRoutes.post('/api/feishu/auth/device/cancel', async (c) => {
+  let body: any;
+  try { body = await c.req.json(); } catch { return c.json({ error: 'invalid_json' }, 400); }
+  if (typeof body?.deviceCode !== 'string' || !body.deviceCode.trim() || body.deviceCode.length >= MAX_DEVICE_CODE_LENGTH) {
+    return c.json({ error: 'invalid_body' }, 400);
+  }
+  try {
+    return c.json(await requireLarkCliManager(c).cancelDeviceAuth(body.deviceCode));
+  } catch (error) {
+    return errorResponse(c, 'device_auth_cancel_failed', error);
   }
 });
 

@@ -13,6 +13,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   cancelConfigInitRemote,
+  cancelDeviceAuthRemote,
   completeConfigInit,
   completeDeviceAuth,
   getLarkCliStatus,
@@ -20,6 +21,8 @@ import {
   startConfigInit,
   startDeviceAuth,
   type DeviceAuthStartResult,
+  type DeviceAuthMode,
+  type DeviceAuthCompleteResult,
   type LarkCliInstallResult,
   type LarkCliToolStatus,
 } from '../api/client';
@@ -29,6 +32,7 @@ export type DeviceAuthPhase =
   | 'starting'
   | 'waiting'
   | 'completing'
+  | 'cancelling'
   | 'success'
   | 'failed';
 
@@ -100,9 +104,11 @@ export interface UseLarkCliSetupResult {
   authPhase: DeviceAuthPhase;
   authSession: ActiveDeviceAuthSession | null;
   authError: string | null;
-  startAuth: () => Promise<void>;
-  /** 取消等待（abort 挂起的 complete 请求，回到 idle；服务端流程自然过期）。 */
-  cancelAuth: () => void;
+  authMode: DeviceAuthMode;
+  authAccount: DeviceAuthCompleteResult['account'] | null;
+  startAuth: (mode?: DeviceAuthMode) => Promise<void>;
+  /** 服务端停止授权进程后才允许重试。 */
+  cancelAuth: () => Promise<void>;
   /** failed → idle，供「重试」前的状态复位。 */
   resetAuth: () => void;
 }
@@ -126,10 +132,13 @@ export function useLarkCliSetup(
   const [authPhase, setAuthPhase] = useState<DeviceAuthPhase>('idle');
   const [authSession, setAuthSession] = useState<ActiveDeviceAuthSession | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [authMode, setAuthMode] = useState<DeviceAuthMode>('reauthorize');
+  const [authAccount, setAuthAccount] = useState<DeviceAuthCompleteResult['account'] | null>(null);
+  const authGenerationRef = useRef(0);
+  const authStartingRef = useRef(false);
+  const authSessionRef = useRef<ActiveDeviceAuthSession | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
-  /** 区分「用户主动取消」与「12 分钟兑底超时」：abort 前置位。 */
-  const userCancelledRef = useRef(false);
   const onStatusChangedRef = useRef(options.onStatusChanged);
   onStatusChangedRef.current = options.onStatusChanged;
 
@@ -241,119 +250,102 @@ export function useLarkCliSetup(
     setConfigInitError(null);
   }, []);
 
-  const waitForCompletion = useCallback(async (deviceCode: string) => {
+  const waitForCompletion = useCallback(async (session: ActiveDeviceAuthSession, generation: number) => {
     setAuthPhase('completing');
-    userCancelledRef.current = false;
     const controller = new AbortController();
     abortRef.current = controller;
     const timer = setTimeout(() => controller.abort(), COMPLETE_TIMEOUT_MS);
     try {
-      const result = await completeDeviceAuth(deviceCode, { signal: controller.signal });
-      if (result.ready) {
+      const result = await completeDeviceAuth(session.deviceCode, { signal: controller.signal });
+      if (authGenerationRef.current !== generation) return;
+      const accountConfirmed = result.account?.id
+        && (session.mode !== 'switch_account' || result.account.id !== session.previousAccount?.id);
+      if (result.ok && result.ready && result.verified && accountConfirmed) {
         setAuthPhase('success');
+        setAuthAccount(result.account ?? null);
         setAuthSession(null);
+        authSessionRef.current = null;
         setAuthError(null);
-        await refreshStatus();
-        onStatusChangedRef.current?.();
       } else {
         setAuthPhase('failed');
-        const missingScopes = result.missingScopes ?? [];
-        if (result.ok && missingScopes.length > 0) {
-          // 授权流程已完成（用户点了同意、token 已写入）且携带缺失清单——
-          // 仅此场景才是「授权页勾选列表未勾全被服务端静默丢弃」（2026-10
-          // 实测）。missingScopes 为空的 ready:false（未认证/identity 非 user/
-          // 认证检查异常等，见 checkAuthReady 的其它 4 个分支）必须回退
-          // result.error，否则「0 项权限未被授予」误导且吞掉真实原因
-          // （diting 审查 F1）。
-          setAuthError(
-            `授权已完成，但本次申请的 ${missingScopes.length} 项权限未被授予（${missingScopes.join('、')}）。`
-              + '最常见原因：授权页的权限勾选列表未全部勾选。请点击「重试认证」，'
-              + '在打开的授权页中确认所有权限项均已勾选后再点「同意授权」；'
-              + '若勾选后仍缺失，多为 lark-cli 应用凭据未发布该权限，可先「更新 lark-cli」再重试。',
-          );
-        } else {
-          setAuthError(
-            result.error
-              || `授权后仍缺少权限：${missingScopes.join('、') || '未知'}，可重试授权`,
-          );
-        }
+        setAuthError(result.error || '本次授权未通过账号和权限验证，请重试；若权限被管理员收回，请联系管理员。');
       }
+      await refreshStatus();
+      onStatusChangedRef.current?.();
     } catch (err) {
+      if (authGenerationRef.current !== generation) return;
       if (controller.signal.aborted) {
-        // 用户取消：回到 idle，不作为失败；兑底超时：给出可重试提示。
-        const userCancelled = userCancelledRef.current;
-        setAuthPhase(userCancelled ? 'idle' : 'failed');
-        setAuthError(userCancelled ? null : '等待浏览器授权超时，请重试');
-        setAuthSession(null);
-      } else {
-        setAuthPhase('failed');
-        setAuthError(errorMessage(err, '等待授权确认失败'));
+        try { await cancelDeviceAuthRemote(session.deviceCode); } catch { /* 保留会话供再次取消 */ }
       }
+      setAuthPhase('failed');
+      setAuthError(controller.signal.aborted ? '等待授权超时，请重试认证' : errorMessage(err, '等待授权确认失败'));
     } finally {
       clearTimeout(timer);
       if (abortRef.current === controller) abortRef.current = null;
     }
   }, [refreshStatus]);
 
-  const startAuth = useCallback(async () => {
+  const startAuth = useCallback(async (mode: DeviceAuthMode = 'reauthorize') => {
+    if (authStartingRef.current) return;
+    authStartingRef.current = true;
+    const generation = ++authGenerationRef.current;
+    abortRef.current?.abort();
     setAuthPhase('starting');
+    setAuthMode(mode);
+    setAuthAccount(null);
     setAuthError(null);
-    setAuthSession(null);
     try {
-      const session = await startDeviceAuth();
-      setAuthSession({ ...session, expiresAt: Date.now() + session.expiresIn * 1000 });
+      // 超时/请求断开后先结束旧服务端流程，不留下阻止换号的挂起会话。
+      if (authSessionRef.current) await cancelDeviceAuthRemote(authSessionRef.current.deviceCode);
+      const result = await startDeviceAuth(mode);
+      if (authGenerationRef.current !== generation) {
+        await cancelDeviceAuthRemote(result.deviceCode);
+        return;
+      }
+      const session = { ...result, expiresAt: Date.now() + result.expiresIn * 1000 };
+      authSessionRef.current = session;
+      setAuthSession(session);
       setAuthPhase('waiting');
-      // 自动打开浏览器让用户确认；卡片内同时展示可点击 URL 备用。
       openInBrowser(session.verificationUrl);
-      void waitForCompletion(session.deviceCode);
+      void waitForCompletion(session, generation);
     } catch (err) {
+      if (authGenerationRef.current !== generation) return;
       setAuthPhase('failed');
       setAuthError(errorMessage(err, '发起飞书认证失败'));
+    } finally {
+      authStartingRef.current = false;
     }
   }, [waitForCompletion]);
 
-  const cancelAuth = useCallback(() => {
-    userCancelledRef.current = true;
+  const cancelAuth = useCallback(async () => {
+    const session = authSessionRef.current;
+    if (!session) return;
+    ++authGenerationRef.current;
+    setAuthPhase('cancelling');
     abortRef.current?.abort();
-    abortRef.current = null;
-    setAuthSession(null);
-    setAuthError(null);
-    setAuthPhase('idle');
-  }, []);
+    try {
+      await cancelDeviceAuthRemote(session.deviceCode);
+      authSessionRef.current = null;
+      setAuthSession(null);
+      setAuthError(null);
+      setAuthPhase('idle');
+      await refreshStatus();
+      onStatusChangedRef.current?.();
+    } catch (err) {
+      setAuthPhase('failed');
+      setAuthError(errorMessage(err, '取消授权失败，请重试'));
+    }
+  }, [refreshStatus]);
 
   const resetAuth = useCallback(() => {
     setAuthPhase('idle');
     setAuthError(null);
   }, []);
 
-  // 需求「未认证则自动认证」：状态就绪且检测到「已安装 + 未认证」时自动发起
-  // device flow（安装完成后的刷新也会走到这里，形成安装→认证连续引导）。
-  // 每会话只自动发起一次，失败后转手动重试，避免循环拉起浏览器。
-  // 【闭环关键 gate】未配置（not_configured）时不得自动发起 auth login——
-  // auth login 在未配置态会被上游拒绝；此时由 configInit 自动引导接手，
-  // 配置成功→刷新→本 effect 再接续认证，形成 安装→配置→认证 全链路。
-  // 置于 startAuth 声明之后（deps 引用，避免 TDZ）。
+  // 让用户先选择重新授权或换号，失效状态下不再自动拉起旧账号授权。
   const configInitNeeded = toolStatus?.error?.includes(CONFIG_NEEDED_MARK) ?? false;
-  const autoStartedRef = useRef(false);
-  useEffect(() => {
-    if (
-      statusLoading
-      || autoStartedRef.current
-      || authPhase !== 'idle'
-      || configInitPhase !== 'idle'
-      || !toolStatus
-      || toolStatus.larkCliInstalled !== true
-      || toolStatus.authReady === true
-      || configInitNeeded
-    ) {
-      return;
-    }
-    autoStartedRef.current = true;
-    void startAuth();
-  }, [statusLoading, toolStatus, authPhase, configInitPhase, configInitNeeded, startAuth]);
-
   // 「已安装 + 未配置」时自动发起 config init（同样每会话一次）。安装
-  // 完成后的首次刷新即触发，与 auto-auth 串成连续引导链。
+  // 完成后由用户选择账号并发起认证。
   const autoConfigInitStartedRef = useRef(false);
   useEffect(() => {
     if (
@@ -389,6 +381,8 @@ export function useLarkCliSetup(
     authPhase,
     authSession,
     authError,
+    authMode,
+    authAccount,
     startAuth,
     cancelAuth,
     resetAuth,
