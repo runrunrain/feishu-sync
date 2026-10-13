@@ -61,6 +61,8 @@ export function AuthSettingsCard() {
     || (toolStatus != null && !toolStatus.npmAvailable);
   const authActive = ['starting', 'waiting', 'completing', 'cancelling'].includes(setup.authPhase);
   const configActive = ['starting', 'waiting', 'completing'].includes(setup.configInitPhase);
+  const hasAccount = authStatus?.account != null;
+  const authActionLabel = hasAccount || ready ? '重新认证' : '开始飞书认证';
 
   const StatusIcon = loading
     ? null
@@ -124,11 +126,11 @@ export function AuthSettingsCard() {
     if (msg.includes('not authenticated') || msg.includes('not logged in')) {
       return '尚未登录飞书。可点击上方按钮开始认证，或在终端执行：lark-cli auth login --scope';
     }
-    if (msg.includes('scope') || msg.includes('permission')) {
-      return `缺失必需权限：${authStatus.missingScopes?.join('、') || '未知'}。可重新发起认证补齐授权`;
+    if (/expired|过期/i.test(msg)) {
+      return '认证已过期。点击「重新认证」，在浏览器中确认当前飞书账号并同意授权后即可恢复。';
     }
-    if (msg.includes('expired') || msg.includes('token')) {
-      return '认证已过期。可点击上方按钮重新认证';
+    if (authStatus.missingScopes?.length) {
+      return `缺失必需权限：${authStatus.missingScopes.join('、')}。可点击「${authActionLabel}」补齐授权`;
     }
     return msg || '认证检查失败';
   })();
@@ -177,13 +179,14 @@ export function AuthSettingsCard() {
         )}
         {toolStatus?.larkCliInstalled && !setup.configInitNeeded && (
           <div className="flex flex-wrap items-center gap-2">
-            {ready && <Button variant="secondary" size="sm" disabled={authActive || configActive || setup.installing} onClick={handleStartAuth}>
-              重新授权
-            </Button>}
+            <Button variant={ready ? 'secondary' : 'primary'} size="sm" disabled={authActive || configActive || setup.installing} onClick={handleStartAuth}>
+              <KeyRound className="w-3.5 h-3.5" />
+              {authActionLabel}
+            </Button>
             <Button variant="secondary" size="sm" disabled={authActive || configActive || setup.installing} onClick={() => void setup.startAuth('switch_account')}>
               切换飞书账号
             </Button>
-            <span className="text-xs text-ink-soft">旧账号被停用或撤权时，可使用获准访问的新账号重新授权。</span>
+            <p className="w-full text-xs text-ink-soft">认证过期时重新认证当前账号；旧账号被停用或撤权时，可切换为获准访问的新账号。</p>
           </div>
         )}
 
@@ -228,6 +231,13 @@ export function AuthSettingsCard() {
             </div>
             {setup.authSession && (
               <>
+            {setup.authMode === 'reauthorize' && setup.authSession.previousAccount && (
+              <p className="text-sm text-ink leading-relaxed">
+                请在浏览器授权页确认当前飞书账号
+                {`（${setup.authSession.previousAccount.name || setup.authSession.previousAccount.id}）`}并同意授权。
+                完成后将自动联网验证账号和同步权限。
+              </p>
+            )}
             {setup.authMode === 'switch_account' && (
               <p className="text-sm text-ink leading-relaxed">
                 请在浏览器授权页选择新飞书账号
@@ -295,7 +305,7 @@ export function AuthSettingsCard() {
         {!authActive && setup.authPhase === 'success' && (
           <div className="p-3 rounded-md border border-jade/30 bg-jade/5">
             <p className="text-sm text-jade">
-              {setup.authMode === 'switch_account' ? '账号切换成功' : '认证成功'}，
+              {setup.authMode === 'switch_account' ? '账号切换成功' : hasAccount ? '重新认证成功' : '认证成功'}，
               已联网验证 {setup.authAccount?.name || setup.authAccount?.id || '当前账号'}。
             </p>
             {setup.authMode === 'switch_account' && <p className="text-xs text-ink-soft mt-1">同步知识库还需要为新账号单独授予文档访问权限。</p>}
@@ -426,13 +436,11 @@ export function AuthSettingsCard() {
           <div className="p-3 rounded-md border border-line bg-paper-2/60 space-y-3">
             <p className="text-sm text-ink leading-relaxed">
               {toolStatus.missingScopes && toolStatus.missingScopes.length > 0
-                ? `已安装 lark-cli 但缺少必需权限：${toolStatus.missingScopes.join('、')}。点击开始认证并在浏览器确认即可补齐。`
-                : '已安装 lark-cli，尚未完成飞书认证。点击开始认证，在浏览器中确认授权后自动完成。'}
+                ? `已安装 lark-cli 但缺少必需权限：${toolStatus.missingScopes.join('、')}。点击上方「${authActionLabel}」并在浏览器确认即可补齐。`
+                : hasAccount
+                  ? '当前账号认证未就绪。点击上方「重新认证」，在浏览器确认当前账号并同意授权；完成后将自动验证。'
+                  : '已安装 lark-cli，尚未完成飞书认证。点击上方「开始飞书认证」，在浏览器确认授权后自动完成。'}
             </p>
-            <Button variant="primary" size="sm" onClick={handleStartAuth}>
-              <KeyRound className="w-3.5 h-3.5" />
-              开始飞书认证
-            </Button>
           </div>
         )}
 

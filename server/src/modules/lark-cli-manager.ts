@@ -304,6 +304,32 @@ export function extractUpstreamAuthErrorMessage(parsed: Record<string, unknown>)
   return '';
 }
 
+/** CLI 的 JSON 通常在 stdout，非零退出时也可能在 stderr；两者分开解析，
+ * 避免诊断日志或重复错误对象破坏原本有效的 JSON。 */
+function parseDeviceAuthOutput(output: { stdout?: string; stderr?: string }): Record<string, unknown> {
+  for (const raw of [output.stdout, output.stderr]) {
+    if (!raw?.trim()) continue;
+    try { return parseLenientDeviceAuthJson(raw); } catch { /* 继续尝试另一个输出流 */ }
+  }
+  throw new LarkCliManagerError('lark-cli 未返回有效的设备授权结果，请重新认证', 'device_auth_start_failed', 502);
+}
+
+/** 不把包含完整命令行/设备码的 execFile Error 直接交给路由和用户。 */
+function deviceAuthStartError(error: unknown): LarkCliManagerError {
+  if (error instanceof LarkCliManagerError) return error;
+  const output = error as { stdout?: string; stderr?: string; code?: string; killed?: boolean } | null;
+  try {
+    const upstream = extractUpstreamAuthErrorMessage(parseDeviceAuthOutput(output ?? {}));
+    if (upstream) return new LarkCliManagerError(`发起设备授权失败：${upstream}`, 'device_auth_start_failed', 502);
+  } catch { /* 使用可操作且不含原始命令行的文案 */ }
+  const message = output?.code === 'ENOENT'
+    ? '未找到 lark-cli，请重新检测安装状态或更新 lark-cli 后重试认证'
+    : output?.killed || output?.code === 'ETIMEDOUT'
+      ? '发起飞书认证超时，请检查网络后重试认证'
+      : '无法发起飞书认证，请检查网络及 lark-cli 应用配置后重试；若应用被停用，请联系管理员。';
+  return new LarkCliManagerError(message, 'device_auth_start_failed', 502);
+}
+
 export class LarkCliManager {
   /** 单例进行中标记：未完成的 device flow 存在时拒绝再次 start。 */
   private pendingDeviceAuth: PendingDeviceAuth | null = null;
@@ -576,7 +602,7 @@ export class LarkCliManager {
         out = await attempt(required);
         requestedScopes = required;
       }
-      const parsed = parseLenientDeviceAuthJson(`${out.stdout}\n${out.stderr}`);
+      const parsed = parseDeviceAuthOutput(out);
       const deviceCode = typeof parsed.device_code === 'string' ? parsed.device_code : '';
       const verificationUrl = typeof parsed.verification_url === 'string' ? parsed.verification_url : '';
       const expiresIn = typeof parsed.expires_in === 'number' && parsed.expires_in > 0 ? parsed.expires_in : 600;
@@ -593,7 +619,7 @@ export class LarkCliManager {
       return { verificationUrl, deviceCode, expiresIn, requestedScopes, mode, previousAccount: before.account };
     } catch (error) {
       this.releaseDeviceAuth(pending);
-      throw error;
+      throw deviceAuthStartError(error);
     }
   }
 

@@ -392,6 +392,63 @@ describe('installOrUpdateLarkCli', () => {
 // ---------------------------------------------------------------------------
 
 describe('device auth flow', () => {
+  it('reauthenticates an expired account and confirms the same account online', async () => {
+    const { manager, client } = createManager({ authReadiness: {
+      ready: false, verified: false, account: { id: 'ou-new', name: '当前账号' },
+      currentScopes: ['im:chat:read'], error: 'User token expired',
+    } });
+    setExecHandler((_file, args) => ({ stdout: args.includes('--no-wait') ? DEVICE_AUTH_JSON : AUTH_COMPLETE_JSON }));
+    const session = await manager.startDeviceAuth('reauthorize');
+    expect(session).toMatchObject({ mode: 'reauthorize', previousAccount: { id: 'ou-new' },
+      requestedScopes: ['im:chat:read', 'wiki:node:retrieve', 'offline_access'] });
+    expect(client.checkAuthReady).toHaveBeenLastCalledWith({ verify: false });
+    client.checkAuthReady.mockResolvedValue({ ready: true, verified: true, account: { id: 'ou-new', name: '当前账号' } });
+    expect(await manager.completeDeviceAuth(session.deviceCode)).toMatchObject({
+      ok: true, ready: true, verified: true, account: { id: 'ou-new' },
+    });
+    expect(client.checkAuthReady).toHaveBeenLastCalledWith({ verify: true });
+    expect(manager.hasPendingDeviceAuth()).toBe(false);
+  });
+
+  it.each(['stdout', 'stderr'] as const)('surfaces nonzero CLI errors from %s and allows retry', async (stream) => {
+    const { manager } = createManager();
+    const error = Object.assign(new Error('Command failed: lark-cli auth login secret-device-code'), {
+      [stream]: JSON.stringify({ ok: false, error: { message: '应用授权已被撤销，请联系管理员' } }),
+    });
+    setExecHandler(() => ({ error }));
+    await expect(manager.startDeviceAuth()).rejects.toMatchObject({
+      code: 'device_auth_start_failed', status: 502,
+      message: '发起设备授权失败：应用授权已被撤销，请联系管理员',
+    });
+    expect(manager.hasPendingDeviceAuth()).toBe(false);
+    setExecHandler(() => ({ stdout: DEVICE_AUTH_JSON }));
+    await expect(manager.startDeviceAuth()).resolves.toMatchObject({ deviceCode: 'dc-123' });
+    await manager.cancelDeviceAuth('dc-123');
+  });
+
+  it('keeps stdout authorization JSON intact when stderr contains a diagnostic JSON object', async () => {
+    const { manager } = createManager();
+    setExecHandler(() => ({ stdout: DEVICE_AUTH_JSON, stderr: '{"warning":"update available"}' }));
+    await expect(manager.startDeviceAuth()).resolves.toMatchObject({ deviceCode: 'dc-123' });
+    await manager.cancelDeviceAuth('dc-123');
+  });
+
+  it.each([
+    { error: Object.assign(new Error('raw command secret-device-code'), { killed: true }), text: '超时' },
+    { error: Object.assign(new Error('raw command secret-device-code'), { code: 'ENOENT' }), text: '未找到 lark-cli' },
+    { error: new Error('raw command secret-device-code'), text: '检查网络' },
+  ])('returns actionable start failures without leaking the command: $text', async ({ error, text }) => {
+    const { manager } = createManager();
+    setExecHandler(() => ({ error }));
+    await expect(manager.startDeviceAuth()).rejects.toMatchObject({
+      code: 'device_auth_start_failed', message: expect.stringContaining(text),
+    });
+    try { await manager.startDeviceAuth(); } catch (failure) {
+      expect((failure as Error).message).not.toContain('secret-device-code');
+    }
+    expect(manager.hasPendingDeviceAuth()).toBe(false);
+  });
+
   it('switches from a revoked account using only required scopes and verifies the new identity', async () => {
     const { manager, client } = createManager({ authReadiness: {
       ready: false, verified: false, account: { id: 'ou-old', name: '旧账号' },
@@ -814,6 +871,19 @@ function buildApp(manager: unknown) {
 }
 
 describe('feishu lark-cli routes', () => {
+  it('defaults to reauthentication and preserves the detailed failure message', async () => {
+    const startDeviceAuth = vi.fn(async () => {
+      throw new LarkCliManagerError('发起飞书认证超时，请检查网络后重试认证', 'device_auth_start_failed', 502);
+    });
+    const app = buildApp({ startDeviceAuth });
+    const response = await app.request('/api/feishu/auth/device/start', { method: 'POST', body: '{}' });
+    expect(startDeviceAuth).toHaveBeenCalledWith('reauthorize');
+    expect(response.status).toBe(502);
+    expect(await response.json()).toEqual({
+      error: 'device_auth_start_failed', message: '发起飞书认证超时，请检查网络后重试认证',
+    });
+  });
+
   it('passes switch mode to the manager and rejects malformed auth requests', async () => {
     const startDeviceAuth = vi.fn(async () => ({ mode: 'switch_account' }));
     const app = buildApp({ startDeviceAuth });

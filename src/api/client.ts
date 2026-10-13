@@ -121,13 +121,18 @@ async function request<T>(
 
     if (!response.ok) {
       let errorMessage = `HTTP ${response.status}: ${response.statusText}`;
+      let errorData: unknown;
       try {
-        const errorData = await response.json();
-        errorMessage = errorData.error || errorMessage;
+        errorData = await response.json();
+        const data = errorData as { message?: unknown; error?: unknown } | null;
+        // 结构化错误码供程序判断；message 才是用户需要的失败原因。
+        const message = typeof data?.message === 'string' ? data.message.trim() : '';
+        const code = typeof data?.error === 'string' ? data.error.trim() : '';
+        errorMessage = message || code || errorMessage;
       } catch {
         // Ignore JSON parse errors
       }
-      throw new APIError(errorMessage, response.status);
+      throw new APIError(errorMessage, response.status, errorData);
     }
 
     return await response.json();
