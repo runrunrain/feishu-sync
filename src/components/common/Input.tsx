@@ -19,7 +19,7 @@ interface TextualInputProps extends BaseInputProps, Omit<React.InputHTMLAttribut
 }
 
 export const Input = forwardRef<HTMLInputElement, TextualInputProps>(
-  ({ label, error, helperText, leftIcon, rightIcon, fullWidth = true, className = '', ...props }, ref) => {
+  ({ label, error, helperText, leftIcon, rightIcon, fullWidth = true, className: _className = '', ...props }, ref) => {
     const id = props.id || `input-${Math.random().toString(36).substr(2, 9)}`;
 
     const inputWrapperClasses = `
@@ -69,7 +69,7 @@ interface SelectProps extends BaseInputProps {
 }
 
 export const Select = forwardRef<HTMLSelectElement, SelectProps & Omit<React.SelectHTMLAttributes<HTMLSelectElement>, 'size'>>(
-  ({ label, error, helperText, fullWidth = true, options, className = '', ...props }, ref) => {
+  ({ label, error, helperText, fullWidth = true, options, className: _className = '', ...props }, ref) => {
     const id = props.id || `select-${Math.random().toString(36).substr(2, 9)}`;
 
     const selectWrapperClasses = `

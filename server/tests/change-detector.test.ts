@@ -32,9 +32,8 @@ import type {
 
 // ----- In-memory mock LocalMapStore -------------------------------------
 
-interface MockRow extends DocumentRecord {
-  // No extra fields; DocumentRecord already covers cloudDeleted / etc.
-}
+// 仅约束类型形状（DocumentRecord 已覆盖 cloudDeleted 等字段）。
+type MockRow = DocumentRecord
 
 class MockLocalMapStore {
   rows = new Map<string, MockRow>();

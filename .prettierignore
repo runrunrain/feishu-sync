@@ -1,0 +1,21 @@
+# 格式化渐进采纳（工程治理 G1）：不做全仓一次性 format，避免大规模无语义 diff。
+# 以下为既有产物/文档/依赖，不参与格式化；新代码建议 `npx prettier --write <file>`。
+node_modules
+dist*
+build
+release*
+server/dist
+amagi-task
+.amagi-worktrees
+projects-memory
+package-lock.json
+server/package-lock.json
+
+# 历史文档与报告保持原貌（含表格排版与飞书导出格式）
+CHANGELOG.md
+docs
+README.md
+CLAUDE.md
+CONTRIBUTING.md
+server/tests/fixtures
+server/scripts

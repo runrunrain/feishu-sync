@@ -8,7 +8,7 @@
 
 **跨平台桌面应用**：自动检测飞书知识库子树变更并选择性同步到本地，保持本地重构后的 Markdown 内容结构（表格布局、层级格式），支持 LLM 驱动的内容适配。
 
-**状态**：v0.3.28，正式同步 + 自定义归档交付版。正式回填默认只生成计划；只有显式 apply 才会写入知识库，路径冲突、移动、删除和未知类型均不会自动执行。变更记录见 [CHANGELOG.md](./CHANGELOG.md)。
+**状态**：v0.3.47，正式同步 + 自定义归档交付版。正式回填默认不提交知识库正文（仍会写配置/状态库/报告）；只有显式 apply 才会提交正文，路径冲突、移动、删除和未知类型均不会自动执行。变更记录见 [CHANGELOG.md](./CHANGELOG.md)。
 
 ---
 
@@ -49,10 +49,10 @@
 
 ## 技术栈
 
-- **桌面**：Electron 31 + electron-builder 24 + electron-updater 6
+- **桌面**：Electron 31 + electron-builder 26 + electron-updater 6
 - **前端**：React 18 + Vite 6 + Tailwind CSS 4
 - **后端**：Hono 4 + @hono/node-server（内嵌同进程）
-- **数据**：better-sqlite3 9（SQLite，documents/sync_log/run_log 主表 + localDirs/custom_folders 等辅助表，启动时 additive 迁移原地升级）
+- **数据**：better-sqlite3 12（SQLite，documents/sync_log/run_log 主表 + localDirs/custom_folders 等辅助表，启动时 additive 迁移原地升级）
 - **LLM**：OpenAI SDK → 智谱 bigmodel GLM（OpenAI 兼容端点，默认 `glm-4-flash`）
 - **飞书**：lark-cli（实测 1.0.89；认证、变更检测、内容读取、媒体下载统一入口；工具不保存飞书 token）
 - **开发**：TypeScript 5 + esbuild 0.28
@@ -80,7 +80,7 @@
 
 ### 环境要求
 
-- Node.js 18+（实测 v24.16.0）
+- Node.js 22.19+（22.x）或 24.x LTS（实测 v24，CI 用 22 LTS）；开发工具链与 Electron 内置 Node 版本分别管理
 - lark-cli 1.0.89+（全局安装：`npm install -g lark-cli`）
 - Windows 11 / macOS（打包目标含 macOS x64/arm64，跨平台打包需目标平台环境）
 
@@ -166,7 +166,7 @@ lark-cli auth status --verify --json
     npx tsx scripts/sync-latest.ts --skip-index
     npx tsx scripts/sync-latest.ts --skip-index --apply
 
-第一条命令只生成 operation manifest 和汇总报告。第二条命令仅执行 create / replace；move、delete、路径冲突、父链不完整、未知对象类型与无权限对象会保留为带 reasonCode 的 blocker，绝不自动覆盖本地文件。
+第一条命令不提交知识库正文，但会写 operation manifest/报告，创建缺失配置、初始化/迁移 SQLite，并在检测时推进 observed 状态；dry-run 不等于所有磁盘状态只读。使用真实状态目录前仍须备份。第二条命令仅执行 create / replace；move、delete、路径冲突、父链不完整、未知对象类型与无权限对象会保留为带 reasonCode 的 blocker，绝不自动覆盖本地文件。
 
 提交前会先把正文、图片、附件、白板缩略图和 sheet CSV 写入 staging。任一资源缺失、媒体下载失败或提交异常时，不推进 SQLite 的 synced 基线。正式运维还应保留 operation manifest 与备份；恢复时同时还原知识库、SQLite 和配置。
 
@@ -313,26 +313,27 @@ export APPLE_API_ISSUER="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 
 ## 项目结构
 
-```
+```text
 feishu-sync/
 ├── dist/                # 前端构建产物
 ├── dist-electron/       # Electron 编译产物（main.cjs/preload.cjs）
+├── docs/                # 开发文档（宗引/架构/测试/数据契约/运维）
 ├── server/
 │   ├── dist/            # Server 构建产物（index.js）
-│   └── src/             # Server 源码（Hono 路由/业务逻辑）
-├── electron/
-│   ├── main.ts          # Electron 主进程
-│   ├── preload.ts       # Context Bridge 暴露 API
-│   └── ...              # 托盘/更新/自启动服务
-├── src/                 # React 前端源码
-├── scripts/             # 构建脚本（build-desktop-target.cjs）
-└── build/               # 打包资源（图标/NSIS 配置）
+│   ├── scripts/         # 运维与阶段脚本（风险分级见 docs/operations.md）
+│   ├── src/             # Server 源码（Hono 路由/业务模块）
+│   └── tests/           # Server 测试（vitest）
+├── electron/            # Electron 主进程与服务（main/preload/tray/updater）
+├── src/                 # React 前端源码（含 vitest 测试）
+├── scripts/             # 构建辅助脚本（build-desktop-target 等）
+└── build/               # 打包资源（图标/NSIS/entitlements）
 ```
 
 ---
 
 ## 开发文档导航
 
+- [docs/](./docs/README.md) —— 开发文档宗引（架构 / 开发 / 测试 / 数据契约 / 运维）
 - [CHANGELOG.md](./CHANGELOG.md) —— 版本化变更记录（Release 说明同源）
 - [CLAUDE.md](./CLAUDE.md) —— 仓库工程约定（架构 gotcha、命令、安全红线、原生模块 ABI）
 - 各模块头部注释 —— 大量「P0-Qx 实测 / 实测 confirmed / 历史教训」标注记录设计动机
@@ -341,7 +342,7 @@ feishu-sync/
 
 ## 当前状态与已知限制
 
-**当前状态**：v0.3.28。核心链路均已落地：定时变更检测 → 分型同步（docx/sheet/slides）→ 表格重构与 LLM 风格对齐 → staged 原子提交；自定义归档（快捷添加 + 手工文件动态纳管）；主区双视图与 Markdown 预览（含 HTML 表格受控渲染/CSV 跳转）；托盘常驻与自动更新；字体平台分栈（macOS 宋/楷中国风，Windows 微软雅黑兑底）。
+**当前状态**：v0.3.47。核心链路均已落地：定时变更检测 → 分型同步（docx/sheet/slides）→ 表格重构与 LLM 风格对齐 → staged 原子提交；自定义归档（快捷添加 + 手工文件动态纳管）；主区双视图与 Markdown 预览（含 HTML 表格受控渲染/CSV 跳转）；托盘常驻与自动更新；字体平台分栈（macOS 宋/楷中国风，Windows 微软雅黑兑底）。
 
 **已知限制**：
 - macOS 打包需 macOS 环境（Windows 上无法生成 macOS DMG）
@@ -352,11 +353,17 @@ feishu-sync/
 
 ## 参与贡献
 
-欢迎 issue / PR。提交前请在 `server/` 下跑通测试与类型检查：
+欢迎 issue / PR。提交前在根目录跑通质量门禁（lint + typecheck + 双包测试）：
 
 ```bash
-cd server && npm test && npm run typecheck
+npm run check          # lint + typecheck + 前端/server 全部测试
+npm run lint           # 仅 eslint
+npm run typecheck      # 根 src + 根配置 + server 三段类型检查
+npm run test:all       # 前端 (vitest) + server (vitest) 测试
 ```
+
+push/PR 会触发 [CI workflow](.github/workflows/ci.yml) 执行同样的检查，请先本地跑通。
+详见 [CONTRIBUTING.md](./CONTRIBUTING.md)。
 
 发布流程：提交合入 `main` 后按 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 在 `CHANGELOG.md` 顶部归档条目，`npm version <patch|minor> --no-git-tag-version` 后打 `v*` 标签推送，[Release workflow](.github/workflows/release.yml) 自动构建三平台产物并发布（Release 说明从 CHANGELOG 同步提取）。
 

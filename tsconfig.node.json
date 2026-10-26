@@ -15,5 +15,5 @@
     "noFallthroughCasesInSwitch": true,
     "types": ["node"]
   },
-  "include": ["vite.config.ts", "electron-builder.config.js"]
+  "include": ["vite.config.ts", "vitest.config.ts"]
 }

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { isValidElement, type ReactElement } from 'react';
 import { parseBlocks, renderInline, resolveMediaPath } from './MarkdownView';
 import type { HtmlTableBlock } from '../../utils/html-table';
 
@@ -153,8 +154,10 @@ describe('MarkdownView parser and renderer', () => {
     it('keeps csv link href intact with paired parentheses', () => {
       const line = '[CSV 原始数据](300-三观系统.csv-data/③-1(Framwork)分析拆解（确定复杂度）.csv)';
       const nodes = renderInline(line, 't', ctx);
-      const link = nodes.find((n): n is { type: string; props: { href: string } } =>
-        typeof n === 'object' && n !== null && 'props' in (n as object) && 'href' in (n as { props: unknown }).props as object);
+      const link = nodes.find(
+        (n): n is ReactElement<{ href: string }> =>
+          isValidElement(n) && n.type === 'a' && typeof (n.props as { href?: unknown }).href === 'string',
+      );
       expect(link).toBeTruthy();
       expect(link!.props.href).toBe('300-三观系统.csv-data/③-1(Framwork)分析拆解（确定复杂度）.csv');
     });

@@ -1,0 +1,51 @@
+# 质量门禁工作流（工程治理 G1 引入）。
+#
+# 触发：main push / 所有 PR / 手动 dispatch。
+# 内容：lint → typecheck（根 src + 根配置 + server）→ 双包测试 →
+#       前端/server/electron-main 构建冒烟（不打包安装包，打包链走 release.yml）。
+# Node：22 LTS（开发 engines 为 ^22.19.0 || ^24.0.0；better-sqlite3 12.x 提供 linux prebuilt）。
+# 双包依赖：根（前端 + electron + 工具链）与 server/（业务 + vitest）。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            server/package-lock.json
+
+      - name: Install dependencies (root + server)
+        run: |
+          npm ci --no-audit --no-fund
+          npm ci --prefix server --no-audit --no-fund
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test (frontend + server)
+        run: npm run test:all
+
+      - name: Build smoke (vite + server tsc + electron esbuild)
+        run: |
+          npm run build:all
+          npm run electron:build

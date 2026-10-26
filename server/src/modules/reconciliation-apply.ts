@@ -176,7 +176,7 @@ export async function applyReconciliation(
   const db = openWritableDb(options.dbPath);
   const results: ReconciliationApplyResult['items'] = [];
   let applied = 0;
-  let skipped = 0;
+  const skipped = 0;
 
   try {
     const update = db.prepare(`

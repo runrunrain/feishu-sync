@@ -180,13 +180,17 @@ describe('html-table utilities', () => {
       const segments = extractHtmlTableBlocks(md);
       expect(segments.length).toBe(3);
       expect(segments[0].type).toBe('text');
-      expect(segments[0].content).toContain('# 标题一');
+      if (segments[0].type === 'text') {
+        expect(segments[0].content).toContain('# 标题一');
+      }
       expect(segments[1].type).toBe('table');
       if (segments[1].type === 'table') {
         expect(segments[1].block.headRows[0].cells[0].content).toBe('Header');
       }
       expect(segments[2].type).toBe('text');
-      expect(segments[2].content).toContain('后置段落');
+      if (segments[2].type === 'text') {
+        expect(segments[2].content).toContain('后置段落');
+      }
     });
   });
 });

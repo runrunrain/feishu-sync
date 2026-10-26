@@ -254,7 +254,7 @@ function stringValue(value: unknown, fallback = ''): string {
  */
 function canonicalizeGlmModelAlias(value: string | undefined | null): string {
   const model = stringValue(value);
-  const match = /^(glm-[^\s\[\]]+)\s*\[[^\]]+\]$/i.exec(model);
+  const match = /^(glm-[^\s[\]]+)\s*\[[^\]]+\]$/i.exec(model);
   return match ? match[1] : model;
 }
 
@@ -522,7 +522,7 @@ export function normalizeWatchedRootLocalDir(value: unknown): string | null {
  */
 export function sanitizeLocalDirName(title: unknown, fallback: string): string {
   const raw = typeof title === 'string' ? title : '';
-  // eslint-disable-next-line no-control-regex
+
   const cleaned = raw.replace(/[\u0000-\u001f\u007f\\/:*?"<>|]+/g, '-')
     .replace(/-{2,}/g, '-')
     .replace(/^[.\s-]+/, '')

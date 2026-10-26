@@ -276,7 +276,7 @@ export class LocalMapStore {
     }
 
     const ddlMatch = this.getCreateTablesDDL().match(
-      /CREATE TABLE IF NOT EXISTS documents \(([\s\S]*?)\n      \);/,
+      /CREATE TABLE IF NOT EXISTS documents \(([\s\S]*?)\n {6}\);/,
     );
     if (!ddlMatch) {
       console.error('[LocalMapStore] 无法从建表 DDL 提取 documents 定义，跳过 obj_type CHECK 重建');
@@ -395,7 +395,7 @@ export class LocalMapStore {
         let state: SyncState;
         let synced: number | null = null;
         let missingCount = 0;
-        let cloudDeleted = 0;
+        const cloudDeleted = 0;
 
         if (wasLegacyDelete) {
           state = 'missing_candidate';

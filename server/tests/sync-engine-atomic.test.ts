@@ -7,7 +7,6 @@ import { afterEach, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import Database from 'better-sqlite3';
 import { SyncEngine } from '../src/modules/sync-engine.js';
 import { LocalMapStore } from '../src/modules/local-map-store.js';
 import type { ChangedDocument } from '../src/types/index.js';
@@ -82,7 +81,7 @@ function makeDoc(overrides: Partial<ChangedDocument> = {}): ChangedDocument {
 
 describe('SyncEngine atomic apply path', () => {
   it('partial sheet export failure leaves prior body/CSV/synced baseline untouched', async () => {
-    const { kb, ops, store, config } = makeWorkspace();
+    const { kb, store, config } = makeWorkspace();
     const mdPath = path.join(kb, '策划 - Designer', '表格.md');
     const csvPath = path.join(kb, '策划 - Designer', '表格.csv-data', '旧表.csv');
     fs.mkdirSync(path.dirname(csvPath), { recursive: true });
@@ -235,7 +234,7 @@ describe('SyncEngine atomic apply path', () => {
   });
 
   it('DB-stage failure after file commit restores prior markdown bytes', async () => {
-    const { kb, ops, store, config } = makeWorkspace();
+    const { kb, store, config } = makeWorkspace();
     const mdPath = path.join(kb, '技术 - Dev', '原子文档', 'README.md');
     fs.mkdirSync(path.dirname(mdPath), { recursive: true });
     fs.writeFileSync(mdPath, '# prior body\n');
@@ -300,7 +299,7 @@ describe('SyncEngine atomic apply path', () => {
   });
 
   it('successful apply writes content then dry-run/re-detect shows no re-pending for that token', async () => {
-    const { kb, ops, store, config } = makeWorkspace();
+    const { kb, store, config } = makeWorkspace();
     const mdPath = path.join(kb, '技术 - Dev', '原子文档', 'README.md');
     fs.mkdirSync(path.dirname(mdPath), { recursive: true });
     fs.writeFileSync(mdPath, '# prior\n');
@@ -381,7 +380,7 @@ describe('SyncEngine atomic apply path', () => {
   });
 
   it('failBeforeCommit leaves zero new files under knowledge base', async () => {
-    const { kb, ops, store, config } = makeWorkspace();
+    const { kb, store, config } = makeWorkspace();
     const mdPath = path.join(kb, '技术 - Dev', '原子文档', 'README.md');
     fs.mkdirSync(path.dirname(mdPath), { recursive: true });
     fs.writeFileSync(mdPath, 'keep-me\n');

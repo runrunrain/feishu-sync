@@ -1130,7 +1130,7 @@ export class LarkCliClient {
   private parseJsonOutput(stdout: string): any {
     // Remove BOM (UTF-8) and ANSI escape codes
     const cleaned = stdout
-      .replace(/^﻿/, '') // BOM
+      .replace(/^\uFEFF/, '') // BOM
       .replace(/\x1b\[[0-9;]*m/g, '') // ANSI escape codes
       .trim();
 

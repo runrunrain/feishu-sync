@@ -26,7 +26,14 @@ npm run dev:desktop  # 编译 server/dist + dist-electron 后并行 vite + elect
 npm run build:all     # vite build + server tsc
 npm run electron:build   # esbuild main.ts/preload.ts → dist-electron/*.cjs
 
-# 测试（在 server/ 下，vitest）
+# 测试（根目录统一入口；server 测试在 server/ 下，vitest）
+npm run check             # lint + typecheck + 前端/server 全部测试（CI 同口径）
+npm test                  # 前端测试（根目录 vitest，src/**/*.test.*）
+npm run test:all          # 前端 + server 全部测试
+npm run typecheck         # 根 src + 根配置文件 + server 三段 tsc --noEmit
+npm run lint              # eslint（flat config，遗留问题已清零）
+
+# 单独跑 server 测试
 cd server
 npm test                       # 全量
 npm run test:watch
@@ -46,9 +53,10 @@ npm run desktop:dist:mac:x64     # Intel
 
 ```bash
 cd server
-npx tsx scripts/sync-latest.ts --skip-index            # 只生成 manifest + 报告（dry-run）
-npx tsx scripts/sync-latest.ts --skip-index --apply    # 真正写盘，仅 create/replace
-# --persist-config 唯一允许改写 config.json；默认只读现有配置
+npx tsx scripts/sync-latest.ts --skip-index            # 不提交KB正文；仍会写配置/SQLite/报告（dry-run）
+npx tsx scripts/sync-latest.ts --skip-index --apply    # 提交KB正文，仅 create/replace
+# 已有配置默认只读，改写需 --persist-config；缺失配置会首次创建。
+# 即使 --skip-index 且未 --apply，也会初始化/迁移SQLite与推进检测状态，使用真实状态目录前备份。
 ```
 
 ## Architecture
@@ -66,14 +74,14 @@ npx tsx scripts/sync-latest.ts --skip-index --apply    # 真正写盘，仅 crea
 
 ### Hono 依赖注入
 
-`server/src/index.ts` `buildServer()` 实例化所有模块后，用一个 `app.use('*')` 中间件把它们塞进 `c.env`（`configManager` / `larkCliClient` / `localMapStore` / `changeDetector`，以及 `desktopToken`）。**该中间件必须挂在 auth 之前**。路由文件（`routes/*.ts`）从 `c.env` 取依赖，不要 `new` 新实例。路由用 `app.route('/', xxxRoutes)` 挂载（前缀在路由文件内写死）。
+`server/src/index.ts` `buildServer()` 实例化所有模块后，用一个 `app.use('*')` 中间件把它们挂到 Hono context 本身（当前写法为 `(c as any).configManager` 等，并非 `c.env`）（`configManager` / `larkCliClient` / `localMapStore` / `changeDetector`，以及 `desktopToken`）。**该中间件必须挂在 auth 之前**。路由文件（`routes/*.ts`）从 context 上的同名属性取依赖，不要 `new` 新实例。路由用 `app.route('/', xxxRoutes)` 挂载（前缀在路由文件内写死）。
 
 ### 核心同步流水线
 
 变更检测与同步是两条独立链路，都围绕 `obj_edit_time`：
 
 - **检测** `ChangeDetector`（`server/src/modules/change-detector.ts`）：遍历 wiki 子树，对比本地 SQLite 的 `observed_obj_edit_time`。检测**只推进 observed 字段**。
-- **同步** `SyncEngine`（`sync-engine.ts`，1475 行，最核心）：`分型读取(docx/sheet/slides) → 媒体引用解析/下载 → 本地引用重写 → staged 原子提交 → 推进 synced 基线`。**只有原子提交成功才推进 `synced_obj_edit_time` 并置 `synced`**——这是不可破的契约，资源缺失/下载失败/提交异常一律不推进。
+- **同步** `SyncEngine`（`sync-engine.ts`，1800+ 行量级、仓库最大核心模块，改前先读模块头注释）：`分型读取(docx/sheet/slides) → 媒体引用解析/下载 → 本地引用重写 → staged 原子提交 → 推进 synced 基线`。**只有原子提交成功才推进 `synced_obj_edit_time` 并置 `synced`**——这是不可破的契约，资源缺失/下载失败/提交异常一律不推进。
 
 ### 自定义归档与双身份契约
 
@@ -86,7 +94,7 @@ npx tsx scripts/sync-latest.ts --skip-index --apply    # 真正写盘，仅 crea
 
 ### 安全写盘：dry-run 默认 + 原子提交
 
-- `SyncOptions.apply` 默认 false（dry-run）；写盘需要 `apply:true` + `confirmation:'APPLY'`。move/delete/路径冲突/父链不完整/未知类型/无权限 → 保留为带 `reasonCode` 的 **blocker**，绝不自动覆盖。
+- `SyncOptions.apply` 默认 false（dry-run）；提交知识库文件需要 `apply:true` + `confirmation:'APPLY'`。move/delete/路径冲突/父链不完整/未知类型/无权限 → 保留为带 `reasonCode` 的 **blocker**，绝不自动覆盖。
 - `atomic-commit.ts`：所有写入先进**库外** staging 目录，校验后 rename 入位；失败从 rollback 快照恢复；`assertInsideRoot` 拒绝路径逃逸。改写盘逻辑必须保持「staging → 校验 → rename → DB 事务」顺序，文件已提交但 DB 失败时用 `SyncEngineTestHooks` 验证回滚。
 
 ### LLM 通道（direct 单通道）
@@ -131,9 +139,11 @@ feishu_sync:
 
 **实测坑**：node_modules 被 `@electron/rebuild` 编译成 Electron ABI 后，直接用系统 Node 跑 vitest 会报 `NODE_MODULE_VERSION` 不匹配，横跨所有直连 better-sqlite3 的测试（20+ 用例）。切回系统 Node ABI：`cd server && npm rebuild better-sqlite3`。跑桌面构建后再跑测试时按此切换。
 
+**Node 24 teardown 崩溃（2026-10 实测）**：better-sqlite3 11.x 在 Node 24 上存在 worker teardown 时序缺陷——GC 弱回调触发 `Statement::~Statement` 时 Environment 已销毁，`RemoveEnvironmentCleanupHook` 断言 `env != nullptr` 崩溃（表现为 custom-folders.test.ts 等 worker 静默退出、49 用例丢失）。已升级 better-sqlite3 ^12 修复（12.4.1+ 含修复）；如再遇类似 worker 崩溃先查原生模块版本矩阵。
+
 ## 代码约定
 
 - 模块/路由/类型注释密度很高，大量「P0-Qx 实测 / 实测 confirmed / 历史教训」标注记录了为什么这样写。改动前读模块头注释，不要凭直觉重写。
-- TypeScript，ESM（`"type": "module"`），server 用 `.js` 扩展名 import（NodeNext 解析）。electron 经 esbuild 打成 CJS（`dist-electron/*.cjs`）。
+- TypeScript，ESM（`"type": "module"`），server 源码用 `.js` 扩展名 import（`moduleResolution: bundler`，非 NodeNext）；electron 经 esbuild 打成 CJS（`dist-electron/*.cjs`）。
 - 后端测试在 `server/tests/`（vitest），倾向算法层 + in-memory mock（避免 better-sqlite3 ABI 依赖，参考 `change-detector.test.ts` / `sync-engine.test.ts` 的模式）。
 - 已知技术债：`server/scripts/e2e-integration-test.ts` 端口硬编码（应为环境变量读取）。

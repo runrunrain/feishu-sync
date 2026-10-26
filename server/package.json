@@ -19,7 +19,7 @@
   },
   "dependencies": {
     "@hono/node-server": "^1.14.0",
-    "better-sqlite3": "^11.9.0",
+    "better-sqlite3": "^12.11.1",
     "csv-parser": "^3.2.1",
     "hono": "^4.7.0",
     "openai": "^4.89.0"

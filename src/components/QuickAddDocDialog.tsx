@@ -150,7 +150,7 @@ export function QuickAddDocDialog({
     // 等对话框渲染完成后再聚焦。
     const timer = setTimeout(() => textareaRef.current?.focus(), 50);
     return () => clearTimeout(timer);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+
   }, [open]);
 
   // 目标文件夹默认值落定：仅当尚未选定（刚打开 / 无有效选择）时，

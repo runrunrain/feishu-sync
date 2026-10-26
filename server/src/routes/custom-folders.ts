@@ -108,7 +108,7 @@ async function resolveConfig(c: any): Promise<{
 function sanitizeFolderName(raw: string): string {
   return raw
     .normalize('NFC')
-    .replace(/[\/\\:*?"<>|\u0000-\u001F]/g, '')
+    .replace(/[/\\:*?"<>|\u0000-\u001F]/g, '')
     .trim()
     .replace(/[.\s]+$/g, '');
 }

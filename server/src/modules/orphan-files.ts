@@ -61,7 +61,7 @@ function hasFeishuSyncMarker(absolutePath: string): boolean {
 
 /** 目录内（递归）是否存在带 feishu_sync 头的 .md；找到首个即停。 */
 function dirContainsSyncMarker(absoluteDir: string): string | null {
-  let stack: string[] = [absoluteDir];
+  const stack: string[] = [absoluteDir];
   while (stack.length > 0) {
     const dir = stack.pop() as string;
     let entries: fs.Dirent[];

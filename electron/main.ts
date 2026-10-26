@@ -24,7 +24,7 @@ import { DesktopUpdaterService } from './updater-service.js';
 import { AutoStartService } from './auto-start-service.js';
 import { ChangeNotificationService } from './change-notification-service.js';
 import { ConfigManager } from '../server/src/modules/config-manager.js';
-import type { DesktopActionResult, QuitReason } from './contracts.js';
+import type { QuitReason } from './contracts.js';
 
 // ============================================================================
 // Constants and Configuration
@@ -330,7 +330,7 @@ function getQuitCoordinator() {
     quitCoordinator = new QuitCoordinator({
       closeServer,
       sanitizeError: sanitizeDesktopError,
-      onBeforeQuit: (reason: QuitReason) => {
+      onBeforeQuit: (_reason: QuitReason) => {
         // 退出前先切断所有指向内嵌 server 的连接来源：停掉主进程的
         // 变更检测轮询、销毁渲染窗口——渲染层每 30s 轮询鉴权状态会
         // 持续维持 keep-alive 连接，让 server.close() 永远等不完。

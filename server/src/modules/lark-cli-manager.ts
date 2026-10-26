@@ -260,7 +260,7 @@ function buildNpmExecutionEnvironment(
  */
 export function parseLenientDeviceAuthJson(raw: string): Record<string, unknown> {
   const cleaned = raw
-    .replace(/^﻿/, '')
+    .replace(/^\uFEFF/, '')
     .replace(/\x1b\[[0-9;]*m/g, '')
     .trim();
   const start = cleaned.indexOf('{');

@@ -489,7 +489,7 @@ export function ModelProviderSettings() {
                           value={model.openAiModel}
                           onChange={(event) => updateModel(selectedProvider, model.id, { openAiModel: event.target.value })}
                           placeholder="glm-4-flash"
-                          helperText={/\bglm-[^\s\[]+\[[^\]]+\]/i.test(model.openAiModel)
+                          helperText={/\bglm-[^\s[]+\[[^\]]+\]/i.test(model.openAiModel)
                             ? 'GLM API 请填写标准模型代码（例如 glm-5.2）；容量显示后缀会在运行时自动移除。'
                             : undefined}
                         />

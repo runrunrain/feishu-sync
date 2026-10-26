@@ -239,7 +239,7 @@ describe('SyncEngine.generateHtmlHeader — YAML-in-comment header', () => {
     // IndexScanner defaulted to docx).
     expect(header).toContain('  obj_type: "sheet"');
     // Core fix point #2: original_link is present and NON-EMPTY.
-    expect(header).toMatch(/  original_link: "https:\/\/[^"]+"/);
+    expect(header).toMatch(/ {2}original_link: "https:\/\/[^"]+"/);
 
     // Regression guards: the legacy Chinese-key defects must NOT reappear.
     expect(header).not.toContain('节点: unknown');

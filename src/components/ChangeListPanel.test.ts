@@ -22,7 +22,7 @@ describe('ChangeListPanel logic & contracts', () => {
     const docMediaGap = makeDoc({
       objToken: 't3',
       changeType: 'modified',
-      mediaGapReason: 'missing 2 images',
+      mediaGapReason: 'sheet_cloud_images_missing',
     });
     const docDeleted = makeDoc({ objToken: 't4', changeType: 'deleted' });
 
@@ -59,7 +59,7 @@ describe('ChangeListPanel logic & contracts', () => {
   describe('computeSelectableDocs regression red-lines', () => {
     const added = [makeDoc({ objToken: 'a1', changeType: 'added' })];
     const modified = [makeDoc({ objToken: 'm1', changeType: 'modified' })];
-    const mediaGap = [makeDoc({ objToken: 'mg1', changeType: 'modified', mediaGapReason: 'gap' })];
+    const mediaGap = [makeDoc({ objToken: 'mg1', changeType: 'modified', mediaGapReason: 'local_placeholder_tags' })];
     const deleted = [makeDoc({ objToken: 'd1', changeType: 'deleted' })];
     const grouped = { added, modified, mediaGap, deleted };
 

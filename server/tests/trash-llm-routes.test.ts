@@ -117,7 +117,7 @@ function makeFakeStore(docs: FakeDoc[]) {
 
 function buildDiApp(deps: Record<string, any>) {
   // Dynamically import Hono to create a wrapping app.
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
+
   const { Hono } = require('hono');
   const wrap = new Hono();
   wrap.use('*', async (c: any, next: any) => {
