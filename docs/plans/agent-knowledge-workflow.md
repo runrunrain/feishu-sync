@@ -18,7 +18,7 @@
 |---|---|---|---|---|---|
 | G1 | 工程治理、文档、验证入口 / luban | v0.3.47、基线调查；隔离 worktree | 工程与文档 diff、docs/reports/engineering-governance.md | check/test/build；保留现有运行契约 | accepted：9281352f；Leader补隔离/排除/事实修正，54+615用例及构建通过 |
 | D1 | trade-wisdom 与 pi 调研、公共方向设计 / fuxi | 用户方向、现有项目和 pi 文档；仅写设计 artifacts | docs/design/agent-knowledge-design.md，公共 API/状态/权限约定 | 真实代码证据，方案可实现，不照搬参考 | accepted：255048cd；公共契约 docs/design/agent-knowledge-design.md，研究证据已落盘 |
-| G2 | main 集成验证与高风险审核 / Leader + diting | G1 | 验证证据、review | 通过后提交 main，不升级版本 | accepted：8b8c6692 + 9438878e 复审PASS；准备治理main提交（不发版）；native运行缺口保留 |
+| G2 | main 集成验证与高风险审核 / Leader + diting | G1 | 验证证据、review | 通过后提交 main，不升级版本 | completed：治理main提交 2c2a6dd；8b8c6692 + 9438878e 复审PASS；native运行缺口保留 |
 | F1 | 标准库、pi 会话与 MCP 后端纵向切片 / luban | main 已提交、D1 公共契约 | 代码/测试/运维文档/报告 | 原始库保护、原子发布、只读讨论、显式 Work、MCP 真协议 | pending |
 | F2 | 标准库浏览和 Agent 会话 UI / luoshen | main 已提交、D1 公共契约 | UI/测试/真实交互证据 | 阅读、来源、构建、会话、模式/错误状态 | pending，与 F1 并行 |
 | F3 | 开发分支集成、端到端验证、独立审核 / Leader + diting | F1、F2 | 验收矩阵/报告/分支提交 | 全套检查 + UI 真交互 + API/MCP 实测；如无可用模型明确未覆盖 | pending |
@@ -49,3 +49,5 @@
 - 2026-10-26：插件已完成后续新任务跨 boot 自动恢复优化；旧 macOS 记录无 boot 身份，最终安全实现保留一次人工确认。主上已在 TUI 为两条旧记录确认无残留进程，正式 reconcile 成功关闭为 cancelled/exited（不推断成功）。G1 续接 9281352f，D1 续接 255048cd；现场仅已有部分配置，未提交，不重放安装。
 - D1 已接受：外部 Node>=22.19 + pi>=1.4<2 的 RPC 侧车，不升级Electron；Discuss只读、Work受控文件工具（无shell）；不可变release+CURRENT原子指针；MCP stdio只读manifest/Markdown、无SQLite依赖。Leader修正POSIX/macOS路径containment为realpath精确比较。真实模型工具往返尚未验证，不能把隔离环境无凭据说成主机全无凭据。D1设计/研究文件属于下一功能分支，治理main不混入未来功能设计。
 - G2已接受：初审dry-run文案/Node范围/DI描述三项均修复并复审PASS。开发宿主支持^22.19.0 || ^24.0.0；默认测试home隔离；原始库来源不能只筛status=synced（changed/error但有成功本地版本仍保留）。Electron31 headers重编译成功，但本机最小启动卡dyld，runtime与打包仍未验证，不阻断不发版治理提交。
+- 治理提交：main@2c2a6dd（55文件，v0.3.47未变，无tag/push/release）。来源软警示已只读复核：31个现存文件与G1 worktree逐字节一致，23个为Leader整合修正/验证资料，5个旧路径为4份报告归档原址及误入源码空壳删除；icon.png 1.5MB需20MB读取预算，非缺失文件。未来设计未混入该提交。
+- 已切换 feat/agent-knowledge-workbench，D1公共设计与研究在此分支持久化，接下来F1/F2各自worktree并行；首轮Work不提供shell，外部MCP必须无SQLite原生依赖。原始源集合保留有成功本地版本的changed/error行，避免检测状态变化被误当源删除。
