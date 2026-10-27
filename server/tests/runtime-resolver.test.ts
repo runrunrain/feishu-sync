@@ -179,6 +179,61 @@ describe('resolveRuntime（fixture）', () => {
     expect(runtime.piCliPath).toBe(cliEntry);
     expect(runtime.piVersion).toBe('1.5.2');
   });
+
+  it('Windows npm 布局：pi.cmd shim 同级 node_modules 推导包根（P0 实测修复）', async () => {
+    const base = fs.mkdtempSync(path.join(fixtureRoot, 'win-npm-'));
+    // node.exe 在 Program Files 风格目录，与 npm prefix 无关。
+    // platform 注入 win32：resolver 固定查找 node.exe（与测试运行平台无关）
+    const nodeDir = path.join(base, 'Program Files', 'nodejs');
+    const nodePath = path.join(nodeDir, 'node.exe');
+    fs.mkdirSync(nodeDir, { recursive: true });
+    fs.writeFileSync(nodePath, 'fake-node', { mode: 0o755 });
+    // npm prefix：%APPDATA%\npm 下 pi.cmd shim 与 node_modules 同级
+    const npmPrefix = path.join(base, 'AppData', 'Roaming', 'npm');
+    const pkgRoot = path.join(npmPrefix, 'node_modules', ...PI_PACKAGE_NAME.split('/'));
+    fs.mkdirSync(path.join(pkgRoot, 'dist'), { recursive: true });
+    fs.writeFileSync(path.join(pkgRoot, 'package.json'), JSON.stringify({ name: PI_PACKAGE_NAME, version: '1.4.0' }));
+    fs.writeFileSync(path.join(pkgRoot, 'dist', 'cli.js'), '// fake');
+    const shimPath = path.join(npmPrefix, 'pi.cmd');
+    // 普通脚本而非 symlink：模拟 Windows npm shim（realpath 原样返回）
+    fs.writeFileSync(shimPath, '@ECHO off\r\nnode "%~dp0\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\cli.js" %*\r\n', { mode: 0o755 });
+
+    const resolver = new PiRuntimeResolver({
+      platform: 'win32',
+      env: {
+        PATH: `${nodeDir}${path.delimiter}${npmPrefix}`,
+        APPDATA: path.join(base, 'AppData', 'Roaming'),
+      },
+      execNodeVersion: async (candidate) => (candidate === nodePath ? '24.18.0' : null),
+    });
+    const runtime = await resolver.resolveRuntime(buildDefaultAgentConfig(fixtureRoot));
+    expect(runtime.nodePath).toBe(nodePath);
+    expect(runtime.piPackageRoot).toBe(pkgRoot);
+    expect(runtime.piCliPath).toBe(path.join(pkgRoot, 'dist', 'cli.js'));
+    expect(runtime.piVersion).toBe('1.4.0');
+  });
+
+  it('Windows npm 布局：PATH 缺 npm 目录时 APPDATA prefix 兑底', async () => {
+    const base = fs.mkdtempSync(path.join(fixtureRoot, 'win-appdata-'));
+    const nodeDir = path.join(base, 'nodejs');
+    const nodePath = path.join(nodeDir, 'node.exe');
+    fs.mkdirSync(nodeDir, { recursive: true });
+    fs.writeFileSync(nodePath, 'fake-node', { mode: 0o755 });
+    const appData = path.join(base, 'AppData', 'Roaming');
+    const pkgRoot = path.join(appData, 'npm', 'node_modules', ...PI_PACKAGE_NAME.split('/'));
+    fs.mkdirSync(path.join(pkgRoot, 'dist'), { recursive: true });
+    fs.writeFileSync(path.join(pkgRoot, 'package.json'), JSON.stringify({ name: PI_PACKAGE_NAME, version: '1.4.0' }));
+    fs.writeFileSync(path.join(pkgRoot, 'dist', 'cli.js'), '// fake');
+
+    const resolver = new PiRuntimeResolver({
+      platform: 'win32',
+      env: { PATH: nodeDir, APPDATA: appData },
+      execNodeVersion: async (candidate) => (candidate === nodePath ? '24.18.0' : null),
+    });
+    const runtime = await resolver.resolveRuntime(buildDefaultAgentConfig(fixtureRoot));
+    expect(runtime.nodePath).toBe(nodePath);
+    expect(runtime.piPackageRoot).toBe(pkgRoot);
+  });
 });
 
 describe('checkReadiness 就绪码（fixture）', () => {

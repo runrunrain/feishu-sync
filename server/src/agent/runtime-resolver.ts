@@ -8,9 +8,11 @@
  *     （复用 lark-cli-client 导出）。每个候选 `node --version`（execFile
  *     不经 shell，5s 超时），取首个 ≥22.19.0。
  *  3. pi 包候选（对选中 node）：nodeBinDir 同级 lib/node_modules、PATH 上
- *     pi 可执行 realpath 回溯。只读文件定位，不执行 npm；自定义 prefix
- *     用显式 piCliPath。校验包根 package.json 的
- *     name/version/dist/cli.js。
+ *     pi 可执行 realpath 回溯。Windows 下 npm 全局 prefix（%APPDATA%\npm）
+ *     与 node.exe 目录无关，且 pi.cmd 是普通脚本非 symlink，故补：prefix
+ *     直推（APPDATA/LOCALAPPDATA）与 shim 同级 node_modules 推导。只读
+ *     文件定位，不执行 npm、不读 shim 内容；自定义 prefix 用显式
+ *     piCliPath。校验包根 package.json 的 name/version/dist/cli.js。
  *
  * 结果缓存在内存，recheck() 或显式失效时重算。
  */
@@ -270,9 +272,18 @@ export class PiRuntimeResolver {
     );
     // fnm/nvm 的 installation 布局：lib 在 bin 同级父目录（上面已覆盖）；
     // Homebrew Intel: /usr/local/bin → ../lib/node_modules（同上）。
-    // Windows：node.exe 同目录 node_modules
+    // Windows：node.exe 同目录 node_modules（fnm-windows 等版本目录布局）。
+    // 注意 Windows npm 全局默认 prefix（%APPDATA%\npm）与 node.exe 安装
+    // 目录无关（P0 实测：Program Files 布局下此候选不命中），补 prefix
+    // 直推候选作为 PATH 未含 npm 目录时的兜底。
     if (platform === 'win32') {
       pushCandidate(path.join(nodeBinDir, 'node_modules', ...PI_PACKAGE_NAME.split('/')));
+      if (env.APPDATA) {
+        pushCandidate(path.join(env.APPDATA, 'npm', 'node_modules', ...PI_PACKAGE_NAME.split('/')));
+      }
+      if (env.LOCALAPPDATA) {
+        pushCandidate(path.join(env.LOCALAPPDATA, 'npm', 'node_modules', ...PI_PACKAGE_NAME.split('/')));
+      }
     }
 
     // 候选 2：PATH 上 pi 可执行的 realpath 回溯
@@ -282,6 +293,15 @@ export class PiRuntimeResolver {
       pathValue,
     );
     if (piOnPath) {
+      // Windows npm shim（pi.cmd/pi.ps1）是普通脚本而非 symlink：realpath
+      // 原样返回 shim 路径，向上回溯找不到包根（%APPDATA%\npm 之上没有
+      // pi 的 package.json）。Windows npm 布局中 shim 与 node_modules 同在
+      // prefix 根，直接推导；POSIX symlink 布局此推导不存在该目录、无害，
+      // nvm-windows（shim/包同在版本目录）同样被覆盖。仍不读 shim 内容、
+      // 不执行任何解释器——发现只做存在性与 package.json 名称校验。
+      pushCandidate(
+        path.join(path.dirname(piOnPath), 'node_modules', ...PI_PACKAGE_NAME.split('/')),
+      );
       const real = fs.realpathSync.native(piOnPath);
       pushCandidate(packageRootFromCliEntry(real));
     }
