@@ -85,7 +85,7 @@ async function fixture() {
     }, { timeout: 5000, interval: 10 });
     return result;
   }
-  return { root, raw, store, call, build, prompts, configManager,
+  return { root, raw, store, call, build, prompts, configManager, documents,
     setGenerated: (value: { markdown?: string; summary?: string }) => { generated = value; }, setSkip: (value: boolean) => { skipWrites = value; },
     setEditorial: (value: boolean) => { editorial = value; }, setBeforeFinish: (fn: () => void) => { beforeFinish = fn; },
     published: () => new StandardKbStore(configManager.getConfig()!.standardKb.outputRoot),
@@ -288,5 +288,36 @@ describe('diff与正文边界', () => {
     expect(hasEditorialHistory('新增战斗行动标准文档，规定每回合双方各行动一次。')).toBe(true);
     expect(hasEditorialHistory('说明战斗行动顺序与技能怒气消耗。')).toBe(false);
     expect(hasEditorialHistory('## 版本兼容规则\n客户端版本不匹配时拒绝连接。')).toBe(false);
+  });
+});
+
+
+describe('源选择批量事务', () => {
+  it('超过分页范围仍一次处理全部；反选去重、隔离根目录并保持原始字节', async () => {
+    const f = await fixture();
+    const before = fs.readFileSync(path.join(f.raw, 'a.md'), 'utf8');
+    for (let i = 0; i < 120; i++) f.documents.push({ ...f.documents[0], objToken: `extra${i}`, title: `文档${i}`, localRelPath: `目录/文档${i}.md` });
+    const tree = await f.call('/api/kb/sources/tree'); expect(tree.status).toBe(200); expect(tree.data.total).toBe(122);
+    const tokens = f.documents.map((doc) => doc.objToken);
+    const body = (action: string, target = tokens) => ({ root: f.raw, action, tokens: target });
+    expect((await f.call('/api/kb/sources/selection', 'POST', body('exclude'))).status).toBe(200);
+    expect(f.store.listKbExcludedSources(f.raw)).toHaveLength(122);
+    await f.call('/api/kb/sources/selection', 'POST', body('invert', ['a', 'a', 'b']));
+    expect(f.store.listKbExcludedSources(f.raw)).toHaveLength(120);
+    expect(f.store.listKbExcludedSources(path.join(f.root, 'different-root'))).toEqual([]);
+    await f.call('/api/kb/sources/selection', 'POST', body('include')); expect(f.store.listKbExcludedSources(f.raw)).toEqual([]);
+    expect(fs.readFileSync(path.join(f.raw, 'a.md'), 'utf8')).toBe(before);
+  });
+  it('未知源、库切换、非法请求或构建进行中均整批拒绝，不部分保存', async () => {
+    const f = await fixture();
+    for (const [body, status] of [
+      [{ root: f.raw, action: 'exclude', tokens: ['a', 'missing'] }, 404],
+      [{ root: 'old-root', action: 'exclude', tokens: ['a'] }, 409],
+      [{ root: f.raw, action: 'other', tokens: ['a'] }, 400],
+      [{ root: f.raw, action: 'exclude', tokens: [] }, 400],
+    ] as const) { expect((await f.call('/api/kb/sources/selection', 'POST', body)).status).toBe(status); expect(f.store.listKbExcludedSources(f.raw)).toEqual([]); }
+    f.store.createKbBuild({ id: 'queued', mode: 'full', status: 'queued', baseReleaseId: null, model: null, createdAt: new Date().toISOString() });
+    expect((await f.call('/api/kb/sources/selection', 'POST', { root: f.raw, action: 'exclude', tokens: ['a', 'b'] })).status).toBe(409);
+    expect(f.store.listKbExcludedSources(f.raw)).toEqual([]);
   });
 });

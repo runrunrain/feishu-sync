@@ -36,3 +36,6 @@ export interface KbSourceChoice {
   published: boolean;
   pending: 'added' | 'changed' | 'removed' | 'unchanged' | 'excluded';
 }
+
+export interface KbSourceTreeNode { id: string; title: string; source?: KbSourceChoice; children: KbSourceTreeNode[] }
+export interface KbSourceTreeDto { root: string; nodes: KbSourceTreeNode[]; total: number }

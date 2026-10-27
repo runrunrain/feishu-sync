@@ -15,6 +15,7 @@
  * 结果缓存在内存，recheck() 或显式失效时重算。
  */
 
+import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -149,6 +150,9 @@ export interface ResolverOverrides {
 
 export class PiRuntimeResolver {
   private cached: ReadinessResult | null = null;
+  private readiness = new Map<string, { value: ReadinessResult; expires: number }>();
+  private probes = new Map<string, Promise<ReadinessResult>>();
+  private generation = 0;
   private readonly resolvedRuntimes = new Map<string, ResolvedRuntime>();
   private readonly overrides: ResolverOverrides;
 
@@ -158,6 +162,7 @@ export class PiRuntimeResolver {
 
   invalidate(): void {
     this.cached = null;
+    this.generation++; this.readiness.clear(); this.probes.clear();
   }
 
   private nodeVersion(nodePath: string): Promise<string | null> {
@@ -312,7 +317,37 @@ export class PiRuntimeResolver {
    * 启动短命 RPC 进程（--no-session --no-tools），发 get_state +
    * get_available_models。此处只做结果归类。
    */
-  async checkReadiness(
+  /** 相同配置/凭据签名共享探测；进程数始终取当前请求，不缓存成旧值。 */
+  async checkReadiness(input: ReadinessProbeInput,
+    modelProbe?: (runtime: ResolvedRuntime) => Promise<{ ok: boolean; stderr?: string; available: string[] } | null>,
+    options: { force?: boolean } = {}): Promise<ReadinessResult> {
+    const env = this.overrides.env ?? process.env;
+    const home = env.PI_CODING_AGENT_DIR || path.join(os.homedir(), '.pi', 'agent');
+    const credentials = input.agentConfig.model.source === 'pi-agent-dir' ? ['models.json', 'auth.json'].map((name) => {
+      try { const stat = fs.statSync(path.join(home, name)); return [name, stat.mtimeMs, stat.size]; } catch { return [name, null]; }
+    }) : [];
+    const key = crypto.createHash('sha256').update(JSON.stringify({ runtime: input.agentConfig.runtime, model: input.agentConfig.model,
+      llm: input.agentConfig.model.source === 'app-llm' ? input.llmConfig : null, home, credentials, probing: Boolean(modelProbe) })).digest('hex');
+    const withCounts = (value: ReadinessResult): ReadinessResult => ({ ...value, processes: { running: input.runningProcesses, max: input.agentConfig.maxConcurrentProcesses } });
+    const pending = this.probes.get(key);
+    if (pending) return withCounts(await pending);
+    const cached = this.readiness.get(key);
+    if (!options.force && cached && cached.expires > Date.now()) return withCounts(cached.value);
+    const generation = this.generation;
+    const promise = this.computeReadiness(input, modelProbe);
+    this.probes.set(key, promise);
+    try {
+      const result = await promise;
+      if (generation === this.generation) {
+        if (this.readiness.size >= 8) this.readiness.delete(this.readiness.keys().next().value!);
+        this.readiness.set(key, { value: result, expires: Date.now() + (result.code === 'ready' || result.code === 'model_unconfigured' ? 300_000 : 30_000) });
+        this.cached = result;
+      }
+      return withCounts(result);
+    } finally { if (this.probes.get(key) === promise) this.probes.delete(key); }
+  }
+
+  private async computeReadiness(
     input: ReadinessProbeInput,
     modelProbe?: (runtime: ResolvedRuntime) => Promise<{ ok: boolean; stderr?: string; available: string[] } | null>,
   ): Promise<ReadinessResult> {
@@ -494,7 +529,6 @@ export class PiRuntimeResolver {
   }
 
   private cache(result: ReadinessResult): ReadinessResult {
-    this.cached = result;
     return result;
   }
 

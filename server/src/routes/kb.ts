@@ -5,6 +5,8 @@
  * 只读查询不依赖 SQLite；构建状态来自 kb_builds 表。
  */
 
+import type { KbSourceChoice } from '../types/kb-version.js';
+import { buildSourceTree } from '../kb/source-tree.js';
 import { Hono } from 'hono';
 import { streamSSE } from 'hono/streaming';
 import type { Context } from 'hono';
@@ -199,8 +201,7 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
   });
 
   // 源选择与版本入口独立于正文。标记只写应用元数据，不编辑原始文件。
-  routes.get('/api/kb/sources', async (c) => {
-    try {
+  const sourceChoices = async () => {
       const { store, config } = await loadStore();
       const excluded = new Set(localMapStore.listKbExcludedSources(config.knowledgeBaseRoot));
       const manifest = store.readManifest();
@@ -209,18 +210,41 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
       const base = new Map((manifest?.sourceSnapshot ?? []).map((entry) => [entry.objToken, entry]));
       const candidates = new Map(collectSourceCandidates(deps.documentsProvider()).map((doc) => [doc.objToken, { title: doc.title, relPath: doc.localRelPath! }]));
       for (const [token, entry] of base) if (!candidates.has(token)) candidates.set(token, entry);
-      const q = (c.req.query('q') ?? '').slice(0, 200).toLowerCase();
-      const limit = Math.max(1, Math.min(100, Number(c.req.query('limit')) || 50));
-      const page = Math.max(1, Math.floor(Number(c.req.query('page')) || 1));
-      const all = [...candidates].map(([objToken, doc]) => {
+      const choices: KbSourceChoice[] = [...candidates].map(([objToken, doc]) => {
         const old = base.get(objToken); const next = current.get(objToken);
         const isExcluded = excluded.has(objToken);
         const pending = isExcluded ? (old ? 'removed' : 'excluded') : !next ? (old ? 'removed' : 'unchanged')
           : !old ? 'added' : next.contentHash !== old.contentHash || next.relPath !== old.relPath || next.title !== old.title ? 'changed' : 'unchanged';
         return { objToken, title: doc.title || objToken, relPath: doc.relPath, included: !isExcluded, published: Boolean(old), pending };
-      }).filter((doc) => `${doc.title} ${doc.relPath} ${doc.objToken}`.toLowerCase().includes(q))
-        .sort((a, b) => a.relPath.localeCompare(b.relPath));
-      return c.json({ sources: all.slice((page - 1) * limit, page * limit), total: all.length, page, limit });
+      });
+    return { choices, config, documents: deps.documentsProvider() };
+  };
+  routes.get('/api/kb/sources', async (c) => {
+    try {
+      const { choices } = await sourceChoices();
+      const q = (c.req.query('q') ?? '').slice(0, 200).toLowerCase();
+      const limit = Math.max(1, Math.min(100, Number(c.req.query('limit')) || 50));
+      const page = Math.max(1, Math.floor(Number(c.req.query('page')) || 1));
+      const all = choices.filter((doc) => `${doc.title} ${doc.relPath} ${doc.objToken}`.toLowerCase().includes(q)).sort((a,b) => a.relPath.localeCompare(b.relPath));
+      return c.json({ sources: all.slice((page-1)*limit, page*limit), total: all.length, page, limit });
+    } catch (error) { return errorResponse(c, error); }
+  });
+  routes.get('/api/kb/sources/tree', async (c) => {
+    try { const { choices, config, documents } = await sourceChoices();
+      return c.json({ root: config.knowledgeBaseRoot, nodes: buildSourceTree(documents, choices), total: choices.length });
+    } catch (error) { return errorResponse(c, error); }
+  });
+  routes.post('/api/kb/sources/selection', async (c) => {
+    try {
+      const body = await c.req.json();
+      if (!body || !['include','exclude','invert'].includes(body.action) || !Array.isArray(body.tokens) || !body.tokens.length || body.tokens.length > 50000 || !body.tokens.every((token: unknown) => typeof token === 'string'))
+        throw new ToolError('invalid_request', '请提供操作类型和1–50000个源文档标识');
+      const { store, config } = await loadStore();
+      if (body.root !== config.knowledgeBaseRoot) throw new ToolError('source_selection_changed', '原始库已变化，请刷新后再选择', 409);
+      const valid = new Set([...collectSourceCandidates(deps.documentsProvider()).map((doc) => doc.objToken), ...(store.readManifest()?.sourceSnapshot.map((entry) => entry.objToken) ?? [])]);
+      if (body.tokens.some((token: string) => !valid.has(token))) throw new ToolError('source_not_found', '部分源文档已不存在，请刷新', 404);
+      if (buildService.activeBuild(localMapStore)) throw new ToolError('kb_build_running', '更新进行中，请结束后再调整源文档', 409);
+      return c.json({ selection: localMapStore.setKbSourcesIncluded(config.knowledgeBaseRoot, body.tokens, body.action) });
     } catch (error) { return errorResponse(c, error); }
   });
 
@@ -234,6 +258,7 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
       if (!deps.documentsProvider().some((doc) => doc.objToken === token)
         && !store.readManifest()?.sourceSnapshot.some((entry) => entry.objToken === token))
         return c.json({ error: 'source_not_found', message: '原始文档不存在' }, 404);
+      if (buildService.activeBuild(localMapStore)) throw new ToolError('kb_build_running', '更新进行中，请结束后再调整源文档', 409);
       localMapStore.setKbSourceExcluded(config.knowledgeBaseRoot, token, !body.included);
       return c.json({ objToken: token, included: body.included });
     } catch (error) { return errorResponse(c, error); }

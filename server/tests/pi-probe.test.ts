@@ -163,6 +163,7 @@ describe('真实 pi RPC（本机 pi 1.4，缺失则 skip）', () => {
 
   it('app-llm 无 key：provider 注册后可用模型为空 → model_auth_missing 诊断', async () => {
     if (!piAvailable()) return;
+    const before = toolsFetchCount;
     const rpc = await spawnProbe({
       withExtension: true,
       providerJson: JSON.stringify({
@@ -173,10 +174,10 @@ describe('真实 pi RPC（本机 pi 1.4，缺失则 skip）', () => {
     });
     try {
       const deadline = Date.now() + 15_000;
-      const before = toolsFetchCount;
       while (toolsFetchCount <= before && Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 300));
       }
+      expect(toolsFetchCount).toBeGreaterThan(before);
       const { models } = await rpc.probeState();
       // E1 实测行为：无 key → feishu-sync-llm 不出现在可用模型
       expect(models.filter((model) => model.startsWith('feishu-sync-llm/'))).toHaveLength(0);

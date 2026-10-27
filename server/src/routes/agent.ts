@@ -108,7 +108,6 @@ export async function agentRoutes(deps: AgentRouteDeps): Promise<Hono> {
 
   routes.post('/api/agent/status/recheck', async (c) => {
     try {
-      resolver.invalidate();
       const config = await configManager.load();
       const status = await resolver.checkReadiness(
         {
@@ -117,6 +116,7 @@ export async function agentRoutes(deps: AgentRouteDeps): Promise<Hono> {
           runningProcesses: pool.runningCount(),
         },
         buildModelProbe(config),
+        { force: true },
       );
       const { piPackageRoot: _ignored, ...dto } = status.runtime;
       return c.json({ ...status, externalPlugins: deps.externalPlugins?.() ?? 0, runtime: dto });

@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
+import { KbSourceSelector } from './KbSourceSelector';
 import { Modal } from '../common/Modal';
 import { Button } from '../common/Button';
-import { getKbChanges, getKbVersion, listKbSources, listKbVersions, setKbSourceIncluded } from '../../api/client';
+import { getKbChanges, getKbVersion, listKbVersions } from '../../api/client';
 import { formatDateTime } from '../../utils/agentReadiness';
 import type { KbChangePreview, KbFileChange, KbSourceChoice, KbVersionDto } from '../../types/kb-version';
 
@@ -18,30 +19,22 @@ export function KbChangesPanel({ tab, onTab, onClose, onChanged, onUpdate, onOpe
   running: boolean;
   canUpdate: boolean;
 }) {
-  const [q, setQ] = useState('');
-  const [page, setPage] = useState(1);
-  const [sources, setSources] = useState<KbSourceChoice[]>([]);
-  const [total, setTotal] = useState(0);
   const [preview, setPreview] = useState<KbChangePreview | null>(null);
   const [history, setHistory] = useState<Awaited<ReturnType<typeof listKbVersions>> | null>(null);
   const [versionId, setVersionId] = useState('');
   const [version, setVersion] = useState<KbVersionDto | null>(null);
   const [loading, setLoading] = useState(false);
   const [versionLoading, setVersionLoading] = useState(false);
-  const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState('');
   const [nonce, setNonce] = useState(0);
 
   useEffect(() => {
-    if (!tab) return;
+    if (!tab || tab === 'sources') { setLoading(false); setError(''); return; }
     let disposed = false;
     setLoading(true); setError('');
     void (async () => {
       try {
-        if (tab === 'sources') {
-          const data = await listKbSources(q, page);
-          if (!disposed) { setSources(data.sources); setTotal(data.total); }
-        } else if (tab === 'pending') {
+        if (tab === 'pending') {
           const data = await getKbChanges();
           if (!disposed) setPreview(data);
         } else {
@@ -55,7 +48,7 @@ export function KbChangesPanel({ tab, onTab, onClose, onChanged, onUpdate, onOpe
       finally { if (!disposed) setLoading(false); }
     })();
     return () => { disposed = true; };
-  }, [tab, q, page, nonce]);
+  }, [tab, nonce]);
 
   useEffect(() => {
     if (tab !== 'history' || !versionId) { setVersion(null); return; }
@@ -66,15 +59,6 @@ export function KbChangesPanel({ tab, onTab, onClose, onChanged, onUpdate, onOpe
       .finally(() => { if (!disposed) setVersionLoading(false); });
     return () => { disposed = true; };
   }, [tab, versionId, nonce]);
-
-  const toggle = async (source: KbSourceChoice) => {
-    setBusy(source.objToken); setError('');
-    try {
-      await setKbSourceIncluded(source.objToken, !source.included);
-      setNonce((n) => n + 1); onChanged();
-    } catch (err) { setError(err instanceof Error ? err.message : '标记保存失败'); }
-    finally { setBusy(null); }
-  };
 
   return <Modal open={tab !== null} title="源文档与变更记录" onClose={onClose} contentClassName="max-w-5xl">
     <div className="flex gap-2 border-b border-line pb-3 mb-3" role="tablist" aria-label="变更管理">
@@ -88,35 +72,7 @@ export function KbChangesPanel({ tab, onTab, onClose, onChanged, onUpdate, onOpe
     </div>
     {error ? <p role="alert" className="text-sm text-seal-2 mb-3">{error}</p> : null}
     <div className="h-[60vh] min-h-[260px] overflow-auto scrollbar-thin">
-      {tab === 'sources' ? <>
-        <p className="text-xs text-ink-soft mb-3 leading-relaxed">
-          取消勾选后，文档继续保留在原始库，但不再参与标准库构建。已参与过的来源会在下次「按变更更新」时移除其影响；重新勾选后可再次参与。
-        </p>
-        <input aria-label="搜索源文档" placeholder="搜索标题、路径或文档标识" value={q}
-          onChange={(e) => { setQ(e.target.value); setPage(1); }} className="w-full px-3 py-2 mb-3 rounded border border-line bg-card-bg text-sm" />
-        {loading ? <p className="text-xs text-ink-faint">正在读取源文档…</p> : <>
-          {sources.map((source) => <div key={source.objToken} className="flex gap-3 items-center py-3 border-b border-line/60">
-            <input type="checkbox" checked={source.included} disabled={running || busy !== null}
-              aria-label={`参与构建：${source.title}`} onChange={() => void toggle(source)} className="accent-[#9e2b25] shrink-0" />
-            <button onClick={() => onOpenSource(source)} className="flex-1 min-w-0 text-left hover:text-seal">
-              <span className="block text-sm text-ink break-all">{source.title}</span>
-              <span className="block text-xs text-ink-faint break-all mt-1">{source.relPath}</span>
-            </button>
-            <span className="text-xs shrink-0 text-ink-soft">{source.included ? '参与构建' : '不参与构建'}</span>
-            <span className={`text-xs shrink-0 ${source.pending === 'removed' ? 'text-seal-2' : 'text-ink-faint'}`}>
-              {LABEL[source.pending]}{source.pending === 'removed' ? '（待更新）' : ''}
-            </span>
-          </div>)}
-          {!sources.length ? <p className="py-6 text-sm text-ink-faint">没有匹配的本地源文档。</p> : null}
-          <div className="flex items-center justify-between py-3 text-xs text-ink-faint">
-            <span>共 {total} 篇 · 第 {page} 页</span><div className="flex gap-2">
-              <Button size="sm" variant="secondary" disabled={page === 1} onClick={() => setPage((p) => p - 1)}>上一页</Button>
-              <Button size="sm" variant="secondary" disabled={page * 50 >= total} onClick={() => setPage((p) => p + 1)}>下一页</Button>
-            </div>
-          </div>
-        </>}
-        {running ? <p className="text-xs text-seal">构建进行中，源选择暂不可更改。</p> : null}
-      </> : tab === 'pending' ? <>
+      {tab === 'sources' ? <KbSourceSelector nonce={nonce} running={running} onChanged={onChanged} onOpenSource={onOpenSource} /> : tab === 'pending' ? <>
         <p className="text-xs text-ink-soft mb-3">比较当前参与构建的原始源与最近发布的源快照。差异用于更新判断，正文会重新写成完整说明。</p>
         {loading ? <p className="text-xs text-ink-faint">正在计算差异…</p> : preview ? <>
           <p className="text-sm text-ink mb-2">{preview.sources.length} 个源变更 · {preview.affectedDocs.length} 篇已有标准文档受影响</p>

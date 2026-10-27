@@ -245,6 +245,8 @@ export class PiRpcProcess extends EventEmitter {
         resolve();
       };
       this.once('first-line', onFirst);
+      // 立即握手；stdin会缓冲到Pi启动完成，避免每次RPC先空等8秒。
+      this.sendCommand('get_state', {}, startupTimeoutMs).catch(() => undefined);
       this.once('exit', () => {
         clearTimeout(timer);
         reject(new PiRpcError('pi_spawn_failed', `pi 进程启动即退出：${this.stderrTailText()}`));

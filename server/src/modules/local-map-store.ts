@@ -2126,6 +2126,21 @@ export class LocalMapStore {
     else this.db.prepare('DELETE FROM kb_source_exclusions WHERE knowledge_root=? AND obj_token=?').run(key, objToken);
   }
 
+  /** 一次事务完成层级/全选/反选，避免逐文档网络请求与部分写入。 */
+  setKbSourcesIncluded(root: string, tokens: string[], action: 'include' | 'exclude' | 'invert'): Array<{ objToken: string; included: boolean }> {
+    const key = this.kbSourceRootKey(root);
+    const insert = this.db.prepare('INSERT OR REPLACE INTO kb_source_exclusions (knowledge_root,obj_token,excluded_at) VALUES (?,?,?)');
+    const remove = this.db.prepare('DELETE FROM kb_source_exclusions WHERE knowledge_root=? AND obj_token=?');
+    return this.db.transaction(() => {
+      const excluded = new Set(this.listKbExcludedSources(root));
+      return [...new Set(tokens)].map((objToken) => {
+        const included = action === 'include' || (action === 'invert' && excluded.has(objToken));
+        if (included) remove.run(key, objToken); else insert.run(key, objToken, new Date().toISOString());
+        return { objToken, included };
+      });
+    })();
+  }
+
   createKbBuild(input: {
     id: string;
     mode: 'incremental' | 'full';

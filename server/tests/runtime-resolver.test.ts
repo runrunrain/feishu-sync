@@ -276,3 +276,44 @@ describe('resolveAppLlmModel', () => {
     expect(second?.openAiModel).toBe('glm-4.6');
   });
 });
+
+describe('就绪缓存与并发探测', () => {
+  function cachedFixture() {
+    const base = fs.mkdtempSync(path.join(fixtureRoot, 'cache-'));
+    const nodePath = makeFakeNode(path.join(base, 'bin'), '24.0.0'); makeFakePiAtLibNodeModules(base, '1.4.1');
+    const resolver = new PiRuntimeResolver({ env: { PATH: path.dirname(nodePath), PI_CODING_AGENT_DIR: base }, execNodeVersion: async () => '24.0.0' });
+    const agentConfig = buildDefaultAgentConfig(base); agentConfig.model = { source: 'pi-agent-dir', piModel: 'configured/one' };
+    const input = { agentConfig, llmConfig: buildDefaultLlmConfigForTest(), runningProcesses: 0 };
+    return { base, resolver, input };
+  }
+  it('合并并发请求，复用模型列表但实时返回进程数；强制刷新只探测一次', async () => {
+    const { resolver, input } = cachedFixture(); const probe = vi.fn(async () => ({ ok: true, available: ['configured/one'] }));
+    const results = await Promise.all([resolver.checkReadiness(input, probe), resolver.checkReadiness({ ...input, runningProcesses: 2 }, probe)]);
+    expect(probe).toHaveBeenCalledOnce(); expect(results[1].processes.running).toBe(2);
+    expect((await resolver.checkReadiness(input, probe)).checkedAt).toBe(results[0].checkedAt);
+    await Promise.all([resolver.checkReadiness(input, probe, { force: true }), resolver.checkReadiness(input, probe, { force: true })]);
+    expect(probe).toHaveBeenCalledTimes(2);
+  });
+  it('五分钟到期、模型修改与凭据文件修改都会重新探测', async () => {
+    const { base, resolver, input } = cachedFixture(); const probe = vi.fn(async () => ({ ok: true, available: ['configured/one', 'configured/two'] }));
+    const now = Date.now(); const date = vi.spyOn(Date, 'now').mockReturnValue(now);
+    try {
+      await resolver.checkReadiness(input, probe); date.mockReturnValue(now + 299_999); await resolver.checkReadiness(input, probe); expect(probe).toHaveBeenCalledOnce();
+      date.mockReturnValue(now + 300_001); await resolver.checkReadiness(input, probe); expect(probe).toHaveBeenCalledTimes(2);
+      input.agentConfig.model.piModel = 'configured/two'; await resolver.checkReadiness(input, probe); expect(probe).toHaveBeenCalledTimes(3);
+      fs.writeFileSync(path.join(base, 'auth.json'), '{}'); await resolver.checkReadiness(input, probe); expect(probe).toHaveBeenCalledTimes(4);
+    } finally { date.mockRestore(); }
+  });
+  it('失败只缓存30秒，失效时旧的在途结果不能重新填充缓存', async () => {
+    const { resolver, input } = cachedFixture(); const probe = vi.fn(async () => ({ ok: false, available: [] as string[] }));
+    const now = Date.now(); const date = vi.spyOn(Date, 'now').mockReturnValue(now);
+    try {
+      await resolver.checkReadiness(input, probe); date.mockReturnValue(now + 30_001); await resolver.checkReadiness(input, probe); expect(probe).toHaveBeenCalledTimes(2);
+    } finally { date.mockRestore(); }
+    resolver.invalidate(); let release!: (value: { ok: boolean; available: string[] }) => void;
+    const slow = vi.fn(() => new Promise<{ ok: boolean; available: string[] }>((resolve) => { release = resolve; }));
+    const request = resolver.checkReadiness(input, slow); await vi.waitFor(() => expect(slow).toHaveBeenCalledOnce());
+    resolver.invalidate(); release({ ok: true, available: ['configured/one'] }); await request;
+    expect(resolver.getCached()).toBeNull(); await resolver.checkReadiness(input, probe); expect(probe).toHaveBeenCalledTimes(3);
+  });
+});

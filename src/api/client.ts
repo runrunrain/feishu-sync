@@ -1,6 +1,6 @@
 import type { PiPluginsDto } from '../types/pi-plugin';
 import type { AgentPluginsDto, AgentPluginInput } from '../types/agent-plugin';
-import type { KbSourceChoice, KbChangePreview, KbVersionDto } from '../types/kb-version';
+import type { KbSourceTreeDto, KbSourceChoice, KbChangePreview, KbVersionDto } from '../types/kb-version';
 /**
  * API client for feishu-sync
  * All requests include X-Desktop-Token header from window.desktop
@@ -1232,4 +1232,9 @@ export function listPiPlugins(): Promise<PiPluginsDto> { return request('/api/ag
 export function managePiPlugin(action: 'install' | 'update' | 'remove' | 'toggle', expectedRevision: string,
   input: { source?: string; id?: string; enabled?: boolean }): Promise<PiPluginsDto> {
   return request(`/api/agent/plugins/${action}`, { method: 'POST', body: JSON.stringify({ expectedRevision, ...input }) });
+}
+
+export function getKbSourceTree() { return request<KbSourceTreeDto>('/api/kb/sources/tree'); }
+export function setKbSourcesSelection(root: string, tokens: string[], action: 'include' | 'exclude' | 'invert') {
+  return request<{ selection: { objToken: string; included: boolean }[] }>('/api/kb/sources/selection', { method: 'POST', body: JSON.stringify({ root, tokens, action }) });
 }
