@@ -27,6 +27,24 @@
 - 字段总表见 README「配置说明」；关键字段：`llm.*`（direct 通道，默认智谱 GLM，`timeoutMs` 默认 600_000）、`pollIntervalMinutes`、`knowledgeBaseRoot`、`requiredScopes`（9 项，与 ConfigManager 默认一致）。
 - apiKey 明文存储是**已知架构决策**（含 `_warning` 字段），加密 deferred；正式回填脚本默认只读配置，唯一例外是显式 `--persist-config`。
 
+## Agent 与标准库（开发分支）
+
+| 数据 | 真相与维护责任 |
+|---|---|
+| `agent_sessions` | 会话标题、模式、Workspace绑定、pi JSONL文件定位与最近错误；正文历史不放SQLite |
+| `<dataRoot>/agent/sessions/*.jsonl` | pi v3树形会话历史；沿当前叶回溯全部节点，输出时才筛消息，不能让compaction/model_change父节点截断历史 |
+| `<dataRoot>/agent/audit/<sessionId>.jsonl` | 写入工具/路径/结果元数据，不含写入正文 |
+| `kb_builds` | 构建状态与统计；CURRENT提交后的异常以文件发布事实为准启动对账，不可用旧DB状态否认已发布内容 |
+| `<outputRoot>/CURRENT.json` | 当前发布指针；一次读取绑定一个release，不能混读两个版本 |
+| `<outputRoot>/releases/<releaseId>/manifest.json` 与 `docs/` | 完整已发布快照及来源；应用不修改已发布正文，MCP只读此处，不读取SQLite |
+| `.staging/<buildId>` 与 `.builds/<buildId>` | 暂存内容、构建事件和校验报告；不是可对外查询的发布 |
+
+以上新表仍经幂等DDL/additive策略建立，不改原`documents`身份及同步基线语义。`dataRoot`与桌面/服务端共用`FEISHU_SYNC_HOME`解析。
+
+配置新增`agent.runtime/model/workspaces`和`standardKb`段。Workspace通过专用API登记，普通PUT配置不接受`agent.workspaces`；改变原始库、标准库或运行资源根也必须对已有Workspace做反向交叉校验，不能只在最初登记时检查。
+
+标准文档使用独立的`feishu_sync_kb` YAML-in-comment头（`doc_id/build_id/sources`），不要与原始库的`feishu_sync`头混用。改标准头需同时维护构建写入/校验和`StandardKbStore.parseStdHeader/stripStdHeader`，并验证UI/MCP读取。
+
 ## Markdown header 契约（round-trip 必须闭环）
 
 写入端 `SyncEngine.generateHtmlHeader`，读取端 `IndexScanner.parseMetadata`。当前规范：文件首部 YAML-in-HTML-comment：

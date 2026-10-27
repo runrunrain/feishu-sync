@@ -67,10 +67,24 @@ npx tsx scripts/sync-latest.ts --skip-index --apply    # 提交KB正文，仅 cr
 | `verify-*` / `test-fetch.ts` / `test-sheet-export.ts` / `test-adapter-fallback.ts` | 历史验收探针，不能统一视作只读：部分初始化数据库、加载或迁移用户配置、执行同步或写临时文件；只有逐脚本验证隔离后才运行 |
 | `gate2-closeout.ts` / `gate5-live-shadow-canary.ts` | 内含文件/SQLite 写入与 apply，不可假定运行前还有确认门 |
 | `smoke-custom-folders.mjs` | 会创建隔离 home、配置与目录并通过接口操作；先核对隔离参数，不能用于生产目录 |
+| `agent-real-model-smoke.ts` | 显式真实模型验证；创建临时raw/config/SQLite/会话与Workspace并触发真实写入/构建、消耗模型额度；必须先给新临时FEISHU_SYNC_HOME，禁止指向生产目录 |
 
 ### 文件级历史参考（不执行）
 
 `migration_v2..v4.sql`、`run-migration-v2/v3/v4.mjs`、`run-migration-v5.ts`（v5 有专项测试 `test:migrations`）、`run_migration_v2.py`、`update_doc_mapping.py`、`e2e-integration-test.ts`（端口硬编码 4123，已知技术债）、`verify-custom-docx-write.mjs`（历史写入验证）。这些文件保留作参考，不因本分组而获得运行许可。`reconcile-apply.ts` 的 operationDirectory 仍直接取 home，未完全沿 FEISHU_SYNC_HOME；在隔离环境运行前需额外审查。
+
+## Agent 工作台验证与打包（开发分支）
+
+- `npm run server:build` 除tsc外，还运行`server/scripts/build-agent-assets.mjs`：复制内置prompts/转发扩展，借`server/scripts/lib/`打包独立MCP CJS。写面仅server/dist，不修改用户资料。
+- Electron31仍内嵌业务server；pi使用外部Node≥22.19。安装包需核对asarUnpack后的扩展/prompts/MCP路径，以及外部运行时的实际发现结果；原生SQLite ABI构建成功不等于桌面运行验证成功。
+- MCP可用独立外部Node运行，不应为连接MCP重编译SQLite。仅使用完整已发布目录；不要把.builds/.staging当知识库，也不要手改CURRENT或已发布正文。
+- 真实模型smoke不是普通单测，需显式授权额度，且只使用脚本自建的无敏感fixture。POSIX shell示例（在server/）：
+
+```bash
+FEISHU_SYNC_HOME="$(mktemp -d)" npx tsx scripts/agent-real-model-smoke.ts
+```
+
+认证交给pi的显式pi-agent-dir模式；不要复制真实应用配置/DB或打印pi auth/models文件来运行验证。成功会清理临时资料，失败保留现场供诊断；保留或分享日志前仍须核对隐私。真实提供商兼容性、目标平台进程回收和桌面运行需独立记录，不能用协议fixture或浏览器成功替代。
 
 ## CI / 质量门禁
 

@@ -1,0 +1,355 @@
+/**
+ * Agent 路由（设计 §9.1 / §9.3 / §9.4）— desktop auth 之后
+ *
+ * GET/POST/PATCH/DELETE 会话、发消息、中止、模式切换、Workspace CRUD、
+ * 运行时状态与重检测。SSE 用 hono/streaming streamSSE（前端 fetch 读流）。
+ */
+
+import { Hono } from 'hono';
+import { streamSSE } from 'hono/streaming';
+import type { Context } from 'hono';
+import type { ContentfulStatusCode } from 'hono/utils/http-status';
+import crypto from 'node:crypto';
+import type { SessionService } from '../agent/session-service.js';
+import { ToolError, type AgentToolService } from '../agent/agent-tool-service.js';
+import type { AgentProcessPool } from '../agent/agent-process-pool.js';
+import type { PiRuntimeResolver } from '../agent/runtime-resolver.js';
+import { validateWorkspacePath } from '../agent/path-guard.js';
+import { collectResolvedRuntimeProtectedRoots, collectStaticProtectedRoots } from '../agent/protected-roots.js';
+import { probeAvailableModels } from '../agent/runtime-probe.js';
+import type { LocalMapStore } from '../modules/local-map-store.js';
+import type { ConfigManager } from '../modules/config-manager.js';
+import type { Config } from '../types/index.js';
+import { resolveDataRoot } from '../modules/data-root.js';
+import type { AgentWorkspaceConfig } from '../types/agent-knowledge.js';
+
+export interface AgentRouteDeps {
+  sessionService: SessionService;
+  toolService: AgentToolService;
+  pool: AgentProcessPool;
+  resolver: PiRuntimeResolver;
+  configManager: ConfigManager;
+  localMapStore: LocalMapStore;
+  /** 内部 API 回环基址（无端口 → 无法 spawn，状态接口会呈现） */
+  internalPort: () => number | null;
+}
+function errorResponse(c: Context, error: unknown): Response {
+  if (error instanceof ToolError) {
+    const details = (error as ToolError & { details?: unknown }).details;
+    return c.json(
+      {
+        error: error.code,
+        message: error.message,
+        ...(details ? { details } : {}),
+      },
+      error.status as ContentfulStatusCode,
+    ) as unknown as Response;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return c.json({ error: 'internal_error', message }, 500) as unknown as Response;
+}
+
+export async function agentRoutes(deps: AgentRouteDeps): Promise<Hono> {
+  const routes = new Hono();
+  const { sessionService, resolver, configManager, localMapStore, pool } = deps;
+
+  // ------------------------------------------------------------------
+  // 运行时状态（Leader steer #4：每次请求取最新 config——factory 顶层捕获
+  // 会在 UI 保存 agent/model 配置后永远用旧对象；probe 也接受本次配置）
+  // ------------------------------------------------------------------
+
+  const buildModelProbe = (config: Config) => async (runtime: Parameters<typeof probeAvailableModels>[0]['runtime']) => {
+    const port = deps.internalPort();
+    if (!port) return null; // 端口未知（未监听）：跳过模型探测，按配置推断
+    const { token } = deps.toolService.createRunContext({
+      runKind: 'probe',
+      outputRoot: '/nonexistent',
+      knowledgeBaseRoot: '/nonexistent',
+    });
+    try {
+      return await probeAvailableModels({
+        runtime,
+        config,
+        dataRoot: resolveDataRoot(),
+        internalBaseUrl: `http://127.0.0.1:${port}`,
+        registerProbeContext: () => token,
+        revokeProbeContext: (used) => deps.toolService.revokeToken(used),
+      });
+    } catch {
+      deps.toolService.revokeToken(token);
+      return null;
+    }
+  };
+
+  routes.get('/api/agent/status', async (c) => {
+    try {
+      const config = await configManager.load();
+      const status = await resolver.checkReadiness(
+        {
+          agentConfig: config.agent,
+          llmConfig: config.llm,
+          runningProcesses: pool.runningCount(),
+        },
+        buildModelProbe(config),
+      );
+      const { piPackageRoot: _ignored, ...dto } = status.runtime;
+      return c.json({
+        ...status,
+        runtime: dto,
+        processes: { running: pool.runningCount(), max: pool.max },
+      });
+    } catch (error) {
+      return errorResponse(c, error);
+    }
+  });
+
+  routes.post('/api/agent/status/recheck', async (c) => {
+    try {
+      resolver.invalidate();
+      const config = await configManager.load();
+      const status = await resolver.checkReadiness(
+        {
+          agentConfig: config.agent,
+          llmConfig: config.llm,
+          runningProcesses: pool.runningCount(),
+        },
+        buildModelProbe(config),
+      );
+      const { piPackageRoot: _ignored, ...dto } = status.runtime;
+      return c.json({ ...status, runtime: dto });
+    } catch (error) {
+      return errorResponse(c, error);
+    }
+  });
+
+  // ------------------------------------------------------------------
+  // 会话
+  // ------------------------------------------------------------------
+
+  routes.get('/api/agent/sessions', async (c) => {
+    const config = await configManager.load();
+    return c.json({ sessions: sessionService.list(localMapStore, config) });
+  });
+
+  routes.post('/api/agent/sessions', async (c) => {
+    try {
+      let body: { title?: string; mode?: string } = {};
+      try {
+        body = await c.req.json() as { title?: string; mode?: string };
+      } catch {
+        /* 空 body 合法 */
+      }
+      const session = sessionService.create(localMapStore, body);
+      return c.json(session, 201);
+    } catch (error) {
+      return errorResponse(c, error);
+    }
+  });
+
+  routes.get('/api/agent/sessions/:id', async (c) => {
+    const config = await configManager.load();
+    const session = sessionService.get(localMapStore, config, c.req.param('id'));
+    if (!session) return c.json({ error: 'session_not_found', message: '会话不存在' }, 404);
+    return c.json(session);
+  });
+
+  routes.patch('/api/agent/sessions/:id', async (c) => {
+    try {
+      const body = await c.req.json() as { title?: string };
+      const session = await sessionService.rename(localMapStore, c.req.param('id'), String(body.title ?? ''));
+      if (!session) return c.json({ error: 'session_not_found', message: '会话不存在' }, 404);
+      return c.json(session);
+    } catch (error) {
+      return errorResponse(c, error);
+    }
+  });
+
+  routes.delete('/api/agent/sessions/:id', async (c) => {
+    try {
+      const ok = await sessionService.delete(localMapStore, c.req.param('id'));
+      if (!ok) return c.json({ error: 'session_not_found', message: '会话不存在' }, 404);
+      return c.json({ ok: true });
+    } catch (error) {
+      return errorResponse(c, error);
+    }
+  });
+
+  routes.get('/api/agent/sessions/:id/messages', (c) => {
+    try {
+      const messages = sessionService.messages(localMapStore, c.req.param('id'));
+      return c.json({ messages });
+    } catch (error) {
+      return errorResponse(c, error);
+    }
+  });
+
+  routes.post('/api/agent/sessions/:id/messages', async (c) => {
+    try {
+      const body = await c.req.json() as { text?: string; delivery?: string };
+      const result = await sessionService.sendMessage(localMapStore, c.req.param('id'), {
+        text: String(body.text ?? ''),
+        delivery: body.delivery,
+      });
+      return c.json(result, 202);
+    } catch (error) {
+      return errorResponse(c, error);
+    }
+  });
+
+  routes.post('/api/agent/sessions/:id/abort', async (c) => {
+    try {
+      const session = await sessionService.abort(localMapStore, c.req.param('id'));
+      if (!session) return c.json({ error: 'session_not_found', message: '会话不存在' }, 404);
+      return c.json(session);
+    } catch (error) {
+      return errorResponse(c, error);
+    }
+  });
+
+  routes.post('/api/agent/sessions/:id/mode', async (c) => {
+    try {
+      const body = await c.req.json() as { mode?: string; workspaceId?: string; confirm?: string };
+      const session = await sessionService.switchMode(localMapStore, c.req.param('id'), body);
+      if (!session) return c.json({ error: 'session_not_found', message: '会话不存在' }, 404);
+      return c.json(session);
+    } catch (error) {
+      return errorResponse(c, error);
+    }
+  });
+
+  // 会话 SSE
+  routes.get('/api/agent/sessions/:id/events', (c) => {
+    const sessionId = c.req.param('id');
+    const lastEventHeader = c.req.header('Last-Event-ID');
+    const lastEventId = lastEventHeader !== undefined && /^-?\d+$/.test(lastEventHeader)
+      ? Number.parseInt(lastEventHeader, 10)
+      : null;
+    const initial = sessionService.sseSince(sessionId, lastEventId);
+    return streamSSE(c, async (stream) => {
+      let lastSeq = initial.events.length > 0 ? initial.events[initial.events.length - 1].id : (lastEventId ?? 0);
+      if (initial.resync) {
+        const latest = sessionService.sseSince(sessionId, null).events;
+        lastSeq = latest.length > 0 ? latest[latest.length - 1].id : 0;
+        await stream.writeSSE({ id: String(lastSeq), event: 'resync', data: '{}' });
+      } else {
+        for (const record of initial.events) {
+          await stream.writeSSE({ id: String(record.id), event: record.event, data: JSON.stringify(record.data) });
+        }
+      }
+      // 订阅后续事件（事件驱动 + 15s 心跳保活）
+      const closed = { value: false };
+      const wake = { resolve: null as null | (() => void) };
+      const listener = (payload: { sessionId: string }) => {
+        if (payload.sessionId !== sessionId) return;
+        wake.resolve?.();
+      };
+      sessionService.on('sse', listener);
+      stream.onAbort(() => {
+        closed.value = true;
+        sessionService.off('sse', listener);
+        wake.resolve?.();
+      });
+      while (!closed.value) {
+        const pending = sessionService.sseSince(sessionId, lastSeq);
+        if (pending.resync) {
+          const latest = sessionService.sseSince(sessionId, null).events;
+          lastSeq = latest.length > 0 ? latest[latest.length - 1].id : 0;
+          await stream.writeSSE({ id: String(lastSeq), event: 'resync', data: '{}' });
+          continue;
+        }
+        for (const record of pending.events) {
+          await stream.writeSSE({ id: String(record.id), event: record.event, data: JSON.stringify(record.data) });
+          lastSeq = record.id;
+        }
+        // 写入期间可能又到新事件；立即检查下一批，避免漏唤醒后等 15 秒心跳。
+        if (pending.events.length > 0) continue;
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, 15_000);
+          timer.unref?.();
+          wake.resolve = () => {
+            clearTimeout(timer);
+            resolve();
+          };
+        });
+        wake.resolve = null;
+        await stream.writeSSE({ event: 'ping', data: '{}' }).catch(() => undefined);
+      }
+    });
+  });
+
+  // ------------------------------------------------------------------
+  // Workspace
+  // ------------------------------------------------------------------
+
+  routes.get('/api/agent/workspaces', async (c) => {
+    const config = await configManager.load();
+    return c.json({ workspaces: config.agent.workspaces });
+  });
+
+  routes.post('/api/agent/workspaces', async (c) => {
+    try {
+      const body = await c.req.json() as { name?: string; path?: string };
+      const name = String(body.name ?? '').trim();
+      if (!name || name.length > 80) {
+        return c.json({ error: 'workspace_path_invalid', message: '名称长度必须在 1..80' }, 400);
+      }
+      const config = await configManager.load();
+      const candidate = String(body.path ?? '').trim();
+      // 受保护运行资源（F3-R01）：应用完整运行依赖树（server 源码/构建
+      // 产物、根目录与子包 node_modules、electron/、dist-electron、Electron
+      // 打包资源）、pi 凭据目录（~/.pi/agent + PI_CODING_AGENT_DIR）、外部
+      // Node 安装根与 pi 包根——ws_write 触达任一即可改写下次 spawn 的
+      // 代码/二进制。发现失败时静态保护根仍生效（resolver 的错误在 spawn
+      // 时另有明确报错）。
+      const protectedRoots: string[] = [...collectStaticProtectedRoots()];
+      try {
+        await resolver.resolveRuntime(config.agent);
+      } catch {
+        /* 主三重 guard + 静态保护根仍生效 */
+      }
+      protectedRoots.push(...collectResolvedRuntimeProtectedRoots(resolver));
+      const guards = {
+        knowledgeBaseRoot: config.knowledgeBaseRoot,
+        outputRoot: config.standardKb.outputRoot,
+        dataRoot: resolveDataRoot(),
+        protectedRoots,
+      };
+      const verdict = validateWorkspacePath(candidate, guards);
+      if (!verdict.ok) {
+        return c.json({ error: verdict.code, message: verdict.message }, 400);
+      }
+      const workspace: AgentWorkspaceConfig = {
+        id: `ws_${crypto.randomBytes(6).toString('hex')}`,
+        name,
+        path: verdict.realPath,
+        createdAt: new Date().toISOString(),
+      };
+      await configManager.updateConfig({
+        agent: { ...config.agent, workspaces: [...config.agent.workspaces, workspace] },
+      });
+      return c.json(workspace, 201);
+    } catch (error) {
+      return errorResponse(c, error);
+    }
+  });
+
+  routes.delete('/api/agent/workspaces/:id', async (c) => {
+    const id = c.req.param('id');
+    const config = await configManager.load();
+    const workspace = config.agent.workspaces.find((candidate) => candidate.id === id);
+    if (!workspace) {
+      return c.json({ error: 'workspace_not_found', message: 'Workspace 不存在' }, 404);
+    }
+    // 绑定的 Work 会话切回 discuss
+    await sessionService.demoteSessionsOnWorkspaceRemoval(localMapStore, id);
+    await configManager.updateConfig({
+      agent: {
+        ...config.agent,
+        workspaces: config.agent.workspaces.filter((candidate) => candidate.id !== id),
+      },
+    });
+    return c.json({ ok: true });
+  });
+
+  return routes;
+}

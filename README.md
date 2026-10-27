@@ -12,6 +12,8 @@
 
 ---
 
+> **开发分支预览**：本分支另含 [Agent 标准知识库工作台](./docs/agent-knowledge.md)：原始库只读整理、可追溯阅读、Discuss/Work 会话及只读 MCP。尚未发版且安全复审未通过，勿对正式资料启用 Work；现有 v0.3.47 安装包不含这些新入口。
+
 ## 下载与安装
 
 从 [GitHub Releases](https://github.com/runrunrain/feishu-sync/releases/latest) 下载对应平台安装包：
@@ -55,6 +57,7 @@
 - **数据**：better-sqlite3 12（SQLite，documents/sync_log/run_log 主表 + localDirs/custom_folders 等辅助表，启动时 additive 迁移原地升级）
 - **LLM**：OpenAI SDK → 智谱 bigmodel GLM（OpenAI 兼容端点，默认 `glm-4-flash`）
 - **飞书**：lark-cli（实测 1.0.89；认证、变更检测、内容读取、媒体下载统一入口；工具不保存飞书 token）
+- **Agent（开发分支）**：外部 Node ≥22.19 + pi ≥1.4/<2 的 RPC 侧车；独立只读 MCP stdio 产物
 - **开发**：TypeScript 5 + esbuild 0.28
 
 ---
@@ -334,6 +337,7 @@ feishu-sync/
 ## 开发文档导航
 
 - [docs/](./docs/README.md) —— 开发文档宗引（架构 / 开发 / 测试 / 数据契约 / 运维）
+- [Agent 标准知识库工作台](./docs/agent-knowledge.md) —— 开发分支的配置、构建、权限与 MCP 使用说明
 - [CHANGELOG.md](./CHANGELOG.md) —— 版本化变更记录（Release 说明同源）
 - [CLAUDE.md](./CLAUDE.md) —— 仓库工程约定（架构 gotcha、命令、安全红线、原生模块 ABI）
 - 各模块头部注释 —— 大量「P0-Qx 实测 / 实测 confirmed / 历史教训」标注记录设计动机

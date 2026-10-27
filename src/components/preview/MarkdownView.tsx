@@ -45,6 +45,60 @@ function isRemoteUrl(src: string): boolean {
   return /^https?:\/\//i.test(src);
 }
 
+// ---------------------------------------------------------------------------
+// 链接协议白名单（F2 安全修复：不可信内容防 javascript:/data: 等注入）
+// ---------------------------------------------------------------------------
+
+/** 允许外链的协议白名单（https/http 外部导航 + mailto 邮件）。 */
+const HREF_PROTOCOL_ALLOWLIST = new Set(['http:', 'https:', 'mailto:']);
+
+/**
+ * 净化不可信 Markdown/HTML 里的链接 href。
+ *
+ * 输入可能是同步产物、标准库 AI 生成文档或 Agent 输出——全部按不可信
+ * 文本对待。规则（Leader 审查修正）：
+ *   1. 先做 HTML 实体解码（`&#106;avascript:` 实体混淆）；
+ *   2. 剥离 C0/DEL 字符并去首尾空白；协议探测额外忽略内部空格，保留合法相对文件名空格；
+ *   3. 解析出 scheme（`^[a-z][a-z0-9+.-]*:`，含 `//` 形式）；
+ *   4. scheme 不在白名单 → 返回 null；无 scheme（相对路径/锚点）→ 放行
+ *      （相对路径在本应用内不会执行脚本，`.csv` 相对导航由上层拦截）。
+ *
+ * 返回净化后的 href（原始非空白的字符串，实体已解码）；拒绝时返回 null，
+ * 调用方降级为纯文本展示，不渲染 <a>。
+ */
+export function sanitizeHref(raw: string): string | null {
+  if (!raw) return null;
+  // 1) 实体解码（markdown 源可能携带；重复解码是幂等安全的展示层行为）。
+  //    另移除空白类命名实体（&Tab;/&NewLine; 等，decodeHtmlEntities 不覆盖）
+  //    ——它们等效于控制字符切片绕过（java&Tab;script:）。
+  let href = decodeHtmlEntities(raw).replace(/&(tab|newline|nonbreakingspace);/gi, '');
+  // 2) 剥离控制字符与内部空白（防止 scheme 解析被切片绕过）
+  // C0/control 字符浏览器会忽略；普通内部空格属于合法文件名，不能把「经济 模型.csv」改名。
+  href = href.replace(/[\x00-\x1f\x7f]+/g, '').trim();
+  if (!href) return null;
+  // 3) scheme 解析：形如 scheme: 或 //host
+  const probe = href.replace(/ /g, '');
+  const schemeMatch = /^([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(probe);
+  if (schemeMatch) {
+    const actualScheme = /^([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(href);
+    return actualScheme && HREF_PROTOCOL_ALLOWLIST.has(actualScheme[1].toLowerCase() + ':') ? href : null;
+  }
+  if (probe.replace(/\\/g, '/').startsWith('//')) return null; // 包含浏览器视作 // 的反斜杠混合形式
+  return href; // 相对路径 / 锚点
+}
+
+/** 链接被拦截时的降级展示（可读、可解释，不伪装成可点击）。 */
+function BlockedLink({ label }: { label: React.ReactNode }) {
+  return (
+    <span
+      className="text-ink-faint underline decoration-dotted cursor-not-allowed"
+      title="已拦截：链接协议不被允许"
+    >
+      {label}
+    </span>
+  );
+}
+
 function looksLikeLocalMedia(src: string): boolean {
   return (
     !isRemoteUrl(src) &&
@@ -96,6 +150,15 @@ interface AuthImageProps {
   alt: string;
   /** md 文件所在目录（kbRoot 相对），用于解析相对 src。 */
   baseDir: string;
+  /**
+   * 远程图片策略（F2 安全修复）：
+   *   - 'auto'：旧行为，远程 URL 直接交给 <img> 自动加载（既有预览面兼容）；
+   *   - 'confirm'：不可信内容默认不自动加载外部图片（防止把源内容
+   *     编码进 URL 经浏览器外发），渲染占位卡片，用户点击后本次加载。
+   * 本地受认证资源（kbRoot 相对路径）不受此策略影响——它们只经唯一
+   * API 出口（getMediaBlobUrl）取本机服务，不携带凭据到远程。
+   */
+  remotePolicy?: 'auto' | 'confirm';
 }
 
 export function resolveMediaPath(src: string, baseDir: string): string {
@@ -115,13 +178,23 @@ export function resolveMediaPath(src: string, baseDir: string): string {
   return stack.join('/');
 }
 
-function AuthImage({ src, alt, baseDir }: AuthImageProps) {
+/** 授权只对当前 URL 生效，组件复用或文档切换不能把上一次点击授权转给另一资源。 */
+export function needsRemoteImageConsent(src: string, policy: 'auto' | 'confirm', authorizedSrc: string | null): boolean {
+  return isRemoteUrl(src) && policy === 'confirm' && authorizedSrc !== src;
+}
+
+function AuthImage({ src, alt, baseDir, remotePolicy = 'auto' }: AuthImageProps) {
   const [blobUrl, setBlobUrl] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
   const [failureDetail, setFailureDetail] = useState<string>('');
+  const [authorizedRemoteSrc, setAuthorizedRemoteSrc] = useState<string | null>(null);
 
   useEffect(() => {
+    setFailed(false);
+    setFailureDetail('');
     if (isRemoteUrl(src)) {
+      // 远程 URL：直接交给 <img>，不经任何鉴权 fetch —— 永不把
+      // X-Desktop-Token 附到远程请求（安全不变量，勿改为 fetch+headers）。
       setBlobUrl(src);
       return;
     }
@@ -151,6 +224,30 @@ function AuthImage({ src, alt, baseDir }: AuthImageProps) {
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   }, [src, baseDir]);
+
+  // 远程图片且策略为 confirm 且未授权：占位，不自动加载（不发起任何请求）。
+  // 注意：所有 hooks 必须在本分支之前调用完毕（条件 return 不能早于 hook）。
+  if (needsRemoteImageConsent(src, remotePolicy, authorizedRemoteSrc)) {
+    let host = src;
+    try {
+      host = new URL(src).host;
+    } catch {
+      /* 保留原文 */
+    }
+    return (
+      <span className="my-2 flex items-center gap-2 rounded-md border border-dashed border-line bg-paper-2/50 px-3 py-3 text-xs text-ink-faint">
+        <ImageIcon className="w-4 h-4 shrink-0" />
+        <span className="min-w-0">外部图片（{host}）不会自动加载</span>
+        <button
+          type="button"
+          onClick={() => setAuthorizedRemoteSrc(src)}
+          className="shrink-0 px-2 py-0.5 rounded-sm border border-jade/40 text-jade hover:bg-jade/10 transition-colors"
+        >
+          点击加载
+        </button>
+      </span>
+    );
+  }
 
   if (failed) {
     return (
@@ -207,6 +304,8 @@ interface InlineContext {
   baseDir: string;
   onNavigateCsv?: (href: string) => boolean;
   feishuHost?: string;
+  /** 远程图片策略（见 AuthImageProps.remotePolicy）；默认 'auto' 保留旧行为。 */
+  remoteImages?: 'auto' | 'confirm';
 }
 
 export function renderInline(text: string, keyPrefix: string, ctx: InlineContext): ReactNode[] {
@@ -225,33 +324,48 @@ export function renderInline(text: string, keyPrefix: string, ctx: InlineContext
       const close = token.indexOf('](');
       const alt = unescapeInline(token.slice(2, close));
       const src = token.slice(close + 2, -1);
-      out.push(<AuthImage key={key} src={src} alt={alt} baseDir={ctx.baseDir} />);
+      out.push(
+        <AuthImage
+          key={key}
+          src={src}
+          alt={alt}
+          baseDir={ctx.baseDir}
+          remotePolicy={ctx.remoteImages ?? 'auto'}
+        />,
+      );
     } else if (token.startsWith('[')) {
-      // 2. Markdown 链接
+      // 2. Markdown 链接（协议白名单：拒绝 javascript:/data:/vbscript: 与
+      //    实体/控制字符混淆；拒绝时降级为纯文本，不渲染 <a>）
       const close = token.indexOf('](');
       const label = unescapeInline(token.slice(1, close));
-      const href = token.slice(close + 2, -1);
-      const isCsv = !isRemoteUrl(href) && href.split(/[?#]/)[0].toLowerCase().endsWith('.csv');
-      out.push(
-        <a
-          key={key}
-          href={href}
-          target={isCsv ? undefined : '_blank'}
-          rel={isCsv ? undefined : 'noopener noreferrer'}
-          onClick={(e) => {
-            if (isCsv && ctx.onNavigateCsv) {
-              const handled = ctx.onNavigateCsv(href);
-              if (handled) {
-                e.preventDefault();
-                e.stopPropagation();
+      const rawHref = token.slice(close + 2, -1);
+      const safeHref = sanitizeHref(rawHref);
+      if (!safeHref) {
+        out.push(<BlockedLink key={key} label={label} />);
+      } else {
+        const isCsv =
+          !isRemoteUrl(safeHref) && safeHref.split(/[?#]/)[0].toLowerCase().endsWith('.csv');
+        out.push(
+          <a
+            key={key}
+            href={safeHref}
+            target={isCsv ? undefined : '_blank'}
+            rel={isCsv ? undefined : 'noopener noreferrer'}
+            onClick={(e) => {
+              if (isCsv && ctx.onNavigateCsv) {
+                const handled = ctx.onNavigateCsv(safeHref);
+                if (handled) {
+                  e.preventDefault();
+                  e.stopPropagation();
+                }
               }
-            }
-          }}
-          className="text-jade hover:text-seal underline underline-offset-2 decoration-line hover:decoration-seal transition-colors cursor-pointer"
-        >
-          {label}
-        </a>,
-      );
+            }}
+            className="text-jade hover:text-seal underline underline-offset-2 decoration-line hover:decoration-seal transition-colors cursor-pointer"
+          >
+            {label}
+          </a>,
+        );
+      }
     } else if (token.startsWith('**')) {
       // 3. Markdown 粗体
       out.push(
@@ -343,33 +457,37 @@ export function renderInline(text: string, keyPrefix: string, ctx: InlineContext
         </code>,
       );
     } else if (/^<a\b/i.test(token)) {
-      // 12. HTML 链接
+      // 12. HTML 链接（同一协议白名单；实体/控制字符混淆在此一并拦截）
       const hrefM = token.match(/\bhref=(?:"([^"]*)"|'([^']*)'|([^\\s>]+))/i);
       const rawHref = hrefM ? hrefM[1] ?? hrefM[2] ?? hrefM[3] ?? '' : '';
-      const href = decodeHtmlEntities(rawHref);
-      const safeHref = /^javascript:/i.test(href.trim()) ? '#' : href;
-      const isCsv = !isRemoteUrl(safeHref) && safeHref.split(/[?#]/)[0].toLowerCase().endsWith('.csv');
+      const safeHref = sanitizeHref(rawHref);
       const inner = token.replace(/^<a\b[^>]*>/i, '').replace(/<\/a>$/i, '');
-      out.push(
-        <a
-          key={key}
-          href={safeHref}
-          target={isCsv ? undefined : '_blank'}
-          rel={isCsv ? undefined : 'noopener noreferrer'}
-          onClick={(e) => {
-            if (isCsv && ctx.onNavigateCsv) {
-              const handled = ctx.onNavigateCsv(safeHref);
-              if (handled) {
-                e.preventDefault();
-                e.stopPropagation();
+      if (!safeHref) {
+        out.push(<BlockedLink key={key} label={renderInline(inner, `${key}-a`, ctx)} />);
+      } else {
+        const isCsv =
+          !isRemoteUrl(safeHref) && safeHref.split(/[?#]/)[0].toLowerCase().endsWith('.csv');
+        out.push(
+          <a
+            key={key}
+            href={safeHref}
+            target={isCsv ? undefined : '_blank'}
+            rel={isCsv ? undefined : 'noopener noreferrer'}
+            onClick={(e) => {
+              if (isCsv && ctx.onNavigateCsv) {
+                const handled = ctx.onNavigateCsv(safeHref);
+                if (handled) {
+                  e.preventDefault();
+                  e.stopPropagation();
+                }
               }
-            }
-          }}
-          className="text-jade hover:text-seal underline underline-offset-2 decoration-line hover:decoration-seal transition-colors cursor-pointer"
-        >
-          {renderInline(inner, `${key}-a`, ctx)}
-        </a>,
-      );
+            }}
+            className="text-jade hover:text-seal underline underline-offset-2 decoration-line hover:decoration-seal transition-colors cursor-pointer"
+          >
+            {renderInline(inner, `${key}-a`, ctx)}
+          </a>,
+        );
+      }
     } else if (/^<span\b/i.test(token)) {
       // 13. HTML span
       const inner = token.replace(/^<span\b[^>]*>/i, '').replace(/<\/span>$/i, '');
@@ -806,6 +924,13 @@ export interface MarkdownViewProps {
   onNavigateCsv?: (href: string) => boolean;
   /** 飞书租户域名（如 "qcnbafdrjx7n.feishu.cn"），用于生成并打开 wiki 超链接。 */
   feishuHost?: string;
+  /**
+   * 远程图片策略（F2 安全修复，不可信内容必设 'confirm'）：
+   *   - 'auto'（默认）：远程图片自动加载（既有预览面兼容行为）；
+   *   - 'confirm'：不自动加载外部图片（渲染占位卡片，点击授权后加载）。
+   * 标准库 AI 生成文档、原始库文档、Agent 输出等不可信入口应传 'confirm'。
+   */
+  remoteImages?: 'auto' | 'confirm';
 }
 
 export function MarkdownView({
@@ -813,9 +938,10 @@ export function MarkdownView({
   baseDir = '',
   onNavigateCsv,
   feishuHost,
+  remoteImages = 'auto',
 }: MarkdownViewProps) {
   const blocks = parseBlocks(preprocess(content));
-  const ctx: InlineContext = { baseDir, onNavigateCsv, feishuHost };
+  const ctx: InlineContext = { baseDir, onNavigateCsv, feishuHost, remoteImages };
   return (
     <div className="px-5 py-4">
       {blocks.map((b, i) => (

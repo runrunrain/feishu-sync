@@ -24,6 +24,19 @@ import type {
   AddLinkToFolderResult,
   DocumentContent,
 } from '../types';
+import type {
+  AgentMessageDto,
+  AgentSessionDto,
+  AgentStatusDto,
+  AgentWorkspaceConfig,
+  KbBuildDto,
+  KbBuildReportDto,
+  KbDocDto,
+  KbMcpInfoDto,
+  KbSearchResult,
+  KbStatusDto,
+  KbTreeNode,
+} from '../types/agent';
 import { emitDiffChanged } from '../utils/syncEvents';
 
 class APIError extends Error {
@@ -53,6 +66,19 @@ async function getApiHeaders(): Promise<Record<string, string>> {
 
   // Development fallback: proxy through Vite
   return {};
+}
+
+/**
+ * F2 SSE 专用：一次性取得鉴权头与 baseUrl，供 SseConnection 在每次
+ * （重）连接时重新获取（token 可能轮换）。EventSource 无法携带
+ * X-Desktop-Token，因此 SSE 一律走 fetch 流（utils/sseStream.ts）。
+ */
+export async function getSseAuth(): Promise<{
+  headers: Record<string, string>;
+  baseUrl: string;
+}> {
+  const [headers, baseUrl] = await Promise.all([getApiHeaders(), getBaseUrl()]);
+  return { headers, baseUrl };
 }
 
 /**
@@ -971,3 +997,195 @@ export async function cleanupOrphanFiles(
     body: JSON.stringify({ items, confirmation }),
   });
 }
+
+// ============================================================================
+// Agent 标准知识库 / 会话 API（F2，契约 docs/design/agent-knowledge-design.md §9）
+// ============================================================================
+//
+// 与 F1 后端并行开发：本节函数按公共契约实现；服务端未就绪时调用方会收到
+// APIError（404 等）并按各视图的不可达/错误状态呈现，不做假成功。
+// 秘密约束（§13-5）：任何 DTO 不含 apiKey / 运行令牌 / desktop token。
+
+/** GET /api/agent/status —— pi 运行时与模型就绪诊断（§9.1）。 */
+export async function getAgentStatus(): Promise<AgentStatusDto> {
+  return request<AgentStatusDto>('/api/agent/status', { timeoutMs: 30_000 });
+}
+
+/** POST /api/agent/status/recheck —— 重新发现与探测（不消耗模型额度）。 */
+export async function recheckAgentStatus(): Promise<AgentStatusDto> {
+  return request<AgentStatusDto>('/api/agent/status/recheck', {
+    method: 'POST',
+    body: JSON.stringify({}),
+    timeoutMs: 60_000,
+  });
+}
+
+/** GET /api/kb/status —— 发布状态 + 待处理变更 + 活跃构建（§9.2）。 */
+export async function getKbStatus(): Promise<KbStatusDto> {
+  return request<KbStatusDto>('/api/kb/status');
+}
+
+/** GET /api/kb/tree —— 发布目录树；未发布抛 APIError(404 kb_not_published)。 */
+export async function getKbTree(): Promise<{ releaseId: string; nodes: KbTreeNode[] }> {
+  return request<{ releaseId: string; nodes: KbTreeNode[] }>('/api/kb/tree');
+}
+
+/** GET /api/kb/docs/:docId —— 标准文档正文 + 来源状态（§9.2）。 */
+export async function getKbDoc(docId: string): Promise<KbDocDto> {
+  return request<KbDocDto>(`/api/kb/docs/${encodeURIComponent(docId)}`);
+}
+
+/** GET /api/kb/search?q= —— 标题/正文子串检索（q 1..200 字符）。 */
+export async function searchKb(
+  q: string,
+  limit = 20,
+): Promise<{ releaseId: string; results: KbSearchResult[] }> {
+  const qs = new URLSearchParams({ q, limit: String(limit) });
+  return request(`/api/kb/search?${qs.toString()}`);
+}
+
+/** POST /api/kb/builds —— 触发构建（需 confirm:'BUILD'；§6.6 手动触发）。 */
+export async function createKbBuild(
+  mode: 'incremental' | 'full',
+): Promise<KbBuildDto> {
+  return request<KbBuildDto>('/api/kb/builds', {
+    method: 'POST',
+    body: JSON.stringify({ mode, confirm: 'BUILD' }),
+  });
+}
+
+/** GET /api/kb/builds —— 构建历史（默认最近 20 条）。 */
+export async function listKbBuilds(limit = 20): Promise<{ builds: KbBuildDto[] }> {
+  return request<{ builds: KbBuildDto[] }>(`/api/kb/builds?limit=${limit}`);
+}
+
+/** GET /api/kb/builds/:id —— 单次构建 + 校验报告（含失败 issues）。 */
+export async function getKbBuild(id: string): Promise<KbBuildDto & { report?: KbBuildReportDto }> {
+  return request<KbBuildDto & { report?: KbBuildReportDto }>(
+    `/api/kb/builds/${encodeURIComponent(id)}`,
+  );
+}
+
+/** POST /api/kb/builds/:id/cancel —— 取消进行中的构建（幂等友好）。 */
+export async function cancelKbBuild(id: string): Promise<KbBuildDto> {
+  return request<KbBuildDto>(`/api/kb/builds/${encodeURIComponent(id)}/cancel`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
+/** GET /api/kb/mcp —— 外部 MCP 连接信息（§9.5，供设置页复制）。 */
+export async function getKbMcpInfo(): Promise<KbMcpInfoDto> {
+  return request<KbMcpInfoDto>('/api/kb/mcp');
+}
+
+// ---------------------------------------------------------------------------
+// 会话（§9.3）
+// ---------------------------------------------------------------------------
+
+/** GET /api/agent/sessions —— 按 updatedAt 倒序，不含已删除。 */
+export async function listAgentSessions(): Promise<AgentSessionDto[]> {
+  const data = await request<{ sessions: AgentSessionDto[] }>('/api/agent/sessions');
+  return data.sessions ?? [];
+}
+
+/** POST /api/agent/sessions —— 新建只允许 discuss；Work 经模式切换进入。 */
+export async function createAgentSession(title?: string): Promise<AgentSessionDto> {
+  return request<AgentSessionDto>('/api/agent/sessions', {
+    method: 'POST',
+    body: JSON.stringify({ mode: 'discuss', ...(title ? { title } : {}) }),
+  });
+}
+
+export async function getAgentSession(id: string): Promise<AgentSessionDto> {
+  return request<AgentSessionDto>(`/api/agent/sessions/${encodeURIComponent(id)}`);
+}
+
+/** PATCH /api/agent/sessions/:id —— 重命名（title 1..80 字符）。 */
+export async function renameAgentSession(id: string, title: string): Promise<AgentSessionDto> {
+  return request<AgentSessionDto>(`/api/agent/sessions/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ title }),
+  });
+}
+
+/** DELETE /api/agent/sessions/:id —— 停进程 + JSONL 归档 + DB 软删。 */
+export async function deleteAgentSession(id: string): Promise<{ ok: true }> {
+  return request<{ ok: true }>(`/api/agent/sessions/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  });
+}
+
+/** GET /api/agent/sessions/:id/messages —— 权威全量历史（resync 拉取用）。 */
+export async function getAgentSessionMessages(id: string): Promise<AgentMessageDto[]> {
+  const data = await request<{ messages: AgentMessageDto[] }>(
+    `/api/agent/sessions/${encodeURIComponent(id)}/messages`,
+  );
+  return data.messages ?? [];
+}
+
+/**
+ * POST /api/agent/sessions/:id/messages —— 发送消息。
+ * 运行中再发需带 delivery:'steer'|'followUp'（否则 409 session_busy）。
+ */
+export async function sendAgentMessage(
+  id: string,
+  body: { text: string; delivery?: 'steer' | 'followUp' },
+): Promise<{ accepted: true; runId: string }> {
+  return request<{ accepted: true; runId: string }>(
+    `/api/agent/sessions/${encodeURIComponent(id)}/messages`,
+    { method: 'POST', body: JSON.stringify(body) },
+  );
+}
+
+/** POST /api/agent/sessions/:id/abort —— 停止当前运行。 */
+export async function abortAgentSession(id: string): Promise<AgentSessionDto> {
+  return request<AgentSessionDto>(`/api/agent/sessions/${encodeURIComponent(id)}/abort`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
+/**
+ * POST /api/agent/sessions/:id/mode —— 模式切换。
+ * 切到 Work 必须带 workspaceId + confirm:'WORK'（§7.6）。
+ */
+export async function switchAgentSessionMode(
+  id: string,
+  body: { mode: 'discuss' } | { mode: 'work'; workspaceId: string; confirm: 'WORK' },
+): Promise<AgentSessionDto> {
+  return request<AgentSessionDto>(`/api/agent/sessions/${encodeURIComponent(id)}/mode`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Workspace（§9.4）
+// ---------------------------------------------------------------------------
+
+/** GET /api/agent/workspaces —— Work 会话可绑定的授权目录列表。 */
+export async function listAgentWorkspaces(): Promise<AgentWorkspaceConfig[]> {
+  const data = await request<{ workspaces: AgentWorkspaceConfig[] }>('/api/agent/workspaces');
+  return data.workspaces ?? [];
+}
+
+/** POST /api/agent/workspaces —— 新增；路径合法性由后端校验（§7.3）。 */
+export async function addAgentWorkspace(body: {
+  name: string;
+  path: string;
+}): Promise<AgentWorkspaceConfig> {
+  return request<AgentWorkspaceConfig>('/api/agent/workspaces', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+/** DELETE /api/agent/workspaces/:id —— 绑定它的 Work 会话被切回 discuss。 */
+export async function deleteAgentWorkspace(id: string): Promise<{ ok: true }> {
+  return request<{ ok: true }>(`/api/agent/workspaces/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  });
+}
+
+export { type AgentMessageDto, type AgentSessionDto, type AgentStatusDto };

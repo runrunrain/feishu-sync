@@ -1,9 +1,9 @@
 /**
- * TopBar - 顶部条（T2 R2.1-AC1/AC2，04 §2.3）
+ * TopBar - 顶部条（T2 R2.1-AC1/AC2，04 §2.3；F2 增「标准库」「对话」）
  *
  * 高度 50px。结构：
  *   左：印章 logo + 标题 + 版本号按钮
- *   中：3 主区导航（壹总览 / 贰同步 / 叁设置），楷体序号 + sans 标签
+ *   中：5 主区导航（壹总览 / 贰同步 / 叁标准库 / 肆对话 / 伍设置）
  *   右：新版本更新入口（仅在有更新时显示）
  *
  * 决策：原 6 Tab 全部并入 3 主区；TopBar 右侧与 GlobalStatusBar 信息去重，
@@ -16,7 +16,7 @@ import { AppVersionButton } from './AppVersionButton';
 // 构建时由 vite 注入（package.json version），顶部栏版本徽标与「关于与更新」保持一致。
 declare const __APP_VERSION__: string;
 
-export type MainArea = 'overview' | 'sync' | 'settings';
+export type MainArea = 'overview' | 'sync' | 'knowledge' | 'agent' | 'settings';
 
 interface TopBarProps {
   currentArea: MainArea;
@@ -28,7 +28,9 @@ interface TopBarProps {
 const NAV_ITEMS: { id: MainArea; ordinal: string; label: string }[] = [
   { id: 'overview', ordinal: '壹', label: '总览' },
   { id: 'sync', ordinal: '贰', label: '同步' },
-  { id: 'settings', ordinal: '叁', label: '设置' },
+  { id: 'knowledge', ordinal: '叁', label: '标准库' },
+  { id: 'agent', ordinal: '肆', label: '对话' },
+  { id: 'settings', ordinal: '伍', label: '设置' },
 ];
 
 export function TopBar({ currentArea, onAreaChange, updateVersion }: TopBarProps) {

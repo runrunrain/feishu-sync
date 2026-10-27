@@ -30,3 +30,25 @@
 - CI：push(main)/PR 自动执行同样检查 + 构建冒烟（`.github/workflows/ci.yml`）。
 - 前端 UI 改动：测试之外必须真机浏览器/Electron 交互验证（项目安全红线）。
 - 桌面打包链：仅 release workflow 覆盖（tag 触发），日常 CI 不打包。
+
+## Agent 工作台的证据分层
+
+| 层 | 能证明什么 | 不能替代什么 |
+|---|---|---|
+| 算法/内存单测 | 路径、集合、覆盖、状态分支和边界输入 | 实际路由派生的保护根、进程回收、UI接线 |
+| 本地协议fixture | provider注册、环境变量、请求/流格式及受控并发 | 真实模型可调用、真实内容质量 |
+| 真实pi RPC | 扩展装载、命令白名单、JSONL和工具规格 | 未发prompt时不能证明模型生成成功 |
+| 临时资料的真实模型往返 | 本应用工具确实读取/写入及实际构建发布 | 生产知识库、大库性能或全部提供商兼容性 |
+| 真实浏览器/桌面 | 实际UI、fetch SSE、权限确认与失败反馈 | 不能凭绿色状态或截图文字断言文件/DB已正确提交 |
+
+重点回归入口：server的`path-guard`、`agent-config`、`agent-internal-auth`、`agent-session`、`agent-status-regression`、`kb-build`、`mcp-kb`、`pi-probe`及后续生命周期专项；前端的`agentReadiness`、`sseStream`、`MarkdownView`和`remoteImageConsent`。实际测试文件以目录和统一入口为准，不以此表数量为门禁。
+
+- 权限测试要调用实际Workspace/配置路由，覆盖授权后再改raw/std/Node/pi根；只测`isPathInside`不足以证明真实保护根完整。
+- 生命周期测试要覆盖未spawn前的容量限制、失败/自然exit/idle/close后的能力撤销，以及busy期间不会按idle回收。
+- 发布测试须用已有相同buildId复现指针后DB失败，注入指针后的清理故障；不能用空库对账冒充真实恢复。
+- full要测未变源和非合作模型仅finish；增量要测仅removed；源变动要测工具报错后仍finish及最后read后再变。模型主动补读所有源可能掩盖服务端工作集缺陷。
+- SSE须先连接空会话再发消息，覆盖0游标、过期游标、缓冲溢出、完整DTO、多工具轮及下一轮、停止ACK乱序。普通事件解析通过不等于HTTP消费者可用。
+- 对比完整raw字节hash、CURRENT与已发布文件；脚本仅检查某个内容标记时，报告必须明示它不是完整hash保护证明。
+- 截图保留错误现场；文件名不是视觉证据。停止请求、aborted文本和最终idle要分别核对，不把中间截图当最终状态。
+
+真实模型smoke按[运维指南](operations.md)显式使用临时目录。未安装pi、模型无认证或平台运行受阻时保留准确跳过/未覆盖，不用fixture、可用列表数量或SQLite编译成功冒充端到端成功。

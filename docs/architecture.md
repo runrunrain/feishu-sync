@@ -56,7 +56,30 @@ flowchart LR
   - `content-backend*.ts` + `direct-channel.ts`：LLM 单通道（OpenAI SDK → 智谱 GLM 默认）；registry `getFallback()` 恒 null，失败由 B6 确定性结果兜底
   - `lark-cli-client.ts` / `lark-cli-manager.ts`：lark-cli 子进程封装（QPS 节流、错误分类、99991400 指数退避）
   - `config-manager.ts`：`watchedRoots` 真相源；`watchedRootUrls` 是内存派生投影
-- **routes/**（11 文件）：HTTP 路由，从 context 同名属性取依赖；前缀在路由文件内写死后 `app.route('/', xxxRoutes)` 挂载
+- **routes/**：HTTP 路由，从 context 同名属性取依赖；前缀在路由文件内写死后 `app.route('/', xxxRoutes)` 挂载
+- **agent/**（开发分支）：外部运行时发现、pi JSONL RPC、进程池、工具权限、路径围栏、会话历史与 SSE；`pi-extension/` 只负责转发，权限裁决留在 server
+- **kb/**（开发分支）：原始源快照、构建/覆盖校验、不可变发布、CURRENT 指针、已发布内容查询
+- **mcp/**（开发分支）：只读 stdio 入口；构建为无 SQLite 原生依赖的独立 CJS
+
+## Agent 侧车与标准库（开发分支）
+
+Hono 仍内嵌 Electron 主进程。新增的外部进程是 pi，而不是另起一套业务 server；开发和独立 server 共用同一套业务实现。
+
+```mermaid
+flowchart LR
+    UI[React 工作台] -->|HTTP / fetch SSE| API[内嵌 Hono]
+    API -->|JSONL RPC| PI[外部 Node ≥22.19 / pi 1.4.x]
+    PI -->|回环 HTTP / 运行能力令牌| TOOLS[服务端工具与权限]
+    TOOLS -->|只读| RAW[本地原始库]
+    TOOLS -->|Build 仅暂存写入| STAGE[构建 staging]
+    STAGE -->|校验 / 原子切换| KB[releases + CURRENT]
+    MCP[独立只读 MCP stdio] --> KB
+```
+
+- Discuss 不暴露本地写工具；Work 仅在显式授权 Workspace 内操作文件，无 shell。运行代码/凭据、原始库和标准库均须与 Workspace 隔离，不能仅靠 prompt 约束。
+- 新构建失败不能沿用原同步引擎的 DB 回滚语义：标准库以 CURRENT 为发布真相，指针提交后的状态库故障应对账，不得误删当前 release。两条流水线的原子提交实现分开维护。
+- 原始源集合依据成功本地版本与文件/hash，不按云端 observed/status 直接删源；sheet CSV 附件使用相同读取围栏。
+- 使用说明见 [agent-knowledge.md](./agent-knowledge.md)，完整 API/安全契约见 [设计文档](./design/agent-knowledge-design.md)。
 
 ## 关键不变量（改动前必读）
 

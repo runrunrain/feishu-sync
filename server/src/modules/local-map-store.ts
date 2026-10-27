@@ -2105,6 +2105,159 @@ export class LocalMapStore {
    * uniformly on fresh databases (where the columns exist via CREATE TABLE)
    * and on legacy databases (where they were added via ALTER).
    */
+  // ===========================================================================
+  // Agent 标准知识库（F1）：kb_builds / agent_sessions 访问器
+  // ===========================================================================
+
+  createKbBuild(input: {
+    id: string;
+    mode: 'incremental' | 'full';
+    status: string;
+    baseReleaseId: string | null;
+    model: string | null;
+    createdAt: string;
+  }): void {
+    this.db.prepare(`
+      INSERT INTO kb_builds (id, mode, status, base_release_id, release_id, model, created_at)
+      VALUES (?, ?, ?, ?, NULL, ?, ?)
+    `).run(input.id, input.mode, input.status, input.baseReleaseId, input.model, input.createdAt);
+  }
+
+  updateKbBuild(id: string, patch: Partial<{
+    status: string;
+    releaseId: string | null;
+    sourceTotal: number;
+    sourceAdded: number;
+    sourceChanged: number;
+    sourceRemoved: number;
+    docsWritten: number;
+    docsDeleted: number;
+    noChanges: boolean;
+    errorCode: string | null;
+    errorMessage: string | null;
+    startedAt: string;
+    finishedAt: string;
+  }>): void {
+    const current = this.db.prepare('SELECT * FROM kb_builds WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    if (!current) throw new Error(`kb_build 不存在: ${id}`);
+    const next = {
+      status: patch.status ?? current.status,
+      release_id: patch.releaseId !== undefined ? patch.releaseId : current.release_id,
+      source_total: patch.sourceTotal ?? current.source_total,
+      source_added: patch.sourceAdded ?? current.source_added,
+      source_changed: patch.sourceChanged ?? current.source_changed,
+      source_removed: patch.sourceRemoved ?? current.source_removed,
+      docs_written: patch.docsWritten ?? current.docs_written,
+      docs_deleted: patch.docsDeleted ?? current.docs_deleted,
+      no_changes: patch.noChanges !== undefined ? (patch.noChanges ? 1 : 0) : current.no_changes,
+      error_code: patch.errorCode !== undefined ? patch.errorCode : current.error_code,
+      error_message: patch.errorMessage !== undefined ? patch.errorMessage : current.error_message,
+      started_at: patch.startedAt ?? current.started_at,
+      finished_at: patch.finishedAt ?? current.finished_at,
+    };
+    this.db.prepare(`
+      UPDATE kb_builds SET status=?, release_id=?, source_total=?, source_added=?,
+        source_changed=?, source_removed=?, docs_written=?, docs_deleted=?,
+        no_changes=?, error_code=?, error_message=?, started_at=?, finished_at=?
+      WHERE id=?
+    `).run(
+      next.status, next.release_id, next.source_total, next.source_added,
+      next.source_changed, next.source_removed, next.docs_written, next.docs_deleted,
+      next.no_changes, next.error_code, next.error_message, next.started_at, next.finished_at,
+      id,
+    );
+  }
+
+  getKbBuild(id: string): Record<string, unknown> | null {
+    return (this.db.prepare('SELECT * FROM kb_builds WHERE id = ?').get(id) as Record<string, unknown> | undefined) ?? null;
+  }
+
+  listKbBuilds(limit = 20): Array<Record<string, unknown>> {
+    return this.db.prepare('SELECT * FROM kb_builds ORDER BY created_at DESC LIMIT ?').all(limit) as Array<Record<string, unknown>>;
+  }
+
+  /** 当前非终态构建（queued/preflight/running/validating/publishing）。 */
+  getActiveKbBuild(): Record<string, unknown> | null {
+    return (this.db.prepare(`
+      SELECT * FROM kb_builds
+      WHERE status IN ('queued','preflight','running','validating','publishing')
+      ORDER BY created_at DESC LIMIT 1
+    `).get() as Record<string, unknown> | undefined) ?? null;
+  }
+
+  /** 启动对账：非终态 → interrupted。 */
+  markInterruptedKbBuilds(): string[] {
+    const info = this.db.prepare(`
+      UPDATE kb_builds SET status='interrupted',
+        error_code=COALESCE(error_code,'interrupted'),
+        error_message=COALESCE(error_message,'应用退出时构建未完成'),
+        finished_at=datetime('now')
+      WHERE status IN ('queued','preflight','running','validating','publishing')
+      RETURNING id
+    `).all() as Array<{ id: string }>;
+    return info.map((row) => row.id);
+  }
+
+  createAgentSession(input: {
+    id: string;
+    title: string;
+    mode: 'discuss' | 'work';
+    workspaceId: string | null;
+    createdAt: string;
+    updatedAt: string;
+  }): void {
+    this.db.prepare(`
+      INSERT INTO agent_sessions (id, title, mode, workspace_id, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(input.id, input.title, input.mode, input.workspaceId, input.createdAt, input.updatedAt);
+  }
+
+  getAgentSession(id: string): Record<string, unknown> | null {
+    return (this.db.prepare('SELECT * FROM agent_sessions WHERE id = ? AND deleted_at IS NULL').get(id) as Record<string, unknown> | undefined) ?? null;
+  }
+
+  listAgentSessions(): Array<Record<string, unknown>> {
+    return this.db.prepare(
+      'SELECT * FROM agent_sessions WHERE deleted_at IS NULL ORDER BY updated_at DESC',
+    ).all() as Array<Record<string, unknown>>;
+  }
+
+  updateAgentSession(id: string, patch: Partial<{
+    title: string;
+    mode: 'discuss' | 'work';
+    workspaceId: string | null;
+    piSessionFile: string | null;
+    lastErrorCode: string | null;
+    lastErrorMessage: string | null;
+    updatedAt: string;
+    deletedAt: string;
+  }>): void {
+    const current = this.getAgentSession(id);
+    if (!current) throw new Error(`agent_session 不存在: ${id}`);
+    this.db.prepare(`
+      UPDATE agent_sessions SET title=?, mode=?, workspace_id=?, pi_session_file=?,
+        last_error_code=?, last_error_message=?, updated_at=?, deleted_at=?
+      WHERE id=?
+    `).run(
+      patch.title ?? current.title,
+      patch.mode ?? current.mode,
+      patch.workspaceId !== undefined ? patch.workspaceId : current.workspace_id,
+      patch.piSessionFile !== undefined ? patch.piSessionFile : current.pi_session_file,
+      patch.lastErrorCode !== undefined ? patch.lastErrorCode : current.last_error_code,
+      patch.lastErrorMessage !== undefined ? patch.lastErrorMessage : current.last_error_message,
+      patch.updatedAt ?? new Date().toISOString(),
+      patch.deletedAt !== undefined ? patch.deletedAt : current.deleted_at,
+      id,
+    );
+  }
+
+  listSessionsByWorkspace(workspaceId: string): Array<Record<string, unknown>> {
+    return this.db.prepare(
+      'SELECT * FROM agent_sessions WHERE workspace_id = ? AND deleted_at IS NULL',
+    ).all(workspaceId) as Array<Record<string, unknown>>;
+  }
+
+
   private getCreateTablesDDL(): string {
     return `
       -- Documents mapping table (v0.1.0 columns only; v0.2.0+ columns are
@@ -2257,6 +2410,53 @@ export class LocalMapStore {
 
       CREATE INDEX IF NOT EXISTS idx_run_log_timestamp ON run_log(timestamp);
       CREATE INDEX IF NOT EXISTS idx_run_log_level ON run_log(level);
+
+      -- =====================================================================
+      -- Agent 标准知识库（F1，设计 §5.3）。全部为新增表，回滚时可直接删除。
+      -- =====================================================================
+
+      -- 标准库构建历史。发布真相 = outputRoot/CURRENT.json + manifest；
+      -- 本表只存构建历史，可由 manifest 重建（启动对账以指针为准）。
+      CREATE TABLE IF NOT EXISTS kb_builds (
+        id TEXT PRIMARY KEY,
+        mode TEXT NOT NULL CHECK(mode IN ('incremental', 'full')),
+        status TEXT NOT NULL CHECK(status IN (
+          'queued', 'preflight', 'running', 'validating', 'publishing',
+          'published', 'failed', 'cancelled', 'interrupted')),
+        base_release_id TEXT,
+        release_id TEXT,
+        model TEXT,
+        source_total INTEGER NOT NULL DEFAULT 0,
+        source_added INTEGER NOT NULL DEFAULT 0,
+        source_changed INTEGER NOT NULL DEFAULT 0,
+        source_removed INTEGER NOT NULL DEFAULT 0,
+        docs_written INTEGER NOT NULL DEFAULT 0,
+        docs_deleted INTEGER NOT NULL DEFAULT 0,
+        no_changes INTEGER NOT NULL DEFAULT 0,
+        error_code TEXT,
+        error_message TEXT,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        finished_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_kb_builds_status ON kb_builds(status);
+      CREATE INDEX IF NOT EXISTS idx_kb_builds_created ON kb_builds(created_at);
+
+      -- Agent 会话元数据。消息历史真相在 pi 会话 JSONL
+      -- （<dataRoot>/agent/sessions/），本表只存元数据与状态。
+      CREATE TABLE IF NOT EXISTS agent_sessions (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        mode TEXT NOT NULL CHECK(mode IN ('discuss', 'work')),
+        workspace_id TEXT,
+        pi_session_file TEXT,
+        last_error_code TEXT,
+        last_error_message TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        deleted_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_agent_sessions_updated ON agent_sessions(updated_at);
     `;
   }
 }

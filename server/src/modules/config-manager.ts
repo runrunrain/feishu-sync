@@ -32,6 +32,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { resolveDataRoot } from './data-root.js';
+import { validateWorkspacesAgainstConfig } from '../agent/protected-roots.js';
+import {
+  buildDefaultAgentConfig,
+  buildDefaultStandardKbConfig,
+  type AgentConfig,
+  type AgentWorkspaceConfig,
+  type StandardKbConfig,
+} from '../types/agent-knowledge.js';
 import type {
   Config,
   LayoutProfile,
@@ -239,6 +247,130 @@ export function reconcileModelAlias(
   return canonicalModel;
 }
 
+// ===========================================================================
+// Agent 标准知识库配置段（F1，additive）：默认合并 + 严格校验
+// ===========================================================================
+
+const THINKING_LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high']);
+const MODEL_SOURCES = new Set(['app-llm', 'pi-agent-dir']);
+const WORKSPACE_ID_PATTERN = /^ws_[A-Za-z0-9]{6,32}$/;
+
+export class InvalidConfigError extends Error {
+  details: Array<{ field: string; code: string }>;
+  constructor(details: Array<{ field: string; code: string }>) {
+    super(`配置校验失败：${details.map((item) => `${item.field}(${item.code})`).join(', ')}`);
+    this.details = details;
+  }
+}
+
+/** 宽容归一：旧配置缺段/缺字段 → 补默认；非法值 → 回退默认并保留结构。 */
+function normalizeAgentConfigLoose(value: unknown, dataRoot: string): AgentConfig {
+  const base = buildDefaultAgentConfig(dataRoot);
+  if (!value || typeof value !== 'object') return base;
+  const raw = value as Partial<AgentConfig>;
+  const modelRaw: Partial<AgentConfig['model']> = raw.model && typeof raw.model === 'object' ? raw.model : {};
+  const runtimeRaw: Partial<AgentConfig['runtime']> = raw.runtime && typeof raw.runtime === 'object' ? raw.runtime : {};
+  return {
+    runtime: {
+      nodePath: typeof runtimeRaw.nodePath === 'string' && runtimeRaw.nodePath.trim() ? runtimeRaw.nodePath.trim() : undefined,
+      piCliPath: typeof runtimeRaw.piCliPath === 'string' && runtimeRaw.piCliPath.trim() ? runtimeRaw.piCliPath.trim() : undefined,
+    },
+    model: {
+      source: MODEL_SOURCES.has(modelRaw.source as string) ? (modelRaw.source as AgentConfig['model']['source']) : 'app-llm',
+      providerId: typeof modelRaw.providerId === 'string' && modelRaw.providerId ? modelRaw.providerId : undefined,
+      modelId: typeof modelRaw.modelId === 'string' && modelRaw.modelId ? modelRaw.modelId : undefined,
+      piModel: typeof modelRaw.piModel === 'string' && modelRaw.piModel.trim() ? modelRaw.piModel.trim() : undefined,
+      thinkingLevel: THINKING_LEVELS.has(modelRaw.thinkingLevel as string)
+        ? (modelRaw.thinkingLevel as AgentConfig['model']['thinkingLevel'])
+        : 'off',
+      contextWindow: typeof modelRaw.contextWindow === 'number' && modelRaw.contextWindow >= 1000 ? Math.floor(modelRaw.contextWindow) : base.model.contextWindow,
+      maxTokens: typeof modelRaw.maxTokens === 'number' && modelRaw.maxTokens >= 256 ? Math.floor(modelRaw.maxTokens) : base.model.maxTokens,
+    },
+    maxConcurrentProcesses: typeof raw.maxConcurrentProcesses === 'number'
+      ? Math.max(1, Math.min(4, Math.floor(raw.maxConcurrentProcesses)))
+      : base.maxConcurrentProcesses,
+    idleTimeoutMinutes: typeof raw.idleTimeoutMinutes === 'number'
+      ? Math.max(1, Math.min(240, Math.floor(raw.idleTimeoutMinutes)))
+      : base.idleTimeoutMinutes,
+    workspaces: Array.isArray(raw.workspaces) ? raw.workspaces.filter(isValidWorkspaceEntry) : [],
+  };
+}
+
+function isValidWorkspaceEntry(value: unknown): value is AgentWorkspaceConfig {
+  if (!value || typeof value !== 'object') return false;
+  const candidate = value as Partial<AgentWorkspaceConfig>;
+  return (
+    typeof candidate.id === 'string' && WORKSPACE_ID_PATTERN.test(candidate.id)
+    && typeof candidate.name === 'string' && candidate.name.trim().length > 0 && candidate.name.length <= 80
+    && typeof candidate.path === 'string' && candidate.path.length > 0 && path.isAbsolute(candidate.path)
+    && typeof candidate.createdAt === 'string'
+  );
+}
+
+function normalizeStandardKbConfigLoose(value: unknown, dataRoot: string): StandardKbConfig {
+  const base = buildDefaultStandardKbConfig(dataRoot);
+  if (!value || typeof value !== 'object') return base;
+  const raw = value as Partial<StandardKbConfig>;
+  return {
+    outputRoot: typeof raw.outputRoot === 'string' && raw.outputRoot.trim() ? raw.outputRoot.trim() : base.outputRoot,
+    retainReleases: typeof raw.retainReleases === 'number'
+      ? Math.max(1, Math.min(20, Math.floor(raw.retainReleases)))
+      : base.retainReleases,
+    buildBatchSize: typeof raw.buildBatchSize === 'number'
+      ? Math.max(1, Math.min(50, Math.floor(raw.buildBatchSize)))
+      : base.buildBatchSize,
+    promptTimeoutMinutes: typeof raw.promptTimeoutMinutes === 'number'
+      ? Math.max(1, Math.min(240, Math.floor(raw.promptTimeoutMinutes)))
+      : base.promptTimeoutMinutes,
+    buildTimeoutMinutes: typeof raw.buildTimeoutMinutes === 'number'
+      ? Math.max(5, Math.min(1440, Math.floor(raw.buildTimeoutMinutes)))
+      : base.buildTimeoutMinutes,
+    autoBuildAfterSync: raw.autoBuildAfterSync === true ? true : false,
+  };
+}
+
+/** 严格校验（PUT /api/config 路径）：非法直接报 InvalidConfigError。 */
+export function validateAgentAndKbConfig(value: {
+  agent?: unknown;
+  standardKb?: unknown;
+}): void {
+  const details: Array<{ field: string; code: string }> = [];
+  if (value.agent !== undefined && (!value.agent || typeof value.agent !== 'object')) {
+    details.push({ field: 'agent', code: 'invalid_type' });
+  } else if (value.agent && typeof value.agent === 'object') {
+    const agent = value.agent as Partial<AgentConfig>;
+    if (agent.model && typeof agent.model === 'object') {
+      const model = agent.model as Partial<AgentConfig['model']>;
+      if (model.source !== undefined && !MODEL_SOURCES.has(model.source as string)) {
+        details.push({ field: 'agent.model.source', code: 'invalid_value' });
+      }
+      if (model.source === 'pi-agent-dir' && model.piModel !== undefined
+        && !/^[A-Za-z0-9_-]+\/[A-Za-z0-9._-]+$/.test(model.piModel ?? '')) {
+        details.push({ field: 'agent.model.piModel', code: 'invalid_format' });
+      }
+      if (model.thinkingLevel !== undefined && !THINKING_LEVELS.has(model.thinkingLevel as string)) {
+        details.push({ field: 'agent.model.thinkingLevel', code: 'invalid_value' });
+      }
+    }
+    if (agent.maxConcurrentProcesses !== undefined
+      && (typeof agent.maxConcurrentProcesses !== 'number'
+        || agent.maxConcurrentProcesses < 1 || agent.maxConcurrentProcesses > 4)) {
+      details.push({ field: 'agent.maxConcurrentProcesses', code: 'out_of_range' });
+    }
+    // agent.workspaces：不校验也不报错——updateConfig 静默忽略该字段
+    //（增删只走专用路由，见 updateConfig 的合并逻辑）。
+  }
+  if (value.standardKb !== undefined && (!value.standardKb || typeof value.standardKb !== 'object')) {
+    details.push({ field: 'standardKb', code: 'invalid_type' });
+  } else if (value.standardKb && typeof value.standardKb === 'object') {
+    const kb = value.standardKb as Partial<StandardKbConfig>;
+    if (kb.outputRoot !== undefined && (typeof kb.outputRoot !== 'string' || !kb.outputRoot.trim())) {
+      details.push({ field: 'standardKb.outputRoot', code: 'invalid_value' });
+    }
+  }
+  if (details.length > 0) throw new InvalidConfigError(details);
+}
+
 const CONFIG_ENTITY_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
 
 function stringValue(value: unknown, fallback = ''): string {
@@ -422,6 +554,8 @@ function buildDefaultLlmConfig(): LlmConfig {
 
 const DEFAULT_CONFIG: Config = {
   llm: buildDefaultLlmConfig(),
+  agent: buildDefaultAgentConfig(resolveDataRoot()),
+  standardKb: buildDefaultStandardKbConfig(resolveDataRoot()),
   pollIntervalMinutes: 30,
   knowledgeBaseRoot: '',
   watchedRoots: [],
@@ -744,6 +878,8 @@ export class ConfigManager {
     if (Object.prototype.hasOwnProperty.call(partial, 'larkCliPath')) {
       delete (partial as Record<string, unknown>).larkCliPath;
     }
+    // F1：agent/standardKb 段严格校验；workspaces 只走专用路由（防绕过路径校验）
+    validateAgentAndKbConfig({ agent: partial.agent, standardKb: partial.standardKb });
     const currentConfig = await this.load();
     const hasStructuredRoots = Object.prototype.hasOwnProperty.call(partial, 'watchedRoots');
     const hasLegacyUrls = Object.prototype.hasOwnProperty.call(partial, 'watchedRootUrls');
@@ -766,7 +902,49 @@ export class ConfigManager {
       llm: partial.llm
         ? this.mergeLlmPartial(currentConfig.llm, partial.llm)
         : currentConfig.llm,
+      agent: partial.agent || partial.standardKb
+        ? (() => {
+          // workspaces：显式提供时采用（专用路由 POST/DELETE
+          // /api/agent/workspaces 走这里）；PUT /api/config 在路由层剔除
+          // 该字段（防 UI 全量回传绕过路径校验），两层各管各的。
+          const incomingWorkspaces = Array.isArray(
+            (partial.agent as { workspaces?: unknown } | undefined)?.workspaces,
+          );
+          const merged = normalizeAgentConfigLoose(
+            partial.agent ? { ...currentConfig.agent, ...partial.agent } : currentConfig.agent,
+            resolveDataRoot(),
+          );
+          return {
+            ...merged,
+            workspaces: incomingWorkspaces ? merged.workspaces : currentConfig.agent.workspaces,
+          };
+        })()
+        : currentConfig.agent,
+      standardKb: partial.standardKb
+        ? normalizeStandardKbConfigLoose(
+          { ...currentConfig.standardKb, ...partial.standardKb },
+          resolveDataRoot(),
+        )
+        : currentConfig.standardKb,
     };
+    // F3-R02：合并后配置交叉校验——已授权 Workspace 与新 knowledgeBaseRoot /
+    // outputRoot / dataRoot / 静态受保护运行资源（源码树/node_modules/Electron/
+    // pi 凭据目录）冲突时拒绝保存（InvalidConfigError → 400 invalid_config），
+    // 而不是让冲突配置落盘后在能力使用时才暴露；同步启动不受影响（load
+    // 保持宽容，只拒绝保存）。pi/Node 安装根依赖运行时发现，由路由层
+    // （routes/config.ts，有 resolver 可用）在保存前补充校验。
+    const workspaceConflicts = validateWorkspacesAgainstConfig({
+      workspaces: updatedConfig.agent.workspaces,
+      knowledgeBaseRoot: updatedConfig.knowledgeBaseRoot,
+      outputRoot: updatedConfig.standardKb.outputRoot,
+      dataRoot: resolveDataRoot(),
+    });
+    if (workspaceConflicts.length > 0) {
+      throw new InvalidConfigError(workspaceConflicts.map((detail) => ({
+        field: detail.field,
+        code: 'workspace_path_forbidden',
+      })));
+    }
     await this.save(updatedConfig);
     return this.config!;
   }
@@ -950,6 +1128,9 @@ export class ConfigManager {
     // 防止旧配置在版本更新后继续污染 lark-cli 解析。
     migrated = migrated || Object.prototype.hasOwnProperty.call(raw, 'larkCliPath');
 
+    // F1 additive：旧配置缺 agent/standardKb 段时补默认并写回一次。
+    migrated = migrated || raw.agent === undefined || raw.standardKb === undefined;
+
     // 2026-10 scope 退役清理：2026-09 的 additive 迁移曾把 docs:document:read
     // 追加进存量配置；该名现已在上游失效，带上它发起授权会被整单拒绝。
     // 从存量列表剔除并触发写回，否则升级后 device flow 依旧发起失败。
@@ -961,6 +1142,8 @@ export class ConfigManager {
 
     const config: Config = {
       llm,
+      agent: normalizeAgentConfigLoose(raw.agent, resolveDataRoot()),
+      standardKb: normalizeStandardKbConfigLoose(raw.standardKb, resolveDataRoot()),
       pollIntervalMinutes: typeof raw.pollIntervalMinutes === 'number'
         ? raw.pollIntervalMinutes
         : DEFAULT_CONFIG.pollIntervalMinutes,

@@ -1,0 +1,92 @@
+{
+  "taskId": "20261026-231519-agent-knowledge-integration",
+  "timestamp": "2026-10-27T03:13:01Z",
+  "agent": "coder",
+  "projectId": "feishu-sync",
+  "taskBrief": "Leader integration of the Agent knowledge workbench, real-entry validation and security hardening",
+  "status": "completed",
+  "phaseState": "accepted-local-feature-branch",
+  "safetyGate": {
+    "verdict": "PASS",
+    "closedFindings": 11,
+    "remaining": [],
+    "scope": "Local feature branch acceptance, not installer/cross-platform release",
+    "reviewer": "/root/residual_review",
+    "previousVerdict": "FIX",
+    "previousReport": "docs/reports/agent-knowledge-review-previous-incremental.md",
+    "firstCandidateRegression": "Old live runtime A roots released after switch to B; fixed by service-lifetime runtime root set and independently retested"
+  },
+  "upstreamArtifactReferences": [
+    "docs/design/agent-knowledge-design.md",
+    "docs/reports/agent-knowledge-backend.md",
+    "docs/reports/agent-knowledge-ui.md",
+    "docs/reports/agent-knowledge-review.md"
+  ],
+  "validationEvidence": {
+    "buildStatus": "passed",
+    "testStatus": "passed",
+    "browserVerification": "verified",
+    "scopeNote": "Final check passed: frontend 12 files/95 tests, server 57 files/750 tests; build:all/electron:build and final MCP CJS stdio 4 tests passed. Independent final review PASS: 5 files/53 tests plus original live A-to-B reproduction now denied. Historical browser/remote GLM evidence retained; no UI changes this continuation.",
+    "commands": [
+      {
+        "command": "npm ci --prefix server && npm run check && npm run build:all && npm run electron:build",
+        "exitCode": 0,
+        "summary": "bg-1ebdb56d: initial integrated baseline, server 704 tests and frontend 91 tests"
+      },
+      {
+        "command": "temporary FEISHU_SYNC_HOME: agent-real-model-smoke.ts",
+        "exitCode": 0,
+        "summary": "bg-97979d3a: real pi-agent-dir GLM, Discuss raw_read, Work write/audit, two-source publication"
+      },
+      {
+        "command": "real browser + local application HTTP + MCP SDK stdio client",
+        "exitCode": 0,
+        "summary": "Read/source/build/cancel, exact pointer and raw SHA preservation, four MCP tools, restart memory, Work consent/write, multi-tool next turn and abort-idle checks"
+      },
+      {
+        "command": "targeted frontend agentReadiness and server agent-session tests; server build",
+        "exitCode": 0,
+        "summary": "Full message DTO and SSE regressions; bg-7d9eba52 additionally passed lint/typecheck, all 92 frontend tests and 27 documentation links; does not supersede the final full check"
+      },
+      {
+        "command": "npm run check",
+        "exitCode": 0,
+        "summary": "Final continuation: lint 0 errors/2 existing warnings; three typechecks; frontend 12 files/95 tests, server 57 files/750 tests"
+      },
+      {
+        "command": "npm run build:all && npm run electron:build",
+        "exitCode": 0,
+        "summary": "Continuation builds passed; Electron GUI not exercised"
+      },
+      {
+        "command": "cd server && npx vitest run tests/mcp-kb.test.ts",
+        "exitCode": 0,
+        "summary": "Final MCP CJS: 4 true stdio tests passed"
+      },
+      {
+        "command": "Independent final targeted vitest (runtime-resolver, protected-workspace, agent-session-concurrency, agent-session, agent-assets-cjs)",
+        "exitCode": 0,
+        "summary": "5 files/53 tests; original A-to-B live-process repro now 400 authorization/403 write, file absent; R01/R04 PASS"
+      }
+    ]
+  },
+  "tags": [
+    "integration",
+    "agent-knowledge",
+    "security-hardening",
+    "local-acceptance",
+    "not-released"
+  ],
+  "relatedFiles": [
+    "docs/reports/agent-knowledge-integration.md",
+    "docs/plans/agent-knowledge-workflow.md",
+    "docs/agent-knowledge.md",
+    "docs/reports/agent-knowledge-residual-validation.md",
+    "docs/reports/agent-knowledge-review-previous-incremental.md"
+  ],
+  "pathDerivation": "Explicit project-local artifact contract. No projects-memory/projects/registry.json was found while ascending from the repository to the filesystem root; no project-memory registry was fabricated.",
+  "nextSteps": {
+    "suggestedAgent": "coder",
+    "suggestedAction": "Local feature implementation accepted; keep version 0.3.47, no merge main/push/tag/release. Installer/native/Windows/RunAsNode/real remote app-llm and large-library validation require a separate requested scope."
+  }
+}

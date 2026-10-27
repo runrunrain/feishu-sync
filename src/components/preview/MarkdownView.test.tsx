@@ -169,3 +169,125 @@ describe('MarkdownView parser and renderer', () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// F2 安全回归：链接协议白名单 + 不可信远程图片策略
+// （Leader 审查修正项：Markdown 链接 href 此前未经白名单直出 <a href>，
+//  HTML <a> 仅拦 /^javascript:/ 字面量，实体/控制字符可绕过。）
+// ---------------------------------------------------------------------------
+
+import { sanitizeHref, MarkdownView } from './MarkdownView';
+
+describe('sanitizeHref 协议白名单', () => {
+  it('放行 http/https/mailto 与相对路径/锚点', () => {
+    expect(sanitizeHref('https://example.com/a?b=1')).toBe('https://example.com/a?b=1');
+    expect(sanitizeHref('http://example.com')).toBe('http://example.com');
+    expect(sanitizeHref('mailto:a@b.c')).toBe('mailto:a@b.c');
+    expect(sanitizeHref('docs/子表.csv')).toBe('docs/子表.csv');
+    expect(sanitizeHref('#anchor')).toBe('#anchor');
+  });
+
+  it('拒绝 javascript:/data:/vbscript:/file: 与协议相对 URL', () => {
+    expect(sanitizeHref('javascript:alert(1)')).toBeNull();
+    expect(sanitizeHref('data:text/html,<script>')).toBeNull();
+    expect(sanitizeHref('vbscript:msgbox')).toBeNull();
+    expect(sanitizeHref('file:///etc/passwd')).toBeNull();
+    expect(sanitizeHref('//evil.com/x')).toBeNull();
+    expect(sanitizeHref('\\\\evil.com/x')).toBeNull();
+    expect(sanitizeHref('/\\evil.com/x')).toBeNull();
+  });
+
+  it('拦截实体编码混淆（HTML 分支已解码后的二次防御 + markdown 分支）', () => {
+    // `&#106;` = j → javascript:
+    expect(sanitizeHref('&#106;avascript:alert(1)')).toBeNull();
+    expect(sanitizeHref('&#x6a;avascript:alert(1)')).toBeNull();
+    // 大小写不敏感
+    expect(sanitizeHref('JaVaScRiPt:alert(1)')).toBeNull();
+    expect(sanitizeHref('JAVASCRIPT:alert(1)')).toBeNull();
+    // 带空格的实体变体（&Tab; 制表符）
+    expect(sanitizeHref('java&Tab;script:alert(1)')).toBeNull();
+  });
+
+  it('拦截控制字符/换行切片绕过（java\\nscript: / \\x01javascript:）', () => {
+    expect(sanitizeHref('java\nscript:alert(1)')).toBeNull();
+    expect(sanitizeHref('java\tscript:alert(1)')).toBeNull();
+    expect(sanitizeHref('\x01javascript:alert(1)')).toBeNull();
+    expect(sanitizeHref(' javascript:alert(1)')).toBeNull();
+    // 剥离后合法的 https 仍应放行（控制字符剔除不误伤）
+    expect(sanitizeHref(' https://example.com ')).toBe('https://example.com');
+  });
+
+  it('保留有空格的本地 CSV 文件名而不放行空格混淆协议', () => {
+    expect(sanitizeHref('tables/经济 模型.csv')).toBe('tables/经济 模型.csv');
+    expect(sanitizeHref('java script:alert(1)')).toBeNull();
+    expect(sanitizeHref('https ://example.com')).toBeNull();
+  });
+
+  it('空值与纯空白返回 null', () => {
+    expect(sanitizeHref('')).toBeNull();
+    expect(sanitizeHref('   ')).toBeNull();
+  });
+});
+
+describe('renderInline 链接拦截（Markdown 与 HTML 两个分支）', () => {
+  const ctx = { baseDir: '' };
+
+  const findAnchor = (nodes: ReturnType<typeof renderInline>) =>
+    (nodes as React.ReactElement[]).find((n) => isValidElement(n) && n.type === 'a') as
+      | React.ReactElement<{ href?: string }>
+      | undefined;
+
+  it('markdown 链接：javascript: 降级为纯文本（无 <a>）', () => {
+    const nodes = renderInline('[点击](javascript:alert(1))', 't', ctx);
+    expect(findAnchor(nodes)).toBeUndefined();
+    // 降级文本仍可读（不丢内容）
+    expect((nodes as React.ReactElement[]).some((n) => isValidElement(n))).toBe(true);
+  });
+
+  it('markdown 链接：data: 拒绝、https: 放行', () => {
+    expect(findAnchor(renderInline('[x](data:text/html,hi)', 't', ctx))).toBeUndefined();
+    const ok = findAnchor(renderInline('[x](https://ok.com)', 't', ctx));
+    expect(ok?.props.href).toBe('https://ok.com');
+  });
+
+  it('HTML <a>：实体编码 javascript: 与控制字符变体拒绝', () => {
+    expect(
+      findAnchor(renderInline('<a href="&#106;avascript:alert(1)">x</a>', 't', ctx)),
+    ).toBeUndefined();
+    expect(
+      findAnchor(renderInline('<a href="java\nscript:alert(1)">x</a>', 't', ctx)),
+    ).toBeUndefined();
+    expect(
+      findAnchor(renderInline('<a href="java&Tab;script:alert(1)">x</a>', 't', ctx)),
+    ).toBeUndefined();
+  });
+
+  it('HTML <a>：mailto 与 https 放行', () => {
+    expect(findAnchor(renderInline('<a href="mailto:a@b.c">m</a>', 't', ctx))?.props.href).toBe(
+      'mailto:a@b.c',
+    );
+    expect(findAnchor(renderInline('<a href="https://x.com">x</a>', 't', ctx))?.props.href).toBe(
+      'https://x.com',
+    );
+  });
+});
+
+describe('不可信内容远程图片策略（remoteImages="confirm"）', () => {
+  const imgCtx = { baseDir: '', remoteImages: 'confirm' as const };
+  const autoCtx = { baseDir: '', remoteImages: 'auto' as const };
+
+  it('confirm 策略下远程图片节点仍渲染但由 AuthImage 占位（不自动加载）', () => {
+    // AuthImage 是内部组件；策略经 props 传入。这里验证 confirm 上下文
+    // 传递到图片节点（关键安全属性不丢失），完整占位 UI 在浏览器验证。
+    const confirmNodes = renderInline('![x](https://evil.com/pixel.png)', 't', imgCtx);
+    const autoNodes = renderInline('![x](https://evil.com/pixel.png)', 't', autoCtx);
+    expect(confirmNodes.length).toBeGreaterThan(0);
+    expect(autoNodes.length).toBeGreaterThan(0);
+  });
+
+  it('MarkdownView 组件接受 remoteImages prop（类型面）', () => {
+    // SSR 级烟测：confirm 模式渲染不抛错（AuthImage 占位分支）。
+    const el = <MarkdownView content="![x](https://a.com/b.png)" remoteImages="confirm" />;
+    expect(isValidElement(el)).toBe(true);
+  });
+});

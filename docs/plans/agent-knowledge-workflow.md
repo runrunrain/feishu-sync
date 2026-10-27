@@ -19,9 +19,9 @@
 | G1 | 工程治理、文档、验证入口 / luban | v0.3.47、基线调查；隔离 worktree | 工程与文档 diff、docs/reports/engineering-governance.md | check/test/build；保留现有运行契约 | accepted：9281352f；Leader补隔离/排除/事实修正，54+615用例及构建通过 |
 | D1 | trade-wisdom 与 pi 调研、公共方向设计 / fuxi | 用户方向、现有项目和 pi 文档；仅写设计 artifacts | docs/design/agent-knowledge-design.md，公共 API/状态/权限约定 | 真实代码证据，方案可实现，不照搬参考 | accepted：255048cd；公共契约 docs/design/agent-knowledge-design.md，研究证据已落盘 |
 | G2 | main 集成验证与高风险审核 / Leader + diting | G1 | 验证证据、review | 通过后提交 main，不升级版本 | completed：治理main提交 2c2a6dd；8b8c6692 + 9438878e 复审PASS；native运行缺口保留 |
-| F1 | 标准库、pi 会话与 MCP 后端纵向切片 / luban | main 已提交、D1 公共契约 | 代码/测试/运维文档/报告 | 原始库保护、原子发布、只读讨论、显式 Work、MCP 真协议 | pending |
-| F2 | 标准库浏览和 Agent 会话 UI / luoshen | main 已提交、D1 公共契约 | UI/测试/真实交互证据 | 阅读、来源、构建、会话、模式/错误状态 | pending，与 F1 并行 |
-| F3 | 开发分支集成、端到端验证、独立审核 / Leader + diting | F1、F2 | 验收矩阵/报告/分支提交 | 全套检查 + UI 真交互 + API/MCP 实测；如无可用模型明确未覆盖 | pending |
+| F1 | 标准库、pi 会话与 MCP 后端纵向切片 / luban | main 已提交、D1 公共契约 | 代码/测试/运维文档/报告 | 原始库保护、原子发布、只读讨论、显式 Work、MCP 真协议 | accepted（本轮续接）：旧交付rejected历史保留；R01/R04残留及活进程运行根回归修复后独立PASS，既有9项关闭保持 |
+| F2 | 标准库浏览和 Agent 会话 UI / luoshen | main 已提交、D1 公共契约 | UI/测试/真实交互证据 | 阅读、来源、构建、会话、模式/错误状态 | accepted：a8c7fb5b；已整合，fixture browser+24截图/视觉委托，真实F1联调待F3 |
+| F3 | 开发分支集成、端到端验证、独立审核 / Leader + diting | F1、F2 | 验收矩阵/报告/分支提交 | 全套检查 + UI 真交互 + API/MCP 实测；如无可用模型明确未覆盖 | completed（本地开发分支）：R01/R04独立PASS，前端95/后端750及构建通过；按原目标本地提交，未合main/push/tag/release，安装包/native验证缺口保留 |
 
 ## 跨边界链路与责任
 - 同步文件 → 构建 API → pi → 暂存标准库 → 校验发布 → UI 阅读：F1 负责身份/来源/构建状态，F2 消费，Leader 真实入口集成验收。原始库不可被构建工具改写。
@@ -51,3 +51,17 @@
 - G2已接受：初审dry-run文案/Node范围/DI描述三项均修复并复审PASS。开发宿主支持^22.19.0 || ^24.0.0；默认测试home隔离；原始库来源不能只筛status=synced（changed/error但有成功本地版本仍保留）。Electron31 headers重编译成功，但本机最小启动卡dyld，runtime与打包仍未验证，不阻断不发版治理提交。
 - 治理提交：main@2c2a6dd（55文件，v0.3.47未变，无tag/push/release）。来源软警示已只读复核：31个现存文件与G1 worktree逐字节一致，23个为Leader整合修正/验证资料，5个旧路径为4份报告归档原址及误入源码空壳删除；icon.png 1.5MB需20MB读取预算，非缺失文件。未来设计未混入该提交。
 - 已切换 feat/agent-knowledge-workbench，D1公共设计与研究在此分支持久化，接下来F1/F2各自worktree并行；首轮Work不提供shell，外部MCP必须无SQLite原生依赖。原始源集合保留有成功本地版本的changed/error行，避免检测状态变化被误当源删除。
+- 功能公共契约提交104ba2f；来源提示中design-research为已接受D1子任务产物，已只读git show复核。F1 ca201dd8（server/构建）、F2 a8c7fb5b（src/electron）各自worktree并行，无共享写入；公共API按D1，偏差必须回Leader。F3统一集成测试/真实入口+一次高风险阶段审核。
+- 已只读核查F1/F2新launch-anchor均记录bootId（新插件确已加载），若再次跨重启可使用可靠boot身份自动恢复；不再沿用旧macOS无身份记录的缺口。
+- Leader用pi-agent-dir合法只读RPC就绪探测（get_available_models，无prompt/无直接读凭据文件）得到504可用模型；D1无key结论只适用于隔离测试目录。已告知F1可在显式opt-in的临时配置中通过pi使用已有凭据做最小真实模型调用，不能假称无凭据跳过。
+- Leader实际真实调用：builtin Haiku4.5收到HTTP400（已分类诊断，available不等于可调用）；改选已注册amagi-glm/glm-5.3-flash、关闭retry与thinking，2s内agent_settled/stop并精确回复smoke标记（bg-8ed04bae）。仅临时无敏感内容，无工具，不能冒充应用工具链验证；已通知F1可用路由。
+- F2安全补充：既有MarkdownView的Markdown href缺协议allowlist，HTML链接只拦简单javascript。已要求UI侧统一安全协议/实体与控制字符处理、远程图片不附desktop token；新Agent/标准库入口默认不自动加载任意外部图片，避免模型输出借图片URL外发源内容。与新功能同批实现/测试/阶段审核，不在main治理提交中偷改旧行为。
+- F1安全补充：Work的授权目录不得与应用运行代码/资源、pi安装树及pi-agent-dir凭据目录重叠，防止写扩展或可执行模型配置后被下一侧车加载而间接突破‘无shell’边界。由服务端路径确定保护根并复核，API不变；普通独立文档Workspace可用。不把文件工具围栏说成抵抗同uid外部程序或第三方自动执行的OS沙箱。
+- F2已整合并接受：主树check/electron:build通过；Leader补图片授权绑定具体URL（切文档/换query重新确认）与本地CSV文件名空格保留/反斜杠协议相对拦截，lint/typecheck/前端测试再次通过。F2新端点验证是明确fixture，不计为最终F1联调；报告docs/reports/agent-knowledge-ui.md、截图global artifacts/f2-agent-knowledge-ui-shots。
+- F1收口前Leader只读发现并要求修正两项具体接线：状态路由factory捕获旧config导致保存后status/probe仍旧值；raw-source谓词遗漏旧lastSyncedAt成功证据并把cloudDeleted观测标记直接当源删除。HTTP新config由F1修复，源谓词在终稿后由Leader整合修复。
+- F3从主树真实pi/HTTP、浏览器、MCP验证核心闭环；又修复CSV附件围栏、SSE空游标/溢出、完整message_end DTO和工具多轮草稿锚点、停止ACK覆盖新SSE idle的竞态。测试与截图含失败现场而非只留成功图，完整证据在integration报告。
+- 06b9041e独立full审核FIX（1C/10M），已接受报告，不代表接受功能。R01–R11包括完整代码树隔离、配置逆向重叠、默认app-llm注册、插话队列所有权、进程/能力回收、busy/idle、full工作集、源变化阻断、指针后DB对账及清理、JSONL元数据父链。全部一批续接04a0416b。续接前Leader回填5个后端修正到原worktree并比对190文件与主树一致，防止续接覆盖整合。
+- 暂不提交功能分支；main治理提交和未改版本号/不push不发版约束不变。
+- 唯一增量复审c478ffaf（报告已接受）仍FIX：9项关闭；R01遗漏Node发现时执行的npm真实代码根，R04进程活着但已settled的get_state收尾窗口仍接受无人消费的消息。04a0416b的‘全修完’交付已拒绝，保留已整合的有效修复和Leader补强，不回滚现场。按规则停止自动修复/复审循环，上报主上；后续须显式决定残留修复，不以全绿测试强行通过。最终检查bg-03556463为741后端/95前端及全部构建通过，功能分支仍未提交。
+
+- 2026-10-26（America/Los_Angeles）：用户通过交接文档明确续接R01/R04，另显式授权只读审查子Agent。先复现旧反例，再移除npm执行发现、补实际npm包根与收尾双守卫。独立审查发现首个候选在A→B切换后丢失旧活进程根保护，已改为服务生命周期运行根集合并补真实协议进程回归；该候选没有提交。有限复核最终PASS，独立5文件53例和原样A→B反例通过；最终check为前端95/后端750例，构建及MCP stdio通过，允许本地功能提交。详见当前review与残留修复验证报告。

@@ -1,0 +1,256 @@
+/**
+ * PiRuntimeResolver 测试（设计 §12.1）
+ *
+ * fixture：临时目录内构造假 node 可执行脚本（打印固定 --version）与假
+ * pi 包（package.json + dist/cli.js）。标明用途：算法层验证，不冒充真实
+ * 安装。真实 pi 的装载/探测由 pi-probe.test.ts 覆盖（本机有 pi 1.4）。
+ */
+
+import { describe, expect, it, beforeAll, afterAll } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {
+  compareVersions,
+  PiRuntimeResolver,
+  satisfiesPiRange,
+  resolveAppLlmModel,
+  PI_PACKAGE_NAME,
+} from '../src/agent/runtime-resolver.js';
+import { buildDefaultAgentConfig } from '../src/types/agent-knowledge.js';
+import { buildDefaultLlmConfigForTest } from './helpers/llm-fixture.js';
+import { makeRuntimeInstallation } from './helpers/runtime-installation.js';
+
+let fixtureRoot: string;
+
+function makeFakeNode(dir: string, version: string): string {
+  // 可执行名必须是 `node`（resolver 按 PATH/dir/node 定位）；不同用例
+  // 各自建独立子目录避免冲突。
+  fs.mkdirSync(dir, { recursive: true });
+  const script = path.join(dir, 'node');
+  fs.writeFileSync(script, `#!/bin/sh\necho "v${version}"\n`, { mode: 0o755 });
+  return script;
+}
+
+function makeFakePiAtLibNodeModules(base: string, version: string): string {
+  const pkgRoot = path.join(base, 'lib', 'node_modules', ...PI_PACKAGE_NAME.split('/'));
+  fs.mkdirSync(path.join(pkgRoot, 'dist'), { recursive: true });
+  fs.writeFileSync(path.join(pkgRoot, 'package.json'), JSON.stringify({ name: PI_PACKAGE_NAME, version }));
+  fs.writeFileSync(path.join(pkgRoot, 'dist', 'cli.js'), '// fake');
+  return pkgRoot;
+}
+
+beforeAll(() => {
+  fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-resolver-fx-'));
+});
+
+afterAll(() => {
+  fs.rmSync(fixtureRoot, { recursive: true, force: true });
+});
+
+describe('compareVersions / satisfiesPiRange', () => {
+  it('语义化比较', () => {
+    expect(compareVersions('22.19.0', '22.19.0')).toBe(0);
+    expect(compareVersions('22.19.1', '22.19.0')).toBe(1);
+    expect(compareVersions('22.9.0', '22.19.0')).toBe(-1);
+    expect(compareVersions('v24.21.0', '22.19.0')).toBe(1);
+    expect(compareVersions('24.0.0-alpha', '24.0.0')).toBe(0);
+  });
+
+  it('pi 支持范围 >=1.4.0 <2.0.0', () => {
+    expect(satisfiesPiRange('1.4.0')).toBe(true);
+    expect(satisfiesPiRange('1.9.9')).toBe(true);
+    expect(satisfiesPiRange('1.3.9')).toBe(false);
+    expect(satisfiesPiRange('2.0.0')).toBe(false);
+    expect(satisfiesPiRange('2.1.0')).toBe(false);
+  });
+});
+
+describe('resolveRuntime（fixture）', () => {
+  it('标准布局、缺pi回退及显式pi均不执行npm symlink入口', async () => {
+    const fixture = makeRuntimeInstallation(path.join(fixtureRoot, 'npm-symlink'));
+    const resolver = new PiRuntimeResolver({ env: { PATH: '' } });
+    const config = buildDefaultAgentConfig(fixtureRoot);
+    config.runtime.nodePath = fixture.nodePath;
+    const found = await resolver.resolveRuntime(config);
+    expect(found.piPackageRoot).toBe(fixture.piRoot);
+    expect(fs.existsSync(fixture.marker)).toBe(false);
+    const customPi = `${fixture.piRoot}-custom`;
+    fs.renameSync(fixture.piRoot, customPi);
+    expect((await resolver.resolveRuntime(config)).piCliPath).toBeNull();
+    expect(fs.existsSync(fixture.marker)).toBe(false);
+    config.runtime.piCliPath = path.join(customPi, 'dist', 'cli.js');
+    expect((await resolver.resolveRuntime(config)).piPackageRoot).toBe(customPi);
+    expect(fs.existsSync(fixture.marker)).toBe(false);
+  });
+
+  it('无候选 → node_missing（nodePath null）', async () => {
+    const resolver = new PiRuntimeResolver({
+      env: { PATH: path.join(fixtureRoot, 'nonexistent-bin') },
+      execNodeVersion: async () => null,
+    });
+    const runtime = await resolver.resolveRuntime(buildDefaultAgentConfig(fixtureRoot));
+    expect(runtime.nodePath).toBeNull();
+  });
+
+  it('找到旧 Node → 不选中，供 node_too_old 诊断', async () => {
+    const nodeDir = path.join(fixtureRoot, 'old-node');
+    const nodePath = makeFakeNode(nodeDir, '20.18.0');
+    const resolver = new PiRuntimeResolver({
+      env: { PATH: nodeDir },
+      execNodeVersion: async (candidate) => (candidate === nodePath ? '20.18.0' : null),
+    });
+    const runtime = await resolver.resolveRuntime(buildDefaultAgentConfig(fixtureRoot));
+    expect(runtime.nodePath).toBeNull();
+  });
+
+  it('PATH 上的新 Node + lib/node_modules pi 包 → 全部解析', async () => {
+    const base = path.join(fixtureRoot, 'good');
+    const binDir = path.join(base, 'bin');
+    const nodePath = makeFakeNode(binDir, '24.21.0');
+    const pkgRoot = path.join(base, 'lib', 'node_modules', ...PI_PACKAGE_NAME.split('/'));
+    fs.mkdirSync(path.join(pkgRoot, 'dist'), { recursive: true });
+    fs.writeFileSync(path.join(pkgRoot, 'package.json'), JSON.stringify({ name: PI_PACKAGE_NAME, version: '1.4.0' }));
+    fs.writeFileSync(path.join(pkgRoot, 'dist', 'cli.js'), '// fake');
+
+    const resolver = new PiRuntimeResolver({
+      env: { PATH: binDir },
+      execNodeVersion: async (candidate) => (candidate === nodePath ? '24.21.0' : null),
+    });
+    const runtime = await resolver.resolveRuntime(buildDefaultAgentConfig(fixtureRoot));
+    expect(runtime.nodePath).toBe(nodePath);
+    expect(runtime.nodeVersion).toBe('24.21.0');
+    expect(runtime.piPackageRoot).toBe(pkgRoot);
+    expect(runtime.piCliPath).toBe(path.join(pkgRoot, 'dist', 'cli.js'));
+    expect(runtime.piVersion).toBe('1.4.0');
+  });
+
+  it('显式 nodePath 排他：坏路径不静默换安装（node_too_old 诊断路径）', async () => {
+    const bad = path.join(fixtureRoot, 'does-not-exist-node');
+    const config = buildDefaultAgentConfig(fixtureRoot);
+    config.runtime.nodePath = bad;
+    const resolver = new PiRuntimeResolver({
+      env: { PATH: '' },
+      execNodeVersion: async () => null,
+    });
+    const runtime = await resolver.resolveRuntime(config);
+    expect(runtime.nodePath).toBeNull();
+  });
+
+  it('pi 包名不匹配 → pi_missing；版本越界 → 版本信息保留供诊断', async () => {
+    const base = path.join(fixtureRoot, 'wrong-pi');
+    const binDir = path.join(base, 'bin');
+    const nodePath = makeFakeNode(binDir, '23.0.0');
+    // 名字不匹配的包放在标准位置
+    const pkgRoot = path.join(base, 'lib', 'node_modules', 'other-package');
+    fs.mkdirSync(path.join(pkgRoot, 'dist'), { recursive: true });
+    fs.writeFileSync(path.join(pkgRoot, 'package.json'), JSON.stringify({ name: 'other-package', version: '2.5.0' }));
+    fs.writeFileSync(path.join(pkgRoot, 'dist', 'cli.js'), '// fake');
+    fs.symlinkSync(path.join(pkgRoot, 'dist', 'cli.js'), path.join(binDir, 'pi'));
+
+    const resolver = new PiRuntimeResolver({
+      env: { PATH: binDir },
+      execNodeVersion: async (candidate) => (candidate === nodePath ? '23.0.0' : null),
+    });
+    const runtime = await resolver.resolveRuntime(buildDefaultAgentConfig(fixtureRoot));
+    expect(runtime.nodePath).toBe(nodePath);
+    expect(runtime.piCliPath).toBeNull(); // 名字不匹配的包不采用
+  });
+
+  it('PATH 上 pi 可执行 realpath 回溯包根', async () => {
+    const base = path.join(fixtureRoot, 'pi-shim');
+    const binDir = path.join(base, 'shim-bin');
+    const pkgRoot = makeFakePiAtLibNodeModules(base, '1.5.2');
+    fs.mkdirSync(binDir, { recursive: true });
+    const nodeDir = path.join(base, 'node-bin');
+    const nodePath = makeFakeNode(nodeDir, '22.20.0');
+    // bin/pi 用 symlink 指向包内 cli（模拟 npm 全局 bin 布局；realpath
+    // 回溯依赖 symlink，不解析脚本内容）
+    const cliEntry = path.join(pkgRoot, 'dist', 'cli.js');
+    fs.chmodSync(cliEntry, 0o755);
+    fs.symlinkSync(cliEntry, path.join(binDir, 'pi'));
+
+    const resolver = new PiRuntimeResolver({
+      env: { PATH: `${binDir}${path.delimiter}${nodeDir}` },
+      execNodeVersion: async (candidate) => (candidate === nodePath ? '22.20.0' : null),
+    });
+    const runtime = await resolver.resolveRuntime(buildDefaultAgentConfig(fixtureRoot));
+    expect(runtime.nodePath).toBe(nodePath);
+    expect(runtime.piCliPath).toBe(cliEntry);
+    expect(runtime.piVersion).toBe('1.5.2');
+  });
+});
+
+describe('checkReadiness 就绪码（fixture）', () => {
+  it('app-llm 无 provider → model_unconfigured', async () => {
+    const resolver = new PiRuntimeResolver({ env: { PATH: '' }, execNodeVersion: async () => null });
+    const llm = buildDefaultLlmConfigForTest();
+    llm.providers = [];
+    const result = await resolver.checkReadiness({
+      agentConfig: buildDefaultAgentConfig(fixtureRoot),
+      llmConfig: llm,
+      runningProcesses: 0,
+    });
+    expect(result.code).toBe('node_missing'); // 无 node 时先卡 node_missing
+  });
+
+  it('app-llm 有 provider 无 key → model_auth_missing（node/pi 就绪后）', async () => {
+    const base = path.join(fixtureRoot, 'ready-nokey');
+    const binDir = path.join(base, 'bin');
+    const nodePath = makeFakeNode(binDir, '24.0.0');
+    makeFakePiAtLibNodeModules(base, '1.4.1');
+    const resolver = new PiRuntimeResolver({
+      env: { PATH: binDir },
+      execNodeVersion: async (candidate) => (candidate === nodePath ? '24.0.0' : null),
+    });
+    const llm = buildDefaultLlmConfigForTest();
+    llm.providers = [{
+      id: 'bigmodel', name: '智谱', enabled: true, apiKey: '',
+      openAiCompatBaseUrl: 'https://open.bigmodel.cn/api/paas/v4',
+      models: [{ id: 'default', name: '默认', openAiModel: 'glm-4-flash', enabled: true }],
+    }];
+    const result = await resolver.checkReadiness({
+      agentConfig: buildDefaultAgentConfig(fixtureRoot),
+      llmConfig: llm,
+      runningProcesses: 0,
+    });
+    expect(result.code).toBe('model_auth_missing');
+  });
+
+  it('pi-agent-dir 无 piModel → model_unconfigured', async () => {
+    const base = path.join(fixtureRoot, 'pidir-nomodel');
+    const binDir = path.join(base, 'bin');
+    const nodePath = makeFakeNode(binDir, '24.0.0');
+    makeFakePiAtLibNodeModules(base, '1.4.1');
+    const resolver = new PiRuntimeResolver({
+      env: { PATH: binDir },
+      execNodeVersion: async (candidate) => (candidate === nodePath ? '24.0.0' : null),
+    });
+    const config = buildDefaultAgentConfig(fixtureRoot);
+    config.model.source = 'pi-agent-dir';
+    config.model.piModel = undefined;
+    const result = await resolver.checkReadiness({
+      agentConfig: config,
+      llmConfig: buildDefaultLlmConfigForTest(),
+      runningProcesses: 0,
+    });
+    expect(result.code).toBe('model_unconfigured');
+  });
+});
+
+describe('resolveAppLlmModel', () => {
+  it('显式 providerId/modelId 优先，缺省回落 active*，key 回落根 apiKey', () => {
+    const llm = buildDefaultLlmConfigForTest();
+    const agent = buildDefaultAgentConfig(fixtureRoot);
+    const resolved = resolveAppLlmModel(llm, agent);
+    expect(resolved).not.toBeNull();
+    expect(resolved!.openAiModel).toBe('glm-4-flash');
+    expect(resolved!.baseUrl).toContain('bigmodel');
+
+    const agentExplicit = buildDefaultAgentConfig(fixtureRoot);
+    agentExplicit.model.providerId = 'second';
+    agentExplicit.model.modelId = 'm2';
+    const second = resolveAppLlmModel(llm, agentExplicit);
+    expect(second?.openAiModel).toBe('glm-4.6');
+  });
+});

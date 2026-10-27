@@ -34,6 +34,17 @@ import { trashRoutes } from './routes/trash.js';
 import { customFolderRoutes } from './routes/custom-folders.js';
 import { orphanFilesRoutes } from './routes/orphan-files.js';
 import { llmRoutes } from './routes/llm.js';
+import { agentInternalRoutes } from './routes/agent-internal.js';
+import { agentRoutes } from './routes/agent.js';
+import { kbRoutes } from './routes/kb.js';
+import { PiRuntimeResolver } from './agent/runtime-resolver.js';
+import { AgentProcessPool } from './agent/agent-process-pool.js';
+import { AgentToolService } from './agent/agent-tool-service.js';
+import { SessionService } from './agent/session-service.js';
+import { KbBuildService } from './kb/kb-build-service.js';
+import { piExtensionPath, readAgentPromptAssets } from './agent/agent-assets.js';
+import { checkRootOverlap, type WorkspaceRootGuards } from './agent/path-guard.js';
+import { collectResolvedRuntimeProtectedRoots, collectStaticProtectedRoots } from './agent/protected-roots.js';
 import type { LarkCliConfig } from './types/index.js';
 
 // ============================================================================
@@ -151,6 +162,79 @@ export async function buildServer(options: CreateServerOptions = {}) {
   );
   console.info('[server] ChangeDetector initialized');
 
+  // ===========================================================================
+  // Agent 标准知识库（F1）：运行时发现 / 进程池 / 工具服务 / 会话 / 构建
+  // ===========================================================================
+  console.info('[server] Initializing Agent knowledge modules');
+  const agentDataRoot = resolveDataRoot();
+  const runtimeResolver = new PiRuntimeResolver();
+  const agentPool = new AgentProcessPool({
+    maxConcurrentProcesses: config.agent.maxConcurrentProcesses,
+    idleTimeoutMinutes: config.agent.idleTimeoutMinutes,
+  });
+  const sheetCsvPaths = (objToken: string): string[] =>
+    localMapStore.getSheetSheets(objToken)
+      .map((sheet) => sheet.local_csv_path)
+      .filter((csvPath) => typeof csvPath === 'string' && csvPath.length > 0);
+  const agentToolService = new AgentToolService({
+    dataRoot: agentDataRoot,
+    documentsProvider: () => localMapStore.getAllDocuments(),
+    sheetCsvPaths,
+    workspaceGuard: (workspaceRoot) => checkRootOverlap(workspaceRoot, workspaceGuardsSnapshot()),
+  });
+  // 回环内部 API 基址：端口在 startServer 监听后回填（构建/会话 spawn 前必然已知）
+  const agentInternalPort = { port: null as number | null };
+  // F3-R02：当前配置快照的 Workspace 守卫。受保护运行根 = 静态（源码/
+  // node_modules/Electron）+ 服务生命周期已发现的运行时根（node/pi/npm）。
+  // 切换配置不会终止旧进程，因此旧安装根到服务重启前也不能开放为Workspace。
+  const workspaceGuardsSnapshot = (): WorkspaceRootGuards => {
+    const config = configManager.getConfig();
+    return {
+      knowledgeBaseRoot: config?.knowledgeBaseRoot ?? '',
+      outputRoot: config?.standardKb.outputRoot ?? '',
+      dataRoot: agentDataRoot,
+      protectedRoots: [...collectStaticProtectedRoots(), ...collectResolvedRuntimeProtectedRoots(runtimeResolver)],
+    };
+  };
+  void (async () => {
+    try {
+      const agentConfig = configManager.getConfig()?.agent;
+      if (agentConfig) {
+        await runtimeResolver.resolveRuntime(agentConfig);
+      }
+    } catch {
+      /* 发现失败时静态根仍生效；spawn 时 resolver 会给出明确错误 */
+    }
+  })();
+  const sessionService = new SessionService({
+    dataRoot: agentDataRoot,
+    pool: agentPool,
+    toolService: agentToolService,
+    resolver: runtimeResolver,
+    configProvider: () => configManager.getConfig(),
+    internalBaseUrl: () => (agentInternalPort.port ? `http://127.0.0.1:${agentInternalPort.port}` : ''),
+    extensionPath: piExtensionPath,
+    workspaceGuards: workspaceGuardsSnapshot,
+  });
+  const kbBuildService = new KbBuildService({
+    dataRoot: agentDataRoot,
+    pool: agentPool,
+    toolService: agentToolService,
+    resolver: runtimeResolver,
+    configProvider: () => configManager.getConfig(),
+    documentsProvider: () => localMapStore.getAllDocuments(),
+    sheetCsvPaths,
+    internalBaseUrl: () => (agentInternalPort.port ? `http://127.0.0.1:${agentInternalPort.port}` : ''),
+    extensionPath: piExtensionPath,
+    promptAssets: readAgentPromptAssets,
+  });
+  // 启动对账：非终态构建置 interrupted；CURRENT 指针为准补 DB
+  const reconcile = kbBuildService.reconcileOnStartup(localMapStore);
+  if (reconcile.interruptedBuildIds.length > 0) {
+    console.info(`[server] kb builds reconciled: ${reconcile.interruptedBuildIds.join(', ')} → interrupted`);
+  }
+  console.info('[server] Agent knowledge modules initialized');
+
   // Create Hono app
   console.info('[server] Creating Hono app');
   const app = new Hono();
@@ -187,6 +271,9 @@ export async function buildServer(options: CreateServerOptions = {}) {
     (c as any).larkCliManager = larkCliManager;
     (c as any).localMapStore = localMapStore;
     (c as any).changeDetector = changeDetector;
+    (c as any).agentSessionService = sessionService;
+    (c as any).kbBuildService = kbBuildService;
+    (c as any).agentRuntimeResolver = runtimeResolver;
 
     // Inject desktopToken for auth middleware via context property
     if (desktopMode) {
@@ -203,6 +290,11 @@ export async function buildServer(options: CreateServerOptions = {}) {
 
   app.route('/', healthRoutes); // Health check is always public (must be before auth middleware)
   console.info('[server] Health routes registered');
+
+  // Agent 内部工具 API（设计 §9.6）：必须在 desktop auth 之前挂载，
+  // 自带回环 + 运行令牌 + 拒 Origin 三重校验（浏览器不可达）。
+  app.route('/', agentInternalRoutes(agentToolService));
+  console.info('[server] Agent internal tool routes registered (pre-auth, loopback + run token)');
 
   // Token authentication (desktop mode only, must run after dependency injection)
   if (desktopMode) {
@@ -224,6 +316,22 @@ export async function buildServer(options: CreateServerOptions = {}) {
   app.route('/', customFolderRoutes);
   app.route('/', orphanFilesRoutes);
   app.route('/', llmRoutes);
+  app.route('/', await agentRoutes({
+    sessionService,
+    toolService: agentToolService,
+    pool: agentPool,
+    resolver: runtimeResolver,
+    configManager,
+    localMapStore,
+    internalPort: () => agentInternalPort.port,
+  }));
+  app.route('/', kbRoutes({
+    buildService: kbBuildService,
+    configManager,
+    localMapStore,
+    documentsProvider: () => localMapStore.getAllDocuments(),
+    sheetCsvPaths,
+  }));
   console.info('[server] Protected routes registered');
 
   // ============================================================================
@@ -243,6 +351,12 @@ export async function buildServer(options: CreateServerOptions = {}) {
   });
 
   console.info('[server] buildServer completed');
+  // 暴露内部端口回填器与进程池（startServer 用；close 时回收子进程）
+  (app as any).__setAgentInternalPort = (port: number) => {
+    agentInternalPort.port = port;
+  };
+  (app as any).__agentPool = agentPool;
+  (app as any).__agentToolService = agentToolService;
   return app;
 }
 
@@ -295,10 +409,24 @@ export async function startServer(options: CreateServerOptions & {
   console.info(`[server] Feishu Sync API listening on ${url}`);
   console.info(`[server] Desktop mode: ${options.desktopMode ? 'enabled' : 'disabled'}`);
 
+  // 回填 Agent 内部 API 端口（session/build spawn pi 进程时需要）
+  const setPort = (app as any).__setAgentInternalPort as ((port: number) => void) | undefined;
+  setPort?.(actualPort);
+
   let closed = false;
   const close = async () => {
     if (closed) return;
     closed = true;
+    // 先回收 pi 子进程（SIGTERM → 3s → SIGKILL / Windows taskkill），
+    // 再关 HTTP：内部工具 API 必须在子进程存续期间可达。
+    const agentPool = (app as any).__agentPool as { closeAll: () => Promise<void> } | undefined;
+    if (agentPool?.closeAll) {
+      try {
+        await agentPool.closeAll();
+      } catch (error) {
+        console.warn('[server] agent pool close failed:', error);
+      }
+    }
     await new Promise<void>((resolve) => {
       let settled = false;
       const finish = () => {

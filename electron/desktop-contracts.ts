@@ -74,6 +74,13 @@ export interface DesktopAPI {
   openDataDirectory: () => Promise<DesktopActionResult>;
 
   /**
+   * F2 Agent Workspace: native directory picker (design §9.4).
+   * Resolves to the chosen absolute path, or null when the user cancels.
+   * Path validity is validated server-side only (§7.3).
+   */
+  selectDirectory: () => Promise<string | null>;
+
+  /**
    * Open application configuration file in default editor
    */
   openConfigFile: () => Promise<DesktopActionResult>;

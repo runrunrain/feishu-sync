@@ -373,6 +373,24 @@ ipcMain.handle('desktop:open-data-directory', async () => {
   return result ? { ok: false, code: 'open-data-directory-failed', error: sanitizeDesktopError(result) } : { ok: true };
 });
 
+// F2 Agent Workspace：原生目录选择对话框（设计 §9.4）。与 openDataDirectory
+// 不同，这里返回用户选中的绝对路径（或 null=取消），不做任何路径合法性
+// 判断——合法性只由后端 /api/agent/workspaces 校验（§7.3），前端不重复实现。
+ipcMain.handle('desktop:select-directory', async (event) => {
+  const parentWindow = BrowserWindow.fromWebContents(event.sender) ?? mainWindow;
+  if (!parentWindow) {
+    return null;
+  }
+  const result = await dialog.showOpenDialog(parentWindow, {
+    properties: ['openDirectory', 'createDirectory'],
+    title: '选择 Workspace 目录',
+  });
+  if (result.canceled || result.filePaths.length === 0) {
+    return null;
+  }
+  return result.filePaths[0];
+});
+
 ipcMain.handle('desktop:open-config-file', async () => {
   // P4: server and desktop share ~/.feishu-sync (not Electron userData).
   const configPath = path.join(

@@ -15,6 +15,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { LucideIcon } from 'lucide-react';
 import {
+  Bot,
   BookOpen,
   Database,
   FolderArchive,
@@ -34,8 +35,9 @@ import { CustomArchiveSettingsCard } from '../components/CustomArchiveSettingsCa
 import { ModelProviderSettings } from '../components/ModelProviderSettings';
 import { AuthSettingsCard } from '../components/AuthSettingsCard';
 import { AppUpdateCard } from '../components/AppUpdateCard';
+import { AgentRuntimeSettingsCard, AgentKbSettingsCard } from '../components/agent/AgentSettingsCard';
 
-type SettingsTab = 'knowledge' | 'models' | 'auth' | 'application';
+type SettingsTab = 'knowledge' | 'models' | 'agent' | 'auth' | 'application';
 
 /** 第二层导航：一个侧栏项 = 一张独立子卡片 */
 interface SettingsSubItem {
@@ -104,6 +106,28 @@ const SETTINGS_TABS: SettingsTabMeta[] = [
         description: 'OpenAI 兼容端点、密钥与模型别名',
         icon: Server,
         render: () => <ModelProviderSettings />,
+      },
+    ],
+  },
+  {
+    id: 'agent',
+    label: 'Agent 标准库',
+    description: 'pi 运行时、模型来源、标准库目录、Workspace 与 MCP',
+    icon: Bot,
+    items: [
+      {
+        id: 'agent-runtime',
+        label: '运行时与模型',
+        description: 'node/pi 发现与覆盖、模型来源与思考档位',
+        icon: Bot,
+        render: () => <AgentRuntimeSettingsCard />,
+      },
+      {
+        id: 'agent-kb',
+        label: '标准库与 Workspace',
+        description: '输出目录、Work 授权目录与 MCP 连接片段',
+        icon: Server,
+        render: () => <AgentKbSettingsCard />,
       },
     ],
   },

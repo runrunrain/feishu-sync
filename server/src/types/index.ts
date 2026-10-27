@@ -25,6 +25,8 @@ export interface WatchedRootConfig {
   enabled: boolean;
 }
 
+import type { AgentConfig, StandardKbConfig } from './agent-knowledge.js';
+
 export interface Config {
   /**
    * v0.2.0 P3: channel-agnostic LLM config. The legacy flat
@@ -36,6 +38,10 @@ export interface Config {
    * name `llm` but its type widens to the new shape.
    */
   llm: LlmConfig;
+  /** Agent 标准知识库（F1，additive）：旧配置无此段时由 ConfigManager 补默认。 */
+  agent: AgentConfig;
+  /** 标准库输出与构建参数（F1，additive）。 */
+  standardKb: StandardKbConfig;
   pollIntervalMinutes: number;
   knowledgeBaseRoot: string;
   /** Authoritative P2 root configuration. */

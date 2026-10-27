@@ -83,7 +83,7 @@ D 的代价：每个活跃会话一个进程（约百 MB 级内存）；扩展�
 3. pi 包候选（对选中的 node）：
    - `<nodeBinDir>/../lib/node_modules/@earendil-works/pi-coding-agent`（POSIX）/ `<nodeBinDir>/node_modules/...`（Windows）；
    - `PATH` 上 `pi` 可执行的 realpath 回溯到包根（`.../dist/bundle/cli.js` → 包根）；
-   - 同目录 `npm root -g` 的输出（用同一 node 的 npm，`execFile`，超时 10s）。
+   - 发现只读取目录、包元数据和可执行入口 realpath，不执行 `npm root -g` 或包管理器 shim；自定义 npm prefix 未在 PATH 暴露 pi 时，填写显式 `piCliPath`。
    校验包根 `package.json`：`name === "@earendil-works/pi-coding-agent"`，`version` 满足 `>=1.4.0 <2.0.0`，存在 `dist/cli.js`。
 4. 启动参数一律 `spawn(nodePath, [<pkg>/dist/cli.js, ...])`，不依赖 shebang 与 PATH（Finder 启动的 App 没有 shell PATH）。
 5. 结果缓存于内存，`POST /api/agent/status/recheck` 或配置变更时失效。

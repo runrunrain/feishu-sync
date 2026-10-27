@@ -3,6 +3,10 @@
  * Reuses server types where applicable
  */
 
+import type { AgentConfig, StandardKbConfig } from './agent';
+
+export type { AgentConfig, StandardKbConfig } from './agent';
+
 // Re-export shared types from server (will be available in production build)
 // For development, we define them here for type safety
 
@@ -29,6 +33,9 @@ export interface Config {
   requiredScopes: string[];
   enableAutoStart: boolean;
   enableNotifications: boolean;
+  /** F2 Agent 标准知识库（设计 §5.2；旧配置缺省时由服务端补默认值）。 */
+  agent?: AgentConfig;
+  standardKb?: StandardKbConfig;
 }
 
 /** One model preset inside a provider's OpenAI-compatible route. */
@@ -598,6 +605,8 @@ export interface DesktopAPI {
     onEvent: (callback: (event: DesktopUpdateEvent) => void) => () => void;
   };
   openDataDirectory: () => Promise<DesktopActionResult>;
+  /** F2 Agent Workspace：原生目录选择（设计 §9.4）；取消返回 null。路径合法性只由后端校验。 */
+  selectDirectory: () => Promise<string | null>;
   openConfigFile: () => Promise<DesktopActionResult>;
   /** 在系统默认浏览器打开外部 URL（仅 http/https，与 electron/main.ts 白名单对应）。 */
   openExternal: (url: string) => Promise<DesktopActionResult>;

@@ -346,6 +346,7 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
                 baseDir={mdBaseDir}
                 onNavigateCsv={handleNavigateCsv}
                 feishuHost={feishuHost}
+                remoteImages="confirm"
               />
             </div>
           ) : hasMd ? (

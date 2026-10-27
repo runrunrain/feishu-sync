@@ -60,6 +60,12 @@ const desktopApi: DesktopAPI = {
     return ipcRenderer.invoke('desktop:open-data-directory');
   },
 
+  // F2 Agent Workspace：原生目录选择（设计 §9.4）。返回选中绝对路径，
+  // 用户取消返回 null；路径合法性由后端统一校验。
+  selectDirectory: async (): Promise<string | null> => {
+    return ipcRenderer.invoke('desktop:select-directory');
+  },
+
   openConfigFile: async (): Promise<DesktopActionResult> => {
     return ipcRenderer.invoke('desktop:open-config-file');
   },

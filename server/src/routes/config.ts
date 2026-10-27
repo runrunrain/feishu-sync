@@ -10,6 +10,8 @@ import path from 'node:path';
 import { Hono } from 'hono';
 import type { Config, WatchedRootConfig } from '../types/index.js';
 import { sanitizeLocalDirName, suggestKnowledgeRoot } from '../modules/config-manager.js';
+import { collectResolvedRuntimeProtectedRoots } from '../agent/protected-roots.js';
+import { checkRootOverlap } from '../agent/path-guard.js';
 
 const configRoutes = new Hono();
 
@@ -155,6 +157,11 @@ configRoutes.put('/api/config', async (c) => {
   }
 
   try {
+    // F1：PUT /api/config 剔除 agent.workspaces（Workspace 增删只走专用
+    // 路由 POST/DELETE /api/agent/workspaces，防 UI 全量回传绕过路径校验）。
+    if (partialConfig.agent && typeof partialConfig.agent === 'object') {
+      delete (partialConfig.agent as { workspaces?: unknown }).workspaces;
+    }
     // 2026-09-04 watchedRoot 删除级联清理：对比保存前后 watchedRoots，
     // 被移除的根在保存成功后自动 purge 其 DB 数据（documents/sheets/
     // pending/localDirs）——否则树面板残留「未分类」组且无法清理。
@@ -201,6 +208,43 @@ configRoutes.put('/api/config', async (c) => {
         taken.add(unique);
         root.localDir = unique;
         autoNamedRoots.push(root as WatchedRootConfig);
+      }
+    }
+
+    // F3-R02：agent.runtime 变更（nodePath/piCliPath 指向新的 pi 安装根）
+    // 时，已有 Workspace 不得覆盖/位于新安装根——否则下次 spawn 就是用
+    // 被改写过的 pi 执行。ConfigManager 只做同步静态保护根交叉校验，
+    // 运行时发现根在此处（有 resolver）补充。发现失败不阻断保存：
+    // resolver 自身会在 spawn 前给出明确错误。
+    const runtimeChange = partialConfig.agent?.runtime;
+    if (runtimeChange && typeof runtimeChange === 'object'
+      && ('nodePath' in runtimeChange || 'piCliPath' in runtimeChange)) {
+      const resolver = (c as any).agentRuntimeResolver;
+      const currentConfig: Config = configBefore;
+      const candidateAgent = { ...currentConfig.agent, ...partialConfig.agent };
+      try {
+        await resolver.resolveRuntime(candidateAgent);
+      } catch {
+        /* 非法 runtime 由后续 spawn 时报错；这里不重复拦截 */
+      }
+      const runtimeRoots = collectResolvedRuntimeProtectedRoots(resolver);
+      if (runtimeRoots.length > 0) {
+        for (const workspace of currentConfig.agent.workspaces) {
+          // 本处只补运行时安装根交叉校验；knowledgeBaseRoot/outputRoot/
+          // dataRoot/静态保护根由 ConfigManager.updateConfig 同步校验（传空跳过）。
+          const verdict = checkRootOverlap(workspace.path, {
+            knowledgeBaseRoot: '',
+            outputRoot: '',
+            dataRoot: '',
+            protectedRoots: runtimeRoots,
+          });
+          if (!verdict.ok) {
+            return c.json({
+              error: 'config_validation_failed',
+              message: `保存被拒绝：Workspace「${workspace.name}」与新运行时安装根冲突：${verdict.message}`,
+            }, 400);
+          }
+        }
       }
     }
 

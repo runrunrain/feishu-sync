@@ -16,17 +16,19 @@ import { TopBar, MainArea } from './components/TopBar';
 import { Dashboard } from './views/Dashboard';
 import { SyncView } from './views/SyncView';
 import { SettingsView } from './views/SettingsView';
+import { KnowledgeView } from './views/KnowledgeView';
+import { AgentView } from './views/AgentView';
 import { useDesktopUpdateBadge } from './hooks/useDesktopUpdate';
 import { SyncProvider } from './hooks/useSync';
 
 function AppShell() {
   const [currentArea, setCurrentArea] = useState<MainArea>('overview');
-  const [settingsFocusTab, setSettingsFocusTab] = useState<'application' | undefined>(undefined);
+  const [settingsFocusTab, setSettingsFocusTab] = useState<'application' | 'agent' | undefined>(undefined);
   const [settingsFocusNonce, setSettingsFocusNonce] = useState(0);
   // 全局新版本徽标（仅桌面端；启动时主进程会静默检查一次更新）。
   const { availableVersion } = useDesktopUpdateBadge();
 
-  const handleJumpToSettings = (tab?: 'application') => {
+  const handleJumpToSettings = (tab?: 'application' | 'agent') => {
     if (tab) {
       setSettingsFocusTab(tab);
       setSettingsFocusNonce((n) => n + 1);
@@ -77,6 +79,20 @@ function AppShell() {
             <SyncView
               active={currentArea === 'sync'}
               onJumpToSettings={() => handleJumpToSettings()}
+            />
+          </div>
+          {/* F2 标准库 / 对话：同样常驻挂载——构建进度与会话生成状态在
+              导航往返后保留（任务书：导航常驻策略保留运行状态）。 */}
+          <div className={currentArea === 'knowledge' ? 'flex-1 min-h-0 flex flex-col animate-fade-in' : 'hidden'}>
+            <KnowledgeView
+              active={currentArea === 'knowledge'}
+              onJumpToSettings={() => handleJumpToSettings('agent')}
+            />
+          </div>
+          <div className={currentArea === 'agent' ? 'flex-1 min-h-0 flex flex-col animate-fade-in' : 'hidden'}>
+            <AgentView
+              active={currentArea === 'agent'}
+              onJumpToSettings={() => handleJumpToSettings('agent')}
             />
           </div>
           <div className={currentArea === 'settings' ? 'animate-fade-in' : 'hidden'}>

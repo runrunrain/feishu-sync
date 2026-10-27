@@ -105,6 +105,16 @@ npx tsx scripts/sync-latest.ts --skip-index --apply    # 提交KB正文，仅 cr
 - Registry 的 `getFallback()` 恒为 null——整理失败由 sync-engine 的确定性 B6 结果兜底。channel 失败不抛异常，返回 `finishReason='error'/'timeout'`。
 - 默认超时 `timeoutMs = 600_000`（10 分钟）——远程模型过载时 SDK 内部重试，旧 60s 会误判超时。
 
+### Agent 标准知识库工作台（开发分支，未发版）
+
+- 先读 `docs/design/agent-knowledge-design.md`，使用说明在 `docs/agent-knowledge.md`；`server/src/agent/`、`kb/`、`mcp/` 独立于既有同步/整理流水线。不要把 pi 接入 ContentBackend registry，也不为 pi 升级 Electron。
+- pi 经外部 Node≥22.19、pi≥1.4/<2 的 JSONL RPC 启动。应用自身的转发扩展只调用回环内部API；服务端裁决工具集与能力令牌。Discuss 工具级只读，Work 首轮不提供 shell。
+- Workspace 与原始库、标准库、数据根、完整应用代码/依赖、Node/pi运行资源和凭据根隔离；配置变更要做反向交叉验证，不能只在登记目录时校验。文件围栏不是同uid/外部自动执行器的OS沙箱。
+- 原始源以成功本地版本和hash为准，不能仅筛status=synced，也不能因cloudDeleted观测而删仍存在的源；CSV附件与主文档同围栏，源变化须阻断构建，模型skip不能绕过。
+- 标准库先staging校验，再生成不可变release、原子切CURRENT；提交后DB异常按指针对账，清理异常不得删除current release。不要把原同步引擎的“DB失败回滚文件”套在此处。
+- 会话历史真相在pi JSONL树，元数据节点不能截断回溯；SSE message_end必须是完整DTO，初始0游标、溢出resync、工具多轮与停止ACK竞态都需实际流回归。状态只能按权威事件推进，不用“请求停止”冒充完成。
+- `server/scripts/build-agent-assets.mjs` 随server build复制prompts/转发扩展并生成独立MCP CJS；MCP只读已发布文件，不导入SQLite。测试一律临时FEISHU_SYNC_HOME；真实模型fixture与真实生产资料严格分开记录。
+
 ### 数据层
 
 - SQLite 在 `~/.feishu-sync/feishu-sync.db`，config 在 `~/.feishu-sync/config.json`；环境变量 `FEISHU_SYNC_HOME` 可整体改根目录（server 与 desktop 共享，**不是** Electron userData）。除 documents/sync_log/run_log 主表外还有 localDirs/custom_folders/sheet_sheets/feishu_pending_items 等辅助表，全部经 additive 迁移演进。
