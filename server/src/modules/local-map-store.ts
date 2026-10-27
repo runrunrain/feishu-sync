@@ -2109,6 +2109,23 @@ export class LocalMapStore {
   // Agent 标准知识库（F1）：kb_builds / agent_sessions 访问器
   // ===========================================================================
 
+  /** 排除标记独立于documents，索引重建/重新同步不清除；按真实原始库根隔离。 */
+  private kbSourceRootKey(root: string): string {
+    try { return fs.realpathSync.native(root); } catch { return path.resolve(root); }
+  }
+
+  listKbExcludedSources(root: string): string[] {
+    return (this.db.prepare('SELECT obj_token FROM kb_source_exclusions WHERE knowledge_root=? ORDER BY obj_token')
+      .all(this.kbSourceRootKey(root)) as Array<{ obj_token: string }>).map((row) => row.obj_token);
+  }
+
+  setKbSourceExcluded(root: string, objToken: string, excluded: boolean): void {
+    const key = this.kbSourceRootKey(root);
+    if (excluded) this.db.prepare('INSERT OR REPLACE INTO kb_source_exclusions (knowledge_root,obj_token,excluded_at) VALUES (?,?,?)')
+      .run(key, objToken, new Date().toISOString());
+    else this.db.prepare('DELETE FROM kb_source_exclusions WHERE knowledge_root=? AND obj_token=?').run(key, objToken);
+  }
+
   createKbBuild(input: {
     id: string;
     mode: 'incremental' | 'full';
@@ -2417,6 +2434,13 @@ export class LocalMapStore {
 
       -- 标准库构建历史。发布真相 = outputRoot/CURRENT.json + manifest；
       -- 本表只存构建历史，可由 manifest 重建（启动对账以指针为准）。
+      CREATE TABLE IF NOT EXISTS kb_source_exclusions (
+        knowledge_root TEXT NOT NULL,
+        obj_token TEXT NOT NULL,
+        excluded_at TEXT NOT NULL,
+        PRIMARY KEY (knowledge_root, obj_token)
+      );
+
       CREATE TABLE IF NOT EXISTS kb_builds (
         id TEXT PRIMARY KEY,
         mode TEXT NOT NULL CHECK(mode IN ('incremental', 'full')),

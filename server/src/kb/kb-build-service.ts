@@ -11,6 +11,7 @@
  */
 
 import crypto from 'node:crypto';
+import type { AppPluginStore, AppPluginSnapshot } from '../agent/app-plugin-store.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -23,7 +24,10 @@ import { buildPiProcessEnv, PiRpcProcess } from '../agent/pi-rpc-process.js';
 import { PiRuntimeResolver, resolveAppLlmModel } from '../agent/runtime-resolver.js';
 import { buildAppLlmRunConfig } from '../agent/provider-descriptor.js';
 import { RawSourceSnapshot, computeSourceHash } from './raw-source-snapshot.js';
-import { StandardKbStore, parseStdHeader } from './standard-kb-store.js';
+import { StandardKbStore, parseStdHeader, stripStdHeader } from './standard-kb-store.js';
+import { KbVersionStore, captureSourceContents, sourceChangePreview, type SourceContents } from './kb-version-store.js';
+import { hasEditorialHistory, hasSourceMetadata } from './body-policy.js';
+import type { KbChangePreview, KbFileChange } from '../types/kb-version.js';
 import {
   toolsForRunKind,
   type AgentStatusDto,
@@ -44,9 +48,11 @@ export interface KbBuildDeps {
   configProvider: () => Config | null;
   documentsProvider: () => import('../types/index.js').DocumentRecord[];
   sheetCsvPaths: (objToken: string) => string[];
+  excludedSourcesProvider?: () => string[];
   internalBaseUrl: () => string;
   extensionPath: () => string | null;
   promptAssets: () => { buildRules: string; styleGuide: string } | null;
+  pluginStore?: AppPluginStore;
 }
 
 interface InMemoryBuild {
@@ -72,6 +78,11 @@ export class KbBuildService extends EventEmitter {
   // ------------------------------------------------------------------
   // 目录布局
   // ------------------------------------------------------------------
+
+  private sourceDocuments() {
+    const excluded = new Set(this.deps.excludedSourcesProvider?.() ?? []);
+    return this.deps.documentsProvider().filter((doc) => !excluded.has(doc.objToken));
+  }
 
   private outputRoot(): string {
     return this.deps.configProvider()?.standardKb.outputRoot ?? '';
@@ -147,6 +158,8 @@ export class KbBuildService extends EventEmitter {
       finishedAt: row.finished_at ? String(row.finished_at) : null,
     };
   }
+
+  hasActiveRun(): boolean { return this.running; }
 
   activeBuild(localMapStore: { getActiveKbBuild(): Record<string, unknown> | null }): KbBuildDto | null {
     const row = localMapStore.getActiveKbBuild();
@@ -304,12 +317,14 @@ export class KbBuildService extends EventEmitter {
     };
 
     try {
+      // 本构建固定一份插件快照，后续修改只影响下次构建。
+      const pluginSnapshot = this.deps.pluginStore?.snapshot('build');
       // ============ preflight ============
       setStatus('preflight', { startedAt });
       this.emitLog(buildId, 'info', `preflight：运行时就绪，开始生成原始源快照`);
       cleanupOldStaging(outputRoot);
 
-      const documents = this.deps.documentsProvider();
+      const documents = this.sourceDocuments();
       const snapshotResult = RawSourceSnapshot.scan(
         config.knowledgeBaseRoot,
         documents,
@@ -333,6 +348,11 @@ export class KbBuildService extends EventEmitter {
       const store = new StandardKbStore(outputRoot);
       const basePointer: KbCurrentPointer | null = store.readCurrent();
       const baseManifest: KbManifest | null = basePointer ? store.readManifest(basePointer.releaseId) : null;
+      const versionStore = new KbVersionStore(outputRoot);
+      const sourceContents = captureSourceContents(snapshot, config.knowledgeBaseRoot);
+      const changePreview = sourceChangePreview(snapshot, sourceContents, baseManifest,
+        versionStore.readSourceContents(baseManifest?.releaseId ?? null),
+        new Set(this.deps.excludedSourcesProvider?.() ?? []));
       let effectiveMode = mode;
       if (mode === 'incremental' && !baseManifest) {
         effectiveMode = 'full';
@@ -411,6 +431,7 @@ export class KbBuildService extends EventEmitter {
         workset,
         stagingRoot: stagingRootPath,
         finishInfo: null,
+        writtenPaths: new Set(),
       };
       // 局部引用：TS 收窄 + 后续批次/finish/校验统一用它（避免可空回读）
       const buildState: BuildRunState = entry.buildState;
@@ -425,6 +446,9 @@ export class KbBuildService extends EventEmitter {
             .map((doc) => ({ path: doc.path, title: doc.title }))
         : [];
 
+      buildState.requiredRewrites = new Set(affectedDocs.map((doc) => doc.path)
+        .filter((docPath) => fs.existsSync(path.join(stagingRootPath, 'docs', docPath))));
+
       const batches = chunk(
         [...workset.keys()].sort(),
         Math.max(1, Math.min(50, config.standardKb.buildBatchSize)),
@@ -438,7 +462,7 @@ export class KbBuildService extends EventEmitter {
       this.emitLog(buildId, 'info', `开始模型构建（${effectiveMode}）：${workset.size} 个工作集源分 ${batches.length} 批`);
 
       // 拉起构建专用 pi 进程
-      const rpc = await this.spawnBuildProcess(buildId, buildState);
+      const rpc = await this.spawnBuildProcess(buildId, buildState, pluginSnapshot);
       entry.process = rpc;
       const overallTimeout = setTimeout(() => {
         this.emitLog(buildId, 'error', `构建整体超时（${config.standardKb.buildTimeoutMinutes} 分钟）`);
@@ -448,7 +472,7 @@ export class KbBuildService extends EventEmitter {
       overallTimeout.unref?.();
 
       try {
-        const assets = this.deps.promptAssets();
+        const assets = this.deps.pluginStore ? null : this.deps.promptAssets();
         const systemRules = assets
           ? `${assets.buildRules}\n\n${assets.styleGuide}`
           : '';
@@ -465,6 +489,7 @@ export class KbBuildService extends EventEmitter {
             batchIndex,
             batchTotal: batches.length,
             firstBatch: batchIndex === 0,
+            sourceChanges: changePreview.sources,
           });
           this.emitLog(buildId, 'info', `批次 ${batchIndex + 1}/${batches.length}：${batch.length} 个源`);
           const outcome = await rpc.prompt(
@@ -552,7 +577,7 @@ export class KbBuildService extends EventEmitter {
       if (entry.cancelRequested) throw new CancelledError();
       setStatus('publishing');
       const releaseId = `r_${new Date().toISOString().replace(/[-:]/g, '').replace('T', 'T').slice(0, 15)}_${crypto.randomBytes(3).toString('hex')}`;
-      verifySnapshotIntact(snapshot, config.knowledgeBaseRoot, this.deps.sheetCsvPaths, this.deps.documentsProvider());
+      verifySnapshotIntact(snapshot, config.knowledgeBaseRoot, this.deps.sheetCsvPaths, this.sourceDocuments());
       const manifest = await this.publishRelease({
         buildId,
         releaseId,
@@ -568,6 +593,9 @@ export class KbBuildService extends EventEmitter {
         stagingRoot: stagingRootPath,
         outputRoot,
         docMeta,
+        sourceContents,
+        changePreview,
+        summary: buildState.finishInfo?.summary ?? '',
       });
       stagingRootPath = ''; // 已被 rename 消费
       localMapStore.updateKbBuild(buildId, {
@@ -609,7 +637,7 @@ export class KbBuildService extends EventEmitter {
     (state as BuildRunState & { docMeta?: Map<string, { title: string; summary: string; tags: string[]; sources: string[] }> }).docMeta = docMeta;
   }
 
-  private async spawnBuildProcess(buildId: string, buildState: BuildRunState): Promise<PiRpcProcess> {
+  private async spawnBuildProcess(buildId: string, buildState: BuildRunState, pluginSnapshot?: AppPluginSnapshot): Promise<PiRpcProcess> {
     const config = this.deps.configProvider()!;
     const runtime = await this.deps.resolver.resolveRuntime(config.agent);
     if (!runtime.nodePath || !runtime.piCliPath) {
@@ -671,11 +699,18 @@ export class KbBuildService extends EventEmitter {
     if (providerJson) {
       env.FEISHU_SYNC_AGENT_PROVIDER_JSON = providerJson;
     }
+    if (pluginSnapshot) {
+      env.FEISHU_SYNC_AGENT_PLUGIN_SNAPSHOT = pluginSnapshot.path;
+      env.FEISHU_SYNC_AGENT_PLUGIN_REVISION = pluginSnapshot.revision;
+      if (pluginSnapshot.externalPlugins) env.FEISHU_SYNC_AGENT_EXTERNAL_PLUGINS = '1';
+    }
+    env.FEISHU_SYNC_AGENT_PI_PACKAGE_ROOT = runtime.piPackageRoot ?? '';
     const extensionPath = this.deps.extensionPath();
     const rpc = new PiRpcProcess({
       nodePath: runtime.nodePath,
       piCliPath: runtime.piCliPath,
       ...(extensionPath ? { extensionPath } : {}),
+      ...(pluginSnapshot ? { additionalExtensionPaths: pluginSnapshot.extensionPaths ?? [pluginSnapshot.extensionPath], allowExternalPluginTools: pluginSnapshot.externalPlugins, additionalSkillPaths: pluginSnapshot.skillPaths, additionalPromptPaths: pluginSnapshot.promptPaths, additionalThemePaths: pluginSnapshot.themePaths } : {}),
       tools: toolsForRunKind('build'),
       noSession: true,
       model,
@@ -707,14 +742,24 @@ export class KbBuildService extends EventEmitter {
     batchIndex: number;
     batchTotal: number;
     firstBatch: boolean;
+    sourceChanges?: KbFileChange[];
   }): string {
     const lines: string[] = [];
+    lines.push('正文必须为当前规则的完整说明。下面的diff只用于判断要更新什么；禁止把修订记录、本次改动、上版/本版对比或版本号写进正文。变更说明只填kb_finish.summary。');
+    for (const change of input.sourceChanges ?? []) {
+      if (!input.batch.includes(change.key) && change.kind !== 'removed') continue;
+      lines.push(`源差异 ${change.key}（${change.title}）：${change.kind}${change.reason === 'excluded' ? '，用户标记为不参与构建' : ''}`);
+      lines.push('<untrusted_source_diff>');
+      lines.push(change.beforeAvailable ? (change.patch.slice(0, 8000) || '原文未变，仅路径/标题变化') : '历史版本只保存hash，未保存旧原文；必须读取当前完整源文档，不推测历史差异。');
+      if (change.truncated || change.patch.length > 8000) lines.push('差异展示已截断；以raw_read当前全文为准。');
+      lines.push('</untrusted_source_diff>');
+    }
     // F3-R07：仅 removed 的增量没有新增/变更源——空批次也要明确告知删除
     // 与受影响文档，模型决定重建或确认默认删除。
     if (input.batch.length === 0) {
       lines.push(`【批次 ${input.batchIndex + 1}/${input.batchTotal}】本次构建没有新增或变更的源，但有源被删除：`);
       lines.push('');
-      lines.push('以下引用已删除源的文档已被默认删除（未复制进本次草稿）：');
+      lines.push('以下文档受到源移除/排除影响：仅引用已移除源的文档已默认删除；其余仍在草稿中，必须读取保留的源后重新写出完整正文并修正sources：');
       for (const doc of input.affectedDocs.slice(0, 200)) {
         lines.push(`- ${doc.path}（${doc.title}）`);
       }
@@ -786,6 +831,9 @@ export class KbBuildService extends EventEmitter {
     outputRoot: string;
     docMeta: Map<string, { title: string; summary: string; tags: string[]; sources: string[] }>;
     skippedSources?: Array<{ objToken: string; reason: string }>;
+    sourceContents?: SourceContents;
+    changePreview?: KbChangePreview;
+    summary?: string;
     /** 单测注入；缺省读 config */
     retainReleasesOverride?: number;
   }): Promise<KbManifest> {
@@ -872,6 +920,12 @@ export class KbBuildService extends EventEmitter {
       skippedSources: input.skippedSources ?? this.active.get(input.buildId)?.buildState?.finishInfo?.skipped ?? [],
     };
     fs.writeFileSync(path.join(releaseDir, 'manifest.json'), JSON.stringify(manifest, null, 2));
+    const versionStore = new KbVersionStore(outputRoot);
+    const baseManifest = input.baseReleaseId ? new StandardKbStore(outputRoot).readManifest(input.baseReleaseId) : null;
+    const sourceContents = input.sourceContents ?? {};
+    versionStore.writeVersion(manifest, baseManifest, sourceContents,
+      input.changePreview ?? sourceChangePreview(input.snapshot, sourceContents, baseManifest,
+        versionStore.readSourceContents(input.baseReleaseId)), input.summary ?? '');
 
     // CURRENT.json 原子发布：tmp → rename
     // 【F3-R10 指针提交点】rename 成功即发布完成；此后任何失败（清理、
@@ -1127,6 +1181,17 @@ export function validateStagingDocs(
       continue;
     }
     const content = fs.readFileSync(full, 'utf-8');
+    if (hasEditorialHistory(stripStdHeader(content)) || hasEditorialHistory(options.docMeta?.get(file)?.summary ?? '')) {
+      issues.push({ path: file, code: 'body_contains_change_history', message: '正文含修订记录/版本对比，请改为当前规则的一次成型表述；变更说明单独记录。' });
+    }
+    const sourceIdentifiers = snapshot.entries.flatMap((entry) => [entry.objToken, entry.relPath]);
+    if (hasSourceMetadata(stripStdHeader(content), sourceIdentifiers)
+      || hasSourceMetadata(options.docMeta?.get(file)?.summary ?? '', sourceIdentifiers)) {
+      issues.push({ path: file, code: 'body_contains_source_metadata', message: '正文不得含来源说明、来源标识、原始路径或构建信息；请自然重写知识内容，来源仅通过sources字段交给侧栏展示。' });
+    }
+    if (state.requiredRewrites?.has(file) && !state.writtenPaths?.has(file)) {
+      issues.push({ path: file, code: 'affected_doc_not_updated', message: '该文档来源已变化，必须重新生成完整正文，不能原样沿用旧草稿。' });
+    }
     const header = parseStdHeader(content);
     if (!header) {
       issues.push({ path: file, code: 'header_missing', message: '无法解析 feishu_sync_kb 文件头' });
@@ -1196,7 +1261,7 @@ export function computeChangeset(
   for (const [token, entry] of currentByToken) {
     const base = baseByToken.get(token);
     if (!base) added.push(token);
-    else if (base.contentHash !== entry.contentHash) changed.push(token);
+    else if (base.contentHash !== entry.contentHash || base.relPath !== entry.relPath || base.title !== entry.title) changed.push(token);
   }
   for (const token of baseByToken.keys()) {
     if (!currentByToken.has(token)) removed.push(token);

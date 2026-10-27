@@ -25,6 +25,7 @@ export type ReadinessCode =
 
 /** §9.1 GET /api/agent/status */
 export interface AgentStatusDto {
+  externalPlugins?: number;
   code: ReadinessCode;
   message: string;
   runtime: {
@@ -111,7 +112,7 @@ export interface KbDocSourceRef {
   objToken: string;
   title: string;
   relPath: string;
-  state: 'current' | 'changed' | 'missing';
+  state: 'current' | 'changed' | 'missing' | 'excluded';
 }
 
 /** §9.2 GET /api/kb/docs/:docId */

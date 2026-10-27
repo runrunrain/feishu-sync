@@ -1,0 +1,8 @@
+{
+  "name": "@feishu-sync/knowledge-workbench",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "飞书知识库工作台：对话、Work、构建与文风上下文",
+  "keywords": ["pi-package"],
+  "pi": { "extensions": ["./feishu-sync-context.js"] }
+}

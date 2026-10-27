@@ -39,6 +39,7 @@ interface KbBuildPanelProps {
   onCollapse: () => void;
   onCancel: () => void;
   cancelling: boolean;
+  layout?: 'bottom' | 'sidebar';
 }
 
 const STEP_LABEL: Record<string, string> = {
@@ -59,6 +60,7 @@ export function KbBuildPanel({
   onCollapse,
   onCancel,
   cancelling,
+  layout = 'bottom',
 }: KbBuildPanelProps) {
   const logEndRef = useRef<HTMLDivElement>(null);
 
@@ -80,12 +82,12 @@ export function KbBuildPanel({
 
   return (
     <section
-      className="shrink-0 h-[240px] min-h-[180px] border-t border-line bg-card-bg flex flex-col animate-fade-in"
+      className={`${layout === 'sidebar' ? 'flex-1 min-h-0' : 'shrink-0 h-[240px] min-h-[180px] border-t border-line'} bg-card-bg flex flex-col animate-fade-in`}
       aria-label="标准库构建进度"
       data-build-status={build.status}
     >
       {/* 头部：状态 + 进度 + 操作 */}
-      <header className="flex items-center gap-3 px-4 py-2 border-b border-line/60 shrink-0">
+      <header className="flex items-center flex-wrap gap-2 px-3 py-2 border-b border-line/60 shrink-0">
         <span
           className={`inline-flex items-center gap-1.5 text-sm font-kai font-medium ${
             failed ? 'text-seal-2' : build.status === 'published' ? 'text-jade' : 'text-ink'
@@ -99,7 +101,7 @@ export function KbBuildPanel({
           ) : null}
           构建 · {KB_BUILD_STATUS_LABEL[build.status] ?? build.status}
         </span>
-        <span className="text-[11px] text-ink-faint font-mono">{build.id}</span>
+        <span className="text-[10px] text-ink-faint font-mono truncate max-w-full" title={build.id}>{build.id}</span>
 
         {!isTerminal && batchTotal > 0 ? (
           <span className="text-xs text-ink-soft">
@@ -141,7 +143,7 @@ export function KbBuildPanel({
 
       {/* 阶段 stepper（终态定格在失败阶段/完成态） */}
       {!failed ? (
-        <div className="flex items-center gap-1 px-4 py-1.5 shrink-0 overflow-x-auto scrollbar-thin">
+        <div className={`flex items-center gap-1 px-4 py-1.5 shrink-0 ${layout === 'sidebar' ? 'flex-wrap gap-y-2' : 'overflow-x-auto scrollbar-thin'}`}>
           {KB_BUILD_ACTIVE_STEPS.map((step, i) => {
             const active = step === build.status;
             const passed =
@@ -202,7 +204,7 @@ export function KbBuildPanel({
       {/* 日志流 */}
       <div className="flex-1 min-h-0 overflow-auto scrollbar-thin px-4 py-2 space-y-0.5">
         {logs.length === 0 ? (
-          <p className="text-[11px] text-ink-faint">等待构建事件…</p>
+          <p className="text-[11px] text-ink-faint">{isTerminal ? '当前会话无实时日志；已发布内容的变化可在变更记录中查看。' : '等待构建事件…'}</p>
         ) : (
           logs.map((line) => <BuildLogRow key={line.id} line={line} />)
         )}

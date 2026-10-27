@@ -125,6 +125,7 @@ export const KB_SOURCE_STATE_LABEL: Record<string, string> = {
   current: '当前',
   changed: '已变更',
   missing: '已缺失',
+  excluded: '已排除',
 };
 
 /** 相对时间（会话列表/构建历史）；只做展示级近似。 */

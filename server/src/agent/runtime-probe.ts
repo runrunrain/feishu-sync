@@ -45,7 +45,7 @@ export async function probeAvailableModels(input: ProbeInput): Promise<ProbeResu
   // 模式不需要扩展（直接读本机凭据目录的模型列表）。
   const registeredToken = input.registerProbeContext?.();
   const probeToken = registeredToken ?? `probe_invalid_${Math.random().toString(36).slice(2)}`;
-  const loadExtension = config.agent.model.source === 'app-llm' && Boolean(input.registerProbeContext);
+  const loadExtension = Boolean(input.registerProbeContext);
   let providerJson: string | undefined;
   let apiKey: string | undefined;
   if (config.agent.model.source === 'app-llm') {
@@ -65,6 +65,7 @@ export async function probeAvailableModels(input: ProbeInput): Promise<ProbeResu
     env.FEISHU_SYNC_AGENT_PROVIDER_JSON = providerJson;
   }
 
+  env.FEISHU_SYNC_AGENT_PI_PACKAGE_ROOT = runtime.piPackageRoot ?? '';
   const rpc = new PiRpcProcess({
     nodePath: runtime.nodePath,
     piCliPath: runtime.piCliPath,

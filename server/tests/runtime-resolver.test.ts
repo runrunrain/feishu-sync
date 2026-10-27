@@ -6,7 +6,7 @@
  * 安装。真实 pi 的装载/探测由 pi-probe.test.ts 覆盖（本机有 pi 1.4）。
  */
 
-import { describe, expect, it, beforeAll, afterAll } from 'vitest';
+import { describe, expect, it, beforeAll, afterAll, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -182,6 +182,28 @@ describe('resolveRuntime（fixture）', () => {
 });
 
 describe('checkReadiness 就绪码（fixture）', () => {
+  it.each([
+    { selected: undefined, result: { ok: true, available: ['configured/one', 'configured/two'] }, code: 'model_unconfigured' },
+    { selected: 'removed/model', result: { ok: true, available: ['configured/one'] }, code: 'model_unconfigured' },
+    { selected: 'configured/one', result: { ok: true, available: ['configured/one'] }, code: 'ready' },
+    { selected: undefined, result: { ok: true, available: [] as string[] }, code: 'model_auth_missing' },
+    { selected: undefined, result: { ok: false, available: [] as string[] }, code: 'pi_spawn_failed' },
+  ])('pi配置选择 $selected：返回$code，同时保留有效模型列表', async ({ selected, result, code }) => {
+    const base = fs.mkdtempSync(path.join(fixtureRoot, 'pi-model-list-'));
+    const nodePath = makeFakeNode(path.join(base, 'bin'), '24.0.0');
+    makeFakePiAtLibNodeModules(base, '1.4.1');
+    const resolver = new PiRuntimeResolver({ env: { PATH: path.dirname(nodePath) }, execNodeVersion: async () => '24.0.0' });
+    const config = buildDefaultAgentConfig(base);
+    config.model.source = 'pi-agent-dir';
+    config.model.piModel = selected;
+    const probe = vi.fn(async () => result);
+    const status = await resolver.checkReadiness({ agentConfig: config, llmConfig: buildDefaultLlmConfigForTest(), runningProcesses: 0 }, probe);
+    expect(probe).toHaveBeenCalledOnce();
+    expect(status.code).toBe(code);
+    expect(status.model.model).toBe(selected ?? null);
+    expect(status.model.available).toEqual(result.available);
+  });
+
   it('app-llm 无 provider → model_unconfigured', async () => {
     const resolver = new PiRuntimeResolver({ env: { PATH: '' }, execNodeVersion: async () => null });
     const llm = buildDefaultLlmConfigForTest();

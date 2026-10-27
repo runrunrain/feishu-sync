@@ -9,6 +9,7 @@
  */
 
 import crypto from 'node:crypto';
+import type { AppPluginStore, AppPluginSnapshot } from './app-plugin-store.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
@@ -50,6 +51,7 @@ export interface SessionServiceDeps {
   /** 内部 API 可达探测（await 就绪） */
   waitForInternalApi?: () => Promise<void>;
   extensionPath: () => string | null;
+  pluginStore?: AppPluginStore;
   /** F3-R02：当前配置快照的 Workspace 守卫（含受保护运行资源根）；
    * spawn/写能力使用时动态复核，冲突即拒绝，不让旧授权永久生效。 */
   workspaceGuards: () => WorkspaceRootGuards;
@@ -78,6 +80,7 @@ export class SessionService extends EventEmitter {
   private readonly sseBuffers = new Map<string, SessionSseEvent[]>();
   private readonly sseSeq = new Map<string, number>();
   private readonly runs = new Map<string, ActiveRun>();
+  private readonly pluginRevisions = new WeakMap<PiRpcProcess, string>();
   private readonly sessionStates = new Map<string, 'starting' | 'streaming'>();
 
   constructor(deps: SessionServiceDeps) {
@@ -337,10 +340,16 @@ export class SessionService extends EventEmitter {
     this.emitSessionState(sessionId, localMapStore);
 
     try {
+      const pluginSnapshot = this.deps.pluginStore?.snapshot(mode);
       let process = this.deps.pool.get(sessionId);
+      if (process && pluginSnapshot && this.pluginRevisions.get(process) !== pluginSnapshot.revision) {
+        await this.deps.pool.terminate(sessionId);
+        this.deps.toolService.revokeBySession(sessionId);
+        process = null;
+      }
       if (!process) {
         await this.deps.waitForInternalApi?.();
-        process = await this.spawnSessionProcess(sessionId, mode, workspace?.path);
+        process = await this.spawnSessionProcess(sessionId, mode, workspace?.path, pluginSnapshot);
       }
       // F3-R06：运行期间挂起 idle 回收；结束（成功/失败/异常）后重起完整
       // idle 窗口——复用进程若已空闲 9 分钟，一次新 prompt 也必须获得全窗口。
@@ -434,6 +443,7 @@ export class SessionService extends EventEmitter {
     sessionId: string,
     mode: AgentSessionMode,
     workspaceRoot: string | undefined,
+    pluginSnapshot?: AppPluginSnapshot,
   ): Promise<PiRpcProcess> {
     const config = this.currentConfig()!;
     const runtime = await this.deps.resolver.resolveRuntime(config.agent);
@@ -511,11 +521,18 @@ export class SessionService extends EventEmitter {
     if (providerJson) {
       env.FEISHU_SYNC_AGENT_PROVIDER_JSON = providerJson;
     }
+    if (pluginSnapshot) {
+      env.FEISHU_SYNC_AGENT_PLUGIN_SNAPSHOT = pluginSnapshot.path;
+      env.FEISHU_SYNC_AGENT_PLUGIN_REVISION = pluginSnapshot.revision;
+      if (pluginSnapshot.externalPlugins) env.FEISHU_SYNC_AGENT_EXTERNAL_PLUGINS = '1';
+    }
+    env.FEISHU_SYNC_AGENT_PI_PACKAGE_ROOT = runtime.piPackageRoot ?? '';
     const extensionPath = this.deps.extensionPath();
     const rpc = new PiRpcProcess({
       nodePath: runtime.nodePath,
       piCliPath: runtime.piCliPath,
       ...(extensionPath ? { extensionPath } : {}),
+      ...(pluginSnapshot ? { additionalExtensionPaths: pluginSnapshot.extensionPaths ?? [pluginSnapshot.extensionPath], allowExternalPluginTools: pluginSnapshot.externalPlugins, additionalSkillPaths: pluginSnapshot.skillPaths, additionalPromptPaths: pluginSnapshot.promptPaths, additionalThemePaths: pluginSnapshot.themePaths } : {}),
       tools: toolsForRunKind(runKind),
       sessionDir: this.sessionDir(),
       sessionId,
@@ -533,6 +550,7 @@ export class SessionService extends EventEmitter {
       // 自动重试交由宿主判定（§4.4 auto_retry 上限）
       await rpc.sendCommand('set_auto_retry', { enabled: false }).catch(() => undefined);
       this.deps.pool.register(sessionId, rpc, 'session', slot);
+      if (pluginSnapshot) this.pluginRevisions.set(rpc, pluginSnapshot.revision);
     } catch (error) {
       // start/register 任一步失败：释放预留 + 终结半启动进程 + 回收令牌，
       // 不留无主 OS 子进程。
@@ -556,6 +574,8 @@ export class SessionService extends EventEmitter {
     }
     return this.get(localMapStore, this.currentConfig(), id);
   }
+
+  hasActiveRuns(): boolean { return this.runs.size > 0; }
 
   isRunning(sessionId: string): boolean {
     return this.runs.has(sessionId);

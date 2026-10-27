@@ -137,12 +137,14 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
           >
             <PlugZap className="w-3.5 h-3.5 mt-0.5 shrink-0 text-[#92580c]" />
             <p className="text-[11px] leading-snug text-[#92580c]">
-              Work 模式：Agent 可在
+              Work 模式：应用自带工具可在
               <span className="font-mono mx-1">{session?.workspace?.path ?? '已授权目录'}</span>
               内创建、修改文件；不能执行命令；原始库与标准库不可写。目录授权即接受此范围的操作。
             </p>
           </div>
         ) : null}
+
+        {(agent.status?.externalPlugins ?? 0) > 0 ? <p role="note" className="px-4 py-2 text-xs text-seal border-b border-line">已启用第三方Pi插件；其代码以当前用户权限运行，可访问文件与网络，能力范围由插件本身决定。</p> : null}
 
         <MessageStream
           messages={sessions.messages}
@@ -153,7 +155,7 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
             <div className="py-8">
               <p className="text-sm text-ink-soft">开始一段新的讨论</p>
               <p className="mt-1.5 text-xs text-ink-faint leading-relaxed max-w-sm mx-auto">
-                Agent 可检索并阅读标准库与原始库。 Discuss 模式只读；需要让它写文件时，
+                应用自带工具可检索并阅读标准库与原始库。 Discuss 模式只读；需要让它写文件时，
                 通过右侧面板显式切换到 Work 模式并授权目录。
               </p>
             </div>

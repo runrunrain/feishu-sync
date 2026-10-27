@@ -169,7 +169,7 @@ export function AgentComposer({
         </div>
         <p className="mt-1.5 text-[10px] text-ink-faint">
           {text.length > MAX_TEXT * 0.8 ? `${text.length}/${MAX_TEXT} 字符 · ` : ''}
-          Discuss 只读标准库与原始库；Work 模式下 Agent 仅可在绑定 Workspace 内写文件，不会执行命令。
+          应用自带工具：Discuss 只读；Work 仅可写绑定 Workspace，无 shell。第三方 Pi 插件按其自身能力运行。
         </p>
       </div>
     </div>

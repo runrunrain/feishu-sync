@@ -15,6 +15,8 @@
  */
 
 'use strict';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 /** @typedef {{ registerTool(tool: any): void; registerProvider(name: string, config: any): void; on(event: 'tool_call', handler: (event: any) => any): void; getAllTools(): any[]; }} ExtensionAPI */
 
@@ -76,6 +78,22 @@ export default async function feishuSyncAgentExtension(/** @type {ExtensionAPI} 
     throw new Error('缺少 FEISHU_SYNC_AGENT_URL / FEISHU_SYNC_AGENT_RUN_TOKEN 环境变量（宿主未注入）');
   }
 
+  // 借助Pi原生模型运行时只读复用认证与models.json，不复制密钥，不写通用Pi。
+  const sharedHome = process.env.FEISHU_SYNC_AGENT_SHARED_PI_HOME;
+  const piRoot = process.env.FEISHU_SYNC_AGENT_PI_PACKAGE_ROOT;
+  if (sharedHome && piRoot) {
+    const load = (name) => import(pathToFileURL(path.join(piRoot, 'dist/core', name + '.js')).href);
+    const { ModelRuntime } = await load('model-runtime');
+    const { ReadOnlyAuthStorage } = await load('auth-storage');
+    const models = await ModelRuntime.create({
+      credentials: new ReadOnlyAuthStorage(path.join(sharedHome, 'auth.json')),
+      modelsPath: path.join(sharedHome, 'models.json'),
+      modelsStorePath: path.join(process.env.PI_CODING_AGENT_DIR, 'shared-models-store.json'),
+      allowModelNetwork: false,
+    });
+    for (const provider of models.getProviders()) pi.registerProvider(provider);
+  }
+
   // app-llm：注册 OpenAI 兼容 provider（key 只经环境变量插值）
   if (PROVIDER_JSON) {
     const descriptor = JSON.parse(PROVIDER_JSON);
@@ -124,13 +142,16 @@ export default async function feishuSyncAgentExtension(/** @type {ExtensionAPI} 
   }
   log(`registered ${selfTools.size} tool(s): ${[...selfTools].join(', ') || '(none)'}`);
 
-  // fail closed：非本扩展注册的工具一律 block
+  // 仅显式安装并启用的扩展可提供额外工具。Pi内置shell/文件工具仍不开放。
+  const external = () => new Set(process.env.FEISHU_SYNC_AGENT_EXTERNAL_PLUGINS === '1'
+    ? pi.getAllTools().filter((tool) => tool.sourceInfo?.path && !tool.sourceInfo.path.startsWith('builtin:')).map((tool) => tool.name)
+    : []);
+  pi.on('session_start', () => {
+    if (process.env.FEISHU_SYNC_AGENT_EXTERNAL_PLUGINS === '1') pi.setActiveTools([...new Set([...selfTools, ...external()])]);
+  });
   pi.on('tool_call', (event) => {
     const name = event && event.toolName;
-    if (typeof name === 'string' && selfTools.has(name)) {
-      return undefined; // 放行
-    }
-    log(`blocking tool_call for non-agent tool: ${name}`);
-    return { block: true, reason: `工具 ${name} 不在本运行的工具白名单内` };
+    if (typeof name === 'string' && (selfTools.has(name) || external().has(name))) return undefined;
+    return { block: true, reason: `工具 ${name} 未由应用或已启用插件提供` };
   });
 }

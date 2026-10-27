@@ -443,23 +443,15 @@ export class PiRuntimeResolver {
 
     // pi-agent-dir：显式 opt-in 复用本机 pi 凭据
     const piModel = agentConfig.model.piModel?.trim() || '';
-    if (!piModel) {
-      return this.cache({
-        ...base,
-        code: 'model_unconfigured',
-        message: 'pi-agent-dir 模式下未配置模型（provider/id）',
-        model: { source: 'pi-agent-dir', model: null, available: [] },
-      });
-    }
     if (modelProbe) {
       const probed = await modelProbe(runtime);
       if (probed === null) {
         // 探测回调显式跳过：按配置推断
         return this.cache({
           ...base,
-          code: 'ready',
-          message: '运行时就绪（模型未探测）',
-          model: { source: 'pi-agent-dir', model: piModel, available: [] },
+          code: piModel ? 'ready' : 'model_unconfigured',
+          message: piModel ? '运行时就绪（模型未探测）' : '请从本机 pi 可用模型列表中选择模型',
+          model: { source: 'pi-agent-dir', model: piModel || null, available: [] },
         });
       }
       if (!probed.ok) {
@@ -467,7 +459,7 @@ export class PiRuntimeResolver {
           ...base,
           code: 'pi_spawn_failed',
           message: `pi 探测进程启动失败：${(probed.stderr ? probed.stderr.slice(0, 500) : '未知错误')}`,
-          model: { source: 'pi-agent-dir', model: piModel, available: [] },
+          model: { source: 'pi-agent-dir', model: piModel || null, available: [] },
         });
       }
       if (probed.available.length === 0) {
@@ -475,15 +467,15 @@ export class PiRuntimeResolver {
           ...base,
           code: 'model_auth_missing',
           message: '本机 pi 凭据下无可用模型（auth.json 缺失或过期）',
-          model: { source: 'pi-agent-dir', model: piModel, available: [] },
+          model: { source: 'pi-agent-dir', model: piModel || null, available: [] },
         });
       }
-      if (!probed.available.includes(piModel)) {
+      if (!piModel || !probed.available.includes(piModel)) {
         return this.cache({
           ...base,
           code: 'model_unconfigured',
-          message: `模型 ${piModel} 不在本机 pi 可用模型列表中`,
-          model: { source: 'pi-agent-dir', model: piModel, available: probed.available },
+          message: piModel ? `模型 ${piModel} 不在本机 pi 可用模型列表中` : '请从本机 pi 可用模型列表中选择模型',
+          model: { source: 'pi-agent-dir', model: piModel || null, available: probed.available },
         });
       }
       return this.cache({
@@ -495,9 +487,9 @@ export class PiRuntimeResolver {
     }
     return this.cache({
       ...base,
-      code: 'ready',
-      message: '运行时就绪（模型未探测）',
-      model: { source: 'pi-agent-dir', model: piModel, available: [] },
+      code: piModel ? 'ready' : 'model_unconfigured',
+      message: piModel ? '运行时就绪（模型未探测）' : '请从本机 pi 可用模型列表中选择模型',
+      model: { source: 'pi-agent-dir', model: piModel || null, available: [] },
     });
   }
 

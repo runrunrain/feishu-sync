@@ -765,15 +765,17 @@ function renderList(
 function renderBlock(block: Block, index: number, ctx: InlineContext): ReactNode {
   const key = `b-${index}`;
   switch (block.type) {
-    case 'heading':
+    case 'heading': {
+      const Heading = `h${block.level}` as 'h1' | 'h2' | 'h3' | 'h4' | 'h5' | 'h6';
       return (
-        <div key={key} className={HEADING_CLASS[block.level] ?? HEADING_CLASS[6]}>
+        <Heading key={key} className={HEADING_CLASS[block.level] ?? HEADING_CLASS[6]}>
           {renderInline(block.text, key, ctx)}
-        </div>
+        </Heading>
       );
+    }
     case 'code':
       return (
-        <div key={key} className="my-3 rounded-md border border-line/70 bg-dark overflow-hidden">
+        <div key={key} data-md-block="code" className="my-3 rounded-md border border-line/70 bg-dark overflow-hidden">
           {block.lang && (
             <div className="px-3 py-1.5 text-[10px] font-mono text-paper/60 border-b border-paper/10 bg-dark">
               {block.lang}
@@ -786,7 +788,7 @@ function renderBlock(block: Block, index: number, ctx: InlineContext): ReactNode
       );
     case 'table':
       return (
-        <div key={key} className="my-3 overflow-x-auto scrollbar-thin rounded-md border border-line/70">
+        <div key={key} data-md-block="table" className="my-3 overflow-x-auto scrollbar-thin rounded-md border border-line/70">
           <table className="w-full text-xs border-collapse">
             <thead>
               <tr className="bg-paper-2">
@@ -824,7 +826,7 @@ function renderBlock(block: Block, index: number, ctx: InlineContext): ReactNode
     case 'html_table':
       // 需求 1：受控 HTML 表格渲染，保留 colspan/rowspan，样式与 Markdown 表格一致
       return (
-        <div key={key} className="my-3 overflow-x-auto scrollbar-thin rounded-md border border-line/70">
+        <div key={key} data-md-block="table" className="my-3 overflow-x-auto scrollbar-thin rounded-md border border-line/70">
           <table className="w-full text-xs border-collapse">
             {block.colgroup && (
               <colgroup>
@@ -931,6 +933,8 @@ export interface MarkdownViewProps {
    * 标准库 AI 生成文档、原始库文档、Agent 输出等不可信入口应传 'confirm'。
    */
   remoteImages?: 'auto' | 'confirm';
+  /** 标准库长文采用独立阅读排版；其他预览入口保留紧凑布局。 */
+  variant?: 'preview' | 'reading';
 }
 
 export function MarkdownView({
@@ -939,11 +943,12 @@ export function MarkdownView({
   onNavigateCsv,
   feishuHost,
   remoteImages = 'auto',
+  variant = 'preview',
 }: MarkdownViewProps) {
   const blocks = parseBlocks(preprocess(content));
   const ctx: InlineContext = { baseDir, onNavigateCsv, feishuHost, remoteImages };
   return (
-    <div className="px-5 py-4">
+    <div className={variant === 'reading' ? 'markdown-reading' : 'px-5 py-4'}>
       {blocks.map((b, i) => (
         <Fragment key={i}>{renderBlock(b, i, ctx)}</Fragment>
       ))}

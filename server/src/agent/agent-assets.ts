@@ -43,6 +43,15 @@ export function piExtensionPath(): string | null {
   return null;
 }
 
+/** 受控的应用上下文Pi扩展；用户内容不作为JS加载。 */
+export function piContextExtensionPath(): string | null {
+  for (const candidate of [
+    path.join(agentAssetsRoot(), 'pi-extension', 'feishu-sync-context.js'),
+    path.join(serverDistRoot(), '..', 'src', 'agent', 'pi-extension', 'feishu-sync-context.js'),
+  ]) if (fs.existsSync(candidate)) return candidate;
+  return null;
+}
+
 /** 读取内置 prompt 资产（构建规则 + 文风规范）。缺任一返回 null。 */
 export function readAgentPromptAssets(): { buildRules: string; styleGuide: string } | null {
   const read = (relative: string): string | null => {
@@ -64,4 +73,11 @@ export function readAgentPromptAssets(): { buildRules: string; styleGuide: strin
     return null;
   }
   return { buildRules, styleGuide };
+}
+
+/** 原生Pi包目录（包含package.json的pi manifest）。 */
+export function piWorkbenchPackageRoot(): string {
+  const extension = piContextExtensionPath();
+  if (!extension) throw new Error('Pi workbench package is missing');
+  return path.dirname(extension);
 }

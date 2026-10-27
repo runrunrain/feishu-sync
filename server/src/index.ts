@@ -8,6 +8,10 @@
  */
 
 import { Hono } from 'hono';
+import { PiPluginService } from './agent/pi-plugin-service.js';
+import { piPluginRoutes } from './routes/pi-plugins.js';
+import { AppPluginStore } from './agent/app-plugin-store.js';
+import { agentPluginRoutes } from './routes/agent-plugins.js';
 import { serve } from '@hono/node-server';
 import type { ServerType } from '@hono/node-server';
 import crypto from 'node:crypto';
@@ -167,6 +171,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
   // ===========================================================================
   console.info('[server] Initializing Agent knowledge modules');
   const agentDataRoot = resolveDataRoot();
+
   const runtimeResolver = new PiRuntimeResolver();
   const agentPool = new AgentProcessPool({
     maxConcurrentProcesses: config.agent.maxConcurrentProcesses,
@@ -193,7 +198,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
       knowledgeBaseRoot: config?.knowledgeBaseRoot ?? '',
       outputRoot: config?.standardKb.outputRoot ?? '',
       dataRoot: agentDataRoot,
-      protectedRoots: [...collectStaticProtectedRoots(), ...collectResolvedRuntimeProtectedRoots(runtimeResolver)],
+      protectedRoots: [...collectStaticProtectedRoots(), ...collectResolvedRuntimeProtectedRoots(runtimeResolver), ...piPlugins.protectedRoots()],
     };
   };
   void (async () => {
@@ -206,7 +211,15 @@ export async function buildServer(options: CreateServerOptions = {}) {
       /* 发现失败时静态根仍生效；spawn 时 resolver 会给出明确错误 */
     }
   })();
-  const sessionService = new SessionService({
+  const piPlugins: PiPluginService = new PiPluginService({
+    dataRoot: agentDataRoot, resolver: runtimeResolver,
+    agentConfig: () => configManager.getConfig()!.agent,
+    running: (): boolean => sessionService.hasActiveRuns() || kbBuildService.hasActiveRun(),
+    retireIdle: () => agentPool.retireIdle(),
+  });
+  await piPlugins.refresh().catch(() => { console.warn('[server] Pi插件资源暂不可用，可在设置中刷新；其他功能继续启动'); });
+  const appPluginStore: AppPluginStore = new AppPluginStore(agentDataRoot, readAgentPromptAssets, () => piPlugins.runtimeResources());
+  const sessionService: SessionService = new SessionService({
     dataRoot: agentDataRoot,
     pool: agentPool,
     toolService: agentToolService,
@@ -214,6 +227,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
     configProvider: () => configManager.getConfig(),
     internalBaseUrl: () => (agentInternalPort.port ? `http://127.0.0.1:${agentInternalPort.port}` : ''),
     extensionPath: piExtensionPath,
+    pluginStore: appPluginStore,
     workspaceGuards: workspaceGuardsSnapshot,
   });
   const kbBuildService = new KbBuildService({
@@ -223,9 +237,11 @@ export async function buildServer(options: CreateServerOptions = {}) {
     resolver: runtimeResolver,
     configProvider: () => configManager.getConfig(),
     documentsProvider: () => localMapStore.getAllDocuments(),
+    excludedSourcesProvider: () => localMapStore.listKbExcludedSources(configManager.getConfig()?.knowledgeBaseRoot ?? ''),
     sheetCsvPaths,
     internalBaseUrl: () => (agentInternalPort.port ? `http://127.0.0.1:${agentInternalPort.port}` : ''),
     extensionPath: piExtensionPath,
+    pluginStore: appPluginStore,
     promptAssets: readAgentPromptAssets,
   });
   // 启动对账：非终态构建置 interrupted；CURRENT 指针为准补 DB
@@ -316,6 +332,8 @@ export async function buildServer(options: CreateServerOptions = {}) {
   app.route('/', customFolderRoutes);
   app.route('/', orphanFilesRoutes);
   app.route('/', llmRoutes);
+  app.route('/', piPluginRoutes(piPlugins));
+  app.route('/', agentPluginRoutes(appPluginStore));
   app.route('/', await agentRoutes({
     sessionService,
     toolService: agentToolService,
@@ -324,6 +342,8 @@ export async function buildServer(options: CreateServerOptions = {}) {
     configManager,
     localMapStore,
     internalPort: () => agentInternalPort.port,
+    externalPlugins: () => piPlugins.externalCount(),
+    pluginProtectedRoots: () => piPlugins.protectedRoots(),
   }));
   app.route('/', kbRoutes({
     buildService: kbBuildService,

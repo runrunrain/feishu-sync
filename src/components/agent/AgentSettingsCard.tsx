@@ -2,8 +2,8 @@
  * AgentSettingsCard —— 设置页 Agent 段（F2，设计 §11.4）
  *
  * 覆盖：运行时状态（node/pi 路径与版本、就绪码）+ 重新检测、路径覆盖、
- * 模型来源（app-llm 下拉选既有 provider/preset；pi-agent-dir 输入
- * provider/id）、thinking 档位、标准库输出目录、Workspace 增删、
+ * 模型来源（app-llm 下拉选既有 provider/preset；pi-agent-dir 从pi有效
+ * 配置探测的列表中选择）、thinking 档位、标准库输出目录、Workspace 增删、
  * MCP 连接片段（复制按钮，API §9.5）。
  *
  * 秘密边界：本卡不展示/不持有任何 apiKey（provider key 由「模型与整理」
@@ -88,14 +88,12 @@ export function AgentRuntimeSettingsCard() {
   const agent = config?.agent;
   const [nodePath, setNodePath] = useState('');
   const [piCliPath, setPiCliPath] = useState('');
-  const [piModel, setPiModel] = useState('');
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     setNodePath(agent?.runtime?.nodePath ?? '');
     setPiCliPath(agent?.runtime?.piCliPath ?? '');
-    setPiModel(agent?.model?.piModel ?? '');
-  }, [agent?.runtime?.nodePath, agent?.runtime?.piCliPath, agent?.model?.piModel]);
+  }, [agent?.runtime?.nodePath, agent?.runtime?.piCliPath]);
 
   const readiness = agentStatus.status
     ? describeReadiness(agentStatus.status.code, agentStatus.status)
@@ -106,6 +104,22 @@ export function AgentRuntimeSettingsCard() {
   const currentProviderId = agent?.model?.providerId || config?.llm.activeProviderId || '';
   const currentModelId = agent?.model?.modelId || config?.llm.activeModelId || '';
   const source = agent?.model?.source ?? 'app-llm';
+  const piModel = agent?.model?.piModel ?? '';
+  const piModels = useMemo(() => {
+    if (agentStatus.unreachable || agentStatus.status?.model.source !== 'pi-agent-dir') return [];
+    return [...new Set(agentStatus.status.model.available)].sort((a, b) => a.localeCompare(b));
+  }, [agentStatus.status, agentStatus.unreachable]);
+  const piModelGroups = useMemo(() => {
+    const groups = new Map<string, string[]>();
+    for (const model of piModels) {
+      const provider = model.split('/')[0];
+      groups.set(provider, [...(groups.get(provider) ?? []), model]);
+    }
+    return [...groups];
+  }, [piModels]);
+  const loadingModels = agentStatus.loading || agentStatus.rechecking
+    || (!agentStatus.unreachable && agentStatus.status?.model.source !== source);
+  const invalidPiModel = Boolean(piModel) && !loadingModels && piModels.length > 0 && !piModels.includes(piModel);
   const thinking = agent?.model?.thinkingLevel ?? 'off';
 
   const saveAgent = async (patch: {
@@ -225,6 +239,7 @@ export function AgentRuntimeSettingsCard() {
               type="radio"
               name="agent-model-source"
               checked={source === 'app-llm'}
+              disabled={saving || agentStatus.loading}
               onChange={() => saveAgent({ model: { source: 'app-llm' } })}
               className="accent-[#9e2b25]"
             />
@@ -239,6 +254,7 @@ export function AgentRuntimeSettingsCard() {
               type="radio"
               name="agent-model-source"
               checked={source === 'pi-agent-dir'}
+              disabled={saving || agentStatus.loading}
               onChange={() => saveAgent({ model: { source: 'pi-agent-dir' } })}
               className="accent-[#9e2b25]"
             />
@@ -289,26 +305,47 @@ export function AgentRuntimeSettingsCard() {
         </div>
       ) : (
         <div>
-          <FieldLabel hint="格式 provider/id">pi 模型</FieldLabel>
+          <FieldLabel hint="从本机 pi 有效配置加载">pi 模型</FieldLabel>
           <div className="flex gap-2">
-            <input
+            <select
               className={`${INPUT_CLS} font-mono text-xs`}
               value={piModel}
-              onChange={(e) => setPiModel(e.target.value)}
-              placeholder="例如 anthropic/claude-..."
+              onChange={(e) => void saveAgent({ model: { piModel: e.target.value } })}
+              disabled={saving || loadingModels || piModels.length === 0}
               aria-label="pi 模型"
-            />
+            >
+              <option value="" disabled>
+                {loadingModels ? '正在加载 pi 模型…' : piModels.length ? '请选择 pi 模型' : '未发现可用模型'}
+              </option>
+              {piModel && !piModels.includes(piModel) ? (
+                <option value={piModel} disabled>
+                  {piModel}（{loadingModels ? '正在核验' : piModels.length ? '当前不可用' : '尚未核验'}）
+                </option>
+              ) : null}
+              {piModelGroups.map(([provider, models]) => (
+                <optgroup key={provider} label={provider}>
+                  {models.map((model) => <option key={model} value={model}>{model}</option>)}
+                </optgroup>
+              ))}
+            </select>
             <Button
               size="sm"
               variant="secondary"
-              loading={saving}
-              disabled={!piModel.trim()}
-              onClick={() => saveAgent({ model: { piModel: piModel.trim() } })}
+              loading={agentStatus.loading || agentStatus.rechecking}
+              disabled={saving}
+              className="shrink-0 whitespace-nowrap"
+              onClick={() => void agentStatus.recheck()}
             >
-              保存
+              <RefreshCw className="w-3.5 h-3.5" /> 刷新模型
             </Button>
           </div>
-          <p className="mt-1 text-[11px] text-ink-faint">将使用本机 pi 的凭据（~/.pi/agent），应用不接触其密钥。</p>
+          <p className="mt-1 text-[11px] text-ink-faint">
+            通过 pi 加载配置与认证后列出可用模型，按提供商分组；选择后自动保存。应用不读取其密钥，实际调用是否成功以模型响应为准。
+          </p>
+          {invalidPiModel ? <p className="mt-1 text-xs text-seal-2" role="alert">原模型已不在可用列表中，请重新选择。</p> : null}
+          {!loadingModels && piModels.length === 0 ? (
+            <p className="mt-1 text-xs text-ink-soft">{agentStatus.unreachable ? '模型列表读取失败，请刷新重试。' : '请检查本机 pi 配置与认证，然后刷新模型。'}</p>
+          ) : null}
         </div>
       )}
 

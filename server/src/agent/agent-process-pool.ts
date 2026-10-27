@@ -208,6 +208,11 @@ export class AgentProcessPool {
   }
 
   /** server close()：终止全部子进程并使后续 reserveSlot 失败。幂等。 */
+  /** 管理插件前回收空闲扩展进程；不关闭进程池本身。 */
+  async retireIdle(): Promise<void> {
+    for (const key of [...this.entries.keys()]) if (!this.busyKeys.has(key)) await this.terminate(key);
+  }
+
   async closeAll(): Promise<void> {
     this.closed = true;
     this.reservations = 0;

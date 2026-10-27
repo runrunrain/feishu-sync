@@ -9,6 +9,7 @@
  */
 @import './tailwind.css';
 @import './theme.css';
+@import './knowledge-reading.css';
 
 @layer base {
   * {

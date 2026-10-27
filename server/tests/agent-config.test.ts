@@ -102,6 +102,22 @@ describe('updateConfig 校验', () => {
     await manager.load();
   });
 
+  it.each(['amagi-公司中转站/claude-fable-5', 'amagi-个人版API- GPT/gpt-6-luna', 'router/vendor/model:latest'])(
+    'pi实际模型标识可保存并回读：%s', async (piModel) => {
+      const base = (await manager.load()).agent;
+      await manager.updateConfig({ agent: { ...base, model: { ...base.model, source: 'pi-agent-dir', piModel } } });
+      expect((await manager.load()).agent.model.piModel).toBe(piModel);
+    },
+  );
+
+  it.each(['provider-only', '/model', 'provider/', ' provider/model', 'provider/model\n', 'provider/\u0000model'])(
+    '拒绝残缺或控制字符pi标识：%j', async (piModel) => {
+      const base = (await manager.load()).agent;
+      await expect(manager.updateConfig({ agent: { ...base, model: { ...base.model, source: 'pi-agent-dir', piModel } } }))
+        .rejects.toThrow(/piModel/);
+    },
+  );
+
   it('agent.workspaces 在 PUT 中被忽略', async () => {
     await manager.updateConfig({
       agent: {

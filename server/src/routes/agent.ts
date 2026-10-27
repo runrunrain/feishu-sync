@@ -32,6 +32,8 @@ export interface AgentRouteDeps {
   localMapStore: LocalMapStore;
   /** 内部 API 回环基址（无端口 → 无法 spawn，状态接口会呈现） */
   internalPort: () => number | null;
+  externalPlugins?: () => number;
+  pluginProtectedRoots?: () => string[];
 }
 function errorResponse(c: Context, error: unknown): Response {
   if (error instanceof ToolError) {
@@ -95,6 +97,7 @@ export async function agentRoutes(deps: AgentRouteDeps): Promise<Hono> {
       const { piPackageRoot: _ignored, ...dto } = status.runtime;
       return c.json({
         ...status,
+        externalPlugins: deps.externalPlugins?.() ?? 0,
         runtime: dto,
         processes: { running: pool.runningCount(), max: pool.max },
       });
@@ -116,7 +119,7 @@ export async function agentRoutes(deps: AgentRouteDeps): Promise<Hono> {
         buildModelProbe(config),
       );
       const { piPackageRoot: _ignored, ...dto } = status.runtime;
-      return c.json({ ...status, runtime: dto });
+      return c.json({ ...status, externalPlugins: deps.externalPlugins?.() ?? 0, runtime: dto });
     } catch (error) {
       return errorResponse(c, error);
     }
@@ -307,7 +310,7 @@ export async function agentRoutes(deps: AgentRouteDeps): Promise<Hono> {
       } catch {
         /* 主三重 guard + 静态保护根仍生效 */
       }
-      protectedRoots.push(...collectResolvedRuntimeProtectedRoots(resolver));
+      protectedRoots.push(...collectResolvedRuntimeProtectedRoots(resolver), ...(deps.pluginProtectedRoots?.() ?? []));
       const guards = {
         knowledgeBaseRoot: config.knowledgeBaseRoot,
         outputRoot: config.standardKb.outputRoot,

@@ -9,8 +9,8 @@
 | # | 决策 | 结论 | 可逆性 |
 |---|---|---|---|
 | D1 | pi 接入方式 | **外部 pi RPC 侧车进程**：server 用外部 Node ≥22.19 启动 `pi/dist/cli.js --mode rpc`，按 JSONL 协议驱动。不在 Electron 进程内 import SDK，不为此升级 Electron。 | 可逆：Electron ≥38 后可改为 SDK 子进程，契约面（HTTP API、工具语义）不变 |
-| D2 | 工具实现位置 | pi 进程只加载一个**纯转发扩展**（`-e`），所有工具在 server 内实现，经回环内部 API + 运行级能力令牌调用；权限裁决全部在 server。 | 可逆 |
-| D3 | pi 资源隔离 | 每次启动强制 `--no-extensions --no-skills --no-prompt-templates --no-context-files --no-themes --no-mcp --no-approve --offline` + `--tools <白名单>`；cwd 为空目录；默认使用应用专属 `PI_CODING_AGENT_DIR`。实测白名单外不存在任何内置工具。 | — |
+| D2 | 工具实现位置 | 应用自带工具经转发扩展调用server内部API与运行级能力令牌；知识库工作台作为内置Pi package加载上下文。用户显式添加的原生Pi插件可提供自身工具和代码能力（§17），宿主API权限不扩张。 | 可逆 |
+| D3 | pi 资源隔离 | 每次启动强制 `--no-extensions --no-skills --no-prompt-templates --no-context-files --no-themes --no-mcp --no-approve --offline`；无外部插件时加`--tools <白名单>`，外部包按§17加载；cwd为空目录；始终使用应用专属 `PI_CODING_AGENT_DIR`。无外部插件时实测白名单外不存在内置工具；外部插件模式下由桥接限制Pi内置工具。 | — |
 | D4 | 模型来源 | 默认 `app-llm`：复用 feishu-sync 已配置的 OpenAI 兼容 provider，经扩展 `registerProvider` 注入，key 只走子进程环境变量；可选 `pi-agent-dir`：显式 opt-in 复用本机 pi 凭据。无模型时诚实失败，不生成任何内容。 | 可逆 |
 | D5 | Discuss / Work | Discuss 工具级只读（无写、无 shell）。Work 必须绑定用户显式授权的 Workspace，只开放 server 实现的受路径守卫的文件工具；**第一阶段不提供 shell**。 | Shell 为后续独立决策（§7.5） |
 | D6 | 标准库发布 | `releases/<id>/` 不可变目录 + `CURRENT.json` 指针（写临时文件后 rename）。staging 与 releases 同卷；任何失败不移动指针。发布真相 = 指针 + release manifest；SQLite 只存构建历史，可由 manifest 重建。 | — |
@@ -121,14 +121,14 @@ cwd = <dataRoot>/agent/empty-cwd    # 空目录，避免任何上下文文件被
 ```
 
 - 扩展路径位于 `server/dist`，打包时已 `asarUnpack: server/**`，是真实文件系统路径，pi 可加载。
-- `--tools` 白名单 + `--no-extensions` 下，实测 `pi.getAllTools()` 只含扩展注册的工具，内置 read/bash 等不存在。
+- 未启用外部包时，`--tools` 白名单 + `--no-extensions` 下，实测 `pi.getAllTools()` 只含扩展注册的工具，内置 read/bash 等不存在。
 
 ### 4.2 子进程环境变量
 
 | 变量 | app-llm 模式 | pi-agent-dir 模式 |
 |---|---|---|
 | 基础 | 白名单继承：`PATH HOME USERPROFILE APPDATA LOCALAPPDATA TMPDIR TEMP TMP LANG LC_ALL SystemRoot` | 继承父进程环境，剔除 `FEISHU_SYNC_*` 敏感变量后再注入下列 |
-| `PI_CODING_AGENT_DIR` | `<dataRoot>/agent/pi-home`（应用专属，空凭据） | 不设置（使用 `~/.pi/agent`） |
+| `PI_CODING_AGENT_DIR` | `<dataRoot>/agent/pi-home`（应用专属） | 同左；共享认证由桥接经Pi只读存储复用，通用设置不写入 |
 | `PI_OFFLINE` / `PI_SKIP_VERSION_CHECK` / `PI_TELEMETRY` | `1` / `1` / `0` | 同左 |
 | `FEISHU_SYNC_AGENT_URL` | `http://127.0.0.1:<port>` | 同左 |
 | `FEISHU_SYNC_AGENT_RUN_TOKEN` | 每次进程启动新生成 32 字节 base64url | 同左 |
@@ -168,7 +168,7 @@ auto_retry_start 累计 > 3 次     → abort，failed(model_request_failed)
 ```
 <dataRoot>/                      # 默认 ~/.feishu-sync，FEISHU_SYNC_HOME 可改
   agent/
-    pi-home/                     # app-llm 模式的 PI_CODING_AGENT_DIR（0700）
+    pi-home/                     # 全部模式的应用专属 PI_CODING_AGENT_DIR（0700）
     empty-cwd/                   # pi 进程 cwd，保持为空
     sessions/                    # pi 会话 JSONL（--session-dir）
     sessions/.deleted/           # 删除的会话移入此处
@@ -359,7 +359,7 @@ queued → preflight → running → validating → publishing → published
 ### 6.7 文风规范（产品内置）
 
 - 新增 `server/src/agent/prompts/standard-kb-style.md`（随 `server/dist` 发布），内容由 planner-doc-style 提炼：定义句开节（「X 是 Y」）、表格装规则散文装机制、箭头因果链、案例数值直接嵌正文、待定项写成「问题＋建议值」、清除口播式引导语与「不是 X 而是 Y」对仗、比喻只用原文出现过的、不生造词、标题用名词性短语、不写版本头与变更记录。
-- 构建规则（同一 prompt 内）：只依据源文档内容写作，不补充源中不存在的事实；源之间冲突时并列写出两种表述及来源，不自行裁决；每篇标准文档必须声明 sources。
+- 构建规则（同一 prompt 内）：只依据源文档内容写作，不补充源中不存在的事实；源之间冲突时自然说明未统一的规则与边界，不自行裁决；每篇标准文档必须通过独立sources字段声明来源。正文、标题和摘要不含来源段落、来源标识、原始路径及构建信息；来源侧栏统一展示追溯信息。工具写入与发布前双重检查，旧正文通过完整构建更新，不用展示过滤删掉含有知识的句子。
 - 运行时不读取 `~/.agents/skills/**`。
 
 ## 7. 会话、模式与能力隔离
@@ -397,7 +397,7 @@ queued → preflight → running → validating → publishing → published
 
 ### 7.2 能力隔离的三层（不依赖提示词）
 
-1. **进程层**：`--tools` 白名单 + `--no-extensions` 等标志；内置工具不存在于进程中（实测）。cwd 为空目录，`--no-context-files` + `--no-approve` 阻止 AGENTS.md/CLAUDE.md 与项目级 `.pi/` 配置加载——原始库或 Workspace 中的这些文件只能作为工具读取的数据出现。
+1. **进程层**：未启用外部包时使用`--tools`白名单，内置工具不存在于进程中（实测）；显式外部包的工具注册与权限边界见§17。始终禁用自动扩展发现。cwd 为空目录，`--no-context-files` + `--no-approve` 阻止 AGENTS.md/CLAUDE.md 与项目级 `.pi/` 配置加载——原始库或 Workspace 中的这些文件只能作为工具读取的数据出现。
 2. **扩展层**：`tool_call` 钩子对非本扩展注册的工具名返回 `{ block: true }`；钩子异常时 pi 默认阻断（fail closed）。
 3. **server 层（权威）**：`/api/agent-internal/*` 校验 `X-Agent-Run-Token` → 取运行上下文 `{ runKind, sessionId|buildId, workspaceRoot?, stagingRoot?, allowedTools }`；工具名不在 `allowedTools` 返回 `403 tool_not_allowed`；所有路径经 PathGuard。模式切换会使旧令牌立即失效（进程重启并换发新令牌）。
 
@@ -607,7 +607,7 @@ server 在此处产生会话/构建 SSE 的 `tool` 事件摘要以外的审计�
 
 ### 9.7 扩展契约（`feishu-sync-agent.js`）
 
-- 只用 Node 内置模块与全局 `fetch`；对 pi 只做类型层面依赖（本地声明最小 `ExtensionAPI` 接口），保证 server 的 `tsc` 无需安装 pi。
+- 工具转发使用Node内置模块与fetch；本机凭据复用在Pi子进程内动态导入当前Pi的原生模型/只读认证接口。server的tsc无需安装Pi依赖。
 - 异步 factory：读取环境变量 → `GET /tools` → 逐个 `pi.registerTool({ name, label, description, parameters, execute })`；app-llm 模式解析 `FEISHU_SYNC_AGENT_PROVIDER_JSON` 后 `pi.registerProvider('feishu-sync-llm', { api: 'openai-completions', baseUrl, apiKey: '$FEISHU_SYNC_AGENT_API_KEY', models: [...] })`。
 - 工具参数用 server 下发的纯 JSON Schema（pi 校验器按 JSON Schema type 工作，MCP 工具同路径）。F1 须用一次真实模型调用或单元级装载测试确认参数校验与执行链路。
 - `GET /tools` 失败时 factory 抛错，进程启动失败 → `pi_spawn_failed`。
@@ -637,17 +637,16 @@ server 在此处产生会话/构建 SSE 的 `tool` 事件摘要以外的审计�
 
 ### 11.2 标准库页（knowledge）
 
-```
-┌ 状态条：发布版本 / 发布时间 / 文档数 / 待处理变更 N（added/changed/removed）/ [增量构建] [全量构建] ┐
-├ 左：目录树（KbTreeNode）+ 搜索框 ┬ 中：文档阅读（复用 MarkdownView） ┬ 右：来源面板 ┤
-│                                  │  标题、摘要、标签                  │  sources 列表，state 徽标   │
-│                                  │                                    │  点击 → 原始文档预览抽屉    │
-└ 底部抽屉：构建进度（SSE：阶段、批次 x/y、工具日志、错误与 report.issues） ┘
-```
+正文占据主要区域。默认只显示紧凑标题和正文，右侧保留48px工具栏；目录、来源、构建、管理统一在同一侧栏按需展开，默认全部收起。大窗口展开320px侧栏，小窗口使用临时覆盖以避免正文被挤窄。
 
-- 未配置/未发布/Agent 未就绪：空状态卡片分别给出原因与跳转（设置页 Agent 段）。
-- 构建按钮：全量构建需二次确认；运行中按钮禁用并显示取消。失败显示 `error.code` 对应中文与 issues 列表，明确"当前发布版本未改变"。
-- `state: 'changed' | 'missing'` 的来源以警示徽标显示（标准文档可能已过时）。
+- 目录：搜索、目录树、选择文档；选择完成后自动收起，保持所选正文。
+- 来源：文档摘要、路径、标签、发布版本和来源追溯；点击来源打开既有原始预览抽屉。
+- 构建：运行状态、步骤、事件/工具日志、失败报告与取消。进入页面、开始运行或收到终态均不自动展开；可回读最近一次构建状态。
+- 管理：当前版本/发布时间/模型、源文档选择、待更新差异、版本记录、按变更更新和全量构建。
+- 后台有任务时仅显示紧凑进度提示；待处理变化用小提示和管理图标标记。正文区域不常驻构建日志、全量状态条或辅助面板。
+- 未配置/未发布/Agent未就绪、正文错误、发布后防混版、来源变化/缺失/排除等行为沿用既有契约。
+
+正文复用MarkdownView的reading展示变体，紧凑预览为默认。独立样式控制18px正文、1.95行高、标题层级、段落/列表/引用间距和940px外容器（常规宽屏正文844px）；顶部紧凑阅读入口调节14–28px字号、1.40–2.40倍行距；采用CSS自定义属性，仅作用于正文及其标题/表格/代码，不放大全局界面。默认表格16px、代码约15px，随正文适度缩放，在块内滚动。偏好存于localStorage的feishu-sync:kb-reading-preferences，加载时校验类型/范围；无存储或损坏时回到默认，保存失败明确显示仅本次生效。刷新后仅恢复阅读偏好，不恢复阅读面板/侧栏展开状态；窄窗口不覆盖手动设置。
 
 ### 11.3 对话页（agent）
 
@@ -666,7 +665,7 @@ server 在此处产生会话/构建 SSE 的 `tool` 事件摘要以外的审计�
 
 ### 11.4 设置页 Agent 段
 
-运行时状态（node/pi 路径与版本、就绪码）、路径覆盖输入、模型来源选择（app-llm 时下拉选择既有 provider/preset；pi-agent-dir 时输入 `provider/id` 并提示"将使用本机 pi 的凭据"）、标准库目录、Workspace 管理、MCP 连接片段（复制按钮）。
+运行时状态（node/pi 路径与版本、就绪码）、路径覆盖输入、模型来源选择（app-llm 时下拉选择既有 provider/preset；pi-agent-dir 时经 pi RPC 加载有效配置下的可用模型，按提供商分组下拉选择，选择后自动保存；首次未选模型也必须返回列表，原选择失效时提示重新选择，并支持刷新）、标准库目录、Workspace 管理、MCP 连接片段（复制按钮）。
 
 ## 12. 交付切片与验收
 
@@ -713,3 +712,26 @@ server 在此处产生会话/构建 SSE 的 `tool` 事件摘要以外的审计�
 | 打包产物中 `ELECTRON_RUN_AS_NODE` 是否可用（mac 签名/公证后） | MCP 推荐启动方式 | 在 `desktop:dist:mac:*` 产物上实测；不可用则改为外部 Node 方式为主 |
 | app-llm provider（如 GLM）对 `openai-completions` 工具调用的兼容 | 构建与会话无法调用工具 | F1 用真实 key 做一次带工具的会话测试；不兼容时提示改用 pi-agent-dir |
 | 大型原始库的构建时长与成本 | 体验与费用 | 首次真实构建记录批次耗时与 token 用量，写入 build 记录 |
+
+
+## 16. 源选择与轻量版本记录
+
+- 源选择标记独立存于SQLite的kb_source_exclusions，以原始库realpath根和objToken为键；不改原文，不进入同步文件头，索引重建不会清除。
+- 构建快照和发布前源集合复核均排除标记源。排除已发布来源等同于变化集removed；恢复参与等同于added。变更集比较源hash、标题和相对路径，忽略云端观测状态。
+- 保留原API mode='incremental'以兼容调用方，界面名称为「按变更更新」。已有标准文档的来源变更时，存活草稿必须显式重写；所有来源被移除时默认删除。
+- 每个新release在docs之外保存source-contents.json及changes.json，记录父版本、说明、源diff和标准正文diff，全部在CURRENT提交前完成。源diff进入批次提示，模型输出必须是完整当前表述。
+- GET /api/kb/sources?q=&page=&limit=列出参与源与待更新状态；PUT /api/kb/sources/:objToken接收{included:boolean}。构建中拒绝修改409。
+- GET /api/kb/changes返回基线releaseId、源逐行diff及受影响文档；GET /api/kb/versions列出保留版本，GET /api/kb/versions/:releaseId返回独立变更详情。历史路径校验和realpath围栏不能绕过。
+- 文档正文与摘要不含修订表、版本头或编辑过程；kb_finish.summary仅进入外部版本记录。历史发布缺少原文快照时明确标记beforeAvailable=false，不伪造旧diff。
+- 本轮版本范围为父子版本、保留历史与差异查看；沿用既有release保留策略，不引入Git进程或远程操作。
+
+
+## 17. Pi原生插件管理
+
+- 单位为Pi package，参考CodeBox的internal/piplugin与PiPluginPanel；安装/更新/移除走当前Node+Pi CLI，Pi SettingsManager/DefaultPackageManager解析manifest及资源。与CodeBox用户级目录不同，本应用始终固定agent/pi-home，运行与管理共用该目录。
+- 内置knowledge-workbench包声明package.json的pi.extensions，原四项上下文合为一个插件下的配置。AppPluginStore保留原覆盖层和自定义配置项，不丢失上一版编辑；上下文配置API移至/api/agent/plugin-contexts。包管理API为GET /api/agent/plugins与POST /api/agent/plugins/install|update|remove|toggle。
+- 自动发现开关保持禁用，只将原生解析后启用的extension/skill/prompt/theme路径显式传给Pi；保留Pi筛选语义，停用前的筛选另存应用内备份。相对本地源的CLI cwd与PI_CODING_AGENT_DIR统一为canonical agentDir，避免/tmp与/private/tmp造成失配。npm/git包实体必须在应用目录内，本地源允许外部绝对路径，纳入Workspace动态保护根。
+- 每次运行固定插件配置快照，包管理时拒绝活跃对话/构建并回收空闲进程。更新列表通过generation拒绝覆盖更新后的缓存；写操作要求expectedRevision。缺失/损坏资源诚实报错；Pi SDK不可用时其他应用功能继续启动，插件页提供刷新和运行时修复入口。
+- 本机Pi模型复用由工具桥在子进程内使用Pi ModelRuntime + ReadOnlyAuthStorage注册原生provider；models.json只读，模型缓存写应用目录。宿主不解析/复制密钥，通用Pi插件不加载。app-llm维持既有provider注入。
+- 未启用外部插件时保持既有--tools白名单。显式启用外部包时允许其原生工具注册，再由桥接将活动工具收敛为宿主工具与非builtin扩展工具；未主动加载的Pi内置shell/文件工具继续被阻断。第三方扩展本身是当前用户权限的Node代码，不宣称具备OS沙箱；对话页面展示这一能力边界。
+- RPC允许命令集合、宿主内部API能力令牌、路径守卫、原始库只读工具与正文发布校验继续生效。终端UI专用插件功能受既有RPC交互策略限制。此版本不合并main或发版。

@@ -20,6 +20,7 @@ const STATE_BADGE: Record<string, string> = {
   current: 'bg-jade/10 text-jade border-jade/20',
   changed: 'bg-[rgba(180,83,9,0.10)] text-[#92580c] border-[rgba(180,83,9,0.35)]',
   missing: 'bg-seal-2/10 text-seal-2 border-seal-2/20',
+  excluded: 'bg-paper-2 text-ink-faint border-line',
 };
 
 export function KbSourcePanel({ docTitle, sources, onOpenSource }: KbSourcePanelProps) {
@@ -69,7 +70,7 @@ export function KbSourcePanel({ docTitle, sources, onOpenSource }: KbSourcePanel
       </div>
       <div className="px-4 py-2.5 border-t border-line/60 shrink-0">
         <p className="text-[11px] text-ink-faint leading-snug">
-          来源即追溯链：标准文档由 AI 依据左侧来源生成，正文主张以来源原文为准（{docTitle.slice(0, 24)}
+          来源即追溯链：标准文档由 AI 依据上述来源生成，正文主张以来源原文为准（{docTitle.slice(0, 24)}
           {docTitle.length > 24 ? '…' : ''}）。
         </p>
       </div>

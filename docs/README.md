@@ -14,6 +14,10 @@
 
 ## 报告与计划
 
+- [原始源选择与标准库版本记录](./reports/kb-source-versioning.md) —— 排除/恢复参与、diff驱动更新、独立版本入口与真实验证。
+
+- [Pi原生插件管理](./reports/pi-native-plugin-management.md) —— 应用专属package安装/启停、内置插件配置、资源加载与真实工具验证。
+
 - [reports/](./reports/) —— 工程审计与治理报告（含 [archive/](./reports/archive/) 历史报告归档）
 - 工程约定速查：仓库根 [CLAUDE.md](../CLAUDE.md)（Agent/协作者的仓库契约入口）
 

@@ -255,6 +255,17 @@ const THINKING_LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high']);
 const MODEL_SOURCES = new Set(['app-llm', 'pi-agent-dir']);
 const WORKSPACE_ID_PATTERN = /^ws_[A-Za-z0-9]{6,32}$/;
 
+/** pi的provider可含中文/空格，model id也可含路径；由RPC列表提供精确标识。 */
+function isValidPiModel(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const slash = value.indexOf('/');
+  if (slash <= 0 || slash === value.length - 1) return false;
+  const provider = value.slice(0, slash);
+  const model = value.slice(slash + 1);
+  return provider.trim() === provider && model.trim() === model
+    && ![...value].some((char) => char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127);
+}
+
 export class InvalidConfigError extends Error {
   details: Array<{ field: string; code: string }>;
   constructor(details: Array<{ field: string; code: string }>) {
@@ -345,7 +356,7 @@ export function validateAgentAndKbConfig(value: {
         details.push({ field: 'agent.model.source', code: 'invalid_value' });
       }
       if (model.source === 'pi-agent-dir' && model.piModel !== undefined
-        && !/^[A-Za-z0-9_-]+\/[A-Za-z0-9._-]+$/.test(model.piModel ?? '')) {
+        && !isValidPiModel(model.piModel)) {
         details.push({ field: 'agent.model.piModel', code: 'invalid_format' });
       }
       if (model.thinkingLevel !== undefined && !THINKING_LEVELS.has(model.thinkingLevel as string)) {

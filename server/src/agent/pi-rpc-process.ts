@@ -19,6 +19,7 @@ import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 
 /** RPC 命令白名单（§4.3）。 */
 export const RPC_COMMAND_WHITELIST: ReadonlySet<string> = new Set([
@@ -52,6 +53,11 @@ export interface RpcSpawnOptions {
   nodePath: string;
   piCliPath: string;
   extensionPath?: string;
+  additionalExtensionPaths?: string[];
+  allowExternalPluginTools?: boolean;
+  additionalSkillPaths?: string[];
+  additionalPromptPaths?: string[];
+  additionalThemePaths?: string[];
   tools: string[];
   sessionDir?: string;
   sessionId?: string;
@@ -151,12 +157,17 @@ export class PiRpcProcess extends EventEmitter {
     }
     if (this.options.noTools) {
       args.push('--no-tools');
-    } else if (this.options.tools.length > 0) {
+    } else if (this.options.tools.length > 0 && !this.options.allowExternalPluginTools) {
       args.push('--tools', this.options.tools.join(','));
     }
-    if (this.options.extensionPath) {
-      args.push('-e', this.options.extensionPath);
+    for (const extension of new Set([this.options.extensionPath, ...(this.options.additionalExtensionPaths ?? [])])) {
+      if (extension) args.push('-e', extension);
     }
+    for (const [flag, paths] of [
+      ['--skill', this.options.additionalSkillPaths],
+      ['--prompt-template', this.options.additionalPromptPaths],
+      ['--theme', this.options.additionalThemePaths],
+    ] as const) for (const resource of paths ?? []) args.push(flag, resource);
     if (this.options.model) {
       const slash = this.options.model.indexOf('/');
       if (slash > 0) {
@@ -669,6 +680,12 @@ export function buildPiProcessEnv(input: {
       env[key] = input.parentEnv[key];
     }
   }
+  // 包/设置始终限定在应用Pi home；本机凭据只由桥接扩展经Pi只读存储使用。
+  if (input.mode === 'pi-agent-dir') {
+    env.FEISHU_SYNC_AGENT_SHARED_PI_HOME = path.resolve(input.parentEnv.PI_CODING_AGENT_DIR || path.join(os.homedir(), '.pi', 'agent'));
+  }
+  env.PI_CODING_AGENT_DIR = path.join(input.dataRoot, 'agent', 'pi-home');
+  fs.mkdirSync(env.PI_CODING_AGENT_DIR, { recursive: true, mode: 0o700 });
   env.PI_OFFLINE = '1';
   env.PI_SKIP_VERSION_CHECK = '1';
   env.PI_TELEMETRY = '0';

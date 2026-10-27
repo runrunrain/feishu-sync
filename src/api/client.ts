@@ -1,3 +1,6 @@
+import type { PiPluginsDto } from '../types/pi-plugin';
+import type { AgentPluginsDto, AgentPluginInput } from '../types/agent-plugin';
+import type { KbSourceChoice, KbChangePreview, KbVersionDto } from '../types/kb-version';
 /**
  * API client for feishu-sync
  * All requests include X-Desktop-Token header from window.desktop
@@ -1189,3 +1192,44 @@ export async function deleteAgentWorkspace(id: string): Promise<{ ok: true }> {
 }
 
 export { type AgentMessageDto, type AgentSessionDto, type AgentStatusDto };
+
+// 标准库源选择、待更新diff与独立版本记录。
+export function listKbSources(q = '', page = 1) {
+  const query = new URLSearchParams({ q, page: String(page), limit: '50' });
+  return request<{ sources: KbSourceChoice[]; total: number; page: number; limit: number }>(`/api/kb/sources?${query}`);
+}
+export function setKbSourceIncluded(objToken: string, included: boolean) {
+  return request<{ objToken: string; included: boolean }>(`/api/kb/sources/${encodeURIComponent(objToken)}`, {
+    method: 'PUT', body: JSON.stringify({ included }),
+  });
+}
+export function getKbChanges() { return request<KbChangePreview>('/api/kb/changes'); }
+export function listKbVersions() {
+  return request<{ versions: Array<Omit<KbVersionDto, 'sourceChanges' | 'docChanges'> & { sourceCount: number; docCount: number }>; retainReleases: number }>('/api/kb/versions');
+}
+export function getKbVersion(releaseId: string) {
+  return request<KbVersionDto>(`/api/kb/versions/${encodeURIComponent(releaseId)}`);
+}
+
+
+export function getAgentPlugins(): Promise<AgentPluginsDto> {
+  return request('/api/agent/plugin-contexts');
+}
+export function createAgentPlugin(expectedRevision: string, plugin: AgentPluginInput): Promise<AgentPluginsDto> {
+  return request('/api/agent/plugin-contexts', { method: 'POST', body: JSON.stringify({ expectedRevision, ...plugin }) });
+}
+export function updateAgentPlugin(id: string, expectedRevision: string, plugin: AgentPluginInput): Promise<AgentPluginsDto> {
+  return request(`/api/agent/plugin-contexts/${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify({ expectedRevision, ...plugin }) });
+}
+export function resetAgentPlugin(id: string, expectedRevision: string): Promise<AgentPluginsDto> {
+  return request(`/api/agent/plugin-contexts/${encodeURIComponent(id)}/reset`, { method: 'POST', body: JSON.stringify({ expectedRevision }) });
+}
+export function deleteAgentPlugin(id: string, expectedRevision: string): Promise<AgentPluginsDto> {
+  return request(`/api/agent/plugin-contexts/${encodeURIComponent(id)}`, { method: 'DELETE', body: JSON.stringify({ expectedRevision }) });
+}
+
+export function listPiPlugins(): Promise<PiPluginsDto> { return request('/api/agent/plugins'); }
+export function managePiPlugin(action: 'install' | 'update' | 'remove' | 'toggle', expectedRevision: string,
+  input: { source?: string; id?: string; enabled?: boolean }): Promise<PiPluginsDto> {
+  return request(`/api/agent/plugins/${action}`, { method: 'POST', body: JSON.stringify({ expectedRevision, ...input }) });
+}

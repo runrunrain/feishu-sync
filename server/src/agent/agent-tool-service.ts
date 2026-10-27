@@ -23,6 +23,7 @@ import { getToolSpec, getToolSpecs } from './tool-specs.js';
 import { RawSourceSnapshot, collectSourceCandidates } from '../kb/raw-source-snapshot.js';
 import { StandardKbStore, stripStdHeader } from '../kb/standard-kb-store.js';
 import { matchGlob } from '../kb/kb-search.js';
+import { hasEditorialHistory, hasSourceMetadata } from '../kb/body-policy.js';
 import type {
   AgentRunContext,
   AgentToolSpec,
@@ -56,6 +57,9 @@ export interface BuildRunState {
   /** kb_write_doc 写入时同步更新（标题/摘要/标签，manifest 生成用） */
   docMeta?: Map<string, { title: string; summary: string; tags: string[]; sources: string[] }>;
   finishInfo: { summary: string; skipped: Array<{ objToken: string; reason: string }> } | null;
+  /** 受旧源变动影响的现存草稿必须显式重写，不能借旧sources声明冒充更新。 */
+  requiredRewrites?: Set<string>;
+  writtenPaths?: Set<string>;
   /**
    * F3-R08：不可恢复毒化标记。raw_read/raw_search 命中
    * source_changed_during_build 后置位；后续每个 batch 结束与发布前都
@@ -558,6 +562,9 @@ export class AgentToolService {
     const title = requireString(args, 'title', 1, 300);
     const markdown = requireString(args, 'markdown', 1, 2_000_000);
     const summary = requireString(args, 'summary', 1, 400);
+    if (hasEditorialHistory(markdown) || hasEditorialHistory(summary)) {
+      throw new ToolError('body_contains_change_history', '正文与文档摘要必须为当前规则的一次成型表述；移除版本头、修订记录和本版/上版对比。变更说明仅放在kb_finish.summary。');
+    }
     const sources = args.sources;
     if (!Array.isArray(sources) || sources.length === 0 || !sources.every((source) => typeof source === 'string')) {
       throw new ToolError('invalid_request', 'sources 必须是非空字符串数组');
@@ -566,6 +573,10 @@ export class AgentToolService {
       if (!state.snapshot.has(source as string)) {
         throw new ToolError('invalid_request', `来源不在快照内: ${source}`);
       }
+    }
+    const sourceIdentifiers = state.snapshot.entries.flatMap((entry) => [entry.objToken, entry.relPath]);
+    if ([title, markdown, summary].some((text) => hasSourceMetadata(text, sourceIdentifiers))) {
+      throw new ToolError('body_contains_source_metadata', '正文、标题与摘要只写自然完整的知识内容。移除来源段落、来源标识、原始文件路径和构建信息；来源仅通过sources字段声明，由来源侧栏展示。冲突内容直接说明未统一的规则，不在正文标注来源。');
     }
     const tags = Array.isArray(args.tags)
       ? args.tags.filter((tag): tag is string => typeof tag === 'string').slice(0, 20)
@@ -593,6 +604,7 @@ export class AgentToolService {
     }
     const target = resolveInside(path.join(state.stagingRoot, 'docs'), docPath, 'write');
     atomicWriteFile(target, full);
+    state.writtenPaths?.add(docPath);
     state.docMeta?.set(docPath, { title, summary, tags, sources: sources as string[] });
     return {
       content: [{ type: 'text', text: `已写入草稿 ${docPath}（docId=${docId}，${full.length} 字节）` }],

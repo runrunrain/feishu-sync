@@ -143,9 +143,9 @@ export const KB_WRITE_DOC_SPEC: AgentToolSpec = {
     properties: {
       path: string('标准文档 POSIX 相对路径（.md 结尾，不以 . 开头，每段 ≤120 字符，深度 ≤6）'),
       title: string('文档标题（名词性短语）'),
-      markdown: string('Markdown 正文（不含文件头，不以 # 标题开头——标题由 server 生成）'),
+      markdown: string('自然完整的知识正文，不含文件头或 # 总标题。禁止来源段落、来源标识、原始路径、来源脚注及构建信息；来源仅填sources，由侧栏展示。'),
       sources: { type: 'array', items: { type: 'string' }, description: '来源 objToken 列表（必须都在快照内）' },
-      summary: string('≤200 字摘要'),
+      summary: string('≤200字的内容概要，只概括本文规则或机制。例如“战斗行动的回合次数、先手判定与怒气消耗”。禁止“新增/补充/生成/撰写标准文档”“依据新增源”“本次更新”等写作动作、来源变动与修订对比。更新总结只填kb_finish.summary。'),
       tags: { type: 'array', items: { type: 'string' }, description: '标签列表' },
     },
     required: ['path', 'title', 'markdown', 'sources', 'summary'],

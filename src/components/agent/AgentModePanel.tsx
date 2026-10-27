@@ -177,8 +177,8 @@ export function AgentModePanel({ session, busy, onSwitchMode, writeRecords }: Ag
           </div>
           <p className="mt-2 text-[11px] text-ink-soft leading-relaxed">
             {isWork
-              ? '可读标准库与原始库，并可在绑定的 Workspace 内创建、修改文件。不能执行任何命令（无 shell）。'
-              : '只读：可检索和阅读标准库与原始库，不提供任何写入工具或命令执行。'}
+              ? '应用自带工具可读知识库、写绑定Workspace，无shell；第三方Pi插件以当前用户权限运行。'
+              : '应用自带工具只读知识库，无shell；第三方Pi插件以当前用户权限运行。'}
           </p>
           {isWork && session?.workspace ? (
             <div className="mt-2.5 px-3 py-2.5 rounded-md border border-[rgba(180,83,9,0.3)] bg-[rgba(180,83,9,0.04)]">

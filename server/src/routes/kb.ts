@@ -14,7 +14,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { KbBuildService } from '../kb/kb-build-service.js';
 import { StandardKbStore, KbNotPublishedError } from '../kb/standard-kb-store.js';
-import { RawSourceSnapshot } from '../kb/raw-source-snapshot.js';
+import { RawSourceSnapshot, collectSourceCandidates } from '../kb/raw-source-snapshot.js';
+import { KbVersionStore, captureSourceContents, sourceChangePreview, validReleaseId } from '../kb/kb-version-store.js';
 import { computeChangeset } from '../kb/kb-build-service.js';
 import { ToolError } from '../agent/agent-tool-service.js';
 import type { LocalMapStore } from '../modules/local-map-store.js';
@@ -72,6 +73,11 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
     return { store: new StandardKbStore(config.standardKb.outputRoot), config };
   }
 
+  const sourceDocuments = (root: string) => {
+    const excluded = new Set(localMapStore.listKbExcludedSources(root));
+    return deps.documentsProvider().filter((doc) => !excluded.has(doc.objToken));
+  };
+
   // ------------------------------------------------------------------
   // 只读查询
   // ------------------------------------------------------------------
@@ -83,7 +89,7 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
       const manifest = store.readManifest();
       const scan = RawSourceSnapshot.scan(
         config.knowledgeBaseRoot,
-        deps.documentsProvider(),
+        sourceDocuments(config.knowledgeBaseRoot),
         deps.sheetCsvPaths,
       );
       const { pending } = compareSources(manifest, scan.entries, deps.sheetCsvPaths, config.knowledgeBaseRoot);
@@ -137,15 +143,17 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
       const config = await configManager.load();
       const scan = RawSourceSnapshot.scan(
         config.knowledgeBaseRoot,
-        deps.documentsProvider(),
+        sourceDocuments(config.knowledgeBaseRoot),
         deps.sheetCsvPaths,
       );
       const currentByToken = new Map(scan.entries.map((entry) => [entry.objToken, entry.contentHash]));
+      const excluded = new Set(localMapStore.listKbExcludedSources(config.knowledgeBaseRoot));
       const sources = doc.sources.map((objToken) => {
         const snapshotEntry = manifest.sourceSnapshot.find((candidate) => candidate.objToken === objToken);
         const currentHash = currentByToken.get(objToken);
         let state: KbSourceState = 'current';
-        if (currentHash === undefined) state = 'missing';
+        if (excluded.has(objToken)) state = 'excluded';
+        else if (currentHash === undefined) state = 'missing';
         else if (snapshotEntry && snapshotEntry.contentHash !== currentHash) state = 'changed';
         return {
           objToken,
@@ -188,6 +196,78 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
     } catch (error) {
       return errorResponse(c, error);
     }
+  });
+
+  // 源选择与版本入口独立于正文。标记只写应用元数据，不编辑原始文件。
+  routes.get('/api/kb/sources', async (c) => {
+    try {
+      const { store, config } = await loadStore();
+      const excluded = new Set(localMapStore.listKbExcludedSources(config.knowledgeBaseRoot));
+      const manifest = store.readManifest();
+      const scan = RawSourceSnapshot.scan(config.knowledgeBaseRoot, sourceDocuments(config.knowledgeBaseRoot), deps.sheetCsvPaths);
+      const current = new Map(scan.entries.map((entry) => [entry.objToken, entry]));
+      const base = new Map((manifest?.sourceSnapshot ?? []).map((entry) => [entry.objToken, entry]));
+      const candidates = new Map(collectSourceCandidates(deps.documentsProvider()).map((doc) => [doc.objToken, { title: doc.title, relPath: doc.localRelPath! }]));
+      for (const [token, entry] of base) if (!candidates.has(token)) candidates.set(token, entry);
+      const q = (c.req.query('q') ?? '').slice(0, 200).toLowerCase();
+      const limit = Math.max(1, Math.min(100, Number(c.req.query('limit')) || 50));
+      const page = Math.max(1, Math.floor(Number(c.req.query('page')) || 1));
+      const all = [...candidates].map(([objToken, doc]) => {
+        const old = base.get(objToken); const next = current.get(objToken);
+        const isExcluded = excluded.has(objToken);
+        const pending = isExcluded ? (old ? 'removed' : 'excluded') : !next ? (old ? 'removed' : 'unchanged')
+          : !old ? 'added' : next.contentHash !== old.contentHash || next.relPath !== old.relPath || next.title !== old.title ? 'changed' : 'unchanged';
+        return { objToken, title: doc.title || objToken, relPath: doc.relPath, included: !isExcluded, published: Boolean(old), pending };
+      }).filter((doc) => `${doc.title} ${doc.relPath} ${doc.objToken}`.toLowerCase().includes(q))
+        .sort((a, b) => a.relPath.localeCompare(b.relPath));
+      return c.json({ sources: all.slice((page - 1) * limit, page * limit), total: all.length, page, limit });
+    } catch (error) { return errorResponse(c, error); }
+  });
+
+  routes.put('/api/kb/sources/:objToken', async (c) => {
+    try {
+      const body = await c.req.json() as { included?: unknown };
+      if (typeof body.included !== 'boolean') return c.json({ error: 'invalid_request', message: 'included必须为boolean' }, 400);
+      if (buildService.activeBuild(localMapStore)) return c.json({ error: 'kb_build_running', message: '更新进行中，请结束后再调整源文档' }, 409);
+      const { store, config } = await loadStore();
+      const token = c.req.param('objToken');
+      if (!deps.documentsProvider().some((doc) => doc.objToken === token)
+        && !store.readManifest()?.sourceSnapshot.some((entry) => entry.objToken === token))
+        return c.json({ error: 'source_not_found', message: '原始文档不存在' }, 404);
+      localMapStore.setKbSourceExcluded(config.knowledgeBaseRoot, token, !body.included);
+      return c.json({ objToken: token, included: body.included });
+    } catch (error) { return errorResponse(c, error); }
+  });
+
+  routes.get('/api/kb/changes', async (c) => {
+    try {
+      const { store, config } = await loadStore();
+      const manifest = store.readManifest();
+      const scan = RawSourceSnapshot.scan(config.knowledgeBaseRoot, sourceDocuments(config.knowledgeBaseRoot), deps.sheetCsvPaths);
+      const snapshot = RawSourceSnapshot.fromEntries(scan.entries, { sheetCsvPaths: deps.sheetCsvPaths });
+      const contents = captureSourceContents(snapshot, config.knowledgeBaseRoot);
+      const versions = new KbVersionStore(config.standardKb.outputRoot);
+      return c.json(sourceChangePreview(snapshot, contents, manifest, versions.readSourceContents(manifest?.releaseId ?? null),
+        new Set(localMapStore.listKbExcludedSources(config.knowledgeBaseRoot))));
+    } catch (error) { return errorResponse(c, error); }
+  });
+
+  routes.get('/api/kb/versions', async (c) => {
+    try {
+      const { config } = await loadStore();
+      return c.json({ versions: new KbVersionStore(config.standardKb.outputRoot).listVersions(), retainReleases: config.standardKb.retainReleases });
+    } catch (error) { return errorResponse(c, error); }
+  });
+
+  routes.get('/api/kb/versions/:releaseId', async (c) => {
+    try {
+      const id = c.req.param('releaseId');
+      if (!validReleaseId(id)) return c.json({ error: 'invalid_request', message: '版本标识无效' }, 400);
+      const { config } = await loadStore();
+      const version = new KbVersionStore(config.standardKb.outputRoot).readVersion(id);
+      if (!version) return c.json({ error: 'version_not_found', message: '版本不存在或已按保留策略清理' }, 404);
+      return c.json(version);
+    } catch (error) { return errorResponse(c, error); }
   });
 
   // ------------------------------------------------------------------

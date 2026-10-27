@@ -22,6 +22,7 @@ import {
   FolderTree,
   Info,
   KeyRound,
+  Puzzle,
   Server,
   Settings,
   ShieldCheck,
@@ -35,6 +36,7 @@ import { CustomArchiveSettingsCard } from '../components/CustomArchiveSettingsCa
 import { ModelProviderSettings } from '../components/ModelProviderSettings';
 import { AuthSettingsCard } from '../components/AuthSettingsCard';
 import { AppUpdateCard } from '../components/AppUpdateCard';
+import { AgentPluginsCard } from '../components/agent/AgentPluginsCard';
 import { AgentRuntimeSettingsCard, AgentKbSettingsCard } from '../components/agent/AgentSettingsCard';
 
 type SettingsTab = 'knowledge' | 'models' | 'agent' | 'auth' | 'application';
@@ -121,6 +123,13 @@ const SETTINGS_TABS: SettingsTabMeta[] = [
         description: 'node/pi 发现与覆盖、模型来源与思考档位',
         icon: Bot,
         render: () => <AgentRuntimeSettingsCard />,
+      },
+      {
+        id: 'agent-plugins',
+        label: '应用插件',
+        description: 'Pi包安装、启停与内置插件配置',
+        icon: Puzzle,
+        render: () => <AgentPluginsCard />,
       },
       {
         id: 'agent-kb',
