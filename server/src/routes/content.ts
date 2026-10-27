@@ -17,6 +17,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { Hono } from 'hono';
+import { MAX_WORKBOOK_BYTES, readWorkbookPreview, workbookPathForMarkdown } from '../modules/sheet-workbook.js';
 import {
   resolveAbsolute,
   toPortableRelative,
@@ -77,6 +78,69 @@ function readTextCapped(
 }
 
 export const contentRoutes = new Hono();
+
+/** The index chooses the workbook. A caller cannot provide an arbitrary path. */
+function findWorkbook(deps: ContentDependencies, objToken: string) {
+  const root = deps.configManager.getConfig()?.knowledgeBaseRoot;
+  const doc = deps.localMapStore.getDocumentByObjToken(objToken);
+  if (!root || !doc || doc.objType !== 'sheet' || !doc.localMdPath) return null;
+  const mdRelative = toPortableRelative(root, doc.localMdPath);
+  if (!mdRelative) return null;
+  const relativePath = workbookPathForMarkdown(mdRelative);
+  const absolutePath = resolveAbsolute(root, relativePath);
+  if (!isPathInsideRoot(root, absolutePath)) return null;
+  try {
+    const rootReal = fs.realpathSync.native(root);
+    const realPath = fs.realpathSync.native(absolutePath);
+    if (!isPathInsideRoot(rootReal, realPath)) return null;
+    const stat = fs.statSync(realPath);
+    if (!stat.isFile()) return null;
+    let mode: 'native' | 'read-reconstruction' | undefined;
+    const metadataPath = `${absolutePath}.metadata.json`;
+    if (fs.existsSync(metadataPath)) {
+      const metadataReal = fs.realpathSync.native(metadataPath);
+      if (isPathInsideRoot(rootReal, metadataReal) && fs.statSync(metadataReal).size < 64 * 1024) {
+        try {
+          const metadata = JSON.parse(fs.readFileSync(metadataReal, 'utf-8'));
+          if (metadata.mode === 'native' || metadata.mode === 'read-reconstruction') mode = metadata.mode;
+        } catch { /* Missing provenance does not make the archived file unreadable. */ }
+      }
+    }
+    return { path: relativePath, absolutePath: realPath, size: stat.size, modifiedTime: stat.mtime.toISOString(), mode };
+  } catch { return null; }
+}
+
+contentRoutes.get('/api/mapping/workbook/:objToken/file', (c) => {
+  const workbook = findWorkbook(getDeps(c), c.req.param('objToken'));
+  if (!workbook) return c.json({ error: 'workbook_not_found' }, 404);
+  if (workbook.size > MAX_WORKBOOK_BYTES) return c.json({ error: 'workbook_too_large' }, 413);
+  return new Response(new Uint8Array(fs.readFileSync(workbook.absolutePath)), {
+    headers: {
+      'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(path.basename(workbook.path))}`,
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+    },
+  });
+});
+
+contentRoutes.get('/api/mapping/workbook/:objToken', async (c) => {
+  const index = c.req.query('sheet') ?? '0';
+  if (!/^\d{1,4}$/.test(index)) return c.json({ error: 'invalid_sheet_index' }, 400);
+  const workbook = findWorkbook(getDeps(c), c.req.param('objToken'));
+  if (!workbook) return c.json({ error: 'workbook_not_found', message: '本地无 Excel 原件，请重新同步该表格' }, 404);
+  if (workbook.size > MAX_WORKBOOK_BYTES) return c.json({ error: 'workbook_too_large', message: 'Excel 超过 64 MB 预览读取上限，请打开本地原件' }, 413);
+  try {
+    const preview = await readWorkbookPreview(workbook.absolutePath, Number(index));
+    c.header('Cache-Control', 'no-store');
+    return c.json(preview);
+  } catch (error) {
+    return c.json({
+      error: 'workbook_preview_failed',
+      message: error instanceof Error ? error.message : 'Excel 预览读取失败，请打开本地原件',
+    }, error instanceof RangeError ? 404 : 422);
+  }
+});
 
 /**
  * GET /api/mapping/media?path=<kbRoot 相对路径>（v0.2.9 预览图片支持）
@@ -253,6 +317,10 @@ contentRoutes.get('/api/mapping/content/:objToken', async (c) => {
       mdContent,
       mdTruncated,
       csvTables,
+      workbook: (() => {
+        const workbook = findWorkbook({ localMapStore, configManager }, objToken);
+        return workbook ? { path: workbook.path, size: workbook.size, modifiedTime: workbook.modifiedTime, mode: workbook.mode } : null;
+      })(),
     });
   } catch (error) {
     console.error('[content] read content failed:', error);

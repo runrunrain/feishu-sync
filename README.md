@@ -43,11 +43,28 @@
 - **表格重构**：A/B/C/D/E 五类块自动识别与重构（metadata/hierarchy/datatable/paragraph/sparse）
 - **LLM 适配**：direct 单通道（OpenAI SDK，默认智谱 bigmodel GLM，`glm-4-flash` 免费档起步），风格对齐失败时回退确定性结果
 - **自定义归档**：结构树之外的零散云文档快捷归档到 `_custom/<文件夹>/`，支持云端变更检测；手工放入的文件在全量重建时自动纳管并回填归属
-- **双视图与预览**：节点树支持飞书结构视图 / 本地目录视图，内置 Markdown 文档预览面板
+- **双视图与预览**：节点树支持飞书结构视图 / 本地目录视图；表格优先预览 Excel 画板，保留行列尺寸、合并区域、字体底色和图片位置，支持工作表切换与缩放
 - **系统托盘**：常驻托盘，快捷键（CmdOrCtrl+Shift+F）显示窗口，支持开机自启
 - **自动更新**：electron-updater 集成，支持检查/下载/安装更新流程
 
 ---
+
+### 表格原件与只读文档
+
+电子表格同步后，以同目录的 `<文档名>.xlsx` 作为画板源文件。`<文档名>.md` 和 `.csv-data/` 继续供文本检索及既有知识库索引使用；Markdown 头部的 `source_workbook` 指向 Excel 原件。原始库的完整性哈希同时包含 XLSX，因此仅调整图片或布局也会触发源变化。
+
+同步优先调用 `lark-cli sheets +workbook-export`，保留飞书导出的文件字节。只有阅读权限、导出返回权限不足时，自动通过 `+workbook-info`、`+sheet-info`、分块 `+cells-get` 和 `+float-image-list` 读取数据，在本地重建 XLSX，不需要修改云文档。重建保留文字坐标、公式及缓存值、样式、行高列宽、隐藏行列、合并区域和浮动图片的锚点、像素偏移、尺寸及层级。`.xlsx.metadata.json` 记录取得方式、版本号和各表核对数量。完整读取需要新版 CLI 提供上述接口。
+
+每个读取块都检查截断标记和真实行列坐标；图片清单数量及读取前后的工作簿版本必须一致。所有原件、元数据、文本和媒体先进入 staging，再一并提交；任一读取、下载或提交失败都不推进同步完成状态。已有手工 Excel 文件不会被自动覆盖。历史 CSV 版本重新同步后才会出现 Excel 画板。
+
+能力边界：阅读权限不保证所有资源接口都可用。图片也不可读取、遇到当前不能完整映射的富文本对象/裁剪样式，或只读重建遇到图表、透视表等对象时，同步会明确失败，保留旧版本。当前只读重建最多 200 万个网格位置、单表 50000 行/1024 列；XLSX 读取上限 64 MB。应用预览按原始几何显示，图表、形状和条件格式的计算效果会提示查看 Excel 原件；它不执行宏、外链或公式重算。不能据此承诺任意受限文档的所有飞书特性均可完整离线复现。
+
+只读验证可在独立输出目录运行（不会写正式知识库或状态库）：
+
+```bash
+node node_modules/tsx/dist/cli.mjs server/scripts/verify-sheet-workbook.ts --token <spreadsheet-token> --output <新文件.xlsx>
+node node_modules/tsx/dist/cli.mjs server/scripts/preview-sheet-workbook.ts <已生成的文件.xlsx>
+```
 
 ## 技术栈
 

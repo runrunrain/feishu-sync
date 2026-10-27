@@ -12,6 +12,7 @@ import { Loader2, FileWarning, Table2 } from 'lucide-react';
 import { Drawer } from '../common/Drawer';
 import { MarkdownView } from '../preview/MarkdownView';
 import { CsvTableView } from '../preview/CsvTableView';
+import { WorkbookView } from '../preview/WorkbookView';
 import { getDocumentContent, APIError } from '../../api/client';
 import type { DocumentContent } from '../../types';
 import type { KbDocSourceRef } from '../../types/agent';
@@ -25,7 +26,7 @@ export function RawSourceDrawer({ source, onClose }: RawSourceDrawerProps) {
   const [content, setContent] = useState<DocumentContent | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [view, setView] = useState<'md' | 'csv'>('md');
+  const [view, setView] = useState<'md' | 'csv' | 'xlsx'>('md');
   const [csvIndex, setCsvIndex] = useState(0);
 
   const objToken = source?.objToken ?? null;
@@ -46,7 +47,8 @@ export function RawSourceDrawer({ source, onClose }: RawSourceDrawerProps) {
       .then((data) => {
         if (cancelled) return;
         setContent(data);
-        if (!data.mdContent && data.csvTables.length > 0) setView('csv');
+        if (data.workbook) setView('xlsx');
+        else if (!data.mdContent && data.csvTables.length > 0) setView('csv');
       })
       .catch((err) => {
         if (cancelled) return;
@@ -66,7 +68,7 @@ export function RawSourceDrawer({ source, onClose }: RawSourceDrawerProps) {
       onClose={onClose}
       title={source ? `原始文档 · ${source.title || '未命名'}` : '原始文档'}
       subtitle={source?.relPath}
-      widthClass="w-[620px] max-w-[92vw]"
+      widthClass={view === 'xlsx' ? 'w-[1080px] max-w-[94vw]' : 'w-[620px] max-w-[92vw]'}
     >
       {loading ? (
         <div className="flex flex-col items-center justify-center gap-3 py-20 text-ink-faint">
@@ -83,6 +85,9 @@ export function RawSourceDrawer({ source, onClose }: RawSourceDrawerProps) {
       ) : content ? (
         <div className="flex flex-col">
           <div className="flex items-center gap-2 px-4 py-2 border-b border-line/60 bg-paper/50">
+            {content.workbook && (
+              <button type="button" onClick={() => setView('xlsx')} className={`px-2.5 py-1 rounded text-xs ${view === 'xlsx' ? 'bg-card-bg border border-line text-ink' : 'text-ink-faint hover:text-ink'}`}>Excel 画板</button>
+            )}
             {content.mdContent ? (
               <button
                 type="button"
@@ -124,7 +129,9 @@ export function RawSourceDrawer({ source, onClose }: RawSourceDrawerProps) {
               <span className="ml-auto text-[11px] text-ink-faint">内容过长已截断</span>
             ) : null}
           </div>
-          {view === 'md' ? (
+          {view === 'xlsx' && content.workbook ? (
+            <WorkbookView key={`${content.objToken}-${content.workbook.modifiedTime}`} objToken={content.objToken} fileName={content.workbook.path} mode={content.workbook.mode} />
+          ) : view === 'md' ? (
             content.mdContent ? (
               <MarkdownView
                 content={content.mdContent}

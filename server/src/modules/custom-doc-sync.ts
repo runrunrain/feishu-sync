@@ -55,6 +55,7 @@ import {
 import type { DocumentIR } from './document-ir.js';
 import { BitableExporter, type BitableClient } from './bitable-exporter.js';
 import { LarkCliError } from './lark-cli-client.js';
+import { stageSourceWorkbook } from './sheet-workbook.js';
 
 export interface SyncDocxToCustomFolderInput {
   /** LarkCliClient instance (public methods only). */
@@ -108,6 +109,7 @@ export interface SyncDocxResult {
 export interface SyncSheetToCustomFolderInput {
   /** LarkCliClient instance (public methods only). */
   larkCliClient: {
+    exportWorkbook(spreadsheetToken: string, outputPath: string): Promise<string>;
     getWorkbookInfo(spreadsheetToken: string): Promise<any>;
     getSheetCsv(options: {
       spreadsheetToken: string;
@@ -353,6 +355,7 @@ export async function syncSheetToCustomFolder(
   // committed files are staged later from ir.sheets[].csvContent.
   const csvTemp = fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-custom-sheet-'));
   try {
+    const workbook = await stageSourceWorkbook(input.larkCliClient, input.objToken, csvTemp, input.localMdPath);
     const csvDataDir = path.join(csvTemp, `${docname}.csv-data`);
     fs.mkdirSync(csvDataDir, { recursive: true });
 
@@ -433,6 +436,7 @@ export async function syncSheetToCustomFolder(
       wikiNodeToken: input.wikiNodeToken,
       spaceId: input.spaceId,
       objType: 'sheet',
+      workbook: { relativePath: workbook.relativePath, metadataRelativePath: workbook.metadataRelativePath, mode: workbook.mode },
       title: input.title,
       originalLink: input.originalLink,
       observedObjEditTime: input.objEditTime,
@@ -450,7 +454,13 @@ export async function syncSheetToCustomFolder(
       })),
     };
 
-    const extraFiles: Array<{ relativePath: string; absoluteSource: string }> = [];
+    const extraFiles: Array<{ relativePath: string; absoluteSource: string }> = [{
+      relativePath: docDirRel ? `${docDirRel}/${workbook.relativePath}` : workbook.relativePath,
+      absoluteSource: workbook.absolutePath,
+    }, {
+      relativePath: docDirRel ? `${docDirRel}/${workbook.metadataRelativePath}` : workbook.metadataRelativePath,
+      absoluteSource: workbook.metadataPath,
+    }];
     for (const image of sheetMediaImages) {
       extraFiles.push({
         relativePath: docDirRel
@@ -478,7 +488,9 @@ export async function syncSheetToCustomFolder(
       throw new Error(commit.error || '自定义归档表格写入失败');
     }
 
-    const committedFiles: string[] = [input.localMdPath];
+    const committedFiles: string[] = [input.localMdPath,
+      path.join(path.dirname(input.localMdPath), workbook.relativePath),
+      path.join(path.dirname(input.localMdPath), workbook.metadataRelativePath)];
     for (const sheet of exported) {
       committedFiles.push(path.join(path.dirname(input.localMdPath), ...sheet.csvRel.split('/')));
     }

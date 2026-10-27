@@ -15,6 +15,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
+import { exportTestWorkbook } from './helpers/workbook.js';
 import os from 'node:os';
 import path from 'node:path';
 import { Hono } from 'hono';
@@ -30,6 +31,7 @@ import { IndexScanner } from '../src/modules/index-scanner.js';
 // ---------------------------------------------------------------------------
 
 const tempDirs: string[] = [];
+const stores: LocalMapStore[] = [];
 
 function makeTempDir(prefix: string): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -38,6 +40,7 @@ function makeTempDir(prefix: string): string {
 }
 
 afterEach(() => {
+  for (const store of stores.splice(0)) store.close();
   while (tempDirs.length > 0) {
     const dir = tempDirs.pop();
     if (dir) fs.rmSync(dir, { recursive: true, force: true });
@@ -150,6 +153,7 @@ function makeFakeLarkCli(options: FakeLarkCliOptions) {
       }
       return { data: { sheets: options.workbooks?.[objToken] ?? [] } };
     },
+    exportWorkbook: exportTestWorkbook,
     async getSheetCsv(input: { sheetId: string }): Promise<any> {
       if (options.sheetCsvFailIds?.has(input.sheetId)) {
         throw new LarkCliError('lark-cli 执行失败：网络错误', 'upstream', true);
@@ -248,6 +252,7 @@ function buildApp(deps: AppDeps) {
 function newStore(): { store: LocalMapStore; dir: string } {
   const dir = makeTempDir('feishu-cf-store-');
   const store = new LocalMapStore(path.join(dir, 'test.db'));
+  stores.push(store);
   store.initialize();
   return { store, dir };
 }

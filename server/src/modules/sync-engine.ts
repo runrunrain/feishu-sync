@@ -67,6 +67,7 @@ import {
 } from './bitable-exporter.js';
 import { adaptSlidesXmlToMarkdown } from './slides-xml-adapter.js';
 import { LarkCliError } from './lark-cli-client.js';
+import { stageSourceWorkbook } from './sheet-workbook.js';
 
 interface FetchedDocument {
   content: string;
@@ -628,6 +629,9 @@ export class SyncEngine {
       images: SheetMediaItem[];
     }> = [];
     const docname = path.basename(localMdPath, '.md');
+    const workbook = doc.objType === 'sheet'
+      ? await stageSourceWorkbook(this.requireLarkCliClient(), doc.objToken, stagingDocDir, localMdPath)
+      : null;
     // bitable 确定性导出（P0 决策，见上方 fetched 构造处的 bitable 分支注
     // 释）：staging workspace 已建好，导出器直接复用 stagingDocDir。CSV 落
     // <docname>.csv-data/、base 元数据落 <docname>.base-meta/、附件落
@@ -782,7 +786,7 @@ export class SyncEngine {
 
     // 8. Atomic content commit: only this step mutates knowledge-base files.
     const headerMeta = this.resolveHeaderMeta(doc, fetched);
-    if (process.env.FEISHU_SYNC_LEGACY_WRITE === '1') {
+    if (process.env.FEISHU_SYNC_LEGACY_WRITE === '1' && !workbook) {
       await this.writeLocalMarkdown(localMdPath, finalContent, headerMeta);
       await this.updateLocalMap(doc, localMdPath);
     } else {
@@ -795,6 +799,7 @@ export class SyncEngine {
         originalLink: headerMeta.originalLink,
         observedObjEditTime: doc.observedObjEditTime ?? null,
         bodyMarkdown: finalContent,
+        workbook: workbook ? { relativePath: workbook.relativePath, metadataRelativePath: workbook.metadataRelativePath, mode: workbook.mode } : undefined,
         images: [
           ...images.map((img) => ({
             relativePath: `images/${path.basename(img.path)}`,
@@ -830,6 +835,16 @@ export class SyncEngine {
         })),
       };
       const extraFiles: Array<{ relativePath: string; absoluteSource: string }> = [];
+      if (workbook) {
+        extraFiles.push({
+          relativePath: relativeDir ? `${relativeDir}/${workbook.relativePath}` : workbook.relativePath,
+          absoluteSource: workbook.absolutePath,
+        });
+        extraFiles.push({
+          relativePath: relativeDir ? `${relativeDir}/${workbook.metadataRelativePath}` : workbook.metadataRelativePath,
+          absoluteSource: workbook.metadataPath,
+        });
+      }
       for (const img of images) {
         const name = path.basename(img.path);
         extraFiles.push({

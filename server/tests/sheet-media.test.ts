@@ -13,6 +13,7 @@
  */
 import { afterEach, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
+import { exportTestWorkbook } from './helpers/workbook.js';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -32,8 +33,10 @@ import { LocalMapStore } from '../src/modules/local-map-store.js';
 import type { ChangedDocument } from '../src/types/index.js';
 
 const temps: string[] = [];
+const stores: LocalMapStore[] = [];
 
 afterEach(() => {
+  for (const store of stores.splice(0)) store.close();
   while (temps.length) {
     const dir = temps.pop();
     if (dir) fs.rmSync(dir, { recursive: true, force: true });
@@ -398,6 +401,7 @@ describe('syncSheetToCustomFolder with float images', () => {
   function makeSheetClient(csv: string) {
     const client = {
       ...makeDownloadClient(),
+      exportWorkbook: exportTestWorkbook,
       async getWorkbookInfo() {
         return {
           data: {
@@ -486,6 +490,7 @@ describe('syncSheetToCustomFolder with float images', () => {
     const client = makeSheetClient('a,b\n');
     // Simulate an older injected client: no float-image capability at all.
     const legacyClient = {
+      exportWorkbook: client.exportWorkbook,
       getWorkbookInfo: client.getWorkbookInfo,
       getSheetCsv: client.getSheetCsv,
       downloadMedia: client.downloadMedia,
@@ -523,6 +528,7 @@ describe('SyncEngine sheet sync with float images', () => {
     fs.mkdirSync(ops, { recursive: true });
 
     const store = new LocalMapStore(path.join(root, 'map.db'));
+    stores.push(store);
     store.initialize();
 
     // ChangeDetector.upsertDocumentSeen normally writes the documents row
@@ -564,6 +570,7 @@ describe('SyncEngine sheet sync with float images', () => {
     const engine = new SyncEngine({
       larkCliClient: {
         ...downloadClient,
+        exportWorkbook: exportTestWorkbook,
         async getWorkbookInfo() {
           return {
             data: {

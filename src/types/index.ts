@@ -372,6 +372,8 @@ export interface DocumentContent {
   mdContent: string | null;
   mdTruncated: boolean;
   csvTables: DocumentCsvTable[];
+  /** Native sheet source; absent on historical CSV-only exports. */
+  workbook?: { path: string; size: number; modifiedTime: string; mode?: 'native' | 'read-reconstruction' } | null;
 }
 
 export interface DocumentCsvTable {

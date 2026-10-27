@@ -28,6 +28,7 @@ import {
 import { Card } from './common/Card';
 import { MarkdownView, resolveMediaPath } from './preview/MarkdownView';
 import { CsvTableView } from './preview/CsvTableView';
+import { WorkbookView } from './preview/WorkbookView';
 import { getDocumentContent } from '../api/client';
 import { appLogger } from '../utils/appLogger';
 import { useToast } from './common/Toast';
@@ -56,7 +57,7 @@ const TYPE_LABEL = {
   unknown: '未知',
 } as const;
 
-type FormatTab = 'md' | 'csv';
+type FormatTab = 'md' | 'csv' | 'xlsx';
 type MdMode = 'rendered' | 'source';
 
 /** 加载骨架屏：模拟标题 + 若干段落的呼吸动画。 */
@@ -119,8 +120,9 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
       .then((data) => {
         if (cancelled) return;
         setContent(data);
-        // MD 缺失但有 CSV 时自动落到 CSV 页签（sheet 未重建 md 的场景）
-        if (data.mdContent == null && data.csvTables.length > 0) {
+        if (data.workbook) {
+          setFormatTab('xlsx');
+        } else if (data.mdContent == null && data.csvTables.length > 0) {
           setFormatTab('csv');
         }
       })
@@ -135,14 +137,14 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
     return () => {
       cancelled = true;
     };
-  }, [objToken]);
+  }, [objToken, node?.last_synced_at]);
 
   const TypeIcon = node ? (TYPE_ICON[node.obj_type] ?? FileType) : FileText;
   const hasMd = content?.mdContent != null;
   const csvTables = useMemo(() => content?.csvTables ?? [], [content]);
   const activeCsv = csvTables[Math.min(csvIndex, csvTables.length - 1)] ?? null;
   const fileMissing =
-    content != null && content.mdContent == null && csvTables.length === 0;
+    content != null && content.mdContent == null && csvTables.length === 0 && !content.workbook;
   // md 文件所在目录（kbRoot 相对），MarkdownView 用它解析相对图片路径。
   const mdBaseDir = useMemo(() => {
     const p = content?.mdPath ?? '';
@@ -210,7 +212,7 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
           </div>
           <p className="text-sm font-kai text-ink-soft">点击左侧节点预览文档</p>
           <p className="text-xs text-ink-faint leading-relaxed max-w-[280px]">
-            选中任意已同步文档后，此处将以 Markdown / CSV 格式展示本地内容
+            选中已同步文档后查看本地内容；表格优先展示 Excel 画板
           </p>
         </div>
       </Card>
@@ -279,6 +281,12 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
 
         {/* 格式页签：MD / CSV（下划线常驻渲染 + scaleX 过渡，与 TopBar 一致） */}
         <div className="mt-2.5 flex items-center gap-4">
+          {content?.workbook && (
+            <button type="button" onClick={() => setFormatTab('xlsx')} className={`relative pb-2 text-xs font-sans-ui ${formatTab === 'xlsx' ? 'text-seal font-medium' : 'text-ink-faint hover:text-ink-soft'}`}>
+              Excel 画板
+              <span aria-hidden className={`absolute bottom-0 left-0 right-0 h-[2px] bg-seal rounded-full ${formatTab === 'xlsx' ? 'scale-x-100' : 'scale-x-0'}`} />
+            </button>
+          )}
           <button
             type="button"
             onClick={() => setFormatTab('md')}
@@ -338,6 +346,8 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
               该文档在云端存在但本地还没有文件，前往「贰 同步」主区同步后即可预览
             </p>
           </div>
+        ) : formatTab === 'xlsx' && content?.workbook ? (
+          <WorkbookView key={`${objToken}-${content.workbook.modifiedTime}`} objToken={objToken!} fileName={content.workbook.path} mode={content.workbook.mode} />
         ) : formatTab === 'md' ? (
           hasMd && mdMode === 'rendered' ? (
             <div key={`${objToken}-md-r`} className="animate-fade-in">
@@ -394,13 +404,16 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
       </div>
 
       {/* 底部：路径 */}
-      {(content?.mdPath || activeCsv) && (
+      {content?.objType === 'sheet' && !content.workbook && !loading && (
+        <p className="shrink-0 border-t border-line bg-paper px-4 py-2 text-[11px] text-ink-soft">此表格为历史文本版本，重新同步后可查看带布局的 Excel 画板。</p>
+      )}
+      {(content?.mdPath || activeCsv || content?.workbook) && (
         <div className="shrink-0 border-t border-line/60 bg-paper/60 px-4 py-2">
           <p
             className="truncate text-[11px] text-ink-faint font-mono"
-            title={formatTab === 'csv' && activeCsv ? activeCsv.path : (content?.mdPath ?? '')}
+            title={formatTab === 'xlsx' ? content?.workbook?.path : formatTab === 'csv' && activeCsv ? activeCsv.path : (content?.mdPath ?? '')}
           >
-            {formatTab === 'csv' && activeCsv ? activeCsv.path : content?.mdPath}
+            {formatTab === 'xlsx' ? content?.workbook?.path : formatTab === 'csv' && activeCsv ? activeCsv.path : content?.mdPath}
           </p>
         </div>
       )}

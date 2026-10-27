@@ -108,6 +108,8 @@ export interface LarkCliExecutionOptions {
    * be relative (notably docs +media-download / +media-preview).
    */
   cwd?: string;
+  /** Export shortcuts include server-side polling and need a longer budget. */
+  timeoutMs?: number;
 }
 
 export interface MediaOutputTarget {
@@ -562,6 +564,25 @@ export class LarkCliClient {
     ], 'sheets');
   }
 
+  /** Download the entire native workbook, including layout and embedded media. */
+  async exportWorkbook(spreadsheetToken: string, outputPath: string): Promise<string> {
+    const target = resolveMediaOutputTarget(outputPath);
+    if (fs.existsSync(target.requestedPath)) {
+      throw new LarkCliError('Excel 导出 staging 文件已存在，请使用新的输出路径', 'parse', false);
+    }
+    await this.execute([
+      'sheets', '+workbook-export', '--spreadsheet-token', spreadsheetToken,
+      '--file-extension', 'xlsx', '--output-path', target.outputName,
+      '--as', 'user', '--format', 'json',
+    ], 'sheets', { cwd: target.directory, timeoutMs: 120_000 });
+    // The shortcut can return an unfinished task reference instead of a file.
+    // A successful process exit is therefore not proof of a complete export.
+    if (!fs.existsSync(target.requestedPath) || fs.statSync(target.requestedPath).size === 0) {
+      throw new LarkCliError('Excel 原件尚未导出完成，请稍后重试同步；本地版本未更新', 'upstream', true);
+    }
+    return target.requestedPath;
+  }
+
   async getSheetCsv(options: {
     spreadsheetToken: string;
     sheetId: string;
@@ -571,6 +592,26 @@ export class LarkCliClient {
       'sheets', '+csv-get', '--spreadsheet-token', options.spreadsheetToken,
       '--sheet-id', options.sheetId, '--range', options.range,
       '--include-row-prefix=false', '--format', 'json',
+    ], 'sheets');
+  }
+
+  async getSheetLayout(options: { spreadsheetToken: string; sheetId: string }): Promise<any> {
+    return this.execute([
+      'sheets', '+sheet-info', '--spreadsheet-token', options.spreadsheetToken,
+      '--sheet-id', options.sheetId,
+      '--include', 'merges,row_heights,col_widths,hidden_rows,hidden_cols,groups,frozen',
+      '--as', 'user', '--format', 'json',
+    ], 'sheets');
+  }
+
+  async getSheetCells(options: {
+    spreadsheetToken: string; sheetId: string; range: string; formulas?: boolean;
+  }): Promise<any> {
+    return this.execute([
+      'sheets', '+cells-get', '--spreadsheet-token', options.spreadsheetToken,
+      '--sheet-id', options.sheetId, '--range', options.range,
+      '--include', options.formulas ? 'value,formula,style' : 'value,style',
+      '--skip-hidden=false', '--max-chars', '500000', '--as', 'user', '--format', 'json',
     ], 'sheets');
   }
 
@@ -1042,7 +1083,7 @@ export class LarkCliClient {
     // this.config.larkCliPath 仅作为测试哨兵注入点存在（缺省 undefined →
     // 走 PATH + 桌面发现目录解析）；LARK_CLI_PATH 环境变量仍可作部署级覆盖。
     const larkCliPath = resolveLarkCliExecutable(this.config.larkCliPath);
-    const timeout = this.config.timeout || 30000;
+    const timeout = executionOptions?.timeoutMs ?? this.config.timeout ?? 30000;
 
     // P0-Win 修复（2026-10 实测事故）：未安装 lark-cli 的 Windows 机器上，
     // execFile 以 shell:true 启动时 cmd.exe 自己 exit 1 并打印本地化文案

@@ -62,7 +62,19 @@ function resolveAttachment(root: string, csvPath: string): string {
 
 export function computeSourceHash(realPath: string, csvPaths: string[], root = path.dirname(realPath)): string {
   const combined = crypto.createHash('sha256');
-  combined.update(fs.readFileSync(realPath));
+  const bytes = fs.readFileSync(realPath);
+  combined.update(bytes);
+  // A text derivative can stay byte-identical when only images/layout change.
+  // Pin the actual XLSX source as part of every raw-source snapshot as well.
+  const sourceMarker = /^\s+source_workbook: ("[^\n]+")\s*$/m.exec(bytes.toString('utf-8'))?.[1];
+  if (sourceMarker) {
+    const sourceName: unknown = JSON.parse(sourceMarker);
+    if (typeof sourceName !== 'string' || /[\\/]/.test(sourceName) || !/\.xlsx$/i.test(sourceName)) {
+      throw new PathGuardError('path_escape', 'Excel 原始源路径无效');
+    }
+    const workbookPath = path.join(path.dirname(realPath), sourceName);
+    combined.update(fs.readFileSync(resolveAttachment(root, workbookPath)));
+  }
   for (const csv of csvPaths) {
     combined.update(fs.readFileSync(resolveAttachment(root, csv)));
   }

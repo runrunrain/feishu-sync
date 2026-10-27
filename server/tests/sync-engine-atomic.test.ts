@@ -10,10 +10,13 @@ import path from 'node:path';
 import { SyncEngine } from '../src/modules/sync-engine.js';
 import { LocalMapStore } from '../src/modules/local-map-store.js';
 import type { ChangedDocument } from '../src/types/index.js';
+import { exportTestWorkbook } from './helpers/workbook.js';
 
 const temps: string[] = [];
+const stores: LocalMapStore[] = [];
 
 afterEach(() => {
+  for (const store of stores.splice(0)) store.close();
   while (temps.length) {
     const dir = temps.pop();
     if (dir) fs.rmSync(dir, { recursive: true, force: true });
@@ -30,6 +33,7 @@ function makeWorkspace() {
   fs.mkdirSync(ops, { recursive: true });
 
   const store = new LocalMapStore(dbPath);
+  stores.push(store);
   store.initialize();
 
   const watchedRoots = [
@@ -114,6 +118,7 @@ describe('SyncEngine atomic apply path', () => {
     let sheetCalls = 0;
     const engine = new SyncEngine({
       larkCliClient: {
+        exportWorkbook: exportTestWorkbook,
         getWorkbookInfo: async () => ({
           data: {
             sheets: [
@@ -194,6 +199,7 @@ describe('SyncEngine atomic apply path', () => {
 
     const engine = new SyncEngine({
       larkCliClient: {
+        exportWorkbook: exportTestWorkbook,
         getWorkbookInfo: async () => ({
           data: {
             sheets: [

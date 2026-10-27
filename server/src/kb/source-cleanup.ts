@@ -8,6 +8,7 @@ import { localPathState } from '../modules/local-path-state.js';
 import { ScanPolicy } from '../modules/scan-policy.js';
 import type { LocalMapStore } from '../modules/local-map-store.js';
 import { collectSourceCandidates } from './raw-source-snapshot.js';
+import { managedWorkbookCompanions } from '../modules/workbook-source.js';
 
 export function cleanupSources(store: LocalMapStore, root: string, sources: Array<{ objToken: string; relPath: string }>) {
   const rootReal = resolveRootReal(root);
@@ -38,12 +39,20 @@ export function cleanupSources(store: LocalMapStore, root: string, sources: Arra
   };
   for (const doc of selected) {
     addFile(doc.localRelPath!);
+    if (doc.objType === 'sheet') {
+      const mdPath = resolveInside(rootReal, doc.localRelPath!, 'read');
+      for (const companion of managedWorkbookCompanions(mdPath)) addFile(companion, true);
+    }
     for (const sheet of store.getSheetSheets(doc.objToken)) addFile(sheet.local_csv_path, true);
   }
   const selectedTokens = new Set(selected.map((doc) => doc.objToken));
   for (const doc of records.values()) {
     if (selectedTokens.has(doc.objToken)) continue;
     const references = [doc.localRelPath!];
+    if (doc.objType === 'sheet') {
+      try { references.push(...managedWorkbookCompanions(resolveInside(rootReal, doc.localRelPath!, 'read'))); }
+      catch { /* A missing unselected source cannot share a live file. */ }
+    }
     if (doc.objType === 'sheet' || doc.objType === 'bitable') references.push(...store.getSheetSheets(doc.objToken).map((sheet) => sheet.local_csv_path));
     for (const reference of references) {
       let resolved: string;

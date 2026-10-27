@@ -41,6 +41,7 @@ import type {
   KbTreeNode,
 } from '../types/agent';
 import { emitDiffChanged } from '../utils/syncEvents';
+import type { WorkbookPreview } from '../types/workbook';
 
 class APIError extends Error {
   constructor(
@@ -630,6 +631,21 @@ export async function getDocumentContent(objToken: string): Promise<DocumentCont
   return request<DocumentContent>(
     `/api/mapping/content/${encodeURIComponent(objToken)}`,
   );
+}
+
+export async function getWorkbookPreview(objToken: string, sheet: number, signal?: AbortSignal): Promise<WorkbookPreview> {
+  return request<WorkbookPreview>(`/api/mapping/workbook/${encodeURIComponent(objToken)}?sheet=${sheet}`, {
+    signal, timeoutMs: 60_000,
+  });
+}
+
+/** Authenticated download of the byte-for-byte archived workbook. */
+export async function getWorkbookBlob(objToken: string): Promise<Blob> {
+  const headers = await getApiHeaders();
+  const baseUrl = await getBaseUrl();
+  const response = await fetch(`${baseUrl}/api/mapping/workbook/${encodeURIComponent(objToken)}/file`, { headers });
+  if (!response.ok) throw new APIError(`Excel 原件下载失败 (${response.status})`, response.status);
+  return response.blob();
 }
 
 /**
