@@ -489,7 +489,7 @@ export function SyncView({ active = true, onJumpToSettings }: SyncViewProps) {
       */}
       <div className="flex min-w-0 flex-1 min-h-0 flex-col gap-3 lg:flex-row">
         {/* Left: change list panel (primary workspace) */}
-        <div className="min-w-0 min-h-[420px] lg:min-h-0 lg:h-full flex-1 flex flex-col">
+        <div className="min-w-0 min-h-[260px] lg:min-h-0 lg:h-full flex-1 flex flex-col">
           <ChangeListPanel
             rootUrl={memoRootUrl}
             rootUrlError={rootUrlError}

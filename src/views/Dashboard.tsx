@@ -20,6 +20,9 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { PanelRightClose, PanelRightOpen } from 'lucide-react';
+import { SourceBatchDialog } from '../components/SourceBatchDialog';
+import { Modal } from '../components/common/Modal';
+import { Button } from '../components/common/Button';
 import { GlobalStatusBar } from '../components/GlobalStatusBar';
 import { VersionUpdateAlert } from '../components/VersionUpdateAlert';
 import { NodeTreeView } from '../components/NodeTreeView';
@@ -191,30 +194,24 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
     }
   }, [toast]);
 
-  // 手动删除节点（2026-09）：confirm 后调 manual-delete（文件移 .trash-bin
-  // 可找回，行硬删），刷新树与详情。云端仍在的节点下次检测会列为新增——
-  // 不勾选即不会同步回来，文案中向用户说明该后果。
-  const handleManualDeleteDoc = useCallback(async (doc: { objToken: string; title: string }) => {
-    const confirmed = window.confirm(
-      `删除节点「${doc.title}」？\n\n本地文件将移入 .trash-bin/（可找回），节点记录将被清除；云端仍存在的话，下次检测会将其列为新增——不勾选同步即不会回来。`,
-    );
-    if (!confirmed) return;
+  const [batchTarget, setBatchTarget] = useState<{ tokens: string[]; action: 'delete' | 'block' } | null>(null);
+  const [selectionVersion, setSelectionVersion] = useState(0);
+  const [deleteTarget, setDeleteTarget] = useState<{ objToken: string; title: string } | null>(null);
+  const [deleteFiles, setDeleteFiles] = useState(true); const [blockDeleted, setBlockDeleted] = useState(false);
+  const [deleting, setDeleting] = useState(false); const [deleteError, setDeleteError] = useState('');
+  const handleManualDeleteDoc = useCallback((doc: { objToken: string; title: string }) => {
+    setDeleteTarget(doc); setDeleteFiles(true); setBlockDeleted(false); setDeleteError('');
+  }, []);
+  const confirmDeleteDoc = async () => {
+    if (!deleteTarget || deleting) return;
+    setDeleting(true); setDeleteError('');
     try {
-      const res = await manualDeleteDoc(doc.objToken);
-      toast.push({
-        type: 'success',
-        message: `已删除「${doc.title}」`,
-        hint: res.file_moved_to_trash ? '本地文件已移入 .trash-bin/' : undefined,
-      });
-      // 选中态指向已删节点时清空，避免详情卡悬挂
-      setSelectedToken((prev) => (prev === doc.objToken ? null : prev));
-      await loadFeishu();
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : '删除失败';
-      appLogger.error('dashboard', 'manual delete failed', err);
-      toast.push({ type: 'error', message: '删除失败', hint: msg });
-    }
-  }, [loadFeishu, toast]);
+      const result = await manualDeleteDoc(deleteTarget.objToken, { deleteFiles, block: blockDeleted });
+      toast.push({ type: 'success', message: result.blocked ? `已删除并屏蔽「${deleteTarget.title}」` : result.pending_sync ? `「${deleteTarget.title}」已转为待同步` : `已删除「${deleteTarget.title}」`, hint: result.trash_dir ? `本地文件已回收至 ${result.trash_dir}` : undefined });
+      setSelectedToken((prev) => prev === deleteTarget.objToken ? null : prev); setDeleteTarget(null); await loadFeishu();
+    } catch (err) { setDeleteError(err instanceof Error ? err.message : '删除失败'); }
+    finally { setDeleting(false); }
+  };
 
   // Load feishu view by default.
   useEffect(() => {
@@ -416,6 +413,20 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
     <div className="flex-1 min-h-0 flex flex-col gap-2.5">
       <VersionUpdateAlert onJumpToSettings={onJumpToSettings} />
       <GlobalStatusBar />
+      {batchTarget ? <SourceBatchDialog root={config?.knowledgeBaseRoot ?? ''} tokens={batchTarget.tokens} action={batchTarget.action} onClose={() => setBatchTarget(null)} onComplete={(count, processedTokens) => {
+        toast.push({ type: 'success', message: `已${batchTarget.action === 'block' ? '屏蔽' : '处理'} ${count} 篇文档` });
+        setSelectedToken((old) => old && processedTokens.includes(old) ? null : old);
+        setBatchTarget(null); setSelectionVersion((version) => version + 1); void loadFeishu(); void loadCustomFolders();
+      }} /> : null}
+      <Modal open={deleteTarget !== null} title={`删除文档「${deleteTarget?.title ?? ''}」`} onClose={() => { if (!deleting) setDeleteTarget(null); }} contentClassName="max-w-xl">
+        <p className="text-sm text-ink-soft leading-relaxed mb-4">删除当前文档的本地版本，子文档继续保留。所属上级仍受有效同步根管理时，当前文档会立即转为待同步。</p>
+        <label className="flex items-start gap-2 text-sm text-ink mb-3"><input type="checkbox" aria-label="同时删除本地源文件" checked={deleteFiles} disabled={deleting} onChange={(e) => setDeleteFiles(e.target.checked)} />同时删除本地源文件（移入可恢复的回收目录）</label>
+        {!deleteFiles ? <p className="text-xs text-ink-faint mb-3">保留磁盘文件，只清除索引基线；重建索引后文件可再次出现。</p> : null}
+        <label className="flex items-start gap-2 text-sm text-ink mb-2"><input type="checkbox" aria-label="移入屏蔽名单" checked={blockDeleted} disabled={deleting} onChange={(e) => setBlockDeleted(e.target.checked)} />移入屏蔽名单</label>
+        <p className="text-xs text-ink-faint mb-4">屏蔽后不会再进入待同步列表，可在「设置 → 知识库与同步 → 同步屏蔽名单」中多选移出。</p>
+        {deleteError ? <p role="alert" className="text-sm text-seal-2 mb-3">{deleteError}</p> : null}
+        <div className="flex justify-end gap-3"><Button size="sm" variant="secondary" disabled={deleting} onClick={() => setDeleteTarget(null)}>取消</Button><Button size="sm" variant="danger" disabled={deleting} onClick={() => void confirmDeleteDoc()}>{deleting ? '正在删除…' : blockDeleted ? '删除并屏蔽' : '确认删除'}</Button></div>
+      </Modal>
 
       {/*
         三栏布局（总览主区）：
@@ -429,7 +440,7 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
         {/* Left: node tree (feishu view only) — width adjustable via resizer；
             右栏展开时按等比例压缩后的 effectiveLeftWidth 渲染 */}
         <div
-          className="min-w-0 min-h-[360px] lg:min-h-0 lg:h-full lg:shrink-0 lg:w-[var(--tree-w)]"
+          className="min-w-0 min-h-[240px] lg:min-h-0 lg:h-full lg:shrink-0 lg:w-[var(--tree-w)]"
           style={{ '--tree-w': `${effectiveLeftWidth}px` } as CSSProperties}
         >
           <NodeTreeView
@@ -444,6 +455,8 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
             focusRequest={focusRequest}
             onRefreshed={loadFeishu}
             onDeleteDoc={handleManualDeleteDoc}
+            onBatchAction={(tokens, action) => setBatchTarget({ tokens, action })}
+            selectionVersion={selectionVersion}
             className="h-full"
           />
         </div>
@@ -457,7 +470,7 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
         />
 
         {/* Center: document preview (primary content area) */}
-        <div className="min-w-0 min-h-[420px] lg:min-h-0 lg:h-full lg:ml-1 flex-1">
+        <div className="min-w-0 min-h-[260px] lg:min-h-0 lg:h-full lg:ml-1 flex-1">
           <DocPreviewPanel
             node={selectedNode}
             onOpenFolder={handleOpenFolder}
@@ -510,7 +523,7 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
               }}
               onOpenFolder={handleOpenFolder}
             />
-            <RecentChanges changes={changes} onJumpToSync={onJumpToSync} className="flex-1 min-h-[220px]" />
+            <RecentChanges changes={changes} onJumpToSync={onJumpToSync} className="flex-1 min-h-[180px]" />
           </div>
         )}
       </div>

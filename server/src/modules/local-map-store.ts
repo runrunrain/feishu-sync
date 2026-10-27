@@ -87,6 +87,8 @@ export class LocalMapStore {
    * everything sitting at the 'unknown' default.
    */
   private applyAdditiveMigrations(): void {
+    const sessionCols = this.db.prepare('PRAGMA table_info(agent_sessions)').all() as Array<{ name: string }>;
+    if (sessionCols.length && !sessionCols.some((c) => c.name === 'model_config_json')) this.db.exec('ALTER TABLE agent_sessions ADD COLUMN model_config_json TEXT');
     const currentCols = this.db.prepare('PRAGMA table_info(documents)').all() as Array<{ name: string }>;
     const colNames = new Set(currentCols.map((c) => c.name));
 
@@ -966,6 +968,46 @@ export class LocalMapStore {
       for (const dir of missingDirs) removeDir.run(dir.localPath);
       return { scanned: rows.length, pruned: tokens.length, prunedTokens: tokens, prunedSheets, prunedDirectories: missingDirs.length };
     })();
+  }
+
+  /** 清除本地成功基线；有效上级/屏蔽身份保留拓扑，供后续待同步或解除屏蔽使用。 */
+  clearLocalDocument(objToken: string, options: { pending: boolean; blockRoot?: string; watchedRootId?: string; watchedRootUrl?: string }): void {
+    this.db.transaction(() => {
+      const doc = this.getDocumentByObjToken(objToken);
+      if (!doc) return;
+      if (options.blockRoot) this.db.prepare(`INSERT OR REPLACE INTO sync_blocklist
+        (knowledge_root,obj_token,title,wiki_node_token,blocked_at) VALUES (?,?,?,?,?)`)
+        .run(this.kbSourceRootKey(options.blockRoot), objToken, doc.title, doc.wikiNodeToken ?? null, new Date().toISOString());
+      if (!options.pending && !options.blockRoot) { this.deleteDocumentByToken(objToken); return; }
+      this.db.prepare('DELETE FROM sheet_sheets WHERE sheet_obj_token=?').run(objToken);
+      this.db.prepare(`UPDATE documents SET local_md_path='',local_rel_path=NULL,last_synced_at='',last_synced_modify_time='',
+        synced_obj_edit_time=NULL,status='changed',sync_state='pending_added',pending_reason='local_deleted',
+        last_sync_error_code=NULL,missing_complete_count=0,
+        watched_root_id=COALESCE(?,watched_root_id),watched_root_url=COALESCE(?,watched_root_url),updated_at=datetime('now') WHERE obj_token=?`)
+        .run(options.watchedRootId ?? null, options.watchedRootUrl ?? null, objToken);
+    })();
+  }
+
+  /** 只屏蔽同步检测，保留已有本地文件与成功基线。 */
+  blockSyncSources(root: string, documents: DocumentRecord[]): void {
+    const insert = this.db.prepare('INSERT OR REPLACE INTO sync_blocklist (knowledge_root,obj_token,title,wiki_node_token,blocked_at) VALUES (?,?,?,?,?)');
+    const key = this.kbSourceRootKey(root);
+    this.db.transaction(() => { for (const doc of documents) insert.run(key, doc.objToken, doc.title, doc.wikiNodeToken ?? null, new Date().toISOString()); })();
+  }
+  clearLocalDocuments(items: Array<{ objToken: string; pending: boolean; blockRoot?: string; watchedRootId?: string; watchedRootUrl?: string }>): void {
+    this.db.transaction(() => { for (const item of items) this.clearLocalDocument(item.objToken, item); })();
+  }
+
+  listSyncBlockedSources(root: string): Array<{ objToken: string; title: string; wikiNodeToken: string | null; blockedAt: string }> {
+    return (this.db.prepare('SELECT obj_token,title,wiki_node_token,blocked_at FROM sync_blocklist WHERE knowledge_root=? ORDER BY blocked_at DESC,obj_token')
+      .all(this.kbSourceRootKey(root)) as any[]).map((row) => ({ objToken: row.obj_token, title: row.title, wikiNodeToken: row.wiki_node_token, blockedAt: row.blocked_at }));
+  }
+  isSyncBlocked(root: string, token: string): boolean {
+    return !!this.db.prepare('SELECT 1 FROM sync_blocklist WHERE knowledge_root=? AND obj_token=?').get(this.kbSourceRootKey(root), token);
+  }
+  removeSyncBlockedSources(root: string, tokens: string[]): number {
+    const remove = this.db.prepare('DELETE FROM sync_blocklist WHERE knowledge_root=? AND obj_token=?');
+    return this.db.transaction(() => [...new Set(tokens)].reduce((sum, token) => sum + remove.run(this.kbSourceRootKey(root), token).changes, 0))();
   }
 
   /** 多源清理的元数据提交；文件移动由调用者先完成，异常时整体回滚。 */
@@ -2278,6 +2320,7 @@ export class LocalMapStore {
     mode: 'discuss' | 'work';
     workspaceId: string | null;
     piSessionFile: string | null;
+    modelConfig: string | null;
     lastErrorCode: string | null;
     lastErrorMessage: string | null;
     updatedAt: string;
@@ -2287,7 +2330,7 @@ export class LocalMapStore {
     if (!current) throw new Error(`agent_session 不存在: ${id}`);
     this.db.prepare(`
       UPDATE agent_sessions SET title=?, mode=?, workspace_id=?, pi_session_file=?,
-        last_error_code=?, last_error_message=?, updated_at=?, deleted_at=?
+        last_error_code=?, last_error_message=?, updated_at=?, deleted_at=?, model_config_json=?
       WHERE id=?
     `).run(
       patch.title ?? current.title,
@@ -2298,6 +2341,7 @@ export class LocalMapStore {
       patch.lastErrorMessage !== undefined ? patch.lastErrorMessage : current.last_error_message,
       patch.updatedAt ?? new Date().toISOString(),
       patch.deletedAt !== undefined ? patch.deletedAt : current.deleted_at,
+      patch.modelConfig !== undefined ? patch.modelConfig : current.model_config_json,
       id,
     );
   }
@@ -2379,6 +2423,12 @@ export class LocalMapStore {
       CREATE INDEX IF NOT EXISTS idx_local_dirs_wiki_node    ON localDirs(mapped_wiki_node_token);
       CREATE INDEX IF NOT EXISTS idx_local_dirs_cloud_match  ON localDirs(cloud_match);
       CREATE INDEX IF NOT EXISTS idx_local_dirs_parent       ON localDirs(parent_path);
+
+      -- 本地库隔离的用户屏蔽意图，索引/云端观测不得覆盖。
+      CREATE TABLE IF NOT EXISTS sync_blocklist (
+        knowledge_root TEXT NOT NULL, obj_token TEXT NOT NULL, title TEXT NOT NULL,
+        wiki_node_token TEXT, blocked_at TEXT NOT NULL, PRIMARY KEY (knowledge_root,obj_token)
+      );
 
       -- Operator-owned Feishu-side repair queue. These rows deliberately do
       -- not participate in the normal added/modified diff until the user has
@@ -2508,6 +2558,7 @@ export class LocalMapStore {
         mode TEXT NOT NULL CHECK(mode IN ('discuss', 'work')),
         workspace_id TEXT,
         pi_session_file TEXT,
+        model_config_json TEXT,
         last_error_code TEXT,
         last_error_message TEXT,
         created_at TEXT NOT NULL,

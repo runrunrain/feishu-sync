@@ -19,7 +19,7 @@ interface TextualInputProps extends BaseInputProps, Omit<React.InputHTMLAttribut
 }
 
 export const Input = forwardRef<HTMLInputElement, TextualInputProps>(
-  ({ label, error, helperText, leftIcon, rightIcon, fullWidth = true, className: _className = '', ...props }, ref) => {
+  ({ label, error, helperText, leftIcon, rightIcon, fullWidth = true, className = '', ...props }, ref) => {
     const id = props.id || `input-${Math.random().toString(36).substr(2, 9)}`;
 
     const inputWrapperClasses = `
@@ -32,25 +32,25 @@ export const Input = forwardRef<HTMLInputElement, TextualInputProps>(
 
     const inputClasses = `
       flex-1 bg-transparent text-ink placeholder:text-ink-faint
-      text-sm px-3 py-2 focus:outline-none min-w-0 font-serif
+      text-sm leading-5 min-h-9 px-2.5 py-1.5 focus:outline-none min-w-0 font-serif
     `;
 
     return (
-      <div className={fullWidth ? 'w-full' : ''}>
+      <div className={`min-w-0 ${fullWidth ? 'w-full' : ''}`}>
         {label && (
           <label htmlFor={id} className="block text-sm font-medium text-ink-soft mb-1.5 font-serif">
             {label}
           </label>
         )}
         <div className={inputWrapperClasses}>
-          {leftIcon && <div className="pl-3 text-ink-faint">{leftIcon}</div>}
+          {leftIcon && <div className="pl-3 shrink-0 text-ink-faint">{leftIcon}</div>}
           <input
             ref={ref}
             id={id}
-            className={inputClasses}
+            className={`${inputClasses} ${className}`}
             {...props}
           />
-          {rightIcon && <div className="pr-3 text-ink-faint">{rightIcon}</div>}
+          {rightIcon && <div className="pr-3 shrink-0 text-ink-faint">{rightIcon}</div>}
         </div>
         {(error || helperText) && (
           <p className={`mt-1.5 text-xs font-serif ${error ? 'text-seal-2' : 'text-ink-faint'}`}>
@@ -69,7 +69,7 @@ interface SelectProps extends BaseInputProps {
 }
 
 export const Select = forwardRef<HTMLSelectElement, SelectProps & Omit<React.SelectHTMLAttributes<HTMLSelectElement>, 'size'>>(
-  ({ label, error, helperText, fullWidth = true, options, className: _className = '', ...props }, ref) => {
+  ({ label, error, helperText, fullWidth = true, options, className = '', ...props }, ref) => {
     const id = props.id || `select-${Math.random().toString(36).substr(2, 9)}`;
 
     const selectWrapperClasses = `
@@ -82,25 +82,25 @@ export const Select = forwardRef<HTMLSelectElement, SelectProps & Omit<React.Sel
 
     const selectClasses = `
       flex-1 bg-transparent text-ink
-      text-sm px-3 py-2 focus:outline-none min-w-0 appearance-none cursor-pointer font-serif
+      text-sm leading-5 min-h-9 px-2.5 py-1.5 focus:outline-none min-w-0 appearance-none cursor-pointer font-serif
     `;
 
     return (
-      <div className={fullWidth ? 'w-full' : ''}>
+      <div className={`min-w-0 ${fullWidth ? 'w-full' : ''}`}>
         {label && (
           <label htmlFor={id} className="block text-sm font-medium text-ink-soft mb-1.5 font-serif">
             {label}
           </label>
         )}
         <div className={selectWrapperClasses}>
-          <select ref={ref} id={id} className={selectClasses} {...props}>
+          <select ref={ref} id={id} className={`${selectClasses} ${className}`} {...props}>
             {options.map(opt => (
               <option key={opt.value} value={opt.value}>
                 {opt.label}
               </option>
             ))}
           </select>
-          <div className="pr-3 pointer-events-none text-ink-faint">
+          <div className="pr-3 shrink-0 pointer-events-none text-ink-faint">
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
             </svg>
@@ -128,8 +128,8 @@ interface ToggleProps {
 
 export function Toggle({ label, checked, onChange, disabled = false, helperText }: ToggleProps) {
   return (
-    <div className="flex items-center justify-between">
-      <div>
+    <div className="flex items-center justify-between gap-3">
+      <div className="min-w-0 flex-1">
         {label && (
           <label className="block text-sm font-medium text-ink font-serif">{label}</label>
         )}
@@ -141,7 +141,7 @@ export function Toggle({ label, checked, onChange, disabled = false, helperText 
         onClick={() => onChange(!checked)}
         disabled={disabled}
         className={`
-          relative inline-flex h-6 w-11 items-center rounded-full transition-colors duration-fast
+          relative inline-flex shrink-0 h-6 w-11 items-center rounded-full transition-colors duration-fast
           ${checked ? 'bg-seal' : 'bg-paper border border-line'}
           ${disabled ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}
         `}

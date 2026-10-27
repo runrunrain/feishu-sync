@@ -197,7 +197,7 @@ export function AppUpdateCard() {
   return (
     <Card variant="default">
       <CardHeader>
-        <div className="flex items-center justify-between">
+        <div className="flex flex-wrap items-center justify-between gap-2">
           <h2 className="text-base font-kai font-medium text-ink">关于与更新</h2>
           <StatusBadge
             status={
@@ -214,7 +214,7 @@ export function AppUpdateCard() {
         </div>
       </CardHeader>
       <CardBody className="space-y-4">
-        <div className="flex items-center justify-between">
+        <div className="flex flex-wrap items-center justify-between gap-2">
           <span className="text-sm text-ink-soft">当前版本</span>
           <span className="text-sm font-mono text-seal">{displayVersion}</span>
         </div>
@@ -244,7 +244,7 @@ export function AppUpdateCard() {
                 style={{ width: `${Math.min(100, Math.max(0, updateState?.progress?.percent ?? 0))}%` }}
               />
             </div>
-            <div className="flex items-center justify-between text-xs text-ink-faint font-sans-ui">
+            <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-ink-faint font-sans-ui">
               <span>{Math.floor(updateState?.progress?.percent ?? 0)}%</span>
               <span>
                 {formatBytes(updateState?.progress?.transferred ?? 0)} / {formatBytes(updateState?.progress?.total ?? 0)}

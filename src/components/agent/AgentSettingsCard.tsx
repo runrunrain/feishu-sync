@@ -52,14 +52,14 @@ function CardShell({
 }) {
   return (
     <section className="rounded-md border border-line bg-card-bg shadow-sm overflow-hidden">
-      <header className="px-5 py-4 border-b border-line/60 flex items-start gap-3">
+      <header className="px-4 py-3 border-b border-line/60 flex items-start gap-3">
         <div className="mt-0.5 text-ink-faint">{icon}</div>
         <div className="min-w-0">
           <h3 className="text-sm font-kai font-medium text-ink">{title}</h3>
           <p className="mt-0.5 text-xs text-ink-faint leading-snug">{description}</p>
         </div>
       </header>
-      <div className="p-5 space-y-4">{children}</div>
+      <div className="p-4 space-y-3">{children}</div>
     </section>
   );
 }
@@ -100,9 +100,10 @@ export function AgentRuntimeSettingsCard() {
     : null;
   const ready = agentStatus.status?.code === 'ready' && !agentStatus.unreachable;
 
-  const providers = useMemo(() => (config?.llm.providers ?? []).filter((p) => p.enabled), [config?.llm.providers]);
+  const providers = useMemo(() => (config?.llm.providers ?? []).filter((p) => p.enabled && p.apiKey?.trim() && /^https?:\/\//i.test(p.openAiCompatBaseUrl) && p.models.some((m) => m.enabled && m.openAiModel.trim())), [config?.llm.providers]);
   const currentProviderId = agent?.model?.providerId || config?.llm.activeProviderId || '';
-  const currentModelId = agent?.model?.modelId || config?.llm.activeModelId || '';
+  const selectedProvider = providers.find((p) => p.id === currentProviderId);
+  const currentModelId = agent?.model?.modelId || (currentProviderId === config?.llm.activeProviderId ? config?.llm.activeModelId : '') || selectedProvider?.defaultModelId || '';
   const source = agent?.model?.source ?? 'app-llm';
   const piModel = agent?.model?.piModel ?? '';
   const piModels = useMemo(() => {
@@ -119,7 +120,7 @@ export function AgentRuntimeSettingsCard() {
   }, [piModels]);
   const loadingModels = agentStatus.loading || agentStatus.rechecking
     || (!agentStatus.unreachable && agentStatus.status?.model.source !== source);
-  const invalidPiModel = Boolean(piModel) && !loadingModels && piModels.length > 0 && !piModels.includes(piModel);
+  const invalidPiModel = Boolean(piModel) && !loadingModels && !piModels.includes(piModel);
   const thinking = agent?.model?.thinkingLevel ?? 'off';
 
   const saveAgent = async (patch: {
@@ -239,11 +240,11 @@ export function AgentRuntimeSettingsCard() {
               type="radio"
               name="agent-model-source"
               checked={source === 'app-llm'}
-              disabled={saving || agentStatus.loading}
+              disabled={saving}
               onChange={() => saveAgent({ model: { source: 'app-llm' } })}
               className="accent-[#9e2b25]"
             />
-            应用内模型（app-llm）
+            应用内服务提供商
           </label>
           <label
             className={`flex items-center gap-2 px-3 py-2 rounded-md border cursor-pointer text-xs ${
@@ -254,11 +255,11 @@ export function AgentRuntimeSettingsCard() {
               type="radio"
               name="agent-model-source"
               checked={source === 'pi-agent-dir'}
-              disabled={saving || agentStatus.loading}
+              disabled={saving}
               onChange={() => saveAgent({ model: { source: 'pi-agent-dir' } })}
               className="accent-[#9e2b25]"
             />
-            本机 pi 凭据
+            本地 Agent 配置（Pi）
           </label>
         </div>
       </div>
@@ -270,18 +271,19 @@ export function AgentRuntimeSettingsCard() {
             <select
               className={INPUT_CLS}
               value={currentProviderId}
-              onChange={(e) => saveAgent({ model: { providerId: e.target.value } })}
+              onChange={(e) => saveAgent({ model: { providerId: e.target.value, modelId: '' } })}
               aria-label="选择提供商"
             >
-              <option value="">（跟随「模型与整理」默认）</option>
+              <option value="">（跟随应用默认）</option>
+              {currentProviderId && !selectedProvider ? <option value={currentProviderId} disabled>原提供商未配置或不可用，请重新选择</option> : null}
               {providers.map((p) => (
                 <option key={p.id} value={p.id}>
-                  {p.name}
+                  {p.name} · {p.protocol === 'anthropic-messages' ? 'Anthropic' : p.protocol === 'openai-responses' ? 'Responses' : 'Chat Completions'}
                 </option>
               ))}
             </select>
             {providers.length === 0 ? (
-              <p className="mt-1 text-[11px] text-ink-faint">尚无已启用的提供商——在「模型与整理」中配置。</p>
+              <p className="mt-1 text-[11px] text-ink-faint">尚无可用提供商，请在「服务提供商与模型」中配置端点、API Key 并启用模型。</p>
             ) : null}
           </div>
           <div>
@@ -293,11 +295,12 @@ export function AgentRuntimeSettingsCard() {
               aria-label="选择模型预设"
             >
               <option value="">（默认）</option>
-              {(providers.find((p) => p.id === currentProviderId)?.models ?? [])
-                .filter((m) => m.enabled)
+              {currentModelId && !selectedProvider?.models.some((m) => m.id === currentModelId && m.enabled && m.openAiModel.trim()) ? <option value={currentModelId} disabled>原模型预设不可用，请重新选择</option> : null}
+              {(selectedProvider?.models ?? [])
+                .filter((m) => m.enabled && m.openAiModel.trim())
                 .map((m) => (
                   <option key={m.id} value={m.id}>
-                    {m.name}
+                    {m.name} · {m.openAiModel}
                   </option>
                 ))}
             </select>
@@ -340,7 +343,7 @@ export function AgentRuntimeSettingsCard() {
             </Button>
           </div>
           <p className="mt-1 text-[11px] text-ink-faint">
-            通过 pi 加载配置与认证后列出可用模型，按提供商分组；选择后自动保存。应用不读取其密钥，实际调用是否成功以模型响应为准。
+            通过 pi 加载配置与认证后列出可用模型，按提供商分组；选择后自动保存。认证由 Pi 在本地只读解析，不会复制密钥或改写通用 Pi 配置；未配置认证的内置目录不会列出。实际连通性以调用结果为准。
           </p>
           {invalidPiModel ? <p className="mt-1 text-xs text-seal-2" role="alert">原模型已不在可用列表中，请重新选择。</p> : null}
           {!loadingModels && piModels.length === 0 ? (
@@ -492,7 +495,7 @@ export function AgentKbSettingsCard() {
   };
 
   return (
-    <>
+    <div className="space-y-3">
       <CardShell
         icon={<Database className="w-4 h-4" />}
         title="标准库输出目录与 Workspace"
@@ -548,15 +551,15 @@ export function AgentKbSettingsCard() {
             <p className="text-xs text-ink-faint mb-2">尚无 Workspace。Work 会话需要至少一个授权目录。</p>
           )}
           <div className="p-3 rounded-md border border-line bg-paper/40 space-y-2">
-            <div className="grid grid-cols-[1fr_2fr] gap-2">
+            <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_minmax(0,2fr)] gap-2">
               <input
                 value={newName}
                 onChange={(e) => setNewName(e.target.value)}
                 placeholder="名称"
-                className="h-8 px-2 rounded border border-line bg-card-bg text-xs focus:outline-none focus:border-seal/50"
+                className="min-w-0 h-8 px-2 rounded border border-line bg-card-bg text-xs focus:outline-none focus:border-seal/50"
                 aria-label="Workspace 名称"
               />
-              <div className="flex gap-1.5">
+              <div className="flex min-w-0 gap-1.5">
                 <input
                   value={newPath}
                   onChange={(e) => setNewPath(e.target.value)}
@@ -595,7 +598,7 @@ export function AgentKbSettingsCard() {
               ) : (
                 <StatusBadge status="neutral">未就绪</StatusBadge>
               )}
-              <span className="text-[11px] text-ink-faint font-mono truncate">{mcp.command} {mcp.args.join(' ')}</span>
+              <span className="min-w-0 flex-1 text-[11px] text-ink-faint font-mono truncate">{mcp.command} {mcp.args.join(' ')}</span>
             </div>
             <div className="relative">
               <pre className="max-h-[180px] overflow-auto scrollbar-thin px-3 py-2.5 rounded-md border border-line bg-dark text-[11px] leading-relaxed text-paper font-mono whitespace-pre">
@@ -615,6 +618,6 @@ export function AgentKbSettingsCard() {
           <p className="text-xs text-ink-faint">MCP 连接信息不可用（后端未实现或服务不可达）。</p>
         )}
       </CardShell>
-    </>
+    </div>
   );
 }

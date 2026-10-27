@@ -42,7 +42,7 @@ export function KbSourcePanel({ docTitle, sources, onOpenSource }: KbSourcePanel
             key={s.objToken}
             type="button"
             onClick={() => onOpenSource(s)}
-            className="w-full text-left px-3 py-2.5 rounded-md border border-line/70 bg-card-bg hover:border-jade/40 hover:shadow-sm transition-all group"
+            className="w-full text-left px-3 py-2 rounded-md border border-line/70 bg-card-bg hover:border-jade/40 hover:shadow-sm transition-all group"
             title={`打开原始文档：${s.relPath}`}
           >
             <div className="flex items-start justify-between gap-2">
@@ -58,7 +58,7 @@ export function KbSourcePanel({ docTitle, sources, onOpenSource }: KbSourcePanel
               <FolderOpen className="w-3 h-3 shrink-0" />
               <span className="truncate font-mono">{s.relPath}</span>
             </div>
-            <div className="mt-1 flex items-center gap-1 text-[11px] text-ink-faint opacity-0 group-hover:opacity-100 transition-opacity">
+            <div className="mt-1 flex items-center gap-1 text-[11px] text-ink-faint text-jade">
               <FileSearch className="w-3 h-3" />
               查看原始内容
             </div>

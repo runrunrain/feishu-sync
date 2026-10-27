@@ -1,0 +1,82 @@
+import { buildDefaultLlmConfigForTest } from './helpers/llm-fixture.js';
+import { afterEach, expect, it, vi } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { ConfigManager } from '../src/modules/config-manager.js';
+import { modelRevision } from '../src/agent/model-revision.js';
+import { buildAppLlmRunConfig } from '../src/agent/provider-descriptor.js';
+const dirs: string[] = [];
+afterEach(() => { vi.unstubAllEnvs(); for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
+it('hashes local credential/config bytes without exposing secrets; source and preset changes retire old processes', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'model-revision-')); dirs.push(dir);
+  const manager = new ConfigManager(path.join(dir, 'config.json')); const config = await manager.load(); config.llm = buildDefaultLlmConfigForTest();
+  config.agent.model.source = 'pi-agent-dir'; vi.stubEnv('PI_CODING_AGENT_DIR', dir);
+  fs.writeFileSync(path.join(dir, 'auth.json'), '{"fixture-key":"A"}');
+  const first = modelRevision(config); expect(first).toMatch(/^[a-f0-9]{64}$/);
+  expect(modelRevision(config)).toBe(first);
+  fs.writeFileSync(path.join(dir, 'auth.json'), '{"fixture-key":"B"}'); expect(modelRevision(config)).not.toBe(first);
+  const second = modelRevision(config); fs.writeFileSync(path.join(dir, 'models.json'), '{}'); expect(modelRevision(config)).not.toBe(second);
+  const third = modelRevision(config); config.agent.model.source = 'app-llm'; expect(modelRevision(config)).not.toBe(third);
+});
+it('uses provider-owned credentials and preset limits in the shared session/build/probe descriptor', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'model-descriptor-')); dirs.push(dir);
+  const manager = new ConfigManager(path.join(dir, 'config.json')); const config = await manager.load(); config.llm = buildDefaultLlmConfigForTest();
+  config.agent.model.source = 'app-llm';
+  const provider = config.llm.providers![0]; provider.apiKey = 'only-fixture-key';
+  provider.models[0].contextWindow = 64000; provider.models[0].maxTokens = 2048; provider.models[0].reasoning = true;
+  const before = modelRevision(config); const resolved = buildAppLlmRunConfig(config.llm, config.agent)!;
+  expect(resolved.apiKey).toBe('only-fixture-key');
+  expect(resolved.providerJson).not.toContain('only-fixture-key');
+  expect(JSON.parse(resolved.providerJson!).models[0]).toMatchObject({ contextWindow: 64000, maxTokens: 2048, reasoning: true });
+  provider.apiKey = 'changed-fixture-key'; expect(modelRevision(config)).not.toBe(before);
+});
+it.each(['openai-completions', 'openai-responses', 'anthropic-messages'] as const)('persists %s, preserves masked credentials and passes protocol to the shared descriptor', async (protocol) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'protocol-config-')); dirs.push(dir);
+  const manager = new ConfigManager(path.join(dir, 'config.json')); const config = await manager.load(); config.llm = buildDefaultLlmConfigForTest();
+  const provider = config.llm.providers![0]; provider.apiKey = 'protocol-fixture-key'; provider.protocol = protocol;
+  await manager.updateConfig({ llm: config.llm });
+  const before = modelRevision(config);
+  provider.apiKey = '***'; await manager.updateConfig({ llm: { providers: [provider] } } as never);
+  const loaded = await manager.load();
+  expect(loaded.llm.providers![0].protocol).toBe(protocol); expect(loaded.llm.providers![0].apiKey).toBe('protocol-fixture-key');
+  const run = buildAppLlmRunConfig(loaded.llm, loaded.agent)!;
+  expect(JSON.parse(run.providerJson!).api).toBe(protocol);
+  loaded.llm.providers![0].protocol = protocol === 'openai-completions' ? 'anthropic-messages' : 'openai-completions';
+  expect(modelRevision(loaded)).not.toBe(before);
+});
+it('old configs default to Chat Completions; unsupported protocol saves are rejected without changing the file', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'protocol-invalid-')); dirs.push(dir);
+  const manager = new ConfigManager(path.join(dir, 'config.json')); const config = await manager.load(); config.llm = buildDefaultLlmConfigForTest();
+  config.llm.providers![0].apiKey = 'fixture'; delete config.llm.providers![0].protocol;
+  await manager.updateConfig({ llm: config.llm });
+  const loaded = await manager.load();
+  expect(JSON.parse(buildAppLlmRunConfig(loaded.llm, loaded.agent)!.providerJson!).api).toBe('openai-completions');
+  const prior = fs.readFileSync(path.join(dir, 'config.json'), 'utf8');
+  loaded.llm.providers![0].protocol = 'unknown' as never;
+  await expect(manager.updateConfig({ llm: loaded.llm })).rejects.toThrow('unsupported_protocol');
+  expect(fs.readFileSync(path.join(dir, 'config.json'), 'utf8')).toBe(prior);
+});
+it('fresh configurations own their provider objects and cannot inherit edits from another instance', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'protocol-defaults-')); dirs.push(dir);
+  const first = await new ConfigManager(path.join(dir, 'a.json')).load();
+  first.llm.providers!.push(buildDefaultLlmConfigForTest().providers![0]); first.llm.providers![0].protocol = 'anthropic-messages';
+  const second = await new ConfigManager(path.join(dir, 'b.json')).load();
+  expect(second.llm.providers).toEqual([]); expect(second.llm.apiKey).toBe('');
+});
+it('a clean install and an explicitly cleared provider list stay empty across saves and reloads', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'clean-models-')); dirs.push(dir);
+  const manager = new ConfigManager(path.join(dir, 'config.json')); let config = await manager.load();
+  expect(config.llm.providers).toEqual([]); expect(config.llm.apiKey).toBe(''); expect(config.llm.model).toBe(''); expect(config.llm.openAiCompatBaseUrl).toBe('');
+  config.llm = buildDefaultLlmConfigForTest(); config.llm.providers![0].apiKey = 'fixture-key'; await manager.updateConfig({ llm: config.llm });
+  await manager.updateConfig({ llm: { providers: [] } } as never);
+  config = await manager.load(); expect(config.llm.providers).toEqual([]); expect(config.llm.apiKey).toBe(''); expect(config.llm.model).toBe(''); expect(config.llm.directModel).toBe(''); expect(config.llm.activeProviderId).toBeUndefined(); expect(buildAppLlmRunConfig(config.llm, config.agent)).toBeNull();
+  await manager.updateConfig({ pollIntervalMinutes: 15 }); expect((await manager.load()).llm.providers).toEqual([]);
+});
+it('deleting the last preset does not regenerate a default model', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'empty-presets-')); dirs.push(dir);
+  const manager = new ConfigManager(path.join(dir, 'config.json')); await manager.load();
+  const llm = buildDefaultLlmConfigForTest(); llm.providers![0].models = []; llm.providers = [llm.providers![0]];
+  await manager.updateConfig({ llm }); const config = await manager.load();
+  expect(config.llm.providers![0].models).toEqual([]); expect(config.llm.model).toBe(''); expect(buildAppLlmRunConfig(config.llm, config.agent)).toBeNull();
+});

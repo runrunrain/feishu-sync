@@ -1,3 +1,4 @@
+import { ConversationModelPicker } from './ConversationModelPicker';
 /**
  * AgentComposer —— 会话输入区（AgentView 底部，§11.3）
  *
@@ -29,6 +30,7 @@ interface AgentComposerProps {
   onRecheck: () => void;
   rechecking: boolean;
   onJumpSettings?: () => void;
+  onModelChanged: () => void;
 }
 
 const MAX_TEXT = 20000;
@@ -45,11 +47,12 @@ export function AgentComposer({
   onRecheck,
   rechecking,
   onJumpSettings,
+  onModelChanged,
 }: AgentComposerProps) {
   const [text, setText] = useState('');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  const notReady = agentUnreachable || (agentStatus !== null && agentStatus.code !== 'ready');
+  const notReady = agentUnreachable || !agentStatus || agentStatus.code !== 'ready';
   const disabled = !session || notReady;
   const running = busy || session?.state === 'streaming' || session?.state === 'starting';
   const canSend = text.trim().length > 0 && text.length <= MAX_TEXT && !disabled && !sending;
@@ -75,17 +78,18 @@ export function AgentComposer({
       <div className="max-w-3xl mx-auto">
         {disabled ? (
           <div
-            className="mb-2 flex items-start gap-2 px-3 py-2 rounded-md border border-[rgba(180,83,9,0.3)] bg-[rgba(180,83,9,0.05)]"
+            className="mb-2 flex flex-wrap items-start gap-2 px-3 py-2 rounded-md border border-[rgba(180,83,9,0.3)] bg-[rgba(180,83,9,0.05)]"
             data-testid="agent-notready"
             role="note"
           >
             <Settings2 className="w-3.5 h-3.5 mt-0.5 shrink-0 text-[#92580c]" />
-            <div className="min-w-0 flex-1">
+            <div className="min-w-0 flex-1 basis-[220px]">
               <p className="text-xs font-medium text-[#92580c]">
-                {!session ? '尚未选择会话' : agentUnreachable ? 'Agent 服务不可用' : readiness?.reason ?? 'Agent 未就绪'}
+                {!session ? '尚未选择会话' : agentUnreachable ? 'Agent 服务不可用' : !agentStatus ? '正在检查模型…' : readiness?.reason ?? 'Agent 未就绪'}
               </p>
               {readiness?.action ? <p className="text-[11px] text-ink-soft mt-0.5 leading-snug">{readiness.action}</p> : null}
             </div>
+            <div className="flex flex-wrap items-center gap-2 pl-5 sm:pl-0">
             {readiness?.recheck || agentUnreachable ? (
               <Button size="sm" variant="secondary" onClick={onRecheck} loading={rechecking}>
                 重新检测
@@ -96,10 +100,11 @@ export function AgentComposer({
                 前往设置
               </Button>
             ) : null}
+            </div>
           </div>
         ) : null}
 
-        <div className="flex items-end gap-2">
+        <div className="rounded-xl border border-line bg-card-bg p-2 focus-within:border-seal/50">
           <textarea
             ref={textareaRef}
             value={text}
@@ -120,11 +125,13 @@ export function AgentComposer({
                   ? 'Agent 正在生成——可插话或排队下一条…'
                   : '描述你的设计问题，Enter 发送，Shift+Enter 换行'
             }
-            className="flex-1 resize-none rounded-md border border-line bg-card-bg px-3 py-2.5 text-sm text-ink placeholder:text-ink-faint focus:outline-none focus:border-seal/50 disabled:bg-paper-2 disabled:text-ink-faint scrollbar-thin"
+            className="block w-full resize-none border-0 bg-transparent px-2 py-2 text-sm text-ink placeholder:text-ink-faint focus:outline-none focus:border-seal/50 disabled:bg-paper-2 disabled:text-ink-faint scrollbar-thin"
             aria-label="消息输入"
             data-testid="agent-composer-input"
           />
-          <div className="flex flex-col gap-1.5 shrink-0">
+          <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+            <ConversationModelPicker session={session} busy={running || sending} onChanged={onModelChanged} />
+          <div className="flex flex-wrap items-center gap-1.5 shrink-0">
             {running ? (
               <>
                 <Button
@@ -165,6 +172,7 @@ export function AgentComposer({
                 发送
               </Button>
             )}
+          </div>
           </div>
         </div>
         <p className="mt-1.5 text-[10px] text-ink-faint">

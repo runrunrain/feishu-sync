@@ -35,7 +35,7 @@ const NAV_ITEMS: { id: MainArea; ordinal: string; label: string }[] = [
 
 export function TopBar({ currentArea, onAreaChange, updateVersion }: TopBarProps) {
   return (
-    <header className="h-[50px] shrink-0 min-w-0 bg-card-bg border-b border-line flex items-center justify-between gap-3 px-4 lg:px-8">
+    <header className="h-[50px] shrink-0 min-w-0 bg-card-bg border-b border-line flex items-center justify-between gap-2 px-3 sm:px-4 lg:px-5">
       {/*
         布局优化：
         - 高度压缩至 50px，给主视口让渡垂直空间

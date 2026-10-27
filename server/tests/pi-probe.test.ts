@@ -82,6 +82,9 @@ async function spawnProbe(options: {
   withExtension?: boolean;
   providerJson?: string;
   apiKey?: string;
+  sharedHome?: string;
+  model?: string;
+  diagnostics?: string[];
 }): Promise<PiRpcProcess> {
   const { token } = toolService.createRunContext({
     runKind: 'probe',
@@ -89,8 +92,8 @@ async function spawnProbe(options: {
     knowledgeBaseRoot: fixtureRoot,
   });
   const env = buildPiProcessEnv({
-    mode: 'app-llm',
-    parentEnv: process.env,
+    mode: options.sharedHome ? 'pi-agent-dir' : 'app-llm',
+    parentEnv: options.sharedHome ? { PATH: process.env.PATH, HOME: fixtureRoot, USERPROFILE: fixtureRoot, SystemRoot: process.env.SystemRoot, PI_CODING_AGENT_DIR: options.sharedHome } : process.env,
     dataRoot: fixtureRoot,
     agentUrl: `http://127.0.0.1:${httpPort}`,
     runToken: token,
@@ -99,22 +102,43 @@ async function spawnProbe(options: {
   if (options.providerJson) {
     env.FEISHU_SYNC_AGENT_PROVIDER_JSON = options.providerJson;
   }
+  env.FEISHU_SYNC_AGENT_PI_PACKAGE_ROOT = runtime!.piPackageRoot!;
   const rpc = new PiRpcProcess({
     nodePath: runtime!.nodePath!,
     piCliPath: runtime!.piCliPath!,
     ...(options.withExtension ? { extensionPath: piExtensionPath() ?? undefined } : {}),
     tools: [],
+    model: options.model,
     noSession: true,
     noTools: true,
     cwd: emptyCwd(),
     env,
     promptTimeoutMs: 30_000,
   });
+  if (options.diagnostics) rpc.on('stderr', (chunk: string) => options.diagnostics!.push(chunk));
   await rpc.start(20_000);
   return rpc;
 }
 
 describe('真实 pi RPC（本机 pi 1.4，缺失则 skip）', () => {
+  it('local config exposes only authenticated chat models and keeps shared credentials unchanged', async () => {
+    if (!piAvailable()) return;
+    const sharedHome = path.join(fixtureRoot, 'shared-pi'); fs.mkdirSync(sharedHome);
+    const provider = (apiKey?: string) => ({ api: 'openai-completions', baseUrl: 'http://127.0.0.1:9999/v1', ...(apiKey !== undefined ? { apiKey } : {}), models: [{ id: 'fixture-chat', name: 'Fixture', contextWindow: 8192, maxTokens: 1024 }] });
+    const auth = JSON.stringify({ 'fixture-stored': { type: 'api_key', key: 'stored-fixture-key' }, 'openai-codex': { type: 'oauth', access: 'expired-fixture', refresh: 'expired-refresh', expires: 1 } });
+    const models = JSON.stringify({ providers: { 'fixture-configured': provider('fixture-key'), 'fixture-stored': provider(), 'fixture-empty': provider() } });
+    fs.writeFileSync(path.join(sharedHome, 'auth.json'), auth);
+    fs.writeFileSync(path.join(sharedHome, 'models.json'), models);
+    const diagnostics: string[] = [];
+    const rpc = await spawnProbe({ withExtension: true, sharedHome, diagnostics });
+    try {
+      const result = await rpc.probeState();
+      expect(result.models.sort(), diagnostics.join('')).toEqual(['fixture-configured/fixture-chat', 'fixture-stored/fixture-chat']);
+      expect(fs.readFileSync(path.join(sharedHome, 'auth.json'), 'utf8')).toBe(auth);
+      expect(fs.readFileSync(path.join(sharedHome, 'models.json'), 'utf8')).toBe(models);
+      expect(fs.existsSync(path.join(sharedHome, 'models-store.json'))).toBe(false);
+    } finally { await rpc.terminate(); }
+  }, TEST_TIMEOUT_MS);
   it('Probe 进程启动 + get_state/get_available_models 往返', async () => {
     if (!piAvailable()) return;
     const rpc = await spawnProbe({});

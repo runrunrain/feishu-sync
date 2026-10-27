@@ -1,3 +1,4 @@
+import { modelRevision } from '../src/agent/model-revision.js';
 /**
  * F3-R04/R05/R06 受控并发回归：会话投递、容量预留与 busy/idle 生命周期
  *
@@ -145,6 +146,12 @@ function makeService(options: { maxConcurrentProcesses?: number; idleTimeoutMinu
       dataRoot,
       protectedRoots: collectResolvedRuntimeProtectedRoots(resolver),
     }),
+  });
+  // Injected fake processes represent an already-spawned session at this configuration.
+  const register = pool.register.bind(pool);
+  vi.spyOn(pool, 'register').mockImplementation((...args) => {
+    (service as unknown as { modelRevisions: WeakMap<PiRpcProcess, string> }).modelRevisions.set(args[1], modelRevision(config));
+    return register(...args);
   });
   return { service, store, pool, config };
 }

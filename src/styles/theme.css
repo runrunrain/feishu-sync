@@ -348,10 +348,15 @@
     outline-offset: -1px;
   }
   .tree-drop-indicator {
+    position: absolute;
+    right: 4px;
     height: 2px;
     background: var(--jade);
     border-radius: 1px;
-    margin: 1px 0;
+    pointer-events: none;
+    z-index: 20;
+    transform: translateY(-1px);
+    box-shadow: 0 0 0 1px var(--card-bg);
   }
 
   /* T9: Toast slide-in / Drawer slide-in (right side) */

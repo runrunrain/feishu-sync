@@ -24,7 +24,7 @@ import { Input, Select, Toggle } from './common/Input';
 import { useConfig } from '../hooks/useConfig';
 import { useToast } from './common/Toast';
 import { revealProviderApiKey } from '../api/client';
-import type { LlmConfig, LlmModelPreset, LlmProviderConfig } from '../types';
+import type { LlmConfig, LlmModelPreset, LlmProviderConfig, LlmProtocol } from '../types';
 
 function cloneLlmConfig(llm: LlmConfig): LlmConfig {
   return {
@@ -55,6 +55,7 @@ function makeProvider(existing: LlmProviderConfig[]): LlmProviderConfig {
     name: '新提供商',
     enabled: true,
     apiKey: '',
+    protocol: 'openai-completions',
     openAiCompatBaseUrl: '',
     defaultModelId: modelId,
     models: [{
@@ -168,14 +169,6 @@ export function ModelProviderSettings() {
   };
 
   const removeProvider = (provider: LlmProviderConfig) => {
-    if (providers.length <= 1) {
-      toast.push({
-        type: 'warning',
-        message: '请至少保留一个提供商',
-        hint: '可关闭该提供商而无需删除。',
-      });
-      return;
-    }
     const remaining = providers.filter((item) => item.id !== provider.id);
     const nextSelected = remaining[0];
     setLocal((current) => {
@@ -184,13 +177,13 @@ export function ModelProviderSettings() {
       return {
         ...current,
         providers: remaining,
-        activeProviderId: wasActive ? nextSelected.id : current.activeProviderId,
+        activeProviderId: wasActive ? nextSelected?.id : current.activeProviderId,
         activeModelId: wasActive
-          ? (nextSelected.defaultModelId ?? nextSelected.models[0]?.id)
+          ? (nextSelected?.defaultModelId ?? nextSelected?.models[0]?.id)
           : current.activeModelId,
       };
     });
-    setSelectedProviderId(nextSelected.id);
+    setSelectedProviderId(nextSelected?.id ?? '');
     setShowKey(false);
     setRevealedProviderId(null);
   };
@@ -223,10 +216,6 @@ export function ModelProviderSettings() {
   };
 
   const removeModel = (provider: LlmProviderConfig, modelId: string) => {
-    if (provider.models.length <= 1) {
-      toast.push({ type: 'warning', message: '每个提供商至少需要一个模型预设' });
-      return;
-    }
     const remaining = provider.models.filter((model) => model.id !== modelId);
     const nextDefault = provider.defaultModelId === modelId
       ? (remaining.find((model) => model.enabled)?.id ?? remaining[0]?.id)
@@ -244,19 +233,36 @@ export function ModelProviderSettings() {
     });
   };
 
-  const handleSave = async () => {
+  const handleSave = async (useForAgent = false) => {
     try {
+      if (providers.some((p) => p.models.some((m) =>
+        (m.contextWindow !== undefined && (!Number.isInteger(m.contextWindow) || m.contextWindow < 1024))
+        || (m.maxTokens !== undefined && (!Number.isInteger(m.maxTokens) || m.maxTokens < 1))
+        || (m.maxTokens !== undefined && m.contextWindow !== undefined && m.maxTokens > m.contextWindow)))) {
+        toast.push({ type: 'warning', message: '上下文窗口须为不小于 1024 的整数，最大输出须为正整数且不超过上下文窗口' }); return;
+      }
       // This card owns provider profiles only. Sending a narrow patch keeps a
       // concurrently open execution-channel card from being overwritten by a
       // stale copy of the rest of `llm`.
+      if (useForAgent && (!selectedProvider?.enabled || !selectedProvider.apiKey.trim() || !/^https?:\/\//i.test(selectedProvider.openAiCompatBaseUrl) || !selectedProvider.models.some((m) => m.enabled && m.openAiModel.trim()))) {
+        toast.push({ type: 'warning', message: '请先启用提供商并填写端点、API Key 和模型代码' }); return;
+      }
       await updateConfig({
+        ...(useForAgent && config?.agent && selectedProvider ? { agent: {
+          ...config.agent, model: { ...config.agent.model, source: 'app-llm' as const,
+            providerId: selectedProvider.id,
+            modelId: selectedProvider.models.find((m) => m.id === selectedProvider.defaultModelId && m.enabled && m.openAiModel.trim())?.id
+              ?? selectedProvider.models.find((m) => m.enabled && m.openAiModel.trim())?.id,
+          },
+        } } : {}),
         llm: {
           providers: local.providers,
           activeProviderId: local.activeProviderId,
           activeModelId: local.activeModelId,
+          contentAdaptationEnabled: (local.providers?.length ?? 0) > 0 && local.contentAdaptationEnabled === true,
         },
       });
-      toast.push({ type: 'success', message: '模型提供商与预设已保存' });
+      toast.push({ type: 'success', message: useForAgent ? '配置已保存并用于 Agent' : '模型提供商与预设已保存' });
     } catch (error) {
       toast.push({
         type: 'error',
@@ -269,13 +275,13 @@ export function ModelProviderSettings() {
   return (
     <Card variant="elevated">
       <CardHeader>
-        <div className="flex items-start justify-between gap-4">
-          <div className="flex items-center gap-2.5">
-            <Server className="w-4 h-4 text-seal" />
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="flex min-w-0 flex-1 basis-56 items-start gap-2">
+            <Server className="w-4 h-4 mt-0.5 shrink-0 text-seal" />
             <div>
               <h2 className="text-base font-kai font-medium text-ink">模型提供商与预设</h2>
               <p className="mt-0.5 text-xs text-ink-faint">
-                按提供商保存端点、密钥与模型别名；当前选中的提供商与预设即文档整理的调用目标。
+                提供商保存连接与密钥，模型预设保存模型代码与运行参数；Agent、标准库构建与原始文档整理可直接使用。
               </p>
             </div>
           </div>
@@ -289,16 +295,15 @@ export function ModelProviderSettings() {
       <CardBody className="space-y-4">
         <div className="rounded-md border border-jade/30 bg-jade/5 px-3 py-2.5 text-xs text-ink-soft">
           <p>
-            文档整理通过当前选中的提供商与模型预设，经 OpenAI 兼容端点调用。
-            GLM（Z.AI / BigModel）容量显示后缀（如 glm-5.2[1m]）会在运行时自动归一为标准模型代码。
+            配置仅保存在本应用。支持 OpenAI Chat Completions、Responses 和 Anthropic；也可在「Agent 标准库 → 运行时与模型」切换为本地 Pi 配置。
           </p>
         </div>
 
         {providers.length === 0 ? (
-          <div className="rounded-md border border-dashed border-line p-6 text-center">
+          <div className="rounded-md border border-dashed border-line px-4 py-6 text-center">
             <Server className="mx-auto h-6 w-6 text-ink-faint" />
             <p className="mt-2 text-sm text-ink-soft">尚未配置远程模型提供商</p>
-            <p className="mt-1 text-xs text-ink-faint">添加后即可为文档整理选择模型。</p>
+            <p className="mt-1 text-xs text-ink-faint">添加后即可为 Agent、标准库构建与原始文档整理选择模型。</p>
             <Button className="mt-4" size="sm" onClick={addProvider}>
               <Plus className="w-3.5 h-3.5" />
               添加第一个提供商
@@ -347,8 +352,7 @@ export function ModelProviderSettings() {
                   variant="ghost"
                   size="sm"
                   onClick={() => removeProvider(selectedProvider)}
-                  disabled={providers.length <= 1}
-                  title={providers.length <= 1 ? '请至少保留一个提供商；可改为停用' : '删除当前提供商'}
+                  title="删除当前提供商"
                 >
                   <Trash2 className="h-3.5 w-3.5" />
                   删除
@@ -363,7 +367,7 @@ export function ModelProviderSettings() {
                     ...provider,
                     name: event.target.value,
                   }))}
-                  placeholder="例如：智谱 GLM / OpenAI / 公司网关"
+                  placeholder="例如：公司网关"
                 />
                 <Toggle
                   label="启用提供商"
@@ -376,17 +380,23 @@ export function ModelProviderSettings() {
                 />
               </div>
 
+              <Select label="接口协议" value={selectedProvider.protocol ?? 'openai-completions'} options={[
+                { value: 'openai-completions', label: 'OpenAI Chat Completions' },
+                { value: 'openai-responses', label: 'OpenAI Responses' },
+                { value: 'anthropic-messages', label: 'Anthropic Messages' },
+              ]} onChange={(e) => updateProvider(selectedProvider.id, (provider) => ({ ...provider, protocol: e.target.value as LlmProtocol }))}
+                helperText="Agent、标准库构建与原始文档整理共用此协议和模型预设。" />
               <div className="grid grid-cols-1 gap-3">
                 <Input
-                  label="Base URL（OpenAI 兼容）"
+                  label="Base URL"
                   type="url"
                   value={selectedProvider.openAiCompatBaseUrl}
                   onChange={(event) => updateProvider(selectedProvider.id, (provider) => ({
                     ...provider,
                     openAiCompatBaseUrl: event.target.value,
                   }))}
-                  placeholder="https://api.example.com/v1"
-                  helperText="文档整理经此 OpenAI 兼容端点调用"
+                  placeholder={selectedProvider.protocol === 'anthropic-messages' ? 'https://api.anthropic.com' : 'https://api.openai.com/v1'}
+                  helperText={selectedProvider.protocol === 'anthropic-messages' ? '填写服务根地址，例如 https://api.anthropic.com，Pi 调用 /v1/messages。' : selectedProvider.protocol === 'openai-responses' ? '填写服务商 API 基础地址，例如 https://api.openai.com/v1；Pi 追加 /responses。' : '填写服务商 API 基础地址，例如 https://api.openai.com/v1；Pi 追加 /chat/completions。'}
                 />
               </div>
 
@@ -433,7 +443,7 @@ export function ModelProviderSettings() {
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
                     <p className="text-sm font-medium text-ink-soft font-serif">模型预设</p>
-                    <p className="mt-0.5 text-xs text-ink-faint">一个预设可为 direct 与 Claude Code 设置不同的模型名。</p>
+                    <p className="mt-0.5 text-xs text-ink-faint">填写服务商的模型代码，并按需设置上下文窗口、输出上限与思考能力。</p>
                   </div>
                   <Button variant="secondary" size="sm" onClick={() => addModel(selectedProvider)}>
                     <Plus className="h-3.5 w-3.5" />
@@ -448,10 +458,10 @@ export function ModelProviderSettings() {
                     ...provider,
                     defaultModelId: event.target.value,
                   }))}
-                  options={selectedProvider.models.map((model) => ({
+                  options={selectedProvider.models.length ? selectedProvider.models.map((model) => ({
                     value: model.id,
                     label: `${model.name || model.id}${model.enabled ? '' : '（已停用）'}`,
-                  }))}
+                  })) : [{ value: '', label: '尚无模型预设' }]}
                   helperText="切换到该提供商且未指定其他预设时使用"
                 />
 
@@ -469,7 +479,6 @@ export function ModelProviderSettings() {
                           <button
                             type="button"
                             onClick={() => removeModel(selectedProvider, model.id)}
-                            disabled={selectedProvider.models.length <= 1}
                             className="rounded p-1 text-ink-faint hover:bg-seal/10 hover:text-seal disabled:cursor-not-allowed disabled:opacity-40"
                             aria-label={`删除模型预设 ${model.name || model.id}`}
                           >
@@ -482,17 +491,24 @@ export function ModelProviderSettings() {
                           label="预设名称"
                           value={model.name}
                           onChange={(event) => updateModel(selectedProvider, model.id, { name: event.target.value })}
-                          placeholder="例如：GLM 5.2"
+                          placeholder="例如：日常整理"
                         />
                         <Input
-                          label="模型别名"
+                          label="模型代码"
                           value={model.openAiModel}
                           onChange={(event) => updateModel(selectedProvider, model.id, { openAiModel: event.target.value })}
-                          placeholder="glm-4-flash"
+                          placeholder="填写服务商的模型代码"
                           helperText={/\bglm-[^\s[]+\[[^\]]+\]/i.test(model.openAiModel)
                             ? 'GLM API 请填写标准模型代码（例如 glm-5.2）；容量显示后缀会在运行时自动移除。'
                             : undefined}
                         />
+                      </div>
+                      <div className="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-2">
+                        <Input label="上下文窗口（tokens）" type="number" min={1024} step={1024} value={model.contextWindow ?? ''} placeholder="默认 128000"
+                          onChange={(e) => updateModel(selectedProvider, model.id, { contextWindow: e.target.value ? Number(e.target.value) : undefined })} />
+                        <Input label="最大输出（tokens）" type="number" min={1} value={model.maxTokens ?? ''} placeholder="默认 8192"
+                          onChange={(e) => updateModel(selectedProvider, model.id, { maxTokens: e.target.value ? Number(e.target.value) : undefined })} />
+                        <Toggle label="支持思考模式" checked={model.reasoning ?? false} onChange={(reasoning) => updateModel(selectedProvider, model.id, { reasoning })} />
                       </div>
                     </div>
                   ))}
@@ -502,8 +518,18 @@ export function ModelProviderSettings() {
           </div>
         ) : null}
 
-        <div className="flex justify-end border-t border-line pt-4">
-          <Button onClick={handleSave} loading={saving}>
+        {providers.length > 0 ? <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 border-t border-line pt-4">
+          <Select label="应用默认提供商" value={local.activeProviderId ?? ''} options={providers.filter((p) => p.enabled).map((p) => ({ value: p.id, label: p.name }))}
+            onChange={(e) => setLocal((current) => current ? { ...current, activeProviderId: e.target.value, activeModelId: providers.find((p) => p.id === e.target.value)?.defaultModelId } : current)} />
+          <Select label="应用默认模型预设" value={local.activeModelId ?? ''} options={(providers.find((p) => p.id === local.activeProviderId)?.models ?? []).filter((m) => m.enabled).map((m) => ({ value: m.id, label: m.name }))}
+            onChange={(e) => setLocal((current) => current ? { ...current, activeModelId: e.target.value } : current)} />
+        </div> : null}
+        {providers.length > 0 ? <Toggle label="同步时整理原始文档" checked={local.contentAdaptationEnabled === true}
+          onChange={(enabled) => setLocal((old) => old ? { ...old, contentAdaptationEnabled: enabled } : old)}
+          helperText="使用相同的应用提供商与模型预设；整理失败时保留确定性转换结果。" /> : null}
+        <div className="flex flex-wrap justify-end gap-3 border-t border-line pt-4">
+          {selectedProvider ? <Button variant="secondary" onClick={() => void handleSave(true)} disabled={saving}>保存并用于 Agent</Button> : null}
+          <Button onClick={() => void handleSave()} loading={saving}>
             <Save className="h-4 w-4" />
             保存提供商配置
           </Button>

@@ -27,6 +27,10 @@ import { TreeNode } from './TreeNode';
 import { EmptyState } from './common/EmptyState';
 import { useToast } from './common/Toast';
 import { appLogger } from '../utils/appLogger';
+import { TreeSelectionBox } from './TreeSelectionBox';
+import { applySelectionGesture, createSelectionResolver, type SelectionModifiers } from '../utils/treeSelection';
+import { SourceNodeMenu, type SourceMenuTarget } from './SourceNodeMenu';
+import { insertionSide, reorderSiblings, siblingDropTarget } from '../utils/treeReorder';
 import { getMappingTree, reorderMapping } from '../api/client';
 import type { CustomFolder, MappingNode, TreeNavTarget, WatchedRoot } from '../types';
 
@@ -49,9 +53,10 @@ interface NodeTreeViewProps {
   selectedToken: string | null;
   onSelect: (objToken: string) => void;
   onRefreshed?: () => void;
-  /** 手动删除节点（2026-09）：树行 hover 出现删除按钮，确认后由父层
-   * 调 manual-delete API（文件入 .trash-bin，行硬删）并刷新树。 */
+  /** 文档右键与归档删除入口，由父层显示本地文件/屏蔽选项并刷新树。 */
   onDeleteDoc?: (doc: { objToken: string; title: string }) => void;
+  onBatchAction?: (tokens: string[], action: 'delete' | 'block') => void;
+  selectionVersion?: number;
   /** Business marks keyed by obj_token (e.g. parsed from title or rules). */
   businessMarksByToken?: Record<string, string[]>;
   /**
@@ -179,6 +184,8 @@ export function NodeTreeView({
   onQuickAdd,
   focusRequest,
   onDeleteDoc,
+  onBatchAction,
+  selectionVersion = 0,
 }: NodeTreeViewProps) {
   const [nodes, setNodes] = useState<MappingNode[]>(nodesProp ?? []);
   const [loading, setLoading] = useState<boolean>(!nodesProp);
@@ -193,6 +200,29 @@ export function NodeTreeView({
   // 再次点击同一书签恢复全部。
   const [activeGroupKey, setActiveGroupKey] = useState<string | null>(null);
   const toast = useToast();
+  const [multiMode, setMultiMode] = useState(false);
+  const [chosen, setChosen] = useState(new Set<string>());
+  const selectionAnchor = useRef<string | null>(null);
+  const [includeChildren, setIncludeChildren] = useState(true);
+  const selectionForest = useMemo(() => {
+    const records = new Map(nodes.map((node) => [node.obj_token, node]));
+    for (const folder of customFolders ?? []) for (const doc of folder.docs) if (!records.has(doc.objToken)) records.set(doc.objToken, { obj_token: doc.objToken, wiki_node_token: null, parent_node_token: null } as MappingNode);
+    return [...records.values()];
+  }, [nodes, customFolders]);
+  const selectionScope = useMemo(() => createSelectionResolver(selectionForest), [selectionForest]);
+  useEffect(() => { setChosen(new Set()); selectionAnchor.current = null; }, [selectionVersion]);
+  useEffect(() => { const valid = new Set(selectionForest.map((node) => node.obj_token)); setChosen((old) => [...old].every((token) => valid.has(token)) ? old : new Set([...old].filter((token) => valid.has(token)))); }, [selectionForest]);
+  const selectionFor = (token: string) => {
+    const scope = includeChildren ? selectionScope([token]) : [token];
+    const count = scope.filter((item) => chosen.has(item)).length;
+    return { selected: count, total: scope.length, onChange: (modifiers: SelectionModifiers) => handleSelection(token, modifiers, true) };
+  };
+  const [contextMenu, setContextMenu] = useState<SourceMenuTarget | null>(null);
+  const closeMenu = useCallback(() => setContextMenu(null), []);
+  const [reorderBusy, setReorderBusy] = useState(false);
+  const branchRefs = useRef(new Map<string, HTMLDivElement>());
+  const dropRef = useRef<{ objToken: string; position: 'before' | 'after' } | null>(null);
+  const leaveTimer = useRef<number | null>(null);
   const dragState = useRef<{ dragged: MappingNode | null }>({ dragged: null });
   // v0.2.9：常驻挂载可见性门控用的根元素引用（见键盘导航 effect）。
   const rootRef = useRef<HTMLDivElement>(null);
@@ -367,91 +397,62 @@ export function NodeTreeView({
     });
   };
 
-  // ---- Drag handlers (decision 5) ----
+  // 同层前/后插入：命中子树归到同级祖先，落点以同步ref为准。
+  const clearDrag = () => {
+    if (leaveTimer.current !== null) window.clearTimeout(leaveTimer.current);
+    dropRef.current = null; dragState.current.dragged = null;
+    setDragOver(null); setDraggingToken(null);
+  };
+  const openNodeMenu = (e: React.MouseEvent, node: MappingNode) => {
+    if (!onDeleteDoc) return;
+    e.preventDefault(); e.stopPropagation(); onSelect(node.obj_token);
+    setContextMenu({ objToken: node.obj_token, title: node.title, x: e.clientX, y: e.clientY });
+  };
   const handleDragStart = (e: React.DragEvent, node: MappingNode) => {
-    dragState.current.dragged = node;
-    setDraggingToken(node.obj_token);
-    e.dataTransfer.effectAllowed = 'move';
-    // Required for Firefox to start DnD.
-    e.dataTransfer.setData('text/plain', node.obj_token);
+    if (reorderBusy || multiMode) { e.preventDefault(); return; }
+    closeMenu(); clearDrag(); dragState.current.dragged = node; setDraggingToken(node.obj_token);
+    e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', node.obj_token);
   };
-
+  const resolveDrop = (e: React.DragEvent, node: MappingNode) => {
+    const dragged = dragState.current.dragged;
+    if (!dragged) return null;
+    const target = siblingDropTarget(dragged, node, tree.nodeByWikiToken);
+    if (!target) return null;
+    const rect = branchRefs.current.get(target.obj_token)?.getBoundingClientRect();
+    if (!rect) return null;
+    return { target, position: insertionSide(e.clientY, rect, dropRef.current?.objToken === target.obj_token ? dropRef.current.position : undefined) };
+  };
   const handleDragOver = (e: React.DragEvent, node: MappingNode) => {
-    const dragged = dragState.current.dragged;
-    if (!dragged || dragged.obj_token === node.obj_token) return;
-    // Same-parent check (decision 5: cross-parent rejected).
-    if ((dragged.parent_node_token ?? null) !== (node.parent_node_token ?? null)) return;
-    e.preventDefault();
-    e.dataTransfer.dropEffect = 'move';
-    // Determine before/after by midpoint.
-    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    const offset = e.clientY - rect.top;
-    const position: 'before' | 'after' = offset < rect.height / 2 ? 'before' : 'after';
-    setDragOver({ objToken: node.obj_token, position });
+    if (leaveTimer.current !== null) window.clearTimeout(leaveTimer.current);
+    const drop = resolveDrop(e, node);
+    if (!drop) { e.dataTransfer.dropEffect = 'none'; dropRef.current = null; setDragOver((old) => old ? null : old); return; }
+    e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = 'move';
+    const next = { objToken: drop.target.obj_token, position: drop.position };
+    dropRef.current = next;
+    setDragOver((old) => old?.objToken === next.objToken && old.position === next.position ? old : next);
   };
-
-  const handleDragLeave = (_e: React.DragEvent, node: MappingNode) => {
-    setDragOver((cur) => (cur?.objToken === node.obj_token ? null : cur));
+  const handleDragLeave = (e: React.DragEvent) => {
+    if (e.relatedTarget instanceof Node && rootRef.current?.contains(e.relatedTarget)) return;
+    if (leaveTimer.current !== null) window.clearTimeout(leaveTimer.current);
+    leaveTimer.current = window.setTimeout(() => { dropRef.current = null; setDragOver(null); }, 100);
   };
-
   const handleDrop = async (e: React.DragEvent, node: MappingNode) => {
-    e.preventDefault();
-    const dragged = dragState.current.dragged;
-    setDragOver(null);
-    setDraggingToken(null);
-    dragState.current.dragged = null;
-    if (!dragged || dragged.obj_token === node.obj_token) return;
-
-    // Decision 5: cross-parent rejected.
-    if ((dragged.parent_node_token ?? null) !== (node.parent_node_token ?? null)) {
-      toast.push({
-        type: 'warning',
-        message: '仅支持同级拖拽排序',
-        hint: '跨父节点移动与飞书结构绑定，已拒绝',
-      });
-      return;
-    }
-
-    // Compute the new ordering of this sibling set.
-    const parent = node.parent_node_token ?? null;
-    const siblings = tree.childrenByParent.get(parent) ?? [];
-    const ordered = siblings.filter((s) => s.obj_token !== dragged.obj_token);
-    const dropIdx = ordered.findIndex((s) => s.obj_token === node.obj_token);
-    if (dropIdx < 0) return;
-    const insertAt = dragOver?.position === 'after' ? dropIdx + 1 : dropIdx;
-    ordered.splice(insertAt, 0, dragged);
-
-    // Optimistic local reorder (immediate UI feedback).
-    const reorderedTokens = ordered.map((s) => s.obj_token);
-    setNodes((prev) => {
-      // Apply sortOrder = index within same-parent group.
-      const next = prev.map((n) => {
-        if ((n.parent_node_token ?? null) !== parent) return n;
-        const idx = reorderedTokens.indexOf(n.obj_token);
-        if (idx < 0) return n;
-        return { ...n, sortOrder: idx };
-      });
-      return next;
-    });
-
+    e.preventDefault(); e.stopPropagation();
+    const dragged = dragState.current.dragged; const drop = resolveDrop(e, node); clearDrag();
+    if (!dragged || !drop || reorderBusy) return;
+    const parent = dragged.parent_node_token ?? null;
+    const reorderedTokens = reorderSiblings(tree.childrenByParent.get(parent) ?? [], dragged, drop.target, drop.position);
+    if (!reorderedTokens) return;
+    const positions = new Map(reorderedTokens.map((token, i) => [token, i]));
+    setNodes((prev) => prev.map((n) => positions.has(n.obj_token) ? { ...n, sortOrder: positions.get(n.obj_token)! } : n));
+    setReorderBusy(true);
     try {
-      await reorderMapping({
-        parent_node_token: parent,
-        ordered_obj_tokens: reorderedTokens,
-      });
-      toast.push({
-        type: 'info',
-        message: '已调整本地展示顺序',
-        hint: '不影响飞书节点结构',
-      });
-      appLogger.info('node-tree', 'reorder ok', { parent, count: reorderedTokens.length });
+      await reorderMapping({ parent_node_token: parent, ordered_obj_tokens: reorderedTokens });
+      toast.push({ type: 'info', message: '已调整同级文档顺序' });
     } catch (err) {
-      const msg = err instanceof Error ? err.message : '调整顺序失败';
-      appLogger.error('node-tree', 'reorder failed', err);
-      toast.push({ type: 'error', message: '调整顺序失败', hint: msg });
-      // Rollback by refetching.
-      void fetchTree();
-    }
+      toast.push({ type: 'error', message: '调整顺序失败', hint: err instanceof Error ? err.message : '' });
+      await fetchTree();
+    } finally { setReorderBusy(false); }
   };
 
   // ---- Recursive render ----
@@ -480,7 +481,8 @@ export function NodeTreeView({
     const marks = businessMarksByToken?.[node.obj_token];
 
     return (
-      <div key={node.obj_token}>
+      <div key={node.obj_token} data-tree-branch={node.obj_token} className="relative" ref={(element) => { if (element) branchRefs.current.set(node.obj_token, element); else branchRefs.current.delete(node.obj_token); }}>
+        {dragOver?.objToken === node.obj_token ? <div className="tree-drop-indicator" data-insert-position={dragOver.position} style={{ left: Math.min(8 + level * 8, 40), [dragOver.position === 'before' ? 'top' : 'bottom']: 0 }} /> : null}
         <TreeNode
           node={node}
           level={level}
@@ -489,14 +491,16 @@ export function NodeTreeView({
           hasChildren={hasChildren}
           businessMarks={marks}
           onToggle={handleToggle}
-          onSelect={onSelect}
+          onSelect={handleRowClick}
           onDragStart={handleDragStart}
           onDragOver={handleDragOver}
           onDragLeave={handleDragLeave}
           onDrop={handleDrop}
           isDragging={draggingToken === node.obj_token}
-          isDropTargetBefore={dragOver?.objToken === node.obj_token && dragOver.position === 'before'}
-          isDropTargetAfter={dragOver?.objToken === node.obj_token && dragOver.position === 'after'}
+          onDragEnd={clearDrag}
+          onContextMenu={openNodeMenu}
+          reorderBusy={reorderBusy || multiMode}
+          selection={multiMode ? selectionFor(node.obj_token) : undefined}
         />
         {hasChildren && isExpanded && (
           <div>{visibleChildren.map((c) => renderNode(c, level + 1))}</div>
@@ -545,6 +549,24 @@ export function NodeTreeView({
     return { groups, unclassified };
   }, [roots, watchedRoots, tree]);
 
+  const selectionCandidates = useMemo(() => {
+    const output = new Set<string>();
+    const walk = (initial: MappingNode[]) => {
+      const queue = [...initial];
+      for (let i = 0; i < queue.length; i++) {
+        const node = queue[i]; if (output.has(node.obj_token) || (visibleTokens && !visibleTokens.has(node.obj_token))) continue;
+        output.add(node.obj_token); queue.push(...(tree.childrenByParent.get(node.wiki_node_token) ?? []));
+      }
+    };
+    if (groupedRoots) {
+      for (const group of groupedRoots.groups) if (!activeGroupKey || activeGroupKey === group.watchedRoot.url) walk(group.displayNodes);
+      if (!activeGroupKey || activeGroupKey === UNCLASSIFIED_KEY) walk(groupedRoots.unclassified);
+    } else if (activeGroupKey !== CUSTOM_ARCHIVE_KEY) walk(roots);
+    if (!activeGroupKey || activeGroupKey === CUSTOM_ARCHIVE_KEY) for (const folder of customFolders ?? []) for (const doc of folder.docs) if (doc.title.toLowerCase().includes(search.trim().toLowerCase())) output.add(doc.objToken);
+    return [...output].filter((token) => !tree.nodeByToken.has(token) || matchedTokens.has(token));
+  }, [groupedRoots, roots, activeGroupKey, visibleTokens, matchedTokens, tree, customFolders, search]);
+  const contextTokens = contextMenu && chosen.has(contextMenu.objToken) ? [...chosen] : contextMenu ? [contextMenu.objToken] : [];
+
   // ------------------------------------------------------------------
   // 键盘上下键导航（v0.2.8）：按渲染顺序前序 DFS 收集「当前可见且已
   // 渲染」的节点行（折叠节点的后代、被 visibleTokens 隐藏的节点都跳过），
@@ -581,6 +603,27 @@ export function NodeTreeView({
     }
     return out;
   }, [groupedRoots, roots, tree, expanded, collapsedGroups, visibleTokens, activeGroupKey]);
+
+  // Range selection uses exactly the displayed rows, including expanded archive groups.
+  const selectableRows = useMemo(() => {
+    const rows = [...navigableTokens];
+    if (!activeGroupKey || activeGroupKey === CUSTOM_ARCHIVE_KEY) {
+      for (const folder of customFolders ?? []) if (!collapsedGroups.has(`custom:${folder.id}`)) {
+        for (const doc of folder.docs) if (doc.title.toLowerCase().includes(search.trim().toLowerCase())) rows.push(doc.objToken);
+      }
+    }
+    return [...new Set(rows)];
+  }, [navigableTokens, activeGroupKey, customFolders, collapsedGroups, search]);
+  const handleSelection = (token: string, modifiers: SelectionModifiers, checkbox = false) => {
+    const result = applySelectionGesture(chosen, token, selectionAnchor.current, selectableRows,
+      (tokens) => includeChildren ? selectionScope(tokens) : [...tokens], modifiers, checkbox);
+    selectionAnchor.current = result.anchor;
+    setChosen(result.chosen);
+  };
+  const handleRowClick = (token: string, event: React.MouseEvent) => {
+    if (multiMode) { event.preventDefault(); handleSelection(token, event); }
+    if (!multiMode || (!event.shiftKey && !event.metaKey && !event.ctrlKey)) onSelect(token);
+  };
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -694,20 +737,23 @@ export function NodeTreeView({
                           key={doc.objToken}
                           data-doc-token={doc.objToken}
                           role="treeitem"
-                          aria-selected={selected}
+                          aria-selected={multiMode ? chosen.has(doc.objToken) : selected}
                           tabIndex={0}
-                          onClick={() => onSelect(doc.objToken)}
+                          onContextMenu={(e) => { if (!onDeleteDoc) return; e.preventDefault(); e.stopPropagation(); onSelect(doc.objToken); setContextMenu({ objToken: doc.objToken, title: doc.title, x: e.clientX, y: e.clientY }); }}
+                          onClick={(e) => handleRowClick(doc.objToken, e)}
                           onKeyDown={(e) => {
+                            if (e.target !== e.currentTarget) return;
                             if (e.key === 'Enter' || e.key === ' ') {
                               e.preventDefault();
-                              onSelect(doc.objToken);
+                              if (multiMode) handleSelection(doc.objToken, e); else onSelect(doc.objToken);
                             }
                           }}
-                          className={`relative flex min-w-0 items-center gap-2 h-8 overflow-hidden pr-2.5 rounded-sm cursor-pointer transition-colors ${
-                            selected ? 'bg-[rgba(158,43,37,0.04)]' : 'hover:bg-paper-2'
+                          className={`relative ${multiMode ? 'select-none' : ''} flex min-w-0 items-center gap-2 h-8 overflow-hidden pr-2.5 rounded-sm cursor-pointer transition-colors ${
+                            (multiMode ? chosen.has(doc.objToken) : selected) ? 'bg-[rgba(158,43,37,0.04)]' : 'hover:bg-paper-2'
                           } focus:outline-none focus-visible:ring-1 focus-visible:ring-seal/50 ${selected ? 'before:absolute before:left-0 before:top-0 before:bottom-0 before:w-0.5 before:bg-seal' : ''}`}
                           style={{ paddingLeft: 16 }}
                         >
+                          {multiMode ? <TreeSelectionBox title={doc.title} {...selectionFor(doc.objToken)} /> : null}
                           <TypeIcon className="w-3.5 h-3.5 text-ink-soft shrink-0" />
                           <span
                             className="min-w-0 flex-1 truncate text-[12px] text-ink"
@@ -992,6 +1038,9 @@ export function NodeTreeView({
 
   return (
     <div ref={rootRef} className="min-h-0 min-w-0 h-full">
+      <SourceNodeMenu target={contextMenu} count={contextTokens.length} onClose={closeMenu}
+        onDelete={(doc) => { if (onBatchAction && contextTokens.length > 1) onBatchAction(contextTokens, 'delete'); else onDeleteDoc?.(doc); }}
+        onBlock={onBatchAction ? () => onBatchAction(contextTokens, 'block') : undefined} />
       <Card variant="default" className={`min-w-0 flex flex-col ${className}`}>
       <div className="flex flex-wrap items-center gap-2 border-b border-line px-3.5 py-2.5">
         <div className="flex min-w-0 flex-1 basis-[120px] items-center gap-2 rounded-md border border-line bg-paper px-2.5 py-1.5 focus-within:border-seal">
@@ -1015,6 +1064,7 @@ export function NodeTreeView({
               <option key={f} value={f}>{FILTER_LABEL[f]}</option>
             ))}
           </select>
+          {onBatchAction ? <button type="button" className="text-xs text-seal border border-line rounded px-2 py-1.5" onClick={() => { setMultiMode(!multiMode); setChosen(new Set()); selectionAnchor.current = null; }}>{multiMode ? '退出多选' : '多选'}</button> : null}
           {onQuickAdd && (
             <button
               type="button"
@@ -1029,6 +1079,12 @@ export function NodeTreeView({
           )}
         </div>
       </div>
+      {multiMode ? <div className="px-3 py-2 border-b border-line bg-paper/50 space-y-2">
+        <div className="flex flex-wrap items-center gap-2 text-xs"><span className="text-ink">已选 {chosen.size} 篇</span><button className="text-seal" onClick={() => setChosen((old) => new Set([...old, ...(includeChildren ? selectionScope(selectionCandidates) : selectionCandidates)]))}>全选当前结果</button><button className="text-ink-soft" onClick={() => { setChosen(new Set()); selectionAnchor.current = null; }}>清空</button></div>
+        <label className="flex gap-2 items-center text-xs text-ink-soft"><input type="checkbox" aria-label="勾选父节点时包含全部子文档" checked={includeChildren} onChange={(e) => setIncludeChildren(e.target.checked)} />勾选父节点时包含全部子文档</label>
+        <p className="text-[11px] text-ink-faint">Shift 连选 · ⌘ / Ctrl 点选增减 · 配合 Shift 追加区间</p>
+        <div className="flex gap-3 text-xs"><button className="text-seal-2 disabled:opacity-40" disabled={!chosen.size} onClick={() => onBatchAction?.([...chosen], 'delete')}>批量删除</button><button className="text-seal disabled:opacity-40" disabled={!chosen.size} onClick={() => onBatchAction?.([...chosen], 'block')}>移入屏蔽名单</button></div>
+      </div> : null}
       {/*
         根目录书签条（2026-08 行为调整）：分组头的永久可见书签栏。
         点击书签 → 树体只显示该分组内容（再点同一书签或「全部」恢复）；

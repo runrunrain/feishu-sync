@@ -79,8 +79,8 @@ export function getEnabledWatchedRootUrls(
 /**
  * A model preset belonging to one remote provider.
  *
- * v0.2.9 起仅保留 direct（OpenAI 兼容端点）通道；每个 preset 只存该端点
- * 可用的模型别名。
+ * Agent 与标准库构建按提供商协议调用预设模型；原始文档整理的 direct
+ * 通道仍使用 OpenAI Chat Completions。
  */
 export interface LlmModelPreset {
   /** Stable local identifier; unique within the provider. */
@@ -91,6 +91,9 @@ export interface LlmModelPreset {
   openAiModel: string;
   /** Disabled presets remain saved but cannot be selected at runtime. */
   enabled: boolean;
+  contextWindow?: number;
+  maxTokens?: number;
+  reasoning?: boolean;
 }
 
 /**
@@ -100,7 +103,11 @@ export interface LlmModelPreset {
  * /api/config and retain the same plaintext-on-disk warning as the legacy
  * `llm.apiKey` field until secure-storage support is introduced.
  */
+export type LlmProtocol = 'openai-completions' | 'openai-responses' | 'anthropic-messages';
+
 export interface LlmProviderConfig {
+  /** Missing in older configs means OpenAI Chat Completions. */
+  protocol?: LlmProtocol;
   /** Stable local identifier; unique across providers. */
   id: string;
   /** Human-readable provider name, for example "智谱 GLM". */
@@ -127,6 +134,8 @@ export interface LlmProviderConfig {
  * values only when no provider profile is configured.
  */
 export interface LlmConfig {
+  /** Runtime projection of the active provider protocol. */
+  protocol?: LlmProtocol;
   /** OpenAI-protocol adapter base URL (DirectChannel/OpenAI SDK). */
   openAiCompatBaseUrl: string;
   /** Provider credential (bearer key). */
@@ -666,6 +675,9 @@ export interface MappingNode {
   last_synced_modify_time: string;
   last_synced_at: string;
   last_seen_at: string | null;
+  /** 持久同步状态，待同步身份不等同于已落盘文档。 */
+  sync_state?: string;
+  sync_blocked?: boolean;
   status: 'synced' | 'changed' | 'error' | 'placeholder';
   cloud_deleted: number; // 0 | 1
   sortOrder: number | null;

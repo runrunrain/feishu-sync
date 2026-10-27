@@ -32,6 +32,7 @@ import {
 import { KnowledgeSettingsCard } from '../components/KnowledgeSettingsCard';
 import { WatchedRootsCard } from '../components/WatchedRootsCard';
 import { OrphanFilesCard } from '../components/OrphanFilesCard';
+import { SyncBlocklistCard } from '../components/SyncBlocklistCard';
 import { CustomArchiveSettingsCard } from '../components/CustomArchiveSettingsCard';
 import { ModelProviderSettings } from '../components/ModelProviderSettings';
 import { AuthSettingsCard } from '../components/AuthSettingsCard';
@@ -88,6 +89,13 @@ const SETTINGS_TABS: SettingsTabMeta[] = [
         render: () => <OrphanFilesCard />,
       },
       {
+        id: 'kb-sync-blocklist',
+        label: '同步屏蔽名单',
+        description: '查看屏蔽文档，多选移出后恢复检测与同步',
+        icon: ShieldCheck,
+        render: () => <SyncBlocklistCard />,
+      },
+      {
         id: 'kb-custom-archive',
         label: '自定义归档',
         description: '快捷添加的零散云文档与分类文件夹管理',
@@ -98,14 +106,14 @@ const SETTINGS_TABS: SettingsTabMeta[] = [
   },
   {
     id: 'models',
-    label: '模型与整理',
-    description: '提供商、模型预设与文档整理',
+    label: '服务提供商与模型',
+    description: '应用模型提供商与模型预设，供 Agent 与文档整理使用',
     icon: Sparkles,
     items: [
       {
         id: 'md-provider',
         label: '模型提供商与预设',
-        description: 'OpenAI 兼容端点、密钥与模型别名',
+        description: 'Chat Completions、Responses、Anthropic 与模型预设',
         icon: Server,
         render: () => <ModelProviderSettings />,
       },
@@ -172,8 +180,7 @@ const SETTINGS_TABS: SettingsTabMeta[] = [
   },
 ];
 
-/** 需求 4：隐藏未完善的「模型与整理」子页入口，保留代码与组件 */
-const VISIBLE_SETTINGS_TABS = SETTINGS_TABS.filter((tab) => tab.id !== 'models');
+const VISIBLE_SETTINGS_TABS = SETTINGS_TABS;
 
 interface SettingsViewProps {
   /**
@@ -214,23 +221,22 @@ export function SettingsView({ focusTabId, focusNonce }: SettingsViewProps) {
   }, [activeSubId]);
 
   const TabIcon = currentTabMeta.icon;
-  const SubIcon = currentSub.icon;
 
   return (
-    <div className="max-w-6xl space-y-4">
-      <div className="border-b border-line pb-3">
+    <div className="max-w-6xl space-y-3">
+      <div className="border-b border-line pb-2">
         <h1
           className="text-xl text-ink leading-tight"
           style={{ fontFamily: 'var(--kai)', fontWeight: 500 }}
         >
           设置
         </h1>
-        <p className="mt-2 text-sm text-ink-soft">{currentTabMeta.description}</p>
+        <p className="mt-1 text-xs leading-relaxed text-ink-soft">{currentTabMeta.description}</p>
       </div>
 
-      {/* 第一层：顶部水平 tab 栏（保留原视觉，仅作分组切换） */}
+      {/* 分类导航在窄窗口换行，避免入口移出可见范围。 */}
       <div
-        className="flex gap-1 overflow-x-auto rounded-md border border-line bg-paper/60 p-1"
+        className="flex flex-wrap gap-1 rounded-md border border-line bg-paper/60 p-1"
         role="tablist"
         aria-label="设置分类"
       >
@@ -246,40 +252,39 @@ export function SettingsView({ focusTabId, focusNonce }: SettingsViewProps) {
               aria-selected={selected}
               aria-controls={`settings-panel-${tab.id}`}
               onClick={() => setActiveTab(tab.id)}
-              className={`flex min-w-max items-center gap-2 rounded px-3 py-2 text-sm transition-colors ${
+              className={`flex min-w-0 items-center gap-1.5 whitespace-nowrap rounded px-2.5 py-1.5 text-xs leading-5 transition-colors ${
                 selected
                   ? 'bg-card-bg text-seal shadow-sm'
                   : 'text-ink-soft hover:bg-paper-2 hover:text-ink'
               }`}
             >
-              <Icon className="h-4 w-4" />
+              <Icon className="h-3.5 w-3.5 shrink-0" />
               {tab.label}
             </button>
           );
         })}
       </div>
 
-      {/* 第二层 + 内容：左侧侧栏（子卡片列表） + 右侧单卡渲染。
-          两者各自在自己视口内独立滚动，避免整页被拉长。 */}
+      {/* 多项分组使用子导航，窄窗口放在内容上方。 */}
       <section
         id={`settings-panel-${activeTab}`}
         role="tabpanel"
         aria-labelledby={`settings-tab-${activeTab}`}
-        className="flex gap-4"
+        className="flex flex-col gap-3 md:flex-row"
       >
-        <aside
-          className="flex w-52 shrink-0 flex-col rounded-md border border-line bg-paper-2/60 p-2"
+        {currentTabMeta.items.length > 1 ? <aside
+          className="flex w-full shrink-0 self-start flex-col md:w-44 rounded-md border border-line bg-paper-2/60 p-2"
           aria-label={`${currentTabMeta.label} 子项`}
         >
           {/* 侧栏头部：当前分组 + 图标，让侧栏自带语境 */}
-          <div className="flex items-center gap-2 px-2 py-2 text-xs font-medium text-ink-faint font-serif">
+          <div className="hidden md:flex items-center gap-2 px-2 py-2 text-xs font-medium text-ink-faint font-serif">
             <TabIcon className="h-3.5 w-3.5" />
             <span className="truncate">{currentTabMeta.label}</span>
           </div>
 
           {/* 侧栏项列表：溢出时在自己视口内滚 */}
           <nav
-            className="flex flex-1 flex-col gap-1 overflow-y-auto scrollbar-thin"
+            className="flex flex-wrap gap-1 md:flex-col"
             role="tablist"
           >
             {currentTabMeta.items.map((item) => {
@@ -293,7 +298,7 @@ export function SettingsView({ focusTabId, focusNonce }: SettingsViewProps) {
                   aria-selected={selected}
                   onClick={() => setActiveSubId(item.id)}
                   title={item.description}
-                  className={`flex items-center gap-2 rounded px-2.5 py-2 text-left text-sm transition-colors ${
+                  className={`flex items-center gap-1.5 rounded px-2.5 py-1.5 text-left text-xs leading-5 transition-colors ${
                     selected
                       ? 'bg-card-bg text-seal shadow-sm'
                       : 'text-ink-soft hover:bg-paper hover:text-ink'
@@ -305,22 +310,13 @@ export function SettingsView({ focusTabId, focusNonce }: SettingsViewProps) {
               );
             })}
           </nav>
-        </aside>
+        </aside> : null}
 
-        {/* 右侧内容区：同一时刻只渲染当前选中的那张卡片。
-            max-h 限定让内容在自己视口内滚，不把整页拉长。
-            约 100dvh - TopBar(52) - 页面 padding(32) - 标题区(约72) - tab栏(约52) ≈ 160px+。 */}
+        {/* 桌面内容独立滚动；窄窗口随页面滚动。 */}
         <div
           ref={contentRef}
-          className="flex-1 min-w-0 overflow-y-auto scrollbar-thin pr-1"
-          style={{ maxHeight: 'calc(100dvh - 168px)' }}
+          className="flex-1 min-w-0 md:max-h-[calc(100dvh-180px)] md:overflow-y-auto scrollbar-thin md:pr-1"
         >
-          <div className="mb-3 flex items-center gap-2 text-sm text-ink-soft">
-            <SubIcon className="h-4 w-4 text-seal" />
-            <span className="font-medium text-ink">{currentSub.label}</span>
-            <span className="text-ink-faint">·</span>
-            <span className="truncate font-serif">{currentSub.description}</span>
-          </div>
           {currentSub.render()}
         </div>
       </section>

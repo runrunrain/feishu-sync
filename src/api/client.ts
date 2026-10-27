@@ -1,3 +1,4 @@
+import type { SourceBatchRequest, SourceBatchPreview, SourceBatchResult } from '../types/source-batch';
 import type { PiPluginsDto } from '../types/pi-plugin';
 import type { AgentPluginsDto, AgentPluginInput } from '../types/agent-plugin';
 import type { KbSourceTreeDto, KbSourceChoice, KbChangePreview, KbVersionDto } from '../types/kb-version';
@@ -826,24 +827,21 @@ export async function clearTrash(): Promise<{ purged: number }> {
 
 /**
  * POST /api/trash/manual-delete — 手动删除任意活行节点（2026-09）：
- * 本地 .md 移入 .trash-bin/（镜像路径可找回），documents + sheet_sheets
- * 行硬删；回收站行（cloud_deleted=1）会 409，需走回收站面板。
+ * 可选回收本地文件与屏蔽。有效父链下保留待同步身份；其他行清理索引。
+ * 回收站行（cloud_deleted=1）会409，需走原回收站面板。
  */
-export async function manualDeleteDoc(objToken: string): Promise<{
-  ok: boolean;
-  file_moved_to_trash: boolean;
-  already_gone?: boolean;
+export async function manualDeleteDoc(objToken: string, options: { deleteFiles?: boolean; block?: boolean } = {}): Promise<{
+  ok: boolean; file_moved_to_trash: boolean; already_gone?: boolean; pending_sync?: boolean; blocked?: boolean; trash_dir?: string;
 }> {
-  const result = await request<{
-    ok: boolean;
-    file_moved_to_trash: boolean;
-    already_gone?: boolean;
-  }>('/api/trash/manual-delete', {
-    method: 'POST',
-    body: JSON.stringify({ obj_token: objToken }),
+  const result = await request<{ ok: boolean; file_moved_to_trash: boolean; already_gone?: boolean; pending_sync?: boolean; blocked?: boolean; trash_dir?: string }>('/api/trash/manual-delete', {
+    method: 'POST', body: JSON.stringify({ obj_token: objToken, delete_local_files: options.deleteFiles !== false, block: options.block === true }),
   });
-  emitDiffChanged('manual-delete');
-  return result;
+  emitDiffChanged('manual-delete'); return result;
+}
+export function getSyncBlocklist() { return request<{ root: string; items: Array<{ objToken: string; title: string; wikiNodeToken: string | null; blockedAt: string }> }>('/api/sync/blocklist'); }
+export async function removeSyncBlocklist(root: string, tokens: string[]) {
+  const result = await request<{ removed: number }>('/api/sync/blocklist/remove', { method: 'POST', body: JSON.stringify({ root, tokens }) });
+  emitDiffChanged('sync-blocklist'); return result;
 }
 
 /**
@@ -1260,4 +1258,26 @@ export async function cleanupKbSources(root: string, sources: Array<{ objToken: 
   const result = await request<{ cleaned: number; movedFiles: number; trashDir: string }>('/api/kb/sources/cleanup', { method: 'POST', body: JSON.stringify({ root, sources, confirm: 'CLEANUP' }) });
   emitDiffChanged('source-cleanup');
   return result;
+}
+
+export function previewSourceBatch(requestBody: SourceBatchRequest) {
+  return request<SourceBatchPreview>('/api/trash/source-batch/preview', { method: 'POST', body: JSON.stringify(requestBody) });
+}
+export async function applySourceBatch(requestBody: SourceBatchRequest, expectedRevision: string) {
+  const result = await request<SourceBatchResult>('/api/trash/source-batch/apply', { method: 'POST', body: JSON.stringify({ ...requestBody, expectedRevision, confirm: 'APPLY' }) });
+  emitDiffChanged('source-batch'); return result;
+}
+
+export interface AgentModelOption {
+  source: 'app-llm' | 'pi-agent-dir'; providerId?: string; modelId?: string; piModel?: string;
+  label: string; reasoning: boolean;
+}
+export function listConversationModels(source: 'app-llm' | 'pi-agent-dir', refresh = false): Promise<{ items: AgentModelOption[]; message: string }> {
+  return request(`/api/agent/models?source=${source}${refresh ? '&refresh=1' : ''}`);
+}
+export function saveConversationModel(id: string, model: import('../types/agent').SessionModelConfig | null): Promise<AgentSessionDto> {
+  return request(`/api/agent/sessions/${encodeURIComponent(id)}/model`, { method: 'PATCH', body: JSON.stringify({ model }) });
+}
+export function requestSessionAgentStatus(id: string, refresh = false): Promise<AgentStatusDto> {
+  return request(`/api/agent/sessions/${encodeURIComponent(id)}/status${refresh ? '?refresh=1' : ''}`);
 }

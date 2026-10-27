@@ -137,7 +137,7 @@ describe('config secret retain semantics (P4)', () => {
     const reloaded = await mgr.load();
     expect(reloaded.llm.providers?.[0]?.apiKey).toBe('provider-secret-must-survive');
     expect(reloaded.llm.providers?.[0]?.models[0]?.name).toBe('GLM 默认（已编辑）');
-    expect(reloaded.llm.model).toBe('glm-5.2');
+    expect(reloaded.llm.model).toBe('glm-4-flash'); // compatibility projection follows the active preset
     expect(reloaded.llm.providers?.[0]?.models[0]?.openAiModel).toBe('glm-4-flash');
     // v0.2.9：旧配置中的 claude 通道字段（primaryChannel 等）读取时归一。
     expect(reloaded.llm.primaryChannel).toBe('direct');
@@ -533,12 +533,12 @@ describe('suggestKnowledgeRoot', () => {
     })).toBe('D:\\飞书知识库');
   });
 
-  it('falls back to ~/Documents/飞书知识库 on win32 without a D drive', () => {
+  it('falls back to C:\\飞书知识库 on win32 without a D drive', () => {
     expect(suggestKnowledgeRoot({
       platform: 'win32',
       homeDir: 'C:\\Users\\tester',
       exists: () => false,
-    })).toBe('C:\\Users\\tester\\Documents\\飞书知识库');
+    })).toBe('C:\\飞书知识库');
   });
 
   it('uses ~/Documents/飞书知识库 on non-win32 platforms', () => {
@@ -547,5 +547,48 @@ describe('suggestKnowledgeRoot', () => {
       homeDir: '/Users/tester',
       exists: () => true,
     })).toBe('/Users/tester/Documents/飞书知识库');
+  });
+});
+
+describe('startup default knowledge library', () => {
+  it('does not overwrite a corrupt existing config during automatic initialization', async () => {
+    const configPath = createTempConfigPath(); fs.writeFileSync(configPath, '{broken');
+    const manager = new ConfigManager(configPath); await manager.load();
+    await manager.initializeKnowledgeBase({ candidates: [path.join(path.dirname(configPath), 'kb')] });
+    expect(fs.readFileSync(configPath, 'utf8')).toBe('{broken');
+  });
+  it('creates and persists the default directory once, preserving an existing custom path', async () => {
+    const configPath = createTempConfigPath(); const manager = new ConfigManager(configPath);
+    await manager.load();
+    const root = path.join(path.dirname(configPath), '飞书知识库');
+    expect((await manager.initializeKnowledgeBase({ candidates: [root] })).knowledgeBaseRoot).toBe(root);
+    expect(fs.statSync(root).isDirectory()).toBe(true);
+    expect((await new ConfigManager(configPath).load()).knowledgeBaseRoot).toBe(root);
+    let touched = false;
+    await manager.initializeKnowledgeBase({ candidates: ['/should-not-create'], mkdir: () => { touched = true; } });
+    expect(touched).toBe(false);
+  });
+  it('tries the next candidate on permission failure; all failures retain the unconfigured state', async () => {
+    const manager = new ConfigManager(createTempConfigPath()); await manager.load();
+    const visited: string[] = [];
+    const config = await manager.initializeKnowledgeBase({ candidates: ['D:\\飞书知识库', 'C:\\飞书知识库'], mkdir: (root) => {
+      visited.push(root); if (root.startsWith('D:')) throw new Error('EACCES');
+    } });
+    expect(visited).toEqual(['D:\\飞书知识库', 'C:\\飞书知识库']);
+    expect(config.knowledgeBaseRoot).toBe('C:\\飞书知识库');
+    const blocked = new ConfigManager(createTempConfigPath()); await blocked.load();
+    expect((await blocked.initializeKnowledgeBase({ candidates: ['unwritable'], mkdir: () => { throw new Error('EACCES'); } })).knowledgeBaseRoot).toBe('');
+  });
+  it('retains preset parameters and masked keys across save/reload', async () => {
+    const manager = new ConfigManager(createTempConfigPath()); await manager.load();
+    const llm = { providers: [{ id: 'gateway', name: 'Gateway', apiKey: 'fixture-key', enabled: true,
+      openAiCompatBaseUrl: 'http://127.0.0.1:9999/v1', defaultModelId: 'fast', models: [
+        { id: 'fast', name: 'Fast', openAiModel: 'test-fast', enabled: true, contextWindow: 64000, maxTokens: 4096, reasoning: true },
+      ] }], activeProviderId: 'gateway', activeModelId: 'fast' };
+    await manager.updateConfig({ llm } as never);
+    llm.providers[0].apiKey = '***'; await manager.updateConfig({ llm } as never);
+    const saved = await manager.load();
+    expect(saved.llm.providers![0].apiKey).toBe('fixture-key');
+    expect(saved.llm.providers![0].models[0]).toMatchObject({ contextWindow: 64000, maxTokens: 4096, reasoning: true });
   });
 });

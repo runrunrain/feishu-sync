@@ -18,6 +18,8 @@ import { AgentToolService, ToolError } from './agent-tool-service.js';
 import { buildPiProcessEnv, PiRpcProcess } from './pi-rpc-process.js';
 import { PiRuntimeResolver } from './runtime-resolver.js';
 import { buildAppLlmRunConfig } from './provider-descriptor.js';
+import type { SessionModelConfig } from '../types/agent-knowledge.js';
+import { modelRevision } from './model-revision.js';
 import { checkRootOverlap, type WorkspaceRootGuards } from './path-guard.js';
 import {
   toolsForRunKind,
@@ -65,6 +67,7 @@ export interface SessionStoreApi {
     mode: 'discuss' | 'work';
     workspaceId: string | null;
     piSessionFile: string | null;
+    modelConfig: string | null;
     lastErrorCode: string | null;
     lastErrorMessage: string | null;
     updatedAt: string;
@@ -80,6 +83,7 @@ export class SessionService extends EventEmitter {
   private readonly sseBuffers = new Map<string, SessionSseEvent[]>();
   private readonly sseSeq = new Map<string, number>();
   private readonly runs = new Map<string, ActiveRun>();
+  private readonly modelRevisions = new WeakMap<PiRpcProcess, string>();
   private readonly pluginRevisions = new WeakMap<PiRpcProcess, string>();
   private readonly sessionStates = new Map<string, 'starting' | 'streaming'>();
 
@@ -109,6 +113,7 @@ export class SessionService extends EventEmitter {
     const errorMessage = row.last_error_message ? String(row.last_error_message) : null;
     return {
       id: sessionId,
+      model: this.readSessionModel(row),
       title: String(row.title),
       mode: row.mode as AgentSessionMode,
       workspace: workspace ? { id: workspace.id, name: workspace.name, path: workspace.path } : null,
@@ -170,6 +175,27 @@ export class SessionService extends EventEmitter {
     if (!row) return null;
     localMapStore.updateAgentSession(id, { title: title.trim(), updatedAt: new Date().toISOString() });
     return this.get(localMapStore, this.currentConfig(), id);
+  }
+
+  private readSessionModel(row: Record<string, unknown>): SessionModelConfig | null {
+    if (typeof row.model_config_json !== 'string' || !row.model_config_json) return null;
+    try { return JSON.parse(row.model_config_json) as SessionModelConfig; } catch { throw new ToolError('invalid_request', '会话模型配置损坏'); }
+  }
+
+  configForSession(store: Pick<SessionStoreApi, 'getAgentSession'>, id: string, base = this.currentConfig()): Config {
+    const row = store.getAgentSession(id);
+    if (!row) throw new ToolError('session_not_found', '会话不存在', 404);
+    if (!base) throw new ToolError('invalid_request', '配置不可用');
+    const model = this.readSessionModel(row);
+    return model ? { ...base, agent: { ...base.agent, model: { ...base.agent.model, ...model } } } : base;
+  }
+
+  setModel(store: SessionStoreApi, id: string, model: SessionModelConfig | null): AgentSessionDto {
+    if (!store.getAgentSession(id)) throw new ToolError('session_not_found', '会话不存在', 404);
+    if (this.isRunning(id) || this.deps.pool.isBusy(id)) throw new ToolError('session_busy', '运行结束后可切换模型与思考强度', 409);
+    store.updateAgentSession(id, { modelConfig: model ? JSON.stringify(model) : null });
+    this.emitSessionState(id, store);
+    return this.get(store, this.currentConfig(), id)!;
   }
 
   private currentConfig(): Config | null {
@@ -325,7 +351,7 @@ export class SessionService extends EventEmitter {
     const row = localMapStore.getAgentSession(sessionId);
     if (!row) return;
     const mode = row.mode as AgentSessionMode;
-    const config = this.currentConfig();
+    const config = this.configForSession(localMapStore, sessionId);
     if (!config) throw new ToolError('invalid_request', '配置不可用');
 
     const workspace = this.workspaceOf(config, row.workspace_id);
@@ -342,14 +368,15 @@ export class SessionService extends EventEmitter {
     try {
       const pluginSnapshot = this.deps.pluginStore?.snapshot(mode);
       let process = this.deps.pool.get(sessionId);
-      if (process && pluginSnapshot && this.pluginRevisions.get(process) !== pluginSnapshot.revision) {
+      if (process && ((pluginSnapshot && this.pluginRevisions.get(process) !== pluginSnapshot.revision)
+        || this.modelRevisions.get(process) !== modelRevision(config))) {
         await this.deps.pool.terminate(sessionId);
         this.deps.toolService.revokeBySession(sessionId);
         process = null;
       }
       if (!process) {
         await this.deps.waitForInternalApi?.();
-        process = await this.spawnSessionProcess(sessionId, mode, workspace?.path, pluginSnapshot);
+        process = await this.spawnSessionProcess(sessionId, mode, workspace?.path, pluginSnapshot, config);
       }
       // F3-R06：运行期间挂起 idle 回收；结束（成功/失败/异常）后重起完整
       // idle 窗口——复用进程若已空闲 9 分钟，一次新 prompt 也必须获得全窗口。
@@ -444,8 +471,10 @@ export class SessionService extends EventEmitter {
     mode: AgentSessionMode,
     workspaceRoot: string | undefined,
     pluginSnapshot?: AppPluginSnapshot,
+    runConfig?: Config,
   ): Promise<PiRpcProcess> {
-    const config = this.currentConfig()!;
+    const config = runConfig ?? this.currentConfig()!;
+    const revision = modelRevision(config);
     const runtime = await this.deps.resolver.resolveRuntime(config.agent);
     if (!runtime.nodePath || !runtime.piCliPath) {
       throw new ToolError('agent_not_ready', 'Agent 运行时未就绪（Node 或 pi 缺失），请检查设置', 503);
@@ -550,6 +579,7 @@ export class SessionService extends EventEmitter {
       // 自动重试交由宿主判定（§4.4 auto_retry 上限）
       await rpc.sendCommand('set_auto_retry', { enabled: false }).catch(() => undefined);
       this.deps.pool.register(sessionId, rpc, 'session', slot);
+      this.modelRevisions.set(rpc, revision);
       if (pluginSnapshot) this.pluginRevisions.set(rpc, pluginSnapshot.revision);
     } catch (error) {
       // start/register 任一步失败：释放预留 + 终结半启动进程 + 回收令牌，

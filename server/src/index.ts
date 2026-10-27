@@ -119,7 +119,8 @@ export async function buildServer(options: CreateServerOptions = {}) {
   // LarkCliClient 内部的 PATH + 桌面发现目录解析，部署级逃生口是
   // LARK_CLI_PATH 环境变量。
   console.info('[server] Loading config');
-  const config = await configManager.load();
+  await configManager.load();
+  const config = await configManager.initializeKnowledgeBase();
   console.info('[server] Config loaded');
 
   console.info('[server] Initializing LocalMapStore');
@@ -164,6 +165,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
     localMapStore,
     {
       knowledgeBaseRoot: config.knowledgeBaseRoot,
+      knowledgeBaseRootProvider: () => configManager.getConfig()?.knowledgeBaseRoot ?? '',
     }
   );
   console.info('[server] ChangeDetector initialized');

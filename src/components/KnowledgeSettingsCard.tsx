@@ -196,7 +196,7 @@ export function KnowledgeSettingsCard() {
             </Button>
           </div>
           <p className="mt-1.5 text-xs text-ink-faint font-serif">
-            本地知识库的根目录绝对路径。同步会将飞书文档写入此目录。
+            启动时自动创建默认目录：Windows 优先 D 盘，再尝试 C 盘；macOS/Linux 放在用户 Documents 下。已有路径保持不变，也可在此修改。
           </p>
         </div>
 

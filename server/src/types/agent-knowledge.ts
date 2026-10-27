@@ -260,7 +260,10 @@ export type AgentSessionMode = 'discuss' | 'work';
 
 export type AgentSessionState = 'idle' | 'starting' | 'streaming' | 'error';
 
+export type SessionModelConfig = Pick<AgentModelConfig, 'source' | 'providerId' | 'modelId' | 'piModel' | 'thinkingLevel'>;
+
 export interface AgentSessionDto {
+  model?: SessionModelConfig | null;
   id: string;
   title: string;
   mode: AgentSessionMode;

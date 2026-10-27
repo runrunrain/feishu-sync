@@ -58,7 +58,7 @@ export function Drawer({
       <div
         className={`${widthClass} h-full bg-card-bg border-l border-line shadow-lg flex flex-col animate-drawer-in`}
       >
-        <div className="flex items-center justify-between px-5 py-3.5 border-b border-line">
+        <div className="flex items-center justify-between gap-2 px-4 py-3 border-b border-line">
           <div className="min-w-0">
             <h2 className="text-base font-kai font-medium text-ink truncate">{title}</h2>
             {subtitle && (
@@ -75,10 +75,10 @@ export function Drawer({
           </button>
         </div>
 
-        <div className="flex-1 overflow-auto scrollbar-thin">{children}</div>
+        <div className="flex-1 min-h-0 overflow-auto scrollbar-thin">{children}</div>
 
         {footer && (
-          <div className="border-t border-line px-5 py-3 bg-paper-2/50">{footer}</div>
+          <div className="border-t border-line px-4 py-3 bg-paper-2/50">{footer}</div>
         )}
       </div>
     </div>

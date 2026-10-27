@@ -19,6 +19,7 @@
     "test:migrations": "vitest run tests/migration-v5.test.ts"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.129.0",
     "@hono/node-server": "^1.14.0",
     "@modelcontextprotocol/sdk": "^1.32.2",
     "better-sqlite3": "^12.11.1",

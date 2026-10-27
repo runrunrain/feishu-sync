@@ -44,10 +44,17 @@ export interface LlmModelPreset {
   name: string;
   openAiModel: string;
   enabled: boolean;
+  contextWindow?: number;
+  maxTokens?: number;
+  reasoning?: boolean;
 }
 
 /** A remotely hosted model provider configured in Settings. */
+export type LlmProtocol = 'openai-completions' | 'openai-responses' | 'anthropic-messages';
+
 export interface LlmProviderConfig {
+  /** Missing in older configs means OpenAI Chat Completions. */
+  protocol?: LlmProtocol;
   id: string;
   name: string;
   enabled: boolean;
@@ -64,6 +71,8 @@ export interface LlmProviderConfig {
  * flat endpoint/key/model 字段为旧配置文件与旧调用方保留的兼容投影。
  */
 export interface LlmConfig {
+  /** Runtime projection of the active provider protocol. */
+  protocol?: LlmProtocol;
   /** OpenAI-protocol adapter base URL (DirectChannel/OpenAI SDK). */
   openAiCompatBaseUrl: string;
   /** Provider credential (bearer key). */
@@ -286,6 +295,9 @@ export interface MappingNode {
   last_synced_modify_time: string;
   last_synced_at: string;
   last_seen_at: string | null;
+  /** 持久同步状态，待同步身份不等同于已落盘文档。 */
+  sync_state?: string;
+  sync_blocked?: boolean;
   status: 'synced' | 'changed' | 'error' | 'placeholder';
   cloud_deleted: number; // 0 | 1
   sortOrder: number | null;

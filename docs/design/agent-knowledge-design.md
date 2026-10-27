@@ -11,7 +11,7 @@
 | D1 | pi 接入方式 | **外部 pi RPC 侧车进程**：server 用外部 Node ≥22.19 启动 `pi/dist/cli.js --mode rpc`，按 JSONL 协议驱动。不在 Electron 进程内 import SDK，不为此升级 Electron。 | 可逆：Electron ≥38 后可改为 SDK 子进程，契约面（HTTP API、工具语义）不变 |
 | D2 | 工具实现位置 | 应用自带工具经转发扩展调用server内部API与运行级能力令牌；知识库工作台作为内置Pi package加载上下文。用户显式添加的原生Pi插件可提供自身工具和代码能力（§17），宿主API权限不扩张。 | 可逆 |
 | D3 | pi 资源隔离 | 每次启动强制 `--no-extensions --no-skills --no-prompt-templates --no-context-files --no-themes --no-mcp --no-approve --offline`；无外部插件时加`--tools <白名单>`，外部包按§17加载；cwd为空目录；始终使用应用专属 `PI_CODING_AGENT_DIR`。无外部插件时实测白名单外不存在内置工具；外部插件模式下由桥接限制Pi内置工具。 | — |
-| D4 | 模型来源 | 默认 `app-llm`：复用 feishu-sync 已配置的 OpenAI 兼容 provider，经扩展 `registerProvider` 注入，key 只走子进程环境变量；可选 `pi-agent-dir`：显式 opt-in 复用本机 pi 凭据。无模型时诚实失败，不生成任何内容。 | 可逆 |
+| D4 | 模型来源 | 默认 `app-llm`：复用 feishu-sync 已配置的 provider 与模型预设，支持 OpenAI Chat Completions、Responses 和 Anthropic Messages；经扩展 `registerProvider` 按所选协议注入，key 只走子进程环境变量；可选 `pi-agent-dir`：显式 opt-in 复用本机 pi 凭据。无模型时诚实失败，不生成任何内容。 | 可逆 |
 | D5 | Discuss / Work | Discuss 工具级只读（无写、无 shell）。Work 必须绑定用户显式授权的 Workspace，只开放 server 实现的受路径守卫的文件工具；**第一阶段不提供 shell**。 | Shell 为后续独立决策（§7.5） |
 | D6 | 标准库发布 | `releases/<id>/` 不可变目录 + `CURRENT.json` 指针（写临时文件后 rename）。staging 与 releases 同卷；任何失败不移动指针。发布真相 = 指针 + release manifest；SQLite 只存构建历史，可由 manifest 重建。 | — |
 | D7 | 对外 MCP | stdio MCP server，单文件打包（esbuild，无原生依赖），**只读取已发布 manifest 与 Markdown，不依赖 SQLite**；默认用应用自带 Electron 可执行文件 `ELECTRON_RUN_AS_NODE=1` 运行，也可用外部 Node ≥20。HTTP transport 延后。 | — |

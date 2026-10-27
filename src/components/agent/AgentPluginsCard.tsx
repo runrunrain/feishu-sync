@@ -36,7 +36,7 @@ export function AgentPluginsCard() {
     finally { setBusy(false); }
   };
   return <section className="space-y-4" aria-label="Pi插件管理">
-    <div className="rounded-md border border-line bg-card-bg p-5 space-y-3">
+    <div className="rounded-md border border-line bg-card-bg p-4 space-y-3">
       <div className="flex gap-2 items-center flex-wrap"><Puzzle className="w-5 h-5 text-seal" /><h2 className="font-kai text-lg flex-1">Pi 插件</h2>
         <Button size="sm" variant="secondary" disabled={busy} onClick={() => void refresh()}><RefreshCw className="w-3.5 h-3.5" />刷新</Button>
         <Button size="sm" disabled={busy || !data} onClick={() => setAdding(!adding)}><Plus className="w-3.5 h-3.5" />添加 Pi 插件</Button>
@@ -53,9 +53,9 @@ export function AgentPluginsCard() {
     </div>
     {!data && !error ? <p className="p-4 text-ink-faint">正在加载Pi插件…</p> : null}
     {data ? <>
-      <nav aria-label="Pi插件列表" className="flex gap-2 overflow-auto pb-1">{data.packages.map((pkg) => <button key={pkg.id} type="button" disabled={busy}
+      <nav aria-label="Pi插件列表" className="flex flex-wrap gap-2">{data.packages.map((pkg) => <button key={pkg.id} type="button" disabled={busy}
         onClick={() => setSelected(pkg.id)} aria-pressed={current?.id === pkg.id}
-        className={`shrink-0 rounded border bg-card-bg px-4 py-3 text-left ${current?.id === pkg.id ? 'border-jade' : 'border-line'}`}>
+        className={`shrink-0 rounded border bg-card-bg px-3 py-2 text-left ${current?.id === pkg.id ? 'border-jade' : 'border-line'}`}>
         <span className="block text-sm text-ink">{pkg.name}</span><span className="block mt-1 text-xs text-ink-faint">{pkg.sourceType === 'builtin' ? '内置' : pkg.sourceType} · {pkg.enabled ? '已启用' : '已停用'}{pkg.version ? ` · v${pkg.version}` : ''}</span>
       </button>)}</nav>
       {current ? <div className="rounded border border-line bg-card-bg p-4 space-y-3">

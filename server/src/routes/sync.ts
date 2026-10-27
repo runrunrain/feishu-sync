@@ -54,6 +54,19 @@ function parseWatchedRootIds(value: unknown): string[] | undefined {
  * separate from mapping/diff so normal polling never turns them into a new
  * pending cloud change again.
  */
+syncRoutes.get('/api/sync/blocklist', async (c) => {
+  const config = await (c as any).configManager.load();
+  return c.json({ root: config.knowledgeBaseRoot, items: (c as any).localMapStore.listSyncBlockedSources(config.knowledgeBaseRoot) });
+});
+syncRoutes.post('/api/sync/blocklist/remove', async (c) => {
+  const body = await c.req.json();
+  const config = await (c as any).configManager.load();
+  if (body?.root !== config.knowledgeBaseRoot) return c.json({ error: 'knowledge_root_changed', message: '知识库已切换，请刷新后重试' }, 409);
+  if (!Array.isArray(body.tokens) || !body.tokens.length || body.tokens.length > 50000 || !body.tokens.every((token: unknown) => typeof token === 'string' && token.length > 0))
+    return c.json({ error: 'invalid_request', message: '请选择要移出屏蔽名单的文档' }, 400);
+  return c.json({ removed: (c as any).localMapStore.removeSyncBlockedSources(config.knowledgeBaseRoot, body.tokens) });
+});
+
 syncRoutes.get('/api/sync/feishu-pending', (c) => {
   try {
     return c.json({ items: getFeishuPendingStore(c).listFeishuPending() });
@@ -152,6 +165,9 @@ syncRoutes.post('/api/sync', async (c) => {
   // Load config
   const config = await configManager.load();
 
+  if (documents.some((doc) => localMapStore.isSyncBlocked?.(config.knowledgeBaseRoot, doc.objToken)))
+    return c.json({ error: 'source_blocked', message: '所选文档已被屏蔽，请刷新列表或先移出屏蔽名单' }, 409);
+
   // 2026-10 首次配置引导：未设置知识库根目录时提前 400（错误码对齐
   // custom-folders 的 knowledge_base_root_not_configured），不再让空路径
   // 穿透到写盘层炸出难以理解的 ENOENT/路径校验错误。前端同步入口有
@@ -173,6 +189,7 @@ syncRoutes.post('/api/sync', async (c) => {
   const layoutReconstructor = new LayoutReconstructor();
   const channelConfig: ChannelConfig = {
     llm: config.llm,
+    selection: config.agent?.model?.source === 'app-llm' ? config.agent.model : undefined,
   };
   const registry = new ContentBackendRegistry(channelConfig);
   const contentAdapter = new ContentAdapter(registry);

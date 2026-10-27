@@ -1,8 +1,9 @@
+import { resolveProviderModel, type ModelSelection } from './model-selection.js';
 /**
  * ContentBackend - LLM channel abstraction (v0.2.0 P3)
  *
  * v0.2.9 清理：claude-cli 与 opencode 两个本地无头 CLI 通道整体移除，
- * 仅保留 DirectChannel（OpenAI SDK 直连 OpenAI 兼容远程端点）。本文件
+ * 保留 DirectChannel（OpenAI/Anthropic SDK 按共享协议调用）。本文件
  * 同步移除 ClaudeCliConfig / OpenCodeCliConfig / claudeCompatBaseUrl /
  * claudeCliModel 等仅服务于已删通道的类型与字段。
  *
@@ -12,9 +13,9 @@
  *     恒为 null，整理失败由 sync-engine 的确定性结果兜底。
  */
 
-import type { LlmModelPreset, LlmProviderConfig } from '../types/index.js';
+import type { LlmProviderConfig, LlmProtocol } from '../types/index.js';
 
-export type { LlmModelPreset, LlmProviderConfig } from '../types/index.js';
+export type { LlmModelPreset, LlmProviderConfig, LlmProtocol } from '../types/index.js';
 
 // ============================================================================
 // Channel Names
@@ -38,6 +39,10 @@ export type ChannelName = 'direct';
  * `model` / `directModel` 为该端点可用的模型别名。
  */
 export interface LlmConfig {
+  contextWindow?: number;
+  maxTokens?: number;
+  reasoning?: boolean;
+  protocol?: LlmProtocol;
   /** OpenAI-compat base URL for DirectChannel (OpenAI SDK baseURL). */
   openAiCompatBaseUrl: string;
   /** Provider credential (bearer key). */
@@ -74,58 +79,15 @@ export interface LlmConfig {
  * friendly configuration error instead of accidentally falling back to a
  * different provider's legacy credentials.
  */
-export function resolveActiveLlmConfig(llm: LlmConfig): LlmConfig {
-  const profiles = Array.isArray(llm.providers)
-    ? llm.providers.filter((profile): profile is LlmProviderConfig => (
-      !!profile
-      && typeof profile === 'object'
-      && profile.enabled !== false
-      && typeof profile.id === 'string'
-    ))
-    : [];
-  const provider = profiles.find((profile) => profile.id === llm.activeProviderId)
-    ?? profiles[0];
-
-  if (!provider) return llm;
-
-  const presets = Array.isArray(provider.models)
-    ? provider.models.filter((preset): preset is LlmModelPreset => (
-      !!preset
-      && typeof preset === 'object'
-      && preset.enabled !== false
-      && typeof preset.id === 'string'
-    ))
-    : [];
-  const preset = presets.find((item) => item.id === llm.activeModelId)
-    ?? presets.find((item) => item.id === provider.defaultModelId)
-    ?? presets[0];
-
-  // A provider without an enabled model remains a valid saved draft. Its
-  // endpoint/key still become effective, while a blank model alias surfaces a
-  // deterministic channel-side configuration error rather than calling a
-  // previously selected provider by accident.
-  const openAiModel = preset && typeof preset.openAiModel === 'string'
-    ? preset.openAiModel
-    : '';
-  const isZai = /(?:^|\.)bigmodel\.cn|(?:^|\.)z\.ai/i.test(provider.openAiCompatBaseUrl);
-  // GLM's current API model identifier is e.g. `glm-5.2`. Older config
-  // examples sometimes stored a capacity display suffix (`glm-5.2[1m]`),
-  // which the OpenAI-compatible endpoint rejects as an unknown model. Keep
-  // the saved display value intact but use the canonical runtime identifier.
-  const normalizeZaiModel = (value: string) => (
-    isZai ? value.trim().replace(/\[[^\]]+\]$/, '') : value
-  );
-  const resolvedOpenAiModel = normalizeZaiModel(openAiModel);
-
-  return {
-    ...llm,
-    openAiCompatBaseUrl: typeof provider.openAiCompatBaseUrl === 'string'
-      ? provider.openAiCompatBaseUrl
-      : '',
-    apiKey: typeof provider.apiKey === 'string' ? provider.apiKey : '',
-    model: resolvedOpenAiModel || '',
-    directModel: resolvedOpenAiModel,
-  };
+export function resolveActiveLlmConfig(llm: LlmConfig, selection?: ModelSelection): LlmConfig {
+  // Only genuinely old flat configs may use flat credentials. An explicit empty
+  // provider array means unconfigured and must never revive deleted profiles.
+  if (!Array.isArray(llm.providers)) return llm;
+  const resolved = resolveProviderModel(llm, selection);
+  return { ...llm, protocol: resolved?.protocol ?? 'openai-completions',
+    openAiCompatBaseUrl: resolved?.baseUrl ?? '', apiKey: resolved?.apiKey ?? '',
+    model: resolved?.openAiModel ?? '', directModel: resolved?.openAiModel ?? '',
+    contextWindow: resolved?.contextWindow, maxTokens: resolved?.maxTokens, reasoning: resolved?.reasoning };
 }
 
 /**
@@ -134,6 +96,7 @@ export function resolveActiveLlmConfig(llm: LlmConfig): LlmConfig {
 export interface ChannelConfig {
   /** Shared LLM provider config. */
   llm: LlmConfig;
+  selection?: ModelSelection;
 }
 
 // ============================================================================

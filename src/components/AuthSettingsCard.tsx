@@ -137,7 +137,7 @@ export function AuthSettingsCard() {
 
   return (
     <Card variant="elevated">
-      <CardHeader className="flex items-center justify-between">
+      <CardHeader className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2.5">
           <KeyRound className="w-4 h-4 text-seal" />
           <h2 className="text-base font-kai font-medium text-ink">飞书认证</h2>

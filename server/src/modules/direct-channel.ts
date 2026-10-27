@@ -1,32 +1,7 @@
-/**
- * DirectChannel - OpenAI SDK 直连 LLM provider (v0.2.0 P3, fallback channel)
- *
- * Implements 03 §4.2 (DeepseekDirectChannel renamed DirectChannel after
- * the bigmodel cognitive correction). This is the FALLBACK channel;
- * the primary is ClaudeCliChannel. Logic was extracted from the legacy
- * ContentAdapter (which hardcoded OpenAI SDK calls).
- *
- * Channel contract:
- *   - Endpoint: `LlmConfig.openAiCompatBaseUrl` (OpenAI-protocol adapter;
- *     for bigmodel this is `https://open.bigmodel.cn/api/paas/v4`).
- *   - Auth: `Authorization: Bearer <apiKey>`.
- *   - Model: `LlmConfig.model` (e.g. `glm-4-flash`).
- *
- * Streaming is supported (and preferred when the orchestrator passes
- * onProgress). Non-streaming mode is used when enableStreaming=false or
- * when onProgress is absent.
- *
- * Error classification:
- *   - Network/SDK error  -> finishReason='error'
- *   - Timeout (AbortController) -> finishReason='timeout'
- *   - Normal completion   -> finishReason='stop' (or 'length' if truncated)
- *
- * Verified P3 实测 (2026-06-18):
- *   curl -H "Authorization: Bearer <full-key>" \
- *        https://open.bigmodel.cn/api/paas/v4/chat/completions
- *   with `model: glm-4-flash` returned standard OpenAI ChatCompletion.
- *   Same key drives claude CLI via the Anthropic adapter, confirming
- *   both channels share ONE `LlmConfig`.
+import Anthropic from '@anthropic-ai/sdk';
+import { providerModelParameters, type ModelSelection } from './model-selection.js';
+/** Source document adaptation via the selected provider's native SDK protocol.
+ * Preserves the DirectChannel contract, prompt, timeout and deterministic sync fallback.
  */
 
 import OpenAI from 'openai';
@@ -53,12 +28,16 @@ export class DirectChannel implements ContentBackend {
   private cachedBaseUrl: string | null = null;
 
   private readonly llm: LlmConfig;
+  private readonly thinking: ModelSelection['thinkingLevel'];
+  private anthropic: Anthropic | null = null;
 
-  constructor(llm: LlmConfig) {
+  constructor(llm: LlmConfig, selection?: ModelSelection) {
     // Provider profiles are resolved once per channel instance. Registries
     // are rebuilt for each sync, so this is both deterministic and avoids a
     // document in the same batch switching provider halfway through.
-    this.llm = resolveActiveLlmConfig(llm);
+    const resolved = resolveActiveLlmConfig(llm, selection);
+    this.llm = { ...resolved, ...providerModelParameters(resolved, selection) };
+    this.thinking = selection?.thinkingLevel ?? 'off';
   }
 
   async adapt(input: AdaptInput): Promise<AdaptOutput> {
@@ -88,7 +67,6 @@ export class DirectChannel implements ContentBackend {
       );
     }
 
-    const client = this.getClient();
     const controller = new AbortController();
     const timeoutHandle = setTimeout(
       () => controller.abort(),
@@ -104,42 +82,74 @@ export class DirectChannel implements ContentBackend {
       let tokensUsed = 0;
       let finishReason: AdaptFinishReason = 'stop';
 
-      if (wantStreaming) {
-        const stream = await client.chat.completions.create(
-          {
-            model,
-            messages: [{ role: 'user', content: prompt }],
-            temperature: options.temperature,
-            stream: true,
-          },
-          { signal: controller.signal }
-        );
-
-        for await (const chunk of stream) {
-          const content = chunk.choices[0]?.delta?.content || '';
-          if (content) {
-            adaptedMarkdown += content;
-            tokensUsed += content.length;
-            options.onProgress?.(content);
+      const protocol = this.llm.protocol ?? 'openai-completions';
+      const maxTokens = this.llm.maxTokens!;
+      const effort = this.thinking === 'minimal' ? 'low' : this.thinking === 'off' ? undefined : this.thinking;
+      const reasoning = this.llm.reasoning && effort;
+      const emit = (text: string) => { if (text) { adaptedMarkdown += text; if (wantStreaming) options.onProgress?.(text); } };
+      if (protocol === 'anthropic-messages') {
+        this.anthropic ??= new Anthropic({ apiKey: this.llm.apiKey, baseURL: this.llm.openAiCompatBaseUrl, maxRetries: 0 });
+        const params: Anthropic.MessageCreateParamsNonStreaming = {
+          model, max_tokens: maxTokens, messages: [{ role: 'user', content: prompt }],
+          ...(reasoning ? { thinking: { type: 'enabled', budget_tokens: Math.max(1024, Math.min(maxTokens - 1, effort === 'high' ? 8192 : effort === 'medium' ? 4096 : 1024)) } as const } : { temperature: options.temperature }),
+        };
+        if (wantStreaming) {
+          let complete = false; let inputTokens = 0;
+          const stream = await this.anthropic.messages.create({ ...params, stream: true }, { signal: controller.signal });
+          for await (const event of stream) {
+            if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') emit(event.delta.text);
+            if (event.type === 'message_start') { inputTokens = event.message.usage.input_tokens; tokensUsed = inputTokens + event.message.usage.output_tokens; }
+            if (event.type === 'message_delta') { tokensUsed = inputTokens + event.usage.output_tokens; if (event.delta.stop_reason === 'max_tokens') finishReason = 'length'; }
+            if (event.type === 'message_stop') complete = true;
           }
+          if (!complete) throw new Error('Anthropic stream ended before message_stop');
+        } else {
+          const response = await this.anthropic.messages.create(params, { signal: controller.signal });
+          for (const block of response.content) if (block.type === 'text') emit(block.text);
+          tokensUsed = response.usage.input_tokens + response.usage.output_tokens;
+          if (response.stop_reason === 'max_tokens') finishReason = 'length';
         }
-      } else {
-        const response = await client.chat.completions.create(
-          {
-            model,
-            messages: [{ role: 'user', content: prompt }],
-            temperature: options.temperature,
-            stream: false,
-          },
-          { signal: controller.signal }
-        );
-
-        adaptedMarkdown = response.choices[0]?.message?.content || '';
-        tokensUsed = response.usage?.total_tokens || 0;
-        const rawFinish = response.choices[0]?.finish_reason;
-        if (rawFinish === 'length') finishReason = 'length';
-        else if (rawFinish && rawFinish !== 'stop') finishReason = 'stop';
-      }
+      } else if (protocol === 'openai-responses') {
+        const params = { model, input: [{ role: 'user' as const, content: prompt }], max_output_tokens: maxTokens,
+          ...(reasoning ? { reasoning: { effort } } : { temperature: options.temperature }) };
+        if (wantStreaming) {
+          let complete = false;
+          const stream = await this.getClient().responses.create({ ...params, stream: true }, { signal: controller.signal });
+          for await (const event of stream) {
+            if (event.type === 'response.output_text.delta') emit(event.delta);
+            if (event.type === 'response.completed' || event.type === 'response.incomplete') {
+              complete = true;
+              tokensUsed = event.response.usage?.total_tokens ?? 0;
+              if (event.response.incomplete_details?.reason === 'max_output_tokens') finishReason = 'length';
+            }
+            if (event.type === 'response.failed') throw new Error(event.response.error?.message ?? 'Responses request failed');
+          }
+          if (!complete) throw new Error('Responses stream ended before a terminal event');
+        } else {
+          const response = await this.getClient().responses.create({ ...params, stream: false }, { signal: controller.signal });
+          emit(response.output_text); tokensUsed = response.usage?.total_tokens ?? 0;
+          if (response.status === 'failed') throw new Error(response.error?.message ?? 'Responses request failed');
+          if (response.incomplete_details?.reason === 'max_output_tokens') finishReason = 'length';
+        }
+      } else if (protocol === 'openai-completions') {
+        const params = { model, messages: [{ role: 'user' as const, content: prompt }],
+          ...(reasoning ? { reasoning_effort: effort, max_completion_tokens: maxTokens } : { temperature: options.temperature, max_tokens: maxTokens }) };
+        if (wantStreaming) {
+          let complete = false;
+          const stream = await this.getClient().chat.completions.create({ ...params, stream: true, stream_options: { include_usage: true } }, { signal: controller.signal });
+          for await (const chunk of stream) {
+            emit(chunk.choices[0]?.delta?.content ?? '');
+            if (chunk.choices[0]?.finish_reason) complete = true;
+            if (chunk.choices[0]?.finish_reason === 'length') finishReason = 'length';
+            if (chunk.usage) tokensUsed = chunk.usage.total_tokens;
+          }
+          if (!complete) throw new Error('Chat stream ended before finish_reason');
+        } else {
+          const response = await this.getClient().chat.completions.create({ ...params, stream: false }, { signal: controller.signal });
+          emit(response.choices[0]?.message?.content ?? ''); tokensUsed = response.usage?.total_tokens ?? 0;
+          if (response.choices[0]?.finish_reason === 'length') finishReason = 'length';
+        }
+      } else throw new Error('Unsupported provider protocol');
 
       return {
         adaptedMarkdown,
@@ -157,7 +167,8 @@ export class DirectChannel implements ContentBackend {
           'timeout'
         );
       }
-      const message = error instanceof Error ? error.message : String(error);
+      const rawMessage = error instanceof Error ? error.message : String(error);
+      const message = this.llm.apiKey ? rawMessage.split(this.llm.apiKey).join('***') : rawMessage;
       return this.buildErrorOutput(
         `DirectChannel: SDK call failed - ${message}`,
         startedAt,
@@ -200,6 +211,7 @@ export class DirectChannel implements ContentBackend {
     this.client = new OpenAI({
       apiKey: this.llm.apiKey,
       baseURL: this.llm.openAiCompatBaseUrl,
+      maxRetries: 0,
     });
     this.cachedKey = this.llm.apiKey;
     this.cachedBaseUrl = this.llm.openAiCompatBaseUrl;

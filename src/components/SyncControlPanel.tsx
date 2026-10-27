@@ -31,13 +31,7 @@ export function SyncControlPanel({
 
   return (
     <Card variant="elevated">
-      <CardBody className="space-y-5">
-        {/*
-          同步操作面板内部布局重构（2026-06-19）：
-          - space-y-3→space-y-5：标题/toggles/action 三组之间 20px 节奏
-          - 内部 toggle 行保持 gap-2.5
-          - action 行 pt-1→pt-2 + 加 mt-1，与上方内容拉开
-        */}
+      <CardBody className="space-y-3">
         <div className="flex items-center justify-between">
           <div>
             <h3 className="text-base font-kai font-medium text-ink">同步到本地</h3>

@@ -10,6 +10,7 @@ import { LocalMapStore } from '../src/modules/local-map-store.js';
 import { KbBuildService } from '../src/kb/kb-build-service.js';
 import { StandardKbStore } from '../src/kb/standard-kb-store.js';
 import { KbVersionStore } from '../src/kb/kb-version-store.js';
+import { planSourceBatch, executeSourceBatch } from '../src/modules/source-batch.js';
 import { lineDiff } from '../src/kb/line-diff.js';
 import { hasEditorialHistory, hasSourceMetadata } from '../src/kb/body-policy.js';
 import { AgentToolService, type BuildRunState } from '../src/agent/agent-tool-service.js';
@@ -339,4 +340,16 @@ describe('手动删源与标准库更新闭环', () => {
     expect((await f.build()).status).toBe('published'); expect(f.published().readManifest()!.docs).toEqual([]);
     expect((await f.call('/api/kb/sources/tree')).data.total).toBe(0);
   });
+});
+
+
+it('批量删除预览列出具体受影响标准文档，执行后通过按变更更新收敛正文', async () => {
+  const f = await fixture(); await f.build('full');
+  const config = f.configManager.getConfig()!;
+  const request = { root: f.raw, tokens: ['b'], action: 'delete' as const, includeDescendants: false, deleteFiles: true, block: false };
+  const plan = planSourceBatch(f.store, config, request);
+  expect(plan.preview.affectedStandardDocs).toEqual(f.published().readManifest()!.docs.map(({docId,title}) => ({docId,title})));
+  executeSourceBatch(f.store, config, request, plan.preview.revision);
+  expect((await f.build()).status).toBe('published'); const manifest = f.published().readManifest()!;
+  expect(f.published().readReleaseDoc(manifest.releaseId, manifest.docs[0]).markdown).not.toContain('规则B');
 });

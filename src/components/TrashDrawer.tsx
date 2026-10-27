@@ -134,7 +134,7 @@ export function TrashDrawer({ open, onClose, onChanged }: TrashDrawerProps) {
       title="回收站"
       subtitle={endpointMissing ? '后端端点缺失 · 仅展示' : `${items.length} 项软删除文档`}
       footer={
-        <div className="flex items-center justify-between">
+        <div className="flex flex-wrap items-center justify-between gap-2">
           <span className="text-xs text-ink-faint font-sans-ui">
             恢复 = 移回原路径 · 清理 = 永久删除
           </span>

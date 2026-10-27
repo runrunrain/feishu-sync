@@ -99,9 +99,9 @@ describe('resolveActiveLlmConfig', () => {
     expect(resolved.directModel).toBe('enabled-direct');
   });
 
-  it('retains legacy fields when no provider profile exists', () => {
-    const config = baseConfig({ providers: [] });
-    expect(resolveActiveLlmConfig(config)).toEqual(config);
+  it('clears stale legacy credentials when the provider list is explicitly empty', () => {
+    expect(resolveActiveLlmConfig(baseConfig({ providers: [] }))).toMatchObject({ apiKey: '', model: '', openAiCompatBaseUrl: '' });
+    const flat = baseConfig(); expect(resolveActiveLlmConfig(flat)).toEqual(flat);
   });
 
   it('uses GLM canonical model IDs instead of an old capacity display suffix', () => {

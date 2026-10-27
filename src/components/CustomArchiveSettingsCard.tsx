@@ -188,10 +188,10 @@ export function CustomArchiveSettingsCard() {
   return (
     <Card>
       <CardHeader>
-        <div className="flex items-center gap-2.5">
+        <div className="flex flex-wrap items-center gap-2">
           <FolderArchive className="w-4 h-4 text-seal" />
-          <h2 className="text-base font-kai font-medium text-ink">自定义归档</h2>
-          <span className="text-xs text-ink-faint font-sans-ui">
+          <h2 className="text-base font-kai font-medium text-ink whitespace-nowrap">自定义归档</h2>
+          <span className="w-full text-xs text-ink-faint font-sans-ui">
             零散云文档与分类文件夹管理；删除/移出均保留本地文件
           </span>
         </div>
@@ -199,7 +199,7 @@ export function CustomArchiveSettingsCard() {
       <CardBody className="space-y-4">
         {/* 新建文件夹 */}
         <div className="flex items-center gap-2">
-          <div className="relative flex-1 flex items-center">
+          <div className="relative min-w-0 flex-1 flex items-center">
             <FolderPlus className="absolute left-3 w-3.5 h-3.5 text-ink-faint pointer-events-none" />
             <input
               type="text"

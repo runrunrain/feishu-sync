@@ -64,6 +64,11 @@ export class MappingService {
     private configManager?: ConfigManager,
   ) {}
 
+  private blockedTokens(): Set<string> {
+    const root = this.configManager?.getConfig()?.knowledgeBaseRoot ?? '';
+    return new Set(this.localMapStore.listSyncBlockedSources?.(root).map((row) => row.objToken) ?? []);
+  }
+
   /**
    * Compute a full DiffReport for a wiki subtree (03 §3.6.2).
    *
@@ -125,6 +130,7 @@ export class MappingService {
    * read-only and completes in constant local-DB time.
    */
   getStoredDiff(rootUrl: string): DiffReport {
+    const blocked = this.blockedTokens();
     const rootToken = this.rootTokenFromUrl(rootUrl);
     const documents = this.localMapStore.getAllDocuments()
       .filter((document) =>
@@ -153,7 +159,7 @@ export class MappingService {
       // POST /api/trash/bulk-process 处理；已确认软删的行归回收站面板
       // （GET /api/trash）管理。否则移入回收站后条目会回灌变更列表，
       // 永远清不掉（2026-09 变更列表删除项修复）。
-      if (document.cloudDeleted === 1) continue;
+      if (document.cloudDeleted === 1 || blocked.has(document.objToken)) continue;
 
       if (document.lastSeenAt && document.lastSeenAt > checkedAt) {
         checkedAt = document.lastSeenAt;
@@ -181,7 +187,7 @@ export class MappingService {
       }
     }
 
-    const liveCount = documents.filter((document) => document.cloudDeleted !== 1).length;
+    const liveCount = documents.filter((document) => document.cloudDeleted !== 1 && !blocked.has(document.objToken)).length;
 
     // Custom-folder archive docs are not scoped to any watched root. They
     // are read globally and appended to the modified bucket (only
@@ -266,8 +272,9 @@ export class MappingService {
    */
   private getCustomFolderModifiedDocs(): ChangedDocument[] {
     const docs = this.localMapStore.listAllCustomFolderDocs();
+    const blocked = this.blockedTokens();
     return docs
-      .filter((doc) => doc.syncState === 'pending_modified')
+      .filter((doc) => doc.syncState === 'pending_modified' && !blocked.has(doc.objToken))
       .map((doc) => this.toCustomChangedDocument(doc));
   }
 
@@ -404,6 +411,7 @@ export class MappingService {
    */
   getTree(): MappingNode[] {
     reconcileLocalIndex(this.localMapStore, this.configManager?.getConfig()?.knowledgeBaseRoot ?? '', () => this.snapshotService.generate());
+    const blocked = this.blockedTokens();
     const documents = this.localMapStore.getAllDocuments();
     // Cloud-view projection: cloud_deleted rows go to the trash-bin UI, and
     // custom-folder archive docs (custom_folder_id set) are rendered by the
@@ -421,7 +429,7 @@ export class MappingService {
       if (d.parentNodeToken) parentSet.add(d.parentNodeToken);
     }
 
-    return live.map((d) => this.projectNode(d, parentSet));
+    return live.map((d) => this.projectNode(d, parentSet, blocked.has(d.objToken)));
   }
 
   /**
@@ -453,6 +461,7 @@ export class MappingService {
    */
   getTreeDetailed(options: { view: 'feishu' | 'local'; includeOrphans?: boolean } = { view: 'feishu' }): TreeResponse {
     reconcileLocalIndex(this.localMapStore, this.configManager?.getConfig()?.knowledgeBaseRoot ?? '', () => this.snapshotService.generate());
+    const blocked = this.blockedTokens();
     const view = options.view === 'local' ? 'local' : 'feishu';
     const includeOrphans = options.includeOrphans ?? (view === 'local');
 
@@ -494,7 +503,7 @@ export class MappingService {
             d.customFolderId == null,
         )
         .map((d) => {
-          const node = this.projectNode(d, parentSet);
+          const node = this.projectNode(d, parentSet, blocked.has(d.objToken));
           if (!(d.title ?? '').trim()) {
             const state = d.syncState ?? d.status;
             if (state === 'restricted' || d.cloudMatch === 'restricted' || d.status === 'placeholder') {
@@ -514,7 +523,7 @@ export class MappingService {
         });
     } else {
       // Local view: all rows (including local-only README/index).
-      nodes = live.map((d) => this.projectNode(d, parentSet));
+      nodes = live.map((d) => this.projectNode(d, parentSet, blocked.has(d.objToken)));
     }
 
     // watched_roots envelope (always present).
@@ -567,7 +576,7 @@ export class MappingService {
    * watched_root_url to the projection so the frontend can group
    * top-level entries.
    */
-  private projectNode(d: any, parentSet: Set<string>): MappingNode {
+  private projectNode(d: any, parentSet: Set<string>, blocked = false): MappingNode {
     const wikiNodeToken = d.wikiNodeToken ?? null;
     const hasChild = wikiNodeToken != null && parentSet.has(wikiNodeToken);
     return {
@@ -577,6 +586,8 @@ export class MappingService {
       obj_type: d.objType ?? 'unknown',
       title: d.title,
       local_path: d.localMdPath,
+      sync_state: d.syncState,
+      sync_blocked: blocked,
       parent_node_token: d.parentNodeToken ?? null,
       has_child: hasChild,
       obj_edit_time: d.objEditTime ?? null,
@@ -632,12 +643,17 @@ export class MappingService {
 
     // Cross-parent defense: verify every token's stored parent matches.
     const mismatches: string[] = [];
+    let orderRoot: string | null | undefined;
+    if (new Set(req.ordered_obj_tokens).size !== req.ordered_obj_tokens.length) throw new MappingValidationError('排序清单不能重复');
     for (const tok of req.ordered_obj_tokens) {
       const row = this.localMapStore.getDocumentByObjToken(tok);
       if (!row) {
         mismatches.push(tok);
         continue;
       }
+      const group = row.watchedRootId || row.watchedRootUrl || null;
+      if (orderRoot === undefined) orderRoot = group;
+      if (orderRoot !== group) mismatches.push(tok);
       const storedParent = row.parentNodeToken ?? null;
       const requestParent = req.parent_node_token ?? null;
       if (storedParent !== requestParent) {

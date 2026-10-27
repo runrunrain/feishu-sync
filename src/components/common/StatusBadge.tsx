@@ -46,7 +46,7 @@ export function StatusBadge({
   };
 
   // sans-ui per 04 §6.2: clearer at small sizes than serif.
-  const baseClasses = `inline-flex items-center rounded-md font-sans-ui border ${sizeClasses[size]}`;
+  const baseClasses = `inline-flex shrink-0 items-center whitespace-nowrap rounded-md font-sans-ui border ${sizeClasses[size]}`;
 
   const statusClasses: Record<BadgeStatus, string> = {
     success: 'bg-jade/10 text-jade border-jade/20',
@@ -81,7 +81,7 @@ export function StatusBadge({
   return (
     <span className={`${baseClasses} ${statusClasses[status]} ${className}`}>
       {!hideDot && (
-        <span className={`rounded-sm ${dotSize[size]} ${dotColor[status]}`} />
+        <span className={`shrink-0 rounded-sm ${dotSize[size]} ${dotColor[status]}`} />
       )}
       {children}
     </span>

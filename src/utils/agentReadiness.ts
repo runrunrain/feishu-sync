@@ -66,7 +66,7 @@ export function describeReadinessCode(code: ReadinessCode, status?: AgentStatusD
         action:
           model?.source === 'pi-agent-dir'
             ? '在设置中选择 provider/model 格式的 pi 模型'
-            : '前往「模型与整理」配置提供商，或在 Agent 设置中选择模型来源',
+            : '前往「服务提供商与模型」配置提供商，或在 Agent 设置中选择模型来源',
         jumpSettings: true,
         recheck: true,
       };
@@ -76,7 +76,7 @@ export function describeReadinessCode(code: ReadinessCode, status?: AgentStatusD
         action:
           model?.source === 'pi-agent-dir'
             ? '本机 pi 凭据缺失或未登录对应模型；请在本机 pi 中配置'
-            : '提供商 API Key 缺失或无效；前往「模型与整理」补全',
+            : '提供商 API Key 缺失或无效；前往「服务提供商与模型」补全',
         jumpSettings: true,
         recheck: true,
       };

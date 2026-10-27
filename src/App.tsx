@@ -62,7 +62,7 @@ function AppShell() {
       */}
       <main className="flex-1 min-h-0 overflow-auto scrollbar-thin flex flex-col">
         <div
-          className={`flex-1 min-h-0 flex flex-col px-4 py-3 sm:px-6 lg:px-8 ${
+          className={`flex-1 min-h-0 flex flex-col px-3 py-3 sm:px-4 lg:px-5 ${
             currentArea === 'settings' ? 'mx-auto max-w-[1440px] w-full' : 'w-full'
           }`}
         >

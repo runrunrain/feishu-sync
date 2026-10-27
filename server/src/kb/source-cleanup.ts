@@ -7,15 +7,14 @@ import { ToolError } from '../agent/agent-tool-service.js';
 import { localPathState } from '../modules/local-path-state.js';
 import { ScanPolicy } from '../modules/scan-policy.js';
 import type { LocalMapStore } from '../modules/local-map-store.js';
-import { collectSourceCandidates } from './raw-source-snapshot.js';
 import { managedWorkbookCompanions } from '../modules/workbook-source.js';
 
-export function cleanupSources(store: LocalMapStore, root: string, sources: Array<{ objToken: string; relPath: string }>) {
+export function prepareSourceCleanup(store: LocalMapStore, root: string, sources: Array<{ objToken: string; relPath: string }>, options: { allowMissing?: boolean; commit?: () => void } = {}) {
   const rootReal = resolveRootReal(root);
-  const records = new Map(collectSourceCandidates(store.getAllDocuments()).map((doc) => [doc.objToken, doc]));
+  const records = new Map(store.getAllDocuments().filter((doc) => doc.localRelPath || doc.localMdPath).map((doc) => [doc.objToken, doc]));
   const selected = [...new Map(sources.map((source) => [source.objToken, source])).values()].map((source) => {
     const record = records.get(source.objToken);
-    if (!record || record.cloudDeleted || record.localRelPath !== source.relPath) throw new ToolError('source_selection_changed', '源文档已变化，请刷新后重新选择', 409);
+    if (!record || record.cloudDeleted || (record.localRelPath || record.localMdPath) !== source.relPath) throw new ToolError('source_selection_changed', '源文档已变化，请刷新后重新选择', 409);
     return record;
   });
   const files = new Map<string, string>();
@@ -38,9 +37,10 @@ export function cleanupSources(store: LocalMapStore, root: string, sources: Arra
     files.set(abs, path.relative(rootReal, abs));
   };
   for (const doc of selected) {
-    addFile(doc.localRelPath!);
+    const md = doc.localRelPath || doc.localMdPath;
+    addFile(md, options.allowMissing);
     if (doc.objType === 'sheet') {
-      const mdPath = resolveInside(rootReal, doc.localRelPath!, 'read');
+      const mdPath = path.resolve(rootReal, relativePath(md));
       for (const companion of managedWorkbookCompanions(mdPath)) addFile(companion, true);
     }
     for (const sheet of store.getSheetSheets(doc.objToken)) addFile(sheet.local_csv_path, true);
@@ -48,9 +48,9 @@ export function cleanupSources(store: LocalMapStore, root: string, sources: Arra
   const selectedTokens = new Set(selected.map((doc) => doc.objToken));
   for (const doc of records.values()) {
     if (selectedTokens.has(doc.objToken)) continue;
-    const references = [doc.localRelPath!];
+    const references = [doc.localRelPath || doc.localMdPath];
     if (doc.objType === 'sheet') {
-      try { references.push(...managedWorkbookCompanions(resolveInside(rootReal, doc.localRelPath!, 'read'))); }
+      try { references.push(...managedWorkbookCompanions(resolveInside(rootReal, relativePath(doc.localRelPath || doc.localMdPath), 'read'))); }
       catch { /* A missing unselected source cannot share a live file. */ }
     }
     if (doc.objType === 'sheet' || doc.objType === 'bitable') references.push(...store.getSheetSheets(doc.objToken).map((sheet) => sheet.local_csv_path));
@@ -60,6 +60,11 @@ export function cleanupSources(store: LocalMapStore, root: string, sources: Arra
       if (files.has(resolved)) throw new ToolError('source_path_shared', '部分文件仍被未选中的文档共用，请先修复重复路径映射', 409);
     }
   }
+  return { rootReal, selected, files };
+}
+
+export function cleanupSources(store: LocalMapStore, root: string, sources: Array<{ objToken: string; relPath: string }>, options: { allowMissing?: boolean; commit?: () => void } = {}) {
+  const { rootReal, selected, files } = prepareSourceCleanup(store, root, sources, options);
   const id = `sources-${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
   const trash = resolveInside(rootReal, `.trash-bin/${id}`, 'mkdir');
   // 保存恢复依据；回收目录中的文档仍有同步头，可移回原位后重建索引。
@@ -73,7 +78,7 @@ export function cleanupSources(store: LocalMapStore, root: string, sources: Arra
       const to = resolveInside(trash, `files/${relative}`, 'write');
       fs.renameSync(from, to); moved.push({ from, to });
     }
-    store.deleteDocumentsByTokens(selected.map((doc) => doc.objToken));
+    if (options.commit) options.commit(); else store.deleteDocumentsByTokens(selected.map((doc) => doc.objToken));
   } catch (error) {
     const failures: string[] = [];
     for (const file of moved.reverse()) { try { fs.renameSync(file.to, file.from); } catch { failures.push(file.from); } }

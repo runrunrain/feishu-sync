@@ -98,6 +98,14 @@ it('真实Pi插件快照进入system；运行中编辑不改变当前任务，�
     expect(systems(2)).not.toContain('PLUGIN_CONTEXT_');
     expect(await complete('第四轮', 5)).toBe(thirdId);
     expect(JSON.stringify(requests[4].messages)).toContain('NATIVE_TOOL_RESULT:NATIVE_TOOL_PAYLOAD');
+    config.llm.providers![0].models[0].openAiModel = 'fixture-next';
+    config.llm.providers![0].models[0].maxTokens = 128;
+    const changedModelId = await complete('使用新模型预设', 6);
+    expect(changedModelId).not.toBe(thirdId);
+    expect(requests[5].model).toBe('fixture-next');
+    expect(requests[5].max_completion_tokens ?? requests[5].max_tokens).toBe(128);
+    expect(await complete('相同配置继续', 7)).toBe(changedModelId);
+
     const allowed = requests[0].tools.map((tool: any) => tool.function.name);
     expect(allowed).toEqual(expect.arrayContaining(['kb_search', 'kb_read', 'raw_search', 'raw_read']));
     expect(allowed).toContain('plugin_echo');

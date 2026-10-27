@@ -1,3 +1,4 @@
+import { resolveProviderModel } from '../modules/model-selection.js';
 /**
  * PiRuntimeResolver — 外部 Node / pi 运行时发现与就绪诊断（设计 §3）
  *
@@ -346,7 +347,7 @@ export class PiRuntimeResolver {
     const credentials = input.agentConfig.model.source === 'pi-agent-dir' ? ['models.json', 'auth.json'].map((name) => {
       try { const stat = fs.statSync(path.join(home, name)); return [name, stat.mtimeMs, stat.size]; } catch { return [name, null]; }
     }) : [];
-    const key = crypto.createHash('sha256').update(JSON.stringify({ runtime: input.agentConfig.runtime, model: input.agentConfig.model,
+    const key = crypto.createHash('sha256').update(JSON.stringify({ runtime: input.agentConfig.runtime, model: { ...input.agentConfig.model, thinkingLevel: undefined },
       llm: input.agentConfig.model.source === 'app-llm' ? input.llmConfig : null, home, credentials, probing: Boolean(modelProbe) })).digest('hex');
     const withCounts = (value: ReadinessResult): ReadinessResult => ({ ...value, processes: { running: input.runningProcesses, max: input.agentConfig.maxConcurrentProcesses } });
     const pending = this.probes.get(key);
@@ -557,14 +558,7 @@ export class PiRuntimeResolver {
   }
 }
 
-export interface AppLlmModelResolution {
-  providerId: string;
-  providerName: string;
-  presetId: string;
-  openAiModel: string;
-  baseUrl: string;
-  apiKey: string;
-}
+export type AppLlmModelResolution = import('../modules/model-selection.js').ResolvedProviderModel;
 
 /**
  * 解析 app-llm 目标模型：显式 providerId/modelId 优先，缺省回落
@@ -574,27 +568,7 @@ export function resolveAppLlmModel(
   llm: LlmConfig,
   agent: AgentConfig,
 ): AppLlmModelResolution | null {
-  const providers = Array.isArray(llm.providers) ? llm.providers : [];
-  const wantedProviderId = agent.model.providerId?.trim() || llm.activeProviderId || '';
-  const provider = providers.find(
-    (candidate) => candidate.id === wantedProviderId && candidate.enabled,
-  ) ?? providers.find((candidate) => candidate.enabled);
-  if (!provider) return null;
-  const wantedModelId = agent.model.modelId?.trim() || llm.activeModelId || '';
-  const preset = provider.models.find(
-    (candidate) => candidate.id === wantedModelId && candidate.enabled,
-  ) ?? provider.models.find((candidate) => candidate.id === provider.defaultModelId && candidate.enabled)
-    ?? provider.models.find((candidate) => candidate.enabled)
-    ?? provider.models[0];
-  if (!preset) return null;
-  return {
-    providerId: provider.id,
-    providerName: provider.name,
-    presetId: preset.id,
-    openAiModel: preset.openAiModel,
-    baseUrl: provider.openAiCompatBaseUrl || llm.openAiCompatBaseUrl,
-    apiKey: provider.apiKey || llm.apiKey,
-  };
+  return resolveProviderModel(llm, agent.model);
 }
 
 export function readinessCodeOf(status: ReadinessResult): ReadinessCode {

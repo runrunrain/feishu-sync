@@ -2,7 +2,7 @@
  * ContentBackendRegistry - 通道注册表（v0.2.9 起：direct 单通道）
  *
  * v0.2.9 清理：claude-cli 与 opencode 两个本地无头 CLI 通道整体移除，
- * 文档整理只保留 DirectChannel（OpenAI 兼容远程端点）。registry 维持
+ * 文档整理保留 DirectChannel 入口，按共享提供商协议调用原生SDK。registry 维持
  * ContentAdapter 的既有调用形态（get()/getFallback()），但：
  *   - 只注册 direct 一个通道，primaryName 恒为 'direct'
  *   - getFallback() 恒为 null（无第二通道可回退；整理失败由
@@ -16,7 +16,7 @@ export class ContentBackendRegistry {
   private readonly channels = new Map<ChannelName, ContentBackend>();
 
   constructor(config: ChannelConfig) {
-    this.register(new DirectChannel(config.llm));
+    this.register(new DirectChannel(config.llm, config.selection));
   }
 
   /**

@@ -10,7 +10,7 @@
  * hook 内部暂停轮询与订阅。
  */
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   Hammer,
   PanelRightClose,
@@ -25,7 +25,7 @@ import { MessageStream } from '../components/agent/MessageStream';
 import { AgentComposer } from '../components/agent/AgentComposer';
 import { AgentModePanel } from '../components/agent/AgentModePanel';
 import { useToast } from '../components/common/Toast';
-import { useAgentStatus } from '../hooks/useAgentStatus';
+import { useSessionAgentStatus } from '../hooks/useSessionAgentStatus';
 import { useAgentSessions } from '../hooks/useAgentSessions';
 import { describeReadinessCode as describeReadiness } from '../utils/agentReadiness';
 
@@ -36,11 +36,12 @@ interface AgentViewProps {
 
 export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
   const toast = useToast();
-  const agent = useAgentStatus(active);
   const sessions = useAgentSessions(active);
-  const [panelOpen, setPanelOpen] = useState(true);
+  const [panelOpen, setPanelOpen] = useState(() => window.innerWidth >= 1280);
+  useEffect(() => { const resize = () => { if (window.innerWidth < 1280) setPanelOpen(false); }; resize(); window.addEventListener('resize', resize); return () => window.removeEventListener('resize', resize); }, []);
 
   const session = sessions.activeSession;
+  const agent = useSessionAgentStatus(session, active);
   const readiness = agent.status ? describeReadiness(agent.status.code, agent.status) : null;
   const isWork = session?.mode === 'work';
   const running = session?.state === 'streaming' || session?.state === 'starting';
@@ -56,11 +57,11 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
 
   return (
     <div
-      className={`h-full min-h-0 grid gap-3 ${panelOpen ? 'grid-cols-[minmax(200px,240px)_minmax(0,1fr)_280px]' : 'grid-cols-[minmax(200px,240px)_minmax(0,1fr)]'}`}
+      className={`relative h-full min-h-0 min-w-0 grid grid-cols-1 gap-3 lg:grid-cols-[200px_minmax(0,1fr)] ${panelOpen ? 'xl:grid-cols-[200px_minmax(0,1fr)_280px]' : ''}`}
       data-view="agent"
     >
       {/* 左：会话列表 */}
-      <div className="min-h-0 rounded-md border border-line bg-card-bg shadow-sm overflow-hidden">
+      <div className="hidden lg:block min-h-0 rounded-md border border-line bg-card-bg shadow-sm overflow-hidden">
         <SessionListPanel
           sessions={sessions.sessions}
           loading={sessions.sessionsLoading}
@@ -75,7 +76,7 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
       {/* 中：消息流 + 输入 */}
       <div className="min-h-0 rounded-md border border-line bg-card-bg shadow-sm flex flex-col overflow-hidden">
         {/* 会话头：标题 + 模式 + 连接状态 */}
-        <header className="shrink-0 px-4 py-2.5 border-b border-line/60 flex items-center gap-2.5">
+        <header className="shrink-0 px-4 py-2.5 border-b border-line/60 flex items-center gap-1.5 sm:gap-2.5">
           <div className="min-w-0 flex-1">
             <h2 className="text-sm font-kai font-medium text-ink truncate">
               {session?.title ?? '未选择会话'}
@@ -96,6 +97,11 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
             </span>
           ) : null}
 
+          <div className="flex items-center gap-1 lg:hidden">
+            <select aria-label="选择会话" className="max-w-[90px] rounded border border-line bg-card-bg px-1 py-1 text-[11px] text-ink-soft" value={sessions.activeId ?? ''} onChange={(e) => sessions.selecting(e.target.value)}>
+              <option value="" disabled>选择会话</option>{sessions.sessions.map((s) => <option key={s.id} value={s.id}>{s.title}</option>)}
+            </select><button className="px-1 text-xs text-seal" onClick={() => void sessions.createSession()} aria-label="新建会话">新建</button>
+          </div>
           {/* SSE 连接指示 */}
           {session ? (
             sessions.sseStatus === 'open' ? (
@@ -108,7 +114,7 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
                 title="连接中断，正在自动重连（保留已接收内容）"
                 data-testid="sse-reconnecting"
               >
-                <RefreshCw className="w-3.5 h-3.5 animate-spin" /> 连接中断，正在重连
+                <RefreshCw className="w-3.5 h-3.5 animate-spin" /><span className="sm:hidden">重连中</span><span className="hidden sm:inline">连接中断，正在重连</span>
               </span>
             ) : sessions.sseStatus === 'closed' ? (
               <span className="shrink-0 inline-flex items-center gap-1 text-[11px] text-ink-faint" title="事件流未连接">
@@ -174,12 +180,14 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
           onRecheck={() => void agent.recheck()}
           rechecking={agent.rechecking}
           onJumpSettings={onJumpToSettings}
+          onModelChanged={sessions.refreshSessions}
         />
       </div>
 
       {/* 右：模式与权限（可折叠） */}
       {panelOpen ? (
-        <div className="min-h-0 rounded-md border border-line bg-card-bg shadow-sm overflow-hidden">
+        <div className="absolute z-40 top-0 bottom-0 right-0 w-[min(280px,90%)] xl:static xl:w-auto min-h-0 rounded-md border border-line bg-card-bg shadow-xl overflow-hidden">
+          <button className="absolute top-2 right-2 text-xs text-seal xl:hidden" aria-label="关闭模式面板" onClick={() => setPanelOpen(false)}>关闭</button>
           <AgentModePanel
             session={session}
             busy={running}

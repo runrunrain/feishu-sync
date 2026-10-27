@@ -316,7 +316,7 @@ describe('checkReadiness 就绪码（fixture）', () => {
 });
 
 describe('resolveAppLlmModel', () => {
-  it('显式 providerId/modelId 优先，缺省回落 active*，key 回落根 apiKey', () => {
+  it('显式 providerId/modelId 优先，缺省回落 active*', () => {
     const llm = buildDefaultLlmConfigForTest();
     const agent = buildDefaultAgentConfig(fixtureRoot);
     const resolved = resolveAppLlmModel(llm, agent);
@@ -329,6 +329,16 @@ describe('resolveAppLlmModel', () => {
     agentExplicit.model.modelId = 'm2';
     const second = resolveAppLlmModel(llm, agentExplicit);
     expect(second?.openAiModel).toBe('glm-4.6');
+  });
+  it('never borrows another provider key or silently replaces disabled/missing explicit selections', () => {
+    const llm = buildDefaultLlmConfigForTest(); const agent = buildDefaultAgentConfig(fixtureRoot);
+    llm.apiKey = 'unrelated-key'; llm.providers![0].apiKey = '';
+    expect(resolveAppLlmModel(llm, agent)?.apiKey).toBe('');
+    agent.model.providerId = 'missing'; expect(resolveAppLlmModel(llm, agent)).toBeNull();
+    agent.model.providerId = llm.providers![0].id; agent.model.modelId = 'missing';
+    expect(resolveAppLlmModel(llm, agent)).toBeNull();
+    agent.model.modelId = ''; llm.providers![0].models.forEach((model) => { model.enabled = false; });
+    expect(resolveAppLlmModel(llm, agent)).toBeNull();
   });
 });
 

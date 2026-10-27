@@ -281,7 +281,7 @@ export function WatchedRootsCard() {
   return (
     <Card variant="elevated">
       <CardHeader>
-        <div className="flex items-center gap-2.5">
+        <div className="flex flex-wrap items-center gap-2">
           <Database className="w-4 h-4 text-seal" />
           <h2 className="text-base font-kai font-medium text-ink">同步根目录</h2>
           <span className="ml-auto text-xs text-ink-faint font-sans-ui">
@@ -297,10 +297,10 @@ export function WatchedRootsCard() {
         </p>
 
         {/* 子页侧边栏模式：左根目录列表（动态增删）+ 右选中项编辑器 */}
-        <div className="flex gap-4">
+        <div className="flex flex-col gap-3 xl:flex-row">
           {/* Left: root list sidebar */}
           <aside
-            className="flex w-52 shrink-0 flex-col rounded-md border border-line bg-paper-2/60 p-2"
+            className="flex w-full shrink-0 self-start flex-col xl:w-44 rounded-md border border-line bg-paper-2/60 p-2"
             aria-label="同步根目录列表"
           >
             <div className="flex items-center justify-between px-2 py-1.5 text-xs font-medium text-ink-faint">

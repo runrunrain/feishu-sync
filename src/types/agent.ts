@@ -199,7 +199,10 @@ export interface KbMcpInfoDto {
 export type AgentSessionMode = 'discuss' | 'work';
 export type AgentSessionState = 'idle' | 'starting' | 'streaming' | 'error';
 
+export type SessionModelConfig = Pick<AgentConfig['model'], 'source' | 'providerId' | 'modelId' | 'piModel' | 'thinkingLevel'>;
+
 export interface AgentSessionDto {
+  model?: SessionModelConfig | null;
   id: string;
   title: string;
   mode: AgentSessionMode;

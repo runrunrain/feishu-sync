@@ -86,8 +86,8 @@ export const RETIRED_REQUEST_SCOPES: readonly string[] = ['docs:document:read'];
  * 计算知识库根目录的缺省建议值（2026-10 首次配置引导）。
  *
  * 规则（用户拍板）：Windows 且 D 盘存在 → `D:\飞书知识库`（国内同事机
- * 器惯例，数据盘独立于系统盘）；其余（含无 D 盘的 Windows / macOS /
- * Linux）→ `~/Documents/飞书知识库`。
+ * 器惯例，数据盘独立于系统盘）；无 D 盘 → `C:\飞书知识库`；macOS /
+ * Linux → `~/Documents/飞书知识库`。
  *
  * 仅计算不创建：预览端点直接返回；采用端点（adopt）才 mkdir + 落盘
  * 保存，避免「看一眼建议」就往用户磁盘写目录。
@@ -104,6 +104,7 @@ export function suggestKnowledgeRoot(
   if (platform === 'win32' && exists('D:\\')) {
     return 'D:\\飞书知识库';
   }
+  if (platform === 'win32') return 'C:\\飞书知识库';
   return join(homeDir, 'Documents', '飞书知识库');
 }
 
@@ -382,6 +383,14 @@ export function validateAgentAndKbConfig(value: {
   if (details.length > 0) throw new InvalidConfigError(details);
 }
 
+const LLM_PROTOCOLS = new Set(['openai-completions', 'openai-responses', 'anthropic-messages']);
+function validateLlmProtocols(llm: Partial<LlmConfig> | undefined): void {
+  if (!Array.isArray(llm?.providers)) return;
+  const details = llm.providers.flatMap((p, i) => p && p.protocol !== undefined && !LLM_PROTOCOLS.has(p.protocol)
+    ? [{ field: `llm.providers[${i}].protocol`, code: 'unsupported_protocol' }] : []);
+  if (details.length) throw new InvalidConfigError(details);
+}
+
 const CONFIG_ENTITY_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
 
 function stringValue(value: unknown, fallback = ''): string {
@@ -441,6 +450,7 @@ function makeLegacyProviderProfile(legacy: LegacyProviderProjection): LlmProvide
       legacy.apiKey,
     ),
     enabled: true,
+    protocol: 'openai-completions',
     apiKey: legacy.apiKey,
     openAiCompatBaseUrl: legacy.openAiCompatBaseUrl,
     defaultModelId: 'default',
@@ -455,7 +465,6 @@ function makeLegacyProviderProfile(legacy: LegacyProviderProjection): LlmProvide
 
 function normalizeModelPresets(
   value: unknown,
-  fallback: Pick<LlmModelPreset, 'openAiModel'>,
 ): LlmModelPreset[] {
   const rawPresets = Array.isArray(value) ? value : [];
   const usedIds = new Set<string>();
@@ -469,18 +478,13 @@ function normalizeModelPresets(
       id,
       name: stringValue(raw.name, `模型 ${index + 1}`) || `模型 ${index + 1}`,
       openAiModel: canonicalizeGlmModelAlias(raw.openAiModel),
+      ...(Number.isInteger(raw.contextWindow) && raw.contextWindow! >= 1024 ? { contextWindow: raw.contextWindow } : {}),
+      ...(Number.isInteger(raw.maxTokens) && raw.maxTokens! >= 1 ? { maxTokens: Math.min(raw.maxTokens!, Number.isInteger(raw.contextWindow) && raw.contextWindow! >= 1024 ? raw.contextWindow! : Number.MAX_SAFE_INTEGER) } : {}),
+      ...(typeof raw.reasoning === 'boolean' ? { reasoning: raw.reasoning } : {}),
       enabled: typeof raw.enabled === 'boolean' ? raw.enabled : true,
     });
   });
 
-  if (presets.length === 0) {
-    presets.push({
-      id: 'default',
-      name: '默认模型',
-      openAiModel: canonicalizeGlmModelAlias(fallback.openAiModel),
-      enabled: true,
-    });
-  }
   return presets;
 }
 
@@ -498,7 +502,7 @@ function normalizeProviderProfiles(
   // migrated. An explicitly empty array is preserved so a local-OpenCode-only
   // setup can opt out of remote profiles.
   if (!Array.isArray(value)) {
-    return [makeLegacyProviderProfile(legacy)];
+    return (legacy.model || legacy.directModel) ? [makeLegacyProviderProfile(legacy)] : [];
   }
 
   const usedIds = new Set<string>();
@@ -507,10 +511,7 @@ function normalizeProviderProfiles(
     if (!candidate || typeof candidate !== 'object') return;
     const raw = candidate as Partial<LlmProviderConfig>;
     const id = uniqueConfigId(raw.id, `provider-${index + 1}`, usedIds);
-    const models = normalizeModelPresets(raw.models, {
-      openAiModel: canonicalizeGlmModelAlias(legacy.directModel)
-        || canonicalizeGlmModelAlias(legacy.model),
-    });
+    const models = normalizeModelPresets(raw.models);
     const requestedDefault = stringValue(raw.defaultModelId);
     const defaultModel = models.find((model) => model.id === requestedDefault && model.enabled)
       ?? models.find((model) => model.enabled)
@@ -519,7 +520,8 @@ function normalizeProviderProfiles(
     providers.push({
       id,
       name: stringValue(raw.name, `提供商 ${index + 1}`) || `提供商 ${index + 1}`,
-      enabled: typeof raw.enabled === 'boolean' ? raw.enabled : true,
+      enabled: (typeof raw.enabled === 'boolean' ? raw.enabled : true) && (raw.protocol === undefined || LLM_PROTOCOLS.has(raw.protocol)),
+      protocol: LLM_PROTOCOLS.has(raw.protocol!) ? raw.protocol : 'openai-completions',
       apiKey: stringValue(raw.apiKey),
       openAiCompatBaseUrl: stringValue(raw.openAiCompatBaseUrl),
       defaultModelId: defaultModel?.id,
@@ -537,23 +539,10 @@ function normalizeProviderProfiles(
  * 的开箱约定）。
  */
 function buildDefaultLlmConfig(): LlmConfig {
-  const legacyProjection: LegacyProviderProjection = {
-    openAiCompatBaseUrl: DEFAULT_OPENAI_COMPAT_BASE_URL,
-    apiKey: '',
-    model: DEFAULT_DIRECT_MODEL,
-    directModel: DEFAULT_DIRECT_MODEL,
-  };
-  const defaultProvider = makeLegacyProviderProfile(legacyProjection);
-
   return {
-    openAiCompatBaseUrl: DEFAULT_OPENAI_COMPAT_BASE_URL,
-    apiKey: '',
-    model: DEFAULT_DIRECT_MODEL,
-    directModel: DEFAULT_DIRECT_MODEL,
-    temperature: 0.2,
-    providers: [defaultProvider],
-    activeProviderId: defaultProvider.id,
-    activeModelId: defaultProvider.defaultModelId,
+    openAiCompatBaseUrl: '', apiKey: '', model: '', directModel: '',
+    temperature: 0.2, providers: [],
+    activeProviderId: undefined, activeModelId: undefined,
     // 10-minute default. See LlmConfig.timeoutMs rationale in types/index.ts.
     timeoutMs: DEFAULT_LLM_TIMEOUT_MS,
     // Document body organisation is opt-in.
@@ -771,9 +760,35 @@ const API_KEY_PLAINTEXT_WARNING =
 export class ConfigManager {
   private configPath: string;
   private config: Config | null = null;
+  private loadFailed = false;
 
   constructor(configPath?: string) {
     this.configPath = configPath || DEFAULT_CONFIG_PATH;
+  }
+
+  /** Startup only: keep existing paths, and retry writable candidates for an unconfigured library. */
+  async initializeKnowledgeBase(options: {
+    candidates?: string[];
+    mkdir?: (root: string) => void;
+  } = {}): Promise<Config> {
+    const current = this.config ?? await this.load();
+    if (this.loadFailed) return current; // Never overwrite an unreadable existing configuration.
+    if (current.knowledgeBaseRoot.trim()) return current;
+    const candidates = options.candidates ?? (process.env.FEISHU_SYNC_HOME?.trim()
+      ? [path.join(resolveDataRoot(), '飞书知识库')]
+      : process.platform === 'win32'
+        ? [suggestKnowledgeRoot(), 'C:\\飞书知识库', path.join(os.homedir(), 'Documents', '飞书知识库')]
+        : [suggestKnowledgeRoot()]);
+    const mkdir = options.mkdir ?? ((root: string) => { fs.mkdirSync(root, { recursive: true }); });
+    for (const root of new Set(candidates)) {
+      try { mkdir(root); }
+      catch { continue; }
+      // Preserve updateConfig's workspace overlap checks. A save failure must not
+      // silently choose another location after successful directory creation.
+      return this.updateConfig({ knowledgeBaseRoot: root });
+    }
+    console.warn('[ConfigManager] 无法创建默认知识库目录，请在设置中指定可写目录');
+    return current;
   }
 
   /**
@@ -783,6 +798,7 @@ export class ConfigManager {
    * upgraded config (plus the security warning).
    */
   async load(): Promise<Config> {
+    this.loadFailed = false;
     try {
       const configDir = path.dirname(this.configPath);
       if (!fs.existsSync(configDir)) {
@@ -811,13 +827,14 @@ export class ConfigManager {
         }
       } else {
         // Fresh install: derive defaults from env and persist.
-        this.config = { ...DEFAULT_CONFIG };
+        this.config = structuredClone(DEFAULT_CONFIG);
         await this.save(this.config);
         console.info('[ConfigManager] Created default config');
       }
     } catch (error) {
       console.error('[ConfigManager] Failed to load config:', error);
-      this.config = { ...DEFAULT_CONFIG };
+      this.loadFailed = true;
+      this.config = structuredClone(DEFAULT_CONFIG);
     }
 
     return this.config!;
@@ -868,6 +885,7 @@ export class ConfigManager {
    * the existing config.
    */
   async updateLLMConfig(llm: Partial<LlmConfig>): Promise<void> {
+    validateLlmProtocols(llm);
     const currentConfig = await this.load();
     const updatedLlm = this.mergeLlmPartial(currentConfig.llm, llm);
     const updatedConfig: Config = {
@@ -891,6 +909,7 @@ export class ConfigManager {
     }
     // F1：agent/standardKb 段严格校验；workspaces 只走专用路由（防绕过路径校验）
     validateAgentAndKbConfig({ agent: partial.agent, standardKb: partial.standardKb });
+    validateLlmProtocols(partial.llm);
     const currentConfig = await this.load();
     const hasStructuredRoots = Object.prototype.hasOwnProperty.call(partial, 'watchedRoots');
     const hasLegacyUrls = Object.prototype.hasOwnProperty.call(partial, 'watchedRootUrls');
@@ -981,6 +1000,9 @@ export class ConfigManager {
         ? this.mergeProviderProfiles(current.providers, partial.providers)
         : current.providers,
     };
+    if (!hasProviders && !current.providers?.length && ['apiKey', 'model', 'directModel', 'openAiCompatBaseUrl'].some((key) => Object.prototype.hasOwnProperty.call(partial, key))) {
+      delete next.providers;
+    }
     if (Object.prototype.hasOwnProperty.call(partial, 'apiKey')) {
       const incoming = partial.apiKey;
       if (incoming === undefined || incoming === '***') {
@@ -1268,14 +1290,14 @@ export class ConfigManager {
     // deepseek `baseUrl` is carried over but the apiKey is a bigmodel
     // key, force the OpenAI-compat endpoint to bigmodel paas/v4.
     // Otherwise deepseek receives a bigmodel Bearer key and returns 401.
-    const openAiBaseUrl = reconcileOpenAiCompatBaseUrl(legacy.baseUrl, apiKey);
-    const model = reconcileModelAlias(legacy.model, apiKey);
+    const openAiBaseUrl = legacy.baseUrl ? reconcileOpenAiCompatBaseUrl(legacy.baseUrl, apiKey) : '';
+    const model = legacy.model ? reconcileModelAlias(legacy.model, apiKey) : '';
 
     return this.normalizeLlmConfig({
       openAiCompatBaseUrl: openAiBaseUrl,
       apiKey,
       model,
-      directModel: model || DEFAULT_DIRECT_MODEL,
+      directModel: model,
       temperature: typeof legacy.temperature === 'number' ? legacy.temperature : 0.2,
       // Legacy flat configs had no timeout field; surface the 10-min
       // default so the timeout config knob is usable immediately after
@@ -1300,10 +1322,11 @@ export class ConfigManager {
     // key but the host is deepseek/openai, substitute bigmodel paas/v4.
     const rawOpenAiBaseUrl = partial.openAiCompatBaseUrl ?? base.openAiCompatBaseUrl;
     const rawModel = partial.model ?? base.model;
+    const authority = Array.isArray(partial.providers);
     const normalizedFlat = {
-      openAiCompatBaseUrl: reconcileOpenAiCompatBaseUrl(rawOpenAiBaseUrl, apiKey),
+      openAiCompatBaseUrl: authority ? rawOpenAiBaseUrl : rawOpenAiBaseUrl ? reconcileOpenAiCompatBaseUrl(rawOpenAiBaseUrl, apiKey) : '',
       apiKey,
-      model: reconcileModelAlias(rawModel, apiKey),
+      model: rawModel ? reconcileModelAlias(rawModel, apiKey) : '',
       directModel: canonicalizeGlmModelAlias(partial.directModel ?? base.directModel),
     };
     const providers = normalizeProviderProfiles(partial.providers, normalizedFlat);
@@ -1324,7 +1347,10 @@ export class ConfigManager {
       ?? activeProvider?.models[0];
 
     return {
-      ...normalizedFlat,
+      ...((authority || providers.length > 0) ? {
+        openAiCompatBaseUrl: activeProvider?.openAiCompatBaseUrl ?? '',
+        apiKey: activeProvider?.apiKey ?? '', model: activeModel?.openAiModel ?? '', directModel: activeModel?.openAiModel ?? '',
+      } : normalizedFlat),
       temperature: typeof partial.temperature === 'number' ? partial.temperature : 0.2,
       providers,
       activeProviderId: activeProvider?.id,

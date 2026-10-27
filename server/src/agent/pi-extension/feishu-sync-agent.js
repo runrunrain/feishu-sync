@@ -15,8 +15,7 @@
  */
 
 'use strict';
-import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { registerConfiguredModels } from './configured-models.js';
 
 /** @typedef {{ registerTool(tool: any): void; registerProvider(name: string, config: any): void; on(event: 'tool_call', handler: (event: any) => any): void; getAllTools(): any[]; }} ExtensionAPI */
 
@@ -82,31 +81,26 @@ export default async function feishuSyncAgentExtension(/** @type {ExtensionAPI} 
   const sharedHome = process.env.FEISHU_SYNC_AGENT_SHARED_PI_HOME;
   const piRoot = process.env.FEISHU_SYNC_AGENT_PI_PACKAGE_ROOT;
   if (sharedHome && piRoot) {
-    const load = (name) => import(pathToFileURL(path.join(piRoot, 'dist/core', name + '.js')).href);
-    const { ModelRuntime } = await load('model-runtime');
-    const { ReadOnlyAuthStorage } = await load('auth-storage');
-    const models = await ModelRuntime.create({
-      credentials: new ReadOnlyAuthStorage(path.join(sharedHome, 'auth.json')),
-      modelsPath: path.join(sharedHome, 'models.json'),
-      modelsStorePath: path.join(process.env.PI_CODING_AGENT_DIR, 'shared-models-store.json'),
-      allowModelNetwork: false,
+    await registerConfiguredModels(pi, {
+      piRoot, sharedHome, appHome: process.env.PI_CODING_AGENT_DIR,
     });
-    for (const provider of models.getProviders()) pi.registerProvider(provider);
   }
 
-  // app-llm：注册 OpenAI 兼容 provider（key 只经环境变量插值）
+  // app-llm：按所选协议注册 provider（key 只经环境变量插值）
   if (PROVIDER_JSON) {
     const descriptor = JSON.parse(PROVIDER_JSON);
+    const api = descriptor.api ?? 'openai-completions';
+    if (!['openai-completions', 'openai-responses', 'anthropic-messages'].includes(api)) throw new Error('不支持的应用模型协议');
     pi.registerProvider('feishu-sync-llm', {
       name: 'feishu-sync LLM',
       baseUrl: descriptor.baseUrl,
       apiKey: `$${API_KEY_ENV}`,
-      api: 'openai-completions',
+      api,
       models: (descriptor.models || []).map((model) => ({
         type: 'chat',
         id: model.id,
         name: model.name || model.id,
-        reasoning: false,
+        reasoning: model.reasoning === true,
         input: ['text'],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: model.contextWindow || 128000,
@@ -146,7 +140,8 @@ export default async function feishuSyncAgentExtension(/** @type {ExtensionAPI} 
   const external = () => new Set(process.env.FEISHU_SYNC_AGENT_EXTERNAL_PLUGINS === '1'
     ? pi.getAllTools().filter((tool) => tool.sourceInfo?.path && !tool.sourceInfo.path.startsWith('builtin:')).map((tool) => tool.name)
     : []);
-  pi.on('session_start', () => {
+  pi.on('session_start', async (_event, ctx) => {
+    if (sharedHome) await ctx.modelRegistry.refresh({ allowNetwork: false });
     if (process.env.FEISHU_SYNC_AGENT_EXTERNAL_PLUGINS === '1') pi.setActiveTools([...new Set([...selfTools, ...external()])]);
   });
   pi.on('tool_call', (event) => {

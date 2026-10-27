@@ -8,6 +8,7 @@
  */
 
 import { ChevronRight, FileText, Table, FileType, Folder } from 'lucide-react';
+import { TreeSelectionBox, type TreeSelectionProps } from './TreeSelectionBox';
 import { BusinessTag } from './common/BusinessTag';
 import { StatusBadge } from './common/StatusBadge';
 import type { MappingNode } from '../types';
@@ -21,15 +22,17 @@ interface TreeNodeProps {
   /** Business marks (T/D/R) — independent tag, decision 1. */
   businessMarks?: string[];
   onToggle: (objToken: string) => void;
-  onSelect: (objToken: string) => void;
+  onSelect: (objToken: string, event: React.MouseEvent) => void;
   /** HTML5 DnD handlers (decision 5, same-level reorder only). */
   onDragStart: (e: React.DragEvent, node: MappingNode) => void;
   onDragOver: (e: React.DragEvent, node: MappingNode) => void;
   onDragLeave: (e: React.DragEvent, node: MappingNode) => void;
   onDrop: (e: React.DragEvent, node: MappingNode) => void;
-  isDropTargetBefore?: boolean;
-  isDropTargetAfter?: boolean;
+  onDragEnd: () => void;
+  onContextMenu?: (e: React.MouseEvent, node: MappingNode) => void;
+  reorderBusy?: boolean;
   isDragging?: boolean;
+  selection?: TreeSelectionProps;
 }
 
 const TYPE_ICON = {
@@ -73,13 +76,16 @@ export function TreeNode({
   onDragOver,
   onDragLeave,
   onDrop,
-  isDropTargetBefore,
-  isDropTargetAfter,
+  onDragEnd,
+  onContextMenu,
+  reorderBusy,
   isDragging,
+  selection,
 }: TreeNodeProps) {
   const TypeIcon = hasChildren ? Folder : (TYPE_ICON[node.obj_type] ?? FileType);
+  const pendingLocal = node.sync_state === 'pending_added' && !node.sync_blocked;
   const showChangedBadge =
-    node.status === 'changed' || node.cloud_deleted === 1;
+    node.sync_blocked || pendingLocal || node.status === 'changed' || node.cloud_deleted === 1;
   // v0.2.5 层级视觉：顶层节点（level 0）文字/图标大于深层；深层不再与顶层同尺寸。
   const isRootLevel = level === 0;
 
@@ -87,7 +93,7 @@ export function TreeNode({
     <div
       role="treeitem"
       aria-expanded={hasChildren ? expanded : undefined}
-      aria-selected={selected}
+      aria-selected={selection ? selection.selected > 0 : selected}
       className={`relative group ${isDragging ? 'tree-node--dragging' : ''}`}
       style={{ paddingLeft: 0 }}
     >
@@ -99,17 +105,21 @@ export function TreeNode({
         - 缩进 8px/级、上限 40px（2026-06-20 由 10px/级、上限 48px 收紧，
           把空间让给标题，深层节点标题可读性优先）
       */}
-      {isDropTargetBefore && <div className="tree-drop-indicator" />}
       <div
         data-node-token={node.obj_token}
-        className={`flex min-w-0 items-center gap-2 h-8 overflow-hidden pr-2.5 rounded-sm cursor-pointer transition-all duration-150 ${
-          selected
+        className={`flex min-w-0 items-center gap-2 h-8 overflow-hidden pr-2.5 rounded-sm cursor-pointer transition-all duration-150 ${selection ? 'select-none' : ''} ${
+          (selection ? selection.selected > 0 : selected)
             ? 'bg-seal/[0.08] shadow-[inset_0_0_0_1px_rgba(158,43,37,0.12)]'
             : 'hover:bg-paper-2 active:bg-paper-2/70'
         } ${selected ? 'before:absolute before:left-0 before:top-1 before:bottom-1 before:w-[3px] before:rounded-full before:bg-seal' : ''}`}
         style={{ paddingLeft: Math.min(8 + level * 8, 40) }}
-        onClick={() => onSelect(node.obj_token)}
-        draggable
+        onClick={(e) => onSelect(node.obj_token, e)}
+        tabIndex={0}
+        aria-label={node.title}
+        onContextMenu={(e) => onContextMenu?.(e, node)}
+        onKeyDown={(e) => { if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) { e.preventDefault(); const rect = e.currentTarget.getBoundingClientRect(); onContextMenu?.({ ...e, clientX: rect.left + 24, clientY: rect.bottom, preventDefault: () => e.preventDefault() } as unknown as React.MouseEvent, node); } }}
+        draggable={!reorderBusy}
+        onDragEnd={onDragEnd}
         onDragStart={(e) => onDragStart(e, node)}
         onDragOver={(e) => onDragOver(e, node)}
         onDragLeave={(e) => onDragLeave(e, node)}
@@ -132,6 +142,7 @@ export function TreeNode({
           </svg>
         </span>
 
+        {selection ? <TreeSelectionBox title={node.title} {...selection} /> : null}
         {/* Collapse/expand arrow (only when has children) */}
         <span className="shrink-0 w-3.5">
           {hasChildren ? (
@@ -180,7 +191,7 @@ export function TreeNode({
             status={node.cloud_deleted === 1 ? 'deleted' : node.status === 'error' ? 'error' : 'modified'}
             size="sm"
           >
-            {node.cloud_deleted === 1 ? '已删除' : '变更'}
+            {node.cloud_deleted === 1 ? '已删除' : node.sync_blocked ? '已屏蔽' : pendingLocal ? '待同步' : '变更'}
           </StatusBadge>
         )}
 
@@ -197,7 +208,6 @@ export function TreeNode({
           </span>
         )}
       </div>
-      {isDropTargetAfter && <div className="tree-drop-indicator" />}
     </div>
   );
 }

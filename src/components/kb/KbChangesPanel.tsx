@@ -61,7 +61,7 @@ export function KbChangesPanel({ tab, onTab, onClose, onChanged, onUpdate, onOpe
   }, [tab, versionId, nonce]);
 
   return <Modal open={tab !== null} title="源文档与变更记录" onClose={onClose} contentClassName="max-w-5xl">
-    <div className="flex gap-2 border-b border-line pb-3 mb-3" role="tablist" aria-label="变更管理">
+    <div className="flex flex-wrap gap-2 border-b border-line pb-3 mb-3" role="tablist" aria-label="变更管理">
       {(['sources', 'pending', 'history'] as const).map((value) => <Button key={value} size="sm"
         role="tab" aria-selected={tab === value} variant={tab === value ? 'primary' : 'secondary'} onClick={() => onTab(value)}>
         {{ sources: '源文档', pending: '待更新差异', history: '版本记录' }[value]}
@@ -71,7 +71,7 @@ export function KbChangesPanel({ tab, onTab, onClose, onChanged, onUpdate, onOpe
       <Button size="sm" variant="secondary" onClick={onClose}>关闭</Button>
     </div>
     {error ? <p role="alert" className="text-sm text-seal-2 mb-3">{error}</p> : null}
-    <div className="h-[60vh] min-h-[260px] overflow-auto scrollbar-thin">
+    <div className="max-h-[60vh] min-h-[160px] overflow-auto scrollbar-thin">
       {tab === 'sources' ? <KbSourceSelector nonce={nonce} running={running} onChanged={onChanged} onOpenSource={onOpenSource} /> : tab === 'pending' ? <>
         <p className="text-xs text-ink-soft mb-3">比较当前参与构建的原始源与最近发布的源快照。差异用于更新判断，正文会重新写成完整说明。</p>
         {loading ? <p className="text-xs text-ink-faint">正在计算差异…</p> : preview ? <>

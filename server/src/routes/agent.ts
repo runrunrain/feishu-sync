@@ -1,3 +1,5 @@
+import { resolveProviderModel } from '../modules/model-selection.js';
+import type { SessionModelConfig } from '../types/agent-knowledge.js';
 /**
  * Agent 路由（设计 §9.1 / §9.3 / §9.4）— desktop auth 之后
  *
@@ -123,6 +125,57 @@ export async function agentRoutes(deps: AgentRouteDeps): Promise<Hono> {
     } catch (error) {
       return errorResponse(c, error);
     }
+  });
+
+  const modelStatus = async (config: Config, force = false) => {
+    const status = await resolver.checkReadiness({ agentConfig: config.agent, llmConfig: config.llm, runningProcesses: pool.runningCount() }, buildModelProbe(config), { force });
+    const { piPackageRoot: _ignored, ...runtime } = status.runtime;
+    return { ...status, runtime, externalPlugins: deps.externalPlugins?.() ?? 0 };
+  };
+  routes.get('/api/agent/models', async (c) => {
+    try {
+      const config = await configManager.load();
+      if (c.req.query('source') === 'pi-agent-dir') {
+        const local: Config = { ...config, agent: { ...config.agent, model: { ...config.agent.model, source: 'pi-agent-dir', piModel: '' } } };
+        const status = await modelStatus(local, c.req.query('refresh') === '1');
+        return c.json({ items: status.model.available.map((piModel) => ({ source: 'pi-agent-dir', piModel, label: piModel, reasoning: true })), message: status.message });
+      }
+      const items = (config.llm.providers ?? []).flatMap((p) => p.models.map((m) => {
+        const resolved = resolveProviderModel(config.llm, { providerId: p.id, modelId: m.id });
+        return resolved?.apiKey ? { source: 'app-llm', providerId: p.id, modelId: m.id, label: `${p.name} / ${m.name}`, reasoning: m.reasoning === true } : null;
+      }).filter(Boolean));
+      return c.json({ items, message: items.length ? '' : '尚无已配置的模型，请先添加服务提供商与预设' });
+    } catch (error) { return errorResponse(c, error); }
+  });
+  routes.get('/api/agent/sessions/:id/status', async (c) => {
+    try { const config = await configManager.load(); return c.json(await modelStatus(sessionService.configForSession(localMapStore, c.req.param('id'), config), c.req.query('refresh') === '1')); }
+    catch (error) { return errorResponse(c, error); }
+  });
+  routes.patch('/api/agent/sessions/:id/model', async (c) => {
+    try {
+      const id = c.req.param('id'); const config = await configManager.load();
+      if (!localMapStore.getAgentSession(id)) throw new ToolError('session_not_found', '会话不存在', 404);
+      if (sessionService.isRunning(id)) throw new ToolError('session_busy', '运行结束后可切换模型与思考强度', 409);
+      const body = await c.req.json();
+      if (!body || typeof body !== 'object' || Array.isArray(body) || !Object.prototype.hasOwnProperty.call(body, 'model')) throw new ToolError('invalid_request', '缺少模型配置');
+      if (body.model === null) return c.json(sessionService.setModel(localMapStore, id, null));
+      const m = body.model;
+      if (!m || !['app-llm', 'pi-agent-dir'].includes(m.source) || !['off', 'minimal', 'low', 'medium', 'high'].includes(m.thinkingLevel)) throw new ToolError('invalid_request', '模型来源或思考强度无效');
+      const model: SessionModelConfig = { source: m.source, thinkingLevel: m.thinkingLevel };
+      if (m.source === 'app-llm') {
+        if (typeof m.providerId !== 'string' || typeof m.modelId !== 'string') throw new ToolError('invalid_request', '请选择服务提供商和模型预设');
+        model.providerId = m.providerId; model.modelId = m.modelId;
+        const resolved = resolveProviderModel(config.llm, model);
+        if (!resolved?.apiKey) throw new ToolError('invalid_request', '模型已删除、停用或缺少认证，请刷新列表');
+        if (!resolved.reasoning && model.thinkingLevel !== 'off') throw new ToolError('invalid_request', '该模型预设未启用思考能力');
+      } else {
+        if (typeof m.piModel !== 'string' || !m.piModel.includes('/')) throw new ToolError('invalid_request', '请选择本地Pi模型');
+        model.piModel = m.piModel;
+        const status = await modelStatus({ ...config, agent: { ...config.agent, model: { ...config.agent.model, ...model } } });
+        if (!status.model.available.includes(m.piModel)) throw new ToolError('invalid_request', '本地Pi模型不可用，请刷新配置与认证');
+      }
+      return c.json(sessionService.setModel(localMapStore, id, model));
+    } catch (error) { return errorResponse(c, error); }
   });
 
   // ------------------------------------------------------------------

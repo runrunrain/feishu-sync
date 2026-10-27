@@ -892,4 +892,12 @@ describe('MappingService.updateSortOrder', () => {
     expect(store.rows.get('TOP2')!.localSortOrder).toBe(0);
     expect(store.rows.get('TOP1')!.localSortOrder).toBe(1);
   });
+  it('父级都为空也不能跨同步根排序，重复标识整批拒绝', () => {
+    store.rows.set('A', makeDoc({ objToken: 'A', parentNodeToken: null, watchedRootId: 'root-a' }));
+    store.rows.set('B', makeDoc({ objToken: 'B', parentNodeToken: null, watchedRootId: 'root-b' }));
+    expect(() => svc.updateSortOrder({ parent_node_token: null, ordered_obj_tokens: ['B','A'] })).toThrow(CrossParentReorderError);
+    expect(() => svc.updateSortOrder({ parent_node_token: null, ordered_obj_tokens: ['A','A'] })).toThrow();
+    expect(store.setSortOrderCalls).toHaveLength(0);
+  });
+
 });

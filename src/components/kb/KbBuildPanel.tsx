@@ -101,7 +101,7 @@ export function KbBuildPanel({
           ) : null}
           构建 · {KB_BUILD_STATUS_LABEL[build.status] ?? build.status}
         </span>
-        <span className="text-[10px] text-ink-faint font-mono truncate max-w-full" title={build.id}>{build.id}</span>
+        <span className="min-w-0 flex-1 text-[10px] text-ink-faint font-mono truncate" title={build.id}>{build.id}</span>
 
         {!isTerminal && batchTotal > 0 ? (
           <span className="text-xs text-ink-soft">
@@ -116,7 +116,7 @@ export function KbBuildPanel({
             />
           </div>
         ) : (
-          <div className="flex-1" />
+          null
         )}
 
         {isTerminal ? (

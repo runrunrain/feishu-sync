@@ -417,11 +417,11 @@ export function KnowledgeView({ active = true, onJumpToSettings }: KnowledgeView
           </div>}
       </aside> : null}
 
-      <nav className="shrink-0 w-12 rounded-md border border-line bg-card-bg shadow-sm flex flex-col items-center gap-2 py-2" aria-label="标准库工具">
+      <nav className="shrink-0 w-12 rounded-md border border-line bg-card-bg shadow-sm flex flex-col items-center gap-1 py-2" aria-label="标准库工具">
         {sidebarItems.map(({ id, label, name, icon: Icon }) => <button key={id} type="button" data-sidebar-trigger={id}
           onClick={() => setSidebar((value) => value === id ? null : id)} aria-label={`${sidebar === id ? '收起' : '打开'}${name}`}
           aria-expanded={sidebar === id} title={name}
-          className={`relative w-10 min-h-[54px] flex flex-col items-center justify-center gap-1 rounded text-[10px] transition-colors ${sidebar === id ? 'bg-seal/10 text-seal' : 'text-ink-faint hover:bg-paper hover:text-ink'}`}>
+          className={`relative w-10 min-h-[44px] flex flex-col items-center justify-center gap-1 rounded text-[10px] transition-colors ${sidebar === id ? 'bg-seal/10 text-seal' : 'text-ink-faint hover:bg-paper hover:text-ink'}`}>
           {id === 'build' && running ? <Loader2 className="w-4 h-4 animate-spin text-seal" /> : <Icon className="w-4 h-4" />}<span>{label}</span>
           {id === 'manage' && pendingTotal > 0 ? <span className="absolute right-1 top-1 w-1.5 h-1.5 rounded-full bg-seal" /> : null}
         </button>)}

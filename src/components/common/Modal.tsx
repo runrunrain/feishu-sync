@@ -45,12 +45,12 @@ export function Modal({ open, title, onClose, children, contentClassName = 'max-
         role="dialog"
         aria-modal="true"
         aria-label={title}
-        className={`w-full ${contentClassName} bg-card-bg border border-line rounded-md shadow-lg`}
+        className={`w-full ${contentClassName} bg-card-bg border border-line rounded-md shadow-lg max-h-[calc(100dvh-32px)] flex flex-col`}
       >
-        <div className="px-6 py-4 border-b border-line">
+        <div className="px-4 py-3 shrink-0 border-b border-line">
           <h3 className="text-base font-kai font-medium text-ink">{title}</h3>
         </div>
-        <div className="px-6 py-5">{children}</div>
+        <div className="p-4 min-h-0 overflow-y-auto scrollbar-thin">{children}</div>
       </div>
     </div>
   );

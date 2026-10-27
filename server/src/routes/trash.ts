@@ -22,6 +22,10 @@
  *   DELETE -> { purged: number }
  */
 
+import { parseSourceBatchRequest, planSourceBatch, executeSourceBatch } from '../modules/source-batch.js';
+import { ToolError } from '../agent/agent-tool-service.js';
+import { deleteSourceNode } from '../modules/source-node-delete.js';
+import { SnapshotService } from '../modules/snapshot-service.js';
 import { Hono } from 'hono';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -256,16 +260,29 @@ trashRoutes.post('/api/trash/restore', async (c) => {
 // POST /api/trash/manual-delete — 手动删除节点（2026-09）
 // ---------------------------------------------------------------------------
 //
-// 用户在节点树上主动删除某个文档（典型：残留的非有效飞书节点）。
-// 与回收站 purge 的语义区分：
-//   - 回收站行（cloud_deleted=1）拒绝本入口 → 409，走回收站面板的恢复/
-//     清空，避免双语义交叉；
-//   - 活行：本地 .md 先移入 .trash-bin/（镜像相对路径，可手工找回），
-//     再硬删 documents + sheet_sheets（LocalMapStore.deleteDocumentByToken
-//     事务内级联）；文件不存在（已手动删）则直接删行。
-// 删除后果说明（前端 confirm 文案同步）：云端仍存在的节点在下次检测会
-// 作为本地缺失新增项重新出现在变更列表——不勾选即不会被同步回来。
-//
+// 节点右键删除：可选回收本地正文/表格附件，可选移入本库的同步屏蔽名单。
+// 有效父链仍通向启用同步根时保留身份与排序、清除本地成功基线并转pending_added；
+// 否则删除索引身份。屏蔽身份保留拓扑但不进入任何待同步结果，移出名单后恢复资格。
+// 文件移动与元数据提交复用source-cleanup事务/回滚，不因移动失败谎报删除成功。
+// 回收站行仍返回409，避免与原回收站恢复/清空流程混用；只处理当前文档，子文档保留。
+for (const mode of ['preview', 'apply'] as const) trashRoutes.post(`/api/trash/source-batch/${mode}`, async (c) => {
+  try {
+    const body = await c.req.json(); const request = parseSourceBatchRequest(body);
+    const store = (c as any).localMapStore; const configManager = (c as any).configManager;
+    const config = await configManager.load();
+    if (mode === 'preview') return c.json(planSourceBatch(store, config, request).preview);
+    if (body.confirm !== 'APPLY' || typeof body.expectedRevision !== 'string') throw new ToolError('confirmation_required', '请核对清单后确认', 400);
+    if (request.action === 'delete' && (c as any).kbBuildService?.activeBuild(store)) throw new ToolError('kb_build_running', '标准库构建中，暂不能批量删除源文档', 409);
+    const result = executeSourceBatch(store, config, request, body.expectedRevision);
+    try { new SnapshotService(store, configManager, { larkCliClient: (c as any).larkCliClient, config }).generate(); }
+    catch (error) { console.warn('[trash] batch snapshot refresh failed:', error); }
+    return c.json(result);
+  } catch (error) {
+    if (error instanceof ToolError) return c.json({ error: error.code, message: error.message }, error.status as 400 | 404 | 409 | 500);
+    return c.json({ error: 'source_batch_failed', message: error instanceof Error ? error.message : '批量操作失败' }, 500);
+  }
+});
+
 trashRoutes.post('/api/trash/manual-delete', async (c) => {
   let body: any;
   try {
@@ -308,28 +325,17 @@ trashRoutes.post('/api/trash/manual-delete', async (c) => {
     }
 
     const config = configManager.getConfig?.() ?? (await configManager.load?.());
-    const root: string | undefined = config?.knowledgeBaseRoot;
-    const localMdPath: string | undefined = doc.localMdPath;
+    if (typeof body.delete_local_files !== 'undefined' && typeof body.delete_local_files !== 'boolean'
+      || typeof body.block !== 'undefined' && typeof body.block !== 'boolean') return c.json({ error: 'invalid_body', message: '删除选项必须为boolean' }, 400);
+    if ((c as any).kbBuildService?.activeBuild(store)) return c.json({ error: 'kb_build_running', message: '标准库构建中，暂不能删除源文档' }, 409);
+    const result = deleteSourceNode(store, config, doc, { deleteFiles: body.delete_local_files !== false, block: body.block === true });
+    try { new SnapshotService(store, configManager, { larkCliClient: (c as any).larkCliClient, config }).generate(); }
+    catch (error) { console.warn('[trash] snapshot refresh after manual delete failed:', error); }
+    return c.json(result);
 
-    let movedToTrash = false;
-    if (root && localMdPath) {
-      const originalAbs = safeResolve(root, localMdPath);
-      const trashAbs = computeTrashPath(root, localMdPath);
-      if (originalAbs && trashAbs && fs.existsSync(originalAbs)) {
-        ensureTrashBin(root);
-        movedToTrash = moveFileSafe(originalAbs, trashAbs);
-        // 移动失败（IO 异常）不阻断行删除：文件残留会被下一次刷新索引的
-        // prune 逻辑按「本地缺失行」重新收敉，不会复活视图节点。
-      }
-    }
-
-    const deleted = store.deleteDocumentByToken(objToken);
-    if (!deleted) {
-      return c.json({ error: 'not_found', message: 'document row vanished' }, 404);
-    }
-    return c.json({ ok: true, file_moved_to_trash: movedToTrash });
   } catch (error) {
     console.error('[trash] manual-delete failed:', error);
+    if (error instanceof ToolError) return c.json({ error: error.code, message: error.message }, error.status as 400 | 409 | 500);
     return c.json(
       {
         error: 'trash_manual_delete_failed',

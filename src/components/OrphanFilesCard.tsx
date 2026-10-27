@@ -71,9 +71,9 @@ export function OrphanFilesCard() {
   };
 
   return (
-    <Card variant="elevated">
-      <div className="flex items-start justify-between gap-4 mb-3">
-        <div>
+    <Card variant="elevated" className="p-4">
+      <div className="flex flex-wrap items-start justify-between gap-3 mb-3">
+        <div className="min-w-0 flex-1 basis-52">
           <h2 className="text-base font-medium text-ink">孤立文件清理</h2>
           <p className="text-xs text-ink-faint mt-1 leading-relaxed">
             同步根被移除后残留在本地的同步产物目录/散档（含 feishu_sync 头）；
@@ -106,7 +106,7 @@ export function OrphanFilesCard() {
               </li>
             ))}
           </ul>
-          <div className="flex items-center justify-between mt-3">
+          <div className="flex flex-wrap items-center justify-between gap-2 mt-3">
             <span className="text-[11px] text-ink-faint">
               共 {items.length} 项，全部移动到回收站（不删除）
             </span>

@@ -120,6 +120,7 @@ interface ComparisonOptions {
 
 export interface ChangeDetectorOptions {
   knowledgeBaseRoot?: string;
+  knowledgeBaseRootProvider?: () => string;
   mediaGap?: {
     enabled?: boolean;
   };
@@ -318,7 +319,9 @@ export class ChangeDetector {
    */
   private fastFallbackRetryAt = new Map<string, number>();
 
-  private knowledgeBaseRoot?: string;
+  private initialKnowledgeBaseRoot?: string;
+  private knowledgeBaseRootProvider?: () => string;
+  private get knowledgeBaseRoot(): string | undefined { return this.knowledgeBaseRootProvider?.() ?? this.initialKnowledgeBaseRoot; }
   private mediaGapEnabled: boolean;
   private hasLoggedMissingKbRoot = false;
 
@@ -327,7 +330,8 @@ export class ChangeDetector {
     private localMapStore: LocalMapStore,
     options: ChangeDetectorOptions = {}
   ) {
-    this.knowledgeBaseRoot = options.knowledgeBaseRoot;
+    this.initialKnowledgeBaseRoot = options.knowledgeBaseRoot;
+    this.knowledgeBaseRootProvider = options.knowledgeBaseRootProvider;
     this.mediaGapEnabled = options.mediaGap?.enabled ?? true;
   }
 
@@ -356,6 +360,13 @@ export class ChangeDetector {
    * @visibleForTesting `bypassCooldown` is intended exclusively for unit
    * tests; production callers must omit it.
    */
+  private withoutBlocked<T extends { changed: boolean | number; changedDocuments: ChangedDocument[] }>(result: T): T {
+    const blocked = new Set(this.localMapStore.listSyncBlockedSources?.(this.knowledgeBaseRoot ?? '').map((row) => row.objToken) ?? []);
+    if (!blocked.size) return result;
+    const changedDocuments = result.changedDocuments.filter((doc) => !blocked.has(doc.objToken));
+    return { ...result, changedDocuments, changed: typeof result.changed === 'boolean' ? changedDocuments.length > 0 : changedDocuments.length };
+  }
+
   async detectChanges(
     rootUrl: string,
     options: DetectChangesOptions = {}
@@ -366,11 +377,11 @@ export class ChangeDetector {
     const mediaGapScope = options.mediaGapScope ?? 'local-only';
     // A full topology reconciliation and a fast metadata poll have different
     // freshness guarantees, so they must never share a cached result.
-    const cacheKey = `${mode}\u0000${rootUrl}`;
+    const cacheKey = `${this.knowledgeBaseRoot ?? ''}\u0000${mode}\u0000${rootUrl}`;
     if (!forceFresh) {
       const cached = this.detectResultCache.get(cacheKey);
       if (cached && cached.expiresAt > Date.now()) {
-        return cached.result;
+        return this.withoutBlocked(cached.result);
       }
     } else if (!bypassCooldown) {
       // forceFresh path: still respect the cooldown. If a detect on this
@@ -380,7 +391,7 @@ export class ChangeDetector {
       if (cached) {
         const sinceCompleted = Date.now() - (cached.expiresAt - DTECT_RESULT_TTL_MS);
         if (sinceCompleted < DETECT_COOLDOWN_MS) {
-          return cached.result;
+          return this.withoutBlocked(cached.result);
         }
       }
     }
@@ -389,7 +400,7 @@ export class ChangeDetector {
     // traversal, including forceFresh callers: it is already a fresh cloud
     // read and starting another one would only increase the upstream QPS.
     const inFlight = this.inFlightDetections.get(cacheKey);
-    if (inFlight) return inFlight;
+    if (inFlight) return inFlight.then((result) => this.withoutBlocked(result));
 
     const detector = mode === 'fast'
       ? this.detectMappedDocumentChanges(rootUrl, mediaGapScope)
@@ -414,7 +425,7 @@ export class ChangeDetector {
     // creating an unhandled rejected promise from `finally`.
     void pending.then(clearInFlight, clearInFlight);
 
-    return pending;
+    return pending.then((result) => this.withoutBlocked(result));
   }
 
   /**
@@ -549,7 +560,7 @@ export class ChangeDetector {
     );
     await this.appendMediaGapPending(result, syncedCustomDocs, options.mediaGapScope ?? 'local-only');
 
-    return result;
+    return this.withoutBlocked(result);
   }
 
   /**
@@ -1250,6 +1261,7 @@ export class ChangeDetector {
           lastSeenAt: now,
         }) as DocumentRecord;
 
+        if (this.localMapStore.isSyncBlocked?.(this.knowledgeBaseRoot ?? '', record.objToken)) continue;
         if (record.syncState === 'pending_added') {
           changedDocuments.push(
             this.toChangedDocument(

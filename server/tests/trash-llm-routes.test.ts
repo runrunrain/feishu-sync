@@ -101,6 +101,10 @@ function makeFakeStore(docs: FakeDoc[]) {
       if (idx >= 0) rows.splice(idx, 1);
       list = rows.filter((r) => r.cloudDeleted === 1);
     },
+    getAllDocuments: () => rows,
+    getSheetSheets: () => [],
+    isSyncBlocked: () => false,
+    clearLocalDocument: (token: string) => { const index = rows.findIndex((row) => row.objToken === token); if (index >= 0) rows.splice(index, 1); },
     deleteDocumentByToken: (tok: string) => {
       const idx = rows.findIndex((r) => r.objToken === tok);
       if (idx < 0) return false;
@@ -386,7 +390,7 @@ describe('POST /api/trash/manual-delete', () => {
     expect(body.file_moved_to_trash).toBe(true);
     // 文件进回收站目录（镜像相对路径），原位消失，行被硬删
     expect(fs.existsSync(original)).toBe(false);
-    expect(fs.existsSync(path.join(tmpRoot, '.trash-bin', 'docs', 'sub', '残留节点.md'))).toBe(true);
+    expect(fs.existsSync(path.join(body.trash_dir, 'files', 'docs', 'sub', '残留节点.md'))).toBe(true);
     expect(store.getDocumentByObjToken('residual-doc')).toBeNull();
   });
 

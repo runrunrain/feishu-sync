@@ -53,21 +53,21 @@ export function BuiltinContextsEditor() {
   };
   const select = (plugin: AgentContextPlugin) => { if (canLeave()) setDraft({ ...plugin, scopes: [...plugin.scopes] }); };
   return <section className="rounded-md border border-line bg-card-bg shadow-sm overflow-hidden">
-    <header className="px-5 py-4 border-b border-line/70 space-y-2">
+    <header className="px-4 py-3 border-b border-line/70 space-y-2">
       <div className="flex items-center gap-2 flex-wrap">
-        <Puzzle className="w-5 h-5 text-seal" /><h2 className="text-lg font-kai text-ink flex-1">知识库工作台 · 上下文配置</h2>
+        <Puzzle className="w-5 h-5 text-seal" /><h2 className="text-base font-kai text-ink flex-1 basis-48">知识库工作台 · 上下文配置</h2>
         <Button size="sm" variant="secondary" disabled={busy} onClick={() => void reload()}><RefreshCw className="w-3.5 h-3.5" />刷新</Button>
         <Button size="sm" disabled={busy || !registry} onClick={() => { if (canLeave()) setDraft(fresh()); }}><Plus className="w-3.5 h-3.5" />新增配置项</Button>
       </div>
       <p className="text-xs text-ink-faint leading-relaxed">这里管理知识库工作台插件的对话、Work、构建规则与文风配置。可调整内容与适用范围，保存后下次对话或构建生效。</p>
     </header>
-    <div className="mx-5 mt-4 rounded border border-line bg-paper/50 px-3 py-2 text-xs text-ink-soft flex items-start gap-2">
+    <div className="mx-4 mt-3 rounded border border-line bg-paper/50 px-3 py-2 text-xs text-ink-soft flex items-start gap-2">
       <ShieldCheck className="w-4 h-4 shrink-0 text-jade" /><span>配置内容按Markdown文本读取。停用配置项只停止该项上下文注入，工具桥接与应用校验仍由应用维护。</span>
     </div>
-    {error ? <div role="alert" className="mx-5 mt-4 rounded border border-seal/30 px-3 py-2 text-sm text-seal">{error}</div> : null}
-    {!registry && !error ? <p className="p-5 text-sm text-ink-faint">正在加载插件…</p> : null}
-    {registry ? <div className="flex flex-col xl:flex-row gap-4 p-5">
-      <nav aria-label="内置插件配置项" className="xl:w-56 xl:shrink-0 flex xl:flex-col gap-2 overflow-auto max-h-[520px]">
+    {error ? <div role="alert" className="mx-4 mt-3 rounded border border-seal/30 px-3 py-2 text-sm text-seal">{error}</div> : null}
+    {!registry && !error ? <p className="p-4 text-sm text-ink-faint">正在加载插件…</p> : null}
+    {registry ? <div className="flex flex-col xl:flex-row gap-4 p-4">
+      <nav aria-label="内置插件配置项" className="xl:w-48 xl:shrink-0 grid grid-cols-1 sm:grid-cols-2 xl:flex xl:flex-col gap-2 max-h-[520px] overflow-y-auto">
         {registry.plugins.map((plugin) => <button key={plugin.id} type="button" disabled={busy} onClick={() => select(plugin)}
           aria-pressed={draft?.id === plugin.id} className={`shrink-0 text-left rounded border px-3 py-2.5 ${draft?.id === plugin.id ? 'border-jade bg-jade/5' : 'border-line hover:bg-paper'}`}>
           <span className="block text-sm text-ink">{plugin.name}</span>

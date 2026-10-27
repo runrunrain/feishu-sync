@@ -168,6 +168,7 @@ interface SpawnOptions {
   withSession?: { sessionDir: string; sessionId: string };
   tools?: string[];
   runKind: 'discuss' | 'work';
+  sharedHome?: string;
 }
 
 async function spawnFixturePi(options: SpawnOptions): Promise<PiRpcProcess> {
@@ -178,14 +179,15 @@ async function spawnFixturePi(options: SpawnOptions): Promise<PiRpcProcess> {
     knowledgeBaseRoot: fixtureRoot,
   });
   const env = buildPiProcessEnv({
-    mode: 'app-llm',
-    parentEnv: process.env,
+    mode: options.sharedHome ? 'pi-agent-dir' : 'app-llm',
+    parentEnv: options.sharedHome ? { PATH: process.env.PATH, HOME: fixtureRoot, USERPROFILE: fixtureRoot, SystemRoot: process.env.SystemRoot, PI_CODING_AGENT_DIR: options.sharedHome } : process.env,
     dataRoot: fixtureRoot,
     agentUrl: `http://127.0.0.1:${internalPort}`,
     runToken: token,
     apiKey: SENTINEL_KEY,
   });
-  env.FEISHU_SYNC_AGENT_PROVIDER_JSON = JSON.stringify({
+  env.FEISHU_SYNC_AGENT_PI_PACKAGE_ROOT = runtime!.piPackageRoot!;
+  if (!options.sharedHome) env.FEISHU_SYNC_AGENT_PROVIDER_JSON = JSON.stringify({
     baseUrl: `http://127.0.0.1:${llmPort}/v1`,
     models: [{ id: 'fixture-model', contextWindow: 8192, maxTokens: 1024 }],
   });
@@ -195,7 +197,7 @@ async function spawnFixturePi(options: SpawnOptions): Promise<PiRpcProcess> {
     ...(piExtensionPath() ? { extensionPath: piExtensionPath()! } : {}),
     tools: options.tools ?? [],
     ...(options.withSession ? { sessionDir: options.withSession.sessionDir, sessionId: options.withSession.sessionId } : { noSession: true }),
-    model: 'feishu-sync-llm/fixture-model',
+    model: options.sharedHome ? 'fixture-local/fixture-model' : 'feishu-sync-llm/fixture-model',
     thinking: 'off',
     cwd: emptyCwd(),
     env,
@@ -206,6 +208,27 @@ async function spawnFixturePi(options: SpawnOptions): Promise<PiRpcProcess> {
 }
 
 describe('R03：app-llm provider 注入（真实 pi + 本地 OpenAI 兼容 fixture）', () => {
+  it('local auth.json credentials reach the selected model without copying or changing shared files', async () => {
+    if (!piAvailable()) return;
+    const sharedHome = path.join(fixtureRoot, 'shared-local'); fs.mkdirSync(sharedHome);
+    const auth = JSON.stringify({ 'fixture-local': { type: 'api_key', key: SENTINEL_KEY } });
+    const models = JSON.stringify({ providers: { 'fixture-local': { api: 'openai-completions', baseUrl: `http://127.0.0.1:${llmPort}/v1`, models: [{ id: 'fixture-model', contextWindow: 8192, maxTokens: 1024 }] } } });
+    fs.writeFileSync(path.join(sharedHome, 'auth.json'), auth); fs.writeFileSync(path.join(sharedHome, 'models.json'), models);
+    llmRequests.length = 0;
+    const rpc = await spawnFixturePi({ runKind: 'discuss', sharedHome });
+    try {
+      const result = await rpc.prompt('Reply with the fixture acknowledgement', { timeoutMs: 40000 });
+      expect(result.outcome).toBe('completed');
+      expect(result.lastAssistantText).toContain('FIXTURE_ACK_7f3a');
+      expect(llmRequests[0].body.model).toBe('fixture-model');
+      expect(llmRequests[0].auth).toBe(`Bearer ${SENTINEL_KEY}`);
+      expect(fs.readFileSync(path.join(sharedHome, 'auth.json'), 'utf8')).toBe(auth);
+      expect(fs.readFileSync(path.join(sharedHome, 'models.json'), 'utf8')).toBe(models);
+      const appAuth = path.join(fixtureRoot, 'agent/pi-home/auth.json');
+      expect(fs.existsSync(appAuth) ? fs.readFileSync(appAuth, 'utf8') : '').not.toContain(SENTINEL_KEY);
+    } finally { await rpc.terminate(); }
+  }, TEST_TIMEOUT_MS);
+
   it('会话选中注册模型，受控请求携带 sentinel key，run token 不进 LLM 请求', async () => {
     if (!piAvailable()) return;
     llmMode = 'text';
