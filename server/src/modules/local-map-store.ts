@@ -10,6 +10,7 @@
  * Uses better-sqlite3 synchronous API with prepared statements for performance.
  */
 
+import { createLocalPathInspector } from './local-path-state.js';
 import Database from 'better-sqlite3';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -933,25 +934,43 @@ export class LocalMapStore {
    * 的新增项报到变更列表，用户可勾选重新同步恢复；云端也已删除的则
    * 永久干净。归档行同理从归档检测的已知集合消失。
    */
-  pruneMissingLocalDocs(rootDir: string): { scanned: number; pruned: number; prunedTokens: string[] } {
-    const rows = this.db.prepare(`
-      SELECT obj_token, local_rel_path FROM documents
-      WHERE local_rel_path IS NOT NULL AND local_rel_path != ''
-        AND cloud_deleted = 0
-    `).all() as Array<{ obj_token: string; local_rel_path: string }>;
+  pruneMissingLocalDocs(rootDir: string): { scanned: number; pruned: number; prunedTokens: string[]; prunedSheets: number; prunedDirectories: number } {
+    const empty = { scanned: 0, pruned: 0, prunedTokens: [] as string[], prunedSheets: 0, prunedDirectories: 0 };
+    // 根不存在/不可读不能解释为整库删除（例如移动硬盘未挂载）。
+    try { if (!rootDir || !fs.statSync(rootDir).isDirectory()) return empty; fs.readdirSync(rootDir); } catch { return empty; }
+    const rows = this.db.prepare(`SELECT obj_token, local_rel_path, local_md_path, status, sync_state,
+      synced_obj_edit_time, last_synced_at FROM documents WHERE cloud_deleted = 0
+      AND (COALESCE(local_rel_path, '') != '' OR COALESCE(local_md_path, '') != '')`).all() as Array<{
+        obj_token: string; local_rel_path: string | null; local_md_path: string; status: string;
+        sync_state: string; synced_obj_edit_time: number | null; last_synced_at: string;
+      }>;
+    const dirs = this.getAllLocalDirs();
+    const inspect = createLocalPathInspector(rootDir);
+    const tokens = rows.filter((row) => {
+      const successful = row.status === 'synced' || row.sync_state === 'synced' || row.synced_obj_edit_time != null
+        || (Number.isFinite(Date.parse(row.last_synced_at)) && Date.parse(row.last_synced_at) > 0);
+      if (!successful) return false; // 尚未落盘的云端待同步项保留。
+      // 旧库根下的绝对路径记录不能随切换库根被误删。
+      if (path.isAbsolute(row.local_md_path) && inspect(row.local_md_path) === 'unsafe') return false;
+      return inspect(path.isAbsolute(row.local_md_path) ? row.local_md_path : row.local_rel_path || row.local_md_path) === 'missing';
+    }).map((row) => row.obj_token);
+    const missingDirs = dirs.filter((dir) => inspect(dir.localPath, 'directory') === 'missing');
+    return this.db.transaction(() => {
+      const removeSheets = this.getStatement('DELETE FROM sheet_sheets WHERE sheet_obj_token = ?');
+      const removeDoc = this.getStatement('DELETE FROM documents WHERE obj_token = ?');
+      let prunedSheets = 0;
+      for (const token of tokens) { prunedSheets += removeSheets.run(token).changes; removeDoc.run(token); }
+      // 修复旧清理留下的孤立表格索引，不依赖SQLite FK开关。
+      prunedSheets += this.db.prepare('DELETE FROM sheet_sheets WHERE NOT EXISTS (SELECT 1 FROM documents WHERE obj_token = sheet_obj_token)').run().changes;
+      const removeDir = this.getStatement('DELETE FROM localDirs WHERE local_path = ?');
+      for (const dir of missingDirs) removeDir.run(dir.localPath);
+      return { scanned: rows.length, pruned: tokens.length, prunedTokens: tokens, prunedSheets, prunedDirectories: missingDirs.length };
+    })();
+  }
 
-    const resolvedRoot = path.resolve(rootDir);
-    const prunedTokens: string[] = []
-    const deleteStmt = this.getStatement('DELETE FROM documents WHERE obj_token = ?');
-    for (const row of rows) {
-      const abs = path.resolve(resolvedRoot, row.local_rel_path);
-      if (!abs.startsWith(resolvedRoot + path.sep)) continue; // 越界异常数据，跳过
-      if (!fs.existsSync(abs)) {
-        deleteStmt.run(row.obj_token);
-        prunedTokens.push(row.obj_token);
-      }
-    }
-    return { scanned: rows.length, pruned: prunedTokens.length, prunedTokens };
+  /** 多源清理的元数据提交；文件移动由调用者先完成，异常时整体回滚。 */
+  deleteDocumentsByTokens(tokens: string[]): number {
+    return this.db.transaction(() => tokens.reduce((sum, token) => sum + Number(this.deleteDocumentByToken(token)), 0))();
   }
 
   /**

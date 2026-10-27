@@ -281,7 +281,8 @@ export class IndexScanner {
     // 结构树成员被清理后，下次检测会作为本地缺失新增项重新出现在
     // 变更列表，可勾选重新同步恢复——闭环。
     try {
-      if (typeof this.localMapStore.pruneMissingLocalDocs === 'function') {
+      if (typeof this.localMapStore.pruneMissingLocalDocs === 'function'
+        && (!this.config?.knowledgeBaseRoot || path.resolve(rootDir) === path.resolve(this.config.knowledgeBaseRoot))) {
         const stats = this.localMapStore.pruneMissingLocalDocs(rootDir);
         result.prunedLocalMissing = stats.pruned;
         if (stats.pruned > 0) {

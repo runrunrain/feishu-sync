@@ -20,6 +20,8 @@ import { fileURLToPath } from 'node:url';
 import { resolveDataRoot } from './modules/data-root.js';
 import type { Server as HttpServer } from 'node:http';
 
+import { reconcileLocalIndex } from './modules/local-index-reconcile.js';
+import { SnapshotService } from './modules/snapshot-service.js';
 import { ConfigManager } from './modules/config-manager.js';
 import { LarkCliClient } from './modules/lark-cli-client.js';
 import { LarkCliManager } from './modules/lark-cli-manager.js';
@@ -181,9 +183,13 @@ export async function buildServer(options: CreateServerOptions = {}) {
     localMapStore.getSheetSheets(objToken)
       .map((sheet) => sheet.local_csv_path)
       .filter((csvPath) => typeof csvPath === 'string' && csvPath.length > 0);
+  const knowledgeDocuments = () => {
+    reconcileLocalIndex(localMapStore, configManager.getConfig()?.knowledgeBaseRoot ?? '', () => new SnapshotService(localMapStore, configManager, { larkCliClient, config: configManager.getConfig() }).generate());
+    return localMapStore.getAllDocuments();
+  };
   const agentToolService = new AgentToolService({
     dataRoot: agentDataRoot,
-    documentsProvider: () => localMapStore.getAllDocuments(),
+    documentsProvider: knowledgeDocuments,
     sheetCsvPaths,
     workspaceGuard: (workspaceRoot) => checkRootOverlap(workspaceRoot, workspaceGuardsSnapshot()),
   });
@@ -236,7 +242,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
     toolService: agentToolService,
     resolver: runtimeResolver,
     configProvider: () => configManager.getConfig(),
-    documentsProvider: () => localMapStore.getAllDocuments(),
+    documentsProvider: knowledgeDocuments,
     excludedSourcesProvider: () => localMapStore.listKbExcludedSources(configManager.getConfig()?.knowledgeBaseRoot ?? ''),
     sheetCsvPaths,
     internalBaseUrl: () => (agentInternalPort.port ? `http://127.0.0.1:${agentInternalPort.port}` : ''),
@@ -349,7 +355,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
     buildService: kbBuildService,
     configManager,
     localMapStore,
-    documentsProvider: () => localMapStore.getAllDocuments(),
+    documentsProvider: knowledgeDocuments,
     sheetCsvPaths,
   }));
   console.info('[server] Protected routes registered');

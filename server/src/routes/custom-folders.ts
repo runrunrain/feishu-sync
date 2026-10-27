@@ -17,6 +17,7 @@
  * rename coordinator, and a single document failure never aborts the batch.
  */
 
+import { reconcileLocalIndex } from '../modules/local-index-reconcile.js';
 import { Hono } from 'hono';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -301,7 +302,8 @@ function tokenTail(objToken: string): string {
 
 customFolderRoutes.get('/api/custom-folders', async (c) => {
   try {
-    const { localMapStore } = await resolveConfig(c);
+    const { localMapStore, knowledgeBaseRoot } = await resolveConfig(c);
+    reconcileLocalIndex(localMapStore, knowledgeBaseRoot);
     const folders = localMapStore.listCustomFolders();
     const result = folders.map((folder: any) => ({
       id: folder.id,

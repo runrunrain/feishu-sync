@@ -296,7 +296,8 @@ describe('源选择批量事务', () => {
   it('超过分页范围仍一次处理全部；反选去重、隔离根目录并保持原始字节', async () => {
     const f = await fixture();
     const before = fs.readFileSync(path.join(f.raw, 'a.md'), 'utf8');
-    for (let i = 0; i < 120; i++) f.documents.push({ ...f.documents[0], objToken: `extra${i}`, title: `文档${i}`, localRelPath: `目录/文档${i}.md` });
+    fs.mkdirSync(path.join(f.raw, '目录'));
+    for (let i = 0; i < 120; i++) { fs.writeFileSync(path.join(f.raw, `目录/文档${i}.md`), '规则'); f.documents.push({ ...f.documents[0], objToken: `extra${i}`, title: `文档${i}`, localRelPath: `目录/文档${i}.md` }); }
     const tree = await f.call('/api/kb/sources/tree'); expect(tree.status).toBe(200); expect(tree.data.total).toBe(122);
     const tokens = f.documents.map((doc) => doc.objToken);
     const body = (action: string, target = tokens) => ({ root: f.raw, action, tokens: target });
@@ -319,5 +320,23 @@ describe('源选择批量事务', () => {
     f.store.createKbBuild({ id: 'queued', mode: 'full', status: 'queued', baseReleaseId: null, model: null, createdAt: new Date().toISOString() });
     expect((await f.call('/api/kb/sources/selection', 'POST', { root: f.raw, action: 'exclude', tokens: ['a', 'b'] })).status).toBe(409);
     expect(f.store.listKbExcludedSources(f.raw)).toEqual([]);
+  });
+});
+
+describe('手动删源与标准库更新闭环', () => {
+  it('已发布源手动删除后从当前选择消失，保留移除差异；更新消除旧正文，历史仍可追溯', async () => {
+    const f = await fixture(); await f.build('full'); const first = f.published().readCurrent()!.releaseId;
+    fs.unlinkSync(path.join(f.raw, 'a.md'));
+    const choices = (await f.call('/api/kb/sources')).data;
+    expect(choices.total).toBe(1); expect(choices.sources[0].objToken).toBe('b');
+    expect((await f.call('/api/kb/changes')).data.sources[0]).toMatchObject({ key: 'a', kind: 'removed' });
+    expect((await f.build()).status).toBe('published');
+    const manifest = f.published().readManifest()!;
+    expect(manifest.sourceSnapshot.map((source) => source.objToken)).toEqual(['b']);
+    expect(f.published().readReleaseDoc(manifest.releaseId, manifest.docs[0]).markdown).not.toContain('规则A');
+    expect((await f.call(`/api/kb/versions/${first}`)).status).toBe(200);
+    fs.unlinkSync(path.join(f.raw, 'b.md'));
+    expect((await f.build()).status).toBe('published'); expect(f.published().readManifest()!.docs).toEqual([]);
+    expect((await f.call('/api/kb/sources/tree')).data.total).toBe(0);
   });
 });

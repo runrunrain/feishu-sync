@@ -24,3 +24,11 @@ describe('源文档树批量选择', () => {
     expect(subtreeTokens(nodes)).toHaveLength(1200);
   });
 });
+
+it('清理模式独立选择可包含父/子，既有参与构建标记不随待清理勾选改变', () => {
+  const selected = new Set(['父文档', '子文档']);
+  const tree = sourceTreeRows(roots, '', new Set(), selected);
+  expect(tree.stats.get('父文档')).toEqual({ total: 3, included: 2 });
+  expect(tree.stats.get('孙文档')?.included).toBe(0);
+  expect(roots[0].children[0].children[0].source?.included).toBe(false);
+});

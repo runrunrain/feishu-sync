@@ -5,6 +5,9 @@
  * 只读查询不依赖 SQLite；构建状态来自 kb_builds 表。
  */
 
+import { SnapshotService } from '../modules/snapshot-service.js';
+import { cleanupSources } from '../kb/source-cleanup.js';
+import { createLocalPathInspector } from '../modules/local-path-state.js';
 import type { KbSourceChoice } from '../types/kb-version.js';
 import { buildSourceTree } from '../kb/source-tree.js';
 import { Hono } from 'hono';
@@ -205,11 +208,14 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
       const { store, config } = await loadStore();
       const excluded = new Set(localMapStore.listKbExcludedSources(config.knowledgeBaseRoot));
       const manifest = store.readManifest();
-      const scan = RawSourceSnapshot.scan(config.knowledgeBaseRoot, sourceDocuments(config.knowledgeBaseRoot), deps.sheetCsvPaths);
+      const documents = deps.documentsProvider();
+      const scan = RawSourceSnapshot.scan(config.knowledgeBaseRoot, documents.filter((doc) => !excluded.has(doc.objToken)), deps.sheetCsvPaths);
       const current = new Map(scan.entries.map((entry) => [entry.objToken, entry]));
       const base = new Map((manifest?.sourceSnapshot ?? []).map((entry) => [entry.objToken, entry]));
-      const candidates = new Map(collectSourceCandidates(deps.documentsProvider()).map((doc) => [doc.objToken, { title: doc.title, relPath: doc.localRelPath! }]));
-      for (const [token, entry] of base) if (!candidates.has(token)) candidates.set(token, entry);
+      const candidates = new Map(collectSourceCandidates(documents).map((doc) => [doc.objToken, { title: doc.title, relPath: doc.localRelPath! }]));
+      // 当前选择仅列实际存在的本地源；旧版本引用留在差异/版本入口。
+      const inspect = createLocalPathInspector(config.knowledgeBaseRoot);
+      for (const [token, doc] of candidates) if (inspect(doc.relPath) !== 'present') candidates.delete(token);
       const choices: KbSourceChoice[] = [...candidates].map(([objToken, doc]) => {
         const old = base.get(objToken); const next = current.get(objToken);
         const isExcluded = excluded.has(objToken);
@@ -217,7 +223,7 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
           : !old ? 'added' : next.contentHash !== old.contentHash || next.relPath !== old.relPath || next.title !== old.title ? 'changed' : 'unchanged';
         return { objToken, title: doc.title || objToken, relPath: doc.relPath, included: !isExcluded, published: Boolean(old), pending };
       });
-    return { choices, config, documents: deps.documentsProvider() };
+    return { choices, config, documents };
   };
   routes.get('/api/kb/sources', async (c) => {
     try {
@@ -245,6 +251,22 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
       if (body.tokens.some((token: string) => !valid.has(token))) throw new ToolError('source_not_found', '部分源文档已不存在，请刷新', 404);
       if (buildService.activeBuild(localMapStore)) throw new ToolError('kb_build_running', '更新进行中，请结束后再调整源文档', 409);
       return c.json({ selection: localMapStore.setKbSourcesIncluded(config.knowledgeBaseRoot, body.tokens, body.action) });
+    } catch (error) { return errorResponse(c, error); }
+  });
+
+  routes.post('/api/kb/sources/cleanup', async (c) => {
+    try {
+      const body = await c.req.json();
+      if (body?.confirm !== 'CLEANUP' || !Array.isArray(body.sources) || !body.sources.length || body.sources.length > 50000
+        || !body.sources.every((source: unknown) => source && typeof source === 'object' && typeof (source as any).objToken === 'string' && typeof (source as any).relPath === 'string'))
+        throw new ToolError('invalid_request', '请确认清理并提供明确的源文档清单', 400);
+      const { config } = await loadStore();
+      if (body.root !== config.knowledgeBaseRoot) throw new ToolError('source_selection_changed', '原始库已变化，请刷新后重新选择', 409);
+      if (buildService.activeBuild(localMapStore)) throw new ToolError('kb_build_running', '更新进行中，暂不能清理源文档', 409);
+      const result = cleanupSources(localMapStore, config.knowledgeBaseRoot, body.sources);
+      try { new SnapshotService(localMapStore, configManager, { larkCliClient: null, config }).generate(); }
+      catch (error) { console.warn('[kb] source cleanup snapshot refresh failed:', error); }
+      return c.json(result);
     } catch (error) { return errorResponse(c, error); }
   });
 

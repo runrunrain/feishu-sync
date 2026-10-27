@@ -1238,3 +1238,10 @@ export function getKbSourceTree() { return request<KbSourceTreeDto>('/api/kb/sou
 export function setKbSourcesSelection(root: string, tokens: string[], action: 'include' | 'exclude' | 'invert') {
   return request<{ selection: { objToken: string; included: boolean }[] }>('/api/kb/sources/selection', { method: 'POST', body: JSON.stringify({ root, tokens, action }) });
 }
+
+/** 指定原始源移入库内回收目录，并清理对应索引。 */
+export async function cleanupKbSources(root: string, sources: Array<{ objToken: string; relPath: string }>) {
+  const result = await request<{ cleaned: number; movedFiles: number; trashDir: string }>('/api/kb/sources/cleanup', { method: 'POST', body: JSON.stringify({ root, sources, confirm: 'CLEANUP' }) });
+  emitDiffChanged('source-cleanup');
+  return result;
+}

@@ -19,6 +19,7 @@
  * work end-to-end without requiring callers to update middleware.
  */
 
+import { reconcileLocalIndex } from '../modules/local-index-reconcile.js';
 import { Hono } from 'hono';
 import { MappingService, MappingValidationError, CrossParentReorderError } from '../modules/mapping-service.js';
 import { SnapshotService } from '../modules/snapshot-service.js';
@@ -260,6 +261,7 @@ mappingRoutes.get('/api/mapping/index', async (c) => {
     if (!config?.knowledgeBaseRoot) {
       return c.json({ error: 'knowledgeBaseRoot not configured' }, 400);
     }
+    reconcileLocalIndex((c as any).localMapStore, config.knowledgeBaseRoot, () => snap.generate());
     const existing = snap.readExisting(config.knowledgeBaseRoot);
     if (!existing) {
       return c.json({ error: 'snapshot_not_generated_yet' }, 404);

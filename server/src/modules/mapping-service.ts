@@ -22,6 +22,8 @@
  *   - display adjustable: only local_sort_order is touched on reorder
  */
 
+import { reconcileLocalIndex } from './local-index-reconcile.js';
+import { localPathState } from './local-path-state.js';
 import type { ChangeDetector } from './change-detector.js';
 import type { LocalMapStore } from './local-map-store.js';
 import type { SnapshotService } from './snapshot-service.js';
@@ -401,6 +403,7 @@ export class MappingService {
    * getTreeDetailed instead.
    */
   getTree(): MappingNode[] {
+    reconcileLocalIndex(this.localMapStore, this.configManager?.getConfig()?.knowledgeBaseRoot ?? '', () => this.snapshotService.generate());
     const documents = this.localMapStore.getAllDocuments();
     // Cloud-view projection: cloud_deleted rows go to the trash-bin UI, and
     // custom-folder archive docs (custom_folder_id set) are rendered by the
@@ -449,6 +452,7 @@ export class MappingService {
    * watched_root_url field per node).
    */
   getTreeDetailed(options: { view: 'feishu' | 'local'; includeOrphans?: boolean } = { view: 'feishu' }): TreeResponse {
+    reconcileLocalIndex(this.localMapStore, this.configManager?.getConfig()?.knowledgeBaseRoot ?? '', () => this.snapshotService.generate());
     const view = options.view === 'local' ? 'local' : 'feishu';
     const includeOrphans = options.includeOrphans ?? (view === 'local');
 
@@ -528,7 +532,7 @@ export class MappingService {
         if (config?.knowledgeBaseRoot) {
           const snap = this.snapshotService.readExisting(config.knowledgeBaseRoot);
           if (snap?.orphan_files) {
-            orphanFiles = snap.orphan_files;
+            orphanFiles = snap.orphan_files.filter((entry) => localPathState(config.knowledgeBaseRoot, entry.path) !== 'missing');
           }
         }
       } catch (err) {

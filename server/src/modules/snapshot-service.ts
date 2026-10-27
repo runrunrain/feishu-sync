@@ -24,6 +24,7 @@
  * and orphan-detection (P1 upgrade pays off here).
  */
 
+import { reconcileLocalIndex } from './local-index-reconcile.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { LocalMapStore } from './local-map-store.js';
@@ -157,6 +158,7 @@ export class SnapshotService {
       );
     }
 
+    reconcileLocalIndex(this.localMapStore, kbRoot);
     const documents = this.localMapStore.getAllDocuments();
     const nodes = documents.map((d) => this.projectDocument(d));
     const customFolderPrefixes = this.collectCustomFolderPrefixes();
@@ -213,6 +215,7 @@ export class SnapshotService {
     }
 
     const previous = this.readExisting(kbRoot);
+    reconcileLocalIndex(this.localMapStore, kbRoot);
     const documents = this.localMapStore.getAllDocuments();
     const nodes = documents.map((d) => this.projectDocument(d));
     const watchedRoots = this.buildWatchedRoots();
