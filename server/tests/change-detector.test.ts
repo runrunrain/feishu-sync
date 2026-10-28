@@ -24,6 +24,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { ChangeDetector } from '../src/modules/change-detector.js';
 import { MappingService } from '../src/modules/mapping-service.js';
+import { LarkCliClient } from '../src/modules/lark-cli-client.js';
 import type {
   CloudNodeObservation,
   LarkCliNodeInfo,
@@ -1198,6 +1199,60 @@ describe('ChangeDetector.detectChanges result cache (sync-state-timeout-fix)', (
     expect(store.rows.get('doc-A')).toMatchObject({
       syncState: 'synced', hasChild: newParent === 'node-A',
     });
+  });
+
+  it('traverses singleton CLI branches and restores cloud-visible descendants hidden by old deletion records', async () => {
+    const store = new MockLocalMapStore();
+    const rootUrl = 'https://example.feishu.cn/wiki/rootA';
+    store.rows.set('root-doc', makeLocal({
+      objToken: 'root-doc', wikiNodeToken: 'rootA', parentNodeToken: null,
+      watchedRootId: 'rootA', watchedRootUrl: rootUrl, hasChild: true,
+    }));
+    const child = makeCloud({
+      obj_token: 'child-doc', node_token: 'child-node',
+      parent_node_token: 'rootA', has_child: true, obj_edit_time: 1000,
+    });
+    const grandchild = makeCloud({
+      obj_token: 'grandchild-doc', node_token: 'grandchild-node',
+      parent_node_token: 'child-node', obj_edit_time: 1000,
+    });
+    for (const node of [child, grandchild]) {
+      store.rows.set(node.obj_token, makeLocal({
+        objToken: node.obj_token, wikiNodeToken: node.node_token,
+        parentNodeToken: node.parent_node_token, watchedRootId: 'rootA',
+        watchedRootUrl: rootUrl, syncState: 'deleted_confirmed', cloudDeleted: 1,
+      }));
+    }
+    const client = new LarkCliClient({ requiredScopes: [] });
+    const listParents: string[] = [];
+    client.getDocumentMetas = async () => ({
+      metas: [{ docToken: 'root-doc', docType: 'docx', latestModifyTime: 1000, title: 'root' }],
+      failed: [],
+    });
+    (client as any).execute = async (args: string[]) => {
+      if (args[1] === '+node-list') {
+        const parent = args[args.indexOf('--parent-node-token') + 1];
+        listParents.push(parent);
+        const node = parent === 'rootA' ? child : grandchild;
+        return (client as any).parseJsonOutput(JSON.stringify(node));
+      }
+      const url = args[args.indexOf('--node-token') + 1];
+      return { ok: true, data: url.endsWith('/child-node') ? child : grandchild };
+    };
+    const detector = new ChangeDetector(client, store as any);
+
+    await detector.detectChanges(rootUrl, { mode: 'fast' });
+
+    expect(listParents).toEqual(['rootA', 'child-node']);
+    const tree = new MappingService(detector, store as any, {} as any).getTree();
+    expect(tree).toHaveLength(3);
+    expect(tree.find((node) => node.obj_token === 'child-doc')).toMatchObject({
+      parent_node_token: 'rootA', has_child: true, cloud_deleted: 0,
+    });
+    expect(tree.find((node) => node.obj_token === 'grandchild-doc')).toMatchObject({
+      parent_node_token: 'child-node', cloud_deleted: 0,
+    });
+    expect(store.missCalls).toEqual([]);
   });
 
   it('refreshes existing child relationships on consecutive fast checks without content edits', async () => {

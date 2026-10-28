@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -125,6 +125,88 @@ describe('LarkCliClient output parsing and classification', () => {
         ],
       },
     });
+  });
+
+  it.each([0, 1, 2])('lists %i bare NDJSON wiki nodes without dropping a singleton', async (count) => {
+    const client = createClient();
+    const nodes = Array.from({ length: count }, (_, index) => ({
+      node_token: `node-${index}`,
+      obj_token: `obj-${index}`,
+      obj_type: 'sheet',
+      title: `子文档 ${index}`,
+      has_child: true,
+      parent_node_token: 'parent',
+      space_id: 'space',
+    }));
+    (client as any).execute = async (args: string[]) => {
+      expect(args).toEqual([
+        'wiki', '+node-list', '--format', 'ndjson', '--page-all',
+        '--space-id', 'space', '--parent-node-token', 'parent',
+      ]);
+      return internals(client).parseJsonOutput(nodes.map((node) => JSON.stringify(node)).join('\n'));
+    };
+
+    expect(await client.listWikiNodes({ spaceId: 'space', parentNodeToken: 'parent' })).toEqual(nodes);
+  });
+
+  it.each(['win32', 'darwin'])('preserves large metadata JSON through the %s CLI boundary', async (platform) => {
+    const client = createClient();
+    const requests = Array.from({ length: 135 }, (_, index) => ({
+      docToken: `document-${index.toString().padStart(19, '0')}`,
+      docType: 'docx',
+    }));
+    const batchSizes: number[] = [];
+    const requestFiles: string[] = [];
+    (client as any).execute = async (args: string[]) => {
+      const dataArgument = args[args.indexOf('--data') + 1];
+      if (platform === 'win32') {
+        expect(dataArgument.startsWith('@')).toBe(true);
+        requestFiles.push(dataArgument.slice(1));
+      }
+      const batch = JSON.parse(dataArgument.startsWith('@')
+        ? fs.readFileSync(dataArgument.slice(1), 'utf8') : dataArgument).request_docs;
+      batchSizes.push(batch.length);
+      if (platform === 'win32') expect(args.join(' ').length).toBeLessThan(7000);
+      return { ok: true, data: {
+        metas: batch.slice(0, -1).map((node: { doc_token: string; doc_type: string }) => ({
+          ...node, latest_modify_time: '1000', title: node.doc_token,
+        })),
+        failed_list: [{ token: batch.at(-1).doc_token, code: 970003 }],
+      } };
+    };
+    vi.stubGlobal('process', { ...process, platform });
+    try {
+      const result = await client.getDocumentMetas(requests);
+      expect(batchSizes).toEqual([135]);
+      expect(result.metas.length + result.failed.length).toBe(requests.length);
+      expect(new Set([...result.metas.map((node) => node.docToken), ...result.failed.map((node) => node.docToken)]).size)
+        .toBe(requests.length);
+      for (const requestFile of requestFiles) {
+        expect(fs.existsSync(requestFile)).toBe(false);
+        expect(fs.existsSync(path.dirname(requestFile))).toBe(false);
+      }
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('removes the Windows metadata request file after a failed CLI call', async () => {
+    const client = createClient();
+    let requestFile = '';
+    (client as any).execute = async (args: string[]) => {
+      requestFile = args[args.indexOf('--data') + 1].slice(1);
+      expect(fs.existsSync(requestFile)).toBe(true);
+      throw new Error('metadata request failed');
+    };
+    vi.stubGlobal('process', { ...process, platform: 'win32' });
+    try {
+      await expect(client.getDocumentMetas([{ docToken: 'document', docType: 'docx' }]))
+        .rejects.toThrow('metadata request failed');
+      expect(fs.existsSync(requestFile)).toBe(false);
+      expect(fs.existsSync(path.dirname(requestFile))).toBe(false);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it('handles braces inside JSON strings while extracting a log-prefixed value', () => {

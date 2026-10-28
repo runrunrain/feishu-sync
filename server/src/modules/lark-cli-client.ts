@@ -910,6 +910,12 @@ export class LarkCliClient {
     if (Array.isArray(data?.records) && !Array.isArray(data?.nodes)) {
       return data.records as LarkCliNodeInfo[];
     }
+    // A single bare NDJSON entity is normalized as data:<node>, while
+    // multiple entities become data.records. Treating the singleton as an
+    // empty list stops BFS at every branch with exactly one child.
+    if (typeof data?.node_token === 'string' && typeof data?.obj_token === 'string') {
+      return [data as LarkCliNodeInfo];
+    }
     return data?.nodes || [];
   }
 
@@ -928,17 +934,34 @@ export class LarkCliClient {
         `drive metadata batch exceeds ${MAX_DRIVE_META_BATCH_SIZE} documents: ${requests.length}`,
       );
     }
-
-    const result = await this.execute([
-      'drive', 'metas', 'batch_query', '--format', 'json',
-      '--data',
-      JSON.stringify({
-        request_docs: requests.map((request) => ({
-          doc_token: request.docToken,
-          doc_type: request.docType,
-        })),
-      }),
-    ], 'drive');
+    const requestJson = JSON.stringify({
+      request_docs: requests.map((request) => ({
+        doc_token: request.docToken,
+        doc_type: request.docType,
+      })),
+    });
+    let requestDir: string | undefined;
+    let result: any;
+    try {
+      let dataArgument = requestJson;
+      if (process.platform === 'win32') {
+        // The .cmd shim both strips inline JSON quotes and imposes an
+        // 8191-character command limit. CLI's documented @file input avoids
+        // both problems while retaining Drive's full 200-document batch.
+        requestDir = fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-sync-drive-meta-'));
+        const requestFile = path.join(requestDir, 'request.json');
+        fs.writeFileSync(requestFile, requestJson, { encoding: 'utf8', mode: 0o600 });
+        dataArgument = `@${requestFile}`;
+      }
+      result = await this.execute([
+        'drive', 'metas', 'batch_query', '--format', 'json', '--data', dataArgument,
+      ], 'drive');
+    } finally {
+      if (requestDir) {
+        fs.rmSync(path.join(requestDir, 'request.json'), { force: true });
+        fs.rmdirSync(requestDir);
+      }
+    }
     const payload = result.data ?? {};
     const metas = Array.isArray(payload.metas)
       ? payload.metas.map((meta: Record<string, unknown>) => {
