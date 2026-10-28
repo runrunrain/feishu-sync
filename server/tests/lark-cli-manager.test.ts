@@ -323,6 +323,10 @@ describe('installOrUpdateLarkCli', () => {
   it('returns npm_not_found without spawning when npm is unavailable', async () => {
     const binDir = makeBinDir(false);
     const { manager } = createManager({ binDir });
+    // This case tests the install guard, not executable discovery. Linux
+    // runners can find their real npm in common directories despite an
+    // empty test PATH, so make the unavailable precondition explicit.
+    vi.spyOn(manager, 'findNpm').mockReturnValue({ available: false, path: null });
 
     const result = await manager.installOrUpdateLarkCli();
 

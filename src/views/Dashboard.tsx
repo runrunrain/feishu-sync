@@ -311,9 +311,10 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
 
   useEffect(() => {
     return onDiffChanged(() => {
+      void loadFeishu();
       void loadDiffAndSnapshot();
     });
-  }, [loadDiffAndSnapshot]);
+  }, [loadFeishu, loadDiffAndSnapshot]);
 
   // The active node list (feishu view only).
   const activeNodes: MappingNode[] = useMemo(() => {

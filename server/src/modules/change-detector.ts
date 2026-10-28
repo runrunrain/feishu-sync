@@ -131,11 +131,10 @@ interface ParentChainProjection {
 }
 
 /**
- * `fast` checks only documents already mapped to the local knowledge base.
- * It intentionally does not discover brand-new/moved/deleted Wiki nodes,
- * which is what lets a normal poll stay O(documents / 200) instead of making
- * one Wiki detail request per node. `full` retains the topology-reconcile
- * path for bootstrap and explicit recovery operations.
+ * `fast` batches content metadata and refreshes Wiki topology through raw
+ * node lists, fetching individual details only for new nodes and bounded
+ * metadata exceptions. `full` additionally refreshes per-node details and
+ * evaluates traversal absences for bootstrap and explicit recovery.
  */
 export type ChangeDetectionMode = 'fast' | 'full';
 
@@ -634,16 +633,15 @@ export class ChangeDetector {
    * downloaded. A Wiki detail lookup is used only for at most eight
    * documents that the batch endpoint explicitly cannot resolve.
    *
-   * Structural reconciliation is deliberately excluded from the metadata
-   * comparison: a metadata batch cannot prove whether a moved Wiki node
-   * still belongs beneath this root. If the local database has no ownership
-   * baseline at all, we fall back once to the full scanner so later polls
-   * can be fast and safe.
+   * Wiki topology comes from a separate raw traversal: a metadata batch
+   * cannot prove whether a moved Wiki node still belongs beneath this root.
+   * If the local database has no ownership baseline at all, we fall back
+   * once to the full scanner so later polls can be fast and safe.
    *
    * fast-added-fix: brand-new nodes are a different story — they are exactly
    * what users expect "立即检测" to surface, and the metadata batch alone
    * structurally cannot see them (they have no local row yet). After the
-   * metadata pass, discoverAddedNodes() runs one raw topology BFS
+   * metadata pass, refreshTopologyObservations() runs one raw topology BFS
    * (one `wiki +node-list` per parent node, no per-node node-get for the
    * unchanged majority) and resolves only genuinely new obj_tokens via
    * `wiki +node-get`. Deletion inference remains a full-mode-only concern:
@@ -809,10 +807,11 @@ export class ChangeDetector {
     // would otherwise never appear in the pending list (the exact regression
     // where "only already-indexed nodes ever update"). Cost: one node-list
     // per parent node, plus one node-get per genuinely new node.
-    const addedObservations = await this.discoverAddedNodes(rootUrl, rootToken, tracked);
-    if (addedObservations.length > 0) observations.push(...addedObservations);
+    const refreshedObservations = await this.refreshTopologyObservations(
+      rootUrl, rootToken, tracked, observations,
+    );
 
-    const changedDocuments = await this.compareWithLocalRecords(observations, {
+    const changedDocuments = await this.compareWithLocalRecords(refreshedObservations, {
       rootToken,
       watchedRootUrl: rootUrl,
       // The fast path checks known documents plus freshly discovered
@@ -831,7 +830,10 @@ export class ChangeDetector {
       changed: changedDocuments.length > 0,
       changedDocuments,
       checkedAt: new Date().toISOString(),
-      totalNodes: tracked.length,
+      totalNodes: new Set([
+        ...tracked.map((record) => record.objToken),
+        ...refreshedObservations.map((node) => node.objToken),
+      ]).size,
       traversalComplete: false,
       failedNodeTokens: Array.from(failedTokens),
       missingCandidates,
@@ -843,12 +845,14 @@ export class ChangeDetector {
   }
 
   /**
-   * Topology discovery for the fast path (fast-added-fix).
+   * Topology refresh for the fast path.
    *
    * Runs the raw BFS (same bfsCollectRawNodes as the full scan — one
-   * `wiki +node-list` per parent node, NO per-node node-get) and returns
-   * observations only for nodes whose obj_token has no row among the
-   * tracked baseline. Each genuinely new node costs one `wiki +node-get`
+   * `wiki +node-list` per parent node, NO per-node node-get) and
+   * updates parent/child metadata for existing observations even if their
+   * content timestamp is unchanged. Previously only new nodes were saved,
+   * freezing existing hierarchy and hasChild at their initial values.
+   * Each genuinely new node costs one `wiki +node-get`
    * to resolve its obj_edit_time/obj_type, mirroring what the full scan
    * would have recorded on first contact.
    *
@@ -857,17 +861,19 @@ export class ChangeDetector {
    * we cannot distinguish "new node" from "level we failed to list".
    * The metadata pass above is unaffected either way.
    * - This pass never feeds deletion inference: its observations flow into
-   * compareWithLocalRecords with traversalComplete=false, so absence of a
-   * local row is the only actionable signal (-> pending_added).
+   * compareWithLocalRecords with traversalComplete=false. Known nodes gain
+   * fresh hierarchy; unseen nodes become pending_added. Absent nodes retain
+   * their previous state until an explicit full reconciliation.
    *
    * space_id sourcing: prefer the space_id already stored on baseline rows
    * (saves one getNode(rootUrl) per fast detect), then the in-memory cache,
    * and only then a fresh root lookup.
    */
-  private async discoverAddedNodes(
+  private async refreshTopologyObservations(
     rootUrl: string,
     rootToken: string,
     tracked: DocumentRecord[],
+    metadataObservations: CloudNodeObservation[],
   ): Promise<CloudNodeObservation[]> {
     let spaceId = tracked.find((record) => record.spaceId)?.spaceId
       ?? this.spaceIdCache.get(rootUrl)
@@ -880,10 +886,10 @@ export class ChangeDetector {
           `[ChangeDetector] Fast added-discovery could not resolve space for ${rootUrl}:`,
           error,
         );
-        return [];
+        return metadataObservations;
       }
     }
-    if (!spaceId) return [];
+    if (!spaceId) return metadataObservations;
     this.spaceIdCache.set(rootUrl, spaceId);
 
     let raw: RawTraversalResult;
@@ -894,27 +900,64 @@ export class ChangeDetector {
         `[ChangeDetector] Fast added-discovery BFS failed for ${rootUrl}:`,
         error,
       );
-      return [];
+      return metadataObservations;
     }
     if (!raw.complete) {
       console.warn(
         `[ChangeDetector] Fast added-discovery skipped: topology incomplete for ${rootUrl}`,
       );
-      return [];
+      return metadataObservations;
     }
 
-    const knownObjTokens = new Set(
-      tracked.filter((record) => record.objToken).map((record) => record.objToken),
-    );
-    const freshNodes = raw.nodes.filter((node) => !knownObjTokens.has(node.obj_token));
-    if (freshNodes.length === 0) return [];
+    const recordsByToken = new Map(tracked.map((record) => [record.objToken, record]));
+    const observationsByToken = new Map(metadataObservations.map((node) => [node.objToken, node]));
+    // A topology response proves identity and hierarchy, not content
+    // freshness. If Drive failed, keep the content observation unavailable
+    // rather than treating a cached timestamp as a successful cloud read.
+    const knownObservation = (record: DocumentRecord): CloudNodeObservation =>
+      observationsByToken.get(record.objToken) ?? {
+        wikiNodeToken: record.wikiNodeToken ?? '',
+        objToken: record.objToken,
+        objType: this.normalizeObjType(record.objType),
+        title: record.title,
+        spaceId: record.spaceId ?? spaceId,
+        parentNodeToken: record.parentNodeToken ?? null,
+        watchedRootId: rootToken,
+        watchedRootUrl: rootUrl,
+        observedObjEditTime: null,
+        hasChild: record.hasChild === true,
+        observationStatus: 'unavailable',
+      };
 
-    const observations: CloudNodeObservation[] = [];
-    for (const node of freshNodes) {
+    // The BFS lists descendants, so infer the watched root's flag from its
+    // current direct children without an additional node-get request.
+    const rootRecord = tracked.find((record) => record.wikiNodeToken === rootToken);
+    if (rootRecord) {
+      observationsByToken.set(rootRecord.objToken, {
+        ...knownObservation(rootRecord),
+        hasChild: raw.nodes.some((node) => node.parent_node_token === rootToken),
+      });
+    }
+
+    let addedCount = 0;
+    for (const node of raw.nodes) {
+      const record = recordsByToken.get(node.obj_token);
+      if (record) {
+        observationsByToken.set(node.obj_token, {
+          ...knownObservation(record),
+          wikiNodeToken: node.node_token,
+          objType: this.normalizeObjType(node.obj_type),
+          title: node.title,
+          spaceId: node.space_id ?? spaceId,
+          parentNodeToken: node.parent_node_token ?? null,
+          hasChild: node.has_child,
+        });
+        continue;
+      }
       const detail = await this.fetchNodeDetail(spaceId, node.node_token, rootUrl);
       const info = detail.node;
       const observedObjEditTime = info?.obj_edit_time ?? null;
-      observations.push({
+      observationsByToken.set(node.obj_token, {
         wikiNodeToken: node.node_token,
         objToken: node.obj_token,
         objType: this.normalizeObjType(info?.obj_type ?? node.obj_type),
@@ -924,16 +967,19 @@ export class ChangeDetector {
         watchedRootId: rootToken,
         watchedRootUrl: rootUrl,
         observedObjEditTime,
-        hasChild: info?.has_child ?? node.has_child,
+        hasChild: node.has_child,
         observationStatus: info && observedObjEditTime != null
           ? 'available'
           : detail.observationStatus,
       });
+      addedCount += 1;
     }
-    console.info(
-      `[ChangeDetector] Fast added-discovery found ${observations.length} new node(s) under ${rootUrl}`,
-    );
-    return observations;
+    if (addedCount > 0) {
+      console.info(
+        `[ChangeDetector] Fast added-discovery found ${addedCount} new node(s) under ${rootUrl}`,
+      );
+    }
+    return [...observationsByToken.values()];
   }
 
   private rootTokenFromUrl(rootUrl: string): string {
