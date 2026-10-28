@@ -32,7 +32,8 @@ import { applySelectionGesture, createSelectionResolver, type SelectionModifiers
 import { SourceNodeMenu, type SourceMenuTarget } from './SourceNodeMenu';
 import { insertionSide, reorderSiblings, siblingDropTarget } from '../utils/treeReorder';
 import { getMappingTree, reorderMapping } from '../api/client';
-import type { CustomFolder, MappingNode, TreeNavTarget, WatchedRoot } from '../types';
+import { cloudMoveFace, isMoveOutEligible } from './move-out/labels';
+import type { CloudMoveRecord, CustomFolder, MappingNode, TreeNavTarget, WatchedRoot } from '../types';
 
 type TreeFilter = 'all' | 'changed' | 'error' | 'orphan';
 
@@ -56,6 +57,16 @@ interface NodeTreeViewProps {
   /** 文档右键与归档删除入口，由父层显示本地文件/屏蔽选项并刷新树。 */
   onDeleteDoc?: (doc: { objToken: string; title: string }) => void;
   onBatchAction?: (tokens: string[], action: 'delete' | 'block') => void;
+  /**
+   * P2-S7：「移出到云空间」右键入口（仅 watchedRoot 成员叶子显示，本地
+   * 判断 + 服务端八分支门控兜底）。两段确认弹窗由父层（Dashboard）挂载。
+   */
+  onMoveOutDoc?: (doc: { objToken: string; title: string }) => void;
+  /**
+   * P2-S7：objToken → 最新移出记录（展示层 join，U48）：moved 覆盖
+   * 「已删除」为「已移出」；moving/pending 显示「移出中」。
+   */
+  latestMoveByToken?: Map<string, CloudMoveRecord>;
   selectionVersion?: number;
   /** Business marks keyed by obj_token (e.g. parsed from title or rules). */
   businessMarksByToken?: Record<string, string[]>;
@@ -185,6 +196,8 @@ export function NodeTreeView({
   focusRequest,
   onDeleteDoc,
   onBatchAction,
+  onMoveOutDoc,
+  latestMoveByToken,
   selectionVersion = 0,
 }: NodeTreeViewProps) {
   const [nodes, setNodes] = useState<MappingNode[]>(nodesProp ?? []);
@@ -404,9 +417,24 @@ export function NodeTreeView({
     setDragOver(null); setDraggingToken(null);
   };
   const openNodeMenu = (e: React.MouseEvent, node: MappingNode) => {
-    if (!onDeleteDoc) return;
+    if (!onDeleteDoc && !onMoveOutDoc) return;
     e.preventDefault(); e.stopPropagation(); onSelect(node.obj_token);
-    setContextMenu({ objToken: node.obj_token, title: node.title, x: e.clientX, y: e.clientY });
+    // P2-S7 移出入口本地资格（watchedRoot 成员叶子；服务端八分支兜底）：
+    // 结构树成员 = wiki_node_token 非空；叶子 = 云端无子且本地未观测到子行。
+    const childrenCount = node.wiki_node_token
+      ? (tree.childrenByParent.get(node.wiki_node_token) ?? []).length
+      : 0;
+    setContextMenu({
+      objToken: node.obj_token,
+      title: node.title,
+      x: e.clientX,
+      y: e.clientY,
+      moveOutEligible: isMoveOutEligible({
+        wiki_node_token: node.wiki_node_token,
+        has_child: node.has_child,
+        childrenCount,
+      }),
+    });
   };
   const handleDragStart = (e: React.DragEvent, node: MappingNode) => {
     if (reorderBusy || multiMode) { e.preventDefault(); return; }
@@ -490,6 +518,7 @@ export function NodeTreeView({
           selected={selectedToken === node.obj_token}
           hasChildren={hasChildren}
           businessMarks={marks}
+          cloudMoveFace={cloudMoveFace(latestMoveByToken?.get(node.obj_token))}
           onToggle={handleToggle}
           onSelect={handleRowClick}
           onDragStart={handleDragStart}
@@ -739,7 +768,7 @@ export function NodeTreeView({
                           role="treeitem"
                           aria-selected={multiMode ? chosen.has(doc.objToken) : selected}
                           tabIndex={0}
-                          onContextMenu={(e) => { if (!onDeleteDoc) return; e.preventDefault(); e.stopPropagation(); onSelect(doc.objToken); setContextMenu({ objToken: doc.objToken, title: doc.title, x: e.clientX, y: e.clientY }); }}
+                          onContextMenu={(e) => { if (!onDeleteDoc) return; e.preventDefault(); e.stopPropagation(); onSelect(doc.objToken); setContextMenu({ objToken: doc.objToken, title: doc.title, x: e.clientX, y: e.clientY, moveOutEligible: false }); }}
                           onClick={(e) => handleRowClick(doc.objToken, e)}
                           onKeyDown={(e) => {
                             if (e.target !== e.currentTarget) return;
@@ -1040,7 +1069,8 @@ export function NodeTreeView({
     <div ref={rootRef} className="min-h-0 min-w-0 h-full">
       <SourceNodeMenu target={contextMenu} count={contextTokens.length} onClose={closeMenu}
         onDelete={(doc) => { if (onBatchAction && contextTokens.length > 1) onBatchAction(contextTokens, 'delete'); else onDeleteDoc?.(doc); }}
-        onBlock={onBatchAction ? () => onBatchAction(contextTokens, 'block') : undefined} />
+        onBlock={onBatchAction ? () => onBatchAction(contextTokens, 'block') : undefined}
+        onMoveOut={onMoveOutDoc} />
       <Card variant="default" className={`min-w-0 flex flex-col ${className}`}>
       <div className="flex flex-wrap items-center gap-2 border-b border-line px-3.5 py-2.5">
         <div className="flex min-w-0 flex-1 basis-[120px] items-center gap-2 rounded-md border border-line bg-paper px-2.5 py-1.5 focus-within:border-seal">

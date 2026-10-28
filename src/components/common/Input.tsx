@@ -124,9 +124,11 @@ interface ToggleProps {
   onChange: (checked: boolean) => void;
   disabled?: boolean;
   helperText?: string;
+  /** 开关按钮的可访问名称（label 与按钮是分离 DOM，无此名称时读屏/自动化无法定位）。 */
+  ariaLabel?: string;
 }
 
-export function Toggle({ label, checked, onChange, disabled = false, helperText }: ToggleProps) {
+export function Toggle({ label, checked, onChange, disabled = false, helperText, ariaLabel }: ToggleProps) {
   return (
     <div className="flex items-center justify-between gap-3">
       <div className="min-w-0 flex-1">
@@ -140,6 +142,9 @@ export function Toggle({ label, checked, onChange, disabled = false, helperText 
       <button
         onClick={() => onChange(!checked)}
         disabled={disabled}
+        aria-label={ariaLabel}
+          role="switch"
+          aria-checked={checked}
         className={`
           relative inline-flex shrink-0 h-6 w-11 items-center rounded-full transition-colors duration-fast
           ${checked ? 'bg-seal' : 'bg-paper border border-line'}

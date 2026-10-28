@@ -11,6 +11,7 @@ import { ChevronRight, FileText, Table, FileType, Folder } from 'lucide-react';
 import { TreeSelectionBox, type TreeSelectionProps } from './TreeSelectionBox';
 import { BusinessTag } from './common/BusinessTag';
 import { StatusBadge } from './common/StatusBadge';
+import type { CloudMoveFace } from './move-out/labels';
 import type { MappingNode } from '../types';
 
 interface TreeNodeProps {
@@ -33,6 +34,12 @@ interface TreeNodeProps {
   reorderBusy?: boolean;
   isDragging?: boolean;
   selection?: TreeSelectionProps;
+  /**
+   * P2-S7：该文档最新移出记录的展示层覆盖（U48 展示层 join，不改观测
+   * 字段）。moved → 「已移出」替代「已删除」徽标（区分于回收站/删除）；
+   * moving/pending → 「移出中」；unknown/failed 同理呈现。null 沿用原状态。
+   */
+  cloudMoveFace?: CloudMoveFace | null;
 }
 
 const TYPE_ICON = {
@@ -81,11 +88,23 @@ export function TreeNode({
   reorderBusy,
   isDragging,
   selection,
+  cloudMoveFace: moveFace,
 }: TreeNodeProps) {
   const TypeIcon = hasChildren ? Folder : (TYPE_ICON[node.obj_type] ?? FileType);
   const pendingLocal = node.sync_state === 'pending_added' && !node.sync_blocked;
+  // P2-S7：移出状态覆盖徽标（moved → 覆盖「已删除」；moving 优先于
+  // 「变更」；其余沿用既有状态文案）。
+  const moveBadge =
+    moveFace != null
+      ? { status: moveFace.badgeStatus, text: moveFace.treeText, title: moveFace.title }
+      : null;
+  const deletedFace = node.cloud_deleted === 1;
   const showChangedBadge =
-    node.sync_blocked || pendingLocal || node.status === 'changed' || node.cloud_deleted === 1;
+    moveBadge != null || node.sync_blocked || pendingLocal || node.status === 'changed' || deletedFace;
+  const badgeStatus = moveBadge?.status
+    ?? (deletedFace ? 'deleted' : node.status === 'error' ? 'error' : 'modified');
+  const badgeText = moveBadge?.text
+    ?? (deletedFace ? '已删除' : node.sync_blocked ? '已屏蔽' : pendingLocal ? '待同步' : '变更');
   // v0.2.5 层级视觉：顶层节点（level 0）文字/图标大于深层；深层不再与顶层同尺寸。
   const isRootLevel = level === 0;
 
@@ -187,12 +206,11 @@ export function TreeNode({
 
         {/* Change badge */}
         {showChangedBadge && (
-          <StatusBadge
-            status={node.cloud_deleted === 1 ? 'deleted' : node.status === 'error' ? 'error' : 'modified'}
-            size="sm"
-          >
-            {node.cloud_deleted === 1 ? '已删除' : node.sync_blocked ? '已屏蔽' : pendingLocal ? '待同步' : '变更'}
-          </StatusBadge>
+          <span title={moveBadge?.title}>
+            <StatusBadge status={badgeStatus} size="sm">
+              {badgeText}
+            </StatusBadge>
+          </span>
         )}
 
         {/* Status dot */}

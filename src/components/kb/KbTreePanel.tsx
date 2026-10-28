@@ -12,6 +12,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronDown, ChevronRight, FileText, Folder, Loader2, Search, X } from 'lucide-react';
 import { searchKb, APIError } from '../../api/client';
 import type { KbSearchResult, KbTreeNode } from '../../types/agent';
+import { KbPublishStateBadge } from './KbPublishStateBadge';
 
 interface KbTreePanelProps {
   nodes: KbTreeNode[];
@@ -20,6 +21,8 @@ interface KbTreePanelProps {
   /** 树刷新信号（发布完成后父级递增以重置展开态）。 */
   releaseId: string;
   loading?: boolean;
+  /** 反向发布状态（P1-S9）：路径 → 最新发布状态与云端链接；空/无行不渲染徽标。 */
+  publicationsByPath?: Map<string, { state: string; cloudUrl: string | null }> | null;
 }
 
 export function KbTreePanel({
@@ -28,6 +31,7 @@ export function KbTreePanel({
   onSelectDoc,
   releaseId,
   loading = false,
+  publicationsByPath,
 }: KbTreePanelProps) {
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<KbSearchResult[] | null>(null);
@@ -114,6 +118,14 @@ export function KbTreePanel({
       >
         <FileText className={`w-3.5 h-3.5 shrink-0 ${selected ? 'text-seal' : 'text-ink-faint'}`} />
         <span className="truncate text-xs">{node.title ?? node.name}</span>
+        {publicationsByPath ? (
+          <KbPublishStateBadge
+            state={publicationsByPath.get(node.path)?.state ?? ''}
+            compact
+            cloudUrl={publicationsByPath.get(node.path)?.cloudUrl ?? null}
+            linkVariant="click"
+          />
+        ) : null}
       </button>
     );
   };

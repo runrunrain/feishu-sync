@@ -23,12 +23,12 @@ import { SyncProvider } from './hooks/useSync';
 
 function AppShell() {
   const [currentArea, setCurrentArea] = useState<MainArea>('overview');
-  const [settingsFocusTab, setSettingsFocusTab] = useState<'application' | 'agent' | undefined>(undefined);
+  const [settingsFocusTab, setSettingsFocusTab] = useState<'application' | 'agent' | 'auth' | undefined>(undefined);
   const [settingsFocusNonce, setSettingsFocusNonce] = useState(0);
   // 全局新版本徽标（仅桌面端；启动时主进程会静默检查一次更新）。
   const { availableVersion } = useDesktopUpdateBadge();
 
-  const handleJumpToSettings = (tab?: 'application' | 'agent') => {
+  const handleJumpToSettings = (tab?: 'application' | 'agent' | 'auth') => {
     if (tab) {
       setSettingsFocusTab(tab);
       setSettingsFocusNonce((n) => n + 1);
@@ -87,6 +87,7 @@ function AppShell() {
             <KnowledgeView
               active={currentArea === 'knowledge'}
               onJumpToSettings={() => handleJumpToSettings('agent')}
+              onJumpToPublishSettings={() => handleJumpToSettings('auth')}
             />
           </div>
           <div className={currentArea === 'agent' ? 'flex-1 min-h-0 flex flex-col animate-fade-in' : 'hidden'}>

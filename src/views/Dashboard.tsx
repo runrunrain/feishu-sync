@@ -32,6 +32,7 @@ import { DocPreviewPanel } from '../components/DocPreviewPanel';
 import { ColumnResizer } from '../components/ColumnResizer';
 import { OrphanFileAlert } from '../components/OrphanFileAlert';
 import { QuickAddDocDialog } from '../components/QuickAddDocDialog';
+import { MoveOutModal } from '../components/move-out/MoveOutModal';
 import { useConfig } from '../hooks/useConfig';
 import { useToast } from '../components/common/Toast';
 import {
@@ -39,12 +40,15 @@ import {
   getMappingIndex,
   getMappingTreeDetailed,
   listCustomFolders,
+  listCloudMoves,
   manualDeleteDoc,
+  previewSourceBatch,
 } from '../api/client';
 import { appLogger } from '../utils/appLogger';
 import { onDiffChanged } from '../utils/syncEvents';
 import { isUsableWikiUrl, pickFirstValidWikiUrl } from '../utils/wikiUrl';
 import type {
+  CloudMoveRecord,
   MappingNode,
   ChangedDocument,
   CustomFolder,
@@ -196,11 +200,44 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
 
   const [batchTarget, setBatchTarget] = useState<{ tokens: string[]; action: 'delete' | 'block' } | null>(null);
   const [selectionVersion, setSelectionVersion] = useState(0);
+  // P2-S7 移出到云空间：目标文档（右键菜单入口）+ 移出记录（展示层 join）。
+  const [moveOutTarget, setMoveOutTarget] = useState<{ objToken: string; title: string } | null>(null);
+  const [cloudMoves, setCloudMoves] = useState<CloudMoveRecord[]>([]);
+  const loadCloudMoves = useCallback(async () => {
+    try {
+      const { moves } = await listCloudMoves({ limit: 200 });
+      setCloudMoves(moves);
+    } catch (err) {
+      // 旧 server（P2-S6 前）混跑兼容：端点 404 不阻断总览，只记日志。
+      appLogger.warn('dashboard', 'listCloudMoves failed', err);
+    }
+  }, []);
+  useEffect(() => { void loadCloudMoves(); }, [loadCloudMoves]);
+  /** objToken → 最新一条移出记录（树徽标覆盖源，U48 展示层 join）。 */
+  const latestMoveByToken = useMemo(() => {
+    const map = new Map<string, CloudMoveRecord>();
+    for (let i = cloudMoves.length - 1; i >= 0; i -= 1) {
+      map.set(cloudMoves[i].objToken, cloudMoves[i]);
+    }
+    return map;
+  }, [cloudMoves]);
+  /** objToken → 该文档全部移出记录（详情卡列表，最新在前）。 */
+  const movesByToken = useMemo(() => {
+    const map = new Map<string, CloudMoveRecord[]>();
+    for (const move of cloudMoves) {
+      const arr = map.get(move.objToken) ?? [];
+      arr.push(move);
+      map.set(move.objToken, arr);
+    }
+    return map;
+  }, [cloudMoves]);
   const [deleteTarget, setDeleteTarget] = useState<{ objToken: string; title: string } | null>(null);
   const [deleteFiles, setDeleteFiles] = useState(true); const [blockDeleted, setBlockDeleted] = useState(false);
   const [deleting, setDeleting] = useState(false); const [deleteError, setDeleteError] = useState('');
+  /** P1-S4：删除确认的引用悬空风险（预览接口返回；null=未加载/无风险）。 */
+  const [deleteRefRisk, setDeleteRefRisk] = useState<{ title: string; count: number; sources: string[] } | null>(null);
   const handleManualDeleteDoc = useCallback((doc: { objToken: string; title: string }) => {
-    setDeleteTarget(doc); setDeleteFiles(true); setBlockDeleted(false); setDeleteError('');
+    setDeleteTarget(doc); setDeleteFiles(true); setBlockDeleted(false); setDeleteError(''); setDeleteRefRisk(null);
   }, []);
   const confirmDeleteDoc = async () => {
     if (!deleteTarget || deleting) return;
@@ -212,6 +249,21 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
     } catch (err) { setDeleteError(err instanceof Error ? err.message : '删除失败'); }
     finally { setDeleting(false); }
   };
+
+  // P1-S4：删除确认前拉取引用悬空风险（复用源批量预览 API 的单文档形态；
+  // 拉取失败不阻断删除——风险提示是增强信息，不是删除门槛）。
+  useEffect(() => {
+    if (!deleteTarget || !config?.knowledgeBaseRoot) { setDeleteRefRisk(null); return; }
+    let cancelled = false;
+    previewSourceBatch({ root: config.knowledgeBaseRoot, tokens: [deleteTarget.objToken], action: 'delete', includeDescendants: false, deleteFiles: true, block: false })
+      .then((preview) => {
+        if (cancelled) return;
+        const risk = preview.referenceLossRisk?.[0];
+        setDeleteRefRisk(risk ? { title: risk.title, count: risk.referencedByCount, sources: risk.sources.map((source) => source.title ?? source.objToken) } : null);
+      })
+      .catch(() => { if (!cancelled) setDeleteRefRisk(null); });
+    return () => { cancelled = true; };
+  }, [deleteTarget, config?.knowledgeBaseRoot]);
 
   // Load feishu view by default.
   useEffect(() => {
@@ -421,6 +473,12 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
       }} /> : null}
       <Modal open={deleteTarget !== null} title={`删除文档「${deleteTarget?.title ?? ''}」`} onClose={() => { if (!deleting) setDeleteTarget(null); }} contentClassName="max-w-xl">
         <p className="text-sm text-ink-soft leading-relaxed mb-4">删除当前文档的本地版本，子文档继续保留。所属上级仍受有效同步根管理时，当前文档会立即转为待同步。</p>
+        {deleteRefRisk && deleteRefRisk.count > 0 ? (
+          <div role="alert" className="mb-4 rounded border border-seal/40 bg-seal/5 px-3 py-2 text-xs leading-relaxed">
+            <p className="text-seal font-medium mb-1">引用悬空风险：该文档被 {deleteRefRisk.count} 篇文档引用，删除后这些引用将指向不存在的文档。</p>
+            <p className="text-ink-soft">引用方：{deleteRefRisk.sources.slice(0, 5).join('、')}{deleteRefRisk.sources.length > 5 ? ' 等' : ''}</p>
+          </div>
+        ) : null}
         <label className="flex items-start gap-2 text-sm text-ink mb-3"><input type="checkbox" aria-label="同时删除本地源文件" checked={deleteFiles} disabled={deleting} onChange={(e) => setDeleteFiles(e.target.checked)} />同时删除本地源文件（移入可恢复的回收目录）</label>
         {!deleteFiles ? <p className="text-xs text-ink-faint mb-3">保留磁盘文件，只清除索引基线；重建索引后文件可再次出现。</p> : null}
         <label className="flex items-start gap-2 text-sm text-ink mb-2"><input type="checkbox" aria-label="移入屏蔽名单" checked={blockDeleted} disabled={deleting} onChange={(e) => setBlockDeleted(e.target.checked)} />移入屏蔽名单</label>
@@ -457,6 +515,8 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
             onRefreshed={loadFeishu}
             onDeleteDoc={handleManualDeleteDoc}
             onBatchAction={(tokens, action) => setBatchTarget({ tokens, action })}
+            onMoveOutDoc={setMoveOutTarget}
+            latestMoveByToken={latestMoveByToken}
             selectionVersion={selectionVersion}
             className="h-full"
           />
@@ -515,6 +575,7 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
               allNodes={activeNodes}
               watchedRoots={watchedRoots}
               onSelectNode={setSelectedToken}
+              cloudMoves={selectedNode ? movesByToken.get(selectedNode.obj_token) : undefined}
               onSyncNode={() => {
                 toast.push({
                   type: 'info',
@@ -540,6 +601,19 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
         foldersLoading={customFoldersLoading}
         onChanged={() => {
           void loadCustomFolders();
+          void loadFeishu();
+        }}
+      />
+
+      {/* P2-S7 移出到云空间：两段确认弹窗（preview → 确认值门控 → 执行 →
+          异步轮询收敛）；收敛后刷新树与移出记录。 */}
+      <MoveOutModal
+        open={moveOutTarget !== null}
+        objToken={moveOutTarget?.objToken ?? null}
+        target={moveOutTarget}
+        onClose={() => setMoveOutTarget(null)}
+        onMoved={() => {
+          void loadCloudMoves();
           void loadFeishu();
         }}
       />

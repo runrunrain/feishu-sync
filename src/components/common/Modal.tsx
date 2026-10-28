@@ -19,9 +19,11 @@ interface ModalProps {
   children: React.ReactNode;
   /** 内容区最大宽度（Tailwind class），缺省 max-w-md。 */
   contentClassName?: string;
+  /** 遮罩层 z-index class，缺省 z-50；需浮在 Drawer(z-[350]) 之上时传 z-[400]。 */
+  zIndexClass?: string;
 }
 
-export function Modal({ open, title, onClose, children, contentClassName = 'max-w-md' }: ModalProps) {
+export function Modal({ open, title, onClose, children, contentClassName = 'max-w-md', zIndexClass = 'z-50' }: ModalProps) {
   useEffect(() => {
     if (!open || !onClose) return;
     const handler = (e: KeyboardEvent) => {
@@ -35,7 +37,7 @@ export function Modal({ open, title, onClose, children, contentClassName = 'max-
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-ink/30 backdrop-blur-[2px] p-4"
+      className={`fixed inset-0 ${zIndexClass} flex items-center justify-center bg-ink/30 backdrop-blur-[2px] p-4`}
       onMouseDown={(e) => {
         // 仅点遮罩空白处关闭；弹窗内容区内冒泡的 mousedown 不触发。
         if (e.target === e.currentTarget) onClose?.();

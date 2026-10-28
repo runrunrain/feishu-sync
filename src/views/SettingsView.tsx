@@ -17,9 +17,11 @@ import type { LucideIcon } from 'lucide-react';
 import {
   Bot,
   BookOpen,
+  CloudUpload,
   Database,
   FolderArchive,
   FolderTree,
+  ImageIcon,
   Info,
   KeyRound,
   PenLine,
@@ -36,6 +38,7 @@ import { WatchedRootsCard } from '../components/WatchedRootsCard';
 import { OrphanFilesCard } from '../components/OrphanFilesCard';
 import { SyncBlocklistCard } from '../components/SyncBlocklistCard';
 import { CustomArchiveSettingsCard } from '../components/CustomArchiveSettingsCard';
+import { SyncMediaSettingsCard } from '../components/SyncMediaSettingsCard';
 import { ModelProviderSettings } from '../components/ModelProviderSettings';
 import { AuthSettingsCard } from '../components/AuthSettingsCard';
 import { AppUpdateCard } from '../components/AppUpdateCard';
@@ -43,6 +46,7 @@ import { AgentPluginsCard } from '../components/agent/AgentPluginsCard';
 import { AgentRuntimeSettingsCard, AgentKbSettingsCard } from '../components/agent/AgentSettingsCard';
 import { CliAccessSettingsCard } from '../components/CliAccessSettingsCard';
 import { FeishuWriteSettingsCard } from '../components/FeishuWriteSettingsCard';
+import { FeishuPublishSettingsCard } from '../components/FeishuPublishSettingsCard';
 
 type SettingsTab = 'knowledge' | 'models' | 'agent' | 'auth' | 'application';
 
@@ -84,6 +88,13 @@ const SETTINGS_TABS: SettingsTabMeta[] = [
         description: '飞书同步根 URL 与本地目录',
         icon: FolderTree,
         render: () => <WatchedRootsCard />,
+      },
+      {
+        id: 'kb-sync-media',
+        label: '同步媒体选项',
+        description: '幻灯片整页截图与白板矢量导出的采集开关',
+        icon: ImageIcon,
+        render: () => <SyncMediaSettingsCard />,
       },
       {
         id: 'kb-orphan-files',
@@ -155,7 +166,7 @@ const SETTINGS_TABS: SettingsTabMeta[] = [
   {
     id: 'auth',
     label: '飞书认证',
-    description: 'lark-cli 登录状态、权限范围与文档写入授权',
+    description: 'lark-cli 登录状态、权限范围、文档写入与反向发布授权',
     icon: ShieldCheck,
     items: [
       {
@@ -171,6 +182,13 @@ const SETTINGS_TABS: SettingsTabMeta[] = [
         description: '写回飞书开关与文档写入权限增量授权（S13）',
         icon: PenLine,
         render: () => <FeishuWriteSettingsCard />,
+      },
+      {
+        id: 'auth-feishu-publish',
+        label: '飞书发布',
+        description: '反向发布开关与发布根校验（P1-S9）',
+        icon: CloudUpload,
+        render: () => <FeishuPublishSettingsCard />,
       },
     ],
   },

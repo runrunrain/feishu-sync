@@ -101,6 +101,59 @@ export function canTestVision(visionEnabled: boolean, providerId: string, modelI
   return visionEnabled || Boolean(providerId) || Boolean(modelId);
 }
 
+// ---------------------------------------------------------------------------
+// P2-S3：构建字数预算（消费 P2-S2 契约：{0} ∪ [4000, 400000]，缺省 40000）
+// ---------------------------------------------------------------------------
+
+/** 每批字数预算取值域边界（与 server normalizeBuildBatchWordBudget 同源；
+ *  PUT 未新增拒绝规则，越界值服务端静默钳到边界，前端按同款逻辑先行钳制，
+ *  保证「保存将按 N 生效」提示与实际落盘值一致）。导出供单测锚定。 */
+export const BUILD_BATCH_WORD_BUDGET_MIN = 4000;
+export const BUILD_BATCH_WORD_BUDGET_MAX = 400000;
+export const BUILD_BATCH_WORD_BUDGET_DEFAULT = 40000;
+
+/** 对齐 server 链制语义（normalizeBuildBatchWordBudget）：非数字/非有限数
+ *  （含空串）→ 缺省 40000；floor 后 ≤0 → 0（按源数分批）；再链到
+ *  [4000, 400000]。PUT 未新增拒绝规则，越界值服务端静默链到边界，前端
+ *  按同款逻辑先行链制，保证提示与实际落盘值一致。导出供单测锚定。 */
+export function clampBuildBatchWordBudget(raw: string | number): number {
+  if (typeof raw === 'string' && !raw.trim()) return BUILD_BATCH_WORD_BUDGET_DEFAULT;
+  const value = typeof raw === 'number' ? raw : Number(String(raw).trim());
+  if (!Number.isFinite(value)) return BUILD_BATCH_WORD_BUDGET_DEFAULT;
+  const budget = Math.floor(value);
+  if (budget <= 0) return 0;
+  return Math.min(BUILD_BATCH_WORD_BUDGET_MAX, Math.max(BUILD_BATCH_WORD_BUDGET_MIN, budget));
+}
+
+/** 输入框即时反馈（null = 输入合法且不会链制，直接保存即可；
+ *  'error' 阻断保存，'hint'/'warn' 仅提示）。导出供单测锚定。 */
+export function describeBuildBatchWordBudgetInput(
+  raw: string,
+): { level: 'hint' | 'warn' | 'error'; text: string } | null {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return { level: 'error', text: '请输入数字（0 或 4000–400000）' };
+  }
+  const value = Number(trimmed);
+  if (!Number.isFinite(value)) {
+    return { level: 'error', text: '非数字：保存时将回落缺省 40000，请修正后再保存' };
+  }
+  if (value <= 0) {
+    // 0 是合法取值；负数/小数 ≤0 会被链到 0，同样回到「按源数分批」。
+    return { level: 'hint', text: '0 = 按源数分批（旧行为，兼容回退开关）' };
+  }
+  const clamped = clampBuildBatchWordBudget(value);
+  if (clamped !== Math.floor(value)) {
+    return {
+      level: 'warn',
+      text: clamped < value
+        ? `高于上限 ${BUILD_BATCH_WORD_BUDGET_MAX}，保存将按 ${clamped} 生效`
+        : `低于下限 ${BUILD_BATCH_WORD_BUDGET_MIN}，保存将按 ${clamped} 生效`,
+    };
+  }
+  return { level: 'hint', text: '0 = 按源数分批（旧行为）；范围 4000–400000，越界保存时按边界链制' };
+}
+
 /** 测试结果一行摘要。导出供单测锚定。 */
 export function describeVisionTestResult(result: AgentVisionTestResult): string {
   if (result.ok) return `测试通过 · ${result.model} · ${result.latencyMs}ms`;
@@ -593,6 +646,10 @@ export function AgentKbSettingsCard() {
   const [outputRoot, setOutputRoot] = useState('');
   const [savingRoot, setSavingRoot] = useState(false);
 
+  // P2-S3：每批字数预算输入（回填自服务端链制后的真相值；保存按前端同款链制发送）。
+  const [budgetInput, setBudgetInput] = useState('');
+  const [savingBudget, setSavingBudget] = useState(false);
+
   const [workspaces, setWorkspaces] = useState<AgentWorkspaceConfig[] | null>(null);
   const [wsLoading, setWsLoading] = useState(true);
   const [newName, setNewName] = useState('');
@@ -606,6 +663,11 @@ export function AgentKbSettingsCard() {
   useEffect(() => {
     setOutputRoot(config?.standardKb?.outputRoot ?? '');
   }, [config?.standardKb?.outputRoot]);
+
+  useEffect(() => {
+    const value = config?.standardKb?.buildBatchWordBudget;
+    setBudgetInput(value === undefined || value === null ? '' : String(value));
+  }, [config?.standardKb?.buildBatchWordBudget]);
 
   const reloadWorkspaces = async () => {
     setWsLoading(true);
@@ -633,6 +695,7 @@ export function AgentKbSettingsCard() {
           outputRoot: '',
           retainReleases: 3,
           buildBatchSize: 10,
+          buildBatchWordBudget: BUILD_BATCH_WORD_BUDGET_DEFAULT,
           promptTimeoutMinutes: 15,
           buildTimeoutMinutes: 180,
           buildParallelism: 2,
@@ -647,6 +710,35 @@ export function AgentKbSettingsCard() {
     }
   };
 
+  // P2-S3：每批字数预算（数字输入 + 保存；越界即时提示链制结果，保存按链制值发送）。
+  const budgetFeedback = describeBuildBatchWordBudgetInput(budgetInput);
+  const saveBudget = async () => {
+    if (!budgetInput.trim() || !Number.isFinite(Number(budgetInput.trim()))) {
+      toast.push({ type: 'warning', message: '请输入数字（0 或 4000–400000）' });
+      return;
+    }
+    setSavingBudget(true);
+    try {
+      const base: StandardKbConfig =
+        config?.standardKb ?? {
+          outputRoot: '',
+          retainReleases: 3,
+          buildBatchSize: 10,
+          buildBatchWordBudget: BUILD_BATCH_WORD_BUDGET_DEFAULT,
+          promptTimeoutMinutes: 15,
+          buildTimeoutMinutes: 180,
+          buildParallelism: 2,
+          autoBuildAfterSync: false,
+        };
+      await updateConfig({ standardKb: { ...base, buildBatchWordBudget: clampBuildBatchWordBudget(budgetInput) } });
+      toast.push({ type: 'success', message: '每批字数预算已保存' });
+    } catch (err) {
+      toast.push({ type: 'error', message: err instanceof APIError ? err.message : '保存失败' });
+    } finally {
+      setSavingBudget(false);
+    }
+  };
+
   // S4 §4.6：构建并行数（1..6；选择即保存，服务端严格校验并夹取）。
   const buildParallelism = config?.standardKb?.buildParallelism ?? 2;
   const saveBuildParallelism = async (value: number) => {
@@ -656,6 +748,7 @@ export function AgentKbSettingsCard() {
           outputRoot: '',
           retainReleases: 3,
           buildBatchSize: 10,
+          buildBatchWordBudget: BUILD_BATCH_WORD_BUDGET_DEFAULT,
           promptTimeoutMinutes: 15,
           buildTimeoutMinutes: 180,
           buildParallelism: 2,
@@ -760,6 +853,52 @@ export function AgentKbSettingsCard() {
           <p className="mt-1 text-[11px] text-ink-faint" data-testid="build-parallelism-hint">
             实际并行受 Agent 进程上限（maxConcurrentProcesses 的后台配额）与工作单元数约束；
             1 路为单进程等价回退，多路只在多单元构建时生效。
+          </p>
+        </div>
+
+        {/* P2-S3：每批字数预算（字数预算制分批；0 = 按源数分批旧行为） */}
+        <div>
+          <FieldLabel hint="0 或 4000–400000">每批字数预算</FieldLabel>
+          <div className="flex gap-2">
+            <input
+              className={`${INPUT_CLS} font-mono text-xs`}
+              type="number"
+              min={0}
+              step={1000}
+              value={budgetInput}
+              disabled={savingBudget}
+              onChange={(e) => setBudgetInput(e.target.value)}
+              placeholder="40000"
+              aria-label="每批字数预算"
+              data-testid="build-word-budget-input"
+            />
+            <Button
+              size="sm"
+              variant="secondary"
+              loading={savingBudget}
+              disabled={budgetFeedback?.level === 'error'}
+              onClick={saveBudget}
+              className="shrink-0 whitespace-nowrap"
+              data-testid="build-word-budget-save"
+            >
+              保存
+            </Button>
+          </div>
+          {budgetFeedback && budgetFeedback.level !== 'hint' ? (
+            <p
+              className={`mt-1 text-[11px] leading-snug ${
+                budgetFeedback.level === 'error' ? 'text-seal-2' : 'text-amber-700'
+              }`}
+              role={budgetFeedback.level === 'error' ? 'alert' : undefined}
+              data-testid="build-word-budget-feedback"
+            >
+              {budgetFeedback.text}
+            </p>
+          ) : null}
+          <p className="mt-1 text-[11px] text-ink-faint leading-relaxed" data-testid="build-word-budget-hint">
+            0 = 按源数分批（旧行为）；范围 4000–400000，越界保存时按边界链制，非数字回落缺省 40000。
+            构建分批按有效字数（源正文 + 已描述图片文字）装箱，与模型上下文消耗同量纲，
+            单源超预算时独占一批；「每批源数上限」仍由构建批次大小约束。
           </p>
         </div>
 

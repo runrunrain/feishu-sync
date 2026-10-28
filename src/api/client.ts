@@ -3,6 +3,12 @@ import type { CliEnableResult, CliInfoDto, CliRotateResult, CliShimInstallResult
 import type { PiPluginsDto } from '../types/pi-plugin';
 import type { AgentPluginsDto, AgentPluginInput } from '../types/agent-plugin';
 import type { KbSourceTreeDto, KbSourceChoice, KbChangePreview, KbVersionDto } from '../types/kb-version';
+import type {
+  KbPublicationRowDto,
+  KbPublishPlanDto,
+  KbPublishRunResultDto,
+  PublishTargetDto,
+} from '../types/kb-publish';
 /**
  * API client for feishu-sync
  * All requests include X-Desktop-Token header from window.desktop
@@ -28,10 +34,18 @@ import type {
   CustomFolder,
   AddLinkToFolderResult,
   DocumentContent,
+  DocumentComments,
   SourceEditStatus,
   SourceEditResult,
   SourcePushPlan,
   SourcePushResult,
+  SourcePushLogRecord,
+  CloudHistoryListResult,
+  HistoryRevertPlan,
+  HistoryRevertExecutionResult,
+  MoveOutPreview,
+  MoveOutExecutionResult,
+  CloudMoveRecord,
 } from '../types';
 import type {
   AgentApprovalDto,
@@ -648,6 +662,16 @@ export async function getDocumentContent(objToken: string): Promise<DocumentCont
   );
 }
 
+/**
+ * GET /api/mapping/comments/:objToken — 文档评论（P2-S4 评论溯源）。
+ * collected=false 表示从未采集（非 docx 或未成功同步过）。
+ */
+export async function getDocumentComments(objToken: string): Promise<DocumentComments> {
+  return request<DocumentComments>(
+    `/api/mapping/comments/${encodeURIComponent(objToken)}`,
+  );
+}
+
 export async function getWorkbookPreview(objToken: string, sheet: number, signal?: AbortSignal): Promise<WorkbookPreview> {
   return request<WorkbookPreview>(`/api/mapping/workbook/${encodeURIComponent(objToken)}?sheet=${sheet}`, {
     signal, timeoutMs: 60_000,
@@ -1132,6 +1156,69 @@ export async function getKbMcpInfo(): Promise<KbMcpInfoDto> {
 }
 
 // ---------------------------------------------------------------------------
+// 反向发布（P1-S9，设计 P1 §4.6；契约见 P1-S8 报告 §二）
+// ---------------------------------------------------------------------------
+
+export interface KbPublishPlanOptions {
+  /** 缺省 = CURRENT 指向的 release（release 不可变，显式指定亦可）。 */
+  releaseId?: string;
+  /** 缺省 = 整个 release（全量模式，含 kb_removed 标记）。 */
+  kbPaths?: string[];
+  /** 解除 publish_cloud_edited 冲突（确认值升级为 OVERWRITE_PUBLISHED）。 */
+  force?: boolean;
+}
+
+/** POST /api/kb/publish/preview —— 只读发布计划（动作/警告/门控/确认值派生）。 */
+export async function previewKbPublish(options: KbPublishPlanOptions): Promise<KbPublishPlanDto> {
+  return request<KbPublishPlanDto>('/api/kb/publish/preview', {
+    method: 'POST',
+    body: JSON.stringify({
+      ...(options.releaseId !== undefined ? { releaseId: options.releaseId } : {}),
+      ...(options.kbPaths !== undefined ? { kbPaths: options.kbPaths } : {}),
+      ...(options.force !== undefined ? { force: options.force } : {}),
+    }),
+    // 计划含云端 metas 批量取数（≤200/批），大库给足余量。
+    timeoutMs: 180_000,
+  });
+}
+
+/** POST /api/kb/publish —— 执行发布（confirm 门 + planKey 复核）。 */
+export async function executeKbPublish(
+  options: KbPublishPlanOptions & { confirm: string; planKey?: string },
+): Promise<KbPublishRunResultDto> {
+  const { confirm, planKey, ...rest } = options;
+  const body: Record<string, unknown> = { ...rest, confirm, actor: 'ui' };
+  if (planKey !== undefined) body.planKey = planKey;
+  // 服务端逐文档串行执行，可能持续数分钟：不设前端超时（由服务端控制节奏）。
+  return request<KbPublishRunResultDto>('/api/kb/publish', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+/** GET /api/kb/publications —— 全部发布记录（kb_path 序）。 */
+export function listKbPublications(): Promise<{ publications: KbPublicationRowDto[] }> {
+  return request<{ publications: KbPublicationRowDto[] }>('/api/kb/publications');
+}
+
+/** GET /api/kb/publications/:kbPath —— 单条发布记录（路径含 `/`，整体编码）。 */
+export function getKbPublication(kbPath: string): Promise<KbPublicationRowDto> {
+  return request<KbPublicationRowDto>(`/api/kb/publications/${encodeURIComponent(kbPath)}`);
+}
+
+/** PUT /api/kb/publish/target —— 设置/清除发布根（仅 desktop token 链路）。 */
+export function setKbPublishTarget(
+  body: { url: string } | { kind: 'drive_folder' | 'wiki_node'; token: string; label?: string; spaceId?: string } | { target: null },
+): Promise<{ target: PublishTargetDto | null; overlapChecked?: boolean }> {
+  return request('/api/kb/publish/target', {
+    method: 'PUT',
+    body: JSON.stringify(body),
+    // wiki 发布根走云端祖先链双向校验（深度 ≤50）。
+    timeoutMs: 120_000,
+  });
+}
+
+// ---------------------------------------------------------------------------
 // 会话（§9.3）
 // ---------------------------------------------------------------------------
 
@@ -1464,4 +1551,136 @@ export function pushSourceToFeishu(
       actor: 'ui',
     }),
   });
+}
+
+// ---------------------------------------------------------------------------
+// P0-S5 回滚 UI（写回记录 / 云端历史 / 回滚两段流；消费 S3/S4 路由）
+// ---------------------------------------------------------------------------
+
+/** GET /api/sources/:objToken/push-log —— 写回记录（created_at 倒序，≤50 行）。 */
+export function getSourcePushLog(objToken: string): Promise<{ logs: SourcePushLogRecord[] }> {
+  return request<{ logs: SourcePushLogRecord[] }>(`/api/sources/${encodeURIComponent(objToken)}/push-log`);
+}
+
+/**
+ * GET /api/sources/:objToken/history —— 云端历史。缺省从第一页聚合（上限
+ * 3 页，truncated=true 时 nextPageToken 续翻）；显式 pageToken 单页透传。
+ */
+export function getCloudHistory(
+  objToken: string,
+  opts?: { pageToken?: string; pageSize?: number },
+): Promise<CloudHistoryListResult> {
+  const query = new URLSearchParams();
+  if (opts?.pageToken) query.set('pageToken', opts.pageToken);
+  if (opts?.pageSize != null) query.set('pageSize', String(opts.pageSize));
+  const qs = query.toString();
+  return request<CloudHistoryListResult>(
+    `/api/sources/${encodeURIComponent(objToken)}/history${qs ? `?${qs}` : ''}`,
+  );
+}
+
+/**
+ * GET /api/sources/:objToken/history-content —— 只读云端正文（T4b-08 对比
+ * 弹窗「对比云端当前」的真实数据源）。缺省 revisionId = 云端当前正文
+ *（最新版）；显式 revisionId 按历史 revision 读取（数值 id 空间，
+ * P0-S1 HP-3）。只读，不碰本地基线。
+ */
+export function fetchCloudContent(
+  objToken: string,
+  opts?: { revisionId?: number },
+): Promise<{ revisionId: number | null; content: string }> {
+  const query = new URLSearchParams();
+  if (opts?.revisionId != null && Number.isFinite(opts.revisionId)) {
+    query.set('revisionId', String(Math.floor(opts.revisionId)));
+  }
+  const qs = query.toString();
+  return request<{ revisionId: number | null; content: string }>(
+    `/api/sources/${encodeURIComponent(objToken)}/history-content${qs ? `?${qs}` : ''}`,
+  );
+}
+
+/**
+ * POST /api/sources/:objToken/history-revert/preview —— 回滚计划（只读）。
+ * target 二选一：{ pushLogId }（写回锚点回滚）| { historyVersionId }（指定版本）。
+ */
+export function previewHistoryRevert(
+  objToken: string,
+  target: { pushLogId?: string; historyVersionId?: string },
+): Promise<HistoryRevertPlan> {
+  return request<HistoryRevertPlan>(`/api/sources/${encodeURIComponent(objToken)}/history-revert/preview`, {
+    method: 'POST',
+    body: JSON.stringify(target),
+  });
+}
+
+/**
+ * POST /api/sources/:objToken/history-revert —— 执行回滚（destructive）。
+ * confirm 必须是 `REVERT_CLOUD:<historyVersionId>`（裸 REVERT_CLOUD 拒 400）；
+ * 异步起步返回 202 { state:'running', taskId, pushLogId }，同步完成 200。
+ */
+export function executeHistoryRevert(
+  objToken: string,
+  target: { pushLogId?: string; historyVersionId?: string },
+  confirm: string,
+): Promise<HistoryRevertExecutionResult> {
+  return request<HistoryRevertExecutionResult>(
+    `/api/sources/${encodeURIComponent(objToken)}/history-revert`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ ...target, confirm, actor: 'ui' }),
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// P2-S7 移出 UI（消费 P2-S6 四端点：preview / 执行 / moves/:id / moves）
+// ---------------------------------------------------------------------------
+
+/**
+ * POST /api/sources/:objToken/move-to-drive/preview —— 移出预览（只读）。
+ * 返回权威 wikiNodeToken（确认值派生源）+ 门控面 + 后果固定文案。
+ */
+export function previewMoveToDrive(
+  objToken: string,
+  opts?: { folderToken?: string },
+): Promise<MoveOutPreview> {
+  return request<MoveOutPreview>(`/api/sources/${encodeURIComponent(objToken)}/move-to-drive/preview`, {
+    method: 'POST',
+    body: JSON.stringify({ folderToken: opts?.folderToken ?? null }),
+  });
+}
+
+/**
+ * POST /api/sources/:objToken/move-to-drive —— 执行移出（destructive 逐次
+ * 确认）。confirm 必须是 `MOVE_OUT:<nodeToken>`（裸 MOVE_OUT 拒 400）；
+ * 异步起步返回 202 { state:'moving', moveId, taskId }，同步完成 200。
+ */
+export function executeMoveToDrive(
+  objToken: string,
+  confirm: string,
+  opts?: { folderToken?: string },
+): Promise<MoveOutExecutionResult> {
+  return request<MoveOutExecutionResult>(
+    `/api/sources/${encodeURIComponent(objToken)}/move-to-drive`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ folderToken: opts?.folderToken ?? null, confirm, actor: 'ui' }),
+    },
+  );
+}
+
+/** GET /api/sources/moves/:moveId —— 单条移出记录（异步收敛轮询）。 */
+export function getCloudMove(moveId: string): Promise<CloudMoveRecord> {
+  return request<CloudMoveRecord>(`/api/sources/moves/${encodeURIComponent(moveId)}`);
+}
+
+/** GET /api/sources/moves?objToken=&limit= —— 移出记录列表（最新在前）。 */
+export function listCloudMoves(
+  opts?: { objToken?: string; limit?: number },
+): Promise<{ moves: CloudMoveRecord[] }> {
+  const query = new URLSearchParams();
+  if (opts?.objToken) query.set('objToken', opts.objToken);
+  if (opts?.limit != null && Number.isFinite(opts.limit)) query.set('limit', String(Math.floor(opts.limit)));
+  const qs = query.toString();
+  return request<{ moves: CloudMoveRecord[] }>(`/api/sources/moves${qs ? `?${qs}` : ''}`);
 }

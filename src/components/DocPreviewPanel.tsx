@@ -30,6 +30,8 @@ import { MarkdownView, resolveMediaPath } from './preview/MarkdownView';
 import { CsvTableView } from './preview/CsvTableView';
 import { WorkbookView } from './preview/WorkbookView';
 import { SourceEditControls } from './SourceEditControls';
+import { SourceCommentsSection } from './SourceCommentsSection';
+import { DocReferenceSection } from './DocReferenceSection';
 import { getDocumentContent } from '../api/client';
 import { appLogger } from '../utils/appLogger';
 import { useToast } from './common/Toast';
@@ -420,6 +422,12 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
           </div>
         )}
       </div>
+
+      {/* P1-S4：文档详情「引用 / 被引用」折叠区（两侧皆空不渲染） */}
+      {!loading && !error && content ? <DocReferenceSection content={content} /> : null}
+
+      {/* P2-S4：评论区（只读；从未采集不渲染，与「没有评论」区分） */}
+      {!loading && !error && objToken ? <SourceCommentsSection objToken={objToken} /> : null}
 
       {/* 底部：路径 */}
       {content?.objType === 'sheet' && !content.workbook && !loading && (

@@ -16,8 +16,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AlertTriangle,
+  Anchor,
   CloudUpload,
+  FileClock,
   FilePenLine,
+  GitCompare,
+  History,
   Loader2,
   RefreshCw,
   RotateCcw,
@@ -30,6 +34,7 @@ import { useToast } from './common/Toast';
 import {
   APIError,
   editSourceDocument,
+  fetchCloudContent,
   getSourceEditStatus,
   previewSourcePush,
   pushSourceToFeishu,
@@ -37,6 +42,11 @@ import {
 } from '../api/client';
 import { appLogger } from '../utils/appLogger';
 import type { SourceEditStatus, SourcePushPlan, SourcePushResult } from '../types';
+import { CloudDiffModal, type CloudDiffSide } from './source-history/CloudDiffModal';
+import { CloudHistoryDrawer } from './source-history/CloudHistoryDrawer';
+import { HistoryRevertModal, type RevertTarget } from './source-history/HistoryRevertModal';
+import { SourcePushLogDrawer } from './source-history/SourcePushLogDrawer';
+import { formatTime, shortHistoryId } from './source-history/labels';
 
 /** 与 S11 splitHeaderBody 同规则：规范分隔 `-->\n\n` 计入头部；无法识别返回 null。 */
 export function splitFeishuSyncHeader(content: string): { header: string; body: string } | null {
@@ -69,7 +79,17 @@ const PUSH_BLOCKED_TEXT: Record<string, string> = {
   images_in_overwrite: '正文包含本地图片引用，云端无法解析（先移除图片再写回）',
   write_disabled: '写回飞书未开启：前往「设置 → 飞书认证 → 飞书写入」开启后重试',
   write_scope_missing: '缺少文档写入权限：前往「设置 → 飞书认证 → 飞书写入 → 授权写入权限」',
+  // P0-S3：overwrite 取不到云端历史锚点（force 不可越过）。
+  rollback_anchor_unavailable:
+    '云端历史暂不可读，取不到覆盖写回必需的回退锚点（覆盖前必须有回退点）。可稍后重试；追加写回不受影响',
+  // P0-S4：回滚互斥门。
+  cloud_revert_running: '该文档有进行中的云端回滚：等待回滚完成（可在「写回记录」查看状态）后再写回',
 };
+
+/** 冲突对比弹窗：云端侧正文真实拉取失败时的降级文案（T4b-08 起通道已
+ * 接入，只剩真实失败才进入此态——如实展示失败原因，不冒充不可接入）。 */
+const cloudBodyUnavailable = (face: { code: string; message: string }): string =>
+  `云端当前正文读取失败${face.code ? `（${face.code}）` : ''}：${face.message}。可先打开飞书文档核对云端内容，稍后重试对比。`;
 
 function errorFace(error: unknown): { code: string; message: string; details?: Record<string, unknown> } {
   if (error instanceof APIError) {
@@ -83,6 +103,41 @@ function errorFace(error: unknown): { code: string; message: string; details?: R
     };
   }
   return { code: '', message: error instanceof Error ? error.message : String(error) };
+}
+
+/**
+ * 冲突对比上下文构建（T4b-08 消费链）：真实调用只读正文 API 拉取**云端
+ * 当前正文**（不带 revisionId 的最新版），左侧云端/右侧本地；只有真实
+ * 失败才降级为不可读态（原因如实展示）。导出供宿主级回归测试直接
+ * 断言发出的 fetch 请求（URL 不含 revisionId）与两侧真实数据。
+ */
+export async function buildCloudDiffContext(
+  objToken: string,
+  context: { title: string; note: string },
+  localBody: string,
+  fetchImpl: (objToken: string) => Promise<{ content: string }> = (token) =>
+    fetchCloudContent(token),
+): Promise<{
+  title: string;
+  note: string;
+  cloud: CloudDiffSide;
+  local: CloudDiffSide;
+}> {
+  try {
+    const cloud = await fetchImpl(objToken);
+    return {
+      ...context,
+      cloud: { label: '云端当前正文', body: cloud.content },
+      local: { label: '本地当前正文', body: localBody },
+    };
+  } catch (error) {
+    const face = errorFace(error);
+    return {
+      ...context,
+      cloud: { label: '云端当前正文', body: null, unavailableReason: cloudBodyUnavailable(face) },
+      local: { label: '本地当前正文', body: localBody },
+    };
+  }
 }
 
 export function SourceEditControls({
@@ -115,6 +170,22 @@ export function SourceEditControls({
   const [reverting, setReverting] = useState(false);
   const mountedRef = useRef(true);
   useEffect(() => () => { mountedRef.current = false; }, []);
+
+  // P0-S5：回滚收敛时不同步重载正文——重载会置空 content 导致本组件卸载，
+  // 把展示中的回滚弹窗/抽屉一起销毁（真机实测）。正文刷新推迟到弹窗关闭后。
+  const revertSettledRef = useRef(false);
+
+  // P0-S5 回滚 UI：写回记录 / 云端历史抽屉 + 回滚弹窗 + 冲突对比弹窗。
+  const [logDrawerOpen, setLogDrawerOpen] = useState(false);
+  const [historyDrawerOpen, setHistoryDrawerOpen] = useState(false);
+  const [revertTarget, setRevertTarget] = useState<RevertTarget | null>(null);
+  const [diffOpen, setDiffOpen] = useState(false);
+  const [diffContext, setDiffContext] = useState<{
+    title: string;
+    note: string;
+    cloud: CloudDiffSide;
+    local: CloudDiffSide;
+  } | null>(null);
 
   const editableType = objType == null || objType === 'docx';
   const state = status?.editState?.state ?? null;
@@ -262,6 +333,26 @@ export function SourceEditControls({
       });
   };
 
+  /** 本地当前正文（去 feishu_sync 头）——冲突对比右侧。 */
+  const localBody = splitFeishuSyncHeader(mdContent!)?.body ?? mdContent!;
+
+  /**
+   * 冲突对比弹窗（设计 §4.5；T4b-08：真实拉取云端当前正文）。先开弹窗呈
+   * 读取中态，拉取完成后回填两侧行级差异；只有真实失败才降级不可读态。
+   */
+  const openCloudDiff = (context: { title: string; note: string }) => {
+    setDiffContext({
+      ...context,
+      cloud: { label: '云端当前正文', body: null, loading: true },
+      local: { label: '本地当前正文', body: localBody },
+    });
+    setDiffOpen(true);
+    void buildCloudDiffContext(objToken, context, localBody).then((next) => {
+      if (!mountedRef.current) return;
+      setDiffContext(next);
+    });
+  };
+
   const badge = (() => {
     if (state === 'dirty') return <span title="本地有未写回的修改"><StatusBadge status="warning" size="sm">本地已修改</StatusBadge></span>;
     if (state === 'conflict') return <span title="写回冲突，需人工核对云端内容"><StatusBadge status="error" size="sm">写回冲突</StatusBadge></span>;
@@ -282,6 +373,27 @@ export function SourceEditControls({
       >
         <FilePenLine className="w-3 h-3" />
         <span className="hidden xl:inline">编辑</span>
+      </button>
+      {/* P0-S5：写回记录 / 云端历史入口（回滚安全网，与编辑同门槛渲染） */}
+      <button
+        type="button"
+        onClick={() => setLogDrawerOpen(true)}
+        title="写回记录：每次写回的锚点与结果，可回滚到写回前"
+        className="inline-flex items-center gap-1 rounded-md border border-line bg-paper px-2 py-1.5 text-[11px] text-ink-soft font-sans-ui transition-colors hover:bg-paper-2 hover:text-ink"
+        data-testid="open-push-log"
+      >
+        <FileClock className="w-3 h-3" />
+        <span className="hidden xl:inline">写回记录</span>
+      </button>
+      <button
+        type="button"
+        onClick={() => setHistoryDrawerOpen(true)}
+        title="云端历史：飞书文档历史版本列表，可回滚到任一历史版本"
+        className="inline-flex items-center gap-1 rounded-md border border-line bg-paper px-2 py-1.5 text-[11px] text-ink-soft font-sans-ui transition-colors hover:bg-paper-2 hover:text-ink"
+        data-testid="open-cloud-history"
+      >
+        <History className="w-3 h-3" />
+        <span className="hidden xl:inline">云端历史</span>
       </button>
       {(state === 'dirty' || state === 'conflict') && (
         <>
@@ -402,6 +514,21 @@ export function SourceEditControls({
                   {(plan.blockedReason === 'write_disabled' || plan.blockedReason === 'write_scope_missing') && (
                     <p className="text-xs text-seal leading-relaxed">路径：设置 → 飞书认证 → 飞书写入（开关与「授权写入权限」入口都在该卡片）。</p>
                   )}
+                  {(plan.blockedReason === 'rollback_anchor_unavailable' || plan.anchorBlockedReason === 'rollback_anchor_unavailable') && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        openCloudDiff({
+                          title: '对比云端与本地 · 覆盖被阻断',
+                          note: '覆盖写回被阻断：云端历史不可读，无法建立回退锚点。可先核对云端当前与本地正文的差异再决定是否稍后重试。',
+                        })
+                      }
+                      className="inline-flex items-center gap-1 rounded-md border border-line bg-paper px-2.5 py-1.5 text-[11px] text-ink-soft transition-colors hover:bg-paper-2 hover:text-ink"
+                    >
+                      <GitCompare className="w-3 h-3" />
+                      对比云端与本地
+                    </button>
+                  )}
                 </div>
               ) : (
                 <>
@@ -425,6 +552,25 @@ export function SourceEditControls({
                         云端文档在本地修改之后有更新（云端时间 {plan.cloud.objEditTime ?? '未知'}）。直接写回会覆盖他人在云端的修改。
                       </p>
                     )}
+                    {/* P0-S3 写前回退锚点（U23）：覆盖/追加均展示；近似锚点明示风险 */}
+                    {plan.rollbackAnchor != null ? (
+                      <p
+                        className={`flex items-start gap-1.5 text-xs leading-relaxed ${plan.rollbackAnchor.exact ? 'text-jade' : 'text-seal-2'}`}
+                        title={`锚点版本 ${plan.rollbackAnchor.historyVersionId}`}
+                      >
+                        <Anchor className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                        {plan.rollbackAnchor.exact
+                          ? `写回锚点 ${shortHistoryId(plan.rollbackAnchor.historyVersionId)}（${formatTime(plan.rollbackAnchor.historyTime)}）：精确，写回后可回滚到写前状态`
+                          : `写回锚点 ${shortHistoryId(plan.rollbackAnchor.historyVersionId)}（${formatTime(plan.rollbackAnchor.historyTime)}）：近似，回滚点早于写前状态，回滚会一并撤销此期间的云端修改`}
+                      </p>
+                    ) : (
+                      plan.mode === 'append' && (
+                        <p className="flex items-start gap-1.5 text-xs text-ink-faint leading-relaxed">
+                          <Anchor className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                          本次追加无回退锚点（云端历史不可读）：如需撤销请到飞书核对处理
+                        </p>
+                      )
+                    )}
                     {plan.warnings.map((w) => (
                       <p key={w} className="text-xs text-ink-faint leading-relaxed">· {w}</p>
                     ))}
@@ -435,10 +581,25 @@ export function SourceEditControls({
                       <p className="text-sm text-seal-2 font-medium">写回未完成</p>
                       <p className="text-xs text-ink-soft leading-relaxed">{pushError.message}</p>
                       {pushError.code === 'source_push_conflict' && (
-                        <p className="text-xs text-seal-2 leading-relaxed">
-                          云端已有更新的修改（云端编辑时间 {String(pushError.details?.cloudObjEditTime ?? '未知')}）。
-                          可选择「强制覆盖」（将丢弃云端的新修改），或取消后先在飞书核对云端内容。
-                        </p>
+                        <>
+                          <p className="text-xs text-seal-2 leading-relaxed">
+                            云端已有更新的修改（云端编辑时间 {String(pushError.details?.cloudObjEditTime ?? '未知')}）。
+                            可选择「强制覆盖」（将丢弃云端的新修改），或取消后先在飞书核对云端内容。
+                          </p>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              openCloudDiff({
+                                title: '对比云端与本地 · 写回冲突',
+                                note: '云端正文在本地基线之后有新修改（时间门拦截）。核对两侧差异后决定：强制覆盖（丢弃云端新修改）或先把本地改动合入云端版本。',
+                              })
+                            }
+                            className="inline-flex items-center gap-1 rounded-md border border-line bg-paper px-2.5 py-1.5 text-[11px] text-ink-soft transition-colors hover:bg-paper-2 hover:text-ink"
+                          >
+                            <GitCompare className="w-3 h-3" />
+                            对比云端与本地
+                          </button>
+                        </>
                       )}
                       {(pushError.code === 'feishu_write_disabled' || pushError.code === 'feishu_write_scope_missing') && (
                         <p className="text-xs text-seal leading-relaxed">
@@ -507,6 +668,60 @@ export function SourceEditControls({
           )}
         </div>
       </Modal>
+
+      {/* ── P0-S5 回滚安全网：写回记录 / 云端历史 / 回滚弹窗 / 冲突对比 ── */}
+      <SourcePushLogDrawer
+        open={logDrawerOpen}
+        onClose={() => setLogDrawerOpen(false)}
+        objToken={objToken}
+        localBody={localBody}
+        onRequestRevert={(target) => setRevertTarget({ pushLogId: target.pushLogId, sourceLabel: target.sourceLabel })}
+        onRequestCompare={(log) =>
+          openCloudDiff({
+            title: `对比云端与本地 · 写回${log.outcome === 'conflict' ? '冲突' : '结果未知'}`,
+            note:
+              log.outcome === 'conflict'
+                ? `该次${log.mode === 'append' ? '追加' : log.mode === 'overwrite' ? '覆盖' : '回滚'}写回因冲突未写入云端（${formatTime(log.createdAt)}）。核对本地正文与云端当前内容后决定：重新写回或放弃本地修改。`
+                : `该次写回结果不确定（${formatTime(log.createdAt)}）：写入是否已落到云端未知，请先对比核对。`,
+          })
+        }
+        onLogsChanged={() => {
+          void refreshStatus(true);
+        }}
+      />
+      <CloudHistoryDrawer
+        open={historyDrawerOpen}
+        onClose={() => setHistoryDrawerOpen(false)}
+        objToken={objToken}
+        onRequestRevert={(target) => setRevertTarget({ historyVersionId: target.historyVersionId, sourceLabel: target.sourceLabel })}
+      />
+      <HistoryRevertModal
+        open={revertTarget != null}
+        onClose={() => {
+          setRevertTarget(null);
+          if (revertSettledRef.current) {
+            revertSettledRef.current = false;
+            onContentChanged?.();
+          }
+        }}
+        objToken={objToken}
+        target={revertTarget}
+        onReverted={() => {
+          // 回滚已收敛：只刷编辑状态；正文重载推迟到弹窗关闭（防卸载连锁）。
+          revertSettledRef.current = true;
+          void refreshStatus(true);
+        }}
+      />
+      {diffContext && (
+        <CloudDiffModal
+          open={diffOpen}
+          onClose={() => setDiffOpen(false)}
+          title={diffContext.title}
+          note={diffContext.note}
+          left={diffContext.cloud}
+          right={diffContext.local}
+        />
+      )}
     </div>
   );
 }

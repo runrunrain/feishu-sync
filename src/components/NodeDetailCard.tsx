@@ -31,8 +31,10 @@ import {
 import { Card, CardBody } from './common/Card';
 import { StatusBadge } from './common/StatusBadge';
 import { BusinessTag } from './common/BusinessTag';
+import { CloudMovesSection } from './move-out/CloudMovesSection';
+import { cloudMoveFace } from './move-out/labels';
 import { useToast } from './common/Toast';
-import type { MappingNode, WatchedRoot } from '../types';
+import type { CloudMoveRecord, MappingNode, WatchedRoot } from '../types';
 
 interface NodeDetailCardProps {
   node: MappingNode | null;
@@ -56,6 +58,11 @@ interface NodeDetailCardProps {
    * Caller updates its selectedToken; this card re-renders with the new node.
    */
   onSelectNode?: (objToken: string) => void;
+  /**
+   * P2-S7：该文档的移出记录（最新在前）。非空时状态徽标按最新记录覆盖
+   * （moved →「已移出到云空间」，区分于回收站/删除），并渲染移出记录列表。
+   */
+  cloudMoves?: CloudMoveRecord[];
 }
 
 const TYPE_ICON = {
@@ -87,6 +94,7 @@ export function NodeDetailCard({
   allNodes,
   watchedRoots,
   onSelectNode,
+  cloudMoves,
 }: NodeDetailCardProps) {
   const toast = useToast();
 
@@ -130,7 +138,10 @@ export function NodeDetailCard({
   const MAX_INLINE_CHILDREN = 5;
 
   const TypeIcon = TYPE_ICON[node.obj_type] ?? FileText;
-  const changed = node.status === 'changed' || node.cloud_deleted === 1;
+  // P2-S7：最新移出记录的展示层覆盖（moved 覆盖「已删除」；moving 优先
+  // 于「变更」；无记录沿用既有状态文案）。
+  const moveFace = cloudMoveFace(cloudMoves?.[0]);
+  const changed = moveFace != null || node.status === 'changed' || node.cloud_deleted === 1;
 
   const handleSync = () => {
     if (!onSyncNode) {
@@ -166,26 +177,33 @@ export function NodeDetailCard({
               )}
             </div>
             <div className="flex items-center gap-2 mt-1.5 flex-wrap">
-              <StatusBadge
-                status={
-                  node.cloud_deleted === 1
-                    ? 'deleted'
-                    : node.status === 'changed'
-                      ? 'modified'
-                      : node.status === 'error'
-                        ? 'error'
-                        : 'success'
-                }
-                size="sm"
-              >
-                {node.cloud_deleted === 1
-                  ? '已删除'
-                  : node.status === 'changed'
-                    ? '变更'
-                    : node.status === 'error'
-                      ? '错误'
-                      : '已同步'}
-              </StatusBadge>
+              <span title={moveFace?.title}>
+                <StatusBadge
+                  status={
+                    moveFace?.badgeStatus ??
+                    (node.cloud_deleted === 1
+                      ? 'deleted'
+                      : node.status === 'changed'
+                        ? 'modified'
+                        : node.status === 'error'
+                          ? 'error'
+                          : 'success')
+                  }
+                  size="sm"
+                >
+                  {moveFace
+                    ? moveFace.kind === 'moved'
+                      ? '已移出到云空间'
+                      : moveFace.treeText
+                    : node.cloud_deleted === 1
+                      ? '已删除'
+                      : node.status === 'changed'
+                        ? '变更'
+                        : node.status === 'error'
+                          ? '错误'
+                          : '已同步'}
+                </StatusBadge>
+              </span>
               <span className="text-[11px] text-ink-faint font-sans-ui">
                 {TYPE_LABEL[node.obj_type]}
               </span>
@@ -312,6 +330,9 @@ export function NodeDetailCard({
             </>
           )}
         </dl>
+
+        {/* P2-S7：移出记录列表（时间/状态/失败原因；无记录不渲染）。 */}
+        <CloudMovesSection moves={cloudMoves ?? []} />
 
         <div className="flex items-center gap-2.5 pt-1">
           <button

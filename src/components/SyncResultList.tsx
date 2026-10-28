@@ -10,6 +10,7 @@ import { CheckCircle2, XCircle, FolderOpen, RotateCw, Wrench } from 'lucide-reac
 import { Card, CardBody } from './common/Card';
 import { Button } from './common/Button';
 import type { SyncResult, FailedDocument } from '../types';
+import { unsupportedCloudTypeText } from '../utils/cloudObjType';
 
 interface SyncResultListProps {
   result: SyncResult;
@@ -203,6 +204,18 @@ export function SyncResultList({
                   <p className="mt-0.5 text-[11px] leading-5 text-ink-faint">
                     它们不会再出现在最近变更；完成授权、恢复/替换页面或启用对应导出能力后，请在待处理面板点击“处理后重新检测”。
                   </p>
+                  {/* P2-S8：未知类型 blocker 附真实云端类型提示（仅存在 cloudObjType 时渲染） */}
+                  {cloudSideFailures.some((document) => document.cloudObjType) && (
+                    <ul className="mt-1 space-y-0.5">
+                      {cloudSideFailures
+                        .filter((document) => document.cloudObjType)
+                        .map((document) => (
+                          <li key={document.objToken} className="text-[11px] leading-5 text-ink-faint break-words">
+                            「{document.title}」{unsupportedCloudTypeText(document.cloudObjType)}
+                          </li>
+                        ))}
+                    </ul>
+                  )}
                 </div>
               </div>
             )}

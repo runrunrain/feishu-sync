@@ -1,8 +1,30 @@
 import { useEffect, useMemo, useState } from 'react';
 import { applySourceBatch, previewSourceBatch } from '../api/client';
-import type { SourceBatchPreview } from '../types/source-batch';
+import type { SourceBatchPreview, SourceBatchReferenceLoss } from '../types/source-batch';
 import { Modal } from './common/Modal';
 import { Button } from './common/Button';
+
+/**
+ * P1-S4（§2.4）：删除确认的引用悬空风险提示（预览 API referenceLossRisk
+ * 非空时展示）。独立导出供 SSR 测试；列表形态与预览清单一致。
+ */
+export function SourceReferenceLossWarning({ items }: { items: SourceBatchReferenceLoss[] }) {
+  if (items.length === 0) return null;
+  return (
+    <div role="alert" className="mb-3 rounded border border-seal/40 bg-seal/5 px-3 py-2 text-xs leading-relaxed text-seal">
+      <p className="mb-1 font-medium">引用悬空风险：{items.length} 篇待删文档被选集外的文档引用，删除后这些引用将指向不存在的文档。</p>
+      <ul className="max-h-24 overflow-auto space-y-1 text-ink-soft">
+        {items.map((item) => (
+          <li key={item.objToken}>
+            「{item.title}」被 {item.referencedByCount} 篇引用
+            （{item.sources.slice(0, 3).map((source) => source.title ?? source.objToken).join('、')}
+            {item.sources.length > 3 || item.referencedByCount > item.sources.length ? ' 等' : ''}）
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
 export function SourceBatchDialog({ root, tokens, action, onClose, onComplete }: { root: string; tokens: string[]; action: 'delete' | 'block'; onClose: () => void; onComplete: (processed: number, processedTokens: string[]) => void }) {
   const [children, setChildren] = useState(false); const [deleteFiles, setDeleteFiles] = useState(true); const [block, setBlock] = useState(false);
   const [preview, setPreview] = useState<SourceBatchPreview | null>(null); const [loading, setLoading] = useState(true); const [busy, setBusy] = useState(false); const [error, setError] = useState(''); const [nonce, setNonce] = useState(0);
@@ -27,6 +49,9 @@ export function SourceBatchDialog({ root, tokens, action, onClose, onComplete }:
     {loading ? <p className="text-sm text-ink-faint py-5">正在计算具体清单与影响范围…</p> : preview ? <>
       <p className="text-sm text-ink mb-2">共 {preview.items.length} 篇 · 直接选择 {preview.directCount} 篇 · 自动追加子文档 {preview.descendantCount} 篇</p>
       <p className="text-xs text-ink-soft mb-3">{counts.pending} 篇转为待同步 · {counts.blocked} 篇屏蔽 · {counts.removed} 篇移除索引 · {preview.files.length} 个本地文件回收 · {preview.affectedStandardDocs.length} 篇标准文档受影响</p>
+      {preview.referenceLossRisk && preview.referenceLossRisk.length > 0 ? (
+        <SourceReferenceLossWarning items={preview.referenceLossRisk} />
+      ) : null}
       <div className="max-h-[30vh] overflow-auto border-y border-line mb-3" aria-label="批量处理文档清单">{preview.items.map((item) => <div key={item.objToken} className="py-2 border-b border-line/50 flex items-start gap-3"><div className="min-w-0 flex-1"><span className="block text-sm text-ink">{item.title}</span><span className="block text-xs text-ink-faint break-all">{item.path}</span></div><span className="text-xs text-seal shrink-0">{{ blocked: '屏蔽', pending: '待同步', removed: '移除索引' }[item.effect]}</span></div>)}</div>
       {preview.files.length ? <details className="text-xs text-ink-soft mb-2"><summary className="cursor-pointer">查看将回收的 {preview.files.length} 个本地文件</summary><ul className="max-h-28 overflow-auto mt-2 space-y-1">{preview.files.map((file) => <li key={file.path} className="break-all">{file.path} · {file.size} 字节</li>)}</ul></details> : null}
       {preview.affectedStandardDocs.length ? <details className="text-xs text-ink-soft mb-2"><summary className="cursor-pointer">查看受影响的标准文档</summary><ul className="max-h-24 overflow-auto mt-2">{preview.affectedStandardDocs.map((doc) => <li key={doc.docId}>{doc.title}</li>)}</ul></details> : null}

@@ -38,6 +38,7 @@ import { SheetSubTableList } from './SheetSubTableList';
 import { useToast } from './common/Toast';
 import type { ChangedDocument, SheetSub } from '../types';
 import { formatCloudModifiedTime } from '../utils/cloudTime';
+import { unsupportedCloudTypeText } from '../utils/cloudObjType';
 
 export interface ChangeItemProps {
   change: ChangedDocument;
@@ -356,6 +357,14 @@ export function ChangeItem({
                 <span className="text-seal font-medium">图片缺失待修复原因：</span>
                 {change.mediaGapReason}
               </div>
+            </div>
+          )}
+
+          {/* P2-S8：未知类型的真实云端类型提示（仅 cloudObjType 存在时渲染，已支持类型不变） */}
+          {change.cloudObjType && unsupportedCloudTypeText(change.cloudObjType) && (
+            <div className="flex items-start gap-2 p-2 rounded bg-seal/5 border border-seal/20 text-ink-soft text-[11px] font-sans-ui">
+              <Info className="w-3.5 h-3.5 text-seal shrink-0 mt-0.5" />
+              <div>{unsupportedCloudTypeText(change.cloudObjType)}</div>
             </div>
           )}
 

@@ -100,6 +100,9 @@ export interface StandardKbConfig {
   buildTimeoutMinutes: number;
   /** S4：并行构建 worker 数（1..6，默认 2；实际受 Agent 进程池后台配额约束） */
   buildParallelism: number;
+  /** P2-S2：每批有效字数预算（0 = 按源数分批旧行为；取值域 {0}∪[4000,400000]，
+   *  默认 40000。buildBatchSize 降为每批源数上限）。 */
+  buildBatchWordBudget: number;
   autoBuildAfterSync: boolean;
 }
 

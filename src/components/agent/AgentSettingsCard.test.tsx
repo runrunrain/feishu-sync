@@ -26,6 +26,8 @@ import {
   AgentKbSettingsCard,
   AgentRuntimeSettingsCard,
   canTestVision,
+  clampBuildBatchWordBudget,
+  describeBuildBatchWordBudgetInput,
   describeVisionStatus,
   describeVisionTestResult,
 } from './AgentSettingsCard';
@@ -76,6 +78,7 @@ function makeConfig(over: { agent?: Partial<Config['agent']>; llm?: Partial<Conf
       outputRoot: '/tmp/standard-kb',
       retainReleases: 3,
       buildBatchSize: 10,
+      buildBatchWordBudget: 40000,
       promptTimeoutMinutes: 15,
       buildTimeoutMinutes: 180,
       buildParallelism: 2,
@@ -202,6 +205,64 @@ describe('AgentKbSettingsCard 构建并行数（S4/S5）', () => {
     setup(config);
     const html = renderToStaticMarkup(<AgentKbSettingsCard />);
     expect(option(html, '2')).toContain('selected');
+  });
+});
+
+describe('AgentKbSettingsCard 每批字数预算（P2-S3）', () => {
+  it('数字输入 + 保存按钮 + 「0 = 按源数分批」说明；SSR 初始空输入阻断保存', () => {
+    setup(makeConfig());
+    const html = renderToStaticMarkup(<AgentKbSettingsCard />);
+    expect(html).toContain('每批字数预算');
+    // SSR 不跑 effect，输入框为空：反馈为 error 且保存按钮 disabled。
+    const input = element(html, 'input', 'build-word-budget-input');
+    expect(input.length).toBeGreaterThan(0);
+    const save = element(html, 'button', 'build-word-budget-save');
+    expect(save).toContain('disabled');
+    expect(html).toContain('data-testid="build-word-budget-feedback"');
+    expect(html).toContain('请输入数字（0 或 4000–400000）');
+    expect(html).toContain('0 = 按源数分批');
+    expect(html).toContain('4000–400000');
+    expect(html).toContain('有效字数');
+  });
+
+  it('clampBuildBatchWordBudget 对齐 server 链制语义', () => {
+    // 非数字/空 → 缺省 40000；≤0 → 0；(0,4000) → 4000；>400000 → 400000；区间内 floor。
+    expect(clampBuildBatchWordBudget('abc')).toBe(40000);
+    expect(clampBuildBatchWordBudget('')).toBe(40000);
+    expect(clampBuildBatchWordBudget(' 12000 ')).toBe(12000);
+    expect(clampBuildBatchWordBudget(0)).toBe(0);
+    expect(clampBuildBatchWordBudget(-5)).toBe(0);
+    expect(clampBuildBatchWordBudget('0')).toBe(0);
+    expect(clampBuildBatchWordBudget(2000)).toBe(4000);
+    expect(clampBuildBatchWordBudget('3999.7')).toBe(4000);
+    expect(clampBuildBatchWordBudget(4000)).toBe(4000);
+    expect(clampBuildBatchWordBudget('40000')).toBe(40000);
+    expect(clampBuildBatchWordBudget('40500.9')).toBe(40500);
+    expect(clampBuildBatchWordBudget(400000)).toBe(400000);
+    expect(clampBuildBatchWordBudget(999999)).toBe(400000);
+  });
+
+  it('describeBuildBatchWordBudgetInput 输入即时反馈分级', () => {
+    // 空 → error（阻断保存）
+    expect(describeBuildBatchWordBudgetInput('')?.level).toBe('error');
+    // 非数字 → error
+    expect(describeBuildBatchWordBudgetInput('abc')?.level).toBe('error');
+    expect(describeBuildBatchWordBudgetInput('abc')?.text).toContain('40000');
+    // 0 / 负数 → hint（按源数分批）
+    expect(describeBuildBatchWordBudgetInput('0')).toMatchObject({ level: 'hint' });
+    expect(describeBuildBatchWordBudgetInput('0')?.text).toContain('按源数分批');
+    expect(describeBuildBatchWordBudgetInput('-3')?.level).toBe('hint');
+    // 越界 → warn，提示链制后生效值
+    expect(describeBuildBatchWordBudgetInput('2000')).toMatchObject({ level: 'warn' });
+    expect(describeBuildBatchWordBudgetInput('2000')?.text).toContain('4000');
+    expect(describeBuildBatchWordBudgetInput('500000')).toMatchObject({ level: 'warn' });
+    expect(describeBuildBatchWordBudgetInput('500000')?.text).toContain('400000');
+    // 合法区间 → hint（不 warn）
+    expect(describeBuildBatchWordBudgetInput('4000')?.level).toBe('hint');
+    expect(describeBuildBatchWordBudgetInput('40000')?.level).toBe('hint');
+    expect(describeBuildBatchWordBudgetInput('400000')?.level).toBe('hint');
+    // 区间内小数仅取整，不提示越界
+    expect(describeBuildBatchWordBudgetInput('40500.9')?.level).toBe('hint');
   });
 });
 

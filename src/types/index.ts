@@ -38,6 +38,19 @@ export interface Config {
   standardKb?: StandardKbConfig;
   /** S12 飞书写回开关段（默认关；服务端校验，缺省视为 false）。 */
   feishuWrite?: { enabled: boolean };
+  /** P1-S8/S9 反向发布段（默认关；与 feishuWrite 同只接受 desktop 链路修改，
+   * 发布根设置走专用端点 PUT /api/kb/publish/target，不经本段落盘）。 */
+  feishuPublish?: {
+    enabled: boolean;
+    target?: {
+      kind: 'drive_folder' | 'wiki_node';
+      token: string;
+      spaceId?: string;
+      label: string;
+    } | null;
+  };
+  /** P1-S5/P0-S6 同步行为段（媒体采集开关；缺省由服务端补）。 */
+  sync?: SyncConfig;
 }
 
 /** One model preset inside a provider's OpenAI-compatible route. */
@@ -147,6 +160,8 @@ export interface ChangedDocument {
   localRelPath?: string | null;
   /** 媒体完整性核对产出的补齐信号，非云端编辑。 */
   mediaGapReason?: 'local_placeholder_tags' | 'sheet_cloud_images_missing';
+  /** P2-S8：检测链折叠为 'unknown' 前的真实云端类型（mindnote/file 等），仅未知类型携带。 */
+  cloudObjType?: string;
 }
 
 export type SyncState =
@@ -179,6 +194,8 @@ export interface FailedDocument {
   suggestedResolution?: string;
   repairAction?: SyncRepairAction;
   watchedRootId?: string | null;
+  /** P2-S8：未知类型 blocker（reasonCode='unsupported_type'）的真实云端类型。 */
+  cloudObjType?: string;
 }
 
 export type SyncPlanReasonCode =
@@ -231,6 +248,8 @@ export interface PlannedSyncDocument {
   localMdPath: string | null;
   previousSha256: string | null;
   reason?: string;
+  /** P2-S8：unsupported_type blocker 的真实云端类型透传。 */
+  cloudObjType?: string;
 }
 
 export type SyncMode = 'dry-run' | 'apply';
@@ -271,10 +290,23 @@ export interface AuthStatus {
   missingScopes?: string[];
   /** S12：写回 scope（docx:document:write_only）是否已授权（写回入口引导用）。 */
   writeScopesGranted?: boolean;
+  /** P1-S5：可选读 scope 分档（granted/missing 对照注册表）。缺失不判定为
+   *  授权不完整；设置页据「开关开启 ∧ missing 非空」提示增量授权。 */
+  optionalScopes?: { granted: string[]; missing: string[] };
   error?: string;
   identity?: string;
   verified?: boolean;
   account?: { id: string; name?: string };
+}
+
+/** 同步行为段（additive；旧配置无此段时由服务端内存补默认）。
+ *  契约：P1-S5 slidesScreenshot（缺省 false）/ P0-S6 whiteboardExport
+ *  （缺省 enabled=true；svgTimeoutMs 非正有限数在服务端归一时剔除）。 */
+export interface SyncConfig {
+  /** 幻灯片整页截图采集（需额外授权 slides:presentation:screenshot）。 */
+  slidesScreenshot?: { enabled: boolean };
+  /** 白板旁路导出（svg 主 + raw 降级，失败只告警不阻断同步）。 */
+  whiteboardExport?: { enabled: boolean; svgTimeoutMs?: number };
 }
 
 // ============================================================================
@@ -324,13 +356,31 @@ export interface SourcePushPlan {
     | 'images_in_append'
     | 'images_in_overwrite'
     | 'write_disabled'
-    | 'write_scope_missing';
+    | 'write_scope_missing'
+    /** P0-S3：overwrite 取不到云端历史回退锚点（force 不可越过）。 */
+    | 'rollback_anchor_unavailable'
+    /** P0-S4：该文档有进行中的云端回滚（互斥门）。 */
+    | 'cloud_revert_running';
   appendMarkdown?: string;
   bytes: number;
   cloud: { objEditTime: string | null; revisionId: number | null };
   /** 云端 obj_edit_time 已越过 base_obj_edit_time（需 force 决策）。 */
   conflict: boolean;
   warnings: string[];
+  /**
+   * P0-S3 写前回退锚点（preview 实际调用一次 history-list，只读）：
+   * 第 1 页最新条目；取锚失败为 null（append 照常推送 + warning，
+   * overwrite 升级 blocked + anchorBlockedReason）。
+   */
+  rollbackAnchor?: {
+    historyVersionId: string;
+    revisionId: number | null;
+    historyTime: string | null;
+    /** U23：false = 锚点历史早于写前云端状态，回滚会一并撤销此期间修改。 */
+    exact: boolean;
+  } | null;
+  /** 与 blockedReason='rollback_anchor_unavailable' 同值，独立字段便于 UI 判因。 */
+  anchorBlockedReason?: 'rollback_anchor_unavailable';
 }
 
 /** POST /api/sources/:objToken/push 响应（S12）。 */
@@ -339,6 +389,162 @@ export interface SourcePushResult {
   mode: 'append' | 'overwrite';
   revisionId: number | null;
   pull: { ok: boolean; status: string; message?: string };
+}
+
+// ============================================================================
+// P2-S7 移出 UI（消费 P2-S6 后端契约）——镜像 server 侧 DTO
+// ============================================================================
+
+/**
+ * 移出门控分支（server CloudMoveBlockedReason 七分支 + 查询期 404 文档
+ * 不在库中共八分支；UI 以可读文案映射呈现，服务端门控兜底）。
+ */
+export type CloudMoveBlockedReason =
+  | 'not_watched_root'
+  | 'has_children'
+  | 'node_not_found'
+  | 'local_edit_pending'
+  | 'cloud_revert_running'
+  | 'cloud_move_running'
+  | 'kb_build_active'
+  | 'source_not_found';
+
+/** POST /api/sources/:objToken/move-to-drive/preview 响应。 */
+export interface MoveOutPreview {
+  objToken: string;
+  title: string;
+  /** 权威 wiki node token（确认值 `MOVE_OUT:<nodeToken>` 的派生源）。 */
+  nodeToken: string;
+  watchedRootId: string | null;
+  watchedRootLabel: string;
+  hasChildren: boolean;
+  target: { folderToken: string | null; label: string };
+  /** 后果固定文案（预览与确认弹窗原样展示，设计 §3.4）。 */
+  consequences: string[];
+  blockedReason: CloudMoveBlockedReason | null;
+}
+
+/** POST /api/sources/:objToken/move-to-drive 响应（200 moved / 202 moving）。 */
+export interface MoveOutExecutionResult {
+  state: 'moved' | 'moving';
+  moveId: string;
+  taskId: string | null;
+  nodeToken: string;
+}
+
+/** cloud_moves 行 camelCase 投影（GET /api/sources/moves[:id]）。 */
+export interface CloudMoveRecord {
+  id: string;
+  objToken: string;
+  wikiNodeToken: string;
+  watchedRootId: string | null;
+  title: string | null;
+  targetFolderToken: string | null;
+  /** 状态机：pending（起步）→ moving → moved / failed / unknown。 */
+  state: 'pending' | 'moving' | 'moved' | 'failed' | 'unknown' | string;
+  taskId: string | null;
+  error: string | null;
+  /** ui | cli。 */
+  actor: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+// ============================================================================
+// P0-S5 回滚 UI（消费 P0-S3/S4 后端契约）——镜像 server 侧 DTO
+// ============================================================================
+
+/** source_push_log 行 camelCase 投影（GET /api/sources/:objToken/push-log 项）。 */
+export interface SourcePushLogRecord {
+  id: string;
+  objToken: string;
+  localRelPath: string;
+  /** append|overwrite|revert（revert 行由云端历史回滚写入，本身也可再回滚）。 */
+  mode: 'append' | 'overwrite' | 'revert' | string;
+  /** ui|cli|agent。 */
+  actor: string;
+  preObjEditTime: string | null;
+  /** 写回前最新 history_version_id（回滚锚点；无锚行不可回滚）。 */
+  anchorHistoryId: string | null;
+  anchorHistoryTime: string | null;
+  /** 锚点历史时间 ≥ 写前云端时间（U23；false 时回滚是近似回退）。 */
+  anchorExact: boolean;
+  /** 取锚失败原因（仅 append 可空锚继续）。 */
+  anchorError: string | null;
+  postRevisionId: string | null;
+  postObjEditTime: string | null;
+  /** started|pushed|conflict|failed|unknown。 */
+  outcome: 'started' | 'pushed' | 'conflict' | 'failed' | 'unknown' | string;
+  /** null|running|done|failed|unknown（该行发起的云端回滚状态）。 */
+  revertState: 'running' | 'done' | 'failed' | 'unknown' | null | string;
+  revertHistoryId: string | null;
+  revertTaskId: string | null;
+  revertError: string | null;
+  revertedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** docs +history-list 单条历史条目（GET /api/sources/:objToken/history 项）。 */
+export interface CloudHistoryEntry {
+  historyVersionId: string | null;
+  revisionId: number | null;
+  /** RFC3339Z（秒级取整）。 */
+  editTime: string | null;
+  /** 编辑者 open_id（上游无姓名字段）。 */
+  editorIds: string[];
+  /** 1=建档 / 2=普通编辑 / 3=revert 产生的历史。 */
+  type: number | null;
+}
+
+/** GET /api/sources/:objToken/history 响应（缺省聚合 3 页，truncated 可续翻）。 */
+export interface CloudHistoryListResult {
+  entries: CloudHistoryEntry[];
+  hasMore: boolean;
+  nextPageToken: string | null;
+  /** true = 因页数上限截断（nextPageToken 非空，可继续翻页）。 */
+  truncated: boolean;
+}
+
+export type HistoryRevertBlockedReason =
+  | 'write_disabled'
+  | 'scope_missing'
+  | 'local_edit_pending'
+  | 'kb_build_active'
+  | 'cloud_revert_running'
+  | 'anchor_missing'
+  | 'history_not_found'
+  | 'invalid_target';
+
+export type HistoryRevertWarning =
+  | 'anchor_inexact'
+  | 'cloud_changed_since_push'
+  | 'cloud_time_unreadable';
+
+/** POST /api/sources/:objToken/history-revert/preview 响应。 */
+export interface HistoryRevertPlan {
+  objToken: string;
+  target: {
+    historyVersionId: string;
+    createdAt: string | null;
+    editorName: string | null;
+    editorIds: string[];
+  };
+  source: 'push_log' | 'history';
+  /** 仅 source='push_log'（U23 锚点精确性）；history 源为 null。 */
+  anchorExact: boolean | null;
+  warnings: HistoryRevertWarning[];
+  blockedReason: HistoryRevertBlockedReason | null;
+}
+
+/** POST /api/sources/:objToken/history-revert 响应（202 异步起步 / 200 同步完成）。 */
+export interface HistoryRevertExecutionResult {
+  state: 'done' | 'running';
+  pushLogId: string;
+  taskId: string | null;
+  targetHistoryVersionId: string;
+  /** 仅 state='done'（锁外回拉结果；失败只记 warning，交检测链收敛）。 */
+  pull: { ok: boolean; status: string; message?: string } | null;
 }
 
 // ============================================================================
@@ -456,6 +662,41 @@ export interface DocumentContent {
   csvTables: DocumentCsvTable[];
   /** Native sheet source; absent on historical CSV-only exports. */
   workbook?: { path: string; size: number; modifiedTime: string; mode?: 'native' | 'read-reconstruction' } | null;
+  /**
+   * P1-S3/S4：被引用关系（入边，服务端返回）；目标双键反查，附引用方
+   * title/相对路径（源行已删时为 null）。
+   */
+  referencedBy?: DocumentIncomingReference[];
+  /** P1-S4：出边引用（已解析到本地文档行；未入本库的目标 objToken 为 null）。 */
+  references?: DocumentOutgoingReference[];
+}
+
+/** P1-S3：入边行（GET /api/mapping/content referencedBy 元素）。 */
+export interface DocumentIncomingReference {
+  srcObjToken: string;
+  targetToken: string;
+  targetType: string;
+  label: string | null;
+  origin: 'body' | 'refmap';
+  kind: string;
+  occurrences: number;
+  updatedAt: string;
+  srcTitle: string | null;
+  srcLocalRelPath: string | null;
+}
+
+/** P1-S4：出边行（GET /api/mapping/content references 元素）。 */
+export interface DocumentOutgoingReference {
+  direction: 'out';
+  token: string;
+  targetType: string;
+  origin: 'body' | 'refmap';
+  kind: string;
+  title: string | null;
+  occurrences: number;
+  objToken: string | null;
+  localRelPath: string | null;
+  synced: boolean;
 }
 
 export interface DocumentCsvTable {
@@ -465,6 +706,27 @@ export interface DocumentCsvTable {
   path: string;
   content: string;
   truncated: boolean;
+}
+
+/**
+ * GET /api/mapping/comments/:objToken 响应（P2-S4 评论溯源）。
+ * collected=false 表示从未采集（非 docx 或未成功同步过），前端隐藏评论区；
+ * truncated=true 表示云端截断（UI 显示「可能不完整」）。
+ */
+export interface DocumentComments {
+  objToken: string;
+  collected: boolean;
+  total: number;
+  truncated: boolean;
+  updatedAt: string | null;
+  comments: Array<{
+    commentRef: string;
+    text: string;
+    quote: string | null;
+    author: string | null;
+    createdAtCloud: string | null;
+    solved: boolean | null;
+  }>;
 }
 
 /**

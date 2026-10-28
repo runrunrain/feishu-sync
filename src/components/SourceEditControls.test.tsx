@@ -10,10 +10,10 @@
  */
 
 import { renderToStaticMarkup } from 'react-dom/server';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('./common/Toast', () => ({ useToast: () => ({ push: vi.fn() }) }));
-import { SourceEditControls, splitFeishuSyncHeader } from './SourceEditControls';
+import { SourceEditControls, buildCloudDiffContext, splitFeishuSyncHeader } from './SourceEditControls';
 
 const HEADER = [
   '<!--',
@@ -66,6 +66,14 @@ describe('SourceEditControls 渲染分支', () => {
     expect(html).not.toContain('写回飞书'); // 无编辑行时不显示写回入口
   });
 
+  it('P0-S5：写回记录 / 云端历史入口渲染（回滚安全网，与编辑同门槛）', () => {
+    const html = render();
+    expect(html).toContain('data-testid="open-push-log"');
+    expect(html).toContain('data-testid="open-cloud-history"');
+    expect(html).toContain('写回记录');
+    expect(html).toContain('云端历史');
+  });
+
   it('mdTruncated：编辑禁用（防整文替换丢尾部）', () => {
     const html = render({ mdTruncated: true });
     const editButton = html.match(/<button[\s\S]*?编辑[\s\S]*?<\/button>/)?.[0] ?? '';
@@ -86,5 +94,51 @@ describe('SourceEditControls 渲染分支', () => {
 
   it('未同步（mdContent null）：整体不渲染', () => {
     expect(render({ mdContent: null })).toBe('');
+  });
+});
+
+describe('T4b-08 对比云端当前 — 宿主消费链（真实 client 请求路径 fetch 断言）', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('宿主发起不带 revisionId 的 history-content 请求（=云端当前正文），并回填两侧行级 diff 上下文', async () => {
+    const urls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      urls.push(String(input));
+      return new Response(JSON.stringify({ revisionId: null, content: '# 云端当前正文\n\n服务端真实拉取。' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+    const ctx = await buildCloudDiffContext('doxcnT1', { title: '对比云端与本地 · 写回冲突', note: 'n' }, '# 本地正文');
+    // 宿主级断言：真实 client.request 发出的 URL（缺省 revisionId = 当前正文）。
+    expect(urls).toEqual(['/api/sources/doxcnT1/history-content']);
+    expect(ctx.cloud).toMatchObject({ label: '云端当前正文', body: '# 云端当前正文\n\n服务端真实拉取。' });
+    expect(ctx.local).toMatchObject({ label: '本地当前正文', body: '# 本地正文' });
+  });
+
+  it('只有真实失败才降级：fetch 502 → cloud.body=null + 如实原因（含服务端错误码与消息）；本地侧保留', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      JSON.stringify({ error: 'history_content_unavailable', message: '云端正文读取失败：upstream boom' }),
+      { status: 502, headers: { 'Content-Type': 'application/json' } },
+    )));
+    const ctx = await buildCloudDiffContext('doxcnT1', { title: 't', note: 'n' }, '# 本地正文');
+    expect(ctx.cloud.body).toBeNull();
+    expect(ctx.cloud.unavailableReason).toContain('history_content_unavailable');
+    expect(ctx.cloud.unavailableReason).toContain('upstream boom');
+    expect(ctx.cloud.unavailableReason).toContain('打开飞书文档核对');
+    expect(ctx.local.body).toBe('# 本地正文');
+  });
+
+  it('fetchImpl 注入面：消费方可直接注入替身（不依赖全局 fetch）', async () => {
+    const requested: string[] = [];
+    const ctx = await buildCloudDiffContext('doxcnT1', { title: 't', note: 'n' }, 'L', async (token) => {
+      requested.push(token);
+      return { content: 'C' };
+    });
+    expect(requested).toEqual(['doxcnT1']);
+    expect(ctx.cloud.body).toBe('C');
+    expect(ctx.local.body).toBe('L');
   });
 });
