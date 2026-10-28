@@ -24,6 +24,8 @@ import {
   isPathInsideRoot,
   joinRelative,
 } from '../modules/path-resolver.js';
+import { resolveSourceLinks, type ResolvedSourceLink, type SourceLinkEdgeRow } from '../kb/source-links.js';
+import type { DocumentRecord } from '../types/index.js';
 
 const MAX_FILE_BYTES = 512 * 1024;
 const MAX_CSV_TABLES = 20;
@@ -35,7 +37,16 @@ interface ContentDependencies {
       objType: string;
       title: string;
       localMdPath: string;
+      wikiNodeToken?: string | null;
     } | null;
+    /** P1-S3：入边查询（被引用，设计 §2.3）——可选以兼容旧测试替身。 */
+    listSourceReferencesByTarget?: (targetTokens: string[]) => unknown[];
+    /** P1-S4：出边查询（引用，设计 §2.3/§2.4）——可选以兼容旧测试替身。 */
+    listSourceReferencesBySrc?: (objToken: string) => unknown[];
+    getDocumentByWikiNodeToken?: (wikiNodeToken: string) => unknown;
+    /** P2-S4：评论溯源查询（设计 §5.1）——可选以兼容旧测试替身。 */
+    getSourceCommentMeta?: (objToken: string) => unknown;
+    listSourceCommentsBySrc?: (objToken: string) => unknown[];
   };
   configManager: {
     getConfig: () => { knowledgeBaseRoot?: string } | null;
@@ -309,6 +320,34 @@ contentRoutes.get('/api/mapping/content/:objToken', async (c) => {
       }
     }
 
+    // P1-S3（设计 §2.3）：被引用关系——按本文档 obj_token 与 wiki_node_token
+    // 双键并集反查入边（外部可能用任一种 URL 引用它）；附源文档 title/
+    // 相对路径供预览面板渲染（S4 UI 消费；源行已删时元数据为 null）。
+    const referencedBy = (() => {
+      if (typeof localMapStore.listSourceReferencesByTarget !== 'function') return [];
+      const tokens = [doc.objToken, doc.wikiNodeToken ?? null].filter(
+        (token): token is string => typeof token === 'string' && token.length > 0,
+      );
+      return localMapStore.listSourceReferencesByTarget(tokens);
+    })();
+
+    // P1-S4（设计 §2.4）：出边引用——预览面板「引用」区；目标按 obj/wiki
+    // 双键解析到本地文档行（未入本库的目标保留原 token 与边标题）。
+    const references: ResolvedSourceLink[] = (() => {
+      if (typeof localMapStore.listSourceReferencesBySrc !== 'function') return [];
+      const outEdges = localMapStore.listSourceReferencesBySrc(doc.objToken) as SourceLinkEdgeRow[];
+      if (!Array.isArray(outEdges) || outEdges.length === 0) return [];
+      return resolveSourceLinks({
+        outEdges,
+        inEdges: [],
+        lookup: (token) =>
+          (localMapStore.getDocumentByObjToken(token)
+            ?? (typeof localMapStore.getDocumentByWikiNodeToken === 'function'
+              ? localMapStore.getDocumentByWikiNodeToken(token)
+              : null)) as DocumentRecord | null,
+      }).out;
+    })();
+
     return c.json({
       objToken: doc.objToken,
       title: doc.title,
@@ -317,6 +356,8 @@ contentRoutes.get('/api/mapping/content/:objToken', async (c) => {
       mdContent,
       mdTruncated,
       csvTables,
+      referencedBy,
+      references,
       workbook: (() => {
         const workbook = findWorkbook({ localMapStore, configManager }, objToken);
         return workbook ? { path: workbook.path, size: workbook.size, modifiedTime: workbook.modifiedTime, mode: workbook.mode } : null;
@@ -327,6 +368,55 @@ contentRoutes.get('/api/mapping/content/:objToken', async (c) => {
     return c.json(
       {
         error: 'content_read_failed',
+        message: error instanceof Error ? error.message : String(error),
+      },
+      500,
+    );
+  }
+});
+
+/**
+ * GET /api/mapping/comments/:objToken — 文档评论（P2-S4 评论溯源，设计
+ * §5.1 预览面板数据面）。只读 SQLite 采集表；collected=false 表示从未
+ * 采集（非 docx 或未成功同步过——sheet/slides 不走 docs+fetch），前端
+ * 隐藏评论区而非显示「0 条」。truncated=true 表示云端截断（comments.tips
+ * 存在），UI 显示「可能不完整」。
+ */
+contentRoutes.get('/api/mapping/comments/:objToken', (c) => {
+  const objToken = c.req.param('objToken');
+  if (!objToken) {
+    return c.json({ error: 'objToken is required' }, 400);
+  }
+  try {
+    const { localMapStore } = getDeps(c);
+    const doc = localMapStore.getDocumentByObjToken(objToken);
+    if (!doc) {
+      return c.json({ error: 'document_not_found' }, 404);
+    }
+    const meta = (typeof localMapStore.getSourceCommentMeta === 'function'
+      ? localMapStore.getSourceCommentMeta(objToken)
+      : null) as {
+      srcObjToken: string; total: number; truncated: boolean; updatedAt: string;
+    } | null;
+    const comments = ((typeof localMapStore.listSourceCommentsBySrc === 'function'
+      ? localMapStore.listSourceCommentsBySrc(objToken)
+      : []) ?? []) as Array<{
+      commentRef: string; text: string; quote: string | null;
+      author: string | null; createdAtCloud: string | null; solved: boolean | null;
+    }>;
+    return c.json({
+      objToken,
+      collected: meta !== null,
+      total: meta?.total ?? 0,
+      truncated: meta?.truncated ?? false,
+      updatedAt: meta?.updatedAt ?? null,
+      comments: meta === null ? [] : comments,
+    });
+  } catch (error) {
+    console.error('[content] read comments failed:', error);
+    return c.json(
+      {
+        error: 'comments_read_failed',
         message: error instanceof Error ? error.message : String(error),
       },
       500,

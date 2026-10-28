@@ -23,6 +23,7 @@ import { RawSourceSnapshot, collectSourceCandidates } from '../kb/raw-source-sna
 import { KbVersionStore, captureSourceContents, sourceChangePreview, validReleaseId } from '../kb/kb-version-store.js';
 import type { KbChangePreview } from '../types/kb-version.js';
 import { computeChangeset } from '../kb/kb-build-service.js';
+import { enrichEntriesWithWhiteboardTextHash } from '../kb/source-images.js';
 import { hashImageFile, resolveSourceImages } from '../kb/source-images.js';
 import { ToolError } from '../agent/agent-tool-service.js';
 import type { LocalMapStore } from '../modules/local-map-store.js';
@@ -59,6 +60,9 @@ function compareSources(
   if (!manifest) {
     return { pending: { added: currentEntries.length, changed: 0, removed: 0 } };
   }
+  // P0-S7：status 预览同样按白板旁路文字判定——scan 条目缺该字段时会与
+  // 非空 manifest 值恒不等而虚报 changed；先补算再比较（mediaHash 语义不变）。
+  enrichEntriesWithWhiteboardTextHash(knowledgeBaseRoot, currentEntries as never);
   const changeset = computeChangeset(currentEntries as never, manifest as never);
   void sheetCsvPaths;
   void knowledgeBaseRoot;
@@ -69,6 +73,28 @@ function compareSources(
       removed: changeset.removed.length,
     },
   };
+}
+
+/**
+ * P1-S3（设计 §2.3）：被引用计数——入链按 obj_token 与 wiki_node_token
+ * 双键并集，同一文档两个键的计数相加（S4 UI 徽标；无 source_references
+ * 方法时返回空 Map，老库/替身安全降级）。
+ */
+function countIncomingReferences(
+  store: LocalMapStore,
+  documents: Array<import('../types/index.js').DocumentRecord>,
+): Map<string, number> {
+  if (typeof store.countSourceReferencesByTarget !== 'function') return new Map();
+  const byTarget = store.countSourceReferencesByTarget();
+  const out = new Map<string, number>();
+  for (const doc of documents) {
+    let count = byTarget.get(doc.objToken) ?? 0;
+    if (doc.wikiNodeToken && doc.wikiNodeToken !== doc.objToken) {
+      count += byTarget.get(doc.wikiNodeToken) ?? 0;
+    }
+    if (count > 0) out.set(doc.objToken, count);
+  }
+  return out;
 }
 
 /** S3（§3.6）：待处理源（added/changed）引用图片的总数与未缓存数。 */
@@ -255,6 +281,7 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
       const current = new Map(scan.entries.map((entry) => [entry.objToken, entry]));
       const base = new Map((manifest?.sourceSnapshot ?? []).map((entry) => [entry.objToken, entry]));
       const candidates = new Map(collectSourceCandidates(documents).map((doc) => [doc.objToken, { title: doc.title, relPath: doc.localRelPath! }]));
+      const referencedCounts = countIncomingReferences(localMapStore, documents);
       // 当前选择仅列实际存在的本地源；旧版本引用留在差异/版本入口。
       const inspect = createLocalPathInspector(config.knowledgeBaseRoot);
       for (const [token, doc] of candidates) if (inspect(doc.relPath) !== 'present') candidates.delete(token);
@@ -263,7 +290,8 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
         const isExcluded = excluded.has(objToken);
         const pending = isExcluded ? (old ? 'removed' : 'excluded') : !next ? (old ? 'removed' : 'unchanged')
           : !old ? 'added' : next.contentHash !== old.contentHash || next.relPath !== old.relPath || next.title !== old.title ? 'changed' : 'unchanged';
-        return { objToken, title: doc.title || objToken, relPath: doc.relPath, included: !isExcluded, published: Boolean(old), pending };
+        return { objToken, title: doc.title || objToken, relPath: doc.relPath, included: !isExcluded, published: Boolean(old), pending,
+          referencedBy: referencedCounts.get(objToken) ?? 0 };
       });
     return { choices, config, documents };
   };

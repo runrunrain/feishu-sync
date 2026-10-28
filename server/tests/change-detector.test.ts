@@ -269,6 +269,42 @@ async function runCompare(
 
 // ----- Tests -------------------------------------------------------------
 
+describe('ChangeDetector.compareWithLocalRecords cloudObjType passthrough (P2-S8)', () => {
+  let store: MockLocalMapStore;
+  beforeEach(() => {
+    store = new MockLocalMapStore();
+  });
+
+  it('carries the raw cloud obj_type on collapsed unknown types (mindnote/file)', async () => {
+    const out = await runCompare(store, [
+      makeCloud({ obj_token: 'MN', node_token: 'nMN', obj_type: 'mindnote', title: '思维笔记' }),
+      makeCloud({ obj_token: 'FL', node_token: 'nFL', obj_type: 'file', title: '云空间文件' }),
+    ]);
+
+    expect(out).toHaveLength(2);
+    const mindnote = out.find((d) => d.objToken === 'MN')!;
+    const file = out.find((d) => d.objToken === 'FL')!;
+    // 分类行为不变：仍折叠 unknown、仍上报 added 变更
+    expect(mindnote.objType).toBe('unknown');
+    expect(mindnote.changeType).toBe('added');
+    expect(file.objType).toBe('unknown');
+    // P2-S8：折叠前真实类型透传
+    expect(mindnote.cloudObjType).toBe('mindnote');
+    expect(file.cloudObjType).toBe('file');
+  });
+
+  it('does NOT add cloudObjType for supported types (byte-identical output)', async () => {
+    const out = await runCompare(store, [
+      makeCloud({ obj_token: 'DOC', node_token: 'nDOC', obj_type: 'docx' }),
+    ]);
+
+    expect(out).toHaveLength(1);
+    // undefined 字段不出现在可观察输出（API JSON）中
+    expect(out[0].cloudObjType).toBeUndefined();
+    expect(JSON.stringify(out[0])).not.toContain('cloudObjType');
+  });
+});
+
 describe('ChangeDetector.compareWithLocalRecords (P2-T1 three-state)', () => {
   let store: MockLocalMapStore;
   beforeEach(() => {

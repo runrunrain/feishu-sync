@@ -56,6 +56,13 @@ import type { DocumentIR } from './document-ir.js';
 import { BitableExporter, type BitableClient } from './bitable-exporter.js';
 import { LarkCliError } from './lark-cli-client.js';
 import { stageSourceWorkbook } from './sheet-workbook.js';
+// P0-S8：白板旁路导出（svg 主 + raw 降级）与 SyncEngine 同一导出链
+// （whiteboard-bypass.ts 共享函数，S6 报告 §五遗留接入；见该模块头）。
+import {
+  exportWhiteboardBypassFile,
+  resolveWhiteboardExportOptionsFromConfig,
+  type WhiteboardBypassFile,
+} from './whiteboard-bypass.js';
 
 export interface SyncDocxToCustomFolderInput {
   /** LarkCliClient instance (public methods only). */
@@ -63,6 +70,12 @@ export interface SyncDocxToCustomFolderInput {
     fetchDocumentMarkdown(objToken: string): Promise<any>;
     downloadMedia(token: string, outputPath: string, type: 'media' | 'whiteboard'): Promise<string>;
     previewMedia(token: string, outputPath: string): Promise<string>;
+    /** P0-S8 白板旁路导出（可选：旧测试替身无此方法 → 跳过不告警，
+     * 与 SyncEngine 同款容错）。 */
+    exportWhiteboard?(
+      whiteboardToken: string,
+      opts: { outputType: 'svg' | 'raw'; outputPath: string; timeoutMs?: number },
+    ): Promise<string>;
   };
   knowledgeBaseRoot: string;
   /** Optional operation staging root override; defaults to ~/.feishu-sync/operations. */
@@ -75,6 +88,12 @@ export interface SyncDocxToCustomFolderInput {
   originalLink: string | null;
   objEditTime: number | null;
   spaceId: string | null;
+  /**
+   * P0-S8：白板旁路导出配置（sync.whiteboardExport 宽容形态，缺省
+   * 开启）。调用方传 config.sync.whiteboardExport；未传时与旧配置
+   * 缺省一致（enabled=true）。
+   */
+  whiteboardExport?: { enabled?: boolean; svgTimeoutMs?: number };
   /**
    * Optional pre-fetched markdown for the pure cloud-doc fallback path: the
    * route already invoked fetchDocumentMarkdown once to resolve the title, so
@@ -159,6 +178,9 @@ interface DownloadedMedia {
   absolutePath: string;
   /** POSIX path relative to the markdown file's directory, e.g. images/01.png */
   relativeToDocDir: string;
+  /** P0-S8：白板旁路导出产物（svg 主 / raw 降级），与 PNG 同主干；
+   * 双失败时缺省（仅告警，不阻断归档，与 SyncEngine 同语义）。 */
+  whiteboardBypass?: WhiteboardBypassFile;
 }
 
 interface DownloadedAttachment {
@@ -214,6 +236,7 @@ export async function syncDocxToCustomFolder(
       input.larkCliClient,
       references.filter((r) => r.kind === 'image' || r.kind === 'whiteboard'),
       mediaTemp,
+      input.whiteboardExport,
     );
     const attachments = await downloadAttachments(
       input.larkCliClient,
@@ -266,6 +289,17 @@ export async function syncDocxToCustomFolder(
           : image.relativeToDocDir,
         absoluteSource: image.absolutePath,
       });
+      // P0-S8：白板旁路文件与 PNG 同批原子提交；不被 md 引用、不进
+      // requiredRelativePaths（可选资源，缺失不阻断）。
+      if (image.whiteboardBypass) {
+        const bypassName = path.basename(image.whiteboardBypass.path);
+        extraFiles.push({
+          relativePath: docDirRel
+            ? `${docDirRel}/images/${bypassName}`
+            : `images/${bypassName}`,
+          absoluteSource: image.whiteboardBypass.path,
+        });
+      }
     }
     for (const attachment of attachments) {
       extraFiles.push({
@@ -728,11 +762,16 @@ function renderLocalizedMediaReferences(content: string): string {
  * Download image/whiteboard tokens into tempDir. Mirrors SyncEngine's
  * transport policy: media-download first, media-preview fallback for plain
  * images; whiteboards are download-only (preview does not support them).
+ *
+ * P0-S8：白板在 PNG 预览就绪后追加旁路导出（svg 主 + raw 降级，与
+ * SyncEngine.downloadImages 同一导出链）；任何失败只告警，绝不阻断
+ * 归档提交（缺 PNG 阻断、缺旁路降级，设计 §5.1）。
  */
 async function downloadMediaReferences(
   client: SyncDocxToCustomFolderInput['larkCliClient'],
   refs: MediaReference[],
   tempDir: string,
+  whiteboardExport: SyncDocxToCustomFolderInput['whiteboardExport'],
 ): Promise<DownloadedMedia[]> {
   const out: DownloadedMedia[] = [];
   const imagesDir = path.join(tempDir, 'images');
@@ -760,11 +799,23 @@ async function downloadMediaReferences(
       }
     }
     assertDownloaded(absolutePath, ref.token);
+    // P0-S8：PNG 就绪后追加旁路导出（staging 内同主干落盘，随 extraFiles
+    // 原子提交）；旧测试替身无 exportWhiteboard → 跳过不告警。
+    const whiteboardBypass = ref.kind === 'whiteboard'
+      && typeof client.exportWhiteboard === 'function'
+      ? await exportWhiteboardBypassFile(
+          client,
+          absolutePath,
+          ref.token,
+          resolveWhiteboardExportOptionsFromConfig({ sync: { whiteboardExport } }),
+        )
+      : undefined;
     out.push({
       token: ref.token,
       kind: ref.kind,
       absolutePath,
       relativeToDocDir: `images/${path.basename(absolutePath)}`,
+      ...(whiteboardBypass ? { whiteboardBypass } : {}),
     });
     index += 1;
   }

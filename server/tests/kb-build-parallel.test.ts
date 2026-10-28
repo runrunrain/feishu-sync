@@ -166,7 +166,9 @@ class FakeRpcProcess extends EventEmitter {
       }
       // 正文/标题/摘要不含 objToken/路径等来源标识（body_contains_source_metadata 拦截）
       await this.call('kb_write_doc', {
-        path: `主题/${unitId || 'u'}-文档${docIndex}.md`,
+        // P2-S2：预算开启后同一工作集会拆多批，路径须按 token 唯一
+        // （docIndex 每批重置，批间会同路径覆盖 → source_not_covered）
+        path: `主题/${unitId || 'u'}-${token}.md`,
         title: `规则主题${docIndex}`,
         markdown: '规则的完整说明：第一段定义，第二段流程与边界。',
         sources: [token],
@@ -233,7 +235,7 @@ function writeRaw(rel: string, content: string): void {
   fs.writeFileSync(full, content);
 }
 
-function makeConfig(overrides: { buildParallelism?: number } = {}): Config {
+function makeConfig(overrides: { buildParallelism?: number; buildBatchWordBudget?: number } = {}): Config {
   return {
     llm: { openAiCompatBaseUrl: '', apiKey: '', model: '', temperature: 0.2, primaryChannel: 'direct', fallbackOnFailure: false },
     agent: {
@@ -246,6 +248,8 @@ function makeConfig(overrides: { buildParallelism?: number } = {}): Config {
     },
     standardKb: {
       outputRoot, retainReleases: 3, buildBatchSize: 10,
+      // P2-S2：缺省 0 = 旧行为（既有用例零回归）；新用例显式传预算
+      buildBatchWordBudget: overrides.buildBatchWordBudget ?? 0,
       promptTimeoutMinutes: 15, buildTimeoutMinutes: 180,
       buildParallelism: overrides.buildParallelism ?? 1, autoBuildAfterSync: false,
     },
@@ -683,5 +687,77 @@ describe('S4：DTO 契约', () => {
     const dtoAgain = harness.service.toDto(rows[0]);
     expect(Array.isArray(dtoAgain.warnings)).toBe(true);
     expect(typeof dtoAgain.parallelism).toBe('number');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P2-S2：字数预算接线（worksetMeta words → packBatches → 批次/单元边界与日志）
+// ---------------------------------------------------------------------------
+
+describe('P2-S2：buildBatchWordBudget 字数预算接线', () => {
+  it('单 worker：预算 = 单源字数 → 每源独批；每批出现 batch k/n 字数日志', async () => {
+    writeRaw('预算域/a.md', `a ${FAT}`);
+    writeRaw('预算域/b.md', `b ${FAT}`);
+    documents.length = 0;
+    documents.push(docRecord('tokBA', '预算域/a.md'), docRecord('tokBB', '预算域/b.md'));
+    // 单源字数（正文 'a ' + FAT 的 countText words）；预算取该值 → 两源必分两批
+    const { countText } = await import('../src/kb/text-stats.js');
+    const perSource = countText(`a ${FAT}`).words;
+    const harness = makeHarness(makeConfig({ buildParallelism: 1, buildBatchWordBudget: perSource }));
+    const dto = await harness.service.createBuild(store as never, { mode: 'full', confirm: 'BUILD' });
+    const row = await waitForTerminal(dto.id);
+    expect(String(row.status)).toBe('published');
+    // 批次 prompt：两个批（各 1 源）+ finish
+    const batchPrompts = harness.fakes[0].prompts.filter((p) => p.includes('请处理以下'));
+    expect(batchPrompts).toHaveLength(2);
+    expect(batchPrompts[0]).toContain('1 个源文档');
+    expect(batchPrompts[1]).toContain('1 个源文档');
+    // §2.3 批次字数日志（budget>0 时每批一行）
+    const logs = harness.service
+      .eventsSince(dto.id, null)
+      .filter((e) => e.event === 'build_log')
+      .map((e) => (e.data as { message?: string }).message ?? '');
+    expect(logs.some((m) => new RegExp(`^batch 1/2: sources=1, words=${perSource}$`).test(m))).toBe(true);
+    expect(logs.some((m) => new RegExp(`^batch 2/2: sources=1, words=${perSource}$`).test(m))).toBe(true);
+  });
+
+  it('单 worker：budget=0（缺省）→ 批次与日志保持旧行为（无 batch 字数行）', async () => {
+    writeRaw('预算零域/a.md', `a ${FAT}`);
+    writeRaw('预算零域/b.md', `b ${FAT}`);
+    documents.length = 0;
+    documents.push(docRecord('tokZA', '预算零域/a.md'), docRecord('tokZB', '预算零域/b.md'));
+    const harness = makeHarness(makeConfig({ buildParallelism: 1 }));
+    const dto = await harness.service.createBuild(store as never, { mode: 'full', confirm: 'BUILD' });
+    const row = await waitForTerminal(dto.id);
+    expect(String(row.status)).toBe('published');
+    expect(harness.fakes[0].prompts.filter((p) => p.includes('请处理以下'))).toHaveLength(1); // 10 源上限一批
+    const logs = harness.service
+      .eventsSince(dto.id, null)
+      .filter((e) => e.event === 'build_log')
+      .map((e) => (e.data as { message?: string }).message ?? '');
+    expect(logs.some((m) => m.startsWith('batch '))).toBe(false);
+  });
+
+  it('并行 W=2：单元预算×3 把同目录两源切成两单元；每批出现 unit 批字数日志', async () => {
+    writeRaw('预算并/a.md', `a ${FAT}`);
+    writeRaw('预算并/b.md', `b ${FAT}`);
+    documents.length = 0;
+    documents.push(docRecord('tokPA', '预算并/a.md'), docRecord('tokPB', '预算并/b.md'));
+    // 单元预算 = 3×budget < 两源合计（2×345）→ 目录簇切成 2 个单元 → workerCount=2
+    const { countText } = await import('../src/kb/text-stats.js');
+    const perSource = countText(`a ${FAT}`).words; // 345
+    const harness = makeHarness(makeConfig({ buildParallelism: 2, buildBatchWordBudget: 200 }));
+    const dto = await harness.service.createBuild(store as never, { mode: 'full', confirm: 'BUILD' });
+    const row = await waitForTerminal(dto.id);
+    expect(String(row.status)).toBe('published');
+    expect(Number(row.unit_total)).toBe(2);
+    expect(Number(row.parallelism)).toBe(2);
+    // §2.3 并行路径批次字数日志（含单元归属）
+    const logs = harness.service
+      .eventsSince(dto.id, null)
+      .filter((e) => e.event === 'build_log')
+      .map((e) => (e.data as { message?: string }).message ?? '');
+    expect(logs.some((m) => new RegExp(`^unit u\\d+ batch 1/1: sources=1, words=${perSource}$`).test(m))).toBe(true);
+    expect(logs.filter((m) => m.startsWith('unit ')).length).toBeGreaterThanOrEqual(2);
   });
 });

@@ -24,12 +24,14 @@ import { buildPiProcessEnv, PiRpcProcess } from '../agent/pi-rpc-process.js';
 import { PiRuntimeResolver, resolveAppLlmModel } from '../agent/runtime-resolver.js';
 import { buildAppLlmRunConfig } from '../agent/provider-descriptor.js';
 import { RawSourceSnapshot, computeSourceHash } from './raw-source-snapshot.js';
+import { isReleaseInUse } from './publication-service.js';
 import { StandardKbStore, parseStdHeader, stripStdHeader } from './standard-kb-store.js';
 import { KbVersionStore, captureSourceContents, sourceChangePreview, type SourceContents } from './kb-version-store.js';
 import { hasEditorialHistory, hasSourceMetadata } from './body-policy.js';
-import { planUnits, type BuildUnit } from './build-units.js';
+import { planUnits, packBatches, type BuildUnit } from './build-units.js';
+import { countText } from './text-stats.js';
 import { PathClaims } from './path-claims.js';
-import { enrichEntriesWithMedia, resolveSourceImages, verifyEntryMediaHash } from './source-images.js';
+import { collectWhiteboardTextsForEntries, enrichEntriesWithMedia, resolveSourceImages, verifyEntryMediaHash, verifyEntryWhiteboardTextHash } from './source-images.js';
 import type { ImageDescription } from '../agent/vision/vision-describer.js';
 import { VisionDescriber } from '../agent/vision/vision-describer.js';
 import { buildDefaultAgentVisionConfig } from '../types/agent-knowledge.js';
@@ -59,6 +61,8 @@ export interface KbBuildDeps {
   documentsProvider: () => import('../types/index.js').DocumentRecord[];
   sheetCsvPaths: (objToken: string) => string[];
   excludedSourcesProvider?: () => string[];
+  /** P1-S8（设计 P1 §4.1 防线 2）：已发布云文档 token 集（快照排除面）。 */
+  publishedTokensProvider?: () => string[];
   internalBaseUrl: () => string;
   extensionPath: () => string | null;
   promptAssets: () => { buildRules: string; styleGuide: string } | null;
@@ -415,9 +419,22 @@ export class KbBuildService extends EventEmitter {
       cleanupOldStaging(outputRoot);
 
       const documents = this.sourceDocuments();
+      // P1-S8（设计 P1 §4.1 防线 2）：发布产物不进构建快照——用户把已发布
+      // 文档移进监听树时，同步会如实镜像，但构建必须排除（防自我喂养），
+      // 并给构建警告 published_doc_in_sources。排除只作用于构建，不影响同步。
+      const publishedTokens = new Set(this.deps.publishedTokensProvider?.() ?? []);
+      let publishedExcludedCount = 0;
+      if (publishedTokens.size > 0) {
+        publishedExcludedCount = documents.filter((doc) => publishedTokens.has(doc.objToken)).length;
+        if (publishedExcludedCount > 0) {
+          this.emitLog(buildId, 'warn', `快照排除 ${publishedExcludedCount} 个已发布云文档（published_doc_in_sources：发布产物不得作为构建源）`);
+        }
+      }
       const snapshotResult = RawSourceSnapshot.scan(
         config.knowledgeBaseRoot,
-        documents,
+        publishedExcludedCount > 0
+          ? documents.filter((doc) => !publishedTokens.has(doc.objToken))
+          : documents,
         this.deps.sheetCsvPaths,
       );
       // S3（§3.4）：为全部条目补充 mediaHash/imageCount（contentHash 公式不变）
@@ -549,6 +566,11 @@ export class KbBuildService extends EventEmitter {
       buildState.requiredRewrites = new Set(affectedDocs.map((doc) => doc.path)
         .filter((docPath) => fs.existsSync(path.join(stagingRootPath, 'docs', docPath))));
 
+      // P0-S7（设计 §5.6 + 任务 4）：白板旁路文字预取——raw_read 可读任意
+      // 快照源，全量预取一次（仅非空文字占内存）；describeWorksetImages 用
+      // 它跳过已有文字的白板识图（省额度，svg/raw 同规则）。
+      buildState.whiteboardTexts = collectWhiteboardTextsForEntries(config.knowledgeBaseRoot, snapshot.entries);
+
       // ---- S3（§3.4）：preflight 图片预描述（stage=describing_images）----
       // vision 就绪 → describeMany（缓存命中不调远端、不计配额）；未就绪 →
       // 全部标 unavailable(vision_unconfigured)。U5：不阻断构建。
@@ -568,6 +590,13 @@ export class KbBuildService extends EventEmitter {
       if (entry.cancelRequested) throw new CancelledError();
 
       const buildWarnings: KbBuildDto['warnings'] = [];
+      if (publishedExcludedCount > 0) {
+        buildWarnings.push({
+          code: 'published_doc_in_sources',
+          count: publishedExcludedCount,
+          message: `${publishedExcludedCount} 个已发布云文档出现在监听树内，已从本次构建快照排除（防自我喂养）；请在飞书侧把这些文档移出监听子树`,
+        });
+      }
       if (entry.images.total > 0 && entry.images.unavailable > 0) {
         buildWarnings.push({
           code: 'images_unavailable',
@@ -583,18 +612,39 @@ export class KbBuildService extends EventEmitter {
 
       // ---- S4（§4.1/§4.2）：单元划分 + worker 调度 ----
       const batchSize = Math.max(1, Math.min(50, config.standardKb.buildBatchSize));
-      const worksetMeta = new Map<string, { relPath: string; bytes: number }>();
+      // P2-S2：每批有效字数预算（ConfigManager 归一后必有；未经归一的对象
+      // 缺字段时按 0 = 旧行为处理，保证旧测试夹具字节级等价）
+      const wordBudget = Math.max(0, Math.floor(config.standardKb.buildBatchWordBudget ?? 0));
+      const worksetMeta = new Map<string, { relPath: string; bytes: number; words: number }>();
       for (const [token] of workset) {
         const sourceEntry = snapshot.get(token);
         if (!sourceEntry) continue;
+        const file = path.join(config.knowledgeBaseRoot, sourceEntry.relPath);
         let bytes = 0;
         try {
-          bytes = fs.statSync(path.join(config.knowledgeBaseRoot, sourceEntry.relPath)).size;
+          bytes = fs.statSync(file).size;
         } catch {
           /* 缺失按 0 */
         }
-        worksetMeta.set(token, { relPath: sourceEntry.relPath, bytes });
+        let words = 0;
+        if (wordBudget > 0) {
+          // P2-S2（§2.2）：有效字数 = 源正文 + 本次识图描述（unavailable 计 0）。
+          // 预算关闭（0）时不读文件——旧行为字节级等价，也省去全量 IO。
+          let content: string | null = null;
+          try {
+            content = fs.readFileSync(file, 'utf-8');
+          } catch {
+            /* 不可读按 0（与 bytes 同口径） */
+          }
+          words = effectiveWords({
+            content,
+            imageDescriptions: [...(buildState.imageDescriptions?.get(token) ?? new Map()).values()],
+            whiteboardTexts: [...(buildState.whiteboardTexts?.get(token) ?? new Map()).values()],
+          });
+        }
+        worksetMeta.set(token, { relPath: sourceEntry.relPath, bytes, words });
       }
+      const wordsOf = (token: string): number => worksetMeta.get(token)?.words ?? 0;
       const units = planUnits({
         mode: effectiveMode,
         workset: worksetMeta,
@@ -605,6 +655,7 @@ export class KbBuildService extends EventEmitter {
         requiredRewrites: [...(buildState.requiredRewrites ?? [])],
         removedSources: changeset.removed,
         batchSize,
+        wordBudget,
       });
       // S4 等价回退：单 worker（buildParallelism=1 或仅 1 个单元）走既有
       // 单进程流水线（全局批切分 + kb_finish 单轮，不引入单元语义）——
@@ -629,6 +680,8 @@ export class KbBuildService extends EventEmitter {
           affectedDocs,
           sourceChanges: changePreview.sources,
           cancelController,
+          wordBudget,
+          wordsOf,
         });
       } else {
       // ---- 单元化并行路径（W ≥ 2）----
@@ -677,6 +730,8 @@ export class KbBuildService extends EventEmitter {
           promptTimeoutMs,
           cancelController,
           slotDeadlineMs,
+          wordBudget,
+          wordsOf,
         });
 
         // 收尾轮（§4.1：复用最后存活 worker，否则新拉 final 进程；kb_finish 单值）
@@ -832,6 +887,9 @@ export class KbBuildService extends EventEmitter {
         continue;
       }
       for (const image of resolveSourceImages(input.entry.buildState?.knowledgeBaseRoot ?? '', entry.relPath, content)) {
+        // P0-S7（任务 4）：旁路文字存在 → 跳过 vision 描述（省额度）；
+        // 文字经 raw_read 内联 <whiteboard_text>（svg/raw 同规则）。
+        if (input.entry.buildState?.whiteboardTexts?.get(token)?.has(image.src)) continue;
         items.push({ objToken: token, src: image.src, file: image.file });
       }
     }
@@ -901,12 +959,18 @@ export class KbBuildService extends EventEmitter {
     affectedDocs: Array<{ path: string; title: string }>;
     sourceChanges: KbFileChange[];
     cancelController: AbortController;
+    /** P2-S2：每批有效字数预算（0 = 旧行为按源数切分） */
+    wordBudget: number;
+    /** P2-S2：objToken → 有效字数（worksetMeta） */
+    wordsOf: (token: string) => number;
   }): Promise<void> {
     const { entry, buildState } = input;
     const config = this.deps.configProvider()!;
-    const batches = chunkTokens(
+    // P2-S2：与并行路径同一 packBatches（wordBudget=0 等价旧 chunkTokens）
+    const batches = packBatches(
       [...input.workset.keys()].sort(),
-      Math.max(1, Math.min(50, config.standardKb.buildBatchSize)),
+      input.wordsOf,
+      { wordBudget: input.wordBudget, maxCount: Math.max(1, Math.min(50, config.standardKb.buildBatchSize)) },
     );
     // F3-R07：仅 removed 的增量（无 added/changed）也必须有一个批次明确
     // 告知模型删除与受影响文档——不能让删除影响只存在于默认删除逻辑里。
@@ -954,6 +1018,12 @@ export class KbBuildService extends EventEmitter {
           sourceChanges: input.sourceChanges,
         });
         this.emitLog(input.buildId, 'info', `批次 ${batchIndex + 1}/${batches.length}：${batch.length} 个源`);
+        // P2-S2（§2.3）：预算开启时每批补一行字数日志（预算调优）；
+        // budget=0 保持旧日志字节级不变
+        if (input.wordBudget > 0) {
+          const batchWords = batch.reduce((sum, token) => sum + input.wordsOf(token), 0);
+          this.emitLog(input.buildId, 'info', `batch ${batchIndex + 1}/${batches.length}: sources=${batch.length}, words=${batchWords}`);
+        }
         const outcome = await rpc.prompt(
           systemRules ? `${batchPrompt}\n\n---\n构建规则与文风规范（每批适用）：\n${systemRules}` : batchPrompt,
           { timeoutMs: config.standardKb.promptTimeoutMinutes * 60_000 },
@@ -1444,6 +1514,10 @@ export class KbBuildService extends EventEmitter {
     promptTimeoutMs: number;
     cancelController: AbortController;
     slotDeadlineMs: number;
+    /** P2-S2：每批有效字数预算（0 = 旧行为按源数切分） */
+    wordBudget: number;
+    /** P2-S2：objToken → 有效字数（worksetMeta） */
+    wordsOf: (token: string) => number;
   }): Promise<void> {
     const { entry, buildState, units } = input;
     let cursor = 0;
@@ -1497,6 +1571,15 @@ export class KbBuildService extends EventEmitter {
             worker.unitBatchIndex = index;
             worker.unitBatchTotal = batches.length;
             this.emitWorker(input.buildId, worker);
+            // P2-S2（§2.3）：预算开启时每批补一行字数日志（含单元归属）
+            if (input.wordBudget > 0) {
+              const batchWords = batches[index].reduce((sum, token) => sum + input.wordsOf(token), 0);
+              this.emitLog(
+                input.buildId,
+                'info',
+                `unit ${unit.id} batch ${index + 1}/${batches.length}: sources=${batches[index].length}, words=${batchWords}`,
+              );
+            }
             const batchPrompt = this.buildUnitBatchPrompt({
               unit,
               batch: batches[index],
@@ -2004,6 +2087,12 @@ export class KbBuildService extends EventEmitter {
     }
     for (const entry of entries.slice(retain)) {
       if (current?.releaseId === entry.name) continue;
+      // P1-S8（设计 P1 §4.6）：发布任务使用中的 release 跳过清理（发布
+      // 固定 releaseId，release 不可变；执行期间被清理会读到半删目录）。
+      if (isReleaseInUse(entry.name)) {
+        this.emit('log', `release ${entry.name} 发布任务使用中，跳过清理`);
+        continue;
+      }
       try {
         fs.rmSync(entry.full, { recursive: true, force: true });
         this.emit('log', `已清理旧 release: ${entry.name}`);
@@ -2153,6 +2242,15 @@ export function verifySnapshotIntact(
       throw new ToolError(
         'source_changed_during_build',
         `发布前复核发现源图片已变更: ${source.relPath}`,
+        409,
+      );
+    }
+    // P0-S7：有 whiteboardTextHash 的源同步复核旁路文字——构建中白板旁路
+    // 被改/删时模型内联文字与快照不一致，同样不得切换 CURRENT。
+    if (!verifyEntryWhiteboardTextHash(rootReal, source)) {
+      throw new ToolError(
+        'source_changed_during_build',
+        `发布前复核发现源白板旁路文字已变更: ${source.relPath}`,
         409,
       );
     }
@@ -2306,6 +2404,12 @@ export function computeChangeset(
     // S3（U4）：vision 启用时变更判定含 mediaHash——双方均非空且不等才算变更；
     // 旧 manifest 无 mediaHash 视为未变（升级后首次增量不触发全量 changed）
     else if (opts?.visionEnabled && base.mediaHash && entry.mediaHash && base.mediaHash !== entry.mediaHash) changed.push(token);
+    // P0-S7（设计 §5.5 四象限）：白板旁路文字 hash 变化 → changed，与
+    // vision 无关（旁路文字零成本）。象限：旧缺失(??'')×新空 → 不变；
+    // 旧空×新非空 → changed（首获文字只重建一次）；旧非空×新非空相等 →
+    // 不变 / 不等 → changed；旧非空×新空 → changed（文字消失，内容变化
+    // 语义）。contentHash 公式不变——旁路文件不进主哈希。
+    else if ((base.whiteboardTextHash ?? '') !== (entry.whiteboardTextHash ?? '')) changed.push(token);
   }
   for (const token of baseByToken.keys()) {
     if (!currentByToken.has(token)) removed.push(token);
@@ -2404,11 +2508,31 @@ export function cleanupOldStaging(outputRoot: string): void {
   }
 }
 
-/** 等价回退路径的批切分（与重构前 chunk 语义一致）。 */
-function chunkTokens(items: string[], size: number): string[][] {
-  const result: string[][] = [];
-  for (let i = 0; i < items.length; i += size) result.push(items.slice(i, i + size));
-  return result;
+/**
+ * P2-S2（§2.2）：有效字数 = countText(源文件正文).words
+ *   + Σ countText(本次识图描述文本).words（unavailable 计 0）
+ *   + Σ countText(白板旁路抽取文字).words（P0-S7 上线）
+ *
+ * 纯函数（调度估计，不进 manifest、不参与任何哈希）；正文读取的是快照
+ * 对应的本地文件，与构建输入同源；描述文本取自本次构建识图阶段的结果，
+ * 白板文字取自 preflight 旁路预取，保证「计入预算的内容」与「worker 经
+ * raw_read 看到的」是同一份。
+ */
+export function effectiveWords(input: {
+  content: string | null;
+  imageDescriptions?: Array<{ state: string; text?: string }>;
+  whiteboardTexts?: Array<{ text: string }>;
+}): number {
+  let words = input.content === null ? 0 : countText(input.content).words;
+  for (const description of input.imageDescriptions ?? []) {
+    if (description.state !== 'unavailable' && description.text) {
+      words += countText(description.text).words;
+    }
+  }
+  for (const whiteboard of input.whiteboardTexts ?? []) {
+    words += countText(whiteboard.text).words;
+  }
+  return words;
 }
 
 function writeReport(outputRoot: string, buildId: string, issues: KbBuildReportIssue[]): void {

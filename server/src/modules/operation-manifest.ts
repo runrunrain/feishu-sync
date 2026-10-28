@@ -301,6 +301,8 @@ function blockedPlan(
     localRelPath?: string | null;
     candidateLocalRelPath?: string | null;
     suggestedResolution?: string;
+    /** P2-S8：仅 unsupported_type 路径携带的真实云端类型。 */
+    cloudObjType?: string;
   },
 ): PlannedSyncDocument {
   return {
@@ -317,6 +319,7 @@ function blockedPlan(
     reason: details.reason,
     candidateLocalRelPath: details.candidateLocalRelPath ?? null,
     suggestedResolution: details.suggestedResolution,
+    cloudObjType: details.cloudObjType,
   };
 }
 
@@ -354,10 +357,21 @@ function planDocument(
   // late apply failure.  Block it before any target path is considered so a
   // dry-run never advertises it as writable.
   if (document.objType === 'unknown') {
+    // P2-S8（设计 §4.3/U50）：检测链折叠前携带的真实云端类型透传进
+    // blocker 详情（cloudObjType + reason 文案）；未知且不可得时保持
+    // 既有文案与字段，行为不变。分类行为本身不变（仍折叠 unknown）。
+    const cloudType = document.cloudObjType?.trim();
     return blockedPlan(document, {
       reasonCode: 'unsupported_type',
-      reason: '云端对象类型未知或当前不支持导出，拒绝生成可写同步计划',
-      suggestedResolution: '确认飞书对象类型并实现对应导出适配器后，再重新生成同步计划。',
+      reason: cloudType
+        ? `云端对象类型 ${cloudType} 当前不支持同步，拒绝生成可写同步计划`
+        : '云端对象类型未知或当前不支持导出，拒绝生成可写同步计划',
+      suggestedResolution: cloudType === 'mindnote'
+        ? '思维笔记暂不支持同步，可在飞书中导出为文档后纳入。'
+        : cloudType === 'file'
+          ? '云空间文件暂不支持同步。'
+          : '确认飞书对象类型并实现对应导出适配器后，再重新生成同步计划。',
+      cloudObjType: cloudType || undefined,
     });
   }
 

@@ -22,6 +22,7 @@ import fs from 'node:fs';
 import { resolveDataRoot } from './data-root.js';
 import type {
   ChangedDocument,
+  DocumentRecord,
   SyncResult,
   SyncOptions,
   SyncedDocument,
@@ -47,8 +48,11 @@ import {
 import { commitDocumentContent } from './content-commit.js';
 import type { DocumentIR } from './document-ir.js';
 import {
+  commitAtomicPlan,
   createAtomicCommitWorkspace,
+  emptyCommitPlan,
   rollbackAtomicPlan,
+  stageFileContent,
 } from './atomic-commit.js';
 import {
   extractFeishuMediaReferences,
@@ -67,13 +71,33 @@ import {
 } from './bitable-exporter.js';
 import { adaptSlidesXmlToMarkdown } from './slides-xml-adapter.js';
 import { LarkCliError } from './lark-cli-client.js';
+// P1-S5（设计 §3.1）：同步侧截图只在可选读 scope 已授权时才调用；scope
+// 清单来自 lark-cli-manager 的注册表（无循环依赖：manager 不回依赖本模块）。
+import { optionalScopesForFeature } from './lark-cli-manager.js';
 import { stageSourceWorkbook } from './sheet-workbook.js';
+// P0-S8：白板旁路导出链自 S6 方法体提炼为共享纯函数——downloadImages、
+// backfillWhiteboardBypass 与 custom-doc-sync（归档链）复用同一实现，
+// 防止三处分叉（见 whiteboard-bypass.ts 模块头）。
+import {
+  exportWhiteboardBypassFile,
+  resolveWhiteboardExportOptionsFromConfig,
+  type WhiteboardBypassFile,
+  type WhiteboardBypassOptions,
+} from './whiteboard-bypass.js';
 // S11（设计 §7.3）：同步提交与源编辑共享 per-token 写锁与 dirty blocker。
 // 锁实例与 SourceEditService 默认使用同一进程级单例（source-write-lock.ts）。
 import { sharedSourceWriteLock, type SourceWriteLockLike } from '../sources/source-write-lock.js';
+// P1-S3（设计 P1 §2.2）：同步提交事务内写引用边——组合入口纯函数，
+// 一次完成 body 主体 + refmap 补充 + 合并归一 + 自引用/媒体排除 + 上限。
+import { extractDocumentReferences, type ExtractDocumentReferencesResult } from '../kb/reference-graph.js';
+// P2-S4（设计 P2 §5.1）：同一 fetch 响应 reference_map.comments 组的评论
+// 采集——纯函数解析（fixture 驱动，容错键缺失），与引用边同事务入库。
+import { extractRefmapComments, type RefmapCommentsExtraction } from '../kb/source-comments.js';
 
 interface FetchedDocument {
   content: string;
+  /** P1-S3：fetch 响应 document.reference_map 原值（键可能整体缺失，RP-3）；仅 docx 携带。 */
+  referenceMap?: unknown;
   images: Array<{
     token: string;
     url?: string;
@@ -88,6 +112,8 @@ interface FetchedDocument {
     kind: 'image' | 'whiteboard';
     slideNumber: number;
   }>;
+  /** P1-S5：幻灯片总页数（截图分批与 all-or-none 的页清单来源）。 */
+  slideCount?: number;
   url: string;
   obj_token: string;
 }
@@ -129,12 +155,39 @@ interface Image {
   token: string;
   path: string;
   kind: 'image' | 'whiteboard';
+  /**
+   * P0-S6（设计 §5.2/§5.3 + P0-S1 HP-4 裁定）：白板引用的旁路导出文件，
+   * 与 PNG 同主干（<stem>.wb.svg / <stem>.wb.raw.json），不被 md 引用、
+   * 不进 feishu_sync 头（§5.5 快照判定在 S7，构建侧按命名约定寻址）。
+   * svg 是主产物；raw 是 svg 失败/超时/校验不过时的降级产物。
+   */
+  whiteboardBypass?: WhiteboardBypassFile;
 }
 
 interface Attachment {
   token: string;
   path: string;
   name: string;
+}
+
+/** P0-S8（设计 §5.8）存量补齐的单条跳过记录：reason 值域见 backfillWhiteboardBypass 注释。 */
+export interface WhiteboardBackfillSkipEntry {
+  objToken: string;
+  reason: string;
+}
+
+/**
+ * P0-S8（设计 §5.8）存量补齐结果：只新增旁路文件，md 字节与 DB 基线
+ * 字段前后不变（committedFiles 仅为本次 atomic-commit 入库的旁路相对
+ * 路径，POSIX 形态，供报告/测试锚定）。
+ */
+export interface WhiteboardBackfillResult {
+  /** 已检视的 synced 文档数。 */
+  scanned: number;
+  /** 本次新入库的旁路文件数（.wb.svg / .wb.raw.json）。 */
+  exported: number;
+  skipped: WhiteboardBackfillSkipEntry[];
+  committedFiles: string[];
 }
 
 /** Test-only fault injection for Gate 3 SyncEngine apply path. */
@@ -323,6 +376,9 @@ function plannedFailure(planned: PlannedSyncDocument): FailedDocument {
     suggestedResolution: planned.suggestedResolution || fallbackResolution,
     repairAction,
     watchedRootId: planned.watchedRootId ?? null,
+    // P2-S8（设计 §4.3/U50）：仅未知类型 blocker 路径透传真实云端类型
+    // （undefined 不进 JSON，其余失败路径输出零变化）。
+    cloudObjType: reasonCode === 'unsupported_type' ? planned.cloudObjType : undefined,
   };
 }
 
@@ -333,6 +389,26 @@ type LocalEditSyncOutcome =
   | { kind: 'blocked'; failure: FailedDocument }
   | { kind: 'synced'; doc: SyncedDocument };
 
+/**
+ * P0-S8（设计 §5.8）：从本地 md 正文提取白板图片引用路径。
+ *
+ * 生产者（两端各两处，改其一必须同步另一处）：docx/custom 链
+ * renderLocalizedMediaReferences → `![飞书白板](images/NN-<token>.png)`；
+ * slides 媒体附录 appendSlidesMediaReferences → `![白板预览](...)`。
+ * 本地 md 不含云端 token——token 由 PNG 文件名主干中的 token 段恢复
+ * （既有媒体命名 `NN-<token>`）。去重后保持文档顺序。
+ */
+const LOCAL_WHITEBOARD_REF_PATTERN = /!\[(?:飞书白板|白板预览)\]\(([^)\s]+)\)/g;
+
+export function extractLocalWhiteboardRefs(markdown: string): string[] {
+  const seen = new Set<string>();
+  for (const match of markdown.matchAll(LOCAL_WHITEBOARD_REF_PATTERN)) {
+    const ref = match[1];
+    if (!seen.has(ref)) seen.add(ref);
+  }
+  return [...seen];
+}
+
 export class SyncEngine {
   private larkCliClient: any;
   private localMapStore: any;
@@ -341,6 +417,11 @@ export class SyncEngine {
   private contentAdapter?: any;
   private testHooks: SyncEngineTestHooks;
   private sourceWriteLock: SourceWriteLockLike;
+  /**
+   * P1-S5：slides 截图可选读 scope 的授权态缓存（每引擎实例一次；一次
+   * 同步内的多个 slides 文档共享同一次 checkAuthReady 快照）。null=未探测。
+   */
+  private slidesScreenshotScopeGranted: boolean | null = null;
 
   constructor(deps: SyncEngineDeps) {
     this.larkCliClient = deps.larkCliClient;
@@ -686,6 +767,18 @@ export class SyncEngine {
         localMediaReferences,
       );
     }
+    // P1-S5 slides 截图采集（设计 §3.2/U36）：默认关闭；开启且可选读 scope
+    // 已授权才采集。all-or-none——任一页失败/超页/未授权时该文档零截图
+    // 引用，正文与现状逐字节一致（截图行是唯一新增输出面）。
+    const slidesScreenshots = doc.objType === 'slides'
+      ? await this.stageSlidesScreenshots(doc, fetched, stagingDocDir, localMdPath)
+      : [];
+    if (slidesScreenshots.length > 0) {
+      // 复用既有 images 通道：ir.images / extraFiles / imagesCount / 原子
+      // 提交全部自动覆盖——截图是 md 引用的普通图片，不另造通道（U36）。
+      for (const shot of slidesScreenshots) images.push(shot.image);
+      expandedContent = this.appendSlidesScreenshotReferences(expandedContent, slidesScreenshots);
+    }
 
     const sheets: Array<{
       sheetId: string;
@@ -852,6 +945,20 @@ export class SyncEngine {
 
     // 8. Atomic content commit: only this step mutates knowledge-base files.
     const headerMeta = this.resolveHeaderMeta(doc, fetched);
+    // P1-S3（设计 P1 §2.2）：引用边抽取——纯函数、零 IO，在 DB 事务外
+    // 计算（避免拉长 SQLite 事务，§6 事务变长风险）；插入在下方原子路径
+    // 的 applyDbWrites 事务内与正文基线同生共死。legacy 写入路径
+    // （FEISHU_SYNC_LEGACY_WRITE）不写边，保持零边缺省。
+    let referenceExtraction: ExtractDocumentReferencesResult = { edges: [], truncated: false };
+    // P2-S4（设计 §5.1）：评论采集——仅当本次 fetch 响应携带 reference_map
+    // （docx 走 docs+fetch；sheet/bitable/slides 无 refmap，从未采集）才解析
+    // 与入库；referenceMap 键整体缺失（RP-3，无评论）也写 meta（total=0），
+    // 与「从未采集」（无 meta 行）区分。解析纯函数、零 IO，事务外计算
+    // （与引用边同款，避免拉长 SQLite 事务）。
+    let commentExtraction: RefmapCommentsExtraction | null = null;
+    if (fetched.referenceMap !== undefined) {
+      commentExtraction = extractRefmapComments(fetched.referenceMap);
+    }
     if (process.env.FEISHU_SYNC_LEGACY_WRITE === '1' && !workbook) {
       await this.writeLocalMarkdown(localMdPath, finalContent, headerMeta);
       await this.updateLocalMap(doc, localMdPath);
@@ -917,6 +1024,15 @@ export class SyncEngine {
           relativePath: relativeDir ? `${relativeDir}/images/${name}` : `images/${name}`,
           absoluteSource: img.path,
         });
+        // P0-S6：白板旁路文件（svg/raw）与 PNG 同批原子提交；md 不引用，
+        // 不进 requiredRelativePaths（旁路是可选资源，缺失不得阻断提交）。
+        if (img.whiteboardBypass) {
+          const bypassName = path.basename(img.whiteboardBypass.path);
+          extraFiles.push({
+            relativePath: relativeDir ? `${relativeDir}/images/${bypassName}` : `images/${bypassName}`,
+            absoluteSource: img.whiteboardBypass.path,
+          });
+        }
       }
       for (const img of sheetMediaImages) {
         const name = path.basename(img.localPath);
@@ -964,6 +1080,21 @@ export class SyncEngine {
       if (!commit.ok) {
         throw new Error(commit.error || '原子内容提交失败');
       }
+
+      // P1-S3：sheet/bitable/slides 不走 docs+fetch（referenceMap undefined）
+      // → 仅正文链接解析（§2.2）。
+      referenceExtraction = extractDocumentReferences({
+        markdown: finalContent,
+        referenceMap: fetched.referenceMap,
+        selfTokens: [doc.objToken, doc.wikiNodeToken ?? null, headerMeta.wikiNodeToken],
+        excludeTokens: [
+          // 媒体计划 token 集（图片/白板/附件，media-reference 已处理者不入图，§2.1）
+          ...images.map((img) => img.token),
+          ...sheetMediaImages.map((img) => img.token),
+          ...attachments.map((att) => att.token),
+          ...(bitableResult?.attachments ?? []).map((att) => att.token),
+        ],
+      });
 
       // 9. DB baseline + sheet_sheets only after files are committed.
       //    All DB writes run in one SQLite transaction so a mid-DB failure
@@ -1017,6 +1148,23 @@ export class SyncEngine {
               lastSyncedAt: nowIso,
             });
           }
+          // P1-S3：与正文同一 DB 事务替换引用边（先删该源旧边再插新边）。
+          // 方法缺失（旧测试替身/旧版本库）时静默跳过；事务中止（含
+          // failAfterMarkDocumentSynced 注入）时边随基线一起回滚。
+          if (typeof this.localMapStore.replaceSourceReferences === 'function') {
+            this.localMapStore.replaceSourceReferences(doc.objToken, referenceExtraction.edges);
+          }
+          // P2-S4：与引用边同事务替换评论（先删后插 + meta；truncated 来自
+          // comments.tips 存在性，如实标注）。commentExtraction === null 表示
+          // 本次 fetch 无 reference_map（非 docx），不写任何行。方法缺失
+          // （旧测试替身）时静默跳过；事务中止时随基线一起回滚。
+          if (commentExtraction !== null && typeof this.localMapStore.replaceSourceComments === 'function') {
+            this.localMapStore.replaceSourceComments(
+              doc.objToken,
+              commentExtraction.comments,
+              { truncated: commentExtraction.truncated },
+            );
+          }
           if (this.testHooks.failAfterMarkDocumentSynced) {
             throw new Error(
               '注入失败：markDocumentSynced 之后 sheet/DB 事务中止',
@@ -1042,6 +1190,14 @@ export class SyncEngine {
     // 状态，下次成功同步会再试清理）。
     this.finalizePushedSourceEdit(doc.objToken);
 
+    // P1-S3（§2.1）：单文档引用边超 500 上限 → 同步警告 references_truncated
+    // （边照常入库，按 occurrences 降序截断；不阻断提交）。
+    if (referenceExtraction.truncated) {
+      console.warn(
+        `[SyncEngine] references_truncated: ${doc.title} 引用边超过上限，已按 occurrences 截断为 ${referenceExtraction.edges.length} 条`,
+      );
+    }
+
     return {
       objToken: doc.objToken,
       title: doc.title,
@@ -1051,6 +1207,7 @@ export class SyncEngine {
       imagesCount: images.length + sheetMediaImages.length,
       attachmentsCount: attachments.length + (bitableResult?.attachments.length ?? 0),
       sheetsCount: sheets.length,
+      referencesTruncated: referenceExtraction.truncated ? true : undefined,
     };
   }
 
@@ -1124,6 +1281,9 @@ export class SyncEngine {
       sheets: Array.isArray(document.sheets) ? document.sheets : [],
       url: typeof document.url === 'string' ? document.url : '',
       obj_token: objToken,
+      // P1-S3（设计 §2.2/U32）：reference_map 与正文同响应返回，零成本携带；
+      // 键整体缺失（RP-3）时为 undefined，抽取层容错零 refmap 边。
+      referenceMap: document.reference_map,
     };
   }
 
@@ -1150,6 +1310,7 @@ export class SyncEngine {
 
     return {
       content: adapted.markdown,
+      slideCount: adapted.slideCount,
       images: [
         ...adapted.imageTokens
           .filter((token) => tokenPattern.test(token))
@@ -1201,7 +1362,12 @@ export class SyncEngine {
           img.kind === 'whiteboard' ? 'whiteboard' : 'media',
         );
         this.assertDownloadedMedia(filepath, img.token);
-        images.push({ token: img.token, path: filepath, kind: img.kind });
+        // P0-S6：白板旁路导出（svg 主 + raw 降级）——只在 PNG 预览已就绪
+        // 之后追加；任何失败只告警，绝不上抛（缺 PNG 阻断、缺旁路降级）。
+        const whiteboardBypass = img.kind === 'whiteboard'
+          ? await this.exportWhiteboardBypassFile(filepath, img.token)
+          : undefined;
+        images.push({ token: img.token, path: filepath, kind: img.kind, whiteboardBypass });
       } catch (downloadError) {
         if (img.kind === 'whiteboard') {
           throw downloadError instanceof Error
@@ -1230,6 +1396,269 @@ export class SyncEngine {
     }
 
     return images;
+  }
+
+  // -------------------------------------------------------------------------
+  // P0-S6 白板旁路导出（设计 §5.1–§5.3 + §10 裁定 1：svg 主 + raw 降级）
+  // ---------------------------------------------------------------------------
+
+  private resolveWhiteboardExportOptions(): WhiteboardBypassOptions {
+    return resolveWhiteboardExportOptionsFromConfig(this.config);
+  }
+
+  /**
+   * 白板旁路导出（永不抛错）：svg 主产物 → 失败/超时/校验不过降级 raw →
+   * 双失败仅告警（whiteboard_svg_unavailable），正文照常走既有 PNG 通道。
+   *
+   * 命名（设计 §5.2）：与 PNG 同主干——<stem>.wb.svg / <stem>.wb.raw.json；
+   * 构建侧（S7）按命名约定寻址，无映射表。md 正文与 feishu_sync 头零
+   * 改动；旁路文件经 downloadImages 调用方加入 atomic-commit extraFiles。
+   *
+   * 校验链（设计 §5.3）：非空、≤ 8 MiB；svg 额外要求开头 2 KiB 内含
+   * "<svg"（防错误页/空壳被当作产物入库）。校验不过删 staging 残留。
+   */
+  private async exportWhiteboardBypassFile(
+    pngPath: string,
+    whiteboardToken: string,
+  ): Promise<WhiteboardBypassFile | undefined> {
+    const options = this.resolveWhiteboardExportOptions();
+    if (!options.enabled) return undefined;
+    const client = this.requireLarkCliClient();
+    // P0-S2 新增方法：旧测试替身没有 → 跳过而非误报降级（与 slides
+    // 截图链的容错先例一致）。
+    if (typeof client.exportWhiteboard !== 'function') return undefined;
+    return exportWhiteboardBypassFile(client, pngPath, whiteboardToken, options);
+  }
+
+  // -------------------------------------------------------------------------
+  // P0-S8 存量补齐（设计 §5.8）：对已同步文档补导白板旁路文件。
+  // 硬约束：只新增 .wb.svg/.wb.raw.json——md 字节与 DB 基线字段（含
+  // synced_obj_edit_time / synced 状态）前后完全不变；脏文档跳过。
+  // -------------------------------------------------------------------------
+
+  /** 从 PNG 主干恢复白板 token；无 `NN-<token>` 形态返回 null。 */
+  private static whiteboardTokenFromStem(stem: string): string | null {
+    const match = stem.match(/^\d+-(.+)$/);
+    const token = match?.[1] ?? '';
+    return token.length > 0 ? token : null;
+  }
+
+  /** §5.8 跳过项：objToken 定位到文档，reason 见方法注释。 */
+  private pushBackfillSkip(
+    skipped: WhiteboardBackfillSkipEntry[],
+    objToken: string,
+    reason: string,
+  ): void {
+    skipped.push({ objToken, reason });
+  }
+
+  /** documents 行的本地 md 绝对路径（兼容旧相对 localMdPath 行）。 */
+  private resolveBackfillMdPath(row: DocumentRecord, root: string): string | null {
+    if (row.localMdPath && path.isAbsolute(row.localMdPath)) return row.localMdPath;
+    if (row.localRelPath) {
+      return path.join(root, ...row.localRelPath.replace(/\\/g, '/').split('/'));
+    }
+    if (row.localMdPath) return path.resolve(root, row.localMdPath);
+    return null;
+  }
+
+  /**
+   * P0-S8 存量补齐（设计 §5.8）：对 synced 文档解析本地 md 白板引用，
+   * 导出缺失的旁路文件（svg 主 + raw 降级，同 S6 导出链）。
+   *
+   * 与自然重同步的差别：稳定不再修改的架构图文档永远不会自然重同步，
+   * 其白板内精确文字只能靠本命令一次性补齐（§5.8 为什么不等自然重同步）。
+   *
+   * 不变量（硬验收）：
+   * - 只新增 .wb.svg/.wb.raw.json——不重写 md、不重写 feishu_sync 头；
+   * - 不写任何 SQLite 字段（synced_obj_edit_time / sync_state / status /
+   *   content_hash 的推导源 md 字节均不变）；
+   * - 导出物先进 staging（镜像路径只用于命名派生，PNG 本体不被读取），
+   *   校验后经同一 atomic-commit 入位，失败整体回滚不留残留。
+   *
+   * 逐文档串行；跳过项进 skipped（reason 值域）：
+   * - not_found / not_synced：仅显式 docTokens 模式报告；
+   * - local_edit_pending：source_edits 存在非 pushed 行（S11 同款判定）；
+   * - local_md_missing：行无本地路径或文件不存在；
+   * - token_unresolvable:<stem>：主干无 `NN-<token>` 段（§5.8 解析不出
+   *   token 的引用跳过并计入报告）；
+   * - already_present:<stem>：同主干旁路已存在（svg 或 raw 任一）；
+   * - png_missing:<stem>：引用的 PNG 预览缺失（KB 不完整，旁路无从锚定）；
+   * - ref_outside_root:<ref>：引用路径逃逸知识库根（防御，生产者不产）；
+   * - export_failed:<stem>：svg+raw 双失败（降级链内已告警）。
+   *
+   * 前置（路由层已拦截，此处防御性直调同样成立）：
+   * sync.whiteboardExport.enabled=false → 抛错拒绝；构建活跃由路由 409
+   * （引擎不依赖 kb 构建面，保持模块边界）。
+   */
+  async backfillWhiteboardBypass(
+    options: { docTokens?: string[] } = {},
+  ): Promise<WhiteboardBackfillResult> {
+    const exportOptions = this.resolveWhiteboardExportOptions();
+    if (!exportOptions.enabled) {
+      throw new Error(
+        'whiteboard_export_disabled: sync.whiteboardExport.enabled=false，旁路导出已关闭，无需补齐',
+      );
+    }
+    const client = this.requireLarkCliClient();
+    if (typeof client.exportWhiteboard !== 'function') {
+      throw new Error(
+        'lark_cli_export_whiteboard_unavailable: lark-cli 客户端不支持 whiteboard +export，无法补齐旁路文件',
+      );
+    }
+
+    const root = path.resolve(this.config.knowledgeBaseRoot);
+    const skipped: WhiteboardBackfillSkipEntry[] = [];
+    const selective = Array.isArray(options.docTokens) && options.docTokens.length > 0;
+
+    // 候选行：显式 docTokens → 逐个解析（缺失/非 synced 计报告，重复
+    // token 去重防同一文档两次扫描）；缺省 → 全量 synced 行（非 synced
+    // 行静默跳过，非本命令可修复面）。
+    let rows: DocumentRecord[];
+    if (selective) {
+      rows = [];
+      const seenTokens = new Set<string>();
+      for (const token of options.docTokens!) {
+        if (seenTokens.has(token)) continue;
+        seenTokens.add(token);
+        const row = typeof this.localMapStore?.getDocumentByObjToken === 'function'
+          ? this.localMapStore.getDocumentByObjToken(token)
+          : null;
+        if (!row) {
+          this.pushBackfillSkip(skipped, token, 'not_found');
+          continue;
+        }
+        rows.push(row);
+      }
+    } else {
+      rows = typeof this.localMapStore?.getAllDocuments === 'function'
+        ? this.localMapStore.getAllDocuments()
+        : [];
+    }
+
+    // 与 getSyncStats 同款成功判定：三字段任一为真即视为 synced 行。
+    const isSyncedRow = (row: DocumentRecord): boolean =>
+      row.status === 'synced' || row.syncState === 'synced' || row.syncedObjEditTime != null;
+
+    // staging 工作区：导出物先落 staging 镜像路径（镜像只用于命名派生），
+    // 全部文档处理完后一次 atomic-commit 入位（校验已由导出链完成）。
+    const operationDirectory = resolveOperationDirectory(
+      root,
+      this.config.operationManifestDir,
+    );
+    const operationId = `wb-backfill-${Date.now()}`;
+    const { stagingRoot, rollbackRoot } = createAtomicCommitWorkspace({
+      operationId,
+      knowledgeBaseRoot: root,
+      operationDirectory,
+    });
+    const plan = emptyCommitPlan({
+      operationId,
+      knowledgeBaseRoot: root,
+      stagingRoot,
+      rollbackRoot,
+    });
+    // 同一相对路径只入 plan 一次：共享 images 目录（mirror-leaf 布局）下
+    // 不同文档引用同一白板时不重复导出/重复计数。
+    const stagedRels = new Set<string>();
+
+    let scanned = 0;
+    for (const row of rows) {
+      if (!isSyncedRow(row)) {
+        if (selective) this.pushBackfillSkip(skipped, row.objToken, 'not_synced');
+        continue;
+      }
+      scanned += 1;
+
+      // S11 同款脏判定：source_edits 非 pushed 行 → 跳过（§5.8 守卫）。
+      if (this.getPendingLocalEditState(row.objToken)) {
+        this.pushBackfillSkip(skipped, row.objToken, 'local_edit_pending');
+        continue;
+      }
+
+      const mdPath = this.resolveBackfillMdPath(row, root);
+      if (
+        !mdPath
+        || !fs.existsSync(mdPath)
+        || !fs.statSync(mdPath).isFile()
+      ) {
+        this.pushBackfillSkip(skipped, row.objToken, 'local_md_missing');
+        continue;
+      }
+      const refs = extractLocalWhiteboardRefs(
+        fs.readFileSync(mdPath, 'utf-8'),
+      );
+      if (refs.length === 0) continue;
+
+      const docDir = path.dirname(mdPath);
+      for (const ref of refs) {
+        const pngAbs = path.resolve(docDir, ...ref.split('/'));
+        const relToRoot = path.relative(root, pngAbs);
+        if (
+          relToRoot === ''
+          || relToRoot.startsWith(`..${path.sep}`)
+          || relToRoot === '..'
+          || path.isAbsolute(relToRoot)
+        ) {
+          this.pushBackfillSkip(skipped, row.objToken, `ref_outside_root:${ref}`);
+          continue;
+        }
+        const stem = path.basename(pngAbs).replace(/\.[^./\\]+$/, '');
+        const whiteboardToken = SyncEngine.whiteboardTokenFromStem(stem);
+        if (!whiteboardToken) {
+          this.pushBackfillSkip(skipped, row.objToken, `token_unresolvable:${stem}`);
+          continue;
+        }
+        const svgExisting = path.join(path.dirname(pngAbs), `${stem}.wb.svg`);
+        const rawExisting = path.join(path.dirname(pngAbs), `${stem}.wb.raw.json`);
+        if (fs.existsSync(svgExisting) || fs.existsSync(rawExisting)) {
+          this.pushBackfillSkip(skipped, row.objToken, `already_present:${stem}`);
+          continue;
+        }
+        if (!fs.existsSync(pngAbs)) {
+          this.pushBackfillSkip(skipped, row.objToken, `png_missing:${stem}`);
+          continue;
+        }
+
+        // 镜像路径 = stagingRoot + 文档内相对布局；只用于命名派生与
+        // lark-cli 子进程 cwd，PNG 本体从不被复制或读取。
+        const mirrorDir = path.join(
+          stagingRoot,
+          ...(toPortableRelative(root, path.dirname(pngAbs)) ?? '')
+            .split('/')
+            .filter(Boolean),
+        );
+        fs.mkdirSync(mirrorDir, { recursive: true });
+        const bypass = await exportWhiteboardBypassFile(
+          client,
+          path.join(mirrorDir, path.basename(pngAbs)),
+          whiteboardToken,
+          exportOptions,
+        );
+        if (!bypass) {
+          this.pushBackfillSkip(skipped, row.objToken, `export_failed:${stem}`);
+          continue;
+        }
+        const relDir = toPortableRelative(root, path.dirname(pngAbs)) ?? '';
+        const relBypass = relDir
+          ? `${relDir}/${path.basename(bypass.path)}`
+          : path.basename(bypass.path);
+        if (stagedRels.has(relBypass)) continue;
+        stagedRels.add(relBypass);
+        stageFileContent(plan, relBypass, fs.readFileSync(bypass.path));
+      }
+    }
+
+    const commit = commitAtomicPlan(plan);
+    if (!commit.ok) {
+      throw new Error(commit.error || '白板旁路补齐原子提交失败（已整体回滚，无残留入库）');
+    }
+    return {
+      scanned,
+      exported: commit.committed.length,
+      skipped,
+      committedFiles: [...commit.committed],
+    };
   }
 
   /**
@@ -1522,6 +1951,193 @@ export class SyncEngine {
 
     if (rendered.length === 0) return content;
     return `${content.trimEnd()}\n\n## 媒体资源\n\n${rendered.join('\n')}\n`;
+  }
+
+  // -------------------------------------------------------------------------
+  // P1-S5 slides 截图采集（设计 §3.2；P1-S1 SP-1 实测：scope
+  // slides:presentation:screenshot 未授权时 CLI 以 missing_scope 拒绝——
+  // 「缺失即跳过」是本切片主线；授权后真实采集路径（SP-2 输出映射 /
+  // SP-3 字节稳定性 / SP-4 体积）待主上授权后于 P1-S6 前实测固化）。
+  // ---------------------------------------------------------------------------
+
+  /** slides +screenshot 单请求页数上限（CLI 契约，SP-1 help 实测）。 */
+  private static readonly SLIDES_SCREENSHOT_BATCH_SIZE = 10;
+  /** 单页体积上限（设计 §6 SP-4：越界按失败处理，all-or-none）。 */
+  private static readonly SLIDES_SCREENSHOT_MAX_BYTES = 10 * 1024 * 1024;
+  /** 单文档页数上限（设计 §3.2 默认 60；超出记警告并跳过）。 */
+  private static readonly SLIDES_SCREENSHOT_MAX_PAGES = 60;
+
+  /**
+   * 采集 slides 逐页截图到 staging（all-or-none）。任一环节失败 → 删除本
+   * 文档全部已暂存截图并返回空数组：文档照常提交、仅记警告，不阻断同步
+   * 也不影响 synced 基线推进条件（U36：失败是警告不是阻断）。
+   */
+  private async stageSlidesScreenshots(
+    doc: ChangedDocument,
+    fetched: FetchedDocument,
+    stagingDocDir: string,
+    localMdPath: string,
+  ): Promise<Array<{ slideNumber: number; image: Image }>> {
+    const warnSkip = (reason: string, detail?: unknown): void => {
+      console.warn(
+        `[SyncEngine] slides_screenshot_unavailable(reason=${reason}) slides="${doc.title}"`,
+        detail ?? '',
+      );
+    };
+    if (this.config?.sync?.slidesScreenshot?.enabled !== true) return [];
+    const pages = fetched.slideCount ?? 0;
+    if (pages < 1) return [];
+    if (pages > SyncEngine.SLIDES_SCREENSHOT_MAX_PAGES) {
+      warnSkip('too_many_pages', pages);
+      return [];
+    }
+    if (!(await this.resolveSlidesScreenshotScopeGranted())) {
+      warnSkip('scope_missing');
+      return [];
+    }
+
+    const stem = path.basename(localMdPath, '.md') || doc.objToken;
+    const imagesDir = path.join(stagingDocDir, 'images');
+    fs.mkdirSync(imagesDir, { recursive: true });
+    const results: Array<{ slideNumber: number; image: Image }> = [];
+    try {
+      for (
+        let start = 0;
+        start < pages;
+        start += SyncEngine.SLIDES_SCREENSHOT_BATCH_SIZE
+      ) {
+        const batch = Array.from(
+          { length: Math.min(SyncEngine.SLIDES_SCREENSHOT_BATCH_SIZE, pages - start) },
+          (_, index) => start + index + 1,
+        );
+        const batchDir = path.join(stagingDocDir, `.slides-screenshots-${start}`);
+        const outputs = await this.requireLarkCliClient().screenshotSlides(doc.objToken, {
+          slideNumbers: batch,
+          outputDir: batchDir,
+        });
+        const byNumber = new Map<number, string>(
+          outputs.map((output: { slideNumber: number; path: string }) => [output.slideNumber, output.path]),
+        );
+        for (const slideNumber of batch) {
+          const source = byNumber.get(slideNumber);
+          if (!source || typeof source !== 'string') {
+            throw new Error(`页 ${slideNumber} 无输出文件映射`);
+          }
+          const extension = this.validateScreenshotFile(source, slideNumber);
+          const target = path.join(
+            imagesDir,
+            `${stem}-p${String(slideNumber).padStart(2, '0')}${extension}`,
+          );
+          fs.copyFileSync(source, target);
+          results.push({
+            slideNumber,
+            image: {
+              token: `slides-screenshot-p${slideNumber}`,
+              path: target,
+              kind: 'image',
+            },
+          });
+        }
+        fs.rmSync(batchDir, { recursive: true, force: true });
+      }
+    } catch (error) {
+      // all-or-none：删除本文档全部已暂存截图（含先前批次的成品与临时目录）。
+      for (const entry of results) fs.rmSync(entry.image.path, { force: true });
+      warnSkip('capture_failed', error instanceof Error ? error.message : String(error));
+      return [];
+    }
+    return results;
+  }
+
+  /** 截图 scope 授权态：一次 checkAuthReady（不联网 verify）快照，失败即未授。 */
+  private async resolveSlidesScreenshotScopeGranted(): Promise<boolean> {
+    if (this.slidesScreenshotScopeGranted !== null) return this.slidesScreenshotScopeGranted;
+    const client = this.requireLarkCliClient();
+    if (typeof client.checkAuthReady !== 'function') {
+      this.slidesScreenshotScopeGranted = false;
+      return false;
+    }
+    try {
+      const readiness = await client.checkAuthReady({ verify: false });
+      const granted = new Set<string>(readiness?.currentScopes ?? []);
+      this.slidesScreenshotScopeGranted = optionalScopesForFeature('slidesScreenshots')
+        .every((scope) => granted.has(scope));
+    } catch {
+      this.slidesScreenshotScopeGranted = false;
+    }
+    return this.slidesScreenshotScopeGranted;
+  }
+
+  /** 校验单页截图：存在、非空、≤10MiB、PNG/JPEG 魔数（SP-4 契约）。 */
+  private validateScreenshotFile(file: string, slideNumber: number): '.png' | '.jpg' {
+    const stat = fs.statSync(file);
+    if (stat.size <= 0 || stat.size > SyncEngine.SLIDES_SCREENSHOT_MAX_BYTES) {
+      throw new Error(`页 ${slideNumber} 截图体积越界: ${stat.size} bytes`);
+    }
+    const head = Buffer.alloc(8);
+    const fd = fs.openSync(file, 'r');
+    try {
+      const read = fs.readSync(fd, head, 0, head.length, 0);
+      if (
+        read >= 8
+        && head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e && head[3] === 0x47
+        && head[4] === 0x0d && head[5] === 0x0a && head[6] === 0x1a && head[7] === 0x0a
+      ) {
+        return '.png';
+      }
+      if (read >= 3 && head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) {
+        return '.jpg';
+      }
+      throw new Error(`页 ${slideNumber} 截图非 PNG/JPEG 魔数`);
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
+
+  /**
+   * P1-S5（设计 §3.2）：为每页追加截图行，位于该页既有媒体行之前；
+   * 「## 媒体资源」区不存在时创建之（格式与 appendSlidesMediaReferences
+   * 一致，两分支产出的区段可安全共存）。
+   */
+  private appendSlidesScreenshotReferences(
+    content: string,
+    screenshots: Array<{ slideNumber: number; image: Image }>,
+  ): string {
+    if (screenshots.length === 0) return content;
+    const shotEntries = screenshots.map((shot) => ({
+      slideNumber: shot.slideNumber,
+      line: `- 幻灯片 ${shot.slideNumber} 截图：![幻灯片 ${shot.slideNumber} 截图](images/${path.basename(shot.image.path)})`,
+    }));
+    const header = '## 媒体资源';
+    const headerIndex = content.lastIndexOf(header);
+    if (headerIndex < 0) {
+      return `${content.trimEnd()}\n\n${header}\n\n${shotEntries.map((entry) => entry.line).join('\n')}\n`;
+    }
+    const before = content.slice(0, headerIndex + header.length);
+    const body = content.slice(headerIndex + header.length).replace(/^\n\n/, '');
+    const mediaEntries = body
+      .split('\n')
+      .filter((line) => line.trim().length > 0)
+      .map((line) => {
+        const match = /^- 幻灯片 (\d+) /.exec(line);
+        return { slideNumber: match ? Number(match[1]) : Number.MAX_SAFE_INTEGER, line };
+      });
+    const merged: Array<{ slideNumber: number; line: string }> = [];
+    let mediaIndex = 0;
+    let shotIndex = 0;
+    while (mediaIndex < mediaEntries.length || shotIndex < shotEntries.length) {
+      const media = mediaEntries[mediaIndex];
+      const shot = shotEntries[shotIndex];
+      // 同页时截图行在前（设计：位于该页既有媒体行之前）。
+      if (shot && (!media || shot.slideNumber <= media.slideNumber)) {
+        merged.push(shot);
+        shotIndex += 1;
+      } else {
+        merged.push(media);
+        mediaIndex += 1;
+      }
+    }
+    return `${before}\n\n${merged.map((entry) => entry.line).join('\n')}\n`;
   }
 
   /**

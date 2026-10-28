@@ -7,13 +7,19 @@
  *   （预认领，防跨单元写冲突）。大分量不拆（正确性优先：同一已有文档
  *   只被一个单元改写）。
  * - full：按 relPath 一级目录聚类（`_custom/<文件夹>` 视为一级），目录内
- *   按 relPath 排序，每 batchSize×3 个源切一单元；ownedDocs 为空
- *   （full 从空 staging 重建，无既有文档需要认领）。
+ *   按 relPath 排序后装箱切单元；ownedDocs 为空（full 从空 staging 重建，
+ *   无既有文档需要认领）。
  * - 仅有删除的增量保底一个空单元（对应现状保底空批：删除影响必须明确
  *   告知模型，不能只存在于默认删除逻辑里）。
  *
- * 单元 id 稳定（u1、u2…按首源 relPath 排序）；返回顺序按 bytes 降序
- * （LPT：worker 拉取式调度从最大单元开始）。
+ * P2-S2（U42/U44）：批与单元改为「有效字数预算装箱」——packBatches 为
+ * 单 worker 与并行路径共用的纯函数（wordBudget=0 时等价旧按源数 chunk）；
+ * full 模式单元切分用 预算×3 / 个数×3，incremental 连通分量不变；单元
+ * 排序键改为 words 降序 → bytes 降序 → 原序（大单元先启动的目的不变）。
+ * 不变量：任何预算下 ∪ unit.sources = 工作集且互不相交、∪ batches =
+ * unit.sources、受影响文档集合不变（划分只改调度，不改构建语义）。
+ *
+ * 单元 id 稳定（u1、u2…按首源 relPath 排序）。
  */
 
 export interface BuildUnitDocRef {
@@ -32,13 +38,15 @@ export interface BuildUnit {
   /** 分量涉及的受影响文档（含默认删除的），供单元提示词使用 */
   affectedDocs: BuildUnitDocRef[];
   bytes: number;
+  /** P2-S2：单元内源的有效字数合计（调度排序键；不进 manifest/哈希） */
+  words: number;
   batches: string[][];
 }
 
 export interface PlanUnitsInput {
   mode: 'full' | 'incremental';
-  /** objToken → 元数据（relPath/bytes 来自快照） */
-  workset: Map<string, { relPath: string; bytes: number }>;
+  /** objToken → 元数据（relPath/bytes 来自快照；words 为 P2-S2 有效字数，缺省 0） */
+  workset: Map<string, { relPath: string; bytes: number; words?: number }>;
   /** incremental：CURRENT manifest.docs（path + sources） */
   baseDocs: Array<{ path: string; sources: string[] }>;
   /** 基线文档标题（path → title；无则用 path） */
@@ -49,6 +57,9 @@ export interface PlanUnitsInput {
   removedSources: string[];
   /** standardKb.buildBatchSize（单元内每批源数） */
   batchSize: number;
+  /** P2-S2：每批有效字数预算（standardKb.buildBatchWordBudget）。
+   * 0/缺省 = 旧行为（按源数切分）；full 模式单元上限 = 该值 ×3。 */
+  wordBudget?: number;
 }
 
 /** relPath 一级目录键；`_custom/<文件夹>` 视为一级（自定义归档整夹一组）。 */
@@ -63,6 +74,40 @@ function chunk<T>(items: T[], size: number): T[][] {
   const result: T[][] = [];
   for (let i = 0; i < items.length; i += size) result.push(items.slice(i, i + size));
   return result;
+}
+
+/**
+ * P2-S2（§2.3）批装箱纯函数——单 worker 路径与 planUnits（并行）共用。
+ *
+ * - wordBudget <= 0 → 等价 chunk(orderedTokens, maxCount)（旧行为，兼容
+ *   回退开关 buildBatchWordBudget=0）。
+ * - 否则顺序贪心：当前批非空且（累计字数 + w > wordBudget 或 批长 ===
+ *   maxCount）→ 封批；单源 w > wordBudget 自然独占一批（不拆源，raw_read
+ *   既有分页承接超长源）。
+ * - 保持输入顺序、只改边界（不重排）：构建日志与批次可复现。
+ */
+export function packBatches(
+  orderedTokens: string[],
+  words: (token: string) => number,
+  opts: { wordBudget: number; maxCount: number },
+): string[][] {
+  const maxCount = Math.max(1, Math.floor(opts.maxCount));
+  if (!(opts.wordBudget > 0)) return chunk(orderedTokens, maxCount);
+  const batches: string[][] = [];
+  let current: string[] = [];
+  let cumulative = 0;
+  for (const token of orderedTokens) {
+    const w = Math.max(0, Math.floor(words(token)));
+    if (current.length > 0 && (cumulative + w > opts.wordBudget || current.length >= maxCount)) {
+      batches.push(current);
+      current = [];
+      cumulative = 0;
+    }
+    current.push(token);
+    cumulative += w;
+  }
+  if (current.length > 0) batches.push(current);
+  return batches;
 }
 
 /** 极简并查集（string 键）。 */
@@ -85,6 +130,8 @@ class UnionFind {
 
 export function planUnits(input: PlanUnitsInput): BuildUnit[] {
   const batchSize = Math.max(1, input.batchSize);
+  const wordBudget = Math.max(0, Math.floor(input.wordBudget ?? 0));
+  const wordsOf = (token: string): number => input.workset.get(token)?.words ?? 0;
 
   if (input.mode === 'full') {
     const clusters = new Map<string, string[]>();
@@ -96,18 +143,19 @@ export function planUnits(input: PlanUnitsInput): BuildUnit[] {
     }
     const units: BuildUnit[] = [];
     for (const [key, tokens] of [...clusters.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
-      // 目录内按 relPath 排序后每 batchSize×3 个源切一单元
+      // 目录内按 relPath 排序后装箱切单元：字数预算 ×3 + 个数上限 batchSize×3
+      // （U44；wordBudget=0 时等价旧 chunk(sorted, batchSize*3)）
       const sorted = tokens
         .map((token) => ({ token, relPath: input.workset.get(token)!.relPath }))
         .sort((a, b) => a.relPath.localeCompare(b.relPath))
         .map((item) => item.token);
       const perUnit = Math.max(1, batchSize * 3);
-      for (const sources of chunk(sorted, perUnit)) {
-        units.push(makeUnit(units.length, sources, input, [], []));
+      for (const sources of packBatches(sorted, wordsOf, { wordBudget: wordBudget * 3, maxCount: perUnit })) {
+        units.push(makeUnit(units.length, sources, input, wordBudget, wordsOf, [], []));
       }
       void key;
     }
-    return sortByBytesDesc(units);
+    return sortUnitsByLoadDesc(units);
   }
 
   // ---- incremental：文档↔源 二部图连通分量 ----
@@ -159,26 +207,33 @@ export function planUnits(input: PlanUnitsInput): BuildUnit[] {
       ...(affectedByComponent.get(root) ?? []),
       ...(deletedDocsByComponent.get(root) ?? []),
     ];
-    units.push(makeUnit(units.length, sources.sort(), input, owned, affectedDocs));
+    units.push(makeUnit(units.length, sources.sort(), input, wordBudget, wordsOf, owned, affectedDocs));
   }
 
   // 仅有删除（或删除影响全部走默认删除）→ 保底一个空单元
   if (units.length === 0 && (affected.length > 0 || input.requiredRewrites.length > 0)) {
-    units.push(makeUnit(0, [], input, [...input.requiredRewrites], affected));
+    units.push(makeUnit(0, [], input, wordBudget, wordsOf, [...input.requiredRewrites], affected));
   }
 
-  return sortByBytesDesc(units);
+  return sortUnitsByLoadDesc(units);
 }
 
 function makeUnit(
   index: number,
   sources: string[],
   input: PlanUnitsInput,
+  wordBudget: number,
+  wordsOf: (token: string) => number,
   ownedDocs: string[],
   affectedDocs: BuildUnitDocRef[],
 ): BuildUnit {
   let bytes = 0;
-  for (const token of sources) bytes += input.workset.get(token)?.bytes ?? 0;
+  let words = 0;
+  for (const token of sources) {
+    const meta = input.workset.get(token);
+    bytes += meta?.bytes ?? 0;
+    words += meta?.words ?? 0;
+  }
   const sortedSources = [...sources].sort();
   return {
     id: `u${index + 1}`,
@@ -186,14 +241,19 @@ function makeUnit(
     ownedDocs: [...ownedDocs].sort(),
     affectedDocs: affectedDocs.sort((a, b) => a.path.localeCompare(b.path)),
     bytes,
-    // 空单元保底一个空批（对应现状保底空批：删除影响必须进 prompt）
-    batches: sortedSources.length === 0 ? [[]] : chunk(sortedSources, Math.max(1, input.batchSize)),
+    words,
+    // 空单元保底一个空批（对应现状保底空批：删除影响必须进 prompt）。
+    // P2-S2：批次装箱与单 worker 路径同一 packBatches（wordBudget=0 等价旧 chunk）
+    batches: sortedSources.length === 0
+      ? [[]]
+      : packBatches(sortedSources, wordsOf, { wordBudget, maxCount: Math.max(1, input.batchSize) }),
   };
 }
 
-function sortByBytesDesc(units: BuildUnit[]): BuildUnit[] {
+/** 返回序（LPT 拉取）：words 降序 → bytes 降序 → 原序（U44 排序键）。 */
+function sortUnitsByLoadDesc(units: BuildUnit[]): BuildUnit[] {
   return units
     .map((unit, index) => ({ unit, index }))
-    .sort((a, b) => (b.unit.bytes - a.unit.bytes) || (a.index - b.index))
+    .sort((a, b) => (b.unit.words - a.unit.words) || (b.unit.bytes - a.unit.bytes) || (a.index - b.index))
     .map((item) => item.unit);
 }

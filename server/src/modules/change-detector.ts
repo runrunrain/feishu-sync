@@ -486,6 +486,7 @@ export class ChangeDetector {
       let cloudTitle: string;
       let cloudSpaceId: string | null;
       let cloudObjType: ChangedDocument['objType'];
+      let cloudRawObjType: string | undefined;
 
       try {
         const nodeInfo = await this.larkCliClient.getNode(reference);
@@ -493,6 +494,7 @@ export class ChangeDetector {
         cloudTitle = nodeInfo.title || doc.title;
         cloudSpaceId = nodeInfo.space_id ?? doc.spaceId ?? null;
         cloudObjType = this.normalizeObjType(nodeInfo.obj_type);
+        cloudRawObjType = this.cloudObjTypeOf(nodeInfo.obj_type);
       } catch (error) {
         // getNode failed: do NOT infer deletion (131005 may be transient
         // permission). Count as error and skip this doc.
@@ -512,6 +514,7 @@ export class ChangeDetector {
         objToken: doc.objToken,
         wikiNodeToken: doc.wikiNodeToken ?? '',
         objType: cloudObjType,
+        cloudObjType: cloudRawObjType,
         title: cloudTitle,
         spaceId: cloudSpaceId,
         parentNodeToken: doc.parentNodeToken ?? null,
@@ -595,6 +598,7 @@ export class ChangeDetector {
       wikiNodeToken: rootInfo.node_token,
       objToken: rootInfo.obj_token,
       objType: this.normalizeObjType(rootInfo.obj_type),
+      cloudObjType: this.cloudObjTypeOf(rootInfo.obj_type),
       title: rootInfo.title,
       spaceId: rootInfo.space_id ?? null,
       observedObjEditTime: rootInfo.obj_edit_time ?? null,
@@ -721,6 +725,7 @@ export class ChangeDetector {
             wikiNodeToken: record.wikiNodeToken ?? '',
             objToken: record.objToken,
             objType: this.normalizeObjType(meta.docType as LarkCliNodeInfo['obj_type']),
+            cloudObjType: this.cloudObjTypeOf(meta.docType as LarkCliNodeInfo['obj_type']),
             title: meta.title || record.title,
             spaceId: record.spaceId ?? null,
             parentNodeToken: record.parentNodeToken ?? null,
@@ -795,6 +800,7 @@ export class ChangeDetector {
         wikiNodeToken: record.wikiNodeToken ?? detail.node.node_token,
         objToken: record.objToken,
         objType: this.normalizeObjType(detail.node.obj_type),
+        cloudObjType: this.cloudObjTypeOf(detail.node.obj_type),
         title: detail.node.title || record.title,
         spaceId: detail.node.space_id ?? record.spaceId ?? null,
         parentNodeToken: detail.node.parent_node_token ?? record.parentNodeToken ?? null,
@@ -958,6 +964,7 @@ export class ChangeDetector {
           ...knownObservation(record),
           wikiNodeToken: node.node_token,
           objType: this.normalizeObjType(node.obj_type),
+          cloudObjType: this.cloudObjTypeOf(node.obj_type),
           title: node.title,
           spaceId: node.space_id ?? spaceId,
           parentNodeToken: node.parent_node_token ?? null,
@@ -972,6 +979,7 @@ export class ChangeDetector {
         wikiNodeToken: node.node_token,
         objToken: node.obj_token,
         objType: this.normalizeObjType(info?.obj_type ?? node.obj_type),
+        cloudObjType: this.cloudObjTypeOf(info?.obj_type ?? node.obj_type),
         title: info?.title || node.title,
         spaceId: info?.space_id ?? node.space_id ?? spaceId,
         parentNodeToken: info?.parent_node_token ?? node.parent_node_token ?? null,
@@ -1090,6 +1098,7 @@ export class ChangeDetector {
         wikiNodeToken: raw.node_token,
         objToken: raw.obj_token,
         objType: this.normalizeObjType(raw.obj_type),
+        cloudObjType: this.cloudObjTypeOf(raw.obj_type),
         title: raw.title,
         spaceId: raw.space_id ?? spaceId,
         observedObjEditTime: objEditTime,
@@ -1274,6 +1283,7 @@ export class ChangeDetector {
         objToken: node.obj_token,
         wikiNodeToken: node.node_token,
         objType: this.normalizeObjType(node.obj_type),
+        cloudObjType: this.cloudObjTypeOf(node.obj_type),
         title: node.title,
         spaceId: node.space_id ?? null,
         parentNodeToken: node.parent_node_token ?? null,
@@ -1388,6 +1398,9 @@ export class ChangeDetector {
     return {
       objToken: observation.objToken,
       objType: observation.objType,
+      // P2-S8：未知类型的原始云端类型透传（undefined 不进 JSON，已支持
+      // 类型与真实类型不可得的变更项输出零变化）。
+      cloudObjType: observation.cloudObjType,
       title: observation.title,
       changeType,
       cloudModifiedTime: this.formatUnixSeconds(observation.observedObjEditTime),
@@ -1558,6 +1571,7 @@ export class ChangeDetector {
         wikiNodeToken: nodeToken,
         objToken: detail.node.obj_token,
         objType: this.normalizeObjType(detail.node.obj_type),
+        cloudObjType: this.cloudObjTypeOf(detail.node.obj_type),
         title: detail.node.title,
         spaceId: detail.node.space_id || fallbackSpaceId || null,
         observedObjEditTime: detail.node.obj_edit_time ?? null,
@@ -1680,6 +1694,22 @@ export class ChangeDetector {
       return raw;
     }
     return 'unknown';
+  }
+
+  /**
+   * P2-S8（设计 §4.3/U50）：折叠为 'unknown' 前的真实云端 obj_type 伴随值。
+   * 已支持类型（docx/sheet/slides/bitable）不携带；'unknown' 是折叠产物而非
+   * 真实类型，也不携带；仅 mindnote/file 及枚举外的真实类型返回原值，供
+   * unsupported_type blocker 详情与 UI 文案使用。不改变任何分类行为。
+   */
+  private cloudObjTypeOf(raw: LarkCliNodeInfo['obj_type']): string | undefined {
+    if (
+      raw === 'docx' || raw === 'sheet' || raw === 'slides' || raw === 'bitable'
+      || raw === 'unknown'
+    ) {
+      return undefined;
+    }
+    return raw;
   }
 
   /**

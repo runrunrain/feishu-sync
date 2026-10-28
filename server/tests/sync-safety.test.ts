@@ -160,6 +160,54 @@ describe('P0 sync write safety', () => {
     expect(fs.existsSync(knowledgeBaseRoot)).toBe(false);
   });
 
+  it('surfaces cloudObjType on unsupported_type blocker details without touching supported types (P2-S8)', async () => {
+    const temporaryRoot = makeTempDirectory('feishu-sync-cloud-obj-type-');
+    const knowledgeBaseRoot = path.join(temporaryRoot, 'knowledge-base');
+    const operationDirectory = path.join(temporaryRoot, 'operations');
+    const { engine } = makeEngine(knowledgeBaseRoot, operationDirectory);
+
+    const result = await engine.syncDocuments([
+      makeDocument({
+        objToken: 'mindnote-token',
+        objType: 'unknown',
+        cloudObjType: 'mindnote',
+        title: '思维笔记',
+      }),
+      makeDocument({
+        objToken: 'doc-token-2',
+        objType: 'docx',
+        title: '普通文档',
+      }),
+    ], {
+      enableLLM: false,
+      fullSync: false,
+    });
+
+    // 未知类型 blocker：详情与文案透出真实云端类型
+    const mindnotePlan = result.plannedDocuments!.find((d) => d.objToken === 'mindnote-token')!;
+    expect(mindnotePlan).toMatchObject({
+      action: 'blocked',
+      reasonCode: 'unsupported_type',
+      cloudObjType: 'mindnote',
+    });
+    expect(mindnotePlan.reason).toContain('mindnote');
+    const mindnoteFailure = result.failedDocuments.find((d) => d.objToken === 'mindnote-token')!;
+    expect(mindnoteFailure.cloudObjType).toBe('mindnote');
+    expect(mindnoteFailure.reasonCode).toBe('unsupported_type');
+    expect(mindnoteFailure.suggestedResolution).toContain('思维笔记暂不支持同步');
+
+    // 已支持类型：字节级不变——计划/失败输出均不出现 cloudObjType
+    const docxPlan = result.plannedDocuments!.find((d) => d.objToken === 'doc-token-2')!;
+    expect(docxPlan.action).toBe('create');
+    expect('cloudObjType' in docxPlan).toBe(false);
+    expect(JSON.stringify(docxPlan)).not.toContain('cloudObjType');
+    const docxFailure = result.failedDocuments.find((d) => d.objToken === 'doc-token-2');
+    expect(docxFailure).toBeUndefined();
+    // API 序列化面：仅未知类型路径携带该字段
+    const failedJson = JSON.stringify(result.failedDocuments);
+    expect(failedJson).toContain('"cloudObjType":"mindnote"');
+  });
+
   it('blocks every document that collides with another planned target', async () => {
     const temporaryRoot = makeTempDirectory('feishu-sync-path-conflict-');
     const knowledgeBaseRoot = path.join(temporaryRoot, 'knowledge-base');

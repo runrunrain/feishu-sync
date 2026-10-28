@@ -228,6 +228,96 @@ syncRoutes.post('/api/sync', async (c) => {
 });
 
 /**
+ * POST /api/sync/whiteboard-backfill — P0-S8 存量补齐（设计 §5.8）
+ *
+ * 人工触发（CLI `sync whiteboard-backfill` / 内部 Agent app_command 同一
+ * 命令表转发）：对 synced 文档补导白板旁路文件（svg 主 + raw 降级）。
+ *
+ * 硬约束（与 SyncEngine.backfillWhiteboardBypass 同一不变量）：只新增
+ * .wb.svg/.wb.raw.json；md 字节与 DB 基线字段前后不变；脏文档跳过。
+ *
+ * 门控：confirm='BACKFILL'（写本地旁路文件的风险级确认，设计 §5.8）；
+ * 知识库根未配置 → 400；whiteboardExport 显式关闭 → 400（无需补齐）；
+ * 标准库构建活跃 → 409（§5.8 守卫，与源编辑/写回链同款探针）。
+ */
+syncRoutes.post('/api/sync/whiteboard-backfill', async (c) => {
+  let payload: Record<string, unknown>;
+  try {
+    payload = await c.req.json<Record<string, unknown>>();
+  } catch {
+    return c.json({ error: 'invalid_json', message: '补齐请求必须是 JSON 对象' }, 400);
+  }
+  if (payload.confirm !== 'BACKFILL') {
+    return c.json({
+      error: 'confirmation_required',
+      message: '白板旁路补齐需要 confirm="BACKFILL"',
+    }, 422);
+  }
+
+  let docTokens: string[] | undefined;
+  if (payload.docTokens !== undefined) {
+    const raw = payload.docTokens;
+    if (
+      !Array.isArray(raw)
+      || raw.length === 0
+      || raw.length > 200
+      || !raw.every((token: unknown) => typeof token === 'string' && token.length > 0)
+    ) {
+      return c.json({
+        error: 'invalid_doc_tokens',
+        message: 'docTokens 必须是 1–200 个非空字符串',
+      }, 400);
+    }
+    docTokens = [...new Set(raw as string[])];
+  }
+
+  const larkCliClient = (c as any).larkCliClient;
+  const localMapStore = (c as any).localMapStore;
+  const configManager = (c as any).configManager;
+  if (!larkCliClient || !localMapStore || !configManager) {
+    return c.json({ error: 'dependencies_not_injected', message: '依赖未注入' }, 500);
+  }
+
+  const config = await configManager.load();
+  if (!config.knowledgeBaseRoot || !config.knowledgeBaseRoot.trim()) {
+    return c.json({
+      error: 'knowledge_base_root_not_configured',
+      message: '知识库根目录未设置：请先在「设置 → 知识库」中配置本地根目录',
+    }, 400);
+  }
+  if (config.sync?.whiteboardExport?.enabled === false) {
+    return c.json({
+      error: 'whiteboard_export_disabled',
+      message: 'sync.whiteboardExport.enabled=false，旁路导出已关闭，无需补齐',
+    }, 400);
+  }
+  // §5.8 守卫：构建活跃 → 整个命令 409（旧测试替身无此方法则不拦）。
+  if (
+    typeof localMapStore.getActiveKbBuild === 'function'
+    && localMapStore.getActiveKbBuild() != null
+  ) {
+    return c.json({
+      error: 'kb_build_active',
+      message: '标准库构建进行中，暂不能补齐白板旁路文件（构建结束或取消后再试）',
+    }, 409);
+  }
+
+  const syncEngine = new SyncEngine({ larkCliClient, localMapStore, config });
+  try {
+    const result = await syncEngine.backfillWhiteboardBypass(
+      docTokens ? { docTokens } : {},
+    );
+    return c.json(result);
+  } catch (error) {
+    console.error('[sync] whiteboard backfill failed:', error);
+    return c.json({
+      error: 'whiteboard_backfill_failed',
+      message: error instanceof Error ? error.message : String(error),
+    }, 500);
+  }
+});
+
+/**
  * POST /api/sync/index - Trigger initial full index scan
  *
  * Request body: { rootDir?: string }  // Optional, defaults to config.knowledgeBaseRoot

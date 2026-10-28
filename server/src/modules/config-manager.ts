@@ -48,12 +48,14 @@ import {
 import type {
   CliConfig,
   Config,
+  FeishuPublishConfig,
   FeishuWriteConfig,
   LayoutProfile,
   LegacyLLMConfig,
   LlmConfig,
   LlmModelPreset,
   LlmProviderConfig,
+  SyncConfig,
   WatchedRootConfig,
 } from '../types/index.js';
 import { getEnabledWatchedRootUrls, isLegacyLlmConfig } from '../types/index.js';
@@ -375,6 +377,12 @@ function normalizeStandardKbConfigLoose(value: unknown, dataRoot: string): Stand
     buildBatchSize: typeof raw.buildBatchSize === 'number'
       ? Math.max(1, Math.min(50, Math.floor(raw.buildBatchSize)))
       : base.buildBatchSize,
+    // P2-S2（§2.5）：每批有效字数预算 0 或 4000..400000；越界钳制到边界，
+    // 非数字回落缺省 40000（0 = 旧行为按源数分批，兼容回退开关）
+    buildBatchWordBudget: normalizeBuildBatchWordBudget(
+      raw.buildBatchWordBudget,
+      base.buildBatchWordBudget,
+    ),
     // S4（设计 §4.6）：并行构建 worker 数 1..6；旧配置缺省回落默认值
     buildParallelism: typeof raw.buildParallelism === 'number'
       ? Math.max(1, Math.min(6, Math.floor(raw.buildParallelism)))
@@ -387,6 +395,17 @@ function normalizeStandardKbConfigLoose(value: unknown, dataRoot: string): Stand
       : base.buildTimeoutMinutes,
     autoBuildAfterSync: raw.autoBuildAfterSync === true ? true : false,
   };
+}
+
+/**
+ * P2-S2（§2.5）：buildBatchWordBudget 宽容归一——取整后钳制到
+ * {0} ∪ [4000, 400000]；非数字/非有限数回落缺省（40000）。
+ */
+function normalizeBuildBatchWordBudget(value: unknown, fallback: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback;
+  const budget = Math.floor(value);
+  if (budget <= 0) return 0;
+  return Math.min(400_000, Math.max(4_000, budget));
 }
 
 /** 严格校验（PUT /api/config 路径）：非法直接报 InvalidConfigError。 */
@@ -690,6 +709,15 @@ const DEFAULT_CONFIG: Config = {
   cli: { enabled: false },
   // S12（additive）：飞书写回默认关闭；旧配置无此段时内存补默认。
   feishuWrite: { enabled: false },
+  // P1-S8（additive）：反向发布默认关闭；旧配置无此段时内存补默认。
+  feishuPublish: { enabled: false },
+  // P1-S5（additive）：同步行为段（幻灯片截图采集）默认关闭；旧配置无此段时内存补默认。
+  // P0-S6（additive）：白板旁路导出（svg 主 + raw 降级）缺省开启（设计
+  // §5.3：旁路失败只告警，md 唯一引用仍是 PNG 预览）。
+  sync: {
+    slidesScreenshot: { enabled: false },
+    whiteboardExport: { enabled: true },
+  },
   pollIntervalMinutes: 30,
   knowledgeBaseRoot: '',
   watchedRoots: [],
@@ -895,9 +923,20 @@ export class ConfigManager {
   private configPath: string;
   private config: Config | null = null;
   private loadFailed = false;
+  /**
+   * T4b-03：候选配置发布根↔watchedRoots 联合校验钩子（需云端祖先链
+   * 解析器，由 index.ts 注入；未注入时跳过——嵌入式/单测场景，专用
+   * target 路由自身仍独立校验）。抛错即拒绝保存。
+   */
+  private publishOverlapHook?: (candidate: Config, previous: Config) => Promise<void>;
 
   constructor(configPath?: string) {
     this.configPath = configPath || DEFAULT_CONFIG_PATH;
+  }
+
+  /** T4b-03：注入发布根联合校验钩子（见字段注释）。 */
+  setPublishOverlapHook(hook: (candidate: Config, previous: Config) => Promise<void>): void {
+    this.publishOverlapHook = hook;
   }
 
   /** Startup only: keep existing paths, and retry writable candidates for an unconfigured library. */
@@ -1050,6 +1089,10 @@ export class ConfigManager {
     validateCliConfig(partial.cli);
     // S12：feishuWrite 段严格校验（同 S8 cli 模式；缺失不报错）。
     validateFeishuWriteConfig(partial.feishuWrite);
+    // P1-S8：feishuPublish 段严格校验（同 S12 feishuWrite 模式；缺失不报错）。
+    validateFeishuPublishConfig(partial.feishuPublish);
+    // P1-S5：sync 段严格校验（同 S8 cli 模式；缺失不报错）。
+    validateSyncConfig(partial.sync);
     const currentConfig = await this.load();
     const hasStructuredRoots = Object.prototype.hasOwnProperty.call(partial, 'watchedRoots');
     const hasLegacyUrls = Object.prototype.hasOwnProperty.call(partial, 'watchedRootUrls');
@@ -1106,6 +1149,27 @@ export class ConfigManager {
       feishuWrite: partial.feishuWrite !== undefined
         ? normalizeFeishuWriteConfigLoose({ ...(currentConfig.feishuWrite ?? { enabled: false }), ...partial.feishuWrite })
         : (currentConfig.feishuWrite ?? { enabled: false }),
+      // P1-S8（additive）：feishuPublish 段同 S12 feishuWrite 模式。
+      feishuPublish: partial.feishuPublish !== undefined
+        ? normalizeFeishuPublishConfigLoose({ ...(currentConfig.feishuPublish ?? { enabled: false }), ...partial.feishuPublish })
+        : (currentConfig.feishuPublish ?? { enabled: false }),
+      // P1-S5（additive）：sync 段同 S8 cli 模式（显式提供时采用，否则
+      // 保留当前值；旧配置内存态默认 {slidesScreenshot:{enabled:false}}）。
+      sync: partial.sync !== undefined
+        ? normalizeSyncConfigLoose({
+          slidesScreenshot: {
+            ...(currentConfig.sync?.slidesScreenshot ?? { enabled: false }),
+            ...(partial.sync.slidesScreenshot ?? {}),
+          },
+          whiteboardExport: {
+            ...(currentConfig.sync?.whiteboardExport ?? { enabled: true }),
+            ...(partial.sync.whiteboardExport ?? {}),
+          },
+        })
+        : (currentConfig.sync ?? {
+          slidesScreenshot: { enabled: false },
+          whiteboardExport: { enabled: true },
+        }),
     };
     // F3-R02：合并后配置交叉校验——已授权 Workspace 与新 knowledgeBaseRoot /
     // outputRoot / dataRoot / 静态受保护运行资源（源码树/node_modules/Electron/
@@ -1127,6 +1191,14 @@ export class ConfigManager {
     }
     // S2（设计 §3.1）：vision.enabled=true 时引用的 provider/预设必须存在且启用
     validateVisionProviderReference(updatedConfig.agent, updatedConfig.llm);
+    // T4b-03：发布根↔watchedRoots 候选态联合校验收敛点——feishuPublish 段
+    // 或 watchedRoots 变化时做祖先链交叉验证（覆盖通用 PUT /api/config 与
+    // 专用 target 路由两个入口、target 与 watchedRoots 两个方向），祖先链
+    // 不可读 fail-closed 拒绝。钩子未注入时跳过（无云端解析器场景）。
+    if (this.publishOverlapHook
+      && (partial.feishuPublish !== undefined || hasStructuredRoots || hasLegacyUrls)) {
+      await this.publishOverlapHook(updatedConfig, currentConfig);
+    }
     await this.save(updatedConfig);
     return this.config!;
   }
@@ -1335,6 +1407,12 @@ export class ConfigManager {
       // S12（additive）：feishuWrite 段宽容归一——缺失/非法 → 默认关闭；
       // 同样不参与 _migrated 回写判定。
       feishuWrite: normalizeFeishuWriteConfigLoose(raw.feishuWrite),
+      // P1-S8（additive）：feishuPublish 段宽容归一——缺失/非法 → 默认
+      // 关闭；不参与 _migrated 回写判定。
+      feishuPublish: normalizeFeishuPublishConfigLoose(raw.feishuPublish),
+      // P1-S5（additive）：sync 段宽容归一——缺失/非法 → 默认关闭；
+      // 不参与 _migrated 回写判定（首次任意 save 时自然落盘）。
+      sync: normalizeSyncConfigLoose(raw.sync),
       pollIntervalMinutes: typeof raw.pollIntervalMinutes === 'number'
         ? raw.pollIntervalMinutes
         : DEFAULT_CONFIG.pollIntervalMinutes,
@@ -1577,6 +1655,83 @@ export function validateCliConfig(value: unknown): void {
 }
 
 // ============================================================================
+// P1-S5 追加：同步行为配置段归一与严格校验（幻灯片截图默认关闭）
+// ============================================================================
+
+/** 宽容归一：缺失/非法 → 默认关闭（load 路径，不拒绝启动）。 */
+export function normalizeSyncConfigLoose(value: unknown): SyncConfig {
+  if (!value || typeof value !== 'object') {
+    return {
+      slidesScreenshot: { enabled: false },
+      whiteboardExport: { enabled: true },
+    };
+  }
+  const raw = value as Partial<SyncConfig>;
+  const screenshot = raw.slidesScreenshot as { enabled?: unknown } | undefined;
+  // P0-S6：白板旁路导出缺省开启；svgTimeoutMs 仅接受正有限数，非法回落
+  // 缺省预算（由 lark-cli 执行层提供）。
+  const whiteboard = raw.whiteboardExport as
+    | { enabled?: unknown; svgTimeoutMs?: unknown }
+    | undefined;
+  const svgTimeoutMs = whiteboard?.svgTimeoutMs;
+  return {
+    slidesScreenshot: {
+      enabled: typeof screenshot?.enabled === 'boolean' ? screenshot.enabled : false,
+    },
+    whiteboardExport: {
+      enabled: typeof whiteboard?.enabled === 'boolean' ? whiteboard.enabled : true,
+      ...(typeof svgTimeoutMs === 'number' && Number.isFinite(svgTimeoutMs) && svgTimeoutMs > 0
+        ? { svgTimeoutMs }
+        : {}),
+    },
+  };
+}
+
+/**
+ * 严格校验（PUT /api/config 路径）：sync 段存在时必须是
+ * { slidesScreenshot: { enabled: boolean } }，非法直接报 InvalidConfigError。
+ */
+export function validateSyncConfig(value: unknown): void {
+  if (value === undefined) return;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new InvalidConfigError([{ field: 'sync', code: 'invalid_type' }]);
+  }
+  const raw = value as Partial<SyncConfig>;
+  if (
+    raw.slidesScreenshot !== undefined
+    && (!raw.slidesScreenshot || typeof raw.slidesScreenshot !== 'object')
+  ) {
+    throw new InvalidConfigError([{ field: 'sync.slidesScreenshot', code: 'invalid_type' }]);
+  }
+  const enabled = (raw.slidesScreenshot as { enabled?: unknown } | undefined)?.enabled;
+  if (enabled !== undefined && typeof enabled !== 'boolean') {
+    throw new InvalidConfigError([{ field: 'sync.slidesScreenshot.enabled', code: 'invalid_type' }]);
+  }
+  // P0-S6：whiteboardExport 段存在时必须是 { enabled: boolean,
+  // svgTimeoutMs?: 正有限数 }，非法直接报 InvalidConfigError。
+  if (
+    raw.whiteboardExport !== undefined
+    && (!raw.whiteboardExport || typeof raw.whiteboardExport !== 'object')
+  ) {
+    throw new InvalidConfigError([{ field: 'sync.whiteboardExport', code: 'invalid_type' }]);
+  }
+  const whiteboard = raw.whiteboardExport as
+    | { enabled?: unknown; svgTimeoutMs?: unknown }
+    | undefined;
+  if (whiteboard?.enabled !== undefined && typeof whiteboard.enabled !== 'boolean') {
+    throw new InvalidConfigError([{ field: 'sync.whiteboardExport.enabled', code: 'invalid_type' }]);
+  }
+  if (
+    whiteboard?.svgTimeoutMs !== undefined
+    && !(typeof whiteboard.svgTimeoutMs === 'number'
+      && Number.isFinite(whiteboard.svgTimeoutMs)
+      && whiteboard.svgTimeoutMs > 0)
+  ) {
+    throw new InvalidConfigError([{ field: 'sync.whiteboardExport.svgTimeoutMs', code: 'invalid_type' }]);
+  }
+}
+
+// ============================================================================
 // S12 追加：飞书写回配置段归一与严格校验（默认关闭）
 // ============================================================================
 
@@ -1601,5 +1756,67 @@ export function validateFeishuWriteConfig(value: unknown): void {
   const raw = value as Partial<FeishuWriteConfig>;
   if (raw.enabled !== undefined && typeof raw.enabled !== 'boolean') {
     throw new InvalidConfigError([{ field: 'feishuWrite.enabled', code: 'invalid_type' }]);
+  }
+}
+
+// ============================================================================
+// P1-S8 追加：反向发布配置段归一与严格校验（默认关闭；发布根双向校验
+// 在专用路由 PUT /api/kb/publish/target 做——需云端祖先链，超出纯配置
+// 校验能力面）
+// ============================================================================
+
+const PUBLISH_TARGET_TOKEN_RE = /^[A-Za-z0-9]{8,64}$/;
+
+/** 宽容归一：缺失/非法 → 默认关闭；target 仅保留结构合法的形态。 */
+export function normalizeFeishuPublishConfigLoose(value: unknown): FeishuPublishConfig {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return { enabled: false };
+  const raw = value as Partial<FeishuPublishConfig>;
+  const result: FeishuPublishConfig = { enabled: raw.enabled === true };
+  const target = raw.target as Partial<FeishuPublishConfig['target']> | null | undefined;
+  if (target && typeof target === 'object' && !Array.isArray(target)) {
+    if ((target.kind === 'drive_folder' || target.kind === 'wiki_node')
+      && typeof target.token === 'string' && PUBLISH_TARGET_TOKEN_RE.test(target.token)
+      && typeof target.label === 'string' && target.label.length > 0) {
+      result.target = {
+        kind: target.kind,
+        token: target.token,
+        ...(typeof target.spaceId === 'string' && target.spaceId.length > 0 ? { spaceId: target.spaceId } : {}),
+        label: target.label,
+      };
+    }
+  }
+  return result;
+}
+
+/**
+ * 严格校验（PUT /api/config 与专用路由路径）：feishuPublish 段存在时
+ * 结构非法直接报 InvalidConfigError；target 允许 null（清除发布根）。
+ */
+export function validateFeishuPublishConfig(value: unknown): void {
+  if (value === undefined) return;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new InvalidConfigError([{ field: 'feishuPublish', code: 'invalid_type' }]);
+  }
+  const raw = value as Partial<FeishuPublishConfig>;
+  if (raw.enabled !== undefined && typeof raw.enabled !== 'boolean') {
+    throw new InvalidConfigError([{ field: 'feishuPublish.enabled', code: 'invalid_type' }]);
+  }
+  if (raw.target === undefined || raw.target === null) return;
+  const target = raw.target as Partial<NonNullable<FeishuPublishConfig['target']>>;
+  if (!target || typeof target !== 'object' || Array.isArray(target)) {
+    throw new InvalidConfigError([{ field: 'feishuPublish.target', code: 'invalid_type' }]);
+  }
+  if (target.kind !== 'drive_folder' && target.kind !== 'wiki_node') {
+    throw new InvalidConfigError([{ field: 'feishuPublish.target.kind', code: 'invalid_type' }]);
+  }
+  if (typeof target.token !== 'string' || !PUBLISH_TARGET_TOKEN_RE.test(target.token)) {
+    throw new InvalidConfigError([{ field: 'feishuPublish.target.token', code: 'invalid_type' }]);
+  }
+  if (typeof target.label !== 'string' || target.label.trim().length === 0 || target.label.length > 200) {
+    throw new InvalidConfigError([{ field: 'feishuPublish.target.label', code: 'invalid_type' }]);
+  }
+  if (target.spaceId !== undefined
+    && (typeof target.spaceId !== 'string' || !PUBLISH_TARGET_TOKEN_RE.test(target.spaceId))) {
+    throw new InvalidConfigError([{ field: 'feishuPublish.target.spaceId', code: 'invalid_type' }]);
   }
 }
