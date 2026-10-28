@@ -6,7 +6,7 @@ import { StandardKbStore } from '../kb/standard-kb-store.js';
 import { createPendingRootResolver } from './source-node-delete.js';
 import type { LocalMapStore } from './local-map-store.js';
 import type { Config, DocumentRecord } from '../types/index.js';
-import type { SourceBatchRequest, SourceBatchPreview, SourceBatchResult } from '../types/source-batch.js';
+import type { SourceBatchPreview, SourceBatchReferenceLoss, SourceBatchRequest, SourceBatchResult } from '../types/source-batch.js';
 
 export function parseSourceBatchRequest(body: unknown): SourceBatchRequest {
   const value = body as Partial<SourceBatchRequest> | null;
@@ -56,10 +56,53 @@ export function planSourceBatch(store: LocalMapStore, config: Config, request: S
     files: fileStates.map(({ path, size }) => ({ path, size })),
     affectedStandardDocs: request.action === 'delete' ? manifest?.docs.filter((doc) => doc.sources.some((token) => selected.has(token))).map(({ docId, title }) => ({ docId, title })) ?? [] : [],
   };
+  // P1-S4（§2.4）：删除确认风险——被选集外文档引用的待删文档列出悬空风险；
+  // 屏蔽不移除本地文档（引用仍可解析），不计算。
+  if (request.action === 'delete') preview.referenceLossRisk = referenceLossRisk(store, docs, selected);
   preview.revision = crypto.createHash('sha256').update(JSON.stringify({ request, preview, fileStates, blocked: [...blocked].sort(), roots: config.watchedRoots,
     topology: all.map((doc) => [doc.objToken,doc.wikiNodeToken,doc.parentNodeToken,doc.cloudDeleted,
       doc.syncState === 'missing_candidate' || doc.syncState === 'deleted_confirmed',doc.customFolderId,doc.watchedRootId,doc.watchedRootUrl,doc.title,doc.localRelPath,doc.localMdPath]).sort((a,b) => String(a[0]).localeCompare(String(b[0]))), release: manifest?.releaseId ?? null })).digest('hex');
   return { preview, docs, actions, sources };
+}
+
+/**
+ * P1-S4（设计 §2.4）：删除确认的引用悬空风险。对每篇待删文档按其
+ * obj_token 与 wiki_node_token 双键反查入边（分批 ≤400 键防 SQLite 变量
+ * 上限），剔除引用方也在本次删除集内的边（同生共死，不悬空）；按引用
+ * 方文档去重计数，sources 列表上限 50。返回按 referencedByCount 降序。
+ */
+function referenceLossRisk(store: LocalMapStore, docs: DocumentRecord[], selected: Set<string>): SourceBatchReferenceLoss[] {
+  if (typeof store.listSourceReferencesByTarget !== 'function') return [];
+  const keyToDoc = new Map<string, DocumentRecord>();
+  for (const doc of docs) {
+    keyToDoc.set(doc.objToken, doc);
+    if (doc.wikiNodeToken) keyToDoc.set(doc.wikiNodeToken, doc);
+  }
+  const keys = [...keyToDoc.keys()];
+  const outside = new Map<string, Map<string, { title: string | null; localRelPath: string | null; occurrences: number }>>();
+  for (let i = 0; i < keys.length; i += 400) {
+    for (const edge of store.listSourceReferencesByTarget(keys.slice(i, i + 400))) {
+      const target = keyToDoc.get(edge.targetToken);
+      if (!target || selected.has(edge.srcObjToken)) continue;
+      const perDoc = outside.get(target.objToken) ?? new Map();
+      const prev = perDoc.get(edge.srcObjToken) ?? { title: edge.srcTitle, localRelPath: edge.srcLocalRelPath, occurrences: 0 };
+      prev.occurrences += edge.occurrences;
+      if (prev.title == null) prev.title = edge.srcTitle;
+      perDoc.set(edge.srcObjToken, prev);
+      outside.set(target.objToken, perDoc);
+    }
+  }
+  if (outside.size === 0) return [];
+  return [...outside.entries()]
+    .map(([objToken, perDoc]) => {
+      const doc = docs.find((candidate) => candidate.objToken === objToken)!;
+      const sources = [...perDoc.entries()]
+        .sort((a, b) => b[1].occurrences - a[1].occurrences || (a[0] < b[0] ? -1 : 1))
+        .slice(0, 50)
+        .map(([srcObjToken, info]) => ({ objToken: srcObjToken, title: info.title, localRelPath: info.localRelPath }));
+      return { objToken, title: doc.title, referencedByCount: perDoc.size, sources };
+    })
+    .sort((a, b) => b.referencedByCount - a.referencedByCount || (a.objToken < b.objToken ? -1 : 1));
 }
 export function executeSourceBatch(store: LocalMapStore, config: Config, request: SourceBatchRequest, expectedRevision: string): SourceBatchResult {
   const plan = planSourceBatch(store, config, request);

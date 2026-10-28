@@ -84,9 +84,13 @@ export interface StandardKbConfig {
   outputRoot: string;
   retainReleases: number;
   buildBatchSize: number;
-  /** S4：单元内每批源数（语义升级为「单元内每批」；单元划分见 build-units.ts） */
+  /** S4：单元内每批源数（语义升级为「每批源数上限」；单元划分见 build-units.ts） */
   promptTimeoutMinutes: number;
   buildTimeoutMinutes: number;
+  /** P2-S2（U42/§2.5）：每批有效字数预算。0 = 关闭（按源数分批的旧行为）；
+   * 4000..400000；缺省 40000（ConfigManager 归一保证存在；越界钳制到边界）。
+   * full 模式单元字数上限 = 该值 ×3（U44）。 */
+  buildBatchWordBudget: number;
   /** S4：并行构建 worker 数（1..6，默认 2；实际受 Agent 进程池后台配额约束）。
    * 缺省/旧配置无此字段 → 默认 2（可设为 1 得到等价单 worker 的旧行为回退） */
   buildParallelism: number;
@@ -139,6 +143,7 @@ export function buildDefaultStandardKbConfig(dataRoot: string): StandardKbConfig
     outputRoot: defaultKbOutputRoot(dataRoot),
     retainReleases: 3,
     buildBatchSize: 10,
+    buildBatchWordBudget: 40_000,
     promptTimeoutMinutes: 15,
     buildTimeoutMinutes: 180,
     buildParallelism: 2,
@@ -204,6 +209,11 @@ export interface RawSourceSnapshotEntry {
   mediaHash?: string | null;
   /** S3：图片引用计数 */
   imageCount?: number;
+  /** P0-S7（设计 P0 §5.5）：白板旁路文字合并哈希（按引用顺序逐板
+   * sha256(origin\0抽取文字) 再拼接后整体 sha256）；无旁路文字为 ''。
+   * 旁路文件不进 contentHash/mediaHash——contentHash 公式不变，升级不
+   * 触发全量 changed；旧 manifest 无此字段视为未变（additive 兼容） */
+  whiteboardTextHash?: string;
 }
 
 export interface KbManifestDoc {
@@ -500,7 +510,11 @@ export interface AgentRunContext {
 // 白名单成员由 agent-tool-service 的族注册表派生，此处仅保证 pi --tools 参数面同步。
 // S3：raw_read_image 追加进 discuss/work 基线面（会话侧按需识图）；
 // S4：kb_unit_done 追加进 build 基线面（逐单元上报）。
-export const DISCUSS_TOOLS = ['kb_search', 'kb_read', 'raw_search', 'raw_read', 'raw_read_image', 'app_command'] as const;
+// P1-S4：raw_links（引用关系查询，只读）追加进 discuss/work/build 三面。
+// P2-S4：raw_comments（评论溯源，只读）只追加进 discuss/work 两面，
+// **不进 build**——评论不在文件哈希围栏内，不得进入构建输入（设计
+// §5.1 硬约束；agent-tool-service 族注册 runKinds 同步限制）。
+export const DISCUSS_TOOLS = ['kb_search', 'kb_read', 'raw_search', 'raw_read', 'raw_read_image', 'raw_links', 'raw_comments', 'app_command'] as const;
 export const WORK_TOOLS = [
   ...DISCUSS_TOOLS,
   'ws_ls',
@@ -514,6 +528,7 @@ export const BUILD_TOOLS = [
   'raw_list',
   'raw_read',
   'raw_search',
+  'raw_links',
   'draft_list',
   'draft_read',
   'draft_search',
