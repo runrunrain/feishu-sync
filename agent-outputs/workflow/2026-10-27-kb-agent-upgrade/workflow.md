@@ -124,3 +124,43 @@
 3. diting 遗留观察（原样保留）：raw_read_image 取消 signal、SyncEngine getPendingLocalEditState DB 故障 fail-open、CLI 写授权便捷入口（auth.login 不支持 scopeSet）、Windows ACL/卷别名。
 4. 打包链验证：desktop:dist 产物上 CLI 的 ELECTRON_RUN_AS_NODE 冒烟、Windows 侧全量。
 5. 主上已提交 b687416（主体）；T3e 修复轮 + 终审报告等 29 处未提交，待主上审后提交。
+
+
+## 9. Phase 4：lark-cli 新能力实施（2026-10-28 启动，主上授权编排实施）
+
+设计真相源（三份独立文档，主上指定目录）：
+`/Users/run.mao/workpace/Database/01-AI技术与工具/飞书同步/迭代设计文档/lark-cli-newcaps-P{0,1,2}.md`（U22-U51，各含切片表/待实测项/分支预案）
+取证输入：`agent-outputs/workflow/2026-10-27-kb-agent-upgrade/lark-cli-newcaps-probe.md`（12 项命令面 help/dry-run 事实）
+
+### 批次规划
+
+| 批次 | 切片 | 依赖 |
+|---|---|---|
+| 4a（运行中） | P0-S1 实测 · P1-S1 实测 · P1-S7+P2-S1 纯函数双模块（publish-render+text-stats 合并，P2-S1 设计已注明「P1 已建则跳过」） | — |
+| 4b | P0-S2（CLI 封装）→ 后续 {S3 锚点, S6 SVG 导出}；P1-S5（scope+截图采集） | 4a 实测 |
+| 4c | P0-S4 回滚→S5 UI；P0-S7 SVG 消费→S8 存量；P0-S9 标题；P1-S2→S3→S4 引用链；P1-S8 发布→S9 UI；P1-S6 截图理解 | 4b |
+| 4d | P2-S2→S3 装箱；P2-S4 评论；P2-S5 移出实测（需测试知识库节点，前置待主上）→S6→S7；P2-S8 类型提示 | 4a/前置 |
+| 收口 | diting 高风险合并审核（写回历史/发布/移出三链）+ 总验收 | 全部 |
+
+实测安全模式沿用 S0/T3a：自建 feishu-sync 前缀测试文档、测完清理（主上「开始实施」视为沿用授权）。
+
+
+## 10. Phase 4 收口（2026-10-28，diting 终裁 PASS）
+
+### 实施总账（22/22 切片）
+- P0 九切片全验收（写回历史安全网 S3/S4/S5/S9 + 白板 SVG 链 S6/S7/S8 + S1/S2 前置）；P1 八切片（S1 实测/S2 抽取/S3 入库/S4 消费/S5 scope 截图/S7 渲染/S8 服务/S9 UI）；P2 七切片（S1 并入 P1-S7/S2 装箱/S3 设置/S4 评论/S6 移出服务/S7 移出 UI/S8 类型提示）+ P2-S5 移出实测待主上环境。
+- Leader 直处理：P0-S5 契约缺口补云端正文只读路由（fetchCloudRevision/history-content，5 用例）；P1-S5 测试断言 toMatchObject 直修；P0 设计 §10/§11 裁定补记。
+
+### diting 收口审核（T4b 三轮）
+- 首轮 full：10 Major（VERDICT: FIX，8 反例动态复现+2 静态）→ 修复批 A（发布链 6 项）+ 批 B（历史/移出链 5 项）→ 复审 7/10 PASS → 终修批 C（F06/F07/F08）→ 终裁 **PASS：原 01-10 全关闭**（T4b-final-verdict.md）。
+- 审核沉淀的反例全部固化为正式测试（kb-publication-fixA/fixC、cloud-move §G、cloud-history §H 等）。
+
+### 最终基线
+server 109 文件/1698 用例 + 前端 41 文件/351 用例 + 三段 typecheck + lint 全绿（批 C 后复核）。
+
+### 遗留清单（待主上环境，不阻塞收口）
+1. slides scope 授权（应用内增量授 slides:presentation:screenshot）→ P1-S6 截图理解提示词小改 + SP-2/3/4 真实采集实测
+2. P2-S5 移出实测（测试知识库节点）→ C-1~C-5 待校正点回填
+3. 真机浏览器/Electron 交互链：P0-S5 回滚 UI（写回→回滚→回拉）/P1-S9 真实发布链/P2-S7 真实移出链/评论与引用面板真机走查
+4. 白板真实文档端到端（S6/S7/S8 联调：svg 成功+超时降级 raw 两形态）
+5. 提交建议：本批含 Phase 3 D1/D2 漂移修复 + Phase 4 全部，约 154 处未提交改动待主上审后分批提交
