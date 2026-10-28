@@ -440,12 +440,80 @@ describe('SourceEditService — revert', () => {
       expect(fx.store.getSourceEdit(fx.objToken)).toBeNull();
       // 备份目录保留（设计 §13：回拉成功前保留本地备份）
       expect(fs.existsSync(path.join(fx.dataRoot, 'source-edits', fx.objToken, 'base.md'))).toBe(true);
-      const audit = fs.readFileSync(path.join(fx.dataRoot, 'agent', 'audit', 'source-edits.jsonl'), 'utf-8');
+      const audit = fs.readFileSync(path.join(fx.dataRoot, 'agent/audit/source-edits.jsonl'), 'utf-8');
       expect(audit).toContain('"result":"reverted"');
       // 无行时再次 revert → 404
       const err = await expectError(fx.service.revert(fx.objToken, 'ui'));
       expect(err.code).toBe('source_edit_not_found');
       expect(err.status).toBe(404);
+    } finally {
+      fx.cleanup();
+    }
+  });
+});
+
+// ===========================================================================
+// P0-S9（S4 遗留补挂，lark-cli-newcaps-P0 §4.4）：cloud_revert_running 互斥门
+// —— edit/revert 遇该文档有进行中的云端回滚 → 409；read 不受影响。
+// ===========================================================================
+describe('SourceEditService — cloud_revert_running 互斥门（P0-S9）', () => {
+  function seedRunningRevert(fx: { store: LocalMapStore; objToken: string }): void {
+    const id = fx.store.insertSourcePushLog({
+      objToken: fx.objToken,
+      localRelPath: '策划/测试文档.md',
+      mode: 'revert',
+      actor: 'ui',
+      anchorHistoryId: '3072',
+      anchorHistoryTime: '2026-10-28T02:00:00Z',
+      anchorExact: true,
+    });
+    fx.store.updateSourcePushLog(id, { outcome: 'pushed' });
+    fx.store.updateSourcePushLogRevert(id, { revertState: 'running', revertHistoryId: '2048', revertTaskId: 'task-x' });
+  }
+
+  it('回滚进行中：edit → 409 cloud_revert_running，不落任何编辑状态', async () => {
+    const fx = makeFixture();
+    try {
+      seedRunningRevert(fx);
+      const error = await expectError(fx.service.edit(
+        fx.objToken,
+        { mode: 'replace_body', body: '# 被编辑\n' },
+        { baseHash: sha(BODY), actor: 'ui' },
+      ));
+      expect(error.code).toBe('cloud_revert_running');
+      expect(error.status).toBe(409);
+      // 无 source_edits 行、无备份目录、文件字节不变
+      expect(fx.store.getSourceEdit(fx.objToken)).toBeNull();
+      expect(fs.existsSync(path.join(fx.dataRoot, 'source-edits', fx.objToken))).toBe(false);
+      expect(fs.readFileSync(fx.absPath, 'utf-8')).toBe(yamlHeader() + BODY);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it('回滚进行中：revert → 409；read 不受门影响', async () => {
+    const fx = makeFixture();
+    try {
+      await fx.service.edit(fx.objToken, { mode: 'replace_body', body: '# 被编辑\n' }, { baseHash: sha(BODY), actor: 'ui' });
+      seedRunningRevert(fx);
+      const error = await expectError(fx.service.revert(fx.objToken, 'ui'));
+      expect(error.code).toBe('cloud_revert_running');
+      expect(error.status).toBe(409);
+      // dirty 行保留（未被 revert 清除）
+      expect(fx.store.getSourceEdit(fx.objToken)?.state).toBe('dirty');
+      // read 只读，不受门影响
+      const view = await fx.service.read(fx.objToken);
+      expect(view.state?.state).toBe('dirty');
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it('无回滚行 → 门不改变既有行为（edit 照常成功）', async () => {
+    const fx = makeFixture();
+    try {
+      await fx.service.edit(fx.objToken, { mode: 'replace_body', body: '# 被编辑\n' }, { baseHash: sha(BODY), actor: 'ui' });
+      expect(fx.store.getSourceEdit(fx.objToken)?.state).toBe('dirty');
     } finally {
       fx.cleanup();
     }

@@ -84,6 +84,14 @@ const POSITIONALS: Record<string, string[]> = {
   'source.revert': ['objToken'],
   'source.push-preview': ['objToken'],
   'source.push': ['objToken'],
+  // P0-S4 登记：cloud.* 首位置参数 objToken（cloud.revert 第二位为目标版本 id）。
+  'cloud.history_list': ['objToken'],
+  'cloud.revert': ['objToken', 'historyVersionId'],
+  // P0-S9 登记：cloud.rename_title 首位 objToken、第二位新标题。
+  'cloud.rename_title': ['objToken', 'title'],
+  // P0-S8 登记：docTokens 为尾位 array 参数，多个位置参数全量收集
+  //（feishu-sync sync whiteboard-backfill <tok1> <tok2> …）。
+  'sync.whiteboard_backfill': ['docTokens'],
 };
 
 export function parseInvocation(argv: string[]): ParsedInvocation {

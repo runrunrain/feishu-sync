@@ -12,6 +12,7 @@ import type { Config, WatchedRootConfig } from '../types/index.js';
 import { sanitizeLocalDirName, suggestKnowledgeRoot } from '../modules/config-manager.js';
 import { collectResolvedRuntimeProtectedRoots } from '../agent/protected-roots.js';
 import { checkRootOverlap } from '../agent/path-guard.js';
+import { PublicationError } from '../kb/publication-service.js';
 
 const configRoutes = new Hono();
 
@@ -168,10 +169,13 @@ configRoutes.put('/api/config', async (c) => {
     // 已前置拒绝 config.set feishuWrite，此处是消费者侧兑底（丢弃语义，
     // 同一 patch 其余字段仍可生效）。
     if (
-      partialConfig.feishuWrite !== undefined
+      (partialConfig.feishuWrite !== undefined || partialConfig.feishuPublish !== undefined)
       && ((c as any).cliActor === true || c.req.header('X-Feishu-Sync-Actor') === 'cli')
     ) {
+      // P1-S8（设计 §4.6）：feishuPublish 与 feishuWrite 同属只接受 desktop
+      // 修改的段（发布根与发布开关都是云端写入权限门）。
       delete partialConfig.feishuWrite;
+      delete partialConfig.feishuPublish;
     }
     // 2026-09-04 watchedRoot 删除级联清理：对比保存前后 watchedRoots，
     // 被移除的根在保存成功后自动 purge 其 DB 数据（documents/sheets/
@@ -305,6 +309,14 @@ configRoutes.put('/api/config', async (c) => {
       ...(purgedWatchedRoots.length > 0 ? { purgedWatchedRoots } : {}),
     });
   } catch (error) {
+    // T4b-03：发布根联合校验（ConfigManager 钩子）以 PublicationError 语义
+    // 上抛（409 重叠 / 502 祖先链不可读），不落入 400 config_validation_failed。
+    if (error instanceof PublicationError) {
+      return c.json(
+        { error: error.code, message: error.message, ...(error.details ? { details: error.details } : {}) },
+        error.status as 200 | 400 | 403 | 404 | 409 | 412 | 500,
+      ) as unknown as Response;
+    }
     return c.json(
       {
         error: 'config_validation_failed',

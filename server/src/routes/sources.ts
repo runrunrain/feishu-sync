@@ -7,7 +7,8 @@
  *   POST /api/sources/:objToken/edit         → { bodyHash, state }
  *   POST /api/sources/:objToken/revert       → { ok: true }
  *
- * 写回飞书（push/preview）属 S12，不在本文件。
+ * 写回飞书（push/preview）属 S12，不在本文件；引用边全量重建（P1-S3，
+ * 设计 P1 §2.2）在本文件（sources/references-rebuild）。
  * 错误体沿用既有 { error, message, details? } 约定；错误码对齐设计 §8。
  *
  * edit 请求体（兼容两种契约面）：
@@ -25,6 +26,7 @@ import {
 import { sharedSourceWriteLock, type SourceWriteLock } from '../sources/source-write-lock.js';
 import type { SourceEditActor, SourceEditOp, SourceEditStateDto } from '../types/index.js';
 import { PathGuardError } from '../agent/path-guard.js';
+import { rebuildSourceReferences } from '../sources/reference-rebuild.js';
 
 export interface SourcesRoutesDeps {
   configManager: any;
@@ -38,6 +40,7 @@ export interface SourcesRoutesDeps {
 
 const EDIT_CONFIRM = 'EDIT';
 const REVERT_CONFIRM = 'REVERT';
+const REBUILD_CONFIRM = 'REBUILD';
 
 export function sourcesRoutes(deps: SourcesRoutesDeps) {
   const routes = new Hono();
@@ -176,6 +179,34 @@ export function sourcesRoutes(deps: SourcesRoutesDeps) {
       const objToken = c.req.param('objToken');
       await service.revert(objToken, parseActor(body.actor));
       return c.json({ ok: true });
+    } catch (error) {
+      return errorResponse(c, error);
+    }
+  });
+
+  // POST /api/sources/references-rebuild — P1-S3 引用边全量重建（设计 §2.2）。
+  // 只读本地 md 纯重算 body 边（零云端调用）；整表替换引用边属维护动作，
+  // 需显式 REBUILD 确认（命令表 sources.references-rebuild 同 confirm）。
+  routes.post('/api/sources/references-rebuild', async (c) => {
+    let body: Record<string, unknown>;
+    try {
+      body = await c.req.json<Record<string, unknown>>();
+    } catch {
+      return c.json({ error: 'invalid_json', message: '重建请求必须是 JSON 对象' }, 400);
+    }
+    if (body.confirm !== REBUILD_CONFIRM) {
+      return c.json(
+        { error: 'confirmation_required', message: `重建引用边需要 confirm: "${REBUILD_CONFIRM}"（将按本地正文全量替换引用边索引）` },
+        400,
+      );
+    }
+    try {
+      const config = await deps.configManager.load();
+      if (!config?.knowledgeBaseRoot) {
+        return c.json({ error: 'knowledge_base_root_not_configured', message: '请先配置本地知识库目录' }, 400);
+      }
+      const result = rebuildSourceReferences(deps.localMapStore, config.knowledgeBaseRoot);
+      return c.json(result);
     } catch (error) {
       return errorResponse(c, error);
     }

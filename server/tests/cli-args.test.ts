@@ -28,11 +28,15 @@ describe('命令词匹配', () => {
     expect(findCommandByWords(['no', 'such'])).toBeNull();
   });
 
-  it('命令表 30 条全部可由空格形式命中（S13 登记 source.* 后）', () => {
+  it('命令表全部可由空格形式命中（S13 source.* + P0-S4/S9 cloud.* + P0-S8/P1-S8 兄弟登记后）', () => {
     for (const def of OPS_COMMANDS) {
       expect(findCommandByWords(spacedName(def.name).split(' '))?.name).toBe(def.name);
     }
-    expect(OPS_COMMANDS.length).toBe(30);
+    // 30（S13）+4（P0-S8 sync.whiteboard_backfill / P1-S8 kb.publish*）
+    // +2（P0-S4 cloud.*）+1（P0-S9 cloud.rename_title）
+    // +1（P1-S3 sources.references-rebuild）
+    // +3（P2-S6 cloud.move_to_drive / cloud.move_status / cloud.moves）= 41。
+    expect(OPS_COMMANDS.length).toBe(41);
   });
 
   it('source.* 位置参数：<objToken> 绑定与必填校验', () => {
@@ -47,6 +51,19 @@ describe('命令词匹配', () => {
     // push 旗标型 boolean
     const pushDef = findOpsCommand('source.push')!;
     expect(buildCommandArgs(pushDef, ['doxcnABC', '--allow-overwrite'])).toEqual({ objToken: 'doxcnABC', allowOverwrite: true });
+  });
+
+  it('cloud.* 位置参数（P0-S4/P0-S9）：objToken + 目标参数绑定与必填校验', () => {
+    const listDef = findOpsCommand('cloud.history_list')!;
+    expect(buildCommandArgs(listDef, ['doxcnABC'])).toEqual({ objToken: 'doxcnABC' });
+    expect(buildCommandArgs(listDef, ['doxcnABC', '--page-token', 't2'])).toEqual({ objToken: 'doxcnABC', pageToken: 't2' });
+    const revertDef = findOpsCommand('cloud.revert')!;
+    expect(buildCommandArgs(revertDef, ['doxcnABC', '2048'])).toEqual({ objToken: 'doxcnABC', historyVersionId: '2048' });
+    // 缺目标版本 id → usage 错（destructive 确认前的参数门）
+    expect(() => buildCommandArgs(revertDef, ['doxcnABC'])).toThrowError(UsageError);
+    const renameDef = findOpsCommand('cloud.rename_title')!;
+    expect(buildCommandArgs(renameDef, ['doxcnABC', '新标题'])).toEqual({ objToken: 'doxcnABC', title: '新标题' });
+    expect(() => buildCommandArgs(renameDef, ['doxcnABC'])).toThrowError(UsageError);
   });
 });
 

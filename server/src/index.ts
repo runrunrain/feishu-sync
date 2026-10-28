@@ -36,7 +36,9 @@ import { healthRoutes } from './routes/health.js';
 import { configRoutes } from './routes/config.js';
 import { detectRoutes } from './routes/detect.js';
 import { syncRoutes } from './routes/sync.js';
-import { feishuRoutes } from './routes/feishu.js';
+import { feishuRoutes, createCloudHistoryService, createCloudMoveService } from './routes/feishu.js';
+import { kbPublicationsRoutes } from './routes/kb-publications.js';
+import { createPublishOverlapConfigHook } from './kb/publication-service.js';
 import { mappingRoutes } from './routes/mapping.js';
 import { contentRoutes } from './routes/content.js';
 import { trashRoutes } from './routes/trash.js';
@@ -159,6 +161,14 @@ export async function buildServer(options: CreateServerOptions = {}) {
   const larkCliClient = new LarkCliClient(larkCliConfig);
   console.info('[server] LarkCliClient initialized');
 
+  // T4b-03（P1 §4.1 防线 1）：发布根↔watchedRoots 候选配置联合校验——
+  // 通用 PUT /api/config 与专用 target 路由两入口两方向都做祖先链交叉
+  // 验证，祖先链不可读 fail-closed 拒绝（钩子在 ConfigManager.updateConfig
+  // 收敛，专用路由自身仍独立校验）。
+  configManager.setPublishOverlapHook(
+    createPublishOverlapConfigHook((token: string) => larkCliClient.getNode(token)),
+  );
+
   // Initialize LarkCliManager (in-app lark-cli install/update + device auth onboarding)
   console.info('[server] Initializing LarkCliManager');
   const larkCliManager = new LarkCliManager(larkCliClient, configManager);
@@ -174,6 +184,21 @@ export async function buildServer(options: CreateServerOptions = {}) {
   const interruptedPushes = localMapStore.markInterruptedSourceEditPushes();
   if (interruptedPushes > 0) {
     console.info(`[server] source edits reconciled: ${interruptedPushes} pushing → conflict`);
+  }
+
+  // P1-S8（设计 P1 §4.2）：残留 creating 发布行置 unknown（创建是否落地
+  // 不确定，不自动重建，交人工核对后经 force 重新发布为新文档）。
+  const interruptedPublications = localMapStore.reconcileKbPublicationsCreating();
+  if (interruptedPublications > 0) {
+    console.info(`[server] kb publications reconciled: ${interruptedPublications} creating → unknown`);
+  }
+
+  // P0-S3（lark-cli-newcaps-P0 §4.1 启动对账）：source_push_log 残留的
+  // started 行置 unknown——写回是否落地不确定，不自动判定成败；交 S5
+  // UI「请对比云端当前」与下一次检测链自然收敛。
+  const interruptedPushLogs = localMapStore.markInterruptedSourcePushLogs();
+  if (interruptedPushLogs > 0) {
+    console.info(`[server] source push log reconciled: ${interruptedPushLogs} started → unknown`);
   }
 
   // Initialize ChangeDetector
@@ -218,6 +243,24 @@ export async function buildServer(options: CreateServerOptions = {}) {
     sheetCsvPaths,
     workspaceGuard: (workspaceRoot) => checkRootOverlap(workspaceRoot, workspaceGuardsSnapshot()),
     visionDescriber,
+    // P1-S4（§2.4）：引用图查询面——raw_read 末页追加与 raw_links 工具；
+    // 入边按 obj_token 与 wiki_node_token 双键并集（§2.3）。
+    sourceLinks: (objToken) => {
+      const doc = localMapStore.getDocumentByObjToken(objToken);
+      const inTokens = [objToken, doc?.wikiNodeToken ?? null].filter(
+        (token): token is string => typeof token === 'string' && token.length > 0,
+      );
+      return {
+        out: localMapStore.listSourceReferencesBySrc(objToken),
+        in: localMapStore.listSourceReferencesByTarget(inTokens),
+      };
+    },
+    // P2-S4（§5.1）：评论溯源查询面——raw_comments 只读工具（仅
+    // Discuss/Work）；meta 无行 = 从未采集（非 docx 或未同步）。
+    comments: (objToken) => ({
+      meta: localMapStore.getSourceCommentMeta(objToken),
+      comments: localMapStore.listSourceCommentsBySrc(objToken),
+    }),
   });
   // 回环内部 API 基址：端口在 startServer 监听后回填（构建/会话 spawn 前必然已知）
   const agentInternalPort = { port: null as number | null };
@@ -284,6 +327,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
     configProvider: () => configManager.getConfig(),
     documentsProvider: knowledgeDocuments,
     excludedSourcesProvider: () => localMapStore.listKbExcludedSources(configManager.getConfig()?.knowledgeBaseRoot ?? ''),
+    publishedTokensProvider: () => localMapStore.listPublishedCloudTokens(),
     sheetCsvPaths,
     internalBaseUrl: () => (agentInternalPort.port ? `http://127.0.0.1:${agentInternalPort.port}` : ''),
     extensionPath: piExtensionPath,
@@ -296,6 +340,44 @@ export async function buildServer(options: CreateServerOptions = {}) {
   if (reconcile.interruptedBuildIds.length > 0) {
     console.info(`[server] kb builds reconciled: ${reconcile.interruptedBuildIds.join(', ')} → interrupted`);
   }
+  // P0-S4（lark-cli-newcaps-P0 §4.4）：云端历史回滚服务（进程级单例——
+  // 轮询器按 5s 节奏收敛 revert_state='running' 行，单行总上限 10 分钟）。
+  // 启动对账：残留 running 回滚行有 task_id 交轮询器续查，无 task_id 置
+  // unknown（revert 非幂等，不自动重试）。DI 注入 routes/feishu 回滚面。
+  const cloudHistoryService = createCloudHistoryService({
+    configManager,
+    localMapStore,
+    larkCliClient,
+    kbBuildService,
+  });
+  const revertReconcile = cloudHistoryService.resumeRunningReverts();
+  if (revertReconcile.resumed > 0 || revertReconcile.markedUnknown > 0) {
+    console.info(`[server] cloud reverts reconciled: ${revertReconcile.resumed} resumed, ${revertReconcile.markedUnknown} → unknown`);
+  }
+  cloudHistoryService.startPoller();
+  // P2-S6（lark-cli-newcaps-P2 §3.4）：安全移出服务（进程级单例——轮询
+  // 器按 5s 节奏收敛 cloud_moves.state='moving' 行，单行总上限 10 分钟）。
+  // 启动对账：pending 行 → unknown；moving 有 task_id 交轮询器续查，无
+  // task_id → unknown（移出非幂等，不自动重试）。moved 收尾触发该
+  // watchedRoot 一次既有变更检测（只推进观测字段）。DI 注入 routes/feishu。
+  const cloudMoveService = createCloudMoveService({
+    configManager,
+    localMapStore,
+    larkCliClient,
+    kbBuildService,
+    detectRoot: async (watchedRootId: string) => {
+      const root = (configManager.getConfig()?.watchedRoots ?? []).find(
+        (item: { id?: string; url?: string }) => item?.id === watchedRootId,
+      );
+      if (!root?.url) return null;
+      return changeDetector.detectChanges(root.url, { forceFresh: true });
+    },
+  });
+  const moveReconcile = cloudMoveService.resumeRunningMoves();
+  if (moveReconcile.resumed > 0 || moveReconcile.markedUnknown > 0) {
+    console.info(`[server] cloud moves reconciled: ${moveReconcile.resumed} resumed, ${moveReconcile.markedUnknown} → unknown`);
+  }
+  cloudMoveService.startPoller();
   // ===========================================================================
   // S6 任务编排（设计 kb-agent-upgrade §5）：RoleRegistry + TaskService +
   // task_* 工具族。状态机/队列在 server（agent_tasks）；子任务进程走
@@ -395,6 +477,10 @@ export async function buildServer(options: CreateServerOptions = {}) {
     approvalService.cancelForSession(sessionId);
   });
   (app as any).__approvalService = approvalService;
+  // P0-S4：close() 时停轮询器（进程退出前停止后台轮询）。
+  (app as any).__cloudHistoryService = cloudHistoryService;
+  // P2-S6：同款收尾（未收敛行留 state='moving'，重启对账续查）。
+  (app as any).__cloudMoveService = cloudMoveService;
   (app as any).__agentSessionService = sessionService;
   console.info('[server] ApprovalService + app_command ops family registered');
 
@@ -431,6 +517,8 @@ export async function buildServer(options: CreateServerOptions = {}) {
     (c as any).changeDetector = changeDetector;
     (c as any).agentSessionService = sessionService;
     (c as any).kbBuildService = kbBuildService;
+    (c as any).cloudHistoryService = cloudHistoryService;
+    (c as any).cloudMoveService = cloudMoveService;
     (c as any).agentRuntimeResolver = runtimeResolver;
 
     // Inject desktopToken for auth middleware via context property
@@ -531,6 +619,13 @@ export async function buildServer(options: CreateServerOptions = {}) {
     documentsProvider: knowledgeDocuments,
     sheetCsvPaths,
   }));
+  // P1-S8（设计 P1 §4.6）：反向发布 API（计划/执行/列表/详情/发布根）。
+  app.route('/', kbPublicationsRoutes({
+    configManager,
+    localMapStore,
+    larkCliClient,
+    dataRoot: agentDataRoot,
+  }));
   console.info('[server] Protected routes registered');
 
   // ============================================================================
@@ -630,6 +725,12 @@ export async function startServer(options: CreateServerOptions & {
     // 再回收 pi 子进程。
     const approvals = (app as any).__approvalService as { close: () => void } | undefined;
     approvals?.close();
+    // P0-S4：停云端回滚轮询器（未收敛行留 revert_state='running'，重启对账续查）。
+    const cloudHistory = (app as any).__cloudHistoryService as { stopPoller: () => void } | undefined;
+    cloudHistory?.stopPoller();
+    // P2-S6：停移出轮询器（未收敛行留 state='moving'，重启对账续查）。
+    const cloudMoves = (app as any).__cloudMoveService as { stopPoller: () => void } | undefined;
+    cloudMoves?.stopPoller();
     // 先回收 pi 子进程（SIGTERM → 3s → SIGKILL / Windows taskkill），
     // 再关 HTTP：内部工具 API 必须在子进程存续期间可达。
     const agentPool = (app as any).__agentPool as { closeAll: () => Promise<void> } | undefined;

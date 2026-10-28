@@ -14,6 +14,17 @@
  * 云端 obj_edit_time 已越过 base_obj_edit_time 且非 force → 状态 conflict、
  * 409 source_push_conflict；`force + confirm:'OVERWRITE_CLOUD'` 越过。
  *
+ * P0-S3（lark-cli-newcaps-P0 §4.2，修订升级设计 §7.5 步骤 2–4）：写回
+ * 执行前经 listDocumentHistory 取云端最新历史条目作为回退锚点，连同
+ * push 计划写入 source_push_log（outcome='started'）；成功 → pushed +
+ * post_revision_id；失败 → conflict/failed/unknown（push_outcome_unknown
+ * 类置 unknown，与 source_edits 状态迁移对应）；回拉成功后把 synced 值
+ * 抄进 post_obj_edit_time。**overwrite 无锚（history-list 空/失败）→
+ * blocked(rollback_anchor_unavailable)，拒绝执行——force 唯一不能越过
+ * 的门（force 语义是接受覆盖云端新改动，不是放弃回退点）；append 无锚
+ * → anchor_error 记原因照常推送（U22 尽力而为）**。锁与 source_edits
+ * 状态机不变（仅增加取锚步骤间的状态回退）。
+ *
  * T3b-03（fail-closed）：非 force 推送时云端 obj_edit_time（或本地基线
  * 时间）不可读 → 拒绝写入（cloud_time_unreadable，保留 dirty，不写不
  * 回拉）——写后回读无法补救写前已覆盖的远端内容，唯一前置防线失效时
@@ -99,14 +110,108 @@ export interface PushExecutionOptions {
 const PUSH_CONFIRM = 'PUSH';
 const OVERWRITE_CONFIRM = 'OVERWRITE_CLOUD';
 
+// =========================================================================
+// P0-S9 §6.1：title_change_not_pushed 警告（push 预览）
+// =========================================================================
+
+/** 警告码（UI warning 面板消费的机器可读锚点；§6.1）。 */
+export const TITLE_CHANGE_NOT_PUSHED_CODE = 'title_change_not_pushed';
+
+/** 提取正文首个一级标题文本（无 H1 → null）。 */
+export function firstH1Title(body: string): string | null {
+  for (const line of body.split('\n')) {
+    const match = /^#\s+(.+?)\s*$/.exec(line);
+    if (match) return match[1].trim();
+  }
+  return null;
+}
+
+/**
+ * 警告文案（前端 warning 面板消费的文案常量同源；码前缀供机器匹配）。
+ * 改名受 local_edit_pending 门（U31：有未写回本地修改时拒绝）——文案
+ * 引导「推送完成后」再改名，与门序一致。
+ */
+export function titleChangeNotPushedMessage(localTitle: string, syncedTitle: string): string {
+  return `${TITLE_CHANGE_NOT_PUSHED_CODE}: 本地标题「${localTitle}」与飞书标题「${syncedTitle || '（空）'}」不一致，推送正文不会同步标题；推送完成后可在文档预览「在飞书重命名」同步标题`;
+}
+
+/**
+ * 警告判定（§6.1）：「本地正文首个 H1 与标题不同 **且基线中二者相同**」
+ * ——分叉由本次本地编辑引入（基线本就分叉的同步态不警告）。标题取
+ * documents 行（最近一次同步的云端标题；改名回拉一致后警告自然消除）。
+ */
+export function computeTitleChangeNotPushed(input: {
+  syncedTitle: string;
+  currentBody: string;
+  baseBody: string;
+}): { localTitle: string; syncedTitle: string } | null {
+  const local = firstH1Title(input.currentBody);
+  if (local == null || local === input.syncedTitle) return null;
+  if (firstH1Title(input.baseBody) !== input.syncedTitle) return null;
+  return { localTitle: local, syncedTitle: input.syncedTitle };
+}
+
 /** v1 写 scope 集（S0 §③ 定值；lark-cli-manager.ts 同名常量的服务侧只读镜像）。 */
 export const FEISHU_WRITE_SCOPES: readonly string[] = ['docx:document:write_only'];
+
+/**
+ * anchor_exact（U23；T4b-09 统一秒级口径，写回链与回滚链共用）：
+ * 锚点历史时间（ISO 字符串，毫秒）≥ 云端 obj_edit_time（**秒**，
+ * getDocumentMetas.latestModifyTime 通道本就是秒——不得再除 1000）。
+ * 秒级取整比较（飞书历史按秒取整）：早 1 秒 → false；相等 → true；
+ * 任一侧不可读/非有限数值 → false（保守，UI 明示「回滚点早于写前
+ * 状态，会一并撤销此期间的云端修改」）。
+ */
+export function computeAnchorExactSeconds(
+  anchorHistoryTime: string | null,
+  cloudObjEditTimeSec: number | null,
+): boolean {
+  if (anchorHistoryTime == null || cloudObjEditTimeSec == null) return false;
+  const anchorMs = Date.parse(anchorHistoryTime);
+  if (!Number.isFinite(anchorMs) || !Number.isFinite(cloudObjEditTimeSec)) return false;
+  return Math.floor(anchorMs / 1000) >= Math.floor(cloudObjEditTimeSec);
+}
 
 export class FeishuWriteService {
   constructor(private readonly deps: FeishuWriteServiceDeps) {}
 
   private get locks(): SourceWriteLockLike {
     return this.deps.locks ?? sharedSourceWriteLock;
+  }
+
+  /**
+   * P0-S4（§4.4 cloud_revert_running 互斥）：该 objToken 是否有进行中的
+   * 云端回滚（source_push_log.revert_state='running'，共享状态源由 S4
+   * CloudHistoryService 同步写入）。访问器缺失（旧桩/异常）按无回滚处理，
+   * 不影响既有链路。
+   */
+  private hasRunningCloudRevert(objToken: string): boolean {
+    try {
+      return this.deps.store.getRunningRevertPushLog?.(objToken) != null;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * P2-S6（lark-cli-newcaps-P2 §3.4/§3.5 云端移出互斥；T4b-05 修订）：
+   * 移出进行中（pending/moving）、已移出（最近一行 moved）或结果未知
+   * （unknown——超时/不可解析/重启对账，云端可能仍在执行或已执行）——
+   * 进行中/未知拒 cloud_move_running，已移出拒 source_moved_out（文档
+   * 已离开受管树，写回后的回拉收敛路径不再成立）。unknown 只经权威
+   * 核对（CloudMoveService.reconcileUnknownMove）证明未移出后解除。
+   * 与 hasRunningCloudRevert 同风格容错；围栏状态源 =
+   * store.getActiveCloudMove / getLatestCloudMove（四方共用同一解释）。
+   */
+  private cloudMoveBlockReason(objToken: string): 'cloud_move_running' | 'source_moved_out' | null {
+    try {
+      const active = this.deps.store.getActiveCloudMove?.(objToken) ?? null;
+      if (active != null) return 'cloud_move_running';
+      const latest = this.deps.store.getLatestCloudMove?.(objToken) ?? null;
+      return latest?.state === 'moved' ? 'source_moved_out' : null;
+    } catch {
+      return null;
+    }
   }
 
   private get overwriteSupported(): boolean {
@@ -200,6 +305,69 @@ export class FeishuWriteService {
   }
 
   // =========================================================================
+  // P0-S3 §4.2：写前回退锚点（history-list 第 1 页最新条目）
+  // =========================================================================
+
+  /**
+   * 取回退锚点（U22/U23）：listDocumentHistory(objToken, {pageSize:5})
+   * 第 1 页最新条目（历史异步定型，不保证覆盖写前全部修改——anchor_exact
+   * 判定交由 UI 明示）。取锚失败容错为空锚（historyVersionId=null +
+   * error 记原因），是否阻断由调用方按 mode 裁定（§4.2 步骤 3）。
+   */
+  private async fetchRollbackAnchor(objToken: string): Promise<{
+    historyVersionId: string | null;
+    revisionId: number | null;
+    historyTime: string | null;
+    error: string | null;
+  }> {
+    try {
+      const page = await this.deps.larkCliClient.listDocumentHistory(objToken, { pageSize: 5 });
+      const entry = page?.entries?.[0];
+      if (typeof entry?.historyVersionId === 'string' && entry.historyVersionId !== '') {
+        return {
+          historyVersionId: entry.historyVersionId,
+          revisionId: typeof entry.revisionId === 'number' ? entry.revisionId : null,
+          historyTime: typeof entry.editTime === 'string' ? entry.editTime : null,
+          error: null,
+        };
+      }
+      return { historyVersionId: null, revisionId: null, historyTime: null, error: 'history_list_empty' };
+    } catch (error) {
+      const code = error instanceof LarkCliError ? (error.upstreamCode ?? error.code) : 'history_list_failed';
+      return { historyVersionId: null, revisionId: null, historyTime: null, error: String(code) };
+    }
+  }
+
+  /**
+   * anchor_exact（U23；T4b-09 起为纯函数 computeAnchorExactSeconds 的
+   * 委托，与回滚链共用同一判定）。语义见导出函数注释。
+   */
+  private computeAnchorExact(anchorHistoryTime: string | null, preObjEditTime: number | null): boolean {
+    return computeAnchorExactSeconds(anchorHistoryTime, preObjEditTime);
+  }
+
+  /**
+   * 锚点行状态更新（§4.2 步骤 6/7）——best-effort：主写入（云端 append/
+   * overwrite 与 source_edits 状态机）已完成，日志更新失败只记控制台
+   * 错误，不改变已发生的推送结果（与 appendAudit 同容错模式）。
+   */
+  private safeUpdatePushLog(
+    pushLogId: string | null,
+    patch: {
+      outcome?: 'started' | 'pushed' | 'conflict' | 'failed' | 'unknown';
+      postRevisionId?: string | null;
+      postObjEditTime?: string | null;
+    },
+  ): void {
+    if (!pushLogId) return;
+    try {
+      this.deps.store.updateSourcePushLog(pushLogId, patch);
+    } catch (error) {
+      console.error('[FeishuWriteService] source_push_log update failed:', error);
+    }
+  }
+
+  // =========================================================================
   // preview（计划态，不改 source_edits）
   // =========================================================================
 
@@ -211,10 +379,33 @@ export class FeishuWriteService {
     cloud: { objEditTime: string | null; revisionId: number | null };
     conflict: boolean;
     warnings: string[];
+    /** P0-S3 §4.2：写前回退锚点（无锚为 null；字段语义见 SourcePushPlanDto）。 */
+    rollbackAnchor: {
+      historyVersionId: string;
+      revisionId: number | null;
+      historyTime: string | null;
+      exact: boolean;
+    } | null;
+    anchorBlockedReason?: 'rollback_anchor_unavailable';
+    /** P0-S9 §6.1：本地编辑引入的 H1/标题分叉（无分叉为 null；改名后回拉一致即消除）。 */
+    titleChangeNotPushed: { localTitle: string; syncedTitle: string } | null;
   }> {
     const warnings: string[] = [];
     const { baseBody } = this.requireEditBaseline(objToken);
     const view = await this.deps.readEditView(objToken);
+    // P0-S9 §6.1：本地编辑改了首个 H1（与标题分叉）→ title_change_not_pushed
+    // 警告——推送正文不会同步标题，引导用户推送后用「在飞书重命名」。
+    // 无论后续门控/计划形态如何都先算出来（只读本地比对，零成本）。
+    const titleChangeNotPushed = computeTitleChangeNotPushed({
+      syncedTitle: view.title,
+      currentBody: view.body,
+      baseBody,
+    });
+    if (titleChangeNotPushed != null) {
+      warnings.push(
+        titleChangeNotPushedMessage(titleChangeNotPushed.localTitle, titleChangeNotPushed.syncedTitle),
+      );
+    }
 
     let mode: 'append' | 'overwrite' | 'blocked';
     let blockedReason: string | undefined;
@@ -228,7 +419,19 @@ export class FeishuWriteService {
         mode = 'blocked';
         blockedReason = 'write_scope_missing';
         warnings.push(`缺少写回权限：${scopes.missingScopes.join(', ')}（发起 scopeSet=write 授权）`);
+      } else if (this.hasRunningCloudRevert(objToken)) {
+        // P0-S4：云端回滚进行中 → blocked(cloud_revert_running)（§4.3
+        // blockedReason 语义；批准前暴露）。
+        mode = 'blocked';
+        blockedReason = 'cloud_revert_running';
       } else {
+        // P2-S6：云端移出互斥（§3.4/§3.5）——进行中 / 已移出（写回链
+        // 后的回拉收敛不再成立），批准前暴露。
+        const moveBlock = this.cloudMoveBlockReason(objToken);
+        if (moveBlock != null) {
+          mode = 'blocked';
+          blockedReason = moveBlock;
+        } else {
         // preview 以能力上限规划（allowOverwrite=true）：覆盖与否最终由
         // push 请求体 allowOverwrite + confirm 门决定。
         const plan = planPush({
@@ -240,6 +443,7 @@ export class FeishuWriteService {
         mode = plan.mode;
         blockedReason = plan.blockedReason;
         appendMarkdown = plan.appendMarkdown;
+        }
       }
     }
 
@@ -269,6 +473,30 @@ export class FeishuWriteService {
     const conflict = cloudTimeReadable && baseTimeReadable && (cloudTime as number) > (baseTime as number);
     if (mode === 'overwrite') warnings.push('覆盖将丢失云端评论锚点/协作块等页面级内容');
 
+    // P0-S3 §4.2：预览也实际调用一次 history-list（只读）——overwrite 无锚
+    // 的 blocked 在批准前暴露；append 无锚仅警告（U22 尽力而为）。锚点
+    // 规则不因 force 豁免（force 唯一不能越过的门）。
+    const anchor = await this.fetchRollbackAnchor(objToken);
+    const rollbackAnchor = anchor.historyVersionId != null ? {
+      historyVersionId: anchor.historyVersionId,
+      revisionId: anchor.revisionId,
+      historyTime: anchor.historyTime,
+      exact: this.computeAnchorExact(anchor.historyTime, cloudTimeReadable ? (cloudTime as number) : null),
+    } : null;
+    let anchorBlockedReason: 'rollback_anchor_unavailable' | undefined;
+    if (rollbackAnchor == null) {
+      if (mode === 'overwrite') {
+        mode = 'blocked';
+        blockedReason = 'rollback_anchor_unavailable';
+        anchorBlockedReason = 'rollback_anchor_unavailable';
+        appendMarkdown = undefined;
+      } else if (mode === 'append') {
+        warnings.push(
+          `写回锚点不可用（${anchor.error ?? 'history_list_empty'}）：本次追加无回退锚点，如需撤销请到飞书云端核对处理`,
+        );
+      }
+    }
+
     return {
       mode,
       blockedReason,
@@ -283,6 +511,9 @@ export class FeishuWriteService {
       },
       conflict,
       warnings,
+      rollbackAnchor,
+      titleChangeNotPushed,
+      ...(anchorBlockedReason !== undefined ? { anchorBlockedReason } : {}),
     };
   }
 
@@ -297,10 +528,39 @@ export class FeishuWriteService {
     state: string;
     mode: 'append' | 'overwrite';
     revisionId: number | null;
+    /** 本次写回的锚点行 id（P0-S3；预览/UI/回滚服务消费）。 */
+    pushLogId: string | null;
     pull: { ok: boolean; status: string; message?: string };
   }> {
     if (this.deps.kbBuild?.isActive()) {
       throw new FeishuWriteError('kb_build_active', '标准库构建进行中，暂不能写回飞书（构建结束或取消后再试）', 409);
+    }
+    // P0-S4（§4.2 步骤 1 新增门）：云端回滚进行中 → 409 cloud_revert_running
+    //（回滚后的回拉会与写回交错；回滚与写回对同一 objToken 互斥）。
+    if (this.hasRunningCloudRevert(objToken)) {
+      throw new FeishuWriteError(
+        'cloud_revert_running',
+        '该文档有进行中的云端回滚，暂不能写回飞书（回滚完成后再试）',
+        409,
+      );
+    }
+    // P2-S6（lark-cli-newcaps-P2 §3.4/§3.5；T4b-05 修订）：云端移出互斥
+    // ——进行中/结果未知拒 cloud_move_running；已移出拒 source_moved_out
+    // （文档已离开受管树，写回后的回拉收敛路径不再成立）。
+    const moveBlock = this.cloudMoveBlockReason(objToken);
+    if (moveBlock === 'cloud_move_running') {
+      throw new FeishuWriteError(
+        'cloud_move_running',
+        '该文档有进行中或结果未知的移出到云空间，暂不能写回飞书：请先在移出记录完成权威核对（确认未移出后再操作）',
+        409,
+      );
+    }
+    if (moveBlock === 'source_moved_out') {
+      throw new FeishuWriteError(
+        'source_moved_out',
+        '该文档已移出到云空间（不再受知识库管理）：本地文件保留但不再支持写回',
+        409,
+      );
     }
     await this.requireWriteGates();
     const actor: SourceEditActor = options.actor === 'cli' || options.actor === 'agent' ? options.actor : 'ui';
@@ -323,10 +583,23 @@ export class FeishuWriteService {
         message: error instanceof Error ? error.message : String(error),
       };
     }
+    // P0-S3 §4.2 步骤 7：回拉成功后把 SyncEngine 推进的 synced 值抄进
+    // 锚点行 post_obj_edit_time（只读抄录，失败不改变推送结果）。
+    if (pull.ok) {
+      try {
+        const synced = this.deps.store.getDocumentByObjToken?.(objToken)?.syncedObjEditTime ?? null;
+        if (synced != null) {
+          this.safeUpdatePushLog(outcome.pushLogId, { postObjEditTime: String(synced) });
+        }
+      } catch {
+        // documents 行缺失/读失败：post_obj_edit_time 留空（仅诊断字段）。
+      }
+    }
     return {
       state: (this.deps.store.getSourceEdit?.(objToken) ?? null)?.state ?? 'pushed',
       mode: outcome.mode,
       revisionId: outcome.revisionId,
+      pushLogId: outcome.pushLogId,
       pull,
     };
   }
@@ -355,7 +628,7 @@ export class FeishuWriteService {
     objToken: string,
     options: PushExecutionOptions,
     actor: SourceEditActor,
-  ): Promise<{ mode: 'append' | 'overwrite'; revisionId: number | null }> {
+  ): Promise<{ mode: 'append' | 'overwrite'; revisionId: number | null; pushLogId: string | null }> {
     const { row, baseBody } = this.requireEditBaseline(objToken);
     if (row.state === 'pushing') {
       throw new FeishuWriteError('source_push_in_progress', '该文档正在写回飞书，请等待推送结束后再操作', 409);
@@ -394,6 +667,7 @@ export class FeishuWriteService {
     // U20① + T3b-03：obj_edit_time 前置比较（唯一竞态防线）。云端或基线
     // 时间不可读 → fail-closed 拒绝（不写、不回拉、保留 dirty）；force +
     // OVERWRITE_CLOUD 可越过（显式用户决策）。
+    let preCloudTime: number | null = null;
     if (options.force !== true) {
       const cloudTime = await this.fetchCloudObjEditTime(objToken);
       const baseTime = row.baseObjEditTime != null ? Number(row.baseObjEditTime) : null;
@@ -411,6 +685,61 @@ export class FeishuWriteService {
         this.appendAudit({ actor, objToken, relPath: row.localRelPath, op: 'push', mode: plan.mode, result: 'conflict', errorCode: 'source_push_conflict' });
         throw new FeishuWriteError('source_push_conflict', message, 409, { cloudObjEditTime: cloudTime });
       }
+      preCloudTime = cloudTime;
+    }
+
+    // P0-S3 §4.2 步骤 3：取回退锚点（在时间门之后——时间门失败时不浪费
+    // 一次 history 调用，也不留无意义锚点）。overwrite 无锚（history-list
+    // 空/失败）→ 回退 pushing→进入时状态并拒绝执行；append 无锚 →
+    // anchor_error 记原因照常推送（U22 尽力而为）。锚点规则不因 force
+    // 豁免：force 的语义是「接受覆盖云端新改动」，不是「放弃回退点」。
+    const anchor = await this.fetchRollbackAnchor(objToken);
+    if (plan.mode === 'overwrite' && anchor.historyVersionId == null) {
+      const message = `无法取得云端历史回退锚点（${anchor.error ?? 'history_list_empty'}）：覆盖会改写云端块结构，无回退点时拒绝执行（force 也不可越过）。请稍后重试，或到飞书云端手动核对`;
+      // 回退 pushing → 进入时状态（§4.2：原 dirty → dirty；原 conflict → conflict）。
+      if (row.state === 'conflict') {
+        this.deps.store.markSourceEditConflict(objToken, { code: 'rollback_anchor_unavailable', message });
+      } else {
+        this.deps.store.markSourceEditPushAborted(objToken, { code: 'rollback_anchor_unavailable', message });
+      }
+      this.appendAudit({
+        actor, objToken, relPath: row.localRelPath, op: 'push', mode: plan.mode,
+        result: 'blocked', errorCode: 'rollback_anchor_unavailable', error: anchor.error ?? undefined,
+      });
+      throw new FeishuWriteError('source_push_blocked', message, 422, { reason: 'rollback_anchor_unavailable' });
+    }
+
+    // §4.2 步骤 4：连同 push 计划写入锚点行（outcome='started'；进程中断
+    // 由启动对账置 unknown）。pre_obj_edit_time：时间门已读值优先；force
+    // 越过时间门时尽力补读（失败可空——force 语义）。anchor_exact = 锚点
+    // 历史时间 ≥ 写前云端 obj_edit_time（秒级取整，U23；任一侧不可读 →
+    // false 保守）。日志写入失败 → fail-closed 拒绝写回（锚点记不下来时
+    // overwrite 没有可用的回退点记录；append 同样拒绝——基础设施故障
+    // 时 source_edits 状态机也已不可信，宁可不写）。
+    if (preCloudTime == null) {
+      preCloudTime = await this.fetchCloudObjEditTime(objToken);
+    }
+    let pushLogId: string | null = null;
+    try {
+      pushLogId = this.deps.store.insertSourcePushLog({
+        objToken,
+        localRelPath: row.localRelPath,
+        mode: plan.mode,
+        actor,
+        preObjEditTime: preCloudTime,
+        anchorHistoryId: anchor.historyVersionId,
+        anchorHistoryTime: anchor.historyTime,
+        anchorExact: this.computeAnchorExact(anchor.historyTime, preCloudTime),
+        anchorError: anchor.error,
+      });
+    } catch (logError) {
+      const message = `写前锚点日志写入失败，已拒绝写回（云端未做任何修改）：${logError instanceof Error ? logError.message : String(logError)}`;
+      this.deps.store.markSourceEditPushAborted(objToken, { code: 'push_log_unavailable', message });
+      this.appendAudit({
+        actor, objToken, relPath: row.localRelPath, op: 'push', mode: plan.mode,
+        result: 'error', errorCode: 'push_log_unavailable', error: message.slice(0, 200),
+      });
+      throw new FeishuWriteError('push_log_unavailable', message, 500);
     }
 
     try {
@@ -420,6 +749,11 @@ export class FeishuWriteService {
       this.deps.store.markSourceEditPushed(objToken, {
         pushMode: outcome.mode,
         pushRevisionId: outcome.revisionId != null ? String(outcome.revisionId) : null,
+      });
+      // §4.2 步骤 6：成功 → 锚点行 outcome='pushed' + 写后 revision。
+      this.safeUpdatePushLog(pushLogId, {
+        outcome: 'pushed',
+        postRevisionId: outcome.revisionId != null ? String(outcome.revisionId) : null,
       });
       this.appendAudit({
         actor,
@@ -431,18 +765,24 @@ export class FeishuWriteService {
         revisionId: outcome.revisionId,
         result: 'pushed',
       });
-      return outcome;
+      return { ...outcome, pushLogId };
     } catch (error) {
       // 失败分类（设计 §7.5 步骤 5）：conflict 类置 conflict；其余回 dirty，
       // 原始错误码保留在 last_error_* 与响应 details。
+      // P0-S3：锚点行同步迁移——conflict 类 → conflict；
+      // push_outcome_unknown（写入结果未知）→ unknown；其余 → failed。
       if (error instanceof FeishuWriteError) {
+        const lastErrorCode = String(error.details?.lastErrorCode ?? error.code);
         this.deps.store.markSourceEditConflict(objToken, {
-          code: String(error.details?.lastErrorCode ?? error.code),
+          code: lastErrorCode,
           message: error.message,
+        });
+        this.safeUpdatePushLog(pushLogId, {
+          outcome: lastErrorCode === 'push_outcome_unknown' ? 'unknown' : 'conflict',
         });
         this.appendAudit({
           actor, objToken, relPath: row.localRelPath, op: 'push', mode: plan.mode,
-          result: 'conflict', errorCode: String(error.details?.lastErrorCode ?? error.code),
+          result: 'conflict', errorCode: lastErrorCode,
         });
         throw error;
       }
@@ -452,6 +792,7 @@ export class FeishuWriteService {
         code: larkCode != null ? `lark_${larkCode}` : 'feishu_write_failed',
         message: message.slice(0, 500),
       });
+      this.safeUpdatePushLog(pushLogId, { outcome: 'failed' });
       this.appendAudit({
         actor, objToken, relPath: row.localRelPath, op: 'push', mode: plan.mode,
         result: 'error', errorCode: larkCode ?? 'feishu_write_failed', error: message.slice(0, 500),

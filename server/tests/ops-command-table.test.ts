@@ -209,6 +209,78 @@ describe('source.* 命令（S13 登记）', () => {
   });
 });
 
+describe('cloud.* 命令（P0-S4 登记）', () => {
+  it('风险级 / confirm / agentExposed 与任务书一致（destructive 必带 confirm → CLI 无 --yes 拒）', () => {
+    expect(findOpsCommand('cloud.history_list')).toMatchObject({ risk: 'read', agentExposed: true });
+    const revert = findOpsCommand('cloud.revert')!;
+    expect(revert).toMatchObject({
+      risk: 'destructive',
+      agentExposed: true,
+      confirm: { field: 'confirm', value: 'REVERT_CLOUD' }, // 表基线值（CLI --yes 门）
+    });
+    // destructive → 发非 GET 请求：cli-app 确认预检必生效（无 --yes → 退出码 4）
+    const specs = revert.request({ objToken: 't', historyVersionId: '2048' });
+    expect(specs.some((spec) => spec.method !== 'GET')).toBe(true);
+  });
+
+  it('cloud.history_list：GET 映射；pageToken 透传查询参数', () => {
+    const def = findOpsCommand('cloud.history_list')!;
+    const [plain] = def.request({ objToken: 'tok' });
+    expect(plain).toMatchObject({ method: 'GET', path: '/api/sources/tok/history' });
+    expect(plain.query).toBeUndefined();
+    const [paged] = def.request({ objToken: 'tok', pageToken: 't2' });
+    expect(paged.query).toEqual({ pageToken: 't2' });
+    expect(() => def.request({})).toThrowError(OpsArgumentError);
+  });
+
+  it('cloud.revert：request() 内置派生确认值 REVERT_CLOUD:<historyVersionId>（锚点 id 必须出现在确认值中）', () => {
+    const def = findOpsCommand('cloud.revert')!;
+    const [spec] = def.request({ objToken: 'tok', historyVersionId: '2048' });
+    expect(spec.method).toBe('POST');
+    expect(spec.path).toBe('/api/sources/tok/history-revert');
+    expect(spec.body).toEqual({ historyVersionId: '2048', confirm: 'REVERT_CLOUD:2048', actor: 'cli' });
+    // 缺参 / 互斥字段形态拒
+    expect(() => def.request({ objToken: 'tok' })).toThrowError(OpsArgumentError);
+    expect(() => def.request({ historyVersionId: '2048' })).toThrowError(OpsArgumentError);
+  });
+
+  it('cloud.revert confirmPlan：previewSpecs 同参；blocked 派生拒绝（history_revert_blocked）；planKey 随目标与警告变化', () => {
+    const def = findOpsCommand('cloud.revert')!;
+    const [preview] = def.confirmPlan!.previewSpecs({ objToken: 'tokA', historyVersionId: '2048' });
+    expect(preview).toEqual({
+      method: 'POST',
+      path: '/api/sources/tokA/history-revert/preview',
+      body: { historyVersionId: '2048' },
+    });
+    // 可行计划 → 确认值含目标 id
+    expect(def.confirmPlan!.deriveConfirm({
+      blockedReason: null,
+      target: { historyVersionId: '2048', createdAt: null, editorName: null, editorIds: [] },
+      warnings: [],
+    })).toBe('REVERT_CLOUD:2048');
+    // 阻断 → 不产生确认值（也不产生批准请求）
+    for (const blockedReason of ['cloud_revert_running', 'history_not_found', 'invalid_target', 'anchor_missing']) {
+      expect(() => def.confirmPlan!.deriveConfirm({ blockedReason, target: { historyVersionId: '2048' } }))
+        .toThrowError(OpsArgumentError);
+    }
+    expect(() => def.confirmPlan!.deriveConfirm({ blockedReason: null, target: { historyVersionId: '' } }))
+      .toThrowError(/缺少目标版本/);
+    // planKey：目标 + 排序后警告集
+    const key1 = def.confirmPlan!.planKey({
+      target: { historyVersionId: '2048' }, warnings: ['cloud_changed_since_push', 'anchor_inexact'],
+    });
+    expect(key1).toBe('2048|anchor_inexact,cloud_changed_since_push');
+    const key2 = def.confirmPlan!.planKey({
+      target: { historyVersionId: '2048' }, warnings: ['anchor_inexact'],
+    });
+    const key3 = def.confirmPlan!.planKey({
+      target: { historyVersionId: '1024' }, warnings: ['anchor_inexact', 'cloud_changed_since_push'],
+    });
+    expect(key2).not.toBe(key1); // 警告集变化 → 过期
+    expect(key3).not.toBe(key1); // 目标变化 → 过期
+  });
+});
+
 describe('config.set 禁止路径', () => {
   const def = findOpsCommand('config.set')!;
 

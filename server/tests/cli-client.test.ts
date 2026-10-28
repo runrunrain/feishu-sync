@@ -160,6 +160,15 @@ describe('CLI 子进程端到端（对本地真实 server）', () => {
     expect(envelope.error.details).toEqual({ field: 'confirm', value: 'BUILD' });
   }, 60_000);
 
+  it('P0-S4：cloud revert 无 --yes → 退出码 4（destructive 级本地预检，不打扰服务器）', async () => {
+    const run = await cli(['--json', 'cloud', 'revert', 'doxcnS4Cli', '2048']);
+    expect(run.code).toBe(4);
+    const envelope = JSON.parse(run.stdout);
+    expect(envelope.ok).toBe(false);
+    expect(envelope.error.code).toBe('confirmation_required');
+    expect(envelope.error.details).toEqual({ field: 'confirm', value: 'REVERT_CLOUD' });
+  }, 60_000);
+
   it('kb build --full --yes 参数解析可达服务器（业务错误也是 exit 1 而非 4）', async () => {
     // 测试环境无 pi 运行时/模型：构建会在业务层失败（如 agent 未就绪），
     // 但 confirm 门已过、mode=full 已注入——证明旗标解析与 confirm 透传正确。

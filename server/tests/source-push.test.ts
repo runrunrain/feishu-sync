@@ -39,6 +39,7 @@ import { modelRevision } from '../src/agent/model-revision.js';
 import type { PiRpcProcess } from '../src/agent/pi-rpc-process.js';
 import type { Config } from '../src/types/index.js';
 import { createOpsToolFamily } from '../src/agent/tools/app-command-family.js';
+import { findOpsCommand } from '../src/ops/command-table.js';
 import {
   normalizeForCompare,
   escapeLiteralAngleBracketsForWrite,
@@ -376,6 +377,24 @@ function makeLarkStub(overrides: Record<string, unknown> = {}): LarkStub {
       calls.push({ op: 'overwrite', args: [token, markdown, revisionId] });
       return { revisionId: 7, warnings: [], raw: {} };
     },
+    // P0-S3 §4.2：写前锚点取用 history-list 第 1 页。默认给一条锚点
+    //（editTime 晚于 BASE_EDIT_TIME → anchor_exact=true）；无锚/失败场景
+    // 用 larkOverrides 覆盖。
+    listDocumentHistory: async (token: string, opts?: { pageSize?: number }) => {
+      calls.push({ op: 'historyList', args: [token, opts?.pageSize] });
+      return {
+        entries: [{
+          historyVersionId: '1024',
+          revisionId: 2,
+          editTime: '2026-10-27T00:00:00Z',
+          editorIds: ['ou-test'],
+          type: 2,
+          raw: {},
+        }],
+        hasMore: false,
+        nextPageToken: null,
+      };
+    },
     __bodyProvider: null,
     ...overrides,
   };
@@ -555,7 +574,8 @@ describe('FeishuWriteService.push — overwrite 三段式', () => {
       expect(result.mode).toBe('overwrite');
       expect(result.revisionId).toBe(7);
       const ops = fx.lark.calls.map((call) => call.op);
-      expect(ops).toEqual(['fetchRevision', 'overwrite', 'fetchBody']);
+      // P0-S3：overwrite 执行前多一次 historyList（写前锚点，§4.2 步骤 3）。
+      expect(ops).toEqual(['historyList', 'fetchRevision', 'overwrite', 'fetchBody']);
       const overwriteCall = fx.lark.calls.find((call) => call.op === 'overwrite')!;
       // 写面转义 + revision 使用 fetch 值（仅防未来值）。
       expect(overwriteCall.args[2]).toBe(5);
@@ -1021,6 +1041,291 @@ function makeApp(deps: Record<string, unknown>): Hono {
   app.route('/', feishuRoutes);
   return app;
 }
+
+describe('P0-S3：写前锚点 — push 时序与 source_push_log 四态迁移', () => {
+  /** 默认锚点条目（与 makeLarkStub 默认一致）。 */
+  const ANCHOR = { historyVersionId: '1024', revisionId: 2, editTime: '2026-10-27T00:00:00Z' };
+
+  it('overwrite 无锚（history-list 空）→ 422 source_push_blocked + source_edits 回退原状态 + 零锚点行零写入', async () => {
+    const fx = makeFixture({
+      baseBody: '# 测试文档\n\n正文基线 ALPHA。\n',
+      larkOverrides: {
+        listDocumentHistory: async () => ({ entries: [], hasMore: false, nextPageToken: null }),
+      },
+    });
+    // overwriteFixture 同构：bodyProvider 返回导出形态供回读（不会走到）。
+    (fx.lark as Record<string, unknown>).__bodyProvider = () => '# 标题改\n\n| 列1 | 列2 |\n|-|-|\n| a | [转义括号] |';
+    try {
+      await editBody(fx, '# 标题改\n\n| 列1 | 列2 |\n|---|---|\n| a | \\[转义括号\\] |\n');
+      const error = await expectPushError(fx.service.push(fx.objToken, {
+        allowOverwrite: true,
+        confirm: 'OVERWRITE_CLOUD',
+      }));
+      expect(error.code).toBe('source_push_blocked');
+      expect(error.status).toBe(422);
+      expect(error.details).toMatchObject({ reason: 'rollback_anchor_unavailable' });
+      // source_edits 回退进入时状态（dirty）且可重试（非 pushing/conflict 死态）。
+      expect(fx.store.getSourceEdit(fx.objToken)).toMatchObject({
+        state: 'dirty',
+        lastErrorCode: 'rollback_anchor_unavailable',
+      });
+      // 不落锚点行（§4.2 步骤 3 拒绝在步骤 4 之前）；云端零写入零回拉。
+      expect(fx.store.listSourcePushLogs(fx.objToken)).toEqual([]);
+      expect(fx.lark.calls.filter((call) => call.op === 'overwrite')).toHaveLength(0);
+      expect(fx.pulls).toEqual([]);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it('overwrite 无锚（history-list 抛错）force 也不可越过（force 语义是接受覆盖，不是放弃回退点）', async () => {
+    const fx = makeFixture({
+      larkOverrides: {
+        listDocumentHistory: async () => {
+          throw new LarkCliError('lark-cli 执行失败：history 上游故障', 'upstream', true);
+        },
+      },
+    });
+    try {
+      await editBody(fx, '# 标题改\n\n正文基线 ALPHA。\n');
+      const error = await expectPushError(fx.service.push(fx.objToken, {
+        allowOverwrite: true,
+        force: true,
+        confirm: 'OVERWRITE_CLOUD',
+      }));
+      expect(error.details).toMatchObject({ reason: 'rollback_anchor_unavailable' });
+      expect(fx.store.getSourceEdit(fx.objToken)?.state).toBe('dirty');
+      expect(fx.store.listSourcePushLogs(fx.objToken)).toEqual([]);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it('append 无锚 → 警告照常写回，锚点行 anchor_error 记原因 + outcome=pushed', async () => {
+    const fx = makeFixture({
+      larkOverrides: {
+        listDocumentHistory: async () => {
+          throw new LarkCliError('999 upstream busy', 'upstream', true, '99991400');
+        },
+      },
+    });
+    try {
+      await editBody(fx, '# 测试文档\n\n正文基线 ALPHA。\n无锚追加\n');
+      const result = await fx.service.push(fx.objToken, { confirm: 'PUSH', actor: 'cli' });
+      expect(result.mode).toBe('append');
+      expect(result.pull.ok).toBe(true);
+      const logs = fx.store.listSourcePushLogs(fx.objToken);
+      expect(logs).toHaveLength(1);
+      expect(logs[0]).toMatchObject({
+        objToken: fx.objToken,
+        mode: 'append',
+        actor: 'cli',
+        anchorHistoryId: null,
+        anchorExact: false,
+        anchorError: '99991400',
+        outcome: 'pushed',
+        postRevisionId: '6',
+      });
+      // 回拉成功后 synced 值抄进 post_obj_edit_time（fixture synced=BASE_EDIT_TIME）。
+      expect(logs[0].postObjEditTime).toBe(String(BASE_EDIT_TIME));
+      expect(result.pushLogId).toBe(logs[0].id);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it('锚点记录四态：started→pushed（含锚点字段与 anchor_exact）；失败→failed；结果未知→unknown；回读失配→conflict', async () => {
+    // ① 成功链路：started → pushed（插入后立即迁移，行字段齐全）。
+    const okFx = makeFixture();
+    try {
+      await editBody(okFx, '# 测试文档\n\n正文基线 ALPHA。\n锚点成功链\n');
+      const outcome = await okFx.service.push(okFx.objToken, { confirm: 'PUSH', actor: 'ui' });
+      const row = okFx.store.getSourcePushLog(outcome.pushLogId!)!;
+      expect(row).toMatchObject({
+        mode: 'append',
+        actor: 'ui',
+        preObjEditTime: String(BASE_EDIT_TIME),
+        anchorHistoryId: ANCHOR.historyVersionId,
+        anchorHistoryTime: ANCHOR.editTime,
+        anchorExact: true,  // 2026-10-27 锚点 ≥ BASE_EDIT_TIME 写前云端时间
+        outcome: 'pushed',
+        postRevisionId: '6',
+      });
+    } finally {
+      okFx.cleanup();
+    }
+
+    // ② 非 conflict 失败（①段 fetch 失败 → dirty）：→ failed。
+    const fetchFail = makeFixture({
+      larkOverrides: {
+        fetchDocumentRevision: async () => {
+          throw new LarkCliError('lark-cli 执行失败：网络异常', 'upstream', true);
+        },
+      },
+    });
+    try {
+      await editBody(fetchFail, '# 标题改\n\n正文基线 ALPHA。\n');
+      await expectPushError(fetchFail.service.push(fetchFail.objToken, {
+        allowOverwrite: true, confirm: 'OVERWRITE_CLOUD',
+      }));
+      const logs = fetchFail.store.listSourcePushLogs(fetchFail.objToken);
+      expect(logs).toHaveLength(1);
+      expect(logs[0].outcome).toBe('failed');
+      expect(logs[0].anchorHistoryId).toBe(ANCHOR.historyVersionId);
+    } finally {
+      fetchFail.cleanup();
+    }
+
+    // ③ 结果未知（append 超时 → source_edits conflict/push_outcome_unknown）：→ unknown。
+    const timeoutFx = makeFixture({
+      larkOverrides: {
+        updateDocumentAppend: async () => {
+          throw new LarkCliError('lark-cli 执行超时', 'timeout', true);
+        },
+      },
+    });
+    try {
+      await editBody(timeoutFx, '# 测试文档\n\n正文基线 ALPHA。\n超时追加\n');
+      const error = await expectPushError(timeoutFx.service.push(timeoutFx.objToken, { confirm: 'PUSH' }));
+      expect(error.details).toMatchObject({ lastErrorCode: 'push_outcome_unknown' });
+      const logs = timeoutFx.store.listSourcePushLogs(timeoutFx.objToken);
+      expect(logs).toHaveLength(1);
+      expect(logs[0].outcome).toBe('unknown');
+    } finally {
+      timeoutFx.cleanup();
+    }
+
+    // ④ 回读失配（conflict 类）：→ conflict。
+    const mismatchFx = makeFixture();
+    (mismatchFx.lark as Record<string, unknown>).__bodyProvider = () => '# 别人的并发内容\n';
+    try {
+      await editBody(mismatchFx, '# 标题改\n\n| 列1 | 列2 |\n|---|---|\n| a | \\[转义括号\\] |\n');
+      await expectPushError(mismatchFx.service.push(mismatchFx.objToken, {
+        allowOverwrite: true, confirm: 'OVERWRITE_CLOUD',
+      }));
+      const logs = mismatchFx.store.listSourcePushLogs(mismatchFx.objToken);
+      expect(logs).toHaveLength(1);
+      expect(logs[0].outcome).toBe('conflict');
+    } finally {
+      mismatchFx.cleanup();
+    }
+  });
+
+  it('重启对账：started 残留 → unknown（不自动判定成败）；终态行不受影响', () => {
+    const fx = makeFixture();
+    try {
+      const startedId = fx.store.insertSourcePushLog({
+        objToken: fx.objToken,
+        localRelPath: '策划/测试文档.md',
+        mode: 'append',
+        actor: 'ui',
+        anchorHistoryId: '1024',
+      });
+      const pushedId = fx.store.insertSourcePushLog({
+        objToken: fx.objToken,
+        localRelPath: '策划/测试文档.md',
+        mode: 'overwrite',
+        actor: 'ui',
+      });
+      fx.store.updateSourcePushLog(pushedId, { outcome: 'pushed', postRevisionId: '9' });
+      expect(fx.store.markInterruptedSourcePushLogs()).toBe(1);
+      expect(fx.store.getSourcePushLog(startedId)?.outcome).toBe('unknown');
+      expect(fx.store.getSourcePushLog(pushedId)?.outcome).toBe('pushed');
+      expect(fx.store.markInterruptedSourcePushLogs()).toBe(0);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it('preview：有锚 → rollbackAnchor{historyVersionId,revisionId,exact}；append 无锚 → 警告 + anchor=null；overwrite 无锚 → blocked(rollback_anchor_unavailable)', async () => {
+    // ① 默认（有锚）：append 计划携带锚点。
+    const okFx = makeFixture();
+    try {
+      await editBody(okFx, '# 测试文档\n\n正文基线 ALPHA。\n预览追加\n');
+      const plan = await okFx.service.preview(okFx.objToken);
+      expect(plan.mode).toBe('append');
+      expect(plan.rollbackAnchor).toEqual({
+        historyVersionId: ANCHOR.historyVersionId,
+        revisionId: ANCHOR.revisionId,
+        historyTime: ANCHOR.editTime,
+        exact: true,
+      });
+      expect(plan.anchorBlockedReason).toBeUndefined();
+    } finally {
+      okFx.cleanup();
+    }
+
+    // ② append 无锚：不阻断，警告 + rollbackAnchor=null，无 anchorBlockedReason。
+    const noAnchorAppend = makeFixture({
+      larkOverrides: { listDocumentHistory: async () => ({ entries: [], hasMore: false, nextPageToken: null }) },
+    });
+    try {
+      await editBody(noAnchorAppend, '# 测试文档\n\n正文基线 ALPHA。\n无锚追加\n');
+      const plan = await noAnchorAppend.service.preview(noAnchorAppend.objToken);
+      expect(plan.mode).toBe('append');
+      expect(plan.rollbackAnchor).toBeNull();
+      expect(plan.anchorBlockedReason).toBeUndefined();
+      expect(plan.blockedReason).toBeUndefined();
+      expect(plan.warnings.some((w) => w.includes('写回锚点不可用'))).toBe(true);
+    } finally {
+      noAnchorAppend.cleanup();
+    }
+
+    // ③ overwrite 无锚：批准前暴露为 blocked + anchorBlockedReason。
+    const noAnchorOverwrite = makeFixture({
+      larkOverrides: { listDocumentHistory: async () => ({ entries: [], hasMore: false, nextPageToken: null }) },
+    });
+    try {
+      await editBody(noAnchorOverwrite, '# 标题改\n\n正文基线 ALPHA。\n');
+      const plan = await noAnchorOverwrite.service.preview(noAnchorOverwrite.objToken);
+      expect(plan.mode).toBe('blocked');
+      expect(plan.blockedReason).toBe('rollback_anchor_unavailable');
+      expect(plan.anchorBlockedReason).toBe('rollback_anchor_unavailable');
+      expect(plan.rollbackAnchor).toBeNull();
+      expect(plan.appendMarkdown).toBeUndefined();
+    } finally {
+      noAnchorOverwrite.cleanup();
+    }
+  });
+
+  it('anchor_exact 边界：锚点时间早于写前云端 obj_edit_time → exact=false（U23 保守）', async () => {
+    const fx = makeFixture({
+      larkOverrides: {
+        listDocumentHistory: async () => ({
+          entries: [{
+            historyVersionId: '512', revisionId: 1,
+            editTime: '2025-01-01T00:00:00Z',  // 远早于 BASE_EDIT_TIME
+            editorIds: [], type: 2, raw: {},
+          }],
+          hasMore: false, nextPageToken: null,
+        }),
+      },
+    });
+    try {
+      await editBody(fx, '# 测试文档\n\n正文基线 ALPHA。\n近似锚点追加\n');
+      const plan = await fx.service.preview(fx.objToken);
+      expect(plan.rollbackAnchor).toMatchObject({ historyVersionId: '512', exact: false });
+      const outcome = await fx.service.push(fx.objToken, { confirm: 'PUSH' });
+      expect(fx.store.getSourcePushLog(outcome.pushLogId!)?.anchorExact).toBe(false);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it('planKey 派生：同模式不同锚点可用性 → 不同 planKey（§4.2：${mode}|${anchorAvailable}）', async () => {
+    const def = findOpsCommand('source.push')!;
+    const key = (preview: Record<string, unknown>) => (def.confirmPlan as { planKey: (json: unknown) => string }).planKey(preview);
+    // 同锚点同模式 → 同 key；锚点变化（有↔无）→ key 变化（防旧确认复用）。
+    expect(key({ mode: 'overwrite', rollbackAnchor: { historyVersionId: '1024' } }))
+      .toBe(key({ mode: 'overwrite', rollbackAnchor: { historyVersionId: '2048' } }));
+    expect(key({ mode: 'overwrite', rollbackAnchor: { historyVersionId: '1024' } }))
+      .not.toBe(key({ mode: 'overwrite', rollbackAnchor: null }));
+    expect(key({ mode: 'append', rollbackAnchor: null }))
+      .not.toBe(key({ mode: 'overwrite', rollbackAnchor: null }));
+    expect(key({ mode: 'append', rollbackAnchor: null }))
+      .toBe('append|noanchor');
+  });
+});
 
 describe('routes/feishu — push API 契约', () => {
   let fx: Fixture;

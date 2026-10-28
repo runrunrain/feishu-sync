@@ -111,6 +111,7 @@ const CONFIG_SET_FORBIDDEN: Array<{ prefix: string; reason: string }> = [
   { prefix: 'llm.providers', reason: 'providers 含明文 apiKey，不接受 CLI 直写' },
   { prefix: 'agent.workspaces', reason: 'Workspace 增删只走专用路由（路径校验）' },
   { prefix: 'feishuWrite', reason: '飞书写回开关只接受应用设置（desktop）修改；CLI 通道不可变更云端写入权限门' },
+  { prefix: 'feishuPublish', reason: '反向发布段（含发布根）只接受应用设置（desktop）修改；CLI 通道不可变更云端写入权限门' },
 ];
 
 function assertConfigSetPathAllowed(path: string): void {
@@ -205,6 +206,38 @@ export const OPS_COMMANDS: readonly OpsCommandDef[] = [
     agentExposed: true,
     params: { type: 'object', properties: {} },
     request: () => [{ method: 'GET', path: '/api/kb/versions' }],
+  },
+  // ---- P1-S8 反向发布（设计 P1 §4.6）-------------------------------------
+  {
+    name: 'kb.publish-preview',
+    summary: '预览标准库发布计划（create/update/skip/blocked、警告与确认值派生）',
+    risk: 'read',
+    agentExposed: true,
+    params: {
+      type: 'object',
+      properties: {
+        releaseId: { type: 'string', description: '发布国定的 release；缺省 = CURRENT' },
+        kbPaths: { type: 'array', description: '标准库文档路径数组；缺省 = 整个 release' },
+        force: { type: 'boolean', description: '与实际执行同参：解除冲突并升级确认值' },
+      },
+    },
+    request: (args) => [{
+      method: 'POST',
+      path: '/api/kb/publish/preview',
+      body: {
+        ...(str(args.releaseId) !== undefined ? { releaseId: str(args.releaseId) } : {}),
+        ...(Array.isArray(args.kbPaths) ? { kbPaths: args.kbPaths } : {}),
+        ...(args.force === true ? { force: true } : {}),
+      },
+    }],
+  },
+  {
+    name: 'kb.publications',
+    summary: '已发布云文档映射与状态（kb_publications）',
+    risk: 'read',
+    agentExposed: true,
+    params: { type: 'object', properties: {} },
+    request: () => [{ method: 'GET', path: '/api/kb/publications' }],
   },
   // T3b-01：参数面收窄为「引用已保存配置」——不接受可覆盖 baseUrl/
   // apiKey 的完整 llm 对象（Agent 通道下等于把已存密钥发往模型指定端
@@ -518,6 +551,69 @@ export const OPS_COMMANDS: readonly OpsCommandDef[] = [
     ),
   },
 
+  // ---- P1-S8 反向发布：remote_write（发布创建/覆盖云文档）----------------
+  {
+    name: 'kb.publish',
+    summary: '发布标准库到飞书（新建云文档 / 更新已有发布；云端冲突需 force 并升级 OVERWRITE_PUBLISHED）',
+    risk: 'remote_write',
+    agentExposed: true,
+    // 表内 confirm 值是 CLI --yes 门与 /api/cli/:command 确认门的基线值；
+    // app_command 通道由 confirmPlan 在批准前经真实 preview 派生（与
+    // source.push 同一 T3d-05R 机制），不再按参数静态猜测。
+    confirm: { field: 'confirm', value: 'PUBLISH' },
+    confirmPlan: {
+      previewSpecs: (args) => [{
+        method: 'POST',
+        path: '/api/kb/publish/preview',
+        // preview 与实际执行同参：force 解除冲突时计划动作与确认值同步升级
+        body: {
+          ...(str(args.releaseId) !== undefined ? { releaseId: str(args.releaseId) } : {}),
+          ...(Array.isArray(args.kbPaths) ? { kbPaths: args.kbPaths } : {}),
+          ...(args.force === true ? { force: true } : {}),
+        },
+      }],
+      deriveConfirm: (previewJson, args) => {
+        const plan = (previewJson ?? {}) as {
+          items?: Array<{ action?: string; cloudEdited?: boolean }>;
+        };
+        const items = Array.isArray(plan.items) ? plan.items : [];
+        if (!items.some((item) => item.action === 'create' || item.action === 'update')) {
+          throw new OpsArgumentError(
+            'publish_plan_not_executable',
+            '当前发布计划无可执行项（全部被阻断），不会发起发布',
+          );
+        }
+        // 与 KbPublishService 同一契约：force 且计划含被 force 解除的
+        // 冲突（publish_cloud_edited）→ OVERWRITE_PUBLISHED；否则 PUBLISH。
+        return args.force === true && items.some((item) => item.cloudEdited === true)
+          ? 'OVERWRITE_PUBLISHED'
+          : 'PUBLISH';
+      },
+      planKey: (previewJson) => String((previewJson as { planKey?: unknown } | null)?.planKey ?? ''),
+    },
+    params: {
+      type: 'object',
+      properties: {
+        releaseId: { type: 'string', description: '发布国定的 release；缺省 = CURRENT' },
+        kbPaths: { type: 'array', description: '标准库文档路径数组；缺省 = 整个 release' },
+        force: { type: 'boolean', description: '越过云端冲突覆盖已发布文档（确认值升级 OVERWRITE_PUBLISHED）' },
+      },
+    },
+    request: (args) => [{
+      method: 'POST',
+      path: '/api/kb/publish',
+      body: {
+        ...(str(args.releaseId) !== undefined ? { releaseId: str(args.releaseId) } : {}),
+        ...(Array.isArray(args.kbPaths) ? { kbPaths: args.kbPaths } : {}),
+        ...(args.force === true ? { force: true } : {}),
+        // 静态猜测（与 source.push 同一限制）：force 但计划无冲突时服务端
+        // 实际要求 PUBLISH，会以 confirmation_required 提示具体值。
+        confirm: args.force === true ? 'OVERWRITE_PUBLISHED' : 'PUBLISH',
+        actor: 'cli',
+      },
+    }],
+  },
+
   // ---- source.*（S13 登记；路由由 S11/S12 交付）--------------------------
   // 设计 §6.3 source show/state 两命令不在本批任务书登记面内，未收录。
   {
@@ -639,7 +735,14 @@ export const OPS_COMMANDS: readonly OpsCommandDef[] = [
         // OVERWRITE_CLOUD；否则 PUSH（append+allowOverwrite 仍是 PUSH）。
         return plan.mode === 'overwrite' || args.force === true ? 'OVERWRITE_CLOUD' : 'PUSH';
       },
-      planKey: (previewJson) => String((previewJson as { mode?: unknown } | null)?.mode ?? ''),
+      planKey: (previewJson) => {
+        // P0-S3 §4.2：锚点可用性纳入计划指纹——批准期间锚点从有到无
+        //（或反向）→ 计划过期重新批准，防止锚点变化后复用旧确认
+        //（overwrite 无锚在执行时 422，批准与执行必须同锚点可用性）。
+        const plan = (previewJson ?? null) as { mode?: unknown; rollbackAnchor?: unknown } | null;
+        const anchorAvailable = plan?.rollbackAnchor != null ? 'anchor' : 'noanchor';
+        return `${String(plan?.mode ?? '')}|${anchorAvailable}`;
+      },
     },
     params: {
       type: 'object',
@@ -665,6 +768,295 @@ export const OPS_COMMANDS: readonly OpsCommandDef[] = [
         },
       }];
     },
+  },
+  // ---- cloud.*（P0-S4 登记；路由由本切片交付）------------------------------
+  // 任务书命名：cloud.history_list / cloud.revert（对应设计 §4.6 的
+  // source.history / source.history-revert 面）。
+  {
+    name: 'cloud.history_list',
+    summary: '云端历史版本列表（分页聚合；type=3 为回滚产生的快照）',
+    risk: 'read',
+    agentExposed: true,
+    params: {
+      type: 'object',
+      properties: {
+        objToken: { type: 'string', description: '文档 objToken（位置参数）' },
+        pageToken: { type: 'string', description: '分页令牌（缺省从第一页聚合，上限 3 页；透传单页）' },
+      },
+      required: ['objToken'],
+    },
+    request: (args) => [{
+      method: 'GET',
+      path: `/api/sources/${encodeURIComponent(requireString(args, 'objToken'))}/history`,
+      ...(str(args.pageToken) !== undefined ? { query: { pageToken: str(args.pageToken) as string } } : {}),
+    }],
+  },
+  {
+    name: 'cloud.revert',
+    summary: '回滚云端文档到指定历史版本（destructive；确认值必须含目标 historyVersionId）',
+    risk: 'destructive',
+    agentExposed: true,
+    // 表内基线值（CLI --yes 门与 /api/cli/:command 确认门）；实际确认值由
+    // confirmPlan 按权威 preview 派生为 REVERT_CLOUD:<historyVersionId>（任务书：
+    // 锚点 historyVersionId 必须出现在确认值中），CLI 通道 request() 同源构造。
+    confirm: { field: 'confirm', value: 'REVERT_CLOUD' },
+    confirmPlan: {
+      previewSpecs: (args) => [{
+        method: 'POST',
+        path: `/api/sources/${encodeURIComponent(requireString(args, 'objToken'))}/history-revert/preview`,
+        body: { historyVersionId: requireString(args, 'historyVersionId') },
+      }],
+      deriveConfirm: (previewJson) => {
+        const plan = (previewJson ?? {}) as {
+          blockedReason?: unknown;
+          target?: { historyVersionId?: unknown } | null;
+        };
+        if (plan.blockedReason) {
+          throw new OpsArgumentError(
+            'history_revert_blocked',
+            `当前不可回滚（${String(plan.blockedReason)}），不会发起云端回滚`,
+          );
+        }
+        const targetId = plan.target && typeof plan.target.historyVersionId === 'string'
+          && plan.target.historyVersionId !== '' ? plan.target.historyVersionId : null;
+        if (!targetId) {
+          throw new OpsArgumentError(
+            'history_revert_blocked',
+            '回滚计划缺少目标版本，不会发起云端回滚',
+          );
+        }
+        return `REVERT_CLOUD:${targetId}`;
+      },
+      planKey: (previewJson) => {
+        // §4.6：planKey = 目标版本 + 警告集（排序）；批准期间任一变化 →
+        // 计划过期重新批准。
+        const plan = (previewJson ?? {}) as {
+          target?: { historyVersionId?: unknown } | null;
+          warnings?: unknown;
+        };
+        const targetId = plan.target && typeof plan.target.historyVersionId === 'string'
+          ? plan.target.historyVersionId : '';
+        const warnings = Array.isArray(plan.warnings)
+          ? (plan.warnings as unknown[]).map((item) => String(item)).sort().join(',') : '';
+        return `${targetId}|${warnings}`;
+      },
+    },
+    params: {
+      type: 'object',
+      properties: {
+        objToken: { type: 'string', description: '文档 objToken（位置参数）' },
+        historyVersionId: { type: 'string', description: '目标历史版本 id（cloud.history_list 查询；最新条目不可作目标）' },
+      },
+      required: ['objToken', 'historyVersionId'],
+    },
+    request: (args) => {
+      const objToken = requireString(args, 'objToken');
+      const historyVersionId = requireString(args, 'historyVersionId');
+      return [{
+        method: 'POST',
+        path: `/api/sources/${encodeURIComponent(objToken)}/history-revert`,
+        body: {
+          historyVersionId,
+          confirm: `REVERT_CLOUD:${historyVersionId}`,
+          actor: 'cli',
+        },
+      }];
+    },
+  },
+  // ---- sync.*（P0-S8 登记；设计 §5.8 存量补齐）---------------------------
+  // 任务书命名 sync.whiteboard_backfill（对应设计 §5.8 命令面；风险级与
+  // 确认值按设计：mutate + BACKFILL；agentExposed 按任务书双通道要求开
+  // 放，超出设计 §5.8 的 agentExposed=false 登记面，报告已记偏差）。
+  {
+    name: 'sync.whiteboard_backfill',
+    summary: '存量补齐白板旁路文件（svg 主 + raw 降级；只新增 .wb.svg/.wb.raw.json，不改 md 与同步基线；脏文档跳过）',
+    risk: 'mutate',
+    agentExposed: true,
+    confirm: { field: 'confirm', value: 'BACKFILL' },
+    params: {
+      type: 'object',
+      properties: {
+        docTokens: { type: 'array', description: '文档 objToken 清单（位置参数可重复；缺省全量 synced 文档）' },
+      },
+    },
+    request: (args) => {
+      const docTokens = Array.isArray(args.docTokens)
+        ? (args.docTokens as unknown[]).filter(
+            (token): token is string => typeof token === 'string' && token.length > 0,
+          )
+        : [];
+      return [{
+        method: 'POST',
+        path: '/api/sync/whiteboard-backfill',
+        body: {
+          confirm: 'BACKFILL',
+          ...(docTokens.length > 0 ? { docTokens } : {}),
+        },
+      }];
+    },
+  },
+  // ---- cloud.rename_title（P0-S9 登记；设计 §6.3 source.rename 面，任务书命名）
+  {
+    name: 'cloud.rename_title',
+    summary: '在飞书重命名文档标题（wiki 成员传 node token；本地文件名不变；确认值 RENAME）',
+    risk: 'remote_write',
+    agentExposed: true,
+    // 设计 §6.3 定级 remote_write（非 destructive），确认值不含新标题；
+    // 新标题由 planKey（target.type|to）约束——批准期间目标或标题变化 →
+    // 计划过期重新批准。
+    confirm: { field: 'confirm', value: 'RENAME' },
+    confirmPlan: {
+      previewSpecs: (args) => [{
+        method: 'POST',
+        path: `/api/sources/${encodeURIComponent(requireString(args, 'objToken'))}/title/preview`,
+        body: { title: requireString(args, 'title') },
+      }],
+      deriveConfirm: (previewJson) => {
+        const plan = (previewJson ?? {}) as { blockedReason?: unknown };
+        if (plan.blockedReason) {
+          throw new OpsArgumentError(
+            'rename_blocked',
+            `当前不可改名（${String(plan.blockedReason)}），不会发起云端改名`,
+          );
+        }
+        return 'RENAME';
+      },
+      planKey: (previewJson) => {
+        // §6.3：planKey = `${target.type}|${to}`（批准期间换标题/换目标 → 重新批准）。
+        const plan = (previewJson ?? {}) as { target?: { type?: unknown } | null; to?: unknown };
+        return `${String(plan.target?.type ?? '')}|${String(plan.to ?? '')}`;
+      },
+    },
+    params: {
+      type: 'object',
+      properties: {
+        objToken: { type: 'string', description: '文档 objToken（位置参数）' },
+        title: { type: 'string', description: '新标题（非空、无换行、≤800 字节；位置参数）' },
+      },
+      required: ['objToken', 'title'],
+    },
+    request: (args) => [{
+      method: 'POST',
+      path: `/api/sources/${encodeURIComponent(requireString(args, 'objToken'))}/title`,
+      body: { title: requireString(args, 'title'), confirm: 'RENAME', actor: 'cli' },
+    }],
+  },
+  // ---- P1-S3 引用图（设计 P1 §2.2）----------------------------------------
+  // agentExposed=false（设计 §2.2）：只读本地 md 纯重算 body 边、零云端
+  // 调用，但会全量替换引用边索引，属用户显式维护动作，不进 Agent 工具面。
+  {
+    name: 'sources.references-rebuild',
+    summary: '全量重建引用边索引（只读本地 md 重抽 body 边，零云端调用；refmap 边随下次同步补齐，脏文档跳过）',
+    risk: 'mutate',
+    agentExposed: false,
+    confirm: { field: 'confirm', value: 'REBUILD' },
+    params: { type: 'object', properties: {} },
+    request: () => [{
+      method: 'POST',
+      path: '/api/sources/references-rebuild',
+      body: { confirm: 'REBUILD' },
+    }],
+  },
+  // ---- cloud.move_*（P2-S6 登记；设计 §3.4 source.move-to-drive 面，任务书命名）
+  // 三条全部 agentExposed=false（§3.1 仅人工：移出是破坏性结构变更，
+  // Agent 工具面不可见——app_command 列表与执行均不可达）。
+  {
+    name: 'cloud.move_to_drive',
+    summary: '把知识库叶子文档移出到云空间（destructive；确认值必须含 wiki node token；移出后本地文件保留但不再同步）',
+    risk: 'destructive',
+    agentExposed: false,
+    // 表内基线值（CLI --yes 门与 /api/cli/:command 确认门）；服务端要求
+    // 完整值 MOVE_OUT:<nodeToken>（由 documents 行权威派生）——UI 直调
+    // 必须传完整值，CLI 内部转发（actor=cli）由服务端升级基值。confirmPlan
+    // 同源供 app_command 批准流派生（虽然 agentExposed=false 使其不可达，
+    // 表内仍登记权威派生计划，防止后续误开放时绕过 node token 确认）。
+    confirm: { field: 'confirm', value: 'MOVE_OUT' },
+    confirmPlan: {
+      previewSpecs: (args) => [{
+        method: 'POST',
+        path: `/api/sources/${encodeURIComponent(requireString(args, 'objToken'))}/move-to-drive/preview`,
+        body: {
+          ...(str(args.folderToken) !== undefined ? { folderToken: str(args.folderToken) as string } : {}),
+        },
+      }],
+      deriveConfirm: (previewJson) => {
+        const plan = (previewJson ?? {}) as {
+          blockedReason?: unknown;
+          nodeToken?: unknown;
+        };
+        if (plan.blockedReason) {
+          throw new OpsArgumentError(
+            'move_out_blocked',
+            `当前不可移出（${String(plan.blockedReason)}），不会发起云端移出`,
+          );
+        }
+        if (typeof plan.nodeToken !== 'string' || plan.nodeToken === '') {
+          throw new OpsArgumentError('move_out_blocked', '移出计划缺少节点身份，不会发起云端移出');
+        }
+        return `MOVE_OUT:${plan.nodeToken}`;
+      },
+      planKey: (previewJson) => {
+        const plan = (previewJson ?? {}) as { nodeToken?: unknown; target?: { folderToken?: unknown } | null };
+        return `${String(plan.nodeToken ?? '')}|${String(plan.target?.folderToken ?? '')}`;
+      },
+    },
+    params: {
+      type: 'object',
+      properties: {
+        objToken: { type: 'string', description: '文档 objToken（位置参数；须为 watchedRoot 结构树叶子成员）' },
+        folderToken: { type: 'string', description: '目标 Drive 文件夹 token（缺省 = 个人空间根）' },
+      },
+      required: ['objToken'],
+    },
+    request: (args) => [{
+      method: 'POST',
+      path: `/api/sources/${encodeURIComponent(requireString(args, 'objToken'))}/move-to-drive`,
+      body: {
+        // CLI 通道基值：服务端按 documents 行权威 nodeToken 校验/升级
+        //（actor=cli 时接受基值，见 CloudMoveService.moveToDrive）。
+        confirm: 'MOVE_OUT',
+        ...(str(args.folderToken) !== undefined ? { folderToken: str(args.folderToken) as string } : {}),
+        actor: 'cli',
+      },
+    }],
+  },
+  {
+    name: 'cloud.move_status',
+    summary: '查询单次移出记录状态（不触发远端调用；轮询由 server 负责）',
+    risk: 'read',
+    agentExposed: false,
+    params: {
+      type: 'object',
+      properties: {
+        moveId: { type: 'string', description: '移出记录 id（mv_…；位置参数）' },
+      },
+      required: ['moveId'],
+    },
+    request: (args) => [{
+      method: 'GET',
+      path: `/api/sources/moves/${encodeURIComponent(requireString(args, 'moveId'))}`,
+    }],
+  },
+  {
+    name: 'cloud.moves',
+    summary: '移出记录列表（created_at 倒序；可按文档过滤）',
+    risk: 'read',
+    agentExposed: false,
+    params: {
+      type: 'object',
+      properties: {
+        objToken: { type: 'string', description: '文档 objToken（缺省全量）' },
+        limit: { type: 'number', description: '返回上限（缺省 50）' },
+      },
+    },
+    request: (args) => [{
+      method: 'GET',
+      path: '/api/sources/moves',
+      query: {
+        ...(str(args.objToken) !== undefined ? { objToken: str(args.objToken) as string } : {}),
+        ...(numberOrNull(args.limit) != null ? { limit: String(numberOrNull(args.limit)) } : {}),
+      },
+    }],
   },
 ];
 

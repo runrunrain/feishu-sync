@@ -30,6 +30,8 @@ import {
   DRAFT_READ_SPEC,
   DRAFT_SEARCH_SPEC,
   RAW_LIST_SPEC,
+  RAW_LINKS_SPEC,
+  RAW_COMMENTS_SPEC,
   RAW_READ_IMAGE_SPEC,
   RAW_READ_SPEC,
   RAW_SEARCH_SPEC,
@@ -43,11 +45,19 @@ import {
 import { TASK_TOOL_FAMILY_NAME } from './tool-specs.js';
 import { RawSourceSnapshot, collectSourceCandidates } from '../kb/raw-source-snapshot.js';
 import { StandardKbStore, stripStdHeader } from '../kb/standard-kb-store.js';
-import { hashImageFile, inlineImageBlocks, resolveSourceImages, type ImageDescriptionLike } from '../kb/source-images.js';
+import { hashImageFile, inlineImageBlocks, resolveSourceImages, extractWhiteboardBypassTexts, type ImageDescriptionLike, type WhiteboardTextMap } from '../kb/source-images.js';
 import type { PathClaims } from '../kb/path-claims.js';
 import type { BuildUnit } from '../kb/build-units.js';
 import type { ImageDescription } from './vision/vision-describer.js';
 import { matchGlob } from '../kb/kb-search.js';
+import {
+  renderSourceLinksBlock,
+  resolveSourceLinks,
+  SOURCE_LINKS_PAGE_LIMIT,
+  type IncomingLinkEdgeRow,
+  type ResolvedSourceLink,
+  type SourceLinkEdgeRow,
+} from '../kb/source-links.js';
 import { hasEditorialHistory, hasSourceMetadata } from '../kb/body-policy.js';
 import type {
   AgentRunContext,
@@ -57,6 +67,7 @@ import type {
 } from '../types/agent-knowledge.js';
 import { toolsForRunKind } from '../types/agent-knowledge.js';
 import type { DocumentRecord } from '../types/index.js';
+import type { SourceCommentMetaRow, SourceCommentRow } from '../modules/local-map-store.js';
 
 export interface ToolResult {
   content: Array<{ type: 'text'; text: string }>;
@@ -72,6 +83,9 @@ export class ToolError extends Error {
     this.status = status;
   }
 }
+
+/** P1-S4（§2.4）：raw_links 双向各方向返回上限。 */
+const RAW_LINKS_LIMIT = 200;
 
 export interface BuildRunState {
   knowledgeBaseRoot: string;
@@ -106,6 +120,12 @@ export interface BuildRunState {
   imageDescriptions?: Map<string, Map<string, ImageDescription>>;
   /** S3：本次构建 vision 是否就绪（未就绪时图片处插 unavailable 标记，U5） */
   visionReady?: boolean;
+  /**
+   * P0-S7（设计 §5.6 + 任务 4）：preflight 白板旁路文字（objToken → src →
+   * 抽取结果，仅非空文字）。raw_read 内联 <whiteboard_text>；命中者跳过
+   * vision 识图（省额度，svg/raw 同规则）。
+   */
+  whiteboardTexts?: Map<string, WhiteboardTextMap>;
 }
 
 export interface RunContextOptions {
@@ -181,6 +201,23 @@ export interface SheetCsvPathResolver {
 }
 
 /**
+ * P1-S4（设计 §2.3/§2.4）：引用图查询面——按 objToken 取出边与入边
+ * （LocalMapStore source_references 查询；入边含双键并集）。未注入时
+ * raw_read 不追加 <source_links>，raw_links 报 references_unavailable。
+ */
+export interface SourceLinksProvider {
+  (objToken: string): { out: SourceLinkEdgeRow[]; in: IncomingLinkEdgeRow[] };
+}
+
+/**
+ * P2-S4（设计 §5.1）：raw_comments 只读工具的数据源（index.ts 注入
+ * LocalMapStore 的按源查询）。meta 为 null = 从未采集（非 docx 或未同步）。
+ */
+export interface SourceCommentsProvider {
+  (objToken: string): { meta: SourceCommentMetaRow | null; comments: SourceCommentRow[] };
+}
+
+/**
  * S3：会话侧图片理解支持（结构化接口，VisionDescriber 天然满足）。
  * raw_read 内联已缓存描述；raw_read_image 按需描述。未注入时会话侧
  * 不做内联、raw_read_image 报 vision_unconfigured。S4 构建侧另需
@@ -203,6 +240,10 @@ export class AgentToolService {
   private readonly workspaceGuard?: (workspaceRoot: string) => { ok: true } | { ok: false; code: string; message: string };
   /** S3：会话侧图片理解（raw_read 内联已缓存描述 + raw_read_image 按需描述） */
   private readonly visionDescriber?: VisionDescriberLike;
+  /** P1-S4：引用图查询（raw_read 末页追加 + raw_links 工具） */
+  private readonly sourceLinksProvider?: SourceLinksProvider;
+  /** P2-S4：评论溯源查询（raw_comments 工具，仅 Discuss/Work） */
+  private readonly commentsProvider?: SourceCommentsProvider;
   /** S1 工具族注册表：族名 → 族定义；工具名 → 族内工具项（注册序）。 */
   private readonly toolFamilies = new Map<string, AgentToolFamily>();
   private readonly familyTools = new Map<string, AgentToolFamilyTool>();
@@ -213,12 +254,16 @@ export class AgentToolService {
     sheetCsvPaths?: SheetCsvPathResolver;
     workspaceGuard?: (workspaceRoot: string) => { ok: true } | { ok: false; code: string; message: string };
     visionDescriber?: VisionDescriberLike;
+    sourceLinks?: SourceLinksProvider;
+    comments?: SourceCommentsProvider;
   }) {
     this.dataRoot = input.dataRoot;
     this.documentsProvider = input.documentsProvider;
     this.sheetCsvPaths = input.sheetCsvPaths ?? (() => []);
     this.workspaceGuard = input.workspaceGuard;
     this.visionDescriber = input.visionDescriber;
+    this.sourceLinksProvider = input.sourceLinks;
+    this.commentsProvider = input.comments;
     this.registerBuiltinFamilies();
   }
 
@@ -278,8 +323,13 @@ export class AgentToolService {
         { spec: RAW_LIST_SPEC, runKinds: ['build'], execute: (context, args) => this.toolRawList(context, args) },
         { spec: RAW_READ_SPEC, runKinds: ['build', 'work', 'discuss'], execute: (context, args) => this.toolRawRead(context, args) },
         { spec: RAW_SEARCH_SPEC, runKinds: ['build', 'work', 'discuss'], execute: (context, args) => this.toolRawSearch(context, args) },
+        // P1-S4（§2.4）：引用关系查询（只读），Discuss/Work/构建均可用
+        { spec: RAW_LINKS_SPEC, runKinds: ['build', 'work', 'discuss'], execute: (context, args) => this.toolRawLinks(context, args) },
         // S3（§3.5）：会话侧按需识图（build 不下发——构建链在 preflight 预描述）
         { spec: RAW_READ_IMAGE_SPEC, runKinds: ['work', 'discuss'], execute: (context, args) => this.toolRawReadImage(context, args) },
+        // P2-S4（§5.1）：评论溯源只读查询——只进 Discuss/Work，不进构建
+        // 工具集（不变量 1：评论不在文件哈希围栏内，不进构建输入）。
+        { spec: RAW_COMMENTS_SPEC, runKinds: ['work', 'discuss'], execute: (_context, args) => this.toolRawComments(args) },
       ],
     });
     // kb_*：标准库读（work/discuss）+ 构建草稿写（build）
@@ -623,7 +673,12 @@ export class AgentToolService {
       : await this.inlineSessionImageDescriptions(context, entry, content);
     const lines = content.split('\n');
     const slice = lines.slice(offset, offset + limit);
-    const wrapped = `<untrusted_source obj_token="${entry.objToken}" title="${escapeXml(entry.title)}">\n${slice.join('\n')}\n</untrusted_source>`;
+    // P1-S4（§2.4）：末页追加 <source_links>（非末页不追加，避免翻页重复）；
+    // 无引用边或未注入引用图时不追加，输出与旧版逐字一致。
+    const isLastPage = offset + slice.length >= lines.length;
+    const sourceLinks = isLastPage ? this.buildSourceLinksBlock(context, entry.objToken) : null;
+    const wrapped = `<untrusted_source obj_token="${entry.objToken}" title="${escapeXml(entry.title)}">\n${slice.join('\n')}\n</untrusted_source>`
+      + (sourceLinks ? `\n${sourceLinks.text}` : '');
     return {
       content: [{ type: 'text', text: wrapped }],
       details: {
@@ -633,11 +688,152 @@ export class AgentToolService {
         offset,
         returnedLines: slice.length,
         totalLines: lines.length,
+        ...(sourceLinks ? { sourceLinks: sourceLinks.summary } : {}),
       },
     };
   }
 
-  /** S3（§3.4）：build 态内联——预描述命中给文本，否则 unavailable 标记。 */
+  /**
+   * P1-S4（§2.4）：raw_read 末页引用块。出入链各取前 30 条（§2.4 上限），
+   * 超出方向标 truncated；无任何边时返回 null（不追加）。
+   */
+  private buildSourceLinksBlock(
+    context: InternalRunContext,
+    objToken: string,
+  ): { text: string; summary: { out: number; in: number; outTruncated: boolean; inTruncated: boolean } } | null {
+    const links = this.resolvedSourceLinks(context, objToken);
+    if (!links) return null;
+    const text = renderSourceLinksBlock({ objToken, out: links.out, in: links.in });
+    if (!text) return null;
+    return {
+      text,
+      summary: {
+        out: Math.min(links.out.length, SOURCE_LINKS_PAGE_LIMIT),
+        in: Math.min(links.in.length, SOURCE_LINKS_PAGE_LIMIT),
+        outTruncated: links.out.length > SOURCE_LINKS_PAGE_LIMIT,
+        inTruncated: links.in.length > SOURCE_LINKS_PAGE_LIMIT,
+      },
+    };
+  }
+
+  /**
+   * P1-S4：解析引用边到本地文档行。出边附 kbDocs（CURRENT manifest 中
+   * sources 含该 objToken 的标准库文档路径）与 in_raw（build 态按快照、
+   * 会话态按成功本地版本）；入边同样附 kbDocs（其 objToken=引用方）。
+   */
+  private resolvedSourceLinks(context: InternalRunContext, objToken: string): {
+    out: Array<ResolvedSourceLink & { kbDocs: string[]; inRaw: boolean }>;
+    in: Array<ResolvedSourceLink & { kbDocs: string[] }>;
+  } | null {
+    if (!this.sourceLinksProvider) return null;
+    const edges = this.sourceLinksProvider(objToken);
+    const documents = this.documentsProvider();
+    const byObjToken = new Map(documents.map((doc) => [doc.objToken, doc]));
+    const byWikiToken = new Map<string, DocumentRecord>();
+    for (const doc of documents) {
+      if (doc.wikiNodeToken) byWikiToken.set(doc.wikiNodeToken, doc);
+    }
+    const lookup = (token: string) => byObjToken.get(token) ?? byWikiToken.get(token) ?? null;
+    const resolved = resolveSourceLinks({ outEdges: edges.out, inEdges: edges.in, lookup });
+    const manifest = this.storeFor(context.options.outputRoot).readManifest();
+    const kbDocsFor = (token: string | null): string[] => {
+      if (!token || !manifest) return [];
+      return manifest.docs.filter((doc) => doc.sources.includes(token)).map((doc) => doc.path);
+    };
+    const snapshot = context.options.buildState?.snapshot;
+    return {
+      out: resolved.out.map((link) => ({
+        ...link,
+        kbDocs: kbDocsFor(link.objToken),
+        inRaw: snapshot ? snapshot.has(link.objToken ?? '') : link.synced,
+      })),
+      in: resolved.in.map((link) => ({ ...link, kbDocs: kbDocsFor(link.objToken) })),
+    };
+  }
+
+  /** P1-S4（§2.4）：raw_links 只读工具——双向引用查询（各方向上限 200）。 */
+  private toolRawLinks(context: InternalRunContext, args: Record<string, unknown>): ToolResult {
+    const objToken = requireString(args, 'objToken', 1, 256);
+    const direction = args.direction === 'out' || args.direction === 'in' || args.direction === 'both'
+      ? args.direction
+      : 'both';
+    if (!this.sourceLinksProvider) {
+      throw new ToolError('references_unavailable', '引用图未接入本运行（缺少引用数据源）', 500);
+    }
+    const links = this.resolvedSourceLinks(context, objToken)!;
+    const out = direction === 'in' ? [] : links.out.slice(0, RAW_LINKS_LIMIT);
+    const inLinks = direction === 'out' ? [] : links.in.slice(0, RAW_LINKS_LIMIT);
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          objToken,
+          direction,
+          out,
+          in: inLinks,
+          outTruncated: direction !== 'in' && links.out.length > RAW_LINKS_LIMIT,
+          inTruncated: direction !== 'out' && links.in.length > RAW_LINKS_LIMIT,
+        }, null, 2),
+      }],
+      details: { objToken, direction, outCount: out.length, inCount: inLinks.length },
+    };
+  }
+
+  /**
+   * P2-S4（设计 §5.1）：raw_comments 只读工具——按源查同步时采集的飞书
+   * 评论。输出以 <untrusted_comments> 包裹（total=本次入库条数，
+   * truncated=comments.tips 截断标记；solved 三态 true/false/省略）。
+   * 文档不存在 → 404；meta 无行（从未采集）→ 包裹内说明行，不报错。
+   */
+  private toolRawComments(args: Record<string, unknown>): ToolResult {
+    const objToken = requireString(args, 'objToken', 1, 256);
+    if (!this.commentsProvider) {
+      throw new ToolError('comments_unavailable', '评论采集未接入本运行（缺少评论数据源）', 500);
+    }
+    // 文档必须存在（与 raw_read 会话态同款存在性判定）。
+    const record = this.documentsProvider().find((doc) => doc.objToken === objToken);
+    if (!record) {
+      throw new ToolError('not_found', `原始文档不存在或无成功本地版本: ${objToken}`, 404);
+    }
+    const { meta, comments } = this.commentsProvider(objToken);
+    const lines: string[] = [];
+    let total = 0;
+    let truncated = false;
+    if (meta) {
+      total = meta.total;
+      truncated = meta.truncated;
+      for (const comment of comments) {
+        const attrs = [
+          `ref="${escapeXml(comment.commentRef)}"`,
+          comment.author != null ? `author="${escapeXml(comment.author)}"` : '',
+          comment.createdAtCloud != null ? `at="${escapeXml(comment.createdAtCloud)}"` : '',
+          comment.solved === true ? 'solved="true"' : comment.solved === false ? 'solved="false"' : '',
+        ].filter(Boolean).join(' ');
+        lines.push(`  <comment ${attrs}>`);
+        if (comment.quote) lines.push(`    <quote>${escapeXml(comment.quote)}</quote>`);
+        lines.push(`    ${escapeXml(comment.text)}`);
+        lines.push('  </comment>');
+      }
+      if (comments.length === 0) {
+        lines.push('  （无评论）');
+      }
+    } else {
+      lines.push('  该文档没有采集过评论（评论仅在 docx 同步成功时采集）。');
+    }
+    const text = [
+      `<untrusted_comments obj_token="${escapeXml(objToken)}" total="${total}" truncated="${truncated}">`,
+      ...lines,
+      '</untrusted_comments>',
+    ].join('\n');
+    return {
+      content: [{ type: 'text', text }],
+      details: { objToken, total, truncated, collected: meta !== null },
+    };
+  }
+
+  /** S3（§3.4）：build 态内联——预描述命中给文本，否则 unavailable 标记。
+   *  P0-S7：白板旁路文字命中 → 先内联 <whiteboard_text>，且不再插识图
+   *  描述（旁路文字优先，跳过该图 vision 结果）。 */
   private inlineBuildImageDescriptions(
     state: BuildRunState,
     entry: RawSourceSnapshotEntry,
@@ -645,25 +841,49 @@ export class AgentToolService {
   ): string {
     const images = resolveSourceImages(state.knowledgeBaseRoot, entry.relPath, content);
     if (images.length === 0) return content;
+    const whiteboard = state.whiteboardTexts?.get(entry.objToken);
     const described = state.imageDescriptions?.get(entry.objToken);
     const fallbackReason = state.visionReady ? 'not_described' : 'vision_unconfigured';
-    return inlineImageBlocks(content, images, (src) =>
-      described?.get(src) ?? { src, state: 'unavailable', reason: fallbackReason });
+    return inlineImageBlocks(
+      content,
+      images,
+      (src) => {
+        if (whiteboard?.has(src)) return undefined;
+        return described?.get(src) ?? { src, state: 'unavailable', reason: fallbackReason };
+      },
+      (src) => whiteboard?.get(src),
+    );
   }
 
-  /** S3（§3.5）：会话态只内联已缓存描述；vision 未就绪不插入任何标记。 */
+  /** S3（§3.5）+ P0-S7：会话态内联——白板旁路文字不依赖 vision（本地
+   *  抽取，零额度成本），任何 vision 状态都先内联；识图描述仍只内联已
+   *  缓存命中，旁路命中者跳过（与构建链同语义）。 */
   private async inlineSessionImageDescriptions(
     context: InternalRunContext,
     entry: RawSourceSnapshotEntry,
     content: string,
   ): Promise<string> {
-    if (!this.visionDescriber || !context.options.knowledgeBaseRoot) return content;
-    const status = await this.visionDescriber.status();
-    if (status.state !== 'ready') return content;
-    const images = resolveSourceImages(context.options.knowledgeBaseRoot, entry.relPath, content);
+    if (!context.options.knowledgeBaseRoot) return content;
+    const root = context.options.knowledgeBaseRoot;
+    const images = resolveSourceImages(root, entry.relPath, content);
     if (images.length === 0) return content;
+    const whiteboardBySrc: WhiteboardTextMap = new Map(
+      extractWhiteboardBypassTexts(root, entry.relPath, content).map((item) => [
+        item.src,
+        { origin: item.origin, text: item.text, truncated: item.truncated },
+      ] as const),
+    );
+    const whiteboardText = (src: string) => whiteboardBySrc.get(src);
+    if (!this.visionDescriber) {
+      return inlineImageBlocks(content, images, () => undefined, whiteboardText);
+    }
+    const status = await this.visionDescriber.status();
+    if (status.state !== 'ready') {
+      return inlineImageBlocks(content, images, () => undefined, whiteboardText);
+    }
     const bySrc = new Map<string, ImageDescriptionLike>();
     for (const image of images) {
+      if (whiteboardBySrc.has(image.src)) continue; // 旁路文字命中：跳过该图描述
       const hash = hashImageFile(image.file);
       if (!hash) {
         bySrc.set(image.src, { src: image.src, state: 'unavailable', reason: 'missing_file' });
@@ -674,7 +894,7 @@ export class AgentToolService {
         ? { src: image.src, state: 'cached', text }
         : { src: image.src, state: 'unavailable', reason: 'not_described' });
     }
-    return inlineImageBlocks(content, images, (src) => bySrc.get(src));
+    return inlineImageBlocks(content, images, (src) => bySrc.get(src), whiteboardText);
   }
 
   /** S3（§3.5）：会话侧按需识图。src 必须属于该源的本地图片引用。 */
@@ -1233,8 +1453,12 @@ function summarizeArgs(toolName: string, args: Record<string, unknown>): string 
       return `path=${String(args.path ?? '')}`;
     case 'raw_read':
       return `objToken=${String(args.objToken ?? '')}`;
+    case 'raw_links':
+      return `objToken=${String(args.objToken ?? '')} direction=${String(args.direction ?? 'both')}`;
     case 'raw_read_image':
       return `objToken=${String(args.objToken ?? '')} src=${String(args.src ?? '')}`;
+    case 'raw_comments':
+      return `objToken=${String(args.objToken ?? '')}`;
     case 'kb_unit_done':
       return `summary=${String(args.summary ?? '').slice(0, 60)} skipped=${Array.isArray(args.skipped) ? args.skipped.length : 0}`;
     case 'kb_read':

@@ -156,6 +156,66 @@ export class SourceEditService {
     }
   }
 
+  /**
+   * P0-S9（S4 遗留补挂，lark-cli-newcaps-P0 §4.4 cloud_revert_running 互斥）：
+   * 云端回滚进行中禁止新建本地脏编辑/放弃本地修改——回滚后的回拉会被
+   * 本地脏状态阻断（local_edit_pending blocker）。与 FeishuWriteService.push /
+   * CloudHistoryService 同源消费 source_push_log.revert_state='running'；
+   * 访问器缺失（旧测试替身）按无回滚容错，不影响既有链路。
+   */
+  private hasRunningCloudRevert(objToken: string): boolean {
+    try {
+      return this.deps.store?.getRunningRevertPushLog?.(objToken) != null;
+    } catch {
+      return false;
+    }
+  }
+
+  private rejectWhenCloudRevertRunning(objToken: string): void {
+    if (this.hasRunningCloudRevert(objToken)) {
+      throw new SourceEditError(
+        'cloud_revert_running',
+        '该文档有进行中的云端回滚，暂不能编辑或放弃本地修改（回滚完成后再操作）',
+        409,
+      );
+    }
+  }
+
+  /**
+   * P2-S6（lark-cli-newcaps-P2 §3.4/§3.5 云端移出互斥；T4b-05 修订）：
+   * 移出进行中（cloud_moves 存在 pending/moving 行）或结果未知（unknown
+   * ——超时/不可解析/重启对账，云端可能仍在执行或已执行）禁止新建本地
+   * 脏编辑/放弃本地修改——cloud_move_running；移出已完成（最近一行
+   * moved）本地编辑与写回一律拒绝 source_moved_out（文档已离开受管树，
+   * 写回后的回拉收敛路径不再成立）。unknown 只经权威核对
+   * （CloudMoveService.reconcileUnknownMove）证明未移出后解除。与
+   * hasRunningCloudRevert 同风格：访问器缺失（旧测试替身）按无移出容错，
+   * 不影响既有链路；围栏状态源与写回/回滚/移出四方共用同一解释。
+   */
+  private rejectWhenCloudMoveBlocking(objToken: string): void {
+    try {
+      const active = this.deps.store?.getActiveCloudMove?.(objToken) ?? null;
+      if (active != null) {
+        throw new SourceEditError(
+          'cloud_move_running',
+          '该文档有进行中或结果未知的移出到云空间，暂不能编辑或放弃本地修改：请先在移出记录完成权威核对（确认未移出后再操作）',
+          409,
+        );
+      }
+      const latest = this.deps.store?.getLatestCloudMove?.(objToken) ?? null;
+      if (latest?.state === 'moved') {
+        throw new SourceEditError(
+          'source_moved_out',
+          '该文档已移出到云空间（不再受知识库管理）：本地文件保留但不再支持编辑与写回',
+          409,
+        );
+      }
+    } catch (error) {
+      if (error instanceof SourceEditError) throw error;
+      // 访问器缺失/查询异常按无移出容错（与 hasRunningCloudRevert 同口径）。
+    }
+  }
+
   /** 解析绝对路径（write 意图，含路径逃逸/符号链接守卫）。 */
   private resolveTarget(root: string, relPath: string): string {
     try {
@@ -268,6 +328,8 @@ export class SourceEditService {
     this.rejectWhenBuildActive();
     const existing: SourceEditRecord | null = this.deps.store.getSourceEdit?.(objToken) ?? null;
     this.rejectWhenPushing(existing);
+    this.rejectWhenCloudRevertRunning(objToken);
+    this.rejectWhenCloudMoveBlocking(objToken);
     const { relPath, title } = this.requireEditableDocument(objToken);
     // 同步屏蔽名单内的文档冻结编辑（生命周期操作同样拒绝，见守卫接线）。
     const root = await this.knowledgeBaseRoot();
@@ -394,6 +456,8 @@ export class SourceEditService {
       throw new SourceEditError('source_edit_not_found', '该文档没有未写回的本地修改', 404);
     }
     this.rejectWhenPushing(existing);
+    this.rejectWhenCloudRevertRunning(objToken);
+    this.rejectWhenCloudMoveBlocking(objToken);
     const { relPath } = this.requireEditableDocument(objToken);
     const root = await this.knowledgeBaseRoot();
     const abs = this.resolveTarget(root, relPath);
