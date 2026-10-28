@@ -7,6 +7,7 @@
  */
 
 import type { AgentToolSpec } from '../types/agent-knowledge.js';
+import { OPS_COMMANDS } from '../ops/command-table.js';
 
 const string = (description: string): Record<string, unknown> => ({ type: 'string', description });
 const integer = (description: string, min?: number, max?: number): Record<string, unknown> => ({
@@ -193,6 +194,47 @@ export const KB_FINISH_SPEC: AgentToolSpec = {
   },
 };
 
+export const KB_UNIT_DONE_SPEC: AgentToolSpec = {
+  name: 'kb_unit_done',
+  label: '完成构建单元',
+  description: '标记当前构建单元完成。本单元内未被任何文档引用的源必须出现在 skipped 中并给出理由（objToken 须属本单元）。处理完本单元全部批次后立即调用；整体收尾时改用 kb_finish。重复调用以最后一次为准。',
+  parameters: {
+    type: 'object',
+    properties: {
+      summary: string('本单元处理总结（做了什么、产出哪些主题文档）'),
+      skipped: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            objToken: string('跳过的源 objToken（须属本单元）'),
+            reason: string('跳过理由'),
+          },
+          required: ['objToken', 'reason'],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: ['summary'],
+    additionalProperties: false,
+  },
+};
+
+export const RAW_READ_IMAGE_SPEC: AgentToolSpec = {
+  name: 'raw_read_image',
+  label: '识图（按需）',
+  description: '读取原始文档中一张引用图片的描述文本（按需触发图片理解模型；结果入内容寻址缓存，下次直接命中）。src 必须属于该源文档的本地图片引用。',
+  parameters: {
+    type: 'object',
+    properties: {
+      objToken: string('源文档 objToken'),
+      src: string('图片在源 markdown 内的引用路径（如 images/03-xxxx）'),
+    },
+    required: ['objToken', 'src'],
+    additionalProperties: false,
+  },
+};
+
 export const WS_LS_SPEC: AgentToolSpec = {
   name: 'ws_ls',
   label: 'Workspace 列目录',
@@ -283,24 +325,159 @@ export const WS_MKDIR_SPEC: AgentToolSpec = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// app_command（S10，设计 kb-agent-upgrade §6.5）——描述由命令表生成，
+// 与 ops/command-table.ts 保持单一真相源（S13 追加命令自动出现在描述中）。
+// ---------------------------------------------------------------------------
+
+function opsCommandLine(name: string, summary: string, params: string[]): string {
+  const paramText = params.length > 0 ? `；参数：${params.join('、')}` : '；无参数';
+  return `- ${name}：${summary}${paramText}`;
+}
+
+function buildAppCommandDescription(): string {
+  const reads: string[] = [];
+  const writes: string[] = [];
+  for (const command of OPS_COMMANDS) {
+    if (!command.agentExposed) continue;
+    const params = Object.entries(command.params.properties).map(([key, schema]) => {
+      const required = (command.params.required ?? []).includes(key) ? `${key}*(必填)` : key;
+      return `${required}<${schema.type}>`;
+    });
+    const line = opsCommandLine(command.name, command.summary, params);
+    if (command.risk === 'read') reads.push(line);
+    else writes.push(line);
+  }
+  return [
+    '执行应用运维命令（命令表与 CLI 共用）。read 级直接执行；mutate/destructive/remote_write 级会挂起等待用户在界面上批准：拒绝、10 分钟无响应或会话结束都会使命令不执行。',
+    '注意：args 中传入的 confirm/confirmation 字段一律被剔除——确认只能来自用户点击批准，模型不能自我确认。',
+    'read 级命令（Discuss 与 Work 会话均可用）：',
+    ...reads,
+    'mutate/destructive 级命令（仅 Work 会话，逐次经用户批准）：',
+    ...writes,
+  ].join('\n');
+}
+
+export const APP_COMMAND_SPEC: AgentToolSpec = {
+  name: 'app_command',
+  label: '应用命令',
+  description: buildAppCommandDescription(),
+  parameters: {
+    type: 'object',
+    properties: {
+      command: { type: 'string', description: '命令名（见上方命令清单）' },
+      args: { type: 'object', description: '命令参数对象（各命令参数见上方清单）；禁止传 confirm/confirmation——会被剔除' },
+    },
+    required: ['command'],
+    additionalProperties: false,
+  },
+};
+
+// ============================================================================
+// 任务编排工具（S6，设计 kb-agent-upgrade §5.2）—— Leader（编排启用的
+// Discuss/Work 会话）专用；子任务运行（runKind='task'）永不获得 task_*。
+// ============================================================================
+
+/** 工具族名（AgentToolService 族注册/会话按族剔除用）。 */
+export const TASK_TOOL_FAMILY_NAME = 'task';
+
+/** task_* 工具名清单（会话 spawn 时追加到 --tools 参数面）。 */
+export const TASK_TOOL_NAMES = ['task_submit', 'task_query', 'task_resume', 'task_cancel'] as const;
+
+export const TASK_SUBMIT_SPEC: AgentToolSpec = {
+  name: 'task_submit',
+  label: '派发子任务',
+  description: '把一段自包含工作派发为后台子任务（角色：kb-analyst 分析 / kb-converter 转换写入 / kb-reviewer 审校）。task 文本必须自包含：子任务看不到本对话历史。转换类角色必须提供 outputDir（Workspace 相对目录，子任务写入被限制在该目录内）。',
+  parameters: {
+    type: 'object',
+    properties: {
+      role: { type: 'string', description: '子任务角色名', enum: ['kb-analyst', 'kb-converter', 'kb-reviewer'] },
+      title: string('任务标题（1..80 字符）'),
+      task: string('任务正文（1..20000 字符）：目标、输入材料（objToken/路径/检索线索）与期望产出'),
+      outputDir: string('Workspace 相对输出目录（写任务必填；同会话非终态任务不得重叠）'),
+    },
+    required: ['role', 'title', 'task'],
+    additionalProperties: false,
+  },
+};
+
+export const TASK_QUERY_SPEC: AgentToolSpec = {
+  name: 'task_query',
+  label: '查询子任务',
+  description: '查询本会话子任务状态与结果。缺省 taskIds 时返回本会话全部任务；wait 可阻塞等待任一/全部任务落定（非 queued/running 即视为落定，blocked 需把 questions 转呈用户作答）。',
+  parameters: {
+    type: 'object',
+    properties: {
+      taskIds: { type: 'array', items: { type: 'string' }, description: '任务 ID 列表（≤32；缺省 = 本会话全部任务）' },
+      wait: {
+        type: 'object',
+        description: '阻塞等待参数',
+        properties: {
+          mode: { type: 'string', description: 'any=任一落定即返回；all=全部落定才返回', enum: ['any', 'all'] },
+          timeoutSeconds: integer('等待上限（秒）', 1, 600),
+        },
+        required: ['mode', 'timeoutSeconds'],
+        additionalProperties: false,
+      },
+    },
+    additionalProperties: false,
+  },
+};
+
+export const TASK_RESUME_SPEC: AgentToolSpec = {
+  name: 'task_resume',
+  label: '转达任务作答',
+  description: '把用户对 blocked 子任务问题的答复转发给该任务，使其继续执行。仅 blocked 状态可作答。',
+  parameters: {
+    type: 'object',
+    properties: {
+      taskId: string('任务 ID'),
+      message: string('用户答复（1..20000 字符）'),
+    },
+    required: ['taskId', 'message'],
+    additionalProperties: false,
+  },
+};
+
+export const TASK_CANCEL_SPEC: AgentToolSpec = {
+  name: 'task_cancel',
+  label: '取消子任务',
+  description: '取消一个非终态子任务（queued/running/blocked）；运行中的子任务进程会被终止。',
+  parameters: {
+    type: 'object',
+    properties: {
+      taskId: string('任务 ID'),
+    },
+    required: ['taskId'],
+    additionalProperties: false,
+  },
+};
+
 const ALL_SPECS: AgentToolSpec[] = [
   KB_SEARCH_SPEC,
   KB_READ_SPEC,
   RAW_SEARCH_SPEC,
   RAW_READ_SPEC,
   RAW_LIST_SPEC,
+  RAW_READ_IMAGE_SPEC,
   DRAFT_LIST_SPEC,
   DRAFT_READ_SPEC,
   DRAFT_SEARCH_SPEC,
   KB_WRITE_DOC_SPEC,
   KB_DELETE_DOC_SPEC,
   KB_FINISH_SPEC,
+  KB_UNIT_DONE_SPEC,
   WS_LS_SPEC,
   WS_READ_SPEC,
   WS_SEARCH_SPEC,
   WS_WRITE_SPEC,
   WS_EDIT_SPEC,
   WS_MKDIR_SPEC,
+  APP_COMMAND_SPEC,
+  TASK_SUBMIT_SPEC,
+  TASK_QUERY_SPEC,
+  TASK_RESUME_SPEC,
+  TASK_CANCEL_SPEC,
 ];
 
 const SPEC_BY_NAME = new Map(ALL_SPECS.map((spec) => [spec.name, spec]));

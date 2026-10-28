@@ -107,7 +107,7 @@ describe('内部 API 三重校验', () => {
     expect(result.status).toBe(403);
   });
 
-  it('合法 discuss 令牌 → 工具规格下发（只含 4 个只读工具）', async () => {
+  it('合法 discuss 令牌 → 工具规格下发（只读工具 + 会话级追加；无 ws_/构建写工具）', async () => {
     const { token } = toolService.createRunContext({
       runKind: 'discuss',
       outputRoot,
@@ -117,8 +117,15 @@ describe('内部 API 三重校验', () => {
       'X-Agent-Run-Token': token,
     });
     expect(result.status).toBe(200);
-    const names = (result.json as Array<{ name: string }>).map((spec) => spec.name).sort();
-    expect(names).toEqual(['kb_read', 'kb_search', 'raw_read', 'raw_search']);
+    const names = (result.json as Array<{ name: string }>).map((spec) => spec.name);
+    // 基线 4 只读工具一个不少；S10 app_command（read 级可用）在场；
+    // Work/Build 专属工具（ws_*、kb_write_doc、draft_*）绝不下发。
+    for (const required of ['kb_read', 'kb_search', 'raw_read', 'raw_search', 'app_command']) {
+      expect(names).toContain(required);
+    }
+    for (const forbidden of ['ws_write', 'ws_edit', 'ws_mkdir', 'kb_write_doc', 'kb_delete_doc', 'kb_finish', 'draft_read']) {
+      expect(names).not.toContain(forbidden);
+    }
   });
 });
 

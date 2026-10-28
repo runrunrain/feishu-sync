@@ -21,7 +21,9 @@ import type { KbBuildService } from '../kb/kb-build-service.js';
 import { StandardKbStore, KbNotPublishedError } from '../kb/standard-kb-store.js';
 import { RawSourceSnapshot, collectSourceCandidates } from '../kb/raw-source-snapshot.js';
 import { KbVersionStore, captureSourceContents, sourceChangePreview, validReleaseId } from '../kb/kb-version-store.js';
+import type { KbChangePreview } from '../types/kb-version.js';
 import { computeChangeset } from '../kb/kb-build-service.js';
+import { hashImageFile, resolveSourceImages } from '../kb/source-images.js';
 import { ToolError } from '../agent/agent-tool-service.js';
 import type { LocalMapStore } from '../modules/local-map-store.js';
 import type { ConfigManager } from '../modules/config-manager.js';
@@ -67,6 +69,46 @@ function compareSources(
       removed: changeset.removed.length,
     },
   };
+}
+
+/** S3（§3.6）：待处理源（added/changed）引用图片的总数与未缓存数。 */
+async function countPendingImages(
+  knowledgeBaseRoot: string,
+  snapshot: RawSourceSnapshot,
+  preview: KbChangePreview,
+  lookup: ((imageHash: string) => Promise<string | null>) | null,
+): Promise<{ total: number; uncached: number }> {
+  const pendingTokens = new Set(
+    preview.sources
+      .filter((change) => change.kind === 'added' || change.kind === 'changed')
+      .map((change) => change.key),
+  );
+  if (pendingTokens.size === 0) return { total: 0, uncached: 0 };
+  let total = 0;
+  const hashes: string[] = [];
+  for (const token of pendingTokens) {
+    const entry = snapshot.get(token);
+    if (!entry) continue;
+    try {
+      const content = fs.readFileSync(path.join(knowledgeBaseRoot, entry.relPath), 'utf-8');
+      for (const image of resolveSourceImages(knowledgeBaseRoot, entry.relPath, content)) {
+        total += 1;
+        const hash = hashImageFile(image.file);
+        if (hash) hashes.push(hash);
+      }
+    } catch {
+      /* 源不可读：不计数（变更预览已如实展示该源状态） */
+    }
+  }
+  if (!lookup) return { total, uncached: total };
+  let uncached = 0;
+  for (const hash of hashes) {
+    const hit = await lookup(hash);
+    if (hit == null) uncached += 1;
+  }
+  // 文件缺失/不可哈希的图片按未缓存计（无法验证缓存）
+  uncached += total - hashes.length;
+  return { total, uncached };
 }
 
 export function kbRoutes(deps: KbRouteDeps): Hono {
@@ -294,8 +336,12 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
       const snapshot = RawSourceSnapshot.fromEntries(scan.entries, { sheetCsvPaths: deps.sheetCsvPaths });
       const contents = captureSourceContents(snapshot, config.knowledgeBaseRoot);
       const versions = new KbVersionStore(config.standardKb.outputRoot);
-      return c.json(sourceChangePreview(snapshot, contents, manifest, versions.readSourceContents(manifest?.releaseId ?? null),
-        new Set(localMapStore.listKbExcludedSources(config.knowledgeBaseRoot))));
+      const preview = sourceChangePreview(snapshot, contents, manifest, versions.readSourceContents(manifest?.releaseId ?? null),
+        new Set(localMapStore.listKbExcludedSources(config.knowledgeBaseRoot)));
+      // S3（§3.6）：变更入口增图片维度——待处理源引用的图片数 / 未缓存数。
+      // 缓存按当前 vision 模型查；未启用/未命中都计入 uncached（诚实计数）。
+      const images = await countPendingImages(config.knowledgeBaseRoot, snapshot, preview, buildService.visionCacheProbe());
+      return c.json({ ...preview, images });
     } catch (error) { return errorResponse(c, error); }
   });
 

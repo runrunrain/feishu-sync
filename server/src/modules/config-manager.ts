@@ -36,12 +36,19 @@ import { validateWorkspacesAgainstConfig } from '../agent/protected-roots.js';
 import {
   buildDefaultAgentConfig,
   buildDefaultStandardKbConfig,
+  buildDefaultAgentVisionConfig,
+  VISION_MAX_IMAGE_BYTES_CEILING,
+  buildDefaultAgentOrchestrationConfig,
   type AgentConfig,
+  type AgentOrchestrationConfig,
+  type AgentVisionConfig,
   type AgentWorkspaceConfig,
   type StandardKbConfig,
 } from '../types/agent-knowledge.js';
 import type {
+  CliConfig,
   Config,
+  FeishuWriteConfig,
   LayoutProfile,
   LegacyLLMConfig,
   LlmConfig,
@@ -298,13 +305,50 @@ function normalizeAgentConfigLoose(value: unknown, dataRoot: string): AgentConfi
       contextWindow: typeof modelRaw.contextWindow === 'number' && modelRaw.contextWindow >= 1000 ? Math.floor(modelRaw.contextWindow) : base.model.contextWindow,
       maxTokens: typeof modelRaw.maxTokens === 'number' && modelRaw.maxTokens >= 256 ? Math.floor(modelRaw.maxTokens) : base.model.maxTokens,
     },
+    vision: normalizeVisionConfigLoose(raw.vision),
+    orchestration: normalizeOrchestrationConfigLoose(raw.orchestration),
     maxConcurrentProcesses: typeof raw.maxConcurrentProcesses === 'number'
-      ? Math.max(1, Math.min(4, Math.floor(raw.maxConcurrentProcesses)))
+      ? Math.max(1, Math.min(6, Math.floor(raw.maxConcurrentProcesses)))
       : base.maxConcurrentProcesses,
     idleTimeoutMinutes: typeof raw.idleTimeoutMinutes === 'number'
       ? Math.max(1, Math.min(240, Math.floor(raw.idleTimeoutMinutes)))
       : base.idleTimeoutMinutes,
     workspaces: Array.isArray(raw.workspaces) ? raw.workspaces.filter(isValidWorkspaceEntry) : [],
+  };
+}
+
+/** 宽容归一：vision 段缺字段补默认；非法值回退默认（load 与 updateConfig 共用）。S2 设计 §3.1。 */
+function normalizeVisionConfigLoose(value: unknown): AgentVisionConfig {
+  const base = buildDefaultAgentVisionConfig();
+  if (!value || typeof value !== 'object') return base;
+  const raw = value as Partial<AgentVisionConfig>;
+  const int = (candidate: unknown, fallback: number, min: number, max: number): number =>
+    typeof candidate === 'number' && Number.isFinite(candidate)
+      ? Math.max(min, Math.min(max, Math.floor(candidate)))
+      : fallback;
+  return {
+    enabled: raw.enabled === true,
+    providerId: typeof raw.providerId === 'string' && raw.providerId.trim() ? raw.providerId.trim() : undefined,
+    modelId: typeof raw.modelId === 'string' && raw.modelId.trim() ? raw.modelId.trim() : undefined,
+    concurrency: int(raw.concurrency, base.concurrency, 1, 8),
+    maxImageBytes: int(raw.maxImageBytes, base.maxImageBytes, 1024, VISION_MAX_IMAGE_BYTES_CEILING),
+    maxImagesPerBuild: int(raw.maxImagesPerBuild, base.maxImagesPerBuild, 0, 5000),
+    timeoutMs: int(raw.timeoutMs, base.timeoutMs, 5_000, 600_000),
+  };
+}
+
+/** 宽容归一：S6 任务编排参数（设计 kb-agent-upgrade §5.2/§5.3）；开关本身在内置插件条目上，不在此段。 */
+function normalizeOrchestrationConfigLoose(value: unknown): AgentOrchestrationConfig {
+  const base = buildDefaultAgentOrchestrationConfig();
+  if (!value || typeof value !== 'object') return base;
+  const raw = value as Partial<AgentOrchestrationConfig>;
+  const int = (candidate: unknown, fallback: number, min: number, max: number): number =>
+    typeof candidate === 'number' && Number.isFinite(candidate)
+      ? Math.max(min, Math.min(max, Math.floor(candidate)))
+      : fallback;
+  return {
+    maxActiveTasksPerSession: int(raw.maxActiveTasksPerSession, base.maxActiveTasksPerSession, 1, 32),
+    taskTimeoutMinutes: int(raw.taskTimeoutMinutes, base.taskTimeoutMinutes, 1, 1440),
   };
 }
 
@@ -331,6 +375,10 @@ function normalizeStandardKbConfigLoose(value: unknown, dataRoot: string): Stand
     buildBatchSize: typeof raw.buildBatchSize === 'number'
       ? Math.max(1, Math.min(50, Math.floor(raw.buildBatchSize)))
       : base.buildBatchSize,
+    // S4（设计 §4.6）：并行构建 worker 数 1..6；旧配置缺省回落默认值
+    buildParallelism: typeof raw.buildParallelism === 'number'
+      ? Math.max(1, Math.min(6, Math.floor(raw.buildParallelism)))
+      : base.buildParallelism,
     promptTimeoutMinutes: typeof raw.promptTimeoutMinutes === 'number'
       ? Math.max(1, Math.min(240, Math.floor(raw.promptTimeoutMinutes)))
       : base.promptTimeoutMinutes,
@@ -366,11 +414,62 @@ export function validateAgentAndKbConfig(value: {
     }
     if (agent.maxConcurrentProcesses !== undefined
       && (typeof agent.maxConcurrentProcesses !== 'number'
-        || agent.maxConcurrentProcesses < 1 || agent.maxConcurrentProcesses > 4)) {
+        || agent.maxConcurrentProcesses < 1 || agent.maxConcurrentProcesses > 6)) {
       details.push({ field: 'agent.maxConcurrentProcesses', code: 'out_of_range' });
+    }
+    // S2 vision 段结构校验（引用存在性由 validateVisionProviderReference 交叉校验）
+    if (agent.vision !== undefined && (!agent.vision || typeof agent.vision !== 'object')) {
+      details.push({ field: 'agent.vision', code: 'invalid_type' });
+    } else if (agent.vision && typeof agent.vision === 'object') {
+      const vision = agent.vision as Partial<AgentVisionConfig>;
+      if (vision.enabled !== undefined && typeof vision.enabled !== 'boolean') {
+        details.push({ field: 'agent.vision.enabled', code: 'invalid_type' });
+      }
+      if (vision.providerId !== undefined && typeof vision.providerId !== 'string') {
+        details.push({ field: 'agent.vision.providerId', code: 'invalid_type' });
+      }
+      if (vision.modelId !== undefined && typeof vision.modelId !== 'string') {
+        details.push({ field: 'agent.vision.modelId', code: 'invalid_type' });
+      }
+      if (vision.concurrency !== undefined
+        && (typeof vision.concurrency !== 'number' || vision.concurrency < 1 || vision.concurrency > 8)) {
+        details.push({ field: 'agent.vision.concurrency', code: 'out_of_range' });
+      }
+      if (vision.maxImageBytes !== undefined
+        && (typeof vision.maxImageBytes !== 'number'
+          || vision.maxImageBytes < 1024 || vision.maxImageBytes > VISION_MAX_IMAGE_BYTES_CEILING)) {
+        details.push({ field: 'agent.vision.maxImageBytes', code: 'out_of_range' });
+      }
+      if (vision.maxImagesPerBuild !== undefined
+        && (typeof vision.maxImagesPerBuild !== 'number'
+          || vision.maxImagesPerBuild < 0 || vision.maxImagesPerBuild > 5000)) {
+        details.push({ field: 'agent.vision.maxImagesPerBuild', code: 'out_of_range' });
+      }
+      if (vision.timeoutMs !== undefined
+        && (typeof vision.timeoutMs !== 'number' || vision.timeoutMs < 5000 || vision.timeoutMs > 600000)) {
+        details.push({ field: 'agent.vision.timeoutMs', code: 'out_of_range' });
+      }
     }
     // agent.workspaces：不校验也不报错——updateConfig 静默忽略该字段
     //（增删只走专用路由，见 updateConfig 的合并逻辑）。
+    // S6：任务编排参数（严格路径；宽容归一在 normalizeOrchestrationConfigLoose）
+    if (agent.orchestration !== undefined && (!agent.orchestration || typeof agent.orchestration !== 'object')) {
+      details.push({ field: 'agent.orchestration', code: 'invalid_type' });
+    } else if (agent.orchestration && typeof agent.orchestration === 'object') {
+      const orchestration = agent.orchestration as Partial<AgentOrchestrationConfig>;
+      if (orchestration.maxActiveTasksPerSession !== undefined
+        && (typeof orchestration.maxActiveTasksPerSession !== 'number'
+          || !Number.isInteger(orchestration.maxActiveTasksPerSession)
+          || orchestration.maxActiveTasksPerSession < 1 || orchestration.maxActiveTasksPerSession > 32)) {
+        details.push({ field: 'agent.orchestration.maxActiveTasksPerSession', code: 'out_of_range' });
+      }
+      if (orchestration.taskTimeoutMinutes !== undefined
+        && (typeof orchestration.taskTimeoutMinutes !== 'number'
+          || !Number.isInteger(orchestration.taskTimeoutMinutes)
+          || orchestration.taskTimeoutMinutes < 1 || orchestration.taskTimeoutMinutes > 1440)) {
+        details.push({ field: 'agent.orchestration.taskTimeoutMinutes', code: 'out_of_range' });
+      }
+    }
   }
   if (value.standardKb !== undefined && (!value.standardKb || typeof value.standardKb !== 'object')) {
     details.push({ field: 'standardKb', code: 'invalid_type' });
@@ -379,8 +478,37 @@ export function validateAgentAndKbConfig(value: {
     if (kb.outputRoot !== undefined && (typeof kb.outputRoot !== 'string' || !kb.outputRoot.trim())) {
       details.push({ field: 'standardKb.outputRoot', code: 'invalid_value' });
     }
+    // S4：并行数范围校验（严格路径；宽容归一在 normalizeStandardKbConfigLoose）
+    if (kb.buildParallelism !== undefined
+      && (typeof kb.buildParallelism !== 'number'
+        || !Number.isInteger(kb.buildParallelism)
+        || kb.buildParallelism < 1 || kb.buildParallelism > 6)) {
+      details.push({ field: 'standardKb.buildParallelism', code: 'out_of_range' });
+    }
   }
   if (details.length > 0) throw new InvalidConfigError(details);
+}
+
+/** S2（设计 §3.1）：vision 引用交叉校验——enabled=true 时引用的 provider
+ * 与预设必须存在且启用（否则 400 invalid_config{field:'agent.vision.*'}）。
+ * 在合并后的完整配置上执行：agent 段保存与 llm 段保存（可能删除被引用的
+ * provider）两条路径都要过这里，防止“删除 provider 后 vision 悬空”。 */
+export function validateVisionProviderReference(agent: AgentConfig, llm: LlmConfig): void {
+  if (!agent.vision?.enabled) return;
+  const providers = llm.providers ?? [];
+  const providerId = agent.vision.providerId ?? llm.activeProviderId;
+  const provider = providers.find((p) => p.id === providerId);
+  if (!provider) {
+    throw new InvalidConfigError([{ field: 'agent.vision.providerId', code: 'invalid_value' }]);
+  }
+  if (!provider.enabled) {
+    throw new InvalidConfigError([{ field: 'agent.vision.providerId', code: 'provider_disabled' }]);
+  }
+  const models = provider.models.filter((m) => m.enabled);
+  const modelId = agent.vision.modelId ?? provider.defaultModelId;
+  if (!modelId || !models.some((m) => m.id === modelId)) {
+    throw new InvalidConfigError([{ field: 'agent.vision.modelId', code: 'invalid_value' }]);
+  }
 }
 
 const LLM_PROTOCOLS = new Set(['openai-completions', 'openai-responses', 'anthropic-messages']);
@@ -481,6 +609,7 @@ function normalizeModelPresets(
       ...(Number.isInteger(raw.contextWindow) && raw.contextWindow! >= 1024 ? { contextWindow: raw.contextWindow } : {}),
       ...(Number.isInteger(raw.maxTokens) && raw.maxTokens! >= 1 ? { maxTokens: Math.min(raw.maxTokens!, Number.isInteger(raw.contextWindow) && raw.contextWindow! >= 1024 ? raw.contextWindow! : Number.MAX_SAFE_INTEGER) } : {}),
       ...(typeof raw.reasoning === 'boolean' ? { reasoning: raw.reasoning } : {}),
+      ...(typeof raw.supportsImages === 'boolean' ? { supportsImages: raw.supportsImages } : {}),
       enabled: typeof raw.enabled === 'boolean' ? raw.enabled : true,
     });
   });
@@ -556,6 +685,11 @@ const DEFAULT_CONFIG: Config = {
   llm: buildDefaultLlmConfig(),
   agent: buildDefaultAgentConfig(resolveDataRoot()),
   standardKb: buildDefaultStandardKbConfig(resolveDataRoot()),
+  // S8（additive）：命令行访问默认关闭；旧配置无此段时内存补默认。
+  // S12（additive）：飞书写回默认关闭（设计 §7.6）。
+  cli: { enabled: false },
+  // S12（additive）：飞书写回默认关闭；旧配置无此段时内存补默认。
+  feishuWrite: { enabled: false },
   pollIntervalMinutes: 30,
   knowledgeBaseRoot: '',
   watchedRoots: [],
@@ -892,6 +1026,8 @@ export class ConfigManager {
       ...currentConfig,
       llm: updatedLlm,
     };
+    // S2：llm 侧保存也可能删除/停用被 vision 引用的 provider —— 同一交叉校验
+    validateVisionProviderReference(currentConfig.agent, updatedLlm);
     await this.save(updatedConfig);
   }
 
@@ -910,6 +1046,10 @@ export class ConfigManager {
     // F1：agent/standardKb 段严格校验；workspaces 只走专用路由（防绕过路径校验）
     validateAgentAndKbConfig({ agent: partial.agent, standardKb: partial.standardKb });
     validateLlmProtocols(partial.llm);
+    // S8：cli 段严格校验（缺失不报错，非法类型拒绝）。
+    validateCliConfig(partial.cli);
+    // S12：feishuWrite 段严格校验（同 S8 cli 模式；缺失不报错）。
+    validateFeishuWriteConfig(partial.feishuWrite);
     const currentConfig = await this.load();
     const hasStructuredRoots = Object.prototype.hasOwnProperty.call(partial, 'watchedRoots');
     const hasLegacyUrls = Object.prototype.hasOwnProperty.call(partial, 'watchedRootUrls');
@@ -956,6 +1096,16 @@ export class ConfigManager {
           resolveDataRoot(),
         )
         : currentConfig.standardKb,
+      // S8（additive）：cli 段显式提供时采用（严格校验已在上方完成），
+      // 否则保留当前值（旧配置内存态默认 {enabled:false}）。
+      cli: partial.cli !== undefined
+        ? normalizeCliConfigLoose({ ...(currentConfig.cli ?? { enabled: false }), ...partial.cli })
+        : (currentConfig.cli ?? { enabled: false }),
+      // S12（additive）：feishuWrite 段同 S8 cli 模式（显式提供时采用，
+      // 否则保留当前值；旧配置内存态默认 {enabled:false}）。
+      feishuWrite: partial.feishuWrite !== undefined
+        ? normalizeFeishuWriteConfigLoose({ ...(currentConfig.feishuWrite ?? { enabled: false }), ...partial.feishuWrite })
+        : (currentConfig.feishuWrite ?? { enabled: false }),
     };
     // F3-R02：合并后配置交叉校验——已授权 Workspace 与新 knowledgeBaseRoot /
     // outputRoot / dataRoot / 静态受保护运行资源（源码树/node_modules/Electron/
@@ -975,6 +1125,8 @@ export class ConfigManager {
         code: 'workspace_path_forbidden',
       })));
     }
+    // S2（设计 §3.1）：vision.enabled=true 时引用的 provider/预设必须存在且启用
+    validateVisionProviderReference(updatedConfig.agent, updatedConfig.llm);
     await this.save(updatedConfig);
     return this.config!;
   }
@@ -1177,6 +1329,12 @@ export class ConfigManager {
       llm,
       agent: normalizeAgentConfigLoose(raw.agent, resolveDataRoot()),
       standardKb: normalizeStandardKbConfigLoose(raw.standardKb, resolveDataRoot()),
+      // S8（additive）：cli 段宽容归一——缺失/非法 → 默认关闭；不参与
+      // _migrated 回写判定（首次任意 save 时自然落盘）。
+      cli: normalizeCliConfigLoose(raw.cli),
+      // S12（additive）：feishuWrite 段宽容归一——缺失/非法 → 默认关闭；
+      // 同样不参与 _migrated 回写判定。
+      feishuWrite: normalizeFeishuWriteConfigLoose(raw.feishuWrite),
       pollIntervalMinutes: typeof raw.pollIntervalMinutes === 'number'
         ? raw.pollIntervalMinutes
         : DEFAULT_CONFIG.pollIntervalMinutes,
@@ -1388,5 +1546,60 @@ export class ConfigManager {
       Array.isArray(v.providers) ||
       typeof v.activeProviderId === 'string'
     );
+  }
+}
+
+// ============================================================================
+// S8 追加：CLI 配置段归一与严格校验（命令行访问，默认关闭）
+// ============================================================================
+
+/** 宽容归一：缺失/非法 → 默认关闭（load 路径，不拒绝启动）。 */
+function normalizeCliConfigLoose(value: unknown): CliConfig {
+  if (!value || typeof value !== 'object') return { enabled: false };
+  const raw = value as Partial<CliConfig>;
+  return { enabled: raw.enabled === true ? true : false };
+}
+
+/**
+ * 严格校验（PUT /api/config 与 /api/cli/enable 路径）：cli 段存在时
+ * 必须是 { enabled: boolean }，非法直接报 InvalidConfigError（§8
+ * invalid_config）。
+ */
+export function validateCliConfig(value: unknown): void {
+  if (value === undefined) return;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new InvalidConfigError([{ field: 'cli', code: 'invalid_type' }]);
+  }
+  const raw = value as Partial<CliConfig>;
+  if (raw.enabled !== undefined && typeof raw.enabled !== 'boolean') {
+    throw new InvalidConfigError([{ field: 'cli.enabled', code: 'invalid_type' }]);
+  }
+}
+
+// ============================================================================
+// S12 追加：飞书写回配置段归一与严格校验（默认关闭）
+// ============================================================================
+
+/** 宽容归一：缺失/非法 → 默认关闭（load 路径，不拒绝启动）。 */
+export function normalizeFeishuWriteConfigLoose(value: unknown): FeishuWriteConfig {
+  if (!value || typeof value !== 'object') return { enabled: false };
+  const raw = value as Partial<FeishuWriteConfig>;
+  return { enabled: raw.enabled === true ? true : false };
+}
+
+/**
+ * 严格校验（PUT /api/config 路径）：feishuWrite 段存在时必须是
+ * { enabled: boolean }，非法直接报 InvalidConfigError（§8 invalid_config）。
+ * 只接受 desktop token 链路：CLI 令牌无法到达 PUT /api/config（desktop auth
+ * 后挂载；CLI 令牌域仅在 /api/cli/*），结构上已隔离。
+ */
+export function validateFeishuWriteConfig(value: unknown): void {
+  if (value === undefined) return;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new InvalidConfigError([{ field: 'feishuWrite', code: 'invalid_type' }]);
+  }
+  const raw = value as Partial<FeishuWriteConfig>;
+  if (raw.enabled !== undefined && typeof raw.enabled !== 'boolean') {
+    throw new InvalidConfigError([{ field: 'feishuWrite.enabled', code: 'invalid_type' }]);
   }
 }

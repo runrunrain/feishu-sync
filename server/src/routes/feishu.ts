@@ -15,7 +15,16 @@
  */
 
 import { Hono } from 'hono';
-import { LarkCliManagerError } from '../modules/lark-cli-manager.js';
+import { LarkCliManagerError, WRITE_SCOPES } from '../modules/lark-cli-manager.js';
+import { SourceEditService, SourceEditError } from '../sources/source-edit-service.js';
+import { FeishuWriteService, FeishuWriteError } from '../sources/feishu-write-service.js';
+import { SyncEngine } from '../modules/sync-engine.js';
+import { LayoutReconstructor } from '../modules/layout-reconstructor.js';
+import { ContentAdapter } from '../modules/content-adapter.js';
+import { ContentBackendRegistry } from '../modules/content-backend-registry.js';
+import type { ChannelConfig } from '../modules/content-backend.js';
+import { resolveDataRoot } from '../modules/data-root.js';
+import type { SourceEditActor } from '../types/index.js';
 
 const feishuRoutes = new Hono();
 
@@ -35,16 +44,23 @@ feishuRoutes.use('*', async (c, next) => {
 
 /**
  * GET /api/feishu/auth-status - Check lark-cli authentication readiness
+ * S12：响应增补 writeScopesGranted（WRITE_SCOPES ⊆ currentScopes，供写回
+ * 入口判断是否需要发起 scopeSet=write 增量授权）。
  */
 feishuRoutes.get('/api/feishu/auth-status', async (c) => {
   const larkCliClient = (c as any).larkCliClient;
 
   try {
     const result = await larkCliClient.checkAuthReady();
-    return c.json(result);
+    const granted = new Set<string>(result.currentScopes ?? []);
+    return c.json({
+      ...result,
+      writeScopesGranted: WRITE_SCOPES.every((scope) => granted.has(scope)),
+    });
   } catch (error) {
     return c.json({
       ready: false,
+      writeScopesGranted: false,
       error: error instanceof Error ? error.message : String(error),
     }, 500);
   }
@@ -109,11 +125,13 @@ feishuRoutes.post('/api/feishu/lark-cli/install', async (c) => {
 
 /**
  * POST /api/feishu/auth/device/start - 发起 Device Flow
- * → { verificationUrl, deviceCode, expiresIn }；已有进行中流程时 409
- * device_auth_in_progress。
+ * body { mode?, scopeSet? }；scopeSet='write' 时请求集并入 WRITE_SCOPES
+ * （S12 写回授权入口；缺省 read，与既有读链路一致）。
+ * → { verificationUrl, deviceCode, expiresIn, requestedScopes, scopeSet }；
+ * 已有进行中流程时 409 device_auth_in_progress。
  */
 feishuRoutes.post('/api/feishu/auth/device/start', async (c) => {
-  let body: { mode?: unknown };
+  let body: { mode?: unknown; scopeSet?: unknown };
   try {
     const text = await c.req.text();
     body = text ? JSON.parse(text) : {};
@@ -125,9 +143,13 @@ feishuRoutes.post('/api/feishu/auth/device/start', async (c) => {
   if (mode !== 'reauthorize' && mode !== 'switch_account') {
     return c.json({ error: 'invalid_auth_mode' }, 400);
   }
+  const scopeSet = body.scopeSet ?? 'read';
+  if (scopeSet !== 'read' && scopeSet !== 'write') {
+    return c.json({ error: 'invalid_body', message: 'scopeSet 只接受 "read" | "write"' }, 400);
+  }
   try {
     const manager = requireLarkCliManager(c);
-    return c.json(await manager.startDeviceAuth(mode));
+    return c.json(await manager.startDeviceAuth(mode, { scopeSet }));
   } catch (error) {
     return errorResponse(c, 'device_auth_start_failed', error);
   }
@@ -221,6 +243,175 @@ feishuRoutes.post('/api/feishu/lark-cli/config-init/cancel', async (c) => {
     return c.json(await manager.cancelConfigInit());
   } catch (error) {
     return errorResponse(c, 'config_init_cancel_failed', error);
+  }
+});
+
+// ============================================================================
+// S12 飞书写回 push API（设计 §7.4/§7.5；任务书指定落在本文件，不动
+// routes/sources.ts——S11 已交付）。依赖经 buildServer DI 中间件注入
+// （configManager / larkCliClient / localMapStore / kbBuildService）。
+// ============================================================================
+
+/** 写回链错误映射：FeishuWriteError/SourceEditError → 声明码；其余 500。 */
+function pushErrorResponse(c: any, error: unknown) {
+  if (error instanceof FeishuWriteError || error instanceof SourceEditError) {
+    return c.json(
+      {
+        error: error.code,
+        message: error.message,
+        ...((error as FeishuWriteError | SourceEditError).details
+          ? { details: (error as FeishuWriteError | SourceEditError).details }
+          : {}),
+      },
+      error.status as 400 | 403 | 404 | 409 | 422 | 500,
+    );
+  }
+  console.error('[feishu] source push failed:', error);
+  return c.json(
+    {
+      error: 'feishu_write_failed',
+      message: error instanceof Error ? error.message : String(error),
+    },
+    500,
+  );
+}
+
+/** 从请求上下文构造 FeishuWriteService（每请求新建，与 sync 路由同模式）。 */
+function createFeishuWriteService(c: any): FeishuWriteService {
+  const configManager = c.configManager;
+  const localMapStore = c.localMapStore;
+  const larkCliClient = c.larkCliClient;
+  const kbBuildService = c.kbBuildService;
+  if (!configManager || !localMapStore || !larkCliClient || !kbBuildService) {
+    throw new Error('dependencies_not_injected');
+  }
+  const dataRoot = resolveDataRoot();
+  const editService = new SourceEditService({
+    config: configManager,
+    store: localMapStore,
+    kbBuild: { isActive: () => kbBuildService.activeBuild(localMapStore) != null },
+    dataRoot,
+  });
+  return new FeishuWriteService({
+    config: configManager,
+    store: localMapStore,
+    larkCliClient,
+    kbBuild: { isActive: () => kbBuildService.activeBuild(localMapStore) != null },
+    dataRoot,
+    readEditView: (objToken: string) => editService.read(objToken),
+    // 单文档回拉：与 POST /api/sync 同一内部入口（SyncEngine apply 链，
+    // enableLLM=false——写回拉回的是用户编辑文本，不叠加 LLM 整理；
+    // 回拉成功由 SyncEngine.finalizePushedSourceEdit 清行删备份）。
+    pullSync: (objToken: string) => pullSyncSingleDocument({ configManager, localMapStore, larkCliClient }, objToken),
+  });
+}
+
+/** 单文档回拉（SyncEngine apply；与 POST /api/sync 同構造面）。 */
+async function pullSyncSingleDocument(
+  context: { configManager: any; localMapStore: any; larkCliClient: any },
+  objToken: string,
+): Promise<{ ok: boolean; status: string; message?: string }> {
+  const { configManager, localMapStore, larkCliClient } = context;
+  const config = await configManager.load();
+  const channelConfig: ChannelConfig = {
+    llm: config.llm,
+    selection: config.agent?.model?.source === 'app-llm' ? config.agent.model : undefined,
+  };
+  const engine = new SyncEngine({
+    larkCliClient,
+    localMapStore,
+    config,
+    layoutReconstructor: new LayoutReconstructor(),
+    contentAdapter: new ContentAdapter(new ContentBackendRegistry(channelConfig)),
+  });
+  const doc = localMapStore.getDocumentByObjToken(objToken);
+  if (!doc) {
+    return { ok: false, status: 'source_not_found', message: `文档不存在：${objToken}` };
+  }
+  const result = await engine.syncDocuments(
+    [{
+      objToken,
+      objType: (doc.objType ?? 'docx') as 'docx',
+      title: doc.title ?? '',
+      changeType: 'modified' as const,
+      cloudModifiedTime: new Date().toISOString(),
+      localSyncedTime: doc.lastSyncedAt ?? null,
+      localMdPath: doc.localMdPath ?? null,
+      wikiNodeToken: doc.wikiNodeToken ?? null,
+      parentNodeToken: doc.parentNodeToken ?? null,
+      spaceId: doc.spaceId ?? null,
+      watchedRootId: doc.watchedRootId ?? null,
+      watchedRootUrl: doc.watchedRootUrl ?? null,
+      localRelPath: doc.localRelPath ?? null,
+      customFolderId: doc.customFolderId ?? null,
+    }],
+    { enableLLM: false, fullSync: false, apply: true, confirmation: 'APPLY' },
+  );
+  if (result.syncedDocuments.some((synced) => synced.objToken === objToken)) {
+    return { ok: true, status: 'synced' };
+  }
+  const failure = result.failedDocuments.find((failed) => failed.objToken === objToken);
+  return {
+    ok: false,
+    status: failure?.reasonCode ?? 'failed',
+    message: failure?.error ?? '回拉同步未成功（可稍后手动同步该文档）',
+  };
+}
+
+/**
+ * POST /api/sources/:objToken/push/preview - 推送计划（不动 source_edits）。
+ * → SourcePushPlanDto（mode/blockedReason/appendMarkdown/bytes/cloud/conflict/warnings）。
+ */
+feishuRoutes.post('/api/sources/:objToken/push/preview', async (c) => {
+  try {
+    const service = createFeishuWriteService(c);
+    return c.json(await service.preview(c.req.param('objToken')));
+  } catch (error) {
+    if (error instanceof Error && error.message === 'dependencies_not_injected') {
+      return c.json({ error: 'dependencies_not_injected' }, 500);
+    }
+    return pushErrorResponse(c, error);
+  }
+});
+
+/**
+ * POST /api/sources/:objToken/push - 执行写回。
+ * body { allowOverwrite?, force?, confirm: 'PUSH' | 'OVERWRITE_CLOUD', actor? }
+ * → { state, mode, revisionId, pull: { ok, status, message? } }。
+ * confirm 门（§7.4）：append 且无 force → 'PUSH'；overwrite 或 force →
+ * 'OVERWRITE_CLOUD'。
+ */
+feishuRoutes.post('/api/sources/:objToken/push', async (c) => {
+  let body: Record<string, unknown>;
+  try {
+    body = await c.req.json<Record<string, unknown>>();
+  } catch {
+    return c.json({ error: 'invalid_json', message: '写回请求必须是 JSON 对象' }, 400);
+  }
+  if (body.confirm !== 'PUSH' && body.confirm !== 'OVERWRITE_CLOUD') {
+    return c.json(
+      {
+        error: 'confirmation_required',
+        message: '写回飞书需要 confirm: "PUSH"（追加）或 "OVERWRITE_CLOUD"（覆盖/强制）',
+      },
+      400,
+    );
+  }
+  try {
+    const service = createFeishuWriteService(c);
+    const actor: SourceEditActor = body.actor === 'cli' || body.actor === 'agent' ? body.actor : 'ui';
+    const result = await service.push(c.req.param('objToken'), {
+      allowOverwrite: body.allowOverwrite === true,
+      force: body.force === true,
+      confirm: body.confirm,
+      actor,
+    });
+    return c.json(result);
+  } catch (error) {
+    if (error instanceof Error && error.message === 'dependencies_not_injected') {
+      return c.json({ error: 'dependencies_not_injected' }, 500);
+    }
+    return pushErrorResponse(c, error);
   }
 });
 

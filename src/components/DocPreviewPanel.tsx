@@ -14,7 +14,7 @@
  *   3. 有内容 → 正常渲染；MD 缺失但有 CSV 时自动切到 CSV 页签
  */
 
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   FileText,
   Table,
@@ -29,6 +29,7 @@ import { Card } from './common/Card';
 import { MarkdownView, resolveMediaPath } from './preview/MarkdownView';
 import { CsvTableView } from './preview/CsvTableView';
 import { WorkbookView } from './preview/WorkbookView';
+import { SourceEditControls } from './SourceEditControls';
 import { getDocumentContent } from '../api/client';
 import { appLogger } from '../utils/appLogger';
 import { useToast } from './common/Toast';
@@ -103,20 +104,16 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
     onOpenFolder?.(node.local_path);
   };
 
-  useEffect(() => {
-    if (!objToken) {
-      setContent(null);
-      setError(null);
-      return;
-    }
-    let cancelled = false;
+  // 内容加载（objToken/同步时间变化与编辑/放弃/写回后重载共用同一入口）。
+  const loadContent = useCallback((token: string) => {
     setLoading(true);
     setError(null);
     setContent(null);
     setFormatTab('md');
     setMdMode('rendered');
     setCsvIndex(0);
-    getDocumentContent(objToken)
+    let cancelled = false;
+    getDocumentContent(token)
       .then((data) => {
         if (cancelled) return;
         setContent(data);
@@ -137,7 +134,16 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
     return () => {
       cancelled = true;
     };
-  }, [objToken, node?.last_synced_at]);
+  }, []);
+
+  useEffect(() => {
+    if (!objToken) {
+      setContent(null);
+      setError(null);
+      return;
+    }
+    return loadContent(objToken);
+  }, [objToken, node?.last_synced_at, loadContent]);
 
   const TypeIcon = node ? (TYPE_ICON[node.obj_type] ?? FileType) : FileText;
   const hasMd = content?.mdContent != null;
@@ -277,6 +283,18 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
             <FolderOpen className="w-3 h-3" />
             <span className="hidden xl:inline">打开</span>
           </button>
+
+          {/* S13 源编辑/写回入口：仅 docx 且有本地 md 时渲染（sheet/slides
+              为导出投影不支持受控编辑；未同步无正文可编辑） */}
+          {objToken && node.obj_type === 'docx' && content?.mdContent != null && !loading && !error && (
+            <SourceEditControls
+              objToken={objToken}
+              objType={node.obj_type}
+              mdContent={content.mdContent}
+              mdTruncated={content.mdTruncated}
+              onContentChanged={() => objToken && loadContent(objToken)}
+            />
+          )}
         </div>
 
         {/* 格式页签：MD / CSV（下划线常驻渲染 + scaleX 过渡，与 TopBar 一致） */}

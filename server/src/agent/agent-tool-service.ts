@@ -19,16 +19,43 @@ import {
   removeFileInside,
   resolveInside,
 } from './path-guard.js';
-import { getToolSpec, getToolSpecs } from './tool-specs.js';
+import {
+  KB_DELETE_DOC_SPEC,
+  KB_FINISH_SPEC,
+  KB_READ_SPEC,
+  KB_SEARCH_SPEC,
+  KB_UNIT_DONE_SPEC,
+  KB_WRITE_DOC_SPEC,
+  DRAFT_LIST_SPEC,
+  DRAFT_READ_SPEC,
+  DRAFT_SEARCH_SPEC,
+  RAW_LIST_SPEC,
+  RAW_READ_IMAGE_SPEC,
+  RAW_READ_SPEC,
+  RAW_SEARCH_SPEC,
+  WS_EDIT_SPEC,
+  WS_LS_SPEC,
+  WS_MKDIR_SPEC,
+  WS_READ_SPEC,
+  WS_SEARCH_SPEC,
+  WS_WRITE_SPEC,
+} from './tool-specs.js';
+import { TASK_TOOL_FAMILY_NAME } from './tool-specs.js';
 import { RawSourceSnapshot, collectSourceCandidates } from '../kb/raw-source-snapshot.js';
 import { StandardKbStore, stripStdHeader } from '../kb/standard-kb-store.js';
+import { hashImageFile, inlineImageBlocks, resolveSourceImages, type ImageDescriptionLike } from '../kb/source-images.js';
+import type { PathClaims } from '../kb/path-claims.js';
+import type { BuildUnit } from '../kb/build-units.js';
+import type { ImageDescription } from './vision/vision-describer.js';
 import { matchGlob } from '../kb/kb-search.js';
 import { hasEditorialHistory, hasSourceMetadata } from '../kb/body-policy.js';
 import type {
   AgentRunContext,
+  AgentRunKind,
   AgentToolSpec,
   RawSourceSnapshotEntry,
 } from '../types/agent-knowledge.js';
+import { toolsForRunKind } from '../types/agent-knowledge.js';
 import type { DocumentRecord } from '../types/index.js';
 
 export interface ToolResult {
@@ -66,6 +93,19 @@ export interface BuildRunState {
    * 检查——模型不得用 skip/finish 绕过，构建必须以同码失败终止。
    */
   poisoned?: { code: string; message: string };
+  /**
+   * S4（§4.4）：并行构建共享状态。所有 worker 共享同一 BuildRunState；
+   * units/unitDone/claims 由 KbBuildService 在 running 前初始化。
+   */
+  units?: BuildUnit[];
+  /** 逐单元完成上报（kb_unit_done；重复调用以最后一次为准） */
+  unitDone?: Map<string, { summary: string; skipped: Array<{ objToken: string; reason: string }> }>;
+  /** 构建内路径认领：worker 上下文写工具先 claim，收尾轮不受限 */
+  claims?: PathClaims;
+  /** S3：preflight 图片描述（objToken → src → 描述/不可用标记） */
+  imageDescriptions?: Map<string, Map<string, ImageDescription>>;
+  /** S3：本次构建 vision 是否就绪（未就绪时图片处插 unavailable 标记，U5） */
+  visionReady?: boolean;
 }
 
 export interface RunContextOptions {
@@ -79,14 +119,68 @@ export interface RunContextOptions {
   knowledgeBaseRoot: string;
   buildState?: BuildRunState;
   onEvent?: (event: { phase: 'start' | 'end'; toolName: string; argsSummary: string; resultSummary?: string; isError?: boolean }) => void;
+  /**
+   * S6：显式覆盖白名单（子任务冻结工具集 = 角色请求 ∩ 父会话模式工具集
+   * ∩ 已知工具，由 TaskService 冻结后传入）。仅保留已知工具，并剔除
+   * task_* 与 app_command（depth=1 子任务防递归/防自我提权）。
+   */
+  allowedToolsOverride?: readonly string[];
+  /** S6：按族名从 runKind 派生白名单中剔除（编排关闭的会话不下发 task_*）。 */
+  disableToolFamilies?: readonly string[];
+  /**
+   * S4（§4.4）：构建 worker 运行上下文。unit 轮受路径认领与 kb_finish 禁用
+   * 约束；final 轮（收尾）不受认领限制、调用 kb_finish。
+   */
+  worker?: BuildWorkerInfo;
 }
 
-interface InternalRunContext extends AgentRunContext {
+/** S4：构建进程的 worker 身份（runKind=build 时存在）。 */
+export interface BuildWorkerInfo {
+  workerId: string;
+  unitId: string | null;
+  phase: 'unit' | 'final';
+}
+
+export interface InternalRunContext extends AgentRunContext {
   options: RunContextOptions;
+}
+
+/** 工具族内单个工具的注册项（S1 工具族注册模型）。 */
+export interface AgentToolFamilyTool {
+  /** 工具规格。tool-specs.ts 仍是唯一定义源：族只引用 SPEC 常量，不复制。 */
+  spec: AgentToolSpec;
+  /** 哪些 runKind 可见本工具（决定 createRunContext 白名单成员）。 */
+  runKinds: ReadonlyArray<AgentRunKind>;
+  /** 执行器：与重构前 dispatch 分支同一实现，同一错误码与错误消息。 */
+  execute: (context: InternalRunContext, args: Record<string, unknown>) => Promise<ToolResult> | ToolResult;
+}
+
+/**
+ * 工具族：一族相关工具的注册单元。S1 把散置的白名单/dispatch/规格收敛
+ * 为族注册；后续切片（S3 raw_read_image、S6 task_*、S10 app_command）
+ * 只 registerToolFamily() 追加新族（或新增族文件后一行登记），不再改
+ * executeTool 主体。
+ */
+export interface AgentToolFamily {
+  name: string;
+  tools: AgentToolFamilyTool[];
 }
 
 export interface SheetCsvPathResolver {
   (objToken: string): string[];
+}
+
+/**
+ * S3：会话侧图片理解支持（结构化接口，VisionDescriber 天然满足）。
+ * raw_read 内联已缓存描述；raw_read_image 按需描述。未注入时会话侧
+ * 不做内联、raw_read_image 报 vision_unconfigured。S4 构建侧另需
+ * describeMany（preflight 预描述）。
+ */
+export interface VisionDescriberLike {
+  status(): Promise<{ state: 'disabled' | 'ready' | 'invalid'; model: string | null; message: string }>;
+  lookup(imageHash: string): Promise<string | null>;
+  describeOne(file: string, src: string, signal?: AbortSignal): Promise<ImageDescription>;
+  describeMany(items: Array<{ file: string; src: string }>, opts: { signal: AbortSignal; onProgress: (p: { done: number; total: number }) => void }): Promise<Map<string, ImageDescription>>;
 }
 
 export class AgentToolService {
@@ -97,17 +191,121 @@ export class AgentToolService {
   private readonly dataRoot: string;
   /** F3-R02：Workspace 动态守卫（当前配置快照）；未注入时不做动态复核 */
   private readonly workspaceGuard?: (workspaceRoot: string) => { ok: true } | { ok: false; code: string; message: string };
+  /** S3：会话侧图片理解（raw_read 内联已缓存描述 + raw_read_image 按需描述） */
+  private readonly visionDescriber?: VisionDescriberLike;
+  /** S1 工具族注册表：族名 → 族定义；工具名 → 族内工具项（注册序）。 */
+  private readonly toolFamilies = new Map<string, AgentToolFamily>();
+  private readonly familyTools = new Map<string, AgentToolFamilyTool>();
 
   constructor(input: {
     dataRoot: string;
     documentsProvider: () => DocumentRecord[];
     sheetCsvPaths?: SheetCsvPathResolver;
     workspaceGuard?: (workspaceRoot: string) => { ok: true } | { ok: false; code: string; message: string };
+    visionDescriber?: VisionDescriberLike;
   }) {
     this.dataRoot = input.dataRoot;
     this.documentsProvider = input.documentsProvider;
     this.sheetCsvPaths = input.sheetCsvPaths ?? (() => []);
     this.workspaceGuard = input.workspaceGuard;
+    this.visionDescriber = input.visionDescriber;
+    this.registerBuiltinFamilies();
+  }
+
+  /**
+   * S1 工具族注册：登记一族工具的「规格 + runKind 白名单成员 + 执行器」。
+   * 白名单成员与 dispatch 全部由此派生；重复族名/重复工具名直接抛错
+   * （注册期错误 fail fast）。
+   */
+  registerToolFamily(family: AgentToolFamily): void {
+    if (this.toolFamilies.has(family.name)) {
+      throw new Error(`工具族已注册: ${family.name}`);
+    }
+    const duplicate = family.tools.find((tool) => this.familyTools.has(tool.spec.name));
+    if (duplicate) {
+      throw new Error(`工具已注册于其他工具族: ${duplicate.spec.name}`);
+    }
+    this.toolFamilies.set(family.name, family);
+    for (const tool of family.tools) {
+      this.familyTools.set(tool.spec.name, tool);
+    }
+  }
+
+  /** 已注册工具族名（注册序；供诊断与测试）。 */
+  registeredFamilies(): string[] {
+    return [...this.toolFamilies.keys()];
+  }
+
+  /**
+   * 从工具族注册表推导 runKind 白名单：成员 = 各族工具 runKinds 命中集；
+   * 顺序 = 基线 toolsForRunKind 冻结顺序在前（既有行为逐字不变），新增
+   * 族工具按注册顺序追加其后。
+   */
+  private allowedToolsForRunKind(runKind: AgentRunKind): string[] {
+    const members = new Set<string>();
+    for (const tool of this.familyTools.values()) {
+      if (tool.runKinds.includes(runKind)) members.add(tool.spec.name);
+    }
+    const ordered: string[] = [];
+    for (const name of toolsForRunKind(runKind)) {
+      if (members.delete(name)) ordered.push(name);
+    }
+    for (const name of members) ordered.push(name);
+    return ordered;
+  }
+
+  /**
+   * 内置四族（raw/kb/draft/ws）——执行器与重构前 dispatch 分支一一对应
+   * （同一方法、同一错误码与消息），仅搬运注册位置，不改语义。
+   * 后续切片新增族：新建 tools/<name>-family.ts 导出 AgentToolFamily，
+   * 再在本方法末尾追加一行 registerToolFamily。
+   */
+  private registerBuiltinFamilies(): void {
+    // raw_*：原始库（build 态走快照校验；discuss/work 态直读）
+    this.registerToolFamily({
+      name: 'raw',
+      tools: [
+        { spec: RAW_LIST_SPEC, runKinds: ['build'], execute: (context, args) => this.toolRawList(context, args) },
+        { spec: RAW_READ_SPEC, runKinds: ['build', 'work', 'discuss'], execute: (context, args) => this.toolRawRead(context, args) },
+        { spec: RAW_SEARCH_SPEC, runKinds: ['build', 'work', 'discuss'], execute: (context, args) => this.toolRawSearch(context, args) },
+        // S3（§3.5）：会话侧按需识图（build 不下发——构建链在 preflight 预描述）
+        { spec: RAW_READ_IMAGE_SPEC, runKinds: ['work', 'discuss'], execute: (context, args) => this.toolRawReadImage(context, args) },
+      ],
+    });
+    // kb_*：标准库读（work/discuss）+ 构建草稿写（build）
+    this.registerToolFamily({
+      name: 'kb',
+      tools: [
+        { spec: KB_SEARCH_SPEC, runKinds: ['work', 'discuss'], execute: (context, args) => this.toolKbSearch(context, args) },
+        { spec: KB_READ_SPEC, runKinds: ['work', 'discuss'], execute: (context, args) => this.toolKbRead(context, args) },
+        { spec: KB_WRITE_DOC_SPEC, runKinds: ['build'], execute: (context, args) => this.toolKbWriteDoc(context, args) },
+        { spec: KB_DELETE_DOC_SPEC, runKinds: ['build'], execute: (context, args) => this.toolKbDeleteDoc(context, args) },
+        // S4（§4.4）：逐单元上报；kb_finish 保持单值、只在收尾轮可用
+        { spec: KB_UNIT_DONE_SPEC, runKinds: ['build'], execute: (context, args) => this.toolKbUnitDone(context, args) },
+        { spec: KB_FINISH_SPEC, runKinds: ['build'], execute: (context, args) => this.toolKbFinish(context, args) },
+      ],
+    });
+    // draft_*：构建 staging 读
+    this.registerToolFamily({
+      name: 'draft',
+      tools: [
+        { spec: DRAFT_LIST_SPEC, runKinds: ['build'], execute: (context) => this.toolDraftList(context) },
+        { spec: DRAFT_READ_SPEC, runKinds: ['build'], execute: (context, args) => this.toolDraftRead(context, args) },
+        { spec: DRAFT_SEARCH_SPEC, runKinds: ['build'], execute: (context, args) => this.toolDraftSearch(context, args) },
+      ],
+    });
+    // ws_*：Workspace 文件工具（work）
+    this.registerToolFamily({
+      name: 'ws',
+      tools: [
+        { spec: WS_LS_SPEC, runKinds: ['work'], execute: (context, args) => this.toolWsLs(context, args) },
+        { spec: WS_READ_SPEC, runKinds: ['work'], execute: (context, args) => this.toolWsRead(context, args) },
+        { spec: WS_SEARCH_SPEC, runKinds: ['work'], execute: (context, args) => this.toolWsSearch(context, args) },
+        { spec: WS_WRITE_SPEC, runKinds: ['work'], execute: (context, args) => this.toolWsWrite(context, args) },
+        { spec: WS_EDIT_SPEC, runKinds: ['work'], execute: (context, args) => this.toolWsEdit(context, args) },
+        { spec: WS_MKDIR_SPEC, runKinds: ['work'], execute: (context, args) => this.toolWsMkdir(context, args) },
+      ],
+    });
   }
 
   private storeFor(outputRoot: string): StandardKbStore {
@@ -119,16 +317,38 @@ export class AgentToolService {
     return store;
   }
 
+  /** 已注册工具名（注册序；S6 工具交集计算的「已知工具」面）。 */
+  registeredToolNames(): string[] {
+    return [...this.familyTools.keys()];
+  }
+
+  /**
+   * 白名单推导（S6 扩展）：基线 = 族注册表按 runKind 派生；
+   * disableToolFamilies → 按族剔除；allowedToolsOverride → 显式覆盖
+   * （仅已知工具，且永不含 task_* 与 app_command——子任务 depth=1 防御）。
+   */
+  private computeAllowedTools(options: RunContextOptions): string[] {
+    let allowed = this.allowedToolsForRunKind(options.runKind);
+    if (options.disableToolFamilies && options.disableToolFamilies.length > 0) {
+      const excluded = new Set<string>();
+      for (const familyName of options.disableToolFamilies) {
+        for (const tool of this.toolFamilies.get(familyName)?.tools ?? []) excluded.add(tool.spec.name);
+      }
+      allowed = allowed.filter((name) => !excluded.has(name));
+    }
+    if (options.allowedToolsOverride) {
+      const childBanned = new Set<string>(['app_command']);
+      for (const tool of this.toolFamilies.get(TASK_TOOL_FAMILY_NAME)?.tools ?? []) childBanned.add(tool.spec.name);
+      const known = new Set(this.familyTools.keys());
+      allowed = [...new Set(options.allowedToolsOverride)].filter((name) => known.has(name) && !childBanned.has(name));
+    }
+    return allowed;
+  }
+
   /** 创建运行上下文（发新令牌）。进程每次启动调用一次。 */
   createRunContext(options: RunContextOptions): { token: string; context: AgentRunContext } {
     const token = crypto.randomBytes(32).toString('base64url');
-    const allowedTools = options.runKind === 'build'
-      ? ['raw_list', 'raw_read', 'raw_search', 'draft_list', 'draft_read', 'draft_search', 'kb_write_doc', 'kb_delete_doc', 'kb_finish']
-      : options.runKind === 'work'
-        ? ['kb_search', 'kb_read', 'raw_search', 'raw_read', 'ws_ls', 'ws_read', 'ws_search', 'ws_write', 'ws_edit', 'ws_mkdir']
-        : options.runKind === 'discuss'
-          ? ['kb_search', 'kb_read', 'raw_search', 'raw_read']
-          : [];
+    const allowedTools = this.computeAllowedTools(options);
     const context: InternalRunContext = {
       runKind: options.runKind,
       sessionId: options.sessionId,
@@ -164,11 +384,13 @@ export class AgentToolService {
     return this.contexts.get(token) ?? null;
   }
 
-  /** GET /tools：返回本运行允许的工具规格。 */
+  /** GET /tools：返回本运行允许的工具规格（族注册表派生，顺序同白名单）。 */
   getToolSpecsForToken(token: string): AgentToolSpec[] | null {
     const context = this.contexts.get(token);
     if (!context) return null;
-    return getToolSpecs(context.allowedTools);
+    return context.allowedTools
+      .map((name) => this.familyTools.get(name)?.spec)
+      .filter((spec): spec is AgentToolSpec => Boolean(spec));
   }
 
   /** POST /tools/:name 执行入口。 */
@@ -180,14 +402,14 @@ export class AgentToolService {
     if (!context.allowedTools.includes(toolName)) {
       throw new ToolError('tool_not_allowed', `工具 ${toolName} 不在本运行的工具白名单内（runKind=${context.runKind}）`, 403);
     }
-    const spec = getToolSpec(toolName);
-    if (!spec) {
+    const tool = this.familyTools.get(toolName);
+    if (!tool || typeof tool.execute !== 'function') {
       throw new ToolError('tool_not_allowed', `未知工具: ${toolName}`, 403);
     }
     const argsSummary = summarizeArgs(toolName, args);
     context.options.onEvent?.({ phase: 'start', toolName, argsSummary });
     try {
-      const result = await this.dispatch(context, toolName, args);
+      const result = await tool.execute(context, args);
       const resultSummary = summarizeResult(result);
       context.options.onEvent?.({ phase: 'end', toolName, argsSummary, resultSummary, isError: false });
       return result;
@@ -201,47 +423,6 @@ export class AgentToolService {
         isError: true,
       });
       throw error;
-    }
-  }
-
-  private async dispatch(context: InternalRunContext, toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
-    switch (toolName) {
-      case 'kb_search':
-        return this.toolKbSearch(context, args);
-      case 'kb_read':
-        return this.toolKbRead(context, args);
-      case 'raw_search':
-        return this.toolRawSearch(context, args);
-      case 'raw_read':
-        return this.toolRawRead(context, args);
-      case 'raw_list':
-        return this.toolRawList(context, args);
-      case 'draft_list':
-        return this.toolDraftList(context);
-      case 'draft_read':
-        return this.toolDraftRead(context, args);
-      case 'draft_search':
-        return this.toolDraftSearch(context, args);
-      case 'kb_write_doc':
-        return this.toolKbWriteDoc(context, args);
-      case 'kb_delete_doc':
-        return this.toolKbDeleteDoc(context, args);
-      case 'kb_finish':
-        return this.toolKbFinish(context, args);
-      case 'ws_ls':
-        return this.toolWsLs(context, args);
-      case 'ws_read':
-        return this.toolWsRead(context, args);
-      case 'ws_search':
-        return this.toolWsSearch(context, args);
-      case 'ws_write':
-        return this.toolWsWrite(context, args);
-      case 'ws_edit':
-        return this.toolWsEdit(context, args);
-      case 'ws_mkdir':
-        return this.toolWsMkdir(context, args);
-      default:
-        throw new ToolError('tool_not_allowed', `工具未实现: ${toolName}`, 403);
     }
   }
 
@@ -409,7 +590,7 @@ export class AgentToolService {
     return content;
   }
 
-  private toolRawRead(context: InternalRunContext, args: Record<string, unknown>): ToolResult {
+  private async toolRawRead(context: InternalRunContext, args: Record<string, unknown>): Promise<ToolResult> {
     const objToken = requireString(args, 'objToken', 1, 256);
     const offset = optionalInt(args, 'offset', 0, 0, 10_000_000);
     const limit = optionalInt(args, 'limit', 800, 1, 2000);
@@ -419,7 +600,12 @@ export class AgentToolService {
     if (!entry) {
       throw new ToolError('not_found', `原始文档不存在或无成功本地版本: ${objToken}`, 404);
     }
-    const content = this.readRawContent(context, objToken);
+    let content = this.readRawContent(context, objToken);
+    // S3（§3.4/§3.5）：图片引用处内联描述——build 用 preflight 预描述结果；
+    // 会话只内联已缓存描述（未缓存标 not_described）；描述同属不可信数据。
+    content = context.options.buildState
+      ? this.inlineBuildImageDescriptions(context.options.buildState, entry, content)
+      : await this.inlineSessionImageDescriptions(context, entry, content);
     const lines = content.split('\n');
     const slice = lines.slice(offset, offset + limit);
     const wrapped = `<untrusted_source obj_token="${entry.objToken}" title="${escapeXml(entry.title)}">\n${slice.join('\n')}\n</untrusted_source>`;
@@ -436,6 +622,82 @@ export class AgentToolService {
     };
   }
 
+  /** S3（§3.4）：build 态内联——预描述命中给文本，否则 unavailable 标记。 */
+  private inlineBuildImageDescriptions(
+    state: BuildRunState,
+    entry: RawSourceSnapshotEntry,
+    content: string,
+  ): string {
+    const images = resolveSourceImages(state.knowledgeBaseRoot, entry.relPath, content);
+    if (images.length === 0) return content;
+    const described = state.imageDescriptions?.get(entry.objToken);
+    const fallbackReason = state.visionReady ? 'not_described' : 'vision_unconfigured';
+    return inlineImageBlocks(content, images, (src) =>
+      described?.get(src) ?? { src, state: 'unavailable', reason: fallbackReason });
+  }
+
+  /** S3（§3.5）：会话态只内联已缓存描述；vision 未就绪不插入任何标记。 */
+  private async inlineSessionImageDescriptions(
+    context: InternalRunContext,
+    entry: RawSourceSnapshotEntry,
+    content: string,
+  ): Promise<string> {
+    if (!this.visionDescriber || !context.options.knowledgeBaseRoot) return content;
+    const status = await this.visionDescriber.status();
+    if (status.state !== 'ready') return content;
+    const images = resolveSourceImages(context.options.knowledgeBaseRoot, entry.relPath, content);
+    if (images.length === 0) return content;
+    const bySrc = new Map<string, ImageDescriptionLike>();
+    for (const image of images) {
+      const hash = hashImageFile(image.file);
+      if (!hash) {
+        bySrc.set(image.src, { src: image.src, state: 'unavailable', reason: 'missing_file' });
+        continue;
+      }
+      const text = await this.visionDescriber.lookup(hash);
+      bySrc.set(image.src, text != null
+        ? { src: image.src, state: 'cached', text }
+        : { src: image.src, state: 'unavailable', reason: 'not_described' });
+    }
+    return inlineImageBlocks(content, images, (src) => bySrc.get(src));
+  }
+
+  /** S3（§3.5）：会话侧按需识图。src 必须属于该源的本地图片引用。 */
+  private async toolRawReadImage(context: InternalRunContext, args: Record<string, unknown>): Promise<ToolResult> {
+    const objToken = requireString(args, 'objToken', 1, 256);
+    const src = requireString(args, 'src', 1, 400);
+    if (!this.visionDescriber) {
+      throw new ToolError('vision_unconfigured', '图片理解未启用（请在设置中配置图片理解模型）', 400);
+    }
+    const status = await this.visionDescriber.status();
+    if (status.state !== 'ready') {
+      throw new ToolError('vision_unconfigured', `图片理解未就绪：${status.message || status.state}`, 400);
+    }
+    const entry = context.options.buildState
+      ? context.options.buildState.snapshot.get(objToken)
+      : this.rawEntriesForDiscuss(context).find((candidate) => candidate.objToken === objToken) ?? null;
+    if (!entry || !context.options.knowledgeBaseRoot) {
+      throw new ToolError('not_found', `原始文档不存在或无成功本地版本: ${objToken}`, 404);
+    }
+    const content = this.readRawContent(context, objToken);
+    const images = resolveSourceImages(context.options.knowledgeBaseRoot, entry.relPath, content);
+    const image = images.find((candidate) => candidate.src === src);
+    if (!image) {
+      throw new ToolError('invalid_request', `src 不属于该源文档的本地图片引用: ${src}`, 400);
+    }
+    const description = await this.visionDescriber.describeOne(image.file, image.src);
+    if (description.state === 'unavailable') {
+      throw new ToolError(description.reason ?? 'vision_failed', `图片描述不可用：${description.message ?? description.reason ?? ''}`.trim(), 502);
+    }
+    return {
+      content: [{
+        type: 'text',
+        text: `<untrusted_image_description obj_token="${escapeXml(objToken)}" src="${escapeXml(src)}">\n${description.text ?? ''}\n</untrusted_image_description>`,
+      }],
+      details: { objToken, src, state: description.state },
+    };
+  }
+
   private toolRawList(context: InternalRunContext, args: Record<string, unknown>): ToolResult {
     if (!context.options.buildState) {
       throw new ToolError('tool_not_allowed', 'raw_list 仅构建运行可用', 403);
@@ -445,7 +707,13 @@ export class AgentToolService {
     const state = context.options.buildState;
     let entries = state.snapshot.entries;
     if (filter === 'workset') {
-      entries = entries.filter((entry) => state.workset.has(entry.objToken));
+      // S4（§4.4）：worker 上下文只列本单元源（跨单元源由其他 worker 处理）
+      const workerUnitId = context.options.worker?.phase === 'unit' ? context.options.worker.unitId : null;
+      const unitSources = workerUnitId
+        ? new Set(state.units?.find((unit) => unit.id === workerUnitId)?.sources ?? [])
+        : null;
+      entries = entries.filter((entry) =>
+        unitSources ? unitSources.has(entry.objToken) : state.workset.has(entry.objToken));
     }
     entries = entries.slice().sort((a, b) => a.relPath.localeCompare(b.relPath));
     let startIndex = 0;
@@ -582,6 +850,8 @@ export class AgentToolService {
       ? args.tags.filter((tag): tag is string => typeof tag === 'string').slice(0, 20)
       : [];
     validateStdDocPath(docPath);
+    // S4（§4.3）：worker 上下文先认领路径——同一路径只允许一个单元写
+    this.assertPathClaim(context, state, docPath);
 
     // docId 继承：按 path 沿用当前 release 的 docId（server 分配）
     const docId = this.inheritDocId(state, docPath) ?? `kd_${crypto.randomBytes(6).toString('hex')}`;
@@ -631,24 +901,73 @@ export class AgentToolService {
   private toolKbDeleteDoc(context: InternalRunContext, args: Record<string, unknown>): ToolResult {
     const state = requireBuildState(context);
     const docPath = requireString(args, 'path', 1, 600);
+    // S4（§4.3）：删除同样受路径认领约束；收尾轮不受限
+    this.assertPathClaim(context, state, docPath);
     removeFileInside(path.join(state.stagingRoot, 'docs'), docPath);
     return { content: [{ type: 'text', text: `已删除草稿 ${docPath}` }] };
   }
 
+  /**
+   * S4（§4.3）：单元轮的写路径必须先认领；他单元已持有 → 工具错误
+   * kb_path_owned_by_other_unit（消息含所属文档标题，提示换路径）。
+   * 收尾轮（phase='final'）与无 worker 上下文（非并行构建/单测直连）不受限。
+   */
+  private assertPathClaim(context: InternalRunContext, state: BuildRunState, docPath: string): void {
+    const worker = context.options.worker;
+    if (!state.claims || !worker || worker.phase !== 'unit' || !worker.unitId) return;
+    const verdict = state.claims.claim(docPath, worker.unitId);
+    if (verdict.ok) return;
+    const title = state.docMeta?.get(docPath)?.title ?? docPath;
+    const ownerUnit = state.units?.find((unit) => unit.id === verdict.owner);
+    const ownerHint = ownerUnit
+      ? `${verdict.owner}（源：${ownerUnit.sources.slice(0, 3).join('、')}${ownerUnit.sources.length > 3 ? '…' : ''}）`
+      : verdict.owner;
+    throw new ToolError(
+      'kb_path_owned_by_other_unit',
+      `路径 ${docPath}（文档「${title}」）由单元 ${ownerHint} 处理；请换一个路径，或留给该单元/收尾轮改写`,
+      409,
+    );
+  }
+
+  /** S4（§4.4）：逐单元上报；objToken 须属本单元；重复调用以最后一次为准。 */
+  private toolKbUnitDone(context: InternalRunContext, args: Record<string, unknown>): ToolResult {
+    const state = requireBuildState(context);
+    const worker = context.options.worker;
+    if (!worker || !worker.unitId || worker.phase !== 'unit') {
+      throw new ToolError('invalid_request', 'kb_unit_done 仅在构建单元轮可用（收尾轮请用 kb_finish）', 400);
+    }
+    const unit = state.units?.find((candidate) => candidate.id === worker.unitId) ?? null;
+    const summary = requireString(args, 'summary', 1, 2000);
+    const skipped = parseSkippedList(args.skipped);
+    for (const item of skipped) {
+      if (!unit || !unit.sources.includes(item.objToken)) {
+        throw new ToolError('invalid_request', `skipped 来源不在本单元内: ${item.objToken}`);
+      }
+    }
+    state.unitDone ??= new Map();
+    state.unitDone.set(worker.unitId, { summary, skipped });
+    return {
+      content: [{ type: 'text', text: `单元 ${worker.unitId} 标记完成：${summary.slice(0, 100)}（skipped ${skipped.length}）` }],
+      details: { unitId: worker.unitId, skipped: skipped.length },
+    };
+  }
+
   private toolKbFinish(context: InternalRunContext, args: Record<string, unknown>): ToolResult {
     const state = requireBuildState(context);
+    // S4（§4.4/U8）：kb_finish 保持单值，只在唯一收尾轮可用
+    const worker = context.options.worker;
+    if (worker && worker.phase !== 'final') {
+      throw new ToolError(
+        'kb_finish_not_allowed_in_unit',
+        '当前是单元处理轮：请先调用 kb_unit_done 结束本单元；kb_finish 只在全部单元完成后的收尾轮可用',
+        400,
+      );
+    }
     if (state.finishInfo) {
       throw new ToolError('invalid_request', 'kb_finish 已调用过');
     }
     const summary = requireString(args, 'summary', 1, 4000);
-    const skipped = Array.isArray(args.skipped)
-      ? args.skipped
-          .filter((item): item is { objToken: string; reason: string } =>
-            Boolean(item) && typeof item === 'object'
-            && typeof (item as { objToken?: unknown }).objToken === 'string'
-            && typeof (item as { reason?: unknown }).reason === 'string')
-          .map((item) => ({ objToken: item.objToken, reason: item.reason.slice(0, 300) }))
-      : [];
+    const skipped = parseSkippedList(args.skipped);
     for (const item of skipped) {
       if (!state.snapshot.has(item.objToken)) {
         throw new ToolError('invalid_request', `skipped 来源不在快照内: ${item.objToken}`);
@@ -825,6 +1144,17 @@ function requireBuildState(context: InternalRunContext): BuildRunState {
   return context.options.buildState;
 }
 
+/** kb_unit_done / kb_finish 共用的 skipped 参数解析（非法项丢弃，reason 截断）。 */
+function parseSkippedList(value: unknown): Array<{ objToken: string; reason: string }> {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((item): item is { objToken: string; reason: string } =>
+      Boolean(item) && typeof item === 'object'
+      && typeof (item as { objToken?: unknown }).objToken === 'string'
+      && typeof (item as { reason?: unknown }).reason === 'string')
+    .map((item) => ({ objToken: item.objToken, reason: item.reason.slice(0, 300) }));
+}
+
 function requireString(args: Record<string, unknown>, key: string, min: number, max: number): string {
   const value = args[key];
   if (typeof value !== 'string') {
@@ -885,6 +1215,10 @@ function summarizeArgs(toolName: string, args: Record<string, unknown>): string 
       return `path=${String(args.path ?? '')}`;
     case 'raw_read':
       return `objToken=${String(args.objToken ?? '')}`;
+    case 'raw_read_image':
+      return `objToken=${String(args.objToken ?? '')} src=${String(args.src ?? '')}`;
+    case 'kb_unit_done':
+      return `summary=${String(args.summary ?? '').slice(0, 60)} skipped=${Array.isArray(args.skipped) ? args.skipped.length : 0}`;
     case 'kb_read':
       return `docId=${String(args.docId ?? args.path ?? '')}`;
     case 'kb_search':
@@ -892,6 +1226,8 @@ function summarizeArgs(toolName: string, args: Record<string, unknown>): string 
     case 'draft_search':
     case 'ws_search':
       return `query=${String(args.query ?? '').slice(0, 60)}`;
+    case 'app_command':
+      return `${String(args.command ?? '')}${args.args && typeof args.args === 'object' ? ` ${JSON.stringify(args.args).slice(0, 120)}` : ''}`;
     default:
       return Object.keys(args).slice(0, 3).join(',');
   }

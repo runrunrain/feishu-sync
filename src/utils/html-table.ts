@@ -133,7 +133,10 @@ function parseTrSection(html: string): HtmlTableRow[] {
     for (const cm of cellMatches) {
       const tag = cm[1].toLowerCase() as 'th' | 'td';
       const attrStr = cm[2] || '';
-      const content = cm[3].trim();
+      // D17：嵌套表格的内部结构标签不再作为字面文本泄漏——剥壳保留文字
+      const content = cm[3]
+        .trim()
+        .replace(/<\/?(?:table|tbody|thead|tfoot|tr|th|td|colgroup|col|caption)\b[^>]*>/gi, '');
 
       // colspan
       const colspanM = attrStr.match(/\bcolspan=["']?(\d+)["']?/i);
@@ -272,30 +275,43 @@ export function parseHtmlTable(rawHtml: string): HtmlTableBlock | null {
  * 识别文本中包含的所有块级 <table>...</table> 片段，
  * 切分为文本段与 HtmlTableBlock 结构列表。
  * 纯函数，独立于 DOM 环境，单元可测。
- */
+ *
+ * D17（2026-10 T2a-r）：改用 <table> 开/闭标签深度计数匹配，嵌套表格
+ * 不再被非贪婪正则在首个 </table> 截断（旧实现外层残片泄漏为正文）；
+ * 未闭合的孤立 <table> 保持旧行为（随文本段流出）。 */
 export function extractHtmlTableBlocks(text: string): HtmlTableSegment[] {
   const segments: HtmlTableSegment[] = [];
   if (!text) return segments;
 
-  const tableRe = /<table\b[\s\S]*?<\/table>/gi;
+  const tagRe = /<table\b[^>]*>|<\/table\s*>/gi;
+  let depth = 0;
+  let tableStart = -1;
   let lastIndex = 0;
   let match: RegExpExecArray | null;
 
-  while ((match = tableRe.exec(text)) !== null) {
-    const before = text.slice(lastIndex, match.index);
-    if (before.length > 0) {
-      segments.push({ type: 'text', content: before });
+  while ((match = tagRe.exec(text)) !== null) {
+    const isClose = match[0].startsWith('</');
+    if (!isClose) {
+      if (depth === 0) tableStart = match.index;
+      depth++;
+    } else if (depth > 0) {
+      depth--;
+      if (depth === 0 && tableStart >= 0) {
+        const before = text.slice(lastIndex, tableStart);
+        if (before.length > 0) {
+          segments.push({ type: 'text', content: before });
+        }
+        const rawTable = text.slice(tableStart, match.index + match[0].length);
+        const block = parseHtmlTable(rawTable);
+        if (block) {
+          segments.push({ type: 'table', raw: rawTable, block });
+        } else {
+          segments.push({ type: 'text', content: rawTable });
+        }
+        lastIndex = match.index + match[0].length;
+      }
     }
-
-    const rawTable = match[0];
-    const block = parseHtmlTable(rawTable);
-    if (block) {
-      segments.push({ type: 'table', raw: rawTable, block });
-    } else {
-      segments.push({ type: 'text', content: rawTable });
-    }
-
-    lastIndex = match.index + rawTable.length;
+    // 孤立 </table>（depth===0）随文本段流出，不改变分段
   }
 
   const remainder = text.slice(lastIndex);

@@ -8,6 +8,7 @@ import { localPathState } from '../modules/local-path-state.js';
 import { ScanPolicy } from '../modules/scan-policy.js';
 import type { LocalMapStore } from '../modules/local-map-store.js';
 import { managedWorkbookCompanions } from '../modules/workbook-source.js';
+import { pendingLocalEditTokens } from '../sources/source-edit-service.js';
 
 export function prepareSourceCleanup(store: LocalMapStore, root: string, sources: Array<{ objToken: string; relPath: string }>, options: { allowMissing?: boolean; commit?: () => void } = {}) {
   const rootReal = resolveRootReal(root);
@@ -17,6 +18,14 @@ export function prepareSourceCleanup(store: LocalMapStore, root: string, sources
     if (!record || record.cloudDeleted || (record.localRelPath || record.localMdPath) !== source.relPath) throw new ToolError('source_selection_changed', '源文档已变化，请刷新后重新选择', 409);
     return record;
   });
+  // S11 守卫（设计 §7.3/§9.1-1a）：存在未写回本地修改（source_edits 非
+  // pushed）的源拒绝清理/移动——本接口是全部源清理调用方（kb routes /
+  // manual-delete / source-batch）的公共咽喉。store 无该方法（旧替身）时
+  // 静默放行，保持既有行为。
+  const pendingEdits = pendingLocalEditTokens(store as any, selected.map((doc) => doc.objToken));
+  if (pendingEdits.length > 0) {
+    throw new ToolError('local_edit_pending', `存在未写回的本地修改（${pendingEdits.join(', ')}），请先写回飞书或放弃修改`, 409);
+  }
   const files = new Map<string, string>();
   const relativePath = (input: string) => {
     let rel = path.isAbsolute(input) ? path.relative(path.resolve(root), input) : input;

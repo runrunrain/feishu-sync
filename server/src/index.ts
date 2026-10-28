@@ -29,6 +29,9 @@ import { LocalMapStore } from './modules/local-map-store.js';
 import { ChangeDetector } from './modules/change-detector.js';
 import { authMiddleware } from './middleware/auth.js';
 import { corsMiddleware } from './middleware/cors.js';
+import { CliEndpoint } from './cli-endpoint.js';
+import { cliRoutes } from './routes/cli.js';
+import { cliAdminRoutes } from './routes/cli-admin.js';
 import { healthRoutes } from './routes/health.js';
 import { configRoutes } from './routes/config.js';
 import { detectRoutes } from './routes/detect.js';
@@ -39,14 +42,22 @@ import { contentRoutes } from './routes/content.js';
 import { trashRoutes } from './routes/trash.js';
 import { customFolderRoutes } from './routes/custom-folders.js';
 import { orphanFilesRoutes } from './routes/orphan-files.js';
+import { sourcesRoutes } from './routes/sources.js';
 import { llmRoutes } from './routes/llm.js';
 import { agentInternalRoutes } from './routes/agent-internal.js';
+import { VisionDescriber } from './agent/vision/vision-describer.js';
 import { agentRoutes } from './routes/agent.js';
 import { kbRoutes } from './routes/kb.js';
 import { PiRuntimeResolver } from './agent/runtime-resolver.js';
 import { AgentProcessPool } from './agent/agent-process-pool.js';
 import { AgentToolService } from './agent/agent-tool-service.js';
 import { SessionService } from './agent/session-service.js';
+import { RoleRegistry } from './agent/tasks/role-registry.js';
+import { TaskService } from './agent/tasks/task-service.js';
+import { taskToolFamily } from './agent/tasks/task-tools.js';
+import { TASK_TOOL_FAMILY_NAME, TASK_TOOL_NAMES } from './agent/tool-specs.js';
+import { ApprovalService } from './agent/approvals/approval-service.js';
+import { createOpsToolFamily } from './agent/tools/app-command-family.js';
 import { KbBuildService } from './kb/kb-build-service.js';
 import { piExtensionPath, readAgentPromptAssets } from './agent/agent-assets.js';
 import { checkRootOverlap, type WorkspaceRootGuards } from './agent/path-guard.js';
@@ -158,6 +169,13 @@ export async function buildServer(options: CreateServerOptions = {}) {
   localMapStore.initialize();
   console.info('[server] Database schema initialized');
 
+  // S12（设计 §7.4）：上次进程退出时未终态的写回推送行置 conflict
+  //（push_interrupted，需用户核对云端后重推或放弃）。行数仅供日志观察。
+  const interruptedPushes = localMapStore.markInterruptedSourceEditPushes();
+  if (interruptedPushes > 0) {
+    console.info(`[server] source edits reconciled: ${interruptedPushes} pushing → conflict`);
+  }
+
   // Initialize ChangeDetector
   console.info('[server] Initializing ChangeDetector');
   const changeDetector = new ChangeDetector(
@@ -189,11 +207,17 @@ export async function buildServer(options: CreateServerOptions = {}) {
     reconcileLocalIndex(localMapStore, configManager.getConfig()?.knowledgeBaseRoot ?? '', () => new SnapshotService(localMapStore, configManager, { larkCliClient, config: configManager.getConfig() }).generate());
     return localMapStore.getAllDocuments();
   };
+  // S3：共享 VisionDescriber（会话内联/raw_read_image + 构建预描述 + changes 计数）
+  const visionDescriber = new VisionDescriber({
+    dataRoot: agentDataRoot,
+    config: () => configManager.load(),
+  });
   const agentToolService = new AgentToolService({
     dataRoot: agentDataRoot,
     documentsProvider: knowledgeDocuments,
     sheetCsvPaths,
     workspaceGuard: (workspaceRoot) => checkRootOverlap(workspaceRoot, workspaceGuardsSnapshot()),
+    visionDescriber,
   });
   // 回环内部 API 基址：端口在 startServer 监听后回填（构建/会话 spawn 前必然已知）
   const agentInternalPort = { port: null as number | null };
@@ -227,6 +251,10 @@ export async function buildServer(options: CreateServerOptions = {}) {
   });
   await piPlugins.refresh().catch(() => { console.warn('[server] Pi插件资源暂不可用，可在设置中刷新；其他功能继续启动'); });
   const appPluginStore: AppPluginStore = new AppPluginStore(agentDataRoot, readAgentPromptAssets, () => piPlugins.runtimeResources());
+  // S6 任务编排：TaskService 在 sessionService 之后构造（SSE 事件出口回
+  // 挂到 sessionService.emitSse）；taskTools 在每次 spawn 时求值，插件开关
+  // 变更后的首个新 run 生效。父会话删除 → 其非终态子任务取消。
+  const tasks: { service: TaskService | null } = { service: null };
   const sessionService: SessionService = new SessionService({
     dataRoot: agentDataRoot,
     pool: agentPool,
@@ -237,6 +265,12 @@ export async function buildServer(options: CreateServerOptions = {}) {
     extensionPath: piExtensionPath,
     pluginStore: appPluginStore,
     workspaceGuards: workspaceGuardsSnapshot,
+    taskTools: () => tasks.service
+      ? { enabled: tasks.service.orchestrationEnabled(), names: TASK_TOOL_NAMES, family: TASK_TOOL_FAMILY_NAME }
+      : null,
+    onSessionDeleted: (sessionId) => {
+      void tasks.service?.cancelSessionTasks(localMapStore, sessionId);
+    },
   });
   const kbBuildService = new KbBuildService({
     dataRoot: agentDataRoot,
@@ -251,18 +285,108 @@ export async function buildServer(options: CreateServerOptions = {}) {
     extensionPath: piExtensionPath,
     pluginStore: appPluginStore,
     promptAssets: readAgentPromptAssets,
+    visionDescriber,
   });
   // 启动对账：非终态构建置 interrupted；CURRENT 指针为准补 DB
   const reconcile = kbBuildService.reconcileOnStartup(localMapStore);
   if (reconcile.interruptedBuildIds.length > 0) {
     console.info(`[server] kb builds reconciled: ${reconcile.interruptedBuildIds.join(', ')} → interrupted`);
   }
+  // ===========================================================================
+  // S6 任务编排（设计 kb-agent-upgrade §5）：RoleRegistry + TaskService +
+  // task_* 工具族。状态机/队列在 server（agent_tasks）；子任务进程走
+  // pool.acquire('background')（与构建 worker 共用后台配额）；插件快照
+  // 取派发时父会话 revision 冻结。触发标准库构建只能经 app_command
+  // kb.build（S10 ops 族，上面已注册）——TaskService 不提供构建入口。
+  // ===========================================================================
+  const roleRegistry = new RoleRegistry();
+  tasks.service = new TaskService({
+    dataRoot: agentDataRoot,
+    pool: agentPool,
+    toolService: agentToolService,
+    roles: roleRegistry,
+    resolver: runtimeResolver,
+    configProvider: () => configManager.getConfig(),
+    sessionInfo: (sessionId) => {
+      const row = localMapStore.getAgentSession(sessionId);
+      if (!row) return null;
+      const workspaceId = row.workspace_id != null ? String(row.workspace_id) : null;
+      const workspace = workspaceId
+        ? configManager.getConfig()?.agent.workspaces.find((candidate) => candidate.id === workspaceId) ?? null
+        : null;
+      return {
+        id: sessionId,
+        mode: row.mode === 'work' ? 'work' : 'discuss',
+        workspaceId,
+        workspacePath: workspace?.path ?? null,
+      };
+    },
+    internalBaseUrl: () => (agentInternalPort.port ? `http://127.0.0.1:${agentInternalPort.port}` : ''),
+    emitTaskUpdate: (sessionId, dto) => sessionService.emitSse(sessionId, 'task_update', dto),
+    extensionPath: piExtensionPath,
+    orchestrationEnabled: () => appPluginStore.list().plugins.some((plugin) => plugin.id === 'orchestration' && plugin.enabled),
+    pluginRevision: (scope) => {
+      try {
+        return appPluginStore.snapshot(scope).revision;
+      } catch {
+        return null;
+      }
+    },
+    frozenSnapshot: (scope, revision) => appPluginStore.frozenSnapshot(scope, revision),
+  });
+  agentToolService.registerToolFamily(taskToolFamily({ service: tasks.service, store: localMapStore }));
+  // 启动对账：queued/running 任务 → interrupted（blocked 保留可作答）
+  const interruptedTaskIds = tasks.service.reconcileOnStartup(localMapStore);
+  if (interruptedTaskIds.length > 0) {
+    console.info(`[server] agent tasks reconciled: ${interruptedTaskIds.join(', ')} → interrupted`);
+  }
   console.info('[server] Agent knowledge modules initialized');
+
+  // ========================================================================
+  // S8：CLI 命令行访问端点（设计 kb-agent-upgrade §6.2）
+  // ========================================================================
+  // 令牌与 desktop token 完全分离；endpoint.json 只在 cli.enabled 时
+  // 发布（startServer 拿到实际端口后回调 onServerStarted）。
+  const cliEndpoint = new CliEndpoint(agentDataRoot, {
+    enabledProvider: () => configManager.getConfig()?.cli?.enabled === true,
+  });
 
   // Create Hono app
   console.info('[server] Creating Hono app');
   const app = new Hono();
   console.info('[server] Hono app created');
+
+  // ===========================================================================
+  // S10：会话内批准流 + app_command（设计 kb-agent-upgrade §6.5）
+  // ===========================================================================
+  // ApprovalService 的事件出口接到 SessionService.emitSse（approval_request /
+  // approval_resolved 并入会话 SSE 流）；run_end（含用户中止）时取消该会话
+  // 全部 pending 批准，防止「运行已停、批准迟到仍执行命令」。app_command
+  // 经 S1 工具族注册模型挂入 ops 族：read 直通，非 read 挂起等待批准，
+  // 执行与 S8 CLI 执行器同构（app.request 携 desktop token，不走网络）。
+  const approvalService = new ApprovalService({
+    dataRoot: agentDataRoot,
+    emit: (sessionId, event, data) => sessionService.emitSse(sessionId, event, data),
+  });
+  agentToolService.registerToolFamily(createOpsToolFamily({
+    approvals: approvalService,
+    getApp: () => app,
+    desktopToken,
+    configProvider: () => configManager.getConfig(),
+    // T3b-07：批准后、执行前复核会话运行状态（aborting/idle 不执行）
+    sessionRunState: (sessionId) => sessionService.runState(sessionId),
+  }));
+  sessionService.on('sse', ({ sessionId, event }) => {
+    if (event === 'run_end') approvalService.cancelForSession(sessionId);
+  });
+  // T3b-07：停止请求即撤销 pending 批准（不等 run_end），与 app_command
+  // 执行前状态复核共同关闭「停止后迟到批准仍执行」窗口。
+  sessionService.on('session_abort', ({ sessionId }) => {
+    approvalService.cancelForSession(sessionId);
+  });
+  (app as any).__approvalService = approvalService;
+  (app as any).__agentSessionService = sessionService;
+  console.info('[server] ApprovalService + app_command ops family registered');
 
   // ============================================================================
   // Middleware Registration Order Matters
@@ -320,6 +444,32 @@ export async function buildServer(options: CreateServerOptions = {}) {
   app.route('/', agentInternalRoutes(agentToolService));
   console.info('[server] Agent internal tool routes registered (pre-auth, loopback + run token)');
 
+  // CLI 面板（设计 kb-agent-upgrade §6.2）：同样挂载在 desktop auth 之前。
+  // /api/cli/enable 与 /api/cli/token/rotate 自带 desktop token 守卫
+  // （CLI 令牌不能自我提权）；其余 /api/cli/* 走 cli-auth 三重校验。
+  // 既有契约不变：health 仍最先注册，agent-internal 仍在 desktop auth 之前。
+  // 命令执行 getApp 必须返回父 app（子 app 只含 CLI 自身路由）。
+  //
+  // S9：CLI 管理面补充端点（info / install-shim，desktop token 域）必须
+  // 挂在 cliRoutes **之前**——cliRoutes 内 use('/api/cli/*') 的 CLI 令牌
+  // 中间件按注册顺序在其后，本文件静态路由先返回即不受其拦截（与
+  // cliRoutes 内 enable/rotate 先注册再挂 use 的策略一致）。
+  app.route('/', cliAdminRoutes({
+    desktopToken,
+    cliEndpoint,
+    configManager,
+    dataRoot: agentDataRoot,
+  }));
+  console.info('[server] CLI admin routes registered (pre-auth, desktop token domain)');
+  app.route('/', cliRoutes({
+    cliEndpoint,
+    desktopToken,
+    configManager,
+    getApp: () => app,
+    dataRoot: agentDataRoot,
+  }));
+  console.info('[server] CLI endpoint routes registered (pre-auth, CLI token domain + desktop-guarded admin)');
+
   // Token authentication (desktop mode only, must run after dependency injection)
   if (desktopMode) {
     app.use('*', authMiddleware());
@@ -339,6 +489,15 @@ export async function buildServer(options: CreateServerOptions = {}) {
   app.route('/', trashRoutes);
   app.route('/', customFolderRoutes);
   app.route('/', orphanFilesRoutes);
+  // S11（设计 §7.4）：源库受控编辑 API。kbBuild 探针对齐 KbBuildService
+  // .activeBuild 的判定面（内存 running + DB 非终态行），锁与 SyncEngine
+  // 共享进程级 sharedSourceWriteLock（routes/sources.ts 内默认回落）。
+  app.route('/', sourcesRoutes({
+    configManager,
+    localMapStore,
+    kbBuild: { isActive: () => kbBuildService.activeBuild(localMapStore) != null },
+    dataRoot: agentDataRoot,
+  }));
   app.route('/', llmRoutes);
   app.route('/', piPluginRoutes(piPlugins));
   app.route('/', agentPluginRoutes(appPluginStore));
@@ -352,6 +511,8 @@ export async function buildServer(options: CreateServerOptions = {}) {
     internalPort: () => agentInternalPort.port,
     externalPlugins: () => piPlugins.externalCount(),
     pluginProtectedRoots: () => piPlugins.protectedRoots(),
+    approvalService,
+    ...(tasks.service ? { taskService: tasks.service } : {}),
   }));
   app.route('/', kbRoutes({
     buildService: kbBuildService,
@@ -385,6 +546,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
   };
   (app as any).__agentPool = agentPool;
   (app as any).__agentToolService = agentToolService;
+  (app as any).__cliEndpoint = cliEndpoint;
   return app;
 }
 
@@ -441,10 +603,23 @@ export async function startServer(options: CreateServerOptions & {
   const setPort = (app as any).__setAgentInternalPort as ((port: number) => void) | undefined;
   setPort?.(actualPort);
 
+  // S8：记录服务 URL 并在 cli.enabled 时发布 CLI 端点文件
+  const cliEndpoint = (app as any).__cliEndpoint as
+    { onServerStarted: (url: string) => void } | undefined;
+  try {
+    cliEndpoint?.onServerStarted(url);
+  } catch (error) {
+    console.warn('[server] CLI endpoint publish failed:', error);
+  }
+
   let closed = false;
   const close = async () => {
     if (closed) return;
     closed = true;
+    // S10：先取消全部 pending 批准（挂起的工具调用立即失败），
+    // 再回收 pi 子进程。
+    const approvals = (app as any).__approvalService as { close: () => void } | undefined;
+    approvals?.close();
     // 先回收 pi 子进程（SIGTERM → 3s → SIGKILL / Windows taskkill），
     // 再关 HTTP：内部工具 API 必须在子进程存续期间可达。
     const agentPool = (app as any).__agentPool as { closeAll: () => Promise<void> } | undefined;
@@ -492,6 +667,16 @@ export async function startServer(options: CreateServerOptions & {
       // 宽限期计时器不能阻止独立 server 进程自然退出。
       graceTimer.unref?.();
     });
+
+    // S8：撤销 CLI 端点（内存令牌失效 + pid 匹配时删除 endpoint.json）。
+    // HTTP 已关闭后再撤销：CLI 客户端在服务存活期间始终可用。Electron
+    // 退出唯一路径是 QuitCoordinator → started.close()，此处即退出钩子
+    // （评估结论：electron/main.ts 无需重复注册，见 S8 报告）。
+    try {
+      (app as any).__cliEndpoint?.revoke?.();
+    } catch (error) {
+      console.warn('[server] CLI endpoint revoke failed:', error);
+    }
   };
 
   return {

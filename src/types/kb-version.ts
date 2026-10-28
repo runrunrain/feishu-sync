@@ -15,6 +15,9 @@ export interface KbChangePreview {
   baseReleaseId: string | null;
   sources: KbFileChange[];
   affectedDocs: Array<{ docId: string; path: string; title: string }>;
+  /** S3 §3.6：待处理源引用图片计数（total）与当前模型未缓存数（uncached；
+   * vision 未启用时 uncached=total）。旧服务端无此字段，按可选防御。 */
+  images?: { total: number; uncached: number };
 }
 
 export interface KbVersionDto {

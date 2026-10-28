@@ -27,7 +27,7 @@ describe('应用专属Pi上下文插件', () => {
   it('默认规则迁移、修改/停用/恢复、进程间持久化，不改通用Pi', async () => {
     const f = fixture();
     const original = fs.readFileSync(path.join(f.generic, 'settings.json'), 'utf8');
-    const initial = await f.call(''); expect(initial.status).toBe(200); expect(initial.data.plugins).toHaveLength(4);
+    const initial = await f.call(''); expect(initial.status).toBe(200); expect(initial.data.plugins).toHaveLength(5); // S6: +orchestration
     expect(initial.data.plugins.find((p: any) => p.id === 'kb-build-rules').content).toBe('BUILD_RULES');
     const edit = await f.call('/kb-style', 'PUT', { expectedRevision: initial.data.revision, content: 'MY_STYLE', enabled: false });
     expect(edit.status).toBe(200);
@@ -54,7 +54,7 @@ describe('应用专属Pi上下文插件', () => {
     expect((await f.call('/kb-style', 'DELETE', base)).status).toBe(400);
     expect((await f.call('/no-such-plugin', 'PUT', { ...base, enabled: false })).status).toBe(404);
     expect((await f.call('/' + plugin.id, 'DELETE', base)).status).toBe(200);
-    expect(f.store.list().plugins).toHaveLength(4);
+    expect(f.store.list().plugins).toHaveLength(5); // S6: +orchestration
   });
 
   it('运行快照按范围冻结；修改仅影响下次运行，不跨范围重启', () => {

@@ -36,6 +36,8 @@ export interface Config {
   /** F2 Agent 标准知识库（设计 §5.2；旧配置缺省时由服务端补默认值）。 */
   agent?: AgentConfig;
   standardKb?: StandardKbConfig;
+  /** S12 飞书写回开关段（默认关；服务端校验，缺省视为 false）。 */
+  feishuWrite?: { enabled: boolean };
 }
 
 /** One model preset inside a provider's OpenAI-compatible route. */
@@ -47,6 +49,8 @@ export interface LlmModelPreset {
   contextWindow?: number;
   maxTokens?: number;
   reasoning?: boolean;
+  /** 该预设是否支持图片输入（仅 UI 提示用途；S2 vision 通道不依赖此字段判定可用性） */
+  supportsImages?: boolean;
 }
 
 /** A remotely hosted model provider configured in Settings. */
@@ -265,10 +269,76 @@ export interface AuthStatus {
   larkCliVersion?: string;
   currentScopes?: string[];
   missingScopes?: string[];
+  /** S12：写回 scope（docx:document:write_only）是否已授权（写回入口引导用）。 */
+  writeScopesGranted?: boolean;
   error?: string;
   identity?: string;
   verified?: boolean;
   account?: { id: string; name?: string };
+}
+
+// ============================================================================
+// 源编辑与写回（S11/S12 API 消费，S13 UI）——镜像 server/src/types/index.ts
+// ============================================================================
+
+export type SourceEditState = 'dirty' | 'pushing' | 'pushed' | 'conflict';
+export type SourceEditActorKind = 'ui' | 'cli' | 'agent' | string;
+
+/** GET /api/sources/:objToken/edit-status 响应（预览面板 OCC 入口）。 */
+export interface SourceEditStatus {
+  objToken: string;
+  relPath: string;
+  title: string;
+  /** 当前正文（不含 feishu_sync 头）的 sha256；编辑保存时作 baseHash。 */
+  bodyHash: string;
+  /** 无编辑行时为 null（此时 bodyHash 即编辑基线）。 */
+  editState: SourceEditStateDto | null;
+}
+
+export interface SourceEditStateDto {
+  objToken: string;
+  relPath: string;
+  title: string;
+  state: SourceEditState;
+  bodyHash: string;
+  baseBodyHash: string;
+  editCount: number;
+  lastActor: SourceEditActorKind;
+  error: null | { code: string; message: string };
+  updatedAt: string;
+}
+
+/** POST /api/sources/:objToken/edit 响应。 */
+export interface SourceEditResult {
+  bodyHash: string;
+  state: SourceEditStateDto;
+}
+
+/** POST /api/sources/:objToken/push/preview 响应（S12）。 */
+export interface SourcePushPlan {
+  mode: 'append' | 'overwrite' | 'blocked';
+  blockedReason?:
+    | 'no_changes'
+    | 'overwrite_required'
+    | 'overwrite_unsupported'
+    | 'images_in_append'
+    | 'images_in_overwrite'
+    | 'write_disabled'
+    | 'write_scope_missing';
+  appendMarkdown?: string;
+  bytes: number;
+  cloud: { objEditTime: string | null; revisionId: number | null };
+  /** 云端 obj_edit_time 已越过 base_obj_edit_time（需 force 决策）。 */
+  conflict: boolean;
+  warnings: string[];
+}
+
+/** POST /api/sources/:objToken/push 响应（S12）。 */
+export interface SourcePushResult {
+  state: SourceEditState | 'pushed';
+  mode: 'append' | 'overwrite';
+  revisionId: number | null;
+  pull: { ok: boolean; status: string; message?: string };
 }
 
 // ============================================================================

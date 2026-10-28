@@ -26,6 +26,7 @@ import { parseSourceBatchRequest, planSourceBatch, executeSourceBatch } from '..
 import { ToolError } from '../agent/agent-tool-service.js';
 import { deleteSourceNode } from '../modules/source-node-delete.js';
 import { SnapshotService } from '../modules/snapshot-service.js';
+import { pendingLocalEditTokens } from '../sources/source-edit-service.js';
 import { Hono } from 'hono';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -226,6 +227,15 @@ trashRoutes.post('/api/trash/restore', async (c) => {
       return c.json({ ok: true });
     }
 
+    // S11 守卫（设计 §7.3）：本地编辑未写回的文档拒绝恢复移动；构建活跃
+    // 同样冻结生命周期操作（与 manual-delete 的 kb_build_running 同源）。
+    if ((c as any).kbBuildService?.activeBuild?.(store)) {
+      return c.json({ error: 'kb_build_running', message: '标准库构建中，暂不能恢复源文档' }, 409);
+    }
+    if (pendingLocalEditTokens(store, [objToken]).length > 0) {
+      return c.json({ error: 'local_edit_pending', message: '本地有未写回的修改：写回飞书或放弃修改后再操作' }, 409);
+    }
+
     const config = configManager.getConfig?.() ?? (await configManager.load?.());
     const root: string | undefined = config?.knowledgeBaseRoot;
     const localMdPath: string | undefined = doc.localMdPath;
@@ -328,6 +338,11 @@ trashRoutes.post('/api/trash/manual-delete', async (c) => {
     if (typeof body.delete_local_files !== 'undefined' && typeof body.delete_local_files !== 'boolean'
       || typeof body.block !== 'undefined' && typeof body.block !== 'boolean') return c.json({ error: 'invalid_body', message: '删除选项必须为boolean' }, 400);
     if ((c as any).kbBuildService?.activeBuild(store)) return c.json({ error: 'kb_build_running', message: '标准库构建中，暂不能删除源文档' }, 409);
+    // S11 守卫：deleteFiles=false 时 prepareSourceCleanup 的公共守卫不会
+    // 触达（只清元数据），这里在路由层兜底覆盖两种分支。
+    if (pendingLocalEditTokens(store, [objToken]).length > 0) {
+      return c.json({ error: 'local_edit_pending', message: '本地有未写回的修改：写回飞书或放弃修改后再删除' }, 409);
+    }
     const result = deleteSourceNode(store, config, doc, { deleteFiles: body.delete_local_files !== false, block: body.block === true });
     try { new SnapshotService(store, configManager, { larkCliClient: (c as any).larkCliClient, config }).generate(); }
     catch (error) { console.warn('[trash] snapshot refresh after manual delete failed:', error); }
@@ -427,6 +442,12 @@ trashRoutes.post('/api/trash/bulk-process', async (c) => {
     const root: string | undefined = config?.knowledgeBaseRoot;
     if (root) ensureTrashBin(root);
 
+    // S11 守卫：构建活跃冻结批量处理；带未写回本地修改的文档逐条拒绝
+    // （记入 failed，不阻断同批其他文档）。
+    if ((c as any).kbBuildService?.activeBuild?.(store)) {
+      return c.json({ error: 'kb_build_running', message: '标准库构建中，暂不能批量处理删除候选' }, 409);
+    }
+
     const now = new Date().toISOString();
     const counts = {
       requested: tokens.length,
@@ -449,6 +470,10 @@ trashRoutes.post('/api/trash/bulk-process', async (c) => {
       }
 
       const cloudDeleted = doc.cloudDeleted === 1 || doc.cloudDeleted === true;
+      if (pendingLocalEditTokens(store, [objToken]).length > 0) {
+        failed.push({ obj_token: objToken, reason: 'local_edit_pending' });
+        continue;
+      }
       if (!cloudDeleted) {
         // 防误删：活行仅接受删除候选状态。
         const syncState: string | undefined = doc.syncState ?? doc.sync_state;
@@ -544,19 +569,33 @@ trashRoutes.delete('/api/trash/purge', async (c) => {
     const root: string | undefined = config?.knowledgeBaseRoot;
     if (root) ensureTrashBin(root);
 
+    // S11 守卫：构建活跃与本地未写回修改都冻结回收站清理（不可恢复删除）。
+    if ((c as any).kbBuildService?.activeBuild?.(store)) {
+      return c.json({ error: 'kb_build_running', message: '标准库构建中，暂不能清理源文档' }, 409);
+    }
+
     if (allFlag) {
       const rows = store.listCloudDeleted() as any[];
       let purged = 0;
+      let skippedLocalEditPending = 0;
       for (const row of rows) {
+        if (pendingLocalEditTokens(store, [row.objToken ?? row.obj_token]).length > 0) {
+          skippedLocalEditPending += 1;
+          console.warn(`[trash] purge skipped ${row.objToken ?? row.obj_token}: local_edit_pending`);
+          continue;
+        }
         const ok = purgeOne(store, root, row.objToken ?? row.obj_token, row);
         if (ok) purged += 1;
       }
-      return c.json({ purged });
+      return c.json({ purged, skipped_local_edit_pending: skippedLocalEditPending });
     }
 
     const doc = store.getDocumentByObjToken(objToken!) as any;
     if (!doc) {
       return c.json({ error: 'not_found', message: 'document not in trash' }, 404);
+    }
+    if (pendingLocalEditTokens(store, [objToken!]).length > 0) {
+      return c.json({ error: 'local_edit_pending', message: '本地有未写回的修改：写回飞书或放弃修改后再操作' }, 409);
     }
     const ok = purgeOne(store, root, objToken!, doc);
     if (!ok) {

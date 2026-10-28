@@ -221,13 +221,20 @@ export async function syncDocxToCustomFolder(
       mediaTemp,
     );
 
-    // 3. Rewrite media spans to local relative paths.
+    // 3. Rewrite media spans to local relative paths, then render the
+    // localized tags as portable markdown links (T0a D3) — same two-step
+    // composition as SyncEngine's docx path (sync-engine.ts:613-615): without
+    // the render step, `<file token="attachments/…">` / `<whiteboard …>`
+    // tags leak into the archived body and the preview shows raw XML text
+    // with no attachment entry point.
     const localMediaReferences = new Map<string, string>();
     for (const image of images) localMediaReferences.set(image.token, image.relativeToDocDir);
     for (const attachment of attachments) {
       localMediaReferences.set(attachment.token, attachment.relativeToDocDir);
     }
-    const bodyMarkdown = rewriteFeishuMediaReferences(content, localMediaReferences);
+    const bodyMarkdown = renderLocalizedMediaReferences(
+      rewriteFeishuMediaReferences(content, localMediaReferences),
+    );
 
     // 4. Build DocumentIR + extraFiles and commit atomically.
     const ir: DocumentIR = {
@@ -689,6 +696,32 @@ function colToLetter(n: number): string {
     x = Math.floor((x - mod) / 26);
   }
   return s;
+}
+
+/**
+ * Render localized media tags (token already rewritten to images/… or
+ * attachments/… relative paths by rewriteFeishuMediaReferences) as portable
+ * markdown links: whiteboard → image link, file/source → attachment link.
+ * Both alternatives consume optional wrapped closing tags so `<whiteboard …>
+ * </whiteboard>` / `<file …></file>` forms leave no residual markup (T0a D3,
+ * and the producer-side half of D19).
+ *
+ * Local copy of SyncEngine.renderLocalizedMediaReferences (sync-engine.ts):
+ * the engine method is private and bound to the engine class, while this
+ * module deliberately composes building blocks instead of instantiating the
+ * engine (see file header, same convention as colToLetter). Behavior must
+ * stay consistent with the engine's copy — change both together.
+ */
+function renderLocalizedMediaReferences(content: string): string {
+  const whiteboards = content.replace(
+    /<whiteboard\b[^>]*\btoken=(['"])(images\/[^'"]+)\1[^>]*>(?:\s*<\/whiteboard>)?/gi,
+    (_whole, _quote: string, localPath: string) => `![飞书白板](${localPath})`,
+  );
+  return whiteboards.replace(
+    /<(?:file|source)\b[^>]*\btoken=(['"])(attachments\/[^'"]+)\1[^>]*\/?>(?:\s*<\/(?:file|source)>)?/gi,
+    (_whole, _quote: string, localPath: string) =>
+      `[${path.basename(localPath)}](${localPath})`,
+  );
 }
 
 /**

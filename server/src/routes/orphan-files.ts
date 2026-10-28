@@ -14,6 +14,7 @@
 import { Hono } from 'hono';
 import type { WatchedRootConfig } from '../types/index.js';
 import { scanOrphanFiles, cleanupOrphanFiles } from '../modules/orphan-files.js';
+import { pendingLocalEditRelPaths } from '../sources/source-edit-service.js';
 
 const orphanFilesRoutes = new Hono();
 
@@ -91,7 +92,18 @@ orphanFilesRoutes.post('/api/orphan-files/cleanup', async (c) => {
     ? current.items.filter((item) => requested.includes(item.relPath))
     : current.items;
 
-  const result = cleanupOrphanFiles(rootDir, targets, body.confirmation ?? '');
+  // S11 守卫（设计 §7.3）：带未写回本地修改的源正文所在路径不参与孤立
+  // 清理（目录目标按路径前缀排除）；构建活跃同样冻结清理移动。
+  if ((c as any).kbBuildService?.activeBuild?.(localMapStore)) {
+    return c.json({ error: 'kb_build_running', message: '标准库构建中，暂不能清理孤立文件' }, 409);
+  }
+  const pendingRelPaths = pendingLocalEditRelPaths(localMapStore);
+  const blocked = (relPath: string): boolean =>
+    pendingRelPaths.some((pending) => pending === relPath || pending.startsWith(`${relPath}/`));
+  const skippedLocalEditPending = targets.filter((item) => blocked(item.relPath));
+  const movableTargets = targets.filter((item) => !blocked(item.relPath));
+
+  const result = cleanupOrphanFiles(rootDir, movableTargets, body.confirmation ?? '');
   return c.json({
     success: result.failed.length === 0,
     dryRun: result.dryRun,
@@ -99,6 +111,7 @@ orphanFilesRoutes.post('/api/orphan-files/cleanup', async (c) => {
     moved: result.moved,
     failed: result.failed,
     scannedTotal: current.items.length,
+    skipped_local_edit_pending: skippedLocalEditPending.map((item) => item.relPath),
   });
 });
 

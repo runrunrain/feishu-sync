@@ -59,11 +59,59 @@ function buildChannel(
   throw new Error(`unknown channel: ${name}`);
 }
 
+/** 路由级配置拒绝（T3b-01：端点锁定/引用校验），统一转 400。 */
+class LlmRouteError extends Error {
+  constructor(
+    public readonly code: 'endpoint_mismatch' | 'invalid_provider',
+    message: string,
+  ) {
+    super(message);
+    this.name = 'LlmRouteError';
+  }
+}
+
+/**
+ * T3b-01 引用模式：请求不携带 llm 对象，只引用已保存的 providerId /
+ * modelId；server 从 ConfigManager 解析完整连接信息（含真实密钥，仅
+ * 进程内使用、绝不回传），模型侧无法提供端点/密钥覆盖。
+ */
+async function resolveReferencedLlmConfig(
+  providerId: string | undefined,
+  modelId: string | undefined,
+  configManager: any,
+): Promise<Record<string, unknown> | null> {
+  if (typeof configManager?.load !== 'function') return null;
+  const config = await configManager.load().catch(() => null);
+  const savedLlm = (config as { llm?: Record<string, unknown> } | null)?.llm;
+  if (!savedLlm || typeof savedLlm !== 'object') return null;
+  if (providerId !== undefined) {
+    const providers = Array.isArray(savedLlm.providers) ? savedLlm.providers : [];
+    const found = providers.some(
+      (item) => !!item && typeof item === 'object' && (item as { id?: unknown }).id === providerId,
+    );
+    if (!found) {
+      throw new LlmRouteError('invalid_provider', `未找到已保存的 LLM 提供商: ${providerId}`);
+    }
+  }
+  return {
+    ...savedLlm,
+    ...(providerId !== undefined ? { activeProviderId: providerId } : {}),
+    ...(modelId !== undefined ? { activeModelId: modelId } : {}),
+  };
+}
+
 /**
  * Config GET intentionally masks a saved API key as `***`. The Settings UI
  * can still test an edited endpoint/model while that mask is present: only
  * the mask sentinel is replaced with the persisted secret, and the secret is
  * never returned or logged. A real user-entered key always wins.
+ *
+ * T3b-01 hardening: restoring a masked secret also LOCKS the endpoint to the
+ * persisted value — a request that pairs `apiKey: '***'` with a different
+ * baseUrl would otherwise send the persisted key to an arbitrary URL chosen
+ * by the caller (prompt-injection exfiltration via agent channels). A
+ * mismatching endpoint is rejected with 400 endpoint_mismatch; an omitted
+ * endpoint inherits the saved one.
  */
 async function restoreMaskedLlmSecrets(
   rawLlm: Record<string, unknown>,
@@ -82,27 +130,64 @@ async function restoreMaskedLlmSecrets(
     const config = await configManager.load();
     const savedLlm = config?.llm;
     const savedProviders = Array.isArray(savedLlm?.providers) ? savedLlm.providers : [];
+    let effective = rawLlm;
+    // 顶层掩码密钥：锁定/继承已保存端点。
+    if (effective.apiKey === '***' && typeof savedLlm?.apiKey === 'string' && savedLlm.apiKey) {
+      const requestedUrl = typeof effective.openAiCompatBaseUrl === 'string'
+        ? effective.openAiCompatBaseUrl
+        : '';
+      if (requestedUrl && requestedUrl !== savedLlm.openAiCompatBaseUrl) {
+        throw new LlmRouteError(
+          'endpoint_mismatch',
+          'apiKey 为掩码时，openAiCompatBaseUrl 必须与已保存配置一致（不能携带已存密钥测试其他端点）',
+        );
+      }
+      effective = {
+        ...effective,
+        ...(requestedUrl ? {} : { openAiCompatBaseUrl: savedLlm.openAiCompatBaseUrl }),
+      };
+    }
     const providers = rawProviders?.map((provider) => {
       if (!provider || typeof provider !== 'object') return provider;
       const candidate = provider as Record<string, unknown>;
       if (candidate.apiKey !== '***') return candidate;
       const id = typeof candidate.id === 'string' ? candidate.id : '';
       const saved = savedProviders.find((item: { id?: unknown }) => item.id === id);
-      return {
-        ...candidate,
-        apiKey: typeof saved?.apiKey === 'string' ? saved.apiKey : '',
-      };
+      if (!saved) {
+        // 引用了不存在的 provider：不给掩码字面量当真实密钥的机会，置空
+        // 密钥走「API Key 为空」友好错误。
+        return { ...candidate, apiKey: '' };
+      }
+      const savedKey = typeof saved.apiKey === 'string' ? saved.apiKey : '';
+      if (savedKey) {
+        const requestedUrl = typeof candidate.openAiCompatBaseUrl === 'string'
+          ? candidate.openAiCompatBaseUrl
+          : ''
+        if (requestedUrl && requestedUrl !== saved.openAiCompatBaseUrl) {
+          throw new LlmRouteError(
+            'endpoint_mismatch',
+            `provider ${id} 的 apiKey 为掩码时，openAiCompatBaseUrl 必须与已保存配置一致`,
+          );
+        }
+        return {
+          ...candidate,
+          apiKey: savedKey,
+          ...(requestedUrl ? {} : { openAiCompatBaseUrl: saved.openAiCompatBaseUrl }),
+        };
+      }
+      return { ...candidate, apiKey: savedKey };
     });
     return {
-      ...rawLlm,
-      apiKey: rawLlm.apiKey === '***' && typeof savedLlm?.apiKey === 'string'
+      ...effective,
+      apiKey: effective.apiKey === '***' && typeof savedLlm?.apiKey === 'string'
         ? savedLlm.apiKey
-        : rawLlm.apiKey,
+        : effective.apiKey,
       ...(providers ? { providers } : {}),
     };
-  } catch {
-    // A connectivity test should return its normal friendly configuration
-    // error rather than expose a ConfigManager stack trace to the renderer.
+  } catch (error) {
+    // 端点锁定/引用校验失败必须上抛（转 400）；ConfigManager 故障仍按
+    // 原语义回退原始请求体，交由后续配置校验给出友好错误。
+    if (error instanceof LlmRouteError) throw error;
     return rawLlm;
   }
 }
@@ -131,14 +216,50 @@ llmRoutes.post('/api/llm/test-channel', async (c) => {
   }
 
   const rawLlm = body.llm;
-  if (!rawLlm || typeof rawLlm !== 'object') {
-    return c.json(
-      { error: 'invalid_body', message: 'llm (LlmConfig) is required' },
-      400,
-    );
+  const providerId = typeof body.providerId === 'string' && body.providerId
+    ? body.providerId
+    : undefined;
+  const modelId = typeof body.modelId === 'string' && body.modelId
+    ? body.modelId
+    : undefined;
+  let llm: Record<string, unknown>;
+  if (rawLlm && typeof rawLlm === 'object') {
+    if (providerId !== undefined || modelId !== undefined) {
+      return c.json(
+        {
+          error: 'invalid_body',
+          message: 'providerId/modelId 引用模式不接受 llm 覆盖对象（只能引用已保存配置）',
+        },
+        400,
+      );
+    }
+    try {
+      llm = await restoreMaskedLlmSecrets(rawLlm as Record<string, unknown>, (c as any).configManager);
+    } catch (error) {
+      if (error instanceof LlmRouteError) {
+        return c.json({ error: error.code, message: error.message }, 400);
+      }
+      throw error;
+    }
+  } else {
+    // T3b-01 引用模式：不携带 llm 对象，从已保存配置解析（缺省测当前
+    // 激活配置；无 ConfigManager 时保留原 400 契约）。
+    try {
+      llm = await resolveReferencedLlmConfig(providerId, modelId, (c as any).configManager)
+        ?? {} as Record<string, unknown>;
+    } catch (error) {
+      if (error instanceof LlmRouteError) {
+        return c.json({ error: error.code, message: error.message }, 400);
+      }
+      throw error;
+    }
+    if (Object.keys(llm).length === 0) {
+      return c.json(
+        { error: 'invalid_body', message: 'llm (LlmConfig) is required' },
+        400,
+      );
+    }
   }
-
-  const llm = await restoreMaskedLlmSecrets(rawLlm as Record<string, unknown>, (c as any).configManager);
 
   // Compose a normalized LlmConfig from the partial body so the channel
   // sees a complete object even if the UI omitted optional fields.
@@ -171,7 +292,7 @@ llmRoutes.post('/api/llm/test-channel', async (c) => {
         success: false,
         durationMs: 0,
         model: effectiveLlm.model,
-        error: rawLlm.apiKey === '***'
+        error: (rawLlm as Record<string, unknown> | undefined)?.apiKey === '***'
           ? '已保存的 API Key 为空，请先在模型提供商中填写并保存'
           : 'API Key 为空，请先在模型提供商中填写后再测试',
       },

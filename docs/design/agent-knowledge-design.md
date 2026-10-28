@@ -209,21 +209,37 @@ export interface AgentConfig {
     contextWindow: number;                                  // app-llm 注册用，默认 128000
     maxTokens: number;                                      // 默认 8192
   };
-  maxConcurrentProcesses: number;                           // 默认 2，范围 1..4
+  vision: AgentVisionConfig;                                // 图片理解通道，缺省 disabled（见下方 AgentVisionConfig）
+  maxConcurrentProcesses: number;                           // 默认 3，范围 1..6；后台类（构建/任务）合计 ≤ M−1（M>1 时为交互会话保留 1 槽）
   idleTimeoutMinutes: number;                               // 默认 10
   workspaces: AgentWorkspaceConfig[];                       // 默认 []
+}
+
+export interface AgentVisionConfig {
+  enabled: boolean;            // 默认 false
+  providerId?: string;         // 引用 llm.providers[].id
+  modelId?: string;            // 引用该 provider 的 models[].id
+  concurrency: number;         // 1..8，默认 3（server 侧 HTTP 并发，不占 pi 进程槽）
+  maxImageBytes: number;       // 默认 5 MiB，上限 20 MiB；超限 unavailable(too_large)
+  maxImagesPerBuild: number;   // 0..5000，默认 300；超出 unavailable(limit)
+  timeoutMs: number;           // 单图超时，默认 120000
 }
 
 export interface StandardKbConfig {
   outputRoot: string;                 // 默认 <dataRoot>/standard-kb
   retainReleases: number;             // 默认 3，范围 1..20
-  buildBatchSize: number;             // 每个 prompt 处理的源文档数，默认 10
+  buildBatchSize: number;             // 单元内每批源数，默认 10（构建按单元划分，见升级增补 §18）
   promptTimeoutMinutes: number;       // 默认 15
   buildTimeoutMinutes: number;        // 默认 180
+  buildParallelism: number;           // 并行构建 worker 数，1..6，默认 2；1 = 单 worker 等价旧行为；实际受进程池后台配额约束
   autoBuildAfterSync: false;          // 第一阶段固定 false（字段预留）
 }
 
 // Config 增加：agent: AgentConfig; standardKb: StandardKbConfig;
+// 另增（additive 可选段，旧配置内存补默认）：
+//   cli?: { enabled: boolean }            // 命令行访问，默认 false，只接受 desktop token 修改
+//   feishuWrite?: { enabled: boolean }    // 飞书写回，默认 false，只接受 desktop token 修改
+// LlmModelPreset 增加可选 supportsImages?: boolean（仅 UI 提示，不参与解析）
 ```
 
 `GET /api/config` 原样返回这两段（无秘密字段）；`PUT /api/config` 校验失败返回 `400 invalid_config` + `details: [{ field, code }]`。Workspace 的增删走专用路由（§9.4），`PUT /api/config` 中的 `agent.workspaces` 被忽略，防止绕过路径校验。
@@ -368,9 +384,10 @@ queued → preflight → running → validating → publishing → published
 
 | 运行类型 | 工具白名单（`--tools`） | 文件可读范围 | 文件可写范围 |
 |---|---|---|---|
-| Discuss | `kb_search kb_read raw_search raw_read` | 已发布标准库 + 原始库 | 无 |
-| Work | Discuss 全部 + `ws_ls ws_read ws_search ws_write ws_edit ws_mkdir` | 上述 + 绑定 Workspace | 仅绑定 Workspace |
-| Build | `raw_list raw_read raw_search draft_list draft_read draft_search kb_write_doc kb_delete_doc kb_finish` | 快照内原始源 + 本构建 staging | 仅本构建 staging（经 server） |
+| Discuss | `kb_search kb_read raw_search raw_read raw_read_image app_command`（app_command 仅 read 级命令）；任务编排启用时追加 `task_submit task_query task_resume task_cancel` | 已发布标准库 + 原始库 | 无 |
+| Work | Discuss 全部（app_command 为全部对 Agent 暴露的命令，非只读级逐次经用户批准）+ `ws_ls ws_read ws_search ws_write ws_edit ws_mkdir`；任务编排启用时同样追加 `task_*` | 上述 + 绑定 Workspace | 仅绑定 Workspace |
+| Build | `raw_list raw_read raw_search draft_list draft_read draft_search kb_write_doc kb_delete_doc kb_unit_done kb_finish` | 快照内原始源 + 本构建 staging | 仅本构建 staging（经 server） |
+| Task（子任务） | 派发时冻结：角色卡请求 ∩ 父会话模式工具集 ∩ 已知工具；永不含 `task_*` 与 `app_command` | 按冻结工具集决定（Workspace 写入收窄至该任务的 outputDir） | 同左 |
 | Probe | 无（`--no-tools`） | 无 | 无 |
 
 工具语义（参数为 JSON Schema，规格由 server `tool-specs.ts` 唯一定义）：
@@ -392,6 +409,13 @@ queued → preflight → running → validating → publishing → published
 | `ws_write` | `{ path, content }` | 创建或整体覆盖（UTF-8，≤2 MB） |
 | `ws_edit` | `{ path, oldText, newText }` | `oldText` 必须唯一精确匹配，否则报错 |
 | `ws_mkdir` | `{ path }` | 递归创建 |
+| `raw_read_image` | `{ objToken, src }` | 图片描述文本（按需调用图片理解模型，结果入内容寻址缓存）。`src` 须属该源的本地图片引用；图片理解未就绪 → 工具错误 `vision_unconfigured` |
+| `kb_unit_done` | `{ summary(≤2000), skipped: [{ objToken, reason }] }` | 构建单元完成上报（objToken 须属本单元，重复调用以最后一次为准）；并行构建中 `kb_finish` 仅收尾轮可用 |
+| `task_submit` | `{ role, title(1..80), task(1..20000), outputDir? }` | `{ taskId, status, queuePosition }`。任务编排启用时的 Leader 工具；任务文本须自包含；写入类角色必填 `outputDir`（Workspace 相对目录，子任务写入收窄至该目录，同会话非终态任务目录不得重叠） |
+| `task_query` | `{ taskIds?(≤32), wait?: { mode: 'any'\|'all', timeoutSeconds: 1..600 } }` | `{ tasks, timedOut }`；`wait` 在工具内阻塞等待任一/全部任务落定 |
+| `task_resume` | `{ taskId, message(1..20000) }` | 任务 DTO（仅 blocked 任务，作答后重新排队） |
+| `task_cancel` | `{ taskId }` | 任务 DTO |
+| `app_command` | `{ command, args? }` | 运维命令表执行结果 JSON（≤20000 字符）。read 级直接执行；mutate/destructive/remote_write 逐次经会话内用户批准（10 分钟无响应或会话中止即不执行）；模型传入的 confirm 字段一律剔除 |
 
 工具结果统一：成功 `{ content: [{type:'text', text}], details }`；失败由扩展抛错，pi 将其作为工具错误结果交给模型，文本为 `"<code>: <message>"`。
 
@@ -448,11 +472,24 @@ pi 内置 bash 以 pi 进程的系统用户权限运行，cwd 不限制其访问
 | 400 | `confirmation_required` | 缺少 `confirm` 字段 |
 | 404 | `session_not_found` / `build_not_found` / `kb_doc_not_found` / `kb_not_published` / `workspace_not_found` | — |
 | 409 | `session_busy` / `agent_busy` / `kb_build_running` | 并发冲突 |
+| 401 | `cli_token_invalid` | CLI 令牌缺失/错误/带 Origin/非回环（命令行访问） |
+| 403 | `cli_forbidden_route` | CLI 令牌访问只接受 desktop token 的路由 |
+| 403 | `feishu_write_disabled` / `feishu_write_scope_missing` | 飞书写回未开启 / 未授权写 scope |
+| 404 | `task_not_found` / `approval_not_found` / `source_edit_not_found` | 子任务 / 批准请求 / 源编辑状态不存在 |
+| 409 | `task_queue_full` / `task_not_blocked` / `task_output_dir_overlap` | 任务编排 |
+| 409 | `source_edit_conflict` / `source_push_conflict` / `source_push_in_progress` / `local_edit_pending` / `source_not_editable` / `kb_build_active` | 源编辑与写回 |
+| 422 | `source_edit_unsupported_type` / `source_header_unsupported` / `source_push_blocked`（`details.reason`） | 源编辑/写回被拒 |
+| 500 | `source_header_roundtrip_failed` | 源编辑写后头部解析不一致，已自动恢复 |
+| 502 | `feishu_write_failed`（`details.larkCode`） | lark-cli 写回失败 |
 | 503 | `agent_not_ready` | `details.code` 为 §3.2 就绪码 |
 | 502 | `model_request_failed` | 模型调用失败（`details.message` 为 pi 原文前 500 字） |
 | 504 | `model_timeout` | 超时 |
 | 500 | `pi_process_exited` | 子进程意外退出 |
 | — | `source_changed_during_build` / `kb_validation_failed` | 构建失败码（写在 build 记录与事件中） |
+| — | `kb_unit_failed`（`details.unitId`） | 构建失败码：并行单元重试后仍失败 |
+| — | `kb_path_owned_by_other_unit` / `kb_finish_not_allowed_in_unit` / `vision_unconfigured` / `task_role_not_allowed_in_mode` / `task_contract_missing` / `approval_rejected` / `approval_timeout` | 工具错误（以工具错误文本返回模型） |
+| — | `local_edit_pending` | SyncEngine blocker：跳过有本地未写回修改的文档 |
+| — | `app_not_running` / `app_not_reachable` | CLI 退出码 3 场景（仅 CLI 本地产生） |
 | 401 / 403 | `Unauthorized` / `tool_not_allowed` / `run_token_invalid` | 认证与授权 |
 
 响应体：`{ "error": "<code>", "message": "<中文可读说明>", "details"?: object }`。
@@ -692,11 +729,13 @@ server 在此处产生会话/构建 SSE 的 `tool` 事件摘要以外的审计�
 
 ## 13. 不变量
 
-1. 原始库只被 SyncEngine 写；Agent 相关代码对原始库只有读路径。
-2. `CURRENT.json` 只在校验全部通过后通过 rename 更新；读者永远看到完整 release。
-3. pi 进程中只存在扩展注册的工具；工具授权以 server 运行上下文为准，提示词不参与授权。
-4. 无可用模型时不产生任何标准文档或助手回复，错误码如实返回。
-5. 秘密（apiKey、运行令牌、desktop token）不出现在 argv、日志、SSE 与 DTO 中。
+1. 原始库正文只由登记在册的受控写者修改：SyncEngine（云端→本地）、源生命周期操作（回收站 restore/purge、源清理、孤立文件清理，只移动/删除、不改正文）、SourceEditService（用户或经批准的 Agent 发起的正文编辑）。每次写都有审计记录；Agent 工具（raw_*、ws_*、kb_*、task_*）对原始库仍只有读路径，唯一的写入口是经用户逐次批准的 `app_command source.*`。
+2. 文档存在未写回本地修改（`source_edits` 非 pushed）时，SyncEngine 与源生命周期操作不得覆盖、移动或删除该文档；`feishu_sync` 头部字节只由 SyncEngine 生成。
+3. `synced_obj_edit_time` 只由 SyncEngine 原子提交推进；写回飞书不推进任何同步基线。
+4. `CURRENT.json` 只在校验全部通过后通过 rename 更新；读者永远看到完整 release。并行构建中校验在全部单元 join 与收尾轮之后对聚合状态执行，任一单元失败则整体失败。
+5. pi 进程中只存在扩展注册的工具；工具授权以 server 运行上下文为准，提示词不参与授权。子任务工具集 = 角色请求 ∩ 父模式工具集；`app_command` 的非只读命令需用户逐次批准，模型不能提供 confirm 字段。
+6. 无可用模型时不产生任何标准文档或助手回复，错误码如实返回。图片理解不可用不阻断文本构建，但必须以 unavailable 标记与构建警告如实告知。
+7. 秘密（apiKey、运行令牌、desktop token、CLI 令牌）不出现在 argv、日志、SSE 与 DTO 中：CLI 令牌只存于 0600 端点文件与请求头；CLI 安装 key 只走 stdin；写回内容经临时文件传 lark-cli。
 
 ## 14. 回滚与迁移
 
@@ -735,3 +774,9 @@ server 在此处产生会话/构建 SSE 的 `tool` 事件摘要以外的审计�
 - 本机Pi模型复用由工具桥在子进程内使用Pi ModelRuntime + ReadOnlyAuthStorage注册原生provider；models.json只读，模型缓存写应用目录。宿主不解析/复制密钥，通用Pi插件不加载。app-llm维持既有provider注入。
 - 未启用外部插件时保持既有--tools白名单。显式启用外部包时允许其原生工具注册，再由桥接将活动工具收敛为宿主工具与非builtin扩展工具；未主动加载的Pi内置shell/文件工具继续被阻断。第三方扩展本身是当前用户权限的Node代码，不宣称具备OS沙箱；对话页面展示这一能力边界。
 - RPC允许命令集合、宿主内部API能力令牌、路径守卫、原始库只读工具与正文发布校验继续生效。终端UI专用插件功能受既有RPC交互策略限制。此版本不合并main或发版。
+
+
+## 18. 升级增补（2026-10）
+
+2026-10 完成的双模型（图片理解）、并行构建、任务编排插件、命令行 CLI 与源库受控写/写回飞书升级已实施合入（切片 S0–S13）。完整增量设计与实施依据是 [kb-agent-upgrade-design.md](./kb-agent-upgrade-design.md)：图片理解通道与 mediaHash、构建单元划分与并行调度、`task_*` 编排工具与角色卡、CLI 命令表与令牌认证、SourceEditService/FeishuWriteService 接口、转义归一化与写回安全协议等增量细节以该文档为准，未提及的契约一律沿用本文。本次升级对本文的基线修订（§5.2 配置段、§7.1 运行类型与工具表、§8 错误码、§13 不变量）已直接并入上文对应章节。
+

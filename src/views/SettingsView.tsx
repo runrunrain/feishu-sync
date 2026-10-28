@@ -22,11 +22,13 @@ import {
   FolderTree,
   Info,
   KeyRound,
+  PenLine,
   Puzzle,
   Server,
   Settings,
   ShieldCheck,
   Sparkles,
+  Terminal,
   Trash2,
 } from 'lucide-react';
 import { KnowledgeSettingsCard } from '../components/KnowledgeSettingsCard';
@@ -39,6 +41,8 @@ import { AuthSettingsCard } from '../components/AuthSettingsCard';
 import { AppUpdateCard } from '../components/AppUpdateCard';
 import { AgentPluginsCard } from '../components/agent/AgentPluginsCard';
 import { AgentRuntimeSettingsCard, AgentKbSettingsCard } from '../components/agent/AgentSettingsCard';
+import { CliAccessSettingsCard } from '../components/CliAccessSettingsCard';
+import { FeishuWriteSettingsCard } from '../components/FeishuWriteSettingsCard';
 
 type SettingsTab = 'knowledge' | 'models' | 'agent' | 'auth' | 'application';
 
@@ -151,7 +155,7 @@ const SETTINGS_TABS: SettingsTabMeta[] = [
   {
     id: 'auth',
     label: '飞书认证',
-    description: 'lark-cli 登录状态与权限范围',
+    description: 'lark-cli 登录状态、权限范围与文档写入授权',
     icon: ShieldCheck,
     items: [
       {
@@ -160,6 +164,13 @@ const SETTINGS_TABS: SettingsTabMeta[] = [
         description: 'lark-cli 登录状态与权限范围',
         icon: KeyRound,
         render: () => <AuthSettingsCard />,
+      },
+      {
+        id: 'auth-feishu-write',
+        label: '飞书写入',
+        description: '写回飞书开关与文档写入权限增量授权（S13）',
+        icon: PenLine,
+        render: () => <FeishuWriteSettingsCard />,
       },
     ],
   },
@@ -175,6 +186,13 @@ const SETTINGS_TABS: SettingsTabMeta[] = [
         description: '版本、更新、自启动与通知',
         icon: Info,
         render: () => <AppUpdateCard />,
+      },
+      {
+        id: 'app-cli',
+        label: '命令行访问',
+        description: '终端调用 feishu-sync 命令：开关、令牌轮换与 feishu-sync 入口生成',
+        icon: Terminal,
+        render: () => <CliAccessSettingsCard />,
       },
     ],
   },

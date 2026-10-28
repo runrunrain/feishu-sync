@@ -513,6 +513,106 @@ export class LarkCliClient {
     ], 'docx');
   }
 
+  // -------------------------------------------------------------------------
+  // S12 飞书写回（设计 §7.5；S0-write-probe 实测定稿）。只新增方法，既有
+  // 读链路零改动。argv 形态锁死 S0 实测版本：
+  //   docs +update --doc <t> --command append|overwrite
+  //              --doc-format markdown --content @<tmpfile> [--revision-id <rev>] --json
+  //
+  // `@file` 只接受子进程 cwd 相对路径（S0 §②-S2 实测：绝对路径报
+  // `unsafe file path`；execute 的 executionOptions.cwd 直通 execFile 的
+  // options.cwd，因此正文经临时目录 + 纯文件名传入，绝不落 argv/日志
+  // （设计 §9.1 不变量 5：写回内容经临时文件传 lark-cli））。
+  // -------------------------------------------------------------------------
+
+  /** 追加 markdown 正文（非幂等；调用方负责不重试）。 */
+  async updateDocumentAppend(
+    objToken: string,
+    markdown: string,
+  ): Promise<{ revisionId: number | null; warnings: string[]; raw: any }> {
+    return this.updateDocument(objToken, 'append', markdown);
+  }
+
+  /**
+   * 全量覆盖正文（markdown）。revisionId 仅防「未来值」（S0 D5 实测：旧
+   * revision 会被静默接受并造成内容重复损坏——服务层三段式协议保证
+   * revision 来自同流程的即时 fetch，且绝不重试旧值）。
+   */
+  async overwriteDocument(
+    objToken: string,
+    markdown: string,
+    revisionId: number,
+  ): Promise<{ revisionId: number | null; warnings: string[]; raw: any }> {
+    return this.updateDocument(objToken, 'overwrite', markdown, revisionId);
+  }
+
+  /** update 命令公共封装：临时目录 + cwd 相对 @file + 容错响应解析。 */
+  private async updateDocument(
+    objToken: string,
+    command: 'append' | 'overwrite',
+    markdown: string,
+    revisionId?: number,
+  ): Promise<{ revisionId: number | null; warnings: string[]; raw: any }> {
+    if (typeof objToken !== 'string' || objToken.trim().length === 0) {
+      throw new Error(`updateDocument requires a non-empty objToken; received: ${String(objToken)}`);
+    }
+    if (typeof markdown !== 'string') {
+      throw new Error('updateDocument requires markdown to be a string');
+    }
+    // 独立临时目录：正文不进 argv/日志；@file 用纯文件名 = 子进程 cwd 相对路径。
+    const stagingDir = fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-sync-push-'));
+    try {
+      const fileName = 'content.md';
+      fs.writeFileSync(path.join(stagingDir, fileName), markdown, 'utf-8');
+      const args = [
+        'docs', '+update',
+        '--doc', objToken,
+        '--command', command,
+        '--doc-format', 'markdown',
+        '--content', `@${fileName}`,
+      ];
+      if (command === 'overwrite') {
+        args.push('--revision-id', String(revisionId));
+      }
+      args.push('--json');
+      const result = await this.execute(args, 'docx', {
+        cwd: stagingDir,
+        // overwrite 是服务端单请求全量替换，大文档余量对齐 export 预算。
+        timeoutMs: 120_000,
+      });
+      const revision = result?.revision_id ?? result?.data?.revision_id ?? result?.data?.document?.revision_id;
+      const warnings = Array.isArray(result?.warnings)
+        ? result.warnings.filter((item: unknown) => typeof item === 'string')
+        : [];
+      return {
+        revisionId: typeof revision === 'number' && Number.isFinite(revision) ? revision : null,
+        warnings,
+        raw: result,
+      };
+    } finally {
+      fs.rmSync(stagingDir, { recursive: true, force: true });
+    }
+  }
+
+  /**
+   * 读取文档当前 revision（S0 D6：docx v1 documents API 写后即时可读，
+   * 无延迟；返回 { revisionId, title? }，失败原样抛 LarkCliError）。
+   */
+  async fetchDocumentRevision(
+    objToken: string,
+  ): Promise<{ revisionId: number | null; title?: string }> {
+    const result = await this.execute([
+      'api', 'GET', `/open-apis/docx/v1/documents/${objToken}`, '--format', 'json',
+    ], 'docx');
+    const data = result?.data ?? result;
+    const document = data?.document ?? {};
+    const revision = data?.revision_id ?? document?.revision_id;
+    return {
+      revisionId: typeof revision === 'number' && Number.isFinite(revision) ? revision : null,
+      title: typeof document?.title === 'string' ? document.title : undefined,
+    };
+  }
+
   async downloadMedia(
     token: string,
     outputPath: string,

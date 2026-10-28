@@ -57,6 +57,14 @@ export interface SessionServiceDeps {
   /** F3-R02：当前配置快照的 Workspace 守卫（含受保护运行资源根）；
    * spawn/写能力使用时动态复核，冲突即拒绝，不让旧授权永久生效。 */
   workspaceGuards: () => WorkspaceRootGuards;
+  /**
+   * S6 任务编排：编排启用时向 Discuss/Work 会话下发 task_* 工具面
+   * （白名单 + pi --tools 参数面）；关闭时按族整族剔除。
+   * 每次 spawn 时求值（插件开关变更后首个新 run 生效）。
+   */
+  taskTools?: () => { enabled: boolean; names: readonly string[]; family: string } | null;
+  /** S6：父会话删除时回调（取消其非终态子任务）。 */
+  onSessionDeleted?: (sessionId: string) => void;
 }
 
 /** LocalMapStore 会话面结构类型（实际由 LocalMapStore 满足）。 */
@@ -83,6 +91,8 @@ export class SessionService extends EventEmitter {
   private readonly sseBuffers = new Map<string, SessionSseEvent[]>();
   private readonly sseSeq = new Map<string, number>();
   private readonly runs = new Map<string, ActiveRun>();
+  /** T3b-07：停止已请求但尚未 run_end 的会话（abort ACK 窗口标记）。 */
+  private readonly abortRequested = new Set<string>();
   private readonly modelRevisions = new WeakMap<PiRpcProcess, string>();
   private readonly pluginRevisions = new WeakMap<PiRpcProcess, string>();
   private readonly sessionStates = new Map<string, 'starting' | 'streaming'>();
@@ -228,6 +238,8 @@ export class SessionService extends EventEmitter {
     }
     this.sseBuffers.delete(id);
     this.emitSessionState(id, localMapStore);
+    // S6：父会话删除 → 其非终态子任务取消（设计 §5.3）
+    this.deps.onSessionDeleted?.(id);
     return true;
   }
 
@@ -362,6 +374,9 @@ export class SessionService extends EventEmitter {
     this.sessionStates.set(sessionId, 'starting');
     const run: ActiveRun = { runId, sessionId, phase: 'starting' };
     this.runs.set(sessionId, run);
+    // 新运行开始即清除上一轮的停止标记（abort 与 runs.set 的竞态窗口内
+    // 旧标记不得海化新运行的批准复核）。
+    this.abortRequested.delete(sessionId);
     this.emitSse(sessionId, 'run_start', { runId });
     this.emitSessionState(sessionId, localMapStore);
 
@@ -460,6 +475,7 @@ export class SessionService extends EventEmitter {
       this.emitSse(sessionId, 'run_end', { runId, outcome: 'failed', error: { code, message: message.slice(0, 500) } });
     } finally {
       this.runs.delete(sessionId);
+      this.abortRequested.delete(sessionId);
       this.sessionStates.delete(sessionId);
       this.deps.pool.setBusy(sessionId, false);
       this.emitSessionState(sessionId, localMapStore);
@@ -495,12 +511,16 @@ export class SessionService extends EventEmitter {
     if (!slot) {
       throw new ToolError('agent_busy', 'Agent 并发已达上限，请稍后重试', 409);
     }
+    // S6：编排启用的会话下发 task_*；关闭时按族从白名单剔除
+    const taskFace = this.deps.taskTools?.() ?? null;
+    const orchestrationOn = taskFace?.enabled === true;
     const { token } = this.deps.toolService.createRunContext({
       runKind,
       sessionId,
       outputRoot: config.standardKb.outputRoot,
       knowledgeBaseRoot: config.knowledgeBaseRoot,
       workspaceRoot,
+      ...(taskFace && !orchestrationOn ? { disableToolFamilies: [taskFace.family] } : {}),
       onEvent: (event) => {
         this.emitSse(sessionId, 'tool', {
           runId: this.runs.get(sessionId)?.runId ?? '',
@@ -562,7 +582,9 @@ export class SessionService extends EventEmitter {
       piCliPath: runtime.piCliPath,
       ...(extensionPath ? { extensionPath } : {}),
       ...(pluginSnapshot ? { additionalExtensionPaths: pluginSnapshot.extensionPaths ?? [pluginSnapshot.extensionPath], allowExternalPluginTools: pluginSnapshot.externalPlugins, additionalSkillPaths: pluginSnapshot.skillPaths, additionalPromptPaths: pluginSnapshot.promptPaths, additionalThemePaths: pluginSnapshot.themePaths } : {}),
-      tools: toolsForRunKind(runKind),
+      tools: orchestrationOn
+        ? [...toolsForRunKind(runKind), ...taskFace!.names]
+        : toolsForRunKind(runKind),
       sessionDir: this.sessionDir(),
       sessionId,
       model,
@@ -598,11 +620,26 @@ export class SessionService extends EventEmitter {
   ): Promise<AgentSessionDto | null> {
     const row = localMapStore.getAgentSession(id);
     if (!row) return null;
+    // T3b-07：停止请求即关闭批准窗口——立即撤销本会话 pending 批准并
+    // 标记 aborting（app_command 批准后执行前据此复核），不等 run_end
+    //（abort ACK 最长等待 15s + 2s 兑底，窗口内迟到批准不得再执行）。
+    this.abortRequested.add(id);
+    this.emit('session_abort', { sessionId: id });
     const process = this.deps.pool.get(id);
     if (process) {
       await process.abort();
     }
     return this.get(localMapStore, this.currentConfig(), id);
+  }
+
+  /**
+   * T3b-07：会话运行状态（app_command 批准后执行前复核用）。
+   * 'aborting'：停止已请求（abort ACK 窗口）；'running'：活跃运行中；
+   * 'idle'：无活跃运行（settled/未运行）。
+   */
+  runState(sessionId: string): 'running' | 'aborting' | 'idle' {
+    if (this.abortRequested.has(sessionId)) return 'aborting';
+    return this.runs.has(sessionId) ? 'running' : 'idle';
   }
 
   hasActiveRuns(): boolean { return this.runs.size > 0; }

@@ -67,18 +67,31 @@ const CONFIG_INIT_URL_TIMEOUT_MS = 90_000;
  * 对齐，取 12 分钟；CLI 正常情况下过期/完成后自行退出）。 */
 const CONFIG_INIT_COMPLETE_TIMEOUT_MS = 12 * 60_000;
 /**
- * 从 `config init --new` 的流式输出中提取验证 URL。形状来自 lark-cli
- * 二进制内嵌的自身提取正则（1.0.95 实测提取）：
- * `https://open.feishu.cn/app/<app_id>/auth?q=<code>`（larksuite.com 域
- * 为海外品牌变体）。不用 g 标志：每次对累积 buffer 重新匹配。
+ * 从 `config init --new` 的流式输出中提取验证 URL。两种形态：
+ * - 1.0.95 内嵌正则形态：`https://open.feishu.cn/app/<app_id>/auth?q=<code>`
+ * - 1.0.97 实测形态（2026-10 本机采样）：CLI 先向 stdout 绘制 UTF-8 块字符
+ *   二维码点阵，再输出 `https://open.feishu.cn/page/cli?user_code=<code>&lpv=…`
+ *   （larksuite.com 域为海外品牌变体）。旧正则只认 app/auth 形态，在
+ *   1.0.97 上永不命中 → config_init_url_timeout 90s 挂死（未配置态应用内
+ *   认证断链的根因）。不用 g 标志：每次对累积 buffer 重新匹配；QR 块字符
+ *   与 URL 混在同一 buffer，正则按 https 前缀锚定不受影响。
  */
-const CONFIG_INIT_URL_RE = /https?:\/\/open\.(?:feishu\.cn|larksuite\.com)\/app\/[^/\s"']+\/auth\?q=[^\s"'<>]+/;
+const CONFIG_INIT_URL_RE = /https?:\/\/open\.(?:feishu\.cn|larksuite\.com)\/(?:app\/[^/\s"']+\/auth\?q=[^\s"'<>]+|page\/cli\?[^\s"'<>]+)/;
 /**
  * 上游「整单 scope 无效」拒绝特征（2026-10 实测：请求集里混入未在 OAuth
  * 应用注册的 scope 名时，飞书 device authorization 直接拒绝整单）。命中
  * 且本次用的是并集请求集时，降级为最小必需集重试。
  */
 const INVALID_SCOPE_RE = /invalid or malformed scopes/i;
+
+/**
+ * S12 写回 scope 集（设计 §7.6；S0-write-probe §③ D2 实测定稿）：v1 仅
+ * 追加正文场景最小集。媒体回传需另加 docs:document.media:upload（实测
+ * 通过，v1 不申请）；运行时遇 missing_scope 错误可读出 scope 名引导增量
+ * 授权。`wiki:node:update` 不在本应用授予集，写 wiki 内 docx 走 docs 域
+ * 命令、无需它。
+ */
+export const WRITE_SCOPES: readonly string[] = ['docx:document:write_only'];
 
 /** Manager 级结构化错误：code 稳定，status 直接映射 HTTP 状态码。 */
 export class LarkCliManagerError extends Error {
@@ -114,6 +127,9 @@ export interface LarkCliInstallResult {
   error?: string;
 }
 
+/** device flow 的 scope 面：read = 既有同步必需集；write = 必需集 ∪ WRITE_SCOPES（S12）。 */
+export type DeviceAuthScopeSet = 'read' | 'write';
+
 export interface DeviceAuthSession {
   verificationUrl: string;
   deviceCode: string;
@@ -125,6 +141,8 @@ export interface DeviceAuthSession {
    * 未勾选/未列出的 scope 会被服务端静默丢弃且流程仍报「授权成功」。 */
   requestedScopes: string[];
   mode: DeviceAuthMode;
+  /** 本次请求的 scope 面（S12；缺省 read。write = 请求基线含 WRITE_SCOPES）。 */
+  scopeSet?: DeviceAuthScopeSet;
   previousAccount?: LarkCliAuthReadiness['account'];
 }
 
@@ -562,8 +580,16 @@ export class LarkCliManager {
     }
   }
 
-  /** 同账号补授权保留并集；换号仅请求同步必需权限。流程不进入同步队列。 */
-  async startDeviceAuth(mode: DeviceAuthMode = 'reauthorize'): Promise<DeviceAuthSession> {
+  /** 同账号补授权保留并集；换号仅请求同步必需权限。流程不进入同步队列。
+   *
+   * S12（设计 §7.6）：options.scopeSet='write' 时把 WRITE_SCOPES 并入
+   * 本次请求基线（写回授权入口）；缺省 'read'，既有读链路 argv 与行为
+   * 字节不变。整单拒绝降级同样退到（含写集的）基线集。
+   */
+  async startDeviceAuth(
+    mode: DeviceAuthMode = 'reauthorize',
+    options: { scopeSet?: DeviceAuthScopeSet } = {},
+  ): Promise<DeviceAuthSession> {
     if (mode !== 'reauthorize' && mode !== 'switch_account') {
       throw new LarkCliManagerError('未知认证模式', 'invalid_auth_mode', 400);
     }
@@ -575,14 +601,18 @@ export class LarkCliManager {
       deviceCode: '', mode, controller: new AbortController(), completing: false,
     };
     this.pendingDeviceAuth = pending;
+    const scopeSet: DeviceAuthScopeSet = options.scopeSet === 'write' ? 'write' : 'read';
     try {
       const required = await this.resolveRequiredScopes();
+      const requestBase = scopeSet === 'write'
+        ? [...new Set([...required, ...WRITE_SCOPES])]
+        : required;
       // 本地快照用于记录旧账号，不能把它当作通过联网验证的就绪状态。
       const before = await this.larkCliClient.checkAuthReady({ verify: false });
       pending.previousAccount = before.account;
       const granted = mode === 'reauthorize' ? before.currentScopes ?? [] : [];
       const retired = new Set(RETIRED_REQUEST_SCOPES);
-      const union = [...new Set([...granted, ...required])].filter((s) => s.trim() && !retired.has(s));
+      const union = [...new Set([...granted, ...requestBase])].filter((s) => s.trim() && !retired.has(s));
       const attempt = async (scopes: string[]) => {
         const args = ['auth', 'login', '--no-wait', '--json', '--scope', scopes.join(' ')];
         try {
@@ -598,9 +628,9 @@ export class LarkCliManager {
       };
       let requestedScopes = union;
       let out = await attempt(union);
-      if (union.some((s) => !required.includes(s)) && INVALID_SCOPE_RE.test(`${out.stdout}\n${out.stderr}`)) {
-        out = await attempt(required);
-        requestedScopes = required;
+      if (union.some((s) => !requestBase.includes(s)) && INVALID_SCOPE_RE.test(`${out.stdout}\n${out.stderr}`)) {
+        out = await attempt(requestBase);
+        requestedScopes = requestBase;
       }
       const parsed = parseDeviceAuthOutput(out);
       const deviceCode = typeof parsed.device_code === 'string' ? parsed.device_code : '';
@@ -616,7 +646,7 @@ export class LarkCliManager {
         void this.cancelDeviceAuth(deviceCode).catch(() => undefined);
       }, Math.min(expiresIn * 1000, DEVICE_AUTH_COMPLETE_TIMEOUT_MS));
       pending.expiryTimer.unref?.();
-      return { verificationUrl, deviceCode, expiresIn, requestedScopes, mode, previousAccount: before.account };
+      return { verificationUrl, deviceCode, expiresIn, requestedScopes, scopeSet, mode, previousAccount: before.account };
     } catch (error) {
       this.releaseDeviceAuth(pending);
       throw deviceAuthStartError(error);

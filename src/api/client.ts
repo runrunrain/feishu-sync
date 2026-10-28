@@ -1,4 +1,5 @@
 import type { SourceBatchRequest, SourceBatchPreview, SourceBatchResult } from '../types/source-batch';
+import type { CliEnableResult, CliInfoDto, CliRotateResult, CliShimInstallResult } from '../types/cli';
 import type { PiPluginsDto } from '../types/pi-plugin';
 import type { AgentPluginsDto, AgentPluginInput } from '../types/agent-plugin';
 import type { KbSourceTreeDto, KbSourceChoice, KbChangePreview, KbVersionDto } from '../types/kb-version';
@@ -27,11 +28,19 @@ import type {
   CustomFolder,
   AddLinkToFolderResult,
   DocumentContent,
+  SourceEditStatus,
+  SourceEditResult,
+  SourcePushPlan,
+  SourcePushResult,
 } from '../types';
 import type {
+  AgentApprovalDto,
   AgentMessageDto,
   AgentSessionDto,
   AgentStatusDto,
+  AgentTaskDto,
+  AgentVisionStatusDto,
+  AgentVisionTestResult,
   AgentWorkspaceConfig,
   KbBuildDto,
   KbBuildReportDto,
@@ -328,6 +337,8 @@ export interface DeviceAuthStartResult {
   expiresIn: number;
   /** 本次请求的 scope 集（2026-10 起服务端返回；旧版本无此字段）。 */
   requestedScopes?: string[];
+  /** S12：read=同步读权限；write=额外并入 docx:document:write_only。 */
+  scopeSet?: 'read' | 'write';
   mode: DeviceAuthMode;
   previousAccount?: AuthStatus['account'];
 }
@@ -371,10 +382,13 @@ export async function installLarkCli(): Promise<LarkCliInstallResult> {
   });
 }
 
-export async function startDeviceAuth(mode: DeviceAuthMode = 'reauthorize'): Promise<DeviceAuthStartResult> {
+export async function startDeviceAuth(
+  mode: DeviceAuthMode = 'reauthorize',
+  options: { scopeSet?: 'read' | 'write' } = {},
+): Promise<DeviceAuthStartResult> {
   return request<DeviceAuthStartResult>('/api/feishu/auth/device/start', {
     method: 'POST',
-    body: JSON.stringify({ mode }),
+    body: JSON.stringify({ mode, scopeSet: options.scopeSet ?? 'read' }),
   });
 }
 
@@ -1037,6 +1051,27 @@ export async function recheckAgentStatus(): Promise<AgentStatusDto> {
   });
 }
 
+/** GET /api/agent/vision/status —— 图片理解通道状态（S2 §四；无秘密字段）。 */
+export async function getAgentVisionStatus(): Promise<AgentVisionStatusDto> {
+  return request<AgentVisionStatusDto>('/api/agent/vision/status');
+}
+
+/**
+ * POST /api/agent/vision/test —— 用内置测试图实测识图模型（真实远端调用，
+ * 仅由用户显式点击触发）。传 providerId/modelId 显式覆盖时允许在启用前
+ * 试测候选模型；失败也回 200（ok=false 携带脱敏 error），400/500 抛 APIError。
+ * 客户端超时留足 vision.timeoutMs（上限 600s）余量，以服务端判定为准。
+ */
+export async function testAgentVision(
+  body: { providerId?: string; modelId?: string } = {},
+): Promise<AgentVisionTestResult> {
+  return request<AgentVisionTestResult>('/api/agent/vision/test', {
+    method: 'POST',
+    body: JSON.stringify(body),
+    timeoutMs: 620_000,
+  });
+}
+
 /** GET /api/kb/status —— 发布状态 + 待处理变更 + 活跃构建（§9.2）。 */
 export async function getKbStatus(): Promise<KbStatusDto> {
   return request<KbStatusDto>('/api/kb/status');
@@ -1163,6 +1198,73 @@ export async function abortAgentSession(id: string): Promise<AgentSessionDto> {
   });
 }
 
+// ---------------------------------------------------------------------------
+// 会话内批准（S10，设计 kb-agent-upgrade §6.5）——app_command 的
+// mutate/destructive/remote_write 级命令挂起等待用户裁决。
+// ---------------------------------------------------------------------------
+
+/** GET /api/agent/sessions/:id/approvals —— 当前待裁决的批准请求。 */
+export async function listAgentApprovals(sessionId: string): Promise<AgentApprovalDto[]> {
+  const data = await request<{ approvals: AgentApprovalDto[] }>(
+    `/api/agent/sessions/${encodeURIComponent(sessionId)}/approvals`,
+  );
+  return data.approvals;
+}
+
+/** POST /api/agent/sessions/:id/approvals/:approvalId/decide —— 用户裁决。 */
+export async function decideAgentApproval(
+  sessionId: string,
+  approvalId: string,
+  decision: 'approve' | 'reject',
+): Promise<{ id: string; decision: 'approve' | 'reject' }> {
+  return request(`/api/agent/sessions/${encodeURIComponent(sessionId)}/approvals/${encodeURIComponent(approvalId)}/decide`, {
+    method: 'POST',
+    body: JSON.stringify({ decision }),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 任务编排（S7，设计 kb-agent-upgrade §5.4）——编排子任务的用户面板。
+// 编排开关本身经既有插件上下文 API（PUT /api/agent/plugin-contexts/
+// orchestration，expectedRevision 乐观锁）切换，不新增路由。
+// ---------------------------------------------------------------------------
+
+/** GET /api/agent/tasks?sessionId= —— 会话内任务（created_at 升序）。 */
+export async function listAgentTasks(sessionId: string): Promise<AgentTaskDto[]> {
+  const data = await request<{ tasks: AgentTaskDto[]}>(
+    `/api/agent/tasks?sessionId=${encodeURIComponent(sessionId)}`,
+  );
+  return data.tasks ?? [];
+}
+
+export async function getAgentTask(id: string): Promise<AgentTaskDto> {
+  return request<AgentTaskDto>(`/api/agent/tasks/${encodeURIComponent(id)}`);
+}
+
+/** POST /api/agent/tasks/:id/cancel —— 取消非终态任务（终态 409 task_not_active）。 */
+export async function cancelAgentTask(id: string): Promise<AgentTaskDto> {
+  return request<AgentTaskDto>(`/api/agent/tasks/${encodeURIComponent(id)}/cancel`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
+/** POST /api/agent/tasks/:id/resume —— 对 blocked 任务提交作答（→ queued）。 */
+export async function resumeAgentTask(id: string, message: string): Promise<AgentTaskDto> {
+  return request<AgentTaskDto>(`/api/agent/tasks/${encodeURIComponent(id)}/resume`, {
+    method: 'POST',
+    body: JSON.stringify({ message }),
+  });
+}
+
+/** GET /api/agent/tasks/:id/messages —— 子任务 JSONL 解析出的消息（同会话历史格式）。 */
+export async function getAgentTaskMessages(id: string): Promise<AgentMessageDto[]> {
+  const data = await request<{ messages: AgentMessageDto[] }>(
+    `/api/agent/tasks/${encodeURIComponent(id)}/messages`,
+  );
+  return data.messages ?? [];
+}
+
 /**
  * POST /api/agent/sessions/:id/mode —— 模式切换。
  * 切到 Work 必须带 workspaceId + confirm:'WORK'（§7.6）。
@@ -1280,4 +1382,86 @@ export function saveConversationModel(id: string, model: import('../types/agent'
 }
 export function requestSessionAgentStatus(id: string, refresh = false): Promise<AgentStatusDto> {
   return request(`/api/agent/sessions/${encodeURIComponent(id)}/status${refresh ? '?refresh=1' : ''}`);
+}
+
+// ---------------------------------------------------------------------------
+// CLI 命令行访问（S9；desktop-guarded 管理面，见 server/src/routes/cli*.ts）
+// ---------------------------------------------------------------------------
+
+/** GET /api/cli/info —— 开关/端点/shim 状态（不含令牌）。 */
+export function getCliInfo(): Promise<CliInfoDto> {
+  return request<CliInfoDto>('/api/cli/info');
+}
+
+/** POST /api/cli/enable —— 开启/关闭命令行访问（发布/撤销 endpoint.json）。 */
+export function setCliEnabled(enabled: boolean): Promise<CliEnableResult> {
+  return request<CliEnableResult>('/api/cli/enable', { method: 'POST', body: JSON.stringify({ enabled }) });
+}
+
+/** POST /api/cli/token/rotate —— 轮换 CLI 令牌（需已开启）。 */
+export function rotateCliToken(): Promise<CliRotateResult> {
+  return request<CliRotateResult>('/api/cli/token/rotate', { method: 'POST', body: JSON.stringify({}) });
+}
+
+/** POST /api/cli/install-shim —— 生成 <dataRoot>/bin/feishu-sync 可执行入口。 */
+export function installCliShim(): Promise<CliShimInstallResult> {
+  return request<CliShimInstallResult>('/api/cli/install-shim', { method: 'POST', body: JSON.stringify({}) });
+}
+
+// ---------------------------------------------------------------------------
+// 源编辑与写回（S11/S12 API，S13 UI 消费）
+// ---------------------------------------------------------------------------
+
+/** GET /api/sources/:objToken/edit-status —— 正文 hash 与编辑状态（OCC 入口）。 */
+export function getSourceEditStatus(objToken: string): Promise<SourceEditStatus> {
+  return request<SourceEditStatus>(`/api/sources/${encodeURIComponent(objToken)}/edit-status`);
+}
+
+/**
+ * POST /api/sources/:objToken/edit —— 保存正文编辑（baseHash OCC）。
+ * 409 source_edit_conflict 时 err.response.details.currentBodyHash 为最新 hash。
+ */
+export function editSourceDocument(
+  objToken: string,
+  opts: { newText: string; baseHash: string },
+): Promise<SourceEditResult> {
+  return request<SourceEditResult>(`/api/sources/${encodeURIComponent(objToken)}/edit`, {
+    method: 'POST',
+    body: JSON.stringify({ newText: opts.newText, baseHash: opts.baseHash, confirm: 'EDIT', actor: 'ui' }),
+  });
+}
+
+/** POST /api/sources/:objToken/revert —— 放弃修改（恢复上次同步正文）。 */
+export function revertSourceEdit(objToken: string): Promise<{ ok: true }> {
+  return request<{ ok: true }>(`/api/sources/${encodeURIComponent(objToken)}/revert`, {
+    method: 'POST',
+    body: JSON.stringify({ confirm: 'REVERT', actor: 'ui' }),
+  });
+}
+
+/** POST /api/sources/:objToken/push/preview —— 写回计划（不动状态）。 */
+export function previewSourcePush(objToken: string): Promise<SourcePushPlan> {
+  return request<SourcePushPlan>(`/api/sources/${encodeURIComponent(objToken)}/push/preview`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
+/**
+ * POST /api/sources/:objToken/push —— 执行写回。
+ * confirm 门（S12）：追加→'PUSH'；覆盖/强制→'OVERWRITE_CLOUD'。
+ */
+export function pushSourceToFeishu(
+  objToken: string,
+  opts: { allowOverwrite?: boolean; force?: boolean; confirm: 'PUSH' | 'OVERWRITE_CLOUD' },
+): Promise<SourcePushResult> {
+  return request<SourcePushResult>(`/api/sources/${encodeURIComponent(objToken)}/push`, {
+    method: 'POST',
+    body: JSON.stringify({
+      allowOverwrite: opts.allowOverwrite === true,
+      force: opts.force === true,
+      confirm: opts.confirm,
+      actor: 'ui',
+    }),
+  });
 }

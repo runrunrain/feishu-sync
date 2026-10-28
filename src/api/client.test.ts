@@ -4,12 +4,21 @@ import { APIError, startDeviceAuth } from './client';
 afterEach(() => vi.unstubAllGlobals());
 
 describe('device authentication API', () => {
-  it('starts same-account reauthentication by default', async () => {
+  it('starts same-account reauthentication by default (scopeSet=read)', async () => {
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({ deviceCode: 'test-device' })));
     vi.stubGlobal('fetch', fetchMock);
     await startDeviceAuth();
     expect(fetchMock).toHaveBeenCalledWith('/api/feishu/auth/device/start', expect.objectContaining({
-      method: 'POST', body: '{"mode":"reauthorize"}',
+      method: 'POST', body: '{"mode":"reauthorize","scopeSet":"read"}',
+    }));
+  });
+
+  it('requests write scope set for feishu write authorization (S13)', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ deviceCode: 'test-device' })));
+    vi.stubGlobal('fetch', fetchMock);
+    await startDeviceAuth('reauthorize', { scopeSet: 'write' });
+    expect(fetchMock).toHaveBeenCalledWith('/api/feishu/auth/device/start', expect.objectContaining({
+      method: 'POST', body: '{"mode":"reauthorize","scopeSet":"write"}',
     }));
   });
 

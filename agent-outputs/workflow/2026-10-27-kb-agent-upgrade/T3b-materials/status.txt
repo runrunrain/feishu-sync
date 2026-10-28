@@ -1,0 +1,114 @@
+ M docs/agent-knowledge.md
+ M docs/design/agent-knowledge-design.md
+ M server/scripts/build-agent-assets.mjs
+ M server/src/agent/agent-assets.ts
+ M server/src/agent/agent-process-pool.ts
+ M server/src/agent/agent-tool-service.ts
+ M server/src/agent/app-plugin-store.ts
+ M server/src/agent/prompts/standard-kb-build.md
+ M server/src/agent/session-service.ts
+ M server/src/agent/tool-specs.ts
+ M server/src/index.ts
+ M server/src/kb/kb-build-service.ts
+ M server/src/kb/source-cleanup.ts
+ M server/src/modules/config-manager.ts
+ M server/src/modules/custom-doc-sync.ts
+ M server/src/modules/lark-cli-client.ts
+ M server/src/modules/lark-cli-manager.ts
+ M server/src/modules/layout-reconstructor.ts
+ M server/src/modules/local-map-store.ts
+ M server/src/modules/sync-engine.ts
+ M server/src/routes/agent.ts
+ M server/src/routes/config.ts
+ M server/src/routes/feishu.ts
+ M server/src/routes/kb.ts
+ M server/src/routes/llm.ts
+ M server/src/routes/orphan-files.ts
+ M server/src/routes/trash.ts
+ M server/src/types/agent-knowledge.ts
+ M server/src/types/index.ts
+ M server/tests/agent-config.test.ts
+ M server/tests/agent-internal-auth.test.ts
+ M server/tests/agent-session.test.ts
+ M server/tests/app-plugins.test.ts
+ M server/tests/config-routes.test.ts
+ M server/tests/custom-folders.test.ts
+ M server/tests/lark-cli-manager.test.ts
+ M server/tests/trash-llm-routes.test.ts
+ M src/api/client.test.ts
+ M src/api/client.ts
+ M src/components/DocPreviewPanel.tsx
+ M src/components/agent/AgentSettingsCard.tsx
+ M src/components/agent/MessageStream.tsx
+ M src/components/kb/KbBuildPanel.tsx
+ M src/components/kb/KbChangesPanel.tsx
+ M src/components/kb/RawSourceDrawer.tsx
+ M src/components/preview/MarkdownView.tsx
+ M src/hooks/useAgentSessions.ts
+ M src/types/agent.ts
+ M src/types/index.ts
+ M src/types/kb-version.ts
+ M src/utils/agentReadiness.ts
+ M src/utils/html-table.ts
+ M src/views/AgentView.tsx
+ M src/views/SettingsView.tsx
+?? agent-outputs/
+?? docs/design/kb-agent-upgrade-design.md
+?? server/scripts/lib/cli-bundle.mjs
+?? server/src/agent/approvals/
+?? server/src/agent/prompts/image-describe.md
+?? server/src/agent/roles/
+?? server/src/agent/tasks/
+?? server/src/agent/tools/
+?? server/src/agent/vision/
+?? server/src/cli-endpoint.ts
+?? server/src/cli/
+?? server/src/kb/build-units.ts
+?? server/src/kb/path-claims.ts
+?? server/src/kb/source-images.ts
+?? server/src/middleware/cli-auth.ts
+?? server/src/ops/
+?? server/src/routes/cli-admin.ts
+?? server/src/routes/cli.ts
+?? server/src/routes/sources.ts
+?? server/src/sources/
+?? server/tests/agent-approvals-routes.test.ts
+?? server/tests/agent-process-pool.test.ts
+?? server/tests/agent-tasks.test.ts
+?? server/tests/agent-tool-families.test.ts
+?? server/tests/app-command-family.test.ts
+?? server/tests/approval-service.test.ts
+?? server/tests/cli-args.test.ts
+?? server/tests/cli-client.test.ts
+?? server/tests/cli-endpoint.test.ts
+?? server/tests/cli-source-commands.test.ts
+?? server/tests/kb-build-parallel.test.ts
+?? server/tests/kb-build-units.test.ts
+?? server/tests/kb-path-claims.test.ts
+?? server/tests/kb-source-images.test.ts
+?? server/tests/layout-reconstructor.test.ts
+?? server/tests/ops-command-table.test.ts
+?? server/tests/source-edit.test.ts
+?? server/tests/source-push.test.ts
+?? server/tests/vision-channel.test.ts
+?? server/tests/vision-config.test.ts
+?? server/tests/vision-describer.test.ts
+?? server/tests/vision-routes.test.ts
+?? src/components/CliAccessSettingsCard.test.tsx
+?? src/components/CliAccessSettingsCard.tsx
+?? src/components/FeishuWriteSettingsCard.test.tsx
+?? src/components/FeishuWriteSettingsCard.tsx
+?? src/components/SourceEditControls.test.tsx
+?? src/components/SourceEditControls.tsx
+?? src/components/agent/AgentSettingsCard.test.tsx
+?? src/components/agent/ApprovalCard.test.tsx
+?? src/components/agent/ApprovalCard.tsx
+?? src/components/agent/TaskPanel.test.tsx
+?? src/components/agent/TaskPanel.tsx
+?? src/components/kb/KbBuildPanel.test.tsx
+?? src/components/kb/KbChangesPanel.test.tsx
+?? src/components/preview/MarkdownView.defects.test.tsx
+?? src/hooks/useAgentOrchestration.ts
+?? src/hooks/useAgentSessions.tasks.test.ts
+?? src/hooks/useCliInfo.ts
+?? src/types/cli.ts

@@ -16,9 +16,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
-import { AgentProcessPool, AgentBusyError } from '../agent/agent-process-pool.js';
-import { AgentToolService, ToolError, validateStdDocPath } from '../agent/agent-tool-service.js';
-import type { BuildRunState } from '../agent/agent-tool-service.js';
+import { AgentProcessPool, AgentBusyError, type PoolSlot } from '../agent/agent-process-pool.js';
+import { AgentToolService, ToolError, validateStdDocPath, type BuildRunState } from '../agent/agent-tool-service.js';
+import type { VisionDescriberLike } from '../agent/agent-tool-service.js';
 import { isPathInside } from '../agent/path-guard.js';
 import { buildPiProcessEnv, PiRpcProcess } from '../agent/pi-rpc-process.js';
 import { PiRuntimeResolver, resolveAppLlmModel } from '../agent/runtime-resolver.js';
@@ -27,12 +27,22 @@ import { RawSourceSnapshot, computeSourceHash } from './raw-source-snapshot.js';
 import { StandardKbStore, parseStdHeader, stripStdHeader } from './standard-kb-store.js';
 import { KbVersionStore, captureSourceContents, sourceChangePreview, type SourceContents } from './kb-version-store.js';
 import { hasEditorialHistory, hasSourceMetadata } from './body-policy.js';
+import { planUnits, type BuildUnit } from './build-units.js';
+import { PathClaims } from './path-claims.js';
+import { enrichEntriesWithMedia, resolveSourceImages, verifyEntryMediaHash } from './source-images.js';
+import type { ImageDescription } from '../agent/vision/vision-describer.js';
+import { VisionDescriber } from '../agent/vision/vision-describer.js';
+import { buildDefaultAgentVisionConfig } from '../types/agent-knowledge.js';
 import type { KbChangePreview, KbFileChange } from '../types/kb-version.js';
 import {
   toolsForRunKind,
   type AgentStatusDto,
   type KbBuildDto,
+  type KbBuildImagesProgress,
+  type KbBuildProgressDto,
   type KbBuildReportIssue,
+  type KbBuildUnitsProgress,
+  type KbBuildWorkerProgress,
   type KbCurrentPointer,
   type KbManifest,
   type KbManifestDoc,
@@ -53,6 +63,25 @@ export interface KbBuildDeps {
   extensionPath: () => string | null;
   promptAssets: () => { buildRules: string; styleGuide: string } | null;
   pluginStore?: AppPluginStore;
+  /** S3：图片描述器（preflight 预描述）。未注入时按 deps 自建（读 config） */
+  visionDescriber?: VisionDescriberLike;
+  /** S4：测试接缝——替换 PiRpcProcess 构造（假 pi 双 worker 回归用） */
+  processFactory?: (options: ConstructorParameters<typeof PiRpcProcess>[0]) => PiRpcProcess;
+}
+
+interface WorkerRuntime {
+  workerId: string;
+  poolKey: string;
+  slot: PoolSlot | null;
+  rpc: PiRpcProcess | null;
+  token: string | null;
+  /** 当前进程的运行上下文（unitId/phase 随拉取单元/收尾轮更新） */
+  context: import('../agent/agent-tool-service.js').InternalRunContext | null;
+  state: KbBuildWorkerProgress['state'];
+  unitId: string | null;
+  unitBatchIndex: number;
+  unitBatchTotal: number;
+  exited: boolean;
 }
 
 interface InMemoryBuild {
@@ -61,6 +90,14 @@ interface InMemoryBuild {
   batchTotal: number;
   buildState: BuildRunState | null;
   cancelRequested: boolean;
+  /** S4：取消句柄集（abort 全部 worker 进程 + 排队 acquire） */
+  cancelController: AbortController | null;
+  timedOut: boolean;
+  /** S4：全部 worker 进程（含收尾轮复用/新拉）；key=workerId */
+  workers: Map<string, WorkerRuntime>;
+  stage: KbBuildProgressDto['stage'];
+  units: KbBuildUnitsProgress;
+  images: KbBuildImagesProgress;
   process: PiRpcProcess | null;
   events: Array<{ seq: number; event: string; data: unknown }>;
 }
@@ -69,6 +106,8 @@ export class KbBuildService extends EventEmitter {
   private readonly deps: KbBuildDeps;
   private readonly active = new Map<string, InMemoryBuild>();
   private running = false;
+  /** S3：未注入 visionDescriber 时的懒建默认实例 */
+  private defaultDescriber?: VisionDescriberLike;
 
   constructor(deps: KbBuildDeps) {
     super();
@@ -130,6 +169,45 @@ export class KbBuildService extends EventEmitter {
   // DTO
   // ------------------------------------------------------------------
 
+  private static readonly EMPTY_IMAGES: KbBuildImagesProgress = { total: 0, described: 0, cached: 0, unavailable: 0 };
+
+  private progressOf(entry?: InMemoryBuild): KbBuildProgressDto {
+    if (!entry) {
+      return {
+        batchIndex: 0,
+        batchTotal: 0,
+        stage: null,
+        units: { total: 0, done: 0, running: 0, failed: 0, retried: 0 },
+        workers: [],
+        images: { ...KbBuildService.EMPTY_IMAGES },
+      };
+    }
+    return {
+      batchIndex: entry.batchIndex,
+      batchTotal: entry.batchTotal,
+      stage: entry.stage,
+      units: { ...entry.units },
+      workers: [...entry.workers.values()].map((worker) => ({
+        workerId: worker.workerId,
+        state: worker.state,
+        unitId: worker.unitId,
+        unitBatchIndex: worker.unitBatchIndex,
+        unitBatchTotal: worker.unitBatchTotal,
+      })),
+      images: { ...entry.images },
+    };
+  }
+
+  private static parseWarnings(value: unknown): KbBuildDto['warnings'] {
+    if (typeof value !== 'string' || !value) return [];
+    try {
+      const parsed = JSON.parse(value) as KbBuildDto['warnings'];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+
   toDto(row: Record<string, unknown>, entry?: InMemoryBuild): KbBuildDto {
     return {
       id: String(row.id),
@@ -147,9 +225,9 @@ export class KbBuildService extends EventEmitter {
         docsWritten: Number(row.docs_written ?? 0),
         docsDeleted: Number(row.docs_deleted ?? 0),
       },
-      progress: entry
-        ? { batchIndex: entry.batchIndex, batchTotal: entry.batchTotal }
-        : { batchIndex: 0, batchTotal: 0 },
+      progress: this.progressOf(entry),
+      parallelism: Number(row.parallelism ?? 1),
+      warnings: KbBuildService.parseWarnings(row.warnings_json),
       error: row.error_code
         ? { code: String(row.error_code), message: String(row.error_message ?? '') }
         : null,
@@ -234,6 +312,12 @@ export class KbBuildService extends EventEmitter {
       batchTotal: 0,
       buildState: null,
       cancelRequested: false,
+      cancelController: null,
+      timedOut: false,
+      workers: new Map(),
+      stage: null,
+      units: { total: 0, done: 0, running: 0, failed: 0, retried: 0 },
+      images: { total: 0, described: 0, cached: 0, unavailable: 0 },
       process: null,
       events: [],
     });
@@ -260,6 +344,11 @@ export class KbBuildService extends EventEmitter {
     const entry = this.active.get(buildId);
     if (entry) {
       entry.cancelRequested = true;
+      // S4：取消句柄集——排队中的 acquire 出队拒绝 + 全部 worker 进程 abort
+      entry.cancelController?.abort();
+      for (const worker of entry.workers.values()) {
+        if (worker.rpc && !worker.rpc.isExited()) void worker.rpc.abort();
+      }
       if (entry.process) {
         await entry.process.abort();
       }
@@ -321,6 +410,7 @@ export class KbBuildService extends EventEmitter {
       const pluginSnapshot = this.deps.pluginStore?.snapshot('build');
       // ============ preflight ============
       setStatus('preflight', { startedAt });
+      entry.stage = 'snapshot';
       this.emitLog(buildId, 'info', `preflight：运行时就绪，开始生成原始源快照`);
       cleanupOldStaging(outputRoot);
 
@@ -330,6 +420,8 @@ export class KbBuildService extends EventEmitter {
         documents,
         this.deps.sheetCsvPaths,
       );
+      // S3（§3.4）：为全部条目补充 mediaHash/imageCount（contentHash 公式不变）
+      enrichEntriesWithMedia(config.knowledgeBaseRoot, snapshotResult.entries);
       const snapshot = RawSourceSnapshot.fromEntries(snapshotResult.entries, {
         knowledgeBaseRoot: config.knowledgeBaseRoot,
         sheetCsvPaths: this.deps.sheetCsvPaths,
@@ -359,8 +451,16 @@ export class KbBuildService extends EventEmitter {
         this.emitLog(buildId, 'info', '无已发布版本，incremental 自动按 full 执行');
       }
 
+      // S3：vision 就绪时变更判定含 mediaHash（双方均非空且不等才算变更，U4）
+      const visionDescriber = this.resolveVisionDescriber();
+      const visionStatus = await visionDescriber.status().catch(() => ({
+        state: 'invalid' as const,
+        model: null as string | null,
+        message: '图片理解状态不可用',
+      }));
+      const visionReady = visionStatus.state === 'ready';
       // 变更集（§6.4：本地字节比较，云端状态变化不参与）
-      const changeset = computeChangeset(snapshot.entries, baseManifest);
+      const changeset = computeChangeset(snapshot.entries, baseManifest, { visionEnabled: visionReady });
       // F3-R07：full 工作集 = 快照全部源——重复 full / 部分变化 full 都必须
       // 重建全库（重复执行、只 finish 不得借 skip 发布空或局部库）；增量
       // 维持 added+changed。覆盖验证以 workset 为准，full 时即全量强制。
@@ -449,25 +549,107 @@ export class KbBuildService extends EventEmitter {
       buildState.requiredRewrites = new Set(affectedDocs.map((doc) => doc.path)
         .filter((docPath) => fs.existsSync(path.join(stagingRootPath, 'docs', docPath))));
 
-      const batches = chunk(
-        [...workset.keys()].sort(),
-        Math.max(1, Math.min(50, config.standardKb.buildBatchSize)),
-      );
-      // F3-R07：仅 removed 的增量（无 added/changed）也必须有一个批次明确
-      // 告知模型删除与受影响文档——不能让删除影响只存在于默认删除逻辑里。
-      if (batches.length === 0 && affectedDocs.length > 0) {
-        batches.push([]);
-      }
-      entry.batchTotal = batches.length + 1; // + 最后 finish prompt
-      this.emitLog(buildId, 'info', `开始模型构建（${effectiveMode}）：${workset.size} 个工作集源分 ${batches.length} 批`);
+      // ---- S3（§3.4）：preflight 图片预描述（stage=describing_images）----
+      // vision 就绪 → describeMany（缓存命中不调远端、不计配额）；未就绪 →
+      // 全部标 unavailable(vision_unconfigured)。U5：不阻断构建。
+      entry.stage = 'describing_images';
+      const cancelController = new AbortController();
+      entry.cancelController = cancelController;
+      buildState.imageDescriptions = await this.describeWorksetImages({
+        buildId,
+        entry,
+        snapshot,
+        workset,
+        describer: visionDescriber,
+        visionReady,
+        signal: cancelController.signal,
+      });
+      buildState.visionReady = visionReady;
+      if (entry.cancelRequested) throw new CancelledError();
 
-      // 拉起构建专用 pi 进程
-      const rpc = await this.spawnBuildProcess(buildId, buildState, pluginSnapshot);
-      entry.process = rpc;
+      const buildWarnings: KbBuildDto['warnings'] = [];
+      if (entry.images.total > 0 && entry.images.unavailable > 0) {
+        buildWarnings.push({
+          code: 'images_unavailable',
+          count: entry.images.unavailable,
+          message: `${entry.images.unavailable}/${entry.images.total} 张图片未理解（${visionReady ? '图片理解通道部分失败' : '图片理解未配置'}）；图片引用处已插入 unavailable 标记`,
+        });
+        this.emitLog(buildId, 'warn', buildWarnings[0].message);
+      }
+      localMapStore.updateKbBuild(buildId, {
+        warningsJson: JSON.stringify(buildWarnings),
+        visionModel: visionReady ? visionStatus.model : null,
+      });
+
+      // ---- S4（§4.1/§4.2）：单元划分 + worker 调度 ----
+      const batchSize = Math.max(1, Math.min(50, config.standardKb.buildBatchSize));
+      const worksetMeta = new Map<string, { relPath: string; bytes: number }>();
+      for (const [token] of workset) {
+        const sourceEntry = snapshot.get(token);
+        if (!sourceEntry) continue;
+        let bytes = 0;
+        try {
+          bytes = fs.statSync(path.join(config.knowledgeBaseRoot, sourceEntry.relPath)).size;
+        } catch {
+          /* 缺失按 0 */
+        }
+        worksetMeta.set(token, { relPath: sourceEntry.relPath, bytes });
+      }
+      const units = planUnits({
+        mode: effectiveMode,
+        workset: worksetMeta,
+        baseDocs: effectiveMode === 'incremental' && baseManifest
+          ? baseManifest.docs.map((doc) => ({ path: doc.path, sources: doc.sources }))
+          : [],
+        baseDocTitles: new Map(baseManifest?.docs.map((doc) => [doc.path, doc.title]) ?? []),
+        requiredRewrites: [...(buildState.requiredRewrites ?? [])],
+        removedSources: changeset.removed,
+        batchSize,
+      });
+      // S4 等价回退：单 worker（buildParallelism=1 或仅 1 个单元）走既有
+      // 单进程流水线（全局批切分 + kb_finish 单轮，不引入单元语义）——
+      // 保证 buildParallelism 缺省/为 1 时行为与现状等价（含
+      // spawnBuildProcess 测试接缝与既有提示词序列）。
+      const parallelismWanted = Math.max(1, Math.min(6, Math.floor(config.standardKb.buildParallelism ?? 1)));
+      const backgroundLimit = this.deps.pool.max > 1 ? this.deps.pool.max - 1 : 1;
+      const workerCount = Math.max(1, Math.min(parallelismWanted, units.length || 1, backgroundLimit));
+      localMapStore.updateKbBuild(buildId, { parallelism: workerCount, unitTotal: units.length });
+
+      if (workerCount <= 1) {
+        // ---- 等价回退：单进程流水线（§4.1 “行为与现状等价”）----
+        entry.units = { total: 1, done: 0, running: 0, failed: 0, retried: 0 };
+        this.emitLog(buildId, 'info', `开始模型构建（${effectiveMode}，单进程）：${workset.size} 个工作集源`);
+        await this.runSingleProcessPhase({
+          buildId,
+          entry,
+          buildState,
+          pluginSnapshot,
+          snapshot,
+          workset,
+          affectedDocs,
+          sourceChanges: changePreview.sources,
+          cancelController,
+        });
+      } else {
+      // ---- 单元化并行路径（W ≥ 2）----
+      buildState.units = units;
+      buildState.unitDone = new Map();
+      buildState.claims = new PathClaims(
+        units.flatMap((unit) => unit.ownedDocs.map((docPath) => ({ path: docPath, unitId: unit.id }))),
+      );
+      entry.units = { total: units.length, done: 0, running: 0, failed: 0, retried: 0 };
+      entry.batchTotal = units.reduce((sum, unit) => sum + unit.batches.length, 0) + 1; // + 收尾轮
+      this.emitLog(buildId, 'info', `开始模型构建（${effectiveMode}，并行 ${workerCount}）：${workset.size} 个工作集源划 ${units.length} 个单元 / ${entry.batchTotal - 1} 批`);
+
+      // S4（§4.5）：整体超时 → 取消句柄集（排队 acquire 出队 + 全部进程 abort）
       const overallTimeout = setTimeout(() => {
-        this.emitLog(buildId, 'error', `构建整体超时（${config.standardKb.buildTimeoutMinutes} 分钟）`);
+        entry.timedOut = true;
         entry.cancelRequested = true;
-        void rpc.abort();
+        this.emitLog(buildId, 'error', `构建整体超时（${config.standardKb.buildTimeoutMinutes} 分钟）`);
+        cancelController.abort();
+        for (const worker of entry.workers.values()) {
+          if (worker.rpc && !worker.rpc.isExited()) void worker.rpc.abort();
+        }
       }, config.standardKb.buildTimeoutMinutes * 60_000);
       overallTimeout.unref?.();
 
@@ -476,83 +658,51 @@ export class KbBuildService extends EventEmitter {
         const systemRules = assets
           ? `${assets.buildRules}\n\n${assets.styleGuide}`
           : '';
+        const promptTimeoutMs = config.standardKb.promptTimeoutMinutes * 60_000;
+        const slotDeadlineMs = Date.parse(startedAt) + config.standardKb.buildTimeoutMinutes * 60_000;
 
-        for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
-          if (entry.cancelRequested) throw new CancelledError();
-          entry.batchIndex = batchIndex + 1;
-          const batch = batches[batchIndex];
-          const batchPrompt = this.buildBatchPrompt({
-            batch,
-            snapshot,
-            workset,
-            affectedDocs,
-            batchIndex,
-            batchTotal: batches.length,
-            firstBatch: batchIndex === 0,
-            sourceChanges: changePreview.sources,
-          });
-          this.emitLog(buildId, 'info', `批次 ${batchIndex + 1}/${batches.length}：${batch.length} 个源`);
-          const outcome = await rpc.prompt(
-            systemRules ? `${batchPrompt}\n\n---\n构建规则与文风规范（每批适用）：\n${systemRules}` : batchPrompt,
-            { timeoutMs: config.standardKb.promptTimeoutMinutes * 60_000 },
-          );
-          if (entry.cancelRequested && outcome.outcome !== 'completed') throw new CancelledError();
-          if (outcome.outcome === 'aborted') throw new CancelledError();
-          if (outcome.outcome === 'failed') {
-            throw new ToolError(
-              outcome.error?.code ?? 'model_request_failed',
-              `批次 ${batchIndex + 1} 失败：${outcome.error?.message ?? '未知错误'}`,
-              502,
-            );
-          }
-          // F3-R08：源变更毒化不可恢复——每个批次结束立即失败，模型不得绕过
-          this.throwIfPoisoned(buildState);
-        }
+        // 单元阶段：W 个 worker 拉取式 LPT 调度，单元内批次串行
+        entry.stage = 'units';
+        await this.runUnitsPhase({
+          buildId,
+          entry,
+          buildState,
+          units,
+          workerCount,
+          pluginSnapshot,
+          snapshot,
+          workset,
+          sourceChanges: changePreview.sources,
+          systemRules,
+          promptTimeoutMs,
+          cancelController,
+          slotDeadlineMs,
+        });
 
-        // finish prompt（模型未调用工具时强制重试一次，不静默失败）
+        // 收尾轮（§4.1：复用最后存活 worker，否则新拉 final 进程；kb_finish 单值）
         if (entry.cancelRequested) throw new CancelledError();
         this.throwIfPoisoned(buildState);
-        entry.batchIndex = entry.batchTotal;
-        const finishPrompt = [
-          '全部批次已完成。请【立即调用 kb_finish 工具】完成构建：',
-          '- summary：本次构建的总结（做了什么、产出哪些主题文档）。',
-          '- skipped：工作集中未被任何文档引用的源，逐个列出 objToken 与理由。',
-          '注意：必须调用工具本身（tool call），不要只回复文本说明。若你尚未写入任何文档，先用 kb_write_doc 写入，再调用 kb_finish。',
-        ].join('\n');
-        let finishOutcome = await rpc.prompt(finishPrompt, {
-          timeoutMs: config.standardKb.promptTimeoutMinutes * 60_000,
+        entry.stage = 'finishing';
+        await this.runFinalRound({
+          buildId,
+          entry,
+          buildState,
+          units,
+          pluginSnapshot,
+          snapshot,
+          systemRules,
+          promptTimeoutMs,
+          cancelController,
+          slotDeadlineMs,
         });
-        if (finishOutcome.outcome === 'aborted') throw new CancelledError();
-        if (finishOutcome.outcome === 'failed') {
-          throw new ToolError(
-            finishOutcome.error?.code ?? 'model_request_failed',
-            `kb_finish 阶段失败：${finishOutcome.error?.message ?? '未知错误'}`,
-            502,
-          );
-        }
-        if (!buildState.finishInfo) {
-          // 一次强制纠正：明确告诉模型未检测到工具调用
-          this.emitLog(buildId, 'warn', '未检测到 kb_finish 调用，发送强制纠正提示');
-          finishOutcome = await rpc.prompt(
-            '系统检测到你没有调用 kb_finish 工具（工具调用记录为空）。现在请直接调用 kb_finish 工具：summary 填写构建总结；如果此前未写任何文档，skipped 列出全部源并说明理由。不要输出任何文本，直接发起工具调用。',
-            { timeoutMs: config.standardKb.promptTimeoutMinutes * 60_000 },
-          );
-          if (finishOutcome.outcome === 'aborted') throw new CancelledError();
-          if (finishOutcome.outcome === 'failed') {
-            throw new ToolError(
-              finishOutcome.error?.code ?? 'model_request_failed',
-              `kb_finish 纠正阶段失败：${finishOutcome.error?.message ?? '未知错误'}`,
-              502,
-            );
-          }
-        }
         if (!buildState.finishInfo) {
           throw new ToolError('kb_validation_failed', '模型在两轮提示后仍未调用 kb_finish', 400);
         }
+        entry.batchIndex = entry.batchTotal;
       } finally {
         clearTimeout(overallTimeout);
-        await this.deps.pool.terminate(`build:${buildId}`);
-        entry.process = null;
+        await this.terminateAllWorkers(buildId, entry);
+      }
       }
 
       // ============ validating ============
@@ -637,17 +787,269 @@ export class KbBuildService extends EventEmitter {
     (state as BuildRunState & { docMeta?: Map<string, { title: string; summary: string; tags: string[]; sources: string[] }> }).docMeta = docMeta;
   }
 
-  private async spawnBuildProcess(buildId: string, buildState: BuildRunState, pluginSnapshot?: AppPluginSnapshot): Promise<PiRpcProcess> {
+  /** S3：图片描述器解析（deps 注入优先；未注入按 dataRoot+config 自建）。 */
+  private resolveVisionDescriber(): VisionDescriberLike {
+    if (this.deps.visionDescriber) return this.deps.visionDescriber;
+    this.defaultDescriber ??= new VisionDescriber({
+      dataRoot: this.deps.dataRoot,
+      config: () => this.deps.configProvider() ?? ({
+        agent: { vision: buildDefaultAgentVisionConfig() },
+        llm: { providers: [] },
+      } as unknown as Config),
+    });
+    return this.defaultDescriber;
+  }
+
+  /** S3（§3.6）：/api/kb/changes 的只读缓存探测（未命中/未启用都计 uncached）。 */
+  visionCacheProbe(): ((imageHash: string) => Promise<string | null>) | null {
+    const describer = this.resolveVisionDescriber();
+    return (hash) => describer.lookup(hash).catch(() => null);
+  }
+
+  /**
+   * S3（§3.4）：preflight 预描述。枚举工作集源图片 → vision ready 时
+   * describeMany（缓存命中不调远端）；否则全部 unavailable(vision_unconfigured)。
+   * describeMany 的结果 Map 以 src 为键，跨源同名 src 会冲突——这里用
+   * `<objToken>::<src>` 组合键传入再拆回（缓存写入按图片字节 hash，不受影响）。
+   */
+  private async describeWorksetImages(input: {
+    buildId: string;
+    entry: InMemoryBuild;
+    snapshot: RawSourceSnapshot;
+    workset: Map<string, 'added' | 'changed' | 'rebuild'>;
+    describer: VisionDescriberLike;
+    visionReady: boolean;
+    signal: AbortSignal;
+  }): Promise<Map<string, Map<string, ImageDescription>>> {
+    const items: Array<{ objToken: string; src: string; file: string }> = [];
+    for (const [token] of input.workset) {
+      const entry = input.snapshot.get(token);
+      if (!entry) continue;
+      let content: string;
+      try {
+        content = input.snapshot.readVerified(input.entry.buildState?.knowledgeBaseRoot ?? '', token).content;
+      } catch {
+        continue;
+      }
+      for (const image of resolveSourceImages(input.entry.buildState?.knowledgeBaseRoot ?? '', entry.relPath, content)) {
+        items.push({ objToken: token, src: image.src, file: image.file });
+      }
+    }
+    input.entry.images = { total: items.length, described: 0, cached: 0, unavailable: 0 };
+    const result = new Map<string, Map<string, ImageDescription>>();
+    if (items.length === 0) return result;
+    const put = (objToken: string, description: ImageDescription) => {
+      let bucket = result.get(objToken);
+      if (!bucket) {
+        bucket = new Map();
+        result.set(objToken, bucket);
+      }
+      bucket.set(description.src, description);
+    };
+    if (!input.visionReady) {
+      for (const item of items) {
+        put(item.objToken, { src: item.src, imageHash: '', state: 'unavailable', reason: 'vision_unconfigured' });
+      }
+      input.entry.images.unavailable = items.length;
+      return result;
+    }
+    this.emitLog(input.buildId, 'info', `图片预描述：${items.length} 张（命中缓存不调远端）`);
+    const composed = await input.describer.describeMany(
+      items.map((item) => ({ file: item.file, src: `${item.objToken}::${item.src}` })),
+      { signal: input.signal, onProgress: () => undefined },
+    );
+    let described = 0;
+    let cached = 0;
+    let unavailable = 0;
+    for (const item of items) {
+      const description = composed.get(`${item.objToken}::${item.src}`);
+      if (description && description.state !== 'unavailable') {
+        put(item.objToken, { ...description, src: item.src });
+        if (description.state === 'cached') cached += 1;
+        else described += 1;
+      } else {
+        put(item.objToken, {
+          src: item.src,
+          imageHash: description?.imageHash ?? '',
+          state: 'unavailable',
+          reason: description?.reason ?? 'vision_failed',
+          ...(description?.message ? { message: description.message } : {}),
+        });
+        unavailable += 1;
+      }
+    }
+    input.entry.images = { total: items.length, described, cached, unavailable };
+    return result;
+  }
+
+  // ------------------------------------------------------------------
+  // S4：worker 编排（§4.1/§4.5）
+  // ------------------------------------------------------------------
+
+  /**
+   * S4 等价回退路径（§4.1 “行为与现状等价”）：单进程全局批切分 +
+   * kb_finish 单轮。保留既有 spawnBuildProcess 测试接缝与提示词序列，
+   * 既有构建语义回归（buildParallelism 缺省/为 1）不改动全绿。
+   */
+  private async runSingleProcessPhase(input: {
+    buildId: string;
+    entry: InMemoryBuild;
+    buildState: BuildRunState;
+    pluginSnapshot?: AppPluginSnapshot;
+    snapshot: RawSourceSnapshot;
+    workset: Map<string, 'added' | 'changed' | 'rebuild'>;
+    affectedDocs: Array<{ path: string; title: string }>;
+    sourceChanges: KbFileChange[];
+    cancelController: AbortController;
+  }): Promise<void> {
+    const { entry, buildState } = input;
     const config = this.deps.configProvider()!;
-    const runtime = await this.deps.resolver.resolveRuntime(config.agent);
-    if (!runtime.nodePath || !runtime.piCliPath) {
-      throw new ToolError('agent_not_ready', 'Agent 运行时未就绪', 503);
+    const batches = chunkTokens(
+      [...input.workset.keys()].sort(),
+      Math.max(1, Math.min(50, config.standardKb.buildBatchSize)),
+    );
+    // F3-R07：仅 removed 的增量（无 added/changed）也必须有一个批次明确
+    // 告知模型删除与受影响文档——不能让删除影响只存在于默认删除逻辑里。
+    if (batches.length === 0 && input.affectedDocs.length > 0) {
+      batches.push([]);
     }
-    // F3-R05：容量先预留后 spawn；token 与进程同生命周期（exit 即回收）。
-    const slot = this.deps.pool.reserveSlot();
-    if (!slot) {
-      throw new ToolError('agent_busy', 'Agent 并发已达上限，无法启动构建', 409);
+    entry.batchTotal = batches.length + 1; // + 最后 finish prompt
+    entry.stage = 'units';
+
+    // T3b-06：单 worker 回退与并行路径同一准入语义——acquire('background')
+    // FIFO 排队 + M-1 后台配额 + 可取消（受整体超时约束），不再用 session
+    // 类 reserveSlot 立即抢最后一个总槽（否则后台任务可占满 M，交互会话
+    // 保留槽消失）。
+    const rpc = await this.spawnBuildProcess(input.buildId, buildState, input.pluginSnapshot, {
+      signal: input.cancelController.signal,
+    });
+    entry.process = rpc;
+    const overallTimeout = setTimeout(() => {
+      entry.timedOut = true;
+      this.emitLog(input.buildId, 'error', `构建整体超时（${config.standardKb.buildTimeoutMinutes} 分钟）`);
+      entry.cancelRequested = true;
+      input.cancelController.abort();
+      void rpc.abort();
+    }, config.standardKb.buildTimeoutMinutes * 60_000);
+    overallTimeout.unref?.();
+
+    try {
+      const assets = this.deps.pluginStore ? null : this.deps.promptAssets();
+      const systemRules = assets
+        ? `${assets.buildRules}\n\n${assets.styleGuide}`
+        : '';
+
+      for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
+        if (entry.cancelRequested) throw new CancelledError();
+        entry.batchIndex = batchIndex + 1;
+        const batch = batches[batchIndex];
+        const batchPrompt = this.buildBatchPrompt({
+          batch,
+          snapshot: input.snapshot,
+          workset: input.workset,
+          affectedDocs: input.affectedDocs,
+          batchIndex,
+          batchTotal: batches.length,
+          firstBatch: batchIndex === 0,
+          sourceChanges: input.sourceChanges,
+        });
+        this.emitLog(input.buildId, 'info', `批次 ${batchIndex + 1}/${batches.length}：${batch.length} 个源`);
+        const outcome = await rpc.prompt(
+          systemRules ? `${batchPrompt}\n\n---\n构建规则与文风规范（每批适用）：\n${systemRules}` : batchPrompt,
+          { timeoutMs: config.standardKb.promptTimeoutMinutes * 60_000 },
+        );
+        if (entry.cancelRequested && outcome.outcome !== 'completed') throw new CancelledError();
+        if (outcome.outcome === 'aborted') throw new CancelledError();
+        if (outcome.outcome === 'failed') {
+          throw new ToolError(
+            outcome.error?.code ?? 'model_request_failed',
+            `批次 ${batchIndex + 1} 失败：${outcome.error?.message ?? '未知错误'}`,
+            502,
+          );
+        }
+        // F3-R08：源变更毒化不可恢复——每个批次结束立即失败，模型不得绕过
+        this.throwIfPoisoned(buildState);
+      }
+
+      // finish prompt（模型未调用工具时强制重试一次，不静默失败）
+      if (entry.cancelRequested) throw new CancelledError();
+      this.throwIfPoisoned(buildState);
+      entry.stage = 'finishing';
+      entry.batchIndex = entry.batchTotal;
+      const finishPrompt = [
+        '全部批次已完成。请【立即调用 kb_finish 工具】完成构建：',
+        '- summary：本次构建的总结（做了什么、产出哪些主题文档）。',
+        '- skipped：工作集中未被任何文档引用的源，逐个列出 objToken 与理由。',
+        '注意：必须调用工具本身（tool call），不要只回复文本说明。若你尚未写入任何文档，先用 kb_write_doc 写入，再调用 kb_finish。',
+      ].join('\n');
+      let finishOutcome = await rpc.prompt(finishPrompt, {
+        timeoutMs: config.standardKb.promptTimeoutMinutes * 60_000,
+      });
+      if (finishOutcome.outcome === 'aborted') throw new CancelledError();
+      if (finishOutcome.outcome === 'failed') {
+        throw new ToolError(
+          finishOutcome.error?.code ?? 'model_request_failed',
+          `kb_finish 阶段失败：${finishOutcome.error?.message ?? '未知错误'}`,
+          502,
+        );
+      }
+      if (!buildState.finishInfo) {
+        // 一次强制纠正：明确告诉模型未检测到工具调用
+        this.emitLog(input.buildId, 'warn', '未检测到 kb_finish 调用，发送强制纠正提示');
+        finishOutcome = await rpc.prompt(
+          '系统检测到你没有调用 kb_finish 工具（工具调用记录为空）。现在请直接调用 kb_finish 工具：summary 填写构建总结；如果此前未写任何文档，skipped 列出全部源并说明理由。不要输出任何文本，直接发起工具调用。',
+          { timeoutMs: config.standardKb.promptTimeoutMinutes * 60_000 },
+        );
+        if (finishOutcome.outcome === 'aborted') throw new CancelledError();
+        if (finishOutcome.outcome === 'failed') {
+          throw new ToolError(
+            finishOutcome.error?.code ?? 'model_request_failed',
+            `kb_finish 纠正阶段失败：${finishOutcome.error?.message ?? '未知错误'}`,
+            502,
+          );
+        }
+      }
+      if (!buildState.finishInfo) {
+        throw new ToolError('kb_validation_failed', '模型在两轮提示后仍未调用 kb_finish', 400);
+      }
+    } finally {
+      clearTimeout(overallTimeout);
+      await this.deps.pool.terminate(`build:${input.buildId}`);
+      entry.process = null;
     }
+  }
+
+  private emitWorker(buildId: string, worker: WorkerRuntime): void {
+    this.emitBuild(buildId, 'build_worker', {
+      workerId: worker.workerId,
+      state: worker.state,
+      unitId: worker.unitId,
+      unitBatchIndex: worker.unitBatchIndex,
+      unitBatchTotal: worker.unitBatchTotal,
+    });
+  }
+
+  private emitUnits(buildId: string): void {
+    const entry = this.active.get(buildId);
+    if (!entry) return;
+    this.emitBuild(buildId, 'build_units', { ...entry.units });
+  }
+
+  /** worker 拉取新单元/进入收尾轮时同步运行上下文（工具按 context 判定单元归属）。 */
+  private setWorkerAssignment(worker: WorkerRuntime, unitId: string | null, phase?: 'unit' | 'final'): void {
+    worker.unitId = unitId;
+    if (worker.context) {
+      worker.context.options.worker = {
+        workerId: worker.workerId,
+        unitId,
+        phase: phase ?? (worker.workerId === 'final' ? 'final' : 'unit'),
+      };
+    }
+  }
+
+  /** 等价回退路径的运行上下文（无 worker 身份，工具行为与重构前一致）。 */
+  private createBuildRunContext(buildId: string, buildState: BuildRunState): { token: string; revoke: () => void } {
+    const config = this.deps.configProvider()!;
     const { token } = this.deps.toolService.createRunContext({
       runKind: 'build',
       buildId,
@@ -663,16 +1065,64 @@ export class KbBuildService extends EventEmitter {
         });
       },
     });
+    return { token, revoke: () => this.deps.toolService.revokeToken(token) };
+  }
+
+  /** 构建 pi 子进程 env（等价回退路径）。 */
+  private buildPiEnv(
+    token: string,
+    apiKey: string | undefined,
+    providerJson: string | undefined,
+    pluginSnapshot: AppPluginSnapshot | undefined,
+    runtime: { piPackageRoot?: string | null },
+  ): NodeJS.ProcessEnv {
+    const config = this.deps.configProvider()!;
+    const env = buildPiProcessEnv({
+      mode: config.agent.model.source,
+      parentEnv: process.env,
+      dataRoot: this.deps.dataRoot,
+      agentUrl: this.deps.internalBaseUrl(),
+      runToken: token,
+      apiKey,
+    });
+    if (providerJson) env.FEISHU_SYNC_AGENT_PROVIDER_JSON = providerJson;
+    if (pluginSnapshot) {
+      env.FEISHU_SYNC_AGENT_PLUGIN_SNAPSHOT = pluginSnapshot.path;
+      env.FEISHU_SYNC_AGENT_PLUGIN_REVISION = pluginSnapshot.revision;
+      if (pluginSnapshot.externalPlugins) env.FEISHU_SYNC_AGENT_EXTERNAL_PLUGINS = '1';
+    }
+    env.FEISHU_SYNC_AGENT_PI_PACKAGE_ROOT = runtime.piPackageRoot ?? '';
+    return env;
+  }
+
+  /**
+   * 既有单进程构建 spawn（等价回退路径专用，保留原签名供测试接缝覆盖：
+   * kb-version / provider-protocol-live 等以 Object.assign 覆盖本方法注入
+   * 假模型）。T3b-06：槽位经 acquireSingleWorkerSlot（acquire('background')
+   * FIFO + M-1 配额 + 可取消）；拿不到（整体超时内）→ agent_busy 409。
+   */
+  private async spawnBuildProcess(
+    buildId: string,
+    buildState: BuildRunState,
+    pluginSnapshot?: AppPluginSnapshot,
+    slotOptions: { signal?: AbortSignal; slotDeadlineMs?: number } = {},
+  ): Promise<PiRpcProcess> {
+    const config = this.deps.configProvider()!;
+    const runtime = await this.deps.resolver.resolveRuntime(config.agent);
+    if (!runtime.nodePath || !runtime.piCliPath) {
+      throw new ToolError('agent_not_ready', 'Agent 运行时未就绪', 503);
+    }
+    const slot = await this.acquireSingleWorkerSlot(slotOptions);
+    const { token, revoke } = this.createBuildRunContext(buildId, buildState);
 
     let model: string;
     let apiKey: string | undefined;
     let providerJson: string | undefined;
     if (config.agent.model.source === 'app-llm') {
-      // F3-R03：与 probe/会话共用 provider descriptor 单一实现
       const runConfig = buildAppLlmRunConfig(config.llm, config.agent);
       if (!runConfig || !runConfig.apiKey) {
         slot.release();
-        this.deps.toolService.revokeToken(token);
+        revoke();
         throw new ToolError('agent_not_ready', 'app-llm 模型未配置或缺少 API Key', 503);
       }
       model = runConfig.model;
@@ -682,35 +1132,25 @@ export class KbBuildService extends EventEmitter {
       const piModel = config.agent.model.piModel?.trim();
       if (!piModel) {
         slot.release();
-        this.deps.toolService.revokeToken(token);
+        revoke();
         throw new ToolError('agent_not_ready', 'pi-agent-dir 模式下未配置模型', 503);
       }
       model = piModel;
     }
 
-    const env = buildPiProcessEnv({
-      mode: config.agent.model.source,
-      parentEnv: process.env,
-      dataRoot: this.deps.dataRoot,
-      agentUrl: this.deps.internalBaseUrl(),
-      runToken: token,
-      apiKey,
-    });
-    if (providerJson) {
-      env.FEISHU_SYNC_AGENT_PROVIDER_JSON = providerJson;
-    }
-    if (pluginSnapshot) {
-      env.FEISHU_SYNC_AGENT_PLUGIN_SNAPSHOT = pluginSnapshot.path;
-      env.FEISHU_SYNC_AGENT_PLUGIN_REVISION = pluginSnapshot.revision;
-      if (pluginSnapshot.externalPlugins) env.FEISHU_SYNC_AGENT_EXTERNAL_PLUGINS = '1';
-    }
-    env.FEISHU_SYNC_AGENT_PI_PACKAGE_ROOT = runtime.piPackageRoot ?? '';
+    const env = this.buildPiEnv(token, apiKey, providerJson, pluginSnapshot, runtime);
     const extensionPath = this.deps.extensionPath();
-    const rpc = new PiRpcProcess({
+    const spawnOptions = {
       nodePath: runtime.nodePath,
       piCliPath: runtime.piCliPath,
       ...(extensionPath ? { extensionPath } : {}),
-      ...(pluginSnapshot ? { additionalExtensionPaths: pluginSnapshot.extensionPaths ?? [pluginSnapshot.extensionPath], allowExternalPluginTools: pluginSnapshot.externalPlugins, additionalSkillPaths: pluginSnapshot.skillPaths, additionalPromptPaths: pluginSnapshot.promptPaths, additionalThemePaths: pluginSnapshot.themePaths } : {}),
+      ...(pluginSnapshot ? {
+        additionalExtensionPaths: pluginSnapshot.extensionPaths ?? [pluginSnapshot.extensionPath],
+        allowExternalPluginTools: pluginSnapshot.externalPlugins,
+        additionalSkillPaths: pluginSnapshot.skillPaths,
+        additionalPromptPaths: pluginSnapshot.promptPaths,
+        additionalThemePaths: pluginSnapshot.themePaths,
+      } : {}),
       tools: toolsForRunKind('build'),
       noSession: true,
       model,
@@ -718,7 +1158,8 @@ export class KbBuildService extends EventEmitter {
       cwd: path.join(this.deps.dataRoot, 'agent', 'empty-cwd'),
       env,
       promptTimeoutMs: config.standardKb.promptTimeoutMinutes * 60_000,
-    });
+    };
+    const rpc = this.deps.processFactory ? this.deps.processFactory(spawnOptions) : new PiRpcProcess(spawnOptions);
     // F3-R05：任何退出路径（正常/取消/超时/崩溃/池回收）都回收令牌。
     rpc.once('exit', () => this.deps.toolService.revokeToken(token));
     try {
@@ -728,12 +1169,63 @@ export class KbBuildService extends EventEmitter {
     } catch (error) {
       slot.release();
       await rpc.terminate().catch(() => undefined);
-      this.deps.toolService.revokeToken(token);
+      revoke();
       throw error;
     }
     return rpc;
   }
 
+  /**
+   * T3b-06：单 worker 槽位获取（与并行路径 acquireWorkerSlot 同一准入
+   * 语义）：acquire('background') FIFO 排队、后台配额 M-1、取消信号
+   * 贯通；首个槽位受整体超时约束（拿不到 → agent_busy），其后排队只受
+   * 取消。与 acquireWorkerSlot 的差别仅在不依赖 entry（回退路径单进程）。
+   */
+  private async acquireSingleWorkerSlot(
+    options: { signal?: AbortSignal; slotDeadlineMs?: number },
+  ): Promise<PoolSlot> {
+    const config = this.deps.configProvider()!;
+    const deadlineMs = options.slotDeadlineMs
+      ?? Date.now() + Math.max(1, config.standardKb.buildTimeoutMinutes) * 60_000;
+    const controller = new AbortController();
+    const onOuterAbort = () => controller.abort();
+    if (options.signal) {
+      if (options.signal.aborted) controller.abort();
+      else options.signal.addEventListener('abort', onOuterAbort, { once: true });
+    }
+    const acquiring = this.deps.pool.acquire('background', { signal: controller.signal });
+    const remaining = deadlineMs - Date.now();
+    let timer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      if (remaining <= 0) {
+        controller.abort();
+        reject(new AgentBusyError('构建整体超时内未能获得进程槽位'));
+        return;
+      }
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(new AgentBusyError('构建整体超时内未能获得进程槽位'));
+      }, remaining);
+      timer.unref?.();
+    });
+    try {
+      return await Promise.race([acquiring, deadline]);
+    } catch (error) {
+      // 竞态兑底：deadline 已拒绝后槽位才授出 → 立即释放，不占容量。
+      acquiring.then((late) => late.release()).catch(() => undefined);
+      if (error instanceof AgentBusyError) throw error;
+      // 取消信号（外层 cancelController）→ 按取消语义冒泡（CancelledError）
+      if ((error as { name?: string })?.name === 'AbortError') {
+        throw new CancelledError();
+      }
+      throw error;
+    } finally {
+      if (timer) clearTimeout(timer);
+      options.signal?.removeEventListener('abort', onOuterAbort);
+    }
+  }
+
+  /** 既有单进程批提示词（等价回退路径，语义与重构前一致）。 */
   private buildBatchPrompt(input: {
     batch: string[];
     snapshot: RawSourceSnapshot;
@@ -791,6 +1283,540 @@ export class KbBuildService extends EventEmitter {
     lines.push('2. 读完本批全部源后，把内容重组为标准文档：合并相关源、消除重复、按主题分篇；已有草稿可用 draft_read 查看后覆盖。');
     lines.push('3. 用 kb_write_doc 写入草稿（每篇都要声明 sources）。');
     lines.push('4. 处理完本批即可，无需调用 kb_finish（最后一批后单独提示）。');
+    return lines.join('\n');
+  }
+
+  /** 拉起（或按 worker 复用）构建 worker 进程：slot 已由调用方持有。 */
+  private async spawnWorkerProcess(input: {
+    buildId: string;
+    entry: InMemoryBuild;
+    buildState: BuildRunState;
+    worker: WorkerRuntime;
+    pluginSnapshot?: AppPluginSnapshot;
+    slot?: PoolSlot;
+  }): Promise<void> {
+    const config = this.deps.configProvider()!;
+    const runtime = await this.deps.resolver.resolveRuntime(config.agent);
+    if (!runtime.nodePath || !runtime.piCliPath) {
+      throw new ToolError('agent_not_ready', 'Agent 运行时未就绪', 503);
+    }
+    const { worker } = input;
+    const { token, context } = this.deps.toolService.createRunContext({
+      runKind: 'build',
+      buildId: input.buildId,
+      outputRoot: config.standardKb.outputRoot,
+      knowledgeBaseRoot: config.knowledgeBaseRoot,
+      buildState: input.buildState,
+      worker: { workerId: worker.workerId, unitId: worker.unitId, phase: worker.workerId === 'final' ? 'final' : 'unit' },
+      onEvent: (event) => {
+        this.emitBuild(input.buildId, 'tool', {
+          phase: event.phase,
+          toolName: event.toolName,
+          summary: event.argsSummary || event.resultSummary || '',
+          ...(event.isError !== undefined ? { isError: event.isError } : {}),
+          workerId: worker.workerId,
+          ...(worker.unitId ? { unitId: worker.unitId } : {}),
+        });
+      },
+    });
+    worker.token = token;
+    worker.context = context as import('../agent/agent-tool-service.js').InternalRunContext;
+
+    let model: string;
+    let apiKey: string | undefined;
+    let providerJson: string | undefined;
+    const dropToken = () => this.deps.toolService.revokeToken(token);
+    if (config.agent.model.source === 'app-llm') {
+      // F3-R03：与 probe/会话共用 provider descriptor 单一实现
+      const runConfig = buildAppLlmRunConfig(config.llm, config.agent);
+      if (!runConfig || !runConfig.apiKey) {
+        input.slot?.release();
+        dropToken();
+        throw new ToolError('agent_not_ready', 'app-llm 模型未配置或缺少 API Key', 503);
+      }
+      model = runConfig.model;
+      apiKey = runConfig.apiKey;
+      providerJson = runConfig.providerJson;
+    } else {
+      const piModel = config.agent.model.piModel?.trim();
+      if (!piModel) {
+        input.slot?.release();
+        dropToken();
+        throw new ToolError('agent_not_ready', 'pi-agent-dir 模式下未配置模型', 503);
+      }
+      model = piModel;
+    }
+
+    const env = buildPiProcessEnv({
+      mode: config.agent.model.source,
+      parentEnv: process.env,
+      dataRoot: this.deps.dataRoot,
+      agentUrl: this.deps.internalBaseUrl(),
+      runToken: token,
+      apiKey,
+    });
+    if (providerJson) env.FEISHU_SYNC_AGENT_PROVIDER_JSON = providerJson;
+    if (input.pluginSnapshot) {
+      env.FEISHU_SYNC_AGENT_PLUGIN_SNAPSHOT = input.pluginSnapshot.path;
+      env.FEISHU_SYNC_AGENT_PLUGIN_REVISION = input.pluginSnapshot.revision;
+      if (input.pluginSnapshot.externalPlugins) env.FEISHU_SYNC_AGENT_EXTERNAL_PLUGINS = '1';
+    }
+    env.FEISHU_SYNC_AGENT_PI_PACKAGE_ROOT = runtime.piPackageRoot ?? '';
+    const extensionPath = this.deps.extensionPath();
+    const spawnOptions = {
+      nodePath: runtime.nodePath,
+      piCliPath: runtime.piCliPath,
+      ...(extensionPath ? { extensionPath } : {}),
+      ...(input.pluginSnapshot ? {
+        additionalExtensionPaths: input.pluginSnapshot.extensionPaths ?? [input.pluginSnapshot.extensionPath],
+        allowExternalPluginTools: input.pluginSnapshot.externalPlugins,
+        additionalSkillPaths: input.pluginSnapshot.skillPaths,
+        additionalPromptPaths: input.pluginSnapshot.promptPaths,
+        additionalThemePaths: input.pluginSnapshot.themePaths,
+      } : {}),
+      tools: toolsForRunKind('build'),
+      noSession: true,
+      model,
+      thinking: config.agent.model.thinkingLevel,
+      cwd: path.join(this.deps.dataRoot, 'agent', 'empty-cwd'),
+      env,
+      promptTimeoutMs: config.standardKb.promptTimeoutMinutes * 60_000,
+    };
+    const rpc = this.deps.processFactory ? this.deps.processFactory(spawnOptions) : new PiRpcProcess(spawnOptions);
+    // F3-R05：任何退出路径（正常/取消/超时/崩溃/池回收）都回收令牌。
+    rpc.once('exit', () => this.deps.toolService.revokeToken(token));
+    try {
+      await rpc.start();
+      await rpc.sendCommand('set_auto_retry', { enabled: false }).catch(() => undefined);
+      this.deps.pool.register(worker.poolKey, rpc, 'build', input.slot);
+    } catch (error) {
+      input.slot?.release();
+      await rpc.terminate().catch(() => undefined);
+      dropToken();
+      throw error;
+    }
+    worker.rpc = rpc;
+  }
+
+  /** 首个槽位受整体超时约束（§4.5：拿不到 → failed agent_busy）；其后排队只受取消。 */
+  private async acquireWorkerSlot(input: {
+    entry: InMemoryBuild;
+    cancelController: AbortController;
+    slotDeadlineMs: number;
+    slotObtained: () => boolean;
+  }): Promise<PoolSlot> {
+    const acquiring = this.deps.pool.acquire('background', { signal: input.cancelController.signal });
+    if (input.slotObtained()) return await acquiring;
+    const remaining = input.slotDeadlineMs - Date.now();
+    if (remaining <= 0) {
+      input.cancelController.abort();
+      acquiring.catch(() => undefined);
+      throw new AgentBusyError('构建整体超时内未能获得进程槽位');
+    }
+    let timer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        if (input.slotObtained()) return;
+        input.cancelController.abort();
+        reject(new AgentBusyError('构建整体超时内未能获得进程槽位'));
+      }, remaining);
+      timer.unref?.();
+    });
+    try {
+      return await Promise.race([acquiring, deadline]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /** worker 主循环：拉取下一单元（LPT 序）→ 单元内批次串行 → 保持进程等待收尾轮复用。 */
+  private async runUnitsPhase(input: {
+    buildId: string;
+    entry: InMemoryBuild;
+    buildState: BuildRunState;
+    units: BuildUnit[];
+    workerCount: number;
+    pluginSnapshot?: AppPluginSnapshot;
+    snapshot: RawSourceSnapshot;
+    workset: Map<string, 'added' | 'changed' | 'rebuild'>;
+    sourceChanges: KbFileChange[];
+    systemRules: string;
+    promptTimeoutMs: number;
+    cancelController: AbortController;
+    slotDeadlineMs: number;
+  }): Promise<void> {
+    const { entry, buildState, units } = input;
+    let cursor = 0;
+    const unitProgress = new Map<string, number>(); // unitId → 已完成批次数
+    for (const unit of units) unitProgress.set(unit.id, 0);
+    const retriedUnits = new Set<string>();
+    let globalFailure: Error | null = null;
+    let slotObtained = false;
+
+    const abortEverything = () => {
+      input.cancelController.abort();
+      for (const worker of entry.workers.values()) {
+        if (worker.rpc && !worker.rpc.isExited()) void worker.rpc.abort();
+      }
+    };
+    const failAll = (cause: unknown) => {
+      if (!globalFailure) globalFailure = cause instanceof Error ? cause : new Error(String(cause));
+      abortEverything();
+    };
+
+    const normalizeWorkerError = (error: unknown): Error => {
+      if (error instanceof Error && error.name === 'AbortError' && input.cancelController.signal.aborted) {
+        return new CancelledError();
+      }
+      return error instanceof Error ? error : new Error(String(error));
+    };
+
+    const runUnitOnWorker = async (worker: WorkerRuntime, unit: BuildUnit): Promise<void> => {
+      entry.units.running += 1;
+      this.emitUnits(input.buildId);
+      this.setWorkerAssignment(worker, unit.id);
+      try {
+        const attempt = async (isRetry: boolean) => {
+          // 进程按需拉起 / 重试时回收重建（认领不释放：PathClaims 首写者持有）
+          if (!worker.rpc || worker.rpc.isExited()) {
+            if (!worker.slot) {
+              worker.slot = await this.acquireWorkerSlot({
+                entry: input.entry,
+                cancelController: input.cancelController,
+                slotDeadlineMs: input.slotDeadlineMs,
+                slotObtained: () => slotObtained,
+              });
+            }
+            await this.spawnWorkerProcess({ buildId: input.buildId, entry: input.entry, buildState, worker, pluginSnapshot: input.pluginSnapshot, slot: worker.slot });
+            worker.slot = null; // 已被 register 消费
+          }
+          const batches = unit.batches;
+          for (let index = unitProgress.get(unit.id) ?? 0; index < batches.length; index += 1) {
+            if (entry.cancelRequested || globalFailure) throw new CancelledError();
+            worker.state = 'running';
+            worker.unitBatchIndex = index;
+            worker.unitBatchTotal = batches.length;
+            this.emitWorker(input.buildId, worker);
+            const batchPrompt = this.buildUnitBatchPrompt({
+              unit,
+              batch: batches[index],
+              batchIndex: index,
+              batchTotal: batches.length,
+              snapshot: input.snapshot,
+              workset: input.workset,
+              sourceChanges: input.sourceChanges,
+              isRetry,
+              claimedDocs: buildState.claims?.ownedBy(unit.id) ?? [],
+            });
+            const outcome = await worker.rpc!.prompt(
+              input.systemRules ? `${batchPrompt}\n\n---\n构建规则与文风规范（每批适用）：\n${input.systemRules}` : batchPrompt,
+              { timeoutMs: input.promptTimeoutMs },
+            );
+            if (entry.cancelRequested && outcome.outcome !== 'completed') throw new CancelledError();
+            if (outcome.outcome === 'aborted') throw new CancelledError();
+            if (outcome.outcome === 'failed') {
+              throw new ToolError(
+                outcome.error?.code ?? 'model_request_failed',
+                `单元 ${unit.id} 批次 ${index + 1} 失败：${outcome.error?.message ?? '未知错误'}`,
+                502,
+              );
+            }
+            // F3-R08：源变更毒化不可恢复——批次边界立即失败
+            this.throwIfPoisoned(buildState);
+            unitProgress.set(unit.id, index + 1);
+            entry.batchIndex += 1;
+          }
+          // 单元末批后必须有 kb_unit_done（一次纠正，仍无即单元失败）
+          if (!buildState.unitDone?.has(unit.id)) {
+            this.emitBuild(input.buildId, 'build_log', { level: 'warn', message: `单元 ${unit.id} 未调用 kb_unit_done，发送纠正提示`, workerId: worker.workerId, unitId: unit.id, at: new Date().toISOString() });
+            const corrected = await worker.rpc!.prompt(
+              `本单元（${unit.id}）的全部批次已处理完。系统未检测到 kb_unit_done 调用。现在请直接调用 kb_unit_done 工具：summary 填写本单元总结；本单元未被任何文档引用的源逐个列入 skipped（objToken 须属本单元）。不要输出文本，直接发起工具调用。`,
+              { timeoutMs: input.promptTimeoutMs },
+            );
+            if (corrected.outcome === 'aborted') throw new CancelledError();
+            if (corrected.outcome === 'failed') {
+              throw new ToolError(corrected.error?.code ?? 'model_request_failed', `单元 ${unit.id} 的 kb_unit_done 纠正轮失败：${corrected.error?.message ?? '未知错误'}`, 502);
+            }
+            if (!buildState.unitDone?.has(unit.id)) {
+              throw new ToolError('kb_unit_failed', `单元 ${unit.id} 在纠正提示后仍未调用 kb_unit_done`, 400);
+            }
+          }
+        };
+        try {
+          await attempt(false);
+        } catch (error) {
+          const code = error instanceof ToolError ? error.code : '';
+          const retryable = code === 'model_timeout' || code === 'model_request_failed' || code === 'pi_process_exited';
+          if (!retryable || retriedUnits.has(unit.id)) throw error;
+          retriedUnits.add(unit.id);
+          entry.units.retried += 1;
+          this.emitBuild(input.buildId, 'build_log', { level: 'warn', message: `单元 ${unit.id} 失败（${code}），自动重试 1 次（从首个未完成批次续跑，已认领文档不释放）`, at: new Date().toISOString() });
+          if (worker.rpc) {
+            await this.deps.pool.terminate(worker.poolKey).catch(() => undefined);
+            worker.rpc = null;
+            worker.token = null;
+          }
+          await attempt(true);
+        }
+        entry.units.done += 1;
+        this.emitUnits(input.buildId);
+      } catch (error) {
+        entry.units.failed += 1;
+        this.emitUnits(input.buildId);
+        // S4（§8）：单元失败统一包装 kb_unit_failed（details.unitId + 引发码）；
+        // 取消不包装（外层按 cancelled 落地）。
+        if (error instanceof CancelledError) throw error;
+        if (error instanceof ToolError && error.code === 'kb_unit_failed') throw error;
+        const causeCode = error instanceof ToolError ? error.code : 'kb_build_failed';
+        const causeMessage = error instanceof Error ? error.message : String(error);
+        const wrapped = new ToolError(
+          'kb_unit_failed',
+          `单元 ${unit.id} 失败（${causeCode}）：${causeMessage}`,
+          500,
+        );
+        (wrapped as ToolError & { details?: unknown }).details = { unitId: unit.id, cause: causeCode };
+        throw wrapped;
+      } finally {
+        entry.units.running -= 1;
+        this.setWorkerAssignment(worker, null);
+        worker.unitBatchIndex = 0;
+        worker.unitBatchTotal = 0;
+        this.emitUnits(input.buildId);
+      }
+    };
+
+    const runWorker = async (workerId: string): Promise<void> => {
+      const worker: WorkerRuntime = {
+        workerId,
+        poolKey: `build:${input.buildId}:${workerId}`,
+        slot: null,
+        rpc: null,
+        token: null,
+        context: null,
+        state: 'waiting_slot',
+        unitId: null,
+        unitBatchIndex: 0,
+        unitBatchTotal: 0,
+        exited: false,
+      };
+      entry.workers.set(workerId, worker);
+      this.emitWorker(input.buildId, worker);
+      try {
+        worker.slot = await this.acquireWorkerSlot({
+          entry: input.entry,
+          cancelController: input.cancelController,
+          slotDeadlineMs: input.slotDeadlineMs,
+          slotObtained: () => slotObtained,
+        });
+        slotObtained = true;
+        while (!globalFailure && !entry.cancelRequested) {
+          const unit = cursor < units.length ? units[cursor++] : null;
+          if (!unit) break;
+          await runUnitOnWorker(worker, unit);
+        }
+        worker.state = 'running'; // 队列耗尽：保持进程/槽位等待收尾轮复用
+        this.emitWorker(input.buildId, worker);
+      } catch (error) {
+        if (!globalFailure && !(error instanceof CancelledError)) failAll(error);
+        throw normalizeWorkerError(error);
+      } finally {
+        if (globalFailure || entry.cancelRequested) {
+          worker.state = 'exited';
+          worker.exited = true;
+          this.emitWorker(input.buildId, worker);
+        }
+      }
+    };
+
+    const workerIds = Array.from({ length: input.workerCount }, (_, index) => `w${index + 1}`);
+    const settled = await Promise.allSettled(workerIds.map(runWorker));
+    if (globalFailure) throw globalFailure;
+    const rejected = settled.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+    if (rejected) {
+      const reason = rejected.reason;
+      throw reason instanceof Error ? reason : new Error(String(reason));
+    }
+    // join 校验：全部单元 done
+    for (const unit of units) {
+      if (!buildState.unitDone?.has(unit.id)) {
+        throw new ToolError('kb_unit_failed', `单元 ${unit.id} 未完成（无 kb_unit_done 上报）`, 400);
+      }
+    }
+  }
+
+  /** 收尾轮：复用最后存活 worker 进程，否则 acquire 后新拉 final 进程；kb_finish 单值。 */
+  private async runFinalRound(input: {
+    buildId: string;
+    entry: InMemoryBuild;
+    buildState: BuildRunState;
+    units: BuildUnit[];
+    pluginSnapshot?: AppPluginSnapshot;
+    snapshot: RawSourceSnapshot;
+    systemRules: string;
+    promptTimeoutMs: number;
+    cancelController: AbortController;
+    slotDeadlineMs: number;
+  }): Promise<void> {
+    const { entry, buildState } = input;
+    const reuse = [...entry.workers.values()]
+      .filter((worker) => worker.rpc && !worker.rpc.isExited())
+      .sort((a, b) => b.workerId.localeCompare(a.workerId))[0] ?? null;
+    let worker = reuse;
+    if (reuse) {
+      reuse.state = 'finishing';
+      this.emitWorker(input.buildId, reuse);
+    } else {
+      worker = {
+        workerId: 'final',
+        poolKey: `build:${input.buildId}:final`,
+        slot: null,
+        rpc: null,
+        token: null,
+        context: null,
+        state: 'waiting_slot',
+        unitId: null,
+        unitBatchIndex: 0,
+        unitBatchTotal: 0,
+        exited: false,
+      };
+      entry.workers.set(worker.workerId, worker);
+      this.emitWorker(input.buildId, worker);
+      worker.slot = await this.acquireWorkerSlot({ ...input, slotObtained: () => true });
+      await this.spawnWorkerProcess({ ...input, buildState, worker, slot: worker.slot });
+      worker.slot = null;
+      worker.state = 'finishing';
+      this.emitWorker(input.buildId, worker);
+    }
+    this.setWorkerAssignment(worker, null, 'final');
+
+    const crossUnitDocs: string[] = [];
+    for (const unit of input.units) {
+      for (const docPath of buildState.claims?.ownedBy(unit.id) ?? []) {
+        crossUnitDocs.push(`- ${docPath}${buildState.docMeta?.get(docPath)?.title ? `（${buildState.docMeta.get(docPath)!.title}）` : ''} — 单元 ${unit.id}`);
+      }
+    }
+    const summaries = input.units.map((unit) => {
+      const report = buildState.unitDone?.get(unit.id);
+      return `- ${unit.id}（源 ${unit.sources.length} 个）：${report?.summary?.slice(0, 500) ?? '（无摘要）'}`;
+    });
+    const finishPrompt = [
+      '全部构建单元已完成，进入整体收尾轮。各单元摘要：',
+      ...summaries,
+      '',
+      ...(crossUnitDocs.length > 0
+        ? ['本构建各单元写入/认领的文档（可读取任意草稿后合并重复主题；本轮写入不受路径限制）：', ...crossUnitDocs.slice(0, 300), '']
+        : []),
+      '请先完成跨单元合并与去重（如无必要不要重写全部文档），然后【立即调用 kb_finish 工具】完成构建：',
+      '- summary：本次构建的整体总结（做了什么、产出哪些主题文档、做了哪些跨单元合并）。',
+      '- skipped：工作集中未被任何文档引用的源，逐个列出 objToken 与理由（全构建范围，不限于某一单元）。',
+      '注意：必须调用工具本身（tool call），不要只回复文本说明。',
+    ].join('\n');
+    const rpc = worker.rpc!;
+    let outcome = await rpc.prompt(
+      input.systemRules ? `${finishPrompt}\n\n---\n构建规则与文风规范（每批适用）：\n${input.systemRules}` : finishPrompt,
+      { timeoutMs: input.promptTimeoutMs },
+    );
+    if (outcome.outcome === 'aborted') throw new CancelledError();
+    if (outcome.outcome === 'failed') {
+      throw new ToolError(outcome.error?.code ?? 'model_request_failed', `kb_finish 阶段失败：${outcome.error?.message ?? '未知错误'}`, 502);
+    }
+    if (!buildState.finishInfo) {
+      this.emitLog(input.buildId, 'warn', '未检测到 kb_finish 调用，发送强制纠正提示');
+      outcome = await rpc.prompt(
+        '系统检测到你没有调用 kb_finish 工具（工具调用记录为空）。现在请直接调用 kb_finish 工具：summary 填写构建总结；如果此前未写任何文档，skipped 列出全部源并说明理由。不要输出任何文本，直接发起工具调用。',
+        { timeoutMs: input.promptTimeoutMs },
+      );
+      if (outcome.outcome === 'aborted') throw new CancelledError();
+      if (outcome.outcome === 'failed') {
+        throw new ToolError(outcome.error?.code ?? 'model_request_failed', `kb_finish 纠正阶段失败：${outcome.error?.message ?? '未知错误'}`, 502);
+      }
+    }
+  }
+
+  /** S4（§4.5）：终止本构建全部进程（含收尾轮），并释放未消费槽位。 */
+  private async terminateAllWorkers(buildId: string, entry: InMemoryBuild): Promise<void> {
+    for (const worker of entry.workers.values()) {
+      if (worker.slot) {
+        worker.slot.release();
+        worker.slot = null;
+      }
+      await this.deps.pool.terminate(worker.poolKey).catch(() => undefined);
+      if (worker.rpc && !worker.rpc.isExited()) {
+        await worker.rpc.terminate().catch(() => undefined);
+      }
+      worker.rpc = null;
+      worker.state = 'exited';
+      worker.exited = true;
+    }
+    this.deps.toolService.revokeByBuild(buildId);
+  }
+
+  /** 单元批次提示词（§4.2/§4.4：单元语境 + 本单元源表 + 受影响文档 + 单元收尾提示）。 */
+  private buildUnitBatchPrompt(input: {
+    unit: BuildUnit;
+    batch: string[];
+    batchIndex: number;
+    batchTotal: number;
+    snapshot: RawSourceSnapshot;
+    workset: Map<string, 'added' | 'changed' | 'rebuild'>;
+    sourceChanges?: KbFileChange[];
+    isRetry: boolean;
+    claimedDocs: string[];
+  }): string {
+    const { unit } = input;
+    const lines: string[] = [];
+    lines.push('正文必须为当前规则的完整说明。下面的diff只用于判断要更新什么；禁止把修订记录、本次改动、上版/本版对比或版本号写进正文。变更说明只填kb_unit_done/kb_finish的summary。');
+    for (const change of input.sourceChanges ?? []) {
+      if (!input.batch.includes(change.key) && change.kind !== 'removed') continue;
+      lines.push(`源差异 ${change.key}（${change.title}）：${change.kind}${change.reason === 'excluded' ? '，用户标记为不参与构建' : ''}`);
+      lines.push('<untrusted_source_diff>');
+      lines.push(change.beforeAvailable ? (change.patch.slice(0, 8000) || '原文未变，仅路径/标题变化') : '历史版本只保存hash，未保存旧原文；必须读取当前完整源文档，不推测历史差异。');
+      if (change.truncated || change.patch.length > 8000) lines.push('差异展示已截断；以raw_read当前全文为准。');
+      lines.push('</untrusted_source_diff>');
+    }
+    if (input.isRetry) {
+      lines.push(`【重试】单元 ${unit.id} 此前失败，从本批继续。本单元已认领的文档（继续改写这些路径，不要换路径）：`);
+      for (const docPath of input.claimedDocs.slice(0, 200)) lines.push(`- ${docPath}`);
+      lines.push('');
+    }
+    if (input.batch.length === 0) {
+      // F3-R07：仅 removed 的增量——空单元也要明确告知删除与受影响文档
+      lines.push(`【单元 ${unit.id} · 批次 ${input.batchIndex + 1}/${input.batchTotal}】本次构建没有新增或变更的源，但有源被删除：`);
+      lines.push('');
+      lines.push('以下文档受到源移除/排除影响：仅引用已移除源的文档已默认删除；其余仍在草稿中，必须读取保留的源后重新写出完整正文并修正sources：');
+      for (const doc of unit.affectedDocs.slice(0, 200)) {
+        lines.push(`- ${doc.path}（${doc.title}${doc.deletedByDefault ? '，已默认删除，可重建' : ''}）`);
+      }
+      lines.push('');
+      lines.push('要求：');
+      lines.push('1. 检查删除后是否仍有主题需要保留：若某主题还承载未删除源的内容，用 kb_write_doc 重建或修订对应文档（sources 声明现存的源）。');
+      lines.push('2. 若删除后无需任何重建，不写文档，直接调用 kb_unit_done 结束本单元。');
+      return lines.join('\n');
+    }
+    lines.push(`【单元 ${unit.id} · 批次 ${input.batchIndex + 1}/${input.batchTotal}】请处理以下 ${input.batch.length} 个源文档（本单元共 ${unit.sources.length} 个源；其余单元由其他进程并行处理，不要试图处理）：`);
+    lines.push('');
+    lines.push('| objToken | 标题 | 相对路径 | 变更类型 |');
+    lines.push('|---|---|---|---|');
+    for (const token of input.batch) {
+      const entry = input.snapshot.get(token);
+      const changeType = input.workset.get(token) ?? 'changed';
+      lines.push(`| ${token} | ${entry?.title ?? token} | ${entry?.relPath ?? ''} | ${changeType === 'rebuild' ? '重建（全量构建）' : changeType} |`);
+    }
+    lines.push('');
+    if (unit.affectedDocs.length > 0) {
+      lines.push('受影响的已有标准文档（其来源在本单元或已删除，需要修订或重写；本单元已预认领这些路径）：');
+      for (const doc of unit.affectedDocs.slice(0, 200)) {
+        lines.push(`- ${doc.path}（${doc.title}${doc.deletedByDefault ? '，已默认删除，可重建' : ''}）`);
+      }
+      lines.push('');
+    }
+    lines.push('要求：');
+    lines.push('1. 立即开始调用工具（先 raw_read 逐个读取；raw_list filter=workset 只列本单元源），不要只回复文本计划。');
+    lines.push('2. 读完本批全部源后，把内容重组为标准文档：合并相关源、消除重复、按主题分篇；已有草稿可用 draft_read 查看后覆盖（只能写本单元认领的路径）。');
+    lines.push('3. 用 kb_write_doc 写入草稿（每篇都要声明 sources）。');
+    lines.push(input.batchIndex + 1 >= input.batchTotal
+      ? '4. 本批是本单元最后一批：处理完后请调用 kb_unit_done（summary + 本单元未被引用源的 skipped）。'
+      : `4. 处理完本批即可（共 ${input.batchTotal} 批），最后一批后系统会提示调用 kb_unit_done。`);
     return lines.join('\n');
   }
 
@@ -1121,6 +2147,15 @@ export function verifySnapshotIntact(
         409,
       );
     }
+    // S3（§3.4）：有 mediaHash 的源同步复核图片字节——构建中图片被替换
+    // 同样不得切换 CURRENT（主文档字节可能未变）。
+    if (!verifyEntryMediaHash(rootReal, source)) {
+      throw new ToolError(
+        'source_changed_during_build',
+        `发布前复核发现源图片已变更: ${source.relPath}`,
+        409,
+      );
+    }
   }
 }
 
@@ -1223,7 +2258,12 @@ export function validateStagingDocs(
   }
 
   // 覆盖检查：工作集内每个源要么被引用，要么在 skipped
-  const skipped = new Set((state.finishInfo?.skipped ?? []).map((item) => item.objToken));
+  // S4（U8）：skipped 集 = ∪unitDone.skipped ∪ finishInfo.skipped
+  const skipped = new Set<string>();
+  for (const report of state.unitDone?.values() ?? []) {
+    for (const item of report.skipped) skipped.add(item.objToken);
+  }
+  for (const item of state.finishInfo?.skipped ?? []) skipped.add(item.objToken);
   for (const [token] of state.workset) {
     if (!referencedSources.has(token) && !skipped.has(token)) {
       issues.push({ objToken: token, code: 'source_not_covered', message: '源既未被文档引用也未列入 skipped' });
@@ -1252,6 +2292,7 @@ export interface ChangesetResult {
 export function computeChangeset(
   current: RawSourceSnapshotEntry[],
   baseManifest: KbManifest | null,
+  opts?: { visionEnabled?: boolean },
 ): ChangesetResult & { isEmpty(): boolean } {
   const currentByToken = new Map(current.map((entry) => [entry.objToken, entry]));
   const baseByToken = new Map((baseManifest?.sourceSnapshot ?? []).map((entry) => [entry.objToken, entry]));
@@ -1262,6 +2303,9 @@ export function computeChangeset(
     const base = baseByToken.get(token);
     if (!base) added.push(token);
     else if (base.contentHash !== entry.contentHash || base.relPath !== entry.relPath || base.title !== entry.title) changed.push(token);
+    // S3（U4）：vision 启用时变更判定含 mediaHash——双方均非空且不等才算变更；
+    // 旧 manifest 无 mediaHash 视为未变（升级后首次增量不触发全量 changed）
+    else if (opts?.visionEnabled && base.mediaHash && entry.mediaHash && base.mediaHash !== entry.mediaHash) changed.push(token);
   }
   for (const token of baseByToken.keys()) {
     if (!currentByToken.has(token)) removed.push(token);
@@ -1272,14 +2316,6 @@ export function computeChangeset(
     removed: removed.sort(),
     isEmpty: () => added.length === 0 && changed.length === 0 && removed.length === 0,
   };
-}
-
-function chunk<T>(items: T[], size: number): T[][] {
-  const result: T[][] = [];
-  for (let i = 0; i < items.length; i += size) {
-    result.push(items.slice(i, i + size));
-  }
-  return result;
 }
 
 /** outputRoot 校验（§5.1）：保存配置与每次构建前执行。 */
@@ -1366,6 +2402,13 @@ export function cleanupOldStaging(outputRoot: string): void {
       /* 清理失败不阻断 */
     }
   }
+}
+
+/** 等价回退路径的批切分（与重构前 chunk 语义一致）。 */
+function chunkTokens(items: string[], size: number): string[][] {
+  const result: string[][] = [];
+  for (let i = 0; i < items.length; i += size) result.push(items.slice(i, i + size));
+  return result;
 }
 
 function writeReport(outputRoot: string, buildId: string, issues: KbBuildReportIssue[]): void {

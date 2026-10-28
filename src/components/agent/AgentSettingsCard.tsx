@@ -17,6 +17,7 @@ import {
   Copy,
   Database,
   FolderPlus,
+  ImageIcon,
   Loader2,
   RefreshCw,
   Server,
@@ -32,11 +33,21 @@ import {
   addAgentWorkspace,
   APIError,
   deleteAgentWorkspace,
+  getAgentVisionStatus,
   getKbMcpInfo,
   listAgentWorkspaces,
+  testAgentVision,
 } from '../../api/client';
 import { describeReadinessCode as describeReadiness } from '../../utils/agentReadiness';
-import type { AgentConfig, AgentWorkspaceConfig, KbMcpInfoDto, StandardKbConfig } from '../../types/agent';
+import type {
+  AgentConfig,
+  AgentVisionConfig,
+  AgentVisionStatusDto,
+  AgentVisionTestResult,
+  AgentWorkspaceConfig,
+  KbMcpInfoDto,
+  StandardKbConfig,
+} from '../../types/agent';
 
 /** 设置卡骨架（对齐既有设置卡片视觉：标题 + 描述 + 内容区）。 */
 function CardShell({
@@ -76,6 +87,33 @@ function FieldLabel({ children, hint }: { children: React.ReactNode; hint?: stri
 const INPUT_CLS =
   'w-full h-9 px-3 rounded-md border border-line bg-card-bg text-sm text-ink focus:outline-none focus:border-seal/50 disabled:bg-paper-2 disabled:text-ink-faint';
 
+/** 图片理解默认参数（与服务端 buildDefaultAgentVisionConfig 对齐；仅防御性兜底，保存时服务端仍会归一）。 */
+export const DEFAULT_VISION_CONFIG: AgentVisionConfig = {
+  enabled: false,
+  concurrency: 3,
+  maxImageBytes: 5 * 1024 * 1024,
+  maxImagesPerBuild: 300,
+  timeoutMs: 120_000,
+};
+
+/** 测试按钮可用条件：已启用，或已显式选了 provider/model（服务端允许启用前试测）。导出供单测锚定。 */
+export function canTestVision(visionEnabled: boolean, providerId: string, modelId: string): boolean {
+  return visionEnabled || Boolean(providerId) || Boolean(modelId);
+}
+
+/** 测试结果一行摘要。导出供单测锚定。 */
+export function describeVisionTestResult(result: AgentVisionTestResult): string {
+  if (result.ok) return `测试通过 · ${result.model} · ${result.latencyMs}ms`;
+  return `测试失败（${result.error?.code ?? result.finishReason}）：${result.error?.message ?? '远端调用失败'}`;
+}
+
+/** vision 状态行文案（disabled/ready/invalid；徽标已显状态名，行文不重复）。导出供单测锚定。 */
+export function describeVisionStatus(status: AgentVisionStatusDto): string {
+  if (status.state === 'ready') return `图片描述通道可用 · ${status.model ?? ''} · 已缓存图片描述 ${status.cachedCount} 条`;
+  if (status.state === 'invalid') return `配置无效：${status.message || '引用的提供商/模型不可用'}`;
+  return '未启用';
+}
+
 // ---------------------------------------------------------------------------
 // 运行时与模型
 // ---------------------------------------------------------------------------
@@ -90,6 +128,53 @@ export function AgentRuntimeSettingsCard() {
   const [piCliPath, setPiCliPath] = useState('');
   const [saving, setSaving] = useState(false);
 
+  // ---- S2/S5：图片理解段（独立状态面；保存走 agent.vision，不动文本模型配置） ----
+  const vision = agent?.vision ?? DEFAULT_VISION_CONFIG;
+  const visionEnabled = vision.enabled;
+  const visionProviderId = vision.providerId || config?.llm.activeProviderId || '';
+  const visionModelId = vision.modelId || '';
+  const [visionStatus, setVisionStatus] = useState<AgentVisionStatusDto | null>(null);
+  const [visionStatusLoading, setVisionStatusLoading] = useState(true);
+  const [visionTesting, setVisionTesting] = useState(false);
+  const [visionTest, setVisionTest] = useState<AgentVisionTestResult | null>(null);
+
+  useEffect(() => {
+    let disposed = false;
+    setVisionStatusLoading(true);
+    getAgentVisionStatus()
+      .then((status) => { if (!disposed) setVisionStatus(status); })
+      .catch(() => { if (!disposed) setVisionStatus(null); })
+      .finally(() => { if (!disposed) setVisionStatusLoading(false); });
+    return () => { disposed = true; };
+  }, [config]);
+
+  const runVisionTest = async () => {
+    setVisionTesting(true);
+    setVisionTest(null);
+    try {
+      const result = await testAgentVision({
+        ...(visionProviderId ? { providerId: visionProviderId } : {}),
+        ...(visionModelId ? { modelId: visionModelId } : {}),
+      });
+      setVisionTest(result);
+    } catch (err) {
+      // 400（vision_unconfigured / invalid_config）等服务端拒绝也如实展示。
+      setVisionTest({
+        ok: false,
+        finishReason: 'error',
+        model: '',
+        latencyMs: 0,
+        sample: '',
+        error: {
+          code: err instanceof APIError ? String(err.response?.error ?? err.statusCode ?? 'request_failed') : 'request_failed',
+          message: err instanceof Error ? err.message : '测试请求失败',
+        },
+      });
+    } finally {
+      setVisionTesting(false);
+    }
+  };
+
   useEffect(() => {
     setNodePath(agent?.runtime?.nodePath ?? '');
     setPiCliPath(agent?.runtime?.piCliPath ?? '');
@@ -101,6 +186,7 @@ export function AgentRuntimeSettingsCard() {
   const ready = agentStatus.status?.code === 'ready' && !agentStatus.unreachable;
 
   const providers = useMemo(() => (config?.llm.providers ?? []).filter((p) => p.enabled && p.apiKey?.trim() && /^https?:\/\//i.test(p.openAiCompatBaseUrl) && p.models.some((m) => m.enabled && m.openAiModel.trim())), [config?.llm.providers]);
+  const visionSelectedProvider = providers.find((p) => p.id === visionProviderId);
   const currentProviderId = agent?.model?.providerId || config?.llm.activeProviderId || '';
   const selectedProvider = providers.find((p) => p.id === currentProviderId);
   const currentModelId = agent?.model?.modelId || (currentProviderId === config?.llm.activeProviderId ? config?.llm.activeModelId : '') || selectedProvider?.defaultModelId || '';
@@ -126,6 +212,7 @@ export function AgentRuntimeSettingsCard() {
   const saveAgent = async (patch: {
     runtime?: { nodePath?: string; piCliPath?: string };
     model?: Partial<AgentConfig['model']>;
+    vision?: Partial<AgentVisionConfig>;
   }) => {
     setSaving(true);
     try {
@@ -146,6 +233,7 @@ export function AgentRuntimeSettingsCard() {
         ...baseAgent,
         runtime: { ...baseAgent.runtime, ...(patch.runtime ?? {}) },
         model: { ...baseAgent.model, ...(patch.model ?? {}) },
+        ...(patch.vision ? { vision: { ...DEFAULT_VISION_CONFIG, ...baseAgent.vision, ...patch.vision } } : {}),
       };
       await updateConfig({ agent: next });
       toast.push({ type: 'success', message: 'Agent 配置已保存' });
@@ -352,6 +440,118 @@ export function AgentRuntimeSettingsCard() {
         </div>
       )}
 
+      {/* S2/S5：图片理解段（设计 §3.6；文本模型下方） */}
+      <div className="rounded-md border border-line bg-paper/30 p-3 space-y-2.5" data-testid="vision-section">
+        <div className="flex items-center justify-between gap-2 flex-wrap">
+          <span className="inline-flex items-center gap-1.5 text-xs font-medium text-ink">
+            <ImageIcon className="w-3.5 h-3.5 text-ink-faint" />
+            图片理解
+          </span>
+          <label className="flex items-center gap-2 text-xs text-ink-soft cursor-pointer">
+            <input
+              type="checkbox"
+              className="accent-[#9e2b25]"
+              checked={visionEnabled}
+              disabled={saving || providers.length === 0}
+              onChange={(e) => saveAgent({ vision: { enabled: e.target.checked } })}
+              aria-label="启用图片理解"
+              data-testid="vision-enabled-toggle"
+            />
+            启用
+          </label>
+        </div>
+
+        <div className="flex items-center gap-2 flex-wrap text-[11px] text-ink-faint" data-testid="vision-status">
+          {visionStatusLoading ? (
+            <span>正在读取图片理解状态…</span>
+          ) : visionStatus ? (
+            <>
+              <StatusBadge
+                status={visionStatus.state === 'ready' ? 'success' : visionStatus.state === 'invalid' ? 'warning' : 'neutral'}
+              >
+                {visionStatus.state === 'ready' ? '就绪' : visionStatus.state === 'invalid' ? '配置无效' : '未启用'}
+              </StatusBadge>
+              <span className="min-w-0">{describeVisionStatus(visionStatus)}</span>
+            </>
+          ) : (
+            <span>图片理解状态不可用（服务未实现或不可达）</span>
+          )}
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div>
+            <FieldLabel>识图提供商</FieldLabel>
+            <select
+              className={INPUT_CLS}
+              value={visionProviderId}
+              disabled={saving}
+              onChange={(e) => saveAgent({ vision: { providerId: e.target.value || undefined, modelId: undefined } })}
+              aria-label="识图提供商"
+            >
+              <option value="">（跟随应用默认）</option>
+              {visionProviderId && !visionSelectedProvider ? <option value={visionProviderId} disabled>原提供商未配置或不可用，请重新选择</option> : null}
+              {providers.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.name} · {p.protocol === 'anthropic-messages' ? 'Anthropic' : p.protocol === 'openai-responses' ? 'Responses' : 'Chat Completions'}
+                </option>
+              ))}
+            </select>
+            {providers.length === 0 ? (
+              <p className="mt-1 text-[11px] text-ink-faint">尚无可用提供商，请先在「服务提供商与模型」中配置。</p>
+            ) : null}
+          </div>
+          <div>
+            <FieldLabel hint="标注「支持图片」为声明能力">识图模型预设</FieldLabel>
+            <select
+              className={INPUT_CLS}
+              value={visionModelId}
+              disabled={saving}
+              onChange={(e) => saveAgent({ vision: { modelId: e.target.value || undefined } })}
+              aria-label="识图模型预设"
+            >
+              <option value="">（提供商默认预设）</option>
+              {visionModelId && !visionSelectedProvider?.models.some((m) => m.id === visionModelId) ? <option value={visionModelId} disabled>原模型预设不可用，请重新选择</option> : null}
+              {(visionSelectedProvider?.models ?? [])
+                .filter((m) => m.enabled && m.openAiModel.trim())
+                .map((m) => (
+                  <option key={m.id} value={m.id} disabled={m.supportsImages === false}>
+                    {m.name} · {m.openAiModel}
+                    {m.supportsImages === true ? '（支持图片）' : m.supportsImages === false ? '（不支持图片）' : ''}
+                  </option>
+                ))}
+            </select>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-2 flex-wrap">
+          <Button
+            size="sm"
+            variant="secondary"
+            loading={visionTesting}
+            disabled={saving || providers.length === 0 || !canTestVision(visionEnabled, visionProviderId, visionModelId)}
+            onClick={() => void runVisionTest()}
+            data-testid="vision-test-button"
+          >
+            测试识图
+          </Button>
+          <span className="text-[11px] text-ink-faint">用内置测试图实测所选模型（真实调用远端，消耗少量额度）</span>
+        </div>
+
+        {visionTest ? (
+          <div data-testid="vision-test-result" className={visionTest.ok ? 'text-[11px] text-jade leading-snug' : 'text-[11px] text-seal-2 leading-snug'} role={visionTest.ok ? undefined : 'alert'}>
+            <p>{describeVisionTestResult(visionTest)}</p>
+            {visionTest.ok && visionTest.sample ? (
+              <p className="mt-0.5 text-ink-soft whitespace-pre-wrap">{visionTest.sample.slice(0, 200)}{visionTest.sample.length > 200 ? '…' : ''}</p>
+            ) : null}
+          </div>
+        ) : null}
+
+        <p className="text-[11px] text-ink-faint leading-relaxed">
+          启用后，标准库构建与 Work 会话会把源文档中的图片发送到所选端点生成文字描述，结果按图片内容缓存；
+          未启用时构建仍可发布，图片处会插入「未理解」标记。凭证取自所选提供商，不在此重复输入。
+        </p>
+      </div>
+
       {/* thinking + 保存路径覆盖 */}
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 items-end">
         <div>
@@ -435,6 +635,7 @@ export function AgentKbSettingsCard() {
           buildBatchSize: 10,
           promptTimeoutMinutes: 15,
           buildTimeoutMinutes: 180,
+          buildParallelism: 2,
           autoBuildAfterSync: false,
         };
       await updateConfig({ standardKb: { ...base, outputRoot: outputRoot.trim() } });
@@ -443,6 +644,27 @@ export function AgentKbSettingsCard() {
       toast.push({ type: 'error', message: err instanceof APIError ? err.message : '保存失败' });
     } finally {
       setSavingRoot(false);
+    }
+  };
+
+  // S4 §4.6：构建并行数（1..6；选择即保存，服务端严格校验并夹取）。
+  const buildParallelism = config?.standardKb?.buildParallelism ?? 2;
+  const saveBuildParallelism = async (value: number) => {
+    try {
+      const base: StandardKbConfig =
+        config?.standardKb ?? {
+          outputRoot: '',
+          retainReleases: 3,
+          buildBatchSize: 10,
+          promptTimeoutMinutes: 15,
+          buildTimeoutMinutes: 180,
+          buildParallelism: 2,
+          autoBuildAfterSync: false,
+        };
+      await updateConfig({ standardKb: { ...base, buildParallelism: value } });
+      toast.push({ type: 'success', message: `构建并行数已设为 ${value}` });
+    } catch (err) {
+      toast.push({ type: 'error', message: err instanceof APIError ? err.message : '保存失败' });
     }
   };
 
@@ -516,6 +738,29 @@ export function AgentKbSettingsCard() {
             </Button>
           </div>
           <p className="mt-1 text-[11px] text-ink-faint">目录不得位于原始知识库内；已有内容且非标准库结构时会被拒绝。</p>
+        </div>
+
+        {/* S4 §4.6：构建并行数 */}
+        <div>
+          <FieldLabel hint="1..6">构建并行数</FieldLabel>
+          <select
+            className={INPUT_CLS}
+            value={String(buildParallelism)}
+            disabled={savingRoot}
+            onChange={(e) => void saveBuildParallelism(Number(e.target.value))}
+            aria-label="构建并行数"
+            data-testid="build-parallelism-select"
+          >
+            {[1, 2, 3, 4, 5, 6].map((n) => (
+              <option key={n} value={n}>
+                {n} 路{n === 1 ? '（单进程，行为与旧版一致）' : ''}
+              </option>
+            ))}
+          </select>
+          <p className="mt-1 text-[11px] text-ink-faint" data-testid="build-parallelism-hint">
+            实际并行受 Agent 进程上限（maxConcurrentProcesses 的后台配额）与工作单元数约束；
+            1 路为单进程等价回退，多路只在多单元构建时生效。
+          </p>
         </div>
 
         <div>

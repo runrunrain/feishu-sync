@@ -128,6 +128,37 @@ describe('config routes', () => {
     expect((await response.json()).config.llm.apiKey).toBe('***');
   });
 
+  it('T3b-02：actor=cli 的 PUT 丢弃 feishuWrite 字段（其余字段照常生效）', async () => {
+    const config = makeConfig();
+    const updateConfig = vi.fn(async (partial: unknown) => ({ ...config, ...(partial as object) }));
+    const app = buildApp({ load: vi.fn(async () => config), updateConfig });
+
+    // 经 /api/cli/:command 内部转发携带的 actor 标记头
+    const response = await app.fetch(new Request('http://x/api/config', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'X-Feishu-Sync-Actor': 'cli' },
+      body: JSON.stringify({ feishuWrite: { enabled: true }, pollIntervalMinutes: 25 }),
+    }));
+
+    expect(response.status).toBe(200);
+    expect(updateConfig).toHaveBeenCalledWith({ pollIntervalMinutes: 25 });
+  });
+
+  it('T3b-02：desktop 链路（无 actor 标记）的 feishuWrite 正常修改（回归）', async () => {
+    const config = makeConfig();
+    const updateConfig = vi.fn(async (partial: unknown) => ({ ...config, ...(partial as object) }));
+    const app = buildApp({ load: vi.fn(async () => config), updateConfig });
+
+    const response = await app.fetch(new Request('http://x/api/config', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ feishuWrite: { enabled: true } }),
+    }));
+
+    expect(response.status).toBe(200);
+    expect(updateConfig).toHaveBeenCalledWith({ feishuWrite: { enabled: true } });
+  });
+
   it('returns 400 when ConfigManager rejects a root contract violation', async () => {
     const app = buildApp({
       updateConfig: vi.fn(async () => {

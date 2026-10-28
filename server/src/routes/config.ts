@@ -162,6 +162,17 @@ configRoutes.put('/api/config', async (c) => {
     if (partialConfig.agent && typeof partialConfig.agent === 'object') {
       delete (partialConfig.agent as { workspaces?: unknown }).workspaces;
     }
+    // T3b-02（设计 §7.6）：feishuWrite 只接受 desktop token 链路修改。
+    // CLI 主体（带 CLI 令牌直连，或经 /api/cli/:command 内部转发携带的
+    // actor 标记头）的请求丢弃该字段——命令表层 CONFIG_SET_FORBIDDEN
+    // 已前置拒绝 config.set feishuWrite，此处是消费者侧兑底（丢弃语义，
+    // 同一 patch 其余字段仍可生效）。
+    if (
+      partialConfig.feishuWrite !== undefined
+      && ((c as any).cliActor === true || c.req.header('X-Feishu-Sync-Actor') === 'cli')
+    ) {
+      delete partialConfig.feishuWrite;
+    }
     // 2026-09-04 watchedRoot 删除级联清理：对比保存前后 watchedRoots，
     // 被移除的根在保存成功后自动 purge 其 DB 数据（documents/sheets/
     // pending/localDirs）——否则树面板残留「未分类」组且无法清理。

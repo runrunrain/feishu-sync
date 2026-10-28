@@ -49,7 +49,7 @@ describe('旧配置兼容（additive 默认合并）', () => {
     expect(config.agent).toBeTruthy();
     expect(config.agent.model.source).toBe('app-llm');
     expect(config.agent.model.thinkingLevel).toBe('off');
-    expect(config.agent.maxConcurrentProcesses).toBe(2);
+    expect(config.agent.maxConcurrentProcesses).toBe(3);
     expect(config.agent.workspaces).toEqual([]);
     expect(config.standardKb.retainReleases).toBe(3);
     expect(config.standardKb.buildBatchSize).toBe(10);
@@ -91,7 +91,7 @@ describe('旧配置兼容（additive 默认合并）', () => {
     const config = await manager.load();
     expect(config.agent.model.source).toBe('pi-agent-dir');
     expect(config.agent.model.thinkingLevel).toBe('off'); // 缺省补默认
-    expect(config.agent.maxConcurrentProcesses).toBe(2);
+    expect(config.agent.maxConcurrentProcesses).toBe(3);
   });
 });
 

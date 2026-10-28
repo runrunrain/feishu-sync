@@ -52,6 +52,30 @@ export function piContextExtensionPath(): string | null {
   return null;
 }
 
+/** 读取 prompts 目录下的单个内置资产（utf-8）。不存在返回 null。S2：vision 识图提示词。 */
+export function readAgentPromptFile(relative: string): string | null {
+  const candidates = [
+    path.join(agentAssetsRoot(), 'prompts', relative),
+    path.join(serverDistRoot(), '..', 'src', 'agent', 'prompts', relative),
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return fs.readFileSync(candidate, 'utf-8');
+  }
+  return null;
+}
+
+/** 读取 prompts 目录下的单个二进制资产（S2：vision 内置测试图）。不存在返回 null。 */
+export function readAgentPromptBinary(relative: string): Buffer | null {
+  const candidates = [
+    path.join(agentAssetsRoot(), 'prompts', relative),
+    path.join(serverDistRoot(), '..', 'src', 'agent', 'prompts', relative),
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return fs.readFileSync(candidate);
+  }
+  return null;
+}
+
 /** 读取内置 prompt 资产（构建规则 + 文风规范）。缺任一返回 null。 */
 export function readAgentPromptAssets(): { buildRules: string; styleGuide: string } | null {
   const read = (relative: string): string | null => {

@@ -23,6 +23,8 @@ import type {
   SyncRepairAction,
   SyncState,
   WatchedRootConfig,
+  SourceEditActor,
+  SourceEditRecord,
 } from '../types/index.js';
 
 const V5_RUNTIME_SCHEMA_VERSION = 'v5_runtime_state';
@@ -89,6 +91,24 @@ export class LocalMapStore {
   private applyAdditiveMigrations(): void {
     const sessionCols = this.db.prepare('PRAGMA table_info(agent_sessions)').all() as Array<{ name: string }>;
     if (sessionCols.length && !sessionCols.some((c) => c.name === 'model_config_json')) this.db.exec('ALTER TABLE agent_sessions ADD COLUMN model_config_json TEXT');
+    // S4（设计 §4.6）：kb_builds 并行构建新列——PRAGMA 守卫 + SAVEPOINT 外
+    // 逐列 ALTER（与 documents 段同模式，但列 DEFAULT 已覆盖旧行）。
+    const kbBuildCols = this.db.prepare('PRAGMA table_info(kb_builds)').all() as Array<{ name: string }>;
+    if (kbBuildCols.length) {
+      const kbBuildColNames = new Set(kbBuildCols.map((c) => c.name));
+      const kbBuildAdditive: Array<[string, string]> = [
+        ['parallelism', 'ALTER TABLE kb_builds ADD COLUMN parallelism INTEGER NOT NULL DEFAULT 1'],
+        ['unit_total', 'ALTER TABLE kb_builds ADD COLUMN unit_total INTEGER NOT NULL DEFAULT 0'],
+        ['vision_model', 'ALTER TABLE kb_builds ADD COLUMN vision_model TEXT'],
+        ['warnings_json', 'ALTER TABLE kb_builds ADD COLUMN warnings_json TEXT'],
+      ];
+      for (const [name, dml] of kbBuildAdditive) {
+        if (!kbBuildColNames.has(name)) {
+          this.db.exec(dml);
+          console.info(`[LocalMapStore] Auto-migration: + kb_builds.${name}`);
+        }
+      }
+    }
     const currentCols = this.db.prepare('PRAGMA table_info(documents)').all() as Array<{ name: string }>;
     const colNames = new Set(currentCols.map((c) => c.name));
 
@@ -212,6 +232,39 @@ export class LocalMapStore {
 
     `);
     console.info('[LocalMapStore] localDirs table ready (v4 structure-align)');
+
+    // S6 任务编排（设计 kb-agent-upgrade §5.4）：agent_tasks 新表。
+    // CREATE TABLE IF NOT EXISTS 对旧库同样新建；与 getCreateTablesDDL
+    // 双登记（回滚策略 §13：旧版本应用忽略新表）。
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS agent_tasks (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        title TEXT NOT NULL,
+        task_text TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('queued','running','done','blocked','failed','cancelled','interrupted')),
+        parent_mode TEXT NOT NULL,
+        workspace_id TEXT,
+        output_dir TEXT,
+        tools_json TEXT NOT NULL,
+        plugin_revision TEXT,
+        model TEXT,
+        rounds INTEGER NOT NULL DEFAULT 0,
+        result_text TEXT,
+        result_truncated INTEGER NOT NULL DEFAULT 0,
+        questions_text TEXT,
+        error_code TEXT,
+        error_message TEXT,
+        pi_session_file TEXT,
+        resume_answers_json TEXT,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        finished_at TEXT,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_agent_tasks_session ON agent_tasks(session_id, created_at);
+    `);
   }
 
   /**
@@ -2230,6 +2283,11 @@ export class LocalMapStore {
     errorMessage: string | null;
     startedAt: string;
     finishedAt: string;
+    /** S4：并行构建新列（缺省不动） */
+    parallelism: number;
+    unitTotal: number;
+    visionModel: string | null;
+    warningsJson: string | null;
   }>): void {
     const current = this.db.prepare('SELECT * FROM kb_builds WHERE id = ?').get(id) as Record<string, unknown> | undefined;
     if (!current) throw new Error(`kb_build 不存在: ${id}`);
@@ -2243,6 +2301,10 @@ export class LocalMapStore {
       docs_written: patch.docsWritten ?? current.docs_written,
       docs_deleted: patch.docsDeleted ?? current.docs_deleted,
       no_changes: patch.noChanges !== undefined ? (patch.noChanges ? 1 : 0) : current.no_changes,
+      parallelism: patch.parallelism ?? current.parallelism ?? 1,
+      unit_total: patch.unitTotal ?? current.unit_total ?? 0,
+      vision_model: patch.visionModel !== undefined ? patch.visionModel : current.vision_model ?? null,
+      warnings_json: patch.warningsJson !== undefined ? patch.warningsJson : current.warnings_json ?? null,
       error_code: patch.errorCode !== undefined ? patch.errorCode : current.error_code,
       error_message: patch.errorMessage !== undefined ? patch.errorMessage : current.error_message,
       started_at: patch.startedAt ?? current.started_at,
@@ -2251,12 +2313,14 @@ export class LocalMapStore {
     this.db.prepare(`
       UPDATE kb_builds SET status=?, release_id=?, source_total=?, source_added=?,
         source_changed=?, source_removed=?, docs_written=?, docs_deleted=?,
-        no_changes=?, error_code=?, error_message=?, started_at=?, finished_at=?
+        no_changes=?, parallelism=?, unit_total=?, vision_model=?, warnings_json=?,
+        error_code=?, error_message=?, started_at=?, finished_at=?
       WHERE id=?
     `).run(
       next.status, next.release_id, next.source_total, next.source_added,
       next.source_changed, next.source_removed, next.docs_written, next.docs_deleted,
-      next.no_changes, next.error_code, next.error_message, next.started_at, next.finished_at,
+      next.no_changes, next.parallelism, next.unit_total, next.vision_model, next.warnings_json,
+      next.error_code, next.error_message, next.started_at, next.finished_at,
       id,
     );
   }
@@ -2350,6 +2414,281 @@ export class LocalMapStore {
     return this.db.prepare(
       'SELECT * FROM agent_sessions WHERE workspace_id = ? AND deleted_at IS NULL',
     ).all(workspaceId) as Array<Record<string, unknown>>;
+  }
+
+  // ===========================================================================
+  // 任务编排（S6，设计 kb-agent-upgrade §5.4）：agent_tasks 访问器。
+  // 状态机权威在 TaskService；本层只提供原子原语（read-modify-write 与
+  // kb_builds 同模式，无业务判断）。
+  // ===========================================================================
+
+  createAgentTask(input: {
+    id: string;
+    sessionId: string;
+    role: string;
+    title: string;
+    taskText: string;
+    status: string;
+    parentMode: 'discuss' | 'work';
+    workspaceId: string | null;
+    outputDir: string | null;
+    toolsJson: string;
+    pluginRevision: string | null;
+    model: string | null;
+    createdAt: string;
+    updatedAt: string;
+  }): void {
+    this.db.prepare(`
+      INSERT INTO agent_tasks (id, session_id, role, title, task_text, status, parent_mode,
+        workspace_id, output_dir, tools_json, plugin_revision, model, rounds,
+        created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+    `).run(
+      input.id, input.sessionId, input.role, input.title, input.taskText, input.status,
+      input.parentMode, input.workspaceId, input.outputDir, input.toolsJson,
+      input.pluginRevision, input.model, input.createdAt, input.updatedAt,
+    );
+  }
+
+  getAgentTask(id: string): Record<string, unknown> | null {
+    return (this.db.prepare('SELECT * FROM agent_tasks WHERE id = ?').get(id) as Record<string, unknown> | undefined) ?? null;
+  }
+
+  updateAgentTask(id: string, patch: Partial<{
+    status: string;
+    rounds: number;
+    model: string | null;
+    resultText: string | null;
+    resultTruncated: boolean;
+    questionsText: string | null;
+    errorCode: string | null;
+    errorMessage: string | null;
+    startedAt: string;
+    finishedAt: string;
+    piSessionFile: string | null;
+    resumeAnswersJson: string | null;
+    updatedAt: string;
+  }>): void {
+    const current = this.getAgentTask(id);
+    if (!current) throw new Error(`agent_task 不存在: ${id}`);
+    const next = {
+      status: patch.status ?? current.status,
+      rounds: patch.rounds !== undefined ? patch.rounds : current.rounds,
+      model: patch.model !== undefined ? patch.model : current.model,
+      result_text: patch.resultText !== undefined ? patch.resultText : current.result_text,
+      result_truncated: patch.resultTruncated !== undefined ? (patch.resultTruncated ? 1 : 0) : current.result_truncated ?? 0,
+      questions_text: patch.questionsText !== undefined ? patch.questionsText : current.questions_text,
+      error_code: patch.errorCode !== undefined ? patch.errorCode : current.error_code,
+      error_message: patch.errorMessage !== undefined ? patch.errorMessage : current.error_message,
+      started_at: patch.startedAt ?? current.started_at,
+      finished_at: patch.finishedAt !== undefined ? patch.finishedAt : current.finished_at,
+      pi_session_file: patch.piSessionFile !== undefined ? patch.piSessionFile : current.pi_session_file,
+      resume_answers_json: patch.resumeAnswersJson !== undefined ? patch.resumeAnswersJson : current.resume_answers_json,
+      updated_at: patch.updatedAt ?? new Date().toISOString(),
+    };
+    this.db.prepare(`
+      UPDATE agent_tasks SET status=?, rounds=?, model=?, result_text=?, result_truncated=?, questions_text=?,
+        error_code=?, error_message=?, started_at=?, finished_at=?, pi_session_file=?,
+        resume_answers_json=?, updated_at=?
+      WHERE id=?
+    `).run(
+      next.status, next.rounds, next.model, next.result_text, next.result_truncated, next.questions_text,
+      next.error_code, next.error_message, next.started_at, next.finished_at,
+      next.pi_session_file, next.resume_answers_json, next.updated_at, id,
+    );
+  }
+
+  listAgentTasksBySession(sessionId: string): Array<Record<string, unknown>> {
+    return this.db.prepare(
+      'SELECT * FROM agent_tasks WHERE session_id = ? ORDER BY created_at ASC, id ASC',
+    ).all(sessionId) as Array<Record<string, unknown>>;
+  }
+
+  listAgentTasksByIds(ids: string[]): Array<Record<string, unknown>> {
+    if (ids.length === 0) return [];
+    const placeholders = ids.map(() => '?').join(',');
+    return this.db.prepare(
+      `SELECT * FROM agent_tasks WHERE id IN (${placeholders}) ORDER BY created_at ASC, id ASC`,
+    ).all(...ids) as Array<Record<string, unknown>>;
+  }
+
+  /** 启动对账：queued/running → interrupted（blocked 保留可作答）。 */
+  markInterruptedAgentTasks(): string[] {
+    const info = this.db.prepare(`
+      UPDATE agent_tasks SET status='interrupted',
+        error_code=COALESCE(error_code,'interrupted'),
+        error_message=COALESCE(error_message,'应用退出时任务未完成'),
+        finished_at=datetime('now'), updated_at=datetime('now')
+      WHERE status IN ('queued','running')
+      RETURNING id
+    `).all() as Array<{ id: string }>;
+    return info.map((row) => row.id);
+  }
+
+  // ===========================================================================
+  // 源库受控编辑（S11，设计 §7.4）：source_edits 访问器
+  // 预编译语句全部经 getStatement；状态机 dirty|pushing|pushed|conflict 中
+  // pushing/pushed/conflict 的写入者主要是 S12 写回链，这里只提供原子原语。
+  // ===========================================================================
+
+  private mapSourceEditRow(row: Record<string, any>): SourceEditRecord {
+    return {
+      objToken: row.obj_token,
+      localRelPath: row.local_rel_path,
+      state: row.state,
+      baseObjEditTime: row.base_obj_edit_time ?? null,
+      baseBodyHash: row.base_body_hash,
+      currentBodyHash: row.current_body_hash,
+      editCount: row.edit_count ?? 0,
+      lastActor: row.last_actor,
+      pushMode: row.push_mode ?? null,
+      pushRevisionId: row.push_revision_id ?? null,
+      lastErrorCode: row.last_error_code ?? null,
+      lastErrorMessage: row.last_error_message ?? null,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      pushedAt: row.pushed_at ?? null,
+    };
+  }
+
+  getSourceEdit(objToken: string): SourceEditRecord | null {
+    const row = this.getStatement('SELECT * FROM source_edits WHERE obj_token = ?')
+      .get(objToken) as Record<string, any> | undefined;
+    return row ? this.mapSourceEditRow(row) : null;
+  }
+
+  /** 首次编辑建行（state='dirty'，edit_count=0 基线，随后 markDirty 收敛到 1）。 */
+  createSourceEdit(input: {
+    objToken: string;
+    localRelPath: string;
+    baseObjEditTime: number | string | null;
+    baseBodyHash: string;
+    currentBodyHash: string;
+    lastActor: SourceEditActor | string;
+  }): void {
+    const now = new Date().toISOString();
+    this.getStatement(`
+      INSERT INTO source_edits
+        (obj_token, local_rel_path, state, base_obj_edit_time, base_body_hash,
+         current_body_hash, edit_count, last_actor, created_at, updated_at)
+      VALUES (?, ?, 'dirty', ?, ?, ?, 0, ?, ?, ?)
+    `).run(
+      input.objToken,
+      input.localRelPath,
+      input.baseObjEditTime == null ? null : String(input.baseObjEditTime),
+      input.baseBodyHash,
+      input.currentBodyHash,
+      input.lastActor,
+      now,
+      now,
+    );
+  }
+
+  /** 后续编辑：state='dirty'、刷新当前哈希、计数+1（设计 §7.2 步骤 6）。 */
+  markSourceEditDirty(
+    objToken: string,
+    patch: { currentBodyHash: string; lastActor: SourceEditActor | string },
+  ): void {
+    this.getStatement(`
+      UPDATE source_edits
+      SET state = 'dirty', current_body_hash = ?, last_actor = ?,
+          edit_count = edit_count + 1, updated_at = ?, pushed_at = NULL
+      WHERE obj_token = ?
+    `).run(patch.currentBodyHash, patch.lastActor, new Date().toISOString(), objToken);
+  }
+
+  /** S12 写回链原语：置 pushed（成功）并记 push_mode/push_revision_id。 */
+  markSourceEditPushed(
+    objToken: string,
+    patch: { pushMode?: string | null; pushRevisionId?: string | null } = {},
+  ): void {
+    this.getStatement(`
+      UPDATE source_edits
+      SET state = 'pushed', push_mode = COALESCE(?, push_mode),
+          push_revision_id = COALESCE(?, push_revision_id),
+          updated_at = ?, pushed_at = ?
+      WHERE obj_token = ?
+    `).run(
+      patch.pushMode ?? null,
+      patch.pushRevisionId ?? null,
+      new Date().toISOString(),
+      new Date().toISOString(),
+      objToken,
+    );
+  }
+
+  /** S12 写回链原语：置 pushing（推送执行中；SyncEngine/编辑面按 pending 阻断）。 */
+  markSourceEditPushing(objToken: string): void {
+    this.getStatement(`
+      UPDATE source_edits
+      SET state = 'pushing', updated_at = ?
+      WHERE obj_token = ?
+    `).run(new Date().toISOString(), objToken);
+  }
+
+  /** S12 写回链原语：置 conflict（revision 未来值/回读失配/结果未知/U20① 前置冲突）。 */
+  markSourceEditConflict(
+    objToken: string,
+    error: { code: string; message: string },
+  ): void {
+    this.getStatement(`
+      UPDATE source_edits
+      SET state = 'conflict', last_error_code = ?, last_error_message = ?, updated_at = ?
+      WHERE obj_token = ?
+    `).run(error.code, error.message.slice(0, 500), new Date().toISOString(), objToken);
+  }
+
+  /** S12 写回链原语：推送失败回 dirty（保留 last_error_* 供 UI 展示；不推进 edit_count）。 */
+  markSourceEditPushAborted(
+    objToken: string,
+    error?: { code: string; message: string },
+  ): void {
+    this.getStatement(`
+      UPDATE source_edits
+      SET state = 'dirty', last_error_code = ?, last_error_message = ?, updated_at = ?
+      WHERE obj_token = ?
+    `).run(
+      error?.code ?? null,
+      error ? error.message.slice(0, 500) : null,
+      new Date().toISOString(),
+      objToken,
+    );
+  }
+
+  /**
+   * S12 启动对账（设计 §7.4）：上次进程退出时未终态的 pushing 行置
+   * conflict（push_interrupted，需用户核对云端后重推或放弃）。返回受影响行数。
+   */
+  markInterruptedSourceEditPushes(): number {
+    const result = this.getStatement(`
+      UPDATE source_edits
+      SET state = 'conflict',
+          last_error_code = 'push_interrupted',
+          last_error_message = '推送中断（服务停止时仍在执行）：请核对飞书云端内容后重推或放弃修改',
+          updated_at = ?
+      WHERE state = 'pushing'
+    `).run(new Date().toISOString());
+    return result.changes;
+  }
+
+  /** 删除编辑行（revert 放弃修改 / 回拉成功后由 SyncEngine 调用）。 */
+  clearSourceEdit(objToken: string): boolean {
+    const result = this.getStatement('DELETE FROM source_edits WHERE obj_token = ?').run(objToken);
+    return result.changes > 0;
+  }
+
+  listSourceEdits(): SourceEditRecord[] {
+    return (this.getStatement('SELECT * FROM source_edits ORDER BY updated_at DESC')
+      .all() as Array<Record<string, any>>).map((row) => this.mapSourceEditRow(row));
+  }
+
+  /** 会阻断同步与生命周期操作的行为（dirty/pushing/conflict）。 */
+  listPendingSourceEdits(): SourceEditRecord[] {
+    return (this.getStatement(`
+      SELECT * FROM source_edits
+      WHERE state IN ('dirty', 'pushing', 'conflict')
+      ORDER BY updated_at DESC
+    `).all() as Array<Record<string, any>>).map((row) => this.mapSourceEditRow(row));
   }
 
 
@@ -2541,6 +2880,11 @@ export class LocalMapStore {
         docs_written INTEGER NOT NULL DEFAULT 0,
         docs_deleted INTEGER NOT NULL DEFAULT 0,
         no_changes INTEGER NOT NULL DEFAULT 0,
+        -- S4（设计 §4.6）：并行构建列；旧库由 applyAdditiveMigrations 补齐
+        parallelism INTEGER NOT NULL DEFAULT 1,
+        unit_total INTEGER NOT NULL DEFAULT 0,
+        vision_model TEXT,
+        warnings_json TEXT,
         error_code TEXT,
         error_message TEXT,
         created_at TEXT NOT NULL,
@@ -2566,6 +2910,64 @@ export class LocalMapStore {
         deleted_at TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_agent_sessions_updated ON agent_sessions(updated_at);
+
+      -- =====================================================================
+      -- 源库受控编辑（S11，设计 §7.4）。新表：CREATE TABLE IF NOT EXISTS 对
+      -- 旧库同样新建，无需 documents 列迁移；写回链字段（push_mode/
+      -- push_revision_id/last_error_*）由 S12 写入。
+      -- =====================================================================
+      CREATE TABLE IF NOT EXISTS source_edits (
+        obj_token TEXT PRIMARY KEY,
+        local_rel_path TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('dirty', 'pushing', 'pushed', 'conflict')),
+        base_obj_edit_time TEXT,
+        base_body_hash TEXT NOT NULL,
+        current_body_hash TEXT NOT NULL,
+        edit_count INTEGER NOT NULL DEFAULT 0,
+        last_actor TEXT NOT NULL,
+        push_mode TEXT,
+        push_revision_id TEXT,
+        last_error_code TEXT,
+        last_error_message TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        pushed_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_source_edits_state ON source_edits(state);
+
+      -- =====================================================================
+      -- 任务编排（S6，设计 kb-agent-upgrade §5.4）。状态机权威在 server
+      -- （TaskService）；消息历史真相在子任务 pi 会话 JSONL
+      -- （<dataRoot>/agent/sessions/tasks/）；pi_session_file /
+      -- resume_answers_json 为 S6 additive 列（服务重启后 resume 自包含）。
+      -- =====================================================================
+      CREATE TABLE IF NOT EXISTS agent_tasks (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        title TEXT NOT NULL,
+        task_text TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('queued','running','done','blocked','failed','cancelled','interrupted')),
+        parent_mode TEXT NOT NULL,
+        workspace_id TEXT,
+        output_dir TEXT,
+        tools_json TEXT NOT NULL,
+        plugin_revision TEXT,
+        model TEXT,
+        rounds INTEGER NOT NULL DEFAULT 0,
+        result_text TEXT,
+        result_truncated INTEGER NOT NULL DEFAULT 0,
+        questions_text TEXT,
+        error_code TEXT,
+        error_message TEXT,
+        pi_session_file TEXT,
+        resume_answers_json TEXT,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        finished_at TEXT,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_agent_tasks_session ON agent_tasks(session_id, created_at);
     `;
   }
 }

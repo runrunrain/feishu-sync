@@ -20,6 +20,27 @@
 import fs from 'node:fs';
 import csv from 'csv-parser';
 
+/**
+ * md 单元格转义（T0a D4）：`|` 转义 + 换行折叠为 <br>，保持 GFM 表格结构。
+ *
+ * Local copy of bitable-exporter.ts escapeMdCell：两个模块职责独立（bitable
+ * 走 base API 确定性渲染，本模块走 sheet CSV 五型重构），2 行纯函数抽
+ * 共享模块反而制造跨职责依赖（先例见 custom-doc-sync.ts colToLetter）；
+ * 两份实现行为必须保持一致，改这里时同步改 bitable-exporter.ts。
+ */
+function escapeMdCell(value: string): string {
+  return value.replace(/\|/g, '\\|').replace(/\r?\n/g, '<br>');
+}
+
+/**
+ * 列表行单元格换行折叠（T0a D4 附带）：A/B/E 型每行产出一个 `* ` 列表项，
+ * 单元格内换行会把列表项拆成多行、脱离列表结构；这些路径不进表格，
+ * 无需转义 `|`，只需把换行折叠为渲染端白名单支持的 <br>。
+ */
+function foldCellNewlines(value: string): string {
+  return value.replace(/\r?\n/g, '<br>');
+}
+
 interface BlockType {
   type: 'metadata' | 'hierarchy' | 'datatable' | 'paragraph' | 'sparse';
   confidence: number;
@@ -221,7 +242,10 @@ export class LayoutReconstructor {
    * Reconstruct metadata block (folded into <details>)
    */
   private reconstructMetadata(block: string[][]): string {
-    const lines = block.map((row) => `* ${row[0]}：${row.slice(1).join('、')}`);
+    const lines = block.map(
+      (row) =>
+        `* ${foldCellNewlines(row[0])}：${row.slice(1).map(foldCellNewlines).join('、')}`,
+    );
     return `<details>\n<summary>元数据</summary>\n\n${lines.join('\n')}\n</details>\n`;
   }
 
@@ -233,7 +257,7 @@ export class LayoutReconstructor {
       const indent = row.findIndex((cell) => cell && cell.trim() !== '');
       const content = row[indent];
       const indentation = '  '.repeat(indent);
-      return `${indentation}* ${content}`;
+      return `${indentation}* ${foldCellNewlines(content)}`;
     });
     return lines.join('\n') + '\n';
   }
@@ -257,9 +281,12 @@ export class LayoutReconstructor {
       return row.slice(0, lastNonEmpty + 1);
     });
 
-    const header = '| ' + trimmedBlock[0].join(' | ') + ' |';
+    // 单元格经 escapeMdCell 转义（T0a D4）：含 `|`/换行的单元格不得拆散表格列。
+    const header = '| ' + trimmedBlock[0].map(escapeMdCell).join(' | ') + ' |';
     const separator = '| ' + trimmedBlock[0].map(() => '---').join(' | ') + ' |';
-    const rows = trimmedBlock.slice(1).map((row) => '| ' + row.join(' | ') + ' |');
+    const rows = trimmedBlock
+      .slice(1)
+      .map((row) => '| ' + row.map(escapeMdCell).join(' | ') + ' |');
     return [header, separator, ...rows].join('\n') + '\n';
   }
 
@@ -278,15 +305,16 @@ export class LayoutReconstructor {
     const lines = block.map((row) => {
       const firstNonEmpty = row.find((cell) => cell && cell.trim() !== '');
       if (!firstNonEmpty) return '';
+      const folded = foldCellNewlines(firstNonEmpty);
 
       // Split by '：' (Chinese colon) or ':'
-      const parts = firstNonEmpty.split(/：|:/);
+      const parts = folded.split(/：|:/);
       if (parts.length >= 2) {
         const key = parts[0].trim();
         const value = parts.slice(1).join(':').trim();
         return `* **${key}**：${value}`;
       }
-      return `* ${firstNonEmpty}`;
+      return `* ${folded}`;
     });
     return lines.filter((line) => line).join('\n') + '\n';
   }

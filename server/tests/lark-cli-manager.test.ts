@@ -591,6 +591,8 @@ describe('device auth flow', () => {
       verificationUrl: 'https://open.feishu.cn/device-verify?dc=dc-123',
       expiresIn: 600,
       requestedScopes: ['wiki:node:retrieve', 'offline_access'],
+      // S12：device flow 会话携带本次请求的 scope 面（缺省 read）。
+      scopeSet: 'read',
     });
     expect(execFileMock).toHaveBeenCalledWith(
       expect.any(String),
@@ -877,7 +879,7 @@ describe('feishu lark-cli routes', () => {
     });
     const app = buildApp({ startDeviceAuth });
     const response = await app.request('/api/feishu/auth/device/start', { method: 'POST', body: '{}' });
-    expect(startDeviceAuth).toHaveBeenCalledWith('reauthorize');
+    expect(startDeviceAuth).toHaveBeenCalledWith('reauthorize', { scopeSet: 'read' });
     expect(response.status).toBe(502);
     expect(await response.json()).toEqual({
       error: 'device_auth_start_failed', message: '发起飞书认证超时，请检查网络后重试认证',
@@ -889,7 +891,7 @@ describe('feishu lark-cli routes', () => {
     const app = buildApp({ startDeviceAuth });
     const post = (body: string) => app.request('/api/feishu/auth/device/start', { method: 'POST', body });
     expect((await post('{"mode":"switch_account"}')).status).toBe(200);
-    expect(startDeviceAuth).toHaveBeenCalledWith('switch_account');
+    expect(startDeviceAuth).toHaveBeenCalledWith('switch_account', { scopeSet: 'read' });
     for (const body of ['null', '[1]', '{', '{"mode":"unknown"}']) {
       expect((await post(body)).status).toBe(400);
     }
@@ -1060,6 +1062,26 @@ describe('config init flow', () => {
     // 结束第一条流程（提前退出），避免悬挂轮询。
     child.emit('close', 1);
     await expect(first).rejects.toMatchObject({ code: 'config_init_failed' });
+  });
+
+  it('extracts the page/cli URL emitted after a UTF-8 QR block matrix (lark-cli 1.0.97 form)', async () => {
+    const manager = makeManagerWithLarkCli();
+    const child = new FakeChild();
+    setSpawnFactory(() => child as unknown as Record<string, unknown>);
+
+    const start = manager.startConfigInit();
+    // 1.0.97 实测：先绘制二维码点阵（块字符+空白的连续行），URL 随后输出。
+    child.stdout.emit('data', Buffer.from('▆▆█▄▀▆▆\n█ ▄▄ █▀▄█\n▆▆█▄▀▆▆\n'));
+    child.stdout.emit(
+      'data',
+      Buffer.from('  https://open.feishu.cn/page/cli?user_code=KNMV-MRVJ&lpv=1.0.97&ocv=1.0.97&from=cli\n'),
+    );
+    const result = await start;
+    expect(result.verificationUrl).toBe(
+      'https://open.feishu.cn/page/cli?user_code=KNMV-MRVJ&lpv=1.0.97&ocv=1.0.97&from=cli',
+    );
+    child.emit('close', 0);
+    await manager.completeConfigInit();
   });
 
   it('completeConfigInit resolves ok on exit 0 and clears the pending state', async () => {

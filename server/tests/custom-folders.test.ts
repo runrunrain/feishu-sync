@@ -1726,3 +1726,69 @@ describe('custom-folder archive hardening — round 2 (concurrency & rollback)',
     expect(store.getDocumentByObjToken('objB')).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// T0a D3: 自定义归档 docx 的媒体引用本地化渲染（对齐主链路 sync-engine）
+// ---------------------------------------------------------------------------
+describe('custom-folder media rendering (T0a D3 producer fix)', () => {
+  let kbRoot: string;
+  let store: LocalMapStore;
+
+  beforeEach(() => {
+    kbRoot = makeTempDir('feishu-cf-media-');
+    ({ store } = newStore());
+  });
+
+  async function makeFolder(name: string): Promise<string> {
+    const a = buildApp({
+      store,
+      larkCli: makeFakeLarkCli({ nodes: {} }),
+      knowledgeBaseRoot: kbRoot,
+    });
+    const res = await a.fetch(new Request('http://x/api/custom-folders', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name }),
+    }));
+    return (await res.json()).folder.id;
+  }
+
+  it('renders localized file/whiteboard tags as markdown links in the archived body', async () => {
+    const folderId = await makeFolder('Archive');
+    const fileToken = 'attToken0123456789'; // >=16 chars, TOKEN_PATTERN shape
+    const wbToken = 'wbToken012345678901';
+    const larkCli = makeFakeLarkCli({
+      nodes: {
+        u: {
+          node_token: 'nM', obj_token: 'objM', obj_type: 'docx',
+          title: 'With Media', space_id: 's', obj_edit_time: 1, has_child: false,
+        },
+      },
+      docs: {
+        objM:
+          '# With Media\n\n' +
+          `<file token="${fileToken}" name="需求说明.pdf"/>\n\n` +
+          `<whiteboard token="${wbToken}">\n</whiteboard>\n`,
+      },
+    });
+    const app = buildApp({ store, larkCli, knowledgeBaseRoot: kbRoot });
+    const res = await app.fetch(new Request(`http://x/api/custom-folders/${folderId}/docs`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ links: ['u'] }),
+    }));
+    const body = await res.json();
+    expect(body.results[0].ok).toBe(true);
+
+    const md = fs.readFileSync(path.join(kbRoot, '_custom/Archive/With Media.md'), 'utf-8');
+    // 附件入口变成可点击的本地链接（T0a D3 主诉求）。
+    expect(md).toContain(`[01-${fileToken}.png](attachments/01-${fileToken}.png)`);
+    // 白板预览变成图片引用。
+    expect(md).toContain(`![飞书白板](images/01-${wbToken}.png)`);
+    // 正文不再残留原始媒体标签（含包裹式闭合标签，T0a D19 生成侧半边）。
+    expect(md).not.toContain('<file ');
+    expect(md).not.toContain('<whiteboard');
+    // 附件字节确实落进了知识库（不只是链接改写）。
+    expect(
+      fs.existsSync(path.join(kbRoot, '_custom/Archive/attachments', `01-${fileToken}.png`)),
+    ).toBe(true);
+  });
+});

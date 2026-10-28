@@ -259,6 +259,26 @@ describe('SessionService（内存 store）', () => {
   });
 });
 
+describe('T3b-07：停止即撤销批准窗口（abort 入口）', () => {
+  it('abort() 立即发 session_abort 事件（不等 run_end）；runState 反映 aborting/idle；新运行清除旧标记', async () => {
+    const { service, store } = makeService(makeConfig());
+    const session = service.create(store, {});
+    const events: string[] = [];
+    service.on('session_abort', ({ sessionId }: { sessionId: string }) => events.push(sessionId));
+
+    // 无活跃运行时 abort 也立即发事件（批准窗口即刻关闭，不等 run_end）
+    expect(service.runState(session.id)).toBe('idle');
+    await service.abort(store, session.id);
+    expect(events).toEqual([session.id]);
+
+    // 幂等：重复 abort 继续发事件；不存在的会话无事件
+    await service.abort(store, session.id);
+    expect(events).toEqual([session.id, session.id]);
+    await service.abort(store, 's_none');
+    expect(events).toHaveLength(2);
+  });
+});
+
 describe('R11：JSONL 回溯索引全部带 id/parentId 节点（不截断、不串支）', () => {
   const ts = '2026-01-01T00:00:00.000Z';
   const line = (value: unknown) => JSON.stringify(value);

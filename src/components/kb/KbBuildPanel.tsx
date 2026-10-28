@@ -1,28 +1,46 @@
 /**
- * KbBuildPanel —— 构建进度面板（KnowledgeView 底部抽屉）
+ * KbBuildPanel —— 构建进度面板（KnowledgeView 底部抽屉 / 侧栏）
  *
  * 数据源：GET /api/kb/builds/:id 轮询 + SSE 事件（§9.2）：
  *   build_status（阶段推进）、build_log（分级日志）、tool（工具调用行）、
  *   assistant_delta（模型说明文字，非文档正文）。
+ * S4/S5：构建中面板内追加 2.5s 轻量轮询拉取 progress DTO（units/workers/
+ * images 细粒度进度只在运行中变化，DB status 不变时无 build_status 事件；
+ * SSE build_worker/build_units 事件由 KnowledgeView 消费面接管，本面板
+ * 在自己的写面内用轮询保持实时，父层 SSE 刷新优先于轮询快照）。
  * 失败态：error.code 中文 + 校验 issues 列表 + 「当前发布版本未变化」
  * 明示（原子发布契约 §6.5：任何失败不移动 CURRENT 指针）。
  */
 
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   AlertCircle,
   AlertTriangle,
   Check,
   ChevronDown,
   CircleDot,
+  ImageIcon,
   Info,
+  Layers,
   Loader2,
   Square,
   Wrench,
 } from 'lucide-react';
 import { Button } from '../common/Button';
-import { KB_BUILD_ACTIVE_STEPS, KB_BUILD_STATUS_LABEL } from '../../utils/agentReadiness';
-import type { KbBuildDto, KbBuildIssue } from '../../types/agent';
+import { getKbBuild } from '../../api/client';
+import {
+  KB_BUILD_ACTIVE_STEPS,
+  KB_BUILD_STAGE_LABEL,
+  KB_BUILD_STATUS_LABEL,
+  KB_BUILD_WARNING_LABEL,
+  KB_BUILD_WORKER_STATE_LABEL,
+} from '../../utils/agentReadiness';
+import type {
+  KbBuildDto,
+  KbBuildIssue,
+  KbBuildWorkerProgress,
+  KbBuildWarning,
+} from '../../types/agent';
 
 export interface BuildLogLine {
   id: number;
@@ -52,6 +70,9 @@ const STEP_LABEL: Record<string, string> = {
 
 const TERMINAL_STATUSES = new Set(['published', 'failed', 'cancelled', 'interrupted']);
 
+/** S4/S5：非终态构建的 progress 轮询间隔（细粒度 stage/worker 变化不触发 DB status 事件）。 */
+const PROGRESS_POLL_INTERVAL_MS = 2_500;
+
 export function KbBuildPanel({
   open,
   build,
@@ -72,37 +93,68 @@ export function KbBuildPanel({
     }
   }, [logs.length]);
 
+  // 构建中轮询 progress：SSE build_status 只在 DB status 切换时携带完整 DTO，
+  // worker/单元/图片计数在 running 内持续推进，需主动拉取；失败静默保持上一帧。
+  const [polled, setPolled] = useState<KbBuildDto | null>(null);
+  useEffect(() => {
+    if (!open || !build || TERMINAL_STATUSES.has(build.status)) return;
+    let disposed = false;
+    const tick = () => {
+      void getKbBuild(build.id)
+        .then((dto) => { if (!disposed) setPolled(dto); })
+        .catch(() => undefined);
+    };
+    const timer = window.setInterval(tick, PROGRESS_POLL_INTERVAL_MS);
+    return () => { disposed = true; window.clearInterval(timer); };
+  }, [open, build]);
+
   if (!open || !build) return null;
 
-  const isTerminal = TERMINAL_STATUSES.has(build.status);
-  const stepIndex = KB_BUILD_ACTIVE_STEPS.indexOf(build.status as (typeof KB_BUILD_ACTIVE_STEPS)[number]);
-  const failed = build.status === 'failed';
-  const batchTotal = build.progress.batchTotal;
-  const batchIndex = build.progress.batchIndex;
+  // 父层（SSE build_status）到达新终态时以父层为准，避免轮询残帧覆盖发布结果。
+  const view = polled && polled.id === build.id && !TERMINAL_STATUSES.has(build.status) ? polled : build;
+  const isTerminal = TERMINAL_STATUSES.has(view.status);
+  const stepIndex = KB_BUILD_ACTIVE_STEPS.indexOf(view.status as (typeof KB_BUILD_ACTIVE_STEPS)[number]);
+  const failed = view.status === 'failed';
+  const progress = view.progress;
+  const batchTotal = progress.batchTotal;
+  const batchIndex = progress.batchIndex;
+  const units = progress.units;
+  const workers = progress.workers;
+  const images = progress.images;
+  const warnings = view.warnings;
+  const showParallelStrip = units.total > 0 || workers.length > 0 || images.total > 0;
 
   return (
     <section
       className={`${layout === 'sidebar' ? 'flex-1 min-h-0' : 'shrink-0 h-[240px] min-h-[180px] border-t border-line'} bg-card-bg flex flex-col animate-fade-in`}
       aria-label="标准库构建进度"
-      data-build-status={build.status}
+      data-build-status={view.status}
     >
       {/* 头部：状态 + 进度 + 操作 */}
       <header className="flex items-center flex-wrap gap-2 px-3 py-2 border-b border-line/60 shrink-0">
         <span
           className={`inline-flex items-center gap-1.5 text-sm font-kai font-medium ${
-            failed ? 'text-seal-2' : build.status === 'published' ? 'text-jade' : 'text-ink'
+            failed ? 'text-seal-2' : view.status === 'published' ? 'text-jade' : 'text-ink'
           }`}
         >
           {!isTerminal ? <Loader2 className="w-4 h-4 animate-spin text-seal" /> : null}
           {failed ? <AlertCircle className="w-4 h-4" /> : null}
-          {build.status === 'published' ? <Check className="w-4 h-4" /> : null}
-          {build.status === 'cancelled' || build.status === 'interrupted' ? (
+          {view.status === 'published' ? <Check className="w-4 h-4" /> : null}
+          {view.status === 'cancelled' || view.status === 'interrupted' ? (
             <Square className="w-3.5 h-3.5 text-ink-faint" />
           ) : null}
-          构建 · {KB_BUILD_STATUS_LABEL[build.status] ?? build.status}
+          构建 · {KB_BUILD_STATUS_LABEL[view.status] ?? view.status}
         </span>
-        <span className="min-w-0 flex-1 text-[10px] text-ink-faint font-mono truncate" title={build.id}>{build.id}</span>
+        <span className="min-w-0 flex-1 text-[10px] text-ink-faint font-mono truncate" title={view.id}>{view.id}</span>
 
+        {!isTerminal && progress.stage ? (
+          <span className="text-xs text-ink-soft" data-testid="kb-build-stage">
+            {KB_BUILD_STAGE_LABEL[progress.stage] ?? progress.stage}
+          </span>
+        ) : null}
+        {!isTerminal && view.parallelism > 1 ? (
+          <span className="text-xs text-ink-faint" title="实际生效并行度">并行 {view.parallelism}</span>
+        ) : null}
         {!isTerminal && batchTotal > 0 ? (
           <span className="text-xs text-ink-soft">
             批次 {Math.min(batchIndex + 1, batchTotal)}/{batchTotal}
@@ -121,8 +173,8 @@ export function KbBuildPanel({
 
         {isTerminal ? (
           <span className="text-[11px] text-ink-faint">
-            {build.counts.docsWritten > 0 ? `写入 ${build.counts.docsWritten} 篇` : ''}
-            {build.counts.docsDeleted > 0 ? ` · 删除 ${build.counts.docsDeleted} 篇` : ''}
+            {view.counts.docsWritten > 0 ? `写入 ${view.counts.docsWritten} 篇` : ''}
+            {view.counts.docsDeleted > 0 ? ` · 删除 ${view.counts.docsDeleted} 篇` : ''}
           </span>
         ) : null}
 
@@ -145,9 +197,9 @@ export function KbBuildPanel({
       {!failed ? (
         <div className={`flex items-center gap-1 px-4 py-1.5 shrink-0 ${layout === 'sidebar' ? 'flex-wrap gap-y-2' : 'overflow-x-auto scrollbar-thin'}`}>
           {KB_BUILD_ACTIVE_STEPS.map((step, i) => {
-            const active = step === build.status;
+            const active = step === view.status;
             const passed =
-              (build.status === 'published' || i < stepIndex) && build.status !== 'cancelled';
+              (view.status === 'published' || i < stepIndex) && view.status !== 'cancelled';
             return (
               <div key={step} className="flex items-center gap-1 shrink-0">
                 {i > 0 ? <span className={`w-4 h-px ${passed || active ? 'bg-jade/50' : 'bg-line'}`} /> : null}
@@ -166,12 +218,66 @@ export function KbBuildPanel({
               </div>
             );
           })}
-          {build.status === 'published' ? (
+          {view.status === 'published' ? (
             <span className="ml-1 inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] text-jade font-medium">
               <Check className="w-3 h-3" />
-              {build.noChanges ? '无变更，未新建发布' : '已发布'}
+              {view.noChanges ? '无变更，未新建发布' : '已发布'}
             </span>
           ) : null}
+        </div>
+      ) : null}
+
+      {/* S4/S5 并行进度：单元计数 + worker 列表 + 图片维度（有数据才渲染） */}
+      {showParallelStrip ? (
+        <div
+          className={`px-4 py-1.5 shrink-0 border-b border-line/60 space-y-1.5 ${layout === 'sidebar' ? '' : 'flex flex-wrap items-center gap-x-4 gap-y-1.5'}`}
+          data-testid="kb-build-parallel"
+        >
+          {units.total > 0 ? (
+            <div className="flex items-center gap-2 min-w-[180px]" data-testid="kb-build-units">
+              <Layers className="w-3.5 h-3.5 shrink-0 text-ink-faint" />
+              <span className="text-[11px] text-ink-soft shrink-0">
+                单元 {units.done}/{units.total}
+              </span>
+              <div className="flex-1 min-w-[60px] h-1.5 rounded-full bg-paper-2 overflow-hidden">
+                <div
+                  className="h-full bg-seal/70 transition-all duration-500"
+                  style={{ width: `${Math.round((units.done / units.total) * 100)}%` }}
+                />
+              </div>
+              {units.running > 0 ? <span className="text-[11px] text-ink-faint">进行 {units.running}</span> : null}
+              {units.retried > 0 ? <span className="text-[11px] text-seal">重试 {units.retried}</span> : null}
+              {units.failed > 0 ? <span className="text-[11px] text-seal-2">失败 {units.failed}</span> : null}
+            </div>
+          ) : null}
+          {workers.length > 0 ? (
+            <div className="flex flex-wrap gap-1.5" data-testid="kb-build-workers">
+              {workers.map((worker) => (
+                <WorkerChip key={worker.workerId} worker={worker} />
+              ))}
+            </div>
+          ) : null}
+          {images.total > 0 ? (
+            <p className="flex items-center gap-1.5 text-[11px] text-ink-soft" data-testid="kb-build-images">
+              <ImageIcon className="w-3.5 h-3.5 shrink-0 text-ink-faint" />
+              图片 已理解 {images.described + images.cached}/{images.total}（缓存 {images.cached}
+              {images.unavailable > 0 ? (
+                <span className="text-seal" title="图片理解未配置或部分失败，图片处已插入未理解标记">
+                  {' · '}{images.unavailable} 张未理解
+                </span>
+              ) : ''}
+              ）
+            </p>
+          ) : null}
+        </div>
+      ) : null}
+
+      {/* S4/S5 构建警告（发布成功也可能携带，如 images_unavailable） */}
+      {warnings.length > 0 ? (
+        <div className="px-4 py-1.5 shrink-0 border-b border-line/60 bg-[rgba(191,144,4,0.05)] space-y-1" data-testid="kb-build-warnings">
+          {warnings.map((warning, i) => (
+            <WarningRow key={`${warning.code}-${i}`} warning={warning} />
+          ))}
         </div>
       ) : null}
 
@@ -179,7 +285,7 @@ export function KbBuildPanel({
       {failed ? (
         <div className="px-4 py-2 shrink-0 border-b border-line/60 bg-[rgba(192,57,43,0.04)]">
           <p className="text-xs text-seal-2 leading-relaxed">
-            构建失败{build.error ? `（${build.error.code}）：${build.error.message}` : ''}。
+            构建失败{view.error ? `（${view.error.code}）：${view.error.message}` : ''}。
             <span className="text-ink-soft">当前已发布的标准库版本未受影响，仍可正常阅读。</span>
           </p>
           {issues.length > 0 ? (
@@ -245,6 +351,51 @@ function BuildLogRow({ line }: { line: BuildLogLine }) {
     <p className={`flex items-start gap-1.5 text-[11px] leading-snug ${color}`}>
       <Icon className="w-3 h-3 mt-0.5 shrink-0" />
       <span className="whitespace-pre-wrap break-all">{line.text}</span>
+    </p>
+  );
+}
+
+/** S4/S5：单个 worker 进度徽标（workerId · 单元 · 批次 · 状态）。 */
+function WorkerChip({ worker }: { worker: KbBuildWorkerProgress }) {
+  const stateLabel = KB_BUILD_WORKER_STATE_LABEL[worker.state] ?? worker.state;
+  const tone =
+    worker.state === 'running'
+      ? 'bg-[rgba(158,43,37,0.08)] text-seal'
+      : worker.state === 'finishing'
+        ? 'bg-jade/10 text-jade'
+        : 'bg-paper-2 text-ink-faint';
+  return (
+    <span
+      className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono ${tone}`}
+      data-worker-id={worker.workerId}
+      data-worker-state={worker.state}
+      title={`worker ${worker.workerId} · ${stateLabel}${worker.unitId ? ` · 单元 ${worker.unitId}` : ''}`}
+    >
+      {worker.state === 'running' ? <Loader2 className="w-2.5 h-2.5 animate-spin" /> : null}
+      {worker.workerId}
+      {worker.unitId ? <span>· {worker.unitId}</span> : null}
+      {worker.state === 'running' && worker.unitBatchTotal > 0 ? (
+        <span>
+          · 批 {Math.min(worker.unitBatchIndex + 1, worker.unitBatchTotal)}/{worker.unitBatchTotal}
+        </span>
+      ) : null}
+      <span className="font-sans">{stateLabel}</span>
+    </span>
+  );
+}
+
+/** S4/S5：构建警告行；images_unavailable 追加「去设置启用」引导。 */
+function WarningRow({ warning }: { warning: KbBuildWarning }) {
+  return (
+    <p className="flex items-start gap-1.5 text-[11px] text-seal leading-snug" data-warning-code={warning.code}>
+      <AlertTriangle className="w-3 h-3 mt-0.5 shrink-0" />
+      <span>
+        <span className="font-medium">{KB_BUILD_WARNING_LABEL[warning.code] ?? warning.code}：</span>
+        {warning.message}
+        {warning.code === 'images_unavailable' ? (
+          <span className="text-ink-soft">可在「设置 → Agent 运行时与模型 → 图片理解」启用并测试识图模型后消除。</span>
+        ) : null}
+      </span>
     </p>
   );
 }

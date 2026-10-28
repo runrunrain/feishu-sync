@@ -1,0 +1,687 @@
+/**
+ * 并行构建流水线集成测试（S4 §4.1-4.5 + S3 构建图片链）
+ *
+ * 用 processFactory 测试接缝注入假 pi 进程（FakeRpcProcess）：不真实调
+ * 模型，prompt 按提示词内容脚本化地经真实 AgentToolService 执行工具。
+ * 覆盖：
+ * - buildParallelism=1 全量构建端到端发布（等价回退）
+ * - 双 worker 并行：他单元预认领路径写入被拒（kb_path_owned_by_other_unit）
+ * - 单元失败（重试后仍败）→ kb_unit_failed，CURRENT 不动
+ * - 可重试错误自动重试 1 次成功 → 发布
+ * - 取消：全部假进程 abort/terminate，CURRENT 不动
+ * - vision 关闭：raw_read 内联 unavailable 标记 + images_unavailable 警告落库
+ * - mediaHash 兼容：旧 manifest 无 mediaHash → 增量不全量 changed
+ */
+
+import { describe, expect, it, beforeAll, afterAll } from 'vitest';
+import { EventEmitter } from 'node:events';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { KbBuildService } from '../src/kb/kb-build-service.js';
+import { computeChangeset } from '../src/kb/kb-build-service.js';
+import { AgentToolService, ToolError } from '../src/agent/agent-tool-service.js';
+import { AgentProcessPool } from '../src/agent/agent-process-pool.js';
+import { LocalMapStore } from '../src/modules/local-map-store.js';
+import { StandardKbStore } from '../src/kb/standard-kb-store.js';
+import { RawSourceSnapshot } from '../src/kb/raw-source-snapshot.js';
+import Database from 'better-sqlite3';
+import type { PiRpcProcess } from '../src/agent/pi-rpc-process.js';
+import type { PiRuntimeResolver } from '../src/agent/runtime-resolver.js';
+import type { Config } from '../src/types/index.js';
+import type { DocumentRecord } from '../src/types/index.js';
+import type { RawSourceSnapshotEntry } from '../src/types/agent-knowledge.js';
+import type { ImageDescription } from '../src/agent/vision/vision-describer.js';
+
+// ---------------------------------------------------------------------------
+// 假 pi 进程：prompt 按内容脚本化，工具经真实 toolService 执行
+// ---------------------------------------------------------------------------
+
+interface FakeScript {
+  /** 命中批次 prompt 时注入一次失败（model_timeout 等）后恢复 */
+  failBatchOnceWithCode?: string;
+  /** 所有批次 prompt 恒定失败（测试单元重试仍败） */
+  failBatchAlwaysWithCode?: string;
+  /** 挂起（不 resolve）直到 abort —— 取消测试 */
+  hangUntilAbort?: boolean;
+  /** 处理指定单元的批次时先尝试写他单元预认领路径；结果记录到 claimRejections */
+  foreignClaimAttempt?: { unitId: string; path: string };
+  claimRejections?: unknown[];
+  /** 批次前 raw_read 并记录内容（vision 内联断言用） */
+  rawReadCapture?: Map<string, string>;
+}
+
+class FakeRpcProcess extends EventEmitter {
+  prompts: string[] = [];
+  terminated = false;
+  abortCount = 0;
+  exited = false;
+  private pending: Array<(value: unknown) => void> = [];
+  private aborted = false;
+
+  constructor(
+    private readonly toolService: AgentToolService,
+    private readonly token: string,
+    private readonly script: FakeScript,
+  ) {
+    super();
+  }
+
+  isExited(): boolean {
+    return this.exited;
+  }
+
+  async start(): Promise<void> {}
+
+  async sendCommand(): Promise<{ success: boolean }> {
+    return { success: true };
+  }
+
+  async abort(): Promise<void> {
+    this.abortCount += 1;
+    this.aborted = true;
+    // 与真实进程一致：abort 后给一个短窗口让 run 结算为 aborted
+    const waiters = this.pending.splice(0);
+    for (const resolve of waiters) resolve({ outcome: 'aborted' });
+  }
+
+  async terminate(): Promise<void> {
+    this.terminated = true;
+    this.exited = true;
+    this.emit('exit');
+  }
+
+  async prompt(message: string): Promise<unknown> {
+    this.prompts.push(message);
+    return await new Promise((resolve) => {
+      void this.act(message).then(resolve, (error) => {
+        // 脚本内工具错误冒泡 = 运行失败（不让 promise 悬挂拖死流水线）
+        resolve({ outcome: 'failed', error: { code: 'fake_script_error', message: String(error) } });
+      });
+    });
+  }
+
+  private async act(message: string): Promise<unknown> {
+    if (this.script.hangUntilAbort) {
+      return await new Promise((resolve) => {
+        this.pending.push(resolve as (value: unknown) => void);
+      });
+    }
+    if ((message.includes('【单元') || message.includes('【批次')) && message.includes('请处理以下')) {
+      return await this.actBatchPrompt(message);
+    }
+    if (message.includes('没有新增或变更的源')) {
+      return { outcome: 'completed' };
+    }
+    if (message.includes('kb_unit_done')) {
+      const unitId = /单元 (u\d+)/.exec(message)?.[1] ?? '';
+      await this.call('kb_unit_done', { summary: `单元 ${unitId} 完成`, skipped: [] });
+      return { outcome: 'completed' };
+    }
+    if (message.includes('kb_finish') || message.includes('整体收尾')) {
+      await this.call('kb_finish', { summary: '整体完成', skipped: [] });
+      return { outcome: 'completed' };
+    }
+    return { outcome: 'completed' };
+  }
+
+  private async actBatchPrompt(message: string): Promise<unknown> {
+    const unitId = /【单元 (u\d+)/.exec(message)?.[1] ?? '';
+    if (this.script.failBatchAlwaysWithCode) {
+      return { outcome: 'failed', error: { code: this.script.failBatchAlwaysWithCode, message: '脚本注入失败' } };
+    }
+    if (this.script.failBatchOnceWithCode) {
+      const code = this.script.failBatchOnceWithCode;
+      this.script.failBatchOnceWithCode = undefined;
+      return { outcome: 'failed', error: { code, message: '脚本注入一次性失败' } };
+    }
+    // 从 prompt 表格解析本批 token（| token | title | relPath | type |）
+    const tokens = [...message.matchAll(/^\| (tok\S+) \|/gm)].map((match) => match[1]);
+    // 他单元认领路径写入尝试（kb_path_owned_by_other_unit 验证）
+    if (this.script.foreignClaimAttempt && unitId === this.script.foreignClaimAttempt.unitId) {
+      try {
+        await this.call('kb_write_doc', {
+          path: this.script.foreignClaimAttempt.path,
+          title: '越权文档',
+          markdown: '不应成功的写入',
+          sources: tokens.slice(0, 1),
+          summary: '越权尝试',
+        });
+      } catch (error) {
+        (this.script.claimRejections ??= []).push(error);
+      }
+      this.script.foreignClaimAttempt = undefined;
+    }
+    let docIndex = 1;
+    for (const token of tokens) {
+      if (this.script.rawReadCapture) {
+        try {
+          const result = await this.call('raw_read', { objToken: token });
+          const text = (result as { content?: Array<{ text?: string }> }).content?.[0]?.text ?? '';
+          this.script.rawReadCapture.set(token, text);
+        } catch {
+          /* 读取失败忽略 */
+        }
+      }
+      // 正文/标题/摘要不含 objToken/路径等来源标识（body_contains_source_metadata 拦截）
+      await this.call('kb_write_doc', {
+        path: `主题/${unitId || 'u'}-文档${docIndex}.md`,
+        title: `规则主题${docIndex}`,
+        markdown: '规则的完整说明：第一段定义，第二段流程与边界。',
+        sources: [token],
+        summary: '规则主题的概要说明',
+      });
+      docIndex += 1;
+    }
+    // 受影响已有文档（prompt 列出）重写：sources 声明本单元现存源
+    const affectedMatch = /受影响的已有标准文档[\s\S]*?(?=\n要求：|\n$)/.exec(message);
+    if (affectedMatch) {
+      const docPaths = [...affectedMatch[0].matchAll(/^- (\S+\.md)（/gm)].map((match) => match[1]);
+      for (const docPath of docPaths) {
+        if (tokens.length === 0) continue;
+        await this.call('kb_write_doc', {
+          path: docPath,
+          title: '受影响主题重写',
+          markdown: '重写后的完整正文，自然语言规则说明。',
+          sources: tokens,
+          summary: '重写概要',
+        }).catch((error) => (this.script.claimRejections ??= []).push(error));
+      }
+    }
+    // 本单元最后一批：直接上报单元完成（不触发纠正轮）
+    if (message.includes('本批是本单元最后一批')) {
+      await this.call('kb_unit_done', { summary: `单元 ${unitId} 完成`, skipped: [] });
+    }
+    return { outcome: 'completed' };
+  }
+
+  private async call(tool: string, args: Record<string, unknown>): Promise<unknown> {
+    return await this.toolService.executeTool(this.token, tool, args);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 夹具
+// ---------------------------------------------------------------------------
+
+let dataRoot: string;
+let kbRoot: string;
+let outputRoot: string;
+let store: LocalMapStore;
+const documents: DocumentRecord[] = [];
+
+function docRecord(token: string, rel: string): DocumentRecord {
+  return {
+    wikiNodeToken: null,
+    objType: 'docx',
+    objToken: token,
+    title: token,
+    localRelPath: rel,
+    localMdPath: path.join(kbRoot, rel),
+    lastSyncedModifyTime: '',
+    lastSyncedAt: new Date().toISOString(),
+    status: 'synced',
+  } as DocumentRecord;
+}
+
+const FAT = '规则的详细说明段落，包含定义、流程、边界与示例，用于把原始源体积撑到足以覆盖产出文档的校验阈值。'.repeat(8);
+
+function writeRaw(rel: string, content: string): void {
+  const full = path.join(kbRoot, rel);
+  fs.mkdirSync(path.dirname(full), { recursive: true });
+  fs.writeFileSync(full, content);
+}
+
+function makeConfig(overrides: { buildParallelism?: number } = {}): Config {
+  return {
+    llm: { openAiCompatBaseUrl: '', apiKey: '', model: '', temperature: 0.2, primaryChannel: 'direct', fallbackOnFailure: false },
+    agent: {
+      runtime: {},
+      model: { source: 'pi-agent-dir', piModel: 'fake/model', thinkingLevel: 'off', contextWindow: 128000, maxTokens: 8192 },
+      vision: { enabled: false, concurrency: 1, maxImageBytes: 5 * 1024 * 1024, maxImagesPerBuild: 10, timeoutMs: 10000 },
+      maxConcurrentProcesses: 3,
+      idleTimeoutMinutes: 10,
+      workspaces: [],
+    },
+    standardKb: {
+      outputRoot, retainReleases: 3, buildBatchSize: 10,
+      promptTimeoutMinutes: 15, buildTimeoutMinutes: 180,
+      buildParallelism: overrides.buildParallelism ?? 1, autoBuildAfterSync: false,
+    },
+    pollIntervalMinutes: 30,
+    knowledgeBaseRoot: kbRoot,
+    watchedRoots: [],
+    watchedRootUrls: [],
+    requiredScopes: [],
+  } as unknown as Config;
+}
+
+function stubResolver(): PiRuntimeResolver {
+  return {
+    resolveRuntime: async () => ({ nodePath: '/bin/true', piCliPath: '/bin/true', piPackageRoot: '' }),
+    checkReadiness: async () => ({ code: 'ready', message: '', model: { model: 'fake/model', available: [] } }),
+  } as unknown as PiRuntimeResolver;
+}
+
+interface Harness {
+  service: KbBuildService;
+  toolService: AgentToolService;
+  pool: AgentProcessPool;
+  fakes: FakeRpcProcess[];
+  script: FakeScript;
+  visionDescriber?: {
+    status: () => Promise<{ state: 'disabled' | 'ready' | 'invalid'; model: string | null; message: string }>;
+    lookup: (hash: string) => Promise<string | null>;
+    describeOne: () => Promise<ImageDescription>;
+    describeMany: (items: Array<{ file: string; src: string }>, opts: { signal: AbortSignal; onProgress: (p: { done: number; total: number }) => void }) => Promise<Map<string, ImageDescription>>;
+  };
+}
+
+function makeHarness(config: Config, script: FakeScript = { claimRejections: [] }, vision?: Harness['visionDescriber']): Harness {
+  const pool = new AgentProcessPool({ maxConcurrentProcesses: 3, idleTimeoutMinutes: 10 });
+  const toolService = new AgentToolService({ dataRoot, documentsProvider: () => documents });
+  const fakes: FakeRpcProcess[] = [];
+  const harness: Harness = { service: null as never, toolService, pool, fakes, script, visionDescriber: vision };
+  const service = new KbBuildService({
+    dataRoot,
+    pool,
+    toolService,
+    resolver: stubResolver(),
+    configProvider: () => config,
+    documentsProvider: () => documents,
+    sheetCsvPaths: () => [],
+    internalBaseUrl: () => 'http://127.0.0.1:39999',
+    extensionPath: () => null,
+    promptAssets: () => null,
+    ...(vision ? { visionDescriber: vision } : {}),
+    processFactory: (options) => {
+      const token = String(options.env.FEISHU_SYNC_AGENT_RUN_TOKEN ?? '');
+      const fake = new FakeRpcProcess(toolService, token, script);
+      fakes.push(fake);
+      return fake as unknown as PiRpcProcess;
+    },
+  });
+  harness.service = service;
+  return harness;
+}
+
+async function waitForTerminal(buildId: string, timeoutMs = 8000): Promise<Record<string, unknown>> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const row = store.getKbBuild(buildId);
+    if (row && !['queued', 'preflight', 'running', 'validating', 'publishing'].includes(String(row.status))) return row;
+    if (Date.now() > deadline) throw new Error(`构建未在 ${timeoutMs}ms 内进入终态: ${row ? row.status : 'missing'}`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+async function createAndRun(harness: Harness, mode: 'full' | 'incremental'): Promise<Record<string, unknown>> {
+  const dto = await harness.service.createBuild(store as never, { mode, confirm: 'BUILD' });
+  return await waitForTerminal(dto.id);
+}
+
+/** 直接发布一个基线 release（增量构建的地基）。 */
+async function publishBase(harness: Harness, docs: Array<{ path: string; docId: string; sources: string[]; body?: string }>, entries: RawSourceSnapshotEntry[]): Promise<string> {
+  const stagingRoot = path.join(outputRoot, '.staging', 'b_base');
+  fs.rmSync(stagingRoot, { recursive: true, force: true });
+  fs.mkdirSync(path.join(stagingRoot, 'docs'), { recursive: true });
+  for (const doc of docs) {
+    const full = path.join(stagingRoot, 'docs', doc.path);
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    fs.writeFileSync(full, `<!--\nfeishu_sync_kb:\n  doc_id: ${doc.docId}\n  sources:\n${doc.sources.map((s) => `    - ${s}`).join('\n')}\n  build_id: b_base\n-->\n# ${doc.path}\n${doc.body ?? '基线正文'}\n`);
+  }
+  const releaseId = `r_base_${crypto.randomBytes(3).toString('hex')}`;
+  const manifest = await harness.service.publishRelease({
+    buildId: 'b_base', releaseId, mode: 'full', baseReleaseId: null, model: null,
+    snapshot: RawSourceSnapshot.fromEntries(entries, { knowledgeBaseRoot: kbRoot }),
+    stagingRoot, outputRoot, docMeta: new Map(docs.map((doc) => [doc.path, { title: doc.path, summary: '基线', tags: [], sources: doc.sources }])),
+    retainReleasesOverride: 5,
+  });
+  return manifest.releaseId;
+}
+
+beforeAll(() => {
+  dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kbpar-data-'));
+  kbRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kbpar-kb-'));
+  outputRoot = path.join(dataRoot, 'standard-kb');
+  fs.mkdirSync(path.join(dataRoot, 'agent'), { recursive: true });
+  store = new LocalMapStore(path.join(dataRoot, 'feishu-sync.db'));
+  store.initialize();
+});
+
+afterAll(() => {
+  fs.rmSync(dataRoot, { recursive: true, force: true });
+  fs.rmSync(kbRoot, { recursive: true, force: true });
+});
+
+const TINY_PNG = Buffer.concat([
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  Buffer.from('png-fixture'),
+]);
+
+// ---------------------------------------------------------------------------
+// 用例
+// ---------------------------------------------------------------------------
+
+describe('S4：buildParallelism=1 等价回退（全量端到端发布）', () => {
+  it('单 worker 全量构建：发布成功、CURRENT 切换、parallelism=1 落库', async () => {
+    writeRaw('战报/a.md', `a ${FAT}`);
+    writeRaw('战报/b.md', `b ${FAT}`);
+    documents.push(docRecord('tokA', '战报/a.md'), docRecord('tokB', '战报/b.md'));
+    const harness = makeHarness(makeConfig({ buildParallelism: 1 }));
+    const row = await createAndRun(harness, 'full');
+    expect(String(row.status)).toBe('published');
+    expect(Number(row.parallelism)).toBe(1);
+    const kbStore = new StandardKbStore(outputRoot);
+    const pointer = kbStore.readCurrent();
+    expect(pointer).toBeTruthy();
+    const manifest = kbStore.readManifest(pointer!.releaseId)!;
+    expect(manifest.docs.length).toBeGreaterThanOrEqual(2);
+    // 假模型对每个源写了主题文档；收尾轮复用 worker（未新拉进程）
+    const fake = harness.fakes[0];
+    expect(harness.fakes).toHaveLength(1);
+    expect(fake.prompts.some((p) => p.includes('kb_finish'))).toBe(true);
+  });
+
+  it('T3b-06：M=3 + 两后台占满 M-1 → 单 worker 构建排队而非立即抢槽；交互保留槽可用；释放后继续', async () => {
+    const harness = makeHarness(makeConfig({ buildParallelism: 1 }));
+    // 两个后台任务占满 M-1 配额（M=3），总槽尚余 1
+    const bg1 = await harness.pool.acquire('background');
+    const bg2 = await harness.pool.acquire('background');
+    expect(bg1 && bg2).toBeTruthy();
+
+    // 交互会话保留槽仍可用（未被单 worker 回退抢占）
+    const sessionSlot = harness.pool.reserveSlot('session');
+    expect(sessionSlot).not.toBeNull();
+    sessionSlot!.release();
+
+    const dto = await harness.service.createBuild(store as never, { mode: 'full', confirm: 'BUILD' });
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    // 排队而非立即抢最后一个总槽：未 spawn、队列深度 1、非终态
+    expect(harness.fakes).toHaveLength(0);
+    expect(harness.pool.queueDepth()).toBe(1);
+    const mid = store.getKbBuild(dto.id);
+    expect(['queued', 'preflight', 'running']).toContain(String(mid?.status));
+
+    // 释放一个后台槽 → 排队构建获得槽位并完成发布
+    bg1.release();
+    const row = await waitForTerminal(dto.id);
+    expect(String(row.status)).toBe('published');
+    expect(harness.fakes.length).toBeGreaterThanOrEqual(1);
+    bg2.release();
+  });
+
+  it('T3b-06：排队中取消 → 出队失败（cancelled），不 spawn，无残留', async () => {
+    const harness = makeHarness(makeConfig({ buildParallelism: 1 }));
+    const bg1 = await harness.pool.acquire('background');
+    const bg2 = await harness.pool.acquire('background');
+    const dto = await harness.service.createBuild(store as never, { mode: 'full', confirm: 'BUILD' });
+    // 等待进入排队（preflight 同步完成后 acquire 入队）
+    const deadline = Date.now() + 5000;
+    while (harness.pool.queueDepth() === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(harness.pool.queueDepth()).toBe(1);
+    expect(harness.fakes).toHaveLength(0);
+
+    await harness.service.cancelBuild(store as never, dto.id);
+    const row = await waitForTerminal(dto.id);
+    expect(String(row.status)).toBe('cancelled');
+    expect(harness.fakes).toHaveLength(0);
+    expect(harness.pool.queueDepth()).toBe(0);
+    bg1.release();
+    bg2.release();
+  });
+});
+
+describe('S4：双 worker 并行 + 路径认领', () => {
+  it('他单元预认领路径写入被拒（kb_path_owned_by_other_unit），构建仍发布', async () => {
+    // 基线：已有/共享.md ← tokA（增量时 tokA changed）
+    writeRaw('dir1/a.md', `a v1 ${FAT}`);
+    writeRaw('dir2/b.md', `b v1 ${FAT}`);
+    const recA = docRecord('tokA', 'dir1/a.md');
+    const recB = docRecord('tokB', 'dir2/b.md');
+    documents.length = 0;
+    documents.push(recA, recB);
+    let harness = makeHarness(makeConfig({ buildParallelism: 1 }));
+    const baseEntries = RawSourceSnapshot.scan(kbRoot, documents).entries;
+    await publishBase(harness, [
+      { path: '已有/共享.md', docId: 'kd_shared', sources: ['tokA'] },
+    ], baseEntries);
+    // 改 tokA → 增量 changed；tokB 相对基线 absent → 增量 added
+    writeRaw('dir1/a.md', `a v2 ${FAT}`);
+    writeRaw('dir2/b.md', `b v2 ${FAT}`);
+
+    const claimRejected: unknown[] = [];
+    const script: FakeScript = {
+      claimRejections: claimRejected,
+      foreignClaimAttempt: { unitId: 'u2', path: '已有/共享.md' },
+    };
+    harness = makeHarness(makeConfig({ buildParallelism: 2 }), script);
+    const dto = await harness.service.createBuild(store as never, { mode: 'incremental', confirm: 'BUILD' });
+    const row = await waitForTerminal(dto.id);
+    const claimError = claimRejected.find((error): error is ToolError => error instanceof ToolError && error.code === 'kb_path_owned_by_other_unit');
+    expect(claimError).toBeTruthy();
+    expect(claimError!.message).toContain('已有/共享.md');
+    expect(claimError!.message).toContain('u1');
+    expect(String(row.status)).toBe('published');
+    expect(Number(row.parallelism)).toBe(2);
+    // 两单元：u1(tokA+共享.md 预认领) 与 u2(tokB)
+    const kbStore = new StandardKbStore(outputRoot);
+    const manifest = kbStore.readManifest(kbStore.readCurrent()!.releaseId)!;
+    expect(manifest.docs.some((doc) => doc.path === '已有/共享.md' || doc.path === '主题/tokA.md')).toBe(true);
+    expect(manifest.docs.some((doc) => doc.sources.includes('tokB'))).toBe(true);
+  });
+});
+
+describe('S4：单元失败 → CURRENT 不动 / 重试成功', () => {
+  it('重试后仍败 → kb_unit_failed，CURRENT 不动', async () => {
+    const before = new StandardKbStore(outputRoot).readCurrent()?.releaseId;
+    writeRaw('失败域/x.md', `x ${FAT}`);
+    writeRaw('失败域二/y.md', `y ${FAT}`);
+    documents.length = 0;
+    documents.push(docRecord('tokFail', '失败域/x.md'), docRecord('tokFail2', '失败域二/y.md'));
+    const harness = makeHarness(makeConfig({ buildParallelism: 2 }), { failBatchAlwaysWithCode: 'model_timeout', claimRejections: [] });
+    const row = await createAndRun(harness, 'full');
+    expect(String(row.status)).toBe('failed');
+    expect(String(row.error_code)).toBe('kb_unit_failed');
+    expect(String(row.error_message)).toContain('model_timeout');
+    // 每个单元重试一次：至少 4 次进程拉起（2 单元 × 初次+重试）
+    expect(harness.fakes.length).toBeGreaterThanOrEqual(4);
+    expect(new StandardKbStore(outputRoot).readCurrent()?.releaseId).toBe(before);
+  });
+
+  it('model_timeout 一次性失败 → 自动重试 1 次后发布', async () => {
+    writeRaw('重试域/y.md', `y ${FAT}`);
+    writeRaw('重试域二/z.md', `z ${FAT}`);
+    documents.length = 0;
+    documents.push(docRecord('tokRetry', '重试域/y.md'), docRecord('tokRetry2', '重试域二/z.md'));
+    const harness = makeHarness(makeConfig({ buildParallelism: 2 }), { failBatchOnceWithCode: 'model_timeout', claimRejections: [] });
+    const row = await createAndRun(harness, 'full');
+    expect(String(row.status)).toBe('published');
+    expect(harness.fakes.length).toBeGreaterThanOrEqual(3); // 2 worker + 至少 1 次重试新进程
+  });
+});
+
+describe('S4：取消终止全部进程', () => {
+  it('hang prompt → cancelBuild → 全部假进程 abort、终态 cancelled、CURRENT 不动', async () => {
+    const before = new StandardKbStore(outputRoot).readCurrent()?.releaseId;
+    writeRaw('取消域/z.md', `z ${FAT}`);
+    writeRaw('取消域/w.md', `w ${FAT}`);
+    documents.length = 0;
+    documents.push(docRecord('tokC1', '取消域/z.md'), docRecord('tokC2', '取消域/w.md'));
+    const harness = makeHarness(makeConfig({ buildParallelism: 2 }), { hangUntilAbort: true });
+    const dto = await harness.service.createBuild(store as never, { mode: 'full', confirm: 'BUILD' });
+    // 等待至少一个 fake 进入 prompt 挂起
+    const deadline = Date.now() + 5000;
+    while (harness.fakes.length === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
+    expect(harness.fakes.length).toBeGreaterThan(0);
+    await harness.service.cancelBuild(store as never, dto.id);
+    const row = await waitForTerminal(dto.id);
+    expect(String(row.status)).toBe('cancelled');
+    expect(new StandardKbStore(outputRoot).readCurrent()?.releaseId).toBe(before);
+    // 全部进程都被 abort（或已 terminate）
+    for (const fake of harness.fakes) {
+      expect(fake.abortCount + (fake.terminated ? 1 : 0)).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('S3：vision 关闭 → unavailable 内联 + images_unavailable 警告', () => {
+  it('raw_read 图片处插入 vision_unconfigured 标记；警告落库', async () => {
+    writeRaw('图域/img-doc.md', `# 带图\n![](images/i1.png)\n正文 ${FAT}`);
+    writeRaw('图域/images/i1.png', TINY_PNG);
+    documents.length = 0;
+    documents.push(docRecord('tokImg', '图域/img-doc.md'));
+    const rawReadCapture = new Map<string, string>();
+    const harness = makeHarness(makeConfig({ buildParallelism: 1 }), { rawReadCapture });
+    const row = await createAndRun(harness, 'full');
+    expect(String(row.status)).toBe('published');
+    const captured = rawReadCapture.get('tokImg') ?? '';
+    expect(captured).toContain('<image_description');
+    expect(captured).toContain('reason="vision_unconfigured"');
+    // 警告与图片计数落库
+    const warnings = JSON.parse(String(row.warnings_json ?? '[]')) as Array<{ code: string; count: number }>;
+    expect(warnings.some((warning) => warning.code === 'images_unavailable' && warning.count >= 1)).toBe(true);
+    expect(String(row.vision_model ?? '')).toBe('');
+    // 发布的 manifest 快照条目带 mediaHash/imageCount（U4：contentHash 公式不变）
+    const kbStore = new StandardKbStore(outputRoot);
+    const manifest = kbStore.readManifest(kbStore.readCurrent()!.releaseId)!;
+    const entry = manifest.sourceSnapshot.find((item) => item.objToken === 'tokImg')!;
+    expect(entry.imageCount).toBe(1);
+    expect(entry.mediaHash).toMatch(/^sha256:/);
+  });
+});
+
+describe('S4：kb_builds 新列 additive 迁移（旧库升级）', () => {
+  it('旧 schema（无新列）→ initialize 后补列且默认值可用', () => {
+    const legacyDb = path.join(dataRoot, `legacy-kb-builds-${Date.now()}.db`);
+    const raw = new Database(legacyDb);
+    raw.exec(`
+      CREATE TABLE kb_builds (
+        id TEXT PRIMARY KEY,
+        mode TEXT NOT NULL,
+        status TEXT NOT NULL,
+        base_release_id TEXT,
+        release_id TEXT,
+        model TEXT,
+        source_total INTEGER NOT NULL DEFAULT 0,
+        source_added INTEGER NOT NULL DEFAULT 0,
+        source_changed INTEGER NOT NULL DEFAULT 0,
+        source_removed INTEGER NOT NULL DEFAULT 0,
+        docs_written INTEGER NOT NULL DEFAULT 0,
+        docs_deleted INTEGER NOT NULL DEFAULT 0,
+        no_changes INTEGER NOT NULL DEFAULT 0,
+        error_code TEXT,
+        error_message TEXT,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        finished_at TEXT
+      );
+    `);
+    raw.prepare("INSERT INTO kb_builds (id, mode, status, created_at) VALUES ('b_old', 'full', 'failed', '2026-01-01')").run();
+    raw.close();
+    const legacyStore = new LocalMapStore(legacyDb);
+    legacyStore.initialize();
+    const row = legacyStore.getKbBuild('b_old')!;
+    expect(Number(row.parallelism)).toBe(1);
+    expect(Number(row.unit_total)).toBe(0);
+    expect(row.vision_model ?? null).toBeNull();
+    expect(row.warnings_json ?? null).toBeNull();
+    legacyStore.updateKbBuild('b_old', { parallelism: 3, unitTotal: 7, warningsJson: '[{"code":"images_unavailable","count":2,"message":"x"}]' });
+    const updated = legacyStore.getKbBuild('b_old')!;
+    expect(Number(updated.parallelism)).toBe(3);
+    expect(Number(updated.unit_total)).toBe(7);
+    expect(String(updated.warnings_json)).toContain('images_unavailable');
+  });
+});
+
+describe('S3：会话侧 raw_read 内联 + raw_read_image（mock describer）', () => {
+  function mockDescriber(state: 'ready' | 'disabled') {
+    return {
+      status: async () => ({ state, model: state === 'ready' ? 'vision/m' : null, message: '' }),
+      lookup: async () => (state === 'ready' ? '缓存中的图片描述文本' : null),
+      describeOne: async (_file: string, src: string) => ({
+        src, imageHash: 'hash-x', state: 'described' as const, text: '按需描述的图片内容',
+      }),
+      describeMany: async () => new Map(),
+    };
+  }
+
+  it('ready：raw_read 内联已缓存描述；raw_read_image 返回描述；非本源 src 拒绝；build 不下发', async () => {
+    writeRaw('会话域/会话.md', '# 会话源\n![](images/s1.png)\n正文');
+    writeRaw('会话域/images/s1.png', TINY_PNG);
+    documents.length = 0;
+    documents.push(docRecord('tokSession', '会话域/会话.md'));
+    const toolService = new AgentToolService({
+      dataRoot, documentsProvider: () => documents, visionDescriber: mockDescriber('ready'),
+    });
+    const { token } = toolService.createRunContext({
+      runKind: 'discuss', outputRoot, knowledgeBaseRoot: kbRoot,
+    });
+    const read = await toolService.executeTool(token, 'raw_read', { objToken: 'tokSession' });
+    const text = read.content[0]!.text;
+    expect(text).toContain('<image_description src="images/s1.png" state="cached">');
+    expect(text).toContain('缓存中的图片描述文本');
+    const image = await toolService.executeTool(token, 'raw_read_image', { objToken: 'tokSession', src: 'images/s1.png' });
+    expect(image.content[0]!.text).toContain('按需描述的图片内容');
+    await expect(toolService.executeTool(token, 'raw_read_image', { objToken: 'tokSession', src: 'images/不存在.png' }))
+      .rejects.toMatchObject({ code: 'invalid_request' });
+    // build 白名单不含 raw_read_image（预描述在 preflight 完成）
+    const buildCtx = toolService.createRunContext({
+      runKind: 'build', buildId: 'b_x', outputRoot, knowledgeBaseRoot: kbRoot,
+    });
+    await expect(toolService.executeTool(buildCtx.token, 'raw_read_image', { objToken: 'tokSession', src: 'images/s1.png' }))
+      .rejects.toMatchObject({ code: 'tool_not_allowed' });
+  });
+
+  it('disabled：raw_read 不内联；raw_read_image 报 vision_unconfigured', async () => {
+    const toolService = new AgentToolService({
+      dataRoot, documentsProvider: () => documents, visionDescriber: mockDescriber('disabled'),
+    });
+    const { token } = toolService.createRunContext({
+      runKind: 'discuss', outputRoot, knowledgeBaseRoot: kbRoot,
+    });
+    const read = await toolService.executeTool(token, 'raw_read', { objToken: 'tokSession' });
+    expect(read.content[0]!.text).not.toContain('<image_description');
+    await expect(toolService.executeTool(token, 'raw_read_image', { objToken: 'tokSession', src: 'images/s1.png' }))
+      .rejects.toMatchObject({ code: 'vision_unconfigured' });
+  });
+});
+
+describe('S3：mediaHash 兼容（U4）', () => {
+  it('旧 manifest 无 mediaHash → 增量不触发全量 changed；图片替换且双方都有 → changed（vision 启用）', () => {
+    const base = [{ objToken: 't', objType: 'docx', title: 't', relPath: 't.md', contentHash: 'h1', objEditTime: null }];
+    const upgraded = [{ ...base[0], mediaHash: 'sha256:new', imageCount: 1 }];
+    // 旧 manifest（无 mediaHash）vs 升级后条目：即使 vision 启用也不算 changed
+    expect(computeChangeset(upgraded as never, { sourceSnapshot: base } as never, { visionEnabled: true }).changed).toEqual([]);
+    expect(computeChangeset(upgraded as never, { sourceSnapshot: base } as never, { visionEnabled: true }).isEmpty()).toBe(true);
+    // 双方都有 mediaHash 且不等 → changed（仅 vision 启用）
+    const baseWithMedia = [{ ...base[0], mediaHash: 'sha256:old', imageCount: 1 }];
+    expect(computeChangeset(upgraded as never, { sourceSnapshot: baseWithMedia } as never, { visionEnabled: true }).changed).toEqual(['t']);
+    expect(computeChangeset(upgraded as never, { sourceSnapshot: baseWithMedia } as never, { visionEnabled: false }).changed).toEqual([]);
+  });
+});
+
+describe('S4：DTO 契约', () => {
+  it('toDto 输出并行进度结构（units/workers/images/stage/parallelism/warnings）', async () => {
+    writeRaw('契约域/c.md', `c ${FAT}`);
+    documents.length = 0;
+    documents.push(docRecord('tokDto', '契约域/c.md'));
+    const harness = makeHarness(makeConfig({ buildParallelism: 1 }));
+    const dto = await harness.service.createBuild(store as never, { mode: 'full', confirm: 'BUILD' });
+    expect(dto.parallelism).toBe(1);
+    expect(dto.progress).toMatchObject({
+      units: { total: expect.any(Number) },
+      workers: expect.any(Array),
+      images: { total: expect.any(Number) },
+    });
+    expect(dto.progress.stage).toBeDefined();
+    await waitForTerminal(dto.id);
+    const rows = store.listKbBuilds(5);
+    const dtoAgain = harness.service.toDto(rows[0]);
+    expect(Array.isArray(dtoAgain.warnings)).toBe(true);
+    expect(typeof dtoAgain.parallelism).toBe('number');
+  });
+});

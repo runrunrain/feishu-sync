@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import { resolveInside, atomicWriteFile, PathGuardError } from './path-guard.js';
 import { ToolError } from './agent-tool-service.js';
 import { readAgentPromptAssets, piContextExtensionPath } from './agent-assets.js';
+import { LEADER_ORCHESTRATION_PROMPT } from './tasks/task-tools.js';
 import type { AgentContextPlugin, AgentPluginsDto, AgentPluginInput, AgentPluginScope } from '../types/agent-plugin.js';
 
 type Registry = { schemaVersion: 1; overrides: Record<string, AgentPluginInput>; custom: AgentContextPlugin[] };
@@ -27,6 +28,14 @@ export class AppPluginStore {
         '你是本地知识工作助手。先检索知识库与相关工作文件，再完成用户要求的修改。原始知识库和标准知识库只读，写入仅限当前授权Workspace。以工具实际结果确认完成，不虚构文件变化。当前应用不提供shell工具。'),
       plugin('kb-build-rules', '标准库构建规则', '源读取、主题组织与构建流程', ['build'], assets.buildRules),
       plugin('kb-style', '标准库文风', '自然完整的知识表述、排版与来源纪律', ['build'], assets.styleGuide),
+      // S6 任务编排（设计 §5.1）：默认停用；启用后向 Discuss/Work 会话注入
+      // Leader 编排提示，并放行 task_* 工具下发（SessionService 按本条 enabled 判定）。
+      {
+        id: 'orchestration', name: '任务编排', kind: 'context', builtin: true, enabled: false,
+        description: 'Leader 任务编排说明（子任务派发、状态与结果协议）',
+        scopes: ['discuss', 'work'],
+        content: LEADER_ORCHESTRATION_PROMPT,
+      },
     ];
   }
 
@@ -43,7 +52,7 @@ export class AppPluginStore {
       if (raw.schemaVersion !== 1 || !raw.overrides || typeof raw.overrides !== 'object' || Array.isArray(raw.overrides)
         || !Array.isArray(raw.custom) || raw.custom.length > 30) throw new Error('schema');
       for (const [id, input] of Object.entries(raw.overrides)) {
-        if (!['discuss-context', 'work-context', 'kb-build-rules', 'kb-style'].includes(id)) throw new Error('id');
+        if (!['discuss-context', 'work-context', 'kb-build-rules', 'kb-style', 'orchestration'].includes(id)) throw new Error('id');
         this.validateInput(input, true);
       }
       const ids = new Set<string>();
@@ -117,6 +126,31 @@ export class AppPluginStore {
     const target = resolveInside(this.dataRoot, REGISTRY, 'write');
     atomicWriteFile(target, JSON.stringify(registry, null, 2)); fs.chmodSync(target, 0o600);
     return this.list();
+  }
+
+  /**
+   * S6：按 revision 复用不可变插件快照（子任务冻结父会话快照用）。
+   * 快照文件内容寻址（snapshot() 只在不存在时写入），直接按 revision
+   * 定位；文件缺失（数据目录被清理）返回 null，由调用方降级为不注入快照。
+   */
+  frozenSnapshot(scope: AgentPluginScope, revision: string): AppPluginSnapshot | null {
+    const extensionPath = piContextExtensionPath();
+    if (!extensionPath) return null;
+    let file: string;
+    try {
+      file = resolveInside(this.dataRoot, `agent/plugins/snapshots/${revision}.json`, 'read');
+    } catch {
+      return null;
+    }
+    if (!fs.existsSync(file) || fs.statSync(file).size > 512 * 1024) return null;
+    void scope; // 快照内容已含 scope，文件存在即内容自洽
+    const native = this.nativeResources?.();
+    return {
+      revision,
+      path: file,
+      extensionPath,
+      ...(native ? { extensionPaths: native.sources, externalPlugins: native.external, skillPaths: native.skills, promptPaths: native.prompts, themePaths: native.themes } : {}),
+    };
   }
 
   snapshot(scope: AgentPluginScope): AppPluginSnapshot {

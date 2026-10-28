@@ -27,6 +27,15 @@ export interface WatchedRootConfig {
 
 import type { AgentConfig, StandardKbConfig } from './agent-knowledge.js';
 
+/**
+ * CLI 命令行访问配置段（S8，additive）：缺省关闭；旧配置无此段时由
+ * ConfigManager 读取时补默认（内存态），不主动回写磁盘。
+ */
+export interface CliConfig {
+  /** 是否开启命令行访问（endpoint.json 发布 + /api/cli/* 命令域）。 */
+  enabled: boolean;
+}
+
 export interface Config {
   /**
    * v0.2.0 P3: channel-agnostic LLM config. The legacy flat
@@ -42,6 +51,10 @@ export interface Config {
   agent: AgentConfig;
   /** 标准库输出与构建参数（F1，additive）。 */
   standardKb: StandardKbConfig;
+  /** CLI 命令行访问（S8，additive，可选：旧配置内存补默认）。 */
+  cli?: CliConfig;
+  /** 飞书写回（S12，additive，可选：旧配置内存补默认 enabled=false）。 */
+  feishuWrite?: FeishuWriteConfig;
   pollIntervalMinutes: number;
   knowledgeBaseRoot: string;
   /** Authoritative P2 root configuration. */
@@ -94,6 +107,8 @@ export interface LlmModelPreset {
   contextWindow?: number;
   maxTokens?: number;
   reasoning?: boolean;
+  /** 仅 UI 提示用途（识图模型下拉标记），不影响任何运行时模型选择。 */
+  supportsImages?: boolean;
 }
 
 /**
@@ -483,7 +498,9 @@ export type SyncFailureReasonCode =
   | 'permission_denied'
   | 'cloud_deleted'
   | 'rate_limited'
-  | 'upstream_error';
+  | 'upstream_error'
+  /** S11（设计 §7.3/§8）：文档存在未写回的本地修改，同步被 blocker 跳过。 */
+  | 'local_edit_pending';
 
 /**
  * Explicitly distinguishes actions that can be automated from those that
@@ -853,4 +870,93 @@ export interface AdaptResult {
   tokensUsed: number;
   duration: number;
   model: string;
+}
+
+// ============================================================================
+// 源库受控编辑（S11，设计 §7.2–§7.4）
+// ============================================================================
+
+/** 编辑发起方：UI 面板 / CLI（S13）/ 内部 Agent（经 app_command，S10）。 */
+export type SourceEditActor = 'ui' | 'cli' | 'agent';
+
+/** source_edits.state：dirty=有未写回修改；pushing/pushed/conflict 属写回链（S12）。 */
+export type SourceEditState = 'dirty' | 'pushing' | 'pushed' | 'conflict';
+
+/**
+ * 受控编辑操作（设计 §7.2）：
+ *   - replace_body：整体替换正文（编辑器保存）；
+ *   - str_replace：局部替换，old 须唯一（除非 replaceAll）。
+ */
+export type SourceEditOp =
+  | { mode: 'replace_body'; body: string }
+  | { mode: 'str_replace'; old: string; new: string; replaceAll?: boolean };
+
+/** source_edits 表行的 camelCase 投影（LocalMapStore 访问器返回）。 */
+export interface SourceEditRecord {
+  objToken: string;
+  localRelPath: string;
+  state: SourceEditState;
+  baseObjEditTime: string | null;
+  baseBodyHash: string;
+  currentBodyHash: string;
+  editCount: number;
+  lastActor: SourceEditActor | string;
+  pushMode: string | null;
+  pushRevisionId: string | null;
+  lastErrorCode: string | null;
+  lastErrorMessage: string | null;
+  createdAt: string;
+  updatedAt: string;
+  pushedAt: string | null;
+}
+
+/** 编辑状态 DTO（GET /api/sources/:objToken/edit-status 与列表项）。 */
+export interface SourceEditStateDto {
+  objToken: string;
+  relPath: string;
+  title: string;
+  state: SourceEditState;
+  bodyHash: string;
+  baseBodyHash: string;
+  editCount: number;
+  lastActor: SourceEditActor | string;
+  error: null | { code: string; message: string };
+  updatedAt: string;
+}
+
+// ============================================================================
+// 飞书写回（S12，设计 §7.4–§7.6）
+// ============================================================================
+
+/** 写回配置段（默认关；只接受 desktop token 链路修改）。 */
+export interface FeishuWriteConfig {
+  enabled: boolean;
+}
+
+/** 推送计划 DTO（POST /api/sources/:objToken/push/preview）。 */
+export interface SourcePushPlanDto {
+  mode: 'append' | 'overwrite' | 'blocked';
+  blockedReason?:
+    | 'no_changes'
+    | 'overwrite_required'
+    | 'overwrite_unsupported'
+    | 'images_in_append'
+    | 'images_in_overwrite'
+    | 'write_disabled'
+    | 'write_scope_missing'
+    | 'cloud_time_unreadable';
+  appendMarkdown?: string;
+  bytes: number;
+  cloud: { objEditTime: string | null; revisionId: number | null };
+  /** 云端 obj_edit_time 已越过 base_obj_edit_time。 */
+  conflict: boolean;
+  warnings: string[];
+}
+
+/** 推送执行结果 DTO（POST /api/sources/:objToken/push）。 */
+export interface SourcePushResultDto {
+  state: SourceEditState | 'pushed';
+  mode: 'append' | 'overwrite';
+  revisionId: number | null;
+  pull: { ok: boolean; status: string; message?: string };
 }

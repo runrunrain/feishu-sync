@@ -24,9 +24,11 @@ import { SessionListPanel } from '../components/agent/SessionListPanel';
 import { MessageStream } from '../components/agent/MessageStream';
 import { AgentComposer } from '../components/agent/AgentComposer';
 import { AgentModePanel } from '../components/agent/AgentModePanel';
+import { TaskPanel } from '../components/agent/TaskPanel';
 import { useToast } from '../components/common/Toast';
 import { useSessionAgentStatus } from '../hooks/useSessionAgentStatus';
 import { useAgentSessions } from '../hooks/useAgentSessions';
+import { useAgentOrchestration } from '../hooks/useAgentOrchestration';
 import { describeReadinessCode as describeReadiness } from '../utils/agentReadiness';
 
 interface AgentViewProps {
@@ -42,6 +44,7 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
 
   const session = sessions.activeSession;
   const agent = useSessionAgentStatus(session, active);
+  const orchestration = useAgentOrchestration(active);
   const readiness = agent.status ? describeReadiness(agent.status.code, agent.status) : null;
   const isWork = session?.mode === 'work';
   const running = session?.state === 'streaming' || session?.state === 'starting';
@@ -157,6 +160,10 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
           draft={sessions.draft}
           streamErrors={sessions.streamErrors}
           loading={sessions.messagesLoading}
+          approvals={sessions.approvals}
+          onApprovalDecision={(id, decision) => { void sessions.decideApproval(id, decision); }}
+          approvalBusyId={sessions.approvalBusyId}
+          taskNotices={sessions.taskNotices}
           emptyHint={
             <div className="py-8">
               <p className="text-sm text-ink-soft">开始一段新的讨论</p>
@@ -184,16 +191,29 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
         />
       </div>
 
-      {/* 右：模式与权限（可折叠） */}
+      {/* 右：任务区（S7）+ 模式与权限（可折叠） */}
       {panelOpen ? (
-        <div className="absolute z-40 top-0 bottom-0 right-0 w-[min(280px,90%)] xl:static xl:w-auto min-h-0 rounded-md border border-line bg-card-bg shadow-xl overflow-hidden">
-          <button className="absolute top-2 right-2 text-xs text-seal xl:hidden" aria-label="关闭模式面板" onClick={() => setPanelOpen(false)}>关闭</button>
-          <AgentModePanel
+        <div className="absolute z-40 top-0 bottom-0 right-0 w-[min(280px,90%)] xl:static xl:w-auto min-h-0 flex flex-col gap-3">
+          <button className="absolute top-2 right-2 z-10 text-xs text-seal xl:hidden" aria-label="关闭模式面板" onClick={() => setPanelOpen(false)}>关闭</button>
+          <TaskPanel
             session={session}
-            busy={running}
-            onSwitchMode={sessions.switchMode}
-            writeRecords={sessions.writeRecords}
+            tasks={sessions.tasks}
+            taskBusyId={sessions.taskBusyId}
+            onCancelTask={(id) => { void sessions.cancelTask(id); }}
+            onResumeTask={(id, message) => { void sessions.resumeTask(id, message); }}
+            orchestrationEnabled={orchestration.enabled}
+            orchestrationBusy={orchestration.busy}
+            orchestrationError={orchestration.error}
+            onToggleOrchestration={(enabled) => { void orchestration.toggle(enabled); }}
           />
+          <div className="flex-1 min-h-0 rounded-md border border-line bg-card-bg shadow-sm overflow-hidden">
+            <AgentModePanel
+              session={session}
+              busy={running}
+              onSwitchMode={sessions.switchMode}
+              writeRecords={sessions.writeRecords}
+            />
+          </div>
         </div>
       ) : null}
     </div>

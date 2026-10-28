@@ -16,18 +16,29 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   abortAgentSession,
+  cancelAgentTask,
   createAgentSession,
+  decideAgentApproval,
   deleteAgentSession,
   getAgentSessionMessages,
   getAgentSession,
   getSseAuth,
+  listAgentApprovals,
   listAgentSessions,
+  listAgentTasks,
   renameAgentSession,
+  resumeAgentTask,
   sendAgentMessage,
   switchAgentSessionMode,
   APIError,
 } from '../api/client';
-import type { AgentMessageDto, AgentSessionDto } from '../types/agent';
+import type {
+  AgentApprovalDto,
+  AgentMessageDto,
+  AgentSessionDto,
+  AgentTaskDto,
+  AgentTaskNotice,
+} from '../types/agent';
 import { SseConnection, type SseStatus } from '../utils/sseStream';
 
 /** 流式中的工具行（SSE tool 事件即时态；message_end 后由权威消息接管）。 */
@@ -56,6 +67,66 @@ export interface WriteRecord {
   detail: string;
 }
 
+/** 会话内待裁决的批准请求（S10：app_command 挂起流）。 */
+export function isAgentApprovalDto(value: unknown): value is AgentApprovalDto {
+  if (!value || typeof value !== 'object') return false;
+  const approval = value as Partial<AgentApprovalDto>;
+  return typeof approval.id === 'string' && approval.id.length > 0
+    && typeof approval.sessionId === 'string'
+    && typeof approval.command === 'string'
+    && typeof approval.expiresAt === 'string';
+}
+
+// ---------------------------------------------------------------------------
+// 任务编排（S7，设计 kb-agent-upgrade §5.4）：task_update SSE 合并语义。
+// 纯函数导出供单测（与 mergeMessageIntoList 同模式）。
+// ---------------------------------------------------------------------------
+
+/** task_update 负载判别（畸形事件丢弃，不污染任务列表）。 */
+export function isAgentTaskDto(value: unknown): value is AgentTaskDto {
+  if (!value || typeof value !== 'object') return false;
+  const task = value as Partial<AgentTaskDto>;
+  return typeof task.id === 'string' && task.id.length > 0
+    && typeof task.sessionId === 'string'
+    && typeof task.title === 'string'
+    && ['queued', 'running', 'done', 'blocked', 'failed', 'cancelled', 'interrupted']
+      .includes(String(task.status));
+}
+
+/**
+ * 任务 DTO 合入列表：同 id 原位替换，其余追加（服务端按 created_at 升序返回，
+ * 迟到的新任务追加在尾保持邻近语义；不重排既有项，避免展开态跳动）。不修改入参。
+ */
+export function mergeTaskIntoList(prev: AgentTaskDto[], task: AgentTaskDto): AgentTaskDto[] {
+  const idx = prev.findIndex((t) => t.id === task.id);
+  if (idx === -1) return [...prev, task];
+  const copy = [...prev];
+  copy[idx] = task;
+  return copy;
+}
+
+/**
+ * 任务态迁移 → 消息流提示文案；无变化或 queued/running 中间态返回 null
+ * （子任务过程细节不入消息流，只在任务区呈现）。导出供单测。
+ */
+export function describeTaskNotice(task: AgentTaskDto, prev: AgentTaskDto | undefined): string | null {
+  if (prev?.status === task.status) return null;
+  switch (task.status) {
+    case 'blocked':
+      return `任务「${task.title}」等待作答`;
+    case 'done':
+      return `任务「${task.title}」已完成`;
+    case 'failed':
+      return `任务「${task.title}」失败（${task.error?.code ?? 'unknown'}）`;
+    case 'cancelled':
+      return `任务「${task.title}」已取消`;
+    case 'interrupted':
+      return `任务「${task.title}」已中断（应用重启）`;
+    default:
+      return null;
+  }
+}
+
 export interface UseAgentSessionsResult {
   sessions: AgentSessionDto[];
   sessionsLoading: boolean;
@@ -67,6 +138,22 @@ export interface UseAgentSessionsResult {
   draft: RunDraft | null;
   /** 本地错误行（发送失败 / run 失败且无消息承载时展示）。 */
   streamErrors: Array<{ id: string; code: string; message: string }>;
+  /** 会话内待裁决批准（S10）。 */
+  approvals: AgentApprovalDto[];
+  /** 正在提交裁决的批准 id。 */
+  approvalBusyId: string | null;
+  /** 用户裁决（批准/拒绝）。 */
+  decideApproval: (id: string, decision: 'approve' | 'reject') => Promise<boolean>;
+  /** 当前会话的编排子任务（S7；task_update SSE 实时刷新）。 */
+  tasks: AgentTaskDto[];
+  /** 任务态变化的提示行（MessageStream 渲染）。 */
+  taskNotices: AgentTaskNotice[];
+  /** 正在提交取消/作答的任务 id（防双击）。 */
+  taskBusyId: string | null;
+  /** 取消任务（非终态）。 */
+  cancelTask: (id: string) => Promise<boolean>;
+  /** 对 blocked 任务提交作答（→ queued）。 */
+  resumeTask: (id: string, message: string) => Promise<boolean>;
   sseStatus: SseStatus;
   sending: boolean;
   selecting: (id: string | null) => void;
@@ -156,12 +243,19 @@ export function useAgentSessions(active: boolean): UseAgentSessionsResult {
   const [messagesLoading, setMessagesLoading] = useState(false);
   const [draft, setDraft] = useState<RunDraft | null>(null);
   const [streamErrors, setStreamErrors] = useState<Array<{ id: string; code: string; message: string }>>([]);
+  const [approvals, setApprovals] = useState<AgentApprovalDto[]>([]);
+  const [approvalBusyId, setApprovalBusyId] = useState<string | null>(null);
+  const [tasks, setTasks] = useState<AgentTaskDto[]>([]);
+  const [taskNotices, setTaskNotices] = useState<AgentTaskNotice[]>([]);
+  const [taskBusyId, setTaskBusyId] = useState<string | null>(null);
   const [sseStatus, setSseStatus] = useState<SseStatus>('closed');
   const [sending, setSending] = useState(false);
   const [sessionNonce, setSessionNonce] = useState(0);
 
   const activeIdRef = useRef<string | null>(null);
   const connectionRef = useRef<SseConnection | null>(null);
+  /** 任务列表镜像：SSE 回调内读取前值推导提示行，避免在 setState 更新器里做副作用。 */
+  const tasksRef = useRef<AgentTaskDto[]>([]);
   /** 乐观 user 消息的本地 id 前缀（权威数据落地时合并）。 */
   const optimisticPrefix = 'local-';
 
@@ -220,6 +314,12 @@ export function useAgentSessions(active: boolean): UseAgentSessionsResult {
     connectionRef.current = null;
     setDraft(null);
     setStreamErrors([]);
+    setApprovals([]);
+    setApprovalBusyId(null);
+    setTasks([]);
+    tasksRef.current = [];
+    setTaskNotices([]);
+    setTaskBusyId(null);
     setSseStatus('closed');
 
     if (!activeId) {
@@ -240,6 +340,27 @@ export function useAgentSessions(active: boolean): UseAgentSessionsResult {
       })
       .finally(() => {
         if (!disposed && activeIdRef.current === sessionId) setMessagesLoading(false);
+      });
+
+    // 恢复挂起中的批准请求（SSE 断线期间的 approval_request 不丢卡片）。
+    void listAgentApprovals(sessionId)
+      .then((list) => {
+        if (!disposed && activeIdRef.current === sessionId) setApprovals(list);
+      })
+      .catch(() => {
+        /* 列表拉取失败：SSE approval_request 事件仍会补上 */
+      });
+
+    // 编排任务列表（S7）：切换会话恢复已有任务；后续由 task_update 增量刷新。
+    void listAgentTasks(sessionId)
+      .then((list) => {
+        if (!disposed && activeIdRef.current === sessionId) {
+          tasksRef.current = list;
+          setTasks(list);
+        }
+      })
+      .catch(() => {
+        /* 拉取失败：保留空列表，SSE task_update / 手动刷新再补 */
       });
 
     const connection = new SseConnection({
@@ -270,6 +391,20 @@ export function useAgentSessions(active: boolean): UseAgentSessionsResult {
     // handleSseEvent 通过闭包引用（下方 useCallback 定义后稳定）。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active, activeId]);
+
+  /** 任务 DTO 合入（task_update SSE / 取消与作答 API 返回共用）：更新列表 + 按迁移推导提示行。 */
+  const applyTaskUpdate = useCallback((task: AgentTaskDto) => {
+    const before = tasksRef.current.find((t) => t.id === task.id);
+    tasksRef.current = mergeTaskIntoList(tasksRef.current, task);
+    setTasks(tasksRef.current);
+    const notice = describeTaskNotice(task, before);
+    if (notice) {
+      const noticeId = `${task.id}:${task.status}:${task.rounds}`;
+      setTaskNotices((prev) =>
+        prev.some((n) => n.id === noticeId) ? prev : [...prev.slice(-19), { id: noticeId, text: notice }],
+      );
+    }
+  }, []);
 
   const handleSseEvent = useCallback(
     (sessionId: string, event: string, payload: any) => {
@@ -327,6 +462,26 @@ export function useAgentSessions(active: boolean): UseAgentSessionsResult {
           }
           break;
         }
+        case 'approval_request': {
+          // S10：app_command 挂起产生的批准请求（负载即 DTO）。
+          if (isAgentApprovalDto(payload)) {
+            setApprovals((prev) => (prev.some((item) => item.id === payload.id) ? prev : [...prev, payload]));
+          }
+          break;
+        }
+        case 'approval_resolved': {
+          const resolvedId = String(payload?.id ?? '');
+          if (resolvedId) {
+            setApprovals((prev) => prev.filter((item) => item.id !== resolvedId));
+          }
+          break;
+        }
+        case 'task_update': {
+          // S7：负载即 AgentTaskDto；畸形事件丢弃。提示行按状态迁移推导，
+          // 去重锚 id:status:rounds（blocked→作答→再 blocked 会因 rounds 变化重新提示）。
+          if (isAgentTaskDto(payload)) applyTaskUpdate(payload);
+          break;
+        }
         case 'run_end': {
           const outcome = payload?.outcome;
           const runId = String(payload?.runId ?? '');
@@ -359,8 +514,79 @@ export function useAgentSessions(active: boolean): UseAgentSessionsResult {
           break;
       }
     },
-    [patchSession, refetchMessages],
+    [patchSession, refetchMessages, applyTaskUpdate],
   );
+
+  const decideApproval = useCallback(async (id: string, decision: 'approve' | 'reject'): Promise<boolean> => {
+    const sessionId = activeIdRef.current;
+    if (!sessionId) return false;
+    setApprovalBusyId(id);
+    try {
+      await decideAgentApproval(sessionId, id, decision);
+      // 成功即移除卡片（SSE approval_resolved 到达时同样幂等）。
+      setApprovals((prev) => prev.filter((item) => item.id !== id));
+      return true;
+    } catch (err) {
+      const apiErr = err instanceof APIError ? err : null;
+      setStreamErrors((prev) => [
+        ...prev,
+        {
+          id: `approval-${id}-${prev.length}`,
+          code: apiErr ? String(apiErr.response?.error ?? 'approval_failed') : 'approval_failed',
+          message: apiErr?.message ?? '裁决提交失败，请重试。',
+        },
+      ]);
+      return false;
+    } finally {
+      setApprovalBusyId(null);
+    }
+  }, []);
+
+  /** 取消任务（S7）：非终态；成功后以返回 DTO 即时刷新（SSE task_update 幂等兜底）。 */
+  const cancelTask = useCallback(async (id: string): Promise<boolean> => {
+    setTaskBusyId(id);
+    try {
+      const dto = await cancelAgentTask(id);
+      applyTaskUpdate(dto);
+      return true;
+    } catch (err) {
+      const apiErr = err instanceof APIError ? err : null;
+      setStreamErrors((prev) => [
+        ...prev,
+        {
+          id: `task-cancel-${id}-${prev.length}`,
+          code: apiErr ? String(apiErr.response?.error ?? 'task_cancel_failed') : 'task_cancel_failed',
+          message: apiErr?.message ?? '取消任务失败，请重试。',
+        },
+      ]);
+      return false;
+    } finally {
+      setTaskBusyId(null);
+    }
+  }, [applyTaskUpdate]);
+
+  /** 对 blocked 任务提交作答（S7）：→ queued；失败时任务仍 blocked，表单保留可重试。 */
+  const resumeTask = useCallback(async (id: string, message: string): Promise<boolean> => {
+    setTaskBusyId(id);
+    try {
+      const dto = await resumeAgentTask(id, message);
+      applyTaskUpdate(dto);
+      return true;
+    } catch (err) {
+      const apiErr = err instanceof APIError ? err : null;
+      setStreamErrors((prev) => [
+        ...prev,
+        {
+          id: `task-resume-${id}-${prev.length}`,
+          code: apiErr ? String(apiErr.response?.error ?? 'task_resume_failed') : 'task_resume_failed',
+          message: apiErr?.message ?? '作答提交失败，请重试。',
+        },
+      ]);
+      return false;
+    } finally {
+      setTaskBusyId(null);
+    }
+  }, [applyTaskUpdate]);
 
   const selecting = useCallback((id: string | null) => {
     setActiveId(id);
@@ -526,6 +752,14 @@ export function useAgentSessions(active: boolean): UseAgentSessionsResult {
     messagesLoading,
     draft,
     streamErrors,
+    approvals,
+    approvalBusyId,
+    decideApproval,
+    tasks,
+    taskNotices,
+    taskBusyId,
+    cancelTask,
+    resumeTask,
     sseStatus,
     sending,
     selecting,

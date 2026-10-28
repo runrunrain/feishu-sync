@@ -56,6 +56,24 @@ export interface AgentWorkspaceConfig {
   createdAt: string;
 }
 
+/** 图片理解通道配置（S2 §3.6；只引用 llm.providers 既有注册表，不新增任何秘密字段）。
+ * 旧配置缺省时由服务端 load 补默认（disabled），前端按可选字段防御。 */
+export interface AgentVisionConfig {
+  enabled: boolean;
+  /** 引用 llm.providers[].id；缺省回落 activeProviderId */
+  providerId?: string;
+  /** 引用该 provider 的 models[].id；缺省回落 provider 默认预设 */
+  modelId?: string;
+  /** server 侧 HTTP 并发（describeMany），1..8，默认 3。不占 pi 进程槽 */
+  concurrency: number;
+  /** 单图上限（字节），默认 5 MiB，硬上限 20 MiB；超限 too_large */
+  maxImageBytes: number;
+  /** 单次构建最多理解的未缓存图片数，0..5000，默认 300；超出 limit */
+  maxImagesPerBuild: number;
+  /** 单图远端调用超时（毫秒），默认 120000 */
+  timeoutMs: number;
+}
+
 export interface AgentConfig {
   runtime: { nodePath?: string; piCliPath?: string };
   model: {
@@ -67,6 +85,8 @@ export interface AgentConfig {
     contextWindow: number;
     maxTokens: number;
   };
+  /** 图片理解通道（S2/S5 UI）；缺省 disabled */
+  vision?: AgentVisionConfig;
   maxConcurrentProcesses: number;
   idleTimeoutMinutes: number;
   workspaces: AgentWorkspaceConfig[];
@@ -78,7 +98,36 @@ export interface StandardKbConfig {
   buildBatchSize: number;
   promptTimeoutMinutes: number;
   buildTimeoutMinutes: number;
+  /** S4：并行构建 worker 数（1..6，默认 2；实际受 Agent 进程池后台配额约束） */
+  buildParallelism: number;
   autoBuildAfterSync: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// S2/S5：图片理解 status/test（GET/POST /api/agent/vision/*，S2-report §四）
+// ---------------------------------------------------------------------------
+
+/** GET /api/agent/vision/status */
+export interface AgentVisionStatusDto {
+  enabled: boolean;
+  state: 'disabled' | 'ready' | 'invalid';
+  /** 配置引用的原始展示（disabled 时也回显引用值） */
+  provider: string | null;
+  /** 仅 ready 时非空 */
+  model: string | null;
+  /** invalid 时给人读的原因 */
+  message: string;
+  cachedCount: number;
+}
+
+/** POST /api/agent/vision/test（失败也回 200，ok=false 携带脱敏 error） */
+export interface AgentVisionTestResult {
+  ok: boolean;
+  finishReason: 'stop' | 'length' | 'error' | 'timeout';
+  model: string;
+  latencyMs: number;
+  sample: string;
+  error?: { code: string; message: string };
 }
 
 // ---------------------------------------------------------------------------
@@ -147,6 +196,54 @@ export type KbBuildStatus =
   | 'cancelled'
   | 'interrupted';
 
+// ---------------------------------------------------------------------------
+// S4 §4.6：构建进度 DTO（多 worker / 单元 / 图片维度）
+// ---------------------------------------------------------------------------
+
+export type KbBuildStage = 'snapshot' | 'describing_images' | 'units' | 'finishing' | 'validating' | 'publishing';
+
+export interface KbBuildUnitsProgress {
+  total: number;
+  done: number;
+  running: number;
+  failed: number;
+  retried: number;
+}
+
+export type KbBuildWorkerState = 'waiting_slot' | 'running' | 'finishing' | 'exited';
+
+export interface KbBuildWorkerProgress {
+  workerId: string;
+  state: KbBuildWorkerState;
+  unitId: string | null;
+  unitBatchIndex: number;
+  unitBatchTotal: number;
+}
+
+export interface KbBuildImagesProgress {
+  total: number;
+  described: number;
+  cached: number;
+  unavailable: number;
+}
+
+export interface KbBuildProgressDto {
+  /** 兼容字段：已完成批次 / 全部批次 + 1（收尾轮） */
+  batchIndex: number;
+  batchTotal: number;
+  stage: KbBuildStage | null;
+  units: KbBuildUnitsProgress;
+  workers: KbBuildWorkerProgress[];
+  images: KbBuildImagesProgress;
+}
+
+/** 构建警告（如 images_unavailable），随构建历史持久化 */
+export interface KbBuildWarning {
+  code: string;
+  count: number;
+  message: string;
+}
+
 export interface KbBuildDto {
   id: string;
   mode: 'incremental' | 'full';
@@ -163,7 +260,11 @@ export interface KbBuildDto {
     docsWritten: number;
     docsDeleted: number;
   };
-  progress: { batchIndex: number; batchTotal: number };
+  progress: KbBuildProgressDto;
+  /** S4：本次构建并行度（实际生效值；1=等价单进程回退） */
+  parallelism: number;
+  /** S4：构建警告（如 images_unavailable） */
+  warnings: KbBuildWarning[];
   error: null | { code: string; message: string };
   createdAt: string;
   startedAt: string | null;
@@ -236,6 +337,69 @@ export interface AgentMessageDto {
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// 会话内批准（S10，设计 kb-agent-upgrade §6.5）
+// ---------------------------------------------------------------------------
+
+export type AgentApprovalRisk = 'read' | 'mutate' | 'destructive' | 'remote_write';
+
+/** 批准请求（SSE approval_request 负载 + GET /approvals 列表项）。 */
+export interface AgentApprovalDto {
+  id: string;
+  sessionId: string;
+  command: string;
+  risk: AgentApprovalRisk;
+  argsSummary: string;
+  preview?: unknown;
+  expiresAt: string;
+}
+
+export type AgentApprovalOutcome = 'approve' | 'reject' | 'timeout' | 'cancelled';
+
+// ---------------------------------------------------------------------------
+// 任务编排（S7，设计 kb-agent-upgrade §5.4；S6 后端契约）
+// ---------------------------------------------------------------------------
+
+export type AgentTaskStatus =
+  | 'queued'
+  | 'running'
+  | 'done'
+  | 'blocked'
+  | 'failed'
+  | 'cancelled'
+  | 'interrupted';
+
+/**
+ * 任务 DTO：GET /api/agent/tasks* 响应项，亦是父会话 SSE `task_update`
+ * 事件的负载（每次状态迁移 / rounds 变化 / 截断结果更新都会推）。
+ */
+export interface AgentTaskDto {
+  id: string;
+  sessionId: string;
+  role: string;
+  title: string;
+  status: AgentTaskStatus;
+  /** queued 时为会话内排队序（1 起，按 created_at,id 字典序）；其余为 null。 */
+  queuePosition: number | null;
+  rounds: number;
+  outputDir: string | null;
+  /** blocked 时子任务提出的 QUESTIONS（作答素材）。 */
+  questions: string | null;
+  result: string | null;
+  /** true = 展示层已截断（工具返回 20000 字符 / 库内 64KB 上限）。 */
+  resultTruncated: boolean;
+  error: null | { code: string; message: string };
+  createdAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+}
+
+/** 任务态变化在消息流中的提示行（前端由 task_update 事件推导）。 */
+export interface AgentTaskNotice {
+  id: string;
+  text: string;
+}
+
 // SSE 事件负载（§9.2 构建 / §9.3 会话）
 // ---------------------------------------------------------------------------
 
@@ -255,6 +419,9 @@ export type AgentSessionEvent =
       isError?: boolean;
     }
   | { type: 'message_end'; runId: string; message: AgentMessageDto }
+  | { type: 'approval_request'; approval: AgentApprovalDto }
+  | { type: 'approval_resolved'; id: string; decision: AgentApprovalOutcome }
+  | { type: 'task_update'; task: AgentTaskDto }
   | {
       type: 'run_end';
       runId: string;
@@ -265,12 +432,16 @@ export type AgentSessionEvent =
 
 export type KbBuildEvent =
   | { type: 'build_status'; build: KbBuildDto }
-  | { type: 'build_log'; level: 'info' | 'warn' | 'error'; message: string; at: string }
+  | { type: 'build_log'; level: 'info' | 'warn' | 'error'; message: string; at: string; workerId?: string; unitId?: string }
+  | { type: 'build_worker'; workerId: string; state: KbBuildWorkerState; unitId: string | null; unitBatchIndex: number; unitBatchTotal: number }
+  | { type: 'build_units'; total: number; done: number; running: number; failed: number; retried: number }
   | {
       type: 'tool';
       phase: 'start' | 'end';
       toolName: string;
       summary: string;
       isError?: boolean;
+      workerId?: string;
+      unitId?: string;
     }
-  | { type: 'assistant_delta'; delta: string };
+  | { type: 'assistant_delta'; delta: string; workerId?: string; unitId?: string };

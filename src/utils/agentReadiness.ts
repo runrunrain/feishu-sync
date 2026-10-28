@@ -112,6 +112,29 @@ export const KB_BUILD_ACTIVE_STEPS = [
   'publishing',
 ] as const;
 
+/** S4 §4.6 细粒度阶段 → 中文（progress.stage；DB status 之外的运行时细分）。 */
+export const KB_BUILD_STAGE_LABEL: Record<string, string> = {
+  snapshot: '源快照',
+  describing_images: '图片理解',
+  units: '单元生成',
+  finishing: '收尾合并',
+  validating: '校验',
+  publishing: '发布',
+};
+
+/** S4 §4.6 worker 状态 → 中文（progress.workers[].state）。 */
+export const KB_BUILD_WORKER_STATE_LABEL: Record<string, string> = {
+  waiting_slot: '等待进程',
+  running: '生成中',
+  finishing: '收尾中',
+  exited: '已退出',
+};
+
+/** S3/S5 构建警告 code → 中文主题（徽标标题用；详情用 DTO 自带 message）。 */
+export const KB_BUILD_WARNING_LABEL: Record<string, string> = {
+  images_unavailable: '图片未理解',
+};
+
 /** 会话状态 → 中文。 */
 export const AGENT_SESSION_STATE_LABEL: Record<string, string> = {
   idle: '空闲',

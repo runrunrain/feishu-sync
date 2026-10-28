@@ -24,6 +24,10 @@ import type { ConfigManager } from '../modules/config-manager.js';
 import type { Config } from '../types/index.js';
 import { resolveDataRoot } from '../modules/data-root.js';
 import type { AgentWorkspaceConfig } from '../types/agent-knowledge.js';
+import { readAgentPromptBinary } from '../agent/agent-assets.js';
+import { VisionChannel } from '../agent/vision/vision-channel.js';
+import { VisionDescriber } from '../agent/vision/vision-describer.js';
+import type { ApprovalService } from '../agent/approvals/approval-service.js';
 
 export interface AgentRouteDeps {
   sessionService: SessionService;
@@ -36,6 +40,10 @@ export interface AgentRouteDeps {
   internalPort: () => number | null;
   externalPlugins?: () => number;
   pluginProtectedRoots?: () => string[];
+  /** S10：会话内批准流（app_command）。 */
+  approvalService?: ApprovalService;
+  /** S6 任务编排服务（可选便于既有测试装配；生产由 index.ts 注入） */
+  taskService?: import('../agent/tasks/task-service.js').TaskService;
 }
 function errorResponse(c: Context, error: unknown): Response {
   if (error instanceof ToolError) {
@@ -273,6 +281,53 @@ export async function agentRoutes(deps: AgentRouteDeps): Promise<Hono> {
     }
   });
 
+  // ------------------------------------------------------------------
+  // 会话内批准（S10，设计 kb-agent-upgrade §6.5）——app_command 的
+  // mutate/destructive/remote_write 级命令挂起等待用户裁决。批准请求经
+  // 会话 SSE（approval_request/approval_resolved）下发；此处是用户裁决入口。
+  // ------------------------------------------------------------------
+
+  routes.get('/api/agent/sessions/:id/approvals', (c) => {
+    try {
+      const id = c.req.param('id');
+      if (!localMapStore.getAgentSession(id)) {
+        return c.json({ error: 'session_not_found', message: '会话不存在' }, 404);
+      }
+      if (!deps.approvalService) {
+        return c.json({ error: 'approvals_unavailable', message: '批准流未启用' }, 503);
+      }
+      return c.json({ approvals: deps.approvalService.listPending(id) });
+    } catch (error) {
+      return errorResponse(c, error);
+    }
+  });
+
+  routes.post('/api/agent/sessions/:id/approvals/:approvalId/decide', async (c) => {
+    try {
+      const id = c.req.param('id');
+      const approvalId = c.req.param('approvalId');
+      if (!localMapStore.getAgentSession(id)) {
+        return c.json({ error: 'session_not_found', message: '会话不存在' }, 404);
+      }
+      if (!deps.approvalService) {
+        return c.json({ error: 'approvals_unavailable', message: '批准流未启用' }, 503);
+      }
+      let body: { decision?: unknown };
+      try {
+        body = await c.req.json() as { decision?: unknown };
+      } catch {
+        return c.json({ error: 'invalid_json', message: '请求体必须是 JSON' }, 400);
+      }
+      if (body.decision !== 'approve' && body.decision !== 'reject') {
+        return c.json({ error: 'invalid_request', message: "decision 必须是 'approve' 或 'reject'" }, 400);
+      }
+      const dto = deps.approvalService.decide(id, approvalId, body.decision);
+      return c.json({ id: dto.id, decision: body.decision });
+    } catch (error) {
+      return errorResponse(c, error);
+    }
+  });
+
   // 会话 SSE
   routes.get('/api/agent/sessions/:id/events', (c) => {
     const sessionId = c.req.param('id');
@@ -405,6 +460,144 @@ export async function agentRoutes(deps: AgentRouteDeps): Promise<Hono> {
       },
     });
     return c.json({ ok: true });
+  });
+
+  // ------------------------------------------------------------------
+  // Vision 通道（设计 §3.6，S2）：status / test。test 用内置测试图真实
+  // 调用一次所选端点（用户显式触发，与生产资料严格分离，不写缓存）。
+  // ------------------------------------------------------------------
+
+  let visionDescriber: VisionDescriber | null = null;
+  const getVisionDescriber = () => (visionDescriber ??= new VisionDescriber({
+    dataRoot: resolveDataRoot(),
+    config: () => configManager.load(),
+  }));
+
+  routes.get('/api/agent/vision/status', async (c) => {
+    try {
+      const config = await configManager.load();
+      const describer = getVisionDescriber();
+      const status = await describer.status();
+      return c.json({
+        enabled: config.agent.vision.enabled,
+        state: status.state,
+        provider: config.agent.vision.providerId ?? config.llm.activeProviderId ?? null,
+        model: status.model,
+        message: status.message,
+        cachedCount: await describer.cachedCount(),
+      });
+    } catch (error) {
+      return errorResponse(c, error);
+    }
+  });
+
+  routes.post('/api/agent/vision/test', async (c) => {
+    try {
+      const config = await configManager.load();
+      let body: { providerId?: unknown; modelId?: unknown } = {};
+      try {
+        body = await c.req.json() as { providerId?: unknown; modelId?: unknown };
+      } catch {
+        /* 空 body 合法：用已保存的 vision 配置 */
+      }
+      const vision = config.agent.vision;
+      const explicitProvider = typeof body.providerId === 'string' && body.providerId.trim() ? body.providerId.trim() : undefined;
+      const explicitModel = typeof body.modelId === 'string' && body.modelId.trim() ? body.modelId.trim() : undefined;
+      if (!vision.enabled && !explicitProvider && !explicitModel) {
+        throw new ToolError('vision_unconfigured', '图片理解未启用，请先在设置中启用并选择模型', 400);
+      }
+      const resolved = resolveProviderModel(config.llm, {
+        providerId: explicitProvider ?? vision.providerId,
+        modelId: explicitModel ?? vision.modelId,
+      });
+      if (!resolved || !resolved.apiKey) {
+        throw new ToolError('invalid_config', '所选服务提供商/模型不可用（不存在、已停用或缺少认证）', 400);
+      }
+      const image = readAgentPromptBinary('vision-test.png');
+      if (!image) {
+        throw new ToolError('vision_fixture_missing', '内置测试图缺失（server 构建资产未复制）', 500);
+      }
+      const channel = new VisionChannel(config.llm, { providerId: resolved.providerId, modelId: resolved.presetId });
+      const result = await channel.describe(
+        {
+          bytes: image,
+          mime: 'image/png',
+          prompt: '这是一张内置测试图。请简要描述图中内容，并逐字转写所有可见文字（中英文均需转写）。',
+        },
+        { timeoutMs: vision.timeoutMs },
+      );
+      const ok = result.finishReason === 'stop' || result.finishReason === 'length';
+      return c.json({
+        ok,
+        finishReason: result.finishReason,
+        model: result.model,
+        latencyMs: result.latencyMs,
+        sample: result.text,
+        ...(ok ? {} : { error: { code: result.finishReason === 'timeout' ? 'timeout' : 'vision_failed', message: result.errorMessage ?? '调用失败' } }),
+      });
+    } catch (error) {
+      return errorResponse(c, error);
+    }
+  });
+
+  // ------------------------------------------------------------------
+  // 任务编排（S6，设计 kb-agent-upgrade §5.4）：任务 CRUD + 作答 + 消息。
+  // UI（S7）消费；task_update 事件经会话 SSE 推送。
+  // ------------------------------------------------------------------
+
+  routes.get('/api/agent/tasks', async (c) => {
+    try {
+      if (!deps.taskService) throw new ToolError('invalid_request', '任务编排服务不可用', 503);
+      const sessionId = c.req.query('sessionId');
+      if (!sessionId || !sessionId.trim()) {
+        throw new ToolError('invalid_request', 'sessionId 必填');
+      }
+      return c.json({ tasks: deps.taskService.listBySession(localMapStore, sessionId) });
+    } catch (error) {
+      return errorResponse(c, error);
+    }
+  });
+
+  routes.get('/api/agent/tasks/:id', async (c) => {
+    try {
+      if (!deps.taskService) throw new ToolError('invalid_request', '任务编排服务不可用', 503);
+      return c.json(deps.taskService.get(localMapStore, c.req.param('id')));
+    } catch (error) {
+      return errorResponse(c, error);
+    }
+  });
+
+  routes.post('/api/agent/tasks/:id/cancel', async (c) => {
+    try {
+      if (!deps.taskService) throw new ToolError('invalid_request', '任务编排服务不可用', 503);
+      return c.json(await deps.taskService.cancel(localMapStore, c.req.param('id')));
+    } catch (error) {
+      return errorResponse(c, error);
+    }
+  });
+
+  routes.post('/api/agent/tasks/:id/resume', async (c) => {
+    try {
+      if (!deps.taskService) throw new ToolError('invalid_request', '任务编排服务不可用', 503);
+      let body: { message?: unknown } = {};
+      try {
+        body = await c.req.json() as { message?: unknown };
+      } catch {
+        /* 空 body 由 message 校验报 400 */
+      }
+      return c.json(deps.taskService.resume(localMapStore, c.req.param('id'), String(body.message ?? '')));
+    } catch (error) {
+      return errorResponse(c, error);
+    }
+  });
+
+  routes.get('/api/agent/tasks/:id/messages', async (c) => {
+    try {
+      if (!deps.taskService) throw new ToolError('invalid_request', '任务编排服务不可用', 503);
+      return c.json({ messages: deps.taskService.messages(localMapStore, c.req.param('id')) });
+    } catch (error) {
+      return errorResponse(c, error);
+    }
   });
 
   return routes;

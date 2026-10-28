@@ -8,9 +8,10 @@
  */
 
 import { useEffect, useRef } from 'react';
-import { AlertCircle, Ban, Check, Loader2, Wrench } from 'lucide-react';
+import { AlertCircle, Ban, Check, ListTodo, Loader2, Wrench } from 'lucide-react';
 import type { RunDraft } from '../../hooks/useAgentSessions';
-import type { AgentMessageDto } from '../../types/agent';
+import type { AgentApprovalDto, AgentMessageDto, AgentTaskNotice } from '../../types/agent';
+import { ApprovalCard } from './ApprovalCard';
 
 interface MessageStreamProps {
   messages: AgentMessageDto[];
@@ -18,9 +19,17 @@ interface MessageStreamProps {
   streamErrors: Array<{ id: string; code: string; message: string }>;
   loading: boolean;
   emptyHint?: React.ReactNode;
+  /** 会话内待裁决的批准请求（S10；空时无卡片）。 */
+  approvals?: AgentApprovalDto[];
+  /** 用户裁决回调（批准/拒绝按钮）。 */
+  onApprovalDecision?: (id: string, decision: 'approve' | 'reject') => void;
+  /** 正在提交裁决的批准 id（按钮防双击）。 */
+  approvalBusyId?: string | null;
+  /** 任务态变化提示行（S7；由 task_update SSE 推导，居中弱化呈现）。 */
+  taskNotices?: AgentTaskNotice[];
 }
 
-export function MessageStream({ messages, draft, streamErrors, loading, emptyHint }: MessageStreamProps) {
+export function MessageStream({ messages, draft, streamErrors, loading, emptyHint, approvals, onApprovalDecision, approvalBusyId, taskNotices }: MessageStreamProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
 
@@ -34,14 +43,14 @@ export function MessageStream({ messages, draft, streamErrors, loading, emptyHin
     return () => el.removeEventListener('scroll', onScroll);
   }, []);
 
-  const contentKey = `${messages.length}|${draft?.text.length ?? 0}|${draft?.tools.length ?? 0}|${streamErrors.length}`;
+  const contentKey = `${messages.length}|${draft?.text.length ?? 0}|${draft?.tools.length ?? 0}|${streamErrors.length}|${approvals?.length ?? 0}|${taskNotices?.length ?? 0}`;
   useEffect(() => {
     if (stickToBottom.current) {
       scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
     }
   }, [contentKey]);
 
-  const hasContent = messages.length > 0 || draft !== null || streamErrors.length > 0;
+  const hasContent = messages.length > 0 || draft !== null || streamErrors.length > 0 || (approvals?.length ?? 0) > 0 || (taskNotices?.length ?? 0) > 0;
 
   return (
     <div ref={scrollRef} className="flex-1 min-h-0 overflow-auto scrollbar-thin" data-testid="agent-message-stream">
@@ -82,6 +91,33 @@ export function MessageStream({ messages, draft, streamErrors, loading, emptyHin
                 Agent 正在思考…
               </div>
             ) : null}
+          </div>
+        ) : null}
+
+        {/* 任务态变化提示行（S7）：task_update 推导的居中弱化行 */}
+        {taskNotices && taskNotices.length > 0 ? (
+          <div className="space-y-1.5" data-testid="task-notice-list">
+            {taskNotices.map((n) => (
+              <div key={n.id} className="text-center" data-role="task-notice">
+                <span className="inline-block px-3 py-1 rounded-full text-[11px] text-ink-faint bg-paper-2 border border-line/60">
+                  {n.text}
+                </span>
+              </div>
+            ))}
+          </div>
+        ) : null}
+
+        {/* 会话内批准卡片（S10）：app_command 挂起等待用户裁决 */}
+        {approvals && approvals.length > 0 && onApprovalDecision ? (
+          <div className="space-y-2" data-testid="approval-list">
+            {approvals.map((approval) => (
+              <ApprovalCard
+                key={approval.id}
+                approval={approval}
+                onDecide={onApprovalDecision}
+                busy={approvalBusyId === approval.id}
+              />
+            ))}
           </div>
         ) : null}
 
@@ -182,6 +218,8 @@ function ToolRow({
   running: boolean;
   isError?: boolean;
 }) {
+  // task_* 工具（S7 编排）用列表图标区分普通工具；行形态沿用 ToolRow。
+  const TaskIcon = name.startsWith('task_') ? ListTodo : Wrench;
   return (
     <div
       className={`inline-flex items-start gap-2 max-w-full px-3 py-1.5 rounded-md border text-[11px] font-mono ${
@@ -201,7 +239,7 @@ function ToolRow({
       ) : (
         <Check className="w-3 h-3 mt-0.5 shrink-0 text-jade" />
       )}
-      <Wrench className="w-3 h-3 mt-0.5 shrink-0 opacity-60" />
+      <TaskIcon className="w-3 h-3 mt-0.5 shrink-0 opacity-60" />
       <span className="font-medium">{name}</span>
       <span className="truncate" title={summary}>
         {summary}

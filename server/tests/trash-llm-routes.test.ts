@@ -628,7 +628,12 @@ describe('llm test-channel route', () => {
   it('uses the persisted key when Settings sends the GET-mask sentinel', async () => {
     const app = buildLlmDiApp({
       configManager: {
-        load: async () => ({ llm: { apiKey: 'saved-key-must-not-leak' } }),
+        load: async () => ({
+          llm: {
+            apiKey: 'saved-key-must-not-leak',
+            openAiCompatBaseUrl: 'http://127.0.0.1:1/v1',
+          },
+        }),
       },
     });
     const res = await app.fetch(
@@ -637,10 +642,8 @@ describe('llm test-channel route', () => {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           channel: 'direct',
-          // A refused local endpoint avoids any real provider call. If the
-          // route treated `***` as the credential, this test would still
-          // leak the sentinel into a provider request; the implementation
-          // instead resolves it only in memory from ConfigManager.
+          // T3b-01：掩码密钥只能搭配与已保存一致的端点（不可读端点避免真实
+          // 提供商调用）；路由只在内存中恢复真实密钥。
           llm: {
             ...validLlm,
             apiKey: '***',
@@ -654,6 +657,174 @@ describe('llm test-channel route', () => {
     expect(body.success).toBe(false);
     expect(body.error).not.toMatch(/apiKey is empty/i);
     expect(JSON.stringify(body)).not.toContain('saved-key-must-not-leak');
+  });
+
+  it('T3b-01：掩码密钥 + 不同端点 → 400 endpoint_mismatch（密钥不得发往调用方指定 URL）', async () => {
+    const savedLlm = {
+      apiKey: 'saved-key-must-not-leak',
+      openAiCompatBaseUrl: 'https://saved.example/api/v4',
+    };
+    const app = buildLlmDiApp({
+      configManager: { load: async () => ({ llm: savedLlm }) },
+    });
+    // 顶层掩码密钥 + 恶意端点
+    const top = await app.fetch(
+      new Request('http://x/api/llm/test-channel', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          channel: 'direct',
+          llm: { ...validLlm, apiKey: '***', openAiCompatBaseUrl: 'https://attacker.example/v1' },
+        }),
+      }),
+    );
+    expect(top.status).toBe(400);
+    expect((await top.json()).error).toBe('endpoint_mismatch');
+
+    // provider 掩码密钥 + 恶意端点（保留 enabled/model 选择，id 对应已保存项）
+    const providersApp = buildLlmDiApp({
+      configManager: {
+        load: async () => ({
+          llm: {
+            ...savedLlm,
+            providers: [{
+              id: 'p1', name: '已保存提供商', enabled: true,
+              apiKey: 'provider-key-must-not-leak',
+              openAiCompatBaseUrl: 'https://saved.example/api/v4',
+              models: [{ id: 'm1', name: 'M1', openAiModel: 'glm-x', enabled: true }],
+            }],
+          },
+        }),
+      },
+    });
+    const provider = await providersApp.fetch(
+      new Request('http://x/api/llm/test-channel', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          channel: 'direct',
+          llm: {
+            ...validLlm,
+            activeProviderId: 'p1',
+            activeModelId: 'm1',
+            providers: [{
+              id: 'p1', name: '已保存提供商', enabled: true,
+              apiKey: '***',
+              openAiCompatBaseUrl: 'https://attacker.example/v1',
+              models: [{ id: 'm1', name: 'M1', openAiModel: 'glm-x', enabled: true }],
+            }],
+          },
+          timeoutMs: 800,
+        }),
+      }),
+    );
+    expect(provider.status).toBe(400);
+    const providerBody = await provider.json();
+    expect(providerBody.error).toBe('endpoint_mismatch');
+    expect(JSON.stringify(providerBody)).not.toContain('provider-key-must-not-leak');
+  });
+
+  it('T3b-01：provider 掩码密钥 + 已保存端点 → 正常测试链路（不拒止）', async () => {
+    const app = buildLlmDiApp({
+      configManager: {
+        load: async () => ({
+          llm: {
+            ...validLlm,
+            providers: [{
+              id: 'p1', name: '已保存提供商', enabled: true,
+              apiKey: 'provider-key-must-not-leak',
+              openAiCompatBaseUrl: 'http://127.0.0.1:1/v1',
+              models: [{ id: 'm1', name: 'M1', openAiModel: 'glm-x', enabled: true }],
+            }],
+            activeProviderId: 'p1',
+            activeModelId: 'm1',
+          },
+        }),
+      },
+    });
+    const res = await app.fetch(
+      new Request('http://x/api/llm/test-channel', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          channel: 'direct',
+          llm: {
+            ...validLlm,
+            providers: [{
+              id: 'p1', name: '已保存提供商', enabled: true,
+              apiKey: '***',
+              openAiCompatBaseUrl: 'http://127.0.0.1:1/v1',
+              models: [{ id: 'm1', name: 'M1', openAiModel: 'glm-x', enabled: true }],
+            }],
+            activeProviderId: 'p1',
+            activeModelId: 'm1',
+          },
+          timeoutMs: 800,
+        }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.success).toBe(false);
+    expect(body.error).not.toMatch(/api\s*key/i);
+    expect(JSON.stringify(body)).not.toContain('provider-key-must-not-leak');
+  });
+
+  it('T3b-01：providerId 引用模式（不带 llm 对象）→ 从已保存配置解析；未知 id 400', async () => {
+    const savedLlmFull = {
+      ...validLlm,
+      providers: [{
+        id: 'p1', name: '已保存提供商', enabled: true,
+        apiKey: 'provider-key-must-not-leak',
+        openAiCompatBaseUrl: 'http://127.0.0.1:1/v1',
+        models: [{ id: 'm1', name: 'M1', openAiModel: 'glm-x', enabled: true }],
+      }],
+    };
+    const app = buildLlmDiApp({
+      configManager: { load: async () => ({ llm: savedLlmFull }) },
+    });
+    const res = await app.fetch(
+      new Request('http://x/api/llm/test-channel', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          channel: 'direct',
+          providerId: 'p1',
+          modelId: 'm1',
+          timeoutMs: 800,
+        }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.success).toBe(false); // 不可达端点：连接失败而非配置缺失
+    expect(body.error).not.toMatch(/api\s*key/i);
+    expect(JSON.stringify(body)).not.toContain('provider-key-must-not-leak');
+
+    // 未知 provider 引用 → 400，不落到其他配置
+    const unknown = await app.fetch(
+      new Request('http://x/api/llm/test-channel', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ channel: 'direct', providerId: 'no-such' }),
+      }),
+    );
+    expect(unknown.status).toBe(400);
+    expect((await unknown.json()).error).toBe('invalid_provider');
+
+    // 引用模式不接受同时携带 llm 覆盖对象
+    const mixed = await app.fetch(
+      new Request('http://x/api/llm/test-channel', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          channel: 'direct',
+          providerId: 'p1',
+          llm: { ...validLlm, apiKey: '***' },
+        }),
+      }),
+    );
+    expect(mixed.status).toBe(400);
   });
 
   it('direct channel with unreachable endpoint returns success=false (timeout/error), no apiKey in response', async () => {

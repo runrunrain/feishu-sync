@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { ImageIcon } from 'lucide-react';
 import { KbSourceSelector } from './KbSourceSelector';
 import { Modal } from '../common/Modal';
 import { Button } from '../common/Button';
@@ -8,6 +9,22 @@ import type { KbChangePreview, KbFileChange, KbSourceChoice, KbVersionDto } from
 
 export type KbChangeTab = 'sources' | 'pending' | 'history';
 const LABEL = { added: '新增', changed: '修改', removed: '移除', unchanged: '无变化', excluded: '已排除' };
+
+/** S3/S5：待处理源的图片计数提示（/api/kb/changes 的 images 维度）。导出供单测锚定。 */
+export function KbPendingImagesHint({ images }: { images: { total: number; uncached: number } }) {
+  if (images.total <= 0) return null;
+  return (
+    <p className="flex items-start gap-1.5 text-xs text-ink-soft mb-3" data-testid="kb-pending-images">
+      <ImageIcon className="w-3.5 h-3.5 mt-0.5 shrink-0 text-ink-faint" />
+      <span>
+        待处理源引用图片约 {images.total} 张
+        {images.uncached > 0
+          ? `，其中 ${images.uncached} 张尚未缓存——未启用图片理解时，构建会在图片处插入「未理解」标记（可在设置 → Agent 开启「图片理解」）。`
+          : '，均已有缓存描述。'}
+      </span>
+    </p>
+  );
+}
 
 export function KbChangesPanel({ tab, onTab, onClose, onChanged, onUpdate, onOpenSource, running, canUpdate }: {
   tab: KbChangeTab | null;
@@ -76,6 +93,7 @@ export function KbChangesPanel({ tab, onTab, onClose, onChanged, onUpdate, onOpe
         <p className="text-xs text-ink-soft mb-3">比较当前参与构建的原始源与最近发布的源快照。差异用于更新判断，正文会重新写成完整说明。</p>
         {loading ? <p className="text-xs text-ink-faint">正在计算差异…</p> : preview ? <>
           <p className="text-sm text-ink mb-2">{preview.sources.length} 个源变更 · {preview.affectedDocs.length} 篇已有标准文档受影响</p>
+          {preview.images ? <KbPendingImagesHint images={preview.images} /> : null}
           {preview.affectedDocs.length ? <p className="text-xs text-ink-faint mb-3">受影响：{preview.affectedDocs.map((doc) => doc.title).join('、')}</p> : null}
           <ChangeList changes={preview.sources} />
           {!preview.sources.length ? <p className="text-sm text-ink-faint py-6">没有待更新的源变更。</p> : null}

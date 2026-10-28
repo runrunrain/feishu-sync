@@ -68,6 +68,9 @@ import {
 import { adaptSlidesXmlToMarkdown } from './slides-xml-adapter.js';
 import { LarkCliError } from './lark-cli-client.js';
 import { stageSourceWorkbook } from './sheet-workbook.js';
+// S11（设计 §7.3）：同步提交与源编辑共享 per-token 写锁与 dirty blocker。
+// 锁实例与 SourceEditService 默认使用同一进程级单例（source-write-lock.ts）。
+import { sharedSourceWriteLock, type SourceWriteLockLike } from '../sources/source-write-lock.js';
 
 interface FetchedDocument {
   content: string;
@@ -157,6 +160,12 @@ interface SyncEngineDeps {
   layoutReconstructor?: any; // Optional M3 injection
   contentAdapter?: any; // Optional M3 injection
   testHooks?: SyncEngineTestHooks;
+  /**
+   * S11：与 SourceEditService 共享的 per-objToken 写锁（设计 §7.3「提交经
+   * SourceWriteLock」）。缺省回落到进程级共享实例，routes/sync.ts 每请求
+   * 构造 SyncEngine 时无需额外注入也能与编辑服务互斥。
+   */
+  sourceWriteLock?: SourceWriteLockLike;
 }
 
 interface ClassifiedSyncFailure {
@@ -260,6 +269,27 @@ export function requiresFeishuSideAction(failure: Pick<FailedDocument, 'repairAc
     || failure.repairAction === 'enable_export_adapter';
 }
 
+/**
+ * S11（设计 §7.3）：文档存在未写回的本地修改时的 blocker 契约。
+ * 文案对齐设计的前端同步列表措辞；不进 feishu_pending（本地侧动作）。
+ */
+function localEditPendingFailure(doc: {
+  objToken: string;
+  title: string;
+  watchedRootId?: string | null;
+}): FailedDocument {
+  return {
+    objToken: doc.objToken,
+    title: doc.title,
+    error: '本地有未写回的修改：写回飞书或放弃修改后再同步',
+    retryable: false,
+    reasonCode: 'local_edit_pending',
+    suggestedResolution: '在原始库编辑面板选择「写回飞书」推送本地修改，或「放弃修改」恢复为上次同步版本，然后再同步。',
+    repairAction: 'manual_review',
+    watchedRootId: doc.watchedRootId ?? null,
+  };
+}
+
 /** Convert a planning guard into the same actionable result contract as a runtime failure. */
 function plannedFailure(planned: PlannedSyncDocument): FailedDocument {
   const reasonCode = planned.reasonCode ?? 'unknown';
@@ -296,6 +326,13 @@ function plannedFailure(planned: PlannedSyncDocument): FailedDocument {
   };
 }
 
+/**
+ * S11（设计 §7.3）：同步循环内在锁内产生的单文档结果（blocker 或提交完成）。
+ */
+type LocalEditSyncOutcome =
+  | { kind: 'blocked'; failure: FailedDocument }
+  | { kind: 'synced'; doc: SyncedDocument };
+
 export class SyncEngine {
   private larkCliClient: any;
   private localMapStore: any;
@@ -303,6 +340,7 @@ export class SyncEngine {
   private layoutReconstructor?: any;
   private contentAdapter?: any;
   private testHooks: SyncEngineTestHooks;
+  private sourceWriteLock: SourceWriteLockLike;
 
   constructor(deps: SyncEngineDeps) {
     this.larkCliClient = deps.larkCliClient;
@@ -311,6 +349,7 @@ export class SyncEngine {
     this.layoutReconstructor = deps.layoutReconstructor;
     this.contentAdapter = deps.contentAdapter;
     this.testHooks = deps.testHooks ?? {};
+    this.sourceWriteLock = deps.sourceWriteLock ?? sharedSourceWriteLock;
   }
 
   /** All Feishu subprocess work is delegated to the injected client. */
@@ -357,6 +396,16 @@ export class SyncEngine {
       for (const planned of manifest.documents) {
         if (planned.action === 'blocked' || planned.action === 'move') {
           failedDocuments.push(plannedFailure(planned));
+          continue;
+        }
+        // S11（设计 §7.3）：dirty/pushing/conflict 文档在 dry-run 中也如实
+        // 预告 local_edit_pending blocker，让同步列表在正式提交前可见。
+        if (this.getPendingLocalEditState(planned.objToken)) {
+          failedDocuments.push(localEditPendingFailure({
+            objToken: planned.objToken,
+            title: planned.title,
+            watchedRootId: planned.watchedRootId ?? null,
+          }));
         }
       }
 
@@ -393,13 +442,30 @@ export class SyncEngine {
       }
 
       try {
-        // Apply uses exactly the target that was independently reviewed in
-        // the manifest; it must not recompute a potentially different path.
-        const result = await this.syncSingleDocument(
-          { ...doc, localMdPath: planned.localMdPath },
-          options,
+        // S11（设计 §7.3）：提交全程持有 SourceWriteLock(objToken)，与
+        // SourceEditService 的编辑/放弃修改互斥；dirty/pushing/conflict 检查
+        // 在锁内执行，消除「检查与提交之间落入新编辑」窗口，绝不覆盖带
+        // 未写回修改的本地文件、绝不推进其 synced 基线。
+        const outcome: LocalEditSyncOutcome = await this.sourceWriteLock.withLock(
+          doc.objToken,
+          async (): Promise<LocalEditSyncOutcome> => {
+            if (this.getPendingLocalEditState(doc.objToken)) {
+              return { kind: 'blocked', failure: localEditPendingFailure(doc) };
+            }
+            // Apply uses exactly the target that was independently reviewed in
+            // the manifest; it must not recompute a potentially different path.
+            const synced = await this.syncSingleDocument(
+              { ...doc, localMdPath: planned.localMdPath },
+              options,
+            );
+            return { kind: 'synced', doc: synced };
+          },
         );
-        syncedDocuments.push(result);
+        if (outcome.kind === 'blocked') {
+          failedDocuments.push(outcome.failure);
+          continue;
+        }
+        syncedDocuments.push(outcome.doc);
       } catch (error) {
         const failure = classifySyncFailure(error);
         const errMsg = failure.message;
@@ -971,6 +1037,11 @@ export class SyncEngine {
       }
     }
 
+    // S11（设计 §7.3）：写回推送（S12）后的回拉同步成功 → 删除该 pushed
+    // 行与备份目录。清行失败不吞掉同步成功（行残留只会继续显示已推送
+    // 状态，下次成功同步会再试清理）。
+    this.finalizePushedSourceEdit(doc.objToken);
+
     return {
       objToken: doc.objToken,
       title: doc.title,
@@ -981,6 +1052,39 @@ export class SyncEngine {
       attachmentsCount: attachments.length + (bitableResult?.attachments.length ?? 0),
       sheetsCount: sheets.length,
     };
+  }
+
+  /**
+   * S11：source_edits 行在 dirty/pushing/conflict 状态时阻断同步覆盖
+   * （设计 §7.3/§9.1 不变量 1a）。旧测试替身没有该方法 → 不阻断，
+   * 保持既有行为。
+   */
+  private getPendingLocalEditState(objToken: string): { state: string } | null {
+    if (typeof this.localMapStore?.getSourceEdit !== 'function') return null;
+    try {
+      const row = this.localMapStore.getSourceEdit(objToken);
+      return row && row.state !== 'pushed' ? row : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** S11：pushed 行在回拉同步成功后清除，同时清理编辑备份目录。 */
+  private finalizePushedSourceEdit(objToken: string): void {
+    try {
+      if (typeof this.localMapStore?.getSourceEdit !== 'function') return;
+      const row = this.localMapStore.getSourceEdit(objToken);
+      if (!row || row.state !== 'pushed') return;
+      if (typeof this.localMapStore.clearSourceEdit === 'function') {
+        this.localMapStore.clearSourceEdit(objToken);
+      }
+      fs.rmSync(
+        path.join(resolveDataRoot(), 'source-edits', objToken),
+        { recursive: true, force: true },
+      );
+    } catch (error) {
+      console.warn(`[SyncEngine] 清理 pushed 编辑行失败（${objToken}，不影响本次同步）:`, error);
+    }
   }
 
   /**

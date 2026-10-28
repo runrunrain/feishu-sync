@@ -13,6 +13,7 @@ import { Drawer } from '../common/Drawer';
 import { MarkdownView } from '../preview/MarkdownView';
 import { CsvTableView } from '../preview/CsvTableView';
 import { WorkbookView } from '../preview/WorkbookView';
+import { SourceEditControls } from '../SourceEditControls';
 import { getDocumentContent, APIError } from '../../api/client';
 import type { DocumentContent } from '../../types';
 import type { KbDocSourceRef } from '../../types/agent';
@@ -28,6 +29,8 @@ export function RawSourceDrawer({ source, onClose }: RawSourceDrawerProps) {
   const [error, setError] = useState<string | null>(null);
   const [view, setView] = useState<'md' | 'csv' | 'xlsx'>('md');
   const [csvIndex, setCsvIndex] = useState(0);
+  /** 编辑/放弃/写回后重载正文（S13）。 */
+  const [reloadNonce, setReloadNonce] = useState(0);
 
   const objToken = source?.objToken ?? null;
 
@@ -60,7 +63,7 @@ export function RawSourceDrawer({ source, onClose }: RawSourceDrawerProps) {
     return () => {
       cancelled = true;
     };
-  }, [objToken]);
+  }, [objToken, reloadNonce]);
 
   return (
     <Drawer
@@ -127,6 +130,18 @@ export function RawSourceDrawer({ source, onClose }: RawSourceDrawerProps) {
             ) : null}
             {content.mdTruncated ? (
               <span className="ml-auto text-[11px] text-ink-faint">内容过长已截断</span>
+            ) : null}
+            {/* S13 源编辑/写回入口（与 DocPreviewPanel 共用组件） */}
+            {objToken && content.mdContent != null && content.objType === 'docx' ? (
+              <span className={content.mdTruncated ? '' : 'ml-auto'}>
+                <SourceEditControls
+                  objToken={objToken}
+                  objType={content.objType}
+                  mdContent={content.mdContent}
+                  mdTruncated={content.mdTruncated}
+                  onContentChanged={() => setReloadNonce((n) => n + 1)}
+                />
+              </span>
             ) : null}
           </div>
           {view === 'xlsx' && content.workbook ? (
