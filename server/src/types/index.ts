@@ -36,6 +36,31 @@ export interface CliConfig {
   enabled: boolean;
 }
 
+/**
+ * 同步行为配置段（P1-S5，additive，设计 §3.2）：旧配置无此段时由
+ * ConfigManager 读取时补默认（内存态），不参与迁移回写。
+ */
+export interface SyncConfig {
+  /**
+   * 幻灯片逐页截图采集（U36/U37）：默认关闭。开启后同步侧仅在当前
+   * 授权已含可选读 scope（slides:presentation:screenshot）时才采集；
+   * 缺失时合法跳过（正文与关闭时逐字节一致）。授权经 OPTIONAL_READ_SCOPES
+   * 注册表并入 device flow 请求基线（lark-cli-manager.ts）。
+   */
+  slidesScreenshot: { enabled: boolean };
+  /**
+   * P0-S6 白板旁路导出（设计 §5.3 + P0-S1 HP-4 裁定：svg 主产物 + raw
+   * 降级）。缺省开启：旁路文件不被 md 引用，失败只告警不阻断提交。
+   * svgTimeoutMs 是 whiteboard +export --output-type svg 的调用方超时
+   * 预算（svg 服务端渲染超时 ~6.5s，内容相关，P0-S1 实测）；缺省用
+   * lark-cli 执行层默认预算。
+   */
+  whiteboardExport: {
+    enabled: boolean;
+    svgTimeoutMs?: number;
+  };
+}
+
 export interface Config {
   /**
    * v0.2.0 P3: channel-agnostic LLM config. The legacy flat
@@ -47,6 +72,8 @@ export interface Config {
    * name `llm` but its type widens to the new shape.
    */
   llm: LlmConfig;
+  /** 同步行为（P1-S5，additive，可选：旧配置内存补默认）。 */
+  sync?: SyncConfig;
   /** Agent 标准知识库（F1，additive）：旧配置无此段时由 ConfigManager 补默认。 */
   agent: AgentConfig;
   /** 标准库输出与构建参数（F1，additive）。 */
@@ -55,6 +82,8 @@ export interface Config {
   cli?: CliConfig;
   /** 飞书写回（S12，additive，可选：旧配置内存补默认 enabled=false）。 */
   feishuWrite?: FeishuWriteConfig;
+  /** 反向发布（P1-S8，additive，可选：旧配置内存补默认 enabled=false）。 */
+  feishuPublish?: FeishuPublishConfig;
   pollIntervalMinutes: number;
   knowledgeBaseRoot: string;
   /** Authoritative P2 root configuration. */
@@ -266,6 +295,13 @@ export interface CloudNodeObservation {
   objToken: string;
   wikiNodeToken: string;
   objType: 'docx' | 'sheet' | 'slides' | 'bitable' | 'unknown';
+  /**
+   * P2-S8（设计 §4.3/U50）：normalizeObjType 折叠为 'unknown' 之前的原始
+   * 云端 obj_type（mindnote/file 等）。仅折叠路径携带——已支持类型与
+   * 真实类型不可得（DB 折叠值/'unknown'）时为 undefined，保证已支持类型
+   * 的可观察输出（API JSON/manifest）字节级不变。
+   */
+  cloudObjType?: string;
   title: string;
   spaceId: string | null;
   parentNodeToken: string | null;
@@ -451,6 +487,12 @@ export interface ChangedDocument {
   customFolderId?: string | null;
   /** 媒体完整性核对产出的补齐信号，非云端编辑。 */
   mediaGapReason?: 'local_placeholder_tags' | 'sheet_cloud_images_missing';
+  /**
+   * P2-S8（设计 §4.3/U50）：检测遍历折叠为 'unknown' 前的真实云端类型
+   * （mindnote/file 等）。仅未知类型携带（透传给 unsupported_type blocker
+   * 详情与 UI 文案）；已支持类型不携带，可观察输出零变化。
+   */
+  cloudObjType?: string;
 }
 
 /**
@@ -473,6 +515,11 @@ export interface SyncedDocument {
   imagesCount: number;
   attachmentsCount: number;
   sheetsCount: number;
+  /**
+   * P1-S3（设计 P1 §2.1）：该文档引用边超 500 上限被截断时为 true
+   * （同步警告 references_truncated 的结果面投射；边照常入库，不阻断）。
+   */
+  referencesTruncated?: boolean;
 }
 
 export interface FailedDocument {
@@ -491,6 +538,12 @@ export interface FailedDocument {
   repairAction?: SyncRepairAction;
   /** Retained so a structural repair can re-traverse only the affected root. */
   watchedRootId?: string | null;
+  /**
+   * P2-S8（设计 §4.3/U50）：未知类型 blocker 的真实云端类型
+   * （mindnote/file 等）。仅 reasonCode='unsupported_type' 路径填充，
+   * 其余失败路径不携带（undefined 不出现在 JSON 序列化中）。
+   */
+  cloudObjType?: string;
 }
 
 export type SyncFailureReasonCode =
@@ -564,6 +617,8 @@ export interface PlannedSyncDocument {
   suggestedResolution?: string;
   plannedMoveFrom?: string | null;
   pathSource?: 'existing-mapping' | 'layout-profile' | 'legacy-fallback';
+  /** P2-S8：unsupported_type blocker 的真实云端类型（与 ChangedDocument 同名透传字段）。 */
+  cloudObjType?: string;
 }
 
 export type SyncPlanReasonCode =
@@ -910,6 +965,37 @@ export interface SourceEditRecord {
   pushedAt: string | null;
 }
 
+/** source_push_log 表行的 camelCase 投影（P0-S3，设计 §4.1；LocalMapStore 访问器返回）。 */
+export interface SourcePushLogRecord {
+  id: string;
+  objToken: string;
+  localRelPath: string;
+  /** append|overwrite|revert（revert 行由 P0-S4 回滚服务写入）。 */
+  mode: 'append' | 'overwrite' | 'revert' | string;
+  actor: SourceEditActor | string;
+  /** 写前云端 obj_edit_time（force 越过时间门时可空）。 */
+  preObjEditTime: string | null;
+  /** 写前最新 history_version_id（写回回退锚点）。 */
+  anchorHistoryId: string | null;
+  anchorHistoryTime: string | null;
+  /** 锚点历史时间 ≥ 写前云端 obj_edit_time（秒级取整，U23）。 */
+  anchorExact: boolean;
+  /** 取锚失败原因（仅 append 可空锚继续，§4.2）。 */
+  anchorError: string | null;
+  postRevisionId: string | null;
+  /** 写后回拉成功时 SyncEngine 推进的 synced 值（只读抄录）。 */
+  postObjEditTime: string | null;
+  /** started|pushed|conflict|failed|unknown（§4.1；与 source_edits 状态迁移对应，见服务层映射）。 */
+  outcome: 'started' | 'pushed' | 'conflict' | 'failed' | 'unknown' | string;
+  revertState: 'running' | 'done' | 'failed' | 'unknown' | null | string;
+  revertHistoryId: string | null;
+  revertTaskId: string | null;
+  revertError: string | null;
+  revertedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 /** 编辑状态 DTO（GET /api/sources/:objToken/edit-status 与列表项）。 */
 export interface SourceEditStateDto {
   objToken: string;
@@ -933,6 +1019,55 @@ export interface FeishuWriteConfig {
   enabled: boolean;
 }
 
+// ============================================================================
+// 反向发布（P1-S8，设计 P1 §4.1/§4.2）
+// ============================================================================
+
+/** 发布根（云侧目标）：专用发布文件夹（Drive）或 wiki 节点。 */
+export interface PublishTargetConfig {
+  kind: 'drive_folder' | 'wiki_node';
+  token: string;
+  spaceId?: string;
+  label: string;
+}
+
+/** 发布配置段（additive，缺省关；与 feishuWrite 同只接受 desktop 链路修改）。 */
+export interface FeishuPublishConfig {
+  enabled: boolean;
+  /** 已通过双向校验的发布根；未配置时为空。 */
+  target?: PublishTargetConfig | null;
+}
+
+/** kb_publications 行（LMS 直读形态；state 为服务层枚举的宽松字符串）。 */
+export interface KbPublicationRecord {
+  kbPath: string;
+  cloudToken: string | null;
+  cloudUrl: string | null;
+  targetToken: string;
+  publishedReleaseId: string | null;
+  publishedContentHash: string | null;
+  publishedObjEditTime: string | null;
+  state: string;
+  warningsJson: string | null;
+  lastError: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** kb_publications upsert 入参（服务层整行写入； created_at 仅首播保留）。 */
+export interface KbPublicationUpsert {
+  kbPath: string;
+  cloudToken?: string | null;
+  cloudUrl?: string | null;
+  targetToken: string;
+  publishedReleaseId?: string | null;
+  publishedContentHash?: string | null;
+  publishedObjEditTime?: string | null;
+  state: string;
+  warningsJson?: string | null;
+  lastError?: string | null;
+}
+
 /** 推送计划 DTO（POST /api/sources/:objToken/push/preview）。 */
 export interface SourcePushPlanDto {
   mode: 'append' | 'overwrite' | 'blocked';
@@ -944,13 +1079,36 @@ export interface SourcePushPlanDto {
     | 'images_in_overwrite'
     | 'write_disabled'
     | 'write_scope_missing'
-    | 'cloud_time_unreadable';
+    | 'cloud_time_unreadable'
+    /** P0-S3 §4.2：overwrite 取不到云端历史回退锚点（force 不可越过）。 */
+    | 'rollback_anchor_unavailable'
+    /** P0-S4 §4.4：该文档有进行中的云端回滚（cloud_revert_running 互斥）。 */
+    | 'cloud_revert_running';
   appendMarkdown?: string;
   bytes: number;
   cloud: { objEditTime: string | null; revisionId: number | null };
   /** 云端 obj_edit_time 已越过 base_obj_edit_time。 */
   conflict: boolean;
   warnings: string[];
+  /**
+   * P0-S3 §4.2 写前回退锚点（preview 实际调用一次 history-list，只读）：
+   * 第 1 页最新条目；取锚失败为 null（append 照常推送 + warning，overwrite
+   * 升级为 blocked）。anchorBlockedReason 与 blockedReason 同值，独立字段
+   * 便于 UI/CLI 判「无锚」原因而不解析 blockedReason 语义。
+   */
+  rollbackAnchor?: {
+    historyVersionId: string;
+    revisionId: number | null;
+    historyTime: string | null;
+    exact: boolean;
+  } | null;
+  anchorBlockedReason?: 'rollback_anchor_unavailable';
+  /**
+   * P0-S9 §6.1：本地编辑引入的正文首个 H1 与标题的分叉（推送正文不同步
+   * 标题）。null = 无警告；改名后回拉标题一致即自然消除。文案常量见
+   * feishu-write-service 的 titleChangeNotPushedMessage（码 title_change_not_pushed）。
+   */
+  titleChangeNotPushed?: { localTitle: string; syncedTitle: string } | null;
 }
 
 /** 推送执行结果 DTO（POST /api/sources/:objToken/push）。 */

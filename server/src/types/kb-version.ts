@@ -35,6 +35,8 @@ export interface KbSourceChoice {
   included: boolean;
   published: boolean;
   pending: 'added' | 'changed' | 'removed' | 'unchanged' | 'excluded';
+  /** P1-S3（设计 §2.3）：被引用计数（obj/wiki 双键并集）；缺省视为 0。 */
+  referencedBy?: number;
 }
 
 export interface KbSourceTreeNode { id: string; title: string; source?: KbSourceChoice; children: KbSourceTreeNode[] }

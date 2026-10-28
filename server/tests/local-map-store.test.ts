@@ -791,3 +791,192 @@ describe('LocalMapStore bitable obj_type CHECK migration', () => {
     expect(secondRunLogs.join('\n')).not.toContain('table rebuilt');
   });
 });
+
+describe('LocalMapStore source_push_log（P0-S3，设计 §4.1）', () => {
+  it('双登记断言：fresh 库建表 + getCreateTablesDDL 与 applyAdditiveMigrations 两处 DDL 一致', () => {
+    const dbPath = createDatabasePath();
+    const store = new LocalMapStore(dbPath);
+    store.initialize();
+    store.close();
+
+    // ① fresh 库（getCreateTablesDDL 侧）：表与索引就位。
+    const database = new Database(dbPath, { readonly: true });
+    const tables = (database.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+      .map((row) => row.name);
+    const indexes = (database.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all() as Array<{ name: string }>)
+      .map((row) => row.name);
+    const columns = (database.prepare('PRAGMA table_info(source_push_log)').all() as Array<{ name: string }>)
+      .map((row) => row.name);
+    database.close();
+    expect(tables).toContain('source_push_log');
+    expect(indexes).toContain('idx_source_push_log_token');
+    // §4.1 全列（revert_* 列本切片只建列，P0-S4 写值）。
+    expect(columns).toEqual([
+      'id', 'obj_token', 'local_rel_path', 'mode', 'actor', 'pre_obj_edit_time',
+      'anchor_history_id', 'anchor_history_time', 'anchor_exact', 'anchor_error',
+      'post_revision_id', 'post_obj_edit_time', 'outcome', 'revert_state',
+      'revert_history_id', 'revert_task_id', 'revert_error', 'reverted_at',
+      'created_at', 'updated_at',
+    ]);
+
+    // ② getCreateTablesDDL() 登记侧：DDL 文本携带建表语句。
+    const probe = new LocalMapStore(dbPath);
+    const ddl = (probe as unknown as { getCreateTablesDDL(): string }).getCreateTablesDDL();
+    expect(ddl).toContain('CREATE TABLE IF NOT EXISTS source_push_log');
+    expect(ddl).toContain('CREATE INDEX IF NOT EXISTS idx_source_push_log_token');
+    probe.close();
+
+    // ③ applyAdditiveMigrations 登记侧：旧库（表被移除）再 initialize 重建。
+    const legacy = new Database(dbPath);
+    legacy.exec('DROP TABLE source_push_log');
+    legacy.close();
+    const upgraded = new LocalMapStore(dbPath);
+    upgraded.initialize();
+    expect(upgraded.listSourcePushLogs('any-token')).toEqual([]);
+    upgraded.close();
+    const reopened = new Database(dbPath, { readonly: true });
+    expect((reopened.prepare("SELECT name FROM sqlite_master WHERE name = 'source_push_log'").get() as { name: string } | undefined)?.name)
+      .toBe('source_push_log');
+    reopened.close();
+  });
+
+  it('insert/get/list：started 行落锚点字段；按 objToken 倒序取最近', () => {
+    const store = new LocalMapStore(createDatabasePath());
+    store.initialize();
+    try {
+      const id = store.insertSourcePushLog({
+        objToken: 'tokA',
+        localRelPath: '策划/文档A.md',
+        mode: 'overwrite',
+        actor: 'ui',
+        preObjEditTime: 1759000000,
+        anchorHistoryId: '1024',
+        anchorHistoryTime: '2026-10-27T00:00:00Z',
+        anchorExact: true,
+      });
+      expect(id).toMatch(/^sp_\d{14}_[0-9a-f]{6}$/);
+      expect(store.getSourcePushLog(id)).toMatchObject({
+        id,
+        objToken: 'tokA',
+        localRelPath: '策划/文档A.md',
+        mode: 'overwrite',
+        actor: 'ui',
+        preObjEditTime: '1759000000',
+        anchorHistoryId: '1024',
+        anchorHistoryTime: '2026-10-27T00:00:00Z',
+        anchorExact: true,
+        anchorError: null,
+        outcome: 'started',
+        revertState: null,
+      });
+
+      // 同 token 第二行（更晚 created_at）→ list 倒序取最近。
+      const db = (store as unknown as { db: Database.Database }).db;
+      db.prepare("UPDATE source_push_log SET created_at = '2026-10-01T00:00:00.000Z' WHERE id = ?").run(id);
+      const id2 = store.insertSourcePushLog({
+        objToken: 'tokA',
+        localRelPath: '策划/文档A.md',
+        mode: 'append',
+        actor: 'agent',
+        anchorError: 'history_list_empty',
+      });
+      const idOther = store.insertSourcePushLog({
+        objToken: 'tokB',
+        localRelPath: '策划/文档B.md',
+        mode: 'append',
+        actor: 'cli',
+      });
+      expect(store.listSourcePushLogs('tokA').map((row) => row.id)).toEqual([id2, id]);
+      expect(store.listSourcePushLogs('tokA', 1).map((row) => row.id)).toEqual([id2]);
+      expect(store.listSourcePushLogs('tokB').map((row) => row.id)).toEqual([idOther]);
+      expect(store.getSourcePushLog(id2)).toMatchObject({ anchorHistoryId: null, anchorExact: false, anchorError: 'history_list_empty' });
+      expect(store.getSourcePushLog('sp_missing')).toBeNull();
+    } finally {
+      store.close();
+    }
+  });
+
+  it('updateSourcePushLog 四态迁移（started→pushed/conflict/failed/unknown）+ post 字段 COALESCE 保留', () => {
+    const store = new LocalMapStore(createDatabasePath());
+    store.initialize();
+    try {
+      const id = store.insertSourcePushLog({
+        objToken: 'tokA', localRelPath: 'a.md', mode: 'append', actor: 'ui',
+      });
+      // pushed + 写后 revision。
+      expect(store.updateSourcePushLog(id, { outcome: 'pushed', postRevisionId: '6' })).toBe(true);
+      expect(store.getSourcePushLog(id)).toMatchObject({ outcome: 'pushed', postRevisionId: '6' });
+      // 后续只补 post_obj_edit_time：outcome/post_revision_id COALESCE 保留原值。
+      expect(store.updateSourcePushLog(id, { postObjEditTime: '1759000042' })).toBe(true);
+      expect(store.getSourcePushLog(id)).toMatchObject({
+        outcome: 'pushed', postRevisionId: '6', postObjEditTime: '1759000042',
+      });
+      // 其余三态可再迁移（如 unknown 覆盖）。
+      expect(store.updateSourcePushLog(id, { outcome: 'unknown' })).toBe(true);
+      expect(store.getSourcePushLog(id)?.outcome).toBe('unknown');
+      expect(store.updateSourcePushLog(id, { outcome: 'conflict' })).toBe(true);
+      expect(store.getSourcePushLog(id)?.outcome).toBe('conflict');
+      expect(store.updateSourcePushLog(id, { outcome: 'failed' })).toBe(true);
+      expect(store.getSourcePushLog(id)?.outcome).toBe('failed');
+      expect(store.updateSourcePushLog('sp_missing', { outcome: 'pushed' })).toBe(false);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('markInterruptedSourcePushLogs：started → unknown；终态行不动', () => {
+    const store = new LocalMapStore(createDatabasePath());
+    store.initialize();
+    try {
+      const ids = ['a', 'b', 'c'].map((tag, index) => {
+        const id = store.insertSourcePushLog({
+          objToken: `tok${index}`, localRelPath: `${tag}.md`, mode: 'append', actor: 'ui',
+        });
+        if (index > 0) store.updateSourcePushLog(id, { outcome: index === 1 ? 'pushed' : 'failed' });
+        return id;
+      });
+      expect(store.markInterruptedSourcePushLogs()).toBe(1);
+      expect(store.getSourcePushLog(ids[0])?.outcome).toBe('unknown');
+      expect(store.getSourcePushLog(ids[1])?.outcome).toBe('pushed');
+      expect(store.getSourcePushLog(ids[2])?.outcome).toBe('failed');
+      expect(store.markInterruptedSourcePushLogs()).toBe(0);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('pruneSourcePushLogs：每 token 保留最近 50 行，revert_state=running 跳过', () => {
+    const store = new LocalMapStore(createDatabasePath());
+    store.initialize();
+    try {
+      const db = (store as unknown as { db: Database.Database }).db;
+      const insert = (token: string, seq: number, revertState?: string): string => {
+        const id = store.insertSourcePushLog({
+          objToken: token, localRelPath: 'x.md', mode: 'append', actor: 'ui',
+        });
+        db.prepare('UPDATE source_push_log SET created_at = ? WHERE id = ?')
+          .run(new Date(1759000000000 + seq * 1000).toISOString(), id);
+        if (revertState) {
+          db.prepare('UPDATE source_push_log SET revert_state = ? WHERE id = ?').run(revertState, id);
+        }
+        return id;
+      };
+      const kept: string[] = [];
+      for (let i = 0; i < 55; i += 1) kept.push(insert('tokA', i));
+      // running 行（最旧）：即使排到 50 名外也保留（S4 轮询器仍需要）。
+      const runningId = insert('tokA', -100, 'running');
+      for (let i = 0; i < 3; i += 1) insert('tokB', i);
+
+      expect(store.pruneSourcePushLogs()).toBe(5); // tokA 超出 50 的 5 行被删。
+      const remaining = store.listSourcePushLogs('tokA', 100).map((row) => row.id);
+      expect(remaining).toHaveLength(51); // 50 新行 + running 行
+      expect(remaining).toContain(runningId);
+      expect(remaining).not.toContain(kept[0]); // 最旧的 5 行被删
+      expect(remaining).toContain(kept[10]);
+      expect(store.listSourcePushLogs('tokB', 100)).toHaveLength(3); // 其他 token 不受影响
+      expect(store.pruneSourcePushLogs()).toBe(0); // 幂等
+    } finally {
+      store.close();
+    }
+  });
+});

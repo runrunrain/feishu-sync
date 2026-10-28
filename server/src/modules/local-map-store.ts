@@ -25,6 +25,9 @@ import type {
   WatchedRootConfig,
   SourceEditActor,
   SourceEditRecord,
+  SourcePushLogRecord,
+  KbPublicationRecord,
+  KbPublicationUpsert,
 } from '../types/index.js';
 
 const V5_RUNTIME_SCHEMA_VERSION = 'v5_runtime_state';
@@ -265,6 +268,136 @@ export class LocalMapStore {
       );
       CREATE INDEX IF NOT EXISTS idx_agent_tasks_session ON agent_tasks(session_id, created_at);
     `);
+
+    // P0-S3（lark-cli-newcaps-P0 §4.1）：source_push_log 新表——写回写前
+    // 锚点日志。行生命周期独立于 source_edits（回拉成功后 source_edits
+    // 行被删除，锚点必须独立留存，S4 回滚服务 / S5 UI 消费）。
+    // CREATE TABLE IF NOT EXISTS 对旧库同样新建；与 getCreateTablesDDL
+    // 双登记（回滚策略：旧版本应用忽略新表）。revert_* 列本切片只建列
+    // 不写值（P0-S4 回滚服务消费）。
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS source_push_log (
+        id TEXT PRIMARY KEY,
+        obj_token TEXT NOT NULL,
+        local_rel_path TEXT NOT NULL,
+        mode TEXT NOT NULL CHECK(mode IN ('append','overwrite','revert')),
+        actor TEXT NOT NULL,
+        pre_obj_edit_time TEXT,
+        anchor_history_id TEXT,
+        anchor_history_time TEXT,
+        anchor_exact INTEGER NOT NULL DEFAULT 0,
+        anchor_error TEXT,
+        post_revision_id TEXT,
+        post_obj_edit_time TEXT,
+        outcome TEXT NOT NULL CHECK(outcome IN ('started','pushed','conflict','failed','unknown')),
+        revert_state TEXT,
+        revert_history_id TEXT,
+        revert_task_id TEXT,
+        revert_error TEXT,
+        reverted_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_source_push_log_token ON source_push_log(obj_token, created_at);
+    `);
+
+    // P1-S8 反向发布（设计 P1 §4.2）：kb_publications 新表（发布映射与
+    // 状态机真相）。CREATE TABLE IF NOT EXISTS 对旧库同样新建；与
+    // getCreateTablesDDL 双登记（回滚策略：旧版本应用忽略新表）。
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS kb_publications (
+        kb_path TEXT PRIMARY KEY,
+        cloud_token TEXT,
+        cloud_url TEXT,
+        target_token TEXT NOT NULL,
+        published_release_id TEXT,
+        published_content_hash TEXT,
+        published_obj_edit_time TEXT,
+        state TEXT NOT NULL CHECK(state IN (
+          'creating','published','published_with_warnings','conflict',
+          'failed','unknown','kb_removed','cloud_missing')),
+        warnings_json TEXT,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_kb_publications_cloud ON kb_publications(cloud_token);
+    `);
+    console.info('[LocalMapStore] kb_publications table ready (P1-S8)');
+    console.info('[LocalMapStore] source_push_log table ready (P0-S3)');
+
+    // P1-S3 引用图（设计 P1 §2.2）：source_references 新表——源文档 → 引用
+    // 目标的出边集合，随 SyncEngine 提交事务「先删该源旧边再插新边」。
+    // CREATE TABLE IF NOT EXISTS 对旧库同样新建；与 getCreateTablesDDL
+    // 双登记（回滚策略：旧版本应用忽略新表）。
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS source_references (
+        src_obj_token TEXT NOT NULL,
+        target_token TEXT NOT NULL,
+        target_type TEXT NOT NULL,
+        origin TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        label TEXT,
+        occurrences INTEGER NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (src_obj_token, target_token, origin, kind)
+      );
+      CREATE INDEX IF NOT EXISTS idx_source_references_target ON source_references(target_token);
+    `);
+    console.info('[LocalMapStore] source_references table ready (P1-S3)');
+
+    // P2-S4 评论溯源（设计 §5.1）：source_comments + source_comment_meta
+    // 两张新表——同步事务内「先删后插」采集，meta 区分「没有评论」
+    // （total=0）与「从未采集」（无行）。CREATE TABLE IF NOT EXISTS 对旧库
+    // 同样新建；与 getCreateTablesDDL 双登记（回滚策略：旧版本应用忽略新表）。
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS source_comments (
+        src_obj_token TEXT NOT NULL,
+        comment_ref TEXT NOT NULL,
+        text TEXT NOT NULL,
+        quote TEXT,
+        author TEXT,
+        created_at_cloud TEXT,
+        solved INTEGER,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (src_obj_token, comment_ref)
+      );
+      CREATE TABLE IF NOT EXISTS source_comment_meta (
+        src_obj_token TEXT PRIMARY KEY,
+        total INTEGER NOT NULL,
+        truncated INTEGER NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `);
+    console.info('[LocalMapStore] source_comments tables ready (P2-S4)');
+
+    // P2-S6（lark-cli-newcaps-P2 §3.3）：cloud_moves 新表——安全移出
+    //（wiki → 云空间）状态机真相。状态机（任务书命名，与设计 §3.3/§3.6
+    // 的映射：pending=started / moving=running / moved=done）：
+    //   pending → moving（异步起步）| moved（同步完成）| failed（业务错）
+    //          | unknown（子进程超时/不可解析/重启残留）
+    //   moving → moved | failed | unknown（轮询超10分钟/丢失 task_id）
+    // 行不随检测/同步删除（审计留存，同 source_push_log 生命周期哲学）。
+    // CREATE TABLE IF NOT EXISTS 对旧库同样新建；与 getCreateTablesDDL
+    // 双登记（回滚策略：旧版本应用忽略新表）。
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS cloud_moves (
+        id TEXT PRIMARY KEY,
+        obj_token TEXT NOT NULL,
+        wiki_node_token TEXT NOT NULL,
+        watched_root_id TEXT,
+        title TEXT,
+        target_folder_token TEXT,
+        state TEXT NOT NULL CHECK(state IN ('pending','moving','moved','failed','unknown')),
+        task_id TEXT,
+        error TEXT,
+        actor TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_cloud_moves_token ON cloud_moves(obj_token, created_at);
+    `);
+    console.info('[LocalMapStore] cloud_moves table ready (P2-S6)');
   }
 
   /**
@@ -805,6 +938,216 @@ export class LocalMapStore {
     stmt.run(errorCode, objToken);
   }
 
+  // =========================================================================
+  // P1-S3 引用图（source_references，设计 P1 §2.2/§2.3）
+  // =========================================================================
+
+  /**
+   * 在当前事务/独立调用中替换一个源文档的全部引用出边：先删旧边、再批量
+   * 插入新边（§2.2）。自包 db.transaction——从 SyncEngine 的提交事务内
+   * 嵌套调用时降级为 savepoint，中止时随外层事务一起回滚（设计验收：
+   * 同步提交失败时边与正文基线一致回滚）。
+   *
+   * edges 为零长度数组也是合法输入（该源已无引用），此时仅清空旧边。
+   */
+  replaceSourceReferences(
+    srcObjToken: string,
+    edges: ReadonlyArray<SourceReferenceInsert>,
+  ): { deleted: number; inserted: number } {
+    const nowIso = new Date().toISOString();
+    const run = (): { deleted: number; inserted: number } => {
+      const deleted = this.getStatement(
+        'DELETE FROM source_references WHERE src_obj_token = ?',
+      ).run(srcObjToken).changes;
+      const insert = this.getStatement(`
+        INSERT INTO source_references
+          (src_obj_token, target_token, target_type, origin, kind, label, occurrences, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      let inserted = 0;
+      for (const edge of edges) {
+        if (!edge || typeof edge.targetToken !== 'string' || edge.targetToken.length === 0) continue;
+        const occurrences = Number.isFinite(edge.occurrences) && edge.occurrences > 0
+          ? Math.floor(edge.occurrences)
+          : 1;
+        insert.run(
+          srcObjToken,
+          edge.targetToken,
+          edge.targetType,
+          edge.origin,
+          edge.kind,
+          edge.title ?? null,
+          occurrences,
+          nowIso,
+        );
+        inserted += 1;
+      }
+      return { deleted, inserted };
+    };
+    return this.db.transaction(run)();
+  }
+
+  /** 删除一个源的全部引用出边（生命周期钩：源行硬删/本地基线清除时同事务调用）。 */
+  deleteSourceReferencesBySrc(objToken: string): number {
+    return this.getStatement('DELETE FROM source_references WHERE src_obj_token = ?')
+      .run(objToken).changes;
+  }
+
+  /** 按源查出边（出链）。occurrences 降序，确定性排序便于断言/展示。 */
+  listSourceReferencesBySrc(objToken: string): SourceReferenceRow[] {
+    const rows = this.getStatement(`
+      SELECT src_obj_token, target_token, target_type, origin, kind, label, occurrences, updated_at
+      FROM source_references
+      WHERE src_obj_token = ?
+      ORDER BY occurrences DESC, target_token, kind, origin
+    `).all(objToken) as Array<Record<string, unknown>>;
+    return rows.map((row) => mapReferenceRow(row));
+  }
+
+  /**
+   * 按目标查入边（被引用关系，§2.3）。入链按 obj_token 与 wiki_node_token
+   * 两个键取并集（外部可能用任一种 URL 引用它），由调用方传入双键；
+   * 返回行附源文档 title/local_rel_path（源行已删时为 null——入边保留）。
+   */
+  listSourceReferencesByTarget(targetTokens: ReadonlyArray<string>): IncomingReferenceRow[] {
+    const tokens = [...new Set(
+      (targetTokens ?? []).filter((token): token is string => typeof token === 'string' && token.length > 0),
+    )];
+    if (tokens.length === 0) return [];
+    const placeholders = tokens.map(() => '?').join(', ');
+    const rows = this.db.prepare(`
+      SELECT sr.src_obj_token, sr.target_token, sr.target_type, sr.origin, sr.kind,
+             sr.label, sr.occurrences, sr.updated_at,
+             d.title AS src_title, d.local_rel_path AS src_local_rel_path
+      FROM source_references sr
+      LEFT JOIN documents d ON d.obj_token = sr.src_obj_token
+      WHERE sr.target_token IN (${placeholders})
+      ORDER BY sr.occurrences DESC, sr.src_obj_token, sr.kind, sr.origin
+    `).all(...tokens) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      ...mapReferenceRow(row),
+      srcTitle: typeof row.src_title === 'string' ? row.src_title : null,
+      srcLocalRelPath: typeof row.src_local_rel_path === 'string' ? row.src_local_rel_path : null,
+    }));
+  }
+
+  /** target_token → 入边计数（列表徽标准备；双键并集由调用方汇总）。 */
+  countSourceReferencesByTarget(): Map<string, number> {
+    const rows = this.getStatement(
+      'SELECT target_token, COUNT(*) AS n FROM source_references GROUP BY target_token',
+    ).all() as Array<{ target_token: string; n: number }>;
+    const out = new Map<string, number>();
+    for (const row of rows) out.set(row.target_token, Number(row.n) || 0);
+    return out;
+  }
+
+  // =========================================================================
+  // P2-S4 评论溯源（source_comments + source_comment_meta，设计 §5.1）
+  // =========================================================================
+
+  /**
+   * 在当前事务/独立调用中替换一个源文档的全部评论：先删该源旧评论与
+   * meta、再批量插入新评论并写 meta（先删后插，重同步替换而非累积）。
+   * 与 replaceSourceReferences 同款自包 db.transaction——从 SyncEngine 的
+   * 提交事务内嵌套调用时降级为 savepoint，中止时随外层事务一起回滚。
+   *
+   * comments 为零长度数组也是合法输入（该源没有评论，meta 记 total=0
+   * ——与「从未采集」的无 meta 行区分）；truncated 来自 comments.tips
+   * 存在性（云端截断如实标注，不补全）。
+   */
+  replaceSourceComments(
+    srcObjToken: string,
+    comments: ReadonlyArray<SourceCommentInsert>,
+    meta: { truncated: boolean },
+  ): { deleted: number; inserted: number } {
+    const nowIso = new Date().toISOString();
+    const run = (): { deleted: number; inserted: number } => {
+      const deleted = this.getStatement(
+        'DELETE FROM source_comments WHERE src_obj_token = ?',
+      ).run(srcObjToken).changes;
+      this.getStatement('DELETE FROM source_comment_meta WHERE src_obj_token = ?')
+        .run(srcObjToken);
+      const insert = this.getStatement(`
+        INSERT INTO source_comments
+          (src_obj_token, comment_ref, text, quote, author, created_at_cloud, solved, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      let inserted = 0;
+      const seenRefs = new Set<string>();
+      for (const comment of comments) {
+        if (!comment || typeof comment.commentRef !== 'string' || comment.commentRef.length === 0) continue;
+        if (typeof comment.text !== 'string' || comment.text.length === 0) continue;
+        if (seenRefs.has(comment.commentRef)) continue; // 主键去重，首次为准（与解析层一致）
+        seenRefs.add(comment.commentRef);
+        insert.run(
+          srcObjToken,
+          comment.commentRef,
+          comment.text,
+          comment.quote ?? null,
+          comment.author ?? null,
+          comment.createdAtCloud ?? null,
+          comment.solved === true ? 1 : comment.solved === false ? 0 : null,
+          nowIso,
+        );
+        inserted += 1;
+      }
+      this.getStatement(`
+        INSERT INTO source_comment_meta (src_obj_token, total, truncated, updated_at)
+        VALUES (?, ?, ?, ?)
+      `).run(srcObjToken, inserted, meta.truncated ? 1 : 0, nowIso);
+      return { deleted, inserted };
+    };
+    return this.db.transaction(run)();
+  }
+
+  /** 删除一个源的全部评论与 meta（生命周期钩：源行硬删/本地基线清除时同事务调用）。 */
+  deleteSourceCommentsBySrc(objToken: string): { comments: number; meta: number } {
+    const run = (): { comments: number; meta: number } => {
+      const comments = this.getStatement('DELETE FROM source_comments WHERE src_obj_token = ?')
+        .run(objToken).changes;
+      const meta = this.getStatement('DELETE FROM source_comment_meta WHERE src_obj_token = ?')
+        .run(objToken).changes;
+      return { comments, meta };
+    };
+    return this.db.transaction(run)();
+  }
+
+  /** 按源查评论（comment_ref 升序，确定性排序便于断言/展示）。 */
+  listSourceCommentsBySrc(objToken: string): SourceCommentRow[] {
+    const rows = this.getStatement(`
+      SELECT src_obj_token, comment_ref, text, quote, author, created_at_cloud, solved, updated_at
+      FROM source_comments
+      WHERE src_obj_token = ?
+      ORDER BY comment_ref
+    `).all(objToken) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      srcObjToken: String(row.src_obj_token),
+      commentRef: String(row.comment_ref),
+      text: String(row.text ?? ''),
+      quote: typeof row.quote === 'string' ? row.quote : null,
+      author: typeof row.author === 'string' ? row.author : null,
+      createdAtCloud: typeof row.created_at_cloud === 'string' ? row.created_at_cloud : null,
+      solved: row.solved === 1 ? true : row.solved === 0 ? false : null,
+      updatedAt: String(row.updated_at),
+    }));
+  }
+
+  /** 按源查采集 meta；无行 = 从未采集（非 docx 或未同步过）。 */
+  getSourceCommentMeta(objToken: string): SourceCommentMetaRow | null {
+    const row = this.getStatement(`
+      SELECT src_obj_token, total, truncated, updated_at
+      FROM source_comment_meta
+      WHERE src_obj_token = ?
+    `).get(objToken) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      srcObjToken: String(row.src_obj_token),
+      total: Number(row.total) || 0,
+      truncated: Number(row.truncated) === 1,
+      updatedAt: String(row.updated_at),
+    };
+  }
+
   /**
    * Move a non-retryable cloud-side issue into the durable Feishu queue.
    * This is intentionally a local state transition only: the application
@@ -1013,10 +1356,25 @@ export class LocalMapStore {
     return this.db.transaction(() => {
       const removeSheets = this.getStatement('DELETE FROM sheet_sheets WHERE sheet_obj_token = ?');
       const removeDoc = this.getStatement('DELETE FROM documents WHERE obj_token = ?');
+      const removeRefs = this.getStatement('DELETE FROM source_references WHERE src_obj_token = ?');
+      // P2-S4：评论与 meta 随源行删除同事务清理（同款生命周期语义）。
+      const removeComments = this.getStatement('DELETE FROM source_comments WHERE src_obj_token = ?');
+      const removeCommentMeta = this.getStatement('DELETE FROM source_comment_meta WHERE src_obj_token = ?');
       let prunedSheets = 0;
-      for (const token of tokens) { prunedSheets += removeSheets.run(token).changes; removeDoc.run(token); }
+      for (const token of tokens) {
+        prunedSheets += removeSheets.run(token).changes;
+        removeRefs.run(token);
+        removeComments.run(token);
+        removeCommentMeta.run(token);
+        removeDoc.run(token);
+      }
       // 修复旧清理留下的孤立表格索引，不依赖SQLite FK开关。
       prunedSheets += this.db.prepare('DELETE FROM sheet_sheets WHERE NOT EXISTS (SELECT 1 FROM documents WHERE obj_token = sheet_obj_token)').run().changes;
+      // P1-S3：防御式清理无源行的引用出边（同款 NOT EXISTS 语义）。
+      this.db.prepare('DELETE FROM source_references WHERE NOT EXISTS (SELECT 1 FROM documents WHERE obj_token = src_obj_token)').run();
+      // P2-S4：同款防御式清理孤立评论与 meta。
+      this.db.prepare('DELETE FROM source_comments WHERE NOT EXISTS (SELECT 1 FROM documents WHERE obj_token = src_obj_token)').run();
+      this.db.prepare('DELETE FROM source_comment_meta WHERE NOT EXISTS (SELECT 1 FROM documents WHERE obj_token = src_obj_token)').run();
       const removeDir = this.getStatement('DELETE FROM localDirs WHERE local_path = ?');
       for (const dir of missingDirs) removeDir.run(dir.localPath);
       return { scanned: rows.length, pruned: tokens.length, prunedTokens: tokens, prunedSheets, prunedDirectories: missingDirs.length };
@@ -1033,6 +1391,13 @@ export class LocalMapStore {
         .run(this.kbSourceRootKey(options.blockRoot), objToken, doc.title, doc.wikiNodeToken ?? null, new Date().toISOString());
       if (!options.pending && !options.blockRoot) { this.deleteDocumentByToken(objToken); return; }
       this.db.prepare('DELETE FROM sheet_sheets WHERE sheet_obj_token=?').run(objToken);
+      // P1-S3：本地正文基线被清除（移出/屏蔽后重挂 pending）→ 引用出边
+      // 同删；下次成功同步自然重算（边与当前本地正文一致，§2.2）。
+      this.db.prepare('DELETE FROM source_references WHERE src_obj_token=?').run(objToken);
+      // P2-S4：评论同理随基线清除（评论只在同步时采集；下次成功同步
+      // 自然重采）。
+      this.db.prepare('DELETE FROM source_comments WHERE src_obj_token=?').run(objToken);
+      this.db.prepare('DELETE FROM source_comment_meta WHERE src_obj_token=?').run(objToken);
       this.db.prepare(`UPDATE documents SET local_md_path='',local_rel_path=NULL,last_synced_at='',last_synced_modify_time='',
         synced_obj_edit_time=NULL,status='changed',sync_state='pending_added',pending_reason='local_deleted',
         last_sync_error_code=NULL,missing_complete_count=0,
@@ -1078,6 +1443,11 @@ export class LocalMapStore {
     const deleteSheets = this.getStatement('DELETE FROM sheet_sheets WHERE sheet_obj_token = ?');
     const deleteDoc = this.getStatement('DELETE FROM documents WHERE obj_token = ?');
     const tx = this.db.transaction(() => {
+      // P1-S3（设计 §2.2 生命周期）：源行硬删时同事务删除引用出边；
+      // 作为 target 的入边保留（指向已不存在文档是真实信息）。
+      this.deleteSourceReferencesBySrc(objToken);
+      // P2-S4：评论与 meta 随源行硬删同事务清理（孤儿数据防御）。
+      this.deleteSourceCommentsBySrc(objToken);
       deleteSheets.run(objToken);
       const info = deleteDoc.run(objToken);
       return info.changes > 0;
@@ -1104,6 +1474,18 @@ export class LocalMapStore {
     const deleteSheetsByRoot = this.getStatement(
       'DELETE FROM sheet_sheets WHERE sheet_obj_token IN (SELECT obj_token FROM documents WHERE watched_root_url = ?)'
     );
+    // P1-S3：同步根移除时级联清理引用出边（子查询依赖 documents 行尚在，
+    // 必须先于 deleteDocs 执行；入边按设计保留）。
+    const deleteRefsByRoot = this.getStatement(
+      'DELETE FROM source_references WHERE src_obj_token IN (SELECT obj_token FROM documents WHERE watched_root_url = ?)'
+    );
+    // P2-S4：评论与 meta 同步根移除时级联清理（同款子查询先行语义）。
+    const deleteCommentsByRoot = this.getStatement(
+      'DELETE FROM source_comments WHERE src_obj_token IN (SELECT obj_token FROM documents WHERE watched_root_url = ?)'
+    );
+    const deleteCommentMetaByRoot = this.getStatement(
+      'DELETE FROM source_comment_meta WHERE src_obj_token IN (SELECT obj_token FROM documents WHERE watched_root_url = ?)'
+    );
     const deletePending = this.getStatement(
       'DELETE FROM feishu_pending_items WHERE watched_root_id = ?'
     );
@@ -1113,6 +1495,9 @@ export class LocalMapStore {
     const tx = this.db.transaction(() => {
       // 子查询依赖 documents 行尚未删除，必须先于 deleteDocs 执行。
       const sheets = deleteSheetsByRoot.run(watchedRootUrl).changes;
+      deleteRefsByRoot.run(watchedRootUrl);
+      deleteCommentsByRoot.run(watchedRootUrl);
+      deleteCommentMetaByRoot.run(watchedRootUrl);
       const pendingItems = watchedRootId
         ? deletePending.run(watchedRootId).changes
         : 0;
@@ -1151,11 +1536,15 @@ export class LocalMapStore {
    * via the FK constraint declared in migration_v2.sql.
    */
   purgeCloudDeleted(objToken: string): void {
-    const stmt = this.getStatement(`
-      DELETE FROM documents
-      WHERE obj_token = ? AND sync_state = 'deleted_confirmed'
-    `);
-    stmt.run(objToken);
+    const tx = this.db.transaction(() => {
+      const info = this.getStatement(`
+        DELETE FROM documents
+        WHERE obj_token = ? AND sync_state = 'deleted_confirmed'
+      `).run(objToken);
+      // P1-S3：仅当行确实被硬删时才同步删引用出边（未删行保留其边）。
+      if (info.changes > 0) this.deleteSourceReferencesBySrc(objToken);
+    });
+    tx();
   }
 
   /**
@@ -2702,6 +3091,508 @@ export class LocalMapStore {
     `).all() as Array<Record<string, any>>).map((row) => this.mapSourceEditRow(row));
   }
 
+  // ===========================================================================
+  // 写前锚点日志（P0-S3，设计 §4.1）：source_push_log 访问器。
+  // 与 source_edits 独立：锚点行不随回拉清行删除；S4 回滚服务读
+  // anchor_*/revert_*，S5 UI 读 outcome 展示写回记录。全部经 getStatement
+  // 预编译；outcome 四态迁移由写回链（FeishuWriteService）驱动，本层只
+  // 提供原子原语。
+  // ===========================================================================
+
+  private mapSourcePushLogRow(row: Record<string, any>): SourcePushLogRecord {
+    return {
+      id: row.id,
+      objToken: row.obj_token,
+      localRelPath: row.local_rel_path,
+      mode: row.mode,
+      actor: row.actor,
+      preObjEditTime: row.pre_obj_edit_time ?? null,
+      anchorHistoryId: row.anchor_history_id ?? null,
+      anchorHistoryTime: row.anchor_history_time ?? null,
+      anchorExact: row.anchor_exact === 1,
+      anchorError: row.anchor_error ?? null,
+      postRevisionId: row.post_revision_id ?? null,
+      postObjEditTime: row.post_obj_edit_time ?? null,
+      outcome: row.outcome,
+      revertState: row.revert_state ?? null,
+      revertHistoryId: row.revert_history_id ?? null,
+      revertTaskId: row.revert_task_id ?? null,
+      revertError: row.revert_error ?? null,
+      revertedAt: row.reverted_at ?? null,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  /**
+   * 写前落锚点行（outcome='started'，§4.2 步骤 4）。id 形如
+   * sp_<yyyymmddHHMMSS>_<6hex>；同秒多次推送由随机段区分。
+   *
+   * T4b-10：回滚链起步（mode='revert'）可携 revertState:'running'——在
+   * revert 命令发出前就把 cloud_revert_running 互斥围栏落盘（写不进就
+   * 不放行执行：insert 抛错直接失败，零云端调用）；后续 taskId 等关键
+   * 字段持久化失败时围栏也不会丢（行至少保持 running，重启对账收敛）。
+   */
+  insertSourcePushLog(input: {
+    objToken: string;
+    localRelPath: string;
+    mode: 'append' | 'overwrite' | 'revert';
+    actor: SourceEditActor | string;
+    preObjEditTime?: number | string | null;
+    anchorHistoryId?: string | null;
+    anchorHistoryTime?: string | null;
+    anchorExact?: boolean;
+    anchorError?: string | null;
+    /** 仅回滚链起步用：立即初始化互斥态（其他调用方缺省 NULL，行为不变）。 */
+    revertState?: 'running';
+  }): string {
+    const now = new Date();
+    const stamp = [
+      now.getUTCFullYear(), String(now.getUTCMonth() + 1).padStart(2, '0'),
+      String(now.getUTCDate()).padStart(2, '0'),
+      String(now.getUTCHours()).padStart(2, '0'),
+      String(now.getUTCMinutes()).padStart(2, '0'),
+      String(now.getUTCSeconds()).padStart(2, '0'),
+    ].join('');
+    const id = `sp_${stamp}_${Array.from({ length: 6 }, () => '0123456789abcdef'[Math.floor(Math.random() * 16)]).join('')}`;
+    this.getStatement(`
+      INSERT INTO source_push_log
+        (id, obj_token, local_rel_path, mode, actor, pre_obj_edit_time,
+         anchor_history_id, anchor_history_time, anchor_exact, anchor_error,
+         outcome, revert_state, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'started', ?, ?, ?)
+    `).run(
+      id,
+      input.objToken,
+      input.localRelPath,
+      input.mode,
+      input.actor,
+      input.preObjEditTime == null ? null : String(input.preObjEditTime),
+      input.anchorHistoryId ?? null,
+      input.anchorHistoryTime ?? null,
+      input.anchorExact === true ? 1 : 0,
+      input.anchorError ?? null,
+      input.revertState === 'running' ? 'running' : null,
+      now.toISOString(),
+      now.toISOString(),
+    );
+    return id;
+  }
+
+  getSourcePushLog(id: string): SourcePushLogRecord | null {
+    const row = this.getStatement('SELECT * FROM source_push_log WHERE id = ?')
+      .get(id) as Record<string, any> | undefined;
+    return row ? this.mapSourcePushLogRow(row) : null;
+  }
+
+  /** 按 objToken 查最近锚点行（created_at 倒序；§4.3 push-log 路由与 S5 UI 消费）。 */
+  listSourcePushLogs(objToken: string, limit = 20): SourcePushLogRecord[] {
+    return (this.getStatement(`
+      SELECT * FROM source_push_log
+      WHERE obj_token = ?
+      ORDER BY created_at DESC, id DESC
+      LIMIT ?
+    `).all(objToken, Math.max(1, Math.floor(limit))) as Array<Record<string, any>>)
+      .map((row) => this.mapSourcePushLogRow(row));
+  }
+
+  /**
+   * 锚点行状态更新（§4.2 步骤 6/7）：outcome 四态迁移 + 写后 revision /
+   * 回拉后的 synced 值抄录。post* 字段仅在新值非空时覆盖（NULL 保留原值）。
+   */
+  updateSourcePushLog(
+    id: string,
+    patch: {
+      outcome?: 'started' | 'pushed' | 'conflict' | 'failed' | 'unknown';
+      postRevisionId?: string | null;
+      postObjEditTime?: string | null;
+    },
+  ): boolean {
+    const result = this.getStatement(`
+      UPDATE source_push_log
+      SET outcome = COALESCE(?, outcome),
+          post_revision_id = COALESCE(?, post_revision_id),
+          post_obj_edit_time = COALESCE(?, post_obj_edit_time),
+          updated_at = ?
+      WHERE id = ?
+    `).run(
+      patch.outcome ?? null,
+      patch.postRevisionId ?? null,
+      patch.postObjEditTime ?? null,
+      new Date().toISOString(),
+      id,
+    );
+    return result.changes > 0;
+  }
+
+  /**
+   * P0-S3 启动对账（§4.1）：上次进程退出时残留的 started 行置 unknown
+   * ——写回是否落地不确定，不自动判定成败（unknown 不自动重试，交
+   * S5 UI「请对比云端当前」/下一次检测收敛）。返回受影响行数。
+   */
+  markInterruptedSourcePushLogs(): number {
+    const result = this.getStatement(`
+      UPDATE source_push_log
+      SET outcome = 'unknown', updated_at = ?
+      WHERE outcome = 'started'
+    `).run(new Date().toISOString());
+    return result.changes;
+  }
+
+  /**
+   * P0-S4（§4.4）：按 objToken 取 revert_state='running' 的锚点行——
+   * cloud_revert_running 互斥门的共享状态源（CloudHistoryService 新回滚、
+   * FeishuWriteService.push 写回、P0-S9 标题同步同源消费）。
+   */
+  getRunningRevertPushLog(objToken: string): SourcePushLogRecord | null {
+    const row = this.getStatement(`
+      SELECT * FROM source_push_log
+      WHERE obj_token = ? AND revert_state = 'running'
+      ORDER BY created_at DESC, id DESC LIMIT 1
+    `).get(objToken) as Record<string, any> | undefined;
+    return row ? this.mapSourcePushLogRow(row) : null;
+  }
+
+  /** 全部 revert_state='running' 行（P0-S4 启动对账 + 轮询器续查）。 */
+  listRunningRevertPushLogs(): SourcePushLogRecord[] {
+    return (this.getStatement(`
+      SELECT * FROM source_push_log
+      WHERE revert_state = 'running'
+      ORDER BY created_at ASC, id ASC
+    `).all() as Array<Record<string, any>>).map((row) => this.mapSourcePushLogRow(row));
+  }
+
+  /**
+   * P0-S4（§4.4）：锚点行回滚字段更新（revert_state 四态迁移 + task/error/
+   * 完成时间）。与 updateSourcePushLog 同容错：字段仅在新值非空时覆盖
+   *（NULL 保留原值；清态不需要——终态行由 prune 保留策略自然淘汰）。
+   */
+  updateSourcePushLogRevert(
+    id: string,
+    patch: {
+      revertState?: 'running' | 'done' | 'failed' | 'unknown';
+      revertHistoryId?: string | null;
+      revertTaskId?: string | null;
+      revertError?: string | null;
+      revertedAt?: string | null;
+    },
+  ): boolean {
+    const result = this.getStatement(`
+      UPDATE source_push_log
+      SET revert_state = COALESCE(?, revert_state),
+          revert_history_id = COALESCE(?, revert_history_id),
+          revert_task_id = COALESCE(?, revert_task_id),
+          revert_error = COALESCE(?, revert_error),
+          reverted_at = COALESCE(?, reverted_at),
+          updated_at = ?
+      WHERE id = ?
+    `).run(
+      patch.revertState ?? null,
+      patch.revertHistoryId ?? null,
+      patch.revertTaskId ?? null,
+      patch.revertError ?? null,
+      patch.revertedAt ?? null,
+      new Date().toISOString(),
+      id,
+    );
+    return result.changes > 0;
+  }
+
+  /**
+   * 保留策略（§4.1）：每个 objToken 保留最近 keepPerToken 行，超出删最旧；
+   * revert_state='running' 的行跳过（S4 轮询器仍需要它们）。返回删除行数。
+   */
+  pruneSourcePushLogs(keepPerToken = 50): number {
+    const stale = this.getStatement(`
+      SELECT id FROM source_push_log
+      WHERE id NOT IN (
+        SELECT id FROM (
+          SELECT id, ROW_NUMBER() OVER (
+            PARTITION BY obj_token ORDER BY created_at DESC, id DESC
+          ) AS rn
+          FROM source_push_log
+        ) WHERE rn <= ?
+      ) AND COALESCE(revert_state, '') <> 'running'
+    `).all(Math.max(1, Math.floor(keepPerToken))) as Array<{ id: string }>;
+    if (stale.length === 0) return 0;
+    const remove = this.getStatement('DELETE FROM source_push_log WHERE id = ?');
+    for (const row of stale) remove.run(row.id);
+    return stale.length;
+  }
+
+  // ===========================================================================
+  // 安全移出 cloud_moves（P2-S6，设计 P2 §3.3/§3.4/§3.6）：访问器。
+  // 与 source_push_log 同哲学：本层只提供原子原语，状态机迁移由服务层
+  //（CloudMoveService）驱动；互斥门消费 getActiveCloudMove /
+  // getLatestCloudMove。全部经 getStatement 预编译。
+  // ===========================================================================
+
+  private mapCloudMoveRow(row: Record<string, any>): CloudMoveRecord {
+    return {
+      id: row.id,
+      objToken: row.obj_token,
+      wikiNodeToken: row.wiki_node_token,
+      watchedRootId: row.watched_root_id ?? null,
+      title: row.title ?? null,
+      targetFolderToken: row.target_folder_token ?? null,
+      state: row.state,
+      taskId: row.task_id ?? null,
+      error: row.error ?? null,
+      actor: row.actor,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  /**
+   * 落移出起步行（state='pending'，设计 §3.4 步骤 3）。id 形如
+   * mv_<yyyymmddHHMMSS>_<6hex>（与 sp_ 同构；同秒多次由随机段区分）。
+   */
+  insertCloudMove(input: {
+    objToken: string;
+    wikiNodeToken: string;
+    watchedRootId?: string | null;
+    title?: string | null;
+    targetFolderToken?: string | null;
+    actor: string;
+  }): string {
+    const now = new Date();
+    const stamp = [
+      now.getUTCFullYear(), String(now.getUTCMonth() + 1).padStart(2, '0'),
+      String(now.getUTCDate()).padStart(2, '0'),
+      String(now.getUTCHours()).padStart(2, '0'),
+      String(now.getUTCMinutes()).padStart(2, '0'),
+      String(now.getUTCSeconds()).padStart(2, '0'),
+    ].join('');
+    const id = `mv_${stamp}_${Array.from({ length: 6 }, () => '0123456789abcdef'[Math.floor(Math.random() * 16)]).join('')}`;
+    this.getStatement(`
+      INSERT INTO cloud_moves
+        (id, obj_token, wiki_node_token, watched_root_id, title,
+         target_folder_token, state, actor, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+    `).run(
+      id,
+      input.objToken,
+      input.wikiNodeToken,
+      input.watchedRootId ?? null,
+      input.title ?? null,
+      input.targetFolderToken ?? null,
+      input.actor,
+      now.toISOString(),
+      now.toISOString(),
+    );
+    return id;
+  }
+
+  getCloudMove(id: string): CloudMoveRecord | null {
+    const row = this.getStatement('SELECT * FROM cloud_moves WHERE id = ?')
+      .get(id) as Record<string, any> | undefined;
+    return row ? this.mapCloudMoveRow(row) : null;
+  }
+
+  /** 列表（cloud.moves 命令面）：objToken 缺省全量；created_at 倒序。 */
+  listCloudMoves(objToken?: string, limit = 50): CloudMoveRecord[] {
+    const sql = objToken
+      ? `SELECT * FROM cloud_moves WHERE obj_token = ? ORDER BY created_at DESC, id DESC LIMIT ?`
+      : `SELECT * FROM cloud_moves ORDER BY created_at DESC, id DESC LIMIT ?`;
+    const rows = objToken
+      ? this.getStatement(sql).all(objToken, Math.max(1, Math.floor(limit))) as Array<Record<string, any>>
+      : this.getStatement(sql).all(Math.max(1, Math.floor(limit))) as Array<Record<string, any>>;
+    return rows.map((row) => this.mapCloudMoveRow(row));
+  }
+
+  /**
+   * 状态机字段更新（§3.4/§3.6）：state 五态迁移 + task_id/error（新值
+   * 非空时覆盖；清态不需要——终态行留存审计）。
+   */
+  updateCloudMove(
+    id: string,
+    patch: { state?: 'pending' | 'moving' | 'moved' | 'failed' | 'unknown'; taskId?: string | null; error?: string | null },
+  ): boolean {
+    const result = this.getStatement(`
+      UPDATE cloud_moves
+      SET state = COALESCE(?, state),
+          task_id = COALESCE(?, task_id),
+          error = COALESCE(?, error),
+          updated_at = ?
+      WHERE id = ?
+    `).run(
+      patch.state ?? null,
+      patch.taskId ?? null,
+      patch.error ?? null,
+      new Date().toISOString(),
+      id,
+    );
+    return result.changes > 0;
+  }
+
+  /**
+   * cloud_move_running 互斥门的共享状态源（设计 §3.4 门控「无 running 的
+   * 移出」；T4b-05 修订口径）：同一 objToken 存在 pending/moving 行 →
+   * 进行中；存在 unknown 行 → 结果未定，同样持续围栏（超时/不可解析/
+   * 重启对账都可能是「云端仍在执行或已执行」——不因轮询终止而解除）。
+   * 只有权威核对（CloudMoveService.reconcileUnknownMove：真实查询任务
+   * 状态或节点归属）证明未移出（→ failed）后才不再命中本门。与
+   * getRunningRevertPushLog 同风格（消费方：SourceEditService /
+   * FeishuWriteService / CloudHistoryService / CloudMoveService 自身——
+   * 四方共用同一围栏解释，不各自猜测）。
+   */
+  getActiveCloudMove(objToken: string): CloudMoveRecord | null {
+    const row = this.getStatement(`
+      SELECT * FROM cloud_moves
+      WHERE obj_token = ? AND state IN ('pending', 'moving', 'unknown')
+      ORDER BY created_at DESC, id DESC LIMIT 1
+    `).get(objToken) as Record<string, any> | undefined;
+    return row ? this.mapCloudMoveRow(row) : null;
+  }
+
+  /**
+   * 移出后本地语义门（设计 §3.5）：最近一行 state='moved' → 该文档已
+   * 离开受管树（source_moved_out，编辑/写回拒绝）。
+   */
+  getLatestCloudMove(objToken: string): CloudMoveRecord | null {
+    const row = this.getStatement(`
+      SELECT * FROM cloud_moves
+      WHERE obj_token = ?
+      ORDER BY created_at DESC, id DESC LIMIT 1
+    `).get(objToken) as Record<string, any> | undefined;
+    return row ? this.mapCloudMoveRow(row) : null;
+  }
+
+  /** 全部 moving 行（P2-S6 启动对账：有 task_id 续查，无则置 unknown）。 */
+  listMovingCloudMoves(): CloudMoveRecord[] {
+    return (this.getStatement(`
+      SELECT * FROM cloud_moves
+      WHERE state = 'moving'
+      ORDER BY created_at ASC, id ASC
+    `).all() as Array<Record<string, any>>).map((row) => this.mapCloudMoveRow(row));
+  }
+
+  /** 全部 pending 行（P2-S6 启动对账：起步行未完成 → 置 unknown）。 */
+  listPendingCloudMoves(): CloudMoveRecord[] {
+    return (this.getStatement(`
+      SELECT * FROM cloud_moves
+      WHERE state = 'pending'
+      ORDER BY created_at ASC, id ASC
+    `).all() as Array<Record<string, any>>).map((row) => this.mapCloudMoveRow(row));
+  }
+
+  // ===========================================================================
+  // 反向发布 kb_publications（P1-S8，设计 P1 §4.2）
+  // ===========================================================================
+
+  private mapKbPublicationRow(row: Record<string, any>): KbPublicationRecord {
+    return {
+      kbPath: String(row.kb_path),
+      cloudToken: row.cloud_token ?? null,
+      cloudUrl: row.cloud_url ?? null,
+      targetToken: String(row.target_token ?? ''),
+      publishedReleaseId: row.published_release_id ?? null,
+      publishedContentHash: row.published_content_hash ?? null,
+      publishedObjEditTime: row.published_obj_edit_time ?? null,
+      state: String(row.state ?? 'unknown'),
+      warningsJson: row.warnings_json ?? null,
+      lastError: row.last_error ?? null,
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+    };
+  }
+
+  /** 整行 upsert（服务层全量传值；created_at 仅首播保留）。 */
+  upsertKbPublication(row: KbPublicationUpsert): void {
+    const now = new Date().toISOString();
+    this.getStatement(`
+      INSERT INTO kb_publications
+        (kb_path, cloud_token, cloud_url, target_token, published_release_id,
+         published_content_hash, published_obj_edit_time, state,
+         warnings_json, last_error, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(kb_path) DO UPDATE SET
+        cloud_token = excluded.cloud_token,
+        cloud_url = excluded.cloud_url,
+        target_token = excluded.target_token,
+        published_release_id = excluded.published_release_id,
+        published_content_hash = excluded.published_content_hash,
+        published_obj_edit_time = excluded.published_obj_edit_time,
+        state = excluded.state,
+        warnings_json = excluded.warnings_json,
+        last_error = excluded.last_error,
+        updated_at = excluded.updated_at
+    `).run(
+      row.kbPath,
+      row.cloudToken ?? null,
+      row.cloudUrl ?? null,
+      row.targetToken,
+      row.publishedReleaseId ?? null,
+      row.publishedContentHash ?? null,
+      row.publishedObjEditTime ?? null,
+      row.state,
+      row.warningsJson ?? null,
+      row.lastError ?? null,
+      now,
+      now,
+    );
+  }
+
+  getKbPublication(kbPath: string): KbPublicationRecord | null {
+    const row = this.getStatement('SELECT * FROM kb_publications WHERE kb_path = ?')
+      .get(kbPath) as Record<string, any> | undefined;
+    return row ? this.mapKbPublicationRow(row) : null;
+  }
+
+  listKbPublications(): KbPublicationRecord[] {
+    return (this.getStatement('SELECT * FROM kb_publications ORDER BY kb_path')
+      .all() as Array<Record<string, any>>)
+      .map((row) => this.mapKbPublicationRow(row));
+  }
+
+  /**
+   * 已发布云文档 token 全集（构建快照排除面，§4.1 防线 2）。T4b-07：
+   * 排除集合是发布产物**谱系**——当前 cloud_token 与 warnings_json 归档的
+   * previousCloudTokens 全部计入；重新发布（force 新建）后旧 token 即使
+   * 被移入监听树/快捷归档也不得作为构建源（防自我喂养不变量）。
+   */
+  listPublishedCloudTokens(): string[] {
+    const tokens = new Set<string>();
+    const rows = this.getStatement(
+      'SELECT cloud_token, warnings_json FROM kb_publications',
+    ).all() as Array<{ cloud_token: string | null; warnings_json: string | null }>;
+    for (const row of rows) {
+      if (typeof row.cloud_token === 'string' && row.cloud_token.length > 0) {
+        tokens.add(row.cloud_token);
+      }
+      if (typeof row.warnings_json === 'string' && row.warnings_json.length > 0) {
+        try {
+          const parsed = JSON.parse(row.warnings_json) as { previousCloudTokens?: unknown };
+          if (Array.isArray(parsed?.previousCloudTokens)) {
+            for (const token of parsed.previousCloudTokens) {
+              if (typeof token === 'string' && token.length > 0) tokens.add(token);
+            }
+          }
+        } catch {
+          /* 损坏的 warnings_json 不影响当前 cloud_token 的排除 */
+        }
+      }
+    }
+    return [...tokens];
+  }
+
+  /**
+   * P1-S8 启动对账（§4.2/§4.7）：残留 creating 行置 unknown——创建是否
+   * 落地不确定，不自动重建（避免云端重复文档），交人工核对后经 force
+   * 重新发布为新文档。返回受影响行数。
+   */
+  reconcileKbPublicationsCreating(): number {
+    const result = this.getStatement(`
+      UPDATE kb_publications
+      SET state = 'unknown',
+          last_error = '发布中断（服务停止时仍在创建）：请到发布根核对是否已生成文档后，以 force 重新发布为新文档',
+          updated_at = ?
+      WHERE state = 'creating'
+    `).run(new Date().toISOString());
+    return result.changes;
+  }
+
 
   private getCreateTablesDDL(): string {
     return `
@@ -2979,6 +3870,120 @@ export class LocalMapStore {
         updated_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_agent_tasks_session ON agent_tasks(session_id, created_at);
+
+      -- =====================================================================
+      -- 写前锚点日志（P0-S3，lark-cli-newcaps-P0 §4.1）。行生命周期独立于
+      -- source_edits（回拉成功后 source_edits 行被删除，锚点独立留存）；
+      -- revert_* 列由 P0-S4 回滚服务写入。与 applyAdditiveMigrations 的
+      -- 新表 exec 双登记。
+      -- =====================================================================
+      CREATE TABLE IF NOT EXISTS source_push_log (
+        id TEXT PRIMARY KEY,
+        obj_token TEXT NOT NULL,
+        local_rel_path TEXT NOT NULL,
+        mode TEXT NOT NULL CHECK(mode IN ('append','overwrite','revert')),
+        actor TEXT NOT NULL,
+        pre_obj_edit_time TEXT,
+        anchor_history_id TEXT,
+        anchor_history_time TEXT,
+        anchor_exact INTEGER NOT NULL DEFAULT 0,
+        anchor_error TEXT,
+        post_revision_id TEXT,
+        post_obj_edit_time TEXT,
+        outcome TEXT NOT NULL CHECK(outcome IN ('started','pushed','conflict','failed','unknown')),
+        revert_state TEXT,
+        revert_history_id TEXT,
+        revert_task_id TEXT,
+        revert_error TEXT,
+        reverted_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_source_push_log_token ON source_push_log(obj_token, created_at);
+
+      -- =====================================================================
+      -- 反向发布（P1-S8，设计 P1 §4.2）：标准库路径 ↔ 云文档映射与发布
+      -- 状态机。新表：CREATE TABLE IF NOT EXISTS 对旧库同样新建；与
+      -- applyAdditiveMigrations 的新表 exec 双登记。
+      -- =====================================================================
+      CREATE TABLE IF NOT EXISTS kb_publications (
+        kb_path TEXT PRIMARY KEY,
+        cloud_token TEXT,
+        cloud_url TEXT,
+        target_token TEXT NOT NULL,
+        published_release_id TEXT,
+        published_content_hash TEXT,
+        published_obj_edit_time TEXT,
+        state TEXT NOT NULL CHECK(state IN (
+          'creating','published','published_with_warnings','conflict',
+          'failed','unknown','kb_removed','cloud_missing')),
+        warnings_json TEXT,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_kb_publications_cloud ON kb_publications(cloud_token);
+
+      -- =====================================================================
+      -- 引用图（P1-S3，设计 P1 §2.2）：源文档 → 引用目标的出边集合。写入
+      -- 点在 SyncEngine 提交事务内（先删该源旧边再插新边）；源文档行删除
+      -- 时同事务删除出边，作为 target 的边保留（指向已不存在文档是真实
+      -- 信息）。与 applyAdditiveMigrations 的新表 exec 双登记。
+      -- =====================================================================
+      CREATE TABLE IF NOT EXISTS source_references (
+        src_obj_token TEXT NOT NULL,
+        target_token TEXT NOT NULL,
+        target_type TEXT NOT NULL,
+        origin TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        label TEXT,
+        occurrences INTEGER NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (src_obj_token, target_token, origin, kind)
+      );
+      CREATE INDEX IF NOT EXISTS idx_source_references_target ON source_references(target_token);
+
+      -- =====================================================================
+      -- 评论溯源（P2-S4，设计 §5.1）：同步事务内采集 reference_map.comments
+      -- 组。meta 行区分「没有评论」（total=0）与「从未采集」（无行，非
+      -- docx 或未同步过）；comments.tips 存在即 truncated=1（不补全）。
+      -- 评论不进构建输入（不变量 1），仅 raw_comments 只读工具与预览面
+      -- 板消费。与 applyAdditiveMigrations 的新表 exec 双登记。
+      -- =====================================================================
+      CREATE TABLE IF NOT EXISTS source_comments (
+        src_obj_token TEXT NOT NULL,
+        comment_ref TEXT NOT NULL,
+        text TEXT NOT NULL,
+        quote TEXT,
+        author TEXT,
+        created_at_cloud TEXT,
+        solved INTEGER,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (src_obj_token, comment_ref)
+      );
+      CREATE TABLE IF NOT EXISTS source_comment_meta (
+        src_obj_token TEXT PRIMARY KEY,
+        total INTEGER NOT NULL,
+        truncated INTEGER NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      -- P2-S6 安全移出（设计 §3.3；状态机任务书命名，与 initialize() 建
+      -- 表段双登记）：pending/moving/moved/failed/unknown。
+      CREATE TABLE IF NOT EXISTS cloud_moves (
+        id TEXT PRIMARY KEY,
+        obj_token TEXT NOT NULL,
+        wiki_node_token TEXT NOT NULL,
+        watched_root_id TEXT,
+        title TEXT,
+        target_folder_token TEXT,
+        state TEXT NOT NULL CHECK(state IN ('pending','moving','moved','failed','unknown')),
+        task_id TEXT,
+        error TEXT,
+        actor TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_cloud_moves_token ON cloud_moves(obj_token, created_at);
     `;
   }
 }
@@ -2986,6 +3991,94 @@ export class LocalMapStore {
 // ===========================================================================
 // Module-level helpers (no class state, safe to share across instances)
 // ===========================================================================
+
+/** P2-S6：cloud_moves 存储行（snake_case 列的驼峰投射；状态机见建表段注释）。 */
+export interface CloudMoveRecord {
+  id: string;
+  objToken: string;
+  wikiNodeToken: string;
+  watchedRootId: string | null;
+  title: string | null;
+  /** NULL = 个人空间根（设计 §3.3）。 */
+  targetFolderToken: string | null;
+  state: 'pending' | 'moving' | 'moved' | 'failed' | 'unknown';
+  taskId: string | null;
+  error: string | null;
+  actor: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** P1-S3：引用边写入入参（与抽取层 SourceReferenceEdge 字段同名，title ↔ label 列；LMS 不反向依赖 kb/）。 */
+export interface SourceReferenceInsert {
+  targetToken: string;
+  targetType: string;
+  title?: string | null;
+  origin: 'body' | 'refmap';
+  kind: string;
+  occurrences: number;
+}
+
+/** P1-S3：source_references 存储行（snake_case 列的驼峰投射）。 */
+export interface SourceReferenceRow {
+  srcObjToken: string;
+  targetToken: string;
+  targetType: string;
+  label: string | null;
+  origin: 'body' | 'refmap';
+  kind: string;
+  occurrences: number;
+  updatedAt: string;
+}
+
+/** P1-S3：入边行（按目标反查，§2.3）；附源文档元数据（源行已删时为 null）。 */
+export interface IncomingReferenceRow extends SourceReferenceRow {
+  srcTitle: string | null;
+  srcLocalRelPath: string | null;
+}
+
+/** P2-S4：评论写入入参（与解析层 ParsedSourceComment 字段同名；LMS 不反向依赖 kb/）。 */
+export interface SourceCommentInsert {
+  commentRef: string;
+  text: string;
+  quote?: string | null;
+  author?: string | null;
+  createdAtCloud?: string | null;
+  solved?: boolean | null;
+}
+
+/** P2-S4：source_comments 存储行（snake_case 列的驼峰投射；solved 三态 true/false/null）。 */
+export interface SourceCommentRow {
+  srcObjToken: string;
+  commentRef: string;
+  text: string;
+  quote: string | null;
+  author: string | null;
+  createdAtCloud: string | null;
+  solved: boolean | null;
+  updatedAt: string;
+}
+
+/** P2-S4：source_comment_meta 存储行；无行 = 从未采集。 */
+export interface SourceCommentMetaRow {
+  srcObjToken: string;
+  total: number;
+  truncated: boolean;
+  updatedAt: string;
+}
+
+function mapReferenceRow(row: Record<string, unknown>): SourceReferenceRow {
+  return {
+    srcObjToken: String(row.src_obj_token ?? ''),
+    targetToken: String(row.target_token ?? ''),
+    targetType: String(row.target_type ?? 'unknown'),
+    label: typeof row.label === 'string' ? row.label : null,
+    origin: row.origin === 'refmap' ? 'refmap' : 'body',
+    kind: String(row.kind ?? ''),
+    occurrences: Number(row.occurrences) || 0,
+    updatedAt: typeof row.updated_at === 'string' ? row.updated_at : '',
+  };
+}
 
 /**
  * Extract the feishu wiki node token from a wiki URL.
