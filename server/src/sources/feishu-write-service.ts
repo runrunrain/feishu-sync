@@ -18,7 +18,9 @@
  * 时间）不可读 → 拒绝写入（cloud_time_unreadable，保留 dirty，不写不
  * 回拉）——写后回读无法补救写前已覆盖的远端内容，唯一前置防线失效时
  * 不得继续；force + OVERWRITE_CLOUD 仍可越过（显式用户决策）。preview
- * 同语义：不可读 → blocked(cloud_time_unreadable)。
+ * 同语义：不可读 → blocked(cloud_time_unreadable)；T3e-R3-01 起 preview
+ * 接受 {force}（与实际执行同参）——force 时时间门是唯一可越过的
+ * blocker（降为 warning 返回原计划），权限/内容类 blocker 不可越过。
  *
  * append 非幂等、不重试；结果未知（超时/回读校验读不回）→ conflict
  * （last_error_code='push_outcome_unknown'），由用户核对云端后重推。
@@ -201,7 +203,7 @@ export class FeishuWriteService {
   // preview（计划态，不改 source_edits）
   // =========================================================================
 
-  async preview(objToken: string): Promise<{
+  async preview(objToken: string, options?: { force?: boolean }): Promise<{
     mode: 'append' | 'overwrite' | 'blocked';
     blockedReason?: string;
     appendMarkdown?: string;
@@ -248,10 +250,17 @@ export class FeishuWriteService {
     const baseTimeReadable = baseTime != null && Number.isFinite(baseTime);
     // T3b-03：云端时间不可读 → fail-closed（预览同步 blocked；不再按
     //「无前置冲突」放行——三段式回读补救不了写前已覆盖的远端内容）。
+    // T3e-R3-01：时间门是唯一可由显式强推越过的 blocker——preview 携带
+    // force（与实际执行同参）时降为 warning、保留 append/overwrite 计划
+    //（与 pushLocked 的 force 契约一致）；权限/内容类 blocker（write_
+    // disabled/write_scope_missing/no_changes 等）不可越过，语义不变。
+    const force = options?.force === true;
     if (!cloudTimeReadable) {
-      warnings.push('云端 obj_edit_time 不可读：写回已阻断（fail-closed）。请稍后重试，或核对云端后以 force + OVERWRITE_CLOUD 确认覆盖');
+      warnings.push(force
+        ? '云端 obj_edit_time 不可读：按显式强推（force）越过时间门，覆盖前请核对云端可能的并发修改'
+        : '云端 obj_edit_time 不可读：写回已阻断（fail-closed）。请稍后重试，或核对云端后以 force + OVERWRITE_CLOUD 确认覆盖');
     }
-    if (mode !== 'blocked' && (!cloudTimeReadable || !baseTimeReadable)) {
+    if (mode !== 'blocked' && (!cloudTimeReadable || !baseTimeReadable) && !force) {
       mode = 'blocked';
       blockedReason = 'cloud_time_unreadable';
       appendMarkdown = undefined;

@@ -75,7 +75,9 @@ export function agentInternalRoutes(toolService: AgentToolService): Hono {
     }
     const args = body.args && typeof body.args === 'object' ? body.args as Record<string, unknown> : {};
     try {
-      const result = await toolService.executeTool(token, name, args);
+      const result = await toolService.executeTool(token, name, args, {
+        toolCallId: typeof body.toolCallId === 'string' ? body.toolCallId : undefined,
+      });
       return c.json(result);
     } catch (error) {
       const code = (error as { code?: string }).code ?? 'tool_error';

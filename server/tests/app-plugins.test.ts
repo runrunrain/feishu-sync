@@ -85,3 +85,28 @@ describe('应用专属Pi上下文插件', () => {
     expect(fs.readFileSync(path.join(other.generic, 'settings.json'), 'utf8')).toBe(before);
   });
 });
+
+describe('R2-05：frozenSnapshot 原生资源版本一致性', () => {
+  it('nativeRevision 变化 → plugin_snapshot_stale 诚实阻断；一致时返回快照；文件缺失仍 null', () => {
+    const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'app-plugins-r205-'));
+    roots.push(dataRoot);
+    const native = { sources: ['/x/native-a.js'], revision: 'native_rev_a', external: true };
+    const store = new AppPluginStore(dataRoot, undefined, () => native);
+    const snapshot = store.snapshot('work');
+    expect(snapshot.extensionPaths).toEqual(['/x/native-a.js']);
+
+    // 版本一致：按 revision 复用快照，native 路径与冻结时一致
+    const frozen = store.frozenSnapshot('work', snapshot.revision);
+    expect(frozen?.revision).toBe(snapshot.revision);
+    expect(frozen?.extensionPaths).toEqual(['/x/native-a.js']);
+
+    // 插件原生资源变更（更新/增删包）：旧 revision 快照不能装当前资源执行
+    native.revision = 'native_rev_b';
+    native.sources = ['/x/native-b.js'];
+    expect(() => store.frozenSnapshot('work', snapshot.revision))
+      .toThrowError(/plugin_snapshot_stale|原生插件资源已变化/);
+
+    // 未知 revision（快照文件缺失）：既有降级语义（null，不抛）
+    expect(store.frozenSnapshot('work', 'deadbeef00')).toBeNull();
+  });
+});

@@ -365,7 +365,11 @@ async function pullSyncSingleDocument(
 feishuRoutes.post('/api/sources/:objToken/push/preview', async (c) => {
   try {
     const service = createFeishuWriteService(c);
-    return c.json(await service.preview(c.req.param('objToken')));
+    // T3e-R3-01：preview 表达本次执行语义——可选 body {force} 与 push 同参
+    //（缺省/非 JSON 体 → false，向后兼容）。force 只越过时间门
+    //（cloud_time_unreadable 降为 warning），权限/内容 blocker 语义不变。
+    const body = await c.req.json<Record<string, unknown>>().catch(() => ({}) as Record<string, unknown>);
+    return c.json(await service.preview(c.req.param('objToken'), { force: body?.force === true }));
   } catch (error) {
     if (error instanceof Error && error.message === 'dependencies_not_injected') {
       return c.json({ error: 'dependencies_not_injected' }, 500);

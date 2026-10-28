@@ -41,6 +41,24 @@ export interface OpsFillContext {
   config: Config | null;
 }
 
+/**
+ * T3d-05R：server 权威确认值派生计划（source.push 专用）。表静态
+ * confirm 值按参数猜测（allowOverwrite||force），与真实服务按实际
+ * diff 形态（plan.mode）派生的要求不一致——append+allowOverwrite 会被
+ * 猜成 OVERWRITE_CLOUD 而实际需要 PUSH。挂本计划的命令在批准前经
+ * 内部 preview 请求取得权威 push plan，按 plan.mode+force 统一派生确认
+ * 值（批准卡展示与执行注入同一派生值），执行前复核计划未变（批准期间
+ * plan 变化 → 拒执行重新批准）。
+ */
+export interface OpsConfirmPlan {
+  /** 内部预检请求（单步；进程内 app.request 执行，目标路由须只读副作用）。 */
+  previewSpecs(args: Record<string, unknown>): OpsRequestSpec[];
+  /** 由 preview 响应派生确认值；计划不可执行（blocked 等）抛 OpsArgumentError。 */
+  deriveConfirm(previewJson: unknown, args: Record<string, unknown>): string;
+  /** 计划指纹：批准时与执行时分别求值，不一致 → 计划过期重新批准。 */
+  planKey(previewJson: unknown): string;
+}
+
 export interface OpsCommandDef {
   /** 命令名（CLI 子命令点号分层，如 `kb.build`）。 */
   name: string;
@@ -50,6 +68,8 @@ export interface OpsCommandDef {
   request(args: Record<string, unknown>): OpsRequestSpec[];
   /** 需要确认后注入的 body 字段（destructive/remote_write 必填）。 */
   confirm?: { field: string; value: string };
+  /** T3d-05R：server 权威确认值派生（挂载时覆盖 confirm.value 的静态猜测）。 */
+  confirmPlan?: OpsConfirmPlan;
   /** 是否对内部 Agent（app_command，S10）暴露。 */
   agentExposed: boolean;
   stream?: 'sse' | 'long-poll';
@@ -59,7 +79,7 @@ export interface OpsCommandDef {
 /** 命令参数构造错误（禁止路径 / 参数形态非法）；执行层转 400。 */
 export class OpsArgumentError extends Error {
   code: string;
-  constructor(code: 'invalid_args' | 'forbidden_path', message: string) {
+  constructor(code: 'invalid_args' | 'forbidden_path' | string, message: string) {
     super(message);
     this.code = code;
   }
@@ -595,9 +615,32 @@ export const OPS_COMMANDS: readonly OpsCommandDef[] = [
     risk: 'remote_write',
     agentExposed: true,
     // 表内 confirm 值是 CLI --yes 门与 /api/cli/:command 确认门的基线值；
-    // 实际请求体的 confirm 由 request() 按 allowOverwrite/force 派生
-    // （PUSH 或 OVERWRITE_CLOUD），两个值都满足「显式确认后才执行」语义。
+    // app_command 通道由 confirmPlan 在批准前经真实 preview 派生（见
+    // OpsConfirmPlan 注释），不再按参数静态猜测。
     confirm: { field: 'confirm', value: 'PUSH' },
+    confirmPlan: {
+      previewSpecs: (args) => [{
+        method: 'POST',
+        path: `/api/sources/${encodeURIComponent(requireString(args, 'objToken'))}/push/preview`,
+        // T3e-R3-01：preview 与实际执行同参——force 时时间门
+        //（cloud_time_unreadable）降为 warning，计划照常派生 OVERWRITE_CLOUD
+        // 批准卡；权限/内容类 blocker 仍 blocked（deriveConfirm 统一拒绝）。
+        ...(args.force === true ? { body: { force: true } } : {}),
+      }],
+      deriveConfirm: (previewJson, args) => {
+        const plan = (previewJson ?? {}) as { mode?: unknown; blockedReason?: unknown };
+        if (plan.mode !== 'append' && plan.mode !== 'overwrite') {
+          throw new OpsArgumentError(
+            'source_push_blocked',
+            `当前修改不可推送（${typeof plan.blockedReason === 'string' ? plan.blockedReason : String(plan.mode ?? '未知')}），不会发起写回`,
+          );
+        }
+        // 与 FeishuWriteService.pushLocked 同一契约：overwrite 或 force →
+        // OVERWRITE_CLOUD；否则 PUSH（append+allowOverwrite 仍是 PUSH）。
+        return plan.mode === 'overwrite' || args.force === true ? 'OVERWRITE_CLOUD' : 'PUSH';
+      },
+      planKey: (previewJson) => String((previewJson as { mode?: unknown } | null)?.mode ?? ''),
+    },
     params: {
       type: 'object',
       properties: {

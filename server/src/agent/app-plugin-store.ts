@@ -132,6 +132,12 @@ export class AppPluginStore {
    * S6：按 revision 复用不可变插件快照（子任务冻结父会话快照用）。
    * 快照文件内容寻址（snapshot() 只在不存在时写入），直接按 revision
    * 定位；文件缺失（数据目录被清理）返回 null，由调用方降级为不注入快照。
+   *
+   * R2-05：native 资源按该快照记录的 nativeRevision 与当前比对——
+   * 版本变化（插件在任务冻结后被增删改）时旧快照无法忠实重建，抛
+   * plugin_snapshot_stale 让任务显式失败（诚实阻断），不把当前最新
+   * native 资源装进旧 revision 快照。未注入 nativeResources 的实例
+   * （纯文本插件测试形态）无 native 面，不做比对。
    */
   frozenSnapshot(scope: AgentPluginScope, revision: string): AppPluginSnapshot | null {
     const extensionPath = piContextExtensionPath();
@@ -144,7 +150,21 @@ export class AppPluginStore {
     }
     if (!fs.existsSync(file) || fs.statSync(file).size > 512 * 1024) return null;
     void scope; // 快照内容已含 scope，文件存在即内容自洽
+    let frozenNativeRevision: string | null = null;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(file, 'utf-8')) as { nativeRevision?: unknown };
+      frozenNativeRevision = typeof parsed.nativeRevision === 'string' ? parsed.nativeRevision : null;
+    } catch {
+      return null;
+    }
     const native = this.nativeResources?.();
+    if (native && native.revision !== frozenNativeRevision) {
+      throw new ToolError(
+        'plugin_snapshot_stale',
+        `插件快照 ${revision.slice(0, 8)} 的原生插件资源已变化（冻结时 ${frozenNativeRevision ? frozenNativeRevision.slice(0, 8) : '无'} → 当前 ${native.revision.slice(0, 8)}），不能以当前资源执行旧快照任务；请重新派发任务`,
+        409,
+      );
+    }
     return {
       revision,
       path: file,

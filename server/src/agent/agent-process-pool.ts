@@ -366,9 +366,17 @@ export class AgentProcessPool {
   }
 
   /** server close()：终止全部子进程并使后续 reserveSlot 失败。幂等。 */
-  /** 管理插件前回收空闲扩展进程；不关闭进程池本身。 */
+  /**
+   * 管理插件前回收空闲扩展进程；不关闭进程池本身。
+   * R2-05：只回收确为空闲的**会话**进程——task/build 后台进程由各自生命
+   * 周期管理（TaskService 轮结束即 terminate、构建取消链自终），不因
+   * 插件管理被误杀（busy 标记之外的第二道防线）。
+   */
   async retireIdle(): Promise<void> {
-    for (const key of [...this.entries.keys()]) if (!this.busyKeys.has(key)) await this.terminate(key);
+    for (const [key, entry] of [...this.entries]) {
+      if (entry.kind !== 'session') continue;
+      if (!this.busyKeys.has(key)) await this.terminate(key);
+    }
   }
 
   async closeAll(): Promise<void> {

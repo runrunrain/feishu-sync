@@ -93,9 +93,18 @@ export class SessionService extends EventEmitter {
   private readonly runs = new Map<string, ActiveRun>();
   /** T3b-07：停止已请求但尚未 run_end 的会话（abort ACK 窗口标记）。 */
   private readonly abortRequested = new Set<string>();
+  /** T3e-R3-02：会话停止信号源（app_command 批准后异步复核链取消用）。 */
+  private readonly abortSignals = new Map<string, Set<AbortController>>();
   private readonly modelRevisions = new WeakMap<PiRpcProcess, string>();
   private readonly pluginRevisions = new WeakMap<PiRpcProcess, string>();
   private readonly sessionStates = new Map<string, 'starting' | 'streaming'>();
+  /**
+   * T3b-07R：toolCallId → 所属 runId（server 权威轮次归属，从 pi
+   * tool_execution_start 事件记录；有界环形，仅保留最近若干条）。
+   * 旧轮迟到的工具 HTTP 请求携帶旧 toolCallId——据此拒绝跨轮执行。
+   */
+  private readonly toolCallRuns = new Map<string, Map<string, string>>();
+  private static readonly TOOL_CALL_TRACK_LIMIT = 512;
 
   constructor(deps: SessionServiceDeps) {
     super();
@@ -237,6 +246,10 @@ export class SessionService extends EventEmitter {
       }
     }
     this.sseBuffers.delete(id);
+    this.toolCallRuns.delete(id);
+    // T3e-R3-02：会话删除 → 挂起停止信号随会话状态丢弃（不触发——删除
+    // 后工具令牌已回收，复核链不可达）。
+    this.abortSignals.delete(id);
     this.emitSessionState(id, localMapStore);
     // S6：父会话删除 → 其非终态子任务取消（设计 §5.3）
     this.deps.onSessionDeleted?.(id);
@@ -408,10 +421,24 @@ export class SessionService extends EventEmitter {
           this.emitSse(sessionId, 'text_delta', { runId, delta });
         });
         rpc.on('tool_execution_start', (event) => {
+          const toolCallId = String((event as { toolCallId?: unknown }).toolCallId ?? '');
+          // T3b-07R：记录 toolCall 的权威轮次归属（有界，迭代序=插入序）
+          if (toolCallId) {
+            let bucket = this.toolCallRuns.get(sessionId);
+            if (!bucket) {
+              bucket = new Map<string, string>();
+              this.toolCallRuns.set(sessionId, bucket);
+            }
+            bucket.set(toolCallId, runId);
+            if (bucket.size > SessionService.TOOL_CALL_TRACK_LIMIT) {
+              const oldest = bucket.keys().next().value;
+              if (oldest !== undefined) bucket.delete(oldest);
+            }
+          }
           this.emitSse(sessionId, 'tool', {
             runId,
             phase: 'start',
-            callId: String((event as { toolCallId?: unknown }).toolCallId ?? ''),
+            callId: toolCallId,
             toolName: String((event as { toolName?: unknown }).toolName ?? ''),
             argsSummary: summarizeToolArgs(event),
           });
@@ -625,6 +652,9 @@ export class SessionService extends EventEmitter {
     //（abort ACK 最长等待 15s + 2s 兑底，窗口内迟到批准不得再执行）。
     this.abortRequested.add(id);
     this.emit('session_abort', { sessionId: id });
+    // T3e-R3-02：停止请求即触发停止信号——批准后仍挂起的异步复核链
+    //（如 source.push 计划复核 preview）立即按停止处理，不等其返回。
+    this.fireAbortSignals(id);
     const process = this.deps.pool.get(id);
     if (process) {
       await process.abort();
@@ -640,6 +670,51 @@ export class SessionService extends EventEmitter {
   runState(sessionId: string): 'running' | 'aborting' | 'idle' {
     if (this.abortRequested.has(sessionId)) return 'aborting';
     return this.runs.has(sessionId) ? 'running' : 'idle';
+  }
+
+  /** T3b-07R：会话当前可执行轮 runId；无活跃运行返回 null。 */
+  currentRunId(sessionId: string): string | null {
+    return this.runs.get(sessionId)?.runId ?? null;
+  }
+
+  /**
+   * T3e-R3-02：创建会话停止信号（app_command 批准后异步复核链的取消源）。
+   * 停止请求（abort）时触发；与 runState/currentRunId 复核共同关闭
+   *「批准后异步 preview 挂起期间停止仍写入」窗口。信号一次性，触发后
+   * 自动清理；会话删除时随会话状态一并丢弃。
+   */
+  abortSignal(sessionId: string): AbortSignal {
+    const controller = new AbortController();
+    let set = this.abortSignals.get(sessionId);
+    if (!set) {
+      set = new Set();
+      this.abortSignals.set(sessionId, set);
+    }
+    set.add(controller);
+    controller.signal.addEventListener('abort', () => {
+      const current = this.abortSignals.get(sessionId);
+      if (current?.delete(controller) && current.size === 0) {
+        this.abortSignals.delete(sessionId);
+      }
+    }, { once: true });
+    return controller.signal;
+  }
+
+  /** 停止请求：触发并清空该会话全部挂起信号（一次性，自动清理）。 */
+  private fireAbortSignals(sessionId: string): void {
+    const set = this.abortSignals.get(sessionId);
+    if (!set) return;
+    this.abortSignals.delete(sessionId);
+    for (const controller of set) controller.abort();
+  }
+
+  /**
+   * T3b-07R：toolCallId → 所属 runId（server 权威轮次归属）。未知
+   * toolCallId（未被任何运行登记过/已被淘汰）返回 null——调用方按不可
+   * 执行处理。
+   */
+  runOfToolCall(sessionId: string, toolCallId: string): string | null {
+    return this.toolCallRuns.get(sessionId)?.get(toolCallId) ?? null;
   }
 
   hasActiveRuns(): boolean { return this.runs.size > 0; }

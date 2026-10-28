@@ -32,6 +32,8 @@ export interface ApprovalRequestDto {
   risk: OpsRisk;
   argsSummary: string;
   preview?: unknown;
+  /** T3b-07R：批准绑定的服务端权威轮次（发起请求所属 runId）。 */
+  runId: string | null;
   expiresAt: string;
 }
 
@@ -87,6 +89,8 @@ export class ApprovalService {
     risk: OpsRisk;
     argsSummary: string;
     preview?: unknown;
+    /** T3b-07R：绑定服务端权威轮次（toolCallId 所属 runId）；缺省 null。 */
+    runId?: string;
   }): { dto: ApprovalRequestDto; settled: Promise<ApprovalDecision> } {
     const id = `apr_${Date.now().toString(36)}_${crypto.randomBytes(5).toString('hex')}`;
     const dto: ApprovalRequestDto = {
@@ -96,6 +100,7 @@ export class ApprovalService {
       risk: input.risk,
       argsSummary: input.argsSummary,
       ...(input.preview !== undefined ? { preview: input.preview } : {}),
+      runId: input.runId ?? null,
       expiresAt: new Date(Date.now() + this.timeoutMs).toISOString(),
     };
     let resolve!: (decision: ApprovalDecision) => void;

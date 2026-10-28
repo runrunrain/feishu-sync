@@ -70,6 +70,20 @@ const TASK_RESULT_TOOL_CHARS = 20_000;
 /** Workspace 写工具：授予任一则 outputDir 必填并收窄写入根。 */
 const WS_WRITE_TOOLS = new Set(['ws_write', 'ws_edit', 'ws_mkdir']);
 
+/** 任务 id 内嵌的单调序号：同一毫秒内提交的任务按提交序排序（queuePosition
+ * 的 created_at|id 键在闰毫秒内会因随机后缀乱序——T3d 实测导致既有用例
+ * 「取消排队中任务」闪断）。 */
+let taskSequence = 0;
+
+/**
+ * T3e-R3-04：任务 id 序号段（base36 定宽 4 位）——同毫秒下 id 的字符串
+ * 排序与提交次序一致（变长 'z'→'10' 进位会在 ORDER BY id / DTO 排序键
+ * 中逆序）。导出供单测锚定进位边界（z→10、zz→100）。
+ */
+export function taskSeqSegment(sequence: number): string {
+  return sequence.toString(36).padStart(4, '0');
+}
+
 // ===========================================================================
 // 协议解析（导出供测试）
 // ===========================================================================
@@ -128,20 +142,22 @@ export function isOutputDirOverlap(a: string, b: string): boolean {
 }
 
 /**
- * T3b-04：解析子任务写入根。outputDir 非空时必须经父 Workspace 的
- * PathGuard resolveInside(…, 'mkdir')——逐级创建、每级创建后 realpath
- * 复核 containment，拒绝任何把子根锚定到父根之外的路径（含祖先
- * symlink）；返回已 realpath 的子根（冻结为该任务的授权根）。只读任务
- * 返回父根；无 Workspace 返回 undefined。
+ * T3b-04 + R2-02：解析子任务写入根。R2-02 起 workspace 以**任务冻结的
+ * workspaceId 解析出的路径**为准（不再读父会话当前 Workspace）：outputDir
+ * 非空时必须经该 Workspace 的 PathGuard resolveInside(…, 'mkdir')——
+ * 逐级创建、每级创建后 realpath 复核 containment，拒绝任何把子根锚定
+ * 到父根之外的路径（含祖先 symlink）；返回已 realpath 的子根（冻结为
+ * 该任务的授权根）。只读任务返回该 Workspace 根；无 Workspace（discuss
+ * 派发的只读任务）返回 undefined。
  */
 export function resolveTaskWorkspaceRoot(
-  session: TaskParentInfo | null,
+  workspacePath: string | null | undefined,
   outputDir: string | null,
 ): string | undefined {
-  if (!session?.workspacePath) return undefined;
-  if (!outputDir) return session.workspacePath;
+  if (!workspacePath) return undefined;
+  if (!outputDir) return workspacePath;
   try {
-    return resolveInside(session.workspacePath, outputDir, 'mkdir');
+    return resolveInside(workspacePath, outputDir, 'mkdir');
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     throw new ToolError('task_output_dir_invalid', `outputDir 越出 Workspace 授权根，已拒绝派发：${message}`, 403);
@@ -180,6 +196,8 @@ export interface TaskStoreApi {
   }>): void;
   listAgentTasksBySession(sessionId: string): Array<Record<string, unknown>>;
   listAgentTasksByIds(ids: string[]): Array<Record<string, unknown>>;
+  /** R2-05：是否存在非终态（queued/running/blocked）任务（插件管理互斥用）。 */
+  hasActiveAgentTasks(): boolean;
   markInterruptedAgentTasks(): string[];
 }
 
@@ -245,6 +263,14 @@ export class TaskService {
   private readonly deps: TaskServiceDeps;
   /** 每任务当前轮的调度 promise（submit/resume 触发，轮结束移除） */
   private readonly dispatches = new Map<string, Promise<void>>();
+  /**
+   * T3e-R3-03：调度/落库失败任务的本轮禁 kick 标记。读成功/写失败时
+   * 行仍读作 queued，若 finally 复查照常自动补派发，会形成无退避微任务
+   * 循环（acquire/读写/错误日志不停放大）；命中即停止该任务的自动重派
+   * （仅显式 resume 清除），blocked→resume 清理竞态的补派发不受影响
+   * （成功轮不置标记）。
+   */
+  private readonly dispatchFailed = new Set<string>();
   /** 排队等待后台槽位的取消句柄（cancel 时 abort 出队） */
   private readonly cancels = new Map<string, AbortController>();
   /** 运行中的子任务 RPC 进程句柄 */
@@ -373,7 +399,7 @@ export class TaskService {
       }
     }
 
-    const taskId = `t_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`;
+    const taskId = `t_${Date.now().toString(36)}_${taskSeqSegment(taskSequence += 1)}_${crypto.randomBytes(4).toString('hex')}`;
     const now = new Date().toISOString();
     const pluginRevision = this.deps.pluginRevision?.(session.mode) ?? null;
     store.createAgentTask({
@@ -407,7 +433,23 @@ export class TaskService {
     if (this.dispatches.has(taskId)) return;
     const run = this.dispatchRound(store, taskId)
       .catch((error) => console.error('[TaskService] dispatch failed:', error))
-      .finally(() => this.dispatches.delete(taskId));
+      .finally(() => {
+        this.dispatches.delete(taskId);
+        // R2-03：blocked 落库/SSE 已发出但旧 dispatch 仍在本 finally 窗口
+        //（await pool.terminate）时，resume 会把行置回 queued 却被上面的
+        // has 守卫挡住——删除旧条目后原子复查 queued 并补派发（恰好一次：
+        // 同步置位防重入，非 queued 即停，不会循环）。复查失败（如测试
+        // 拆除后 store 不可用）不补派发也不抛出——finally 抛出会让本
+        // promise 链失控（实测：拆除后 SqliteError 循环放大）。
+        try {
+          const current = store.getAgentTask(taskId);
+          if (current && String(current.status) === 'queued' && !this.dispatchFailed.has(taskId)) {
+            this.kickDispatch(store, taskId);
+          }
+        } catch (error) {
+          console.error('[TaskService] re-dispatch check failed:', error);
+        }
+      });
     this.dispatches.set(taskId, run);
   }
 
@@ -427,13 +469,19 @@ export class TaskService {
       slot = await this.deps.pool.acquire('background', { signal: controller.signal });
     } catch {
       // cancel() 已先置 cancelled；其余（池关闭等）→ interrupted（与启动对账同语义）
-      const current = store.getAgentTask(taskId);
-      if (current && String(current.status) === 'queued') {
-        this.finish(store, taskId, {
-          status: 'interrupted',
-          errorCode: 'agent_pool_closed',
-          errorMessage: '进程池不可用，任务未启动',
-        });
+      try {
+        const current = store.getAgentTask(taskId);
+        if (current && String(current.status) === 'queued') {
+          this.finish(store, taskId, {
+            status: 'interrupted',
+            errorCode: 'agent_pool_closed',
+            errorMessage: '进程池不可用，任务未启动',
+          });
+        }
+      } catch (error) {
+        console.error('[TaskService] acquire-failure persist failed:', error);
+        // T3e-R3-03：落库失败（行仍读作 queued）→ 停止自动重派（有限收敛）
+        this.dispatchFailed.add(taskId);
       }
       return;
     } finally {
@@ -448,12 +496,27 @@ export class TaskService {
       const config = this.deps.configProvider();
       if (!config) throw new ToolError('invalid_request', '配置不可用');
       const timeoutMs = Math.max(1, config.agent.orchestration.taskTimeoutMinutes) * 60_000;
-      // T3b-04：outputDir 必须经父 Workspace PathGuard 逐级创建并复核
-      // realpath 仍在父根内（祖先 symlink 等越出父根的路径直接拒绝派发），
-      // 冻结后的子根随 spawn 输入下发，不再用 path.join 授权。
-      const parentSession = this.deps.sessionInfo(String(row.session_id));
+      // T3b-04 + R2-02：outputDir 必须经 PathGuard 逐级创建并复核 realpath
+      // 仍在授权根内（祖先 symlink 等越出根的路径直接拒绝派发），冻结后的
+      // 子根随 spawn 输入下发，不再用 path.join 授权。授权根按**任务冻结
+      // 的 workspaceId** 从当前配置解析（不用父会话当前 Workspace——排队/
+      // blocked 期间父会话切模式或换 Workspace 不改变任务授权；Workspace
+      // 被移除时任务显式失败，不静默转授其他根）。
+      const workspaceId = row.workspace_id != null ? String(row.workspace_id) : null;
+      let workspacePath: string | null = null;
+      if (workspaceId) {
+        const workspace = config.agent.workspaces.find((candidate) => candidate.id === workspaceId) ?? null;
+        if (!workspace) {
+          throw new ToolError(
+            'task_workspace_unavailable',
+            `任务冻结的 Workspace ${workspaceId} 已不存在（可能已被移除），任务无法继续；请重新派发`,
+            403,
+          );
+        }
+        workspacePath = workspace.path;
+      }
       const workspaceRoot = resolveTaskWorkspaceRoot(
-        parentSession,
+        workspacePath,
         row.output_dir != null ? String(row.output_dir) : null,
       );
       const now = new Date().toISOString();
@@ -470,6 +533,10 @@ export class TaskService {
       const spawner = this.deps.spawner ?? ((input: TaskSpawnInput) => this.spawnProcess(input));
       const rpc = await spawner({ task: this.view(store, taskId), prompt, timeoutMs, slot, workspaceRoot });
       this.deps.pool.register(`task:${taskId}`, rpc, 'build', slot);
+      // R2-05：轮运行期间挂起 idle 回收（插件管理 retireIdle 只回收空闲
+      // 会话，但 busy 标记是双保险——任何走到 setBusy 之前/之间的窗口都
+      // 不容任务进程被当作空闲进程终止）。
+      this.deps.pool.setBusy(`task:${taskId}`, true);
       slot = null; // register 已消费预留
       this.processes.set(taskId, rpc);
       // spawn 期间被取消：不再发 prompt，回收进程
@@ -481,15 +548,27 @@ export class TaskService {
       await this.persistSessionFile(store, taskId, rpc);
       await this.processOutcome(store, taskId, rpc, outcome, timeoutMs);
     } catch (error) {
-      // cancel 已先置 cancelled（终态守卫会跳过）；否则按失败落地
+      // cancel 已先置 cancelled（终态守卫会跳过）；否则按失败落地。
+      // finish 自身失败（如测试拆除后 store 不可用）不再抛出——catch 块
+      // 抛出会让本 dispatch promise 链失控（实测 SqliteError 循环放大）。
       const code = error instanceof ToolError ? error.code
         : typeof (error as { code?: unknown })?.code === 'string' ? String((error as { code?: string }).code)
           : 'task_spawn_failed';
       const message = error instanceof Error ? error.message : String(error);
-      this.finish(store, taskId, { status: 'failed', errorCode: code, errorMessage: message.slice(0, 500) });
+      try {
+        this.finish(store, taskId, { status: 'failed', errorCode: code, errorMessage: message.slice(0, 500) });
+      } catch (finishError) {
+        console.error('[TaskService] dispatch failure persist failed:', finishError);
+        // T3e-R3-03：finish 也写不进去（读成功/写持续失败）→ 行仍是
+        // queued；置禁 kick 标记阻止 finally 复查自动重派（否则无界循环）。
+        this.dispatchFailed.add(taskId);
+      }
     } finally {
       slot?.release();
       this.processes.delete(taskId);
+      // R2-05：解除 busy 后再回收（terminate 也会清 busyKeys，此处显式
+      // 成对，避免任何路径下残留 busy 标记）。
+      this.deps.pool.setBusy(`task:${taskId}`, false);
       // 每轮结束即回收子任务进程（blocked 也不例外）：槽位还给共享配额，
       // resume 重新 acquire + 同 --session-id 重建（JSONL 上下文延续）。
       await this.deps.pool.terminate(`task:${taskId}`).catch(() => undefined);
@@ -795,14 +874,33 @@ export class TaskService {
     return rows.map((row) => this.toDto(store, row, 'tool'));
   }
 
-  async cancel(store: TaskStoreApi, taskId: string): Promise<AgentTaskDto> {
+  /**
+   * R2-01：归属校验——内部工具（task_resume/task_cancel）必须传调用方会话
+   * id；不匹配 → 403（任何状态修改、结果返回与调度之前）。desktop 任务
+   * 面板入口不传（独立的全局授权契约：desktop token 鉴权）。
+   */
+  private assertOwnership(row: Record<string, unknown>, callerSessionId: string | undefined): void {
+    if (callerSessionId === undefined) return;
+    if (String(row.session_id) !== callerSessionId) {
+      throw new ToolError(
+        'task_not_owned_by_session',
+        `任务 ${String(row.id)} 不属于当前会话（属于 ${String(row.session_id)}），无权操作`,
+        403,
+      );
+    }
+  }
+
+  async cancel(store: TaskStoreApi, taskId: string, options?: { callerSessionId?: string }): Promise<AgentTaskDto> {
     const row = store.getAgentTask(taskId);
     if (!row) throw new ToolError('task_not_found', `任务不存在: ${taskId}`, 404);
+    this.assertOwnership(row, options?.callerSessionId);
     if (AGENT_TASK_TERMINAL_STATUSES.has(String(row.status) as AgentTaskStatus)) {
       throw new ToolError('task_not_active', `任务已结束（${String(row.status)}），不能取消`, 409);
     }
     // 排队等待者出队；运行中进程 abort；两者竞态由终态守卫收敛
     this.cancels.get(taskId)?.abort();
+    // T3e-R3-03：终态清理禁 kick 标记（不再调度的任务不占内存标记）
+    this.dispatchFailed.delete(taskId);
     store.updateAgentTask(taskId, {
       status: 'cancelled',
       errorCode: null,
@@ -817,9 +915,15 @@ export class TaskService {
   }
 
   /** blocked → 用户作答 → queued（重新调度；设计 §5.3 resume 边）。 */
-  resume(store: TaskStoreApi, taskId: string, message: string): AgentTaskDto {
+  resume(
+    store: TaskStoreApi,
+    taskId: string,
+    message: string,
+    options?: { callerSessionId?: string },
+  ): AgentTaskDto {
     const row = store.getAgentTask(taskId);
     if (!row) throw new ToolError('task_not_found', `任务不存在: ${taskId}`, 404);
+    this.assertOwnership(row, options?.callerSessionId);
     if (String(row.status) !== 'blocked') {
       throw new ToolError('task_not_blocked', `仅 blocked 任务可作答（当前 ${String(row.status)}）`, 409);
     }
@@ -834,6 +938,8 @@ export class TaskService {
       errorMessage: null,
       updatedAt: new Date().toISOString(),
     });
+    // T3e-R3-03：显式作答清除禁 kick 标记（故障后唯一的显式恢复入口）。
+    this.dispatchFailed.delete(taskId);
     this.emitUpdate(store, taskId);
     this.kickDispatch(store, taskId);
     return this.get(store, taskId);
@@ -885,5 +991,14 @@ export class TaskService {
     const ids = store.markInterruptedAgentTasks();
     for (const id of ids) this.emitUpdate(store, id);
     return ids;
+  }
+
+  /**
+   * R2-05：是否存在非终态（queued/running/blocked）任务。插件管理
+   * （install/update/remove/toggle）以此作互斥：有排队/运行/等待作答的
+   * 任务时拒绝 plugin_busy，防止 retireIdle/快照失效波及任务进程。
+   */
+  hasPendingWork(store: TaskStoreApi): boolean {
+    return store.hasActiveAgentTasks();
   }
 }

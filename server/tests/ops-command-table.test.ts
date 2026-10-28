@@ -190,6 +190,23 @@ describe('source.* 命令（S13 登记）', () => {
     expect((forced.body as Record<string, unknown>).confirm).toBe('OVERWRITE_CLOUD');
     expect((forced.body as Record<string, unknown>).force).toBe(true);
   });
+
+  it('T3e-R3-01：source.push confirmPlan previewSpecs 与实际执行同参（force 时 preview body 携带 force）', () => {
+    const def = findOpsCommand('source.push')!;
+    // 非 force：preview 不带 body（路由缺省 force=false，向后兼容）
+    const plain = def.confirmPlan!.previewSpecs({ objToken: 'tokA' });
+    expect(plain).toEqual([{ method: 'POST', path: '/api/sources/tokA/push/preview' }]);
+    // force：preview 请求体携带 force——服务端时间门降为 warning，
+    // 批准卡可派生 OVERWRITE_CLOUD（见 source-push 全链测试）
+    const forced = def.confirmPlan!.previewSpecs({ objToken: 'tokA', force: true });
+    expect(forced[0].body).toEqual({ force: true });
+    // force 不可越过权限/内容类 blocker：preview 仍 blocked 时派生一律拒绝
+    expect(() => def.confirmPlan!.deriveConfirm(
+      { mode: 'blocked', blockedReason: 'write_scope_missing' }, { force: true },
+    )).toThrowError(/不可推送/);
+    // force + 可行计划（时间门已降为 warning）→ OVERWRITE_CLOUD
+    expect(def.confirmPlan!.deriveConfirm({ mode: 'append' }, { force: true })).toBe('OVERWRITE_CLOUD');
+  });
 });
 
 describe('config.set 禁止路径', () => {

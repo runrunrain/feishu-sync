@@ -202,6 +202,17 @@ export class VisionDescriber {
     const unavailable = (reason: ImageUnavailableReason, message?: string): ImageDescription => ({
       src, imageHash: '', state: 'unavailable', reason, ...(message ? { message } : {}),
     });
+    // R2-06：stat 先行——超限单图不读入内存即拒（读取后复核先保留作竞态兑底）
+    const maxBytes = Math.min(vision.maxImageBytes, 20 * 1024 * 1024);
+    let size = -1;
+    try {
+      size = fs.statSync(file).size;
+    } catch {
+      return unavailable('missing_file', `无法读取图片文件：${file}`);
+    }
+    if (size > maxBytes) {
+      return unavailable('too_large', `图片 ${size} 字节超出上限 ${vision.maxImageBytes}`);
+    }
     let bytes: Buffer;
     try {
       bytes = fs.readFileSync(file);
@@ -211,7 +222,7 @@ export class VisionDescriber {
     const imageHash = crypto.createHash('sha256').update(bytes).digest('hex');
     const mime = sniffImageMime(bytes);
     if (!mime) return { src, imageHash, state: 'unavailable', reason: 'unsupported_format' };
-    if (bytes.length > Math.min(vision.maxImageBytes, 20 * 1024 * 1024)) {
+    if (bytes.length > maxBytes) {
       return { src, imageHash, state: 'unavailable', reason: 'too_large', message: `图片 ${bytes.length} 字节超出上限 ${vision.maxImageBytes}` };
     }
     const context = await this.resolveContext();
@@ -231,7 +242,14 @@ export class VisionDescriber {
     return { src, imageHash, state: 'unavailable', reason: 'vision_failed', message: result.errorMessage };
   }
 
-  /** 批量：缓存命中不计 maxImagesPerBuild；未缓存超出配额的部分标 limit。 */
+  /**
+   * 批量：缓存命中不计 maxImagesPerBuild；未缓存超出配额的部分标 limit。
+   *
+   * R2-06：内存有界——先 stat 尺寸（超限单图不读即拒），逐图读取→哈希→
+   * 查缓存（命中即释放字节，不保留）；仅配额内未缓存图保留 bytes 进入
+   * 并发描述队列；配额截断后不再读取剩余文件（直接标 limit），在途字节
+   * 上限 = quota × maxImageBytes，不随全工作集无界增长。
+   */
   async describeMany(
     items: Array<{ file: string; src: string }>,
     opts: { signal: AbortSignal; onProgress: (p: { done: number; total: number }) => void },
@@ -243,10 +261,31 @@ export class VisionDescriber {
     let done = 0;
     const total = items.length;
     const progress = () => opts.onProgress({ done, total });
+    const quota = Math.max(0, Math.min(vision.maxImagesPerBuild, 5000));
+    const maxBytes = Math.min(vision.maxImageBytes, 20 * 1024 * 1024);
 
-    // 第一遍：本地检查（文件/格式/大小/缓存）——不触网
+    // 第一遍：本地检查（stat 尺寸/文件/格式/缓存）——不触网、不超配额读满
     const pending: Array<{ file: string; src: string; bytes: Buffer; imageHash: string; mime: VisionImageMime }> = [];
     for (const item of items) {
+      // 配额已满：剩余未缓存图不再读文件（读到的字节也不保留），直接标 limit
+      if (context && pending.length >= quota) {
+        results.set(item.src, { src: item.src, imageHash: '', state: 'unavailable', reason: 'limit' });
+        done += 1;
+        continue;
+      }
+      let size = -1;
+      try {
+        size = fs.statSync(item.file).size;
+      } catch {
+        results.set(item.src, { src: item.src, imageHash: '', state: 'unavailable', reason: 'missing_file' });
+        done += 1;
+        continue;
+      }
+      if (size > maxBytes) {
+        results.set(item.src, { src: item.src, imageHash: '', state: 'unavailable', reason: 'too_large', message: `图片 ${size} 字节超出上限 ${vision.maxImageBytes}` });
+        done += 1;
+        continue;
+      }
       let bytes: Buffer;
       try {
         bytes = fs.readFileSync(item.file);
@@ -262,7 +301,7 @@ export class VisionDescriber {
         done += 1;
         continue;
       }
-      if (bytes.length > Math.min(vision.maxImageBytes, 20 * 1024 * 1024)) {
+      if (bytes.length > maxBytes) { // stat/读取竞态兑底
         results.set(item.src, { src: item.src, imageHash, state: 'unavailable', reason: 'too_large' });
         done += 1;
         continue;
@@ -270,32 +309,27 @@ export class VisionDescriber {
       if (context) {
         const cached = this.readCache(imageHash, context.modelKey);
         if (cached) {
+          // 命中即释放字节（不进 pending，不占配额）
           results.set(item.src, { src: item.src, imageHash, state: 'cached', text: cached.text });
           done += 1;
           continue;
         }
+      } else {
+        // 未启用：逐图分类但不保留字节（内存有界），全部 vision_unconfigured
+        results.set(item.src, { src: item.src, imageHash, state: 'unavailable', reason: 'vision_unconfigured' });
+        done += 1;
+        continue;
       }
       pending.push({ file: item.file, src: item.src, bytes, imageHash, mime });
     }
     progress();
 
+    // 未启用：第一遍已逐图标 vision_unconfigured（不保留字节），无描述队列
     if (!context) {
-      for (const item of pending) {
-        results.set(item.src, { src: item.src, imageHash: item.imageHash, state: 'unavailable', reason: 'vision_unconfigured' });
-        done += 1;
-      }
-      progress();
       return results;
     }
 
-    // 未缓存超出配额 → limit（缓存命中不计入配额）
-    const quota = Math.max(0, Math.min(vision.maxImagesPerBuild, 5000));
-    const toDescribe = pending.slice(0, quota);
-    for (const item of pending.slice(quota)) {
-      results.set(item.src, { src: item.src, imageHash: item.imageHash, state: 'unavailable', reason: 'limit' });
-      done += 1;
-    }
-    progress();
+    const toDescribe = pending; // 已在第一遍截断至 quota 内
 
     // 并发受限的远端描述（worker pool）
     const concurrency = Math.max(1, Math.min(vision.concurrency, 8));

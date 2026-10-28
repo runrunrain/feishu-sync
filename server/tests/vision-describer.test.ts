@@ -10,7 +10,7 @@
  *   - apiKey 绝不出现在任何输出
  */
 
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -276,6 +276,55 @@ describe('VisionDescriber.describeMany', () => {
     const fileA = writeImage(root, 'a.png', TINY_PNG);
     const results = await describer.describeMany([{ file: fileA, src: 'images/a' }], { signal: new AbortController().signal, onProgress: () => {} });
     expect(results.get('images/a')).toMatchObject({ state: 'unavailable', reason: 'vision_unconfigured' });
+  });
+
+  it('R2-06：大量未缓存图 + 小配额 → 读取文件数 ≤ quota（quota 截断后不再读取剩余文件）', async () => {
+    const fixture = await fixtureWithCounter();
+    const root = newTmpRoot();
+    const describer = new VisionDescriber({
+      dataRoot: root,
+      config: () => makeConfig(fixture.port, { maxImagesPerBuild: 3, concurrency: 2 }),
+    });
+    // 10 张互不相同的合法 PNG（IEND 后拖尾被解析器忽略，字节不同即不同 hash）
+    const files = Array.from({ length: 10 }, (_, index) =>
+      writeImage(root, `img-${index}.png`, Buffer.concat([TINY_PNG, Buffer.from([index, 0x00, 0x01])])));
+    const readSpy = vi.spyOn(fs, 'readFileSync');
+    try {
+      const results = await describer.describeMany(
+        files.map((file, index) => ({ file, src: `images/${index}` })),
+        { signal: new AbortController().signal, onProgress: () => {} },
+      );
+      // 图片文件读取次数（排除缓存文件读取）≤ 配额 3：配额满后剩余文件不再读入内存
+      const imageReads = readSpy.mock.calls
+        .map(([readPath]) => String(readPath))
+        .filter((readPath) => readPath.startsWith(root) && !readPath.includes('vision-cache'))
+        .length;
+      expect(imageReads).toBeLessThanOrEqual(3);
+      expect([...results.values()].filter((item) => item.state === 'described')).toHaveLength(3);
+      expect([...results.values()].filter((item) => item.reason === 'limit')).toHaveLength(7);
+      expect(fixture.count()).toBe(3);
+    } finally {
+      readSpy.mockRestore();
+    }
+  });
+
+  it('R2-06：stat 先行——超限单图不读入内存即拒（describeOne/describeMany 同口径）', async () => {
+    const fixture = await fixtureWithCounter();
+    const root = newTmpRoot();
+    // maxImageBytes=8：TINY_PNG（70B）超限，应被 stat 直接拒绝
+    const describer = new VisionDescriber({ dataRoot: root, config: () => makeConfig(fixture.port, { maxImageBytes: 8 }) });
+    const big = writeImage(root, 'big.png', TINY_PNG);
+    const readSpy = vi.spyOn(fs, 'readFileSync');
+    try {
+      const one = await describer.describeOne(big, 'images/big');
+      expect(one.reason).toBe('too_large');
+      const batch = await describer.describeMany([{ file: big, src: 'images/big2' }], { signal: new AbortController().signal, onProgress: () => {} });
+      expect(batch.get('images/big2')?.reason).toBe('too_large');
+      expect(readSpy.mock.calls.filter(([readPath]) => String(readPath).endsWith('big.png'))).toHaveLength(0);
+      expect(fixture.count()).toBe(0);
+    } finally {
+      readSpy.mockRestore();
+    }
   });
 });
 

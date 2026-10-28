@@ -246,7 +246,11 @@ export async function buildServer(options: CreateServerOptions = {}) {
   const piPlugins: PiPluginService = new PiPluginService({
     dataRoot: agentDataRoot, resolver: runtimeResolver,
     agentConfig: () => configManager.getConfig()!.agent,
-    running: (): boolean => sessionService.hasActiveRuns() || kbBuildService.hasActiveRun(),
+    // R2-05：插件管理互斥纳入后台任务——会话/构建之外，queued/running/
+    // blocked 的编排任务也算活跃（任务进程不标 busy 的窗口与冻结快照都
+    // 受插件变更影响），有任务时 plugin_busy 拒绝。
+    running: (): boolean => sessionService.hasActiveRuns() || kbBuildService.hasActiveRun()
+      || (tasks.service?.hasPendingWork(localMapStore) ?? false),
     retireIdle: () => agentPool.retireIdle(),
   });
   await piPlugins.refresh().catch(() => { console.warn('[server] Pi插件资源暂不可用，可在设置中刷新；其他功能继续启动'); });
@@ -375,6 +379,12 @@ export async function buildServer(options: CreateServerOptions = {}) {
     configProvider: () => configManager.getConfig(),
     // T3b-07：批准后、执行前复核会话运行状态（aborting/idle 不执行）
     sessionRunState: (sessionId) => sessionService.runState(sessionId),
+    // T3b-07R：工具请求与批准绑定 server 权威轮次（toolCallId 所属 runId
+    // 必须等于会话当前可执行轮；跨轮迟到请求拒绝，旧轮批准不被新轮洗白）
+    toolCallRun: (sessionId, toolCallId) => sessionService.runOfToolCall(sessionId, toolCallId),
+    currentRunId: (sessionId) => sessionService.currentRunId(sessionId),
+    // T3e-R3-02：停止信号（批准后异步复核链取消源；abort 时触发）
+    sessionAbortSignal: (sessionId) => sessionService.abortSignal(sessionId),
   }));
   sessionService.on('sse', ({ sessionId, event }) => {
     if (event === 'run_end') approvalService.cancelForSession(sessionId);

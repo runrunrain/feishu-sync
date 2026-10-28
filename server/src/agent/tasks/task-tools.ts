@@ -126,11 +126,14 @@ export function taskToolFamily(deps: { service: TaskService; store: TaskStoreApi
         spec: TASK_RESUME_SPEC,
         runKinds: ['discuss', 'work'],
         execute: (context, args) => {
-          requireParentSession(context);
+          // R2-01：消费 requireParentSession 的调用方会话 id——resume 前校验
+          // 任务归属（跨会话 403，零调度零写入）。
+          const sessionId = requireParentSession(context);
           return jsonString(deps.service.resume(
             deps.store,
             requireString(args, 'taskId', 1, 128),
             requireString(args, 'message', 1, 20_000),
+            { callerSessionId: sessionId },
           ));
         },
       },
@@ -138,8 +141,13 @@ export function taskToolFamily(deps: { service: TaskService; store: TaskStoreApi
         spec: TASK_CANCEL_SPEC,
         runKinds: ['discuss', 'work'],
         execute: async (context, args) => {
-          requireParentSession(context);
-          return jsonString(await deps.service.cancel(deps.store, requireString(args, 'taskId', 1, 128)));
+          // R2-01：同上——跨会话取消/读取结果一律 403。
+          const sessionId = requireParentSession(context);
+          return jsonString(await deps.service.cancel(
+            deps.store,
+            requireString(args, 'taskId', 1, 128),
+            { callerSessionId: sessionId },
+          ));
         },
       },
     ],

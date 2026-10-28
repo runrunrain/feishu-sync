@@ -21,6 +21,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { EventEmitter } from 'node:events';
 import { Hono } from 'hono';
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { LocalMapStore } from '../src/modules/local-map-store.js';
@@ -28,6 +29,16 @@ import { LarkCliClient, LarkCliError } from '../src/modules/lark-cli-client.js';
 import { LarkCliManager } from '../src/modules/lark-cli-manager.js';
 import { SourceEditService } from '../src/sources/source-edit-service.js';
 import { FeishuWriteService, FeishuWriteError } from '../src/sources/feishu-write-service.js';
+import { AgentToolService } from '../src/agent/agent-tool-service.js';
+import { ApprovalService } from '../src/agent/approvals/approval-service.js';
+import { SessionService } from '../src/agent/session-service.js';
+import type { SessionStoreApi } from '../src/agent/session-service.js';
+import { AgentProcessPool } from '../src/agent/agent-process-pool.js';
+import { PiRuntimeResolver } from '../src/agent/runtime-resolver.js';
+import { modelRevision } from '../src/agent/model-revision.js';
+import type { PiRpcProcess } from '../src/agent/pi-rpc-process.js';
+import type { Config } from '../src/types/index.js';
+import { createOpsToolFamily } from '../src/agent/tools/app-command-family.js';
 import {
   normalizeForCompare,
   escapeLiteralAngleBracketsForWrite,
@@ -1174,5 +1185,464 @@ describe('LarkCliManager.startDeviceAuth — scopeSet read/write', () => {
     expect(session.requestedScopes).toEqual(['wiki:node:retrieve', 'offline_access', 'docx:document:write_only']);
     const scopeArg = execFileMock.mock.calls[0][1].at(-1);
     expect(scopeArg).toBe('wiki:node:retrieve offline_access docx:document:write_only');
+  });
+});
+
+// ===========================================================================
+// F. T3d-05R：app_command source.push → 真实 feishu 路由 → FeishuWriteService
+//    全链（append / overwrite / force / append+allowOverwrite 四态 + 计划过期）
+// ===========================================================================
+
+describe('T3d-05R：app_command source.push 确认值按真实计划派生（真实路由全链）', () => {
+  let prevHome: string | undefined;
+
+  beforeEach(() => {
+    prevHome = process.env.FEISHU_SYNC_HOME;
+  });
+
+  afterEach(() => {
+    if (prevHome === undefined) delete process.env.FEISHU_SYNC_HOME;
+    else process.env.FEISHU_SYNC_HOME = prevHome;
+  });
+
+  /** 真实 feishuRoutes + 真实 ApprovalService + ops 工具族（进程内转发）。 */
+  function appCommandEnv(fx: Fixture) {
+    const hono = makeApp({
+      larkCliClient: fx.lark,
+      larkCliManager: {},
+      configManager: { getConfig: () => ({ knowledgeBaseRoot: fx.kbRoot, feishuWrite: { enabled: true } }), load: async () => ({}) },
+      localMapStore: fx.store,
+      kbBuildService: { activeBuild: () => null },
+    });
+    process.env.FEISHU_SYNC_HOME = fx.dataRoot;
+    const approvals = new ApprovalService({ dataRoot: fx.dataRoot, timeoutMs: 8_000 });
+    const toolService = new AgentToolService({ dataRoot: fx.dataRoot, documentsProvider: () => [] });
+    toolService.registerToolFamily(createOpsToolFamily({
+      approvals,
+      getApp: () => hono,
+      desktopToken: 'stub-desktop-token',
+      configProvider: () => null,
+    }));
+    const token = toolService.createRunContext({
+      runKind: 'work', sessionId: 's_t3d05', outputRoot: os.tmpdir(), knowledgeBaseRoot: fx.kbRoot,
+    }).token;
+    return {
+      approvals,
+      token,
+      runPush: (args: Record<string, unknown>) =>
+        toolService.executeTool(token, 'app_command', { command: 'source.push', args }),
+    };
+  }
+
+  /** 发起 push → 等待批准卡 → 断言派生确认值。 */
+  async function pendingPush(env: ReturnType<typeof appCommandEnv>, args: Record<string, unknown>) {
+    const pending = env.runPush(args);
+    for (let i = 0; i < 50; i += 1) {
+      if (env.approvals.listPending('s_t3d05').length > 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    const [dto] = env.approvals.listPending('s_t3d05');
+    expect(dto).toBeDefined();
+    return { pending, dto };
+  }
+
+  it('append：确认值 PUSH；批准 → 真实服务以 append 执行成功', async () => {
+    const fx = makeFixture();
+    try {
+      await editBody(fx, '# 测试文档\n\n正文基线 ALPHA。\n路由追加段\n');
+      const env = appCommandEnv(fx);
+      const { pending, dto } = await pendingPush(env, { objToken: OBJ });
+      expect(dto.risk).toBe('remote_write');
+      expect((dto.preview as { confirmValue?: string }).confirmValue).toBe('PUSH');
+      env.approvals.decide('s_t3d05', dto.id, 'approve');
+      const result = await pending;
+      expect(result.details).toMatchObject({ command: 'source.push' });
+      expect(fx.lark.calls.some((call) => call.op === 'append')).toBe(true);
+      expect(fx.lark.calls.some((call) => call.op === 'overwrite')).toBe(false);
+      const row = fx.store.getSourceEdit(OBJ);
+      expect(row === null || row.state === 'pushed').toBe(true);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it('append + allowOverwrite=true（回归）：确认值仍按真实计划派生为 PUSH → 执行成功', async () => {
+    const fx = makeFixture();
+    try {
+      await editBody(fx, '# 测试文档\n\n正文基线 ALPHA。\n路由追加段\n');
+      const env = appCommandEnv(fx);
+      const { pending, dto } = await pendingPush(env, { objToken: OBJ, allowOverwrite: true });
+      // diting T3b-05R：旧实现按参数猜 OVERWRITE_CLOUD，真实服务按 append
+      // 要求 PUSH → confirmation_required 400。现按权威 preview 派生。
+      expect((dto.preview as { confirmValue?: string }).confirmValue).toBe('PUSH');
+      env.approvals.decide('s_t3d05', dto.id, 'approve');
+      await pending;
+      expect(fx.lark.calls.some((call) => call.op === 'append')).toBe(true);
+      expect(fx.lark.calls.some((call) => call.op === 'overwrite')).toBe(false);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it('overwrite：确认值 OVERWRITE_CLOUD；批准 → 真实服务以 overwrite 执行', async () => {
+    const fx = makeFixture();
+    try {
+      // 修改既有内容（非纯追加）→ 真实计划 = overwrite；回读校验返回预期正文
+      const overwritten = '# 测试文档\n\n正文基线 BETA（已改写）。\n';
+      await editBody(fx, overwritten);
+      (fx.lark as unknown as { __bodyProvider: (() => string) | null }).__bodyProvider = () => overwritten;
+      const env = appCommandEnv(fx);
+      const { pending, dto } = await pendingPush(env, { objToken: OBJ, allowOverwrite: true });
+      expect((dto.preview as { confirmValue?: string }).confirmValue).toBe('OVERWRITE_CLOUD');
+      env.approvals.decide('s_t3d05', dto.id, 'approve');
+      await pending;
+      expect(fx.lark.calls.some((call) => call.op === 'overwrite')).toBe(true);
+      expect(fx.lark.calls.some((call) => call.op === 'append')).toBe(false);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it('force=true（append 形态）：确认值 OVERWRITE_CLOUD（与真实服务同契约）→ 执行成功', async () => {
+    const fx = makeFixture();
+    try {
+      await editBody(fx, '# 测试文档\n\n正文基线 ALPHA。\n路由追加段\n');
+      const env = appCommandEnv(fx);
+      const { pending, dto } = await pendingPush(env, { objToken: OBJ, force: true });
+      expect((dto.preview as { confirmValue?: string }).confirmValue).toBe('OVERWRITE_CLOUD');
+      env.approvals.decide('s_t3d05', dto.id, 'approve');
+      await pending;
+      // force 不改变执行形态：append 计划仍以 append 执行
+      expect(fx.lark.calls.some((call) => call.op === 'append')).toBe(true);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it('计划过期：批准期间 append→overwrite → approval_plan_expired，零写入', async () => {
+    const fx = makeFixture();
+    try {
+      await editBody(fx, '# 测试文档\n\n正文基线 ALPHA。\n路由追加段\n');
+      const env = appCommandEnv(fx);
+      const { pending, dto } = await pendingPush(env, { objToken: OBJ });
+      expect((dto.preview as { confirmValue?: string }).confirmValue).toBe('PUSH');
+      // 批准前真实计划变化（用户把修改改成覆盖形态）
+      await editBody(fx, '# 测试文档\n\n正文基线 BETA（已改写）。\n');
+      env.approvals.decide('s_t3d05', dto.id, 'approve');
+      await expect(pending).rejects.toMatchObject({ code: 'approval_plan_expired', status: 409 });
+      // 零写入：lark 写方法未被调用，本地修改仍保留
+      expect(fx.lark.calls.some((call) => call.op === 'append' || call.call === 'overwrite')).toBe(false);
+      expect(fx.store.getSourceEdit(OBJ)?.state).toBe('dirty');
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it('R3-01：metas 不可读（时间门）——非 force：blocked 无批准卡；force：OVERWRITE_CLOUD 批准卡并可执行', async () => {
+    const fx = makeFixture({
+      larkOverrides: {
+        getDocumentMetas: async () => { throw new Error('drive metas unavailable'); },
+      },
+    });
+    try {
+      await editBody(fx, '# 测试文档\n\n正文基线 ALPHA。\n路由追加段\n');
+      const env = appCommandEnv(fx);
+      // 对照：非 force——preview 不带 force，fail-closed 时间门 → 计划
+      // blocked(cloud_time_unreadable)，不产生批准卡，直接工具错误（零写入）
+      await expect(env.runPush({ objToken: OBJ })).rejects.toMatchObject({
+        code: 'source_push_blocked',
+        status: 400,
+      });
+      expect(env.approvals.listPending('s_t3d05')).toHaveLength(0);
+      expect(fx.lark.calls.some((call) => call.op === 'append' || call.op === 'overwrite')).toBe(false);
+      // force：preview 与实际执行同参——时间门降为 warning，append 计划
+      // 照常 → OVERWRITE_CLOUD 批准卡 → 批准 → 真实服务以 append 执行
+      const { pending, dto } = await pendingPush(env, { objToken: OBJ, force: true });
+      expect((dto.preview as { confirmValue?: string }).confirmValue).toBe('OVERWRITE_CLOUD');
+      env.approvals.decide('s_t3d05', dto.id, 'approve');
+      await pending;
+      expect(fx.lark.calls.some((call) => call.op === 'append')).toBe(true);
+      const row = fx.store.getSourceEdit(OBJ);
+      expect(row === null || row.state === 'pushed').toBe(true);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it('R3-01 对照：权限类 blocker 不可被 force 越过（写 scope 缺失仍拒绝、零写入）', async () => {
+    const fx = makeFixture({
+      larkOverrides: {
+        checkAuthReady: async () => ({
+          ready: true, verified: true, identity: 'user',
+          currentScopes: ['wiki:node:retrieve'], missingScopes: [],
+        }),
+      },
+    });
+    try {
+      await editBody(fx, '# 测试文档\n\n正文基线 ALPHA。\n路由追加段\n');
+      const env = appCommandEnv(fx);
+      await expect(env.runPush({ objToken: OBJ, force: true })).rejects.toMatchObject({
+        code: 'source_push_blocked',
+        status: 400,
+      });
+      expect(env.approvals.listPending('s_t3d05')).toHaveLength(0);
+      expect(fx.lark.calls.some((call) => call.op === 'append' || call.op === 'overwrite')).toBe(false);
+      expect(fx.store.getSourceEdit(OBJ)?.state).toBe('dirty');
+    } finally {
+      fx.cleanup();
+    }
+  });
+});
+
+// ===========================================================================
+// G. T3e-R3-02：批准后异步 plan 复核窗口（真实 SessionService + 真实路由）
+//    批准后第二次 preview 挂起（metas 门控）→ 停止/换轮 → 释放 →
+//    断言零写入（对照：不停止则正常执行）。
+// ===========================================================================
+
+/** 受控会话 RPC double（同 app-command-family.test 的 RoundFakeRpc 模式）。 */
+class RecheckFakeRpc extends EventEmitter {
+  prompts: string[] = [];
+  exited = false;
+  active = false;
+  private resolvers: Array<(value: unknown) => void> = [];
+
+  isExited(): boolean { return this.exited; }
+  hasActiveRun(): boolean { return this.active; }
+  async start(): Promise<void> {}
+  async prompt(message: string): Promise<unknown> {
+    this.prompts.push(message);
+    this.active = true;
+    return new Promise((resolve) => { this.resolvers.push(resolve); });
+  }
+  resolvePrompt(value: unknown): void {
+    this.active = false;
+    this.resolvers.shift()?.(value);
+  }
+  async sendCommand(type: string): Promise<unknown> {
+    return type === 'get_state' ? { success: true, data: {} } : { success: true, data: {} };
+  }
+  async abort(): Promise<void> {}
+  async terminate(): Promise<void> { this.exited = true; this.emit('exit'); }
+}
+
+function recheckStore(): SessionStoreApi {
+  const rows = new Map<string, Record<string, unknown>>();
+  return {
+    getAgentSession: (id) => (rows.get(id) ? { ...rows.get(id)! } : null),
+    createAgentSession: (input) => {
+      rows.set(input.id, {
+        id: input.id, title: input.title, mode: input.mode, workspace_id: input.workspaceId,
+        pi_session_file: null, last_error_code: null, last_error_message: null,
+        created_at: input.createdAt, updated_at: input.updatedAt, deleted_at: null,
+      });
+    },
+    listAgentSessions: () => [...rows.values()],
+    updateAgentSession: (id, patch) => {
+      const row = rows.get(id);
+      if (!row) throw new Error(`agent_session 不存在: ${id}`);
+      const mapped: Record<string, unknown> = {};
+      if ('title' in patch) mapped.title = patch.title;
+      if ('mode' in patch) mapped.mode = patch.mode;
+      if ('workspaceId' in patch) mapped.workspace_id = patch.workspaceId;
+      if ('piSessionFile' in patch) mapped.pi_session_file = patch.piSessionFile;
+      if ('lastErrorCode' in patch) mapped.last_error_code = patch.lastErrorCode;
+      if ('lastErrorMessage' in patch) mapped.last_error_message = patch.lastErrorMessage;
+      if ('updatedAt' in patch) mapped.updated_at = patch.updatedAt;
+      if ('deletedAt' in patch) mapped.deleted_at = patch.deletedAt;
+      rows.set(id, { ...row, ...mapped });
+    },
+    listSessionsByWorkspace: () => [],
+  } as SessionStoreApi;
+}
+
+function recheckConfig(): Config {
+  return {
+    llm: {
+      openAiCompatBaseUrl: 'https://x/v1', apiKey: '', model: 'm', temperature: 0.2,
+      primaryChannel: 'direct', fallbackOnFailure: false,
+    },
+    agent: {
+      runtime: {}, model: { source: 'app-llm', thinkingLevel: 'off', contextWindow: 128000, maxTokens: 8192 },
+      maxConcurrentProcesses: 2, idleTimeoutMinutes: 10, workspaces: [],
+    },
+    standardKb: {
+      outputRoot: '/tmp/recheck-out', retainReleases: 3, buildBatchSize: 10,
+      promptTimeoutMinutes: 15, buildTimeoutMinutes: 180, autoBuildAfterSync: false,
+    },
+  } as unknown as Config;
+}
+
+/**
+ * 真实 feishu 路由 + 真实 ApprovalService + 真实 SessionService 全链：
+ * getDocumentMetas 第 2 次调用（批准后复核 preview）挂起等 releaseRecheck。
+ */
+function makeRecheckEnv() {
+  let metasCalls = 0;
+  let releaseRecheck: (() => void) | null = null;
+  const fx = makeFixture({
+    larkOverrides: {
+      getDocumentMetas: async (reqs: Array<{ docToken: string; docType: string }>) => {
+        metasCalls += 1;
+        if (metasCalls === 2) {
+          await new Promise<void>((resolve) => { releaseRecheck = resolve; });
+        }
+        return {
+          metas: reqs.map((r) => ({
+            docToken: r.docToken, docType: r.docType, latestModifyTime: BASE_EDIT_TIME, title: '',
+          })),
+          failed: [],
+        };
+      },
+    },
+  });
+  const prevHome = process.env.FEISHU_SYNC_HOME;
+  process.env.FEISHU_SYNC_HOME = fx.dataRoot;
+  const hono = makeApp({
+    larkCliClient: fx.lark,
+    larkCliManager: {},
+    configManager: {
+      getConfig: () => ({ knowledgeBaseRoot: fx.kbRoot, feishuWrite: { enabled: true } }),
+      load: async () => ({}),
+    },
+    localMapStore: fx.store,
+    kbBuildService: { activeBuild: () => null },
+  });
+  const pool = new AgentProcessPool({ maxConcurrentProcesses: 2 });
+  const approvals = new ApprovalService({ dataRoot: fx.dataRoot, timeoutMs: 8_000 });
+  const toolService = new AgentToolService({ dataRoot: fx.dataRoot, documentsProvider: () => [] });
+  const config = recheckConfig();
+  const store = recheckStore();
+  const sessions = new SessionService({
+    dataRoot: fx.dataRoot,
+    pool,
+    toolService,
+    resolver: new PiRuntimeResolver(),
+    configProvider: () => config,
+    internalBaseUrl: () => 'http://127.0.0.1:39999',
+    extensionPath: () => null,
+    workspaceGuards: () => ({
+      knowledgeBaseRoot: '/tmp/recheck-kb', outputRoot: config.standardKb.outputRoot, dataRoot: fx.dataRoot,
+    }),
+  });
+  toolService.registerToolFamily(createOpsToolFamily({
+    approvals,
+    getApp: () => hono,
+    desktopToken: 'stub-desktop-token',
+    configProvider: () => null,
+    sessionRunState: (sid) => sessions.runState(sid),
+    toolCallRun: (sid, toolCallId) => sessions.runOfToolCall(sid, toolCallId),
+    currentRunId: (sid) => sessions.currentRunId(sid),
+    sessionAbortSignal: (sid) => sessions.abortSignal(sid),
+  }));
+  // 预注册 fake 进程并同步 modelRevisions（复用进程不触发真实 spawn）
+  const register = pool.register.bind(pool);
+  const registerSpy = vi.spyOn(pool, 'register').mockImplementation((...args) => {
+    (sessions as unknown as { modelRevisions: WeakMap<PiRpcProcess, string> }).modelRevisions.set(
+      args[1], modelRevision(config),
+    );
+    return register(...args);
+  });
+  const session = sessions.create(store, { title: '复核窗口' });
+  const fake = new RecheckFakeRpc();
+  pool.register(session.id, fake as unknown as PiRpcProcess, 'session');
+  const token = toolService.createRunContext({
+    runKind: 'work', sessionId: session.id, outputRoot: os.tmpdir(), knowledgeBaseRoot: fx.kbRoot,
+  }).token;
+  const writeCalls = () => fx.lark.calls.filter((call) => call.op === 'append' || call.op === 'overwrite');
+  return {
+    fx, sessions, store, session, fake, token, approvals, toolService, writeCalls,
+    metasCalls: () => metasCalls,
+    releaseRecheck: () => releaseRecheck?.(),
+    cleanup: async () => {
+      approvals.close();
+      await pool.closeAll();
+      registerSpy.mockRestore();
+      if (prevHome === undefined) delete process.env.FEISHU_SYNC_HOME;
+      else process.env.FEISHU_SYNC_HOME = prevHome;
+      fx.cleanup();
+    },
+  };
+}
+
+describe('T3e-R3-02：批准后异步 plan 复核窗口（真实 SessionService + 真实路由）', () => {
+  /** 发起 run + 登记 toolCall 归属 + 发起 source.push（挂起等批准）。 */
+  async function startPush(env: ReturnType<typeof makeRecheckEnv>, toolCallId: string) {
+    const run = await env.sessions.sendMessage(env.store, env.session.id, { text: `轮次-${toolCallId}` });
+    await vi.waitFor(() => expect(env.sessions.currentRunId(env.session.id)).toBe(run.runId));
+    env.fake.emit('tool_execution_start', { toolCallId, toolName: 'app_command' });
+    const pending = env.toolService.executeTool(
+      env.token,
+      'app_command',
+      { command: 'source.push', args: { objToken: OBJ } },
+      { toolCallId },
+    );
+    await vi.waitFor(() => expect(env.approvals.listPending(env.session.id).length).toBe(1));
+    const [dto] = env.approvals.listPending(env.session.id);
+    expect(dto.runId).toBe(run.runId); // 批准卡绑定 server 权威轮次
+    env.approvals.decide(env.session.id, dto.id, 'approve');
+    // 批准后复核 preview 挂起（metas 第 2 次调用）
+    await vi.waitFor(() => expect(env.metasCalls()).toBe(2));
+    return { pending, run };
+  }
+
+  it('停止：批准后复核 preview 挂起 → abort 立即拒绝；释放挂起 preview 后仍零写入', async () => {
+    const env = makeRecheckEnv();
+    try {
+      await editBody(env.fx, '# 测试文档\n\n正文基线 ALPHA。\n路由追加段\n');
+      const { pending } = await startPush(env, 'tc_recheck_1');
+      // 停止请求 → 停止信号立即取消复核链（不等挂起的 preview 返回）
+      const rejection = expect(pending).rejects.toMatchObject({ code: 'approval_cancelled', status: 409 });
+      await env.sessions.abort(env.store, env.session.id);
+      await rejection;
+      expect(env.writeCalls()).toHaveLength(0);
+      // 释放挂起的复核 preview：被弃置的链路不得补发写入（本地仍 dirty）
+      env.releaseRecheck();
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(env.writeCalls()).toHaveLength(0);
+      expect(env.fx.store.getSourceEdit(OBJ)?.state).toBe('dirty');
+      // 收尾：结束挂起的 run prompt
+      env.fake.resolvePrompt({ outcome: 'aborted', lastAssistantText: '' });
+      await vi.waitFor(() => expect(env.sessions.currentRunId(env.session.id)).toBeNull());
+    } finally {
+      await env.cleanup();
+    }
+  });
+
+  it('换轮：run1 结束 + run2 开始 → 释放复核 preview → approval_round_expired，零写入', async () => {
+    const env = makeRecheckEnv();
+    try {
+      await editBody(env.fx, '# 测试文档\n\n正文基线 ALPHA。\n路由追加段\n');
+      const { pending } = await startPush(env, 'tc_recheck_2');
+      // 复核挂起期间：run1 结束（超时/异常）并开始 run2（旧批准不可跨轮执行）
+      env.fake.resolvePrompt({ outcome: 'completed', lastAssistantText: '第一轮结束' });
+      await vi.waitFor(() => expect(env.sessions.currentRunId(env.session.id)).toBeNull());
+      const run2 = await env.sessions.sendMessage(env.store, env.session.id, { text: '第二轮' });
+      await vi.waitFor(() => expect(env.sessions.currentRunId(env.session.id)).toBe(run2.runId));
+      env.releaseRecheck();
+      await expect(pending).rejects.toMatchObject({ code: 'approval_round_expired', status: 409 });
+      expect(env.writeCalls()).toHaveLength(0);
+      expect(env.fx.store.getSourceEdit(OBJ)?.state).toBe('dirty');
+      env.fake.resolvePrompt({ outcome: 'completed', lastAssistantText: '第二轮结束' });
+      await vi.waitFor(() => expect(env.sessions.currentRunId(env.session.id)).toBeNull());
+    } finally {
+      await env.cleanup();
+    }
+  });
+
+  it('对照（不停止）：复核 preview 释放后计划未变 → 正常执行 append', async () => {
+    const env = makeRecheckEnv();
+    try {
+      await editBody(env.fx, '# 测试文档\n\n正文基线 ALPHA。\n路由追加段\n');
+      const { pending } = await startPush(env, 'tc_recheck_3');
+      env.releaseRecheck();
+      const result = await pending;
+      expect(result.details).toMatchObject({ command: 'source.push' });
+      expect(env.fx.lark.calls.some((call) => call.op === 'append')).toBe(true);
+      env.fake.resolvePrompt({ outcome: 'completed', lastAssistantText: '完成' });
+      await vi.waitFor(() => expect(env.sessions.currentRunId(env.session.id)).toBeNull());
+    } finally {
+      await env.cleanup();
+    }
   });
 });

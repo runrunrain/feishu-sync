@@ -2512,6 +2512,17 @@ export class LocalMapStore {
     ).all(...ids) as Array<Record<string, unknown>>;
   }
 
+  /**
+   * R2-05：是否存在非终态（queued/running/blocked）任务——插件管理互斥与
+   * retireIdle 保护的活跃判定（TaskService.hasPendingWork 消费）。
+   */
+  hasActiveAgentTasks(): boolean {
+    const row = this.db.prepare(
+      "SELECT 1 AS active FROM agent_tasks WHERE status IN ('queued','running','blocked') LIMIT 1",
+    ).get() as { active: number } | undefined;
+    return row != null;
+  }
+
   /** 启动对账：queued/running → interrupted（blocked 保留可作答）。 */
   markInterruptedAgentTasks(): string[] {
     const info = this.db.prepare(`

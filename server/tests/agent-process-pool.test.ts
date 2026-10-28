@@ -241,3 +241,28 @@ describe('既有立即语义不回归（F3-R05）', () => {
     expect(pool.loadCount()).toBe(0);
   });
 });
+
+describe('R2-05：retireIdle 只回收确为空闲的会话进程', () => {
+  it('空闲会话回收；busy 会话与 task/build 后台进程不回收', async () => {
+    const pool = new AgentProcessPool({ maxConcurrentProcesses: 6 });
+    const sessionIdle = fakeProcess();
+    const sessionBusy = fakeProcess();
+    const taskProc = fakeProcess();
+    pool.register('s-idle', sessionIdle, 'session');
+    pool.register('s-busy', sessionBusy, 'session');
+    pool.setBusy('s-busy', true);
+    pool.register('task:t1', taskProc, 'build');
+
+    await pool.retireIdle();
+    expect(sessionIdle.isExited()).toBe(true); // 空闲会话被回收
+    expect(sessionBusy.isExited()).toBe(false); // busy 会话保留
+    expect(taskProc.isExited()).toBe(false); // task 进程不由 idle 回收管
+
+    // 解除 busy 后会话可回收；task 进程仍只由 TaskService 生命周期终止
+    pool.setBusy('s-busy', false);
+    await pool.retireIdle();
+    expect(sessionBusy.isExited()).toBe(true);
+    expect(taskProc.isExited()).toBe(false);
+    await pool.closeAll();
+  });
+});

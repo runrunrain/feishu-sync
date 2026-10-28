@@ -246,6 +246,81 @@ describe('工具授权（runKind 白名单）', () => {
     expect(badSource.json.error).toBe('invalid_request');
   });
 
+  it('R2-04：kb_delete_doc 路径别名（./、反斜杠）在认领与触盘前拒绝；他单元文档字节不变', async () => {
+    const RawSourceSnapshotModule = await import('../src/kb/raw-source-snapshot.js');
+    const PathClaimsModule = await import('../src/kb/path-claims.js');
+    const rawFile = path.join(kbRoot, '原始.md');
+    fs.writeFileSync(rawFile, '# 原始\n内容');
+    const snapshot = RawSourceSnapshotModule.RawSourceSnapshot.fromEntries(
+      [{
+        objToken: 'tokR204', objType: 'docx', title: '原始', relPath: '原始.md',
+        contentHash: RawSourceSnapshotModule.computeSourceHash(rawFile, []),
+        objEditTime: null,
+      }],
+      { knowledgeBaseRoot: kbRoot },
+    );
+    const claims = new PathClaimsModule.PathClaims();
+    const buildState = {
+      knowledgeBaseRoot: kbRoot,
+      snapshot,
+      workset: new Map([['tokR204', 'added']]),
+      stagingRoot,
+      finishInfo: null,
+      claims,
+    };
+    const workerToken = (unitId: string) => toolService.createRunContext({
+      runKind: 'build',
+      buildId: 'b_r204',
+      outputRoot,
+      knowledgeBaseRoot: kbRoot,
+      buildState,
+      worker: { workerId: `w-${unitId}`, unitId, phase: 'unit' as const },
+    }).token;
+
+    // u1 认领并写入 topic/a.md
+    const write = await call('POST', '/api/agent-internal/tools/kb_write_doc', {
+      toolCallId: 'r204-w',
+      args: {
+        path: 'topic/a.md', title: '认领文档', markdown: 'u1 的正文内容',
+        sources: ['tokR204'], summary: '摘要',
+      },
+    }, { 'X-Agent-Run-Token': workerToken('u1') });
+    expect(write.status).toBe(200);
+    const target = path.join(stagingRoot, 'docs', 'topic', 'a.md');
+    const bytesBefore = fs.readFileSync(target, 'utf-8');
+
+    // u2 用别名路径删除：`./` 段与反斜杠均在认领前被拒（与写入同一规范门）
+    for (const alias of ['topic/./a.md', 'topic\\a.md', 'topic/../topic/a.md']) {
+      const attempt = await call('POST', '/api/agent-internal/tools/kb_delete_doc', {
+        toolCallId: `r204-d-${alias.length}`,
+        args: { path: alias },
+      }, { 'X-Agent-Run-Token': workerToken('u2') });
+      expect(attempt.status).toBe(400);
+      expect(attempt.json.error).toBe('invalid_request');
+      // 原文件字节不变；认领账本未新增别名键
+      expect(fs.readFileSync(target, 'utf-8')).toBe(bytesBefore);
+    }
+    expect(claims.ownerOf('topic/./a.md')).toBeNull();
+    expect(claims.ownerOf('topic/a.md')).toBe('u1');
+
+    // 对照：合法路径下他单元删除 → 认领拒绝（kb_path_owned_by_other_unit）
+    const contested = await call('POST', '/api/agent-internal/tools/kb_delete_doc', {
+      toolCallId: 'r204-d-canonical',
+      args: { path: 'topic/a.md' },
+    }, { 'X-Agent-Run-Token': workerToken('u2') });
+    expect(contested.status).toBe(409);
+    expect(contested.json.error).toBe('kb_path_owned_by_other_unit');
+    expect(fs.existsSync(target)).toBe(true);
+
+    // 对照：持有者 u1 用规范路径删除照常成功
+    const owned = await call('POST', '/api/agent-internal/tools/kb_delete_doc', {
+      toolCallId: 'r204-d-owner',
+      args: { path: 'topic/a.md' },
+    }, { 'X-Agent-Run-Token': workerToken('u1') });
+    expect(owned.status).toBe(200);
+    expect(fs.existsSync(target)).toBe(false);
+  });
+
   it('模式切换撤销旧令牌：revokeBySession 后 401', async () => {
     const { token } = toolService.createRunContext({
       runKind: 'work',

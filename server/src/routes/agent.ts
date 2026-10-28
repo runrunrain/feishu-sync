@@ -570,6 +570,8 @@ export async function agentRoutes(deps: AgentRouteDeps): Promise<Hono> {
   routes.post('/api/agent/tasks/:id/cancel', async (c) => {
     try {
       if (!deps.taskService) throw new ToolError('invalid_request', '任务编排服务不可用', 503);
+      // R2-01：desktop 面板入口不传 callerSessionId（独立的全局授权契约：
+      // desktop token 鉴权）；内部 task_resume/task_cancel 工具面强制归属校验。
       return c.json(await deps.taskService.cancel(localMapStore, c.req.param('id')));
     } catch (error) {
       return errorResponse(c, error);
@@ -585,6 +587,7 @@ export async function agentRoutes(deps: AgentRouteDeps): Promise<Hono> {
       } catch {
         /* 空 body 由 message 校验报 400 */
       }
+      // R2-01：同 cancel——desktop 面板全局授权；工具面归属校验在 TaskService。
       return c.json(deps.taskService.resume(localMapStore, c.req.param('id'), String(body.message ?? '')));
     } catch (error) {
       return errorResponse(c, error);

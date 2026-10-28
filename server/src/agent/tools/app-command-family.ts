@@ -47,6 +47,21 @@ export interface OpsFamilyDeps {
    * 缺省不复核（非会话内调用/测试场景）。
    */
   sessionRunState?: (sessionId: string) => 'running' | 'aborting' | 'idle';
+  /**
+   * T3b-07R：toolCallId → 所属 runId（server 权威轮次归属，由
+   * SessionService 从 pi tool_execution_start 事件记录）。与
+   * currentRunId 同时注入时启用跨轮迟到请求拒绝；缺省不绑定（测试/
+   * 非会话场景）。
+   */
+  toolCallRun?: (sessionId: string, toolCallId: string) => string | null;
+  /** T3b-07R：会话当前可执行轮 runId；无活跃运行返回 null。 */
+  currentRunId?: (sessionId: string) => string | null;
+  /**
+   * T3e-R3-02：会话停止信号（批准后异步复核链取消源）。停止请求时
+   * 触发——复核 preview 挂起期间立即按停止处理，不等它返回。缺省不
+   * 取消（非会话内调用/测试场景）。
+   */
+  sessionAbortSignal?: (sessionId: string) => AbortSignal | undefined;
 }
 
 const DEFAULT_RESULT_MAX_CHARS = 20_000;
@@ -148,6 +163,32 @@ async function executeSpecs(
   });
   return { data, httpStatus: 200 };
 }
+/**
+ * T3e-R3-02：可取消的复核调用——批准后复核 preview 挂起期间停止信号
+ * 触发时立即按停止处理（底层 preview 只读、结果弃置），不再等它返回
+ * 后派发写入。信号未触发则透传原结果/错误。
+ */
+async function raceAbortSignal<T>(
+  promise: Promise<T>,
+  signal: AbortSignal | undefined,
+  commandName: string,
+): Promise<T> {
+  if (!signal) return promise;
+  const cancelled = () => new ToolError(
+    'approval_cancelled',
+    `会话已停止，命令 ${commandName} 的批准已失效，不再执行`,
+    409,
+  );
+  if (signal.aborted) throw cancelled();
+  return await new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(cancelled());
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => { signal.removeEventListener('abort', onAbort); resolve(value); },
+      (error) => { signal.removeEventListener('abort', onAbort); reject(error); },
+    );
+  });
+}
 
 /** 构造 ops 工具族（S1 registerToolFamily 追加模型；index.ts 注册）。 */
 export function createOpsToolFamily(deps: OpsFamilyDeps): AgentToolFamily {
@@ -158,7 +199,11 @@ export function createOpsToolFamily(deps: OpsFamilyDeps): AgentToolFamily {
     tools: [{
       spec: APP_COMMAND_SPEC,
       runKinds: ['discuss', 'work'],
-      execute: async (context: InternalRunContext, args: Record<string, unknown>): Promise<ToolResult> => {
+      execute: async (
+        context: InternalRunContext,
+        args: Record<string, unknown>,
+        meta?: { toolCallId?: string },
+      ): Promise<ToolResult> => {
         const commandName = typeof args.command === 'string' ? args.command : '';
         if (!commandName) {
           throw new ToolError('invalid_request', 'command 必须是非空字符串');
@@ -181,6 +226,29 @@ export function createOpsToolFamily(deps: OpsFamilyDeps): AgentToolFamily {
         validateOpsArgs(def, sanitized);
         const config = deps.configProvider();
         const filled = def.fillDefaults ? def.fillDefaults(sanitized, { config }) : sanitized;
+        // T3e-R3-02：sessionId 提前到批准流之前（本轮可执行复核闭包用）。
+        const sessionId = context.sessionId ?? '';
+        // T3b-07R：工具请求绑定的 server 权威轮次（Work 分支赋值；
+        // confirmPlan 复核闭包在调用时已赋值）。
+        let requestRunId: string | null = null;
+        /**
+         * T3e-R3-02：本轮可执行复核（停止请求/运行结束/换轮均不可执行）
+         *——批准后与异步复核 preview 完成后各查一次（同一判定两处使用，
+         * 关闭「批准后异步窗口内停止/换轮仍写入」）。
+         */
+        const assertRoundExecutable = (): void => {
+          const runState = deps.sessionRunState?.(sessionId);
+          if (runState === 'aborting' || runState === 'idle') {
+            throw new ToolError('approval_cancelled', `会话已停止，命令 ${def.name} 的批准已失效，不再执行`, 409);
+          }
+          if (requestRunId !== null && deps.currentRunId && deps.currentRunId(sessionId) !== requestRunId) {
+            throw new ToolError(
+              'approval_round_expired',
+              `命令 ${def.name} 的批准所属运行已结束，不再执行`,
+              409,
+            );
+          }
+        };
         let specs: OpsRequestSpec[];
         try {
           specs = def.request(filled);
@@ -191,16 +259,56 @@ export function createOpsToolFamily(deps: OpsFamilyDeps): AgentToolFamily {
           throw error;
         }
 
+        // T3d-05R：server 权威确认值——挂 confirmPlan 的命令在批准前经
+        // 内部 preview 请求取得权威 push plan，按实际 mode/force 派生确认值
+        //（不再由命令表静态参数猜测）；批准卡展示与执行注入同一派生值。
+        let confirmValue: string | undefined = def.confirm?.value;
+        let approvedPlanKey: string | null = null;
+        if (def.confirmPlan) {
+          const previewSpecs = def.confirmPlan.previewSpecs(filled);
+          const { data: previewJson } = await executeSpecs(deps, previewSpecs);
+          try {
+            confirmValue = def.confirmPlan.deriveConfirm(previewJson, filled);
+          } catch (error) {
+            if (error instanceof OpsArgumentError) {
+              throw new ToolError(error.code, error.message, 400);
+            }
+            throw error;
+          }
+          approvedPlanKey = def.confirmPlan.planKey(previewJson);
+        }
+
         const runSpecs = async (): Promise<ToolResult> => {
-          // 确认值注入：仅在用户批准后到达这里。request() 派生后的 body
-          // 原样转发（T3b-05：source.push 等命令按 allowOverwrite/force
-          // 派生 PUSH/OVERWRITE_CLOUD，不能被表基线值覆盖）；表登记字段
-          // 缺失时（未来漏烘条目）才补注入基线值。
+          // 确认值注入：仅在用户批准后到达这里。confirmPlan 命令强制注入
+          // 派生值（覆盖 request() 的静态猜测）；其余命令仅在表登记字段
+          // 缺失时（未来漏烘条目）补注入基线值。
           if (def.confirm) {
+            if (def.confirmPlan) {
+              // T3d-05R：计划过期复核——批准期间权威 plan 变化（如 append
+              // 变 overwrite）则旧批准的确认语义不再成立，拒执行（重新
+              // 发起命令即重新批准）。T3e-R3-02：复核 preview 可取消——
+              // 挂起期间停止信号触发立即按停止处理；preview 完成后、派发
+              // mutation 紧前再复核本轮可执行（停止/换轮均拒）。
+              const { data: recheckJson } = await raceAbortSignal(
+                executeSpecs(deps, def.confirmPlan.previewSpecs(filled)),
+                deps.sessionAbortSignal?.(sessionId),
+                def.name,
+              );
+              assertRoundExecutable();
+              if (def.confirmPlan.planKey(recheckJson) !== approvedPlanKey) {
+                throw new ToolError(
+                  'approval_plan_expired',
+                  `命令 ${def.name} 的批准已过期（推送计划在批准期间发生变化），请重新发起以重新批准`,
+                  409,
+                );
+              }
+            }
             for (const spec of specs) {
               if (spec.method !== 'GET' && spec.body && typeof spec.body === 'object' && !Array.isArray(spec.body)) {
                 const body = spec.body as Record<string, unknown>;
-                if (body[def.confirm.field] === undefined) {
+                if (def.confirmPlan) {
+                  body[def.confirm.field] = confirmValue;
+                } else if (body[def.confirm.field] === undefined) {
                   body[def.confirm.field] = def.confirm.value;
                 }
               }
@@ -225,18 +333,38 @@ export function createOpsToolFamily(deps: OpsFamilyDeps): AgentToolFamily {
         }
 
         // Work 会话：非 read 级挂起等待用户批准。
-        const sessionId = context.sessionId ?? '';
         if (!sessionId) {
           throw new ToolError('invalid_request', 'app_command 写级命令需要会话上下文', 400);
+        }
+        // T3b-07R：工具请求绑定 server 权威轮次——toolCallId 所属轮已结束
+        //（或换轮）的迟到请求在此拒绝，不产生批准请求；旧轮批准不能被
+        //「新轮正在跑」洗白。（requestRunId 在 confirmPlan 复核闭包声明，
+        // 此处赋值。）
+        if (deps.toolCallRun && deps.currentRunId) {
+          const toolCallId = meta?.toolCallId ?? '';
+          if (toolCallId) {
+            requestRunId = deps.toolCallRun(sessionId, toolCallId);
+            const current = deps.currentRunId(sessionId);
+            if (!requestRunId || requestRunId !== current) {
+              throw new ToolError(
+                'stale_tool_request',
+                `命令 ${def.name} 的工具请求所属运行已结束（跨轮迟到请求不再可执行）`,
+                409,
+              );
+            }
+          }
         }
         const { settled } = deps.approvals.begin({
           sessionId,
           command: def.name,
           risk: def.risk,
           argsSummary: JSON.stringify(sanitized).slice(0, 400),
+          ...(requestRunId !== null ? { runId: requestRunId } : {}),
           preview: {
             summary: def.summary,
-            ...(def.confirm ? { confirmField: def.confirm.field, confirmValue: def.confirm.value } : {}),
+            ...(def.confirm
+              ? { confirmField: def.confirm.field, confirmValue: confirmValue ?? def.confirm.value }
+              : {}),
           },
         });
         const decision = await settled;
@@ -249,14 +377,10 @@ export function createOpsToolFamily(deps: OpsFamilyDeps): AgentToolFamily {
           }
           throw new ToolError('approval_cancelled', `会话已结束，命令 ${def.name} 的批准请求已取消`, 409);
         }
-        // T3b-07：批准后、执行前复核运行状态——停止请求已进入（aborting）
-        // 或运行已结束（idle，settled 延迟窗口）时不执行，迟到批准按取消
-        // 处理；与 abort 入口即时撤销 pending 批准共同关闭「停止后仍执行」
-        // 窗口。
-        const runState = deps.sessionRunState?.(sessionId);
-        if (runState === 'aborting' || runState === 'idle') {
-          throw new ToolError('approval_cancelled', `会话已停止，命令 ${def.name} 的批准已失效，不再执行`, 409);
-        }
+        // T3b-07 + T3b-07R + T3e-R3-02：批准后、执行前复核本轮可执行
+        //（aborting/idle/换轮均不执行）；confirmPlan 命令在异步复核
+        // preview 完成后会再查一次（runSpecs 内 assertRoundExecutable）。
+        assertRoundExecutable();
         return runSpecs();
       },
     }],

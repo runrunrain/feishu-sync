@@ -13,13 +13,21 @@
  *  - args 按命令表 JSON Schema 校验；结果截断 ≤20000
  */
 
-import { describe, expect, it, beforeAll, afterAll } from 'vitest';
+import { describe, expect, it, beforeAll, afterAll, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { EventEmitter } from 'node:events';
 import { Hono } from 'hono';
 import { AgentToolService, ToolError } from '../src/agent/agent-tool-service.js';
 import { ApprovalService } from '../src/agent/approvals/approval-service.js';
+import { SessionService } from '../src/agent/session-service.js';
+import { AgentProcessPool } from '../src/agent/agent-process-pool.js';
+import { PiRuntimeResolver } from '../src/agent/runtime-resolver.js';
+import { modelRevision } from '../src/agent/model-revision.js';
+import type { SessionStoreApi } from '../src/agent/session-service.js';
+import type { PiRpcProcess } from '../src/agent/pi-rpc-process.js';
+import type { Config } from '../src/types/index.js';
 import {
   createOpsToolFamily,
   stripConfirmArgs,
@@ -33,6 +41,8 @@ let toolService: AgentToolService;
 let app: Hono;
 let buildHits: Array<Record<string, unknown>>;
 let toolEvents: Array<{ phase: string; toolName: string; argsSummary: string }>;
+/** push/preview 桩计划（T3d-05R：可按用例切换 append/overwrite） */
+let pushPreviewPlan: { mode: string; blockedReason?: string };
 
 /** stub 目标路由：记录 kb.builds 命中与请求体；kb.status 只读返回。 */
 function makeStubApp(): Hono {
@@ -43,6 +53,7 @@ function makeStubApp(): Hono {
     buildHits.push(body as Record<string, unknown>);
     return c.json({ buildId: 'b_test_1', status: 'queued' }, 201);
   });
+  stub.post('/api/sources/:objToken/push/preview', (c) => c.json(pushPreviewPlan));
   stub.post('/api/sources/:objToken/push', async (c) => {
     const body = await c.req.json().catch(() => ({}));
     buildHits.push(body as Record<string, unknown>);
@@ -74,6 +85,7 @@ beforeAll(() => {
   dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'appcmd-'));
   buildHits = [];
   toolEvents = [];
+  pushPreviewPlan = { mode: 'append' };
   approvals = new ApprovalService({ dataRoot, timeoutMs: 8_000 });
   app = makeStubApp();
   toolService = new AgentToolService({ dataRoot, documentsProvider: () => [] });
@@ -182,36 +194,71 @@ describe('mutate 级批准流', () => {
     expect(buildHits[0].confirm).toBe('BUILD');
   });
 
-  it('T3b-05：source.push allowOverwrite=true 经批准后 confirm=OVERWRITE_CLOUD 原样到达服务端（mock 全链）', async () => {
+  it('T3d-05R：source.push 确认值由权威 preview 派生（append+allowOverwrite → PUSH；overwrite → OVERWRITE_CLOUD；blocked → 拒绝）', async () => {
     const tokenId = token('work');
     buildHits = [];
-    const pending = run(tokenId, {
+    // 真实 diff 形态 = 纯追加：即使 allowOverwrite=true，确认值也是 PUSH
+    //（diting T3b-05R 回归——旧实现按参数猜 OVERWRITE_CLOUD 会被服务拒）
+    pushPreviewPlan = { mode: 'append' };
+    const appendPending = run(tokenId, {
       command: 'source.push',
       args: { objToken: 'tokT3b05', allowOverwrite: true },
     });
     await new Promise((resolve) => setTimeout(resolve, 20));
-    const [dto] = approvals.listPending('s_appcmd_1');
-    expect(dto.risk).toBe('remote_write');
-    approvals.decide('s_appcmd_1', dto.id, 'approve');
-    const result = await pending;
-    // request() 派生的 OVERWRITE_CLOUD 不被表基线值 PUSH 覆盖；服务端接受
-    expect(buildHits).toHaveLength(1);
-    expect(buildHits[0]).toMatchObject({
-      allowOverwrite: true,
-      force: false,
-      confirm: 'OVERWRITE_CLOUD',
-      actor: 'cli',
-    });
-    expect(result.content[0]?.text).toContain('pushed');
+    const [appendDto] = approvals.listPending('s_appcmd_1');
+    expect(appendDto.risk).toBe('remote_write');
+    // 批准卡展示派生值（非表基线 PUSH 猜测路径，而是 preview 派生结果）
+    expect((appendDto.preview as { confirmValue?: string }).confirmValue).toBe('PUSH');
+    approvals.decide('s_appcmd_1', appendDto.id, 'approve');
+    await appendPending;
+    expect(buildHits[0]).toMatchObject({ allowOverwrite: true, force: false, confirm: 'PUSH', actor: 'cli' });
 
-    // 无覆盖标志的普通推送：confirm=PUSH（表基线与派生一致）
+    // 真实 diff 形态 = 覆盖：确认值升级 OVERWRITE_CLOUD
     buildHits = [];
-    const plain = run(tokenId, { command: 'source.push', args: { objToken: 'tokT3b05' } });
+    pushPreviewPlan = { mode: 'overwrite' };
+    const overwritePending = run(token('work'), {
+      command: 'source.push',
+      args: { objToken: 'tokT3b05', allowOverwrite: true },
+    });
     await new Promise((resolve) => setTimeout(resolve, 20));
-    const [dto2] = approvals.listPending('s_appcmd_1');
-    approvals.decide('s_appcmd_1', dto2.id, 'approve');
-    await plain;
-    expect(buildHits[0]).toMatchObject({ confirm: 'PUSH' });
+    const [overwriteDto] = approvals.listPending('s_appcmd_1');
+    expect((overwriteDto.preview as { confirmValue?: string }).confirmValue).toBe('OVERWRITE_CLOUD');
+    approvals.decide('s_appcmd_1', overwriteDto.id, 'approve');
+    await overwritePending;
+    expect(buildHits[0]).toMatchObject({ confirm: 'OVERWRITE_CLOUD' });
+
+    // force=true（append 形态）：确认值 OVERWRITE_CLOUD（与真实服务同契约）
+    buildHits = [];
+    pushPreviewPlan = { mode: 'append' };
+    const forcePending = run(token('work'), {
+      command: 'source.push',
+      args: { objToken: 'tokT3b05', force: true },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const [forceDto] = approvals.listPending('s_appcmd_1');
+    expect((forceDto.preview as { confirmValue?: string }).confirmValue).toBe('OVERWRITE_CLOUD');
+    approvals.decide('s_appcmd_1', forceDto.id, 'approve');
+    await forcePending;
+    expect(buildHits[0]).toMatchObject({ force: true, confirm: 'OVERWRITE_CLOUD' });
+
+    // 计划不可推送（blocked）：不产生批准请求，直接工具错误
+    buildHits = [];
+    pushPreviewPlan = { mode: 'blocked', blockedReason: 'no_changes' };
+    await expect(run(token('work'), { command: 'source.push', args: { objToken: 'tokT3b05' } }))
+      .rejects.toMatchObject({ code: 'source_push_blocked', status: 400 });
+    expect(approvals.pendingCount()).toBe(0);
+    expect(buildHits).toHaveLength(0);
+
+    // 批准期间计划变化（append→overwrite）→ 批准过期拒执行
+    buildHits = [];
+    pushPreviewPlan = { mode: 'append' };
+    const stalePending = run(token('work'), { command: 'source.push', args: { objToken: 'tokT3b05' } });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const [staleDto] = approvals.listPending('s_appcmd_1');
+    pushPreviewPlan = { mode: 'overwrite' }; // 批准前真实计划变化
+    approvals.decide('s_appcmd_1', staleDto.id, 'approve');
+    await expect(stalePending).rejects.toMatchObject({ code: 'approval_plan_expired', status: 409 });
+    expect(buildHits).toHaveLength(0);
   });
 
   it('T3b-07：停止后（aborting/settled）迟到批准不再执行 → approval_cancelled，目标路由零命中', async () => {
@@ -409,5 +456,172 @@ describe('纯函数', () => {
     expect(text.length).toBeLessThanOrEqual(50 + 40);
     expect(text).toContain('已截断');
     expect(truncateJson({ a: 1 }, 50)).toBe(JSON.stringify({ a: 1 }, null, 2));
+  });
+});
+
+// ===========================================================================
+// T3b-07R：工具请求绑定 server 权威轮次（真实 SessionService 流时序）
+// ===========================================================================
+
+/** 受控 RPC double：prompt 挂起等 resolvePrompt；可注入 tool_execution_start。 */
+class RoundFakeRpc extends EventEmitter {
+  prompts: string[] = [];
+  exited = false;
+  active = false;
+  private resolvers: Array<(value: unknown) => void> = [];
+
+  isExited(): boolean { return this.exited; }
+  hasActiveRun(): boolean { return this.active; }
+  async start(): Promise<void> {}
+  async prompt(message: string): Promise<unknown> {
+    this.prompts.push(message);
+    this.active = true;
+    return new Promise((resolve) => { this.resolvers.push(resolve); });
+  }
+  resolvePrompt(value: unknown): void {
+    this.active = false;
+    this.resolvers.shift()?.(value);
+  }
+  async sendCommand(type: string): Promise<unknown> {
+    return type === 'get_state' ? { success: true, data: {} } : { success: true, data: {} };
+  }
+  async abort(): Promise<void> {}
+  async terminate(): Promise<void> { this.exited = true; this.emit('exit'); }
+}
+
+function roundStore(): SessionStoreApi {
+  const rows = new Map<string, Record<string, unknown>>();
+  return {
+    getAgentSession: (id) => (rows.get(id) ? { ...rows.get(id)! } : null),
+    createAgentSession: (input) => {
+      rows.set(input.id, {
+        id: input.id, title: input.title, mode: input.mode, workspace_id: input.workspaceId,
+        pi_session_file: null, last_error_code: null, last_error_message: null,
+        created_at: input.createdAt, updated_at: input.updatedAt, deleted_at: null,
+      });
+    },
+    listAgentSessions: () => [...rows.values()],
+    updateAgentSession: (id, patch) => {
+      const row = rows.get(id);
+      if (!row) throw new Error(`agent_session 不存在: ${id}`);
+      const mapped: Record<string, unknown> = {};
+      if ('title' in patch) mapped.title = patch.title;
+      if ('mode' in patch) mapped.mode = patch.mode;
+      if ('workspaceId' in patch) mapped.workspace_id = patch.workspaceId;
+      if ('piSessionFile' in patch) mapped.pi_session_file = patch.piSessionFile;
+      if ('lastErrorCode' in patch) mapped.last_error_code = patch.lastErrorCode;
+      if ('lastErrorMessage' in patch) mapped.last_error_message = patch.lastErrorMessage;
+      if ('updatedAt' in patch) mapped.updated_at = patch.updatedAt;
+      if ('deletedAt' in patch) mapped.deleted_at = patch.deletedAt;
+      rows.set(id, { ...row, ...mapped });
+    },
+    listSessionsByWorkspace: () => [],
+  } as SessionStoreApi;
+}
+
+function roundConfig(): Config {
+  return {
+    llm: {
+      openAiCompatBaseUrl: 'https://x/v1', apiKey: '', model: 'm', temperature: 0.2,
+      primaryChannel: 'direct', fallbackOnFailure: false,
+    },
+    agent: {
+      runtime: {}, model: { source: 'app-llm', thinkingLevel: 'off', contextWindow: 128000, maxTokens: 8192 },
+      maxConcurrentProcesses: 2, idleTimeoutMinutes: 10, workspaces: [],
+    },
+    standardKb: {
+      outputRoot: '/tmp/round-out', retainReleases: 3, buildBatchSize: 10,
+      promptTimeoutMinutes: 15, buildTimeoutMinutes: 180, autoBuildAfterSync: false,
+    },
+  } as unknown as Config;
+}
+
+describe('T3b-07R：工具请求与批准绑定权威轮次（真实 SessionService 流时序）', () => {
+  it('旧轮迟到请求跨到新轮 → 409 stale_tool_request（零批准零执行）；同轮请求照常且批准卡带 runId', async () => {
+    const roundRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'appcmd-round-'));
+    const pool = new AgentProcessPool({ maxConcurrentProcesses: 2 });
+    const config = roundConfig();
+    const store = roundStore();
+    const roundApprovals = new ApprovalService({ dataRoot: roundRoot, timeoutMs: 8_000 });
+    const roundTools = new AgentToolService({ dataRoot: roundRoot, documentsProvider: () => [] });
+    const resolver = new PiRuntimeResolver();
+    const sessions = new SessionService({
+      dataRoot: roundRoot,
+      pool,
+      toolService: roundTools,
+      resolver,
+      configProvider: () => config,
+      internalBaseUrl: () => 'http://127.0.0.1:39999',
+      extensionPath: () => null,
+      workspaceGuards: () => ({
+        knowledgeBaseRoot: '/tmp/round-kb', outputRoot: config.standardKb.outputRoot, dataRoot: roundRoot,
+      }),
+    });
+    roundTools.registerToolFamily(createOpsToolFamily({
+      approvals: roundApprovals,
+      getApp: () => app,
+      desktopToken: 'stub-desktop-token',
+      configProvider: () => null,
+      sessionRunState: (sid) => sessions.runState(sid),
+      toolCallRun: (sid, toolCallId) => sessions.runOfToolCall(sid, toolCallId),
+      currentRunId: (sid) => sessions.currentRunId(sid),
+    }));
+    // 预注册 fake 进程并同步 modelRevisions（复用进程不触发真实 spawn）
+    const register = pool.register.bind(pool);
+    vi.spyOn(pool, 'register').mockImplementation((...args) => {
+      (sessions as unknown as { modelRevisions: WeakMap<PiRpcProcess, string> }).modelRevisions.set(
+        args[1], modelRevision(config),
+      );
+      return register(...args);
+    });
+    const session = sessions.create(store, { title: '跨轮请求' });
+    const fake = new RoundFakeRpc();
+    pool.register(session.id, fake as unknown as PiRpcProcess, 'session');
+    const token = roundTools.createRunContext({
+      runKind: 'work', sessionId: session.id, outputRoot: os.tmpdir(), knowledgeBaseRoot: os.tmpdir(),
+    }).token;
+
+    try {
+      // 第一轮：运行中，pi 发起 tc_r1 工具调用（服务端权威记录归属）
+      const run1 = await sessions.sendMessage(store, session.id, { text: '第一轮' });
+      await vi.waitFor(() => expect(sessions.currentRunId(session.id)).toBe(run1.runId));
+      fake.emit('tool_execution_start', { toolCallId: 'tc_r1', toolName: 'app_command' });
+      expect(sessions.runOfToolCall(session.id, 'tc_r1')).toBe(run1.runId);
+      fake.resolvePrompt({ outcome: 'completed', lastAssistantText: '完成' });
+      await vi.waitFor(() => expect(sessions.currentRunId(session.id)).toBeNull());
+
+      // 第二轮开始（复用同一进程——旧令牌与进程均未变）
+      const run2 = await sessions.sendMessage(store, session.id, { text: '第二轮' });
+      await vi.waitFor(() => expect(sessions.currentRunId(session.id)).toBe(run2.runId));
+
+      // 旧轮迟到的工具 HTTP 请求（携 tc_r1）跨到新轮 → 拒绝；不产生批准
+      buildHits = [];
+      await expect(roundTools.executeTool(token, 'app_command', { command: 'kb.build' }, { toolCallId: 'tc_r1' }))
+        .rejects.toMatchObject({ code: 'stale_tool_request', status: 409 });
+      expect(roundApprovals.pendingCount()).toBe(0);
+      expect(buildHits).toHaveLength(0);
+
+      // 同轮（run2）请求照常：批准卡携带 runId；批准 → 执行
+      buildHits = [];
+      fake.emit('tool_execution_start', { toolCallId: 'tc_r2', toolName: 'app_command' });
+      const pending = roundTools.executeTool(
+        token, 'app_command', { command: 'kb.build', args: { mode: 'full' } }, { toolCallId: 'tc_r2' },
+      );
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const [dto] = roundApprovals.listPending(session.id);
+      expect(dto.runId).toBe(run2.runId);
+      expect((dto.preview as { confirmValue?: string }).confirmValue).toBe('BUILD');
+      roundApprovals.decide(session.id, dto.id, 'approve');
+      const result = await pending;
+      expect(result.details).toMatchObject({ command: 'kb.build' });
+      expect(buildHits).toHaveLength(1);
+
+      fake.resolvePrompt({ outcome: 'completed', lastAssistantText: '第二轮完成' });
+      await vi.waitFor(() => expect(sessions.currentRunId(session.id)).toBeNull());
+    } finally {
+      roundApprovals.close();
+      await pool.closeAll();
+      fs.rmSync(roundRoot, { recursive: true, force: true });
+    }
   });
 });

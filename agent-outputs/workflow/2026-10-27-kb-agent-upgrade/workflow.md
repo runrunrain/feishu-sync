@@ -67,8 +67,8 @@
 | 任务 | 执行 | 验收 | 状态 |
 |---|---|---|---|
 | T3a 端到端集成验证 | Leader/luban | 真机入口逐项：双模型构建含图片源、并行构建进度、编排插件驱动构建、CLI 全命令面、源库修改+上传（有权限文档）、预览修复前后对照 | **大体完成**（2026-10-27 Leader 实测：①CLI 开启→endpoint.json 0700/0600→shim→全命令面真实调用+退出码矩阵 4/2✓；②R5 完整链路真实云端验证：构造真实测试文档→edit(OCC)→dirty→preview(write_disabled 引导/overwrite+conflict 判定)→无确认 422→`--allow-overwrite --force --yes` 三段式 overwrite→云端回读追加段/`<sheet>` 字面保留/管道方括号保真→回拉 synced+清行→清理无残留✓；③认证断链修复真机验证✓；④S5/S7/S13 真机浏览器含 26 截图✓。受本机无生产数据根限制：真实并行构建/编排真实模型端到端/vision 真实识图——留主上真机环境使用时验证，已列入收口清单） |
-| T3b diting 高风险合并审核 | diting(full) | R5 写通道/R2 并行发布路径/安全边界 diff 一次合并审核，VERDICT=PASS | running（07112497） |
-| T3c 收口 | Leader | 总验收矩阵 met/partial/missed | pending |
+| T3b diting 高风险审核（四轮循环） | diting | R1(FIX 4C3M)→T3c(7修)→R2(FIX 5F/1R/1NF+新1C5M)→T3d(8+2修)→R3(FIX 6F/2R/2NF+3M1m)→T3e(4修)→**R4 PASS** | **done**（全部 accepted；四轮收敛 7→10→4→0 Critical 归零） |
+| T3c 收口 | Leader | 总验收矩阵 met/partial/missed | **done**（见下） |
 
 ## 4. 跨边界链路清单（初始，T1 后细化）
 
@@ -102,3 +102,25 @@
 - **S0 重大发现（D5）**：飞书 revision OCC 只防未来值，旧 revision 静默接受且 stale overwrite 造成正文重复损坏——设计 U20 已修订为三段式协议（fetch→立即写→写后回读校验），U18/U19/U21/§7.5/§11 同步定稿。S12 按修订版实现。
 - 第一批集成验证：server 78 files/1001 tests + 前端 160 tests + 三段 typecheck 全绿（S1+S2+S8+S11+认证修复+T2a 合并态）。
 - T2a 两切片验收：Leader 代跑合并后全量（前端 160 / server 定向 56 + 全量 866）全绿、typecheck 通过后 accept（自动基线检查因 vitest 探测形态不可用，waive 并以亲验替代）。
+
+
+## 8. 总验收矩阵（2026-10-28 收口）
+
+| 需求 | 结论 | 证据要点 |
+|---|---|---|
+| R1 图片/文本双模型 | **met** | `agent.vision` 配置（引 llm.providers 不新增 key）+ 三协议 VisionChannel + 内容寻址缓存 + preflight 预描述 + raw_read 内联/raw_read_image + UI 设置段（含测试按钮/降级警告）；vision 未配置时构建不阻断仅警告 |
+| R2 多子 agent 并行构建 | **met** | 单元划分（连通分量/LPT）+ 路径认领 + kb_unit_done + 唯一收尾轮 + 取消句柄集 + buildParallelism 1..6（W=1 等价回退）；假 pi 双 worker/失败/取消测试全绿 |
+| R3 agent 编排插件 | **met** | knowledge-workbench「任务编排」配置 + 3 角色卡 + task_submit/query/resume/cancel + DONE/BLOCKED marker + blocked→作答→resume + UI 任务区（真机 6 截图）；安全边界经 diting 四轮打磨（跨会话归属/递归防护/冻结 Workspace/插件互斥） |
+| R4 封装 CLI | **met** | esbuild 单文件 CLI（25+5 命令/--json/退出码矩阵）+ 独立 cliToken+endpoint.json(0600) + shim + 设置卡片；对真实 server 端到端 16/16+13/13；Leader 真实命令面冒烟 |
+| R5 源库修改+上传飞书 | **met** | SourceEditService 受控写（header 保全/OCC/备份/审计）+ local_edit_pending 防覆盖 + 三段式写回（fetch→立即写→写后回读）+ CLI source.* 5 命令；**真实云端端到端全通**（构造真实测试文档→编辑→force 推送→云端保真→回拉清行） |
+| R6 md 预览逐项修复 | **partial** | 19 项缺陷全清单（T0a）；渲染端 17 项 + 生成端 D3/D4 已修（53 个新测试，前端 237 全绿）；**10 项待主上真实样本确认**（公式/mermaid/下划线等形态需生产数据核对） |
+| 附：应用内认证断链 | **met**（额外） | lark-cli 1.0.97 URL 形态变更修复 + 真机验证；主上已走应用内完成认证 |
+
+最终全量：server **1216 tests** + 前端 **237 tests** + 三段 typecheck + eslint 0 error；diting 四轮审核 VERDICT=PASS（静态范围）。
+
+### 遗留清单（移交主上/后续版本）
+1. R6 十项待真实样本（T0a §⑤）——提供数据根路径或样例文件即可补修。
+2. 真实模型端到端：vision 真实识图质量、并行构建真实模型 fixture 对比、编排真实 pi 全链——本机无生产数据根与模型额度授权。
+3. diting 遗留观察（原样保留）：raw_read_image 取消 signal、SyncEngine getPendingLocalEditState DB 故障 fail-open、CLI 写授权便捷入口（auth.login 不支持 scopeSet）、Windows ACL/卷别名。
+4. 打包链验证：desktop:dist 产物上 CLI 的 ELECTRON_RUN_AS_NODE 冒烟、Windows 侧全量。
+5. 主上已提交 b687416（主体）；T3e 修复轮 + 终审报告等 29 处未提交，待主上审后提交。

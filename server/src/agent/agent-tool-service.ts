@@ -145,16 +145,26 @@ export interface InternalRunContext extends AgentRunContext {
   options: RunContextOptions;
 }
 
+/** 单次工具请求的调用侧元数据（内部 API 透传；不进模型可见面）。 */
+export interface ToolRequestMeta {
+  /** T3b-07R：pi 分配的 toolCallId（轮次归属绑定的权威键）。 */
+  toolCallId?: string;
+}
+
 /** 工具族内单个工具的注册项（S1 工具族注册模型）。 */
 export interface AgentToolFamilyTool {
   /** 工具规格。tool-specs.ts 仍是唯一定义源：族只引用 SPEC 常量，不复制。 */
   spec: AgentToolSpec;
   /** 哪些 runKind 可见本工具（决定 createRunContext 白名单成员）。 */
   runKinds: ReadonlyArray<AgentRunKind>;
-  /** 执行器：与重构前 dispatch 分支同一实现，同一错误码与错误消息。 */
-  execute: (context: InternalRunContext, args: Record<string, unknown>) => Promise<ToolResult> | ToolResult;
+  /** 执行器：与重构前 dispatch 分支同一实现，同一错误码与错误消息；meta
+   * 为内部 API 透传的调用侧元数据（toolCallId 等，可缺省）。 */
+  execute: (
+    context: InternalRunContext,
+    args: Record<string, unknown>,
+    meta?: ToolRequestMeta,
+  ) => Promise<ToolResult> | ToolResult;
 }
-
 /**
  * 工具族：一族相关工具的注册单元。S1 把散置的白名单/dispatch/规格收敛
  * 为族注册；后续切片（S3 raw_read_image、S6 task_*、S10 app_command）
@@ -393,8 +403,13 @@ export class AgentToolService {
       .filter((spec): spec is AgentToolSpec => Boolean(spec));
   }
 
-  /** POST /tools/:name 执行入口。 */
-  async executeTool(token: string, toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
+  /** POST /tools/:name 执行入口（meta：内部 API 透传的调用侧元数据）。 */
+  async executeTool(
+    token: string,
+    toolName: string,
+    args: Record<string, unknown>,
+    meta?: ToolRequestMeta,
+  ): Promise<ToolResult> {
     const context = this.contexts.get(token);
     if (!context) {
       throw new ToolError('run_token_invalid', '运行令牌无效或已过期', 401);
@@ -409,7 +424,7 @@ export class AgentToolService {
     const argsSummary = summarizeArgs(toolName, args);
     context.options.onEvent?.({ phase: 'start', toolName, argsSummary });
     try {
-      const result = await tool.execute(context, args);
+      const result = await tool.execute(context, args, meta);
       const resultSummary = summarizeResult(result);
       context.options.onEvent?.({ phase: 'end', toolName, argsSummary, resultSummary, isError: false });
       return result;
@@ -901,6 +916,9 @@ export class AgentToolService {
   private toolKbDeleteDoc(context: InternalRunContext, args: Record<string, unknown>): ToolResult {
     const state = requireBuildState(context);
     const docPath = requireString(args, 'path', 1, 600);
+    // R2-04：与 kb_write_doc 同一合法规范路径门——`./`/反斜杠等别名在
+    // 认领与触盘之前拒绝，防止用另一字符串认领却删除同一实际文件。
+    validateStdDocPath(docPath);
     // S4（§4.3）：删除同样受路径认领约束；收尾轮不受限
     this.assertPathClaim(context, state, docPath);
     removeFileInside(path.join(state.stagingRoot, 'docs'), docPath);
