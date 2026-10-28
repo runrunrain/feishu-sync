@@ -41,7 +41,7 @@
 | 临时资料的真实模型往返 | 本应用工具确实读取/写入及实际构建发布 | 生产知识库、大库性能或全部提供商兼容性 |
 | 真实浏览器/桌面 | 实际UI、fetch SSE、权限确认与失败反馈 | 不能凭绿色状态或截图文字断言文件/DB已正确提交 |
 
-重点回归入口：server的`path-guard`、`agent-config`、`agent-internal-auth`、`agent-session`、`agent-status-regression`、`kb-build`、`mcp-kb`、`pi-probe`及后续生命周期专项；前端的`agentReadiness`、`sseStream`、`MarkdownView`和`remoteImageConsent`。实际测试文件以目录和统一入口为准，不以此表数量为门禁。
+重点回归入口：server的`path-guard`、`agent-config`、`agent-internal-auth`、`agent-session`、`agent-status-regression`、`agent-process-pool`、`agent-tasks`、`agent-approvals-routes`、`agent-tool-families`、`app-command-family`、`ops-command-table`、`kb-build`、`kb-build-parallel`、`kb-build-units`、`kb-path-claims`、`kb-source-images`、`mcp-kb`、`pi-probe`及后续生命周期专项；升级新增面还有 `vision-*`（通道/配置/描述器/路由）、`cli-*`（args/client/endpoint/source-commands）、`source-edit`/`source-push` 与 `layout-reconstructor`（五类块转义专项，6 用例）及前端 `MarkdownView.defects`（导出形态预览修复回归）。前端的`agentReadiness`、`sseStream`、`MarkdownView`和`remoteImageConsent`仍为基础入口。实际测试文件以目录和统一入口为准，不以此表数量为门禁。
 
 - 权限测试要调用实际Workspace/配置路由，覆盖授权后再改raw/std/Node/pi根；只测`isPathInside`不足以证明真实保护根完整。
 - 生命周期测试要覆盖未spawn前的容量限制、失败/自然exit/idle/close后的能力撤销，以及busy期间不会按idle回收。

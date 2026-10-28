@@ -157,7 +157,7 @@ auto_retry_start 累计 > 3 次     → abort，failed(model_request_failed)
 
 ### 4.5 进程池
 
-- `agent.maxConcurrentProcesses` 默认 2（构建占 1，会话占其余；超出时会话请求返回 `409 agent_busy`）。
+- `agent.maxConcurrentProcesses` 默认 3、范围 1..6（后台类合计 ≤ M−1 为交互会话保留槽，后台任务 FIFO 排队而非立即 409；见 §18 升级增补与基线 §5.2）。
 - 会话进程空闲 `agent.idleTimeoutMinutes`（默认 10）后 `stdin.end()` + 5s 后 kill；下次发消息用同一 `--session-id` 重新拉起，pi 从 JSONL 恢复上下文。
 - server `close()` 时终止全部子进程（POSIX 发 SIGTERM，3s 后 SIGKILL；Windows `taskkill /T /F`）。
 

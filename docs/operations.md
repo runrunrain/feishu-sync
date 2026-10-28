@@ -75,8 +75,9 @@ npx tsx scripts/sync-latest.ts --skip-index --apply    # 提交KB正文，仅 cr
 
 ## Agent 工作台验证与打包（开发分支）
 
-- `npm run server:build` 除tsc外，还运行`server/scripts/build-agent-assets.mjs`：复制内置prompts/转发扩展，借`server/scripts/lib/`打包独立MCP CJS。写面仅server/dist，不修改用户资料。
-- Electron31仍内嵌业务server；pi使用外部Node≥22.19。安装包需核对asarUnpack后的扩展/prompts/MCP路径，以及外部运行时的实际发现结果；原生SQLite ABI构建成功不等于桌面运行验证成功。
+- `npm run server:build` 除tsc外，还运行`server/scripts/build-agent-assets.mjs`：复制内置prompts/转发扩展，借`server/scripts/lib/`打包独立MCP CJS（`dist/mcp/kb-mcp.cjs`）与CLI客户端（`dist/cli/feishu-sync-cli.cjs`，esbuild platform=node 单文件）。写面仅server/dist，不修改用户资料。
+- Electron31仍内嵌业务server；pi使用外部Node≥22.19。安装包需核对asarUnpack后的扩展/prompts/MCP/CLI路径，以及外部运行时的实际发现结果；原生SQLite ABI构建成功不等于桌面运行验证成功。
+- CLI 打包形态：应用内「设置 → 应用 → 命令行访问 → 安装命令行工具」经 `/api/cli/install-shim` 写 `<dataRoot>/bin/feishu-sync`（POSIX 0755）与 `feishu-sync.cmd`（Windows）——打包版 shim 以应用 Electron 可执行文件 + `ELECTRON_RUN_AS_NODE=1` 调起 cli.cjs，开发版用当前 Node。CLI 只调运行中的 server（读 `<dataRoot>/run/endpoint.json`），无离线直写；退出码 3 表示应用未运行/不可达。
 - MCP可用独立外部Node运行，不应为连接MCP重编译SQLite。仅使用完整已发布目录；不要把.builds/.staging当知识库，也不要手改CURRENT或已发布正文。
 - 真实模型smoke不是普通单测，需显式授权额度，且只使用脚本自建的无敏感fixture。POSIX shell示例（在server/）：
 

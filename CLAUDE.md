@@ -25,6 +25,9 @@ npm run dev:desktop  # 编译 server/dist + dist-electron 后并行 vite + elect
 # 构建
 npm run build:all     # vite build + server tsc
 npm run electron:build   # esbuild main.ts/preload.ts → dist-electron/*.cjs
+# 注：server build 同时运行 build-agent-assets.mjs —— 复制 prompts/转发扩展，
+# 并 esbuild 打包独立 MCP（server/dist/mcp/kb-mcp.cjs）与 CLI 客户端
+# （server/dist/cli/feishu-sync-cli.cjs，随 asarUnpack server/** 解包）。
 
 # 测试（根目录统一入口；server 测试在 server/ 下，vitest）
 npm run check             # lint + typecheck + 前端/server 全部测试（CI 同口径）
@@ -107,18 +110,28 @@ npx tsx scripts/sync-latest.ts --skip-index --apply    # 提交KB正文，仅 cr
 
 ### Agent 标准知识库工作台（开发分支，未发版）
 
-- 先读 `docs/design/agent-knowledge-design.md`，使用说明在 `docs/agent-knowledge.md`；`server/src/agent/`、`kb/`、`mcp/` 独立于既有同步/整理流水线。不要把 pi 接入 ContentBackend registry，也不为 pi 升级 Electron。
+- 先读 `docs/design/agent-knowledge-design.md`（基线）与 `docs/design/kb-agent-upgrade-design.md`（2026-10 升级增补），使用说明在 `docs/agent-knowledge.md`；`server/src/agent/`、`kb/`、`mcp/`、`sources/`、`ops/`、`cli/` 独立于既有同步/整理流水线。不要把 pi 接入 ContentBackend registry，也不为 pi 升级 Electron。
 - pi 经外部 Node≥22.19、pi≥1.4/<2 的 JSONL RPC 启动。应用自身的转发扩展只调用回环内部API；服务端裁决工具集与能力令牌。应用自带的Discuss工具只读，Work不提供shell。显式添加的原生Pi插件是受用户信任的Node代码，以当前用户权限运行；不能用宿主工具围栏宣称它们具备OS沙箱。
 - Workspace 与原始库、标准库、数据根、完整应用代码/依赖、Node/pi运行资源和凭据根隔离；配置变更要做反向交叉验证，不能只在登记目录时校验。文件围栏不是同uid/外部自动执行器的OS沙箱。
 - 原始源以成功本地版本和hash为准，不能仅筛status=synced，也不能因cloudDeleted观测而删仍存在的源；CSV附件与主文档同围栏，源变化须阻断构建，模型skip不能绕过。
 - 标准库先staging校验，再生成不可变release、原子切CURRENT；提交后DB异常按指针对账，清理异常不得删除current release。不要把原同步引擎的“DB失败回滚文件”套在此处。
 - 会话历史真相在pi JSONL树，元数据节点不能截断回溯；SSE message_end必须是完整DTO，初始0游标、溢出resync、工具多轮与停止ACK竞态都需实际流回归。状态只能按权威事件推进，不用“请求停止”冒充完成。
-- Pi插件以原生package为单位，由正式CLI安装/更新/移除，SDK解析manifest与资源；仅管理应用agent/pi-home。knowledge-workbench内置包包含对话/Work/构建/文风配置项。运行期只显式加载应用启用的资源，通用Pi认证经Pi只读存储复用，不复制密钥。插件包变更须拒绝活跃任务并回收空闲进程，本地插件源码也受Workspace保护。
+- Pi插件以原生package为单位，由正式CLI安装/更新/移除，SDK解析manifest与资源；仅管理应用agent/pi-home。knowledge-workbench内置包包含对话/Work/构建/文风/任务编排配置项。运行期只显式加载应用启用的资源，通用Pi认证经Pi只读存储复用，不复制密钥。插件包变更须拒绝活跃任务并回收空闲进程，本地插件源码也受Workspace保护。
 - `server/scripts/build-agent-assets.mjs` 随server build复制prompts/转发扩展并生成独立MCP CJS；MCP只读已发布文件，不导入SQLite。测试一律临时FEISHU_SYNC_HOME；真实模型fixture与真实生产资料严格分开记录。
+
+#### 2026-10 升级增补（kb-agent-upgrade S0–S14 已合入）
+
+- **双模型与并行构建**：`agent/vision/`（VisionChannel/VisionDescriber，内容寻址缓存 `<dataRoot>/agent/vision-cache/`；配置 `agent.vision` 缺省 disabled，失败不阻断构建、图片标 unavailable + 构建警告）。`kb/build-units.ts` + `kb/path-claims.ts` + `kb/source-images.ts` 支撑多 worker 并行构建：`standardKb.buildParallelism` 1..6 默认 2（=1 等价旧行为）；单元内 `kb_unit_done` 上报，`kb_finish` 仅收尾轮可用；worker 写他单元路径被 `kb_path_owned_by_other_unit` 拒绝；快照条目新增 `mediaHash`（`contentHash` 公式不变，旧 manifest 视为未变）。
+- **进程池准入**（`agent-process-pool.ts`）：`acquire('session'|'background')` FIFO 排队，后台类（构建 worker/任务进程）合计 ≤ M−1（M≥2 时为交互会话保留 1 槽）；`agent.maxConcurrentProcesses` 1..6 默认 3。会话仍是立即语义（满 → 409 agent_busy）。
+- **任务编排**（`agent/tasks/` + `agent/roles/`）：`task_submit/query/resume/cancel` 工具与 `agent_tasks` 表；三张内置角色卡（analyst/converter/reviewer）；子任务工具集 = 角色请求 ∩ 父会话模式工具集，永不获得 `task_*`/`app_command`；跨会话任务归属校验；开关是 knowledge-workbench 内置插件的「任务编排」条目（默认停用）。
+- **CLI 与运维命令面**：`ops/command-table.ts` 30 条命令表，CLI 与内部 Agent 工具 `app_command` 共用（HTTP API 仍是唯一业务契约）。CLI 源码 `server/src/cli/`，产物 `server/dist/cli/feishu-sync-cli.cjs`；应用内一键生成 shim `<dataRoot>/bin/feishu-sync`。开启 `cli.enabled` 后 `cli-endpoint.ts` 发布 `<dataRoot>/run/endpoint.json`（0700/0600，tmp+rename）与独立 CLI 令牌；`middleware/cli-auth.ts` 三重校验（回环 Host + 无 Origin + `X-Cli-Token` timing-safe）。**CLI 令牌与 desktop token 双向隔离**：`/api/cli/enable|token/rotate|info|install-shim` 只接受 desktop token；CLI 令牌不进 `/api/agent-internal/*`，desktop auth 域也不接受 CLI 令牌。命令表 `config.set` 对 CLI/app_command 主体禁改 `cli.*`/`llm.*` 密钥面/`agent.workspaces`/`feishuWrite`；`PUT /api/config` 对 CLI 主体（内部转发 actor 标记）丢弃 `feishuWrite`。CLI 退出码 0/1/2/3/4；destructive/remote_write 需 `--yes`。
+- **app_command 批准流**（`agent/approvals/` + `agent/tools/app-command-family.ts`，工具族经 `AgentToolService.registerToolFamily()` 注册）：read 级直通；mutate/destructive/remote_write 逐次经会话内用户批准（`/api/agent/sessions/:id/approvals*` + SSE `approval_request`）；模型传入的 confirm 字段一律剔除，批准执行绑定服务端运行轮次（会话停止即取消待执行复核、拒绝跨轮操作）。
+- **源库受控写与写回飞书**（`sources/`）：SourceEditService 是原始库正文第三写者（用户或经批准的 `app_command source.*`）：原 header 字节保全（写后 `parseMetadata` 逐字段复核）+ baseHash OCC + 编辑前备份 `<dataRoot>/source-edits/<objToken>/` + 审计 `agent/audit/source-edits.jsonl`；`source_edits` 表登记 dirty/pushing/pushed/conflict。**SyncEngine/回收站/源清理/孤立清理遇非 pushed 行一律 `local_edit_pending` 拒绝（blocker），绝不覆盖**。FeishuWriteService 经 lark-cli `docs +update` 三段式写回（fetch → 同流程立即写 → 写后回读校验，转义归一化层比对；stale overwrite 会静默损坏正文，绝不重试旧 revision）；写回**不推进任何 synced 基线**，成功后立即单文档回拉收敛。写权限走 `scopeSet:'write'` 增量授权（`WRITE_SCOPES=['docx:document:write_only']`，`feishuWrite.enabled` 默认关）。
+- **原始库写者不变量已修订**（基线 §13.1）：正文只由登记在册的受控写者修改——SyncEngine（云端→本地）、源生命周期操作（回收站 restore/purge、源清理、孤立清理，只移动/删除不改正文）、SourceEditService；`feishu_sync` 头部字节只由 SyncEngine 生成；Agent 工具对原始库仍只有读路径，唯一写入口是经用户逐次批准的 `app_command source.*`。
 
 ### 数据层
 
-- SQLite 在 `~/.feishu-sync/feishu-sync.db`，config 在 `~/.feishu-sync/config.json`；环境变量 `FEISHU_SYNC_HOME` 可整体改根目录（server 与 desktop 共享，**不是** Electron userData）。除 documents/sync_log/run_log 主表外还有 localDirs/custom_folders/sheet_sheets/feishu_pending_items 等辅助表，全部经 additive 迁移演进。
+- SQLite 在 `~/.feishu-sync/feishu-sync.db`，config 在 `~/.feishu-sync/config.json`；环境变量 `FEISHU_SYNC_HOME` 可整体改根目录（server 与 desktop 共享，**不是** Electron userData）。除 documents/sync_log/run_log 主表外还有 localDirs/custom_folders/sheet_sheets/feishu_pending_items 等辅助表，以及工作台的 kb_builds/agent_sessions/agent_tasks/source_edits（kb_builds 含 parallelism/unit_total/vision_model/warnings_json 增列），全部经 additive 迁移演进（新表/新列双登记 additive 数组 + `getCreateTablesDDL()`）。config 的工作台段：`agent`（runtime/model/vision/orchestration/maxConcurrentProcesses/workspaces）、`standardKb`（含 buildParallelism）与可选段 `cli`/`feishuWrite`（均默认关，additive）。
 - `LocalMapStore`（`local-map-store.ts`）用 better-sqlite3 **同步** API + 预编译语句。`initialize()` 每次启动跑 `applyAdditiveMigrations()`：每条 `ALTER TABLE ADD COLUMN` 用 `PRAGMA table_info` 守卫，旧库原地升级。新列加到该数组 + `getCreateTablesDDL()` 两处。
 - 历史迁移脚本（`server/scripts/migration_v2..v5`）是文件级参考；线上升级靠上面的 additive 自动迁移，不再手工跑。
 - **`watchedRoots`（`WatchedRootConfig[]`）是真相源**，`watchedRootUrls` 是 ConfigManager 内存派生、不落盘的兼容投影。

@@ -14,8 +14,8 @@ npm install && cd server && npm install && cd ..
 
 | 包 | 职责 | 测试 |
 |----|------|------|
-| 根 | React 前端 `src/`、Electron `electron/`、构建脚本 | vitest（`src/**/*.test.{ts,tsx}`，8 文件） |
-| `server/` | Hono server、业务模块、运维脚本 | vitest（`tests/**/*.test.ts`，43 文件） |
+| 根 | React 前端 `src/`、Electron `electron/`、构建脚本 | vitest（`src/**/*.test.{ts,tsx}`，27 文件） |
+| `server/` | Hono server、业务模块、运维脚本 | vitest（`tests/**/*.test.ts`，90 文件） |
 
 根 `dependencies` 为空、运行库全在 devDependencies——这是既定结构（打包只收 `server/node_modules/**`，见 `electron-builder.config.cjs` files 列表），不是错误。
 
@@ -35,9 +35,11 @@ npm run typecheck      # 根 src（含测试）+ 根配置 + server 三段
 npm run test:all       # 双包全部测试
 
 # 构建
-npm run build:all      # vite build + server tsc
+npm run build:all      # vite build + server tsc（含 build-agent-assets：prompts/MCP/CLI 产物）
 npm run electron:build # esbuild main/preload → dist-electron/*.cjs
 ```
+
+`build:all` 中的 server build 会同步生成 Agent 工作台资产：内置 prompts/转发扩展复制、独立 MCP CJS（`server/dist/mcp/kb-mcp.cjs`）与 CLI 客户端（`server/dist/cli/feishu-sync-cli.cjs`，esbuild 单文件、零原生依赖）。CLI 的使用与认证见 [agent-knowledge.md](./agent-knowledge.md)「命令行访问」。
 
 单跑 server 测试/用例：
 

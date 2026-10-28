@@ -1,6 +1,6 @@
 # 架构与模块地图
 
-> 锚点声明：本文结构与代码实测对齐（2026-10，v0.3.47 基线）。模块职责的权威细节在源码头注释，本文是导航图，不复制全部细节。
+> 锚点声明：本文结构与代码实测对齐（2026-10，v0.3.47 基线 + feat/agent-knowledge-workbench 工作台升级）。模块职责的权威细节在源码头注释，本文是导航图，不复制全部细节。
 
 ## 三层同进程架构
 
@@ -57,9 +57,12 @@ flowchart LR
   - `lark-cli-client.ts` / `lark-cli-manager.ts`：lark-cli 子进程封装（QPS 节流、错误分类、99991400 指数退避）
   - `config-manager.ts`：`watchedRoots` 真相源；`watchedRootUrls` 是内存派生投影
 - **routes/**：HTTP 路由，从 context 同名属性取依赖；前缀在路由文件内写死后 `app.route('/', xxxRoutes)` 挂载
-- **agent/**（开发分支）：外部运行时发现、pi JSONL RPC、进程池、工具权限、路径围栏、会话历史与 SSE；`pi-extension/` 只负责转发，权限裁决留在 server
-- **kb/**（开发分支）：原始源快照、构建/覆盖校验、不可变发布、CURRENT 指针、已发布内容查询
+- **agent/**（开发分支）：外部运行时发现、pi JSONL RPC、进程池（`acquire('session'|'background')` FIFO 准入，后台合计 ≤ M−1）、工具权限（工具族注册 `registerToolFamily`）、路径围栏、会话历史与 SSE；`tasks/`+`roles/` 任务编排（agent_tasks 表、三张角色卡）；`vision/` 图片理解通道（VisionChannel/VisionDescriber + 内容寻址缓存）；`approvals/` 会话内批准流；`pi-extension/` 只负责转发，权限裁决留在 server
+- **kb/**（开发分支）：原始源快照、构建/覆盖校验、不可变发布、CURRENT 指针、已发布内容查询；`build-units.ts`/`path-claims.ts`/`source-images.ts` 支撑多 worker 并行构建（buildParallelism 1..6 默认 2）
 - **mcp/**（开发分支）：只读 stdio 入口；构建为无 SQLite 原生依赖的独立 CJS
+- **sources/**（开发分支）：原始库正文受控写与写回飞书——`source-edit-service.ts`（header 字节保全 + baseHash OCC + 备份/审计）、`feishu-write-service.ts`（三段式写回 + 回拉收敛）、`push-planner.ts`（append/overwrite 纯函数）、`source-write-lock.ts`（按 objToken 进程内互斥）
+- **ops/**（开发分支）：`command-table.ts` 30 条命令表（风险级 read/mutate/destructive/remote_write），CLI 与 `app_command` 工具共用；HTTP API 仍是唯一业务契约
+- **cli/**（开发分支）：CLI 客户端源码（esbuild 产物 `server/dist/cli/feishu-sync-cli.cjs`）；配套 `server/src/cli-endpoint.ts`（`<dataRoot>/run/endpoint.json` 发布/轮换）与 `server/src/middleware/cli-auth.ts`（回环 + 无 Origin + `X-Cli-Token` 三重校验）
 
 ## Agent 侧车与标准库（开发分支）
 
@@ -76,18 +79,22 @@ flowchart LR
     MCP[独立只读 MCP stdio] --> KB
 ```
 
-- Discuss 不暴露本地写工具；Work 仅在显式授权 Workspace 内操作文件，无 shell。运行代码/凭据、原始库和标准库均须与 Workspace 隔离，不能仅靠 prompt 约束。
+- Discuss 不暴露本地写工具；Work 仅在显式授权 Workspace 内操作文件，无 shell。运行代码/凭据、原始库和标准库均须与 Workspace 隔离，不能仅靠 prompt 约束。Work 会话可经 `app_command` 执行运维命令：read 级直通，mutate/destructive/remote_write 逐次经会话内用户批准（模型传入的 confirm 字段一律剔除）。
 - 新构建失败不能沿用原同步引擎的 DB 回滚语义：标准库以 CURRENT 为发布真相，指针提交后的状态库故障应对账，不得误删当前 release。两条流水线的原子提交实现分开维护。
 - 原始源集合依据成功本地版本与文件/hash，不按云端 observed/status 直接删源；sheet CSV 附件使用相同读取围栏。
-- 使用说明见 [agent-knowledge.md](./agent-knowledge.md)，完整 API/安全契约见 [设计文档](./design/agent-knowledge-design.md)。
+- 并行构建：单元划分后多 worker 各自 acquire 后台进程槽，路径先到先认领（`path-claims.ts`）；任一单元重试后仍失败则整体失败、CURRENT 不动；收尾轮在全部单元 join 后对聚合状态统一校验。
+- CLI（`feishu-sync`，设置开启 `cli.enabled` 后可用）：业务命令只走运行中 server（无离线直写）；独立 CLI 令牌与 desktop token 双向隔离，`/api/cli/enable|token/rotate|info|install-shim` 只接受 desktop token，CLI 令牌不进 `/api/agent-internal/*`；命令面由 `ops/command-table.ts` 单表供给。
+- 源编辑与写回（`sources/`）：仅 docx 且规范头的源可编辑；`source_edits` 登记脏状态，SyncEngine/回收站/源清理遇非 pushed 行一律 `local_edit_pending` 拒绝；写回飞书三段式（fetch→写→回读校验）且不推进任何 synced 基线，成功后单文档回拉收敛。
+- 使用说明见 [agent-knowledge.md](./agent-knowledge.md)，完整 API/安全契约见 [基线设计](./design/agent-knowledge-design.md) 与 [升级增补](./design/kb-agent-upgrade-design.md)。
 
 ## 关键不变量（改动前必读）
 
 1. **synced 基线推进契约**：只有 staged 原子提交成功才推进 `synced_obj_edit_time` 并置 `synced`。资源缺失/下载失败/提交异常一律不推进（`sync-engine.ts`）。
 2. **原子提交顺序**：staging → 校验 → rename → DB 事务，不可重排；文件已提交但 DB 失败时走回滚（`atomic-commit.ts`，`SyncEngineTestHooks` 验证）。
 3. **双身份互斥**：`custom_folder_id` 与 `watched_root_*` 不得并存；结构树所有权优先。回填不清 `wiki_node_token`；飞书树出口必须按 `customFolderId IS NULL` 过滤归档行（两处视图）。
-4. **零飞书 token**：代码中不得出现任何飞书 token/app_id/app_secret；全部委托 lark-cli user 认证态。
+4. **零飞书 token**：代码中不得出现任何飞书 token/app_id/app_secret；全部委托 lark-cli user 认证态。写回飞书走 lark-cli `docs +update` + `docx:document:write_only` 增量授权，不在代码中引入新凭据形态。
 5. **Markdown header round-trip**：`generateHtmlHeader` 写、`IndexScanner.parseMetadata` 读，当前规范为文件首部 YAML-in-HTML-comment（另兼容 3 种历史格式）。改字段必须同步两端并有 round-trip 用例。
+6. **原始库受控写者清单（工作台升级后）**：原始库正文只由 SyncEngine（云端→本地）、源生命周期操作（回收站/源清理/孤立清理，只移动删除不改正文）、SourceEditService（用户或经批准的 `app_command source.*`）修改，每次写有审计；`feishu_sync` 头部字节只由 SyncEngine 生成；存在非 pushed `source_edits` 行时任何链路不得覆盖/移动/删除该文档（`local_edit_pending`）。`synced_obj_edit_time` 仍只由 SyncEngine 原子提交推进，写回飞书不推进任何同步基线。
 
 ## Electron 侧（electron/）
 

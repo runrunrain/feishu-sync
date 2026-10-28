@@ -12,7 +12,7 @@
 
 ---
 
-> **开发分支预览**：本分支另含 [Agent 标准知识库工作台](./docs/agent-knowledge.md)：原始库只读整理、可追溯阅读、Discuss/Work 会话及只读 MCP。尚未发版且安全复审未通过，勿对正式资料启用 Work；现有 v0.3.47 安装包不含这些新入口。
+> **开发分支预览**：本分支另含 [Agent 标准知识库工作台](./docs/agent-knowledge.md)：原始库只读整理、可追溯阅读、Discuss/Work 会话、只读 MCP，以及双模型图片理解、多进程并行构建、任务编排、`feishu-sync` 命令行、源文档受控编辑与写回飞书。尚未发版；残留修复已通过独立安全复审，但 Electron 本机、Windows、安装包与真实远端 Key 等验证边界仍保留，勿在未备份的正式资料上启用 Work 与写回。现有 v0.3.47 安装包不含这些新入口。
 
 ## 下载与安装
 
@@ -73,8 +73,8 @@ node node_modules/tsx/dist/cli.mjs server/scripts/preview-sheet-workbook.ts <已
 - **后端**：Hono 4 + @hono/node-server（内嵌同进程）
 - **数据**：better-sqlite3 12（SQLite，documents/sync_log/run_log 主表 + localDirs/custom_folders 等辅助表，启动时 additive 迁移原地升级）
 - **LLM**：OpenAI SDK → 智谱 bigmodel GLM（OpenAI 兼容端点，默认 `glm-4-flash`）
-- **飞书**：lark-cli（实测 1.0.89；认证、变更检测、内容读取、媒体下载统一入口；工具不保存飞书 token）
-- **Agent（开发分支）**：外部 Node ≥22.19 + pi ≥1.4/<2 的 RPC 侧车；独立只读 MCP stdio 产物
+- **飞书**：lark-cli（实测 1.0.89；1.0.97 的 config init 双形态 URL 已兼容；认证、变更检测、内容读取、媒体下载与写回统一入口；工具不保存飞书 token）
+- **Agent（开发分支）**：外部 Node ≥22.19 + pi ≥1.4/<2 的 RPC 侧车；独立只读 MCP stdio 产物与 `feishu-sync` CLI（esbuild 单文件 CJS）
 - **开发**：TypeScript 5 + esbuild 0.28
 
 ---

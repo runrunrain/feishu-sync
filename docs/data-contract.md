@@ -34,14 +34,20 @@
 | `agent_sessions` | 会话标题、模式、Workspace绑定、pi JSONL文件定位与最近错误；正文历史不放SQLite |
 | `<dataRoot>/agent/sessions/*.jsonl` | pi v3树形会话历史；沿当前叶回溯全部节点，输出时才筛消息，不能让compaction/model_change父节点截断历史 |
 | `<dataRoot>/agent/audit/<sessionId>.jsonl` | 写入工具/路径/结果元数据，不含写入正文 |
-| `kb_builds` | 构建状态与统计；CURRENT提交后的异常以文件发布事实为准启动对账，不可用旧DB状态否认已发布内容 |
+| `agent_tasks`（2026-10 升级） | 任务编排记录（role/status/output_dir/tools_json/plugin_revision/rounds/result/questions）；状态机 queued/running/done/blocked/failed/cancelled/interrupted；启动时非终态置 interrupted；跨会话访问校验归属 |
+| `source_edits`（2026-10 升级） | 原始库受控编辑登记（state dirty/pushing/pushed/conflict、base/current_body_hash、push_mode/revision）；启动时 pushing 置 conflict（push_interrupted）；SyncEngine/回收站/源清理遇非 pushed 行一律 `local_edit_pending` 拒绝 |
+| `kb_builds` | 构建状态与统计（含增列 parallelism/unit_total/vision_model/warnings_json）；CURRENT提交后的异常以文件发布事实为准启动对账，不可用旧DB状态否认已发布内容 |
+| `<dataRoot>/agent/vision-cache/` | 图片描述内容寻址缓存（`<hash[0:2]>/<imageHash>.<modelKey>.json`，tmp+rename）；v1 无淘汰 |
+| `<dataRoot>/source-edits/<objToken>/` | 源编辑前备份（base.md 同步版正文 + 最近 20 份编辑前版本） |
+| `<dataRoot>/agent/audit/{cli,source-edits,source-pushes}.jsonl` | CLI 命令（非 GET）、源编辑、写回的审计流水；只记时间/方法/路径/hash 等元数据，不记正文 |
+| `<dataRoot>/run/endpoint.json` | CLI 端点发现文件（url/pid/cliToken，0600，tmp+rename）；仅 `cli.enabled` 时发布，pid 匹配才可 revoke |
 | `<outputRoot>/CURRENT.json` | 当前发布指针；一次读取绑定一个release，不能混读两个版本 |
-| `<outputRoot>/releases/<releaseId>/manifest.json` 与 `docs/` | 完整已发布快照及来源；应用不修改已发布正文，MCP只读此处，不读取SQLite |
+| `<outputRoot>/releases/<releaseId>/manifest.json` 与 `docs/` | 完整已发布快照及来源（快照条目含 mediaHash/imageCount）；应用不修改已发布正文，MCP只读此处，不读取SQLite |
 | `.staging/<buildId>` 与 `.builds/<buildId>` | 暂存内容、构建事件和校验报告；不是可对外查询的发布 |
 
-以上新表仍经幂等DDL/additive策略建立，不改原`documents`身份及同步基线语义。`dataRoot`与桌面/服务端共用`FEISHU_SYNC_HOME`解析。
+以上新表仍经幂等DDL/additive策略建立（agent_tasks/source_edits 新表与 kb_builds 新列均双登记 additive 数组与 `getCreateTablesDDL()`），不改原`documents`身份及同步基线语义。`dataRoot`与桌面/服务端共用`FEISHU_SYNC_HOME`解析。
 
-配置新增`agent.runtime/model/workspaces`和`standardKb`段。Workspace通过专用API登记，普通PUT配置不接受`agent.workspaces`；改变原始库、标准库或运行资源根也必须对已有Workspace做反向交叉校验，不能只在最初登记时检查。
+配置新增`agent`（runtime/model/**vision**/**orchestration**/maxConcurrentProcesses/workspaces）与`standardKb`段，另有可选段`cli`（命令行访问，默认关）与`feishuWrite`（飞书写回，默认关）；`LlmModelPreset` 增可选 `supportsImages`（仅 UI 提示）。`agent.vision` 以 providerId/modelId 引用 `llm.providers`，不新增密钥字段，缺省 disabled。`standardKb.buildParallelism` 1..6 默认 2，`agent.maxConcurrentProcesses` 1..6 默认 3（后台类合计 ≤ M−1）。`cli`/`feishuWrite` 只接受 desktop token 修改，CLI 主体提交的 `PUT /api/config` 会丢弃这两个字段。Workspace通过专用API登记，普通PUT配置不接受`agent.workspaces`；改变原始库、标准库或运行资源根也必须对已有Workspace做反向交叉校验，不能只在最初登记时检查。
 
 标准文档使用独立的`feishu_sync_kb` YAML-in-comment头（`doc_id/build_id/sources`），不要与原始库的`feishu_sync`头混用。改标准头需同时维护构建写入/校验和`StandardKbStore.parseStdHeader/stripStdHeader`，并验证UI/MCP读取。
 
@@ -65,5 +71,6 @@ feishu_sync:
 ## 写盘安全（文件层契约）
 
 - `SyncOptions.apply` 默认 false（dry-run）；写盘需 `apply:true + confirmation:'APPLY'`。
-- move/delete/路径冲突/父链不完整/未知类型/无权限 → 带 `reasonCode` 的 blocker，绝不自动覆盖。
+- move/delete/路径冲突/父链不完整/未知类型/无权限 → 带 `reasonCode` 的 blocker，绝不自动覆盖；源编辑未写回（`source_edits` 非 pushed）同样产生 `local_edit_pending` blocker。
 - 原子提交顺序不可变：库外 staging → 校验 → rename → DB 事务；失败从 rollback 快照恢复；`assertInsideRoot` 拒绝路径逃逸。
+- 源编辑写入（SourceEditService，另序）：持按 objToken 进程内写锁 → baseHash OCC 校验 → 新内容 = **原 header 字节 + 新 body** 同目录临时文件 fsync+rename → 写后重读 `parseMetadata` 逐字段复核，失配即从备份恢复并报 `source_header_roundtrip_failed`；`documents` 表与 observed/synced 基线不动，下次构建按 changed 处理。

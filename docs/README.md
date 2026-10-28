@@ -9,8 +9,9 @@
 | [testing.md](./testing.md) | 测试分层、运行命令、编写约定、已知问题 | 日常开发 / 提交前 |
 | [data-contract.md](./data-contract.md) | SQLite 表契约、config.json、Markdown header round-trip | 改数据层/同步引擎必读 |
 | [operations.md](./operations.md) | 发布打包流程、正式回填运维、server/scripts 脚本风险分级 | 发版 / 运维 |
-| [agent-knowledge.md](./agent-knowledge.md) | Agent 工作台配置、原始/标准库关系、Discuss/Work 权限、只读 MCP（开发分支） | 使用者 / 开发者 |
-| [design/agent-knowledge-design.md](./design/agent-knowledge-design.md) | Agent 标准库公共设计与 API/安全契约 | 改工作台实现必读 |
+| [agent-knowledge.md](./agent-knowledge.md) | Agent 工作台配置、原始/标准库关系、Discuss/Work 权限、任务编排、CLI、源编辑写回、只读 MCP（开发分支） | 使用者 / 开发者 |
+| [design/agent-knowledge-design.md](./design/agent-knowledge-design.md) | Agent 标准库公共设计与 API/安全契约（基线，含 §18 升级增补索引） | 改工作台实现必读 |
+| [design/kb-agent-upgrade-design.md](./design/kb-agent-upgrade-design.md) | 2026-10 升级增补：双模型图片理解、并行构建、任务编排、CLI 命令面、源库受控写/写回飞书 | 改升级模块实现必读 |
 
 ## 报告与计划
 

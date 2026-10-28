@@ -88,7 +88,7 @@ export interface StandardKbConfig {
   promptTimeoutMinutes: number;
   buildTimeoutMinutes: number;
   /** S4：并行构建 worker 数（1..6，默认 2；实际受 Agent 进程池后台配额约束）。
-   * 缺省/旧配置无此字段 → 1（等价单 worker 回退，行为与既有构建一致） */
+   * 缺省/旧配置无此字段 → 默认 2（可设为 1 得到等价单 worker 的旧行为回退） */
   buildParallelism: number;
   /** 第一阶段固定 false（字段预留） */
   autoBuildAfterSync: boolean;

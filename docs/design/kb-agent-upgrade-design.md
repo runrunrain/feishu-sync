@@ -2,6 +2,7 @@
 
 > 本文是 `docs/design/agent-knowledge-design.md`（下称**基线**）的增补演进，不替代基线。只写增量结论、接口、不变量与切片；未提及的契约一律沿用基线。引用写作「基线 §x」。
 > **状态：已实施（S0–S14 合入），基线修订见 `agent-knowledge-design.md` §18。本文保留为实施依据，不删内容。**
+> **实施勘误（以代码为准）**：① §6.2 令牌头名实为 `X-Cli-Token`（非 X-Feishu-Sync-Cli-Token）；② 审计文件实位于 `<dataRoot>/agent/audit/`（cli.jsonl / source-edits.jsonl / source-pushes.jsonl，写回审计独立成文件）；③ CLI 令牌与 desktop token 为完全分离域，desktop auth 中间件不接受 CLI 令牌（严格于本文「或」的表述）；④ §6.5 批准决定路径实为 `POST …/approvals/:approvalId/decide`；⑤ §4.7 池 acquire kind 实现归并为 `'session'|'background'` 两类（后台统一 M−1 配额，key 按用途区分）。
 > 输入证据：`agent-outputs/workflow/2026-10-27-kb-agent-upgrade/` 下 T0b（lark-cli 写能力）、T0c（amagi-pi 编排机制）、T0d（并行化与模型通道，含 part2）。代码基线 `feat/agent-knowledge-workbench @59a76fa`。预览渲染修复（T2a）不在本文范围。
 
 ## 0. 决策总表
