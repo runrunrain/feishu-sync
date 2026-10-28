@@ -23,6 +23,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { ChangeDetector } from '../src/modules/change-detector.js';
+import { MappingService } from '../src/modules/mapping-service.js';
+import { LarkCliClient } from '../src/modules/lark-cli-client.js';
 import type {
   CloudNodeObservation,
   LarkCliNodeInfo,
@@ -1103,7 +1105,7 @@ describe('ChangeDetector.detectChanges result cache (sync-state-timeout-fix)', (
     expect(lark.detailCalls).toBe(1);
   });
 
-  it('discovers brand-new wiki nodes as pending additions in fast mode (fast-added-fix)', async () => {
+  it.each(['rootA', 'node-A'])('discovers brand-new wiki nodes beneath %s in fast mode', async (newParent) => {
     const store = new MockLocalMapStore();
     const rootUrl = 'https://qcnbafdrjx7n.feishu.cn/wiki/rootA';
     store.rows.set('doc-A', makeLocal({
@@ -1136,9 +1138,12 @@ describe('ChangeDetector.detectChanges result cache (sync-state-timeout-fix)', (
         this.listCalls.push(opts.parentNodeToken);
         if (opts.parentNodeToken === 'rootA') {
           return [
-            { node_token: 'node-A', obj_token: 'doc-A', obj_type: 'docx', title: 't-doc-A', has_child: false, parent_node_token: 'rootA', space_id: opts.spaceId },
-            { node_token: 'node-NEW', obj_token: 'doc-NEW', obj_type: 'docx', title: 'New doc', has_child: false, parent_node_token: 'rootA', space_id: opts.spaceId },
+            { node_token: 'node-A', obj_token: 'doc-A', obj_type: 'docx', title: 't-doc-A', has_child: newParent === 'node-A', parent_node_token: 'rootA', space_id: opts.spaceId },
+            ...(newParent === 'rootA' ? [makeCloud({ node_token: 'node-NEW', obj_token: 'doc-NEW', title: 'New doc', parent_node_token: newParent })] : []),
           ];
+        }
+        if (opts.parentNodeToken === 'node-A' && newParent === 'node-A') {
+          return [makeCloud({ node_token: 'node-NEW', obj_token: 'doc-NEW', title: 'New doc', parent_node_token: newParent })];
         }
         return [];
       },
@@ -1153,7 +1158,7 @@ describe('ChangeDetector.detectChanges result cache (sync-state-timeout-fix)', (
             space_id: 'space-1',
             obj_edit_time: 500,
             has_child: false,
-            parent_node_token: 'rootA',
+            parent_node_token: newParent,
           };
         }
         throw new Error('unexpected getNode call: ' + url);
@@ -1168,20 +1173,19 @@ describe('ChangeDetector.detectChanges result cache (sync-state-timeout-fix)', (
     });
 
     // Topology BFS started from the watched root token.
-    expect(lark.listCalls).toEqual(['rootA']);
+    expect(lark.listCalls).toEqual(newParent === 'rootA' ? ['rootA'] : ['rootA', 'node-A']);
     // Exactly one node-get for the brand-new node — the mapped doc-A is
     // served by the metadata batch and must not fall back to wiki details.
     expect(lark.detailUrls).toEqual(['https://qcnbafdrjx7n.feishu.cn/wiki/node-NEW']);
     expect(result.changed).toBe(true);
+    expect(result.totalNodes).toBe(2);
     expect(result.changedDocuments).toEqual([
       expect.objectContaining({
         objToken: 'doc-NEW',
         changeType: 'added',
         syncState: 'pending_added',
         title: 'New doc',
-        // Direct child of the watched root resolves without a root
-        // observation (projectParentChains rootToken special case).
-        parentChainTitles: [],
+        parentChainTitles: newParent === 'rootA' ? [] : ['t-doc-A'],
         isWatchedRootNode: false,
       }),
     ]);
@@ -1192,7 +1196,147 @@ describe('ChangeDetector.detectChanges result cache (sync-state-timeout-fix)', (
       observedObjEditTime: 500,
     });
     // doc-A stays synced: no false positive from the discovery pass.
-    expect(store.rows.get('doc-A')).toMatchObject({ syncState: 'synced' });
+    expect(store.rows.get('doc-A')).toMatchObject({
+      syncState: 'synced', hasChild: newParent === 'node-A',
+    });
+  });
+
+  it('traverses singleton CLI branches and restores cloud-visible descendants hidden by old deletion records', async () => {
+    const store = new MockLocalMapStore();
+    const rootUrl = 'https://example.feishu.cn/wiki/rootA';
+    store.rows.set('root-doc', makeLocal({
+      objToken: 'root-doc', wikiNodeToken: 'rootA', parentNodeToken: null,
+      watchedRootId: 'rootA', watchedRootUrl: rootUrl, hasChild: true,
+    }));
+    const child = makeCloud({
+      obj_token: 'child-doc', node_token: 'child-node',
+      parent_node_token: 'rootA', has_child: true, obj_edit_time: 1000,
+    });
+    const grandchild = makeCloud({
+      obj_token: 'grandchild-doc', node_token: 'grandchild-node',
+      parent_node_token: 'child-node', obj_edit_time: 1000,
+    });
+    for (const node of [child, grandchild]) {
+      store.rows.set(node.obj_token, makeLocal({
+        objToken: node.obj_token, wikiNodeToken: node.node_token,
+        parentNodeToken: node.parent_node_token, watchedRootId: 'rootA',
+        watchedRootUrl: rootUrl, syncState: 'deleted_confirmed', cloudDeleted: 1,
+      }));
+    }
+    const client = new LarkCliClient({ requiredScopes: [] });
+    const listParents: string[] = [];
+    client.getDocumentMetas = async () => ({
+      metas: [{ docToken: 'root-doc', docType: 'docx', latestModifyTime: 1000, title: 'root' }],
+      failed: [],
+    });
+    (client as any).execute = async (args: string[]) => {
+      if (args[1] === '+node-list') {
+        const parent = args[args.indexOf('--parent-node-token') + 1];
+        listParents.push(parent);
+        const node = parent === 'rootA' ? child : grandchild;
+        return (client as any).parseJsonOutput(JSON.stringify(node));
+      }
+      const url = args[args.indexOf('--node-token') + 1];
+      return { ok: true, data: url.endsWith('/child-node') ? child : grandchild };
+    };
+    const detector = new ChangeDetector(client, store as any);
+
+    await detector.detectChanges(rootUrl, { mode: 'fast' });
+
+    expect(listParents).toEqual(['rootA', 'child-node']);
+    const tree = new MappingService(detector, store as any, {} as any).getTree();
+    expect(tree).toHaveLength(3);
+    expect(tree.find((node) => node.obj_token === 'child-doc')).toMatchObject({
+      parent_node_token: 'rootA', has_child: true, cloud_deleted: 0,
+    });
+    expect(tree.find((node) => node.obj_token === 'grandchild-doc')).toMatchObject({
+      parent_node_token: 'child-node', cloud_deleted: 0,
+    });
+    expect(store.missCalls).toEqual([]);
+  });
+
+  it('refreshes existing child relationships on consecutive fast checks without content edits', async () => {
+    const store = new MockLocalMapStore();
+    const rootUrl = 'https://example.feishu.cn/wiki/rootA';
+    for (const [objToken, wikiNodeToken, parentNodeToken] of [
+      ['root-doc', 'rootA', ''],
+      ['doc-A', 'node-A', 'rootA'],
+      ['doc-B', 'node-B', 'rootA'],
+      ['doc-C', 'node-C', 'rootA'],
+    ]) {
+      store.rows.set(objToken, makeLocal({
+        objToken, wikiNodeToken, parentNodeToken,
+        watchedRootId: 'rootA', watchedRootUrl: rootUrl, hasChild: false,
+      }));
+    }
+    let childCount = 0;
+    const getNode = vi.fn(async () => { throw new Error('known nodes need no detail lookup'); });
+    const lark = {
+      getNode,
+      async getDocumentMetas(requests: Array<{ docToken: string; docType: string }>) {
+        return {
+          metas: requests.map((r) => ({ ...r, latestModifyTime: 1000, title: 't-' + r.docToken })),
+          failed: [],
+        };
+      },
+      async listWikiNodes(opts: { parentNodeToken: string }) {
+        return [...store.rows.values()]
+          .filter((row) => row.wikiNodeToken !== 'rootA')
+          .map((row) => makeCloud({
+            obj_token: row.objToken, node_token: row.wikiNodeToken!,
+            parent_node_token:
+              (row.objToken === 'doc-B' && childCount >= 1) ||
+              (row.objToken === 'doc-C' && childCount >= 2) ? 'node-A' : 'rootA',
+            has_child: row.objToken === 'doc-A' && childCount > 0,
+          }))
+          .filter((node) => node.parent_node_token === opts.parentNodeToken);
+      },
+    };
+    const detector = new ChangeDetector(lark as any, store as any);
+    const mapping = new MappingService(detector, store as any, {} as any);
+    for (const count of [0, 1, 2, 0]) {
+      childCount = count;
+      const result = await detector.detectChanges(rootUrl, {
+        mode: 'fast', forceFresh: true, bypassCooldown: true,
+      });
+      expect(result.changedDocuments).toEqual([]);
+      expect(store.rows.get('doc-A')).toMatchObject({
+        hasChild: count > 0, syncState: 'synced', syncedObjEditTime: 1000,
+        localMdPath: '/path/doc-A.md',
+      });
+      expect(store.rows.get('root-doc')!.hasChild).toBe(true);
+      const tree = mapping.getTree();
+      expect(tree.filter((node) => node.parent_node_token === 'node-A')).toHaveLength(count);
+      expect(tree.find((node) => node.obj_token === 'doc-A')!.has_child).toBe(count > 0);
+      expect(store.missCalls).toEqual([]);
+    }
+    expect(getNode).not.toHaveBeenCalled();
+  });
+
+  it('refreshes topology even when Drive metadata is unavailable without advancing the sync baseline', async () => {
+    const store = new MockLocalMapStore();
+    const rootUrl = 'https://example.feishu.cn/wiki/rootA';
+    store.rows.set('doc-A', makeLocal({
+      objToken: 'doc-A', wikiNodeToken: 'node-A',
+      watchedRootId: 'rootA', watchedRootUrl: rootUrl, hasChild: true,
+    }));
+    const detector = new ChangeDetector({
+      async getDocumentMetas() { throw new Error('Drive unavailable'); },
+      async listWikiNodes() {
+        return [makeCloud({ obj_token: 'doc-A', node_token: 'node-A', title: 'Fresh title', parent_node_token: 'rootA' })];
+      },
+      async getNode() { throw new Error('known nodes need no detail lookup'); },
+    } as any, store as any);
+
+    const result = await detector.detectChanges(rootUrl, { mode: 'fast' });
+
+    expect(store.rows.get('doc-A')).toMatchObject({
+      title: 'Fresh title', hasChild: false, syncState: 'synced',
+      syncedObjEditTime: 1000, observedObjEditTime: 1000,
+    });
+    expect(result.failedNodeTokens).toContain('doc-A');
+    expect(result.changedDocuments).toEqual([]);
+    expect(store.missCalls).toEqual([]);
   });
 
   it('skips fast added-discovery when the topology BFS is incomplete (fail-closed)', async () => {
@@ -1203,6 +1347,7 @@ describe('ChangeDetector.detectChanges result cache (sync-state-timeout-fix)', (
       wikiNodeToken: 'node-A',
       watchedRootId: 'rootA',
       watchedRootUrl: rootUrl,
+      hasChild: true,
     }));
     const lark = {
       async getDocumentMetas(requests: Array<{ docToken: string; docType: string }>) {
@@ -1237,6 +1382,8 @@ describe('ChangeDetector.detectChanges result cache (sync-state-timeout-fix)', (
     // topology pass produced no phantom additions.
     expect(result.changed).toBe(false);
     expect(result.changedDocuments).toEqual([]);
+    expect(store.rows.get('doc-A')!.hasChild).toBe(true);
+    expect(store.missCalls).toEqual([]);
   });
 
   it('joins concurrent calls before the completed-result cache is populated', async () => {
