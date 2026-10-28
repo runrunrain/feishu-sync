@@ -1,0 +1,12 @@
+{
+  "ok": false,
+  "identity": "user",
+  "error": {
+    "type": "api",
+    "subtype": "unknown",
+    "code": 4000002,
+    "message": "Invalid request parameters: the document version may be stale, block_id may be malformed, or references a non-existent block. Re-fetch the document structure (via the export API) and retry with the latest version and block_id",
+    "log_id": "LOGIDPROBE36",
+    "troubleshooter": "排查建议查看(Troubleshooting suggestions): https://open.feishu.cn/search?from=openapi&log_id=LOGIDPROBE36&code=4000002&method_id=7624117956138650561"
+  }
+}

@@ -93,6 +93,51 @@ const INVALID_SCOPE_RE = /invalid or malformed scopes/i;
  */
 export const WRITE_SCOPES: readonly string[] = ['docx:document:write_only'];
 
+// ----------------------------------------------------------------------------
+// P1-B 可选读 scope 注册表（设计 §3.1/U37；P1-S1 SP-1 实测定型：
+// slides 截图所需 scope 仅 slides:presentation:screenshot 一项，
+// missing_scopes 错误原文已存档 fixtures/p1s1-lark-cli/）。
+// ----------------------------------------------------------------------------
+
+/** 可选读能力名：每项对应一个功能开关（Config 段位）与一组 scope。 */
+export type OptionalReadFeature = 'slidesScreenshots';
+
+/**
+ * 可选读 scope 注册表。功能开关开启时对应 scope 才并入 device flow 请求
+ * 基线（与 WRITE_SCOPES 同一位置），未开启/未授权不影响任何现有功能——
+ * 读能力不挂在写授权上（U37）。
+ */
+export const OPTIONAL_READ_SCOPES: ReadonlyArray<{
+  feature: OptionalReadFeature;
+  scopes: readonly string[];
+}> = [
+  { feature: 'slidesScreenshots', scopes: ['slides:presentation:screenshot'] },
+];
+
+/** 注册表中某能力所需的全部 scope（空集表示未知能力名）。 */
+export function optionalScopesForFeature(feature: OptionalReadFeature): readonly string[] {
+  return OPTIONAL_READ_SCOPES.find((entry) => entry.feature === feature)?.scopes ?? [];
+}
+
+/** 注册表中登记的全部可选读 scope（auth-status 的 granted/missing 分发用）。 */
+export function allOptionalReadScopes(): string[] {
+  return [...new Set(OPTIONAL_READ_SCOPES.flatMap((entry) => [...entry.scopes]))];
+}
+
+/**
+ * 按配置功能开关求可选读 scope 并集。开关全关时返回空数组——device flow
+ * 请求基线与既有行为字节一致（设计 §3.1 不变量：读能力新增的 scope 只在
+ * 用户显式开启对应功能时请求）。
+ */
+export function enabledOptionalScopes(config: Pick<Config, 'sync'> | null | undefined): string[] {
+  if (!config?.sync) return [];
+  const enabled: string[] = [];
+  if (config.sync.slidesScreenshot?.enabled === true) {
+    enabled.push(...optionalScopesForFeature('slidesScreenshots'));
+  }
+  return [...new Set(enabled)];
+}
+
 /** Manager 级结构化错误：code 稳定，status 直接映射 HTTP 状态码。 */
 export class LarkCliManagerError extends Error {
   constructor(
@@ -585,10 +630,17 @@ export class LarkCliManager {
    * S12（设计 §7.6）：options.scopeSet='write' 时把 WRITE_SCOPES 并入
    * 本次请求基线（写回授权入口）；缺省 'read'，既有读链路 argv 与行为
    * 字节不变。整单拒绝降级同样退到（含写集的）基线集。
+   *
+   * P1-B（设计 §3.4）：options.includeOptionalScopes=true 时把
+   * enabledOptionalScopes(config) 并入本次请求集（可选读 scope 增量授权
+   * 入口）。scopeSet 沿用当前值：调用方显式传入时以其为准，未传时按已授
+   * 集合自动判定（已授包含 WRITE_SCOPES 全部 → write，否则 read），保证
+   * 开启读功能既不会意外申请写权限，也不会把已授的写权限从请求里丢掉。
+   * includeOptionalScopes 缺省 false：既有调用 argv 与行为字节不变。
    */
   async startDeviceAuth(
     mode: DeviceAuthMode = 'reauthorize',
-    options: { scopeSet?: DeviceAuthScopeSet } = {},
+    options: { scopeSet?: DeviceAuthScopeSet; includeOptionalScopes?: boolean } = {},
   ): Promise<DeviceAuthSession> {
     if (mode !== 'reauthorize' && mode !== 'switch_account') {
       throw new LarkCliManagerError('未知认证模式', 'invalid_auth_mode', 400);
@@ -601,18 +653,31 @@ export class LarkCliManager {
       deviceCode: '', mode, controller: new AbortController(), completing: false,
     };
     this.pendingDeviceAuth = pending;
-    const scopeSet: DeviceAuthScopeSet = options.scopeSet === 'write' ? 'write' : 'read';
+    const includeOptionalScopes = options.includeOptionalScopes === true;
     try {
       const required = await this.resolveRequiredScopes();
-      const requestBase = scopeSet === 'write'
-        ? [...new Set([...required, ...WRITE_SCOPES])]
-        : required;
       // 本地快照用于记录旧账号，不能把它当作通过联网验证的就绪状态。
       const before = await this.larkCliClient.checkAuthReady({ verify: false });
       pending.previousAccount = before.account;
       const granted = mode === 'reauthorize' ? before.currentScopes ?? [] : [];
+      const scopeSet: DeviceAuthScopeSet = options.scopeSet === 'write'
+        ? 'write'
+        : options.scopeSet === 'read'
+          ? 'read'
+          : includeOptionalScopes
+              && WRITE_SCOPES.every((scope) => granted.includes(scope))
+            ? 'write'
+            : 'read';
+      const requestBase = scopeSet === 'write'
+        ? [...new Set([...required, ...WRITE_SCOPES])]
+        : required;
+      // P1-B：可选读 scope 只在显式请求增量授权时并入，且同样剔除已退役名。
+      const optional = includeOptionalScopes
+        ? enabledOptionalScopes(await this.resolveOptionalScopeConfig())
+        : [];
       const retired = new Set(RETIRED_REQUEST_SCOPES);
-      const union = [...new Set([...granted, ...requestBase])].filter((s) => s.trim() && !retired.has(s));
+      const union = [...new Set([...granted, ...requestBase, ...optional])]
+        .filter((s) => s.trim() && !retired.has(s));
       const attempt = async (scopes: string[]) => {
         const args = ['auth', 'login', '--no-wait', '--json', '--scope', scopes.join(' ')];
         try {
@@ -629,6 +694,8 @@ export class LarkCliManager {
       let requestedScopes = union;
       let out = await attempt(union);
       if (union.some((s) => !requestBase.includes(s)) && INVALID_SCOPE_RE.test(`${out.stdout}\n${out.stderr}`)) {
+        // 整单拒绝（含可选 scope 未在 OAuth 应用注册的形态）：降级为最小
+        // 必需集重试——可选 scope 与已授额外集一并退场，基础授权仍可完成。
         out = await attempt(requestBase);
         requestedScopes = requestBase;
       }
@@ -987,6 +1054,17 @@ export class LarkCliManager {
       homeDir: this.discovery.homeDir,
       platform: this.discovery.platform,
     });
+  }
+
+  /**
+   * P1-B：可选读 scope 的配置源。getConfig 是内存缓存，可能与 resolveRequiredScopes
+   * 一样在启动早期为空，兜底再 load 一次；两者都失败时返回 null（可选集为空，
+   * 行为退回现状）。
+   */
+  private async resolveOptionalScopeConfig(): Promise<Config | null> {
+    const cached = this.configManager.getConfig();
+    if (cached) return cached;
+    return this.configManager.load().catch(() => null);
   }
 
   private async resolveRequiredScopes(): Promise<string[]> {

@@ -1,0 +1,11 @@
+{
+  "ok": false,
+  "identity": "user",
+  "error": {
+    "type": "validation",
+    "subtype": "invalid_argument",
+    "message": "--title must not be empty or whitespace-only",
+    "hint": "the API accepts an empty new_title and clears the resource title; pass the exact title you want to see",
+    "param": "--title"
+  }
+}

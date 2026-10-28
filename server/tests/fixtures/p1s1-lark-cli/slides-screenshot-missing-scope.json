@@ -1,0 +1,15 @@
+{
+  "_note": "slides +screenshot 实跑 exit=3；dry-run / 越界页 / 非法页号同为此错误（scope 校验先于参数语义校验与服务端调用）；hint 给出两段式 device flow",
+  "ok": false,
+  "identity": "user",
+  "error": {
+    "type": "authorization",
+    "subtype": "missing_scope",
+    "message": "missing required scope(s): slides:presentation:screenshot",
+    "hint": "run `lark-cli auth login --scope \"slides:presentation:screenshot\" --no-wait --json` to get device_code and verification_url; present verification_url to the user exactly and end this turn; after the user confirms authorization, run `lark-cli auth login --device-code <device_code>` in a later turn to finish login",
+    "missing_scopes": [
+      "slides:presentation:screenshot"
+    ],
+    "identity": "user"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "ok": true,
+  "identity": "user",
+  "data": {
+    "document": {
+      "new_blocks": [
+        {
+          "block_id": "BLOCKIDPROBE1",
+          "block_token": "WBTOKENPROBE1",
+          "block_type": "whiteboard"
+        }
+      ],
+      "revision_id": 6,
+      "url": "https://TENANT.feishu.cn/docx/DOCXTOKENPROBE1"
+    },
+    "result": "success",
+    "warnings": []
+  }
+}

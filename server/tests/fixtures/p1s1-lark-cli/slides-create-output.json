@@ -1,0 +1,15 @@
+{
+  "ok": true,
+  "identity": "user",
+  "data": {
+    "revision_id": 1,
+    "slide_ids": [
+      "pww",
+      "pwH"
+    ],
+    "slides_added": 2,
+    "title": "p1s1-截图测试",
+    "url": "https://<tenant>.feishu.cn/slides/AhCksWVJYlAe31duDQoc3DxIn3b",
+    "xml_presentation_id": "AhCksWVJYlAe31duDQoc3DxIn3b"
+  }
+}

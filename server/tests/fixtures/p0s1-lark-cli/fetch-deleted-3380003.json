@@ -1,0 +1,12 @@
+{
+  "ok": false,
+  "identity": "user",
+  "error": {
+    "type": "api",
+    "subtype": "unknown",
+    "code": 3380003,
+    "message": "Document page has been deleted. This page can no longer be edited; choose another page or create a new document",
+    "log_id": "LOGIDPROBE",
+    "troubleshooter": "排查建议查看(Troubleshooting suggestions): https://open.feishu.cn/search?from=openapi&log_id=LOGIDPROBE&code=3380003&method_id=7624117956138650561"
+  }
+}

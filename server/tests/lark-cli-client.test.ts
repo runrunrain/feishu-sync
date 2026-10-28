@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   buildLarkCliEnvironment,
   LarkCliClient,
@@ -14,6 +15,7 @@ import {
 type ClientInternals = {
   parseJsonOutput(stdout: string): any;
   extractJsonValues(stdout: string): string[];
+  classifyError(message: string, upstreamCode?: string): import('../src/modules/lark-cli-client.js').LarkCliError;
 };
 
 function createClient(): LarkCliClient {
@@ -34,7 +36,7 @@ describe('LarkCliClient output parsing and classification', () => {
     { status: 'missing', available: false, verified: false },
     { status: 'ready', available: true, verified: undefined },
   ])('rejects stale grants when user diagnostics are $status / verified=$verified', async (diagnostics) => {
-    const client = new LarkCliClient({ requiredScopes: ['wiki:node:retrieve'] });
+    const client = new LarkCliClient({ requiredScopes: ['wiki:node:retrieve'], timeout: 1_000, larkCliPath: 'lark-cli-not-invoked-by-these-tests' });
     const calls: string[][] = [];
     (client as any).execute = async (args: string[]) => {
       calls.push(args);
@@ -51,7 +53,7 @@ describe('LarkCliClient output parsing and classification', () => {
   });
 
   it('accepts a refreshed and server-verified user, independent of bot verification', async () => {
-    const client = new LarkCliClient({ requiredScopes: ['wiki:node:retrieve'] });
+    const client = new LarkCliClient({ requiredScopes: ['wiki:node:retrieve'], timeout: 1_000, larkCliPath: 'lark-cli-not-invoked-by-these-tests' });
     (client as any).execute = async (args: string[]) => args[0] === '--version'
       ? { ok: true, data: { version: '1.0.97' } }
       : { ok: true, data: { identity: 'user', identities: {
@@ -140,7 +142,7 @@ describe('LarkCliClient output parsing and classification', () => {
     }));
     (client as any).execute = async (args: string[]) => {
       expect(args).toEqual([
-        'wiki', '+node-list', '--format', 'ndjson', '--page-all',
+        'wiki', '+node-list', '--format', 'ndjson', '--page-all', '--page-limit', '0',
         '--space-id', 'space', '--parent-node-token', 'parent',
       ]);
       return internals(client).parseJsonOutput(nodes.map((node) => JSON.stringify(node)).join('\n'));
@@ -542,5 +544,472 @@ describe('LarkCliClient.listBaseRecords — ndjson artifact 通道（v0.3.34 真
     expect(page.items.length).toBe(3);
     expect(page.has_more).toBe(true);
     expect(fs.existsSync(writtenFile)).toBe(false);
+  });
+});
+
+describe('classifyError: not-in-wiki classification (lark-cli ≥1.0.95 drift, audit D1)', () => {
+  it.each([
+    { code: '131014', label: 'new code (node_by_token migration, ≥1.0.95)' },
+    { code: '131005', label: 'legacy code (≤1.0.94)' },
+  ])('classifies $label as not_in_wiki and non-retryable', ({ code }) => {
+    const client = createClient();
+    const err = internals(client).classifyError(
+      'document is not in wiki',
+      code,
+    );
+    expect(err.code).toBe('not_in_wiki');
+    expect(err.retryable).toBe(false);
+    expect(err.upstreamCode).toBe(code);
+  });
+
+  it('classifies the textual form without upstream code as 131014 not_in_wiki', () => {
+    const client = createClient();
+    const err = internals(client).classifyError(
+      'wiki +node-get failed: {"code":131014,"message":"document is not in wiki"}',
+    );
+    expect(err.code).toBe('not_in_wiki');
+    expect(err.retryable).toBe(false);
+    expect(err.upstreamCode).toBe('131014');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P0-S2：新能力五方法（fixture 驱动；真实输出样本见
+// tests/fixtures/p0s1-lark-cli/，P0-S1 探针 2026-10-28，lark-cli 1.0.98）。
+// argv 断言对照 fixture README 记录的真实命令形态（已与本地
+// `lark-cli docs +history-list/+history-revert/+history-revert-status、
+// whiteboard +export、drive +update-title --help` 核对）。
+// ---------------------------------------------------------------------------
+
+const p0s1FixtureRoot = path.join(
+  path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'p0s1-lark-cli',
+);
+
+function loadP0s1Fixture(name: string): any {
+  return JSON.parse(fs.readFileSync(path.join(p0s1FixtureRoot, name), 'utf-8'));
+}
+
+describe('P0-S2 listDocumentHistory — docs +history-list 封装', () => {
+  it('builds the probed argv (page-size clamp 1..20, optional page-token) on the docx bucket', async () => {
+    const client = createClient();
+    const calls: Array<{ args: string[]; apiType: string }> = [];
+    (client as any).execute = async (args: string[], apiType: string) => {
+      calls.push({ args, apiType });
+      return { ok: true, data: { entries: [], has_more: false, page_token: '' } };
+    };
+
+    await client.listDocumentHistory('DOCXTOKEN1');
+    await client.listDocumentHistory('DOCXTOKEN1', { pageToken: 'NEXT', pageSize: 5 });
+    await client.listDocumentHistory('DOCXTOKEN1', { pageSize: 99 });
+    await client.listDocumentHistory('DOCXTOKEN1', { pageSize: 0 });
+
+    expect(calls.map((call) => call.apiType)).toEqual(['docx', 'docx', 'docx', 'docx']);
+    // P0-S1 真实命令形态：docs +history-list --doc <t> --page-size <n> [--page-token <p>] --format json
+    expect(calls[0].args).toEqual([
+      'docs', '+history-list', '--doc', 'DOCXTOKEN1', '--page-size', '20', '--format', 'json',
+    ]);
+    expect(calls[1].args).toEqual([
+      'docs', '+history-list', '--doc', 'DOCXTOKEN1', '--page-size', '5',
+      '--page-token', 'NEXT', '--format', 'json',
+    ]);
+    expect(calls[2].args[calls[2].args.indexOf('--page-size') + 1]).toBe('20'); // 钳制上限
+    expect(calls[3].args[calls[3].args.indexOf('--page-size') + 1]).toBe('1'); // 钳制下限
+  });
+
+  it('parses the multi-entry fixture: string history_version_id, numeric revision_id, editor_ids, type 1/2/3', async () => {
+    const client = createClient();
+    const fixture = loadP0s1Fixture('history-list-multi-entry.json');
+    (client as any).execute = async () => fixture;
+
+    const page = await client.listDocumentHistory('DOCXTOKEN1', { pageSize: 20 });
+
+    expect(page.entries).toHaveLength(4);
+    expect(page.entries[0]).toEqual({
+      historyVersionId: '4096',
+      revisionId: 4,
+      editTime: '2026-10-28T09:07:26Z',
+      editorIds: ['ou_EDITOR_PROBE'],
+      type: 3, // revert 产生的历史
+      raw: fixture.data.entries[0],
+    });
+    expect(page.entries.map((entry) => entry.type)).toEqual([3, 2, 2, 1]);
+    expect(page.entries.map((entry) => entry.historyVersionId)).toEqual(['4096', '3072', '2048', '1024']);
+    expect(page.hasMore).toBe(false);
+    expect(page.nextPageToken).toBe(null);
+  });
+
+  it('parses the fresh-doc single-entry fixture and tolerates an empty page', async () => {
+    const client = createClient();
+    (client as any).execute = async () => loadP0s1Fixture('history-list-fresh-doc.json');
+    const fresh = await client.listDocumentHistory('DOCXTOKEN1');
+    expect(fresh.entries).toHaveLength(1);
+    expect(fresh.entries[0]).toMatchObject({ historyVersionId: '1024', revisionId: 1, type: 1 });
+
+    (client as any).execute = async () => ({ ok: true, data: { entries: [], has_more: false, page_token: '' } });
+    const empty = await client.listDocumentHistory('DOCXTOKEN1');
+    expect(empty).toEqual({ entries: [], hasMore: false, nextPageToken: null });
+  });
+
+  it('derives nextPageToken from has_more + page_token（驼峰键双读兜底；末页不产令牌）', async () => {
+    const client = createClient();
+    (client as any).execute = async () => ({
+      ok: true, data: { entries: [{ history_version_id: '2048' }], has_more: true, page_token: 'NEXT' },
+    });
+    expect(await client.listDocumentHistory('DOCXTOKEN1')).toMatchObject({ hasMore: true, nextPageToken: 'NEXT' });
+
+    (client as any).execute = async () => ({
+      ok: true, data: { entries: [], hasMore: true, pageToken: 'CAMEL' },
+    });
+    expect(await client.listDocumentHistory('DOCXTOKEN1')).toMatchObject({ hasMore: true, nextPageToken: 'CAMEL' });
+
+    // has_more=false 时 page_token 即使非空也不产下一页令牌
+    (client as any).execute = async () => ({
+      ok: true, data: { entries: [], has_more: false, page_token: 'STALE' },
+    });
+    expect(await client.listDocumentHistory('DOCXTOKEN1')).toMatchObject({ hasMore: false, nextPageToken: null });
+  });
+});
+
+describe('P0-S2 revertDocumentHistory / revertDocumentHistoryStatus — revert 与状态轮询', () => {
+  it('builds the probed argv with wait-timeout-ms clamped to 0..30000 and a subprocess budget above it', async () => {
+    const client = createClient();
+    const calls: Array<{ args: string[]; apiType: string; options: any }> = [];
+    (client as any).execute = async (args: string[], apiType: string, options: any) => {
+      calls.push({ args, apiType, options });
+      return loadP0s1Fixture('history-revert-done.json');
+    };
+
+    await client.revertDocumentHistory('DOCXTOKEN1', '2048');
+    await client.revertDocumentHistory('DOCXTOKEN1', '2048', { waitTimeoutMs: 0 });
+    await client.revertDocumentHistory('DOCXTOKEN1', '2048', { waitTimeoutMs: 99999 });
+
+    expect(calls.map((call) => call.apiType)).toEqual(['docx', 'docx', 'docx']);
+    // P0-S1 真实命令形态：docs +history-revert --doc <t> --history-version-id <id> --wait-timeout-ms <ms> --format json
+    expect(calls[0].args).toEqual([
+      'docs', '+history-revert', '--doc', 'DOCXTOKEN1', '--history-version-id', '2048',
+      '--wait-timeout-ms', '30000', '--format', 'json',
+    ]);
+    expect(calls[1].args[calls[1].args.indexOf('--wait-timeout-ms') + 1]).toBe('0'); // 异步形态合法
+    expect(calls[2].args[calls[2].args.indexOf('--wait-timeout-ms') + 1]).toBe('30000'); // 钳制上限
+    // 子进程预算 > 服务端等待预算（waitTimeoutMs + 15s）
+    expect(calls.map((call) => call.options.timeoutMs)).toEqual([45_000, 15_000, 45_000]);
+  });
+
+  it('parses the done and running fixtures; done still carries task_id', async () => {
+    const client = createClient();
+    (client as any).execute = async () => loadP0s1Fixture('history-revert-done.json');
+    expect(await client.revertDocumentHistory('DOCXTOKEN1', '2048')).toEqual({
+      status: 'done', taskId: 'task-uuid-probe-1', pollAfterMs: 0, failedBlockTokens: null,
+    });
+
+    (client as any).execute = async () => loadP0s1Fixture('history-revert-running.json');
+    expect(await client.revertDocumentHistory('DOCXTOKEN1', '3072', { waitTimeoutMs: 0 })).toEqual({
+      status: 'running', taskId: 'task-uuid-probe-3', pollAfterMs: 10000, failedBlockTokens: null,
+    });
+  });
+
+  it('normalizes an unknown revert status to running（task_status 双读兜底）', async () => {
+    const client = createClient();
+    (client as any).execute = async () => ({ ok: true, data: { task_status: 'pending', task_id: 't' } });
+    expect(await client.revertDocumentHistory('DOCXTOKEN1', '1024', { waitTimeoutMs: 0 }))
+      .toMatchObject({ status: 'running', taskId: 't' });
+  });
+
+  it('rejects empty tokens/ids at the boundary before spawning a subprocess', async () => {
+    const client = createClient();
+    (client as any).execute = async () => { throw new Error('execute must not be called'); };
+    await expect(client.revertDocumentHistory('', '2048')).rejects.toThrow(/non-empty objToken/);
+    await expect(client.revertDocumentHistory('DOCXTOKEN1', '')).rejects.toThrow(/non-empty historyVersionId/);
+    await expect(client.revertDocumentHistoryStatus('DOCXTOKEN1', ' ')).rejects.toThrow(/non-empty taskId/);
+  });
+
+  it('revertDocumentHistoryStatus parses the done fixture and reads failed_block_tokens', async () => {
+    const client = createClient();
+    const calls: string[][] = [];
+    (client as any).execute = async (args: string[]) => {
+      calls.push(args);
+      return loadP0s1Fixture('history-revert-status-done.json');
+    };
+
+    const done = await client.revertDocumentHistoryStatus('DOCXTOKEN1', 'task-uuid-probe-1');
+    // P0-S1 真实命令形态：docs +history-revert-status --doc <t> --task-id <id> --format json
+    expect(calls[0]).toEqual([
+      'docs', '+history-revert-status', '--doc', 'DOCXTOKEN1',
+      '--task-id', 'task-uuid-probe-1', '--format', 'json',
+    ]);
+    expect(done).toEqual({ status: 'done', failedBlockTokens: [] });
+
+    (client as any).execute = async () => ({
+      ok: true, data: { status: 'failed', failed_block_tokens: ['blkA', 'blkB', 42] },
+    });
+    expect(await client.revertDocumentHistoryStatus('DOCXTOKEN1', 't2')).toEqual({
+      status: 'failed', failedBlockTokens: ['blkA', 'blkB'], // 非字符串元素被过滤
+    });
+
+    (client as any).execute = async () => ({ ok: true, data: { status: 'weird' } });
+    expect(await client.revertDocumentHistoryStatus('DOCXTOKEN1', 't3'))
+      .toEqual({ status: 'running', failedBlockTokens: null });
+  });
+});
+
+describe('P0-S2 exportWhiteboard — whiteboard +export 双形态旁路导出', () => {
+  it('builds the probed argv (svg/raw) with cwd fencing and a caller-supplied svg timeout budget', async () => {
+    const client = createClient();
+    const staging = fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-sync-wb-export-'));
+    try {
+      const calls: Array<{ args: string[]; apiType: string; options: any }> = [];
+      (client as any).execute = async (args: string[], apiType: string, options: any) => {
+        calls.push({ args, apiType, options });
+        const outputName = args[args.indexOf('--output') + 1];
+        fs.writeFileSync(path.join(staging, outputName), '<svg xmlns="http://www.w3.org/2000/svg"/>', 'utf-8');
+        return { ok: true, data: { svg_path: `./${outputName}`, size_bytes: 48 } };
+      };
+
+      await client.exportWhiteboard('WBTOKENPROBE1', {
+        outputType: 'svg', outputPath: path.join(staging, 'probe.wb.svg'), timeoutMs: 30_000,
+      });
+      await client.exportWhiteboard('WBTOKENPROBE1', {
+        outputType: 'raw', outputPath: path.join(staging, 'probe.wb.raw.json'),
+      });
+
+      // P0-S1 真实命令形态：whiteboard +export --whiteboard-token <t> --output-type <type> --output <name> --overwrite --format json
+      expect(calls[0]).toMatchObject({ apiType: 'docx', options: { cwd: staging, timeoutMs: 30_000 } });
+      expect(calls[0].args).toEqual([
+        'whiteboard', '+export', '--whiteboard-token', 'WBTOKENPROBE1',
+        '--output-type', 'svg', '--output', 'probe.wb.svg', '--overwrite', '--format', 'json',
+      ]);
+      expect(calls[1].args).toEqual([
+        'whiteboard', '+export', '--whiteboard-token', 'WBTOKENPROBE1',
+        '--output-type', 'raw', '--output', 'probe.wb.raw.json', '--overwrite', '--format', 'json',
+      ]);
+      expect(calls[1].options).toEqual({ cwd: staging }); // 未传预算 → execute 缺省
+    } finally {
+      fs.rmSync(staging, { recursive: true, force: true });
+    }
+  });
+
+  it('resolves data.svg_path (svg) and data.output_path (raw) against cwd and returns the fenced path', async () => {
+    const client = createClient();
+    const staging = fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-sync-wb-export-'));
+    try {
+      const svgFixture = loadP0s1Fixture('whiteboard-export-svg-success.json');
+      (client as any).execute = async () => {
+        fs.writeFileSync(path.join(staging, 'probe-min.wb.svg'), '<svg/>', 'utf-8');
+        return svgFixture; // data.svg_path = "./probe-min.wb.svg"（P0-S1 实测键名，非 output_path）
+      };
+      const svgPath = await client.exportWhiteboard('WBTOKENPROBE1', {
+        outputType: 'svg', outputPath: path.join(staging, 'probe-min.wb.svg'),
+      });
+      expect(svgPath).toBe(path.join(staging, 'probe-min.wb.svg'));
+
+      const rawNodes = loadP0s1Fixture('whiteboard-export-raw-nodes.json');
+      (client as any).execute = async () => {
+        fs.writeFileSync(path.join(staging, 'probe.wb.raw.json'), JSON.stringify(rawNodes), 'utf-8');
+        return { ok: true, data: { output_path: './probe.wb.raw.json' } };
+      };
+      const rawPath = await client.exportWhiteboard('WBTOKENPROBE1', {
+        outputType: 'raw', outputPath: path.join(staging, 'probe.wb.raw.json'),
+      });
+      expect(rawPath).toBe(path.join(staging, 'probe.wb.raw.json'));
+    } finally {
+      fs.rmSync(staging, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an escaping svg_path and an empty/missing artifact despite a successful exit', async () => {
+    const client = createClient();
+    const staging = fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-sync-wb-export-'));
+    const outside = path.join(os.tmpdir(), `feishu-sync-wb-escape-${Date.now()}.wb.svg`);
+    try {
+      // 场景 1：上报绝对路径指向 staging 外的已存在文件 → 围栏拒绝
+      fs.writeFileSync(outside, '<svg/>', 'utf-8');
+      (client as any).execute = async () => ({ ok: true, data: { svg_path: outside } });
+      await expect(client.exportWhiteboard('WBTOKENPROBE1', {
+        outputType: 'svg', outputPath: path.join(staging, 'probe.wb.svg'),
+      })).rejects.toThrow('输出目录外');
+
+      // 场景 2：成功退出但未落盘 → 完整性拒绝（非误导性的围栏文案）
+      (client as any).execute = async () => ({ ok: true, data: { svg_path: './probe.wb.svg' } });
+      await expect(client.exportWhiteboard('WBTOKENPROBE1', {
+        outputType: 'svg', outputPath: path.join(staging, 'probe.wb.svg'),
+      })).rejects.toThrow('白板导出尚未完成');
+
+      // 场景 3：落盘但空文件（0 字节）→ 同完整性拒绝
+      fs.writeFileSync(path.join(staging, 'probe.wb.svg'), '', 'utf-8');
+      await expect(client.exportWhiteboard('WBTOKENPROBE1', {
+        outputType: 'svg', outputPath: path.join(staging, 'probe.wb.svg'),
+      })).rejects.toThrow('白板导出尚未完成');
+    } finally {
+      fs.rmSync(staging, { recursive: true, force: true });
+      fs.rmSync(outside, { force: true });
+    }
+  });
+});
+
+describe('P0-S2 updateDocumentTitle — drive +update-title 封装', () => {
+  it('builds the probed argv with default docx type, explicit wiki type, and never --on-extension-mismatch', async () => {
+    const client = createClient();
+    const calls: string[][] = [];
+    (client as any).execute = async (args: string[], apiType: string) => {
+      calls.push(args);
+      expect(apiType).toBe('drive');
+      return loadP0s1Fixture('update-title-success.json');
+    };
+
+    await client.updateDocumentTitle('DOCXTOKENPROBE1', 'feishu-sync-p0s1-probe 改名测试');
+    await client.updateDocumentTitle('wikcnodetoken', '节点标题', { type: 'wiki' });
+
+    // P0-S1 真实命令形态：drive +update-title --token <t> --type <type> --title <title> --format json
+    expect(calls[0]).toEqual([
+      'drive', '+update-title', '--token', 'DOCXTOKENPROBE1', '--type', 'docx',
+      '--title', 'feishu-sync-p0s1-probe 改名测试', '--format', 'json',
+    ]);
+    expect(calls[1]).toEqual([
+      'drive', '+update-title', '--token', 'wikcnodetoken', '--type', 'wiki',
+      '--title', '节点标题', '--format', 'json',
+    ]);
+    expect(calls.flat().join(' ')).not.toContain('--on-extension-mismatch');
+    expect(calls.flat().join(' ')).not.toContain('--type file');
+  });
+
+  it('normalizes the success fixture payload', async () => {
+    const client = createClient();
+    const fixture = loadP0s1Fixture('update-title-success.json');
+    (client as any).execute = async () => fixture;
+
+    await expect(client.updateDocumentTitle('DOCXTOKENPROBE1', 'feishu-sync-p0s1-probe 改名测试'))
+      .resolves.toEqual({
+        fileToken: 'DOCXTOKENPROBE1',
+        title: 'feishu-sync-p0s1-probe 改名测试',
+        type: 'docx',
+        updated: true,
+        url: 'https://www.feishu.cn/docx/DOCXTOKENPROBE1',
+        raw: fixture,
+      });
+  });
+
+  it('rejects empty tokens and empty titles at the boundary（空标题 CLI 也本地拦截）', async () => {
+    const client = createClient();
+    (client as any).execute = async () => { throw new Error('execute must not be called'); };
+    await expect(client.updateDocumentTitle('', 't')).rejects.toThrow(/non-empty fileToken/);
+    await expect(client.updateDocumentTitle('DOCXTOKENPROBE1', '  ')).rejects.toThrow(/non-empty title/);
+  });
+});
+
+describe('P0-S2 classifyError：P0-S1 实测新错误码（fixture 驱动）', () => {
+  it('classifies the concurrent-revert fixture (10020) as retryable conflict（含 stderr 文本兜底）', () => {
+    const client = createClient();
+    // 真实路径：进程 exit 1 + stderr JSON 体 → extractUpstreamCode 结构化路径
+    // 恢复 code 后进 classifyError；这里以 fixture 体直接驱动分类。
+    const fixture = loadP0s1Fixture('history-revert-error-10020.json');
+    let error: any;
+    try {
+      internals(client).parseJsonOutput(JSON.stringify(fixture));
+      throw new Error('expected parseJsonOutput to throw');
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(LarkCliError);
+    expect(error).toMatchObject({ code: 'conflict', retryable: true, upstreamCode: '10020' });
+
+    // execFile 失败路径：stderr 非 JSON 文本，靠已知码集文本兜底
+    const textual = internals(client).classifyError(
+      'lark-cli failed: 10020 Another history revert task is already in progress',
+    );
+    expect(textual).toMatchObject({ code: 'conflict', retryable: true, upstreamCode: '10020' });
+  });
+
+  it('classifies both 3380002 fixtures (notfound / newest-entry) as non-retryable invalid_target, distinct from deleted 3380003', () => {
+    const client = createClient();
+    for (const name of ['history-revert-error-3380002-notfound.json', 'history-revert-error-3380002-newest-entry.json']) {
+      try {
+        internals(client).parseJsonOutput(JSON.stringify(loadP0s1Fixture(name)));
+        throw new Error('expected parseJsonOutput to throw');
+      } catch (error) {
+        expect(error).toBeInstanceOf(LarkCliError);
+        expect(error).toMatchObject({ code: 'invalid_target', retryable: false, upstreamCode: '3380002' });
+      }
+    }
+    // 3380003（已删除）分支不受新码影响——两码语义区分（任务书点名）
+    const deleted = internals(client).classifyError('fetch on deleted doc 3380003', '3380003');
+    expect(deleted).toMatchObject({ code: 'deleted', retryable: false, upstreamCode: '3380003' });
+    const invalidTarget = internals(client).classifyError('history revert 3380002 INVALID ARGUMENT', '3380002');
+    expect(invalidTarget).toMatchObject({ code: 'invalid_target', retryable: false, upstreamCode: '3380002' });
+  });
+
+  it('classifies the update-title type-mismatch fixture (981003) as non-retryable type_mismatch', () => {
+    const client = createClient();
+    const fixture = loadP0s1Fixture('update-title-error-981003.json');
+    try {
+      internals(client).parseJsonOutput(JSON.stringify(fixture));
+      throw new Error('expected parseJsonOutput to throw');
+    } catch (error) {
+      expect(error).toBeInstanceOf(LarkCliError);
+      expect(error).toMatchObject({ code: 'type_mismatch', retryable: false, upstreamCode: '981003' });
+    }
+  });
+
+  it('classifies the svg server-timeout fixture as retryable timeout（S6 降级 raw 的判定输入）', () => {
+    const client = createClient();
+    const fixture = loadP0s1Fixture('whiteboard-export-svg-timeout.json');
+    // "server time out error"（带空格）此前落 upstream；归 timeout 供 S6 判降级
+    try {
+      internals(client).parseJsonOutput(JSON.stringify(fixture));
+      throw new Error('expected parseJsonOutput to throw');
+    } catch (error) {
+      expect(error).toBeInstanceOf(LarkCliError);
+      expect(error).toMatchObject({ code: 'timeout', retryable: true });
+    }
+  });
+});
+
+describe('T4b-06 incomplete_response — 非幂等写响应缺必要字段 → 未知信号（非明确失败，不可重试）', () => {
+  it('revertDocumentHistory：缺 status/task_status → incomplete_response；异步缺 task_id → incomplete_response（均 retryable=false）', async () => {
+    const client = createClient();
+    (client as any).execute = async () => ({ ok: true, data: { task_id: 't1' } });
+    await expect(client.revertDocumentHistory('DOCXTOKEN1', '2048', { waitTimeoutMs: 0 })).rejects.toMatchObject({
+      code: 'incomplete_response', retryable: false,
+    });
+    (client as any).execute = async () => ({ ok: true, data: { status: 'running' } });
+    await expect(client.revertDocumentHistory('DOCXTOKEN1', '2048', { waitTimeoutMs: 0 })).rejects.toMatchObject({
+      code: 'incomplete_response', retryable: false,
+    });
+    // 同步 done / 异步 running+task_id 不受影响（既有合法形态）。
+    (client as any).execute = async () => ({ ok: true, data: { status: 'done' } });
+    await expect(client.revertDocumentHistory('DOCXTOKEN1', '2048')).resolves.toMatchObject({ status: 'done' });
+    (client as any).execute = async () => ({ ok: true, data: { status: 'running', task_id: 't2' } });
+    await expect(client.revertDocumentHistory('DOCXTOKEN1', '2048', { waitTimeoutMs: 0 })).resolves.toMatchObject({
+      status: 'running', taskId: 't2',
+    });
+  });
+
+  it('moveWikiNodeToDrive：缺 state/status → incomplete_response；异步缺 task_id → incomplete_response', async () => {
+    const client = createClient();
+    (client as any).execute = async () => ({ ok: true, data: { task_id: 't1' } });
+    await expect(client.moveWikiNodeToDrive('wikinT4b')).rejects.toMatchObject({
+      code: 'incomplete_response', retryable: false,
+    });
+    (client as any).execute = async () => ({ ok: true, data: { state: 'running' } });
+    await expect(client.moveWikiNodeToDrive('wikinT4b')).rejects.toMatchObject({
+      code: 'incomplete_response', retryable: false,
+    });
+    // done 形态（同步完成）不受影响。
+    (client as any).execute = async () => ({ ok: true, data: { state: 'done' } });
+    await expect(client.moveWikiNodeToDrive('wikinT4b')).resolves.toMatchObject({ state: 'done' });
+  });
+
+  it('createDocumentMarkdown：响应缺 document_id → incomplete_response（不再抛普通 Error 冒充明确失败）', async () => {
+    const client = createClient();
+    (client as any).execute = async () => ({ ok: true, data: { document: { url: 'https://x' } } });
+    let caught: unknown;
+    try {
+      await client.createDocumentMarkdown({ title: 't', markdown: '# x', parentToken: 'fld1' });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(LarkCliError);
+    expect(caught).toMatchObject({ code: 'incomplete_response', retryable: false });
+    expect((caught as Error).message).toContain('document_id');
+    expect((caught as Error).message).toContain('请勿按失败重发');
   });
 });

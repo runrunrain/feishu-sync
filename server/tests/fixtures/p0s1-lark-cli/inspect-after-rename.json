@@ -1,0 +1,11 @@
+{
+  "ok": true,
+  "identity": "user",
+  "data": {
+    "input_url": "https://TENANT.feishu.cn/docx/DOCXTOKENPROBE1",
+    "title": "feishu-sync-p0s1-probe 改名测试",
+    "token": "DOCXTOKENPROBE1",
+    "type": "docx",
+    "url": "https://www.feishu.cn/docx/DOCXTOKENPROBE1"
+  }
+}

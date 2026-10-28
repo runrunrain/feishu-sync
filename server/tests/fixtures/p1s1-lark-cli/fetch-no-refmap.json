@@ -1,0 +1,14 @@
+{
+  "ok": true,
+  "_note": "文档含 @doc cite / @user cite / 普通链接，但无评论：reference_map 键整体缺失（document keys = content/document_id/revision_id）。RP-3 + RP-1 定型样本",
+  "data": {
+    "document": {
+      "document_id": "XjO4dP7NGoWVMfxMn3HcReVMnrf",
+      "document_keys_order": [
+        "content",
+        "document_id",
+        "revision_id"
+      ]
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "ok": true,
+  "identity": "user",
+  "data": {
+    "document": {
+      "content": "<title>feishu-sync-p0s1-probe2</title><h1>feishu-sync-p0s1-probe2 基线</h1><p>第二探针：验证异步 revert、revision-id fetch、内嵌白板回滚语义。</p><whiteboard token=\"WBTOKENPROBE3\" type=\"mermaid\">flowchart LR\n  P[锚点] --&gt; Q[回滚]</whiteboard><p>probe2 追加段：revert 目标之后的内容。</p>",
+      "document_id": "DOCXTOKENPROBE2",
+      "revision_id": 6
+    }
+  }
+}

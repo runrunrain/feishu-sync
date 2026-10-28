@@ -104,10 +104,10 @@ function makeFakeLarkCli(options: FakeLarkCliOptions) {
       const token = url;
       if (options.nodeGetFailUrls?.has(token)) {
         throw new LarkCliError(
-          '131005 document is not in wiki',
+          '131014 document is not in wiki',
           'upstream',
           true,
-          '131005',
+          '131014',
         );
       }
       if (options.permissionDeniedUrls?.has(token)) {

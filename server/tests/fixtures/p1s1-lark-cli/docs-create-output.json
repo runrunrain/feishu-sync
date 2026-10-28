@@ -1,0 +1,11 @@
+{
+  "ok": true,
+  "identity": "user",
+  "data": {
+    "document": {
+      "document_id": "VtS3d0GPLoAxLJxAGHLcv1tMnQZ",
+      "revision_id": 3,
+      "url": "https://<tenant>.feishu.cn/docx/VtS3d0GPLoAxLJxAGHLcv1tMnQZ"
+    }
+  }
+}

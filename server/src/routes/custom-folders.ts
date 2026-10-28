@@ -507,6 +507,7 @@ customFolderRoutes.post('/api/custom-folders/:id/docs', async (c) => {
             operationDirectory,
             localMapStore,
             larkCliClient,
+            whiteboardExport: config?.sync?.whiteboardExport,
           })),
         );
       } catch (error) {
@@ -533,6 +534,8 @@ interface LinkContext {
   operationDirectory: string;
   localMapStore: any;
   larkCliClient: any;
+  /** P0-S8：白板旁路导出配置（config.sync.whiteboardExport 宽容形态）。 */
+  whiteboardExport?: { enabled?: boolean; svgTimeoutMs?: number };
 }
 
 interface LinkResult {
@@ -568,12 +571,15 @@ async function processOneLink(ctx: LinkContext): Promise<LinkResult> {
     node = await ctx.larkCliClient.getNode(linkStr);
   } catch (error) {
     // Fallback for pure cloud-document links that are not part of any wiki
-    // space: lark-cli `wiki +node-get` rejects them with 131005
-    // "document is not in wiki". Only that specific signal is allowed to
+    // space: lark-cli `wiki +node-get` rejects them with "document is not in
+    // wiki" — 131005 on CLI ≤1.0.94, **131014 from 1.0.95** (node_by_token
+    // migration, 2026-10 audit D1). Both codes accepted for cross-version
+    // compatibility. Only that specific signal is allowed to
     // bypass getNode — permission errors (131006/40403) and any other failure
     // must surface verbatim so they cannot smuggle a direct fetch.
     const isNotInWiki =
-      error instanceof LarkCliError && error.upstreamCode === '131005';
+      error instanceof LarkCliError
+      && (error.upstreamCode === '131005' || error.upstreamCode === '131014');
     if (!isNotInWiki) {
       const classified = classifyLinkError(error);
       return { link: linkStr, ok: false, error: classified };
@@ -806,6 +812,7 @@ async function processOneLink(ctx: LinkContext): Promise<LinkResult> {
           originalLink: linkStr,
           objEditTime: node.obj_edit_time ?? null,
           spaceId: node.space_id ?? null,
+          whiteboardExport: ctx.whiteboardExport,
         });
     commitPlan = syncResult.commitPlan;
   } catch (error) {

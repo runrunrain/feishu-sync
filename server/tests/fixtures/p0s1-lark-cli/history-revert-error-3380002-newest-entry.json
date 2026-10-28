@@ -1,0 +1,12 @@
+{
+  "ok": false,
+  "identity": "user",
+  "error": {
+    "type": "api",
+    "subtype": "unknown",
+    "code": 3380002,
+    "message": "INVALID ARGUMENT",
+    "log_id": "LOGIDPROBE47",
+    "troubleshooter": "排查建议查看(Troubleshooting suggestions): https://open.feishu.cn/search?from=openapi&log_id=LOGIDPROBE47&code=3380002&method_id=7652368008158219237"
+  }
+}

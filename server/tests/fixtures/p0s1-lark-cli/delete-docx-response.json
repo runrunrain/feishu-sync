@@ -1,0 +1,12 @@
+{
+  "ok": true,
+  "identity": "user",
+  "data": {
+    "deleted": true,
+    "file_token": "DOCXTOKENPROBE1",
+    "ready": true,
+    "status": "success",
+    "task_id": "schedule|TICKETPROBE3",
+    "type": "docx"
+  }
+}

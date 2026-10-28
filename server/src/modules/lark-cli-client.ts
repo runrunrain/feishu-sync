@@ -84,10 +84,23 @@ export type LarkCliErrorCode =
   | 'auth'
   | 'permission'
   | 'deleted'
+  | 'not_in_wiki'
+  | 'missing_scope'
   | 'rate_limited'
   | 'timeout'
   | 'parse'
-  | 'upstream';
+  | 'upstream'
+  // P0-S2（P0-S1 实测定稿，fixture p0s1-lark-cli）：10020 = history revert
+  // 并发单飞（可重试·先轮询）；3380002 = 回滚目标无效（含最新条目不可作
+  // 目标）；981003 = update-title 类型错配。尾部追加，既有分类零改动。
+  | 'conflict'
+  | 'invalid_target'
+  | 'type_mismatch'
+  // T4b-06（lark-cli-client 层）：非幂等写命令（create/revert/move）已发出
+  // 后，响应缺少必要字段（如 status/task_id/document_id）——云端可能已
+  // 受理，但结果无法从响应判定。这是「未知」类信号，不是「明确失败」；
+  // 不可重试（retryable=false，重发会造成重复写），由服务层置 unknown。
+  | 'incomplete_response';
 
 /** Structured error surfaced consistently by every lark-cli command path. */
 export class LarkCliError extends Error {
@@ -116,6 +129,13 @@ export interface MediaOutputTarget {
   directory: string;
   outputName: string;
   requestedPath: string;
+}
+
+/** slides +screenshot 单页输出映射（设计 §3.2：文件↔页号映射以 JSON 输出为准）。 */
+export interface SlidesScreenshotOutput {
+  slideNumber: number;
+  /** 输出文件的绝对路径（已校验位于请求的 outputDir 围栏内）。 */
+  path: string;
 }
 
 export interface LarkCliAuthReadiness {
@@ -148,13 +168,83 @@ export interface LarkCliDocumentMetaBatchResult {
   failed: Array<{ docToken: string; code?: number }>;
 }
 
+// -------------------------------------------------------------------------
+// P0-S2 新能力 DTO（lark-cli-newcaps-P0 §3 + §10 P0-S1 实测定稿；真实输出
+// 样本 fixture：server/tests/fixtures/p0s1-lark-cli/）。三能力共用：history
+// （A 写回历史安全网）、whiteboard export（B 白板 SVG 通路）、update-title
+// （C 标题同步）。
+// -------------------------------------------------------------------------
+
+/** docs +history-list 单条历史条目（P0-S1 HP-1 实测形态）。 */
+export interface DocHistoryEntry {
+  /**
+   * 历史版本 id：字符串（1024×n 步进），与 revision_id 无耦合。回滚目标
+   * 与写前锚点都用它（注意：`docs +fetch --revision-id` 收的是数值
+   * revision_id，不是它）。
+   */
+  historyVersionId: string | null;
+  /** 数值 revision id（与 `+fetch --revision-id` 同一 id 空间）。 */
+  revisionId: number | null;
+  /** RFC3339Z（秒级取整）；同一操作产生的多条目可共享同一时间。 */
+  editTime: string | null;
+  /** 编辑者 open_id 数组（上游无姓名字段；要姓名需另查通讯录，v1 不做）。 */
+  editorIds: string[];
+  /** 1=建档 / 2=普通编辑 / 3=revert 产生的历史（UI 可标注「回滚快照」）。 */
+  type: number | null;
+  /** 原始条目，仅诊断用途，不进对外 DTO。 */
+  raw: unknown;
+}
+
+/** docs +history-list 一页结果（条目按新→旧排序）。 */
+export interface DocumentHistoryPage {
+  entries: DocHistoryEntry[];
+  hasMore: boolean;
+  /** has_more=true 时下一页令牌；否则 null（fixture：末页 page_token 为空串）。 */
+  nextPageToken: string | null;
+}
+
+/** docs +history-revert 结果（同步 done / 异步 running 两形态）。 */
+export interface DocumentHistoryRevertResult {
+  status: 'done' | 'running';
+  /** done 形态仍返回 task_id（P0-S1 HP-2 实测）。 */
+  taskId: string | null;
+  /** 轮询建议间隔（running 形态实测 10000；done 为 0）。 */
+  pollAfterMs: number | null;
+  /** 部分块回滚失败清单（revert 响应一般不带；状态轮询接口必带）。 */
+  failedBlockTokens: string[] | null;
+}
+
+/** docs +history-revert-status 轮询结果。 */
+export interface DocumentHistoryRevertStatus {
+  /** 未知取值归一为 running，由调用方按上限轮询（§3 双读容错原则）。 */
+  status: 'done' | 'running' | 'failed';
+  /** 非空 = 部分块回滚失败，服务层必须读取并上抛警告（P0-S1 HP-2）。 */
+  failedBlockTokens: string[] | null;
+}
+
+/** drive +update-title 归一化结果（原始响应见 raw）。 */
+export interface UpdateDocumentTitleResult {
+  fileToken: string | null;
+  title: string | null;
+  type: string | null;
+  updated: boolean;
+  url: string | null;
+  raw: unknown;
+}
+
+/** 容错读取字符串数组字段：缺失/非数组 → null；元素按类型过滤。 */
+function toStringArrayOrNull(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null;
+  return value.filter((item): item is string => typeof item === 'string');
+}
+
 export interface LarkCliExecutableResolutionOptions {
   homeDir?: string;
   platform?: NodeJS.Platform;
   env?: NodeJS.ProcessEnv;
 }
 
-type LarkCliApiType = 'wiki' | 'docx' | 'sheets' | 'base' | 'drive' | 'auth';
+type LarkCliApiType = 'wiki' | 'docx' | 'sheets' | 'base' | 'drive' | 'slides' | 'auth';
 
 // A Drive metadata request can describe 200 documents at once, so a low
 // command rate is still substantially faster than individual node-get calls.
@@ -171,6 +261,9 @@ const API_QPS_LIMITS: Record<LarkCliApiType, number> = {
   // 速率不变，这里只决定 base 桶自身的上限。
   base: 10,
   drive: 1,
+  // P1-B slides 截图（设计 §3.2）：服务端逐页渲染，限 1 QPS；仍受全局
+  // 3 QPS 桶约束。
+  slides: 1,
   auth: 1,
 };
 /** Cross-endpoint ceiling: per-API buckets alone cannot prevent a burst. */
@@ -494,11 +587,17 @@ export class LarkCliClient {
     return pending;
   }
 
-  async fetchDocumentMarkdown(objToken: string): Promise<any> {
-    return this.execute([
+  async fetchDocumentMarkdown(objToken: string, opts?: { revisionId?: number }): Promise<any> {
+    // opts.revisionId：P0-S5 对比弹窗只读云端历史正文（`docs +fetch --revision-id`，
+    // id 空间=history 的 revision_id 数值——P0-S1 实测 HP-3；缺省不传=最新版）。
+    const args = [
       'docs', '+fetch', '--api-version', 'v2', '--doc', objToken,
       '--doc-format', 'markdown', '--detail', 'simple',
-    ], 'docx');
+    ];
+    if (typeof opts?.revisionId === 'number' && Number.isFinite(opts.revisionId)) {
+      args.push('--revision-id', String(Math.floor(opts.revisionId)));
+    }
+    return this.execute(args, 'docx');
   }
 
   /** Read the authoritative XML presentation body for a Slides object. */
@@ -511,6 +610,155 @@ export class LarkCliClient {
       }),
       '--format', 'json',
     ], 'docx');
+  }
+
+  // -------------------------------------------------------------------------
+  // P1-B slides 截图（设计 §3.2；P1-S1 SP-1/SP-2 实测输入）：
+  // - argv：`slides +screenshot --as user --presentation <id>
+  //   --slide-number <n1,n2,…> --output-dir <rel> --format json`；
+  //   `--slide-number` 为 pflag ints，"1,2" 逗号形式已实测解析通过；
+  //   单请求 ≤10 页，超出由本方法拒绝（分批在 SyncEngine 层）。
+  // - scope：`slides:presentation:screenshot` 当前未授权时 CLI 以 exit 3 +
+  //   missing_scope 错误体拒绝（原文见 tests/fixtures/p1s1-lark-cli/），
+  //   经 classifyError 透传为 code='missing_scope'，由上层引导增量授权。
+  // - 输出围栏同 fetchMediaToPath：子进程 cwd = outputDir 父目录，
+  //   --output-dir 传相对名；返回路径逐条校验不逃逸。
+  // - 页号↔文件映射：优先 JSON 输出（SP-2 授权后待实测定型，这里做宽容
+  //   多形态解析）；无映射时退化为输出目录扫描（文件名含数字按数值排序
+  //   配对页号），数量不匹配则拒绝。只追加方法，既有读链路零改动。
+  // -------------------------------------------------------------------------
+
+  /** 批量采集幻灯片页面截图；返回每页的输出文件路径映射。 */
+  async screenshotSlides(
+    xmlPresentationId: string,
+    options: { slideNumbers: number[]; outputDir: string },
+  ): Promise<SlidesScreenshotOutput[]> {
+    if (typeof xmlPresentationId !== 'string' || !xmlPresentationId.trim()) {
+      throw new Error(
+        `screenshotSlides requires a non-empty presentation token; received: ${String(xmlPresentationId)}`,
+      );
+    }
+    if (typeof options.outputDir !== 'string' || !options.outputDir.trim()) {
+      throw new Error(`screenshotSlides requires a non-empty outputDir; received: ${String(options.outputDir)}`);
+    }
+    if (!Array.isArray(options.slideNumbers) || options.slideNumbers.length === 0) {
+      throw new Error('screenshotSlides 仅接受 1–10 个页码，收到空列表');
+    }
+    // 升序去重：确定性的 argv（与退化扫描的页号↔文件配对顺序一致）。
+    const unique = [...new Set(options.slideNumbers)].sort((a, b) => a - b);
+    if (unique.length > 10 || unique.some((n) => !Number.isInteger(n) || n < 1)) {
+      throw new Error(
+        `screenshotSlides 仅接受 1–10 个正整数页码，实际: ${JSON.stringify(options.slideNumbers)}`,
+      );
+    }
+
+    const requestedDir = path.resolve(options.outputDir);
+    const parentDir = path.dirname(requestedDir);
+    const dirName = path.basename(requestedDir);
+    fs.mkdirSync(requestedDir, { recursive: true });
+    const args = [
+      'slides', '+screenshot', '--as', 'user',
+      '--presentation', xmlPresentationId,
+      '--slide-number', unique.join(','),
+      '--output-dir', dirName,
+      '--format', 'json',
+    ];
+    // 服务端逐页渲染较慢：给足 10 页批的余量（对齐 exportWorkbook 预算量级）。
+    const result = await this.execute(args, 'slides', { cwd: parentDir, timeoutMs: 120_000 });
+
+    let entries = this.extractSlidesScreenshotEntries(result);
+    if (entries.length === 0) {
+      entries = this.scanSlidesScreenshotDir(requestedDir, [...unique].sort((a, b) => a - b));
+    }
+    if (entries.length === 0) {
+      throw new LarkCliError(
+        `slides +screenshot 未返回页号↔文件映射，且输出目录无可配对文件: ${requestedDir}`,
+        'parse',
+        false,
+      );
+    }
+
+    const resolved = entries.map((entry) => {
+      // CLI 相对路径优先按子进程 cwd（parentDir）解析；不存在时兑底按
+      // 输出目录相对解析（SP-2 未定型：两种基准都可能出现，最终都以围栏
+      // 校验为准，不改变拒绝逃逸语义）。
+      const fromCwd = path.resolve(parentDir, entry.path);
+      const fromDir = path.resolve(requestedDir, entry.path);
+      return {
+        slideNumber: entry.slideNumber,
+        path: fs.existsSync(fromCwd) ? fromCwd : fromDir,
+      };
+    });
+    for (const entry of resolved) {
+      if (!isPathInsideDirectory(requestedDir, entry.path)) {
+        throw new LarkCliError(
+          `lark-cli 返回了输出目录外的截图路径: ${entry.path}`,
+          'upstream',
+          false,
+        );
+      }
+    }
+    return resolved;
+  }
+
+  /**
+   * 从 slides +screenshot 的 JSON 响应中宽容提取页号↔文件条目：深度 ≤4
+   * 递归扫描，命中「页号键 + 路径键」共现的对象即收（SP-2 形态未定，
+   * 覆盖 data.screenshots[] / 裸数组 / snake/camel 键名等候选）。
+   */
+  private extractSlidesScreenshotEntries(
+    payload: unknown,
+    depth = 0,
+    out: Array<{ slideNumber: number; path: string }> = [],
+  ): Array<{ slideNumber: number; path: string }> {
+    if (Array.isArray(payload)) {
+      for (const item of payload) this.extractSlidesScreenshotEntries(item, depth + 1, out);
+      return out;
+    }
+    if (!payload || typeof payload !== 'object' || depth > 4) return out;
+    const record = payload as Record<string, unknown>;
+    const slideRaw = record.slide_number ?? record.slideNumber ?? record.slide ?? record.page ?? record.page_number;
+    const slideNumber = Number(slideRaw);
+    const rawPath = record.saved_path ?? record.path ?? record.file ?? record.file_path ?? record.output;
+    if (Number.isInteger(slideNumber) && slideNumber >= 1 && typeof rawPath === 'string' && rawPath.trim()) {
+      out.push({ slideNumber, path: rawPath.trim() });
+      return out;
+    }
+    for (const key of Object.keys(record)) {
+      // 提示文案与诊断消息不是映射载体，跳过以防误扫。
+      if (key === 'hint' || key === 'message' || key === 'error') continue;
+      this.extractSlidesScreenshotEntries(record[key], depth + 1, out);
+    }
+    return out;
+  }
+
+  /**
+   * SP-2 未定型时的退化通道：扫描输出目录文件，按文件名中的数值排序后
+   * 与升序页码一一配对；文件数与页码数不匹配则返回空（上层拒绝）。
+   */
+  private scanSlidesScreenshotDir(
+    requestedDir: string,
+    sortedSlideNumbers: number[],
+  ): Array<{ slideNumber: number; path: string }> {
+    let names: string[];
+    try {
+      names = fs
+        .readdirSync(requestedDir, { withFileTypes: true })
+        .filter((entry) => entry.isFile())
+        .map((entry) => entry.name);
+    } catch {
+      return [];
+    }
+    const numericKey = (name: string): { n: number; name: string } => {
+      const match = /\d+/.exec(name);
+      return { n: match ? Number(match[0]) : Number.MAX_SAFE_INTEGER, name };
+    };
+    const sorted = names.map(numericKey).sort((a, b) => a.n - b.n || a.name.localeCompare(b.name));
+    if (sorted.length !== sortedSlideNumbers.length) return [];
+    return sorted.map((entry, index) => ({
+      slideNumber: sortedSlideNumbers[index],
+      path: path.join(requestedDir, entry.name),
+    }));
   }
 
   // -------------------------------------------------------------------------
@@ -610,6 +858,100 @@ export class LarkCliClient {
     return {
       revisionId: typeof revision === 'number' && Number.isFinite(revision) ? revision : null,
       title: typeof document?.title === 'string' ? document.title : undefined,
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // P1-S8 反向发布（设计 P1 §4.4/§4.5；P1-S1 PB-1/PB-2 实测定稿 argv）。
+  // 只新增方法，既有读写链路零改动：
+  //   docs +create --doc-format markdown --title <t> --content @<tmpfile>
+  //                --parent-token <target> --format json
+  //   docs +script --command parse --doc <t> --format json
+  // 正文经临时目录 + 子进程 cwd 相对 @file 传入（与 updateDocument 同一
+  // 实测约束与安全属性：不落 argv/日志；@file 只接受 cwd 相对路径）。
+  // -------------------------------------------------------------------------
+
+  /**
+   * 以 Markdown 直传创建云文档（P1-S1 实测：--title 只前置标题不去重
+   * 正文同名 H1——去重由调用方 renderForPublish 承担；响应
+   * data.document.{document_id, revision_id, url}）。
+   */
+  async createDocumentMarkdown(options: {
+    title: string;
+    markdown: string;
+    parentToken: string;
+  }): Promise<{ documentId: string; url: string | null; revisionId: number | null }> {
+    if (typeof options.title !== 'string' || options.title.trim().length === 0) {
+      throw new Error('createDocumentMarkdown requires a non-empty title');
+    }
+    if (typeof options.markdown !== 'string') {
+      throw new Error('createDocumentMarkdown requires markdown to be a string');
+    }
+    if (typeof options.parentToken !== 'string' || options.parentToken.trim().length === 0) {
+      throw new Error('createDocumentMarkdown requires a non-empty parentToken');
+    }
+    const stagingDir = fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-sync-publish-'));
+    try {
+      const fileName = 'content.md';
+      fs.writeFileSync(path.join(stagingDir, fileName), options.markdown, 'utf-8');
+      const args = [
+        'docs', '+create',
+        '--doc-format', 'markdown',
+        '--title', options.title,
+        '--content', `@${fileName}`,
+        '--parent-token', options.parentToken,
+        '--format', 'json',
+      ];
+      const result = await this.execute(args, 'docx', {
+        cwd: stagingDir,
+        // create 是服务端单请求全量写入，大文档余量对齐 update 预算。
+        timeoutMs: 120_000,
+      });
+      const document = result?.data?.document ?? {};
+      const documentId = typeof document.document_id === 'string' ? document.document_id : '';
+      if (!documentId) {
+        // T4b-06：命令已发出且退出成功，但响应缺 document_id——云端可能
+        // 已创建文档，结果未知。不得按「明确失败」抛普通 Error（发布链会
+        // 落 failed 并允许普通重发 → 重复云文档）：归 incomplete_response，
+        // 由上层置 unknown 并禁止普通重发。
+        throw new LarkCliError(
+          'docs +create 响应缺少 data.document.document_id，创建结果未知（命令已发出，请勿按失败重发）',
+          'incomplete_response',
+          false,
+        );
+      }
+      const revision = document.revision_id;
+      return {
+        documentId,
+        url: typeof document.url === 'string' && document.url.length > 0 ? document.url : null,
+        revisionId: typeof revision === 'number' && Number.isFinite(revision) ? revision : null,
+      };
+    } finally {
+      fs.rmSync(stagingDir, { recursive: true, force: true });
+    }
+  }
+
+  /**
+   * parse 回读画像（P1-S1 PB-2：data.profile.{word_count,char_count,
+   * block_count}；发布回读校验比对 char_count，读授权内）。字段缺失返回
+   * null，不抛错（校验侧降级为 publish_verify_unavailable）。
+   */
+  async parseDocumentProfile(
+    objToken: string,
+  ): Promise<{ charCount: number | null; wordCount: number | null; blockCount: number | null }> {
+    if (typeof objToken !== 'string' || objToken.trim().length === 0) {
+      throw new Error('parseDocumentProfile requires a non-empty objToken');
+    }
+    const result = await this.execute([
+      'docs', '+script', '--command', 'parse', '--doc', objToken, '--format', 'json',
+    ], 'docx', { timeoutMs: 60_000 });
+    const profile = result?.data?.profile ?? {};
+    const numberOrNull = (value: unknown): number | null =>
+      typeof value === 'number' && Number.isFinite(value) ? value : null;
+    return {
+      charCount: numberOrNull(profile.char_count),
+      wordCount: numberOrNull(profile.word_count),
+      blockCount: numberOrNull(profile.block_count),
     };
   }
 
@@ -1035,7 +1377,10 @@ export class LarkCliClient {
     parentNodeToken?: string;
     pageSize?: number;
   }): Promise<LarkCliNodeInfo[]> {
-    const args = ['wiki', '+node-list', '--format', 'ndjson', '--page-all'];
+    const args = ['wiki', '+node-list', '--format', 'ndjson', '--page-all', '--page-limit', '0'];
+    // ↑ --page-limit 0 = unlimited：1.0.98 起 --page-all 受默认 --page-limit 10
+    // 截断（每分支 ≤10×50=500 节点静默停止，ok:true 无截断标记）——大子树
+    // 会被误判 missing/deletion 候选。显式置 0 信任上游 QPS 节流（audit D2）。
     if (options.spaceId) args.push('--space-id', options.spaceId);
     if (options.parentNodeToken) args.push('--parent-node-token', options.parentNodeToken);
     if (options.pageSize) args.push('--page-size', String(options.pageSize));
@@ -1484,7 +1829,12 @@ export class LarkCliClient {
     }
     // 2. Textual fallback: match a known API code embedded in stderr text.
     //    \b boundaries prevent matching inside longer digit runs (e.g. a PID).
-    const known = rawMessage.match(/\b(131005|131006|40403|3380003|99991400)\b/);
+    //    131014 = "document is not in wiki" on lark-cli ≥1.0.95 (node_by_token
+    //    migration); 131005 = same meaning on older CLI. Audit D1 (2026-10).
+    //    P0-S2 追加 10020 / 3380002 / 981003：错误体非 JSON 时的文本兜底
+    //    （10020=并发 revert 单飞、3380002=回滚目标无效、981003=改名类型
+    //    错配；三种形态均以 p0s1-lark-cli fixture 实证）。
+    const known = rawMessage.match(/\b(131005|131006|131014|40403|3380003|99991400|10020|3380002|981003)\b/);
     return known ? known[1] : undefined;
   }
 
@@ -1499,6 +1849,18 @@ export class LarkCliClient {
       return new LarkCliError(
         'lark-cli 已安装但尚未完成初始配置：请在终端执行 lark-cli config init --new（它会输出一个验证 URL，在浏览器打开完成配置），然后回到应用重新检测并认证',
         'auth',
+        false,
+        upstreamCode,
+      );
+    }
+    // P1-S5（设计 §3.2；P1-S1 SP-1 实测定型）：scope 校验先于一切参数校验，
+    // 缺失可选读 scope（如 slides:presentation:screenshot）时 lark-cli 以
+    // 非零退出 + JSON 错误体拒绝。错误原文含 scope 名与 CLI 的增量授权
+    // hint，透传原文供上层引导增量授权；不可重试（重试无意义，需授权）。
+    if (upstreamCode === 'missing_scope' || /(?:missing_scope|missing required scope)/i.test(message)) {
+      return new LarkCliError(
+        `缺少飞书授权（missing_scope）：${message}`,
+        'missing_scope',
         false,
         upstreamCode,
       );
@@ -1520,10 +1882,62 @@ export class LarkCliClient {
     if (/(?:40403|131006|permission|forbidden|access denied|无权限)/i.test(message)) {
       return new LarkCliError('无权限访问该节点', 'permission', false, upstreamCode);
     }
+    // 「文档不在 wiki 空间」：CLI hint 明示 Do not retry（换 docs/sheets/base/drive
+    // 命令而非重试 wiki 命令）。131014 = lark-cli ≥1.0.95（node_by_token 迁移），
+    // 131005 = 旧版；不可重试，调用方（如 custom-folders 归档 fallback）按
+    // upstreamCode 识别后改走云文档通道（audit D1，2026-10）。
+    if (
+      upstreamCode === '131014' || upstreamCode === '131005'
+      || /document is not in wiki/i.test(message)
+    ) {
+      return new LarkCliError(
+        '该文档不在 wiki 空间（云文档），请用对应的云文档链接或 docs/drive 命令访问',
+        'not_in_wiki',
+        false,
+        upstreamCode ?? '131014',
+      );
+    }
+    // P0-S2（P0-S1 实测定稿）：history revert 并发单飞门——服务端同一文档
+    // 只允许一个 revert 任务（10020）。可重试但不是立即重试：先轮询既有
+    // 任务状态再重试（S4 的 cloud_revert_running 门是它的本地镜像）。
+    if (upstreamCode === '10020' || /\b10020\b/.test(message)) {
+      return new LarkCliError(
+        '该文档已有回滚任务进行中，请先轮询任务状态完成后再重试',
+        'conflict',
+        true,
+        upstreamCode ?? '10020',
+      );
+    }
+    // 3380002：revert 目标无效——history_version_id 不存在，或目标为最新
+    // 历史条目（最新条目被下一次写超越后才可作目标；两种形态同码，P0-S1
+    // 两份 fixture 互证）。注意与 3380003（文档已删除，上方 deleted 分支）
+    // 是两个不同语义：3380002 换目标/重新 list 可恢复，3380003 文档没了。
+    if (upstreamCode === '3380002' || /\b3380002\b/.test(message)) {
+      return new LarkCliError(
+        '回滚目标无效：历史版本不存在或为最新历史条目，不可作为回滚目标',
+        'invalid_target',
+        false,
+        upstreamCode ?? '3380002',
+      );
+    }
+    // 981003：update-title 类型错配（token 与 --type 不符，报 "not found."，
+    // 与未知 token 同码）。本地映射可能已过期：不得自动换 type 重试（U31），
+    // 应先重新检测/核对类型（drive +inspect）。
+    if (upstreamCode === '981003' || /\b981003\b/.test(message)) {
+      return new LarkCliError(
+        '标题更新类型错配：token 与传入类型不符，请先核对文档类型后重试',
+        'type_mismatch',
+        false,
+        upstreamCode ?? '981003',
+      );
+    }
     if (/(?:not authenticated|token expired|unauthorized|认证)/i.test(normalized)) {
       return new LarkCliError('认证失效，请执行 lark-cli auth login', 'auth', false, upstreamCode);
     }
-    if (/(?:timeout|timed out|超时)/i.test(normalized)) {
+    // "server time out error"（P0-S1 白板 svg 服务端渲染超时 fixture 形态：
+    // 带空格的 time out 不被 timeout/timed out 覆盖）——归 timeout 可重试，
+    // S6 以此码判定「svg 失败降级 raw」。
+    if (/(?:timeout|timed out|time out|超时)/i.test(normalized)) {
       return new LarkCliError('lark-cli 执行超时', 'timeout', true, upstreamCode);
     }
     return new LarkCliError(`lark-cli 执行失败：${message}`, 'upstream', true, upstreamCode);
@@ -1566,6 +1980,399 @@ export class LarkCliClient {
       await new Promise((resolve) => setTimeout(resolve, waitTime));
     }
   }
+
+  // -------------------------------------------------------------------------
+  // P0-S2 新能力五方法（lark-cli-newcaps-P0 §3 + §10 P0-S1 实测定稿，
+  // lark-cli 1.0.98 实测命令形态；fixture server/tests/fixtures/
+  // p0s1-lark-cli/）。只追加：既有读写方法 argv 零改动。apiType 复用既有
+  // 桶：history / whiteboard → 'docx'，update-title → 'drive'。
+  // -------------------------------------------------------------------------
+
+  /**
+   * docs +history-list —— 云端历史分页（每页 1-20；P0-S1 HP-1：新建文档
+   * 立即有 1 条 type=1 建档历史；但历史条目异步定型、非每 revision 必有，
+   * 解析仍容忍空列表）。写前锚点取第 1 页（pageSize 5）即可（U22/U23）。
+   */
+  async listDocumentHistory(
+    objToken: string,
+    opts?: { pageToken?: string; pageSize?: number },
+  ): Promise<DocumentHistoryPage> {
+    if (typeof objToken !== 'string' || objToken.trim().length === 0) {
+      throw new Error(
+        `listDocumentHistory requires a non-empty objToken; received: ${String(objToken)}`,
+      );
+    }
+    const pageSize = Math.min(20, Math.max(1, Math.floor(opts?.pageSize ?? 20)));
+    const args = [
+      'docs', '+history-list',
+      '--doc', objToken,
+      '--page-size', String(pageSize),
+    ];
+    if (opts?.pageToken) args.push('--page-token', opts.pageToken);
+    args.push('--format', 'json');
+    const result = await this.execute(args, 'docx');
+    const data = result?.data ?? result;
+    // 双读容错（§3）：实测形态 data.entries；items/histories/records 兜底
+    // 未来字段漂移（与 fetchDocumentRevision 的「结构化优先」同模式）。
+    const rawEntries = data?.entries ?? data?.items ?? data?.histories ?? data?.records;
+    const entries: DocHistoryEntry[] = Array.isArray(rawEntries)
+      ? rawEntries
+        .filter((entry: unknown): entry is Record<string, unknown> =>
+          entry !== null && typeof entry === 'object')
+        .map((entry) => ({
+          historyVersionId: typeof entry.history_version_id === 'string'
+            ? entry.history_version_id : null,
+          revisionId: typeof entry.revision_id === 'number' && Number.isFinite(entry.revision_id)
+            ? entry.revision_id : null,
+          // edit_time 为主（fixture 实测）；created_at/create_time 兜底
+          // （HP-1 待定字段名的既定处置，双读不丢时间信息）。
+          editTime: typeof entry.edit_time === 'string' ? entry.edit_time
+            : typeof entry.created_at === 'string' ? entry.created_at
+              : typeof entry.create_time === 'string' ? entry.create_time : null,
+          editorIds: toStringArrayOrNull(entry.editor_ids) ?? [],
+          type: typeof entry.type === 'number' && Number.isFinite(entry.type)
+            ? entry.type : null,
+          raw: entry,
+        }))
+      : [];
+    const hasMore = data?.has_more === true || data?.hasMore === true;
+    const pageToken = typeof data?.page_token === 'string' ? data.page_token
+      : typeof data?.pageToken === 'string' ? data.pageToken : '';
+    return {
+      entries,
+      hasMore,
+      nextPageToken: hasMore && pageToken !== '' ? pageToken : null,
+    };
+  }
+
+  /**
+   * docs +history-revert —— 回滚到历史版本（P0-S1 HP-2：revert 产生新历史
+   * type=3，回滚可再回滚；不回滚文档 title；内嵌白板块随正文整体恢复）。
+   *
+   * 非幂等：调用方绝不重试；子进程超时/输出不可解析 → 抛 LarkCliError，
+   * 服务层置 unknown（设计 §4.4）。waitTimeoutMs 缺省 30000（同步等待上
+   * 限）；传 0 走异步形态（立即返回 running + task_id，由调用方轮询
+   * revertDocumentHistoryStatus）。最新历史条目不可作目标（3380002）。
+   */
+  async revertDocumentHistory(
+    objToken: string,
+    historyVersionId: string,
+    opts?: { waitTimeoutMs?: number },
+  ): Promise<DocumentHistoryRevertResult> {
+    if (typeof objToken !== 'string' || objToken.trim().length === 0) {
+      throw new Error(
+        `revertDocumentHistory requires a non-empty objToken; received: ${String(objToken)}`,
+      );
+    }
+    if (typeof historyVersionId !== 'string' || historyVersionId.trim().length === 0) {
+      throw new Error(
+        `revertDocumentHistory requires a non-empty historyVersionId; received: ${String(historyVersionId)}`,
+      );
+    }
+    const waitTimeoutMs = Math.min(30_000, Math.max(0, Math.floor(opts?.waitTimeoutMs ?? 30_000)));
+    const result = await this.execute([
+      'docs', '+history-revert',
+      '--doc', objToken,
+      '--history-version-id', historyVersionId,
+      '--wait-timeout-ms', String(waitTimeoutMs),
+      '--format', 'json',
+    ], 'docx', {
+      // 子进程预算必须大于 --wait-timeout-ms（CLI 内部同步等待上限），
+      // 预留 15s 收尾，否则同步等待恰好命中客户端超时被误判为 timeout。
+      timeoutMs: waitTimeoutMs + 15_000,
+    });
+    const data = result?.data ?? result;
+    // 双读：data.status ?? data.task_status；未知取值 → running（调用方
+    // 继续轮询直到上限）。
+    const rawStatus = typeof data?.status === 'string' ? data.status
+      : typeof data?.task_status === 'string' ? data.task_status : '';
+    // T4b-06：非幂等写已发出，响应形态不完整 = 结果未知（不是明确失败）：
+    //   - 缺 status/task_status：无法区分同步完成/异步起步；
+    //   - 异步形态缺 task_id：无法轮询收敛。
+    // 两种都抛 incomplete_response（不可重试），由服务层置 unknown。
+    if (rawStatus === '') {
+      throw new LarkCliError(
+        'docs +history-revert 响应缺少 status/task_status 字段，回滚结果未知（命令已发出，请勿重发）',
+        'incomplete_response',
+        false,
+      );
+    }
+    const taskId = typeof data?.task_id === 'string' && data.task_id !== '' ? data.task_id : null;
+    if (rawStatus !== 'done' && taskId == null) {
+      throw new LarkCliError(
+        'docs +history-revert 异步响应缺少 task_id，回滚任务无法轮询收敛，结果未知（命令已发出，请勿重发）',
+        'incomplete_response',
+        false,
+      );
+    }
+    return {
+      status: rawStatus === 'done' ? 'done' : 'running',
+      taskId,
+      pollAfterMs: typeof data?.poll_after_ms === 'number' && Number.isFinite(data.poll_after_ms)
+        ? data.poll_after_ms : null,
+      failedBlockTokens: toStringArrayOrNull(data?.failed_block_tokens),
+    };
+  }
+
+  /**
+   * docs +history-revert-status —— 轮询回滚任务状态。failedBlockTokens
+   * 非空 = 部分块回滚失败（P0-S1 HP-2：该字段必须读取并上抛警告）。
+   */
+  async revertDocumentHistoryStatus(
+    objToken: string,
+    taskId: string,
+  ): Promise<DocumentHistoryRevertStatus> {
+    if (typeof objToken !== 'string' || objToken.trim().length === 0) {
+      throw new Error(
+        `revertDocumentHistoryStatus requires a non-empty objToken; received: ${String(objToken)}`,
+      );
+    }
+    if (typeof taskId !== 'string' || taskId.trim().length === 0) {
+      throw new Error(
+        `revertDocumentHistoryStatus requires a non-empty taskId; received: ${String(taskId)}`,
+      );
+    }
+    const result = await this.execute([
+      'docs', '+history-revert-status',
+      '--doc', objToken,
+      '--task-id', taskId,
+      '--format', 'json',
+    ], 'docx');
+    const data = result?.data ?? result;
+    const rawStatus = typeof data?.status === 'string' ? data.status
+      : typeof data?.task_status === 'string' ? data.task_status : '';
+    const status: DocumentHistoryRevertStatus['status'] = rawStatus === 'done' ? 'done'
+      : rawStatus === 'failed' || rawStatus === 'error' ? 'failed'
+        : 'running';
+    return {
+      status,
+      failedBlockTokens: toStringArrayOrNull(data?.failed_block_tokens),
+    };
+  }
+
+  /**
+   * whiteboard +export —— 白板旁路导出（P0-S1 HP-4 分支裁定：svg 主产物
+   * ——文字为真实 <text>/<tspan> 节点；raw 为降级产物——复杂画板 svg 会
+   * 服务端渲染超时（~6.5s，内容相关，归 timeout 类错误），raw 稳定可用。
+   * S6 走「先 svg、network/timeout 类失败降级 raw」双源链）。
+   *
+   * - 响应键按类型区分（P0-S1 实测，非统一 output 字段）：svg →
+   *   data.svg_path；raw → data.output_path。（preview 是
+   *   preview_image_path 且扩展名必须 .jpg——本方法不暴露 preview；同步
+   *   链的 PNG 走既有 media-download --type whiteboard，不经 +export。）
+   * - 超时预算由调用方传入（svg 的服务端超时是 S6 降级判定的输入）；
+   *   未传时用 execute 缺省预算。
+   * - 输出围栏复用 resolveMediaOutputTarget + isPathInsideDirectory
+   *   （fetchMediaToPath 同款）；另按 exportWorkbook 先例校验落盘存在
+   *   且非空（导出类命令成功退出不等于文件完整）。
+   */
+  async exportWhiteboard(
+    whiteboardToken: string,
+    opts: { outputType: 'svg' | 'raw'; outputPath: string; timeoutMs?: number },
+  ): Promise<string> {
+    if (typeof whiteboardToken !== 'string' || whiteboardToken.trim().length === 0) {
+      throw new Error(
+        `exportWhiteboard requires a non-empty whiteboardToken; received: ${String(whiteboardToken)}`,
+      );
+    }
+    const target = resolveMediaOutputTarget(opts.outputPath);
+    const execution: LarkCliExecutionOptions = { cwd: target.directory };
+    if (opts.timeoutMs != null) execution.timeoutMs = opts.timeoutMs;
+    const result = await this.execute([
+      'whiteboard', '+export',
+      '--whiteboard-token', whiteboardToken,
+      '--output-type', opts.outputType,
+      '--output', target.outputName,
+      '--overwrite',
+      '--format', 'json',
+    ], 'docx', execution);
+    const data = result?.data ?? result;
+    const reported = opts.outputType === 'svg' ? data?.svg_path : data?.output_path;
+    const resolvedPath = typeof reported === 'string' && reported !== ''
+      ? path.resolve(target.directory, reported)
+      : target.requestedPath;
+    // 顺序：先验落盘完整性、后验输出围栏——两分支都抛错，上报路径任何
+    // 形态都不会被返回给调用方；先验完整性可避免 macOS /var→/private
+    // 符号链接差异在文件尚不存在时抢先触发围栏（isPathInsideDirectory
+    // 只对已存在路径做 realpath 归一），产生误导性的「输出目录外」文案。
+    if (!fs.existsSync(resolvedPath) || fs.statSync(resolvedPath).size === 0) {
+      throw new LarkCliError(
+        '白板导出尚未完成或文件为空，请稍后重试；本地版本未更新',
+        'upstream',
+        true,
+      );
+    }
+    if (!isPathInsideDirectory(target.directory, resolvedPath)) {
+      throw new LarkCliError(
+        `lark-cli 返回了输出目录外的白板导出路径: ${resolvedPath}`,
+        'upstream',
+        false,
+      );
+    }
+    return resolvedPath;
+  }
+
+  /**
+   * drive +update-title —— 飞书侧改名（P0-C；P0-S1 HP-6 实测）。type 缺省
+   * docx；wiki 成员必须传 node token + --type wiki（底层 obj token 不被
+   * 接受，节点与文档标题双向同步）。绝不传 --type file，也不传
+   * --on-extension-mismatch（非 file 类型无扩展名语义）。981003 = 类型
+   * 错配（与未知 token 同码 "not found."），调用方不得自动改用另一种
+   * type 重试（U31：本地映射可能已过期，应先重新检测）；空标题由 CLI
+   * 本地拦截（服务层另有 title_invalid 门，S9）。限流 99991400 走既有
+   * 指数退避。
+   */
+  async updateDocumentTitle(
+    fileToken: string,
+    title: string,
+    opts?: { type?: 'wiki' | 'docx' | 'sheet' | 'slides' | 'bitable' },
+  ): Promise<UpdateDocumentTitleResult> {
+    if (typeof fileToken !== 'string' || fileToken.trim().length === 0) {
+      throw new Error(
+        `updateDocumentTitle requires a non-empty fileToken; received: ${String(fileToken)}`,
+      );
+    }
+    if (typeof title !== 'string' || title.trim().length === 0) {
+      throw new Error(
+        `updateDocumentTitle requires a non-empty title; received: ${String(title)}`,
+      );
+    }
+    const result = await this.execute([
+      'drive', '+update-title',
+      '--token', fileToken,
+      '--type', opts?.type ?? 'docx',
+      '--title', title,
+      '--format', 'json',
+    ], 'drive');
+    const data = result?.data ?? result;
+    return {
+      fileToken: typeof data?.file_token === 'string' ? data.file_token : null,
+      title: typeof data?.title === 'string' ? data.title : null,
+      type: typeof data?.type === 'string' ? data.type : null,
+      updated: data?.updated === true,
+      url: typeof data?.url === 'string' ? data.url : null,
+      raw: result,
+    };
+  }
+
+  /**
+   * wiki +move-to-drive —— 知识库节点移出到云空间（P2-S6，设计 P2
+   * §3.2；probe §9：1.0.71 #1869，Risk: write）。folderToken 省略 = 移到
+   * 个人空间根。异步任务形态：state 双读（done 完成态 / 其余含未知取值
+   * 归一 running，交调用方轮询）；任务号双读 task_id/taskId。
+   *
+   * 【待 S5 实测校正】真实输出字段名（state/status、task_id 形态、是否有
+   * poll_after_ms / next_command 续查建议）尚未实测；本方法按通用异步
+   * 模式（P0-S1 history-revert 同款双读）实现，S5 实测后按真实 help/
+   * 输出样本校正。非幂等：调用方绝不重试；子进程超时/不可解析 → 抛
+   * LarkCliError，服务层置 unknown。
+   */
+  async moveWikiNodeToDrive(
+    nodeToken: string,
+    opts?: { folderToken?: string | null },
+  ): Promise<WikiMoveToDriveResult> {
+    if (typeof nodeToken !== 'string' || nodeToken.trim().length === 0) {
+      throw new Error(
+        `moveWikiNodeToDrive requires a non-empty nodeToken; received: ${String(nodeToken)}`,
+      );
+    }
+    const folderToken = typeof opts?.folderToken === 'string' && opts.folderToken.trim().length !== 0
+      ? opts.folderToken : null;
+    const result = await this.execute([
+      'wiki', '+move-to-drive',
+      '--node-token', nodeToken,
+      ...(folderToken ? ['--folder-token', folderToken] : []),
+      '--format', 'json',
+    ], 'wiki');
+    const data = result?.data ?? result;
+    // 双读容错（通用异步模式）：state/status 键、task_id/taskId 键同读。
+    const rawState = typeof data?.state === 'string' ? data.state
+      : typeof data?.status === 'string' ? data.status
+        : typeof data?.task_status === 'string' ? data.task_status : '';
+    const taskId = typeof data?.task_id === 'string' && data.task_id !== '' ? data.task_id
+      : typeof data?.taskId === 'string' && data.taskId !== '' ? data.taskId : null;
+    const pollAfterMs = typeof data?.poll_after_ms === 'number' && Number.isFinite(data.poll_after_ms)
+      ? data.poll_after_ms : null;
+    // T4b-06：非幂等写已发出，响应形态不完整 = 结果未知（不是明确失败）：
+    // 缺 state 键、或异步形态缺 task_id（无法轮询收敛）都归
+    // incomplete_response（不可重试），由服务层置 unknown；绝不重发。
+    if (rawState === '') {
+      throw new LarkCliError(
+        'wiki +move-to-drive 响应缺少 state/status 字段，移出结果未知（命令已发出，请勿重发）',
+        'incomplete_response',
+        false,
+      );
+    }
+    if (rawState !== 'done' && taskId == null) {
+      throw new LarkCliError(
+        'wiki +move-to-drive 异步响应缺少 task_id，移出任务无法轮询收敛，结果未知（命令已发出，请勿重发）',
+        'incomplete_response',
+        false,
+      );
+    }
+    return {
+      state: rawState === 'done' ? 'done' : 'running',
+      taskId,
+      pollAfterMs,
+      raw: result,
+    };
+  }
+
+  /**
+   * drive +task_result —— 通用异步任务结果轮询（probe §9：其 help 覆盖
+   * wiki move-to-drive 任务类型；设计 §3.2 配套轮询口）。只读；失败由
+   * 调用方按节奏续查（不判终态）。
+   *
+   * 【待 S5 实测校正】参数名（--task-id）与输出字段（state/status/message
+   * 形态、失败描述键）以 S5 实测为准。
+   */
+  async getDriveTaskResult(taskId: string): Promise<DriveTaskResult> {
+    if (typeof taskId !== 'string' || taskId.trim().length === 0) {
+      throw new Error(
+        `getDriveTaskResult requires a non-empty taskId; received: ${String(taskId)}`,
+      );
+    }
+    const result = await this.execute([
+      'drive', '+task_result',
+      '--task-id', taskId,
+      '--format', 'json',
+    ], 'drive');
+    const data = result?.data ?? result;
+    const rawState = typeof data?.state === 'string' ? data.state
+      : typeof data?.status === 'string' ? data.status
+        : typeof data?.task_status === 'string' ? data.task_status : '';
+    const state: DriveTaskResult['state'] = rawState === 'done' || rawState === 'success'
+      ? 'done'
+      : rawState === 'failed' || rawState === 'error' ? 'failed'
+        : 'running';
+    return {
+      state,
+      message: typeof data?.message === 'string' ? data.message
+        : typeof data?.error === 'string' ? data.error : null,
+      raw: result,
+    };
+  }
+}
+
+/** wiki +move-to-drive 起步结果（同步 done / 异步 running 两形态）。 */
+export interface WikiMoveToDriveResult {
+  /** 未知取值归一为 running，由调用方按上限轮询（通用异步模式双读容错）。 */
+  state: 'done' | 'running';
+  /** 异步任务号；done 形态也可能携带（同 history-revert 实测形态）。 */
+  taskId: string | null;
+  /** 轮询建议间隔（ms）；缺失由服务层缺省节奏兜底。 */
+  pollAfterMs: number | null;
+  /** 原始响应，仅诊断用途，不进对外 DTO。 */
+  raw: unknown;
+}
+
+/** drive +task_result 轮询结果（wiki move-to-drive 任务共用）。 */
+export interface DriveTaskResult {
+  state: 'done' | 'running' | 'failed';
+  /** 失败描述（缺失为 null）；成功/进行中为 null。 */
+  message: string | null;
+  /** 原始响应，仅诊断用途。 */
+  raw: unknown;
 }
 
 /**

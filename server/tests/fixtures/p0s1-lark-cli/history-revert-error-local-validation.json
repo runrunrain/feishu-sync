@@ -1,0 +1,10 @@
+{
+  "ok": false,
+  "identity": "user",
+  "error": {
+    "type": "validation",
+    "subtype": "invalid_argument",
+    "message": "--history-version-id must be a positive integer string returned by docs +history-list",
+    "param": "--history-version-id"
+  }
+}

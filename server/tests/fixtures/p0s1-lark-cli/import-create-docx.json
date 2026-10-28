@@ -1,0 +1,17 @@
+{
+  "ok": true,
+  "identity": "user",
+  "data": {
+    "extra": [
+      "_pod_name"
+    ],
+    "job_error_msg": "success",
+    "job_status": 0,
+    "job_status_label": "success",
+    "ready": true,
+    "ticket": "TICKETPROBE1",
+    "token": "DOCXTOKENPROBE1",
+    "type": "docx",
+    "url": "https://TENANT.feishu.cn/docx/DOCXTOKENPROBE1"
+  }
+}

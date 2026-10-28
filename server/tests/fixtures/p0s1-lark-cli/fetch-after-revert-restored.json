@@ -1,0 +1,11 @@
+{
+  "ok": true,
+  "identity": "user",
+  "data": {
+    "document": {
+      "content": "<title>feishu-sync-p0s1-probe</title><h1>feishu-sync-p0s1-probe 基线段落</h1><p>P0-S1 实测基线正文 v1。本段用于 history/revert/update-title/whiteboard 探测。</p>",
+      "document_id": "DOCXTOKENPROBE1",
+      "revision_id": 5
+    }
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "ok": true,
+  "identity": "user",
+  "data": {
+    "entries": [
+      {
+        "edit_time": "2026-10-28T09:07:26Z",
+        "editor_ids": [
+          "ou_EDITOR_PROBE"
+        ],
+        "history_version_id": "4096",
+        "revision_id": 4,
+        "type": 3
+      },
+      {
+        "edit_time": "2026-10-28T09:07:03Z",
+        "editor_ids": [
+          "ou_EDITOR_PROBE"
+        ],
+        "history_version_id": "3072",
+        "revision_id": 3,
+        "type": 2
+      },
+      {
+        "edit_time": "2026-10-28T09:05:03Z",
+        "editor_ids": [
+          "ou_EDITOR_PROBE"
+        ],
+        "history_version_id": "2048",
+        "revision_id": 2,
+        "type": 2
+      },
+      {
+        "edit_time": "2026-10-28T09:05:03Z",
+        "editor_ids": [
+          "ou_EDITOR_PROBE"
+        ],
+        "history_version_id": "1024",
+        "revision_id": 1,
+        "type": 1
+      }
+    ],
+    "has_more": false,
+    "page_token": ""
+  }
+}

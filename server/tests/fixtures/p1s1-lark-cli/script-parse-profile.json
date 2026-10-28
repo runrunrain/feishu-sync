@@ -1,0 +1,70 @@
+{
+  "_note": "docs +script --command parse --doc <token>：data.profile 形态（blocks[] 为块型统计非块列表）；本地可见字符口径对照见报告 PB-3",
+  "data": {
+    "assessment": {
+      "status": "passed"
+    },
+    "profile": {
+      "word_count": 119,
+      "char_count": 272,
+      "block_count": 18,
+      "blocks": [
+        {
+          "type": "p",
+          "count": 6,
+          "ratio": 0.333333
+        },
+        {
+          "type": "li",
+          "count": 2,
+          "ratio": 0.111111
+        },
+        {
+          "type": "tr",
+          "count": 2,
+          "ratio": 0.111111
+        },
+        {
+          "type": "h1",
+          "count": 1,
+          "ratio": 0.055556
+        },
+        {
+          "type": "h2",
+          "count": 1,
+          "ratio": 0.055556
+        },
+        {
+          "type": "pre",
+          "count": 1,
+          "ratio": 0.055556
+        },
+        {
+          "type": "table",
+          "count": 1,
+          "ratio": 0.055556
+        },
+        {
+          "type": "tbody",
+          "count": 1,
+          "ratio": 0.055556
+        },
+        {
+          "type": "thead",
+          "count": 1,
+          "ratio": 0.055556
+        },
+        {
+          "type": "title",
+          "count": 1,
+          "ratio": 0.055556
+        },
+        {
+          "type": "ul",
+          "count": 1,
+          "ratio": 0.055556
+        }
+      ]
+    }
+  }
+}

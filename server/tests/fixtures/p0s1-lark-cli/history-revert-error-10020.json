@@ -1,0 +1,12 @@
+{
+  "ok": false,
+  "identity": "user",
+  "error": {
+    "type": "api",
+    "subtype": "unknown",
+    "code": 10020,
+    "message": "Another history revert task is already in progress. Wait for it to finish or poll task status before retrying.",
+    "log_id": "LOGIDPROBE",
+    "troubleshooter": "排查建议查看(Troubleshooting suggestions): https://open.feishu.cn/search?from=openapi&log_id=LOGIDPROBE&code=10020&method_id=7652368008158219237"
+  }
+}

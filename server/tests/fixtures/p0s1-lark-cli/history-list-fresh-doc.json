@@ -1,0 +1,19 @@
+{
+  "ok": true,
+  "identity": "user",
+  "data": {
+    "entries": [
+      {
+        "edit_time": "2026-10-28T09:05:03Z",
+        "editor_ids": [
+          "ou_EDITOR_PROBE"
+        ],
+        "history_version_id": "1024",
+        "revision_id": 1,
+        "type": 1
+      }
+    ],
+    "has_more": false,
+    "page_token": ""
+  }
+}

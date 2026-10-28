@@ -1,0 +1,9 @@
+{
+  "ok": false,
+  "identity": "user",
+  "error": {
+    "type": "network",
+    "subtype": "timeout",
+    "message": "API call failed: server time out error"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "_note": "同文档加一条全文评论后：reference_map 出现，仅 comments 组；@doc/@user cite 与 sheet 嵌入不进 reference_map（内联正文）",
+  "data": {
+    "document": {
+      "reference_map": {
+        "comments": {
+          "c1": {
+            "data": "<comment comment-id=\"7701642957111200774\" is_whole=\"true\"><msg user=\"测试用户\">p1s1 探针评论：验证 reference_map comments 组</msg></comment>"
+          }
+        }
+      }
+    }
+  }
+}

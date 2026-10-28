@@ -1,0 +1,13 @@
+{
+  "ok": false,
+  "identity": "user",
+  "error": {
+    "type": "api",
+    "subtype": "unknown",
+    "code": 981003,
+    "message": "not found.",
+    "hint": "the endpoint looks the token up under the declared type: confirm the token exists and that --type sheet is its real type (resolve both with `lark-cli drive +inspect`)",
+    "log_id": "LOGIDPROBE6B",
+    "troubleshooter": "排查建议查看(Troubleshooting suggestions): https://open.feishu.cn/search?from=openapi&log_id=LOGIDPROBE6B&code=981003&method_id=7627127103925947349"
+  }
+}

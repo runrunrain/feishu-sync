@@ -1,0 +1,8 @@
+{
+  "ok": true,
+  "identity": "user",
+  "data": {
+    "code": "flowchart TD\n  A[同步引擎 SyncEngine] --\u003e B{原子提交成功?}\n  B --\u003e|是| C[推进 synced 基线]\n  B --\u003e|否| D[保留 blocker 不推进]\n  C --\u003e E[检测链下一轮]\n  D --\u003e E",
+    "syntax_type": "mermaid"
+  }
+}
