@@ -51,6 +51,14 @@ export interface AgentStatusDto {
   checkedAt: string;
 }
 
+export interface ClaudeConnectionTestResult {
+  ok: boolean;
+  providerName: string;
+  model: string;
+  latencyMs: number;
+  errorMessage?: string;
+}
+
 // ---------------------------------------------------------------------------
 // §5.2 配置段（config.json 新增；GET /api/config 原样返回，无秘密字段）
 // ---------------------------------------------------------------------------
@@ -308,6 +316,7 @@ export interface KbMcpInfoDto {
 // §9.3 会话
 // ---------------------------------------------------------------------------
 
+export type AgentBackend = 'pi' | 'claude-code';
 export type AgentSessionMode = 'discuss' | 'work';
 export type AgentSessionState = 'idle' | 'starting' | 'streaming' | 'error';
 

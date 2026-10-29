@@ -7,7 +7,8 @@
  *
  * 之前所有卡片在一个长 `space-y-6` 列表里垂直堆叠，"模型与通道" 这种
  * 多卡 + 嵌套子面板的分组会拉得非常长。现在侧栏只列该分组的卡片，
- * 右侧内容区同一时刻只渲染一张卡片，侧栏与内容区各自在自己视口里独立滚动。
+ * 右侧同一时刻只显示一张卡片；访问过的卡片保持挂载以保留草稿，
+ * 侧栏与内容区各自在自己视口里独立滚动。
  *
  * 窄屏策略（按用户明确选择）：侧栏始终常驻显示，不折叠。
  */
@@ -32,7 +33,10 @@ import {
   Sparkles,
   Terminal,
   Trash2,
+  Save,
 } from 'lucide-react';
+import { SettingsDraftProvider, useSettingsDraft } from '../hooks/settingsDraft';
+import { Button } from '../components/common/Button';
 import { KnowledgeSettingsCard } from '../components/KnowledgeSettingsCard';
 import { WatchedRootsCard } from '../components/WatchedRootsCard';
 import { OrphanFilesCard } from '../components/OrphanFilesCard';
@@ -145,13 +149,13 @@ const SETTINGS_TABS: SettingsTabMeta[] = [
   {
     id: 'agent',
     label: 'Agent 标准库',
-    description: 'pi 运行时、模型来源、标准库目录、Workspace 与 MCP',
+    description: 'Pi / Claude Code 运行时、模型来源、标准库目录、Workspace 与 MCP',
     icon: Bot,
     items: [
       {
         id: 'agent-runtime',
         label: '运行时与模型',
-        description: 'node/pi 发现与覆盖、模型来源与思考档位',
+        description: 'Node、Pi / Claude Code 路径、模型来源与思考档位',
         icon: Bot,
         render: () => <AgentRuntimeSettingsCard />,
       },
@@ -237,6 +241,11 @@ interface SettingsViewProps {
 }
 
 export function SettingsView({ focusTabId, focusNonce }: SettingsViewProps) {
+  return <SettingsDraftProvider><SettingsContent focusTabId={focusTabId} focusNonce={focusNonce} /></SettingsDraftProvider>;
+}
+
+function SettingsContent({ focusTabId, focusNonce }: SettingsViewProps) {
+  const draft = useSettingsDraft()!;
   const [activeTab, setActiveTab] = useState<SettingsTab>('knowledge');
   const currentTabMeta = VISIBLE_SETTINGS_TABS.find((tab) => tab.id === activeTab) ?? VISIBLE_SETTINGS_TABS[0];
 
@@ -248,6 +257,7 @@ export function SettingsView({ focusTabId, focusNonce }: SettingsViewProps) {
 
   // 第二层导航：当前选中的侧栏项。切 tab 时重置为该分组的第一项。
   const [activeSubId, setActiveSubId] = useState<string>(currentTabMeta.items[0].id);
+  const [visited, setVisited] = useState(() => new Set([currentTabMeta.items[0].id]));
   useEffect(() => {
     // 切分组时回到该分组第一个侧栏项。
     setActiveSubId(currentTabMeta.items[0].id);
@@ -257,6 +267,7 @@ export function SettingsView({ focusTabId, focusNonce }: SettingsViewProps) {
     () => currentTabMeta.items.find((item) => item.id === activeSubId) ?? currentTabMeta.items[0],
     [currentTabMeta, activeSubId],
   );
+  useEffect(() => { setVisited((prev) => prev.has(currentSub.id) ? prev : new Set([...prev, currentSub.id])); }, [currentSub.id]);
 
   // 切侧栏项时把右侧内容滚回顶部（内容区独立滚动，不继承外层位置）。
   const contentRef = useRef<HTMLDivElement>(null);
@@ -295,7 +306,8 @@ export function SettingsView({ focusTabId, focusNonce }: SettingsViewProps) {
               role="tab"
               aria-selected={selected}
               aria-controls={`settings-panel-${tab.id}`}
-              onClick={() => setActiveTab(tab.id)}
+              disabled={draft.saving}
+              onClick={() => { draft.stageForm(currentSub.id); setActiveTab(tab.id); }}
               className={`flex min-w-0 items-center gap-1.5 whitespace-nowrap rounded px-2.5 py-1.5 text-xs leading-5 transition-colors ${
                 selected
                   ? 'bg-card-bg text-seal shadow-sm'
@@ -307,9 +319,19 @@ export function SettingsView({ focusTabId, focusNonce }: SettingsViewProps) {
             </button>
           );
         })}
+        <div className="ml-auto flex items-center gap-2 px-1">
+          {draft.dirty ? <span className="text-xs text-ink-faint">有未保存的修改</span> : null}
+          {draft.saveMessage ? <span role="status" className="text-xs text-jade">{draft.saveMessage}</span> : null}
+          <Button size="sm" loading={draft.saving} disabled={draft.loading || !draft.config} onClick={() => void draft.save()}><Save className="h-3.5 w-3.5" />保存</Button>
+        </div>
       </div>
+      {draft.saveError ? <div role="alert" className="flex flex-wrap items-center gap-2 text-xs text-seal-2">
+        <span>保存失败：{draft.saveError}。修改仍保留，可修正后重试。</span>
+        {draft.conflict ? <Button size="sm" variant="secondary" loading={draft.saving} onClick={() => void draft.allowConflictOverwrite()}>允许下次保存覆盖该列表</Button> : null}
+      </div> : null}
 
       {/* 多项分组使用子导航，窄窗口放在内容上方。 */}
+      <fieldset disabled={draft.saving}>
       <section
         id={`settings-panel-${activeTab}`}
         role="tabpanel"
@@ -340,7 +362,7 @@ export function SettingsView({ focusTabId, focusNonce }: SettingsViewProps) {
                   type="button"
                   role="tab"
                   aria-selected={selected}
-                  onClick={() => setActiveSubId(item.id)}
+                  onClick={() => { draft.stageForm(currentSub.id); setActiveSubId(item.id); }}
                   title={item.description}
                   className={`flex items-center gap-1.5 rounded px-2.5 py-1.5 text-left text-xs leading-5 transition-colors ${
                     selected
@@ -361,9 +383,12 @@ export function SettingsView({ focusTabId, focusNonce }: SettingsViewProps) {
           ref={contentRef}
           className="flex-1 min-w-0 md:max-h-[calc(100dvh-180px)] md:overflow-y-auto scrollbar-thin md:pr-1"
         >
-          {currentSub.render()}
+          {VISIBLE_SETTINGS_TABS.flatMap((tab) => tab.items).filter((item) => visited.has(item.id)).map((item) => (
+            <div key={item.id} hidden={currentSub.id !== item.id}>{item.render()}</div>
+          ))}
         </div>
       </section>
+      </fieldset>
     </div>
   );
 }

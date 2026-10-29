@@ -543,6 +543,11 @@ function validateLlmProtocols(llm: Partial<LlmConfig> | undefined): void {
   if (!Array.isArray(llm?.providers)) return;
   const details = llm.providers.flatMap((p, i) => p && p.protocol !== undefined && !LLM_PROTOCOLS.has(p.protocol)
     ? [{ field: `llm.providers[${i}].protocol`, code: 'unsupported_protocol' }] : []);
+  llm.providers.forEach((p, i) => {
+    if (p && p.anthropicAuthType !== undefined && !['api-key', 'auth-token'].includes(p.anthropicAuthType)) {
+      details.push({ field: `llm.providers[${i}].anthropicAuthType`, code: 'unsupported_auth_type' });
+    }
+  });
   if (details.length) throw new InvalidConfigError(details);
 }
 
@@ -680,6 +685,7 @@ function normalizeProviderProfiles(
       enabled: (typeof raw.enabled === 'boolean' ? raw.enabled : true) && (raw.protocol === undefined || LLM_PROTOCOLS.has(raw.protocol)),
       protocol: LLM_PROTOCOLS.has(raw.protocol!) ? raw.protocol : 'openai-completions',
       openAiProtocol: raw.openAiProtocol === 'openai-responses' || raw.openAiProtocol === 'openai-completions' ? raw.openAiProtocol : undefined,
+      anthropicAuthType: raw.anthropicAuthType === 'api-key' || raw.anthropicAuthType === 'auth-token' ? raw.anthropicAuthType : undefined,
       protocolBaseUrls: raw.protocolBaseUrls && typeof raw.protocolBaseUrls === 'object'
         ? Object.fromEntries([...LLM_PROTOCOLS].flatMap((protocol) => typeof raw.protocolBaseUrls?.[protocol as LlmProtocol] === 'string' ? [[protocol, raw.protocolBaseUrls[protocol as LlmProtocol]]] : [])) : undefined,
       apiKey: stringValue(raw.apiKey),
@@ -1596,6 +1602,7 @@ export class ConfigManager {
 
     return {
       ...((authority || providers.length > 0) ? {
+        anthropicAuthType: activeProvider?.anthropicAuthType,
         openAiCompatBaseUrl: activeProvider?.openAiCompatBaseUrl ?? '',
         apiKey: activeProvider?.apiKey ?? '', model: activeModel?.openAiModel ?? '', directModel: activeModel?.openAiModel ?? '',
       } : normalizedFlat),

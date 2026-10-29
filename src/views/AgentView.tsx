@@ -10,7 +10,7 @@
  * hook 内部暂停轮询与订阅。
  */
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Hammer,
   PanelRightClose,
@@ -26,10 +26,13 @@ import { AgentComposer } from '../components/agent/AgentComposer';
 import { AgentModePanel } from '../components/agent/AgentModePanel';
 import { TaskPanel } from '../components/agent/TaskPanel';
 import { useToast } from '../components/common/Toast';
+import { Button } from '../components/common/Button';
+import { Modal } from '../components/common/Modal';
 import { useSessionAgentStatus } from '../hooks/useSessionAgentStatus';
 import { useAgentSessions } from '../hooks/useAgentSessions';
 import { useAgentOrchestration } from '../hooks/useAgentOrchestration';
 import { describeReadinessCode as describeReadiness } from '../utils/agentReadiness';
+import type { AgentBackend } from '../types/agent';
 
 interface AgentViewProps {
   active?: boolean;
@@ -39,8 +42,13 @@ interface AgentViewProps {
 export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
   const toast = useToast();
   const sessions = useAgentSessions(active);
+  const [creatingSession, setCreatingSession] = useState(false);
+  const [createOpen, setCreateOpen] = useState(false);
+  const [createFailed, setCreateFailed] = useState(false);
+  const createLock = useRef(false);
   const [panelOpen, setPanelOpen] = useState(() => window.innerWidth >= 1280);
   useEffect(() => { const resize = () => { if (window.innerWidth < 1280) setPanelOpen(false); }; resize(); window.addEventListener('resize', resize); return () => window.removeEventListener('resize', resize); }, []);
+  useEffect(() => { if (!active) setCreateOpen(false); }, [active]);
 
   const session = sessions.activeSession;
   const agent = useSessionAgentStatus(session, active);
@@ -48,6 +56,16 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
   const readiness = agent.status ? describeReadiness(agent.status.code, agent.status) : null;
   const isWork = session?.mode === 'work';
   const running = session?.state === 'streaming' || session?.state === 'starting';
+
+  const openCreate = () => { setCreateFailed(false); setCreateOpen(true); };
+  const createWithBackend = async (backend: AgentBackend) => {
+    if (createLock.current) return;
+    createLock.current = true; setCreatingSession(true); setCreateFailed(false);
+    try {
+      const created = await sessions.createSession(backend);
+      if (created) setCreateOpen(false); else setCreateFailed(true);
+    } finally { createLock.current = false; setCreatingSession(false); }
+  };
 
   const handleSend = async (text: string, delivery?: 'steer' | 'followUp') => {
     const ok = await sessions.send(text, delivery);
@@ -70,7 +88,7 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
           loading={sessions.sessionsLoading}
           activeId={sessions.activeId}
           onSelect={sessions.selecting}
-          onCreate={sessions.createSession}
+          onCreate={openCreate}
           onRename={sessions.renameSession}
           onDelete={sessions.removeSession}
         />
@@ -103,7 +121,7 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
           <div className="flex items-center gap-1 lg:hidden">
             <select aria-label="选择会话" className="max-w-[90px] rounded border border-line bg-card-bg px-1 py-1 text-[11px] text-ink-soft" value={sessions.activeId ?? ''} onChange={(e) => sessions.selecting(e.target.value)}>
               <option value="" disabled>选择会话</option>{sessions.sessions.map((s) => <option key={s.id} value={s.id}>{s.title}</option>)}
-            </select><button className="px-1 text-xs text-seal" onClick={() => void sessions.createSession()} aria-label="新建会话">新建</button>
+            </select><button className="px-1 text-xs text-seal" onClick={openCreate} aria-label="新建会话">新建</button>
           </div>
           {/* SSE 连接指示 */}
           {session ? (
@@ -216,6 +234,25 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
           </div>
         </div>
       ) : null}
+      <Modal open={createOpen} title="新建会话" onClose={creatingSession ? undefined : () => setCreateOpen(false)}>
+        <div className="space-y-3">
+          <p className="text-sm text-ink-soft">选择此会话使用的 Agent 基座。会话创建后会保留所选基座及历史；标准知识库构建等应用能力的基座在设置中单独配置。</p>
+          <div className="grid gap-2 sm:grid-cols-2">
+            <button type="button" disabled={creatingSession} onClick={() => void createWithBackend('pi')} aria-label="新建 Pi 会话"
+              className="rounded-md border border-line bg-paper/40 px-3 py-3 text-left hover:border-seal hover:bg-seal/5 disabled:opacity-50">
+              <span className="block text-sm font-medium text-ink">Pi</span>
+              <span className="mt-1 block text-xs text-ink-faint">使用应用提供商或本地 Pi 模型。</span>
+            </button>
+            <button type="button" disabled={creatingSession} onClick={() => void createWithBackend('claude-code')} aria-label="新建 Claude Code 会话"
+              className="rounded-md border border-line bg-paper/40 px-3 py-3 text-left hover:border-seal hover:bg-seal/5 disabled:opacity-50">
+              <span className="block text-sm font-medium text-ink">Claude Code</span>
+              <span className="mt-1 block text-xs text-ink-faint">使用应用内 Anthropic 兼容提供商。</span>
+            </button>
+          </div>
+          {createFailed ? <p role="alert" className="text-xs text-seal-2">{sessions.sessionsError || '新建会话失败，请重试。'}</p> : null}
+          <div className="flex justify-end"><Button size="sm" variant="secondary" disabled={creatingSession} onClick={() => setCreateOpen(false)}>取消</Button></div>
+        </div>
+      </Modal>
     </div>
   );
 }

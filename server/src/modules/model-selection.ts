@@ -4,6 +4,7 @@ export interface ModelSelection { providerId?: string; modelId?: string; context
 export interface ResolvedProviderModel {
   providerId: string; providerName: string; presetId: string; openAiModel: string;
   baseUrl: string; apiKey: string; protocol: LlmProtocol;
+  anthropicAuthType?: 'api-key' | 'auth-token';
   contextWindow?: number; maxTokens?: number; reasoning?: boolean;
   thinkingLevels?: import('../types/agent-knowledge.js').AgentThinkingLevel[];
 }
@@ -27,10 +28,18 @@ export function resolveProviderModel(llm: Pick<LlmConfig, 'providers' | 'activeP
   return { providerId: provider.id, providerName: provider.name, presetId: preset.id,
     openAiModel: /^glm-/i.test(id) ? id.replace(/\s*\[[^\]]+\]$/, '') : id,
     baseUrl, apiKey: provider.apiKey.trim(), protocol,
+    ...(protocol === 'anthropic-messages' ? { anthropicAuthType: provider.anthropicAuthType ?? 'api-key' } : {}),
     contextWindow: preset.contextWindow, maxTokens: preset.maxTokens, reasoning: preset.reasoning, thinkingLevels: preset.thinkingLevels };
 }
 
 export function providerModelParameters(model: Pick<ResolvedProviderModel, 'contextWindow' | 'maxTokens' | 'reasoning'>, defaults: ModelSelection = {}) {
   const contextWindow = model.contextWindow ?? defaults.contextWindow ?? 128000;
   return { contextWindow, maxTokens: Math.min(model.maxTokens ?? defaults.maxTokens ?? 8192, contextWindow), reasoning: model.reasoning ?? false };
+}
+
+/** Explicit null suppresses SDK environment fallbacks to unrelated credentials. */
+export function anthropicClientAuth(config: { apiKey: string; anthropicAuthType?: 'api-key' | 'auth-token' }) {
+  return config.anthropicAuthType === 'auth-token'
+    ? { apiKey: null, authToken: config.apiKey }
+    : { apiKey: config.apiKey, authToken: null };
 }

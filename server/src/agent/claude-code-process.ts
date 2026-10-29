@@ -20,6 +20,7 @@ export interface ClaudeCodeOptions {
   model: string;
   baseUrl: string;
   apiKey: string;
+  authType?: 'api-key' | 'auth-token';
   thinking?: import('../types/agent-knowledge.js').AgentThinkingLevel;
   contextWindow?: number;
   maxTokens?: number;
@@ -31,12 +32,17 @@ export interface ClaudeCodeOptions {
   ephemeral?: boolean;
 }
 
-function appEnvironment(opts: ClaudeCodeOptions): NodeJS.ProcessEnv {
-  const allowed = new Set(['PATH', 'Path', 'HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'TMPDIR', 'TEMP', 'TMP', 'LANG', 'LC_ALL', 'SystemRoot', 'SystemDrive', 'PATHEXT', 'ComSpec', 'USER', 'LOGNAME', 'SHELL', 'TZ']);
+export function buildClaudeEnvironment(opts: ClaudeCodeOptions): NodeJS.ProcessEnv {
+  const allowed = new Set(['PATH', 'Path', 'HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'TMPDIR', 'TEMP', 'TMP', 'LANG', 'LC_ALL', 'SystemRoot', 'SystemDrive', 'PATHEXT', 'ComSpec', 'USER', 'LOGNAME', 'SHELL', 'TZ',
+    'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy', 'NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE']);
   const env: NodeJS.ProcessEnv = {};
   for (const key of Object.keys(opts.parentEnv)) if (allowed.has(key)) env[key] = opts.parentEnv[key];
-  env.ANTHROPIC_API_KEY = opts.apiKey;
+  if (opts.authType === 'auth-token') env.ANTHROPIC_AUTH_TOKEN = opts.apiKey;
+  else env.ANTHROPIC_API_KEY = opts.apiKey;
   env.ANTHROPIC_BASE_URL = opts.baseUrl;
+  // Native background requests also use the selected app preset. Do not let
+  // Claude's built-in aliases route auxiliary work to an unconfigured model.
+  for (const name of ['ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL', 'CLAUDE_CODE_SUBAGENT_MODEL']) env[name] = opts.model;
   env.FEISHU_SYNC_AGENT_URL = opts.agentUrl;
   env.FEISHU_SYNC_AGENT_RUN_TOKEN = opts.runToken;
   env.DISABLE_TELEMETRY = '1';
@@ -58,6 +64,21 @@ function snapshotText(snapshot?: ClaudeCodeOptions['pluginSnapshot']): string {
   if (parsed.schemaVersion !== 1 || !Array.isArray(parsed.plugins)) throw new Error('应用上下文快照无效');
   return parsed.plugins.filter((p) => p.enabled && typeof p.content === 'string' && p.content.trim())
     .map((p) => `## ${p.name ?? '上下文'}\n\n${p.content}`).join('\n\n');
+}
+
+/** Claude Code can write retry errors only to its private session JSONL. */
+export function claudeFatalApiError(record: unknown, secrets: string[]): string | null {
+  if (!record || typeof record !== 'object') return null;
+  const entry = record as { type?: string; subtype?: string; error?: { status?: unknown; formatted?: unknown; message?: unknown } };
+  if (entry.type !== 'system' || entry.subtype !== 'api_error') return null;
+  const status = Number(entry.error?.status);
+  if (![400, 401, 403, 404].includes(status)) return null;
+  let detail = String(entry.error?.formatted ?? entry.error?.message ?? `HTTP ${status}`);
+  for (const secret of secrets) if (secret) detail = detail.replaceAll(secret, '[redacted]');
+  detail = detail.slice(0, 350);
+  return status === 401 || status === 403
+    ? `模型服务认证失败（${status}）：${detail}。请检查提供商 API Key、接口地址和访问权限。`
+    : `模型服务请求失败（${status}）：${detail}`;
 }
 
 /** Implements the process surface consumed by SessionService, tasks and builds. */
@@ -140,8 +161,18 @@ export class ClaudeCodeProcess extends PiRpcProcess {
       ...(this.contextText ? ['--append-system-prompt-file', path.join(this.configDir, 'context.txt')] : []),
       ...(fs.existsSync(this.sessionMarker) ? ['--resume', this.claudeId] : ['--session-id', this.claudeId]),
     ];
-    const env = appEnvironment(this.settings);
+    const env = buildClaudeEnvironment(this.settings);
     env.CLAUDE_CONFIG_DIR = this.claudeHome;
+    let diagnosticPath: string | null = null;
+    let diagnosticOffset = 0;
+    const projectsDir = path.join(this.claudeHome, 'projects');
+    try {
+      if (fs.existsSync(projectsDir)) for (const dir of fs.readdirSync(projectsDir, { withFileTypes: true })) {
+        if (!dir.isDirectory()) continue;
+        const candidate = path.join(projectsDir, dir.name, `${this.claudeId}.jsonl`);
+        if (fs.existsSync(candidate)) { diagnosticPath = candidate; diagnosticOffset = fs.statSync(candidate).size; break; }
+      }
+    } catch { /* The session may not have a diagnostic file yet. */ }
     let child: ChildProcess;
     try {
       this.appendMessage({ role: 'user', content: message });
@@ -150,6 +181,36 @@ export class ClaudeCodeProcess extends PiRpcProcess {
     } catch (error) { this.running = false; throw error; }
     let buffer = '', stderr = '', result: Record<string, unknown> | null = null;
     let lastText = '', initialized = false, streamError: Error | null = null, timedOut = false;
+    let fatalApiError: string | null = null;
+    let diagnosticBuffer = '';
+    const inspectDiagnostics = () => {
+      try {
+        if (!diagnosticPath && fs.existsSync(projectsDir)) {
+          for (const dir of fs.readdirSync(projectsDir, { withFileTypes: true })) {
+            if (!dir.isDirectory()) continue;
+            const candidate = path.join(projectsDir, dir.name, `${this.claudeId}.jsonl`);
+            if (fs.existsSync(candidate)) { diagnosticPath = candidate; break; }
+          }
+        }
+        if (!diagnosticPath || fatalApiError || this.aborted) return;
+        const size = fs.statSync(diagnosticPath).size;
+        if (size < diagnosticOffset) { diagnosticOffset = 0; diagnosticBuffer = ''; }
+        if (size === diagnosticOffset) return;
+        const fd = fs.openSync(diagnosticPath, 'r');
+        try {
+          const chunk = Buffer.alloc(Math.min(size - diagnosticOffset, 256 * 1024));
+          diagnosticOffset += fs.readSync(fd, chunk, 0, chunk.length, diagnosticOffset);
+          diagnosticBuffer += chunk.toString('utf8');
+        } finally { fs.closeSync(fd); }
+        const lines = diagnosticBuffer.split('\n'); diagnosticBuffer = lines.pop() ?? '';
+        for (const line of lines) {
+          try { fatalApiError = claudeFatalApiError(JSON.parse(line), [this.settings.apiKey, this.settings.runToken]); } catch { /* ignore non-JSON records */ }
+          if (fatalApiError) { void this.abort(); break; }
+        }
+      } catch { /* Missing/incomplete diagnostic files do not fail the run. */ }
+    };
+    const diagnosticTimer = setInterval(inspectDiagnostics, 1000);
+    diagnosticTimer.unref?.();
     const consume = (line: string) => {
       let record: any;
       try { record = JSON.parse(line); } catch { return; }
@@ -194,12 +255,13 @@ export class ClaudeCodeProcess extends PiRpcProcess {
       child.once('error', (error) => resolve({ code: null, error }));
       child.once('close', (code) => resolve({ code }));
     });
-    clearTimeout(timeout); this.childProcess = null; this.running = false;
+    clearTimeout(timeout); clearInterval(diagnosticTimer); this.childProcess = null; this.running = false;
     if (buffer.trim()) consume(buffer);
     const output = result as Record<string, unknown> | null;
     let outcome: RunOutcome;
     if (timedOut) outcome = { outcome: 'failed', error: { code: 'model_timeout', message: 'Claude Code 响应超时' } };
     else if (streamError) outcome = { outcome: 'failed', error: { code: 'agent_error', message: 'Claude Code 会话记录写入失败' } };
+    else if (fatalApiError) outcome = { outcome: 'failed', error: { code: 'model_request_failed', message: fatalApiError } };
     else if (this.aborted) outcome = { outcome: 'aborted' };
     else if (exit.error || exit.code !== 0 || !output || output.is_error === true || !initialized) {
       const messageText = String(output?.result ?? exit.error?.message ?? stderr ?? 'Claude Code 未返回完整结果')

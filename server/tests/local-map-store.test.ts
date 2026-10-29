@@ -188,6 +188,29 @@ describe('LocalMapStore runtime schema', () => {
     store.close();
   });
 
+  it('preserves local content through permission loss and restores the readable state', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'permission-retain-'));
+    const file = path.join(root, 'local.md');
+    fs.writeFileSync(file, '保留原始本地内容');
+    const store = new LocalMapStore(createDatabasePath());
+    try {
+      store.initialize();
+      const observation = { objToken: 'permission-doc', wikiNodeToken: 'permission-node', objType: 'docx' as const,
+        title: '本地文档', spaceId: 'space', parentNodeToken: 'root', watchedRootId: 'root',
+        watchedRootUrl: 'https://tenant.feishu.cn/wiki/root', hasChild: false };
+      store.recordCloudObservation({ ...observation, observedObjEditTime: 100, observationStatus: 'available', lastSeenAt: '2026-07-17T00:00:00Z' });
+      store.markDocumentSynced({ objToken: observation.objToken, syncedObjEditTime: 100, localMdPath: file, localRelPath: 'local.md' });
+      store.recordCloudObservation({ ...observation, observedObjEditTime: null, observationStatus: 'restricted', lastSeenAt: '2026-07-17T00:01:00Z' });
+      store.recordCompleteTraversalMiss(observation.objToken, '2026-07-17T00:02:00Z');
+      expect(store.getDocumentByObjToken(observation.objToken)).toMatchObject({ syncState: 'restricted', cloudDeleted: 0, localMdPath: file });
+      expect(store.listMissingCandidates()).toHaveLength(0);
+      expect(fs.readFileSync(file, 'utf8')).toBe('保留原始本地内容');
+      store.recordCloudObservation({ ...observation, observedObjEditTime: 100, observationStatus: 'available', lastSeenAt: '2026-07-17T00:03:00Z' });
+      expect(store.getDocumentByObjToken(observation.objToken)).toMatchObject({ syncState: 'synced', localMdPath: file });
+      expect(fs.readFileSync(file, 'utf8')).toBe('保留原始本地内容');
+    } finally { store.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
   it('keeps Feishu-side failures out of normal state transitions until an explicit recheck succeeds', () => {
     const dbPath = createDatabasePath();
     const store = new LocalMapStore(dbPath);

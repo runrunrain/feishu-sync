@@ -33,6 +33,7 @@ import {
   APIError,
 } from '../api/client';
 import type {
+  AgentBackend,
   AgentApprovalDto,
   AgentMessageDto,
   AgentSessionDto,
@@ -158,7 +159,7 @@ export interface UseAgentSessionsResult {
   sending: boolean;
   selecting: (id: string | null) => void;
   refreshSessions: () => void;
-  createSession: () => Promise<AgentSessionDto | null>;
+  createSession: (backend?: AgentBackend) => Promise<AgentSessionDto | null>;
   renameSession: (id: string, title: string) => Promise<boolean>;
   removeSession: (id: string) => Promise<boolean>;
   send: (text: string, delivery?: 'steer' | 'followUp') => Promise<boolean>;
@@ -594,9 +595,9 @@ export function useAgentSessions(active: boolean): UseAgentSessionsResult {
 
   const refreshSessions = useCallback(() => setSessionNonce((n) => n + 1), []);
 
-  const createSession = useCallback(async () => {
+  const createSession = useCallback(async (backend?: AgentBackend) => {
     try {
-      const created = await createAgentSession();
+      const created = await createAgentSession(undefined, backend);
       setSessions((prev) => [created, ...prev]);
       setActiveId(created.id);
       setMessages([]);

@@ -163,15 +163,20 @@ export class SessionService extends EventEmitter {
     localMapStore: {
       createAgentSession(input: { id: string; title: string; mode: 'discuss' | 'work'; workspaceId: string | null; backend?: 'pi' | 'claude-code'; createdAt: string; updatedAt: string }): void;
     },
-    input: { title?: string; mode?: string },
+    input: { title?: string; mode?: string; backend?: string },
   ): AgentSessionDto {
     if (input.mode !== undefined && input.mode !== 'discuss') {
       throw new ToolError('invalid_request', '新建会话只允许 discuss 模式（Work 经模式切换进入）');
     }
+    if (input.backend !== undefined && input.backend !== 'pi' && input.backend !== 'claude-code') {
+      throw new ToolError('invalid_request', '会话基座必须是 Pi 或 Claude Code');
+    }
     const id = `s_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`;
     const title = (input.title ?? '新会话').trim().slice(0, 80) || '新会话';
     const now = new Date().toISOString();
-    const backend = this.currentConfig()?.agent.runtime.backend === 'claude-code' ? 'claude-code' : 'pi';
+    // The explicit choice belongs to this conversation. Older callers that
+    // omit it retain the configured application backend as their default.
+    const backend = input.backend ?? (this.currentConfig()?.agent.runtime.backend === 'claude-code' ? 'claude-code' : 'pi');
     localMapStore.createAgentSession({ id, title, mode: 'discuss', workspaceId: null, backend, createdAt: now, updatedAt: now });
     fs.mkdirSync(this.sessionDir(), { recursive: true });
     return {

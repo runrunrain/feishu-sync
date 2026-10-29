@@ -27,6 +27,7 @@ import { Button } from './common/Button';
 import { Toggle } from './common/Input';
 import { useToast } from './common/Toast';
 import { useConfig } from '../hooks/useConfig';
+import { useSettingsDraft } from '../hooks/settingsDraft';
 import { useAuthStatus } from '../hooks/useAuthStatus';
 import {
   APIError,
@@ -59,6 +60,7 @@ function openUrlInBrowser(url: string): void {
 export function FeishuWriteSettingsCard() {
   const toast = useToast();
   const { config, updateConfig } = useConfig();
+  const draft = useSettingsDraft();
   const { authStatus, loading: authLoading, refresh } = useAuthStatus(0);
 
   const [savingToggle, setSavingToggle] = useState(false);
@@ -78,7 +80,7 @@ export function FeishuWriteSettingsCard() {
     setSavingToggle(true);
     try {
       await updateConfig({ feishuWrite: { enabled: next } });
-      toast.push({ type: 'success', message: next ? '已开启写回飞书' : '已关闭写回飞书' });
+      if (!draft) toast.push({ type: 'success', message: next ? '已开启写回飞书' : '已关闭写回飞书' });
     } catch (err) {
       const message = err instanceof APIError ? err.message : '设置保存失败';
       toast.push({ type: 'error', message });

@@ -48,6 +48,8 @@ import type {
   CloudMoveRecord,
 } from '../types';
 import type {
+  AgentBackend,
+  ClaudeConnectionTestResult,
   AgentApprovalDto,
   AgentMessageDto,
   AgentSessionDto,
@@ -597,6 +599,10 @@ export async function refreshSheet(objToken: string): Promise<SyncResult> {
 
 export async function updateAgentRuntime(backend: 'pi' | 'claude-code'): Promise<void> {
   await request('/api/agent/runtime/update', { method: 'POST', body: JSON.stringify({ backend }) });
+}
+
+export function testClaudeConnection(): Promise<ClaudeConnectionTestResult> {
+  return request('/api/agent/claude/connection-test', { method: 'POST', body: '{}', timeoutMs: 90_000 });
 }
 
 /** Read durable issues that must be repaired in Feishu before syncing can continue. */
@@ -1243,10 +1249,10 @@ export async function listAgentSessions(): Promise<AgentSessionDto[]> {
 }
 
 /** POST /api/agent/sessions —— 新建只允许 discuss；Work 经模式切换进入。 */
-export async function createAgentSession(title?: string): Promise<AgentSessionDto> {
+export async function createAgentSession(title?: string, backend?: AgentBackend): Promise<AgentSessionDto> {
   return request<AgentSessionDto>('/api/agent/sessions', {
     method: 'POST',
-    body: JSON.stringify({ mode: 'discuss', ...(title ? { title } : {}) }),
+    body: JSON.stringify({ mode: 'discuss', ...(title ? { title } : {}), ...(backend ? { backend } : {}) }),
   });
 }
 

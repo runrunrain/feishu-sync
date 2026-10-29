@@ -157,6 +157,8 @@ export function NodeDetailCard({
                     moveFace?.badgeStatus ??
                     (node.cloud_deleted === 1
                       ? 'deleted'
+                      : node.sync_state === 'restricted' || node.cloud_match === 'restricted'
+                        ? 'warning'
                       : node.status === 'changed'
                         ? 'modified'
                         : node.status === 'error'
@@ -171,6 +173,8 @@ export function NodeDetailCard({
                       : moveFace.treeText
                     : node.cloud_deleted === 1
                       ? '已删除'
+                      : node.sync_state === 'restricted' || node.cloud_match === 'restricted'
+                        ? '暂无云文档访问权限'
                       : node.status === 'changed'
                         ? '变更'
                         : node.status === 'error'

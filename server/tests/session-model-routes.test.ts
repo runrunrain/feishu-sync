@@ -53,3 +53,35 @@ it('rejects missing/disabled/unconfigured models, invalid levels and busy switch
   expect((await f.patch({ source: 'app-llm', providerId: 'fixture', modelId: 'deep', thinkingLevel: 'low' })).status).toBe(409);
   expect(f.store.getAgentSession(f.session.id)?.model_config_json).toBeNull();
 });
+
+it('new conversations choose their own backend without changing the application backend or existing sessions', async () => {
+  const f = await fixture();
+  const historyPath = path.join(path.dirname((f.manager as unknown as { configPath: string }).configPath), 'existing.jsonl');
+  fs.writeFileSync(historyPath, JSON.stringify({ type: 'message', id: 'prior', parentId: null, timestamp: '2026-01-01T00:00:00Z', message: { role: 'user', content: '旧会话内容' } }));
+  f.store.updateAgentSession(f.session.id, { piSessionFile: historyPath });
+  const create = (body: unknown) => f.app.fetch(new Request('http://x/api/agent/sessions', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  }));
+  const claudeResponse = await create({ mode: 'discuss', backend: 'claude-code' });
+  expect(claudeResponse.status).toBe(201);
+  const claude = await claudeResponse.json();
+  const piResponse = await create({ mode: 'discuss', backend: 'pi' });
+  expect(piResponse.status).toBe(201);
+  const pi = await piResponse.json();
+  expect(claude.backend).toBe('claude-code');
+  expect(pi.backend).toBe('pi');
+  expect(f.manager.getConfig().agent.runtime.backend).toBe('pi');
+  expect(f.service.configForSession(f.store, claude.id).agent.runtime.backend).toBe('claude-code');
+  expect(f.service.configForSession(f.store, pi.id).agent.runtime.backend).toBe('pi');
+
+  await f.manager.updateConfig({ agent: { ...f.manager.getConfig().agent, runtime: { ...f.manager.getConfig().agent.runtime, backend: 'claude-code' } } });
+  expect(f.manager.getConfig().agent.runtime.backend).toBe('claude-code');
+  expect(f.service.get(f.store, f.manager.getConfig(), pi.id)?.backend).toBe('pi');
+  expect(f.service.get(f.store, f.manager.getConfig(), claude.id)?.backend).toBe('claude-code');
+  expect(f.service.get(f.store, f.manager.getConfig(), f.session.id)?.backend).toBe('pi');
+  expect(f.service.messages(f.store, f.session.id)).toMatchObject([{ id: 'prior', role: 'user', text: '旧会话内容' }]);
+  expect((await (await create({ mode: 'discuss' })).json()).backend).toBe('claude-code');
+  for (const backend of ['other', null, 123]) {
+    expect((await create({ backend })).status).toBe(400);
+  }
+});

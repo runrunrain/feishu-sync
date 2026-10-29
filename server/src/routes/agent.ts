@@ -30,6 +30,7 @@ import { VisionDescriber } from '../agent/vision/vision-describer.js';
 import type { ApprovalService } from '../agent/approvals/approval-service.js';
 import type { RuntimeInstaller } from '../agent/runtime-installer.js';
 import { configuredThinkingLevels, THINKING_LEVELS } from '../agent/thinking-capabilities.js';
+import { testClaudeConnection } from '../agent/claude-connection-test.js';
 
 export interface AgentRouteDeps {
   sessionService: SessionService;
@@ -67,6 +68,15 @@ function errorResponse(c: Context, error: unknown): Response {
 export async function agentRoutes(deps: AgentRouteDeps): Promise<Hono> {
   const routes = new Hono();
   const { sessionService, resolver, configManager, localMapStore, pool } = deps;
+
+  routes.post('/api/agent/claude/connection-test', async (c) => {
+    try {
+      const port = deps.internalPort();
+      if (!port) throw new ToolError('agent_not_ready', '应用内部工具服务尚未就绪', 503);
+      return c.json(await testClaudeConnection({ config: await configManager.load(), dataRoot: resolveDataRoot(),
+        internalBaseUrl: `http://127.0.0.1:${port}`, resolver, pool, toolService: deps.toolService }));
+    } catch (error) { return errorResponse(c, error); }
+  });
 
   routes.post('/api/agent/runtime/update', async (c) => {
     const body = await c.req.json<{ backend?: string }>().catch(() => null);
@@ -217,12 +227,13 @@ export async function agentRoutes(deps: AgentRouteDeps): Promise<Hono> {
 
   routes.post('/api/agent/sessions', async (c) => {
     try {
-      let body: { title?: string; mode?: string } = {};
+      let body: { title?: string; mode?: string; backend?: string } = {};
       try {
-        body = await c.req.json() as { title?: string; mode?: string };
+        body = await c.req.json() as { title?: string; mode?: string; backend?: string };
       } catch {
         /* 空 body 合法 */
       }
+      if (!body || typeof body !== 'object' || Array.isArray(body)) throw new ToolError('invalid_request', '会话配置无效');
       const session = sessionService.create(localMapStore, body);
       return c.json(session, 201);
     } catch (error) {

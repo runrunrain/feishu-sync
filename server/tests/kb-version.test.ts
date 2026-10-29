@@ -20,7 +20,11 @@ import { kbRoutes } from '../src/routes/kb.js';
 import type { DocumentRecord } from '../src/types/index.js';
 
 const roots: string[] = [];
-afterAll(() => roots.forEach((root) => fs.rmSync(root, { recursive: true, force: true })));
+const openedStores: LocalMapStore[] = [];
+afterAll(() => {
+  for (const store of openedStores) store.close();
+  roots.forEach((root) => fs.rmSync(root, { recursive: true, force: true }));
+});
 
 async function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kb-version-')); roots.push(root);
@@ -28,7 +32,7 @@ async function fixture() {
   const configManager = new ConfigManager(path.join(root, 'config.json'));
   await configManager.load();
   await configManager.updateConfig({ knowledgeBaseRoot: raw, standardKb: { outputRoot: path.join(root, 'standard'), retainReleases: 3 } } as never);
-  const store = new LocalMapStore(path.join(root, 'db.sqlite')); store.initialize();
+  const store = new LocalMapStore(path.join(root, 'db.sqlite')); openedStores.push(store); store.initialize();
   const documents: DocumentRecord[] = ['a', 'b'].map((token) => ({
     objToken: token, wikiNodeToken: null, objType: 'docx', title: token,
     localRelPath: `${token}.md`, localMdPath: path.join(raw, `${token}.md`),
@@ -118,7 +122,7 @@ describe('源选择 → 源diff → 按变更更新 → 独立版本', () => {
     expect(version.docChanges[0].patch).toContain('-规则A');
     expect(version.summary).toContain('独立版本记录');
     expect(f.prompts.some((prompt) => prompt.includes('用户标记为不参与构建') && prompt.includes('-规则A'))).toBe(true);
-    const reopened = new LocalMapStore(path.join(f.root, 'db.sqlite')); reopened.initialize();
+    const reopened = new LocalMapStore(path.join(f.root, 'db.sqlite')); openedStores.push(reopened); reopened.initialize();
     expect(reopened.listKbExcludedSources(f.raw)).toEqual(['a']);
     f.store.upsertDocument({ ...f.store.getAllDocuments()[0], title: '重新同步后的A' });
     expect(f.store.listKbExcludedSources(f.raw)).toEqual(['a']);

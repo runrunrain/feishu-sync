@@ -792,6 +792,15 @@ export class ChangeDetector {
       );
       if (!detail.node) {
         this.fastFallbackRetryAt.set(objToken, fallbackNow + FAST_DETAIL_FALLBACK_RETRY_MS);
+        if (detail.observationStatus === 'restricted') {
+          observations.push({
+            wikiNodeToken: record.wikiNodeToken ?? '', objToken: record.objToken,
+            objType: record.objType, title: record.title, spaceId: record.spaceId ?? null,
+            parentNodeToken: record.parentNodeToken ?? null, watchedRootId: record.watchedRootId || rootToken,
+            watchedRootUrl: record.watchedRootUrl ?? rootUrl, observedObjEditTime: null,
+            hasChild: record.hasChild === true, observationStatus: 'restricted',
+          });
+        }
         continue;
       }
 
@@ -1066,7 +1075,10 @@ export class ChangeDetector {
       const lastRefresh = this.lastObjEditTimeRefreshAt.get(raw.obj_token) ?? 0;
       const ttlExpired = now - lastRefresh > OBJ_EDIT_TIME_REFRESH_TTL_MS;
 
-      if (fingerprintUnchanged && cached?.objEditTime != null && !ttlExpired) {
+      if (cached?.syncState === 'restricted' && !ttlExpired) {
+        objEditTime = null;
+        observationStatus = 'restricted';
+      } else if (fingerprintUnchanged && cached?.objEditTime != null && !ttlExpired) {
         // Fingerprint hit AND TTL fresh: reuse cached obj_edit_time, skip node-get.
         objEditTime = cached.objEditTime;
       } else {
@@ -1231,7 +1243,7 @@ export class ChangeDetector {
   }
 
   private isPermissionError(message: string): boolean {
-    return /(?:40403|131006|无权限|permission|forbidden|access denied)/i.test(message);
+    return /(?:40403|131006|3350003|无权限|permission|forbidden|access denied)/i.test(message);
   }
 
   /**
@@ -1357,6 +1369,7 @@ export class ChangeDetector {
 
     try {
       const allLocal = this.localMapStore.getAllDocuments() as DocumentRecord[];
+      let absenceProbes = 0;
       for (const local of allLocal) {
         if (seenObjTokens.has(local.objToken)) continue;
         const state = local.syncState ?? this.legacyStateFromDocument(local);
@@ -1379,6 +1392,24 @@ export class ChangeDetector {
             (local.parentNodeToken != null && local.parentNodeToken !== '' && traversedNodeTokens.has(local.parentNodeToken))
           );
         if (!belongsToRoot) continue;
+
+        // An omitted node can also have lost access. Probe a bounded number
+        // serially; a timeout or ambiguous not-found never proves permission.
+        const retryAt = this.fastFallbackRetryAt.get(local.objToken) ?? 0;
+        if (options.watchedRootUrl && local.wikiNodeToken && absenceProbes < FAST_DETAIL_FALLBACK_MAX && retryAt <= Date.now()) {
+          absenceProbes += 1;
+          const detail = await this.fetchNodeDetail(local.spaceId ?? '', local.wikiNodeToken, options.watchedRootUrl);
+          if (!detail.node) this.fastFallbackRetryAt.set(local.objToken, Date.now() + FAST_DETAIL_FALLBACK_RETRY_MS);
+          if (detail.observationStatus === 'restricted') {
+            this.localMapStore.recordCloudObservation({
+              objToken: local.objToken, wikiNodeToken: local.wikiNodeToken, objType: local.objType,
+              title: local.title, spaceId: local.spaceId ?? null, parentNodeToken: local.parentNodeToken ?? null,
+              watchedRootId: local.watchedRootId || rootToken, watchedRootUrl: local.watchedRootUrl ?? options.watchedRootUrl,
+              observedObjEditTime: null, hasChild: local.hasChild === true, observationStatus: 'restricted', lastSeenAt: now,
+            });
+            continue;
+          }
+        }
 
         this.localMapStore.recordCompleteTraversalMiss(local.objToken, now);
       }

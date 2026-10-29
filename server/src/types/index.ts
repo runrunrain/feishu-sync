@@ -151,6 +151,8 @@ export interface LlmModelPreset {
 export type LlmProtocol = 'openai-completions' | 'openai-responses' | 'anthropic-messages';
 
 export interface LlmProviderConfig {
+  /** Anthropic credentials share apiKey; missing preserves legacy x-api-key authentication. */
+  anthropicAuthType?: 'api-key' | 'auth-token';
   openAiProtocol?: 'openai-completions' | 'openai-responses';
   protocolBaseUrls?: Partial<Record<LlmProtocol, string>>;
   /** Missing in older configs means OpenAI Chat Completions. */
@@ -181,6 +183,8 @@ export interface LlmProviderConfig {
  * values only when no provider profile is configured.
  */
 export interface LlmConfig {
+  /** Runtime projection of the selected provider's Anthropic authentication. */
+  anthropicAuthType?: 'api-key' | 'auth-token';
   /** Runtime projection of the active provider protocol. */
   protocol?: LlmProtocol;
   /** OpenAI-protocol adapter base URL (DirectChannel/OpenAI SDK). */

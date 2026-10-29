@@ -196,7 +196,7 @@ function cloudMatchLabel(cm?: LocalDirTreeNode['cloud_match']): {
     case 'synced':
       return { text: '已对应', cls: 'bg-jade/10 text-jade' };
     case 'restricted':
-      return { text: '受限', cls: 'bg-seal/10 text-seal' };
+      return { text: '暂无云文档访问权限', cls: 'bg-seal/10 text-seal' };
     case 'local_only':
       return { text: '本地独有', cls: 'bg-ink-faint/10 text-ink-faint' };
     case 'unknown':

@@ -28,19 +28,22 @@ import { Card, CardHeader, CardBody } from './common/Card';
 import { Button } from './common/Button';
 import { Input, Range } from './common/Input';
 import { useConfig } from '../hooks/useConfig';
+import { useSettingsForm } from '../hooks/settingsDraft';
 import { useToast } from './common/Toast';
 import type { Config } from '../types';
 
 export function KnowledgeSettingsCard() {
-  const { config, loading, error, saving, updateConfig } = useConfig();
+  const { config, loading, error } = useConfig();
   const toast = useToast();
   const [local, setLocal] = useState<Partial<Config>>({});
+  const currentRoot = config?.knowledgeBaseRoot;
+  const currentPollInterval = config?.pollIntervalMinutes;
 
   useEffect(() => {
-    if (config) {
-      setLocal(config);
+    if (currentRoot !== undefined && currentPollInterval !== undefined) {
+      setLocal({ knowledgeBaseRoot: currentRoot, pollIntervalMinutes: currentPollInterval });
     }
-  }, [config]);
+  }, [currentRoot, currentPollInterval]);
 
   const viewState: 'loading' | 'error' | 'ready' = loading
     ? 'loading'
@@ -59,26 +62,12 @@ export function KnowledgeSettingsCard() {
     setLocal((p) => ({ ...p, [k]: v }));
   };
 
-  const handleSave = async () => {
-    if (!cur) return;
-
-    try {
-      // Only send the non-root knowledge-base fields. NEVER send llm — the
-      // server GET masks apiKey to '***', and sending it back would
-      // overwrite the user's real key.
-      await updateConfig({
-        knowledgeBaseRoot: (cur.knowledgeBaseRoot ?? '').trim(),
-        pollIntervalMinutes: cur.pollIntervalMinutes,
-      });
-      toast.push({ type: 'success', message: '已保存知识库设置' });
-    } catch (err) {
-      toast.push({
-        type: 'error',
-        message: '保存失败',
-        hint: err instanceof Error ? err.message : '',
-      });
-    }
-  };
+  useSettingsForm('kb-base', () => {
+    if (!cur || !config) return null;
+    const knowledgeBaseRoot = (cur.knowledgeBaseRoot ?? '').trim();
+    if (knowledgeBaseRoot === config.knowledgeBaseRoot && cur.pollIntervalMinutes === config.pollIntervalMinutes) return null;
+    return { knowledgeBaseRoot, pollIntervalMinutes: cur.pollIntervalMinutes };
+  });
 
   const handleOpenDataDir = async () => {
     if (typeof window !== 'undefined' && window.desktop?.openDataDirectory) {
@@ -170,7 +159,6 @@ export function KnowledgeSettingsCard() {
           <Database className="w-4 h-4 text-seal" />
           <h2 className="text-base font-kai font-medium text-ink">知识库设置</h2>
         </div>
-        <Button size="sm" onClick={handleSave} loading={saving}>保存设置</Button>
       </CardHeader>
       <CardBody className="space-y-5">
         {/* Local root directory */}

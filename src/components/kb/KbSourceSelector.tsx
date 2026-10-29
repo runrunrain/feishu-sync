@@ -53,15 +53,16 @@ export function KbSourceSelector({ running, nonce, onChanged, onOpenSource, canB
     finally { setBusy(false); }
   };
   const resetScroll = () => { setScroll(0); if (viewport.current) viewport.current.scrollTop = 0; };
-  const start = Math.max(0, Math.floor(scroll / ROW_HEIGHT) - 8); const end = Math.min(tree.rows.length, start + Math.ceil((viewport.current?.clientHeight ?? 600) / ROW_HEIGHT) + 16);
-  if (confirmation) return <div>
+  const start = Math.max(0, Math.floor(scroll / ROW_HEIGHT) - 8); const end = Math.min(tree.rows.length, start + Math.ceil((viewport.current?.clientHeight || 600) / ROW_HEIGHT) + 16);
+  if (confirmation) return <div className="h-full overflow-auto scrollbar-thin">
     <h4 className="text-base text-ink mb-3">确认清理 {confirmation.length} 篇源文档</h4>
     <p className="text-sm text-ink-soft leading-relaxed mb-3">将以下本地正文和已登记的表格附件移入原始库的回收目录，并清除对应索引。飞书云端原文保留；下次检测可能重新列为待同步，勾选同步后会下载回来。标准库中的已有内容会在下次「按变更更新」时处理，历史版本保留。</p>
     <div className="max-h-[34vh] overflow-auto border-y border-line mb-4">{confirmation.map((source) => <div key={source.objToken} className="py-2 text-sm text-ink">{source.title}<span className="block text-xs text-ink-faint break-all">{source.relPath}</span></div>)}</div>
     {error ? <p role="alert" className="text-sm text-seal-2 mb-3">{error}</p> : null}
     <div className="flex gap-3 justify-end"><Button size="sm" variant="secondary" disabled={busy} onClick={() => setConfirmation(null)}>取消清理</Button><Button size="sm" disabled={disabled} onClick={() => void confirmCleanup()}>{busy ? '正在清理…' : '确认移入回收区'}</Button></div>
   </div>;
-  return <div>
+  return <div className="flex h-full min-h-0 flex-col">
+    <div className="shrink-0 max-h-[45%] overflow-y-auto scrollbar-thin">
     {!cleanupMode ? <p className="text-xs text-ink-soft mb-3 leading-relaxed">勾选某个层级会同时选择其全部下级文档。取消后保留原文，已参与构建的来源会在下次「按变更更新」时移除其影响。</p> : null}
     {cleanupMode ? <p role="status" className="text-sm text-seal mb-3">清理选择模式：请勾选要移入回收区的文档，再点击「清理所选」。</p> : null}
     {notice ? <p role="status" className="text-xs text-jade break-all mb-3">{notice}</p> : null}
@@ -78,7 +79,8 @@ export function KbSourceSelector({ running, nonce, onChanged, onOpenSource, canB
     </div>
     <p className="text-xs text-ink-faint mb-2">{q ? `批量操作作用于筛选出的 ${tree.targets.length} 篇文档；层级复选框始终包含全部下级。` : '批量操作覆盖全部文档，包括收起的层级。'}</p>
     {error ? <p role="alert" className="text-sm text-seal-2 mb-2">{error}</p> : null}
-    {loading && !data ? <p className="py-6 text-sm text-ink-faint">正在读取源文档…</p> : <div ref={viewport} onScroll={(e) => setScroll(e.currentTarget.scrollTop)} className="h-[38vh] min-h-[180px] overflow-auto scrollbar-thin border-y border-line" aria-label="源文档层级">
+    </div>
+    {loading && !data ? <p className="flex-1 py-6 text-sm text-ink-faint">正在读取源文档…</p> : <div ref={viewport} onScroll={(e) => setScroll(e.currentTarget.scrollTop)} className="flex-1 min-h-0 overflow-auto scrollbar-thin border-y border-line" aria-label="源文档层级">
       <div style={{ height: tree.rows.length * ROW_HEIGHT, position: 'relative' }}>
         {tree.rows.slice(start, end).map(({ node, depth }, index) => {
           const count = tree.stats.get(node.id)!; const expanded = q.trim() || !collapsed.has(node.id);
@@ -96,7 +98,7 @@ export function KbSourceSelector({ running, nonce, onChanged, onOpenSource, canB
       {!tree.rows.length ? <p className="py-6 text-sm text-ink-faint">没有匹配的本地源文档。</p> : null}
     </div>}
     {running ? <p className="text-xs text-seal mt-2">构建进行中，源选择暂不可更改。</p> : null}
-    {!cleanupMode ? <div className="mt-3 flex items-center justify-end gap-3">
+    {!cleanupMode ? <div className="mt-3 flex shrink-0 flex-wrap items-center justify-end gap-3">
       <span className="text-xs text-ink-faint">将重新构建已选的 {totalIncluded} 篇源文档</span>
       <Button size="sm" disabled={disabled || !canBuild || totalIncluded === 0} onClick={() => onBuild(totalIncluded)}>构建所选文档</Button>
     </div> : null}

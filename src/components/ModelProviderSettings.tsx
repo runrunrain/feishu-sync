@@ -6,7 +6,7 @@
  * 提供商/预设。claude-cli / opencode 本地无头通道已移除。
  */
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Eye,
   EyeOff,
@@ -14,7 +14,6 @@ import {
   Layers3,
   Loader2,
   Plus,
-  Save,
   Server,
   Trash2,
 } from 'lucide-react';
@@ -22,6 +21,7 @@ import { Card, CardBody, CardHeader } from './common/Card';
 import { Button } from './common/Button';
 import { Input, Select, Toggle } from './common/Input';
 import { useConfig } from '../hooks/useConfig';
+import { useSettingsForm } from '../hooks/settingsDraft';
 import { useToast } from './common/Toast';
 import { revealProviderApiKey } from '../api/client';
 import type { LlmConfig, LlmModelPreset, LlmProviderConfig } from '../types';
@@ -71,18 +71,34 @@ function makeProvider(existing: LlmProviderConfig[]): LlmProviderConfig {
 }
 
 export function ModelProviderSettings() {
-  const { config, saving, updateConfig } = useConfig();
+  const { config } = useConfig();
   const toast = useToast();
   const [local, setLocal] = useState<LlmConfig | null>(null);
   const [selectedProviderId, setSelectedProviderId] = useState('');
+  const [chosenExplicitly, setChosenExplicitly] = useState(false);
   const [showKey, setShowKey] = useState(false);
   const [revealedProviderId, setRevealedProviderId] = useState<string | null>(null);
   const [revealingKey, setRevealingKey] = useState(false);
+  const revealedKey = useRef<string | null>(null);
+  const localRef = useRef<LlmConfig | null>(null);
+  const acceptedProviders = useRef<LlmProviderConfig[] | undefined>(undefined);
+  localRef.current = local;
+  useEffect(() => {
+    if (config?.agent?.model.source === 'app-llm' && config.agent.model.providerId === selectedProviderId) setChosenExplicitly(false);
+  }, [config?.agent?.model.source, config?.agent?.model.providerId, selectedProviderId]);
 
   useEffect(() => {
     if (!config?.llm) return;
     const next = cloneLlmConfig(config.llm);
     const providers = next.providers ?? [];
+    const currentProviders = localRef.current?.providers?.map((provider) => provider.id === revealedProviderId && provider.apiKey === revealedKey.current
+      ? { ...provider, apiKey: '***' } : provider);
+    // An unrelated draft update must not erase unsaved provider edits. A
+    // successful staging/save is allowed to refresh the matching form.
+    if (currentProviders && acceptedProviders.current
+      && JSON.stringify(currentProviders) !== JSON.stringify(acceptedProviders.current)
+      && JSON.stringify(currentProviders) !== JSON.stringify(providers)) return;
+    acceptedProviders.current = providers;
     setLocal(next);
     setSelectedProviderId((current) => (
       providers.some((provider) => provider.id === current)
@@ -91,13 +107,44 @@ export function ModelProviderSettings() {
     ));
     setShowKey(false);
     setRevealedProviderId(null);
-  }, [config]);
+    revealedKey.current = null;
+    // Only changes to profiles can refresh this editor; other draft fields
+    // must not reset a partially entered provider.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [config?.llm.providers]);
 
-  if (!local) return null;
-
-  const providers = local.providers ?? [];
+  const providers = local?.providers ?? [];
   const selectedProvider = providers.find((provider) => provider.id === selectedProviderId)
     ?? providers[0];
+
+  useSettingsForm('md-provider', () => {
+    if (!local || !config) return null;
+    const safeProviders = providers.map((provider) => provider.id === revealedProviderId && provider.apiKey === revealedKey.current
+      ? { ...provider, apiKey: '***' } : provider);
+    const profilesChanged = JSON.stringify(safeProviders) !== JSON.stringify(config.llm.providers ?? []);
+    const agentChanged = chosenExplicitly && selectedProvider && config.agent
+      && (config.agent.model.source !== 'app-llm' || config.agent.model.providerId !== selectedProvider.id);
+    if (!profilesChanged && !agentChanged) return null;
+    if (providers.some((p) => p.models.some((m) =>
+      (m.contextWindow !== undefined && (!Number.isInteger(m.contextWindow) || m.contextWindow < 1024))
+      || (m.maxTokens !== undefined && (!Number.isInteger(m.maxTokens) || m.maxTokens < 1))
+      || (m.maxTokens !== undefined && m.contextWindow !== undefined && m.maxTokens > m.contextWindow)))) {
+      throw new Error('模型提供商：上下文窗口须为不小于 1024 的整数，最大输出须为正整数且不超过上下文窗口');
+    }
+    const agentPreset = selectedProvider?.models.find((m) => m.id === (config.llm.activeProviderId === selectedProvider.id ? config.llm.activeModelId : selectedProvider.defaultModelId) && m.enabled && m.openAiModel.trim())
+      ?? selectedProvider?.models.find((m) => m.id === selectedProvider.defaultModelId && m.enabled && m.openAiModel.trim())
+      ?? selectedProvider?.models.find((m) => m.enabled && m.openAiModel.trim());
+    const previousThinking = config.agent?.model.thinkingLevel ?? 'off';
+    const allowedThinking = previousThinking === 'off' || (agentPreset?.reasoning && agentPreset.thinkingLevels?.includes(previousThinking)
+      && (config.agent?.runtime.backend !== 'claude-code' || previousThinking !== 'minimal'));
+    return {
+      ...(config.agent && selectedProvider ? { agent: { ...config.agent, model: { ...config.agent.model, source: 'app-llm' as const,
+        providerId: selectedProvider.id, modelId: agentPreset?.id, thinkingLevel: allowedThinking ? previousThinking : 'off' } } } : {}),
+      llm: { providers: safeProviders },
+    };
+  });
+
+  if (!local) return null;
 
   const updateProvider = (providerId: string, updater: (provider: LlmProviderConfig) => LlmProviderConfig) => {
     setLocal((current) => {
@@ -116,7 +163,8 @@ export function ModelProviderSettings() {
     // A key obtained from the explicit reveal endpoint should not stay in
     // client state after the user hides it or switches providers. `***` is
     // understood by ConfigManager as "retain the stored secret" on save.
-    updateProvider(providerId, (provider) => ({ ...provider, apiKey: '***' }));
+    updateProvider(providerId, (provider) => provider.apiKey === revealedKey.current ? { ...provider, apiKey: '***' } : provider);
+    revealedKey.current = null;
     setRevealedProviderId(null);
   };
 
@@ -138,6 +186,7 @@ export function ModelProviderSettings() {
     setRevealingKey(true);
     try {
       const apiKey = await revealProviderApiKey(selectedProvider.id);
+      revealedKey.current = apiKey;
       updateProvider(selectedProvider.id, (provider) => ({ ...provider, apiKey }));
       setRevealedProviderId(selectedProvider.id);
       setShowKey(true);
@@ -237,45 +286,6 @@ export function ModelProviderSettings() {
     });
   };
 
-  const handleSave = async () => {
-    try {
-      if (providers.some((p) => p.models.some((m) =>
-        (m.contextWindow !== undefined && (!Number.isInteger(m.contextWindow) || m.contextWindow < 1024))
-        || (m.maxTokens !== undefined && (!Number.isInteger(m.maxTokens) || m.maxTokens < 1))
-        || (m.maxTokens !== undefined && m.contextWindow !== undefined && m.maxTokens > m.contextWindow)))) {
-        toast.push({ type: 'warning', message: '上下文窗口须为不小于 1024 的整数，最大输出须为正整数且不超过上下文窗口' }); return;
-      }
-      // This card owns provider profiles only. Sending a narrow patch keeps a
-      // concurrently open execution-channel card from being overwritten by a
-      // stale copy of the rest of `llm`.
-      const agentPreset = selectedProvider?.models.find((m) => m.id === (local.activeProviderId === selectedProvider.id ? local.activeModelId : selectedProvider.defaultModelId) && m.enabled && m.openAiModel.trim())
-        ?? selectedProvider?.models.find((m) => m.id === selectedProvider.defaultModelId && m.enabled && m.openAiModel.trim())
-        ?? selectedProvider?.models.find((m) => m.enabled && m.openAiModel.trim());
-      const previousThinking = config?.agent?.model.thinkingLevel ?? 'off';
-      const allowedThinking = previousThinking === 'off' || (agentPreset?.reasoning && agentPreset.thinkingLevels?.includes(previousThinking)
-        && (config?.agent?.runtime.backend !== 'claude-code' || previousThinking !== 'minimal'));
-      await updateConfig({
-        ...(config?.agent && selectedProvider ? { agent: {
-          ...config.agent, model: { ...config.agent.model, source: 'app-llm' as const,
-            providerId: selectedProvider.id,
-            modelId: agentPreset?.id,
-            thinkingLevel: allowedThinking ? previousThinking : 'off',
-          },
-        } } : {}),
-        llm: {
-          providers: local.providers,
-        },
-      });
-      toast.push({ type: 'success', message: selectedProvider ? '配置已保存并用于 Agent' : '模型提供商与预设已保存' });
-    } catch (error) {
-      toast.push({
-        type: 'error',
-        message: '保存模型提供商失败',
-        hint: error instanceof Error ? error.message : '',
-      });
-    }
-  };
-
   return (
     <Card variant="elevated">
       <CardHeader>
@@ -290,7 +300,6 @@ export function ModelProviderSettings() {
             </div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <Button size="sm" onClick={() => void handleSave()} loading={saving}><Save className="h-3.5 w-3.5" />保存提供商配置</Button>
             <Button variant="secondary" size="sm" onClick={addProvider}>
               <Plus className="w-3.5 h-3.5" />
               添加提供商
@@ -329,6 +338,7 @@ export function ModelProviderSettings() {
                     onClick={() => {
                       concealRevealedKey(selectedProvider.id);
                       setSelectedProviderId(provider.id);
+                      setChosenExplicitly(true);
                       setShowKey(false);
                     }}
                     className={`w-full rounded-md border px-3 py-2.5 text-left transition-colors ${
@@ -429,6 +439,12 @@ export function ModelProviderSettings() {
               </div>
               <div className="space-y-3 rounded-md border border-line p-3">
               <h3 className="text-sm font-medium text-ink">Anthropic</h3>
+              <Select label="Anthropic 认证方式" value={selectedProvider.anthropicAuthType ?? 'api-key'} options={[
+                { value: 'api-key', label: 'API Key（x-api-key）' },
+                { value: 'auth-token', label: 'Bearer Token（Authorization）' },
+              ]} onChange={(event) => updateProvider(selectedProvider.id, (provider) => ({ ...provider,
+                anthropicAuthType: event.target.value as 'api-key' | 'auth-token' }))}
+                helperText="共用下方 API Key。按服务商要求选择；智谱等网关通常使用 Bearer Token。" />
               <Input label="Anthropic Messages Base URL" type="url"
                 value={selectedProvider.protocol === 'anthropic-messages' ? selectedProvider.openAiCompatBaseUrl : selectedProvider.protocolBaseUrls?.['anthropic-messages'] ?? ''}
                 onChange={(event) => {
@@ -558,7 +574,7 @@ export function ModelProviderSettings() {
                           {(['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const).map((level) => <label key={level} className="flex items-center gap-1 text-xs text-ink-soft">
                             <input type="checkbox" checked={model.thinkingLevels?.includes(level) ?? false} onChange={(event) => updateModel(selectedProvider, model.id, {
                               thinkingLevels: event.target.checked ? [...(model.thinkingLevels ?? []).filter((item) => item !== level), level] : (model.thinkingLevels ?? []).filter((item) => item !== level),
-                            })} />{{ minimal: '最低', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最大' }[level]}
+                            })} />{level}
                           </label>)}
                         </div>
                       </div> : null}

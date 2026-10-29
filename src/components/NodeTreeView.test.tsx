@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { findRenderableRoots } from './NodeTreeView';
 import type { MappingNode } from '../types';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { TreeNode } from './TreeNode';
 
 function makeNode(overrides: Partial<MappingNode>): MappingNode {
   return {
@@ -50,4 +52,12 @@ describe('findRenderableRoots', () => {
     expect(findRenderableRoots([externalRoot, child, regularRoot]).map((node) => node.obj_token))
       .toEqual(['external-root', 'regular-root']);
   });
+});
+
+it('在节点树中标记本地保留但暂无云文档访问权限的文档', () => {
+  const html = renderToStaticMarkup(<TreeNode node={makeNode({ title: '保留文档', sync_state: 'restricted', local_path: '/kb/local.md' })}
+    level={0} expanded={false} selected={false} hasChildren={false} onToggle={() => {}} onSelect={() => {}}
+    onDragStart={() => {}} onDragOver={() => {}} onDragLeave={() => {}} onDrop={() => {}} onDragEnd={() => {}} />);
+  expect(html).toContain('保留文档');
+  expect(html).toContain('暂无云文档访问权限');
 });

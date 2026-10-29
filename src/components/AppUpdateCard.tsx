@@ -24,6 +24,7 @@ import { StatusBadge } from './common/StatusBadge';
 import { Button } from './common/Button';
 import { Toggle } from './common/Input';
 import { useConfig } from '../hooks/useConfig';
+import { useSettingsDraft } from '../hooks/settingsDraft';
 import { useToast } from './common/Toast';
 import { appLogger } from '../utils/appLogger';
 import type { DesktopPlatformCapabilities, DesktopUpdateState } from '../types';
@@ -60,6 +61,7 @@ function formatBytes(bytes: number): string {
 
 export function AppUpdateCard() {
   const { config, updateConfig } = useConfig();
+  const draft = useSettingsDraft();
   const toast = useToast();
   const [updateState, setUpdateState] = useState<DesktopUpdateState | null>(null);
   const [capabilities, setCapabilities] = useState<DesktopPlatformCapabilities | null>(null);
@@ -350,7 +352,7 @@ export function AppUpdateCard() {
             onChange={async (v) => {
               try {
                 await updateConfig({ enableAutoStart: v });
-                toast.push({ type: 'success', message: v ? '已开启开机自启动' : '已关闭开机自启动' });
+                if (!draft) toast.push({ type: 'success', message: v ? '已开启开机自启动' : '已关闭开机自启动' });
               } catch (err) {
                 toast.push({ type: 'error', message: '设置保存失败', hint: err instanceof Error ? err.message : '' });
               }
@@ -363,7 +365,7 @@ export function AppUpdateCard() {
             onChange={async (v) => {
               try {
                 await updateConfig({ enableNotifications: v });
-                toast.push({ type: 'success', message: v ? '已开启同步通知' : '已关闭同步通知' });
+                if (!draft) toast.push({ type: 'success', message: v ? '已开启同步通知' : '已关闭同步通知' });
               } catch (err) {
                 toast.push({ type: 'error', message: '设置保存失败', hint: err instanceof Error ? err.message : '' });
               }

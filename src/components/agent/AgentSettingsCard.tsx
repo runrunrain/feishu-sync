@@ -28,6 +28,7 @@ import { Button } from '../common/Button';
 import { StatusBadge } from '../common/StatusBadge';
 import { useToast } from '../common/Toast';
 import { useConfig } from '../../hooks/useConfig';
+import { useSettingsDraft, useSettingsForm } from '../../hooks/settingsDraft';
 import { useAgentStatus } from '../../hooks/useAgentStatus';
 import {
   addAgentWorkspace,
@@ -38,10 +39,12 @@ import {
   getKbMcpInfo,
   listAgentWorkspaces,
   testAgentVision,
+  testClaudeConnection,
 } from '../../api/client';
 import { describeReadinessCode as describeReadiness } from '../../utils/agentReadiness';
 import type {
   AgentConfig,
+  ClaudeConnectionTestResult,
   AgentVisionConfig,
   AgentVisionStatusDto,
   AgentVisionTestResult,
@@ -175,6 +178,7 @@ export function describeVisionStatus(status: AgentVisionStatusDto): string {
 export function AgentRuntimeSettingsCard() {
   const toast = useToast();
   const { config, updateConfig } = useConfig();
+  const draft = useSettingsDraft();
   const agentStatus = useAgentStatus(true);
 
   const agent = config?.agent;
@@ -182,7 +186,9 @@ export function AgentRuntimeSettingsCard() {
   const [piCliPath, setPiCliPath] = useState('');
   const [claudeCliPath, setClaudeCliPath] = useState('');
   const [saving, setSaving] = useState(false);
-  const [updatingRuntime, setUpdatingRuntime] = useState(false);
+  const [updatingRuntime, setUpdatingRuntime] = useState<'pi' | 'claude-code' | null>(null);
+  const [testingConnection, setTestingConnection] = useState(false);
+  const [connectionTest, setConnectionTest] = useState<ClaudeConnectionTestResult | null>(null);
 
   // ---- S2/S5：图片理解段（独立状态面；保存走 agent.vision，不动文本模型配置） ----
   const vision = agent?.vision ?? DEFAULT_VISION_CONFIG;
@@ -274,6 +280,13 @@ export function AgentRuntimeSettingsCard() {
     ? detectedPiLevels ?? (manualPiLevels ? ['off' as const, ...manualPiLevels.filter((level) => level !== 'off')] : undefined)
     : selectedPreset?.reasoning ? (selectedPreset.thinkingLevels ? ['off' as const, ...selectedPreset.thinkingLevels.filter((level) => level !== 'off' && (backend !== 'claude-code' || level !== 'minimal'))] : undefined) : ['off' as const];
 
+  useSettingsForm('agent-runtime', () => {
+    if (!agent) return null;
+    const paths = { nodePath: nodePath.trim() || undefined, piCliPath: piCliPath.trim() || undefined, claudeCliPath: claudeCliPath.trim() || undefined };
+    if (paths.nodePath === agent.runtime.nodePath && paths.piCliPath === agent.runtime.piCliPath && paths.claudeCliPath === agent.runtime.claudeCliPath) return null;
+    return { agent: { ...agent, runtime: { ...agent.runtime, ...paths } } };
+  });
+
   const saveAgent = async (patch: {
     runtime?: Partial<AgentConfig['runtime']>;
     model?: Partial<AgentConfig['model']>;
@@ -301,8 +314,7 @@ export function AgentRuntimeSettingsCard() {
         ...(patch.vision ? { vision: { ...DEFAULT_VISION_CONFIG, ...baseAgent.vision, ...patch.vision } } : {}),
       };
       await updateConfig({ agent: next });
-      toast.push({ type: 'success', message: 'Agent 配置已保存' });
-      agentStatus.refresh();
+      if (!draft) { toast.push({ type: 'success', message: 'Agent 配置已保存' }); agentStatus.refresh(); }
     } catch (err) {
       toast.push({ type: 'error', message: err instanceof APIError ? err.message : '保存失败' });
     } finally {
@@ -314,10 +326,10 @@ export function AgentRuntimeSettingsCard() {
     <CardShell
       icon={<Bot className="w-4 h-4" />}
       title="Agent 运行时与模型"
-      description="选择新会话及标准库构建使用的基座；既有会话保留原有基座和历史"
+      description="选择标准知识库构建等应用基础能力使用的基座；新会话可单独选择，已有会话保持原基座"
     >
       <div>
-        <FieldLabel>Agent 基座</FieldLabel>
+        <FieldLabel>应用基础能力的 Agent 基座</FieldLabel>
         <div className="flex gap-2">
           <Button size="sm" variant={backend === 'pi' ? 'primary' : 'secondary'} disabled={saving} onClick={() => void saveAgent({ runtime: { backend: 'pi' } })}>Pi</Button>
           <Button size="sm" variant={backend === 'claude-code' ? 'primary' : 'secondary'} disabled={saving} onClick={() => void saveAgent({ runtime: { backend: 'claude-code' } })}>Claude Code</Button>
@@ -338,12 +350,13 @@ export function AgentRuntimeSettingsCard() {
         <Button size="sm" variant="secondary" onClick={() => void agentStatus.recheck()} loading={agentStatus.rechecking}>
           <RefreshCw className="w-3.5 h-3.5" /> 重新检测
         </Button>
-        <Button size="sm" variant="secondary" loading={updatingRuntime} disabled={saving} onClick={() => {
-          setUpdatingRuntime(true);
-          void updateAgentRuntime(backend).then(() => { toast.push({ type: 'success', message: `${backend === 'pi' ? 'Pi' : 'Claude Code'} 已更新` }); agentStatus.refresh(); })
-            .catch((error) => toast.push({ type: 'error', message: error instanceof Error ? error.message : 'Agent 更新失败' }))
-            .finally(() => setUpdatingRuntime(false));
-        }}>更新 {backend === 'pi' ? 'Pi' : 'Claude Code'}</Button>
+        {(['pi', 'claude-code'] as const).map((runtimeBackend) => <Button key={runtimeBackend} size="sm" variant="secondary"
+          loading={updatingRuntime === runtimeBackend} disabled={saving || updatingRuntime !== null} onClick={() => {
+            setUpdatingRuntime(runtimeBackend);
+            void updateAgentRuntime(runtimeBackend).then(() => { toast.push({ type: 'success', message: `${runtimeBackend === 'pi' ? 'Pi' : 'Claude Code'} 已更新` }); agentStatus.refresh(); })
+              .catch((error) => toast.push({ type: 'error', message: error instanceof Error ? error.message : 'Agent 更新失败' }))
+              .finally(() => setUpdatingRuntime(null));
+          }}>更新 {runtimeBackend === 'pi' ? 'Pi' : 'Claude Code'}</Button>)}
         <div className="min-w-0 text-[11px] text-ink-faint leading-relaxed">
           {agentStatus.status?.runtime.nodeVersion ? (
             <span className="font-mono">node {agentStatus.status.runtime.nodeVersion}</span>
@@ -369,6 +382,21 @@ export function AgentRuntimeSettingsCard() {
           ) : null}
         </div>
       </div>
+      {draft?.dirty ? <p className="text-[11px] text-ink-faint">运行状态基于已保存的配置；保存后可重新检测。</p> : null}
+      <div className="space-y-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <Button size="sm" variant="secondary" loading={testingConnection} disabled={saving || Boolean(draft?.dirty)} onClick={() => {
+            setTestingConnection(true); setConnectionTest(null);
+            void testClaudeConnection().then(setConnectionTest).catch((error) => setConnectionTest({ ok: false, providerName: '', model: '', latencyMs: 0,
+              errorMessage: error instanceof Error ? error.message : '连接测试失败' })).finally(() => setTestingConnection(false));
+          }}>测试 Claude Code 连接</Button>
+          <span className="text-[11px] text-ink-faint">使用已保存的应用提供商与预设，发送简短消息，会产生少量模型用量。</span>
+        </div>
+        {connectionTest ? <p role={connectionTest.ok ? 'status' : 'alert'} className={`text-xs ${connectionTest.ok ? 'text-jade' : 'text-seal-2'}`}>
+          {connectionTest.ok ? `连接成功 · ${connectionTest.providerName} / ${connectionTest.model} · ${(connectionTest.latencyMs / 1000).toFixed(1)} 秒`
+            : `连接失败：${connectionTest.errorMessage}`}
+        </p> : null}
+      </div>
 
       {/* 路径覆盖 */}
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -383,13 +411,23 @@ export function AgentRuntimeSettingsCard() {
           />
         </div>
         <div>
-          <FieldLabel hint="留空自动发现">{backend === 'claude-code' ? 'Claude Code 可执行文件路径' : 'pi 包路径'}</FieldLabel>
+          <FieldLabel hint="留空自动发现">Pi 包路径</FieldLabel>
           <input
             className={`${INPUT_CLS} font-mono text-xs`}
-            value={backend === 'claude-code' ? claudeCliPath : piCliPath}
-            onChange={(e) => backend === 'claude-code' ? setClaudeCliPath(e.target.value) : setPiCliPath(e.target.value)}
-            placeholder={backend === 'claude-code' ? '自动发现 Claude Code' : '自动发现（>=1.4.0 <2）'}
-            aria-label={backend === 'claude-code' ? 'Claude Code 路径覆盖' : 'pi 路径覆盖'}
+            value={piCliPath}
+            onChange={(e) => setPiCliPath(e.target.value)}
+            placeholder="自动发现（>=1.4.0 <2）"
+            aria-label="pi 路径覆盖"
+          />
+        </div>
+        <div>
+          <FieldLabel hint="留空自动发现">Claude Code 可执行文件路径</FieldLabel>
+          <input
+            className={`${INPUT_CLS} font-mono text-xs`}
+            value={claudeCliPath}
+            onChange={(e) => setClaudeCliPath(e.target.value)}
+            placeholder="自动发现 Claude Code"
+            aria-label="Claude Code 路径覆盖"
           />
         </div>
       </div>
@@ -512,7 +550,7 @@ export function AgentRuntimeSettingsCard() {
             </Button>
           </div>
           <p className="mt-1 text-[11px] text-ink-faint">
-            通过 pi 加载配置与认证后列出可用模型，按提供商分组；选择后自动保存。认证由 Pi 在本地只读解析，不会复制密钥或改写通用 Pi 配置；未配置认证的内置目录不会列出。实际连通性以调用结果为准。
+            通过 pi 加载配置与认证后列出可用模型，按提供商分组；修改后请点击顶部保存。认证由 Pi 在本地只读解析，不会复制密钥或改写通用 Pi 配置；未配置认证的内置目录不会列出。实际连通性以调用结果为准。
           </p>
           {invalidPiModel ? <p className="mt-1 text-xs text-seal-2" role="alert">原模型已不在可用列表中，请重新选择。</p> : null}
           {!loadingModels && piModels.length === 0 ? (
@@ -654,14 +692,6 @@ export function AgentRuntimeSettingsCard() {
             }} />{{ minimal: '最低', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最大' }[level]}</label>)}
           </div>}
         </div>
-        <Button
-          variant="secondary"
-          size="sm"
-          loading={saving}
-          onClick={() => saveAgent({ runtime: { nodePath: nodePath.trim() || undefined, piCliPath: piCliPath.trim() || undefined, claudeCliPath: claudeCliPath.trim() || undefined } })}
-        >
-          保存路径覆盖
-        </Button>
       </div>
     </CardShell>
   );
@@ -674,13 +704,12 @@ export function AgentRuntimeSettingsCard() {
 export function AgentKbSettingsCard() {
   const toast = useToast();
   const { config, updateConfig } = useConfig();
+  const draft = useSettingsDraft();
 
   const [outputRoot, setOutputRoot] = useState('');
-  const [savingRoot, setSavingRoot] = useState(false);
 
   // P2-S3：每批字数预算输入（回填自服务端链制后的真相值；保存按前端同款链制发送）。
   const [budgetInput, setBudgetInput] = useState('');
-  const [savingBudget, setSavingBudget] = useState(false);
 
   const [workspaces, setWorkspaces] = useState<AgentWorkspaceConfig[] | null>(null);
   const [wsLoading, setWsLoading] = useState(true);
@@ -719,59 +748,18 @@ export function AgentKbSettingsCard() {
       .finally(() => setMcpLoading(false));
   }, []);
 
-  const saveOutputRoot = async () => {
-    setSavingRoot(true);
-    try {
-      const base: StandardKbConfig =
-        config?.standardKb ?? {
-          outputRoot: '',
-          retainReleases: 3,
-          buildBatchSize: 10,
-          buildBatchWordBudget: BUILD_BATCH_WORD_BUDGET_DEFAULT,
-          promptTimeoutMinutes: 15,
-          buildTimeoutMinutes: 180,
-          buildParallelism: 2,
-          autoBuildAfterSync: false,
-        };
-      await updateConfig({ standardKb: { ...base, outputRoot: outputRoot.trim() } });
-      toast.push({ type: 'success', message: '标准库目录已保存' });
-    } catch (err) {
-      toast.push({ type: 'error', message: err instanceof APIError ? err.message : '保存失败' });
-    } finally {
-      setSavingRoot(false);
-    }
-  };
-
-  // P2-S3：每批字数预算（数字输入 + 保存；越界即时提示链制结果，保存按链制值发送）。
   const budgetFeedback = describeBuildBatchWordBudgetInput(budgetInput);
-  const saveBudget = async () => {
-    if (!budgetInput.trim() || !Number.isFinite(Number(budgetInput.trim()))) {
-      toast.push({ type: 'warning', message: '请输入数字（0 或 4000–400000）' });
-      return;
-    }
-    setSavingBudget(true);
-    try {
-      const base: StandardKbConfig =
-        config?.standardKb ?? {
-          outputRoot: '',
-          retainReleases: 3,
-          buildBatchSize: 10,
-          buildBatchWordBudget: BUILD_BATCH_WORD_BUDGET_DEFAULT,
-          promptTimeoutMinutes: 15,
-          buildTimeoutMinutes: 180,
-          buildParallelism: 2,
-          autoBuildAfterSync: false,
-        };
-      await updateConfig({ standardKb: { ...base, buildBatchWordBudget: clampBuildBatchWordBudget(budgetInput) } });
-      toast.push({ type: 'success', message: '每批字数预算已保存' });
-    } catch (err) {
-      toast.push({ type: 'error', message: err instanceof APIError ? err.message : '保存失败' });
-    } finally {
-      setSavingBudget(false);
-    }
-  };
+  useSettingsForm('agent-kb', () => {
+    const base = config?.standardKb;
+    if (!base) return null;
+    const rootChanged = outputRoot.trim() !== base.outputRoot;
+    const budgetChanged = budgetInput !== String(base.buildBatchWordBudget ?? '');
+    if (!rootChanged && !budgetChanged) return null;
+    if (budgetChanged && (!budgetInput.trim() || !Number.isFinite(Number(budgetInput.trim())))) throw new Error('标准库：每批字数预算请输入数字（0 或 4000–400000）');
+    return { standardKb: { ...base, outputRoot: outputRoot.trim(), ...(budgetChanged ? { buildBatchWordBudget: clampBuildBatchWordBudget(budgetInput) } : {}) } };
+  });
 
-  // S4 §4.6：构建并行数（1..6；选择即保存，服务端严格校验并夹取）。
+  // S4 §4.6：构建并行数（1..6；进入设置草稿，服务端严格校验并夹取）。
   const buildParallelism = config?.standardKb?.buildParallelism ?? 2;
   const saveBuildParallelism = async (value: number) => {
     try {
@@ -787,7 +775,7 @@ export function AgentKbSettingsCard() {
           autoBuildAfterSync: false,
         };
       await updateConfig({ standardKb: { ...base, buildParallelism: value } });
-      toast.push({ type: 'success', message: `构建并行数已设为 ${value}` });
+      if (!draft) toast.push({ type: 'success', message: `构建并行数已设为 ${value}` });
     } catch (err) {
       toast.push({ type: 'error', message: err instanceof APIError ? err.message : '保存失败' });
     }
@@ -858,9 +846,6 @@ export function AgentKbSettingsCard() {
               placeholder="/Users/you/.feishu-sync/standard-kb"
               aria-label="标准库输出目录"
             />
-            <Button size="sm" variant="secondary" loading={savingRoot} onClick={saveOutputRoot}>
-              保存
-            </Button>
           </div>
           <p className="mt-1 text-[11px] text-ink-faint">目录不得位于原始知识库内；已有内容且非标准库结构时会被拒绝。</p>
         </div>
@@ -871,7 +856,6 @@ export function AgentKbSettingsCard() {
           <select
             className={INPUT_CLS}
             value={String(buildParallelism)}
-            disabled={savingRoot}
             onChange={(e) => void saveBuildParallelism(Number(e.target.value))}
             aria-label="构建并行数"
             data-testid="build-parallelism-select"
@@ -898,23 +882,11 @@ export function AgentKbSettingsCard() {
               min={0}
               step={1000}
               value={budgetInput}
-              disabled={savingBudget}
               onChange={(e) => setBudgetInput(e.target.value)}
               placeholder="40000"
               aria-label="每批字数预算"
               data-testid="build-word-budget-input"
             />
-            <Button
-              size="sm"
-              variant="secondary"
-              loading={savingBudget}
-              disabled={budgetFeedback?.level === 'error'}
-              onClick={saveBudget}
-              className="shrink-0 whitespace-nowrap"
-              data-testid="build-word-budget-save"
-            >
-              保存
-            </Button>
           </div>
           {budgetFeedback && budgetFeedback.level !== 'hint' ? (
             <p
@@ -936,6 +908,7 @@ export function AgentKbSettingsCard() {
 
         <div>
           <FieldLabel>Workspace（Work 模式可写目录）</FieldLabel>
+          {draft ? <p className="mb-2 text-[11px] text-ink-faint">添加或移除 Workspace 会立即更改授权；其他设置在顶部保存后生效。</p> : null}
           {wsLoading ? (
             <p className="flex items-center gap-2 text-xs text-ink-faint py-2">
               <Loader2 className="w-3.5 h-3.5 animate-spin" /> 读取中…

@@ -99,12 +99,13 @@ export function TreeNode({
       ? { status: moveFace.badgeStatus, text: moveFace.treeText, title: moveFace.title }
       : null;
   const deletedFace = node.cloud_deleted === 1;
+  const restricted = node.sync_state === 'restricted' || node.cloud_match === 'restricted';
   const showChangedBadge =
-    moveBadge != null || node.sync_blocked || pendingLocal || node.status === 'changed' || deletedFace;
+    moveBadge != null || restricted || node.sync_blocked || pendingLocal || node.status === 'changed' || deletedFace;
   const badgeStatus = moveBadge?.status
-    ?? (deletedFace ? 'deleted' : node.status === 'error' ? 'error' : 'modified');
+    ?? (deletedFace ? 'deleted' : restricted ? 'warning' : node.status === 'error' ? 'error' : 'modified');
   const badgeText = moveBadge?.text
-    ?? (deletedFace ? '已删除' : node.sync_blocked ? '已屏蔽' : pendingLocal ? '待同步' : '变更');
+    ?? (deletedFace ? '已删除' : restricted ? '暂无云文档访问权限' : node.sync_blocked ? '已屏蔽' : pendingLocal ? '待同步' : '变更');
   // v0.2.5 层级视觉：顶层节点（level 0）文字/图标大于深层；深层不再与顶层同尺寸。
   const isRootLevel = level === 0;
 

@@ -39,6 +39,7 @@ export type ChannelName = 'direct';
  * `model` / `directModel` 为该端点可用的模型别名。
  */
 export interface LlmConfig {
+  anthropicAuthType?: 'api-key' | 'auth-token';
   contextWindow?: number;
   maxTokens?: number;
   reasoning?: boolean;
@@ -85,7 +86,7 @@ export function resolveActiveLlmConfig(llm: LlmConfig, selection?: ModelSelectio
   if (!Array.isArray(llm.providers)) return llm;
   const resolved = resolveProviderModel(llm, selection);
   return { ...llm, protocol: resolved?.protocol ?? 'openai-completions',
-    openAiCompatBaseUrl: resolved?.baseUrl ?? '', apiKey: resolved?.apiKey ?? '',
+    openAiCompatBaseUrl: resolved?.baseUrl ?? '', apiKey: resolved?.apiKey ?? '', anthropicAuthType: resolved?.anthropicAuthType,
     model: resolved?.openAiModel ?? '', directModel: resolved?.openAiModel ?? '',
     contextWindow: resolved?.contextWindow, maxTokens: resolved?.maxTokens, reasoning: resolved?.reasoning };
 }

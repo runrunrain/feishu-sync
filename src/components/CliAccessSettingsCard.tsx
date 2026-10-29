@@ -14,6 +14,7 @@ import { Button } from './common/Button';
 import { StatusBadge } from './common/StatusBadge';
 import { useToast } from './common/Toast';
 import { useCliInfo } from '../hooks/useCliInfo';
+import { useSettingsDraft } from '../hooks/settingsDraft';
 import {
   APIError,
   installCliShim,
@@ -49,6 +50,8 @@ function InfoRow({ label, value, mono }: { label: string; value: string; mono?: 
 export function CliAccessSettingsCard() {
   const toast = useToast();
   const { info, loading, reload } = useCliInfo();
+  const draft = useSettingsDraft();
+  const [pendingEnabled, setPendingEnabled] = useState<boolean | null>(null);
   const [busy, setBusy] = useState<'toggle' | 'rotate' | 'shim' | null>(null);
 
   const runAction = async (
@@ -68,7 +71,12 @@ export function CliAccessSettingsCard() {
     }
   };
 
-  const enabled = info?.enabled === true;
+  const enabled = pendingEnabled ?? info?.enabled === true;
+  const setEnabled = (next: boolean) => {
+    if (!draft) { void runAction('toggle', () => setCliEnabled(next), next ? '命令行访问已开启' : '命令行访问已关闭，令牌立即失效'); return; }
+    setPendingEnabled(next === (info?.enabled === true) ? null : next);
+    draft.stageAction('命令行访问设置', next === (info?.enabled === true) ? null : async () => { await setCliEnabled(next); await reload(); setPendingEnabled(null); });
+  };
 
   return (
     <section className="rounded-md border border-line bg-card-bg shadow-sm overflow-hidden">
@@ -98,10 +106,11 @@ export function CliAccessSettingsCard() {
           <>
             <div className="flex items-center gap-3 flex-wrap">
               {enabled ? (
-                <StatusBadge status="success">已开启</StatusBadge>
+                <StatusBadge status={pendingEnabled !== null ? 'warning' : 'success'}>{pendingEnabled !== null ? '待开启' : '已开启'}</StatusBadge>
               ) : (
-                <StatusBadge status="neutral">未开启</StatusBadge>
+                <StatusBadge status={pendingEnabled !== null ? 'warning' : 'neutral'}>{pendingEnabled !== null ? '待关闭' : '未开启'}</StatusBadge>
               )}
+              {pendingEnabled !== null ? <span className="text-xs text-seal">待顶部保存后生效</span> : null}
               {enabled && info.endpointPublished ? null : enabled ? (
                 <span className="text-[11px] text-ink-faint">端点未发布（应用重启后生效）</span>
               ) : null}
@@ -111,7 +120,7 @@ export function CliAccessSettingsCard() {
                 loading={busy === 'toggle'}
                 disabled={busy !== null}
                 onClick={() =>
-                  void runAction('toggle', () => setCliEnabled(!enabled), enabled ? '命令行访问已关闭，令牌立即失效' : '命令行访问已开启')
+                  setEnabled(!enabled)
                 }
                 aria-label={enabled ? '关闭命令行访问' : '开启命令行访问'}
               >
@@ -122,7 +131,7 @@ export function CliAccessSettingsCard() {
                   size="sm"
                   variant="secondary"
                   loading={busy === 'rotate'}
-                  disabled={busy !== null}
+                  disabled={busy !== null || pendingEnabled !== null}
                   onClick={() => void runAction('rotate', () => rotateCliToken(), 'CLI 令牌已轮换（旧令牌立即失效）')}
                 >
                   <RefreshCw className="w-3.5 h-3.5" /> 轮换令牌
@@ -157,7 +166,7 @@ export function CliAccessSettingsCard() {
                   size="sm"
                   variant="secondary"
                   loading={busy === 'shim'}
-                  disabled={busy !== null || !enabled}
+                  disabled={busy !== null || !enabled || pendingEnabled !== null}
                   onClick={() => void runAction('shim', () => installCliShim(), 'shim 已生成（重新生成会覆盖）')}
                 >
                   {info.shimInstalled ? '重新生成 shim' : '生成 feishu-sync 命令'}

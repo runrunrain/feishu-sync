@@ -127,8 +127,12 @@ describe('Agent 基座选择', () => {
     setup(makeConfig({ agent: { ...agent, runtime: { backend: 'claude-code' },
       model: { ...agent.model, source: 'pi-agent-dir', piModel: 'pi/model' } }, llm: { providers: [...PROVIDERS, anthropic] } }));
     const html = renderToStaticMarkup(<AgentRuntimeSettingsCard />);
-    expect(html).toContain('Agent 基座');
+    expect(html).toContain('应用基础能力的 Agent 基座');
+    expect(html).toContain('新会话可单独选择');
     expect(html).toContain('Claude Code 路径覆盖');
+    expect(html).toContain('pi 路径覆盖');
+    expect(html).toContain('更新 Pi');
+    expect(html).toContain('更新 Claude Code');
     expect(html).toContain('预设上下文窗口用于自动压缩');
     expect(html).not.toContain('本地 Agent 配置（Pi）');
     const providerSelect = html.match(/<select[^>]*aria-label="选择提供商"[^>]*>[\s\S]*?<\/select>/)?.[0] ?? '';
@@ -242,15 +246,14 @@ describe('AgentKbSettingsCard 构建并行数（S4/S5）', () => {
 });
 
 describe('AgentKbSettingsCard 每批字数预算（P2-S3）', () => {
-  it('数字输入 + 保存按钮 + 「0 = 按源数分批」说明；SSR 初始空输入阻断保存', () => {
+  it('数字输入 + 「0 = 按源数分批」说明；保存由设置页统一处理', () => {
     setup(makeConfig());
     const html = renderToStaticMarkup(<AgentKbSettingsCard />);
     expect(html).toContain('每批字数预算');
-    // SSR 不跑 effect，输入框为空：反馈为 error 且保存按钮 disabled。
+    // SSR 不跑 effect，输入框为空：显示输入错误。
     const input = element(html, 'input', 'build-word-budget-input');
     expect(input.length).toBeGreaterThan(0);
-    const save = element(html, 'button', 'build-word-budget-save');
-    expect(save).toContain('disabled');
+    expect(element(html, 'button', 'build-word-budget-save')).toBe('');
     expect(html).toContain('data-testid="build-word-budget-feedback"');
     expect(html).toContain('请输入数字（0 或 4000–400000）');
     expect(html).toContain('0 = 按源数分批');

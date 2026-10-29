@@ -27,7 +27,7 @@ export function createClaudeProcess(options: {
   return new ClaudeCodeProcess({ executable, nodePath: options.nodePath, bridgePath,
     cwd: path.join(options.dataRoot, 'agent', 'empty-cwd'),
     sessionDir: options.sessionDir ?? path.join(options.dataRoot, 'agent', 'sessions'), sessionId: options.sessionId,
-    tools: specs.map((spec) => spec.name), model: provider.openAiModel, baseUrl: provider.baseUrl, apiKey: provider.apiKey,
+    tools: specs.map((spec) => spec.name), model: provider.openAiModel, baseUrl: provider.baseUrl, apiKey: provider.apiKey, authType: provider.anthropicAuthType,
     thinking: provider.reasoning ? options.config.agent.model.thinkingLevel : 'off',
     contextWindow: providerModelParameters(provider, options.config.agent.model).contextWindow,
     maxTokens: providerModelParameters(provider, options.config.agent.model).maxTokens,

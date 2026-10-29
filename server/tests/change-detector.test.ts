@@ -311,6 +311,27 @@ describe('ChangeDetector.compareWithLocalRecords (P2-T1 three-state)', () => {
     store = new MockLocalMapStore();
   });
 
+  it('保留遍历中消失但明确无权限的本地文档，不将其列为删除候选', async () => {
+    const rootUrl = 'https://tenant.feishu.cn/wiki/rootA';
+    store.rows.set('A', makeLocal({ objToken: 'A', wikiNodeToken: 'node-A', watchedRootId: 'rootA', watchedRootUrl: rootUrl, localMdPath: '/kb/A.md' }));
+    const detector = new ChangeDetector({ getNode: async () => { throw new Error('无权限访问该节点'); } } as any, store as any);
+    const compare = (detector as any).compareWithLocalRecords.bind(detector);
+    await compare([], { rootToken: 'rootA', watchedRootUrl: rootUrl, traversalComplete: true });
+    await compare([], { rootToken: 'rootA', watchedRootUrl: rootUrl, traversalComplete: true });
+    expect(store.rows.get('A')).toMatchObject({ syncState: 'restricted', cloudDeleted: 0, localMdPath: '/kb/A.md' });
+    expect(store.listMissingCandidates()).toHaveLength(0);
+  });
+
+  it('超时无法证明权限变化，保持待确认状态而不报告权限不足', async () => {
+    const rootUrl = 'https://tenant.feishu.cn/wiki/rootA';
+    store.rows.set('A', makeLocal({ objToken: 'A', wikiNodeToken: 'node-A', watchedRootId: 'rootA', watchedRootUrl: rootUrl }));
+    const detector = new ChangeDetector({ getNode: async () => { throw new Error('timeout'); } } as any, store as any);
+    const compare = (detector as any).compareWithLocalRecords.bind(detector);
+    await compare([], { rootToken: 'rootA', watchedRootUrl: rootUrl, traversalComplete: true });
+    await compare([], { rootToken: 'rootA', watchedRootUrl: rootUrl, traversalComplete: true });
+    expect(store.rows.get('A')).toMatchObject({ syncState: 'missing_candidate', cloudDeleted: 0 });
+  });
+
   it('identifies a brand-new cloud node as added', async () => {
     const cloud = [makeCloud({ obj_token: 'A', node_token: 'nA' })];
     const out = await runCompare(store, cloud);
@@ -1130,6 +1151,7 @@ describe('ChangeDetector.detectChanges result cache (sync-state-timeout-fix)', (
       bypassCooldown: true,
       mode: 'fast',
     });
+    expect(store.rows.get('doc-A')).toMatchObject({ syncState: 'restricted', cloudDeleted: 0 });
     await detector.detectChanges(rootUrl, {
       forceFresh: true,
       bypassCooldown: true,
@@ -1139,6 +1161,7 @@ describe('ChangeDetector.detectChanges result cache (sync-state-timeout-fix)', (
     // The metadata batch may be retried, but a permanently failing node-get
     // must not add a second detail request until its retry cooldown expires.
     expect(lark.detailCalls).toBe(1);
+    expect(store.rows.get('doc-A')?.syncState).toBe('restricted');
   });
 
   it.each(['rootA', 'node-A'])('discovers brand-new wiki nodes beneath %s in fast mode', async (newParent) => {

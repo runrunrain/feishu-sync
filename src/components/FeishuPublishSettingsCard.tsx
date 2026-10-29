@@ -3,16 +3,15 @@
  *
  *   - feishuPublish.enabled 开关（PUT /api/config；服务端合并保留 target，
  *     CLI 主体禁改由服务端强制）
- *   - 发布根设置：粘贴 Drive 文件夹 / wiki 节点 URL → PUT /api/kb/publish/target
- *     （专用端点，仅 desktop token；服务端即时双向校验——发布根在监听树内、
- *     监听树在发布根内、无法校验均拒绝并给出可读文案）
+ *   - 发布根设置：粘贴 Drive 文件夹 / wiki 节点 URL，纳入统一配置草稿。
+ *     顶部保存时服务端联合校验发布根与同步根，无法校验或存在重叠时拒绝。
  *   - 清除发布根（两步确认）
  *
  * 依赖提示：反向发布还需「飞书写入」开启 + 写权限授权（本卡只提示，
  * 授权入口在「飞书写入」卡）。
  */
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { CloudUpload, FolderTree, RefreshCw, Trash2 } from 'lucide-react';
 import { Card, CardHeader, CardBody } from './common/Card';
 import { StatusBadge } from './common/StatusBadge';
@@ -20,38 +19,39 @@ import { Button } from './common/Button';
 import { Toggle } from './common/Input';
 import { useToast } from './common/Toast';
 import { useConfig } from '../hooks/useConfig';
-import { APIError, setKbPublishTarget } from '../api/client';
+import { useSettingsDraft, useSettingsForm } from '../hooks/settingsDraft';
+import { APIError } from '../api/client';
 import { publishTargetKindLabel } from '../utils/kbPublish';
-
-/** 服务端错误码 → 附加提示（message 本身已可读，这里补操作指引）。 */
-const TARGET_ERROR_HINTS: Record<string, string> = {
-  publish_target_inside_watched_root: '发布根不能位于任何监听（同步）目录子树内：已发布内容会被同步回流，形成自我喂养回路。',
-  watched_root_inside_publish_target: '监听目录不能位于发布根内：请先更换发布根或调整监听根。',
-  publish_target_unverifiable: '无法解析该节点的祖先链（网络或权限原因）：不能证明与监听目录不重叠即拒绝配置，可改用 Drive 文件夹发布根。',
-  invalid_request: '请粘贴 Drive 文件夹链接（…/drive/folder/<token>）或知识库节点链接（…/wiki/<token>）。',
-};
 
 export function FeishuPublishSettingsCard() {
   const toast = useToast();
   const { config, updateConfig, refresh } = useConfig();
+  const draft = useSettingsDraft();
 
   const [savingToggle, setSavingToggle] = useState(false);
   const [urlInput, setUrlInput] = useState('');
-  const [savingTarget, setSavingTarget] = useState(false);
-  const [targetError, setTargetError] = useState<{ message: string; hint?: string } | null>(null);
   const [confirmingClear, setConfirmingClear] = useState(false);
-  const [clearing, setClearing] = useState(false);
 
   const publish = config?.feishuPublish;
   const enabled = publish?.enabled === true;
   const target = publish?.target ?? null;
   const feishuWriteEnabled = config?.feishuWrite?.enabled === true;
+  useEffect(() => { setUrlInput(''); }, [target?.kind, target?.token]);
+  useSettingsForm('auth-feishu-publish', () => {
+    const url = urlInput.trim();
+    if (!url) return null;
+    const drive = /\/drive\/folder\/([A-Za-z0-9]{8,64})/.exec(url);
+    const wiki = /\/wiki\/([A-Za-z0-9]{8,64})/.exec(url);
+    if (!drive && !wiki) throw new Error('飞书发布：请输入有效的 Drive 文件夹或知识库节点链接');
+    const nextTarget = { kind: drive ? 'drive_folder' as const : 'wiki_node' as const, token: (drive ?? wiki)![1], label: url.slice(0, 200) };
+    return { feishuPublish: { enabled, target: nextTarget } };
+  });
 
   const handleToggle = async (next: boolean) => {
     setSavingToggle(true);
     try {
       await updateConfig({ feishuPublish: { enabled: next } });
-      toast.push({ type: 'success', message: next ? '已开启反向发布' : '已关闭反向发布' });
+      if (!draft) toast.push({ type: 'success', message: next ? '已开启反向发布' : '已关闭反向发布' });
     } catch (err) {
       toast.push({ type: 'error', message: err instanceof APIError ? err.message : '设置保存失败' });
     } finally {
@@ -59,48 +59,13 @@ export function FeishuPublishSettingsCard() {
     }
   };
 
-  const parseTargetError = (err: unknown): { message: string; hint?: string } => {
-    if (err instanceof APIError) {
-      const code = (err.response as { error?: string } | undefined)?.error;
-      return { message: err.message, hint: code ? TARGET_ERROR_HINTS[code] : undefined };
-    }
-    return { message: '发布根保存失败' };
-  };
-
-  const saveTarget = async () => {
-    const url = urlInput.trim();
-    if (!url) return;
-    setSavingTarget(true);
-    setTargetError(null);
-    try {
-      const result = await setKbPublishTarget({ url });
-      setUrlInput('');
-      await refresh();
-      toast.push({
-        type: 'success',
-        message: result.target
-          ? `发布根已校验并保存：${publishTargetKindLabel(result.target.kind)} · ${result.target.label}`
-          : '发布根已保存',
-      });
-    } catch (err) {
-      setTargetError(parseTargetError(err));
-    } finally {
-      setSavingTarget(false);
-    }
-  };
-
   const clearTarget = async () => {
-    setClearing(true);
-    setTargetError(null);
     try {
-      await setKbPublishTarget({ target: null });
-      await refresh();
+      await updateConfig({ feishuPublish: { enabled, target: null } });
       setConfirmingClear(false);
-      toast.push({ type: 'info', message: '已清除发布根' });
+      if (!draft) toast.push({ type: 'info', message: '已清除发布根' });
     } catch (err) {
-      setTargetError(parseTargetError(err));
-    } finally {
-      setClearing(false);
+      toast.push({ type: 'error', message: err instanceof Error ? err.message : '清除发布根失败' });
     }
   };
 
@@ -144,7 +109,7 @@ export function FeishuPublishSettingsCard() {
               发布根
             </h3>
             {target ? (
-              <StatusBadge status="success" size="sm">已校验</StatusBadge>
+              <StatusBadge status={draft?.dirty ? 'warning' : 'success'} size="sm">{draft?.dirty ? '待保存与校验' : '已校验'}</StatusBadge>
             ) : (
               <StatusBadge status="warning" size="sm">未配置</StatusBadge>
             )}
@@ -158,8 +123,8 @@ export function FeishuPublishSettingsCard() {
               <div className="flex items-center gap-2 pt-1">
                 {confirmingClear ? (
                   <>
-                    <Button size="sm" variant="secondary" onClick={() => setConfirmingClear(false)} disabled={clearing}>取消</Button>
-                    <Button size="sm" onClick={() => void clearTarget()} loading={clearing}>
+                    <Button size="sm" variant="secondary" onClick={() => setConfirmingClear(false)}>取消</Button>
+                    <Button size="sm" onClick={() => void clearTarget()}>
                       <Trash2 className="w-3.5 h-3.5" />确认清除
                     </Button>
                     <span className="text-xs text-ink-faint">清除后发布功能暂停，已发布文档保留</span>
@@ -190,16 +155,7 @@ export function FeishuPublishSettingsCard() {
                 className="flex-1 min-w-0 h-8 px-3 text-xs rounded border border-line bg-card-bg text-ink placeholder:text-ink-faint focus:outline-none focus:border-seal/50"
                 spellCheck={false}
               />
-              <Button size="sm" onClick={() => void saveTarget()} loading={savingTarget} disabled={!urlInput.trim()}>
-                校验并保存
-              </Button>
             </div>
-            {targetError ? (
-              <div role="alert" className="rounded border border-seal-2/40 bg-seal-2/5 p-2 space-y-1" data-testid="publish-target-error">
-                <p className="text-xs text-seal-2 leading-relaxed">{targetError.message}</p>
-                {targetError.hint ? <p className="text-xs text-seal-2/80 leading-relaxed">{targetError.hint}</p> : null}
-              </div>
-            ) : null}
           </div>
         </div>
       </CardBody>

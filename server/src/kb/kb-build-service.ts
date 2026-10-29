@@ -91,6 +91,8 @@ interface WorkerRuntime {
 
 interface InMemoryBuild {
   id: string;
+  /** 基座在创建构建时固定，设置变更只影响之后的新构建。 */
+  backend?: 'pi' | 'claude-code';
   batchIndex: number;
   batchTotal: number;
   buildState: BuildRunState | null;
@@ -117,6 +119,13 @@ export class KbBuildService extends EventEmitter {
   constructor(deps: KbBuildDeps) {
     super();
     this.deps = deps;
+  }
+
+  private configForBuild(buildId: string): Config {
+    const current = this.deps.configProvider();
+    if (!current) throw new ToolError('invalid_request', '配置不可用');
+    const backend = this.active.get(buildId)?.backend;
+    return backend ? { ...current, agent: { ...current.agent, runtime: { ...current.agent.runtime, backend } } } : current;
   }
 
   // ------------------------------------------------------------------
@@ -313,6 +322,7 @@ export class KbBuildService extends EventEmitter {
     });
     this.active.set(buildId, {
       id: buildId,
+      backend: config.agent.runtime.backend === 'claude-code' ? 'claude-code' : 'pi',
       batchIndex: 0,
       batchTotal: 0,
       buildState: null,
@@ -383,7 +393,7 @@ export class KbBuildService extends EventEmitter {
   ): Promise<void> {
     const entry = this.active.get(buildId)!;
     this.running = true;
-    const config = this.deps.configProvider()!;
+    const config = this.configForBuild(buildId);
     const outputRoot = config.standardKb.outputRoot;
     const startedAt = new Date().toISOString();
     let stagingRootPath = this.stagingRoot(outputRoot, buildId);
@@ -966,7 +976,7 @@ export class KbBuildService extends EventEmitter {
     wordsOf: (token: string) => number;
   }): Promise<void> {
     const { entry, buildState } = input;
-    const config = this.deps.configProvider()!;
+    const config = this.configForBuild(input.buildId);
     // P2-S2：与并行路径同一 packBatches（wordBudget=0 等价旧 chunkTokens）
     const batches = packBatches(
       [...input.workset.keys()].sort(),
@@ -1120,7 +1130,7 @@ export class KbBuildService extends EventEmitter {
 
   /** 等价回退路径的运行上下文（无 worker 身份，工具行为与重构前一致）。 */
   private createBuildRunContext(buildId: string, buildState: BuildRunState): { token: string; revoke: () => void } {
-    const config = this.deps.configProvider()!;
+    const config = this.configForBuild(buildId);
     const { token } = this.deps.toolService.createRunContext({
       runKind: 'build',
       buildId,
@@ -1146,8 +1156,8 @@ export class KbBuildService extends EventEmitter {
     providerJson: string | undefined,
     pluginSnapshot: AppPluginSnapshot | undefined,
     runtime: { piPackageRoot?: string | null },
+    config: Config,
   ): NodeJS.ProcessEnv {
-    const config = this.deps.configProvider()!;
     const env = buildPiProcessEnv({
       mode: config.agent.model.source,
       parentEnv: process.env,
@@ -1178,7 +1188,7 @@ export class KbBuildService extends EventEmitter {
     pluginSnapshot?: AppPluginSnapshot,
     slotOptions: { signal?: AbortSignal; slotDeadlineMs?: number } = {},
   ): Promise<PiRpcProcess> {
-    const config = this.deps.configProvider()!;
+    const config = this.configForBuild(buildId);
     const runtime = await this.deps.resolver.resolveRuntime(config.agent);
     if (!runtime.nodePath || (config.agent.runtime.backend !== 'claude-code' && !runtime.piCliPath)) {
       throw new ToolError('agent_not_ready', 'Agent 运行时未就绪', 503);
@@ -1219,7 +1229,7 @@ export class KbBuildService extends EventEmitter {
       model = piModel;
     }
 
-    const env = this.buildPiEnv(token, apiKey, providerJson, pluginSnapshot, runtime);
+    const env = this.buildPiEnv(token, apiKey, providerJson, pluginSnapshot, runtime, config);
     const extensionPath = this.deps.extensionPath();
     const spawnOptions = {
       nodePath: runtime.nodePath,
@@ -1376,7 +1386,7 @@ export class KbBuildService extends EventEmitter {
     pluginSnapshot?: AppPluginSnapshot;
     slot?: PoolSlot;
   }): Promise<void> {
-    const config = this.deps.configProvider()!;
+    const config = this.configForBuild(input.buildId);
     const runtime = await this.deps.resolver.resolveRuntime(config.agent);
     if (!runtime.nodePath || (config.agent.runtime.backend !== 'claude-code' && !runtime.piCliPath)) {
       throw new ToolError('agent_not_ready', 'Agent 运行时未就绪', 503);

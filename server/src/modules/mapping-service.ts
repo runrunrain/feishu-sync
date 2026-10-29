@@ -616,7 +616,9 @@ export class MappingService {
       sortOrder: d.localSortOrder ?? null,
       // v0.2.0 cloud-link-coverage: expose the explicit feishu relationship.
       original_link: d.originalLink ?? null,
-      cloud_match: (d.cloudMatch ?? 'unknown') as
+      cloud_match: (d.syncState === 'restricted' || (d.syncState === 'feishu_pending' && d.lastSyncErrorCode === 'permission_denied')
+        ? 'restricted'
+        : d.syncState && d.cloudMatch === 'restricted' ? (d.localMdPath ? 'synced' : 'unknown') : d.cloudMatch ?? 'unknown') as
         | 'synced'
         | 'restricted'
         | 'unknown',

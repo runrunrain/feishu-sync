@@ -95,6 +95,7 @@ export default async function feishuSyncAgentExtension(/** @type {ExtensionAPI} 
       name: 'feishu-sync LLM',
       baseUrl: descriptor.baseUrl,
       apiKey: `$${API_KEY_ENV}`,
+      ...(descriptor.authHeader === true ? { authHeader: true } : {}),
       api,
       models: (descriptor.models || []).map((model) => ({
         type: 'chat',

@@ -648,6 +648,13 @@ describe('MappingService.getTreeDetailed (v0.2.0 structure-align Phase B)', () =
     });
   });
 
+  it('keeps permission-restricted local documents in both views and clears the badge after recovery', () => {
+    store.rows.set('R', makeDoc({ objToken: 'R', wikiNodeToken: 'WR', title: '本地文档', localMdPath: '/kb/local.md', cloudMatch: 'synced', syncState: 'restricted', cloudDeleted: 0 }));
+    for (const view of ['feishu', 'local'] as const) expect(svc.getTreeDetailed({ view }).nodes).toContainEqual(expect.objectContaining({ obj_token: 'R', title: '本地文档', local_path: '/kb/local.md', cloud_match: 'restricted' }));
+    store.rows.set('R', makeDoc({ objToken: 'R', wikiNodeToken: 'WR', title: '本地文档', localMdPath: '/kb/local.md', cloudMatch: 'restricted', syncState: 'synced', cloudDeleted: 0 }));
+    expect(svc.getTreeDetailed({ view: 'feishu' }).nodes[0].cloud_match).toBe('synced');
+  });
+
   it('feishu view filters out placeholder nodes (empty title with wiki_node_token)', () => {
     // Placeholder rows come from change-detector.upsertDocumentSeen's
     // permission-restricted branch: they have a non-empty wiki_node_token

@@ -40,6 +40,7 @@ export function buildAppLlmRunConfig(
     providerJson: JSON.stringify({
       baseUrl: resolution.baseUrl,
       api: resolution.protocol,
+      ...(resolution.protocol === 'anthropic-messages' && resolution.anthropicAuthType === 'auth-token' ? { authHeader: true } : {}),
       models: [{
         id: resolution.openAiModel,
         ...providerModelParameters(resolution, agent.model),

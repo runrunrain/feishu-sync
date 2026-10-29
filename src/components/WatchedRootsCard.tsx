@@ -27,11 +27,11 @@ import { Button } from './common/Button';
 import { Input, Toggle } from './common/Input';
 import { useToast } from './common/Toast';
 import { useConfig } from '../hooks/useConfig';
+import { useSettingsForm } from '../hooks/settingsDraft';
 import { getMappingIndex } from '../api/client';
 import { normalizeFeishuUrl, extractWikiRootId } from '../utils/feishu-url';
 import { appLogger } from '../utils/appLogger';
 import type {
-  Config,
   IndexSnapshot,
   WatchedRoot,
   WatchedRootConfig,
@@ -120,21 +120,22 @@ function rowDisplayName(row: RootRow): string {
 }
 
 export function WatchedRootsCard() {
-  const { config, saving, updateConfig } = useConfig();
+  const { config } = useConfig();
   const toast = useToast();
   const [localRoots, setLocalRoots] = useState<WatchedRootConfig[]>([]);
   const [snapshot, setSnapshot] = useState<IndexSnapshot | null>(null);
   const [loadingSnapshot, setLoadingSnapshot] = useState(false);
   // 子页侧边栏：当前选中的根目录下标（增删后钳位）。
   const [selectedIndex, setSelectedIndex] = useState(0);
+  const configuredRoots = config?.watchedRoots;
 
   useEffect(() => {
-    if (config) {
-      const roots = config.watchedRoots ?? [];
+    if (configuredRoots) {
+      const roots = configuredRoots;
       setLocalRoots(roots.length > 0 ? roots : [createEmptyRoot()]);
       setSelectedIndex(0);
     }
-  }, [config]);
+  }, [configuredRoots]);
 
   const fetchSnapshot = async () => {
     setLoadingSnapshot(true);
@@ -209,8 +210,9 @@ export function WatchedRootsCard() {
     }
   };
 
-  const handleSave = async () => {
+  useSettingsForm('kb-roots', () => {
     const draftRoots = localRoots.filter((root) => root.url.trim() || root.localDir.trim());
+    if (!config || JSON.stringify(draftRoots) === JSON.stringify(config.watchedRoots ?? [])) return null;
     const normalizedRoots: WatchedRootConfig[] = [];
     const ids = new Set<string>();
 
@@ -219,26 +221,15 @@ export function WatchedRootsCard() {
       const id = normalizedUrl.isValid ? extractWikiRootId(normalizedUrl.canonical) : null;
       const localDir = root.localDir.trim().replace(/\\/g, '/').replace(/\/+$/g, '');
       if (!id) {
-        toast.push({
-          type: 'warning',
-          message: '存在无效的飞书根 URL',
-          hint: '必须是 https://<租户>.feishu.cn/wiki/<token>，且每行都需要有效 URL。',
-        });
-        return;
+        throw new Error('同步根目录：存在无效的飞书根 URL，必须是 https://<租户>.feishu.cn/wiki/<token>');
       }
       if (localDir && (localDir.startsWith('/') || /^[A-Za-z]:\//.test(localDir) || localDir.split('/').some(
         (segment) => !segment || segment === '.' || segment === '..' || segment.endsWith('.'),
       ))) {
-        toast.push({
-          type: 'warning',
-          message: '本地目录必须是知识库根目录下的相对路径',
-          hint: '例如“技术 - Dev”；不能使用绝对路径或 ..。留空则按根节点标题自动命名。',
-        });
-        return;
+        throw new Error('同步根目录：本地目录必须是知识库根目录下的相对路径');
       }
       if (ids.has(id)) {
-        toast.push({ type: 'warning', message: '同一个飞书根目录不能重复配置', hint: id });
-        return;
+        throw new Error('同步根目录：同一个飞书根目录不能重复配置');
       }
       ids.add(id);
       normalizedRoots.push({
@@ -250,33 +241,8 @@ export function WatchedRootsCard() {
       });
     }
 
-    try {
-      // Never resend `llm`: GET returns a masked api key. Structured roots
-      // are validated again by ConfigManager before anything is persisted.
-      // localDir 留空的 root 由服务端按根节点标题自动命名（2026-09-04），
-      // 保存后用服务端返回值回填表单，展示自动生成的目录名。
-      const patch: Partial<Config> = { watchedRoots: normalizedRoots };
-      const updated = await updateConfig(patch);
-      const savedRoots: WatchedRootConfig[] = updated?.watchedRoots ?? normalizedRoots;
-      setLocalRoots(savedRoots.length > 0 ? savedRoots : [createEmptyRoot()]);
-      setSelectedIndex(0);
-      const autoNamed = savedRoots.filter((root) =>
-        !normalizedRoots.some((draft) => draft.id === root.id && draft.localDir));
-      toast.push({
-        type: 'success',
-        message: `已保存（${savedRoots.length} 个 watchedRoot）`,
-        hint: autoNamed.length > 0
-          ? `自动命名目录：${autoNamed.map((r) => r.localDir).join('、')}`
-          : '启用的根目录会在下次「立即检测」或轮询时参与同步。',
-      });
-    } catch (err) {
-      toast.push({
-        type: 'error',
-        message: '保存 watchedRoots 失败',
-        hint: err instanceof Error ? err.message : '',
-      });
-    }
-  };
+    return { watchedRoots: normalizedRoots };
+  });
 
   return (
     <Card variant="elevated">
@@ -289,7 +255,6 @@ export function WatchedRootsCard() {
             {summary.disabled > 0 && ` · ${summary.disabled} 已停用`}
             {summary.errored > 0 && ` · ${summary.errored} 错误`}
           </span>
-          <Button size="sm" onClick={handleSave} loading={saving}>保存同步根目录</Button>
         </div>
       </CardHeader>
       <CardBody className="space-y-4">

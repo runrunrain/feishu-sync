@@ -19,11 +19,13 @@ interface ModalProps {
   children: React.ReactNode;
   /** 内容区最大宽度（Tailwind class），缺省 max-w-md。 */
   contentClassName?: string;
+  /** 内容区布局；默认可滚动，复杂弹窗可自行管理内部滚动区域。 */
+  bodyClassName?: string;
   /** 遮罩层 z-index class，缺省 z-50；需浮在 Drawer(z-[350]) 之上时传 z-[400]。 */
   zIndexClass?: string;
 }
 
-export function Modal({ open, title, onClose, children, contentClassName = 'max-w-md', zIndexClass = 'z-50' }: ModalProps) {
+export function Modal({ open, title, onClose, children, contentClassName = 'max-w-md', bodyClassName = 'overflow-y-auto', zIndexClass = 'z-50' }: ModalProps) {
   useEffect(() => {
     if (!open || !onClose) return;
     const handler = (e: KeyboardEvent) => {
@@ -52,7 +54,7 @@ export function Modal({ open, title, onClose, children, contentClassName = 'max-
         <div className="px-4 py-3 shrink-0 border-b border-line">
           <h3 className="text-base font-kai font-medium text-ink">{title}</h3>
         </div>
-        <div className="p-4 min-h-0 overflow-y-auto scrollbar-thin">{children}</div>
+        <div className={`p-4 min-h-0 scrollbar-thin ${bodyClassName}`}>{children}</div>
       </div>
     </div>
   );

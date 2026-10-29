@@ -39,6 +39,7 @@ let dataRoot: string;
 let kbRoot: string;      // 原始知识库根（模拟）
 let outputRoot: string;  // 标准库输出
 let store: LocalMapStore;
+const openedStores: LocalMapStore[] = [];
 
 function docRecord(overrides: Partial<DocumentRecord> & { objToken: string; localRelPath: string }): DocumentRecord {
   return {
@@ -59,10 +60,12 @@ beforeAll(() => {
   outputRoot = path.join(dataRoot, 'standard-kb');
   fs.mkdirSync(path.join(dataRoot, 'agent'), { recursive: true });
   store = new LocalMapStore(path.join(dataRoot, 'feishu-sync.db'));
+  openedStores.push(store);
   store.initialize();
 });
 
 afterAll(() => {
+  for (const opened of openedStores) opened.close();
   fs.rmSync(dataRoot, { recursive: true, force: true });
   fs.rmSync(kbRoot, { recursive: true, force: true });
 });
@@ -336,6 +339,7 @@ describe('发布原子性与对账（§6.5 publishing / §5.3）', () => {
     // 模拟：指针已指向 r_test1，但 DB 无该 published 记录
     const svc = makeService();
     const freshStore = new LocalMapStore(path.join(dataRoot, 'reconcile.db'));
+    openedStores.push(freshStore);
     freshStore.initialize();
     freshStore.createKbBuild({
       id: 'b_orphan', mode: 'full', status: 'running',
@@ -616,6 +620,7 @@ describe('F3-R09：对账 upsert（同 buildId 行 UPDATE 而非撞 PK 吞错）
     const buildId = String(manifest.buildId);
     for (const stale of ['publishing', 'failed', 'interrupted'] as const) {
       const freshStore = new LocalMapStore(path.join(dataRoot, `reconcile-upsert-${stale}.db`));
+      openedStores.push(freshStore);
       freshStore.initialize();
       freshStore.createKbBuild({
         id: buildId, mode: 'full', status: stale,

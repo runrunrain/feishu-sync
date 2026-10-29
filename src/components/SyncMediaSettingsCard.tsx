@@ -22,6 +22,7 @@ import { Button } from './common/Button';
 import { Toggle } from './common/Input';
 import { useToast } from './common/Toast';
 import { useConfig } from '../hooks/useConfig';
+import { useSettingsDraft, useSettingsForm } from '../hooks/settingsDraft';
 import { useAuthStatus } from '../hooks/useAuthStatus';
 import { APIError } from '../api/client';
 
@@ -55,12 +56,12 @@ export function describeSvgTimeoutInput(
 export function SyncMediaSettingsCard() {
   const toast = useToast();
   const { config, updateConfig, saving } = useConfig();
+  const draft = useSettingsDraft();
   const { authStatus, loading: authLoading, refresh } = useAuthStatus(0);
 
   const [savingSlides, setSavingSlides] = useState(false);
   const [savingWb, setSavingWb] = useState(false);
   const [svgTimeoutInput, setSvgTimeoutInput] = useState('');
-  const [savingSvgTimeout, setSavingSvgTimeout] = useState(false);
 
   useEffect(() => {
     const value = config?.sync?.whiteboardExport?.svgTimeoutMs;
@@ -81,7 +82,7 @@ export function SyncMediaSettingsCard() {
     setSavingSlides(true);
     try {
       await updateConfig({ sync: { slidesScreenshot: { enabled: next } } });
-      toast.push({ type: 'success', message: next ? '已开启幻灯片整页截图' : '已关闭幻灯片整页截图' });
+      if (!draft) toast.push({ type: 'success', message: next ? '已开启幻灯片整页截图' : '已关闭幻灯片整页截图' });
     } catch (err) {
       toast.push({ type: 'error', message: err instanceof APIError ? err.message : '设置保存失败' });
     } finally {
@@ -93,7 +94,7 @@ export function SyncMediaSettingsCard() {
     setSavingWb(true);
     try {
       await updateConfig({ sync: { whiteboardExport: { enabled: next } } });
-      toast.push({ type: 'success', message: next ? '已开启白板矢量导出' : '已关闭白板矢量导出' });
+      if (!draft) toast.push({ type: 'success', message: next ? '已开启白板矢量导出' : '已关闭白板矢量导出' });
     } catch (err) {
       toast.push({ type: 'error', message: err instanceof APIError ? err.message : '设置保存失败' });
     } finally {
@@ -102,29 +103,14 @@ export function SyncMediaSettingsCard() {
   };
 
   const svgTimeoutFeedback = describeSvgTimeoutInput(svgTimeoutInput, wbSvgTimeout !== undefined);
-  const saveSvgTimeout = async () => {
+  useSettingsForm('kb-sync-media', () => {
     const trimmed = svgTimeoutInput.trim();
-    if (!trimmed) {
-      toast.push({ type: 'info', message: '留空即保留现值，无需保存' });
-      return;
-    }
+    if (!trimmed) return null;
     const value = Number(trimmed);
-    if (!Number.isInteger(value) || value <= 0) {
-      toast.push({ type: 'warning', message: '请输入正整数（毫秒）' });
-      return;
-    }
-    setSavingSvgTimeout(true);
-    try {
-      // server 对 whiteboardExport 子段是 spread merge；显式携带当前 enabled，
-      // 避免依赖「省略键保留旧值」的合并细节。
-      await updateConfig({ sync: { whiteboardExport: { enabled: wbEnabled, svgTimeoutMs: value } } });
-      toast.push({ type: 'success', message: 'SVG 导出超时已保存' });
-    } catch (err) {
-      toast.push({ type: 'error', message: err instanceof APIError ? err.message : '设置保存失败' });
-    } finally {
-      setSavingSvgTimeout(false);
-    }
-  };
+    if (!Number.isInteger(value) || value <= 0) throw new Error('同步媒体选项：SVG 导出超时请输入正整数（毫秒）');
+    if (value === wbSvgTimeout) return null;
+    return { sync: { whiteboardExport: { enabled: wbEnabled, svgTimeoutMs: value } } };
+  });
 
   return (
     <Card variant="elevated">
@@ -207,23 +193,12 @@ export function SyncMediaSettingsCard() {
                     step={1000}
                     className="w-full h-9 px-3 rounded-md border border-line bg-card-bg text-sm text-ink font-mono focus:outline-none focus:border-seal/50"
                     value={svgTimeoutInput}
-                    disabled={savingSvgTimeout}
                     onChange={(e) => setSvgTimeoutInput(e.target.value)}
                     placeholder={String(WHITEBOARD_SVG_TIMEOUT_DEFAULT_MS)}
                     aria-label="SVG 导出超时毫秒数"
                     data-testid="whiteboard-svg-timeout-input"
                   />
                 </div>
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  loading={savingSvgTimeout}
-                  disabled={svgTimeoutFeedback.level === 'error'}
-                  onClick={saveSvgTimeout}
-                  className="shrink-0 whitespace-nowrap mt-7"
-                >
-                  保存
-                </Button>
               </div>
               <p
                 className={`mt-1 text-xs font-serif ${svgTimeoutFeedback.level === 'error' ? 'text-seal-2' : 'text-ink-faint'}`}

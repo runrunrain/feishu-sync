@@ -11,9 +11,10 @@
  * 服务端真相源单一、前端副本最终一致。
  */
 
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useContext } from 'react';
 import { getConfig, saveConfig, APIError, type ConfigUpdate } from '../api/client';
 import type { Config } from '../types';
+import { SettingsDraftContext } from './settingsDraft';
 
 export const CONFIG_UPDATED_EVENT = 'feishu-sync:config-updated';
 
@@ -29,6 +30,8 @@ interface UseConfigResult {
 }
 
 export function useConfig(): UseConfigResult {
+  const draft = useContext(SettingsDraftContext);
+  const isDraft = draft !== null;
   const [config, setConfig] = useState<Config | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -84,20 +87,22 @@ export function useConfig(): UseConfigResult {
   }, [loadConfig]);
 
   useEffect(() => {
+    if (isDraft) return;
     loadConfig();
-  }, [loadConfig]);
+  }, [loadConfig, isDraft]);
 
   // 跨实例同步：任一组件保存配置后广播事件，本实例重新拉取服务端
   // 真相源（避免各副本漂移；详见文件头注释）。
   useEffect(() => {
+    if (isDraft) return;
     const handler = () => {
       void loadConfig();
     };
     window.addEventListener(CONFIG_UPDATED_EVENT, handler);
     return () => window.removeEventListener(CONFIG_UPDATED_EVENT, handler);
-  }, [loadConfig]);
+  }, [loadConfig, isDraft]);
 
-  return {
+  return draft ?? {
     config,
     loading,
     error,

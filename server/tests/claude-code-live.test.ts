@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
+import { execFileSync } from 'node:child_process';
 import Database from 'better-sqlite3';
 import type { AddressInfo } from 'node:net';
 import { ClaudeCodeProcess } from '../src/agent/claude-code-process.js';
@@ -258,4 +259,10 @@ describe('Claude Code with an app-configured Anthropic provider', () => {
     }
   }, 60_000);
 });
-function processExecPath() { return globalThis.process.execPath; }
+function processExecPath() {
+  // SQLite tests can run under Electron's ABI; the tool bridge still needs
+  // the external Node runtime used by the application in production.
+  return process.versions.electron
+    ? execFileSync(process.platform === 'win32' ? 'node.exe' : 'node', ['-p', 'process.execPath'], { encoding: 'utf8', windowsHide: true }).trim()
+    : process.execPath;
+}

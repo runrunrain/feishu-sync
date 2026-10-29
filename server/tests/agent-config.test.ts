@@ -108,12 +108,14 @@ describe('updateConfig 校验', () => {
     const config = await manager.load();
     config.llm.providers = [{ id: 'dual', name: 'Dual', enabled: true, protocol: 'openai-completions',
       openAiCompatBaseUrl: 'https://example.com/v1', apiKey: 'test-key', openAiProtocol: 'openai-responses', protocolBaseUrls: { 'anthropic-messages': 'https://example.com/anthropic' },
-      models: [{ id: 'model', name: 'Model', openAiModel: 'model', enabled: true }] }];
+      anthropicAuthType: 'auth-token', models: [{ id: 'model', name: 'Model', openAiModel: 'model', enabled: true }] }];
     await manager.updateConfig({ llm: config.llm });
     const provider = (await manager.load()).llm.providers?.[0];
     expect(provider?.protocol).toBe('openai-completions');
     expect(provider?.openAiProtocol).toBe('openai-responses');
+    expect(provider?.anthropicAuthType).toBe('auth-token');
     expect(provider?.protocolBaseUrls?.['anthropic-messages']).toBe('https://example.com/anthropic');
+    await expect(manager.updateConfig({ llm: { providers: [{ ...provider!, anthropicAuthType: 'unsupported' as never }] } })).rejects.toThrow(/anthropicAuthType/);
   });
 
   it('切换 Claude 基座时保留 Pi 模型来源，拒绝未知基座', async () => {

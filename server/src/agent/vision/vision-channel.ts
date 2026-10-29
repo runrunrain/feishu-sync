@@ -19,7 +19,7 @@
 
 import Anthropic from '@anthropic-ai/sdk';
 import OpenAI from 'openai';
-import { providerModelParameters, type ModelSelection } from '../../modules/model-selection.js';
+import { anthropicClientAuth, providerModelParameters, type ModelSelection } from '../../modules/model-selection.js';
 import { resolveActiveLlmConfig, type LlmConfig } from '../../modules/content-backend.js';
 
 export type VisionImageMime = 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp';
@@ -211,7 +211,7 @@ export class VisionChannel {
 
   private getAnthropic(): Anthropic {
     this.anthropic ??= new Anthropic({
-      apiKey: this.llm.apiKey,
+      ...anthropicClientAuth(this.llm),
       baseURL: this.llm.openAiCompatBaseUrl,
       maxRetries: 0,
     });

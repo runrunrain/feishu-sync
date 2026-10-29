@@ -47,7 +47,7 @@ describe('FeishuPublishSettingsCard', () => {
     expect(html).toContain('未配置');
     expect(html).toContain('发布根必须位于所有监听（同步）目录之外');
     expect(html).toContain('publish-target-url');
-    expect(html).toContain('校验并保存');
+    expect(html).not.toContain('校验并保存');
   });
 
   it('已配置发布根：展示 kind/label/token 与清除入口', () => {

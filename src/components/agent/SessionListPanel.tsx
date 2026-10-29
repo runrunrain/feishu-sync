@@ -25,7 +25,7 @@ interface SessionListPanelProps {
   loading: boolean;
   activeId: string | null;
   onSelect: (id: string) => void;
-  onCreate: () => Promise<AgentSessionDto | null>;
+  onCreate: () => void;
   onRename: (id: string, title: string) => Promise<boolean>;
   onDelete: (id: string) => Promise<boolean>;
 }
@@ -46,7 +46,6 @@ export function SessionListPanel({
   onRename,
   onDelete,
 }: SessionListPanelProps) {
-  const [creating, setCreating] = useState(false);
   const [renaming, setRenaming] = useState<AgentSessionDto | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [renameBusy, setRenameBusy] = useState(false);
@@ -72,18 +71,11 @@ export function SessionListPanel({
     if (ok) setRenaming(null);
   };
 
-  const handleCreate = async () => {
-    if (creating) return;
-    setCreating(true);
-    await onCreate();
-    setCreating(false);
-  };
-
   return (
     <div className="flex flex-col h-full min-h-0" data-testid="agent-session-list">
       <div className="flex items-center justify-between px-3 py-2.5 border-b border-line/60 shrink-0">
         <span className="text-sm font-kai font-medium text-ink">会话</span>
-        <Button size="sm" variant="ghost" onClick={() => void handleCreate()} loading={creating} aria-label="新建会话">
+        <Button size="sm" variant="ghost" onClick={onCreate} aria-label="新建会话">
           <Plus className="w-4 h-4" />
           新建
         </Button>
@@ -104,7 +96,7 @@ export function SessionListPanel({
               <br />
               新建一个，开始与 Agent 讨论设计。
             </p>
-            <Button size="sm" variant="secondary" className="mt-3" onClick={() => void handleCreate()} loading={creating}>
+            <Button size="sm" variant="secondary" className="mt-3" onClick={onCreate}>
               新建会话
             </Button>
           </div>

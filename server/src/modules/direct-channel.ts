@@ -1,5 +1,5 @@
 import Anthropic from '@anthropic-ai/sdk';
-import { providerModelParameters, type ModelSelection } from './model-selection.js';
+import { anthropicClientAuth, providerModelParameters, type ModelSelection } from './model-selection.js';
 /** Source document adaptation via the selected provider's native SDK protocol.
  * Preserves the DirectChannel contract, prompt, timeout and deterministic sync fallback.
  */
@@ -90,7 +90,7 @@ export class DirectChannel implements ContentBackend {
       const reasoning = this.llm.reasoning && effort;
       const emit = (text: string) => { if (text) { adaptedMarkdown += text; if (wantStreaming) options.onProgress?.(text); } };
       if (protocol === 'anthropic-messages') {
-        this.anthropic ??= new Anthropic({ apiKey: this.llm.apiKey, baseURL: this.llm.openAiCompatBaseUrl, maxRetries: 0 });
+        this.anthropic ??= new Anthropic({ ...anthropicClientAuth(this.llm), baseURL: this.llm.openAiCompatBaseUrl, maxRetries: 0 });
         const params: Anthropic.MessageCreateParamsNonStreaming = {
           model, max_tokens: maxTokens, messages: [{ role: 'user', content: prompt }],
           ...(reasoning ? { thinking: { type: 'enabled', budget_tokens: Math.max(1024, Math.min(maxTokens - 1, effort === 'high' ? 8192 : effort === 'medium' ? 4096 : 1024)) } as const } : { temperature: options.temperature }),
