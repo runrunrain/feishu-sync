@@ -80,6 +80,7 @@ export function BuiltinContextsEditor() {
     finally { setBusy(false); }
   };
   const select = (plugin: AgentContextPlugin) => setSelectedId(plugin.id);
+  const orchestration = drafts.orchestration ?? registry?.plugins.find((plugin) => plugin.id === 'orchestration');
   return <section className="rounded-md border border-line bg-card-bg shadow-sm overflow-hidden">
     <header className="px-4 py-3 border-b border-line/70 space-y-2">
       <div className="flex items-center gap-2 flex-wrap">
@@ -87,6 +88,7 @@ export function BuiltinContextsEditor() {
         <Button size="sm" variant="secondary" disabled={busy || dirty} onClick={() => void reload()}><RefreshCw className="w-3.5 h-3.5" />刷新</Button>
         <Button size="sm" disabled={busy || !registry || Boolean(drafts.new)} onClick={() => { setDraft(fresh()); setSelectedId('new'); }}><Plus className="w-3.5 h-3.5" />新增配置项</Button>
       </div>
+      {orchestration && <label className="flex items-center gap-2 text-xs text-ink-soft"><input type="checkbox" checked={orchestration.enabled} onChange={(event) => setDraft({ ...orchestration, enabled: event.target.checked })} />启用任务编排（每会话最多 5 个未完成任务）</label>}
       <p className="text-xs text-ink-faint leading-relaxed">这里管理知识库工作台插件的对话、Work、构建规则与文风配置。可调整内容与适用范围，保存后下次对话或构建生效。</p>
     </header>
     <div className="mx-4 mt-3 rounded border border-line bg-paper/50 px-3 py-2 text-xs text-ink-soft flex items-start gap-2">

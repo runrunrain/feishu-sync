@@ -552,18 +552,17 @@ describe('假 pi 状态机（§5.5 验收行）', () => {
 });
 
 describe('编排开关（AppPluginStore orchestration 条目）', () => {
-  it('默认停用、可启用；frozenSnapshot 按 revision 复用快照文件', () => {
+  it('默认启用、可停用；frozenSnapshot 按 revision 复用快照文件', () => {
     const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-plugins-6-'));
     temporaryRoots.push(dataRoot);
     const store = new AppPluginStore(dataRoot);
     const list = store.list();
     const orchestration = list.plugins.find((plugin) => plugin.id === 'orchestration');
-    expect(orchestration).toMatchObject({ builtin: true, enabled: false, kind: 'context' });
+    expect(orchestration).toMatchObject({ builtin: true, enabled: true, kind: 'context' });
     expect(orchestration?.scopes).toEqual(['discuss', 'work']);
     expect(orchestration?.content).toContain('task_submit');
-    // 启用（沿用插件 overrides 面）
-    const enabled = store.mutate('update', 'orchestration', list.revision, { enabled: true });
-    expect(enabled.plugins.find((plugin) => plugin.id === 'orchestration')?.enabled).toBe(true);
+    const disabled = store.mutate('update', 'orchestration', list.revision, { enabled: false });
+    expect(disabled.plugins.find((plugin) => plugin.id === 'orchestration')?.enabled).toBe(false);
     // frozenSnapshot：未知 revision → null；真实 snapshot revision → 文件存在
     expect(store.frozenSnapshot('work', 'deadbeef')).toBeNull();
     const snapshot = store.snapshot('work');

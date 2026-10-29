@@ -70,7 +70,7 @@ describe('应用专属Pi上下文插件', () => {
     expect(fs.readFileSync(build.path, 'utf8')).toContain('BUILD_RULES');
     expect(fs.readFileSync(build.path, 'utf8')).not.toContain('DISCUSS_V2');
     const next = f.store.list(); f.store.mutate('update', 'discuss-context', next.revision, { enabled: false });
-    expect(JSON.parse(fs.readFileSync(f.store.snapshot('discuss').path, 'utf8')).plugins).toEqual([]);
+    expect(JSON.parse(fs.readFileSync(f.store.snapshot('discuss').path, 'utf8')).plugins.map((p: { id: string }) => p.id)).toEqual(['orchestration']);
     expect(checkRootOverlap(path.dirname(first.path), { dataRoot: f.data, knowledgeBaseRoot: '', outputRoot: '' }).ok).toBe(false);
   });
 

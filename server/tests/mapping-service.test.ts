@@ -45,6 +45,20 @@ it('lists synced CSV-only sheets for XLSX repair until an XLSX exists', () => {
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+it('shows identity-matched local paths for permission-restricted documents without changing the saved record', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'restricted-tree-'));
+  try {
+    const file = path.join(root, '旧名称.md');
+    fs.writeFileSync(file, '<!--\r\nfeishu_sync:\r\n  obj_token: "DOC"\r\n  wiki_node_token: "WIKI"\r\n-->\r\n# 内容');
+    const store = new MockLocalMapStore();
+    store.rows.set('DOC', makeDoc({ objToken: 'DOC', wikiNodeToken: 'WIKI', localMdPath: '', syncState: 'feishu_pending', lastSyncErrorCode: 'permission_denied' }));
+    const svc = new MappingService(new MockChangeDetector() as any, store as any, new MockSnapshotService() as any, { getConfig: () => ({ knowledgeBaseRoot: root }) } as any);
+    const node = svc.getTreeDetailed({ view: 'feishu' }).nodes[0];
+    expect(node).toMatchObject({ obj_token: 'DOC', local_path: file, cloud_match: 'restricted' });
+    expect(store.rows.get('DOC')?.localMdPath).toBe('');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 // ---------------------------------------------------------------------------
 // Mocks
 // ---------------------------------------------------------------------------

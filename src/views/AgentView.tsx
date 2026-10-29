@@ -12,9 +12,6 @@
 
 import { useEffect, useRef, useState } from 'react';
 import {
-  Hammer,
-  PanelRightClose,
-  PanelRightOpen,
   PlugZap,
   RefreshCw,
   Wifi,
@@ -24,15 +21,14 @@ import { SessionListPanel } from '../components/agent/SessionListPanel';
 import { MessageStream } from '../components/agent/MessageStream';
 import { AgentComposer } from '../components/agent/AgentComposer';
 import { AgentModePanel } from '../components/agent/AgentModePanel';
-import { TaskPanel } from '../components/agent/TaskPanel';
 import { useToast } from '../components/common/Toast';
 import { Button } from '../components/common/Button';
 import { Modal } from '../components/common/Modal';
 import { useSessionAgentStatus } from '../hooks/useSessionAgentStatus';
 import { useAgentSessions } from '../hooks/useAgentSessions';
-import { useAgentOrchestration } from '../hooks/useAgentOrchestration';
 import { describeReadinessCode as describeReadiness } from '../utils/agentReadiness';
-import type { AgentBackend } from '../types/agent';
+import type { AgentBackend, AgentWorkspaceConfig } from '../types/agent';
+import { addAgentWorkspace, listAgentWorkspaces } from '../api/client';
 
 interface AgentViewProps {
   active?: boolean;
@@ -46,23 +42,28 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
   const [createOpen, setCreateOpen] = useState(false);
   const [createFailed, setCreateFailed] = useState(false);
   const createLock = useRef(false);
-  const [panelOpen, setPanelOpen] = useState(() => window.innerWidth >= 1280);
-  useEffect(() => { const resize = () => { if (window.innerWidth < 1280) setPanelOpen(false); }; resize(); window.addEventListener('resize', resize); return () => window.removeEventListener('resize', resize); }, []);
+  const [workspaces, setWorkspaces] = useState<AgentWorkspaceConfig[]>([]);
+  const [createWorkspace, setCreateWorkspace] = useState(false);
+  const [workspaceName, setWorkspaceName] = useState('');
+  const [workspacePath, setWorkspacePath] = useState('');
+  const [workspaceBusy, setWorkspaceBusy] = useState(false);
+  const [workspaceError, setWorkspaceError] = useState('');
+  const [targetWorkspace, setTargetWorkspace] = useState<string | undefined>();
+  useEffect(() => { if (active) void listAgentWorkspaces().then(setWorkspaces).catch(() => {}); }, [active]);
   useEffect(() => { if (!active) setCreateOpen(false); }, [active]);
 
   const session = sessions.activeSession;
   const agent = useSessionAgentStatus(session, active);
-  const orchestration = useAgentOrchestration(active);
   const readiness = agent.status ? describeReadiness(agent.status.code, agent.status) : null;
   const isWork = session?.mode === 'work';
   const running = session?.state === 'streaming' || session?.state === 'starting';
 
-  const openCreate = () => { setCreateFailed(false); setCreateOpen(true); };
+  const openCreate = (workspaceId?: string) => { setTargetWorkspace(workspaceId); setCreateFailed(false); setCreateOpen(true); };
   const createWithBackend = async (backend: AgentBackend) => {
     if (createLock.current) return;
     createLock.current = true; setCreatingSession(true); setCreateFailed(false);
     try {
-      const created = await sessions.createSession(backend);
+      const created = targetWorkspace ? await sessions.createSession(backend, targetWorkspace) : await sessions.createSession(backend);
       if (created) setCreateOpen(false); else setCreateFailed(true);
     } finally { createLock.current = false; setCreatingSession(false); }
   };
@@ -78,7 +79,7 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
 
   return (
     <div
-      className={`relative h-full min-h-0 min-w-0 grid grid-cols-1 gap-3 lg:grid-cols-[200px_minmax(0,1fr)] ${panelOpen ? 'xl:grid-cols-[200px_minmax(0,1fr)_280px]' : ''}`}
+      className="relative h-full min-h-0 min-w-0 grid grid-cols-1 gap-3 lg:grid-cols-[200px_minmax(0,1fr)]"
       data-view="agent"
     >
       {/* 左：会话列表 */}
@@ -89,6 +90,9 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
           activeId={sessions.activeId}
           onSelect={sessions.selecting}
           onCreate={openCreate}
+          workspaces={workspaces}
+          workspaceMode={isWork}
+          onAddWorkspace={() => { setWorkspaceError(''); setCreateWorkspace(true); }}
           onRename={sessions.renameSession}
           onDelete={sessions.removeSession}
         />
@@ -112,16 +116,12 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
             ) : null}
           </div>
 
-          {isWork ? (
-            <span className="shrink-0 inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] border border-[rgba(180,83,9,0.35)] text-[#92580c] bg-[rgba(180,83,9,0.06)]">
-              <Hammer className="w-3 h-3" /> Work
-            </span>
-          ) : null}
+          <AgentModePanel session={session} busy={running} onSwitchMode={sessions.switchMode} writeRecords={sessions.writeRecords} onWorkspacesChanged={() => { void listAgentWorkspaces().then(setWorkspaces).catch(() => {}); sessions.refreshSessions(); }} />
 
           <div className="flex items-center gap-1 lg:hidden">
             <select aria-label="选择会话" className="max-w-[90px] rounded border border-line bg-card-bg px-1 py-1 text-[11px] text-ink-soft" value={sessions.activeId ?? ''} onChange={(e) => sessions.selecting(e.target.value)}>
               <option value="" disabled>选择会话</option>{sessions.sessions.map((s) => <option key={s.id} value={s.id}>{s.title}</option>)}
-            </select><button className="px-1 text-xs text-seal" onClick={openCreate} aria-label="新建会话">新建</button>
+            </select><button className="px-1 text-xs text-seal" onClick={() => openCreate()} aria-label="新建会话">新建</button>
           </div>
           {/* SSE 连接指示 */}
           {session ? (
@@ -144,15 +144,6 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
             ) : null
           ) : null}
 
-          <button
-            type="button"
-            onClick={() => setPanelOpen((v) => !v)}
-            className="shrink-0 p-1 rounded text-ink-faint hover:text-ink hover:bg-paper transition-colors"
-            aria-label={panelOpen ? '收起模式面板' : '展开模式面板'}
-            title={panelOpen ? '收起模式与权限面板' : '展开模式与权限面板'}
-          >
-            {panelOpen ? <PanelRightClose className="w-4 h-4" /> : <PanelRightOpen className="w-4 h-4" />}
-          </button>
         </header>
 
         {/* Work 常驻风险条 */}
@@ -187,7 +178,7 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
               <p className="text-sm text-ink-soft">开始一段新的讨论</p>
               <p className="mt-1.5 text-xs text-ink-faint leading-relaxed max-w-sm mx-auto">
                 应用自带工具可检索并阅读标准库与原始库。 Discuss 模式只读；需要让它写文件时，
-                通过右侧面板显式切换到 Work 模式并授权目录。
+                通过会话顶部的模式按钮切换到 Work 并授权目录。
               </p>
             </div>
           }
@@ -209,34 +200,18 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
         />
       </div>
 
-      {/* 右：任务区（S7）+ 模式与权限（可折叠） */}
-      {panelOpen ? (
-        <div className="absolute z-40 top-0 bottom-0 right-0 w-[min(280px,90%)] xl:static xl:w-auto min-h-0 flex flex-col gap-3">
-          <button className="absolute top-2 right-2 z-10 text-xs text-seal xl:hidden" aria-label="关闭模式面板" onClick={() => setPanelOpen(false)}>关闭</button>
-          <TaskPanel
-            session={session}
-            tasks={sessions.tasks}
-            taskBusyId={sessions.taskBusyId}
-            onCancelTask={(id) => { void sessions.cancelTask(id); }}
-            onResumeTask={(id, message) => { void sessions.resumeTask(id, message); }}
-            orchestrationEnabled={orchestration.enabled}
-            orchestrationBusy={orchestration.busy}
-            orchestrationError={orchestration.error}
-            onToggleOrchestration={(enabled) => { void orchestration.toggle(enabled); }}
-          />
-          <div className="flex-1 min-h-0 rounded-md border border-line bg-card-bg shadow-sm overflow-hidden">
-            <AgentModePanel
-              session={session}
-              busy={running}
-              onSwitchMode={sessions.switchMode}
-              writeRecords={sessions.writeRecords}
-            />
-          </div>
+      <Modal open={createWorkspace} title="新建工作区" onClose={workspaceBusy ? undefined : () => setCreateWorkspace(false)}>
+        <div className="space-y-3">
+          <input aria-label="工作区名称" placeholder="工作区名称" value={workspaceName} onChange={(e) => setWorkspaceName(e.target.value)} className="w-full rounded border border-line bg-card-bg px-3 py-2 text-sm" />
+          <div className="flex gap-2"><input aria-label="工作区目录" placeholder="目录绝对路径" value={workspacePath} onChange={(e) => setWorkspacePath(e.target.value)} className="min-w-0 flex-1 rounded border border-line bg-card-bg px-3 py-2 text-sm" /><Button size="sm" variant="secondary" onClick={() => { void window.desktop?.selectDirectory?.().then((path) => { if (path) setWorkspacePath(path); }); }}>选择目录</Button></div>
+          {workspaceError && <p role="alert" className="text-xs text-seal-2">{workspaceError}</p>}
+          <div className="flex justify-end"><Button size="sm" loading={workspaceBusy} disabled={!workspaceName.trim() || !workspacePath.trim()} onClick={() => { setWorkspaceBusy(true); setWorkspaceError(''); void addAgentWorkspace({ name: workspaceName.trim(), path: workspacePath.trim() }).then((workspace) => { setWorkspaces((items) => [...items, workspace]); setWorkspaceName(''); setWorkspacePath(''); setCreateWorkspace(false); }).catch((error) => setWorkspaceError(error instanceof Error ? error.message : '创建失败')).finally(() => setWorkspaceBusy(false)); }}>创建</Button></div>
         </div>
-      ) : null}
+      </Modal>
       <Modal open={createOpen} title="新建会话" onClose={creatingSession ? undefined : () => setCreateOpen(false)}>
         <div className="space-y-3">
           <p className="text-sm text-ink-soft">选择此会话使用的 Agent 基座。会话创建后会保留所选基座及历史；标准知识库构建等应用能力的基座在设置中单独配置。</p>
+          {targetWorkspace && <p className="text-xs text-ink-soft">将在所选工作区创建 Work 会话，允许应用自带工具写入该目录。</p>}
           <div className="grid gap-2 sm:grid-cols-2">
             <button type="button" disabled={creatingSession} onClick={() => void createWithBackend('pi')} aria-label="新建 Pi 会话"
               className="rounded-md border border-line bg-paper/40 px-3 py-3 text-left hover:border-seal hover:bg-seal/5 disabled:opacity-50">

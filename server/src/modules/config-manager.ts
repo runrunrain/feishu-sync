@@ -354,7 +354,7 @@ function normalizeOrchestrationConfigLoose(value: unknown): AgentOrchestrationCo
       ? Math.max(min, Math.min(max, Math.floor(candidate)))
       : fallback;
   return {
-    maxActiveTasksPerSession: int(raw.maxActiveTasksPerSession, base.maxActiveTasksPerSession, 1, 32),
+    maxActiveTasksPerSession: int(raw.maxActiveTasksPerSession, base.maxActiveTasksPerSession, 1, 5),
     taskTimeoutMinutes: int(raw.taskTimeoutMinutes, base.taskTimeoutMinutes, 1, 1440),
   };
 }
@@ -487,7 +487,7 @@ export function validateAgentAndKbConfig(value: {
       if (orchestration.maxActiveTasksPerSession !== undefined
         && (typeof orchestration.maxActiveTasksPerSession !== 'number'
           || !Number.isInteger(orchestration.maxActiveTasksPerSession)
-          || orchestration.maxActiveTasksPerSession < 1 || orchestration.maxActiveTasksPerSession > 32)) {
+          || orchestration.maxActiveTasksPerSession < 1 || orchestration.maxActiveTasksPerSession > 5)) {
         details.push({ field: 'agent.orchestration.maxActiveTasksPerSession', code: 'out_of_range' });
       }
       if (orchestration.taskTimeoutMinutes !== undefined

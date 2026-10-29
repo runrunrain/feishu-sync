@@ -392,9 +392,9 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
             <div className="w-14 h-14 rounded-md bg-paper-2 border border-line/60 flex items-center justify-center">
               <CloudOff className="w-6 h-6 text-ink-faint" />
             </div>
-            <p className="text-sm font-kai text-ink-soft">尚未同步到本地</p>
+            <p className="text-sm font-kai text-ink-soft">{node.cloud_match === 'restricted' ? '暂无可预览的本地版本' : '尚未同步到本地'}</p>
             <p className="text-xs text-ink-faint leading-relaxed max-w-[280px]">
-              该文档在云端存在但本地还没有文件，前往「贰 同步」主区同步后即可预览
+              {node.cloud_match === 'restricted' ? '云端访问受限，未能唯一匹配本地文件。请检查本地文件和飞书访问权限。' : '该文档在云端存在但本地还没有文件，前往「贰 同步」主区同步后即可预览'}
             </p>
           </div>
         ) : formatTab === 'xlsx' && content?.workbook ? (

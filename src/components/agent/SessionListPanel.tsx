@@ -19,13 +19,17 @@ import { Button } from '../common/Button';
 import { Modal } from '../common/Modal';
 import { formatRelativeTime } from '../../utils/agentReadiness';
 import type { AgentSessionDto } from '../../types/agent';
+import type { AgentWorkspaceConfig } from '../../types/agent';
 
 interface SessionListPanelProps {
   sessions: AgentSessionDto[];
   loading: boolean;
   activeId: string | null;
   onSelect: (id: string) => void;
-  onCreate: () => void;
+  onCreate: (workspaceId?: string) => void;
+  workspaces?: AgentWorkspaceConfig[];
+  onAddWorkspace?: () => void;
+  workspaceMode?: boolean;
   onRename: (id: string, title: string) => Promise<boolean>;
   onDelete: (id: string) => Promise<boolean>;
 }
@@ -45,6 +49,9 @@ export function SessionListPanel({
   onCreate,
   onRename,
   onDelete,
+  workspaces = [],
+  onAddWorkspace,
+  workspaceMode = false,
 }: SessionListPanelProps) {
   const [renaming, setRenaming] = useState<AgentSessionDto | null>(null);
   const [renameValue, setRenameValue] = useState('');
@@ -75,7 +82,7 @@ export function SessionListPanel({
     <div className="flex flex-col h-full min-h-0" data-testid="agent-session-list">
       <div className="flex items-center justify-between px-3 py-2.5 border-b border-line/60 shrink-0">
         <span className="text-sm font-kai font-medium text-ink">会话</span>
-        <Button size="sm" variant="ghost" onClick={onCreate} aria-label="新建会话">
+        <Button size="sm" variant="ghost" onClick={() => onCreate()} aria-label="新建会话">
           <Plus className="w-4 h-4" />
           新建
         </Button>
@@ -88,7 +95,7 @@ export function SessionListPanel({
               <div key={i} className="h-10 rounded-md bg-paper-2 animate-pulse" />
             ))}
           </div>
-        ) : sessions.length === 0 ? (
+        ) : sessions.length === 0 && workspaces.length === 0 ? (
           <div className="px-4 py-10 text-center">
             <SquarePen className="w-6 h-6 mx-auto text-ink-faint mb-2" />
             <p className="text-xs text-ink-faint leading-relaxed">
@@ -96,12 +103,16 @@ export function SessionListPanel({
               <br />
               新建一个，开始与 Agent 讨论设计。
             </p>
-            <Button size="sm" variant="secondary" className="mt-3" onClick={onCreate}>
+            <Button size="sm" variant="secondary" className="mt-3" onClick={() => onCreate()}>
               新建会话
             </Button>
           </div>
         ) : (
-          sessions.map((s) => {
+          [...(workspaceMode ? workspaces.map((workspace) => ({ id: workspace.id, name: workspace.name, items: sessions.filter((s) => s.workspace?.id === workspace.id) })) : []),
+            { id: '', name: workspaceMode ? '未分组' : '', items: workspaceMode ? sessions.filter((s) => !s.workspace || !workspaces.some((workspace) => workspace.id === s.workspace?.id)) : sessions }]
+          .filter((group) => group.id || group.items.length).map((group) => <div key={group.id}>
+            {group.name && <div className="flex items-center gap-1 px-3 py-2 text-xs text-ink-faint"><span className="min-w-0 flex-1 truncate">{group.name}</span>{group.id && <button aria-label={`在 ${group.name} 新建会话`} onClick={() => onCreate(group.id)} className="p-1 hover:text-seal"><Plus className="w-3.5 h-3.5" /></button>}</div>}
+          {group.items.map((s) => {
             const active = s.id === activeId;
             return (
               <div
@@ -166,8 +177,9 @@ export function SessionListPanel({
                 </div>
               </div>
             );
-          })
+          })}</div>)
         )}
+        {workspaceMode && onAddWorkspace && <button className="mx-3 my-2 text-xs text-ink-faint hover:text-seal" onClick={onAddWorkspace}>＋ 新建工作区</button>}
       </div>
 
       {/* 重命名弹窗 */}

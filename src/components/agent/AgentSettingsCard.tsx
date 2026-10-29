@@ -38,6 +38,7 @@ import {
   getAgentVisionStatus,
   getKbMcpInfo,
   listAgentWorkspaces,
+  listConversationModels,
   testAgentVision,
   testClaudeConnection,
 } from '../../api/client';
@@ -189,6 +190,10 @@ export function AgentRuntimeSettingsCard() {
   const [updatingRuntime, setUpdatingRuntime] = useState<'pi' | 'claude-code' | null>(null);
   const [testingConnection, setTestingConnection] = useState(false);
   const [connectionTest, setConnectionTest] = useState<ClaudeConnectionTestResult | null>(null);
+  const [configBackend, setConfigBackend] = useState<'pi' | 'claude-code' | null>(null);
+  const [localModels, setLocalModels] = useState<Awaited<ReturnType<typeof listConversationModels>>['items']>([]);
+  const [localModelsLoading, setLocalModelsLoading] = useState(false);
+  const [localModelsError, setLocalModelsError] = useState(false);
 
   // ---- S2/S5：图片理解段（独立状态面；保存走 agent.vision，不动文本模型配置） ----
   const vision = agent?.vision ?? DEFAULT_VISION_CONFIG;
@@ -254,13 +259,23 @@ export function AgentRuntimeSettingsCard() {
   const currentProviderId = agent?.model?.providerId || config?.llm.activeProviderId || '';
   const selectedProvider = providers.find((p) => p.id === currentProviderId);
   const currentModelId = agent?.model?.modelId || (currentProviderId === config?.llm.activeProviderId ? config?.llm.activeModelId : '') || selectedProvider?.defaultModelId || '';
-  const backend = agent?.runtime?.backend ?? 'pi';
+  const appBackend = agent?.runtime?.backend ?? 'pi';
+  const backend = configBackend ?? appBackend;
   const source = backend === 'claude-code' ? 'app-llm' : agent?.model?.source ?? 'app-llm';
+  const [modelsRefresh, setModelsRefresh] = useState(0);
+  useEffect(() => {
+    if (backend !== 'pi' || source !== 'pi-agent-dir') return;
+    let cancelled = false;
+    setLocalModelsLoading(true); setLocalModelsError(false);
+    listConversationModels('pi-agent-dir', modelsRefresh > 0).then((result) => { if (!cancelled) setLocalModels(result.items); })
+      .catch(() => { if (!cancelled) setLocalModelsError(true); })
+      .finally(() => { if (!cancelled) setLocalModelsLoading(false); });
+    return () => { cancelled = true; };
+  }, [backend, source, modelsRefresh]);
   const piModel = agent?.model?.piModel ?? '';
   const piModels = useMemo(() => {
-    if (agentStatus.unreachable || agentStatus.status?.model.source !== 'pi-agent-dir') return [];
-    return [...new Set(agentStatus.status.model.available)].sort((a, b) => a.localeCompare(b));
-  }, [agentStatus.status, agentStatus.unreachable]);
+    return [...new Set(localModels.flatMap((model) => model.piModel ? [model.piModel] : []))].sort((a, b) => a.localeCompare(b));
+  }, [localModels]);
   const piModelGroups = useMemo(() => {
     const groups = new Map<string, string[]>();
     for (const model of piModels) {
@@ -269,12 +284,11 @@ export function AgentRuntimeSettingsCard() {
     }
     return [...groups];
   }, [piModels]);
-  const loadingModels = agentStatus.loading || agentStatus.rechecking
-    || (!agentStatus.unreachable && agentStatus.status?.model.source !== source);
+  const loadingModels = localModelsLoading;
   const invalidPiModel = Boolean(piModel) && !loadingModels && !piModels.includes(piModel);
   const thinking = agent?.model?.thinkingLevel ?? 'off';
   const selectedPreset = selectedProvider?.models.find((model) => model.id === currentModelId);
-  const detectedPiLevels = agentStatus.status?.model.capabilities?.[piModel];
+  const detectedPiLevels = localModels.find((model) => model.piModel === piModel)?.thinkingLevels ?? undefined;
   const manualPiLevels = agent?.model?.piThinkingLevels?.[piModel];
   const knownLevels = source === 'pi-agent-dir'
     ? detectedPiLevels ?? (manualPiLevels ? ['off' as const, ...manualPiLevels.filter((level) => level !== 'off')] : undefined)
@@ -330,13 +344,22 @@ export function AgentRuntimeSettingsCard() {
     >
       <div>
         <FieldLabel>应用基础能力的 Agent 基座</FieldLabel>
+        <select aria-label="应用基础能力的 Agent 基座" className={INPUT_CLS} value={appBackend} disabled={saving}
+          onChange={(e) => { setConfigBackend(backend); void saveAgent({ runtime: { backend: e.target.value as 'pi' | 'claude-code' } }); }}>
+          <option value="pi">Pi</option><option value="claude-code">Claude Code</option>
+        </select>
+      </div>
+      <div>
+        <FieldLabel>查看基座配置</FieldLabel>
         <div className="flex gap-2">
-          <Button size="sm" variant={backend === 'pi' ? 'primary' : 'secondary'} disabled={saving} onClick={() => void saveAgent({ runtime: { backend: 'pi' } })}>Pi</Button>
-          <Button size="sm" variant={backend === 'claude-code' ? 'primary' : 'secondary'} disabled={saving} onClick={() => void saveAgent({ runtime: { backend: 'claude-code' } })}>Claude Code</Button>
+          <Button size="sm" variant={backend === 'pi' ? 'primary' : 'secondary'} onClick={() => setConfigBackend('pi')}>Pi 配置</Button>
+          <Button size="sm" variant={backend === 'claude-code' ? 'primary' : 'secondary'} onClick={() => setConfigBackend('claude-code')}>Claude Code 配置</Button>
         </div>
+        <p className="mt-1 text-[11px] text-ink-faint">切换配置视图不会改变应用基座。应用提供商、模型预设及思考设置由两个基座共用。</p>
         {backend === 'claude-code' && <p className="mt-1 text-[11px] text-ink-faint">使用应用内 Anthropic Messages 兼容提供商。应用上下文与受控工具可用；Pi 专用扩展不会加载。预设上下文窗口用于自动压缩，实际窗口受 Claude Code 和模型限制。</p>}
       </div>
       {/* 就绪状态 */}
+      <p className="text-[11px] text-ink-faint">运行状态显示已保存的应用基础能力基座。</p>
       <div className="flex items-center gap-3 flex-wrap px-3 py-2.5 rounded-md border border-line bg-paper/40">
         {agentStatus.loading ? (
           <StatusBadge status="loading">检测中…</StatusBadge>
@@ -363,7 +386,7 @@ export function AgentRuntimeSettingsCard() {
           ) : (
             <span>未发现 Node</span>
           )}
-          {backend === 'claude-code' ? (agentStatus.status?.runtime.claudeVersion ? ` · Claude Code ${agentStatus.status.runtime.claudeVersion}` : ' · 未发现 Claude Code') : agentStatus.status?.runtime.piVersion ? (
+          {appBackend === 'claude-code' ? (agentStatus.status?.runtime.claudeVersion ? ` · Claude Code ${agentStatus.status.runtime.claudeVersion}` : ' · 未发现 Claude Code') : agentStatus.status?.runtime.piVersion ? (
             <>
               {' · '}
               <span className="font-mono">pi {agentStatus.status.runtime.piVersion}</span>
@@ -541,10 +564,10 @@ export function AgentRuntimeSettingsCard() {
             <Button
               size="sm"
               variant="secondary"
-              loading={agentStatus.loading || agentStatus.rechecking}
+              loading={loadingModels}
               disabled={saving}
               className="shrink-0 whitespace-nowrap"
-              onClick={() => void agentStatus.recheck()}
+              onClick={() => setModelsRefresh((value) => value + 1)}
             >
               <RefreshCw className="w-3.5 h-3.5" /> 刷新模型
             </Button>
@@ -554,7 +577,7 @@ export function AgentRuntimeSettingsCard() {
           </p>
           {invalidPiModel ? <p className="mt-1 text-xs text-seal-2" role="alert">原模型已不在可用列表中，请重新选择。</p> : null}
           {!loadingModels && piModels.length === 0 ? (
-            <p className="mt-1 text-xs text-ink-soft">{agentStatus.unreachable ? '模型列表读取失败，请刷新重试。' : '请检查本机 pi 配置与认证，然后刷新模型。'}</p>
+            <p className="mt-1 text-xs text-ink-soft">{localModelsError ? '模型列表读取失败，请刷新重试。' : '请检查本机 pi 配置与认证，然后刷新模型。'}</p>
           ) : null}
         </div>
       )}

@@ -159,7 +159,7 @@ export interface UseAgentSessionsResult {
   sending: boolean;
   selecting: (id: string | null) => void;
   refreshSessions: () => void;
-  createSession: (backend?: AgentBackend) => Promise<AgentSessionDto | null>;
+  createSession: (backend?: AgentBackend, workspaceId?: string) => Promise<AgentSessionDto | null>;
   renameSession: (id: string, title: string) => Promise<boolean>;
   removeSession: (id: string) => Promise<boolean>;
   send: (text: string, delivery?: 'steer' | 'followUp') => Promise<boolean>;
@@ -442,7 +442,7 @@ export function useAgentSessions(active: boolean): UseAgentSessionsResult {
               isError: payload?.isError === true,
             };
             if (idx === -1) tools.push(row);
-            else tools[idx] = row;
+            else tools[idx] = { ...row, argsSummary: row.argsSummary || tools[idx].argsSummary };
             return { ...cur, tools };
           });
           break;
@@ -595,9 +595,13 @@ export function useAgentSessions(active: boolean): UseAgentSessionsResult {
 
   const refreshSessions = useCallback(() => setSessionNonce((n) => n + 1), []);
 
-  const createSession = useCallback(async (backend?: AgentBackend) => {
+  const createSession = useCallback(async (backend?: AgentBackend, workspaceId?: string) => {
     try {
-      const created = await createAgentSession(undefined, backend);
+      let created = await createAgentSession(undefined, backend, workspaceId);
+      if (workspaceId) {
+        try { created = await switchAgentSessionMode(created.id, { mode: 'work', workspaceId, confirm: 'WORK' }); }
+        catch (err) { setSessionsError(err instanceof Error ? err.message : '会话已创建，但切换 Work 失败'); }
+      }
       setSessions((prev) => [created, ...prev]);
       setActiveId(created.id);
       setMessages([]);

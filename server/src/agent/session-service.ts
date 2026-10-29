@@ -93,6 +93,7 @@ export class SessionService extends EventEmitter {
   private readonly sseBuffers = new Map<string, SessionSseEvent[]>();
   private readonly sseSeq = new Map<string, number>();
   private readonly runs = new Map<string, ActiveRun>();
+  private readonly approvalModes = new Map<string, 'ask' | 'auto'>();
   /** T3b-07：停止已请求但尚未 run_end 的会话（abort ACK 窗口标记）。 */
   private readonly abortRequested = new Set<string>();
   /** T3e-R3-02：会话停止信号源（app_command 批准后异步复核链取消用）。 */
@@ -134,6 +135,7 @@ export class SessionService extends EventEmitter {
     const errorMessage = row.last_error_message ? String(row.last_error_message) : null;
     return {
       id: sessionId,
+      approvalMode: this.approvalModes.get(sessionId) ?? 'ask',
       backend: row.runtime_backend === 'claude-code' ? 'claude-code' : 'pi',
       model: this.readSessionModel(row),
       title: String(row.title),
@@ -163,7 +165,7 @@ export class SessionService extends EventEmitter {
     localMapStore: {
       createAgentSession(input: { id: string; title: string; mode: 'discuss' | 'work'; workspaceId: string | null; backend?: 'pi' | 'claude-code'; createdAt: string; updatedAt: string }): void;
     },
-    input: { title?: string; mode?: string; backend?: string },
+    input: { title?: string; mode?: string; backend?: string; workspaceId?: string },
   ): AgentSessionDto {
     if (input.mode !== undefined && input.mode !== 'discuss') {
       throw new ToolError('invalid_request', '新建会话只允许 discuss 模式（Work 经模式切换进入）');
@@ -177,10 +179,12 @@ export class SessionService extends EventEmitter {
     // The explicit choice belongs to this conversation. Older callers that
     // omit it retain the configured application backend as their default.
     const backend = input.backend ?? (this.currentConfig()?.agent.runtime.backend === 'claude-code' ? 'claude-code' : 'pi');
-    localMapStore.createAgentSession({ id, title, mode: 'discuss', workspaceId: null, backend, createdAt: now, updatedAt: now });
+    const workspace = input.workspaceId ? this.workspaceOf(this.currentConfig(), input.workspaceId) : null;
+    if (input.workspaceId && !workspace) throw new ToolError('workspace_not_found', 'Workspace 不存在或未绑定', 404);
+    localMapStore.createAgentSession({ id, title, mode: 'discuss', workspaceId: workspace?.id ?? null, backend, createdAt: now, updatedAt: now });
     fs.mkdirSync(this.sessionDir(), { recursive: true });
     return {
-      id, title, mode: 'discuss', workspace: null, state: 'idle', lastError: null, backend,
+      id, title, mode: 'discuss', workspace: workspace ? { id: workspace.id, name: workspace.name, path: workspace.path } : null, state: 'idle', lastError: null, backend,
       createdAt: now, updatedAt: now,
     };
   }
@@ -229,6 +233,18 @@ export class SessionService extends EventEmitter {
     return this.get(store, this.currentConfig(), id)!;
   }
 
+  approvalMode(id: string): 'ask' | 'auto' { return this.approvalModes.get(id) ?? 'ask'; }
+
+  setApprovalMode(store: SessionStoreApi, id: string, mode: 'ask' | 'auto'): AgentSessionDto {
+    const row = store.getAgentSession(id);
+    if (!row) throw new ToolError('session_not_found', '会话不存在', 404);
+    if (row.mode !== 'work') throw new ToolError('invalid_request', '只有 Work 会话可设置审批方式');
+    if (this.isRunning(id) || this.deps.pool.isBusy(id)) throw new ToolError('session_busy', '请在运行结束后切换审批方式', 409);
+    if (mode === 'auto') this.approvalModes.set(id, mode); else this.approvalModes.delete(id);
+    this.emitSessionState(id, store);
+    return this.get(store, this.currentConfig(), id)!;
+  }
+
   private currentConfig(): Config | null {
     return this.deps.configProvider();
   }
@@ -243,6 +259,7 @@ export class SessionService extends EventEmitter {
       throw new ToolError('session_busy', '会话运行中，请先停止', 409);
     }
     await this.deps.pool.terminate(id);
+    this.approvalModes.delete(id);
     this.deps.toolService.revokeBySession(id);
     localMapStore.updateAgentSession(id, { deletedAt: new Date().toISOString() });
     // JSONL 移到 sessions/.deleted/
@@ -300,7 +317,8 @@ export class SessionService extends EventEmitter {
     if (body.mode === 'discuss') {
       await this.deps.pool.terminate(id);
       this.deps.toolService.revokeBySession(id);
-      localMapStore.updateAgentSession(id, { mode: 'discuss', workspaceId: null });
+      localMapStore.updateAgentSession(id, { mode: 'discuss' });
+      this.approvalModes.delete(id);
       this.emitSessionState(id, localMapStore);
       return this.get(localMapStore, config, id);
     }
@@ -327,6 +345,7 @@ export class SessionService extends EventEmitter {
     workspaceId: string,
   ): Promise<void> {
     for (const row of localMapStore.listSessionsByWorkspace(workspaceId)) {
+      this.approvalModes.delete(String(row.id));
       await this.deps.pool.terminate(String(row.id));
       this.deps.toolService.revokeBySession(String(row.id));
       localMapStore.updateAgentSession(String(row.id), { mode: 'discuss', workspaceId: null });
@@ -385,6 +404,10 @@ export class SessionService extends EventEmitter {
       return { accepted: true, runId: existingRun.runId };
     }
 
+    if (row.title === '新会话') {
+      const title = body.text.trim().replace(/\s+/g, ' ').slice(0, 40);
+      if (title) { localMapStore.updateAgentSession(id, { title, updatedAt: new Date().toISOString() }); this.emitSessionState(id, localMapStore); }
+    }
     const runId = `run_${crypto.randomBytes(6).toString('hex')}`;
     // 异步执行；错误经 SSE 与 last_error 落地
     void this.executeRun(localMapStore, id, body.text, runId).catch((error) => {
@@ -430,7 +453,7 @@ export class SessionService extends EventEmitter {
       }
       if (!process) {
         await this.deps.waitForInternalApi?.();
-        process = await this.spawnSessionProcess(sessionId, mode, workspace?.path, pluginSnapshot, config);
+        process = await this.spawnSessionProcess(sessionId, mode, mode === 'work' ? workspace?.path : undefined, pluginSnapshot, config);
       }
       // F3-R06：运行期间挂起 idle 回收；结束（成功/失败/异常）后重起完整
       // idle 窗口——复用进程若已空闲 9 分钟，一次新 prompt 也必须获得全窗口。
@@ -578,6 +601,8 @@ export class SessionService extends EventEmitter {
       workspaceRoot,
       ...(taskFace && !orchestrationOn ? { disableToolFamilies: [taskFace.family] } : {}),
       onEvent: (event) => {
+        // Pi already forwards its native execution events with authoritative call IDs.
+        if (config.agent.runtime.backend !== 'claude-code') return;
         if (config.agent.runtime.backend === 'claude-code' && event.phase === 'start' && event.toolCallId
           && this.runs.get(sessionId)?.phase === 'running' && !this.abortRequested.has(sessionId)) {
           let bucket = this.toolCallRuns.get(sessionId);

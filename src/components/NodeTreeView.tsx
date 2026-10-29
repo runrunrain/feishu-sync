@@ -94,7 +94,7 @@ interface NodeTreeViewProps {
   watchedRoots?: WatchedRoot[];
   /**
    * 自定义归档文件夹（数据源 GET /api/custom-folders，由父组件注入）。
-   * 渲染在 watchedRoot 分组下方「自定义归档」区块：每个文件夹可收起/展开
+   * 渲染在「自定义归档」区块：每个文件夹可收起/展开
    * （复用 watchedRoot 分组折叠交互），其下渲染文档行，点击 onSelect(objToken)
    * 联动详情卡。
    */
@@ -631,12 +631,13 @@ export function NodeTreeView({
 
   // Range selection uses exactly the displayed rows, including expanded archive groups.
   const selectableRows = useMemo(() => {
-    const rows = [...navigableTokens];
+    const rows: string[] = [];
     if (!activeGroupKey || activeGroupKey === CUSTOM_ARCHIVE_KEY) {
       for (const folder of customFolders ?? []) if (!collapsedGroups.has(`custom:${folder.id}`)) {
         for (const doc of folder.docs) if (doc.title.toLowerCase().includes(search.trim().toLowerCase())) rows.push(doc.objToken);
       }
     }
+    rows.push(...navigableTokens);
     return [...new Set(rows)];
   }, [navigableTokens, activeGroupKey, customFolders, collapsedGroups, search]);
   const handleSelection = (token: string, modifiers: SelectionModifiers, checkbox = false) => {
@@ -942,6 +943,8 @@ export function NodeTreeView({
               无匹配节点
             </p>
           )}
+          {(!activeGroupKey || activeGroupKey === CUSTOM_ARCHIVE_KEY) &&
+            renderCustomArchive()}
           {groupedRoots ? (
             <>
               {(activeGroupKey
@@ -1024,8 +1027,6 @@ export function NodeTreeView({
           ) : (
             roots.map((r) => renderNode(r, 0))
           )}
-          {(!activeGroupKey || activeGroupKey === CUSTOM_ARCHIVE_KEY) &&
-            renderCustomArchive()}
         </div>
         <div className="mt-2 pt-2 border-t border-line/70 text-[11px] text-ink-faint font-sans-ui flex min-w-0 items-center justify-between gap-2 shrink-0 select-none">
           <span

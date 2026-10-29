@@ -1249,10 +1249,10 @@ export async function listAgentSessions(): Promise<AgentSessionDto[]> {
 }
 
 /** POST /api/agent/sessions —— 新建只允许 discuss；Work 经模式切换进入。 */
-export async function createAgentSession(title?: string, backend?: AgentBackend): Promise<AgentSessionDto> {
+export async function createAgentSession(title?: string, backend?: AgentBackend, workspaceId?: string): Promise<AgentSessionDto> {
   return request<AgentSessionDto>('/api/agent/sessions', {
     method: 'POST',
-    body: JSON.stringify({ mode: 'discuss', ...(title ? { title } : {}), ...(backend ? { backend } : {}) }),
+    body: JSON.stringify({ mode: 'discuss', ...(title ? { title } : {}), ...(backend ? { backend } : {}), ...(workspaceId ? { workspaceId } : {}) }),
   });
 }
 
@@ -1481,6 +1481,9 @@ export interface AgentModelOption {
   source: 'app-llm' | 'pi-agent-dir'; providerId?: string; modelId?: string; piModel?: string;
   label: string; reasoning: boolean;
   thinkingLevels?: import('../types/agent').AgentConfig['model']['thinkingLevel'][] | null;
+}
+export function setSessionApprovalMode(id: string, mode: 'ask' | 'auto'): Promise<AgentSessionDto> {
+  return request(`/api/agent/sessions/${encodeURIComponent(id)}/approval-mode`, { method: 'PUT', body: JSON.stringify({ mode }) });
 }
 export function listConversationModels(source: 'app-llm' | 'pi-agent-dir', refresh = false, backend?: 'pi' | 'claude-code'): Promise<{ items: AgentModelOption[]; message: string }> {
   return request(`/api/agent/models?source=${source}${refresh ? '&refresh=1' : ''}${backend ? `&backend=${backend}` : ''}`);

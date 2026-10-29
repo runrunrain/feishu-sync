@@ -28,10 +28,10 @@ export class AppPluginStore {
         '你是本地知识工作助手。先检索知识库与相关工作文件，再完成用户要求的修改。原始知识库和标准知识库只读，写入仅限当前授权Workspace。以工具实际结果确认完成，不虚构文件变化。当前应用不提供shell工具。'),
       plugin('kb-build-rules', '标准库构建规则', '源读取、主题组织与构建流程', ['build'], assets.buildRules),
       plugin('kb-style', '标准库文风', '自然完整的知识表述、排版与来源纪律', ['build'], assets.styleGuide),
-      // S6 任务编排（设计 §5.1）：默认停用；启用后向 Discuss/Work 会话注入
+      // 任务编排默认启用；启用后向 Discuss/Work 会话注入
       // Leader 编排提示，并放行 task_* 工具下发（SessionService 按本条 enabled 判定）。
       {
-        id: 'orchestration', name: '任务编排', kind: 'context', builtin: true, enabled: false,
+        id: 'orchestration', name: '任务编排', kind: 'context', builtin: true, enabled: true,
         description: 'Leader 任务编排说明（子任务派发、状态与结果协议）',
         scopes: ['discuss', 'work'],
         content: LEADER_ORCHESTRATION_PROMPT,

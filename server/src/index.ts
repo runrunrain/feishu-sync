@@ -403,7 +403,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
     sessionInfo: (sessionId) => {
       const row = localMapStore.getAgentSession(sessionId);
       if (!row) return null;
-      const workspaceId = row.workspace_id != null ? String(row.workspace_id) : null;
+      const workspaceId = row.mode === 'work' && row.workspace_id != null ? String(row.workspace_id) : null;
       const workspace = workspaceId
         ? configManager.getConfig()?.agent.workspaces.find((candidate) => candidate.id === workspaceId) ?? null
         : null;
@@ -472,6 +472,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
     // 必须等于会话当前可执行轮；跨轮迟到请求拒绝，旧轮批准不被新轮洗白）
     toolCallRun: (sessionId, toolCallId) => sessionService.runOfToolCall(sessionId, toolCallId),
     currentRunId: (sessionId) => sessionService.currentRunId(sessionId),
+    approvalMode: (sessionId) => sessionService.approvalMode(sessionId),
     // T3e-R3-02：停止信号（批准后异步复核链取消源；abort 时触发）
     sessionAbortSignal: (sessionId) => sessionService.abortSignal(sessionId),
   }));

@@ -124,6 +124,22 @@ describe('read 级直通', () => {
 });
 
 describe('mutate 级批准流', () => {
+  it('免审批只对授权的 Work 会话生效，并保留停止状态检查', async () => {
+    const auto = new AgentToolService({ dataRoot, documentsProvider: () => [] });
+    let state: 'running' | 'idle' = 'running';
+    auto.registerToolFamily(createOpsToolFamily({ approvals, getApp: () => app, desktopToken: 'stub', configProvider: () => null,
+      approvalMode: (id) => id === 'auto-session' ? 'auto' : 'ask', sessionRunState: () => state }));
+    const work = auto.createRunContext({ runKind: 'work', sessionId: 'auto-session', outputRoot: os.tmpdir(), knowledgeBaseRoot: os.tmpdir() }).token;
+    const discuss = auto.createRunContext({ runKind: 'discuss', sessionId: 'auto-session', outputRoot: os.tmpdir(), knowledgeBaseRoot: os.tmpdir() }).token;
+    buildHits = [];
+    await auto.executeTool(work, 'app_command', { command: 'kb.build', args: { mode: 'full' } });
+    expect(buildHits).toHaveLength(1);
+    expect(approvals.pendingCount()).toBe(0);
+    await expect(auto.executeTool(discuss, 'app_command', { command: 'kb.build', args: { mode: 'full' } })).rejects.toThrow();
+    state = 'idle';
+    await expect(auto.executeTool(work, 'app_command', { command: 'kb.build', args: { mode: 'full' } })).rejects.toThrow(/停止/);
+    expect(buildHits).toHaveLength(1);
+  });
   it('未批准不执行：挂起 → 拒绝 → approval_rejected，目标路由零命中', async () => {
     const tokenId = token('work');
     buildHits = [];

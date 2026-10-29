@@ -453,6 +453,8 @@ export class IndexScanner {
    * indexable.
    */
   parseMetadata(content: string): ParsedMetadata | null {
+    // Windows files commonly use CRLF; normalize before applying header patterns.
+    content = content.replace(/\r\n/g, '\n');
     // 1. New spec: YAML-in-comment
     const yamlHeader = this.parseYamlHtmlHeader(content);
     if (yamlHeader) return yamlHeader;

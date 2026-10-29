@@ -7,7 +7,7 @@
  * 全部用内存 store stub，不触真实 DB 与进程。
  */
 
-import { describe, expect, it, afterAll } from 'vitest';
+import { describe, expect, it, afterAll, vi } from 'vitest';
 import { Hono } from 'hono';
 import { agentRoutes, type AgentRouteDeps } from '../src/routes/agent.js';
 import fs from 'node:fs';
@@ -102,6 +102,32 @@ function makeConfig(): Config {
   } as unknown as Config;
 }
 
+it('审批方式仅适用于 Work，会话隔离并在移除工作区后恢复默认', async () => {
+  const { service, store } = makeService(makeConfig());
+  const first = service.create(store, {});
+  const second = service.create(store, {});
+  expect(() => service.setApprovalMode(store, first.id, 'auto')).toThrow(/Work/);
+  store.updateAgentSession(first.id, { mode: 'work', workspaceId: 'ws_test1' });
+  expect(service.setApprovalMode(store, first.id, 'auto').approvalMode).toBe('auto');
+  expect(service.approvalMode(second.id)).toBe('ask');
+  await service.demoteSessionsOnWorkspaceRemoval(store, 'ws_test1');
+  expect(service.approvalMode(first.id)).toBe('ask');
+});
+
+it('按工作区创建只读会话并用首条消息命名，不覆盖手动标题', async () => {
+  const { service, store } = makeService(makeConfig());
+  const grouped = service.create(store, { workspaceId: 'ws_test1' });
+  expect(grouped.mode).toBe('discuss');
+  expect(grouped.workspace?.id).toBe('ws_test1');
+  expect(() => service.create(store, { workspaceId: 'missing' })).toThrow(/Workspace/);
+  vi.spyOn(service as any, 'executeRun').mockResolvedValue(undefined);
+  await service.sendMessage(store, grouped.id, { text: '设计一个\n技能系统' });
+  expect(service.get(store, makeConfig(), grouped.id)?.title).toBe('设计一个 技能系统');
+  service.rename(store, grouped.id, '用户命名');
+  await service.sendMessage(store, grouped.id, { text: '后续消息' });
+  expect(service.get(store, makeConfig(), grouped.id)?.title).toBe('用户命名');
+});
+
 describe('RPC message_end 必须是完整DTO（不能把Partial塞入前端列表）', () => {
   it('工具调用与最终文本都带独立id、assistant角色和时间', () => {
     const call = toAssistantMessageDto({ content: [{ type: 'toolCall', id: 'tc', name: 'raw_read', arguments: { objToken: 'synthetic' } }] }, 'live-first');
@@ -153,7 +179,7 @@ describe('SessionService（内存 store）', () => {
     expect(renamed?.title).toBe('新名字');
   });
 
-  it('模式切换：work 需 confirm WORK + 有效 workspace；discuss 回切清绑定', async () => {
+  it('模式切换：work 需 confirm WORK + 有效 workspace；discuss 保留分组', async () => {
     const { service, store } = makeService(makeConfig());
     const session = service.create(store, {});
     await expect(service.switchMode(store, session.id, { mode: 'work', workspaceId: 'ws_test1' }))
@@ -165,7 +191,7 @@ describe('SessionService（内存 store）', () => {
     expect(switched?.workspace?.id).toBe('ws_test1');
     const back = await service.switchMode(store, session.id, { mode: 'discuss' });
     expect(back?.mode).toBe('discuss');
-    expect(back?.workspace).toBeNull();
+    expect(back?.workspace?.id).toBe('ws_test1');
   });
 
   it('Workspace 删除时绑定的 Work 会话自动切回 discuss', async () => {

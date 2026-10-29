@@ -9,22 +9,17 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import {
-  Check,
   FilePlus2,
   FolderPlus,
   Hammer,
   Loader2,
   MessageCircle,
-  Pencil,
-  ShieldCheck,
   Trash2,
 } from 'lucide-react';
 import { Button } from '../common/Button';
 import { Modal } from '../common/Modal';
-import { StatusBadge } from '../common/StatusBadge';
 import { useToast } from '../common/Toast';
 import { addAgentWorkspace, APIError, deleteAgentWorkspace, listAgentWorkspaces } from '../../api/client';
-import { formatRelativeTime } from '../../utils/agentReadiness';
 import type { AgentSessionDto, AgentWorkspaceConfig } from '../../types/agent';
 import type { WriteRecord } from '../../hooks/useAgentSessions';
 
@@ -35,9 +30,10 @@ interface AgentModePanelProps {
     body: { mode: 'discuss' } | { mode: 'work'; workspaceId: string; confirm: 'WORK' },
   ) => Promise<boolean>;
   writeRecords: WriteRecord[];
+  onWorkspacesChanged?: () => void;
 }
 
-export function AgentModePanel({ session, busy, onSwitchMode, writeRecords }: AgentModePanelProps) {
+export function AgentModePanel({ session, busy, onSwitchMode, onWorkspacesChanged }: AgentModePanelProps) {
   const toast = useToast();
   const [modalOpen, setModalOpen] = useState(false);
   const [workspaces, setWorkspaces] = useState<AgentWorkspaceConfig[] | null>(null);
@@ -123,6 +119,7 @@ export function AgentModePanel({ session, busy, onSwitchMode, writeRecords }: Ag
     try {
       const created = await addAgentWorkspace({ name, path: dir });
       setWorkspaces((prev) => [...(prev ?? []), created]);
+      onWorkspacesChanged?.();
       setSelectedWs(created.id);
       setNewName('');
       setNewPath('');
@@ -142,6 +139,7 @@ export function AgentModePanel({ session, busy, onSwitchMode, writeRecords }: Ag
     try {
       await deleteAgentWorkspace(id);
       setWorkspaces((prev) => (prev ?? []).filter((w) => w.id !== id));
+      onWorkspacesChanged?.();
       if (selectedWs === id) setSelectedWs('');
       toast.push({ type: 'info', message: `Workspace「${name}」已移除（绑定它的 Work 会话将切回 Discuss）` });
     } catch (err) {
@@ -153,86 +151,13 @@ export function AgentModePanel({ session, busy, onSwitchMode, writeRecords }: Ag
   };
 
   return (
-    <div className="flex flex-col h-full min-h-0" data-testid="agent-mode-panel">
-      <div className="px-4 py-3 border-b border-line/60 shrink-0">
-        <h3 className="text-sm font-kai font-medium text-ink flex items-center gap-1.5">
-          <ShieldCheck className="w-3.5 h-3.5 text-jade" />
-          模式与权限
-        </h3>
-      </div>
-
-      <div className="flex-1 min-h-0 overflow-auto scrollbar-thin p-4 space-y-4">
-        {/* 当前模式 */}
-        <section>
-          <div className="flex items-center gap-2">
-            {isWork ? (
-              <StatusBadge status="warning">
-                <Hammer className="w-3 h-3" /> Work 模式
-              </StatusBadge>
-            ) : (
-              <StatusBadge status="success">
-                <MessageCircle className="w-3 h-3" /> Discuss 模式
-              </StatusBadge>
-            )}
-          </div>
-          <p className="mt-2 text-[11px] text-ink-soft leading-relaxed">
-            {isWork
-              ? '应用自带工具可读知识库、写绑定Workspace，无shell；第三方Pi插件以当前用户权限运行。'
-              : '应用自带工具只读知识库，无shell；第三方Pi插件以当前用户权限运行。'}
-          </p>
-          {isWork && session?.workspace ? (
-            <div className="mt-2.5 px-3 py-2.5 rounded-md border border-[rgba(180,83,9,0.3)] bg-[rgba(180,83,9,0.04)]">
-              <p className="text-xs font-medium text-ink">{session.workspace.name}</p>
-              <p className="mt-0.5 text-[11px] text-ink-faint font-mono break-all">{session.workspace.path}</p>
-            </div>
-          ) : null}
-        </section>
-
-        {/* Work 写入记录 */}
-        {isWork ? (
-          <section>
-            <h4 className="text-xs font-medium text-ink mb-1.5">写入记录</h4>
-            {writeRecords.length === 0 ? (
-              <p className="text-[11px] text-ink-faint">本次会话暂无文件写入。</p>
-            ) : (
-              <ul className="space-y-1">
-                {writeRecords.map((r, i) => (
-                  <li
-                    key={`${r.at}-${i}`}
-                    className={`flex items-start gap-1.5 px-2 py-1.5 rounded border text-[11px] ${
-                      r.ok ? 'border-line/60 bg-paper/40' : 'border-seal-2/30 bg-[rgba(192,57,43,0.05)]'
-                    }`}
-                  >
-                    {r.ok ? <Check className="w-3 h-3 mt-0.5 shrink-0 text-jade" /> : <Pencil className="w-3 h-3 mt-0.5 shrink-0 text-seal-2" />}
-                    <span className="min-w-0 flex-1">
-                      <span className="font-mono break-all">{r.path}</span>
-                      <span className="ml-1 text-ink-faint">({r.tool})</span>
-                      {!r.ok ? <span className="block text-seal-2">{r.detail}</span> : null}
-                    </span>
-                    <span className="shrink-0 text-ink-faint">{formatRelativeTime(r.at)}</span>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </section>
-        ) : null}
-
-        {/* 切换动作 */}
-        <section className="pt-1">
-          {isWork ? (
-            <Button size="sm" variant="secondary" onClick={switchBackToDiscuss} loading={switching} disabled={running} className="w-full">
-              切回 Discuss（只读）
-            </Button>
-          ) : (
-            <Button size="sm" variant="primary" onClick={() => setModalOpen(true)} disabled={running} className="w-full">
-              <Hammer className="w-3.5 h-3.5" />
-              切换到 Work 模式
-            </Button>
-          )}
-          {running ? <p className="mt-1.5 text-[10px] text-ink-faint">运行中的会话不能切换模式，请先停止。</p> : null}
-        </section>
-      </div>
-
+    <>
+      <button type="button" disabled={!session || running || switching} aria-label="切换会话模式"
+        title={isWork ? '切换到 Chat（只读）' : '切换到 Work（可写工作区）'}
+        className="inline-flex items-center gap-1 px-2 py-1 rounded border border-line text-xs text-ink-soft hover:text-seal hover:border-seal/50 disabled:opacity-50"
+        onClick={() => { if (isWork) void switchBackToDiscuss(); else if (session?.workspace) { setSwitching(true); void onSwitchMode({ mode: 'work', workspaceId: session.workspace.id, confirm: 'WORK' }).then((ok) => { if (!ok) toast.push({ type: 'error', message: '切换 Work 失败，请重试' }); }).finally(() => setSwitching(false)); } else setModalOpen(true); }}>
+        {isWork ? <Hammer className="w-3 h-3" /> : <MessageCircle className="w-3 h-3" />} {isWork ? 'Work' : 'Chat'}
+      </button>
       {/* Work 切换确认 Modal（显式授权，§7.6） */}
       <Modal
         open={modalOpen}
@@ -360,6 +285,6 @@ export function AgentModePanel({ session, busy, onSwitchMode, writeRecords }: Ag
           </div>
         </div>
       </Modal>
-    </div>
+    </>
   );
 }

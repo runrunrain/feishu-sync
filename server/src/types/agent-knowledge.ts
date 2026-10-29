@@ -63,7 +63,7 @@ export interface AgentConfig {
   model: AgentModelConfig;
   /** 图片理解通道（S2）；缺省 disabled，见 buildDefaultAgentVisionConfig */
   vision: AgentVisionConfig;
-  /** 任务编排参数（S6，设计 kb-agent-upgrade §5.1/§5.2）；开关本身在内置插件条目 orchestration 上（默认停用） */
+  /** 任务编排参数；开关位于内置插件条目 orchestration，默认启用。 */
   orchestration: AgentOrchestrationConfig;
   maxConcurrentProcesses: number;
   idleTimeoutMinutes: number;
@@ -122,7 +122,7 @@ export function buildDefaultAgentVisionConfig(): AgentVisionConfig {
 
 export function buildDefaultAgentOrchestrationConfig(): AgentOrchestrationConfig {
   return {
-    maxActiveTasksPerSession: 8,
+    maxActiveTasksPerSession: 5,
     taskTimeoutMinutes: 30,
   };
 }
@@ -400,6 +400,7 @@ export type AgentSessionState = 'idle' | 'starting' | 'streaming' | 'error';
 export type SessionModelConfig = Pick<AgentModelConfig, 'source' | 'providerId' | 'modelId' | 'piModel' | 'thinkingLevel'>;
 
 export interface AgentSessionDto {
+  approvalMode?: 'ask' | 'auto';
   backend?: 'pi' | 'claude-code';
   model?: SessionModelConfig | null;
   id: string;

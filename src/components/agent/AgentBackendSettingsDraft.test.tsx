@@ -29,7 +29,11 @@ it('基础能力基座的选择先进入统一草稿，只在总保存后提交'
   const click = async (label: string) => act(async () => [...container.querySelectorAll('button')].find((button) => button.textContent?.trim() === label)!.click());
   try {
     await act(async () => root.render(<SettingsDraftProvider><Save /><AgentRuntimeSettingsCard /></SettingsDraftProvider>));
-    await click('Pi');
+    await click('Pi 配置');
+    expect((container.querySelector('[aria-label="应用基础能力的 Agent 基座"]') as HTMLSelectElement).value).toBe('claude-code');
+    expect(container.textContent).toContain('本地 Agent 配置（Pi）');
+    const backendSelect = container.querySelector('[aria-label="应用基础能力的 Agent 基座"]') as HTMLSelectElement;
+    await act(async () => { backendSelect.value = 'pi'; backendSelect.dispatchEvent(new Event('change', { bubbles: true })); });
     expect(api.save).not.toHaveBeenCalled();
     const testButton = [...container.querySelectorAll('button')].find((button) => button.textContent === '测试 Claude Code 连接')!;
     expect(testButton.disabled).toBe(true);

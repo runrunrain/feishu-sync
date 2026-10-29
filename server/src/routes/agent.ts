@@ -227,9 +227,9 @@ export async function agentRoutes(deps: AgentRouteDeps): Promise<Hono> {
 
   routes.post('/api/agent/sessions', async (c) => {
     try {
-      let body: { title?: string; mode?: string; backend?: string } = {};
+      let body: { title?: string; mode?: string; backend?: string; workspaceId?: string } = {};
       try {
-        body = await c.req.json() as { title?: string; mode?: string; backend?: string };
+        body = await c.req.json() as { title?: string; mode?: string; backend?: string; workspaceId?: string };
       } catch {
         /* 空 body 合法 */
       }
@@ -257,6 +257,14 @@ export async function agentRoutes(deps: AgentRouteDeps): Promise<Hono> {
     } catch (error) {
       return errorResponse(c, error);
     }
+  });
+
+  routes.put('/api/agent/sessions/:id/approval-mode', async (c) => {
+    try {
+      const body = await c.req.json().catch(() => null) as { mode?: unknown } | null;
+      if (body?.mode !== 'ask' && body?.mode !== 'auto') throw new ToolError('invalid_request', '请选择有效的审批方式');
+      return c.json(sessionService.setApprovalMode(localMapStore, c.req.param('id'), body.mode));
+    } catch (error) { return errorResponse(c, error); }
   });
 
   routes.delete('/api/agent/sessions/:id', async (c) => {

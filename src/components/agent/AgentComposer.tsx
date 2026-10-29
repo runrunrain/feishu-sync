@@ -17,6 +17,7 @@ import { CornerDownLeft, ListPlus, Send, Settings2, Square } from 'lucide-react'
 import { Button } from '../common/Button';
 import type { AgentSessionDto, AgentStatusDto } from '../../types/agent';
 import type { ReadinessCopy } from '../../utils/agentReadiness';
+import { setSessionApprovalMode } from '../../api/client';
 
 interface AgentComposerProps {
   session: AgentSessionDto | null;
@@ -50,6 +51,8 @@ export function AgentComposer({
   onModelChanged,
 }: AgentComposerProps) {
   const [text, setText] = useState('');
+  const [approvalSaving, setApprovalSaving] = useState(false);
+  const [approvalError, setApprovalError] = useState('');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const notReady = agentUnreachable || !agentStatus || agentStatus.code !== 'ready';
@@ -130,7 +133,17 @@ export function AgentComposer({
             data-testid="agent-composer-input"
           />
           <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
-            <ConversationModelPicker session={session} busy={running || sending} onChanged={onModelChanged} />
+            <div className="flex flex-wrap items-center gap-2">
+              <ConversationModelPicker session={session} busy={running || sending} onChanged={onModelChanged} />
+              {session?.mode === 'work' && <select aria-label="Work 审批方式" value={session.approvalMode ?? 'ask'} disabled={running || sending || approvalSaving}
+                className="rounded border border-line bg-card-bg px-2 py-1 text-xs text-ink-soft"
+                onChange={(event) => {
+                  const mode = event.target.value as 'ask' | 'auto'; setApprovalError(''); setApprovalSaving(true);
+                  void setSessionApprovalMode(session.id, mode).then(() => onModelChanged()).catch((error) => setApprovalError(error instanceof Error ? error.message : '审批方式切换失败')).finally(() => setApprovalSaving(false));
+                }}>
+                <option value="ask">逐次审批</option><option value="auto">免审批</option>
+              </select>}
+            </div>
           <div className="flex flex-wrap items-center gap-1.5 shrink-0">
             {running ? (
               <>
@@ -175,6 +188,8 @@ export function AgentComposer({
           </div>
           </div>
         </div>
+        {approvalError && <p role="alert" className="mt-1 text-xs text-seal-2">{approvalError}</p>}
+        {session?.mode === 'work' && <p className="mt-1 text-[10px] text-ink-faint">审批方式控制应用命令；免审批允许本会话直接执行写入、删除和云端写操作。重启应用后恢复逐次审批。</p>}
         <p className="mt-1.5 text-[10px] text-ink-faint">
           {text.length > MAX_TEXT * 0.8 ? `${text.length}/${MAX_TEXT} 字符 · ` : ''}
           应用自带工具：Discuss 只读；Work 仅可写绑定 Workspace，无 shell。{session?.backend === 'claude-code' ? 'Claude Code 不加载 Pi 专用扩展。' : '第三方 Pi 插件按其自身能力运行。'}

@@ -323,6 +323,7 @@ export type AgentSessionState = 'idle' | 'starting' | 'streaming' | 'error';
 export type SessionModelConfig = Pick<AgentConfig['model'], 'source' | 'providerId' | 'modelId' | 'piModel' | 'thinkingLevel'>;
 
 export interface AgentSessionDto {
+  approvalMode?: 'ask' | 'auto';
   backend?: 'pi' | 'claude-code';
   model?: SessionModelConfig | null;
   id: string;

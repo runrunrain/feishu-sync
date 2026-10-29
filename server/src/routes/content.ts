@@ -25,6 +25,7 @@ import {
   joinRelative,
 } from '../modules/path-resolver.js';
 import { resolveSourceLinks, type ResolvedSourceLink, type SourceLinkEdgeRow } from '../kb/source-links.js';
+import { recoverLocalDocument } from '../modules/recover-local-document.js';
 import type { DocumentRecord } from '../types/index.js';
 
 const MAX_FILE_BYTES = 512 * 1024;
@@ -40,6 +41,9 @@ interface ContentDependencies {
       lastSyncedAt?: string | null;
       syncedObjEditTime?: number | null;
       wikiNodeToken?: string | null;
+      syncState?: DocumentRecord['syncState'];
+      lastSyncErrorCode?: string | null;
+      cloudMatch?: DocumentRecord['cloudMatch'];
     } | null;
     /** P1-S3：入边查询（被引用，设计 §2.3）——可选以兼容旧测试替身。 */
     listSourceReferencesByTarget?: (targetTokens: string[]) => unknown[];
@@ -253,8 +257,9 @@ contentRoutes.get('/api/mapping/content/:objToken', async (c) => {
     // Resolve the markdown path defensively: the column may hold an absolute
     // path written by older versions, or a portable relative path. Either way
     // the result must land inside knowledgeBaseRoot.
-    const mdRel = doc.localMdPath
-      ? toPortableRelative(knowledgeBaseRoot, doc.localMdPath)
+    const localPath = doc.localMdPath || recoverLocalDocument(knowledgeBaseRoot, doc);
+    const mdRel = localPath
+      ? toPortableRelative(knowledgeBaseRoot, localPath)
       : null;
 
     let mdPath: string | null = null;

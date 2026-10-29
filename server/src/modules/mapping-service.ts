@@ -23,6 +23,7 @@
  */
 
 import { reconcileLocalIndex } from './local-index-reconcile.js';
+import { recoverLocalDocument } from './recover-local-document.js';
 import { localPathState } from './local-path-state.js';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -70,6 +71,11 @@ export class MappingService {
   private blockedTokens(): Set<string> {
     const root = this.configManager?.getConfig()?.knowledgeBaseRoot ?? '';
     return new Set(this.localMapStore.listSyncBlockedSources?.(root).map((row) => row.objToken) ?? []);
+  }
+
+  private withRecoveredPath(doc: DocumentRecord): DocumentRecord {
+    const recovered = recoverLocalDocument(this.configManager?.getConfig()?.knowledgeBaseRoot ?? '', doc);
+    return recovered ? { ...doc, localMdPath: recovered } : doc;
   }
 
   private missingWorkbook(doc: DocumentRecord): boolean {
@@ -446,7 +452,7 @@ export class MappingService {
       if (d.parentNodeToken) parentSet.add(d.parentNodeToken);
     }
 
-    return live.map((d) => this.projectNode(d, parentSet, blocked.has(d.objToken)));
+    return live.map((d) => this.projectNode(this.withRecoveredPath(d), parentSet, blocked.has(d.objToken)));
   }
 
   /**
@@ -520,7 +526,7 @@ export class MappingService {
             d.customFolderId == null,
         )
         .map((d) => {
-          const node = this.projectNode(d, parentSet, blocked.has(d.objToken));
+          const node = this.projectNode(this.withRecoveredPath(d), parentSet, blocked.has(d.objToken));
           if (!(d.title ?? '').trim()) {
             const state = d.syncState ?? d.status;
             if (state === 'restricted' || d.cloudMatch === 'restricted' || d.status === 'placeholder') {
@@ -540,7 +546,7 @@ export class MappingService {
         });
     } else {
       // Local view: all rows (including local-only README/index).
-      nodes = live.map((d) => this.projectNode(d, parentSet, blocked.has(d.objToken)));
+      nodes = live.map((d) => this.projectNode(this.withRecoveredPath(d), parentSet, blocked.has(d.objToken)));
     }
 
     // watched_roots envelope (always present).

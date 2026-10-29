@@ -74,6 +74,7 @@ export function MessageStream({ messages, draft, streamErrors, loading, emptyHin
                 key={t.callId}
                 name={t.name}
                 summary={t.phase === 'end' ? t.resultSummary || t.argsSummary : t.argsSummary}
+                args={t.argsSummary}
                 running={t.phase === 'start'}
                 isError={t.isError === true}
               />
@@ -164,9 +165,7 @@ function MessageRow({ message }: { message: AgentMessageDto }) {
           {message.toolCalls && message.toolCalls.length > 0 ? (
             <div className="mb-1.5 space-y-1">
               {message.toolCalls.map((tc) => (
-                <p key={tc.id} className="text-[11px] text-ink-faint font-mono truncate">
-                  ⚙ {tc.name} {tc.argsSummary}
-                </p>
+                <ToolRow key={tc.id} name={tc.name} summary={tc.argsSummary} args={tc.argsSummary} running={false} invocation />
               ))}
             </div>
           ) : null}
@@ -210,19 +209,23 @@ function MessageRow({ message }: { message: AgentMessageDto }) {
 function ToolRow({
   name,
   summary,
+  args,
+  invocation,
   running,
   isError,
 }: {
   name: string;
   summary: string;
+  args?: string;
+  invocation?: boolean;
   running: boolean;
   isError?: boolean;
 }) {
   // task_* 工具（S7 编排）用列表图标区分普通工具；行形态沿用 ToolRow。
   const TaskIcon = name.startsWith('task_') ? ListTodo : Wrench;
   return (
-    <div
-      className={`inline-flex items-start gap-2 max-w-full px-3 py-1.5 rounded-md border text-[11px] font-mono ${
+    <details
+      className={`max-w-full px-3 py-1.5 rounded-md border text-[11px] font-mono ${
         isError
           ? 'border-seal-2/30 bg-[rgba(192,57,43,0.05)] text-seal-2'
           : running
@@ -232,6 +235,7 @@ function ToolRow({
       data-tool={name}
       data-tool-phase={running ? 'start' : isError ? 'error' : 'end'}
     >
+      <summary className="flex items-start gap-2 cursor-pointer list-none">
       {running ? (
         <Loader2 className="w-3 h-3 mt-0.5 shrink-0 animate-spin text-jade" />
       ) : isError ? (
@@ -241,9 +245,16 @@ function ToolRow({
       )}
       <TaskIcon className="w-3 h-3 mt-0.5 shrink-0 opacity-60" />
       <span className="font-medium">{name}</span>
+      <span className="shrink-0">{running ? '执行中' : isError ? '失败' : invocation ? '已调用' : '完成'}</span>
       <span className="truncate" title={summary}>
         {summary}
       </span>
-    </div>
+      </summary>
+      <div className="mt-2 space-y-1 text-ink-soft whitespace-pre-wrap break-all">
+        {args ? <p>参数：{args}</p> : null}
+        {!running && summary && summary !== args ? <p>结果：{summary}</p> : null}
+        {!args && summary ? <p>结果：{summary}</p> : null}
+      </div>
+    </details>
   );
 }

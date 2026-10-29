@@ -56,6 +56,7 @@ export interface OpsFamilyDeps {
   toolCallRun?: (sessionId: string, toolCallId: string) => string | null;
   /** T3b-07R：会话当前可执行轮 runId；无活跃运行返回 null。 */
   currentRunId?: (sessionId: string) => string | null;
+  approvalMode?: (sessionId: string) => 'ask' | 'auto';
   /**
    * T3e-R3-02：会话停止信号（批准后异步复核链取消源）。停止请求时
    * 触发——复核 preview 挂起期间立即按停止处理，不等它返回。缺省不
@@ -353,6 +354,11 @@ export function createOpsToolFamily(deps: OpsFamilyDeps): AgentToolFamily {
               );
             }
           }
+        }
+        if (deps.approvalMode?.(sessionId) === 'auto') {
+          assertRoundExecutable();
+          deps.approvals.audit(sessionId, { path: def.name, result: 'auto_approved', risk: def.risk });
+          return runSpecs();
         }
         const { settled } = deps.approvals.begin({
           sessionId,
