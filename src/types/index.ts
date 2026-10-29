@@ -62,6 +62,7 @@ export interface LlmModelPreset {
   contextWindow?: number;
   maxTokens?: number;
   reasoning?: boolean;
+  thinkingLevels?: Array<'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'>;
   /** 该预设是否支持图片输入（仅 UI 提示用途；S2 vision 通道不依赖此字段判定可用性） */
   supportsImages?: boolean;
 }

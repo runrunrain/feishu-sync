@@ -45,6 +45,7 @@ export interface AgentStatusDto {
     source: 'app-llm' | 'pi-agent-dir';
     model: string | null;
     available: string[];
+    capabilities?: Record<string, Array<'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'>>;
   };
   processes: { running: number; max: number };
   checkedAt: string;
@@ -87,7 +88,8 @@ export interface AgentConfig {
     providerId?: string;
     modelId?: string;
     piModel?: string;
-    thinkingLevel: 'off' | 'minimal' | 'low' | 'medium' | 'high';
+    thinkingLevel: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+    piThinkingLevels?: Record<string, Array<'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'>>;
     contextWindow: number;
     maxTokens: number;
   };

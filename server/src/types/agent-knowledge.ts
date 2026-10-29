@@ -21,7 +21,7 @@ export interface AgentWorkspaceConfig {
 
 export type AgentModelSource = 'app-llm' | 'pi-agent-dir';
 
-export type AgentThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high';
+export type AgentThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
 export interface AgentModelConfig {
   source: AgentModelSource;
@@ -30,6 +30,7 @@ export interface AgentModelConfig {
   modelId?: string;
   /** pi-agent-dir：'provider/id' */
   piModel?: string;
+  piThinkingLevels?: Record<string, AgentThinkingLevel[]>;
   thinkingLevel: AgentThinkingLevel;
   /** app-llm 注册 provider 用（上下文窗口），默认 128000 */
   contextWindow: number;
@@ -194,6 +195,7 @@ export interface AgentStatusDto {
     source: AgentModelSource;
     model: string | null;
     available: string[];
+    capabilities?: Record<string, AgentThinkingLevel[]>;
   };
   processes: { running: number; max: number };
   checkedAt: string;

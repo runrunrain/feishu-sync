@@ -40,6 +40,7 @@ import { SyncBlocklistCard } from '../components/SyncBlocklistCard';
 import { CustomArchiveSettingsCard } from '../components/CustomArchiveSettingsCard';
 import { SyncMediaSettingsCard } from '../components/SyncMediaSettingsCard';
 import { ModelProviderSettings } from '../components/ModelProviderSettings';
+import { ModelDefaultsSettings } from '../components/ModelDefaultsSettings';
 import { AuthSettingsCard } from '../components/AuthSettingsCard';
 import { AppUpdateCard } from '../components/AppUpdateCard';
 import { AgentPluginsCard } from '../components/agent/AgentPluginsCard';
@@ -131,6 +132,13 @@ const SETTINGS_TABS: SettingsTabMeta[] = [
         description: 'Chat Completions、Responses、Anthropic 与模型预设',
         icon: Server,
         render: () => <ModelProviderSettings />,
+      },
+      {
+        id: 'md-defaults',
+        label: '默认模型与文档整理',
+        description: '应用默认提供商、模型预设与同步整理',
+        icon: Settings,
+        render: () => <ModelDefaultsSettings />,
       },
     ],
   },

@@ -43,6 +43,9 @@ export function buildAppLlmRunConfig(
       models: [{
         id: resolution.openAiModel,
         ...providerModelParameters(resolution, agent.model),
+        ...(resolution.thinkingLevels ? { thinkingLevelMap: Object.fromEntries(
+          ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'].map((level) => [level, resolution.thinkingLevels!.includes(level as typeof resolution.thinkingLevels[number]) ? level : null]),
+        ) } : {}),
       }],
     }),
   };

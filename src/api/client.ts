@@ -1474,6 +1474,7 @@ export async function applySourceBatch(requestBody: SourceBatchRequest, expected
 export interface AgentModelOption {
   source: 'app-llm' | 'pi-agent-dir'; providerId?: string; modelId?: string; piModel?: string;
   label: string; reasoning: boolean;
+  thinkingLevels?: import('../types/agent').AgentConfig['model']['thinkingLevel'][] | null;
 }
 export function listConversationModels(source: 'app-llm' | 'pi-agent-dir', refresh = false, backend?: 'pi' | 'claude-code'): Promise<{ items: AgentModelOption[]; message: string }> {
   return request(`/api/agent/models?source=${source}${refresh ? '&refresh=1' : ''}${backend ? `&backend=${backend}` : ''}`);

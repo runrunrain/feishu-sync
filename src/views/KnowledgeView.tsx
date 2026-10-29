@@ -96,6 +96,7 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
   const [sidebar, setSidebar] = useState<'directory' | 'sources' | 'build' | 'publish' | 'manage' | null>(null);
   const [cancelling, setCancelling] = useState(false);
   const [confirming, setConfirming] = useState<'incremental' | 'full' | null>(null);
+  const [selectedBuildCount, setSelectedBuildCount] = useState(0);
   const [starting, setStarting] = useState(false);
 
   const [changeTab, setChangeTab] = useState<KbChangeTab | null>(null);
@@ -391,8 +392,7 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
               {onJumpToSettings ? <Button size="sm" onClick={onJumpToSettings}>前往设置</Button> : null}</>} />
             : <EmptyCard icon={<Sparkles className="w-8 h-8 text-jade" />} title="尚未发布标准知识库"
               description="选择参与构建的原始文档后，生成可阅读、可追溯的标准知识库。"
-              actions={<><Button size="sm" variant="secondary" onClick={() => setChangeTab('sources')}>选择源文档</Button>
-                <Button size="sm" disabled={!agentReady || running} onClick={() => setConfirming('full')}>开始全量构建</Button></>} />
+              action={<Button size="sm" onClick={() => setChangeTab('sources')}>选择源文档</Button>} />
           : docLoading || treeLoading ? <div className="p-8 animate-pulse space-y-4" aria-busy="true">
             {Array.from({ length: 10 }).map((_, i) => <div key={i} className="h-3 bg-paper-2 rounded" />)}
           </div> : docError ? <EmptyCard icon={<AlertCircle className="w-8 h-8 text-seal-2" />} title="文档加载失败" description={docError}
@@ -457,8 +457,6 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
               {!agentReady && readiness?.action ? <p className="text-ink-faint leading-relaxed">{readiness.action}</p> : null}
               <Button size="sm" variant="secondary" className="w-full" disabled={!agentReady || running || starting}
                 loading={starting && confirming === 'incremental'} onClick={() => setConfirming('incremental')}>按变更更新</Button>
-              <Button size="sm" className="w-full" disabled={!agentReady || running || starting}
-                loading={starting && confirming === 'full'} onClick={() => setConfirming('full')}>全量构建</Button>
               <button type="button" className="text-ink-faint underline" onClick={agentReady ? () => void agent.recheck() : onJumpToSettings}>检查运行时与模型</button>
             </div>
           </div>}
@@ -494,26 +492,27 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
         canUpdate={agentReady && !starting}
         onChanged={() => { void loadStatus(); setDocReload((n) => n + 1); }}
         onUpdate={() => { setChangeTab(null); setConfirming('incremental'); }}
+        onBuildSelected={(count) => { setSelectedBuildCount(count); setChangeTab(null); setConfirming('full'); }}
         onOpenSource={(choice) => { setChangeTab(null); setSource({ objToken: choice.objToken, title: choice.title, relPath: choice.relPath, state: choice.included ? 'current' : 'excluded' }); }} />
 
       {/* 构建确认弹窗 */}
       <Modal
         open={confirming !== null}
-        title={confirming === 'full' ? '确认全量构建' : '确认按变更更新'}
+        title={confirming === 'full' ? '确认构建所选文档' : '确认按变更更新'}
         onClose={() => setConfirming(null)}
       >
         {confirming === 'full' ? (
           <div className="space-y-3 text-sm text-ink-soft leading-relaxed">
             <p>
-              全量构建将<b className="text-ink">重新生成标准库的全部文档</b>
-              {kbStatus?.current ? `（当前 ${kbStatus.current.docCount} 篇将被新发布替换）` : ''}。
-              按变更更新与全量构建都会消耗已配置模型的额度；全量通常耗时与费用更高。
+              将使用当前已选的 <b className="text-ink">{selectedBuildCount} 篇源文档</b>重新生成标准库。
+              {kbStatus?.current ? `新版本会替换当前发布的 ${kbStatus.current.docCount} 篇标准文档，未选源文档的内容不会保留在新版本中。` : ''}
+              构建会消耗已配置模型的额度。
             </p>
             <p className="text-xs text-ink-faint">
               发布前旧版本保持可用；任何失败都不会改变当前已发布的版本。
             </p>
             <ConfirmActions
-              confirmLabel="开始全量构建"
+              confirmLabel="开始构建"
               busy={starting}
               onConfirm={() => startBuild('full')}
               onCancel={() => setConfirming(null)}

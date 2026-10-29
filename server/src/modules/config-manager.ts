@@ -262,7 +262,7 @@ export function reconcileModelAlias(
 // Agent 标准知识库配置段（F1，additive）：默认合并 + 严格校验
 // ===========================================================================
 
-const THINKING_LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high']);
+const THINKING_LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
 const MODEL_SOURCES = new Set(['app-llm', 'pi-agent-dir']);
 const WORKSPACE_ID_PATTERN = /^ws_[A-Za-z0-9]{6,32}$/;
 
@@ -304,6 +304,8 @@ function normalizeAgentConfigLoose(value: unknown, dataRoot: string): AgentConfi
       providerId: typeof modelRaw.providerId === 'string' && modelRaw.providerId ? modelRaw.providerId : undefined,
       modelId: typeof modelRaw.modelId === 'string' && modelRaw.modelId ? modelRaw.modelId : undefined,
       piModel: typeof modelRaw.piModel === 'string' && modelRaw.piModel.trim() ? modelRaw.piModel.trim() : undefined,
+      piThinkingLevels: modelRaw.piThinkingLevels && typeof modelRaw.piThinkingLevels === 'object' && !Array.isArray(modelRaw.piThinkingLevels)
+        ? Object.fromEntries(Object.entries(modelRaw.piThinkingLevels).filter(([, levels]) => Array.isArray(levels)).map(([id, levels]) => [id, levels.filter((level) => THINKING_LEVELS.has(level))])) : undefined,
       thinkingLevel: THINKING_LEVELS.has(modelRaw.thinkingLevel as string)
         ? (modelRaw.thinkingLevel as AgentConfig['model']['thinkingLevel'])
         : 'off',
@@ -634,6 +636,7 @@ function normalizeModelPresets(
       ...(Number.isInteger(raw.contextWindow) && raw.contextWindow! >= 1024 ? { contextWindow: raw.contextWindow } : {}),
       ...(Number.isInteger(raw.maxTokens) && raw.maxTokens! >= 1 ? { maxTokens: Math.min(raw.maxTokens!, Number.isInteger(raw.contextWindow) && raw.contextWindow! >= 1024 ? raw.contextWindow! : Number.MAX_SAFE_INTEGER) } : {}),
       ...(typeof raw.reasoning === 'boolean' ? { reasoning: raw.reasoning } : {}),
+      ...(Array.isArray(raw.thinkingLevels) ? { thinkingLevels: raw.thinkingLevels.filter((level) => THINKING_LEVELS.has(level)) } : {}),
       ...(typeof raw.supportsImages === 'boolean' ? { supportsImages: raw.supportsImages } : {}),
       enabled: typeof raw.enabled === 'boolean' ? raw.enabled : true,
     });

@@ -267,6 +267,12 @@ export function AgentRuntimeSettingsCard() {
     || (!agentStatus.unreachable && agentStatus.status?.model.source !== source);
   const invalidPiModel = Boolean(piModel) && !loadingModels && !piModels.includes(piModel);
   const thinking = agent?.model?.thinkingLevel ?? 'off';
+  const selectedPreset = selectedProvider?.models.find((model) => model.id === currentModelId);
+  const detectedPiLevels = agentStatus.status?.model.capabilities?.[piModel];
+  const manualPiLevels = agent?.model?.piThinkingLevels?.[piModel];
+  const knownLevels = source === 'pi-agent-dir'
+    ? detectedPiLevels ?? (manualPiLevels ? ['off' as const, ...manualPiLevels.filter((level) => level !== 'off')] : undefined)
+    : selectedPreset?.reasoning ? (selectedPreset.thinkingLevels ? ['off' as const, ...selectedPreset.thinkingLevels.filter((level) => level !== 'off' && (backend !== 'claude-code' || level !== 'minimal'))] : undefined) : ['off' as const];
 
   const saveAgent = async (patch: {
     runtime?: Partial<AgentConfig['runtime']>;
@@ -637,12 +643,16 @@ export function AgentRuntimeSettingsCard() {
             onChange={(e) => saveAgent({ model: { thinkingLevel: e.target.value as AgentConfig['model']['thinkingLevel'] } })}
             aria-label="思考档位"
           >
-            <option value="off">关闭</option>
-            <option value="minimal">最小</option>
-            <option value="low">低</option>
-            <option value="medium">中</option>
-            <option value="high">高</option>
+            {!knownLevels?.includes(thinking) && <option value={thinking} disabled>当前档位未确认</option>}
+            {(knownLevels ?? ['off' as const]).map((level) => <option key={level} value={level}>{{ off: '关闭', minimal: '最低', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最大' }[level]}</option>)}
           </select>
+          {!knownLevels && <p className="mt-1 text-xs text-ink-faint">无法探测思考档位，请先配置模型支持的档位。</p>}
+          {source === 'pi-agent-dir' && piModel && !detectedPiLevels && <div className="mt-2 flex flex-wrap gap-2">
+            {(['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const).map((level) => <label key={level} className="flex items-center gap-1 text-xs text-ink-soft"><input type="checkbox" checked={manualPiLevels?.includes(level) ?? false} onChange={(event) => {
+              const levels = event.target.checked ? [...(manualPiLevels ?? []), level] : (manualPiLevels ?? []).filter((item) => item !== level);
+              void saveAgent({ model: { piThinkingLevels: { ...agent?.model.piThinkingLevels, [piModel]: levels } } });
+            }} />{{ minimal: '最低', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最大' }[level]}</label>)}
+          </div>}
         </div>
         <Button
           variant="secondary"

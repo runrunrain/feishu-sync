@@ -347,7 +347,7 @@ export class PiRuntimeResolver {
    */
   /** 相同配置/凭据签名共享探测；进程数始终取当前请求，不缓存成旧值。 */
   async checkReadiness(input: ReadinessProbeInput,
-    modelProbe?: (runtime: ResolvedRuntime) => Promise<{ ok: boolean; stderr?: string; available: string[] } | null>,
+    modelProbe?: (runtime: ResolvedRuntime) => Promise<{ ok: boolean; stderr?: string; available: string[]; capabilities?: AgentStatusDto['model']['capabilities'] } | null>,
     options: { force?: boolean } = {}): Promise<ReadinessResult> {
     const env = this.overrides.env ?? process.env;
     const home = env.PI_CODING_AGENT_DIR || path.join(os.homedir(), '.pi', 'agent');
@@ -378,7 +378,7 @@ export class PiRuntimeResolver {
 
   private async computeReadiness(
     input: ReadinessProbeInput,
-    modelProbe?: (runtime: ResolvedRuntime) => Promise<{ ok: boolean; stderr?: string; available: string[] } | null>,
+    modelProbe?: (runtime: ResolvedRuntime) => Promise<{ ok: boolean; stderr?: string; available: string[]; capabilities?: AgentStatusDto['model']['capabilities'] } | null>,
   ): Promise<ReadinessResult> {
     const { agentConfig, llmConfig, runningProcesses } = input;
     const runtime = await this.resolveRuntime(agentConfig);
@@ -557,14 +557,14 @@ export class PiRuntimeResolver {
           ...base,
           code: 'model_unconfigured',
           message: piModel ? `模型 ${piModel} 不在本机 pi 可用模型列表中` : '请从本机 pi 可用模型列表中选择模型',
-          model: { source: 'pi-agent-dir', model: piModel || null, available: probed.available },
+          model: { source: 'pi-agent-dir', model: piModel || null, available: probed.available, capabilities: probed.capabilities },
         });
       }
       return this.cache({
         ...base,
         code: 'ready',
         message: '运行时与模型均就绪',
-        model: { source: 'pi-agent-dir', model: piModel, available: probed.available },
+        model: { source: 'pi-agent-dir', model: piModel, available: probed.available, capabilities: probed.capabilities },
       });
     }
     return this.cache({

@@ -3,13 +3,15 @@ import { cleanupKbSources, getKbSourceTree, setKbSourcesSelection } from '../../
 import type { KbSourceChoice, KbSourceTreeDto } from '../../types/kb-version';
 import { sourceTreeRows, subtreeTokens } from '../../utils/kbSourceTree';
 import { Button } from '../common/Button';
+import { ChevronDown, ChevronRight, FileText, Folder } from 'lucide-react';
+const ROW_HEIGHT = 32;
 const LABEL = { added: '新增', changed: '修改', removed: '待移除', unchanged: '', excluded: '已排除' };
 function SelectionBox({ included, total, disabled, title, onChange, cleanup = false }: { included: number; total: number; disabled: boolean; title: string; onChange: () => void; cleanup?: boolean }) {
   const ref = useRef<HTMLInputElement>(null);
   useEffect(() => { if (ref.current) ref.current.indeterminate = included > 0 && included < total; }, [included, total]);
   return <input ref={ref} type="checkbox" aria-label={`${cleanup ? '选择清理' : '参与构建'}：${title}`} checked={total > 0 && included === total} disabled={disabled || !total} onChange={onChange} className="accent-[#9e2b25] shrink-0" />;
 }
-export function KbSourceSelector({ running, nonce, onChanged, onOpenSource }: { running: boolean; nonce: number; onChanged: () => void; onOpenSource: (source: KbSourceChoice) => void }) {
+export function KbSourceSelector({ running, nonce, onChanged, onOpenSource, canBuild, onBuild }: { running: boolean; nonce: number; onChanged: () => void; onOpenSource: (source: KbSourceChoice) => void; canBuild: boolean; onBuild: (count: number) => void }) {
   const [data, setData] = useState<KbSourceTreeDto | null>(null);
   const [cleanupMode, setCleanupMode] = useState(false);
   const [selected, setSelected] = useState(new Set<string>());
@@ -51,7 +53,7 @@ export function KbSourceSelector({ running, nonce, onChanged, onOpenSource }: { 
     finally { setBusy(false); }
   };
   const resetScroll = () => { setScroll(0); if (viewport.current) viewport.current.scrollTop = 0; };
-  const start = Math.max(0, Math.floor(scroll / 52) - 8); const end = Math.min(tree.rows.length, start + 45);
+  const start = Math.max(0, Math.floor(scroll / ROW_HEIGHT) - 8); const end = Math.min(tree.rows.length, start + Math.ceil((viewport.current?.clientHeight ?? 600) / ROW_HEIGHT) + 16);
   if (confirmation) return <div>
     <h4 className="text-base text-ink mb-3">确认清理 {confirmation.length} 篇源文档</h4>
     <p className="text-sm text-ink-soft leading-relaxed mb-3">将以下本地正文和已登记的表格附件移入原始库的回收目录，并清除对应索引。飞书云端原文保留；下次检测可能重新列为待同步，勾选同步后会下载回来。标准库中的已有内容会在下次「按变更更新」时处理，历史版本保留。</p>
@@ -77,13 +79,14 @@ export function KbSourceSelector({ running, nonce, onChanged, onOpenSource }: { 
     <p className="text-xs text-ink-faint mb-2">{q ? `批量操作作用于筛选出的 ${tree.targets.length} 篇文档；层级复选框始终包含全部下级。` : '批量操作覆盖全部文档，包括收起的层级。'}</p>
     {error ? <p role="alert" className="text-sm text-seal-2 mb-2">{error}</p> : null}
     {loading && !data ? <p className="py-6 text-sm text-ink-faint">正在读取源文档…</p> : <div ref={viewport} onScroll={(e) => setScroll(e.currentTarget.scrollTop)} className="h-[38vh] min-h-[180px] overflow-auto scrollbar-thin border-y border-line" aria-label="源文档层级">
-      <div style={{ height: tree.rows.length * 52, position: 'relative' }}>
+      <div style={{ height: tree.rows.length * ROW_HEIGHT, position: 'relative' }}>
         {tree.rows.slice(start, end).map(({ node, depth }, index) => {
           const count = tree.stats.get(node.id)!; const expanded = q.trim() || !collapsed.has(node.id);
-          return <div key={node.id} style={{ position: 'absolute', top: (start + index) * 52, height: 52, left: 0, right: 0, paddingLeft: Math.min(depth, 12) * 20 + 4 }} className="flex gap-3 items-center border-b border-line/60 pr-2">
-            {node.children.length ? <button className="w-5 shrink-0 text-ink-soft" aria-label={`${expanded ? '收起' : '展开'}：${node.title}`} aria-expanded={Boolean(expanded)} onClick={() => setCollapsed((old) => { const next = new Set(old); if (next.has(node.id)) next.delete(node.id); else next.add(node.id); return next; })}>{expanded ? '▾' : '▸'}</button> : <span className="w-5 shrink-0" />}
+          return <div key={node.id} style={{ position: 'absolute', top: (start + index) * ROW_HEIGHT, height: ROW_HEIGHT, left: 0, right: 0, paddingLeft: Math.min(depth, 12) * 18 + 4 }} className="flex gap-2 items-center rounded hover:bg-paper-2 pr-2">
+            {node.children.length ? <button className="w-4 shrink-0 text-ink-faint" aria-label={`${expanded ? '收起' : '展开'}：${node.title}`} aria-expanded={Boolean(expanded)} onClick={() => setCollapsed((old) => { const next = new Set(old); if (next.has(node.id)) next.delete(node.id); else next.add(node.id); return next; })}>{expanded ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}</button> : <span className="w-4 shrink-0" />}
             <SelectionBox cleanup={cleanupMode} included={count.included} total={count.total} disabled={disabled} title={node.title} onChange={() => void change(subtreeTokens([node]), count.included === count.total ? 'exclude' : 'include')} />
-            <div className="flex-1 min-w-0"><span className="block text-sm text-ink truncate" title={node.title}>{node.title}</span>{node.source ? <span className="block text-xs text-ink-faint truncate" title={node.source.relPath}>{node.source.relPath}</span> : <span className="text-xs text-ink-faint">文档层级</span>}</div>
+            {node.children.length || !node.source ? <Folder className="w-4 h-4 shrink-0 text-ink-soft" /> : <FileText className="w-4 h-4 shrink-0 text-ink-faint" />}
+            <div className="flex-1 min-w-0"><span className="block text-sm text-ink truncate" title={node.source?.relPath ?? node.title}>{node.title}</span></div>
             {node.children.length ? <span className="text-xs text-ink-soft shrink-0">{count.included}/{count.total} 篇</span> : null}
             {node.source ? <><span className="text-xs text-ink-faint shrink-0">{LABEL[node.source.pending]}</span><button className="text-xs text-seal shrink-0" onClick={() => onOpenSource(node.source!)} aria-label={`预览：${node.title}`}>预览</button></> : null}
             <button className="text-xs text-seal shrink-0 disabled:opacity-40" disabled={disabled} aria-label={`清理${node.children.length ? '层级' : '文档'}：${node.title}`} onClick={() => requestCleanup(subtreeTokens([node]))}>清理</button>
@@ -93,5 +96,9 @@ export function KbSourceSelector({ running, nonce, onChanged, onOpenSource }: { 
       {!tree.rows.length ? <p className="py-6 text-sm text-ink-faint">没有匹配的本地源文档。</p> : null}
     </div>}
     {running ? <p className="text-xs text-seal mt-2">构建进行中，源选择暂不可更改。</p> : null}
+    {!cleanupMode ? <div className="mt-3 flex items-center justify-end gap-3">
+      <span className="text-xs text-ink-faint">将重新构建已选的 {totalIncluded} 篇源文档</span>
+      <Button size="sm" disabled={disabled || !canBuild || totalIncluded === 0} onClick={() => onBuild(totalIncluded)}>构建所选文档</Button>
+    </div> : null}
   </div>;
 }

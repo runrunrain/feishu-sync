@@ -136,6 +136,7 @@ export interface LlmModelPreset {
   contextWindow?: number;
   maxTokens?: number;
   reasoning?: boolean;
+  thinkingLevels?: import('./agent-knowledge.js').AgentThinkingLevel[];
   /** 仅 UI 提示用途（识图模型下拉标记），不影响任何运行时模型选择。 */
   supportsImages?: boolean;
 }

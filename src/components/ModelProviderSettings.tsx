@@ -237,7 +237,7 @@ export function ModelProviderSettings() {
     });
   };
 
-  const handleSave = async (useForAgent = false) => {
+  const handleSave = async () => {
     try {
       if (providers.some((p) => p.models.some((m) =>
         (m.contextWindow !== undefined && (!Number.isInteger(m.contextWindow) || m.contextWindow < 1024))
@@ -248,25 +248,25 @@ export function ModelProviderSettings() {
       // This card owns provider profiles only. Sending a narrow patch keeps a
       // concurrently open execution-channel card from being overwritten by a
       // stale copy of the rest of `llm`.
-      if (useForAgent && (!selectedProvider?.enabled || !selectedProvider.apiKey.trim() || !/^https?:\/\//i.test(selectedProvider.openAiCompatBaseUrl) || !selectedProvider.models.some((m) => m.enabled && m.openAiModel.trim()))) {
-        toast.push({ type: 'warning', message: '请先启用提供商并填写端点、API Key 和模型代码' }); return;
-      }
+      const agentPreset = selectedProvider?.models.find((m) => m.id === (local.activeProviderId === selectedProvider.id ? local.activeModelId : selectedProvider.defaultModelId) && m.enabled && m.openAiModel.trim())
+        ?? selectedProvider?.models.find((m) => m.id === selectedProvider.defaultModelId && m.enabled && m.openAiModel.trim())
+        ?? selectedProvider?.models.find((m) => m.enabled && m.openAiModel.trim());
+      const previousThinking = config?.agent?.model.thinkingLevel ?? 'off';
+      const allowedThinking = previousThinking === 'off' || (agentPreset?.reasoning && agentPreset.thinkingLevels?.includes(previousThinking)
+        && (config?.agent?.runtime.backend !== 'claude-code' || previousThinking !== 'minimal'));
       await updateConfig({
-        ...(useForAgent && config?.agent && selectedProvider ? { agent: {
+        ...(config?.agent && selectedProvider ? { agent: {
           ...config.agent, model: { ...config.agent.model, source: 'app-llm' as const,
             providerId: selectedProvider.id,
-            modelId: selectedProvider.models.find((m) => m.id === selectedProvider.defaultModelId && m.enabled && m.openAiModel.trim())?.id
-              ?? selectedProvider.models.find((m) => m.enabled && m.openAiModel.trim())?.id,
+            modelId: agentPreset?.id,
+            thinkingLevel: allowedThinking ? previousThinking : 'off',
           },
         } } : {}),
         llm: {
           providers: local.providers,
-          activeProviderId: local.activeProviderId,
-          activeModelId: local.activeModelId,
-          contentAdaptationEnabled: (local.providers?.length ?? 0) > 0 && local.contentAdaptationEnabled === true,
         },
       });
-      toast.push({ type: 'success', message: useForAgent ? '配置已保存并用于 Agent' : '模型提供商与预设已保存' });
+      toast.push({ type: 'success', message: selectedProvider ? '配置已保存并用于 Agent' : '模型提供商与预设已保存' });
     } catch (error) {
       toast.push({
         type: 'error',
@@ -290,7 +290,6 @@ export function ModelProviderSettings() {
             </div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            {selectedProvider ? <Button variant="secondary" size="sm" onClick={() => void handleSave(true)} disabled={saving}>保存并用于 Agent</Button> : null}
             <Button size="sm" onClick={() => void handleSave()} loading={saving}><Save className="h-3.5 w-3.5" />保存提供商配置</Button>
             <Button variant="secondary" size="sm" onClick={addProvider}>
               <Plus className="w-3.5 h-3.5" />
@@ -538,7 +537,7 @@ export function ModelProviderSettings() {
                         <Input
                           label="模型代码"
                           value={model.openAiModel}
-                          onChange={(event) => updateModel(selectedProvider, model.id, { openAiModel: event.target.value })}
+                          onChange={(event) => updateModel(selectedProvider, model.id, { openAiModel: event.target.value, thinkingLevels: undefined })}
                           placeholder="填写服务商的模型代码"
                           helperText={/\bglm-[^\s[]+\[[^\]]+\]/i.test(model.openAiModel)
                             ? 'GLM API 请填写标准模型代码（例如 glm-5.2）；容量显示后缀会在运行时自动移除。'
@@ -552,6 +551,17 @@ export function ModelProviderSettings() {
                           onChange={(e) => updateModel(selectedProvider, model.id, { maxTokens: e.target.value ? Number(e.target.value) : undefined })} />
                         <Toggle label="支持思考模式" checked={model.reasoning ?? false} onChange={(reasoning) => updateModel(selectedProvider, model.id, { reasoning })} />
                       </div>
+                      {model.reasoning ? <div className="mt-3">
+                        <p className="text-sm text-ink-soft">支持的思考档位</p>
+                        <p className="mt-1 text-xs text-ink-faint">第三方模型未提供可验证的档位信息时，请根据服务商说明选择；关闭始终可用。</p>
+                        <div className="mt-2 flex flex-wrap gap-3">
+                          {(['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const).map((level) => <label key={level} className="flex items-center gap-1 text-xs text-ink-soft">
+                            <input type="checkbox" checked={model.thinkingLevels?.includes(level) ?? false} onChange={(event) => updateModel(selectedProvider, model.id, {
+                              thinkingLevels: event.target.checked ? [...(model.thinkingLevels ?? []).filter((item) => item !== level), level] : (model.thinkingLevels ?? []).filter((item) => item !== level),
+                            })} />{{ minimal: '最低', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最大' }[level]}
+                          </label>)}
+                        </div>
+                      </div> : null}
                     </div>
                   ))}
                 </div>
@@ -560,15 +570,6 @@ export function ModelProviderSettings() {
           </div>
         ) : null}
 
-        {providers.length > 0 ? <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 border-t border-line pt-4">
-          <Select label="应用默认提供商" value={local.activeProviderId ?? ''} options={providers.filter((p) => p.enabled).map((p) => ({ value: p.id, label: p.name }))}
-            onChange={(e) => setLocal((current) => current ? { ...current, activeProviderId: e.target.value, activeModelId: providers.find((p) => p.id === e.target.value)?.defaultModelId } : current)} />
-          <Select label="应用默认模型预设" value={local.activeModelId ?? ''} options={(providers.find((p) => p.id === local.activeProviderId)?.models ?? []).filter((m) => m.enabled).map((m) => ({ value: m.id, label: m.name }))}
-            onChange={(e) => setLocal((current) => current ? { ...current, activeModelId: e.target.value } : current)} />
-        </div> : null}
-        {providers.length > 0 ? <Toggle label="同步时整理原始文档" checked={local.contentAdaptationEnabled === true}
-          onChange={(enabled) => setLocal((old) => old ? { ...old, contentAdaptationEnabled: enabled } : old)}
-          helperText="使用相同的应用提供商与模型预设；整理失败时保留确定性转换结果。" /> : null}
       </CardBody>
     </Card>
   );

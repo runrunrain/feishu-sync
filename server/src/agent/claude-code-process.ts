@@ -20,7 +20,7 @@ export interface ClaudeCodeOptions {
   model: string;
   baseUrl: string;
   apiKey: string;
-  thinking?: 'off' | 'minimal' | 'low' | 'medium' | 'high';
+  thinking?: import('../types/agent-knowledge.js').AgentThinkingLevel;
   contextWindow?: number;
   maxTokens?: number;
   agentUrl: string;
@@ -44,7 +44,7 @@ function appEnvironment(opts: ClaudeCodeOptions): NodeJS.ProcessEnv {
   env.DISABLE_AUTOUPDATER = '1';
   env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1';
   if (!opts.thinking || opts.thinking === 'off') env.CLAUDE_CODE_DISABLE_THINKING = '1';
-  else env.CLAUDE_CODE_EFFORT_LEVEL = opts.thinking === 'minimal' ? 'low' : opts.thinking;
+  else env.CLAUDE_CODE_EFFORT_LEVEL = opts.thinking;
   if (opts.contextWindow) env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = String(opts.contextWindow);
   if (opts.maxTokens) env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = String(opts.maxTokens);
   return env;

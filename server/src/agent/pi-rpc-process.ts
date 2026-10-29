@@ -20,6 +20,8 @@ import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { piThinkingLevels } from './thinking-capabilities.js';
+import type { AgentThinkingLevel } from '../types/agent-knowledge.js';
 
 /** RPC 命令白名单（§4.3）。 */
 export const RPC_COMMAND_WHITELIST: ReadonlySet<string> = new Set([
@@ -603,19 +605,26 @@ export class PiRpcProcess extends EventEmitter {
   async probeState(): Promise<{
     state: Record<string, unknown> | null;
     models: string[];
+    capabilities: Record<string, AgentThinkingLevel[]>;
   }> {
     const stateResponse = await this.sendCommand('get_state', {});
     const modelsResponse = await this.sendCommand('get_available_models', {});
     const models: string[] = [];
+    const capabilities: Record<string, AgentThinkingLevel[]> = {};
     if (modelsResponse.success && modelsResponse.data) {
-      const data = modelsResponse.data as { models?: Array<{ provider?: string; id?: string }> };
+      const data = modelsResponse.data as { models?: Array<{ provider?: string; id?: string; reasoning?: boolean; thinkingLevelMap?: Record<string, unknown> }> };
       for (const model of data.models ?? []) {
-        if (model.provider && model.id) models.push(`${model.provider}/${model.id}`);
+        if (model.provider && model.id) {
+          const id = `${model.provider}/${model.id}`;
+          models.push(id);
+          if (typeof model.reasoning === 'boolean') capabilities[id] = piThinkingLevels(model);
+        }
       }
     }
     return {
       state: stateResponse.success ? (stateResponse.data as Record<string, unknown>) : null,
       models,
+      capabilities,
     };
   }
 }

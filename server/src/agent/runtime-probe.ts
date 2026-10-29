@@ -28,6 +28,7 @@ export interface ProbeResult {
   ok: boolean;
   stderr?: string;
   available: string[];
+  capabilities?: Record<string, import('../types/agent-knowledge.js').AgentThinkingLevel[]>;
 }
 
 /**
@@ -85,8 +86,8 @@ export async function probeAvailableModels(input: ProbeInput): Promise<ProbeResu
   rpc.on('stderr', (chunk: string) => stderrChunks.push(chunk));
   try {
     await rpc.start(20_000);
-    const { models } = await rpc.probeState();
-    return { ok: true, available: models, stderr: stderrChunks.join('').slice(-2000) };
+    const { models, capabilities } = await rpc.probeState();
+    return { ok: true, available: models, capabilities, stderr: stderrChunks.join('').slice(-2000) };
   } catch (error) {
     return {
       ok: false,

@@ -26,12 +26,13 @@ export function KbPendingImagesHint({ images }: { images: { total: number; uncac
   );
 }
 
-export function KbChangesPanel({ tab, onTab, onClose, onChanged, onUpdate, onOpenSource, running, canUpdate }: {
+export function KbChangesPanel({ tab, onTab, onClose, onChanged, onUpdate, onBuildSelected, onOpenSource, running, canUpdate }: {
   tab: KbChangeTab | null;
   onTab: (tab: KbChangeTab) => void;
   onClose: () => void;
   onChanged: () => void;
   onUpdate: () => void;
+  onBuildSelected: (count: number) => void;
   onOpenSource: (source: KbSourceChoice) => void;
   running: boolean;
   canUpdate: boolean;
@@ -89,7 +90,7 @@ export function KbChangesPanel({ tab, onTab, onClose, onChanged, onUpdate, onOpe
     </div>
     {error ? <p role="alert" className="text-sm text-seal-2 mb-3">{error}</p> : null}
     <div className="max-h-[60vh] min-h-[160px] overflow-auto scrollbar-thin">
-      {tab === 'sources' ? <KbSourceSelector nonce={nonce} running={running} onChanged={onChanged} onOpenSource={onOpenSource} /> : tab === 'pending' ? <>
+      {tab === 'sources' ? <KbSourceSelector nonce={nonce} running={running} canBuild={canUpdate} onBuild={onBuildSelected} onChanged={onChanged} onOpenSource={onOpenSource} /> : tab === 'pending' ? <>
         <p className="text-xs text-ink-soft mb-3">比较当前参与构建的原始源与最近发布的源快照。差异用于更新判断，正文会重新写成完整说明。</p>
         {loading ? <p className="text-xs text-ink-faint">正在计算差异…</p> : preview ? <>
           <p className="text-sm text-ink mb-2">{preview.sources.length} 个源变更 · {preview.affectedDocs.length} 篇已有标准文档受影响</p>

@@ -12,9 +12,10 @@ afterEach(() => { vi.restoreAllMocks(); for (const cleanup of cleanups.splice(0)
 async function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'session-model-route-'));
   const manager = new ConfigManager(path.join(root, 'config.json')); await manager.load();
+  await manager.updateConfig({ agent: { ...manager.getConfig().agent, runtime: { ...manager.getConfig().agent.runtime, backend: 'pi' } } });
   await manager.updateConfig({ llm: { providers: [{ id: 'fixture', name: 'Fixture', enabled: true, apiKey: 'route-fixture-secret', protocol: 'openai-responses', openAiCompatBaseUrl: 'http://127.0.0.1:9999/v1', defaultModelId: 'fast', models: [
     { id: 'fast', name: 'Fast', openAiModel: 'fast-code', enabled: true, reasoning: false },
-    { id: 'deep', name: 'Deep', openAiModel: 'deep-code', enabled: true, reasoning: true },
+    { id: 'deep', name: 'Deep', openAiModel: 'deep-code', enabled: true, reasoning: true, thinkingLevels: ['low', 'high', 'xhigh', 'max'] },
     { id: 'disabled', name: 'Disabled', openAiModel: 'disabled-code', enabled: false },
   ] }], activeProviderId: 'fixture', activeModelId: 'fast' } } as never);
   const store = new LocalMapStore(path.join(root, 'db.sqlite')); store.initialize(); const pool = new AgentProcessPool(); const resolver = new PiRuntimeResolver();
@@ -37,11 +38,12 @@ it('catalog exposes only usable presets; model/effort persists per session witho
   expect(f.service.get(f.store, f.manager.getConfig(), f.other.id)?.model).toBeNull();
   expect(fs.readFileSync((f.manager as unknown as { configPath: string }).configPath, 'utf8')).toBe(before);
   expect(f.service.configForSession(f.store, f.session.id).agent.model.thinkingLevel).toBe('high');
+  expect((await f.patch({ source: 'app-llm', providerId: 'fixture', modelId: 'deep', thinkingLevel: 'max' })).status).toBe(200);
   expect((await f.patch(null)).status).toBe(200); expect(f.service.get(f.store, f.manager.getConfig(), f.session.id)?.model).toBeNull();
 });
 it('rejects missing/disabled/unconfigured models, invalid levels and busy switches without writing stale choices', async () => {
   const f = await fixture();
-  for (const patch of [null, 'xhigh', 'bad']) {
+  for (const patch of [null, 'medium', 'bad']) {
     const response = await f.patch({ source: 'app-llm', providerId: 'fixture', modelId: 'deep', thinkingLevel: patch }); expect(response.status).toBe(400);
   }
   for (const modelId of ['missing', 'disabled']) expect((await f.patch({ source: 'app-llm', providerId: 'fixture', modelId, thinkingLevel: 'off' })).status).toBe(400);

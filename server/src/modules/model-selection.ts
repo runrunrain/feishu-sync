@@ -1,10 +1,11 @@
 /** Shared provider/preset resolution for Agent, standard KB and source adaptation. */
 import type { LlmConfig, LlmProtocol } from '../types/index.js';
-export interface ModelSelection { providerId?: string; modelId?: string; contextWindow?: number; maxTokens?: number; thinkingLevel?: 'off' | 'minimal' | 'low' | 'medium' | 'high' }
+export interface ModelSelection { providerId?: string; modelId?: string; contextWindow?: number; maxTokens?: number; thinkingLevel?: import('../types/agent-knowledge.js').AgentThinkingLevel }
 export interface ResolvedProviderModel {
   providerId: string; providerName: string; presetId: string; openAiModel: string;
   baseUrl: string; apiKey: string; protocol: LlmProtocol;
   contextWindow?: number; maxTokens?: number; reasoning?: boolean;
+  thinkingLevels?: import('../types/agent-knowledge.js').AgentThinkingLevel[];
 }
 export function resolveProviderModel(llm: Pick<LlmConfig, 'providers' | 'activeProviderId' | 'activeModelId'>, selection: ModelSelection = {}, requiredProtocol?: LlmProtocol): ResolvedProviderModel | null {
   const providers = (llm.providers ?? []).filter((p) => p.enabled);
@@ -26,7 +27,7 @@ export function resolveProviderModel(llm: Pick<LlmConfig, 'providers' | 'activeP
   return { providerId: provider.id, providerName: provider.name, presetId: preset.id,
     openAiModel: /^glm-/i.test(id) ? id.replace(/\s*\[[^\]]+\]$/, '') : id,
     baseUrl, apiKey: provider.apiKey.trim(), protocol,
-    contextWindow: preset.contextWindow, maxTokens: preset.maxTokens, reasoning: preset.reasoning };
+    contextWindow: preset.contextWindow, maxTokens: preset.maxTokens, reasoning: preset.reasoning, thinkingLevels: preset.thinkingLevels };
 }
 
 export function providerModelParameters(model: Pick<ResolvedProviderModel, 'contextWindow' | 'maxTokens' | 'reasoning'>, defaults: ModelSelection = {}) {

@@ -84,7 +84,9 @@ export class DirectChannel implements ContentBackend {
 
       const protocol = this.llm.protocol ?? 'openai-completions';
       const maxTokens = this.llm.maxTokens!;
-      const effort = this.thinking === 'minimal' ? 'low' : this.thinking === 'off' ? undefined : this.thinking;
+      // The bundled OpenAI SDK types predate extended effort values; preserve
+      // the configured wire value for compatible providers that support them.
+      const effort = (this.thinking === 'minimal' ? 'low' : this.thinking === 'off' ? undefined : this.thinking) as 'low' | 'medium' | 'high' | undefined;
       const reasoning = this.llm.reasoning && effort;
       const emit = (text: string) => { if (text) { adaptedMarkdown += text; if (wantStreaming) options.onProgress?.(text); } };
       if (protocol === 'anthropic-messages') {

@@ -29,6 +29,7 @@ import { VisionChannel } from '../agent/vision/vision-channel.js';
 import { VisionDescriber } from '../agent/vision/vision-describer.js';
 import type { ApprovalService } from '../agent/approvals/approval-service.js';
 import type { RuntimeInstaller } from '../agent/runtime-installer.js';
+import { configuredThinkingLevels, THINKING_LEVELS } from '../agent/thinking-capabilities.js';
 
 export interface AgentRouteDeps {
   sessionService: SessionService;
@@ -148,7 +149,8 @@ export async function agentRoutes(deps: AgentRouteDeps): Promise<Hono> {
   const modelStatus = async (config: Config, force = false) => {
     const status = await resolver.checkReadiness({ agentConfig: config.agent, llmConfig: config.llm, runningProcesses: pool.runningCount() }, buildModelProbe(config), { force });
     const { piPackageRoot: _ignored, ...runtime } = status.runtime;
-    return { ...status, runtime, externalPlugins: deps.externalPlugins?.() ?? 0 };
+    const capabilities = { ...Object.fromEntries(Object.entries(config.agent.model.piThinkingLevels ?? {}).map(([id, levels]) => [id, THINKING_LEVELS.filter((level) => level === 'off' || levels.includes(level))])), ...status.model.capabilities };
+    return { ...status, model: { ...status.model, capabilities }, runtime, externalPlugins: deps.externalPlugins?.() ?? 0 };
   };
   routes.get('/api/agent/models', async (c) => {
     try {
@@ -156,11 +158,11 @@ export async function agentRoutes(deps: AgentRouteDeps): Promise<Hono> {
       if (c.req.query('source') === 'pi-agent-dir') {
         const local: Config = { ...config, agent: { ...config.agent, runtime: { ...config.agent.runtime, backend: 'pi' }, model: { ...config.agent.model, source: 'pi-agent-dir', piModel: '' } } };
         const status = await modelStatus(local, c.req.query('refresh') === '1');
-        return c.json({ items: status.model.available.map((piModel) => ({ source: 'pi-agent-dir', piModel, label: piModel, reasoning: true })), message: status.message });
+        return c.json({ items: status.model.available.map((piModel) => ({ source: 'pi-agent-dir', piModel, label: piModel, reasoning: (status.model.capabilities?.[piModel]?.length ?? 0) > 1, thinkingLevels: status.model.capabilities?.[piModel] ?? null })), message: status.message });
       }
       const items = (config.llm.providers ?? []).flatMap((p) => p.models.map((m) => {
         const resolved = resolveProviderModel(config.llm, { providerId: p.id, modelId: m.id }, c.req.query('backend') === 'claude-code' ? 'anthropic-messages' : undefined);
-        return resolved?.apiKey && (c.req.query('backend') !== 'claude-code' || resolved.protocol === 'anthropic-messages') ? { source: 'app-llm', providerId: p.id, modelId: m.id, label: `${p.name} / ${m.name}`, reasoning: m.reasoning === true } : null;
+        return resolved?.apiKey && (c.req.query('backend') !== 'claude-code' || resolved.protocol === 'anthropic-messages') ? { source: 'app-llm', providerId: p.id, modelId: m.id, label: `${p.name} / ${m.name}`, reasoning: m.reasoning === true, thinkingLevels: configuredThinkingLevels(m.thinkingLevels, m.reasoning, c.req.query('backend') === 'claude-code' ? 'claude-code' : 'pi') } : null;
       }).filter(Boolean));
       return c.json({ items, message: items.length ? '' : c.req.query('backend') === 'claude-code' ? '请先配置 Anthropic Messages 兼容的提供商和模型' : '尚无已配置的模型，请先添加服务提供商与预设' });
     } catch (error) { return errorResponse(c, error); }
@@ -178,7 +180,7 @@ export async function agentRoutes(deps: AgentRouteDeps): Promise<Hono> {
       if (!body || typeof body !== 'object' || Array.isArray(body) || !Object.prototype.hasOwnProperty.call(body, 'model')) throw new ToolError('invalid_request', '缺少模型配置');
       if (body.model === null) return c.json(sessionService.setModel(localMapStore, id, null));
       const m = body.model;
-      if (!m || !['app-llm', 'pi-agent-dir'].includes(m.source) || !['off', 'minimal', 'low', 'medium', 'high'].includes(m.thinkingLevel)) throw new ToolError('invalid_request', '模型来源或思考强度无效');
+      if (!m || !['app-llm', 'pi-agent-dir'].includes(m.source) || !THINKING_LEVELS.includes(m.thinkingLevel)) throw new ToolError('invalid_request', '模型来源或思考强度无效');
       const model: SessionModelConfig = { source: m.source, thinkingLevel: m.thinkingLevel };
       const sessionConfig = sessionService.configForSession(localMapStore, id, config);
       const sessionBackend = sessionConfig.agent.runtime.backend;
@@ -190,11 +192,15 @@ export async function agentRoutes(deps: AgentRouteDeps): Promise<Hono> {
         if (!resolved?.apiKey) throw new ToolError('invalid_request', '模型已删除、停用或缺少认证，请刷新列表');
         if (sessionBackend === 'claude-code' && resolved.protocol !== 'anthropic-messages') throw new ToolError('invalid_request', 'Claude Code 需要 Anthropic Messages 兼容的提供商');
         if (!resolved.reasoning && model.thinkingLevel !== 'off') throw new ToolError('invalid_request', '该模型预设未启用思考能力');
+        const levels = configuredThinkingLevels(resolved.thinkingLevels, resolved.reasoning, sessionBackend ?? 'pi');
+        if (model.thinkingLevel !== 'off' && !levels?.includes(model.thinkingLevel)) throw new ToolError('invalid_request', levels ? '该模型不支持所选思考档位' : '请先在模型预设中配置支持的思考档位');
       } else {
         if (typeof m.piModel !== 'string' || !m.piModel.includes('/')) throw new ToolError('invalid_request', '请选择本地Pi模型');
         model.piModel = m.piModel;
         const status = await modelStatus({ ...sessionConfig, agent: { ...sessionConfig.agent, model: { ...sessionConfig.agent.model, ...model } } });
         if (!status.model.available.includes(m.piModel)) throw new ToolError('invalid_request', '本地Pi模型不可用，请刷新配置与认证');
+        const levels = status.model.capabilities?.[m.piModel];
+        if (levels ? !levels.includes(model.thinkingLevel) : model.thinkingLevel !== 'off') throw new ToolError('invalid_request', '本地 Pi 模型不支持该档位或无法探测档位');
       }
       return c.json(sessionService.setModel(localMapStore, id, model));
     } catch (error) { return errorResponse(c, error); }

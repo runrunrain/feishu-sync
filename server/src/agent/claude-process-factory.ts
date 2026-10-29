@@ -19,6 +19,9 @@ export function createClaudeProcess(options: {
   if (!provider?.apiKey || provider.protocol !== 'anthropic-messages' || !executable || !bridgePath) {
     throw new ToolError('agent_not_ready', 'Claude Code 需要可执行文件以及已配置密钥的 Anthropic 兼容模型', 503);
   }
+  if (provider.reasoning && options.config.agent.model.thinkingLevel === 'minimal') {
+    throw new ToolError('agent_not_ready', 'Claude Code 不支持最低思考档位，请选择该模型支持的档位', 400);
+  }
   const specs = options.toolService.getToolSpecsForToken(options.token);
   if (!specs) throw new ToolError('agent_not_ready', 'Agent 工具运行上下文已失效', 503);
   return new ClaudeCodeProcess({ executable, nodePath: options.nodePath, bridgePath,
