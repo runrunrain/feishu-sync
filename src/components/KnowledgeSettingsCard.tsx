@@ -165,11 +165,12 @@ export function KnowledgeSettingsCard() {
 
   return (
     <Card variant="elevated">
-      <CardHeader>
+      <CardHeader className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-2.5">
           <Database className="w-4 h-4 text-seal" />
           <h2 className="text-base font-kai font-medium text-ink">知识库设置</h2>
         </div>
+        <Button size="sm" onClick={handleSave} loading={saving}>保存设置</Button>
       </CardHeader>
       <CardBody className="space-y-5">
         {/* Local root directory */}
@@ -220,11 +221,6 @@ export function KnowledgeSettingsCard() {
           如需指定可启动前设置 LARK_CLI_PATH 环境变量。
         </div>
 
-        <div className="flex justify-end pt-3 border-t border-line">
-          <Button onClick={handleSave} loading={saving}>
-            保存设置
-          </Button>
-        </div>
       </CardBody>
     </Card>
   );

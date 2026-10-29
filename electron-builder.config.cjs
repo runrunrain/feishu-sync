@@ -102,7 +102,7 @@ module.exports = {
     {
       from: path.resolve(__dirname, "build"),
       to: "build",
-      filter: ["tray-icon.ico", "tray-iconTemplate.png"],
+      filter: ["tray-icon.ico", "tray-iconTemplate.png", "tray-iconTemplate@2x.png"],
     },
   ],
   publish: [
@@ -128,7 +128,7 @@ module.exports = {
     main: "dist-electron/main.cjs",
   },
   mac: targetPlatform === "darwin" ? {
-    // 纸墨「飞」印章应用图标（2026-09 定稿）；icns 由 1024 源图全尺寸生成。
+    // 书页与同步标记：icns 由 1024 像素源图生成。
     icon: "build/icon.icns",
     target: [
       { target: "dmg", arch: [targetArch] },

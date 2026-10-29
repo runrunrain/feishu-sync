@@ -294,7 +294,7 @@ function normalizeAgentConfigLoose(value: unknown, dataRoot: string): AgentConfi
   const runtimeRaw: Partial<AgentConfig['runtime']> = raw.runtime && typeof raw.runtime === 'object' ? raw.runtime : {};
   return {
     runtime: {
-      backend: runtimeRaw.backend === 'claude-code' ? 'claude-code' : 'pi',
+      backend: runtimeRaw.backend === 'pi' ? 'pi' : 'claude-code',
       nodePath: typeof runtimeRaw.nodePath === 'string' && runtimeRaw.nodePath.trim() ? runtimeRaw.nodePath.trim() : undefined,
       piCliPath: typeof runtimeRaw.piCliPath === 'string' && runtimeRaw.piCliPath.trim() ? runtimeRaw.piCliPath.trim() : undefined,
       claudeCliPath: typeof runtimeRaw.claudeCliPath === 'string' && runtimeRaw.claudeCliPath.trim() ? runtimeRaw.claudeCliPath.trim() : undefined,
@@ -676,6 +676,7 @@ function normalizeProviderProfiles(
       name: stringValue(raw.name, `提供商 ${index + 1}`) || `提供商 ${index + 1}`,
       enabled: (typeof raw.enabled === 'boolean' ? raw.enabled : true) && (raw.protocol === undefined || LLM_PROTOCOLS.has(raw.protocol)),
       protocol: LLM_PROTOCOLS.has(raw.protocol!) ? raw.protocol : 'openai-completions',
+      openAiProtocol: raw.openAiProtocol === 'openai-responses' || raw.openAiProtocol === 'openai-completions' ? raw.openAiProtocol : undefined,
       protocolBaseUrls: raw.protocolBaseUrls && typeof raw.protocolBaseUrls === 'object'
         ? Object.fromEntries([...LLM_PROTOCOLS].flatMap((protocol) => typeof raw.protocolBaseUrls?.[protocol as LlmProtocol] === 'string' ? [[protocol, raw.protocolBaseUrls[protocol as LlmProtocol]]] : [])) : undefined,
       apiKey: stringValue(raw.apiKey),

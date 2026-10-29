@@ -595,6 +595,10 @@ export async function refreshSheet(objToken: string): Promise<SyncResult> {
   return result;
 }
 
+export async function updateAgentRuntime(backend: 'pi' | 'claude-code'): Promise<void> {
+  await request('/api/agent/runtime/update', { method: 'POST', body: JSON.stringify({ backend }) });
+}
+
 /** Read durable issues that must be repaired in Feishu before syncing can continue. */
 export async function listFeishuPending(): Promise<FeishuPendingItem[]> {
   const data = await request<{ items?: FeishuPendingItem[] } | FeishuPendingItem[]>('/api/sync/feishu-pending');

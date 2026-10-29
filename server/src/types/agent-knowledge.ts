@@ -128,7 +128,7 @@ export function buildDefaultAgentOrchestrationConfig(): AgentOrchestrationConfig
 
 export function buildDefaultAgentConfig(_dataRoot: string): AgentConfig {
   return {
-    runtime: {},
+    runtime: { backend: 'claude-code' },
     model: { ...DEFAULT_AGENT_MODEL_CONFIG },
     vision: buildDefaultAgentVisionConfig(),
     orchestration: buildDefaultAgentOrchestrationConfig(),

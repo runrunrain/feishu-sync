@@ -6,6 +6,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { findExecutableOnPath, getNodeRuntimeCandidateDirectories } from '../modules/lark-cli-client.js';
 import { resolveProviderModel } from '../modules/model-selection.js';
+import { resolveDataRoot } from '../modules/data-root.js';
 import type { AgentConfig } from '../types/agent-knowledge.js';
 import type { LlmConfig } from '../types/index.js';
 
@@ -27,6 +28,7 @@ export function resolveClaudeCodePath(configured?: string, env = process.env, pl
   }
   const names = platform === 'win32' ? ['claude.exe', 'claude.cmd'] : ['claude'];
   const candidates = [
+    path.join(resolveDataRoot(), 'agent', 'runtimes', 'claude-code', 'node_modules', '@anthropic-ai', 'claude-code', 'bin', 'claude.exe'),
     platform === 'win32' ? path.join(home, '.local', 'bin', 'claude.exe') : path.join(home, '.local', 'bin', 'claude'),
     ...directories.flatMap((dir) => names.map((name) => path.join(dir, name))),
     findExecutableOnPath(names, env.PATH ?? env.Path) ?? '',

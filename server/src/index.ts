@@ -62,6 +62,7 @@ import { ApprovalService } from './agent/approvals/approval-service.js';
 import { createOpsToolFamily } from './agent/tools/app-command-family.js';
 import { KbBuildService } from './kb/kb-build-service.js';
 import { piExtensionPath, readAgentPromptAssets } from './agent/agent-assets.js';
+import { RuntimeInstaller } from './agent/runtime-installer.js';
 import { checkRootOverlap, type WorkspaceRootGuards } from './agent/path-guard.js';
 import { collectResolvedRuntimeProtectedRoots, collectStaticProtectedRoots } from './agent/protected-roots.js';
 import type { LarkCliConfig } from './types/index.js';
@@ -264,6 +265,8 @@ export async function buildServer(options: CreateServerOptions = {}) {
   });
   // 回环内部 API 基址：端口在 startServer 监听后回填（构建/会话 spawn 前必然已知）
   const agentInternalPort = { port: null as number | null };
+  const runtimeInstaller = new RuntimeInstaller(agentDataRoot, runtimeResolver, agentPool, () => configManager.getConfig()!.agent);
+  if (process.env.NODE_ENV !== 'test' && !process.env.VITEST) void runtimeInstaller.ensureMissing().catch((error) => console.warn('[agent] 自动安装未完成:', error instanceof Error ? error.message : 'unknown error'));
   // F3-R02：当前配置快照的 Workspace 守卫。受保护运行根 = 静态（源码/
   // node_modules/Electron）+ 服务生命周期已发现的运行时根（node/pi/npm）。
   // 切换配置不会终止旧进程，因此旧安装根到服务重启前也不能开放为Workspace。
@@ -608,6 +611,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
     toolService: agentToolService,
     pool: agentPool,
     resolver: runtimeResolver,
+    runtimeInstaller,
     configManager,
     localMapStore,
     internalPort: () => agentInternalPort.port,

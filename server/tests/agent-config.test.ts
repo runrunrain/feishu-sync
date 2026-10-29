@@ -47,6 +47,7 @@ describe('旧配置兼容（additive 默认合并）', () => {
     const manager = new ConfigManager(configPath);
     const config = await manager.load();
     expect(config.agent).toBeTruthy();
+    expect(config.agent.runtime.backend).toBe('claude-code');
     expect(config.agent.model.source).toBe('app-llm');
     expect(config.agent.model.thinkingLevel).toBe('off');
     expect(config.agent.maxConcurrentProcesses).toBe(3);
@@ -90,7 +91,7 @@ describe('旧配置兼容（additive 默认合并）', () => {
     const manager = new ConfigManager(configPath);
     const config = await manager.load();
     expect(config.agent.model.source).toBe('pi-agent-dir');
-    expect(config.agent.runtime.backend).toBe('pi');
+    expect(config.agent.runtime.backend).toBe('claude-code');
     expect(config.agent.model.thinkingLevel).toBe('off'); // 缺省补默认
     expect(config.agent.maxConcurrentProcesses).toBe(3);
   });
@@ -106,11 +107,12 @@ describe('updateConfig 校验', () => {
   it('保存并重新加载一个提供商的多个协议地址', async () => {
     const config = await manager.load();
     config.llm.providers = [{ id: 'dual', name: 'Dual', enabled: true, protocol: 'openai-completions',
-      openAiCompatBaseUrl: 'https://example.com/v1', apiKey: 'test-key', protocolBaseUrls: { 'anthropic-messages': 'https://example.com/anthropic' },
+      openAiCompatBaseUrl: 'https://example.com/v1', apiKey: 'test-key', openAiProtocol: 'openai-responses', protocolBaseUrls: { 'anthropic-messages': 'https://example.com/anthropic' },
       models: [{ id: 'model', name: 'Model', openAiModel: 'model', enabled: true }] }];
     await manager.updateConfig({ llm: config.llm });
     const provider = (await manager.load()).llm.providers?.[0];
     expect(provider?.protocol).toBe('openai-completions');
+    expect(provider?.openAiProtocol).toBe('openai-responses');
     expect(provider?.protocolBaseUrls?.['anthropic-messages']).toBe('https://example.com/anthropic');
   });
 

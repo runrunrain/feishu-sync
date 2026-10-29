@@ -17,11 +17,16 @@ import {
   resolveAppLlmModel,
   PI_PACKAGE_NAME,
 } from '../src/agent/runtime-resolver.js';
-import { buildDefaultAgentConfig } from '../src/types/agent-knowledge.js';
+import { buildDefaultAgentConfig as defaultAgentConfig } from '../src/types/agent-knowledge.js';
 import { buildDefaultLlmConfigForTest } from './helpers/llm-fixture.js';
 import { makeRuntimeInstallation } from './helpers/runtime-installation.js';
 
 let fixtureRoot: string;
+function buildDefaultAgentConfig(root: string) {
+  const config = defaultAgentConfig(root);
+  config.runtime.backend = 'pi';
+  return config;
+}
 
 function makeFakeNode(dir: string, version: string): string {
   // 按当前平台模拟 resolver 要找的可执行文件名；版本由测试注入。

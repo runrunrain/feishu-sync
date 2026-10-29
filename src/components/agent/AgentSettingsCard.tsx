@@ -32,6 +32,7 @@ import { useAgentStatus } from '../../hooks/useAgentStatus';
 import {
   addAgentWorkspace,
   APIError,
+  updateAgentRuntime,
   deleteAgentWorkspace,
   getAgentVisionStatus,
   getKbMcpInfo,
@@ -181,6 +182,7 @@ export function AgentRuntimeSettingsCard() {
   const [piCliPath, setPiCliPath] = useState('');
   const [claudeCliPath, setClaudeCliPath] = useState('');
   const [saving, setSaving] = useState(false);
+  const [updatingRuntime, setUpdatingRuntime] = useState(false);
 
   // ---- S2/S5：图片理解段（独立状态面；保存走 agent.vision，不动文本模型配置） ----
   const vision = agent?.vision ?? DEFAULT_VISION_CONFIG;
@@ -330,6 +332,12 @@ export function AgentRuntimeSettingsCard() {
         <Button size="sm" variant="secondary" onClick={() => void agentStatus.recheck()} loading={agentStatus.rechecking}>
           <RefreshCw className="w-3.5 h-3.5" /> 重新检测
         </Button>
+        <Button size="sm" variant="secondary" loading={updatingRuntime} disabled={saving} onClick={() => {
+          setUpdatingRuntime(true);
+          void updateAgentRuntime(backend).then(() => { toast.push({ type: 'success', message: `${backend === 'pi' ? 'Pi' : 'Claude Code'} 已更新` }); agentStatus.refresh(); })
+            .catch((error) => toast.push({ type: 'error', message: error instanceof Error ? error.message : 'Agent 更新失败' }))
+            .finally(() => setUpdatingRuntime(false));
+        }}>更新 {backend === 'pi' ? 'Pi' : 'Claude Code'}</Button>
         <div className="min-w-0 text-[11px] text-ink-faint leading-relaxed">
           {agentStatus.status?.runtime.nodeVersion ? (
             <span className="font-mono">node {agentStatus.status.runtime.nodeVersion}</span>

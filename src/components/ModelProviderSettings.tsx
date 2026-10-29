@@ -24,7 +24,7 @@ import { Input, Select, Toggle } from './common/Input';
 import { useConfig } from '../hooks/useConfig';
 import { useToast } from './common/Toast';
 import { revealProviderApiKey } from '../api/client';
-import type { LlmConfig, LlmModelPreset, LlmProviderConfig, LlmProtocol } from '../types';
+import type { LlmConfig, LlmModelPreset, LlmProviderConfig } from '../types';
 
 const NEW_PRESET_CONTEXT_WINDOW = 200_000;
 
@@ -289,10 +289,14 @@ export function ModelProviderSettings() {
               </p>
             </div>
           </div>
-          <Button variant="secondary" size="sm" onClick={addProvider}>
-            <Plus className="w-3.5 h-3.5" />
-            添加提供商
-          </Button>
+          <div className="flex flex-wrap items-center gap-2">
+            {selectedProvider ? <Button variant="secondary" size="sm" onClick={() => void handleSave(true)} disabled={saving}>保存并用于 Agent</Button> : null}
+            <Button size="sm" onClick={() => void handleSave()} loading={saving}><Save className="h-3.5 w-3.5" />保存提供商配置</Button>
+            <Button variant="secondary" size="sm" onClick={addProvider}>
+              <Plus className="w-3.5 h-3.5" />
+              添加提供商
+            </Button>
+          </div>
         </div>
       </CardHeader>
 
@@ -384,39 +388,59 @@ export function ModelProviderSettings() {
                 />
               </div>
 
-              <Select label="接口协议" value={selectedProvider.protocol ?? 'openai-completions'} options={[
-                { value: 'openai-completions', label: 'OpenAI Chat Completions' },
-                { value: 'openai-responses', label: 'OpenAI Responses' },
-                { value: 'anthropic-messages', label: 'Anthropic Messages' },
-              ]} onChange={(e) => updateProvider(selectedProvider.id, (provider) => {
-                const next = e.target.value as LlmProtocol;
-                const previous = provider.protocol ?? 'openai-completions';
-                const urls = { ...provider.protocolBaseUrls, [previous]: provider.openAiCompatBaseUrl };
-                return { ...provider, protocol: next, openAiCompatBaseUrl: urls[next] ?? '', protocolBaseUrls: urls };
-              })}
-                helperText="默认协议供常规请求使用；其他协议可在下方单独配置，模型预设和 API Key 共用。" />
-              <div className="grid grid-cols-1 gap-3">
-                <Input
-                  label="Base URL"
-                  type="url"
-                  value={selectedProvider.openAiCompatBaseUrl}
-                  onChange={(event) => updateProvider(selectedProvider.id, (provider) => ({
-                    ...provider,
-                    openAiCompatBaseUrl: event.target.value,
-                    protocolBaseUrls: { ...provider.protocolBaseUrls, [provider.protocol ?? 'openai-completions']: event.target.value },
-                  }))}
-                  placeholder={selectedProvider.protocol === 'anthropic-messages' ? 'https://api.anthropic.com' : 'https://api.openai.com/v1'}
-                  helperText={selectedProvider.protocol === 'anthropic-messages' ? '填写服务根地址，例如 https://api.anthropic.com，Pi 调用 /v1/messages。' : selectedProvider.protocol === 'openai-responses' ? '填写服务商 API 基础地址，例如 https://api.openai.com/v1；Pi 追加 /responses。' : '填写服务商 API 基础地址，例如 https://api.openai.com/v1；Pi 追加 /chat/completions。'}
-                />
+              <fieldset className="space-y-2">
+                <legend className="text-sm font-medium text-ink">常规请求默认接口</legend>
+                {(['openai', 'anthropic'] as const).map((kind) => <label key={kind} className="inline-flex items-center gap-1.5 mr-4 text-sm text-ink-soft">
+                  <input type="radio" name="provider-default-interface" checked={(selectedProvider.protocol === 'anthropic-messages') === (kind === 'anthropic')}
+                    onChange={() => updateProvider(selectedProvider.id, (provider) => {
+                      const previous = provider.protocol ?? 'openai-completions';
+                      const openAiProtocol = provider.openAiProtocol ?? (previous === 'openai-responses' ? 'openai-responses' : 'openai-completions');
+                      const next = kind === 'anthropic' ? 'anthropic-messages' : openAiProtocol;
+                      const urls = { ...provider.protocolBaseUrls, [previous]: provider.openAiCompatBaseUrl };
+                      const other = openAiProtocol === 'openai-completions' ? 'openai-responses' : 'openai-completions';
+                      return { ...provider, openAiProtocol, protocol: next, protocolBaseUrls: urls,
+                        openAiCompatBaseUrl: urls[next] ?? (kind === 'openai' ? urls[other] : '') ?? '' };
+                    })} />{kind === 'openai' ? 'OpenAI' : 'Anthropic'}
+                </label>)}
+              </fieldset>
+              <div className="space-y-3 rounded-md border border-line p-3">
+              <h3 className="text-sm font-medium text-ink">OpenAI</h3>
+              <Select label="OpenAI 接口协议" value={selectedProvider.openAiProtocol ?? (selectedProvider.protocol === 'openai-responses' ? 'openai-responses' : 'openai-completions')} options={[
+                { value: 'openai-completions', label: 'Chat Completions' },
+                { value: 'openai-responses', label: 'Responses' },
+              ]} onChange={(e) => {
+                const next = e.target.value as 'openai-completions' | 'openai-responses';
+                updateProvider(selectedProvider.id, (provider) => {
+                  if (provider.protocol === 'anthropic-messages') return { ...provider, openAiProtocol: next };
+                  const previous = provider.protocol ?? 'openai-completions';
+                  const urls = { ...provider.protocolBaseUrls, [previous]: provider.openAiCompatBaseUrl };
+                  return { ...provider, openAiProtocol: next, protocol: next, protocolBaseUrls: urls, openAiCompatBaseUrl: urls[next] ?? provider.openAiCompatBaseUrl };
+                });
+              }} helperText="选择 OpenAI 请求使用的协议。" />
+              <Input label="OpenAI Base URL" type="url"
+                value={(selectedProvider.protocol ?? 'openai-completions') !== 'anthropic-messages' ? selectedProvider.openAiCompatBaseUrl : selectedProvider.protocolBaseUrls?.[selectedProvider.openAiProtocol ?? 'openai-completions'] ?? selectedProvider.protocolBaseUrls?.['openai-completions'] ?? selectedProvider.protocolBaseUrls?.['openai-responses'] ?? ''}
+                onChange={(event) => {
+                  const value = event.target.value;
+                  updateProvider(selectedProvider.id, (provider) => ({ ...provider,
+                    openAiCompatBaseUrl: provider.protocol === 'anthropic-messages' ? provider.openAiCompatBaseUrl : value,
+                    protocolBaseUrls: { ...provider.protocolBaseUrls, 'openai-completions': value, 'openai-responses': value } }));
+                }}
+                placeholder="https://api.openai.com/v1"
+                helperText="供 OpenAI Chat Completions 和 Responses 使用；具体协议由上方选择。" />
               </div>
-
-              {(['openai-completions', 'openai-responses', 'anthropic-messages'] as LlmProtocol[]).filter((protocol) => protocol !== (selectedProvider.protocol ?? 'openai-completions')).map((protocol) => (
-                <Input key={protocol} label={`${protocol === 'anthropic-messages' ? 'Anthropic Messages' : protocol === 'openai-responses' ? 'OpenAI Responses' : 'OpenAI Chat Completions'} Base URL（可选）`}
-                  type="url" value={selectedProvider.protocolBaseUrls?.[protocol] ?? ''}
-                  onChange={(event) => updateProvider(selectedProvider.id, (provider) => ({ ...provider, protocolBaseUrls: { ...provider.protocolBaseUrls, [protocol]: event.target.value } }))}
-                  placeholder={protocol === 'anthropic-messages' ? 'https://api.anthropic.com' : 'https://api.openai.com/v1'}
-                  helperText={protocol === 'anthropic-messages' ? 'Claude Code 使用此地址；留空表示不支持该协议。' : '留空表示不配置该协议。'} />
-              ))}
+              <div className="space-y-3 rounded-md border border-line p-3">
+              <h3 className="text-sm font-medium text-ink">Anthropic</h3>
+              <Input label="Anthropic Messages Base URL" type="url"
+                value={selectedProvider.protocol === 'anthropic-messages' ? selectedProvider.openAiCompatBaseUrl : selectedProvider.protocolBaseUrls?.['anthropic-messages'] ?? ''}
+                onChange={(event) => {
+                  const value = event.target.value;
+                  updateProvider(selectedProvider.id, (provider) => ({ ...provider,
+                    openAiCompatBaseUrl: provider.protocol === 'anthropic-messages' ? value : provider.openAiCompatBaseUrl,
+                    protocolBaseUrls: { ...provider.protocolBaseUrls, 'anthropic-messages': value } }));
+                }}
+                placeholder="https://api.anthropic.com"
+                helperText="Claude Code 使用此地址；留空表示不支持该协议。" />
+              </div>
 
               <Input
                 label="API Key"
@@ -545,13 +569,6 @@ export function ModelProviderSettings() {
         {providers.length > 0 ? <Toggle label="同步时整理原始文档" checked={local.contentAdaptationEnabled === true}
           onChange={(enabled) => setLocal((old) => old ? { ...old, contentAdaptationEnabled: enabled } : old)}
           helperText="使用相同的应用提供商与模型预设；整理失败时保留确定性转换结果。" /> : null}
-        <div className="flex flex-wrap justify-end gap-3 border-t border-line pt-4">
-          {selectedProvider ? <Button variant="secondary" onClick={() => void handleSave(true)} disabled={saving}>保存并用于 Agent</Button> : null}
-          <Button onClick={() => void handleSave()} loading={saving}>
-            <Save className="h-4 w-4" />
-            保存提供商配置
-          </Button>
-        </div>
       </CardBody>
     </Card>
   );

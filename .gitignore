@@ -52,6 +52,8 @@ server/tsconfig.tsbuildinfo
 # 例外：Windows 打包图标源图（electron-builder win.icon 引用，
 # 历史上被全局 *.png 拦截导致从未入库，v0.3.x 一直缺失）
 !build/icon.png
+!build/tray-icon-source.png
+!build/tray-iconTemplate@2x.png
 
 # Claude Code / Amagi runtime artifacts
 .claude/

@@ -37,6 +37,7 @@ import {
 } from '../types/agent-knowledge.js';
 import type { LlmConfig } from '../types/index.js';
 import { inspectClaudeCode, resolveClaudeCodePath, resolveClaudeProvider } from './claude-runtime.js';
+import { resolveDataRoot } from '../modules/data-root.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -200,7 +201,8 @@ export class PiRuntimeResolver {
     const homeDir = this.overrides.homeDir ?? os.homedir();
     const platform = this.overrides.platform ?? process.platform;
     const explicitNode = agentConfig.runtime.nodePath?.trim() || env.FEISHU_SYNC_PI_NODE?.trim() || '';
-    const explicitPi = agentConfig.runtime.piCliPath?.trim() || env.FEISHU_SYNC_PI_CLI?.trim() || '';
+    const managedPi = path.join(resolveDataRoot(), 'agent', 'runtimes', 'pi', 'node_modules', '@earendil-works', 'pi-coding-agent');
+    const explicitPi = agentConfig.runtime.piCliPath?.trim() || env.FEISHU_SYNC_PI_CLI?.trim() || (fs.existsSync(path.join(managedPi, 'package.json')) ? managedPi : '');
 
     // ---- Node 发现（显式覆盖排他：坏路径产生精确错误而不是静默换一个安装） ----
     let nodePath: string | null = null;

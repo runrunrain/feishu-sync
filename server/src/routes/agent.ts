@@ -28,6 +28,7 @@ import { readAgentPromptBinary } from '../agent/agent-assets.js';
 import { VisionChannel } from '../agent/vision/vision-channel.js';
 import { VisionDescriber } from '../agent/vision/vision-describer.js';
 import type { ApprovalService } from '../agent/approvals/approval-service.js';
+import type { RuntimeInstaller } from '../agent/runtime-installer.js';
 
 export interface AgentRouteDeps {
   sessionService: SessionService;
@@ -44,6 +45,7 @@ export interface AgentRouteDeps {
   approvalService?: ApprovalService;
   /** S6 任务编排服务（可选便于既有测试装配；生产由 index.ts 注入） */
   taskService?: import('../agent/tasks/task-service.js').TaskService;
+  runtimeInstaller?: RuntimeInstaller;
 }
 function errorResponse(c: Context, error: unknown): Response {
   if (error instanceof ToolError) {
@@ -64,6 +66,14 @@ function errorResponse(c: Context, error: unknown): Response {
 export async function agentRoutes(deps: AgentRouteDeps): Promise<Hono> {
   const routes = new Hono();
   const { sessionService, resolver, configManager, localMapStore, pool } = deps;
+
+  routes.post('/api/agent/runtime/update', async (c) => {
+    const body = await c.req.json<{ backend?: string }>().catch(() => null);
+    if (!body || (body.backend !== 'pi' && body.backend !== 'claude-code')) return c.json({ error: 'invalid_request', message: '请选择 Agent 基座' }, 400);
+    if (!deps.runtimeInstaller) return c.json({ error: 'unavailable', message: '运行时安装服务不可用' }, 503);
+    try { await deps.runtimeInstaller.install(body.backend); return c.json({ ok: true }); }
+    catch (error) { return c.json({ error: 'runtime_update_failed', message: error instanceof Error ? error.message : '更新失败' }, 409); }
+  });
 
   // ------------------------------------------------------------------
   // 运行时状态（Leader steer #4：每次请求取最新 config——factory 顶层捕获

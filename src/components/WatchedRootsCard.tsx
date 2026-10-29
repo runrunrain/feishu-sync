@@ -289,6 +289,7 @@ export function WatchedRootsCard() {
             {summary.disabled > 0 && ` · ${summary.disabled} 已停用`}
             {summary.errored > 0 && ` · ${summary.errored} 错误`}
           </span>
+          <Button size="sm" onClick={handleSave} loading={saving}>保存同步根目录</Button>
         </div>
       </CardHeader>
       <CardBody className="space-y-4">
@@ -433,9 +434,6 @@ export function WatchedRootsCard() {
           </div>
         </div>
 
-        <div className="flex justify-end pt-3 border-t border-line">
-          <Button onClick={handleSave} loading={saving}>保存同步根目录</Button>
-        </div>
       </CardBody>
     </Card>
   );

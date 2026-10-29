@@ -70,6 +70,7 @@ export interface LlmModelPreset {
 export type LlmProtocol = 'openai-completions' | 'openai-responses' | 'anthropic-messages';
 
 export interface LlmProviderConfig {
+  openAiProtocol?: 'openai-completions' | 'openai-responses';
   protocolBaseUrls?: Partial<Record<LlmProtocol, string>>;
   /** Missing in older configs means OpenAI Chat Completions. */
   protocol?: LlmProtocol;
