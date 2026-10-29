@@ -39,6 +39,8 @@ import type { ImageDescription } from '../src/agent/vision/vision-describer.js';
 // ---------------------------------------------------------------------------
 
 interface FakeScript {
+  /** 模拟模型输出正文（用于短图文源的体积校验回归）。 */
+  outputMarkdown?: string;
   /** 命中批次 prompt 时注入一次失败（model_timeout 等）后恢复 */
   failBatchOnceWithCode?: string;
   /** 所有批次 prompt 恒定失败（测试单元重试仍败） */
@@ -170,7 +172,7 @@ class FakeRpcProcess extends EventEmitter {
         // （docIndex 每批重置，批间会同路径覆盖 → source_not_covered）
         path: `主题/${unitId || 'u'}-${token}.md`,
         title: `规则主题${docIndex}`,
-        markdown: '规则的完整说明：第一段定义，第二段流程与边界。',
+        markdown: this.script.outputMarkdown ?? '规则的完整说明：第一段定义，第二段流程与边界。',
         sources: [token],
         summary: '规则主题的概要说明',
       });
@@ -556,6 +558,40 @@ describe('S3：vision 关闭 → unavailable 内联 + images_unavailable 警告'
     const entry = manifest.sourceSnapshot.find((item) => item.objToken === 'tokImg')!;
     expect(entry.imageCount).toBe(1);
     expect(entry.mediaHash).toMatch(/^sha256:/);
+  });
+});
+
+describe('小批次图文源：按识图文本校验体积并保持发布保护', () => {
+  it.each([1, 2])('Pi 单 worker 构建 %i 篇短图文源可以发布，真正膨胀时保留上一版本', async (count) => {
+    documents.length = 0;
+    for (let i = 0; i < count; i++) {
+      writeRaw(`短图文/图示${i}.md`, '# 图示\n![](images/diagram.png)\n');
+      documents.push(docRecord(`tokSize${i}`, `短图文/图示${i}.md`));
+    }
+    writeRaw('短图文/images/diagram.png', TINY_PNG);
+    const vision: NonNullable<Harness['visionDescriber']> = {
+      status: async () => ({ state: 'ready', model: 'fixture/vision', message: '' }),
+      lookup: async () => null,
+      describeOne: async () => ({ src: 'images/diagram.png', imageHash: 'fixture', state: 'described', text: '图中的结构信息。'.repeat(100) }),
+      describeMany: async (items, options) => {
+        options.onProgress({ done: items.length, total: items.length });
+        return new Map(items.map((item) => [item.src, { src: item.src, imageHash: 'fixture', state: 'described' as const, text: '图中的结构信息。'.repeat(100) }]));
+      },
+    };
+    const script: FakeScript = { outputMarkdown: '图示规则的完整说明。'.repeat(180) };
+    const harness = makeHarness(makeConfig({ buildParallelism: 1 }), script, vision);
+    const published = await createAndRun(harness, 'full');
+    expect(published.status).toBe('published');
+    expect(harness.fakes).toHaveLength(1);
+    const pointer = new StandardKbStore(outputRoot).readCurrent()!;
+    expect(new StandardKbStore(outputRoot).readManifest(pointer.releaseId)?.docs).toHaveLength(count);
+    script.outputMarkdown = '超量的规则说明。'.repeat(2000);
+    const rejected = await createAndRun(harness, 'full');
+    expect(rejected.status).toBe('failed');
+    expect(rejected.error_code).toBe('kb_validation_failed');
+    expect(rejected.error_message).toContain('total_too_large');
+    expect(new StandardKbStore(outputRoot).readCurrent()?.releaseId).toBe(pointer.releaseId);
+    expect(fs.readFileSync(path.join(kbRoot, '短图文/图示0.md'), 'utf8')).toBe('# 图示\n![](images/diagram.png)\n');
   });
 });
 

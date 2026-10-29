@@ -15,10 +15,20 @@ import { IndexScanner } from '../modules/index-scanner.js';
 import { LayoutReconstructor } from '../modules/layout-reconstructor.js';
 import { ContentAdapter } from '../modules/content-adapter.js';
 import { ContentBackendRegistry } from '../modules/content-backend-registry.js';
+import { scheduleSnapshotRefresh, flushSnapshotRefresh } from '../modules/snapshot-refresh.js';
 import type { ChannelConfig } from '../modules/content-backend.js';
 import type { ChangedDocument, SyncOptions, SyncResult } from '../types/index.js';
 
 const syncRoutes = new Hono();
+
+syncRoutes.post('/api/sync/snapshot', async (c) => {
+  const config = await (c as any).configManager.load();
+  if (!config.knowledgeBaseRoot) return c.json({ error: 'knowledge_base_root_not_configured' }, 400);
+  const { SnapshotService } = await import('../modules/snapshot-service.js');
+  flushSnapshotRefresh(config.knowledgeBaseRoot, () => new SnapshotService((c as any).localMapStore, (c as any).configManager,
+    new IndexScanner({ localMapStore: (c as any).localMapStore, larkCliClient: (c as any).larkCliClient, config })).generate());
+  return c.json({ ok: true });
+});
 
 /** The durable operator queue has a deliberately small route-facing contract. */
 function getFeishuPendingStore(c: any): {
@@ -218,7 +228,8 @@ syncRoutes.post('/api/sync', async (c) => {
       const { SnapshotService } = await import('../modules/snapshot-service.js');
       const indexScanner = new IndexScanner({ localMapStore, larkCliClient, config });
       const snapshotService = new SnapshotService(localMapStore, configManager, indexScanner);
-      snapshotService.generate();
+      if (rawOptionsObject.deferSnapshot === true) scheduleSnapshotRefresh(config.knowledgeBaseRoot, () => snapshotService.generate());
+      else flushSnapshotRefresh(config.knowledgeBaseRoot, () => snapshotService.generate());
     } catch (snapshotError) {
       console.warn('[sync] _index.json refresh after sync failed (non-fatal):', snapshotError);
     }

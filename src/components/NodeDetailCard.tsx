@@ -15,7 +15,7 @@
  * 双视图通用（飞书视图 / 本地视图选中文件节点都显示同样的字段）。
  */
 
-import type { JSX } from 'react';
+import { useEffect, useState, type JSX } from 'react';
 import {
   FileText,
   Table,
@@ -32,6 +32,7 @@ import { BusinessTag } from './common/BusinessTag';
 import { CloudMovesSection } from './move-out/CloudMovesSection';
 import { cloudMoveFace } from './move-out/labels';
 import type { CloudMoveRecord, MappingNode, WatchedRoot } from '../types';
+import { normalizeExternalUrl } from '../utils/external-url';
 
 interface NodeDetailCardProps {
   node: MappingNode | null;
@@ -91,6 +92,8 @@ export function NodeDetailCard({
   cloudMoves,
   onCloudMovesChanged,
 }: NodeDetailCardProps) {
+  const [linkError, setLinkError] = useState('');
+  useEffect(() => setLinkError(''), [node?.obj_token]);
 
   if (!node) {
     return (
@@ -135,6 +138,7 @@ export function NodeDetailCard({
   // P2-S7：最新移出记录的展示层覆盖（moved 覆盖「已删除」；moving 优先
   // 于「变更」；无记录沿用既有状态文案）。
   const moveFace = cloudMoveFace(cloudMoves?.[0]);
+  const originalUrl = normalizeExternalUrl(node.original_link);
 
   return (
     <Card variant="default">
@@ -196,19 +200,28 @@ export function NodeDetailCard({
           </dd>
           <dt className="text-ink-faint font-sans-ui col-span-1">飞书原文</dt>
           <dd className="text-ink-soft font-mono col-span-2 break-all">
-            {node.original_link ? (
+            {originalUrl ? (
               <a
-                href={node.original_link}
+                href={originalUrl}
                 target="_blank"
                 rel="noopener noreferrer"
+                onClick={(event) => {
+                  if (!window.desktop?.openExternal) return;
+                  event.preventDefault();
+                  setLinkError('');
+                  void window.desktop.openExternal(originalUrl).then((result) => {
+                    if (!result.ok) setLinkError('无法打开浏览器，请检查系统默认浏览器设置。');
+                  }).catch(() => setLinkError('无法打开浏览器，请检查系统默认浏览器设置。'));
+                }}
                 className="inline-flex items-center gap-1 text-jade hover:text-jade-2 underline underline-offset-2"
               >
                 <ExternalLink className="w-3 h-3 shrink-0" />
-                <span className="break-all">{node.original_link}</span>
+                <span className="break-all">{originalUrl}</span>
               </a>
             ) : (
-              <span className="text-ink-faint">--（无云链接）</span>
+              <span className="text-ink-faint">{node.original_link ? '云链接格式无效' : '--（无云链接）'}</span>
             )}
+            {linkError && <span role="alert" className="block mt-1 text-seal-2">{linkError}</span>}
           </dd>
           <dt className="text-ink-faint font-sans-ui col-span-1">云匹配</dt>
           <dd className="col-span-2">

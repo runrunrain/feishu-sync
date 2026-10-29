@@ -89,8 +89,9 @@ function FieldLabel({ children, hint }: { children: React.ReactNode; hint?: stri
   );
 }
 
-const INPUT_CLS =
-  'w-full h-9 px-3 rounded-md border border-line bg-card-bg text-sm text-ink focus:outline-none focus:border-seal/50 disabled:bg-paper-2 disabled:text-ink-faint';
+const INPUT_BASE_CLS =
+  'h-9 px-3 rounded-md border border-line bg-card-bg text-sm text-ink focus:outline-none focus:border-seal/50 disabled:bg-paper-2 disabled:text-ink-faint';
+const INPUT_CLS = `w-full ${INPUT_BASE_CLS}`;
 
 /** 图片理解默认参数（与服务端 buildDefaultAgentVisionConfig 对齐；仅防御性兜底，保存时服务端仍会归一）。 */
 export const DEFAULT_VISION_CONFIG: AgentVisionConfig = {
@@ -344,7 +345,7 @@ export function AgentRuntimeSettingsCard() {
     >
       <div>
         <FieldLabel>应用基础能力的 Agent 基座</FieldLabel>
-        <select aria-label="应用基础能力的 Agent 基座" className={INPUT_CLS} value={appBackend} disabled={saving}
+        <select aria-label="应用基础能力的 Agent 基座" className={`w-auto max-w-full ${INPUT_BASE_CLS}`} value={appBackend} disabled={saving}
           onChange={(e) => { setConfigBackend(backend); void saveAgent({ runtime: { backend: e.target.value as 'pi' | 'claude-code' } }); }}>
           <option value="pi">Pi</option><option value="claude-code">Claude Code</option>
         </select>

@@ -181,6 +181,7 @@ export type SyncState =
   | 'deleted_confirmed';
 
 export interface SyncedDocument {
+  performance?: { elapsedMs: number; phasesMs: Record<string, number>; cliCalls: number; queueMs: number; throttleMs: number; executionMs: number; cacheHits: number };
   sheetAcquisition?: 'native' | 'read-reconstruction' | 'csv-fallback';
   objToken: string;
   title: string;

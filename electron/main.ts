@@ -25,6 +25,7 @@ import { AutoStartService } from './auto-start-service.js';
 import { ChangeNotificationService } from './change-notification-service.js';
 import { ConfigManager } from '../server/src/modules/config-manager.js';
 import type { QuitReason } from './contracts.js';
+import { externalNavigationUrl } from '../src/utils/external-url.js';
 
 // ============================================================================
 // Constants and Configuration
@@ -275,7 +276,15 @@ function createMainWindow() {
     }
   });
 
-  window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  window.webContents.setWindowOpenHandler(({ url }) => {
+    const externalUrl = externalNavigationUrl(url, allowedOrigin);
+    if (externalUrl) {
+      void shell.openExternal(externalUrl).catch((error) => {
+        console.error('[Electron] Failed to open external link:', sanitizeDesktopError(error));
+      });
+    }
+    return { action: 'deny' };
+  });
 
   // Load frontend based on environment
   if (process.env.NODE_ENV === 'development') {

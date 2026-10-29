@@ -6,7 +6,7 @@
  * - listWikiNodes(): wiki +node-list with space-id and parent-node-token
  * - getNode(): wiki +node-get returning space_id, obj_token, obj_edit_time, has_child
  * - api(): generic lark-cli api command fallback
- * - QPS throttling: token bucket (wiki 10, docx 5, sheets 5)
+ * - Shared QPS throttling: global 3, wiki 3, docx/sheets 2
  * - Error classification: 99991400 (rate limit), 40403 (no permission), timeout, auth errors
  *
  * IMPORTANT: This module must NOT contain any Feishu token variables.
@@ -19,6 +19,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'util';
 import { SCOPE_ALIAS_GROUPS } from './config-manager.js';
+import { CliCommandQueue, isParallelCliRead } from './cli-command-queue.js';
+import { scopedRead, syncScope } from './sync-performance.js';
+import { versionedSheetRead } from './versioned-sheet-cache.js';
 
 /**
  * Windows shell 引号包裹（2026-09 实测事故：`C:\Program Files\nodejs\npm.cmd`
@@ -250,7 +253,7 @@ type LarkCliApiType = 'wiki' | 'docx' | 'sheets' | 'base' | 'drive' | 'slides' |
 // command rate is still substantially faster than individual node-get calls.
 // Keep this deliberately below the observed tenant-side burst ceiling: the
 // desktop poller, a manual recovery, and a sync may all share one lark-cli
-// identity. The queue below serializes processes; these limits shape their
+// identity. The queue below bounds concurrent reads; these limits shape their
 // aggregate request rate so a recovery does not cause 99991400/QPS failures.
 const API_QPS_LIMITS: Record<LarkCliApiType, number> = {
   wiki: 3,
@@ -542,10 +545,12 @@ export class LarkCliClient {
   private qpsLimiter: Map<string, number[]> = new Map();
   /**
    * The CLI process is shared by UI reads, the desktop poller and explicit
-   * actions. Serializing invocation removes the last cross-root race that a
-   * per-endpoint token bucket alone cannot prevent.
+   * actions. Reads have two slots; unknown/write commands remain exclusive.
+   * Throttle admission is shared and serialized across both read slots.
    */
-  private commandQueue: Promise<void> = Promise.resolve();
+  private commandQueue = new CliCommandQueue();
+  private throttleQueue: Promise<void> = Promise.resolve();
+  private rateLimitUntil = 0;
 
   constructor(private config: LarkCliConfig) {}
 
@@ -568,23 +573,26 @@ export class LarkCliClient {
     apiType: LarkCliApiType = 'wiki',
     executionOptions?: LarkCliExecutionOptions,
   ): Promise<any> {
-    const pending = this.commandQueue.then(
-      async () => {
+    const metrics = syncScope()?.metrics; const queuedAt = performance.now();
+    return this.commandQueue.run(isParallelCliRead(args), async () => {
+      if (metrics) { metrics.queueMs += performance.now() - queuedAt; metrics.cliCalls++; }
+      const throttleAt = performance.now();
+      const waiting = this.throttleQueue.then(async () => {
+        if (this.rateLimitUntil > Date.now()) await new Promise((resolve) => setTimeout(resolve, this.rateLimitUntil - Date.now()));
         await this.throttle(apiType);
-        return this.execLarkCli(args, executionOptions);
-      },
-      async () => {
-        await this.throttle(apiType);
-        return this.execLarkCli(args, executionOptions);
-      },
-    );
-    // Keep the queue alive after a failed command; callers still receive the
-    // original rejection through `pending`.
-    this.commandQueue = pending.then(
-      () => undefined,
-      () => undefined,
-    );
-    return pending;
+        while (this.rateLimitUntil > Date.now()) {
+          await new Promise((resolve) => setTimeout(resolve, this.rateLimitUntil - Date.now()));
+          await this.throttle(apiType);
+        }
+      });
+      this.throttleQueue = waiting.catch(() => undefined);
+      await waiting;
+      if (metrics) metrics.throttleMs += performance.now() - throttleAt;
+      const executionAt = performance.now();
+      try { return await this.execLarkCli(args, executionOptions); }
+      catch (error) { if ((error as LarkCliError)?.code === 'rate_limited') this.rateLimitUntil = Date.now() + 3000; throw error; }
+      finally { if (metrics) metrics.executionMs += performance.now() - executionAt; }
+    });
   }
 
   async fetchDocumentMarkdown(objToken: string, opts?: { revisionId?: number }): Promise<any> {
@@ -997,11 +1005,12 @@ export class LarkCliClient {
     return reportedPath;
   }
 
-  async getWorkbookInfo(spreadsheetToken: string): Promise<any> {
-    return this.execute([
+  async getWorkbookInfo(spreadsheetToken: string, fresh = false): Promise<any> {
+    const read = () => this.execute([
       'sheets', '+workbook-info', '--spreadsheet-token', spreadsheetToken,
       '--format', 'json',
     ], 'sheets');
+    return fresh ? read() : scopedRead(`workbook:${spreadsheetToken}`, read);
   }
 
   /** Download the entire native workbook, including layout and embedded media. */
@@ -1045,14 +1054,14 @@ export class LarkCliClient {
   }
 
   async getSheetCells(options: {
-    spreadsheetToken: string; sheetId: string; range: string; formulas?: boolean;
+    spreadsheetToken: string; sheetId: string; range: string; formulas?: boolean; revision?: number | string;
   }): Promise<any> {
-    return this.execute([
+    return versionedSheetRead(options, () => this.execute([
       'sheets', '+cells-get', '--spreadsheet-token', options.spreadsheetToken,
       '--sheet-id', options.sheetId, '--range', options.range,
       '--include', options.formulas ? 'value,formula,style' : 'value,style',
       '--skip-hidden=false', '--max-chars', '500000', '--as', 'user', '--format', 'json',
-    ], 'sheets');
+    ], 'sheets'));
   }
 
   /**
@@ -1064,12 +1073,12 @@ export class LarkCliClient {
     spreadsheetToken: string;
     sheetId: string;
   }): Promise<any> {
-    return this.execute([
+    return scopedRead(`float-images:${options.spreadsheetToken}:${options.sheetId}`, () => this.execute([
       'sheets', '+float-image-list',
       '--spreadsheet-token', options.spreadsheetToken,
       '--sheet-id', options.sheetId,
       '--format', 'json',
-    ], 'sheets');
+    ], 'sheets'));
   }
 
   async getSheetCharts(options: { spreadsheetToken: string; sheetId: string }): Promise<any> {
@@ -1960,26 +1969,17 @@ export class LarkCliClient {
    * QPS throttling (token bucket algorithm)
    */
   private async throttle(apiType: LarkCliApiType): Promise<void> {
-    // The global bucket comes first because an API-specific queue can be
-    // empty while another endpoint has just consumed the tenant's allowance.
-    await this.throttleBucket(GLOBAL_QPS_BUCKET, GLOBAL_QPS_LIMIT);
-    await this.throttleBucket(apiType, API_QPS_LIMITS[apiType]);
-  }
-
-  private async throttleBucket(bucket: string, limit: number): Promise<void> {
     while (true) {
       const now = Date.now();
-      const calls = this.qpsLimiter.get(bucket) || [];
-      // Remove calls older than one second before deciding whether another
-      // command may start. Recompute after waiting so timestamps stay real.
-      const recentCalls = calls.filter((t) => now - t < 1000);
-      if (recentCalls.length < limit) {
-        recentCalls.push(now);
-        this.qpsLimiter.set(bucket, recentCalls);
+      const global = (this.qpsLimiter.get(GLOBAL_QPS_BUCKET) ?? []).filter((t) => now - t < 1000);
+      const api = (this.qpsLimiter.get(apiType) ?? []).filter((t) => now - t < 1000);
+      if (global.length < GLOBAL_QPS_LIMIT && api.length < API_QPS_LIMITS[apiType]) {
+        this.qpsLimiter.set(GLOBAL_QPS_BUCKET, [...global, now]);
+        this.qpsLimiter.set(apiType, [...api, now]);
         return;
       }
-
-      const waitTime = Math.max(1, 1000 - (now - recentCalls[0]));
+      const waitTime = Math.max(1, global.length >= GLOBAL_QPS_LIMIT ? 1000 - (now - global[0]) : 0,
+        api.length >= API_QPS_LIMITS[apiType] ? 1000 - (now - api[0]) : 0);
       await new Promise((resolve) => setTimeout(resolve, waitTime));
     }
   }

@@ -308,14 +308,13 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
             <span className="hidden xl:inline">打开</span>
           </button>
 
-          {/* S13 源编辑/写回入口：仅 docx 且有本地 md 时渲染（sheet/slides
+          {/* 源文档状态/写回入口：仅 docx 且有本地 md 时渲染（sheet/slides
               为导出投影不支持受控编辑；未同步无正文可编辑） */}
           {objToken && node.obj_type === 'docx' && content?.mdContent != null && !loading && !error && (
             <SourceEditControls
               objToken={objToken}
               objType={node.obj_type}
               mdContent={content.mdContent}
-              mdTruncated={content.mdTruncated}
               onContentChanged={() => objToken && loadContent(objToken)}
             />
           )}

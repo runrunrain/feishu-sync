@@ -36,7 +36,6 @@ import type {
   DocumentContent,
   DocumentComments,
   SourceEditStatus,
-  SourceEditResult,
   SourcePushPlan,
   SourcePushResult,
   SourcePushLogRecord,
@@ -568,7 +567,7 @@ export async function adoptKnowledgeRootSuggestion(): Promise<string> {
 
 export async function syncDocs(
   documents: ChangedDocument[],
-  options: { enableLLM?: boolean; adoptExistingProfileTargets?: boolean } = {},
+  options: { enableLLM?: boolean; adoptExistingProfileTargets?: boolean; deferSnapshot?: boolean } = {},
 ): Promise<SyncResult> {
   const result = await request<SyncResult>('/api/sync', {
     method: 'POST',
@@ -577,6 +576,7 @@ export async function syncDocs(
       options: {
         enableLLM: options.enableLLM === true,
         adoptExistingProfileTargets: options.adoptExistingProfileTargets === true,
+        deferSnapshot: options.deferSnapshot === true,
         fullSync: false,
         apply: true,
         confirmation: 'APPLY',
@@ -589,6 +589,11 @@ export async function syncDocs(
   // diff 无副作用。
   emitDiffChanged('sync');
   return result;
+}
+
+export async function flushSyncSnapshot(): Promise<void> {
+  await request('/api/sync/snapshot', { method: 'POST' });
+  emitDiffChanged('sync-batch-completed');
 }
 
 export async function refreshSheet(objToken: string): Promise<SyncResult> {
@@ -1526,20 +1531,6 @@ export function installCliShim(): Promise<CliShimInstallResult> {
 /** GET /api/sources/:objToken/edit-status —— 正文 hash 与编辑状态（OCC 入口）。 */
 export function getSourceEditStatus(objToken: string): Promise<SourceEditStatus> {
   return request<SourceEditStatus>(`/api/sources/${encodeURIComponent(objToken)}/edit-status`);
-}
-
-/**
- * POST /api/sources/:objToken/edit —— 保存正文编辑（baseHash OCC）。
- * 409 source_edit_conflict 时 err.response.details.currentBodyHash 为最新 hash。
- */
-export function editSourceDocument(
-  objToken: string,
-  opts: { newText: string; baseHash: string },
-): Promise<SourceEditResult> {
-  return request<SourceEditResult>(`/api/sources/${encodeURIComponent(objToken)}/edit`, {
-    method: 'POST',
-    body: JSON.stringify({ newText: opts.newText, baseHash: opts.baseHash, confirm: 'EDIT', actor: 'ui' }),
-  });
 }
 
 /** POST /api/sources/:objToken/revert —— 放弃修改（恢复上次同步正文）。 */

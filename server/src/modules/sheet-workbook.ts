@@ -7,6 +7,7 @@ import * as SSF from 'ssf';
 import crypto from 'node:crypto';
 import { reconstructWorkbookFromReads, type WorkbookReadClient } from './sheet-read-reconstruction.js';
 import { workbookPathForMarkdown } from './workbook-source.js';
+import { measureSyncPhase } from './sync-performance.js';
 export { workbookPathForMarkdown } from './workbook-source.js';
 import type { WorkbookCell, WorkbookFont, WorkbookPreview, WorkbookSheetLayout } from '../types/workbook.js';
 
@@ -63,6 +64,7 @@ export async function stageSourceWorkbook(
   absolutePath: string; relativePath: string;
   metadataPath: string; metadataRelativePath: string;
   mode: 'native' | 'read-reconstruction';
+  revision?: number | string;
 }> {
   if (typeof client.exportWorkbook !== 'function') {
     throw new Error('当前 lark-cli 客户端不支持 Excel 原件导出，请更新应用和 lark-cli 后重试');
@@ -88,7 +90,7 @@ export async function stageSourceWorkbook(
   let mode: 'native' | 'read-reconstruction' = 'native';
   let details: object = {};
   try {
-    const reported = await client.exportWorkbook(spreadsheetToken, absolutePath);
+    const reported = await measureSyncPhase('native-export', () => client.exportWorkbook(spreadsheetToken, absolutePath));
     if (path.resolve(reported) !== path.resolve(absolutePath)) throw new Error('Excel 导出未写入指定 staging 路径');
     await readWorkbookPackage(absolutePath);
   } catch (error) {
@@ -99,7 +101,7 @@ export async function stageSourceWorkbook(
     }
     console.info('[sheet-workbook] Native export unavailable; rebuilding workbook through read APIs.');
     try {
-      details = await reconstructWorkbookFromReads(client as WorkbookReadClient, spreadsheetToken, absolutePath);
+      details = await measureSyncPhase('read-reconstruction', () => reconstructWorkbookFromReads(client as WorkbookReadClient, spreadsheetToken, absolutePath));
     } catch (reconstructionError) {
       if ((reconstructionError as { code?: string })?.code === 'auth') throw reconstructionError;
       throw new WorkbookAcquisitionError('Excel 原件获取和只读重建均未完成', { cause: reconstructionError });
@@ -113,7 +115,7 @@ export async function stageSourceWorkbook(
     schemaVersion: 1, objToken: spreadsheetToken, ...details, mode,
     sha256: crypto.createHash('sha256').update(fs.readFileSync(absolutePath)).digest('hex'),
   }, null, 2), 'utf-8');
-  return { absolutePath, relativePath, metadataPath, metadataRelativePath, mode };
+  return { absolutePath, relativePath, metadataPath, metadataRelativePath, mode, revision: (details as { revision?: number | string }).revision };
 }
 
 const DEFAULT_THEME = ['FFFFFF', '000000', 'E7E6E6', '44546A', '4472C4', 'ED7D31', 'A5A5A5', 'FFC000', '5B9BD5', '70AD47', '0563C1', '954F72'];
@@ -164,6 +166,24 @@ function formattedText(cell: ExcelJS.Cell, date1904: boolean): string {
   // Formula evaluation belongs to Excel; use its exported cached result only.
   if (result == null && cell.type === ExcelJS.ValueType.Formula) return `=${cell.formula}`;
   return cell.text;
+}
+
+/** Derive the textual companion from the same verified XLSX, without a second cloud read. */
+export async function readReconstructedSheetCsv(file: string, name: string, rows: number, columns: number): Promise<string> {
+  if (!Number.isInteger(rows) || !Number.isInteger(columns) || rows < 1 || columns < 1 || rows * columns > 2_000_000) throw new Error('CSV 派生范围无效');
+  const { workbook } = await loadWorkbook(file);
+  const sheet = workbook.getWorksheet(name); if (!sheet) throw new Error('Excel 中缺少待派生工作表');
+  const lines: string[] = [];
+  for (let row = 1; row <= rows; row++) {
+    const source = sheet.findRow(row); const fields: string[] = [];
+    for (let column = 1; column <= columns; column++) {
+      const cell = source?.findCell(column);
+      const text = !cell || (cell.isMerged && cell.master.address !== cell.address) ? '' : formattedText(cell, Boolean(workbook.properties.date1904));
+      fields.push(/[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text);
+    }
+    lines.push(fields.join(','));
+  }
+  return lines.join('\n') + '\n';
 }
 
 export function columnWidthPixels(width: number): number {

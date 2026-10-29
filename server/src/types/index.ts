@@ -515,6 +515,7 @@ export function isMediaGapReason(
 }
 
 export interface SyncedDocument {
+  performance?: import('../modules/sync-performance.js').SyncPerformance;
   sheetAcquisition?: 'native' | 'read-reconstruction' | 'csv-fallback';
   objToken: string;
   title: string;

@@ -2342,12 +2342,14 @@ export function validateStagingDocs(
     }
     const full = path.join(docsDir, file);
     const stat = fs.statSync(full);
-    totalBytes += stat.size;
     if (stat.size > 1024 * 1024) {
+      totalBytes += stat.size;
       issues.push({ path: file, code: 'file_too_large', message: `单文件超过 1MB（${stat.size} 字节）` });
       continue;
     }
     const content = fs.readFileSync(full, 'utf-8');
+    // 系统生成的来源头不属于模型产出的知识正文，不能占用短文档预算。
+    totalBytes += Buffer.byteLength(stripStdHeader(content), 'utf-8');
     if (hasEditorialHistory(stripStdHeader(content)) || hasEditorialHistory(options.docMeta?.get(file)?.summary ?? '')) {
       issues.push({ path: file, code: 'body_contains_change_history', message: '正文含修订记录/版本对比，请改为当前规则的一次成型表述；变更说明单独记录。' });
     }
@@ -2376,17 +2378,27 @@ export function validateStagingDocs(
     }
   }
 
-  // 总量约束：≤ 原始库总量 × 3
-  let rawBytes = 0;
+  // 扩写上限按模型实际可读的文本计量。图文源的 Markdown 往往只有
+  // 图片链接；漏掉识图/白板/CSV 会把正常重建误判为膨胀。
+  // 每个源至少允许 4 KiB 正文，容纳短源的标题、表格和结构化说明；
+  // 保底按源数而非产出篇数增长，不能通过拆分大量文档放大预算。
+  let inputBytes = 0;
   for (const entry of snapshot.entries) {
-    try {
-      rawBytes += fs.statSync(path.join(state.knowledgeBaseRoot, entry.relPath)).size;
-    } catch {
-      /* 缺失按 0 */
+    const source = snapshot.readVerified(state.knowledgeBaseRoot, entry.objToken);
+    inputBytes += Buffer.byteLength(source.content, 'utf-8');
+    for (const attachment of source.attachments) inputBytes += Buffer.byteLength(attachment.content, 'utf-8');
+    const whiteboards = state.whiteboardTexts?.get(entry.objToken);
+    for (const [src, description] of state.imageDescriptions?.get(entry.objToken) ?? []) {
+      // raw_read 对有白板文字的图片优先内联白板文字，不能重复计入识图。
+      if (!whiteboards?.has(src) && description.state !== 'unavailable' && description.text) {
+        inputBytes += Buffer.byteLength(description.text, 'utf-8');
+      }
     }
+    for (const whiteboard of whiteboards?.values() ?? []) inputBytes += Buffer.byteLength(whiteboard.text, 'utf-8');
   }
-  if (rawBytes > 0 && totalBytes > rawBytes * 3) {
-    issues.push({ code: 'total_too_large', message: `产出总量 ${totalBytes} 超过原始库总量 ×3（${rawBytes * 3}）` });
+  const maxBytes = Math.max(inputBytes * 3, snapshot.size * 4 * 1024);
+  if (snapshot.size > 0 && totalBytes > maxBytes) {
+    issues.push({ code: 'total_too_large', message: `产出正文 ${totalBytes} 字节超过上限 ${maxBytes} 字节（有效源文本 ${inputBytes} 字节 ×3，每源至少 4 KiB；含 CSV、图片描述和白板文字）` });
   }
 
   // 覆盖检查：工作集内每个源要么被引用，要么在 skipped

@@ -39,6 +39,7 @@ import {
   renameCustomFolder,
 } from '../api/client';
 import { appLogger } from '../utils/appLogger';
+import { normalizeExternalUrl } from '../utils/external-url';
 import type { CustomFolder } from '../types';
 
 const DOC_TYPE_ICON: Record<string, typeof FileText> = {
@@ -342,9 +343,9 @@ export function CustomArchiveSettingsCard() {
                               <span className="min-w-0 flex-1 truncate text-xs text-ink font-sans-ui" title={doc.localRelPath}>
                                 {doc.title}
                               </span>
-                              {doc.originalLink && (
+                              {normalizeExternalUrl(doc.originalLink) && (
                                 <a
-                                  href={doc.originalLink}
+                                  href={normalizeExternalUrl(doc.originalLink)!}
                                   target="_blank"
                                   rel="noreferrer"
                                   aria-label={`在飞书中打开 ${doc.title}`}

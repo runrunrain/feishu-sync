@@ -33,6 +33,7 @@ import { SourceNodeMenu, type SourceMenuTarget } from './SourceNodeMenu';
 import { insertionSide, reorderSiblings, siblingDropTarget } from '../utils/treeReorder';
 import { getMappingTree, reorderMapping } from '../api/client';
 import { cloudMoveFace } from './move-out/labels';
+import { normalizeExternalUrl } from '../utils/external-url';
 import type { CloudMoveRecord, CustomFolder, MappingNode, TreeNavTarget, WatchedRoot } from '../types';
 
 type TreeFilter = 'all' | 'changed' | 'error' | 'orphan';
@@ -788,8 +789,8 @@ export function NodeTreeView({
                           >
                             {doc.title}
                           </span>
-                          <a
-                            href={doc.originalLink}
+                          {normalizeExternalUrl(doc.originalLink) && <a
+                            href={normalizeExternalUrl(doc.originalLink)!}
                             target="_blank"
                             rel="noreferrer"
                             onClick={(e) => e.stopPropagation()}
@@ -797,7 +798,7 @@ export function NodeTreeView({
                             className="shrink-0 text-[10px] text-ink-faint hover:text-seal font-sans-ui"
                           >
                             原文
-                          </a>
+                          </a>}
                           {onDeleteDoc && (
                             <button
                               type="button"

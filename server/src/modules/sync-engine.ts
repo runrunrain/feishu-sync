@@ -47,6 +47,9 @@ import {
   toPortableRelative,
 } from './path-resolver.js';
 import { commitDocumentContent } from './content-commit.js';
+import crypto from 'node:crypto';
+import { withSyncPerformance, measureSyncPhase, recordSyncDuration } from './sync-performance.js';
+import type { AdaptOutput } from './content-backend.js';
 import type { DocumentIR } from './document-ir.js';
 import {
   commitAtomicPlan,
@@ -75,7 +78,7 @@ import { LarkCliError } from './lark-cli-client.js';
 // P1-S5（设计 §3.1）：同步侧截图只在可选读 scope 已授权时才调用；scope
 // 清单来自 lark-cli-manager 的注册表（无循环依赖：manager 不回依赖本模块）。
 import { optionalScopesForFeature } from './lark-cli-manager.js';
-import { stageSourceWorkbook, WorkbookAcquisitionError } from './sheet-workbook.js';
+import { stageSourceWorkbook, WorkbookAcquisitionError, readReconstructedSheetCsv } from './sheet-workbook.js';
 import { managedWorkbookCompanions } from './workbook-source.js';
 // P0-S8：白板旁路导出链自 S6 方法体提炼为共享纯函数——downloadImages、
 // backfillWhiteboardBypass 与 custom-doc-sync（归档链）复用同一实现，
@@ -261,7 +264,7 @@ export function classifySyncFailure(error: unknown): ClassifiedSyncFailure {
         message: '飞书接口正在限流，已停止本次请求以避免继续放大流量。',
         retryable: true,
         reasonCode: 'rate_limited',
-        suggestedResolution: '等待短暂冷却后重试；应用会串行、低速执行请求，避免并发重放。',
+        suggestedResolution: '等待短暂冷却后重试；应用会限制并发并共享请求速率上限。',
         repairAction: 'retry',
       };
     }
@@ -270,7 +273,7 @@ export function classifySyncFailure(error: unknown): ClassifiedSyncFailure {
       retryable: error.retryable,
       reasonCode: 'upstream_error',
       suggestedResolution: error.retryable
-        ? '可在网络或飞书服务恢复后重试；重试会串行执行，不会并发放大请求。'
+        ? '可在网络或飞书服务恢复后重试；应用会限制并发并共享请求速率上限。'
         : '请根据错误详情修正配置或云端状态后重新检测。',
       repairAction: error.retryable ? 'retry' : 'manual_review',
     };
@@ -309,7 +312,7 @@ export function classifySyncFailure(error: unknown): ClassifiedSyncFailure {
       message: '飞书接口正在限流，已停止本次请求以避免继续放大流量。',
       retryable: true,
       reasonCode: 'rate_limited',
-      suggestedResolution: '等待短暂冷却后重试；应用会串行、低速执行请求，避免并发重放。',
+      suggestedResolution: '等待短暂冷却后重试；应用会限制并发并共享请求速率上限。',
       repairAction: 'retry',
     };
   }
@@ -317,7 +320,7 @@ export function classifySyncFailure(error: unknown): ClassifiedSyncFailure {
     message,
     retryable: true,
     reasonCode: 'upstream_error',
-    suggestedResolution: '可在网络或飞书服务恢复后重试；重试会串行执行，不会并发放大请求。',
+    suggestedResolution: '可在网络或飞书服务恢复后重试；应用会限制并发并共享请求速率上限。',
     repairAction: 'retry',
   };
 }
@@ -552,7 +555,9 @@ export class SyncEngine {
         // 未写回修改的本地文件、绝不推进其 synced 基线。
         const outcome: LocalEditSyncOutcome = await this.sourceWriteLock.withLock(
           doc.objToken,
-          async (): Promise<LocalEditSyncOutcome> => {
+          async (): Promise<LocalEditSyncOutcome> => this.sourceWriteLock.withLock(`target:${process.platform === 'win32' ? path.resolve(planned.localMdPath!).toLowerCase() : path.resolve(planned.localMdPath!)}`, async () => {
+            const targetHash = fs.existsSync(planned.localMdPath!) ? crypto.createHash('sha256').update(fs.readFileSync(planned.localMdPath!)).digest('hex') : null;
+            if (planned.previousSha256 !== undefined && targetHash !== planned.previousSha256) throw new Error('同步排队期间本地目标发生变化，已保留当前文件，请重新检测');
             if (this.getPendingLocalEditState(doc.objToken)) {
               return { kind: 'blocked', failure: localEditPendingFailure(doc) };
             }
@@ -560,12 +565,13 @@ export class SyncEngine {
             if (cloudBlock) return { kind: 'blocked', failure: cloudOperationFailure(doc, cloudBlock) };
             // Apply uses exactly the target that was independently reviewed in
             // the manifest; it must not recompute a potentially different path.
-            const synced = await this.syncSingleDocument(
+            const measured = await withSyncPerformance(doc.objToken, () => this.syncSingleDocument(
               { ...doc, localMdPath: planned.localMdPath },
               options,
-            );
-            return { kind: 'synced', doc: synced };
-          },
+              targetHash,
+            ));
+            return { kind: 'synced', doc: { ...measured.value, performance: measured.performance } };
+          }),
         );
         if (outcome.kind === 'blocked') {
           failedDocuments.push(outcome.failure);
@@ -665,7 +671,8 @@ export class SyncEngine {
    */
   private async syncSingleDocument(
     doc: ChangedDocument,
-    options: SyncOptions
+    options: SyncOptions,
+    expectedTargetSha?: string | null,
   ): Promise<SyncedDocument> {
     // 1. Fetch document content from Feishu
     //
@@ -714,10 +721,10 @@ export class SyncEngine {
       // docs +fetch is docx-only. Slides must use the dedicated XML API; a
       // read/export failure is surfaced as a failed sync instead of being
       // recorded as a successful metadata placeholder.
-      fetched = await this.fetchSlidesContent(doc.objToken, doc.title);
+      fetched = await measureSyncPhase('fetch', () => this.fetchSlidesContent(doc.objToken, doc.title));
     } else {
       try {
-        fetched = await this.fetchDocumentContent(doc.objToken, doc.objType);
+        fetched = await measureSyncPhase('fetch', () => this.fetchDocumentContent(doc.objToken, doc.objType));
       } catch (error) {
         // A permission failure is actionable only in Feishu.  Do not create
         // an empty placeholder and falsely report the document as synced;
@@ -772,8 +779,8 @@ export class SyncEngine {
       : stagingRoot;
     fs.mkdirSync(stagingDocDir, { recursive: true });
 
-    const images = await this.downloadImages(fetched, stagingDocDir);
-    const attachments = await this.downloadAttachments(fetched, stagingDocDir);
+    const images = await measureSyncPhase('media', () => this.downloadImages(fetched, stagingDocDir));
+    const attachments = await measureSyncPhase('media', () => this.downloadAttachments(fetched, stagingDocDir));
 
     const localMediaReferences = new Map<string, string>();
     for (const image of images) {
@@ -817,7 +824,7 @@ export class SyncEngine {
     let sheetFallback = false;
     let fallbackRevision: unknown;
     if (doc.objType === 'sheet') {
-      try { workbook = await stageSourceWorkbook(this.requireLarkCliClient(), doc.objToken, stagingDocDir, localMdPath); }
+      try { workbook = await measureSyncPhase('workbook', () => stageSourceWorkbook(this.requireLarkCliClient(), doc.objToken, stagingDocDir, localMdPath)); }
       catch (error) {
         if (!(error instanceof WorkbookAcquisitionError)) throw error;
         sheetFallback = true;
@@ -847,17 +854,18 @@ export class SyncEngine {
       );
     }
     if (doc.objType === 'sheet') {
-      const exportedSheets = await this.exportSheetsToStaging(
+      const exportedSheets = await measureSyncPhase('csv', () => this.exportSheetsToStaging(
         doc.objToken,
         stagingDocDir,
         docname,
         undefined,
-        sheetFallback ? fallbackRevision : undefined,
-      );
+        sheetFallback ? fallbackRevision : workbook?.revision,
+        workbook?.mode === 'read-reconstruction' ? workbook.absolutePath : undefined,
+      ));
       sheets.push(...exportedSheets);
-      if (sheetFallback) {
-        const finalRevision = (await this.requireLarkCliClient().getWorkbookInfo(doc.objToken))?.data?.revision;
-        if (finalRevision == null || String(finalRevision) !== String(fallbackRevision)) throw new Error('读取 CSV 期间表格版本变化，已保留现有本地文件');
+      if (sheetFallback || workbook?.revision != null) {
+        const finalRevision = (await this.requireLarkCliClient().getWorkbookInfo(doc.objToken, true))?.data?.revision;
+        if (finalRevision == null || String(finalRevision) !== String(sheetFallback ? fallbackRevision : workbook?.revision)) throw new Error('读取 CSV 期间表格版本变化，已保留现有本地文件');
       }
     }
     // Sheet float images flow through the same images/extraFiles channel as
@@ -889,9 +897,7 @@ export class SyncEngine {
     if (this.layoutReconstructor && sheets.length > 0) {
       const reconstructedSheets: string[] = [];
       for (const sheet of sheets) {
-        const reconstructedMarkdown = await this.layoutReconstructor.reconstructToMarkdown(
-          sheet.csvPath,
-        );
+        const reconstructedMarkdown = await measureSyncPhase('layout', () => this.layoutReconstructor!.reconstructToMarkdown(sheet.csvPath));
         let section =
           `## 子表: ${sheet.title}\n\n[CSV 原始数据](${sheet.csvRel})\n\n${reconstructedMarkdown}`;
         // 浮动图片大图展示区：CSV 单元格内的引用之外，追加不依赖 CSV
@@ -939,7 +945,7 @@ export class SyncEngine {
         // { channel?, adapt: { temperature, enableStreaming, onProgress,
         //                       timeoutMs } }). ContentAdapter 内部根据
         // registry 的 primaryChannel 选择通道并自动 fallback。
-        const adapted = await this.contentAdapter.adaptContent(
+        const adapted = await measureSyncPhase<AdaptOutput>('llm', () => this.contentAdapter!.adaptContent(
           finalContent,
           localOldContent,
           {
@@ -952,7 +958,7 @@ export class SyncEngine {
               timeoutMs: this.config.llm.timeoutMs ?? 600_000,
             },
           }
-        );
+        ));
         if (
           (adapted.finishReason === 'stop' || adapted.finishReason === 'length') &&
           adapted.adaptedMarkdown.trim().length > 0
@@ -983,6 +989,11 @@ export class SyncEngine {
       }
     }
 
+    const commitStarted = performance.now();
+    if (expectedTargetSha !== undefined) {
+      const currentHash = fs.existsSync(localMdPath) ? crypto.createHash('sha256').update(fs.readFileSync(localMdPath)).digest('hex') : null;
+      if (currentHash !== expectedTargetSha) throw new Error('同步读取期间本地文件发生变化，已保留当前文件，请重新检测');
+    }
     // 8. Atomic content commit: only this step mutates knowledge-base files.
     const headerMeta = this.resolveHeaderMeta(doc, fetched);
     // P1-S3（设计 P1 §2.2）：引用边抽取——纯函数、零 IO，在 DB 事务外
@@ -1230,6 +1241,7 @@ export class SyncEngine {
     // 行与备份目录。清行失败不吞掉同步成功（行残留只会继续显示已推送
     // 状态，下次成功同步会再试清理）。
     this.finalizePushedSourceEdit(doc.objToken);
+    recordSyncDuration('commit', commitStarted);
 
     // P1-S3（§2.1）：单文档引用边超 500 上限 → 同步警告 references_truncated
     // （边照常入库，按 occurrences 降序截断；不阻断提交）。
@@ -2520,6 +2532,7 @@ export class SyncEngine {
     docname: string,
     onlySheetId?: string,
     expectedRevision?: unknown,
+    reconstructedWorkbook?: string,
   ): Promise<Array<{
     sheetId: string;
     title: string;
@@ -2579,7 +2592,7 @@ export class SyncEngine {
       const cols = sheet.column_count ?? 20;
       const range = `A1:${colToLetter(cols)}${rows}`;
 
-      const csvResult = await this.requireLarkCliClient().getSheetCsv({
+      const csvResult = reconstructedWorkbook ? { data: { annotated_csv: await readReconstructedSheetCsv(reconstructedWorkbook, sheet.sheet_name, rows, cols), actual_range: range, has_more: false, revision: expectedRevision } } : await this.requireLarkCliClient().getSheetCsv({
         spreadsheetToken: sheetToken,
         sheetId: sheet.sheet_id,
         range,

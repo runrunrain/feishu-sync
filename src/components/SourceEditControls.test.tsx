@@ -3,9 +3,8 @@
  *
  * SSR + 纯函数锚定（CliAccessSettingsCard.test.tsx 同法：effects 不跑，
  * 初始渲染只含入口按钮；异步流由 server 侧测试与真机浏览器验证覆盖）：
- *   - docx + 本地正文 → 「编辑」入口渲染
+ *   - docx + 本地正文 → 展示写回记录和历史，不提供手动编辑
  *   - sheet / 无本地正文 → 整体不渲染
- *   - mdTruncated → 编辑禁用（防整文替换丢尾部）
  *   - splitFeishuSyncHeader 与 S11 splitHeaderBody 同规则切分
  */
 
@@ -50,7 +49,7 @@ describe('splitFeishuSyncHeader（与 S11 服务端切分同规则）', () => {
     expect(split!.body).toBe('\n正文');
   });
 
-  it('历史头格式（无 feishu_sync 键）→ null（编辑入口禁用）', () => {
+  it('历史头格式（无 feishu_sync 键）→ null', () => {
     expect(splitFeishuSyncHeader('<!--\n来源: 飞书知识库\nobj_token: t (docx)\n-->\n\n' + BODY)).toBeNull();
   });
 
@@ -60,32 +59,19 @@ describe('splitFeishuSyncHeader（与 S11 服务端切分同规则）', () => {
 });
 
 describe('SourceEditControls 渲染分支', () => {
-  it('docx + 本地正文：编辑入口渲染', () => {
+  it('docx + 本地正文：无手动编辑入口', () => {
     const html = render();
-    expect(html).toContain('编辑');
+    expect(html).not.toContain('编辑正文');
+    expect(html).not.toContain('正文编辑器');
     expect(html).not.toContain('写回飞书'); // 无编辑行时不显示写回入口
   });
 
-  it('P0-S5：写回记录 / 云端历史入口渲染（回滚安全网，与编辑同门槛）', () => {
+  it('写回记录 / 云端历史入口继续可用', () => {
     const html = render();
     expect(html).toContain('data-testid="open-push-log"');
     expect(html).toContain('data-testid="open-cloud-history"');
     expect(html).toContain('写回记录');
     expect(html).toContain('云端历史');
-  });
-
-  it('mdTruncated：编辑禁用（防整文替换丢尾部）', () => {
-    const html = render({ mdTruncated: true });
-    const editButton = html.match(/<button[\s\S]*?编辑[\s\S]*?<\/button>/)?.[0] ?? '';
-    expect(editButton).toContain('disabled');
-    expect(editButton).toContain('超过预览大小上限');
-  });
-
-  it('头部非规范格式：编辑禁用并提示重新同步', () => {
-    const html = render({ mdContent: '纯正文无头部\n' });
-    const editButton = html.match(/<button[\s\S]*?编辑[\s\S]*?<\/button>/)?.[0] ?? '';
-    expect(editButton).toContain('disabled');
-    expect(editButton).toContain('重新同步');
   });
 
   it('sheet 类型：整体不渲染', () => {

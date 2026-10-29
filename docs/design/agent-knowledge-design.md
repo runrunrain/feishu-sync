@@ -360,7 +360,7 @@ queued → preflight → running → validating → publishing → published
 2. **running**：拉起构建专用 pi 进程（`--no-session`，工具集见 §7.1 Build 行）。系统提示 = 内置构建规则 + 文风规范（§6.7）。工作集按 `buildBatchSize` 分批，每批一个 prompt，内容为本批源清单（objToken、标题、relPath、变更类型）与受影响文档清单；正文由 Agent 经工具读取。每批按 §4.4 判定，任一批失败即整体失败。最后一个 prompt 要求调用 `kb_finish`。
 3. **validating**（server 确定性校验，失败即 `failed(kb_validation_failed)`，`report.json` 列出逐条问题）：
    - 每个 `.md` 都能解析出 header，`sources` 非空且全部在快照内；
-   - 路径合规（§6.2），无 symlink，无非 `.md` 文件；单文件 ≤1 MB，总量 ≤ 原始库总量 × 3；
+   - 路径合规（§6.2），无 symlink，无非 `.md` 文件；单文件 ≤1 MB；产出正文总量（不含服务端生成的来源头）≤ `max(有效源文本字节数 × 3, 源数量 × 4 KiB)`。有效源文本包含主文档、CSV 附件、本轮成功的图片描述与白板旁路文字；同一图片优先计白板文字，不计 unavailable 描述或图片二进制。每源 4 KiB 保底用于短文档的标题、表格和结构化说明，按源数而非产出篇数计算；
    - 工作集内每个源要么被至少一篇文档引用，要么出现在 `kb_finish.skipped` 中并有理由；
    - `kb_finish` 已被调用。
 4. **publishing**：生成 manifest → `rename(.staging/<buildId>, releases/<releaseId>)` → 写 `CURRENT.json.tmp` 后 `rename` 为 `CURRENT.json` → DB 事务写 `published` → 清理超出 `retainReleases` 的旧 release。指针 rename 之前失败：删除 release 目录（未被引用）并标 `failed`；指针 rename 之后 DB 失败：保留发布，下次启动对账补 DB。

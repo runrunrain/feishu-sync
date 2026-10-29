@@ -86,6 +86,48 @@ function makeDoc(overrides: Partial<ChangedDocument> = {}): ChangedDocument {
 }
 
 describe('SyncEngine atomic apply path', () => {
+  it.each(['during-fetch', 'queued-sync'])('preserves newer local bytes for %s', async (scenario) => {
+    const { kb, store, config } = makeWorkspace();
+    const mdPath = path.join(kb, '技术 - Dev', '原子文档', 'README.md');
+    fs.mkdirSync(path.dirname(mdPath), { recursive: true });
+    fs.writeFileSync(mdPath, '# prior\n');
+    store.upsertDocument({ objToken: 'tok-doc', wikiNodeToken: 'node-doc', objType: 'docx', title: '原子文档',
+      localMdPath: mdPath, localRelPath: '技术 - Dev/原子文档/README.md', watchedRootId: 'dev',
+      lastSyncedModifyTime: 'old', lastSyncedAt: '2026-01-01T00:00:00.000Z',
+      syncedObjEditTime: 10, observedObjEditTime: 10, status: 'synced', syncState: 'synced' } as any);
+    store.markDocumentSynced({ objToken: 'tok-doc', syncedObjEditTime: 10, localMdPath: mdPath,
+      lastSyncedModifyTime: 'old', lastSyncedAt: '2026-01-01T00:00:00.000Z' });
+    let entered!: () => void, release!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let fetches = 0;
+    const client = { fetchDocumentMarkdown: async () => {
+      fetches++; entered();
+      if (scenario === 'during-fetch') fs.writeFileSync(mdPath, '# user edit\n');
+      else await gate;
+      return { data: { document: { content: 'cloud body\n', images: [], attachments: [], sheets: [], url: '' } } };
+    } };
+    const engine = new SyncEngine({ larkCliClient: client, localMapStore: store, config });
+    const doc = makeDoc({ localMdPath: mdPath, localRelPath: '技术 - Dev/原子文档/README.md', observedObjEditTime: 20 });
+    const options = { enableLLM: false, fullSync: false, apply: true, confirmation: 'APPLY' as const };
+    const first = engine.syncDocuments([doc], options);
+    await started;
+    if (scenario === 'during-fetch') {
+      expect((await first).success).toBe(false);
+      expect(fs.readFileSync(mdPath, 'utf8')).toBe('# user edit\n');
+      expect(store.getDocumentByObjToken('tok-doc')?.syncedObjEditTime).toBe(10);
+    } else {
+      const second = engine.syncDocuments([{ ...doc, observedObjEditTime: 30 }], options);
+      release();
+      const [a, b] = await Promise.all([first, second]);
+      expect(a.success).toBe(true); expect(b.success).toBe(false);
+      expect(b.failedDocuments[0].error).toContain('本地目标发生变化');
+      expect(fetches).toBe(1);
+      expect(fs.readFileSync(mdPath, 'utf8')).toContain('cloud body');
+      expect(store.getDocumentByObjToken('tok-doc')?.syncedObjEditTime).toBe(20);
+    }
+  });
+
   it('refreshes an already mapped sheet through the single-document route', async () => {
     const { kb, store, config } = makeWorkspace();
     const mdPath = path.join(kb, '策划 - Designer', '表格.md');

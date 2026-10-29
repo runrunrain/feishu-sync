@@ -1,7 +1,7 @@
 /**
  * RecentChanges - 最近变更卡片流（T12，04 §4.1）
  *
- * 总览右栏，展示最近 10 条变更（取自 DiffReport）。点击跳转同步区。
+ * 总览右栏，展示最近 10 条变更（取自 DiffReport）。点击条目预览文档。
  */
 
 import { FileText, Table, FileType, ArrowRight, Clock, Inbox } from 'lucide-react';
@@ -14,6 +14,7 @@ interface RecentChangesProps {
   changes: ChangedDocument[];
   maxItems?: number;
   onJumpToSync?: () => void;
+  onSelectDocument: (document: ChangedDocument) => void;
   className?: string;
 }
 
@@ -34,6 +35,7 @@ export function RecentChanges({
   changes,
   maxItems = 10,
   onJumpToSync,
+  onSelectDocument,
   className = '',
 }: RecentChangesProps) {
   const visible = changes.slice(0, maxItems);
@@ -64,12 +66,11 @@ export function RecentChanges({
           visible.map((c) => {
             const TypeIcon = TYPE_ICON[c.objType] ?? FileType;
             return (
-              <div
+              <button
+                type="button"
                 key={c.objToken}
-                className="flex items-center gap-2.5 px-2.5 py-2 rounded transition-colors duration-150 hover:bg-paper-2 cursor-pointer"
-                onClick={onJumpToSync}
-                role="button"
-                tabIndex={0}
+                className="w-full text-left flex items-center gap-2.5 px-2.5 py-2 rounded transition-colors duration-150 hover:bg-paper-2 cursor-pointer"
+                onClick={() => onSelectDocument(c)}
               >
                 <TypeIcon className="w-4 h-4 text-ink-soft shrink-0" />
                 <span className="flex-1 truncate text-sm text-ink">{c.title}</span>
@@ -80,7 +81,7 @@ export function RecentChanges({
                   <Clock className="w-3 h-3" />
                   {formatCloudModifiedTime(c.cloudModifiedTime)}
                 </span>
-              </div>
+              </button>
             );
           })
         )}

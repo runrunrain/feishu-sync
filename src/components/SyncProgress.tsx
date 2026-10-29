@@ -3,7 +3,7 @@
  *
  * - 位置：挂在同步主区最顶部，sticky 跟随滚动——同步期间始终可见，
  *   不再被挤到页面底部；
- * - 真实进度：useSync.syncDocuments 逐文档串行提交（后端按文档独立原子
+ * - 真实进度：useSync.syncDocuments 两路受控同步（后端按文档独立原子
  *   提交，语义等价），每完成一篇推进 done；百分比与「done / total」
  *   均为真实数值；
  * - 当前文档：currentTitle 实时显示正在同步的文档名（截断保护 +

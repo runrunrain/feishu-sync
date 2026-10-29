@@ -94,6 +94,8 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
     | null
   >(null);
   const [selectedToken, setSelectedToken] = useState<string | null>(null);
+  const [recentSelection, setRecentSelection] = useState<ChangedDocument | null>(null);
+  const [previewRequest, setPreviewRequest] = useState(0);
   // 自定义归档文件夹（GET /api/custom-folders）；快捷添加对话框的显隐。
   const [customFolders, setCustomFolders] = useState<CustomFolder[]>([]);
   const [customFoldersLoading, setCustomFoldersLoading] = useState(true);
@@ -408,8 +410,28 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
     () =>
       activeNodes.find((n) => n.obj_token === selectedToken) ??
       customDocNodes.find((n) => n.obj_token === selectedToken) ??
+      (recentSelection?.objToken === selectedToken ? {
+        obj_token: recentSelection.objToken,
+        wiki_node_token: recentSelection.wikiNodeToken ?? null,
+        space_id: recentSelection.spaceId ?? null,
+        obj_type: recentSelection.objType,
+        title: recentSelection.title,
+        local_path: recentSelection.localMdPath ?? '',
+        parent_node_token: recentSelection.parentNodeToken ?? null,
+        has_child: recentSelection.hasChild ?? false,
+        obj_edit_time: recentSelection.observedObjEditTime ?? null,
+        last_synced_modify_time: '',
+        last_synced_at: recentSelection.localSyncedTime ?? '',
+        last_seen_at: null,
+        status: 'changed' as const,
+        cloud_deleted: recentSelection.changeType === 'deleted' ? 1 : 0,
+        sortOrder: null,
+        original_link: null,
+        cloud_match: 'unknown' as const,
+        watched_root_url: recentSelection.watchedRootUrl ?? null,
+      } : null) ??
       null,
-    [activeNodes, customDocNodes, selectedToken],
+    [activeNodes, customDocNodes, selectedToken, recentSelection],
   );
 
   // Build a set of orphan local paths to drive NodeTreeView's "仅孤儿" filter.
@@ -535,6 +557,7 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
         {/* Center: document preview (primary content area) */}
         <div className="min-w-0 min-h-[260px] lg:min-h-0 lg:h-full lg:ml-1 flex-1">
           <DocPreviewPanel
+            key={previewRequest}
             node={selectedNode}
             onOpenFolder={handleOpenFolder}
             className="h-full"
@@ -580,7 +603,11 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
               cloudMoves={selectedNode ? movesByToken.get(selectedNode.obj_token) : undefined}
               onCloudMovesChanged={() => { void loadCloudMoves(); void loadFeishu(); }}
             />
-            <RecentChanges changes={changes} onJumpToSync={onJumpToSync} className="flex-1 min-h-[180px]" />
+            <RecentChanges changes={changes} onJumpToSync={onJumpToSync} onSelectDocument={(doc) => {
+              setRecentSelection(doc);
+              setSelectedToken(doc.objToken);
+              setPreviewRequest((value) => value + 1);
+            }} className="flex-1 min-h-[180px]" />
           </div>
         )}
       </div>

@@ -24,6 +24,7 @@
  */
 
 import fs from 'node:fs';
+import { syncScope } from './sync-performance.js';
 import path from 'node:path';
 
 // ---------------------------------------------------------------------------
@@ -231,7 +232,19 @@ export async function downloadSheetMedia(
       options.imagesDir,
       `${safeTitle}_${sanitizeFileStem(address)}_${sanitizeFileStem(floatImage.floatImageId)}`,
     );
-    const absolutePath = await downloadFloatImage(options.client, floatImage, stem);
+    const scope = syncScope(); const cacheKey = `${floatImage.imageToken}:${floatImage.floatImageId}:${floatImage.url ?? ''}`;
+    const cached = scope?.media.get(cacheKey);
+    let absolutePath: string;
+    if (cached) {
+      absolutePath = `${stem}${cached.extension}`;
+      fs.writeFileSync(absolutePath, cached.bytes); scope!.metrics.cacheHits++;
+    } else {
+      absolutePath = await downloadFloatImage(options.client, floatImage, stem);
+      const size = fs.statSync(absolutePath).size;
+      if (scope && size <= 24 * 1024 * 1024 && scope.mediaBytes + size <= 32 * 1024 * 1024) {
+        scope.media.set(cacheKey, { bytes: fs.readFileSync(absolutePath), extension: path.extname(absolutePath) }); scope.mediaBytes += size;
+      }
+    }
     assertDownloadedSheetMedia(
       absolutePath,
       `子表 "${options.subSheetTitle}" 单元格 ${address} (${floatImage.floatImageId})`,

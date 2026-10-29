@@ -8,9 +8,9 @@ import { addPieChart } from './sheet-chart-reconstruction.js';
 
 type JsonObject = Record<string, any>;
 export interface WorkbookReadClient extends SheetMediaDownloadClient {
-  getWorkbookInfo(token: string): Promise<any>;
+  getWorkbookInfo(token: string, fresh?: boolean): Promise<any>;
   getSheetLayout(options: { spreadsheetToken: string; sheetId: string }): Promise<any>;
-  getSheetCells(options: { spreadsheetToken: string; sheetId: string; range: string; formulas?: boolean }): Promise<any>;
+  getSheetCells(options: { spreadsheetToken: string; sheetId: string; range: string; formulas?: boolean; revision?: number | string }): Promise<any>;
   getSheetFloatImages(options: { spreadsheetToken: string; sheetId: string }): Promise<any>;
   getSheetCharts?(options: { spreadsheetToken: string; sheetId: string }): Promise<any>;
 }
@@ -142,25 +142,29 @@ function completeWindow(data: JsonObject, window: Window): boolean {
 async function readWindow(
   client: WorkbookReadClient, token: string, sheetId: string, revision: number | string,
   window: Window, worksheet: ExcelJS.Worksheet, approximations: NonNullable<WorkbookReadManifest['approximations']>,
+  sizing: { rows: number; columns: number },
 ): Promise<number> {
   const range = `${columnLetters(window.left)}${window.top}:${columnLetters(window.right)}${window.bottom}`;
-  const values = payload(await client.getSheetCells({ spreadsheetToken: token, sheetId, range }));
+  const values = payload(await client.getSheetCells({ spreadsheetToken: token, sheetId, range, revision }));
   assertRevision(values, revision);
   // The formula rendering mode replaces values, so read cached values and
   // formulas separately. This also distinguishes literal '=...' text.
-  const formulas = payload(await client.getSheetCells({ spreadsheetToken: token, sheetId, range, formulas: true }));
+  const formulas = completeWindow(values, window)
+    ? payload(await client.getSheetCells({ spreadsheetToken: token, sheetId, range, formulas: true, revision })) : values;
   assertRevision(formulas, revision);
   if (!completeWindow(values, window) || !completeWindow(formulas, window)) {
     // No partially returned cells are accepted. Retry smaller rectangles.
     if (window.bottom > window.top) {
       const mid = (window.top + window.bottom) >>> 1;
-      return await readWindow(client, token, sheetId, revision, { ...window, bottom: mid }, worksheet, approximations)
-        + await readWindow(client, token, sheetId, revision, { ...window, top: mid + 1 }, worksheet, approximations);
+      sizing.rows = Math.min(sizing.rows, mid - window.top + 1);
+      return await readWindow(client, token, sheetId, revision, { ...window, bottom: mid }, worksheet, approximations, sizing)
+        + await readWindow(client, token, sheetId, revision, { ...window, top: mid + 1 }, worksheet, approximations, sizing);
     }
     if (window.right > window.left) {
       const mid = (window.left + window.right) >>> 1;
-      return await readWindow(client, token, sheetId, revision, { ...window, right: mid }, worksheet, approximations)
-        + await readWindow(client, token, sheetId, revision, { ...window, left: mid + 1 }, worksheet, approximations);
+      sizing.columns = Math.min(sizing.columns, mid - window.left + 1);
+      return await readWindow(client, token, sheetId, revision, { ...window, right: mid }, worksheet, approximations, sizing)
+        + await readWindow(client, token, sheetId, revision, { ...window, left: mid + 1 }, worksheet, approximations, sizing);
     }
     throw new Error(`单元格 ${range} 读取仍被截断，不能确认完整同步`);
   }
@@ -266,11 +270,16 @@ export async function reconstructWorkbookFromReads(
     worksheet.state = source.is_hidden ? 'hidden' : 'visible';
     applyLayout(worksheet, layout, rows, columns);
     let cells = 0;
-    for (let top = 1; top <= rows; top += 64) {
-      for (let left = 1; left <= columns; left += 32) {
+    const sizing = { rows: 256, columns: 32 };
+    for (let top = 1; top <= rows;) {
+      const bottom = Math.min(rows, top + sizing.rows - 1);
+      for (let left = 1; left <= columns;) {
+        const right = Math.min(columns, left + sizing.columns - 1);
         cells += await readWindow(client, token, source.sheet_id, info.revision,
-          { top, left, bottom: Math.min(rows, top + 63), right: Math.min(columns, left + 31) }, worksheet, manifest.approximations!);
+          { top, left, bottom, right }, worksheet, manifest.approximations!, sizing);
+        left = right + 1;
       }
+      top = bottom + 1;
     }
     if (source.merged_cells_count != null && layout.merged_cells.length !== Number(source.merged_cells_count)) throw new Error(`工作表 ${source.sheet_name} 的合并区域数量不一致`);
     for (const merge of layout.merged_cells) {
@@ -320,7 +329,7 @@ export async function reconstructWorkbookFromReads(
     manifest.sheets.push({ id: source.sheet_id, name: worksheet.name, rows, columns, cells, merges: layout.merged_cells.length, images: imageCount });
     console.info(`[sheet-workbook] Rebuilt sheet ${worksheet.name}: ${cells} populated cells, ${layout.merged_cells.length} merges, ${imageCount} images.`);
   }
-  const finalInfo = payload(await client.getWorkbookInfo(token));
+  const finalInfo = payload(await client.getWorkbookInfo(token, true));
   assertRevision(finalInfo, info.revision);
   if (finalInfo.sheets?.length !== info.sheets.length) throw new Error('读取期间工作表清单变化，请重新同步');
   await workbook.xlsx.writeFile(outputPath);

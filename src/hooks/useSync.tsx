@@ -16,10 +16,10 @@
  * and the backend remains the final safety gate for every planned write.
  */
 
-import { createContext, useCallback, useContext, useMemo, useState } from 'react';
+import { createContext, useCallback, useContext, useMemo, useState, useRef } from 'react';
 import type { ReactNode } from 'react';
 import type { SyncResult, ChangedDocument, SyncDocumentOptions } from '../types';
-import { syncDocs, syncIndex as apiSyncIndex } from '../api/client';
+import { syncDocs, flushSyncSnapshot, syncIndex as apiSyncIndex } from '../api/client';
 
 interface IndexResult {
   scanned: number;
@@ -37,9 +37,9 @@ interface UseSyncResult {
   error: string | null;
   /** 本次（或最近一次）syncDocuments 提交的文档总数；0 表示尚未发起同步。 */
   total: number;
-  /** 已完成（成功+失败）的文档数——逐文档串行提交驱动，真实进度。 */
+  /** 已完成（成功+失败）的文档数——按实际完成计数。 */
   done: number;
-  /** 当前正在同步的文档标题（串行提交中实时更新；空闲时 null）。 */
+  /** 当前正在同步的文档标题（最多两篇；空闲时 null）。 */
   currentTitle: string | null;
   /** 本次已失败文档数（实时）。 */
   failedCount: number;
@@ -55,6 +55,7 @@ const SyncContext = createContext<UseSyncResult | null>(null);
 
 export function SyncProvider({ children }: { children: ReactNode }) {
   const [syncing, setSyncing] = useState(false);
+  const syncLock = useRef(false);
   const [indexing, setIndexing] = useState(false);
   const [syncResult, setSyncResult] = useState<SyncResult | null>(null);
   const [indexResult, setIndexResult] = useState<IndexResult | null>(null);
@@ -68,11 +69,14 @@ export function SyncProvider({ children }: { children: ReactNode }) {
     documents: ChangedDocument[],
     options: SyncDocumentOptions = {},
   ) => {
+    if (syncLock.current) return null;
+    documents = [...new Map(documents.map((doc) => [doc.objToken, doc])).values()];
     if (documents.length === 0) {
       setError('No documents selected for sync');
       return null;
     }
 
+    syncLock.current = true;
     setSyncing(true);
     setError(null);
     setSyncResult(null);
@@ -81,25 +85,22 @@ export function SyncProvider({ children }: { children: ReactNode }) {
     setFailedCount(0);
     setCurrentTitle(documents[0]?.title ?? null);
 
-    // 2026-09 真实进度修复：改为逐文档串行提交（后端本就按文档独立原子
-    // 提交，语义等价；本地 HTTP 开销可忽略）。每完成一个文档即推进
-    // done / currentTitle / failedCount，SyncProgress 得以展示真实百分比
-    // 与当前正在同步的文档名。结果聚合成单份 SyncResult 供报告面板使用。
+    // Two document workers overlap IO and local processing. Each completion
+    // advances real progress; the backend owns rate limits and atomic writes.
     const syncedAcc: SyncResult['syncedDocuments'] = [];
     const failedAcc: SyncResult['failedDocuments'] = [];
     let lastResult: SyncResult | null = null;
-    let firstStartedAt = '';
-    let durationMs = 0;
+    const started = Date.now();
+    let next = 0, completed = 0;
+    const activeTitles = new Map<number, string>();
 
     try {
-      for (let i = 0; i < documents.length; i += 1) {
-        const doc = documents[i];
-        setCurrentTitle(doc.title);
+      const worker = async () => { while (next < documents.length) {
+        const i = next++; const doc = documents[i];
+        activeTitles.set(i, doc.title); setCurrentTitle([...activeTitles.values()].join(" / "));
         try {
-          const result = await syncDocs([doc], options);
+          const result = await syncDocs([doc], { ...options, deferSnapshot: true });
           lastResult = result;
-          if (!firstStartedAt && result.startedAt) firstStartedAt = result.startedAt;
-          durationMs += result.duration ?? 0;
           syncedAcc.push(...(result.syncedDocuments ?? []));
           failedAcc.push(...(result.failedDocuments ?? []));
           setFailedCount(failedAcc.length);
@@ -115,18 +116,21 @@ export function SyncProvider({ children }: { children: ReactNode }) {
           });
           setFailedCount(failedAcc.length);
         }
-        setDone(i + 1);
-      }
+        activeTitles.delete(i); setCurrentTitle([...activeTitles.values()].join(" / ") || null);
+        setDone(++completed);
+      } };
+      await Promise.all(Array.from({ length: Math.min(2, documents.length) }, worker));
+      await flushSyncSnapshot().catch(() => undefined);
 
       const completedAt = new Date().toISOString();
       const aggregated: SyncResult = {
-        ...(lastResult as SyncResult),
+        ...(lastResult ?? {}),
         success: failedAcc.length === 0,
         syncedDocuments: syncedAcc,
         failedDocuments: failedAcc,
-        startedAt: firstStartedAt || completedAt,
+        startedAt: new Date(started).toISOString(),
         completedAt,
-        duration: durationMs,
+        duration: Date.now() - started,
       };
       setSyncResult(aggregated);
       return aggregated;
@@ -135,6 +139,7 @@ export function SyncProvider({ children }: { children: ReactNode }) {
       setError(message);
       return null;
     } finally {
+      syncLock.current = false;
       setSyncing(false);
       setCurrentTitle(null);
     }

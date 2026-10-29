@@ -1,9 +1,7 @@
 /**
- * SourceEditControls —— 源文档编辑/写回控件（S13，设计 §7.6）
+ * SourceEditControls —— 源文档修改状态与写回控件（S13，设计 §7.6）
  *
  * 预览面板（DocPreviewPanel / RawSourceDrawer）共用的操作条：
- *   - 「编辑」→ 正文编辑器 Modal（feishu_sync 头部不可见不可改；保存走
- *     S11 edit API，baseHash OCC，409 冲突在编辑器内呈现并引导重载）
  *   - 状态徽标（dirty 本地有修改 / pushed 已写回待回拉 / conflict 冲突）
  *   - 「放弃修改」（revert，恢复上次同步正文，带确认）
  *   - 「写回飞书」（S12 push preview → 按确认级别二次确认 → push；
@@ -19,7 +17,6 @@ import {
   Anchor,
   CloudUpload,
   FileClock,
-  FilePenLine,
   GitCompare,
   History,
   Loader2,
@@ -33,7 +30,6 @@ import { StatusBadge } from './common/StatusBadge';
 import { useToast } from './common/Toast';
 import {
   APIError,
-  editSourceDocument,
   fetchCloudContent,
   getSourceEditStatus,
   previewSourcePush,
@@ -61,13 +57,11 @@ export function splitFeishuSyncHeader(content: string): { header: string; body: 
 
 interface SourceEditControlsProps {
   objToken: string;
-  /** 'docx' 才有编辑面（sheet/slides 导出投影编辑会 422）；null 按未知放行由服务端裁决。 */
+  /** 'docx' 才支持状态与写回；null 按未知放行由服务端裁决。 */
   objType?: string | null;
   /** 本地 md 全文（含头部）；null=未同步到本地（不渲染）。 */
   mdContent: string | null;
-  /** 512KB 预览截断标记：截断时禁止编辑（整文替换会丢尾部内容）。 */
-  mdTruncated?: boolean;
-  /** 编辑/放弃/写回成功后通知父组件重载预览内容。 */
+  /** 放弃/写回成功后通知父组件重载预览内容。 */
   onContentChanged?: () => void;
 }
 
@@ -144,19 +138,11 @@ export function SourceEditControls({
   objToken,
   objType,
   mdContent,
-  mdTruncated = false,
   onContentChanged,
 }: SourceEditControlsProps) {
   const toast = useToast();
   const [status, setStatus] = useState<SourceEditStatus | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
-
-  // 编辑器
-  const [editorOpen, setEditorOpen] = useState(false);
-  const [editorText, setEditorText] = useState('');
-  const [saving, setSaving] = useState(false);
-  const [editorError, setEditorError] = useState<string | null>(null);
-  const [editorConflict, setEditorConflict] = useState(false);
 
   // 写回
   const [pushOpen, setPushOpen] = useState(false);
@@ -217,45 +203,6 @@ export function SourceEditControls({
   }, [objToken, mdContent, refreshStatus]);
 
   if (!objToken || mdContent == null || !editableType) return null;
-
-  const headerEditable = mdTruncated
-    ? { ok: false as const, reason: '文档超过预览大小上限，为防丢内容请直接编辑本地文件' }
-    : splitFeishuSyncHeader(mdContent)
-      ? { ok: true as const, reason: '' }
-      : { ok: false as const, reason: '文档头部不是当前同步格式（重新同步后可编辑）' };
-
-  const openEditor = () => {
-    const split = headerEditable.ok ? splitFeishuSyncHeader(mdContent!) : null;
-    setEditorText(split?.body ?? '');
-    setEditorError(null);
-    setEditorConflict(false);
-    setEditorOpen(true);
-  };
-
-  const handleSave = async () => {
-    if (!status) return;
-    setSaving(true);
-    setEditorError(null);
-    setEditorConflict(false);
-    try {
-      await editSourceDocument(objToken, { newText: editorText, baseHash: status.bodyHash });
-      if (!mountedRef.current) return;
-      toast.push({ type: 'success', message: '已保存修改（本地有未写回的修改，同步将暂缓该文档）' });
-      setEditorOpen(false);
-      await refreshStatus();
-      onContentChanged?.();
-    } catch (error) {
-      if (!mountedRef.current) return;
-      const face = errorFace(error);
-      if (face.code === 'source_edit_conflict') {
-        setEditorConflict(true);
-      } else {
-        setEditorError(face.message || '保存失败');
-      }
-    } finally {
-      if (mountedRef.current) setSaving(false);
-    }
-  };
 
   const handleRevert = () => {
     const edit = status?.editState;
@@ -379,17 +326,7 @@ export function SourceEditControls({
   return (
     <div className="inline-flex shrink-0 items-center gap-1.5">
       {badge}
-      <button
-        type="button"
-        onClick={openEditor}
-        disabled={!headerEditable.ok}
-        title={headerEditable.ok ? '编辑正文（头部同步元数据不可改）' : headerEditable.reason}
-        className="inline-flex items-center gap-1 rounded-md border border-line bg-paper px-2 py-1.5 text-[11px] text-ink-soft font-sans-ui transition-colors hover:bg-paper-2 hover:text-ink disabled:opacity-40 disabled:cursor-not-allowed"
-      >
-        <FilePenLine className="w-3 h-3" />
-        <span className="hidden xl:inline">编辑</span>
-      </button>
-      {/* P0-S5：写回记录 / 云端历史入口（回滚安全网，与编辑同门槛渲染） */}
+      {/* 写回记录和云端历史仍可用于查看和处理 Agent 的修改。 */}
       <button
         type="button"
         onClick={() => setLogDrawerOpen(true)}
@@ -434,61 +371,6 @@ export function SourceEditControls({
         </>
       )}
       {statusError && <span className="text-[10px] text-ink-faint">{statusError}</span>}
-
-      {/* ── 正文编辑器（头部不可见不可改）────────────────────────────── */}
-      <Modal
-        open={editorOpen}
-        title={`编辑正文 · ${status?.title ?? objToken}`}
-        onClose={() => setEditorOpen(false)}
-        contentClassName="max-w-3xl"
-      >
-        <div className="space-y-3">
-          <p className="text-xs text-ink-faint leading-relaxed">
-            只编辑正文部分；文件头部的同步元数据（feishu_sync 注释块）由同步链维护，不参与编辑。
-            保存后文档将标记为「本地已修改」，在写回飞书前同步不会覆盖该文档。
-          </p>
-          <textarea
-            value={editorText}
-            onChange={(e) => setEditorText(e.target.value)}
-            spellCheck={false}
-            aria-label="正文编辑器"
-            className="h-[52vh] w-full resize-none rounded-md border border-line bg-paper px-3 py-2.5 font-mono text-xs leading-relaxed text-ink focus:outline-none focus:border-seal/50"
-          />
-          {editorConflict && (
-            <div className="rounded-md border border-seal-2/40 bg-seal-2/5 p-3 space-y-2">
-              <p className="text-sm text-seal-2 font-medium">保存冲突：正文已被其他入口修改</p>
-              <p className="text-xs text-ink-soft leading-relaxed">
-                当前编辑基于的版本已过期（baseHash 不一致）。请关闭编辑器后重新点「编辑」加载最新正文；
-                未保存的改动如需保留，请先复制到别处。
-              </p>
-              <div className="flex gap-2">
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  onClick={async () => {
-                    await refreshStatus();
-                    onContentChanged?.();
-                  }}
-                >
-                  <RefreshCw className="w-3.5 h-3.5" />
-                  刷新最新正文
-                </Button>
-              </div>
-            </div>
-          )}
-          {editorError && (
-            <p className="rounded-md border border-seal-2/40 bg-seal-2/5 p-2.5 text-xs text-seal-2 leading-relaxed">{editorError}</p>
-          )}
-          <div className="flex items-center justify-end gap-2">
-            <Button variant="ghost" size="sm" onClick={() => setEditorOpen(false)} disabled={saving}>
-              取消
-            </Button>
-            <Button variant="primary" size="sm" onClick={() => void handleSave()} loading={saving} disabled={editorConflict}>
-              保存修改
-            </Button>
-          </div>
-        </div>
-      </Modal>
 
       {/* ── 写回飞书：preview → 确认 → 执行 → 结果 ──────────────────── */}
       <Modal

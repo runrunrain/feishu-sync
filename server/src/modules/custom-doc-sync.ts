@@ -26,6 +26,7 @@
  */
 
 import fs from 'node:fs';
+import { withSyncPerformance, syncScope } from './sync-performance.js';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -55,7 +56,7 @@ import {
 import type { DocumentIR } from './document-ir.js';
 import { BitableExporter, type BitableClient } from './bitable-exporter.js';
 import { LarkCliError } from './lark-cli-client.js';
-import { stageSourceWorkbook, WorkbookAcquisitionError } from './sheet-workbook.js';
+import { stageSourceWorkbook, WorkbookAcquisitionError, readReconstructedSheetCsv } from './sheet-workbook.js';
 import { managedWorkbookCompanions } from './workbook-source.js';
 // P0-S8：白板旁路导出（svg 主 + raw 降级）与 SyncEngine 同一导出链
 // （whiteboard-bypass.ts 共享函数，S6 报告 §五遗留接入；见该模块头）。
@@ -130,7 +131,7 @@ export interface SyncSheetToCustomFolderInput {
   /** LarkCliClient instance (public methods only). */
   larkCliClient: {
     exportWorkbook(spreadsheetToken: string, outputPath: string): Promise<string>;
-    getWorkbookInfo(spreadsheetToken: string): Promise<any>;
+    getWorkbookInfo(spreadsheetToken: string, fresh?: boolean): Promise<any>;
     getSheetCsv(options: {
       spreadsheetToken: string;
       sheetId: string;
@@ -372,6 +373,11 @@ export async function syncDocxToCustomFolder(
 export async function syncSheetToCustomFolder(
   input: SyncSheetToCustomFolderInput,
 ): Promise<SyncSheetResult> {
+  if (syncScope()) return syncSheetToCustomFolderImpl(input);
+  return (await withSyncPerformance(input.objToken, () => syncSheetToCustomFolderImpl(input))).value;
+}
+
+async function syncSheetToCustomFolderImpl(input: SyncSheetToCustomFolderInput): Promise<SyncSheetResult> {
   const root = path.resolve(input.knowledgeBaseRoot);
   const relativeMd =
     toPortableRelative(root, input.localMdPath) ?? path.basename(input.localMdPath);
@@ -423,7 +429,9 @@ export async function syncSheetToCustomFolder(
       const cols = sheet.column_count ?? 20;
       const range = `A1:${colToLetter(cols)}${rows}`;
 
-      const csvResult = await input.larkCliClient.getSheetCsv({
+      const csvResult = workbook?.mode === 'read-reconstruction'
+        ? { data: { annotated_csv: await readReconstructedSheetCsv(workbook.absolutePath, sheet.sheet_name, rows, cols) } }
+        : await input.larkCliClient.getSheetCsv({
         spreadsheetToken: input.objToken,
         sheetId: sheet.sheet_id,
         range,
@@ -466,9 +474,9 @@ export async function syncSheetToCustomFolder(
       });
     }
 
-    if (!workbook) {
-      const finalRevision = (await input.larkCliClient.getWorkbookInfo(input.objToken))?.data?.revision;
-      if (finalRevision == null || String(finalRevision) !== String(fallbackRevision)) throw new Error('读取 CSV 期间表格版本变化，已保留现有本地文件');
+    if (!workbook || workbook.revision != null) {
+      const finalRevision = (await input.larkCliClient.getWorkbookInfo(input.objToken, true))?.data?.revision;
+      if (finalRevision == null || String(finalRevision) !== String(workbook?.revision ?? fallbackRevision)) throw new Error('读取 CSV 期间表格版本变化，已保留现有本地文件');
     }
     // 3. Reconstruct every sub-sheet into markdown (same section format as
     // SyncEngine step 6: header + CSV link + reconstructed body, joined by

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -69,6 +69,13 @@ function readClient() {
 }
 
 describe('native workbook source and authorized read reconstruction', () => {
+  it('reads 1024 rows in eight requests instead of the former 32 without dropping data', async () => {
+    const { client, calls } = readClient(); const info = client.getWorkbookInfo; const layout = client.getSheetLayout;
+    client.getWorkbookInfo = async () => { const result = await info('token'); result.data.sheets[0].row_count = 1024; return result; };
+    client.getSheetLayout = async (options) => { const result = await layout(options); result.data.row_heights = [{ rows: '1:1024', height: 24 }]; return result; };
+    const manifest = await reconstructWorkbookFromReads(client, 'token', path.join(temporary(), 'large.xlsx'));
+    expect(calls).toHaveLength(8); expect(manifest.sheets[0].cells).toBe(7); expect(manifest.sheets[0].rows).toBe(1024);
+  });
   it('uses the controlled export cwd and keeps comma-separated include flags in a single argument', async () => {
     const directory = temporary(), client = new LarkCliClient({ requiredScopes: [] });
     const calls: Array<{ args: string[]; options: any }> = [];
@@ -225,8 +232,10 @@ describe('native workbook source and authorized read reconstruction', () => {
 
   it('archives a read-only reconstructed workbook through the shipped custom-folder commit pipeline', async () => {
     const root = temporary(), ops = temporary(), { client } = readClient();
+    const csvRead = vi.fn(async () => { throw new Error('duplicate CSV request'); });
+    const download = vi.spyOn(client, 'downloadMedia');
     const result = await syncSheetToCustomFolder({
-      larkCliClient: { ...client, getSheetCsv: async () => ({ data: { annotated_csv: '说明,数值\n完整内容,0\n' } }) },
+      larkCliClient: { ...client, getSheetCsv: csvRead },
       knowledgeBaseRoot: root, operationDirectory: ops, localMdPath: path.join(root, '画板.md'),
       objToken: 'token', wikiNodeToken: null, title: '画板', originalLink: null, objEditTime: 41, spaceId: null,
     });
@@ -236,6 +245,8 @@ describe('native workbook source and authorized read reconstruction', () => {
     expect(markdown).toContain('source_workbook: "画板.xlsx"');
     expect(markdown).toContain('source_acquisition: "read-reconstruction"');
     expect((await readWorkbookPreview(path.join(root, '画板.xlsx'), 0)).sheet.images).toHaveLength(1);
+    expect(csvRead).not.toHaveBeenCalled(); expect(download).toHaveBeenCalledTimes(1);
+    expect(fs.readFileSync(path.join(root, '画板.csv-data', '画板.csv'), 'utf8')).toContain('完整说明文字');
   });
 
   it('falls back to CSV and retains the previous managed workbook when reconstruction is unsupported', async () => {
