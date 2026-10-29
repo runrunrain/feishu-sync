@@ -524,7 +524,7 @@ export interface AgentRunContext {
 // P2-S4：raw_comments（评论溯源，只读）只追加进 discuss/work 两面，
 // **不进 build**——评论不在文件哈希围栏内，不得进入构建输入（设计
 // §5.1 硬约束；agent-tool-service 族注册 runKinds 同步限制）。
-export const DISCUSS_TOOLS = ['kb_search', 'kb_read', 'raw_search', 'raw_read', 'raw_read_image', 'raw_links', 'raw_comments', 'app_command'] as const;
+export const DISCUSS_TOOLS = ['kb_search', 'kb_read', 'kb_grep', 'raw_search', 'raw_read', 'raw_read_image', 'raw_links', 'raw_comments', 'app_command'] as const;
 export const WORK_TOOLS = [
   ...DISCUSS_TOOLS,
   'ws_ls',

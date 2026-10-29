@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /** E0 offline evaluator. No database/model/API access and no writes to input releases.
- * See docs/kb-evaluation.md. lex-v1 deliberately fails until P1 is wired on resume.
+ * See docs/kb-evaluation.md. lex-v1 uses the real product query facade.
  */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -10,15 +10,16 @@ import { performance } from 'node:perf_hooks';
 import { isPathInside } from '../src/agent/path-guard.js';
 import { loadQueries, loadRelease, sha256 } from './lib/kb-eval-io.js';
 import { createBaselineRanker, type EvalRanker, type RankerName } from './lib/kb-eval-rankers.js';
+import { createLexRanker } from './lib/kb-eval-lex.js';
 import { collectMemory, compareReport, evaluate, reportMarkdown } from './lib/kb-eval-runner.js';
 import { BENCH_QUERIES, fixtureDir, materializeSynthetic, SYNTHETIC_SEED } from './lib/kb-eval-synthetic.js';
 
 export const HELP = `KB evaluation (offline; writes only --out and owned temporary synthetic files)
   --release <release-dir> --queries <jsonl> --ranker l0|l1|lex-v1 --out <new-dir>
-  --synthetic-fixture --ranker l0|l1 --out <new-dir> [--compare <report.json>]
-  --synthetic-mb 10|30 --ranker l0|l1 --out <new-dir>
+  --synthetic-fixture --ranker l0|l1|lex-v1 --out <new-dir> [--compare <report.json>]
+  --synthetic-mb 10|30 --ranker l0|l1|lex-v1 --out <new-dir>
   --compare <report.json>  Add per-query metric deltas (same corpus and query hashes only).
-lex-v1 is explicitly not ready until P1 KbQueryService is connected; no fake metrics.
+lex-v1 calls product KbQueryService, including real section hits and exhaustive grep pages.
 Synthetic scales are exact MiB of UTF-8 BODY, performance/memory only (no quality gates).
 `;
 export interface CliOptions {
@@ -55,10 +56,6 @@ export function parseArgs(argv: string[]): CliOptions {
 
 /** Exported real CLI entry for isolated integration tests; shared engine seam is evaluate(). */
 export async function runCli(options: CliOptions): Promise<void> {
-  if (options.ranker === 'lex-v1') {
-    // Fail before creating any output or data, including in synthetic mode.
-    createBaselineRanker('lex-v1', { releaseId: '', docs: [], readBody: () => '' });
-  }
   let temporary: string | undefined;
   let ranker: EvalRanker | undefined;
   try {
@@ -80,7 +77,7 @@ export async function runCli(options: CliOptions): Promise<void> {
     }
     const plannedOut = path.join(fs.realpathSync(ancestor), ...missing);
     if (isPathInside(release.dir, plannedOut)) throw new Error('out_inside_release: input is immutable');
-    ranker = createBaselineRanker(options.ranker, release);
+    ranker = options.ranker === 'lex-v1' ? await createLexRanker(release) : createBaselineRanker(options.ranker, release);
     const preparationMs = performance.now() - start;
     const queryFile = options.syntheticFixture ? path.join(fixtureDir, 'synthetic-queries.jsonl') : options.queries;
     const queries = options.syntheticMb ? [] : loadQueries(queryFile!, release);

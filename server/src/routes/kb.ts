@@ -19,6 +19,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { KbBuildService } from '../kb/kb-build-service.js';
 import { StandardKbStore, KbNotPublishedError } from '../kb/standard-kb-store.js';
+import { QueryError } from '../kb/search/kb-query-service.js';
 import { RawSourceSnapshot, collectSourceCandidates } from '../kb/raw-source-snapshot.js';
 import { KbVersionStore, captureSourceContents, sourceChangePreview, validReleaseId } from '../kb/kb-version-store.js';
 import type { KbChangePreview } from '../types/kb-version.js';
@@ -40,6 +41,10 @@ export interface KbRouteDeps {
 }
 
 function errorResponse(c: Context, error: unknown): Response {
+  if (error instanceof QueryError) {
+    const status = error.code.startsWith('invalid_') ? 400 : ['kb_not_published', 'kb_release_unavailable', 'kb_not_found'].includes(error.code) ? 404 : 500;
+    return c.json({ error: error.code, message: error.message, details: error.details }, status) as unknown as Response;
+  }
   if (error instanceof ToolError) {
     return c.json({ error: error.code, message: error.message }, error.status as ContentfulStatusCode) as unknown as Response;
   }
@@ -141,9 +146,11 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
   const routes = new Hono();
   const { buildService, configManager, localMapStore } = deps;
 
+  let queryStore: StandardKbStore | undefined;
   async function loadStore(): Promise<{ store: StandardKbStore; config: Awaited<ReturnType<ConfigManager['load']>> }> {
     const config = await configManager.load();
-    return { store: new StandardKbStore(config.standardKb.outputRoot), config };
+    if (!queryStore || queryStore.outputRootPath !== config.standardKb.outputRoot) queryStore = new StandardKbStore(config.standardKb.outputRoot);
+    return { store: queryStore, config };
   }
 
   const sourceDocuments = (root: string) => {
@@ -265,7 +272,7 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
       if (!manifest) {
         return c.json({ error: 'kb_not_published', message: '标准知识库尚未发布' }, 404);
       }
-      return c.json({ releaseId: manifest.releaseId, results: store.search(manifest, q, limit) });
+      return c.json({ releaseId: manifest.releaseId, results: await store.search(manifest, q, limit) });
     } catch (error) {
       return errorResponse(c, error);
     }

@@ -1,6 +1,6 @@
 /** P0/L1 合成语料单测；不读取生产知识库，也不复用 E0 评测 fixture。 */
 import { describe, expect, it, vi } from 'vitest';
-import { legacySearchDocs, parseSearchQuery, searchDocs, type SearchableDoc } from '../src/kb/kb-search.js';
+import { legacySearchDocs, parseSearchQuery, l1SearchDocs as searchDocs, type SearchableDoc } from '../src/kb/kb-search.js';
 
 const doc = (path: string, fields: Partial<SearchableDoc> = {}): SearchableDoc => ({
   docId: path, path, title: '条目', summary: '', headings: [], ...fields,

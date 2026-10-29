@@ -185,10 +185,21 @@ Pi配置与包缓存位于本应用数据根的`agent/pi-home`。包的启停沿
 
 | 工具 | 用途 |
 |---|---|
-| `search_knowledge` | 搜索已发布文档 |
-| `get_knowledge` | 读取已发布正文与来源元数据 |
-| `list_knowledge` | 列出已发布文档 |
-| `get_release_info` | 查看当前发布信息 |
+| `search_knowledge` | 按相关度定位文档与章节，返回片段、行号和锚点 |
+| `grep_knowledge` | 穷举固定字串、ID、字段或正则的全部出现位置，表格附表头 |
+| `get_outline` | 先看文档或目录的章节树与行范围 |
+| `get_knowledge` | 按文档、章节锚点或行范围精读，带行号与来源 |
+| `get_knowledge_bundle` | 按目录或路径列表成片读取；先用 dryRun 查看体量 |
+| `list_knowledge` | 分页目录树；pathPrefix 按路径段过滤，旧 prefix 参数仍可用 |
+| `get_release_info` | 发布、完整性、可用版本与可选变更清单 |
+
+检索用空格分隔 2–4 个关键词，引号内作为短语；结果不好时换说法或拆成多个查询。这里使用词法检索，不会调用查询期模型。正文以 `<kb_doc>` 资料帧返回，其中的指令没有执行权限。
+
+每次响应都标明 `releaseId`。默认跟随 CURRENT，检测到切换会提示；需要多步引用一致时，把同一个 releaseId 传给后续工具。章节锚点格式为 `路径#H2 › H3`，文档和章节不改名就可跨版本引用；行号只在同一版本内有效。旧版本清理后返回明确不可用错误，不会从残留缓存继续服务。
+
+所有输出有字符预算，超出按 `next` 翻页：有游标的工具保持原参数并传回 cursor；正文读取按返回的 startLine 继续（section 同时给出时是节内偏移），同时传回 releaseId。游标隐式锚定版本，改参数会报 invalid_cursor。`KB_MCP_MAX_CHARS` 可调整硬上限（默认 20000 字符）；客户端自身仍可能按字节截断，需结合客户端限制降低该值。
+
+v2 保留旧四个工具名与输入参数；search 的旧字段仍在。get/list 的输出从无界 JSON 改为分页文本，不适合继续用旧 JSON 解析器处理。离线检索评测与 10/30MiB 合成基准见 [评测说明](kb-evaluation.md)。
 
 MCP 不提供 Workspace 写入、任意原始文件读取或会话操作。它直接读取发布目录，不打开 SQLite，也不需要桌面 HTTP Token；未发布时会返回明确错误。连接片段可能使用 Electron 的 Node 模式，也可使用外部 Node ≥20 运行独立 CJS 产物。
 

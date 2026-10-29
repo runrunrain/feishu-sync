@@ -25,7 +25,7 @@ node --expose-gc --import tsx server/scripts/kb-eval.ts \
   --release /absolute/standard-kb/releases/r_ID \
   --queries /absolute/private-eval/queries.jsonl --ranker l0 --out "$EVAL/real-l0"
 
-# P1 未接线时明确失败，退出 1，不产生报告；绝不自动换成 L1。
+# 共用 lex-v1 产品引擎：真实章节命中与穷举grep，不回退冒充L1。
 node --import tsx server/scripts/kb-eval.ts \
   --synthetic-fixture --ranker lex-v1 --out "$EVAL/lex-v1"
 ```
@@ -61,15 +61,15 @@ node --import tsx server/scripts/kb-eval.ts \
 | ndcgAt10 | 文档 grade=max(章节 grade)，gain=`2^grade-1`，discount=`log2(rank+1)`，按理想前 10 归一 |
 | grepCompleteness | 实际 grep 全部页返回位置集合与 exhaustive 的交集 / exhaustive 集合；允许超集、不重复计数 |
 
-每组与整体均为逐查询宏平均，`count` 表示可计算项数量。无相关标注/无直接回答章节/无非空 exhaustive，或排序器不具备相关能力时为 `null`（Markdown 为 N/A），不补零、不当 100%。当前 L0/L1 无章节 hits 和产品 grep，SectionHit/Grep 两项都为 N/A；这是真实能力缺口，不是漏算。接入 P1 后由真实引擎填充。单测中的 synthetic adapter 仅验证指标和共享调用契约，不是 lex-v1 运行证据。
+每组与整体均为逐查询宏平均，`count` 表示可计算项数量。无相关标注/无直接回答章节/无非空 exhaustive，或排序器不具备相关能力时为 `null`（Markdown 为 N/A），不补零、不当 100%。L0/L1 无章节 hits 和产品 grep，SectionHit/Grep 两项为 N/A。lex-v1 已接入真实 KbQueryService：直接使用其 hits，grep 排空全部游标页，partial 或执行错误会令评测失败，不用参考扫描补齐产品结果。测试中的 synthetic adapter 仍只证明指标接口；CLI lex-v1 输出才是实际产品引擎运行。
 
 ## L0 冻结与产品 L1 接线
 
 - `server/scripts/lib/kb-eval-rankers.ts` 导出可直接调用的 `rankL0`、`rankL1`、`createBaselineRanker` 与 `EvalRanker`。
 - L0 冻结自 `kb-search.ts@1df5fff3dc540cb6c9e92e8e714018b61cd03663`：整串 trim/lowercase；title includes +100、startsWith +50，path +30、headings +40、summary +20、body +60；原片段截取、localeCompare 并列、1..50 limit 均保留。不会 import 后续已改为 L1 的 `searchDocs` 造成基线漂移。
 - L1 在阶段 A 集成时已接到产品显式导出的 `l1SearchDocs` 和 `parseSearchQuery`（`implementation=product-p0-l1`），不另造比较算法。按空白/标点分单元，引号内保留短语，去重、保留 `_ . - + % #`，不提前应用 lex-v1 的 8 单元截断；逐单元 L0 权重之和乘 `0.5 + 命中单元数/总单元数`，片段取正文最早命中，并列按确定性 path 码元顺序。没有 IDF/回退/章节推断/NFKC。早期 E0 报告的独立 L1 数字是历史证据，集成报告使用产品 L1 重跑。
-- `evaluate()`（`kb-eval-runner.ts`）接受 `EvalRanker`，是后续 resume 的共享 ranker 接入点。P1 接线时用真实 `KbQueryService` 实例；search 传固定 releaseId/limit=10，把实际 `hits` 原样传入，`supportsSections=true`；grep 必须排空产品游标页并确认完整，失败或 partial 不得伪装完整；close 负责资源释放。不得用参考扫描器补产品 grep 指标。
-- lex-v1 当前 CLI 明确 `ranker_not_ready`。不猜尚不存在的 KbQueryService 构造/返回签名；后续同任务 resume 替换这一显式拒绝分支即可，不改业务文件。
+- `evaluate()`（`kb-eval-runner.ts`）接受 `EvalRanker`。`kb-eval-lex.ts` 用真实 KbQueryService，只注入已验证的固定 release 目录定位，不改排名或grep算法，也不创建CURRENT或复制知识库。search 排空需要的top-k页并原样使用 hits；grep 排空所有页并拒绝partial。全部读取绑定输入版本。
+- CLI `--ranker lex-v1` 可用于合成及真实输入。设置了 `FEISHU_KB_RANKER=l1` 时会明确报冲突，避免把L1结果标成lex-v1。基线工厂仍拒绝拿L0/L1冒充lex；三种实现都有明确implementation字段。
 
 ## 性能与内存解释
 
@@ -83,7 +83,7 @@ node --import tsx server/scripts/kb-eval.ts \
 - L0/L1 warm 每次逐篇读文件、realpath 校验和 contentHash 复核；额外完整性开销纳入时延，不能冒称当前产品端到端性能或纯 CPU 算法性能。
 - 内存 delta 是本评测进程观测值（含结果 DTO、校验与查询分配），不是 P1 索引稳态内存。`--expose-gc` 下前后强制 GC；不用该选项时 `gcAvailable=false`，不以此裁定内存预算。maxRSS 包含生成语料阶段。
 - `resultCharsP95` 是 ranker 结果 JSON 字符数，不是 MCP 响应预算验证。无产品 grep 则不产生 grep p95。
-- 后续 P1 必须另测真实构建/稳态堆增量和真实服务 grep，才可对照设计 §6.5 的预算；当前任何合成数字均不直接判真实质量门槛。
+- lex-v1 的 preparation 包含输入校验与实际索引预热，堆增量包含常驻索引；grep p95包含排空所有产品分页（每页重新扫描）。它可用于设计 §6.5 合成规模预算对照，但不代表真实冷盘、真实语料或LAN性能，更不能替代真实检索质量门槛。
 
 ## 相关测试
 

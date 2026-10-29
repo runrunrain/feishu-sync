@@ -10,9 +10,9 @@
 
 | Phase | 节点 / 完整切片 / Agent | 依赖 | 输出 | 验收 | 审核 | 状态 |
 |---|---|---|---|---|---|---|
-| A 基线与缺陷修复 | A0 接入/数据证据调查 baize；A1 P0 多词与 raw_search 排序 luban；A2 E0 评测工具与合成 fixture luban | 设计 | investigation.md、p0-report.md、eval-report.md、stage-a-acceptance.md | 64项通过，产品L1合成Q2 Recall 0→1；真实80条缺失不冒充 | Leader | accepted; committing |
-| B 共用检索引擎 | B1 P1 kb/search + Store/API/MCP search 接线 luban；B2 基准与集成 Leader | A 完成后才切换；隔离开发可提前 | engine-report.md；纯函数/索引/cache/service | 算法、hash/围栏、分页基础、三端一致、10/30MB预算、无原生bundle/Node20 | diting full | isolated implementation running |
-| C 完整成品 | C1 P2 七工具 stdio 与文档 luban；C2 P3 内置工具/API luban；C3 P5 网关/管理面 luban；C4 P5 设置UI luoshen | B；C3/C4基于设计冻结API先做隔离开发，最终依赖真实引擎/注册 | 各节点报告与代码 | MCP真实传输、鉴权矩阵、重启/心跳、UI真实交互、两种启动形态 | diting full，合并阶段diff一次 | C3/C4 prep running; C1/C2 pending |
+| A 基线与缺陷修复 | A0 接入/数据证据调查 baize；A1 P0 多词与 raw_search 排序 luban；A2 E0 评测工具与合成 fixture luban | 设计 | investigation.md、p0-report.md、eval-report.md、stage-a-acceptance.md | 64项通过，产品L1合成Q2 Recall 0→1；真实80条缺失不冒充 | Leader | committed 8fba395 |
+| B 共用查询能力 | B1 P1 引擎 luban；B2 E0 lex适配/P2七工具/P3内置接入与集成 Leader | A | engine-report.md、stage-b-evidence.md、stage-b-fixes.md、stage-b-review.md | 157项初验+49项修复相关；10/30MiB预算达标；F1/F2修复终审PASS；真实80条仍缺 | diting full首审+一次终审 | accepted; committing |
+| C 内网共享成品 | C3 P5 网关/管理面 luban；C4 P5 设置UI luoshen（原C1/C2已随B合入） | B；冻结管理API+共用注册 | gateway-report.md、ui-report.md与集成证据 | 65项机制+正式Node20/24网关与管理API链已通过；补10/30MiB容量/真实UI、最终diting | diting full，合并阶段diff一次 | integrated; C3 d6a19feb补bench/恢复；C4 56df927c真实browser |
 | D 交付验证 | D1 全量check/build、客户端/性能抽检、门控判定、文档与成品 Leader/执行者 | C | acceptance-report.md、最终产物、提交记录 | 逐条设计追溯 met/partial/missed；未具备外部设备/人工标注条件如实披露 | 按新增风险决定 | pending |
 
 每阶段验收后更新本文件并提交该阶段全部本任务变更；仅显式列出的文件进入提交。
@@ -46,4 +46,8 @@ A1 在主树限界小改；A2 在独立 worktree（只改脚本/fixtures）。B1
 - 2026-10-29：Leader直接处理：编排、集成、有限修复与阶段提交；业务重实现分派。
 - 2026-10-29：全局luban/luoshen模型gpt-6.1-terra未注册，首派spawn前零效果失败；初期曾临时覆盖为gpt-6.1-sol恢复。主上随后明确要求后续派发用配置默认模型，已立即从主树与全部worktree删除角色覆盖；运行中任务不打断，后续派发/resume均不指定模型/profile。默认不可用时不擅换模型。临时amagi.json仅剩测试超时，不入阶段提交，收尾移除。
 - 2026-10-29：并行提前启动B1隔离开发与C3/C4无真实依赖部分，不提前切换排序器；E0基线先于P1集成。冻结网关最小契约new KbQueryService(root:string)，registerKbTools(server:Server,service,state:{lastServedCurrent?:string}):void；细节以B1产物供C1适配。
-- 2026-10-29：A集成完成，E0的L1现调用产品显式命名入口；64项通过、真实CLI重跑。C1默认派发02090083再次模型未注册，未换模型；Leader将承担暂不可派发的必要集成实现。
+- 2026-10-29：A集成提交8fba395，E0的L1现调用产品显式命名入口；64项通过、真实CLI重跑。C1默认派发02090083再次模型未注册，未换模型；Leader承担P2/P3与E0 lex接线。B合并为共用查询完整阶段（P1/P2/P3），P5为C，避免提交不可构建的跨接口中间态。
+- 2026-10-29：B初验157项，合成10/30MiB预算达标。独立首审F1 Major分页适配断路/F2 Minor含#路径回归；Leader最小修复，49项相关验证通过，终审d0d6eb69 PASS，任务均已accept，真实80条门槛仍缺。
+- 2026-10-29：C正式管理API→子进程→7工具、三端一致、双session notice、轮换/停用、Node20 HTTP bundle真实测试通过。配置保存后refresh的兼容回归已修。C3/C4原始报告仍记录阻塞/mock历史，最新进展需看续接附录。
+- 2026-10-29：主上修复openai-codex新模型目录注册并重启，默认gpt-6.1-terra:xhigh续接已成功：C3 d6a19feb（父96969048），C4 56df927c（父0547ff9f），无模型覆盖。C3写隔离gateway树，C4写隔离UI树，不覆盖Leader主树集成。
+- 2026-10-29：真实browser临时主应用已运行：/tmp/feishu-kb-live.MH6HuA/runtime.json；Node API62492/Vite5173/仅回环gateway62493，临时资料无生产正文；C4独立session验收后保持服务供后续使用，最终由Leader回收。Electron留成品runtime验证，不并发改共享ABI。

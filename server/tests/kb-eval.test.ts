@@ -216,7 +216,7 @@ describe('runner and real CLI', () => {
       expect(() => parseArgs(argv)).toThrow('usage:');
     }
   });
-  it('CLI writes JSON/Markdown; lex-v1 exits nonzero and leaves no fake output', () => {
+  it('CLI writes JSON/Markdown for baselines and the real shared lex-v1 facade', () => {
     const root = temp();
     const script = fileURLToPath(new URL('../scripts/kb-eval.ts', import.meta.url));
     const run = (ranker: string) => spawnSync(process.execPath, ['--import', 'tsx', script, '--synthetic-fixture', '--ranker', ranker, '--out', path.join(root, ranker)], {
@@ -241,9 +241,13 @@ describe('runner and real CLI', () => {
     expect(pinnedReport.comparison.ranker).toBe('l0');
     // Refuse overwriting report evidence.
     expect(run('l0').stderr).toContain('out_not_empty');
-    const failed = run('lex-v1');
-    expect(failed.status).toBe(1); expect(failed.stderr).toContain('ranker_not_ready');
-    expect(fs.existsSync(path.join(root, 'lex-v1'))).toBe(false);
+    const lexical = run('lex-v1');
+    expect(lexical.status).toBe(0); expect(lexical.stderr).toBe('');
+    const lexicalReport = JSON.parse(fs.readFileSync(path.join(root, 'lex-v1/report.json'), 'utf8'));
+    expect(lexicalReport.implementation).toBe('product-KbQueryService/lex-v1');
+    expect(lexicalReport.overall.grepCompleteness).toEqual({ mean: 1, count: 2 });
+    expect(lexicalReport.overall.sectionHitAt5.count).toBeGreaterThan(0);
+    expect(lexicalReport.gateStatus).toBe('not-assessed');
   });
   it('never writes into release, including a new nested output or symlink alias', async () => {
     const { release, queryFile } = fixture();
