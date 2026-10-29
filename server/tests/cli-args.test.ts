@@ -35,8 +35,10 @@ describe('命令词匹配', () => {
     // 30（S13）+4（P0-S8 sync.whiteboard_backfill / P1-S8 kb.publish*）
     // +2（P0-S4 cloud.*）+1（P0-S9 cloud.rename_title）
     // +1（P1-S3 sources.references-rebuild）
-    // +3（P2-S6 cloud.move_to_drive / cloud.move_status / cloud.moves）= 41。
-    expect(OPS_COMMANDS.length).toBe(41);
+    // +2（历史移出记录只读查询）= 40。
+    expect(OPS_COMMANDS.length).toBe(40);
+    expect(findOpsCommand('cloud.move_to_drive')).toBeUndefined();
+    expect(findCommandByWords(['cloud', 'move_to_drive'])).toBeNull();
   });
 
   it('source.* 位置参数：<objToken> 绑定与必填校验', () => {

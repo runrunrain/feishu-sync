@@ -957,69 +957,7 @@ export const OPS_COMMANDS: readonly OpsCommandDef[] = [
       body: { confirm: 'REBUILD' },
     }],
   },
-  // ---- cloud.move_*（P2-S6 登记；设计 §3.4 source.move-to-drive 面，任务书命名）
-  // 三条全部 agentExposed=false（§3.1 仅人工：移出是破坏性结构变更，
-  // Agent 工具面不可见——app_command 列表与执行均不可达）。
-  {
-    name: 'cloud.move_to_drive',
-    summary: '把知识库叶子文档移出到云空间（destructive；确认值必须含 wiki node token；移出后本地文件保留但不再同步）',
-    risk: 'destructive',
-    agentExposed: false,
-    // 表内基线值（CLI --yes 门与 /api/cli/:command 确认门）；服务端要求
-    // 完整值 MOVE_OUT:<nodeToken>（由 documents 行权威派生）——UI 直调
-    // 必须传完整值，CLI 内部转发（actor=cli）由服务端升级基值。confirmPlan
-    // 同源供 app_command 批准流派生（虽然 agentExposed=false 使其不可达，
-    // 表内仍登记权威派生计划，防止后续误开放时绕过 node token 确认）。
-    confirm: { field: 'confirm', value: 'MOVE_OUT' },
-    confirmPlan: {
-      previewSpecs: (args) => [{
-        method: 'POST',
-        path: `/api/sources/${encodeURIComponent(requireString(args, 'objToken'))}/move-to-drive/preview`,
-        body: {
-          ...(str(args.folderToken) !== undefined ? { folderToken: str(args.folderToken) as string } : {}),
-        },
-      }],
-      deriveConfirm: (previewJson) => {
-        const plan = (previewJson ?? {}) as {
-          blockedReason?: unknown;
-          nodeToken?: unknown;
-        };
-        if (plan.blockedReason) {
-          throw new OpsArgumentError(
-            'move_out_blocked',
-            `当前不可移出（${String(plan.blockedReason)}），不会发起云端移出`,
-          );
-        }
-        if (typeof plan.nodeToken !== 'string' || plan.nodeToken === '') {
-          throw new OpsArgumentError('move_out_blocked', '移出计划缺少节点身份，不会发起云端移出');
-        }
-        return `MOVE_OUT:${plan.nodeToken}`;
-      },
-      planKey: (previewJson) => {
-        const plan = (previewJson ?? {}) as { nodeToken?: unknown; target?: { folderToken?: unknown } | null };
-        return `${String(plan.nodeToken ?? '')}|${String(plan.target?.folderToken ?? '')}`;
-      },
-    },
-    params: {
-      type: 'object',
-      properties: {
-        objToken: { type: 'string', description: '文档 objToken（位置参数；须为 watchedRoot 结构树叶子成员）' },
-        folderToken: { type: 'string', description: '目标 Drive 文件夹 token（缺省 = 个人空间根）' },
-      },
-      required: ['objToken'],
-    },
-    request: (args) => [{
-      method: 'POST',
-      path: `/api/sources/${encodeURIComponent(requireString(args, 'objToken'))}/move-to-drive`,
-      body: {
-        // CLI 通道基值：服务端按 documents 行权威 nodeToken 校验/升级
-        //（actor=cli 时接受基值，见 CloudMoveService.moveToDrive）。
-        confirm: 'MOVE_OUT',
-        ...(str(args.folderToken) !== undefined ? { folderToken: str(args.folderToken) as string } : {}),
-        actor: 'cli',
-      },
-    }],
-  },
+  // 历史移出记录只读查询。
   {
     name: 'cloud.move_status',
     summary: '查询单次移出记录状态（不触发远端调用；轮询由 server 负责）',
