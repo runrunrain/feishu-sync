@@ -7,14 +7,14 @@
  *    按源查、meta 区分「没有评论」与「从未采集」、生命周期级联；
  *  - SyncEngine：docx 同步事务内采集入库（与引用边同事务）、重同步替换、
  *    TestHooks failAfterMarkDocumentSynced → 评论随基线回滚、无
- *    reference_map 键（非 docx / RP-3）→ 不写 meta；
+ *    非 docx 不写 meta；docx 响应省略 reference_map 时记录零评论；
  *  - rebuild（reference-rebuild.ts）不重建评论（纯本地无 refmap，评论只在
  *    同步时采集）；
  *  - raw_comments 工具：登记进 Discuss/Work、构建工具集排除断言、输出
  *    <untrusted_comments> 包裹与转义、404、从未采集说明；
  *  - GET /api/mapping/comments/:objToken：collected true/false 两形态。
  */
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -115,6 +115,11 @@ describe('解析器 extractRefmapComments（fixture 驱动，设计 §5.1 / MD-3
     });
   });
 
+  it('非法 Unicode 数字实体保留原文，不中断评论解析', () => {
+    const result = extractRefmapComments({ comments: { c1: { data: '<comment><msg>异常 &#1114112; &#x110000; 正文</msg></comment>' } } });
+    expect(result.comments[0].text).toBe('异常 &#1114112; &#x110000; 正文');
+  });
+
   it('容错双读：quote/solved/created 属性与 quote 子元素；未提供为 null', () => {
     const attr = extractRefmapComments({
       comments: {
@@ -197,7 +202,7 @@ function makeEngine(harness: Harness, client: unknown, testHooks?: Record<string
 class DocxCommentMockClient {
   constructor(
     private readonly content: string,
-    /** undefined = 响应整体没有 reference_map 键（RP-3 / 非 docx）。 */
+    /** undefined = docx 响应整体没有 reference_map 键（RP-3）。 */
     private readonly referenceMap?: unknown,
   ) {}
 
@@ -357,6 +362,34 @@ describe('LocalMapStore source_comments / source_comment_meta（两张表 + 生�
 });
 
 describe('SyncEngine 同步事务内采集（P2-S4，设计 §5.1）', () => {
+  it('未知云端回滚阻断同步，不读取云端或推进本地基线', async () => {
+    const harness = makeHarness();
+    const id = harness.store.insertSourcePushLog({ objToken: SRC, localRelPath: '文档甲.md', mode: 'revert', actor: 'ui' });
+    harness.store.updateSourcePushLogRevert(id, { revertState: 'unknown' });
+    const client = new DocxCommentMockClient('# 正文\n');
+    const fetch = vi.spyOn(client, 'fetchDocumentMarkdown');
+    const result = await makeEngine(harness, client).syncDocuments([makeChangedDoc(harness.kbRoot)], SYNC_OPTIONS);
+    expect(result.success).toBe(false);
+    expect(result.failedDocuments[0].reasonCode).toBe('cloud_operation_pending');
+    expect(fetch).not.toHaveBeenCalled();
+    expect(harness.store.getDocumentByObjToken(SRC)?.syncedObjEditTime ?? null).toBeNull();
+    harness.store.close();
+  });
+
+  it.each(['unknown', 'moved'] as const)('移出状态 %s 在预览与执行时均阻断同步', async (state) => {
+    const harness = makeHarness();
+    const id = harness.store.insertCloudMove({ objToken: SRC, wikiNodeToken: WIKI, actor: 'ui' });
+    harness.store.updateCloudMove(id, { state });
+    const client = new DocxCommentMockClient('# 正文\n');
+    const fetch = vi.spyOn(client, 'fetchDocumentMarkdown');
+    const expected = state === 'moved' ? 'source_moved_out' : 'cloud_operation_pending';
+    const dryRun = await makeEngine(harness, client).syncDocuments([makeChangedDoc(harness.kbRoot)], { enableLLM: false, fullSync: false });
+    expect(dryRun.failedDocuments[0].reasonCode).toBe(expected);
+    const applied = await makeEngine(harness, client).syncDocuments([makeChangedDoc(harness.kbRoot)], SYNC_OPTIONS);
+    expect(applied.failedDocuments[0].reasonCode).toBe(expected);
+    expect(fetch).not.toHaveBeenCalled();
+    harness.store.close();
+  });
   it('docx 同步成功：评论与引用边同事务入库；meta 如实标注', async () => {
     const harness = makeHarness();
     const result = await makeEngine(harness, new DocxCommentMockClient('# 正文\n', REFMAP_WITH_COMMENTS))
@@ -436,13 +469,16 @@ describe('SyncEngine 同步事务内采集（P2-S4，设计 §5.1）', () => {
     harness.store.close();
   });
 
-  it('fetch 响应无 reference_map 键（RP-3 / 非 docx）：不写任何评论与 meta（从未采集）', async () => {
+  it('docx 响应无 reference_map 键：清除旧评论并记录已采集的零评论', async () => {
     const harness = makeHarness();
-    const result = await makeEngine(harness, new DocxCommentMockClient('# 正文\n'))
+    await makeEngine(harness, new DocxCommentMockClient('# 正文\n', REFMAP_WITH_COMMENTS))
       .syncDocuments([makeChangedDoc(harness.kbRoot)], SYNC_OPTIONS);
+    expect(harness.store.listSourceCommentsBySrc(SRC)).toHaveLength(2);
+    const result = await makeEngine(harness, new DocxCommentMockClient('# 正文\n'))
+      .syncDocuments([makeChangedDoc(harness.kbRoot, { changeType: 'modified' })], SYNC_OPTIONS);
     expect(result.success).toBe(true);
     expect(harness.store.listSourceCommentsBySrc(SRC)).toEqual([]);
-    expect(harness.store.getSourceCommentMeta(SRC)).toBeNull();
+    expect(harness.store.getSourceCommentMeta(SRC)).toMatchObject({ total: 0, truncated: false });
     harness.store.close();
   });
 
@@ -456,11 +492,11 @@ describe('SyncEngine 同步事务内采集（P2-S4，设计 §5.1）', () => {
     harness.store.close();
   });
 
-  it('rebuild（references-rebuild）不重建评论：行原样保留，也不为无评论文档造 meta', async () => {
+  it('rebuild（references-rebuild）不重建评论：行与采集状态原样保留', async () => {
     const harness = makeHarness();
     await makeEngine(harness, new DocxCommentMockClient('# 正文\n', REFMAP_WITH_COMMENTS))
       .syncDocuments([makeChangedDoc(harness.kbRoot)], SYNC_OPTIONS);
-    // 另一篇已同步文档从未采集评论（无 reference_map 键）。
+    // 另一篇已同步文档没有评论。
     const OTHER = 'srcDocxComment000002';
     await makeEngine(harness, new DocxCommentMockClient('# 其他\n'))
       .syncDocuments([makeChangedDoc(harness.kbRoot, {
@@ -469,7 +505,8 @@ describe('SyncEngine 同步事务内采集（P2-S4，设计 §5.1）', () => {
         title: '无评论文档',
         localMdPath: path.join(harness.kbRoot, '无评论文档.md'),
       })], SYNC_OPTIONS);
-    expect(harness.store.getSourceCommentMeta(OTHER)).toBeNull();
+    const otherMeta = harness.store.getSourceCommentMeta(OTHER);
+    expect(otherMeta).toMatchObject({ total: 0 });
 
     const before = harness.store.listSourceCommentsBySrc(SRC);
     const metaBefore = harness.store.getSourceCommentMeta(SRC);
@@ -477,10 +514,10 @@ describe('SyncEngine 同步事务内采集（P2-S4，设计 §5.1）', () => {
     expect(rebuild.rebuilt).toBeGreaterThanOrEqual(1);
 
     // 评论只在同步时采集：rebuild 纯本地无 refmap → 行与 meta 逐字不变，
-    // 也不为 OTHER 造出 meta 行。
+    // 也不改变 OTHER 的采集状态。
     expect(harness.store.listSourceCommentsBySrc(SRC)).toEqual(before);
     expect(harness.store.getSourceCommentMeta(SRC)).toEqual(metaBefore);
-    expect(harness.store.getSourceCommentMeta(OTHER)).toBeNull();
+    expect(harness.store.getSourceCommentMeta(OTHER)).toEqual(otherMeta);
     harness.store.close();
   });
 });

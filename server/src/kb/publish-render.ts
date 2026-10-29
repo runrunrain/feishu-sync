@@ -70,7 +70,7 @@ export interface RenderForPublishResult {
 const STD_HEADER_RE = /^<!--\s*\nfeishu_sync_kb:\n([\s\S]*?)\n-->\s*\n?/;
 const HEADER_TITLE_RE = /^ {2}title:\s*(.+?)\s*$/m;
 /** 首个 H1（与 kb-build-service 的 title 提取同口径）。 */
-const H1_RE = /^#\s+(.+?)\s*$/m;
+const H1_RE = /^#\s+(.+?)\s*$/;
 const FENCE_OPEN_RE = /^ {0,3}(`{3,}|~{3,})/;
 const FENCE_CLOSE_RE = /^ {0,3}(`{3,}|~{3,}) *$/;
 const SCHEME_RE = /^[a-zA-Z][a-zA-Z0-9+.-]*:/;
@@ -86,6 +86,27 @@ function sha256Hex(text: string): string {
 function fallbackTitle(kbPath: string): string {
   const base = kbPath.split('/').pop() ?? kbPath;
   return base.replace(/\.md$/i, '');
+}
+
+/** Find a heading outside fenced code so code examples are never used as titles. */
+function findHeading(body: string): { index: number; text: string } | null {
+  let offset = 0;
+  let fence: { char: string; len: number } | null = null;
+  for (const line of body.split('\n')) {
+    if (fence) {
+      const close = FENCE_CLOSE_RE.exec(line);
+      if (close && close[1][0] === fence.char && close[1].length >= fence.len) fence = null;
+    } else {
+      const open = FENCE_OPEN_RE.exec(line);
+      if (open) fence = { char: open[1][0], len: open[1].length };
+      else {
+        const match = H1_RE.exec(line);
+        if (match) return { index: offset, text: match[1].trim() };
+      }
+    }
+    offset += line.length + 1;
+  }
+  return null;
 }
 
 /**
@@ -185,8 +206,8 @@ export function renderForPublish(input: RenderForPublishInput): RenderForPublish
   let body = headerMatch ? markdown.slice(headerMatch[0].length) : markdown;
   const headerTitle = headerMatch ? HEADER_TITLE_RE.exec(headerMatch[1])?.[1].trim() : undefined;
 
-  const h1Match = H1_RE.exec(body);
-  const h1Text = h1Match?.[1].trim();
+  const h1Match = findHeading(body);
+  const h1Text = h1Match?.text;
   const title = headerTitle || h1Text || fallbackTitle(kbPath);
 
   // 2) 与标题相同的首个 H1 从正文移除

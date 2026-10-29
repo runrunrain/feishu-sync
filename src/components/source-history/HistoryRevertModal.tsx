@@ -71,10 +71,15 @@ export function HistoryRevertModal({ open, onClose, objToken, target, onReverted
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pollTriesRef = useRef(0);
   const mountedRef = useRef(true);
+  const generationRef = useRef(0);
 
-  useEffect(() => () => {
-    mountedRef.current = false;
-    if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      generationRef.current += 1;
+      if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
+    };
   }, []);
 
   const stopPolling = useCallback(() => {
@@ -86,6 +91,8 @@ export function HistoryRevertModal({ open, onClose, objToken, target, onReverted
 
   const loadPlan = useCallback(() => {
     if (!target) return;
+    const generation = ++generationRef.current;
+    stopPolling();
     setPhase('preview');
     setPlanLoading(true);
     setPlan(null);
@@ -93,12 +100,13 @@ export function HistoryRevertModal({ open, onClose, objToken, target, onReverted
     setExecError(null);
     setResult(null);
     setConfirmText('');
+    setExecuting(false);
     previewHistoryRevert(objToken, {
       ...(target.pushLogId ? { pushLogId: target.pushLogId } : {}),
       ...(target.historyVersionId ? { historyVersionId: target.historyVersionId } : {}),
     })
       .then((next) => {
-        if (!mountedRef.current) return;
+        if (!mountedRef.current || generation !== generationRef.current) return;
         setPlan(next);
         // 预填确认值（任务书：预填 REVERT_CLOUD:<id> 待确认；按钮以精确匹配门控）。
         if (next.blockedReason == null && next.target.historyVersionId) {
@@ -106,28 +114,30 @@ export function HistoryRevertModal({ open, onClose, objToken, target, onReverted
         }
       })
       .catch((error) => {
-        if (!mountedRef.current) return;
+        if (!mountedRef.current || generation !== generationRef.current) return;
         const face = errorFace(error);
         setPlanError({ code: face.code, message: face.message });
       })
       .finally(() => {
-        if (mountedRef.current) setPlanLoading(false);
+        if (mountedRef.current && generation === generationRef.current) setPlanLoading(false);
       });
-  }, [objToken, target]);
+  }, [objToken, target, stopPolling]);
 
   useEffect(() => {
     if (open && target) loadPlan();
     if (!open) stopPolling();
+    return () => { generationRef.current += 1; stopPolling(); };
   }, [open, target, loadPlan, stopPolling]);
 
   /** 202 running → 轮询 push-log 行 revertState 至终态（与 server 轮询器落库节奏同拍）。 */
   const pollRevertState = useCallback((pushLogId: string) => {
+    const generation = generationRef.current;
     pollTriesRef.current = 0;
     const tick = () => {
       pollTriesRef.current += 1;
       getSourcePushLog(objToken)
         .then(({ logs }) => {
-          if (!mountedRef.current) return;
+          if (!mountedRef.current || generation !== generationRef.current) return;
           const row: SourcePushLogRecord | undefined = logs.find((log) => log.id === pushLogId);
           if (row && row.revertState !== 'running' && row.revertState != null) {
             setPollCount(pollTriesRef.current);
@@ -138,6 +148,7 @@ export function HistoryRevertModal({ open, onClose, objToken, target, onReverted
               onReverted();
             } else if (row.revertState === 'failed') {
               setResult({ kind: 'failed', taskId: row.revertTaskId, message: row.revertError ?? '云端返回回滚失败', pull: null });
+              if (row.revertError?.startsWith('partial_blocks_failed:')) onReverted();
             } else {
               setResult({ kind: 'unknown', taskId: row.revertTaskId, message: row.revertError ?? '回滚状态未知，请到飞书文档历史核对实际结果', pull: null });
               onReverted();
@@ -153,7 +164,7 @@ export function HistoryRevertModal({ open, onClose, objToken, target, onReverted
           pollTimerRef.current = setTimeout(tick, POLL_INTERVAL_MS);
         })
         .catch((error) => {
-          if (!mountedRef.current) return;
+          if (!mountedRef.current || generation !== generationRef.current) return;
           appLogger.warn('history-revert', 'poll push-log failed', error);
           if (pollTriesRef.current >= POLL_MAX_TRIES) {
             setResult({ kind: 'unknown', taskId: null, message: '轮询请求连续失败：回滚状态未知，请到飞书核对', pull: null });
@@ -169,6 +180,7 @@ export function HistoryRevertModal({ open, onClose, objToken, target, onReverted
     if (!plan || !target || plan.blockedReason != null) return;
     const required = deriveRevertConfirmValue(plan.target.historyVersionId);
     if (confirmText.trim() !== required) return;
+    const generation = generationRef.current;
     setExecuting(true);
     setExecError(null);
     executeHistoryRevert(
@@ -180,25 +192,32 @@ export function HistoryRevertModal({ open, onClose, objToken, target, onReverted
       confirmText.trim(),
     )
       .then((result) => {
-        if (!mountedRef.current) return;
+        if (!mountedRef.current || generation !== generationRef.current) { onReverted(); return; }
         setPhase('result');
         if (result.state === 'running') {
           setResult({ kind: 'running', taskId: result.taskId, message: null, pull: null });
           toast.push({ type: 'info', message: '回滚请求已提交云端（异步执行），正在跟踪收敛…' });
           pollRevertState(result.pushLogId);
+        } else if (result.state === 'failed') {
+          const count = result.failedBlockTokens?.length ?? 0;
+          const detail = result.partialFailure ? `部分块回滚失败${count ? `（${count} 个）` : ''}，请核对云端内容` : '云端回滚失败，请核对云端内容';
+          setResult({ kind: 'failed', taskId: result.taskId, message: detail, pull: result.pull });
+          toast.push({ type: 'warning', message: detail });
+          onReverted();
         } else {
-          setResult({ kind: 'done', taskId: result.taskId, message: '云端已回滚到目标版本', pull: result.pull });
-          toast.push({ type: 'success', message: '云端回滚完成' });
+          const partial = result.failedBlockTokens?.length ? `（${result.failedBlockTokens.length} 个块回滚失败，请核对云端内容）` : '';
+          setResult({ kind: 'done', taskId: result.taskId, message: `云端已回滚到目标版本${partial}`, pull: result.pull });
+          toast.push({ type: partial ? 'warning' : 'success', message: `云端回滚完成${partial}` });
           onReverted();
         }
       })
       .catch((error) => {
-        if (!mountedRef.current) return;
+        if (!mountedRef.current || generation !== generationRef.current) { onReverted(); return; }
         const face = errorFace(error);
         setExecError({ code: face.code, message: face.message });
       })
       .finally(() => {
-        if (mountedRef.current) setExecuting(false);
+        if (mountedRef.current && generation === generationRef.current) setExecuting(false);
       });
   };
 

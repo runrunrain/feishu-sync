@@ -19,6 +19,7 @@
 
 import path from 'node:path';
 import fs from 'node:fs';
+import { resolveInside } from '../agent/path-guard.js';
 import { resolveDataRoot } from './data-root.js';
 import type {
   ChangedDocument,
@@ -343,6 +344,15 @@ function localEditPendingFailure(doc: {
   };
 }
 
+function cloudOperationFailure(doc: { objToken: string; title: string; watchedRootId?: string | null }, reason: 'cloud_operation_pending' | 'source_moved_out'): FailedDocument {
+  return {
+    objToken: doc.objToken, title: doc.title, retryable: false, reasonCode: reason,
+    error: reason === 'source_moved_out' ? '文档已移出知识库，不能继续同步' : '云端回滚或移出进行中或结果未知，暂不能同步',
+    suggestedResolution: '请在写回记录或移出记录中核对云端任务状态，再决定后续操作。',
+    repairAction: 'manual_review', watchedRootId: doc.watchedRootId ?? null,
+  };
+}
+
 /** Convert a planning guard into the same actionable result contract as a runtime failure. */
 function plannedFailure(planned: PlannedSyncDocument): FailedDocument {
   const reasonCode = planned.reasonCode ?? 'unknown';
@@ -487,6 +497,9 @@ export class SyncEngine {
             title: planned.title,
             watchedRootId: planned.watchedRootId ?? null,
           }));
+        } else {
+          const reason = this.getCloudOperationBlock(planned.objToken);
+          if (reason) failedDocuments.push(cloudOperationFailure(planned, reason));
         }
       }
 
@@ -533,6 +546,8 @@ export class SyncEngine {
             if (this.getPendingLocalEditState(doc.objToken)) {
               return { kind: 'blocked', failure: localEditPendingFailure(doc) };
             }
+            const cloudBlock = this.getCloudOperationBlock(doc.objToken);
+            if (cloudBlock) return { kind: 'blocked', failure: cloudOperationFailure(doc, cloudBlock) };
             // Apply uses exactly the target that was independently reviewed in
             // the manifest; it must not recompute a potentially different path.
             const synced = await this.syncSingleDocument(
@@ -950,9 +965,8 @@ export class SyncEngine {
     // 的 applyDbWrites 事务内与正文基线同生共死。legacy 写入路径
     // （FEISHU_SYNC_LEGACY_WRITE）不写边，保持零边缺省。
     let referenceExtraction: ExtractDocumentReferencesResult = { edges: [], truncated: false };
-    // P2-S4（设计 §5.1）：评论采集——仅当本次 fetch 响应携带 reference_map
-    // （docx 走 docs+fetch；sheet/bitable/slides 无 refmap，从未采集）才解析
-    // 与入库；referenceMap 键整体缺失（RP-3，无评论）也写 meta（total=0），
+    // P2-S4（设计 §5.1）：评论采集——仅 docs+fetch 成功时解析与入库；
+    // sheet/bitable/slides 未采集，reference_map 缺失表示零评论（RP-3），
     // 与「从未采集」（无 meta 行）区分。解析纯函数、零 IO，事务外计算
     // （与引用边同款，避免拉长 SQLite 事务）。
     let commentExtraction: RefmapCommentsExtraction | null = null;
@@ -1218,12 +1232,14 @@ export class SyncEngine {
    */
   private getPendingLocalEditState(objToken: string): { state: string } | null {
     if (typeof this.localMapStore?.getSourceEdit !== 'function') return null;
-    try {
-      const row = this.localMapStore.getSourceEdit(objToken);
-      return row && row.state !== 'pushed' ? row : null;
-    } catch {
-      return null;
-    }
+    // 状态读取失败时无法证明本地文件安全，必须阻断同步及补齐。
+    const row = this.localMapStore.getSourceEdit(objToken);
+    return row && row.state !== 'pushed' ? row : null;
+  }
+
+  private getCloudOperationBlock(objToken: string): 'cloud_operation_pending' | 'source_moved_out' | null {
+    if (this.localMapStore?.getRunningRevertPushLog?.(objToken) != null || this.localMapStore?.getActiveCloudMove?.(objToken) != null) return 'cloud_operation_pending';
+    return this.localMapStore?.getLatestCloudMove?.(objToken)?.state === 'moved' ? 'source_moved_out' : null;
   }
 
   /** S11：pushed 行在回拉同步成功后清除，同时清理编辑备份目录。 */
@@ -1282,8 +1298,9 @@ export class SyncEngine {
       url: typeof document.url === 'string' ? document.url : '',
       obj_token: objToken,
       // P1-S3（设计 §2.2/U32）：reference_map 与正文同响应返回，零成本携带；
-      // 键整体缺失（RP-3）时为 undefined，抽取层容错零 refmap 边。
-      referenceMap: document.reference_map,
+      // 键整体缺失（RP-3）时用空对象，标记本次成功采集了零评论。
+      // docs +fetch 省略该字段表示本次无评论；与未调用 fetch 的其他类型区分。
+      referenceMap: document.reference_map ?? {},
     };
   }
 
@@ -1561,6 +1578,8 @@ export class SyncEngine {
     // 同一相对路径只入 plan 一次：共享 images 目录（mirror-leaf 布局）下
     // 不同文档引用同一白板时不重复导出/重复计数。
     const stagedRels = new Set<string>();
+    const checkedDocs: Array<{ objToken: string; mdPath: string; body: Buffer }> = [];
+    const checkedTargets: Array<{ svg: string; raw: string; pngRel: string }> = [];
 
     let scanned = 0;
     for (const row of rows) {
@@ -1575,8 +1594,15 @@ export class SyncEngine {
         this.pushBackfillSkip(skipped, row.objToken, 'local_edit_pending');
         continue;
       }
+      const cloudBlock = this.getCloudOperationBlock(row.objToken);
+      if (cloudBlock) {
+        this.pushBackfillSkip(skipped, row.objToken, cloudBlock);
+        continue;
+      }
 
-      const mdPath = this.resolveBackfillMdPath(row, root);
+      let mdPath = this.resolveBackfillMdPath(row, root);
+      const mdRel = mdPath ? toPortableRelative(root, mdPath) : null;
+      try { if (mdRel) resolveInside(root, mdRel, 'read'); else mdPath = null; } catch { mdPath = null; }
       if (
         !mdPath
         || !fs.existsSync(mdPath)
@@ -1585,10 +1611,10 @@ export class SyncEngine {
         this.pushBackfillSkip(skipped, row.objToken, 'local_md_missing');
         continue;
       }
-      const refs = extractLocalWhiteboardRefs(
-        fs.readFileSync(mdPath, 'utf-8'),
-      );
+      const body = fs.readFileSync(mdPath);
+      const refs = extractLocalWhiteboardRefs(body.toString('utf-8'));
       if (refs.length === 0) continue;
+      checkedDocs.push({ objToken: row.objToken, mdPath, body });
 
       const docDir = path.dirname(mdPath);
       for (const ref of refs) {
@@ -1619,6 +1645,15 @@ export class SyncEngine {
           this.pushBackfillSkip(skipped, row.objToken, `png_missing:${stem}`);
           continue;
         }
+        try {
+          // realpath 校验图片及其父目录，防符号链接把旁路写入根目录外。
+          resolveInside(root, relToRoot.split(path.sep).join('/'), 'read');
+          const parentRel = toPortableRelative(root, path.dirname(pngAbs));
+          resolveInside(root, parentRel || '.', 'read');
+        } catch {
+          this.pushBackfillSkip(skipped, row.objToken, `ref_outside_root:${ref}`);
+          continue;
+        }
 
         // 镜像路径 = stagingRoot + 文档内相对布局；只用于命名派生与
         // lark-cli 子进程 cwd，PNG 本体从不被复制或读取。
@@ -1639,16 +1674,38 @@ export class SyncEngine {
           this.pushBackfillSkip(skipped, row.objToken, `export_failed:${stem}`);
           continue;
         }
+        if (fs.existsSync(svgExisting) || fs.existsSync(rawExisting)) {
+          this.pushBackfillSkip(skipped, row.objToken, `already_present:${stem}`);
+          continue;
+        }
         const relDir = toPortableRelative(root, path.dirname(pngAbs)) ?? '';
         const relBypass = relDir
           ? `${relDir}/${path.basename(bypass.path)}`
           : path.basename(bypass.path);
         if (stagedRels.has(relBypass)) continue;
         stagedRels.add(relBypass);
+        checkedTargets.push({ svg: svgExisting, raw: rawExisting, pngRel: relToRoot.split(path.sep).join('/') });
         stageFileContent(plan, relBypass, fs.readFileSync(bypass.path));
       }
     }
 
+    // 以上导出会等待云端；提交前重新检查源文件和所有目标，且检查到
+    // 原子提交之间不再 await，防止本进程其他任务在窗口内修改这些状态。
+    for (const doc of checkedDocs) {
+      const rel = toPortableRelative(root, doc.mdPath);
+      if (!rel) throw new Error(`白板补齐期间源路径无效：${doc.objToken}`);
+      resolveInside(root, rel, 'read');
+      if (this.getPendingLocalEditState(doc.objToken) || this.getCloudOperationBlock(doc.objToken)
+        || !fs.existsSync(doc.mdPath) || !fs.readFileSync(doc.mdPath).equals(doc.body)) {
+        throw new Error(`白板补齐期间源文档或云端操作状态发生变化：${doc.objToken}，未提交任何文件`);
+      }
+    }
+    for (const { svg, raw, pngRel } of checkedTargets) {
+      if (fs.existsSync(svg) || fs.existsSync(raw)) throw new Error('白板补齐期间目标文件已出现，未提交任何文件');
+      resolveInside(root, pngRel, 'read');
+      const parentRel = toPortableRelative(root, path.dirname(svg));
+      resolveInside(root, parentRel || '.', 'read');
+    }
     const commit = commitAtomicPlan(plan);
     if (!commit.ok) {
       throw new Error(commit.error || '白板旁路补齐原子提交失败（已整体回滚，无残留入库）');

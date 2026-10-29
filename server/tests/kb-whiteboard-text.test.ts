@@ -178,6 +178,10 @@ describe('extractWhiteboardRawText', () => {
 // ---------------------------------------------------------------------------
 
 describe('resolveWhiteboardBypassRefs / extractWhiteboardBypassTexts', () => {
+  it('缺失旁路文件时不误读重复源目录下的同名文件', () => {
+    write('nested/nested/images/missing.wb.svg', '<svg><text>无关文档</text></svg>');
+    expect(resolveWhiteboardBypassRefs(kbRoot, 'nested/doc.md', '![白板](images/missing.png)')).toEqual([]);
+  });
   it('svg 优先、raw 降级、无旁路无条目、越界引用跳过', () => {
     write('wb/文档.md', [
       '![飞书白板](images/01-t.png)',

@@ -10,7 +10,7 @@
  * - 导出链与 S6 完全同一函数（whiteboard-bypass.ts 共享）；
  * - 命令 sync.whiteboard_backfill（mutate + BACKFILL，CLI+app_command 双通道）。
  */
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -165,6 +165,54 @@ describe('extractLocalWhiteboardRefs（本地 md 白板引用解析）', () => {
 });
 
 describe('SyncEngine.backfillWhiteboardBypass（P0-S8 硬验收）', () => {
+  it('导出期间出现旁路文件时保留已有文件，不覆盖', async () => {
+    const { kbRoot, opDir } = makeDirs();
+    const client = new ExportMockClient();
+    const store = new BackfillStore();
+    seedSyncedDoc(store, kbRoot);
+    const target = path.join(kbRoot, '架构图', 'images', `01-${WB_TOKEN}.wb.svg`);
+    const original = client.exportWhiteboard.bind(client);
+    vi.spyOn(client, 'exportWhiteboard').mockImplementation(async (token, opts) => {
+      const result = await original(token, opts);
+      fs.writeFileSync(target, '另一个操作写入的内容');
+      return result;
+    });
+    const result = await makeEngine(kbRoot, opDir, client, store).backfillWhiteboardBypass();
+    expect(result.exported).toBe(0);
+    expect(fs.readFileSync(target, 'utf8')).toBe('另一个操作写入的内容');
+  });
+
+  it('导出期间文档变脏时不提交旁路', async () => {
+    const { kbRoot, opDir } = makeDirs();
+    const client = new ExportMockClient();
+    const store = new BackfillStore();
+    const { objToken } = seedSyncedDoc(store, kbRoot);
+    const original = client.exportWhiteboard.bind(client);
+    vi.spyOn(client, 'exportWhiteboard').mockImplementation(async (token, opts) => {
+      const result = await original(token, opts);
+      store.sourceEdits.set(objToken, { state: 'dirty' });
+      return result;
+    });
+    await expect(makeEngine(kbRoot, opDir, client, store).backfillWhiteboardBypass()).rejects.toThrow('状态发生变化');
+    expect(fs.existsSync(path.join(kbRoot, '架构图', 'images', `01-${WB_TOKEN}.wb.svg`))).toBe(false);
+  });
+
+  it('拒绝指向根目录外的图片目录符号链接', async () => {
+    const { kbRoot, opDir } = makeDirs();
+    const client = new ExportMockClient();
+    const store = new BackfillStore();
+    const { mdPath } = seedSyncedDoc(store, kbRoot);
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-outside-'));
+    try {
+      fs.rmSync(path.join(path.dirname(mdPath), 'images'), { recursive: true });
+      fs.writeFileSync(path.join(outside, `01-${WB_TOKEN}.png`), 'preview');
+      fs.symlinkSync(outside, path.join(path.dirname(mdPath), 'images'), 'dir');
+      const result = await makeEngine(kbRoot, opDir, client, store).backfillWhiteboardBypass();
+      expect(result.exported).toBe(0);
+      expect(client.exportWhiteboardCalls).toEqual([]);
+      expect(fs.existsSync(path.join(outside, `01-${WB_TOKEN}.wb.svg`))).toBe(false);
+    } finally { fs.rmSync(outside, { recursive: true, force: true }); }
+  });
   it('补齐 .wb.svg：md 字节与 DB 基线字段前后逐字段一致，只新增旁路文件', async () => {
     const { kbRoot, opDir } = makeDirs();
     const client = new ExportMockClient();
@@ -224,6 +272,19 @@ describe('SyncEngine.backfillWhiteboardBypass（P0-S8 硬验收）', () => {
 
     expect(result).toMatchObject({ scanned: 1, exported: 0 });
     expect(result.skipped).toEqual([{ objToken, reason: 'local_edit_pending' }]);
+    expect(client.exportWhiteboardCalls).toEqual([]);
+    expect(fs.existsSync(path.join(kbRoot, '架构图', 'images', `01-${WB_TOKEN}.wb.svg`))).toBe(false);
+  });
+
+  it('编辑状态读取失败时阻断补齐，不导出或写入旁路文件', async () => {
+    const { kbRoot, opDir } = makeDirs();
+    const client = new ExportMockClient();
+    const store = new BackfillStore();
+    seedSyncedDoc(store, kbRoot);
+    vi.spyOn(store, 'getSourceEdit').mockImplementation(() => { throw new Error('database unavailable'); });
+
+    await expect(makeEngine(kbRoot, opDir, client, store).backfillWhiteboardBypass())
+      .rejects.toThrow('database unavailable');
     expect(client.exportWhiteboardCalls).toEqual([]);
     expect(fs.existsSync(path.join(kbRoot, '架构图', 'images', `01-${WB_TOKEN}.wb.svg`))).toBe(false);
   });

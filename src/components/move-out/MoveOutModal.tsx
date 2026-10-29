@@ -74,6 +74,7 @@ export function MoveOutModal({ open, onClose, objToken, target, onMoved }: MoveO
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pollTriesRef = useRef(0);
   const mountedRef = useRef(true);
+  const generationRef = useRef(0);
 
   useEffect(() => {
     // StrictMode 双挂载（dev）：effect 重跑时恢复 mounted 标记，否则首次
@@ -81,6 +82,7 @@ export function MoveOutModal({ open, onClose, objToken, target, onMoved }: MoveO
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      generationRef.current += 1;
       if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
     };
   }, []);
@@ -94,6 +96,8 @@ export function MoveOutModal({ open, onClose, objToken, target, onMoved }: MoveO
 
   const loadPlan = useCallback(() => {
     if (!objToken) return;
+    const generation = ++generationRef.current;
+    stopPolling();
     setPhase('preview');
     setPlanLoading(true);
     setPlan(null);
@@ -101,9 +105,10 @@ export function MoveOutModal({ open, onClose, objToken, target, onMoved }: MoveO
     setExecError(null);
     setResult(null);
     setConfirmText('');
+    setExecuting(false);
     previewMoveToDrive(objToken)
       .then((next) => {
-        if (!mountedRef.current) return;
+        if (!mountedRef.current || generation !== generationRef.current) return;
         setPlan(next);
         // 预填确认值（任务书：预填 MOVE_OUT:<wikiNodeToken> 待确认；
         // 按钮以精确匹配门控——改一字即不可执行）。
@@ -112,28 +117,30 @@ export function MoveOutModal({ open, onClose, objToken, target, onMoved }: MoveO
         }
       })
       .catch((error) => {
-        if (!mountedRef.current) return;
+        if (!mountedRef.current || generation !== generationRef.current) return;
         const face = errorFace(error);
         setPlanError(face);
       })
       .finally(() => {
-        if (mountedRef.current) setPlanLoading(false);
+        if (mountedRef.current && generation === generationRef.current) setPlanLoading(false);
       });
-  }, [objToken]);
+  }, [objToken, stopPolling]);
 
   useEffect(() => {
     if (open && objToken) loadPlan();
     if (!open) stopPolling();
+    return () => { generationRef.current += 1; stopPolling(); };
   }, [open, objToken, loadPlan, stopPolling]);
 
   /** 202 moving → 轮询 moves/:moveId 至终态（server 轮询器落库节奏同拍）。 */
   const pollMoveState = useCallback((moveId: string) => {
+    const generation = generationRef.current;
     pollTriesRef.current = 0;
     const finish = (face: MoveOutResultFace, notify?: 'moved') => {
       setResult(face);
+      onMoved();
       if (notify === 'moved') {
         toast.push({ type: 'success', message: '文档已移出到云空间' });
-        onMoved();
       }
     };
     const tick = () => {
@@ -141,7 +148,7 @@ export function MoveOutModal({ open, onClose, objToken, target, onMoved }: MoveO
       setPollCount(pollTriesRef.current);
       getCloudMove(moveId)
         .then((row: CloudMoveRecord) => {
-          if (!mountedRef.current) return;
+          if (!mountedRef.current || generation !== generationRef.current) return;
           if (row.state === 'moving' || row.state === 'pending') {
             if (pollTriesRef.current >= POLL_MAX_TRIES) {
               finish({
@@ -164,11 +171,10 @@ export function MoveOutModal({ open, onClose, objToken, target, onMoved }: MoveO
             finish({ kind: 'failed', moveId, taskId: row.taskId ?? null, message: row.error ?? '云端返回移出失败' });
           } else {
             finish({ kind: 'unknown', moveId, taskId: row.taskId ?? null, message: MOVE_OUT_UNKNOWN_GUIDE });
-            onMoved();
           }
         })
         .catch((error) => {
-          if (!mountedRef.current) return;
+          if (!mountedRef.current || generation !== generationRef.current) return;
           appLogger.warn('move-out', 'poll cloud move failed', error);
           if (pollTriesRef.current >= POLL_MAX_TRIES) {
             finish({ kind: 'unknown', moveId, taskId: null, message: '轮询请求连续失败：移出状态未知，请到飞书核对' });
@@ -184,14 +190,16 @@ export function MoveOutModal({ open, onClose, objToken, target, onMoved }: MoveO
     if (!plan || !objToken || plan.blockedReason != null) return;
     const required = deriveMoveOutConfirmValue(plan.nodeToken);
     if (confirmText.trim() !== required) return;
+    const generation = generationRef.current;
     setExecuting(true);
     setExecError(null);
     executeMoveToDrive(objToken, confirmText.trim())
       .then((outcome) => {
-        if (!mountedRef.current) return;
+        if (!mountedRef.current || generation !== generationRef.current) { onMoved(); return; }
         setPhase('result');
         if (outcome.state === 'moving') {
           setResult({ kind: 'moving', moveId: outcome.moveId, taskId: outcome.taskId, message: null });
+          onMoved();
           toast.push({ type: 'info', message: '移出请求已提交云端（异步执行），正在跟踪收敛…' });
           pollMoveState(outcome.moveId);
         } else {
@@ -206,12 +214,13 @@ export function MoveOutModal({ open, onClose, objToken, target, onMoved }: MoveO
         }
       })
       .catch((error) => {
-        if (!mountedRef.current) return;
+        if (!mountedRef.current || generation !== generationRef.current) { onMoved(); return; }
         const face = errorFace(error);
         setExecError(face);
+        onMoved();
       })
       .finally(() => {
-        if (mountedRef.current) setExecuting(false);
+        if (mountedRef.current && generation === generationRef.current) setExecuting(false);
       });
   };
 

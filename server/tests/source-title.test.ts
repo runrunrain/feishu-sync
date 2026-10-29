@@ -16,7 +16,7 @@
  *  - app_command cloud.rename_title 批准流端到端（remote_write 逐次批准）
  */
 
-import { describe, expect, it, afterEach } from 'vitest';
+import { describe, expect, it, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -382,6 +382,42 @@ describe('buildRenamePlan — 门控矩阵', () => {
 // ===========================================================================
 
 describe('renameCloudTitle — 执行', () => {
+  it.each(['getRunningRevertPushLog', 'getActiveCloudMove', 'getLatestCloudMove'] as const)('状态查询失败时本地撤销与云端写回均不执行：%s', async (method) => {
+    const fx = fixture();
+    await editBody(fx, '# 本地修改\n\n保留正文。\n');
+    const before = fs.readFileSync(fx.absPath, 'utf8');
+    vi.spyOn(fx.store, method).mockImplementation(() => { throw new Error('database unavailable'); });
+    await expect(fx.editService.revert(OBJ, 'ui')).rejects.toThrow('database unavailable');
+    await expect(fx.writeService.push(OBJ, { confirm: 'PUSH', actor: 'ui' })).rejects.toThrow('database unavailable');
+    expect(fs.readFileSync(fx.absPath, 'utf8')).toBe(before);
+    expect(fx.lark.calls.filter((call) => ['append', 'overwrite'].includes(call.op))).toHaveLength(0);
+  });
+  it.each(['getRunningRevertPushLog', 'getActiveCloudMove', 'getLatestCloudMove'] as const)('互斥状态查询失败时禁止改名：%s', async (method) => {
+    const fx = fixture();
+    vi.spyOn(fx.store, method).mockImplementation(() => { throw new Error('database unavailable'); });
+    await expect(fx.titleService.renameCloudTitle(OBJ, '新标题', { confirmValue: RENAME_CONFIRM_VALUE })).rejects.toThrow('database unavailable');
+    expect(fx.lark.calls.filter((call) => call.op === 'updateTitle')).toHaveLength(0);
+  });
+
+  it('移出未收敛时禁止改名', async () => {
+    const fx = fixture();
+    vi.spyOn(fx.store, 'getActiveCloudMove').mockReturnValue({ state: 'unknown' } as never);
+    expect((await fx.titleService.buildRenamePlan(OBJ, '新标题')).blockedReason).toBe('cloud_move_running');
+    await expect(fx.titleService.renameCloudTitle(OBJ, '新标题', { confirmValue: RENAME_CONFIRM_VALUE })).rejects.toMatchObject({ code: 'cloud_move_running' });
+    expect(fx.lark.calls.filter((call) => call.op === 'updateTitle')).toHaveLength(0);
+  });
+
+  it('锁内发现节点身份变化时不修改旧节点', async () => {
+    const fx = fixture();
+    const original = fx.store.getDocumentByObjToken.bind(fx.store);
+    let reads = 0;
+    vi.spyOn(fx.store, 'getDocumentByObjToken').mockImplementation((token) => {
+      const doc = original(token);
+      return doc && ++reads > 1 ? { ...doc, wikiNodeToken: 'replacementNode000001' } : doc;
+    });
+    await expect(fx.titleService.renameCloudTitle(OBJ, '新标题', { confirmValue: RENAME_CONFIRM_VALUE })).rejects.toMatchObject({ code: 'source_identity_changed' });
+    expect(fx.lark.calls.filter((call) => call.op === 'updateTitle')).toHaveLength(0);
+  });
   it('confirm 门：非 RENAME → 400 confirmation_required（早于任何远端调用）', async () => {
     const fx = fixture();
     const error = await expectTitleError(

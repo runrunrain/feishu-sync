@@ -16,7 +16,7 @@
  *    blocked 拒绝）
  */
 
-import { describe, expect, it, afterEach } from 'vitest';
+import { describe, expect, it, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -66,9 +66,9 @@ function defaultEntries() {
 
 function makeLarkStub(opts: {
   historyPages?: Array<{ entries: ReturnType<typeof defaultEntries>; hasMore: boolean; nextPageToken: string | null }>;
-  revertResult?: { status: 'done' | 'running'; taskId: string | null; pollAfterMs?: number; failedBlockTokens?: string[] | null };
+  revertResult?: { status: 'done' | 'running' | 'failed' | 'partial_failed'; taskId: string | null; pollAfterMs?: number; failedBlockTokens?: string[] | null };
   revertError?: unknown;
-  revertStatus?: { status: 'done' | 'running' | 'failed'; failedBlockTokens?: string[] | null };
+  revertStatus?: { status: 'done' | 'running' | 'failed' | 'partial_failed'; failedBlockTokens?: string[] | null };
   statusError?: unknown;
   cloudTime?: number | null;
   scopes?: string[];
@@ -423,6 +423,90 @@ describe('buildRevertPlan — 门控与警告', () => {
 // ===========================================================================
 
 describe('revertToAnchor — 执行与状态迁移', () => {
+  it('partial_failed 是终态，保留失败块并回拉已变化正文', async () => {
+    const fx = fixture({ revertResult: { status: 'running', taskId: 'task-1' }, revertStatus: { status: 'partial_failed', failedBlockTokens: ['blk1'] } });
+    const result = await fx.service.revertToAnchor(OBJ, { historyVersionId: '2048' }, { confirmValue: 'REVERT_CLOUD:2048' });
+    fx.clock.value += 10_000;
+    await fx.service.pollOnce();
+    expect(fx.store.getSourcePushLog(result.pushLogId)).toMatchObject({ revertState: 'failed', revertError: 'partial_blocks_failed:blk1' });
+    expect(fx.pulls).toEqual([OBJ]);
+    expect(fx.store.getRunningRevertPushLog(OBJ)).toBeNull();
+  });
+
+  it('即时返回 partial_failed 时同样记录并回拉', async () => {
+    const fx = fixture({ revertResult: { status: 'partial_failed', taskId: 'task-1', failedBlockTokens: ['blk2'] } });
+    const result = await fx.service.revertToAnchor(OBJ, { historyVersionId: '2048' }, { confirmValue: 'REVERT_CLOUD:2048' });
+    expect(result).toMatchObject({ state: 'failed', partialFailure: true, failedBlockTokens: ['blk2'], pull: { ok: true } });
+    expect(fx.store.getSourcePushLog(result.pushLogId)).toMatchObject({ revertState: 'failed', revertError: 'partial_blocks_failed:blk2' });
+  });
+  it('轮询请求未完成时下一轮不会并发查询同一任务', async () => {
+    const fx = fixture();
+    let release!: (value: { status: 'done'; failedBlockTokens: null }) => void;
+    const pending = new Promise<{ status: 'done'; failedBlockTokens: null }>((resolve) => { release = resolve; });
+    const poll = vi.spyOn(fx.lark, 'revertDocumentHistoryStatus').mockReturnValue(pending);
+    const row = seedRunningRevert(fx);
+    fx.service.resumeRunningReverts();
+    fx.clock.value += 6000;
+    const first = fx.service.pollOnce();
+    await fx.service.pollOnce();
+    expect(poll).toHaveBeenCalledTimes(1);
+    release({ status: 'done', failedBlockTokens: null });
+    await first;
+    expect(fx.store.getSourcePushLog(row.id)?.revertState).toBe('done');
+  });
+  it('同步完成含部分失败块时持久化并在响应中返回，不能静默报完整成功', async () => {
+    const fx = fixture({ revertResult: { status: 'done', taskId: 'task-done', failedBlockTokens: ['blockA', 'blockB'] } });
+    const result = await fx.service.revertToAnchor(OBJ, { historyVersionId: '2048' }, { confirmValue: 'REVERT_CLOUD:2048' });
+    expect(result.failedBlockTokens).toEqual(['blockA', 'blockB']);
+    expect(fx.store.getSourcePushLog(result.pushLogId)?.revertError).toBe('partial_blocks_failed:blockA,blockB');
+    expect(auditLines(fx).at(-1)).toMatchObject({ event: 'history_revert_done', failedBlockTokens: ['blockA', 'blockB'] });
+  });
+  it('unknown 有任务号：持续阻断，直到云端确认终态后释放并回拉', async () => {
+    const fx = fixture({ revertStatus: { status: 'done' } });
+    const row = seedRunningRevert(fx);
+    fx.store.updateSourcePushLogRevert(row.id, { revertState: 'unknown', revertError: 'timeout' });
+    expect(fx.store.getRunningRevertPushLog(OBJ)?.id).toBe(row.id);
+    await expect(fx.service.revertToAnchor(OBJ, { historyVersionId: '2048' }, { confirmValue: 'REVERT_CLOUD:2048' })).rejects.toMatchObject({ code: 'cloud_revert_running' });
+    expect(await fx.service.reconcileUnknownRevert(OBJ, row.id)).toEqual({ state: 'done', reason: null });
+    expect(fx.store.getSourcePushLog(row.id)).toMatchObject({ revertState: 'done', outcome: 'pushed', revertError: null });
+    expect(fx.store.getRunningRevertPushLog(OBJ)).toBeNull();
+    expect(fx.pulls).toEqual([OBJ]);
+    await expect(fx.service.reconcileUnknownRevert(OBJ, row.id)).rejects.toMatchObject({ code: 'revert_not_unknown' });
+  });
+
+  it('unknown 云端仍在运行或无任务号时不能自动解除；人工确认保留结果未知', async () => {
+    const fx = fixture({ revertStatus: { status: 'running' } });
+    const running = seedRunningRevert(fx);
+    fx.store.updateSourcePushLogRevert(running.id, { revertState: 'unknown' });
+    expect(await fx.service.reconcileUnknownRevert(OBJ, running.id)).toEqual({ state: 'unknown', reason: 'task_still_running' });
+    expect(await fx.service.reconcileUnknownRevert(OBJ, running.id, `REVERT_SETTLED:${running.id}`)).toEqual({ state: 'unknown', reason: 'task_still_running' });
+    expect(fx.store.getRunningRevertPushLog(OBJ)).not.toBeNull();
+    fx.store.resolveUnknownRevert(running.id, 'failed', 'fixture');
+    const missing = seedRunningRevert(fx, { taskId: null });
+    fx.store.updateSourcePushLogRevert(missing.id, { revertState: 'unknown' });
+    expect(await fx.service.reconcileUnknownRevert(OBJ, missing.id)).toEqual({ state: 'unknown', reason: 'task_id_missing' });
+    expect(await fx.service.reconcileUnknownRevert(OBJ, missing.id, `REVERT_SETTLED:${missing.id}`)).toEqual({ state: 'resolved', reason: null });
+    expect(fx.store.getSourcePushLog(missing.id)).toMatchObject({ revertState: 'resolved', outcome: 'unknown' });
+    expect(fx.store.getRunningRevertPushLog(OBJ)).toBeNull();
+  });
+
+  it('历史记录截断与清理不会隐藏或删除未知回滚围栏', () => {
+    const fx = fixture();
+    const row = seedRunningRevert(fx, { taskId: null });
+    fx.store.updateSourcePushLogRevert(row.id, { revertState: 'unknown' });
+    for (let i = 0; i < 3; i++) fx.store.insertSourcePushLog({ objToken: OBJ, localRelPath: 'a.md', mode: 'append', actor: 'ui' });
+    expect(fx.store.listSourcePushLogs(OBJ, 1)[0].id).toBe(row.id);
+    fx.store.pruneSourcePushLogs(1);
+    expect(fx.store.getSourcePushLog(row.id)?.revertState).toBe('unknown');
+  });
+  it.each(['getRunningRevertPushLog', 'getActiveCloudMove'] as const)('互斥状态查询失败时阻断回滚：%s', async (method) => {
+    const fx = fixture();
+    vi.spyOn(fx.store, method).mockImplementation(() => { throw new Error('database unavailable'); });
+    await expect(fx.service.revertToAnchor(OBJ, { historyVersionId: '2048' }, { confirmValue: deriveRevertConfirmValue('2048') }))
+      .rejects.toThrow('database unavailable');
+    expect(fx.lark.calls.filter((call) => call.op === 'revert')).toHaveLength(0);
+    expect(fx.store.listSourcePushLogs(OBJ)).toHaveLength(0);
+  });
   it('confirm 门：裸 REVERT_CLOUD / 错误 id / 缺省 → 400 confirmation_required', async () => {
     const fx = fixture();
     await expect(fx.service.revertToAnchor(OBJ, { historyVersionId: '2048' }, { confirmValue: 'REVERT_CLOUD' }))
@@ -803,6 +887,19 @@ function makeApp(fx: Fixture): Hono {
 }
 
 describe('routes/feishu — push-log / history / history-revert', () => {
+  it('未知回滚核对路由按文档归属检查，人工确认后保留结果未知', async () => {
+    const fx = fixture();
+    const row = seedRunningRevert(fx, { taskId: null });
+    fx.store.updateSourcePushLogRevert(row.id, { revertState: 'unknown' });
+    const app = makeApp(fx);
+    const request = (token: string, confirm?: string) => app.request(`/api/sources/${token}/reverts/${row.id}/reconcile`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ confirm }),
+    });
+    expect((await request('other')).status).toBe(404);
+    expect(await (await request(OBJ)).json()).toEqual({ state: 'unknown', reason: 'task_id_missing' });
+    expect(await (await request(OBJ, `REVERT_SETTLED:${row.id}`)).json()).toEqual({ state: 'resolved', reason: null });
+    expect(fx.store.getSourcePushLog(row.id)).toMatchObject({ revertState: 'resolved', outcome: 'unknown' });
+  });
   it('GET push-log：写回记录倒序（含回滚状态字段）', async () => {
     const fx = fixture();
     seedRunningRevert(fx);

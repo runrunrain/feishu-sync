@@ -63,6 +63,7 @@ interface NodeDetailCardProps {
    * （moved →「已移出到云空间」，区分于回收站/删除），并渲染移出记录列表。
    */
   cloudMoves?: CloudMoveRecord[];
+  onCloudMovesChanged?: () => void;
 }
 
 const TYPE_ICON = {
@@ -95,6 +96,7 @@ export function NodeDetailCard({
   watchedRoots,
   onSelectNode,
   cloudMoves,
+  onCloudMovesChanged,
 }: NodeDetailCardProps) {
   const toast = useToast();
 
@@ -332,7 +334,7 @@ export function NodeDetailCard({
         </dl>
 
         {/* P2-S7：移出记录列表（时间/状态/失败原因；无记录不渲染）。 */}
-        <CloudMovesSection moves={cloudMoves ?? []} />
+        <CloudMovesSection moves={cloudMoves ?? []} onChanged={onCloudMovesChanged} />
 
         <div className="flex items-center gap-2.5 pt-1">
           <button

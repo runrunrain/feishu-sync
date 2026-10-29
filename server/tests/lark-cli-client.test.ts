@@ -750,6 +750,13 @@ describe('P0-S2 revertDocumentHistory / revertDocumentHistoryStatus — revert �
     expect(await client.revertDocumentHistoryStatus('DOCXTOKEN1', 't3'))
       .toEqual({ status: 'running', failedBlockTokens: null });
   });
+
+  it('partial_failed 是明确终态，即时响应与状态查询均保留失败块', async () => {
+    const client = createClient();
+    (client as any).execute = async () => ({ data: { status: 'partial_failed', failed_block_tokens: ['blk1'] } });
+    expect(await client.revertDocumentHistory('DOCXTOKEN1', '2048')).toMatchObject({ status: 'partial_failed', failedBlockTokens: ['blk1'] });
+    expect(await client.revertDocumentHistoryStatus('DOCXTOKEN1', 'task')).toEqual({ status: 'partial_failed', failedBlockTokens: ['blk1'] });
+  });
 });
 
 describe('P0-S2 exportWhiteboard — whiteboard +export 双形态旁路导出', () => {

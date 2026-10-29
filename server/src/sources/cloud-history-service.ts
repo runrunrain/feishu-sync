@@ -134,12 +134,14 @@ export interface CloudHistoryListResult extends DocumentHistoryPage {
 }
 
 export interface RevertExecutionResult {
-  state: 'done' | 'running';
+  state: 'done' | 'running' | 'failed';
   pushLogId: string;
   taskId: string | null;
   targetHistoryVersionId: string;
   /** 仅 state='done'（锁外回拉结果；失败只记 warning，交检测链收敛）。 */
   pull: { ok: boolean; status: string; message?: string } | null;
+  failedBlockTokens?: string[];
+  partialFailure?: boolean;
   /**
    * T4b-10：关键互斥/任务标识字段的持久化降级说明（例如 running/taskId
    * 写入遇瞬时 DB 异常——行至少保持 running 围栏 + 进程内轮询继续；
@@ -191,6 +193,7 @@ export class CloudHistoryService {
   private readonly now: () => number;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private readonly tracked = new Map<string, TrackedRevert>();
+  private polling = false;
 
   constructor(private readonly deps: CloudHistoryServiceDeps) {
     this.pollerTickMs = deps.poller?.tickMs ?? 5_000;
@@ -253,11 +256,7 @@ export class CloudHistoryService {
 
   /** cloud_revert_running 互斥判定（§4.4）：共享状态 = revert_state='running' 行。 */
   private hasRunningRevert(objToken: string): SourcePushLogRecord | null {
-    try {
-      return this.deps.store.getRunningRevertPushLog?.(objToken) ?? null;
-    } catch {
-      return null;
-    }
+    return this.deps.store.getRunningRevertPushLog?.(objToken) ?? null;
   }
 
   /** 门控评估（§4.3 blockedReason 语义；执行路径同判定复用——§4.4 步骤 1 复核）。 */
@@ -279,12 +278,8 @@ export class CloudHistoryService {
     // 任务书「移出进行中→源编辑/写回/回滚拒绝」；unknown 云端可能仍在
     // 执行或已执行，同样持续围栏，只经权威核对解除）。访问器缺失按无
     // 移出容错。
-    try {
-      if (this.deps.store.getActiveCloudMove?.(objToken) != null) {
-        return { blockedReason: 'cloud_move_running' };
-      }
-    } catch {
-      // 旧测试替身无访问器：容错，不影响既有链路。
+    if (this.deps.store.getActiveCloudMove?.(objToken) != null) {
+      return { blockedReason: 'cloud_move_running' };
     }
     return { blockedReason: null };
   }
@@ -322,7 +317,7 @@ export class CloudHistoryService {
       case 'cloud_revert_running':
         return new CloudHistoryError(
           'cloud_revert_running',
-          '该文档有进行中的云端回滚，请等待完成（或状态收敛为 unknown）后再操作',
+          '该文档的云端回滚进行中或结果未知，请在写回记录中核对任务状态后再操作',
           409,
         );
       case 'cloud_move_running':
@@ -577,7 +572,7 @@ export class CloudHistoryService {
     if (gates.blockedReason) throw this.blockedError(gates.blockedReason, { missingScopes: gates.missingScopes });
     const outcome = await this.locks.withLock(objToken, () =>
       this.revertLocked(objToken, targetId, actor, options.approvalId));
-    if (outcome.state === 'done') {
+    if (outcome.state === 'done' || outcome.partialFailure) {
       // 锁外回拉：与写回同一入口（SyncEngine apply 链）；回拉失败只记
       // warning，交检测链自然收敛——本服务不改任何 synced 基线字段。
       try {
@@ -640,6 +635,8 @@ export class CloudHistoryService {
         waitTimeoutMs: REVERT_START_WAIT_MS,
       });
       if (result.status === 'done') {
+        const failedBlockTokens = result.failedBlockTokens ?? [];
+        const partial = failedBlockTokens.length > 0 ? `partial_blocks_failed:${failedBlockTokens.join(',')}` : null;
         // 同步完成（罕见形态）：立即终态 + 锁外回拉（调用方处理）。
         // outcome='pushed' 属审计级字段（best-effort）；终态 done 是围栏
         // 释放写——失败时行保持 running（fail-closed），交重启对账收敛。
@@ -649,16 +646,32 @@ export class CloudHistoryService {
           revertHistoryId: targetId,
           revertTaskId: result.taskId,
           revertedAt: new Date().toISOString(),
+          ...(partial ? { revertError: partial } : {}),
         }));
         this.appendAudit('history_revert_done', {
           objToken, pushLogId, historyVersionId: targetId, actor, approvalId, taskId: result.taskId,
+          ...(partial ? { failedBlockTokens } : {}),
         });
         return {
           state: 'done', pushLogId, taskId: result.taskId, targetHistoryVersionId: targetId, pull: null,
+          ...(partial ? { failedBlockTokens } : {}),
           ...(persisted ? {} : {
             persistWarning: '回滚已同步完成，但终态落盘失败：行保持 running 围栏，重启对账会收敛为 unknown；期间编辑/写回/新回滚仍被拒绝',
           }),
         };
+      }
+      if (result.status === 'failed' || result.status === 'partial_failed') {
+        const partialFailure = result.status === 'partial_failed';
+        const tokens = result.failedBlockTokens ?? [];
+        const detail = partialFailure ? `partial_blocks_failed:${tokens.join(',')}` : 'revert_failed_upstream';
+        this.safeUpdate(pushLogId, (store) => store.updateSourcePushLog(pushLogId, { outcome: 'failed' }));
+        const persisted = this.criticalUpdate(pushLogId, (store) => store.updateSourcePushLogRevert(pushLogId, {
+          revertState: 'failed', revertHistoryId: targetId, revertTaskId: result.taskId, revertError: detail,
+        }));
+        this.appendAudit('history_revert_failed', { objToken, pushLogId, historyVersionId: targetId, actor, error: detail });
+        return { state: 'failed', pushLogId, taskId: result.taskId, targetHistoryVersionId: targetId, pull: null,
+          ...(partialFailure ? { partialFailure: true, failedBlockTokens: tokens } : {}),
+          ...(persisted ? {} : { persistWarning: '回滚失败状态未能落盘，保护保持生效，请刷新记录核对' }) };
       }
       // 异步起步：云端已接受 → outcome='pushed'（审计级，best-effort）+
       // revert_task_id（关键：重启续查依据；客户端层已保证 running 形态
@@ -824,17 +837,69 @@ export class CloudHistoryService {
     return { resumed, markedUnknown };
   }
 
+  /** 核对未知任务；无任务号时仅允许用户明确确认云端任务已经结束。 */
+  async reconcileUnknownRevert(objToken: string, pushLogId: string, manualConfirm?: unknown): Promise<{
+    state: 'unknown' | 'done' | 'failed' | 'resolved'; reason: string | null;
+  }> {
+    const result = await this.locks.withLock(objToken, async () => {
+      const row: SourcePushLogRecord | null = this.deps.store.getSourcePushLog?.(pushLogId) ?? null;
+      if (!row || row.objToken !== objToken) throw new CloudHistoryError('push_log_not_found', '回滚记录不存在或不属于该文档', 404);
+      if (row.revertState !== 'unknown') throw new CloudHistoryError('revert_not_unknown', '该回滚记录不处于未知状态，请刷新记录', 409);
+      let state: 'done' | 'failed' | 'resolved';
+      let detail: string | null = null;
+      if (row.revertTaskId) {
+        let status: { status: 'done' | 'running' | 'failed' | 'partial_failed'; failedBlockTokens: string[] | null } | null;
+        try {
+          status = await this.deps.larkCliClient.revertDocumentHistoryStatus(objToken, row.revertTaskId);
+        } catch {
+          status = null;
+        }
+        if (!status) {
+          if (manualConfirm !== `REVERT_SETTLED:${pushLogId}`) return { state: 'unknown' as const, reason: 'task_result_unreadable' };
+          state = 'resolved';
+          detail = 'manual_confirmed_task_settled_outcome_unknown';
+        } else {
+          if (status.status === 'running') return { state: 'unknown' as const, reason: 'task_still_running' };
+          state = status.status === 'partial_failed' ? 'failed' : status.status;
+          if (status.status === 'partial_failed' || status.failedBlockTokens?.length) detail = `partial_blocks_failed:${(status.failedBlockTokens ?? []).join(',')}`;
+          else if (state === 'failed') detail = 'revert_failed_upstream';
+        }
+      } else {
+        if (manualConfirm !== `REVERT_SETTLED:${pushLogId}`) {
+          return { state: 'unknown' as const, reason: 'task_id_missing' };
+        }
+        state = 'resolved';
+        detail = 'manual_confirmed_task_settled_outcome_unknown';
+      }
+      if (!this.deps.store.resolveUnknownRevert(pushLogId, state, detail)) {
+        throw new CloudHistoryError('revert_state_changed', '回滚状态已变化，请刷新记录', 409);
+      }
+      this.appendAudit('history_revert_reconciled', { objToken, pushLogId, state, detail });
+      return { state, reason: detail?.startsWith('partial_blocks_failed:') ? 'partial_failed' : null };
+    });
+    if (result.state === 'done' || result.state === 'resolved' || (result.state === 'failed' && result.reason === 'partial_failed')) {
+      try { await this.deps.pullSync(objToken); } catch (error) {
+        console.error('[CloudHistoryService] post-reconcile pull failed:', error);
+      }
+    }
+    return result;
+  }
+
   /** 单轮扫描（定时器入口；测试直调）。只处理到期行（poll_after_ms 节奏）。 */
   async pollOnce(): Promise<void> {
-    const now = this.now();
-    for (const row of [...this.tracked.values()]) {
-      if (row.nextPollAt > now) continue;
-      await this.pollRow(row, now);
-    }
+    if (this.polling) return;
+    this.polling = true;
+    try {
+      const now = this.now();
+      for (const row of [...this.tracked.values()]) {
+        if (row.nextPollAt > now) continue;
+        await this.pollRow(row, now);
+      }
+    } finally { this.polling = false; }
   }
 
   private async pollRow(row: TrackedRevert, now: number): Promise<void> {
-    let status: { status: 'done' | 'running' | 'failed'; failedBlockTokens: string[] | null };
+    let status: { status: 'done' | 'running' | 'failed' | 'partial_failed'; failedBlockTokens: string[] | null };
     try {
       status = await this.deps.larkCliClient.revertDocumentHistoryStatus(row.objToken, row.taskId);
     } catch (error) {
@@ -847,8 +912,8 @@ export class CloudHistoryService {
       this.finalizeDone(row, status);
       return;
     }
-    if (status.status === 'failed') {
-      this.finalizeFailed(row, status);
+    if (status.status === 'failed' || status.status === 'partial_failed') {
+      this.finalizeFailed(row, { status: status.status, failedBlockTokens: status.failedBlockTokens });
       return;
     }
     // running（含未知取值归一 running，P0-S2 契约）：续查或超限。
@@ -892,9 +957,9 @@ export class CloudHistoryService {
     });
   }
 
-  private finalizeFailed(row: TrackedRevert, status: { failedBlockTokens: string[] | null }): void {
-    const detail = status.failedBlockTokens != null && status.failedBlockTokens.length > 0
-      ? `partial_blocks_failed:${status.failedBlockTokens.join(',')}` : 'revert_failed_upstream';
+  private finalizeFailed(row: TrackedRevert, status: { status: 'failed' | 'partial_failed'; failedBlockTokens: string[] | null }): void {
+    const detail = status.status === 'partial_failed' || (status.failedBlockTokens != null && status.failedBlockTokens.length > 0)
+      ? `partial_blocks_failed:${(status.failedBlockTokens ?? []).join(',')}` : 'revert_failed_upstream';
     this.safeUpdateBoolean(row.pushLogId, (store) =>
       store.updateSourcePushLog(row.pushLogId, { outcome: 'failed' }));
     const persisted = this.criticalUpdate(row.pushLogId, (store) => store.updateSourcePushLogRevert(row.pushLogId, {
@@ -909,6 +974,9 @@ export class CloudHistoryService {
     this.tracked.delete(row.pushLogId);
     this.appendAudit('history_revert_failed', {
       objToken: row.objToken, pushLogId: row.pushLogId, taskId: row.taskId, error: detail,
+    });
+    if (status.status === 'partial_failed') void Promise.resolve(this.deps.pullSync(row.objToken)).catch((error) => {
+      console.error('[CloudHistoryService] partial revert pull failed:', error);
     });
   }
 

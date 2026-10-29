@@ -496,17 +496,8 @@ export function resolveWhiteboardBypassRefs(
       const rel = `${stem}${suffix}`;
       const relWithDir = sourceDir ? `${sourceDir}/${rel}` : rel;
       try {
-        let resolved: string;
-        try {
-          resolved = resolveInside(knowledgeBaseRoot, relWithDir, 'read');
-        } catch (error) {
-          if (error instanceof PathGuardError && error.code === 'not_found') {
-            const normalized = resolveInside(knowledgeBaseRoot, sourceDir || '.', 'read');
-            resolved = path.join(normalized, ...relWithDir.split('/'));
-          } else {
-            throw error;
-          }
-        }
+        // 这里只消费已存在的旁路文件；缺失时继续尝试另一种格式。
+        const resolved = resolveInside(knowledgeBaseRoot, relWithDir, 'read');
         const stat = fs.statSync(resolved, { throwIfNoEntry: false });
         if (stat?.isFile()) {
           result.push({ src, file: resolved, origin });

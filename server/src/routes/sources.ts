@@ -177,7 +177,7 @@ export function sourcesRoutes(deps: SourcesRoutesDeps) {
         );
       }
       const objToken = c.req.param('objToken');
-      await service.revert(objToken, parseActor(body.actor));
+      await service.revert(objToken, parseActor(body.actor), typeof body.acknowledgedUnknownUpdatedAt === 'string' ? body.acknowledgedUnknownUpdatedAt : undefined);
       return c.json({ ok: true });
     } catch (error) {
       return errorResponse(c, error);

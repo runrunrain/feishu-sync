@@ -553,7 +553,9 @@ export type SyncFailureReasonCode =
   | 'rate_limited'
   | 'upstream_error'
   /** S11（设计 §7.3/§8）：文档存在未写回的本地修改，同步被 blocker 跳过。 */
-  | 'local_edit_pending';
+  | 'local_edit_pending'
+  | 'cloud_operation_pending'
+  | 'source_moved_out';
 
 /**
  * Explicitly distinguishes actions that can be automated from those that

@@ -22,6 +22,19 @@ describe('device authentication API', () => {
     }));
   });
 
+  it('requests enabled optional scopes without forcing the read-only scope set', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ deviceCode: 'test-device' })));
+    vi.stubGlobal('fetch', fetchMock);
+    await startDeviceAuth('reauthorize', { includeOptionalScopes: true });
+    expect(fetchMock).toHaveBeenCalledWith('/api/feishu/auth/device/start', expect.objectContaining({
+      body: '{"mode":"reauthorize","includeOptionalScopes":true}',
+    }));
+    await startDeviceAuth('reauthorize', { scopeSet: 'write', includeOptionalScopes: true });
+    expect(fetchMock).toHaveBeenLastCalledWith('/api/feishu/auth/device/start', expect.objectContaining({
+      body: '{"mode":"reauthorize","scopeSet":"write","includeOptionalScopes":true}',
+    }));
+  });
+
   it.each([
     { body: { error: 'device_auth_start_failed', message: '认证超时，请检查网络后重试' }, message: '认证超时，请检查网络后重试' },
     { body: { error: 'device_auth_in_progress' }, message: 'device_auth_in_progress' },

@@ -164,11 +164,7 @@ export class SourceEditService {
    * 访问器缺失（旧测试替身）按无回滚容错，不影响既有链路。
    */
   private hasRunningCloudRevert(objToken: string): boolean {
-    try {
-      return this.deps.store?.getRunningRevertPushLog?.(objToken) != null;
-    } catch {
-      return false;
-    }
+    return this.deps.store?.getRunningRevertPushLog?.(objToken) != null;
   }
 
   private rejectWhenCloudRevertRunning(objToken: string): void {
@@ -193,26 +189,21 @@ export class SourceEditService {
    * 不影响既有链路；围栏状态源与写回/回滚/移出四方共用同一解释。
    */
   private rejectWhenCloudMoveBlocking(objToken: string): void {
-    try {
-      const active = this.deps.store?.getActiveCloudMove?.(objToken) ?? null;
-      if (active != null) {
-        throw new SourceEditError(
-          'cloud_move_running',
-          '该文档有进行中或结果未知的移出到云空间，暂不能编辑或放弃本地修改：请先在移出记录完成权威核对（确认未移出后再操作）',
-          409,
-        );
-      }
-      const latest = this.deps.store?.getLatestCloudMove?.(objToken) ?? null;
-      if (latest?.state === 'moved') {
-        throw new SourceEditError(
-          'source_moved_out',
-          '该文档已移出到云空间（不再受知识库管理）：本地文件保留但不再支持编辑与写回',
-          409,
-        );
-      }
-    } catch (error) {
-      if (error instanceof SourceEditError) throw error;
-      // 访问器缺失/查询异常按无移出容错（与 hasRunningCloudRevert 同口径）。
+    const active = this.deps.store?.getActiveCloudMove?.(objToken) ?? null;
+    if (active != null) {
+      throw new SourceEditError(
+        'cloud_move_running',
+        '该文档有进行中或结果未知的移出到云空间，暂不能编辑或放弃本地修改：请先在移出记录完成权威核对（确认未移出后再操作）',
+        409,
+      );
+    }
+    const latest = this.deps.store?.getLatestCloudMove?.(objToken) ?? null;
+    if (latest?.state === 'moved') {
+      throw new SourceEditError(
+        'source_moved_out',
+        '该文档已移出到云空间（不再受知识库管理）：本地文件保留但不再支持编辑与写回',
+        409,
+      );
     }
   }
 
@@ -445,17 +436,21 @@ export class SourceEditService {
    * source_edits 行（清 dirty）。备份目录保留（回滚章节：回拉成功前保留；
    * 本地留档便于事后追溯）。
    */
-  async revert(objToken: string, actor: SourceEditActor): Promise<void> {
-    return this.locks.withLock(objToken, async () => this.revertLocked(objToken, actor));
+  async revert(objToken: string, actor: SourceEditActor, acknowledgedUnknownUpdatedAt?: string): Promise<void> {
+    return this.locks.withLock(objToken, async () => this.revertLocked(objToken, actor, acknowledgedUnknownUpdatedAt));
   }
 
-  private async revertLocked(objToken: string, actor: SourceEditActor): Promise<void> {
+  private async revertLocked(objToken: string, actor: SourceEditActor, acknowledgedUnknownUpdatedAt?: string): Promise<void> {
     this.rejectWhenBuildActive();
     const existing: SourceEditRecord | null = this.deps.store.getSourceEdit?.(objToken) ?? null;
     if (!existing) {
       throw new SourceEditError('source_edit_not_found', '该文档没有未写回的本地修改', 404);
     }
     this.rejectWhenPushing(existing);
+    if ((existing.lastErrorCode === 'push_outcome_unknown' || existing.lastErrorCode === 'push_interrupted')
+        && (!existing.updatedAt || acknowledgedUnknownUpdatedAt !== existing.updatedAt)) {
+      throw new SourceEditError('source_push_unknown_unconfirmed', '上次写回结果未知。请先确认上次操作已结束并核对飞书内容，再决定是否放弃本地修改', 409);
+    }
     this.rejectWhenCloudRevertRunning(objToken);
     this.rejectWhenCloudMoveBlocking(objToken);
     const { relPath } = this.requireEditableDocument(objToken);

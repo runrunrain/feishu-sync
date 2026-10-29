@@ -160,6 +160,7 @@ export function SourceEditControls({
 
   // 写回
   const [pushOpen, setPushOpen] = useState(false);
+  const [unknownAcknowledged, setUnknownAcknowledged] = useState(false);
   const [plan, setPlan] = useState<SourcePushPlan | null>(null);
   const [planLoading, setPlanLoading] = useState(false);
   const [planError, setPlanError] = useState<{ code: string; message: string } | null>(null);
@@ -257,12 +258,16 @@ export function SourceEditControls({
   };
 
   const handleRevert = () => {
+    const edit = status?.editState;
+    const unknown = edit?.error?.code === 'push_outcome_unknown' || edit?.error?.code === 'push_interrupted';
     const confirmed = window.confirm(
-      '确定放弃修改？本地正文将恢复为上次同步版本，本次编辑内容会被丢弃（可从编辑备份找回）。',
+      unknown
+        ? '上次写回结果未知。请先确认上次操作已结束并核对飞书内容。确定已完成核对并放弃本地修改？本地正文将恢复为上次同步版本，之后同步可能更新本地内容。'
+        : '确定放弃修改？本地正文将恢复为上次同步版本，本次编辑内容会被丢弃（可从编辑备份找回）。',
     );
     if (!confirmed) return;
     setReverting(true);
-    revertSourceEdit(objToken)
+    revertSourceEdit(objToken, unknown ? edit?.updatedAt : undefined)
       .then(async () => {
         if (!mountedRef.current) return;
         toast.push({ type: 'success', message: '已放弃修改，正文恢复为上次同步版本' });
@@ -272,6 +277,7 @@ export function SourceEditControls({
       .catch((error) => {
         if (!mountedRef.current) return;
         toast.push({ type: 'error', message: errorFace(error).message || '放弃修改失败' });
+        void refreshStatus();
       })
       .finally(() => {
         if (mountedRef.current) setReverting(false);
@@ -279,6 +285,7 @@ export function SourceEditControls({
   };
 
   const openPush = () => {
+    setUnknownAcknowledged(false);
     setPushOpen(true);
     setPlan(null);
     setPlanError(null);
@@ -303,7 +310,10 @@ export function SourceEditControls({
     setPushing(true);
     setPushError(null);
     try {
-      const result = await pushSourceToFeishu(objToken, opts);
+      const result = await pushSourceToFeishu(objToken, {
+        ...opts,
+        acknowledgedUnknownUpdatedAt: unknownAcknowledged ? plan?.unknownPushUpdatedAt ?? undefined : undefined,
+      });
       if (!mountedRef.current) return;
       setPushResult(result);
       await refreshStatus();
@@ -311,6 +321,11 @@ export function SourceEditControls({
     } catch (error) {
       if (!mountedRef.current) return;
       setPushError(errorFace(error));
+      setUnknownAcknowledged(false);
+      try {
+        const next = await previewSourcePush(objToken);
+        if (mountedRef.current) setPlan(next);
+      } catch { /* 保留原错误；用户可重新打开预览 */ }
     } finally {
       if (mountedRef.current) setPushing(false);
     }
@@ -532,6 +547,12 @@ export function SourceEditControls({
                 </div>
               ) : (
                 <>
+                  {plan.unknownPushUpdatedAt && (
+                    <label className="flex items-start gap-2 rounded-md border border-seal-2/40 bg-seal-2/5 p-3 text-xs text-seal-2 leading-relaxed">
+                      <input type="checkbox" checked={unknownAcknowledged} onChange={(event) => setUnknownAcknowledged(event.target.checked)} />
+                      我已确认上次写回操作结束，并核对飞书内容确实需要再次写回；重复追加可能产生重复内容。
+                    </label>
+                  )}
                   <div className="rounded-md border border-line bg-paper-2/60 p-3 space-y-1.5">
                     <div className="flex items-center justify-between">
                       <span className="text-sm text-ink font-medium">
@@ -580,7 +601,7 @@ export function SourceEditControls({
                     <div className="rounded-md border border-seal-2/40 bg-seal-2/5 p-3 space-y-2">
                       <p className="text-sm text-seal-2 font-medium">写回未完成</p>
                       <p className="text-xs text-ink-soft leading-relaxed">{pushError.message}</p>
-                      {pushError.code === 'source_push_conflict' && (
+                      {pushError.code === 'source_push_conflict' && pushError.details?.lastErrorCode !== 'push_outcome_unknown' && (
                         <>
                           <p className="text-xs text-seal-2 leading-relaxed">
                             云端已有更新的修改（云端编辑时间 {String(pushError.details?.cloudObjEditTime ?? '未知')}）。
@@ -614,26 +635,26 @@ export function SourceEditControls({
                       取消
                     </Button>
                     {plan.mode === 'append' && !plan.conflict && (
-                      <Button variant="primary" size="sm" onClick={() => void doPush({ confirm: 'PUSH' })} loading={pushing}>
+                      <Button variant="primary" size="sm" onClick={() => void doPush({ confirm: 'PUSH' })} loading={pushing} disabled={!!plan.unknownPushUpdatedAt && !unknownAcknowledged}>
                         <UploadCloud className="w-3.5 h-3.5" />
                         确认追加写回
                       </Button>
                     )}
                     {plan.mode === 'append' && plan.conflict && (
-                      <Button variant="danger" size="sm" onClick={() => void doPush({ force: true, confirm: 'OVERWRITE_CLOUD' })} loading={pushing}>
+                      <Button variant="danger" size="sm" onClick={() => void doPush({ force: true, confirm: 'OVERWRITE_CLOUD' })} loading={pushing} disabled={!!plan.unknownPushUpdatedAt && !unknownAcknowledged}>
                         <AlertTriangle className="w-3.5 h-3.5" />
                         强制追加（覆盖云端新修改）
                       </Button>
                     )}
                     {plan.mode === 'overwrite' && (
-                      <Button variant="danger" size="sm" onClick={() => void doPush({ allowOverwrite: true, confirm: 'OVERWRITE_CLOUD' })} loading={pushing}>
+                      <Button variant="danger" size="sm" onClick={() => void doPush({ allowOverwrite: true, confirm: 'OVERWRITE_CLOUD' })} loading={pushing} disabled={!!plan.unknownPushUpdatedAt && !unknownAcknowledged}>
                         <AlertTriangle className="w-3.5 h-3.5" />
                         我已了解风险，覆盖云端
                       </Button>
                     )}
                     {/* 冲突 + overwrite：同样走 force+OVERWRITE_CLOUD */}
-                    {pushError?.code === 'source_push_conflict' && (
-                      <Button variant="danger" size="sm" onClick={() => void doPush({ allowOverwrite: plan.mode === 'overwrite', force: true, confirm: 'OVERWRITE_CLOUD' })} loading={pushing}>
+                    {pushError?.code === 'source_push_conflict' && pushError.details?.lastErrorCode !== 'push_outcome_unknown' && (
+                      <Button variant="danger" size="sm" onClick={() => void doPush({ allowOverwrite: plan.mode === 'overwrite', force: true, confirm: 'OVERWRITE_CLOUD' })} loading={pushing} disabled={!!plan.unknownPushUpdatedAt && !unknownAcknowledged}>
                         <AlertTriangle className="w-3.5 h-3.5" />
                         强制覆盖云端
                       </Button>

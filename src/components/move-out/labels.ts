@@ -26,7 +26,7 @@ export const MOVE_OUT_BLOCKED_TEXT: Record<CloudMoveBlockedReason, string> = {
   has_children: '该节点有子节点，只支持移出单篇叶子文档（请先处理子节点）',
   node_not_found: '知识库中已不存在该节点（可能已被移动或删除），无法移出',
   local_edit_pending: '该文档有未写回的本地修改：请先写回或放弃本地修改，再移出到云空间',
-  cloud_revert_running: '该文档有进行中的云端回滚，请等待完成（或状态收敛为未知）后再移出',
+  cloud_revert_running: '该文档的云端回滚进行中或结果未知，请在写回记录中核对后再移出',
   cloud_move_running: '该文档有进行中或结果未知的移出（未知需权威核对解除）：请在移出记录完成核对，确认未移出后再操作',
   kb_build_active: '标准库构建进行中，暂不能移出到云空间（构建结束或取消后再试）',
   source_not_found: '文档不在库中（可能已被清理）：请刷新索引后重试',

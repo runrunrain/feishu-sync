@@ -3021,7 +3021,7 @@ export class LocalMapStore {
   markSourceEditPushing(objToken: string): void {
     this.getStatement(`
       UPDATE source_edits
-      SET state = 'pushing', updated_at = ?
+      SET state = 'pushing', last_error_code = NULL, last_error_message = NULL, updated_at = ?
       WHERE obj_token = ?
     `).run(new Date().toISOString(), objToken);
   }
@@ -3190,7 +3190,8 @@ export class LocalMapStore {
     return (this.getStatement(`
       SELECT * FROM source_push_log
       WHERE obj_token = ?
-      ORDER BY created_at DESC, id DESC
+      ORDER BY CASE WHEN revert_state IN ('running', 'unknown') THEN 0 ELSE 1 END,
+        created_at DESC, id DESC
       LIMIT ?
     `).all(objToken, Math.max(1, Math.floor(limit))) as Array<Record<string, any>>)
       .map((row) => this.mapSourcePushLogRow(row));
@@ -3247,7 +3248,7 @@ export class LocalMapStore {
   getRunningRevertPushLog(objToken: string): SourcePushLogRecord | null {
     const row = this.getStatement(`
       SELECT * FROM source_push_log
-      WHERE obj_token = ? AND revert_state = 'running'
+      WHERE obj_token = ? AND revert_state IN ('running', 'unknown')
       ORDER BY created_at DESC, id DESC LIMIT 1
     `).get(objToken) as Record<string, any> | undefined;
     return row ? this.mapSourcePushLogRow(row) : null;
@@ -3298,6 +3299,17 @@ export class LocalMapStore {
     return result.changes > 0;
   }
 
+  /** 单赢家解除未知回滚围栏；只允许依据任务终态或明确人工核对落账。 */
+  resolveUnknownRevert(id: string, state: 'done' | 'failed' | 'resolved', detail: string | null): boolean {
+    const now = new Date().toISOString();
+    return this.getStatement(`
+      UPDATE source_push_log SET revert_state = ?, revert_error = ?,
+        outcome = CASE WHEN ? = 'done' THEN 'pushed' WHEN ? = 'failed' THEN 'failed' ELSE 'unknown' END,
+        reverted_at = CASE WHEN ? = 'done' THEN ? ELSE reverted_at END, updated_at = ?
+      WHERE id = ? AND revert_state = 'unknown'
+    `).run(state, detail, state, state, state, now, now, id).changes > 0;
+  }
+
   /**
    * 保留策略（§4.1）：每个 objToken 保留最近 keepPerToken 行，超出删最旧；
    * revert_state='running' 的行跳过（S4 轮询器仍需要它们）。返回删除行数。
@@ -3312,7 +3324,7 @@ export class LocalMapStore {
           ) AS rn
           FROM source_push_log
         ) WHERE rn <= ?
-      ) AND COALESCE(revert_state, '') <> 'running'
+      ) AND COALESCE(revert_state, '') NOT IN ('running', 'unknown')
     `).all(Math.max(1, Math.floor(keepPerToken))) as Array<{ id: string }>;
     if (stale.length === 0) return 0;
     const remove = this.getStatement('DELETE FROM source_push_log WHERE id = ?');
@@ -3392,9 +3404,10 @@ export class LocalMapStore {
 
   /** 列表（cloud.moves 命令面）：objToken 缺省全量；created_at 倒序。 */
   listCloudMoves(objToken?: string, limit = 50): CloudMoveRecord[] {
+    const order = `ORDER BY CASE WHEN state IN ('pending', 'moving', 'unknown') THEN 0 ELSE 1 END, created_at DESC, id DESC LIMIT ?`;
     const sql = objToken
-      ? `SELECT * FROM cloud_moves WHERE obj_token = ? ORDER BY created_at DESC, id DESC LIMIT ?`
-      : `SELECT * FROM cloud_moves ORDER BY created_at DESC, id DESC LIMIT ?`;
+      ? `SELECT * FROM cloud_moves WHERE obj_token = ? ${order}`
+      : `SELECT * FROM cloud_moves ${order}`;
     const rows = objToken
       ? this.getStatement(sql).all(objToken, Math.max(1, Math.floor(limit))) as Array<Record<string, any>>
       : this.getStatement(sql).all(Math.max(1, Math.floor(limit))) as Array<Record<string, any>>;
@@ -3426,13 +3439,18 @@ export class LocalMapStore {
     return result.changes > 0;
   }
 
+  /** 核对结果只可从 unknown 单次收敛，避免并发核对覆盖已落盘终态。 */
+  resolveUnknownCloudMove(id: string, state: 'moved' | 'failed', error: string | null): boolean {
+    return this.getStatement(`UPDATE cloud_moves SET state = ?, error = ?, updated_at = ?
+      WHERE id = ? AND state = 'unknown'`).run(state, error, new Date().toISOString(), id).changes > 0;
+  }
+
   /**
    * cloud_move_running 互斥门的共享状态源（设计 §3.4 门控「无 running 的
    * 移出」；T4b-05 修订口径）：同一 objToken 存在 pending/moving 行 →
    * 进行中；存在 unknown 行 → 结果未定，同样持续围栏（超时/不可解析/
    * 重启对账都可能是「云端仍在执行或已执行」——不因轮询终止而解除）。
-   * 只有权威核对（CloudMoveService.reconcileUnknownMove：真实查询任务
-   * 状态或节点归属）证明未移出（→ failed）后才不再命中本门。与
+   * 查询任务终态或明确人工核对结束及去向后才不再命中本门。与
    * getRunningRevertPushLog 同风格（消费方：SourceEditService /
    * FeishuWriteService / CloudHistoryService / CloudMoveService 自身——
    * 四方共用同一围栏解释，不各自猜测）。

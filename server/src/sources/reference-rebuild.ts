@@ -27,7 +27,8 @@
 
 import fs from 'node:fs';
 import { extractDocumentReferences } from '../kb/reference-graph.js';
-import { isPathInsideRoot, resolveAbsolute, toPortableRelative } from '../modules/path-resolver.js';
+import { toPortableRelative } from '../modules/path-resolver.js';
+import { PathGuardError, resolveInside } from '../agent/path-guard.js';
 import type { LocalMapStore } from '../modules/local-map-store.js';
 import type { DocumentRecord } from '../types/index.js';
 
@@ -124,16 +125,15 @@ export function rebuildSourceReferences(
       result.skipped.push({ objToken: doc.objToken, title: doc.title, reason: 'file_missing' });
       continue;
     }
-    const abs = resolveAbsolute(knowledgeBaseRoot, rel);
-    if (!isPathInsideRoot(knowledgeBaseRoot, abs)) {
-      result.skipped.push({ objToken: doc.objToken, title: doc.title, reason: 'outside_root' });
-      continue;
-    }
+    let abs: string;
     let stat: fs.Stats;
     try {
+      abs = resolveInside(knowledgeBaseRoot, rel, 'read');
       stat = fs.statSync(abs);
-    } catch {
-      result.skipped.push({ objToken: doc.objToken, title: doc.title, reason: 'file_missing' });
+    } catch (error) {
+      const reason = error instanceof PathGuardError && error.code !== 'not_found'
+        ? 'outside_root' : 'file_missing';
+      result.skipped.push({ objToken: doc.objToken, title: doc.title, reason });
       continue;
     }
     try {

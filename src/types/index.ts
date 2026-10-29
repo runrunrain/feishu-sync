@@ -214,7 +214,10 @@ export type SyncFailureReasonCode =
   | 'permission_denied'
   | 'cloud_deleted'
   | 'rate_limited'
-  | 'upstream_error';
+  | 'upstream_error'
+  | 'local_edit_pending'
+  | 'cloud_operation_pending'
+  | 'source_moved_out';
 
 export type SyncRepairAction =
   | 'rebuild_parent_chain'
@@ -348,6 +351,7 @@ export interface SourceEditResult {
 
 /** POST /api/sources/:objToken/push/preview 响应（S12）。 */
 export interface SourcePushPlan {
+  unknownPushUpdatedAt?: string | null;
   mode: 'append' | 'overwrite' | 'blocked';
   blockedReason?:
     | 'no_changes'
@@ -539,10 +543,12 @@ export interface HistoryRevertPlan {
 
 /** POST /api/sources/:objToken/history-revert 响应（202 异步起步 / 200 同步完成）。 */
 export interface HistoryRevertExecutionResult {
-  state: 'done' | 'running';
+  state: 'done' | 'running' | 'failed';
   pushLogId: string;
   taskId: string | null;
   targetHistoryVersionId: string;
+  failedBlockTokens?: string[];
+  partialFailure?: boolean;
   /** 仅 state='done'（锁外回拉结果；失败只记 warning，交检测链收敛）。 */
   pull: { ok: boolean; status: string; message?: string } | null;
 }

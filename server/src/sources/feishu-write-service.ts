@@ -103,6 +103,7 @@ export interface FeishuWriteServiceDeps {
 export interface PushExecutionOptions {
   allowOverwrite?: boolean;
   force?: boolean;
+  acknowledgedUnknownUpdatedAt?: string;
   confirm: string;
   actor?: SourceEditActor;
 }
@@ -182,15 +183,11 @@ export class FeishuWriteService {
   /**
    * P0-S4（§4.4 cloud_revert_running 互斥）：该 objToken 是否有进行中的
    * 云端回滚（source_push_log.revert_state='running'，共享状态源由 S4
-   * CloudHistoryService 同步写入）。访问器缺失（旧桩/异常）按无回滚处理，
+   * CloudHistoryService 同步写入）。访问器缺失（旧桩）按无回滚处理，
    * 不影响既有链路。
    */
   private hasRunningCloudRevert(objToken: string): boolean {
-    try {
-      return this.deps.store.getRunningRevertPushLog?.(objToken) != null;
-    } catch {
-      return false;
-    }
+    return this.deps.store.getRunningRevertPushLog?.(objToken) != null;
   }
 
   /**
@@ -204,14 +201,10 @@ export class FeishuWriteService {
    * store.getActiveCloudMove / getLatestCloudMove（四方共用同一解释）。
    */
   private cloudMoveBlockReason(objToken: string): 'cloud_move_running' | 'source_moved_out' | null {
-    try {
-      const active = this.deps.store.getActiveCloudMove?.(objToken) ?? null;
-      if (active != null) return 'cloud_move_running';
-      const latest = this.deps.store.getLatestCloudMove?.(objToken) ?? null;
-      return latest?.state === 'moved' ? 'source_moved_out' : null;
-    } catch {
-      return null;
-    }
+    const active = this.deps.store.getActiveCloudMove?.(objToken) ?? null;
+    if (active != null) return 'cloud_move_running';
+    const latest = this.deps.store.getLatestCloudMove?.(objToken) ?? null;
+    return latest?.state === 'moved' ? 'source_moved_out' : null;
   }
 
   private get overwriteSupported(): boolean {
@@ -389,6 +382,7 @@ export class FeishuWriteService {
     anchorBlockedReason?: 'rollback_anchor_unavailable';
     /** P0-S9 §6.1：本地编辑引入的 H1/标题分叉（无分叉为 null；改名后回拉一致即消除）。 */
     titleChangeNotPushed: { localTitle: string; syncedTitle: string } | null;
+    unknownPushUpdatedAt: string | null;
   }> {
     const warnings: string[] = [];
     const { baseBody } = this.requireEditBaseline(objToken);
@@ -513,6 +507,7 @@ export class FeishuWriteService {
       warnings,
       rollbackAnchor,
       titleChangeNotPushed,
+      unknownPushUpdatedAt: row && (row.lastErrorCode === 'push_outcome_unknown' || row.lastErrorCode === 'push_interrupted') ? row.updatedAt : null,
       ...(anchorBlockedReason !== undefined ? { anchorBlockedReason } : {}),
     };
   }
@@ -629,9 +624,18 @@ export class FeishuWriteService {
     options: PushExecutionOptions,
     actor: SourceEditActor,
   ): Promise<{ mode: 'append' | 'overwrite'; revisionId: number | null; pushLogId: string | null }> {
+    // 锁外的授权检查可能等待云端；等待期间回滚或移出可能已经启动。
+    if (this.deps.kbBuild?.isActive()) throw new FeishuWriteError('kb_build_active', '标准库构建进行中，暂不能写回', 409);
+    if (this.hasRunningCloudRevert(objToken)) throw new FeishuWriteError('cloud_revert_running', '云端回滚进行中或结果未知，请先核对', 409);
+    const moveBlock = this.cloudMoveBlockReason(objToken);
+    if (moveBlock) throw new FeishuWriteError(moveBlock, '云端移出正在进行、结果未知或已经完成，不能写回', 409);
     const { row, baseBody } = this.requireEditBaseline(objToken);
     if (row.state === 'pushing') {
       throw new FeishuWriteError('source_push_in_progress', '该文档正在写回飞书，请等待推送结束后再操作', 409);
+    }
+    if ((row.lastErrorCode === 'push_outcome_unknown' || row.lastErrorCode === 'push_interrupted')
+        && (!row.updatedAt || options.acknowledgedUnknownUpdatedAt !== row.updatedAt)) {
+      throw new FeishuWriteError('source_push_unknown_unconfirmed', '上次写回结果未知。请先确认上次操作已结束，并核对飞书内容确实需要再次写回', 409);
     }
     const view = await this.deps.readEditView(objToken);
 
@@ -742,10 +746,12 @@ export class FeishuWriteService {
       throw new FeishuWriteError('push_log_unavailable', message, 500);
     }
 
+    let writeCompleted = false;
     try {
       const outcome = plan.mode === 'append'
         ? await this.executeAppend(objToken, plan.appendMarkdown ?? '')
         : await this.executeOverwrite(objToken, view.body);
+      writeCompleted = true;
       this.deps.store.markSourceEditPushed(objToken, {
         pushMode: outcome.mode,
         pushRevisionId: outcome.revisionId != null ? String(outcome.revisionId) : null,
@@ -767,6 +773,12 @@ export class FeishuWriteService {
       });
       return { ...outcome, pushLogId };
     } catch (error) {
+      if (writeCompleted) {
+        const message = '云端写入已完成，但本地状态保存失败：请核对云端内容，切勿直接重推';
+        this.safeUpdatePushLog(pushLogId, { outcome: 'unknown' });
+        try { this.deps.store.markSourceEditConflict(objToken, { code: 'push_outcome_unknown', message }); } catch { /* 保留 pushing 围栏供启动对账 */ }
+        throw new FeishuWriteError('source_push_conflict', message, 409, { lastErrorCode: 'push_outcome_unknown' });
+      }
       // 失败分类（设计 §7.5 步骤 5）：conflict 类置 conflict；其余回 dirty，
       // 原始错误码保留在 last_error_* 与响应 details。
       // P0-S3：锚点行同步迁移——conflict 类 → conflict；
@@ -898,10 +910,10 @@ export class FeishuWriteService {
           { lastErrorCode: 'push_revision_conflict' },
         );
       }
-      if (error.code === 'timeout') {
+      if (phase !== 'overwrite_fetch' && (error.code === 'timeout' || error.code === 'parse' || error.code === 'incomplete_response')) {
         return new FeishuWriteError(
           'source_push_conflict',
-          `飞书写回超时（${phase}），写入结果未知：请核对云端内容后重推或放弃修改，不会自动重试`,
+          `飞书写回响应不可确定（${phase}，${error.code}），写入结果未知：请核对云端内容后重推或放弃修改，不会自动重试`,
           409,
           { lastErrorCode: 'push_outcome_unknown' },
         );

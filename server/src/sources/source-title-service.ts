@@ -71,6 +71,8 @@ export type TitleRenameBlockedReason =
   | 'local_edit_pending'
   | 'kb_build_active'
   | 'cloud_revert_running'
+  | 'cloud_move_running'
+  | 'source_moved_out'
   | 'unsupported_type'
   | 'title_unchanged';
 
@@ -171,11 +173,7 @@ export class SourceTitleService {
 
   /** cloud_revert_running 互斥判定（§4.4）：revert_state='running' 行为共享状态源。 */
   private hasRunningRevert(objToken: string): boolean {
-    try {
-      return this.deps.store.getRunningRevertPushLog?.(objToken) != null;
-    } catch {
-      return false;
-    }
+    return this.deps.store.getRunningRevertPushLog?.(objToken) != null;
   }
 
   /**
@@ -241,6 +239,10 @@ export class SourceTitleService {
           '该文档有进行中的云端回滚，暂不能在飞书改名（回滚完成后再试）',
           409,
         );
+      case 'cloud_move_running':
+        return new SourceTitleError('cloud_move_running', '该文档的移出正在进行或结果未知，请先核对移出状态', 409);
+      case 'source_moved_out':
+        return new SourceTitleError('source_moved_out', '该文档已移出受管理的知识库，无法在此改名', 409);
       case 'unsupported_type':
         return new SourceTitleError(
           'unsupported_type',
@@ -285,6 +287,8 @@ export class SourceTitleService {
       return blocked('local_edit_pending');
     }
     if (this.hasRunningRevert(objToken)) return blocked('cloud_revert_running');
+    if (this.deps.store.getActiveCloudMove?.(objToken) != null) return blocked('cloud_move_running');
+    if (this.deps.store.getLatestCloudMove?.(objToken)?.state === 'moved') return blocked('source_moved_out');
     const target = this.deriveTarget(objToken, doc);
     if (target == null) return blocked('unsupported_type');
     if (to === from) return blocked('title_unchanged');
@@ -343,6 +347,15 @@ export class SourceTitleService {
     const plan = await this.buildRenamePlan(objToken, to);
     if (plan.blockedReason != null || plan.target == null) {
       throw this.blockedError(plan.blockedReason ?? 'unsupported_type');
+    }
+    if (plan.target.token !== target.token || plan.target.type !== target.type || plan.from !== from) {
+      throw new SourceTitleError('source_identity_changed', '文档身份或原标题已变化，请刷新计划后重新确认', 409);
+    }
+    // 授权检查为异步调用，期间索引检测仍可能更新 documents 行。
+    const current = this.deps.store.getDocumentByObjToken?.(objToken) ?? null;
+    const currentTarget = current ? this.deriveTarget(objToken, current) : null;
+    if (!currentTarget || currentTarget.token !== target.token || currentTarget.type !== target.type || current.title !== from) {
+      throw new SourceTitleError('source_identity_changed', '文档身份或原标题已变化，请刷新计划后重新确认', 409);
     }
     try {
       const result = await this.deps.larkCliClient.updateDocumentTitle(target.token, to, {

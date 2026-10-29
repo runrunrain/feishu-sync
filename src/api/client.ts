@@ -398,11 +398,15 @@ export async function installLarkCli(): Promise<LarkCliInstallResult> {
 
 export async function startDeviceAuth(
   mode: DeviceAuthMode = 'reauthorize',
-  options: { scopeSet?: 'read' | 'write' } = {},
+  options: { scopeSet?: 'read' | 'write'; includeOptionalScopes?: boolean } = {},
 ): Promise<DeviceAuthStartResult> {
   return request<DeviceAuthStartResult>('/api/feishu/auth/device/start', {
     method: 'POST',
-    body: JSON.stringify({ mode, scopeSet: options.scopeSet ?? 'read' }),
+    body: JSON.stringify({
+      mode,
+      ...(options.scopeSet ? { scopeSet: options.scopeSet } : options.includeOptionalScopes ? {} : { scopeSet: 'read' }),
+      ...(options.includeOptionalScopes ? { includeOptionalScopes: true } : {}),
+    }),
   });
 }
 
@@ -1519,10 +1523,10 @@ export function editSourceDocument(
 }
 
 /** POST /api/sources/:objToken/revert —— 放弃修改（恢复上次同步正文）。 */
-export function revertSourceEdit(objToken: string): Promise<{ ok: true }> {
+export function revertSourceEdit(objToken: string, acknowledgedUnknownUpdatedAt?: string): Promise<{ ok: true }> {
   return request<{ ok: true }>(`/api/sources/${encodeURIComponent(objToken)}/revert`, {
     method: 'POST',
-    body: JSON.stringify({ confirm: 'REVERT', actor: 'ui' }),
+    body: JSON.stringify({ confirm: 'REVERT', actor: 'ui', acknowledgedUnknownUpdatedAt }),
   });
 }
 
@@ -1540,13 +1544,14 @@ export function previewSourcePush(objToken: string): Promise<SourcePushPlan> {
  */
 export function pushSourceToFeishu(
   objToken: string,
-  opts: { allowOverwrite?: boolean; force?: boolean; confirm: 'PUSH' | 'OVERWRITE_CLOUD' },
+  opts: { allowOverwrite?: boolean; force?: boolean; acknowledgedUnknownUpdatedAt?: string; confirm: 'PUSH' | 'OVERWRITE_CLOUD' },
 ): Promise<SourcePushResult> {
   return request<SourcePushResult>(`/api/sources/${encodeURIComponent(objToken)}/push`, {
     method: 'POST',
     body: JSON.stringify({
       allowOverwrite: opts.allowOverwrite === true,
       force: opts.force === true,
+      acknowledgedUnknownUpdatedAt: opts.acknowledgedUnknownUpdatedAt,
       confirm: opts.confirm,
       actor: 'ui',
     }),
@@ -1560,6 +1565,14 @@ export function pushSourceToFeishu(
 /** GET /api/sources/:objToken/push-log —— 写回记录（created_at 倒序，≤50 行）。 */
 export function getSourcePushLog(objToken: string): Promise<{ logs: SourcePushLogRecord[] }> {
   return request<{ logs: SourcePushLogRecord[] }>(`/api/sources/${encodeURIComponent(objToken)}/push-log`);
+}
+
+export function reconcileUnknownRevert(objToken: string, pushLogId: string, confirm?: string): Promise<{
+  state: 'unknown' | 'done' | 'failed' | 'resolved'; reason: string | null;
+}> {
+  return request(`/api/sources/${encodeURIComponent(objToken)}/reverts/${encodeURIComponent(pushLogId)}/reconcile`, {
+    method: 'POST', body: JSON.stringify(confirm ? { confirm } : {}),
+  });
 }
 
 /**
@@ -1672,6 +1685,14 @@ export function executeMoveToDrive(
 /** GET /api/sources/moves/:moveId —— 单条移出记录（异步收敛轮询）。 */
 export function getCloudMove(moveId: string): Promise<CloudMoveRecord> {
   return request<CloudMoveRecord>(`/api/sources/moves/${encodeURIComponent(moveId)}`);
+}
+
+export function reconcileCloudMove(moveId: string, confirm?: string): Promise<{
+  moveId: string; objToken: string; state: 'moved' | 'failed' | 'unknown'; taskId: string | null; reason: string | null;
+}> {
+  return request(`/api/sources/moves/${encodeURIComponent(moveId)}/reconcile`, {
+    method: 'POST', body: JSON.stringify(confirm ? { confirm } : {}),
+  });
 }
 
 /** GET /api/sources/moves?objToken=&limit= —— 移出记录列表（最新在前）。 */

@@ -714,6 +714,43 @@ describe('FeishuWriteService.push — overwrite 三段式', () => {
 });
 
 describe('FeishuWriteService.push — 前置门与状态机', () => {
+  it('授权检查期间出现未知回滚时，锁内复核阻断写回', async () => {
+    const fx = makeFixture();
+    try {
+      await editBody(fx, '# 测试文档\n\n正文基线 ALPHA。\n追加\n');
+      fx.lark.checkAuthReady = async () => {
+        const id = fx.store.insertSourcePushLog({ objToken: OBJ, localRelPath: 'a.md', mode: 'revert', actor: 'ui' });
+        fx.store.updateSourcePushLogRevert(id, { revertState: 'unknown' });
+        return { currentScopes: ['docx:document:write_only'], ready: true };
+      };
+      await expect(fx.service.push(OBJ, { confirm: 'PUSH' })).rejects.toMatchObject({ code: 'cloud_revert_running' });
+      expect(fx.lark.calls.filter((call) => call.op === 'append')).toHaveLength(0);
+      expect(fx.store.getSourceEdit(OBJ)?.state).toBe('dirty');
+    } finally { fx.cleanup(); }
+  });
+
+  it.each(['parse', 'incomplete_response'] as const)('追加后响应不确定 %s 时不标为可安全重试', async (code) => {
+    const fx = makeFixture({ larkOverrides: { updateDocumentAppend: async () => { throw new LarkCliError('invalid response', code, false); } } });
+    try {
+      await editBody(fx, '# 测试文档\n\n正文基线 ALPHA。\n追加\n');
+      await expect(fx.service.push(OBJ, { confirm: 'PUSH' })).rejects.toMatchObject({ details: { lastErrorCode: 'push_outcome_unknown' } });
+      expect(fx.store.getSourceEdit(OBJ)).toMatchObject({ state: 'conflict', lastErrorCode: 'push_outcome_unknown' });
+      expect(fx.store.listSourcePushLogs(OBJ)[0].outcome).toBe('unknown');
+    } finally { fx.cleanup(); }
+  });
+
+  it('云端写入成功后本地状态写失败时保留未知状态，避免误报未写入', async () => {
+    const fx = makeFixture();
+    try {
+      await editBody(fx, '# 测试文档\n\n正文基线 ALPHA。\n追加\n');
+      vi.spyOn(fx.store, 'markSourceEditPushed').mockImplementation(() => { throw new Error('disk failure'); });
+      await expect(fx.service.push(OBJ, { confirm: 'PUSH' })).rejects.toMatchObject({ details: { lastErrorCode: 'push_outcome_unknown' } });
+      expect(fx.lark.calls.filter((call) => call.op === 'append')).toHaveLength(1);
+      expect(fx.store.getSourceEdit(OBJ)).toMatchObject({ state: 'conflict', lastErrorCode: 'push_outcome_unknown' });
+      expect(fx.store.listSourcePushLogs(OBJ)[0].outcome).toBe('unknown');
+      expect(fx.pulls).toHaveLength(0);
+    } finally { fx.cleanup(); }
+  });
   it('obj_edit_time 前进 → 409 source_push_conflict + 状态 conflict；force+OVERWRITE_CLOUD 越过', async () => {
     const fx = makeFixture({
       larkOverrides: {
@@ -1003,6 +1040,14 @@ describe('LocalMapStore — S12 状态原语与启动对账', () => {
         lastErrorCode: 'push_interrupted',
       });
       expect(fx.store.markInterruptedSourceEditPushes()).toBe(0);
+      const preview = await fx.service.preview(fx.objToken);
+      expect(preview.unknownPushUpdatedAt).toBeTruthy();
+      const pushError = await expectPushError(fx.service.push(fx.objToken, { confirm: 'PUSH' }));
+      expect(pushError.code).toBe('source_push_unknown_unconfirmed');
+      await expect(fx.editService.revert(fx.objToken, 'ui')).rejects.toMatchObject({ code: 'source_push_unknown_unconfirmed' });
+      expect(fx.store.getSourceEdit(fx.objToken)?.lastErrorCode).toBe('push_interrupted');
+      await fx.editService.revert(fx.objToken, 'ui', preview.unknownPushUpdatedAt!);
+      expect(fx.store.getSourceEdit(fx.objToken)).toBeNull();
     } finally {
       fx.cleanup();
     }
@@ -1191,6 +1236,16 @@ describe('P0-S3：写前锚点 — push 时序与 source_push_log 四态迁移',
       const logs = timeoutFx.store.listSourcePushLogs(timeoutFx.objToken);
       expect(logs).toHaveLength(1);
       expect(logs[0].outcome).toBe('unknown');
+      const preview = await timeoutFx.service.preview(timeoutFx.objToken);
+      expect(preview.unknownPushUpdatedAt).toBeTruthy();
+      const rejected = await expectPushError(timeoutFx.service.push(timeoutFx.objToken, { confirm: 'PUSH' }));
+      expect(rejected.code).toBe('source_push_unknown_unconfirmed');
+      const stale = await expectPushError(timeoutFx.service.push(timeoutFx.objToken, { confirm: 'PUSH', acknowledgedUnknownUpdatedAt: 'stale' }));
+      expect(stale.code).toBe('source_push_unknown_unconfirmed');
+      expect(timeoutFx.store.listSourcePushLogs(timeoutFx.objToken)).toHaveLength(1);
+      const accepted = await expectPushError(timeoutFx.service.push(timeoutFx.objToken, { confirm: 'PUSH', acknowledgedUnknownUpdatedAt: preview.unknownPushUpdatedAt! }));
+      expect(accepted.details).toMatchObject({ lastErrorCode: 'push_outcome_unknown' });
+      expect(timeoutFx.store.listSourcePushLogs(timeoutFx.objToken)).toHaveLength(2);
     } finally {
       timeoutFx.cleanup();
     }

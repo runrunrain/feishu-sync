@@ -205,7 +205,7 @@ export interface DocumentHistoryPage {
 
 /** docs +history-revert 结果（同步 done / 异步 running 两形态）。 */
 export interface DocumentHistoryRevertResult {
-  status: 'done' | 'running';
+  status: 'done' | 'running' | 'failed' | 'partial_failed';
   /** done 形态仍返回 task_id（P0-S1 HP-2 实测）。 */
   taskId: string | null;
   /** 轮询建议间隔（running 形态实测 10000；done 为 0）。 */
@@ -217,7 +217,7 @@ export interface DocumentHistoryRevertResult {
 /** docs +history-revert-status 轮询结果。 */
 export interface DocumentHistoryRevertStatus {
   /** 未知取值归一为 running，由调用方按上限轮询（§3 双读容错原则）。 */
-  status: 'done' | 'running' | 'failed';
+  status: 'done' | 'running' | 'failed' | 'partial_failed';
   /** 非空 = 部分块回滚失败，服务层必须读取并上抛警告（P0-S1 HP-2）。 */
   failedBlockTokens: string[] | null;
 }
@@ -2098,7 +2098,8 @@ export class LarkCliClient {
       );
     }
     const taskId = typeof data?.task_id === 'string' && data.task_id !== '' ? data.task_id : null;
-    if (rawStatus !== 'done' && taskId == null) {
+    const terminal = rawStatus === 'done' || rawStatus === 'failed' || rawStatus === 'partial_failed';
+    if (!terminal && taskId == null) {
       throw new LarkCliError(
         'docs +history-revert 异步响应缺少 task_id，回滚任务无法轮询收敛，结果未知（命令已发出，请勿重发）',
         'incomplete_response',
@@ -2106,7 +2107,7 @@ export class LarkCliClient {
       );
     }
     return {
-      status: rawStatus === 'done' ? 'done' : 'running',
+      status: terminal ? rawStatus as 'done' | 'failed' | 'partial_failed' : 'running',
       taskId,
       pollAfterMs: typeof data?.poll_after_ms === 'number' && Number.isFinite(data.poll_after_ms)
         ? data.poll_after_ms : null,
@@ -2141,7 +2142,7 @@ export class LarkCliClient {
     const data = result?.data ?? result;
     const rawStatus = typeof data?.status === 'string' ? data.status
       : typeof data?.task_status === 'string' ? data.task_status : '';
-    const status: DocumentHistoryRevertStatus['status'] = rawStatus === 'done' ? 'done'
+    const status: DocumentHistoryRevertStatus['status'] = rawStatus === 'partial_failed' ? 'partial_failed' : rawStatus === 'done' ? 'done'
       : rawStatus === 'failed' || rawStatus === 'error' ? 'failed'
         : 'running';
     return {
@@ -2261,11 +2262,9 @@ export class LarkCliClient {
    * 个人空间根。异步任务形态：state 双读（done 完成态 / 其余含未知取值
    * 归一 running，交调用方轮询）；任务号双读 task_id/taskId。
    *
-   * 【待 S5 实测校正】真实输出字段名（state/status、task_id 形态、是否有
-   * poll_after_ms / next_command 续查建议）尚未实测；本方法按通用异步
-   * 模式（P0-S1 history-revert 同款双读）实现，S5 实测后按真实 help/
-   * 输出样本校正。非幂等：调用方绝不重试；子进程超时/不可解析 → 抛
-   * LarkCliError，服务层置 unknown。
+   * CLI 1.0.98 自带协议文档规定 status=0 成功、1 进行中、负数失败，
+   * 最多轮询约 60 秒；客户端保留 80 秒预算以接收完整 task_id。
+   * 非幂等：调用方绝不重试；子进程超时/不可解析 → 服务层置 unknown。
    */
   async moveWikiNodeToDrive(
     nodeToken: string,
@@ -2283,12 +2282,13 @@ export class LarkCliClient {
       '--node-token', nodeToken,
       ...(folderToken ? ['--folder-token', folderToken] : []),
       '--format', 'json',
-    ], 'wiki');
+    ], 'wiki', { timeoutMs: 80_000 });
     const data = result?.data ?? result;
-    // 双读容错（通用异步模式）：state/status 键、task_id/taskId 键同读。
+    // CLI 1.0.98 wiki_move_to_drive：数值状态 0 成功、1 进行中、-1 失败。
     const rawState = typeof data?.state === 'string' ? data.state
       : typeof data?.status === 'string' ? data.status
         : typeof data?.task_status === 'string' ? data.task_status : '';
+    const numericStatus = typeof data?.status === 'number' ? data.status : null;
     const taskId = typeof data?.task_id === 'string' && data.task_id !== '' ? data.task_id
       : typeof data?.taskId === 'string' && data.taskId !== '' ? data.taskId : null;
     const pollAfterMs = typeof data?.poll_after_ms === 'number' && Number.isFinite(data.poll_after_ms)
@@ -2296,14 +2296,19 @@ export class LarkCliClient {
     // T4b-06：非幂等写已发出，响应形态不完整 = 结果未知（不是明确失败）：
     // 缺 state 键、或异步形态缺 task_id（无法轮询收敛）都归
     // incomplete_response（不可重试），由服务层置 unknown；绝不重发。
-    if (rawState === '') {
+    if ((numericStatus != null && numericStatus < 0) || data?.failed === true) {
+      throw new LarkCliError(`飞书移出任务失败：${String(data?.status_msg ?? 'move failed')}`, 'upstream', false);
+    }
+    const done = numericStatus === 0 || (numericStatus == null && rawState === 'done');
+    const running = numericStatus === 1 || (numericStatus == null && rawState !== '' && !done);
+    if (!done && !running) {
       throw new LarkCliError(
         'wiki +move-to-drive 响应缺少 state/status 字段，移出结果未知（命令已发出，请勿重发）',
         'incomplete_response',
         false,
       );
     }
-    if (rawState !== 'done' && taskId == null) {
+    if (running && taskId == null) {
       throw new LarkCliError(
         'wiki +move-to-drive 异步响应缺少 task_id，移出任务无法轮询收敛，结果未知（命令已发出，请勿重发）',
         'incomplete_response',
@@ -2311,7 +2316,7 @@ export class LarkCliClient {
       );
     }
     return {
-      state: rawState === 'done' ? 'done' : 'running',
+      state: done ? 'done' : 'running',
       taskId,
       pollAfterMs,
       raw: result,
@@ -2323,8 +2328,7 @@ export class LarkCliClient {
    * wiki move-to-drive 任务类型；设计 §3.2 配套轮询口）。只读；失败由
    * 调用方按节奏续查（不判终态）。
    *
-   * 【待 S5 实测校正】参数名（--task-id）与输出字段（state/status/message
-   * 形态、失败描述键）以 S5 实测为准。
+   * CLI 1.0.98 要求 --scenario wiki_move_to_drive，状态为数值。
    */
   async getDriveTaskResult(taskId: string): Promise<DriveTaskResult> {
     if (typeof taskId !== 'string' || taskId.trim().length === 0) {
@@ -2334,6 +2338,7 @@ export class LarkCliClient {
     }
     const result = await this.execute([
       'drive', '+task_result',
+      '--scenario', 'wiki_move_to_drive',
       '--task-id', taskId,
       '--format', 'json',
     ], 'drive');
@@ -2341,13 +2346,16 @@ export class LarkCliClient {
     const rawState = typeof data?.state === 'string' ? data.state
       : typeof data?.status === 'string' ? data.status
         : typeof data?.task_status === 'string' ? data.task_status : '';
-    const state: DriveTaskResult['state'] = rawState === 'done' || rawState === 'success'
-      ? 'done'
-      : rawState === 'failed' || rawState === 'error' ? 'failed'
-        : 'running';
+    const numericStatus = typeof data?.status === 'number' ? data.status : null;
+    const state: DriveTaskResult['state'] = numericStatus === 0 ? 'done'
+      : numericStatus != null && numericStatus < 0 ? 'failed'
+        : numericStatus != null ? 'running'
+          : rawState === 'done' || rawState === 'success' ? 'done'
+            : rawState === 'failed' || rawState === 'error' ? 'failed' : 'running';
     return {
       state,
-      message: typeof data?.message === 'string' ? data.message
+      message: typeof data?.status_msg === 'string' ? data.status_msg
+        : typeof data?.message === 'string' ? data.message
         : typeof data?.error === 'string' ? data.error : null,
       raw: result,
     };

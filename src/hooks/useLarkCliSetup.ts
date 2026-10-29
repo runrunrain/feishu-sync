@@ -297,7 +297,8 @@ export function useLarkCliSetup(
     try {
       // 超时/请求断开后先结束旧服务端流程，不留下阻止换号的挂起会话。
       if (authSessionRef.current) await cancelDeviceAuthRemote(authSessionRef.current.deviceCode);
-      const result = await startDeviceAuth(mode);
+      // 将已开启功能的可选权限加入授权，并让服务端保留当前读写权限档位。
+      const result = await startDeviceAuth(mode, { includeOptionalScopes: true });
       if (authGenerationRef.current !== generation) {
         await cancelDeviceAuthRemote(result.deviceCode);
         return;

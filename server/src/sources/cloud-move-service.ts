@@ -177,6 +177,7 @@ export class CloudMoveService {
   private readonly now: () => number;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private readonly tracked = new Map<string, TrackedMove>();
+  private polling = false;
 
   constructor(private readonly deps: CloudMoveServiceDeps) {
     this.pollerTickMs = deps.poller?.tickMs ?? 5_000;
@@ -249,7 +250,7 @@ export class CloudMoveService {
       case 'cloud_revert_running':
         return new CloudMoveError(
           'cloud_revert_running',
-          '该文档有进行中的云端回滚，请等待完成（或状态收敛为 unknown）后再移出',
+          '该文档的云端回滚进行中或结果未知，请在写回记录中核对任务状态后再移出',
           409,
         );
       case 'cloud_move_running':
@@ -286,11 +287,13 @@ export class CloudMoveService {
   }
 
   /** 实时取节点信息（§3.4 步骤 2）：has_child → blocked；取不到 → not_found。 */
-  private async fetchNodeState(nodeToken: string): Promise<{ hasChildren: boolean } | null> {
+  private async fetchNodeState(nodeToken: string, objToken: string): Promise<{ hasChildren: boolean } | null> {
     try {
       const node = await this.deps.larkCliClient.getNode(nodeToken);
       if (!node || typeof node !== 'object') return null;
-      return { hasChildren: node.has_child === true };
+      // 不完整或身份不一致的响应不能证明目标是该文档的叶节点。
+      if (node.obj_token !== objToken || typeof node.has_child !== 'boolean') return null;
+      return { hasChildren: node.has_child };
     } catch (error) {
       // 节点不存在/无权限：getNode 抛 LarkCliError——移出面统一按
       // not_found 处理（原始错误进日志，不吞）。
@@ -320,7 +323,7 @@ export class CloudMoveService {
     const identity = this.requireIdentity(objToken);
     const local = this.evaluateLocalGates(objToken);
     if (local != null) return { blockedReason: local, identity, hasChildren: null };
-    const node = await this.fetchNodeState(identity.nodeToken);
+    const node = await this.fetchNodeState(identity.nodeToken, objToken);
     if (node == null) return { blockedReason: 'node_not_found', identity, hasChildren: null };
     if (node.hasChildren) return { blockedReason: 'has_children', identity, hasChildren: true };
     return { blockedReason: null, identity, hasChildren: false };
@@ -402,6 +405,11 @@ export class CloudMoveService {
     // §3.4 步骤 1 复核：批准与执行之间状态可能变化，锁内读 DB 权威。
     const gates = await this.evaluateGates(objToken);
     if (gates.blockedReason) throw this.blockedError(gates.blockedReason);
+    const latest = this.requireIdentity(objToken);
+    if (gates.identity?.nodeToken !== identity.nodeToken || gates.identity.watchedRootId !== identity.watchedRootId
+      || latest.nodeToken !== identity.nodeToken || latest.watchedRootId !== identity.watchedRootId) {
+      throw new CloudMoveError('source_identity_changed', '文档节点或所属同步根已变化，请刷新预览后重新确认', 409);
+    }
     // 步骤 3：INSERT pending 行 + 审计 started。
     const moveId: string = this.deps.store.insertCloudMove({
       objToken,
@@ -548,19 +556,15 @@ export class CloudMoveService {
 
   /**
    * unknown 移出行的权威核对（只读查询 + 记录收敛；不发起任何写云端
-   * 动作）：只有真实查询任务状态或节点归属证明未移出（→ failed 释放
-   * 围栏）才解除；证明已移出（→ moved，转 source_moved_out 语义）；
-   * 无法证明 → 保持 unknown 围栏不变。
+   * 动作）：真实查询任务终态，或由用户确认任务结束与最终去向，才收敛。
    *
    *  - 有 task_id：drive +task_result 轮询——done → moved；failed →
    *    failed（释放）；running/查询失败 → 保持 unknown（reason 返回）。
-   *  - 无 task_id：wiki +node-get 查节点归属——节点仍在且 obj_token 一致
-   *    → 未移出（failed + reconciled_node_still_in_wiki，释放）；查询
-   *    失败/节点不在（无法区分已移出与已删除）→ 保持 unknown（reason）。
+   *  - 无法查询任务时：要求明确人工确认；确认未移出还需验证节点身份。
    *
    * 状态写走 criticalUpdate：失败时行保持 unknown 围栏（fail-closed）。
    */
-  async reconcileUnknownMove(moveId: string): Promise<{
+  async reconcileUnknownMove(moveId: string, manualConfirm?: unknown): Promise<{
     moveId: string;
     objToken: string;
     /** 落盘后的最新状态；仍为 'unknown' = 无法证明，围栏保持。 */
@@ -568,6 +572,14 @@ export class CloudMoveService {
     taskId: string | null;
     /** 保持 unknown 时的原因（task_still_running / node_lookup_inconclusive…）。 */
     reason: string | null;
+  }> {
+    const initial = this.deps.store.getCloudMove?.(moveId) ?? null;
+    if (!initial) throw new CloudMoveError('cloud_move_not_found', `移出记录不存在：${moveId}`, 404);
+    return this.locks.withLock(initial.objToken, () => this.reconcileUnknownMoveLocked(moveId, manualConfirm));
+  }
+
+  private async reconcileUnknownMoveLocked(moveId: string, manualConfirm?: unknown): Promise<{
+    moveId: string; objToken: string; state: 'moved' | 'failed' | 'unknown'; taskId: string | null; reason: string | null;
   }> {
     const row = this.deps.store.getCloudMove?.(moveId) ?? null;
     if (!row) {
@@ -581,7 +593,7 @@ export class CloudMoveService {
       );
     }
     if (row.taskId) {
-      let status: { state: 'done' | 'running' | 'failed'; message?: string | null };
+      let status: { state: 'done' | 'running' | 'failed'; message?: string | null } | null;
       try {
         status = await this.deps.larkCliClient.getDriveTaskResult(row.taskId);
       } catch (error) {
@@ -590,51 +602,56 @@ export class CloudMoveService {
           objToken: row.objToken, moveId, taskId: row.taskId,
           result: 'task_result_unreadable', error: String(error).slice(0, 300),
         });
-        return { moveId, objToken: row.objToken, state: 'unknown', taskId: row.taskId, reason: 'task_result_unreadable' };
+        status = null;
       }
-      if (status.state === 'running') {
+      if (status?.state === 'running') {
         this.appendAudit('move_to_drive_reconcile', {
           objToken: row.objToken, moveId, taskId: row.taskId, result: 'task_still_running',
         });
         return { moveId, objToken: row.objToken, state: 'unknown', taskId: row.taskId, reason: 'task_still_running' };
       }
-      const next: 'moved' | 'failed' = status.state === 'done' ? 'moved' : 'failed';
-      const persisted = this.criticalUpdate(moveId, (store) => store.updateCloudMove(moveId, {
-        state: next,
-        ...(next === 'failed' && status.message ? { error: String(status.message).slice(0, 500) } : {}),
-      }));
-      this.appendAudit('move_to_drive_reconcile', {
-        objToken: row.objToken, moveId, taskId: row.taskId,
-        result: persisted ? next : `${next}_persist_failed`,
-      });
-      if (next === 'moved' && persisted) {
-        // 与 finalizeMoved 同收尾语义：锁外触发一次变更检测（best-effort）。
-        void Promise.resolve(this.triggerDetect({
-          state: 'moved', moveId, taskId: row.taskId, nodeToken: row.wikiNodeToken ?? '',
-          watchedRootId: row.watchedRootId ?? null,
-        })).catch(() => undefined);
+      if (status) {
+        const next: 'moved' | 'failed' = status.state === 'done' ? 'moved' : 'failed';
+        const detail = next === 'failed' ? String(status.message ?? 'move_failed_upstream').slice(0, 500) : null;
+        const persisted = this.criticalUpdate(moveId, (store) => store.resolveUnknownCloudMove(moveId, next, detail));
+        this.appendAudit('move_to_drive_reconcile', {
+          objToken: row.objToken, moveId, taskId: row.taskId,
+          result: persisted ? next : `${next}_persist_failed`,
+        });
+        if (next === 'moved' && persisted) {
+          void Promise.resolve(this.triggerDetect({
+            state: 'moved', moveId, taskId: row.taskId, nodeToken: row.wikiNodeToken ?? '',
+            watchedRootId: row.watchedRootId ?? null,
+          })).catch(() => undefined);
+        }
+        return {
+          moveId, objToken: row.objToken, state: persisted ? next : 'unknown', taskId: row.taskId,
+          reason: persisted ? null : 'state_persist_failed',
+        };
       }
-      const latest = persisted ? next : 'unknown';
-      return {
-        moveId, objToken: row.objToken, state: latest, taskId: row.taskId,
-        reason: persisted ? null : 'state_persist_failed',
-      };
     }
-    // 无 task_id：查节点归属（wiki +node-get）。
+    // 节点仍在并不证明异步任务已停止；无可读终态时必须人工确认。
+    if (manualConfirm !== `MOVE_SETTLED_NOT_MOVED:${moveId}` && manualConfirm !== `MOVE_SETTLED_MOVED:${moveId}`) {
+      return { moveId, objToken: row.objToken, state: 'unknown', taskId: row.taskId ?? null, reason: row.taskId ? 'task_result_unreadable' : 'task_id_missing' };
+    }
+    if (manualConfirm === `MOVE_SETTLED_MOVED:${moveId}`) {
+      const persisted = this.criticalUpdate(moveId, (store) => store.resolveUnknownCloudMove(moveId, 'moved', 'manual_confirmed_moved'));
+      this.appendAudit('move_to_drive_reconcile', { objToken: row.objToken, moveId, result: persisted ? 'manual_moved' : 'state_persist_failed' });
+      if (persisted) void Promise.resolve(this.triggerDetect({ state: 'moved', moveId, taskId: row.taskId ?? null, nodeToken: row.wikiNodeToken ?? '', watchedRootId: row.watchedRootId ?? null })).catch(() => undefined);
+      return { moveId, objToken: row.objToken, state: persisted ? 'moved' : 'unknown', taskId: row.taskId ?? null, reason: persisted ? null : 'state_persist_failed' };
+    }
+    // 人工确认任务已结束且未移出后，再检查节点身份；无法查明则继续保护。
     try {
       const node = await this.deps.larkCliClient.getNode(row.wikiNodeToken);
       if (node && typeof node === 'object' && node.obj_token === row.objToken) {
-        // 节点仍在知识库且指向同一文档 → 未移出（权威证明，释放围栏）。
-        const persisted = this.criticalUpdate(moveId, (store) => store.updateCloudMove(moveId, {
-          state: 'failed',
-          error: 'reconciled_node_still_in_wiki',
-        }));
+        // 用户已确认任务停止，且节点仍指向同一文档。
+        const persisted = this.criticalUpdate(moveId, (store) => store.resolveUnknownCloudMove(moveId, 'failed', 'manual_confirmed_not_moved'));
         this.appendAudit('move_to_drive_reconcile', {
           objToken: row.objToken, moveId, result: persisted ? 'failed' : 'failed_persist_failed',
-          detail: 'reconciled_node_still_in_wiki',
+          detail: 'manual_confirmed_not_moved',
         });
         return {
-          moveId, objToken: row.objToken, state: persisted ? 'failed' : 'unknown', taskId: null,
+          moveId, objToken: row.objToken, state: persisted ? 'failed' : 'unknown', taskId: row.taskId ?? null,
           reason: persisted ? null : 'state_persist_failed',
         };
       }
@@ -642,7 +659,7 @@ export class CloudMoveService {
       this.appendAudit('move_to_drive_reconcile', {
         objToken: row.objToken, moveId, result: 'node_lookup_inconclusive', detail: 'obj_token_mismatch',
       });
-      return { moveId, objToken: row.objToken, state: 'unknown', taskId: null, reason: 'node_lookup_inconclusive' };
+      return { moveId, objToken: row.objToken, state: 'unknown', taskId: row.taskId ?? null, reason: 'node_lookup_inconclusive' };
     } catch (error) {
       // 节点查不到（可能已移出/已删除，无法区分）或查询失败：不能证明
       // 未移出——围栏保持，交用户到飞书人工核对。
@@ -650,7 +667,7 @@ export class CloudMoveService {
         objToken: row.objToken, moveId, result: 'node_lookup_inconclusive',
         error: String(error).slice(0, 300),
       });
-      return { moveId, objToken: row.objToken, state: 'unknown', taskId: null, reason: 'node_lookup_inconclusive' };
+      return { moveId, objToken: row.objToken, state: 'unknown', taskId: row.taskId ?? null, reason: 'node_lookup_inconclusive' };
     }
   }
 
@@ -744,11 +761,15 @@ export class CloudMoveService {
 
   /** 单轮扫描（定时器入口；测试直调）。只处理到期行（poll_after_ms 节奏）。 */
   async pollOnce(): Promise<void> {
-    const now = this.now();
-    for (const row of [...this.tracked.values()]) {
-      if (row.nextPollAt > now) continue;
-      await this.pollRow(row, now);
-    }
+    if (this.polling) return;
+    this.polling = true;
+    try {
+      const now = this.now();
+      for (const row of [...this.tracked.values()]) {
+        if (row.nextPollAt > now) continue;
+        await this.pollRow(row, now);
+      }
+    } finally { this.polling = false; }
   }
 
   private async pollRow(row: TrackedMove, now: number): Promise<void> {

@@ -37,6 +37,14 @@ function sha256(text: string): string {
 }
 
 describe('renderForPublish · 头部与标题', () => {
+  it('代码块内的 H1 保持原样，标题取代码块外的首个 H1', () => {
+    const code = '````md\n```\n# 示例代码\n````\n';
+    const result = render(code + '# 实际标题\n正文');
+    expect(result.title).toBe('实际标题');
+    expect(result.body).toBe(code + '正文');
+    expect(render(code).title).toBe('intro');
+    expect(render(code).body).toBe(code);
+  });
   it('去头部注释；标题取首个 H1；与标题相同的首个 H1 从正文移除', () => {
     const r = render(KB_HEADER + '# 标题甲\n\n正文段落。\n');
     expect(r.title).toBe('标题甲');

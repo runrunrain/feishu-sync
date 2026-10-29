@@ -313,6 +313,29 @@ describe('POST /api/sources/references-rebuild（P1-S3 路由面）', () => {
 });
 
 describe('sources.references-rebuild（P1-S3，设计 §2.2 存量段）', () => {
+  it('拒绝指向知识库外的符号链接，并保留旧引用', () => {
+    const harness = makeHarness();
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'ref-outside-'));
+    try {
+      fs.writeFileSync(path.join(outside, 'other.md'), `[外部](https://x.feishu.cn/docx/${TGT_BODY_1})`);
+      fs.symlinkSync(outside, path.join(harness.kbRoot, 'link'), 'dir');
+      harness.store.upsertDocument({
+        objToken: SRC, objType: 'docx', title: '链接', status: 'synced',
+        localMdPath: path.join(harness.kbRoot, 'link', 'other.md'),
+        localRelPath: 'link/other.md', lastSyncedAt: '2026-10-28T00:00:00.000Z',
+        lastSyncedModifyTime: '2026-10-28T00:00:00.000Z',
+      } as any);
+      const prior = extractDocumentReferences({ markdown: `[旧引用](https://x.feishu.cn/docx/${TGT_BODY_2})` }).edges;
+      harness.store.replaceSourceReferences(SRC, prior);
+      const result = rebuildSourceReferences(harness.store, harness.kbRoot);
+      expect(result.rebuilt).toBe(0);
+      expect(result.skipped).toContainEqual({ objToken: SRC, title: '链接', reason: 'outside_root' });
+      expect(harness.store.listSourceReferencesBySrc(SRC).map((edge) => edge.targetToken)).toEqual([TGT_BODY_2]);
+    } finally {
+      harness.store.close();
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
   it('本地 md 纯重算等价：body 边 == 直接抽取；refmap 边按设计清除；脏文档跳过', async () => {
     const harness = makeHarness();
     await makeEngine(harness, new DocxRefMockClient(CONTENT_V1, REFMAP_V1))

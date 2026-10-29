@@ -10,8 +10,7 @@
  *   }
  *
  * - 无可提取数据（无评论）时 `reference_map` 键**整体缺失**（RP-3）——
- *   调用方以「referenceMap !== undefined」区分「本次 fetch 携带了评论组」
- *   与「从未采集」（后者不写 meta，设计 §5.1）。
+ *   调用方区分成功执行 docs +fetch（缺键视为零评论）与未采集的文档类型。
  * - `comments.tips` 存在即截断（probe §1：`comments.tips.data` 表示截断）；
  *   tips 不是评论条目。
  * - 条目字段按容错双读解析（MD-3 只实测到 msg 文本与 user 作者；quote/
@@ -200,11 +199,11 @@ function decodeEntities(raw: string): string {
     .replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, (match, body: string) => {
       if (body.startsWith('#x') || body.startsWith('#X')) {
         const code = Number.parseInt(body.slice(2), 16);
-        return Number.isFinite(code) && code > 0 ? String.fromCodePoint(code) : match;
+        return Number.isInteger(code) && code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : match;
       }
       if (body.startsWith('#')) {
         const code = Number.parseInt(body.slice(1), 10);
-        return Number.isFinite(code) && code > 0 ? String.fromCodePoint(code) : match;
+        return Number.isInteger(code) && code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : match;
       }
       switch (body) {
         case 'amp': return '&';

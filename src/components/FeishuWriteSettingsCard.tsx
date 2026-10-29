@@ -92,7 +92,7 @@ export function FeishuWriteSettingsCard() {
     setSession(null);
     setAuthError(null);
     try {
-      const result = await startDeviceAuth('reauthorize', { scopeSet: 'write' });
+      const result = await startDeviceAuth('reauthorize', { scopeSet: 'write', includeOptionalScopes: true });
       if (!result.deviceCode || !result.verificationUrl) throw new Error('授权会话创建失败');
       setSession(result);
       setPhase('waiting');

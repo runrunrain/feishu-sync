@@ -20,7 +20,7 @@
  *    + CLI /api/cli/:command 确认门（422；「CLI 无 --yes 拒」的服务端面）。
  */
 
-import { describe, expect, it, afterEach } from 'vitest';
+import { describe, expect, it, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -200,6 +200,23 @@ async function startMoving(fx: Fixture): Promise<string> {
 // ===========================================================================
 
 describe('CLI 方法 moveWikiNodeToDrive / getDriveTaskResult', () => {
+  it('按 CLI 1.0.98 数值协议处理成功、处理中与失败，并给予内置轮询足够时间', async () => {
+    const client = new LarkCliClient();
+    const execute = vi.fn(async () => ({ data: { status: 0, ready: true, failed: false, task_id: 'full-task-id' } }));
+    (client as any).execute = execute;
+    expect(await client.moveWikiNodeToDrive(NODE)).toMatchObject({ state: 'done', taskId: 'full-task-id' });
+    expect(execute.mock.calls[0][2]).toEqual({ timeoutMs: 80_000 });
+    execute.mockResolvedValueOnce({ data: { status: 1, ready: false, failed: false, task_id: 'full-task-id' } });
+    expect(await client.moveWikiNodeToDrive(NODE)).toMatchObject({ state: 'running', taskId: 'full-task-id' });
+    execute.mockResolvedValueOnce({ data: { status: -1, ready: false, failed: true, task_id: 'full-task-id', status_msg: 'denied' } } as never);
+    await expect(client.moveWikiNodeToDrive(NODE)).rejects.toMatchObject({ code: 'upstream' });
+    execute.mockResolvedValueOnce({ data: { status: 0, ready: true, failed: false, task_id: 'full-task-id' } });
+    expect(await client.getDriveTaskResult('full-task-id')).toMatchObject({ state: 'done' });
+    execute.mockResolvedValueOnce({ data: { status: -1, ready: false, failed: true, task_id: 'full-task-id', status_msg: 'denied' } } as never);
+    expect(await client.getDriveTaskResult('full-task-id')).toMatchObject({ state: 'failed', message: 'denied' });
+    execute.mockResolvedValueOnce({ data: { status: 1, ready: false, failed: false, task_id: 'full-task-id' } });
+    expect(await client.getDriveTaskResult('full-task-id')).toMatchObject({ state: 'running' });
+  });
   function stubbedClient(): { client: LarkCliClient; calls: Array<{ args: string[]; apiType: string }> } {
     const client = new LarkCliClient();
     const calls: Array<{ args: string[]; apiType: string }> = [];
@@ -243,7 +260,7 @@ describe('CLI 方法 moveWikiNodeToDrive / getDriveTaskResult', () => {
     });
   });
 
-  it('getDriveTaskResult：drive +task_result --task-id（参数名待 S5 校正）；三态归一', async () => {
+  it('getDriveTaskResult：明确指定 wiki_move_to_drive 场景；三态归一', async () => {
     const client = new LarkCliClient();
     const calls: Array<{ args: string[]; apiType: string }> = [];
     (client as any).execute = async (args: string[], apiType: string) => {
@@ -253,7 +270,7 @@ describe('CLI 方法 moveWikiNodeToDrive / getDriveTaskResult', () => {
     const ok = await client.getDriveTaskResult(TASK);
     expect(ok.state).toBe('done'); // success 归一 done（待 S5 校正）
     expect(calls[0]).toEqual({
-      args: ['drive', '+task_result', '--task-id', TASK, '--format', 'json'],
+      args: ['drive', '+task_result', '--scenario', 'wiki_move_to_drive', '--task-id', TASK, '--format', 'json'],
       apiType: 'drive',
     });
     (client as any).execute = async () => ({ data: { status: 'failed', error: 'boom' } });
@@ -412,6 +429,40 @@ describe('门控分支', () => {
     const err = await expectMoveError(fx.service.moveToDrive(OBJ, { confirmValue: deriveMoveOutConfirmValue(NODE) }));
     expect(err.code).toBe('node_not_found');
   });
+
+  it('确认后节点身份发生变化时拒绝移出旧节点', async () => {
+    const fx = fixture();
+    const originalGetNode = fx.lark.getNode;
+    let calls = 0;
+    fx.lark.getNode = async (token: string) => {
+      const node = await originalGetNode(token);
+      if (++calls === 1) {
+        const doc = fx.store.getDocumentByObjToken(OBJ)!;
+        fx.store.upsertDocument({ ...doc, wikiNodeToken: 'replacementNode000001' });
+      }
+      return node;
+    };
+    const err = await expectMoveError(fx.service.moveToDrive(OBJ, { confirmValue: deriveMoveOutConfirmValue(NODE) }));
+    expect(err).toMatchObject({ code: 'source_identity_changed', status: 409 });
+    expect(fx.lark.calls.filter((call) => call.op === 'move')).toEqual([]);
+    expect(fx.store.listCloudMoves()).toEqual([]);
+  });
+
+  it('云端节点指向其他文档时不允许移出', async () => {
+    const fx = fixture();
+    fx.lark.getNode = async () => ({ obj_token: 'differentDocument', has_child: false });
+    const err = await expectMoveError(fx.service.moveToDrive(OBJ, { confirmValue: deriveMoveOutConfirmValue(NODE) }));
+    expect(err.code).toBe('node_not_found');
+    expect(fx.lark.calls.filter((call) => call.op === 'move')).toEqual([]);
+  });
+
+  it('云端未返回子节点状态时拒绝移出', async () => {
+    const fx = fixture();
+    fx.lark.getNode = async () => ({ obj_token: OBJ });
+    const err = await expectMoveError(fx.service.moveToDrive(OBJ, { confirmValue: deriveMoveOutConfirmValue(NODE) }));
+    expect(err.code).toBe('node_not_found');
+    expect(fx.lark.calls.filter((call) => call.op === 'move')).toEqual([]);
+  });
 });
 
 // ===========================================================================
@@ -419,6 +470,35 @@ describe('门控分支', () => {
 // ===========================================================================
 
 describe('状态机与轮询', () => {
+  it('真实客户端归一化的数值任务响应进入服务状态机并收敛', async () => {
+    const fx = fixture();
+    const client = new LarkCliClient();
+    (client as any).execute = async (args: string[]) => args[1] === '+move-to-drive'
+      ? { data: { status: 1, ready: false, failed: false, task_id: 'signed-full-task-id' } }
+      : { data: { status: 0, ready: true, failed: false, task_id: 'signed-full-task-id' } };
+    fx.lark.moveWikiNodeToDrive = client.moveWikiNodeToDrive.bind(client);
+    fx.lark.getDriveTaskResult = client.getDriveTaskResult.bind(client);
+    const result = await fx.service.moveToDrive(OBJ, { confirmValue: deriveMoveOutConfirmValue(NODE) });
+    expect(result).toMatchObject({ state: 'moving', taskId: 'signed-full-task-id' });
+    fx.clock.value += 5_000;
+    await fx.service.pollOnce();
+    expect(fx.store.getCloudMove(result.moveId)).toMatchObject({ state: 'moved', taskId: 'signed-full-task-id' });
+  });
+  it('前一轮任务查询尚未完成时不会发起重叠轮询', async () => {
+    const fx = fixture();
+    let release!: (value: { state: 'done'; message: null }) => void;
+    const pending = new Promise<{ state: 'done'; message: null }>((resolve) => { release = resolve; });
+    let calls = 0;
+    fx.lark.getDriveTaskResult = async () => { calls++; return pending; };
+    const id = await startMoving(fx);
+    fx.clock.value += 10_000;
+    const first = fx.service.pollOnce();
+    await fx.service.pollOnce();
+    expect(calls).toBe(1);
+    release({ state: 'done', message: null });
+    await first;
+    expect(fx.store.getCloudMove(id)?.state).toBe('moved');
+  });
   it('同步 done → moved + 审计 + 触发一次检测；本地 documents 行与文件字节不动（§3.5）', async () => {
     const fx = fixture({ moveResult: { state: 'done', taskId: TASK } });
     const beforeDoc = { ...fx.store.getDocumentByObjToken(OBJ) };
@@ -933,6 +1013,7 @@ describe('T4b-05 unknown 移出持续围栏 + 权威核对解除', () => {
     fxRunning.store.updateCloudMove(moveIdRunning, { state: 'unknown', error: 'poll_deadline_exceeded' });
     const kept = await fxRunning.service.reconcileUnknownMove(moveIdRunning);
     expect(kept).toMatchObject({ state: 'unknown', reason: 'task_still_running' });
+    expect(await fxRunning.service.reconcileUnknownMove(moveIdRunning, `MOVE_SETTLED_NOT_MOVED:${moveIdRunning}`)).toMatchObject({ state: 'unknown', reason: 'task_still_running' });
     expect(fxRunning.store.getCloudMove(moveIdRunning)?.state).toBe('unknown');
     expect(fxRunning.store.getActiveCloudMove(OBJ)?.state).toBe('unknown');
 
@@ -944,17 +1025,18 @@ describe('T4b-05 unknown 移出持续围栏 + 权威核对解除', () => {
     expect(unreadable).toMatchObject({ state: 'unknown', reason: 'task_result_unreadable' });
   });
 
-  it('权威核对（无 taskId）：节点仍在知识库且指向同一文档 → failed 释放；查不到 → 保持 unknown；非 unknown 行拒 409', async () => {
-    // 节点仍在 → 权威证明未移出 → 释放。
+  it('无 taskId 时必须人工确认任务已结束，并验证节点；非 unknown 行拒 409', async () => {
     const fxStill = fixture();
     const moveId = fxStill.store.insertCloudMove({
       objToken: OBJ, wikiNodeToken: NODE, watchedRootId: ROOT_ID, actor: 'ui',
     });
     fxStill.store.updateCloudMove(moveId, { state: 'unknown', error: 'pending_unresolved_after_restart' });
-    const reconciled = await fxStill.service.reconcileUnknownMove(moveId);
+    expect(await fxStill.service.reconcileUnknownMove(moveId)).toMatchObject({ state: 'unknown', reason: 'task_id_missing' });
+    expect(fxStill.store.getActiveCloudMove(OBJ)?.state).toBe('unknown');
+    const reconciled = await fxStill.service.reconcileUnknownMove(moveId, `MOVE_SETTLED_NOT_MOVED:${moveId}`);
     expect(reconciled).toMatchObject({ state: 'failed', reason: null });
     expect(fxStill.store.getCloudMove(moveId)).toMatchObject({
-      state: 'failed', error: 'reconciled_node_still_in_wiki',
+      state: 'failed', error: 'manual_confirmed_not_moved',
     });
     expect(fxStill.store.getActiveCloudMove(OBJ)).toBeNull(); // 围栏解除
     expect(fxStill.lark.calls.map((call) => call.op)).toEqual(['getNode']);
@@ -965,9 +1047,12 @@ describe('T4b-05 unknown 移出持续围栏 + 权威核对解除', () => {
       objToken: OBJ, wikiNodeToken: NODE, watchedRootId: ROOT_ID, actor: 'ui',
     });
     fxMissing.store.updateCloudMove(moveIdMissing, { state: 'unknown', error: 'x' });
-    const kept = await fxMissing.service.reconcileUnknownMove(moveIdMissing);
+    const kept = await fxMissing.service.reconcileUnknownMove(moveIdMissing, `MOVE_SETTLED_NOT_MOVED:${moveIdMissing}`);
     expect(kept).toMatchObject({ state: 'unknown', reason: 'node_lookup_inconclusive' });
     expect(fxMissing.store.getActiveCloudMove(OBJ)?.state).toBe('unknown');
+    const moved = await fxMissing.service.reconcileUnknownMove(moveIdMissing, `MOVE_SETTLED_MOVED:${moveIdMissing}`);
+    expect(moved).toMatchObject({ state: 'moved', reason: null });
+    expect(fxMissing.store.getLatestCloudMove(OBJ)?.state).toBe('moved');
 
     // 非 unknown 行拒绝核对（409）；不存在 404。
     const fxDone = fixture({ moveResult: { state: 'done', taskId: TASK } });
@@ -978,6 +1063,16 @@ describe('T4b-05 unknown 移出持续围栏 + 权威核对解除', () => {
     await expect(fxDone.service.reconcileUnknownMove('mv_nonexistent')).rejects.toMatchObject({
       code: 'cloud_move_not_found', status: 404,
     });
+  });
+
+  it('并发核对只能有一次终态落盘', async () => {
+    const fx = fixture({ taskResult: { state: 'done' } });
+    const id = await startMoving(fx);
+    fx.store.updateCloudMove(id, { state: 'unknown' });
+    const results = await Promise.allSettled([fx.service.reconcileUnknownMove(id), fx.service.reconcileUnknownMove(id)]);
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
+    expect(fx.store.getCloudMove(id)?.state).toBe('moved');
   });
 
   it('路由 POST /api/sources/moves/:moveId/reconcile：解除 → 200；无法证明 → 202 保持 unknown', async () => {
@@ -994,6 +1089,18 @@ describe('T4b-05 unknown 移出持续围栏 + 权威核对解除', () => {
     const pending = await makeApp(fxRunning).request(`/api/sources/moves/${moveIdRunning}/reconcile`, { method: 'POST' });
     expect(pending.status).toBe(202);
     expect(await pending.json()).toMatchObject({ state: 'unknown', reason: 'task_still_running' });
+
+    const fxManual = fixture();
+    const manualId = fxManual.store.insertCloudMove({ objToken: OBJ, wikiNodeToken: NODE, watchedRootId: ROOT_ID, actor: 'ui' });
+    fxManual.store.updateCloudMove(manualId, { state: 'unknown' });
+    const app = makeApp(fxManual);
+    const first = await app.request(`/api/sources/moves/${manualId}/reconcile`, { method: 'POST' });
+    expect(first.status).toBe(202);
+    const confirmed = await app.request(`/api/sources/moves/${manualId}/reconcile`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ confirm: `MOVE_SETTLED_NOT_MOVED:${manualId}` }),
+    });
+    expect(confirmed.status).toBe(200);
+    expect(await confirmed.json()).toMatchObject({ state: 'failed' });
   });
 });
 

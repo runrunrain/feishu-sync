@@ -11,7 +11,7 @@
  * 门控未开（提示去向设置）——不渲染假数据。
  */
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   CloudUpload,
@@ -77,10 +77,12 @@ export function KbPublishModal({
   const [checked, setChecked] = useState<Set<string> | null>(null);
   const [force, setForce] = useState(false);
   const [plan, setPlan] = useState<KbPublishPlanDto | null>(null);
+  const [previewOptions, setPreviewOptions] = useState<{ kbPaths?: string[]; force?: boolean } | null>(null);
   const [previewing, setPreviewing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [confirmInput, setConfirmInput] = useState('');
   const [result, setResult] = useState<KbPublishRunResultDto | null>(null);
+  const generationRef = useRef(0);
 
   const docEntries = useMemo<DocEntry[]>(() => {
     const out: DocEntry[] = [];
@@ -116,15 +118,19 @@ export function KbPublishModal({
   // 打开弹窗即复位流程状态（选择集默认全选；force/确认值/结果清空）。
   useEffect(() => {
     if (!open) return;
+    generationRef.current += 1;
     setTab(initialTab);
     setStep('select');
     setScope('selected');
     setChecked(null);
     setForce(false);
     setPlan(null);
+    setPreviewOptions(null);
     setError(null);
     setConfirmInput('');
     setResult(null);
+    setPreviewing(false);
+    return () => { generationRef.current += 1; };
   }, [open, initialTab]);
 
   const planOptions = useMemo(() => ({
@@ -133,35 +139,42 @@ export function KbPublishModal({
   }), [scope, effectiveChecked, force]);
 
   const generatePreview = async () => {
+    const generation = ++generationRef.current;
     setPreviewing(true);
     setError(null);
     try {
       const dto = await previewKbPublish(planOptions);
+      if (generation !== generationRef.current) return;
       setPlan(dto);
+      setPreviewOptions(planOptions);
       setConfirmInput('');
       setStep('preview');
     } catch (err) {
+      if (generation !== generationRef.current) return;
       setError(err instanceof APIError ? err.message : '发布计划生成失败');
     } finally {
-      setPreviewing(false);
+      if (generation === generationRef.current) setPreviewing(false);
     }
   };
 
   const runPublish = async () => {
-    if (!plan || confirmInput !== plan.confirmRequired) return;
+    if (!plan || !previewOptions || confirmInput.trim() !== plan.confirmRequired) return;
+    const generation = generationRef.current;
     setStep('executing');
     setError(null);
     try {
-      const run = await executeKbPublish({ ...planOptions, confirm: confirmInput, planKey: plan.planKey });
+      const run = await executeKbPublish({ ...previewOptions, confirm: confirmInput.trim(), planKey: plan.planKey });
+      onPublicationsChanged();
+      if (generation !== generationRef.current) return;
       setResult(run);
       setStep('result');
-      onPublicationsChanged();
       const { created, updated, blocked, failed } = run.counts;
       toast.push({
         type: failed > 0 ? 'warning' : 'success',
         message: `发布完成：新建 ${created} · 更新 ${updated} · 阻断 ${blocked} · 失败 ${failed}`,
       });
     } catch (err) {
+      if (generation !== generationRef.current) { onPublicationsChanged(); return; }
       // 计划变化/确认值失效等：回到预览位让用户重新预览（保留错误文案）。
       setStep('preview');
       setError(err instanceof APIError ? err.message : '发布执行失败');

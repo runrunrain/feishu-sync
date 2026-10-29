@@ -124,6 +124,6 @@ describe('CloudMovesSection 移出记录列表', () => {
   it('unknown 行附「到飞书核对」引导', () => {
     const html = renderToStaticMarkup(<CloudMovesSection moves={[makeMove({ state: 'unknown' })]} />);
     expect(html).toContain('状态未知');
-    expect(html).toContain('到飞书知识库核对');
+    expect(html).toContain('核对云端任务是否结束');
   });
 });

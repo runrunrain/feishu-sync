@@ -112,6 +112,17 @@ describe('extractBodyReferences（正文双解析主体）', () => {
     expect(edges.map((e) => e.targetToken)).toEqual([ok]);
   });
 
+  it('代码围栏和行内代码只由足够长或等长的标记闭合', () => {
+    const hidden = mkToken('hidden');
+    const visible = mkToken('visible');
+    const md = [
+      '````', '```', `https://x.feishu.cn/docx/${hidden}`, '````',
+      `\`\`code \`\`\` https://x.feishu.cn/docx/${hidden} \`\``,
+      `[可见](https://x.feishu.cn/docx/${visible})`,
+    ].join('\n');
+    expect(extractBodyReferences(md).map((edge) => edge.targetToken)).toEqual([visible]);
+  });
+
   it('自引用排除：selfTokens 命中（obj_token 与 wiki_node_token 两种）丢弃', () => {
     const selfObj = mkToken('selfobj');
     const selfWiki = mkToken('selfwiki');

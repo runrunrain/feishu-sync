@@ -576,6 +576,7 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
               watchedRoots={watchedRoots}
               onSelectNode={setSelectedToken}
               cloudMoves={selectedNode ? movesByToken.get(selectedNode.obj_token) : undefined}
+              onCloudMovesChanged={() => { void loadCloudMoves(); void loadFeishu(); }}
               onSyncNode={() => {
                 toast.push({
                   type: 'info',

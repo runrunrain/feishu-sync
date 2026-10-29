@@ -34,55 +34,61 @@ export function CloudHistoryDrawer({ open, onClose, objToken, onRequestRevert }:
   /** 全局最新条目 id（仅第 1 页首行；续翻页的首行不是全局最新）。 */
   const [latestId, setLatestId] = useState<string | null>(null);
   const mountedRef = useRef(true);
+  const requestGeneration = useRef(0);
 
-  useEffect(() => () => {
-    mountedRef.current = false;
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; requestGeneration.current += 1; };
   }, []);
 
   const loadFirstPage = useCallback(() => {
+    const generation = ++requestGeneration.current;
     setLoading(true);
+    setLoadingMore(false);
     setError(null);
     setEntries(null);
     setNextPageToken(null);
     setTruncated(false);
     getCloudHistory(objToken)
       .then((page) => {
-        if (!mountedRef.current) return;
+        if (!mountedRef.current || generation !== requestGeneration.current) return;
         setEntries(page.entries);
         setNextPageToken(page.truncated ? page.nextPageToken : null);
         setTruncated(page.truncated);
         setLatestId(page.entries[0]?.historyVersionId ?? null);
       })
       .catch((err) => {
-        if (!mountedRef.current) return;
+        if (!mountedRef.current || generation !== requestGeneration.current) return;
         setError(err instanceof Error ? err.message : '云端历史加载失败');
       })
       .finally(() => {
-        if (mountedRef.current) setLoading(false);
+        if (mountedRef.current && generation === requestGeneration.current) setLoading(false);
       });
   }, [objToken]);
 
   const loadMore = () => {
     if (!nextPageToken || loadingMore) return;
+    const generation = requestGeneration.current;
     setLoadingMore(true);
     getCloudHistory(objToken, { pageToken: nextPageToken })
       .then((page) => {
-        if (!mountedRef.current) return;
+        if (!mountedRef.current || generation !== requestGeneration.current) return;
         setEntries((prev) => [...(prev ?? []), ...page.entries]);
         setNextPageToken(page.truncated || page.hasMore ? page.nextPageToken : null);
         setTruncated(page.truncated);
       })
       .catch((err) => {
-        if (!mountedRef.current) return;
+        if (!mountedRef.current || generation !== requestGeneration.current) return;
         setError(err instanceof Error ? err.message : '云端历史续翻失败');
       })
       .finally(() => {
-        if (mountedRef.current) setLoadingMore(false);
+        if (mountedRef.current && generation === requestGeneration.current) setLoadingMore(false);
       });
   };
 
   useEffect(() => {
     if (open) loadFirstPage();
+    return () => { requestGeneration.current += 1; };
   }, [open, loadFirstPage]);
 
   return (

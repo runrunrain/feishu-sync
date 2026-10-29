@@ -84,11 +84,11 @@ describe('rollbackRowGate 行回滚门控', () => {
     expect(gate.reason).toContain('history_list_empty');
   });
 
-  it('非成功写回（conflict/failed/unknown/started）禁用：云端未被本次修改', () => {
+  it('非成功写回禁用，未知状态不假称云端未修改', () => {
     const expected: Record<string, string> = {
       conflict: '未成功',
       failed: '未成功',
-      unknown: '未成功',
+      unknown: '结果未知',
       started: '尚未结束',
     };
     for (const outcome of ['conflict', 'failed', 'unknown', 'started'] as const) {

@@ -447,6 +447,7 @@ feishuRoutes.post('/api/sources/:objToken/push', async (c) => {
     const result = await service.push(c.req.param('objToken'), {
       allowOverwrite: body.allowOverwrite === true,
       force: body.force === true,
+      acknowledgedUnknownUpdatedAt: typeof body.acknowledgedUnknownUpdatedAt === 'string' ? body.acknowledgedUnknownUpdatedAt : undefined,
       confirm: body.confirm,
       actor,
     });
@@ -598,6 +599,19 @@ feishuRoutes.post('/api/sources/:objToken/history-revert/preview', async (c) => 
     if (error instanceof Error && error.message === 'dependencies_not_injected') {
       return c.json({ error: 'dependencies_not_injected' }, 500);
     }
+    return pushErrorResponse(c, error);
+  }
+});
+
+/** 未知回滚任务的状态核对；无 taskId 需人工确认云端已结束。 */
+feishuRoutes.post('/api/sources/:objToken/reverts/:pushLogId/reconcile', async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const result = await requireCloudHistoryService(c).reconcileUnknownRevert(
+      c.req.param('objToken'), c.req.param('pushLogId'), body?.confirm,
+    );
+    return c.json(result);
+  } catch (error) {
     return pushErrorResponse(c, error);
   }
 });
@@ -875,14 +889,14 @@ feishuRoutes.get('/api/sources/moves', (c) => {
 
 /**
  * POST /api/sources/moves/:moveId/reconcile - unknown 移出的权威核对（T4b-05
- * 围栏解除唯一入口）：真实查询任务状态或节点归属；证明未移出 → failed
- *（释放围栏）；证明已移出 → moved；无法证明 → 保持 unknown。只读云端
- * 查询 + 记录收敛，不发起任何写云端动作。
+ * 围栏解除入口）：查询任务终态；无可靠任务状态时要求人工确认任务已结束及去向。
+ * 确认未移出时还需检查节点身份；不发起任何云端写入。
  */
 feishuRoutes.post('/api/sources/moves/:moveId/reconcile', async (c) => {
   try {
     const service = requireCloudMoveService(c);
-    const result = await service.reconcileUnknownMove(c.req.param('moveId'));
+    const body = await c.req.json().catch(() => ({}));
+    const result = await service.reconcileUnknownMove(c.req.param('moveId'), body?.confirm);
     return c.json(result, result.state === 'unknown' ? 202 : 200);
   } catch (error) {
     if (error instanceof Error && error.message === 'dependencies_not_injected') {

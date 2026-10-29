@@ -210,7 +210,16 @@ function stripInlineCode(line: string): string {
     if (line[i] === '`') {
       let n = 0;
       while (line[i + n] === '`') n += 1;
-      const close = line.indexOf('`'.repeat(n), i + n);
+      let close = i + n;
+      while (close < line.length) {
+        close = line.indexOf('`', close);
+        if (close === -1) break;
+        let length = 0;
+        while (line[close + length] === '`') length += 1;
+        if (length === n) break;
+        close += length;
+      }
+      if (close >= line.length) close = -1;
       if (close !== -1) {
         out.push(' ');
         i = close + n;
@@ -304,10 +313,11 @@ function collectBodyEdges(markdown: string, selfTokens: Set<string>, excludeToke
 
   let inFence = false;
   let fenceMarkerChar = '';
+  let fenceMarkerLength = 0;
   for (const rawLine of markdown.split(/\r?\n/)) {
     if (inFence) {
       const close = rawLine.match(FENCE_CLOSE_RE);
-      if (close && close[1][0] === fenceMarkerChar) {
+      if (close && close[1][0] === fenceMarkerChar && close[1].length >= fenceMarkerLength) {
         inFence = false;
         fenceMarkerChar = '';
       }
@@ -317,6 +327,7 @@ function collectBodyEdges(markdown: string, selfTokens: Set<string>, excludeToke
     if (open) {
       inFence = true;
       fenceMarkerChar = open[1][0];
+      fenceMarkerLength = open[1].length;
       continue;
     }
     scanLine(stripInlineCode(rawLine), addEdge);

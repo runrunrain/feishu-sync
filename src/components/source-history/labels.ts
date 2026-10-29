@@ -83,6 +83,9 @@ export function rollbackRowGate(log: SourcePushLogRecord): { enabled: boolean; r
   if (log.revertState === 'running') {
     return { enabled: false, reason: '该行发起的云端回滚仍在进行中' };
   }
+  if (log.revertState === 'unknown') {
+    return { enabled: false, reason: '云端回滚结果未知，请先核对任务状态' };
+  }
   if (log.anchorHistoryId == null || log.anchorHistoryId === '') {
     return {
       enabled: false,
@@ -95,6 +98,7 @@ export function rollbackRowGate(log: SourcePushLogRecord): { enabled: boolean; r
     return { enabled: false, reason: '写回尚未结束，暂无回滚点' };
   }
   if (log.outcome !== 'pushed') {
+    if (log.outcome === 'unknown') return { enabled: false, reason: '该次云端操作结果未知，请先核对云端内容' };
     return { enabled: false, reason: `该次写回未成功（${log.outcome}），云端没有被本次写回修改` };
   }
   return { enabled: true, reason: '' };

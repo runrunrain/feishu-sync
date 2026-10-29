@@ -14,7 +14,7 @@ import { FileClock, GitCompare, Loader2, RefreshCw, RotateCcw, ScrollText } from
 import { Drawer } from '../common/Drawer';
 import { StatusBadge } from '../common/StatusBadge';
 import { EmptyState } from '../common/EmptyState';
-import { getSourcePushLog } from '../../api/client';
+import { getSourcePushLog, reconcileUnknownRevert } from '../../api/client';
 import { appLogger } from '../../utils/appLogger';
 import type { SourcePushLogRecord } from '../../types';
 import {
@@ -56,13 +56,21 @@ export function SourcePushLogDrawer({
   const [logs, setLogs] = useState<SourcePushLogRecord[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [reconciling, setReconciling] = useState<string | null>(null);
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pollTriesRef = useRef(0);
   const mountedRef = useRef(true);
+  const generationRef = useRef(0);
+  const onLogsChangedRef = useRef(onLogsChanged);
+  onLogsChangedRef.current = onLogsChanged;
 
-  useEffect(() => () => {
-    mountedRef.current = false;
-    if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      generationRef.current += 1;
+      if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
+    };
   }, []);
 
   const stopPolling = useCallback(() => {
@@ -80,22 +88,23 @@ export function SourcePushLogDrawer({
       return;
     }
     if (pollTimerRef.current) return;
+    const generation = generationRef.current;
     const tick = () => {
       pollTriesRef.current += 1;
       getSourcePushLog(objToken)
         .then(({ logs: next }) => {
-          if (!mountedRef.current) return;
+          if (!mountedRef.current || generation !== generationRef.current) return;
           setLogs(next);
           if (next.some((row) => row.revertState === 'running') && pollTriesRef.current < POLL_MAX_TRIES) {
             pollTimerRef.current = setTimeout(tick, POLL_INTERVAL_MS);
           } else {
             pollTimerRef.current = null;
             pollTriesRef.current = 0;
-            onLogsChanged?.();
+            onLogsChangedRef.current?.();
           }
         })
         .catch((err) => {
-          if (!mountedRef.current) return;
+          if (!mountedRef.current || generation !== generationRef.current) return;
           appLogger.warn('push-log', 'poll failed', err);
           if (pollTriesRef.current < POLL_MAX_TRIES) {
             pollTimerRef.current = setTimeout(tick, POLL_INTERVAL_MS);
@@ -106,33 +115,60 @@ export function SourcePushLogDrawer({
         });
     };
     pollTimerRef.current = setTimeout(tick, POLL_INTERVAL_MS);
-  }, [objToken, onLogsChanged, stopPolling]);
+  }, [objToken, stopPolling]);
 
   const refresh = useCallback(() => {
+    const generation = ++generationRef.current;
+    stopPolling();
     setLoading(true);
     setError(null);
+    setLogs(null);
+    setReconciling(null);
     getSourcePushLog(objToken)
       .then(({ logs: rows }) => {
-        if (!mountedRef.current) return;
+        if (!mountedRef.current || generation !== generationRef.current) return;
         setLogs(rows);
         schedulePollIfNeeded(rows);
       })
       .catch((err) => {
-        if (!mountedRef.current) return;
+        if (!mountedRef.current || generation !== generationRef.current) return;
         setError(err instanceof Error ? err.message : '写回记录加载失败');
       })
       .finally(() => {
-        if (mountedRef.current) setLoading(false);
+        if (mountedRef.current && generation === generationRef.current) setLoading(false);
       });
-  }, [objToken, schedulePollIfNeeded]);
+  }, [objToken, schedulePollIfNeeded, stopPolling]);
 
   useEffect(() => {
     if (open) refresh();
     else stopPolling();
+    return () => { generationRef.current += 1; stopPolling(); };
   }, [open, refresh, stopPolling]);
 
+  const reconcile = async (log: SourcePushLogRecord, manual = false) => {
+    if (reconciling) return;
+    if (manual && !window.confirm('请先到飞书确认回滚任务已经结束；其结果可能仍未知。若任务尚在运行，解除保护可能造成后续操作互相覆盖。确认已核对并解除保护吗？')) return;
+    const generation = generationRef.current;
+    setReconciling(log.id);
+    setError(null);
+    try {
+      const result = await reconcileUnknownRevert(objToken, log.id, manual ? `REVERT_SETTLED:${log.id}` : undefined);
+      if (generation !== generationRef.current || !mountedRef.current) return;
+      if (result.state === 'unknown') {
+        setError(result.reason === 'task_still_running' ? '云端回滚仍在进行，请稍后核对。' : '暂无法确认云端回滚任务状态，保护仍然生效。');
+      } else {
+        refresh();
+        onLogsChangedRef.current?.();
+      }
+    } catch (err) {
+      if (generation === generationRef.current && mountedRef.current) setError(err instanceof Error ? err.message : '核对回滚状态失败');
+    } finally {
+      if (generation === generationRef.current && mountedRef.current) setReconciling(null);
+    }
+  };
+
   return (
-    <Drawer open={open} onClose={onClose} title="写回记录" subtitle={`最近 50 次写回与回滚 · ${objToken}`} widthClass="w-[720px] max-w-[94vw]">
+    <Drawer open={open} onClose={onClose} title="写回记录" subtitle={`最多 50 条写回与回滚，未收敛任务优先 · ${objToken}`} widthClass="w-[720px] max-w-[94vw]">
       <div className="p-4 space-y-3">
         <div className="flex items-center justify-between">
           <p className="text-xs text-ink-faint">
@@ -202,6 +238,7 @@ export function SourcePushLogDrawer({
                       {log.revertState === 'done' && <>已回滚（{formatTime(log.revertedAt)}）</>}
                       {log.revertState === 'failed' && <span className="text-seal-2">回滚失败：{log.revertError ?? '未知原因'}</span>}
                       {log.revertState === 'unknown' && <span className="text-seal">回滚状态未知：请到飞书历史版本核对</span>}
+                      {log.revertState === 'resolved' && <span className="text-ink-faint">已人工确认任务结束，回滚结果仍未知</span>}
                     </p>
                   )}
                   {log.outcome === 'unknown' && (
@@ -209,6 +246,16 @@ export function SourcePushLogDrawer({
                   )}
 
                   <div className="flex items-center justify-end gap-2">
+                    {log.revertState === 'unknown' && (
+                      <>
+                        {log.revertTaskId && <button type="button" disabled={reconciling != null} onClick={() => void reconcile(log)}
+                          className="rounded-md border border-line px-2 py-1 text-[11px] text-ink-soft disabled:opacity-40">核对回滚任务</button>}
+                        <button type="button" disabled={reconciling != null} onClick={() => void reconcile(log, true)}
+                          className="rounded-md border border-line px-2 py-1 text-[11px] text-ink-soft disabled:opacity-40">
+                          {reconciling === log.id ? '核对中…' : '人工确认任务已结束'}
+                        </button>
+                      </>
+                    )}
                     {compareable && (
                       <button
                         type="button"
