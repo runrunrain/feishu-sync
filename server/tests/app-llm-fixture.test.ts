@@ -44,7 +44,7 @@ let llmPort = 0;
 /** fixture 收到的请求（url/auth/headers/body） */
 const llmRequests: Array<{ url: string; auth: string | undefined; headers: http.IncomingHttpHeaders; body: any }> = [];
 /** steer 场景控制：'text' 直答 | 'toolround' 挂起等 steer 后回工具调用 | 'steered' 第二轮 */
-let llmMode: 'text' | 'toolround' | 'steered' = 'text';
+let llmMode: 'text' | 'toolround' | 'steered' | 'quota' = 'text';
 let steerSent = false;
 
 function sseBody(payload: unknown): string {
@@ -110,6 +110,11 @@ beforeAll(async () => {
       try { body = JSON.parse(Buffer.concat(chunks).toString('utf-8')); } catch { body = null; }
       llmRequests.push({ url: String(req.url), auth: req.headers.authorization, headers: { ...req.headers }, body });
       if (req.method === 'POST' && String(req.url).includes('chat/completions')) {
+        if (llmMode === 'quota') {
+          res.writeHead(429, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ code: '1113', message: `余额不足或无可用资源包: ${SENTINEL_KEY}` }));
+          return;
+        }
         res.writeHead(200, { 'Content-Type': 'text/event-stream' });
         if (llmMode === 'toolround') {
           void (async () => {
@@ -208,6 +213,20 @@ async function spawnFixturePi(options: SpawnOptions): Promise<PiRpcProcess> {
 }
 
 describe('R03：app-llm provider 注入（真实 pi + 本地 OpenAI 兼容 fixture）', () => {
+  it('模型额度不足时返回具体原因并隐藏服务商回显的密钥', async (ctx) => {
+    if (!piAvailable()) { ctx.skip(); return; }
+    llmMode = 'quota';
+    const rpc = await spawnFixturePi({ runKind: 'discuss' });
+    try {
+      await rpc.sendCommand('set_auto_retry', { enabled: false });
+      const result = await rpc.prompt('使用合成内容测试额度错误', { timeoutMs: 40000 });
+      expect(result.outcome).toBe('failed');
+      expect(result.error?.code).toBe('model_quota_exceeded');
+      expect(result.error?.message).toContain('余额不足');
+      expect(result.error?.message).toContain('1113');
+      expect(result.error?.message).not.toContain(SENTINEL_KEY);
+    } finally { llmMode = 'text'; await rpc.terminate(); }
+  }, TEST_TIMEOUT_MS);
   it('local auth.json credentials reach the selected model without copying or changing shared files', async () => {
     if (!piAvailable()) return;
     const sharedHome = path.join(fixtureRoot, 'shared-local'); fs.mkdirSync(sharedHome);

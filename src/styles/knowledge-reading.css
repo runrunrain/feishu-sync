@@ -1,4 +1,4 @@
-/* 标准知识库的长文排版，仅作用于 reading 入口。 */
+/* 标准知识库的正文尺寸沿用用户设置，其余 Markdown 排版与文档预览统一。 */
 .kb-reading-page {
   width: 100%;
   max-width: 940px;
@@ -7,86 +7,13 @@
 }
 
 .markdown-reading {
-  color: var(--ink);
   font-size: var(--kb-font-size, 18px);
   line-height: var(--kb-line-height, 1.95);
-  overflow-wrap: anywhere;
 }
 
-.markdown-reading :is(p, ul, ol, blockquote) {
-  font-size: inherit;
-  line-height: inherit;
-  color: inherit;
-}
-
-.markdown-reading p {
-  margin-block: 0 1.2em;
-}
-
-.markdown-reading :is(h1, h2, h3, h4, h5, h6) {
-  color: var(--ink);
-  font-weight: 600;
-  line-height: 1.5;
-  text-wrap: pretty;
-  margin-block: 1.8em 0.65em;
-}
-
-.markdown-reading h1 {
-  font-size: 1.667em;
-  padding-bottom: 0.6em;
-  margin-bottom: 1em;
-}
-.markdown-reading h2 { font-size: 1.389em; }
-.markdown-reading h3 { font-size: 1.222em; }
-.markdown-reading h4 { font-size: 1.111em; }
-.markdown-reading :is(h5, h6) { font-size: 1em; }
-.markdown-reading > :first-child { margin-top: 0; }
-
-.markdown-reading :is(ul, ol) {
-  margin-block: 0 1.25em;
-  padding-left: 0.4em;
-}
-.markdown-reading li { margin-block: 0.45em; }
-
-.markdown-reading blockquote {
-  margin-block: 1.5em;
-  padding: 0.85em 1.2em;
-  background: var(--paper);
-  border-left-width: 3px;
-  font-style: normal;
-}
-.markdown-reading blockquote p { margin-block: 0.35em; }
-
-.markdown-reading [data-md-block] { margin-block: 1.6em; }
-.markdown-reading table {
-  font-size: max(14px, 0.889em);
-  line-height: var(--kb-line-height, 1.8);
-}
-.markdown-reading :is(th, td) {
-  padding: 0.75em 1em;
-  min-width: 7em;
-  color: var(--ink);
-}
-.markdown-reading th { white-space: normal; }
-
-.markdown-reading pre {
-  font-size: max(13px, 0.833em);
-  line-height: var(--kb-line-height, 1.8);
-  padding: 1.2em 1.4em;
-  overflow-wrap: normal;
-  tab-size: 2;
-}
-.markdown-reading code { font-size: 0.9em; }
-.markdown-reading hr { margin-block: 2em; }
-.markdown-reading img {
-  display: block;
-  height: auto;
-  margin: 1.6em auto;
-}
+.markdown-reading .markdown-table { font-size: max(13px, 0.889em); }
+.markdown-reading .markdown-code-content { font-size: max(13px, 0.833em); }
 
 @media (max-width: 640px) {
   .kb-reading-page { padding: 24px 20px 56px; }
-  .markdown-reading h1 { font-size: 1.5em; }
-  .markdown-reading h2 { font-size: 1.278em; }
-  .markdown-reading h3 { font-size: 1.167em; }
 }

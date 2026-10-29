@@ -257,7 +257,9 @@ export function AgentRuntimeSettingsCard() {
   const providers = useMemo(() => (config?.llm.providers ?? []).filter((p) => p.enabled && p.apiKey?.trim() && (/^https?:\/\//i.test(p.openAiCompatBaseUrl) || Object.values(p.protocolBaseUrls ?? {}).some((url) => /^https?:\/\//i.test(url ?? ''))) && p.models.some((m) => m.enabled && m.openAiModel.trim())), [config?.llm.providers]);
   const supportsClaude = (p: typeof providers[number]) => /^https?:\/\//i.test(p.protocolBaseUrls?.['anthropic-messages'] || (p.protocol === 'anthropic-messages' ? p.openAiCompatBaseUrl : ''));
   const visionSelectedProvider = providers.find((p) => p.id === visionProviderId);
-  const currentProviderId = agent?.model?.providerId || config?.llm.activeProviderId || '';
+  const providerOverride = agent?.model?.providerId || '';
+  const modelOverride = agent?.model?.modelId || '';
+  const currentProviderId = providerOverride || config?.llm.activeProviderId || '';
   const selectedProvider = providers.find((p) => p.id === currentProviderId);
   const currentModelId = agent?.model?.modelId || (currentProviderId === config?.llm.activeProviderId ? config?.llm.activeModelId : '') || selectedProvider?.defaultModelId || '';
   const appBackend = agent?.runtime?.backend ?? 'pi';
@@ -501,12 +503,12 @@ export function AgentRuntimeSettingsCard() {
             <FieldLabel>提供商（应用内已配置）</FieldLabel>
             <select
               className={INPUT_CLS}
-              value={currentProviderId}
+              value={providerOverride}
               onChange={(e) => saveAgent({ model: { providerId: e.target.value, modelId: '' } })}
               aria-label="选择提供商"
             >
-              <option value="">（跟随应用默认）</option>
-              {currentProviderId && (!selectedProvider || (backend === 'claude-code' && !supportsClaude(selectedProvider))) ? <option value={currentProviderId} disabled>原提供商不可用或协议不兼容，请重新选择</option> : null}
+              <option value="">跟随应用默认{!providerOverride && selectedProvider ? `（当前：${selectedProvider.name}）` : ''}</option>
+              {providerOverride && (!selectedProvider || (backend === 'claude-code' && !supportsClaude(selectedProvider))) ? <option value={providerOverride} disabled>原提供商不可用或协议不兼容，请重新选择</option> : null}
               {providers.filter((p) => backend !== 'claude-code' || supportsClaude(p)).map((p) => (
                 <option key={p.id} value={p.id}>
                   {p.name} · {backend === 'claude-code' || p.protocol === 'anthropic-messages' ? 'Anthropic' : p.protocol === 'openai-responses' ? 'Responses' : 'Chat Completions'}
@@ -521,12 +523,12 @@ export function AgentRuntimeSettingsCard() {
             <FieldLabel>模型预设</FieldLabel>
             <select
               className={INPUT_CLS}
-              value={currentModelId}
-              onChange={(e) => saveAgent({ model: { modelId: e.target.value } })}
+              value={modelOverride}
+              onChange={(e) => saveAgent({ model: { ...(e.target.value && !providerOverride ? { providerId: currentProviderId } : {}), modelId: e.target.value } })}
               aria-label="选择模型预设"
             >
-              <option value="">（默认）</option>
-              {currentModelId && !selectedProvider?.models.some((m) => m.id === currentModelId && m.enabled && m.openAiModel.trim()) ? <option value={currentModelId} disabled>原模型预设不可用，请重新选择</option> : null}
+              <option value="">默认预设{!modelOverride && selectedPreset ? `（当前：${selectedPreset.name}）` : ''}</option>
+              {modelOverride && !selectedProvider?.models.some((m) => m.id === modelOverride && m.enabled && m.openAiModel.trim()) ? <option value={modelOverride} disabled>原模型预设不可用，请重新选择</option> : null}
               {(selectedProvider?.models ?? [])
                 .filter((m) => m.enabled && m.openAiModel.trim())
                 .map((m) => (

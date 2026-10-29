@@ -1,12 +1,13 @@
 import { useEffect, useState } from 'react';
 import { Settings } from 'lucide-react';
 import { useConfig } from '../hooks/useConfig';
-import { useSettingsForm } from '../hooks/settingsDraft';
+import { useSettingsDraft, useSettingsForm } from '../hooks/settingsDraft';
 import { Card, CardBody, CardHeader } from './common/Card';
 import { Select, Toggle } from './common/Input';
 
 export function ModelDefaultsSettings() {
   const { config } = useConfig();
+  const draft = useSettingsDraft();
   const [providerId, setProviderId] = useState('');
   const [modelId, setModelId] = useState('');
   const [adaptationEnabled, setAdaptationEnabled] = useState(false);
@@ -31,6 +32,10 @@ export function ModelDefaultsSettings() {
   const providers = (config.llm.providers ?? []).filter((provider) => provider.enabled);
   const provider = providers.find((item) => item.id === providerId);
   const models = (provider?.models ?? []).filter((model) => model.enabled);
+  const agent = config.agent;
+  const agentProvider = providers.find((item) => item.id === (agent?.model.providerId || config.llm.activeProviderId));
+  const agentPresetId = agent?.model.modelId || (agentProvider?.id === config.llm.activeProviderId ? config.llm.activeModelId : agentProvider?.defaultModelId);
+  const agentPreset = agentProvider?.models.find((item) => item.id === agentPresetId);
 
   return (
     <Card variant="elevated">
@@ -46,6 +51,12 @@ export function ModelDefaultsSettings() {
         </div>
       </CardHeader>
       <CardBody className="space-y-4">
+        {agent ? <p className="text-xs text-ink-soft" role="status">
+          标准库构建设置：{agent.model.source === 'pi-agent-dir' && agent.runtime.backend !== 'claude-code'
+            ? `本地 Pi · ${agent.model.piModel || '未选择模型'}`
+            : `${agentProvider?.name || '未选择提供商'} · ${agentPreset?.name || '未选择模型'}${agent.model.providerId || agent.model.modelId ? '（Agent 单独指定）' : '（跟随应用默认）'}`}。
+          {draft?.dirty ? '草稿保存后生效。' : ''}可在「Agent 标准库 → 运行时与模型」调整。
+        </p> : null}
         {providers.length === 0 ? (
           <p className="text-sm text-ink-soft">请先在「模型提供商与预设」中配置并启用提供商。</p>
         ) : (

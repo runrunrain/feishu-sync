@@ -54,6 +54,7 @@ server/tsconfig.tsbuildinfo
 !build/icon.png
 !build/tray-icon-source.png
 !build/tray-iconTemplate@2x.png
+!server/src/agent/prompts/vision-test.png
 
 # Claude Code / Amagi runtime artifacts
 .claude/

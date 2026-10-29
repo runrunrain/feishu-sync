@@ -1,0 +1,151 @@
+/* Markdown 正文专用排版；不改变应用导航和表格数据预览。 */
+.markdown-body {
+  min-width: 0;
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+
+.markdown-preview {
+  width: 100%;
+  max-width: 960px;
+  margin-inline: auto;
+  padding: 24px clamp(18px, 3vw, 32px) 64px;
+}
+
+/* 同步引用里的正文不应再次套用页面边距。 */
+.markdown-body .markdown-body {
+  max-width: none;
+  padding: 0;
+  font-size: inherit;
+  line-height: inherit;
+}
+
+.markdown-body :is(p, ul, ol, blockquote) {
+  color: inherit;
+  font-size: inherit;
+  line-height: inherit;
+}
+
+.markdown-body p { margin-block: 0 0.9em; }
+
+.markdown-body :is(h1, h2, h3, h4, h5, h6) {
+  margin-block: 1.45em 0.55em;
+  padding: 0;
+  border: 0;
+  color: var(--ink);
+  font-family: inherit;
+  font-weight: 650;
+  line-height: 1.35;
+  text-wrap: pretty;
+}
+
+.markdown-body h1 { font-size: 1.6em; }
+.markdown-body h2 { font-size: 1.35em; }
+.markdown-body h3 { font-size: 1.15em; }
+.markdown-body :is(h4, h5, h6) { font-size: 1em; }
+.markdown-body > :first-child { margin-top: 0; }
+.markdown-body > :last-child { margin-bottom: 0; }
+
+.markdown-body :is(ul, ol) { margin-block: 0.4em 1em; padding-left: 1.55em; }
+.markdown-body li { padding-left: 0.15em; }
+.markdown-body li + li { margin-top: 0.3em; }
+.markdown-body li > :is(ul, ol) { margin-block: 0.3em; }
+.markdown-body li::marker { color: var(--ink-soft); }
+
+.markdown-body blockquote {
+  margin-block: 1.1em;
+  padding: 0.1em 0 0.1em 1em;
+  border-left: 3px solid #c9c9c7;
+  color: var(--ink-soft);
+  font-style: normal;
+}
+.markdown-body blockquote p { margin-block: 0.3em; }
+.markdown-body hr { margin-block: 1.6em; border: 0; border-top: 1px solid #e2e0dc; }
+.markdown-body a { color: #1769a8; text-decoration-color: currentColor; text-underline-offset: 0.15em; }
+.markdown-body a:hover { color: #10547f; }
+.markdown-body strong { font-weight: 650; }
+
+.markdown-body :not(pre) > code {
+  margin: 0;
+  padding: 0.12em 0.3em;
+  border: 0;
+  border-radius: 4px;
+  background: #efeeeb;
+  color: inherit;
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+
+.markdown-body [data-md-block] { margin-block: 1.15em; }
+.markdown-body [data-md-block="callout"],
+.markdown-body [data-md-block="details"] { font-size: inherit; }
+
+.markdown-code-block {
+  overflow: hidden;
+  border: 1px solid #e3e2df;
+  border-radius: 8px;
+  background: #f4f3f0;
+}
+.markdown-code-label {
+  padding: 0.45em 1em;
+  border-bottom: 1px solid #e3e2df;
+  color: var(--ink-soft);
+  font-family: var(--font-sans);
+  font-size: 0.82em;
+  line-height: 1.4;
+}
+.markdown-code-content {
+  overflow-x: auto;
+  margin: 0;
+  padding: 1em 1.15em;
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  line-height: 1.55;
+  overflow-wrap: normal;
+  white-space: pre;
+  tab-size: 2;
+}
+.markdown-code-content code { font: inherit; }
+
+.markdown-table-wrap {
+  width: fit-content;
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid #dfdedb;
+  border-radius: 8px;
+}
+.markdown-table-wrap:focus-visible { outline: 2px solid var(--jade); outline-offset: 2px; }
+.markdown-table {
+  width: max-content;
+  max-width: 100%;
+  border-collapse: collapse;
+  color: var(--ink);
+  font-size: 0.94em;
+  line-height: 1.5;
+}
+.markdown-table :is(th, td) {
+  max-width: 24rem;
+  padding: 0.45em 0.75em;
+  border-bottom: 1px solid #e7e6e3;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+.markdown-table :is(th, td):not(:empty) { min-width: 4.25rem; }
+.markdown-table :is(th, td):empty { padding-inline: 0.55em; }
+.markdown-table th { background: #f4f3f0; font-weight: 650; }
+.markdown-table tr:last-child > :is(th, td) { border-bottom: 0; }
+/* 原文里完全为空的行仍保留为表格行，但不再制造大块空白。 */
+.markdown-table tr[data-md-empty-row="true"] > td { height: 6px; padding-block: 0; line-height: 1; }
+
+.markdown-body img { display: block; max-width: 100%; height: auto; margin-block: 0.9em; border-radius: 8px; }
+
+@media (max-width: 640px) {
+  .markdown-preview { padding: 18px 16px 48px; }
+  .markdown-body h1 { font-size: 1.45em; }
+  .markdown-body h2 { font-size: 1.25em; }
+}

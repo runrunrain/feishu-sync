@@ -31,6 +31,29 @@ it('uses provider-owned credentials and preset limits in the shared session/buil
   expect(JSON.parse(resolved.providerJson!).models[0]).toMatchObject({ contextWindow: 64000, maxTokens: 2048, reasoning: true });
   provider.apiKey = 'changed-fixture-key'; expect(modelRevision(config)).not.toBe(before);
 });
+it('Agent 默认跟随应用模型，显式选择可覆盖，清除后继续跟随默认变更', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'model-default-follow-')); dirs.push(dir);
+  const manager = new ConfigManager(path.join(dir, 'config.json'));
+  const config = await manager.load();
+  const llm = buildDefaultLlmConfigForTest();
+  const original = llm.providers![0];
+  const provider = (id: string, model: string) => ({ ...original, id, name: id, apiKey: `fixture-key-${id}`,
+    defaultModelId: model, models: [{ id: model, name: model, openAiModel: model, enabled: true }] });
+  llm.providers = [provider('glm', 'glm-model'), provider('gemini', 'gemini-model')];
+  llm.activeProviderId = 'gemini'; llm.activeModelId = 'gemini-model';
+  const agent = { ...config.agent, model: { ...config.agent.model, source: 'app-llm' as const, providerId: 'glm', modelId: 'glm-model' } };
+  await manager.updateConfig({ llm, agent });
+  let loaded = await manager.load();
+  expect(buildAppLlmRunConfig(loaded.llm, loaded.agent)?.model).toBe('feishu-sync-llm/glm-model');
+  await manager.updateConfig({ agent: { ...loaded.agent, model: { ...loaded.agent.model, providerId: '', modelId: '' } } });
+  loaded = await manager.load();
+  expect(loaded.agent.model.providerId).toBeUndefined();
+  expect(loaded.agent.model.modelId).toBeUndefined();
+  expect(buildAppLlmRunConfig(loaded.llm, loaded.agent)?.model).toBe('feishu-sync-llm/gemini-model');
+  await manager.updateConfig({ llm: { activeProviderId: 'glm', activeModelId: 'glm-model' } } as never);
+  loaded = await manager.load();
+  expect(buildAppLlmRunConfig(loaded.llm, loaded.agent)?.model).toBe('feishu-sync-llm/glm-model');
+});
 it.each(['openai-completions', 'openai-responses', 'anthropic-messages'] as const)('persists %s, preserves masked credentials and passes protocol to the shared descriptor', async (protocol) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'protocol-config-')); dirs.push(dir);
   const manager = new ConfigManager(path.join(dir, 'config.json')); const config = await manager.load(); config.llm = buildDefaultLlmConfigForTest();

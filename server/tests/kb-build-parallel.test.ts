@@ -45,6 +45,7 @@ interface FakeScript {
   failBatchOnceWithCode?: string;
   /** 所有批次 prompt 恒定失败（测试单元重试仍败） */
   failBatchAlwaysWithCode?: string;
+  failBatchMessage?: string;
   /** 挂起（不 resolve）直到 abort —— 取消测试 */
   hangUntilAbort?: boolean;
   /** 处理指定单元的批次时先尝试写他单元预认领路径；结果记录到 claimRejections */
@@ -131,7 +132,7 @@ class FakeRpcProcess extends EventEmitter {
   private async actBatchPrompt(message: string): Promise<unknown> {
     const unitId = /【单元 (u\d+)/.exec(message)?.[1] ?? '';
     if (this.script.failBatchAlwaysWithCode) {
-      return { outcome: 'failed', error: { code: this.script.failBatchAlwaysWithCode, message: '脚本注入失败' } };
+      return { outcome: 'failed', error: { code: this.script.failBatchAlwaysWithCode, message: this.script.failBatchMessage ?? '脚本注入失败' } };
     }
     if (this.script.failBatchOnceWithCode) {
       const code = this.script.failBatchOnceWithCode;
@@ -483,6 +484,26 @@ describe('S4：双 worker 并行 + 路径认领', () => {
 });
 
 describe('S4：单元失败 → CURRENT 不动 / 重试成功', () => {
+  it.each([1, 2])('额度不足：%i 个 worker 保留具体原因，不重试、不更改已发布版本', async (parallelism) => {
+    const before = new StandardKbStore(outputRoot).readCurrent()?.releaseId;
+    const rawA = `示例源 A ${FAT}`;
+    writeRaw('额度域一/a.md', rawA);
+    writeRaw('额度域二/b.md', `示例源 B ${FAT}`);
+    documents.length = 0;
+    documents.push(docRecord('tokQuotaA', '额度域一/a.md'), docRecord('tokQuotaB', '额度域二/b.md'));
+    const harness = makeHarness(makeConfig({ buildParallelism: parallelism }), {
+      failBatchAlwaysWithCode: 'model_quota_exceeded', failBatchMessage: '429: 1113 余额不足或无可用资源包',
+    });
+    const row = await createAndRun(harness, 'full');
+    expect(row.status).toBe('failed');
+    expect(String(row.error_message)).toContain('余额不足');
+    expect(String(row.error_message)).toContain('1113');
+    expect(String(row.error_code)).toBe(parallelism === 1 ? 'model_quota_exceeded' : 'kb_unit_failed');
+    expect(harness.fakes.length).toBeLessThanOrEqual(parallelism);
+    expect(new StandardKbStore(outputRoot).readCurrent()?.releaseId).toBe(before);
+    expect(fs.readFileSync(path.join(kbRoot, '额度域一/a.md'), 'utf8')).toBe(rawA);
+  });
+
   it('重试后仍败 → kb_unit_failed，CURRENT 不动', async () => {
     const before = new StandardKbStore(outputRoot).readCurrent()?.releaseId;
     writeRaw('失败域/x.md', `x ${FAT}`);

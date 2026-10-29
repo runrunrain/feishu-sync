@@ -193,6 +193,10 @@ export function KbBuildPanel({
         </button> : null}
       </header>
 
+      {view.model ? <div className="shrink-0 px-3 py-1 text-[11px] text-ink-faint break-all" data-testid="kb-build-model">
+        构建模型：{view.model}
+      </div> : null}
+
       {/* 阶段 stepper（终态定格在失败阶段/完成态） */}
       {!failed ? (
         <div className={`flex items-center gap-1 px-4 py-1.5 shrink-0 ${layout === 'sidebar' ? 'flex-wrap gap-y-2' : 'overflow-x-auto scrollbar-thin'}`}>

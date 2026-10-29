@@ -75,7 +75,6 @@ export function ModelProviderSettings() {
   const toast = useToast();
   const [local, setLocal] = useState<LlmConfig | null>(null);
   const [selectedProviderId, setSelectedProviderId] = useState('');
-  const [chosenExplicitly, setChosenExplicitly] = useState(false);
   const [showKey, setShowKey] = useState(false);
   const [revealedProviderId, setRevealedProviderId] = useState<string | null>(null);
   const [revealingKey, setRevealingKey] = useState(false);
@@ -83,10 +82,6 @@ export function ModelProviderSettings() {
   const localRef = useRef<LlmConfig | null>(null);
   const acceptedProviders = useRef<LlmProviderConfig[] | undefined>(undefined);
   localRef.current = local;
-  useEffect(() => {
-    if (config?.agent?.model.source === 'app-llm' && config.agent.model.providerId === selectedProviderId) setChosenExplicitly(false);
-  }, [config?.agent?.model.source, config?.agent?.model.providerId, selectedProviderId]);
-
   useEffect(() => {
     if (!config?.llm) return;
     const next = cloneLlmConfig(config.llm);
@@ -122,24 +117,14 @@ export function ModelProviderSettings() {
     const safeProviders = providers.map((provider) => provider.id === revealedProviderId && provider.apiKey === revealedKey.current
       ? { ...provider, apiKey: '***' } : provider);
     const profilesChanged = JSON.stringify(safeProviders) !== JSON.stringify(config.llm.providers ?? []);
-    const agentChanged = chosenExplicitly && selectedProvider && config.agent
-      && (config.agent.model.source !== 'app-llm' || config.agent.model.providerId !== selectedProvider.id);
-    if (!profilesChanged && !agentChanged) return null;
+    if (!profilesChanged) return null;
     if (providers.some((p) => p.models.some((m) =>
       (m.contextWindow !== undefined && (!Number.isInteger(m.contextWindow) || m.contextWindow < 1024))
       || (m.maxTokens !== undefined && (!Number.isInteger(m.maxTokens) || m.maxTokens < 1))
       || (m.maxTokens !== undefined && m.contextWindow !== undefined && m.maxTokens > m.contextWindow)))) {
       throw new Error('模型提供商：上下文窗口须为不小于 1024 的整数，最大输出须为正整数且不超过上下文窗口');
     }
-    const agentPreset = selectedProvider?.models.find((m) => m.id === (config.llm.activeProviderId === selectedProvider.id ? config.llm.activeModelId : selectedProvider.defaultModelId) && m.enabled && m.openAiModel.trim())
-      ?? selectedProvider?.models.find((m) => m.id === selectedProvider.defaultModelId && m.enabled && m.openAiModel.trim())
-      ?? selectedProvider?.models.find((m) => m.enabled && m.openAiModel.trim());
-    const previousThinking = config.agent?.model.thinkingLevel ?? 'off';
-    const allowedThinking = previousThinking === 'off' || (agentPreset?.reasoning && agentPreset.thinkingLevels?.includes(previousThinking)
-      && (config.agent?.runtime.backend !== 'claude-code' || previousThinking !== 'minimal'));
     return {
-      ...(config.agent && selectedProvider ? { agent: { ...config.agent, model: { ...config.agent.model, source: 'app-llm' as const,
-        providerId: selectedProvider.id, modelId: agentPreset?.id, thinkingLevel: allowedThinking ? previousThinking : 'off' } } } : {}),
       llm: { providers: safeProviders },
     };
   });
@@ -338,7 +323,6 @@ export function ModelProviderSettings() {
                     onClick={() => {
                       concealRevealedKey(selectedProvider.id);
                       setSelectedProviderId(provider.id);
-                      setChosenExplicitly(true);
                       setShowKey(false);
                     }}
                     className={`w-full rounded-md border px-3 py-2.5 text-left transition-colors ${

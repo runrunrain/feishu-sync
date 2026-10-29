@@ -318,10 +318,10 @@ export class PiRpcProcess extends EventEmitter {
     if (!this.activeRun || this.activeRun.finished) return;
     if (command !== 'prompt' && command !== 'steer' && command !== 'follow_up') return;
     if (!success) {
-      const errorText = typeof record.error === 'string' ? record.error : 'prompt 被拒绝';
+      const errorText = this.safeErrorText(typeof record.error === 'string' ? record.error : 'prompt 被拒绝');
       this.finishActiveRun({
         outcome: 'failed',
-        error: { code: classifyPromptError(errorText), message: errorText.slice(0, 500) },
+        error: { code: classifyPromptError(errorText), message: errorText },
       });
     }
     // success:true → 继续等待事件（agent_settled 等）。
@@ -341,11 +341,17 @@ export class PiRpcProcess extends EventEmitter {
     this.emit('event', event);
     const run = this.activeRun;
     if (event.type === 'message_end') {
-      const message = event.message as { role?: string; stopReason?: string; content?: unknown } | undefined;
+      const message = event.message as { role?: string; stopReason?: string; errorMessage?: unknown; content?: unknown } | undefined;
       if (message && message.role === 'assistant') {
         if (run) {
           run.lastStopReason = message.stopReason ?? null;
           run.lastAssistantText = extractText(message.content);
+          // Pi 将服务商错误放在 assistant.errorMessage，而非正文。每次
+          // assistant 消息都更新，避免重试成功后沿用上一轮的错误。
+          const errorText = typeof message.errorMessage === 'string' && message.errorMessage.trim()
+            ? message.errorMessage : run.lastAssistantText;
+          run.lastErrorText = message.stopReason === 'error' && errorText
+            ? this.safeErrorText(errorText) : null;
         }
         this.emit('assistant_message_end', message);
       } else if (message) {
@@ -392,7 +398,7 @@ export class PiRpcProcess extends EventEmitter {
         if (run.lastStopReason === 'error') {
           this.finishActiveRun({
             outcome: 'failed',
-            error: { code: 'model_request_failed', message: (run.lastErrorText ?? '模型返回 error').slice(0, 500) },
+            error: { code: classifyPromptError(run.lastErrorText ?? ''), message: run.lastErrorText || '模型返回 error' },
           });
           return;
         }
@@ -504,7 +510,7 @@ export class PiRpcProcess extends EventEmitter {
       if (this.activeRun === run && !run.finished) {
         this.finishActiveRun({
           outcome: 'failed',
-          error: { code: classifyPromptError(response.error ?? ''), message: (response.error ?? 'prompt 被拒绝').slice(0, 500) },
+          error: { code: classifyPromptError(response.error ?? ''), message: this.safeErrorText(response.error ?? 'prompt 被拒绝') },
         });
       }
     }
@@ -554,6 +560,19 @@ export class PiRpcProcess extends EventEmitter {
       entry.reject(error);
     }
     this.pending.clear();
+  }
+
+  /** 服务商错误可能回显凭据；只返回有限长度的脱敏诊断。 */
+  private safeErrorText(message: string): string {
+    let safe = message;
+    for (const [name, secret] of Object.entries(this.options.env)) {
+      if (secret && /(?:^|_)(?:api_?key|token|secret|password|authorization)(?:_|$)/i.test(name)) {
+        safe = safe.split(secret).join('[redacted]');
+      }
+    }
+    safe = safe.replace(/\bBearer\s+[^\s"',}\]]+/gi, 'Bearer [redacted]');
+    safe = safe.replace(/("(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|client[_-]?secret|secret|password|authorization)"\s*:\s*")[^"]*(")/gi, '$1[redacted]$2');
+    return safe.trim().slice(0, 500);
   }
 
   isExited(): boolean {
@@ -643,6 +662,7 @@ function extractText(content: unknown): string | null {
 }
 
 function classifyPromptError(errorText: string): string {
+  if (/insufficient[_ -]?(?:quota|balance|credit)|余额不足|无可用资源包/i.test(errorText)) return 'model_quota_exceeded';
   if (/no api key/i.test(errorText)) return 'model_auth_missing';
   if (/not found/i.test(errorText) && /model/i.test(errorText)) return 'model_unconfigured';
   return 'model_request_failed';

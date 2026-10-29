@@ -12,8 +12,9 @@ it('原生Pi包安装/资源解析/启停/更新/移除，保留本地文件与�
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'native-pi-plugin-')); roots.push(root);
   const data = path.join(root, 'app'); fs.mkdirSync(data);
   const config = buildDefaultAgentConfig(data); const resolver = new PiRuntimeResolver();
+  config.runtime.backend = 'pi';
   const runtime = await resolver.resolveRuntime(config);
-  if (!runtime.nodePath) { ctx.skip(); return; }
+  if (!runtime.nodePath || !runtime.piCliPath) { ctx.skip(); return; }
   const generic = path.join(root, 'generic-pi'); fs.mkdirSync(generic); fs.writeFileSync(path.join(generic, 'settings.json'), '{"packages":["npm:generic-untouched"]}');
   vi.stubEnv('PI_CODING_AGENT_DIR', generic);
   const pkg = path.join(root, 'fixture-package'); fs.mkdirSync(path.join(pkg, 'extensions'), { recursive: true });

@@ -70,6 +70,7 @@ describe('KbBuildPanel 并行进度（S4/S5）', () => {
   it('多 worker 运行态：并行度、细粒度阶段、单元计数与 worker 徽标', () => {
     const html = render(makeBuild());
     expect(html).toContain('data-build-status="running"');
+    expect(html).toContain('构建模型：glm-4.7');
     expect(html).toContain('并行 3');
     expect(html).toContain('data-testid="kb-build-stage"');
     expect(html).toContain('单元生成');

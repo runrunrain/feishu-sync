@@ -402,10 +402,13 @@ export function validateWorkspacePath(
   if (realNorm === '/' || realNorm === '' || /^[a-z]:\\?$/.test(realNorm)) {
     return { ok: false, code: 'workspace_path_forbidden', message: `不允许使用文件系统根目录: ${real}` };
   }
-  if (systemExactDirs.some((dir) => realNorm === normalizeForCompare(dir))) {
+  if (systemExactDirs.some((dir) => realNorm === normalizeForCompare(dir, platform))) {
     return { ok: false, code: 'workspace_path_forbidden', message: `不允许使用系统目录: ${real}` };
   }
-  if (systemSubtreeDirs.some((dir) => realNorm.startsWith(normalizeForCompare(dir) + (platform === 'win32' ? '\\' : '/')))) {
+  if (systemSubtreeDirs.some((dir) => {
+    const root = normalizeForCompare(dir, platform);
+    return realNorm === root || realNorm.startsWith(root + (platform === 'win32' ? '\\' : '/'));
+  })) {
     return { ok: false, code: 'workspace_path_forbidden', message: `不允许使用系统目录: ${real}` };
   }
   if (realNorm === normalizeForCompare(homeDir, platform)) {

@@ -372,7 +372,11 @@ describe('R05：容量预留（reserveSlot）', () => {
   });
 
   it('池满时第二会话立即 agent_busy 失败，不 spawn 新进程', async () => {
-    const { service, store, pool } = makeService({ maxConcurrentProcesses: 1 });
+    const { service, store, pool, config } = makeService({ maxConcurrentProcesses: 1 });
+    const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'busy-pi-'));
+    temporaryRoots.push(fixtureRoot);
+    const runtime = makeRuntimeInstallation(fixtureRoot);
+    config.agent.runtime = { backend: 'pi', nodePath: runtime.nodePath, piCliPath: runtime.piRoot };
     pool.register('other', new FakeRpcProcess() as unknown as PiRpcProcess, 'session'); // 占满
     createSession(store, 's2');
     const runEnd = captureRunEnd(service, 's2');
@@ -382,6 +386,7 @@ describe('R05：容量预留（reserveSlot）', () => {
     expect((event.error as { code?: string }).code).toBe('agent_busy');
     expect(store.getAgentSession('s2')?.last_error_code).toBe('agent_busy');
     expect(pool.runningCount()).toBe(1); // 没有第二个进程
+    expect(fs.existsSync(runtime.marker)).toBe(false);
   });
 });
 

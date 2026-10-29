@@ -180,9 +180,13 @@ describe('validateWorkspacePath', () => {
     if (!verdict.ok) expect(verdict.code).toBe('workspace_path_forbidden');
   });
 
-  it('系统目录 → forbidden', () => {
-    const verdict = validateWorkspacePath('/etc', guards);
-    expect(verdict.ok).toBe(false);
+  it('系统目录本身及其子目录 → forbidden', () => {
+    const systemRoot = process.platform === 'win32' ? process.env.SystemRoot : '/etc';
+    expect(systemRoot).toBeTruthy();
+    for (const candidate of [systemRoot!, path.join(systemRoot!, process.platform === 'win32' ? 'System32' : 'default')]) {
+      if (!fs.existsSync(candidate)) continue;
+      expect(validateWorkspacePath(candidate, guards)).toMatchObject({ ok: false, code: 'workspace_path_forbidden' });
+    }
   });
 
   it('与受保护运行资源（pi 凭据目录/安装树）重叠 → forbidden（Leader steer #3）', () => {

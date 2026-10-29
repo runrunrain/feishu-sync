@@ -37,7 +37,7 @@ function setValue(element: HTMLInputElement | HTMLSelectElement, value: string) 
 }
 beforeEach(() => { fixture.save.mockReset().mockImplementation(async () => structuredClone(fixture.config)); });
 
-it('跨子页保留草稿，统一保存提供商与默认设置，并用于 Agent', async () => {
+it('跨子页保留草稿，统一保存提供商与默认设置，不覆盖 Agent 独立选择', async () => {
   const container = document.createElement('div'); document.body.append(container); const root = createRoot(container);
   try {
     await act(async () => root.render(<SettingsDraftProvider><Controls /><ModelProviderSettings /><ModelDefaultsSettings /></SettingsDraftProvider>));
@@ -56,8 +56,8 @@ it('跨子页保留草稿，统一保存提供商与默认设置，并用于 Age
     expect(fixture.save).toHaveBeenCalledTimes(1);
     expect(fixture.save).toHaveBeenCalledWith(expect.objectContaining({
       llm: expect.objectContaining({ providers: [expect.objectContaining({ name: '新提供商', anthropicAuthType: 'auth-token' })], activeModelId: 'm1', contentAdaptationEnabled: true }),
-      agent: expect.objectContaining({ model: expect.objectContaining({ source: 'app-llm', providerId: 'p1', modelId: 'm2' }) }),
     }));
+    expect(fixture.save.mock.calls[0][0]).not.toHaveProperty('agent');
   } finally { act(() => root.unmount()); container.remove(); }
 });
 
@@ -75,4 +75,24 @@ it('保存失败后保留草稿，修复网络后可重试', async () => {
     expect(fixture.save).toHaveBeenCalledTimes(2);
     expect(fixture.save.mock.calls[1][0].llm.providers[0].name).toBe('待保存名称');
   } finally { act(() => root.unmount()); container.remove(); }
+});
+
+it('编辑非默认提供商不会把 Agent 从应用默认模型切走', async () => {
+  const initial = structuredClone(fixture.config);
+  fixture.config.agent.model.source = 'app-llm';
+  fixture.config.llm.providers.push({ id: 'p2', name: '另一提供商', enabled: true, apiKey: '***', protocol: 'anthropic-messages',
+    openAiCompatBaseUrl: 'https://other.example.com', defaultModelId: 'other-model', models: [
+      { id: 'other-model', name: '其他模型', openAiModel: 'other-model', enabled: true },
+    ] });
+  const container = document.createElement('div'); document.body.append(container); const root = createRoot(container);
+  try {
+    await act(async () => root.render(<SettingsDraftProvider><Controls /><ModelProviderSettings /></SettingsDraftProvider>));
+    await act(async () => [...container.querySelectorAll('button')].find((button) => button.textContent?.includes('另一提供商'))!.click());
+    const name = [...container.querySelectorAll('input')].find((input) => input.value === '另一提供商')!;
+    await act(async () => setValue(name, '已编辑的另一提供商'));
+    await act(async () => [...container.querySelectorAll('button')].find((button) => button.textContent === '总保存')!.click());
+    expect(fixture.save).toHaveBeenCalledTimes(1);
+    expect(fixture.save.mock.calls[0][0]).not.toHaveProperty('agent');
+    expect(fixture.save.mock.calls[0][0].llm.providers[1].name).toBe('已编辑的另一提供商');
+  } finally { act(() => root.unmount()); container.remove(); Object.assign(fixture.config, initial); }
 });

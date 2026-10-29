@@ -49,9 +49,10 @@ function wire(api: LlmProtocol, model: string, text: string, tool?: Call): strin
     + event('message_stop', {});
 }
 
-it.each<LlmProtocol>(['openai-completions', 'openai-responses', 'anthropic-messages'])('%s: session and full KB build use the selected protocol/preset', async (api, ctx) => {
+it.for<LlmProtocol>(['openai-completions', 'openai-responses', 'anthropic-messages'])('%s: session and full KB build use the selected protocol/preset', async (api, ctx) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'protocol-live-')); roots.push(root);
   const manager = new ConfigManager(path.join(root, 'config.json')); const config = await manager.load();
+  config.agent.runtime.backend = 'pi';
   const resolver = new PiRuntimeResolver(); const runtime = await resolver.resolveRuntime(config.agent);
   if (!runtime.nodePath || !runtime.piCliPath) { ctx.skip(); return; }
   const raw = path.join(root, 'raw'); fs.mkdirSync(raw); const source = '# 阅读规则\n阅读时应先掌握基础规则，再结合实际情境理解细节。';

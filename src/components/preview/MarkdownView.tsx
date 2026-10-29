@@ -1223,29 +1223,27 @@ function renderBlock(block: Block, index: number, ctx: InlineContext): ReactNode
     }
     case 'code':
       return (
-        <div key={key} data-md-block="code" className="my-3 rounded-md border border-line/70 bg-dark overflow-hidden">
+        <div key={key} data-md-block="code" className="markdown-code-block">
           {block.lang && (
-            <div className="px-3 py-1.5 text-[10px] font-mono text-paper/60 border-b border-paper/10 bg-dark">
+            <div className="markdown-code-label">
               {block.lang}
             </div>
           )}
-          <pre className="px-3.5 py-3 text-xs leading-relaxed text-paper font-mono overflow-x-auto scrollbar-thin">
-            {block.lines.join('\n')}
+          <pre className="markdown-code-content scrollbar-thin">
+            <code>{block.lines.join('\n')}</code>
           </pre>
         </div>
       );
     case 'table':
       return (
-        <div key={key} data-md-block="table" className="my-3 overflow-x-auto scrollbar-thin rounded-md border border-line/70">
-          <table className="w-full text-xs border-collapse">
+        <div key={key} data-md-block="table" className="markdown-table-wrap scrollbar-thin" tabIndex={0} role="region" aria-label="表格，内容过宽时可横向滚动">
+          <table className="markdown-table">
             <thead>
-              <tr className="bg-paper-2">
+              <tr>
                 {block.header.map((cell, ci) => (
                   <th
                     key={ci}
-                    className={`px-3 py-2 font-medium text-ink border-b border-line whitespace-nowrap ${
-                      ALIGN_CLASS[block.aligns[ci] ?? 'left']
-                    }`}
+                    className={ALIGN_CLASS[block.aligns[ci] ?? 'left']}
                   >
                     {renderInline(cell, `${key}-h${ci}`, ctx)}
                   </th>
@@ -1254,13 +1252,11 @@ function renderBlock(block: Block, index: number, ctx: InlineContext): ReactNode
             </thead>
             <tbody>
               {block.rows.map((row, ri) => (
-                <tr key={ri} className={ri % 2 === 1 ? 'bg-paper/60' : 'bg-card-bg'}>
+                <tr key={ri} data-md-empty-row={row.every((cell) => !cell.trim()) ? 'true' : undefined}>
                   {row.map((cell, ci) => (
                     <td
                       key={ci}
-                      className={`px-3 py-1.5 text-ink-soft border-b border-line/40 align-top ${
-                        ALIGN_CLASS[block.aligns[ci] ?? 'left']
-                      }`}
+                      className={ALIGN_CLASS[block.aligns[ci] ?? 'left']}
                     >
                       {renderInline(cell, `${key}-r${ri}c${ci}`, ctx)}
                     </td>
@@ -1274,8 +1270,8 @@ function renderBlock(block: Block, index: number, ctx: InlineContext): ReactNode
     case 'html_table':
       // 需求 1：受控 HTML 表格渲染，保留 colspan/rowspan，样式与 Markdown 表格一致
       return (
-        <div key={key} data-md-block="table" className="my-3 overflow-x-auto scrollbar-thin rounded-md border border-line/70">
-          <table className="w-full text-xs border-collapse">
+        <div key={key} data-md-block="table" className="markdown-table-wrap scrollbar-thin" tabIndex={0} role="region" aria-label="表格，内容过宽时可横向滚动">
+          <table className="markdown-table">
             {block.colgroup && (
               <colgroup>
                 {block.colgroup.map((col, ci) => (
@@ -1290,7 +1286,7 @@ function renderBlock(block: Block, index: number, ctx: InlineContext): ReactNode
             {block.headRows.length > 0 && (
               <thead>
                 {block.headRows.map((row, ri) => (
-                  <tr key={ri} className="bg-paper-2">
+                  <tr key={ri}>
                     {row.cells.map((cell, ci) => (
                       <th
                         key={ci}
@@ -1300,9 +1296,7 @@ function renderBlock(block: Block, index: number, ctx: InlineContext): ReactNode
                           verticalAlign: cell.valign || 'top',
                           ...(cell.style || {}),
                         }}
-                        className={`px-3 py-2 font-medium text-ink border-b border-line ${
-                          cell.align ? ALIGN_CLASS[cell.align] : 'text-left'
-                        }`}
+                        className={cell.align ? ALIGN_CLASS[cell.align] : 'text-left'}
                       >
                         {renderInline(cell.content, `${key}-h${ri}c${ci}`, ctx)}
                       </th>
@@ -1313,7 +1307,7 @@ function renderBlock(block: Block, index: number, ctx: InlineContext): ReactNode
             )}
             <tbody>
               {block.bodyRows.map((row, ri) => (
-                <tr key={ri} className={ri % 2 === 1 ? 'bg-paper/60' : 'bg-card-bg'}>
+                <tr key={ri}>
                   {row.cells.map((cell, ci) => (
                     <td
                       key={ci}
@@ -1323,9 +1317,7 @@ function renderBlock(block: Block, index: number, ctx: InlineContext): ReactNode
                         verticalAlign: cell.valign || 'top',
                         ...(cell.style || {}),
                       }}
-                      className={`px-3 py-1.5 text-ink-soft border-b border-line/40 ${
-                        cell.align ? ALIGN_CLASS[cell.align] : 'text-left'
-                      }`}
+                      className={cell.align ? ALIGN_CLASS[cell.align] : 'text-left'}
                     >
                       {renderInline(cell.content, `${key}-r${ri}c${ci}`, ctx)}
                     </td>
@@ -1423,7 +1415,7 @@ export interface MarkdownViewProps {
    * 标准库 AI 生成文档、原始库文档、Agent 输出等不可信入口应传 'confirm'。
    */
   remoteImages?: 'auto' | 'confirm';
-  /** 标准库长文采用独立阅读排版；其他预览入口保留紧凑布局。 */
+  /** 标准库长文保留可调字号与行距；其他预览入口使用常规阅读排版。 */
   variant?: 'preview' | 'reading';
 }
 
@@ -1439,7 +1431,7 @@ export function MarkdownView({
   const blocks = parseBlocks(preprocess(content));
   const ctx: InlineContext = { baseDir, onNavigateCsv, feishuHost, remoteImages, resolveSyncedReferences };
   return (
-    <div className={variant === 'reading' ? 'markdown-reading' : 'px-5 py-4'}>
+    <div className={`markdown-body ${variant === 'reading' ? 'markdown-reading' : 'markdown-preview'}`}>
       {blocks.map((b, i) => (
         <Fragment key={i}>{renderBlock(b, i, ctx)}</Fragment>
       ))}

@@ -6,8 +6,8 @@
  * 用最新配置判定（修复前 factory 顶层捕获旧 config 对象，保存后永远
  * 报 model_auth_missing）。
  *
- * 独立临时 configPath，不污染共享 FEISHU_SYNC_HOME。不断言绝对就绪
- * （机器可能无 pi），断言「不再卡在旧配置的诊断码 + source/model 已切换」。
+ * 显式使用 Pi 基座与临时运行时布局，避免默认基座或机器上是否安装 Pi
+ * 影响测试；不启动假 CLI，专门验证保存后状态路由读取的是最新配置。
  */
 
 import { describe, expect, it, beforeAll, afterAll } from 'vitest';
@@ -15,6 +15,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { buildServer } from '../src/index.js';
+import { PI_PACKAGE_NAME } from '../src/agent/runtime-resolver.js';
 import type { Hono } from 'hono';
 
 let configPath: string;
@@ -24,7 +25,17 @@ let app: Hono;
 beforeAll(async () => {
   configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-status-reg-'));
   configPath = path.join(configDir, 'config.json');
+  const piRoot = path.join(configDir, 'pi');
+  fs.mkdirSync(path.join(piRoot, 'dist'), { recursive: true });
+  fs.writeFileSync(path.join(piRoot, 'package.json'), JSON.stringify({ name: PI_PACKAGE_NAME, version: '1.4.0' }));
+  fs.writeFileSync(path.join(piRoot, 'dist', 'cli.js'), '// fixture: status probe does not spawn when no server port exists');
   app = await buildServer({ desktopMode: false, configPath }) as unknown as Hono;
+  const setup = await app.fetch(new Request('http://127.0.0.1:1/api/config', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ agent: { runtime: { backend: 'pi', nodePath: process.execPath, piCliPath: piRoot } } }),
+  }));
+  expect(setup.status).toBe(200);
 });
 
 afterAll(() => {
@@ -79,9 +90,7 @@ describe('agent status 配置新鲜度（steer #4 回归）', () => {
       expect(result.body.model.source).toBe('pi-agent-dir');
       expect(result.body.model.model).toBe('amagi-glm/glm-5.3-flash');
       expect(['model_auth_missing', 'model_unconfigured']).not.toContain(result.body.code);
-      // 机器相关：有 pi → ready；无 pi → node_missing/pi_missing（都不是旧配置的错）
-      expect(['ready', 'node_missing', 'node_too_old', 'pi_missing', 'pi_version_unsupported'])
-        .toContain(result.body.code);
+      expect(result.body.code).toBe('ready');
     }
   });
 });

@@ -16,8 +16,7 @@
  *  - 互斥门消费方：SourceEditService / FeishuWriteService /
  *    CloudHistoryService 对 cloud_move_running / source_moved_out 的拒绝。
  *  - 迁移双登记：initialize() 建表段 + getCreateTablesDDL() 同源 DDL。
- *  - 路由四端点 + 命令表三条（agentExposed=false / destructive+confirm）
- *    + CLI /api/cli/:command 确认门（422；「CLI 无 --yes 拒」的服务端面）。
+ *  - 已移除的移出路由与 CLI 命令始终拒绝执行，历史记录查询仍可用。
  */
 
 import { describe, expect, it, afterEach, vi } from 'vitest';
@@ -32,8 +31,7 @@ import { SourceEditService } from '../src/sources/source-edit-service.js';
 import { FeishuWriteService } from '../src/sources/feishu-write-service.js';
 import { CloudHistoryService } from '../src/sources/cloud-history-service.js';
 import { feishuRoutes } from '../src/routes/feishu.js';
-import { findOpsCommand } from '../src/ops/command-table.js';
-import { evaluateRequestSpecs } from '../src/cli/args.js';
+import { findOpsCommand, opsCommandMetadata } from '../src/ops/command-table.js';
 import { cliRoutes } from '../src/routes/cli.js';
 import { CliEndpoint } from '../src/cli-endpoint.js';
 
@@ -702,7 +700,7 @@ describe('互斥门消费方（cloud_move_running / source_moved_out）', () => 
 });
 
 // ===========================================================================
-// F. 路由四端点 + 命令表三条 + CLI 确认门（「CLI 无 --yes 拒」服务端面）
+// F. 已移除的操作入口与历史记录查询
 // ===========================================================================
 
 function makeApp(fx: Fixture): Hono {
@@ -719,48 +717,22 @@ function makeApp(fx: Fixture): Hono {
   return app;
 }
 
-describe('routes/feishu — 移出四端点', () => {
-  it('POST move-to-drive/preview → 200 计划（blockedReason 门控面）', async () => {
-    const fx = fixture({ nodeHasChild: true });
-    const res = await makeApp(fx).request(`/api/sources/${OBJ}/move-to-drive/preview`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
-    });
-    expect(res.status).toBe(200);
-    const plan = await res.json();
-    expect(plan).toMatchObject({ blockedReason: 'has_children', nodeToken: NODE });
-  });
-
-  it('POST move-to-drive：缺 confirm → 400；异步起步 → 202 moving', async () => {
+describe('routes/feishu — 已移除的移出操作和历史查询', () => {
+  it.each([
+    { suffix: '/preview', body: {} },
+    { suffix: '', body: {} },
+    { suffix: '', body: { confirm: deriveMoveOutConfirmValue(NODE), actor: 'ui' } },
+  ])('移出操作 $suffix 始终返回 410，且不触及云端或本地记录', async ({ suffix, body }) => {
     const fx = fixture();
-    const app = makeApp(fx);
-    const bad = await app.request(`/api/sources/${OBJ}/move-to-drive`, {
+    const res = await makeApp(fx).request(`/api/sources/${OBJ}/move-to-drive${suffix}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
+      body: JSON.stringify(body),
     });
-    expect(bad.status).toBe(400);
-    expect((await bad.json()).error).toBe('confirmation_required');
-
-    const ok = await app.request(`/api/sources/${OBJ}/move-to-drive`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ confirm: deriveMoveOutConfirmValue(NODE), actor: 'ui' }),
-    });
-    expect(ok.status).toBe(202);
-    expect(await ok.json()).toMatchObject({ state: 'moving', moveId: expect.stringMatching(/^mv_/) });
-  });
-
-  it('POST move-to-drive：同步 done → 200 moved', async () => {
-    const fx = fixture({ moveResult: { state: 'done', taskId: TASK } });
-    const res = await makeApp(fx).request(`/api/sources/${OBJ}/move-to-drive`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ confirm: deriveMoveOutConfirmValue(NODE) }),
-    });
-    expect(res.status).toBe(200);
-    expect(await res.json()).toMatchObject({ state: 'moved' });
+    expect(res.status).toBe(410);
+    expect(await res.json()).toMatchObject({ error: 'feature_removed' });
+    expect(fx.lark.calls).toHaveLength(0);
+    expect(fx.store.listCloudMoves(OBJ, 10)).toHaveLength(0);
   });
 
   it('GET moves/:moveId → 行 / 404；GET moves 列表与 objToken 过滤', async () => {
@@ -782,13 +754,13 @@ describe('routes/feishu — 移出四端点', () => {
   });
 });
 
-describe('命令表 cloud.move_*（三条 agentExposed=false）', () => {
-  it('三条登记齐全：move_to_drive destructive+confirm；后两条只读', () => {
-    const move = findOpsCommand('cloud.move_to_drive')!;
-    expect(move).toBeDefined();
-    expect(move.risk).toBe('destructive');
-    expect(move.agentExposed).toBe(false);
-    expect(move.confirm).toEqual({ field: 'confirm', value: 'MOVE_OUT' });
+describe('命令表：移出操作已删除，历史查询保留', () => {
+  it('移出命令不在注册表和命令列表中', () => {
+    expect(findOpsCommand('cloud.move_to_drive')).toBeUndefined();
+    expect(opsCommandMetadata().some((command) => command.name === 'cloud.move_to_drive')).toBe(false);
+  });
+
+  it('历史状态与列表仍是只读命令', () => {
     const status = findOpsCommand('cloud.move_status')!;
     expect(status).toMatchObject({ risk: 'read', agentExposed: false });
     expect(status.request!({ moveId: 'mv_1' })[0]).toMatchObject({
@@ -802,29 +774,14 @@ describe('命令表 cloud.move_*（三条 agentExposed=false）', () => {
     expect(list.request!({})[0]).toEqual({ method: 'GET', path: '/api/sources/moves', query: {} });
   });
 
-  it('move_to_drive request：CLI 基值 confirm + actor=cli（服务端权威升级）', () => {
-    const def = findOpsCommand('cloud.move_to_drive')!;
-    const specs = evaluateRequestSpecs(def, { objToken: OBJ, folderToken: FOLDER });
-    expect(specs[0]).toMatchObject({ method: 'POST', path: `/api/sources/${OBJ}/move-to-drive` });
-    expect((specs[0].body as Record<string, unknown>)).toEqual({
-      confirm: 'MOVE_OUT', folderToken: FOLDER, actor: 'cli',
-    });
-    // cli-app 确认预检的触发条件（confirmRequired = def.confirm && 非 GET spec）
-    // ——即「CLI 无 --yes 拒绝（退出码 4）」的本地门输入。
-    expect(def.confirm).toBeDefined();
-    expect(specs.some((spec) => spec.method !== 'GET')).toBe(true);
-  });
-
-  it('app_command 面不可达：三条 agentExposed=false（app-command-family 的判定源）', () => {
-    // app_command 执行器对 agentExposed=false 抛 command_not_allowed（403）；
-    // 列表/执行共用 findOpsCommand 判定源——此处锁定表内属性。
-    for (const name of ['cloud.move_to_drive', 'cloud.move_status', 'cloud.moves']) {
+  it('历史查询也不对 app_command 暴露', () => {
+    for (const name of ['cloud.move_status', 'cloud.moves']) {
       expect(findOpsCommand(name)?.agentExposed).toBe(false);
     }
   });
 });
 
-describe('CLI 域：/api/cli/cloud.move_to_drive 确认门', () => {
+describe('CLI 域：移出命令已删除', () => {
   function makeCliApp(fx: Fixture): { cliApp: Hono; token: string } {
     const endpoint = new CliEndpoint(fx.dataRoot, { enabledProvider: () => true });
     endpoint.publish('http://127.0.0.1:9');
@@ -851,28 +808,18 @@ describe('CLI 域：/api/cli/cloud.move_to_drive 确认门', () => {
     });
   }
 
-  it('无 confirm（CLI 无 --yes）→ 422 confirmation_required，不触达业务路由', async () => {
+  it.each([
+    { args: { objToken: OBJ } },
+    { args: { objToken: OBJ }, confirm: 'MOVE_OUT' },
+  ])('即使提供确认，CLI 移出命令仍不可执行：%j', async (body) => {
     const fx = fixture();
     const { cliApp, token } = makeCliApp(fx);
-    const res = await cliRequest(cliApp, token, { args: { objToken: OBJ } });
-    expect(res.status).toBe(422);
+    const res = await cliRequest(cliApp, token, body);
+    expect(res.status).toBe(404);
     const json = await res.json();
-    expect(json.ok).toBe(false);
-    expect(json.error).toMatchObject({ code: 'confirmation_required' });
-    // 确认门先于转发：业务链未被触达（无 getNode/move 调用、无 cloud_moves 行）
+    expect(json.error).toBe('unknown_command');
     expect(fx.lark.calls).toHaveLength(0);
     expect(fx.store.listCloudMoves(OBJ, 10)).toHaveLength(0);
-  });
-
-  it('带 confirm 基值（--yes 注入）→ 转发业务路由全链走通（actor=cli 服务端升级）', async () => {
-    const fx = fixture({ moveResult: { state: 'done', taskId: TASK } });
-    const { cliApp, token } = makeCliApp(fx);
-    const res = await cliRequest(cliApp, token, { args: { objToken: OBJ }, confirm: 'MOVE_OUT' });
-    expect(res.status).toBe(200);
-    const json = await res.json();
-    expect(json.ok).toBe(true);
-    expect(json.data).toMatchObject({ state: 'moved' });
-    expect(fx.lark.calls.map((call) => call.op)).toEqual(['getNode', 'getNode', 'move']);
   });
 
   it('CLI 令牌缺失 → 401（不进入命令执行）', async () => {

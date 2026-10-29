@@ -131,7 +131,12 @@ describe('Vision API（共享配置状态，按序执行）', () => {
     const captured = fixture.captured();
     expect(captured?.model).toBe('vision-model');
     const blocks = captured?.messages?.[0]?.content ?? [];
-    expect(blocks.some((b: any) => b.type === 'image_url' && String(b.image_url.url).startsWith('data:image/png;base64,'))).toBe(true);
+    const imageUrl = blocks.find((b: any) => b.type === 'image_url')?.image_url?.url;
+    expect(imageUrl).toMatch(/^data:image\/png;base64,/);
+    const image = Buffer.from(imageUrl.slice('data:image/png;base64,'.length), 'base64');
+    expect(image.subarray(0, 8)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    expect(image.readUInt32BE(16)).toBe(320);
+    expect(image.readUInt32BE(20)).toBe(320);
     // test 不写缓存（fixture 与生产资料严格分离）
     const status = await json<{ cachedCount: number }>('GET', '/api/agent/vision/status');
     expect(status.body.cachedCount).toBe(0);
