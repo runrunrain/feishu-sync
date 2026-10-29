@@ -75,7 +75,8 @@ import { LarkCliError } from './lark-cli-client.js';
 // P1-S5（设计 §3.1）：同步侧截图只在可选读 scope 已授权时才调用；scope
 // 清单来自 lark-cli-manager 的注册表（无循环依赖：manager 不回依赖本模块）。
 import { optionalScopesForFeature } from './lark-cli-manager.js';
-import { stageSourceWorkbook } from './sheet-workbook.js';
+import { stageSourceWorkbook, WorkbookAcquisitionError } from './sheet-workbook.js';
+import { managedWorkbookCompanions } from './workbook-source.js';
 // P0-S8：白板旁路导出链自 S6 方法体提炼为共享纯函数——downloadImages、
 // backfillWhiteboardBypass 与 custom-doc-sync（归档链）复用同一实现，
 // 防止三处分叉（见 whiteboard-bypass.ts 模块头）。
@@ -812,9 +813,18 @@ export class SyncEngine {
       images: SheetMediaItem[];
     }> = [];
     const docname = path.basename(localMdPath, '.md');
-    const workbook = doc.objType === 'sheet'
-      ? await stageSourceWorkbook(this.requireLarkCliClient(), doc.objToken, stagingDocDir, localMdPath)
-      : null;
+    let workbook: Awaited<ReturnType<typeof stageSourceWorkbook>> | null = null;
+    let sheetFallback = false;
+    let fallbackRevision: unknown;
+    if (doc.objType === 'sheet') {
+      try { workbook = await stageSourceWorkbook(this.requireLarkCliClient(), doc.objToken, stagingDocDir, localMdPath); }
+      catch (error) {
+        if (!(error instanceof WorkbookAcquisitionError)) throw error;
+        sheetFallback = true;
+        fallbackRevision = (await this.requireLarkCliClient().getWorkbookInfo(doc.objToken))?.data?.revision;
+        if (fallbackRevision == null) throw new Error('无法确认 CSV 后备版本，已保留现有本地文件');
+      }
+    }
     // bitable 确定性导出（P0 决策，见上方 fetched 构造处的 bitable 分支注
     // 释）：staging workspace 已建好，导出器直接复用 stagingDocDir。CSV 落
     // <docname>.csv-data/、base 元数据落 <docname>.base-meta/、附件落
@@ -841,8 +851,14 @@ export class SyncEngine {
         doc.objToken,
         stagingDocDir,
         docname,
+        undefined,
+        sheetFallback ? fallbackRevision : undefined,
       );
       sheets.push(...exportedSheets);
+      if (sheetFallback) {
+        const finalRevision = (await this.requireLarkCliClient().getWorkbookInfo(doc.objToken))?.data?.revision;
+        if (finalRevision == null || String(finalRevision) !== String(fallbackRevision)) throw new Error('读取 CSV 期间表格版本变化，已保留现有本地文件');
+      }
     }
     // Sheet float images flow through the same images/extraFiles channel as
     // docx media so commitDocumentContent + atomic-commit cover them.
@@ -982,7 +998,7 @@ export class SyncEngine {
     if (fetched.referenceMap !== undefined) {
       commentExtraction = extractRefmapComments(fetched.referenceMap);
     }
-    if (process.env.FEISHU_SYNC_LEGACY_WRITE === '1' && !workbook) {
+    if (process.env.FEISHU_SYNC_LEGACY_WRITE === '1' && !workbook && !sheetFallback) {
       await this.writeLocalMarkdown(localMdPath, finalContent, headerMeta);
       await this.updateLocalMap(doc, localMdPath);
     } else {
@@ -996,6 +1012,8 @@ export class SyncEngine {
         observedObjEditTime: doc.observedObjEditTime ?? null,
         bodyMarkdown: finalContent,
         workbook: workbook ? { relativePath: workbook.relativePath, metadataRelativePath: workbook.metadataRelativePath, mode: workbook.mode } : undefined,
+        sheetFallback,
+        previousWorkbook: sheetFallback && managedWorkbookCompanions(localMdPath).length ? `${docname}.xlsx` : undefined,
         images: [
           ...images.map((img) => ({
             relativePath: `images/${path.basename(img.path)}`,
@@ -1230,6 +1248,7 @@ export class SyncEngine {
       imagesCount: images.length + sheetMediaImages.length,
       attachmentsCount: attachments.length + (bitableResult?.attachments.length ?? 0),
       sheetsCount: sheets.length,
+      sheetAcquisition: doc.objType === 'sheet' ? (workbook?.mode ?? 'csv-fallback') : undefined,
       referencesTruncated: referenceExtraction.truncated ? true : undefined,
     };
   }
@@ -2500,6 +2519,7 @@ export class SyncEngine {
     stagingDocDir: string,
     docname: string,
     onlySheetId?: string,
+    expectedRevision?: unknown,
   ): Promise<Array<{
     sheetId: string;
     title: string;
@@ -2519,6 +2539,9 @@ export class SyncEngine {
     }> = [];
 
     const workbookInfo = await this.requireLarkCliClient().getWorkbookInfo(sheetToken);
+    if (expectedRevision != null && String(workbookInfo?.data?.revision) !== String(expectedRevision)) {
+      throw new Error('读取子表清单期间表格版本变化，已保留现有本地文件');
+    }
     let sheetsList = (workbookInfo.data?.sheets || []) as Array<{
       sheet_id: string;
       sheet_name: string;
@@ -2562,6 +2585,10 @@ export class SyncEngine {
         range,
       });
       const csvText = csvResult?.data?.annotated_csv ?? '';
+      if (expectedRevision != null && (csvResult?.data?.has_more !== false || csvResult?.data?.truncated === true
+        || csvResult?.data?.actual_range !== range || String(csvResult?.data?.revision) !== String(expectedRevision))) {
+        throw new Error(`子表 ${sheet.sheet_name} 的 CSV 范围、版本或完整性无法确认，已保留现有本地文件`);
+      }
       if (!csvText || csvText.trim().length === 0) {
         throw new Error(
           `csv-get 返回空内容: sheet="${sheet.sheet_name}" range=${range}`,

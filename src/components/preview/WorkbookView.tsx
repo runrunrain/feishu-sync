@@ -154,7 +154,7 @@ export function WorkbookView({ objToken, fileName, mode }: { objToken: string; f
     <div ref={panel} className="flex min-h-[460px] h-full flex-col">
       <div className="flex flex-wrap shrink-0 items-center gap-3 border-b border-line bg-paper/60 px-3 py-2 text-xs text-ink-soft">
         <span className="font-medium">Excel 画板</span>
-        {mode === 'read-reconstruction' && <span className="text-[11px] text-ink-faint">只读接口重建</span>}
+        {mode === 'read-reconstruction' && <span className="text-[11px] text-ink-faint">只读接口重建：提及为文本；图表需下载查看，部分仅保存于伴随记录</span>}
         <label className="ml-auto flex items-center gap-1.5">缩放
           <select aria-label="Excel 缩放比例" value={zoom} onChange={(e) => setZoom(e.target.value === 'fit' ? 'fit' : Number(e.target.value))} className="rounded border border-line bg-card-bg px-1 py-1">
             <option value="fit">适合宽度</option>

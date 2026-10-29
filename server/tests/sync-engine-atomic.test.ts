@@ -11,6 +11,8 @@ import { SyncEngine } from '../src/modules/sync-engine.js';
 import { LocalMapStore } from '../src/modules/local-map-store.js';
 import type { ChangedDocument } from '../src/types/index.js';
 import { exportTestWorkbook } from './helpers/workbook.js';
+import { Hono } from 'hono';
+import { syncRoutes } from '../src/routes/sync.js';
 
 const temps: string[] = [];
 const stores: LocalMapStore[] = [];
@@ -84,6 +86,54 @@ function makeDoc(overrides: Partial<ChangedDocument> = {}): ChangedDocument {
 }
 
 describe('SyncEngine atomic apply path', () => {
+  it('refreshes an already mapped sheet through the single-document route', async () => {
+    const { kb, store, config } = makeWorkspace();
+    const mdPath = path.join(kb, '策划 - Designer', '表格.md');
+    fs.mkdirSync(path.dirname(mdPath), { recursive: true }); fs.writeFileSync(mdPath, '# 表格\n');
+    store.upsertDocument({ objToken: 'tok-sheet', wikiNodeToken: 'node-sheet', objType: 'sheet', title: '表格', localMdPath: mdPath,
+      localRelPath: '策划 - Designer/表格.md', watchedRootId: 'designer', parentNodeToken: 'designer', status: 'synced', lastSyncedModifyTime: 'old', lastSyncedAt: '2026-01-01T00:00:00.000Z' } as any);
+    const app = new Hono();
+    app.use('*', async (c, next) => {
+      (c as any).localMapStore = store; (c as any).configManager = { load: async () => config };
+      (c as any).larkCliClient = {
+        getNode: async () => ({ obj_token: 'tok-sheet', obj_type: 'sheet', title: '表格', obj_edit_time: 200, has_child: false, parent_node_token: 'designer' }),
+        exportWorkbook: exportTestWorkbook,
+        getWorkbookInfo: async () => ({ data: { sheets: [{ sheet_id: 's1', sheet_name: '主表', row_count: 2, column_count: 2 }] } }),
+        getSheetCsv: async () => ({ data: { annotated_csv: 'a,b\n1,2\n' } }),
+      };
+      await next();
+    });
+    app.route('/', syncRoutes);
+    const response = await app.request('/api/sync/refresh-sheet', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ objToken: 'tok-sheet' }) });
+    expect(response.status).toBe(200);
+    const result = await response.json();
+    expect(result.success).toBe(true);
+    expect(result.syncedDocuments[0].sheetAcquisition).toBe('native');
+    expect(fs.existsSync(path.join(kb, '策划 - Designer', '表格.xlsx'))).toBe(true);
+  });
+  it('commits a verified CSV fallback without replacing a previous Excel', async () => {
+    const { kb, store, config } = makeWorkspace();
+    const mdPath = path.join(kb, '策划 - Designer', '表格.md'), xlsxPath = path.join(kb, '策划 - Designer', '表格.xlsx');
+    fs.mkdirSync(path.dirname(mdPath), { recursive: true });
+    await exportTestWorkbook('tok-sheet', xlsxPath); const original = fs.readFileSync(xlsxPath);
+    fs.writeFileSync(mdPath, '<!--\nfeishu_sync:\n  source_workbook: "表格.xlsx"\n-->\n# 表格');
+    fs.writeFileSync(`${xlsxPath}.metadata.json`, JSON.stringify({ objToken: 'tok-sheet', mode: 'native' }));
+    store.upsertDocument({ objToken: 'tok-sheet', wikiNodeToken: 'node-sheet', objType: 'sheet', title: '表格', localMdPath: mdPath,
+      localRelPath: '策划 - Designer/表格.md', watchedRootId: 'designer', status: 'synced', lastSyncedModifyTime: 'old', lastSyncedAt: '2026-01-01T00:00:00.000Z' } as any);
+    const client = { exportWorkbook: async () => { throw new Error('export denied'); },
+      getWorkbookInfo: async () => ({ data: { revision: 41, sheets: [{ sheet_id: 's1', sheet_name: '主表', row_count: 2, column_count: 2 }] } }),
+      getSheetCsv: async () => ({ data: { annotated_csv: 'a,b\n1,2\n', revision: 41, has_more: false, actual_range: 'A1:B2' } }) };
+    const engine = new SyncEngine({ larkCliClient: client, localMapStore: store, config });
+    const result = await engine.syncDocuments([makeDoc({ objToken: 'tok-sheet', objType: 'sheet', title: '表格',
+      localMdPath: mdPath, localRelPath: '策划 - Designer/表格.md', watchedRootId: 'designer', observedObjEditTime: 200 })],
+      { enableLLM: false, fullSync: false, apply: true, confirmation: 'APPLY' });
+    expect(result.success).toBe(true);
+    expect(result.syncedDocuments[0].sheetAcquisition).toBe('csv-fallback');
+    expect(fs.readFileSync(xlsxPath)).toEqual(original);
+    expect(fs.readFileSync(mdPath, 'utf8')).toContain('previous_workbook: "表格.xlsx"');
+    expect(fs.readFileSync(path.join(kb, '策划 - Designer', '表格.csv-data', '主表.csv'), 'utf8')).toContain('1,2');
+  });
+
   it('partial sheet export failure leaves prior body/CSV/synced baseline untouched', async () => {
     const { kb, store, config } = makeWorkspace();
     const mdPath = path.join(kb, '策划 - Designer', '表格.md');

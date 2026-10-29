@@ -507,6 +507,7 @@ export function isMediaGapReason(
 }
 
 export interface SyncedDocument {
+  sheetAcquisition?: 'native' | 'read-reconstruction' | 'csv-fallback';
   objToken: string;
   title: string;
   localMdPath: string;

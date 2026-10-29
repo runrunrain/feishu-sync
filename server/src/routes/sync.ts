@@ -227,6 +227,61 @@ syncRoutes.post('/api/sync', async (c) => {
   return c.json(result);
 });
 
+/** Explicitly refresh one mapped sheet using the same planner, locks and atomic commit as sync. */
+syncRoutes.post('/api/sync/refresh-sheet', async (c) => {
+  const body = await c.req.json<{ objToken?: string }>().catch(() => null);
+  const token = body?.objToken;
+  if (typeof token !== 'string' || !token) return c.json({ error: 'invalid_document', message: '缺少文档标识' }, 400);
+  const store = (c as any).localMapStore, client = (c as any).larkCliClient;
+  const config = await (c as any).configManager.load();
+  if (!config.knowledgeBaseRoot?.trim()) return c.json({ error: 'knowledge_base_root_not_configured', message: '请先配置知识库根目录。' }, 400);
+  const record = store.getDocumentByObjToken(token);
+  if (!record || record.objType !== 'sheet' || record.cloudDeleted || !record.localMdPath || !record.wikiNodeToken) {
+    return c.json({ error: 'sheet_not_refreshable', message: '该表格没有可用的本地映射或云端节点，请先检测并同步。' }, 409);
+  }
+  if (store.isSyncBlocked?.(config.knowledgeBaseRoot, token)) return c.json({ error: 'source_blocked', message: '文档已被屏蔽，请先移出屏蔽名单。' }, 409);
+  try {
+    const cloud = await client.getNode(record.wikiNodeToken);
+    if (cloud.obj_token !== token || cloud.obj_type !== 'sheet' || cloud.obj_edit_time == null) {
+      return c.json({ error: 'cloud_identity_changed', message: '云端表格标识或版本不可确认，请先重新检测。' }, 409);
+    }
+    const parents: string[] = [];
+    if (!record.customFolderId && record.watchedRootId && record.wikiNodeToken !== record.watchedRootId) {
+      let parent = cloud.parent_node_token ?? record.parentNodeToken;
+      const visited = new Set<string>();
+      while (parent && parent !== record.watchedRootId) {
+        if (visited.has(parent) || visited.size >= 100) return c.json({ error: 'missing_parent_chain', message: '无法确认完整父级路径，请先重新检测。' }, 409);
+        visited.add(parent);
+        const ancestor = store.getDocumentByWikiNodeToken(parent);
+        if (!ancestor || ancestor.cloudDeleted) return c.json({ error: 'missing_parent_chain', message: '无法确认完整父级路径，请先重新检测。' }, 409);
+        parents.unshift(ancestor.title);
+        parent = ancestor.parentNodeToken;
+      }
+      if (parent !== record.watchedRootId) return c.json({ error: 'missing_parent_chain', message: '无法确认所属同步根，请先重新检测。' }, 409);
+    }
+    const doc: ChangedDocument = {
+      objToken: token, objType: 'sheet', title: cloud.title, changeType: 'modified',
+      cloudModifiedTime: new Date(cloud.obj_edit_time * 1000).toISOString(), localSyncedTime: record.lastSyncedAt ?? null,
+      localMdPath: record.localMdPath, localRelPath: record.localRelPath, wikiNodeToken: record.wikiNodeToken,
+      parentNodeToken: cloud.parent_node_token ?? record.parentNodeToken, spaceId: cloud.space_id ?? record.spaceId,
+      watchedRootId: record.watchedRootId, watchedRootUrl: record.watchedRootUrl, customFolderId: record.customFolderId,
+      hasChild: cloud.has_child, observedObjEditTime: cloud.obj_edit_time,
+      parentChainTitles: parents, isWatchedRootNode: record.wikiNodeToken === record.watchedRootId,
+    };
+    const engine = new SyncEngine({ larkCliClient: client, localMapStore: store, config, layoutReconstructor: new LayoutReconstructor() });
+    const result = await engine.syncDocuments([doc], { enableLLM: false, fullSync: false, apply: true, confirmation: 'APPLY' });
+    if (result.syncedDocuments.length > 0) {
+      try {
+        const { SnapshotService } = await import('../modules/snapshot-service.js');
+        new SnapshotService(store, (c as any).configManager, new IndexScanner({ localMapStore: store, larkCliClient: client, config })).generate();
+      } catch (error) { console.warn('[sync] snapshot refresh after sheet refresh failed:', error); }
+    }
+    return c.json(result);
+  } catch (error) {
+    return c.json({ error: 'sheet_refresh_failed', message: error instanceof Error ? error.message : String(error) }, 500);
+  }
+});
+
 /**
  * POST /api/sync/whiteboard-backfill — P0-S8 存量补齐（设计 §5.8）
  *

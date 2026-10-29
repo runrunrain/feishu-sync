@@ -14,7 +14,7 @@
  *   3. 有内容 → 正常渲染；MD 缺失但有 CSV 时自动切到 CSV 页签
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   FileText,
   Table,
@@ -24,6 +24,7 @@ import {
   Code2,
   BookOpen,
   FolderOpen,
+  RefreshCw,
 } from 'lucide-react';
 import { Card } from './common/Card';
 import { MarkdownView, resolveMediaPath } from './preview/MarkdownView';
@@ -32,7 +33,7 @@ import { WorkbookView } from './preview/WorkbookView';
 import { SourceEditControls } from './SourceEditControls';
 import { SourceCommentsSection } from './SourceCommentsSection';
 import { DocReferenceSection } from './DocReferenceSection';
-import { getDocumentContent } from '../api/client';
+import { getDocumentContent, refreshSheet } from '../api/client';
 import { appLogger } from '../utils/appLogger';
 import { useToast } from './common/Toast';
 import { useConfig } from '../hooks/useConfig';
@@ -63,6 +64,13 @@ const TYPE_LABEL = {
 type FormatTab = 'md' | 'csv' | 'xlsx';
 type MdMode = 'rendered' | 'source';
 
+export function initialDocumentFormat(data: DocumentContent): FormatTab {
+  if (data.sheetStatus?.acquisition === 'csv-fallback' && data.csvTables.length > 0) return 'csv';
+  if (data.workbook) return 'xlsx';
+  if (data.mdContent == null && data.csvTables.length > 0) return 'csv';
+  return 'md';
+}
+
 /** 加载骨架屏：模拟标题 + 若干段落的呼吸动画。 */
 function LoadingSkeleton() {
   return (
@@ -85,6 +93,7 @@ function LoadingSkeleton() {
 export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPreviewPanelProps) {
   const [content, setContent] = useState<DocumentContent | null>(null);
   const [loading, setLoading] = useState(false);
+  const [refreshingSheet, setRefreshingSheet] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [formatTab, setFormatTab] = useState<FormatTab>('md');
   const [mdMode, setMdMode] = useState<MdMode>('rendered');
@@ -97,6 +106,8 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
   }, [config?.watchedRootUrls, config?.watchedRoots]);
 
   const objToken = node?.obj_token ?? null;
+  const currentToken = useRef(objToken);
+  currentToken.current = objToken;
 
   const handleOpenFolder = () => {
     if (!node?.local_path) {
@@ -119,11 +130,7 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
       .then((data) => {
         if (cancelled) return;
         setContent(data);
-        if (data.workbook) {
-          setFormatTab('xlsx');
-        } else if (data.mdContent == null && data.csvTables.length > 0) {
-          setFormatTab('csv');
-        }
+        setFormatTab(initialDocumentFormat(data));
       })
       .catch((err) => {
         if (cancelled) return;
@@ -150,6 +157,20 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
   const TypeIcon = node ? (TYPE_ICON[node.obj_type] ?? FileType) : FileText;
   const hasMd = content?.mdContent != null;
   const csvTables = useMemo(() => content?.csvTables ?? [], [content]);
+  const status = content?.sheetStatus;
+  const sheetLabel = status ? ({ native: 'Excel 原件', 'read-reconstruction': 'Excel 重建', 'unknown-excel': 'Excel（来源未知）', 'csv-fallback': 'CSV 后备', 'legacy-csv': '历史 CSV', unavailable: '尚无本地表格' } as const)[status.acquisition] : '';
+  const handleRefreshSheet = async () => {
+    if (!objToken || refreshingSheet) return;
+    setRefreshingSheet(true);
+    try {
+      const result = await refreshSheet(objToken);
+      if (!result.success || result.failedDocuments.length) throw new Error(result.failedDocuments[0]?.error ?? '重新获取未完成');
+      toast.push({ type: 'success', message: '表格获取完成，请查看版本状态。' });
+      if (currentToken.current === objToken) loadContent(objToken);
+    } catch (error) {
+      toast.push({ type: 'error', message: error instanceof Error ? error.message : '重新获取失败，已有文件已保留' });
+    } finally { setRefreshingSheet(false); }
+  };
   const activeCsv = csvTables[Math.min(csvIndex, csvTables.length - 1)] ?? null;
   const fileMissing =
     content != null && content.mdContent == null && csvTables.length === 0 && !content.workbook;
@@ -275,6 +296,7 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
           )}
 
           {/* 在系统文件管理器中打开本地文件 */}
+          {node.obj_type === 'sheet' && <button type="button" onClick={() => void handleRefreshSheet()} disabled={refreshingSheet || !node.local_path} className="inline-flex shrink-0 items-center gap-1 rounded-md border border-line bg-paper px-2 py-1.5 text-[11px] text-ink-soft hover:bg-paper-2 disabled:opacity-40"><RefreshCw className={`w-3 h-3 ${refreshingSheet ? 'animate-spin' : ''}`} />{refreshingSheet ? '获取中…' : '重新获取 Excel'}</button>}
           <button
             type="button"
             onClick={handleOpenFolder}
@@ -299,6 +321,15 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
           )}
         </div>
 
+        {status && <div className="mt-2 text-[11px] text-ink-soft" role="status">
+          <span>{sheetLabel}</span>{status.syncedAt && <span> · 同步时间 {new Date(status.syncedAt).toLocaleString()}</span>}
+          {status.cloudEditTime != null && status.cloudEditTime > 0 && <span> · 云端修改时间 {new Date(status.cloudEditTime < 100000000000 ? status.cloudEditTime * 1000 : status.cloudEditTime).toLocaleString()}</span>}
+          {status.workbookMayBeOlder && <span> · 已保留此前的 Excel，可能较旧；当前默认显示本次获取的 CSV</span>}
+          {status.workbookMayBeOlder && content?.workbook?.modifiedTime && <span> · Excel 本地修改时间 {new Date(content.workbook.modifiedTime).toLocaleString()}</span>}
+          {status.acquisition === 'read-reconstruction' && status.approximations.includes('mention') && <span> · 提及已转为文本</span>}
+          {status.acquisition === 'read-reconstruction' && status.approximations.includes('chart-approximate-pie') && <span> · 饼图近似重建，需下载查看</span>}
+          {status.acquisition === 'read-reconstruction' && status.approximations.includes('chart-metadata-only') && <span> · 部分图表仅保存配置</span>}
+        </div>}
         {/* 格式页签：MD / CSV（下划线常驻渲染 + scaleX 过渡，与 TopBar 一致） */}
         <div className="mt-2.5 flex items-center gap-4">
           {content?.workbook && (

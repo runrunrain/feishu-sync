@@ -4,6 +4,7 @@ import path from 'node:path';
 import ExcelJS from 'exceljs';
 import JSZip from 'jszip';
 import { downloadSheetMedia, parseSheetFloatImages, type SheetMediaDownloadClient } from './sheet-media.js';
+import { addPieChart } from './sheet-chart-reconstruction.js';
 
 type JsonObject = Record<string, any>;
 export interface WorkbookReadClient extends SheetMediaDownloadClient {
@@ -11,12 +12,14 @@ export interface WorkbookReadClient extends SheetMediaDownloadClient {
   getSheetLayout(options: { spreadsheetToken: string; sheetId: string }): Promise<any>;
   getSheetCells(options: { spreadsheetToken: string; sheetId: string; range: string; formulas?: boolean }): Promise<any>;
   getSheetFloatImages(options: { spreadsheetToken: string; sheetId: string }): Promise<any>;
+  getSheetCharts?(options: { spreadsheetToken: string; sheetId: string }): Promise<any>;
 }
 
 export interface WorkbookReadManifest {
   mode: 'read-reconstruction';
   revision: number | string;
   sheets: Array<{ id: string; name: string; rows: number; columns: number; cells: number; merges: number; images: number }>;
+  approximations?: Array<{ sheet: string; cell?: string; kind: string; detail: unknown }>;
 }
 
 function payload(response: JsonObject): JsonObject {
@@ -68,7 +71,7 @@ function excelFont(styles: JsonObject): Partial<ExcelJS.Font> {
   };
 }
 
-function applyCell(cell: ExcelJS.Cell, raw: JsonObject, formulaRaw: JsonObject) {
+function applyCell(cell: ExcelJS.Cell, raw: JsonObject, formulaRaw: JsonObject, approximations: NonNullable<WorkbookReadManifest['approximations']>) {
   const styles = raw.cell_styles ?? {};
   const formulaValue = formulaRaw.formula ?? formulaRaw.value;
   const formula = typeof formulaValue === 'string' && formulaValue.startsWith('=')
@@ -81,11 +84,16 @@ function applyCell(cell: ExcelJS.Cell, raw: JsonObject, formulaRaw: JsonObject) 
     && typeof raw.rich_text[0].link === 'string') {
     cell.value = { text: String(raw.rich_text[0].text ?? value ?? raw.rich_text[0].link), hyperlink: raw.rich_text[0].link };
   } else if (Array.isArray(raw.rich_text) && raw.rich_text.length > 0) {
+    if (typeof value === 'string' && raw.rich_text.every((run: JsonObject) => typeof run.text === 'string')
+      && raw.rich_text.map((run: JsonObject) => run.text).join('') !== value) {
+      throw new Error(`单元格 ${cell.address} 的富文本与显示值不一致，无法确认完整重建`);
+    }
     const runs: ExcelJS.RichText[] = [];
     for (const run of raw.rich_text) {
-      if (run.type !== 'text' || typeof run.text !== 'string') {
+      if (!['text', 'mention'].includes(run.type) || typeof run.text !== 'string') {
         throw new Error(`单元格 ${cell.address} 包含尚不能完整重建的富文本对象 (${run.type ?? '未知类型'})`);
       }
+      if (run.type === 'mention') approximations.push({ sheet: cell.worksheet.name, cell: cell.address, kind: 'mention', detail: { ...run } });
       runs.push({ text: run.text, font: excelFont({ ...styles, ...run.style }) });
     }
     cell.value = { richText: runs };
@@ -133,7 +141,7 @@ function completeWindow(data: JsonObject, window: Window): boolean {
 
 async function readWindow(
   client: WorkbookReadClient, token: string, sheetId: string, revision: number | string,
-  window: Window, worksheet: ExcelJS.Worksheet,
+  window: Window, worksheet: ExcelJS.Worksheet, approximations: NonNullable<WorkbookReadManifest['approximations']>,
 ): Promise<number> {
   const range = `${columnLetters(window.left)}${window.top}:${columnLetters(window.right)}${window.bottom}`;
   const values = payload(await client.getSheetCells({ spreadsheetToken: token, sheetId, range }));
@@ -146,13 +154,13 @@ async function readWindow(
     // No partially returned cells are accepted. Retry smaller rectangles.
     if (window.bottom > window.top) {
       const mid = (window.top + window.bottom) >>> 1;
-      return await readWindow(client, token, sheetId, revision, { ...window, bottom: mid }, worksheet)
-        + await readWindow(client, token, sheetId, revision, { ...window, top: mid + 1 }, worksheet);
+      return await readWindow(client, token, sheetId, revision, { ...window, bottom: mid }, worksheet, approximations)
+        + await readWindow(client, token, sheetId, revision, { ...window, top: mid + 1 }, worksheet, approximations);
     }
     if (window.right > window.left) {
       const mid = (window.left + window.right) >>> 1;
-      return await readWindow(client, token, sheetId, revision, { ...window, right: mid }, worksheet)
-        + await readWindow(client, token, sheetId, revision, { ...window, left: mid + 1 }, worksheet);
+      return await readWindow(client, token, sheetId, revision, { ...window, right: mid }, worksheet, approximations)
+        + await readWindow(client, token, sheetId, revision, { ...window, left: mid + 1 }, worksheet, approximations);
     }
     throw new Error(`单元格 ${range} 读取仍被截断，不能确认完整同步`);
   }
@@ -162,7 +170,7 @@ async function readWindow(
       if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error(`单元格响应无效: ${range}`);
       if (Object.keys(raw).length === 0) return;
       const cell = worksheet.getCell(values.ranges[0].row_indices[rowIndex], columnNumber(values.ranges[0].col_indices[colIndex]));
-      applyCell(cell, raw, formulas.ranges[0].cells[rowIndex][colIndex]);
+      applyCell(cell, raw, formulas.ranges[0].cells[rowIndex][colIndex], approximations);
       if (cell.value != null) nonEmpty++;
     });
   });
@@ -230,20 +238,28 @@ export async function reconstructWorkbookFromReads(
   if (!Array.isArray(info.sheets) || !info.sheets.length || info.revision == null) throw new Error('工作簿清单或版本号缺失，无法完整重建 Excel');
   const workbook = new ExcelJS.Workbook();
   workbook.creator = 'feishu-sync';
-  const manifest: WorkbookReadManifest = { mode: 'read-reconstruction', revision: info.revision, sheets: [] };
+  const manifest: WorkbookReadManifest = { mode: 'read-reconstruction', revision: info.revision, sheets: [], approximations: [] };
   let totalCells = 0;
   for (const source of [...info.sheets].sort((a, b) => Number(a.index ?? 0) - Number(b.index ?? 0))) {
     if (source.resource_type !== 'sheet') throw new Error(`工作表类型缺失或包含非网格工作表，无法完整重建: ${source.sheet_name}`);
     for (const field of ['float_image_count', 'merged_cells_count', 'chart_count', 'pivot_table_count']) {
       if (!Number.isInteger(source[field]) || source[field] < 0) throw new Error(`工作表 ${source.sheet_name} 缺少对象数量元信息 (${field})`);
     }
-    if (Number(source.chart_count ?? 0) || Number(source.pivot_table_count ?? 0)) throw new Error(`工作表 ${source.sheet_name} 含图表或透视表，当前只读重建无法保真，请取得原件导出权限`);
+    if (Number(source.pivot_table_count ?? 0)) throw new Error(`工作表 ${source.sheet_name} 含图表或透视表，当前只读重建无法保真，请取得原件导出权限`);
     const rows = Number(source.row_count), columns = Number(source.column_count);
     totalCells += rows * columns;
     if (!Number.isInteger(rows) || !Number.isInteger(columns) || rows < 1 || columns < 1 || rows > 50_000 || columns > 1024 || totalCells > 2_000_000) {
       throw new Error(`工作表 ${source.sheet_name} 的范围无效或超过当前完整重建上限`);
     }
     const options = { spreadsheetToken: token, sheetId: String(source.sheet_id) };
+    if (source.chart_count > 0) {
+      if (!client.getSheetCharts) throw new Error(`工作表 ${source.sheet_name} 的图表读取不可用`);
+      const chartData = payload(await client.getSheetCharts(options));
+      assertRevision(chartData, info.revision);
+      const charts = chartData.sheets?.find((s: JsonObject) => s.sheet_id === source.sheet_id)?.charts;
+      if (!Array.isArray(charts) || charts.length !== source.chart_count) throw new Error(`工作表 ${source.sheet_name} 图表清单不完整`);
+      for (const chart of charts) manifest.approximations!.push({ sheet: source.sheet_name, kind: 'chart-metadata-only', detail: chart });
+    }
     const layout = payload(await client.getSheetLayout(options));
     assertRevision(layout, info.revision);
     const worksheet = workbook.addWorksheet(String(source.sheet_name));
@@ -253,7 +269,7 @@ export async function reconstructWorkbookFromReads(
     for (let top = 1; top <= rows; top += 64) {
       for (let left = 1; left <= columns; left += 32) {
         cells += await readWindow(client, token, source.sheet_id, info.revision,
-          { top, left, bottom: Math.min(rows, top + 63), right: Math.min(columns, left + 31) }, worksheet);
+          { top, left, bottom: Math.min(rows, top + 63), right: Math.min(columns, left + 31) }, worksheet, manifest.approximations!);
       }
     }
     if (source.merged_cells_count != null && layout.merged_cells.length !== Number(source.merged_cells_count)) throw new Error(`工作表 ${source.sheet_name} 的合并区域数量不一致`);
@@ -311,6 +327,11 @@ export async function reconstructWorkbookFromReads(
   // Pin Normal's font explicitly so the host Office default cannot change
   // the digit-width basis used by column geometry. Cell fonts are untouched.
   const zip = await JSZip.loadAsync(fs.readFileSync(outputPath));
+  for (const entry of manifest.approximations!) {
+    if (entry.kind !== 'chart-metadata-only') continue;
+    const sheetIndex = manifest.sheets.findIndex((sheet) => sheet.name === entry.sheet) + 1;
+    if (sheetIndex > 0 && await addPieChart(zip, sheetIndex, entry.detail as JsonObject)) entry.kind = 'chart-approximate-pie';
+  }
   const stylesFile = zip.file('xl/styles.xml');
   if (!stylesFile) throw new Error('重建工作簿缺少样式定义');
   let styles = await stylesFile.async('string');

@@ -175,6 +175,7 @@ export type SyncState =
   | 'deleted_confirmed';
 
 export interface SyncedDocument {
+  sheetAcquisition?: 'native' | 'read-reconstruction' | 'csv-fallback';
   objToken: string;
   title: string;
   localMdPath: string;
@@ -668,6 +669,7 @@ export interface DocumentContent {
   csvTables: DocumentCsvTable[];
   /** Native sheet source; absent on historical CSV-only exports. */
   workbook?: { path: string; size: number; modifiedTime: string; mode?: 'native' | 'read-reconstruction' } | null;
+  sheetStatus?: { acquisition: 'native' | 'read-reconstruction' | 'unknown-excel' | 'csv-fallback' | 'legacy-csv' | 'unavailable'; workbookMayBeOlder: boolean; syncedAt: string | null; cloudEditTime?: number | null; approximations: string[] } | null;
   /**
    * P1-S3/S4：被引用关系（入边，服务端返回）；目标双键反查，附引用方
    * title/相对路径（源行已删时为 null）。

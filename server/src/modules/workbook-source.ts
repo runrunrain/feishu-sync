@@ -9,7 +9,7 @@ export function workbookPathForMarkdown(mdPath: string): string {
 export function managedWorkbookCompanions(mdPath: string): string[] {
   if (!fs.existsSync(mdPath)) return [];
   const header = fs.readFileSync(mdPath, 'utf-8').slice(0, 16_384);
-  const marker = /^\s+source_workbook: ("[^\n]+")\s*$/m.exec(header)?.[1];
+  const marker = /^\s+(?:source_workbook|previous_workbook): ("[^\n]+")\s*$/m.exec(header)?.[1];
   if (!marker) return [];
   try {
     const workbookPath = workbookPathForMarkdown(mdPath);

@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { Hono } from 'hono';
 import ExcelJS from 'exceljs';
+import JSZip from 'jszip';
 import { stageSourceWorkbook, readWorkbookPreview } from '../src/modules/sheet-workbook.js';
 import { reconstructWorkbookFromReads, type WorkbookReadClient } from '../src/modules/sheet-read-reconstruction.js';
 import { LarkCliClient, LarkCliError } from '../src/modules/lark-cli-client.js';
@@ -141,6 +142,45 @@ describe('native workbook source and authorized read reconstruction', () => {
     expect(calls).toContain('A1:E1:true');
   });
 
+  it('retains mention text and identity and rebuilds a supported pie chart with source references', async () => {
+    const { client } = readClient();
+    const info = client.getWorkbookInfo;
+    client.getWorkbookInfo = async (token) => { const result = await info(token); result.data.sheets[0].chart_count = 1; result.data.sheets[0].float_image_count = 0; return result; };
+    client.getSheetFloatImages = async () => ({ data: { revision: 41, total: 0, sheets: [] } });
+    const get = client.getSheetCells;
+    client.getSheetCells = async (options) => {
+      const result = await get(options);
+      result.data.ranges[0].cells[0][0] = { value: '设计 ', rich_text: [{ type: 'mention', text: '设计', mention_token: 'abc', mention_type: 22 }, { type: 'text', text: ' ' }] };
+      return result;
+    };
+    client.getSheetCharts = async () => ({ data: { revision: 41, sheets: [{ sheet_id: 's1', charts: [{ chart_id: 'c1', details: {
+      position: { col: 'B', row: 1 }, size: { width: 400, height: 300 },
+      snapshot: { data: { refs: [{ value: "'画板'!C1:D5" }], direction: 'column', isStaticData: false,
+        dim1: { serie: { index: 1 } }, dim2: { series: [{ index: 2 }] } }, plotArea: { plot: { type: 'pie' } }, title: { text: '数量' } },
+    } }] }] } });
+    const file = path.join(temporary(), 'result.xlsx');
+    const report = await reconstructWorkbookFromReads(client, 'token', file);
+    expect(report.approximations).toContainEqual(expect.objectContaining({ kind: 'mention', cell: 'A1', detail: { type: 'mention', text: '设计', mention_token: 'abc', mention_type: 22 } }));
+    expect(report.approximations).toContainEqual(expect.objectContaining({ kind: 'chart-approximate-pie' }));
+    const saved = new ExcelJS.Workbook(); await saved.xlsx.readFile(file);
+    expect(saved.worksheets[0].getCell('A1').text).toBe('设计 ');
+    const zip = await JSZip.loadAsync(fs.readFileSync(file));
+    const chart = await zip.file('xl/charts/chart-fs1.xml')!.async('string');
+    expect(chart).toContain('&apos;画板&apos;!$C$2:$C$5');
+    expect(chart).toContain('&apos;画板&apos;!$D$2:$D$5');
+    expect(await zip.file('xl/worksheets/sheet1.xml')!.async('string')).toContain('<drawing');
+  });
+
+  it('preserves unsupported chart details in the reconstruction manifest', async () => {
+    const { client } = readClient();
+    const info = client.getWorkbookInfo;
+    client.getWorkbookInfo = async (token) => { const result = await info(token); result.data.sheets[0].chart_count = 1; return result; };
+    const chart = { chart_id: 'c1', details: { snapshot: { plotArea: { plot: { type: 'bar' } } } } };
+    client.getSheetCharts = async () => ({ data: { revision: 41, sheets: [{ sheet_id: 's1', charts: [chart] }] } });
+    const report = await reconstructWorkbookFromReads(client, 'token', path.join(temporary(), 'chart.xlsx'));
+    expect(report.approximations).toContainEqual({ sheet: '画板', kind: 'chart-metadata-only', detail: chart });
+  });
+
   it.each(['version', 'missing-image', 'missing-layout', 'single-cell-truncated', 'wrong-coordinates', 'unsupported-object'])(
     'rejects %s instead of committing an incomplete workbook', async (kind) => {
       const { client } = readClient();
@@ -198,6 +238,61 @@ describe('native workbook source and authorized read reconstruction', () => {
     expect((await readWorkbookPreview(path.join(root, '画板.xlsx'), 0)).sheet.images).toHaveLength(1);
   });
 
+  it('falls back to CSV and retains the previous managed workbook when reconstruction is unsupported', async () => {
+    const root = temporary(), ops = temporary(), { client } = readClient();
+    const mdPath = path.join(root, '画板.md'), xlsxPath = path.join(root, '画板.xlsx');
+    await exportTestWorkbook('token', xlsxPath);
+    const original = fs.readFileSync(xlsxPath);
+    fs.writeFileSync(mdPath, '<!--\nfeishu_sync:\n  source_workbook: "画板.xlsx"\n-->\n# old');
+    fs.writeFileSync(`${xlsxPath}.metadata.json`, JSON.stringify({ objToken: 'token', mode: 'native' }));
+    const info = client.getWorkbookInfo;
+    client.getWorkbookInfo = async (token) => { const value = await info(token); value.data.sheets[0].chart_count = 1; return value; };
+    await syncSheetToCustomFolder({
+      larkCliClient: { ...client, getSheetCsv: async () => ({ data: { annotated_csv: '说明,数值\n新内容,1\n', has_more: false, actual_range: 'A1:E6', revision: 41 } }) },
+      knowledgeBaseRoot: root, operationDirectory: ops, localMdPath: mdPath,
+      objToken: 'token', wikiNodeToken: null, title: '画板', originalLink: null, objEditTime: 41, spaceId: null,
+    });
+    expect(fs.readFileSync(xlsxPath)).toEqual(original);
+    expect(fs.readFileSync(mdPath, 'utf8')).toContain('source_acquisition: "csv-fallback"');
+    expect(fs.readFileSync(mdPath, 'utf8')).toContain('previous_workbook: "画板.xlsx"');
+    expect(fs.readFileSync(path.join(root, '画板.csv-data', '画板.csv'), 'utf8')).toContain('新内容');
+  });
+
+  it('leaves existing files unchanged if the CSV fallback fails or changes revision', async () => {
+    for (const revisionChanges of [false, true]) {
+      const root = temporary(), ops = temporary(), { client } = readClient();
+      const mdPath = path.join(root, '画板.md'); fs.writeFileSync(mdPath, 'original');
+      let calls = 0;
+      const info = client.getWorkbookInfo;
+      client.getWorkbookInfo = async (token) => {
+        const value = await info(token); value.data.sheets[0].chart_count = 1;
+        if (revisionChanges && ++calls >= 4) value.data.revision = 42;
+        return value;
+      };
+      const input = { larkCliClient: { ...client, getSheetCsv: async () => {
+        if (!revisionChanges) throw new Error('CSV unavailable');
+        return { data: { annotated_csv: '表头\n数据\n', has_more: false, actual_range: 'A1:E6', revision: 41 } };
+      } }, knowledgeBaseRoot: root, operationDirectory: ops, localMdPath: mdPath,
+      objToken: 'token', wikiNodeToken: null, title: '画板', originalLink: null, objEditTime: 41, spaceId: null };
+      await expect(syncSheetToCustomFolder(input)).rejects.toThrow();
+      expect(fs.readFileSync(mdPath, 'utf8')).toBe('original');
+      expect(fs.existsSync(path.join(root, '画板.csv-data', '画板.csv'))).toBe(false);
+    }
+  });
+
+  it('rejects a truncated CSV fallback without replacing the old markdown', async () => {
+    const root = temporary(), ops = temporary(), { client } = readClient();
+    const mdPath = path.join(root, '画板.md'); fs.writeFileSync(mdPath, 'original');
+    const info = client.getWorkbookInfo;
+    client.getWorkbookInfo = async (token) => { const value = await info(token); value.data.sheets[0].chart_count = 1; return value; };
+    await expect(syncSheetToCustomFolder({
+      larkCliClient: { ...client, getSheetCsv: async () => ({ data: { annotated_csv: '部分内容', has_more: true, actual_range: 'A1:E6', revision: 41 } }) },
+      knowledgeBaseRoot: root, operationDirectory: ops, localMdPath: mdPath,
+      objToken: 'token', wikiNodeToken: null, title: '画板', originalLink: null, objEditTime: 41, spaceId: null,
+    })).rejects.toThrow('完整性无法确认');
+    expect(fs.readFileSync(mdPath, 'utf8')).toBe('original');
+  });
+
   it('pins image/layout-only changes in raw-source integrity hashes', async () => {
     const root = temporary(), mdPath = path.join(root, 'Doc.md'), workbookPath = path.join(root, 'Doc.xlsx');
     fs.writeFileSync(mdPath, '<!--\nfeishu_sync:\n  source_workbook: "Doc.xlsx"\n-->\n# Doc');
@@ -250,6 +345,17 @@ describe('workbook content routes', () => {
     expect(response.headers.get('Content-Type')).toContain('spreadsheetml.sheet');
     expect((await app.request('/api/mapping/workbook/token?sheet=-1')).status).toBe(400);
     expect((await app.request('/api/mapping/workbook/token?sheet=7')).status).toBe(404);
+  });
+
+  it('reports a retained workbook as older when the latest successful sync used CSV fallback', async () => {
+    const { root, app } = await setup();
+    fs.writeFileSync(path.join(root, 'Doc.md'), '<!--\nfeishu_sync:\n  source_acquisition: "csv-fallback"\n  previous_workbook: "Doc.xlsx"\n-->\n# Doc');
+    fs.mkdirSync(path.join(root, 'Doc.csv-data'));
+    fs.writeFileSync(path.join(root, 'Doc.csv-data', 'Sheet.csv'), 'value\n1\n');
+    const content = await (await app.request('/api/mapping/content/token')).json();
+    expect(content.sheetStatus).toMatchObject({ acquisition: 'csv-fallback', workbookMayBeOlder: true });
+    expect(content.workbook.path).toBe('Doc.xlsx');
+    expect(content.csvTables).toHaveLength(1);
   });
 
   it('rejects symlinks escaping the knowledge base and unknown document tokens', async () => {

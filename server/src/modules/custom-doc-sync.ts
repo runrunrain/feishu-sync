@@ -55,7 +55,8 @@ import {
 import type { DocumentIR } from './document-ir.js';
 import { BitableExporter, type BitableClient } from './bitable-exporter.js';
 import { LarkCliError } from './lark-cli-client.js';
-import { stageSourceWorkbook } from './sheet-workbook.js';
+import { stageSourceWorkbook, WorkbookAcquisitionError } from './sheet-workbook.js';
+import { managedWorkbookCompanions } from './workbook-source.js';
 // P0-S8：白板旁路导出（svg 主 + raw 降级）与 SyncEngine 同一导出链
 // （whiteboard-bypass.ts 共享函数，S6 报告 §五遗留接入；见该模块头）。
 import {
@@ -396,7 +397,15 @@ export async function syncSheetToCustomFolder(
   // committed files are staged later from ir.sheets[].csvContent.
   const csvTemp = fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-custom-sheet-'));
   try {
-    const workbook = await stageSourceWorkbook(input.larkCliClient, input.objToken, csvTemp, input.localMdPath);
+    let workbook: Awaited<ReturnType<typeof stageSourceWorkbook>> | null = null;
+    let fallbackRevision: unknown;
+    try { workbook = await stageSourceWorkbook(input.larkCliClient, input.objToken, csvTemp, input.localMdPath); }
+    catch (error) {
+      if (!(error instanceof WorkbookAcquisitionError)) throw error;
+      fallbackRevision = (await input.larkCliClient.getWorkbookInfo(input.objToken))?.data?.revision;
+      if (fallbackRevision == null) throw new Error('无法确认 CSV 后备版本，已保留现有本地文件');
+      if (String(workbookInfo?.data?.revision) !== String(fallbackRevision)) throw new Error('读取子表清单期间表格版本变化，已保留现有本地文件');
+    }
     const csvDataDir = path.join(csvTemp, `${docname}.csv-data`);
     fs.mkdirSync(csvDataDir, { recursive: true });
 
@@ -420,6 +429,10 @@ export async function syncSheetToCustomFolder(
         range,
       });
       const csvText = csvResult?.data?.annotated_csv ?? '';
+      if (!workbook && (csvResult?.data?.has_more !== false || csvResult?.data?.truncated === true
+        || csvResult?.data?.actual_range !== range || String(csvResult?.data?.revision) !== String(fallbackRevision))) {
+        throw new Error(`子表 ${sheet.sheet_name} 的 CSV 范围、版本或完整性无法确认，已保留现有本地文件`);
+      }
       if (!csvText || csvText.trim().length === 0) {
         throw new Error(
           `csv-get 返回空内容: sheet="${sheet.sheet_name}" range=${range}`,
@@ -453,6 +466,10 @@ export async function syncSheetToCustomFolder(
       });
     }
 
+    if (!workbook) {
+      const finalRevision = (await input.larkCliClient.getWorkbookInfo(input.objToken))?.data?.revision;
+      if (finalRevision == null || String(finalRevision) !== String(fallbackRevision)) throw new Error('读取 CSV 期间表格版本变化，已保留现有本地文件');
+    }
     // 3. Reconstruct every sub-sheet into markdown (same section format as
     // SyncEngine step 6: header + CSV link + reconstructed body, joined by
     // horizontal rules).
@@ -477,7 +494,9 @@ export async function syncSheetToCustomFolder(
       wikiNodeToken: input.wikiNodeToken,
       spaceId: input.spaceId,
       objType: 'sheet',
-      workbook: { relativePath: workbook.relativePath, metadataRelativePath: workbook.metadataRelativePath, mode: workbook.mode },
+      workbook: workbook ? { relativePath: workbook.relativePath, metadataRelativePath: workbook.metadataRelativePath, mode: workbook.mode } : undefined,
+      sheetFallback: !workbook,
+      previousWorkbook: !workbook && managedWorkbookCompanions(input.localMdPath).length ? `${docname}.xlsx` : undefined,
       title: input.title,
       originalLink: input.originalLink,
       observedObjEditTime: input.objEditTime,
@@ -495,13 +514,13 @@ export async function syncSheetToCustomFolder(
       })),
     };
 
-    const extraFiles: Array<{ relativePath: string; absoluteSource: string }> = [{
+    const extraFiles: Array<{ relativePath: string; absoluteSource: string }> = workbook ? [{
       relativePath: docDirRel ? `${docDirRel}/${workbook.relativePath}` : workbook.relativePath,
       absoluteSource: workbook.absolutePath,
     }, {
       relativePath: docDirRel ? `${docDirRel}/${workbook.metadataRelativePath}` : workbook.metadataRelativePath,
       absoluteSource: workbook.metadataPath,
-    }];
+    }] : [];
     for (const image of sheetMediaImages) {
       extraFiles.push({
         relativePath: docDirRel
@@ -529,9 +548,9 @@ export async function syncSheetToCustomFolder(
       throw new Error(commit.error || '自定义归档表格写入失败');
     }
 
-    const committedFiles: string[] = [input.localMdPath,
+    const committedFiles: string[] = [input.localMdPath, ...(workbook ? [
       path.join(path.dirname(input.localMdPath), workbook.relativePath),
-      path.join(path.dirname(input.localMdPath), workbook.metadataRelativePath)];
+      path.join(path.dirname(input.localMdPath), workbook.metadataRelativePath)] : [])];
     for (const sheet of exported) {
       committedFiles.push(path.join(path.dirname(input.localMdPath), ...sheet.csvRel.split('/')));
     }

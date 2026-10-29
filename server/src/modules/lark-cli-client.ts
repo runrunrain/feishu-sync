@@ -1072,6 +1072,11 @@ export class LarkCliClient {
     ], 'sheets');
   }
 
+  async getSheetCharts(options: { spreadsheetToken: string; sheetId: string }): Promise<any> {
+    return this.execute(['sheets', '+chart-list', '--spreadsheet-token', options.spreadsheetToken,
+      '--sheet-id', options.sheetId, '--as', 'user', '--format', 'json'], 'sheets');
+  }
+
   // -------------------------------------------------------------------------
   // bitable (多维表格 / base) read 能力。
   //

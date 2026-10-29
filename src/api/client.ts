@@ -589,6 +589,12 @@ export async function syncDocs(
   return result;
 }
 
+export async function refreshSheet(objToken: string): Promise<SyncResult> {
+  const result = await request<SyncResult>('/api/sync/refresh-sheet', { method: 'POST', body: JSON.stringify({ objToken }) });
+  emitDiffChanged('sheet-refresh');
+  return result;
+}
+
 /** Read durable issues that must be repaired in Feishu before syncing can continue. */
 export async function listFeishuPending(): Promise<FeishuPendingItem[]> {
   const data = await request<{ items?: FeishuPendingItem[] } | FeishuPendingItem[]>('/api/sync/feishu-pending');

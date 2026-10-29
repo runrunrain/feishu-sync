@@ -48,6 +48,11 @@ export interface WorkbookExportClient {
   exportWorkbook(spreadsheetToken: string, outputPath: string): Promise<string>;
 }
 
+/** Only acquisition failures may fall back to CSV; local ownership and auth failures remain blockers. */
+export class WorkbookAcquisitionError extends Error {
+  constructor(message: string, options?: ErrorOptions) { super(message, options); this.name = 'WorkbookAcquisitionError'; }
+}
+
 /** Export into staging and preserve the native archive without re-serializing. */
 export async function stageSourceWorkbook(
   client: WorkbookExportClient & Partial<WorkbookReadClient>,
@@ -69,11 +74,12 @@ export async function stageSourceWorkbook(
     let knownOwner = false;
     try {
       const metadataPath = `${finalPath}.metadata.json`;
-      if (fs.statSync(metadataPath).size < 64 * 1024) {
+      if (fs.statSync(metadataPath).size < 2 * 1024 * 1024) {
         knownOwner = JSON.parse(fs.readFileSync(metadataPath, 'utf-8')).objToken === spreadsheetToken;
       }
     } catch { /* Historical/manual files have no ownership sidecar. */ }
-    if (!knownOwner && !previous.includes(`source_workbook: ${JSON.stringify(path.basename(finalPath))}`)) {
+    if (!knownOwner && !previous.includes(`source_workbook: ${JSON.stringify(path.basename(finalPath))}`)
+      && !previous.includes(`previous_workbook: ${JSON.stringify(path.basename(finalPath))}`)) {
       throw new Error(`本地 Excel 文件已存在且未纳管，无法覆盖: ${path.basename(finalPath)}`);
     }
   }
@@ -89,10 +95,15 @@ export async function stageSourceWorkbook(
     if ((error as { code?: string })?.code === 'auth') throw error;
     if (typeof client.getSheetLayout !== 'function' || typeof client.getSheetCells !== 'function'
       || typeof client.getSheetFloatImages !== 'function' || typeof client.getWorkbookInfo !== 'function') {
-      throw error;
+      throw new WorkbookAcquisitionError('Excel 原件获取失败，且只读重建不可用', { cause: error });
     }
     console.info('[sheet-workbook] Native export unavailable; rebuilding workbook through read APIs.');
-    details = await reconstructWorkbookFromReads(client as WorkbookReadClient, spreadsheetToken, absolutePath);
+    try {
+      details = await reconstructWorkbookFromReads(client as WorkbookReadClient, spreadsheetToken, absolutePath);
+    } catch (reconstructionError) {
+      if ((reconstructionError as { code?: string })?.code === 'auth') throw reconstructionError;
+      throw new WorkbookAcquisitionError('Excel 原件获取和只读重建均未完成', { cause: reconstructionError });
+    }
     mode = 'read-reconstruction';
     await readWorkbookPackage(absolutePath);
   }

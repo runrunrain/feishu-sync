@@ -51,6 +51,8 @@ export interface DocumentIR {
   sheets: DocumentSheetRef[];
   /** Native source; Markdown and CSV are only retrieval derivatives. */
   workbook?: { relativePath: string; metadataRelativePath?: string; mode?: 'native' | 'read-reconstruction' };
+  sheetFallback?: boolean;
+  previousWorkbook?: string;
 }
 
 export interface RenderedDocument {
@@ -78,6 +80,8 @@ export function renderDocumentMarkdown(ir: DocumentIR, options?: {
     ir.workbook ? '  source_format: "xlsx"' : null,
     ir.workbook ? `  source_workbook: ${JSON.stringify(ir.workbook.relativePath)}` : null,
     ir.workbook?.mode ? `  source_acquisition: ${JSON.stringify(ir.workbook.mode)}` : null,
+    ir.sheetFallback ? '  source_acquisition: "csv-fallback"' : null,
+    ir.previousWorkbook ? `  previous_workbook: ${JSON.stringify(ir.previousWorkbook)}` : null,
     ir.originalLink ? `  original_link: "${ir.originalLink}"` : null,
     `  fetch_date: "${fetchDate}"`,
     observedEditIso
@@ -122,7 +126,9 @@ export function renderDocumentMarkdown(ir: DocumentIR, options?: {
 
   if (ir.workbook) {
     const href = encodeURI(ir.workbook.relativePath).replace(/\(/g, '%28').replace(/\)/g, '%29');
-    body = `> 原始画板：[Excel 工作簿](${href})。以下文本供检索使用，布局以 Excel 原件为准。\n\n${body}`;
+    body = `> ${ir.workbook.mode === 'read-reconstruction' ? '只读接口重建画板' : '原始画板'}：[Excel 工作簿](${href})。以下文本供检索使用。\n\n${body}`;
+  } else if (ir.sheetFallback) {
+    body = `> 本次仅获取 CSV 后备内容，格式及对象可能不完整。\n\n${body}`;
   }
 
   return {

@@ -127,6 +127,8 @@ export function SyncResultList({
                   <span className="text-[11px] text-ink-faint font-sans-ui">
                     {d.imagesCount > 0 && `${d.imagesCount} 图 · `}
                     {d.sheetsCount > 0 && `${d.sheetsCount} 表 · `}
+                    {d.sheetAcquisition === 'csv-fallback' && 'CSV 后备（Excel 获取未完成） · '}
+                    {d.sheetAcquisition === 'read-reconstruction' && '只读重建 Excel · '}
                     {Math.max(1, Math.round(d.size / 1024))} KB
                   </span>
                   {onOpen && (

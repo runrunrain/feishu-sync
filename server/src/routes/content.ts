@@ -37,6 +37,8 @@ interface ContentDependencies {
       objType: string;
       title: string;
       localMdPath: string;
+      lastSyncedAt?: string | null;
+      syncedObjEditTime?: number | null;
       wikiNodeToken?: string | null;
     } | null;
     /** P1-S3：入边查询（被引用，设计 §2.3）——可选以兼容旧测试替身。 */
@@ -110,7 +112,7 @@ function findWorkbook(deps: ContentDependencies, objToken: string) {
     const metadataPath = `${absolutePath}.metadata.json`;
     if (fs.existsSync(metadataPath)) {
       const metadataReal = fs.realpathSync.native(metadataPath);
-      if (isPathInsideRoot(rootReal, metadataReal) && fs.statSync(metadataReal).size < 64 * 1024) {
+      if (isPathInsideRoot(rootReal, metadataReal) && fs.statSync(metadataReal).size < 2 * 1024 * 1024) {
         try {
           const metadata = JSON.parse(fs.readFileSync(metadataReal, 'utf-8'));
           if (metadata.mode === 'native' || metadata.mode === 'read-reconstruction') mode = metadata.mode;
@@ -348,6 +350,20 @@ contentRoutes.get('/api/mapping/content/:objToken', async (c) => {
       }).out;
     })();
 
+    const workbook = findWorkbook({ localMapStore, configManager }, objToken);
+    const fallback = /^\s+source_acquisition:\s*"csv-fallback"\s*$/m.test(mdContent?.slice(0, 16384) ?? '');
+    let approximations: string[] = [];
+    if (workbook) {
+      try {
+        const real = fs.realpathSync.native(`${workbook.absolutePath}.metadata.json`);
+        if (isPathInsideRoot(fs.realpathSync.native(knowledgeBaseRoot), real) && fs.statSync(real).size < 2 * 1024 * 1024) {
+          const metadata = JSON.parse(fs.readFileSync(real, 'utf-8'));
+          if (metadata.objToken === objToken && Array.isArray(metadata.approximations)) {
+            approximations = [...new Set<string>(metadata.approximations.map((a: any) => String(a.kind)))];
+          }
+        }
+      } catch { /* Historical workbooks may not have a readable sidecar. */ }
+    }
     return c.json({
       objToken: doc.objToken,
       title: doc.title,
@@ -358,10 +374,14 @@ contentRoutes.get('/api/mapping/content/:objToken', async (c) => {
       csvTables,
       referencedBy,
       references,
-      workbook: (() => {
-        const workbook = findWorkbook({ localMapStore, configManager }, objToken);
-        return workbook ? { path: workbook.path, size: workbook.size, modifiedTime: workbook.modifiedTime, mode: workbook.mode } : null;
-      })(),
+      workbook: workbook ? { path: workbook.path, size: workbook.size, modifiedTime: workbook.modifiedTime, mode: workbook.mode } : null,
+      sheetStatus: doc.objType === 'sheet' ? {
+        acquisition: fallback ? 'csv-fallback' : workbook ? workbook.mode ?? 'unknown-excel' : csvTables.length ? 'legacy-csv' : 'unavailable',
+        workbookMayBeOlder: fallback && !!workbook,
+        syncedAt: doc.lastSyncedAt ?? null,
+        cloudEditTime: doc.syncedObjEditTime ?? null,
+        approximations,
+      } : null,
     });
   } catch (error) {
     console.error('[content] read content failed:', error);
