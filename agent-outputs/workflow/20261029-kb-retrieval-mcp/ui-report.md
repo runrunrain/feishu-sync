@@ -1,5 +1,11 @@
 # C4 / P5 知识库共享设置卡交付
 
+> **最新候选增量复验通过（181dc28f，详见文末）：**真实 Electron 的四类复制均经系统剪贴板回读验证；新包启动日志未检出本次真实令牌；CIDR 清空、原生失焦、停用作废及退出回收通过。旧候选的复制和日志缺陷记录保留为历史证据，不能套用到新包；standalone 已由上游在显式回环端口另行补验。
+
+> **CIDR 结论纠正（最新鉴别）：此前“清空 CIDR 未生效”是误报。** 旧候选真实 UI 正确触发输入事件后发送省略 `allowCidrs` 的 PUT，HTTP 200；GET config、磁盘配置和输入框均恢复默认。完整时序见文末「CIDR 原始链路鉴别」。剪贴板与启动日志问题不受此更正影响。
+
+> 真实打包 Electron 已完成隔离交互；剪贴板与启动日志问题待修复，CIDR 清空问题经最新鉴别已撤回。此前各节保留各自时点的证据。
+
 > 续接更新：下方新增「真实浏览器 + 隔离后端」记录，原 mock 记录保留为历史证据。真实 Electron 尚待成品补验；原文中“本轮未连接后端”等语句仅描述第一轮。
 
 ## 结论
@@ -204,3 +210,110 @@ cwd：本 worktree。`npx vitest run src/components/KbLanMcpSettingsCard.test.ts
 - 清空 CIDR 恢复默认的 UI→真实 API 闭环、真实状态 503/loading、两个设备的真实 pi/Claude 挂载、外网卡/防火墙和 `.local` 解析未完成。
 - 新增回环修复的视觉与真实后端交互还未验证；仅定向组件测试/typecheck/lint 通过。主树服务提供的旧 UI 在本轮观测期间未直接修改。
 - 本轮代码增量无提交；`amagi.json`、依赖外链与其他会话修改未触碰。
+
+## 最新续接：真实打包 Electron GUI（2026-10-29）
+
+### 结论与重要缺陷
+
+**完整候选 `.app` 真机 GUI 已运行，不是浏览器或 fixture。** preload 鉴权、动态主 API、回环网关、生命周期、审计和回环/冲突地址修复均实际验证；完整 P5 GUI 验收仍未通过。下列第 2 项经后续鉴别撤回，第 1、3 项不受影响；未擅改后端、Electron 或候选包：
+
+1. **剪贴板无法复制（产品阻塞）**：在 Electron 文件页面真实点击复制地址、pi 配置、Claude 配置、令牌，均提示复制失败；对已知非秘密文本直接调用 `navigator.clipboard.writeText` 返回 `NotAllowedError: Failed to execute 'writeText' on 'Clipboard': Write permission denied.`。四项均不能算通过；无权限情况下浏览器证据不能替代 Electron 剪贴板。建议由 Leader 审核受限 preload clipboard bridge 或正确的权限处理，再重包真实复测；本轮未注入绕过权限、未修改代码。
+2. **CIDR 清空未生效（已撤回的误报）**：上一轮 `fill ''` 后未核验按钮可用、未捕获本次 PUT 或 busy 转换，误把旧成功提示和旧值当成本次提交结果。最新真实链路证明清空正常，详见文末；不再作为产品缺陷。
+3. **desktop token 出现在 server 启动日志（安全缺陷及本轮披露）**：真实候选启动时 stdout 的 `buildServer` options 包含 desktop token 明文。本轮为排查启动时读取了自有启动日志，工具输出中也实际出现了该临时令牌，违背不输出令牌的要求；不在本报告复制其值。发现后立即将该 owned `app.log` 设为 0600 并在原文件中脱敏，布尔复核 `desktopTokenRedacted=true`、`unredactedDesktopToken=false`、`unredactedKbToken=false`；后续启动 stdout/stderr 指向 `/dev/null`。临时应用已退出，desktop token 随进程退出失效；工具会话中已发生的输出不能当作未发生。请 Leader 优先审查并修复生产启动日志，评估日志的其他敏感字段；不因本轮安全首审 PASS 忽略新证据。
+
+### 输入、隔离与进程
+
+- 完整实读 `/Users/run.mao/workpace/feishu-sync/agent-outputs/workflow/20261029-kb-retrieval-mcp/package-report.md`、本报告；复用此前已加载的 agent-browser CLI core/electron 指南。上游 package-report 的 ABI125、签名和 RunAsNode MCP 验证是上游证据，本轮不重新打包或重建。
+- 候选：`/Users/run.mao/workpace/feishu-sync/dist-desktop/darwin-arm64/mac-arm64/Feishu Sync.app/Contents/MacOS/Feishu Sync`，直接启动真实 GUI：`env -u ELECTRON_RUN_AS_NODE NODE_ENV=production FEISHU_SYNC_HOME=/tmp/kb-electron-ui.uIwtKo/data <candidate> --remote-debugging-address=127.0.0.1 --remote-debugging-port=61126 --user-data-dir=/tmp/kb-electron-ui.uIwtKo/user`。独立 session `kb-electron-real-845709126bdf` 明确 `--cdp 61126`，连接的是 app 内 `file://...app.asar/dist/index.html` 页面，不是独立 Chromium 页面。
+- 新建 owned 临时目录 `/tmp/kb-electron-ui.uIwtKo/`，从打包任务的 owned synthetic-kb 复制合成 `fixture-r1` 到其中 `kb/`。配置只绑定 `127.0.0.1`，固定测试端口 `61125`；独立用户目录隔离 single-instance。没有手动更改模型配置、共享 ABI、依赖、主树/候选代码或用户数据。
+- app 正常启动日志还出现 `claude-code 自动安装失败`，未发起模型请求；这是产品启动自动行为，不是本任务主动更改模型配置。未追查其外部副作用。
+- 最终 UI 勾选停用并作废，权威 status `disabled/enabled=false/tokenMasked=null/bindAddress=127.0.0.1`；三次自有 app 实例均经 SIGTERM 进入产品 `QuitCoordinator` 正常退出，session 已关闭；确认网关端口 `61125` 的 `lsof -nP -iTCP:61125 -sTCP:LISTEN` 无输出、退出 1。未停止 Leader 的 Node/Vite。保留 owned 临时目录、已脱敏 0600 启动日志与 screenshots，不做未授权清理。
+
+### 真实 GUI 证据
+
+| 交互 | 实测 | 状态 |
+|---|---|---|
+| preload / 动态主端口 | 实际 `window.desktop.getServerStatus()` 返回 running、动态主端口 61128；`getApiHeaders()` 只检查有 desktop header，不打印值；同头请求真实 config/status 成功。CDP 单独绑定回环 61126 | PASS |
+| 初始 / 启用 | 初始 disabled；确认风险后真实网关状态 running，bind/resolvedHost=127.0.0.1、port=61125，有掩码；合成库网关实际 child 运行 | PASS |
+| 令牌显示、隐藏、原生失焦 | 点击显示/隐藏只检查 DOM 布尔；再次显示后用 macOS `osascript` 激活 Finder，Electron 页面 `document.hasFocus()=false` 且明文节点消失；没有在显示期间截图、snapshot 或输出 DOM 正文 | PASS |
+| URL / pi / Claude / token 复制 | 四类真实按钮全部失败并明确提示；已知非秘密写入探针同样 `NotAllowedError`。因为产品写入没有成功，按指示未读取未知系统剪贴板；不能声称系统剪贴板布尔或哈希回验通过 | **FAIL，见缺陷 1** |
+| 轮换与审计 | 确认轮换，随后状态 running、未自动显示明文；真实 audit 返回 enabled、token_revealed、token_rotated、index_build、disabled | PASS |
+| 回环修复 | 在真实候选中回环监听时，说明「其他设备无法连接」，服务提供的 `.local` 复制按钮及下拉选项均 disabled，回环 URL 保持可选 | PASS，真实截图 `electron-running.png` |
+| 端口冲突修复 | 将网关端口改为同一 owned app 动态主 API 端口（第一次 61128，另次 62818），真实 state=`port_in_use`，可读中文警告、服务未运行说明、全部地址复制与客户端配置复制 disabled；改回 61125 后 running | PASS，真实截图 `electron-failure-final.png` |
+| 高级 maxSessions / CIDR | maxSessions=8 与自定义回环 CIDR 实际保存/GET 回读；此前清空旧值仍存在的判断已撤回，最新正确触发的清空已验证 | **PASS，见文末鉴别** |
+| loading / 保留令牌 | 经 `pgrep -P 27007`/`ps` 核对 gateway child PID 29365 命令包含 owned `/tmp/kb-electron-ui.uIwtKo/kb`、真实 gateway CJS 与 127.0.0.1 后，仅对该 child 发 SIGSTOP；点击停用，UI 实测 `aria-busy=true`、显示「正在处理共享请求」，随后真实超时停止 child 并收敛 disabled。停用前后掩码相等，重新开启仍相等；仅比较布尔，不输出掩码 | PASS（停止的 child 为本任务自有进程，未 mock 服务响应） |
+| 停用作废 / 退出回收 | UI 停用并作废；再单独启用以测应用退出时 child 回收，确认该 child 命令含 owned 根，随后向本任务 app 发送正常 SIGTERM，app 退出、网关监听消失；重启同一隔离 app，UI 再停用并作废新令牌，最后正常退出。又为异常截图复跑一次并再次 UI 停用作废、正常退出 | PASS |
+
+### 视觉材料与盲区
+
+所有下列截图均真实 Electron、无明文令牌，并已用 read 实际查看：
+- `screenshots/electron-disabled.png`：初始 disabled、开启行动与空审计层级清晰。
+- `screenshots/electron-advanced.png`：本机回环、端口、maxSessions=8 和自定义 CIDR 可见；截图本身不证明清空成功。
+- `screenshots/electron-running.png`：运行状态、回环地址、禁用 `.local` 与解释可见；截图只有掩码。
+- `screenshots/electron-failure-final.png`：实际占用端口中文错误、不可连接说明及禁用的复制按钮可见，掩码而非明文；为纠正早轮 `electron-port-error.png`/`electron-port-error-top.png` 因内部滚动只截到高级表单未截到错误状态而重拍。
+- `screenshots/electron-final-disabled.png`：停用并作废反馈与 disabled 状态可见。
+
+未在真实 Electron 复测 375px、高 DPI、Windows、读屏器、非回环 `.local`、第二台设备客户端；未测试权限失败后的系统剪贴板恢复。截图视觉反馈不能代替四类失败的复制功能。未重新运行全量回归；本次未改源代码。当前候选源码/包 hash 一致性由另一个任务最终核对，不能由本报告代替。
+
+## 最新续接：旧候选 CIDR 原始链路鉴别
+
+**结论：撤回此前“CIDR 清空未生效 / 界面误报成功”的产品缺陷判断。** 同一旧候选与同一 owned 数据根中，正确触发输入事件后，PUT、服务端持久化、GET config 和 UI 值一致。上轮 `fill ''` 导致的是验证工具/观察时序误报，不是本次观测到的产品故障；不再建议为此修改 manager。
+
+### 环境及观察方法
+
+- 候选同上，Leader 指定旧候选 c2aca8d；复用 `/tmp/kb-electron-ui.uIwtKo/data` 与 `/tmp/kb-electron-ui.uIwtKo/user`，`env -u ELECTRON_RUN_AS_NODE NODE_ENV=production ... --remote-debugging-address=127.0.0.1 --remote-debugging-port=61126`，stdout/stderr 均 `/dev/null`。不读取上一轮 owned 日志，不重新打包或修改产品、模型、依赖。
+- 自有真实 app PID 33979；独立 CDP session `kb-cidr-investigate-845709126bdf`。网关配置始终 `bindAddress=127.0.0.1`。测试业务只读写该临时 data root。
+- 在页面上包装原始 `fetch`，只对 `PUT /api/kb-lan-mcp/settings` 旁路观察：提取四个允许字段及 `hasOwnProperty('allowCidrs')`，异步 `response.clone().json()` 只提取 status / state / enabled / bindAddress / port；原 fetch 的返回 Promise 和 response 不替换、不改变业务请求或响应。MutationObserver 记录本卡 `aria-busy` 变化；每轮清空观察缓存后，必须等待该轮 PUT 的响应体解析完成，且观察到 busy true→false，再读取 UI、GET config 和磁盘。
+- 报告中的 `allowCidrs: null` 是**脱敏观察摘要表示该字段不存在**，不是请求 body 含 `null`；真实有无以 `hasAllowCidrs` 为准。没有输出 token、请求头或完整配置。
+
+### 可复现时序与原始字段
+
+1. 初始 disabled，绑定 `127.0.0.1`，端口 `62818`，maxSessions=8。通过真实 UI 将 CIDR 改为 `127.0.0.0/9` 并提交：PUT body 精确字段 `{bindAddress:'127.0.0.1',port:62818,maxSessions:8,allowCidrs:['127.0.0.0/9']}`，`hasAllowCidrs=true`；响应 HTTP 200，`{state:'disabled',enabled:false,bindAddress:'127.0.0.1',port:62818}`。观察到 busy=true（performance.now 115041.6）→false（115048.5），响应到达 115046.1。完成后 GET config、磁盘 `config.json.kbLanMcp` 均有 `allowCidrs:['127.0.0.0/9']`，textarea 为 `127.0.0.0/9`。
+2. 尝试 `agent-browser ... fill ''` 后，直接检查真实 DOM：textarea 值为空，但「应用高级设置」仍 disabled、busy=false；点击并等待时本轮观察到 `calls=[]`、`busy=[]`，React 后续重绘把 textarea 还原为旧值。这解释了先前把旧反馈当作新提交的误判。不能仅凭 CLI fill 返回成功或已存在的成功提示宣称请求完成。
+3. 使用真实 UI 输入事件清空：对 textarea 调用原生 focus/select 选中全部，再通过 agent-browser `press Backspace`。点击前实测 textarea=`''` 且「应用高级设置」`disabled=false`。本轮真实 PUT body 精确字段 `{bindAddress:'127.0.0.1',port:62818,maxSessions:8}`，`hasAllowCidrs=false`；HTTP 200，响应提取 `{state:'disabled',enabled:false,bindAddress:'127.0.0.1',port:62818}`。busy=true（261407.3）→false（261412.6），响应到达 261410.1；等待 responseComplete 和 busy=false 后 textarea 仍为空。
+4. 随后通过 desktop preload 获取鉴权头但不输出，真实 GET `/api/config` 的 `kbLanMcp`：`bindAddress=127.0.0.1, port=62818, maxSessions=8, hasAllowCidrs=false`；独立读取 owned `/tmp/kb-electron-ui.uIwtKo/data/config.json` 对应字段，`hasAllowCidrs=false`；UI textarea=`''`。省略字段即按默认段，三层一致。
+
+排查中一次错误键盘组合只删除末位，形成无效 `127.0.0.0/`；服务端真实返回 HTTP 400，未冒充清空成功。其后用原生选中+Backspace 再发送上述唯一成功清空请求。不是连续三次清空：第一次捕获完整正向证据已解释差异，未作无必要的重复业务操作。
+
+### 结束与风险
+
+为满足本轮结束要求，在已确认绑定回环后经 UI 开启，再选「停用并作废令牌」。最终 status：`state=disabled, enabled=false, tokenMasked=null, bindAddress=127.0.0.1, port=62818`；关闭独立浏览器 session，以 SIGTERM 触发自有 app 的正常退出，`lsof -nP -iTCP:62818 -sTCP:LISTEN` 无输出、退出 1。未停止 Leader 的服务，没有新增代码文件或 commit。
+
+本轮只鉴别旧候选 CIDR，不重验已报告的剪贴板/日志修复、新候选 hash 或完整 Electron 回归；这些须由相应后续任务验证。
+
+## 最新续接：最终候选 181dc28f 真实 Electron 增量复验
+
+### 结论及输入
+
+本轮目标项 **PASS**：四类真实产品复制、写入权限边界、已知 token 对启动日志比较、原生失焦隐藏、CIDR 清空与停用/退出回收。复验没有重新构建、修改源码/候选包/依赖、配置模型或启用非回环网卡；不替代最终安全终审、上游的 standalone 补验或其他旧轮未覆盖项。
+
+实读主树 `agent-outputs/workflow/20261029-kb-retrieval-mcp/package-report.md` 的当前候选段：构建前、构建后、打包后各 481 条生产源清单 SHA-256 均为 `885c1582db06618660e9d1e092d34b8931579366c470b3e4efe861e548b91f3b`；包完整清单、ABI125/SQLite、CLI/MCP、DMG/ZIP 的通过为上游记录，本轮不重跑。用户指定该最终候选为 181dc28f；上游报告表述为 c2aca8d 基础上加未提交修复，二者提交标识关系不由此报告独立证明。用户反馈 main check+build exit 0、前端 427/server 1981 通过，属上游信息，不作为本轮实跑。
+
+### 实测环境与安全方法
+
+- 使用 `/Users/run.mao/workpace/feishu-sync/dist-desktop/darwin-arm64/mac-arm64/Feishu Sync.app/Contents/MacOS/Feishu Sync`；`env -u ELECTRON_RUN_AS_NODE NODE_ENV=production FEISHU_SYNC_HOME=/tmp/kb-electron-ui.uIwtKo/data <app> --remote-debugging-address=127.0.0.1 --remote-debugging-port=61126 --user-data-dir=/tmp/kb-electron-ui.uIwtKo/user`。独立 session `kb-final-electron-845709126bdf`；仅 owned 合成 KB、回环 `127.0.0.1:62818`，没读取旧日志或默认用户状态。
+- 本次 startup stdout/stderr 写入 `mktemp` 创建的 owned `/tmp/kb-electron-ui.uIwtKo/final-startup.JQsKoY`（`umask 077`，实测 0600），未直接 read/dump。私有 Node 脚本 `/tmp/kb-electron-ui.uIwtKo/final-clipboard-check.cjs` 经 CDP 在自身内存获取本次 desktop header，并对真实已启用网关调用 reveal 获取本次 KB token（会产生审计）；脚本内与日志内容、剪贴板比较，仅输出固定字段布尔，不输出 token、剪贴板正文、头或完整 config。脚本和日志保留在 owned 目录；回滚仅经授权删除这些 owned 临时文件，勿清理他人工作。
+- 每次系统剪贴板读取都在点击对应真实 UI 按钮且观察到本轮不同类别的「已复制」反馈后执行。pi 与 Claude 的反馈文字相同，故先点击地址复制并观察地址反馈，再选择 Claude、点击复制并观察配置反馈，避免把前一个提示当本次完成。四次分别内存解析/比较；复制令牌后再次用真实地址按钮覆盖剪贴板，未留下令牌。
+- 第一次私有脚本因猜错 agent-browser 下拉选择语法失败，并因未关闭调试 WebSocket 被 60 秒看门狗终止；只完成了地址/pi 证据。核对 CLI 语法并修正 owned helper、失败时主动退出后重跑，全部得到以下结果。没有绕过权限或更改产品。
+
+### 复制、日志和 GUI 证据
+
+| 目标 | 真实观察 | 结果 |
+|---|---|---|
+| 原生桥与权限 | 运行时 `window.desktop.writeClipboardText` 存在，顶层 desktop API 没有 clipboard-read 桥；对已知非秘密字符串调用原生 `navigator.clipboard.writeText` 得 `NotAllowedError`。没有为页面注入剪贴板权限。主树 `electron/preload.ts` 显式暴露写方法，未暴露读方法 | PASS |
+| 地址复制 | 点击回环 URL 的产品复制按钮后系统 `pbpaste` 在 Node 内存中与真实 status 回环 URL 相等；不含本次 KB token、URL 无 query | PASS |
+| pi 配置复制 | 真实点击、内存 JSON 解析成功，URL 等于回环 URL，Authorization 严格等于 `Bearer ${FEISHU_KB_TOKEN}` 字面引用，全文与 URL 均不包含实际 KB token | PASS |
+| Claude Code 配置复制 | 切换客户端后真实点击，内存 JSON 解析成功，type=http、URL 等于回环 URL、Authorization 为同一环境变量引用，全文与 URL 均不包含实际 KB token | PASS |
+| 令牌复制 | 真实点击「复制令牌」，确认本轮反馈后，Node 内存计算系统剪贴板与真实 reveal token 的 SHA-256 相等；不输出 hash 或明文 | PASS |
+| 启动日志 | 私有脚本比较本次 desktop header 和 KB token：`hasDesktopToken=false`、`hasKbToken=false`；`hasBuildServerStarted=true`、`hasBuildServerCompleted=true`、安全 Building server 两个白名单字段投影存在、旧 buildServer options dump 不存在；`hasOldStandaloneTokenLine=false`，日志 0600 | PASS（仅本次 Electron 进程日志；不是 standalone 实测） |
+| 原生失焦 | 通过 System Events 激活 owned PID 40322 后 UI「显示」，只输出 `visible=true, focused=true`；再激活 Finder，输出 `hidden=true, masked=true, focused=false`；未在明文显示期间截图或 snapshot | PASS |
+| CIDR 恢复默认 | 初始空；真实 UI 保存 `127.0.0.0/9`，本轮 PUT 200、busy true→false；原生 select+Backspace 清空，提交前 buttonEnabled=true；本轮 PUT 200、`hasAllowCidrs=false`、busy true→false、textarea 空，GET config 同样无 allowCidrs，bind=127.0.0.1 | PASS；先前误报的撤回仍有效 |
+| 退出回收与最终作废 | UI 运行时 child PID 41075 命令指向 owned KB、回环 62818；关闭本任务 CDP session，向 app PID 40322 发正常 SIGTERM，父与 child 均退出、监听消失。重启同一隔离 app PID 41139，真实 UI 勾选停用并作废；status `disabled/enabled=false/tokenMasked=null/bind=127.0.0.1`。关闭 session、SIGTERM 正常退出；`lsof -nP -iTCP:62818 -sTCP:LISTEN` 无输出且 exit 1 | PASS |
+
+`screenshots/electron-final181-running.png` 与 `screenshots/electron-final181-disabled.png` 均真实候选、只在令牌隐藏时截图并已用 read 实际查看：运行态回环说明与禁用的 `.local` 复制可辨；停用态明确显示令牌已作废。截图不用于证明剪贴板内容，内容由上述私有内存回验确定。
+
+### 未覆盖与剩余风险
+
+- 可选 Agent 设置中 stdio MCP 配置复制未点；本轮未重新跑全部旧状态、其他视口、Windows、第二设备或非回环连接。
+- standalone 是不同启动路径。实读上游 package-report 更新：显式回环端口 49614 下真实入口、管理/网关链、退出及本次测试凭据的日志不泄漏检查通过；使用 `NODE_ENV=test` 跳过自动安装，默认 3001 被占用未实测。不得将本轮 Electron 日志检查或 `hasOldStandaloneTokenLine=false` 当 standalone 验证。
+- 前端 427 / server 1981、CLI/ABI/DMG/ZIP 为用户或上游报告，未在本轮独立重跑；本报告不代替 Leader 的最终增量安全终审。无 commit。

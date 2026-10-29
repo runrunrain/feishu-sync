@@ -2,6 +2,7 @@
  * 明文不进 toast/logger/配置；仅显式 reveal 持有，隐藏/失焦/离开卡片即清除。
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { writeClipboardText } from '../utils/clipboard'
 import { Copy, Network, RefreshCw } from 'lucide-react'
 import { Button } from './common/Button'
 import { Modal } from './common/Modal'
@@ -291,7 +292,7 @@ export function KbLanMcpSettingsCard() {
   }
   const copy = async (value: string, label: string) => {
     try {
-      await navigator.clipboard.writeText(value)
+      await writeClipboardText(value)
       if (alive.current) setFeedback({ error: false, text: `${label}已复制` })
     } catch {
       if (alive.current)

@@ -4,7 +4,7 @@
   "agent": "leader",
   "projectId": "feishu-sync",
   "taskBrief": "知识库检索与MCP交付执行计划",
-  "status": "in-progress",
+  "status": "completed",
   "upstreamArtifactReferences": [
     "/Users/run.mao/workpace/Database/01-AI技术与工具/飞书同步/知识库方案/知识库检索与MCP服务设计方案.md"
   ],

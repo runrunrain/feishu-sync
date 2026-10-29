@@ -1,6 +1,7 @@
 # 知识库检索与 MCP 成品交付工作流
 
 - task_tier: complex; execution_mode: agent_team; autonomy: unattended
+- 当前终态：本机实现/交付已验收，外部真实质量与实机门槛 partial（见 acceptance-report.md）；历史记录中的 pending/FAIL 以最新续接及下方收口为准。
 - 基线：`/Users/run.mao/workpace/Database/01-AI技术与工具/飞书同步/知识库方案/知识库检索与MCP服务设计方案.md`（v1.1，完整 §§0–13 + 附录）
 - 仓库起点：main `41d6aca`。已有未跟踪文件 `agent-outputs/workflow/2026-10-27-kb-agent-upgrade/session-friction-review-2026-10-28.md` 保持不动、不提交。
 - 用户授权：按推荐决策，无人值守；每个大阶段验收后自动 git commit，不 push。
@@ -12,8 +13,8 @@
 |---|---|---|---|---|---|---|
 | A 基线与缺陷修复 | A0 接入/数据证据调查 baize；A1 P0 多词与 raw_search 排序 luban；A2 E0 评测工具与合成 fixture luban | 设计 | investigation.md、p0-report.md、eval-report.md、stage-a-acceptance.md | 64项通过，产品L1合成Q2 Recall 0→1；真实80条缺失不冒充 | Leader | committed 8fba395 |
 | B 共用查询能力 | B1 P1 引擎 luban；B2 E0 lex适配/P2七工具/P3内置接入与集成 Leader | A | engine-report.md、stage-b-evidence.md、stage-b-fixes.md、stage-b-review.md | 157项初验+49项修复相关；10/30MiB预算达标；F1/F2修复终审PASS；真实80条仍缺 | diting full首审+一次终审 | committed 060c02f |
-| C 内网共享成品 | C3 P5 网关/管理面 luban；C4 P5 设置UI luoshen（原C1/C2已随B合入） | B；冻结管理API+共用注册 | gateway-report.md、ui-report.md与集成证据 | 65项机制+正式Node20/24网关与管理API链已通过；补10/30MiB容量/真实UI、最终diting | diting full 02908e87 PASS（代码Gate） | code complete; committing; 完整Electron归D补验 |
-| D 交付验证 | D1 全量check/build、真实客户端与独立staging打包、门控与成品 Leader/执行者 | C | acceptance-report.md、package-report.md、客户端报告、最终产物与提交记录 | 全量test:all 423+1977通过；兼容修复后复测/真实Electron/最终check仍需收口；外部条件如实披露 | C安全审核覆盖新兼容增量 | running: client7098e081 / package7f8020f1 |
+| C 内网共享成品 | C3 P5 网关/管理面 luban；C4 P5 设置UI luoshen（原C1/C2已随B合入） | B；冻结管理API+共用注册 | gateway-report.md、ui-report.md与集成证据 | 机制/正式API/容量/真实Electron通过；两真机缺陷关闭，CIDR误报撤回 | 初审02908e87 + 唯一增量d5338094 PASS | committed c2aca8d；修复随D最终提交 |
+| D 交付验证 | D1 全量check/build、真实客户端与独立staging打包、门控与成品 Leader/执行者 | C | acceptance-report.md、package-report.md、客户端报告、最终产物与提交记录 | 最终427+1981通过/8skip；新版Electron与介质通过；外部门槛按partial披露 | d5338094 PASS，无finding | accepted；本文件同批最终提交 |
 
 每阶段验收后更新本文件并提交该阶段全部本任务变更；仅显式列出的文件进入提交。
 
@@ -59,3 +60,12 @@ A1 在主树限界小改；A2 在独立 worktree（只改脚本/fixtures）。B1
 - 2026-10-29：C full代码审核02908e87 PASS；真实pi/Claude修复后复测7098e081已完成（pi≤6k逐页无截断/Claude七工具和15-40k正文实测）。C代码与文档Gate将提交，完整Electron仍由D验收，不把code PASS称发布批准。
 - 2026-10-29：新增真实Discuss/Pi进程→转发扩展→内部HTTP→section/literal grep会话集成通过（eced9633，仅合成推理fixture）。最终统一npm run check退出0：前端424通过，server1979通过/8skip，lint0error/3既有warning，日志bg-dbfe5e82。
 - 2026-10-29：完整打包Electron GUI补验已续接b7a9eab9（独立用户数据与回环网关，不触真实用户实例/共享ABI），尚未签发GUI通过；候选最后hash/DMG介质检查待源冻结后补齐。
+- 2026-10-29：包最终复核03a528f4通过：475源文件与c2aca8d一致、app/DMG/ZIP清单及codesign一致、DMG只读挂载后已卸载、主树ABI不变。但b7a9eab9真实Electron发现三项缺陷（复制被权限拒绝、CIDR清空现象（worker真实ConfigManager反证nested merge假设，包请求链复核中）、legacy server启动options泄露desktop token），当前候选明确不放行；临时泄露令牌随app退出失效，日志已脱敏0600，未涉及真实用户token。d16d475b合并修根因，随后重包/真机复验/一次安全增量审，不用原PASS覆盖新证据。
+- 2026-10-29：c1ea3374精确捕获旧候选PUT→200/busy→磁盘→GET，证明CIDR清空原本成功；初测fill空串未触发React、按钮disabled且无新请求，误读旧toast。撤回该产品FAIL及manager防御改动，仅保留回归测试。两真实缺陷由受限write-only clipboard IPC/共用helper与日志白名单修复；ea948f1a定向51+19项/tsc/build通过。主树最终npm run check && build:all && electron:build bg-a85e675f退出0，前端427、server1981通过/8skip；新包181dc28f正在重打及补standalone:3001。
+
+## 最终收口
+
+- 181dc28f重包/7ad957c3补验：481条生产源digest `885c1582db06618660e9d1e092d34b8931579366c470b3e4efe861e548b91f3b`，包/构建对应、签名、ABI125/137、DMG挂载/ZIP完整清单、MCP真实SDK通过。正式standalone入口以FEISHU_SYNC_PORT显式49614通过；默认3001 foreign watcher未触碰，NODE_ENV=test跳过自动安装，边界不隐藏。
+- c00dda65最终真实Electron PASS：四复制系统剪贴板私有回验、配置不含实际token、浏览器权限仍拒且无read桥、实际两token日志未检出、blur/CIDR/作废/正常退出通过。Leader抽看最终运行/停用截图，令牌均掩码；截图保留本机screenshots/（按仓库策略不入Git）。
+- d5338094唯一增量安全终审PASS、无finding，已accept；本机交付门关闭。真实80条/12问人工/异机/睡眠24h/Windows/默认3001/公证等仍按acceptance-report列partial，P4/X/P5b未越门控。
+- 回收本任务Node/Vite与全部QA实例；六个owned worktree先留tracked patch/非链接未跟踪文件至 `.amagi-reports/worktree-archives-kb-retrieval-20261029/` 再移除。三棵既有他人worktree保持不动，用户原未跟踪复盘文件SHA-256前后相等；临时amagi.json已移除、未入提交。独立打包staging/旧候选归档保留供复核，无push/上传/公证。

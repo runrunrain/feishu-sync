@@ -16,6 +16,8 @@ import type {
 } from './contracts.js';
 
 export interface DesktopAPI {
+  /** Write-only clipboard; restricted to the main window's main frame. */
+  writeClipboardText: (text: string) => Promise<void>;
   /**
    * Get API headers for authenticated requests to embedded server
    * @returns Promise resolving to headers object with X-Desktop-Token

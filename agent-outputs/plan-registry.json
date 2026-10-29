@@ -10,7 +10,7 @@
       { "phase": "A 基线与缺陷修复", "taskCount": 3, "status": "completed" },
       { "phase": "B 共用查询能力（P1/P2/P3）", "taskCount": 2, "status": "completed" },
       { "phase": "C 内网共享实现与代码Gate（P5）", "taskCount": 2, "status": "completed" },
-      { "phase": "D 交付验证", "taskCount": 1, "status": "running" }
+      { "phase": "D 交付验证", "taskCount": 1, "status": "completed" }
     ],
     "relatedPlanId": ""
   }

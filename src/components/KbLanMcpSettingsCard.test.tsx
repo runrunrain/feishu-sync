@@ -290,6 +290,17 @@ describe('内网 MCP 设置交互（模拟管理 API）', () => {
     })
     expect(api.enable).not.toHaveBeenCalled()
   })
+  it('清空自定义 CIDR 后按完整资源提交省略值并按回读清空', async () => {
+    api.settings.mockResolvedValueOnce({ kbLanMcp: { bindAddress: '127.0.0.1', port: 47391, maxSessions: 8, allowCidrs: ['127.0.0.0/8'] } })
+      .mockResolvedValue({ kbLanMcp: { bindAddress: '127.0.0.1', port: 47391, maxSessions: 8 } })
+    await mount()
+    const textarea = container.querySelector('textarea')!
+    expect(textarea.value).toBe('127.0.0.0/8')
+    await change(textarea, '')
+    await click('应用高级设置')
+    expect(api.save).toHaveBeenCalledWith({ bindAddress: '127.0.0.1', port: 47391, maxSessions: 8, allowCidrs: undefined })
+    expect(textarea.value).toBe('')
+  })
   it('高级设置失败保留草稿，加载失败不伪装默认配置', async () => {
     api.settings.mockRejectedValue(new Error('network'))
     await mount()

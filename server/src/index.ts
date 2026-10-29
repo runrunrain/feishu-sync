@@ -689,7 +689,7 @@ export async function startServer(options: CreateServerOptions & {
   const port = options.port ?? DEFAULT_PORT;
   const hostname = options.hostname || '127.0.0.1';
 
-  console.info(`[server] Building server with options:`, options);
+  console.info('[server] Building server', { desktopMode: options.desktopMode === true, corsDevMode: options.corsDevMode === true });
   const app = await buildServer(options);
   console.info(`[server] Server built, starting HTTP server on port ${port}`);
 
@@ -841,8 +841,7 @@ if (isMainModule) {
   const standaloneToken =
     process.env.FEISHU_SYNC_DEV_TOKEN?.trim() ||
     crypto.randomBytes(32).toString('base64url');
-  console.info(`[server] Standalone mode token: ${standaloneToken}`);
-  console.info('[server] Use this token via X-Desktop-Token header to access protected routes');
+  console.info('[server] Standalone authentication enabled; configure FEISHU_SYNC_DEV_TOKEN for client access');
 
   // FEISHU_SYNC_PORT：本机 3001 被其他项目占用时的避让出口（默认 3001）。
   const standalonePort = Number(process.env.FEISHU_SYNC_PORT) || 3001;

@@ -11,6 +11,7 @@
  */
 
 import { useState } from 'react';
+import { writeClipboardText } from '../utils/clipboard';
 import {
   RefreshCw,
   CheckCircle,
@@ -94,7 +95,7 @@ export function AuthSettingsCard() {
   const handleCopyUrl = async () => {
     if (!setup.authSession) return;
     try {
-      await navigator.clipboard.writeText(setup.authSession.verificationUrl);
+      await writeClipboardText(setup.authSession.verificationUrl);
       setUrlCopied(true);
       setTimeout(() => setUrlCopied(false), 2000);
     } catch {
@@ -379,7 +380,7 @@ export function AuthSettingsCard() {
                     <Button
                       variant="ghost"
                       size="sm"
-                      onClick={() => void navigator.clipboard.writeText(setup.configInitUrl ?? '').catch(() => undefined)}
+                      onClick={() => void writeClipboardText(setup.configInitUrl ?? '').catch(() => undefined)}
                     >
                       <Copy className="w-3.5 h-3.5" />
                       复制

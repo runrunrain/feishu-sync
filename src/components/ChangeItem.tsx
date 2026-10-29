@@ -17,6 +17,7 @@
  */
 
 import { useState, type MouseEvent, type KeyboardEvent } from 'react';
+import { writeClipboardText } from '../utils/clipboard';
 import {
   FileText,
   Table,
@@ -141,8 +142,8 @@ export function ChangeItem({
     e.stopPropagation();
     const textToCopy = change.localMdPath || change.objToken;
     try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(textToCopy);
+      if (window.desktop?.writeClipboardText || navigator.clipboard) {
+        await writeClipboardText(textToCopy);
       } else {
         const input = document.createElement('input');
         input.value = textToCopy;

@@ -1,0 +1,28 @@
+{
+  "taskId": "20261029-kb-retrieval-mcp",
+  "timestamp": "2026-10-29T20:58:06Z",
+  "agent": "leader",
+  "projectId": "feishu-sync",
+  "taskBrief": "知识库检索与MCP源码、本机安装包及证据化验收",
+  "status": "completed",
+  "upstreamArtifactReferences": [
+    "/Users/run.mao/workpace/Database/01-AI技术与工具/飞书同步/知识库方案/知识库检索与MCP服务设计方案.md",
+    "agent-outputs/execution-plan/20261029-kb-retrieval-mcp/execution-plan.md"
+  ],
+  "validationEvidence": {
+    "buildStatus": "passed",
+    "testStatus": "passed",
+    "browserVerification": "verified",
+    "commands": [
+      { "command": "npm run check && npm run build:all && npm run electron:build", "exitCode": 0, "summary": "bg-a85e675f: frontend427/server1981 passed, server8 skipped; lint0error/3legacy warnings" },
+      { "command": "npm run lint", "exitCode": 0, "summary": "最终新增打包/standalone helpers也纳入；0error/3legacy warnings" },
+      { "command": "python3 agent-outputs/workflow/20261029-kb-retrieval-mcp/package-source-manifest.py /tmp/feishu-kb-final-source-check.json", "exitCode": 0, "summary": "481 paths, SHA256 885c1582db06618660e9d1e092d34b8931579366c470b3e4efe861e548b91f3b; 与最终包快照相同" }
+    ]
+  },
+  "tags": ["kb-retrieval", "mcp", "lan", "desktop", "local-adhoc"],
+  "relatedFiles": ["acceptance-report.md", "workflow.md", "package-report.md", "ui-report.md", "client-compatibility-report.md", "discuss-integration-report.md", "stage-d-fixes.md", "stage-d-review.md"],
+  "nextSteps": {
+    "suggestedAgent": "leader",
+    "suggestedAction": "本机交付已验收，c00dda65真实Electron及d5338094唯一安全增量终审PASS。后续有真实release后采集80条与人工12问；补第二设备、睡眠24h、目标token预算/默认3001等明确partial项。P4/X/P5b仅实际门控触发才另开任务。"
+  }
+}
