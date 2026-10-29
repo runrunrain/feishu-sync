@@ -529,11 +529,16 @@ export class AgentToolService {
   }
 
   private async toolKbGrep(context: InternalRunContext, args: Record<string, unknown>): Promise<ToolResult> {
+    // This handler shares Electron's event loop; JS regex has no interruptible timeout.
+    // Only isolated MCP processes may execute regex (LAN adds the parent watchdog).
+    if (args.mode !== undefined && args.mode !== 'literal') {
+      throw new ToolError('invalid_request', '应用内 kb_grep 仅支持 literal；正则请使用独立只读 MCP');
+    }
     const page = await this.query(() => getKbQueryService(context.options.outputRoot).grep({
       pattern: requireString(args, 'pattern', 1, 200),
       ...(args.pathPrefix !== undefined ? { pathPrefix: requireString(args, 'pathPrefix', 0, 4096) } : {}),
       ...(args.cursor !== undefined ? { cursor: requireString(args, 'cursor', 1, 2048) } : {}),
-      mode: args.mode === undefined ? 'literal' : requireString(args, 'mode', 1, 20) as 'literal' | 'regex',
+      mode: 'literal',
       ...(args.caseSensitive !== undefined ? { caseSensitive: args.caseSensitive as boolean } : {}),
       context: optionalInt(args, 'context', 0, 0, 3), maxMatches: optionalInt(args, 'maxMatches', 100, 1, 500),
     }));

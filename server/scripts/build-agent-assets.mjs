@@ -12,7 +12,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { bundleMcp } from './lib/mcp-bundle.mjs';
+import { bundleMcp, bundleGateway } from './lib/mcp-bundle.mjs';
 import { bundleCli } from './lib/cli-bundle.mjs';
 
 const serverRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -57,6 +57,9 @@ console.info(`[build-agent-assets] copied ${roleCount} role card(s)`);
 // 2. MCP 单文件打包（共享入口，配置见 lib/mcp-bundle.mjs）
 const { outfile, size } = await bundleMcp();
 console.info(`[build-agent-assets] bundled ${path.basename(outfile)} (${(size / 1024).toFixed(1)} KB)`);
+
+const gateway = await bundleGateway();
+console.info(`[build-agent-assets] bundled ${path.basename(gateway.outfile)} (${(gateway.size / 1024).toFixed(1)} KB)`);
 
 // 3. CLI 单文件打包（S9，设计 kb-agent-upgrade §6.1/U12；共享入口见
 //    lib/cli-bundle.mjs）——产物 shim 与 Electron RunAsNode 均直接调起。

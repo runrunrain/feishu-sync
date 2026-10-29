@@ -99,6 +99,7 @@ function AppShell() {
           <div className={currentArea === 'settings' ? 'animate-fade-in' : 'hidden'}>
             {/* focusTabId：点 TopBar「新版本」徽标或总览页版本更新入口时直达「应用 · 关于与更新」 */}
             <SettingsView
+              active={currentArea === 'settings'}
               focusTabId={settingsFocusTab || (availableVersion ? 'application' : undefined)}
               focusNonce={settingsFocusNonce}
             />

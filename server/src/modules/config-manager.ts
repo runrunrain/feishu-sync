@@ -32,6 +32,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { resolveDataRoot } from './data-root.js';
+import { defaultLanConfig, normalizeLanConfig, validateLanConfig } from '../kb-lan/network.js';
 import { validateWorkspacesAgainstConfig } from '../agent/protected-roots.js';
 import {
   buildDefaultAgentConfig,
@@ -725,6 +726,7 @@ const DEFAULT_CONFIG: Config = {
   // S8（additive）：命令行访问默认关闭；旧配置无此段时内存补默认。
   // S12（additive）：飞书写回默认关闭（设计 §7.6）。
   cli: { enabled: false },
+  kbLanMcp: defaultLanConfig(),
   // S12（additive）：飞书写回默认关闭；旧配置无此段时内存补默认。
   feishuWrite: { enabled: false },
   // P1-S8（additive）：反向发布默认关闭；旧配置无此段时内存补默认。
@@ -1105,6 +1107,7 @@ export class ConfigManager {
     validateLlmProtocols(partial.llm);
     // S8：cli 段严格校验（缺失不报错，非法类型拒绝）。
     validateCliConfig(partial.cli);
+    if (partial.kbLanMcp !== undefined) validateLanConfig(partial.kbLanMcp);
     // S12：feishuWrite 段严格校验（同 S8 cli 模式；缺失不报错）。
     validateFeishuWriteConfig(partial.feishuWrite);
     // P1-S8：feishuPublish 段严格校验（同 S12 feishuWrite 模式；缺失不报错）。
@@ -1159,6 +1162,9 @@ export class ConfigManager {
         : currentConfig.standardKb,
       // S8（additive）：cli 段显式提供时采用（严格校验已在上方完成），
       // 否则保留当前值（旧配置内存态默认 {enabled:false}）。
+      kbLanMcp: partial.kbLanMcp !== undefined
+        ? normalizeLanConfig(partial.kbLanMcp)
+        : (currentConfig.kbLanMcp ?? defaultLanConfig()),
       cli: partial.cli !== undefined
         ? normalizeCliConfigLoose({ ...(currentConfig.cli ?? { enabled: false }), ...partial.cli })
         : (currentConfig.cli ?? { enabled: false }),
@@ -1422,6 +1428,8 @@ export class ConfigManager {
       // S8（additive）：cli 段宽容归一——缺失/非法 → 默认关闭；不参与
       // _migrated 回写判定（首次任意 save 时自然落盘）。
       cli: normalizeCliConfigLoose(raw.cli),
+      // Missing LAN settings are memory defaults only; never a migration trigger.
+      kbLanMcp: normalizeLanConfig(raw.kbLanMcp),
       // S12（additive）：feishuWrite 段宽容归一——缺失/非法 → 默认关闭；
       // 同样不参与 _migrated 回写判定。
       feishuWrite: normalizeFeishuWriteConfigLoose(raw.feishuWrite),

@@ -11,9 +11,9 @@
 | Phase | 节点 / 完整切片 / Agent | 依赖 | 输出 | 验收 | 审核 | 状态 |
 |---|---|---|---|---|---|---|
 | A 基线与缺陷修复 | A0 接入/数据证据调查 baize；A1 P0 多词与 raw_search 排序 luban；A2 E0 评测工具与合成 fixture luban | 设计 | investigation.md、p0-report.md、eval-report.md、stage-a-acceptance.md | 64项通过，产品L1合成Q2 Recall 0→1；真实80条缺失不冒充 | Leader | committed 8fba395 |
-| B 共用查询能力 | B1 P1 引擎 luban；B2 E0 lex适配/P2七工具/P3内置接入与集成 Leader | A | engine-report.md、stage-b-evidence.md、stage-b-fixes.md、stage-b-review.md | 157项初验+49项修复相关；10/30MiB预算达标；F1/F2修复终审PASS；真实80条仍缺 | diting full首审+一次终审 | accepted; committing |
-| C 内网共享成品 | C3 P5 网关/管理面 luban；C4 P5 设置UI luoshen（原C1/C2已随B合入） | B；冻结管理API+共用注册 | gateway-report.md、ui-report.md与集成证据 | 65项机制+正式Node20/24网关与管理API链已通过；补10/30MiB容量/真实UI、最终diting | diting full，合并阶段diff一次 | integrated; C3 d6a19feb补bench/恢复；C4 56df927c真实browser |
-| D 交付验证 | D1 全量check/build、客户端/性能抽检、门控判定、文档与成品 Leader/执行者 | C | acceptance-report.md、最终产物、提交记录 | 逐条设计追溯 met/partial/missed；未具备外部设备/人工标注条件如实披露 | 按新增风险决定 | pending |
+| B 共用查询能力 | B1 P1 引擎 luban；B2 E0 lex适配/P2七工具/P3内置接入与集成 Leader | A | engine-report.md、stage-b-evidence.md、stage-b-fixes.md、stage-b-review.md | 157项初验+49项修复相关；10/30MiB预算达标；F1/F2修复终审PASS；真实80条仍缺 | diting full首审+一次终审 | committed 060c02f |
+| C 内网共享成品 | C3 P5 网关/管理面 luban；C4 P5 设置UI luoshen（原C1/C2已随B合入） | B；冻结管理API+共用注册 | gateway-report.md、ui-report.md与集成证据 | 65项机制+正式Node20/24网关与管理API链已通过；补10/30MiB容量/真实UI、最终diting | diting full 02908e87 PASS（代码Gate） | code complete; committing; 完整Electron归D补验 |
+| D 交付验证 | D1 全量check/build、真实客户端与独立staging打包、门控与成品 Leader/执行者 | C | acceptance-report.md、package-report.md、客户端报告、最终产物与提交记录 | 全量test:all 423+1977通过；兼容修复后复测/真实Electron/最终check仍需收口；外部条件如实披露 | C安全审核覆盖新兼容增量 | running: client7098e081 / package7f8020f1 |
 
 每阶段验收后更新本文件并提交该阶段全部本任务变更；仅显式列出的文件进入提交。
 
@@ -50,4 +50,12 @@ A1 在主树限界小改；A2 在独立 worktree（只改脚本/fixtures）。B1
 - 2026-10-29：B初验157项，合成10/30MiB预算达标。独立首审F1 Major分页适配断路/F2 Minor含#路径回归；Leader最小修复，49项相关验证通过，终审d0d6eb69 PASS，任务均已accept，真实80条门槛仍缺。
 - 2026-10-29：C正式管理API→子进程→7工具、三端一致、双session notice、轮换/停用、Node20 HTTP bundle真实测试通过。配置保存后refresh的兼容回归已修。C3/C4原始报告仍记录阻塞/mock历史，最新进展需看续接附录。
 - 2026-10-29：主上修复openai-codex新模型目录注册并重启，默认gpt-6.1-terra:xhigh续接已成功：C3 d6a19feb（父96969048），C4 56df927c（父0547ff9f），无模型覆盖。C3写隔离gateway树，C4写隔离UI树，不覆盖Leader主树集成。
-- 2026-10-29：真实browser临时主应用已运行：/tmp/feishu-kb-live.MH6HuA/runtime.json；Node API62492/Vite5173/仅回环gateway62493，临时资料无生产正文；C4独立session验收后保持服务供后续使用，最终由Leader回收。Electron留成品runtime验证，不并发改共享ABI。
+- 2026-10-29：真实browser临时主应用已运行：/tmp/feishu-kb-live.MH6HuA/runtime.json；Node API62492/Vite5173/仅回环gateway62493，临时资料无生产正文。C4真实启停/轮换/审计/端口故障已验证，最终已停用并作废token，Node/Vite保留供复核；Leader自己的browser已关闭。Electron留成品runtime验证，不改共享ABI。
+- 2026-10-29：C3生产默认看门狗真实恢复13029.46ms≤15s、10/30MiB单/3×4压测通过；indexBuildMs只在原缓存build回调观察，无另一套索引。最终增量仅gateway entry/audit/2测试，已回流；报告最新段覆盖早期blocked历史。
+- 2026-10-29：首次全量发现2项旧测试根因（macOS /etc symlink、Pi测试误用Claude默认），3fac3164只修测试32项通过。随后test:all全量前端65文件423项、server136文件1977项通过/8skip（bg-24eac70a）。另一次check被正在编写的client-smoke artifact prefer-const阻断，已交原作者修正，最终还需一次统一check。
+- 2026-10-29：真实pi/Claude CLI驱动发现Claude三工具顶层oneOf被跳过、pi direct8k中文按字节截中段；Leader修复schema兼容（互斥仍强校验）、pi会话≤6000字符页预算，26项相关回归通过，7098e081继续真实CLI复测，非真实LLM质量测试。
+- 2026-10-29：C4实接发现回环.local推荐及故障地址误导，card+test两文件增量已合并；17项定向测试通过，最终视觉/Electron补验待候选。应用内kb_grep改literal-only，regex只留独立MCP进程，纳入C安全审核02908e87。
+- 2026-10-29：独立staging候选打包7f8020f1已完成，app/dmg/zip已生成；codesign通过、包内ABI125 SQLite与stdio/HTTP MCP真调用通过，主树ABI137及native hash不变。staging /Users/run.mao/feishu-sync-candidate.1cQjnvcc；默认ad-hoc Mac arm64，无上传/公证。selected打包首派因交接过大零效果失败，改为独立isolated任务成功。
+- 2026-10-29：C full代码审核02908e87 PASS；真实pi/Claude修复后复测7098e081已完成（pi≤6k逐页无截断/Claude七工具和15-40k正文实测）。C代码与文档Gate将提交，完整Electron仍由D验收，不把code PASS称发布批准。
+- 2026-10-29：新增真实Discuss/Pi进程→转发扩展→内部HTTP→section/literal grep会话集成通过（eced9633，仅合成推理fixture）。最终统一npm run check退出0：前端424通过，server1979通过/8skip，lint0error/3既有warning，日志bg-dbfe5e82。
+- 2026-10-29：完整打包Electron GUI补验已续接b7a9eab9（独立用户数据与回环网关，不触真实用户实例/共享ABI），尚未签发GUI通过；候选最后hash/DMG介质检查待源冻结后补齐。

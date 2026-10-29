@@ -54,12 +54,12 @@ export const KB_READ_SPEC: AgentToolSpec = {
 export const KB_GREP_SPEC: AgentToolSpec = {
   name: 'kb_grep',
   label: '标准库穷举',
-  description: '在已发布标准库穷举字串、ID、字段或正则的全部出现位置，不按相关度截断。命中表格附表头；按返回的 next 游标保持原参数继续。只读，行号仅对响应的 releaseId 有效。',
+  description: '在已发布标准库穷举字串、ID、字段的全部出现位置，不按相关度截断。应用内仅支持literal，正则请用独立MCP。命中表格附表头；按返回的 next 游标保持原参数继续。只读，行号仅对响应的 releaseId 有效。',
   parameters: {
     type: 'object',
     properties: {
       pattern: string('匹配模式（1..200字符）'),
-      mode: { type: 'string', enum: ['literal', 'regex'] },
+      mode: { type: 'string', enum: ['literal'] },
       caseSensitive: { type: 'boolean' },
       pathPrefix: string('按路径段限定目录'),
       context: integer('前后上下文行数', 0, 3),

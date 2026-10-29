@@ -46,6 +46,8 @@ describe.each(['discuss', 'work'] as const)('%s read-only query tools', (runKind
     const matches = [...first.files, ...next.files].flatMap((f: { matches: unknown[] }) => f.matches);
     expect(matches).toHaveLength(2); expect(JSON.stringify(matches)).toContain('tableHeader');
     await expect(tools.executeTool(token, 'kb_grep', { pattern: '(a+)+$', mode: 'regex' })).rejects.toMatchObject({ code: 'invalid_request' });
+    await expect(tools.executeTool(token, 'kb_grep', { pattern: '(a|aa)+$', mode: 'regex' })).rejects.toMatchObject({ code: 'invalid_request' });
+    expect(getToolSpec('kb_grep')?.parameters.properties).toHaveProperty('mode', { type: 'string', enum: ['literal'] });
   });
 });
 it('registers grep consistently in specs, process tools and server capability tokens, never build/task', async () => {

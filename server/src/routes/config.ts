@@ -158,6 +158,8 @@ configRoutes.put('/api/config', async (c) => {
   }
 
   try {
+    // LAN sharing has exactly one write surface: desktop-only dedicated routes.
+    delete partialConfig.kbLanMcp;
     // F1：PUT /api/config 剔除 agent.workspaces（Workspace 增删只走专用
     // 路由 POST/DELETE /api/agent/workspaces，防 UI 全量回传绕过路径校验）。
     if (partialConfig.agent && typeof partialConfig.agent === 'object') {
@@ -264,6 +266,10 @@ configRoutes.put('/api/config', async (c) => {
     }
 
     const updatedConfig = await configManager.updateConfig(partialConfig);
+    if (updatedConfig.standardKb?.outputRoot !== configBefore.standardKb?.outputRoot) {
+      try { await (c as any).kbLanGateway?.refresh(); }
+      catch { console.warn('[config] LAN MCP refresh failed after settings were saved'); }
+    }
 
     // 自动命名的目录立即落盘（否则用户要等首次同步才看得到）；失败不阻断
     // ——同步链路 atomic-commit 写盘时会 recursive mkdir 兑底。

@@ -1,3 +1,4 @@
+import type { KbLanMcpStatus, KbLanMcpSettings, KbLanMcpAuditEntry } from '../types/kb-lan-mcp';
 import type { SourceBatchRequest, SourceBatchPreview, SourceBatchResult } from '../types/source-batch';
 import type { CliEnableResult, CliInfoDto, CliRotateResult, CliShimInstallResult } from '../types/cli';
 import type { PiPluginsDto } from '../types/pi-plugin';
@@ -1509,6 +1510,41 @@ export function requestSessionAgentStatus(id: string, refresh = false): Promise<
 // ---------------------------------------------------------------------------
 // CLI 命令行访问（S9；desktop-guarded 管理面，见 server/src/routes/cli*.ts）
 // ---------------------------------------------------------------------------
+
+/** 内网 MCP：轮询只读脱敏 status/audit；明文只能由显式用户动作获取。 */
+export function getKbLanMcpStatus(signal?: AbortSignal): Promise<KbLanMcpStatus> {
+  return request('/api/kb-lan-mcp/status', { signal, timeoutMs: 15_000 });
+}
+/** status 未包含高级配置；沿用配置读取面，绝不经通用 config PUT 写入。 */
+export function getKbLanMcpSettings(signal?: AbortSignal): Promise<{ kbLanMcp?: KbLanMcpSettings }> {
+  return request('/api/config', { signal, timeoutMs: 15_000 });
+}
+export function enableKbLanMcp(body: { bindAddress?: string; port?: number } = {}): Promise<KbLanMcpStatus> {
+  return request('/api/kb-lan-mcp/enable', { method: 'POST', body: JSON.stringify({
+    ...(body.bindAddress !== undefined ? { bindAddress: body.bindAddress } : {}),
+    ...(body.port !== undefined ? { port: body.port } : {}),
+  }), timeoutMs: 20_000 });
+}
+export function disableKbLanMcp(revokeToken = false): Promise<unknown> {
+  return request('/api/kb-lan-mcp/disable', { method: 'POST', body: JSON.stringify({ revokeToken }), timeoutMs: 20_000 });
+}
+export function saveKbLanMcpSettings(body: KbLanMcpSettings): Promise<unknown> {
+  const { bindAddress, port, maxSessions, allowCidrs } = body;
+  return request('/api/kb-lan-mcp/settings', {
+    method: 'PUT', body: JSON.stringify({ bindAddress, port, maxSessions, ...(allowCidrs !== undefined ? { allowCidrs } : {}) }), timeoutMs: 20_000,
+  });
+}
+export function rotateKbLanMcpToken(): Promise<unknown> {
+  return request('/api/kb-lan-mcp/token/rotate', { method: 'POST', timeoutMs: 20_000 });
+}
+export async function revealKbLanMcpToken(): Promise<string> {
+  const data = await request<{ token: string }>('/api/kb-lan-mcp/token/reveal', { method: 'POST', cache: 'no-store', timeoutMs: 15_000 });
+  if (typeof data.token !== 'string' || !data.token) throw new Error('服务未返回令牌');
+  return data.token;
+}
+export function getKbLanMcpAudit(signal?: AbortSignal): Promise<KbLanMcpAuditEntry[]> {
+  return request('/api/kb-lan-mcp/audit?limit=20', { signal, timeoutMs: 15_000 });
+}
 
 /** GET /api/cli/info —— 开关/端点/shim 状态（不含令牌）。 */
 export function getCliInfo(): Promise<CliInfoDto> {

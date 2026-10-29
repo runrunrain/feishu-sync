@@ -40,7 +40,10 @@ describe('seven read-only MCP tools', () => {
   it('advertises exact tools, annotations, standalone instructions and compact descriptions', async () => {
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual(['get_knowledge', 'get_knowledge_bundle', 'get_outline', 'get_release_info', 'grep_knowledge', 'list_knowledge', 'search_knowledge']);
-    for (const tool of tools) expect(tool.annotations).toEqual({ readOnlyHint: true, idempotentHint: true, openWorldHint: false });
+    for (const tool of tools) {
+      expect(tool.annotations).toEqual({ readOnlyHint: true, idempotentHint: true, openWorldHint: false });
+      for (const keyword of ['oneOf', 'anyOf', 'allOf']) expect(tool.inputSchema).not.toHaveProperty(keyword);
+    }
     expect(client.getInstructions()).toBe(KB_MCP_INSTRUCTIONS);
     expect(KB_MCP_INSTRUCTIONS.split('\n')[0]).toContain('只读');
     expect(tools.map((t) => t.description).join('').length + KB_MCP_INSTRUCTIONS.length).toBeLessThan(2500);
@@ -131,9 +134,30 @@ describe('seven read-only MCP tools', () => {
     const ambiguous = await error('get_knowledge', { docId: 'damage', section: '通用' }, 'kb_section_ambiguous'); expect(ambiguous.candidates).toHaveLength(2);
     await error('get_knowledge', { path: '战斗/伤害.md', docId: 'damage' }, 'invalid_request');
     await error('get_outline', {}, 'invalid_request');
+    await error('get_knowledge', {}, 'invalid_request');
+    await error('get_knowledge_bundle', {}, 'invalid_request');
     await error('search_knowledge', { query: 'a'.repeat(201) }, 'invalid_request');
     await error('search_knowledge', { query: '暴击', limit: 31 }, 'invalid_request');
     await error('search_knowledge', { query: '暴击', unexpected: true }, 'invalid_request');
     await error('get_release_info', { releaseId: '../escape' }, 'invalid_request');
+  });
+
+  it('uses a Chinese byte-safe page budget for pi sessions and preserves every line through next', async () => {
+    const body = '# 长文\n## 规则\n' + Array.from({ length: 90 }, (_, i) => `第${i}行` + '知识资料'.repeat(45)).join('\n');
+    writeSearchRelease(root, 'pi_long', [{ path: '长文.md', docId: 'long', body }]);
+    await client.close(); client = new Client({ name: 'pi', version: '1.4.0' });
+    await client.connect(new StdioClientTransport({ command: process.execPath, args: [script, '--kb-root', root], env: { ...process.env, FEISHU_SYNC_HOME: root } as Record<string, string> }));
+    let startLine = 1, pages = 0;
+    const restored: string[] = [];
+    for (;;) {
+      const page = await call('get_knowledge', { docId: 'long', startLine, maxLines: 2000, releaseId: 'pi_long' }, 6000);
+      expect(Buffer.byteLength(page.text, 'utf8')).toBeLessThan(20000);
+      for (const line of page.text.split('\n')) { const match = /^\s*\d+\t(.*)$/.exec(line); if (match) restored.push(match[1]); }
+      const next = /next: startLine=(\d+)/.exec(page.text);
+      expect(++pages).toBeLessThan(20);
+      if (!next) break;
+      expect(Number(next[1])).toBeGreaterThan(startLine); startLine = Number(next[1]);
+    }
+    expect(pages).toBeGreaterThan(1); expect(restored.join('\n')).toBe(body);
   });
 });
