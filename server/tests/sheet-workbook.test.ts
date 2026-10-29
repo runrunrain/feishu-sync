@@ -135,6 +135,87 @@ describe('native workbook source and authorized read reconstruction', () => {
     expect(saved.worksheets[0].getCell('E4').hyperlink).toBe('https://example.com/reference');
   });
 
+  it('reconstructs an embedded cell image with its bytes, anchor and dimensions', async () => {
+    const { client } = readClient();
+    const get = client.getSheetCells;
+    client.getSheetCells = async (options) => {
+      const result = await get(options);
+      result.data.ranges[0].cells[0][0] = { rich_text: [{ type: 'embed-image', text: '',
+        image_token: 'embedded-token', image_width: 80, image_height: 48 }] };
+      return result;
+    };
+    const directory = temporary();
+    const result = await stageSourceWorkbook(client, 'token', directory, path.join(directory, 'Doc.md'));
+    const manifest = JSON.parse(fs.readFileSync(result.metadataPath, 'utf-8'));
+    expect(manifest.sheets[0].images).toBe(2);
+    expect(manifest.approximations).toContainEqual({ sheet: '画板', cell: 'A1', kind: 'embedded-cell-image-drawing', detail: { width: 80, height: 48 } });
+    const preview = await readWorkbookPreview(result.absolutePath, 0);
+    expect(preview.sheet.images).toHaveLength(2);
+    expect(preview.sheet.images.find((image) => image.x === 0 && image.y === 0)).toMatchObject({
+      width: 80, height: 48, dataUrl: `data:image/png;base64,${PNG.toString('base64')}`,
+    });
+  });
+
+  it('retains mixed rich text, inline link targets and mention identities', async () => {
+    const { client } = readClient();
+    const get = client.getSheetCells;
+    client.getSheetCells = async (options) => {
+      const result = await get(options);
+      result.data.ranges[0].cells[0][0] = { value: '查看资料和设计', note: '原有批注', rich_text: [
+        { type: 'text', text: '查看' },
+        { type: 'link', text: '资料', link: 'https://example.com/reference' },
+        { type: 'text', text: '和' },
+        { type: 'mention', text: '设计', mention_token: 'author', mention_type: 3 },
+      ] };
+      return result;
+    };
+    const directory = temporary();
+    const result = await stageSourceWorkbook(client, 'token', directory, path.join(directory, 'Doc.md'));
+    const manifest = JSON.parse(fs.readFileSync(result.metadataPath, 'utf-8'));
+    expect(manifest.approximations).toContainEqual(expect.objectContaining({ cell: 'A1', kind: 'inline-link-metadata', detail: expect.objectContaining({ link: 'https://example.com/reference', text: '资料' }) }));
+    expect(manifest.approximations).toContainEqual(expect.objectContaining({ cell: 'A1', kind: 'mention', detail: expect.objectContaining({ mention_token: 'author' }) }));
+    const preview = await readWorkbookPreview(result.absolutePath, 0);
+    expect(preview.sheet.cells.find((cell) => cell.address === 'A1')?.text).toBe('查看资料和设计');
+    expect(preview.sheet.cells.find((cell) => cell.address === 'A1')?.richText?.map((run) => run.text)).toEqual(['查看', '资料', '和', '设计']);
+    const saved = new ExcelJS.Workbook(); await saved.xlsx.readFile(result.absolutePath);
+    expect(saved.worksheets[0].getCell('A1').note).toContain('原有批注');
+    expect(saved.worksheets[0].getCell('A1').note).toContain('https://example.com/reference');
+  });
+
+  it('does not create a workbook when an embedded image cannot be downloaded', async () => {
+    const { client } = readClient();
+    const get = client.getSheetCells;
+    client.getSheetCells = async (options) => {
+      const result = await get(options);
+      result.data.ranges[0].cells[0][0] = { rich_text: [{ type: 'embed-image', text: '',
+        image_token: 'embedded-token', image_width: 80, image_height: 48 }] };
+      return result;
+    };
+    client.downloadMedia = async (token, outputPath) => {
+      if (token === 'embedded-token') throw new Error('图片不可用');
+      fs.writeFileSync(`${outputPath}.png`, PNG);
+      return `${outputPath}.png`;
+    };
+    const directory = temporary(), output = path.join(directory, 'rejected.xlsx');
+    await expect(reconstructWorkbookFromReads(client, 'token', output)).rejects.toThrow();
+    expect(fs.existsSync(output)).toBe(false);
+  });
+
+  it('explains why attachments cannot be silently omitted from a reconstruction', async () => {
+    const { client } = readClient();
+    const get = client.getSheetCells;
+    client.getSheetCells = async (options) => {
+      const result = await get(options);
+      result.data.ranges[0].cells[0][0] = { value: '数据.json', rich_text: [
+        { type: 'attachment', text: '数据.json', attachment_token: 'file-token', file_size: 10, mime_type: 'application/json' },
+      ] };
+      return result;
+    };
+    const output = path.join(temporary(), 'rejected.xlsx');
+    await expect(reconstructWorkbookFromReads(client, 'token', output)).rejects.toThrow('含附件，当前无法完整还原附件原件');
+    expect(fs.existsSync(output)).toBe(false);
+  });
+
   it('splits truncated read windows and accepts only complete row/column coordinates', async () => {
     const { client, calls } = readClient();
     const get = client.getSheetCells;

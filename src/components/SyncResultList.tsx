@@ -6,11 +6,12 @@
  * 重试 = 重新调起 useSync.syncDocuments 传入失败项。
  */
 
-import { CheckCircle2, XCircle, FolderOpen, RotateCw, Wrench } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, XCircle, FolderOpen, RotateCw, Wrench } from 'lucide-react';
 import { Card, CardBody } from './common/Card';
 import { Button } from './common/Button';
 import type { SyncResult, FailedDocument } from '../types';
 import { unsupportedCloudTypeText } from '../utils/cloudObjType';
+import { summarizeSyncResult } from '../utils/syncResultSummary';
 
 interface SyncResultListProps {
   result: SyncResult;
@@ -40,9 +41,7 @@ export function SyncResultList({
   onOpen,
   onClear,
 }: SyncResultListProps) {
-  const isDryRun = result.mode === 'dry-run';
-  const ok = result.success && result.failedDocuments.length === 0;
-  const failedCount = result.failedDocuments.length;
+  const { isDryRun, partialDocuments, completedDocuments, writablePlans, successCount, failedCount, ok } = summarizeSyncResult(result);
   const cloudSideFailures = result.failedDocuments.filter((document) =>
     document.repairAction === 'grant_access'
       || document.repairAction === 'review_deleted'
@@ -59,30 +58,31 @@ export function SyncResultList({
   const existingFileFailures = result.failedDocuments.filter((document) =>
     document.repairAction === 'adopt_existing_file',
   );
-  const plannedDocuments = result.plannedDocuments ?? [];
-  const writablePlans = plannedDocuments.filter((document) => document.action !== 'blocked');
-  const successCount = isDryRun ? writablePlans.length : result.syncedDocuments.length;
   const issueLabel = isDryRun ? '阻止' : '失败';
 
   return (
     <Card variant={ok ? 'default' : 'elevated'} className={ok ? 'border-jade/30' : 'border-seal/30'}>
       <CardBody className="space-y-3">
         {/* Header summary */}
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           {ok ? (
             <CheckCircle2 className="w-4 h-4 text-jade" />
+          ) : partialDocuments.length > 0 && failedCount === 0 ? (
+            <AlertTriangle className="w-4 h-4 text-seal" />
           ) : (
             <XCircle className="w-4 h-4 text-seal-2" />
           )}
           <span className="text-sm text-ink font-medium">
             {isDryRun
               ? (ok ? '核验计划已生成' : '核验计划已生成（含阻止项）')
-              : (ok ? '同步完成' : '同步完成（含失败项）')}
+              : (ok ? '同步完成' : partialDocuments.length > 0
+                ? (failedCount > 0 ? '同步完成（含待修复和失败项）' : '同步完成（含待修复项）')
+                : '同步完成（含失败项）')}
           </span>
           <span className="text-xs text-ink-faint font-sans-ui">
             {isDryRun
               ? `${successCount} 待写入 / ${failedCount} ${issueLabel}`
-              : `${successCount} 成功 / ${failedCount} ${issueLabel}`}
+              : `${successCount} 成功${partialDocuments.length ? ` / ${partialDocuments.length} 待修复` : ''} / ${failedCount} ${issueLabel}`}
             {' · 用时 '}{formatDuration(result.duration)}
           </span>
         </div>
@@ -117,7 +117,7 @@ export function SyncResultList({
               成功 ({successCount})
             </p>
             <ul className="space-y-1">
-              {result.syncedDocuments.map((d) => (
+              {completedDocuments.map((d) => (
                 <li
                   key={d.objToken}
                   className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-paper-2"
@@ -127,7 +127,6 @@ export function SyncResultList({
                   <span className="text-[11px] text-ink-faint font-sans-ui">
                     {d.imagesCount > 0 && `${d.imagesCount} 图 · `}
                     {d.sheetsCount > 0 && `${d.sheetsCount} 表 · `}
-                    {d.sheetAcquisition === 'csv-fallback' && 'CSV 后备（Excel 获取未完成） · '}
                     {d.sheetAcquisition === 'read-reconstruction' && '只读重建 Excel · '}
                     {Math.max(1, Math.round(d.size / 1024))} KB
                   </span>
@@ -139,6 +138,29 @@ export function SyncResultList({
                     >
                       <FolderOpen className="w-3 h-3" />
                       打开
+                    </button>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {!isDryRun && partialDocuments.length > 0 && (
+          <div>
+            <p className="text-[11px] text-seal font-medium mb-1.5">Excel 待修复 ({partialDocuments.length})</p>
+            <ul className="space-y-1">
+              {partialDocuments.map((document) => (
+                <li key={document.objToken} className="flex items-start gap-2 rounded bg-seal/5 px-2 py-2">
+                  <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-seal" />
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm text-ink">{document.title}</p>
+                    <p className="text-[11px] leading-5 text-ink-soft">CSV 后备已保存，Excel 尚未获取，文档会继续留在待修复列表。</p>
+                    {document.sheetAcquisitionIssue && <p className="text-[11px] leading-5 text-ink-faint break-words">原因：{document.sheetAcquisitionIssue}</p>}
+                  </div>
+                  {onOpen && (
+                    <button type="button" onClick={() => onOpen(document.localMdPath)} className="inline-flex shrink-0 items-center gap-1 rounded border border-line bg-card-bg px-2 py-0.5 text-[11px] text-ink-soft hover:bg-paper-2 font-sans-ui">
+                      <FolderOpen className="h-3 w-3" />打开
                     </button>
                   )}
                 </li>

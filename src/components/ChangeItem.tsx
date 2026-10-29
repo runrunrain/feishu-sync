@@ -31,6 +31,7 @@ import {
   Check,
   FolderOpen,
   Info,
+  Wrench,
 } from 'lucide-react';
 import { StatusBadge } from './common/StatusBadge';
 import { BusinessTag } from './common/BusinessTag';
@@ -107,7 +108,7 @@ export function ChangeItem({
   const toast = useToast();
 
   const isDeleted = change.changeType === 'deleted';
-  const StateIcon = STATE_ICON[change.changeType];
+  const StateIcon = change.xlsxMissing && change.syncState === 'synced' ? Wrench : STATE_ICON[change.changeType];
   const TypeIcon = TYPE_ICON[change.objType] ?? FileType;
   const isSheet = change.objType === 'sheet';
   const hasSubSheets = isSheet && Array.isArray(sheets) && sheets.length > 0;
@@ -168,6 +169,7 @@ export function ChangeItem({
   };
 
   const displayPath = getDisplayPath(change);
+  const stateLabel = change.xlsxMissing && change.syncState === 'synced' ? 'Excel 待修复' : STATE_LABEL[change.changeType];
 
   return (
     <div
@@ -181,7 +183,7 @@ export function ChangeItem({
         onKeyDown={handleKeyDown}
         role="button"
         tabIndex={0}
-        aria-label={`${change.title} - ${STATE_LABEL[change.changeType]}`}
+        aria-label={`${change.title} - ${stateLabel}`}
       >
         {/* Checkbox (32px 居中对齐，删除项禁用不可批量同步) */}
         <div
@@ -241,6 +243,9 @@ export function ChangeItem({
                 图片缺失
               </span>
             )}
+            {change.xlsxMissing && change.syncState !== 'synced' && (
+              <span className="inline-flex shrink-0 items-center rounded border border-seal/25 bg-seal/10 px-1 py-0.2 text-[10px] text-seal font-sans-ui">Excel 待修复</span>
+            )}
 
             {/* 业务标签 */}
             {businessMarks && businessMarks.length > 0 && (
@@ -265,7 +270,7 @@ export function ChangeItem({
           <StatusBadge status={change.changeType} size="sm" hideDot={false}>
             <span className="inline-flex items-center gap-1">
               <StateIcon className="w-2.5 h-2.5" />
-              {STATE_LABEL[change.changeType]}
+              {stateLabel}
             </span>
           </StatusBadge>
         </div>

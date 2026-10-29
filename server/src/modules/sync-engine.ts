@@ -822,12 +822,17 @@ export class SyncEngine {
     const docname = path.basename(localMdPath, '.md');
     let workbook: Awaited<ReturnType<typeof stageSourceWorkbook>> | null = null;
     let sheetFallback = false;
+    let sheetAcquisitionIssue: string | undefined;
     let fallbackRevision: unknown;
     if (doc.objType === 'sheet') {
       try { workbook = await measureSyncPhase('workbook', () => stageSourceWorkbook(this.requireLarkCliClient(), doc.objToken, stagingDocDir, localMdPath)); }
       catch (error) {
         if (!(error instanceof WorkbookAcquisitionError)) throw error;
         sheetFallback = true;
+        const cause = error.cause instanceof Error
+          ? error.cause.message.replace(/float_image\s+\S+\s+\([^)]*\)/g, '表格图片')
+          : '';
+        sheetAcquisitionIssue = `${error.message}${cause ? `：${cause}` : ''}`.slice(0, 500);
         fallbackRevision = (await this.requireLarkCliClient().getWorkbookInfo(doc.objToken))?.data?.revision;
         if (fallbackRevision == null) throw new Error('无法确认 CSV 后备版本，已保留现有本地文件');
       }
@@ -1261,6 +1266,7 @@ export class SyncEngine {
       attachmentsCount: attachments.length + (bitableResult?.attachments.length ?? 0),
       sheetsCount: sheets.length,
       sheetAcquisition: doc.objType === 'sheet' ? (workbook?.mode ?? 'csv-fallback') : undefined,
+      sheetAcquisitionIssue,
       referencesTruncated: referenceExtraction.truncated ? true : undefined,
     };
   }

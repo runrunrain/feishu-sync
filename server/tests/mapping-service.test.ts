@@ -45,6 +45,21 @@ it('lists synced CSV-only sheets for XLSX repair until an XLSX exists', () => {
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+it('keeps CSV fallback in repair when only an older workbook exists', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sheet-stale-workbook-'));
+  try {
+    const md = path.join(root, 'sheet.md');
+    fs.writeFileSync(md, '<!--\nfeishu_sync:\n  obj_token: "sheet"\n  source_acquisition: "csv-fallback"\n  previous_workbook: "sheet.xlsx"\n-->\n# sheet');
+    fs.writeFileSync(path.join(root, 'sheet.xlsx'), 'previous workbook');
+    const store = new MockLocalMapStore(), url = 'https://example.feishu.cn/wiki/rootA';
+    store.rows.set('sheet', makeDoc({ objToken: 'sheet', objType: 'sheet', watchedRootUrl: url, watchedRootId: 'rootA', syncState: 'synced', localMdPath: md }));
+    const svc = new MappingService(new MockChangeDetector() as any, store as any, new MockSnapshotService() as any, { getConfig: () => ({ knowledgeBaseRoot: root }) } as any);
+    expect(svc.getStoredDiff(url).modified).toMatchObject([{ objToken: 'sheet', xlsxMissing: true }]);
+    fs.writeFileSync(md, '<!--\nfeishu_sync:\n  obj_token: "sheet"\n  source_acquisition: "read-reconstruction"\n-->\n# sheet\n  source_acquisition: "csv-fallback"');
+    expect(svc.getStoredDiff(url).modified).toEqual([]);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 it('shows identity-matched local paths for permission-restricted documents without changing the saved record', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'restricted-tree-'));
   try {

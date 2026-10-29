@@ -519,6 +519,8 @@ export function isMediaGapReason(
 export interface SyncedDocument {
   performance?: import('../modules/sync-performance.js').SyncPerformance;
   sheetAcquisition?: 'native' | 'read-reconstruction' | 'csv-fallback';
+  /** Excel acquisition failed, while a version-checked CSV fallback was saved. */
+  sheetAcquisitionIssue?: string;
   objToken: string;
   title: string;
   localMdPath: string;

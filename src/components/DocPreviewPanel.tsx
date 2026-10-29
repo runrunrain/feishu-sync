@@ -165,7 +165,12 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
     try {
       const result = await refreshSheet(objToken);
       if (!result.success || result.failedDocuments.length) throw new Error(result.failedDocuments[0]?.error ?? '重新获取未完成');
-      toast.push({ type: 'success', message: '表格获取完成，请查看版本状态。' });
+      const fallback = result.syncedDocuments.find((document) => document.sheetAcquisition === 'csv-fallback');
+      if (fallback) {
+        toast.push({ type: 'warning', message: 'CSV 后备已保存，Excel 仍待修复。', hint: fallback.sheetAcquisitionIssue });
+      } else {
+        toast.push({ type: 'success', message: '表格获取完成，请查看版本状态。' });
+      }
       if (currentToken.current === objToken) loadContent(objToken);
     } catch (error) {
       toast.push({ type: 'error', message: error instanceof Error ? error.message : '重新获取失败，已有文件已保留' });
@@ -296,7 +301,7 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
           )}
 
           {/* 在系统文件管理器中打开本地文件 */}
-          {node.obj_type === 'sheet' && content && !content.workbook && ['legacy-csv', 'csv-fallback'].includes(content.sheetStatus?.acquisition ?? '') && <button type="button" onClick={() => void handleRefreshSheet()} disabled={refreshingSheet || !node.local_path} className="inline-flex shrink-0 items-center gap-1 rounded-md border border-line bg-paper px-2 py-1.5 text-[11px] text-ink-soft hover:bg-paper-2 disabled:opacity-40"><RefreshCw className={`w-3 h-3 ${refreshingSheet ? 'animate-spin' : ''}`} />{refreshingSheet ? '获取中…' : '重新获取 Excel'}</button>}
+          {node.obj_type === 'sheet' && content && (content.sheetStatus?.acquisition === 'csv-fallback' || (!content.workbook && content.sheetStatus?.acquisition === 'legacy-csv')) && <button type="button" onClick={() => void handleRefreshSheet()} disabled={refreshingSheet || !node.local_path} className="inline-flex shrink-0 items-center gap-1 rounded-md border border-line bg-paper px-2 py-1.5 text-[11px] text-ink-soft hover:bg-paper-2 disabled:opacity-40"><RefreshCw className={`w-3 h-3 ${refreshingSheet ? 'animate-spin' : ''}`} />{refreshingSheet ? '获取中…' : '重新获取 Excel'}</button>}
           <button
             type="button"
             onClick={handleOpenFolder}
@@ -326,6 +331,8 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
           {status.workbookMayBeOlder && <span> · 已保留此前的 Excel，可能较旧；当前默认显示本次获取的 CSV</span>}
           {status.workbookMayBeOlder && content?.workbook?.modifiedTime && <span> · Excel 本地修改时间 {new Date(content.workbook.modifiedTime).toLocaleString()}</span>}
           {status.acquisition === 'read-reconstruction' && status.approximations.includes('mention') && <span> · 提及已转为文本</span>}
+          {status.acquisition === 'read-reconstruction' && status.approximations.includes('embedded-cell-image-drawing') && <span> · 单元格内图片已按位置还原为锚定图片</span>}
+          {status.acquisition === 'read-reconstruction' && status.approximations.includes('inline-link-metadata') && <span> · 混排文字链接保存在单元格批注与元数据中</span>}
           {status.acquisition === 'read-reconstruction' && status.approximations.includes('chart-approximate-pie') && <span> · 饼图近似重建，需下载查看</span>}
           {status.acquisition === 'read-reconstruction' && status.approximations.includes('chart-metadata-only') && <span> · 部分图表仅保存配置</span>}
         </div>}

@@ -37,7 +37,7 @@ const TAB_LABEL: Record<Tab, string> = {
   added: '新增',
   modified: '已修改',
   mediaGap: '图片缺失待修复',
-  xlsxMissing: 'XLSX 缺失待修复',
+  xlsxMissing: 'Excel 待修复',
   deleted: '已删除',
 };
 

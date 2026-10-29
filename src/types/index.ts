@@ -183,6 +183,7 @@ export type SyncState =
 export interface SyncedDocument {
   performance?: { elapsedMs: number; phasesMs: Record<string, number>; cliCalls: number; queueMs: number; throttleMs: number; executionMs: number; cacheHits: number };
   sheetAcquisition?: 'native' | 'read-reconstruction' | 'csv-fallback';
+  sheetAcquisitionIssue?: string;
   objToken: string;
   title: string;
   localMdPath: string;

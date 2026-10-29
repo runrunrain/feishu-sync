@@ -28,6 +28,7 @@ import { useSync } from '../hooks/useSync';
 import { useToast } from '../components/common/Toast';
 import { appLogger } from '../utils/appLogger';
 import { isUsableWikiUrl, pickFirstValidWikiUrl } from '../utils/wikiUrl';
+import { summarizeSyncResult } from '../utils/syncResultSummary';
 import { detectChanges, requestFeishuPendingRecheck, bulkProcessDeletedDocs } from '../api/client';
 import type { ChangedDocument, DiffReport, FailedDocument, FeishuPendingItem } from '../types';
 
@@ -140,19 +141,18 @@ export function SyncView({ active = true, onJumpToSettings }: SyncViewProps) {
     // Feishu queue. Refresh both the normal cached diff and that queue.
     setDiffRefreshSignal((value) => value + 1);
     if (result) {
-      const isDryRun = result.mode === 'dry-run';
-      const plannedCount = isDryRun
-        ? (result.plannedDocuments ?? []).filter((document) => document.action !== 'blocked').length
-        : result.syncedDocuments.length;
-      const ok = result.success && result.failedDocuments.length === 0;
+      const { isDryRun, partialDocuments, successCount, ok } = summarizeSyncResult(result);
+      const pendingExcel = partialDocuments.length;
       toast.push({
         type: ok ? 'success' : 'warning',
         message: isDryRun
           ? (ok ? '核验计划已生成' : '核验计划已生成（含阻止项）')
-          : (ok ? '同步完成' : '同步完成（含失败项）'),
+          : (ok ? '同步完成' : pendingExcel
+            ? (result.failedDocuments.length ? '同步完成（含待修复和失败项）' : '同步完成（含待修复项）')
+            : '同步完成（含失败项）'),
         hint: isDryRun
-          ? `${plannedCount} 待写入 / ${result.failedDocuments.length} 阻止`
-          : `${plannedCount} 成功 / ${result.failedDocuments.length} 失败`,
+          ? `${successCount} 待写入 / ${result.failedDocuments.length} 阻止`
+          : `${successCount} 成功${pendingExcel ? ` / ${pendingExcel} 待修复` : ''} / ${result.failedDocuments.length} 失败`,
       });
     }
   };
@@ -270,10 +270,13 @@ export function SyncView({ active = true, onJumpToSettings }: SyncViewProps) {
       );
       setDiffRefreshSignal((value) => value + 1);
       const notRecovered = targets.length - recovered.size;
+      const summary = result ? summarizeSyncResult(result) : null;
+      const pendingExcel = summary?.partialDocuments.length ?? 0;
+      const completed = Boolean(summary?.ok);
       toast.push({
-        type: result?.success ? 'success' : 'warning',
-        message: result?.success ? '结构修复并同步完成' : '结构修复后同步完成（含失败项）',
-        hint: `${recovered.size} 项已重试${notRecovered > 0 ? `；${notRecovered} 项仍需后续处理` : ''}`,
+        type: completed ? 'success' : 'warning',
+        message: completed ? '结构修复并同步完成' : '结构修复后同步完成（含待处理项）',
+        hint: `${recovered.size} 项已重试${pendingExcel ? `；${pendingExcel} 项 Excel 待修复` : ''}${notRecovered > 0 ? `；${notRecovered} 项仍需后续处理` : ''}`,
       });
     } finally {
       setRepairingParentChains(false);
@@ -312,11 +315,14 @@ export function SyncView({ active = true, onJumpToSettings }: SyncViewProps) {
         adoptExistingProfileTargets: true,
       });
       setDiffRefreshSignal((value) => value + 1);
+      const summary = result ? summarizeSyncResult(result) : null;
+      const pendingExcel = summary?.partialDocuments.length ?? 0;
+      const completed = Boolean(summary?.ok);
       toast.push({
-        type: result?.success ? 'success' : 'warning',
-        message: result?.success ? '本地旧文件已认领并同步' : '认领并同步完成（含未处理项）',
+        type: completed ? 'success' : 'warning',
+        message: completed ? '本地旧文件已认领并同步' : '认领并同步完成（含未处理项）',
         hint: result
-          ? `${result.syncedDocuments.length} 成功 / ${result.failedDocuments.length} 未处理`
+          ? `${summary?.successCount ?? 0} 成功${pendingExcel ? ` / ${pendingExcel} 待修复` : ''} / ${result.failedDocuments.length} 未处理`
           : '请求未完成，请查看同步结果。',
       });
     } finally {

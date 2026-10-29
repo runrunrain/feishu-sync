@@ -83,7 +83,22 @@ export class MappingService {
     const md = doc.localMdPath;
     if (!root || doc.objType !== 'sheet' || !md || !/\.md$/i.test(md)) return false;
     const workbook = workbookPathForMarkdown(md);
-    if (localPathState(root, md) !== 'present' || localPathState(root, workbook) !== 'missing') return false;
+    if (localPathState(root, md) !== 'present') return false;
+    const workbookState = localPathState(root, workbook);
+    if (workbookState === 'present') {
+      // CSV fallback may leave an older managed workbook alongside the new
+      // Markdown. File existence alone does not make that workbook current.
+      let descriptor: number | undefined;
+      try {
+        descriptor = fs.openSync(path.resolve(root, md), 'r');
+        const buffer = Buffer.alloc(16_384);
+        const bytes = fs.readSync(descriptor, buffer, 0, buffer.length, 0);
+        const header = /^<!--\s*\r?\n([\s\S]*?)\r?\n-->/.exec(buffer.subarray(0, bytes).toString('utf8'))?.[1];
+        return !!header && /^feishu_sync:\s*$/m.test(header) && /^\s+source_acquisition:\s*"csv-fallback"\s*$/m.test(header);
+      } catch { return false; }
+      finally { if (descriptor !== undefined) { try { fs.closeSync(descriptor); } catch { /* Best-effort cleanup. */ } } }
+    }
+    if (workbookState !== 'missing') return false;
     const csvDir = md.replace(/\.md$/i, '.csv-data');
     if (localPathState(root, csvDir, 'directory') !== 'present') return false;
     try { return fs.readdirSync(path.resolve(root, csvDir), { withFileTypes: true }).some((item) => item.isFile() && /\.csv$/i.test(item.name)); }
@@ -296,7 +311,10 @@ export class MappingService {
     const docs = this.localMapStore.listAllCustomFolderDocs();
     const blocked = this.blockedTokens();
     return docs
-      .filter((doc) => (doc.syncState === 'pending_modified' || (doc.syncState === 'synced' && this.missingWorkbook(doc))) && !blocked.has(doc.objToken))
+      .filter((doc) => {
+        const state = this.storedSyncState(doc);
+        return (state === 'pending_modified' || (state === 'synced' && this.missingWorkbook(doc))) && !blocked.has(doc.objToken);
+      })
       .map((doc) => this.toCustomChangedDocument(doc));
   }
 

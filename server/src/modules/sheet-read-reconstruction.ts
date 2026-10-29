@@ -71,15 +71,46 @@ function excelFont(styles: JsonObject): Partial<ExcelJS.Font> {
   };
 }
 
-function applyCell(cell: ExcelJS.Cell, raw: JsonObject, formulaRaw: JsonObject, approximations: NonNullable<WorkbookReadManifest['approximations']>) {
+interface EmbeddedCellImage {
+  token: string;
+  address: string;
+  row: number;
+  column: number;
+  width: number;
+  height: number;
+}
+
+function applyCell(
+  cell: ExcelJS.Cell,
+  raw: JsonObject,
+  formulaRaw: JsonObject,
+  approximations: NonNullable<WorkbookReadManifest['approximations']>,
+  embeddedImages: EmbeddedCellImage[],
+) {
   const styles = raw.cell_styles ?? {};
   const formulaValue = formulaRaw.formula ?? formulaRaw.value;
   const formula = typeof formulaValue === 'string' && formulaValue.startsWith('=')
     && (formulaRaw.formula != null || formulaValue !== raw.value) ? formulaValue.slice(1) : null;
   const value = raw.value ?? null;
+  const inlineLinks: Array<{ text: string; link: string }> = [];
   if (formula) {
     if (value != null && !['number', 'string', 'boolean'].includes(typeof value)) throw new Error(`公式结果类型未支持: ${cell.address}`);
     cell.value = { formula, result: value ?? undefined };
+  } else if (Array.isArray(raw.rich_text) && raw.rich_text.length === 1 && raw.rich_text[0].type === 'embed-image') {
+    const image = raw.rich_text[0];
+    if (typeof image.image_token !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(image.image_token)
+      || typeof image.image_width !== 'number' || !Number.isFinite(image.image_width) || image.image_width <= 0
+      || typeof image.image_height !== 'number' || !Number.isFinite(image.image_height) || image.image_height <= 0
+      || (image.text != null && image.text !== '') || (value != null && value !== '')) {
+      throw new Error(`单元格 ${cell.address} 的内嵌图片信息不完整`);
+    }
+    embeddedImages.push({ token: image.image_token, address: cell.address, row: Number(cell.row) - 1,
+      column: Number(cell.col) - 1, width: image.image_width, height: image.image_height });
+    // ExcelJS writes floating drawings rather than native in-cell images.
+    // Record the conversion explicitly instead of claiming identical behavior.
+    approximations.push({ sheet: cell.worksheet.name, cell: cell.address, kind: 'embedded-cell-image-drawing',
+      detail: { width: image.image_width, height: image.image_height } });
+    cell.value = null;
   } else if (Array.isArray(raw.rich_text) && raw.rich_text.length === 1 && raw.rich_text[0].type === 'link'
     && typeof raw.rich_text[0].link === 'string') {
     cell.value = { text: String(raw.rich_text[0].text ?? value ?? raw.rich_text[0].link), hyperlink: raw.rich_text[0].link };
@@ -90,10 +121,21 @@ function applyCell(cell: ExcelJS.Cell, raw: JsonObject, formulaRaw: JsonObject, 
     }
     const runs: ExcelJS.RichText[] = [];
     for (const run of raw.rich_text) {
-      if (!['text', 'mention'].includes(run.type) || typeof run.text !== 'string') {
+      if (run.type === 'attachment') {
+        throw new Error(`单元格 ${cell.address} 含附件，当前无法完整还原附件原件；请取得工作簿导出权限后重试`);
+      }
+      if (!['text', 'mention', 'link'].includes(run.type) || typeof run.text !== 'string'
+        || (run.type === 'link' && (typeof run.link !== 'string' || !run.link))) {
         throw new Error(`单元格 ${cell.address} 包含尚不能完整重建的富文本对象 (${run.type ?? '未知类型'})`);
       }
       if (run.type === 'mention') approximations.push({ sheet: cell.worksheet.name, cell: cell.address, kind: 'mention', detail: { ...run } });
+      // A spreadsheet hyperlink applies to the whole cell, so multiple inline
+      // links cannot be represented without changing its meaning. Keep the
+      // text and styles in Excel and the individual targets in the sidecar.
+      if (run.type === 'link') {
+        approximations.push({ sheet: cell.worksheet.name, cell: cell.address, kind: 'inline-link-metadata', detail: { ...run } });
+        inlineLinks.push({ text: run.text, link: run.link });
+      }
       runs.push({ text: run.text, font: excelFont({ ...styles, ...run.style }) });
     }
     cell.value = { richText: runs };
@@ -120,7 +162,11 @@ function applyCell(cell: ExcelJS.Cell, raw: JsonObject, formulaRaw: JsonObject, 
     borders[edge] = { style, color: excelColor(border.color) };
   }
   cell.border = borders;
-  if (raw.note != null) cell.note = String(raw.note);
+  if (raw.note != null || inlineLinks.length > 0) {
+    cell.note = [raw.note != null ? String(raw.note) : '',
+      inlineLinks.length ? `飞书单元格文字链接：\n${inlineLinks.map((link) => `${link.text}: ${link.link}`).join('\n')}` : '',
+    ].filter(Boolean).join('\n\n');
+  }
 }
 
 type Window = { top: number; bottom: number; left: number; right: number };
@@ -142,7 +188,7 @@ function completeWindow(data: JsonObject, window: Window): boolean {
 async function readWindow(
   client: WorkbookReadClient, token: string, sheetId: string, revision: number | string,
   window: Window, worksheet: ExcelJS.Worksheet, approximations: NonNullable<WorkbookReadManifest['approximations']>,
-  sizing: { rows: number; columns: number },
+  sizing: { rows: number; columns: number }, embeddedImages: EmbeddedCellImage[],
 ): Promise<number> {
   const range = `${columnLetters(window.left)}${window.top}:${columnLetters(window.right)}${window.bottom}`;
   const values = payload(await client.getSheetCells({ spreadsheetToken: token, sheetId, range, revision }));
@@ -157,14 +203,14 @@ async function readWindow(
     if (window.bottom > window.top) {
       const mid = (window.top + window.bottom) >>> 1;
       sizing.rows = Math.min(sizing.rows, mid - window.top + 1);
-      return await readWindow(client, token, sheetId, revision, { ...window, bottom: mid }, worksheet, approximations, sizing)
-        + await readWindow(client, token, sheetId, revision, { ...window, top: mid + 1 }, worksheet, approximations, sizing);
+      return await readWindow(client, token, sheetId, revision, { ...window, bottom: mid }, worksheet, approximations, sizing, embeddedImages)
+        + await readWindow(client, token, sheetId, revision, { ...window, top: mid + 1 }, worksheet, approximations, sizing, embeddedImages);
     }
     if (window.right > window.left) {
       const mid = (window.left + window.right) >>> 1;
       sizing.columns = Math.min(sizing.columns, mid - window.left + 1);
-      return await readWindow(client, token, sheetId, revision, { ...window, right: mid }, worksheet, approximations, sizing)
-        + await readWindow(client, token, sheetId, revision, { ...window, left: mid + 1 }, worksheet, approximations, sizing);
+      return await readWindow(client, token, sheetId, revision, { ...window, right: mid }, worksheet, approximations, sizing, embeddedImages)
+        + await readWindow(client, token, sheetId, revision, { ...window, left: mid + 1 }, worksheet, approximations, sizing, embeddedImages);
     }
     throw new Error(`单元格 ${range} 读取仍被截断，不能确认完整同步`);
   }
@@ -174,7 +220,7 @@ async function readWindow(
       if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error(`单元格响应无效: ${range}`);
       if (Object.keys(raw).length === 0) return;
       const cell = worksheet.getCell(values.ranges[0].row_indices[rowIndex], columnNumber(values.ranges[0].col_indices[colIndex]));
-      applyCell(cell, raw, formulas.ranges[0].cells[rowIndex][colIndex], approximations);
+      applyCell(cell, raw, formulas.ranges[0].cells[rowIndex][colIndex], approximations, embeddedImages);
       if (cell.value != null) nonEmpty++;
     });
   });
@@ -271,12 +317,13 @@ export async function reconstructWorkbookFromReads(
     applyLayout(worksheet, layout, rows, columns);
     let cells = 0;
     const sizing = { rows: 256, columns: 32 };
+    const embeddedImages: EmbeddedCellImage[] = [];
     for (let top = 1; top <= rows;) {
       const bottom = Math.min(rows, top + sizing.rows - 1);
       for (let left = 1; left <= columns;) {
         const right = Math.min(columns, left + sizing.columns - 1);
         cells += await readWindow(client, token, source.sheet_id, info.revision,
-          { top, left, bottom, right }, worksheet, manifest.approximations!, sizing);
+          { top, left, bottom, right }, worksheet, manifest.approximations!, sizing, embeddedImages);
         left = right + 1;
       }
       top = bottom + 1;
@@ -317,6 +364,23 @@ export async function reconstructWorkbookFromReads(
             nativeRowOff: Math.round(Number(raw.offset?.row_offset ?? 0) * 9525),
           } as unknown as ExcelJS.Anchor,
           ext: { width: parsedImage.width, height: parsedImage.height }, editAs: 'oneCell',
+        });
+      }
+      const cellImages = await downloadSheetMedia({
+        client, imagesDir, subSheetTitle: `${source.sheet_id}-cell`,
+        floatImages: embeddedImages.map((item, index) => ({
+          floatImageId: `cell-${index}`, imageToken: item.token, address: item.address,
+          row: item.row, col: item.column, width: item.width, height: item.height, url: null,
+        })),
+      });
+      imageCount += cellImages.length;
+      for (let index = 0; index < embeddedImages.length; index++) {
+        const image = embeddedImages[index];
+        const buffer = fs.readFileSync(cellImages[index].localPath);
+        const id = workbook.addImage({ base64: buffer.toString('base64'), extension: imageExtension(buffer) });
+        worksheet.addImage(id, {
+          tl: { nativeCol: image.column, nativeRow: image.row, nativeColOff: 0, nativeRowOff: 0 } as unknown as ExcelJS.Anchor,
+          ext: { width: image.width, height: image.height }, editAs: 'oneCell',
         });
       }
     } finally {

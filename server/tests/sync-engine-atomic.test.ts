@@ -9,6 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { SyncEngine } from '../src/modules/sync-engine.js';
 import { LocalMapStore } from '../src/modules/local-map-store.js';
+import { MappingService } from '../src/modules/mapping-service.js';
 import type { ChangedDocument } from '../src/types/index.js';
 import { exportTestWorkbook } from './helpers/workbook.js';
 import { Hono } from 'hono';
@@ -174,6 +175,52 @@ describe('SyncEngine atomic apply path', () => {
     expect(fs.readFileSync(xlsxPath)).toEqual(original);
     expect(fs.readFileSync(mdPath, 'utf8')).toContain('previous_workbook: "表格.xlsx"');
     expect(fs.readFileSync(path.join(kb, '策划 - Designer', '表格.csv-data', '主表.csv'), 'utf8')).toContain('1,2');
+  });
+
+  it('keeps a CSV fallback in the repair list until a later sync commits an Excel workbook', async () => {
+    const { kb, store, config } = makeWorkspace();
+    const mdPath = path.join(kb, '策划 - Designer', '表格.md');
+    fs.mkdirSync(path.dirname(mdPath), { recursive: true });
+    fs.writeFileSync(mdPath, '# prior\n');
+    store.upsertDocument({ objToken: 'tok-sheet', wikiNodeToken: 'node-sheet', objType: 'sheet', title: '表格',
+      localMdPath: mdPath, localRelPath: '策划 - Designer/表格.md', watchedRootId: 'designer',
+      parentNodeToken: 'designer', status: 'changed', syncState: 'pending_modified',
+      lastSyncedModifyTime: 'old', lastSyncedAt: '2026-01-01T00:00:00.000Z', observedObjEditTime: 200 } as any);
+    let imageAvailable = false;
+    const client = {
+      exportWorkbook: async () => { throw new Error('export denied'); },
+      getWorkbookInfo: async () => ({ data: { revision: 41, sheets: [{ sheet_id: 's1', sheet_name: '主表', row_count: 2, column_count: 2,
+        resource_type: 'sheet', float_image_count: 0, merged_cells_count: 0, chart_count: 0, pivot_table_count: 0 }] } }),
+      getSheetLayout: async () => ({ data: { revision: 41, row_heights: [{ rows: '1:2', height: 24 }],
+        column_widths: [{ cols: 'A:B', width: 80 }], hidden_rows: [], hidden_columns: [], merged_cells: [] } }),
+      getSheetCells: async () => ({ data: { revision: 41, has_more: false, ranges: [{ actual_range: 'A1:B2', truncated: false,
+        row_indices: [1, 2], col_indices: ['A', 'B'], cells: [[{ rich_text: [{ type: 'embed-image', text: '',
+          image_token: 'cell-image', image_width: 80, image_height: 48 }] }, { value: 'b' }], [{ value: 1 }, { value: 2 }]] }] } }),
+      getSheetFloatImages: async () => ({ data: { revision: 41, total: 0, sheets: [] } }),
+      downloadMedia: async (_token: string, output: string) => {
+        if (!imageAvailable) throw new Error('image unavailable');
+        fs.writeFileSync(`${output}.png`, Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==', 'base64'));
+        return `${output}.png`;
+      },
+      previewMedia: async () => { throw new Error('image unavailable'); },
+      getSheetCsv: async () => ({ data: { annotated_csv: 'a,b\n1,2\n', revision: 41, has_more: false, actual_range: 'A1:B2' } }),
+    };
+    const engine = new SyncEngine({ larkCliClient: client, localMapStore: store, config });
+    const mapping = new MappingService({} as any, store, {} as any, { getConfig: () => config } as any);
+    const options = { enableLLM: false, fullSync: false, apply: true, confirmation: 'APPLY' as const };
+    const doc = makeDoc({ objToken: 'tok-sheet', objType: 'sheet', title: '表格', localMdPath: mdPath,
+      localRelPath: '策划 - Designer/表格.md', watchedRootId: 'designer', observedObjEditTime: 200 });
+    const partial = await engine.syncDocuments([doc], options);
+    expect(partial.syncedDocuments[0]).toMatchObject({ sheetAcquisition: 'csv-fallback', sheetAcquisitionIssue: expect.stringContaining('image unavailable') });
+    const repair = mapping.getStoredDiff(config.watchedRoots[1].url).modified;
+    expect(repair).toMatchObject([{ objToken: 'tok-sheet', xlsxMissing: true }]);
+    expect(fs.existsSync(path.join(kb, '策划 - Designer', '表格.xlsx'))).toBe(false);
+
+    imageAvailable = true;
+    const complete = await engine.syncDocuments(repair, options);
+    expect(complete.syncedDocuments[0]).toMatchObject({ sheetAcquisition: 'read-reconstruction' });
+    expect(fs.existsSync(path.join(kb, '策划 - Designer', '表格.xlsx'))).toBe(true);
+    expect(mapping.getStoredDiff(config.watchedRoots[1].url).modified).toEqual([]);
   });
 
   it('partial sheet export failure leaves prior body/CSV/synced baseline untouched', async () => {
