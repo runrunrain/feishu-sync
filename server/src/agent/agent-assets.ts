@@ -30,6 +30,13 @@ export function agentAssetsRoot(): string {
   return path.join(serverDistRoot(), 'agent');
 }
 
+export function claudeBridgePath(): string | null {
+  for (const candidate of [path.join(agentAssetsRoot(), 'claude-bridge.cjs'), path.join(serverDistRoot(), '..', 'src', 'agent', 'claude-bridge.cjs')]) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
 /** pi 扩展绝对路径（真实文件系统；不存在返回 null）。 */
 export function piExtensionPath(): string | null {
   const candidates = [

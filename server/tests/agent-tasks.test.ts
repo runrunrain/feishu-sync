@@ -18,6 +18,7 @@ import { LocalMapStore } from '../src/modules/local-map-store.js';
 import { AgentProcessPool } from '../src/agent/agent-process-pool.js';
 import { AgentToolService } from '../src/agent/agent-tool-service.js';
 import { PiRuntimeResolver } from '../src/agent/runtime-resolver.js';
+import { isPathInside } from '../src/agent/path-guard.js';
 import { RoleRegistry } from '../src/agent/tasks/role-registry.js';
 import {
   TaskService,
@@ -74,11 +75,13 @@ class FakeTaskRpc extends EventEmitter {
 
 const temporaryRoots: string[] = [];
 const pools: AgentProcessPool[] = [];
+const stores: LocalMapStore[] = [];
 // 先 await closeAll 再删临时根：closeAll 的排队者拒绝链（dispatchRound
 // catch→finish 落库）需要 store 仍可用——不等得 rmSync 会让迟到落库撞
 // 上已删除的 DB（SqliteError 循环放大，T3d 实测）。
 afterAll(async () => {
   for (const pool of pools) await pool.closeAll();
+  for (const store of stores) store.close();
   for (const root of temporaryRoots) fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -123,6 +126,7 @@ function makeEnv(opts: EnvOptions = {}) {
   temporaryRoots.push(dataRoot);
   const store = new LocalMapStore(path.join(dataRoot, 'feishu-sync.db'));
   store.initialize();
+  stores.push(store);
   const pool = opts.pool ?? new AgentProcessPool({ maxConcurrentProcesses: 3 });
   pools.push(pool);
   const toolService = new AgentToolService({ dataRoot, documentsProvider: () => [] });
@@ -273,10 +277,10 @@ describe('marker 协议与 outputDir 校验', () => {
 
     // 正常路径：逐级创建并返回父根内 realpath
     const resolved = resolveTaskWorkspaceRoot(session.workspacePath, 'a/b/c');
-    expect(resolved!.startsWith(fs.realpathSync(wsRoot) + path.sep)).toBe(true);
+    expect(isPathInside(fs.realpathSync.native(wsRoot), resolved!)).toBe(true);
     expect(fs.statSync(resolved!).isDirectory()).toBe(true);
     // 已存在真实子目录复用
-    expect(resolveTaskWorkspaceRoot(session.workspacePath, 'a/b')).toBe(fs.realpathSync(path.join(wsRoot, 'a', 'b')));
+    expect(resolveTaskWorkspaceRoot(session.workspacePath, 'a/b')).toBe(fs.realpathSync.native(path.join(wsRoot, 'a', 'b')));
     // 只读任务：父根原样；无 Workspace：undefined
     expect(resolveTaskWorkspaceRoot(session.workspacePath, null)).toBe(wsRoot);
     expect(resolveTaskWorkspaceRoot(null, 'a')).toBeUndefined();
@@ -633,7 +637,7 @@ describe('R2-02：任务授权根按冻结 workspaceId 解析（不受父会话�
     expect(env.service.get(env.store, dto.id).status).toBe('done');
     // 授权根 = 冻结的 W1/out（已 realpath），不足 W2
     const root = env.spawnInputs[0]!.workspaceRoot!;
-    expect(root.startsWith(fs.realpathSync(w1) + path.sep)).toBe(true);
+    expect(isPathInside(fs.realpathSync.native(w1), root)).toBe(true);
     expect(fs.existsSync(path.join(w1, 'out'))).toBe(true);
     expect(fs.existsSync(path.join(w2, 'out'))).toBe(false);
   });
@@ -657,7 +661,7 @@ describe('R2-02：任务授权根按冻结 workspaceId 解析（不受父会话�
     env.service.resume(env.store, dto.id, '继续');
     await env.service.whenSettled(dto.id);
     expect(env.service.get(env.store, dto.id).status).toBe('done');
-    expect(env.spawnInputs[1]!.workspaceRoot!.startsWith(fs.realpathSync(w1) + path.sep)).toBe(true);
+    expect(isPathInside(fs.realpathSync.native(w1), env.spawnInputs[1]!.workspaceRoot!)).toBe(true);
   });
 
   it('冻结的 Workspace 被移除 → 任务显式 failed(task_workspace_unavailable)，零 spawn', async () => {

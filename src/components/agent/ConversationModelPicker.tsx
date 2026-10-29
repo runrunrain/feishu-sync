@@ -13,7 +13,8 @@ export function ConversationModelPicker({ session, busy, onChanged }: { session:
   const [open, setOpen] = useState<'models' | 'effort' | null>(null);
   const [source, setSource] = useState<'app-llm' | 'pi-agent-dir'>('app-llm');
   const [items, setItems] = useState<AgentModelOption[]>([]); const [loading, setLoading] = useState(false); const [saving, setSaving] = useState(false); const [message, setMessage] = useState('');
-  const current = session?.model ?? config?.agent?.model;
+  const current = session?.model ?? (session?.backend === 'claude-code' && config?.agent?.model
+    ? { ...config.agent.model, source: 'app-llm' as const } : config?.agent?.model);
   const currentProvider = current?.providerId || config?.llm.activeProviderId;
   const currentPreset = current?.modelId || (currentProvider === config?.llm.activeProviderId ? config?.llm.activeModelId : config?.llm.providers?.find((p) => p.id === currentProvider)?.defaultModelId);
   const provider = config?.llm.providers?.find((p) => p.id === currentProvider);
@@ -33,9 +34,9 @@ export function ConversationModelPicker({ session, busy, onChanged }: { session:
   useEffect(() => {
     if (open !== 'models') return;
     let cancelled = false; setLoading(true); setItems([]); setMessage('');
-    void listConversationModels(source).then((data) => { if (!cancelled) { setItems(data.items); setMessage(data.message); } }).catch(() => { if (!cancelled) setMessage('读取模型失败，请重试'); }).finally(() => { if (!cancelled) setLoading(false); });
+    void listConversationModels(source, false, session?.backend).then((data) => { if (!cancelled) { setItems(data.items); setMessage(data.message); } }).catch(() => { if (!cancelled) setMessage('读取模型失败，请重试'); }).finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, [open, source]);
+  }, [open, source, session?.backend]);
   const save = async (model: SessionModelConfig | null) => {
     if (!session || disabled) return; setSaving(true);
     try { await saveConversationModel(session.id, model); setOpen(null); onChanged(); }
@@ -48,13 +49,13 @@ export function ConversationModelPicker({ session, busy, onChanged }: { session:
   return <div ref={root} className="relative flex items-center gap-1 min-w-0" data-testid="conversation-model-picker">
     <button type="button" aria-label="切换会话模型" aria-expanded={open === 'models'} disabled={disabled} title={busy ? '运行结束后可切换' : '仅当前会话生效，保留历史'}
       className="inline-flex min-w-0 items-center gap-1 rounded-full px-2.5 py-1 text-xs text-ink-soft hover:bg-paper-2 disabled:opacity-45"
-      onClick={() => { setSource(current?.source ?? 'app-llm'); setOpen(open === 'models' ? null : 'models'); }}><span className="max-w-[180px] truncate">{label}</span><ChevronDown className="h-3 w-3 shrink-0" /></button>
+      onClick={() => { setSource(session?.backend === 'claude-code' ? 'app-llm' : current?.source ?? 'app-llm'); setOpen(open === 'models' ? null : 'models'); }}><span className="max-w-[180px] truncate">{label}</span><ChevronDown className="h-3 w-3 shrink-0" /></button>
     <button type="button" aria-label="调整模型思考强度" aria-expanded={open === 'effort'} disabled={disabled || !activeChoice() || !reasoning} title={reasoning ? '调整当前会话的思考强度' : '该模型预设未启用思考能力'}
       className="inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs text-seal hover:bg-paper-2 disabled:opacity-45"
       onClick={() => setOpen(open === 'effort' ? null : 'effort')}>{LABELS[LEVELS.indexOf(thinking)]}思考<ChevronDown className="h-3 w-3" /></button>
     {open ? <div className="absolute z-50 bottom-full left-0 mb-2 w-[min(320px,70vw)] max-h-[min(400px,60vh)] overflow-y-auto rounded-xl border border-line bg-card-bg p-3 shadow-xl" role="dialog" aria-label={open === 'models' ? '选择会话模型' : '模型思考强度'}>
       {open === 'models' ? <>
-        <div className="flex gap-2 mb-2 text-xs"><button className={`px-2 py-1 rounded ${source === 'app-llm' ? 'bg-seal/10 text-seal' : 'text-ink-soft'}`} onClick={() => setSource('app-llm')}>应用提供商</button><button className={`px-2 py-1 rounded ${source === 'pi-agent-dir' ? 'bg-seal/10 text-seal' : 'text-ink-soft'}`} onClick={() => setSource('pi-agent-dir')}>本地 Pi</button></div>
+        <div className="flex gap-2 mb-2 text-xs"><button className={`px-2 py-1 rounded ${source === 'app-llm' ? 'bg-seal/10 text-seal' : 'text-ink-soft'}`} onClick={() => setSource('app-llm')}>应用提供商</button>{session?.backend !== 'claude-code' && <button className={`px-2 py-1 rounded ${source === 'pi-agent-dir' ? 'bg-seal/10 text-seal' : 'text-ink-soft'}`} onClick={() => setSource('pi-agent-dir')}>本地 Pi</button>}</div>
         <div className="max-h-60 overflow-y-auto scrollbar-thin space-y-1">
           {loading ? <p className="p-2 text-xs text-ink-faint">正在加载模型…</p> : !items.length ? <p className="p-2 text-xs text-ink-faint">{message || '尚无可用模型'}</p> : items.map((m) => <button key={key(m)} type="button" aria-label={`使用模型 ${m.label}`} disabled={saving}
             className="block w-full text-left px-2 py-2 rounded-md text-xs text-ink hover:bg-seal/10 break-words" onClick={() => void save({ source: m.source, providerId: m.providerId, modelId: m.modelId, piModel: m.piModel, thinkingLevel: m.reasoning ? thinking : 'off' })}>{m.label}</button>)}

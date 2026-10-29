@@ -96,16 +96,22 @@ export function collectStaticProtectedRoots(context: ProtectedRootsContext = {})
 export function collectRuntimeProtectedRoots(runtime: {
   nodePath: string | null | undefined;
   piPackageRoot: string | null | undefined;
+  claudeCliPath?: string | null;
 }): string[] {
   const roots: string[] = [];
+  if (runtime.claudeCliPath) {
+    roots.push(path.dirname(runtime.claudeCliPath));
+    try { roots.push(path.dirname(fs.realpathSync.native(runtime.claudeCliPath))); } catch { /* unavailable executable */ }
+  }
   if (runtime.nodePath) {
-    roots.push(path.dirname(runtime.nodePath));
+    const nodeDirs = [path.dirname(runtime.nodePath)];
     try {
       const real = fs.realpathSync.native(runtime.nodePath);
       const realDir = path.dirname(real);
-      if (!roots.includes(realDir)) roots.push(realDir);
+      if (!nodeDirs.includes(realDir)) nodeDirs.push(realDir);
     } catch { /* 节点不存在时按字面目录保护 */ }
-    for (const nodeDir of [...new Set(roots)]) {
+    roots.push(...nodeDirs);
+    for (const nodeDir of nodeDirs) {
       const npmRoots = [
         path.resolve(nodeDir, '..', 'lib', 'node_modules', 'npm'),
         path.join(nodeDir, 'node_modules', 'npm'),
@@ -151,7 +157,7 @@ export function collectResolvedRuntimeProtectedRoots(
 
 /** 全量受保护根 = 静态 + 运行时（调用方先完成 runtime 发现）。 */
 export function collectAllProtectedRoots(
-  runtime: { nodePath: string | null | undefined; piPackageRoot: string | null | undefined },
+  runtime: { nodePath: string | null | undefined; piPackageRoot: string | null | undefined; claudeCliPath?: string | null },
   context: ProtectedRootsContext = {},
 ): string[] {
   return [...collectStaticProtectedRoots(context), ...collectRuntimeProtectedRoots(runtime)];

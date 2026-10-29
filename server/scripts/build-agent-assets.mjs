@@ -45,6 +45,7 @@ if (!fs.existsSync(distRoot)) {
 }
 const promptCount = copyDir(promptsSrc, path.join(distRoot, 'agent', 'prompts'));
 const extensionCount = copyDir(extensionSrc, path.join(distRoot, 'agent', 'pi-extension'));
+fs.copyFileSync(path.join(srcRoot, 'agent', 'claude-bridge.cjs'), path.join(distRoot, 'agent', 'claude-bridge.cjs'));
 console.info(`[build-agent-assets] copied ${promptCount} prompt file(s), ${extensionCount} extension file(s)`);
 
 // S6 任务编排：角色卡（server/src/agent/roles/*.md → dist/agent/roles）。

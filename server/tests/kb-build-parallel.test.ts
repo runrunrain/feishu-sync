@@ -355,6 +355,7 @@ beforeAll(() => {
 });
 
 afterAll(() => {
+  store.close();
   fs.rmSync(dataRoot, { recursive: true, force: true });
   fs.rmSync(kbRoot, { recursive: true, force: true });
 });
@@ -598,6 +599,7 @@ describe('S4：kb_builds 新列 additive 迁移（旧库升级）', () => {
     expect(Number(updated.parallelism)).toBe(3);
     expect(Number(updated.unit_total)).toBe(7);
     expect(String(updated.warnings_json)).toContain('images_unavailable');
+    legacyStore.close();
   });
 });
 

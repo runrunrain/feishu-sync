@@ -90,6 +90,7 @@ describe('旧配置兼容（additive 默认合并）', () => {
     const manager = new ConfigManager(configPath);
     const config = await manager.load();
     expect(config.agent.model.source).toBe('pi-agent-dir');
+    expect(config.agent.runtime.backend).toBe('pi');
     expect(config.agent.model.thinkingLevel).toBe('off'); // 缺省补默认
     expect(config.agent.maxConcurrentProcesses).toBe(3);
   });
@@ -100,6 +101,15 @@ describe('updateConfig 校验', () => {
   beforeEach(async () => {
     manager = new ConfigManager(newConfigPath());
     await manager.load();
+  });
+
+  it('切换 Claude 基座时保留 Pi 模型来源，拒绝未知基座', async () => {
+    const base = (await manager.load()).agent;
+    const updated = await manager.updateConfig({ agent: { ...base, runtime: { backend: 'claude-code', claudeCliPath: 'C:/tools/claude.exe' },
+      model: { ...base.model, source: 'pi-agent-dir', piModel: 'example/model' } } });
+    expect(updated.agent.runtime).toMatchObject({ backend: 'claude-code', claudeCliPath: 'C:/tools/claude.exe' });
+    expect(updated.agent.model).toMatchObject({ source: 'pi-agent-dir', piModel: 'example/model' });
+    await expect(manager.updateConfig({ agent: { ...updated.agent, runtime: { backend: 'unknown' as never } } })).rejects.toThrow(/agent.runtime.backend/);
   });
 
   it.each(['amagi-公司中转站/claude-fable-5', 'amagi-个人版API- GPT/gpt-6-luna', 'router/vendor/model:latest'])(

@@ -1471,8 +1471,8 @@ export interface AgentModelOption {
   source: 'app-llm' | 'pi-agent-dir'; providerId?: string; modelId?: string; piModel?: string;
   label: string; reasoning: boolean;
 }
-export function listConversationModels(source: 'app-llm' | 'pi-agent-dir', refresh = false): Promise<{ items: AgentModelOption[]; message: string }> {
-  return request(`/api/agent/models?source=${source}${refresh ? '&refresh=1' : ''}`);
+export function listConversationModels(source: 'app-llm' | 'pi-agent-dir', refresh = false, backend?: 'pi' | 'claude-code'): Promise<{ items: AgentModelOption[]; message: string }> {
+  return request(`/api/agent/models?source=${source}${refresh ? '&refresh=1' : ''}${backend ? `&backend=${backend}` : ''}`);
 }
 export function saveConversationModel(id: string, model: import('../types/agent').SessionModelConfig | null): Promise<AgentSessionDto> {
   return request(`/api/agent/sessions/${encodeURIComponent(id)}/model`, { method: 'PATCH', body: JSON.stringify({ model }) });

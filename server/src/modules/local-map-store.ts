@@ -94,6 +94,7 @@ export class LocalMapStore {
   private applyAdditiveMigrations(): void {
     const sessionCols = this.db.prepare('PRAGMA table_info(agent_sessions)').all() as Array<{ name: string }>;
     if (sessionCols.length && !sessionCols.some((c) => c.name === 'model_config_json')) this.db.exec('ALTER TABLE agent_sessions ADD COLUMN model_config_json TEXT');
+    if (sessionCols.length && !sessionCols.some((c) => c.name === 'runtime_backend')) this.db.exec("ALTER TABLE agent_sessions ADD COLUMN runtime_backend TEXT NOT NULL DEFAULT 'pi'");
     // S4（设计 §4.6）：kb_builds 并行构建新列——PRAGMA 守卫 + SAVEPOINT 外
     // 逐列 ALTER（与 documents 段同模式，但列 DEFAULT 已覆盖旧行）。
     const kbBuildCols = this.db.prepare('PRAGMA table_info(kb_builds)').all() as Array<{ name: string }>;
@@ -2749,13 +2750,14 @@ export class LocalMapStore {
     title: string;
     mode: 'discuss' | 'work';
     workspaceId: string | null;
+    backend?: 'pi' | 'claude-code';
     createdAt: string;
     updatedAt: string;
   }): void {
     this.db.prepare(`
-      INSERT INTO agent_sessions (id, title, mode, workspace_id, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(input.id, input.title, input.mode, input.workspaceId, input.createdAt, input.updatedAt);
+      INSERT INTO agent_sessions (id, title, mode, workspace_id, created_at, updated_at, runtime_backend)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(input.id, input.title, input.mode, input.workspaceId, input.createdAt, input.updatedAt, input.backend ?? 'pi');
   }
 
   getAgentSession(id: string): Record<string, unknown> | null {
@@ -3823,6 +3825,7 @@ export class LocalMapStore {
         workspace_id TEXT,
         pi_session_file TEXT,
         model_config_json TEXT,
+        runtime_backend TEXT NOT NULL DEFAULT 'pi',
         last_error_code TEXT,
         last_error_message TEXT,
         created_at TEXT NOT NULL,

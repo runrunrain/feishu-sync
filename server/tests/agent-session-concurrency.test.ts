@@ -131,7 +131,8 @@ function makeService(options: { maxConcurrentProcesses?: number; idleTimeoutMinu
     idleTimeoutMinutes: options.idleTimeoutMinutes ?? 10,
   });
   const config = makeConfig();
-  const resolver = new PiRuntimeResolver();
+  // 受控测试只需要解析 fixture，不执行临时 POSIX 脚本（Windows 也可运行）。
+  const resolver = new PiRuntimeResolver({ execNodeVersion: async () => '24.21.0' });
   const service = new SessionService({
     dataRoot,
     pool,

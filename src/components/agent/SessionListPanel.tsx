@@ -136,6 +136,7 @@ export function SessionListPanel({
                     </span>
                   </div>
                   <div className="mt-1 flex items-center gap-1.5 pl-5">
+                    <span className="text-[10px] text-ink-faint">{s.backend === 'claude-code' ? 'Claude Code' : 'Pi'}</span>
                     <span className={`w-1.5 h-1.5 rounded-full ${STATE_DOT[s.state] ?? STATE_DOT.idle}`} />
                     <span className="text-[10px] text-ink-faint">
                       {s.state === 'streaming'

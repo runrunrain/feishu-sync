@@ -179,6 +179,7 @@ export function AgentRuntimeSettingsCard() {
   const agent = config?.agent;
   const [nodePath, setNodePath] = useState('');
   const [piCliPath, setPiCliPath] = useState('');
+  const [claudeCliPath, setClaudeCliPath] = useState('');
   const [saving, setSaving] = useState(false);
 
   // ---- S2/S5：图片理解段（独立状态面；保存走 agent.vision，不动文本模型配置） ----
@@ -231,7 +232,8 @@ export function AgentRuntimeSettingsCard() {
   useEffect(() => {
     setNodePath(agent?.runtime?.nodePath ?? '');
     setPiCliPath(agent?.runtime?.piCliPath ?? '');
-  }, [agent?.runtime?.nodePath, agent?.runtime?.piCliPath]);
+    setClaudeCliPath(agent?.runtime?.claudeCliPath ?? '');
+  }, [agent?.runtime?.nodePath, agent?.runtime?.piCliPath, agent?.runtime?.claudeCliPath]);
 
   const readiness = agentStatus.status
     ? describeReadiness(agentStatus.status.code, agentStatus.status)
@@ -243,7 +245,8 @@ export function AgentRuntimeSettingsCard() {
   const currentProviderId = agent?.model?.providerId || config?.llm.activeProviderId || '';
   const selectedProvider = providers.find((p) => p.id === currentProviderId);
   const currentModelId = agent?.model?.modelId || (currentProviderId === config?.llm.activeProviderId ? config?.llm.activeModelId : '') || selectedProvider?.defaultModelId || '';
-  const source = agent?.model?.source ?? 'app-llm';
+  const backend = agent?.runtime?.backend ?? 'pi';
+  const source = backend === 'claude-code' ? 'app-llm' : agent?.model?.source ?? 'app-llm';
   const piModel = agent?.model?.piModel ?? '';
   const piModels = useMemo(() => {
     if (agentStatus.unreachable || agentStatus.status?.model.source !== 'pi-agent-dir') return [];
@@ -263,7 +266,7 @@ export function AgentRuntimeSettingsCard() {
   const thinking = agent?.model?.thinkingLevel ?? 'off';
 
   const saveAgent = async (patch: {
-    runtime?: { nodePath?: string; piCliPath?: string };
+    runtime?: Partial<AgentConfig['runtime']>;
     model?: Partial<AgentConfig['model']>;
     vision?: Partial<AgentVisionConfig>;
   }) => {
@@ -302,8 +305,16 @@ export function AgentRuntimeSettingsCard() {
     <CardShell
       icon={<Bot className="w-4 h-4" />}
       title="Agent 运行时与模型"
-      description="pi 以外部子进程运行（RPC 侧车）；模型不可用时如实禁用并给出原因"
+      description="选择新会话及标准库构建使用的基座；既有会话保留原有基座和历史"
     >
+      <div>
+        <FieldLabel>Agent 基座</FieldLabel>
+        <div className="flex gap-2">
+          <Button size="sm" variant={backend === 'pi' ? 'primary' : 'secondary'} disabled={saving} onClick={() => void saveAgent({ runtime: { backend: 'pi' } })}>Pi</Button>
+          <Button size="sm" variant={backend === 'claude-code' ? 'primary' : 'secondary'} disabled={saving} onClick={() => void saveAgent({ runtime: { backend: 'claude-code' } })}>Claude Code</Button>
+        </div>
+        {backend === 'claude-code' && <p className="mt-1 text-[11px] text-ink-faint">使用应用内 Anthropic Messages 兼容提供商。应用上下文与受控工具可用；Pi 专用扩展不会加载。预设上下文窗口用于自动压缩，实际窗口受 Claude Code 和模型限制。</p>}
+      </div>
       {/* 就绪状态 */}
       <div className="flex items-center gap-3 flex-wrap px-3 py-2.5 rounded-md border border-line bg-paper/40">
         {agentStatus.loading ? (
@@ -324,7 +335,7 @@ export function AgentRuntimeSettingsCard() {
           ) : (
             <span>未发现 Node</span>
           )}
-          {agentStatus.status?.runtime.piVersion ? (
+          {backend === 'claude-code' ? (agentStatus.status?.runtime.claudeVersion ? ` · Claude Code ${agentStatus.status.runtime.claudeVersion}` : ' · 未发现 Claude Code') : agentStatus.status?.runtime.piVersion ? (
             <>
               {' · '}
               <span className="font-mono">pi {agentStatus.status.runtime.piVersion}</span>
@@ -357,13 +368,13 @@ export function AgentRuntimeSettingsCard() {
           />
         </div>
         <div>
-          <FieldLabel hint="留空自动发现">pi 包路径</FieldLabel>
+          <FieldLabel hint="留空自动发现">{backend === 'claude-code' ? 'Claude Code 可执行文件路径' : 'pi 包路径'}</FieldLabel>
           <input
             className={`${INPUT_CLS} font-mono text-xs`}
-            value={piCliPath}
-            onChange={(e) => setPiCliPath(e.target.value)}
-            placeholder="自动发现（>=1.4.0 <2）"
-            aria-label="pi 路径覆盖"
+            value={backend === 'claude-code' ? claudeCliPath : piCliPath}
+            onChange={(e) => backend === 'claude-code' ? setClaudeCliPath(e.target.value) : setPiCliPath(e.target.value)}
+            placeholder={backend === 'claude-code' ? '自动发现 Claude Code' : '自动发现（>=1.4.0 <2）'}
+            aria-label={backend === 'claude-code' ? 'Claude Code 路径覆盖' : 'pi 路径覆盖'}
           />
         </div>
       </div>
@@ -381,7 +392,7 @@ export function AgentRuntimeSettingsCard() {
               type="radio"
               name="agent-model-source"
               checked={source === 'app-llm'}
-              disabled={saving}
+              disabled={saving || backend === 'claude-code'}
               onChange={() => saveAgent({ model: { source: 'app-llm' } })}
               className="accent-[#9e2b25]"
             />
@@ -396,7 +407,7 @@ export function AgentRuntimeSettingsCard() {
               type="radio"
               name="agent-model-source"
               checked={source === 'pi-agent-dir'}
-              disabled={saving}
+              disabled={saving || backend === 'claude-code'}
               onChange={() => saveAgent({ model: { source: 'pi-agent-dir' } })}
               className="accent-[#9e2b25]"
             />
@@ -416,15 +427,15 @@ export function AgentRuntimeSettingsCard() {
               aria-label="选择提供商"
             >
               <option value="">（跟随应用默认）</option>
-              {currentProviderId && !selectedProvider ? <option value={currentProviderId} disabled>原提供商未配置或不可用，请重新选择</option> : null}
-              {providers.map((p) => (
+              {currentProviderId && (!selectedProvider || (backend === 'claude-code' && selectedProvider.protocol !== 'anthropic-messages')) ? <option value={currentProviderId} disabled>原提供商不可用或协议不兼容，请重新选择</option> : null}
+              {providers.filter((p) => backend !== 'claude-code' || p.protocol === 'anthropic-messages').map((p) => (
                 <option key={p.id} value={p.id}>
                   {p.name} · {p.protocol === 'anthropic-messages' ? 'Anthropic' : p.protocol === 'openai-responses' ? 'Responses' : 'Chat Completions'}
                 </option>
               ))}
             </select>
-            {providers.length === 0 ? (
-              <p className="mt-1 text-[11px] text-ink-faint">尚无可用提供商，请在「服务提供商与模型」中配置端点、API Key 并启用模型。</p>
+            {providers.filter((p) => backend !== 'claude-code' || p.protocol === 'anthropic-messages').length === 0 ? (
+              <p className="mt-1 text-[11px] text-ink-faint">{backend === 'claude-code' ? '请配置 Anthropic Messages 兼容的提供商、API Key 和模型。' : '尚无可用提供商，请在「服务提供商与模型」中配置端点、API Key 并启用模型。'}</p>
             ) : null}
           </div>
           <div>
@@ -626,7 +637,7 @@ export function AgentRuntimeSettingsCard() {
           variant="secondary"
           size="sm"
           loading={saving}
-          onClick={() => saveAgent({ runtime: { nodePath: nodePath.trim() || undefined, piCliPath: piCliPath.trim() || undefined } })}
+          onClick={() => saveAgent({ runtime: { nodePath: nodePath.trim() || undefined, piCliPath: piCliPath.trim() || undefined, claudeCliPath: claudeCliPath.trim() || undefined } })}
         >
           保存路径覆盖
         </Button>

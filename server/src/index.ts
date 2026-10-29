@@ -393,6 +393,10 @@ export async function buildServer(options: CreateServerOptions = {}) {
     roles: roleRegistry,
     resolver: runtimeResolver,
     configProvider: () => configManager.getConfig(),
+    sessionConfig: (id) => {
+      try { return sessionService.configForSession(localMapStore, id, configManager.getConfig()); }
+      catch { return null; }
+    },
     sessionInfo: (sessionId) => {
       const row = localMapStore.getAgentSession(sessionId);
       if (!row) return null;
@@ -411,14 +415,14 @@ export async function buildServer(options: CreateServerOptions = {}) {
     emitTaskUpdate: (sessionId, dto) => sessionService.emitSse(sessionId, 'task_update', dto),
     extensionPath: piExtensionPath,
     orchestrationEnabled: () => appPluginStore.list().plugins.some((plugin) => plugin.id === 'orchestration' && plugin.enabled),
-    pluginRevision: (scope) => {
+    pluginRevision: (scope, backend) => {
       try {
-        return appPluginStore.snapshot(scope).revision;
+        return appPluginStore.snapshot(scope, { includeNative: backend !== 'claude-code' }).revision;
       } catch {
         return null;
       }
     },
-    frozenSnapshot: (scope, revision) => appPluginStore.frozenSnapshot(scope, revision),
+    frozenSnapshot: (scope, revision, backend) => appPluginStore.frozenSnapshot(scope, revision, { includeNative: backend !== 'claude-code' }),
   });
   agentToolService.registerToolFamily(taskToolFamily({ service: tasks.service, store: localMapStore }));
   // 启动对账：queued/running 任务 → interrupted（blocked 保留可作答）

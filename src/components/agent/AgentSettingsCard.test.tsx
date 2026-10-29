@@ -120,6 +120,24 @@ beforeEach(() => {
   visionStatusMock.mockReset();
 });
 
+describe('Agent 基座选择', () => {
+  it('Claude Code 显示应用提供商，并标明原 Pi 选择不可用', () => {
+    const anthropic = { ...PROVIDERS[0], id: 'anthropic', name: '兼容 Anthropic', protocol: 'anthropic-messages' as const };
+    const agent = makeConfig().agent!;
+    setup(makeConfig({ agent: { ...agent, runtime: { backend: 'claude-code' },
+      model: { ...agent.model, source: 'pi-agent-dir', piModel: 'pi/model' } }, llm: { providers: [...PROVIDERS, anthropic] } }));
+    const html = renderToStaticMarkup(<AgentRuntimeSettingsCard />);
+    expect(html).toContain('Agent 基座');
+    expect(html).toContain('Claude Code 路径覆盖');
+    expect(html).toContain('预设上下文窗口用于自动压缩');
+    const providerSelect = html.match(/<select[^>]*aria-label="选择提供商"[^>]*>[\s\S]*?<\/select>/)?.[0] ?? '';
+    expect(providerSelect).toContain('兼容 Anthropic');
+    expect(providerSelect).toContain('原提供商不可用或协议不兼容');
+    expect(providerSelect).not.toContain('示例智谱');
+    expect(html).not.toContain('aria-label="pi 模型"');
+  });
+});
+
 describe('AgentRuntimeSettingsCard 图片理解段（S2/S5）', () => {
   it('启用态：段标题、已勾选开关、测试按钮可用、发送端点提示', () => {
     setup(makeConfig());

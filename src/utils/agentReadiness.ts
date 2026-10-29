@@ -60,6 +60,12 @@ export function describeReadinessCode(code: ReadinessCode, status?: AgentStatusD
         jumpSettings: true,
         recheck: true,
       };
+    case 'claude_missing':
+      return { reason: '未找到 Claude Code', action: '安装 Claude Code，或在设置中指定其可执行文件路径', jumpSettings: true, recheck: true };
+    case 'claude_spawn_failed':
+      return { reason: 'Claude Code 不可用', action: status?.message ?? '检查路径和版本后重新检测', jumpSettings: true, recheck: true };
+    case 'claude_protocol_unsupported':
+      return { reason: '提供商协议不兼容', action: '选择 Anthropic Messages 兼容的应用内服务提供商和模型预设', jumpSettings: true, recheck: true };
     case 'model_unconfigured':
       return {
         reason: model?.source === 'pi-agent-dir' ? '未指定 pi 模型' : '应用内未配置模型',

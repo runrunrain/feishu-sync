@@ -2,7 +2,7 @@
  * NodeDetailCard - 节点详情卡（T12，04 §4.1.2 元素清单）
  *
  * 点击节点树节点联动显示该节点详情：标题 / 类型 / 路径 / 修改时间 /
- * 状态 / 同步此节点按钮 / 在文件夹中打开。
+ * 状态和文档关联信息。
  *
  * v0.2.0 cloud-link-coverage: 新增「飞书原文」可点击链接 + 「云匹配」徽章
  * （已对应 / 权限受限 / 未分类），让每个本地文档与飞书云的对应关系明确可见。
@@ -20,8 +20,6 @@ import {
   FileText,
   Table,
   FileType,
-  FolderOpen,
-  RefreshCw,
   ExternalLink,
   CloudOff,
   HelpCircle,
@@ -33,14 +31,11 @@ import { StatusBadge } from './common/StatusBadge';
 import { BusinessTag } from './common/BusinessTag';
 import { CloudMovesSection } from './move-out/CloudMovesSection';
 import { cloudMoveFace } from './move-out/labels';
-import { useToast } from './common/Toast';
 import type { CloudMoveRecord, MappingNode, WatchedRoot } from '../types';
 
 interface NodeDetailCardProps {
   node: MappingNode | null;
   businessMarks?: string[];
-  onSyncNode?: (objToken: string) => void;
-  onOpenFolder?: (localPath: string) => void;
   /**
    * v0.2.0 structure-align Phase D (D3): full node list so we can resolve
    * parent_node_token → parent node and find children. When absent the
@@ -90,15 +85,12 @@ function formatTime(t: string | null | undefined): string {
 export function NodeDetailCard({
   node,
   businessMarks,
-  onSyncNode,
-  onOpenFolder,
   allNodes,
   watchedRoots,
   onSelectNode,
   cloudMoves,
   onCloudMovesChanged,
 }: NodeDetailCardProps) {
-  const toast = useToast();
 
   if (!node) {
     return (
@@ -143,26 +135,6 @@ export function NodeDetailCard({
   // P2-S7：最新移出记录的展示层覆盖（moved 覆盖「已删除」；moving 优先
   // 于「变更」；无记录沿用既有状态文案）。
   const moveFace = cloudMoveFace(cloudMoves?.[0]);
-  const changed = moveFace != null || node.status === 'changed' || node.cloud_deleted === 1;
-
-  const handleSync = () => {
-    if (!onSyncNode) {
-      toast.push({
-        type: 'info',
-        message: '请前往「同步」主区同步该节点',
-      });
-      return;
-    }
-    onSyncNode(node.obj_token);
-  };
-
-  const handleOpenFolder = () => {
-    if (!node.local_path) {
-      toast.push({ type: 'warning', message: '该节点尚未同步到本地' });
-      return;
-    }
-    onOpenFolder?.(node.local_path);
-  };
 
   return (
     <Card variant="default">
@@ -336,25 +308,6 @@ export function NodeDetailCard({
         {/* P2-S7：移出记录列表（时间/状态/失败原因；无记录不渲染）。 */}
         <CloudMovesSection moves={cloudMoves ?? []} onChanged={onCloudMovesChanged} />
 
-        <div className="flex items-center gap-2.5 pt-1">
-          <button
-            type="button"
-            onClick={handleSync}
-            disabled={!changed}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs text-white bg-seal hover:bg-seal-2 rounded-md font-sans-ui transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            <RefreshCw className="w-3.5 h-3.5" />
-            同步此节点
-          </button>
-          <button
-            type="button"
-            onClick={handleOpenFolder}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs text-ink-soft border border-line rounded-md bg-paper hover:bg-paper-2 font-sans-ui transition-colors"
-          >
-            <FolderOpen className="w-3.5 h-3.5" />
-            在文件夹中打开
-          </button>
-        </div>
       </CardBody>
     </Card>
   );

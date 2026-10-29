@@ -293,8 +293,10 @@ function normalizeAgentConfigLoose(value: unknown, dataRoot: string): AgentConfi
   const runtimeRaw: Partial<AgentConfig['runtime']> = raw.runtime && typeof raw.runtime === 'object' ? raw.runtime : {};
   return {
     runtime: {
+      backend: runtimeRaw.backend === 'claude-code' ? 'claude-code' : 'pi',
       nodePath: typeof runtimeRaw.nodePath === 'string' && runtimeRaw.nodePath.trim() ? runtimeRaw.nodePath.trim() : undefined,
       piCliPath: typeof runtimeRaw.piCliPath === 'string' && runtimeRaw.piCliPath.trim() ? runtimeRaw.piCliPath.trim() : undefined,
+      claudeCliPath: typeof runtimeRaw.claudeCliPath === 'string' && runtimeRaw.claudeCliPath.trim() ? runtimeRaw.claudeCliPath.trim() : undefined,
     },
     model: {
       source: MODEL_SOURCES.has(modelRaw.source as string) ? (modelRaw.source as AgentConfig['model']['source']) : 'app-llm',
@@ -418,6 +420,9 @@ export function validateAgentAndKbConfig(value: {
     details.push({ field: 'agent', code: 'invalid_type' });
   } else if (value.agent && typeof value.agent === 'object') {
     const agent = value.agent as Partial<AgentConfig>;
+    if (agent.runtime?.backend !== undefined && !['pi', 'claude-code'].includes(agent.runtime.backend)) {
+      details.push({ field: 'agent.runtime.backend', code: 'invalid_value' });
+    }
     if (agent.model && typeof agent.model === 'object') {
       const model = agent.model as Partial<AgentConfig['model']>;
       if (model.source !== undefined && !MODEL_SOURCES.has(model.source as string)) {

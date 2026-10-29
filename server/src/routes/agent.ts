@@ -144,15 +144,15 @@ export async function agentRoutes(deps: AgentRouteDeps): Promise<Hono> {
     try {
       const config = await configManager.load();
       if (c.req.query('source') === 'pi-agent-dir') {
-        const local: Config = { ...config, agent: { ...config.agent, model: { ...config.agent.model, source: 'pi-agent-dir', piModel: '' } } };
+        const local: Config = { ...config, agent: { ...config.agent, runtime: { ...config.agent.runtime, backend: 'pi' }, model: { ...config.agent.model, source: 'pi-agent-dir', piModel: '' } } };
         const status = await modelStatus(local, c.req.query('refresh') === '1');
         return c.json({ items: status.model.available.map((piModel) => ({ source: 'pi-agent-dir', piModel, label: piModel, reasoning: true })), message: status.message });
       }
       const items = (config.llm.providers ?? []).flatMap((p) => p.models.map((m) => {
         const resolved = resolveProviderModel(config.llm, { providerId: p.id, modelId: m.id });
-        return resolved?.apiKey ? { source: 'app-llm', providerId: p.id, modelId: m.id, label: `${p.name} / ${m.name}`, reasoning: m.reasoning === true } : null;
+        return resolved?.apiKey && (c.req.query('backend') !== 'claude-code' || resolved.protocol === 'anthropic-messages') ? { source: 'app-llm', providerId: p.id, modelId: m.id, label: `${p.name} / ${m.name}`, reasoning: m.reasoning === true } : null;
       }).filter(Boolean));
-      return c.json({ items, message: items.length ? '' : '尚无已配置的模型，请先添加服务提供商与预设' });
+      return c.json({ items, message: items.length ? '' : c.req.query('backend') === 'claude-code' ? '请先配置 Anthropic Messages 兼容的提供商和模型' : '尚无已配置的模型，请先添加服务提供商与预设' });
     } catch (error) { return errorResponse(c, error); }
   });
   routes.get('/api/agent/sessions/:id/status', async (c) => {
@@ -170,16 +170,20 @@ export async function agentRoutes(deps: AgentRouteDeps): Promise<Hono> {
       const m = body.model;
       if (!m || !['app-llm', 'pi-agent-dir'].includes(m.source) || !['off', 'minimal', 'low', 'medium', 'high'].includes(m.thinkingLevel)) throw new ToolError('invalid_request', '模型来源或思考强度无效');
       const model: SessionModelConfig = { source: m.source, thinkingLevel: m.thinkingLevel };
+      const sessionConfig = sessionService.configForSession(localMapStore, id, config);
+      const sessionBackend = sessionConfig.agent.runtime.backend;
+      if (sessionBackend === 'claude-code' && m.source !== 'app-llm') throw new ToolError('invalid_request', 'Claude Code 只支持应用内 Anthropic 兼容提供商');
       if (m.source === 'app-llm') {
         if (typeof m.providerId !== 'string' || typeof m.modelId !== 'string') throw new ToolError('invalid_request', '请选择服务提供商和模型预设');
         model.providerId = m.providerId; model.modelId = m.modelId;
         const resolved = resolveProviderModel(config.llm, model);
         if (!resolved?.apiKey) throw new ToolError('invalid_request', '模型已删除、停用或缺少认证，请刷新列表');
+        if (sessionBackend === 'claude-code' && resolved.protocol !== 'anthropic-messages') throw new ToolError('invalid_request', 'Claude Code 需要 Anthropic Messages 兼容的提供商');
         if (!resolved.reasoning && model.thinkingLevel !== 'off') throw new ToolError('invalid_request', '该模型预设未启用思考能力');
       } else {
         if (typeof m.piModel !== 'string' || !m.piModel.includes('/')) throw new ToolError('invalid_request', '请选择本地Pi模型');
         model.piModel = m.piModel;
-        const status = await modelStatus({ ...config, agent: { ...config.agent, model: { ...config.agent.model, ...model } } });
+        const status = await modelStatus({ ...sessionConfig, agent: { ...sessionConfig.agent, model: { ...sessionConfig.agent.model, ...model } } });
         if (!status.model.available.includes(m.piModel)) throw new ToolError('invalid_request', '本地Pi模型不可用，请刷新配置与认证');
       }
       return c.json(sessionService.setModel(localMapStore, id, model));

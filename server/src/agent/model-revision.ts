@@ -7,7 +7,7 @@ import type { Config } from '../types/index.js';
 
 export function modelRevision(config: Config): string {
   const hash = crypto.createHash('sha256');
-  hash.update(JSON.stringify({ runtime: config.agent.runtime, model: config.agent.model,
+  hash.update(JSON.stringify({ runtime: { ...config.agent.runtime, backend: config.agent.runtime.backend ?? 'pi' }, model: config.agent.model,
     llm: config.agent.model.source === 'app-llm' ? config.llm : null }));
   if (config.agent.model.source === 'pi-agent-dir') {
     const home = path.resolve(process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), '.pi', 'agent'));

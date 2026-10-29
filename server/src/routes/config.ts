@@ -233,7 +233,7 @@ configRoutes.put('/api/config', async (c) => {
     // resolver 自身会在 spawn 前给出明确错误。
     const runtimeChange = partialConfig.agent?.runtime;
     if (runtimeChange && typeof runtimeChange === 'object'
-      && ('nodePath' in runtimeChange || 'piCliPath' in runtimeChange)) {
+      && ('nodePath' in runtimeChange || 'piCliPath' in runtimeChange || 'claudeCliPath' in runtimeChange || 'backend' in runtimeChange)) {
       const resolver = (c as any).agentRuntimeResolver;
       const currentConfig: Config = configBefore;
       const candidateAgent = { ...currentConfig.agent, ...partialConfig.agent };

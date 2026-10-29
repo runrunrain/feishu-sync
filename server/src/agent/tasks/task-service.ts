@@ -27,6 +27,7 @@ import path from 'node:path';
 import type { AgentProcessPool, PoolSlot } from '../agent-process-pool.js';
 import { AgentToolService, ToolError } from '../agent-tool-service.js';
 import { PiRpcProcess, buildPiProcessEnv } from '../pi-rpc-process.js';
+import { createClaudeProcess } from '../claude-process-factory.js';
 import type { PiRuntimeResolver } from '../runtime-resolver.js';
 import { buildAppLlmRunConfig } from '../provider-descriptor.js';
 import { parseSessionJsonl } from '../session-service.js';
@@ -243,6 +244,7 @@ export interface TaskServiceDeps {
   roles: RoleRegistry;
   resolver: PiRuntimeResolver;
   configProvider: () => Config | null;
+  sessionConfig?: (sessionId: string) => Config | null;
   sessionInfo: (sessionId: string) => TaskParentInfo | null;
   /** 回环内部 API 基址（子进程工具转发用） */
   internalBaseUrl: () => string;
@@ -252,9 +254,9 @@ export interface TaskServiceDeps {
   /** 编排开关（AppPluginStore orchestration 条目）；未注入视为关闭 */
   orchestrationEnabled?: () => boolean;
   /** 派发时冻结的父会话插件快照 revision */
-  pluginRevision?: (scope: 'discuss' | 'work') => string | null;
+  pluginRevision?: (scope: 'discuss' | 'work', backend?: 'pi' | 'claude-code') => string | null;
   /** 按 revision 复用不可变快照文件（AppPluginStore.frozenSnapshot） */
-  frozenSnapshot?: (scope: 'discuss' | 'work', revision: string) => AppPluginSnapshot | null;
+  frozenSnapshot?: (scope: 'discuss' | 'work', revision: string, backend?: 'pi' | 'claude-code') => AppPluginSnapshot | null;
   waitForInternalApi?: () => Promise<void>;
   spawner?: TaskProcessSpawner;
 }
@@ -347,7 +349,7 @@ export class TaskService {
     }
     const session = this.deps.sessionInfo(input.sessionId);
     if (!session) throw new ToolError('session_not_found', '会话不存在', 404);
-    const config = this.deps.configProvider();
+    const config = this.deps.sessionConfig ? this.deps.sessionConfig(input.sessionId) : this.deps.configProvider();
     if (!config) throw new ToolError('invalid_request', '配置不可用');
 
     const card = this.deps.roles.get(String(input.role));
@@ -401,7 +403,7 @@ export class TaskService {
 
     const taskId = `t_${Date.now().toString(36)}_${taskSeqSegment(taskSequence += 1)}_${crypto.randomBytes(4).toString('hex')}`;
     const now = new Date().toISOString();
-    const pluginRevision = this.deps.pluginRevision?.(session.mode) ?? null;
+    const pluginRevision = this.deps.pluginRevision?.(session.mode, config.agent.runtime.backend) ?? null;
     store.createAgentTask({
       id: taskId,
       sessionId: input.sessionId,
@@ -755,11 +757,11 @@ export class TaskService {
 
   private async spawnProcess(input: TaskSpawnInput): Promise<PiRpcProcess> {
     const task = input.task;
-    const config = this.deps.configProvider();
+    const config = this.deps.sessionConfig ? this.deps.sessionConfig(task.sessionId) : this.deps.configProvider();
     if (!config) throw new ToolError('invalid_request', '配置不可用');
     await this.deps.waitForInternalApi?.();
     const runtime = await this.deps.resolver.resolveRuntime(config.agent);
-    if (!runtime.nodePath || !runtime.piCliPath) {
+    if (!runtime.nodePath || (config.agent.runtime.backend !== 'claude-code' && !runtime.piCliPath)) {
       throw new ToolError('agent_not_ready', 'Agent 运行时未就绪（Node 或 pi 缺失）', 503);
     }
 
@@ -768,6 +770,22 @@ export class TaskService {
     // 不再 path.join + recursive mkdir（祖先 symlink 会把授权根扩到
     // 父根之外）。
     const workspaceRoot = input.workspaceRoot;
+
+    if (config.agent.runtime.backend === 'claude-code') {
+      const snapshot = task.pluginRevision ? this.deps.frozenSnapshot?.(task.parentMode, task.pluginRevision, 'claude-code') ?? null : null;
+      const { token } = this.deps.toolService.createRunContext({ runKind: 'task', sessionId: task.id,
+        allowedToolsOverride: task.tools, outputRoot: config.standardKb.outputRoot, knowledgeBaseRoot: config.knowledgeBaseRoot,
+        ...(workspaceRoot ? { workspaceRoot } : {}) });
+      let rpc: PiRpcProcess | undefined;
+      try {
+        rpc = createClaudeProcess({ config, nodePath: runtime.nodePath, token, sessionId: task.id, dataRoot: this.deps.dataRoot,
+          sessionDir: path.join(this.deps.dataRoot, 'agent', 'sessions', 'tasks'), internalBaseUrl: this.deps.internalBaseUrl(),
+          toolService: this.deps.toolService, pluginSnapshot: snapshot ?? undefined, timeoutMs: input.timeoutMs });
+        rpc.once('exit', () => this.deps.toolService.revokeToken(token));
+        await rpc.start();
+      } catch (error) { await rpc?.terminate().catch(() => undefined); this.deps.toolService.revokeToken(token); throw error; }
+      return rpc;
+    }
 
     // 模型 = agent.model（v1 不按任务换模型）
     let model: string;
@@ -822,7 +840,7 @@ export class TaskService {
     const extensionPath = this.deps.extensionPath();
     const rpc = new PiRpcProcess({
       nodePath: runtime.nodePath,
-      piCliPath: runtime.piCliPath,
+      piCliPath: runtime.piCliPath!,
       ...(extensionPath ? { extensionPath } : {}),
       ...(pluginSnapshot ? {
         additionalExtensionPaths: pluginSnapshot.extensionPaths ?? [pluginSnapshot.extensionPath],

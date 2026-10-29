@@ -138,7 +138,7 @@ export interface RunContextOptions {
   /** discuss/work 会话的原始库根 */
   knowledgeBaseRoot: string;
   buildState?: BuildRunState;
-  onEvent?: (event: { phase: 'start' | 'end'; toolName: string; argsSummary: string; resultSummary?: string; isError?: boolean }) => void;
+  onEvent?: (event: { phase: 'start' | 'end'; toolName: string; toolCallId?: string; argsSummary: string; resultSummary?: string; isError?: boolean }) => void;
   /**
    * S6：显式覆盖白名单（子任务冻结工具集 = 角色请求 ∩ 父会话模式工具集
    * ∩ 已知工具，由 TaskService 冻结后传入）。仅保留已知工具，并剔除
@@ -472,17 +472,18 @@ export class AgentToolService {
       throw new ToolError('tool_not_allowed', `未知工具: ${toolName}`, 403);
     }
     const argsSummary = summarizeArgs(toolName, args);
-    context.options.onEvent?.({ phase: 'start', toolName, argsSummary });
+    context.options.onEvent?.({ phase: 'start', toolName, ...(meta?.toolCallId ? { toolCallId: meta.toolCallId } : {}), argsSummary });
     try {
       const result = await tool.execute(context, args, meta);
       const resultSummary = summarizeResult(result);
-      context.options.onEvent?.({ phase: 'end', toolName, argsSummary, resultSummary, isError: false });
+      context.options.onEvent?.({ phase: 'end', toolName, ...(meta?.toolCallId ? { toolCallId: meta.toolCallId } : {}), argsSummary, resultSummary, isError: false });
       return result;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       context.options.onEvent?.({
         phase: 'end',
         toolName,
+        ...(meta?.toolCallId ? { toolCallId: meta.toolCallId } : {}),
         argsSummary,
         resultSummary: message.slice(0, 300),
         isError: true,

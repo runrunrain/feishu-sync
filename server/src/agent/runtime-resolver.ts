@@ -36,6 +36,7 @@ import {
   type ReadinessCode,
 } from '../types/agent-knowledge.js';
 import type { LlmConfig } from '../types/index.js';
+import { inspectClaudeCode, resolveClaudeCodePath, resolveClaudeProvider } from './claude-runtime.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -49,6 +50,7 @@ export interface ResolvedRuntime {
   /** pi CLI 入口（<pkg>/dist/cli.js 或 bundle 变体） */
   piCliPath: string | null;
   piVersion: string | null;
+  claudeCliPath?: string | null;
 }
 
 export interface ReadinessProbeInput {
@@ -185,7 +187,10 @@ export class PiRuntimeResolver {
   /** 发现 Node ≥22.19 与 pi 包（不做模型探测）。 */
   async resolveRuntime(agentConfig: AgentConfig): Promise<ResolvedRuntime> {
     const runtime = await this.discoverRuntime(agentConfig);
-    const key = JSON.stringify([runtime.nodePath, runtime.piPackageRoot]);
+    if (agentConfig.runtime.backend === 'claude-code' || agentConfig.runtime.claudeCliPath) {
+      runtime.claudeCliPath = resolveClaudeCodePath(agentConfig.runtime.claudeCliPath, this.overrides.env ?? process.env, this.overrides.platform ?? process.platform);
+    }
+    const key = JSON.stringify([runtime.nodePath, runtime.piPackageRoot, runtime.claudeCliPath]);
     this.resolvedRuntimes.set(key, runtime);
     return runtime;
   }
@@ -344,11 +349,12 @@ export class PiRuntimeResolver {
     options: { force?: boolean } = {}): Promise<ReadinessResult> {
     const env = this.overrides.env ?? process.env;
     const home = env.PI_CODING_AGENT_DIR || path.join(os.homedir(), '.pi', 'agent');
-    const credentials = input.agentConfig.model.source === 'pi-agent-dir' ? ['models.json', 'auth.json'].map((name) => {
+    const usesAppModel = input.agentConfig.runtime.backend === 'claude-code' || input.agentConfig.model.source === 'app-llm';
+    const credentials = !usesAppModel ? ['models.json', 'auth.json'].map((name) => {
       try { const stat = fs.statSync(path.join(home, name)); return [name, stat.mtimeMs, stat.size]; } catch { return [name, null]; }
     }) : [];
     const key = crypto.createHash('sha256').update(JSON.stringify({ runtime: input.agentConfig.runtime, model: { ...input.agentConfig.model, thinkingLevel: undefined },
-      llm: input.agentConfig.model.source === 'app-llm' ? input.llmConfig : null, home, credentials, probing: Boolean(modelProbe) })).digest('hex');
+      llm: usesAppModel ? input.llmConfig : null, home, credentials, probing: Boolean(modelProbe) })).digest('hex');
     const withCounts = (value: ReadinessResult): ReadinessResult => ({ ...value, processes: { running: input.runningProcesses, max: input.agentConfig.maxConcurrentProcesses } });
     const pending = this.probes.get(key);
     if (pending) return withCounts(await pending);
@@ -386,6 +392,24 @@ export class PiRuntimeResolver {
       processes: { running: runningProcesses, max: agentConfig.maxConcurrentProcesses },
       checkedAt: new Date().toISOString(),
     };
+
+    if (agentConfig.runtime.backend === 'claude-code') {
+      const executable = resolveClaudeCodePath(agentConfig.runtime.claudeCliPath, this.overrides.env ?? process.env, this.overrides.platform ?? process.platform);
+      const claudeBase = { ...base, runtime: { ...base.runtime, backend: 'claude-code' as const, claudeCliPath: executable, claudeVersion: null as string | null } };
+      const model = resolveClaudeProvider(llmConfig, agentConfig);
+      const info = { source: 'app-llm' as const, model: model?.openAiModel ?? null, available: [] as string[] };
+      if (!runtime.nodePath) return { ...claudeBase, code: 'node_missing', message: 'Claude Code 工具桥需要 Node ≥22.19', model: info };
+      if (!executable) return { ...claudeBase, code: 'claude_missing', message: '未找到 Claude Code，请安装或在设置中填写可执行文件路径', model: info };
+      try {
+        const found = await inspectClaudeCode(executable);
+        claudeBase.runtime.claudeVersion = found.version;
+        if (!found.supported) return { ...claudeBase, code: 'claude_spawn_failed', message: 'Claude Code 缺少安全运行所需参数，请更新 Claude Code', model: info };
+      } catch { return { ...claudeBase, code: 'claude_spawn_failed', message: 'Claude Code 无法运行，请检查可执行文件路径', model: info }; }
+      if (!model) return { ...claudeBase, code: 'model_unconfigured', message: 'Claude Code 请使用应用内服务提供商和模型预设', model: info };
+      if (model.protocol !== 'anthropic-messages') return { ...claudeBase, code: 'claude_protocol_unsupported', message: 'Claude Code 需要 Anthropic Messages 兼容的服务提供商', model: info };
+      if (!model.apiKey) return { ...claudeBase, code: 'model_auth_missing', message: `提供商 ${model.providerName} 未配置 API Key`, model: info };
+      return { ...claudeBase, code: 'ready', message: 'Claude Code 和应用内模型已配置（尚未验证服务商连接）', model: info };
+    }
 
     const oldNode = (this as { lastSeenOldNode?: { path: string; version: string } }).lastSeenOldNode;
 

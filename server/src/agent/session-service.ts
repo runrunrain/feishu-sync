@@ -18,6 +18,8 @@ import { AgentToolService, ToolError } from './agent-tool-service.js';
 import { buildPiProcessEnv, PiRpcProcess } from './pi-rpc-process.js';
 import { PiRuntimeResolver } from './runtime-resolver.js';
 import { buildAppLlmRunConfig } from './provider-descriptor.js';
+import { createClaudeProcess } from './claude-process-factory.js';
+import { ClaudeCodeProcess } from './claude-code-process.js';
 import type { SessionModelConfig } from '../types/agent-knowledge.js';
 import { modelRevision } from './model-revision.js';
 import { checkRootOverlap, type WorkspaceRootGuards } from './path-guard.js';
@@ -132,6 +134,7 @@ export class SessionService extends EventEmitter {
     const errorMessage = row.last_error_message ? String(row.last_error_message) : null;
     return {
       id: sessionId,
+      backend: row.runtime_backend === 'claude-code' ? 'claude-code' : 'pi',
       model: this.readSessionModel(row),
       title: String(row.title),
       mode: row.mode as AgentSessionMode,
@@ -158,7 +161,7 @@ export class SessionService extends EventEmitter {
 
   create(
     localMapStore: {
-      createAgentSession(input: { id: string; title: string; mode: 'discuss' | 'work'; workspaceId: string | null; createdAt: string; updatedAt: string }): void;
+      createAgentSession(input: { id: string; title: string; mode: 'discuss' | 'work'; workspaceId: string | null; backend?: 'pi' | 'claude-code'; createdAt: string; updatedAt: string }): void;
     },
     input: { title?: string; mode?: string },
   ): AgentSessionDto {
@@ -168,10 +171,11 @@ export class SessionService extends EventEmitter {
     const id = `s_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`;
     const title = (input.title ?? '新会话').trim().slice(0, 80) || '新会话';
     const now = new Date().toISOString();
-    localMapStore.createAgentSession({ id, title, mode: 'discuss', workspaceId: null, createdAt: now, updatedAt: now });
+    const backend = this.currentConfig()?.agent.runtime.backend === 'claude-code' ? 'claude-code' : 'pi';
+    localMapStore.createAgentSession({ id, title, mode: 'discuss', workspaceId: null, backend, createdAt: now, updatedAt: now });
     fs.mkdirSync(this.sessionDir(), { recursive: true });
     return {
-      id, title, mode: 'discuss', workspace: null, state: 'idle', lastError: null,
+      id, title, mode: 'discuss', workspace: null, state: 'idle', lastError: null, backend,
       createdAt: now, updatedAt: now,
     };
   }
@@ -206,7 +210,10 @@ export class SessionService extends EventEmitter {
     if (!row) throw new ToolError('session_not_found', '会话不存在', 404);
     if (!base) throw new ToolError('invalid_request', '配置不可用');
     const model = this.readSessionModel(row);
-    return model ? { ...base, agent: { ...base.agent, model: { ...base.agent.model, ...model } } } : base;
+    const backend = row.runtime_backend === 'claude-code' ? 'claude-code' : 'pi';
+    const resolvedModel = model ? { ...base.agent.model, ...model } : backend === 'claude-code'
+      ? { ...base.agent.model, source: 'app-llm' as const } : base.agent.model;
+    return { ...base, agent: { ...base.agent, runtime: { ...base.agent.runtime, backend }, model: resolvedModel } };
   }
 
   setModel(store: SessionStoreApi, id: string, model: SessionModelConfig | null): AgentSessionDto {
@@ -243,6 +250,20 @@ export class SessionService extends EventEmitter {
         fs.renameSync(sessionFile, target);
       } catch {
         /* 移动失败保留原文件（软删除语义已达成） */
+      }
+    }
+    if (row.runtime_backend === 'claude-code') {
+      // Claude's native resume state is isolated per session. Move it with
+      // the app transcript instead of leaving a live orphan on soft delete.
+      const key = crypto.createHash('sha256').update(id).digest('hex');
+      const base = path.join(this.sessionDir(), 'claude');
+      const deletedDir = path.join(this.sessionDir(), '.deleted');
+      fs.mkdirSync(deletedDir, { recursive: true });
+      for (const name of [`${key}.home`, `${key}.session`]) {
+        const source = path.join(base, name);
+        if (fs.existsSync(source)) {
+          try { fs.renameSync(source, path.join(deletedDir, `${name}.${Date.now()}`)); } catch { /* Preserve on failed move. */ }
+        }
       }
     }
     this.sseBuffers.delete(id);
@@ -394,7 +415,7 @@ export class SessionService extends EventEmitter {
     this.emitSessionState(sessionId, localMapStore);
 
     try {
-      const pluginSnapshot = this.deps.pluginStore?.snapshot(mode);
+      const pluginSnapshot = this.deps.pluginStore?.snapshot(mode, { includeNative: config.agent.runtime.backend !== 'claude-code' });
       let process = this.deps.pool.get(sessionId);
       if (process && ((pluginSnapshot && this.pluginRevisions.get(process) !== pluginSnapshot.revision)
         || this.modelRevisions.get(process) !== modelRevision(config))) {
@@ -501,6 +522,9 @@ export class SessionService extends EventEmitter {
       localMapStore.updateAgentSession(sessionId, { lastErrorCode: code, lastErrorMessage: message.slice(0, 500) });
       this.emitSse(sessionId, 'run_end', { runId, outcome: 'failed', error: { code, message: message.slice(0, 500) } });
     } finally {
+      // Claude's run token must never survive into another run. Its CLI is
+      // resumed with a new capability context on the next message.
+      if (config.agent.runtime.backend === 'claude-code') await this.deps.pool.terminate(sessionId).catch((error) => console.error('[SessionService] Claude cleanup failed:', error));
       this.runs.delete(sessionId);
       this.abortRequested.delete(sessionId);
       this.sessionStates.delete(sessionId);
@@ -519,7 +543,7 @@ export class SessionService extends EventEmitter {
     const config = runConfig ?? this.currentConfig()!;
     const revision = modelRevision(config);
     const runtime = await this.deps.resolver.resolveRuntime(config.agent);
-    if (!runtime.nodePath || !runtime.piCliPath) {
+    if (!runtime.nodePath || (config.agent.runtime.backend !== 'claude-code' && !runtime.piCliPath)) {
       throw new ToolError('agent_not_ready', 'Agent 运行时未就绪（Node 或 pi 缺失），请检查设置', 503);
     }
     const runKind = mode === 'work' ? 'work' : 'discuss';
@@ -549,10 +573,23 @@ export class SessionService extends EventEmitter {
       workspaceRoot,
       ...(taskFace && !orchestrationOn ? { disableToolFamilies: [taskFace.family] } : {}),
       onEvent: (event) => {
+        if (config.agent.runtime.backend === 'claude-code' && event.phase === 'start' && event.toolCallId
+          && this.runs.get(sessionId)?.phase === 'running' && !this.abortRequested.has(sessionId)) {
+          let bucket = this.toolCallRuns.get(sessionId);
+          if (!bucket) { bucket = new Map<string, string>(); this.toolCallRuns.set(sessionId, bucket); }
+          bucket.set(event.toolCallId, this.runs.get(sessionId)!.runId);
+          if (bucket.size > SessionService.TOOL_CALL_TRACK_LIMIT) bucket.delete(bucket.keys().next().value!);
+        }
+        if (config.agent.runtime.backend === 'claude-code' && event.phase === 'end') {
+          const rpc = this.deps.pool.get(sessionId);
+          if (rpc instanceof ClaudeCodeProcess) {
+            try { rpc.recordToolResult(event); } catch (error) { console.error('[SessionService] Could not record Claude tool result:', error); }
+          }
+        }
         this.emitSse(sessionId, 'tool', {
           runId: this.runs.get(sessionId)?.runId ?? '',
           phase: event.phase,
-          callId: '',
+          callId: config.agent.runtime.backend === 'claude-code' ? event.toolCallId ?? '' : '',
           toolName: event.toolName,
           argsSummary: event.argsSummary,
           ...(event.resultSummary !== undefined ? { resultSummary: event.resultSummary } : {}),
@@ -560,6 +597,20 @@ export class SessionService extends EventEmitter {
         });
       },
     });
+
+    if (config.agent.runtime.backend === 'claude-code') {
+      let rpc: PiRpcProcess;
+      try { rpc = createClaudeProcess({ config, nodePath: runtime.nodePath!, token, sessionId, dataRoot: this.deps.dataRoot,
+        internalBaseUrl: this.deps.internalBaseUrl(), toolService: this.deps.toolService, pluginSnapshot }); }
+      catch (error) { slot.release(); this.deps.toolService.revokeToken(token); throw error; }
+      rpc.once('exit', () => this.deps.toolService.revokeToken(token));
+      try {
+        await rpc.start(); this.deps.pool.register(sessionId, rpc, 'session', slot);
+        this.modelRevisions.set(rpc, revision);
+        if (pluginSnapshot) this.pluginRevisions.set(rpc, pluginSnapshot.revision);
+      } catch (error) { slot.release(); await rpc.terminate().catch(() => undefined); this.deps.toolService.revokeToken(token); throw error; }
+      return rpc;
+    }
 
     const llm = config.llm;
     let model: string;
@@ -606,7 +657,7 @@ export class SessionService extends EventEmitter {
     const extensionPath = this.deps.extensionPath();
     const rpc = new PiRpcProcess({
       nodePath: runtime.nodePath,
-      piCliPath: runtime.piCliPath,
+      piCliPath: runtime.piCliPath!,
       ...(extensionPath ? { extensionPath } : {}),
       ...(pluginSnapshot ? { additionalExtensionPaths: pluginSnapshot.extensionPaths ?? [pluginSnapshot.extensionPath], allowExternalPluginTools: pluginSnapshot.externalPlugins, additionalSkillPaths: pluginSnapshot.skillPaths, additionalPromptPaths: pluginSnapshot.promptPaths, additionalThemePaths: pluginSnapshot.themePaths } : {}),
       tools: orchestrationOn

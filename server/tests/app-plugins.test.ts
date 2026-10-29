@@ -87,6 +87,16 @@ describe('应用专属Pi上下文插件', () => {
 });
 
 describe('R2-05：frozenSnapshot 原生资源版本一致性', () => {
+  it('Claude 文本快照不依赖 Pi 原生插件状态，仍可冻结和复用', () => {
+    const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'app-plugins-claude-'));
+    roots.push(dataRoot);
+    const store = new AppPluginStore(dataRoot, undefined, () => { throw new Error('Pi plugins are unavailable'); });
+    const snapshot = store.snapshot('work', { includeNative: false });
+    expect(fs.readFileSync(snapshot.path, 'utf8')).toContain('本地知识工作助手');
+    expect(store.frozenSnapshot('work', snapshot.revision, { includeNative: false })?.revision).toBe(snapshot.revision);
+    expect(() => store.snapshot('work')).toThrow('Pi plugins are unavailable');
+  });
+
   it('nativeRevision 变化 → plugin_snapshot_stale 诚实阻断；一致时返回快照；文件缺失仍 null', () => {
     const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'app-plugins-r205-'));
     roots.push(dataRoot);

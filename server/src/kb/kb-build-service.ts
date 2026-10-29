@@ -23,6 +23,7 @@ import { isPathInside } from '../agent/path-guard.js';
 import { buildPiProcessEnv, PiRpcProcess } from '../agent/pi-rpc-process.js';
 import { PiRuntimeResolver, resolveAppLlmModel } from '../agent/runtime-resolver.js';
 import { buildAppLlmRunConfig } from '../agent/provider-descriptor.js';
+import { createClaudeProcess } from '../agent/claude-process-factory.js';
 import { RawSourceSnapshot, computeSourceHash } from './raw-source-snapshot.js';
 import { isReleaseInUse } from './publication-service.js';
 import { StandardKbStore, parseStdHeader, stripStdHeader } from './standard-kb-store.js';
@@ -411,7 +412,7 @@ export class KbBuildService extends EventEmitter {
 
     try {
       // 本构建固定一份插件快照，后续修改只影响下次构建。
-      const pluginSnapshot = this.deps.pluginStore?.snapshot('build');
+      const pluginSnapshot = this.deps.pluginStore?.snapshot('build', { includeNative: config.agent.runtime.backend !== 'claude-code' });
       // ============ preflight ============
       setStatus('preflight', { startedAt });
       entry.stage = 'snapshot';
@@ -788,10 +789,10 @@ export class KbBuildService extends EventEmitter {
         releaseId,
         mode: effectiveMode,
         baseReleaseId: baseManifest?.releaseId ?? null,
-        model: config.agent.model.source === 'app-llm'
+        model: config.agent.model.source === 'app-llm' || config.agent.runtime.backend === 'claude-code'
           ? (() => {
             const resolution = resolveAppLlmModel(config.llm, config.agent);
-            return resolution ? `feishu-sync-llm/${resolution.openAiModel}` : null;
+            return resolution ? `${config.agent.runtime.backend === 'claude-code' ? 'claude-code' : 'feishu-sync-llm'}/${resolution.openAiModel}` : null;
           })()
           : config.agent.model.piModel ?? null,
         snapshot,
@@ -1179,11 +1180,21 @@ export class KbBuildService extends EventEmitter {
   ): Promise<PiRpcProcess> {
     const config = this.deps.configProvider()!;
     const runtime = await this.deps.resolver.resolveRuntime(config.agent);
-    if (!runtime.nodePath || !runtime.piCliPath) {
+    if (!runtime.nodePath || (config.agent.runtime.backend !== 'claude-code' && !runtime.piCliPath)) {
       throw new ToolError('agent_not_ready', 'Agent 运行时未就绪', 503);
     }
     const slot = await this.acquireSingleWorkerSlot(slotOptions);
     const { token, revoke } = this.createBuildRunContext(buildId, buildState);
+
+    if (config.agent.runtime.backend === 'claude-code') {
+      let rpc: PiRpcProcess | undefined;
+      try {
+        rpc = createClaudeProcess({ config, nodePath: runtime.nodePath, token, sessionId: `build:${buildId}`, dataRoot: this.deps.dataRoot,
+          internalBaseUrl: this.deps.internalBaseUrl(), toolService: this.deps.toolService, pluginSnapshot, ephemeral: true });
+        rpc.once('exit', revoke); await rpc.start(); this.deps.pool.register(`build:${buildId}`, rpc, 'build', slot);
+        return rpc;
+      } catch (error) { slot.release(); await rpc?.terminate().catch(() => undefined); revoke(); throw error; }
+    }
 
     let model: string;
     let apiKey: string | undefined;
@@ -1212,7 +1223,7 @@ export class KbBuildService extends EventEmitter {
     const extensionPath = this.deps.extensionPath();
     const spawnOptions = {
       nodePath: runtime.nodePath,
-      piCliPath: runtime.piCliPath,
+      piCliPath: runtime.piCliPath!,
       ...(extensionPath ? { extensionPath } : {}),
       ...(pluginSnapshot ? {
         additionalExtensionPaths: pluginSnapshot.extensionPaths ?? [pluginSnapshot.extensionPath],
@@ -1367,7 +1378,7 @@ export class KbBuildService extends EventEmitter {
   }): Promise<void> {
     const config = this.deps.configProvider()!;
     const runtime = await this.deps.resolver.resolveRuntime(config.agent);
-    if (!runtime.nodePath || !runtime.piCliPath) {
+    if (!runtime.nodePath || (config.agent.runtime.backend !== 'claude-code' && !runtime.piCliPath)) {
       throw new ToolError('agent_not_ready', 'Agent 运行时未就绪', 503);
     }
     const { worker } = input;
@@ -1391,6 +1402,19 @@ export class KbBuildService extends EventEmitter {
     });
     worker.token = token;
     worker.context = context as import('../agent/agent-tool-service.js').InternalRunContext;
+
+    if (config.agent.runtime.backend === 'claude-code') {
+      let rpc: PiRpcProcess | undefined;
+      try {
+        rpc = createClaudeProcess({ config, nodePath: runtime.nodePath, token, sessionId: `build:${input.buildId}:${worker.workerId}`,
+          dataRoot: this.deps.dataRoot, internalBaseUrl: this.deps.internalBaseUrl(), toolService: this.deps.toolService,
+          pluginSnapshot: input.pluginSnapshot, ephemeral: true });
+        rpc.once('exit', () => this.deps.toolService.revokeToken(token));
+        await rpc.start(); this.deps.pool.register(worker.poolKey, rpc, 'build', input.slot);
+        worker.rpc = rpc;
+        return;
+      } catch (error) { input.slot?.release(); await rpc?.terminate().catch(() => undefined); this.deps.toolService.revokeToken(token); throw error; }
+    }
 
     let model: string;
     let apiKey: string | undefined;
@@ -1435,7 +1459,7 @@ export class KbBuildService extends EventEmitter {
     const extensionPath = this.deps.extensionPath();
     const spawnOptions = {
       nodePath: runtime.nodePath,
-      piCliPath: runtime.piCliPath,
+      piCliPath: runtime.piCliPath!,
       ...(extensionPath ? { extensionPath } : {}),
       ...(input.pluginSnapshot ? {
         additionalExtensionPaths: input.pluginSnapshot.extensionPaths ?? [input.pluginSnapshot.extensionPath],

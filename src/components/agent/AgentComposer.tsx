@@ -122,7 +122,7 @@ export function AgentComposer({
               disabled
                 ? '输入不可用'
                 : running
-                  ? 'Agent 正在生成——可插话或排队下一条…'
+                  ? session?.backend === 'claude-code' ? 'Claude Code 正在生成，请等待本轮结束…' : 'Agent 正在生成——可插话或排队下一条…'
                   : '描述你的设计问题，Enter 发送，Shift+Enter 换行'
             }
             className="block w-full resize-none border-0 bg-transparent px-2 py-2 text-sm text-ink placeholder:text-ink-faint focus:outline-none focus:border-seal/50 disabled:bg-paper-2 disabled:text-ink-faint scrollbar-thin"
@@ -134,7 +134,7 @@ export function AgentComposer({
           <div className="flex flex-wrap items-center gap-1.5 shrink-0">
             {running ? (
               <>
-                <Button
+                {session?.backend !== 'claude-code' && <Button
                   size="sm"
                   variant="secondary"
                   onClick={() => void doSend('steer')}
@@ -143,8 +143,8 @@ export function AgentComposer({
                 >
                   <CornerDownLeft className="w-3.5 h-3.5" />
                   插话
-                </Button>
-                <Button
+                </Button>}
+                {session?.backend !== 'claude-code' && <Button
                   size="sm"
                   variant="secondary"
                   onClick={() => void doSend('followUp')}
@@ -153,7 +153,7 @@ export function AgentComposer({
                 >
                   <ListPlus className="w-3.5 h-3.5" />
                   排队
-                </Button>
+                </Button>}
                 <Button size="sm" variant="ghost" onClick={onStop} className="text-seal-2 hover:bg-[rgba(192,57,43,0.06)]">
                   <Square className="w-3.5 h-3.5" />
                   停止
@@ -177,7 +177,7 @@ export function AgentComposer({
         </div>
         <p className="mt-1.5 text-[10px] text-ink-faint">
           {text.length > MAX_TEXT * 0.8 ? `${text.length}/${MAX_TEXT} 字符 · ` : ''}
-          应用自带工具：Discuss 只读；Work 仅可写绑定 Workspace，无 shell。第三方 Pi 插件按其自身能力运行。
+          应用自带工具：Discuss 只读；Work 仅可写绑定 Workspace，无 shell。{session?.backend === 'claude-code' ? 'Claude Code 不加载 Pi 专用扩展。' : '第三方 Pi 插件按其自身能力运行。'}
         </p>
       </div>
     </div>

@@ -32,7 +32,6 @@ import { DocPreviewPanel } from '../components/DocPreviewPanel';
 import { ColumnResizer } from '../components/ColumnResizer';
 import { OrphanFileAlert } from '../components/OrphanFileAlert';
 import { QuickAddDocDialog } from '../components/QuickAddDocDialog';
-import { MoveOutModal } from '../components/move-out/MoveOutModal';
 import { useConfig } from '../hooks/useConfig';
 import { useToast } from '../components/common/Toast';
 import {
@@ -201,7 +200,6 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
   const [batchTarget, setBatchTarget] = useState<{ tokens: string[]; action: 'delete' | 'block' } | null>(null);
   const [selectionVersion, setSelectionVersion] = useState(0);
   // P2-S7 移出到云空间：目标文档（右键菜单入口）+ 移出记录（展示层 join）。
-  const [moveOutTarget, setMoveOutTarget] = useState<{ objToken: string; title: string } | null>(null);
   const [cloudMoves, setCloudMoves] = useState<CloudMoveRecord[]>([]);
   const loadCloudMoves = useCallback(async () => {
     try {
@@ -506,6 +504,11 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
             nodes={feishuEnv?.nodes}
             selectedToken={selectedToken}
             onSelect={setSelectedToken}
+            onSyncNode={() => {
+              toast.push({ type: 'info', message: '请前往「贰 同步」主区同步该节点' });
+              onJumpToSync();
+            }}
+            onOpenFolder={handleOpenFolder}
             businessMarksByToken={businessMarksByToken}
             orphanPaths={orphanPaths}
             watchedRoots={watchedRoots}
@@ -515,7 +518,6 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
             onRefreshed={loadFeishu}
             onDeleteDoc={handleManualDeleteDoc}
             onBatchAction={(tokens, action) => setBatchTarget({ tokens, action })}
-            onMoveOutDoc={setMoveOutTarget}
             latestMoveByToken={latestMoveByToken}
             selectionVersion={selectionVersion}
             className="h-full"
@@ -577,14 +579,6 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
               onSelectNode={setSelectedToken}
               cloudMoves={selectedNode ? movesByToken.get(selectedNode.obj_token) : undefined}
               onCloudMovesChanged={() => { void loadCloudMoves(); void loadFeishu(); }}
-              onSyncNode={() => {
-                toast.push({
-                  type: 'info',
-                  message: '请前往「贰 同步」主区同步该节点',
-                });
-                onJumpToSync();
-              }}
-              onOpenFolder={handleOpenFolder}
             />
             <RecentChanges changes={changes} onJumpToSync={onJumpToSync} className="flex-1 min-h-[180px]" />
           </div>
@@ -608,16 +602,6 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
 
       {/* P2-S7 移出到云空间：两段确认弹窗（preview → 确认值门控 → 执行 →
           异步轮询收敛）；收敛后刷新树与移出记录。 */}
-      <MoveOutModal
-        open={moveOutTarget !== null}
-        objToken={moveOutTarget?.objToken ?? null}
-        target={moveOutTarget}
-        onClose={() => setMoveOutTarget(null)}
-        onMoved={() => {
-          void loadCloudMoves();
-          void loadFeishu();
-        }}
-      />
     </div>
   );
 }

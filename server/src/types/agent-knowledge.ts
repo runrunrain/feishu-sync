@@ -58,7 +58,7 @@ export interface AgentVisionConfig {
 }
 
 export interface AgentConfig {
-  runtime: { nodePath?: string; piCliPath?: string };
+  runtime: { backend?: 'pi' | 'claude-code'; nodePath?: string; piCliPath?: string; claudeCliPath?: string };
   model: AgentModelConfig;
   /** 图片理解通道（S2）；缺省 disabled，见 buildDefaultAgentVisionConfig */
   vision: AgentVisionConfig;
@@ -168,6 +168,9 @@ export type ReadinessCode =
   | 'pi_missing'
   | 'pi_version_unsupported'
   | 'pi_spawn_failed'
+  | 'claude_missing'
+  | 'claude_spawn_failed'
+  | 'claude_protocol_unsupported'
   | 'model_unconfigured'
   | 'model_auth_missing';
 
@@ -183,6 +186,9 @@ export interface AgentStatusDto {
     piCliPath: string | null;
     piVersion: string | null;
     supportedRange: string;
+    backend?: 'pi' | 'claude-code';
+    claudeCliPath?: string | null;
+    claudeVersion?: string | null;
   };
   model: {
     source: AgentModelSource;
@@ -392,6 +398,7 @@ export type AgentSessionState = 'idle' | 'starting' | 'streaming' | 'error';
 export type SessionModelConfig = Pick<AgentModelConfig, 'source' | 'providerId' | 'modelId' | 'piModel' | 'thinkingLevel'>;
 
 export interface AgentSessionDto {
+  backend?: 'pi' | 'claude-code';
   model?: SessionModelConfig | null;
   id: string;
   title: string;

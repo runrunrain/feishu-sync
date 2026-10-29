@@ -139,7 +139,7 @@ export class AppPluginStore {
    * native 资源装进旧 revision 快照。未注入 nativeResources 的实例
    * （纯文本插件测试形态）无 native 面，不做比对。
    */
-  frozenSnapshot(scope: AgentPluginScope, revision: string): AppPluginSnapshot | null {
+  frozenSnapshot(scope: AgentPluginScope, revision: string, options: { includeNative?: boolean } = {}): AppPluginSnapshot | null {
     const extensionPath = piContextExtensionPath();
     if (!extensionPath) return null;
     let file: string;
@@ -157,7 +157,7 @@ export class AppPluginStore {
     } catch {
       return null;
     }
-    const native = this.nativeResources?.();
+    const native = options.includeNative === false ? undefined : this.nativeResources?.();
     if (native && native.revision !== frozenNativeRevision) {
       throw new ToolError(
         'plugin_snapshot_stale',
@@ -173,11 +173,11 @@ export class AppPluginStore {
     };
   }
 
-  snapshot(scope: AgentPluginScope): AppPluginSnapshot {
+  snapshot(scope: AgentPluginScope, options: { includeNative?: boolean } = {}): AppPluginSnapshot {
     const extensionPath = piContextExtensionPath();
     if (!extensionPath) throw new ToolError('plugin_assets_missing', 'Pi上下文扩展缺失，请重新构建应用', 503);
     const { plugins } = this.list();
-    const native = this.nativeResources?.();
+    const native = options.includeNative === false ? undefined : this.nativeResources?.();
     const content = JSON.stringify({ schemaVersion: 1, scope, nativeRevision: native?.revision, plugins: plugins.filter((p) => p.enabled && p.scopes.includes(scope)) });
     const revision = crypto.createHash('sha256').update(content).digest('hex');
     resolveInside(this.dataRoot, 'agent/plugins/snapshots', 'mkdir');

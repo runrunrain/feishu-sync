@@ -797,26 +797,7 @@ function moveErrorResponse(c: any, error: unknown) {
  * getNode 实时取叶子状态）。body { folderToken? } → MoveOutPreview
  *（blockedReason 门控面 + consequences 固定文案）。
  */
-feishuRoutes.post('/api/sources/:objToken/move-to-drive/preview', async (c) => {
-  let body: Record<string, unknown>;
-  try {
-    body = await c.req.json<Record<string, unknown>>();
-  } catch {
-    body = {};
-  }
-  try {
-    const service = requireCloudMoveService(c);
-    const plan = await service.buildMoveOutPreview(c.req.param('objToken'), {
-      folderToken: typeof body.folderToken === 'string' ? body.folderToken : null,
-    });
-    return c.json(plan);
-  } catch (error) {
-    if (error instanceof Error && error.message === 'dependencies_not_injected') {
-      return c.json({ error: 'dependencies_not_injected' }, 500);
-    }
-    return moveErrorResponse(c, error);
-  }
-});
+feishuRoutes.post('/api/sources/:objToken/move-to-drive/preview', (c) => c.json({ error: 'feature_removed', message: '移出到云空间功能已移除' }, 410));
 
 /**
  * POST /api/sources/:objToken/move-to-drive - 执行移出（destructive 逐次确认）。
@@ -824,37 +805,7 @@ feishuRoutes.post('/api/sources/:objToken/move-to-drive/preview', async (c) => {
  * 返回 202 { state:'moving', moveId, taskId }；同步完成 200。
  * 移出后本地文件与标准库不动（§3.5，移出仅云端动作）。
  */
-feishuRoutes.post('/api/sources/:objToken/move-to-drive', async (c) => {
-  let body: Record<string, unknown>;
-  try {
-    body = await c.req.json<Record<string, unknown>>();
-  } catch {
-    return c.json({ error: 'invalid_json', message: '移出请求必须是 JSON 对象' }, 400);
-  }
-  if (typeof body.confirm !== 'string' || body.confirm === '') {
-    return c.json(
-      {
-        error: 'confirmation_required',
-        message: '移出到云空间需要 confirm: "MOVE_OUT:<nodeToken>"（确认值必须包含文档的 wiki node token）',
-      },
-      400,
-    );
-  }
-  try {
-    const service = requireCloudMoveService(c);
-    const result = await service.moveToDrive(c.req.param('objToken'), {
-      folderToken: typeof body.folderToken === 'string' ? body.folderToken : null,
-      confirmValue: body.confirm,
-      actor: body.actor === 'cli' || body.actor === 'agent' ? body.actor : 'ui',
-    });
-    return c.json(result, result.state === 'moving' ? 202 : 200);
-  } catch (error) {
-    if (error instanceof Error && error.message === 'dependencies_not_injected') {
-      return c.json({ error: 'dependencies_not_injected' }, 500);
-    }
-    return moveErrorResponse(c, error);
-  }
-});
+feishuRoutes.post('/api/sources/:objToken/move-to-drive', (c) => c.json({ error: 'feature_removed', message: '移出到云空间功能已移除' }, 410));
 
 /** GET /api/sources/moves/:moveId - 移出记录（cloud.move_status；不触发远端调用）。 */
 feishuRoutes.get('/api/sources/moves/:moveId', (c) => {

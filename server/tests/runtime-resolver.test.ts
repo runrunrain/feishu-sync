@@ -24,10 +24,9 @@ import { makeRuntimeInstallation } from './helpers/runtime-installation.js';
 let fixtureRoot: string;
 
 function makeFakeNode(dir: string, version: string): string {
-  // 可执行名必须是 `node`（resolver 按 PATH/dir/node 定位）；不同用例
-  // 各自建独立子目录避免冲突。
+  // 按当前平台模拟 resolver 要找的可执行文件名；版本由测试注入。
   fs.mkdirSync(dir, { recursive: true });
-  const script = path.join(dir, 'node');
+  const script = path.join(dir, process.platform === 'win32' ? 'node.exe' : 'node');
   fs.writeFileSync(script, `#!/bin/sh\necho "v${version}"\n`, { mode: 0o755 });
   return script;
 }
@@ -69,7 +68,7 @@ describe('compareVersions / satisfiesPiRange', () => {
 describe('resolveRuntime（fixture）', () => {
   it('标准布局、缺pi回退及显式pi均不执行npm symlink入口', async () => {
     const fixture = makeRuntimeInstallation(path.join(fixtureRoot, 'npm-symlink'));
-    const resolver = new PiRuntimeResolver({ env: { PATH: '' } });
+    const resolver = new PiRuntimeResolver({ env: { PATH: '' }, execNodeVersion: async (candidate) => candidate === fixture.nodePath ? '24.21.0' : null });
     const config = buildDefaultAgentConfig(fixtureRoot);
     config.runtime.nodePath = fixture.nodePath;
     const found = await resolver.resolveRuntime(config);
@@ -168,7 +167,7 @@ describe('resolveRuntime（fixture）', () => {
     // 回溯依赖 symlink，不解析脚本内容）
     const cliEntry = path.join(pkgRoot, 'dist', 'cli.js');
     fs.chmodSync(cliEntry, 0o755);
-    fs.symlinkSync(cliEntry, path.join(binDir, 'pi'));
+    fs.symlinkSync(cliEntry, path.join(binDir, process.platform === 'win32' ? 'pi.cmd' : 'pi'));
 
     const resolver = new PiRuntimeResolver({
       env: { PATH: `${binDir}${path.delimiter}${nodeDir}` },
