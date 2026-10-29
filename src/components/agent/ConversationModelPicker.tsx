@@ -52,7 +52,7 @@ export function ConversationModelPicker({ session, busy, onChanged }: { session:
     <button type="button" aria-label="调整模型思考强度" aria-expanded={open === 'effort'} disabled={disabled || !activeChoice() || !reasoning} title={reasoning ? '调整当前会话的思考强度' : '该模型预设未启用思考能力'}
       className="inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs text-seal hover:bg-paper-2 disabled:opacity-45"
       onClick={() => setOpen(open === 'effort' ? null : 'effort')}>{LABELS[LEVELS.indexOf(thinking)]}思考<ChevronDown className="h-3 w-3" /></button>
-    {open ? <div className="absolute z-50 bottom-full left-0 sm:left-auto sm:right-0 mb-2 w-[min(320px,70vw)] rounded-xl border border-line bg-card-bg p-3 shadow-xl" role="dialog" aria-label={open === 'models' ? '选择会话模型' : '模型思考强度'}>
+    {open ? <div className="absolute z-50 bottom-full left-0 mb-2 w-[min(320px,70vw)] max-h-[min(400px,60vh)] overflow-y-auto rounded-xl border border-line bg-card-bg p-3 shadow-xl" role="dialog" aria-label={open === 'models' ? '选择会话模型' : '模型思考强度'}>
       {open === 'models' ? <>
         <div className="flex gap-2 mb-2 text-xs"><button className={`px-2 py-1 rounded ${source === 'app-llm' ? 'bg-seal/10 text-seal' : 'text-ink-soft'}`} onClick={() => setSource('app-llm')}>应用提供商</button><button className={`px-2 py-1 rounded ${source === 'pi-agent-dir' ? 'bg-seal/10 text-seal' : 'text-ink-soft'}`} onClick={() => setSource('pi-agent-dir')}>本地 Pi</button></div>
         <div className="max-h-60 overflow-y-auto scrollbar-thin space-y-1">

@@ -31,6 +31,21 @@ function internals(client: LarkCliClient): ClientInternals {
 }
 
 describe('LarkCliClient output parsing and classification', () => {
+  it('reads slides using typed flags that survive the Windows command shell', async () => {
+    const client = createClient();
+    const execute = vi.fn().mockResolvedValue({ ok: true });
+    (client as any).execute = execute;
+    await client.fetchSlidesXml('presentation123');
+    expect(execute).toHaveBeenCalledWith([
+      'slides', 'xml_presentations', 'get', '--as', 'user',
+      '--xml-presentation-id', 'presentation123', '--revision-id', '-1', '--format', 'json',
+    ], 'docx');
+  });
+
+  it('classifies the slides API no-permission response as non-retryable', () => {
+    expect(internals(createClient()).classifyError('3350003 no perm', '3350003'))
+      .toMatchObject({ code: 'permission', retryable: false, upstreamCode: '3350003' });
+  });
   it.each([
     { status: 'verify_failed', available: false, verified: false },
     { status: 'missing', available: false, verified: false },

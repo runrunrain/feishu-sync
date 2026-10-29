@@ -28,6 +28,16 @@ describe('sync failure retry classification', () => {
       .toMatchObject({ retryable: true, reasonCode: 'rate_limited', repairAction: 'retry' });
   });
 
+  it.each([
+    '单元格 B2 包含尚不能完整重建的富文本对象 (mention)',
+    '工作表 Sheet1 含图表或透视表，当前只读重建无法保真，请取得原件导出权限',
+  ])('explains workbook reconstruction limitations instead of suggesting a network retry: %s', (message) => {
+    expect(classifySyncFailure(new Error(message))).toMatchObject({
+      message, retryable: false, repairAction: 'manual_review',
+      suggestedResolution: expect.stringContaining('导出权限'),
+    });
+  });
+
   it('only queues failures that require an operator action in Feishu', () => {
     expect(requiresFeishuSideAction({ repairAction: 'grant_access' })).toBe(true);
     expect(requiresFeishuSideAction({ repairAction: 'review_deleted' })).toBe(true);

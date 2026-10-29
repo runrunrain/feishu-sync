@@ -604,10 +604,8 @@ export class LarkCliClient {
   async fetchSlidesXml(xmlPresentationId: string): Promise<any> {
     return this.execute([
       'slides', 'xml_presentations', 'get', '--as', 'user',
-      '--params', JSON.stringify({
-        xml_presentation_id: xmlPresentationId,
-        revision_id: -1,
-      }),
+      '--xml-presentation-id', xmlPresentationId,
+      '--revision-id', '-1',
       '--format', 'json',
     ], 'docx');
   }
@@ -1879,7 +1877,7 @@ export class LarkCliClient {
     if (/(?:99991400|rate limit|qps|限频|限流)/i.test(message)) {
       return new LarkCliError('QPS 限频，请稍后重试', 'rate_limited', true, upstreamCode ?? '99991400');
     }
-    if (/(?:40403|131006|permission|forbidden|access denied|无权限)/i.test(message)) {
+    if (/(?:40403|131006|3350003|\bno perm\b|permission|forbidden|access denied|无权限)/i.test(message)) {
       return new LarkCliError('无权限访问该节点', 'permission', false, upstreamCode);
     }
     // 「文档不在 wiki 空间」：CLI hint 明示 Do not retry（换 docs/sheets/base/drive

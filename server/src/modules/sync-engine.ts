@@ -276,6 +276,15 @@ export function classifySyncFailure(error: unknown): ClassifiedSyncFailure {
   }
 
   const message = error instanceof Error ? error.message : String(error);
+  if (/尚不能完整重建的富文本对象|尚不能完整重建的对象|含图表或透视表，当前只读重建无法保真/.test(message)) {
+    return {
+      message,
+      retryable: false,
+      reasonCode: 'upstream_error',
+      suggestedResolution: '原件导出未成功，当前只读重建无法保留这些对象。请检查飞书表格的导出权限及导出设置，允许当前账号导出后重新同步。',
+      repairAction: 'manual_review',
+    };
+  }
   if (/(?:3380003|document page has been deleted|page can no longer be edited|文档.*已删除)/i.test(message)) {
     return {
       message: '云端文档已删除或不再可编辑。请在飞书中选择有效节点后重新检测；此项不能通过重试恢复。',

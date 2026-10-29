@@ -26,6 +26,8 @@ import { useToast } from './common/Toast';
 import { revealProviderApiKey } from '../api/client';
 import type { LlmConfig, LlmModelPreset, LlmProviderConfig, LlmProtocol } from '../types';
 
+const NEW_PRESET_CONTEXT_WINDOW = 200_000;
+
 function cloneLlmConfig(llm: LlmConfig): LlmConfig {
   return {
     ...llm,
@@ -63,6 +65,7 @@ function makeProvider(existing: LlmProviderConfig[]): LlmProviderConfig {
       name: '默认模型',
       openAiModel: '',
       enabled: true,
+      contextWindow: NEW_PRESET_CONTEXT_WINDOW,
     }],
   };
 }
@@ -194,6 +197,7 @@ export function ModelProviderSettings() {
       name: `模型 ${provider.models.length + 1}`,
       openAiModel: '',
       enabled: true,
+      contextWindow: NEW_PRESET_CONTEXT_WINDOW,
     };
     updateProvider(provider.id, (current) => ({
       ...current,
@@ -504,7 +508,7 @@ export function ModelProviderSettings() {
                         />
                       </div>
                       <div className="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-2">
-                        <Input label="上下文窗口（tokens）" type="number" min={1024} step={1024} value={model.contextWindow ?? ''} placeholder="默认 128000"
+                        <Input label="上下文窗口（tokens）" type="number" min={1024} step={1} value={model.contextWindow ?? ''} placeholder="默认 128000"
                           onChange={(e) => updateModel(selectedProvider, model.id, { contextWindow: e.target.value ? Number(e.target.value) : undefined })} />
                         <Input label="最大输出（tokens）" type="number" min={1} value={model.maxTokens ?? ''} placeholder="默认 8192"
                           onChange={(e) => updateModel(selectedProvider, model.id, { maxTokens: e.target.value ? Number(e.target.value) : undefined })} />
