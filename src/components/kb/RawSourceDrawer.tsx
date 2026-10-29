@@ -149,6 +149,7 @@ export function RawSourceDrawer({ source, onClose }: RawSourceDrawerProps) {
             content.mdContent ? (
               <MarkdownView
                 content={content.mdContent}
+                resolveSyncedReferences
                 baseDir={content.mdPath ? content.mdPath.split('/').slice(0, -1).join('/') : ''}
                 remoteImages="confirm"
               />

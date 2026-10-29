@@ -687,6 +687,12 @@ export async function getDocumentContent(objToken: string): Promise<DocumentCont
   );
 }
 
+/** Read a referenced Feishu block on demand; the source file stays unchanged. */
+export function getSyncedReference(token: string, block: string): Promise<{ content: string; baseDir?: string }> {
+  const query = new URLSearchParams({ token, block });
+  return request<{ content: string }>(`/api/mapping/synced-reference?${query}`);
+}
+
 /**
  * GET /api/mapping/comments/:objToken — 文档评论（P2-S4 评论溯源）。
  * collected=false 表示从未采集（非 docx 或未成功同步过）。

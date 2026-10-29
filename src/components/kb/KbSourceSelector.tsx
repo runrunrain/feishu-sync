@@ -84,13 +84,14 @@ export function KbSourceSelector({ running, nonce, onChanged, onOpenSource, canB
       <div style={{ height: tree.rows.length * ROW_HEIGHT, position: 'relative' }}>
         {tree.rows.slice(start, end).map(({ node, depth }, index) => {
           const count = tree.stats.get(node.id)!; const expanded = q.trim() || !collapsed.has(node.id);
-          return <div key={node.id} style={{ position: 'absolute', top: (start + index) * ROW_HEIGHT, height: ROW_HEIGHT, left: 0, right: 0, paddingLeft: Math.min(depth, 12) * 18 + 4 }} className="flex gap-2 items-center rounded hover:bg-paper-2 pr-2">
+          return <div key={node.id} style={{ position: 'absolute', top: (start + index) * ROW_HEIGHT, height: ROW_HEIGHT, left: 0, right: 0, paddingLeft: Math.min(depth, 6) * 12 + 4 }} className="flex gap-1 items-center min-w-0 rounded hover:bg-paper-2 pr-1">
             {node.children.length ? <button className="w-4 shrink-0 text-ink-faint" aria-label={`${expanded ? '收起' : '展开'}：${node.title}`} aria-expanded={Boolean(expanded)} onClick={() => setCollapsed((old) => { const next = new Set(old); if (next.has(node.id)) next.delete(node.id); else next.add(node.id); return next; })}>{expanded ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}</button> : <span className="w-4 shrink-0" />}
             <SelectionBox cleanup={cleanupMode} included={count.included} total={count.total} disabled={disabled} title={node.title} onChange={() => void change(subtreeTokens([node]), count.included === count.total ? 'exclude' : 'include')} />
             {node.children.length || !node.source ? <Folder className="w-4 h-4 shrink-0 text-ink-soft" /> : <FileText className="w-4 h-4 shrink-0 text-ink-faint" />}
             <div className="flex-1 min-w-0"><span className="block text-sm text-ink truncate" title={node.source?.relPath ?? node.title}>{node.title}</span></div>
             {node.children.length ? <span className="text-xs text-ink-soft shrink-0">{count.included}/{count.total} 篇</span> : null}
-            {node.source ? <><span className="text-xs text-ink-faint shrink-0">{LABEL[node.source.pending]}</span><button className="text-xs text-seal shrink-0" onClick={() => onOpenSource(node.source!)} aria-label={`预览：${node.title}`}>预览</button></> : null}
+            {node.sourceUnavailable ? <span className="text-xs text-ink-faint shrink-0" title="该节点是一份云文档，目前没有可确认的本地正文；同步成功或恢复本地版本后可参与构建">源不可用</span> : null}
+            {node.source ? <>{node.source.recovered ? <span className="text-xs text-jade shrink-0" title="按文档标识找到的本地历史版本，云端同步状态未变">本地</span> : null}<span className="text-xs text-ink-faint shrink-0">{LABEL[node.source.pending]}</span><button className="text-xs text-seal shrink-0" onClick={() => onOpenSource(node.source!)} aria-label={`预览：${node.title}`}>预览</button></> : null}
             <button className="text-xs text-seal shrink-0 disabled:opacity-40" disabled={disabled} aria-label={`清理${node.children.length ? '层级' : '文档'}：${node.title}`} onClick={() => requestCleanup(subtreeTokens([node]))}>清理</button>
           </div>;
         })}

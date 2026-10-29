@@ -10,6 +10,7 @@ import { LocalMapStore } from '../src/modules/local-map-store.js';
 import { KbBuildService } from '../src/kb/kb-build-service.js';
 import { StandardKbStore } from '../src/kb/standard-kb-store.js';
 import { KbVersionStore } from '../src/kb/kb-version-store.js';
+import { projectKnowledgeDocuments, recoveredSourceCsvPaths } from '../src/kb/local-source-projection.js';
 import { planSourceBatch, executeSourceBatch } from '../src/modules/source-batch.js';
 import { lineDiff } from '../src/kb/line-diff.js';
 import { hasEditorialHistory, hasSourceMetadata } from '../src/kb/body-policy.js';
@@ -41,13 +42,15 @@ async function fixture() {
   fs.writeFileSync(path.join(raw, 'a.md'), '规则A：怒气消耗10。\n' + '怒气不足时不能释放技能，规则按当前配置生效。\n'.repeat(8));
   fs.writeFileSync(path.join(raw, 'b.md'), '规则B：速度高者先手。\n' + '双方各行动一次，以速度决定行动顺序。\n'.repeat(8));
   for (const doc of documents) store.upsertDocument(doc);
-  const tools = new AgentToolService({ dataRoot: root, documentsProvider: () => documents });
+  const documentsProvider = () => projectKnowledgeDocuments(raw, documents);
+  const sheetCsvPaths = (token: string) => recoveredSourceCsvPaths(raw, documentsProvider().find((doc) => doc.objToken === token), []);
+  const tools = new AgentToolService({ dataRoot: root, documentsProvider, sheetCsvPaths });
   const resolver = new PiRuntimeResolver();
   vi.spyOn(resolver, 'checkReadiness').mockResolvedValue({ code: 'ready', model: { model: 'fixture/model' } } as never);
   const service = new KbBuildService({
     dataRoot: root, pool: new AgentProcessPool(), toolService: tools, resolver,
-    configProvider: () => configManager.getConfig(), documentsProvider: () => documents,
-    excludedSourcesProvider: () => store.listKbExcludedSources(raw), sheetCsvPaths: () => [],
+    configProvider: () => configManager.getConfig(), documentsProvider,
+    excludedSourcesProvider: () => store.listKbExcludedSources(raw), sheetCsvPaths,
     internalBaseUrl: () => '', extensionPath: () => null, promptAssets: () => null,
   });
   const prompts: string[] = [];
@@ -75,7 +78,7 @@ async function fixture() {
       },
     });
   } });
-  const app = new Hono(); app.route('/', kbRoutes({ buildService: service, configManager, localMapStore: store, documentsProvider: () => documents, sheetCsvPaths: () => [] }));
+  const app = new Hono(); app.route('/', kbRoutes({ buildService: service, configManager, localMapStore: store, documentsProvider, sheetCsvPaths }));
   async function call(url: string, method = 'GET', body?: unknown) {
     const response = await app.request(url, { method, headers: { 'Content-Type': 'application/json' }, ...(body !== undefined ? { body: JSON.stringify(body) } : {}) });
     return { status: response.status, data: await response.json() as any };
@@ -298,6 +301,38 @@ describe('diff与正文边界', () => {
 
 
 describe('源选择批量事务', () => {
+  it('父节点的历史本地正文和子文档都出现在源树并进入构建快照', async () => {
+    const f = await fixture();
+    const parentFile = path.join(f.raw, '历史父节点.md');
+    fs.writeFileSync(parentFile, '<!--\nfeishu_sync:\n  obj_token: "a"\n  wiki_node_token: "wiki-a"\n  obj_type: "slides"\n-->\n# 父文档\n' + '父节点规则：按照当前配置组织玩法。\n'.repeat(8));
+    f.documents[0] = { ...f.documents[0], wikiNodeToken: 'wiki-a', objType: 'slides', title: '父文档', localRelPath: null,
+      localMdPath: '', lastSyncedAt: '', status: 'error', syncState: 'restricted', lastSyncErrorCode: 'permission_denied' };
+    f.documents[1] = { ...f.documents[1], wikiNodeToken: 'wiki-b', parentNodeToken: 'wiki-a', title: '子文档' };
+    const tree = await f.call('/api/kb/sources/tree');
+    expect(tree.status).toBe(200); expect(tree.data.total).toBe(2);
+    const parent = tree.data.nodes.find((node: any) => node.source?.objToken === 'a');
+    expect(parent.source).toMatchObject({ objToken: 'a', relPath: '历史父节点.md', recovered: true, included: true });
+    expect(parent.children.map((node: any) => node.source?.objToken)).toEqual(['b']);
+    expect((await f.call('/api/kb/sources/selection', 'POST', { root: f.raw, action: 'exclude', tokens: ['a', 'b'] })).status).toBe(200);
+    expect(f.store.listKbExcludedSources(f.raw)).toEqual(expect.arrayContaining(['a', 'b']));
+    expect((await f.call('/api/kb/sources/selection', 'POST', { root: f.raw, action: 'include', tokens: ['a', 'b'] })).status).toBe(200);
+    f.setGenerated({ markdown: '父节点规则按照当前配置组织玩法。\n\n规则B：速度高者先手，双方各行动一次。' });
+    const build = await f.build('full'); expect(build.status, JSON.stringify(build)).toBe('published');
+    expect(f.published().readManifest()!.sourceSnapshot.map((source) => source.objToken).sort()).toEqual(['a', 'b']);
+    expect(f.documents[0]).toMatchObject({ localRelPath: null, localMdPath: '', syncState: 'restricted', lastSyncErrorCode: 'permission_denied' });
+    expect(fs.readFileSync(parentFile, 'utf8')).toContain('父节点规则');
+  });
+
+  it('父节点无可验证本地正文时标明源不可用，不把它虚计入可构建数量', async () => {
+    const f = await fixture();
+    f.documents[0] = { ...f.documents[0], wikiNodeToken: 'wiki-a', localRelPath: null, localMdPath: '', lastSyncedAt: '', status: 'error' };
+    f.documents[1] = { ...f.documents[1], wikiNodeToken: 'wiki-b', parentNodeToken: 'wiki-a' };
+    const tree = await f.call('/api/kb/sources/tree');
+    expect(tree.data.total).toBe(1);
+    expect(tree.data.nodes[0]).toMatchObject({ title: 'a', sourceUnavailable: true, children: [{ source: { objToken: 'b' } }] });
+    expect(tree.data.nodes[0].source).toBeUndefined();
+  });
+
   it('超过分页范围仍一次处理全部；反选去重、隔离根目录并保持原始字节', async () => {
     const f = await fixture();
     const before = fs.readFileSync(path.join(f.raw, 'a.md'), 'utf8');

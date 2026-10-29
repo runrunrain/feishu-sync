@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react';
-import { ImageIcon } from 'lucide-react';
+import { ImageIcon, RefreshCw } from 'lucide-react';
 import { KbSourceSelector } from './KbSourceSelector';
-import { Modal } from '../common/Modal';
 import { Button } from '../common/Button';
 import { getKbChanges, getKbVersion, listKbVersions } from '../../api/client';
 import { formatDateTime } from '../../utils/agentReadiness';
@@ -26,10 +25,9 @@ export function KbPendingImagesHint({ images }: { images: { total: number; uncac
   );
 }
 
-export function KbChangesPanel({ tab, onTab, onClose, onChanged, onUpdate, onBuildSelected, onOpenSource, running, canUpdate }: {
-  tab: KbChangeTab | null;
+export function KbChangesPanel({ tab, onTab, onChanged, onUpdate, onBuildSelected, onOpenSource, running, canUpdate }: {
+  tab: KbChangeTab;
   onTab: (tab: KbChangeTab) => void;
-  onClose: () => void;
   onChanged: () => void;
   onUpdate: () => void;
   onBuildSelected: (count: number) => void;
@@ -47,9 +45,10 @@ export function KbChangesPanel({ tab, onTab, onClose, onChanged, onUpdate, onBui
   const [nonce, setNonce] = useState(0);
 
   useEffect(() => {
-    if (!tab || tab === 'sources') { setLoading(false); setError(''); return; }
+    if (tab === 'sources') { setLoading(false); setError(''); return; }
     let disposed = false;
     setLoading(true); setError('');
+    if (tab === 'pending') setPreview(null);
     void (async () => {
       try {
         if (tab === 'pending') {
@@ -78,18 +77,18 @@ export function KbChangesPanel({ tab, onTab, onClose, onChanged, onUpdate, onBui
     return () => { disposed = true; };
   }, [tab, versionId, nonce]);
 
-  return <Modal open={tab !== null} title="源文档与变更记录" onClose={onClose} contentClassName="max-w-5xl h-[min(760px,calc(100dvh-32px))]" bodyClassName="flex flex-1 flex-col overflow-hidden">
-    <div className="flex shrink-0 flex-wrap gap-2 border-b border-line pb-3 mb-3" role="tablist" aria-label="变更管理">
-      {(['sources', 'pending', 'history'] as const).map((value) => <Button key={value} size="sm"
-        role="tab" aria-selected={tab === value} variant={tab === value ? 'primary' : 'secondary'} onClick={() => onTab(value)}>
+  return <div className="flex flex-1 min-h-0 flex-col p-3" data-testid="kb-build-sidebar">
+    <div className="flex shrink-0 items-center gap-1 border-b border-line pb-3 mb-3" role="tablist" aria-label="构建内容">
+      {(['sources', 'pending', 'history'] as const).map((value) => <button key={value} type="button"
+        role="tab" aria-selected={tab === value} onClick={() => onTab(value)}
+        className={`flex-1 min-w-0 rounded px-1 py-2 text-xs whitespace-nowrap ${tab === value ? 'bg-seal text-white' : 'text-ink-soft hover:bg-paper'}`}>
         {{ sources: '源文档', pending: '待更新差异', history: '版本记录' }[value]}
-      </Button>)}
-      <div className="flex-1" />
-      <Button size="sm" variant="ghost" onClick={() => setNonce((n) => n + 1)}>刷新</Button>
-      <Button size="sm" variant="secondary" onClick={onClose}>关闭</Button>
+      </button>)}
+      <button type="button" aria-label="刷新构建内容" title="刷新" onClick={() => setNonce((n) => n + 1)}
+        className="shrink-0 p-2 rounded text-ink-faint hover:bg-paper hover:text-ink"><RefreshCw className="w-4 h-4" /></button>
     </div>
     {error ? <p role="alert" className="text-sm text-seal-2 mb-3">{error}</p> : null}
-    <div className={`flex-1 min-h-0 ${tab === 'sources' ? 'overflow-hidden' : 'overflow-auto scrollbar-thin'}`}>
+    <div className={`flex-1 min-h-0 ${tab === 'sources' ? 'overflow-hidden' : 'overflow-auto scrollbar-thin pr-1'}`}>
       {tab === 'sources' ? <KbSourceSelector nonce={nonce} running={running} canBuild={canUpdate} onBuild={onBuildSelected} onChanged={onChanged} onOpenSource={onOpenSource} /> : tab === 'pending' ? <>
         <p className="text-xs text-ink-soft mb-3">比较当前参与构建的原始源与最近发布的源快照。差异用于更新判断，正文会重新写成完整说明。</p>
         {loading ? <p className="text-xs text-ink-faint">正在计算差异…</p> : preview ? <>
@@ -121,7 +120,7 @@ export function KbChangesPanel({ tab, onTab, onClose, onChanged, onUpdate, onBui
     {tab === 'pending' ? <div className="pt-3 mt-3 border-t border-line flex justify-end">
       <Button size="sm" onClick={onUpdate} disabled={!canUpdate || running || loading || !preview?.sources.length}>按这些变更更新</Button>
     </div> : null}
-  </Modal>;
+  </div>;
 }
 
 function ChangeList({ changes }: { changes: KbFileChange[] }) {

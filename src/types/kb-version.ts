@@ -38,7 +38,8 @@ export interface KbSourceChoice {
   included: boolean;
   published: boolean;
   pending: 'added' | 'changed' | 'removed' | 'unchanged' | 'excluded';
+  recovered?: boolean;
 }
 
-export interface KbSourceTreeNode { id: string; title: string; source?: KbSourceChoice; children: KbSourceTreeNode[] }
+export interface KbSourceTreeNode { id: string; title: string; source?: KbSourceChoice; sourceUnavailable?: boolean; children: KbSourceTreeNode[] }
 export interface KbSourceTreeDto { root: string; nodes: KbSourceTreeNode[]; total: number }

@@ -32,7 +32,7 @@
 
 import { Fragment, useEffect, useState, type JSX, type ReactNode } from 'react';
 import { ImageIcon, Loader2 } from 'lucide-react';
-import { getMediaBlobUrl } from '../../api/client';
+import { getMediaBlobUrl, getSyncedReference } from '../../api/client';
 import {
   decodeHtmlEntities,
   extractHtmlTableBlocks,
@@ -130,6 +130,25 @@ function looksLikeLocalMedia(src: string): boolean {
   );
 }
 
+/** Convert simple exported HTML lists while preserving item order and nesting. */
+function convertHtmlLists(text: string, stack: Array<{ ordered: boolean; next: number }>): string {
+  return text.replace(/<(\/?)(ul|ol|li)\b([^>]*)>/gi, (tag, slash: string, type: string, attrs: string) => {
+    const kind = type.toLowerCase();
+    if (kind === 'ul' || kind === 'ol') {
+      if (slash) { if (!stack.length) return tag; stack.pop(); }
+      else stack.push({ ordered: kind === 'ol', next: 1 });
+      return '\n';
+    }
+    const list = stack[stack.length - 1];
+    if (!list) return tag;
+    if (slash) return '\n';
+    const explicit = /(?:^|\s)seq\s*=\s*["']?(\d+)/i.exec(attrs);
+    const number = explicit ? Number(explicit[1]) : list.next;
+    list.next = number + 1;
+    return `\n${'  '.repeat(stack.length - 1)}${list.ordered ? `${number}.` : '-'} `;
+  });
+}
+
 /**
  * preprocess：同步产物预处理。
  *
@@ -171,6 +190,35 @@ export function preprocess(markdown: string): string {
 /** 仅作用于非代码段的一系列产物适配替换。 */
 function transformTextSegment(text: string): string {
   let out = text;
+  // 飞书文档标题与布局包装属于导出语义，保留实际文字并按 Markdown 排版。
+  // 区分行内代码，避免改写代码示例；围栏代码已在 preprocess 中隔离。
+  let tableDepth = 0;
+  const listStack: Array<{ ordered: boolean; next: number }> = [];
+  out = out.split(/(`+[^`\n]*`+)/g).map((part, index) => {
+    if (index % 2) return part;
+    const withoutHtmlParagraphs = part.split(/(<\/?table\b[^>]*>)/gi).map((piece) => {
+      if (/^<table\b/i.test(piece)) { tableDepth++; return piece; }
+      if (/^<\/table\b/i.test(piece)) { tableDepth = Math.max(0, tableDepth - 1); return piece; }
+      if (tableDepth) return piece;
+      return convertHtmlLists(piece
+        .replace(/<h([1-6])\b[^>]*>([^<\n]*)<\/h\1\s*>/gi, (_all, level: string, title: string) => `\n\n${'#'.repeat(Number(level))} ${decodeHtmlEntities(title.trim())}\n\n`)
+        .replace(/<\/?p\b[^>]*>/gi, '\n\n'), listStack);
+    }).join('');
+    return withoutHtmlParagraphs
+      .replace(/^\s*<title\b[^>]*>([^\n<]*)<\/title\s*>\s*$/gim, (_all, title: string) => `\n# ${decodeHtmlEntities(title.trim())}\n`)
+      .replace(/<\/?(?:grid|column|figure|fragment)\b[^>]*>/gi, '\n\n')
+      .replace(/<agenda\b[^>]*>\s*<\/agenda\s*>/gi, '\n\n> 议程内容未包含在本地导出中。\n\n')
+      .replace(/<\/?sub-page-list\b[^>]*>/gi, '\n\n')
+      .replace(/<sub-page\b([^>]*?)\s*\/>/gi, (_all, attrs: string) => {
+        const title = /(?:^|\s)title\s*=\s*(?:"([^"]*)"|'([^']*)')/i.exec(attrs);
+        const text = decodeHtmlEntities(title?.[1] ?? title?.[2] ?? '未命名子页面');
+        return `\n- ${text.replace(/([\\`*_[\]])/g, '\\$1')}\n`;
+      })
+      .replace(/<synced_reference\b([^>]*?)>([\s\S]*?)<\/synced_reference\s*>/gi,
+        (_all, attrs: string, inner: string) => inner.trim() ? `\n\n${inner}\n\n` : `\n\n<synced_reference${attrs}></synced_reference>\n\n`)
+      .replace(/<synced_reference\b([^>]*?)\/\s*>/gi,
+        (_all, attrs: string) => `\n\n<synced_reference${attrs}></synced_reference>\n\n`);
+  }).join('');
   // 1) XML 媒体标签 → Markdown 图片/附件链接（仅当属性值已是本地相对路径；
   //    仍是飞书 token 的保留原文，避免渲染出坏图）。
   //    D3：file/source 的本地非图片路径（attachments/*.pdf 等）转可点击
@@ -183,7 +231,9 @@ function transformTextSegment(text: string): string {
     return whole;
   });
   // 2) 剥掉 <synced-source> 包裹标签（保留内部内容）。
-  out = out.replace(/<\/?synced-source>/g, '');
+  out = out.replace(/<\/?synced-source\b[^>]*>/gi, '');
+  out = out.replace(/<whiteboard\b[^>]*?(?:\/\s*>|>\s*<\/whiteboard\s*>)/gi,
+    '\n\n> 此白板尚未同步到本地，请查看飞书原文。\n\n');
   // 3) 剥掉 HTML 注释（含文件首部的 feishu_sync YAML-in-comment 头，
   //    真实 Markdown 渲染器同样不展示注释）；未闭合的 <!-- 只去标记不吞正文
   //    （D2：避免非贪婪匹配吃到后文 --> 而丢大段内容）。
@@ -388,6 +438,7 @@ interface InlineContext {
   feishuHost?: string;
   /** 远程图片策略（见 AuthImageProps.remotePolicy）；默认 'auto' 保留旧行为。 */
   remoteImages?: 'auto' | 'confirm';
+  resolveSyncedReferences?: boolean;
 }
 
 export function renderInline(text: string, keyPrefix: string, ctx: InlineContext): ReactNode[] {
@@ -657,6 +708,7 @@ export type Block =
   | { type: 'quote'; lines: string[] }
   | { type: 'hr' }
   | { type: 'paragraph'; text: string }
+  | { type: 'synced_reference'; token: string; blockId: string }
   // D1：sheet A 型元数据 <details> 块受控渲染（原生折叠，summary 经行内解析）
   | { type: 'details'; summary: string; blocks: Block[] }
   // D9：飞书 <callout> 提示块受控渲染（emoji + 底色，内容递归块解析）
@@ -764,6 +816,15 @@ export function parseBlocks(markdown: string): Block[] {
       }
       i++; // skip closing fence
       blocks.push({ type: 'code', lang: (fence[1] ?? '').trim(), lines: buf });
+      continue;
+    }
+
+    const reference = line.match(/^\s*<synced_reference\b([^>]*)>\s*<\/synced_reference\s*>\s*$/i);
+    if (reference) {
+      const attr = (name: string) => new RegExp(`(?:^|\\s)${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`, 'i').exec(reference[1]);
+      const token = attr('src-token'), block = attr('src-block-id');
+      blocks.push({ type: 'synced_reference', token: token?.[1] ?? token?.[2] ?? '', blockId: block?.[1] ?? block?.[2] ?? '' });
+      i++;
       continue;
     }
 
@@ -1108,9 +1169,50 @@ function renderList(
   return renderListNodes(buildListTree(block.items), keyPrefix, ctx);
 }
 
+// Only simultaneous reads are shared; completed results are not kept as stale cloud data.
+const pendingReferences = new Map<string, Promise<{ content: string; baseDir?: string }>>();
+function readReference(token: string, blockId: string) {
+  const key = `${token}:${blockId}`;
+  const existing = pendingReferences.get(key);
+  if (existing) return existing;
+  const pending = getSyncedReference(token, blockId).finally(() => pendingReferences.delete(key));
+  pendingReferences.set(key, pending);
+  return pending;
+}
+
+function SyncedReference({ token, blockId, feishuHost, autoLoad }: { token: string; blockId: string; feishuHost?: string; autoLoad?: boolean }) {
+  const [content, setContent] = useState<{ content: string; baseDir?: string } | null>(null);
+  const [status, setStatus] = useState<'idle' | 'loading' | 'error'>('idle');
+  const [attempt, setAttempt] = useState(0);
+  const valid = /^[A-Za-z0-9]{1,128}$/.test(token) && /^[A-Za-z0-9]{1,128}$/.test(blockId);
+  useEffect(() => {
+    if (!valid || (!autoLoad && attempt === 0)) return;
+    let cancelled = false;
+    setStatus('loading'); setContent(null);
+    readReference(token, blockId).then((result) => {
+      if (!cancelled) { setContent(result); setStatus('idle'); }
+    }).catch(() => { if (!cancelled) setStatus('error'); });
+    return () => { cancelled = true; };
+  }, [token, blockId, autoLoad, attempt, valid]);
+  const sourceUrl = valid && feishuHost && /^[A-Za-z0-9.-]+$/.test(feishuHost) ? `https://${feishuHost}/docx/${token}` : null;
+  return <div className="my-3 rounded-md border border-line bg-paper/40 px-3 py-2 text-sm" data-md-block="synced-reference">
+    <div className="flex flex-wrap items-center gap-2 text-xs text-ink-faint">
+      <span>同步引用</span>
+      {status === 'loading' && <span role="status">正在加载引用内容…</span>}
+      {status === 'error' && <span role="status">无法加载引用内容，请检查网络或飞书访问权限。</span>}
+      {!valid && <span>引用信息不完整，无法加载内容。</span>}
+      {valid && status !== 'loading' && content === null && <button type="button" className="text-seal underline" onClick={() => setAttempt((value) => value + 1)}>{status === 'error' ? '重试' : '加载引用内容'}</button>}
+      {sourceUrl && <button type="button" className="text-jade underline" onClick={() => openExternalUrl(sourceUrl)}>查看飞书原文</button>}
+    </div>
+    {content !== null && (content.content.trim() ? <MarkdownView content={content.content} baseDir={content.baseDir} feishuHost={feishuHost} remoteImages="confirm" /> : <p className="mt-2 text-xs text-ink-faint">引用内容为空。</p>)}
+  </div>;
+}
+
 function renderBlock(block: Block, index: number, ctx: InlineContext): ReactNode {
   const key = `b-${index}`;
   switch (block.type) {
+    case 'synced_reference':
+      return <SyncedReference key={key} token={block.token} blockId={block.blockId} feishuHost={ctx.feishuHost} autoLoad={ctx.resolveSyncedReferences} />;
     case 'heading': {
       const Heading = `h${block.level}` as 'h1' | 'h2' | 'h3' | 'h4' | 'h5' | 'h6';
       return (
@@ -1312,6 +1414,8 @@ export interface MarkdownViewProps {
   onNavigateCsv?: (href: string) => boolean;
   /** 飞书租户域名（如 "qcnbafdrjx7n.feishu.cn"），用于生成并打开 wiki 超链接。 */
   feishuHost?: string;
+  /** 仅本地源文档预览自动读取飞书同步引用；其他不可信内容须用户主动加载。 */
+  resolveSyncedReferences?: boolean;
   /**
    * 远程图片策略（F2 安全修复，不可信内容必设 'confirm'）：
    *   - 'auto'（默认）：远程图片自动加载（既有预览面兼容行为）；
@@ -1328,11 +1432,12 @@ export function MarkdownView({
   baseDir = '',
   onNavigateCsv,
   feishuHost,
+  resolveSyncedReferences = false,
   remoteImages = 'auto',
   variant = 'preview',
 }: MarkdownViewProps) {
   const blocks = parseBlocks(preprocess(content));
-  const ctx: InlineContext = { baseDir, onNavigateCsv, feishuHost, remoteImages };
+  const ctx: InlineContext = { baseDir, onNavigateCsv, feishuHost, remoteImages, resolveSyncedReferences };
   return (
     <div className={variant === 'reading' ? 'markdown-reading' : 'px-5 py-4'}>
       {blocks.map((b, i) => (

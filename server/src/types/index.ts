@@ -391,6 +391,8 @@ export interface DocumentRecord {
   watchedRootId?: string | null;
   /** Portable, POSIX-style path. P2 owns its full backfill. */
   localRelPath?: string | null;
+  /** 仅运行时投影：经文档身份验证找到的未登记本地版本，不代表云端同步成功。 */
+  recoveredLocalVersion?: boolean;
   missingCompleteCount?: number;
   lastSyncErrorCode?: string | null;
   hasChild?: boolean;

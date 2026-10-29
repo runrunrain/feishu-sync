@@ -9,13 +9,20 @@ import { ScanPolicy } from '../modules/scan-policy.js';
 import type { LocalMapStore } from '../modules/local-map-store.js';
 import { managedWorkbookCompanions } from '../modules/workbook-source.js';
 import { pendingLocalEditTokens } from '../sources/source-edit-service.js';
+import { projectKnowledgeDocuments, recoveredSourceCsvPaths } from './local-source-projection.js';
+import type { DocumentRecord } from '../types/index.js';
 
 export function prepareSourceCleanup(store: LocalMapStore, root: string, sources: Array<{ objToken: string; relPath: string }>, options: { allowMissing?: boolean; commit?: () => void } = {}) {
   const rootReal = resolveRootReal(root);
-  const records = new Map(store.getAllDocuments().filter((doc) => doc.localRelPath || doc.localMdPath).map((doc) => [doc.objToken, doc]));
+  const originalRecords = store.getAllDocuments();
+  const originals = new Map(originalRecords.map((doc) => [doc.objToken, doc]));
+  const records = new Map(projectKnowledgeDocuments(root, originalRecords).filter((doc) => doc.localRelPath || doc.localMdPath).map((doc) => [doc.objToken, doc]));
+  const csvPaths = (doc: DocumentRecord) => recoveredSourceCsvPaths(rootReal, doc, store.getSheetSheets(doc.objToken).map((sheet) => sheet.local_csv_path));
   const selected = [...new Map(sources.map((source) => [source.objToken, source])).values()].map((source) => {
     const record = records.get(source.objToken);
-    if (!record || record.cloudDeleted || (record.localRelPath || record.localMdPath) !== source.relPath) throw new ToolError('source_selection_changed', '源文档已变化，请刷新后重新选择', 409);
+    const original = originals.get(source.objToken);
+    const matchesLegacyAbsolute = !original?.localRelPath && original?.localMdPath === source.relPath;
+    if (!record || record.cloudDeleted || ((record.localRelPath || record.localMdPath) !== source.relPath && !matchesLegacyAbsolute)) throw new ToolError('source_selection_changed', '源文档已变化，请刷新后重新选择', 409);
     return record;
   });
   // S11 守卫（设计 §7.3/§9.1-1a）：存在未写回本地修改（source_edits 非
@@ -52,7 +59,7 @@ export function prepareSourceCleanup(store: LocalMapStore, root: string, sources
       const mdPath = path.resolve(rootReal, relativePath(md));
       for (const companion of managedWorkbookCompanions(mdPath)) addFile(companion, true);
     }
-    for (const sheet of store.getSheetSheets(doc.objToken)) addFile(sheet.local_csv_path, true);
+    for (const csv of csvPaths(doc)) addFile(csv, true);
   }
   const selectedTokens = new Set(selected.map((doc) => doc.objToken));
   for (const doc of records.values()) {
@@ -62,7 +69,7 @@ export function prepareSourceCleanup(store: LocalMapStore, root: string, sources
       try { references.push(...managedWorkbookCompanions(resolveInside(rootReal, relativePath(doc.localRelPath || doc.localMdPath), 'read'))); }
       catch { /* A missing unselected source cannot share a live file. */ }
     }
-    if (doc.objType === 'sheet' || doc.objType === 'bitable') references.push(...store.getSheetSheets(doc.objToken).map((sheet) => sheet.local_csv_path));
+    if (doc.objType === 'sheet' || doc.objType === 'bitable') references.push(...csvPaths(doc));
     for (const reference of references) {
       let resolved: string;
       try { resolved = resolveInside(rootReal, relativePath(reference), 'read'); } catch { continue; }

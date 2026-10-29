@@ -3,7 +3,8 @@
  *
  * 源集合 = documents 中已有成功本地同步版本、local_rel_path 非空且文件
  * 存在的行（结构树成员与 _custom/ 归档都算）。成功版本由
- * synced_obj_edit_time / sync_state / 历史 status='synced' 等基线证据判断
+ * synced_obj_edit_time / sync_state / 历史 status='synced' 等基线证据，
+ * 或由身份唯一匹配的本地历史文件投影判断；投影不更改同步状态。
  * —— 不能只过滤当前 status='synced'：检测把状态改成 changed、后续同步
  * 失败标 error 时，已有本地版本仍是合法原始源。
  *
@@ -19,6 +20,8 @@ import type { RawSourceSnapshotEntry } from '../types/agent-knowledge.js';
 
 /** 判断一行是否有成功本地版本的基线证据。 */
 export function hasSuccessfulLocalVersion(record: DocumentRecord): boolean {
+  // 身份与路径已由本地源投影校验；不修改持久化的云端同步状态。
+  if (record.recoveredLocalVersion) return true;
   if (record.syncedObjEditTime !== null && record.syncedObjEditTime !== undefined) return true;
   if (record.syncState === 'synced') return true;
   if (record.status === 'synced') return true;

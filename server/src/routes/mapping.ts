@@ -20,6 +20,9 @@
  */
 
 import { reconcileLocalIndex } from '../modules/local-index-reconcile.js';
+import fs from 'node:fs';
+import path from 'node:path';
+import { resolveInside } from '../agent/path-guard.js';
 import { Hono } from 'hono';
 import { MappingService, MappingValidationError, CrossParentReorderError } from '../modules/mapping-service.js';
 import { SnapshotService } from '../modules/snapshot-service.js';
@@ -27,6 +30,46 @@ import { IndexScanner } from '../modules/index-scanner.js';
 import type { ReorderRequest } from '../types/index.js';
 
 const mappingRoutes = new Hono();
+
+/** Read one Feishu synced block without modifying the local source document. */
+mappingRoutes.get('/api/mapping/synced-reference', async (c) => {
+  const token = c.req.query('token') ?? '';
+  const block = c.req.query('block') ?? '';
+  if (!/^[A-Za-z0-9]{1,128}$/.test(token) || !/^[A-Za-z0-9]{1,128}$/.test(block)) {
+    return c.json({ error: 'invalid_reference', message: '同步引用标识无效' }, 400);
+  }
+  try {
+    const result = await (c as any).larkCliClient.fetchSyncedReference(token, block);
+    let content = result?.data?.document?.content;
+    if (typeof content !== 'string') return c.json({ error: 'invalid_response', message: '同步引用内容不可用' }, 502);
+    if (Buffer.byteLength(content, 'utf8') > 512 * 1024) return c.json({ error: 'reference_too_large', message: '同步引用内容过大，请打开飞书原文查看' }, 413);
+    // A cloud block may contain whiteboard tokens while the indexed source
+    // already has their rendered images. Only use a unique, confined local
+    // token match; never guess a different image when it is missing.
+    let baseDir = '';
+    try {
+      const root = (c as any).configManager.getConfig()?.knowledgeBaseRoot;
+      const record = (c as any).localMapStore.getDocumentByObjToken(token);
+      if (root && record?.localRelPath) {
+        const source = resolveInside(root, record.localRelPath, 'read');
+        baseDir = path.relative(fs.realpathSync.native(root), path.dirname(source)).replace(/\\/g, '/');
+        const imageDir = resolveInside(root, path.join(baseDir, 'images'), 'read');
+        const files = fs.readdirSync(imageDir, { withFileTypes: true }).filter((item) => item.isFile()).map((item) => item.name);
+        content = content.replace(/<whiteboard\b([^>]*?)(?:\/\s*>|>\s*<\/whiteboard\s*>)/gi, (whole: string, attrs: string) => {
+          const id = /(?:^|\s)token\s*=\s*["']([A-Za-z0-9]+)["']/i.exec(attrs)?.[1];
+          if (!id) return whole;
+          const matches = files.filter((name: string) => /^[A-Za-z0-9_.-]+\.(?:png|jpe?g|gif|webp)$/i.test(name)
+            && new RegExp(`(?:^|-)${id}\\.(?:png|jpe?g|gif|webp)$`, 'i').test(name));
+          return matches.length === 1 ? `![飞书白板](images/${matches[0]})` : whole;
+        });
+      }
+    } catch { /* Missing/unsafe local media remains an explicit placeholder. */ }
+    return c.json({ content, baseDir });
+  } catch (error) {
+    const code = (error as { code?: string })?.code;
+    return c.json({ error: code ?? 'reference_unavailable', message: code === 'permission' ? '暂无同步引用访问权限' : '无法读取同步引用，请检查网络或飞书访问权限' }, code === 'permission' ? 403 : 502);
+  }
+});
 
 /**
  * Lazily build a MappingService. The first request pays the

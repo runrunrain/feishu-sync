@@ -608,6 +608,15 @@ export class LarkCliClient {
     return this.execute(args, 'docx');
   }
 
+  /** Fetch exactly one referenced block and its descendants using the current user identity. */
+  async fetchSyncedReference(objToken: string, blockId: string): Promise<any> {
+    return this.execute([
+      'docs', '+fetch', '--doc', objToken, '--scope', 'range',
+      '--start-block-id', blockId, '--end-block-id', blockId,
+      '--doc-format', 'markdown', '--detail', 'simple', '--as', 'user', '--format', 'json',
+    ], 'docx');
+  }
+
   /** Read the authoritative XML presentation body for a Slides object. */
   async fetchSlidesXml(xmlPresentationId: string): Promise<any> {
     return this.execute([

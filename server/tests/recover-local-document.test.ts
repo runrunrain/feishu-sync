@@ -6,6 +6,9 @@ import { Hono } from 'hono';
 import { contentRoutes } from '../src/routes/content.js';
 import { recoverLocalDocument } from '../src/modules/recover-local-document.js';
 import { IndexScanner } from '../src/modules/index-scanner.js';
+import { projectKnowledgeDocuments, recoveredSourceCsvPaths } from '../src/kb/local-source-projection.js';
+import { RawSourceSnapshot } from '../src/kb/raw-source-snapshot.js';
+import type { DocumentRecord } from '../src/types/index.js';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
@@ -30,4 +33,52 @@ it('拒绝重复身份、不同 wiki 身份以及非权限受限记录', () => {
   const mismatchRoot = fixture(); fs.writeFileSync(path.join(mismatchRoot, 'a.md'), header(doc.objToken, 'other'));
   expect(recoverLocalDocument(mismatchRoot, doc)).toBeNull();
   expect(recoverLocalDocument(mismatchRoot, { ...doc, lastSyncErrorCode: null })).toBeNull();
+});
+
+it('仅将唯一匹配的历史文件投影为构建源，不修改原始记录；拒绝重复或被其他记录占用的路径', () => {
+  const root = fixture(); const file = path.join(root, '旧标题.md'); fs.writeFileSync(file, header('object-a'));
+  const record: DocumentRecord = { ...doc, lastSyncErrorCode: null, objType: 'slides', title: '新标题', localRelPath: null,
+    lastSyncedAt: '', lastSyncedModifyTime: '', status: 'error' };
+  const projected = projectKnowledgeDocuments(root, [record]);
+  expect(projected[0]).toMatchObject({ localMdPath: file, localRelPath: '旧标题.md', recoveredLocalVersion: true, status: 'error' });
+  expect(record).toMatchObject({ localMdPath: '', localRelPath: null, lastSyncedAt: '', status: 'error' });
+  expect(RawSourceSnapshot.scan(root, projected).entries.map((entry) => entry.objToken)).toEqual(['object-a']);
+  const owner: DocumentRecord = { ...record, objToken: 'other', localMdPath: file, localRelPath: '旧标题.md', status: 'synced' };
+  expect(projectKnowledgeDocuments(root, [record, owner])[0].localRelPath).toBeNull();
+  const legacy = { ...record, localMdPath: file, status: 'synced' as const };
+  expect(projectKnowledgeDocuments(root, [legacy])[0].localRelPath).toBe('旧标题.md');
+  const partial = { ...record, localMdPath: file, localRelPath: '旧标题.md' };
+  expect(projectKnowledgeDocuments(root, [partial])[0].recoveredLocalVersion).toBe(true);
+  expect(RawSourceSnapshot.scan(root, projectKnowledgeDocuments(root, [partial])).entries).toHaveLength(1);
+  expect(projectKnowledgeDocuments(root, [{ ...partial, localRelPath: '其他路径.md' }])[0].recoveredLocalVersion).toBeUndefined();
+  expect(projectKnowledgeDocuments(root, [{ ...record, localMdPath: path.join(path.dirname(root), 'outside.md') }])[0].recoveredLocalVersion).toBeUndefined();
+
+  const duplicateRoot = fixture(); fs.writeFileSync(path.join(duplicateRoot, 'a.md'), header('object-a')); fs.writeFileSync(path.join(duplicateRoot, 'b.md'), header('object-a'));
+  expect(projectKnowledgeDocuments(duplicateRoot, [record])[0].localRelPath).toBeNull();
+  const mismatchRoot = fixture(); fs.writeFileSync(path.join(mismatchRoot, 'a.md'), header('object-a', 'wiki-other'));
+  expect(projectKnowledgeDocuments(mismatchRoot, [record])[0].localRelPath).toBeNull();
+});
+
+it('构建源预览也能读取非权限错误但身份匹配的旧文档', async () => {
+  const root = fixture(); const content = header('object-a'); fs.writeFileSync(path.join(root, '旧文档.md'), content);
+  const app = new Hono();
+  app.use('*', async (c, next) => { (c as any).localMapStore = { getDocumentByObjToken: () => ({ ...doc, lastSyncErrorCode: null, objType: 'slides', title: '云文档' }) }; (c as any).configManager = { getConfig: () => ({ knowledgeBaseRoot: root }) }; await next(); });
+  app.route('/', contentRoutes);
+  const response = await app.request('/api/mapping/content/object-a');
+  expect(response.status).toBe(200); expect(await response.json()).toMatchObject({ mdPath: '旧文档.md', mdContent: content });
+});
+
+it('历史表格的 CSV 附件进入构建快照并接受变更校验', () => {
+  const root = fixture(); const file = path.join(root, '旧表.md');
+  fs.writeFileSync(file, header('object-a').replace('slides', 'sheet'));
+  const csv = path.join(root, '旧表.csv-data', '表一.csv'); fs.mkdirSync(path.dirname(csv)); fs.writeFileSync(csv, '名称,数值\n消耗,10');
+  const record: DocumentRecord = { ...doc, objType: 'sheet', title: '表格', localRelPath: null, lastSyncedAt: '', lastSyncedModifyTime: '', status: 'error' };
+  const projected = projectKnowledgeDocuments(root, [record]);
+  const resolveCsv = () => recoveredSourceCsvPaths(root, projected[0], []);
+  expect(resolveCsv()).toEqual([fs.realpathSync.native(csv)]);
+  const scan = RawSourceSnapshot.scan(root, projected, resolveCsv);
+  const snapshot = RawSourceSnapshot.fromEntries(scan.entries, { sheetCsvPaths: resolveCsv });
+  expect(snapshot.readVerified(root, 'object-a').attachments[0].content).toContain('消耗,10');
+  fs.writeFileSync(csv, '名称,数值\n消耗,20');
+  expect(() => snapshot.readVerified(root, 'object-a')).toThrow(/构建期间被修改/);
 });

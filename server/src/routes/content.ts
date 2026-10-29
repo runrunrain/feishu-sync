@@ -38,6 +38,7 @@ interface ContentDependencies {
       objType: string;
       title: string;
       localMdPath: string;
+      localRelPath?: string | null;
       lastSyncedAt?: string | null;
       syncedObjEditTime?: number | null;
       wikiNodeToken?: string | null;
@@ -257,7 +258,7 @@ contentRoutes.get('/api/mapping/content/:objToken', async (c) => {
     // Resolve the markdown path defensively: the column may hold an absolute
     // path written by older versions, or a portable relative path. Either way
     // the result must land inside knowledgeBaseRoot.
-    const localPath = doc.localMdPath || recoverLocalDocument(knowledgeBaseRoot, doc);
+    const localPath = doc.localMdPath || doc.localRelPath || recoverLocalDocument(knowledgeBaseRoot, doc, { allowAnyState: true });
     const mdRel = localPath
       ? toPortableRelative(knowledgeBaseRoot, localPath)
       : null;

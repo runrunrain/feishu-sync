@@ -82,6 +82,26 @@ describe('磁盘删除与本地索引校正', () => {
 });
 
 describe('工具内指定源清理', () => {
+  it('用户确认清理时可回收身份匹配的历史表格及其未登记 CSV', async () => {
+    const f = await fixture();
+    const md = path.join(f.raw, '章节', '历史表.md');
+    const csv = path.join(f.raw, '章节', '历史表.csv-data', '数据.csv');
+    fs.writeFileSync(md, '<!--\nfeishu_sync:\n  obj_token: "history"\n  wiki_node_token: "wiki-history"\n  obj_type: "sheet"\n-->\n# 历史表');
+    fs.mkdirSync(path.dirname(csv)); fs.writeFileSync(csv, '名称,数值\n消耗,10');
+    f.store.upsertDocument({ objToken: 'history', wikiNodeToken: 'wiki-history', objType: 'sheet', title: '历史表', localRelPath: null,
+      localMdPath: '', lastSyncedAt: '', lastSyncedModifyTime: '', status: 'error' });
+    f.store.createSourceEdit({ objToken: 'history', localRelPath: '章节/历史表.md', baseObjEditTime: null, baseBodyHash: 'a', currentBodyHash: 'b', lastActor: 'ui' });
+    expect(() => cleanupSources(f.store, f.raw, [{ objToken: 'history', relPath: '章节/历史表.md' }])).toThrow('存在未写回的本地修改');
+    expect(fs.existsSync(md)).toBe(true); expect(fs.existsSync(csv)).toBe(true);
+    f.store.markSourceEditPushed('history');
+    const result = cleanupSources(f.store, f.raw, [{ objToken: 'history', relPath: '章节/历史表.md' }]);
+    expect(result).toMatchObject({ cleaned: 1, movedFiles: 2 });
+    expect(fs.existsSync(md)).toBe(false); expect(fs.existsSync(csv)).toBe(false);
+    expect(fs.readFileSync(path.join(result.trashDir, 'files', '章节/历史表.csv-data/数据.csv'), 'utf8')).toContain('消耗,10');
+    expect(f.store.getDocumentByObjToken('history')).toBeNull();
+    expect(fs.existsSync(f.docs[0].localMdPath)).toBe(true);
+  });
+
   it('清单确认后批量回收md/表格CSV，并清除索引；未选文档字节与索引保持', async () => {
     const f = await fixture(); const before = fs.readFileSync(f.docs[1].localMdPath!, 'utf8');
     const response = await f.call('/api/kb/sources/cleanup', { root: f.raw, sources: sources([f.docs[0], f.docs[2]]), confirm: 'CLEANUP' });

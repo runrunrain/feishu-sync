@@ -61,6 +61,7 @@ import { TASK_TOOL_FAMILY_NAME, TASK_TOOL_NAMES } from './agent/tool-specs.js';
 import { ApprovalService } from './agent/approvals/approval-service.js';
 import { createOpsToolFamily } from './agent/tools/app-command-family.js';
 import { KbBuildService } from './kb/kb-build-service.js';
+import { projectKnowledgeDocuments, recoveredSourceCsvPaths } from './kb/local-source-projection.js';
 import { piExtensionPath, readAgentPromptAssets } from './agent/agent-assets.js';
 import { RuntimeInstaller } from './agent/runtime-installer.js';
 import { checkRootOverlap, type WorkspaceRootGuards } from './agent/path-guard.js';
@@ -225,13 +226,19 @@ export async function buildServer(options: CreateServerOptions = {}) {
     maxConcurrentProcesses: config.agent.maxConcurrentProcesses,
     idleTimeoutMinutes: config.agent.idleTimeoutMinutes,
   });
-  const sheetCsvPaths = (objToken: string): string[] =>
-    localMapStore.getSheetSheets(objToken)
+  const knowledgeDocuments = () => {
+    const root = configManager.getConfig()?.knowledgeBaseRoot ?? '';
+    reconcileLocalIndex(localMapStore, root, () => new SnapshotService(localMapStore, configManager, { larkCliClient, config: configManager.getConfig() }).generate());
+    return projectKnowledgeDocuments(root, localMapStore.getAllDocuments());
+  };
+  const sheetCsvPaths = (objToken: string): string[] => {
+    const mapped = localMapStore.getSheetSheets(objToken)
       .map((sheet) => sheet.local_csv_path)
       .filter((csvPath) => typeof csvPath === 'string' && csvPath.length > 0);
-  const knowledgeDocuments = () => {
-    reconcileLocalIndex(localMapStore, configManager.getConfig()?.knowledgeBaseRoot ?? '', () => new SnapshotService(localMapStore, configManager, { larkCliClient, config: configManager.getConfig() }).generate());
-    return localMapStore.getAllDocuments();
+    const record = localMapStore.getDocumentByObjToken(objToken);
+    if (!record || (record.objType !== 'sheet' && record.objType !== 'bitable')) return mapped;
+    const root = configManager.getConfig()?.knowledgeBaseRoot ?? '';
+    return recoveredSourceCsvPaths(root, projectKnowledgeDocuments(root, [record])[0], mapped);
   };
   // S3：共享 VisionDescriber（会话内联/raw_read_image + 构建预描述 + changes 计数）
   const visionDescriber = new VisionDescriber({

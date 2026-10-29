@@ -183,14 +183,14 @@ export function KbBuildPanel({
             取消构建
           </Button>
         ) : null}
-        <button
+        {layout !== 'sidebar' ? <button
           type="button"
           onClick={onCollapse}
           className="text-ink-faint hover:text-ink transition-colors p-1"
-          aria-label="收起构建面板"
+          aria-label="收起进度面板"
         >
           <ChevronDown className="w-4 h-4" />
-        </button>
+        </button> : null}
       </header>
 
       {/* 阶段 stepper（终态定格在失败阶段/完成态） */}
@@ -310,7 +310,7 @@ export function KbBuildPanel({
       {/* 日志流 */}
       <div className="flex-1 min-h-0 overflow-auto scrollbar-thin px-4 py-2 space-y-0.5">
         {logs.length === 0 ? (
-          <p className="text-[11px] text-ink-faint">{isTerminal ? '当前会话无实时日志；已发布内容的变化可在变更记录中查看。' : '等待构建事件…'}</p>
+          <p className="text-[11px] text-ink-faint">{isTerminal ? '当前会话无实时日志；已发布内容的变化可在版本记录中查看。' : '等待构建事件…'}</p>
         ) : (
           logs.map((line) => <BuildLogRow key={line.id} line={line} />)
         )}

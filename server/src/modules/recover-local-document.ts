@@ -15,8 +15,8 @@ function readIdentity(file: string) {
 }
 
 /** Locate an unindexed local version by its embedded Feishu identity, without changing sync state. */
-export function recoverLocalDocument(root: string, doc: Pick<DocumentRecord, 'objToken' | 'localMdPath'> & Partial<Pick<DocumentRecord, 'wikiNodeToken' | 'syncState' | 'lastSyncErrorCode' | 'cloudMatch'>>): string | null {
-  if (!root || doc.localMdPath || !(doc.syncState === 'restricted' || doc.lastSyncErrorCode === 'permission_denied' || doc.cloudMatch === 'restricted')) return null;
+export function recoverLocalDocument(root: string, doc: Pick<DocumentRecord, 'objToken' | 'localMdPath'> & Partial<Pick<DocumentRecord, 'wikiNodeToken' | 'syncState' | 'lastSyncErrorCode' | 'cloudMatch'>>, options: { allowAnyState?: boolean } = {}): string | null {
+  if (!root || doc.localMdPath || (!options.allowAnyState && !(doc.syncState === 'restricted' || doc.lastSyncErrorCode === 'permission_denied' || doc.cloudMatch === 'restricted'))) return null;
   const resolvedRoot = path.resolve(root);
   let index = cache.get(resolvedRoot);
   if (!index || Date.now() - index.at > 10_000) {

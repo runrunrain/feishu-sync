@@ -25,6 +25,8 @@ export function buildSourceTree(documents: DocumentRecord[], choices: KbSourceCh
   const roots: KbSourceTreeNode[] = [];
   const folders = new Map<string, KbSourceTreeNode>();
   for (const [token, node] of nodes) {
+    // 没有可构建本地正文的真实云节点仍作为层级显示，但不算入已选数量。
+    if (!node.source && records.has(token)) node.sourceUnavailable = true;
     const parent = parents.get(token);
     let cycle = false; const seen = new Set([token]); let ancestor = parent;
     while (ancestor) { if (seen.has(ancestor)) { cycle = true; break; } seen.add(ancestor); ancestor = parents.get(ancestor); }

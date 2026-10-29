@@ -280,7 +280,7 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
       const scan = RawSourceSnapshot.scan(config.knowledgeBaseRoot, documents.filter((doc) => !excluded.has(doc.objToken)), deps.sheetCsvPaths);
       const current = new Map(scan.entries.map((entry) => [entry.objToken, entry]));
       const base = new Map((manifest?.sourceSnapshot ?? []).map((entry) => [entry.objToken, entry]));
-      const candidates = new Map(collectSourceCandidates(documents).map((doc) => [doc.objToken, { title: doc.title, relPath: doc.localRelPath! }]));
+      const candidates = new Map(collectSourceCandidates(documents).map((doc) => [doc.objToken, { title: doc.title, relPath: doc.localRelPath!, recovered: doc.recoveredLocalVersion === true }]));
       const referencedCounts = countIncomingReferences(localMapStore, documents);
       // 当前选择仅列实际存在的本地源；旧版本引用留在差异/版本入口。
       const inspect = createLocalPathInspector(config.knowledgeBaseRoot);
@@ -290,7 +290,7 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
         const isExcluded = excluded.has(objToken);
         const pending = isExcluded ? (old ? 'removed' : 'excluded') : !next ? (old ? 'removed' : 'unchanged')
           : !old ? 'added' : next.contentHash !== old.contentHash || next.relPath !== old.relPath || next.title !== old.title ? 'changed' : 'unchanged';
-        return { objToken, title: doc.title || objToken, relPath: doc.relPath, included: !isExcluded, published: Boolean(old), pending,
+        return { objToken, title: doc.title || objToken, relPath: doc.relPath, included: !isExcluded, published: Boolean(old), pending, ...(doc.recovered ? { recovered: true } : {}),
           referencedBy: referencedCounts.get(objToken) ?? 0 };
       });
     return { choices, config, documents };

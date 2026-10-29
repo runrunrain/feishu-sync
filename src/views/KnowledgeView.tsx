@@ -1,7 +1,7 @@
 /**
  * KnowledgeView —— 标准知识库主区（F2，设计 §11.2）
  *
- * 布局：正文优先，目录/来源/构建/管理统一在默认收起的侧栏。
+ * 布局：左侧常驻目录，右侧按需展开来源、发布、构建和进度。
  *
  * 状态覆盖：加载骨架 / 未发布（Agent 就绪→引导构建；未就绪→原因+跳转）/
  * 服务不可达 / 文档加载失败 / 构建运行中（按钮禁用+取消）/ 构建失败
@@ -9,7 +9,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
-import { Activity, AlertCircle, BookOpen, ChevronRight, CloudUpload, Link2, ListTree, Loader2, Settings2, Sparkles } from 'lucide-react';
+import { Activity, AlertCircle, BookOpen, ChevronLeft, ChevronRight, CloudUpload, Hammer, Link2, ListTree, Loader2, Settings2, Sparkles } from 'lucide-react';
 import { KbReadingControls } from '../components/kb/KbReadingControls';
 import { useKbReadingPreferences } from '../hooks/useKbReadingPreferences';
 import { KbTreePanel } from '../components/kb/KbTreePanel';
@@ -41,7 +41,7 @@ import {
 import type { KbBuildDto, KbBuildIssue, KbDocDto, KbDocSourceRef, KbStatusDto, KbTreeNode } from '../types/agent';
 import type { KbPublicationRowDto } from '../types/kb-publish';
 import { SseConnection } from '../utils/sseStream';
-import { describeReadinessCode as describeReadiness, formatDateTime } from '../utils/agentReadiness';
+import { describeReadinessCode as describeReadiness } from '../utils/agentReadiness';
 import { flattenDocPaths } from '../utils/kbPublish';
 
 interface KnowledgeViewProps {
@@ -93,13 +93,14 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
   const [build, setBuild] = useState<KbBuildDto | null>(null);
   const [buildIssues, setBuildIssues] = useState<KbBuildIssue[]>([]);
   const [buildLogs, setBuildLogs] = useState<BuildLogLine[]>([]);
-  const [sidebar, setSidebar] = useState<'directory' | 'sources' | 'build' | 'publish' | 'manage' | null>(null);
+  const [directoryOpen, setDirectoryOpen] = useState(true);
+  const [sidebar, setSidebar] = useState<'sources' | 'build' | 'publish' | 'progress' | null>(null);
   const [cancelling, setCancelling] = useState(false);
   const [confirming, setConfirming] = useState<'incremental' | 'full' | null>(null);
   const [selectedBuildCount, setSelectedBuildCount] = useState(0);
   const [starting, setStarting] = useState(false);
 
-  const [changeTab, setChangeTab] = useState<KbChangeTab | null>(null);
+  const [changeTab, setChangeTab] = useState<KbChangeTab>('sources');
   const [source, setSource] = useState<KbDocSourceRef | null>(null);
   const [publications, setPublications] = useState<KbPublicationRowDto[]>([]);
   const [publicationsLoading, setPublicationsLoading] = useState(false);
@@ -342,7 +343,7 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
 
   useEffect(() => { if (!active) setSidebar(null); }, [active]);
   useEffect(() => {
-    if (sidebar !== 'build' || build) return;
+    if (sidebar !== 'progress' || build) return;
     let disposed = false;
     void listKbBuilds(1).then(async ({ builds }) => {
       if (!builds[0]) return;
@@ -359,12 +360,16 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
   const pending = kbStatus?.pending;
   const pendingTotal = pending ? pending.added + pending.changed + pending.removed : 0;
 
+  const openBuild = (tab: KbChangeTab) => {
+    setChangeTab(tab);
+    setSidebar('build');
+  };
+
   const sidebarItems = [
-    { id: 'directory' as const, label: '目录', name: '目录与搜索', icon: ListTree },
     { id: 'sources' as const, label: '来源', name: '来源与文档信息', icon: Link2 },
-    { id: 'build' as const, label: '构建', name: '构建进度', icon: Activity },
     { id: 'publish' as const, label: '发布', name: '发布到飞书', icon: CloudUpload },
-    { id: 'manage' as const, label: '管理', name: '更新与版本管理', icon: Settings2 },
+    { id: 'build' as const, label: '构建', name: '构建标准库', icon: Hammer },
+    { id: 'progress' as const, label: '进度', name: '构建进度', icon: Activity },
   ];
 
   const docPublication = doc ? publicationsByPath.get(doc.path) ?? null : null;
@@ -372,15 +377,27 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
 
   return (
     <div className="relative flex h-full min-h-0 min-w-0 gap-2" data-view="knowledge">
+      {directoryOpen ? <aside className="absolute left-0 inset-y-0 z-20 md:static shrink-0 h-full min-h-0 rounded-md border border-line bg-card-bg shadow-lg md:shadow-sm flex flex-col overflow-hidden"
+        style={{ width: 'min(256px, calc(100vw - 104px))' }} aria-label="标准库目录" data-testid="kb-directory-panel">
+        <header className="shrink-0 h-11 px-3 border-b border-line/60 flex items-center justify-between">
+          <h3 className="text-sm font-kai text-ink">目录与搜索</h3>
+          <button type="button" onClick={() => setDirectoryOpen(false)} aria-label="收起目录" title="收起目录" className="p-1 text-ink-faint hover:text-ink"><ChevronLeft className="w-4 h-4" /></button>
+        </header>
+        {tree ? <KbTreePanel nodes={tree.nodes} selectedDocId={selectedDocId} onSelectDoc={setSelectedDocId}
+          releaseId={tree.releaseId} publicationsByPath={publicationsByPath} />
+          : <p className="p-4 text-xs text-ink-faint">发布后在此浏览目录和搜索。</p>}
+      </aside> : <div className="shrink-0 w-9 rounded-md border border-line bg-card-bg shadow-sm flex justify-center pt-2">
+        <button type="button" onClick={() => setDirectoryOpen(true)} aria-label="打开目录" title="打开目录" className="self-start p-2 rounded text-ink-faint hover:bg-paper hover:text-ink"><ListTree className="w-4 h-4" /></button>
+      </div>}
       <article className="flex-1 min-w-0 min-h-0 rounded-md border border-line bg-card-bg shadow-sm flex flex-col overflow-hidden"
         aria-label="标准知识库正文" data-testid="kb-reader-panel">
         <header className="shrink-0 min-h-[44px] px-5 py-2 border-b border-line/60 flex items-center gap-2">
           <BookOpen className="w-4 h-4 text-seal shrink-0" />
           <h2 className="text-sm font-kai text-ink truncate flex-1">{doc?.title ?? '标准知识库'}</h2>
           {doc ? <KbReadingControls preferences={preferences} onChange={updatePreferences} storageUnavailable={storageUnavailable} active={active} /> : null}
-          {running ? <button type="button" onClick={() => setSidebar('build')} className="shrink-0 flex items-center gap-1 text-xs text-seal">
+          {running ? <button type="button" onClick={() => setSidebar('progress')} className="shrink-0 flex items-center gap-1 text-xs text-seal">
             <Loader2 className="w-3 h-3 animate-spin" /> 更新中
-          </button> : pendingTotal > 0 ? <button type="button" onClick={() => setChangeTab('pending')} className="shrink-0 text-xs text-seal">{pendingTotal} 处待更新</button> : null}
+          </button> : pendingTotal > 0 ? <button type="button" onClick={() => openBuild('pending')} className="shrink-0 text-xs text-seal">{pendingTotal} 处待更新</button> : null}
         </header>
         {statusError && !kbStatus ? <EmptyCard icon={<AlertCircle className="w-8 h-8 text-seal-2" />} title="标准库服务不可用"
           description={statusError} action={<Button size="sm" variant="secondary" onClick={() => { setStatusLoading(true); void loadStatus(); }}>重试</Button>} />
@@ -392,7 +409,7 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
               {onJumpToSettings ? <Button size="sm" onClick={onJumpToSettings}>前往设置</Button> : null}</>} />
             : <EmptyCard icon={<Sparkles className="w-8 h-8 text-jade" />} title="尚未发布标准知识库"
               description="选择参与构建的原始文档后，生成可阅读、可追溯的标准知识库。"
-              action={<Button size="sm" onClick={() => setChangeTab('sources')}>选择源文档</Button>} />
+              action={<Button size="sm" onClick={() => openBuild('sources')}>选择源文档</Button>} />
           : docLoading || treeLoading ? <div className="p-8 animate-pulse space-y-4" aria-busy="true">
             {Array.from({ length: 10 }).map((_, i) => <div key={i} className="h-3 bg-paper-2 rounded" />)}
           </div> : docError ? <EmptyCard icon={<AlertCircle className="w-8 h-8 text-seal-2" />} title="文档加载失败" description={docError}
@@ -402,21 +419,17 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
               <MarkdownView variant="reading" content={doc.markdown} baseDir={doc.path.split('/').slice(0, -1).join('/')} remoteImages="confirm" />
             </div>
           </div> : <EmptyCard icon={<BookOpen className="w-8 h-8 text-ink-faint" />} title="选择文档开始阅读"
-            description="目录和搜索位于侧栏，选择文档后侧栏会自动收起。"
-            action={<Button size="sm" variant="secondary" onClick={() => setSidebar('directory')}>打开目录</Button>} />}
+            description="通过左侧目录和搜索选择文档。"
+            action={!directoryOpen ? <Button size="sm" variant="secondary" onClick={() => setDirectoryOpen(true)}>打开目录</Button> : undefined} />}
       </article>
 
-      {sidebar ? <aside className="absolute right-14 inset-y-0 z-20 lg:static shrink-0 h-full min-h-0 rounded-md border border-line bg-card-bg shadow-lg lg:shadow-sm flex flex-col overflow-hidden"
-        style={{ width: 'min(320px, calc(100vw - 104px))' }} aria-label="标准库侧栏" data-testid="kb-sidebar">
+      {sidebar ? <aside className="absolute right-14 inset-y-0 z-30 xl:static shrink-0 h-full min-h-0 rounded-md border border-line bg-card-bg shadow-lg xl:shadow-sm flex flex-col overflow-hidden"
+        style={{ width: sidebar === 'build' ? 'min(440px, calc(100vw - 104px))' : 'min(320px, calc(100vw - 104px))' }} aria-label="标准库侧栏" data-testid="kb-sidebar">
         <header className="shrink-0 h-11 px-3 border-b border-line/60 flex items-center justify-between">
           <h3 className="text-sm font-kai text-ink">{sidebarItems.find((item) => item.id === sidebar)?.name}</h3>
           <button type="button" onClick={() => setSidebar(null)} aria-label="收起标准库侧栏" title="收起侧栏" className="p-1 text-ink-faint hover:text-ink"><ChevronRight className="w-4 h-4" /></button>
         </header>
-        {sidebar === 'directory' ? tree ? <KbTreePanel nodes={tree.nodes} selectedDocId={selectedDocId}
-          onSelectDoc={(id) => { setSelectedDocId(id); setSidebar(null); }} releaseId={tree.releaseId}
-          publicationsByPath={publicationsByPath} />
-          : <p className="p-4 text-xs text-ink-faint">发布后在此浏览目录和搜索。</p>
-          : sidebar === 'sources' ? doc ? <div className="flex-1 min-h-0 overflow-auto scrollbar-thin">
+        {sidebar === 'sources' ? doc ? <div className="flex-1 min-h-0 overflow-auto scrollbar-thin">
             <div className="px-4 py-3 space-y-2 border-b border-line/60 text-xs text-ink-soft">
               {doc.summary ? <p className="leading-relaxed">{doc.summary}</p> : null}
               <p className="text-ink-faint break-all">{doc.path}</p>
@@ -429,9 +442,9 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
             </div>
             <div className="min-h-[200px]"><KbSourcePanel docTitle={doc.title} sources={doc.sources} onOpenSource={setSource} /></div>
           </div> : <p className="p-4 text-xs text-ink-faint">选择文档后查看来源与文档信息。</p>
-          : sidebar === 'build' ? build ? <KbBuildPanel open build={build} issues={buildIssues} logs={buildLogs}
+          : sidebar === 'progress' ? build ? <KbBuildPanel open build={build} issues={buildIssues} logs={buildLogs}
             onCollapse={() => setSidebar(null)} onCancel={cancelBuild} cancelling={cancelling} layout="sidebar" />
-            : <p className="p-4 text-xs text-ink-faint">尚无构建记录。可在管理侧栏发起更新。</p>
+            : <p className="p-4 text-xs text-ink-faint">尚无构建记录。可在构建侧栏选择文档并发起构建。</p>
           : sidebar === 'publish' ? <KbPublishPanel
             publications={publications}
             loading={publicationsLoading}
@@ -439,27 +452,22 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
             onOpenPublish={() => setPublishModal({ open: true, tab: 'publish' })}
             onOpenHistory={() => setPublishModal({ open: true, tab: 'history' })}
             onRefresh={() => void loadPublications()} />
-          : <div className="flex-1 min-h-0 overflow-auto p-4 space-y-4 text-xs text-ink-soft">
-            <div className="space-y-2">
-              <h4 className="text-ink font-medium">当前标准库</h4>
-              <p>{kbStatus?.current ? `${kbStatus.current.docCount} 篇文档 · ${kbStatus.current.sourceCount} 个来源` : '尚未发布'}</p>
-              {kbStatus?.current ? <><p>{formatDateTime(kbStatus.current.publishedAt)}</p>
-                <p className="font-mono text-[10px] text-ink-faint break-all">{kbStatus.current.releaseId}</p>
-                <p className="font-mono text-[10px] text-ink-faint break-all">{kbStatus.current.model}</p></> : null}
-            </div>
-            <div className="grid grid-cols-1 gap-2 border-t border-line pt-3">
-              <Button size="sm" variant="secondary" onClick={() => setChangeTab('sources')}>源文档</Button>
-              <Button size="sm" variant="secondary" onClick={() => setChangeTab('pending')}>待更新差异{pendingTotal ? `（${pendingTotal}）` : ''}</Button>
-              <Button size="sm" variant="secondary" onClick={() => setChangeTab('history')}>变更记录</Button>
-            </div>
-            <div className="space-y-3 border-t border-line pt-3">
-              {agent.loading ? <StatusBadge status="loading">检测中</StatusBadge> : <StatusBadge status={agentReady ? 'success' : 'warning'}>{agentReady ? 'Agent 就绪' : readiness?.reason ?? 'Agent 未就绪'}</StatusBadge>}
-              {!agentReady && readiness?.action ? <p className="text-ink-faint leading-relaxed">{readiness.action}</p> : null}
-              <Button size="sm" variant="secondary" className="w-full" disabled={!agentReady || running || starting}
-                loading={starting && confirming === 'incremental'} onClick={() => setConfirming('incremental')}>按变更更新</Button>
-              <button type="button" className="text-ink-faint underline" onClick={agentReady ? () => void agent.recheck() : onJumpToSettings}>检查运行时与模型</button>
-            </div>
-          </div>}
+          : <>
+            {!agentReady ? <div className="shrink-0 px-4 py-2 border-b border-line/60 text-xs text-ink-soft space-y-1">
+              {agent.loading ? <StatusBadge status="loading">检测中</StatusBadge> : <StatusBadge status="warning">{readiness?.reason ?? 'Agent 未就绪'}</StatusBadge>}
+              {readiness?.action ? <p className="leading-relaxed">{readiness.action}</p> : null}
+              <div className="flex gap-3">
+                <button type="button" className="text-seal underline" onClick={() => void agent.recheck()}>重新检测</button>
+                {onJumpToSettings ? <button type="button" className="text-seal underline" onClick={onJumpToSettings}>前往设置</button> : null}
+              </div>
+            </div> : null}
+            <KbChangesPanel tab={changeTab} onTab={setChangeTab}
+              running={running} canUpdate={agentReady && !starting}
+              onChanged={() => { void loadStatus(); setDocReload((n) => n + 1); }}
+              onUpdate={() => setConfirming('incremental')}
+              onBuildSelected={(count) => { setSelectedBuildCount(count); setConfirming('full'); }}
+              onOpenSource={(choice) => setSource({ objToken: choice.objToken, title: choice.title, relPath: choice.relPath, state: choice.included ? 'current' : 'excluded' })} />
+          </>}
       </aside> : null}
 
       <nav className="shrink-0 w-12 rounded-md border border-line bg-card-bg shadow-sm flex flex-col items-center gap-1 py-2" aria-label="标准库工具">
@@ -467,8 +475,8 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
           onClick={() => setSidebar((value) => value === id ? null : id)} aria-label={`${sidebar === id ? '收起' : '打开'}${name}`}
           aria-expanded={sidebar === id} title={name}
           className={`relative w-10 min-h-[44px] flex flex-col items-center justify-center gap-1 rounded text-[10px] transition-colors ${sidebar === id ? 'bg-seal/10 text-seal' : 'text-ink-faint hover:bg-paper hover:text-ink'}`}>
-          {id === 'build' && running ? <Loader2 className="w-4 h-4 animate-spin text-seal" /> : <Icon className="w-4 h-4" />}<span>{label}</span>
-          {id === 'manage' && pendingTotal > 0 ? <span className="absolute right-1 top-1 w-1.5 h-1.5 rounded-full bg-seal" /> : null}
+          {id === 'progress' && running ? <Loader2 className="w-4 h-4 animate-spin text-seal" /> : <Icon className="w-4 h-4" />}<span>{label}</span>
+          {id === 'build' && pendingTotal > 0 ? <span className="absolute right-1 top-1 w-1.5 h-1.5 rounded-full bg-seal" /> : null}
           {id === 'publish' && publishConflictCount > 0 ? <span className="absolute right-1 top-1 w-1.5 h-1.5 rounded-full bg-seal-2" aria-label={`${publishConflictCount} 篇文档发布异常`} /> : null}
         </button>)}
       </nav>
@@ -486,14 +494,6 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
         onPublicationsChanged={() => void loadPublications()}
         onJumpToSettings={onJumpToPublishSettings}
       />
-
-      <KbChangesPanel tab={changeTab} onTab={setChangeTab} onClose={() => setChangeTab(null)}
-        running={running}
-        canUpdate={agentReady && !starting}
-        onChanged={() => { void loadStatus(); setDocReload((n) => n + 1); }}
-        onUpdate={() => { setChangeTab(null); setConfirming('incremental'); }}
-        onBuildSelected={(count) => { setSelectedBuildCount(count); setChangeTab(null); setConfirming('full'); }}
-        onOpenSource={(choice) => { setChangeTab(null); setSource({ objToken: choice.objToken, title: choice.title, relPath: choice.relPath, state: choice.included ? 'current' : 'excluded' }); }} />
 
       {/* 构建确认弹窗 */}
       <Modal
@@ -521,7 +521,7 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
         ) : (
           <div className="space-y-3 text-sm text-ink-soft leading-relaxed">
             <p>比较当前参与构建的原始源与上次发布快照，只更新受影响的标准文档：</p>
-            <button type="button" className="text-xs text-seal underline" onClick={() => { setConfirming(null); setChangeTab('pending'); }}>查看源文档差异与影响范围</button>
+            <button type="button" className="text-xs text-seal underline" onClick={() => { setConfirming(null); openBuild('pending'); }}>查看源文档差异与影响范围</button>
             {pending && kbStatus?.current ? (
               <div className="flex items-center gap-3 text-xs">
                 <span className="text-jade">新增 {pending.added}</span>
