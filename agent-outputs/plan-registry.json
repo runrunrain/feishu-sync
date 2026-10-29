@@ -1,0 +1,17 @@
+[
+  {
+    "id": "execution-plan-20261029-kb-retrieval-mcp",
+    "type": "execution-plan",
+    "path": "agent-outputs/execution-plan/20261029-kb-retrieval-mcp/",
+    "timestamp": "2026-10-29T18:08:20Z",
+    "status": "active",
+    "summary": "4阶段9节点：E0/P0、共用lex-v1引擎、七工具与应用内接入及内网共享、成品验收；真实评测和触发项分离。",
+    "phases": [
+      { "phase": "A 基线与缺陷修复", "taskCount": 3, "status": "completed" },
+      { "phase": "B 共用检索引擎", "taskCount": 2, "status": "running" },
+      { "phase": "C 完整成品", "taskCount": 4, "status": "pending" },
+      { "phase": "D 交付验证", "taskCount": 1, "status": "pending" }
+    ],
+    "relatedPlanId": ""
+  }
+]

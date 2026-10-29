@@ -49,7 +49,7 @@ import { hashImageFile, inlineImageBlocks, resolveSourceImages, extractWhiteboar
 import type { PathClaims } from '../kb/path-claims.js';
 import type { BuildUnit } from '../kb/build-units.js';
 import type { ImageDescription } from './vision/vision-describer.js';
-import { matchGlob } from '../kb/kb-search.js';
+import { matchGlob, parseSearchQuery } from '../kb/kb-search.js';
 import {
   renderSourceLinksBlock,
   resolveSourceLinks,
@@ -582,38 +582,62 @@ export class AgentToolService {
   private toolRawSearch(context: InternalRunContext, args: Record<string, unknown>): ToolResult {
     const query = requireString(args, 'query', 1, 200);
     const limit = optionalInt(args, 'limit', 20, 1, 20);
-    const lowerQuery = query.toLowerCase();
+    const units = parseSearchQuery(query);
+    if (!units.length) return { content: [{ type: 'text', text: JSON.stringify({ results: [] }, null, 2) }] };
     const entries = context.options.buildState
       ? context.options.buildState.snapshot.entries
       : this.rawEntriesForDiscuss(context);
-    const results: Array<Record<string, unknown>> = [];
+    const hits: Array<{ result: Record<string, unknown>; score: number; relPath: string }> = [];
     for (const entry of entries) {
       let snippet = '';
-      let score = 0;
-      if (entry.title.toLowerCase().includes(lowerQuery)) score += 10;
-      if (entry.relPath.toLowerCase().includes(lowerQuery)) score += 5;
+      let content = '';
       try {
-        const content = this.readRawContent(context, entry.objToken);
-        const lower = content.toLowerCase();
-        const index = lower.indexOf(lowerQuery);
-        if (index >= 0) {
-          score += 20;
-          const start = Math.max(0, index - 60);
-          snippet = `${start > 0 ? '…' : ''}${content.slice(start, index + query.length + 100).replace(/\n+/g, ' ')}…`;
-        }
+        content = this.readRawContent(context, entry.objToken);
       } catch {
-        /* 读取失败只降权 */
+        /* 读取失败只降权；readRawContent 仍负责构建快照毒化标记。 */
+      }
+      const title = entry.title.toLowerCase();
+      const relPath = entry.relPath.toLowerCase();
+      const lower = content.toLowerCase();
+      let score = 0;
+      let matched = 0;
+      let firstIndex = -1;
+      let firstLength = 0;
+      for (const unit of units) {
+        let unitScore = 0;
+        if (title.includes(unit)) unitScore += 10;
+        if (relPath.includes(unit)) unitScore += 5;
+        const index = lower.indexOf(unit);
+        if (index >= 0) {
+          unitScore += 20;
+          if (firstIndex < 0 || index < firstIndex) {
+            firstIndex = index;
+            firstLength = unit.length;
+          }
+        }
+        if (unitScore > 0) matched += 1;
+        score += unitScore;
+      }
+      score *= 0.5 + matched / units.length;
+      if (firstIndex >= 0) {
+        const start = Math.max(0, firstIndex - 60);
+        snippet = `${start > 0 ? '…' : ''}${content.slice(start, firstIndex + firstLength + 100).replace(/\n+/g, ' ')}…`;
       }
       if (score > 0) {
-        results.push({
-          objToken: entry.objToken,
-          title: entry.title,
+        hits.push({
+          score,
           relPath: entry.relPath,
-          ...(snippet ? { snippet } : {}),
+          result: {
+            objToken: entry.objToken,
+            title: entry.title,
+            relPath: entry.relPath,
+            ...(snippet ? { snippet } : {}),
+          },
         });
       }
-      if (results.length >= limit) break;
     }
+    hits.sort((a, b) => b.score - a.score || (a.relPath < b.relPath ? -1 : a.relPath > b.relPath ? 1 : 0));
+    const results = hits.slice(0, limit).map((hit) => hit.result);
     return { content: [{ type: 'text', text: JSON.stringify({ results }, null, 2) }] };
   }
 

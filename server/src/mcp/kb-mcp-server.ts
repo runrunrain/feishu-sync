@@ -63,7 +63,7 @@ async function main(): Promise<void> {
     tools: [
       {
         name: 'search_knowledge',
-        description: '在已发布标准知识库中搜索文档（大小写不敏感子串，标题/章节加权）',
+        description: '在已发布标准知识库中搜索文档。用空格分隔 2–4 个关键词，引号内作为短语；大小写不敏感子串匹配，标题/章节加权，按相关度返回。',
         inputSchema: {
           type: 'object',
           properties: {

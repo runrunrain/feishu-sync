@@ -78,6 +78,7 @@ beforeAll(async () => {
   transport = new StdioClientTransport({
     command: process.execPath,
     args: [mcpScript, '--kb-root', kbRoot],
+    env: { FEISHU_SYNC_HOME: path.join(kbRoot, 'data') },
   });
   await client.connect(transport);
 });
@@ -100,6 +101,7 @@ describe('kb-mcp stdio 四工具', () => {
     for (const tool of listed.tools) {
       expect((tool as { annotations?: { readOnlyHint?: boolean } }).annotations?.readOnlyHint).toBe(true);
     }
+    expect(listed.tools.find((tool) => tool.name === 'search_knowledge')?.description).toContain('用空格分隔');
   });
 
   it('未发布 → search/get/list 均报 kb_not_published', async () => {
@@ -113,7 +115,7 @@ describe('kb-mcp stdio 四工具', () => {
 
   it('发布后 → 四工具返回真实数据', async () => {
     writeRelease('r_mcp1', [
-      { path: '战斗/结算.md', docId: 'kd_m1', title: '战斗结算', sources: ['tokA'], body: '伤害 = 攻击 × (1 - 减伤)。' },
+      { path: '战斗/结算.md', docId: 'kd_m1', title: '战斗结算', sources: ['tokA'], body: '伤害 = 攻击 × (1 - 减伤)。skill_id 1001 hp+10% Critical Hit。' },
       { path: '经济/资源.md', docId: 'kd_m2', title: '资源产出', sources: ['tokB'], body: '金币产出按小时结算。' },
     ]);
     const info = await callTool('get_release_info', {});
@@ -135,6 +137,32 @@ describe('kb-mcp stdio 四工具', () => {
     const listText = (list.content as Array<{ text: string }>)[0].text;
     expect(listText).toContain('kd_m1');
     expect(listText).not.toContain('kd_m2');
+  });
+
+  it('P0：多词先排序再 limit；引号短语与英文 ID/数值可经真实 stdio 检索', async () => {
+    const ranked = await callTool('search_knowledge', { query: '战斗 结算', limit: 1 });
+    const data = JSON.parse((ranked.content as Array<{ text: string }>)[0].text);
+    expect(data.releaseId).toBe('r_mcp1');
+    expect(data.results.map((hit: { docId: string }) => hit.docId)).toEqual(['kd_m1']);
+    expect(Object.keys(data.results[0]).sort()).toEqual(['docId', 'path', 'title', 'summary', 'snippet'].sort());
+    for (const query of ['SKILL_ID 1001', 'hp+10%', '"Critical Hit"', '「Critical Hit」']) {
+      const response = await callTool('search_knowledge', { query });
+      const parsed = JSON.parse((response.content as Array<{ text: string }>)[0].text);
+      expect(parsed.results.map((hit: { docId: string }) => hit.docId)).toEqual(['kd_m1']);
+      expect(parsed.results[0].snippet).toContain('skill_id');
+    }
+  });
+
+  it('P0：多词并列按 path 确定性排序，纯分隔符无命中', async () => {
+    writeRelease('r_p0_tie', [
+      { path: 'z.md', docId: 'kd_z', title: '战斗结算', sources: ['tokZ'], body: '正文' },
+      { path: 'a.md', docId: 'kd_a', title: '战斗结算', sources: ['tokA'], body: '正文' },
+    ]);
+    const response = await callTool('search_knowledge', { query: '战斗 结算', limit: 1 });
+    const parsed = JSON.parse((response.content as Array<{ text: string }>)[0].text);
+    expect(parsed.results.map((hit: { path: string }) => hit.path)).toEqual(['a.md']);
+    const empty = await callTool('search_knowledge', { query: ',，；;' });
+    expect(JSON.parse((empty.content as Array<{ text: string }>)[0].text).results).toEqual([]);
   });
 
   it('发布切换后 → 每次调用重新读 CURRENT，结果即时变化', async () => {

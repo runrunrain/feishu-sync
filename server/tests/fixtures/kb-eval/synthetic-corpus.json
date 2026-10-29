@@ -1,0 +1,27 @@
+{
+  "synthetic": true,
+  "releaseId": "synthetic-e0-v1",
+  "description": "Hand-authored synthetic test fixture, NOT production design or a real 80-query evaluation set.",
+  "docs": [
+    {
+      "path": "战斗/伤害.md", "title": "伤害结算", "summary": "攻击、闪避、暴击的结算顺序。", "headings": ["结算顺序", "暴击"],
+      "body": "# 伤害结算\n\n## 结算顺序\n攻击先检查闪避，再检查暴击，最后扣除生命值。\n\n## 暴击\n暴击倍率为150%。\n### 技能表\n| skill_id | 名称 | 倍率 |\n| --- | --- | --- |\n| 1001 | 烈焰斩 | 120% |\n| 1002 | 冰封术 | 90% |\n\n```md\n## 假标题\n```\n"
+    },
+    {
+      "path": "养成/宠物.md", "title": "宠物升星", "summary": "宠物升星消耗星尘。", "headings": ["升星消耗", "生命值"],
+      "body": "# 宠物升星\n\n## 升星消耗\n宠物从一星升到二星消耗10颗星尘。\n\n## 生命值\n生命值决定宠物承受伤害的上限。\n"
+    },
+    {
+      "path": "公会/活动.md", "title": "公会活动", "summary": "公会系统的集体玩法。", "headings": ["团战", "签到"],
+      "body": "# 公会活动\n\n## 团战\n公会每周开展团战，奖励公会贡献。\n\n## 签到\n成员每日签到增加公会贡献。\n"
+    },
+    {
+      "path": "公会/商店.md", "title": "公会商店", "summary": "公会贡献兑换道具。", "headings": ["兑换"],
+      "body": "# 公会商店\n\n## 兑换\n公会贡献可兑换技能1001的残页。\n"
+    },
+    {
+      "path": "经济/消耗.md", "title": "消耗规则", "summary": "系统消耗与设计规则。", "headings": ["资源"],
+      "body": "# 消耗规则\n\n## 资源\n金币消耗用于建筑升级，消耗规则记录在资源总表。\n"
+    }
+  ]
+}

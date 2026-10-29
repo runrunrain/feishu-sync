@@ -20,7 +20,7 @@ const integer = (description: string, min?: number, max?: number): Record<string
 export const KB_SEARCH_SPEC: AgentToolSpec = {
   name: 'kb_search',
   label: '标准库搜索',
-  description: '在已发布标准知识库中搜索文档。大小写不敏感子串匹配，标题与章节标题加权。返回 docId、路径、标题、摘要与片段。',
+  description: '在已发布标准知识库中搜索文档。用空格分隔 2–4 个关键词，引号内作为短语；大小写不敏感子串匹配，标题与章节标题加权，按相关度返回 docId、路径、标题、摘要与片段。',
   parameters: {
     type: 'object',
     properties: {
@@ -51,7 +51,7 @@ export const KB_READ_SPEC: AgentToolSpec = {
 export const RAW_SEARCH_SPEC: AgentToolSpec = {
   name: 'raw_search',
   label: '原始库搜索',
-  description: '在本地原始知识库（飞书同步产物）中按标题与内容搜索文档。返回 objToken、标题、相对路径与片段。',
+  description: '在本地原始知识库（飞书同步产物）中按标题与内容搜索文档。用空格分隔 2–4 个关键词，引号内作为短语；按相关度返回 objToken、标题、相对路径与片段。',
   parameters: {
     type: 'object',
     properties: {
