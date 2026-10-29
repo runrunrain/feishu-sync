@@ -160,11 +160,17 @@ describe('Claude Code with an app-configured Anthropic provider', () => {
       incompatible.llm.providers![0].protocol = 'openai-completions';
       const rejected = await resolver.checkReadiness({ agentConfig: incompatible.agent, llmConfig: incompatible.llm, runningProcesses: 0 });
       expect(rejected.code).toBe('claude_protocol_unsupported');
+      const dual = structuredClone(config);
+      dual.llm.providers![0].protocol = 'openai-completions';
+      dual.llm.providers![0].openAiCompatBaseUrl = 'https://example.invalid/v1';
+      dual.llm.providers![0].protocolBaseUrls = { 'anthropic-messages': `http://127.0.0.1:${port}` };
+      expect((await resolver.checkReadiness({ agentConfig: dual.agent, llmConfig: dual.llm, runningProcesses: 0 })).code).toBe('ready');
       const piSource = structuredClone(config);
       piSource.agent.model.source = 'pi-agent-dir';
       expect((await resolver.checkReadiness({ agentConfig: piSource.agent, llmConfig: piSource.llm, runningProcesses: 0 })).code).toBe('ready');
       piSource.llm.providers![0].protocol = 'openai-completions';
       expect((await resolver.checkReadiness({ agentConfig: piSource.agent, llmConfig: piSource.llm, runningProcesses: 0 })).code).toBe('claude_protocol_unsupported');
+      config.llm.providers![0] = dual.llm.providers![0];
       const accepted = await service.sendMessage(store, session.id, { text: 'Find the fixture' });
       const deadline = Date.now() + 30_000;
       while (service.isRunning(session.id) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 30));

@@ -16,6 +16,13 @@ function makeDoc(overrides: Partial<ChangedDocument>): ChangedDocument {
 }
 
 describe('ChangeListPanel logic & contracts', () => {
+  it('classifies missing XLSX separately and allows selecting the repair group', () => {
+    const repair = makeDoc({ objToken: 'sheet', objType: 'sheet', xlsxMissing: true });
+    const grouped = groupDiffChanges({ added: [], modified: [repair], deleted: [], unchanged: 0, totalCloud: 1, totalLocal: 1, checkedAt: '' });
+    expect(grouped.xlsxMissing.map((doc) => doc.objToken)).toEqual(['sheet']);
+    expect(grouped.modified).toEqual([]);
+    expect(computeSelectableDocs('xlsxMissing', grouped)).toEqual([repair]);
+  });
   it('correctly classifies added, modified, mediaGap and deleted documents', () => {
     const docAdded = makeDoc({ objToken: 't1', changeType: 'added' });
     const docModNormal = makeDoc({ objToken: 't2', changeType: 'modified' });

@@ -19,12 +19,31 @@
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {
   MappingService,
   MappingValidationError,
   CrossParentReorderError,
 } from '../src/modules/mapping-service.js';
 import type { ChangedDocument, DocumentRecord } from '../src/types/index.js';
+
+it('lists synced CSV-only sheets for XLSX repair until an XLSX exists', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sheet-repair-'));
+  try {
+    fs.writeFileSync(path.join(root, 'sheet.md'), '# sheet');
+    fs.mkdirSync(path.join(root, 'sheet.csv-data'));
+    fs.writeFileSync(path.join(root, 'sheet.csv-data', 'Sheet1.csv'), 'a,b');
+    const store = new MockLocalMapStore();
+    const url = 'https://example.feishu.cn/wiki/rootA';
+    store.rows.set('sheet', makeDoc({ objToken: 'sheet', objType: 'sheet', watchedRootUrl: url, watchedRootId: 'rootA', syncState: 'synced', localMdPath: path.join(root, 'sheet.md') }));
+    const svc = new MappingService(new MockChangeDetector() as any, store as any, new MockSnapshotService() as any, { getConfig: () => ({ knowledgeBaseRoot: root }) } as any);
+    expect(svc.getStoredDiff(url).modified).toMatchObject([{ objToken: 'sheet', xlsxMissing: true }]);
+    fs.writeFileSync(path.join(root, 'sheet.xlsx'), 'fixture');
+    expect(svc.getStoredDiff(url).modified).toEqual([]);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
 
 // ---------------------------------------------------------------------------
 // Mocks

@@ -52,5 +52,5 @@ export async function inspectClaudeCode(file: string): Promise<{ version: string
 }
 
 export function resolveClaudeProvider(llm: LlmConfig, agent: AgentConfig) {
-  return resolveProviderModel(llm, agent.model);
+  return resolveProviderModel(llm, agent.model, 'anthropic-messages') ?? resolveProviderModel(llm, agent.model);
 }

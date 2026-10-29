@@ -24,6 +24,9 @@
 
 import { reconcileLocalIndex } from './local-index-reconcile.js';
 import { localPathState } from './local-path-state.js';
+import fs from 'node:fs';
+import path from 'node:path';
+import { workbookPathForMarkdown } from './workbook-source.js';
 import type { ChangeDetector } from './change-detector.js';
 import type { LocalMapStore } from './local-map-store.js';
 import type { SnapshotService } from './snapshot-service.js';
@@ -67,6 +70,18 @@ export class MappingService {
   private blockedTokens(): Set<string> {
     const root = this.configManager?.getConfig()?.knowledgeBaseRoot ?? '';
     return new Set(this.localMapStore.listSyncBlockedSources?.(root).map((row) => row.objToken) ?? []);
+  }
+
+  private missingWorkbook(doc: DocumentRecord): boolean {
+    const root = this.configManager?.getConfig()?.knowledgeBaseRoot;
+    const md = doc.localMdPath;
+    if (!root || doc.objType !== 'sheet' || !md || !/\.md$/i.test(md)) return false;
+    const workbook = workbookPathForMarkdown(md);
+    if (localPathState(root, md) !== 'present' || localPathState(root, workbook) !== 'missing') return false;
+    const csvDir = md.replace(/\.md$/i, '.csv-data');
+    if (localPathState(root, csvDir, 'directory') !== 'present') return false;
+    try { return fs.readdirSync(path.resolve(root, csvDir), { withFileTypes: true }).some((item) => item.isFile() && /\.csv$/i.test(item.name)); }
+    catch { return false; }
   }
 
   /**
@@ -172,7 +187,7 @@ export class MappingService {
           'added',
           hierarchyByObjToken.get(document.objToken) ?? null,
         ));
-      } else if (state === 'pending_modified') {
+      } else if (state === 'pending_modified' || (state === 'synced' && this.missingWorkbook(document))) {
         modified.push(this.toStoredChangedDocument(
           document,
           'modified',
@@ -250,6 +265,7 @@ export class MappingService {
       hasChild: document.hasChild ?? false,
       observedObjEditTime: observed,
       syncState: this.storedSyncState(document),
+      xlsxMissing: this.missingWorkbook(document) || undefined,
       // pending_reason 持久标记：media-gap 项在 cached diff 重建时保留
       // 分组身份（前端「图片缺失待修复」分组），不退化为普通 modified。
       mediaGapReason: isMediaGapReason(document.pendingReason)
@@ -274,7 +290,7 @@ export class MappingService {
     const docs = this.localMapStore.listAllCustomFolderDocs();
     const blocked = this.blockedTokens();
     return docs
-      .filter((doc) => doc.syncState === 'pending_modified' && !blocked.has(doc.objToken))
+      .filter((doc) => (doc.syncState === 'pending_modified' || (doc.syncState === 'synced' && this.missingWorkbook(doc))) && !blocked.has(doc.objToken))
       .map((doc) => this.toCustomChangedDocument(doc));
   }
 
@@ -304,6 +320,7 @@ export class MappingService {
       hasChild: doc.hasChild ?? false,
       observedObjEditTime: observed,
       syncState: doc.syncState,
+      xlsxMissing: this.missingWorkbook(doc) || undefined,
       mediaGapReason: isMediaGapReason(doc.pendingReason) ? doc.pendingReason : undefined,
       localRelPath: doc.localRelPath ?? null,
       customFolderId: doc.customFolderId ?? null,

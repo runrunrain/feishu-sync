@@ -103,6 +103,17 @@ describe('updateConfig 校验', () => {
     await manager.load();
   });
 
+  it('保存并重新加载一个提供商的多个协议地址', async () => {
+    const config = await manager.load();
+    config.llm.providers = [{ id: 'dual', name: 'Dual', enabled: true, protocol: 'openai-completions',
+      openAiCompatBaseUrl: 'https://example.com/v1', apiKey: 'test-key', protocolBaseUrls: { 'anthropic-messages': 'https://example.com/anthropic' },
+      models: [{ id: 'model', name: 'Model', openAiModel: 'model', enabled: true }] }];
+    await manager.updateConfig({ llm: config.llm });
+    const provider = (await manager.load()).llm.providers?.[0];
+    expect(provider?.protocol).toBe('openai-completions');
+    expect(provider?.protocolBaseUrls?.['anthropic-messages']).toBe('https://example.com/anthropic');
+  });
+
   it('切换 Claude 基座时保留 Pi 模型来源，拒绝未知基座', async () => {
     const base = (await manager.load()).agent;
     const updated = await manager.updateConfig({ agent: { ...base, runtime: { backend: 'claude-code', claudeCliPath: 'C:/tools/claude.exe' },

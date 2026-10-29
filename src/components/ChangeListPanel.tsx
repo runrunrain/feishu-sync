@@ -30,13 +30,14 @@ import { detectChanges, detectChangesAll, getStoredMappingDiff } from '../api/cl
 import type { ChangedDocument, DiffReport, SheetSub } from '../types';
 import { isUsableWikiUrl } from '../utils/wikiUrl';
 
-type Tab = 'all' | 'added' | 'modified' | 'mediaGap' | 'deleted';
+type Tab = 'all' | 'added' | 'modified' | 'mediaGap' | 'xlsxMissing' | 'deleted';
 
 const TAB_LABEL: Record<Tab, string> = {
   all: '全部',
   added: '新增',
   modified: '已修改',
   mediaGap: '图片缺失待修复',
+  xlsxMissing: 'XLSX 缺失待修复',
   deleted: '已删除',
 };
 
@@ -162,13 +163,17 @@ export function groupDiffChanges(diff: DiffReport | null) {
       added: [],
       modified: [],
       mediaGap: [],
+      xlsxMissing: [],
       deleted: [] as ChangedDocument[],
     };
   }
   const modifiedList: ChangedDocument[] = [];
   const mediaGapList: ChangedDocument[] = [];
+  const xlsxMissingList: ChangedDocument[] = [];
   for (const doc of diff.modified) {
-    if (doc.mediaGapReason) {
+    if (doc.xlsxMissing) {
+      xlsxMissingList.push(doc);
+    } else if (doc.mediaGapReason) {
       mediaGapList.push(doc);
     } else {
       modifiedList.push(doc);
@@ -178,6 +183,7 @@ export function groupDiffChanges(diff: DiffReport | null) {
     added: diff.added,
     modified: modifiedList,
     mediaGap: mediaGapList,
+    xlsxMissing: xlsxMissingList,
     deleted: diff.deleted,
   };
 }
@@ -188,9 +194,11 @@ export function computeSelectableDocs(
     added: ChangedDocument[];
     modified: ChangedDocument[];
     mediaGap: ChangedDocument[];
+    xlsxMissing?: ChangedDocument[];
     deleted: ChangedDocument[];
   },
 ): ChangedDocument[] {
+  if (tab === 'xlsxMissing') return grouped.xlsxMissing ?? [];
   if (tab === 'mediaGap') {
     return grouped.mediaGap;
   }
@@ -365,7 +373,7 @@ export function ChangeListPanel({
 
   const visibleChanges = useMemo(() => {
     if (tab === 'all') {
-      return [...grouped.added, ...grouped.modified, ...grouped.mediaGap, ...grouped.deleted];
+      return [...grouped.added, ...grouped.modified, ...grouped.mediaGap, ...grouped.xlsxMissing, ...grouped.deleted];
     }
     return grouped[tab];
   }, [tab, grouped]);
@@ -493,6 +501,7 @@ export function ChangeListPanel({
     grouped.added.length +
     grouped.modified.length +
     grouped.mediaGap.length +
+    grouped.xlsxMissing.length +
     grouped.deleted.length;
 
   if (totalChanges === 0) {
@@ -574,7 +583,7 @@ export function ChangeListPanel({
       <div className="shrink-0 px-4 py-2.5 sm:px-5 border-b border-line bg-paper/40 space-y-2.5">
         {/* Tabs 过滤 */}
         <div className="flex items-center gap-1.5 overflow-x-auto scrollbar-thin">
-          {(['all', 'added', 'modified', 'mediaGap', 'deleted'] as Tab[]).map((t) => {
+          {(['all', 'added', 'modified', 'mediaGap', 'xlsxMissing', 'deleted'] as Tab[]).map((t) => {
             const count = t === 'all' ? totalChanges : grouped[t].length;
             const isActive = tab === t;
             return (

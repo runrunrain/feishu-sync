@@ -6,13 +6,15 @@ export interface ResolvedProviderModel {
   baseUrl: string; apiKey: string; protocol: LlmProtocol;
   contextWindow?: number; maxTokens?: number; reasoning?: boolean;
 }
-export function resolveProviderModel(llm: Pick<LlmConfig, 'providers' | 'activeProviderId' | 'activeModelId'>, selection: ModelSelection = {}): ResolvedProviderModel | null {
+export function resolveProviderModel(llm: Pick<LlmConfig, 'providers' | 'activeProviderId' | 'activeModelId'>, selection: ModelSelection = {}, requiredProtocol?: LlmProtocol): ResolvedProviderModel | null {
   const providers = (llm.providers ?? []).filter((p) => p.enabled);
   const explicitProvider = selection.providerId?.trim();
   const provider = explicitProvider ? providers.find((p) => p.id === explicitProvider)
     : providers.find((p) => p.id === llm.activeProviderId) ?? providers[0];
-  if (!provider || !/^https?:\/\//i.test(provider.openAiCompatBaseUrl.trim())) return null;
-  const protocol = provider.protocol ?? 'openai-completions';
+  if (!provider) return null;
+  const protocol = requiredProtocol ?? provider.protocol ?? 'openai-completions';
+  const baseUrl = provider.protocolBaseUrls?.[protocol]?.trim() || (protocol === (provider.protocol ?? 'openai-completions') ? provider.openAiCompatBaseUrl.trim() : '');
+  if (!/^https?:\/\//i.test(baseUrl)) return null;
   if (!['openai-completions', 'openai-responses', 'anthropic-messages'].includes(protocol)) return null;
   const models = provider.models.filter((m) => m.enabled && m.openAiModel.trim());
   const explicitModel = selection.modelId?.trim();
@@ -23,7 +25,7 @@ export function resolveProviderModel(llm: Pick<LlmConfig, 'providers' | 'activeP
   const id = preset.openAiModel.trim();
   return { providerId: provider.id, providerName: provider.name, presetId: preset.id,
     openAiModel: /^glm-/i.test(id) ? id.replace(/\s*\[[^\]]+\]$/, '') : id,
-    baseUrl: provider.openAiCompatBaseUrl.trim(), apiKey: provider.apiKey.trim(), protocol,
+    baseUrl, apiKey: provider.apiKey.trim(), protocol,
     contextWindow: preset.contextWindow, maxTokens: preset.maxTokens, reasoning: preset.reasoning };
 }
 

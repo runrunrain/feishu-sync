@@ -45,6 +45,7 @@ import {
   type AgentWorkspaceConfig,
   type StandardKbConfig,
 } from '../types/agent-knowledge.js';
+import type { LlmProtocol } from '../types/index.js';
 import type {
   CliConfig,
   Config,
@@ -675,6 +676,8 @@ function normalizeProviderProfiles(
       name: stringValue(raw.name, `提供商 ${index + 1}`) || `提供商 ${index + 1}`,
       enabled: (typeof raw.enabled === 'boolean' ? raw.enabled : true) && (raw.protocol === undefined || LLM_PROTOCOLS.has(raw.protocol)),
       protocol: LLM_PROTOCOLS.has(raw.protocol!) ? raw.protocol : 'openai-completions',
+      protocolBaseUrls: raw.protocolBaseUrls && typeof raw.protocolBaseUrls === 'object'
+        ? Object.fromEntries([...LLM_PROTOCOLS].flatMap((protocol) => typeof raw.protocolBaseUrls?.[protocol as LlmProtocol] === 'string' ? [[protocol, raw.protocolBaseUrls[protocol as LlmProtocol]]] : [])) : undefined,
       apiKey: stringValue(raw.apiKey),
       openAiCompatBaseUrl: stringValue(raw.openAiCompatBaseUrl),
       defaultModelId: defaultModel?.id,

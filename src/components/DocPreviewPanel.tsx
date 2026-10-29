@@ -296,7 +296,7 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
           )}
 
           {/* 在系统文件管理器中打开本地文件 */}
-          {node.obj_type === 'sheet' && <button type="button" onClick={() => void handleRefreshSheet()} disabled={refreshingSheet || !node.local_path} className="inline-flex shrink-0 items-center gap-1 rounded-md border border-line bg-paper px-2 py-1.5 text-[11px] text-ink-soft hover:bg-paper-2 disabled:opacity-40"><RefreshCw className={`w-3 h-3 ${refreshingSheet ? 'animate-spin' : ''}`} />{refreshingSheet ? '获取中…' : '重新获取 Excel'}</button>}
+          {node.obj_type === 'sheet' && content && !content.workbook && ['legacy-csv', 'csv-fallback'].includes(content.sheetStatus?.acquisition ?? '') && <button type="button" onClick={() => void handleRefreshSheet()} disabled={refreshingSheet || !node.local_path} className="inline-flex shrink-0 items-center gap-1 rounded-md border border-line bg-paper px-2 py-1.5 text-[11px] text-ink-soft hover:bg-paper-2 disabled:opacity-40"><RefreshCw className={`w-3 h-3 ${refreshingSheet ? 'animate-spin' : ''}`} />{refreshingSheet ? '获取中…' : '重新获取 Excel'}</button>}
           <button
             type="button"
             onClick={handleOpenFolder}

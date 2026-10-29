@@ -149,7 +149,7 @@ export async function agentRoutes(deps: AgentRouteDeps): Promise<Hono> {
         return c.json({ items: status.model.available.map((piModel) => ({ source: 'pi-agent-dir', piModel, label: piModel, reasoning: true })), message: status.message });
       }
       const items = (config.llm.providers ?? []).flatMap((p) => p.models.map((m) => {
-        const resolved = resolveProviderModel(config.llm, { providerId: p.id, modelId: m.id });
+        const resolved = resolveProviderModel(config.llm, { providerId: p.id, modelId: m.id }, c.req.query('backend') === 'claude-code' ? 'anthropic-messages' : undefined);
         return resolved?.apiKey && (c.req.query('backend') !== 'claude-code' || resolved.protocol === 'anthropic-messages') ? { source: 'app-llm', providerId: p.id, modelId: m.id, label: `${p.name} / ${m.name}`, reasoning: m.reasoning === true } : null;
       }).filter(Boolean));
       return c.json({ items, message: items.length ? '' : c.req.query('backend') === 'claude-code' ? '请先配置 Anthropic Messages 兼容的提供商和模型' : '尚无已配置的模型，请先添加服务提供商与预设' });
@@ -176,7 +176,7 @@ export async function agentRoutes(deps: AgentRouteDeps): Promise<Hono> {
       if (m.source === 'app-llm') {
         if (typeof m.providerId !== 'string' || typeof m.modelId !== 'string') throw new ToolError('invalid_request', '请选择服务提供商和模型预设');
         model.providerId = m.providerId; model.modelId = m.modelId;
-        const resolved = resolveProviderModel(config.llm, model);
+        const resolved = resolveProviderModel(config.llm, model, sessionBackend === 'claude-code' ? 'anthropic-messages' : undefined);
         if (!resolved?.apiKey) throw new ToolError('invalid_request', '模型已删除、停用或缺少认证，请刷新列表');
         if (sessionBackend === 'claude-code' && resolved.protocol !== 'anthropic-messages') throw new ToolError('invalid_request', 'Claude Code 需要 Anthropic Messages 兼容的提供商');
         if (!resolved.reasoning && model.thinkingLevel !== 'off') throw new ToolError('invalid_request', '该模型预设未启用思考能力');

@@ -240,7 +240,8 @@ export function AgentRuntimeSettingsCard() {
     : null;
   const ready = agentStatus.status?.code === 'ready' && !agentStatus.unreachable;
 
-  const providers = useMemo(() => (config?.llm.providers ?? []).filter((p) => p.enabled && p.apiKey?.trim() && /^https?:\/\//i.test(p.openAiCompatBaseUrl) && p.models.some((m) => m.enabled && m.openAiModel.trim())), [config?.llm.providers]);
+  const providers = useMemo(() => (config?.llm.providers ?? []).filter((p) => p.enabled && p.apiKey?.trim() && (/^https?:\/\//i.test(p.openAiCompatBaseUrl) || Object.values(p.protocolBaseUrls ?? {}).some((url) => /^https?:\/\//i.test(url ?? ''))) && p.models.some((m) => m.enabled && m.openAiModel.trim())), [config?.llm.providers]);
+  const supportsClaude = (p: typeof providers[number]) => /^https?:\/\//i.test(p.protocolBaseUrls?.['anthropic-messages'] || (p.protocol === 'anthropic-messages' ? p.openAiCompatBaseUrl : ''));
   const visionSelectedProvider = providers.find((p) => p.id === visionProviderId);
   const currentProviderId = agent?.model?.providerId || config?.llm.activeProviderId || '';
   const selectedProvider = providers.find((p) => p.id === currentProviderId);
@@ -382,7 +383,9 @@ export function AgentRuntimeSettingsCard() {
       {/* 模型来源 */}
       <div>
         <FieldLabel>模型来源</FieldLabel>
-        <div className="grid grid-cols-2 gap-2">
+        {backend === 'claude-code' ? (
+          <p className="rounded-md border border-line px-3 py-2 text-xs text-ink">应用内服务提供商</p>
+        ) : <div className="grid grid-cols-2 gap-2">
           <label
             className={`flex items-center gap-2 px-3 py-2 rounded-md border cursor-pointer text-xs ${
               source === 'app-llm' ? 'border-seal/50 bg-[rgba(158,43,37,0.05)] text-ink' : 'border-line text-ink-soft hover:bg-paper'
@@ -392,7 +395,7 @@ export function AgentRuntimeSettingsCard() {
               type="radio"
               name="agent-model-source"
               checked={source === 'app-llm'}
-              disabled={saving || backend === 'claude-code'}
+              disabled={saving}
               onChange={() => saveAgent({ model: { source: 'app-llm' } })}
               className="accent-[#9e2b25]"
             />
@@ -407,13 +410,13 @@ export function AgentRuntimeSettingsCard() {
               type="radio"
               name="agent-model-source"
               checked={source === 'pi-agent-dir'}
-              disabled={saving || backend === 'claude-code'}
+              disabled={saving}
               onChange={() => saveAgent({ model: { source: 'pi-agent-dir' } })}
               className="accent-[#9e2b25]"
             />
             本地 Agent 配置（Pi）
           </label>
-        </div>
+        </div>}
       </div>
 
       {source === 'app-llm' ? (
@@ -427,14 +430,14 @@ export function AgentRuntimeSettingsCard() {
               aria-label="选择提供商"
             >
               <option value="">（跟随应用默认）</option>
-              {currentProviderId && (!selectedProvider || (backend === 'claude-code' && selectedProvider.protocol !== 'anthropic-messages')) ? <option value={currentProviderId} disabled>原提供商不可用或协议不兼容，请重新选择</option> : null}
-              {providers.filter((p) => backend !== 'claude-code' || p.protocol === 'anthropic-messages').map((p) => (
+              {currentProviderId && (!selectedProvider || (backend === 'claude-code' && !supportsClaude(selectedProvider))) ? <option value={currentProviderId} disabled>原提供商不可用或协议不兼容，请重新选择</option> : null}
+              {providers.filter((p) => backend !== 'claude-code' || supportsClaude(p)).map((p) => (
                 <option key={p.id} value={p.id}>
-                  {p.name} · {p.protocol === 'anthropic-messages' ? 'Anthropic' : p.protocol === 'openai-responses' ? 'Responses' : 'Chat Completions'}
+                  {p.name} · {backend === 'claude-code' || p.protocol === 'anthropic-messages' ? 'Anthropic' : p.protocol === 'openai-responses' ? 'Responses' : 'Chat Completions'}
                 </option>
               ))}
             </select>
-            {providers.filter((p) => backend !== 'claude-code' || p.protocol === 'anthropic-messages').length === 0 ? (
+            {providers.filter((p) => backend !== 'claude-code' || supportsClaude(p)).length === 0 ? (
               <p className="mt-1 text-[11px] text-ink-faint">{backend === 'claude-code' ? '请配置 Anthropic Messages 兼容的提供商、API Key 和模型。' : '尚无可用提供商，请在「服务提供商与模型」中配置端点、API Key 并启用模型。'}</p>
             ) : null}
           </div>
