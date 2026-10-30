@@ -79,6 +79,7 @@ import { LarkCliError } from './lark-cli-client.js';
 // 清单来自 lark-cli-manager 的注册表（无循环依赖：manager 不回依赖本模块）。
 import { optionalScopesForFeature } from './lark-cli-manager.js';
 import { stageSourceWorkbook, WorkbookAcquisitionError, readReconstructedSheetCsv } from './sheet-workbook.js';
+import { renderWorkbookAttachments } from './sheet-attachments.js';
 import { managedWorkbookCompanions } from './workbook-source.js';
 // P0-S8：白板旁路导出链自 S6 方法体提炼为共享纯函数——downloadImages、
 // backfillWhiteboardBypass 与 custom-doc-sync（归档链）复用同一实现，
@@ -1026,7 +1027,7 @@ export class SyncEngine {
         title: doc.title,
         originalLink: headerMeta.originalLink,
         observedObjEditTime: doc.observedObjEditTime ?? null,
-        bodyMarkdown: finalContent,
+        bodyMarkdown: finalContent + renderWorkbookAttachments(workbook?.attachments ?? []),
         workbook: workbook ? { relativePath: workbook.relativePath, metadataRelativePath: workbook.metadataRelativePath, mode: workbook.mode } : undefined,
         sheetFallback,
         previousWorkbook: sheetFallback && managedWorkbookCompanions(localMdPath).length ? `${docname}.xlsx` : undefined,
@@ -1043,6 +1044,7 @@ export class SyncEngine {
           })),
         ],
         attachments: [
+          ...(workbook?.attachments ?? []),
           ...attachments.map((att) => ({
             relativePath: `attachments/${path.basename(att.path)}`,
             name: att.name,
@@ -1066,6 +1068,10 @@ export class SyncEngine {
       };
       const extraFiles: Array<{ relativePath: string; absoluteSource: string }> = [];
       if (workbook) {
+        for (const attachment of workbook.attachments) extraFiles.push({
+          relativePath: relativeDir ? `${relativeDir}/${attachment.relativePath}` : attachment.relativePath,
+          absoluteSource: path.join(stagingDocDir, ...attachment.relativePath.split('/')),
+        });
         extraFiles.push({
           relativePath: relativeDir ? `${relativeDir}/${workbook.relativePath}` : workbook.relativePath,
           absoluteSource: workbook.absolutePath,

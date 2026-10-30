@@ -201,7 +201,56 @@ describe('native workbook source and authorized read reconstruction', () => {
     expect(fs.existsSync(output)).toBe(false);
   });
 
-  it('explains why attachments cannot be silently omitted from a reconstruction', async () => {
+  it('preserves link text and records unavailable targets instead of rejecting the workbook', async () => {
+    const { client } = readClient(), get = client.getSheetCells;
+    client.getSheetCells = async (options) => {
+      const result = await get(options);
+      result.data.ranges[0].cells[0][0] = { value: '迁移到草稿', rich_text: [
+        { type: 'text', text: '迁移到' }, { type: 'link', text: '草稿' },
+      ] };
+      result.data.ranges[0].cells[0][1] = { value: '日志', rich_text: [{ type: 'link', text: '日志', link: '' }] };
+      return result;
+    };
+    const file = path.join(temporary(), 'links.xlsx');
+    const manifest = await reconstructWorkbookFromReads(client, 'token', file);
+    expect(manifest.approximations?.filter((a) => a.kind === 'link-target-unavailable')).toHaveLength(2);
+    const saved = new ExcelJS.Workbook(); await saved.xlsx.readFile(file);
+    expect(saved.worksheets[0].getCell('A1').text).toBe('迁移到草稿');
+    expect(saved.worksheets[0].getCell('A1').note).toContain('未返回跳转地址');
+    expect(saved.worksheets[0].getCell('B1').text).toBe('日志');
+    expect(saved.worksheets[0].getCell('B1').hyperlink).toBeUndefined();
+    fs.writeFileSync(`${file}.metadata.json`, JSON.stringify(manifest));
+    expect((await readWorkbookPreview(file, 0)).sheet.warnings).toContain('部分内部链接未返回跳转地址，已保留文字；跳转请查看飞书原文。');
+  });
+
+  it('maps zero row heights and column widths to hidden dimensions without losing cells', async () => {
+    const { client } = readClient(), layout = client.getSheetLayout;
+    client.getSheetLayout = async (options) => {
+      const result = await layout(options);
+      result.data.row_heights[0].height = 0;
+      result.data.column_widths[0].width = 0;
+      result.data.hidden_rows = [3]; result.data.hidden_columns = [3];
+      return result;
+    };
+    const file = path.join(temporary(), 'hidden.xlsx');
+    await reconstructWorkbookFromReads(client, 'token', file);
+    const preview = await readWorkbookPreview(file, 0);
+    expect(preview.sheet.rows.slice(0, 3)).toEqual([0, 0, 32]);
+    expect(preview.sheet.columns.slice(0, 3)).toEqual([0, 0, 120]);
+    expect(preview.sheet.rows[3]).toBe(0);
+    expect(preview.sheet.columns[3]).toBe(0);
+    const saved = new ExcelJS.Workbook(); await saved.xlsx.readFile(file);
+    expect(saved.worksheets[0].getCell('A1').text).toBe('完整说明文字');
+    expect(saved.worksheets[0].getCell('B2').formula).toBe('2+2');
+  });
+
+  it.each([-1, Number.NaN, Number.POSITIVE_INFINITY])('still rejects invalid dimension %s', async (size) => {
+    const { client } = readClient(), layout = client.getSheetLayout;
+    client.getSheetLayout = async (options) => { const result = await layout(options); result.data.row_heights[0].height = size; return result; };
+    await expect(reconstructWorkbookFromReads(client, 'token', path.join(temporary(), 'invalid.xlsx'))).rejects.toThrow('行高信息');
+  });
+
+  it('does not silently omit an attachment when neither download nor preview has the source bytes', async () => {
     const { client } = readClient();
     const get = client.getSheetCells;
     client.getSheetCells = async (options) => {
@@ -212,8 +261,50 @@ describe('native workbook source and authorized read reconstruction', () => {
       return result;
     };
     const output = path.join(temporary(), 'rejected.xlsx');
-    await expect(reconstructWorkbookFromReads(client, 'token', output)).rejects.toThrow('含附件，当前无法完整还原附件原件');
+    await expect(reconstructWorkbookFromReads(client, 'token', output)).rejects.toThrow('附件“数据.json”未完整获取');
     expect(fs.existsSync(output)).toBe(false);
+  });
+
+  it('commits verified source attachments alongside custom workbooks and exposes local links', async () => {
+    const { client } = readClient(), get = client.getSheetCells, download = client.downloadMedia;
+    const bytes = Buffer.from('{"data":"附件内容"}');
+    client.getSheetCells = async (options) => {
+      const result = await get(options);
+      const attachment = { type: 'attachment', text: '数据.json', attachment_token: 'file-token', file_size: bytes.length, mime_type: 'application/json' };
+      result.data.ranges[0].cells[0][0] = { value: '数据.json', rich_text: [attachment] };
+      result.data.ranges[0].cells[0][1] = { value: '参见数据.json', note: '原始批注', rich_text: [{ type: 'text', text: '参见' }, attachment] };
+      return result;
+    };
+    client.downloadMedia = async (token, target, type) => {
+      if (token === 'file-token') throw new Error('export denied');
+      return download(token, target, type);
+    };
+    client.previewMedia = vi.fn(async (_token, target) => { fs.writeFileSync(`${target}.json`, bytes); return `${target}.json`; });
+    const root = temporary();
+    const result = await syncSheetToCustomFolder({
+      larkCliClient: { ...client, getSheetCsv: vi.fn() }, knowledgeBaseRoot: root, operationDirectory: temporary(),
+      localMdPath: path.join(root, 'Doc.md'), objToken: 'token', wikiNodeToken: null, title: 'Doc', originalLink: null, objEditTime: 41, spaceId: null,
+    });
+    const manifest = JSON.parse(fs.readFileSync(path.join(root, 'Doc.xlsx.metadata.json'), 'utf8'));
+    const attachment = manifest.attachments[0];
+    expect(manifest.attachments).toHaveLength(2);
+    expect(client.previewMedia).toHaveBeenCalledTimes(1);
+    expect(attachment.acquisition).toBe('preview');
+    const localAttachment = path.join(root, ...attachment.relativePath.split('/'));
+    expect(fs.readFileSync(localAttachment)).toEqual(bytes);
+    expect(result.committedFiles).toContain(localAttachment);
+    expect(result.committedFiles.filter((file) => file === localAttachment)).toHaveLength(1);
+    expect(fs.readFileSync(result.localMdPath, 'utf8')).toContain('## 表格附件');
+    const saved = new ExcelJS.Workbook(); await saved.xlsx.readFile(path.join(root, 'Doc.xlsx'));
+    expect(saved.worksheets[0].getCell('A1').hyperlink).toBe(attachment.relativePath);
+    expect(saved.worksheets[0].getCell('B1').text).toBe('参见数据.json');
+    expect(saved.worksheets[0].getCell('B1').note).toContain('原始批注');
+    expect(saved.worksheets[0].getCell('B1').note).toContain(attachment.relativePath);
+    const originalHash = computeSourceHash(result.localMdPath, [], root);
+    fs.appendFileSync(localAttachment, 'changed');
+    expect(computeSourceHash(result.localMdPath, [], root)).not.toBe(originalHash);
+    fs.unlinkSync(localAttachment);
+    expect(() => computeSourceHash(result.localMdPath, [], root)).toThrow();
   });
 
   it('splits truncated read windows and accepts only complete row/column coordinates', async () => {

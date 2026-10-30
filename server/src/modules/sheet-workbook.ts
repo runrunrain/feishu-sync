@@ -5,7 +5,8 @@ import ExcelJS from 'exceljs';
 import JSZip from 'jszip';
 import * as SSF from 'ssf';
 import crypto from 'node:crypto';
-import { reconstructWorkbookFromReads, type WorkbookReadClient } from './sheet-read-reconstruction.js';
+import { reconstructWorkbookFromReads, type WorkbookReadClient, type WorkbookReadManifest } from './sheet-read-reconstruction.js';
+import type { WorkbookAttachment } from './sheet-attachments.js';
 import { workbookPathForMarkdown } from './workbook-source.js';
 import { measureSyncPhase } from './sync-performance.js';
 export { workbookPathForMarkdown } from './workbook-source.js';
@@ -65,6 +66,7 @@ export async function stageSourceWorkbook(
   metadataPath: string; metadataRelativePath: string;
   mode: 'native' | 'read-reconstruction';
   revision?: number | string;
+  attachments: WorkbookAttachment[];
 }> {
   if (typeof client.exportWorkbook !== 'function') {
     throw new Error('当前 lark-cli 客户端不支持 Excel 原件导出，请更新应用和 lark-cli 后重试');
@@ -115,7 +117,12 @@ export async function stageSourceWorkbook(
     schemaVersion: 1, objToken: spreadsheetToken, ...details, mode,
     sha256: crypto.createHash('sha256').update(fs.readFileSync(absolutePath)).digest('hex'),
   }, null, 2), 'utf-8');
-  return { absolutePath, relativePath, metadataPath, metadataRelativePath, mode, revision: (details as { revision?: number | string }).revision };
+  return { absolutePath, relativePath, metadataPath, metadataRelativePath, mode,
+    revision: (details as Partial<WorkbookReadManifest>).revision,
+    // Several cells may refer to the same file. A commit plan must write each
+    // destination once, otherwise a second backup can break rollback.
+    attachments: [...new Map(((details as Partial<WorkbookReadManifest>).attachments ?? [])
+      .map((attachment) => [attachment.relativePath, attachment])).values()] };
 }
 
 const DEFAULT_THEME = ['FFFFFF', '000000', 'E7E6E6', '44546A', '4472C4', 'ED7D31', 'A5A5A5', 'FFC000', '5B9BD5', '70AD47', '0563C1', '954F72'];
@@ -296,6 +303,23 @@ export async function readWorkbookPreview(absolutePath: string, sheetIndex: numb
   const sheet = workbook.worksheets[sheetIndex];
   if (!sheet) throw new RangeError('工作表不存在');
   const warnings = [...commonWarnings];
+  // Surface representation differences in the normal preview, not just in a
+  // machine-readable sidecar or Excel cell notes.
+  const metadataPath = `${absolutePath}.metadata.json`;
+  try {
+    const stat = fs.lstatSync(metadataPath);
+    if (stat.isFile() && !stat.isSymbolicLink() && stat.size < 8 * 1024 * 1024) {
+      const metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
+      const notes = Array.isArray(metadata.approximations)
+        ? metadata.approximations.filter((entry: { sheet?: string }) => entry?.sheet === sheet.name) : [];
+      if (notes.some((entry: { kind?: string }) => entry.kind === 'link-target-unavailable')) {
+        warnings.push('部分内部链接未返回跳转地址，已保留文字；跳转请查看飞书原文。');
+      }
+      if (notes.some((entry: { kind?: string }) => entry.kind === 'attachment-json-preview')) {
+        warnings.push('部分 JSON 附件保存为云端预览副本，非原件字节副本；请在 Markdown 的“表格附件”中查看。');
+      }
+    }
+  } catch { /* Native or historical workbooks may have no readable sidecar. */ }
   const images = sheet.getImages().map((image) => ({ ...image, range: image.range as NativeImageRange }));
   // ExcelJS's declared WorksheetModel omits rows and conditionalFormattings.
   const model = sheet.model as ExcelJS.WorksheetModel & {

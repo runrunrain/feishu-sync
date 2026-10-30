@@ -5,6 +5,7 @@ import ExcelJS from 'exceljs';
 import JSZip from 'jszip';
 import { downloadSheetMedia, parseSheetFloatImages, type SheetMediaDownloadClient } from './sheet-media.js';
 import { addPieChart } from './sheet-chart-reconstruction.js';
+import { downloadWorkbookAttachment, type WorkbookAttachment, type PendingWorkbookAttachment } from './sheet-attachments.js';
 
 type JsonObject = Record<string, any>;
 export interface WorkbookReadClient extends SheetMediaDownloadClient {
@@ -20,6 +21,7 @@ export interface WorkbookReadManifest {
   revision: number | string;
   sheets: Array<{ id: string; name: string; rows: number; columns: number; cells: number; merges: number; images: number }>;
   approximations?: Array<{ sheet: string; cell?: string; kind: string; detail: unknown }>;
+  attachments?: WorkbookAttachment[];
 }
 
 function payload(response: JsonObject): JsonObject {
@@ -86,6 +88,7 @@ function applyCell(
   formulaRaw: JsonObject,
   approximations: NonNullable<WorkbookReadManifest['approximations']>,
   embeddedImages: EmbeddedCellImage[],
+  attachments: PendingWorkbookAttachment[],
 ) {
   const styles = raw.cell_styles ?? {};
   const formulaValue = formulaRaw.formula ?? formulaRaw.value;
@@ -112,7 +115,7 @@ function applyCell(
       detail: { width: image.image_width, height: image.image_height } });
     cell.value = null;
   } else if (Array.isArray(raw.rich_text) && raw.rich_text.length === 1 && raw.rich_text[0].type === 'link'
-    && typeof raw.rich_text[0].link === 'string') {
+    && typeof raw.rich_text[0].link === 'string' && raw.rich_text[0].link.trim()) {
     cell.value = { text: String(raw.rich_text[0].text ?? value ?? raw.rich_text[0].link), hyperlink: raw.rich_text[0].link };
   } else if (Array.isArray(raw.rich_text) && raw.rich_text.length > 0) {
     if (typeof value === 'string' && raw.rich_text.every((run: JsonObject) => typeof run.text === 'string')
@@ -122,10 +125,18 @@ function applyCell(
     const runs: ExcelJS.RichText[] = [];
     for (const run of raw.rich_text) {
       if (run.type === 'attachment') {
-        throw new Error(`单元格 ${cell.address} 含附件，当前无法完整还原附件原件；请取得工作簿导出权限后重试`);
+        if (typeof run.text !== 'string' || typeof run.attachment_token !== 'string'
+          || !/^[A-Za-z0-9_-]{1,128}$/.test(run.attachment_token)
+          || !Number.isSafeInteger(run.file_size) || run.file_size < 0) {
+          throw new Error(`单元格 ${cell.address} 的附件名称、标识或大小缺失`);
+        }
+        attachments.push({ sheet: cell.worksheet.name, cell: cell.address, name: run.text,
+          token: run.attachment_token, size: run.file_size, mimeType: run.mime_type,
+          single: raw.rich_text.length === 1 });
+        runs.push({ text: run.text, font: excelFont({ ...styles, ...run.style }) });
+        continue;
       }
-      if (!['text', 'mention', 'link'].includes(run.type) || typeof run.text !== 'string'
-        || (run.type === 'link' && (typeof run.link !== 'string' || !run.link))) {
+      if (!['text', 'mention', 'link'].includes(run.type) || typeof run.text !== 'string') {
         throw new Error(`单元格 ${cell.address} 包含尚不能完整重建的富文本对象 (${run.type ?? '未知类型'})`);
       }
       if (run.type === 'mention') approximations.push({ sheet: cell.worksheet.name, cell: cell.address, kind: 'mention', detail: { ...run } });
@@ -133,8 +144,10 @@ function applyCell(
       // links cannot be represented without changing its meaning. Keep the
       // text and styles in Excel and the individual targets in the sidecar.
       if (run.type === 'link') {
-        approximations.push({ sheet: cell.worksheet.name, cell: cell.address, kind: 'inline-link-metadata', detail: { ...run } });
-        inlineLinks.push({ text: run.text, link: run.link });
+        const target = typeof run.link === 'string' && run.link.trim() ? run.link : null;
+        approximations.push({ sheet: cell.worksheet.name, cell: cell.address,
+          kind: target ? 'inline-link-metadata' : 'link-target-unavailable', detail: { ...run } });
+        inlineLinks.push({ text: run.text, link: target ?? '云端读取接口未返回跳转地址，请在飞书原文查看' });
       }
       runs.push({ text: run.text, font: excelFont({ ...styles, ...run.style }) });
     }
@@ -189,6 +202,7 @@ async function readWindow(
   client: WorkbookReadClient, token: string, sheetId: string, revision: number | string,
   window: Window, worksheet: ExcelJS.Worksheet, approximations: NonNullable<WorkbookReadManifest['approximations']>,
   sizing: { rows: number; columns: number }, embeddedImages: EmbeddedCellImage[],
+  attachments: PendingWorkbookAttachment[],
 ): Promise<number> {
   const range = `${columnLetters(window.left)}${window.top}:${columnLetters(window.right)}${window.bottom}`;
   const values = payload(await client.getSheetCells({ spreadsheetToken: token, sheetId, range, revision }));
@@ -203,14 +217,14 @@ async function readWindow(
     if (window.bottom > window.top) {
       const mid = (window.top + window.bottom) >>> 1;
       sizing.rows = Math.min(sizing.rows, mid - window.top + 1);
-      return await readWindow(client, token, sheetId, revision, { ...window, bottom: mid }, worksheet, approximations, sizing, embeddedImages)
-        + await readWindow(client, token, sheetId, revision, { ...window, top: mid + 1 }, worksheet, approximations, sizing, embeddedImages);
+      return await readWindow(client, token, sheetId, revision, { ...window, bottom: mid }, worksheet, approximations, sizing, embeddedImages, attachments)
+        + await readWindow(client, token, sheetId, revision, { ...window, top: mid + 1 }, worksheet, approximations, sizing, embeddedImages, attachments);
     }
     if (window.right > window.left) {
       const mid = (window.left + window.right) >>> 1;
       sizing.columns = Math.min(sizing.columns, mid - window.left + 1);
-      return await readWindow(client, token, sheetId, revision, { ...window, right: mid }, worksheet, approximations, sizing, embeddedImages)
-        + await readWindow(client, token, sheetId, revision, { ...window, left: mid + 1 }, worksheet, approximations, sizing, embeddedImages);
+      return await readWindow(client, token, sheetId, revision, { ...window, right: mid }, worksheet, approximations, sizing, embeddedImages, attachments)
+        + await readWindow(client, token, sheetId, revision, { ...window, left: mid + 1 }, worksheet, approximations, sizing, embeddedImages, attachments);
     }
     throw new Error(`单元格 ${range} 读取仍被截断，不能确认完整同步`);
   }
@@ -220,7 +234,7 @@ async function readWindow(
       if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error(`单元格响应无效: ${range}`);
       if (Object.keys(raw).length === 0) return;
       const cell = worksheet.getCell(values.ranges[0].row_indices[rowIndex], columnNumber(values.ranges[0].col_indices[colIndex]));
-      applyCell(cell, raw, formulas.ranges[0].cells[rowIndex][colIndex], approximations, embeddedImages);
+      applyCell(cell, raw, formulas.ranges[0].cells[rowIndex][colIndex], approximations, embeddedImages, attachments);
       if (cell.value != null) nonEmpty++;
     });
   });
@@ -235,27 +249,38 @@ function applyLayout(worksheet: ExcelJS.Worksheet, layout: JsonObject, rows: num
   }
   for (const band of layout.row_heights) {
     const [start, end] = dimensions(band.rows);
-    if (!Number.isFinite(band.height) || band.height <= 0 || end > rows) throw new Error('行高信息不完整或越界');
-    for (let row = start; row <= end; row++) { worksheet.getRow(row).height = band.height * 0.75; rowCoverage.add(row); }
+    if (!Number.isFinite(band.height) || band.height < 0 || end > rows) throw new Error('行高信息不完整或越界');
+    for (let row = start; row <= end; row++) {
+      // Feishu uses a zero dimension for collapsed/hidden rows and columns.
+      // ExcelJS serializes zero height as default, so also set the hidden flag.
+      worksheet.getRow(row).height = band.height * 0.75;
+      if (band.height === 0) worksheet.getRow(row).hidden = true;
+      rowCoverage.add(row);
+    }
   }
   for (const band of layout.column_widths) {
     const [start, end] = dimensions(band.cols, true);
-    if (!Number.isFinite(band.width) || band.width <= 0 || end > columns) throw new Error('列宽信息不完整或越界');
+    if (!Number.isFinite(band.width) || band.width < 0 || end > columns) throw new Error('列宽信息不完整或越界');
     for (let column = start; column <= end; column++) {
       // OOXML stores the padded width, not the character count shown in the
       // Excel column-width dialog. Calibri 11 has a 7px maximum digit width.
       worksheet.getColumn(column).width = Math.floor(band.width / 7 * 256) / 256;
+      if (band.width === 0) worksheet.getColumn(column).hidden = true;
       colCoverage.add(column);
     }
   }
   if (rowCoverage.size !== rows || colCoverage.size !== columns) throw new Error(`工作表 ${worksheet.name} 的行高或列宽未覆盖完整范围`);
   for (const hidden of layout.hidden_rows) {
-    const [start, end] = dimensions(typeof hidden === 'string' ? hidden : hidden.rows);
+    // The read API returns numeric hidden indices as zero-based coordinates;
+    // older fixtures/clients use one-based A1 range strings.
+    const [start, end] = typeof hidden === 'number' ? dimensions(String(hidden + 1))
+      : dimensions(typeof hidden === 'string' ? hidden : hidden.rows);
     if (end > rows) throw new Error('隐藏行范围越界');
     for (let row = start; row <= end; row++) worksheet.getRow(row).hidden = true;
   }
   for (const hidden of layout.hidden_columns) {
-    const [start, end] = dimensions(typeof hidden === 'string' ? hidden : hidden.cols, true);
+    const [start, end] = typeof hidden === 'number' ? dimensions(String(hidden + 1))
+      : dimensions(typeof hidden === 'string' ? hidden : hidden.cols, true);
     if (end > columns) throw new Error('隐藏列范围越界');
     for (let column = start; column <= end; column++) worksheet.getColumn(column).hidden = true;
   }
@@ -288,7 +313,8 @@ export async function reconstructWorkbookFromReads(
   if (!Array.isArray(info.sheets) || !info.sheets.length || info.revision == null) throw new Error('工作簿清单或版本号缺失，无法完整重建 Excel');
   const workbook = new ExcelJS.Workbook();
   workbook.creator = 'feishu-sync';
-  const manifest: WorkbookReadManifest = { mode: 'read-reconstruction', revision: info.revision, sheets: [], approximations: [] };
+  const manifest: WorkbookReadManifest = { mode: 'read-reconstruction', revision: info.revision, sheets: [], approximations: [], attachments: [] };
+  const attachments: PendingWorkbookAttachment[] = [];
   let totalCells = 0;
   for (const source of [...info.sheets].sort((a, b) => Number(a.index ?? 0) - Number(b.index ?? 0))) {
     if (source.resource_type !== 'sheet') throw new Error(`工作表类型缺失或包含非网格工作表，无法完整重建: ${source.sheet_name}`);
@@ -323,7 +349,7 @@ export async function reconstructWorkbookFromReads(
       for (let left = 1; left <= columns;) {
         const right = Math.min(columns, left + sizing.columns - 1);
         cells += await readWindow(client, token, source.sheet_id, info.revision,
-          { top, left, bottom, right }, worksheet, manifest.approximations!, sizing, embeddedImages);
+          { top, left, bottom, right }, worksheet, manifest.approximations!, sizing, embeddedImages, attachments);
         left = right + 1;
       }
       top = bottom + 1;
@@ -392,6 +418,24 @@ export async function reconstructWorkbookFromReads(
     }
     manifest.sheets.push({ id: source.sheet_id, name: worksheet.name, rows, columns, cells, merges: layout.merged_cells.length, images: imageCount });
     console.info(`[sheet-workbook] Rebuilt sheet ${worksheet.name}: ${cells} populated cells, ${layout.merged_cells.length} merges, ${imageCount} images.`);
+  }
+  const attachmentCache = new Map<string, WorkbookAttachment>();
+  for (const pending of attachments) {
+    const key = `${pending.token}:${pending.size}:${pending.name}`;
+    const cached = attachmentCache.get(key);
+    const attachment = cached ? { ...cached, sheet: pending.sheet, cell: pending.cell }
+      : await downloadWorkbookAttachment(client, pending, path.dirname(outputPath));
+    attachmentCache.set(key, attachment);
+    manifest.attachments!.push(attachment);
+    const cell = workbook.getWorksheet(pending.sheet)!.getCell(pending.cell);
+    if (pending.single) cell.value = { text: pending.name, hyperlink: attachment.relativePath };
+    cell.note = [typeof cell.note === 'string' ? cell.note : '',
+      `本地附件：${pending.name}\n${attachment.relativePath}`,
+      attachment.representation === 'json-preview' ? 'JSON 预览副本：云端返回内容大小与原件记录不同，非原件字节副本。' : '',
+    ].filter(Boolean).join('\n\n');
+    manifest.approximations!.push({ sheet: pending.sheet, cell: pending.cell,
+      kind: attachment.representation === 'json-preview' ? 'attachment-json-preview' : 'attachment-local-file',
+      detail: { relativePath: attachment.relativePath, sha256: attachment.sha256, sourceSize: attachment.sourceSize, savedSize: attachment.size } });
   }
   const finalInfo = payload(await client.getWorkbookInfo(token, true));
   assertRevision(finalInfo, info.revision);

@@ -57,6 +57,7 @@ import type { DocumentIR } from './document-ir.js';
 import { BitableExporter, type BitableClient } from './bitable-exporter.js';
 import { LarkCliError } from './lark-cli-client.js';
 import { stageSourceWorkbook, WorkbookAcquisitionError, readReconstructedSheetCsv } from './sheet-workbook.js';
+import { renderWorkbookAttachments } from './sheet-attachments.js';
 import { managedWorkbookCompanions } from './workbook-source.js';
 // P0-S8：白板旁路导出（svg 主 + raw 降级）与 SyncEngine 同一导出链
 // （whiteboard-bypass.ts 共享函数，S6 报告 §五遗留接入；见该模块头）。
@@ -491,7 +492,7 @@ async function syncSheetToCustomFolderImpl(input: SyncSheetToCustomFolderInput):
       }
       sections.push(section);
     }
-    const bodyMarkdown = sections.join('\n\n---\n\n');
+    const bodyMarkdown = sections.join('\n\n---\n\n') + renderWorkbookAttachments(workbook?.attachments ?? []);
 
     // 4. Build the DocumentIR and commit atomically. content-commit stages
     // each ir.sheets[].csvContent itself; float images ride the extraFiles
@@ -513,7 +514,7 @@ async function syncSheetToCustomFolderImpl(input: SyncSheetToCustomFolderInput):
         relativePath: image.localRelPath,
         token: image.token,
       })),
-      attachments: [],
+      attachments: workbook?.attachments ?? [],
       sheets: exported.map((sheet) => ({
         sheetId: sheet.sheetId,
         title: sheet.title,
@@ -529,6 +530,10 @@ async function syncSheetToCustomFolderImpl(input: SyncSheetToCustomFolderInput):
       relativePath: docDirRel ? `${docDirRel}/${workbook.metadataRelativePath}` : workbook.metadataRelativePath,
       absoluteSource: workbook.metadataPath,
     }] : [];
+    for (const attachment of workbook?.attachments ?? []) extraFiles.push({
+      relativePath: docDirRel ? `${docDirRel}/${attachment.relativePath}` : attachment.relativePath,
+      absoluteSource: path.join(csvTemp, ...attachment.relativePath.split('/')),
+    });
     for (const image of sheetMediaImages) {
       extraFiles.push({
         relativePath: docDirRel
@@ -558,7 +563,8 @@ async function syncSheetToCustomFolderImpl(input: SyncSheetToCustomFolderInput):
 
     const committedFiles: string[] = [input.localMdPath, ...(workbook ? [
       path.join(path.dirname(input.localMdPath), workbook.relativePath),
-      path.join(path.dirname(input.localMdPath), workbook.metadataRelativePath)] : [])];
+      path.join(path.dirname(input.localMdPath), workbook.metadataRelativePath),
+      ...workbook.attachments.map((item) => path.join(path.dirname(input.localMdPath), ...item.relativePath.split('/')))] : [])];
     for (const sheet of exported) {
       committedFiles.push(path.join(path.dirname(input.localMdPath), ...sheet.csvRel.split('/')));
     }

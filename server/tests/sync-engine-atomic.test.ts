@@ -177,7 +177,7 @@ describe('SyncEngine atomic apply path', () => {
     expect(fs.readFileSync(path.join(kb, '策划 - Designer', '表格.csv-data', '主表.csv'), 'utf8')).toContain('1,2');
   });
 
-  it('keeps a CSV fallback in the repair list until a later sync commits an Excel workbook', async () => {
+  it.each(['image', 'attachment'])('keeps a CSV fallback in the repair list until a later sync commits its %s and workbook', async (kind) => {
     const { kb, store, config } = makeWorkspace();
     const mdPath = path.join(kb, '策划 - Designer', '表格.md');
     fs.mkdirSync(path.dirname(mdPath), { recursive: true });
@@ -194,11 +194,13 @@ describe('SyncEngine atomic apply path', () => {
       getSheetLayout: async () => ({ data: { revision: 41, row_heights: [{ rows: '1:2', height: 24 }],
         column_widths: [{ cols: 'A:B', width: 80 }], hidden_rows: [], hidden_columns: [], merged_cells: [] } }),
       getSheetCells: async () => ({ data: { revision: 41, has_more: false, ranges: [{ actual_range: 'A1:B2', truncated: false,
-        row_indices: [1, 2], col_indices: ['A', 'B'], cells: [[{ rich_text: [{ type: 'embed-image', text: '',
-          image_token: 'cell-image', image_width: 80, image_height: 48 }] }, { value: 'b' }], [{ value: 1 }, { value: 2 }]] }] } }),
+        row_indices: [1, 2], col_indices: ['A', 'B'], cells: [[{ rich_text: [kind === 'image' ? { type: 'embed-image', text: '',
+          image_token: 'cell-image', image_width: 80, image_height: 48 } : { type: 'attachment', text: 'data.json',
+          attachment_token: 'cell-file', file_size: 2, mime_type: 'application/json' }] }, { value: 'b' }], [{ value: 1 }, { value: 2 }]] }] } }),
       getSheetFloatImages: async () => ({ data: { revision: 41, total: 0, sheets: [] } }),
       downloadMedia: async (_token: string, output: string) => {
         if (!imageAvailable) throw new Error('image unavailable');
+        if (kind === 'attachment') { fs.writeFileSync(`${output}.json`, '{}'); return `${output}.json`; }
         fs.writeFileSync(`${output}.png`, Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==', 'base64'));
         return `${output}.png`;
       },
@@ -221,6 +223,11 @@ describe('SyncEngine atomic apply path', () => {
     expect(complete.syncedDocuments[0]).toMatchObject({ sheetAcquisition: 'read-reconstruction' });
     expect(fs.existsSync(path.join(kb, '策划 - Designer', '表格.xlsx'))).toBe(true);
     expect(mapping.getStoredDiff(config.watchedRoots[1].url).modified).toEqual([]);
+    if (kind === 'attachment') {
+      const metadata = JSON.parse(fs.readFileSync(path.join(kb, '策划 - Designer', '表格.xlsx.metadata.json'), 'utf8'));
+      expect(fs.readFileSync(path.join(path.dirname(mdPath), metadata.attachments[0].relativePath), 'utf8')).toBe('{}');
+      expect(fs.readFileSync(mdPath, 'utf8')).toContain('## 表格附件');
+    }
   });
 
   it('partial sheet export failure leaves prior body/CSV/synced baseline untouched', async () => {

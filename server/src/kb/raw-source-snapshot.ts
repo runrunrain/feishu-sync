@@ -77,6 +77,25 @@ export function computeSourceHash(realPath: string, csvPaths: string[], root = p
     }
     const workbookPath = path.join(path.dirname(realPath), sourceName);
     combined.update(fs.readFileSync(resolveAttachment(root, workbookPath)));
+    // Reconstructed sheets can have external source attachments (e.g. videos).
+    // Include their bytes so a changed/missing attachment cannot reuse a build
+    // snapshot that was created from an intact workbook bundle.
+    const metadataPath = `${workbookPath}.metadata.json`;
+    if (fs.existsSync(metadataPath)) {
+      const metadataReal = resolveAttachment(root, metadataPath);
+      if (fs.statSync(metadataReal).size > 8 * 1024 * 1024) throw new Error('Excel 来源元数据过大');
+      const metadata = JSON.parse(fs.readFileSync(metadataReal, 'utf8'));
+      const seen = new Set<string>();
+      for (const attachment of metadata.attachments ?? []) {
+        if (typeof attachment.relativePath !== 'string'
+          || !/^attachments\/[a-f0-9]{64}-[^/\\]+$/.test(attachment.relativePath)) {
+          throw new PathGuardError('path_escape', 'Excel 附件路径无效');
+        }
+        if (seen.has(attachment.relativePath)) continue;
+        seen.add(attachment.relativePath);
+        combined.update(fs.readFileSync(resolveAttachment(root, path.join(path.dirname(realPath), attachment.relativePath))));
+      }
+    }
   }
   for (const csv of csvPaths) {
     combined.update(fs.readFileSync(resolveAttachment(root, csv)));
