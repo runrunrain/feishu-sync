@@ -36,6 +36,7 @@ import { kbLanMcpRoutes } from './routes/kb-lan-mcp.js';
 import { kbMcpInstallRoutes } from './routes/kb-mcp-install.js';
 import { McpClientInstaller } from './kb/mcp-client-installer.js';
 import { kbMcpInfo } from './kb/mcp-info.js';
+import { rawCatalogPath, writeRawCatalog } from './kb/raw-mcp-catalog.js';
 import { cliAdminRoutes } from './routes/cli-admin.js';
 import { healthRoutes } from './routes/health.js';
 import { configRoutes } from './routes/config.js';
@@ -611,7 +612,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
 
   app.route('/', kbLanMcpRoutes({ manager: kbLanGateway, desktopToken }));
   app.route('/', kbMcpInstallRoutes({
-    installer: new McpClientInstaller({ dataRoot: agentDataRoot, info: () => kbMcpInfo(configManager.getConfig()!.standardKb.outputRoot) }),
+    installer: new McpClientInstaller({ dataRoot: agentDataRoot, info: () => kbMcpInfo(configManager.getConfig()!.standardKb.outputRoot, rawCatalogPath(agentDataRoot)) }),
     desktopToken,
   }));
   app.route('/', configRoutes);
@@ -690,6 +691,15 @@ export async function buildServer(options: CreateServerOptions = {}) {
   (app as any).__agentToolService = agentToolService;
   (app as any).__cliEndpoint = cliEndpoint;
   (app as any).__kbLanGateway = kbLanGateway;
+  (app as any).__refreshRawMcpCatalog = () => {
+    const root = configManager.getConfig()?.knowledgeBaseRoot ?? '';
+    try { writeRawCatalog(rawCatalogPath(agentDataRoot), root, root ? knowledgeDocuments() : [], sheetCsvPaths); }
+    catch (error) {
+      // A root switch or failed projection must not continue exposing the former allowlist.
+      writeRawCatalog(rawCatalogPath(agentDataRoot), root, [], () => []);
+      throw error;
+    }
+  };
   return app;
 }
 
@@ -757,12 +767,20 @@ export async function startServer(options: CreateServerOptions & {
 
   // Independent fixed-port child; failure never changes the loopback listener.
   const kbLanGateway = (app as any).__kbLanGateway as KbLanGatewayManager;
+  const refreshRawCatalog = () => {
+    try { (app as any).__refreshRawMcpCatalog?.(); }
+    catch { console.warn('[server] raw MCP catalog refresh failed'); }
+  };
+  refreshRawCatalog();
+  const rawCatalogTimer = setInterval(refreshRawCatalog, 10_000);
+  rawCatalogTimer.unref();
   void kbLanGateway.start().catch(() => console.warn('[server] LAN MCP gateway startup failed'));
 
   let closed = false;
   const close = async () => {
     if (closed) return;
     closed = true;
+    clearInterval(rawCatalogTimer);
     await kbLanGateway.close();
     // S10：先取消全部 pending 批准（挂起的工具调用立即失败），
     // 再回收 pi 子进程。

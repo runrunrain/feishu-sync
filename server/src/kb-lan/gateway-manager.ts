@@ -8,6 +8,7 @@ import type { KbLanMcpConfig } from '../types/index.js';
 import { defaultLanConfig, privateInterfaces, resolveBind, validateLanConfig, DEFAULT_CIDRS } from './network.js';
 import { LanTokenStore } from './token-store.js';
 import { LanAudit } from './audit.js';
+import { rawCatalogPath } from '../kb/raw-mcp-catalog.js';
 
 export type LanState = 'disabled' | 'starting' | 'running' | 'port_in_use' | 'bind_unavailable' | 'no_private_interface' | 'artifact_missing' | 'failed';
 export interface GatewayManagerOptions {
@@ -167,7 +168,7 @@ export class KbLanGatewayManager {
     this.heartbeat = new HeartbeatDeadline(this.now(), this.timing.tickMs, this.timing.heartbeatMs, this.timing.driftMs);
     let child: ChildProcess;
     try {
-      child = (this.options.spawn ?? spawn)(this.options.executable ?? process.execPath, [this.artifact(), '--kb-root', this.options.config.getConfig()!.standardKb.outputRoot, '--host', this.host, '--port', String(config.port), '--max-sessions', String(config.maxSessions), '--allow-cidrs', (config.allowCidrs ?? DEFAULT_CIDRS).join(',')], { env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+      child = (this.options.spawn ?? spawn)(this.options.executable ?? process.execPath, [this.artifact(), '--kb-root', this.options.config.getConfig()!.standardKb.outputRoot, '--raw-catalog', rawCatalogPath(this.options.dataRoot), '--host', this.host, '--port', String(config.port), '--max-sessions', String(config.maxSessions), '--allow-cidrs', (config.allowCidrs ?? DEFAULT_CIDRS).join(',')], { env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
     } catch { this.failure('failed', 'spawn_failed'); this.scheduleRestart(); return; }
     this.child = child;
     let buffer = '';

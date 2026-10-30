@@ -2,7 +2,8 @@
 import { KbQueryService } from '../kb/search/kb-query-service.js';
 import { KbIndexCache } from '../kb/search/kb-index-cache.js';
 import type { KbIndex } from '../kb/search/index-types.js';
-import { registerKbTools, KB_MCP_INSTRUCTIONS } from './kb-mcp-tools.js';
+import { registerKbTools, KB_MCP_INSTRUCTIONS, RAW_MCP_INSTRUCTIONS } from './kb-mcp-tools.js';
+import { RawQueryService } from '../kb/raw-query-service.js';
 import { createHttpGateway } from '../kb-lan/http-gateway.js';
 import { validateLanConfig, DEFAULT_CIDRS } from '../kb-lan/network.js';
 
@@ -36,7 +37,8 @@ async function main(): Promise<void> {
   if (!root || !host || host === 'auto') throw new Error('invalid_gateway_arguments');
   // Exactly one service and index cache, separate notice state per MCP session.
   const service = new KbQueryService(root, { cache: new AuditedIndexCache() });
-  const gateway = createHttpGateway({ host, port, maxSessions, allowCidrs, digests: (process.env.KB_LAN_TOKEN_SHA256 ?? '').split(','), register: (server, state) => registerKbTools(server, service, state), instructions: KB_MCP_INSTRUCTIONS, emit });
+  const raw = arg('--raw-catalog') ? new RawQueryService(arg('--raw-catalog')!) : undefined;
+  const gateway = createHttpGateway({ host, port, maxSessions, allowCidrs, digests: (process.env.KB_LAN_TOKEN_SHA256 ?? '').split(','), register: (server, state) => registerKbTools(server, service, state, raw), instructions: KB_MCP_INSTRUCTIONS + (raw ? RAW_MCP_INSTRUCTIONS : ''), emit });
   await gateway.listen();
   emit({ type: 'ready', host, port, pid: process.pid });
   // Best-effort warmup shares the same cache/build promise as actual calls.

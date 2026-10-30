@@ -618,6 +618,7 @@ export function KbLanMcpSettingsCard() {
             ) : (
               <form onSubmit={saveSettings} className="space-y-3">
                 <fieldset disabled={blocked || !!settingsError} className="space-y-3">
+                  <p className="text-xs text-muted">内网与本机 MCP 使用相同资料范围：已发布标准库＋已同步原始文档，均为只读。</p>
                   <label className="block space-y-1">
                     <span>绑定网卡</span>
                     <select
@@ -856,7 +857,7 @@ export function KbLanMcpSettingsCard() {
                 只在家庭、公司有线网或可信 Wi-Fi 上开启；公共或访客 Wi-Fi 请勿开启。需要加密请绑定
                 Tailscale / WireGuard 地址。
               </p>
-              <p>仅共享已发布标准库的只读检索与正文，不开放原始库、写操作或应用管理权限。</p>
+              <p>共享范围与本机 MCP 一致：已发布标准库和已同步原始文档（含未参与构建的文档）。仅允许只读检索与阅读，不开放写操作或应用管理权限。</p>
               <p>
                 随时可在本卡点击「停用共享」关闭监听；怀疑令牌泄露时选择轮换，或停用并作废令牌。
               </p>

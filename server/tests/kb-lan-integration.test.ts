@@ -60,7 +60,9 @@ it('desktop manages the real gateway, three readers agree, notices are per sessi
   expect((await fetch(endpoint, { headers: { Authorization: `Bearer ${tokenA}`, 'X-Forwarded-For': '8.8.8.8' } })).status).toBe(405);
   const a = await connect(endpoint, tokenA), b = await connect(endpoint, tokenA);
   const stdio = new Client({ name: 'stdio-comparison', version: '2' });
-  await stdio.connect(new StdioClientTransport({ command: process.execPath, args: [stdioScript, '--kb-root', kb], env: { ...process.env, FEISHU_SYNC_HOME: root } as Record<string, string> }));
+  await stdio.connect(new StdioClientTransport({ command: process.execPath, args: [stdioScript, '--kb-root', kb, '--raw-catalog', path.join(root, 'mcp/raw-catalog.json')], env: { ...process.env, FEISHU_SYNC_HOME: root } as Record<string, string> }));
+  expect((await stdio.listTools()).tools).toEqual((await a.client.listTools()).tools);
+  expect((await stdio.listTools()).tools).toHaveLength(10);
   closers.push(() => stdio.close());
   const args = { query: '暴击 伤害', limit: 10 };
   const httpSearch = JSON.parse(text(await a.client.callTool({ name: 'search_knowledge', arguments: args })));

@@ -1,4 +1,4 @@
-/** Read-only stdio entry. The same seven tools are registered by the isolated LAN gateway.
+/** Read-only stdio entry. The isolated LAN gateway uses the same standard/raw registration.
  * Single-file Node20 CJS bundle: no SQLite/native modules, outbound network or file writes.
  */
 import fs from 'node:fs';
@@ -7,7 +7,8 @@ import path from 'node:path';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { KbQueryService } from '../kb/search/kb-query-service.js';
-import { KB_MCP_INSTRUCTIONS, registerKbTools } from './kb-mcp-tools.js';
+import { KB_MCP_INSTRUCTIONS, RAW_MCP_INSTRUCTIONS, registerKbTools } from './kb-mcp-tools.js';
+import { RawQueryService } from '../kb/raw-query-service.js';
 
 function resolveKbRoot(argv: string[]): string {
   const index = argv.indexOf('--kb-root');
@@ -24,13 +25,28 @@ function resolveKbRoot(argv: string[]): string {
 }
 
 async function main(): Promise<void> {
-  const service = new KbQueryService(resolveKbRoot(process.argv.slice(2)), {
+  const kbRoot = resolveKbRoot(process.argv.slice(2));
+  const rawAt = process.argv.indexOf('--raw-catalog');
+  let rawFile = rawAt >= 0 ? process.argv[rawAt + 1] : undefined;
+  if (rawAt >= 0 && (!rawFile || rawFile.startsWith('--'))) throw new Error('--raw-catalog 需要清单路径');
+  // Upgrade existing app-owned stdio configs without touching the client's other settings.
+  // An explicitly unrelated --kb-root must never inherit this application's raw library.
+  if (rawAt < 0) {
+    const dataRoot = process.env.FEISHU_SYNC_HOME?.trim() || path.join(os.homedir(), '.feishu-sync');
+    try {
+      const config = JSON.parse(fs.readFileSync(path.join(dataRoot, 'config.json'), 'utf8'));
+      const candidate = path.join(dataRoot, 'mcp', 'raw-catalog.json');
+      if (typeof config.standardKb?.outputRoot === 'string' && path.resolve(config.standardKb.outputRoot) === kbRoot && fs.existsSync(candidate)) rawFile = candidate;
+    } catch { /* Standalone standard-only invocation remains compatible. */ }
+  }
+  const raw = rawFile ? new RawQueryService(rawFile) : undefined;
+  const service = new KbQueryService(kbRoot, {
     onWarmError: (error) => console.error('[kb-mcp] prewarm:', error instanceof Error ? error.message : String(error)),
   });
   const server = new Server({ name: 'feishu-sync-kb', version: '2.0.0' }, {
-    capabilities: { tools: {} }, instructions: KB_MCP_INSTRUCTIONS,
+    capabilities: { tools: {} }, instructions: KB_MCP_INSTRUCTIONS + (raw ? RAW_MCP_INSTRUCTIONS : ''),
   });
-  registerKbTools(server, service, {});
+  registerKbTools(server, service, {}, raw);
   await server.connect(new StdioServerTransport());
   console.error('[kb-mcp] listening on stdio (toolsVersion=2)');
 }

@@ -53,6 +53,7 @@ import type { PathClaims } from '../kb/path-claims.js';
 import type { BuildUnit } from '../kb/build-units.js';
 import type { ImageDescription } from './vision/vision-describer.js';
 import { matchGlob, parseSearchQuery } from '../kb/kb-search.js';
+import { scoreRawText } from '../kb/raw-search-score.js';
 import {
   renderSourceLinksBlock,
   resolveSourceLinks,
@@ -630,40 +631,13 @@ export class AgentToolService {
       : this.rawEntriesForDiscuss(context);
     const hits: Array<{ result: Record<string, unknown>; score: number; relPath: string }> = [];
     for (const entry of entries) {
-      let snippet = '';
       let content = '';
       try {
         content = this.readRawContent(context, entry.objToken);
       } catch {
         /* 读取失败只降权；readRawContent 仍负责构建快照毒化标记。 */
       }
-      const title = entry.title.toLowerCase();
-      const relPath = entry.relPath.toLowerCase();
-      const lower = content.toLowerCase();
-      let score = 0;
-      let matched = 0;
-      let firstIndex = -1;
-      let firstLength = 0;
-      for (const unit of units) {
-        let unitScore = 0;
-        if (title.includes(unit)) unitScore += 10;
-        if (relPath.includes(unit)) unitScore += 5;
-        const index = lower.indexOf(unit);
-        if (index >= 0) {
-          unitScore += 20;
-          if (firstIndex < 0 || index < firstIndex) {
-            firstIndex = index;
-            firstLength = unit.length;
-          }
-        }
-        if (unitScore > 0) matched += 1;
-        score += unitScore;
-      }
-      score *= 0.5 + matched / units.length;
-      if (firstIndex >= 0) {
-        const start = Math.max(0, firstIndex - 60);
-        snippet = `${start > 0 ? '…' : ''}${content.slice(start, firstIndex + firstLength + 100).replace(/\n+/g, ' ')}…`;
-      }
+      const { score, snippet } = scoreRawText(entry.title, entry.relPath, content, units);
       if (score > 0) {
         hits.push({
           score,

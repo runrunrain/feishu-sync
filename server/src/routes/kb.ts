@@ -32,6 +32,7 @@ import type { LocalMapStore } from '../modules/local-map-store.js';
 import type { ConfigManager } from '../modules/config-manager.js';
 import { resolveDataRoot } from '../modules/data-root.js';
 import { kbMcpInfo } from '../kb/mcp-info.js';
+import { rawCatalogPath } from '../kb/raw-mcp-catalog.js';
 import type { KbDocDto, KbSourceState, KbStatusDto } from '../types/agent-knowledge.js';
 
 export interface KbRouteDeps {
@@ -510,7 +511,7 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
 
   routes.get('/api/kb/mcp', async (c) => {
     const config = await configManager.load();
-    return c.json(kbMcpInfo(config.standardKb.outputRoot));
+    return c.json(kbMcpInfo(config.standardKb.outputRoot, rawCatalogPath(resolveDataRoot())));
   });
 
   return routes;

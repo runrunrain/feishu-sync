@@ -4,14 +4,14 @@ import { serverDistRoot } from '../agent/agent-assets.js';
 import type { KbMcpInfoDto } from '../types/agent-knowledge.js';
 
 /** The same executable and arguments are used for copying and installing MCP. */
-export function kbMcpInfo(kbRoot: string): KbMcpInfoDto {
+export function kbMcpInfo(kbRoot: string, rawCatalog?: string): KbMcpInfoDto {
   const root = serverDistRoot();
   const dist = path.basename(root) === 'src' ? path.join(root, '..', 'dist') : root;
   const script = path.join(dist, 'mcp', 'kb-mcp.cjs');
   const env: Record<string, string> = process.versions.electron ? { ELECTRON_RUN_AS_NODE: '1' } : {};
   const entry = {
     command: process.execPath,
-    args: [script, '--kb-root', kbRoot],
+    args: [script, '--kb-root', kbRoot, ...(rawCatalog ? ['--raw-catalog', rawCatalog] : [])],
     ...(Object.keys(env).length ? { env } : {}),
   };
   return {

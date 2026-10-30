@@ -56,7 +56,7 @@ export function KbMcpLocalSettingsCard() {
       <header className="px-4 py-3 border-b border-line/60 flex items-start gap-3">
         <Server className="w-4 h-4 mt-0.5 shrink-0 text-ink-soft" />
         <div><h3 className="text-sm font-kai font-medium text-ink">本机 MCP 安装</h3>
-          <p className="mt-1 text-xs text-ink-soft">让本机 Agent 通过只读 MCP 访问已发布的标准知识库。</p>
+          <p className="mt-1 text-xs text-ink-soft">让本机 Agent 通过只读 MCP 访问标准库与已同步的原始文档。</p>
         </div>
       </header>
       <div className="p-4 space-y-3 text-xs text-ink-soft">
@@ -91,7 +91,7 @@ export function KbMcpLocalSettingsCard() {
             <pre aria-label="本地 MCP 配置" className="max-h-48 overflow-auto scrollbar-thin rounded border border-line bg-paper/50 p-3 text-[11px] leading-relaxed select-text">{info.snippet}</pre>
             <Button size="sm" variant="secondary" className="absolute right-2 top-2" onClick={() => void copy()}><Copy className="w-3.5 h-3.5" />复制</Button>
           </div>
-          <p className="mt-2">本地 MCP 只读取已发布的标准库；未发布时，客户端会收到明确提示。</p>
+          <p className="mt-2">原始库不需要先构建标准库。应用运行时约每 10 秒刷新源清单；关闭后沿用最后清单读取本地文件。升级启动应用后，旧安装可自动识别同一应用的源清单；自定义配置可点击更新并重启客户端。</p>
         </details> : null}
       </div>
     </section>
