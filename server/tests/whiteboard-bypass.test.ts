@@ -92,6 +92,7 @@ class WhiteboardPipelineStore {
   records = new Map<string, DocumentRecord>();
   upserted: Array<Record<string, unknown>> = [];
   markSyncedCalls: Array<Record<string, unknown>> = [];
+  deletedSources: Array<{ root: string; objToken: string }> = [];
 
   getDocumentByObjToken(objToken: string): DocumentRecord | null {
     return this.records.get(objToken) ?? null;
@@ -107,6 +108,12 @@ class WhiteboardPipelineStore {
   }
   markDocumentSynced(input: Record<string, unknown>): void {
     this.markSyncedCalls.push({ ...input });
+  }
+  withTransaction<T>(operation: () => T): T {
+    return operation();
+  }
+  markLocalSourceDeleted(root: string, document: DocumentRecord): void {
+    this.deletedSources.push({ root, objToken: document.objToken });
   }
   deleteDocumentsByTokens(): void {
     /* cleanupSources 默认 commit 分支 */
@@ -322,6 +329,7 @@ describe('SyncEngine — P0-S6 白板旁路导出（svg 主 + raw 降级）', ()
         { objToken: 'doxcnWbBypass1', relPath: '白板文档.md' },
       ]);
       expect(cleaned.cleaned).toBe(1);
+      expect(run.store.deletedSources).toEqual([{ root: run.kbRoot, objToken: 'doxcnWbBypass1' }]);
       expect(fs.existsSync(path.join(run.kbRoot, '白板文档.md'))).toBe(false);
       expect(fs.existsSync(png)).toBe(true);
       expect(fs.existsSync(svg)).toBe(true);
