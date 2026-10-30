@@ -98,6 +98,7 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
   const [formatTab, setFormatTab] = useState<FormatTab>('md');
   const [mdMode, setMdMode] = useState<MdMode>('rendered');
   const [csvIndex, setCsvIndex] = useState(0);
+  const [workbookToolbar, setWorkbookToolbar] = useState<HTMLDivElement | null>(null);
   const toast = useToast();
   const { config } = useConfig();
 
@@ -157,8 +158,6 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
   const TypeIcon = node ? (TYPE_ICON[node.obj_type] ?? FileType) : FileText;
   const hasMd = content?.mdContent != null;
   const csvTables = useMemo(() => content?.csvTables ?? [], [content]);
-  const status = content?.sheetStatus;
-  const sheetLabel = status ? ({ native: 'Excel 原件', 'read-reconstruction': 'Excel 重建', 'unknown-excel': 'Excel（来源未知）', 'csv-fallback': 'CSV 后备', 'legacy-csv': '历史 CSV', unavailable: '尚无本地表格' } as const)[status.acquisition] : '';
   const handleRefreshSheet = async () => {
     if (!objToken || refreshingSheet) return;
     setRefreshingSheet(true);
@@ -325,22 +324,12 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
           )}
         </div>
 
-        {status && <div className="mt-2 text-[11px] text-ink-soft" role="status">
-          <span>{sheetLabel}</span>{status.syncedAt && <span> · 同步时间 {new Date(status.syncedAt).toLocaleString()}</span>}
-          {status.cloudEditTime != null && status.cloudEditTime > 0 && <span> · 云端修改时间 {new Date(status.cloudEditTime < 100000000000 ? status.cloudEditTime * 1000 : status.cloudEditTime).toLocaleString()}</span>}
-          {status.workbookMayBeOlder && <span> · 已保留此前的 Excel，可能较旧；当前默认显示本次获取的 CSV</span>}
-          {status.workbookMayBeOlder && content?.workbook?.modifiedTime && <span> · Excel 本地修改时间 {new Date(content.workbook.modifiedTime).toLocaleString()}</span>}
-          {status.acquisition === 'read-reconstruction' && status.approximations.includes('mention') && <span> · 提及已转为文本</span>}
-          {status.acquisition === 'read-reconstruction' && status.approximations.includes('embedded-cell-image-drawing') && <span> · 单元格内图片已按位置还原为锚定图片</span>}
-          {status.acquisition === 'read-reconstruction' && status.approximations.includes('inline-link-metadata') && <span> · 混排文字链接保存在单元格批注与元数据中</span>}
-          {status.acquisition === 'read-reconstruction' && status.approximations.includes('chart-approximate-pie') && <span> · 饼图近似重建，需下载查看</span>}
-          {status.acquisition === 'read-reconstruction' && status.approximations.includes('chart-metadata-only') && <span> · 部分图表仅保存配置</span>}
-        </div>}
         {/* 格式页签：MD / CSV（下划线常驻渲染 + scaleX 过渡，与 TopBar 一致） */}
-        <div className="mt-2.5 flex items-center gap-4">
+        <div className="mt-2.5 flex flex-wrap items-center gap-x-4 gap-y-1">
           {content?.workbook && (
             <button type="button" onClick={() => setFormatTab('xlsx')} className={`relative pb-2 text-xs font-sans-ui ${formatTab === 'xlsx' ? 'text-seal font-medium' : 'text-ink-faint hover:text-ink-soft'}`}>
               Excel 画板
+              {content.sheetStatus?.workbookMayBeOlder && <span className="ml-1 text-ink-faint" title="此前的 Excel 可能较旧，默认显示本次获取的 CSV">（旧版本）</span>}
               <span aria-hidden className={`absolute bottom-0 left-0 right-0 h-[2px] bg-seal rounded-full ${formatTab === 'xlsx' ? 'scale-x-100' : 'scale-x-0'}`} />
             </button>
           )}
@@ -380,6 +369,7 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
               }`}
             />
           </button>
+          {formatTab === 'xlsx' && content?.workbook && <div ref={setWorkbookToolbar} className="ml-auto pb-1" data-testid="workbook-toolbar-slot" />}
         </div>
       </div>
 
@@ -404,7 +394,7 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
             </p>
           </div>
         ) : formatTab === 'xlsx' && content?.workbook ? (
-          <WorkbookView key={`${objToken}-${content.workbook.modifiedTime}`} objToken={objToken!} fileName={content.workbook.path} mode={content.workbook.mode} />
+          <WorkbookView key={`${objToken}-${content.workbook.modifiedTime}`} objToken={objToken!} fileName={content.workbook.path} toolbarTarget={workbookToolbar} />
         ) : formatTab === 'md' ? (
           hasMd && mdMode === 'rendered' ? (
             <div key={`${objToken}-md-r`} className="animate-fade-in">
@@ -462,22 +452,22 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
       </div>
 
       {/* P1-S4：文档详情「引用 / 被引用」折叠区（两侧皆空不渲染） */}
-      {!loading && !error && content ? <DocReferenceSection content={content} /> : null}
+      {!loading && !error && content ? <DocReferenceSection key={`references-${objToken}`} content={content} /> : null}
 
       {/* P2-S4：评论区（只读；从未采集不渲染，与「没有评论」区分） */}
-      {!loading && !error && objToken ? <SourceCommentsSection objToken={objToken} /> : null}
+      {!loading && !error && objToken ? <SourceCommentsSection key={`comments-${objToken}`} objToken={objToken} /> : null}
 
       {/* 底部：路径 */}
       {content?.objType === 'sheet' && !content.workbook && !loading && (
         <p className="shrink-0 border-t border-line bg-paper px-4 py-2 text-[11px] text-ink-soft">此表格为历史文本版本，重新同步后可查看带布局的 Excel 画板。</p>
       )}
-      {(content?.mdPath || activeCsv || content?.workbook) && (
+      {formatTab !== 'xlsx' && (content?.mdPath || activeCsv) && (
         <div className="shrink-0 border-t border-line/60 bg-paper/60 px-4 py-2">
           <p
             className="truncate text-[11px] text-ink-faint font-mono"
-            title={formatTab === 'xlsx' ? content?.workbook?.path : formatTab === 'csv' && activeCsv ? activeCsv.path : (content?.mdPath ?? '')}
+            title={formatTab === 'csv' && activeCsv ? activeCsv.path : (content?.mdPath ?? '')}
           >
-            {formatTab === 'xlsx' ? content?.workbook?.path : formatTab === 'csv' && activeCsv ? activeCsv.path : content?.mdPath}
+            {formatTab === 'csv' && activeCsv ? activeCsv.path : content?.mdPath}
           </p>
         </div>
       )}

@@ -47,9 +47,20 @@ describe('commentsHeaderLabel（设计 §5.1 文案）', () => {
 });
 
 describe('SourceCommentsList 渲染', () => {
+  it('默认收起评论正文，但保留数量和截断提示', () => {
+    const markup = renderToStaticMarkup(<SourceCommentsList data={makeComments({
+      total: 1, truncated: true,
+      comments: [{ commentRef: 'c1', text: '隐藏的评论', quote: null, author: null, createdAtCloud: null, solved: null }],
+    })} />);
+    expect(markup).toContain('评论 1 条（可能不完整）');
+    expect(markup).toContain('aria-expanded="false"');
+    expect(markup).not.toContain('隐藏的评论');
+  });
+
   it('完整评论：作者/时间/已解决/划词引用/正文', () => {
     const markup = renderToStaticMarkup(
       <SourceCommentsList
+        defaultOpen
         data={makeComments({
           total: 2,
           comments: [
@@ -87,7 +98,7 @@ describe('SourceCommentsList 渲染', () => {
 
   it('截断标注：truncated=true → 头部含「可能不完整」', () => {
     const markup = renderToStaticMarkup(
-      <SourceCommentsList data={makeComments({ total: 50, truncated: true })} />,
+      <SourceCommentsList defaultOpen data={makeComments({ total: 50, truncated: true })} />,
     );
     expect(markup).toContain('评论 50 条（可能不完整）');
     expect(markup).toContain('暂无评论');
@@ -96,6 +107,7 @@ describe('SourceCommentsList 渲染', () => {
   it('字段缺失容错：未知作者占位、无时间/解决态省略', () => {
     const markup = renderToStaticMarkup(
       <SourceCommentsList
+        defaultOpen
         data={makeComments({
           total: 1,
           comments: [{
@@ -117,6 +129,7 @@ describe('SourceCommentsList 渲染', () => {
   it('多行正文保留换行（whitespace-pre-wrap）', () => {
     const markup = renderToStaticMarkup(
       <SourceCommentsList
+        defaultOpen
         data={makeComments({
           total: 1,
           comments: [{

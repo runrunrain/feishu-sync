@@ -19,12 +19,12 @@ import { EventEmitter } from 'node:events';
 import { AgentProcessPool, AgentBusyError, type PoolSlot } from '../agent/agent-process-pool.js';
 import { AgentToolService, ToolError, validateStdDocPath, type BuildRunState } from '../agent/agent-tool-service.js';
 import type { VisionDescriberLike } from '../agent/agent-tool-service.js';
-import { isPathInside } from '../agent/path-guard.js';
+import { isPathInside, PathGuardError } from '../agent/path-guard.js';
 import { buildPiProcessEnv, PiRpcProcess } from '../agent/pi-rpc-process.js';
 import { PiRuntimeResolver, resolveAppLlmModel } from '../agent/runtime-resolver.js';
 import { buildAppLlmRunConfig } from '../agent/provider-descriptor.js';
 import { createClaudeProcess } from '../agent/claude-process-factory.js';
-import { RawSourceSnapshot, computeSourceHash } from './raw-source-snapshot.js';
+import { RawSourceSnapshot, collectSourceCandidates, computeSourceHash } from './raw-source-snapshot.js';
 import { isReleaseInUse } from './publication-service.js';
 import { StandardKbStore, parseStdHeader, stripStdHeader } from './standard-kb-store.js';
 import { getKbQueryService } from './search/kb-query-service.js';
@@ -814,7 +814,24 @@ export class KbBuildService extends EventEmitter {
       if (entry.cancelRequested) throw new CancelledError();
       setStatus('publishing');
       const releaseId = `r_${new Date().toISOString().replace(/[-:]/g, '').replace('T', 'T').slice(0, 15)}_${crypto.randomBytes(3).toString('hex')}`;
-      verifySnapshotIntact(snapshot, config.knowledgeBaseRoot, this.deps.sheetCsvPaths, this.sourceDocuments());
+      // 只复核本次快照中的源；构建期间新同步的文档留待下一次构建。
+      // 快照创建和发布前必须使用同一条发布产物排除规则，避免把排除项误判为新增源。
+      const currentPublishedTokens = new Set(this.deps.publishedTokensProvider?.() ?? []);
+      const currentDocuments = this.sourceDocuments().filter((doc) => !currentPublishedTokens.has(doc.objToken));
+      const newSources = verifySnapshotIntact(snapshot, config.knowledgeBaseRoot, this.deps.sheetCsvPaths, currentDocuments);
+      if (snapshot.size === 0 && newSources > 0) {
+        throw new ToolError('source_changed_during_build', '构建开始时没有可用源文档；构建期间有新文档同步完成，请重新选择并构建。', 409);
+      }
+      if (newSources > 0) {
+        const warning = {
+          code: 'sources_added_during_build',
+          count: newSources,
+          message: `构建期间新增 ${newSources} 篇可用源文档，未包含在本次构建中；可在下次构建或待更新差异中选择处理。`,
+        };
+        buildWarnings.push(warning);
+        localMapStore.updateKbBuild(buildId, { warningsJson: JSON.stringify(buildWarnings) });
+        this.emitLog(buildId, 'warn', warning.message);
+      }
       const manifest = await this.publishRelease({
         buildId,
         releaseId,
@@ -859,7 +876,8 @@ export class KbBuildService extends EventEmitter {
       } else if (error instanceof AgentBusyError) {
         failBuild('agent_busy', error.message);
       } else {
-        const code = error instanceof ToolError ? error.code : 'kb_build_failed';
+        const code = error instanceof ToolError || (error instanceof PathGuardError && error.code === 'source_changed_during_build')
+          ? error.code : 'kb_build_failed';
         const message = error instanceof Error ? error.message : String(error);
         failBuild(code, message);
       }
@@ -2262,20 +2280,48 @@ class CancelledError extends Error {
  * F3-R08：发布前复核快照完整性（导出供单测）：逐源重算 contentHash
  * （主文档 + CSV 附件，与 scan/readVerified 同一哈希函数），任一不一致
  * 抛 source_changed_during_build——模型最后一次 read 之后源被改，不得
- * 切换 CURRENT。
+ * 切换 CURRENT。新出现的源不改变本次快照，返回其数量供提示下次构建。
  */
 export function verifySnapshotIntact(
   snapshot: RawSourceSnapshot,
   knowledgeBaseRoot: string,
   sheetCsvPaths: (objToken: string) => string[],
   currentDocuments?: import('../types/index.js').DocumentRecord[],
-): void {
+): number {
   const rootReal = fs.realpathSync.native(knowledgeBaseRoot);
+  let newSources = 0;
   if (currentDocuments) {
-    const current = RawSourceSnapshot.scan(rootReal, currentDocuments, sheetCsvPaths).entries;
-    const digest = (entries: RawSourceSnapshotEntry[]) => JSON.stringify(entries.map((item) => [item.objToken, item.contentHash]).sort((a, b) => a[0].localeCompare(b[0])));
-    if (digest(current) !== digest(snapshot.entries)) {
-      throw new ToolError('source_changed_during_build', '发布前复核发现原始源集合或内容已变化', 409);
+    const candidates = collectSourceCandidates(currentDocuments);
+    const byToken = new Map(candidates.map((record) => [record.objToken, record]));
+    for (const source of snapshot.entries) {
+      const record = byToken.get(source.objToken);
+      if (!record) {
+        throw new ToolError('source_changed_during_build', `发布前复核发现所选源已移除或不再参与构建：${source.relPath}`, 409);
+      }
+      let current: RawSourceSnapshotEntry | undefined;
+      try {
+        current = RawSourceSnapshot.scan(rootReal, [record], sheetCsvPaths).entries[0];
+      } catch {
+        throw new ToolError('source_changed_during_build', `发布前复核无法读取所选源或其附件：${source.relPath}`, 409);
+      }
+      if (!current || current.contentHash !== source.contentHash) {
+        throw new ToolError('source_changed_during_build', `发布前复核发现所选源已变更或不可读取：${source.relPath}`, 409);
+      }
+      const snapshotPath = path.resolve(rootReal, source.relPath);
+      const currentPath = path.resolve(rootReal, current.relPath);
+      if ((process.platform === 'win32' ? snapshotPath.toLowerCase() : snapshotPath)
+        !== (process.platform === 'win32' ? currentPath.toLowerCase() : currentPath)) {
+        throw new ToolError('source_changed_during_build', `发布前复核发现所选源的本地路径已变更：${source.relPath}`, 409);
+      }
+    }
+    for (const record of candidates) {
+      if (snapshot.has(record.objToken)) continue;
+      try {
+        const real = fs.realpathSync.native(path.join(rootReal, record.localRelPath!));
+        if (isPathInside(rootReal, real) && fs.statSync(real).isFile()) newSources += 1;
+      } catch {
+        // 尚未完成同步或无法读取的新增源不计入提示。
+      }
     }
   }
   for (const source of snapshot.entries) {
@@ -2314,6 +2360,7 @@ export function verifySnapshotIntact(
       );
     }
   }
+  return newSources;
 }
 
 export interface ValidateStagingOptions {

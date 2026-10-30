@@ -140,6 +140,7 @@ export const KB_BUILD_WORKER_STATE_LABEL: Record<string, string> = {
 export const KB_BUILD_WARNING_LABEL: Record<string, string> = {
   images_unavailable: '图片未理解',
   images_refresh_incomplete: '图片重新生成未完成',
+  sources_added_during_build: '构建期间新增文档',
 };
 
 /** 会话状态 → 中文。 */

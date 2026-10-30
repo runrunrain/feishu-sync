@@ -53,6 +53,8 @@ interface FakeScript {
   claimRejections?: unknown[];
   /** 批次前 raw_read 并记录内容（vision 内联断言用） */
   rawReadCapture?: Map<string, string>;
+  /** 完成模型生成后模拟同步、选集或发布状态变化。 */
+  beforeFinish?: () => void;
 }
 
 class FakeRpcProcess extends EventEmitter {
@@ -123,6 +125,9 @@ class FakeRpcProcess extends EventEmitter {
       return { outcome: 'completed' };
     }
     if (message.includes('kb_finish') || message.includes('整体收尾')) {
+      const beforeFinish = this.script.beforeFinish;
+      this.script.beforeFinish = undefined;
+      beforeFinish?.();
       await this.call('kb_finish', { summary: '整体完成', skipped: [] });
       return { outcome: 'completed' };
     }
@@ -285,7 +290,7 @@ interface Harness {
   };
 }
 
-function makeHarness(config: Config, script: FakeScript = { claimRejections: [] }, vision?: Harness['visionDescriber'], excluded: string[] = []): Harness {
+function makeHarness(config: Config, script: FakeScript = { claimRejections: [] }, vision?: Harness['visionDescriber'], excluded: string[] = [], published: string[] = []): Harness {
   const pool = new AgentProcessPool({ maxConcurrentProcesses: 3, idleTimeoutMinutes: 10 });
   const toolService = new AgentToolService({ dataRoot, documentsProvider: () => documents });
   const fakes: FakeRpcProcess[] = [];
@@ -298,6 +303,7 @@ function makeHarness(config: Config, script: FakeScript = { claimRejections: [] 
     configProvider: () => config,
     documentsProvider: () => documents,
     excludedSourcesProvider: () => excluded,
+    publishedTokensProvider: () => published,
     sheetCsvPaths: () => [],
     internalBaseUrl: () => 'http://127.0.0.1:39999',
     extensionPath: () => null,
@@ -368,6 +374,106 @@ const TINY_PNG = Buffer.concat([
   Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
   Buffer.from('png-fixture'),
 ]);
+
+describe('发布前复核所选源快照', () => {
+  it('构建期间其他文档同步完成：发布初始选集并提示下次处理新增源', async () => {
+    writeRaw('同步竞态/已选.md', `# 已选源\n${FAT}`);
+    documents.length = 0;
+    const selected = docRecord('tokStableBuild', '同步竞态/已选.md');
+    const pending = { ...docRecord('tokLaterSync', '同步竞态/稍后同步.md'), status: 'placeholder', lastSyncedAt: '' } as DocumentRecord;
+    documents.push(selected, pending);
+    const harness = makeHarness(makeConfig(), { beforeFinish: () => {
+      writeRaw('同步竞态/稍后同步.md', `# 新同步源\n${FAT}`);
+      Object.assign(pending, { status: 'synced', lastSyncedAt: new Date().toISOString() });
+    } });
+    const row = await createAndRun(harness, 'full');
+    expect(row.status).toBe('published');
+    const kbStore = new StandardKbStore(outputRoot);
+    const manifest = kbStore.readManifest(String(row.release_id))!;
+    expect(manifest.sourceSnapshot.map((source) => source.objToken)).toEqual(['tokStableBuild']);
+    expect(manifest.docs.every((doc) => doc.sources.every((source) => source === 'tokStableBuild'))).toBe(true);
+    expect(JSON.parse(String(row.warnings_json))).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'sources_added_during_build', count: 1, message: expect.stringContaining('下次构建') }),
+    ]));
+    const later = RawSourceSnapshot.scan(kbRoot, documents).entries;
+    expect(computeChangeset(later, manifest).added).toContain('tokLaterSync');
+  });
+
+  it('初始选集没有可用源且构建中同步完成：保留上一版本并要求重新构建', async () => {
+    documents.length = 0;
+    const pending = { ...docRecord('tokEmptyLaterSync', '同步竞态/空选集后同步.md'), status: 'placeholder', lastSyncedAt: '' } as DocumentRecord;
+    documents.push(pending);
+    const previous = new StandardKbStore(outputRoot).readCurrent()?.releaseId;
+    const harness = makeHarness(makeConfig(), { beforeFinish: () => {
+      writeRaw('同步竞态/空选集后同步.md', `# 新同步源\n${FAT}`);
+      Object.assign(pending, { status: 'synced', lastSyncedAt: new Date().toISOString() });
+    } });
+    const row = await createAndRun(harness, 'full');
+    expect(row).toMatchObject({ status: 'failed', error_code: 'source_changed_during_build' });
+    expect(String(row.error_message)).toContain('重新选择并构建');
+    expect(new StandardKbStore(outputRoot).readCurrent()?.releaseId).toBe(previous);
+  });
+
+  it('已发布到飞书的文档在快照和发布前复核均排除', async () => {
+    writeRaw('发布产物/来源.md', `# 正常来源\n${FAT}`);
+    writeRaw('发布产物/标准产物.md', `# 不应作为来源\n${FAT}`);
+    documents.length = 0;
+    documents.push(docRecord('tokRealSource', '发布产物/来源.md'), docRecord('tokPublishedOutput', '发布产物/标准产物.md'));
+    const harness = makeHarness(makeConfig(), {}, undefined, [], ['tokPublishedOutput']);
+    const row = await createAndRun(harness, 'full');
+    expect(row.status).toBe('published');
+    const manifest = new StandardKbStore(outputRoot).readManifest(String(row.release_id))!;
+    expect(manifest.sourceSnapshot.map((source) => source.objToken)).toEqual(['tokRealSource']);
+    expect(JSON.parse(String(row.warnings_json))).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'published_doc_in_sources', count: 1 }),
+    ]));
+    expect(JSON.parse(String(row.warnings_json))).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'sources_added_during_build' }),
+    ]));
+  });
+
+  it.each(['excluded', 'published'] as const)('所选源构建期间变为 %s：阻断发布并保留上一版本', async (change) => {
+    writeRaw('同步竞态/被移除.md', `# 原始源\n${FAT}`);
+    documents.length = 0;
+    documents.push(docRecord('tokRemovedBuild', '同步竞态/被移除.md'));
+    const excluded: string[] = [];
+    const published: string[] = [];
+    const previous = new StandardKbStore(outputRoot).readCurrent()?.releaseId;
+    const harness = makeHarness(makeConfig(), { beforeFinish: () => {
+      (change === 'excluded' ? excluded : published).push('tokRemovedBuild');
+    } }, undefined, excluded, published);
+    const row = await createAndRun(harness, 'full');
+    expect(row).toMatchObject({ status: 'failed', error_code: 'source_changed_during_build' });
+    expect(String(row.error_message)).toContain('所选源已移除');
+    expect(new StandardKbStore(outputRoot).readCurrent()?.releaseId).toBe(previous);
+  });
+
+  it('构建期间所选源内容被修改：阻断发布并保留上一版本', async () => {
+    writeRaw('同步竞态/被修改.md', `# 原始源\n${FAT}`);
+    documents.length = 0;
+    documents.push(docRecord('tokChangedBuild', '同步竞态/被修改.md'));
+    const previous = new StandardKbStore(outputRoot).readCurrent()?.releaseId;
+    const harness = makeHarness(makeConfig(), { beforeFinish: () => writeRaw('同步竞态/被修改.md', `# 同步后新内容\n${FAT}`) });
+    const row = await createAndRun(harness, 'full');
+    expect(row).toMatchObject({ status: 'failed', error_code: 'source_changed_during_build' });
+    expect(new StandardKbStore(outputRoot).readCurrent()?.releaseId).toBe(previous);
+  });
+
+  it('构建期间所选源的图片被替换：阻断发布并保留上一版本', async () => {
+    writeRaw('同步竞态/图文.md', `# 图文\n![](images/guard.png)\n${FAT}`);
+    const imagePath = path.join(kbRoot, '同步竞态/images/guard.png');
+    fs.mkdirSync(path.dirname(imagePath), { recursive: true });
+    fs.writeFileSync(imagePath, TINY_PNG);
+    documents.length = 0;
+    documents.push(docRecord('tokChangedImage', '同步竞态/图文.md'));
+    const previous = new StandardKbStore(outputRoot).readCurrent()?.releaseId;
+    const harness = makeHarness(makeConfig(), { beforeFinish: () => fs.writeFileSync(imagePath, Buffer.concat([TINY_PNG, Buffer.from('changed')])) });
+    const row = await createAndRun(harness, 'full');
+    expect(row).toMatchObject({ status: 'failed', error_code: 'source_changed_during_build' });
+    expect(String(row.error_message)).toContain('源图片已变更');
+    expect(new StandardKbStore(outputRoot).readCurrent()?.releaseId).toBe(previous);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // 用例

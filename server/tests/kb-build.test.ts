@@ -563,14 +563,35 @@ describe('F3-R08：毒化与发布前复核（不可恢复失败，模型无法�
 });
 
 describe('发布点源集合与主文件围栏', () => {
-  it('新增本地源阻断；仅云端观测变化不误报', () => {
+  it('构建期间新增的源不改变当前快照；所选源移除或内容改变仍阻断', () => {
     writeRaw('publish-source-a.md', 'A');
     writeRaw('publish-source-b.md', 'B');
     const a = docRecord({ objToken: 'publish-a', localRelPath: 'publish-source-a.md' });
     const b = docRecord({ objToken: 'publish-b', localRelPath: 'publish-source-b.md' });
     const snapshot = RawSourceSnapshot.fromEntries(RawSourceSnapshot.scan(kbRoot, [a]).entries);
-    expect(() => verifySnapshotIntact(snapshot, kbRoot, () => [], [{ ...a, cloudDeleted: 1, observedObjEditTime: 999 }])).not.toThrow();
-    expect(() => verifySnapshotIntact(snapshot, kbRoot, () => [], [a, b])).toThrow(/源集合/);
+    expect(verifySnapshotIntact(snapshot, kbRoot, () => [], [{ ...a, cloudDeleted: 1, observedObjEditTime: 999 }])).toBe(0);
+    expect(verifySnapshotIntact(snapshot, kbRoot, () => [], [a, b])).toBe(1);
+    expect(() => verifySnapshotIntact(snapshot, kbRoot, () => [], [b])).toThrow(/所选源已移除/);
+    writeRaw('publish-source-a.md', 'A changed');
+    expect(() => verifySnapshotIntact(snapshot, kbRoot, () => [], [a, b])).toThrow(/所选源已变更/);
+  });
+
+  it('无关新增文档的附件尚未就绪时不影响本次所选源', () => {
+    writeRaw('publish-stable.md', '稳定的原始源');
+    writeRaw('publish-new.md', '正在同步的表格');
+    const a = docRecord({ objToken: 'publish-stable', localRelPath: 'publish-stable.md' });
+    const b = docRecord({ objToken: 'publish-new', localRelPath: 'publish-new.md', objType: 'sheet' });
+    const snapshot = RawSourceSnapshot.fromEntries(RawSourceSnapshot.scan(kbRoot, [a]).entries);
+    expect(verifySnapshotIntact(snapshot, kbRoot, (token) => token === b.objToken ? ['尚不存在.csv'] : [], [a, b])).toBe(1);
+  });
+
+  it('所选源被重新映射到另一条路径，即使内容相同也拒绝发布旧路径', () => {
+    writeRaw('publish-old-path.md', '相同内容');
+    writeRaw('publish-new-path.md', '相同内容');
+    const old = docRecord({ objToken: 'publish-moved', localRelPath: 'publish-old-path.md' });
+    const moved = docRecord({ objToken: 'publish-moved', localRelPath: 'publish-new-path.md' });
+    const snapshot = RawSourceSnapshot.fromEntries(RawSourceSnapshot.scan(kbRoot, [old]).entries);
+    expect(() => verifySnapshotIntact(snapshot, kbRoot, () => [], [moved])).toThrow(/本地路径已变更/);
   });
 
   it('主文件被替换成越界symlink时拒绝，不读取越界内容进行hash', () => {

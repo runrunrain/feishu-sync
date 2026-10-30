@@ -135,6 +135,12 @@ describe('KbBuildPanel 并行进度（S4/S5）', () => {
 });
 
 describe('KbBuildPanel 构建警告（S3/S5）', () => {
+  it('构建期间新增源时在已发布结果中提示下次处理', () => {
+    const html = render(makeBuild({ status: 'published', warnings: [{ code: 'sources_added_during_build', count: 2, message: '新增 2 篇源文档，可在下次构建时处理。' }] }));
+    expect(html).toContain('构建期间新增文档');
+    expect(html).toContain('下次构建');
+  });
+
   it('重新生成未完成时显示保留缓存的警告', () => {
     const html = render(makeBuild({ warnings: [{ code: 'images_refresh_incomplete', count: 1, message: '1 张图片未能重新生成，已有缓存已保留。' }] }));
     expect(html).toContain('图片重新生成未完成');

@@ -144,7 +144,7 @@ export function RawSourceDrawer({ source, onClose }: RawSourceDrawerProps) {
             ) : null}
           </div>
           {view === 'xlsx' && content.workbook ? (
-            <WorkbookView key={`${content.objToken}-${content.workbook.modifiedTime}`} objToken={content.objToken} fileName={content.workbook.path} mode={content.workbook.mode} />
+            <WorkbookView key={`${content.objToken}-${content.workbook.modifiedTime}`} objToken={content.objToken} fileName={content.workbook.path} />
           ) : view === 'md' ? (
             content.mdContent ? (
               <MarkdownView

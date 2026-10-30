@@ -13,7 +13,7 @@
  */
 
 import { useEffect, useState } from 'react';
-import { MessageSquare, CheckCircle2, Circle } from 'lucide-react';
+import { MessageSquare, CheckCircle2, Circle, ChevronRight } from 'lucide-react';
 import { getDocumentComments } from '../api/client';
 import { appLogger } from '../utils/appLogger';
 import type { DocumentComments } from '../types';
@@ -67,23 +67,26 @@ export function SourceCommentsSection({ objToken }: SourceCommentsSectionProps) 
   // 从未采集（非 docx 或未成功同步过）→ 不渲染（与「没有评论」区分）。
   if (!data.collected) return null;
 
-  return <SourceCommentsList data={data} />;
+  return <SourceCommentsList key={objToken} data={data} />;
 }
 
 /**
  * 纯展示列表（SSR 可锚定，SourceEditControls.test 同法）：已采集数据 →
  * 头部「评论 n 条（可能不完整）」+ 逐条评论（作者/时间/已解决/划词/正文）。
  */
-export function SourceCommentsList({ data }: { data: DocumentComments }) {
+export function SourceCommentsList({ data, defaultOpen = false }: { data: DocumentComments; defaultOpen?: boolean }) {
+  const [open, setOpen] = useState(defaultOpen);
   return (
     <div className="shrink-0 border-t border-line/60 bg-paper/40" data-testid="source-comments-section">
-      <div className="flex items-center gap-1.5 px-4 pt-2 pb-1">
-        <MessageSquare className="w-3 h-3 text-ink-faint" />
-        <p className="text-[11px] text-ink-soft font-sans-ui font-medium">
+      <button type="button" aria-expanded={open} onClick={() => setOpen((value) => !value)}
+        className="flex w-full items-center gap-1.5 px-4 py-2 text-left text-[11px] text-ink-soft font-sans-ui hover:text-ink">
+        <ChevronRight className={`w-3 h-3 shrink-0 transition-transform ${open ? 'rotate-90' : ''}`} aria-hidden />
+        <MessageSquare className="w-3 h-3 text-ink-faint" aria-hidden />
+        <span className="font-medium">
           {commentsHeaderLabel(data)}
-        </p>
-      </div>
-      <div className="max-h-56 overflow-y-auto scrollbar-thin px-4 pb-2.5 space-y-2">
+        </span>
+      </button>
+      {open ? <div className="max-h-56 overflow-y-auto scrollbar-thin px-4 pb-2.5 space-y-2">
         {data.comments.length === 0 ? (
           <p className="text-[11px] text-ink-faint font-sans-ui py-1">暂无评论</p>
         ) : (
@@ -122,7 +125,7 @@ export function SourceCommentsList({ data }: { data: DocumentComments }) {
             </div>
           ))
         )}
-      </div>
+      </div> : null}
     </div>
   );
 }

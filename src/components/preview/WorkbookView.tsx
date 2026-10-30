@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
+import { createPortal } from 'react-dom';
 import { Download, Loader2, RefreshCw } from 'lucide-react';
 import { getWorkbookBlob, getWorkbookPreview } from '../../api/client';
 import type { WorkbookCell, WorkbookFont, WorkbookPreview, WorkbookSheetLayout } from '../../types/workbook';
@@ -30,7 +31,6 @@ function borderStyle(cell: WorkbookCell): CSSProperties {
 export function WorkbookCanvas({ sheet, zoom = 1 }: { sheet: WorkbookSheetLayout; zoom?: number }) {
   const viewport = useRef<HTMLDivElement>(null);
   const [view, setView] = useState({ left: 0, top: 0, width: 1200, height: 600 });
-  const [selected, setSelected] = useState<WorkbookCell | null>(null);
   const layout = useMemo(() => prepareWorkbookLayout(sheet), [sheet]);
   useEffect(() => {
     const element = viewport.current;
@@ -75,7 +75,6 @@ export function WorkbookCanvas({ sheet, zoom = 1 }: { sheet: WorkbookSheetLayout
                 key={cell.address}
                 data-cell={cell.address}
                 title={`${cell.address}${cell.formula ? ` · =${cell.formula}` : ''}\n${cell.text}`}
-                onClick={() => setSelected(cell)}
                 style={{
                   position: 'absolute', zIndex: 1, left: x, top: y, width: textWidth, height,
                   overflow: 'hidden', display: 'flex',
@@ -83,8 +82,6 @@ export function WorkbookCanvas({ sheet, zoom = 1 }: { sheet: WorkbookSheetLayout
                   justifyContent: cell.horizontal === 'right' ? 'flex-end' : cell.horizontal === 'center' ? 'center' : 'flex-start',
                   padding: `1px 3px 1px ${3 + (cell.indent ?? 0) * 12}px`, boxSizing: 'border-box',
                   ...fontStyle(cell.font),
-                  outline: selected?.address === cell.address ? '2px solid #4c7c66' : undefined,
-                  outlineOffset: -2,
                 }}
               >
                 <span style={{ whiteSpace: cell.wrap ? 'pre-wrap' : 'pre', overflowWrap: cell.wrap ? 'anywhere' : undefined, lineHeight: 1.15, flexShrink: 0, maxWidth: cell.wrap ? width - 6 : undefined, transform: cell.rotation ? `rotate(${-cell.rotation}deg)` : undefined }}>
@@ -98,14 +95,11 @@ export function WorkbookCanvas({ sheet, zoom = 1 }: { sheet: WorkbookSheetLayout
           </div>
         </div>
       </div>
-      <div className="shrink-0 border-t border-line bg-paper px-3 py-2 text-[11px] text-ink-soft whitespace-pre-wrap max-h-28 overflow-auto">
-        {selected ? <><strong className="mr-3 font-mono">{selected.address}</strong>{selected.formula ? `=${selected.formula}\n` : ''}{selected.text}</> : '点击单元格可查看并复制完整文字。'}
-      </div>
     </div>
   );
 }
 
-export function WorkbookView({ objToken, fileName, mode }: { objToken: string; fileName: string; mode?: 'native' | 'read-reconstruction' }) {
+export function WorkbookView({ objToken, fileName, toolbarTarget }: { objToken: string; fileName: string; toolbarTarget?: HTMLElement | null }) {
   const [preview, setPreview] = useState<WorkbookPreview | null>(null);
   const [sheetIndex, setSheetIndex] = useState(0);
   const [zoom, setZoom] = useState<number | 'fit'>(1);
@@ -150,12 +144,9 @@ export function WorkbookView({ objToken, fileName, mode }: { objToken: string; f
     } catch (err) { setError(err instanceof Error ? err.message : 'Excel 原件下载失败'); }
     finally { setDownloading(false); }
   };
-  return (
-    <div ref={panel} className="flex min-h-[460px] h-full flex-col">
-      <div className="flex flex-wrap shrink-0 items-center gap-3 border-b border-line bg-paper/60 px-3 py-2 text-xs text-ink-soft">
-        <span className="font-medium">Excel 画板</span>
-        {mode === 'read-reconstruction' && <span className="text-[11px] text-ink-faint">只读接口重建：提及为文本；图表需下载查看，部分仅保存于伴随记录</span>}
-        <label className="ml-auto flex items-center gap-1.5">缩放
+  const toolbar = (
+      <div className="flex items-center justify-end gap-3 text-xs text-ink-soft">
+        <label className="flex items-center gap-1.5">缩放
           <select aria-label="Excel 缩放比例" value={zoom} onChange={(e) => setZoom(e.target.value === 'fit' ? 'fit' : Number(e.target.value))} className="rounded border border-line bg-card-bg px-1 py-1">
             <option value="fit">适合宽度</option>
             {[0.25, 0.5, 0.75, 1, 1.25, 1.5, 2].map((value) => <option key={value} value={value}>{value * 100}%</option>)}
@@ -165,6 +156,12 @@ export function WorkbookView({ objToken, fileName, mode }: { objToken: string; f
           {downloading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}下载 Excel
         </button>
       </div>
+  );
+  return (
+    <div ref={panel} className="flex min-h-[460px] h-full flex-col">
+      {toolbarTarget === undefined
+        ? <div className="shrink-0 border-b border-line bg-paper/60 px-3 py-2">{toolbar}</div>
+        : toolbarTarget ? createPortal(toolbar, toolbarTarget) : null}
       {error ? <div role="alert" className="px-4 py-6 text-xs text-seal">{error}<button type="button" onClick={() => setRetry((value) => value + 1)} className="ml-3 inline-flex items-center gap-1"><RefreshCw className="h-3 w-3" />重试</button></div> : null}
       {loading ? <div className="flex min-h-[320px] flex-1 items-center justify-center gap-2 text-xs text-ink-faint"><Loader2 className="h-4 w-4 animate-spin" />正在读取 Excel 布局…</div> : preview && !error ? (
         <>
