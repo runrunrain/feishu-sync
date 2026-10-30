@@ -10,11 +10,15 @@
  *   3. tool_call 钩子对非本扩展注册的工具一律 block（fail closed）。
  *   4. 工具 execute → POST /api/agent-internal/tools/:name。
  *
- * 只用 Node 内置模块与全局 fetch；对 pi 只做类型层面依赖（本地最小
- * ExtensionAPI 接口声明），保证 server 的 tsc 无需安装 pi。
+ * Bearer 模式按需复用已安装 Pi 的 Anthropic 适配器；server 的 tsc
+ * 不需要安装 Pi。
  */
 
 'use strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
 import { registerConfiguredModels } from './configured-models.js';
 
 /** @typedef {{ registerTool(tool: any): void; registerProvider(name: string, config: any): void; on(event: 'tool_call', handler: (event: any) => any): void; getAllTools(): any[]; }} ExtensionAPI */
@@ -23,6 +27,21 @@ const AGENT_URL = process.env.FEISHU_SYNC_AGENT_URL || '';
 const RUN_TOKEN = process.env.FEISHU_SYNC_AGENT_RUN_TOKEN || '';
 const API_KEY_ENV = 'FEISHU_SYNC_AGENT_API_KEY';
 const PROVIDER_JSON = process.env.FEISHU_SYNC_AGENT_PROVIDER_JSON || '';
+
+// Pi's authHeader adds Authorization but also leaves apiKey set, causing its
+// Anthropic adapter to send x-api-key as well. Delegate to that same adapter
+// with header-owned auth so a Bearer-only gateway sees just one credential.
+async function anthropicBearerStream(piRoot) {
+  if (!piRoot) throw new Error('无法定位 Pi 运行时，不能使用 Anthropic Bearer 认证');
+  const resolver = createRequire(path.join(piRoot, 'package.json'));
+  const searchPaths = resolver.resolve.paths('@earendil-works/pi-ai') ?? [];
+  const entry = searchPaths.map((dir) => path.join(dir, '@earendil-works', 'pi-ai', 'dist', 'api', 'anthropic-messages.js'))
+    .find((file) => fs.existsSync(file));
+  if (!entry) throw new Error('Pi 运行时缺少 Anthropic 适配器');
+  const { streamSimple } = await import(pathToFileURL(entry).href);
+  if (typeof streamSimple !== 'function') throw new Error('Pi 的 Anthropic 适配器不可用');
+  return (model, context, options) => streamSimple(model, context, { ...options, apiKey: undefined });
+}
 
 function log(...args) {
   // stderr：pi 保留 stdout 给 JSONL 协议
@@ -91,11 +110,14 @@ export default async function feishuSyncAgentExtension(/** @type {ExtensionAPI} 
     const descriptor = JSON.parse(PROVIDER_JSON);
     const api = descriptor.api ?? 'openai-completions';
     if (!['openai-completions', 'openai-responses', 'anthropic-messages'].includes(api)) throw new Error('不支持的应用模型协议');
+    const streamSimple = api === 'anthropic-messages' && descriptor.authHeader === true
+      ? await anthropicBearerStream(piRoot) : undefined;
     pi.registerProvider('feishu-sync-llm', {
       name: 'feishu-sync LLM',
       baseUrl: descriptor.baseUrl,
       apiKey: `$${API_KEY_ENV}`,
       ...(descriptor.authHeader === true ? { authHeader: true } : {}),
+      ...(streamSimple ? { streamSimple } : {}),
       api,
       models: (descriptor.models || []).map((model) => ({
         type: 'chat',

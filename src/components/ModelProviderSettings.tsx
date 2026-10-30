@@ -57,6 +57,7 @@ function makeProvider(existing: LlmProviderConfig[]): LlmProviderConfig {
     name: '新提供商',
     enabled: true,
     apiKey: '',
+    anthropicAuthType: 'auth-token',
     protocol: 'openai-completions',
     openAiCompatBaseUrl: '',
     defaultModelId: modelId,
@@ -423,12 +424,6 @@ export function ModelProviderSettings() {
               </div>
               <div className="space-y-3 rounded-md border border-line p-3">
               <h3 className="text-sm font-medium text-ink">Anthropic</h3>
-              <Select label="Anthropic 认证方式" value={selectedProvider.anthropicAuthType ?? 'api-key'} options={[
-                { value: 'api-key', label: 'API Key（x-api-key）' },
-                { value: 'auth-token', label: 'Bearer Token（Authorization）' },
-              ]} onChange={(event) => updateProvider(selectedProvider.id, (provider) => ({ ...provider,
-                anthropicAuthType: event.target.value as 'api-key' | 'auth-token' }))}
-                helperText="共用下方 API Key。按服务商要求选择；智谱等网关通常使用 Bearer Token。" />
               <Input label="Anthropic Messages Base URL" type="url"
                 value={selectedProvider.protocol === 'anthropic-messages' ? selectedProvider.openAiCompatBaseUrl : selectedProvider.protocolBaseUrls?.['anthropic-messages'] ?? ''}
                 onChange={(event) => {

@@ -43,8 +43,7 @@ it('跨子页保留草稿，统一保存提供商与默认设置，不覆盖 Age
     await act(async () => root.render(<SettingsDraftProvider><Controls /><ModelProviderSettings /><ModelDefaultsSettings /></SettingsDraftProvider>));
     const input = [...container.querySelectorAll('input')].find((item) => item.value === '提供商')!;
     await act(async () => setValue(input, '新提供商'));
-    const authLabel = [...container.querySelectorAll('label')].find((item) => item.textContent === 'Anthropic 认证方式')!;
-    await act(async () => setValue(container.querySelector(`#${authLabel.htmlFor}`) as HTMLSelectElement, 'auth-token'));
+    expect(container.textContent).not.toContain('Anthropic 认证方式');
     await act(async () => [...container.querySelectorAll('button')].find((item) => item.textContent === '切换子页')!.click());
     const label = [...container.querySelectorAll('label')].find((item) => item.textContent === '应用默认模型预设')!;
     const modelSelect = container.querySelector(`#${label.htmlFor}`) as HTMLSelectElement;
@@ -55,9 +54,40 @@ it('跨子页保留草稿，统一保存提供商与默认设置，不覆盖 Age
     await act(async () => [...container.querySelectorAll('button')].find((item) => item.textContent === '总保存')!.click());
     expect(fixture.save).toHaveBeenCalledTimes(1);
     expect(fixture.save).toHaveBeenCalledWith(expect.objectContaining({
-      llm: expect.objectContaining({ providers: [expect.objectContaining({ name: '新提供商', anthropicAuthType: 'auth-token' })], activeModelId: 'm1', contentAdaptationEnabled: true }),
+      llm: expect.objectContaining({ providers: [expect.objectContaining({ name: '新提供商' })], activeModelId: 'm1', contentAdaptationEnabled: true }),
     }));
     expect(fixture.save.mock.calls[0][0]).not.toHaveProperty('agent');
+  } finally { act(() => root.unmount()); container.remove(); }
+});
+
+it.each(['api-key', 'auth-token', undefined] as const)('编辑时保留已有 Anthropic 认证配置 %s', async (authType) => {
+  const initial = structuredClone(fixture.config);
+  const provider = fixture.config.llm.providers[0] as typeof fixture.config.llm.providers[number] & { anthropicAuthType?: 'api-key' | 'auth-token' };
+  if (authType === undefined) delete provider.anthropicAuthType;
+  else provider.anthropicAuthType = authType;
+  const container = document.createElement('div'); document.body.append(container); const root = createRoot(container);
+  try {
+    await act(async () => root.render(<SettingsDraftProvider><Controls /><ModelProviderSettings /></SettingsDraftProvider>));
+    expect(container.textContent).not.toContain('Anthropic 认证方式');
+    const name = [...container.querySelectorAll('input')].find((input) => input.value === '提供商')!;
+    await act(async () => setValue(name, '已编辑的提供商'));
+    await act(async () => [...container.querySelectorAll('button')].find((button) => button.textContent === '总保存')!.click());
+    expect(fixture.save).toHaveBeenCalledTimes(1);
+    expect(fixture.save.mock.calls[0][0].llm.providers[0].anthropicAuthType).toBe(authType);
+  } finally { act(() => root.unmount()); container.remove(); Object.assign(fixture.config, initial); }
+});
+
+it('新提供商自动使用 Bearer 认证，无需选择认证方式', async () => {
+  const container = document.createElement('div'); document.body.append(container); const root = createRoot(container);
+  try {
+    await act(async () => root.render(<SettingsDraftProvider><Controls /><ModelProviderSettings /></SettingsDraftProvider>));
+    await act(async () => [...container.querySelectorAll('button')].find((button) => button.textContent?.includes('添加提供商'))!.click());
+    expect(container.textContent).not.toContain('Anthropic 认证方式');
+    await act(async () => [...container.querySelectorAll('button')].find((button) => button.textContent === '总保存')!.click());
+    expect(fixture.save).toHaveBeenCalledTimes(1);
+    expect(fixture.save.mock.calls[0][0].llm.providers[1]).toEqual(expect.objectContaining({
+      name: '新提供商', anthropicAuthType: 'auth-token',
+    }));
   } finally { act(() => root.unmount()); container.remove(); }
 });
 

@@ -28,6 +28,8 @@ import { PiRuntimeResolver } from '../src/agent/runtime-resolver.js';
 import { piExtensionPath } from '../src/agent/agent-assets.js';
 import { parseSessionJsonl } from '../src/agent/session-service.js';
 import { buildDefaultAgentConfig } from '../src/types/agent-knowledge.js';
+import { buildAppLlmRunConfig } from '../src/agent/provider-descriptor.js';
+import { buildDefaultLlmConfigForTest } from './helpers/llm-fixture.js';
 
 const TEST_TIMEOUT_MS = 90_000;
 const SENTINEL_KEY = 'test-sentinel-key-f3r03';
@@ -70,6 +72,16 @@ function toolCallStreamChunks(): string {
   return sseBody(chunk({ role: 'assistant', content: '' }, null))
     + sseBody(chunk({ tool_calls: [{ index: 0, id: 'call_fix1', type: 'function', function: { name: 'kb_search', arguments: '{"query":"fixture"}' } }] }, null))
     + sseBody(chunk({}, 'tool_calls'));
+}
+
+function anthropicTextStream(text: string): string {
+  const event = (type: string, data: object) => `event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`;
+  return event('message_start', { message: { id: 'msg_fixture', type: 'message', role: 'assistant', model: 'fixture-model', content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0 } } })
+    + event('content_block_start', { index: 0, content_block: { type: 'text', text: '' } })
+    + event('content_block_delta', { index: 0, delta: { type: 'text_delta', text } })
+    + event('content_block_stop', { index: 0 })
+    + event('message_delta', { delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 1 } })
+    + event('message_stop', {});
 }
 
 function waitFor(predicate: () => boolean, timeoutMs = 20_000, label = 'condition'): Promise<void> {
@@ -135,6 +147,9 @@ beforeAll(async () => {
           res.write(textStreamChunks('FIXTURE_ACK_7f3a 收到'));
           res.end('data: [DONE]\n\n');
         }
+      } else if (req.method === 'POST' && String(req.url).includes('/v1/messages')) {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        res.end(anthropicTextStream('ANTHROPIC_FIXTURE_OK'));
       } else {
         res.writeHead(404, { 'Content-Type': 'application/json' });
         res.end('{}');
@@ -174,6 +189,7 @@ interface SpawnOptions {
   tools?: string[];
   runKind: 'discuss' | 'work';
   sharedHome?: string;
+  anthropicAuth?: 'api-key' | 'auth-token';
 }
 
 async function spawnFixturePi(options: SpawnOptions): Promise<PiRpcProcess> {
@@ -192,10 +208,23 @@ async function spawnFixturePi(options: SpawnOptions): Promise<PiRpcProcess> {
     apiKey: SENTINEL_KEY,
   });
   env.FEISHU_SYNC_AGENT_PI_PACKAGE_ROOT = runtime!.piPackageRoot!;
-  if (!options.sharedHome) env.FEISHU_SYNC_AGENT_PROVIDER_JSON = JSON.stringify({
-    baseUrl: `http://127.0.0.1:${llmPort}/v1`,
-    models: [{ id: 'fixture-model', contextWindow: 8192, maxTokens: 1024 }],
-  });
+  if (!options.sharedHome) {
+    if (options.anthropicAuth) {
+      const llm = buildDefaultLlmConfigForTest();
+      const provider = llm.providers![0];
+      provider.apiKey = SENTINEL_KEY;
+      provider.protocol = 'anthropic-messages';
+      provider.openAiCompatBaseUrl = `http://127.0.0.1:${llmPort}`;
+      provider.anthropicAuthType = options.anthropicAuth;
+      provider.models[0].openAiModel = 'fixture-model';
+      const agent = buildDefaultAgentConfig(fixtureRoot);
+      agent.model.source = 'app-llm';
+      env.FEISHU_SYNC_AGENT_PROVIDER_JSON = buildAppLlmRunConfig(llm, agent)!.providerJson;
+    } else env.FEISHU_SYNC_AGENT_PROVIDER_JSON = JSON.stringify({
+      baseUrl: `http://127.0.0.1:${llmPort}/v1`,
+      models: [{ id: 'fixture-model', contextWindow: 8192, maxTokens: 1024 }],
+    });
+  }
   const rpc = new PiRpcProcess({
     nodePath: runtime!.nodePath!,
     piCliPath: runtime!.piCliPath!,
@@ -210,6 +239,23 @@ async function spawnFixturePi(options: SpawnOptions): Promise<PiRpcProcess> {
   });
   await rpc.start(30_000);
   return rpc;
+}
+
+for (const anthropicAuth of ['api-key', 'auth-token'] as const) {
+  it(`真实 Pi 使用已保存的 Anthropic 认证 ${anthropicAuth}`, async (ctx) => {
+    if (!piAvailable()) { ctx.skip(); return; }
+    const start = llmRequests.length;
+    const rpc = await spawnFixturePi({ runKind: 'discuss', anthropicAuth });
+    try {
+      const result = await rpc.prompt('fixture');
+      expect(result).toMatchObject({ outcome: 'completed', lastAssistantText: 'ANTHROPIC_FIXTURE_OK' });
+      const request = llmRequests.slice(start).find((call) => call.url.includes('/v1/messages'));
+      expect(request).toBeDefined();
+      expect(request!.body.model).toBe('fixture-model');
+      expect(request!.auth).toBe(anthropicAuth === 'auth-token' ? `Bearer ${SENTINEL_KEY}` : undefined);
+      expect(request!.headers['x-api-key']).toBe(anthropicAuth === 'api-key' ? SENTINEL_KEY : undefined);
+    } finally { await rpc.terminate(); }
+  }, TEST_TIMEOUT_MS);
 }
 
 describe('R03：app-llm provider 注入（真实 pi + 本地 OpenAI 兼容 fixture）', () => {
