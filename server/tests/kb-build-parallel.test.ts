@@ -290,7 +290,7 @@ interface Harness {
   };
 }
 
-function makeHarness(config: Config, script: FakeScript = { claimRejections: [] }, vision?: Harness['visionDescriber'], excluded: string[] = [], published: string[] = []): Harness {
+function makeHarness(config: Config, script: FakeScript = { claimRejections: [] }, vision?: Harness['visionDescriber'], excluded: string[] = [], published: string[] = [], unselected: string[] = []): Harness {
   const pool = new AgentProcessPool({ maxConcurrentProcesses: 3, idleTimeoutMinutes: 10 });
   const toolService = new AgentToolService({ dataRoot, documentsProvider: () => documents });
   const fakes: FakeRpcProcess[] = [];
@@ -303,6 +303,7 @@ function makeHarness(config: Config, script: FakeScript = { claimRejections: [] 
     configProvider: () => config,
     documentsProvider: () => documents,
     excludedSourcesProvider: () => excluded,
+    unselectedSourcesProvider: () => unselected,
     publishedTokensProvider: () => published,
     sheetCsvPaths: () => [],
     internalBaseUrl: () => 'http://127.0.0.1:39999',
@@ -551,6 +552,26 @@ describe('S4：buildParallelism=1 等价回退（全量端到端发布）', () =
 });
 
 describe('S4：双 worker 并行 + 路径认领', () => {
+  it('并行构建所选新来源时继承旧库，未勾选的旧文档与身份保持', async () => {
+    const original = docRecord('tokKeep', 'keep/source.md');
+    const first = docRecord('tokNewA', 'branchA/source.md');
+    const second = docRecord('tokNewB', 'branchB/source.md');
+    for (const doc of [original, first, second]) writeRaw(doc.localRelPath!, FAT);
+    documents.length = 0; documents.push(original, first, second);
+    const harness = makeHarness(makeConfig({ buildParallelism: 2 }), {}, undefined, [], [], ['tokKeep']);
+    const releaseId = await publishBase(harness, [{ path: '已有/保留.md', docId: 'kd_keep', sources: ['tokKeep'], body: '保留的独立规则。' }], RawSourceSnapshot.scan(kbRoot, [original]).entries);
+    const bytes = fs.readFileSync(path.join(outputRoot, 'releases', releaseId, 'docs', '已有/保留.md'));
+    const dto = await harness.service.createBuild(store as never, { mode: 'incremental', confirm: 'BUILD', rebuildSelected: true });
+    const row = await waitForTerminal(dto.id);
+    expect(row.status, String(row.error_message)).toBe('published'); expect(row.parallelism).toBe(2);
+    const manifest = new StandardKbStore(outputRoot).readManifest()!;
+    expect(manifest.docs.find((doc) => doc.path === '已有/保留.md')).toMatchObject({ docId: 'kd_keep', sources: ['tokKeep'] });
+    expect(manifest.docs.some((doc) => doc.sources.includes('tokNewA'))).toBe(true);
+    expect(manifest.docs.some((doc) => doc.sources.includes('tokNewB'))).toBe(true);
+    expect(fs.readFileSync(path.join(outputRoot, 'releases', manifest.releaseId, 'docs', '已有/保留.md'))).toEqual(bytes);
+    expect(manifest.sourceSnapshot.map((source) => source.objToken).sort()).toEqual(['tokKeep', 'tokNewA', 'tokNewB']);
+  });
+
   it('他单元预认领路径写入被拒（kb_path_owned_by_other_unit），构建仍发布', async () => {
     // 基线：已有/共享.md ← tokA（增量时 tokA changed）
     writeRaw('dir1/a.md', `a v1 ${FAT}`);

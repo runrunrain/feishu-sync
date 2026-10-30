@@ -13,6 +13,8 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { writeSearchRelease } from './helpers/kb-search-fixture.js';
+import { LocalMapStore } from '../src/modules/local-map-store.js';
+import { RawQueryService } from '../src/kb/raw-query-service.js';
 
 const serverRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const gatewayScript = path.join(serverRoot, 'dist/mcp/kb-mcp-gateway.cjs');
@@ -32,6 +34,26 @@ async function connect(url: string, token: string) {
   const transport = new StreamableHTTPClientTransport(new URL(url), { requestInit: { headers: { Authorization: `Bearer ${token}` } } });
   await client.connect(transport); closers.push(() => client.close()); return { client, transport };
 }
+
+it('application startup snapshots actual indexed outgoing and incoming references for MCP', async () => {
+  const root = temporary(), raw = path.join(root, 'raw'); fs.mkdirSync(raw); vi.stubEnv('FEISHU_SYNC_HOME', root);
+  fs.writeFileSync(path.join(raw, '来源.md'), '# 来源'); fs.writeFileSync(path.join(raw, '目标.md'), '# 目标');
+  const configPath = path.join(root, 'config.json');
+  fs.writeFileSync(configPath, JSON.stringify({ knowledgeBaseRoot: raw, standardKb: { outputRoot: path.join(root, 'standard') }, agent: {}, cli: { enabled: false }, kbLanMcp: { enabled: false, bindAddress: '127.0.0.1', port: await freePort(), maxSessions: 16 } }));
+  const store = new LocalMapStore(path.join(root, 'feishu-sync.db')); store.initialize();
+  const src = 'src0000000000001', dst = 'dst0000000000001', wiki = 'wik0000000000001';
+  try {
+    store.upsertDocument({ objToken: src, objType: 'docx', title: '来源', wikiNodeToken: null, localRelPath: '来源.md', localMdPath: path.join(raw, '来源.md'), lastSyncedModifyTime: '', lastSyncedAt: '2026-01-01T00:00:00Z', status: 'synced' });
+    store.upsertDocument({ objToken: dst, objType: 'docx', title: '目标', wikiNodeToken: wiki, localRelPath: '目标.md', localMdPath: path.join(raw, '目标.md'), lastSyncedModifyTime: '', lastSyncedAt: '2026-01-01T00:00:00Z', status: 'synced' });
+    store.replaceSourceReferences(src, [{ targetToken: wiki, targetType: 'wiki', origin: 'body', kind: 'link', occurrences: 2 }]);
+  } finally { store.close(); }
+  const { startServer } = await import('../src/index.js');
+  const main = await startServer({ configPath, desktopMode: true, desktopToken: 'synthetic-desktop-control', hostname: '127.0.0.1', port: 0 });
+  closers.push(main.close);
+  const service = new RawQueryService(path.join(root, 'mcp/raw-catalog.json'));
+  expect(await service.call('raw_links', { objToken: src }, 6000)).toMatchObject({ outCount: 1, links: [{ objToken: dst, occurrences: 2 }] });
+  expect(await service.call('raw_links', { objToken: dst }, 6000)).toMatchObject({ inCount: 1, links: [{ objToken: src }] });
+}, 20000);
 
 it('desktop manages the real gateway, three readers agree, notices are per session, rotation and disable revoke access', async () => {
   const root = temporary(), kb = path.join(root, 'standard'), port = await freePort();
@@ -62,7 +84,7 @@ it('desktop manages the real gateway, three readers agree, notices are per sessi
   const stdio = new Client({ name: 'stdio-comparison', version: '2' });
   await stdio.connect(new StdioClientTransport({ command: process.execPath, args: [stdioScript, '--kb-root', kb, '--raw-catalog', path.join(root, 'mcp/raw-catalog.json')], env: { ...process.env, FEISHU_SYNC_HOME: root } as Record<string, string> }));
   expect((await stdio.listTools()).tools).toEqual((await a.client.listTools()).tools);
-  expect((await stdio.listTools()).tools).toHaveLength(10);
+  expect((await stdio.listTools()).tools).toHaveLength(17);
   closers.push(() => stdio.close());
   const args = { query: '暴击 伤害', limit: 10 };
   const httpSearch = JSON.parse(text(await a.client.callTool({ name: 'search_knowledge', arguments: args })));

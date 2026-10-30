@@ -54,8 +54,8 @@ export function MessageStream({ messages, draft, streamErrors, loading, emptyHin
   const hasContent = messages.length > 0 || draft !== null || streamErrors.length > 0 || (approvals?.length ?? 0) > 0 || (taskNotices?.length ?? 0) > 0;
 
   return (
-    <div ref={scrollRef} className="flex-1 min-h-0 overflow-auto scrollbar-thin" data-testid="agent-message-stream">
-      <div className="max-w-3xl mx-auto px-5 py-4 space-y-3">
+    <div ref={scrollRef} className="flex-1 min-h-0 min-w-0 overflow-auto scrollbar-thin" data-testid="agent-message-stream">
+      <div className="w-full min-w-0 px-3 py-4 space-y-3 sm:px-6 lg:px-8">
         {loading && messages.length === 0 && !draft ? (
           <div className="space-y-3 py-4" aria-busy="true">
             <div className="h-10 w-3/5 rounded-md bg-paper-2 animate-pulse" />

@@ -96,7 +96,7 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
   const [directoryOpen, setDirectoryOpen] = useState(true);
   const [sidebar, setSidebar] = useState<'sources' | 'build' | 'publish' | 'progress' | null>(null);
   const [cancelling, setCancelling] = useState(false);
-  const [confirming, setConfirming] = useState<'incremental' | 'full' | null>(null);
+  const [confirming, setConfirming] = useState<'incremental' | 'selected' | null>(null);
   const [selectedBuildCount, setSelectedBuildCount] = useState(0);
   const [refreshImages, setRefreshImages] = useState(false);
   const [starting, setStarting] = useState(false);
@@ -291,19 +291,21 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
 
   // ---- 构建动作 -----------------------------------------------------------
   const startBuild = useCallback(
-    async (mode: 'incremental' | 'full', refresh = false) => {
+    async (mode: 'incremental' | 'selected', refresh = false) => {
       setStarting(true);
       try {
-        const dto = refresh ? await createKbBuild(mode, { refreshImages: true }) : await createKbBuild(mode);
+        const dto = mode === 'selected'
+          ? await createKbBuild('incremental', { rebuildSelected: true, ...(refresh ? { refreshImages: true } : {}) })
+          : await createKbBuild('incremental');
         setBuild(dto);
         setBuildIssues([]);
         setBuildLogs([]);
-        if (TERMINAL_BUILD.has(dto.status)) {
+        if (dto.status === 'published') {
           // 立即终态（如 no_changes 直接 published）。
           if (dto.noChanges) {
             toast.push({ type: 'info', message: '原始库无变更，未生成新发布' });
-            void loadStatus();
           }
+          void refreshPublished();
         }
         setConfirming(null);
         setRefreshImages(false);
@@ -326,7 +328,7 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
         setStarting(false);
       }
     },
-    [agent, loadStatus, toast],
+    [agent, loadStatus, refreshPublished, toast],
   );
 
   const cancelBuild = useCallback(async () => {
@@ -467,11 +469,11 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
                 {onJumpToSettings ? <button type="button" className="text-seal underline" onClick={onJumpToSettings}>前往设置</button> : null}
               </div>
             </div> : null}
-            <KbChangesPanel tab={changeTab} onTab={setChangeTab}
+            <KbChangesPanel tab={changeTab} onTab={setChangeTab} releaseId={kbStatus?.current?.releaseId}
               running={running} canUpdate={agentReady && !starting}
               onChanged={() => { void loadStatus(); setDocReload((n) => n + 1); }}
               onUpdate={() => setConfirming('incremental')}
-              onBuildSelected={(count) => { setSelectedBuildCount(count); setRefreshImages(false); setConfirming('full'); }}
+              onBuildSelected={(count) => { setSelectedBuildCount(count); setRefreshImages(false); setConfirming('selected'); }}
               onOpenSource={(choice) => setSource({ objToken: choice.objToken, title: choice.title, relPath: choice.relPath, state: choice.excluded ? 'excluded' : 'current' })} />
           </>}
       </aside> : null}
@@ -504,16 +506,17 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
       {/* 构建确认弹窗 */}
       <Modal
         open={confirming !== null}
-        title={confirming === 'full' ? '确认构建所选文档' : '确认按变更更新'}
+        title={confirming === 'selected' ? '确认构建所选文档' : '确认按变更更新'}
         onClose={() => { setConfirming(null); setRefreshImages(false); }}
       >
-        {confirming === 'full' ? (
+        {confirming === 'selected' ? (
           <div className="space-y-3 text-sm text-ink-soft leading-relaxed">
             <p>
-              将使用当前已选的 <b className="text-ink">{selectedBuildCount} 篇源文档</b>重新生成标准库。
-              {kbStatus?.current ? `新版本会替换当前发布的 ${kbStatus.current.docCount} 篇标准文档，未选源文档的内容不会保留在新版本中。` : ''}
+              将构建当前已选的 <b className="text-ink">{selectedBuildCount} 篇源文档</b>。
+              {kbStatus?.current ? `在现有 ${kbStatus.current.docCount} 篇标准文档的基础上继续构建，合并更新相关内容，保留未受影响的文档。` : '本次将创建标准知识库。'}
               构建会消耗已配置模型的额度。
             </p>
+            {kbStatus?.current && pending && (pending.changed > 0 || pending.removed > 0) ? <p className="text-xs text-ink-faint">已有来源的待更新内容也会一并处理。</p> : null}
             <p className="text-xs text-ink-faint">
               发布前旧版本保持可用；任何失败都不会改变当前已发布的版本。
             </p>
@@ -521,14 +524,14 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
               <input type="checkbox" className="mt-1 accent-[#9e2b25]" checked={refreshImages} disabled={starting}
                 onChange={(event) => setRefreshImages(event.target.checked)} />
               <span>
-                <span className="block text-ink">重新生成所选文档的图片描述</span>
+                <span className="block text-ink">重新生成本次处理文档的图片描述</span>
                 <span className="block mt-1 text-xs text-ink-faint">会重新调用识图模型并计入识图上限；相同图片共用缓存，失败时保留原有缓存。</span>
               </span>
             </label>
             <ConfirmActions
               confirmLabel="开始构建"
               busy={starting}
-              onConfirm={() => startBuild('full', refreshImages)}
+              onConfirm={() => startBuild('selected', refreshImages)}
               onCancel={() => { setConfirming(null); setRefreshImages(false); }}
             />
           </div>

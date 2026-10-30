@@ -88,8 +88,10 @@ it('左侧目录保持可用，构建、差异、版本和进度从右侧直接�
     await click(button('全选'));
     await click(button('构建所选文档'));
     expect(container.querySelector('[role="dialog"]')?.textContent).toContain('2 篇源文档');
+    expect(container.querySelector('[role="dialog"]')?.textContent).toContain('在现有 2 篇标准文档的基础上继续构建');
+    expect(container.querySelector('[role="dialog"]')?.textContent).not.toContain('未选源文档的内容不会保留');
     await click(button('开始构建'));
-    expect(state.createBuild).toHaveBeenCalledWith('full');
+    expect(state.createBuild).toHaveBeenCalledWith('incremental', { rebuildSelected: true });
     expect(container.querySelector('[data-testid="kb-build-sidebar"]')).not.toBeNull();
     expect(container.querySelector('[aria-label="标准库构建进度"]')).toBeNull();
 
@@ -128,7 +130,7 @@ it('所选文档可选择重新生成图片描述，取消重置并在启动失�
     await act(async () => root.render(<KnowledgeView />));
     await click(container.querySelector<HTMLButtonElement>('[aria-label="打开构建标准库"]')!);
     await click(button('构建所选文档'));
-    expect(dialog().textContent).toContain('重新生成所选文档的图片描述');
+    expect(dialog().textContent).toContain('重新生成本次处理文档的图片描述');
     expect(checkbox().checked).toBe(false);
     await click(checkbox());
     await click(button('取消'));
@@ -136,11 +138,11 @@ it('所选文档可选择重新生成图片描述，取消重置并在启动失�
     expect(checkbox().checked).toBe(false);
     await click(checkbox());
     await click(button('开始构建'));
-    expect(state.createBuild).toHaveBeenLastCalledWith('full', { refreshImages: true });
+    expect(state.createBuild).toHaveBeenLastCalledWith('incremental', { rebuildSelected: true, refreshImages: true });
     expect(checkbox().checked).toBe(true);
     await click(button('开始构建'));
     expect(state.createBuild).toHaveBeenCalledTimes(2);
-    expect(state.createBuild).toHaveBeenLastCalledWith('full', { refreshImages: true });
+    expect(state.createBuild).toHaveBeenLastCalledWith('incremental', { rebuildSelected: true, refreshImages: true });
     expect(container.querySelector('[role="dialog"]')).toBeNull();
   } finally { act(() => root.unmount()); container.remove(); }
 });

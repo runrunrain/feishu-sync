@@ -11,7 +11,7 @@ function SelectionBox({ included, total, disabled, title, onChange, cleanup = fa
   useEffect(() => { if (ref.current) ref.current.indeterminate = included > 0 && included < total; }, [included, total]);
   return <input ref={ref} type="checkbox" aria-label={`${cleanup ? '选择清理' : '参与构建'}：${title}`} checked={total > 0 && included === total} disabled={disabled || !total} onChange={onChange} className="accent-[#9e2b25] shrink-0" />;
 }
-export function KbSourceSelector({ running, nonce, onChanged, onOpenSource, canBuild, onBuild }: { running: boolean; nonce: number; onChanged: () => void; onOpenSource: (source: KbSourceChoice) => void; canBuild: boolean; onBuild: (count: number) => void }) {
+export function KbSourceSelector({ running, nonce, releaseId, onChanged, onOpenSource, canBuild, onBuild }: { running: boolean; nonce: number; releaseId?: string | null; onChanged: () => void; onOpenSource: (source: KbSourceChoice) => void; canBuild: boolean; onBuild: (count: number) => void }) {
   const [data, setData] = useState<KbSourceTreeDto | null>(null);
   const [cleanupMode, setCleanupMode] = useState(false);
   const [selected, setSelected] = useState(new Set<string>());
@@ -23,7 +23,7 @@ export function KbSourceSelector({ running, nonce, onChanged, onOpenSource, canB
   useEffect(() => { let disposed = false; setLoading(true); setError('');
     void getKbSourceTree().then((value) => { if (!disposed) setData(value); }).catch((err) => { if (!disposed) setError(String(err.message ?? err)); }).finally(() => { if (!disposed) setLoading(false); });
     return () => { disposed = true; };
-  }, [nonce]);
+  }, [nonce, releaseId]);
   const tree = useMemo(() => sourceTreeRows(data?.nodes ?? [], q, collapsed, cleanupMode ? selected : undefined), [data, q, collapsed, cleanupMode, selected]);
   const allStats = useMemo(() => sourceTreeRows(data?.nodes ?? [], '', new Set(), cleanupMode ? selected : undefined).stats, [data, cleanupMode, selected]);
   const totalIncluded = (data?.nodes ?? []).reduce((sum, node) => sum + (allStats.get(node.id)?.included ?? 0), 0);
@@ -63,7 +63,7 @@ export function KbSourceSelector({ running, nonce, onChanged, onOpenSource, canB
   </div>;
   return <div className="flex h-full min-h-0 flex-col">
     <div className="shrink-0 max-h-[45%] overflow-y-auto scrollbar-thin">
-    {!cleanupMode ? <p className="text-xs text-ink-soft mb-3 leading-relaxed">勾选某个层级会同时选择其全部下级文档，用于「构建所选文档」。取消勾选不会产生移除差异；「按变更更新」会继续保留仍然可用的已发布来源。</p> : null}
+    {!cleanupMode ? <p className="text-xs text-ink-soft mb-3 leading-relaxed">勾选包含该层级的全部下级文档。构建会在现有标准库基础上继续，已构建来源可重新选中更新；取消勾选不会产生移除差异。</p> : null}
     {cleanupMode ? <p role="status" className="text-sm text-seal mb-3">清理选择模式：请勾选要移入回收区的文档，再点击「清理所选」。</p> : null}
     {notice ? <p role="status" className="text-xs text-jade break-all mb-3">{notice}</p> : null}
     <input aria-label="搜索源文档" placeholder="搜索标题、路径或文档标识" value={q} onChange={(e) => { setQ(e.target.value); resetScroll(); }} className="w-full px-3 py-2 mb-3 rounded border border-line bg-card-bg text-sm" />
@@ -91,7 +91,7 @@ export function KbSourceSelector({ running, nonce, onChanged, onOpenSource, canB
             <div className="flex-1 min-w-0"><span className="block text-sm text-ink truncate" title={node.source?.relPath ?? node.title}>{node.title}</span></div>
             {node.children.length ? <span className="text-xs text-ink-soft shrink-0">{count.included}/{count.total} 篇</span> : null}
             {node.sourceUnavailable ? <span className="text-xs text-ink-faint shrink-0" title="该节点是一份云文档，目前没有可确认的本地正文；同步成功或恢复本地版本后可参与构建">源不可用</span> : null}
-            {node.source ? <>{node.source.recovered ? <span className="text-xs text-jade shrink-0" title="按文档标识找到的本地历史版本，云端同步状态未变">本地</span> : null}<span className="text-xs text-ink-faint shrink-0">{LABEL[node.source.pending]}</span><button className="text-xs text-seal shrink-0" onClick={() => onOpenSource(node.source!)} aria-label={`预览：${node.title}`}>预览</button></> : null}
+            {node.source ? <>{node.source.published ? <span className="text-xs text-jade shrink-0" title="已包含在当前标准库中，重新选中可更新相关内容">已构建</span> : null}{node.source.recovered ? <span className="text-xs text-jade shrink-0" title="按文档标识找到的本地历史版本，云端同步状态未变">本地</span> : null}<span className="text-xs text-ink-faint shrink-0">{LABEL[node.source.pending]}</span><button className="text-xs text-seal shrink-0" onClick={() => onOpenSource(node.source!)} aria-label={`预览：${node.title}`}>预览</button></> : null}
             <button className="text-xs text-seal shrink-0 disabled:opacity-40" disabled={disabled} aria-label={`清理${node.children.length ? '层级' : '文档'}：${node.title}`} onClick={() => requestCleanup(subtreeTokens([node]))}>清理</button>
           </div>;
         })}

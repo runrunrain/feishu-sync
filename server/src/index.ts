@@ -693,7 +693,10 @@ export async function buildServer(options: CreateServerOptions = {}) {
   (app as any).__kbLanGateway = kbLanGateway;
   (app as any).__refreshRawMcpCatalog = () => {
     const root = configManager.getConfig()?.knowledgeBaseRoot ?? '';
-    try { writeRawCatalog(rawCatalogPath(agentDataRoot), root, root ? knowledgeDocuments() : [], sheetCsvPaths); }
+    try { writeRawCatalog(rawCatalogPath(agentDataRoot), root, root ? knowledgeDocuments() : [], sheetCsvPaths, (doc) => ({
+      out: localMapStore.listSourceReferencesBySrc(doc.objToken),
+      in: localMapStore.listSourceReferencesByTarget([doc.objToken, doc.wikiNodeToken ?? ''].filter(Boolean)),
+    })); }
     catch (error) {
       // A root switch or failed projection must not continue exposing the former allowlist.
       writeRawCatalog(rawCatalogPath(agentDataRoot), root, [], () => []);

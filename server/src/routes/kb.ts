@@ -415,7 +415,7 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
 
   routes.post('/api/kb/builds', async (c) => {
     try {
-      const body = await c.req.json() as { mode?: string; confirm?: string; refreshImages?: boolean };
+      const body = await c.req.json() as { mode?: string; confirm?: string; refreshImages?: boolean; rebuildSelected?: boolean };
       const dto = await buildService.createBuild(localMapStore as never, body);
       return c.json(dto, 202);
     } catch (error) {

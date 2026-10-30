@@ -104,6 +104,8 @@ export interface BuildRunState {
   finishInfo: { summary: string; skipped: Array<{ objToken: string; reason: string }>; docMerges?: Array<{ path: string; mergedInto: string[] }> } | null;
   /** 受旧源变动影响的现存草稿必须显式重写，不能借旧sources声明冒充更新。 */
   requiredRewrites?: Set<string>;
+  /** 继续构建时，未受影响的旧文档须保留，或经显式合并继承全部来源。 */
+  preservedDocs?: Map<string, string[]>;
   writtenPaths?: Set<string>;
   /** Pinned previous release, used to reject invented merge origins before kb_finish commits. */
   baseDocPaths?: Set<string>;

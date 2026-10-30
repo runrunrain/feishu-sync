@@ -31,7 +31,7 @@ it('old app-owned stdio entries gain raw tools, but unrelated standard roots do 
   const standard = path.join(root, 'standard');
   fs.writeFileSync(path.join(root, 'config.json'), JSON.stringify({ standardKb: { outputRoot: standard } }));
   writeRawCatalog(path.join(root, 'mcp/raw-catalog.json'), raw, records, () => []);
-  for (const [kbRoot, count] of [[standard, 10], [path.join(root, 'unrelated'), 7]] as const) {
+  for (const [kbRoot, count] of [[standard, 17], [path.join(root, 'unrelated'), 7]] as const) {
     const client = new Client({ name: 'legacy-config', version: '1' });
     try {
       await client.connect(new StdioClientTransport({ command: process.execPath, args: [path.resolve('dist/mcp/kb-mcp.cjs'), '--kb-root', kbRoot],
@@ -87,7 +87,7 @@ it('real stdio and authenticated HTTP expose identical raw tools/results, matchi
     await local.connect(new StdioClientTransport({ command: process.execPath, args: [path.resolve('dist/mcp/kb-mcp.cjs'), '--kb-root', standard.kbRoot, '--raw-catalog', catalog], stderr: 'pipe' }));
     await remote.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${(gateway.server.address() as AddressInfo).port}/mcp`), { requestInit: { headers: { Authorization: `Bearer ${token}` } } }));
     expect((await local.listTools()).tools).toEqual((await remote.listTools()).tools);
-    expect((await local.listTools()).tools).toHaveLength(10);
+    expect((await local.listTools()).tools).toHaveLength(17);
     for (const [name, args] of [['raw_list', { pathPrefix: '200' }], ['raw_search', { query: '200 数据结构' }], ['raw_read', { objToken: 't1' }]] as const) {
       const request = { name, arguments: args }; const a = await local.callTool(request), b = await remote.callTool(request);
       expect(a.isError).not.toBe(true); expect(a).toEqual(b);

@@ -25,7 +25,7 @@ export function KbPendingImagesHint({ images }: { images: { total: number; uncac
   );
 }
 
-export function KbChangesPanel({ tab, onTab, onChanged, onUpdate, onBuildSelected, onOpenSource, running, canUpdate }: {
+export function KbChangesPanel({ tab, onTab, onChanged, onUpdate, onBuildSelected, onOpenSource, running, canUpdate, releaseId }: {
   tab: KbChangeTab;
   onTab: (tab: KbChangeTab) => void;
   onChanged: () => void;
@@ -34,6 +34,7 @@ export function KbChangesPanel({ tab, onTab, onChanged, onUpdate, onBuildSelecte
   onOpenSource: (source: KbSourceChoice) => void;
   running: boolean;
   canUpdate: boolean;
+  releaseId?: string | null;
 }) {
   const [preview, setPreview] = useState<KbChangePreview | null>(null);
   const [history, setHistory] = useState<Awaited<ReturnType<typeof listKbVersions>> | null>(null);
@@ -65,7 +66,7 @@ export function KbChangesPanel({ tab, onTab, onChanged, onUpdate, onBuildSelecte
       finally { if (!disposed) setLoading(false); }
     })();
     return () => { disposed = true; };
-  }, [tab, nonce]);
+  }, [tab, nonce, releaseId]);
 
   useEffect(() => {
     if (tab !== 'history' || !versionId) { setVersion(null); return; }
@@ -75,7 +76,7 @@ export function KbChangesPanel({ tab, onTab, onChanged, onUpdate, onBuildSelecte
       .catch((err) => { if (!disposed) setError(err instanceof Error ? err.message : '版本读取失败'); })
       .finally(() => { if (!disposed) setVersionLoading(false); });
     return () => { disposed = true; };
-  }, [tab, versionId, nonce]);
+  }, [tab, versionId, nonce, releaseId]);
 
   return <div className="flex flex-1 min-h-0 flex-col p-3" data-testid="kb-build-sidebar">
     <div className="flex shrink-0 items-center gap-1 border-b border-line pb-3 mb-3" role="tablist" aria-label="构建内容">
@@ -89,7 +90,7 @@ export function KbChangesPanel({ tab, onTab, onChanged, onUpdate, onBuildSelecte
     </div>
     {error ? <p role="alert" className="text-sm text-seal-2 mb-3">{error}</p> : null}
     <div className={`flex-1 min-h-0 ${tab === 'sources' ? 'overflow-hidden' : 'overflow-auto scrollbar-thin pr-1'}`}>
-      {tab === 'sources' ? <KbSourceSelector nonce={nonce} running={running} canBuild={canUpdate} onBuild={onBuildSelected} onChanged={onChanged} onOpenSource={onOpenSource} /> : tab === 'pending' ? <>
+      {tab === 'sources' ? <KbSourceSelector nonce={nonce} releaseId={releaseId} running={running} canBuild={canUpdate} onBuild={onBuildSelected} onChanged={onChanged} onOpenSource={onOpenSource} /> : tab === 'pending' ? <>
         <p className="text-xs text-ink-soft mb-3">比较当前参与构建的原始源与最近发布的源快照。差异用于更新判断，正文会重新写成完整说明。</p>
         {loading ? <p className="text-xs text-ink-faint">正在计算差异…</p> : preview ? <>
           <p className="text-sm text-ink mb-2">{preview.sources.length} 个源变更 · {preview.affectedDocs.length} 篇已有标准文档受影响</p>

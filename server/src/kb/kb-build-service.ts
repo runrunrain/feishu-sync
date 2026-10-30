@@ -33,7 +33,7 @@ import { hasEditorialHistory, hasSourceMetadata } from './body-policy.js';
 import { planUnits, packBatches, type BuildUnit } from './build-units.js';
 import { countText } from './text-stats.js';
 import { PathClaims } from './path-claims.js';
-import { collectWhiteboardTextsForEntries, enrichEntriesWithMedia, resolveSourceImages, verifyEntryMediaHash, verifyEntryWhiteboardTextHash } from './source-images.js';
+import { collectWhiteboardTextsForEntries, enrichEntriesWithMedia, hashImageFile, resolveSourceImages, verifyEntryMediaHash, verifyEntryWhiteboardTextHash } from './source-images.js';
 import type { ImageDescription } from '../agent/vision/vision-describer.js';
 import { VisionDescriber } from '../agent/vision/vision-describer.js';
 import { buildDefaultAgentVisionConfig } from '../types/agent-knowledge.js';
@@ -100,6 +100,8 @@ interface InMemoryBuild {
   backend?: 'pi' | 'claude-code';
   /** 本次所选源文档的图片是否强制重新识别。 */
   refreshImages: boolean;
+  /** 沿用当前标准库，并强制重建当前勾选的源。 */
+  rebuildSelected: boolean;
   imageRefreshFailures: number;
   batchIndex: number;
   batchTotal: number;
@@ -288,7 +290,7 @@ export class KbBuildService extends EventEmitter {
       getActiveKbBuild(): Record<string, unknown> | null;
       updateKbBuild(id: string, patch: Record<string, unknown>): void;
     },
-    input: { mode?: string; confirm?: string; refreshImages?: boolean },
+    input: { mode?: string; confirm?: string; refreshImages?: boolean; rebuildSelected?: boolean },
   ): Promise<KbBuildDto> {
     const config = this.deps.configProvider();
     if (!config) throw new ToolError('invalid_request', '配置不可用');
@@ -301,7 +303,13 @@ export class KbBuildService extends EventEmitter {
     if (input.refreshImages !== undefined && typeof input.refreshImages !== 'boolean') {
       throw new ToolError('invalid_request', 'refreshImages 必须是布尔值');
     }
-    if (input.refreshImages && input.mode !== 'full') {
+    if (input.rebuildSelected !== undefined && typeof input.rebuildSelected !== 'boolean') {
+      throw new ToolError('invalid_request', 'rebuildSelected 必须是布尔值');
+    }
+    if (input.rebuildSelected && input.mode !== 'incremental') {
+      throw new ToolError('invalid_request', '构建所选文档须在现有标准库基础上继续构建');
+    }
+    if (input.refreshImages && input.mode !== 'full' && !input.rebuildSelected) {
       throw new ToolError('invalid_request', '重新生成图片描述仅支持构建所选文档');
     }
     if (this.running || localMapStore.getActiveKbBuild()) {
@@ -342,6 +350,7 @@ export class KbBuildService extends EventEmitter {
       id: buildId,
       backend: config.agent.runtime.backend === 'claude-code' ? 'claude-code' : 'pi',
       refreshImages: input.refreshImages === true,
+      rebuildSelected: input.rebuildSelected === true,
       imageRefreshFailures: 0,
       batchIndex: 0,
       batchTotal: 0,
@@ -524,6 +533,15 @@ export class KbBuildService extends EventEmitter {
         for (const token of changeset.added) workset.set(token, 'added');
         for (const token of changeset.changed) workset.set(token, 'changed');
       }
+      if (entry.rebuildSelected) {
+        const unselected = new Set(this.deps.unselectedSourcesProvider?.() ?? this.deps.excludedSourcesProvider?.() ?? []);
+        const selected = snapshot.entries.filter((source) => !unselected.has(source.objToken));
+        if (!selected.length) throw new ToolError('no_sources_selected', '没有可构建的所选源文档，请刷新源文档列表后重新选择。', 400);
+        for (const source of selected) {
+          if (!workset.has(source.objToken)) workset.set(source.objToken, 'rebuild');
+        }
+        this.emitLog(buildId, 'info', `继续构建：${selected.length} 个所选源，保留未受影响的现有标准文档`);
+      }
 
       localMapStore.updateKbBuild(buildId, {
         sourceTotal: snapshot.size,
@@ -532,7 +550,7 @@ export class KbBuildService extends EventEmitter {
         sourceRemoved: changeset.removed.length,
       });
 
-      if (effectiveMode === 'incremental' && changeset.isEmpty()) {
+      if (effectiveMode === 'incremental' && changeset.isEmpty() && workset.size === 0) {
         // 无变更：直接以 no_changes 结束（不新建 release）
         stagingRootPath = '';
         localMapStore.updateKbBuild(buildId, {
@@ -602,6 +620,11 @@ export class KbBuildService extends EventEmitter {
 
       buildState.requiredRewrites = new Set(affectedDocs.map((doc) => doc.path)
         .filter((docPath) => fs.existsSync(path.join(stagingRootPath, 'docs', docPath))));
+      if (entry.rebuildSelected && baseManifest) {
+        const affectedPaths = new Set(affectedDocs.map((doc) => doc.path));
+        buildState.preservedDocs = new Map(baseManifest.docs.filter((doc) => !affectedPaths.has(doc.path))
+          .map((doc) => [doc.path, doc.sources]));
+      }
 
       // P0-S7（设计 §5.6 + 任务 4）：白板旁路文字预取——raw_read 可读任意
       // 快照源，全量预取一次（仅非空文字占内存）；describeWorksetImages 用
@@ -622,6 +645,7 @@ export class KbBuildService extends EventEmitter {
         visionReady,
         signal: cancelController.signal,
       });
+      if (entry.rebuildSelected) await this.includeRetainedImageCache(buildState, visionDescriber, cancelController.signal);
       buildState.visionReady = visionReady;
       if (entry.cancelRequested) throw new CancelledError();
 
@@ -971,7 +995,7 @@ export class KbBuildService extends EventEmitter {
     this.emitLog(input.buildId, 'info', !input.visionReady
       ? `图片预描述：${items.length} 张（识图服务未就绪，仅复用已有缓存）`
       : input.entry.refreshImages
-      ? `图片预描述：${items.length} 张（重新生成所选源文档图片描述）`
+      ? `图片预描述：${items.length} 张（重新生成本次处理源文档的图片描述）`
       : `图片预描述：${items.length} 张（命中缓存不调远端）`);
     const composed = await input.describer.describeMany(
       items.map((item) => ({ file: item.file, src: `${item.objToken}::${item.src}` })),
@@ -1002,6 +1026,28 @@ export class KbBuildService extends EventEmitter {
     input.entry.images = { total: items.length, described, cached, unavailable };
     input.entry.imageRefreshFailures = refreshFailures;
     return result;
+  }
+
+  /** 沿用的图文源也须计入有效文本预算；只读本地缓存，不识图、不计入本次识图数量。 */
+  private async includeRetainedImageCache(state: BuildRunState, describer: VisionDescriberLike, signal: AbortSignal): Promise<void> {
+    const cachedByHash = new Map<string, string | null>();
+    for (const entry of state.snapshot.entries) {
+      if (signal.aborted) return;
+      if (state.workset.has(entry.objToken) || entry.imageCount === 0) continue;
+      const content = state.snapshot.readVerified(state.knowledgeBaseRoot, entry.objToken).content;
+      for (const image of resolveSourceImages(state.knowledgeBaseRoot, entry.relPath, content)) {
+        if (signal.aborted) return;
+        if (state.whiteboardTexts?.get(entry.objToken)?.has(image.src)) continue;
+        const hash = hashImageFile(image.file);
+        if (!hash) continue;
+        if (!cachedByHash.has(hash)) cachedByHash.set(hash, await describer.lookup(hash).catch(() => null));
+        const text = cachedByHash.get(hash);
+        if (text == null) continue;
+        const descriptions = state.imageDescriptions!.get(entry.objToken) ?? new Map<string, ImageDescription>();
+        descriptions.set(image.src, { src: image.src, imageHash: hash, state: 'cached', text });
+        state.imageDescriptions!.set(entry.objToken, descriptions);
+      }
+    }
   }
 
   // ------------------------------------------------------------------
@@ -1382,6 +1428,7 @@ export class KbBuildService extends EventEmitter {
   }): string {
     const lines: string[] = [];
     lines.push('正文必须为当前规则的完整说明。下面的diff只用于判断要更新什么；禁止把修订记录、本次改动、上版/本版对比或版本号写进正文。变更说明只填kb_finish.summary。');
+    lines.push('若草稿中已有标准文档，须在其基础上继续构建：保留未受影响的文档与来源；相关内容可合并更新。删除旧路径进行合并时须在kb_finish.docMerges声明目标，不能用本批文档替代整个知识库。');
     for (const change of input.sourceChanges ?? []) {
       if (!input.batch.includes(change.key) && change.kind !== 'removed') continue;
       lines.push(`源差异 ${change.key}（${change.title}）：${change.kind}${change.reason === 'excluded' ? '，用户标记为不参与构建' : ''}`);
@@ -1412,7 +1459,7 @@ export class KbBuildService extends EventEmitter {
     for (const token of input.batch) {
       const entry = input.snapshot.get(token);
       const changeType = input.workset.get(token) ?? 'changed';
-      lines.push(`| ${token} | ${entry?.title ?? token} | ${entry?.relPath ?? ''} | ${changeType === 'rebuild' ? '重建（全量构建）' : changeType} |`);
+      lines.push(`| ${token} | ${entry?.title ?? token} | ${entry?.relPath ?? ''} | ${changeType === 'rebuild' ? '重新构建' : changeType} |`);
     }
     lines.push('');
     if (input.affectedDocs.length > 0) {
@@ -1936,6 +1983,7 @@ export class KbBuildService extends EventEmitter {
     const { unit } = input;
     const lines: string[] = [];
     lines.push('正文必须为当前规则的完整说明。下面的diff只用于判断要更新什么；禁止把修订记录、本次改动、上版/本版对比或版本号写进正文。变更说明只填kb_unit_done/kb_finish的summary。');
+    lines.push('若草稿中已有标准文档，须保留本单元工作范围之外的文档与来源；相关内容在既有正文基础上更新，不能用本单元文档替代整个知识库。');
     for (const change of input.sourceChanges ?? []) {
       if (!input.batch.includes(change.key) && change.kind !== 'removed') continue;
       lines.push(`源差异 ${change.key}（${change.title}）：${change.kind}${change.reason === 'excluded' ? '，用户标记为不参与构建' : ''}`);
@@ -1970,7 +2018,7 @@ export class KbBuildService extends EventEmitter {
     for (const token of input.batch) {
       const entry = input.snapshot.get(token);
       const changeType = input.workset.get(token) ?? 'changed';
-      lines.push(`| ${token} | ${entry?.title ?? token} | ${entry?.relPath ?? ''} | ${changeType === 'rebuild' ? '重建（全量构建）' : changeType} |`);
+      lines.push(`| ${token} | ${entry?.title ?? token} | ${entry?.relPath ?? ''} | ${changeType === 'rebuild' ? '重新构建' : changeType} |`);
     }
     lines.push('');
     if (unit.affectedDocs.length > 0) {
@@ -2417,6 +2465,7 @@ export function validateStagingDocs(
 
   let totalBytes = 0;
   const referencedSources = new Set<string>();
+  const sourcesByPath = new Map<string, string[]>();
   for (const file of files) {
     try {
       validateStdDocPath(file);
@@ -2454,6 +2503,7 @@ export function validateStagingDocs(
       issues.push({ path: file, code: 'header_missing', message: '无法解析 feishu_sync_kb 文件头' });
       continue;
     }
+    sourcesByPath.set(file, header.sources);
     if (header.sources.length === 0) {
       issues.push({ path: file, code: 'sources_empty', message: 'sources 为空' });
     }
@@ -2463,6 +2513,21 @@ export function validateStagingDocs(
       } else {
         referencedSources.add(token);
       }
+    }
+  }
+
+  // 继续构建不得借重写/清空 staging 丢掉无关文档。允许模型把相关主题
+  // 合并到其他路径，但必须显式声明合并，且目标仍继承旧文档的来源。
+  const merges = new Map((state.finishInfo?.docMerges ?? []).map((merge) => [merge.path, merge.mergedInto]));
+  for (const [docPath, sources] of state.preservedDocs ?? []) {
+    const targets = sourcesByPath.has(docPath) ? [docPath] : merges.get(docPath);
+    if (!targets?.length) {
+      issues.push({ path: docPath, code: 'existing_doc_removed', message: '未受影响的已有标准文档被移除；请保留正文，或声明合并到保留其来源的文档。' });
+      continue;
+    }
+    const retained = new Set(targets.flatMap((target) => sourcesByPath.get(target) ?? []));
+    for (const source of sources) {
+      if (!retained.has(source)) issues.push({ path: docPath, objToken: source, code: 'existing_source_removed', message: '未受影响的已有来源被丢弃；继续构建须保留其内容与来源关系。' });
     }
   }
 

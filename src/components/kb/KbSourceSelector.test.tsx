@@ -3,13 +3,13 @@ import { act } from 'react';
 import { createRoot } from 'react-dom/client';
 import { expect, it, vi } from 'vitest';
 
-const state = vi.hoisted(() => ({ included: new Set(['a']), build: vi.fn(), selection: vi.fn(), parentSource: false, unavailableParent: false }));
+const state = vi.hoisted(() => ({ included: new Set(['a']), published: new Set<string>(), build: vi.fn(), selection: vi.fn(), parentSource: false, unavailableParent: false }));
 vi.mock('../../api/client', () => ({
   getKbSourceTree: async () => {
-    const child = { id: 'b', title: '子文档', children: [], source: { objToken: 'b', title: '子文档', relPath: 'b.md', included: state.included.has('b'), pending: 'unchanged' } };
+    const child = { id: 'b', title: '子文档', children: [], source: { objToken: 'b', title: '子文档', relPath: 'b.md', included: state.included.has('b'), published: state.published.has('b'), pending: 'unchanged' } };
     if (state.unavailableParent) return { root: 'root', total: 1, nodes: [{ id: 'a', title: '父文档', sourceUnavailable: true, children: [child] }] };
-    if (state.parentSource) return { root: 'root', total: 2, nodes: [{ id: 'a', title: '父文档', source: { objToken: 'a', title: '父文档', relPath: '旧标题.md', included: state.included.has('a'), pending: 'added', recovered: true }, children: [child] }] };
-    return { root: 'root', total: 2, nodes: [{ id: 'folder', title: '目录', children: ['a', 'b'].map((id) => ({ id, title: id, children: [], source: { objToken: id, title: id, relPath: `${id}.md`, included: state.included.has(id), pending: 'unchanged' } })) }] };
+    if (state.parentSource) return { root: 'root', total: 2, nodes: [{ id: 'a', title: '父文档', source: { objToken: 'a', title: '父文档', relPath: '旧标题.md', included: state.included.has('a'), published: state.published.has('a'), pending: 'added', recovered: true }, children: [child] }] };
+    return { root: 'root', total: 2, nodes: [{ id: 'folder', title: '目录', children: ['a', 'b'].map((id) => ({ id, title: id, children: [], source: { objToken: id, title: id, relPath: `${id}.md`, included: state.included.has(id), published: state.published.has(id), pending: 'unchanged' } })) }] };
   },
   setKbSourcesSelection: async (_root: string, tokens: string[], action: string) => { state.selection(tokens, action); for (const token of tokens) { if (action === 'include') state.included.add(token); else state.included.delete(token); } },
   cleanupKbSources: vi.fn(),
@@ -73,4 +73,22 @@ it('父文档没有可用本地源时显示原因，只对有正文的子文档�
     const build = [...container.querySelectorAll('button')].find((item) => item.textContent === '构建所选文档')!;
     await act(async () => build.click()); expect(state.build).toHaveBeenLastCalledWith(1);
   } finally { act(() => root.unmount()); container.remove(); state.unavailableParent = false; }
+});
+
+it('已构建标记来自成功发布，与当前勾选独立，发布新版本后自动刷新', async () => {
+  state.included = new Set(['b']); state.published = new Set(['a']);
+  const container = document.createElement('div'); document.body.append(container);
+  const root = createRoot(container);
+  const row = (title: string) => container.querySelector(`[aria-label="预览：${title}"]`)!.closest('div')!;
+  const render = (releaseId: string) => root.render(<KbSourceSelector releaseId={releaseId} running={false} nonce={0} canBuild onBuild={state.build} onChanged={() => {}} onOpenSource={() => {}} />);
+  try {
+    await act(async () => render('r1'));
+    expect(row('a').textContent).toContain('已构建');
+    expect(row('b').textContent).not.toContain('已构建');
+    expect(container.querySelector<HTMLInputElement>('[aria-label="参与构建：a"]')!.checked).toBe(false);
+    state.published.add('b');
+    await act(async () => render('r2'));
+    expect(row('a').textContent).toContain('已构建');
+    expect(row('b').textContent).toContain('已构建');
+  } finally { act(() => root.unmount()); container.remove(); state.published = new Set(); }
 });
