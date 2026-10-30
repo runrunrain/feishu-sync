@@ -78,7 +78,7 @@ export function AgentComposer({
 
   return (
     <div className="min-w-0 shrink-0 border-t border-line bg-card-bg/70 px-3 py-3 sm:px-6 lg:px-8" data-testid="agent-composer">
-      <div className="w-full min-w-0">
+      <div className="w-full min-w-0 max-w-3xl mx-auto">
         {disabled ? (
           <div
             className="mb-2 flex flex-wrap items-start gap-2 px-3 py-2 rounded-md border border-[rgba(180,83,9,0.3)] bg-[rgba(180,83,9,0.05)]"
