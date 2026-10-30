@@ -27,6 +27,7 @@ import { ConfigManager } from '../server/src/modules/config-manager.js';
 import type { QuitReason } from './contracts.js';
 import { externalNavigationUrl } from '../src/utils/external-url.js';
 import { writeClipboardText } from './clipboard-service.js';
+import { createDesktopDiagnostics } from './diagnostics.js';
 
 // ============================================================================
 // Constants and Configuration
@@ -36,6 +37,10 @@ const LOOPBACK_HOST = '127.0.0.1';
 const DESKTOP_TOKEN_HEADER = 'X-Desktop-Token';
 const HEALTH_TIMEOUT_MS = 15_000;
 const HEALTH_POLL_INTERVAL_MS = 250;
+const recordDiagnostic = createDesktopDiagnostics(process.env.FEISHU_SYNC_HOME || path.join(os.homedir(), '.feishu-sync'));
+process.on('uncaughtExceptionMonitor', (error, origin) => recordDiagnostic('uncaught-exception', { origin, message: error.message, stack: error.stack }));
+app.on('render-process-gone', (_event, _contents, details) => recordDiagnostic('renderer-exit', details));
+app.on('child-process-gone', (_event, details) => recordDiagnostic('child-exit', details));
 
 // ============================================================================
 // State Management
@@ -585,6 +590,7 @@ ipcMain.handle('desktop:change-notification:manual-check', async () => {
 // ============================================================================
 
 async function boot() {
+  recordDiagnostic('startup', { version: app.getVersion(), node: process.versions.node, electron: process.versions.electron });
   // Get quit coordinator ready
   getQuitCoordinator();
 
@@ -714,6 +720,7 @@ app.on('activate', () => {
 });
 
 app.on('before-quit', (event) => {
+  recordDiagnostic('quit-requested');
   getQuitCoordinator().handleBeforeQuit(event);
 });
 

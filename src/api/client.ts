@@ -1184,6 +1184,22 @@ export async function cancelKbBuild(id: string): Promise<KbBuildDto> {
   });
 }
 
+export async function resumeKbBuild(id: string): Promise<KbBuildDto> {
+  return request<KbBuildDto>(`/api/kb/builds/${encodeURIComponent(id)}/resume`, {
+    method: 'POST', body: JSON.stringify({ confirm: 'RESUME' }),
+  });
+}
+
+export interface KbBuildLogEvent {
+  seq: number;
+  event: string;
+  data: { level?: 'info' | 'warn' | 'error'; message?: string; at?: string; phase?: string; toolName?: string; summary?: string; isError?: boolean; delta?: string };
+}
+
+export function getKbBuildLogs(id: string): Promise<{ events: KbBuildLogEvent[] }> {
+  return request(`/api/kb/builds/${encodeURIComponent(id)}/logs`);
+}
+
 /** GET /api/kb/mcp —— 外部 MCP 连接信息（§9.5，供设置页复制）。 */
 export async function getKbMcpInfo(): Promise<KbMcpInfoDto> {
   return request<KbMcpInfoDto>('/api/kb/mcp');

@@ -106,6 +106,8 @@ export interface BuildRunState {
   requiredRewrites?: Set<string>;
   /** 继续构建时，未受影响的旧文档须保留，或经显式合并继承全部来源。 */
   preservedDocs?: Map<string, string[]>;
+  /** 完整写入/删除草稿或提交进度后原子保存检查点。 */
+  onCheckpoint?: () => void;
   writtenPaths?: Set<string>;
   /** Pinned previous release, used to reject invented merge origins before kb_finish commits. */
   baseDocPaths?: Set<string>;
@@ -484,6 +486,7 @@ export class AgentToolService {
     context.options.onEvent?.({ phase: 'start', toolName, ...(meta?.toolCallId ? { toolCallId: meta.toolCallId } : {}), argsSummary });
     try {
       const result = await tool.execute(context, args, meta);
+      if (['kb_write_doc', 'kb_delete_doc', 'kb_unit_done', 'kb_finish'].includes(toolName)) context.options.buildState?.onCheckpoint?.();
       const resultSummary = summarizeResult(result);
       context.options.onEvent?.({ phase: 'end', toolName, ...(meta?.toolCallId ? { toolCallId: meta.toolCallId } : {}), argsSummary, resultSummary, isError: false });
       return result;

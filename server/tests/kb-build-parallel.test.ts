@@ -980,7 +980,8 @@ describe('P2-S2：buildBatchWordBudget 字数预算接线', () => {
     const row = await waitForTerminal(dto.id);
     expect(String(row.status)).toBe('published');
     // 批次 prompt：两个批（各 1 源）+ finish
-    const batchPrompts = harness.fakes[0].prompts.filter((p) => p.includes('请处理以下'));
+    const batchPrompts = harness.fakes.flatMap((process) => process.prompts).filter((p) => p.includes('请处理以下'));
+    expect(harness.fakes).toHaveLength(2); // 每批释放上下文，下一批通过已保存草稿继续。
     expect(batchPrompts).toHaveLength(2);
     expect(batchPrompts[0]).toContain('1 个源文档');
     expect(batchPrompts[1]).toContain('1 个源文档');

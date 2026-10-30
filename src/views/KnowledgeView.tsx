@@ -31,12 +31,14 @@ import {
   cancelKbBuild,
   createKbBuild,
   getKbBuild,
+  getKbBuildLogs,
   getKbDoc,
   getKbStatus,
   getKbTree,
   getSseAuth,
   listKbBuilds,
   listKbPublications,
+  resumeKbBuild,
 } from '../api/client';
 import type { KbBuildDto, KbBuildIssue, KbDocDto, KbDocSourceRef, KbStatusDto, KbTreeNode } from '../types/agent';
 import type { KbPublicationRowDto } from '../types/kb-publish';
@@ -91,6 +93,8 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
   const [docError, setDocError] = useState<string | null>(null);
 
   const [build, setBuild] = useState<KbBuildDto | null>(null);
+  // 连接只随构建身份切换；启动时读取最新状态快照中的续传游标。
+  const latestBuild = useRef(build); latestBuild.current = build;
   const [buildIssues, setBuildIssues] = useState<KbBuildIssue[]>([]);
   const [buildLogs, setBuildLogs] = useState<BuildLogLine[]>([]);
   const [directoryOpen, setDirectoryOpen] = useState(true);
@@ -100,6 +104,8 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
   const [selectedBuildCount, setSelectedBuildCount] = useState(0);
   const [refreshImages, setRefreshImages] = useState(false);
   const [starting, setStarting] = useState(false);
+  const [resumeConfirm, setResumeConfirm] = useState(false);
+  const [resuming, setResuming] = useState(false);
 
   const [changeTab, setChangeTab] = useState<KbChangeTab>('sources');
   const [source, setSource] = useState<KbDocSourceRef | null>(null);
@@ -110,10 +116,10 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
   const buildConnRef = useRef<SseConnection | null>(null);
   const logSeq = useRef(0);
 
-  const appendLog = useCallback((kind: BuildLogLine['kind'], text: string, at?: string) => {
-    setBuildLogs((prev) => [
-      ...prev.slice(-400),
-      { id: (logSeq.current += 1), kind, text, at },
+  const appendLog = useCallback((kind: BuildLogLine['kind'], text: string, at?: string, seq?: number) => {
+    setBuildLogs((prev) => seq !== undefined && prev.some((line) => line.seq === seq) ? prev : [
+      ...prev.slice(-399),
+      { id: (logSeq.current += 1), kind, text, at, seq },
     ]);
   }, []);
 
@@ -234,6 +240,7 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
     if (!active || !buildId) return;
     const connection = new SseConnection({
       endpoint: `/api/kb/builds/${encodeURIComponent(buildId)}/events`,
+      initialLastEventId: latestBuild.current?.eventSeq !== undefined ? String(latestBuild.current.eventSeq) : undefined,
       getAuth: getSseAuth,
       onMessage: (m) => {
         let payload: any;
@@ -265,16 +272,17 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
             break;
           }
           case 'build_log':
-            appendLog(payload?.level ?? 'info', String(payload?.message ?? ''), payload?.at);
+            appendLog(payload?.level ?? 'info', String(payload?.message ?? ''), payload?.at, m.id ? Number(m.id) : undefined);
             break;
           case 'tool':
             appendLog(
               payload?.phase === 'end' ? 'tool-end' : 'tool-start',
-              `${payload?.toolName ?? ''} ${payload?.summary ?? ''}${payload?.isError ? ' ✕' : ''}`,
+              `${payload?.isError ? '✕ ' : ''}${payload?.toolName ?? ''} ${payload?.summary ?? ''}`,
+              undefined, m.id ? Number(m.id) : undefined,
             );
             break;
           case 'assistant_delta':
-            appendLog('assistant', String(payload?.delta ?? ''));
+            appendLog('assistant', String(payload?.delta ?? ''), undefined, m.id ? Number(m.id) : undefined);
             break;
           default:
             break;
@@ -344,6 +352,43 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
       setCancelling(false);
     }
   }, [build, toast]);
+
+  const continueBuild = async () => {
+    if (!build) return;
+    setResuming(true);
+    try {
+      const dto = await resumeKbBuild(build.id);
+      setBuild(dto); setBuildIssues([]); setResumeConfirm(false);
+      appendLog('info', '已请求从检查点继续构建');
+    } catch (error) {
+      toast.push({ type: 'error', message: error instanceof Error ? error.message : '继续构建失败' });
+      const code = error instanceof APIError ? (error.response as { error?: string } | undefined)?.error : null;
+      if (code && ['source_changed_during_build', 'kb_resume_stale', 'kb_resume_unavailable'].includes(code)) {
+        setResumeConfirm(false);
+        setBuild((previous) => previous?.recovery ? { ...previous, recovery: { ...previous.recovery, canResume: false, reason: error instanceof Error ? error.message : '检查点不可用，请重新构建' } } : previous);
+      } else {
+        void getKbBuild(build.id).then(setBuild).catch(() => undefined);
+      }
+    } finally { setResuming(false); }
+  };
+
+  // 重启应用后恢复落盘日志；已有实时日志时保持当前流，避免重复插入。
+  const trackedBuildId = build?.id;
+  useEffect(() => {
+    if (!trackedBuildId) return;
+    let disposed = false;
+    void getKbBuildLogs(trackedBuildId).then(({ events }) => {
+      if (disposed) return;
+      const restored: BuildLogLine[] = events.flatMap(({ seq, event, data }) => {
+        const line = event === 'build_log' ? { kind: data.level ?? 'info', text: data.message ?? '', at: data.at }
+          : event === 'tool' ? { kind: data.phase === 'end' ? 'tool-end' as const : 'tool-start' as const, text: `${data.isError ? '✕ ' : ''}${data.toolName ?? ''} ${data.summary ?? ''}` }
+          : event === 'assistant_delta' ? { kind: 'assistant' as const, text: data.delta ?? '' } : null;
+        return line ? [{ ...line, seq, id: (logSeq.current += 1) }] : [];
+      }).slice(-400);
+      setBuildLogs((previous) => [...restored.filter((line) => !previous.some((current) => current.seq === line.seq)), ...previous].slice(-400));
+    }).catch(() => undefined);
+    return () => { disposed = true; };
+  }, [trackedBuildId]);
 
   useEffect(() => { if (!active) setSidebar(null); }, [active]);
   useEffect(() => {
@@ -451,7 +496,8 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
             <div className="min-h-[200px]"><KbSourcePanel docTitle={doc.title} sources={doc.sources} onOpenSource={setSource} /></div>
           </div> : <p className="p-4 text-xs text-ink-faint">选择文档后查看来源与文档信息。</p>
           : sidebar === 'progress' ? build ? <KbBuildPanel open build={build} issues={buildIssues} logs={buildLogs}
-            onCollapse={() => setSidebar(null)} onCancel={cancelBuild} cancelling={cancelling} layout="sidebar" />
+            onCollapse={() => setSidebar(null)} onCancel={cancelBuild} cancelling={cancelling} layout="sidebar"
+            onResume={() => setResumeConfirm(true)} onRestart={() => openBuild('sources')} resuming={resuming} />
             : <p className="p-4 text-xs text-ink-faint">尚无构建记录。可在构建侧栏选择文档并发起构建。</p>
           : sidebar === 'publish' ? <KbPublishPanel
             publications={publications}
@@ -502,6 +548,15 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
         onPublicationsChanged={() => void loadPublications()}
         onJumpToSettings={onJumpToPublishSettings}
       />
+
+      <Modal open={resumeConfirm} title="确认从断点继续" onClose={() => { if (!resuming) setResumeConfirm(false); }}>
+        <div className="space-y-3 text-sm text-ink-soft leading-relaxed">
+          <p>已保存 {build?.recovery?.draftCount ?? 0} 篇草稿，完成 {build?.recovery?.completedBatches ?? 0}/{build?.recovery?.totalBatches ?? 0} 批。</p>
+          <p>将跳过已完成批次，保留已写入的完整草稿，继续未完成内容，并复用已完成的图片转化结果。</p>
+          <p className="text-xs text-ink-faint">使用当前配置的构建模型继续并消耗模型额度。源文档或标准库版本已变化时需重新构建；失败不会改变当前发布版本。</p>
+          <ConfirmActions confirmLabel="继续构建" busy={resuming} onConfirm={continueBuild} onCancel={() => setResumeConfirm(false)} />
+        </div>
+      </Modal>
 
       {/* 构建确认弹窗 */}
       <Modal

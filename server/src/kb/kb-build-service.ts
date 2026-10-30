@@ -19,7 +19,7 @@ import { EventEmitter } from 'node:events';
 import { AgentProcessPool, AgentBusyError, type PoolSlot } from '../agent/agent-process-pool.js';
 import { AgentToolService, ToolError, validateStdDocPath, type BuildRunState } from '../agent/agent-tool-service.js';
 import type { VisionDescriberLike } from '../agent/agent-tool-service.js';
-import { isPathInside, PathGuardError } from '../agent/path-guard.js';
+import { isPathInside, PathGuardError, resolveInside } from '../agent/path-guard.js';
 import { buildPiProcessEnv, PiRpcProcess } from '../agent/pi-rpc-process.js';
 import { PiRuntimeResolver, resolveAppLlmModel } from '../agent/runtime-resolver.js';
 import { buildAppLlmRunConfig } from '../agent/provider-descriptor.js';
@@ -40,6 +40,7 @@ import { buildDefaultAgentVisionConfig } from '../types/agent-knowledge.js';
 import type { KbChangePreview, KbDocMerge, KbFileChange } from '../types/kb-version.js';
 import { sourceVersionWarning } from './search/query-metadata.js';
 import { selectKnowledgeSources } from './source-selection.js';
+import { BuildCheckpointStore, type BuildCheckpoint } from './build-checkpoint.js';
 import {
   toolsForRunKind,
   type AgentStatusDto,
@@ -117,6 +118,16 @@ interface InMemoryBuild {
   images: KbBuildImagesProgress;
   process: PiRpcProcess | null;
   events: Array<{ seq: number; event: string; data: unknown }>;
+  nextSeq: number;
+  requestedMode: 'full' | 'incremental';
+  baseReleaseId: string | null;
+  resume?: BuildCheckpoint;
+  singleBatches: string[][];
+  singleCompleted: number;
+  unitProgress: Map<string, number>;
+  workerCount: number;
+  wordBudget: number;
+  checkpointReady: boolean;
 }
 
 export class KbBuildService extends EventEmitter {
@@ -131,11 +142,65 @@ export class KbBuildService extends EventEmitter {
     this.deps = deps;
   }
 
+  private newEntry(id: string, backend: 'pi' | 'claude-code', mode: 'full' | 'incremental', rebuildSelected = false, refreshImages = false): InMemoryBuild {
+    return { id, backend, requestedMode: mode, rebuildSelected, refreshImages, imageRefreshFailures: 0,
+      batchIndex: 0, batchTotal: 0, buildState: null, cancelRequested: false, cancelController: null, timedOut: false,
+      workers: new Map(), stage: null, units: { total: 0, done: 0, running: 0, failed: 0, retried: 0 },
+      images: { total: 0, described: 0, cached: 0, unavailable: 0 }, process: null, events: [], nextSeq: 1,
+      baseReleaseId: null, singleBatches: [], singleCompleted: 0, unitProgress: new Map(), workerCount: 1, wordBudget: 0, checkpointReady: false };
+  }
+
+  private persistCheckpoint(buildId: string): void {
+    const entry = this.active.get(buildId); const state = entry?.buildState;
+    if (!entry?.checkpointReady || !state) return;
+    const units = state.units ?? [];
+    const unitDone = [...(state.unitDone ?? [])].filter(([id]) => {
+      const unit = units.find((candidate) => candidate.id === id);
+      return unit && (entry.unitProgress.get(id) ?? 0) >= unit.batches.length;
+    });
+    const batchesDone = units.length ? unitDone.length === units.length : entry.singleCompleted >= entry.singleBatches.length;
+    try {
+      new BuildCheckpointStore(this.outputRoot()).save({ schemaVersion: 1, buildId, knowledgeBaseRoot: state.knowledgeBaseRoot,
+        baseReleaseId: entry.baseReleaseId, requestedMode: entry.requestedMode, mode: state.mode, backend: entry.backend ?? 'pi', rebuildSelected: entry.rebuildSelected,
+        snapshot: state.snapshot.entries, workset: [...state.workset], docMeta: [...(state.docMeta ?? [])], writtenPaths: [...(state.writtenPaths ?? [])],
+        preservedDocs: [...(state.preservedDocs ?? [])], requiredRewrites: [...(state.requiredRewrites ?? [])], baseDocPaths: [...(state.baseDocPaths ?? [])],
+        finishInfo: batchesDone ? state.finishInfo : null, imageDescriptions: [...(state.imageDescriptions ?? [])].map(([token, values]) => [token, [...values]]),
+        units, unitDone, claims: units.flatMap((unit) => (state.claims?.ownedBy(unit.id) ?? []).map((docPath) => ({ path: docPath, unitId: unit.id }))),
+        singleBatches: entry.singleBatches, singleCompleted: entry.singleCompleted,
+        unitProgress: units.map((unit) => [unit.id, entry.unitProgress.get(unit.id) ?? 0]),
+        workerCount: entry.workerCount, wordBudget: entry.wordBudget, progress: this.progressOf(entry), updatedAt: new Date().toISOString(),
+      }, state.stagingRoot);
+    } catch (error) {
+      const message = `无法保存构建检查点：${error instanceof Error ? error.message : String(error)}`;
+      state.poisoned = { code: 'kb_checkpoint_failed', message };
+      throw new ToolError('kb_checkpoint_failed', message, 500);
+    }
+  }
+
   private configForBuild(buildId: string): Config {
     const current = this.deps.configProvider();
     if (!current) throw new ToolError('invalid_request', '配置不可用');
     const backend = this.active.get(buildId)?.backend;
     return backend ? { ...current, agent: { ...current.agent, runtime: { ...current.agent.runtime, backend } } } : current;
+  }
+
+  private resumeValidationFeedback(entry: InMemoryBuild): string[] {
+    if (!entry.resume) return [];
+    const prefix = '这是断点继续。请先用 draft_list/draft_read 检查已恢复草稿，再完成收尾。';
+    try {
+      const report = JSON.parse(fs.readFileSync(path.join(this.buildsRoot(this.outputRoot()), entry.id, 'report.json'), 'utf8'));
+      const issues = Array.isArray(report.issues) ? report.issues.slice(0, 50) : [];
+      return [prefix, ...(issues.length ? ['上次校验未通过，请修复以下问题后重新调用 kb_finish：', JSON.stringify(issues).slice(0, 16000)] : [])];
+    } catch { return [prefix]; }
+  }
+
+  private finishCoverage(state: BuildRunState): string[] {
+    const covered = new Set([...(state.docMeta?.values() ?? [])].flatMap((doc) => doc.sources));
+    const uncovered = [...state.workset.keys()].filter((token) => !covered.has(token));
+    return [
+      `完整工作集有 ${state.workset.size} 个源，当前草稿尚未引用其中 ${uncovered.length} 个源。收尾须核对整个工作集，不能仅根据最后一批填写 skipped。`,
+      ...(uncovered.length ? ['尚未覆盖的源（有内容则补建，否则在 skipped 明确说明理由）：', ...uncovered.slice(0, 300).map((token) => `- ${token}`)] : []),
+    ];
   }
 
   // ------------------------------------------------------------------
@@ -169,10 +234,11 @@ export class KbBuildService extends EventEmitter {
 
   private emitBuild(buildId: string, event: string, data: unknown): void {
     const entry = this.active.get(buildId);
-    const seq = (entry?.events.length ?? 0) + 1;
+    const seq = entry ? entry.nextSeq++ : 1;
     const record = { seq, event, data };
     if (entry) {
       entry.events.push(record);
+      if (entry.events.length > 1000) entry.events.splice(0, entry.events.length - 1000);
     }
     // 持久化事件日志（先建目录——appendFileSync 不会自建父目录）
     try {
@@ -237,8 +303,15 @@ export class KbBuildService extends EventEmitter {
   }
 
   toDto(row: Record<string, unknown>, entry?: InMemoryBuild): KbBuildDto {
+    entry ??= this.active.get(String(row.id));
+    const recoverable = ['interrupted', 'failed', 'cancelled'].includes(String(row.status));
+    const checkpoint = recoverable ? new BuildCheckpointStore(this.outputRoot()).summary(String(row.id)) : null;
+    const config = this.deps.configProvider();
+    const stale = checkpoint && ((new StandardKbStore(this.outputRoot()).readCurrent()?.releaseId ?? null) !== checkpoint.baseReleaseId
+      || path.resolve(config?.knowledgeBaseRoot ?? '') !== path.resolve(checkpoint.knowledgeBaseRoot));
     return {
       id: String(row.id),
+      ...(entry ? { eventSeq: entry.nextSeq - 1 } : {}),
       mode: row.mode as KbBuildDto['mode'],
       status: row.status as KbBuildDto['status'],
       noChanges: row.no_changes === 1,
@@ -253,7 +326,11 @@ export class KbBuildService extends EventEmitter {
         docsWritten: Number(row.docs_written ?? 0),
         docsDeleted: Number(row.docs_deleted ?? 0),
       },
-      progress: this.progressOf(entry),
+      progress: entry ? this.progressOf(entry) : checkpoint?.progress ? { ...checkpoint.progress, workers: [], units: { ...checkpoint.progress.units, running: 0 } } : this.progressOf(),
+      ...(recoverable ? { recovery: { canResume: !!checkpoint && !stale,
+        reason: !checkpoint ? '本次构建没有可验证的检查点；重新构建可复用已有图片缓存。' : stale ? '原始库目录或标准库基准版本已变化，请在当前版本上重新构建。' : null,
+        checkpointAt: checkpoint?.checkpointAt ?? null, draftCount: checkpoint?.draftCount ?? 0,
+        completedBatches: checkpoint?.completedBatches ?? 0, totalBatches: checkpoint?.totalBatches ?? 0 } } : {}),
       parallelism: Number(row.parallelism ?? 1),
       warnings: KbBuildService.parseWarnings(row.warnings_json),
       error: row.error_code
@@ -275,9 +352,23 @@ export class KbBuildService extends EventEmitter {
 
   eventsSince(buildId: string, lastSeq: number | null): Array<{ seq: number; event: string; data: unknown }> {
     const entry = this.active.get(buildId);
-    if (!entry) return [];
+    if (!entry) return this.readStoredEvents(buildId).filter((event) => lastSeq === null || event.seq > lastSeq);
     if (lastSeq === null) return entry.events;
     return entry.events.filter((record) => record.seq > lastSeq);
+  }
+
+  private readStoredEvents(buildId: string): Array<{ seq: number; event: string; data: unknown }> {
+    if (!/^[A-Za-z0-9_-]{1,120}$/.test(buildId)) return [];
+    try {
+      const file = path.join(this.buildsRoot(this.outputRoot()), buildId, 'events.jsonl');
+      const fd = fs.openSync(file, 'r');
+      try {
+        const size = fs.fstatSync(fd).size; const start = Math.max(0, size - 2 * 1024 * 1024);
+        const bytes = Buffer.alloc(size - start); fs.readSync(fd, bytes, 0, bytes.length, start);
+        const lines = bytes.toString('utf8').split('\n'); if (start) lines.shift();
+        return lines.flatMap((line) => { try { const value = JSON.parse(line); return Number.isSafeInteger(value.seq) && typeof value.event === 'string' ? [{ seq: value.seq as number, event: value.event as string, data: value.data as unknown }] : []; } catch { return []; } }).slice(-1000);
+      } finally { fs.closeSync(fd); }
+    } catch { return []; }
   }
 
   // ------------------------------------------------------------------
@@ -327,6 +418,7 @@ export class KbBuildService extends EventEmitter {
       (error as ToolError & { details?: unknown }).details = { code: status.code };
       throw error;
     }
+    if (this.running || localMapStore.getActiveKbBuild()) throw new ToolError('kb_build_running', '已有构建正在进行', 409);
 
     // outputRoot 校验
     const outputRoot = config.standardKb.outputRoot;
@@ -346,25 +438,7 @@ export class KbBuildService extends EventEmitter {
       model,
       createdAt: new Date().toISOString(),
     });
-    this.active.set(buildId, {
-      id: buildId,
-      backend: config.agent.runtime.backend === 'claude-code' ? 'claude-code' : 'pi',
-      refreshImages: input.refreshImages === true,
-      rebuildSelected: input.rebuildSelected === true,
-      imageRefreshFailures: 0,
-      batchIndex: 0,
-      batchTotal: 0,
-      buildState: null,
-      cancelRequested: false,
-      cancelController: null,
-      timedOut: false,
-      workers: new Map(),
-      stage: null,
-      units: { total: 0, done: 0, running: 0, failed: 0, retried: 0 },
-      images: { total: 0, described: 0, cached: 0, unavailable: 0 },
-      process: null,
-      events: [],
-    });
+    this.active.set(buildId, this.newEntry(buildId, config.agent.runtime.backend === 'claude-code' ? 'claude-code' : 'pi', input.mode, input.rebuildSelected === true, input.refreshImages === true));
 
     // 异步执行
     void this.runPipeline(localMapStore as never, buildId, input.mode).catch((error) => {
@@ -373,6 +447,39 @@ export class KbBuildService extends EventEmitter {
 
     const row = localMapStore.getActiveKbBuild();
     return this.toDto(row ?? { id: buildId, mode: input.mode, status: 'queued', created_at: new Date().toISOString() }, this.active.get(buildId));
+  }
+
+  async resumeBuild(localMapStore: Parameters<KbBuildService['createBuild']>[0] & { getKbBuild(id: string): Record<string, unknown> | null }, buildId: string, confirm?: string): Promise<KbBuildDto> {
+    if (confirm !== 'RESUME') throw new ToolError('confirmation_required', '继续构建需要 confirm: "RESUME"');
+    if (this.running || localMapStore.getActiveKbBuild()) throw new ToolError('kb_build_running', '已有构建正在进行', 409);
+    const row = localMapStore.getKbBuild(buildId);
+    if (!row) throw new ToolError('build_not_found', '构建记录不存在', 404);
+    if (!['interrupted', 'failed', 'cancelled'].includes(String(row.status))) throw new ToolError('kb_resume_unavailable', '该构建无需恢复', 409);
+    const config = this.deps.configProvider(); if (!config) throw new ToolError('invalid_request', '配置不可用');
+    let checkpoint: BuildCheckpoint | null;
+    try { checkpoint = new BuildCheckpointStore(config.standardKb.outputRoot).read(buildId); }
+    catch (error) { throw new ToolError('kb_resume_unavailable', error instanceof Error ? error.message : '检查点无法读取', 409); }
+    if (!checkpoint) throw new ToolError('kb_resume_unavailable', '本次构建没有可验证的检查点；重新构建可复用已有图片缓存。', 409);
+    if (row.error_code === 'kb_validation_failed' && checkpoint.finishInfo) checkpoint = { ...checkpoint, finishInfo: null };
+    if (path.resolve(config.knowledgeBaseRoot) !== path.resolve(checkpoint.knowledgeBaseRoot)) throw new ToolError('kb_resume_stale', '原始库目录已切换，请重新构建', 409);
+    if ((new StandardKbStore(config.standardKb.outputRoot).readCurrent()?.releaseId ?? null) !== checkpoint.baseReleaseId) throw new ToolError('kb_resume_stale', '标准库已发布了其他版本，请在当前版本上重新构建', 409);
+    const snapshot = RawSourceSnapshot.fromEntries(checkpoint.snapshot, { sheetCsvPaths: this.deps.sheetCsvPaths });
+    const excluded = new Set([...(this.deps.excludedSourcesProvider?.() ?? []), ...(this.deps.publishedTokensProvider?.() ?? [])]);
+    try {
+      verifySnapshotIntact(snapshot, config.knowledgeBaseRoot, this.deps.sheetCsvPaths, this.deps.documentsProvider().filter((doc) => !excluded.has(doc.objToken)));
+    } catch (error) {
+      throw new ToolError('source_changed_during_build', error instanceof Error ? error.message : '恢复前发现源文档已变化，请重新构建', 409);
+    }
+    const ready = await this.deps.resolver.checkReadiness({ agentConfig: { ...config.agent, runtime: { ...config.agent.runtime, backend: checkpoint.backend } }, llmConfig: config.llm, runningProcesses: this.deps.pool.runningCount() });
+    if (ready.code !== 'ready') throw new ToolError('agent_not_ready', `Agent 未就绪：${ready.message}`, 503);
+    if (this.running || localMapStore.getActiveKbBuild()) throw new ToolError('kb_build_running', '已有构建正在进行', 409);
+    const entry = this.newEntry(buildId, checkpoint.backend, checkpoint.requestedMode, checkpoint.rebuildSelected);
+    entry.resume = checkpoint; entry.singleBatches = checkpoint.singleBatches; entry.singleCompleted = checkpoint.singleCompleted;
+    entry.unitProgress = new Map(checkpoint.unitProgress); entry.events = this.readStoredEvents(buildId); entry.nextSeq = (entry.events.at(-1)?.seq ?? 0) + 1;
+    this.active.set(buildId, entry);
+    localMapStore.updateKbBuild(buildId, { status: 'queued', model: ready.model.model, errorCode: null, errorMessage: null, finishedAt: null });
+    void this.runPipeline(localMapStore as never, buildId, checkpoint.requestedMode).catch((error) => console.error('[KbBuildService] resume failed:', error));
+    return this.toDto(localMapStore.getKbBuild(buildId)!, entry);
   }
 
   async cancelBuild(
@@ -421,6 +528,7 @@ export class KbBuildService extends EventEmitter {
     mode: 'incremental' | 'full',
   ): Promise<void> {
     const entry = this.active.get(buildId)!;
+    const resume = entry.resume;
     this.running = true;
     const config = this.configForBuild(buildId);
     const outputRoot = config.standardKb.outputRoot;
@@ -461,8 +569,11 @@ export class KbBuildService extends EventEmitter {
       const store = new StandardKbStore(outputRoot);
       const basePointer: KbCurrentPointer | null = store.readCurrent();
       const baseManifest: KbManifest | null = basePointer ? store.readManifest(basePointer.releaseId) : null;
+      if (resume && (basePointer?.releaseId ?? null) !== resume.baseReleaseId) throw new ToolError('kb_resume_stale', '标准库基准版本已变化，请重新构建', 409);
+      entry.baseReleaseId = basePointer?.releaseId ?? null;
       const retainedSources = mode === 'incremental' ? baseManifest?.sourceSnapshot.map((source) => source.objToken) ?? [] : [];
-      const documents = this.sourceDocuments(retainedSources);
+      const excludedForResume = new Set(this.deps.excludedSourcesProvider?.() ?? []);
+      const documents = resume ? this.deps.documentsProvider().filter((doc) => !excludedForResume.has(doc.objToken)) : this.sourceDocuments(retainedSources);
       // P1-S8（设计 P1 §4.1 防线 2）：发布产物不进构建快照——用户把已发布
       // 文档移进监听树时，同步会如实镜像，但构建必须排除（防自我喂养），
       // 并给构建警告 published_doc_in_sources。排除只作用于构建，不影响同步。
@@ -474,7 +585,7 @@ export class KbBuildService extends EventEmitter {
           this.emitLog(buildId, 'warn', `快照排除 ${publishedExcludedCount} 个已发布云文档（published_doc_in_sources：发布产物不得作为构建源）`);
         }
       }
-      const snapshotResult = RawSourceSnapshot.scan(
+      const snapshotResult = resume ? { entries: resume.snapshot, missingFiles: [] } : RawSourceSnapshot.scan(
         config.knowledgeBaseRoot,
         publishedExcludedCount > 0
           ? documents.filter((doc) => !publishedTokens.has(doc.objToken))
@@ -482,11 +593,12 @@ export class KbBuildService extends EventEmitter {
         this.deps.sheetCsvPaths,
       );
       // S3（§3.4）：为全部条目补充 mediaHash/imageCount（contentHash 公式不变）
-      enrichEntriesWithMedia(config.knowledgeBaseRoot, snapshotResult.entries);
+      if (!resume) enrichEntriesWithMedia(config.knowledgeBaseRoot, snapshotResult.entries);
       const snapshot = RawSourceSnapshot.fromEntries(snapshotResult.entries, {
         knowledgeBaseRoot: config.knowledgeBaseRoot,
         sheetCsvPaths: this.deps.sheetCsvPaths,
       });
+      if (resume) verifySnapshotIntact(snapshot, config.knowledgeBaseRoot, this.deps.sheetCsvPaths, documents.filter((doc) => !publishedTokens.has(doc.objToken)));
       this.emitLog(buildId, 'info', `快照完成：${snapshot.size} 个原始源（${snapshotResult.missingFiles.length} 个候选源文件缺失）`);
       for (const source of snapshot.entries) {
         const warning = sourceVersionWarning(source);
@@ -495,8 +607,10 @@ export class KbBuildService extends EventEmitter {
 
       // staging 准备
       stagingRootPath = this.stagingRoot(outputRoot, buildId);
-      fs.rmSync(stagingRootPath, { recursive: true, force: true });
+      if (!isPathInside(path.resolve(outputRoot, '.staging'), path.resolve(stagingRootPath))) throw new ToolError('kb_resume_unavailable', '构建暂存目录越界', 409);
+      if (!resume) fs.rmSync(stagingRootPath, { recursive: true, force: true });
       fs.mkdirSync(path.join(stagingRootPath, 'docs'), { recursive: true });
+      if (resume) new BuildCheckpointStore(outputRoot).restore(buildId, stagingRootPath);
       fs.writeFileSync(
         path.join(stagingRootPath, 'raw-snapshot.json'),
         JSON.stringify(snapshot.entries, null, 2),
@@ -526,14 +640,14 @@ export class KbBuildService extends EventEmitter {
       // F3-R07：full 工作集 = 快照全部源——重复 full / 部分变化 full 都必须
       // 重建全库（重复执行、只 finish 不得借 skip 发布空或局部库）；增量
       // 维持 added+changed。覆盖验证以 workset 为准，full 时即全量强制。
-      const workset = new Map<string, 'added' | 'changed' | 'rebuild'>();
-      if (effectiveMode === 'full') {
+      const workset = new Map<string, 'added' | 'changed' | 'rebuild'>(resume?.workset ?? []);
+      if (!resume && effectiveMode === 'full') {
         for (const source of snapshot.entries) workset.set(source.objToken, 'rebuild');
-      } else {
+      } else if (!resume) {
         for (const token of changeset.added) workset.set(token, 'added');
         for (const token of changeset.changed) workset.set(token, 'changed');
       }
-      if (entry.rebuildSelected) {
+      if (entry.rebuildSelected && !resume) {
         const unselected = new Set(this.deps.unselectedSourcesProvider?.() ?? this.deps.excludedSourcesProvider?.() ?? []);
         const selected = snapshot.entries.filter((source) => !unselected.has(source.objToken));
         if (!selected.length) throw new ToolError('no_sources_selected', '没有可构建的所选源文档，请刷新源文档列表后重新选择。', 400);
@@ -567,9 +681,9 @@ export class KbBuildService extends EventEmitter {
 
       // 增量：复制当前 release docs 到 staging，写 docId 继承映射；
       // 仅引用已删除源的文档默认删除（§6.4）。
-      const docMeta = new Map<string, { title: string; summary: string; tags: string[]; sources: string[] }>();
+      const docMeta = new Map<string, { title: string; summary: string; tags: string[]; sources: string[] }>(resume?.docMeta ?? []);
       let docsDeletedByDefault = 0;
-      if (effectiveMode === 'incremental' && baseManifest) {
+      if (!resume && effectiveMode === 'incremental' && baseManifest) {
         const baseReleaseDir = path.join(outputRoot, 'releases', baseManifest.releaseId);
         const removedSet = new Set(changeset.removed);
         const docIdMap: Record<string, string> = {};
@@ -601,15 +715,16 @@ export class KbBuildService extends EventEmitter {
         mode: effectiveMode,
         workset,
         stagingRoot: stagingRootPath,
-        finishInfo: null,
-        writtenPaths: new Set(),
-        baseDocPaths: new Set(baseManifest?.docs.map((doc) => doc.path) ?? []),
+        finishInfo: resume?.finishInfo ?? null,
+        writtenPaths: new Set(resume?.writtenPaths ?? []),
+        baseDocPaths: new Set(resume?.baseDocPaths ?? baseManifest?.docs.map((doc) => doc.path) ?? []),
       };
       // 局部引用：TS 收窄 + 后续批次/finish/校验统一用它（避免可空回读）
       const buildState: BuildRunState = entry.buildState;
       // kb_write_doc 写入时同步 docMeta（通过 onEvent 钩子后校验阶段重建也可），
       // 校验阶段以解析 staging 文件头为准，meta 仅作标题/摘要补充源。
       this.patchBuildStateMeta(buildState, docMeta);
+      buildState.onCheckpoint = () => this.persistCheckpoint(buildId);
       setStatus('running');
 
       const affectedDocs = effectiveMode === 'incremental' && baseManifest
@@ -618,9 +733,11 @@ export class KbBuildService extends EventEmitter {
             .map((doc) => ({ path: doc.path, title: doc.title }))
         : [];
 
-      buildState.requiredRewrites = new Set(affectedDocs.map((doc) => doc.path)
+      buildState.requiredRewrites = new Set(resume?.requiredRewrites ?? affectedDocs.map((doc) => doc.path)
         .filter((docPath) => fs.existsSync(path.join(stagingRootPath, 'docs', docPath))));
-      if (entry.rebuildSelected && baseManifest) {
+      if (resume) {
+        buildState.preservedDocs = new Map(resume.preservedDocs);
+      } else if (entry.rebuildSelected && baseManifest) {
         const affectedPaths = new Set(affectedDocs.map((doc) => doc.path));
         buildState.preservedDocs = new Map(baseManifest.docs.filter((doc) => !affectedPaths.has(doc.path))
           .map((doc) => [doc.path, doc.sources]));
@@ -636,7 +753,7 @@ export class KbBuildService extends EventEmitter {
       entry.stage = 'describing_images';
       const cancelController = new AbortController();
       entry.cancelController = cancelController;
-      buildState.imageDescriptions = await this.describeWorksetImages({
+      buildState.imageDescriptions = resume ? new Map(resume.imageDescriptions.map(([token, values]) => [token, new Map(values)])) : await this.describeWorksetImages({
         buildId,
         entry,
         snapshot,
@@ -645,7 +762,8 @@ export class KbBuildService extends EventEmitter {
         visionReady,
         signal: cancelController.signal,
       });
-      if (entry.rebuildSelected) await this.includeRetainedImageCache(buildState, visionDescriber, cancelController.signal);
+      if (resume) { entry.images = resume.progress.images; this.emitLog(buildId, 'info', `已恢复检查点：${resume.writtenPaths.length} 份已写草稿，复用 ${entry.images.described + entry.images.cached} 个图片转化结果；从未完成部分继续。`); }
+      if (entry.rebuildSelected && !resume) await this.includeRetainedImageCache(buildState, visionDescriber, cancelController.signal);
       buildState.visionReady = visionReady;
       if (entry.cancelRequested) throw new CancelledError();
 
@@ -684,7 +802,8 @@ export class KbBuildService extends EventEmitter {
       const batchSize = Math.max(1, Math.min(50, config.standardKb.buildBatchSize));
       // P2-S2：每批有效字数预算（ConfigManager 归一后必有；未经归一的对象
       // 缺字段时按 0 = 旧行为处理，保证旧测试夹具字节级等价）
-      const wordBudget = Math.max(0, Math.floor(config.standardKb.buildBatchWordBudget ?? 0));
+      const wordBudget = resume?.wordBudget ?? Math.max(0, Math.floor(config.standardKb.buildBatchWordBudget ?? 0));
+      entry.wordBudget = wordBudget;
       const worksetMeta = new Map<string, { relPath: string; bytes: number; words: number }>();
       for (const [token] of workset) {
         const sourceEntry = snapshot.get(token);
@@ -715,7 +834,7 @@ export class KbBuildService extends EventEmitter {
         worksetMeta.set(token, { relPath: sourceEntry.relPath, bytes, words });
       }
       const wordsOf = (token: string): number => worksetMeta.get(token)?.words ?? 0;
-      const units = planUnits({
+      const units = resume?.units.length ? resume.units : planUnits({
         mode: effectiveMode,
         workset: worksetMeta,
         baseDocs: effectiveMode === 'incremental' && baseManifest
@@ -733,10 +852,11 @@ export class KbBuildService extends EventEmitter {
       // spawnBuildProcess 测试接缝与既有提示词序列）。
       const parallelismWanted = Math.max(1, Math.min(6, Math.floor(config.standardKb.buildParallelism ?? 1)));
       const backgroundLimit = this.deps.pool.max > 1 ? this.deps.pool.max - 1 : 1;
-      const workerCount = Math.max(1, Math.min(parallelismWanted, units.length || 1, backgroundLimit));
+      const workerCount = Math.max(1, Math.min(resume?.workerCount ?? parallelismWanted, units.length || 1, backgroundLimit));
+      entry.workerCount = workerCount;
       localMapStore.updateKbBuild(buildId, { parallelism: workerCount, unitTotal: units.length });
 
-      if (workerCount <= 1) {
+      if (workerCount <= 1 && !resume?.units.length) {
         // ---- 等价回退：单进程流水线（§4.1 “行为与现状等价”）----
         entry.units = { total: 1, done: 0, running: 0, failed: 0, retried: 0 };
         this.emitLog(buildId, 'info', `开始模型构建（${effectiveMode}，单进程）：${workset.size} 个工作集源`);
@@ -756,12 +876,14 @@ export class KbBuildService extends EventEmitter {
       } else {
       // ---- 单元化并行路径（W ≥ 2）----
       buildState.units = units;
-      buildState.unitDone = new Map();
+      buildState.unitDone = new Map(resume?.unitDone ?? []);
       buildState.claims = new PathClaims(
-        units.flatMap((unit) => unit.ownedDocs.map((docPath) => ({ path: docPath, unitId: unit.id }))),
+        [...units.flatMap((unit) => unit.ownedDocs.map((docPath) => ({ path: docPath, unitId: unit.id }))), ...(resume?.claims ?? [])],
       );
-      entry.units = { total: units.length, done: 0, running: 0, failed: 0, retried: 0 };
+      entry.units = { total: units.length, done: buildState.unitDone.size, running: 0, failed: 0, retried: 0 };
       entry.batchTotal = units.reduce((sum, unit) => sum + unit.batches.length, 0) + 1; // + 收尾轮
+      entry.batchIndex = [...entry.unitProgress.values()].reduce((sum, count) => sum + count, 0);
+      entry.checkpointReady = true; this.persistCheckpoint(buildId);
       this.emitLog(buildId, 'info', `开始模型构建（${effectiveMode}，并行 ${workerCount}）：${workset.size} 个工作集源划 ${units.length} 个单元 / ${entry.batchTotal - 1} 批`);
 
       // S4（§4.5）：整体超时 → 取消句柄集（排队 acquire 出队 + 全部进程 abort）
@@ -847,6 +969,9 @@ export class KbBuildService extends EventEmitter {
           400,
         );
       }
+      // 同一个 buildId 可恢复后通过校验，不继续展示上次失败的报告。
+      const reportPath = resolveInside(outputRoot, `.builds/${buildId}/report.json`, 'write');
+      if (fs.existsSync(reportPath)) fs.unlinkSync(reportPath);
 
       // ============ publishing ============
       if (entry.cancelRequested) throw new CancelledError();
@@ -855,7 +980,8 @@ export class KbBuildService extends EventEmitter {
       // 只复核本次快照中的源；构建期间新同步的文档留待下一次构建。
       // 快照创建和发布前必须使用同一条发布产物排除规则，避免把排除项误判为新增源。
       const currentPublishedTokens = new Set(this.deps.publishedTokensProvider?.() ?? []);
-      const currentDocuments = this.sourceDocuments(retainedSources).filter((doc) => !currentPublishedTokens.has(doc.objToken));
+      const currentDocuments = this.sourceDocuments(resume ? snapshot.entries.map((source) => source.objToken) : retainedSources)
+        .filter((doc) => !currentPublishedTokens.has(doc.objToken));
       const newSources = verifySnapshotIntact(snapshot, config.knowledgeBaseRoot, this.deps.sheetCsvPaths, currentDocuments);
       if (snapshot.size === 0 && newSources > 0) {
         throw new ToolError('source_changed_during_build', '构建开始时没有可用源文档；构建期间有新文档同步完成，请重新选择并构建。', 409);
@@ -1077,7 +1203,7 @@ export class KbBuildService extends EventEmitter {
     const { entry, buildState } = input;
     const config = this.configForBuild(input.buildId);
     // P2-S2：与并行路径同一 packBatches（wordBudget=0 等价旧 chunkTokens）
-    const batches = packBatches(
+    const batches = entry.resume ? entry.singleBatches : packBatches(
       [...input.workset.keys()].sort(),
       input.wordsOf,
       { wordBudget: input.wordBudget, maxCount: Math.max(1, Math.min(50, config.standardKb.buildBatchSize)) },
@@ -1089,12 +1215,15 @@ export class KbBuildService extends EventEmitter {
     }
     entry.batchTotal = batches.length + 1; // + 最后 finish prompt
     entry.stage = 'units';
+    entry.singleBatches = batches; entry.checkpointReady = true;
+    this.persistCheckpoint(input.buildId);
+    if (buildState.finishInfo) return;
 
     // T3b-06：单 worker 回退与并行路径同一准入语义——acquire('background')
     // FIFO 排队 + M-1 后台配额 + 可取消（受整体超时约束），不再用 session
     // 类 reserveSlot 立即抢最后一个总槽（否则后台任务可占满 M，交互会话
     // 保留槽消失）。
-    const rpc = await this.spawnBuildProcess(input.buildId, buildState, input.pluginSnapshot, {
+    let rpc = await this.spawnBuildProcess(input.buildId, buildState, input.pluginSnapshot, {
       signal: input.cancelController.signal,
     });
     entry.process = rpc;
@@ -1113,7 +1242,7 @@ export class KbBuildService extends EventEmitter {
         ? `${assets.buildRules}\n\n${assets.styleGuide}`
         : '';
 
-      for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
+      for (let batchIndex = entry.singleCompleted; batchIndex < batches.length; batchIndex += 1) {
         if (entry.cancelRequested) throw new CancelledError();
         entry.batchIndex = batchIndex + 1;
         const batch = batches[batchIndex];
@@ -1134,8 +1263,10 @@ export class KbBuildService extends EventEmitter {
           const batchWords = batch.reduce((sum, token) => sum + input.wordsOf(token), 0);
           this.emitLog(input.buildId, 'info', `batch ${batchIndex + 1}/${batches.length}: sources=${batch.length}, words=${batchWords}`);
         }
+        const continuation = '每个批次使用独立模型上下文。先用 draft_list/draft_read 检查已保存草稿，再补齐本批内容。不要覆盖无关内容。\n\n'
+          + (entry.resume ? '这是中断后的断点继续，已完成批次不会重复执行；本批已成功写入的完整草稿已恢复，请保留并继续完善。\n\n' : '');
         const outcome = await rpc.prompt(
-          systemRules ? `${batchPrompt}\n\n---\n构建规则与文风规范（每批适用）：\n${systemRules}` : batchPrompt,
+          continuation + (systemRules ? `${batchPrompt}\n\n---\n构建规则与文风规范（每批适用）：\n${systemRules}` : batchPrompt),
           { timeoutMs: config.standardKb.promptTimeoutMinutes * 60_000 },
         );
         if (entry.cancelRequested && outcome.outcome !== 'completed') throw new CancelledError();
@@ -1149,6 +1280,14 @@ export class KbBuildService extends EventEmitter {
         }
         // F3-R08：源变更毒化不可恢复——每个批次结束立即失败，模型不得绕过
         this.throwIfPoisoned(buildState);
+        entry.singleCompleted = batchIndex + 1;
+        this.persistCheckpoint(input.buildId);
+        // 每批采用独立模型进程，上下文不随几十份文档持续累积。
+        if (batchIndex + 1 < batches.length) {
+          await this.deps.pool.terminate(`build:${input.buildId}`);
+          rpc = await this.spawnBuildProcess(input.buildId, buildState, input.pluginSnapshot, { signal: input.cancelController.signal });
+          entry.process = rpc;
+        }
       }
 
       // finish prompt（模型未调用工具时强制重试一次，不静默失败）
@@ -1157,6 +1296,8 @@ export class KbBuildService extends EventEmitter {
       entry.stage = 'finishing';
       entry.batchIndex = entry.batchTotal;
       const finishPrompt = [
+        ...this.resumeValidationFeedback(entry),
+        ...this.finishCoverage(buildState),
         '全部批次已完成。请【立即调用 kb_finish 工具】完成构建：',
         '- summary：本次构建的总结（做了什么、产出哪些主题文档）。',
         '- skipped：工作集中未被任何文档引用的源，逐个列出 objToken 与理由。',
@@ -1653,10 +1794,13 @@ export class KbBuildService extends EventEmitter {
     /** P2-S2：objToken → 有效字数（worksetMeta） */
     wordsOf: (token: string) => number;
   }): Promise<void> {
-    const { entry, buildState, units } = input;
+    const { entry, buildState } = input;
+    if (buildState.finishInfo) return;
+    const units = input.units.filter((unit) => !buildState.unitDone?.has(unit.id));
+    if (!units.length) return;
     let cursor = 0;
-    const unitProgress = new Map<string, number>(); // unitId → 已完成批次数
-    for (const unit of units) unitProgress.set(unit.id, 0);
+    const unitProgress = entry.unitProgress; // 持久化已完成批次，重启后继续。
+    for (const unit of units) if (!unitProgress.has(unit.id)) unitProgress.set(unit.id, 0);
     const retriedUnits = new Set<string>();
     let globalFailure: Error | null = null;
     let slotObtained = false;
@@ -1725,8 +1869,9 @@ export class KbBuildService extends EventEmitter {
               isRetry,
               claimedDocs: buildState.claims?.ownedBy(unit.id) ?? [],
             });
+            const continuation = entry.resume ? '这是断点继续：已完成单元/批次不重复执行。请用 draft_list/draft_read 检查本单元已恢复的完整草稿，保留结果并补齐未完成内容。\n\n' : '';
             const outcome = await worker.rpc!.prompt(
-              input.systemRules ? `${batchPrompt}\n\n---\n构建规则与文风规范（每批适用）：\n${input.systemRules}` : batchPrompt,
+              continuation + (input.systemRules ? `${batchPrompt}\n\n---\n构建规则与文风规范（每批适用）：\n${input.systemRules}` : batchPrompt),
               { timeoutMs: input.promptTimeoutMs },
             );
             if (entry.cancelRequested && outcome.outcome !== 'completed') throw new CancelledError();
@@ -1742,6 +1887,7 @@ export class KbBuildService extends EventEmitter {
             this.throwIfPoisoned(buildState);
             unitProgress.set(unit.id, index + 1);
             entry.batchIndex += 1;
+            this.persistCheckpoint(input.buildId);
           }
           // 单元末批后必须有 kb_unit_done（一次纠正，仍无即单元失败）
           if (!buildState.unitDone?.has(unit.id)) {
@@ -1763,7 +1909,7 @@ export class KbBuildService extends EventEmitter {
           await attempt(false);
         } catch (error) {
           const code = error instanceof ToolError ? error.code : '';
-          const retryable = code === 'model_timeout' || code === 'model_request_failed' || code === 'pi_process_exited';
+          const retryable = code === 'model_timeout' || code === 'model_request_failed' || code === 'pi_process_exited' || code === 'pi_transport_failed';
           if (!retryable || retriedUnits.has(unit.id)) throw error;
           retriedUnits.add(unit.id);
           entry.units.retried += 1;
@@ -1776,6 +1922,7 @@ export class KbBuildService extends EventEmitter {
           await attempt(true);
         }
         entry.units.done += 1;
+        this.persistCheckpoint(input.buildId);
         this.emitUnits(input.buildId);
       } catch (error) {
         entry.units.failed += 1;
@@ -1875,6 +2022,7 @@ export class KbBuildService extends EventEmitter {
     slotDeadlineMs: number;
   }): Promise<void> {
     const { entry, buildState } = input;
+    if (buildState.finishInfo) return;
     const reuse = [...entry.workers.values()]
       .filter((worker) => worker.rpc && !worker.rpc.isExited())
       .sort((a, b) => b.workerId.localeCompare(a.workerId))[0] ?? null;
@@ -1917,6 +2065,8 @@ export class KbBuildService extends EventEmitter {
       return `- ${unit.id}（源 ${unit.sources.length} 个）：${report?.summary?.slice(0, 500) ?? '（无摘要）'}`;
     });
     const finishPrompt = [
+      ...this.resumeValidationFeedback(entry),
+      ...this.finishCoverage(buildState),
       '全部构建单元已完成，进入整体收尾轮。各单元摘要：',
       ...summaries,
       '',
@@ -2244,12 +2394,10 @@ export class KbBuildService extends EventEmitter {
   }
 
   private cleanupAfterPipeline(buildId: string): void {
-    // 失败/取消 staging 保留至下次构建开始（诊断用，最多 3 个）——由
-    // cleanupOldStaging 处理；此处只清活跃记录。
-    setTimeout(() => {
-      const entry = this.active.get(buildId);
-      if (entry && entry.events.length > 2000) entry.events.length = 500;
-    }, 60_000).unref?.();
+    // 有检查点的失败/取消草稿保留供恢复；此处释放进程内快照与图片描述。
+    const entry = this.active.get(buildId);
+    if (entry) entry.checkpointReady = false;
+    setTimeout(() => { if (this.active.get(buildId) === entry) this.active.delete(buildId); }, 60_000).unref?.();
   }
 
   // ------------------------------------------------------------------
@@ -2263,17 +2411,9 @@ export class KbBuildService extends EventEmitter {
     const interrupted = typeof store.markInterruptedKbBuilds === 'function'
       ? store.markInterruptedKbBuilds()
       : [];
-    // 删除 interrupted 对应 staging
+    // 中断草稿与检查点保留，只有验证通过的恢复操作可以替换工作目录。
     const outputRoot = this.outputRoot();
     if (outputRoot) {
-      for (const buildId of interrupted) {
-        const staging = this.stagingRoot(outputRoot, buildId);
-        try {
-          fs.rmSync(staging, { recursive: true, force: true });
-        } catch {
-          /* 清理失败保留（下次构建前再清） */
-        }
-      }
       cleanupOldStaging(outputRoot);
       // 指针对账：CURRENT 指向的 release 与 DB 最后 published 不一致 → 以指针为准
       const store = new StandardKbStore(outputRoot);
@@ -2687,7 +2827,7 @@ export function validateOutputRoot(
   }
 }
 
-/** 清理旧 staging（保留最近 3 个）。 */
+/** 保留可恢复构建；其余暂存目录最多保留最近 3 个。 */
 export function cleanupOldStaging(outputRoot: string): void {
   const stagingDir = path.join(outputRoot, '.staging');
   if (!fs.existsSync(stagingDir)) return;
@@ -2700,6 +2840,8 @@ export function cleanupOldStaging(outputRoot: string): void {
     .sort((a, b) => b.mtimeMs - a.mtimeMs);
   for (const entry of entries.slice(3)) {
     try {
+      const buildId = path.basename(entry.full);
+      if (new BuildCheckpointStore(outputRoot).summary(buildId)) continue;
       fs.rmSync(entry.full, { recursive: true, force: true });
     } catch {
       /* 清理失败不阻断 */

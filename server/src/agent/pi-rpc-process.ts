@@ -75,6 +75,8 @@ export interface RpcSpawnOptions {
   promptTimeoutMs?: number;
   /** auto_retry_start 累计上限（超过即 abort 并判失败） */
   maxAutoRetries?: number;
+  /** 限制单条 JSONL 帧，防止损坏输出或累计大消息撑爆宿主进程。 */
+  maxFrameBytes?: number;
 }
 
 export interface RpcEventPayload {
@@ -114,6 +116,8 @@ export class PiRpcProcess extends EventEmitter {
   private exitInfo: { code: number | null; signal: NodeJS.Signals | null } | null = null;
   private stderrTail: string[] = [];
   private stdoutBuffer = '';
+  private stdoutBufferedBytes = 0;
+  private transportFailed = false;
   private readonly options: RpcSpawnOptions;
 
   // 单次运行判定状态
@@ -191,11 +195,17 @@ export class PiRpcProcess extends EventEmitter {
       cwd: this.options.cwd,
       env: this.options.env,
       stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
     });
 
     const child = this.child;
     if (!child.stdin || !child.stdout || !child.stderr) {
       throw new PiRpcError('pi_spawn_failed', '无法建立子进程 stdio 管道');
+    }
+    // 子进程关闭管道时，error 发生在流上而非 ChildProcess 上；没有监听
+    // 会成为宿主的未捕获异常，导致整个桌面应用退出。
+    for (const pipe of [child.stdin, child.stdout, child.stderr]) {
+      pipe.on('error', (error) => this.failTransport('pi_transport_failed', error));
     }
 
     child.stdout.setEncoding('utf-8');
@@ -262,17 +272,35 @@ export class PiRpcProcess extends EventEmitter {
   }
 
   private onStdoutData(chunk: string): void {
+    if (this.transportFailed) return;
     this.stdoutBuffer += chunk;
+    this.stdoutBufferedBytes += Buffer.byteLength(chunk);
+    const limit = this.options.maxFrameBytes ?? 16 * 1024 * 1024;
     // 只按 LF 分帧（容忍尾部 CR）
     let newlineIndex = this.stdoutBuffer.indexOf('\n');
     while (newlineIndex >= 0) {
-      const line = this.stdoutBuffer.slice(0, newlineIndex).replace(/\r$/, '');
+      const raw = this.stdoutBuffer.slice(0, newlineIndex);
+      const line = raw.replace(/\r$/, '');
       this.stdoutBuffer = this.stdoutBuffer.slice(newlineIndex + 1);
+      this.stdoutBufferedBytes -= Buffer.byteLength(raw) + 1;
+      if (Buffer.byteLength(raw) > limit) { this.failTransport('pi_frame_too_large', new Error(`模型 RPC 帧超过 ${limit} 字节`)); return; }
       if (line.trim().length > 0) {
-        this.handleLine(line);
+        try { this.handleLine(line); }
+        catch (error) { this.failTransport('pi_protocol_failed', error); return; }
       }
       newlineIndex = this.stdoutBuffer.indexOf('\n');
     }
+    if (this.stdoutBufferedBytes > limit) this.failTransport('pi_frame_too_large', new Error(`模型 RPC 未结束帧超过 ${limit} 字节`));
+  }
+
+  private failTransport(code: string, cause: unknown): void {
+    if (this.transportFailed) return;
+    this.transportFailed = true; this.stdoutBuffer = ''; this.stdoutBufferedBytes = 0;
+    const message = this.safeErrorText(cause instanceof Error ? cause.message : String(cause));
+    this.failPending(new PiRpcError(code, message));
+    this.finishActiveRun({ outcome: 'failed', error: { code, message } });
+    this.emit('transport_error', { code, message });
+    void this.terminate(0).catch(() => undefined);
   }
 
   private handleLine(line: string): void {
@@ -418,10 +446,10 @@ export class PiRpcProcess extends EventEmitter {
 
   private writeLine(line: string): void {
     const child = this.child;
-    if (!child || this.exited || !child.stdin || child.stdin.destroyed) {
+    if (!child || this.exited || this.transportFailed || !child.stdin || child.stdin.destroyed || child.stdin.writableEnded) {
       throw new PiRpcError('pi_process_exited', 'pi 进程已退出，无法发送命令');
     }
-    child.stdin.write(`${line}\n`);
+    child.stdin.write(`${line}\n`, (error) => { if (error) this.failTransport('pi_transport_failed', error); });
   }
 
   /** 发送白名单命令并等待 response。 */
@@ -504,16 +532,19 @@ export class PiRpcProcess extends EventEmitter {
     }, timeoutMs);
     run.timeoutTimer.unref?.();
 
-    const response = await this.sendCommand('prompt', payload, 30_000);
-    if (!response.success) {
-      // handleResponseForRun 已处理（或兜底）
-      if (this.activeRun === run && !run.finished) {
+    // 管道可能在 prompt 的确认帧之前关闭；命令拒绝也统一结算为运行失败，
+    // 不留下独立的 rejected promise 或等待已经退出的进程。
+    void this.sendCommand('prompt', payload, 30_000).then((response) => {
+      if (!response.success && this.activeRun === run && !run.finished) {
         this.finishActiveRun({
           outcome: 'failed',
           error: { code: classifyPromptError(response.error ?? ''), message: this.safeErrorText(response.error ?? 'prompt 被拒绝') },
         });
       }
-    }
+    }, (error: unknown) => {
+      if (this.activeRun === run && !run.finished) this.finishActiveRun({ outcome: 'failed',
+        error: { code: error instanceof PiRpcError ? error.code : 'pi_transport_failed', message: this.safeErrorText(error instanceof Error ? error.message : String(error)) } });
+    });
     const outcome = await outcomePromise;
     return outcome;
   }

@@ -66,6 +66,14 @@ function render(build: KbBuildDto, layout: 'bottom' | 'sidebar' = 'bottom'): str
   );
 }
 
+it('中断后显示实际检查点与继续入口；旧构建明确说明无法恢复', () => {
+  const build = makeBuild({ status: 'interrupted', recovery: { canResume: true, reason: null, checkpointAt: '2026-10-30T00:00:00Z', draftCount: 11, completedBatches: 1, totalBatches: 4 } });
+  const html = renderToStaticMarkup(<KbBuildPanel open build={build} issues={[]} logs={[]} onCollapse={() => undefined} onCancel={() => undefined} cancelling={false} onResume={() => undefined} />);
+  expect(html).toContain('已保存 11 篇草稿'); expect(html).toContain('完成 1/4 批'); expect(html).toContain('从断点继续');
+  const legacy = render(makeBuild({ status: 'interrupted', recovery: { ...build.recovery!, canResume: false, reason: '旧版本没有保存检查点' } }));
+  expect(legacy).toContain('旧版本没有保存检查点'); expect(legacy).not.toContain('从断点继续');
+});
+
 describe('KbBuildPanel 并行进度（S4/S5）', () => {
   it('多 worker 运行态：并行度、细粒度阶段、单元计数与 worker 徽标', () => {
     const html = render(makeBuild());

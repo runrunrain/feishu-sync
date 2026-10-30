@@ -2719,6 +2719,7 @@ export class LocalMapStore {
 
   updateKbBuild(id: string, patch: Partial<{
     status: string;
+    model: string | null;
     releaseId: string | null;
     sourceTotal: number;
     sourceAdded: number;
@@ -2729,8 +2730,8 @@ export class LocalMapStore {
     noChanges: boolean;
     errorCode: string | null;
     errorMessage: string | null;
-    startedAt: string;
-    finishedAt: string;
+    startedAt: string | null;
+    finishedAt: string | null;
     /** S4：并行构建新列（缺省不动） */
     parallelism: number;
     unitTotal: number;
@@ -2741,6 +2742,7 @@ export class LocalMapStore {
     if (!current) throw new Error(`kb_build 不存在: ${id}`);
     const next = {
       status: patch.status ?? current.status,
+      model: patch.model !== undefined ? patch.model : current.model,
       release_id: patch.releaseId !== undefined ? patch.releaseId : current.release_id,
       source_total: patch.sourceTotal ?? current.source_total,
       source_added: patch.sourceAdded ?? current.source_added,
@@ -2755,20 +2757,20 @@ export class LocalMapStore {
       warnings_json: patch.warningsJson !== undefined ? patch.warningsJson : current.warnings_json ?? null,
       error_code: patch.errorCode !== undefined ? patch.errorCode : current.error_code,
       error_message: patch.errorMessage !== undefined ? patch.errorMessage : current.error_message,
-      started_at: patch.startedAt ?? current.started_at,
-      finished_at: patch.finishedAt ?? current.finished_at,
+      started_at: patch.startedAt !== undefined ? patch.startedAt : current.started_at,
+      finished_at: patch.finishedAt !== undefined ? patch.finishedAt : current.finished_at,
     };
     this.db.prepare(`
       UPDATE kb_builds SET status=?, release_id=?, source_total=?, source_added=?,
         source_changed=?, source_removed=?, docs_written=?, docs_deleted=?,
         no_changes=?, parallelism=?, unit_total=?, vision_model=?, warnings_json=?,
-        error_code=?, error_message=?, started_at=?, finished_at=?
+        error_code=?, error_message=?, started_at=?, finished_at=?, model=?
       WHERE id=?
     `).run(
       next.status, next.release_id, next.source_total, next.source_added,
       next.source_changed, next.source_removed, next.docs_written, next.docs_deleted,
       next.no_changes, next.parallelism, next.unit_total, next.vision_model, next.warnings_json,
-      next.error_code, next.error_message, next.started_at, next.finished_at,
+      next.error_code, next.error_message, next.started_at, next.finished_at, next.model,
       id,
     );
   }

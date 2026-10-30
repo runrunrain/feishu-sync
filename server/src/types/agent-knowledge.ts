@@ -333,6 +333,9 @@ export interface KbBuildDto {
   createdAt: string;
   startedAt: string | null;
   finishedAt: string | null;
+  /** 当前状态已包含至此的事件；重启/恢复连接据此跳过旧终态。 */
+  eventSeq?: number;
+  recovery?: { canResume: boolean; reason: string | null; checkpointAt: string | null; draftCount: number; completedBatches: number; totalBatches: number };
 }
 
 export interface KbBuildReportIssue {

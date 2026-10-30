@@ -6,8 +6,17 @@
  * id 含 NUL 忽略、空 data 事件丢弃、Last-Event-ID 游标。
  */
 
-import { describe, expect, it } from 'vitest';
-import { SseParser, type SseMessage } from './sseStream';
+import { describe, expect, it, vi } from 'vitest';
+import { SseParser, SseConnection, type SseMessage } from './sseStream';
+
+it('构建恢复从已加载状态的游标接收新事件，避免旧失败状态重放', async () => {
+  let request: Request | undefined;
+  const connection = new SseConnection({ endpoint: '/events', initialLastEventId: '110',
+    getAuth: async () => ({ baseUrl: 'http://localhost', headers: {} }), onMessage: vi.fn(), maxRetries: 0 });
+  vi.stubGlobal('fetch', async (value: Request) => { request = value; connection.stop(); return new Response(null, { status: 500 }); });
+  try { await connection.start(); expect(request?.headers.get('Last-Event-ID')).toBe('110'); }
+  finally { vi.unstubAllGlobals(); }
+});
 
 function drain(): SseMessage[] {
   const out: SseMessage[] = [];

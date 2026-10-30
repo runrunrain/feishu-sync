@@ -21,6 +21,11 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     return;
   }
   send({ type: 'response', id: command.id, command: 'prompt', success: true });
+  if (process.env.FIXTURE_SCENARIO === 'large-frame') {
+    process.stdout.write('x'.repeat(5000));
+    return;
+  }
+  if (process.env.FIXTURE_SCENARIO === 'pending') return;
   const error = process.env.FIXTURE_SCENARIO === 'quota'
     ? { role: 'assistant', stopReason: 'error', content: [], errorMessage:
         '429: {"code":"1113","message":"余额不足或无可用资源包 fixture-run-secret", "api_key":"fixture-api-secret", "token":"other-provider-token"}' }
@@ -69,5 +74,39 @@ describe('Pi RPC 模型错误传递', () => {
     expect(outcome).toMatchObject({ outcome: 'failed', error: { code: 'model_auth_missing' } });
     expect(outcome.error?.message).not.toContain('fixture-api-secret');
     expect(outcome.error?.message).not.toContain('fixture-run-secret');
+  });
+});
+
+describe('Pi RPC 宿主异常隔离', () => {
+  it('stdin/stdout/stderr 的异步错误终止本次运行，不抛出宿主未捕获异常', async () => {
+    for (const pipeName of ['stdin', 'stdout', 'stderr'] as const) {
+      const rpc = new PiRpcProcess({ nodePath: process.execPath, piCliPath: cli, cwd: root, tools: [], noSession: true, env: { ...process.env, FIXTURE_SCENARIO: 'pending' } });
+      try {
+        await rpc.start();
+        const outcome = rpc.prompt('fixture');
+        const child = (rpc as unknown as { child: { stdin: NodeJS.WritableStream; stdout: NodeJS.ReadableStream; stderr: NodeJS.ReadableStream } }).child;
+        expect(() => child[pipeName].emit('error', Object.assign(new Error('broken pipe'), { code: 'EPIPE' }))).not.toThrow();
+        expect(await outcome).toMatchObject({ outcome: 'failed', error: { code: 'pi_transport_failed' } });
+      } finally { await rpc.terminate(); }
+    }
+  });
+
+  it('未结束的超大 JSONL 帧会结算为失败并清空缓冲', async () => {
+    const rpc = new PiRpcProcess({ nodePath: process.execPath, piCliPath: cli, cwd: root, tools: [], noSession: true,
+      env: { ...process.env, FIXTURE_SCENARIO: 'large-frame' }, maxFrameBytes: 1024 });
+    try {
+      await rpc.start();
+      expect(await rpc.prompt('fixture')).toMatchObject({ outcome: 'failed', error: { code: 'pi_frame_too_large' } });
+      expect((rpc as unknown as { stdoutBuffer: string }).stdoutBuffer).toBe('');
+    } finally { await rpc.terminate(); }
+  });
+
+  it('模型事件处理器抛错被收敛成运行失败', async () => {
+    const rpc = new PiRpcProcess({ nodePath: process.execPath, piCliPath: cli, cwd: root, tools: [], noSession: true, env: { ...process.env, FIXTURE_SCENARIO: 'fallback' } });
+    try {
+      await rpc.start();
+      rpc.on('event', () => { throw new Error('fixture listener failed'); });
+      expect(await rpc.prompt('fixture')).toMatchObject({ outcome: 'failed', error: { code: 'pi_protocol_failed' } });
+    } finally { await rpc.terminate(); }
   });
 });

@@ -145,6 +145,8 @@ async function buildSseRequest(
 
 export interface SseConnectionOptions {
   endpoint: string;
+  /** 从已加载的状态快照继续，避免重放恢复前的旧终态。 */
+  initialLastEventId?: string;
   /** 每次尝试连接时重新获取鉴权头与 baseUrl（token 可能轮换）。 */
   getAuth: () => Promise<{ headers: Record<string, string>; baseUrl: string }>;
   onMessage: (m: SseMessage) => void;
@@ -165,7 +167,7 @@ export class SseConnection {
   private attempt = 0;
   private lastEventId = '';
 
-  constructor(private readonly options: SseConnectionOptions) {}
+  constructor(private readonly options: SseConnectionOptions) { this.lastEventId = options.initialLastEventId ?? ''; }
 
   get status(): SseStatus {
     return this.stopped ? 'closed' : this.attempt === 0 ? 'connecting' : 'reconnecting';

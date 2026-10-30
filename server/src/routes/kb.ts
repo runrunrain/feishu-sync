@@ -430,6 +430,19 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
     return c.json({ builds: rows.map((row) => buildService.toDto(row)) });
   });
 
+  routes.post('/api/kb/builds/:id/resume', async (c) => {
+    try {
+      await configManager.load();
+      const body = await c.req.json() as { confirm?: string };
+      return c.json(await buildService.resumeBuild(localMapStore, c.req.param('id'), body.confirm), 202);
+    } catch (error) { return errorResponse(c, error); }
+  });
+
+  routes.get('/api/kb/builds/:id/logs', (c) => {
+    if (!localMapStore.getKbBuild(c.req.param('id'))) return c.json({ error: 'build_not_found', message: '构建记录不存在' }, 404);
+    return c.json({ events: buildService.eventsSince(c.req.param('id'), null) });
+  });
+
   routes.get('/api/kb/builds/:id', (c) => {
     const row = localMapStore.getKbBuild(c.req.param('id'));
     if (!row) {

@@ -288,6 +288,8 @@ export interface KbBuildDto {
   createdAt: string;
   startedAt: string | null;
   finishedAt: string | null;
+  eventSeq?: number;
+  recovery?: { canResume: boolean; reason: string | null; checkpointAt: string | null; draftCount: number; completedBatches: number; totalBatches: number };
 }
 
 export interface KbBuildIssue {

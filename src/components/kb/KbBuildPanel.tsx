@@ -44,6 +44,7 @@ import type {
 
 export interface BuildLogLine {
   id: number;
+  seq?: number;
   kind: 'info' | 'warn' | 'error' | 'tool-start' | 'tool-end' | 'assistant';
   text: string;
   at?: string;
@@ -57,6 +58,9 @@ interface KbBuildPanelProps {
   onCollapse: () => void;
   onCancel: () => void;
   cancelling: boolean;
+  onResume?: () => void;
+  onRestart?: () => void;
+  resuming?: boolean;
   layout?: 'bottom' | 'sidebar';
 }
 
@@ -81,6 +85,9 @@ export function KbBuildPanel({
   onCollapse,
   onCancel,
   cancelling,
+  onResume,
+  onRestart,
+  resuming = false,
   layout = 'bottom',
 }: KbBuildPanelProps) {
   const logEndRef = useRef<HTMLDivElement>(null);
@@ -157,14 +164,14 @@ export function KbBuildPanel({
         ) : null}
         {!isTerminal && batchTotal > 0 ? (
           <span className="text-xs text-ink-soft">
-            批次 {Math.min(batchIndex + 1, batchTotal)}/{batchTotal}
+            批次 {Math.min(Math.max(1, batchIndex), batchTotal)}/{batchTotal}
           </span>
         ) : null}
         {!isTerminal && batchTotal > 0 ? (
           <div className="flex-1 max-w-[280px] h-1.5 rounded-full bg-paper-2 overflow-hidden">
             <div
               className="h-full bg-seal/70 transition-all duration-500"
-              style={{ width: `${Math.round(((batchIndex + 1) / batchTotal) * 100)}%` }}
+              style={{ width: `${Math.min(100, Math.round((batchIndex / batchTotal) * 100))}%` }}
             />
           </div>
         ) : (
@@ -311,10 +318,20 @@ export function KbBuildPanel({
         </div>
       ) : null}
 
+      {isTerminal && view.status !== 'published' ? <div className="shrink-0 px-4 py-3 border-b border-line/60 space-y-2" data-testid="kb-build-recovery">
+        {view.recovery?.canResume ? <>
+          <p className="text-xs text-ink-soft">已保存 {view.recovery.draftCount} 篇草稿，完成 {view.recovery.completedBatches}/{view.recovery.totalBatches} 批。继续时复用已完成批次和图片描述。</p>
+          <Button size="sm" variant="primary" onClick={onResume} loading={resuming} disabled={!onResume}>从断点继续</Button>
+        </> : <>
+          <p className="text-xs text-ink-soft">{view.recovery?.reason ?? '本次构建没有可用检查点，重新构建可复用已有图片缓存。'}</p>
+          {onRestart ? <Button size="sm" variant="secondary" onClick={onRestart}>选择文档重新构建</Button> : null}
+        </>}
+      </div> : null}
+
       {/* 日志流 */}
       <div className="flex-1 min-h-0 overflow-auto scrollbar-thin px-4 py-2 space-y-0.5">
         {logs.length === 0 ? (
-          <p className="text-[11px] text-ink-faint">{isTerminal ? '当前会话无实时日志；已发布内容的变化可在版本记录中查看。' : '等待构建事件…'}</p>
+          <p className="text-[11px] text-ink-faint">{isTerminal ? '暂无保存的构建日志。' : '等待构建事件…'}</p>
         ) : (
           logs.map((line) => <BuildLogRow key={line.id} line={line} />)
         )}

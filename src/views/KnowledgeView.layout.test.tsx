@@ -9,6 +9,8 @@ const state = vi.hoisted(() => ({
   deletedSource: false,
   listBuilds: vi.fn(),
   createBuild: vi.fn(),
+  resumeBuild: vi.fn(),
+  interrupted: false,
   toast: { push: vi.fn(), dismiss: vi.fn(), toasts: [] },
   agent: { status: { code: 'ready' }, unreachable: false, loading: false, rechecking: false, recheck: vi.fn(), refresh: vi.fn() },
 }));
@@ -46,7 +48,9 @@ vi.mock('../api/client', () => {
     listKbVersions: async () => ({ retainReleases: 3, versions: [{ releaseId: 'r1', publishedAt: '2026-10-29T00:00:00Z', docCount: 2 }] }),
     getKbVersion: async () => ({ releaseId: 'r1', baseReleaseId: null, summary: '', docChanges: changes, sourceChanges: [] }),
     listKbBuilds: state.listBuilds.mockResolvedValue({ builds: [build] }),
-    getKbBuild: async () => build,
+    getKbBuild: async () => state.interrupted ? { ...build, status: 'interrupted', recovery: { canResume: true, draftCount: 11, completedBatches: 1, totalBatches: 4 } } : build,
+    getKbBuildLogs: async () => ({ events: [{ seq: 1, event: 'build_log', data: { level: 'info', message: '之前完成第一批' } }] }),
+    resumeKbBuild: state.resumeBuild.mockResolvedValue(build),
     createKbBuild: state.createBuild.mockResolvedValue(build),
     cancelKbBuild: vi.fn(), getSseAuth: vi.fn(), searchKb: vi.fn(),
   };
@@ -55,6 +59,22 @@ vi.mock('../api/client', () => {
 import { KnowledgeView } from './KnowledgeView';
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 Element.prototype.scrollIntoView = vi.fn();
+
+it('重启后加载中断检查点和历史日志，确认后发起断点继续', async () => {
+  state.interrupted = true; state.resumeBuild.mockClear();
+  const container = document.createElement('div'); document.body.append(container); const root = createRoot(container);
+  const button = (text: string) => [...container.querySelectorAll('button')].find((item) => item.textContent?.trim() === text)!;
+  try {
+    await act(async () => root.render(<KnowledgeView />));
+    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="打开构建进度"]')!.click());
+    expect(container.textContent).toContain('已保存 11 篇草稿'); expect(container.textContent).toContain('之前完成第一批');
+    expect(state.resumeBuild).not.toHaveBeenCalled();
+    await act(async () => button('从断点继续').click());
+    expect(container.querySelector('[role="dialog"]')?.textContent).toContain('跳过已完成批次');
+    await act(async () => button('继续构建').click());
+    expect(state.resumeBuild).toHaveBeenCalledWith('build-1'); expect(container.querySelector('[role="dialog"]')).toBeNull();
+  } finally { act(() => root.unmount()); container.remove(); state.interrupted = false; }
+});
 
 it('左侧目录保持可用，构建、差异、版本和进度从右侧直接访问', async () => {
   state.hasCurrent = true; state.included = new Set(['a']); state.listBuilds.mockClear(); state.createBuild.mockClear();
