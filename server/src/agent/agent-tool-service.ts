@@ -22,6 +22,7 @@ import {
 import {
   KB_DELETE_DOC_SPEC,
   KB_FINISH_SPEC,
+  KB_GREP_SPEC,
   KB_READ_SPEC,
   KB_SEARCH_SPEC,
   KB_UNIT_DONE_SPEC,
@@ -45,11 +46,13 @@ import {
 import { TASK_TOOL_FAMILY_NAME } from './tool-specs.js';
 import { RawSourceSnapshot, collectSourceCandidates } from '../kb/raw-source-snapshot.js';
 import { StandardKbStore, stripStdHeader } from '../kb/standard-kb-store.js';
+import { getKbQueryService, QueryError } from '../kb/search/kb-query-service.js';
+import { splitAnchor } from '../kb/search/outline.js';
 import { hashImageFile, inlineImageBlocks, resolveSourceImages, extractWhiteboardBypassTexts, type ImageDescriptionLike, type WhiteboardTextMap } from '../kb/source-images.js';
 import type { PathClaims } from '../kb/path-claims.js';
 import type { BuildUnit } from '../kb/build-units.js';
 import type { ImageDescription } from './vision/vision-describer.js';
-import { matchGlob } from '../kb/kb-search.js';
+import { matchGlob, parseSearchQuery } from '../kb/kb-search.js';
 import {
   renderSourceLinksBlock,
   resolveSourceLinks,
@@ -338,6 +341,7 @@ export class AgentToolService {
       tools: [
         { spec: KB_SEARCH_SPEC, runKinds: ['work', 'discuss'], execute: (context, args) => this.toolKbSearch(context, args) },
         { spec: KB_READ_SPEC, runKinds: ['work', 'discuss'], execute: (context, args) => this.toolKbRead(context, args) },
+        { spec: KB_GREP_SPEC, runKinds: ['work', 'discuss'], execute: (context, args) => this.toolKbGrep(context, args) },
         { spec: KB_WRITE_DOC_SPEC, runKinds: ['build'], execute: (context, args) => this.toolKbWriteDoc(context, args) },
         { spec: KB_DELETE_DOC_SPEC, runKinds: ['build'], execute: (context, args) => this.toolKbDeleteDoc(context, args) },
         // S4（§4.4）：逐单元上报；kb_finish 保持单值、只在收尾轮可用
@@ -496,25 +500,56 @@ export class AgentToolService {
   // kb_*（读已发布标准库）
   // ------------------------------------------------------------------
 
-  private toolKbSearch(context: InternalRunContext, args: Record<string, unknown>): ToolResult {
+  private async query<T>(operation: () => Promise<T>): Promise<T> {
+    try { return await operation(); }
+    catch (error) {
+      if (!(error instanceof QueryError)) throw error;
+      const status = ['kb_not_published', 'kb_not_found', 'kb_release_unavailable', 'kb_section_not_found'].includes(error.code) ? 404
+        : ['kb_index_failed', 'kb_integrity_error'].includes(error.code) ? 500 : 400;
+      throw new ToolError(error.code, error.message, status);
+    }
+  }
+
+  private async toolKbSearch(context: InternalRunContext, args: Record<string, unknown>): Promise<ToolResult> {
     const query = requireString(args, 'query', 1, 200);
-    const limit = optionalInt(args, 'limit', 20, 1, 20);
+    const limit = optionalInt(args, 'limit', 20, 1, 30);
+    const cursor = args.cursor === undefined ? undefined : requireString(args, 'cursor', 1, 2048);
     const store = this.storeFor(context.options.outputRoot);
     const manifest = store.readManifest();
-    if (!manifest) {
+    if (!manifest && !cursor) {
       throw new ToolError('kb_not_published', '标准知识库尚未发布，无法搜索', 404);
     }
-    const hits = store.search(manifest, query, limit);
+    const page = await this.query(() => getKbQueryService(context.options.outputRoot).search({
+      query, limit, cursor, releaseId: cursor ? undefined : manifest!.releaseId,
+      ...(args.pathPrefix !== undefined ? { pathPrefix: requireString(args, 'pathPrefix', 0, 4096) } : {}),
+    }));
     return {
-      content: [{ type: 'text', text: JSON.stringify({ releaseId: manifest.releaseId, results: hits }, null, 2) }],
+      content: [{ type: 'text', text: JSON.stringify(page) }],
     };
   }
 
-  private toolKbRead(context: InternalRunContext, args: Record<string, unknown>): ToolResult {
+  private async toolKbGrep(context: InternalRunContext, args: Record<string, unknown>): Promise<ToolResult> {
+    // This handler shares Electron's event loop; JS regex has no interruptible timeout.
+    // Only isolated MCP processes may execute regex (LAN adds the parent watchdog).
+    if (args.mode !== undefined && args.mode !== 'literal') {
+      throw new ToolError('invalid_request', '应用内 kb_grep 仅支持 literal；正则请使用独立只读 MCP');
+    }
+    const page = await this.query(() => getKbQueryService(context.options.outputRoot).grep({
+      pattern: requireString(args, 'pattern', 1, 200),
+      ...(args.pathPrefix !== undefined ? { pathPrefix: requireString(args, 'pathPrefix', 0, 4096) } : {}),
+      ...(args.cursor !== undefined ? { cursor: requireString(args, 'cursor', 1, 2048) } : {}),
+      mode: 'literal',
+      ...(args.caseSensitive !== undefined ? { caseSensitive: args.caseSensitive as boolean } : {}),
+      context: optionalInt(args, 'context', 0, 0, 3), maxMatches: optionalInt(args, 'maxMatches', 100, 1, 500),
+    }));
+    return { content: [{ type: 'text', text: JSON.stringify(page) }] };
+  }
+
+  private async toolKbRead(context: InternalRunContext, args: Record<string, unknown>): Promise<ToolResult> {
     const docId = typeof args.docId === 'string' && args.docId ? args.docId : undefined;
     const docPath = typeof args.path === 'string' && args.path ? args.path : undefined;
-    if (!docId && !docPath) {
-      throw new ToolError('invalid_request', 'docId 与 path 必须提供其一');
+    if (Number(Boolean(docId)) + Number(Boolean(docPath)) !== 1) {
+      throw new ToolError('invalid_request', 'docId 与 path 必须二选一');
     }
     const offset = optionalInt(args, 'offset', 0, 0, 10_000_000);
     const limit = optionalInt(args, 'limit', 800, 1, 2000);
@@ -523,17 +558,19 @@ export class AgentToolService {
     if (!manifest) {
       throw new ToolError('kb_not_published', '标准知识库尚未发布', 404);
     }
-    const doc = store.findDoc(manifest, { docId, path: docPath });
+    const doc = store.findDoc(manifest, { docId, path: docPath === undefined ? undefined : splitAnchor(docPath, manifest.docs.map((entry) => entry.path)).path });
     if (!doc) {
       throw new ToolError('kb_doc_not_found', `标准文档不存在: ${docId ?? docPath}`, 404);
     }
-    const loaded = store.readReleaseDoc(manifest.releaseId, doc);
-    const lines = loaded.markdown.split('\n');
-    const slice = lines.slice(offset, offset + limit);
+    const page = await this.query(() => getKbQueryService(context.options.outputRoot).read({
+      docId, path: docPath, releaseId: manifest.releaseId, startLine: offset + 1, maxLines: limit, includeSources: false,
+      ...(args.section !== undefined ? { section: requireString(args, 'section', 1, 4096) } : {}),
+    }));
+    const totalLines = Number(/lines="\d+-\d+\/(\d+)"/.exec(page.text)?.[1] ?? 0);
     return {
       content: [{
         type: 'text',
-        text: slice.join('\n'),
+        text: page.text,
       }],
       details: {
         docId: doc.docId,
@@ -542,9 +579,11 @@ export class AgentToolService {
         summary: doc.summary,
         tags: doc.tags,
         sources: doc.sources,
+        releaseId: page.releaseId,
         offset,
-        returnedLines: slice.length,
-        totalLines: lines.length,
+        returnedLines: page.endLine - page.startLine + 1,
+        totalLines,
+        nextOffset: page.next === null ? null : page.next - 1,
       },
     };
   }
@@ -582,38 +621,62 @@ export class AgentToolService {
   private toolRawSearch(context: InternalRunContext, args: Record<string, unknown>): ToolResult {
     const query = requireString(args, 'query', 1, 200);
     const limit = optionalInt(args, 'limit', 20, 1, 20);
-    const lowerQuery = query.toLowerCase();
+    const units = parseSearchQuery(query);
+    if (!units.length) return { content: [{ type: 'text', text: JSON.stringify({ results: [] }, null, 2) }] };
     const entries = context.options.buildState
       ? context.options.buildState.snapshot.entries
       : this.rawEntriesForDiscuss(context);
-    const results: Array<Record<string, unknown>> = [];
+    const hits: Array<{ result: Record<string, unknown>; score: number; relPath: string }> = [];
     for (const entry of entries) {
       let snippet = '';
-      let score = 0;
-      if (entry.title.toLowerCase().includes(lowerQuery)) score += 10;
-      if (entry.relPath.toLowerCase().includes(lowerQuery)) score += 5;
+      let content = '';
       try {
-        const content = this.readRawContent(context, entry.objToken);
-        const lower = content.toLowerCase();
-        const index = lower.indexOf(lowerQuery);
-        if (index >= 0) {
-          score += 20;
-          const start = Math.max(0, index - 60);
-          snippet = `${start > 0 ? '…' : ''}${content.slice(start, index + query.length + 100).replace(/\n+/g, ' ')}…`;
-        }
+        content = this.readRawContent(context, entry.objToken);
       } catch {
-        /* 读取失败只降权 */
+        /* 读取失败只降权；readRawContent 仍负责构建快照毒化标记。 */
+      }
+      const title = entry.title.toLowerCase();
+      const relPath = entry.relPath.toLowerCase();
+      const lower = content.toLowerCase();
+      let score = 0;
+      let matched = 0;
+      let firstIndex = -1;
+      let firstLength = 0;
+      for (const unit of units) {
+        let unitScore = 0;
+        if (title.includes(unit)) unitScore += 10;
+        if (relPath.includes(unit)) unitScore += 5;
+        const index = lower.indexOf(unit);
+        if (index >= 0) {
+          unitScore += 20;
+          if (firstIndex < 0 || index < firstIndex) {
+            firstIndex = index;
+            firstLength = unit.length;
+          }
+        }
+        if (unitScore > 0) matched += 1;
+        score += unitScore;
+      }
+      score *= 0.5 + matched / units.length;
+      if (firstIndex >= 0) {
+        const start = Math.max(0, firstIndex - 60);
+        snippet = `${start > 0 ? '…' : ''}${content.slice(start, firstIndex + firstLength + 100).replace(/\n+/g, ' ')}…`;
       }
       if (score > 0) {
-        results.push({
-          objToken: entry.objToken,
-          title: entry.title,
+        hits.push({
+          score,
           relPath: entry.relPath,
-          ...(snippet ? { snippet } : {}),
+          result: {
+            objToken: entry.objToken,
+            title: entry.title,
+            relPath: entry.relPath,
+            ...(snippet ? { snippet } : {}),
+          },
         });
       }
-      if (results.length >= limit) break;
     }
+    hits.sort((a, b) => b.score - a.score || (a.relPath < b.relPath ? -1 : a.relPath > b.relPath ? 1 : 0));
+    const results = hits.slice(0, limit).map((hit) => hit.result);
     return { content: [{ type: 'text', text: JSON.stringify({ results }, null, 2) }] };
   }
 

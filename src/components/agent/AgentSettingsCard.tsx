@@ -11,6 +11,7 @@
  */
 
 import { useEffect, useMemo, useState } from 'react';
+import { writeClipboardText } from '../../utils/clipboard';
 import {
   Bot,
   Check,
@@ -847,7 +848,7 @@ export function AgentKbSettingsCard() {
   const copySnippet = async () => {
     if (!mcp?.snippet) return;
     try {
-      await navigator.clipboard.writeText(mcp.snippet);
+      await writeClipboardText(mcp.snippet);
       setCopied(true);
       window.setTimeout(() => setCopied(false), 2000);
     } catch {

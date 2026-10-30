@@ -196,9 +196,11 @@ lark-cli auth status --verify --json
 
 ```bash
 # 并行启动前端（vite）+ server（tsx watch）
+# 同一终端生成仅用于本次开发会话的凭据；Vite proxy 与 server 共用，勿打印或提交。
+export FEISHU_SYNC_DEV_TOKEN="$(node -e "process.stdout.write(require('node:crypto').randomBytes(32).toString('base64url'))")"
 npm run dev:all
 
-# 或分别启动
+# 或分别启动（两个终端须设置相同的 FEISHU_SYNC_DEV_TOKEN）
 npm run dev          # 仅前端
 npm run server:dev   # 仅 server
 

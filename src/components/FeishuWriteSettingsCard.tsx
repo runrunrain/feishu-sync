@@ -12,6 +12,7 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { writeClipboardText } from '../utils/clipboard';
 import {
   CheckCircle,
   Copy,
@@ -133,7 +134,7 @@ export function FeishuWriteSettingsCard() {
   const handleCopyUrl = async () => {
     if (!session) return;
     try {
-      await navigator.clipboard.writeText(session.verificationUrl);
+      await writeClipboardText(session.verificationUrl);
       setUrlCopied(true);
       setTimeout(() => setUrlCopied(false), 2000);
     } catch {

@@ -183,8 +183,15 @@ describe('validateWorkspacePath', () => {
   it('系统目录本身及其子目录 → forbidden', () => {
     const systemRoot = process.platform === 'win32' ? process.env.SystemRoot : '/etc';
     expect(systemRoot).toBeTruthy();
-    for (const candidate of [systemRoot!, path.join(systemRoot!, process.platform === 'win32' ? 'System32' : 'default')]) {
-      if (!fs.existsSync(candidate)) continue;
+    // /etc 在 macOS 上是 symlink，工作区入口本身拒绝 symlink；
+    // 系统目录与子树断言应使用真实目录，不能把 invalid 当成 forbidden。
+    const realSystemRoot = fs.realpathSync.native(systemRoot!);
+    if (fs.lstatSync(systemRoot!).isSymbolicLink()) {
+      expect(validateWorkspacePath(systemRoot!, guards)).toMatchObject({ ok: false, code: 'workspace_path_invalid' });
+    }
+    const child = fs.readdirSync(realSystemRoot, { withFileTypes: true }).find((entry) => entry.isDirectory());
+    expect(child).toBeDefined();
+    for (const candidate of [realSystemRoot, path.join(realSystemRoot, child!.name)]) {
       expect(validateWorkspacePath(candidate, guards)).toMatchObject({ ok: false, code: 'workspace_path_forbidden' });
     }
   });

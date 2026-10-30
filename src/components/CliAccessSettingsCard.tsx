@@ -9,6 +9,7 @@
  */
 
 import { useState } from 'react';
+import { writeClipboardText } from '../utils/clipboard';
 import { Check, Copy, Loader2, RefreshCw, Terminal, TerminalSquare } from 'lucide-react';
 import { Button } from './common/Button';
 import { StatusBadge } from './common/StatusBadge';
@@ -24,6 +25,7 @@ import {
 
 function InfoRow({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
   const [copied, setCopied] = useState(false);
+  const [copyFailed, setCopyFailed] = useState(false);
   return (
     <div className="flex items-center gap-2 min-w-0">
       <span className="shrink-0 text-xs text-ink-faint w-24">{label}</span>
@@ -34,15 +36,17 @@ function InfoRow({ label, value, mono }: { label: string; value: string; mono?: 
         type="button"
         className="p-1 rounded text-ink-faint hover:text-ink hover:bg-paper disabled:opacity-40"
         onClick={() => {
-          void navigator.clipboard.writeText(value).then(() => {
+          void writeClipboardText(value).then(() => {
+            setCopyFailed(false);
             setCopied(true);
             window.setTimeout(() => setCopied(false), 1500);
-          });
+          }).catch(() => setCopyFailed(true));
         }}
         aria-label={`复制${label}`}
       >
         {copied ? <Check className="w-3.5 h-3.5 text-jade" /> : <Copy className="w-3.5 h-3.5" />}
       </button>
+      {copyFailed && <span role="alert" className="text-xs text-seal">复制失败</span>}
     </div>
   );
 }

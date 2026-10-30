@@ -31,6 +31,8 @@ import { authMiddleware } from './middleware/auth.js';
 import { corsMiddleware } from './middleware/cors.js';
 import { CliEndpoint } from './cli-endpoint.js';
 import { cliRoutes } from './routes/cli.js';
+import { KbLanGatewayManager } from './kb-lan/gateway-manager.js';
+import { kbLanMcpRoutes } from './routes/kb-lan-mcp.js';
 import { cliAdminRoutes } from './routes/cli-admin.js';
 import { healthRoutes } from './routes/health.js';
 import { configRoutes } from './routes/config.js';
@@ -451,6 +453,8 @@ export async function buildServer(options: CreateServerOptions = {}) {
     enabledProvider: () => configManager.getConfig()?.cli?.enabled === true,
   });
 
+  const kbLanGateway = new KbLanGatewayManager({ dataRoot: agentDataRoot, config: configManager });
+
   // Create Hono app
   console.info('[server] Creating Hono app');
   const app = new Hono();
@@ -526,6 +530,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
   app.use('*', async (c, next) => {
     // Inject dependencies for downstream routes
     (c as any).configManager = configManager;
+    (c as any).kbLanGateway = kbLanGateway;
     (c as any).larkCliClient = larkCliClient;
     (c as any).larkCliManager = larkCliManager;
     (c as any).localMapStore = localMapStore;
@@ -593,6 +598,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
   // Register Protected Routes (auth required)
   // ============================================================================
 
+  app.route('/', kbLanMcpRoutes({ manager: kbLanGateway, desktopToken }));
   app.route('/', configRoutes);
   app.route('/', detectRoutes);
   app.route('/', syncRoutes);
@@ -668,6 +674,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
   (app as any).__agentPool = agentPool;
   (app as any).__agentToolService = agentToolService;
   (app as any).__cliEndpoint = cliEndpoint;
+  (app as any).__kbLanGateway = kbLanGateway;
   return app;
 }
 
@@ -682,7 +689,7 @@ export async function startServer(options: CreateServerOptions & {
   const port = options.port ?? DEFAULT_PORT;
   const hostname = options.hostname || '127.0.0.1';
 
-  console.info(`[server] Building server with options:`, options);
+  console.info('[server] Building server', { desktopMode: options.desktopMode === true, corsDevMode: options.corsDevMode === true });
   const app = await buildServer(options);
   console.info(`[server] Server built, starting HTTP server on port ${port}`);
 
@@ -733,10 +740,15 @@ export async function startServer(options: CreateServerOptions & {
     console.warn('[server] CLI endpoint publish failed:', error);
   }
 
+  // Independent fixed-port child; failure never changes the loopback listener.
+  const kbLanGateway = (app as any).__kbLanGateway as KbLanGatewayManager;
+  void kbLanGateway.start().catch(() => console.warn('[server] LAN MCP gateway startup failed'));
+
   let closed = false;
   const close = async () => {
     if (closed) return;
     closed = true;
+    await kbLanGateway.close();
     // S10：先取消全部 pending 批准（挂起的工具调用立即失败），
     // 再回收 pi 子进程。
     const approvals = (app as any).__approvalService as { close: () => void } | undefined;
@@ -829,8 +841,7 @@ if (isMainModule) {
   const standaloneToken =
     process.env.FEISHU_SYNC_DEV_TOKEN?.trim() ||
     crypto.randomBytes(32).toString('base64url');
-  console.info(`[server] Standalone mode token: ${standaloneToken}`);
-  console.info('[server] Use this token via X-Desktop-Token header to access protected routes');
+  console.info('[server] Standalone authentication enabled; configure FEISHU_SYNC_DEV_TOKEN for client access');
 
   // FEISHU_SYNC_PORT：本机 3001 被其他项目占用时的避让出口（默认 3001）。
   const standalonePort = Number(process.env.FEISHU_SYNC_PORT) || 3001;
@@ -841,6 +852,12 @@ if (isMainModule) {
     corsDevMode: true, // P0-bug-1 fix: standalone always serves a browser client (vite 5173 cross-origin)
     port: standalonePort,
     hostname: '127.0.0.1', // Bind to localhost only in standalone mode
+  }).then((started) => {
+    // Electron already closes via QuitCoordinator → started.close().
+    // Standalone needs the same shutdown contract on process signals.
+    for (const signal of ['SIGTERM', 'SIGINT'] as const) process.once(signal, () => {
+      void started.close().then(() => process.exit(0));
+    });
   }).catch((error) => {
     console.error('[server] Failed to start:', error);
     process.exit(1);

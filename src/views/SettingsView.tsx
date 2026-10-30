@@ -25,6 +25,7 @@ import {
   ImageIcon,
   Info,
   KeyRound,
+  Network,
   PenLine,
   Puzzle,
   Server,
@@ -50,6 +51,7 @@ import { AppUpdateCard } from '../components/AppUpdateCard';
 import { AgentPluginsCard } from '../components/agent/AgentPluginsCard';
 import { AgentRuntimeSettingsCard, AgentKbSettingsCard } from '../components/agent/AgentSettingsCard';
 import { CliAccessSettingsCard } from '../components/CliAccessSettingsCard';
+import { KbLanMcpSettingsCard } from '../components/KbLanMcpSettingsCard';
 import { FeishuWriteSettingsCard } from '../components/FeishuWriteSettingsCard';
 import { FeishuPublishSettingsCard } from '../components/FeishuPublishSettingsCard';
 
@@ -62,6 +64,8 @@ interface SettingsSubItem {
   description: string;
   icon: LucideIcon;
   render: () => React.ReactNode;
+  /** 敏感管理卡离开即卸载，不保留明文/异步请求。 */
+  unmountOnLeave?: boolean;
 }
 
 interface SettingsTabMeta {
@@ -173,6 +177,14 @@ const SETTINGS_TABS: SettingsTabMeta[] = [
         icon: Server,
         render: () => <AgentKbSettingsCard />,
       },
+      {
+        id: 'agent-kb-lan',
+        label: '知识库共享',
+        description: '可信内网只读 MCP：地址、令牌、客户端配置与访问审计',
+        icon: Network,
+        render: () => <KbLanMcpSettingsCard />,
+        unmountOnLeave: true,
+      },
     ],
   },
   {
@@ -231,6 +243,8 @@ const SETTINGS_TABS: SettingsTabMeta[] = [
 const VISIBLE_SETTINGS_TABS = SETTINGS_TABS;
 
 interface SettingsViewProps {
+  /** 主区常驻挂载；隐藏时敏感共享卡必须卸载。 */
+  active?: boolean;
   /**
    * 请求聚焦到指定分组（如 TopBar「新版本」徽标 → 'application'）。
    * 仅在值变化时生效一次：不持续锁定，用户随后可自由切换。
@@ -240,11 +254,11 @@ interface SettingsViewProps {
   focusNonce?: number;
 }
 
-export function SettingsView({ focusTabId, focusNonce }: SettingsViewProps) {
-  return <SettingsDraftProvider><SettingsContent focusTabId={focusTabId} focusNonce={focusNonce} /></SettingsDraftProvider>;
+export function SettingsView({ focusTabId, focusNonce, active = true }: SettingsViewProps) {
+  return <SettingsDraftProvider><SettingsContent active={active} focusTabId={focusTabId} focusNonce={focusNonce} /></SettingsDraftProvider>;
 }
 
-function SettingsContent({ focusTabId, focusNonce }: SettingsViewProps) {
+function SettingsContent({ focusTabId, focusNonce, active }: SettingsViewProps) {
   const draft = useSettingsDraft()!;
   const [activeTab, setActiveTab] = useState<SettingsTab>('knowledge');
   const currentTabMeta = VISIBLE_SETTINGS_TABS.find((tab) => tab.id === activeTab) ?? VISIBLE_SETTINGS_TABS[0];
@@ -383,7 +397,7 @@ function SettingsContent({ focusTabId, focusNonce }: SettingsViewProps) {
           ref={contentRef}
           className="flex-1 min-w-0 md:max-h-[calc(100dvh-180px)] md:overflow-y-auto scrollbar-thin md:pr-1"
         >
-          {VISIBLE_SETTINGS_TABS.flatMap((tab) => tab.items).filter((item) => visited.has(item.id)).map((item) => (
+          {VISIBLE_SETTINGS_TABS.flatMap((tab) => tab.items).filter((item) => visited.has(item.id) && (!item.unmountOnLeave || (active && currentSub.id === item.id))).map((item) => (
             <div key={item.id} hidden={currentSub.id !== item.id}>{item.render()}</div>
           ))}
         </div>

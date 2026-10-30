@@ -74,7 +74,8 @@ it('真实Pi插件快照进入system；运行中编辑不改变当前任务，�
   const service = new SessionService({ dataRoot: root, pool, toolService: tools, resolver, configProvider: () => config,
     internalBaseUrl: () => `http://127.0.0.1:${port}`, extensionPath: piExtensionPath, pluginStore: plugins,
     workspaceGuards: () => ({ dataRoot: root, knowledgeBaseRoot: '', outputRoot: '' }) });
-  const session = service.create(store, { title: '插件验收' });
+  const session = service.create(store, { title: '插件验收', backend: 'pi' });
+  expect(session.backend).toBe('pi');
   const complete = async (message: string, count: number) => {
     await service.sendMessage(store, session.id, { text: message });
     await vi.waitFor(() => { expect(requests).toHaveLength(count); expect(service.isRunning(session.id)).toBe(false); }, { timeout: 35000, interval: 25 });
@@ -83,7 +84,10 @@ it('真实Pi插件快照进入system；运行中编辑不改变当前任务，�
   };
   try {
     await service.sendMessage(store, session.id, { text: '第一轮' });
-    await vi.waitFor(() => expect(releaseFirst).toBeTypeOf('function'), { timeout: 35000, interval: 25 });
+    await vi.waitFor(() => {
+      const lastError = service.get(store, config, session.id)?.lastError;
+      expect(releaseFirst, `Pi session error: ${JSON.stringify(lastError)}`).toBeTypeOf('function');
+    }, { timeout: 35000, interval: 25 });
     plugins.mutate('update', 'discuss-context', plugins.list().revision, { content: 'PLUGIN_CONTEXT_B_83ad' });
     const firstId = pool.get(session.id)!.id;
     releaseFirst!();

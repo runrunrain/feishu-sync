@@ -7,7 +7,7 @@
  * Adapted from tts-voice-generator/main.ts with feishu-sync adaptations
  */
 
-import { app, BrowserWindow, dialog, ipcMain, session, shell, globalShortcut } from 'electron';
+import { app, BrowserWindow, clipboard, dialog, ipcMain, session, shell, globalShortcut } from 'electron';
 import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
@@ -26,6 +26,7 @@ import { ChangeNotificationService } from './change-notification-service.js';
 import { ConfigManager } from '../server/src/modules/config-manager.js';
 import type { QuitReason } from './contracts.js';
 import { externalNavigationUrl } from '../src/utils/external-url.js';
+import { writeClipboardText } from './clipboard-service.js';
 
 // ============================================================================
 // Constants and Configuration
@@ -361,6 +362,10 @@ function getQuitCoordinator() {
 // ============================================================================
 // IPC Handlers
 // ============================================================================
+
+ipcMain.handle('desktop:clipboard-write-text', (event, value: unknown) => {
+  writeClipboardText(event, mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null, value, (text) => clipboard.writeText(text));
+});
 
 ipcMain.handle('desktop:get-api-headers', () => {
   if (!desktopApiToken) {

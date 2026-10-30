@@ -955,6 +955,7 @@ export interface ChannelTestResult {
 
 // Desktop API types (from desktop-contracts.ts)
 export interface DesktopAPI {
+  writeClipboardText: (text: string) => Promise<void>;
   getApiHeaders: () => Promise<{ 'X-Desktop-Token': string }>;
   getServerStatus: () => Promise<{ running: boolean; port: number | null }>;
   /** 平台能力与真实应用版本（electron/main.ts desktop:get-platform-capabilities）。 */

@@ -5,6 +5,10 @@
  * Agent、MCP 结果一致。本模块只做内存匹配，输入由调用方装载。
  */
 
+import { assembleIndex, indexDoc } from './search/index-core.js';
+import { rankLexV1 } from './search/rank-lex-v1.js';
+import { makeSnippet, type SnippetHit } from './search/snippet.js';
+
 export interface SearchableDoc {
   docId: string;
   path: string;
@@ -19,10 +23,97 @@ export interface SearchHit {
   title: string;
   summary: string;
   snippet: string;
+  score?: number;
+  coverage?: number;
+  hits?: SnippetHit[];
 }
 
-/** 大小写不敏感子串搜索；标题/章节标题命中加权。 */
-export function searchDocs(
+/**
+ * P0/L1 查询单元：引号内保留短语，其余按空白/标点切分，去重。
+ * + - _ . % # 不作分隔符，保留英文 ID、版本号和数值；单字/单数字仍可查。
+ * 不含 lex-v1 的规范化、词表回退或单元数量截断。
+ */
+export function parseSearchQuery(query: string): string[] {
+  const units: string[] = [];
+  const tokens = /"([^"]*)"|“([^”]*)”|「([^」]*)」|([^\s,，。；;、:：!！?？()（）[\]【】{}<>《》'"“”‘’「」|\\/]+)/g;
+  for (const match of query.toLowerCase().matchAll(tokens)) {
+    const unit = (match[1] ?? match[2] ?? match[3] ?? match[4]).trim();
+    if (unit) units.push(unit);
+  }
+  return [...new Set(units)];
+}
+
+/** L1：沿用字段权重，逐单元子串匹配；覆盖率乘子 = 0.5 + hits/units。 */
+export function l1SearchDocs(
+  docs: SearchableDoc[],
+  query: string,
+  limit = 20,
+  bodyFetcher?: (doc: SearchableDoc) => string | null,
+  unbounded = false,
+): SearchHit[] {
+  const units = parseSearchQuery(query);
+  if (!units.length) return [];
+  const hits: Array<{ hit: SearchHit; score: number }> = [];
+  for (const doc of docs) {
+    const title = doc.title.toLowerCase();
+    const docPath = doc.path.toLowerCase();
+    const headings = doc.headings.map((heading) => heading.toLowerCase());
+    const summary = doc.summary.toLowerCase();
+    const body = bodyFetcher?.(doc) ?? '';
+    const lowerBody = body.toLowerCase();
+    let score = 0;
+    let matched = 0;
+    let firstIndex = -1;
+    let firstLength = 0;
+    for (const unit of units) {
+      let unitScore = 0;
+      if (title.includes(unit)) unitScore += 100;
+      if (title.startsWith(unit)) unitScore += 50;
+      if (docPath.includes(unit)) unitScore += 30;
+      if (headings.some((heading) => heading.includes(unit))) unitScore += 40;
+      if (summary.includes(unit)) unitScore += 20;
+      const index = lowerBody.indexOf(unit);
+      if (index >= 0) {
+        unitScore += 60;
+        if (firstIndex < 0 || index < firstIndex) {
+          firstIndex = index;
+          firstLength = unit.length;
+        }
+      }
+      if (unitScore > 0) matched += 1;
+      score += unitScore;
+    }
+    if (!matched) continue;
+    score *= 0.5 + matched / units.length;
+    let snippet = doc.summary.slice(0, 160) || doc.title;
+    if (firstIndex >= 0) {
+      const start = Math.max(0, firstIndex - 60);
+      const end = Math.min(body.length, firstIndex + firstLength + 120);
+      snippet = `${start > 0 ? '…' : ''}${body.slice(start, end).replace(/\n+/g, ' ')}${end < body.length ? '…' : ''}`;
+    }
+    hits.push({ hit: { docId: doc.docId, path: doc.path, title: doc.title, summary: doc.summary, snippet }, score });
+  }
+  // 不依赖宿主 locale，输入顺序不影响并列结果。
+  hits.sort((a, b) => b.score - a.score || (a.hit.path < b.hit.path ? -1 : a.hit.path > b.hit.path ? 1 : 0));
+  return hits.slice(0, unbounded ? limit : Math.max(1, Math.min(limit, 50))).map((hit) => hit.hit);
+}
+
+/** Synchronous compatibility entry; release I/O and caching belong to KbQueryService. */
+export function searchDocs(docs: SearchableDoc[], query: string, limit = 20, bodyFetcher?: (doc: SearchableDoc) => string | null): SearchHit[] {
+  if (!query.trim()) return [];
+  if (process.env.FEISHU_KB_RANKER === 'l1') return l1SearchDocs(docs, query, limit, bodyFetcher);
+  const index = assembleIndex('memory', docs.map((doc) => indexDoc({ ...doc, tags: [], sources: [] },
+    bodyFetcher?.(doc) ?? `# ${doc.title}\n${doc.headings.map((h) => `## ${h}`).join('\n')}`)));
+  const result = rankLexV1(index, query);
+  return result.ranked.slice(0, Math.max(1, Math.min(limit, 50))).map((r) => {
+    const hits = r.sections.slice(0, 2).map((s) => makeSnippet(r.doc, s.section, result.query));
+    return { docId: r.doc.docId, path: r.doc.path, title: r.doc.title, summary: r.doc.summary.slice(0, 120),
+      snippet: hits[0]?.snippet ?? '', score: Math.round(r.score * 100) / 100, coverage: r.coverage, hits };
+  });
+}
+
+/** L0 原实现：仅供 E0 基线比较，保留整串子串匹配、排序与片段行为。 */
+export function legacySearchDocs(
   docs: SearchableDoc[],
   query: string,
   limit = 20,

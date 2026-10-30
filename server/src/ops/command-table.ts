@@ -105,6 +105,7 @@ function requireString(args: Record<string, unknown>, field: string): string {
  * /api/config 对 actor='cli' 同语义。
  */
 const CONFIG_SET_FORBIDDEN: Array<{ prefix: string; reason: string }> = [
+  { prefix: 'kbLanMcp', reason: '知识库内网共享只能由桌面设置管理' },
   { prefix: 'cli', reason: 'CLI 主体不能改写命令行访问开关（请在应用设置中操作）' },
   { prefix: 'llm', reason: 'LLM 整段与密钥面不接受 CLI 直写（含明文 apiKey 风险）' },
   { prefix: 'llm.apiKey', reason: 'apiKey 只能经应用设置或 stdin 通道写入' },
@@ -278,7 +279,7 @@ export const OPS_COMMANDS: readonly OpsCommandDef[] = [
   // ---- mutate -------------------------------------------------------------
   {
     name: 'config.set',
-    summary: '窄 patch 写入单个配置路径（禁 cli.*/llm 密钥面/agent.workspaces/feishuWrite）',
+    summary: '窄 patch 写入单个配置路径（禁 cli.*/kbLanMcp/llm 密钥面/agent.workspaces/feishuWrite）',
     risk: 'mutate',
     agentExposed: true,
     params: {

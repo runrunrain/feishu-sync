@@ -12,8 +12,12 @@ import path from 'node:path';
 import {
   isPathInside,
   PathGuardError,
+  resolveInside,
 } from '../agent/path-guard.js';
-import { searchDocs, type SearchHit } from './kb-search.js';
+import type { SearchHit } from './kb-search.js';
+import { getKbQueryService, type KbQueryService } from './search/kb-query-service.js';
+export { stripStdHeader } from './search/header.js';
+import { stripStdHeader } from './search/header.js';
 import type {
   KbCurrentPointer,
   KbManifest,
@@ -28,17 +32,6 @@ export class KbNotPublishedError extends Error {
   }
 }
 
-interface CachedManifest {
-  releaseId: string;
-  mtimeMs: number;
-  manifest: KbManifest;
-}
-
-/** 从标准文档 Markdown 中剥去 server 生成的文件头。 */
-export function stripStdHeader(markdown: string): string {
-  const match = /^<!--\s*\nfeishu_sync_kb:[\s\S]*?\n-->\s*\n?/.exec(markdown);
-  return match ? markdown.slice(match[0].length) : markdown;
-}
 
 /** 解析标准文档文件头（feishu_sync_kb YAML-in-comment）。 */
 export function parseStdHeader(
@@ -70,11 +63,13 @@ export interface LoadedDoc {
 
 export class StandardKbStore {
   private readonly outputRoot: string;
+  readonly queryService: KbQueryService;
   private cachedPointer: { mtimeMs: number; pointer: KbCurrentPointer | null } | null = null;
-  private cachedManifest: CachedManifest | null = null;
+
 
   constructor(outputRoot: string) {
     this.outputRoot = outputRoot;
+    this.queryService = getKbQueryService(outputRoot);
   }
 
   get outputRootPath(): string {
@@ -113,27 +108,10 @@ export class StandardKbStore {
     return path.join(this.outputRoot, 'releases', releaseId);
   }
 
-  private manifestPath(releaseId: string): string {
-    return path.join(this.releaseDir(releaseId), 'manifest.json');
-  }
-
-  /** 读取发布 manifest（按 releaseId 缓存）。 */
+  /** Resolve before reading metadata too; a cached pointer must not bypass release realpath fences. */
   readManifest(releaseId?: string): KbManifest | null {
-    const current = releaseId ? { releaseId } : this.readCurrent();
-    if (!current) return null;
-    const manifestFile = this.manifestPath(current.releaseId);
-    const stat = fs.statSync(manifestFile, { throwIfNoEntry: false });
-    if (!stat) return null;
-    if (this.cachedManifest && this.cachedManifest.releaseId === current.releaseId && this.cachedManifest.mtimeMs === stat.mtimeMs) {
-      return this.cachedManifest.manifest;
-    }
     try {
-      const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf-8')) as KbManifest;
-      if (manifest.releaseId !== current.releaseId) {
-        throw new Error('manifest releaseId 与目录不一致');
-      }
-      this.cachedManifest = { releaseId: current.releaseId, mtimeMs: stat.mtimeMs, manifest };
-      return manifest;
+      return this.queryService.resolveRelease(releaseId).manifest;
     } catch {
       return null;
     }
@@ -141,7 +119,8 @@ export class StandardKbStore {
 
   /** 读取 release 内文档文件（realpath 围栏校验；文件位于 docs/ 下）。 */
   readReleaseDoc(releaseId: string, doc: KbManifestDoc): LoadedDoc {
-    const rootReal = fs.realpathSync.native(path.join(this.releaseDir(releaseId), 'docs'));
+    const release = this.queryService.resolveRelease(releaseId);
+    const rootReal = resolveInside(release.releaseDir, 'docs', 'read');
     const target = path.join(rootReal, doc.path);
     const targetReal = fs.realpathSync.native(target);
     if (!isPathInside(rootReal, targetReal)) {
@@ -206,33 +185,16 @@ export class StandardKbStore {
     return sortNodes(root.children!);
   }
 
-  /** 搜索已发布文档（含正文片段）。 */
-  search(manifest: KbManifest, query: string, limit = 20): SearchHit[] {
-    const releaseId = manifest.releaseId;
-    const bodyCache = new Map<string, string | null>();
-    return searchDocs(
-      manifest.docs.map((doc) => ({
-        docId: doc.docId,
-        path: doc.path,
-        title: doc.title,
-        summary: doc.summary,
-        headings: doc.headings,
-      })),
-      query,
-      limit,
-      (entry) => {
-        if (bodyCache.has(entry.docId)) return bodyCache.get(entry.docId) ?? null;
-        let body: string | null = null;
-        try {
-          const doc = manifest.docs.find((candidate) => candidate.docId === entry.docId);
-          if (doc) body = this.readReleaseDoc(releaseId, doc).markdown;
-        } catch {
-          body = null;
-        }
-        bodyCache.set(entry.docId, body);
-        return body;
-      },
-    );
+  /** Legacy UI top-k contract: drain shared budget pages instead of silently losing hits. */
+  async search(manifest: KbManifest, query: string, limit = 20): Promise<SearchHit[]> {
+    const results: SearchHit[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await this.queryService.search({ releaseId: manifest.releaseId, query, limit, cursor });
+      results.push(...page.results);
+      cursor = page.next ?? undefined;
+    } while (cursor && results.length < limit);
+    return results.slice(0, limit);
   }
 }
 

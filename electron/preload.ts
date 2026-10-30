@@ -20,6 +20,7 @@ import type {
 import type { DesktopAPI } from './desktop-contracts.js';
 
 const desktopApi: DesktopAPI = {
+  writeClipboardText: (text: string): Promise<void> => ipcRenderer.invoke('desktop:clipboard-write-text', text),
   getApiHeaders: async (): Promise<{ 'X-Desktop-Token': string }> => {
     return ipcRenderer.invoke('desktop:get-api-headers');
   },

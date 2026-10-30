@@ -27,6 +27,7 @@ import { createClaudeProcess } from '../agent/claude-process-factory.js';
 import { RawSourceSnapshot, computeSourceHash } from './raw-source-snapshot.js';
 import { isReleaseInUse } from './publication-service.js';
 import { StandardKbStore, parseStdHeader, stripStdHeader } from './standard-kb-store.js';
+import { getKbQueryService } from './search/kb-query-service.js';
 import { KbVersionStore, captureSourceContents, sourceChangePreview, type SourceContents } from './kb-version-store.js';
 import { hasEditorialHistory, hasSourceMetadata } from './body-policy.js';
 import { planUnits, packBatches, type BuildUnit } from './build-units.js';
@@ -2102,6 +2103,10 @@ export class KbBuildService extends EventEmitter {
       publishedAt: manifest.publishedAt,
     }, null, 2));
     fs.renameSync(tmpPath, pointerPath);
+    // CURRENT is committed. Prewarm is best-effort and must never delay/fail publication.
+    setImmediate(() => { void getKbQueryService(outputRoot).prewarmCurrent().catch((error) => {
+      this.emit('log', `检索索引预热失败（发布已成功）：${String(error)}`);
+    }); });
     return manifest;
   }
 

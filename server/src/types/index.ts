@@ -61,6 +61,14 @@ export interface SyncConfig {
   };
 }
 
+export interface KbLanMcpConfig {
+  enabled: boolean;
+  bindAddress: string;
+  port: number;
+  allowCidrs?: string[];
+  maxSessions: number;
+}
+
 export interface Config {
   /**
    * v0.2.0 P3: channel-agnostic LLM config. The legacy flat
@@ -80,6 +88,8 @@ export interface Config {
   standardKb: StandardKbConfig;
   /** CLI 命令行访问（S8，additive，可选：旧配置内存补默认）。 */
   cli?: CliConfig;
+  /** 内网只读 MCP，共享开关仅走 desktop 专用管理路由。 */
+  kbLanMcp?: KbLanMcpConfig;
   /** 飞书写回（S12，additive，可选：旧配置内存补默认 enabled=false）。 */
   feishuWrite?: FeishuWriteConfig;
   /** 反向发布（P1-S8，additive，可选：旧配置内存补默认 enabled=false）。 */

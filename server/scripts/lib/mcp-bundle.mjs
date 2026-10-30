@@ -16,10 +16,20 @@ export const mcpOutDefault = path.join(serverRoot, 'dist', 'mcp', 'kb-mcp.cjs');
  * 无 external——SDK 纯 JS 全量打入，产物可直接被外部 Node ≥20 运行）。
  */
 export async function bundleMcp(outfile = mcpOutDefault) {
+  return bundleReadOnlyMcp(mcpEntry, outfile);
+}
+
+export const gatewayOutDefault = path.join(serverRoot, 'dist', 'mcp', 'kb-mcp-gateway.cjs');
+export async function bundleGateway(outfile = gatewayOutDefault) {
+  return bundleReadOnlyMcp(path.join(serverRoot, 'src', 'mcp', 'kb-mcp-gateway.ts'), outfile);
+}
+
+async function bundleReadOnlyMcp(entry, outfile) {
   const result = await build({
-    entryPoints: [mcpEntry],
+    entryPoints: [entry],
     outfile,
     bundle: true,
+    metafile: true,
     platform: 'node',
     format: 'cjs',
     target: 'node20',
@@ -30,6 +40,11 @@ export async function bundleMcp(outfile = mcpOutDefault) {
   });
   if (result.errors.length > 0) {
     throw new Error(`esbuild 打包失败: ${result.errors.map((error) => error.text).join('; ')}`);
+  }
+  const code = fs.readFileSync(outfile, 'utf8');
+  if (Object.keys(result.metafile.inputs).some((input) => /better-sqlite3|\.node$/.test(input))
+    || /better-sqlite3|\.node["'`]/.test(code)) {
+    throw new Error('只读 MCP bundle 不得包含原生模块引用');
   }
   return { outfile, size: fs.statSync(outfile).size };
 }
