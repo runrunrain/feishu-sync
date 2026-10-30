@@ -1154,10 +1154,11 @@ export async function searchKb(
 /** POST /api/kb/builds —— 触发构建（需 confirm:'BUILD'；§6.6 手动触发）。 */
 export async function createKbBuild(
   mode: 'incremental' | 'full',
+  options?: { refreshImages?: boolean },
 ): Promise<KbBuildDto> {
   return request<KbBuildDto>('/api/kb/builds', {
     method: 'POST',
-    body: JSON.stringify({ mode, confirm: 'BUILD' }),
+    body: JSON.stringify({ mode, confirm: 'BUILD', ...options }),
   });
 }
 

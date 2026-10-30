@@ -93,6 +93,9 @@ interface InMemoryBuild {
   id: string;
   /** 基座在创建构建时固定，设置变更只影响之后的新构建。 */
   backend?: 'pi' | 'claude-code';
+  /** 本次所选源文档的图片是否强制重新识别。 */
+  refreshImages: boolean;
+  imageRefreshFailures: number;
   batchIndex: number;
   batchTotal: number;
   buildState: BuildRunState | null;
@@ -276,7 +279,7 @@ export class KbBuildService extends EventEmitter {
       getActiveKbBuild(): Record<string, unknown> | null;
       updateKbBuild(id: string, patch: Record<string, unknown>): void;
     },
-    input: { mode?: string; confirm?: string },
+    input: { mode?: string; confirm?: string; refreshImages?: boolean },
   ): Promise<KbBuildDto> {
     const config = this.deps.configProvider();
     if (!config) throw new ToolError('invalid_request', '配置不可用');
@@ -285,6 +288,12 @@ export class KbBuildService extends EventEmitter {
     }
     if (input.mode !== 'incremental' && input.mode !== 'full') {
       throw new ToolError('invalid_request', "mode 必须是 'incremental' 或 'full'");
+    }
+    if (input.refreshImages !== undefined && typeof input.refreshImages !== 'boolean') {
+      throw new ToolError('invalid_request', 'refreshImages 必须是布尔值');
+    }
+    if (input.refreshImages && input.mode !== 'full') {
+      throw new ToolError('invalid_request', '重新生成图片描述仅支持构建所选文档');
     }
     if (this.running || localMapStore.getActiveKbBuild()) {
       throw new ToolError('kb_build_running', '已有构建正在进行', 409);
@@ -323,6 +332,8 @@ export class KbBuildService extends EventEmitter {
     this.active.set(buildId, {
       id: buildId,
       backend: config.agent.runtime.backend === 'claude-code' ? 'claude-code' : 'pi',
+      refreshImages: input.refreshImages === true,
+      imageRefreshFailures: 0,
       batchIndex: 0,
       batchTotal: 0,
       buildState: null,
@@ -583,8 +594,7 @@ export class KbBuildService extends EventEmitter {
       buildState.whiteboardTexts = collectWhiteboardTextsForEntries(config.knowledgeBaseRoot, snapshot.entries);
 
       // ---- S3（§3.4）：preflight 图片预描述（stage=describing_images）----
-      // vision 就绪 → describeMany（缓存命中不调远端、不计配额）；未就绪 →
-      // 全部标 unavailable(vision_unconfigured)。U5：不阻断构建。
+      // 优先复用已有缓存；vision 未就绪时仅未缓存图片标记 unavailable。
       entry.stage = 'describing_images';
       const cancelController = new AbortController();
       entry.cancelController = cancelController;
@@ -609,12 +619,22 @@ export class KbBuildService extends EventEmitter {
         });
       }
       if (entry.images.total > 0 && entry.images.unavailable > 0) {
-        buildWarnings.push({
+        const warning = {
           code: 'images_unavailable',
           count: entry.images.unavailable,
           message: `${entry.images.unavailable}/${entry.images.total} 张图片未理解（${visionReady ? '图片理解通道部分失败' : '图片理解未配置'}）；图片引用处已插入 unavailable 标记`,
-        });
-        this.emitLog(buildId, 'warn', buildWarnings[0].message);
+        };
+        buildWarnings.push(warning);
+        this.emitLog(buildId, 'warn', warning.message);
+      }
+      if (entry.imageRefreshFailures > 0) {
+        const warning = {
+          code: 'images_refresh_incomplete',
+          count: entry.imageRefreshFailures,
+          message: `${entry.imageRefreshFailures} 张图片未能重新生成或保存，已有缓存已保留；请检查识图服务、图片大小、识图上限或本地存储。`,
+        };
+        buildWarnings.push(warning);
+        this.emitLog(buildId, 'warn', warning.message);
       }
       localMapStore.updateKbBuild(buildId, {
         warningsJson: JSON.stringify(buildWarnings),
@@ -866,15 +886,15 @@ export class KbBuildService extends EventEmitter {
     return this.defaultDescriber;
   }
 
-  /** S3（§3.6）：/api/kb/changes 的只读缓存探测（未命中/未启用都计 uncached）。 */
+  /** S3（§3.6）：/api/kb/changes 的只读缓存探测。 */
   visionCacheProbe(): ((imageHash: string) => Promise<string | null>) | null {
     const describer = this.resolveVisionDescriber();
     return (hash) => describer.lookup(hash).catch(() => null);
   }
 
   /**
-   * S3（§3.4）：preflight 预描述。枚举工作集源图片 → vision ready 时
-   * describeMany（缓存命中不调远端）；否则全部 unavailable(vision_unconfigured)。
+   * S3（§3.4）：preflight 预描述。枚举工作集源图片并优先使用已有缓存；
+   * vision 未就绪时未缓存的图片标为 unavailable(vision_unconfigured)。
    * describeMany 的结果 Map 以 src 为键，跨源同名 src 会冲突——这里用
    * `<objToken>::<src>` 组合键传入再拆回（缓存写入按图片字节 hash，不受影响）。
    */
@@ -915,23 +935,22 @@ export class KbBuildService extends EventEmitter {
       }
       bucket.set(description.src, description);
     };
-    if (!input.visionReady) {
-      for (const item of items) {
-        put(item.objToken, { src: item.src, imageHash: '', state: 'unavailable', reason: 'vision_unconfigured' });
-      }
-      input.entry.images.unavailable = items.length;
-      return result;
-    }
-    this.emitLog(input.buildId, 'info', `图片预描述：${items.length} 张（命中缓存不调远端）`);
+    this.emitLog(input.buildId, 'info', !input.visionReady
+      ? `图片预描述：${items.length} 张（识图服务未就绪，仅复用已有缓存）`
+      : input.entry.refreshImages
+      ? `图片预描述：${items.length} 张（重新生成所选源文档图片描述）`
+      : `图片预描述：${items.length} 张（命中缓存不调远端）`);
     const composed = await input.describer.describeMany(
       items.map((item) => ({ file: item.file, src: `${item.objToken}::${item.src}` })),
-      { signal: input.signal, onProgress: () => undefined },
+      { signal: input.signal, onProgress: () => undefined, refreshCached: input.entry.refreshImages },
     );
     let described = 0;
     let cached = 0;
     let unavailable = 0;
+    let refreshFailures = 0;
     for (const item of items) {
       const description = composed.get(`${item.objToken}::${item.src}`);
+      if (description?.refreshFailure) refreshFailures += 1;
       if (description && description.state !== 'unavailable') {
         put(item.objToken, { ...description, src: item.src });
         if (description.state === 'cached') cached += 1;
@@ -948,6 +967,7 @@ export class KbBuildService extends EventEmitter {
       }
     }
     input.entry.images = { total: items.length, described, cached, unavailable };
+    input.entry.imageRefreshFailures = refreshFailures;
     return result;
   }
 

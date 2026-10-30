@@ -114,6 +114,36 @@ it('左侧目录保持可用，构建、差异、版本和进度从右侧直接�
   } finally { act(() => root.unmount()); container.remove(); }
 });
 
+it('所选文档可选择重新生成图片描述，取消重置并在启动失败后保留选择', async () => {
+  state.hasCurrent = true; state.included = new Set(['a']); state.createBuild.mockClear();
+  state.createBuild.mockRejectedValueOnce(new Error('构建启动失败'));
+  const container = document.createElement('div'); document.body.append(container);
+  const root = createRoot(container);
+  const button = (text: string) => [...container.querySelectorAll('button')].find((item) => item.textContent?.trim() === text)!;
+  const dialog = () => container.querySelector<HTMLElement>('[role="dialog"]')!;
+  const checkbox = () => dialog().querySelector<HTMLInputElement>('input[type="checkbox"]')!;
+  const click = async (element: HTMLElement) => act(async () => element.click());
+  try {
+    await act(async () => root.render(<KnowledgeView />));
+    await click(container.querySelector<HTMLButtonElement>('[aria-label="打开构建标准库"]')!);
+    await click(button('构建所选文档'));
+    expect(dialog().textContent).toContain('重新生成所选文档的图片描述');
+    expect(checkbox().checked).toBe(false);
+    await click(checkbox());
+    await click(button('取消'));
+    await click(button('构建所选文档'));
+    expect(checkbox().checked).toBe(false);
+    await click(checkbox());
+    await click(button('开始构建'));
+    expect(state.createBuild).toHaveBeenLastCalledWith('full', { refreshImages: true });
+    expect(checkbox().checked).toBe(true);
+    await click(button('开始构建'));
+    expect(state.createBuild).toHaveBeenCalledTimes(2);
+    expect(state.createBuild).toHaveBeenLastCalledWith('full', { refreshImages: true });
+    expect(container.querySelector('[role="dialog"]')).toBeNull();
+  } finally { act(() => root.unmount()); container.remove(); }
+});
+
 it('首次构建入口打开源选择，进度入口按需加载最近的记录', async () => {
   state.hasCurrent = false; state.included = new Set(['a']); state.listBuilds.mockClear();
   const container = document.createElement('div'); document.body.append(container);

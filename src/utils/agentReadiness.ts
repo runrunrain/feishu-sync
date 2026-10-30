@@ -139,6 +139,7 @@ export const KB_BUILD_WORKER_STATE_LABEL: Record<string, string> = {
 /** S3/S5 构建警告 code → 中文主题（徽标标题用；详情用 DTO 自带 message）。 */
 export const KB_BUILD_WARNING_LABEL: Record<string, string> = {
   images_unavailable: '图片未理解',
+  images_refresh_incomplete: '图片重新生成未完成',
 };
 
 /** 会话状态 → 中文。 */

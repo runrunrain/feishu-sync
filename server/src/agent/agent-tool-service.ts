@@ -118,7 +118,7 @@ export interface BuildRunState {
   claims?: PathClaims;
   /** S3：preflight 图片描述（objToken → src → 描述/不可用标记） */
   imageDescriptions?: Map<string, Map<string, ImageDescription>>;
-  /** S3：本次构建 vision 是否就绪（未就绪时图片处插 unavailable 标记，U5） */
+  /** S3：本次构建 vision 是否就绪（未就绪且未命中的图片插 unavailable 标记，U5） */
   visionReady?: boolean;
   /**
    * P0-S7（设计 §5.6 + 任务 4）：preflight 白板旁路文字（objToken → src →
@@ -227,7 +227,7 @@ export interface VisionDescriberLike {
   status(): Promise<{ state: 'disabled' | 'ready' | 'invalid'; model: string | null; message: string }>;
   lookup(imageHash: string): Promise<string | null>;
   describeOne(file: string, src: string, signal?: AbortSignal): Promise<ImageDescription>;
-  describeMany(items: Array<{ file: string; src: string }>, opts: { signal: AbortSignal; onProgress: (p: { done: number; total: number }) => void }): Promise<Map<string, ImageDescription>>;
+  describeMany(items: Array<{ file: string; src: string }>, opts: { signal: AbortSignal; onProgress: (p: { done: number; total: number }) => void; refreshCached?: boolean }): Promise<Map<string, ImageDescription>>;
 }
 
 export class AgentToolService {

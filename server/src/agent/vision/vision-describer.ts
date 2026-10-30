@@ -6,9 +6,8 @@
  * （preflight describeMany）与 S5 设置页（status / test API）消费。
  *
  * 契约：
- *   - 缓存目录 `<dataRoot>/agent/vision-cache/<hash[0:2]>/<imageHash>.<modelKey>.json`，
- *     modelKey = sha256(`${providerId}/${model}/${promptVersion}`)[0:12]，
- *     tmp+rename 原子写；v1 无淘汰（设计 §11 未知项）。
+ *   - 每张图片按内容哈希共用一份当前描述；旧版按模型区分的缓存仍可读取。
+ *     记录保留模型和提示词版本，tmp+rename 原子写；缓存不自动淘汰。
  *   - 永不抛异常（文件/配置/网络错误一律落入 unavailable + reason）。
  *   - apiKey 绝不进日志/错误信息（VisionChannel 已脱敏，此处不额外打印）。
  *   - 非图片文件（magic bytes 不匹配）诚实报 unsupported_format。
@@ -42,6 +41,8 @@ export interface ImageDescription {
   text?: string;
   /** 调试用失败消息（已脱敏，不含 apiKey） */
   message?: string;
+  /** 手动重新生成未完成，旧缓存仍然保留（如存在）。 */
+  refreshFailure?: 'limit' | 'too_large' | 'vision_unconfigured' | 'vision_failed' | 'cache_write_failed';
 }
 
 export interface VisionStatus {
@@ -93,12 +94,40 @@ export function sniffImageMime(bytes: Buffer): VisionImageMime | null {
   return null;
 }
 
+/** 旧缓存可能来自更高的单图上限；分块哈希以查找缓存，不加载整张大图。 */
+function hashOversizedImage(file: string): string | null {
+  const hardLimit = 20 * 1024 * 1024;
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(file, 'r');
+    const digest = crypto.createHash('sha256');
+    const chunk = Buffer.allocUnsafe(64 * 1024);
+    let total = 0;
+    for (;;) {
+      const read = fs.readSync(fd, chunk, 0, chunk.length, null);
+      if (read === 0) break;
+      total += read;
+      if (total > hardLimit) return null;
+      digest.update(chunk.subarray(0, read));
+    }
+    return digest.digest('hex');
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch { /* 关闭失败不影响缓存查询 */ }
+  }
+}
+
 export function visionCacheRoot(dataRoot: string): string {
   return path.join(dataRoot, 'agent', 'vision-cache');
 }
 
 export function visionCacheFilePath(dataRoot: string, imageHash: string, modelKey: string): string {
   return path.join(visionCacheRoot(dataRoot), imageHash.slice(0, 2), `${imageHash}.${modelKey}.json`);
+}
+
+export function visionCurrentCacheFilePath(dataRoot: string, imageHash: string): string {
+  return path.join(visionCacheRoot(dataRoot), imageHash.slice(0, 2), `${imageHash}.json`);
 }
 
 interface VisionCacheEntry {
@@ -167,18 +196,16 @@ export class VisionDescriber {
     return { state: 'ready', model: context.modelAlias, message: '' };
   }
 
-  /** 只读缓存查找（不触发远端调用）。未就绪 / 未命中返回 null。 */
+  /** 只读缓存查找（不触发远端调用）；模型切换或服务未就绪不影响已有描述。 */
   async lookup(imageHash: string): Promise<string | null> {
-    const context = await this.resolveContext();
-    if (!context) return null;
-    const entry = this.readCache(imageHash, context.modelKey);
+    const entry = this.readCache(imageHash);
     return entry?.text ?? null;
   }
 
-  /** 缓存条目总数（跨所有模型，供设置页展示）。 */
+  /** 已缓存的不同图片数量（兼容旧版同图多模型条目）。 */
   async cachedCount(): Promise<number> {
     const root = visionCacheRoot(this.deps.dataRoot);
-    let count = 0;
+    const hashes = new Set<string>();
     let buckets: string[] = [];
     try {
       buckets = fs.readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
@@ -187,12 +214,15 @@ export class VisionDescriber {
     }
     for (const bucket of buckets) {
       try {
-        count += fs.readdirSync(path.join(root, bucket)).filter((name) => name.endsWith('.json')).length;
+        for (const name of fs.readdirSync(path.join(root, bucket))) {
+          const match = /^([0-9a-f]{64})(?:\.[0-9a-f]{12})?\.json$/.exec(name);
+          if (match) hashes.add(match[1]);
+        }
       } catch {
         /* 单桶读取失败不影响计数 */
       }
     }
-    return count;
+    return hashes.size;
   }
 
   /** 单图：读文件 → 嗅探 → 缓存 → 远端。永不抛异常。 */
@@ -211,6 +241,9 @@ export class VisionDescriber {
       return unavailable('missing_file', `无法读取图片文件：${file}`);
     }
     if (size > maxBytes) {
+      const imageHash = size <= 20 * 1024 * 1024 ? hashOversizedImage(file) : null;
+      const cached = imageHash ? this.readCache(imageHash) : null;
+      if (imageHash && cached) return { src, imageHash, state: 'cached', text: cached.text };
       return unavailable('too_large', `图片 ${size} 字节超出上限 ${vision.maxImageBytes}`);
     }
     let bytes: Buffer;
@@ -222,37 +255,36 @@ export class VisionDescriber {
     const imageHash = crypto.createHash('sha256').update(bytes).digest('hex');
     const mime = sniffImageMime(bytes);
     if (!mime) return { src, imageHash, state: 'unavailable', reason: 'unsupported_format' };
+    const cached = this.readCache(imageHash);
+    if (cached) return { src, imageHash, state: 'cached', text: cached.text };
     if (bytes.length > maxBytes) {
       return { src, imageHash, state: 'unavailable', reason: 'too_large', message: `图片 ${bytes.length} 字节超出上限 ${vision.maxImageBytes}` };
     }
     const context = await this.resolveContext();
     if (!context) return { src, imageHash, state: 'unavailable', reason: 'vision_unconfigured' };
-    const cached = this.readCache(imageHash, context.modelKey);
-    if (cached) return { src, imageHash, state: 'cached', text: cached.text };
     // VisionChannel 内部会按 selection 从 providers 重新解析 apiKey/baseUrl/protocol
     const channel = new VisionChannel(config.llm, { providerId: context.providerId, modelId: context.presetId });
     const result = await channel.describe(
       { bytes, mime, prompt: context.prompt },
       { timeoutMs: context.timeoutMs, signal },
     );
-    if (result.finishReason === 'stop' || result.finishReason === 'length') {
+    if ((result.finishReason === 'stop' || result.finishReason === 'length') && typeof result.text === 'string' && result.text.trim()) {
       this.writeCache({ imageHash, modelKey: context.modelKey, model: context.modelAlias, promptVersion: context.promptVersion, text: result.text });
       return { src, imageHash, state: 'described', text: result.text };
     }
-    return { src, imageHash, state: 'unavailable', reason: 'vision_failed', message: result.errorMessage };
+    return { src, imageHash, state: 'unavailable', reason: 'vision_failed', message: result.errorMessage || '图片识别未返回有效描述' };
   }
 
   /**
    * 批量：缓存命中不计 maxImagesPerBuild；未缓存超出配额的部分标 limit。
    *
-   * R2-06：内存有界——先 stat 尺寸（超限单图不读即拒），逐图读取→哈希→
-   * 查缓存（命中即释放字节，不保留）；仅配额内未缓存图保留 bytes 进入
-   * 并发描述队列；配额截断后不再读取剩余文件（直接标 limit），在途字节
-   * 上限 = quota × maxImageBytes，不随全工作集无界增长。
+   * 逐图读取并检查缓存，即使新识别配额已满也不遗漏后续缓存。
+   * 同一图片内容在本批次只识别一次；只有配额内的图片字节进入队列，
+   * 其余字节检查后立即释放，内存仍受 quota × maxImageBytes 约束。
    */
   async describeMany(
     items: Array<{ file: string; src: string }>,
-    opts: { signal: AbortSignal; onProgress: (p: { done: number; total: number }) => void },
+    opts: { signal: AbortSignal; onProgress: (p: { done: number; total: number }) => void; refreshCached?: boolean },
   ): Promise<Map<string, ImageDescription>> {
     const results = new Map<string, ImageDescription>();
     const context = await this.resolveContext();
@@ -264,15 +296,10 @@ export class VisionDescriber {
     const quota = Math.max(0, Math.min(vision.maxImagesPerBuild, 5000));
     const maxBytes = Math.min(vision.maxImageBytes, 20 * 1024 * 1024);
 
-    // 第一遍：本地检查（stat 尺寸/文件/格式/缓存）——不触网、不超配额读满
-    const pending: Array<{ file: string; src: string; bytes: Buffer; imageHash: string; mime: VisionImageMime }> = [];
+    // 第一遍：逐张检查本地文件和缓存；相同内容共用一个待识别任务。
+    const pending: Array<{ sources: string[]; bytes: Buffer; imageHash: string; mime: VisionImageMime; cached: VisionCacheEntry | null }> = [];
+    const pendingByHash = new Map<string, typeof pending[number]>();
     for (const item of items) {
-      // 配额已满：剩余未缓存图不再读文件（读到的字节也不保留），直接标 limit
-      if (context && pending.length >= quota) {
-        results.set(item.src, { src: item.src, imageHash: '', state: 'unavailable', reason: 'limit' });
-        done += 1;
-        continue;
-      }
       let size = -1;
       try {
         size = fs.statSync(item.file).size;
@@ -282,7 +309,11 @@ export class VisionDescriber {
         continue;
       }
       if (size > maxBytes) {
-        results.set(item.src, { src: item.src, imageHash: '', state: 'unavailable', reason: 'too_large', message: `图片 ${size} 字节超出上限 ${vision.maxImageBytes}` });
+        const imageHash = size <= 20 * 1024 * 1024 ? hashOversizedImage(item.file) : null;
+        const cached = imageHash ? this.readCache(imageHash) : null;
+        results.set(item.src, imageHash && cached
+          ? { src: item.src, imageHash, state: 'cached', text: cached.text, ...(opts.refreshCached ? { refreshFailure: 'too_large' as const } : {}) }
+          : { src: item.src, imageHash: imageHash ?? '', state: 'unavailable', reason: 'too_large', message: `图片 ${size} 字节超出上限 ${vision.maxImageBytes}` });
         done += 1;
         continue;
       }
@@ -301,35 +332,51 @@ export class VisionDescriber {
         done += 1;
         continue;
       }
+      const cached = this.readCache(imageHash);
       if (bytes.length > maxBytes) { // stat/读取竞态兑底
-        results.set(item.src, { src: item.src, imageHash, state: 'unavailable', reason: 'too_large' });
+        results.set(item.src, cached
+          ? { src: item.src, imageHash, state: 'cached', text: cached.text, ...(opts.refreshCached ? { refreshFailure: 'too_large' as const } : {}) }
+          : { src: item.src, imageHash, state: 'unavailable', reason: 'too_large' });
         done += 1;
         continue;
       }
-      if (context) {
-        const cached = this.readCache(imageHash, context.modelKey);
-        if (cached) {
-          // 命中即释放字节（不进 pending，不占配额）
-          results.set(item.src, { src: item.src, imageHash, state: 'cached', text: cached.text });
-          done += 1;
-          continue;
-        }
-      } else {
-        // 未启用：逐图分类但不保留字节（内存有界），全部 vision_unconfigured
-        results.set(item.src, { src: item.src, imageHash, state: 'unavailable', reason: 'vision_unconfigured' });
+      if (cached && !opts.refreshCached) {
+        results.set(item.src, { src: item.src, imageHash, state: 'cached', text: cached.text });
         done += 1;
         continue;
       }
-      pending.push({ file: item.file, src: item.src, bytes, imageHash, mime });
+      if (!context) {
+        // 服务未就绪仍使用已有缓存，且不尝试重新识别。
+        results.set(item.src, cached
+          ? { src: item.src, imageHash, state: 'cached', text: cached.text, refreshFailure: 'vision_unconfigured' }
+          : { src: item.src, imageHash, state: 'unavailable', reason: 'vision_unconfigured' });
+        done += 1;
+        continue;
+      }
+      const existing = pendingByHash.get(imageHash);
+      if (existing) {
+        existing.sources.push(item.src);
+        continue;
+      }
+      if (pending.length >= quota) {
+        results.set(item.src, cached
+          ? { src: item.src, imageHash, state: 'cached', text: cached.text, refreshFailure: 'limit' }
+          : { src: item.src, imageHash, state: 'unavailable', reason: 'limit' });
+        done += 1;
+        continue;
+      }
+      const task = { sources: [item.src], bytes, imageHash, mime, cached };
+      pending.push(task);
+      pendingByHash.set(imageHash, task);
     }
     progress();
 
-    // 未启用：第一遍已逐图标 vision_unconfigured（不保留字节），无描述队列
+    // 服务未就绪时已在第一遍复用缓存或标记 unavailable，无描述队列。
     if (!context) {
       return results;
     }
 
-    const toDescribe = pending; // 已在第一遍截断至 quota 内
+    const toDescribe = pending;
 
     // 并发受限的远端描述（worker pool）
     const concurrency = Math.max(1, Math.min(vision.concurrency, 8));
@@ -337,17 +384,26 @@ export class VisionDescriber {
     const worker = async () => {
       while (cursor < toDescribe.length) {
         const item = toDescribe[cursor++];
-        const result = await new VisionChannel(
+        const result = opts.signal.aborted ? { finishReason: 'error', text: '', errorMessage: '图片识别已取消' } : await new VisionChannel(
           config.llm,
           { providerId: context.providerId, modelId: context.presetId },
         ).describe({ bytes: item.bytes, mime: item.mime, prompt: context.prompt }, { timeoutMs: context.timeoutMs, signal: opts.signal });
-        if (result.finishReason === 'stop' || result.finishReason === 'length') {
-          this.writeCache({ imageHash: item.imageHash, modelKey: context.modelKey, model: context.modelAlias, promptVersion: context.promptVersion, text: result.text });
-          results.set(item.src, { src: item.src, imageHash: item.imageHash, state: 'described', text: result.text });
-        } else {
-          results.set(item.src, { src: item.src, imageHash: item.imageHash, state: 'unavailable', reason: 'vision_failed', message: result.errorMessage });
+        const hasText = typeof result.text === 'string' && Boolean(result.text.trim());
+        const success = !opts.signal.aborted && (result.finishReason === 'stop' || result.finishReason === 'length') && hasText;
+        const saved = success && this.writeCache({ imageHash: item.imageHash, modelKey: context.modelKey, model: context.modelAlias, promptVersion: context.promptVersion, text: result.text });
+        const message = result.errorMessage || (!success && !hasText ? '图片识别未返回有效描述' : undefined);
+        for (const src of item.sources) {
+          if (opts.refreshCached && item.cached && (!success || !saved)) {
+            results.set(src, { src, imageHash: item.imageHash, state: 'cached', text: item.cached.text,
+              refreshFailure: success ? 'cache_write_failed' : 'vision_failed', ...(message ? { message } : {}) });
+          } else if (success) {
+            results.set(src, { src, imageHash: item.imageHash, state: 'described', text: result.text,
+              ...(opts.refreshCached && !saved ? { refreshFailure: 'cache_write_failed' as const } : {}) });
+          } else {
+            results.set(src, { src, imageHash: item.imageHash, state: 'unavailable', reason: 'vision_failed', message });
+          }
         }
-        done += 1;
+        done += item.sources.length;
         progress();
       }
     };
@@ -360,32 +416,59 @@ export class VisionDescriber {
     return resolveVisionContext(config);
   }
 
-  private readCache(imageHash: string, modelKey: string): VisionCacheEntry | null {
+  private readCache(imageHash: string): VisionCacheEntry | null {
+    if (!/^[0-9a-f]{64}$/.test(imageHash)) return null;
+    const readEntry = (file: string): VisionCacheEntry | null => {
+      try {
+        const entry = JSON.parse(fs.readFileSync(file, 'utf-8')) as VisionCacheEntry;
+        return entry?.imageHash === imageHash && typeof entry.text === 'string' && entry.text.trim() ? entry : null;
+      } catch {
+        return null;
+      }
+    };
+    const current = readEntry(visionCurrentCacheFilePath(this.deps.dataRoot, imageHash));
+    if (current) return current;
+
+    // 升级前可能同图有多种模型的结果，保留旧文件并使用最近生成的一条。
     try {
-      const raw = fs.readFileSync(visionCacheFilePath(this.deps.dataRoot, imageHash, modelKey), 'utf-8');
-      const entry = JSON.parse(raw) as VisionCacheEntry;
-      if (typeof entry?.text !== 'string') return null;
-      return entry;
+      const bucket = path.dirname(visionCurrentCacheFilePath(this.deps.dataRoot, imageHash));
+      let latest: VisionCacheEntry | null = null;
+      let latestTime = -Infinity;
+      for (const name of fs.readdirSync(bucket).sort()) {
+        if (!new RegExp(`^${imageHash}\\.[0-9a-f]{12}\\.json$`).test(name)) continue;
+        const file = path.join(bucket, name);
+        const entry = readEntry(file);
+        if (!entry) continue;
+        const createdAt = Date.parse(entry.createdAt);
+        let time = createdAt;
+        if (!Number.isFinite(time)) {
+          try { time = fs.statSync(file).mtimeMs; } catch { continue; }
+        }
+        if (!latest || time > latestTime) { latest = entry; latestTime = time; }
+      }
+      return latest;
     } catch {
       return null;
     }
   }
 
   /** tmp+rename 原子写；失败静默（缓存不可用不阻断描述主链路）。 */
-  private writeCache(entry: Omit<VisionCacheEntry, 'schemaVersion' | 'createdAt'>): void {
-    const target = visionCacheFilePath(this.deps.dataRoot, entry.imageHash, entry.modelKey);
+  private writeCache(entry: Omit<VisionCacheEntry, 'schemaVersion' | 'createdAt'>): boolean {
+    const target = visionCurrentCacheFilePath(this.deps.dataRoot, entry.imageHash);
     const tmp = `${target}.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
     const record: VisionCacheEntry = { schemaVersion: 1, createdAt: new Date().toISOString(), ...entry };
     try {
       fs.mkdirSync(path.dirname(target), { recursive: true });
       fs.writeFileSync(tmp, JSON.stringify(record, null, 2), 'utf-8');
       fs.renameSync(tmp, target);
+      return true;
     } catch {
       try {
         fs.unlinkSync(tmp);
       } catch {
         /* 清理失败忽略 */
       }
+      return false;
     }
   }
 }

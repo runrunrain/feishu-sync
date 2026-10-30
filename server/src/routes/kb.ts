@@ -367,7 +367,7 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
       const preview = sourceChangePreview(snapshot, contents, manifest, versions.readSourceContents(manifest?.releaseId ?? null),
         new Set(localMapStore.listKbExcludedSources(config.knowledgeBaseRoot)));
       // S3（§3.6）：变更入口增图片维度——待处理源引用的图片数 / 未缓存数。
-      // 缓存按当前 vision 模型查；未启用/未命中都计入 uncached（诚实计数）。
+      // 按图片内容查找已有描述；未命中才计入 uncached。
       const images = await countPendingImages(config.knowledgeBaseRoot, snapshot, preview, buildService.visionCacheProbe());
       return c.json({ ...preview, images });
     } catch (error) { return errorResponse(c, error); }
@@ -397,7 +397,7 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
 
   routes.post('/api/kb/builds', async (c) => {
     try {
-      const body = await c.req.json() as { mode?: string; confirm?: string };
+      const body = await c.req.json() as { mode?: string; confirm?: string; refreshImages?: boolean };
       const dto = await buildService.createBuild(localMapStore as never, body);
       return c.json(dto, 202);
     } catch (error) {

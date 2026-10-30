@@ -93,12 +93,27 @@ async function fixture() {
     }, { timeout: 5000, interval: 10 });
     return result;
   }
-  return { root, raw, store, call, build, prompts, configManager, documents,
+  return { root, raw, store, call, build, prompts, configManager, documents, service,
     setGenerated: (value: { markdown?: string; summary?: string }) => { generated = value; }, setSkip: (value: boolean) => { skipWrites = value; },
     setEditorial: (value: boolean) => { editorial = value; }, setBeforeFinish: (fn: () => void) => { beforeFinish = fn; },
     published: () => new StandardKbStore(configManager.getConfig()!.standardKb.outputRoot),
   };
 }
+
+it('构建路由传递重新识图选项并拒绝无效参数', async () => {
+  const f = await fixture();
+  const invalid = await f.call('/api/kb/builds', 'POST', { mode: 'full', confirm: 'BUILD', refreshImages: 'true' });
+  expect(invalid.status).toBe(400);
+  const spy = vi.spyOn(f.service, 'createBuild');
+  const accepted = await f.call('/api/kb/builds', 'POST', { mode: 'full', confirm: 'BUILD', refreshImages: true });
+  expect(accepted.status).toBe(202);
+  expect(spy).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ mode: 'full', refreshImages: true }));
+  await vi.waitFor(async () => {
+    const result = await f.call(`/api/kb/builds/${accepted.data.id}`);
+    expect(['published', 'failed', 'cancelled']).toContain(result.data.status);
+  }, { timeout: 5000, interval: 10 });
+  spy.mockRestore();
+});
 
 describe('源选择 → 源diff → 按变更更新 → 独立版本', () => {
   it('混合来源排除/重新参与，正文同步重写；标记持久且原始字节不变', async () => {

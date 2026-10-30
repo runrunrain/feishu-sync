@@ -18,7 +18,7 @@ import http from 'node:http';
 import path from 'node:path';
 import type { AddressInfo } from 'node:net';
 import type { Config } from '../src/types/index.js';
-import { VisionDescriber, sniffImageMime, visionCacheFilePath } from '../src/agent/vision/vision-describer.js';
+import { VisionDescriber, sniffImageMime, visionCacheFilePath, visionCurrentCacheFilePath } from '../src/agent/vision/vision-describer.js';
 import { readAgentPromptFile } from '../src/agent/agent-assets.js';
 
 const TINY_PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64');
@@ -33,7 +33,7 @@ afterAll(() => {
 });
 
 /** 可直接计数的 fixture 句柄 */
-async function fixtureWithCounter(mode: { fail?: boolean } = {}): Promise<{ port: number; count: () => number }> {
+async function fixtureWithCounter(mode: { fail?: boolean; empty?: boolean } = {}): Promise<{ port: number; count: () => number }> {
   let calls = 0;
   const server = http.createServer((req, res) => {
     let raw = '';
@@ -49,7 +49,7 @@ async function fixtureWithCounter(mode: { fail?: boolean } = {}): Promise<{ port
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         id: 'c', object: 'chat.completion', model: body.model,
-        choices: [{ index: 0, message: { role: 'assistant', content: `DESC(${calls})` }, finish_reason: 'stop' }],
+        choices: [{ index: 0, message: { role: 'assistant', content: mode.empty ? '   ' : `DESC(${calls})` }, finish_reason: 'stop' }],
         usage: { total_tokens: 10 },
       }));
     });
@@ -124,7 +124,7 @@ describe('VisionDescriber.describeOne + 缓存', () => {
     expect(fixture.count()).toBe(1);
 
     // 缓存文件落盘：两级目录 + JSON 字段
-    const cacheFile = visionCacheFilePath(root, first.imageHash, expectCacheKey(config));
+    const cacheFile = visionCurrentCacheFilePath(root, first.imageHash);
     expect(fs.existsSync(cacheFile)).toBe(true);
     const entry = JSON.parse(fs.readFileSync(cacheFile, 'utf-8'));
     expect(entry.schemaVersion).toBe(1);
@@ -148,7 +148,7 @@ describe('VisionDescriber.describeOne + 缓存', () => {
     expect(await describer.cachedCount()).toBe(1);
   });
 
-  it('缓存命中跨 modelKey 隔离：换模型后不读旧缓存', async () => {
+  it('切换识图模型仍复用已有缓存，主动重新生成后再切回也使用新结果', async () => {
     const fixture = await fixtureWithCounter();
     const root = newTmpRoot();
     let config = makeConfig(fixture.port);
@@ -157,7 +157,7 @@ describe('VisionDescriber.describeOne + 缓存', () => {
     const first = await describer.describeOne(file, 'images/01-a');
     expect(first.state).toBe('described');
 
-    // 切换到 alt 模型（新 modelKey）→ 重新远端
+    // 切换到 alt 模型仍复用既有结果，只有明确重新生成时才调用新模型。
     config = makeConfig(fixture.port, {}, {
       models: [
         { id: 'preset', name: 'Vision Preset', enabled: true, openAiModel: 'vision-model', contextWindow: 64000, maxTokens: 2048 },
@@ -165,10 +165,61 @@ describe('VisionDescriber.describeOne + 缓存', () => {
       ],
     });
     config.agent.vision.modelId = 'alt';
-    const redescribed = await describer.describeOne(file, 'images/01-a');
-    expect(redescribed.state).toBe('described');
+    expect(await describer.describeOne(file, 'images/01-a')).toMatchObject({ state: 'cached', text: 'DESC(1)' });
+    expect(fixture.count()).toBe(1);
+    const refreshed = await describer.describeMany([{ file, src: 'images/01-a' }],
+      { signal: new AbortController().signal, onProgress: () => {}, refreshCached: true });
+    expect(refreshed.get('images/01-a')).toMatchObject({ state: 'described', text: 'DESC(2)' });
+    config.agent.vision.modelId = 'preset';
+    expect(await describer.describeOne(file, 'images/01-a')).toMatchObject({ state: 'cached', text: 'DESC(2)' });
+    expect(await describer.lookup(first.imageHash)).toBe('DESC(2)');
     expect(fixture.count()).toBe(2);
-    expect(await describer.cachedCount()).toBe(2); // 两个 modelKey 各一条
+    expect(await describer.cachedCount()).toBe(1);
+  });
+
+  it('兼容同图多模型的旧缓存并优先使用最新结果，重新生成后保留旧文件', async () => {
+    const fixture = await fixtureWithCounter();
+    const root = newTmpRoot();
+    const config = makeConfig(fixture.port);
+    const describer = new VisionDescriber({ dataRoot: root, config: () => config });
+    const file = writeImage(root, 'legacy.png', TINY_PNG);
+    const hash = crypto.createHash('sha256').update(TINY_PNG).digest('hex');
+    const oldPath = visionCacheFilePath(root, hash, expectCacheKey(config));
+    const recentPath = visionCacheFilePath(root, hash, '123456789abc');
+    fs.mkdirSync(path.dirname(oldPath), { recursive: true });
+    const legacy = { schemaVersion: 1, imageHash: hash, modelKey: expectCacheKey(config), model: 'old', promptVersion: 'old', text: '旧结果', createdAt: '2026-01-01T00:00:00.000Z' };
+    fs.writeFileSync(oldPath, JSON.stringify(legacy));
+    fs.writeFileSync(recentPath, JSON.stringify({ ...legacy, modelKey: '123456789abc', text: '较新的结果', createdAt: '2026-02-01T00:00:00.000Z' }));
+    expect(await describer.describeOne(file, 'legacy')).toMatchObject({ state: 'cached', text: '较新的结果' });
+    expect(await describer.cachedCount()).toBe(1);
+    const refreshed = await describer.describeMany([{ file, src: 'legacy' }],
+      { signal: new AbortController().signal, onProgress: () => {}, refreshCached: true });
+    expect(refreshed.get('legacy')).toMatchObject({ state: 'described', text: 'DESC(1)' });
+    expect(await describer.describeOne(file, 'legacy')).toMatchObject({ state: 'cached', text: 'DESC(1)' });
+    expect(fs.existsSync(oldPath)).toBe(true);
+    expect(fs.existsSync(recentPath)).toBe(true);
+    expect(await describer.cachedCount()).toBe(1);
+  });
+
+  it('识图未启用或配置无效时仍可复用缓存，重新生成时明确标记未完成', async () => {
+    const fixture = await fixtureWithCounter();
+    const root = newTmpRoot();
+    let config = makeConfig(fixture.port);
+    const describer = new VisionDescriber({ dataRoot: root, config: () => config });
+    const cached = writeImage(root, 'cached.png', TINY_PNG);
+    const fresh = writeImage(root, 'fresh.png', OTHER_PNG);
+    const hash = (await describer.describeOne(cached, 'cached')).imageHash;
+    config = makeConfig(fixture.port, { enabled: false });
+    expect(await describer.lookup(hash)).toBe('DESC(1)');
+    const items = [{ file: cached, src: 'cached' }, { file: fresh, src: 'fresh' }];
+    const normal = await describer.describeMany(items, { signal: new AbortController().signal, onProgress: () => {} });
+    expect(normal.get('cached')).toMatchObject({ state: 'cached', text: 'DESC(1)' });
+    expect(normal.get('fresh')).toMatchObject({ state: 'unavailable', reason: 'vision_unconfigured' });
+    config = makeConfig(fixture.port, {}, { apiKey: '' });
+    const refresh = await describer.describeMany(items, { signal: new AbortController().signal, onProgress: () => {}, refreshCached: true });
+    expect(refresh.get('cached')).toMatchObject({ state: 'cached', text: 'DESC(1)', refreshFailure: 'vision_unconfigured' });
+    expect(refresh.get('fresh')).toMatchObject({ state: 'unavailable', reason: 'vision_unconfigured' });
+    expect(fixture.count()).toBe(1);
   });
 
   it('missing_file / unsupported_format / too_large / vision_unconfigured 均不触网不抛异常', async () => {
@@ -278,7 +329,7 @@ describe('VisionDescriber.describeMany', () => {
     expect(results.get('images/a')).toMatchObject({ state: 'unavailable', reason: 'vision_unconfigured' });
   });
 
-  it('R2-06：大量未缓存图 + 小配额 → 读取文件数 ≤ quota（quota 截断后不再读取剩余文件）', async () => {
+  it('大量未缓存图只在配额内发起识别', async () => {
     const fixture = await fixtureWithCounter();
     const root = newTmpRoot();
     const describer = new VisionDescriber({
@@ -288,24 +339,158 @@ describe('VisionDescriber.describeMany', () => {
     // 10 张互不相同的合法 PNG（IEND 后拖尾被解析器忽略，字节不同即不同 hash）
     const files = Array.from({ length: 10 }, (_, index) =>
       writeImage(root, `img-${index}.png`, Buffer.concat([TINY_PNG, Buffer.from([index, 0x00, 0x01])])));
-    const readSpy = vi.spyOn(fs, 'readFileSync');
+    const results = await describer.describeMany(
+      files.map((file, index) => ({ file, src: `images/${index}` })),
+      { signal: new AbortController().signal, onProgress: () => {} },
+    );
+    expect([...results.values()].filter((item) => item.state === 'described')).toHaveLength(3);
+    expect([...results.values()].filter((item) => item.reason === 'limit')).toHaveLength(7);
+    expect(fixture.count()).toBe(3);
+  });
+
+  it('新图配额用完后仍查找并复用后面的缓存，配额为零也可复用', async () => {
+    const fixture = await fixtureWithCounter();
+    const root = newTmpRoot();
+    let quota = 1;
+    const describer = new VisionDescriber({ dataRoot: root, config: () => makeConfig(fixture.port, { maxImagesPerBuild: quota }) });
+    const cached = writeImage(root, 'cached.png', TINY_PNG);
+    const fresh = writeImage(root, 'fresh.png', OTHER_PNG);
+    const over = writeImage(root, 'over.png', Buffer.concat([TINY_PNG, Buffer.from([2])]));
+    await describer.describeOne(cached, 'warm');
+    const results = await describer.describeMany([
+      { file: fresh, src: 'fresh' }, { file: over, src: 'over' }, { file: cached, src: 'cached' },
+    ], { signal: new AbortController().signal, onProgress: () => {} });
+    expect(results.get('fresh')?.state).toBe('described');
+    expect(results.get('over')).toMatchObject({ state: 'unavailable', reason: 'limit' });
+    expect(results.get('cached')).toMatchObject({ state: 'cached', text: 'DESC(1)' });
+    expect(fixture.count()).toBe(2);
+    quota = 0;
+    const zero = await describer.describeMany([{ file: cached, src: 'cached' }, { file: over, src: 'over' }],
+      { signal: new AbortController().signal, onProgress: () => {} });
+    expect(zero.get('cached')?.state).toBe('cached');
+    expect(zero.get('over')).toMatchObject({ state: 'unavailable', reason: 'limit' });
+    expect(fixture.count()).toBe(2);
+  });
+
+  it('单图识别大小上限降低后仍能复用已有缓存', async () => {
+    const fixture = await fixtureWithCounter();
+    const root = newTmpRoot();
+    let maxImageBytes = 1024;
+    const describer = new VisionDescriber({ dataRoot: root, config: () => makeConfig(fixture.port, { maxImageBytes }) });
+    const file = writeImage(root, 'cached.png', TINY_PNG);
+    await describer.describeOne(file, 'cached');
+    maxImageBytes = 8;
+    expect(await describer.describeOne(file, 'cached')).toMatchObject({ state: 'cached', text: 'DESC(1)' });
+    const normal = await describer.describeMany([{ file, src: 'cached' }],
+      { signal: new AbortController().signal, onProgress: () => {} });
+    expect(normal.get('cached')).toMatchObject({ state: 'cached', text: 'DESC(1)' });
+    const refresh = await describer.describeMany([{ file, src: 'cached' }],
+      { signal: new AbortController().signal, onProgress: () => {}, refreshCached: true });
+    expect(refresh.get('cached')).toMatchObject({ state: 'cached', text: 'DESC(1)', refreshFailure: 'too_large' });
+    expect(fixture.count()).toBe(1);
+  });
+
+  it('同一图片被多个文档引用时只识别一次并只占一个配额', async () => {
+    const fixture = await fixtureWithCounter();
+    const root = newTmpRoot();
+    const describer = new VisionDescriber({ dataRoot: root, config: () => makeConfig(fixture.port, { maxImagesPerBuild: 1 }) });
+    const a = writeImage(root, 'a.png', TINY_PNG);
+    const same = writeImage(root, 'same.png', TINY_PNG);
+    const other = writeImage(root, 'other.png', OTHER_PNG);
+    const progress: number[] = [];
+    const results = await describer.describeMany([
+      { file: a, src: 'doc1::a' }, { file: same, src: 'doc2::same' }, { file: other, src: 'doc3::other' },
+    ], { signal: new AbortController().signal, onProgress: ({ done }) => progress.push(done) });
+    expect(results.get('doc1::a')).toMatchObject({ state: 'described', text: 'DESC(1)' });
+    expect(results.get('doc2::same')).toMatchObject({ state: 'described', text: 'DESC(1)' });
+    expect(results.get('doc3::other')).toMatchObject({ state: 'unavailable', reason: 'limit' });
+    expect(fixture.count()).toBe(1);
+    expect(progress.at(-1)).toBe(3);
+  });
+
+  it('手动重新生成后更新共享缓存，其他图片缓存不受影响', async () => {
+    const fixture = await fixtureWithCounter();
+    const root = newTmpRoot();
+    const describer = new VisionDescriber({ dataRoot: root, config: () => makeConfig(fixture.port) });
+    const selected = writeImage(root, 'selected.png', TINY_PNG);
+    const other = writeImage(root, 'other.png', OTHER_PNG);
+    await describer.describeOne(selected, 'selected');
+    await describer.describeOne(other, 'other');
+    const results = await describer.describeMany([
+      { file: selected, src: 'doc1::selected' }, { file: selected, src: 'doc2::selected' },
+    ], { signal: new AbortController().signal, onProgress: () => {}, refreshCached: true });
+    expect(results.get('doc1::selected')).toMatchObject({ state: 'described', text: 'DESC(3)' });
+    expect(results.get('doc2::selected')).toMatchObject({ state: 'described', text: 'DESC(3)' });
+    expect(await describer.describeOne(selected, 'selected')).toMatchObject({ state: 'cached', text: 'DESC(3)' });
+    expect(await describer.describeOne(other, 'other')).toMatchObject({ state: 'cached', text: 'DESC(2)' });
+    expect(fixture.count()).toBe(3);
+  });
+
+  it('重新生成失败或达到上限时保留并复用旧缓存', async () => {
+    const mode = { fail: false };
+    const fixture = await fixtureWithCounter(mode);
+    const root = newTmpRoot();
+    let quota = 1;
+    const describer = new VisionDescriber({ dataRoot: root, config: () => makeConfig(fixture.port, { maxImagesPerBuild: quota }) });
+    const cached = writeImage(root, 'cached.png', TINY_PNG);
+    await describer.describeOne(cached, 'cached');
+    mode.fail = true;
+    const failed = await describer.describeMany([{ file: cached, src: 'cached' }],
+      { signal: new AbortController().signal, onProgress: () => {}, refreshCached: true });
+    expect(failed.get('cached')).toMatchObject({ state: 'cached', text: 'DESC(1)', refreshFailure: 'vision_failed' });
+    quota = 0;
+    const limited = await describer.describeMany([{ file: cached, src: 'cached' }],
+      { signal: new AbortController().signal, onProgress: () => {}, refreshCached: true });
+    expect(limited.get('cached')).toMatchObject({ state: 'cached', text: 'DESC(1)', refreshFailure: 'limit' });
+    expect(await describer.describeOne(cached, 'cached')).toMatchObject({ state: 'cached', text: 'DESC(1)' });
+    expect(fixture.count()).toBe(2);
+  });
+
+  it('模型返回空描述时不覆盖旧缓存，也不将未缓存图片计为成功', async () => {
+    const mode = { empty: false };
+    const fixture = await fixtureWithCounter(mode);
+    const root = newTmpRoot();
+    const describer = new VisionDescriber({ dataRoot: root, config: () => makeConfig(fixture.port) });
+    const cached = writeImage(root, 'cached.png', TINY_PNG);
+    const fresh = writeImage(root, 'fresh.png', OTHER_PNG);
+    await describer.describeOne(cached, 'cached');
+    mode.empty = true;
+    const results = await describer.describeMany([{ file: cached, src: 'cached' }, { file: fresh, src: 'fresh' }],
+      { signal: new AbortController().signal, onProgress: () => {}, refreshCached: true });
+    expect(results.get('cached')).toMatchObject({ state: 'cached', text: 'DESC(1)', refreshFailure: 'vision_failed' });
+    expect(results.get('fresh')).toMatchObject({ state: 'unavailable', reason: 'vision_failed' });
+    expect(await describer.describeOne(cached, 'cached')).toMatchObject({ state: 'cached', text: 'DESC(1)' });
+    expect(await describer.lookup(crypto.createHash('sha256').update(OTHER_PNG).digest('hex'))).toBeNull();
+  });
+
+  it('取消后不再发起图片识别并保留原有缓存', async () => {
+    const fixture = await fixtureWithCounter();
+    const root = newTmpRoot();
+    const describer = new VisionDescriber({ dataRoot: root, config: () => makeConfig(fixture.port) });
+    const file = writeImage(root, 'cached.png', TINY_PNG);
+    await describer.describeOne(file, 'cached');
+    const controller = new AbortController(); controller.abort();
+    const result = await describer.describeMany([{ file, src: 'cached' }],
+      { signal: controller.signal, onProgress: () => {}, refreshCached: true });
+    expect(result.get('cached')).toMatchObject({ state: 'cached', text: 'DESC(1)', refreshFailure: 'vision_failed' });
+    expect(await describer.describeOne(file, 'cached')).toMatchObject({ state: 'cached', text: 'DESC(1)' });
+    expect(fixture.count()).toBe(1);
+  });
+
+  it('重新生成的缓存写入失败时保留旧缓存', async () => {
+    const fixture = await fixtureWithCounter();
+    const root = newTmpRoot();
+    const describer = new VisionDescriber({ dataRoot: root, config: () => makeConfig(fixture.port) });
+    const file = writeImage(root, 'cached.png', TINY_PNG);
+    await describer.describeOne(file, 'cached');
+    const rename = vi.spyOn(fs, 'renameSync').mockImplementation(() => { throw new Error('disk failure'); });
     try {
-      const results = await describer.describeMany(
-        files.map((file, index) => ({ file, src: `images/${index}` })),
-        { signal: new AbortController().signal, onProgress: () => {} },
-      );
-      // 图片文件读取次数（排除缓存文件读取）≤ 配额 3：配额满后剩余文件不再读入内存
-      const imageReads = readSpy.mock.calls
-        .map(([readPath]) => String(readPath))
-        .filter((readPath) => readPath.startsWith(root) && !readPath.includes('vision-cache'))
-        .length;
-      expect(imageReads).toBeLessThanOrEqual(3);
-      expect([...results.values()].filter((item) => item.state === 'described')).toHaveLength(3);
-      expect([...results.values()].filter((item) => item.reason === 'limit')).toHaveLength(7);
-      expect(fixture.count()).toBe(3);
-    } finally {
-      readSpy.mockRestore();
-    }
+      const result = await describer.describeMany([{ file, src: 'cached' }],
+        { signal: new AbortController().signal, onProgress: () => {}, refreshCached: true });
+      expect(result.get('cached')).toMatchObject({ state: 'cached', text: 'DESC(1)', refreshFailure: 'cache_write_failed' });
+      expect(await describer.describeOne(file, 'cached')).toMatchObject({ state: 'cached', text: 'DESC(1)' });
+      expect(fixture.count()).toBe(2);
+    } finally { rename.mockRestore(); }
   });
 
   it('R2-06：stat 先行——超限单图不读入内存即拒（describeOne/describeMany 同口径）', async () => {

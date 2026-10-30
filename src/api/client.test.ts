@@ -1,7 +1,20 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { APIError, startDeviceAuth } from './client';
+import { APIError, createKbBuild, startDeviceAuth } from './client';
 
 afterEach(() => vi.unstubAllGlobals());
+
+it('仅在请求重新生成图片描述时发送构建选项', async () => {
+  const fetchMock = vi.fn(async () => new Response('{}'));
+  vi.stubGlobal('fetch', fetchMock);
+  await createKbBuild('full', { refreshImages: true });
+  await createKbBuild('full');
+  expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/kb/builds', expect.objectContaining({
+    method: 'POST', body: '{"mode":"full","confirm":"BUILD","refreshImages":true}',
+  }));
+  expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/kb/builds', expect.objectContaining({
+    method: 'POST', body: '{"mode":"full","confirm":"BUILD"}',
+  }));
+});
 
 describe('device authentication API', () => {
   it('starts same-account reauthentication by default (scopeSet=read)', async () => {

@@ -32,7 +32,7 @@ import type { PiRuntimeResolver } from '../src/agent/runtime-resolver.js';
 import type { Config } from '../src/types/index.js';
 import type { DocumentRecord } from '../src/types/index.js';
 import type { RawSourceSnapshotEntry } from '../src/types/agent-knowledge.js';
-import type { ImageDescription } from '../src/agent/vision/vision-describer.js';
+import { VisionDescriber, visionCurrentCacheFilePath, type ImageDescription } from '../src/agent/vision/vision-describer.js';
 
 // ---------------------------------------------------------------------------
 // 假 pi 进程：prompt 按内容脚本化，工具经真实 toolService 执行
@@ -281,11 +281,11 @@ interface Harness {
     status: () => Promise<{ state: 'disabled' | 'ready' | 'invalid'; model: string | null; message: string }>;
     lookup: (hash: string) => Promise<string | null>;
     describeOne: () => Promise<ImageDescription>;
-    describeMany: (items: Array<{ file: string; src: string }>, opts: { signal: AbortSignal; onProgress: (p: { done: number; total: number }) => void }) => Promise<Map<string, ImageDescription>>;
+    describeMany: (items: Array<{ file: string; src: string }>, opts: { signal: AbortSignal; onProgress: (p: { done: number; total: number }) => void; refreshCached?: boolean }) => Promise<Map<string, ImageDescription>>;
   };
 }
 
-function makeHarness(config: Config, script: FakeScript = { claimRejections: [] }, vision?: Harness['visionDescriber']): Harness {
+function makeHarness(config: Config, script: FakeScript = { claimRejections: [] }, vision?: Harness['visionDescriber'], excluded: string[] = []): Harness {
   const pool = new AgentProcessPool({ maxConcurrentProcesses: 3, idleTimeoutMinutes: 10 });
   const toolService = new AgentToolService({ dataRoot, documentsProvider: () => documents });
   const fakes: FakeRpcProcess[] = [];
@@ -297,6 +297,7 @@ function makeHarness(config: Config, script: FakeScript = { claimRejections: [] 
     resolver: stubResolver(),
     configProvider: () => config,
     documentsProvider: () => documents,
+    excludedSourcesProvider: () => excluded,
     sheetCsvPaths: () => [],
     internalBaseUrl: () => 'http://127.0.0.1:39999',
     extensionPath: () => null,
@@ -556,7 +557,92 @@ describe('S4：取消终止全部进程', () => {
   });
 });
 
+describe('所选源文档的图片重新生成', () => {
+  it('仅处理选中源，传递刷新选项，失败时复用旧描述并显示警告', async () => {
+    writeRaw('刷新域/selected.md', `# 选中\n![](images/a.png)\n${FAT}`);
+    writeRaw('刷新域/excluded.md', `# 未选中\n![](images/b.png)\n${FAT}`);
+    fs.mkdirSync(path.join(kbRoot, '刷新域/images'), { recursive: true });
+    fs.writeFileSync(path.join(kbRoot, '刷新域/images/a.png'), TINY_PNG);
+    fs.writeFileSync(path.join(kbRoot, '刷新域/images/b.png'), TINY_PNG);
+    documents.length = 0;
+    documents.push(docRecord('tokRefreshSelected', '刷新域/selected.md'), docRecord('tokRefreshExcluded', '刷新域/excluded.md'));
+    const calls: Array<{ sources: string[]; refresh: boolean }> = [];
+    const vision: NonNullable<Harness['visionDescriber']> = {
+      status: async () => ({ state: 'ready', model: 'fixture/vision', message: '' }),
+      lookup: async () => '已有描述',
+      describeOne: async () => ({ src: 'a', imageHash: 'fixture', state: 'cached', text: '已有描述' }),
+      describeMany: async (items, opts) => {
+        calls.push({ sources: items.map((item) => item.src), refresh: opts.refreshCached === true });
+        opts.onProgress({ done: items.length, total: items.length });
+        return new Map(items.map((item) => [item.src, { src: item.src, imageHash: 'fixture', state: 'cached' as const, text: '已有描述',
+          ...(opts.refreshCached ? { refreshFailure: 'vision_failed' as const } : {}) }]));
+      },
+    };
+    const rawReadCapture = new Map<string, string>();
+    const harness = makeHarness(makeConfig(), { rawReadCapture }, vision, ['tokRefreshExcluded']);
+    const first = await createAndRun(harness, 'full');
+    expect(first.status).toBe('published');
+    const accepted = await harness.service.createBuild(store as never, { mode: 'full', confirm: 'BUILD', refreshImages: true });
+    const refreshed = await waitForTerminal(accepted.id);
+    expect(refreshed.status).toBe('published');
+    expect(calls).toEqual([
+      { sources: ['tokRefreshSelected::images/a.png'], refresh: false },
+      { sources: ['tokRefreshSelected::images/a.png'], refresh: true },
+    ]);
+    expect(rawReadCapture.get('tokRefreshSelected')).toContain('已有描述');
+    expect(rawReadCapture.has('tokRefreshExcluded')).toBe(false);
+    expect(JSON.parse(String(refreshed.warnings_json))).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'images_refresh_incomplete', count: 1 }),
+    ]));
+  });
+
+  it('拒绝非布尔值和增量构建中的重新生成选项', async () => {
+    const harness = makeHarness(makeConfig());
+    await expect(harness.service.createBuild(store as never, { mode: 'full', confirm: 'BUILD', refreshImages: 'true' as never }))
+      .rejects.toMatchObject({ code: 'invalid_request' });
+    await expect(harness.service.createBuild(store as never, { mode: 'incremental', confirm: 'BUILD', refreshImages: true }))
+      .rejects.toMatchObject({ code: 'invalid_request' });
+  });
+});
+
 describe('S3：vision 关闭 → unavailable 内联 + images_unavailable 警告', () => {
+  it('服务未就绪时，构建仍内联已有缓存；强制重试会保留缓存并报告未完成', async () => {
+    const cachedImage = Buffer.concat([TINY_PNG, Buffer.from('cached-while-disabled')]);
+    const freshImage = Buffer.concat([TINY_PNG, Buffer.from('fresh-while-disabled')]);
+    writeRaw('图域/缓存文档.md', `# 带图\n![](images/cached-disabled.png)\n![](images/fresh-disabled.png)\n正文 ${FAT}`);
+    writeRaw('图域/images/cached-disabled.png', cachedImage);
+    writeRaw('图域/images/fresh-disabled.png', freshImage);
+    documents.length = 0;
+    documents.push(docRecord('tokCachedDisabled', '图域/缓存文档.md'));
+    const imageHash = crypto.createHash('sha256').update(cachedImage).digest('hex');
+    const cacheFile = visionCurrentCacheFilePath(dataRoot, imageHash);
+    fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
+    fs.writeFileSync(cacheFile, JSON.stringify({
+      schemaVersion: 1, imageHash, modelKey: '123456789abc', model: 'old-model',
+      promptVersion: 'old', text: '先前识别的图片', createdAt: '2026-01-01T00:00:00.000Z',
+    }));
+    try {
+      const rawReadCapture = new Map<string, string>();
+      const describer = new VisionDescriber({ dataRoot, config: () => makeConfig() });
+      const harness = makeHarness(makeConfig({ buildParallelism: 1 }), { rawReadCapture }, describer);
+      const row = await createAndRun(harness, 'full');
+      expect(String(row.status)).toBe('published');
+      expect(rawReadCapture.get('tokCachedDisabled')).toContain('先前识别的图片');
+      expect(rawReadCapture.get('tokCachedDisabled')).toContain('reason="vision_unconfigured"');
+      const warnings = JSON.parse(String(row.warnings_json ?? '[]')) as Array<{ code: string; count: number }>;
+      expect(warnings).toContainEqual(expect.objectContaining({ code: 'images_unavailable', count: 1 }));
+      const refresh = await harness.service.createBuild(store as never, { mode: 'full', confirm: 'BUILD', refreshImages: true });
+      const refreshed = await waitForTerminal(refresh.id);
+      expect(rawReadCapture.get('tokCachedDisabled')).toContain('先前识别的图片');
+      expect(JSON.parse(String(refreshed.warnings_json ?? '[]'))).toContainEqual(
+        expect.objectContaining({ code: 'images_refresh_incomplete', count: 1 }),
+      );
+      expect(JSON.parse(fs.readFileSync(cacheFile, 'utf-8')).text).toBe('先前识别的图片');
+    } finally {
+      fs.rmSync(cacheFile, { force: true });
+    }
+  });
+
   it('raw_read 图片处插入 vision_unconfigured 标记；警告落库', async () => {
     writeRaw('图域/img-doc.md', `# 带图\n![](images/i1.png)\n正文 ${FAT}`);
     writeRaw('图域/images/i1.png', TINY_PNG);

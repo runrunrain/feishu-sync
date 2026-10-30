@@ -693,7 +693,7 @@ export function AgentRuntimeSettingsCard() {
 
         <p className="text-[11px] text-ink-faint leading-relaxed">
           启用后，标准库构建与 Work 会话会把源文档中的图片发送到所选端点生成文字描述，结果按图片内容缓存；
-          未启用时构建仍可发布，图片处会插入「未理解」标记。凭证取自所选提供商，不在此重复输入。
+          未启用时构建仍可复用已有图片描述；未缓存的图片会插入「未理解」标记。凭证取自所选提供商，不在此重复输入。
         </p>
       </div>
 

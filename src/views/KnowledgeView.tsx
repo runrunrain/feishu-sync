@@ -98,6 +98,7 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
   const [cancelling, setCancelling] = useState(false);
   const [confirming, setConfirming] = useState<'incremental' | 'full' | null>(null);
   const [selectedBuildCount, setSelectedBuildCount] = useState(0);
+  const [refreshImages, setRefreshImages] = useState(false);
   const [starting, setStarting] = useState(false);
 
   const [changeTab, setChangeTab] = useState<KbChangeTab>('sources');
@@ -290,10 +291,10 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
 
   // ---- 构建动作 -----------------------------------------------------------
   const startBuild = useCallback(
-    async (mode: 'incremental' | 'full') => {
+    async (mode: 'incremental' | 'full', refresh = false) => {
       setStarting(true);
       try {
-        const dto = await createKbBuild(mode);
+        const dto = refresh ? await createKbBuild(mode, { refreshImages: true }) : await createKbBuild(mode);
         setBuild(dto);
         setBuildIssues([]);
         setBuildLogs([]);
@@ -305,6 +306,7 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
           }
         }
         setConfirming(null);
+        setRefreshImages(false);
       } catch (err) {
         if (err instanceof APIError) {
           const code = (err.response as { error?: string } | undefined)?.error;
@@ -465,7 +467,7 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
               running={running} canUpdate={agentReady && !starting}
               onChanged={() => { void loadStatus(); setDocReload((n) => n + 1); }}
               onUpdate={() => setConfirming('incremental')}
-              onBuildSelected={(count) => { setSelectedBuildCount(count); setConfirming('full'); }}
+              onBuildSelected={(count) => { setSelectedBuildCount(count); setRefreshImages(false); setConfirming('full'); }}
               onOpenSource={(choice) => setSource({ objToken: choice.objToken, title: choice.title, relPath: choice.relPath, state: choice.included ? 'current' : 'excluded' })} />
           </>}
       </aside> : null}
@@ -499,7 +501,7 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
       <Modal
         open={confirming !== null}
         title={confirming === 'full' ? '确认构建所选文档' : '确认按变更更新'}
-        onClose={() => setConfirming(null)}
+        onClose={() => { setConfirming(null); setRefreshImages(false); }}
       >
         {confirming === 'full' ? (
           <div className="space-y-3 text-sm text-ink-soft leading-relaxed">
@@ -511,11 +513,19 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
             <p className="text-xs text-ink-faint">
               发布前旧版本保持可用；任何失败都不会改变当前已发布的版本。
             </p>
+            <label className="flex items-start gap-2 rounded-md border border-line px-3 py-2 cursor-pointer">
+              <input type="checkbox" className="mt-1 accent-[#9e2b25]" checked={refreshImages} disabled={starting}
+                onChange={(event) => setRefreshImages(event.target.checked)} />
+              <span>
+                <span className="block text-ink">重新生成所选文档的图片描述</span>
+                <span className="block mt-1 text-xs text-ink-faint">会重新调用识图模型并计入识图上限；相同图片共用缓存，失败时保留原有缓存。</span>
+              </span>
+            </label>
             <ConfirmActions
               confirmLabel="开始构建"
               busy={starting}
-              onConfirm={() => startBuild('full')}
-              onCancel={() => setConfirming(null)}
+              onConfirm={() => startBuild('full', refreshImages)}
+              onCancel={() => { setConfirming(null); setRefreshImages(false); }}
             />
           </div>
         ) : (
