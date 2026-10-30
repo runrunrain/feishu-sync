@@ -20,6 +20,7 @@ export function projectKnowledgeDocuments(root: string, documents: DocumentRecor
     tokens.add(doc.objToken); owners.set(normalized, tokens);
   }
   return documents.map((doc) => {
+    if (doc.pendingReason === 'local_deleted') return doc;
     const mdRel = doc.localMdPath ? toPortableRelative(root, doc.localMdPath) : null;
     if (doc.localMdPath && !mdRel) return doc;
     if (doc.localRelPath && mdRel && key(doc.localRelPath.replace(/\\/g, '/')) !== key(mdRel)) return doc;

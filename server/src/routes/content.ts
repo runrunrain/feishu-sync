@@ -43,9 +43,11 @@ interface ContentDependencies {
       syncedObjEditTime?: number | null;
       wikiNodeToken?: string | null;
       syncState?: DocumentRecord['syncState'];
+      pendingReason?: DocumentRecord['pendingReason'];
       lastSyncErrorCode?: string | null;
       cloudMatch?: DocumentRecord['cloudMatch'];
     } | null;
+    isLocalSourceDeleted?: (root: string, objToken: string) => boolean;
     /** P1-S3：入边查询（被引用，设计 §2.3）——可选以兼容旧测试替身。 */
     listSourceReferencesByTarget?: (targetTokens: string[]) => unknown[];
     /** P1-S4：出边查询（引用，设计 §2.3/§2.4）——可选以兼容旧测试替身。 */
@@ -67,6 +69,12 @@ function getDeps(c: any): ContentDependencies {
     throw new Error('[content] required dependencies not injected');
   }
   return { localMapStore, configManager };
+}
+
+function isDeletedSource(deps: ContentDependencies, doc: NonNullable<ReturnType<ContentDependencies['localMapStore']['getDocumentByObjToken']>>): boolean {
+  const root = deps.configManager.getConfig()?.knowledgeBaseRoot ?? '';
+  return doc.pendingReason === 'local_deleted' || (typeof deps.localMapStore.isLocalSourceDeleted === 'function'
+    && deps.localMapStore.isLocalSourceDeleted(root, doc.objToken));
 }
 
 /** Read a UTF-8 text file with a hard byte cap; null when unreadable. */
@@ -101,7 +109,7 @@ export const contentRoutes = new Hono();
 function findWorkbook(deps: ContentDependencies, objToken: string) {
   const root = deps.configManager.getConfig()?.knowledgeBaseRoot;
   const doc = deps.localMapStore.getDocumentByObjToken(objToken);
-  if (!root || !doc || doc.objType !== 'sheet' || !doc.localMdPath) return null;
+  if (!root || !doc || isDeletedSource(deps, doc) || doc.objType !== 'sheet' || !doc.localMdPath) return null;
   const mdRelative = toPortableRelative(root, doc.localMdPath);
   if (!mdRelative) return null;
   const relativePath = workbookPathForMarkdown(mdRelative);
@@ -251,7 +259,7 @@ contentRoutes.get('/api/mapping/content/:objToken', async (c) => {
     }
 
     const doc = localMapStore.getDocumentByObjToken(objToken);
-    if (!doc) {
+    if (!doc || isDeletedSource({ localMapStore, configManager }, doc)) {
       return c.json({ error: 'document_not_found' }, 404);
     }
 
@@ -414,9 +422,9 @@ contentRoutes.get('/api/mapping/comments/:objToken', (c) => {
     return c.json({ error: 'objToken is required' }, 400);
   }
   try {
-    const { localMapStore } = getDeps(c);
+    const { localMapStore, configManager } = getDeps(c);
     const doc = localMapStore.getDocumentByObjToken(objToken);
-    if (!doc) {
+    if (!doc || isDeletedSource({ localMapStore, configManager }, doc)) {
       return c.json({ error: 'document_not_found' }, 404);
     }
     const meta = (typeof localMapStore.getSourceCommentMeta === 'function'

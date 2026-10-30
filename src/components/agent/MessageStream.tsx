@@ -7,10 +7,11 @@
  * 自动滚底：接近底部时新内容贴底；用户上翻阅读时不打扰。
  */
 
-import { useEffect, useRef } from 'react';
+import { memo, useEffect, useRef } from 'react';
 import { AlertCircle, Ban, Check, ListTodo, Loader2, Wrench } from 'lucide-react';
 import type { RunDraft } from '../../hooks/useAgentSessions';
 import type { AgentApprovalDto, AgentMessageDto, AgentTaskNotice } from '../../types/agent';
+import { MarkdownView } from '../preview/MarkdownView';
 import { ApprovalCard } from './ApprovalCard';
 
 interface MessageStreamProps {
@@ -80,11 +81,8 @@ export function MessageStream({ messages, draft, streamErrors, loading, emptyHin
               />
             ))}
             {draft.text ? (
-              <div className="px-4 py-3 rounded-md border border-jade/25 bg-card-bg">
-                <p className="text-sm text-ink leading-relaxed whitespace-pre-wrap break-words">
-                  {draft.text}
-                  <span className="inline-block w-[2px] h-4 align-[-2px] ml-0.5 bg-seal animate-pulse" aria-hidden />
-                </p>
+              <div className="agent-markdown agent-markdown-streaming px-4 py-3 rounded-md border border-jade/25 bg-card-bg" aria-busy="true">
+                <MarkdownView content={draft.text} remoteImages="confirm" />
               </div>
             ) : draft.tools.length === 0 ? (
               <div className="px-4 py-3 rounded-md border border-line bg-paper/60 text-xs text-ink-faint inline-flex items-center gap-2">
@@ -145,7 +143,7 @@ export function MessageStream({ messages, draft, streamErrors, loading, emptyHin
   );
 }
 
-function MessageRow({ message }: { message: AgentMessageDto }) {
+const MessageRow = memo(function MessageRow({ message }: { message: AgentMessageDto }) {
   if (message.role === 'user') {
     return (
       <div className="flex justify-end" data-role="user">
@@ -170,8 +168,8 @@ function MessageRow({ message }: { message: AgentMessageDto }) {
             </div>
           ) : null}
           {message.text ? (
-            <div className="px-4 py-3 rounded-md rounded-tl-sm border border-line bg-card-bg">
-              <p className="text-sm text-ink leading-relaxed whitespace-pre-wrap break-words">{message.text}</p>
+            <div className="agent-markdown px-4 py-3 rounded-md rounded-tl-sm border border-line bg-card-bg">
+              <MarkdownView content={message.text} remoteImages="confirm" />
             </div>
           ) : null}
           {message.error ? (
@@ -204,7 +202,7 @@ function MessageRow({ message }: { message: AgentMessageDto }) {
       </span>
     </div>
   );
-}
+});
 
 function ToolRow({
   name,

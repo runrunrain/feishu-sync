@@ -47,7 +47,7 @@ export function KbSourceSelector({ running, nonce, onChanged, onOpenSource, canB
     try {
       const result = await cleanupKbSources(data.root, confirmation.map(({ objToken, relPath }) => ({ objToken, relPath })));
       setConfirmation(null); setSelected(new Set()); resetScroll();
-      setNotice(`已清理 ${result.cleaned} 篇源文档及对应索引。回收位置：${result.trashDir}。正文可从 files 移回原位置后重建索引；表格附件映射可重新同步恢复，原映射保存在 cleanup.json。`);
+      setNotice(`已清理 ${result.cleaned} 篇源文档及对应索引。回收位置：${result.trashDir}。可重新同步或添加以恢复，原映射保存在 cleanup.json。`);
       onChanged(); setData(await getKbSourceTree());
     } catch (err) { setError(err instanceof Error ? err.message : '清理失败'); }
     finally { setBusy(false); }

@@ -1,4 +1,5 @@
 import type { KbLanMcpStatus, KbLanMcpSettings, KbLanMcpAuditEntry } from '../types/kb-lan-mcp';
+import type { McpClientTarget, McpInstallStatus } from '../types/kb-mcp-install';
 import type { SourceBatchRequest, SourceBatchPreview, SourceBatchResult } from '../types/source-batch';
 import type { CliEnableResult, CliInfoDto, CliRotateResult, CliShimInstallResult } from '../types/cli';
 import type { PiPluginsDto } from '../types/pi-plugin';
@@ -1186,6 +1187,17 @@ export async function cancelKbBuild(id: string): Promise<KbBuildDto> {
 /** GET /api/kb/mcp —— 外部 MCP 连接信息（§9.5，供设置页复制）。 */
 export async function getKbMcpInfo(): Promise<KbMcpInfoDto> {
   return request<KbMcpInfoDto>('/api/kb/mcp');
+}
+
+/** User-level MCP changes are immediate and require desktop authorization. */
+export function getKbMcpInstallStatus(): Promise<{ targets: McpInstallStatus[] }> {
+  return request('/api/kb-mcp-install/status', { cache: 'no-store' });
+}
+export function installKbMcp(target: McpClientTarget): Promise<McpInstallStatus> {
+  return request('/api/kb-mcp-install/install', { method: 'POST', body: JSON.stringify({ target }) });
+}
+export function removeKbMcp(target: McpClientTarget): Promise<McpInstallStatus> {
+  return request('/api/kb-mcp-install/remove', { method: 'POST', body: JSON.stringify({ target }) });
 }
 
 // ---------------------------------------------------------------------------

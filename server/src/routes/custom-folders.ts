@@ -310,7 +310,7 @@ customFolderRoutes.get('/api/custom-folders', async (c) => {
       name: folder.name,
       localRelPath: folder.localRelPath,
       createdAt: folder.createdAt,
-      docs: localMapStore.listCustomFolderDocs(folder.id).map((doc: any) => ({
+      docs: localMapStore.listCustomFolderDocs(folder.id, knowledgeBaseRoot).map((doc: any) => ({
         objToken: doc.objToken,
         title: doc.title,
         objType: doc.objType,
@@ -705,7 +705,11 @@ async function processOneLink(ctx: LinkContext): Promise<LinkResult> {
 
   // 2. Reject documents already present in the mapping table.
   const existing = ctx.localMapStore.getDocumentByObjToken(objToken);
-  if (existing) {
+  const deletedArchive = existing?.customFolderId && existing.pendingReason === 'local_deleted' && !existing.watchedRootId;
+  if (ctx.localMapStore.isSyncBlocked?.(ctx.knowledgeBaseRoot, objToken)) {
+    return { link: linkStr, ok: false, objToken, title, objType, error: { code: 'already_exists', message: '该文档已在同步屏蔽名单，请先在设置中移出屏蔽名单' } };
+  }
+  if (existing && !deletedArchive) {
     let existingLocation = STRUCTURE_TREE_LABEL;
     if (existing.customFolderId) {
       const owner = ctx.localMapStore.getCustomFolder(existing.customFolderId);
@@ -847,6 +851,7 @@ async function processOneLink(ctx: LinkContext): Promise<LinkResult> {
       originalLink: linkStr,
       objEditTime: node.obj_edit_time ?? null,
       spaceId: node.space_id ?? null,
+      knowledgeRoot: ctx.knowledgeBaseRoot,
     });
     if (writeResult && !writeResult.applied) {
       // Race: the doc became a structure-tree member between our dup-check and

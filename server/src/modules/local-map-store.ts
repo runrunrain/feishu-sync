@@ -1383,14 +1383,15 @@ export class LocalMapStore {
   }
 
   /** 清除本地成功基线；有效上级/屏蔽身份保留拓扑，供后续待同步或解除屏蔽使用。 */
-  clearLocalDocument(objToken: string, options: { pending: boolean; blockRoot?: string; watchedRootId?: string; watchedRootUrl?: string }): void {
+  clearLocalDocument(objToken: string, options: { pending: boolean; blockRoot?: string; deletedRoot?: string; watchedRootId?: string; watchedRootUrl?: string }): void {
     this.db.transaction(() => {
       const doc = this.getDocumentByObjToken(objToken);
       if (!doc) return;
+      if (options.deletedRoot) this.markLocalSourceDeleted(options.deletedRoot, doc);
       if (options.blockRoot) this.db.prepare(`INSERT OR REPLACE INTO sync_blocklist
         (knowledge_root,obj_token,title,wiki_node_token,blocked_at) VALUES (?,?,?,?,?)`)
         .run(this.kbSourceRootKey(options.blockRoot), objToken, doc.title, doc.wikiNodeToken ?? null, new Date().toISOString());
-      if (!options.pending && !options.blockRoot) { this.deleteDocumentByToken(objToken); return; }
+      if (!options.pending && (!options.blockRoot || doc.customFolderId)) { this.deleteDocumentByToken(objToken); return; }
       this.db.prepare('DELETE FROM sheet_sheets WHERE sheet_obj_token=?').run(objToken);
       // P1-S3：本地正文基线被清除（移出/屏蔽后重挂 pending）→ 引用出边
       // 同删；下次成功同步自然重算（边与当前本地正文一致，§2.2）。
@@ -1413,7 +1414,7 @@ export class LocalMapStore {
     const key = this.kbSourceRootKey(root);
     this.db.transaction(() => { for (const doc of documents) insert.run(key, doc.objToken, doc.title, doc.wikiNodeToken ?? null, new Date().toISOString()); })();
   }
-  clearLocalDocuments(items: Array<{ objToken: string; pending: boolean; blockRoot?: string; watchedRootId?: string; watchedRootUrl?: string }>): void {
+  clearLocalDocuments(items: Array<{ objToken: string; pending: boolean; blockRoot?: string; deletedRoot?: string; watchedRootId?: string; watchedRootUrl?: string }>): void {
     this.db.transaction(() => { for (const item of items) this.clearLocalDocument(item.objToken, item); })();
   }
 
@@ -2028,7 +2029,7 @@ export class LocalMapStore {
    * List documents belonging to a custom folder, ordered by title.
    * Used by GET /api/custom-folders to compose the docs array per folder.
    */
-  listCustomFolderDocs(folderId: string): Array<{
+  listCustomFolderDocs(folderId: string, root?: string): Array<{
     objToken: string;
     title: string;
     objType: string;
@@ -2038,9 +2039,11 @@ export class LocalMapStore {
     const rows = this.getStatement(`
       SELECT obj_token, title, obj_type, original_link, local_rel_path
       FROM documents
-      WHERE custom_folder_id = ?
+      WHERE custom_folder_id = ? AND COALESCE(pending_reason, '') <> 'local_deleted'
+        AND cloud_deleted = 0
+        AND NOT EXISTS (SELECT 1 FROM local_source_deletions d WHERE d.knowledge_root = ? AND d.obj_token = documents.obj_token)
       ORDER BY title COLLATE NOCASE ASC
-    `).all(folderId) as Array<{
+    `).all(folderId, root ? this.kbSourceRootKey(root) : '') as Array<{
       obj_token: string;
       title: string;
       obj_type: string;
@@ -2077,6 +2080,7 @@ export class LocalMapStore {
     objEditTime: number | null;
     spaceId: string | null;
     lastSyncedAt?: string;
+    knowledgeRoot?: string;
   }): { applied: boolean } {
     const nowIso = input.lastSyncedAt ?? new Date().toISOString();
     // INSERT the documents row with the archive contract: watched_root_* NULL,
@@ -2122,24 +2126,27 @@ export class LocalMapStore {
         pending_reason = NULL,
         updated_at = datetime('now')
       WHERE documents.watched_root_id IS NULL
-        AND documents.wiki_node_token IS NULL
+        AND (documents.wiki_node_token IS NULL OR (documents.custom_folder_id IS NOT NULL AND documents.pending_reason = 'local_deleted'))
     `);
-    const info = stmt.run(
-      input.objToken,
-      input.wikiNodeToken,
-      input.objType,
-      input.title,
-      input.localMdPath,
-      input.objEditTime != null ? String(input.objEditTime) : '',
-      nowIso,
-      input.originalLink,
-      input.objEditTime,
-      input.objEditTime,
-      input.localRelPath,
-      input.spaceId,
-      input.folderId,
-    );
-    return { applied: info.changes > 0 };
+    return this.db.transaction(() => {
+      const info = stmt.run(
+        input.objToken,
+        input.wikiNodeToken,
+        input.objType,
+        input.title,
+        input.localMdPath,
+        input.objEditTime != null ? String(input.objEditTime) : '',
+        nowIso,
+        input.originalLink,
+        input.objEditTime,
+        input.objEditTime,
+        input.localRelPath,
+        input.spaceId,
+        input.folderId,
+      );
+      if (info.changes > 0 && input.knowledgeRoot) this.clearLocalSourceDeletion(input.knowledgeRoot, input.objToken);
+      return { applied: info.changes > 0 };
+    })();
   }
 
   /**
@@ -2616,6 +2623,32 @@ export class LocalMapStore {
   /** 排除标记独立于documents，索引重建/重新同步不清除；按真实原始库根隔离。 */
   private kbSourceRootKey(root: string): string {
     try { return fs.realpathSync.native(root); } catch { return path.resolve(root); }
+  }
+
+  /** 用户删除意图与索引记录分离，保留文件或重新索引时也不能自动复活。 */
+  markLocalSourceDeleted(root: string, doc: DocumentRecord): void {
+    const raw = doc.localRelPath || doc.localMdPath;
+    const relative = raw ? path.relative(path.resolve(root), path.resolve(root, raw)).replace(/\\/g, '/') : null;
+    const safePath = relative && relative !== '..' && !relative.startsWith('../') && !path.isAbsolute(relative) ? relative : null;
+    this.db.prepare(`INSERT INTO local_source_deletions (knowledge_root,obj_token,local_rel_path,original_link,deleted_at)
+      VALUES (?,?,?,?,?) ON CONFLICT(knowledge_root,obj_token) DO UPDATE SET
+      local_rel_path=COALESCE(excluded.local_rel_path,local_source_deletions.local_rel_path),
+      original_link=COALESCE(excluded.original_link,local_source_deletions.original_link), deleted_at=excluded.deleted_at`)
+      .run(this.kbSourceRootKey(root), doc.objToken, safePath, doc.originalLink ?? null, new Date().toISOString());
+  }
+
+  listLocalSourceDeletions(root: string): Array<{ objToken: string; localRelPath: string | null; originalLink: string | null }> {
+    if (!root) return [];
+    return (this.db.prepare('SELECT obj_token,local_rel_path,original_link FROM local_source_deletions WHERE knowledge_root=?')
+      .all(this.kbSourceRootKey(root)) as any[]).map((row) => ({ objToken: row.obj_token, localRelPath: row.local_rel_path, originalLink: row.original_link }));
+  }
+
+  isLocalSourceDeleted(root: string, token: string): boolean {
+    return !!root && !!this.db.prepare('SELECT 1 FROM local_source_deletions WHERE knowledge_root=? AND obj_token=?').get(this.kbSourceRootKey(root), token);
+  }
+
+  clearLocalSourceDeletion(root: string, token: string): void {
+    if (root) this.db.prepare('DELETE FROM local_source_deletions WHERE knowledge_root=? AND obj_token=?').run(this.kbSourceRootKey(root), token);
   }
 
   listKbExcludedSources(root: string): string[] {
@@ -3689,6 +3722,11 @@ export class LocalMapStore {
       CREATE TABLE IF NOT EXISTS sync_blocklist (
         knowledge_root TEXT NOT NULL, obj_token TEXT NOT NULL, title TEXT NOT NULL,
         wiki_node_token TEXT, blocked_at TEXT NOT NULL, PRIMARY KEY (knowledge_root,obj_token)
+      );
+
+      CREATE TABLE IF NOT EXISTS local_source_deletions (
+        knowledge_root TEXT NOT NULL, obj_token TEXT NOT NULL, local_rel_path TEXT,
+        original_link TEXT, deleted_at TEXT NOT NULL, PRIMARY KEY (knowledge_root,obj_token)
       );
 
       -- Operator-owned Feishu-side repair queue. These rows deliberately do

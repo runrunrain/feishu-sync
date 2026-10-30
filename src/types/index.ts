@@ -138,6 +138,7 @@ export interface LegacyLLMConfig {
 }
 
 export interface ChangedDocument {
+  localDeleted?: boolean;
   xlsxMissing?: boolean;
   objToken: string;
   objType: 'docx' | 'sheet' | 'slides' | 'unknown';

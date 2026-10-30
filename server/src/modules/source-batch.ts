@@ -44,7 +44,7 @@ export function planSourceBatch(store: LocalMapStore, config: Config, request: S
   const finalRoot = createPendingRootResolver(finalTopology, config);
   const actions = docs.map((doc) => {
     const root = request.action === 'delete' ? finalRoot(doc) : null;
-    return { objToken: doc.objToken, pending: Boolean(root), blockRoot: willBlock(doc) ? request.root : undefined, watchedRootId: root?.id, watchedRootUrl: root?.url };
+    return { objToken: doc.objToken, pending: Boolean(root), blockRoot: willBlock(doc) ? request.root : undefined, deletedRoot: request.action === 'delete' ? request.root : undefined, watchedRootId: root?.id, watchedRootUrl: root?.url };
   });
   const sources = request.action === 'delete' && request.deleteFiles ? docs.filter((doc) => doc.localRelPath || doc.localMdPath).map((doc) => ({ objToken: doc.objToken, relPath: doc.localRelPath || doc.localMdPath })) : [];
   const prepared = sources.length ? prepareSourceCleanup(store, request.root, sources, { allowMissing: true }) : null;

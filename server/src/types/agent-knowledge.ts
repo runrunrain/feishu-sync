@@ -255,7 +255,7 @@ export interface KbCurrentPointer {
   publishedAt: string;
 }
 
-export type KbSourceState = 'current' | 'changed' | 'missing' | 'excluded';
+export type KbSourceState = 'current' | 'changed' | 'missing' | 'excluded' | 'deleted';
 
 export interface KbStatusDto {
   outputRoot: string;

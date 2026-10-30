@@ -119,7 +119,8 @@ export class SourceEditService {
   /** documents 行解析：objType/cloud_deleted/路径等入口校验。 */
   private requireDocument(objToken: string): Record<string, any> {
     const doc = this.deps.store?.getDocumentByObjToken?.(objToken);
-    if (!doc) {
+    const root = this.deps.config.getConfig?.()?.knowledgeBaseRoot;
+    if (!doc || doc.pendingReason === 'local_deleted' || (root && this.deps.store?.isLocalSourceDeleted?.(root, objToken))) {
       throw new SourceEditError('source_not_found', `文档不存在：${objToken}`, 404);
     }
     return doc;

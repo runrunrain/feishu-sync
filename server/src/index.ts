@@ -20,7 +20,7 @@ import { fileURLToPath } from 'node:url';
 import { resolveDataRoot } from './modules/data-root.js';
 import type { Server as HttpServer } from 'node:http';
 
-import { reconcileLocalIndex } from './modules/local-index-reconcile.js';
+import { filterDeletedLocalDocuments, reconcileLocalIndex } from './modules/local-index-reconcile.js';
 import { SnapshotService } from './modules/snapshot-service.js';
 import { ConfigManager } from './modules/config-manager.js';
 import { LarkCliClient } from './modules/lark-cli-client.js';
@@ -33,6 +33,9 @@ import { CliEndpoint } from './cli-endpoint.js';
 import { cliRoutes } from './routes/cli.js';
 import { KbLanGatewayManager } from './kb-lan/gateway-manager.js';
 import { kbLanMcpRoutes } from './routes/kb-lan-mcp.js';
+import { kbMcpInstallRoutes } from './routes/kb-mcp-install.js';
+import { McpClientInstaller } from './kb/mcp-client-installer.js';
+import { kbMcpInfo } from './kb/mcp-info.js';
 import { cliAdminRoutes } from './routes/cli-admin.js';
 import { healthRoutes } from './routes/health.js';
 import { configRoutes } from './routes/config.js';
@@ -231,7 +234,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
   const knowledgeDocuments = () => {
     const root = configManager.getConfig()?.knowledgeBaseRoot ?? '';
     reconcileLocalIndex(localMapStore, root, () => new SnapshotService(localMapStore, configManager, { larkCliClient, config: configManager.getConfig() }).generate());
-    return projectKnowledgeDocuments(root, localMapStore.getAllDocuments());
+    return projectKnowledgeDocuments(root, filterDeletedLocalDocuments(localMapStore, root, localMapStore.getAllDocuments()));
   };
   const sheetCsvPaths = (objToken: string): string[] => {
     const mapped = localMapStore.getSheetSheets(objToken)
@@ -599,6 +602,10 @@ export async function buildServer(options: CreateServerOptions = {}) {
   // ============================================================================
 
   app.route('/', kbLanMcpRoutes({ manager: kbLanGateway, desktopToken }));
+  app.route('/', kbMcpInstallRoutes({
+    installer: new McpClientInstaller({ dataRoot: agentDataRoot, info: () => kbMcpInfo(configManager.getConfig()!.standardKb.outputRoot) }),
+    desktopToken,
+  }));
   app.route('/', configRoutes);
   app.route('/', detectRoutes);
   app.route('/', syncRoutes);

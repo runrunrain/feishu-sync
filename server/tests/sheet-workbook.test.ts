@@ -493,8 +493,11 @@ describe('native workbook source and authorized read reconstruction', () => {
     await exportTestWorkbook('token', path.join(root, 'Doc.xlsx'));
     fs.writeFileSync(path.join(root, 'Doc.xlsx.metadata.json'), '{"mode":"native"}');
     const record = { objToken: 'token', objType: 'sheet', localRelPath: 'Doc.md', localMdPath: mdPath, status: 'synced' };
-    const result = cleanupSources({ getAllDocuments: () => [record], getSheetSheets: () => [], deleteDocumentsByTokens: () => {} } as any,
+    const markDeleted = vi.fn();
+    const result = cleanupSources({ getAllDocuments: () => [record], getSheetSheets: () => [], deleteDocumentsByTokens: () => {},
+      withTransaction: (fn: () => void) => fn(), markLocalSourceDeleted: markDeleted } as any,
       root, [{ objToken: 'token', relPath: 'Doc.md' }]);
+    expect(markDeleted).toHaveBeenCalledWith(root, record);
     expect(result.movedFiles).toBe(3);
     expect(fs.existsSync(path.join(root, 'Doc.xlsx'))).toBe(false);
     expect(fs.existsSync(path.join(result.trashDir, 'files', 'Doc.xlsx'))).toBe(true);

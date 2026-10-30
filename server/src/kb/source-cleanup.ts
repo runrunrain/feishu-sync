@@ -83,7 +83,7 @@ export function cleanupSources(store: LocalMapStore, root: string, sources: Arra
   const { rootReal, selected, files } = prepareSourceCleanup(store, root, sources, options);
   const id = `sources-${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
   const trash = resolveInside(rootReal, `.trash-bin/${id}`, 'mkdir');
-  // 保存恢复依据；回收目录中的文档仍有同步头，可移回原位后重建索引。
+  // 保存恢复依据；重新添加或同步时可以使用回收目录中的原文件和映射记录。
   fs.writeFileSync(path.join(trash, 'cleanup.json'), JSON.stringify({ version: 1, root: rootReal, createdAt: new Date().toISOString(),
     documents: selected, sheets: selected.flatMap((doc) => store.getSheetSheets(doc.objToken)), files: [...files.values()] }, null, 2), { flag: 'wx' });
   const moved: Array<{ from: string; to: string }> = [];
@@ -94,7 +94,10 @@ export function cleanupSources(store: LocalMapStore, root: string, sources: Arra
       const to = resolveInside(trash, `files/${relative}`, 'write');
       fs.renameSync(from, to); moved.push({ from, to });
     }
-    if (options.commit) options.commit(); else store.deleteDocumentsByTokens(selected.map((doc) => doc.objToken));
+    if (options.commit) options.commit(); else store.withTransaction(() => {
+      for (const doc of selected) store.markLocalSourceDeleted(root, doc);
+      store.deleteDocumentsByTokens(selected.map((doc) => doc.objToken));
+    });
   } catch (error) {
     const failures: string[] = [];
     for (const file of moved.reverse()) { try { fs.renameSync(file.to, file.from); } catch { failures.push(file.from); } }

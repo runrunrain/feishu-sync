@@ -127,6 +127,7 @@ function makeFixture(opts: {
   return {
     kbRoot, dataRoot, store, service, absPath, relPath, objToken,
     cleanup: () => {
+      store.close();
       fs.rmSync(kbRoot, { recursive: true, force: true });
       fs.rmSync(dataRoot, { recursive: true, force: true });
     },
@@ -139,6 +140,15 @@ function readBody(fx: Fixture): string {
   if (content.slice(end, end + 2) === '\n\n') end += 2;
   return content.slice(end);
 }
+
+it('源文档被删除后，即使文件和旧索引记录仍在也不能经编辑接口读取', async () => {
+  const fx = makeFixture();
+  try {
+    fx.store.markLocalSourceDeleted(fx.kbRoot, fx.store.getDocumentByObjToken(fx.objToken)!);
+    expect(fs.existsSync(fx.absPath)).toBe(true);
+    await expect(fx.service.read(fx.objToken)).rejects.toMatchObject({ code: 'source_not_found', status: 404 });
+  } finally { fx.cleanup(); }
+});
 
 function readHeader(fx: Fixture): string {
   const content = fs.readFileSync(fx.absPath, 'utf-8');
@@ -344,6 +354,7 @@ describe('SourceEditService — edit', () => {
       expect(content.startsWith(yamlHeader(objToken))).toBe(true);
       expect(content.endsWith('# 归档编辑后\n')).toBe(true);
     } finally {
+      store.close();
       fs.rmSync(kbRoot, { recursive: true, force: true });
       fs.rmSync(dataRoot, { recursive: true, force: true });
     }

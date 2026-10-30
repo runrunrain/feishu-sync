@@ -98,6 +98,7 @@ describe('SyncEngine atomic apply path', () => {
       syncedObjEditTime: 10, observedObjEditTime: 10, status: 'synced', syncState: 'synced' } as any);
     store.markDocumentSynced({ objToken: 'tok-doc', syncedObjEditTime: 10, localMdPath: mdPath,
       lastSyncedModifyTime: 'old', lastSyncedAt: '2026-01-01T00:00:00.000Z' });
+    store.markLocalSourceDeleted(kb, store.getDocumentByObjToken('tok-doc')!);
     let entered!: () => void, release!: () => void;
     const started = new Promise<void>((resolve) => { entered = resolve; });
     const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -117,6 +118,7 @@ describe('SyncEngine atomic apply path', () => {
       expect((await first).success).toBe(false);
       expect(fs.readFileSync(mdPath, 'utf8')).toBe('# user edit\n');
       expect(store.getDocumentByObjToken('tok-doc')?.syncedObjEditTime).toBe(10);
+      expect(store.isLocalSourceDeleted(kb, 'tok-doc')).toBe(true);
     } else {
       const second = engine.syncDocuments([{ ...doc, observedObjEditTime: 30 }], options);
       release();
@@ -126,6 +128,7 @@ describe('SyncEngine atomic apply path', () => {
       expect(fetches).toBe(1);
       expect(fs.readFileSync(mdPath, 'utf8')).toContain('cloud body');
       expect(store.getDocumentByObjToken('tok-doc')?.syncedObjEditTime).toBe(20);
+      expect(store.isLocalSourceDeleted(kb, 'tok-doc')).toBe(false);
     }
   });
 
@@ -342,6 +345,7 @@ describe('SyncEngine atomic apply path', () => {
       lastSyncedModifyTime: 'old',
       lastSyncedAt: '2026-01-01T00:00:00.000Z',
     });
+    store.markLocalSourceDeleted(kb, store.getDocumentByObjToken('tok-sheet')!);
 
     const engine = new SyncEngine({
       larkCliClient: {
@@ -383,6 +387,7 @@ describe('SyncEngine atomic apply path', () => {
     const row = store.getDocumentByObjToken('tok-sheet');
     expect(row?.syncedObjEditTime).toBe(999);
     expect(row?.syncState).toBe('synced');
+    expect(store.isLocalSourceDeleted(kb, 'tok-sheet')).toBe(true);
   });
 
   it('DB-stage failure after file commit restores prior markdown bytes', async () => {

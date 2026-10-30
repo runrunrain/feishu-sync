@@ -8,9 +8,11 @@ import { ConfigManager } from '../src/modules/config-manager.js';
 import { IndexScanner } from '../src/modules/index-scanner.js';
 import { SnapshotService } from '../src/modules/snapshot-service.js';
 import { MappingService } from '../src/modules/mapping-service.js';
-import { reconcileLocalIndex } from '../src/modules/local-index-reconcile.js';
+import { filterDeletedLocalDocuments, reconcileLocalIndex } from '../src/modules/local-index-reconcile.js';
+import { projectKnowledgeDocuments } from '../src/kb/local-source-projection.js';
 import { cleanupSources } from '../src/kb/source-cleanup.js';
 import { trashRoutes } from '../src/routes/trash.js';
+import { contentRoutes } from '../src/routes/content.js';
 import { syncRoutes } from '../src/routes/sync.js';
 import { ChangeDetector } from '../src/modules/change-detector.js';
 import { kbRoutes } from '../src/routes/kb.js';
@@ -31,7 +33,7 @@ async function fixture() {
   store.upsertSheetSheet({ sheetObjToken: 'sheet', sheetId: 'tab', sheetTitle: '页', localCsvPath: csv, status: 'synced' });
   const snapshot = new SnapshotService(store, config, { larkCliClient: {}, config: config.getConfig() }); snapshot.generate();
   let running = false;
-  const app = new Hono(); app.use('*', async (c, next) => { (c as any).configManager = config; (c as any).localMapStore = store; (c as any).larkCliClient = {}; (c as any).kbBuildService = { activeBuild: () => running ? {} : null }; await next(); }); app.route('/', trashRoutes); app.route('/', syncRoutes); app.route('/', kbRoutes({ localMapStore: store, configManager: config, buildService: { activeBuild: () => running ? {} : null } as never,
+  const app = new Hono(); app.use('*', async (c, next) => { (c as any).configManager = config; (c as any).localMapStore = store; (c as any).larkCliClient = {}; (c as any).kbBuildService = { activeBuild: () => running ? {} : null }; await next(); }); app.route('/', trashRoutes); app.route('/', syncRoutes); app.route('/', contentRoutes); app.route('/', kbRoutes({ localMapStore: store, configManager: config, buildService: { activeBuild: () => running ? {} : null } as never,
     documentsProvider: () => { reconcileLocalIndex(store, raw, () => snapshot.generate()); return store.getAllDocuments(); }, sheetCsvPaths: (token) => store.getSheetSheets(token).map((s) => s.local_csv_path) }));
   const call = async (url: string, body?: unknown) => { const response = await app.request(url, { method: body ? 'POST' : 'GET', ...(body ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {}) }); return { status: response.status, data: await response.json() as any }; };
   return { root, raw, store, docs, csv, config, snapshot, call, running: () => { running = true; } };
@@ -140,6 +142,7 @@ describe('工具内指定源清理', () => {
     expect(f.store.getAllDocuments()).toHaveLength(3); for (const doc of f.docs) expect(fs.existsSync(doc.localMdPath!)).toBe(true);
     vi.spyOn(f.store, 'deleteDocumentsByTokens').mockImplementation(() => { throw new Error('fixture db failure'); });
     expect(() => cleanupSources(f.store, f.raw, sources(f.docs))).toThrow('fixture db failure');
+    expect(f.store.listLocalSourceDeletions(f.raw)).toEqual([]);
     expect(f.store.getAllDocuments()).toHaveLength(3); for (const doc of f.docs) expect(fs.existsSync(doc.localMdPath!)).toBe(true);
     expect(fs.existsSync(f.csv)).toBe(true);
   });
@@ -174,7 +177,8 @@ describe('侧栏删除、有效父级待同步和屏蔽名单', () => {
     await new IndexScanner({ localMapStore: f.store, larkCliClient: {}, config: f.config.getConfig() }).scanKnowledgeBase(f.raw);
     expect(f.store.getDocumentByObjToken('b')?.syncState).toBe('pending_added');
     expect(fs.readFileSync(f.docs[0].localMdPath!, 'utf8')).toBe(beforeParent);
-    expect(mapping.getTreeDetailed().nodes.find((n) => n.obj_token === 'b')).toMatchObject({ sync_state: 'pending_added', sync_blocked: false });
+    expect(mapping.getTreeDetailed().nodes.find((n) => n.obj_token === 'b')).toBeUndefined();
+    expect(mapping.getStoredDiff(f.watched.url).added.find((d) => d.objToken === 'b')?.localDeleted).toBe(true);
   });
   it('上级失效、未纳管或循环时清除节点；可选择仅删索引而保留文件', async () => {
     const f = await managedFixture();
@@ -186,6 +190,60 @@ describe('侧栏删除、有效父级待同步和屏蔽名单', () => {
     f.store.markCloudDeleted('a', new Date().toISOString());
     expect((await f.call('/api/trash/manual-delete', { obj_token: 'b' })).data.pending_sync).toBe(false);
     expect(f.store.getDocumentByObjToken('b')).toBeNull();
+  });
+  it('保留文件的删除跨重建索引和重启持续生效，且不影响其他源或不同知识库', async () => {
+    const f = await managedFixture();
+    const deletedPath = f.docs[1].localMdPath!;
+    expect((await f.call('/api/mapping/content/b')).status).toBe(200);
+    expect((await f.call('/api/trash/manual-delete', { obj_token: 'b', delete_local_files: false })).status).toBe(200);
+    expect(fs.existsSync(deletedPath)).toBe(true);
+    expect(f.store.isLocalSourceDeleted(f.raw, 'b')).toBe(true);
+    expect((await f.call('/api/mapping/content/b')).status).toBe(404);
+    expect((await f.call('/api/mapping/comments/b')).status).toBe(404);
+    expect(f.store.isLocalSourceDeleted(path.join(f.root, 'other'), 'b')).toBe(false);
+    const scanner = new IndexScanner({ localMapStore: f.store, larkCliClient: {}, config: f.config.getConfig() });
+    await scanner.scanKnowledgeBase(path.join(f.raw, '章节'));
+    const visible = projectKnowledgeDocuments(f.raw, filterDeletedLocalDocuments(f.store, f.raw, f.store.getAllDocuments()));
+    expect(visible.map((doc) => doc.objToken)).not.toContain('b');
+    expect(visible.map((doc) => doc.objToken)).toEqual(expect.arrayContaining(['a', 'sheet']));
+    expect(f.snapshot.generate().nodes.map((node) => node.obj_token)).not.toContain('b');
+    const reopened = new LocalMapStore(path.join(f.root, 'db.sqlite')); reopened.initialize();
+    try { expect(reopened.isLocalSourceDeleted(f.raw, 'b')).toBe(true); } finally { reopened.close(); }
+    expect((await f.call('/api/kb/sources/tree')).data.total).toBe(2);
+  });
+  it('只带旧原始链接的文件不会重新解析已删文档，同路径的新身份仍可索引', async () => {
+    const f = await managedFixture();
+    const file = f.docs[1].localMdPath!;
+    const link = 'https://example.feishu.cn/wiki/old-b';
+    f.store.upsertDocument({ ...f.docs[1], parentNodeToken: f.watched.id, originalLink: link });
+    fs.writeFileSync(file, `<!--\nfeishu_sync:\n  original_link: ${link}\n-->\n# 旧文档`);
+    expect((await f.call('/api/trash/manual-delete', { obj_token: 'b', delete_local_files: false })).status).toBe(200);
+    const getNode = vi.fn(async () => ({ obj_token: 'b', obj_type: 'docx' }));
+    const scanner = new IndexScanner({ localMapStore: f.store, larkCliClient: { getNode }, config: f.config.getConfig() });
+    await scanner.scanKnowledgeBase(f.raw);
+    expect(getNode).not.toHaveBeenCalled();
+    fs.writeFileSync(file, '<!--\nfeishu_sync:\n  obj_token: new-identity\n-->\n# 新文档');
+    await scanner.scanKnowledgeBase(f.raw);
+    expect(f.store.getDocumentByObjToken('new-identity')).not.toBeNull();
+    expect(f.store.isLocalSourceDeleted(f.raw, 'b')).toBe(true);
+  });
+  it('删除自定义归档并选择屏蔽后不再出现在归档列表，移出屏蔽后可重新添加', async () => {
+    const f = await fixture();
+    f.store.createCustomFolder({ id: 'custom', name: '归档', localRelPath: '_custom/archive' });
+    const file = path.join(f.raw, '_custom/archive/doc.md'); fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, '<!--\nfeishu_sync:\n  obj_token: archived\n-->\n# 归档文档');
+    const record = { objToken: 'archived', folderId: 'custom', wikiNodeToken: null, objType: 'docx' as const, title: '归档文档', localMdPath: file,
+      localRelPath: '_custom/archive/doc.md', originalLink: null, objEditTime: null, spaceId: null, knowledgeRoot: f.raw };
+    f.store.setDocumentCustomFolder(record);
+    expect((await f.call('/api/trash/manual-delete', { obj_token: 'archived', delete_local_files: false, block: true })).status).toBe(200);
+    expect(f.store.listCustomFolderDocs('custom', f.raw)).toEqual([]);
+    expect(f.store.isSyncBlocked(f.raw, 'archived')).toBe(true);
+    await new IndexScanner({ localMapStore: f.store, larkCliClient: {}, config: f.config.getConfig() }).scanKnowledgeBase(f.raw);
+    expect(f.store.getDocumentByObjToken('archived')).toBeNull();
+    f.store.removeSyncBlockedSources(f.raw, ['archived']);
+    expect(f.store.setDocumentCustomFolder(record)).toEqual({ applied: true });
+    expect(f.store.isLocalSourceDeleted(f.raw, 'archived')).toBe(false);
+    expect(f.store.listCustomFolderDocs('custom', f.raw).map((doc) => doc.objToken)).toEqual(['archived']);
   });
   it('删除提交失败回滚本地文件，不留下屏蔽或已完成状态', async () => {
     const f = await managedFixture();
@@ -224,6 +282,7 @@ describe('侧栏删除、有效父级待同步和屏蔽名单', () => {
       expect(result.status).toBe(200); expect(result.data.items).toHaveLength(3); expect(result.data).toMatchObject({ directCount: 2, descendantCount: 1 });
       expect(result.data.items.every((item: any) => item.effect === 'removed')).toBe(true); expect(result.data.files).toHaveLength(4);
       expect(f.store.getAllDocuments()).toEqual(before); expect(f.store.listSyncBlockedSources(f.raw)).toEqual([]);
+      expect(f.store.listLocalSourceDeletions(f.raw)).toEqual([]);
       for (const doc of f.docs) expect(fs.existsSync(doc.localMdPath!)).toBe(true);
     });
     it('批量删除使用一次文件回收与元数据事务，未选父文档和其字节保持', async () => {

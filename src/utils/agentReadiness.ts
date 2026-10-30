@@ -156,6 +156,7 @@ export const KB_SOURCE_STATE_LABEL: Record<string, string> = {
   current: '当前',
   changed: '已变更',
   missing: '已缺失',
+  deleted: '已删除',
   excluded: '已排除',
 };
 

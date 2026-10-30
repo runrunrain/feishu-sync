@@ -1211,6 +1211,7 @@ export class SyncEngine {
               lastSyncedAt: nowIso,
             });
           }
+          this.localMapStore.clearLocalSourceDeletion?.(this.config.knowledgeBaseRoot, doc.objToken);
           // P1-S3：与正文同一 DB 事务替换引用边（先删该源旧边再插新边）。
           // 方法缺失（旧测试替身/旧版本库）时静默跳过；事务中止（含
           // failAfterMarkDocumentSynced 注入）时边随基线一起回滚。
@@ -1884,6 +1885,7 @@ export class SyncEngine {
         lastSyncedModifyTime: doc.cloudModifiedTime,
         lastSyncedAt: new Date().toISOString(),
       });
+      this.localMapStore.clearLocalSourceDeletion?.(this.config.knowledgeBaseRoot, doc.objToken);
     }
   }
 

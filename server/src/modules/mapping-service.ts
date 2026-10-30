@@ -22,7 +22,7 @@
  *   - display adjustable: only local_sort_order is touched on reorder
  */
 
-import { reconcileLocalIndex } from './local-index-reconcile.js';
+import { filterDeletedLocalDocuments, reconcileLocalIndex } from './local-index-reconcile.js';
 import { recoverLocalDocument } from './recover-local-document.js';
 import { localPathState } from './local-path-state.js';
 import fs from 'node:fs';
@@ -167,6 +167,9 @@ export class MappingService {
    */
   getStoredDiff(rootUrl: string): DiffReport {
     const blocked = this.blockedTokens();
+    const root = this.configManager?.getConfig()?.knowledgeBaseRoot ?? '';
+    const locallyDeleted = new Set(root && typeof this.localMapStore.listLocalSourceDeletions === 'function'
+      ? this.localMapStore.listLocalSourceDeletions(root).map((item) => item.objToken) : []);
     const rootToken = this.rootTokenFromUrl(rootUrl);
     const documents = this.localMapStore.getAllDocuments()
       .filter((document) =>
@@ -207,18 +210,21 @@ export class MappingService {
           document,
           'added',
           hierarchyByObjToken.get(document.objToken) ?? null,
+          locallyDeleted,
         ));
       } else if (state === 'pending_modified' || (state === 'synced' && this.missingWorkbook(document))) {
         modified.push(this.toStoredChangedDocument(
           document,
           'modified',
           hierarchyByObjToken.get(document.objToken) ?? null,
+          locallyDeleted,
         ));
       } else if (state === 'missing_candidate') {
         deleted.push(this.toStoredChangedDocument(
           document,
           'deleted',
           hierarchyByObjToken.get(document.objToken) ?? null,
+          locallyDeleted,
         ));
       }
     }
@@ -264,6 +270,7 @@ export class MappingService {
     document: DocumentRecord,
     changeType: ChangedDocument['changeType'],
     hierarchy: StoredParentChainProjection | null,
+    locallyDeleted: Set<string>,
   ): ChangedDocument {
     const observed = document.observedObjEditTime ?? document.objEditTime ?? null;
     const milliseconds = observed != null && observed < 100_000_000_000
@@ -296,6 +303,7 @@ export class MappingService {
       isWatchedRootNode: hierarchy?.isWatchedRootNode,
       localRelPath: document.localRelPath ?? null,
       customFolderId: document.customFolderId ?? null,
+      localDeleted: document.pendingReason === 'local_deleted' || locallyDeleted.has(document.objToken),
     };
   }
 
@@ -308,7 +316,7 @@ export class MappingService {
    * isWatchedRootNode are left undefined. watchedRootId is null.
    */
   private getCustomFolderModifiedDocs(): ChangedDocument[] {
-    const docs = this.localMapStore.listAllCustomFolderDocs();
+    const docs = filterDeletedLocalDocuments(this.localMapStore, this.configManager?.getConfig()?.knowledgeBaseRoot ?? '', this.localMapStore.listAllCustomFolderDocs());
     const blocked = this.blockedTokens();
     return docs
       .filter((doc) => {
@@ -453,7 +461,7 @@ export class MappingService {
   getTree(): MappingNode[] {
     reconcileLocalIndex(this.localMapStore, this.configManager?.getConfig()?.knowledgeBaseRoot ?? '', () => this.snapshotService.generate());
     const blocked = this.blockedTokens();
-    const documents = this.localMapStore.getAllDocuments();
+    const documents = filterDeletedLocalDocuments(this.localMapStore, this.configManager?.getConfig()?.knowledgeBaseRoot ?? '', this.localMapStore.getAllDocuments());
     // Cloud-view projection: cloud_deleted rows go to the trash-bin UI, and
     // custom-folder archive docs (custom_folder_id set) are rendered by the
     // 自定义归档 section (GET /api/custom-folders) — neither belongs in the
@@ -506,7 +514,7 @@ export class MappingService {
     const view = options.view === 'local' ? 'local' : 'feishu';
     const includeOrphans = options.includeOrphans ?? (view === 'local');
 
-    const documents = this.localMapStore.getAllDocuments();
+    const documents = filterDeletedLocalDocuments(this.localMapStore, this.configManager?.getConfig()?.knowledgeBaseRoot ?? '', this.localMapStore.getAllDocuments());
     const live = documents.filter((d) => (d.cloudDeleted ?? 0) === 0);
 
     // Precompute parent->child presence once for O(N) has_child.

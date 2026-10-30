@@ -24,7 +24,7 @@
  * and orphan-detection (P1 upgrade pays off here).
  */
 
-import { reconcileLocalIndex } from './local-index-reconcile.js';
+import { filterDeletedLocalDocuments, reconcileLocalIndex } from './local-index-reconcile.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { LocalMapStore } from './local-map-store.js';
@@ -159,12 +159,12 @@ export class SnapshotService {
     }
 
     reconcileLocalIndex(this.localMapStore, kbRoot);
-    const documents = this.localMapStore.getAllDocuments();
+    const documents = filterDeletedLocalDocuments(this.localMapStore, kbRoot, this.localMapStore.getAllDocuments());
     const nodes = documents.map((d) => this.projectDocument(d));
     const customFolderPrefixes = this.collectCustomFolderPrefixes();
     const orphanFiles = this.scanOrphanFiles(
       kbRoot,
-      new Set(documents.map((d) => d.localMdPath)),
+      new Set([...documents.map((d) => d.localMdPath), ...(this.localMapStore.listLocalSourceDeletions?.(kbRoot) ?? []).flatMap((d) => d.localRelPath ? [d.localRelPath] : [])]),
       customFolderPrefixes,
     );
     const topLevelDirs = this.aggregateTopLevelDirs(nodes, kbRoot);
@@ -216,7 +216,7 @@ export class SnapshotService {
 
     const previous = this.readExisting(kbRoot);
     reconcileLocalIndex(this.localMapStore, kbRoot);
-    const documents = this.localMapStore.getAllDocuments();
+    const documents = filterDeletedLocalDocuments(this.localMapStore, kbRoot, this.localMapStore.getAllDocuments());
     const nodes = documents.map((d) => this.projectDocument(d));
     const watchedRoots = this.buildWatchedRoots();
     const mountedDirs = previous?.mounted_dirs ?? this.scanMountedDirs(kbRoot, watchedRoots);

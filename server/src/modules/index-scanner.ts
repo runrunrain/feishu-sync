@@ -195,10 +195,15 @@ export class IndexScanner {
 
     console.info(`[IndexScanner] Found ${mdFiles.length} markdown files`);
 
+    const knowledgeRoot = this.config?.knowledgeBaseRoot || rootDir;
+    const deletions: Array<{ objToken: string; localRelPath: string | null; originalLink: string | null }> =
+      typeof this.localMapStore.listLocalSourceDeletions === 'function' ? this.localMapStore.listLocalSourceDeletions(knowledgeRoot) : [];
+    const deletedTokens = new Set(deletions.map((item) => item.objToken));
+
     // Process each .md file
     for (const mdPath of mdFiles) {
       try {
-        const indexed = await this.indexFile(mdPath);
+        const indexed = await this.indexFile(mdPath, knowledgeRoot, deletedTokens, deletions);
         if (indexed) {
           result.indexed++;
         } else {
@@ -360,7 +365,7 @@ export class IndexScanner {
    * Index a single markdown file.
    * Returns true if indexed, false if skipped (no valid header).
    */
-  private async indexFile(mdPath: string): Promise<boolean> {
+  private async indexFile(mdPath: string, root: string, deletedTokens: Set<string>, deletions: Array<{ localRelPath: string | null; originalLink: string | null }>): Promise<boolean> {
     const content = fs.readFileSync(mdPath, 'utf-8');
 
     const header = this.parseMetadata(content);
@@ -372,6 +377,13 @@ export class IndexScanner {
 
     let objToken = header.obj_token;
     let objType = header.obj_type ?? 'docx';
+
+    if (objToken && deletedTokens.has(objToken)) return false;
+    // 没有 token 的旧格式先按路径和原始链接识别，避免对已删除文档发起解析。
+    const rel = toPortableRelative(root, mdPath);
+    const pathKey = (value: string) => process.platform === 'win32' ? value.toLowerCase() : value;
+    if (!objToken && rel && deletions.some((item) => item.localRelPath && pathKey(item.localRelPath) === pathKey(rel)
+      && item.originalLink === header.original_link)) return false;
 
     // If obj_token is missing but original link exists, try to resolve
     if (!objToken && header.original_link) {
@@ -396,6 +408,7 @@ export class IndexScanner {
       // Still no obj_token, skip
       return false;
     }
+    if (deletedTokens.has(objToken)) return false;
 
     // Upsert to SQLite
     // v0.2.0 cloud-link-coverage: persist original_link extracted from the

@@ -472,6 +472,7 @@ export interface SheetSheetRecord {
 }
 
 export interface ChangedDocument {
+  localDeleted?: boolean;
   xlsxMissing?: boolean;
   objToken: string;
   objType: 'docx' | 'sheet' | 'slides' | 'bitable' | 'unknown';

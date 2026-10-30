@@ -15,6 +15,32 @@
   padding: 24px clamp(18px, 3vw, 32px) 64px;
 }
 
+/* 对话气泡使用与原文预览相同的渲染，但不叠加整页阅读边距。 */
+.agent-markdown .markdown-preview {
+  max-width: none;
+  padding: 0;
+  font-size: 14px;
+}
+
+.agent-markdown-streaming .markdown-body > :last-child::after {
+  content: '';
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  margin-left: 0.18em;
+  vertical-align: -0.12em;
+  background: var(--seal);
+  animation: agent-markdown-caret 1.4s ease-in-out infinite;
+}
+
+@keyframes agent-markdown-caret {
+  50% { opacity: 0.35; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agent-markdown-streaming .markdown-body > :last-child::after { animation: none; }
+}
+
 /* 同步引用里的正文不应再次套用页面边距。 */
 .markdown-body .markdown-body {
   max-width: none;

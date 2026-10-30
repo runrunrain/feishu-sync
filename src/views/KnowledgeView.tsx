@@ -401,6 +401,10 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
             <Loader2 className="w-3 h-3 animate-spin" /> 更新中
           </button> : pendingTotal > 0 ? <button type="button" onClick={() => openBuild('pending')} className="shrink-0 text-xs text-seal">{pendingTotal} 处待更新</button> : null}
         </header>
+        {doc?.sources.some((source) => source.state === 'deleted') ? <div role="status" className="shrink-0 px-5 py-2 border-b border-seal-2/20 bg-seal-2/5 text-xs text-seal-2 flex flex-wrap items-center gap-2">
+          <span>本文引用的原始文档已删除，当前内容可能过时。</span>
+          <button type="button" className="underline" onClick={() => openBuild('pending')}>查看差异并更新构建</button>
+        </div> : null}
         {statusError && !kbStatus ? <EmptyCard icon={<AlertCircle className="w-8 h-8 text-seal-2" />} title="标准库服务不可用"
           description={statusError} action={<Button size="sm" variant="secondary" onClick={() => { setStatusLoading(true); void loadStatus(); }}>重试</Button>} />
           : treeLoading && !tree || statusLoading ? <div className="flex-1 p-8 animate-pulse space-y-4" aria-busy="true">

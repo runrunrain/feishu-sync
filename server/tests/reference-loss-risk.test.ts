@@ -19,12 +19,13 @@ import type { DocumentRecord } from '../src/types/index.js';
 import type { SourceReferenceInsert } from '../src/modules/local-map-store.js';
 
 const tmpDirs: string[] = [];
-afterEach(() => { for (const dir of tmpDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
+const stores: LocalMapStore[] = [];
+afterEach(() => { for (const store of stores.splice(0)) store.close(); for (const dir of tmpDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
 
 async function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'p1s4-risk-')); tmpDirs.push(root);
   const raw = path.join(root, 'raw'); fs.mkdirSync(raw, { recursive: true });
-  const store = new LocalMapStore(path.join(root, 'db.sqlite')); store.initialize();
+  const store = new LocalMapStore(path.join(root, 'db.sqlite')); stores.push(store); store.initialize();
   const config = new ConfigManager(path.join(root, 'config.json')); await config.load();
   await config.updateConfig({ knowledgeBaseRoot: raw, standardKb: { outputRoot: path.join(root, 'standard') } } as never);
   const docs: DocumentRecord[] = (['a', 'b', 'c'] as const).map((token) => ({

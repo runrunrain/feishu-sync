@@ -8,6 +8,7 @@
 import { SnapshotService } from '../modules/snapshot-service.js';
 import { cleanupSources } from '../kb/source-cleanup.js';
 import { createLocalPathInspector } from '../modules/local-path-state.js';
+import { filterDeletedLocalDocuments } from '../modules/local-index-reconcile.js';
 import type { KbSourceChoice } from '../types/kb-version.js';
 import { buildSourceTree } from '../kb/source-tree.js';
 import { Hono } from 'hono';
@@ -16,7 +17,6 @@ import type { Context } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import type { KbBuildService } from '../kb/kb-build-service.js';
 import { StandardKbStore, KbNotPublishedError } from '../kb/standard-kb-store.js';
 import { QueryError } from '../kb/search/kb-query-service.js';
@@ -30,7 +30,8 @@ import { ToolError } from '../agent/agent-tool-service.js';
 import type { LocalMapStore } from '../modules/local-map-store.js';
 import type { ConfigManager } from '../modules/config-manager.js';
 import { resolveDataRoot } from '../modules/data-root.js';
-import type { KbDocDto, KbMcpInfoDto, KbSourceState, KbStatusDto } from '../types/agent-knowledge.js';
+import { kbMcpInfo } from '../kb/mcp-info.js';
+import type { KbDocDto, KbSourceState, KbStatusDto } from '../types/agent-knowledge.js';
 
 export interface KbRouteDeps {
   buildService: KbBuildService;
@@ -155,7 +156,7 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
 
   const sourceDocuments = (root: string) => {
     const excluded = new Set(localMapStore.listKbExcludedSources(root));
-    return deps.documentsProvider().filter((doc) => !excluded.has(doc.objToken));
+    return filterDeletedLocalDocuments(localMapStore, root, deps.documentsProvider()).filter((doc) => !excluded.has(doc.objToken));
   };
 
   // ------------------------------------------------------------------
@@ -228,11 +229,13 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
       );
       const currentByToken = new Map(scan.entries.map((entry) => [entry.objToken, entry.contentHash]));
       const excluded = new Set(localMapStore.listKbExcludedSources(config.knowledgeBaseRoot));
+      const deleted = new Set(localMapStore.listLocalSourceDeletions?.(config.knowledgeBaseRoot).map((item) => item.objToken) ?? []);
       const sources = doc.sources.map((objToken) => {
         const snapshotEntry = manifest.sourceSnapshot.find((candidate) => candidate.objToken === objToken);
         const currentHash = currentByToken.get(objToken);
         let state: KbSourceState = 'current';
-        if (excluded.has(objToken)) state = 'excluded';
+        if (deleted.has(objToken)) state = 'deleted';
+        else if (excluded.has(objToken)) state = 'excluded';
         else if (currentHash === undefined) state = 'missing';
         else if (snapshotEntry && snapshotEntry.contentHash !== currentHash) state = 'changed';
         return {
@@ -283,7 +286,7 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
       const { store, config } = await loadStore();
       const excluded = new Set(localMapStore.listKbExcludedSources(config.knowledgeBaseRoot));
       const manifest = store.readManifest();
-      const documents = deps.documentsProvider();
+      const documents = filterDeletedLocalDocuments(localMapStore, config.knowledgeBaseRoot, deps.documentsProvider());
       const scan = RawSourceSnapshot.scan(config.knowledgeBaseRoot, documents.filter((doc) => !excluded.has(doc.objToken)), deps.sheetCsvPaths);
       const current = new Map(scan.entries.map((entry) => [entry.objToken, entry]));
       const base = new Map((manifest?.sourceSnapshot ?? []).map((entry) => [entry.objToken, entry]));
@@ -500,45 +503,10 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
 
   routes.get('/api/kb/mcp', async (c) => {
     const config = await configManager.load();
-    const mcpScript = path.join(serverDistRoot(), 'mcp', 'kb-mcp.cjs');
-    const available = fs.existsSync(mcpScript);
-    const kbRoot = config.standardKb.outputRoot;
-
-    // 推荐配置：应用自带 Electron 可执行（ELECTRON_RUN_AS_NODE=1）；
-    // standalone/开发模式（node 直跑）用当前 Node。
-    const isElectron = Boolean(process.versions.electron);
-    const primaryCommand = isElectron ? process.execPath : process.execPath;
-    const primaryEnv: Record<string, string> = isElectron ? { ELECTRON_RUN_AS_NODE: '1' } : {};
-
-    const dto: KbMcpInfoDto = {
-      available,
-      command: primaryCommand,
-      args: [mcpScript, '--kb-root', kbRoot],
-      env: primaryEnv,
-      alternative: {
-        command: 'node',
-        args: [mcpScript, '--kb-root', kbRoot],
-        note: '外部 Node ≥20 亦可运行（kb-mcp.cjs 无原生依赖、不打开 SQLite）',
-      },
-      snippet: JSON.stringify({
-        mcpServers: {
-          'feishu-kb': {
-            command: primaryCommand,
-            args: [mcpScript, '--kb-root', kbRoot],
-            ...(Object.keys(primaryEnv).length > 0 ? { env: primaryEnv } : {}),
-          },
-        },
-      }, null, 2),
-    };
-    return c.json(dto);
+    return c.json(kbMcpInfo(config.standardKb.outputRoot));
   });
 
   return routes;
-}
-
-function serverDistRoot(): string {
-  // 本文件编译后位于 dist/routes/kb.js；dist 根即上溯一级
-  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 }
 
 function buildServiceDepsOutputRoot(deps: KbRouteDeps): string {

@@ -20,6 +20,7 @@ const STATE_BADGE: Record<string, string> = {
   current: 'bg-jade/10 text-jade border-jade/20',
   changed: 'bg-[rgba(180,83,9,0.10)] text-[#92580c] border-[rgba(180,83,9,0.35)]',
   missing: 'bg-seal-2/10 text-seal-2 border-seal-2/20',
+  deleted: 'bg-seal-2/10 text-seal-2 border-seal-2/20',
   excluded: 'bg-paper-2 text-ink-faint border-line',
 };
 
@@ -42,6 +43,7 @@ export function KbSourcePanel({ docTitle, sources, onOpenSource }: KbSourcePanel
             key={s.objToken}
             type="button"
             onClick={() => onOpenSource(s)}
+            disabled={s.state === 'deleted'}
             className="w-full text-left px-3 py-2 rounded-md border border-line/70 bg-card-bg hover:border-jade/40 hover:shadow-sm transition-all group"
             title={`打开原始文档：${s.relPath}`}
           >
@@ -60,7 +62,7 @@ export function KbSourcePanel({ docTitle, sources, onOpenSource }: KbSourcePanel
             </div>
             <div className="mt-1 flex items-center gap-1 text-[11px] text-ink-faint text-jade">
               <FileSearch className="w-3 h-3" />
-              查看原始内容
+              {s.state === 'deleted' ? '原始文档已删除' : '查看原始内容'}
             </div>
           </button>
         ))}

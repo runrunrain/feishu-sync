@@ -8,6 +8,8 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { writeSearchRelease } from './helpers/kb-search-fixture.js';
 import { KB_MCP_INSTRUCTIONS } from '../src/mcp/kb-mcp-tools.js';
+import { McpClientInstaller } from '../src/kb/mcp-client-installer.js';
+import { kbMcpInfo } from '../src/kb/mcp-info.js';
 
 const serverRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const script = path.join(serverRoot, 'dist/mcp/kb-mcp.cjs');
@@ -37,6 +39,23 @@ async function json(name: string, args: Record<string, unknown> = {}, cap = 2000
 async function error(name: string, args: Record<string, unknown>, code: string) { const value = await json(name, args); expect(value.response.isError).toBe(true); expect(value.data.error.code).toBe(code); return value.data.error; }
 
 describe('seven read-only MCP tools', () => {
+  it('connects to the actual MCP using the entry installed into a synthetic .agents config', async () => {
+    publish();
+    const home = path.join(root, 'client-home'); fs.mkdirSync(home);
+    const installer = new McpClientInstaller({ homeDir: home, dataRoot: root, info: () => kbMcpInfo(root) });
+    expect(installer.install('agents').state).toBe('installed');
+    const entry = JSON.parse(fs.readFileSync(path.join(home, '.agents', '.mcp.json'), 'utf8')).mcpServers['feishu-kb'];
+    const installedClient = new Client({ name: 'installed-config-test', version: '1' });
+    try {
+      await installedClient.connect(new StdioClientTransport({ command: entry.command, args: entry.args,
+        env: { ...process.env, ...entry.env, FEISHU_SYNC_HOME: root } as Record<string, string> }));
+      expect((await installedClient.listTools()).tools.map((tool) => tool.name)).toContain('search_knowledge');
+      const response = await installedClient.callTool({ name: 'get_release_info', arguments: {} });
+      expect(response.isError).not.toBe(true);
+      expect(JSON.stringify(response.content)).toContain('r1');
+    } finally { await installedClient.close(); }
+  });
+
   it('advertises exact tools, annotations, standalone instructions and compact descriptions', async () => {
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual(['get_knowledge', 'get_knowledge_bundle', 'get_outline', 'get_release_info', 'grep_knowledge', 'list_knowledge', 'search_knowledge']);

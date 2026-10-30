@@ -31,7 +31,7 @@ export function deleteSourceNode(store: LocalMapStore, config: Config, doc: Docu
   if ((options.block || options.deleteFiles && (doc.localRelPath || doc.localMdPath)) && !config.knowledgeBaseRoot) throw new ToolError('knowledge_base_root_not_configured', '请先配置本地知识库目录', 400);
   const root = pendingRootForDeletedDoc(doc, store.getAllDocuments(), config);
   const blocked = options.block || store.isSyncBlocked(config.knowledgeBaseRoot, doc.objToken);
-  const commit = () => store.clearLocalDocument(doc.objToken, { pending: Boolean(root), blockRoot: blocked ? config.knowledgeBaseRoot : undefined, watchedRootId: root?.id, watchedRootUrl: root?.url });
+  const commit = () => store.clearLocalDocument(doc.objToken, { pending: Boolean(root), blockRoot: blocked ? config.knowledgeBaseRoot : undefined, deletedRoot: config.knowledgeBaseRoot || undefined, watchedRootId: root?.id, watchedRootUrl: root?.url });
   let cleanup: ReturnType<typeof cleanupSources> | undefined;
   if (options.deleteFiles && (doc.localRelPath || doc.localMdPath)) {
     cleanup = cleanupSources(store, config.knowledgeBaseRoot, [{ objToken: doc.objToken, relPath: doc.localRelPath || doc.localMdPath }], { allowMissing: true, commit });

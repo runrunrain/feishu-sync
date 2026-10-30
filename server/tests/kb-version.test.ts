@@ -11,6 +11,7 @@ import { KbBuildService } from '../src/kb/kb-build-service.js';
 import { StandardKbStore } from '../src/kb/standard-kb-store.js';
 import { KbVersionStore } from '../src/kb/kb-version-store.js';
 import { projectKnowledgeDocuments, recoveredSourceCsvPaths } from '../src/kb/local-source-projection.js';
+import { filterDeletedLocalDocuments } from '../src/modules/local-index-reconcile.js';
 import { planSourceBatch, executeSourceBatch } from '../src/modules/source-batch.js';
 import { lineDiff } from '../src/kb/line-diff.js';
 import { hasEditorialHistory, hasSourceMetadata } from '../src/kb/body-policy.js';
@@ -42,7 +43,7 @@ async function fixture() {
   fs.writeFileSync(path.join(raw, 'a.md'), '规则A：怒气消耗10。\n' + '怒气不足时不能释放技能，规则按当前配置生效。\n'.repeat(8));
   fs.writeFileSync(path.join(raw, 'b.md'), '规则B：速度高者先手。\n' + '双方各行动一次，以速度决定行动顺序。\n'.repeat(8));
   for (const doc of documents) store.upsertDocument(doc);
-  const documentsProvider = () => projectKnowledgeDocuments(raw, documents);
+  const documentsProvider = () => projectKnowledgeDocuments(raw, filterDeletedLocalDocuments(store, raw, documents));
   const sheetCsvPaths = (token: string) => recoveredSourceCsvPaths(raw, documentsProvider().find((doc) => doc.objToken === token), []);
   const tools = new AgentToolService({ dataRoot: root, documentsProvider, sheetCsvPaths });
   const resolver = new PiRuntimeResolver();
@@ -93,7 +94,7 @@ async function fixture() {
     }, { timeout: 5000, interval: 10 });
     return result;
   }
-  return { root, raw, store, call, build, prompts, configManager, documents, service,
+  return { root, raw, store, call, build, prompts, configManager, documents, service, tools,
     setGenerated: (value: { markdown?: string; summary?: string }) => { generated = value; }, setSkip: (value: boolean) => { skipWrites = value; },
     setEditorial: (value: boolean) => { editorial = value; }, setBeforeFinish: (fn: () => void) => { beforeFinish = fn; },
     published: () => new StandardKbStore(configManager.getConfig()!.standardKb.outputRoot),
@@ -440,4 +441,26 @@ it('批量删除预览列出具体受影响标准文档，执行后通过按变�
   executeSourceBatch(f.store, config, request, plan.preview.revision);
   expect((await f.build()).status).toBe('published'); const manifest = f.published().readManifest()!;
   expect(f.published().readReleaseDoc(manifest.releaseId, manifest.docs[0]).markdown).not.toContain('规则B');
+});
+
+it('保留文件的删除不会参与原始检索和后续构建，已发布文档标记受影响并可更新', async () => {
+  const f = await fixture();
+  expect((await f.build('full')).status).toBe('published');
+  const original = f.published().readManifest()!;
+  const request = { root: f.raw, tokens: ['b'], action: 'delete' as const, includeDescendants: false, deleteFiles: false, block: false };
+  executeSourceBatch(f.store, f.configManager.getConfig()!, request, planSourceBatch(f.store, f.configManager.getConfig()!, request).preview.revision);
+  expect(fs.existsSync(path.join(f.raw, 'b.md'))).toBe(true);
+  expect((await f.call('/api/kb/sources')).data.sources.map((s: any) => s.objToken)).toEqual(['a']);
+  expect((await f.call(`/api/kb/docs/${original.docs[0].docId}`)).data.sources.find((s: any) => s.objToken === 'b').state).toBe('deleted');
+  const pending = (await f.call('/api/kb/changes')).data;
+  expect(pending.sources).toEqual(expect.arrayContaining([expect.objectContaining({ key: 'b', kind: 'removed' })]));
+  expect(pending.affectedDocs).toEqual(expect.arrayContaining([expect.objectContaining({ docId: original.docs[0].docId })]));
+  const context = f.tools.createRunContext({ runKind: 'discuss', outputRoot: f.configManager.getConfig()!.standardKb.outputRoot, knowledgeBaseRoot: f.raw });
+  await expect(f.tools.executeTool(context.token, 'raw_read', { objToken: 'b' })).rejects.toMatchObject({ code: 'not_found' });
+  const search = await f.tools.executeTool(context.token, 'raw_search', { query: '规则B' });
+  expect(JSON.stringify(search)).not.toContain('速度高者先手');
+  expect((await f.build()).status).toBe('published');
+  const updated = f.published().readManifest()!;
+  expect(updated.sourceSnapshot.map((source) => source.objToken)).toEqual(['a']);
+  expect(f.published().readReleaseDoc(updated.releaseId, updated.docs[0]).markdown).not.toContain('规则B');
 });

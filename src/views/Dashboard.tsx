@@ -245,7 +245,10 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
     try {
       const result = await manualDeleteDoc(deleteTarget.objToken, { deleteFiles, block: blockDeleted });
       toast.push({ type: 'success', message: result.blocked ? `已删除并屏蔽「${deleteTarget.title}」` : result.pending_sync ? `「${deleteTarget.title}」已转为待同步` : `已删除「${deleteTarget.title}」`, hint: result.trash_dir ? `本地文件已回收至 ${result.trash_dir}` : undefined });
-      setSelectedToken((prev) => prev === deleteTarget.objToken ? null : prev); setDeleteTarget(null); await loadFeishu();
+      setSelectedToken((prev) => prev === deleteTarget.objToken ? null : prev);
+      setRecentSelection((prev) => prev?.objToken === deleteTarget.objToken ? null : prev);
+      setDeleteTarget(null);
+      await Promise.all([loadFeishu(), loadCustomFolders(), loadDiffAndSnapshot()]);
     } catch (err) { setDeleteError(err instanceof Error ? err.message : '删除失败'); }
     finally { setDeleting(false); }
   };
@@ -324,6 +327,7 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
         try {
           const diff: DiffReport = await getStoredMappingDiff(url);
           for (const doc of [...diff.added, ...diff.modified, ...diff.deleted]) {
+            if (doc.localDeleted) continue;
             const key = doc.objToken ?? `${doc.title}:${doc.localMdPath ?? ''}`;
             if (seen.has(key)) continue;
             seen.add(key);
@@ -361,9 +365,10 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
   useEffect(() => {
     return onDiffChanged(() => {
       void loadFeishu();
+      void loadCustomFolders();
       void loadDiffAndSnapshot();
     });
-  }, [loadFeishu, loadDiffAndSnapshot]);
+  }, [loadFeishu, loadCustomFolders, loadDiffAndSnapshot]);
 
   // The active node list (feishu view only).
   const activeNodes: MappingNode[] = useMemo(() => {
@@ -489,7 +494,8 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
       {batchTarget ? <SourceBatchDialog root={config?.knowledgeBaseRoot ?? ''} tokens={batchTarget.tokens} action={batchTarget.action} onClose={() => setBatchTarget(null)} onComplete={(count, processedTokens) => {
         toast.push({ type: 'success', message: `已${batchTarget.action === 'block' ? '屏蔽' : '处理'} ${count} 篇文档` });
         setSelectedToken((old) => old && processedTokens.includes(old) ? null : old);
-        setBatchTarget(null); setSelectionVersion((version) => version + 1); void loadFeishu(); void loadCustomFolders();
+        setRecentSelection((old) => old && processedTokens.includes(old.objToken) ? null : old);
+        setBatchTarget(null); setSelectionVersion((version) => version + 1); void loadFeishu(); void loadCustomFolders(); void loadDiffAndSnapshot();
       }} /> : null}
       <Modal open={deleteTarget !== null} title={`删除文档「${deleteTarget?.title ?? ''}」`} onClose={() => { if (!deleting) setDeleteTarget(null); }} contentClassName="max-w-xl">
         <p className="text-sm text-ink-soft leading-relaxed mb-4">删除当前文档的本地版本，子文档继续保留。所属上级仍受有效同步根管理时，当前文档会立即转为待同步。</p>
@@ -500,7 +506,7 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
           </div>
         ) : null}
         <label className="flex items-start gap-2 text-sm text-ink mb-3"><input type="checkbox" aria-label="同时删除本地源文件" checked={deleteFiles} disabled={deleting} onChange={(e) => setDeleteFiles(e.target.checked)} />同时删除本地源文件（移入可恢复的回收目录）</label>
-        {!deleteFiles ? <p className="text-xs text-ink-faint mb-3">保留磁盘文件，只清除索引基线；重建索引后文件可再次出现。</p> : null}
+        {!deleteFiles ? <p className="text-xs text-ink-faint mb-3">保留磁盘文件，但不再加入索引或构建；重新同步或添加后可恢复。</p> : null}
         <label className="flex items-start gap-2 text-sm text-ink mb-2"><input type="checkbox" aria-label="移入屏蔽名单" checked={blockDeleted} disabled={deleting} onChange={(e) => setBlockDeleted(e.target.checked)} />移入屏蔽名单</label>
         <p className="text-xs text-ink-faint mb-4">屏蔽后不会再进入待同步列表，可在「设置 → 知识库与同步 → 同步屏蔽名单」中多选移出。</p>
         {deleteError ? <p role="alert" className="text-sm text-seal-2 mb-3">{deleteError}</p> : null}

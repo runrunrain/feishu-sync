@@ -52,6 +52,7 @@ import { AgentPluginsCard } from '../components/agent/AgentPluginsCard';
 import { AgentRuntimeSettingsCard, AgentKbSettingsCard } from '../components/agent/AgentSettingsCard';
 import { CliAccessSettingsCard } from '../components/CliAccessSettingsCard';
 import { KbLanMcpSettingsCard } from '../components/KbLanMcpSettingsCard';
+import { KbMcpLocalSettingsCard } from '../components/KbMcpLocalSettingsCard';
 import { FeishuWriteSettingsCard } from '../components/FeishuWriteSettingsCard';
 import { FeishuPublishSettingsCard } from '../components/FeishuPublishSettingsCard';
 
@@ -173,16 +174,16 @@ const SETTINGS_TABS: SettingsTabMeta[] = [
       {
         id: 'agent-kb',
         label: '标准库与 Workspace',
-        description: '输出目录、Work 授权目录与 MCP 连接片段',
+        description: '输出目录、构建参数与 Work 授权目录',
         icon: Server,
         render: () => <AgentKbSettingsCard />,
       },
       {
         id: 'agent-kb-lan',
         label: '知识库共享',
-        description: '可信内网只读 MCP：地址、令牌、客户端配置与访问审计',
+        description: '本机 MCP 安装与内网知识库共享',
         icon: Network,
-        render: () => <KbLanMcpSettingsCard />,
+        render: () => <div className="space-y-3"><KbMcpLocalSettingsCard /><KbLanMcpSettingsCard /></div>,
         unmountOnLeave: true,
       },
     ],

@@ -25,6 +25,7 @@ let statusFailure = false
 let auditFailure = false
 let delay = false
 let clipboardFailure = false
+const localInstalls = new Set<string>()
 const audit: KbLanMcpAuditEntry[] = []
 function record(event: string) {
   audit.unshift({ time: new Date().toISOString(), event, remote: '127.0.0.1', status: 'ok' })
@@ -70,6 +71,19 @@ window.fetch = async (input, init) => {
       llm: { enabled: false, providers: [], presets: [] },
       kbLanMcp: settings,
     })
+  if (path === '/api/kb/mcp')
+    return json({ available: true, command: '/synthetic/feishu-sync', args: ['kb-mcp.cjs'], env: {}, snippet: '{"mcpServers":{"feishu-kb":{"command":"/synthetic/feishu-sync"}}}', alternative: { command: 'node', args: [], note: '' } })
+  const localTargets = () => ['agents', 'claude'].map((target) => ({
+    target,
+    path: target === 'agents' ? '/home/demo/.agents/.mcp.json' : '/home/demo/.claude.json',
+    state: localInstalls.has(target) ? 'installed' : 'not_installed',
+  }))
+  if (path === '/api/kb-mcp-install/status') return json({ targets: localTargets() })
+  if (path === '/api/kb-mcp-install/install' || path === '/api/kb-mcp-install/remove') {
+    if (path.endsWith('/install')) localInstalls.add(body.target)
+    else localInstalls.delete(body.target)
+    return json(localTargets().find((item) => item.target === body.target))
+  }
   if (path.endsWith('/status') && path.includes('kb-lan-mcp'))
     return statusFailure ? json({ message: '模拟：服务暂时不可达' }, 503) : json(status())
   if (path.includes('/audit?'))

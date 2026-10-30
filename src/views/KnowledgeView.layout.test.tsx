@@ -6,6 +6,7 @@ import { expect, it, vi } from 'vitest';
 const state = vi.hoisted(() => ({
   included: new Set(['a']),
   hasCurrent: true,
+  deletedSource: false,
   listBuilds: vi.fn(),
   createBuild: vi.fn(),
   toast: { push: vi.fn(), dismiss: vi.fn(), toasts: [] },
@@ -34,7 +35,7 @@ vi.mock('../api/client', () => {
       { name: '第一篇', title: '第一篇', path: '分类/第一篇.md', type: 'doc', docId: 'first' },
       { name: '第二篇', title: '第二篇', path: '分类/第二篇.md', type: 'doc', docId: 'second' },
     ] }] }),
-    getKbDoc: async (id: string) => ({ docId: id, title: id === 'first' ? '第一篇' : '第二篇', path: `分类/${id}.md`, summary: '', tags: [], markdown: `${id} 正文`, releaseId: 'r1', sources: [] }),
+    getKbDoc: async (id: string) => ({ docId: id, title: id === 'first' ? '第一篇' : '第二篇', path: `分类/${id}.md`, summary: '', tags: [], markdown: `${id} 正文`, releaseId: 'r1', sources: state.deletedSource ? [{ objToken: 'a', title: '已删除来源', relPath: 'a.md', state: 'deleted' }] : [] }),
     listKbPublications: async () => ({ publications: [] }),
     getKbSourceTree: async () => ({ root: 'root', total: 2, nodes: [{ id: 'folder', title: '源目录', children: ['a', 'b'].map((id) => ({
       id, title: `来源 ${id.toUpperCase()}`, children: [], source: { objToken: id, title: `来源 ${id.toUpperCase()}`, relPath: `${id}.md`, included: state.included.has(id), pending: 'changed' },
@@ -160,4 +161,22 @@ it('首次构建入口打开源选择，进度入口按需加载最近的记录'
     expect(state.listBuilds).toHaveBeenCalledTimes(1);
     expect(container.querySelector('[aria-label="标准库构建进度"]')?.textContent).toContain('已发布');
   } finally { act(() => root.unmount()); container.remove(); state.hasCurrent = true; }
+});
+
+it('受删除源影响的标准文档在正文旁提示，并可直接打开差异更新', async () => {
+  state.hasCurrent = true; state.deletedSource = true;
+  const container = document.createElement('div'); document.body.append(container);
+  const root = createRoot(container);
+  const button = (text: string) => [...container.querySelectorAll('button')].find((item) => item.textContent?.trim() === text)!;
+  try {
+    await act(async () => root.render(<KnowledgeView />));
+    await act(async () => button('第二篇').click());
+    const reader = container.querySelector('[data-testid="kb-reader-panel"]')!;
+    expect(reader.textContent).toContain('原始文档已删除');
+    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="收起目录"]')!.click());
+    expect(reader.textContent).toContain('原始文档已删除');
+    await act(async () => button('查看差异并更新构建').click());
+    expect(button('待更新差异').getAttribute('aria-selected')).toBe('true');
+    expect(button('按这些变更更新')).toBeTruthy();
+  } finally { act(() => root.unmount()); container.remove(); state.deletedSource = false; }
 });

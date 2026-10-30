@@ -3,25 +3,20 @@
  *
  * 覆盖：运行时状态（node/pi 路径与版本、就绪码）+ 重新检测、路径覆盖、
  * 模型来源（app-llm 下拉选既有 provider/preset；pi-agent-dir 从pi有效
- * 配置探测的列表中选择）、thinking 档位、标准库输出目录、Workspace 增删、
- * MCP 连接片段（复制按钮，API §9.5）。
+ * 配置探测的列表中选择）、thinking 档位、标准库输出目录及 Workspace 增删。
  *
  * 秘密边界：本卡不展示/不持有任何 apiKey（provider key 由「模型与整理」
  * 卡管理）；agent.status DTO 本身无秘密字段。
  */
 
 import { useEffect, useMemo, useState } from 'react';
-import { writeClipboardText } from '../../utils/clipboard';
 import {
   Bot,
-  Check,
-  Copy,
   Database,
   FolderPlus,
   ImageIcon,
   Loader2,
   RefreshCw,
-  Server,
   ShieldCheck,
   Trash2,
 } from 'lucide-react';
@@ -37,7 +32,6 @@ import {
   updateAgentRuntime,
   deleteAgentWorkspace,
   getAgentVisionStatus,
-  getKbMcpInfo,
   listAgentWorkspaces,
   listConversationModels,
   testAgentVision,
@@ -51,7 +45,6 @@ import type {
   AgentVisionStatusDto,
   AgentVisionTestResult,
   AgentWorkspaceConfig,
-  KbMcpInfoDto,
   StandardKbConfig,
 } from '../../types/agent';
 
@@ -725,7 +718,7 @@ export function AgentRuntimeSettingsCard() {
 }
 
 // ---------------------------------------------------------------------------
-// 标准库目录 + Workspace + MCP
+// 标准库目录 + Workspace
 // ---------------------------------------------------------------------------
 
 export function AgentKbSettingsCard() {
@@ -743,10 +736,6 @@ export function AgentKbSettingsCard() {
   const [newName, setNewName] = useState('');
   const [newPath, setNewPath] = useState('');
   const [addBusy, setAddBusy] = useState(false);
-
-  const [mcp, setMcp] = useState<KbMcpInfoDto | null>(null);
-  const [mcpLoading, setMcpLoading] = useState(true);
-  const [copied, setCopied] = useState(false);
 
   useEffect(() => {
     setOutputRoot(config?.standardKb?.outputRoot ?? '');
@@ -769,10 +758,6 @@ export function AgentKbSettingsCard() {
   };
   useEffect(() => {
     void reloadWorkspaces();
-    getKbMcpInfo()
-      .then(setMcp)
-      .catch(() => setMcp(null))
-      .finally(() => setMcpLoading(false));
   }, []);
 
   const budgetFeedback = describeBuildBatchWordBudgetInput(budgetInput);
@@ -842,17 +827,6 @@ export function AgentKbSettingsCard() {
       toast.push({ type: 'info', message: `Workspace「${ws.name}」已移除` });
     } catch (err) {
       toast.push({ type: 'error', message: err instanceof APIError ? err.message : '移除失败' });
-    }
-  };
-
-  const copySnippet = async () => {
-    if (!mcp?.snippet) return;
-    try {
-      await writeClipboardText(mcp.snippet);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 2000);
-    } catch {
-      toast.push({ type: 'warning', message: '复制失败，请手动选择文本复制' });
     }
   };
 
@@ -997,43 +971,6 @@ export function AgentKbSettingsCard() {
         </div>
       </CardShell>
 
-      <CardShell
-        icon={<Server className="w-4 h-4" />}
-        title="标准库 MCP 连接"
-        description="把已发布的标准知识库以只读 MCP 提供给外部工具（IDE、其他 Agent）"
-      >
-        {mcpLoading ? (
-          <p className="flex items-center gap-2 text-xs text-ink-faint">
-            <Loader2 className="w-3.5 h-3.5 animate-spin" /> 读取连接信息…
-          </p>
-        ) : mcp ? (
-          <div className="space-y-3">
-            <div className="flex items-center gap-2">
-              {mcp.available ? (
-                <StatusBadge status="success">可用</StatusBadge>
-              ) : (
-                <StatusBadge status="neutral">未就绪</StatusBadge>
-              )}
-              <span className="min-w-0 flex-1 text-[11px] text-ink-faint font-mono truncate">{mcp.command} {mcp.args.join(' ')}</span>
-            </div>
-            <div className="relative">
-              <pre className="max-h-[180px] overflow-auto scrollbar-thin px-3 py-2.5 rounded-md border border-line bg-dark text-[11px] leading-relaxed text-paper font-mono whitespace-pre">
-                {mcp.snippet}
-              </pre>
-              <Button size="sm" variant="secondary" className="absolute right-2 top-2" onClick={copySnippet}>
-                {copied ? <Check className="w-3.5 h-3.5 text-jade" /> : <Copy className="w-3.5 h-3.5" />}
-                {copied ? '已复制' : '复制'}
-              </Button>
-            </div>
-            <p className="text-[11px] text-ink-faint leading-relaxed">
-              推荐使用应用自带 Electron 以 Node 模式启动（见片段）；备选：{mcp.alternative.command}（{mcp.alternative.note}）。
-              MCP 只读已发布内容，未发布时外部调用会得到明确错误。
-            </p>
-          </div>
-        ) : (
-          <p className="text-xs text-ink-faint">MCP 连接信息不可用（后端未实现或服务不可达）。</p>
-        )}
-      </CardShell>
     </div>
   );
 }

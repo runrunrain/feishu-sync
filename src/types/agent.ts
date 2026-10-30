@@ -180,7 +180,7 @@ export interface KbDocSourceRef {
   objToken: string;
   title: string;
   relPath: string;
-  state: 'current' | 'changed' | 'missing' | 'excluded';
+  state: 'current' | 'changed' | 'missing' | 'excluded' | 'deleted';
 }
 
 /** §9.2 GET /api/kb/docs/:docId */
