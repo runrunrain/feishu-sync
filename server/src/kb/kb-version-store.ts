@@ -6,7 +6,7 @@ import { StandardKbStore } from './standard-kb-store.js';
 import { RawSourceSnapshot } from './raw-source-snapshot.js';
 import { lineDiff } from './line-diff.js';
 import type { KbManifest } from '../types/agent-knowledge.js';
-import type { KbChangePreview, KbFileChange, KbVersionDto } from '../types/kb-version.js';
+import type { KbChangePreview, KbDocMerge, KbFileChange, KbVersionDto } from '../types/kb-version.js';
 
 export type SourceContents = Record<string, string>;
 export const validReleaseId = (id: string) => /^[A-Za-z0-9_-]{1,120}$/.test(id);
@@ -113,9 +113,16 @@ export class KbVersionStore {
     sourceContents: SourceContents,
     preview: KbChangePreview,
     summary: string,
+    docMerges: KbDocMerge[] = [],
   ): KbVersionDto {
     const oldDocs = new Map((base?.docs ?? []).map((doc) => [doc.path, doc]));
     const nextDocs = new Map(manifest.docs.map((doc) => [doc.path, doc]));
+    const merges = new Map<string, string[]>();
+    for (const merge of docMerges) {
+      if (merges.has(merge.path) || !oldDocs.has(merge.path) || nextDocs.has(merge.path) || !merge.mergedInto.length
+        || merge.mergedInto.some((target) => !nextDocs.has(target))) throw new Error('invalid_doc_merge: 合并声明须指向已移除的旧文档及本版存在的目标');
+      merges.set(merge.path, [...new Set(merge.mergedInto)]);
+    }
     const docChanges: KbFileChange[] = [];
     for (const key of [...new Set([...oldDocs.keys(), ...nextDocs.keys()])].sort()) {
       const old = oldDocs.get(key); const next = nextDocs.get(key);
@@ -126,6 +133,7 @@ export class KbVersionStore {
       docChanges.push({
         key, title: (next ?? old)!.title, path: (next ?? old)!.path,
         kind: !old ? 'added' : !next ? 'removed' : 'changed', beforeAvailable: true,
+        ...(merges.has(key) ? { mergedInto: merges.get(key)! } : {}),
         ...lineDiff(before, after),
       });
     }

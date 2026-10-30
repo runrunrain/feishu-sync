@@ -121,6 +121,8 @@ interface ComparisonOptions {
 export interface ChangeDetectorOptions {
   knowledgeBaseRoot?: string;
   knowledgeBaseRootProvider?: () => string;
+  watchedRootUrlsProvider?: () => string[];
+  onArchiveAdopted?: () => void;
   mediaGap?: {
     enabled?: boolean;
   };
@@ -320,6 +322,8 @@ export class ChangeDetector {
 
   private initialKnowledgeBaseRoot?: string;
   private knowledgeBaseRootProvider?: () => string;
+  private watchedRootUrlsProvider?: () => string[];
+  private onArchiveAdopted?: () => void;
   private get knowledgeBaseRoot(): string | undefined { return this.knowledgeBaseRootProvider?.() ?? this.initialKnowledgeBaseRoot; }
   private mediaGapEnabled: boolean;
   private hasLoggedMissingKbRoot = false;
@@ -331,6 +335,8 @@ export class ChangeDetector {
   ) {
     this.initialKnowledgeBaseRoot = options.knowledgeBaseRoot;
     this.knowledgeBaseRootProvider = options.knowledgeBaseRootProvider;
+    this.watchedRootUrlsProvider = options.watchedRootUrlsProvider;
+    this.onArchiveAdopted = options.onArchiveAdopted;
     this.mediaGapEnabled = options.mediaGap?.enabled ?? true;
   }
 
@@ -607,6 +613,7 @@ export class ChangeDetector {
       watchedRootId: rootToken,
       watchedRootUrl: rootUrl,
       observationStatus: 'available',
+      observedInWatchedTree: true,
     });
 
     // 3. Compare with local SQLite records (three-state)
@@ -937,6 +944,14 @@ export class ChangeDetector {
 
     const recordsByToken = new Map(tracked.map((record) => [record.objToken, record]));
     const observationsByToken = new Map(metadataObservations.map((node) => [node.objToken, node]));
+    const alternativeObservations: CloudNodeObservation[] = [];
+    const recordTopologyObservation = (observation: CloudNodeObservation) => {
+      const previous = observationsByToken.get(observation.objToken);
+      if (previous?.observedInWatchedTree && previous.wikiNodeToken !== observation.wikiNodeToken) {
+        alternativeObservations.push(previous);
+      }
+      observationsByToken.set(observation.objToken, observation);
+    };
     // A topology response proves identity and hierarchy, not content
     // freshness. If Drive failed, keep the content observation unavailable
     // rather than treating a cached timestamp as a successful cloud read.
@@ -959,9 +974,10 @@ export class ChangeDetector {
     // current direct children without an additional node-get request.
     const rootRecord = tracked.find((record) => record.wikiNodeToken === rootToken);
     if (rootRecord) {
-      observationsByToken.set(rootRecord.objToken, {
+      recordTopologyObservation({
         ...knownObservation(rootRecord),
         hasChild: raw.nodes.some((node) => node.parent_node_token === rootToken),
+        observedInWatchedTree: true,
       });
     }
 
@@ -969,7 +985,7 @@ export class ChangeDetector {
     for (const node of raw.nodes) {
       const record = recordsByToken.get(node.obj_token);
       if (record) {
-        observationsByToken.set(node.obj_token, {
+        recordTopologyObservation({
           ...knownObservation(record),
           wikiNodeToken: node.node_token,
           objType: this.normalizeObjType(node.obj_type),
@@ -978,13 +994,14 @@ export class ChangeDetector {
           spaceId: node.space_id ?? spaceId,
           parentNodeToken: node.parent_node_token ?? null,
           hasChild: node.has_child,
+          observedInWatchedTree: true,
         });
         continue;
       }
       const detail = await this.fetchNodeDetail(spaceId, node.node_token, rootUrl);
       const info = detail.node;
       const observedObjEditTime = info?.obj_edit_time ?? null;
-      observationsByToken.set(node.obj_token, {
+      recordTopologyObservation({
         wikiNodeToken: node.node_token,
         objToken: node.obj_token,
         objType: this.normalizeObjType(info?.obj_type ?? node.obj_type),
@@ -999,6 +1016,7 @@ export class ChangeDetector {
         observationStatus: info && observedObjEditTime != null
           ? 'available'
           : detail.observationStatus,
+        observedInWatchedTree: true,
       });
       addedCount += 1;
     }
@@ -1007,7 +1025,7 @@ export class ChangeDetector {
         `[ChangeDetector] Fast added-discovery found ${addedCount} new node(s) under ${rootUrl}`,
       );
     }
-    return [...observationsByToken.values()];
+    return [...observationsByToken.values(), ...alternativeObservations];
   }
 
   private rootTokenFromUrl(rootUrl: string): string {
@@ -1053,6 +1071,9 @@ export class ChangeDetector {
   ): Promise<TraversalResult> {
     const rawTraversal = await this.bfsCollectRawNodes(spaceId, rootToken);
     const enriched: CloudNodeObservation[] = [];
+    // 多个 Wiki 节点可能指向同一底层文档；同一次遍历内复用最新的内容
+    // 时间，不能因第二个节点命中 TTL 而退回数据库中旧的时间戳。
+    const observedObjectTimes = new Map<string, number>();
 
     for (const raw of rawTraversal.nodes) {
       const cached = this.localMapStore.getDocumentByObjToken(raw.obj_token);
@@ -1075,7 +1096,10 @@ export class ChangeDetector {
       const lastRefresh = this.lastObjEditTimeRefreshAt.get(raw.obj_token) ?? 0;
       const ttlExpired = now - lastRefresh > OBJ_EDIT_TIME_REFRESH_TTL_MS;
 
-      if (cached?.syncState === 'restricted' && !ttlExpired) {
+      const observedObjectTime = observedObjectTimes.get(raw.obj_token);
+      if (observedObjectTime !== undefined) {
+        objEditTime = observedObjectTime;
+      } else if (cached?.syncState === 'restricted' && !ttlExpired) {
         objEditTime = null;
         observationStatus = 'restricted';
       } else if (fingerprintUnchanged && cached?.objEditTime != null && !ttlExpired) {
@@ -1105,6 +1129,7 @@ export class ChangeDetector {
           observationStatus = detail.observationStatus;
         }
       }
+      if (observationStatus === 'available' && objEditTime != null) observedObjectTimes.set(raw.obj_token, objEditTime);
 
       enriched.push({
         wikiNodeToken: raw.node_token,
@@ -1119,6 +1144,7 @@ export class ChangeDetector {
         watchedRootId: rootToken,
         watchedRootUrl,
         observationStatus,
+        observedInWatchedTree: true,
       });
     }
 
@@ -1311,23 +1337,86 @@ export class ChangeDetector {
       rootToken,
       options.watchedRootUrl ?? null,
     );
+    const observedTreeNodes = new Map(observations.filter((node) => node.observedInWatchedTree).map((node) => [node.wikiNodeToken, node]));
+    const localDocuments = this.localMapStore.getAllDocuments() as DocumentRecord[];
+    const archivedTokens = new Set(localDocuments.filter((document) => document.customFolderId).map((document) => document.objToken));
+    const treeNodesByObject = new Map<string, Set<string>>();
+    for (const node of observations) {
+      if (!node.observedInWatchedTree || !node.wikiNodeToken) continue;
+      const tokens = treeNodesByObject.get(node.objToken) ?? new Set<string>();
+      tokens.add(node.wikiNodeToken);
+      treeNodesByObject.set(node.objToken, tokens);
+    }
+    const preferredNodes = new Map<string, string>();
+    for (const document of localDocuments) {
+      const originalWiki = document.customFolderId ? document.originalLink?.match(/\/wiki\/([A-Za-z0-9]+)/i)?.[1] : null;
+      const preferred = originalWiki || document.wikiNodeToken;
+      if (preferred && treeNodesByObject.get(document.objToken)?.has(preferred)) preferredNodes.set(document.objToken, preferred);
+    }
+    const hasObservedTreePath = (nodeToken: string): boolean => {
+      const visited = new Set<string>();
+      let token = nodeToken;
+      while (token !== rootToken) {
+        if (!token || visited.has(token)) return false;
+        visited.add(token);
+        const node = observedTreeNodes.get(token);
+        if (!node?.parentNodeToken) return false;
+        if (token !== nodeToken && this.localMapStore.getDocumentByObjToken(node.objToken)?.customFolderId) return false;
+        token = node.parentNodeToken;
+      }
+      return true;
+    };
+    const configuredRoot = !!options.watchedRootUrl && (this.watchedRootUrlsProvider?.().includes(options.watchedRootUrl) ?? false);
+    let adoptedAny = false;
+    const processedObjects = new Set<string>();
+    // 归档父子节点可能同时迁入；先接入父节点，避免子节点暂时挂到错误层级。
+    const orderedObservations = observations.some((node) => archivedTokens.has(node.objToken))
+      ? [...observations].sort((a, b) => (parentChains.get(a.wikiNodeToken)?.parentChainTitles.length ?? Number.MAX_SAFE_INTEGER)
+        - (parentChains.get(b.wikiNodeToken)?.parentChainTitles.length ?? Number.MAX_SAFE_INTEGER))
+      : observations;
 
     // Pass 1: cloud observation -> persistent state machine. This is the
     // only code path that updates observed time; it never writes the synced
     // baseline, so pending additions/modifications remain visible on every
     // subsequent poll until the P3 file/DB commit succeeds.
-    for (const observation of observations) {
+    for (const observation of orderedObservations) {
       seenObjTokens.add(observation.objToken);
       if (observation.wikiNodeToken) traversedNodeTokens.add(observation.wikiNodeToken);
       if (observation.parentNodeToken) traversedNodeTokens.add(observation.parentNodeToken);
 
       try {
+        // 同一底层文档可能同时存在多个 Wiki 引用。优先保留原节点，
+        // 避免遍历顺序让快捷方式抢走原节点的位置或重复产生变更。
+        const preferredNode = preferredNodes.get(observation.objToken);
+        if (processedObjects.has(observation.objToken) || (preferredNode && preferredNode !== observation.wikiNodeToken)) continue;
+        const current = this.localMapStore.getDocumentByObjToken(observation.objToken) as DocumentRecord | null;
+        let adoptCustomFolderId: string | undefined;
+        if (current?.customFolderId) {
+          const originalWiki = current.originalLink?.match(/\/wiki\/([A-Za-z0-9]+)/i)?.[1];
+          const expectedWiki = originalWiki || current.wikiNodeToken;
+          const hierarchy = parentChains.get(observation.wikiNodeToken);
+          const blocked = this.localMapStore.isSyncBlocked?.(this.knowledgeBaseRoot ?? '', current.objToken);
+          const deleted = current.pendingReason === 'local_deleted' || this.localMapStore.isLocalSourceDeleted?.(this.knowledgeBaseRoot ?? '', current.objToken);
+          // 只有本次真实树遍历和可验证父链才能转移归属；Drive 元数据、
+          // 权限错误或另一个 Wiki 节点引用同一文档都不能证明它已移动。
+          if (!observation.observedInWatchedTree || !configuredRoot || !hierarchy || !hasObservedTreePath(observation.wikiNodeToken)
+            || !observation.wikiNodeToken || blocked || deleted) continue;
+          if (expectedWiki && expectedWiki !== observation.wikiNodeToken) {
+            // 如果飞书移动后节点标识改变，仅在旧地址明确解析到新节点时
+            // 接管；同一底层文档的快捷方式不能作为移动证据。
+            const resolved = await this.fetchNodeDetail(observation.spaceId ?? '', expectedWiki, options.watchedRootUrl!);
+            if (resolved.node?.obj_token !== observation.objToken || resolved.node?.node_token !== observation.wikiNodeToken) continue;
+          }
+          adoptCustomFolderId = current.customFolderId;
+        }
         const record = this.localMapStore.recordCloudObservation({
           ...observation,
           watchedRootId: observation.watchedRootId || rootToken,
           watchedRootUrl: observation.watchedRootUrl ?? options.watchedRootUrl ?? null,
           lastSeenAt: now,
-        }) as DocumentRecord;
+        }, { adoptCustomFolderId }) as DocumentRecord;
+        processedObjects.add(observation.objToken);
+        if (adoptCustomFolderId && !record.customFolderId) adoptedAny = true;
 
         if (this.localMapStore.isSyncBlocked?.(this.knowledgeBaseRoot ?? '', record.objToken)) continue;
         if (record.syncState === 'pending_added') {
@@ -1358,6 +1447,11 @@ export class ChangeDetector {
           error,
         );
       }
+    }
+
+    if (adoptedAny) {
+      try { this.onArchiveAdopted?.(); }
+      catch (error) { console.warn('[ChangeDetector] Could not refresh the local snapshot after archive adoption:', error); }
     }
 
     // An incomplete traversal never enters the absence pass. The resulting

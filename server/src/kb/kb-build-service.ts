@@ -37,7 +37,9 @@ import { collectWhiteboardTextsForEntries, enrichEntriesWithMedia, resolveSource
 import type { ImageDescription } from '../agent/vision/vision-describer.js';
 import { VisionDescriber } from '../agent/vision/vision-describer.js';
 import { buildDefaultAgentVisionConfig } from '../types/agent-knowledge.js';
-import type { KbChangePreview, KbFileChange } from '../types/kb-version.js';
+import type { KbChangePreview, KbDocMerge, KbFileChange } from '../types/kb-version.js';
+import { sourceVersionWarning } from './search/query-metadata.js';
+import { selectKnowledgeSources } from './source-selection.js';
 import {
   toolsForRunKind,
   type AgentStatusDto,
@@ -63,6 +65,8 @@ export interface KbBuildDeps {
   documentsProvider: () => import('../types/index.js').DocumentRecord[];
   sheetCsvPaths: (objToken: string) => string[];
   excludedSourcesProvider?: () => string[];
+  /** 完整重建时未勾选的源；增量更新保留未被明确移除的已发布来源。 */
+  unselectedSourcesProvider?: () => string[];
   /** P1-S8（设计 P1 §4.1 防线 2）：已发布云文档 token 集（快照排除面）。 */
   publishedTokensProvider?: () => string[];
   internalBaseUrl: () => string;
@@ -136,9 +140,13 @@ export class KbBuildService extends EventEmitter {
   // 目录布局
   // ------------------------------------------------------------------
 
-  private sourceDocuments() {
-    const excluded = new Set(this.deps.excludedSourcesProvider?.() ?? []);
-    return this.deps.documentsProvider().filter((doc) => !excluded.has(doc.objToken));
+  private sourceDocuments(published: Iterable<string> = []) {
+    const excluded = this.deps.excludedSourcesProvider?.() ?? [];
+    return selectKnowledgeSources(this.deps.documentsProvider(), {
+      unselected: this.deps.unselectedSourcesProvider?.() ?? excluded,
+      excluded,
+      published,
+    });
   }
 
   private outputRoot(): string {
@@ -441,7 +449,11 @@ export class KbBuildService extends EventEmitter {
       this.emitLog(buildId, 'info', `preflight：运行时就绪，开始生成原始源快照`);
       cleanupOldStaging(outputRoot);
 
-      const documents = this.sourceDocuments();
+      const store = new StandardKbStore(outputRoot);
+      const basePointer: KbCurrentPointer | null = store.readCurrent();
+      const baseManifest: KbManifest | null = basePointer ? store.readManifest(basePointer.releaseId) : null;
+      const retainedSources = mode === 'incremental' ? baseManifest?.sourceSnapshot.map((source) => source.objToken) ?? [] : [];
+      const documents = this.sourceDocuments(retainedSources);
       // P1-S8（设计 P1 §4.1 防线 2）：发布产物不进构建快照——用户把已发布
       // 文档移进监听树时，同步会如实镜像，但构建必须排除（防自我喂养），
       // 并给构建警告 published_doc_in_sources。排除只作用于构建，不影响同步。
@@ -467,6 +479,10 @@ export class KbBuildService extends EventEmitter {
         sheetCsvPaths: this.deps.sheetCsvPaths,
       });
       this.emitLog(buildId, 'info', `快照完成：${snapshot.size} 个原始源（${snapshotResult.missingFiles.length} 个候选源文件缺失）`);
+      for (const source of snapshot.entries) {
+        const warning = sourceVersionWarning(source);
+        if (warning) this.emitLog(buildId, 'warn', `${warning.code}：${source.title}；本地路径 ${source.relPath}。${warning.message}`);
+      }
 
       // staging 准备
       stagingRootPath = this.stagingRoot(outputRoot, buildId);
@@ -477,14 +493,11 @@ export class KbBuildService extends EventEmitter {
         JSON.stringify(snapshot.entries, null, 2),
       );
 
-      const store = new StandardKbStore(outputRoot);
-      const basePointer: KbCurrentPointer | null = store.readCurrent();
-      const baseManifest: KbManifest | null = basePointer ? store.readManifest(basePointer.releaseId) : null;
       const versionStore = new KbVersionStore(outputRoot);
       const sourceContents = captureSourceContents(snapshot, config.knowledgeBaseRoot);
       const changePreview = sourceChangePreview(snapshot, sourceContents, baseManifest,
         versionStore.readSourceContents(baseManifest?.releaseId ?? null),
-        new Set(this.deps.excludedSourcesProvider?.() ?? []));
+        new Set([...(this.deps.excludedSourcesProvider?.() ?? []), ...(mode === 'full' ? this.deps.unselectedSourcesProvider?.() ?? [] : [])]));
       let effectiveMode = mode;
       if (mode === 'incremental' && !baseManifest) {
         effectiveMode = 'full';
@@ -572,6 +585,7 @@ export class KbBuildService extends EventEmitter {
         stagingRoot: stagingRootPath,
         finishInfo: null,
         writtenPaths: new Set(),
+        baseDocPaths: new Set(baseManifest?.docs.map((doc) => doc.path) ?? []),
       };
       // 局部引用：TS 收窄 + 后续批次/finish/校验统一用它（避免可空回读）
       const buildState: BuildRunState = entry.buildState;
@@ -817,7 +831,7 @@ export class KbBuildService extends EventEmitter {
       // 只复核本次快照中的源；构建期间新同步的文档留待下一次构建。
       // 快照创建和发布前必须使用同一条发布产物排除规则，避免把排除项误判为新增源。
       const currentPublishedTokens = new Set(this.deps.publishedTokensProvider?.() ?? []);
-      const currentDocuments = this.sourceDocuments().filter((doc) => !currentPublishedTokens.has(doc.objToken));
+      const currentDocuments = this.sourceDocuments(retainedSources).filter((doc) => !currentPublishedTokens.has(doc.objToken));
       const newSources = verifySnapshotIntact(snapshot, config.knowledgeBaseRoot, this.deps.sheetCsvPaths, currentDocuments);
       if (snapshot.size === 0 && newSources > 0) {
         throw new ToolError('source_changed_during_build', '构建开始时没有可用源文档；构建期间有新文档同步完成，请重新选择并构建。', 409);
@@ -2016,6 +2030,7 @@ export class KbBuildService extends EventEmitter {
     sourceContents?: SourceContents;
     changePreview?: KbChangePreview;
     summary?: string;
+    docMerges?: KbDocMerge[];
     /** 单测注入；缺省读 config */
     retainReleasesOverride?: number;
   }): Promise<KbManifest> {
@@ -2107,7 +2122,8 @@ export class KbBuildService extends EventEmitter {
     const sourceContents = input.sourceContents ?? {};
     versionStore.writeVersion(manifest, baseManifest, sourceContents,
       input.changePreview ?? sourceChangePreview(input.snapshot, sourceContents, baseManifest,
-        versionStore.readSourceContents(input.baseReleaseId)), input.summary ?? '');
+        versionStore.readSourceContents(input.baseReleaseId)), input.summary ?? '',
+      input.docMerges ?? this.active.get(input.buildId)?.buildState?.finishInfo?.docMerges ?? []);
 
     // CURRENT.json 原子发布：tmp → rename
     // 【F3-R10 指针提交点】rename 成功即发布完成；此后任何失败（清理、

@@ -431,18 +431,30 @@ export class IndexScanner {
     const localRelPath =
       kbRoot.length > 0 ? toPortableRelative(kbRoot, mdPath) : null;
 
+    const existing = this.localMapStore.getDocumentByObjToken?.(objToken) as DocumentRecord | null | undefined;
+    const observedTreeRecord = existing?.watchedRootId && existing.lastSeenAt ? existing : null;
+    if (observedTreeRecord && kbRoot && observedTreeRecord.localMdPath) {
+      const mapped = toPortableRelative(kbRoot, observedTreeRecord.localMdPath);
+      const samePath = mapped && localRelPath && (process.platform === 'win32'
+        ? mapped.toLowerCase() === localRelPath.toLowerCase() : mapped === localRelPath);
+      if (mapped && localRelPath && !samePath && fs.existsSync(path.resolve(kbRoot, mapped))) {
+        // 旧归档副本或重复文件不能抢走已经验证的本地映射。
+        return false;
+      }
+    }
+
     this.localMapStore.upsertDocument({
       objToken,
-      wikiNodeToken: header.wiki_node_token ?? null,
-      objType: objType as DocumentRecord['objType'],
-      title,
+      wikiNodeToken: observedTreeRecord?.wikiNodeToken ?? header.wiki_node_token ?? null,
+      objType: observedTreeRecord?.objType ?? objType as DocumentRecord['objType'],
+      title: observedTreeRecord?.title || title,
       localMdPath: mdPath,
       lastSyncedModifyTime:
         header.last_synced_modify_time || header.fetch_date || today,
       lastSyncedAt: new Date().toISOString(),
       status: 'synced',
-      originalLink: header.original_link ?? null,
-      spaceId: header.space_id ?? null,
+      originalLink: observedTreeRecord?.originalLink ?? header.original_link ?? null,
+      spaceId: observedTreeRecord?.spaceId ?? header.space_id ?? null,
       ...(localRelPath != null ? { localRelPath } : {}),
     });
 

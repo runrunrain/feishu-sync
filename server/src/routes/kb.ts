@@ -11,6 +11,7 @@ import { createLocalPathInspector } from '../modules/local-path-state.js';
 import { filterDeletedLocalDocuments } from '../modules/local-index-reconcile.js';
 import type { KbSourceChoice } from '../types/kb-version.js';
 import { buildSourceTree } from '../kb/source-tree.js';
+import { selectKnowledgeSources } from '../kb/source-selection.js';
 import { Hono } from 'hono';
 import { streamSSE } from 'hono/streaming';
 import type { Context } from 'hono';
@@ -154,9 +155,12 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
     return { store: queryStore, config };
   }
 
-  const sourceDocuments = (root: string) => {
-    const excluded = new Set(localMapStore.listKbExcludedSources(root));
-    return filterDeletedLocalDocuments(localMapStore, root, deps.documentsProvider()).filter((doc) => !excluded.has(doc.objToken));
+  const sourceDocuments = (root: string, published: Iterable<string> = []) => {
+    return selectKnowledgeSources(filterDeletedLocalDocuments(localMapStore, root, deps.documentsProvider()), {
+      unselected: localMapStore.listKbExcludedSources(root),
+      excluded: localMapStore.listKbExplicitlyExcludedSources(root),
+      published,
+    });
   };
 
   // ------------------------------------------------------------------
@@ -170,7 +174,7 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
       const manifest = store.readManifest();
       const scan = RawSourceSnapshot.scan(
         config.knowledgeBaseRoot,
-        sourceDocuments(config.knowledgeBaseRoot),
+        sourceDocuments(config.knowledgeBaseRoot, manifest?.sourceSnapshot.map((source) => source.objToken)),
         deps.sheetCsvPaths,
       );
       const { pending } = compareSources(manifest, scan.entries, deps.sheetCsvPaths, config.knowledgeBaseRoot);
@@ -224,11 +228,11 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
       const config = await configManager.load();
       const scan = RawSourceSnapshot.scan(
         config.knowledgeBaseRoot,
-        sourceDocuments(config.knowledgeBaseRoot),
+        sourceDocuments(config.knowledgeBaseRoot, manifest.sourceSnapshot.map((source) => source.objToken)),
         deps.sheetCsvPaths,
       );
       const currentByToken = new Map(scan.entries.map((entry) => [entry.objToken, entry.contentHash]));
-      const excluded = new Set(localMapStore.listKbExcludedSources(config.knowledgeBaseRoot));
+      const excluded = new Set(localMapStore.listKbExplicitlyExcludedSources(config.knowledgeBaseRoot));
       const deleted = new Set(localMapStore.listLocalSourceDeletions?.(config.knowledgeBaseRoot).map((item) => item.objToken) ?? []);
       const sources = doc.sources.map((objToken) => {
         const snapshotEntry = manifest.sourceSnapshot.find((candidate) => candidate.objToken === objToken);
@@ -284,10 +288,13 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
   // 源选择与版本入口独立于正文。标记只写应用元数据，不编辑原始文件。
   const sourceChoices = async () => {
       const { store, config } = await loadStore();
-      const excluded = new Set(localMapStore.listKbExcludedSources(config.knowledgeBaseRoot));
+      const unselected = new Set(localMapStore.listKbExcludedSources(config.knowledgeBaseRoot));
+      const excluded = new Set(localMapStore.listKbExplicitlyExcludedSources(config.knowledgeBaseRoot));
       const manifest = store.readManifest();
       const documents = filterDeletedLocalDocuments(localMapStore, config.knowledgeBaseRoot, deps.documentsProvider());
-      const scan = RawSourceSnapshot.scan(config.knowledgeBaseRoot, documents.filter((doc) => !excluded.has(doc.objToken)), deps.sheetCsvPaths);
+      const scan = RawSourceSnapshot.scan(config.knowledgeBaseRoot, selectKnowledgeSources(documents, {
+        unselected, excluded, published: manifest?.sourceSnapshot.map((source) => source.objToken),
+      }), deps.sheetCsvPaths);
       const current = new Map(scan.entries.map((entry) => [entry.objToken, entry]));
       const base = new Map((manifest?.sourceSnapshot ?? []).map((entry) => [entry.objToken, entry]));
       const candidates = new Map(collectSourceCandidates(documents).map((doc) => [doc.objToken, { title: doc.title, relPath: doc.localRelPath!, recovered: doc.recoveredLocalVersion === true }]));
@@ -298,9 +305,9 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
       const choices: KbSourceChoice[] = [...candidates].map(([objToken, doc]) => {
         const old = base.get(objToken); const next = current.get(objToken);
         const isExcluded = excluded.has(objToken);
-        const pending = isExcluded ? (old ? 'removed' : 'excluded') : !next ? (old ? 'removed' : 'unchanged')
+        const pending = isExcluded ? (old ? 'removed' : 'excluded') : !next ? (old ? 'removed' : 'excluded')
           : !old ? 'added' : next.contentHash !== old.contentHash || next.relPath !== old.relPath || next.title !== old.title ? 'changed' : 'unchanged';
-        return { objToken, title: doc.title || objToken, relPath: doc.relPath, included: !isExcluded, published: Boolean(old), pending, ...(doc.recovered ? { recovered: true } : {}),
+        return { objToken, title: doc.title || objToken, relPath: doc.relPath, included: !unselected.has(objToken), excluded: isExcluded, published: Boolean(old), pending, ...(doc.recovered ? { recovered: true } : {}),
           referencedBy: referencedCounts.get(objToken) ?? 0 };
       });
     return { choices, config, documents };
@@ -370,12 +377,12 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
     try {
       const { store, config } = await loadStore();
       const manifest = store.readManifest();
-      const scan = RawSourceSnapshot.scan(config.knowledgeBaseRoot, sourceDocuments(config.knowledgeBaseRoot), deps.sheetCsvPaths);
+      const scan = RawSourceSnapshot.scan(config.knowledgeBaseRoot, sourceDocuments(config.knowledgeBaseRoot, manifest?.sourceSnapshot.map((source) => source.objToken)), deps.sheetCsvPaths);
       const snapshot = RawSourceSnapshot.fromEntries(scan.entries, { sheetCsvPaths: deps.sheetCsvPaths });
       const contents = captureSourceContents(snapshot, config.knowledgeBaseRoot);
       const versions = new KbVersionStore(config.standardKb.outputRoot);
       const preview = sourceChangePreview(snapshot, contents, manifest, versions.readSourceContents(manifest?.releaseId ?? null),
-        new Set(localMapStore.listKbExcludedSources(config.knowledgeBaseRoot)));
+        new Set(localMapStore.listKbExplicitlyExcludedSources(config.knowledgeBaseRoot)));
       // S3（§3.6）：变更入口增图片维度——待处理源引用的图片数 / 未缓存数。
       // 按图片内容查找已有描述；未命中才计入 uncached。
       const images = await countPendingImages(config.knowledgeBaseRoot, snapshot, preview, buildService.visionCacheProbe());

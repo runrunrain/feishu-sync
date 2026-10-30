@@ -52,5 +52,5 @@ export function grepDocs(docs: KbIndexDoc[], opts: GrepOptions, timing: { now?: 
         ...(context ? { before: ctx(Math.max(0, i - context), i), after: ctx(i + 1, Math.min(doc.lines.length, i + 1 + context)) } : {}) } });
     }
   }
-  return { entries, complete: true, regexTruncatedLines };
+  return { entries, complete: regexTruncatedLines === 0, ...(regexTruncatedLines ? { partialReason: 'regex_line_limit' } : {}), regexTruncatedLines };
 }

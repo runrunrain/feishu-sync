@@ -108,6 +108,11 @@ const desktopApi: DesktopAPI = {
     manualCheck: async (): Promise<ChangeDetectionResult> => {
       return ipcRenderer.invoke('desktop:change-notification:manual-check');
     },
+    onChecked: (callback: () => void): (() => void) => {
+      const listener = () => callback();
+      ipcRenderer.on('desktop:change-notification:checked', listener);
+      return () => ipcRenderer.removeListener('desktop:change-notification:checked', listener);
+    },
   },
 };
 

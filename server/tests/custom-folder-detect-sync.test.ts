@@ -522,7 +522,7 @@ describe('operation-manifest createOperationManifest with custom docs', () => {
     const planned = manifest.documents[0];
     // Must NOT be blocked.
     expect(planned.action).not.toBe('blocked');
-    expect(planned.localMdPath).toContain('_custom/my-folder/custom-doc.md');
+    expect(planned.localMdPath?.replace(/\\/g, '/')).toContain('_custom/my-folder/custom-doc.md');
   });
 
   it('non-custom doc without watchedRootId is still blocked as unknown_watched_root', () => {

@@ -4,12 +4,16 @@ export interface KbFileChange {
   path: string;
   kind: 'added' | 'changed' | 'removed';
   reason?: 'excluded' | 'missing' | 'content';
+  /** Explicit build declaration only; never inferred from shared sources or similar titles. */
+  mergedInto?: string[];
   beforeAvailable: boolean;
   patch: string;
   additions: number;
   deletions: number;
   truncated: boolean;
 }
+
+export interface KbDocMerge { path: string; mergedInto: string[] }
 
 export interface KbChangePreview {
   baseReleaseId: string | null;
@@ -33,6 +37,8 @@ export interface KbSourceChoice {
   title: string;
   relPath: string;
   included: boolean;
+  /** 明确移出标准库；与本次构建是否勾选分别表示。 */
+  excluded?: boolean;
   published: boolean;
   pending: 'added' | 'changed' | 'removed' | 'unchanged' | 'excluded';
   /** 本地文件按文档身份恢复，未更改云端同步状态。 */

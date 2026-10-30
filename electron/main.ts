@@ -92,7 +92,7 @@ function isValidFeishuWikiUrl(url: string | null | undefined): url is string {
 /**
  * Returns ALL valid watched root URLs from the latest config (empty
  * array when none are configured or every entry is malformed). Backed
- * by a snapshot refreshed at boot and on config save.
+ * by a snapshot refreshed at boot and before each poll.
  *
  * Used by ChangeNotificationService.getWatchedRootUrls to (a) skip the
  * detect poll when no roots are configured, and (b) drive the multi-root
@@ -101,17 +101,15 @@ function isValidFeishuWikiUrl(url: string | null | undefined): url is string {
  * (urls.find → first valid) left roots [1..N] never auto-detected.
  *
  * Synchronous read would be cleaner, but ConfigManager.load() is async,
- * so a cached snapshot is returned; see refreshWatchedRootUrlsSnapshot()
- * which is invoked on boot. Runtime config edits without a restart are
- * picked up on the next config-save IPC round-trip if the handler calls
- * the refresh; until then the snapshot reflects the boot-time config.
+ * so a cached snapshot is returned; refreshWatchedRootUrlsSnapshot()
+ * reloads it before each poll, including after settings changes.
  */
 function readAllValidWatchedRootUrls(): string[] {
   return currentValidWatchedRootUrlsSnapshot;
 }
 
-// Latest known set of valid watched root URLs. Refreshed at boot and on
-// config save. Default empty until the first refresh.
+// Latest known set of valid watched root URLs. Refreshed at boot and
+// before each poll. Default empty until the first refresh.
 let currentValidWatchedRootUrlsSnapshot: string[] = [];
 
 async function refreshWatchedRootUrlsSnapshot(): Promise<void> {
@@ -666,11 +664,8 @@ async function boot() {
     // drives the multi-root /api/detect/changes-all endpoint via the
     // getWatchedRootUrls callback so every configured root is auto-
     // detected — the earlier single-root design left roots [1..N]
-    // unwatched. The snapshot is refreshed on boot (here); runtime
-    // config edits without an IPC round-trip require an app restart to
-    // be picked up by the poller. This is an architectural constraint,
-    // not a bug — settings UI saves via the IPC handler so the common
-    // path is covered.
+    // unwatched. Refresh the snapshot before each poll so settings edits
+    // are picked up without restarting the application.
     changeNotificationService = new ChangeNotificationService({
       getWindow: () => mainWindow,
       getServerUrl: () => startedServer?.url ?? null,
@@ -678,6 +673,8 @@ async function boot() {
       sanitizeError: sanitizeDesktopError,
       trayService: () => trayService,
       getWatchedRootUrls: () => readAllValidWatchedRootUrls(),
+      refreshSettings: refreshWatchedRootUrlsSnapshot,
+      notificationsEnabled: () => configManager?.getConfig()?.enableNotifications ?? false,
     });
 
     // Apply auto-start setting from config (single source of truth)
@@ -689,8 +686,8 @@ async function boot() {
       }
     }
 
-    // Start change notification polling if enabled
-    if (config.enableNotifications && changeNotificationService) {
+    // 定时检测独立于通知开关：关闭通知不能阻止节点树自动更新。
+    if (changeNotificationService) {
       const pollInterval = config.pollIntervalMinutes || 30;
       console.info(`[Boot] Starting change notification with ${pollInterval}min interval`);
       changeNotificationService.start(pollInterval);

@@ -472,7 +472,7 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
               onChanged={() => { void loadStatus(); setDocReload((n) => n + 1); }}
               onUpdate={() => setConfirming('incremental')}
               onBuildSelected={(count) => { setSelectedBuildCount(count); setRefreshImages(false); setConfirming('full'); }}
-              onOpenSource={(choice) => setSource({ objToken: choice.objToken, title: choice.title, relPath: choice.relPath, state: choice.included ? 'current' : 'excluded' })} />
+              onOpenSource={(choice) => setSource({ objToken: choice.objToken, title: choice.title, relPath: choice.relPath, state: choice.excluded ? 'excluded' : 'current' })} />
           </>}
       </aside> : null}
 

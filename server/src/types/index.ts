@@ -328,6 +328,8 @@ export interface CloudNodeObservation {
   hasChild: boolean;
   /** Whether detail lookup succeeded, was permission-restricted, or failed transiently. */
   observationStatus: 'available' | 'restricted' | 'unavailable';
+  /** 本次节点列表遍历直接观察到属于当前同步根；元数据查询不能证明归属。 */
+  observedInWatchedTree?: boolean;
 }
 
 export interface DocumentRecord {

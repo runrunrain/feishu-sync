@@ -86,6 +86,8 @@ export interface PathResolveInput {
    * Default false: keep verified existing mappings (preferred identity).
    */
   preferProfilePath?: boolean;
+  /** 已由调用方核对文件内 obj_token 时，可继续复用知识库内旧归档路径。 */
+  allowVerifiedOutsideRoot?: boolean;
   /**
    * Other documents' planned or occupied relative markdown paths
    * (POSIX). Used for duplicate-target and case-collision detection.
@@ -401,7 +403,7 @@ export function resolveLocalTarget(input: PathResolveInput): PathPlanResult {
         existingRel,
         input.watchedRoot.localDir,
       );
-      if (!underRootDir) {
+      if (!underRootDir && !input.allowVerifiedOutsideRoot) {
         conflicts.push({
           kind: 'escape-root',
           message: `已有映射不在 watchedRoot.localDir 内: ${existingRel}`,
@@ -533,7 +535,7 @@ export function resolveLocalTarget(input: PathResolveInput): PathPlanResult {
   };
 }
 
-function isUnderLocalDir(relativePath: string, localDir: string): boolean {
+export function isUnderLocalDir(relativePath: string, localDir: string): boolean {
   const normalizedDir = localDir.replace(/\\/g, '/').replace(/\/$/, '');
   const normalizedPath = relativePath.replace(/\\/g, '/');
   return (

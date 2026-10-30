@@ -40,6 +40,10 @@ type ChangeNotificationServiceOptions = {
    * caller does not need to loop over these URLs itself.
    */
   getWatchedRootUrls: () => string[];
+  /** Refresh desktop's config snapshot before each poll. */
+  refreshSettings?: () => Promise<void>;
+  /** Controls tray notifications only; polling still runs when disabled. */
+  notificationsEnabled?: () => boolean;
 };
 
 interface ChangeDetectionResult {
@@ -57,7 +61,6 @@ export class ChangeNotificationService {
   private pollTimer: NodeJS.Timeout | null = null;
   /** A manual click, boot check and interval tick must share one poll. */
   private inFlightCheck: Promise<ChangeDetectionResult | null> | null = null;
-  private lastNotificationTime: number = 0;
   private lastChangedCount: number = 0;
 
   constructor(private readonly options: ChangeNotificationServiceOptions) {}
@@ -130,6 +133,13 @@ export class ChangeNotificationService {
       return null;
     }
 
+    try {
+      await this.options.refreshSettings?.();
+    } catch (error) {
+      console.warn('[ChangeNotification] Could not refresh settings:', this.options.sanitizeError(error));
+      return null;
+    }
+
     const rootUrls = this.options.getWatchedRootUrls();
     if (rootUrls.length === 0) {
       // No valid watched root URL configured — nothing to detect.
@@ -162,15 +172,25 @@ export class ChangeNotificationService {
 
       const result: ChangeDetectionResult = await response.json();
 
+      // 自动检测也会改变树归属；通知渲染进程重新读取本地视图，
+      // 即使正文时间未变化、changedDocuments 为空也不能漏掉。
+      try {
+        const window = this.options.getWindow();
+        if (window && !window.isDestroyed() && !window.webContents.isDestroyed()) {
+          window.webContents.send('desktop:change-notification:checked');
+        }
+      } catch (error) {
+        console.warn('[ChangeNotification] Could not notify the renderer:', this.options.sanitizeError(error));
+      }
+
       if (result.changed && result.changedDocuments.length > 0) {
         // Check if this is a new change (different from last notification)
         const currentChangedCount = result.changedDocuments.length;
         const isNewChange = currentChangedCount !== this.lastChangedCount;
 
-        if (isNewChange) {
+        if (isNewChange && (this.options.notificationsEnabled?.() ?? true)) {
           this.notifyChanges(result.changedDocuments);
           this.lastChangedCount = currentChangedCount;
-          this.lastNotificationTime = Date.now();
         }
       }
 

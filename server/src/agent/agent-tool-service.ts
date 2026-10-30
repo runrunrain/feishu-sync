@@ -100,10 +100,12 @@ export interface BuildRunState {
   stagingRoot: string;
   /** kb_write_doc 写入时同步更新（标题/摘要/标签，manifest 生成用） */
   docMeta?: Map<string, { title: string; summary: string; tags: string[]; sources: string[] }>;
-  finishInfo: { summary: string; skipped: Array<{ objToken: string; reason: string }> } | null;
+  finishInfo: { summary: string; skipped: Array<{ objToken: string; reason: string }>; docMerges?: Array<{ path: string; mergedInto: string[] }> } | null;
   /** 受旧源变动影响的现存草稿必须显式重写，不能借旧sources声明冒充更新。 */
   requiredRewrites?: Set<string>;
   writtenPaths?: Set<string>;
+  /** Pinned previous release, used to reject invented merge origins before kb_finish commits. */
+  baseDocPaths?: Set<string>;
   /**
    * F3-R08：不可恢复毒化标记。raw_read/raw_search 命中
    * source_changed_during_build 后置位；后续每个 batch 结束与发布前都
@@ -1275,7 +1277,29 @@ export class AgentToolService {
         throw new ToolError('invalid_request', `skipped 来源不在快照内: ${item.objToken}`);
       }
     }
-    state.finishInfo = { summary, skipped };
+    const docMerges: Array<{ path: string; mergedInto: string[] }> = [];
+    if (args.docMerges !== undefined) {
+      if (!Array.isArray(args.docMerges) || args.docMerges.length > 100) throw new ToolError('invalid_request', 'docMerges 必须是至多 100 项的数组');
+      const seen = new Set<string>();
+      for (const item of args.docMerges) {
+        if (!item || typeof item !== 'object' || typeof item.path !== 'string' || !Array.isArray(item.mergedInto)
+          || !item.mergedInto.length || item.mergedInto.length > 20 || !item.mergedInto.every((p: unknown) => typeof p === 'string')) {
+          throw new ToolError('invalid_request', 'docMerges 每项须提供 path 与非空 mergedInto 路径数组');
+        }
+        validateStdDocPath(item.path);
+        if (state.baseDocPaths && !state.baseDocPaths.has(item.path)) throw new ToolError('invalid_request', '合并的旧路径不在构建基准版本中');
+        if (seen.has(item.path)) throw new ToolError('invalid_request', 'docMerges 旧路径不可重复');
+        seen.add(item.path);
+        if (fs.existsSync(path.join(state.stagingRoot, 'docs', item.path))) throw new ToolError('invalid_request', '合并前的旧路径仍存在，请先删除旧草稿');
+        const targets = [...new Set<string>(item.mergedInto)];
+        for (const target of targets) {
+          validateStdDocPath(target);
+          if (target === item.path || !fs.statSync(resolveInside(path.join(state.stagingRoot, 'docs'), target, 'read')).isFile()) throw new ToolError('invalid_request', '合并目标必须是本版存在的文档');
+        }
+        docMerges.push({ path: item.path, mergedInto: targets });
+      }
+    }
+    state.finishInfo = { summary, skipped, ...(docMerges.length ? { docMerges } : {}) };
     return { content: [{ type: 'text', text: `构建标记完成：${summary.slice(0, 100)}` }] };
   }
 

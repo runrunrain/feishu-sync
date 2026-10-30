@@ -17,16 +17,17 @@ import { parseQuery, queryHints } from './query.js';
 import { resolveAnchor, sectionRange, splitAnchor } from './outline.js';
 import { resolveRelease as resolvePublishedRelease, availableReleases, validateReleaseId, type ResolvedRelease } from './release-reader.js';
 import { QueryError, invalid } from './query-error.js';
+import { KB_COVERAGE_NOTE, sourceVersionWarning, suggestDocPaths } from './query-metadata.js';
 export { QueryError } from './query-error.js';
 export { resolveRelease, readCurrent } from './release-reader.js';
 export type { ResolvedRelease } from './release-reader.js';
 
 export interface PageParams { releaseId?: string; cursor?: string; maxChars?: number }
 export interface SearchParams extends PageParams { query: string; limit?: number; pathPrefix?: string; tags?: string[]; maxSnippets?: number }
-export interface SearchResultHit { docId: string; path: string; title: string; summary: string; snippet: string; score?: number; coverage?: number; hits?: SnippetHit[] }
-export interface SearchResult { releaseId: string; ranker: 'lex-v1'|'l1'; rankerVersion: 'lex-v1'|'l1'; query: ReturnType<typeof parseQuery>; total: number; results: SearchResultHit[]; next: string|null; hint?: string[] }
+export interface SearchResultHit { docId: string; path: string; title: string; summary: string; snippet: string; score?: number; coverage?: number; matchedUnits?: string[]; fallbackUnits?: string[]; matchType?: 'exact'|'fallback'; hits?: SnippetHit[] }
+export interface SearchResult { releaseId: string; ranker: 'lex-v1'|'l1'; rankerVersion: 'lex-v1'|'l1'; query: ReturnType<typeof parseQuery>; total: number; results: SearchResultHit[]; next: string|null; unmatchedUnits: string[]; warning?: string; hint?: string[] }
 export interface GrepParams extends PageParams { pattern: string; mode?: 'literal'|'regex'; caseSensitive?: boolean; pathPrefix?: string; context?: number; maxMatches?: number }
-export interface GrepResult { releaseId: string; totalMatches: number; totalFiles: number; complete: boolean; partial?: boolean; partialReason?: string; regexTruncatedLines?: number; files: Array<{ path: string; title: string; matches: GrepMatch[] }>; next: string|null }
+export interface GrepResult { releaseId: string; mode: 'literal'|'regex'; hint?: string; totalMatches: number; totalFiles: number; complete: boolean; partial?: boolean; partialReason?: string; regexTruncatedLines?: number; files: Array<{ path: string; title: string; matches: GrepMatch[] }>; next: string|null }
 export interface OutlineParams extends PageParams { path?: string; docId?: string; pathPrefix?: string; depth?: 2|3 }
 export interface ReadParams { path?: string; docId?: string; section?: string; startLine?: number; maxLines?: number; includeSources?: boolean; releaseId?: string; maxChars?: number }
 export interface BundleParams extends PageParams { pathPrefix?: string; paths?: string[]; dryRun?: boolean; lineNumbers?: boolean }
@@ -38,7 +39,9 @@ export interface ReleaseInfoResult {
   releaseId: string; buildId: string; mode: KbManifest['mode']; baseReleaseId: string|null; publishedAt: string; model: string|null;
   docCount: number; sourceCount: number; bodyChars: number; ranker: 'lex-v1'|'l1'; toolsVersion: '2';
   integrity: KbIndex['integrity']; availableReleases: string[];
-  changes?: { summary: string; docs: Array<Pick<KbVersionDto['docChanges'][number], 'path'|'title'|'kind'|'additions'|'deletions'>> }|null;
+  coverage: { kind: 'curated'; note: string; referencedSourceCount: number; skippedSourceCount: number };
+  sources: Array<{ objToken: string; title: string; relPath: string; referencedBy: number; warning?: ReturnType<typeof sourceVersionWarning> }>;
+  changes?: { summary: string; docs: Array<Pick<KbVersionDto['docChanges'][number], 'path'|'title'|'kind'|'additions'|'deletions'|'reason'> & { mergedInto?: string[]|null; removalNote?: string }> }|null;
   next: string|null;
 }
 interface Cursor { v: 1; r: string; t: string; h: string; o: number }
@@ -162,7 +165,7 @@ export class KbQueryService {
     const entry = release.manifest.docs.find((d) => ref.path !== undefined ? d.path === ref.path : d.docId === ref.docId);
     if (entry) throw new QueryError('kb_integrity_error', '文档缺失、越界或内容哈希不匹配', { path: entry.path });
     const term = ref.path ?? ref.docId ?? '';
-    const suggestions = release.manifest.docs.filter((d) => term.includes(d.title) || d.title.includes(term)).slice(0, 5).map((d) => d.path);
+    const suggestions = suggestDocPaths(index.docs, term, ref.docId !== undefined);
     throw new QueryError('kb_not_found', '文档不存在', { suggestions });
   }
 
@@ -190,13 +193,17 @@ export class KbQueryService {
           if (!hit) {
             const hits = r.sections.filter((s, i) => s.score > 0 || i === 0).slice(0, maxSnippets).map((s) => makeSnippet(r.doc, s.section, query));
             hit = { docId: r.doc.docId, path: r.doc.path, title: r.doc.title, summary: r.doc.summary.slice(0, 120),
-              snippet: hits[0]?.snippet ?? '', hits, score: Math.round(r.score * 100) / 100, coverage: r.coverage };
+              snippet: hits[0]?.snippet ?? '', hits, score: Math.round(r.score * 100) / 100, coverage: r.coverage,
+              matchedUnits: r.matchedUnits, fallbackUnits: r.fallbackUnits, matchType: r.matchedUnits.length ? 'exact' : 'fallback' };
           }
           return hit;
         };
       });
     }
-    const base = { releaseId: release.releaseId, ranker, rankerVersion: ranker, query, total: results.length,
+    const selectedDocs = index.docs.filter(selected);
+    const unmatchedUnits = query.units.filter((unit) => !selectedDocs.some((doc) => doc.normAll.includes(unit) || Object.values(doc.meta).some((v) => v.includes(unit))));
+    const base = { releaseId: release.releaseId, ranker, rankerVersion: ranker, query, total: results.length, unmatchedUnits,
+      ...(unmatchedUnits.length ? { warning: '部分完整关键词在当前检索范围内未命中；回退片段仅供改写查询参考，不代表已覆盖所问主题。' } : {}),
       ...(!results.length ? { hint: queryHints(query, index.vocab) } : {}) };
     return this.jsonPage(results, offset, limit, budget, next, (page, cursor) => ({ ...base, results: page.map((build) => build()), next: cursor })) as SearchResult;
   }
@@ -207,7 +214,9 @@ export class KbQueryService {
     const caseSensitive = bool(params.caseSensitive, false, 'caseSensitive'), budget = this.budget(params, 12000);
     const { release, index, offset, next } = await this.begin('grep', params, { pattern: params.pattern, mode, caseSensitive, pathPrefix, context, maxMatches, budget });
     const scan = grepDocs(index.docs, { ...params, mode, caseSensitive, pathPrefix, context });
-    const base = { releaseId: release.releaseId, totalMatches: scan.entries.length, totalFiles: new Set(scan.entries.map((e) => e.path)).size,
+    const base = { releaseId: release.releaseId, mode,
+      ...(mode === 'literal' && /[[\]()*+?{}|^$\\]/.test(params.pattern) ? { hint: '当前按字面量查询；若要使用正则表达式，请显式传入 mode: "regex"。' } : {}),
+      totalMatches: scan.entries.length, totalFiles: new Set(scan.entries.map((e) => e.path)).size,
       complete: scan.complete, ...(!scan.complete ? { partial: true, partialReason: scan.partialReason } : {}),
       ...(scan.regexTruncatedLines ? { regexTruncatedLines: scan.regexTruncatedLines } : {}) };
     return this.jsonPage(scan.entries, offset, maxMatches, budget, next, (page, cursor) => {
@@ -265,7 +274,12 @@ export class KbQueryService {
   }
   private sourcesText(manifest: KbManifest, doc: KbIndexDoc): string {
     if (!doc.sources.length) return '';
-    return 'sources: ' + doc.sources.map((id) => { const source = manifest.sourceSnapshot.find((s) => s.objToken === id); return source ? `${source.title} (${source.relPath})` : id; }).join('; ') + '\n';
+    return 'sources: ' + doc.sources.map((id) => {
+      const source = manifest.sourceSnapshot.find((s) => s.objToken === id);
+      if (!source) return id;
+      const warning = sourceVersionWarning(source);
+      return `${source.title} (${source.relPath})${warning ? ` [source_version_label_mismatch: 标题 V${warning.titleVersion} / 路径 V${warning.pathVersion}；可能是旧路径名，内容版本未确认]` : ''}`;
+    }).join('; ') + '\n';
   }
 
   async bundle(params: BundleParams): Promise<TextPage> {
@@ -341,22 +355,40 @@ export class KbQueryService {
       try {
         const value = JSON.parse(fs.readFileSync(resolveInside(release.releaseDir, 'changes.json', 'read'), 'utf8')) as KbVersionDto;
         if (!Array.isArray(value.docChanges) || typeof value.summary !== 'string') throw new Error('changes.json invalid');
-        changes = { summary: value.summary, docs: value.docChanges.map(({ path, title, kind, additions, deletions }) => ({ path, title, kind, additions, deletions })) };
+        changes = { summary: value.summary, docs: value.docChanges.map(({ path, title, kind, additions, deletions, reason, mergedInto }) => {
+          if (mergedInto !== undefined && (kind !== 'removed' || !Array.isArray(mergedInto) || !mergedInto.length
+            || !mergedInto.every((p) => typeof p === 'string' && m.docs.some((d) => d.path === p)))) throw new Error('changes.json invalid merge targets');
+          return { path, title, kind, additions, deletions, ...(reason ? { reason } : {}),
+            ...(kind === 'removed' ? { mergedInto: mergedInto ?? null,
+              removalNote: mergedInto ? '构建明确声明内容合并至目标文档。' : '本版不再包含此路径；未记录合并去向，不能据此认定内容已迁移。' } : {}) };
+        }) };
       } catch (e) {
         if ((e as { code?: string }).code === 'not_found') changes = null;
         else throw new QueryError('kb_index_failed', '版本变更记录无效或越界', { detail: String(e) });
       }
     }
     // Large integrity/changes inventories are paged, not silently dropped. P2 may expose the additive cursor.
-    type Item = { kind: 'missing'|'mismatched'|'release'; value: string } | { kind: 'change'; value: NonNullable<ReleaseInfoResult['changes']>['docs'][number] };
+    const sourceRefs = new Map<string, number>();
+    for (const doc of m.docs) for (const token of new Set(doc.sources)) sourceRefs.set(token, (sourceRefs.get(token) ?? 0) + 1);
+    const sources = m.sourceSnapshot.map((source) => {
+      const warning = sourceVersionWarning(source);
+      return { objToken: source.objToken, title: source.title, relPath: source.relPath,
+        referencedBy: sourceRefs.get(source.objToken) ?? 0, ...(warning ? { warning } : {}) };
+    });
+    type Item = { kind: 'missing'|'mismatched'|'release'; value: string } | { kind: 'change'; value: NonNullable<ReleaseInfoResult['changes']>['docs'][number] }
+      | { kind: 'source'; value: ReleaseInfoResult['sources'][number] };
     const items: Item[] = [...index.integrity.missing.map((value) => ({ kind: 'missing' as const, value })),
       ...index.integrity.mismatched.map((value) => ({ kind: 'mismatched' as const, value })),
       ...availableReleases(this.kbRoot).map((value) => ({ kind: 'release' as const, value })),
-      ...(changes?.docs.map((value) => ({ kind: 'change' as const, value })) ?? [])];
+      ...(changes?.docs.map((value) => ({ kind: 'change' as const, value })) ?? []),
+      ...sources.map((value) => ({ kind: 'source' as const, value }))];
     return this.jsonPage(items, offset, Number.MAX_SAFE_INTEGER, budget, next, (page, cursor) => ({
       releaseId: release.releaseId, buildId: m.buildId, mode: m.mode, baseReleaseId: m.baseReleaseId, publishedAt: m.publishedAt, model: m.model,
       docCount: m.docs.length, sourceCount: m.sourceSnapshot.length, bodyChars: index.docs.reduce((sum, d) => sum + d.lines.join('\n').length, 0),
       ranker: process.env.FEISHU_KB_RANKER === 'l1' ? 'l1' : 'lex-v1', toolsVersion: '2',
+      coverage: { kind: 'curated', note: KB_COVERAGE_NOTE, referencedSourceCount: sources.filter((source) => source.referencedBy > 0).length,
+        skippedSourceCount: m.skippedSources?.length ?? 0 },
+      sources: page.filter((i) => i.kind === 'source').map((i) => i.value),
       integrity: { verified: index.integrity.verified, missing: page.filter((i) => i.kind === 'missing').map((i) => i.value), mismatched: page.filter((i) => i.kind === 'mismatched').map((i) => i.value) },
       availableReleases: page.filter((i) => i.kind === 'release').map((i) => i.value),
       ...(includeChanges ? { changes: changes ? { summary: changes.summary, docs: page.filter((i) => i.kind === 'change').map((i) => i.value) } : null } : {}), next: cursor,

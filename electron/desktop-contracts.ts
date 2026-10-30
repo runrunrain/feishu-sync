@@ -135,5 +135,7 @@ export interface DesktopAPI {
      * Manually trigger a change detection check
      */
     manualCheck: () => Promise<ChangeDetectionResult>;
+    /** 自动检测完成后通知界面刷新本地树与差异。 */
+    onChecked: (callback: () => void) => () => void;
   };
 }

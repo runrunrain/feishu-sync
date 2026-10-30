@@ -1,22 +1,24 @@
 import { normalize, comparePath } from './normalize.js';
 import { invalid } from './query-error.js';
 
-export interface ParsedQuery { units: string[]; fallback: Record<string, string[]>; ignored: string[]; truncated?: boolean }
+export interface ParsedQuery { units: string[]; phrases?: string[]; fallback: Record<string, string[]>; ignored: string[]; truncated?: boolean }
 export function parseQuery(query: string): ParsedQuery {
   if (typeof query !== 'string') invalid('query');
   const q = normalize(query).trim();
   if (q.length < 1 || q.length > 200) invalid('query', 'query 长度必须在 1..200');
   const units: string[] = [];
   const ignored: string[] = [];
+  const phrases: string[] = [];
   const seen = new Set<string>();
   const tokens = /"([^"]*)"|“([^”]*)”|「([^」]*)」|([^\s,，。；;、:：!！?？()（）[\]【】{}<>《》'"“”‘’「」|\\/]+)/g;
   for (const m of q.matchAll(tokens)) {
     const u = (m[1] ?? m[2] ?? m[3] ?? m[4]).trim();
+    if (u && m[4] === undefined && !phrases.includes(u)) phrases.push(u);
     if (!u || seen.has(u) || /^[\x00-\x7f]$/.test(u)) continue;
     seen.add(u);
     (units.length < 8 ? units : ignored).push(u);
   }
-  return { units, fallback: {}, ignored };
+  return { units, ...(phrases.length ? { phrases: phrases.filter((u) => units.includes(u)) } : {}), fallback: {}, ignored };
 }
 
 export function buildVocab(fields: string[]): string[] {

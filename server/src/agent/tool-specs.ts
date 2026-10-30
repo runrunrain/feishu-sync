@@ -199,6 +199,14 @@ export const KB_FINISH_SPEC: AgentToolSpec = {
     type: 'object',
     properties: {
       summary: string('本次构建总结'),
+      docMerges: {
+        type: 'array', maxItems: 100,
+        description: '明确合并/迁移的旧标准文档及本版目标路径；仅在实际保留了旧文内容时声明，不能按共享来源猜测。未发生合并可省略。',
+        items: { type: 'object', properties: {
+          path: string('本版已移除的旧标准文档路径'),
+          mergedInto: { type: 'array', minItems: 1, maxItems: 20, items: { type: 'string' }, description: '本版存在的合并目标路径' },
+        }, required: ['path', 'mergedInto'], additionalProperties: false },
+      },
       skipped: {
         type: 'array',
         items: {

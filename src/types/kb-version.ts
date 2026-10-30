@@ -36,6 +36,8 @@ export interface KbSourceChoice {
   title: string;
   relPath: string;
   included: boolean;
+  /** 明确移出标准库；与本次构建是否勾选分别表示。 */
+  excluded?: boolean;
   published: boolean;
   pending: 'added' | 'changed' | 'removed' | 'unchanged' | 'excluded';
   recovered?: boolean;

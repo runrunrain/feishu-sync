@@ -92,6 +92,11 @@ export class LocalMapStore {
    * everything sitting at the 'unknown' default.
    */
   private applyAdditiveMigrations(): void {
+    const sourceExclusionCols = this.db.prepare('PRAGMA table_info(kb_source_exclusions)').all() as Array<{ name: string }>;
+    if (!sourceExclusionCols.some((column) => column.name === 'exclusion_kind')) {
+      // 历史复选框记录没有删除意图证据，按构建选择保留，避免误删已发布内容。
+      this.db.exec("ALTER TABLE kb_source_exclusions ADD COLUMN exclusion_kind TEXT NOT NULL DEFAULT 'build_selection'");
+    }
     const sessionCols = this.db.prepare('PRAGMA table_info(agent_sessions)').all() as Array<{ name: string }>;
     if (sessionCols.length && !sessionCols.some((c) => c.name === 'model_config_json')) this.db.exec('ALTER TABLE agent_sessions ADD COLUMN model_config_json TEXT');
     if (sessionCols.length && !sessionCols.some((c) => c.name === 'runtime_backend')) this.db.exec("ALTER TABLE agent_sessions ADD COLUMN runtime_backend TEXT NOT NULL DEFAULT 'pi'");
@@ -782,7 +787,7 @@ export class LocalMapStore {
     `).run(reason, objToken);
   }
 
-  recordCloudObservation(observation: CloudNodeObservation & { lastSeenAt: string }): DocumentRecord {
+  recordCloudObservation(observation: CloudNodeObservation & { lastSeenAt: string }, options: { adoptCustomFolderId?: string } = {}): DocumentRecord {
     const current = this.getDocumentByObjToken(observation.objToken);
     const pending = this.getFeishuPendingByObjToken(observation.objToken);
     // A Feishu-side repair is opt-in: routine polls keep the queue entry and
@@ -819,6 +824,7 @@ export class LocalMapStore {
         status = excluded.status,
         watched_root_id = COALESCE(excluded.watched_root_id, documents.watched_root_id),
         watched_root_url = COALESCE(excluded.watched_root_url, documents.watched_root_url),
+        custom_folder_id = CASE WHEN documents.custom_folder_id = ? THEN NULL ELSE documents.custom_folder_id END,
         has_child = excluded.has_child,
         last_seen_at = excluded.last_seen_at,
         missing_complete_count = 0,
@@ -853,6 +859,7 @@ export class LocalMapStore {
       observation.watchedRootId || null,
       observation.watchedRootUrl ?? null,
       observation.hasChild ? 1 : 0,
+      options.adoptCustomFolderId ?? null,
     );
 
     // The row was inserted/updated in the same synchronous connection, so a
@@ -2197,7 +2204,7 @@ export class LocalMapStore {
    * NULL). Symmetric to backfillWatchedRoots(), but driven by longest-prefix
    * matching against registered folder paths instead of config.
    *
-   * Candidates: custom_folder_id NULL + watched_root_url NULL +
+   * Candidates: custom_folder_id NULL + watched_root_url/id NULL +
    * cloud_deleted = 0 + non-empty local_rel_path. watchedRoot-owned rows are
    * excluded because structure-tree ownership wins over archive ownership.
    *
@@ -2238,6 +2245,7 @@ export class LocalMapStore {
           `SELECT obj_token, local_rel_path FROM documents
            WHERE custom_folder_id IS NULL
              AND watched_root_url IS NULL
+             AND watched_root_id IS NULL
              AND cloud_deleted = 0
              AND local_rel_path IS NOT NULL
              AND local_rel_path != ''`,
@@ -2412,9 +2420,10 @@ export class LocalMapStore {
           .prepare(
           `UPDATE documents
              SET watched_root_url = ?, watched_root_id = ?, updated_at = datetime('now')
-             WHERE LOWER(local_md_path) LIKE ? ESCAPE '\\'
+             WHERE (LOWER(local_md_path) LIKE ? ESCAPE '\\'
                 OR LOWER(local_md_path) LIKE ? ESCAPE '\\'
-                OR LOWER(local_md_path) LIKE ? ESCAPE '\\'`,
+                OR LOWER(local_md_path) LIKE ? ESCAPE '\\')
+               AND (last_seen_at IS NULL OR watched_root_id IS NULL OR watched_root_id = ?)`,
           )
           .run(
             root.url,
@@ -2422,8 +2431,17 @@ export class LocalMapStore {
             `%${segs}%`,
             `%${relSegs}%`,
             `%${winSegs}%`,
+            root.id,
           );
         tagged += res.changes;
+      }
+
+      // 云端遍历确认的归属高于磁盘目录：归档迁入树后文件可以仍保留在
+      // _custom，重建索引不得把它重新归档或让它脱离原同步根。
+      for (const root of configuredRoots) {
+        const restored = this.db.prepare(`UPDATE documents SET watched_root_url = ?, updated_at = datetime('now')
+          WHERE watched_root_id = ? AND watched_root_url IS NULL AND last_seen_at IS NOT NULL`).run(root.url, root.id);
+        tagged += restored.changes;
       }
 
       const total = (
@@ -2620,7 +2638,7 @@ export class LocalMapStore {
   // Agent 标准知识库（F1）：kb_builds / agent_sessions 访问器
   // ===========================================================================
 
-  /** 排除标记独立于documents，索引重建/重新同步不清除；按真实原始库根隔离。 */
+  /** 源选择标记独立于documents，索引重建/重新同步不清除；按真实原始库根隔离。 */
   private kbSourceRootKey(root: string): string {
     try { return fs.realpathSync.native(root); } catch { return path.resolve(root); }
   }
@@ -2656,9 +2674,15 @@ export class LocalMapStore {
       .all(this.kbSourceRootKey(root)) as Array<{ obj_token: string }>).map((row) => row.obj_token);
   }
 
+  /** 明确要求从标准库移除的来源；普通构建勾选不属于此类。 */
+  listKbExplicitlyExcludedSources(root: string): string[] {
+    return (this.db.prepare("SELECT obj_token FROM kb_source_exclusions WHERE knowledge_root=? AND exclusion_kind='explicit' ORDER BY obj_token")
+      .all(this.kbSourceRootKey(root)) as Array<{ obj_token: string }>).map((row) => row.obj_token);
+  }
+
   setKbSourceExcluded(root: string, objToken: string, excluded: boolean): void {
     const key = this.kbSourceRootKey(root);
-    if (excluded) this.db.prepare('INSERT OR REPLACE INTO kb_source_exclusions (knowledge_root,obj_token,excluded_at) VALUES (?,?,?)')
+    if (excluded) this.db.prepare("INSERT OR REPLACE INTO kb_source_exclusions (knowledge_root,obj_token,excluded_at,exclusion_kind) VALUES (?,?,?,'explicit')")
       .run(key, objToken, new Date().toISOString());
     else this.db.prepare('DELETE FROM kb_source_exclusions WHERE knowledge_root=? AND obj_token=?').run(key, objToken);
   }
@@ -2666,7 +2690,8 @@ export class LocalMapStore {
   /** 一次事务完成层级/全选/反选，避免逐文档网络请求与部分写入。 */
   setKbSourcesIncluded(root: string, tokens: string[], action: 'include' | 'exclude' | 'invert'): Array<{ objToken: string; included: boolean }> {
     const key = this.kbSourceRootKey(root);
-    const insert = this.db.prepare('INSERT OR REPLACE INTO kb_source_exclusions (knowledge_root,obj_token,excluded_at) VALUES (?,?,?)');
+    const insert = this.db.prepare(`INSERT INTO kb_source_exclusions (knowledge_root,obj_token,excluded_at,exclusion_kind) VALUES (?,?,?,'build_selection')
+      ON CONFLICT(knowledge_root,obj_token) DO UPDATE SET excluded_at=excluded.excluded_at`);
     const remove = this.db.prepare('DELETE FROM kb_source_exclusions WHERE knowledge_root=? AND obj_token=?');
     return this.db.transaction(() => {
       const excluded = new Set(this.listKbExcludedSources(root));
@@ -3821,6 +3846,7 @@ export class LocalMapStore {
         knowledge_root TEXT NOT NULL,
         obj_token TEXT NOT NULL,
         excluded_at TEXT NOT NULL,
+        exclusion_kind TEXT NOT NULL DEFAULT 'build_selection',
         PRIMARY KEY (knowledge_root, obj_token)
       );
 

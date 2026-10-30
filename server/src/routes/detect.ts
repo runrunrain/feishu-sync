@@ -236,7 +236,15 @@ detectRoutes.post('/api/detect/changes-all', async (c) => {
 
   // Merge custom-folder modified docs into the aggregated response.
   if (customResult.changedDocuments.length) {
-    aggregatedChangedDocuments.push(...customResult.changedDocuments);
+    const treeTokens = new Set(aggregatedChangedDocuments.map((document) => document.objToken));
+    const store = (c as any).localMapStore;
+    for (const document of customResult.changedDocuments) {
+      // 根遍历可能刚把该文档从归档接入节点树。优先保留带新父链的
+      // 结果，不回灌前一阶段的归档副本或重复计数。
+      if (treeTokens.has(document.objToken)) continue;
+      if (typeof store?.getDocumentByObjToken === 'function' && !store.getDocumentByObjToken(document.objToken)?.customFolderId) continue;
+      aggregatedChangedDocuments.push(document);
+    }
   }
   aggregatedTotalNodes += customResult.checked;
 

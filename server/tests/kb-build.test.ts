@@ -335,6 +335,27 @@ describe('发布原子性与对账（§6.5 publishing / §5.3）', () => {
     expect(fs.existsSync(path.join(outputRoot, 'releases', 'r_bad'))).toBe(false);
   });
 
+  it('合并去向随发布写入；无效目标不会移动 CURRENT 或删除旧发布', async () => {
+    const service = makeService();
+    const mergeRoot = path.join(dataRoot, 'merge-output');
+    const snapshot = RawSourceSnapshot.fromEntries([]);
+    const common = { mode: 'full' as const, model: null, snapshot, outputRoot: mergeRoot, docMeta: new Map(), retainReleasesOverride: 3 };
+    await service.publishRelease({ ...common, buildId: 'b_merge_old', releaseId: 'r_merge_old', baseReleaseId: null,
+      stagingRoot: stageReleaseFiles('b_merge_old', [{ path: '旧.md', docId: 'old', sources: [], body: '旧内容' }]) });
+    const pointer = fs.readFileSync(path.join(mergeRoot, 'CURRENT.json'));
+    await expect(service.publishRelease({ ...common, buildId: 'b_merge_bad', releaseId: 'r_merge_bad', baseReleaseId: 'r_merge_old',
+      stagingRoot: stageReleaseFiles('b_merge_bad', [{ path: '新.md', docId: 'new', sources: [], body: '合并内容' }]),
+      docMerges: [{ path: '旧.md', mergedInto: ['不存在.md'] }] })).rejects.toThrow('invalid_doc_merge');
+    expect(fs.readFileSync(path.join(mergeRoot, 'CURRENT.json'))).toEqual(pointer);
+    expect(fs.existsSync(path.join(mergeRoot, 'releases/r_merge_old/docs/旧.md'))).toBe(true);
+    expect(fs.existsSync(path.join(mergeRoot, 'releases/r_merge_bad'))).toBe(false);
+    await service.publishRelease({ ...common, buildId: 'b_merge_new', releaseId: 'r_merge_new', baseReleaseId: 'r_merge_old',
+      stagingRoot: stageReleaseFiles('b_merge_new', [{ path: '新.md', docId: 'new', sources: [], body: '合并内容' }]),
+      docMerges: [{ path: '旧.md', mergedInto: ['新.md'] }] });
+    const changes = JSON.parse(fs.readFileSync(path.join(mergeRoot, 'releases/r_merge_new/changes.json'), 'utf8'));
+    expect(changes.docChanges.find((d: { path: string }) => d.path === '旧.md').mergedInto).toEqual(['新.md']);
+  });
+
   it('指针后 DB 失败的启动对账：以 CURRENT 指针为准补写 DB', () => {
     // 模拟：指针已指向 r_test1，但 DB 无该 published 记录
     const svc = makeService();

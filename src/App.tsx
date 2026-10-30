@@ -9,7 +9,7 @@
  * 不再使用：SyncPulse（信息密度低，被 GlobalStatusBar 取代）。
  */
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { ErrorBoundary } from './components/common/ErrorBoundary';
 import { ToastProvider } from './components/common/Toast';
 import { TopBar, MainArea } from './components/TopBar';
@@ -20,8 +20,10 @@ import { KnowledgeView } from './views/KnowledgeView';
 import { AgentView } from './views/AgentView';
 import { useDesktopUpdateBadge } from './hooks/useDesktopUpdate';
 import { SyncProvider } from './hooks/useSync';
+import { emitDiffChanged } from './utils/syncEvents';
 
 function AppShell() {
+  useEffect(() => window.desktop?.changeNotification?.onChecked?.(() => emitDiffChanged('background-detect')), []);
   const [currentArea, setCurrentArea] = useState<MainArea>('overview');
   const [settingsFocusTab, setSettingsFocusTab] = useState<'application' | 'agent' | 'auth' | undefined>(undefined);
   const [settingsFocusNonce, setSettingsFocusNonce] = useState(0);

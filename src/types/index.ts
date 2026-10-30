@@ -956,6 +956,7 @@ export interface ChannelTestResult {
 
 // Desktop API types (from desktop-contracts.ts)
 export interface DesktopAPI {
+  changeNotification?: { onChecked?: (callback: () => void) => () => void };
   writeClipboardText: (text: string) => Promise<void>;
   getApiHeaders: () => Promise<{ 'X-Desktop-Token': string }>;
   getServerStatus: () => Promise<{ running: boolean; port: number | null }>;

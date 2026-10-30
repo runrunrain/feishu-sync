@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
+import Database from 'better-sqlite3';
 import { Hono } from 'hono';
 import { ConfigManager } from '../src/modules/config-manager.js';
 import { LocalMapStore } from '../src/modules/local-map-store.js';
@@ -51,7 +52,8 @@ async function fixture() {
   const service = new KbBuildService({
     dataRoot: root, pool: new AgentProcessPool(), toolService: tools, resolver,
     configProvider: () => configManager.getConfig(), documentsProvider,
-    excludedSourcesProvider: () => store.listKbExcludedSources(raw), sheetCsvPaths,
+    excludedSourcesProvider: () => store.listKbExplicitlyExcludedSources(raw),
+    unselectedSourcesProvider: () => store.listKbExcludedSources(raw), sheetCsvPaths,
     internalBaseUrl: () => '', extensionPath: () => null, promptAssets: () => null,
   });
   const prompts: string[] = [];
@@ -317,6 +319,96 @@ describe('diff与正文边界', () => {
 
 
 describe('源选择批量事务', () => {
+  it('取消构建勾选不生成移除差异，增量更新保留未改动的已发布来源', async () => {
+    const f = await fixture();
+    expect((await f.build('full')).status).toBe('published');
+    const manifest = f.published().readManifest()!;
+    const before = ['a', 'b'].map((token) => fs.readFileSync(path.join(f.raw, `${token}.md`), 'utf8'));
+    expect((await f.call('/api/kb/sources/selection', 'POST', { root: f.raw, action: 'exclude', tokens: ['a', 'b'] })).status).toBe(200);
+    expect(f.store.listKbExcludedSources(f.raw)).toEqual(['a', 'b']);
+    expect(f.store.listKbExplicitlyExcludedSources(f.raw)).toEqual([]);
+    const choices = (await f.call('/api/kb/sources')).data.sources;
+    expect(choices).toHaveLength(2);
+    expect(choices.every((choice: any) => choice.included === false && choice.pending === 'unchanged' && choice.excluded === false)).toBe(true);
+    expect((await f.call('/api/kb/changes')).data).toMatchObject({ sources: [], affectedDocs: [] });
+    expect((await f.call('/api/kb/status')).data.pending).toEqual({ added: 0, changed: 0, removed: 0 });
+    expect((await f.call(`/api/kb/docs/${manifest.docs[0].docId}`)).data.sources.map((source: any) => source.state)).toEqual(['current', 'current']);
+    expect((await f.build()).noChanges).toBe(true);
+    expect(f.published().readCurrent()!.releaseId).toBe(manifest.releaseId);
+    expect(['a', 'b'].map((token) => fs.readFileSync(path.join(f.raw, `${token}.md`), 'utf8'))).toEqual(before);
+  });
+
+  it('未勾选的已发布源仍按真实正文变更更新，未选择的新源不会混入', async () => {
+    const f = await fixture(); await f.build('full');
+    fs.writeFileSync(path.join(f.raw, 'c.md'), '规则C：未选择的新文档。');
+    f.documents.push({ ...f.documents[1], objToken: 'c', title: 'c', localRelPath: 'c.md', localMdPath: path.join(f.raw, 'c.md') });
+    await f.call('/api/kb/sources/selection', 'POST', { root: f.raw, action: 'exclude', tokens: ['a', 'b', 'c'] });
+    fs.writeFileSync(path.join(f.raw, 'a.md'), '规则A：怒气消耗20。\n' + '怒气不足时不能释放技能，规则按当前配置生效。\n'.repeat(8));
+    expect((await f.call('/api/kb/changes')).data.sources).toEqual([expect.objectContaining({ key: 'a', kind: 'changed', reason: 'content' })]);
+    expect((await f.build()).status).toBe('published');
+    const manifest = f.published().readManifest()!;
+    expect(manifest.sourceSnapshot.map((source) => source.objToken)).toEqual(['a', 'b']);
+    const body = f.published().readReleaseDoc(manifest.releaseId, manifest.docs[0]).markdown;
+    expect(body).toContain('怒气消耗20'); expect(body).toContain('规则B'); expect(body).not.toContain('规则C');
+  });
+
+  it('已发布的历史本地文件仍在时，云端权限状态与取消勾选不会使它变成移除差异', async () => {
+    const f = await fixture();
+    const content = fs.readFileSync(path.join(f.raw, 'a.md'), 'utf8');
+    fs.writeFileSync(path.join(f.raw, 'a.md'), '<!--\nfeishu_sync:\n  obj_token: "a"\n  wiki_node_token: "wiki-a"\n  obj_type: "slides"\n-->\n' + content);
+    f.documents[0] = { ...f.documents[0], wikiNodeToken: 'wiki-a', objType: 'slides' };
+    f.setGenerated({ markdown: content + '\n\n' + fs.readFileSync(path.join(f.raw, 'b.md'), 'utf8') });
+    expect((await f.build('full')).status).toBe('published');
+    const releaseId = f.published().readCurrent()!.releaseId;
+    f.documents[0] = { ...f.documents[0], localRelPath: null, localMdPath: '', status: 'error', syncState: 'restricted', lastSyncedAt: '', syncedObjEditTime: null };
+    await f.call('/api/kb/sources/selection', 'POST', { root: f.raw, action: 'exclude', tokens: ['a', 'b'] });
+    expect((await f.call('/api/kb/sources')).data.sources.find((source: any) => source.objToken === 'a')).toMatchObject({ included: false, pending: 'unchanged', recovered: true });
+    expect((await f.call('/api/kb/changes')).data.sources).toEqual([]);
+    expect((await f.build()).noChanges).toBe(true);
+    expect(f.published().readCurrent()!.releaseId).toBe(releaseId);
+  });
+
+  it('构建取消勾选与明确排除分别保存，实际删除仍产生移除差异', async () => {
+    const f = await fixture(); await f.build('full');
+    await f.call('/api/kb/sources/selection', 'POST', { root: f.raw, action: 'exclude', tokens: ['a', 'b'] });
+    await f.call('/api/kb/sources/a', 'PUT', { included: false });
+    await f.call('/api/kb/sources/selection', 'POST', { root: f.raw, action: 'exclude', tokens: ['a'] });
+    expect(f.store.listKbExplicitlyExcludedSources(f.raw)).toEqual(['a']);
+    fs.unlinkSync(path.join(f.raw, 'b.md'));
+    const changes = (await f.call('/api/kb/changes')).data.sources;
+    expect(changes).toEqual([
+      expect.objectContaining({ key: 'a', kind: 'removed', reason: 'excluded' }),
+      expect.objectContaining({ key: 'b', kind: 'removed', reason: 'missing' }),
+    ]);
+    await f.call('/api/kb/sources/selection', 'POST', { root: f.raw, action: 'include', tokens: ['a'] });
+    expect(f.store.listKbExplicitlyExcludedSources(f.raw)).toEqual([]);
+  });
+
+  it('旧版本的勾选记录自动迁移为构建选择，保留原选择且不误删已有标准库', async () => {
+    const f = await fixture(); await f.build('full');
+    const releaseId = f.published().readCurrent()!.releaseId;
+    const db = new Database(path.join(f.root, 'db.sqlite'));
+    try {
+      db.exec('ALTER TABLE kb_source_exclusions DROP COLUMN exclusion_kind');
+      const insert = db.prepare('INSERT INTO kb_source_exclusions (knowledge_root,obj_token,excluded_at) VALUES (?,?,?)');
+      for (const token of ['a', 'b']) insert.run(fs.realpathSync.native(f.raw), token, '2026-10-30T06:19:01.583Z');
+    } finally { db.close(); }
+    f.store.initialize(); f.store.initialize();
+    expect(f.store.listKbExcludedSources(f.raw)).toEqual(['a', 'b']);
+    expect(f.store.listKbExplicitlyExcludedSources(f.raw)).toEqual([]);
+    expect((await f.call('/api/kb/changes')).data.sources).toEqual([]);
+    expect((await f.build()).noChanges).toBe(true);
+    expect(f.published().readCurrent()!.releaseId).toBe(releaseId);
+  });
+
+  it('完整重建仍采用确认弹窗中的所选源集合', async () => {
+    const f = await fixture(); await f.build('full');
+    await f.call('/api/kb/sources/selection', 'POST', { root: f.raw, action: 'exclude', tokens: ['a'] });
+    expect((await f.call('/api/kb/changes')).data.sources).toEqual([]);
+    expect((await f.build('full')).status).toBe('published');
+    expect(f.published().readManifest()!.sourceSnapshot.map((source) => source.objToken)).toEqual(['b']);
+  });
+
   it('本地目录与云文档合并后可按父节点选择，保留所有源和原始文件', async () => {
     const f = await fixture();
     const paths = ['策划/200/200.md', '策划/200/04/04.md', '策划/200/04/本地.md'];

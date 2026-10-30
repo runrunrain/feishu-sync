@@ -5,7 +5,7 @@ import { sourceTreeRows, subtreeTokens } from '../../utils/kbSourceTree';
 import { Button } from '../common/Button';
 import { ChevronDown, ChevronRight, FileText, Folder } from 'lucide-react';
 const ROW_HEIGHT = 32;
-const LABEL = { added: '新增', changed: '修改', removed: '待移除', unchanged: '', excluded: '已排除' };
+const LABEL = { added: '新增', changed: '修改', removed: '待移除', unchanged: '', excluded: '未选' };
 function SelectionBox({ included, total, disabled, title, onChange, cleanup = false }: { included: number; total: number; disabled: boolean; title: string; onChange: () => void; cleanup?: boolean }) {
   const ref = useRef<HTMLInputElement>(null);
   useEffect(() => { if (ref.current) ref.current.indeterminate = included > 0 && included < total; }, [included, total]);
@@ -63,7 +63,7 @@ export function KbSourceSelector({ running, nonce, onChanged, onOpenSource, canB
   </div>;
   return <div className="flex h-full min-h-0 flex-col">
     <div className="shrink-0 max-h-[45%] overflow-y-auto scrollbar-thin">
-    {!cleanupMode ? <p className="text-xs text-ink-soft mb-3 leading-relaxed">勾选某个层级会同时选择其全部下级文档。取消后保留原文，已参与构建的来源会在下次「按变更更新」时移除其影响。</p> : null}
+    {!cleanupMode ? <p className="text-xs text-ink-soft mb-3 leading-relaxed">勾选某个层级会同时选择其全部下级文档，用于「构建所选文档」。取消勾选不会产生移除差异；「按变更更新」会继续保留仍然可用的已发布来源。</p> : null}
     {cleanupMode ? <p role="status" className="text-sm text-seal mb-3">清理选择模式：请勾选要移入回收区的文档，再点击「清理所选」。</p> : null}
     {notice ? <p role="status" className="text-xs text-jade break-all mb-3">{notice}</p> : null}
     <input aria-label="搜索源文档" placeholder="搜索标题、路径或文档标识" value={q} onChange={(e) => { setQ(e.target.value); resetScroll(); }} className="w-full px-3 py-2 mb-3 rounded border border-line bg-card-bg text-sm" />

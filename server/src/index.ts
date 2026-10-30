@@ -71,7 +71,7 @@ import { piExtensionPath, readAgentPromptAssets } from './agent/agent-assets.js'
 import { RuntimeInstaller } from './agent/runtime-installer.js';
 import { checkRootOverlap, type WorkspaceRootGuards } from './agent/path-guard.js';
 import { collectResolvedRuntimeProtectedRoots, collectStaticProtectedRoots } from './agent/protected-roots.js';
-import type { LarkCliConfig } from './types/index.js';
+import { getEnabledWatchedRootUrls, type LarkCliConfig } from './types/index.js';
 
 // ============================================================================
 // Configuration and Constants
@@ -216,6 +216,13 @@ export async function buildServer(options: CreateServerOptions = {}) {
     {
       knowledgeBaseRoot: config.knowledgeBaseRoot,
       knowledgeBaseRootProvider: () => configManager.getConfig()?.knowledgeBaseRoot ?? '',
+      watchedRootUrlsProvider: () => getEnabledWatchedRootUrls(configManager.getConfig()),
+      onArchiveAdopted: () => {
+        const current = configManager.getConfig();
+        const snapshot = new SnapshotService(localMapStore, configManager, { larkCliClient, config: current });
+        if (current?.knowledgeBaseRoot && snapshot.readExisting(current.knowledgeBaseRoot)) snapshot.refreshSortOrder();
+        else if (current?.knowledgeBaseRoot) snapshot.generate();
+      },
     }
   );
   console.info('[server] ChangeDetector initialized');
@@ -341,7 +348,8 @@ export async function buildServer(options: CreateServerOptions = {}) {
     resolver: runtimeResolver,
     configProvider: () => configManager.getConfig(),
     documentsProvider: knowledgeDocuments,
-    excludedSourcesProvider: () => localMapStore.listKbExcludedSources(configManager.getConfig()?.knowledgeBaseRoot ?? ''),
+    excludedSourcesProvider: () => localMapStore.listKbExplicitlyExcludedSources(configManager.getConfig()?.knowledgeBaseRoot ?? ''),
+    unselectedSourcesProvider: () => localMapStore.listKbExcludedSources(configManager.getConfig()?.knowledgeBaseRoot ?? ''),
     publishedTokensProvider: () => localMapStore.listPublishedCloudTokens(),
     sheetCsvPaths,
     internalBaseUrl: () => (agentInternalPort.port ? `http://127.0.0.1:${agentInternalPort.port}` : ''),

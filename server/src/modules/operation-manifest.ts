@@ -18,7 +18,9 @@ import type {
   WatchedRootConfig,
 } from '../types/index.js';
 import { ScanPolicy } from './scan-policy.js';
+import { IndexScanner } from './index-scanner.js';
 import {
+  isUnderLocalDir,
   resolveAbsolute,
   resolveLocalTarget,
   sanitizePathSegment as sanitizeResolverSegment,
@@ -390,6 +392,24 @@ function planDocument(
   }
 
   if (!isCustomFolderDoc && watchedRoot) {
+    // 从归档接入云端节点树只改变逻辑归属。旧文件和附件仍在原位置，
+    // 同步时先核对文件头身份，再继续原地更新，避免覆盖或丢失附件。
+    const existingInput = document.localRelPath || document.localMdPath;
+    const existingRel = existingInput ? toPortableRelative(root, existingInput) : null;
+    if (existingInput && !existingRel) {
+      return blockedPlan(document, { reasonCode: 'unsafe_path', reason: '已有文件路径位于知识库根目录之外，拒绝同步', suggestedResolution: '请检查该文档的本地文件映射。' });
+    }
+    const existingPath = existingRel ? resolveAbsolute(root, existingRel) : null;
+    const outsideWatchedRoot = existingRel && !isUnderLocalDir(existingRel, watchedRoot.localDir);
+    let verifiedOutsideRoot = false;
+    if (outsideWatchedRoot && existingPath && fs.existsSync(existingPath)) {
+      const unsafe = unsafePathReason(root, existingPath);
+      if (unsafe) return blockedPlan(document, { reasonCode: 'unsafe_path', reason: unsafe, candidateLocalRelPath: existingRel });
+      verifiedOutsideRoot = hasMatchingDocumentIdentity(existingPath, document.objToken);
+      if (!verifiedOutsideRoot) return blockedPlan(document, { reasonCode: 'path_conflict',
+        reason: '已有文件位于同步根之外，且文件头无法确认属于当前文档，拒绝覆盖',
+        candidateLocalRelPath: existingRel, suggestedResolution: '核对原文件身份及路径后再同步。' });
+    }
     const resolved = resolveLocalTarget({
       knowledgeBaseRoot: root,
       watchedRoot,
@@ -399,22 +419,20 @@ function planDocument(
       isWatchedRootNode: document.isWatchedRootNode,
       existingLocalRelPath: document.localRelPath ?? null,
       existingLocalMdPath: document.localMdPath,
+      allowVerifiedOutsideRoot: verifiedOutsideRoot,
       objType: document.objType,
       occupiedRelPaths: occupied,
       // Existing localMdPath that already points at a file is a replace, not
       // an overwrite of a foreign body — PathResolver handles this via
       // existing-mapping preference.
-      rejectExistingFiles:
-        !document.localMdPath
-        && !document.localRelPath
-        && !adoptExistingProfileTargets,
+      rejectExistingFiles: !adoptExistingProfileTargets || Boolean(document.localMdPath || document.localRelPath),
     });
 
     if (!resolved.ok || !resolved.target) {
-      const candidateLocalRelPath =
-        resolved.conflicts.find((conflict) => conflict.relativePath)?.relativePath ?? null;
-      const reasonCode = reasonCodeForPathConflicts(resolved.conflicts);
       const hasExistingFile = resolved.conflicts.some((conflict) => conflict.kind === 'existing-file');
+      const candidateLocalRelPath = resolved.conflicts.find((conflict) => conflict.kind === 'existing-file')?.relativePath
+        ?? resolved.conflicts.find((conflict) => conflict.relativePath)?.relativePath ?? null;
+      const reasonCode = hasExistingFile ? 'path_conflict' : reasonCodeForPathConflicts(resolved.conflicts);
       return blockedPlan(document, {
         reasonCode,
         reason:
@@ -542,6 +560,19 @@ function planDocument(
     ...documentPlanContext(document),
     pathSource: 'legacy-fallback',
   };
+}
+
+function hasMatchingDocumentIdentity(filePath: string, objToken: string): boolean {
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) return false;
+    const fd = fs.openSync(filePath, 'r');
+    try {
+      const buffer = Buffer.alloc(Math.min(stat.size, 64 * 1024));
+      const length = fs.readSync(fd, buffer, 0, buffer.length, 0);
+      return new IndexScanner({} as never).parseMetadata(buffer.subarray(0, length).toString('utf8'))?.obj_token === objToken;
+    } finally { fs.closeSync(fd); }
+  } catch { return false; }
 }
 
 /**

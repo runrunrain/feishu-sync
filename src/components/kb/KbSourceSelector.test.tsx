@@ -24,6 +24,7 @@ it('构建当前选择，全选和取消全选后使用最新的数量', async (
   const button = (label: string) => [...container.querySelectorAll('button')].find((item) => item.textContent === label)!;
   try {
     await act(async () => root.render(<KbSourceSelector running={false} nonce={0} canBuild onBuild={state.build} onChanged={() => {}} onOpenSource={() => {}} />));
+    expect(container.textContent).toContain('取消勾选不会产生移除差异');
     expect(container.querySelector('[aria-label="参与构建：a"]')).not.toBeNull();
     await act(async () => button('构建所选文档').click());
     expect(state.build).toHaveBeenLastCalledWith(1);
