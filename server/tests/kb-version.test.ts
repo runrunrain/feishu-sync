@@ -316,6 +316,40 @@ describe('diff与正文边界', () => {
 
 
 describe('源选择批量事务', () => {
+  it('本地目录与云文档合并后可按父节点选择，保留所有源和原始文件', async () => {
+    const f = await fixture();
+    const paths = ['策划/200/200.md', '策划/200/04/04.md', '策划/200/04/本地.md'];
+    for (const [index, relPath] of paths.entries()) {
+      const file = path.join(f.raw, relPath);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, `文档 ${index}`);
+    }
+    f.documents[0] = { ...f.documents[0], title: '200', wikiNodeToken: 'wiki-a', parentNodeToken: 'missing-root', localRelPath: paths[0], localMdPath: path.join(f.raw, paths[0]) };
+    f.documents[1] = { ...f.documents[1], title: '04', wikiNodeToken: 'wiki-b', parentNodeToken: 'wiki-a', localRelPath: paths[1], localMdPath: path.join(f.raw, paths[1]) };
+    f.documents.push({ ...f.documents[1], objToken: 'c', title: '本地', wikiNodeToken: null, parentNodeToken: null, localRelPath: paths[2], localMdPath: path.join(f.raw, paths[2]) });
+
+    const tree = await f.call('/api/kb/sources/tree');
+    expect(tree.status).toBe(200);
+    expect(tree.data.total).toBe(3);
+    const parent = tree.data.nodes[0].children[0];
+    expect(parent).toMatchObject({ title: '200', source: { objToken: 'a' }, children: [
+      { title: '04', source: { objToken: 'b' }, children: [{ source: { objToken: 'c' } }] },
+    ] });
+    const tokens: string[] = [];
+    const queue = [parent];
+    while (queue.length) {
+      const node = queue.pop()!;
+      if (node.source) tokens.push(node.source.objToken);
+      queue.push(...node.children);
+    }
+    expect(tokens.sort()).toEqual(['a', 'b', 'c']);
+    expect((await f.call('/api/kb/sources/selection', 'POST', { root: f.raw, action: 'exclude', tokens })).status).toBe(200);
+    expect(f.store.listKbExcludedSources(f.raw).sort()).toEqual(tokens);
+    expect((await f.call('/api/kb/sources/selection', 'POST', { root: f.raw, action: 'include', tokens })).status).toBe(200);
+    expect(f.store.listKbExcludedSources(f.raw)).toEqual([]);
+    expect(paths.map((relPath) => fs.readFileSync(path.join(f.raw, relPath), 'utf8'))).toEqual(['文档 0', '文档 1', '文档 2']);
+  });
+
   it('父节点的历史本地正文和子文档都出现在源树并进入构建快照', async () => {
     const f = await fixture();
     const parentFile = path.join(f.raw, '历史父节点.md');

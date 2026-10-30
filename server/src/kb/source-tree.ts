@@ -1,6 +1,73 @@
 import type { DocumentRecord } from '../types/index.js';
 import type { KbSourceChoice, KbSourceTreeNode } from '../types/kb-version.js';
 
+/** 本地父文档既可能位于「目录/目录.md」，也可能位于「目录.md」。 */
+function documentFolderKeys(relPath: string): string[] {
+  const parts = relPath.replace(/\\/g, '/').split('/');
+  if (parts.some((part) => !part || part === '.' || part === '..')) return [];
+  const file = parts.pop()!;
+  if (!/\.md$/i.test(file)) return [];
+  const name = file.slice(0, -3);
+  if (!name) return [];
+  const keys = [[...parts, name].join('/')];
+  const parent = parts.at(-1);
+  if (parent && (process.platform === 'win32' ? parent.toLowerCase() === name.toLowerCase() : parent === name)) {
+    keys.push(parts.join('/'));
+  }
+  return keys.map((key) => process.platform === 'win32' ? key.toLowerCase() : key);
+}
+
+/**
+ * 无父链的本地源会创建目录节点，真实云文档也可能代表同一目录。
+ * 只在路径唯一且两者位于同一层（或文档直接位于该目录内）时合并，
+ * 不凭名称猜测身份，也不改变有明确父链的不同分支。
+ */
+function mergeMirroredFolders(
+  roots: KbSourceTreeNode[],
+  folders: Map<string, KbSourceTreeNode>,
+  nodes: Map<string, KbSourceTreeNode>,
+): void {
+  const folderKeys = new Map<KbSourceTreeNode, string>();
+  for (const [prefix, folder] of folders) {
+    const key = prefix.slice(1);
+    folderKeys.set(folder, process.platform === 'win32' ? key.toLowerCase() : key);
+  }
+  const owners = new Map<string, Set<KbSourceTreeNode>>();
+  for (const node of nodes.values()) {
+    if (!node.source) continue;
+    for (const key of documentFolderKeys(node.source.relPath)) {
+      const matches = owners.get(key) ?? new Set<KbSourceTreeNode>();
+      matches.add(node);
+      owners.set(key, matches);
+    }
+  }
+
+  const queue = [roots];
+  while (queue.length) {
+    const siblings = queue.pop()!;
+    const siblingSet = new Set(siblings);
+    for (let i = 0; i < siblings.length;) {
+      const folder = siblings[i];
+      const folderKey = folderKeys.get(folder);
+      const matches = folderKey ? owners.get(folderKey) : undefined;
+      if (!matches || matches.size !== 1) { i += 1; continue; }
+      const owner = matches.values().next().value!;
+      const ownerInsideFolder = folder.children.includes(owner);
+      if (!ownerInsideFolder && !siblingSet.has(owner)) { i += 1; continue; }
+      owner.children.push(...folder.children.filter((child) => child !== owner));
+      siblingSet.delete(folder);
+      if (ownerInsideFolder) {
+        siblings[i] = owner;
+        siblingSet.add(owner);
+        i += 1;
+      } else {
+        siblings.splice(i, 1);
+      }
+    }
+    for (const node of siblings) if (node.children.length) queue.push(node.children);
+  }
+}
+
 /** 优先真实wiki父链；无父链时按本地目录分组，未同步父文档作为层级节点保留。 */
 export function buildSourceTree(documents: DocumentRecord[], choices: KbSourceChoice[]): KbSourceTreeNode[] {
   const records = new Map(documents.map((doc) => [doc.objToken, doc]));
@@ -41,6 +108,7 @@ export function buildSourceTree(documents: DocumentRecord[], choices: KbSourceCh
     }
     children.push(node);
   }
+  mergeMirroredFolders(roots, folders, nodes);
   const queue = [roots];
   while (queue.length) { const children = queue.pop()!; children.sort((a, b) => a.title.localeCompare(b.title)); for (const child of children) if (child.children.length) queue.push(child.children); }
   return roots;
