@@ -63,6 +63,10 @@ import type {
   KbBuildOrchestrationDto,
   KbBuildReportDto,
   KbDocDto,
+  KbGovernanceDecisionsDto,
+  KbGovernanceDecisionDto,
+  KbGovernancePendingDto,
+  KbHumanReviewDto,
   KbMcpInfoDto,
   KbSearchResult,
   KbStatusDto,
@@ -1225,6 +1229,63 @@ export async function confirmKbRelease(
 /** GET /api/kb/mcp —— 外部 MCP 连接信息（§9.5，供设置页复制）。 */
 export async function getKbMcpInfo(): Promise<KbMcpInfoDto> {
   return request<KbMcpInfoDto>('/api/kb/mcp');
+}
+
+// ---------------------------------------------------------------------------
+// D1（A 案 §4.2/§5.1）人工治理：业务决定 + 高风险人审
+// 写端点仅 desktop 人工入口（CLI 主体 403 kb_governance_forbidden；
+// 决定并发冲突 409 kb_decision_revision_conflict）。
+// ---------------------------------------------------------------------------
+
+/** GET /api/kb/governance/pending —— 待治理对象联查（高风险人审/候选/决定过期）。 */
+export async function getKbGovernancePending(): Promise<KbGovernancePendingDto> {
+  return request<KbGovernancePendingDto>('/api/kb/governance/pending');
+}
+
+/** GET /api/kb/governance/decisions?objectId= —— 决定历史 + 当前有效 + revision。 */
+export async function listKbGovernanceDecisions(objectId?: string): Promise<KbGovernanceDecisionsDto> {
+  const qs = objectId ? `?objectId=${encodeURIComponent(objectId)}` : '';
+  return request<KbGovernanceDecisionsDto>(`/api/kb/governance/decisions${qs}`);
+}
+
+/** POST /api/kb/governance/decisions —— 提交人工业务决定（rationale 必填；
+ * expectedRevision 防并发覆盖；被取代决定保留可追溯）。 */
+export async function submitKbGovernanceDecision(body: {
+  objectId: string;
+  payloadHash: string;
+  scopeKey: string;
+  businessStatus: KbGovernanceDecisionDto['businessStatus'];
+  rationale: string;
+  evidenceIds?: string[];
+  supersedesDecisionId?: string;
+  expectedRevision: number;
+  actor?: string;
+}): Promise<{ decision: KbGovernanceDecisionDto; revision: number }> {
+  return request<{ decision: KbGovernanceDecisionDto; revision: number }>('/api/kb/governance/decisions', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+/** GET /api/kb/governance/human-reviews?objectId= —— 人工复核记录。 */
+export async function listKbHumanReviews(objectId?: string): Promise<{ reviews: KbHumanReviewDto[] }> {
+  const qs = objectId ? `?objectId=${encodeURIComponent(objectId)}` : '';
+  return request<{ reviews: KbHumanReviewDto[] }>(`/api/kb/governance/human-reviews${qs}`);
+}
+
+/** POST /api/kb/governance/human-reviews —— 登记人工内容复核（绑定当前载荷）。 */
+export async function recordKbHumanReview(body: {
+  objectId: string;
+  reviewSubjectHash: string;
+  passed: boolean;
+  reviewerId?: string;
+  note?: string;
+  actor?: string;
+}): Promise<{ review: KbHumanReviewDto }> {
+  return request<{ review: KbHumanReviewDto }>('/api/kb/governance/human-reviews', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
 }
 
 /** User-level MCP changes are immediate and require desktop authorization. */

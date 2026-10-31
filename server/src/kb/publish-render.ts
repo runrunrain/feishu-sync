@@ -28,18 +28,32 @@
  * 5. 代码保护（确定性渲染的正确性边界，设计未明说、此处收紧）：围栏代码块
  *    （```/~~~）与行内代码 span 内的链接/图片一律不改写——标准库正文常含
  *    Markdown 示例，改写会损坏示例内容。
+ * 6. 对象锚点降级（A 案 §7.5）：服务端注入的受限空锚点 `<a id="ko_…"></a>`
+ *    剥离（飞书富文本无对应承载，保留会以字面 HTML 泄入云端）；对象链接
+ *    `path.md#ko_objectId` 保留链接文字降级为指向目标文档的链接（fragment
+ *    丢弃——飞书文档 URL 不承载 Markdown 锚点，云端只能保证文档级跳转）；
+ *    裸锚 `#ko_…`（编译正常不应出现，防御性处理）同样降级为纯文字。每次
+ *    降级发 object_anchor_not_preserved 警告（reason: invisible_anchor /
+ *    link_fragment），进入 publication-service 的 warnings 通道。
  *
  * contentHash = sha256(body)（UTF-8 字节的 hex；设计 §4.2「渲染后发布正文
  * sha256」——标题经 --title 单独传递，不入哈希）。
  *
- * 警告 PublishWarning 按 (code, target) 首次出现去重（同目标多次引用只报
- * 一次，稳定 warnings_json 体积与顺序）。
+ * 警告 PublishWarning 按 (code, target, objectId, reason) 首次出现去重
+ * （同目标/同对象多次引用只报一次，稳定 warnings_json 体积与顺序）。
  */
 
 import crypto from 'node:crypto';
 import path from 'node:path';
 
-export type PublishWarningCode = 'link_target_unpublished' | 'image_not_published';
+export type PublishWarningCode =
+  | 'link_target_unpublished'
+  | 'image_not_published'
+  | 'object_anchor_not_preserved';
+
+/** A 案 §7.5 锚点降级种类：invisible_anchor=空锚点剥离；link_fragment=
+ * 对象链接 fragment 丢弃（降级为文档级跳转/纯文字）。 */
+export type AnchorDegradeReason = 'link_fragment' | 'invisible_anchor';
 
 export interface PublishWarning {
   code: PublishWarningCode;
@@ -49,6 +63,10 @@ export interface PublishWarning {
   target?: string;
   /** 保留进正文的文字（链接文字 / 图片 alt）。 */
   text?: string;
+  /** object_anchor_not_preserved：锚点/fragment 指向的知识对象 ID。 */
+  objectId?: string;
+  /** object_anchor_not_preserved：降级种类（A 案 §7.5）。 */
+  reason?: AnchorDegradeReason;
 }
 
 export interface RenderForPublishInput {
@@ -77,6 +95,11 @@ const SCHEME_RE = /^[a-zA-Z][a-zA-Z0-9+.-]*:/;
 /** 行内图片/链接（URL 不含空白与右括号；支持 "title" 后缀）。 */
 const IMAGE_REF_RE = /!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g;
 const LINK_REF_RE = /\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g;
+/** A 案 §7.5 对象锚点：服务端注入的受限空锚点（与 knowledge-schema 的
+ * SERVER_ANCHOR_RE 同形态）与内部链接的 ko_ fragment。 */
+const SERVER_ANCHOR_TAG_RE = /<a id="(ko_[A-Za-z0-9_-]+)"><\/a>/g;
+const KO_FRAGMENT_RE = /#(ko_[A-Za-z0-9_-]+)$/;
+const BARE_KO_ANCHOR_RE = /^#(ko_[A-Za-z0-9_-]+)$/;
 
 function sha256Hex(text: string): string {
   return crypto.createHash('sha256').update(text, 'utf8').digest('hex');
@@ -175,7 +198,26 @@ function splitInlineCode(line: string): InlineSegment[] {
   return segments;
 }
 
-/** 围栏外一行的链接/图片改写（图片先于链接，避免 `!` 残留）。 */
+/**
+ * A 案 §7.5 剥离服务端受限空锚点（invisible_anchor）：飞书富文本无对应
+ * 承载，保留会以字面 HTML 泄入云端正文。只剥该精确形态，其余 HTML 不动
+ * （knowledge-compiler 已在发布侧剥离任意其他 HTML ID）；每处剥离发一次
+ * 警告。剥离只移除标签本身——独占一行的锚点变空行而非删行，避免把锚点
+ * 两侧的段落合并（段落分隔语义不变，contentHash 仍确定性）。
+ */
+function stripServerAnchors(
+  text: string,
+  kbPath: string,
+  warn: (w: PublishWarning) => void,
+): string {
+  return text.replace(SERVER_ANCHOR_TAG_RE, (_whole, objectId: string) => {
+    warn({ code: 'object_anchor_not_preserved', kbPath, objectId, reason: 'invisible_anchor' });
+    return '';
+  });
+}
+
+/** 围栏外一行的链接/图片改写（图片先于链接，避免 `!` 残留；锚点剥离先于
+ * 二者——A 案 §7.5）。 */
 function rewriteRefs(
   text: string,
   kbPath: string,
@@ -190,9 +232,30 @@ function rewriteRefs(
   });
   return images.replace(LINK_REF_RE, (whole, label: string, url: string) => {
     const target = resolveInternal(kbPath, url);
-    if (target === null) return whole; // 源引用/外链：原样保留
+    if (target === null) {
+      // A 案 §7.5：裸 ko_ 锚链接（#ko_…，指向本文档内对象锚点）——锚点
+      // 已剥离、云端无承载，降级为纯文字保留链接文字；非 ko_ 纯锚与
+      // 外部形式（源引用/外链）原样保留（现状）。
+      const bareKo = BARE_KO_ANCHOR_RE.exec(url);
+      if (bareKo) {
+        warn({ code: 'object_anchor_not_preserved', kbPath, objectId: bareKo[1], reason: 'link_fragment' });
+        return label;
+      }
+      return whole; // 源引用/外链/普通锚点：原样保留
+    }
     const cloud = urlMap.get(target);
-    if (cloud) return `[${label}](${cloud})`;
+    const koFragment = KO_FRAGMENT_RE.exec(url);
+    if (cloud) {
+      // A 案 §7.5：对象链接降级为文档级跳转——fragment 丢弃（飞书文档
+      // URL 不承载 Markdown 锚点），链接文字与目标文档链接保留。
+      if (koFragment) {
+        warn({ code: 'object_anchor_not_preserved', kbPath, target, objectId: koFragment[1], reason: 'link_fragment' });
+      }
+      return `[${label}](${cloud})`;
+    }
+    // 目标未发布：链接整体降级为纯文字，由 link_target_unpublished 表达
+    // （锚点定位信息随之消失，不再叠加 object_anchor_not_preserved——
+    // 未发布是更根本的阻断，警告不重复计）。
     warn({ code: 'link_target_unpublished', kbPath, target, text: label });
     return label;
   });
@@ -220,7 +283,9 @@ export function renderForPublish(input: RenderForPublishInput): RenderForPublish
   const warnings: PublishWarning[] = [];
   const seen = new Set<string>();
   const warn = (w: PublishWarning) => {
-    const key = `${w.code}\u0000${w.target ?? ''}`;
+    // A 案 §7.5：去重键含 objectId/reason——同一对象的多处锚点/fragment
+    // 只报一次，不同对象/不同降级种类分别可见。
+    const key = `${w.code}\u0000${w.target ?? ''}\u0000${w.objectId ?? ''}\u0000${w.reason ?? ''}`;
     if (seen.has(key)) return;
     seen.add(key);
     warnings.push(w);
@@ -242,7 +307,9 @@ export function renderForPublish(input: RenderForPublishInput): RenderForPublish
       continue;
     }
     const rewritten = splitInlineCode(line)
-      .map((seg) => (seg.code ? seg.text : rewriteRefs(seg.text, kbPath, publishedUrlByKbPath, warn)))
+      .map((seg) => (seg.code
+        ? seg.text
+        : rewriteRefs(stripServerAnchors(seg.text, kbPath, warn), kbPath, publishedUrlByKbPath, warn)))
       .join('');
     outLines.push(rewritten);
   }

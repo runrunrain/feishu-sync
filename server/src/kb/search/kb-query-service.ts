@@ -16,7 +16,8 @@ import { comparePath, matchesPrefix } from './normalize.js';
 import { parseQuery, queryHints } from './query.js';
 import { resolveAnchor, sectionRange, splitAnchor, type KbSection } from './outline.js';
 import { resolveRelease as resolvePublishedRelease, availableReleases, validateReleaseId, loadReleaseKnowledge, type ResolvedRelease } from './release-reader.js';
-import { assembleKnowledgeIndex, KNOWLEDGE_INDEX_SCHEMA_VERSION, type KbKnowledgeIndex } from './knowledge-index.js';
+import { assembleKnowledgeIndex, KNOWLEDGE_INDEX_SCHEMA_VERSION, resolveLegacyRef, type KbKnowledgeIndex } from './knowledge-index.js';
+import { resolveEvidenceCurrency, type EvidenceCurrencyState } from './evidence-currency.js';
 import {
   BUSINESS_STATUSES,
   KNOWLEDGE_OBJECT_TYPES,
@@ -27,6 +28,7 @@ import {
   type EvidenceRole,
   type KnowledgeObject,
   type KnowledgeObjectType,
+  type KnowledgeRelation,
   type KnowledgeRelationType,
   type ReviewStatus,
 } from '../knowledge-schema.js';
@@ -63,13 +65,16 @@ export interface KbObjectResultRow {
   evidenceCount: number;
   /** 高风险 claim 无绑定证据的 claimKey（A案 §8.1 证据缺口） */
   evidenceGaps: string[];
+  /** A案 §6.1：asOf 显式传入时对象缺少时间范围——对象模型无有效区间字段，
+   * 如实标注不冒充完整 as-of 推理；不传 asOf 不标注（行为不变） */
+  timeUnknown?: boolean;
   /** 未处于 approved+passed 时提示禁止直接执行（A案 §8.1：用途过滤不是权限机制） */
   caution?: string;
   tombstone?: { reason: string; successorObjectIds: string[] };
   /** related 行携带：命中该对象的关系边 */
-  relation?: { edgeId: string; type: KnowledgeRelationType; direction: 'out' | 'in' };
+  relation?: { edgeId: string; type: KnowledgeRelationType; direction: 'out' | 'in'; /** A案 §6.1：该边缺少时间范围 */ timeUnknown?: boolean };
 }
-export interface KbRelationHint { edgeId: string; type: KnowledgeRelationType; fromObjectId: string; toObjectId: string; decisionRef?: string }
+export interface KbRelationHint { edgeId: string; type: KnowledgeRelationType; fromObjectId: string; toObjectId: string; decisionRef?: string; /** A案 §6.1：asOf 查询下该边缺少时间范围 */ timeUnknown?: boolean }
 export interface KbRelatedBudget {
   maxHops: 1; maxObjects: 6; maxChars: 6000;
   included: number; chars: number;
@@ -79,12 +84,17 @@ export interface KbRelatedBudget {
 export interface ObjectQueryParams extends PageParams {
   usage?: KbUsage;
   objectId?: string;
+  /** A案 §2.4：旧 path#heading 形态引用（与 objectId 二选一；直取/compare 解析族） */
+  legacyRef?: string;
   familyKey?: string;
   types?: KnowledgeObjectType[];
   domainIds?: string[];
   businessStatuses?: BusinessStatus[];
   reviewStatuses?: ReviewStatus[];
   limit?: number;
+  /** A案 §8.1/§6.1：业务日期（ISO）；关系按 validFrom/validUntil 判定有效性，
+   * 缺少时间范围的对象/关系标 timeUnknown；缺省行为完全不变 */
+  asOf?: string;
 }
 export interface ObjectQueryResult {
   releaseId: string;
@@ -100,9 +110,22 @@ export interface ObjectQueryResult {
   excluded?: Record<string, number>;
   hint?: string[];
   legacy?: { label: 'legacy-unclassified'; notice: string };
+  /** asOf 显式传入时回显（业务日期尽力判定） */
+  asOf?: string;
   next: string | null;
 }
-export interface ObjectReadParams extends PageParams { objectId: string }
+export interface ObjectReadParams extends PageParams {
+  /** objectId 与 legacyRef 二选一（A案 §2.4） */
+  objectId?: string;
+  /** 旧 path#heading 引用：命中 alias 表返回当前对象（带 migratedFrom） */
+  legacyRef?: string;
+  /** A案 §8.1/§6.1 业务日期（ISO）：关系有效性 + timeUnknown 标注 */
+  asOf?: string;
+  /** A案 §8.3：当前源根路径（调用方注入：routes 从 config 原始库根解析；
+   * MCP 由进程注入）——提供时证据逐条比对 current/stale/source_missing */
+  currentSourceRoot?: string;
+}
+export interface KbEvidenceCurrentRef { path: string; resourceHash: string }
 export interface KbEvidenceDto {
   evidenceId: string;
   claimKey: string;
@@ -112,6 +135,12 @@ export interface KbEvidenceDto {
   /** 依据定位描述（A案 §8.3：返回该 release 保留的版本和定位） */
   locator: string;
   quoteHash: string;
+  /** A案 §8.3 当前源比对（提供 currentSourceRoot 时逐条给出） */
+  currency?: EvidenceCurrencyState;
+  currencyNote?: string;
+  /** A案 §8.3 双版本并列：发布依据版本（source+locator 即 release 保留侧）
+   * 与当前源版本；仅 current/stale 给出 */
+  comparison?: { currentRef: KbEvidenceCurrentRef | null };
 }
 export interface ObjectReadResult {
   releaseId: string;
@@ -122,6 +151,9 @@ export interface ObjectReadResult {
   related: KbObjectResultRow[];
   relatedBudget: KbRelatedBudget;
   conflictHints: KbRelationHint[];
+  /** A案 §2.4：legacyRef 解析路径信息（objectId 直取不携带） */
+  migratedFrom?: { legacyRef: string; aliasHitObjectId: string; via: string[]; cycle?: boolean };
+  asOf?: string;
   legacy?: { label: 'legacy-unclassified'; notice: string };
   next: null;
 }
@@ -132,6 +164,9 @@ export interface SearchParams extends PageParams { query: string; limit?: number
   domainIds?: string[];
   businessStatuses?: BusinessStatus[];
   reviewStatuses?: ReviewStatus[];
+  /** A案 §6.1 业务日期（ISO）：仅在对象感知/用途过滤下生效（关系有效性、
+   * timeUnknown 标注）；纯全文检索不消费，不改变缺省行为 */
+  asOf?: string;
 }
 export interface SearchResultHit { docId: string; path: string; title: string; summary: string; snippet: string; score?: number; coverage?: number; matchedUnits?: string[]; fallbackUnits?: string[]; matchType?: 'exact'|'fallback'; hits?: SnippetHit[];
   /** 对象感知模式：命中文档内通过过滤的对象及其状态（A案 §8.1 标签随结果流转） */
@@ -140,6 +175,7 @@ export interface SearchResult { releaseId: string; ranker: 'lex-v1'|'l1'; ranker
   usage?: KbUsage;
   /** v1 release / 旧 schema 内容：未分类，不能看起来像已批准（A案 §8.1） */
   legacy?: 'legacy-unclassified';
+  asOf?: string;
   excluded?: Record<string, number>; }
 export interface GrepParams extends PageParams { pattern: string; mode?: 'literal'|'regex'; caseSensitive?: boolean; pathPrefix?: string; context?: number; maxMatches?: number }
 export interface GrepResult { releaseId: string; mode: 'literal'|'regex'; hint?: string; totalMatches: number; totalFiles: number; complete: boolean; partial?: boolean; partialReason?: string; regexTruncatedLines?: number; files: Array<{ path: string; title: string; matches: GrepMatch[] }>; next: string|null }
@@ -160,7 +196,9 @@ export interface ReleaseInfoResult {
   next: string|null;
 }
 interface Cursor { v: 1; r: string; t: string; h: string; o: number; /** A案 §8.2：用途查询钉住 evaluatedAt（新鲜度跨页稳定） */ e?: number }
-export interface KbQueryServiceOptions extends BuildIndexOptions { maxChars?: number; cache?: KbIndexCache; prewarm?: boolean; onWarmError?: (error: unknown) => void }
+export interface KbQueryServiceOptions extends BuildIndexOptions { maxChars?: number; cache?: KbIndexCache; prewarm?: boolean; onWarmError?: (error: unknown) => void;
+  /** A案 §8.3：应用级注入的当前源根（进程配置一处生效；调用点显式传参优先） */
+  currentSourceRoot?: string }
 function int(value: number|undefined, fallback: number, min: number, max: number, field: string): number {
   if (value === undefined) return fallback;
   if (!Number.isInteger(value) || value < min || value > max) invalid(field, `${field} 必须在 ${min}..${max}`);
@@ -182,6 +220,65 @@ function stringArray(value: string[] | undefined, field: string, max: number): s
   return [...new Set(value)].sort();
 }
 function string(value: string|undefined, field: string): void { if (value !== undefined && typeof value !== 'string') invalid(field); }
+/** A案 §8.1/§6.1：asOf 业务日期校验（ISO 日期或日期时间；缺失=缺省行为不变）。
+ * diting S-F07：严格日历与时区校验——
+ * - 日期形态（YYYY-MM-DD）按 UTC 业务日解释（当日 00:00:00Z）；
+ * - 日期时间形态必须带 Z 或显式 ±HH:MM 偏移（无时区拒绝——Date.parse
+ *   会按服务器本地时区解释，同请求在不同机器可跨过不同 validFrom/
+ *   validUntil 边界）；
+ * - 年月日必须真实存在（拒绝 2025-02-30/2025-02-29；Date.parse 会把
+ *   不存在的日期归一到下月，静默漂移业务时点）；
+ * - 规范化后返回（date 原样；datetime 统一 UTC 形态）供游标绑定与回显，
+ *   等价时点（如 +08:00 与对应 UTC）跨页游标一致。 */
+function parseAsOf(value: string | undefined, field = 'asOf'): { ms: number; normalized: string } | undefined {
+  if (value === undefined) return undefined;
+  const dateForm = /^(\d{4})-(\d{2})-(\d{2})$/;
+  const timeForm = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d{1,6})?(Z|[+-]\d{2}:\d{2})$/;
+  const bad = (extra?: string): never => invalid(field, `${field} 必须是真实存在的 ISO 日期（YYYY-MM-DD，按 UTC 业务日解释）或带 Z/显式时区偏移的日期时间（如 2025-01-01 或 2025-01-01T00:00:00Z${extra ?? ''}）`);
+  if (typeof value !== 'string' || value.length > 40 || (!dateForm.test(value) && !timeForm.test(value))) {
+    bad('；无时区的时间（如 2025-01-01T00:00:00）被拒绝');
+  }
+  const match = dateForm.test(value) ? dateForm.exec(value)! : timeForm.exec(value)!;
+  const year = Number(match[1]), month = Number(match[2]), day = Number(match[3]);
+  // 真实日历日期：与 Date UTC 往返比对（归一化偏差即拒绝，覆盖闰年/大小月）
+  const probe = Date.UTC(year, month - 1, day);
+  const roundtrip = new Date(probe);
+  if (roundtrip.getUTCFullYear() !== year || roundtrip.getUTCMonth() !== month - 1 || roundtrip.getUTCDate() !== day) {
+    invalid(field, `${field} 日期不存在：${value}（须为真实日历日期，含闰年规则）`);
+  }
+  if (dateForm.test(value)) {
+    return { ms: Date.parse(`${value}T00:00:00Z`), normalized: value };
+  }
+  const hour = Number(match[4]), minute = Number(match[5]), second = Number(match[6]);
+  if (hour > 23 || minute > 59 || second > 59) invalid(field, `${field} 时间分量越界：${value}`);
+  const offset = match[8]!;
+  if (offset !== 'Z') {
+    const oh = Number(offset.slice(1, 3)), om = Number(offset.slice(4, 6));
+    if (oh > 23 || om > 59) invalid(field, `${field} 时区偏移越界：${offset}`);
+  }
+  const ms = Date.parse(value);
+  if (!Number.isFinite(ms)) bad();
+  return { ms, normalized: new Date(ms).toISOString().replace(/\.000Z$/, 'Z') };
+}
+/** A案 §6.1：关系有效区间只在原文或裁定明确给出时记录；asOf 显式传入时
+ * 按其判定（validFrom>asOf 未生效 / validUntil≤asOf 已失效）。不可解析的
+ * 边界不约束（发布校验器拒绝非法日期，此处防御）。 */
+function relationActiveAt(relation: KnowledgeRelation, asOf: number | undefined): boolean {
+  if (asOf === undefined) return true;
+  if (relation.validFrom !== undefined) {
+    const from = Date.parse(relation.validFrom);
+    if (Number.isFinite(from) && from > asOf) return false;
+  }
+  if (relation.validUntil !== undefined) {
+    const until = Date.parse(relation.validUntil);
+    if (Number.isFinite(until) && until <= asOf) return false;
+  }
+  return true;
+}
+/** A案 §6.1：asOf 查询下该关系缺少可用时间范围（两个边界均缺失或不可解析） */
+function relationTimeUnknown(relation: KnowledgeRelation): boolean {
+  return relation.validFrom === undefined && relation.validUntil === undefined;
+}
 function prefix(value?: string): string {
   string(value, 'pathPrefix'); const p = (value ?? '').replace(/\/+$/, '');
   if (p && (p.startsWith('/') || p.includes('\\') || p.split('/').some((s) => !s || s === '..' || s === '.') || /[:\0]/.test(p))) invalid('pathPrefix');
@@ -218,11 +315,14 @@ function frame(doc: KbIndexDoc, releaseId: string, start: number, end: number, n
 export class KbQueryService {
   readonly cache: KbIndexCache;
   readonly maxChars: number;
+  /** A案 §8.3：进程级当前源根注入（调用点显式传参优先） */
+  readonly currentSourceRoot: string | undefined;
   constructor(public readonly kbRoot: string, private readonly options: KbQueryServiceOptions = {}) {
     this.cache = options.cache ?? new KbIndexCache();
     const env = Number(process.env.KB_MCP_MAX_CHARS);
     const hardLimit = Number.isInteger(env) && env >= 2000 ? env : 20000;
     this.maxChars = int(options.maxChars, hardLimit, 2000, hardLimit, 'maxChars');
+    this.currentSourceRoot = options.currentSourceRoot !== undefined && options.currentSourceRoot.trim() ? options.currentSourceRoot : undefined;
     if (options.prewarm !== false) setImmediate(() => { void this.prewarmCurrent().catch((e) => {
       if (options.onWarmError) options.onWarmError(e); else console.warn('[kb-search] prewarm failed:', e);
     }); });
@@ -339,8 +439,9 @@ export class KbQueryService {
     return (object.claims ?? []).some((claim) => claim.riskCategory === 'high');
   }
   /** 必需依赖可用（A案 §8.1）：depends_on/exception_to 目标自身满足资格且
-   * 其必需依赖递归可用；depends_on 环不可用（带 visiting 守卫）。 */
-  private dependencyUsable(view: KbKnowledgeIndex, objectId: string, evaluatedAt: number, memo: Map<string, boolean>, visiting: Set<string>): boolean {
+   * 其必需依赖递归可用；depends_on 环不可用（带 visiting 守卫）。
+   * asOf 显式传入时依赖边按 validFrom/validUntil 判定有效性（A案 §6.1）。 */
+  private dependencyUsable(view: KbKnowledgeIndex, objectId: string, evaluatedAt: number, memo: Map<string, boolean>, visiting: Set<string>, asOf: number | undefined): boolean {
     const memoized = memo.get(objectId);
     if (memoized !== undefined) return memoized;
     if (visiting.has(objectId)) return false;
@@ -353,7 +454,8 @@ export class KbQueryService {
     if (usable) {
       for (const edge of view.relationsFrom.get(objectId) ?? []) {
         if (edge.type !== 'depends_on' && edge.type !== 'exception_to') continue;
-        if (!this.dependencyUsable(view, edge.toObjectId, evaluatedAt, memo, visiting)) { usable = false; break; }
+        if (!relationActiveAt(edge, asOf)) continue;
+        if (!this.dependencyUsable(view, edge.toObjectId, evaluatedAt, memo, visiting, asOf)) { usable = false; break; }
       }
     }
     visiting.delete(objectId);
@@ -361,14 +463,15 @@ export class KbQueryService {
     return usable;
   }
   /** operational 资格首命原因（A案 §8.1：无结果时返回原因计数，不退回 candidate） */
-  private operationalBlockReason(view: KbKnowledgeIndex, object: KnowledgeObject, evaluatedAt: number, memo: Map<string, boolean>): string | null {
+  private operationalBlockReason(view: KbKnowledgeIndex, object: KnowledgeObject, evaluatedAt: number, memo: Map<string, boolean>, asOf: number | undefined): string | null {
     if (object.businessStatus !== 'approved') return 'not_approved';
     if (object.reviewStatus !== 'passed') return 'review_not_passed';
     if (KbQueryService.isUnknownScope(object)) return 'scope_unknown';
     if (this.freshnessOf(object, evaluatedAt).state === 'overdue' && KbQueryService.hasHighRiskClaim(object)) return 'high_risk_overdue';
     for (const edge of view.relationsFrom.get(object.objectId) ?? []) {
       if (edge.type !== 'depends_on' && edge.type !== 'exception_to') continue;
-      if (!this.dependencyUsable(view, edge.toObjectId, evaluatedAt, memo, new Set())) return 'dependency_unavailable';
+      if (!relationActiveAt(edge, asOf)) continue;
+      if (!this.dependencyUsable(view, edge.toObjectId, evaluatedAt, memo, new Set(), asOf)) return 'dependency_unavailable';
     }
     return null;
   }
@@ -392,7 +495,7 @@ export class KbQueryService {
     }
     return parts.join('\n');
   }
-  private objectRow(release: ResolvedRelease, view: KbKnowledgeIndex, index: KbIndex, object: KnowledgeObject, evaluatedAt: number, matchType: KbObjectMatchType): KbObjectResultRow {
+  private objectRow(release: ResolvedRelease, view: KbKnowledgeIndex, index: KbIndex, object: KnowledgeObject, evaluatedAt: number, matchType: KbObjectMatchType, asOf: number | undefined): KbObjectResultRow {
     const evidence = view.evidenceByObject.get(object.objectId) ?? [];
     const boundClaims = new Set(evidence.map((item) => item.claimKey));
     const knownEvidenceIds = new Set(view.knowledge.evidence.map((item) => item.evidenceId));
@@ -421,6 +524,9 @@ export class KbQueryService {
       snippet: this.canonicalSnippet(index, object),
       evidenceCount: evidence.length,
       evidenceGaps,
+      // A案 §6.1：对象模型不携带有效区间（缺省不是永久有效）——按业务日期
+      // 查询时如实标注 timeUnknown，不冒充支持完整 as-of 推理
+      ...(asOf !== undefined ? { timeUnknown: true } : {}),
       ...(approvedPassed ? {} : { caution: '该对象未处于 approved+review passed 状态，禁止直接作为现行规则执行；用途过滤不是权限机制，直接读取需自行核对状态与证据。' }),
       ...(object.tombstone ? { tombstone: { reason: object.tombstone.reason, successorObjectIds: object.tombstone.successorObjectIds } } : {}),
     };
@@ -428,21 +534,26 @@ export class KbQueryService {
   /** A案 §8.2：关系扩展预算（样本初始默认 1 跳/6 对象/6000 字符）。related 与
    * direct 分离；depends_on/exception_to 优先，其次 part_of；conflicts_with/
    * supersedes 只返回提示与入口，不带入计算链；objectId 去重，超预算返回
-   * remaining 与停止原因。 */
-  private expandRelated(release: ResolvedRelease, view: KbKnowledgeIndex, index: KbIndex, direct: KnowledgeObject[], evaluatedAt: number): { related: KbObjectResultRow[]; relatedBudget: KbRelatedBudget; conflictHints: KbRelationHint[] } {
+   * remaining 与停止原因。asOf 显式传入时关系按 validFrom/validUntil 过滤
+   * （A案 §6.1/§8.1：supersedes 未生效→无提示；被取代对象本身不因此隐藏
+   * ——历史时点语义下 asOf 早于取代生效时间时被取代对象仍可见）。 */
+  private expandRelated(release: ResolvedRelease, view: KbKnowledgeIndex, index: KbIndex, direct: KnowledgeObject[], evaluatedAt: number, asOf: number | undefined): { related: KbObjectResultRow[]; relatedBudget: KbRelatedBudget; conflictHints: KbRelationHint[] } {
     const MAX_HOPS = 1, MAX_OBJECTS = 6, MAX_CHARS = 6000;
     const priority: Partial<Record<KnowledgeRelationType, number>> = { depends_on: 0, exception_to: 0, part_of: 1 };
     const seen = new Set(direct.map((object) => object.objectId));
     const conflictHints: KbRelationHint[] = [];
     const hintSeen = new Set<string>();
-    const candidates: Array<{ object: KnowledgeObject; relation: { edgeId: string; type: KnowledgeRelationType; direction: 'out' | 'in' }; priority: number }> = [];
+    const candidates: Array<{ object: KnowledgeObject; relation: { edgeId: string; type: KnowledgeRelationType; direction: 'out' | 'in'; timeUnknown?: boolean }; priority: number }> = [];
     for (const object of direct) {
       const edges = [...(view.relationsFrom.get(object.objectId) ?? []), ...(view.relationsTo.get(object.objectId) ?? [])];
       for (const edge of edges) {
+        if (!relationActiveAt(edge, asOf)) continue;
         if (edge.type === 'conflicts_with' || edge.type === 'supersedes') {
           if (!hintSeen.has(edge.edgeId)) {
             hintSeen.add(edge.edgeId);
-            conflictHints.push({ edgeId: edge.edgeId, type: edge.type, fromObjectId: edge.fromObjectId, toObjectId: edge.toObjectId, ...(edge.decisionRef ? { decisionRef: edge.decisionRef } : {}) });
+            conflictHints.push({ edgeId: edge.edgeId, type: edge.type, fromObjectId: edge.fromObjectId, toObjectId: edge.toObjectId,
+              ...(edge.decisionRef ? { decisionRef: edge.decisionRef } : {}),
+              ...(asOf !== undefined && relationTimeUnknown(edge) ? { timeUnknown: true } : {}) });
           }
           continue;
         }
@@ -453,7 +564,10 @@ export class KbQueryService {
         const other = view.objectsById.get(otherId);
         if (!other || other.tombstone) continue;
         seen.add(otherId);
-        candidates.push({ object: other, relation: { edgeId: edge.edgeId, type: edge.type, direction: edge.fromObjectId === object.objectId ? 'out' : 'in' }, priority: rank });
+        candidates.push({ object: other,
+          relation: { edgeId: edge.edgeId, type: edge.type, direction: edge.fromObjectId === object.objectId ? 'out' : 'in',
+            ...(asOf !== undefined && relationTimeUnknown(edge) ? { timeUnknown: true } : {}) },
+          priority: rank });
       }
     }
     candidates.sort((a, b) => a.priority - b.priority || (a.relation.edgeId < b.relation.edgeId ? -1 : 1));
@@ -461,7 +575,7 @@ export class KbQueryService {
     let chars = 0, stopReason: KbRelatedBudget['stopReason'] = null;
     for (const candidate of candidates) {
       if (related.length >= MAX_OBJECTS) { stopReason = 'max_objects'; break; }
-      const row: KbObjectResultRow = { ...this.objectRow(release, view, index, candidate.object, evaluatedAt, 'related'), relation: candidate.relation };
+      const row: KbObjectResultRow = { ...this.objectRow(release, view, index, candidate.object, evaluatedAt, 'related', asOf), relation: candidate.relation };
       const rowChars = JSON.stringify(row).length;
       if (chars + rowChars > MAX_CHARS) { stopReason = 'max_chars'; break; }
       related.push(row); chars += rowChars;
@@ -487,27 +601,31 @@ export class KbQueryService {
       notice: '该 release 为 v1（未组织化），无知识对象数据；内容按 legacy-unclassified 处理，不能视为已批准。可继续用全文检索/阅读（search/grep/read）浏览内容，对象级特性不可用。' };
   }
 
-  /** A案 §8.1 对象级查询：objectId 直取 / 过滤列表 / compare 同族并列。 */
+  /** A案 §8.1 对象级查询：objectId/legacyRef 直取 / 过滤列表 / compare 同族并列。 */
   async objects(params: ObjectQueryParams): Promise<ObjectQueryResult> {
     const usage: KbUsage = params.usage === undefined ? 'browse' : params.usage;
     if (usage !== 'browse' && usage !== 'operational' && usage !== 'compare') invalid('usage');
+    const asOf = parseAsOf(params.asOf);
+    const asOfMs = asOf?.ms; // diting S-F07：规范化后进游标/回显（asOf.normalized）
     const types = enumArray(params.types, KNOWLEDGE_OBJECT_TYPES, 'types', 6);
     const businessStatuses = enumArray(params.businessStatuses, BUSINESS_STATUSES, 'businessStatuses', 5);
     const reviewStatuses = enumArray(params.reviewStatuses, REVIEW_STATUSES, 'reviewStatuses', 4);
     const domainIds = stringArray(params.domainIds, 'domainIds', 10);
     const filtersPresent = types !== undefined || businessStatuses !== undefined || reviewStatuses !== undefined || domainIds !== undefined;
     const objectId = params.objectId === undefined ? undefined : (string(params.objectId, 'objectId'), params.objectId);
+    const legacyRef = params.legacyRef === undefined ? undefined : (string(params.legacyRef, 'legacyRef'), params.legacyRef);
     const familyKey = params.familyKey === undefined ? undefined : (string(params.familyKey, 'familyKey'), params.familyKey);
     if (objectId !== undefined && objectId.length < 3) invalid('objectId');
+    if (legacyRef !== undefined && (legacyRef.length < 3 || legacyRef.length > 4096 || !legacyRef.includes('#'))) invalid('legacyRef', 'legacyRef 必须是 path#heading 形态且长度 3..4096');
     if (familyKey !== undefined && (familyKey.length < 1 || familyKey.length > 200)) invalid('familyKey');
     // 互斥校验（沿用现有参数互斥模式）：直取不带过滤；compare 需族键且不接受状态过滤
-    if (objectId !== undefined && familyKey !== undefined) invalid('objectId', 'objectId 与 familyKey 不得同时提供');
-    if (objectId !== undefined && filtersPresent) invalid('objectId', 'objectId 直取不接受过滤参数');
+    if (Number(objectId !== undefined) + Number(legacyRef !== undefined) + Number(familyKey !== undefined) > 1) invalid('objectId', 'objectId/legacyRef/familyKey 至多提供一个');
+    if ((objectId !== undefined || legacyRef !== undefined) && filtersPresent) invalid('objectId', 'objectId/legacyRef 直取不接受过滤参数');
     if (usage === 'compare') {
-      if (objectId === undefined && familyKey === undefined) invalid('familyKey', 'compare 需要 familyKey 或 objectId');
+      if (objectId === undefined && familyKey === undefined && legacyRef === undefined) invalid('familyKey', 'compare 需要 familyKey、objectId 或 legacyRef');
       if (filtersPresent) invalid('usage', 'compare 并列返回各状态方案，不接受类型/状态过滤');
     }
-    if (usage === 'operational' && objectId === undefined && familyKey !== undefined) invalid('familyKey', 'operational 列表不接受 familyKey；同族对比请使用 compare');
+    if (usage === 'operational' && objectId === undefined && legacyRef === undefined && familyKey !== undefined) invalid('familyKey', 'operational 列表不接受 familyKey；同族对比请使用 compare');
     const limit = int(params.limit, 30, 1, 100, 'limit');
     const budget = this.budget(params, 12000);
     const pre = this.resolveRelease(params.releaseId ?? (params.cursor === undefined ? undefined : decode(params.cursor).r));
@@ -519,8 +637,8 @@ export class KbQueryService {
     }
     const evaluatedAt = params.cursor === undefined ? Date.now() : decode(params.cursor).e ?? Date.now();
     const organizationHash = pre.organization!.hash;
-    // A案 §8.2：游标绑定 usage/过滤参数/组织规则版本；evaluatedAt 由游标 e 钉住
-    const normalized = { usage, objectId, familyKey, types, domainIds, businessStatuses, reviewStatuses, limit, budget, organizationHash };
+    // A案 §8.2：游标绑定 usage/过滤参数/组织规则版本/asOf；evaluatedAt 由游标 e 钉住
+    const normalized = { usage, objectId, legacyRef, familyKey, types, domainIds, businessStatuses, reviewStatuses, limit, budget, organizationHash, ...(asOf !== undefined ? { asOf: asOf.normalized } : {}) };
     const { release, index, offset, next } = await this.begin('objects', { ...params, releaseId: pre.releaseId }, normalized, { evaluatedAt });
 
     let direct: KnowledgeObject[];
@@ -528,19 +646,28 @@ export class KbQueryService {
     let excluded: Record<string, number> | undefined;
     const hint: string[] = [];
     if (usage === 'compare') {
-      // A案 §8.1：同 familyKey 方案/冲突/取代并列返回，各标状态；objectId 用于解析所属族
-      const target = objectId !== undefined ? view.objectsById.get(objectId) : undefined;
+      // A案 §8.1：同 familyKey 方案/冲突/取代并列返回，各标状态；objectId/legacyRef 用于解析所属族
+      const target = objectId !== undefined ? view.objectsById.get(objectId)
+        : legacyRef !== undefined ? view.objectsById.get(resolveLegacyRef(view, legacyRef)?.objectId ?? '') : undefined;
       const key = familyKey ?? target?.familyKey;
-      if (!key) throw new QueryError('kb_not_found', '知识对象不存在', { objectId, releaseId: release.releaseId });
+      if (!key) throw new QueryError('kb_not_found', legacyRef !== undefined ? '旧引用未命中 alias 表' : '知识对象不存在', { objectId, legacyRef, releaseId: release.releaseId });
       matchType = 'family';
       direct = view.activeObjects.filter((object) => object.familyKey === key)
         .sort((a, b) => (a.canonical?.path ?? '').localeCompare(b.canonical?.path ?? '')
           || (a.canonical?.bodyRange.startLine ?? 0) - (b.canonical?.bodyRange.startLine ?? 0)
           || (a.objectId < b.objectId ? -1 : 1));
-    } else if (objectId !== undefined) {
-      // A案 §8.1：直接读取已知对象不受 operational 隐式屏蔽（DTO 带状态与提示）
-      const object = view.objectsById.get(objectId);
-      if (!object) throw new QueryError('kb_not_found', '知识对象不存在', { objectId, releaseId: release.releaseId });
+    } else if (objectId !== undefined || legacyRef !== undefined) {
+      // A案 §8.1：直接读取已知对象不受 operational 隐式屏蔽（DTO 带状态与提示）；
+      // A案 §2.4：legacyRef 经 alias 表解析（多后继停在被命中对象，不静默跳第一个）
+      let object: KnowledgeObject | undefined;
+      if (legacyRef !== undefined) {
+        const resolution = resolveLegacyRef(view, legacyRef);
+        object = resolution ? view.objectsById.get(resolution.objectId) : undefined;
+        if (!object) throw new QueryError('kb_not_found', '旧引用未命中 alias 表', { legacyRef, releaseId: release.releaseId });
+      } else {
+        object = view.objectsById.get(objectId!);
+        if (!object) throw new QueryError('kb_not_found', '知识对象不存在', { objectId, releaseId: release.releaseId });
+      }
       direct = [object]; matchType = 'object_id';
     } else {
       matchType = 'filter';
@@ -551,7 +678,7 @@ export class KbQueryService {
       for (const object of view.activeObjects) {
         if (!KbQueryService.objectFiltersMatch(object, filters)) { excluded.excluded_by_filter = (excluded.excluded_by_filter ?? 0) + 1; continue; }
         if (usage === 'operational') {
-          const reason = this.operationalBlockReason(view, object, evaluatedAt, memo);
+          const reason = this.operationalBlockReason(view, object, evaluatedAt, memo, asOfMs);
           if (reason) { excluded[reason] = (excluded[reason] ?? 0) + 1; continue; }
         }
         passing.push(object);
@@ -563,23 +690,33 @@ export class KbQueryService {
         hint.push('当前过滤条件下无满足 operational 资格的对象；excluded 为各原因计数，不自动退回 candidate。可改用 browse 查看候选对象、get_object 直接读取对象（不受屏蔽），或回源原始库核实。');
       }
     }
+    if (asOfMs !== undefined) hint.push(`asOf=${asOf!.normalized} 按业务日期尽力判定：关系按 validFrom/validUntil 过滤；对象缺少时间范围标 timeUnknown，本查询不冒充完整 as-of 推理。`);
     return this.jsonPage(direct, offset, limit, budget, next, (page, cursor) => {
-      const rows = page.map((object) => this.objectRow(release, view, index, object, evaluatedAt, matchType));
-      const { related, relatedBudget, conflictHints } = this.expandRelated(release, view, index, page, evaluatedAt);
+      const rows = page.map((object) => this.objectRow(release, view, index, object, evaluatedAt, matchType, asOfMs));
+      const { related, relatedBudget, conflictHints } = this.expandRelated(release, view, index, page, evaluatedAt, asOfMs);
       return {
         releaseId: release.releaseId, usage, organizationHash,
         total: direct.length, objects: rows, related, relatedBudget, conflictHints,
-        ...(usage === 'operational' && objectId === undefined ? { excluded: excluded ?? {} } : {}),
+        ...(asOfMs !== undefined ? { asOf: asOf!.normalized } : {}),
+        ...(usage === 'operational' && objectId === undefined && legacyRef === undefined ? { excluded: excluded ?? {} } : {}),
         ...(hint.length ? { hint } : {}),
         next: cursor,
       };
     }) as ObjectQueryResult;
   }
 
-  /** A案 §8.1/§8.3：objectId 直取（对象+状态+canonical 片段+证据列表+关系扩展）。 */
+  /** A案 §8.1/§8.3/§2.4：objectId/legacyRef 直取（对象+状态+canonical 片段+证据
+   * 列表（可选当前源比对）+关系扩展）。asOf 业务日期仅作用于关系有效性与
+   * timeUnknown 标注，不改变 freshness（新鲜度是审查过程状态，非业务日期）。 */
   async getObject(params: ObjectReadParams): Promise<ObjectReadResult> {
     string(params.objectId, 'objectId');
-    if (params.objectId.length < 3 || params.objectId.length > 120) invalid('objectId');
+    string(params.legacyRef, 'legacyRef');
+    if (Number(params.objectId !== undefined) + Number(params.legacyRef !== undefined) !== 1) invalid('objectId', 'objectId 与 legacyRef 必须二选一');
+    const asOf = parseAsOf(params.asOf);
+    const asOfMs = asOf?.ms; // diting S-F07：规范化后回显
+    if (params.objectId !== undefined && (params.objectId.length < 3 || params.objectId.length > 120)) invalid('objectId');
+    if (params.legacyRef !== undefined && (params.legacyRef.length < 3 || params.legacyRef.length > 4096 || !params.legacyRef.includes('#'))) invalid('legacyRef', 'legacyRef 必须是 path#heading 形态且长度 3..4096');
+    const sourceRoot = params.currentSourceRoot !== undefined && params.currentSourceRoot.trim() ? params.currentSourceRoot : this.currentSourceRoot;
     const release = this.resolveRelease(params.releaseId);
     const view = this.knowledgeView(release);
     if (!view) {
@@ -588,14 +725,34 @@ export class KbQueryService {
         evidenceNote: '', related: [], relatedBudget: KbQueryService.relatedBudgetEmpty(), conflictHints: [],
         legacy: KbQueryService.legacyNotice(), next: null };
     }
-    const object = view.objectsById.get(params.objectId);
-    if (!object) throw new QueryError('kb_not_found', '知识对象不存在', { objectId: params.objectId, releaseId: release.releaseId });
+    // A案 §2.4：legacyRef → alias 表命中 → 迁移链 → 当前对象（多后继/环停在
+    // 被命中对象，不静默跳第一个）；未命中按旧引用报 not_found
+    let object: KnowledgeObject | undefined;
+    let migratedFrom: ObjectReadResult['migratedFrom'];
+    if (params.legacyRef !== undefined) {
+      const resolution = resolveLegacyRef(view, params.legacyRef);
+      if (!resolution) throw new QueryError('kb_not_found', '旧引用未命中 alias 表', { legacyRef: params.legacyRef, releaseId: release.releaseId });
+      object = view.objectsById.get(resolution.objectId);
+      migratedFrom = { legacyRef: params.legacyRef, aliasHitObjectId: resolution.aliasHitObjectId, via: resolution.migratedFrom,
+        ...(resolution.cycle ? { cycle: true } : {}) };
+      if (!object) throw new QueryError('kb_not_found', '旧引用指向的对象不存在', { legacyRef: params.legacyRef, objectId: resolution.objectId, releaseId: release.releaseId });
+    } else {
+      object = view.objectsById.get(params.objectId!);
+      if (!object) throw new QueryError('kb_not_found', '知识对象不存在', { objectId: params.objectId, releaseId: release.releaseId });
+    }
     const index = await this.load(release);
     const evaluatedAt = Date.now();
-    const row = this.objectRow(release, view, index, object, evaluatedAt, 'object_id');
-    const { related, relatedBudget, conflictHints } = this.expandRelated(release, view, index, [object], evaluatedAt);
+    const row = this.objectRow(release, view, index, object, evaluatedAt, 'object_id', asOfMs);
+    const { related, relatedBudget, conflictHints } = this.expandRelated(release, view, index, [object], evaluatedAt, asOfMs);
     const evidence = view.evidenceByObject.get(object.objectId) ?? [];
-    const evidenceDto: KbEvidenceDto[] = evidence.slice(0, 50).map((item) => ({
+    const pageEvidence = evidence.slice(0, 50);
+    // A案 §8.3：当前源并列比对（提供 sourceRoot 时逐条执行；未提供退化为
+    // 既有 evidenceNote，不访问原始库）
+    const snapshotRel = new Map(release.manifest.sourceSnapshot.map((source) => [source.objToken, source.relPath] as const));
+    const currency = sourceRoot
+      ? pageEvidence.map((item) => resolveEvidenceCurrency({ sourceRoot: sourceRoot!, evidence: item, publishedRelPath: snapshotRel.get(item.sourceRef.sourceId) }))
+      : null;
+    const evidenceDto: KbEvidenceDto[] = pageEvidence.map((item, i) => ({
       evidenceId: item.evidenceId,
       claimKey: item.claimKey,
       role: item.role,
@@ -603,14 +760,27 @@ export class KbQueryService {
       source: { ...item.sourceRef },
       locator: KbQueryService.evidenceLocator(item),
       quoteHash: item.quoteHash,
+      ...(currency ? {
+        currency: currency[i]!.currency,
+        ...(currency[i]!.note ? { currencyNote: currency[i]!.note } : {}),
+        ...(currency[i]!.currency === 'current' || currency[i]!.currency === 'stale'
+          ? { comparison: { currentRef: currency[i]!.currentRef } } : {}),
+      } : {}),
     }));
+    const counts = currency ? currency.reduce<Record<string, number>>((acc, item) => { acc[item.currency] = (acc[item.currency] ?? 0) + 1; return acc; }, {}) : null;
+    const evidenceNote = `依据为该 release 发布时保留的证据版本与定位（共 ${evidence.length} 条${evidence.length > 50 ? `，本页仅列前 50 条` : ''}）。`
+      + (currency && counts
+        ? `已按当前源根比对：current ${counts.current ?? 0} / stale ${counts.stale ?? 0} / source_missing ${counts.source_missing ?? 0} / unsupported ${counts.unsupported ?? 0}；stale 时并列发布依据版本（source+locator）与当前源版本（comparison.currentRef），hash 变化需人工复核；source_missing 表示当前源缺失，发布依据不因此抹除，但存在后续维护风险。`
+        : '当前原始源是否仍与发布依据一致需另行比对，本查询不访问原始库。');
     return {
       releaseId: release.releaseId,
       organizationHash: release.organization!.hash,
       object: row,
       evidence: evidenceDto,
-      evidenceNote: `依据为该 release 发布时保留的证据版本与定位（共 ${evidence.length} 条${evidence.length > 50 ? `，本页仅列前 50 条` : ''}）；当前原始源是否仍与发布依据一致需另行比对，本查询不访问原始库。`,
+      evidenceNote,
       related, relatedBudget, conflictHints,
+      ...(migratedFrom ? { migratedFrom } : {}),
+      ...(asOfMs !== undefined ? { asOf: asOf!.normalized } : {}),
       next: null,
     };
   }
@@ -643,9 +813,12 @@ export class KbQueryService {
   async search(params: SearchParams): Promise<SearchResult> {
     const parsed = parseQuery(params.query), limit = int(params.limit, 10, 1, 30, 'limit');
     const maxSnippets = int(params.maxSnippets, 2, 0, 3, 'maxSnippets'), pathPrefix = prefix(params.pathPrefix);
+    const asOf = parseAsOf(params.asOf);
+    const asOfMs = asOf?.ms; // diting S-F07：规范化后进游标/回显
     if (params.tags !== undefined && (!Array.isArray(params.tags) || params.tags.length > 5 || !params.tags.every((t) => typeof t === 'string'))) invalid('tags');
     const tags = [...new Set(params.tags ?? [])].sort();
-    // A案 §8.1：usage 三态与对象过滤——给出任一参数即进入对象感知模式；缺省行为不变
+    // A案 §8.1：usage 三态与对象过滤——给出任一参数即进入对象感知模式；缺省行为不变。
+    // asOf 仅在对象感知/用途过滤下生效（A案 §6.1 关系有效性），不单独触发对象感知
     const usage: KbUsage | undefined = params.usage === undefined ? undefined
       : (params.usage === 'browse' || params.usage === 'operational' ? params.usage
         : params.usage === 'compare' ? invalid('usage', 'compare 属对象级查询（同 familyKey 并列），请使用对象查询入口') : invalid('usage'));
@@ -660,7 +833,8 @@ export class KbQueryService {
     const evaluatedAt = knowledgeActive && pre ? (params.cursor === undefined ? Date.now() : decode(params.cursor).e ?? Date.now()) : undefined;
     const state = await this.begin('search', knowledgeActive ? { ...params, releaseId: pre!.releaseId } : params,
       { query: params.query, limit, maxSnippets, pathPrefix, tags, budget,
-        ...(knowledgeActive ? { usage: usage ?? 'browse', types, domainIds, businessStatuses, reviewStatuses, organizationHash: pre!.organization?.hash ?? null } : {}) },
+        ...(knowledgeActive ? { usage: usage ?? 'browse', types, domainIds, businessStatuses, reviewStatuses, organizationHash: pre!.organization?.hash ?? null,
+          ...(asOfMs !== undefined ? { asOf: asOf!.normalized } : {}) } : {}) },
       knowledgeActive && evaluatedAt !== undefined ? { evaluatedAt } : undefined);
     const { release, index, offset, next } = state;
     const ranker = process.env.FEISHU_KB_RANKER === 'l1' ? 'l1' : 'lex-v1';
@@ -677,12 +851,12 @@ export class KbQueryService {
       for (const object of view.activeObjects) {
         if (!KbQueryService.objectFiltersMatch(object, filters)) { excluded.excluded_by_filter = (excluded.excluded_by_filter ?? 0) + 1; continue; }
         if (mode === 'operational') {
-          const reason = this.operationalBlockReason(view, object, evaluatedAt!, memo);
+          const reason = this.operationalBlockReason(view, object, evaluatedAt!, memo, asOfMs);
           if (reason) excluded[reason] = (excluded[reason] ?? 0) + 1;
         }
       }
       const passes = (object: KnowledgeObject) => KbQueryService.objectFiltersMatch(object, filters)
-        && (mode !== 'operational' || this.operationalBlockReason(view, object, evaluatedAt!, memo) === null);
+        && (mode !== 'operational' || this.operationalBlockReason(view, object, evaluatedAt!, memo, asOfMs) === null);
       const docQualifying = new Map<string, KnowledgeObject[]>();
       for (const [docPath, objects] of view.objectsByDoc) {
         const passing = objects.filter(passes);
@@ -741,9 +915,11 @@ export class KbQueryService {
     if (knowledge?.mode === 'operational' && !results.length) {
       hints.push('无满足 operational 资格的对象命中（excluded 为原因计数，不自动退回 candidate）。可用 browse 查看候选、get_object 直接读取对象（不受屏蔽），或回源原始库核实。');
     }
+    if (asOfMs !== undefined) hints.push(`asOf=${asOf!.normalized} 按业务日期尽力判定（关系 validFrom/validUntil）；对象缺少时间范围标 timeUnknown，不冒充完整 as-of 推理。`);
     const base = { releaseId: release.releaseId, ranker, rankerVersion: ranker, query, total: results.length, unmatchedUnits,
+      ...(knowledgeActive && asOfMs !== undefined ? { asOf: asOf!.normalized } : {}),
       ...(unmatchedUnits.length ? { warning: '部分完整关键词在当前检索范围内未命中；回退片段仅供改写查询参考，不代表已覆盖所问主题。' } : {}),
-      ...(!results.length ? { hint: hints } : {}),
+      ...(!results.length || hints.length ? { hint: hints } : {}),
       ...(knowledgeActive ? { usage: knowledge?.mode ?? (usage ?? 'browse'), ...(knowledge ? { excluded: knowledge.excluded } : {}), ...(view ? {} : { legacy: 'legacy-unclassified' as const }) } : {}) };
     return this.jsonPage(results, offset, limit, budget, next, (page, cursor) => ({ ...base, results: page.map((build) => build()), next: cursor })) as SearchResult;
   }

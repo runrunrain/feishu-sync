@@ -193,6 +193,7 @@ describe('evidence-locator：CsvCells（引号内换行不等于新记录）', (
 });
 
 describe('evidence-locator：WorkbookCells', () => {
+  // D3：资源接口 sheet 感知（cell(sheet,a1)、合并主格键 `${sheet}!${A1}`）
   const cells: Record<string, { value: string; formula: string | null }> = {
     A1: { value: '10', formula: null },
     B1: { value: '20', formula: '=A1*2' },
@@ -204,8 +205,8 @@ describe('evidence-locator：WorkbookCells', () => {
     workbookName: '数值表.xlsx',
     sheetNames: ['Sheet1', 'Sheet2'],
     usedRange: { maxRow: 5, maxCol: 5 },
-    cell: (a1) => cells[a1],
-    mergedAnchors: new Set(['B2']),
+    cell: (_sheet, a1) => cells[a1],
+    mergedAnchors: new Set(['Sheet1!B2']),
   };
   it('正例：区间 + 合并主格 + 公式性质', () => {
     const result = resolveSelector(workbookResource, {
@@ -520,12 +521,12 @@ describe('kb_write_doc：原子落盘与声明', () => {
     const first = await service.executeTool(token, 'kb_write_doc', { ...BASE_WRITE, objects: [object] });
     const objectId = ((first.details as Record<string, unknown>).objectMap as Record<string, string>)['objKeep']!;
     // F03：流水审查通过回写对象级机器审凭据（scope 命中该文档）
-    const marked = service.markObjectsMachineReviewed(state, ['战斗/伤害规则.md'], 'kr_carry_1');
+    const marked = await service.markObjectsMachineReviewed(state, ['战斗/伤害规则.md'], 'kr_carry_1');
     expect(marked).toBe(1);
     let draft = JSON.parse(fs.readFileSync(path.join(state.stagingRoot, 'knowledge-draft.json'), 'utf-8')) as { objects: Array<Record<string, unknown>> };
     expect(draft.objects[0]).toMatchObject({ reviewStatus: 'passed', reviewActorKind: 'machine', reviewerId: 'kr_carry_1' });
     // scope 外文档的对象不回写
-    expect(service.markObjectsMachineReviewed(state, ['战斗/其他文档.md'], 'kr_x')).toBe(0);
+    expect(await service.markObjectsMachineReviewed(state, ['战斗/其他文档.md'], 'kr_x')).toBe(0);
     // F06：纯重申（载荷与审查主体未变）继承审查凭据；新 clientKey 同族三元组身份保留
     const redeclared = await service.executeTool(token, 'kb_write_doc', {
       ...BASE_WRITE,

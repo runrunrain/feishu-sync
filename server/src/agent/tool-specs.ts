@@ -33,6 +33,7 @@ export const KB_SEARCH_SPEC: AgentToolSpec = {
       businessStatuses: { type: 'array', items: { type: 'string', enum: ['unknown', 'candidate', 'approved', 'disputed', 'deprecated'] }, description: '业务状态过滤' },
       reviewStatuses: { type: 'array', items: { type: 'string', enum: ['pending', 'passed', 'rejected', 'stale'] }, description: '审查状态过滤' },
       domainIds: { type: 'array', items: { type: 'string', maxLength: 80 }, description: '领域 ID 过滤（任一命中即可）' },
+      asOf: string('业务日期（ISO 日期或日期时间，A案 §6.1）：仅在对象感知/用途过滤下生效——关系按 validFrom/validUntil 判定有效性，缺少时间范围的对象/关系标 timeUnknown；纯全文检索不消费'),
     },
     required: ['query'],
     additionalProperties: false,
@@ -208,7 +209,9 @@ const evidenceSelectorSchema: Record<string, unknown> = {
     formulaTexts: { type: 'array', items: { type: 'string' }, description: 'workbook_cells：公式文本（声明 formula_text 性质时附）' },
     valueNature: { type: 'string', enum: ['formula_text', 'cached_value', 'mixed'], description: 'workbook_cells：值性质（缓存值不代表本轮计算）' },
     // media_region
-    imageHash: string('media_region：图片内容哈希（来自资源表）'),
+    // media_region：图片字节哈希对模型不可见——缺省由服务端按资源钉住并随
+    // 声明冻结（D3，A案 §5.2）；显式提供时必须与资源一致。
+    imageHash: string('media_region：图片内容哈希（可缺省：由服务端按资源钉住）'),
     captionHash: string('media_region：旁路文字/描述 hash（可选）'),
     describerVersion: string('media_region：描述器版本（可选）'),
   },
@@ -221,7 +224,7 @@ const sourceRefSchema: Record<string, unknown> = {
   description: '证据来源引用（sourceSnapshotHash/resourceHash 由 server 按快照与资源表补齐复核，不需要也不接受自报）',
   properties: {
     sourceId: string('来源 objToken（必须在快照内）'),
-    resourceId: string('资源 ID：主文档=objToken；CSV 附件=<objToken>#csv:<文件名>（来自 raw_read 资源表）'),
+    resourceId: string('资源 ID：主文档=objToken；CSV 附件=<objToken>#csv:<文件名>；声明工作簿=<objToken>#workbook:<xlsx 名>；图片=<objToken>#image:<md 内 src>（未描述图片不登记）'),
   },
   required: ['sourceId', 'resourceId'],
   additionalProperties: false,

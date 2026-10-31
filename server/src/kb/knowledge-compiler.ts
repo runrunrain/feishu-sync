@@ -31,6 +31,7 @@
 import { Buffer } from 'node:buffer';
 import type {
   BodyRange,
+  BusinessStatus,
   CoverageItem,
   Evidence,
   KnowledgeManifest,
@@ -116,17 +117,50 @@ export interface EvidenceResourceIndexEntry {
   path?: string;
 }
 
+/** evidence/ 内单个证据文件的登记项（D3，A 案 §5.4/§6.2）。工作簿为被引
+ * 用区间的最小快照 JSON，图片为本体字节 + 描述快照；hash 覆盖文件字节，
+ * 整表义 evidence-resources.json 又被 manifest.evidence.hash 覆盖。 */
+export interface EvidenceFileIndexEntry {
+  resourceId: string;
+  /** release 内相对路径（evidence/ 前缀） */
+  path: string;
+  hash: string;
+  bytes: number;
+  kind: 'workbook' | 'image';
+  /** 引用该文件的证据（evidenceId 列表） */
+  evidenceIds: string[];
+  /** 图片证据的描述快照（审查所需图片资源及描述一并保留，不只留描述） */
+  image?: { src: string; imageHash: string; caption: string; describerVersion?: string };
+}
+
 export interface EvidenceResourcesFile {
   schemaVersion: 1;
   normalization: 'utf8-bytes-in-source-contents';
   resources: EvidenceResourceIndexEntry[];
-  /** evidence/ 子目录登记（被引用的工作簿/图片最小充分内容；本阶段声明
-   * 面仅正文/CSV，通常为空——管线保留给后续证据类型） */
-  evidenceFiles: Array<{ resourceId: string; path: string; hash: string; bytes: number }>;
+  /** evidence/ 子目录登记（被引用的工作簿/图片最小充分内容）；无
+   * workbook/image 证据时为空数组（旧行为不变） */
+  evidenceFiles: EvidenceFileIndexEntry[];
 }
 
-/** governance.json 最小骨架（A 案 §4.2/§6.2）：审查凭据集合引用；人工
- * 业务决定服务（decisions）属后续迭代，本阶段恒为空数组、不阻塞发布。 */
+/** governance.json 内的人工决定条目（A 案 §4.2：手工决定作为独立依据
+ * 随 release 冻结，不能假装来自飞书源）。D1 决定服务起支持真实条目；
+ * 构建期写入由 D5 接线（kb-build-service 冻结快照 → release 布局）。
+ * 结构与 KnowledgeGovernanceService.GovernanceDecisionRecord 保持兼容。 */
+export interface GovernanceDecisionEntry {
+  decisionId: string;
+  createdAt: string;
+  actor: string;
+  objectId: string;
+  payloadHash: string;
+  scopeKey: string;
+  businessStatus: BusinessStatus;
+  rationale: string;
+  evidenceIds?: string[];
+  supersedesDecisionId?: string;
+}
+
+/** governance.json（A 案 §4.2/§6.2）：审查凭据集合引用 + 本 release 冻结
+ * 的有效人工决定（D1 起支持真实条目；构建侧写入由 D5 接线）。 */
 export interface GovernanceFile {
   schemaVersion: 1;
   releaseId: string;
@@ -135,7 +169,28 @@ export interface GovernanceFile {
     validReportIds: string[];
     candidateHash?: string;
   };
-  decisions: [];
+  decisions: GovernanceDecisionEntry[];
+  /** diting S-F06（A 案 §4.2）：发布时实际采用的人审凭据——不可变
+   * release 自持证据（随 governance hash 进 manifest 链）；运行期治理
+   * 日志后续新增/清理不改变已发布 release 的展示。结构与
+   * KnowledgeGovernanceService.HumanReviewRecord 保持兼容，另附日志序。 */
+  humanReviewCredentials?: HumanReviewCredentialEntry[];
+}
+
+/** governance.json 内的人审凭据条目（diting S-F06，A 案 §4.2：随 release
+ * 冻结的独立行为与依据记录）。 */
+export interface HumanReviewCredentialEntry {
+  reviewId: string;
+  createdAt: string;
+  actor: string;
+  objectId: string;
+  /** 凭据绑定的对象审查主体哈希（与发布对象一致才被采用） */
+  reviewSubjectHash: string;
+  reviewerId?: string;
+  passed: boolean;
+  note?: string;
+  /** 运行期 human-reviews.jsonl 内的追加序（审计追溯用） */
+  logIndex: number;
 }
 
 export interface KnowledgeCompileResult {
@@ -190,6 +245,13 @@ export class FenceTracker {
     return match ? { run: match[1]!, rest: match[2] ?? '' } : null;
   }
 
+  /** A案 §2.4/编译契约（diting 遗留观察）：CommonMark 规定反引号围栏的
+   * info string 不得含反引号——```bad`info 不是开栏（波浪围栏不受此限）。
+   * validator 复用同一状态机，两端口径一致。 */
+  static isOpeningFence(fence: { run: string; rest: string }): boolean {
+    return !(fence.run[0] === '`' && fence.rest.includes('`'));
+  }
+
   visit(line: string): void {
     const fence = FenceTracker.fenceRunOf(line);
     if (!fence) return;
@@ -200,6 +262,7 @@ export class FenceTracker {
       }
       return;
     }
+    if (!FenceTracker.isOpeningFence(fence)) return;
     this.open = { marker, length: fence.run.length };
   }
 

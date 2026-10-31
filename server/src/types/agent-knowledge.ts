@@ -109,6 +109,10 @@ export interface StandardKbConfig {
   /** B案 §7：发布方式。additive 可选：缺省 'auto'（通过后自动整版发布）；
    * 'confirm' 只在最终候选版本就绪后确认一次（绑定候选版本）。 */
   publishMode?: 'auto' | 'confirm';
+  /** D3（A 案 §5.4）：单 release 证据资源（evidence/ 内工作簿区间快照 +
+   * 图片本体）总量上限（字节）。additive 可选：未设时用缺省 20MB；
+   * 超限发布期 blocking（kb_evidence_unresolved，列出各资源体量）。 */
+  evidenceBudgetBytes?: number;
   /** 第一阶段固定 false（字段预留） */
   autoBuildAfterSync: boolean;
 }
@@ -141,6 +145,19 @@ export interface KbReviewPolicyConfig {
   maxAutoRevisions?: number;
   /** 模型接口失败重试次数，0..5，默认 2（B案 §5）；与内容修订分开计数。 */
   maxInterfaceRetries?: number;
+}
+
+/** D3（A 案 §5.4）：单 release 证据资源总量缺省预算（20MB）。 */
+export const DEFAULT_EVIDENCE_BUDGET_BYTES = 20 * 1024 * 1024;
+/** 证据预算可设范围：1MB..2GB（宽容归一钳制；严格校验同界）。 */
+export const EVIDENCE_BUDGET_MIN_BYTES = 1024 * 1024;
+export const EVIDENCE_BUDGET_MAX_BYTES = 2 * 1024 * 1024 * 1024;
+
+/** D3：解析证据资源预算（未设/非法回落缺省 20MB）。 */
+export function resolveEvidenceBudgetBytes(config: Pick<StandardKbConfig, 'evidenceBudgetBytes'> | null | undefined): number {
+  const value = config?.evidenceBudgetBytes;
+  if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_EVIDENCE_BUDGET_BYTES;
+  return Math.min(EVIDENCE_BUDGET_MAX_BYTES, Math.max(EVIDENCE_BUDGET_MIN_BYTES, Math.floor(value)));
 }
 
 /** B案 §6 构建名额解析：buildConcurrency 优先，未设时回落 buildParallelism；
@@ -527,6 +544,11 @@ export interface KbBuildOrchestrationDto {
     concurrency: number;
     maxAutoRevisions: number;
     maxInterfaceRetries: number;
+    /** D5（A 案 §4.2）：构建启动时冻结的治理决定快照哈希（进度可见；
+     * 无冻结文件/旧检查点为 null）。 */
+    governanceSnapshotHash?: string | null;
+    /** D5（B 案 §3）：规划者是否启用（复用撰写模型，默认关闭） */
+    plannerEnabled?: boolean;
   };
   ended: boolean;
   endReason: string | null;

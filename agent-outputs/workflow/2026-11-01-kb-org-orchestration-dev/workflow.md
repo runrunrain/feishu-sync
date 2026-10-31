@@ -37,6 +37,22 @@
 | P5 | T6 集成验证+diting 终审 | diting | 全部 | 阶段 diff | 审核报告 | findings 回流修复；`npm run check` 全绿 | ✅ 2026-11-01（VERDICT FIX：6 Major + 2 Minor，全部有复现证据） |
 | P5 | T8 二轮修复（F05-R/N01）+ 增量复审 | luban+diting | T7 | 复审报告 | 冻结完整参数+旧检查点兼容 | 复现基线反转 | ✅ 2026-11-01（增量复审：6 RESOLVED + 2 部分→T8 修复；Leader 独立复验谓词反转/全量 check EXIT=0） |
 
+## P6 补充开发（2026-11-01 主上指令：两案 vs 94fdb65 核对后补齐）
+
+核对结论（已确认缺口）：A1 人工决定服务/高风险人审入口（A案§4.2，approved 不可达）；A2 工作簿/图片证据落盘（§5.4，evidenceFiles 恒空）；A3 反向发布锚点降级（§7.5）；A4 asOf 查询+关系时间字段（§8.1/§6.1）；A5 证据当前源并列比对（§8.3）；A6 增量影响闭包（§7.2，现仅源 token 映射）；A7 旧 path#heading alias 解析（§2.4）；A8 围栏 info-string（diting 遗留）；B1 规划者接线（B案§3，工具已就绪无调度）；B2 调度优先级（B案§6，readyTasks 无优先级）。已实现确认：对象迁移查询侧 tombstone/successors ✅、requiredRewrites 基础 ✅。
+
+| 任务 | 范围 | 状态 |
+|---|---|---|
+| D1 治理：决定服务+人审入口+validator | A1（不含 kb-build-service 接线） | ✅ 2026-11-01（49/49+前端 486；治理 API 真机三校验过） |
+| D2 检索：asOf/当前源比对/alias/围栏 | A4/A5/A7/A8 | ✅ 2026-11-01（19 新用例；unsupported 第四态诚实） |
+| D3 证据：工作簿/图片资源落盘 | A2（含发布段 evidence/） | ✅ 2026-11-01（真实 ExcelJS fixture 端到端+预算 blocking） |
+| D4 反向发布：锚点降级 | A3 | ✅ 2026-11-01（16 用例；skip_unchanged 也拦/sidecar 损坏 fail-closed） |
+| D5 调度：规划轮+影响闭包+优先级+决定冻结接线 | B1/B2/A6+A1 接线 | ✅ 2026-11-01（2407/2407；「空治理 warning/治理在用 blocking」过渡取舍经 Leader 复核采纳） |
+| diting 增量审核 | D1–D5 合并 diff | ✅ VERDICT FIX（6M+1m，全部带 E1/E2 复现） |
+| D6 终审修复：S-F01–S-F07 | 全部 | ✅ 2026-11-01（七项复现全反转+反向取证；governance-seam 闭环；全量 2425+check EXIT=0） |
+
+**P6 补充批后仍开放/披露项**：① aging 实为类内静态 FIFO（措辞已如实，动态 aging 未实现）；② S-F01 选择声明串行（同 build 内声明并行度让位正确性）；③ alias 表仅覆盖本 release canonical 位置（改名/移动前的完整历史位置不可恢复，A 案 §2.4 未全量落地）；④ 治理面板真机视觉验证待 UI 复审（jsdom 交互测试已锚）；⑤ 隔离样本业务验证（A 案 §9 攻防拼点）仍未执行——需真实源库与业务负责人，属使用阶段非开发阶段。
+
 ## 总验收矩阵（2026-11-01 终态）
 
 | 总验收项 | 结果 | 证据 |

@@ -279,6 +279,8 @@ export interface CreateBuildTaskInput {
   dependencies: BuildTaskDependency[];
   allowedWritePaths: string[];
   outputRequirements: string;
+  /** D5（B 案 §6）：入队时间；缺省 now。类内 FIFO 排序维度用（非动态 aging；测试可注入）。 */
+  queuedAt?: string;
 }
 
 /**
@@ -343,6 +345,8 @@ export class BuildOrchestration {
       dependencies: deps.map((dep) => ({ ...dep })),
       allowedWritePaths: [...(input.allowedWritePaths ?? [])],
       outputRequirements: input.outputRequirements ?? '',
+      // D5（B 案 §6）：入队时间随任务创建冻结；类内 FIFO 排序只读此字段
+      queuedAt: input.queuedAt ?? new Date().toISOString(),
       execState: 'queued',
       artifactState: 'pending',
       acceptanceState: 'unreviewed',
@@ -463,6 +467,17 @@ export class BuildOrchestration {
    * requires 'acceptance_passed' → 依赖任务 acceptanceState='passed'。
    * 审查任务执行结束但报告缺失（artifact 非 available）不能解锁下游
    * （B 案 §7）。构建结束后不再产出就绪任务。
+   *
+   * D5（B 案 §6）调度优先级：结果按优先级排序返回（FIFO 升级为优先级
+   * 队列；调度方消费顺序即可）：
+   * 1. 已产生草稿的 review/revise 任务优先（避免新撰写抢占审查名额——
+   *    B 案「优先处理已经产生草稿的审查和修订」）；
+   * 2. 同优先级类内按入队时间 queuedAt 升序（diting 披露修正：这是类内
+   *    FIFO——静态比较入队时间，不是动态 aging，不会随等待时长提升
+   *    优先级、不跨类抗饥饿；类 1 长期饱和时类 0 之外的新任务可能持续
+   *    延后，仅靠修订/重试上限与构建超时兜底）；
+   * 3. 其余（write/integrate 首轮、plan）同序；queuedAt 缺省的旧快照按
+   *    创建序。等待者不占位语义不变（消费方按容量领取）。
    */
   readyTasks(): BuildTask[] {
     if (this.endedAt) return [];
@@ -472,7 +487,7 @@ export class BuildOrchestration {
       if (!this.dependenciesSatisfied(task)) continue;
       result.push(this.snapshotTask(task));
     }
-    return result;
+    return result.sort((a, b) => compareReadyOrder(a, b));
   }
 
   dependenciesSatisfied(task: BuildTask): boolean {
@@ -784,4 +799,34 @@ export function nextAttemptTaskId(orchestration: BuildOrchestration, baseId: str
 export function dependencyUnlocked(task: BuildTask, requires: BuildTaskUnlockCondition): boolean {
   if (requires === 'artifact_available') return task.artifactState === 'available';
   return task.acceptanceState === 'passed';
+}
+
+// ============================================================================
+// D5（B 案 §6）调度优先级：已产生草稿的审查/修订优先 + 类内 FIFO
+// ============================================================================
+
+/**
+ * 优先级类（D5，B 案 §6「优先处理已经产生草稿的审查和修订」）：
+ * - 0（高）：已产生草稿的审查与修订任务——role=review/final_review（共
+ *   依赖解锁剖面上必然已有草稿产物），以及轮次 ≥1 的 write/integrate
+ *   修订轮（定向回应已有审查报告的草稿）；
+ * - 1（其余）：首轮 write/integrate 与 plan 按创建序 + 入队序。
+ * diting 披露修正：类内比较是静态 queuedAt FIFO，不是动态 aging——
+ * 不随等待时长提升优先级，不提供跨类抗饥饿。 */
+export function schedulingPriorityClass(task: Pick<BuildTask, 'role' | 'revision'>): 0 | 1 {
+  if (task.role === 'review' || task.role === 'final_review') return 0;
+  if ((task.role === 'write' || task.role === 'integrate') && task.revision > 0) return 0;
+  return 1;
+}
+
+/** readyTasks 排序比较器：优先类升序 → queuedAt 升序（类内 FIFO：早入队
+ * 者先出，静态入队时间比较，非动态 aging）→ 创建序（taskMap 插入序由
+ * 调用方稳定排序保留）。 */
+function compareReadyOrder(a: BuildTask, b: BuildTask): number {
+  const classDiff = schedulingPriorityClass(a) - schedulingPriorityClass(b);
+  if (classDiff !== 0) return classDiff;
+  const at = a.queuedAt ?? '';
+  const bt = b.queuedAt ?? '';
+  if (at !== bt) return at < bt ? -1 : 1;
+  return 0; // 稳定排序保留创建序（Map 插入序）
 }

@@ -52,9 +52,11 @@ import path from 'node:path';
 import { LarkCliError } from '../modules/lark-cli-client.js';
 import { FEISHU_WRITE_SCOPES } from '../sources/feishu-write-service.js';
 import { StandardKbStore } from './standard-kb-store.js';
+import type { KbKnowledgeIndex } from './standard-kb-store.js';
 import { validReleaseId } from './kb-version-store.js';
 import { renderForPublish } from './publish-render.js';
 import { countText } from './text-stats.js';
+import { isKbManifestV2 } from '../types/agent-knowledge.js';
 import type {
   Config,
   KbPublicationRecord,
@@ -72,6 +74,14 @@ export const PUBLISH_VERIFY_RATIO_MAX = 1.25;
 /** §4.1：wiki 祖先链上溯深度上限。 */
 export const PUBLISH_ANCESTRY_MAX_DEPTH = 50;
 
+/**
+ * A 案 §7.5「分发成功与内容权威无关」：反向分发是浏览副本通道，组织元
+ * 数据（knowledge.json/状态 sidecar）不随飞书分发——计划与执行结果都
+ * 携带本说明，云端版本不替代本地 release 的权威地位。
+ */
+export const PUBLISH_DISTRIBUTION_NOTE =
+  '分发内容不含组织元数据（knowledge.json/状态 sidecar 不随飞书分发）；云端版本仅作浏览副本，权威以本地 release 为准';
+
 export type KbPublicationState =
   | 'creating'
   | 'published'
@@ -87,7 +97,8 @@ const KB_PUBLICATION_STATES: ReadonlySet<string> = new Set<KbPublicationState>([
   'failed', 'unknown', 'kb_removed', 'cloud_missing',
 ]);
 
-/** 发布运行警告（渲染警告 §4.3 + 回读校验警告 §4.5 的统一 DTO 形态）。 */
+/** 发布运行警告（渲染警告 §4.3 + 回读校验警告 §4.5 + A 案 §7.5 锦点降
+ * 级/状态提示缺失的统一 DTO 形态）。 */
 export interface PublicationWarningDto {
   code: string;
   kbPath: string;
@@ -95,6 +106,11 @@ export interface PublicationWarningDto {
   text?: string;
   local?: number;
   cloud?: number;
+  /** object_anchor_not_preserved / kb_status_prompt_missing：涉及的知识对象 ID（A 案 §7.5）。 */
+  objectId?: string;
+  /** object_anchor_not_preserved: link_fragment|invisible_anchor；
+   * kb_status_prompt_missing: businessStatus 或 knowledge_index_unavailable。 */
+  reason?: string;
 }
 
 /** warnings_json 解析形态（previousCloudTokens 见 §4.7 归档规则）。 */
@@ -282,6 +298,57 @@ export function createPublishOverlapConfigHook(
 // release「使用中」标记（§4.6：发布期间保留策略清理跳过使用中的 release）
 // ===========================================================================
 
+// ===========================================================================
+// A 案 §7.5 状态提示自然化：候选/争议/废弃对象的状态边界必须在自然正文中可理解
+// ===========================================================================
+
+/**
+ * A 案 §7.5 状态关键词表：candidate/disputed/deprecated 边界的自然语言表
+ * 达（构建提示词已要求「候选/争议边界写在自然正文」——本表校验其存在）。
+ * 合并为一张宽表、任一命中即视为有状态提示：这是存在性安全网（防 sidecar
+ * 状态在正文完全无呈现的静默分发），不是语义审查——词表覆盖三类状态的
+ * 自然表达即可，精确的状态-用词对应由构建内容审查负责。
+ */
+export const STATUS_PROMPT_KEYWORDS: ReadonlySet<string> = new Set([
+  // candidate：候选/备选/待定族
+  '候选', '备选', '待定', '待选', '暂定', '待决', '未定', '尚未确定', '尚未明确', '待确认', '待明确',
+  // disputed：争议/并存/未统一族
+  '争议', '分歧', '冲突', '并存', '未统一', '待统一', '待裁决', '无定论',
+  // deprecated：废弃族
+  '废弃', '弃用', '淘汰', '退役', '停用', '不再使用', '不再采用',
+]);
+
+/**
+ * 正文行片段（对象 canonical bodyRange 投影）内是否含状态关键词段（A 案
+ * §7.5）。围栏代码块内的示例不计（与 renderForPublish 的代码保护同口
+ * 径——示例里的「候选」不是业务状态声明）；行内代码命中仍计（存在性检
+ * 查取宽松方向，误拦交给人工核对而不是静默放行）。空片段（bodyRange 越
+ * 出正文，sidecar 与正文不一致）返回 false——不能证明状态提示存在。
+ */
+export function hasStatusPromptInBody(bodyLines: string[]): boolean {
+  let fence: { char: string; len: number } | null = null;
+  for (const line of bodyLines) {
+    if (fence) {
+      const close = /^ {0,3}(`{3,}|~{3,}) *$/.exec(line);
+      if (close && close[1][0] === fence.char && close[1].length >= fence.len) fence = null;
+      continue;
+    }
+    const open = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+    if (open) {
+      fence = { char: open[1][0], len: open[1].length };
+      continue;
+    }
+    for (const keyword of STATUS_PROMPT_KEYWORDS) {
+      if (line.includes(keyword)) return true;
+    }
+  }
+  return false;
+}
+
+// ===========================================================================
+// release「使用中」标记（§4.6：发布期间保留策略清理跳过使用中的 release）
+// ===========================================================================
+
 const releasesInUse = new Set<string>();
 
 export function markReleaseInUse(releaseId: string): void {
@@ -304,7 +371,7 @@ export interface PublishPlanItemDto {
   kbPath: string;
   title: string;
   action: 'create' | 'update' | 'skip_unchanged' | 'blocked';
-  blockedReason?: 'publish_cloud_edited' | 'cloud_missing' | 'state_unknown' | 'render_failed';
+  blockedReason?: 'publish_cloud_edited' | 'cloud_missing' | 'state_unknown' | 'render_failed' | 'kb_status_prompt_missing';
   contentHash: string;
   warnings: PublicationWarningDto[];
   state: KbPublicationState | null;
@@ -330,6 +397,8 @@ export interface PublishPlanDto {
   };
   /** 执行所需确认值（force 解除冲突时升级为 OVERWRITE_PUBLISHED）。 */
   confirmRequired: typeof PUBLISH_CONFIRM | typeof PUBLISH_OVERWRITE_CONFIRM;
+  /** A 案 §7.5「分发成功与内容权威无关」：分发说明（组织元数据不随飞书分发）。 */
+  distributionNote: string;
 }
 
 export interface PublishItemResultDto {
@@ -349,6 +418,8 @@ export interface PublishRunResultDto {
   items: PublishItemResultDto[];
   removedMarked: string[];
   counts: { created: number; updated: number; skipped: number; blocked: number; failed: number; secondPass: number };
+  /** A 案 §7.5「分发成功与内容权威无关」：分发说明（组织元数据不随飞书分发）。 */
+  distributionNote: string;
 }
 
 interface RenderCacheEntry {
@@ -593,6 +664,22 @@ export class KbPublishService {
       }
     }
 
+    // A 案 §7.5 状态提示门：v2 release（含 knowledge.json）反向分发前校验
+    // 候选/争议/废弃对象在自然正文中有状态说明；v1 无对象语义跳过（无警
+    // 告）。sidecar 损坏/不可读 → fail-closed 阻止全部文档（§8.2 组织查询
+    // 失败不降级，不能证明状态提示存在即不允许分发）。
+    let knowledgeIndex: KbKnowledgeIndex | null = null;
+    let knowledgeGateError: string | null = null;
+    if (isKbManifestV2(manifest)) {
+      try {
+        knowledgeIndex = store.readKnowledgeIndex(manifest.releaseId);
+        if (!knowledgeIndex) knowledgeGateError = 'knowledge.json 索引不可用（v2 release 缺组织数据）';
+      } catch (error) {
+        knowledgeIndex = null;
+        knowledgeGateError = String(error instanceof Error ? error.message : error).slice(0, 200);
+      }
+    }
+
     // 渲染（确定性；readReleaseDoc 失败 → blocked(render_failed)）
     const renders = new Map<string, RenderCacheEntry>();
     const items: PublishPlanItemDto[] = [];
@@ -611,8 +698,10 @@ export class KbPublishService {
         cloudEdited: false,
       };
       let render: RenderCacheEntry | null = null;
+      let sourceMarkdown = '';
       try {
         const loaded = store.readReleaseDoc(manifest.releaseId, doc);
+        sourceMarkdown = loaded.markdown;
         const result = renderForPublish({ kbPath: doc.path, markdown: loaded.markdown, publishedUrlByKbPath });
         render = {
           kbPath: doc.path,
@@ -633,6 +722,20 @@ export class KbPublishService {
       dto.contentHash = render.contentHash;
       dto.warnings = render.warnings;
       this.decideAction(dto, render, row, options.force === true);
+      // A 案 §7.5：无对应状态提示的候选/争议/废弃对象 → 阻止该文档反向分
+      // 发。create/update/skip_unchanged 一律 blocked——skip 本无写入，但
+      // 第二遍互链回写会按 hash 变化对 skip 项 overwrite，同样构成分发动
+      // 作，故一并阻断；原因经 kb_status_prompt_missing 警告在发布详情可见。
+      const statusWarnings: PublicationWarningDto[] = knowledgeGateError !== null
+        ? [{ code: 'kb_status_prompt_missing', kbPath: doc.path, reason: 'knowledge_index_unavailable', text: knowledgeGateError }]
+        : knowledgeIndex !== null ? this.collectStatusPromptWarnings(knowledgeIndex, doc.path, sourceMarkdown) : [];
+      if (statusWarnings.length > 0) {
+        dto.warnings = [...dto.warnings, ...statusWarnings];
+        if (dto.action !== 'blocked') {
+          dto.action = 'blocked';
+          dto.blockedReason = 'kb_status_prompt_missing';
+        }
+      }
       if (dto.action === 'update' && row) updateCandidates.push({ item: dto, row });
       items.push(dto);
     }
@@ -685,8 +788,45 @@ export class KbPublishService {
         targetConfigured: target !== null,
       },
       confirmRequired: forceReleasedConflict ? PUBLISH_OVERWRITE_CONFIRM : PUBLISH_CONFIRM,
+      distributionNote: PUBLISH_DISTRIBUTION_NOTE,
     };
     return { dto, renders };
+  }
+
+  /**
+   * A 案 §7.5 状态提示自然化检查：文档内 businessStatus 为
+   * candidate/disputed/deprecated 的对象，其 canonical 正文范围内必须含
+   * 状态关键词（飞书端不携带 knowledge.json 状态标注，正文无呈现会被误
+   * 读为已确认结论）。approved/unknown 无此强制（unknown 不构成业务声
+   * 明）。缺失 → kb_status_prompt_missing（blocking，由 buildPlan 阻止该
+   * 文档反向分发）。
+   */
+  private collectStatusPromptWarnings(
+    index: KbKnowledgeIndex,
+    kbPath: string,
+    markdown: string,
+  ): PublicationWarningDto[] {
+    const warnings: PublicationWarningDto[] = [];
+    const objects = (index.objectsByDoc.get(kbPath) ?? []).filter((object) => object.canonical !== null
+      && (object.businessStatus === 'candidate'
+        || object.businessStatus === 'disputed'
+        || object.businessStatus === 'deprecated'));
+    if (objects.length === 0) return warnings;
+    const lines = markdown.split('\n');
+    for (const object of objects) {
+      const range = object.canonical!.bodyRange;
+      const slice = lines.slice(Math.max(range.startLine - 1, 0), range.endLine);
+      if (!hasStatusPromptInBody(slice)) {
+        warnings.push({
+          code: 'kb_status_prompt_missing',
+          kbPath,
+          objectId: object.objectId,
+          reason: object.businessStatus,
+          text: `对象 ${object.objectId}（businessStatus=${object.businessStatus}）的正文范围（${range.startLine}-${range.endLine} 行）未含状态边界说明：飞书端不携带 knowledge.json 状态标注，缺失会呈现为已确认结论，该文档被阻止反向分发（A 案 §7.5）`,
+        });
+      }
+    }
+    return warnings;
   }
 
   /**
@@ -1003,7 +1143,7 @@ export class KbPublishService {
         event: 'publish_finished', actor, releaseId: plan.releaseId,
         counts: { ...counts }, removedMarked: removedMarked.length,
       });
-      return { releaseId: plan.releaseId, target, items: results, removedMarked, counts };
+      return { releaseId: plan.releaseId, target, items: results, removedMarked, counts, distributionNote: PUBLISH_DISTRIBUTION_NOTE };
     } finally {
       if (inUseReleaseId !== null) releaseInUseEnded(inUseReleaseId);
       this.publishRunning = false;

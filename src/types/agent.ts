@@ -567,3 +567,76 @@ export type KbBuildEvent =
       unitId?: string;
     }
   | { type: 'assistant_delta'; delta: string; workerId?: string; unitId?: string };
+
+// ---------------------------------------------------------------------------
+// D1（A 案 §4.2/§5.1）人工治理 —— server KnowledgeGovernanceService 镜像
+// ---------------------------------------------------------------------------
+
+export type KbGovernanceBusinessStatus = 'unknown' | 'candidate' | 'approved' | 'disputed' | 'deprecated';
+
+/** 人工业务决定记录（追加式；supersede 链保留历史） */
+export interface KbGovernanceDecisionDto {
+  decisionId: string;
+  createdAt: string;
+  actor: string;
+  objectId: string;
+  payloadHash: string;
+  scopeKey: string;
+  businessStatus: KbGovernanceBusinessStatus;
+  rationale: string;
+  evidenceIds?: string[];
+  supersedesDecisionId?: string;
+  /** 登记时与当前对象 payloadHash 不匹配（消费端拒绝当轮生效） */
+  payloadMismatch?: boolean;
+}
+
+/** 人工内容复核记录（绑定 reviewSubjectHash；变化即失效） */
+export interface KbHumanReviewDto {
+  reviewId: string;
+  createdAt: string;
+  actor: string;
+  objectId: string;
+  reviewSubjectHash: string;
+  reviewerId?: string;
+  passed: boolean;
+  note?: string;
+}
+
+export interface KbGovernanceDecisionsDto {
+  records: KbGovernanceDecisionDto[];
+  effective: KbGovernanceDecisionDto[];
+  revision: number;
+}
+
+/** 待治理对象（GET /api/kb/governance/pending 行；当前 release × 治理状态联查） */
+export interface KbGovernancePendingObjectDto {
+  objectId: string;
+  title: string;
+  type: string;
+  scopeKey: string;
+  businessStatus: KbGovernanceBusinessStatus;
+  reviewStatus: string;
+  payloadHash: string;
+  reviewSubjectHash: string;
+  highRiskClaims: string[];
+  humanReviewed: boolean;
+  effectiveDecision: {
+    decisionId: string;
+    businessStatus: KbGovernanceBusinessStatus;
+    createdAt: string;
+    payloadMismatch: boolean;
+  } | null;
+  allowedDecisionTargets: KbGovernanceBusinessStatus[];
+}
+
+export interface KbGovernancePendingDto {
+  releaseId: string | null;
+  highRisk: KbGovernancePendingObjectDto[];
+  candidates: KbGovernancePendingObjectDto[];
+  staleDecisions: KbGovernancePendingObjectDto[];
+  /** diting S-F04：可操作对象（当前 release 全部活跃对象；含 unknown/
+ * approved/deprecated 的合法转移入口，目标集由服务端按有效决定链计算） */
+  governable: KbGovernancePendingObjectDto[];
+  /** 状态转移表（server DECISION_TARGETS_BY_STATUS；渲染选择项语义用） */
+  transitionTable: Record<string, KbGovernanceBusinessStatus[]>;
+}

@@ -74,6 +74,12 @@ import {
   type EvidenceReadReceipt,
   type EvidenceResource,
 } from '../kb/evidence-locator.js';
+import {
+  IMAGE_RESOURCE_PREFIX,
+  WORKBOOK_RESOURCE_PREFIX,
+  collectImageEvidenceResources,
+  loadWorkbookEvidenceResource,
+} from '../kb/evidence-resources.js';
 import { computeCandidateHash, type ReviewIssue, type ReviewReport } from '../kb/orchestration-contracts.js';
 import { getKbQueryService, QueryError } from '../kb/search/kb-query-service.js';
 import { splitAnchor } from '../kb/search/outline.js';
@@ -167,6 +173,10 @@ export interface BuildRunState {
   whiteboardTexts?: Map<string, WhiteboardTextMap>;
   /** T3（A 案 §6.2）：knowledge-draft.json 内存缓存（真相在文件；首次访问加载） */
   knowledgeDraft?: KnowledgeDraftFile;
+  /** diting S-F01：构建级知识声明互斥队列尾（同 build 的「读取声明→
+   * 复核→提交」临界区排队串行；跨 build 不互斥——worker 共享同一
+   * BuildRunState，锁住在 state 上即构建级）。 */
+  knowledgeDeclarationQueue?: Promise<unknown>;
   /** T3（A 案 §7.2）：organization-plan.json 内存缓存 */
   organizationPlan?: OrganizationPlanFile;
   /** T3（A 案 §5.3）：read-receipts.jsonl 内存镜像（真相在文件；首次访问加载） */
@@ -660,6 +670,9 @@ export class AgentToolService {
       ...(args.domainIds !== undefined ? { domainIds: args.domainIds as string[] } : {}),
       ...(args.businessStatuses !== undefined ? { businessStatuses: args.businessStatuses as unknown as BusinessStatus[] } : {}),
       ...(args.reviewStatuses !== undefined ? { reviewStatuses: args.reviewStatuses as unknown as ReviewStatus[] } : {}),
+      // D5（A案 §6.1）：asOf 透传共用查询层校验/判定（对象感知模式下生效，
+      // 关系 validFrom/validUntil 与 timeUnknown 标注）；不传时行为不变
+      ...(args.asOf !== undefined ? { asOf: requireString(args, 'asOf', 1, 40) } : {}),
     }));
     return {
       content: [{ type: 'text', text: JSON.stringify(page) }],
@@ -1486,7 +1499,7 @@ export class AgentToolService {
   // kb_write_doc / kb_delete_doc / kb_finish（构建 staging 写）
   // ------------------------------------------------------------------
 
-  private toolKbWriteDoc(context: InternalRunContext, args: Record<string, unknown>, meta?: ToolRequestMeta): ToolResult {
+  private async toolKbWriteDoc(context: InternalRunContext, args: Record<string, unknown>, meta?: ToolRequestMeta): Promise<ToolResult> {
     const state = requireBuildState(context);
     // T3（A 案 §7.1）：审查者没有任何草稿写入口
     this.assertNotReviewPhase(context);
@@ -1520,120 +1533,128 @@ export class AgentToolService {
     // ---- T3（A 案 §7.1）：知识声明（全部可选；旧式调用不带新参数完全兼容）----
     const declarationKeys = ['planId', 'expectedDraftRevision', 'objects', 'presentations', 'relations', 'evidenceClaims', 'coverageUpdates'] as const;
     const hasDeclaration = declarationKeys.some((key) => args[key] !== undefined);
-    const baseDraft = hasDeclaration ? this.loadKnowledgeDraft(state) : null;
-    if (baseDraft && meta?.toolCallId && baseDraft.calls[meta.toolCallId]) {
-      // 同 toolCallId 重复提交幂等返回（A 案 §7.1）；不重复写入、不推进修订
-      const call = baseDraft.calls[meta.toolCallId]!;
-      return {
-        content: [{ type: 'text', text: `已写入草稿 ${call.path}（幂等重放，docId=${call.docId}，draftRevision=${call.draftRevision}）` }],
-        details: {
-          path: call.path, docId: call.docId, bytes: call.bytes, idempotentReplay: true,
-          draftRevision: call.draftRevision, objectMap: call.objectIdMap, evidenceMap: call.evidenceIdMap,
-        },
-      };
-    }
-
-    // docId 继承：按 path 沿用当前 release 的 docId（server 分配）；同构建
-    // 内已声明过该路径则沿用 knowledge-draft 登记的 docId（身份稳定）
-    const docId = this.inheritDocId(state, docPath)
-      ?? baseDraft?.docs[docPath]?.docId
-      ?? `kd_${crypto.randomBytes(6).toString('hex')}`;
-    // diting F02：声明坐标基准 = markdown 参数。工具在正文前生成 `# title`
-    // 并剥离首部空行，发布正文行号 = 参数行号 + bodyLineOffset（= 1 − 剥离
-    // 行数）；编译器按该偏移重映射 canonical/claims/presentations，工具侧
-    // 生成标题前后声明坐标一致转换。
-    const stripMatch = /^\s*\n/.exec(markdown);
-    const strippedLines = stripMatch ? stripMatch[0].split('\n').length - 1 : 0;
-    const bodyLineOffset = 1 - strippedLines;
-    // diting F06：托管文档（基线登记对象）不允许旧式参数重写——那会静默
-    // 丢失组织/审查登记并降级 v1；必须携带声明重申，或显式 kb_delete_doc
-    // （对象丢失由发布门禁 kb_migration_invalid 拦截）。
-    if (!baseDraft) {
-      const existing = this.loadKnowledgeDraft(state);
-      const managed = existing.objects.some((object) => !object.tombstone && object.canonical?.path === docPath);
-      if (managed) {
-        throw new ToolError(
-          'kb_object_registry_stale',
-          `文档 ${docPath} 已登记知识对象，旧式参数重写会静默丢失组织/审查登记（不允许静默降 v1，diting F06）。请携带 objects/evidenceClaims 等声明重申对象，或先 kb_delete_doc 删除该文档并声明对象迁移`,
-          409,
-        );
-      }
-    }
-    // 声明解析与校验（写入即拒；正文尚未落盘，任何拒绝都不产生部分写入）
-    const declaration = baseDraft
-      ? this.buildKnowledgeDeclaration(context, state, baseDraft, docPath, docId, args, markdown)
-      : null;
-
-    const buildId = context.buildId ?? 'unknown';
-    const header = [
-      '<!--',
-      'feishu_sync_kb:',
-      `  doc_id: ${docId}`,
-      '  sources:',
-      ...(sources as string[]).map((source) => `    - ${source}`),
-      `  build_id: ${buildId}`,
-      '-->',
-    ].join('\n');
-    const body = markdown.replace(/^\s*\n/, '');
-    const full = `${header}\n# ${title}\n${body}\n`;
-    // 深路径先建父目录（mkdir intent 逐级复核），再裁决写入
-    const parentRel = docPath.includes('/') ? docPath.slice(0, docPath.lastIndexOf('/')) : null;
-    if (parentRel) {
-      resolveInside(path.join(state.stagingRoot, 'docs'), parentRel, 'mkdir');
-    }
-    const target = resolveInside(path.join(state.stagingRoot, 'docs'), docPath, 'write');
-    // T3（A 案 §7.1）：草稿与知识声明同代写入——正文成功而声明持久化失败
-    // 时整体失败（毒化构建，不部分写入），先留旧字节快照供回滚。
-    const previousBytes = fs.existsSync(target) ? fs.readFileSync(target) : null;
-    atomicWriteFile(target, full);
-    if (declaration) {
-      declaration.draft.docs[docPath] = { docId, revision: declaration.draftRevision, bodyLineOffset, basis: 'draft' };
-      const bytes = Buffer.byteLength(full, 'utf-8');
-      if (meta?.toolCallId) {
-        declaration.draft.calls[meta.toolCallId] = {
-          path: docPath,
-          at: new Date().toISOString(),
-          draftRevision: declaration.draftRevision,
-          docId,
-          bytes,
-          objectIdMap: declaration.objectIdMap,
-          evidenceIdMap: declaration.evidenceIdMap,
+    // diting S-F01：bodyRange 计算与声明保存必须在同一构建级互斥区内——
+    // buildKnowledgeDeclaration 内的工作簿/图片证据装配会 await 让出执行；
+    // 无互斥时，先读取共享 knowledgeDraft 深拷贝的一方会在返回后把旧副本
+    // 整包保存，覆盖并发方的 docs/objects/evidence/clientKeys/calls 登记
+    //（文件级 PathClaims 不保护 knowledge-draft.json）。锁住共享
+    // BuildRunState：同 build 的声明写者串行，跨 build 不相互阻塞。
+    return this.withKnowledgeDeclarationLock(state, async (): Promise<ToolResult> => {
+      const baseDraft = hasDeclaration ? this.loadKnowledgeDraft(state) : null;
+      if (baseDraft && meta?.toolCallId && baseDraft.calls[meta.toolCallId]) {
+        // 同 toolCallId 重复提交幂等返回（A 案 §7.1）；不重复写入、不推进修订
+        const call = baseDraft.calls[meta.toolCallId]!;
+        return {
+          content: [{ type: 'text', text: `已写入草稿 ${call.path}（幂等重放，docId=${call.docId}，draftRevision=${call.draftRevision}）` }],
+          details: {
+            path: call.path, docId: call.docId, bytes: call.bytes, idempotentReplay: true,
+            draftRevision: call.draftRevision, objectMap: call.objectIdMap, evidenceMap: call.evidenceIdMap,
+          },
         };
       }
-      try {
-        this.saveKnowledgeDraft(state, declaration.draft);
-      } catch (error) {
-        // 回滚正文，不部分写入；回滚本身失败则保持毒化由批循环终止
-        try {
-          if (previousBytes === null) removeFileInside(path.join(state.stagingRoot, 'docs'), docPath);
-          else atomicWriteFile(target, previousBytes);
-        } catch { /* 已尽力回滚 */ }
-        const message = `知识声明持久化失败（构建已毒化）: ${error instanceof Error ? error.message : String(error)}`;
-        state.poisoned = { code: 'kb_declaration_write_failed', message };
-        throw new ToolError('kb_declaration_write_failed', message, 500);
+
+      // docId 继承：按 path 沿用当前 release 的 docId（server 分配）；同构建
+      // 内已声明过该路径则沿用 knowledge-draft 登记的 docId（身份稳定）
+      const docId = this.inheritDocId(state, docPath)
+        ?? baseDraft?.docs[docPath]?.docId
+        ?? `kd_${crypto.randomBytes(6).toString('hex')}`;
+      // diting F02：声明坐标基准 = markdown 参数。工具在正文前生成 `# title`
+      // 并剥离首部空行，发布正文行号 = 参数行号 + bodyLineOffset（= 1 − 剥离
+      // 行数）；编译器按该偏移重映射 canonical/claims/presentations，工具侧
+      // 生成标题前后声明坐标一致转换。
+      const stripMatch = /^\s*\n/.exec(markdown);
+      const strippedLines = stripMatch ? stripMatch[0].split('\n').length - 1 : 0;
+      const bodyLineOffset = 1 - strippedLines;
+      // diting F06：托管文档（基线登记对象）不允许旧式参数重写——那会静默
+      // 丢失组织/审查登记并降级 v1；必须携带声明重申，或显式 kb_delete_doc
+      // （对象丢失由发布门禁 kb_migration_invalid 拦截）。
+      if (!baseDraft) {
+        const existing = this.loadKnowledgeDraft(state);
+        const managed = existing.objects.some((object) => !object.tombstone && object.canonical?.path === docPath);
+        if (managed) {
+          throw new ToolError(
+            'kb_object_registry_stale',
+            `文档 ${docPath} 已登记知识对象，旧式参数重写会静默丢失组织/审查登记（不允许静默降 v1，diting F06）。请携带 objects/evidenceClaims 等声明重申对象，或先 kb_delete_doc 删除该文档并声明对象迁移`,
+            409,
+          );
+        }
       }
-    }
-    state.writtenPaths?.add(docPath);
-    state.docMeta?.set(docPath, { title, summary, tags, sources: sources as string[] });
-    return {
-      content: [{
-        type: 'text',
-        text: `已写入草稿 ${docPath}（docId=${docId}，${full.length} 字节）`
-          + (declaration ? `；知识声明：对象 ${Object.keys(declaration.objectIdMap).length}、证据 ${Object.keys(declaration.evidenceIdMap).length}、draftRevision=${declaration.draftRevision}` : ''),
-      }],
-      details: {
-        path: docPath,
-        docId,
-        bytes: Buffer.byteLength(full, 'utf-8'),
-        ...(declaration
-          ? {
+      // 声明解析与校验（写入即拒；正文尚未落盘，任何拒绝都不产生部分写入）
+      const declaration = baseDraft
+        ? await this.buildKnowledgeDeclaration(context, state, baseDraft, docPath, docId, args, markdown)
+        : null;
+
+      const buildId = context.buildId ?? 'unknown';
+      const header = [
+        '<!--',
+        'feishu_sync_kb:',
+        `  doc_id: ${docId}`,
+        '  sources:',
+        ...(sources as string[]).map((source) => `    - ${source}`),
+        `  build_id: ${buildId}`,
+        '-->',
+      ].join('\n');
+      const body = markdown.replace(/^\s*\n/, '');
+      const full = `${header}\n# ${title}\n${body}\n`;
+      // 深路径先建父目录（mkdir intent 逐级复核），再裁决写入
+      const parentRel = docPath.includes('/') ? docPath.slice(0, docPath.lastIndexOf('/')) : null;
+      if (parentRel) {
+        resolveInside(path.join(state.stagingRoot, 'docs'), parentRel, 'mkdir');
+      }
+      const target = resolveInside(path.join(state.stagingRoot, 'docs'), docPath, 'write');
+      // T3（A 案 §7.1）：草稿与知识声明同代写入——正文成功而声明持久化失败
+      // 时整体失败（毒化构建，不部分写入），先留旧字节快照供回滚。
+      const previousBytes = fs.existsSync(target) ? fs.readFileSync(target) : null;
+      atomicWriteFile(target, full);
+      if (declaration) {
+        declaration.draft.docs[docPath] = { docId, revision: declaration.draftRevision, bodyLineOffset, basis: 'draft' };
+        const bytes = Buffer.byteLength(full, 'utf-8');
+        if (meta?.toolCallId) {
+          declaration.draft.calls[meta.toolCallId] = {
+            path: docPath,
+            at: new Date().toISOString(),
             draftRevision: declaration.draftRevision,
-            objectMap: declaration.objectIdMap,
-            evidenceMap: declaration.evidenceIdMap,
-          }
-          : {}),
-      },
-    };
+            docId,
+            bytes,
+            objectIdMap: declaration.objectIdMap,
+            evidenceIdMap: declaration.evidenceIdMap,
+          };
+        }
+        try {
+          this.saveKnowledgeDraft(state, declaration.draft);
+        } catch (error) {
+          // 回滚正文，不部分写入；回滚本身失败则保持毒化由批循环终止
+          try {
+            if (previousBytes === null) removeFileInside(path.join(state.stagingRoot, 'docs'), docPath);
+            else atomicWriteFile(target, previousBytes);
+          } catch { /* 已尽力回滚 */ }
+          const message = `知识声明持久化失败（构建已毒化）: ${error instanceof Error ? error.message : String(error)}`;
+          state.poisoned = { code: 'kb_declaration_write_failed', message };
+          throw new ToolError('kb_declaration_write_failed', message, 500);
+        }
+      }
+      state.writtenPaths?.add(docPath);
+      state.docMeta?.set(docPath, { title, summary, tags, sources: sources as string[] });
+      return {
+        content: [{
+          type: 'text',
+          text: `已写入草稿 ${docPath}（docId=${docId}，${full.length} 字节）`
+            + (declaration ? `；知识声明：对象 ${Object.keys(declaration.objectIdMap).length}、证据 ${Object.keys(declaration.evidenceIdMap).length}、draftRevision=${declaration.draftRevision}` : ''),
+        }],
+        details: {
+          path: docPath,
+          docId,
+          bytes: Buffer.byteLength(full, 'utf-8'),
+          ...(declaration
+            ? {
+              draftRevision: declaration.draftRevision,
+              objectMap: declaration.objectIdMap,
+              evidenceMap: declaration.evidenceIdMap,
+            }
+            : {}),
+        },
+      };
+    });
   }
 
   private inheritDocId(state: BuildRunState, docPath: string): string | null {
@@ -1762,10 +1783,16 @@ export class AgentToolService {
   // T3：知识协议（A 案 §7.1/§7.2）——声明解析、组织计划、审查提交
   // ------------------------------------------------------------------
 
-  /** 审查轮没有任何草稿写入口（A 案 §7.1）。 */
+  /** 审查轮没有任何草稿写入口（A 案 §7.1）；规划轮同样无草稿写入口
+   *（D5，B 案 §3：规划者只提交计划建议，「规划者不能自行增加并发、
+   * 跳过审查或决定发布」，也没有草稿写面）。 */
   private assertNotReviewPhase(context: InternalRunContext): void {
-    if (context.options.worker?.phase === 'review') {
+    const phase = context.options.worker?.phase;
+    if (phase === 'review') {
       throw new ToolError('kb_review_readonly', '审查者没有任何草稿写入口；草稿修订由撰写/整合轮提交', 403);
+    }
+    if (phase === 'plan') {
+      throw new ToolError('kb_plan_readonly', '规划者没有任何草稿写入口：只读源材料并经 kb_submit_plan 提交计划建议；草稿由撰写单元按冻结计划写入', 403);
     }
   }
 
@@ -1804,6 +1831,29 @@ export class AgentToolService {
     fs.mkdirSync(state.stagingRoot, { recursive: true });
     atomicWriteFile(path.join(state.stagingRoot, 'knowledge-draft.json'), `${JSON.stringify(draft, null, 2)}\n`);
     state.knowledgeDraft = draft;
+  }
+
+  /**
+   * diting S-F01（构建级互斥队列）：同 build 的「读取当前声明→并发/计划
+   * 复核→正文与声明提交」临界区串行执行；跨 build 不相互阻塞（锁住在
+   * 共享 BuildRunState 上）。必须覆盖 bodyRange 计算与声明保存的全过程
+   *（含 buildKnowledgeDeclaration 内工作簿/图片证据装配的 await 让出
+   * 窗口）——否则先读取共享 knowledgeDraft 深拷贝的 worker 会在返回后把
+   * 旧副本整包覆盖回去，丢失并发 worker 的 docs/objects/evidence/
+   * clientKeys/calls 登记与审查凭据回写。所有修改共享登记/审查凭据的
+   * 写者（kb_write_doc 声明段、markObjectsMachineReviewed）共用本机制。
+   */
+  private async withKnowledgeDeclarationLock<T>(state: BuildRunState, operation: () => Promise<T> | T): Promise<T> {
+    const prior = state.knowledgeDeclarationQueue ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    state.knowledgeDeclarationQueue = prior.then(() => gate);
+    await prior;
+    try {
+      return await operation();
+    } finally {
+      release(); // 前一临界区失败也必然放行后续排队者（不毒化队列）
+    }
   }
 
   private loadOrganizationPlan(state: BuildRunState, buildId = 'unknown'): OrganizationPlanFile {
@@ -1847,7 +1897,7 @@ export class AgentToolService {
    * kb_* 系列；ID 全部 server 预分配，模型自报的 approved/passed/reviewer
    * 等字段不在入参面，永远不会被读取。
    */
-  private buildKnowledgeDeclaration(
+  private async buildKnowledgeDeclaration(
     context: InternalRunContext,
     state: BuildRunState,
     base: KnowledgeDraftFile,
@@ -1855,12 +1905,12 @@ export class AgentToolService {
     docId: string,
     args: Record<string, unknown>,
     markdown: string,
-  ): {
+  ): Promise<{
     draft: KnowledgeDraftFile;
     objectIdMap: Record<string, string>;
     evidenceIdMap: Record<string, string>;
     draftRevision: number;
-  } {
+  }> {
     void context;
     const draft: KnowledgeDraftFile = JSON.parse(JSON.stringify(base)) as KnowledgeDraftFile;
     const markdownLines = markdown.split('\n');
@@ -2036,30 +2086,34 @@ export class AgentToolService {
       lineStart: receipt.selector.lineStart,
       lineEnd: receipt.selector.lineEnd,
     }));
-    const resourceCache = new Map<string, { resources: EvidenceResource[]; sourceSnapshotHash: string }>();
-    const resourcesFor = (sourceId: string): { resources: EvidenceResource[]; sourceSnapshotHash: string } => {
+    // D3（A 案 §5.2/§5.4）：工作簿/图片资源按引用懒装配（Promise 缓存防重入
+    // ——工作簿解析是异步 ExcelJS 路径）；未被引用的源不额外解析，旧式
+    // text/csv 行为字节级不变。
+    const resourceCache = new Map<string, Promise<{ resources: EvidenceResource[]; sourceSnapshotHash: string }>>();
+    const resourcesFor = (sourceId: string, referenced: ReadonlySet<string>): Promise<{ resources: EvidenceResource[]; sourceSnapshotHash: string }> => {
       const cached = resourceCache.get(sourceId);
       if (cached) return cached;
-      const entry = state.snapshot.get(sourceId);
-      if (!entry) throw new ToolError('invalid_request', `来源不在快照内: ${sourceId}`);
-      let verified;
-      try {
-        verified = state.snapshot.readVerified(state.knowledgeBaseRoot, sourceId);
-      } catch (error) {
-        if (error instanceof PathGuardError && error.code === 'source_changed_during_build') {
-          state.poisoned = { code: error.code, message: error.message };
+      const promise = (async (): Promise<{ resources: EvidenceResource[]; sourceSnapshotHash: string }> => {
+        const entry = state.snapshot.get(sourceId);
+        if (!entry) throw new ToolError('invalid_request', `来源不在快照内: ${sourceId}`);
+        let verified;
+        try {
+          verified = state.snapshot.readVerified(state.knowledgeBaseRoot, sourceId);
+        } catch (error) {
+          if (error instanceof PathGuardError && error.code === 'source_changed_during_build') {
+            state.poisoned = { code: error.code, message: error.message };
+          }
+          throw error;
         }
-        throw error;
-      }
-      const resources: EvidenceResource[] = [{
-        resourceId: sourceId,
-        kind: 'text',
-        content: verified.content,
-        sourceId,
-        sourceSnapshotHash: entry.contentHash,
-        resourceHash: contentResourceHash(verified.content),
-      }];
-      for (const attachment of verified.attachments) {
+        const resources: EvidenceResource[] = [{
+          resourceId: sourceId,
+          kind: 'text',
+          content: verified.content,
+          sourceId,
+          sourceSnapshotHash: entry.contentHash,
+          resourceHash: contentResourceHash(verified.content),
+        }];
+        for (const attachment of verified.attachments) {
         const base = path.basename(attachment.path);
         resources.push({
           resourceId: `${sourceId}#csv:${base}`,
@@ -2071,11 +2125,47 @@ export class AgentToolService {
           resourceHash: contentResourceHash(attachment.content),
         });
       }
-      const pack = { resources, sourceSnapshotHash: entry.contentHash };
-      resourceCache.set(sourceId, pack);
-      return pack;
+      // D3（A 案 §5.2）：声明 XLSX 进入资源表（WorkbookCells selector 可引用）；
+      // 解析复用 raw-workbook 既有路径与体量/结构护栏。
+      if ([...referenced].some((id) => id.startsWith(`${sourceId}${WORKBOOK_RESOURCE_PREFIX}`))) {
+        try {
+          const payload = await loadWorkbookEvidenceResource(state.knowledgeBaseRoot, entry, verified.content);
+          if (!payload) {
+            throw new Error(`源内无 source_workbook 声明（${entry.relPath}）；声明 XLSX 才能作为工作簿证据资源`);
+          }
+          resources.push(payload.resource);
+        } catch (error) {
+          if (error instanceof ToolError) throw error;
+          throw new ToolError('kb_evidence_unresolved',
+            `工作簿证据资源不可用: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      // D3（A 案 §5.1/§5.2）：只登记已有识图描述的被引用图片——unavailable
+      // 图片不得充当支撑；未描述图片不在资源表，引用即拒。
+      if ([...referenced].some((id) => id.startsWith(`${sourceId}${IMAGE_RESOURCE_PREFIX}`))) {
+        for (const payload of collectImageEvidenceResources(
+          state.knowledgeBaseRoot, entry, verified.content, state.imageDescriptions?.get(sourceId),
+        )) {
+          resources.push(payload.resource);
+        }
+      }
+        const pack = { resources, sourceSnapshotHash: entry.contentHash };
+        return pack;
+      })();
+      resourceCache.set(sourceId, promise);
+      return promise;
     };
     const evidenceInputs = args.evidenceClaims === undefined ? [] : requireArray(args, 'evidenceClaims');
+    // 引用资源 ID 预扫描：按源分组，驱动工作簿/图片资源的懒装配
+    const referencedBySource = new Map<string, Set<string>>();
+    for (const raw of evidenceInputs) {
+      const probe = asRecord(raw);
+      const probeRef = asRecord(probe?.sourceRef);
+      if (typeof probeRef?.sourceId !== 'string' || typeof probeRef.resourceId !== 'string') continue;
+      let set = referencedBySource.get(probeRef.sourceId);
+      if (!set) { set = new Set(); referencedBySource.set(probeRef.sourceId, set); }
+      set.add(probeRef.resourceId);
+    }
     const newEvidence: Evidence[] = [];
     const evidenceIdMap: Record<string, string> = {};
     const submissionEvidenceKeys = new Map<string, string>();
@@ -2092,13 +2182,19 @@ export class AgentToolService {
       if (!sourceRefInput) throw new ToolError('invalid_request', 'evidenceClaims.sourceRef 必须是对象');
       const sourceId = requireString(sourceRefInput, 'sourceId', 1, 256);
       const resourceId = requireString(sourceRefInput, 'resourceId', 1, 400);
-      const pack = resourcesFor(sourceId);
+      const pack = await resourcesFor(sourceId, referencedBySource.get(sourceId) ?? new Set());
       const resource = pack.resources.find((candidate) => candidate.resourceId === resourceId);
       if (!resource) {
         throw new ToolError('kb_evidence_unresolved',
-          `证据资源不在本构建资源表: ${resourceId}（可用：${pack.resources.map((candidate) => candidate.resourceId).join(', ')}；资源表来自 raw_read 回执）`);
+          `证据资源不在本构建资源表: ${resourceId}（可用：${pack.resources.map((candidate) => candidate.resourceId).join(', ')}；资源表来自 raw_read 回执，工作簿=<objToken>#workbook:<名>、图片=<objToken>#image:<src>，未描述图片不登记）`);
       }
-      const selector = parseSelector(input.selector);
+      let selector = parseSelector(input.selector);
+      // D3：media_region 的 imageHash 由服务端按资源钉住——图片字节哈希对
+      // 模型不可见，缺省即补齐并随声明冻结（显式提供时必须与资源一致，
+      // resolveSelector 会拒绝不符值）。
+      if (selector.kind === 'media_region' && !selector.imageHash && resource.kind === 'image') {
+        selector = { ...selector, imageHash: resource.imageHash };
+      }
       const role = input.role;
       if (role !== 'supports' && role !== 'contradicts' && role !== 'context') {
         throw new ToolError('invalid_request', `evidenceClaims.role 非法: ${String(role)}`);
@@ -2322,7 +2418,7 @@ export class AgentToolService {
       if (seenItemIds.has(itemId)) throw new ToolError('invalid_request', `coverageUpdates.itemId 重复: ${itemId}`);
       seenItemIds.add(itemId);
       const sourceId = requireString(input, 'sourceId', 1, 256);
-      const pack = resourcesFor(sourceId);
+      const pack = await resourcesFor(sourceId, referencedBySource.get(sourceId) ?? new Set());
       const category = requireString(input, 'category', 1, 200);
       const disposition = input.disposition;
       if (disposition !== 'mapped' && disposition !== 'excluded_template' && disposition !== 'excluded_nonknowledge' && disposition !== 'unresolved') {
@@ -2404,24 +2500,30 @@ export class AgentToolService {
    * 为声明期按当时对象载荷计算并随草稿留存的值（重申时已按实际载荷
    * 失效/继承）。文档级报告不自动冒充人审（reviewActorKind 恒 machine）。
    * scopePaths=null 表示全库范围（最终复核）。返回本次标记的对象数。
+   *
+   * diting S-F01：本方法修改共享声明/审查凭据，与 kb_write_doc 声明段
+   * 共用同一构建级互斥队列（异步化排队）——否则它会落在并发 kb_write_doc
+   * 的「读旧副本→await→整包保存」窗口内被覆盖丢失。
    */
-  markObjectsMachineReviewed(state: BuildRunState, scopePaths: string[] | null, reportId: string): number {
-    const draft = this.loadKnowledgeDraft(state);
-    const scope = scopePaths ? new Set(scopePaths) : null;
-    const reviewedAt = new Date().toISOString();
-    let marked = 0;
-    for (const object of draft.objects) {
-      if (object.tombstone || !object.canonical) continue;
-      if (scope && !scope.has(object.canonical.path)) continue;
-      if (object.reviewStatus === 'passed' && object.reviewerId === reportId) continue; // 幂等
-      object.reviewStatus = 'passed';
-      object.reviewActorKind = 'machine';
-      object.reviewerId = reportId;
-      object.reviewedAt = reviewedAt;
-      marked += 1;
-    }
-    if (marked > 0) this.saveKnowledgeDraft(state, draft);
-    return marked;
+  async markObjectsMachineReviewed(state: BuildRunState, scopePaths: string[] | null, reportId: string): Promise<number> {
+    return this.withKnowledgeDeclarationLock(state, () => {
+      const draft = this.loadKnowledgeDraft(state);
+      const scope = scopePaths ? new Set(scopePaths) : null;
+      const reviewedAt = new Date().toISOString();
+      let marked = 0;
+      for (const object of draft.objects) {
+        if (object.tombstone || !object.canonical) continue;
+        if (scope && !scope.has(object.canonical.path)) continue;
+        if (object.reviewStatus === 'passed' && object.reviewerId === reportId) continue; // 幂等
+        object.reviewStatus = 'passed';
+        object.reviewActorKind = 'machine';
+        object.reviewerId = reportId;
+        object.reviewedAt = reviewedAt;
+        marked += 1;
+      }
+      if (marked > 0) this.saveKnowledgeDraft(state, draft);
+      return marked;
+    });
   }
 
 
@@ -3121,9 +3223,11 @@ function parseSelector(value: unknown): EvidenceSelector {
     };
   }
   if (kind === 'media_region') {
+    // D3（A 案 §5.2）：imageHash 可缺省——图片字节哈希对模型不可见，缺省时
+    // 由声明校验按资源钉住并随声明冻结；显式提供且与资源不符会被拒。
     return {
       kind: 'media_region',
-      imageHash: optStr(input, 'imageHash') ?? (() => { throw new ToolError('invalid_request', 'media_region.imageHash 必填'); })(),
+      imageHash: optStr(input, 'imageHash') ?? '',
       ...(asRecord(input.region)
         ? {
           region: {

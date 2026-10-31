@@ -37,6 +37,10 @@ export interface BuildUnit {
   ownedDocs: string[];
   /** 分量涉及的受影响文档（含默认删除的），供单元提示词使用 */
   affectedDocs: BuildUnitDocRef[];
+  /** D5（A 案 §7.2）：闭包文档的支撑源（只读输入）。它们不在工作集（未
+   * 变化、不计云端新增/不进批次/不要求 skipped 去向），仅供单元核对与
+   * 引用（raw_read 可读快照内任意源）。 */
+  readOnlySources?: string[];
   bytes: number;
   /** P2-S2：单元内源的有效字数合计（调度排序键；不进 manifest/哈希） */
   words: number;
@@ -60,6 +64,11 @@ export interface PlanUnitsInput {
   /** P2-S2：每批有效字数预算（standardKb.buildBatchWordBudget）。
    * 0/缺省 = 旧行为（按源数切分）；full 模式单元上限 = 该值 ×3。 */
   wordBudget?: number;
+  /** D5（A 案 §7.2）闭包文档归属：requiredRewrites 中由影响闭包/决定/
+   * 迁移种子纳入的文档及其支撑源。seedPath 给出时并入种子文档所在分量
+   *（语义闭包沿边传播）；否则并入自身支撑源分量，分量无工作集源时由
+   * 兼底/归并机制归属到可执行单元——闭包文档不能成孤儿（必须有人重写）。 */
+  closureDocLinks?: Array<{ path: string; sources: string[]; seedPath?: string }>;
 }
 
 /** relPath 一级目录键；`_custom/<文件夹>` 视为一级（自定义归档整夹一组）。 */
@@ -164,6 +173,18 @@ export function planUnits(input: PlanUnitsInput): BuildUnit[] {
   const graphSources = new Set<string>([...worksetTokens, ...removedSet]);
   const requiredSet = new Set(input.requiredRewrites);
   const uf = new UnionFind();
+  // D5（A 案 §7.2）：闭包文档先并入归属分量——有 seedPath 的并入种子
+  // 文档分量（语义闭包沿边传播到同一执行单元）；无 seedPath 的（决定/
+  // 迁移种子）并入自身支撑源分量，无工作集源时由下方孤儿归并/兼底处理。
+  const closureReadOnly = new Map<string, string[]>();
+  for (const link of input.closureDocLinks ?? []) {
+    closureReadOnly.set(link.path, [...new Set(link.sources)]);
+    if (link.seedPath) {
+      uf.union(`doc:${link.path}`, `doc:${link.seedPath}`);
+    } else {
+      for (const token of link.sources) uf.union(`doc:${link.path}`, `src:${token}`);
+    }
+  }
   // 受影响文档 = sources ∩ (workset ∪ removed) 非空；或本身在 requiredRewrites。
   // 先建图（union），分量归属在全部 union 完成后再解析——中途的 root
   // 可能被后续 union 链改写，插入时记账会错桶。
@@ -207,12 +228,35 @@ export function planUnits(input: PlanUnitsInput): BuildUnit[] {
       ...(affectedByComponent.get(root) ?? []),
       ...(deletedDocsByComponent.get(root) ?? []),
     ];
-    units.push(makeUnit(units.length, sources.sort(), input, wordBudget, wordsOf, owned, affectedDocs));
+    // D5（A 案 §7.2）：分量内闭包文档的支撑源归入单元只读输入
+    const readOnly = [...new Set(affectedDocs.flatMap((doc) => closureReadOnly.get(doc.path) ?? []))];
+    units.push(makeUnit(units.length, sources.sort(), input, wordBudget, wordsOf, owned, affectedDocs, readOnly));
+    void root;
+  }
+
+  // D5（A 案 §7.2）：孤儿闭包文档归并——requiredRewrites 中未被任何分量
+  // 单元认领的文档（决定/迁移种子且自身源不在工作集），归并到首个单元
+  //（负载最大单元，sortUnitsByLoadDesc 后）；否则由下方兼底空单元承接。
+  // 不归并就没有执行者重写它们，闭包会静默失效。
+  const ownedByUnits = new Set(units.flatMap((unit) => unit.ownedDocs));
+  const orphanDocs = units.length > 0
+    ? [...requiredSet].filter((docPath) => !ownedByUnits.has(docPath))
+    : [];
+  if (orphanDocs.length > 0) {
+    const target = units[0]!;
+    for (const docPath of orphanDocs) {
+      target.ownedDocs.push(docPath);
+      if (!target.affectedDocs.some((doc) => doc.path === docPath)) {
+        target.affectedDocs.push({ path: docPath, title: input.baseDocTitles?.get(docPath) ?? docPath });
+      }
+    }
+    target.readOnlySources = [...new Set([...(target.readOnlySources ?? []), ...orphanDocs.flatMap((docPath) => closureReadOnly.get(docPath) ?? [])])];
   }
 
   // 仅有删除（或删除影响全部走默认删除）→ 保底一个空单元
   if (units.length === 0 && (affected.length > 0 || input.requiredRewrites.length > 0)) {
-    units.push(makeUnit(0, [], input, wordBudget, wordsOf, [...input.requiredRewrites], affected));
+    units.push(makeUnit(0, [], input, wordBudget, wordsOf, [...input.requiredRewrites], affected,
+      [...new Set(input.requiredRewrites.flatMap((docPath) => closureReadOnly.get(docPath) ?? []))]));
   }
 
   return sortUnitsByLoadDesc(units);
@@ -226,6 +270,7 @@ function makeUnit(
   wordsOf: (token: string) => number,
   ownedDocs: string[],
   affectedDocs: BuildUnitDocRef[],
+  readOnlySources?: string[],
 ): BuildUnit {
   let bytes = 0;
   let words = 0;
@@ -240,6 +285,7 @@ function makeUnit(
     sources: sortedSources,
     ownedDocs: [...ownedDocs].sort(),
     affectedDocs: affectedDocs.sort((a, b) => a.path.localeCompare(b.path)),
+    ...(readOnlySources && readOnlySources.length > 0 ? { readOnlySources: [...new Set(readOnlySources)].sort() } : {}),
     bytes,
     words,
     // 空单元保底一个空批（对应现状保底空批：删除影响必须进 prompt）。

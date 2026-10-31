@@ -40,6 +40,8 @@ import {
   buildDefaultAgentVisionConfig,
   VISION_MAX_IMAGE_BYTES_CEILING,
   buildDefaultAgentOrchestrationConfig,
+  EVIDENCE_BUDGET_MAX_BYTES,
+  EVIDENCE_BUDGET_MIN_BYTES,
   type AgentConfig,
   type AgentOrchestrationConfig,
   type AgentVisionConfig,
@@ -407,6 +409,11 @@ function normalizeStandardKbConfigLoose(value: unknown, dataRoot: string): Stand
     reviewPolicy: normalizeReviewPolicyLoose(raw.reviewPolicy, base.reviewPolicy),
     // B案 §7：发布方式（非法值回落默认 auto）
     publishMode: raw.publishMode === 'confirm' ? 'confirm' : 'auto',
+    // D3（A 案 §5.4）：证据资源预算（非数字/非法保持 undefined → 缺省
+    // 20MB，resolveEvidenceBudgetBytes 统一解析）
+    evidenceBudgetBytes: typeof raw.evidenceBudgetBytes === 'number' && Number.isFinite(raw.evidenceBudgetBytes)
+      ? Math.max(EVIDENCE_BUDGET_MIN_BYTES, Math.min(EVIDENCE_BUDGET_MAX_BYTES, Math.floor(raw.evidenceBudgetBytes)))
+      : undefined,
     promptTimeoutMinutes: typeof raw.promptTimeoutMinutes === 'number'
       ? Math.max(1, Math.min(240, Math.floor(raw.promptTimeoutMinutes)))
       : base.promptTimeoutMinutes,
@@ -581,6 +588,13 @@ export function validateAgentAndKbConfig(value: {
     // B案 §7：发布方式枚举
     if (kb.publishMode !== undefined && !['auto', 'confirm'].includes(kb.publishMode)) {
       details.push({ field: 'standardKb.publishMode', code: 'invalid_value' });
+    }
+    // D3（A 案 §5.4）：证据资源预算范围（严格路径；宽容归一在
+    // normalizeStandardKbConfigLoose）
+    if (kb.evidenceBudgetBytes !== undefined
+      && (typeof kb.evidenceBudgetBytes !== 'number' || !Number.isInteger(kb.evidenceBudgetBytes)
+        || kb.evidenceBudgetBytes < EVIDENCE_BUDGET_MIN_BYTES || kb.evidenceBudgetBytes > EVIDENCE_BUDGET_MAX_BYTES)) {
+      details.push({ field: 'standardKb.evidenceBudgetBytes', code: 'out_of_range' });
     }
     // B案 §5：审查闭环预算范围
     if (kb.reviewPolicy !== undefined && (!kb.reviewPolicy || typeof kb.reviewPolicy !== 'object')) {

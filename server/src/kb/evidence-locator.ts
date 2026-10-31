@@ -44,16 +44,21 @@ export interface EvidenceCsvResource extends EvidenceResourceBase {
   parserVersion?: string;
 }
 
-/** 工作簿资源：冻结解析快照（消费 raw-workbook.ts 既有解析；此处无 IO） */
+/** 工作簿资源：冻结解析快照（消费 raw-workbook.ts 既有解析；此处无 IO）。
+ * D3（A 案 §5.2）：cell/mergedAnchors 均 sheet 感知——多 sheet 工作簿里
+ * 同名 A1 跨 sheet 歧义，未带 sheet 的查格会把 Sheet1 的值冒充 Sheet2
+ * 证据；mergedAnchors 键为 `${sheet}!${A1}`（A1 大写）。usedRange 为全簿
+ * 上界（各 sheet 维度最大值）：越出它的区间必拒绝；落在上界内但超出
+ * 该 sheet 实际维度的格子按空值解（`A1=`），由 quoteHash 保持两端一致。 */
 export interface EvidenceWorkbookResource extends EvidenceResourceBase {
   kind: 'workbook';
   workbookName: string;
   sheetNames: string[];
   /** 已用区域上界（1 起始；A1 区间越界拒绝） */
   usedRange: { maxRow: number; maxCol: number };
-  /** A1 → 单元格快照；公式文本与缓存值性质由此区分 */
-  cell: (a1: string) => { value: string; formula: string | null } | undefined;
-  /** 实际合并主格集合（A1 集合；提供时校验 selector.mergedCellAnchors） */
+  /** sheet + A1 → 单元格快照；公式文本与缓存值性质由此区分 */
+  cell: (sheet: string, a1: string) => { value: string; formula: string | null } | undefined;
+  /** 实际合并主格集合（`${sheet}!${A1}`；提供时校验 selector.mergedCellAnchors） */
   mergedAnchors?: ReadonlySet<string>;
 }
 
@@ -316,8 +321,8 @@ function resolveWorkbookCells(resource: EvidenceWorkbookResource, selector: Work
       || cell.col < range.startCol || cell.col > range.endCol) {
       return { ok: false, code: 'kb_evidence_unresolved', message: `WorkbookCells 合并主格不在区间内: ${anchor}` };
     }
-    if (resource.mergedAnchors && !resource.mergedAnchors.has(anchor.toUpperCase())) {
-      return { ok: false, code: 'kb_evidence_unresolved', message: `WorkbookCells 合并主格与资源合并表不符: ${anchor}` };
+    if (resource.mergedAnchors && !resource.mergedAnchors.has(`${selector.sheet}!${anchor.toUpperCase()}`)) {
+      return { ok: false, code: 'kb_evidence_unresolved', message: `WorkbookCells 合并主格与资源合并表不符: ${selector.sheet}!${anchor}` };
     }
   }
   const parts: string[] = [];
@@ -326,7 +331,7 @@ function resolveWorkbookCells(resource: EvidenceWorkbookResource, selector: Work
   for (let row = range.startRow; row <= range.endRow; row += 1) {
     for (let col = range.startCol; col <= range.endCol; col += 1) {
       const a1 = `${colLetters(col)}${row}`;
-      const cell = resource.cell(a1);
+      const cell = resource.cell(selector.sheet, a1);
       if (cell) {
         if (cell.formula) { formulaCells += 1; parts.push(`${a1}=${cell.formula}`); }
         else { valueCells += 1; parts.push(`${a1}=${cell.value}`); }

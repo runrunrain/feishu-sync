@@ -9,7 +9,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
-import { Activity, AlertCircle, BookOpen, ChevronLeft, ChevronRight, CloudUpload, Hammer, Link2, ListTree, Loader2, Settings2, Sparkles } from 'lucide-react';
+import { Activity, AlertCircle, BookOpen, ChevronLeft, ChevronRight, CloudUpload, Hammer, Link2, ListTree, Loader2, Settings2, ShieldCheck, Sparkles } from 'lucide-react';
 import { KbReadingControls } from '../components/kb/KbReadingControls';
 import { useKbReadingPreferences } from '../hooks/useKbReadingPreferences';
 import { KbTreePanel } from '../components/kb/KbTreePanel';
@@ -19,6 +19,7 @@ import { KbBuildPanel, type BuildLogLine } from '../components/kb/KbBuildPanel';
 import { KbPublishPanel } from '../components/kb/KbPublishPanel';
 import { KbPublishModal, type KbPublishModalTab } from '../components/kb/KbPublishModal';
 import { KbPublishStateBadge } from '../components/kb/KbPublishStateBadge';
+import { KbGovernancePanel } from '../components/kb/KbGovernancePanel';
 import { RawSourceDrawer } from '../components/kb/RawSourceDrawer';
 import { MarkdownView } from '../components/preview/MarkdownView';
 import { Modal } from '../components/common/Modal';
@@ -98,7 +99,7 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
   const [buildIssues, setBuildIssues] = useState<KbBuildIssue[]>([]);
   const [buildLogs, setBuildLogs] = useState<BuildLogLine[]>([]);
   const [directoryOpen, setDirectoryOpen] = useState(true);
-  const [sidebar, setSidebar] = useState<'sources' | 'build' | 'publish' | 'progress' | null>(null);
+  const [sidebar, setSidebar] = useState<'sources' | 'build' | 'publish' | 'progress' | 'governance' | null>(null);
   const [cancelling, setCancelling] = useState(false);
   const [confirming, setConfirming] = useState<'incremental' | 'selected' | null>(null);
   const [selectedBuildCount, setSelectedBuildCount] = useState(0);
@@ -419,6 +420,7 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
     { id: 'publish' as const, label: '发布', name: '发布到飞书', icon: CloudUpload },
     { id: 'build' as const, label: '构建', name: '构建标准库', icon: Hammer },
     { id: 'progress' as const, label: '进度', name: '构建进度', icon: Activity },
+    { id: 'governance' as const, label: '治理', name: '人工复核与业务决定', icon: ShieldCheck },
   ];
 
   const docPublication = doc ? publicationsByPath.get(doc.path) ?? null : null;
@@ -500,6 +502,7 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
             onResume={() => setResumeConfirm(true)} onRestart={() => openBuild('sources')} resuming={resuming}
             onBuildUpdated={setBuild} />
             : <p className="p-4 text-xs text-ink-faint">尚无构建记录。可在构建侧栏选择文档并发起构建。</p>
+          : sidebar === 'governance' ? <KbGovernancePanel />
           : sidebar === 'publish' ? <KbPublishPanel
             publications={publications}
             loading={publicationsLoading}

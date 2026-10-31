@@ -20,11 +20,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { KbBuildService } from '../kb/kb-build-service.js';
 import { StandardKbStore, KbNotPublishedError } from '../kb/standard-kb-store.js';
-import { QueryError } from '../kb/search/kb-query-service.js';
+import { QueryError, getKbQueryService } from '../kb/search/kb-query-service.js';
 import { RawSourceSnapshot, collectSourceCandidates } from '../kb/raw-source-snapshot.js';
 import { KbVersionStore, captureSourceContents, sourceChangePreview, validReleaseId } from '../kb/kb-version-store.js';
 import type { KbChangePreview } from '../types/kb-version.js';
 import { computeChangeset } from '../kb/kb-build-service.js';
+import { KnowledgeGovernanceService, allowedDecisionTargets } from '../kb/knowledge-governance-service.js';
 import { enrichEntriesWithWhiteboardTextHash } from '../kb/source-images.js';
 import { hashImageFile, resolveSourceImages } from '../kb/source-images.js';
 import { ToolError } from '../agent/agent-tool-service.js';
@@ -34,6 +35,7 @@ import { resolveDataRoot } from '../modules/data-root.js';
 import { kbMcpInfo } from '../kb/mcp-info.js';
 import { rawCatalogPath } from '../kb/raw-mcp-catalog.js';
 import type { BusinessStatus, KnowledgeObjectType, ReviewStatus } from '../kb/knowledge-schema.js';
+import { BUSINESS_STATUSES } from '../kb/knowledge-schema.js';
 import type { KbDocDto, KbSourceState, KbStatusDto } from '../types/agent-knowledge.js';
 
 export interface KbRouteDeps {
@@ -288,6 +290,7 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
       const domainIds = c.req.queries('domainIds') ?? [];
       const businessStatuses = c.req.queries('businessStatuses') ?? [];
       const reviewStatuses = c.req.queries('reviewStatuses') ?? [];
+      const asOf = c.req.query('asOf') ?? undefined; // A案 §6.1/§8.1：业务日期（ISO）
       if (usage !== undefined || types.length || domainIds.length || businessStatuses.length || reviewStatuses.length) {
         const page = await store.queryService.search({
           releaseId: manifest.releaseId, query: q, limit,
@@ -296,10 +299,33 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
           ...(domainIds.length ? { domainIds } : {}),
           ...(businessStatuses.length ? { businessStatuses: businessStatuses as unknown as BusinessStatus[] } : {}),
           ...(reviewStatuses.length ? { reviewStatuses: reviewStatuses as unknown as ReviewStatus[] } : {}),
+          ...(asOf !== undefined ? { asOf } : {}),
         });
         return c.json(page);
       }
       return c.json({ releaseId: manifest.releaseId, results: await store.search(manifest, q, limit) });
+    } catch (error) {
+      return errorResponse(c, error);
+    }
+  });
+
+  // A案 §8.1/§8.3/§2.4：对象直取（UI/HTTP 入口；objectId/legacyRef 二选一）。
+  // 当前源根由本层从 config 原始库根解析注入——证据逐条比对 current/stale/
+  // source_missing；未配置原始库根时退化为 evidenceNote，不访问原始库。
+  // 共用查询门面（getKbQueryService），与 search/MCP 同一实现，不另写过滤器。
+  routes.get('/api/kb/objects', async (c) => {
+    try {
+      const objectId = c.req.query('objectId') ?? undefined;
+      const legacyRef = c.req.query('legacyRef') ?? undefined;
+      const asOf = c.req.query('asOf') ?? undefined;
+      const { config } = await loadStore();
+      const read = await getKbQueryService(config.standardKb.outputRoot).getObject({
+        ...(objectId !== undefined ? { objectId } : {}),
+        ...(legacyRef !== undefined ? { legacyRef } : {}),
+        ...(asOf !== undefined ? { asOf } : {}),
+        ...(config.knowledgeBaseRoot ? { currentSourceRoot: config.knowledgeBaseRoot } : {}),
+      });
+      return c.json(read);
     } catch (error) {
       return errorResponse(c, error);
     }
@@ -552,6 +578,136 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
         await stream.writeSSE({ event: 'ping', data: '{}' }).catch(() => undefined);
       }
     });
+  });
+
+  // ------------------------------------------------------------------
+  // 人工治理（A 案 §4.2/§5.1，D1）：业务决定 + 高风险人审
+  // ------------------------------------------------------------------
+
+  // 治理服务与 StandardKbStore 同模式：按 outputRoot 懒加载缓存（配置切根后重建）。
+  let governanceService: KnowledgeGovernanceService | undefined;
+  async function loadGovernance(): Promise<KnowledgeGovernanceService> {
+    const config = await configManager.load();
+    if (!governanceService || governanceService.outputRoot !== config.standardKb.outputRoot) {
+      governanceService = new KnowledgeGovernanceService({ outputRoot: config.standardKb.outputRoot });
+    }
+    return governanceService;
+  }
+
+  // 写入口纪律（A 案 §4.2）：仅 desktop 人工入口接受——Build/Task/CLI/
+  // app_command 均不获得此写权限。CLI 主体（带 CLI 令牌直连，或经
+  // /api/cli/:command 内部转发携带的 actor 标记头）一律 403（伪造该头
+  // 只会让自己被拒，无提权面；与 kb-mcp-install 同法）。读端点不拦截
+  //（桌面鉴权域仍由全局 authMiddleware 把守）。
+  const governanceWriteGuard = (c: Context): Response | null => {
+    if ((c as any).cliActor === true || c.req.header('X-Feishu-Sync-Actor') !== undefined || c.req.header('X-Cli-Token') !== undefined) {
+      return c.json({ error: 'kb_governance_forbidden', message: '人工业务决定与人工复核仅接受 desktop 人工入口（A 案 §4.2）' }, 403) as unknown as Response;
+    }
+    return null;
+  };
+
+  routes.get('/api/kb/governance/decisions', async (c) => {
+    try {
+      const service = await loadGovernance();
+      const objectId = c.req.query('objectId') || undefined;
+      const view = service.listDecisions(objectId);
+      return c.json({
+        records: view.records,
+        effective: view.effective,
+        revision: view.revision,
+      });
+    } catch (error) {
+      return errorResponse(c, error);
+    }
+  });
+
+  routes.post('/api/kb/governance/decisions', async (c) => {
+    const forbidden = governanceWriteGuard(c);
+    if (forbidden) return forbidden;
+    try {
+      const body = await c.req.json().catch(() => null) as {
+        objectId?: unknown; payloadHash?: unknown; scopeKey?: unknown;
+        businessStatus?: unknown; rationale?: unknown; actor?: unknown;
+        evidenceIds?: unknown; supersedesDecisionId?: unknown; expectedRevision?: unknown;
+      } | null;
+      if (!body || typeof body.objectId !== 'string' || typeof body.payloadHash !== 'string'
+        || typeof body.scopeKey !== 'string' || typeof body.businessStatus !== 'string'
+        || !BUSINESS_STATUSES.has(body.businessStatus as BusinessStatus)
+        || typeof body.rationale !== 'string' || typeof body.expectedRevision !== 'number'
+        || !Number.isInteger(body.expectedRevision) || body.expectedRevision < 0) {
+        throw new ToolError('invalid_request', '决定提交需要 objectId/payloadHash/scopeKey/businessStatus/rationale 与 expectedRevision', 400);
+      }
+      const service = await loadGovernance();
+      const result = service.recordDecision({
+        ...(typeof body.actor === 'string' ? { actor: body.actor } : {}),
+        objectId: body.objectId,
+        payloadHash: body.payloadHash,
+        scopeKey: body.scopeKey,
+        businessStatus: body.businessStatus as BusinessStatus,
+        rationale: body.rationale,
+        ...(Array.isArray(body.evidenceIds) && body.evidenceIds.every((id) => typeof id === 'string')
+          ? { evidenceIds: body.evidenceIds as string[] } : {}),
+        ...(typeof body.supersedesDecisionId === 'string' ? { supersedesDecisionId: body.supersedesDecisionId } : {}),
+        expectedRevision: body.expectedRevision,
+      });
+      return c.json(result);
+    } catch (error) {
+      return errorResponse(c, error);
+    }
+  });
+
+  routes.get('/api/kb/governance/human-reviews', async (c) => {
+    try {
+      const service = await loadGovernance();
+      return c.json({ reviews: service.humanReviews(c.req.query('objectId') || undefined) });
+    } catch (error) {
+      return errorResponse(c, error);
+    }
+  });
+
+  routes.post('/api/kb/governance/human-reviews', async (c) => {
+    const forbidden = governanceWriteGuard(c);
+    if (forbidden) return forbidden;
+    try {
+      const body = await c.req.json().catch(() => null) as {
+        objectId?: unknown; reviewSubjectHash?: unknown; reviewerId?: unknown;
+        passed?: unknown; note?: unknown; actor?: unknown;
+      } | null;
+      if (!body || typeof body.objectId !== 'string' || typeof body.reviewSubjectHash !== 'string'
+        || typeof body.passed !== 'boolean') {
+        throw new ToolError('invalid_request', '人工复核需要 objectId/reviewSubjectHash 与 passed', 400);
+      }
+      const service = await loadGovernance();
+      const review = service.recordHumanReview({
+        ...(typeof body.actor === 'string' ? { actor: body.actor } : {}),
+        objectId: body.objectId,
+        reviewSubjectHash: body.reviewSubjectHash,
+        ...(typeof body.reviewerId === 'string' ? { reviewerId: body.reviewerId } : {}),
+        passed: body.passed,
+        ...(typeof body.note === 'string' ? { note: body.note } : {}),
+      });
+      return c.json({ review });
+    } catch (error) {
+      return errorResponse(c, error);
+    }
+  });
+
+  // 待治理对象联查（前端人工面板数据源：当前 release 对象 × 治理状态）。
+  routes.get('/api/kb/governance/pending', async (c) => {
+    try {
+      const service = await loadGovernance();
+      const view = service.pendingGovernanceWork();
+      // allowedDecisionTargets 由服务层按状态转移表返回；此端点另附转移表
+      // 全量供前端渲染选择项语义（保持只读端点无副作用）。
+      return c.json({
+        ...view,
+        transitionTable: Object.fromEntries(
+          [...BUSINESS_STATUSES].map((status) => [status, allowedDecisionTargets(status)]),
+        ),
+      });
+    } catch (error) {
+      return errorResponse(c, error);
+    }
   });
 
   // ------------------------------------------------------------------

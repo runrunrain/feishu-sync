@@ -101,7 +101,9 @@ export interface BuildSpec {
     reviewer: BuildRoleModelConfig;
     /** 整合者缺省跟随撰写模型（B 案 §3） */
     integrator?: BuildRoleModelConfig;
-    /** 规划者默认关闭（B 案 §1/§3）：程序按关联与预算分单元 */
+    /** 规划者默认关闭（B 案 §1/§3）：程序按关联与预算分单元。D5：开启
+     * 时规划轮复用 buildRoles.writer 模型（不新增 planner 配置面——B 案
+     * §8「规划作为高级选项默认关闭」），冻结身份随 writer 派发校验。 */
     plannerEnabled?: boolean;
   };
   /** 规范版本（角色提示词/审查规范/规划规则的冻结版本标识） */
@@ -195,6 +197,10 @@ export interface BuildTask {
   allowedWritePaths: string[];
   /** 输出要求说明 */
   outputRequirements: string;
+  /** D5（B 案 §6）：入队时间（ISO UTC，additive 可选——旧快照缺省按创建
+   * 序参与排序）。调度优先级的 aging 维度：queued 越久优先级越高（同
+   * 优先级类内比较），防新撰写长期抢占不到名额。 */
+  queuedAt?: string;
   // ---- 三轴状态（B 案 §7）：分别记录、分别推进 ----
   execState: BuildExecState;
   artifactState: BuildArtifactState;

@@ -61,7 +61,7 @@ const validGeneration = (id: string) => /^cp_[a-f0-9]{20}$/.test(id);
 const digest = (file: string) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 
 /** 检查点允许的库外声明产物相对路径（diting F01：save/restore 同集）。 */
-const KNOWLEDGE_ARTIFACTS = ['knowledge-draft.json', 'organization-plan.json', 'read-receipts.jsonl', 'candidate.json'] as const;
+const KNOWLEDGE_ARTIFACTS = ['knowledge-draft.json', 'organization-plan.json', 'read-receipts.jsonl', 'candidate.json', 'governance-freeze.json'] as const;
 
 function validCheckpointRelativePath(relative: string): boolean {
   if (relative === '.docid-map.json' || (KNOWLEDGE_ARTIFACTS as readonly string[]).includes(relative)) return true;

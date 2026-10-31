@@ -37,7 +37,7 @@ import { PathClaims } from './path-claims.js';
 import { collectWhiteboardTextsForEntries, enrichEntriesWithMedia, hashImageFile, resolveSourceImages, verifyEntryMediaHash, verifyEntryWhiteboardTextHash } from './source-images.js';
 import type { ImageDescription } from '../agent/vision/vision-describer.js';
 import { VisionDescriber } from '../agent/vision/vision-describer.js';
-import { buildDefaultAgentVisionConfig } from '../types/agent-knowledge.js';
+import { buildDefaultAgentVisionConfig, resolveEvidenceBudgetBytes } from '../types/agent-knowledge.js';
 import type { KbChangePreview, KbDocMerge, KbFileChange } from '../types/kb-version.js';
 import { sourceVersionWarning } from './search/query-metadata.js';
 import { selectKnowledgeSources } from './source-selection.js';
@@ -58,16 +58,26 @@ import {
 } from './orchestration-contracts.js';
 import { contentResourceHash, verifyEvidence } from './evidence-locator.js';
 import type { EvidenceReadReceipt, EvidenceResource } from './evidence-locator.js';
+// D3（A案 §5.2/§5.4）：工作簿/图片证据资源装配与 evidence/ 落盘规划
+import {
+  collectImageEvidenceResources,
+  loadWorkbookEvidenceResource,
+  planReleaseEvidenceFiles,
+  type ImageEvidencePayload,
+  type WorkbookEvidencePayload,
+} from './evidence-resources.js';
 import {
   compileKnowledgeRelease,
   type CompilerDocInput,
   type CompilerEvidenceResource,
   type GovernanceFile,
+  type HumanReviewCredentialEntry,
   type KnowledgeCompileResult,
 } from './knowledge-compiler.js';
 import { runKnowledgeGates } from './knowledge-validator.js';
-import type { ObjectMigration, ValidationIssue } from './knowledge-schema.js';
+import type { ObjectMigration, KnowledgeObject, KnowledgeRelation, ValidationIssue } from './knowledge-schema.js';
 import type { KnowledgeManifest } from './knowledge-schema.js';
+import { KnowledgeGovernanceService, effectiveHumanReviewOf, type GovernanceSnapshotForBuild } from './knowledge-governance-service.js';
 import { buildRoleLlmRunConfig } from '../agent/provider-descriptor.js';
 import { resolveProviderModel, providerModelParameters } from '../modules/model-selection.js';
 import { readAgentPromptFile } from '../agent/agent-assets.js';
@@ -720,6 +730,11 @@ export class KbBuildService extends EventEmitter {
         JSON.stringify(snapshot.entries, null, 2),
       );
 
+      // D5（A 案 §4.2「构建冻结决定集合及其哈希，发布前复核，期间改变则
+      // 失败重取」）：新构建取当前决定集快照写入 staging（随检查点持久化）；
+      // 恢复时沿用冻结快照，与当前决定集不一致则重取后继续。
+      const governanceFreeze = this.freezeOrRefreshGovernanceSnapshot(buildId, outputRoot, stagingRootPath, Boolean(resume));
+
       const versionStore = new KbVersionStore(outputRoot);
       const sourceContents = captureSourceContents(snapshot, config.knowledgeBaseRoot);
       const changePreview = sourceChangePreview(snapshot, sourceContents, baseManifest,
@@ -768,7 +783,38 @@ export class KbBuildService extends EventEmitter {
         sourceRemoved: changeset.removed.length,
       });
 
-      if (effectiveMode === 'incremental' && changeset.isEmpty() && workset.size === 0) {
+      // ---- D5（A 案 §7.2）：增量影响闭包（两阶段：种子 → 语义边扩展）----
+      // 种子 = 源变化重叠文档 ∪ 决定变化文档（冻结治理快照的有效决定）∪
+      // 迁移对象宿主文档；扩展沿基线 relations 入边 restates/depends_on/
+      // exception_to 把重述宿主/消费者文档加入重写面，去重到固定点。
+      // 闭包文档的支撑源作为只读输入纳入单元，不能误计成云端新增。
+      const baselineKnowledge = baseManifest ? new KbVersionStore(outputRoot).readKnowledgeManifest(baseManifest.releaseId) : null;
+      const affectedDocs = effectiveMode === 'incremental' && baseManifest
+        ? baseManifest.docs
+            .filter((doc) => doc.sources.some((token) => workset.has(token) || changeset.removed.includes(token)))
+            .map((doc) => ({ path: doc.path, title: doc.title }))
+        : [];
+      const emptyClosure: ImpactClosureResult = {
+        requiredRewrites: [], closureDocs: [], closureSeedOf: new Map(), readOnlySources: new Map(),
+        seeds: { sourceChange: [], decisionChange: [], migration: [] },
+      };
+      const impactClosure = effectiveMode === 'incremental' && baseManifest
+        ? computeImpactClosure({
+            seedDocPaths: affectedDocs.map((doc) => doc.path),
+            baseline: baselineKnowledge,
+            effectiveDecisions: governanceFreeze.effectiveDecisions,
+            migrations: baselineKnowledge?.migrations ?? [],
+            baseDocSources: new Map(baseManifest.docs.map((doc) => [doc.path, doc.sources] as const)),
+          })
+        : emptyClosure;
+      if (impactClosure.closureDocs.length > 0 || impactClosure.seeds.decisionChange.length > 0 || impactClosure.seeds.migration.length > 0) {
+        this.emitLog(buildId, 'info', `增量影响闭包：种子 ${impactClosure.seeds.sourceChange.length + impactClosure.seeds.decisionChange.length + impactClosure.seeds.migration.length} 篇（源变化 ${impactClosure.seeds.sourceChange.length}/决定 ${impactClosure.seeds.decisionChange.length}/迁移 ${impactClosure.seeds.migration.length}），语义闭包扩展 ${impactClosure.closureDocs.length} 篇（A 案 §7.2）`);
+      }
+
+      // 无变更且无闭包/决定/迁移种子：直接以 no_changes 结束（不新建 release）；
+      // 决定变化必须发布才生效（生效点=下一次成功发布，A 案 §4.2）
+      if (effectiveMode === 'incremental' && changeset.isEmpty() && workset.size === 0
+        && impactClosure.requiredRewrites.length === 0) {
         // 无变更：直接以 no_changes 结束（不新建 release）
         stagingRootPath = '';
         localMapStore.updateKbBuild(buildId, {
@@ -845,18 +891,16 @@ export class KbBuildService extends EventEmitter {
       buildState.onCheckpoint = () => this.persistCheckpoint(buildId);
       setStatus('running');
 
-      const affectedDocs = effectiveMode === 'incremental' && baseManifest
-        ? baseManifest.docs
-            .filter((doc) => doc.sources.some((token) => workset.has(token) || changeset.removed.includes(token)))
-            .map((doc) => ({ path: doc.path, title: doc.title }))
-        : [];
-
-      buildState.requiredRewrites = new Set(resume?.requiredRewrites ?? affectedDocs.map((doc) => doc.path)
+      // D5（A 案 §7.2）：requiredRewrites = 种子 ∪ 语义闭包（旧 affectedDocs
+      // 口径包含在种子内）；preservedDocs 相应收缩（闭包内文档不再 preserved）。
+      buildState.requiredRewrites = new Set(resume?.requiredRewrites ?? impactClosure.requiredRewrites
         .filter((docPath) => fs.existsSync(path.join(stagingRootPath, 'docs', docPath))));
       if (resume) {
         buildState.preservedDocs = new Map(resume.preservedDocs);
       } else if (entry.rebuildSelected && baseManifest) {
-        const affectedPaths = new Set(affectedDocs.map((doc) => doc.path));
+        // 用未过滤的闭包重写面排除：默认删除文档（仅引用已删源）既不在
+        // staging 也不得破 preserved 保护（现状 affectedDocs 同口径）
+        const affectedPaths = new Set(impactClosure.requiredRewrites);
         buildState.preservedDocs = new Map(baseManifest.docs.filter((doc) => !affectedPaths.has(doc.path))
           .map((doc) => [doc.path, doc.sources]));
       }
@@ -952,6 +996,14 @@ export class KbBuildService extends EventEmitter {
         worksetMeta.set(token, { relPath: sourceEntry.relPath, bytes, words });
       }
       const wordsOf = (token: string): number => worksetMeta.get(token)?.words ?? 0;
+      // D5（A 案 §7.2）：闭包/决定/迁移种子文档的支撑源作为只读输入纳入
+      // 单元（语义闭包文档并入拉入它的种子文档分量；决定/迁移种子无自然
+      // 种子文档时由孤儿归并/兼底承接——不进工作集、不误计云端新增）
+      const baseDocSources = new Map(baseManifest?.docs.map((doc) => [doc.path, doc.sources] as const) ?? []);
+      // 源变化种子文档已随工作集接入分量（其变更源在批次内），不重复登记
+      const sourceSeedSet = new Set(impactClosure.seeds.sourceChange);
+      const closureLinkDocs = [...new Set([...impactClosure.closureDocs, ...impactClosure.seeds.decisionChange, ...impactClosure.seeds.migration])]
+        .filter((docPath) => !sourceSeedSet.has(docPath));
       const units = resume?.units.length ? resume.units : planUnits({
         mode: effectiveMode,
         workset: worksetMeta,
@@ -963,6 +1015,13 @@ export class KbBuildService extends EventEmitter {
         removedSources: changeset.removed,
         batchSize,
         wordBudget,
+        ...(closureLinkDocs.length > 0 ? {
+          closureDocLinks: closureLinkDocs.map((docPath) => ({
+            path: docPath,
+            sources: impactClosure.readOnlySources.get(docPath) ?? baseDocSources.get(docPath) ?? [],
+            ...(impactClosure.closureSeedOf.get(docPath) ? { seedPath: impactClosure.closureSeedOf.get(docPath)! } : {}),
+          })),
+        } : {}),
       });
       // S4 等价回退：单 worker（N=1 或仅 1 个单元）走既有
       // 单进程流水线（全局批切分 + kb_finish 单轮，不引入单元语义）——
@@ -1245,6 +1304,7 @@ export class KbBuildService extends EventEmitter {
         sourceContents,
         changePreview,
         summary: buildState.finishInfo?.summary ?? '',
+        imageDescriptions: buildState.imageDescriptions,
       });
       stagingRootPath = ''; // 已被 rename 消费
       localMapStore.updateKbBuild(buildId, {
@@ -1450,6 +1510,59 @@ export class KbBuildService extends EventEmitter {
     return draft.objects.filter((object) => !object.tombstone).length;
   }
 
+  // ------------------------------------------------------------------
+  // D5（A 案 §4.2）：治理决定快照——构建启动冻结、发布前复核
+  // ------------------------------------------------------------------
+
+  private static governanceFreezePath(stagingRoot: string): string {
+    return path.join(stagingRoot, 'governance-freeze.json');
+  }
+
+  /** 读取 staging 冻结快照（旧检查点/无文件 → null）。 */
+  private readGovernanceFreeze(stagingRoot: string): GovernanceSnapshotForBuild | null {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(KbBuildService.governanceFreezePath(stagingRoot), 'utf8')) as GovernanceSnapshotForBuild;
+      return parsed && typeof parsed === 'object' && typeof parsed.snapshotHash === 'string' ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private writeGovernanceFreeze(stagingRoot: string, snapshot: GovernanceSnapshotForBuild): void {
+    fs.writeFileSync(KbBuildService.governanceFreezePath(stagingRoot), `${JSON.stringify(snapshot, null, 2)}\n`);
+  }
+
+  /**
+   * D5（A 案 §4.2「构建冻结决定集合及其哈希，发布前复核，期间改变则失
+   * 败重取」）：
+   * - 新构建：取当前快照写入 staging（随检查点持久化）；
+   * - 恢复：优先沿用冻结快照；与当前决定集不一致（构建期间决定变化）时
+   *   重取覆盖（「重新取快照后继续」）；旧检查点无冻结文件 → 补写。
+   */
+  private freezeOrRefreshGovernanceSnapshot(
+    buildId: string,
+    outputRoot: string,
+    stagingRoot: string,
+    isResume: boolean,
+  ): GovernanceSnapshotForBuild {
+    const service = new KnowledgeGovernanceService({ outputRoot });
+    if (!isResume) {
+      const snapshot = service.snapshotForBuild();
+      this.writeGovernanceFreeze(stagingRoot, snapshot);
+      return snapshot;
+    }
+    const frozen = this.readGovernanceFreeze(stagingRoot);
+    const fresh = service.snapshotForBuild();
+    if (!frozen || frozen.snapshotHash !== fresh.snapshotHash) {
+      this.writeGovernanceFreeze(stagingRoot, fresh);
+      this.emitLog(buildId, 'info', frozen
+        ? '构建期间治理决定集已变化，重新取快照后继续（A 案 §4.2）'
+        : '旧检查点无治理冻结快照，已按当前决定集补写（A 案 §4.2）');
+      return fresh;
+    }
+    return frozen;
+  }
+
   /**
    * T2a：编排骨架任务登记（B 案 §7/附录 A）。write 任务的输入引用为快照
    * 源 token（raw:<objToken>），允许写入路径 = 单元认领文档；依赖为空
@@ -1465,10 +1578,13 @@ export class KbBuildService extends EventEmitter {
     const orchestration = entry.orchestration;
     if (!orchestration) return;
     try {
-      if (units.length > 0) {
+      // D5（B 案 §3）：plannerEnabled 时写作任务由 syncOrchestrationTasks 在
+      // 计划冻结（planRevision ≥ 1）后派发；此处不预建（计划先行）。
+      const orchestrated = reviewPipelineActive(orchestration.spec);
+      const deferWrites = orchestrated && orchestration.spec.roles.plannerEnabled === true;
+      if (units.length > 0 && !deferWrites) {
         // T2b：新流水（审查者显式配置）用轮次化 id（t:write:U:r0），
         // 后继轮次由 runOrchestratedPhase 的 sync 派生；旧路径保持 t:U
-        const orchestrated = reviewPipelineActive(orchestration.spec);
         for (const unit of units) {
           const taskId = orchestrated ? `t:write:${unit.id}:r0` : `t:${unit.id}`;
           if (orchestration.task(taskId)) continue;
@@ -1489,7 +1605,7 @@ export class KbBuildService extends EventEmitter {
             orchestration.submitResult({ taskId, revision: 0, artifactState: 'available', resultRef: `unit:${unit.id}:done` });
           }
         }
-      } else {
+      } else if (units.length === 0) {
         if (!orchestration.task('t:single')) {
           orchestration.createTask({
             taskId: 't:single',
@@ -2665,14 +2781,17 @@ export class KbBuildService extends EventEmitter {
       lines.push('');
     }
     if (input.batch.length === 0) {
-      // F3-R07：仅 removed 的增量——空单元也要明确告知删除与受影响文档
-      lines.push(`【单元 ${unit.id} · 批次 ${input.batchIndex + 1}/${input.batchTotal}】本次构建没有新增或变更的源，但有源被删除：`);
+      // F3-R07：仅 removed 的增量——空单元也要明确告知删除与受影响文档；
+      // D5（A 案 §7.2）：决定变化/迁移种子驱动的空批同理——重写面必须明确
+      // 告知模型，不能只存在于闭包计算里
+      lines.push(`【单元 ${unit.id} · 批次 ${input.batchIndex + 1}/${input.batchTotal}】本次构建没有新增或变更的源；本单元由源删除、治理决定变化或语义影响闭包驱动：`);
       lines.push('');
-      lines.push('以下文档受到源移除/排除影响：仅引用已移除源的文档已默认删除；其余仍在草稿中，必须读取保留的源后重新写出完整正文并修正sources：');
+      lines.push('以下文档受到源移除/治理决定/语义影响（restates/depends_on/exception_to）驱动，必须重写或明确处理：仅引用已移除源的文档已默认删除；其余仍在草稿中，必须读取保留的源后重新写出完整正文并修正sources：');
       for (const doc of unit.affectedDocs.slice(0, 200)) {
         lines.push(`- ${doc.path}（${doc.title}${doc.deletedByDefault ? '，已默认删除，可重建' : ''}）`);
       }
       lines.push('');
+      appendReadOnlySourceLines(lines, input.snapshot, unit.readOnlySources);
       lines.push('要求：');
       lines.push('1. 检查删除后是否仍有主题需要保留：若某主题还承载未删除源的内容，用 kb_write_doc 重建或修订对应文档（sources 声明现存的源）。');
       lines.push('2. 若删除后无需任何重建，不写文档，直接调用 kb_unit_done 结束本单元。');
@@ -2695,6 +2814,8 @@ export class KbBuildService extends EventEmitter {
       }
       lines.push('');
     }
+    // D5（A 案 §7.2）：闭包文档支撑源——只读输入，不进本批处理面
+    appendReadOnlySourceLines(lines, input.snapshot, unit.readOnlySources);
     lines.push('要求：');
     lines.push('1. 立即开始调用工具（先 raw_read 逐个读取；raw_list filter=workset 只列本单元源），不要只回复文本计划。');
     lines.push('2. 读完本批全部源后，把内容重组为标准文档：合并相关源、消除重复、按主题分篇；已有草稿可用 draft_read 查看后覆盖（只能写本单元认领的路径）。');
@@ -2718,6 +2839,13 @@ export class KbBuildService extends EventEmitter {
     const fromAssets = readAgentPromptFile('standard-kb-review.md');
     if (fromAssets) return fromAssets;
     return '你是标准知识库构建的独立审查者。对照冻结源材料检查草稿，经 kb_submit_review 提交审查报告；你没有草稿写入口。问题分 blocking/suggestion，blocking 必须带草稿位置与源位置；未检查范围如实声明。';
+  }
+
+  /** D5（B 案 §3）规划规则提示词：standard-kb-plan.md（缺省读内置资产）。 */
+  private planRulesText(): string {
+    const fromAssets = readAgentPromptFile('standard-kb-plan.md');
+    if (fromAssets) return fromAssets;
+    return '你是标准知识库构建的组织规划者。读源目录、摘要与引用关系，经 kb_submit_plan 提交主题分组与对象候选建议；规划者不能自行增加并发、跳过审查或决定发布，也没有草稿写入口。';
   }
 
   /**
@@ -2800,21 +2928,65 @@ export class KbBuildService extends EventEmitter {
    * 派生任务同步（B 案 §4/§7 依赖解锁）：写完→审；审过→标 passed；
    * blocking→修订（预算内）；全部通过→整合；整合完成→最终复核；
    * 终态但未闭环的任务（取消/崩溃恢复）补 #attempt 后继。幂等。
+   * D5（B 案 §3）：plannerEnabled=true 时先建规划任务，计划冻结
+   *（planRevision ≥ 1）后才派发写作单元（输入引用绑定 planId）；
+   * plannerEnabled 缺省/false 时不建规划任务，行为与现状一致。
    */
   private syncOrchestrationTasks(input: OrchestratedPhaseInput): void {
     const orchestration = input.entry.orchestration!;
     const stagingRoot = input.buildState.stagingRoot;
+    // ---- D5（B 案 §3）：规划任务族 ----
+    const plannerEnabled = orchestration.spec.roles.plannerEnabled === true;
+    const planTasks = orchestration.tasks
+      .filter((t) => parseOrchestrationTaskId(t.taskId)?.kind === 'plan')
+      .sort((a, b) => compareTaskOrder(a.taskId, b.taskId));
+    const latestPlan = planTasks[planTasks.length - 1] ?? null;
+    if (plannerEnabled && !latestPlan) {
+      orchestration.createTask({
+        taskId: 't:plan:r0',
+        revision: 0,
+        role: 'plan',
+        unitId: null,
+        reviewSubjectDraftHash: null,
+        inputRefs: [...input.workset.keys()].map((token) => `raw:${token}`),
+        dependencies: [],
+        allowedWritePaths: [],
+        outputRequirements: '组织规划：读源目录/摘要/引用关系，经 kb_submit_plan 提交主题分组与对象候选（B 案 §3）',
+      });
+    } else if (plannerEnabled && latestPlan
+      && (latestPlan.execState === 'failed' || latestPlan.execState === 'cancelled')) {
+      // 断点续跑：规划任务后继（B 案 §8）
+      const ref = parseOrchestrationTaskId(latestPlan.taskId)!;
+      orchestration.createTask({
+        taskId: nextAttemptTaskId(orchestration, `t:plan:r${ref.round}`),
+        revision: ref.round,
+        role: 'plan',
+        unitId: null,
+        reviewSubjectDraftHash: null,
+        inputRefs: [...input.workset.keys()].map((token) => `raw:${token}`),
+        dependencies: [],
+        allowedWritePaths: [],
+        outputRequirements: '规划轮断点续跑（后继尝试）',
+      });
+    }
+    // 计划冻结判定：规划任务完成且产物可用（planRevision ≥ 1 由执行层校验）
+    const planReady = !plannerEnabled
+      || (latestPlan !== null && latestPlan.execState === 'done' && latestPlan.artifactState === 'available');
     for (const unit of input.units) {
       const latest = this.latestWriteTasks(orchestration, [unit]).get(unit.id) ?? null;
-      let target = latest;
+      const target = latest;
       if (!target) {
-        target = orchestration.createTask({
+        // D5（B 案 §3）：计划未冻结前不派发写作（单元划分仍由程序
+        // planUnits 产生；计划只影响组织登记与路径预认领）
+        if (!planReady) continue;
+        const planRef = this.planInputRef(stagingRoot);
+        orchestration.createTask({
           taskId: `t:write:${unit.id}:r0`,
           revision: 0,
           role: 'write',
           unitId: unit.id,
           reviewSubjectDraftHash: null,
-          inputRefs: unit.sources.map((token) => `raw:${token}`),
+          inputRefs: [...(planRef ? [planRef] : []), ...unit.sources.map((token) => `raw:${token}`)],
           dependencies: [],
           allowedWritePaths: [...unit.ownedDocs],
           outputRequirements: `单元 ${unit.id}：${unit.batches.length} 批草稿写入与 kb_unit_done 上报`,
@@ -2992,7 +3164,7 @@ export class KbBuildService extends EventEmitter {
     if (currentHash !== task.reviewSubjectDraftHash) {
       throw new ToolError('kb_review_stale_binding', `审查期间草稿发生了变化（${unit.id}），本轮报告作废并重审`);
     }
-    this.submitReviewResult(input, task, report, { scope: 'unit', subjectKey: `unit:${unit.id}`, round, reportUnitId: unit.id });
+    await this.submitReviewResult(input, task, report, { scope: 'unit', subjectKey: `unit:${unit.id}`, round, reportUnitId: unit.id });
   }
 
   /** 整合轮（B 案 §4）：跨单元合并去重 + kb_finish；任何正文/标题/来源变化
@@ -3115,7 +3287,7 @@ export class KbBuildService extends EventEmitter {
     if (report.draftHash !== currentHash || currentHash !== task.reviewSubjectDraftHash) {
       throw new ToolError('kb_review_stale_binding', '最终复核期间候选内容发生变化，报告作废并重审');
     }
-    this.submitReviewResult(input, task, report, { scope: 'integration', subjectKey: 'role:integrate', round: parseOrchestrationTaskId(task.taskId)?.round ?? 0, reportUnitId: 'all' });
+    await this.submitReviewResult(input, task, report, { scope: 'integration', subjectKey: 'role:integrate', round: parseOrchestrationTaskId(task.taskId)?.round ?? 0, reportUnitId: 'all' });
   }
 
   /**
@@ -3124,12 +3296,12 @@ export class KbBuildService extends EventEmitter {
    * 预算耗尽 → pending_decision + failed(kb_review_required) 可恢复；
    * suggestion 不阻塞。报告归档保留讨论轨迹。
    */
-  private submitReviewResult(
+  private async submitReviewResult(
     input: OrchestratedPhaseInput & { task: BuildTask },
     reviewTask: BuildTask,
     report: ReviewReport,
     meta: { scope: 'unit' | 'integration'; subjectKey: string; round: number; reportUnitId: string },
-  ): void {
+  ): Promise<void> { // diting S-F01：markObjectsMachineReviewed 异步化（构建级互斥队列）
     const { entry, buildState } = input;
     const orchestration = entry.orchestration!;
     const stagingRoot = buildState.stagingRoot;
@@ -3150,7 +3322,7 @@ export class KbBuildService extends EventEmitter {
       // 门禁同步收紧：pending 对象 blocking（knowledge-validator）。
       const unitOfReport = input.units.find((candidate) => candidate.id === meta.reportUnitId) ?? null;
       const scopePaths = meta.scope === 'unit' && unitOfReport ? this.unitScopePaths(buildState, unitOfReport) : null;
-      const marked = this.deps.toolService.markObjectsMachineReviewed(buildState, scopePaths, report.reportId);
+      const marked = await this.deps.toolService.markObjectsMachineReviewed(buildState, scopePaths, report.reportId);
       if (marked > 0) {
         this.emitLog(input.buildId, 'info', `对象级机器审查凭据：${marked} 个对象 reviewStatus=passed（报告 ${report.reportId} 绑定；A 案 §4.2/§7.4）`);
       }
@@ -3328,7 +3500,9 @@ export class KbBuildService extends EventEmitter {
   private static isInterfaceRetryable(error: unknown): boolean {
     const code = error instanceof ToolError ? error.code : '';
     return code === 'model_timeout' || code === 'model_request_failed' || code === 'pi_process_exited'
-      || code === 'pi_transport_failed' || code === 'kb_review_report_missing' || code === 'kb_review_stale_binding';
+      || code === 'pi_transport_failed' || code === 'kb_review_report_missing' || code === 'kb_review_stale_binding'
+      // D5（B 案 §3）：规划轮未提交计划与审查报告缺失同型（执行通道失败）
+      || code === 'kb_plan_missing';
   }
 
   /**
@@ -3372,7 +3546,9 @@ export class KbBuildService extends EventEmitter {
    * 上下文）；模型按冻结 BuildSpec 角色解析。 */
   private async spawnOrchestratedWorker(input: OrchestratedPhaseInput & { task: BuildTask; slotObtained: () => boolean }): Promise<WorkerRuntime> {
     const { task, entry } = input;
-    const phase = task.role === 'review' || task.role === 'final_review'
+    // D5（B 案 §3）：plan → 'plan'（规划轮上下文：可 kb_submit_plan，无草稿写）
+    const phase = task.role === 'plan' ? 'plan' as const
+      : task.role === 'review' || task.role === 'final_review'
       ? 'review' as const
       : task.role === 'integrate' ? 'final' as const : 'unit' as const;
     const workerId = `o-${task.taskId}`;
@@ -3515,6 +3691,8 @@ export class KbBuildService extends EventEmitter {
   private resolveRoleModel(buildId: string, role: BuildRole): { model: string; apiKey?: string; providerJson?: string; thinking?: string } | null {
     const spec = this.active.get(buildId)?.orchestration?.spec;
     if (!spec) return null;
+    // D5（B 案 §3）：规划者复用撰写模型（不新增配置面——“规划作为高级选项
+    // 默认关闭”，模型预设跟随 writer 冻结身份）
     const roleKey: 'writer' | 'reviewer' | 'integrator' = role === 'review' || role === 'final_review'
       ? 'reviewer'
       : role === 'integrate' ? 'integrator' : 'writer';
@@ -3584,6 +3762,11 @@ export class KbBuildService extends EventEmitter {
     const { task } = input;
     const ref = parseOrchestrationTaskId(task.taskId);
     if (!ref) throw new ToolError('kb_pipeline_invalid', `编排任务 id 无法解析：${task.taskId}`, 500);
+    if (task.role === 'plan') {
+      // D5（B 案 §3）：规划轮——模型提计划，程序校验后派发写作
+      await this.runOrchestratedPlan(input, worker);
+      return;
+    }
     if (task.role === 'write') {
       const unit = input.units.find((candidate) => candidate.id === task.unitId);
       if (!unit) throw new ToolError('kb_pipeline_invalid', `编排任务引用未知单元：${task.taskId}`, 500);
@@ -3606,6 +3789,98 @@ export class KbBuildService extends EventEmitter {
       return;
     }
     await this.runOrchestratedFinalReview(input, worker, ref.attempt);
+  }
+
+  /**
+   * D5（B 案 §3）规划轮：模型读源目录/摘要/引用关系后经 kb_submit_plan
+   * 提交主题分组与对象候选；server 校验（T3：路径归属/覆盖/无环/预分配）
+   * 后 planRevision 冻结，写作单元由 sync 派发（输入引用绑定 planId）。
+   * 未提交计划 = 执行失败（接口通道可重试，与审查报告缺失同型）；
+   * 重试耗尽 → 构建失败可恢复（沿用 orchestration 状态机 #attempt 后继）。
+   */
+  private async runOrchestratedPlan(
+    input: OrchestratedPhaseInput & { task: BuildTask },
+    worker: WorkerRuntime,
+  ): Promise<void> {
+    const { entry, buildState, task } = input;
+    const orchestration = entry.orchestration!;
+    entry.stage = 'units';
+    this.emitLog(input.buildId, 'info', `规划轮启动（${input.workset.size} 个工作集源；B 案 §3：模型提计划，程序校验后执行）`);
+    const prompt = this.buildPlanPrompt(input);
+    let outcome = await worker.rpc!.prompt(
+      input.systemRules ? `${this.planRulesText()}\n\n---\n${prompt}` : `${this.planRulesText()}\n\n${prompt}`,
+      { timeoutMs: input.promptTimeoutMs },
+    );
+    if (entry.cancelRequested && outcome.outcome !== 'completed') throw new CancelledError();
+    if (outcome.outcome === 'aborted') throw new CancelledError();
+    if (outcome.outcome === 'failed') {
+      throw new ToolError(outcome.error?.code ?? 'model_request_failed', `规划轮失败：${outcome.error?.message ?? '未知错误'}`, 502);
+    }
+    this.throwIfPoisoned(buildState);
+    let plan = this.readOrganizationPlan(buildState.stagingRoot);
+    if (!plan || plan.planRevision < 1) {
+      this.emitLog(input.buildId, 'warn', '规划轮未检测到 kb_submit_plan 调用，发送纠正提示');
+      outcome = await worker.rpc!.prompt(
+        '系统检测到你没有调用 kb_submit_plan 工具。现在请直接调用 kb_submit_plan：docs 提交主题分组建议（path/title/summary），objectCandidates 提交对象候选。不要输出任何文本，直接发起工具调用。',
+        { timeoutMs: input.promptTimeoutMs },
+      );
+      if (outcome.outcome === 'aborted') throw new CancelledError();
+      if (outcome.outcome === 'failed') {
+        throw new ToolError(outcome.error?.code ?? 'model_request_failed', `规划轮纠正失败：${outcome.error?.message ?? '未知错误'}`, 502);
+      }
+      plan = this.readOrganizationPlan(buildState.stagingRoot);
+    }
+    if (!plan || plan.planRevision < 1) {
+      throw new ToolError('kb_plan_missing', `规划任务 ${task.taskId} 执行结束但未提交组织计划（kb_submit_plan）`);
+    }
+    this.emitLog(input.buildId, 'info', `组织计划已冻结：${plan.planId}（planRevision=${plan.planRevision}；文档 ${plan.docs.length}、对象 ${plan.objects.length}）——写作单元按计划派发`);
+    orchestration.submitResult({
+      taskId: task.taskId, revision: task.revision, artifactState: 'available',
+      resultRef: `plan:${plan.planId}@${plan.planRevision}`,
+    });
+    this.persistCheckpoint(input.buildId);
+  }
+
+  /** D5（B 案 §3）规划轮提示词：源目录/摘要/引用关系 + 基线对象登记摘要。 */
+  private buildPlanPrompt(input: OrchestratedPhaseInput): string {
+    const lines: string[] = [];
+    lines.push('【组织规划】（B 案 §3：规划者提出主题分组与对象候选，程序校验后执行）');
+    lines.push('');
+    lines.push(`本次构建工作集（${input.workset.size} 个源）：`);
+    lines.push('| objToken | 标题 | 相对路径 | 变更类型 |');
+    lines.push('|---|---|---|---|');
+    for (const [token, changeType] of input.workset) {
+      const entry = input.snapshot.get(token);
+      lines.push(`| ${token} | ${entry?.title ?? token} | ${entry?.relPath ?? ''} | ${changeType === 'rebuild' ? '重新构建' : changeType} |`);
+    }
+    lines.push('');
+    if (input.entry.resume?.finishInfo) {
+      lines.push('（断点续跑提示：本轮只需补交计划；已写入草稿与已完成单元不重复执行。）');
+      lines.push('');
+    }    lines.push('要求：');
+    lines.push('1. 用 raw_read/raw_search 按预算抽样阅读源正文（目录分组只是执行线索，不等于主题边界），raw_links 查看引用关系。');
+    lines.push('2. 经 kb_submit_plan 提交：docs（主题分组建议）+ objectCandidates（对象候选，canonicalPath 必须在计划文档内）+ dependencies/migrations（如有依据）。');
+    lines.push('3. 必须以工具调用结束；你没有草稿写入口，也不能自行增加并发、跳过审查或决定发布。');
+    return lines.join('\n');
+  }
+
+  /** 读取 staging 组织计划（无/损坏 → null）。 */
+  private readOrganizationPlan(stagingRoot: string): OrganizationPlanFile | null {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(path.join(stagingRoot, 'organization-plan.json'), 'utf8')) as OrganizationPlanFile;
+      return parsed && typeof parsed === 'object' && typeof parsed.planId === 'string' ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** D5（B 案 §3）：写作任务的计划输入引用（plan:<planId>@<planRevision>）；
+   * 仅在计划已提交（planRevision ≥ 1）时绑定——基线装载预置的 planRevision=0
+   * 不是本轮模型计划，不绑定。 */
+  private planInputRef(stagingRoot: string): string | null {
+    const plan = this.readOrganizationPlan(stagingRoot);
+    if (!plan || plan.planRevision < 1) return null;
+    return `plan:${plan.planId}@${plan.planRevision}`;
   }
 
   /** 单元写入（轮次 0）：批次推进与既有单元阶段一致（unitProgress 断点续跑）。 */
@@ -3903,22 +4178,50 @@ export class KbBuildService extends EventEmitter {
     const changePreview = sourceChangePreview(state.snapshot, sourceContents, baseManifest,
       versionStore.readSourceContents(baseManifest?.releaseId ?? null),
       new Set([...(this.deps.excludedSourcesProvider?.() ?? []), ...(checkpoint.requestedMode === 'full' ? this.deps.unselectedSourcesProvider?.() ?? [] : [])]));
-    const manifest = await this.publishRelease({
-      buildId,
-      releaseId,
-      mode: checkpoint.mode,
-      baseReleaseId: checkpoint.baseReleaseId,
-      knowledgeBaseRoot: config.knowledgeBaseRoot,
-      model: row.model ? String(row.model) : null,
-      snapshot: state.snapshot,
-      stagingRoot,
-      outputRoot,
-      docMeta: state.docMeta ?? new Map(),
-      skippedSources: checkpoint.finishInfo.skipped,
-      sourceContents,
-      changePreview,
-      summary: checkpoint.finishInfo.summary,
-    });
+    // D5（A 案 §4.2）：确认时决定集已变化 → 重取快照后重试发布一次
+    //（确认等待期间登记决定是预期工作流——「决定待发布」的生效点就是
+    // 本次确认发布；候选内容未变，重取只刷新决定面）
+    let manifest: Awaited<ReturnType<KbBuildService['publishRelease']>>;
+    try {
+      manifest = await this.publishRelease({
+        buildId,
+        releaseId,
+        mode: checkpoint.mode,
+        baseReleaseId: checkpoint.baseReleaseId,
+        knowledgeBaseRoot: config.knowledgeBaseRoot,
+        model: row.model ? String(row.model) : null,
+        snapshot: state.snapshot,
+        stagingRoot,
+        outputRoot,
+        docMeta: state.docMeta ?? new Map(),
+        skippedSources: checkpoint.finishInfo.skipped,
+        sourceContents,
+        changePreview,
+        summary: checkpoint.finishInfo.summary,
+        imageDescriptions: state.imageDescriptions,
+      });
+    } catch (error) {
+      if (!(error instanceof ToolError) || error.code !== 'kb_governance_changed') throw error;
+      this.emitLog(buildId, 'info', `确认发布时治理决定集已变化，重取快照后重试（A 案 §4.2）：${error.message}`);
+      this.freezeOrRefreshGovernanceSnapshot(buildId, outputRoot, stagingRoot, true);
+      manifest = await this.publishRelease({
+        buildId,
+        releaseId,
+        mode: checkpoint.mode,
+        baseReleaseId: checkpoint.baseReleaseId,
+        knowledgeBaseRoot: config.knowledgeBaseRoot,
+        model: row.model ? String(row.model) : null,
+        snapshot: state.snapshot,
+        stagingRoot,
+        outputRoot,
+        docMeta: state.docMeta ?? new Map(),
+        skippedSources: checkpoint.finishInfo.skipped,
+        sourceContents,
+        changePreview,
+        summary: checkpoint.finishInfo.summary,
+        imageDescriptions: state.imageDescriptions,
+      });
+    }
     localMapStore.updateKbBuild(buildId, { status: 'published', releaseId, finishedAt: new Date().toISOString() });
     this.emitLog(buildId, 'info', `确认发布完成：release=${releaseId}，${manifest.docs.length} 篇文档`);
     void row;
@@ -3975,6 +4278,7 @@ export class KbBuildService extends EventEmitter {
     }
     const roleModelOf = (role: string): KbBuildOrchestrationTaskDto['model'] => {
       const roles = orchestration!.spec.roles;
+      // D5（B 案 §3）：plan 复用 writer 模型（不新增配置面）
       const selected = role === 'review' || role === 'final_review'
         ? roles.reviewer
         : role === 'integrate'
@@ -4026,6 +4330,9 @@ export class KbBuildService extends EventEmitter {
       /* staging 已消费/清理时不计入 */
     }
     const summary = orchestration.summary();
+    // D5（A 案 §4.2）：决定快照哈希随进度端点可见（前端“决定待发布”提示
+    // 已有；此处补齐构建侧冻结指纹）
+    const governanceSnapshotHash = this.readGovernanceFreeze(stagingRoot)?.snapshotHash ?? null;
     return {
       buildId,
       spec: {
@@ -4034,6 +4341,8 @@ export class KbBuildService extends EventEmitter {
         concurrency: orchestration.spec.concurrency,
         maxAutoRevisions: orchestration.spec.maxAutoRevisions,
         maxInterfaceRetries: orchestration.spec.maxInterfaceRetries,
+        ...(governanceSnapshotHash ? { governanceSnapshotHash } : { governanceSnapshotHash: null }),
+        ...(orchestration.spec.roles.plannerEnabled !== undefined ? { plannerEnabled: orchestration.spec.roles.plannerEnabled } : {}),
       },
       ended: orchestration.ended,
       endReason: orchestration.endReason,
@@ -4100,6 +4409,10 @@ export class KbBuildService extends EventEmitter {
     /** T4a（A案 §6.2/§7.4）：知识化发布（v2）必需——证据重解引用与资源
      * 区段计算用；无知识声明的 v1 发布不需要。 */
     knowledgeBaseRoot?: string;
+    /** D3（A案 §5.2/§5.4）：识图描述（objToken → src → 描述）。图片证据
+     * 的 quoteHash 复核与描述快照留存需要；有 media_region 证据而缺描述
+     * 时发布期 blocking。两个发布入口（流水/确认）均从构建状态传入。 */
+    imageDescriptions?: Map<string, Map<string, ImageDescription>>;
   }): Promise<KbManifest> {
     const { outputRoot, releaseId, stagingRoot } = input;
     const docsDir = path.join(stagingRoot, 'docs');
@@ -4145,7 +4458,7 @@ export class KbBuildService extends EventEmitter {
    *   staging、CURRENT 不动（A案 §7.4 发布前复核）；编译/门禁均在写盘
    *   前完成，半成品 release 目录由 publishRelease 外层 catch 清理。
    */
-  private prepareKnowledgePublish(input: {
+  private async prepareKnowledgePublish(input: {
     buildId: string;
     releaseId: string;
     stagingRoot: string;
@@ -4153,7 +4466,9 @@ export class KbBuildService extends EventEmitter {
     snapshot: RawSourceSnapshot;
     knowledgeBaseRoot?: string;
     baseReleaseId: string | null;
-  }): {
+    /** D3：识图描述（图片证据 caption 复核与描述快照留存） */
+    imageDescriptions?: Map<string, Map<string, ImageDescription>>;
+  }): Promise<{
     compiled: KnowledgeCompileResult;
     knowledgeBytes: string;
     evidenceBytes: string;
@@ -4161,7 +4476,9 @@ export class KbBuildService extends EventEmitter {
     organization: KbOrganizationManifestSection;
     evidenceSection: { resourcesPath: string; hash: string };
     governanceSection: { path: string; hash: string };
-  } | null {
+    /** D3（A案 §5.4）：evidence/ 子目录写盘清单（已过体量预算门禁） */
+    evidenceFileWrites: Array<{ path: string; bytes: Buffer }>;
+  } | null> {
     const draftFile = path.join(input.stagingRoot, 'knowledge-draft.json');
     if (!fs.existsSync(draftFile)) return null;
     let draft: Parameters<typeof compileKnowledgeRelease>[0]['knowledgeDraft'];
@@ -4278,6 +4595,86 @@ export class KbBuildService extends EventEmitter {
     }
     const maxTotalBytes = Math.max(inputBytes * 3, input.snapshot.size * 4 * 1024);
 
+    // ---- D3（A案 §5.2/§5.4）：工作簿/图片证据资源装配（compile 前注入，
+    //  否则编译器资源表缺项会误报 kb_evidence_unresolved）----
+    // 只为实际声明了 workbook_cells/media_region 证据的源装配（未引用的源
+    // 不解析工作簿，与声明面同懒策略）；载荷同时供发布门禁重解引用与
+    // evidence/ 落盘规划，三者同源一致。
+    const evidenceBlocking: ValidationIssue[] = [];
+    const workbookSourceIds = new Set<string>();
+    const imageSourceIds = new Set<string>();
+    for (const claim of draft.evidence) {
+      if (claim.selector.kind === 'workbook_cells') workbookSourceIds.add(claim.sourceRef.sourceId);
+      else if (claim.selector.kind === 'media_region') imageSourceIds.add(claim.sourceRef.sourceId);
+    }
+    const gateResourcePacks = new Map<string, EvidenceResource[]>();
+    const wbPayloads = new Map<string, WorkbookEvidencePayload>();
+    const imgPayloads = new Map<string, ImageEvidencePayload>();
+    for (const sourceId of new Set([...workbookSourceIds, ...imageSourceIds])) {
+      const entry = input.snapshot.get(sourceId);
+      if (!entry) {
+        evidenceBlocking.push({
+          code: 'kb_evidence_unresolved', field: 'sourceRef.sourceId',
+          message: `证据来源不在本构建快照内: ${sourceId}`, severity: 'blocking',
+        });
+        continue;
+      }
+      let verified: { content: string; attachments: Array<{ path: string; content: string }> };
+      try {
+        verified = input.snapshot.readVerified(input.knowledgeBaseRoot, sourceId);
+      } catch (error) {
+        evidenceBlocking.push({
+          code: 'kb_evidence_unresolved', field: 'sourceRef',
+          message: `证据来源读取失败（源已变化或越界）: ${sourceId} — ${error instanceof Error ? error.message : String(error)}`,
+          severity: 'blocking',
+        });
+        continue;
+      }
+      const pack: EvidenceResource[] = [{
+        resourceId: sourceId, kind: 'text', content: verified.content,
+        sourceId, sourceSnapshotHash: entry.contentHash,
+        resourceHash: contentResourceHash(verified.content),
+      }];
+      for (const attachment of verified.attachments) {
+        const base = path.basename(attachment.path);
+        pack.push({
+          resourceId: `${sourceId}#csv:${base}`, kind: 'csv', content: attachment.content,
+          path: base, sourceId, sourceSnapshotHash: entry.contentHash,
+          resourceHash: contentResourceHash(attachment.content),
+        });
+      }
+      if (workbookSourceIds.has(sourceId)) {
+        try {
+          const payload = await loadWorkbookEvidenceResource(input.knowledgeBaseRoot, entry, verified.content);
+          if (!payload) {
+            evidenceBlocking.push({
+              code: 'kb_evidence_unresolved', field: 'sourceRef.resourceId',
+              message: `工作簿证据引用的源无 source_workbook 声明: ${sourceId}（${entry.relPath}）`, severity: 'blocking',
+            });
+          } else {
+            wbPayloads.set(payload.resource.resourceId, payload);
+            pack.push(payload.resource);
+            evidenceResources.push({ resource: payload.resource });
+          }
+        } catch (error) {
+          evidenceBlocking.push({
+            code: 'kb_evidence_unresolved', field: 'sourceRef.resourceId',
+            message: `工作簿证据资源不可读: ${sourceId} — ${error instanceof Error ? error.message : String(error)}`, severity: 'blocking',
+          });
+        }
+      }
+      if (imageSourceIds.has(sourceId)) {
+        for (const payload of collectImageEvidenceResources(
+          input.knowledgeBaseRoot, entry, verified.content, input.imageDescriptions?.get(sourceId),
+        )) {
+          imgPayloads.set(payload.resource.resourceId, payload);
+          pack.push(payload.resource);
+          evidenceResources.push({ resource: payload.resource });
+        }
+      }
+      gateResourcePacks.set(sourceId, pack);
+    }
+
     const compiled = compileKnowledgeRelease({
       docs,
       knowledgeDraft: draft,
@@ -4287,6 +4684,106 @@ export class KbBuildService extends EventEmitter {
       maxTotalBytes,
       releaseId: input.releaseId,
     });
+
+    // ---- D5（A 案 §4.2）：治理冻结复核 + 决定生效 ----
+    // 构建启动时冻结决定集及其哈希（staging/governance-freeze.json，随
+    // 检查点持久化）；发布前复核：期间决定变化 → kb_governance_changed
+    // 失败可恢复（恢复/确认重取快照后继续——A 案「构建冻结决定集合及其
+    // 哈希，发布前复核，期间改变则失败重取」）。
+    const governanceFreeze = (() => {
+      const frozen = this.readGovernanceFreeze(input.stagingRoot);
+      const fresh = new KnowledgeGovernanceService({ outputRoot: input.outputRoot }).snapshotForBuild();
+      if (frozen && frozen.snapshotHash !== fresh.snapshotHash) {
+        throw new ToolError('kb_governance_changed',
+          `构建期间治理决定集已变化（冻结 ${frozen.snapshotHash.slice(0, 12)}… ≠ 当前 ${fresh.snapshotHash.slice(0, 12)}…）：发布中止、CURRENT 不动；请恢复构建重取决定快照后继续（A 案 §4.2）`, 409);
+      }
+      return frozen ?? fresh; // 旧检查点无冻结文件：按当前决定集发布（补冻结由恢复路径写入）
+    })();
+    // 决定的生效点是下一次成功发布：把冻结快照中绑定当前载荷/范围的有效
+    // 决定应用到对象 businessStatus（approved/disputed/deprecated 由决定
+    // 驱动写入 knowledge.json；载荷不匹配的决定不生效，由门禁按
+    // kb_decision_stale 披露）。businessStatus 在 payloadHash 排除面内，
+    // 应用不改变对象载荷与审查主体。
+    const frozenDecisions = new Map(governanceFreeze.effectiveDecisions.map((decision) => [decision.objectId, decision] as const));
+    for (const object of compiled.knowledge.objects) {
+      if (object.tombstone) continue;
+      const decision = frozenDecisions.get(object.objectId);
+      if (!decision || decision.payloadHash !== object.payloadHash || decision.scopeKey !== object.scopeKey) continue;
+      if (object.businessStatus === decision.businessStatus) continue;
+      object.businessStatus = decision.businessStatus;
+    }
+    // ---- diting S-F06（A 案 §4.2）：人审凭据随 release 冻结 ----
+    // 发布时把实际采用的人审凭据（对象/subjectHash/有效结论/actor/时间/
+    // 记录序）投影进 governance.json（manifest hash 链绑定，见
+    // governanceSection）；有匹配通过人审的对象同时写 reviewActorKind='human'
+    //（凭据随本 release 自持——后续运行期治理日志新增/清理不改变已发布
+    // release 的展示，展示读 sidecar 凭据不读运行期日志）。reviewActorKind/
+    // reviewerId/reviewedAt 不在 payloadHash/reviewSubjectHash 输入面内，
+    // 应用不改变对象载荷与审查主体哈希。凭据聚合与门禁同源
+    //（effectiveHumanReviewOf：日志序最新一条；最新拒绝不发布、被门禁
+    // kb_review_human_rejected 阻断，不会到达此处投影）。
+    const adoptedHumanReviews: HumanReviewCredentialEntry[] = [];
+    const adoptedReviewKeys = new Set<string>();
+    for (const object of compiled.knowledge.objects) {
+      if (object.tombstone) continue;
+      const latest = effectiveHumanReviewOf(governanceFreeze.humanReviews, object.objectId, object.reviewSubjectHash);
+      if (!latest || !latest.passed) continue;
+      object.reviewActorKind = 'human';
+      object.reviewerId = latest.reviewerId?.trim() ? latest.reviewerId.trim() : latest.reviewId;
+      object.reviewedAt = latest.createdAt;
+      const key = `${object.objectId}\u0000${object.reviewSubjectHash}`;
+      if (adoptedReviewKeys.has(key)) continue;
+      adoptedReviewKeys.add(key);
+      adoptedHumanReviews.push({
+        reviewId: latest.reviewId,
+        createdAt: latest.createdAt,
+        actor: latest.actor,
+        objectId: latest.objectId,
+        reviewSubjectHash: latest.reviewSubjectHash,
+        ...(latest.reviewerId ? { reviewerId: latest.reviewerId } : {}),
+        passed: latest.passed,
+        ...(latest.note ? { note: latest.note } : {}),
+        logIndex: governanceFreeze.humanReviews.indexOf(latest),
+      });
+    }
+
+    // ---- D3（A案 §5.4/§6.2）：落盘规划 + 体量预算 + evidenceFiles 登记 ----
+    const evidence = compiled.knowledge.evidence;
+    // 引用的资源不在载荷内（未描述图片/资源拼错）→ blocking，不能悄悄仅留描述
+    for (const claim of evidence) {
+      if (claim.selector.kind === 'workbook_cells' && !wbPayloads.has(claim.sourceRef.resourceId)) {
+        evidenceBlocking.push({
+          code: 'kb_evidence_unresolved', field: 'sourceRef.resourceId',
+          message: `工作簿证据资源未装配: ${claim.evidenceId} → ${claim.sourceRef.resourceId}`, severity: 'blocking',
+        });
+      }
+      if (claim.selector.kind === 'media_region' && !imgPayloads.has(claim.sourceRef.resourceId)) {
+        evidenceBlocking.push({
+          code: 'kb_evidence_unresolved', field: 'sourceRef.resourceId',
+          message: `图片证据资源未装配（未描述/缺失即不得充当支撑，A案 §5.1）: ${claim.evidenceId} → ${claim.sourceRef.resourceId}`,
+          severity: 'blocking',
+        });
+      }
+    }
+    const evidencePlan = planReleaseEvidenceFiles({ evidence, workbookPayloads: wbPayloads, imagePayloads: imgPayloads });
+    const evidenceBudget = resolveEvidenceBudgetBytes(this.deps.configProvider()?.standardKb);
+    if (evidencePlan.totalBytes > evidenceBudget) {
+      evidenceBlocking.push({
+        code: 'kb_evidence_unresolved', field: 'evidenceFiles',
+        message: `证据资源总量 ${evidencePlan.totalBytes} 字节超过预算 ${evidenceBudget} 字节（A案 §5.4：无法保留则阻止发布）。各资源体量：${evidencePlan.files.map((file) => `${file.path}=${file.bytes.length}`).join(', ')}——请收窄引用区间或减少图片证据`,
+        severity: 'blocking',
+      });
+    }
+    // evidenceFiles 登记（hash 链：manifest.evidence.hash → 本表 → 文件字节）
+    compiled.evidenceResources.evidenceFiles = evidencePlan.files.map((file) => ({
+      resourceId: file.resourceId,
+      path: file.path,
+      hash: file.hash,
+      bytes: file.bytes.length,
+      kind: file.kind,
+      evidenceIds: file.evidenceIds,
+      ...(file.image ? { image: file.image } : {}),
+    }));
 
     // sidecar 投影与哈希（A案 §6.2 发布布局；manifest 绑定三者 hash）
     const sha = (bytes: string): string => `sha256:${crypto.createHash('sha256').update(bytes, 'utf8').digest('hex')}`;
@@ -4312,7 +4809,32 @@ export class KbBuildService extends EventEmitter {
         validReportIds: candidateWrapper?.candidate?.acceptance?.validReportIds ?? [],
         ...(candidateWrapper?.candidateHash ? { candidateHash: candidateWrapper.candidateHash } : {}),
       },
-      decisions: [], // 人工业务决定服务属后续迭代（A案 §4.2；本阶段骨架不阻塞）
+      // D5（A 案 §4.2）：本 release 生效的真实决定条目——绑定发布对象
+      // payloadHash 的有效决定（手工决定作为独立依据随 release 冻结，
+      // 不假装来自飞书源）；载荷/范围不匹配的决定不随本 release 生效。
+      decisions: compiled.knowledge.objects
+        .filter((object) => !object.tombstone)
+        .flatMap((object) => {
+          const decision = frozenDecisions.get(object.objectId);
+          if (!decision || decision.payloadHash !== object.payloadHash || decision.scopeKey !== object.scopeKey) return [];
+          return [{
+            decisionId: decision.decisionId,
+            createdAt: decision.createdAt,
+            actor: decision.actor,
+            objectId: decision.objectId,
+            payloadHash: decision.payloadHash,
+            scopeKey: decision.scopeKey,
+            businessStatus: decision.businessStatus,
+            rationale: decision.rationale,
+            ...(decision.evidenceIds && decision.evidenceIds.length > 0 ? { evidenceIds: [...decision.evidenceIds] } : {}),
+            ...(decision.supersedesDecisionId ? { supersedesDecisionId: decision.supersedesDecisionId } : {}),
+          }];
+        })
+        .sort((a, b) => (a.objectId < b.objectId ? -1 : a.objectId > b.objectId ? 1 : 0)),
+      // diting S-F06（A 案 §4.2）：实际采用的人审凭据随不可变 release 冻结
+      //（哈希经 governanceSection → manifest.governance.hash 链绑定）；
+      // 无采用凭据时省略字段，旧 release 语义不变。
+      ...(adoptedHumanReviews.length > 0 ? { humanReviewCredentials: adoptedHumanReviews } : {}),
     };
     const governanceBytes = `${JSON.stringify(governance, null, 2)}\n`;
     const managedPaths = new Set(
@@ -4338,7 +4860,12 @@ export class KbBuildService extends EventEmitter {
       }
     }
 
-    // 发布门禁（A案 §7.4：canPublish 之后、CURRENT 原子切换之前）
+    // 发布门禁（A案 §7.4：canPublish 之后、CURRENT 原子切换之前）；D3：
+    // 工作簿/图片预装配包传入（异步解析产物），证据预算/装配失败同道阻断。
+    // D5（A 案 §4.2）：门禁消费冻结快照（D1 双参形态的冻结侧）——治理在用
+    //（存在决定/人审记录）时传入，高风险人审与决定门禁 blocking；从未启用
+    // 治理（空快照）时沿用 D1 缺省披露语义（warning），不改变现状行为。
+    const governanceActive = governanceFreeze.decisionRecords.length > 0 || governanceFreeze.humanReviews.length > 0;
     const gates = runKnowledgeGates({
       compiled,
       candidate: candidateWrapper?.candidate ?? null,
@@ -4346,24 +4873,30 @@ export class KbBuildService extends EventEmitter {
       snapshot: input.snapshot,
       knowledgeBaseRoot: input.knowledgeBaseRoot,
       receipts,
+      ...(gateResourcePacks.size > 0 ? { resourcePacks: gateResourcePacks } : {}),
+      ...(governanceActive ? { governance: governanceFreeze } : {}),
       sidecars: {
         organization: { path: organization.path, hash: organization.hash, bytes: knowledgeBytes },
         evidence: { resourcesPath: evidenceSection.resourcesPath, hash: evidenceSection.hash, bytes: evidenceBytes },
         governance: { path: governanceSection.path, hash: governanceSection.hash, bytes: governanceBytes },
       },
     });
-    if (gates.blocking.length > 0) {
+    const blocking = [...evidenceBlocking, ...gates.blocking];
+    if (blocking.length > 0) {
       writeReport(input.outputRoot, input.buildId, [
-        ...gates.blocking.map(KbBuildService.knowledgeIssueToReport),
+        ...blocking.map(KbBuildService.knowledgeIssueToReport),
         ...gates.warnings.map(KbBuildService.knowledgeIssueToReport),
       ]);
       throw new ToolError('kb_publish_blocked',
-        `知识发布门禁未通过（${gates.blocking.length} 个阻断问题，详见 report）：${gates.blocking.slice(0, 3).map((issue) => `${issue.code} ${issue.message}`).join('；')}`, 409);
+        `知识发布门禁未通过（${blocking.length} 个阻断问题，详见 report）：${blocking.slice(0, 3).map((issue) => `${issue.code} ${issue.message}`).join('；')}`, 409);
     }
     for (const warning of gates.warnings) {
       this.emitLog(input.buildId, 'warn', `知识门禁警告 ${warning.code}：${warning.message}`);
     }
-    return { compiled, knowledgeBytes, evidenceBytes, governanceBytes, organization, evidenceSection, governanceSection };
+    return {
+      compiled, knowledgeBytes, evidenceBytes, governanceBytes, organization, evidenceSection, governanceSection,
+      evidenceFileWrites: evidencePlan.files.map((file) => ({ path: file.path, bytes: file.bytes })),
+    };
   }
 
   private async publishReleaseInner(
@@ -4377,7 +4910,7 @@ export class KbBuildService extends EventEmitter {
 
     // T4a（A案 §6.2/§7.4）：staging 存在知识声明 → 编译 + 门禁 + v2 布局
     //（发布正文为编译产物；staging 草稿保留供恢复）；无声明 → v1 不变。
-    const knowledgePlan = this.prepareKnowledgePublish({
+    const knowledgePlan = await this.prepareKnowledgePublish({
       buildId: input.buildId,
       releaseId,
       stagingRoot,
@@ -4385,6 +4918,7 @@ export class KbBuildService extends EventEmitter {
       snapshot: input.snapshot,
       knowledgeBaseRoot: input.knowledgeBaseRoot,
       baseReleaseId: input.baseReleaseId,
+      imageDescriptions: input.imageDescriptions,
     });
 
     const docs: KbManifestDoc[] = [];
@@ -4401,6 +4935,13 @@ export class KbBuildService extends EventEmitter {
       fs.writeFileSync(path.join(releaseDir, knowledgePlan.organization.path), knowledgePlan.knowledgeBytes);
       fs.writeFileSync(path.join(releaseDir, knowledgePlan.evidenceSection.resourcesPath), knowledgePlan.evidenceBytes);
       fs.writeFileSync(path.join(releaseDir, knowledgePlan.governanceSection.path), knowledgePlan.governanceBytes);
+      // D3（A案 §5.4/§6.2）：evidence/ 子目录——工作簿区间最小快照与图片
+      // 本体；登记在 evidence-resources.json（hash 链随 manifest 绑定）。
+      for (const file of knowledgePlan.evidenceFileWrites) {
+        const target = path.join(releaseDir, file.path);
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, file.bytes);
+      }
     } else {
       const files: string[] = [];
       const walk = (dir: string, prefix: string) => {
@@ -4649,7 +5190,7 @@ interface OrchestratedPhaseInput {
 }
 
 interface OrchestratedTaskRef {
-  kind: 'write' | 'review' | 'integrate' | 'final';
+  kind: 'write' | 'review' | 'integrate' | 'final' | 'plan';
   unitId: string | null;
   round: number;
   attempt: number;
@@ -4657,17 +5198,17 @@ interface OrchestratedTaskRef {
 
 /**
  * 解析编排任务 id：t:write:<unit>:r<n>[#<a>] / t:review:<unit>:r<n>[#<a>] /
- * t:integrate:r<n>[#<a>] / t:final:r<n>[#<a>]。旧式 t:<unitId>/t:single
- * 返回 null（不走新流水）。
+ * t:integrate:r<n>[#<a>] / t:final:r<n>[#<a>] / t:plan:r<n>[#<a>]（D5 规划轮）。
+ * 旧式 t:<unitId>/t:single 返回 null（不走新流水）。
  */
 function parseOrchestrationTaskId(taskId: string): OrchestratedTaskRef | null {
   const match = /^t:(write|review):([A-Za-z0-9_-]+):r(\d+)(?:#(\d+))?$/.exec(taskId)
-    ?? /^t:(integrate|final):r(\d+)(?:#(\d+))?$/.exec(taskId);
+    ?? /^t:(integrate|final|plan):r(\d+)(?:#(\d+))?$/.exec(taskId);
   if (!match) return null;
   if (match.length === 5) {
     return { kind: match[1] as 'write' | 'review', unitId: match[2], round: Number(match[3]), attempt: Number(match[4] ?? 0) };
   }
-  return { kind: match[1] as 'integrate' | 'final', unitId: null, round: Number(match[2]), attempt: Number(match[3] ?? 0) };
+  return { kind: match[1] as 'integrate' | 'final' | 'plan', unitId: null, round: Number(match[2]), attempt: Number(match[3] ?? 0) };
 }
 
 /** 任务排序：轮次优先，同轮按 attempt（后继在后）。 */
@@ -4677,6 +5218,18 @@ function compareTaskOrder(a: string, b: string): number {
   if (!refA || !refB) return a.localeCompare(b);
   if (refA.round !== refB.round) return refA.round - refB.round;
   return refA.attempt - refB.attempt;
+}
+
+/** D5（A 案 §7.2）：闭包文档支撑源进单元提示词——只读输入面，
+ * 未变化、不计入本批处理、不得当作新增材料或列为 skipped。 */
+function appendReadOnlySourceLines(lines: string[], snapshot: RawSourceSnapshot, readOnlySources: string[] | undefined): void {
+  if (!readOnlySources || readOnlySources.length === 0) return;
+  lines.push('以下源是上述受影响文档的支撑源（只读输入：它们未发生变化，不计入本批处理面、不要求去向说明，供核对与引用；不得当作新增材料或列为 skipped）：');
+  for (const token of readOnlySources.slice(0, 100)) {
+    const entry = snapshot.get(token);
+    lines.push(`- ${token}（${entry?.title ?? token}，${entry?.relPath ?? ''}）`);
+  }
+  lines.push('');
 }
 
 // ===========================================================================
@@ -4961,6 +5514,139 @@ export function computeChangeset(
     changed: changed.sort(),
     removed: removed.sort(),
     isEmpty: () => added.length === 0 && changed.length === 0 && removed.length === 0,
+  };
+}
+
+// ============================================================================
+// D5（A 案 §7.2）：增量影响闭包——两阶段（种子 → 语义边扩展到固定点）
+// ============================================================================
+
+export interface ImpactClosureInput {
+  /** 阶段 1 种子：源 token 变化重叠的基线文档（现状 affectedDocs 口径） */
+  seedDocPaths: string[];
+  /** 基线 knowledge.json（无基线组织时传 null → 只返回种子） */
+  baseline: KnowledgeManifest | null;
+  /** 冻结治理快照的有效决定（阶段 1 种子：决定变化绑定的对象所在文档） */
+  effectiveDecisions?: Array<{ objectId: string; payloadHash: string; businessStatus: string }>;
+  /** 迁移映射（阶段 1 种子：迁移对象所在文档） */
+  migrations?: ObjectMigration[];
+  /** 基线文档支撑源（path → sources；闭包文档只读输入收集用） */
+  baseDocSources?: Map<string, string[]>;
+}
+
+export interface ImpactClosureResult {
+  /** 种子 ∪ 闭包（按 path 去重排序）：增量必重写面（requiredRewrites 输入） */
+  requiredRewrites: string[];
+  /** 仅闭包新增（非源变化种子）：其支撑源作为只读输入纳入单元 */
+  closureDocs: string[];
+  /** 闭包文档 → 种子文档（planUnits closureDocLinks 的 seedPath；
+   * 决定/迁移种子无自然种子文档时不出现） */
+  closureSeedOf: Map<string, string>;
+  /** 闭包文档的支撑源（只读输入，不进工作集、不误计云端新增） */
+  readOnlySources: Map<string, string[]>;
+  seeds: { sourceChange: string[]; decisionChange: string[]; migration: string[] };
+}
+
+/** 参与闭包传播的语义边（A 案 §3.3/§6.1）：受影响对象被 restates（受控
+ * 重述宿主）/depends_on/exception_to（消费者）指向时，指向方所在文档
+ * 进入影响面——主对象变化 → 呈现补审 + 直接消费者进入影响清单。 */
+const IMPACT_INBOUND_RELATION_TYPES: ReadonlySet<string> = new Set(['restates', 'depends_on', 'exception_to']);
+
+/**
+ * D5（A 案 §7.2）增量影响闭包（纯函数，导出供单测）：
+ * 1. 种子：源变化重叠文档 ∪ 决定变化文档（有效决定与基线对象状态/载荷
+ *    不一致 → 该对象宿主文档重写以承载新决定）∪ 迁移对象宿主文档；
+ * 2. 扩展：沿基线 relations 的入边 restates/depends_on/exception_to 把
+ *    指向方（重述宿主/消费者）文档加入重写面，按文档路径去重迭代到
+ *    固定点（A 案 §3.3「影响传播按 ID 去重到固定点，不截断待审对象」）。
+ * 闭包文档（非种子）的支撑源作为只读输入返回，不能误计成云端新增。
+ */
+export function computeImpactClosure(input: ImpactClosureInput): ImpactClosureResult {
+  const seeds = {
+    sourceChange: [...new Set(input.seedDocPaths)].sort(),
+    decisionChange: [] as string[],
+    migration: [] as string[],
+  };
+  const required = new Set<string>(seeds.sourceChange);
+  if (input.baseline) {
+    const docOf = new Map<string, string>();
+    for (const object of input.baseline.objects) {
+      if (object.tombstone || !object.canonical) continue;
+      if (!docOf.has(object.objectId)) docOf.set(object.objectId, object.canonical.path);
+    }
+    const byId = new Map(input.baseline.objects.map((object) => [object.objectId, object] as const));
+    // 决定变化种子：有效决定将改变本 release 生效面（状态待变更或载荷待
+    // 重绑）→ 对象宿主文档必须重写承载（决定生效点=下一次成功发布）
+    for (const decision of input.effectiveDecisions ?? []) {
+      const object = byId.get(decision.objectId);
+      if (!object || object.tombstone || !object.canonical) continue;
+      if (object.businessStatus === decision.businessStatus && object.payloadHash === decision.payloadHash) continue;
+      seeds.decisionChange.push(object.canonical.path);
+      required.add(object.canonical.path);
+    }
+    // 迁移种子：迁移对象宿主文档进入重写面（A 案 §2.4 迁移必须可验证）
+    for (const migration of input.migrations ?? []) {
+      const docPath = docOf.get(migration.objectId);
+      if (!docPath) continue;
+      seeds.migration.push(docPath);
+      required.add(docPath);
+    }
+    // 扩展：受影响对象的入边（restates/depends_on/exception_to）指向方文档
+    // 入队迭代到固定点；边端点必须解析到活跃对象；记录拉入种子文档供
+    // planUnits 把闭包文档并入同分量（决定/迁移种子无自然种子不记录）。
+    // 均按端点预索引：建索引 O(对象+边)，固定点均摊 O(新增文档×平均入边)
+    const inboundByObject = new Map<string, KnowledgeRelation[]>();
+    for (const edge of input.baseline.relations) {
+      if (!IMPACT_INBOUND_RELATION_TYPES.has(edge.type)) continue;
+      const bucket = inboundByObject.get(edge.toObjectId) ?? [];
+      bucket.push(edge);
+      inboundByObject.set(edge.toObjectId, bucket);
+    }
+    const objectsByDoc = new Map<string, KnowledgeObject[]>();
+    for (const object of input.baseline.objects) {
+      if (object.tombstone || !object.canonical) continue;
+      const bucket = objectsByDoc.get(object.canonical.path) ?? [];
+      bucket.push(object);
+      objectsByDoc.set(object.canonical.path, bucket);
+    }
+    const closureSeedOf = new Map<string, string>();
+    const frontier = [...required];
+    while (frontier.length > 0) {
+      const docPath = frontier.pop()!;
+      for (const object of objectsByDoc.get(docPath) ?? []) {
+        for (const edge of inboundByObject.get(object.objectId) ?? []) {
+          const hostDoc = docOf.get(edge.fromObjectId);
+          if (!hostDoc || required.has(hostDoc)) continue;
+          required.add(hostDoc);
+          if (!closureSeedOf.has(hostDoc)) closureSeedOf.set(hostDoc, docPath);
+          frontier.push(hostDoc);
+        }
+      }
+    }
+    seeds.decisionChange = [...new Set(seeds.decisionChange)].sort();
+    seeds.migration = [...new Set(seeds.migration)].sort();
+    const seedSet = new Set([...seeds.sourceChange, ...seeds.decisionChange, ...seeds.migration]);
+    const closureDocs = [...required].filter((docPath) => !seedSet.has(docPath)).sort();
+    // 闭包只读输入：闭包文档自身支撑源（种子文档的源已在工作集/删除面）
+    const readOnlySources = new Map<string, string[]>();
+    for (const docPath of closureDocs) {
+      const sources = input.baseDocSources?.get(docPath) ?? [];
+      if (sources.length > 0) readOnlySources.set(docPath, [...sources]);
+    }
+    return {
+      requiredRewrites: [...required].sort(),
+      closureDocs,
+      closureSeedOf,
+      readOnlySources,
+      seeds,
+    };
+  }
+  return {
+    requiredRewrites: [...required].sort(),
+    closureDocs: [],
+    closureSeedOf: new Map(),
+    readOnlySources: new Map(),
+    seeds,
   };
 }
 

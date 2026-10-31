@@ -91,7 +91,7 @@ it('左侧目录保持可用，构建、差异、版本和进度从右侧直接�
     expect(container.querySelector('[data-testid="kb-directory-panel"]')).not.toBeNull();
     expect(container.querySelector('[data-testid="kb-sidebar"]')).toBeNull();
     expect([...container.querySelectorAll('[data-sidebar-trigger]')].map((el) => el.getAttribute('data-sidebar-trigger')))
-      .toEqual(['sources', 'publish', 'build', 'progress']);
+      .toEqual(['sources', 'publish', 'build', 'progress', 'governance']);
 
     await click(button('第二篇'));
     expect(container.querySelector('[data-testid="kb-directory-panel"]')).not.toBeNull();
