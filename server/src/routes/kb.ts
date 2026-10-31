@@ -33,6 +33,7 @@ import type { ConfigManager } from '../modules/config-manager.js';
 import { resolveDataRoot } from '../modules/data-root.js';
 import { kbMcpInfo } from '../kb/mcp-info.js';
 import { rawCatalogPath } from '../kb/raw-mcp-catalog.js';
+import type { BusinessStatus, KnowledgeObjectType, ReviewStatus } from '../kb/knowledge-schema.js';
 import type { KbDocDto, KbSourceState, KbStatusDto } from '../types/agent-knowledge.js';
 
 export interface KbRouteDeps {
@@ -280,6 +281,24 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
       if (!manifest) {
         return c.json({ error: 'kb_not_published', message: '标准知识库尚未发布' }, 404);
       }
+      // A案 §8.1：现有端点透传对象感知参数（usage/types/状态），共用查询层
+      // 校验与过滤；给出任一参数时返回带 next 游标的分页 DTO，不再走 top-k 拉取
+      const usage = c.req.query('usage');
+      const types = c.req.queries('types') ?? [];
+      const domainIds = c.req.queries('domainIds') ?? [];
+      const businessStatuses = c.req.queries('businessStatuses') ?? [];
+      const reviewStatuses = c.req.queries('reviewStatuses') ?? [];
+      if (usage !== undefined || types.length || domainIds.length || businessStatuses.length || reviewStatuses.length) {
+        const page = await store.queryService.search({
+          releaseId: manifest.releaseId, query: q, limit,
+          ...(usage !== undefined ? { usage: usage as 'browse' | 'operational' } : {}),
+          ...(types.length ? { types: types as unknown as KnowledgeObjectType[] } : {}),
+          ...(domainIds.length ? { domainIds } : {}),
+          ...(businessStatuses.length ? { businessStatuses: businessStatuses as unknown as BusinessStatus[] } : {}),
+          ...(reviewStatuses.length ? { reviewStatuses: reviewStatuses as unknown as ReviewStatus[] } : {}),
+        });
+        return c.json(page);
+      }
       return c.json({ releaseId: manifest.releaseId, results: await store.search(manifest, q, limit) });
     } catch (error) {
       return errorResponse(c, error);
@@ -468,6 +487,23 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
       const dto = await buildService.cancelBuild(localMapStore as never, c.req.param('id'));
       if (!dto) return c.json({ error: 'build_not_found', message: '构建不存在' }, 404);
       return c.json(dto);
+    } catch (error) {
+      return errorResponse(c, error);
+    }
+  });
+
+  // T2b（B 案 §4/附录 B）：编排流水进度——同一份 BuildOrchestration 数据源
+  routes.get('/api/kb/builds/:id/orchestration', (c) => {
+    const dto = buildService.orchestrationProgress(localMapStore, c.req.param('id'));
+    if (!dto) return c.json({ error: 'build_not_found', message: '构建不存在或无编排数据' }, 404);
+    return c.json(dto);
+  });
+
+  // T2b（B 案 §7）：待确认发布——确认绑定候选哈希，内容变化则失效拒绝
+  routes.post('/api/kb/builds/:id/release-confirm', async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({})) as { candidateHash?: string; actor?: string };
+      return c.json(await buildService.releaseConfirm(localMapStore, c.req.param('id'), body));
     } catch (error) {
       return errorResponse(c, error);
     }

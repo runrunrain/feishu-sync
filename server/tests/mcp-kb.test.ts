@@ -58,7 +58,7 @@ describe('seven read-only MCP tools', () => {
 
   it('advertises exact tools, annotations, standalone instructions and compact descriptions', async () => {
     const { tools } = await client.listTools();
-    expect(tools.map((t) => t.name).sort()).toEqual(['get_knowledge', 'get_knowledge_bundle', 'get_outline', 'get_release_info', 'grep_knowledge', 'list_knowledge', 'search_knowledge']);
+    expect(tools.map((t) => t.name).sort()).toEqual(['compare_knowledge', 'get_knowledge', 'get_knowledge_bundle', 'get_object', 'get_outline', 'get_release_info', 'grep_knowledge', 'list_knowledge', 'search_knowledge']);
     for (const tool of tools) {
       expect(tool.annotations).toEqual({ readOnlyHint: true, idempotentHint: true, openWorldHint: false });
       for (const keyword of ['oneOf', 'anyOf', 'allOf']) expect(tool.inputSchema).not.toHaveProperty(keyword);
@@ -67,11 +67,29 @@ describe('seven read-only MCP tools', () => {
     expect(KB_MCP_INSTRUCTIONS.split('\n')[0]).toContain('只读');
     expect(tools.map((t) => t.description).join('').length + KB_MCP_INSTRUCTIONS.length).toBeLessThan(2500);
   });
-  it('reports no published release for all seven valid invocations', async () => {
+  it('reports no published release for all valid invocations', async () => {
     for (const [name, args] of [['search_knowledge', { query: '暴击' }], ['grep_knowledge', { pattern: '1001' }], ['get_outline', { pathPrefix: '' }],
-      ['get_knowledge', { path: 'a.md' }], ['get_knowledge_bundle', { pathPrefix: '' }], ['list_knowledge', {}], ['get_release_info', {}]] as Array<[string, Record<string, unknown>]>) {
+      ['get_knowledge', { path: 'a.md' }], ['get_knowledge_bundle', { pathPrefix: '' }], ['list_knowledge', {}], ['get_release_info', {}],
+      ['get_object', { objectId: 'ko_x' }], ['compare_knowledge', { familyKey: 'fam:x' }]] as Array<[string, Record<string, unknown>]>) {
       await error(name, args, 'kb_not_published');
     }
+  });
+  it('v1 release: object tools return legacy-unclassified guidance instead of failing; compare validates its inputs', async () => {
+    publish();
+    const object = await json('get_object', { objectId: 'ko_damage' });
+    expect(object.data.legacy.label).toBe('legacy-unclassified');
+    expect(object.data.object).toBeNull();
+    expect(object.data.legacy.notice).toContain('全文检索');
+    const compared = await json('compare_knowledge', { familyKey: 'fam:modifier' });
+    expect(compared.data.legacy.label).toBe('legacy-unclassified');
+    const operational = await json('search_knowledge', { query: '暴击', usage: 'operational' });
+    expect(operational.data.results).toEqual([]);
+    expect(operational.data.legacy).toBe('legacy-unclassified');
+    expect(operational.data.excluded).toEqual({ legacy_unclassified: 3 });
+    await error('compare_knowledge', {}, 'invalid_request');
+    await error('search_knowledge', { query: '暴击', usage: 'compare' }, 'invalid_request');
+    await error('search_knowledge', { query: '暴击', usage: 'weird' }, 'invalid_request');
+    await error('search_knowledge', { query: '暴击', types: ['nonsense'] }, 'invalid_request');
   });
   it('searches multiple terms, IDs and quoted phrases with additive legacy fields and line anchors', async () => {
     publish();

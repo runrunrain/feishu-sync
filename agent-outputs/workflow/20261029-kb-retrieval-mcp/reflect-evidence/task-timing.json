@@ -1,0 +1,266 @@
+{
+  "source": "per-task artifact metadata, not inferred goal completion",
+  "tasks": [
+    {
+      "taskId": "02908e87-bdcf-4347-bc3d-023d748a589a",
+      "agent": "diting",
+      "status": "done",
+      "blocked": false,
+      "startedAt": 1793303219076,
+      "endedAt": 1793303594143,
+      "outputBytes": 766
+    },
+    {
+      "taskId": "03a528f4-f8a7-4e39-ba4d-cd358a5c3ad9",
+      "agent": "luban",
+      "status": "done",
+      "blocked": false,
+      "startedAt": 1793304279142,
+      "endedAt": 1793304409602,
+      "outputBytes": 817
+    },
+    {
+      "taskId": "0547ff9f-4d08-4c1e-b22c-f865b846402e",
+      "agent": "luoshen",
+      "status": "done",
+      "blocked": false,
+      "startedAt": 1793297597549,
+      "endedAt": 1793298569786,
+      "outputBytes": 536
+    },
+    {
+      "taskId": "181dc28f-c64c-4e31-9afd-658734fbf594",
+      "agent": "luban",
+      "status": "done",
+      "blocked": false,
+      "startedAt": 1793306381862,
+      "endedAt": 1793306639761,
+      "outputBytes": 857
+    },
+    {
+      "taskId": "236dd084-2300-400e-b026-0aa085d37e80",
+      "agent": "luban",
+      "status": "done",
+      "blocked": false,
+      "startedAt": 1793302049874,
+      "endedAt": 1793302214026,
+      "outputBytes": 1157
+    },
+    {
+      "taskId": "262b51cc-3d14-4586-a703-aeae202a826e",
+      "agent": "luban",
+      "status": "done",
+      "blocked": false,
+      "startedAt": 1793297548312,
+      "endedAt": 1793299283639,
+      "outputBytes": 808
+    },
+    {
+      "taskId": "3fac3164-c30c-47f3-88fc-9e73b3dc80fa",
+      "agent": "luban",
+      "status": "done",
+      "blocked": false,
+      "startedAt": 1793302313259,
+      "endedAt": 1793302463375,
+      "outputBytes": 898
+    },
+    {
+      "taskId": "44cc0165-b90c-4b80-8974-b5b047a03764",
+      "agent": "luban",
+      "status": "done",
+      "blocked": false,
+      "startedAt": 1793302277800,
+      "endedAt": 1793302774741,
+      "outputBytes": 1064
+    },
+    {
+      "taskId": "56df927c-8fb4-46be-ba40-ccb304fa3db2",
+      "agent": "luoshen",
+      "status": "done",
+      "blocked": false,
+      "startedAt": 1793301794125,
+      "endedAt": 1793303204625,
+      "outputBytes": 869
+    },
+    {
+      "taskId": "5877bab7-d0ad-4ab4-915c-248a710c4d76",
+      "agent": "luban",
+      "status": "done",
+      "blocked": false,
+      "startedAt": 1793301966682,
+      "endedAt": 1793302100716,
+      "outputBytes": 759
+    },
+    {
+      "taskId": "69c9cd6e-61e8-4012-a07b-d7a54be9fb17",
+      "agent": "baize",
+      "status": "done",
+      "blocked": false,
+      "startedAt": 1793297379869,
+      "endedAt": 1793297811521,
+      "outputBytes": 1827
+    },
+    {
+      "taskId": "7098e081-0e3f-4d79-bd22-abb3a3f05fd2",
+      "agent": "luban",
+      "status": "done",
+      "blocked": false,
+      "startedAt": 1793303086206,
+      "endedAt": 1793303347386,
+      "outputBytes": 876
+    },
+    {
+      "taskId": "7ad957c3-3483-4f20-ab57-f2f7ab462c55",
+      "agent": "luban",
+      "status": "done",
+      "blocked": false,
+      "startedAt": 1793306794076,
+      "endedAt": 1793306881535,
+      "outputBytes": 778
+    },
+    {
+      "taskId": "7f8020f1-8018-463e-91f0-9e9bf680ce68",
+      "agent": "luban",
+      "status": "done",
+      "blocked": false,
+      "startedAt": 1793303070346,
+      "endedAt": 1793303620222,
+      "outputBytes": 997
+    },
+    {
+      "taskId": "8647a359-398a-4355-8bb6-599be52740d6",
+      "agent": "luban",
+      "status": "done",
+      "blocked": false,
+      "startedAt": 1793297437792,
+      "endedAt": 1793297780374,
+      "outputBytes": 702
+    },
+    {
+      "taskId": "96969048-2b70-4548-a697-b0ac4bce349e",
+      "agent": "luban",
+      "status": "blocked",
+      "blocked": true,
+      "startedAt": 1793297638875,
+      "endedAt": 1793299315307,
+      "outputBytes": 756
+    },
+    {
+      "taskId": "b7a9eab9-c9fa-4874-90f7-8b195863b45c",
+      "agent": "luoshen",
+      "status": "done",
+      "blocked": false,
+      "startedAt": 1793303790634,
+      "endedAt": 1793304940181,
+      "outputBytes": 1240
+    },
+    {
+      "taskId": "c00dda65-f4da-47eb-8355-66da5bf56418",
+      "agent": "luoshen",
+      "status": "done",
+      "blocked": false,
+      "startedAt": 1793306747880,
+      "endedAt": 1793307531306,
+      "outputBytes": 799
+    },
+    {
+      "taskId": "c1ea3374-5a43-4d98-b75e-fecd9daf7c03",
+      "agent": "luoshen",
+      "status": "done",
+      "blocked": false,
+      "startedAt": 1793305705302,
+      "endedAt": 1793306210240,
+      "outputBytes": 698
+    },
+    {
+      "taskId": "d0d6eb69-51f8-4d09-8e50-aa51ffb9f30a",
+      "agent": "diting",
+      "status": "done",
+      "blocked": false,
+      "startedAt": 1793300213311,
+      "endedAt": 1793300299419,
+      "outputBytes": 554
+    },
+    {
+      "taskId": "d16d475b-64c6-4154-ba28-0cd6b2c66bd7",
+      "agent": "luban",
+      "status": "blocked",
+      "blocked": true,
+      "startedAt": 1793305139986,
+      "endedAt": 1793305549011,
+      "outputBytes": 1334
+    },
+    {
+      "taskId": "d5338094-8a24-409a-8301-2f15699ad1c2",
+      "agent": "diting",
+      "status": "done",
+      "blocked": false,
+      "startedAt": 1793307592273,
+      "endedAt": 1793307751251,
+      "outputBytes": 546
+    },
+    {
+      "taskId": "d6a19feb-fb64-4f93-b42d-4b5df4166f1d",
+      "agent": "luban",
+      "status": "blocked",
+      "blocked": true,
+      "startedAt": 1793301751763,
+      "endedAt": 1793301984252,
+      "outputBytes": 837
+    },
+    {
+      "taskId": "e3ceed9c-f864-4844-8fdd-361fc2c0119d",
+      "agent": "luban",
+      "status": "done",
+      "blocked": false,
+      "startedAt": 1793297453311,
+      "endedAt": 1793298167989,
+      "outputBytes": 962
+    },
+    {
+      "taskId": "ea932685-a444-44af-81fd-23d55b2d70fd",
+      "agent": "luban",
+      "status": "done",
+      "blocked": false,
+      "startedAt": 1793302488603,
+      "endedAt": 1793302583649,
+      "outputBytes": 691
+    },
+    {
+      "taskId": "ea948f1a-0437-4b86-8dc9-d9ed5f6e879a",
+      "agent": "luban",
+      "status": "done",
+      "blocked": false,
+      "startedAt": 1793306255915,
+      "endedAt": 1793306310668,
+      "outputBytes": 972
+    },
+    {
+      "taskId": "eced9633-2065-4ccc-863e-b14c8ebaa05a",
+      "agent": "luban",
+      "status": "done",
+      "blocked": false,
+      "startedAt": 1793303639554,
+      "endedAt": 1793303747598,
+      "outputBytes": 1061
+    },
+    {
+      "taskId": "f60c2dd2-db77-46f3-845c-7d76a7b5a666",
+      "agent": "luban",
+      "status": "done",
+      "blocked": false,
+      "startedAt": 1793305691858,
+      "endedAt": 1793305796768,
+      "outputBytes": 668
+    },
+    {
+      "taskId": "f83d3088-52fe-4903-9164-e89db0df5e91",
+      "agent": "diting",
+      "status": "done",
+      "blocked": false,
+      "startedAt": 1793299556774,
+      "endedAt": 1793299852196,
+      "outputBytes": 594
+    }
+  ]
+}

@@ -18,6 +18,9 @@ import type { SearchHit } from './kb-search.js';
 import { getKbQueryService, type KbQueryService } from './search/kb-query-service.js';
 export { stripStdHeader } from './search/header.js';
 import { stripStdHeader } from './search/header.js';
+import { loadReleaseKnowledge } from './search/release-reader.js';
+import { assembleKnowledgeIndex, KNOWLEDGE_INDEX_SCHEMA_VERSION, type KbKnowledgeIndex } from './search/knowledge-index.js';
+export type { KbKnowledgeIndex } from './search/knowledge-index.js';
 import type {
   KbCurrentPointer,
   KbManifest,
@@ -31,6 +34,10 @@ export class KbNotPublishedError extends Error {
     this.name = 'KbNotPublishedError';
   }
 }
+
+// 知识索引视图（KbKnowledgeIndex）与装配实现移至 ./search/knowledge-index.ts
+// （A案 §8：StandardKbStore 与 KbQueryService 共用同一视图，不各写一套）；
+// 本文件按原路径 re-export 该类型，T4a 导出面不变。
 
 
 /** 解析标准文档文件头（feishu_sync_kb YAML-in-comment）。 */
@@ -106,6 +113,27 @@ export class StandardKbStore {
 
   releaseDir(releaseId: string): string {
     return path.join(this.outputRoot, 'releases', releaseId);
+  }
+
+  private knowledgeCache = new Map<string, KbKnowledgeIndex>();
+
+  /** 知识索引读取（A案 §8 双读）：v1/未组织化 release 返回 null；v2 按组织
+   * 段哈希加载并缓存（缓存键含索引结构版本，A案 §8.2）。sidecar 损坏 →
+   * 抛 QueryError（组织查询失败不降级）。 */
+  readKnowledgeIndex(releaseId?: string): KbKnowledgeIndex | null {
+    const release = this.queryService.resolveRelease(releaseId);
+    if (!release.organization) return null;
+    const cacheKey = `${release.releaseId}:${release.organization.hash}:${KNOWLEDGE_INDEX_SCHEMA_VERSION}`;
+    const cached = this.knowledgeCache.get(cacheKey);
+    if (cached) return cached;
+    const { knowledge } = loadReleaseKnowledge(release);
+    const index = assembleKnowledgeIndex(release.releaseId, knowledge);
+    // 缓存同 release 仅保一份（旧哈希让位）
+    for (const key of this.knowledgeCache.keys()) {
+      if (key.startsWith(`${release.releaseId}:`)) this.knowledgeCache.delete(key);
+    }
+    this.knowledgeCache.set(cacheKey, index);
+    return index;
   }
 
   /** Resolve before reading metadata too; a cached pointer must not bypass release realpath fences. */

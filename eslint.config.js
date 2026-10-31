@@ -17,6 +17,7 @@ export default tseslint.config(
       'build/**',
       'amagi-task/**',
       '.amagi-worktrees/**',
+      '.amagi-reports/**',
       'projects-memory/**',
       'docs/**',
       'server/tests/fixtures/**',

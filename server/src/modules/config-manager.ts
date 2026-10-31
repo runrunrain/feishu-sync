@@ -44,6 +44,9 @@ import {
   type AgentOrchestrationConfig,
   type AgentVisionConfig,
   type AgentWorkspaceConfig,
+  type KbBuildRoleConfig,
+  type KbBuildRolesConfig,
+  type KbReviewPolicyConfig,
   type StandardKbConfig,
 } from '../types/agent-knowledge.js';
 import type { LlmProtocol } from '../types/index.js';
@@ -393,6 +396,17 @@ function normalizeStandardKbConfigLoose(value: unknown, dataRoot: string): Stand
     buildParallelism: typeof raw.buildParallelism === 'number'
       ? Math.max(1, Math.min(6, Math.floor(raw.buildParallelism)))
       : base.buildParallelism,
+    // B案 §6：构建名额 N（1..8，全部文本构建角色合计）；非数字保持
+    // undefined → 回落 buildParallelism（resolveBuildConcurrency 统一解析）
+    buildConcurrency: typeof raw.buildConcurrency === 'number' && Number.isFinite(raw.buildConcurrency)
+      ? Math.max(1, Math.min(8, Math.floor(raw.buildConcurrency)))
+      : undefined,
+    // B案 §3/§8：角色模型（宽容归一；严格校验在 validateAgentAndKbConfig）
+    buildRoles: normalizeBuildRolesLoose(raw.buildRoles, base.buildRoles),
+    // B案 §5：审查闭环预算
+    reviewPolicy: normalizeReviewPolicyLoose(raw.reviewPolicy, base.reviewPolicy),
+    // B案 §7：发布方式（非法值回落默认 auto）
+    publishMode: raw.publishMode === 'confirm' ? 'confirm' : 'auto',
     promptTimeoutMinutes: typeof raw.promptTimeoutMinutes === 'number'
       ? Math.max(1, Math.min(240, Math.floor(raw.promptTimeoutMinutes)))
       : base.promptTimeoutMinutes,
@@ -412,6 +426,50 @@ function normalizeBuildBatchWordBudget(value: unknown, fallback: number): number
   const budget = Math.floor(value);
   if (budget <= 0) return 0;
   return Math.min(400_000, Math.max(4_000, budget));
+}
+
+/** B案 §3/§8：角色模型宽容归一——逐角色回落默认（跟随活跃预设）；
+ * thinking 非法值丢弃（语义等同缺省 'off'）；integrator 缺省跟随 writer。 */
+function normalizeBuildRolesLoose(value: unknown, base: KbBuildRolesConfig | undefined): KbBuildRolesConfig {
+  const writerBase: KbBuildRoleConfig = base?.writer ?? { modelPresetId: '' };
+  const reviewerBase: KbBuildRoleConfig = base?.reviewer ?? { modelPresetId: '' };
+  if (!value || typeof value !== 'object') {
+    return { writer: writerBase, reviewer: reviewerBase, integrator: base?.integrator, plannerEnabled: base?.plannerEnabled ?? false };
+  }
+  const raw = value as Partial<KbBuildRolesConfig>;
+  const normalizeRole = (candidate: unknown, fallback: KbBuildRoleConfig): KbBuildRoleConfig => {
+    if (!candidate || typeof candidate !== 'object') return fallback;
+    const role = candidate as Partial<KbBuildRoleConfig>;
+    return {
+      modelPresetId: typeof role.modelPresetId === 'string' ? role.modelPresetId : fallback.modelPresetId,
+      providerId: typeof role.providerId === 'string' && role.providerId ? role.providerId : undefined,
+      thinking: role.thinking !== undefined && THINKING_LEVELS.has(role.thinking)
+        ? role.thinking
+        : undefined,
+    };
+  };
+  return {
+    writer: normalizeRole(raw.writer, writerBase),
+    reviewer: normalizeRole(raw.reviewer, reviewerBase),
+    integrator: raw.integrator !== undefined ? normalizeRole(raw.integrator, writerBase) : undefined,
+    plannerEnabled: raw.plannerEnabled === true,
+  };
+}
+
+/** B案 §5：审查闭环预算宽容归一（maxAutoRevisions 1..5、
+ * maxInterfaceRetries 0..5；非数字回落默认 2/2）。 */
+function normalizeReviewPolicyLoose(value: unknown, base: KbReviewPolicyConfig | undefined): KbReviewPolicyConfig {
+  const fallback: KbReviewPolicyConfig = base ?? { maxAutoRevisions: 2, maxInterfaceRetries: 2 };
+  if (!value || typeof value !== 'object') return fallback;
+  const raw = value as Partial<KbReviewPolicyConfig>;
+  const int = (candidate: unknown, fb: number, min: number, max: number): number =>
+    typeof candidate === 'number' && Number.isFinite(candidate)
+      ? Math.max(min, Math.min(max, Math.floor(candidate)))
+      : fb;
+  return {
+    maxAutoRevisions: int(raw.maxAutoRevisions, fallback.maxAutoRevisions ?? 2, 1, 5),
+    maxInterfaceRetries: int(raw.maxInterfaceRetries, fallback.maxInterfaceRetries ?? 2, 0, 5),
+  };
 }
 
 /** 严格校验（PUT /api/config 路径）：非法直接报 InvalidConfigError。 */
@@ -512,6 +570,66 @@ export function validateAgentAndKbConfig(value: {
         || !Number.isInteger(kb.buildParallelism)
         || kb.buildParallelism < 1 || kb.buildParallelism > 6)) {
       details.push({ field: 'standardKb.buildParallelism', code: 'out_of_range' });
+    }
+    // B案 §6：构建名额 N（1..8；严格路径；宽容归一在 normalizeStandardKbConfigLoose）
+    if (kb.buildConcurrency !== undefined
+      && (typeof kb.buildConcurrency !== 'number'
+        || !Number.isInteger(kb.buildConcurrency)
+        || kb.buildConcurrency < 1 || kb.buildConcurrency > 8)) {
+      details.push({ field: 'standardKb.buildConcurrency', code: 'out_of_range' });
+    }
+    // B案 §7：发布方式枚举
+    if (kb.publishMode !== undefined && !['auto', 'confirm'].includes(kb.publishMode)) {
+      details.push({ field: 'standardKb.publishMode', code: 'invalid_value' });
+    }
+    // B案 §5：审查闭环预算范围
+    if (kb.reviewPolicy !== undefined && (!kb.reviewPolicy || typeof kb.reviewPolicy !== 'object')) {
+      details.push({ field: 'standardKb.reviewPolicy', code: 'invalid_type' });
+    } else if (kb.reviewPolicy && typeof kb.reviewPolicy === 'object') {
+      const policy = kb.reviewPolicy as Partial<KbReviewPolicyConfig>;
+      if (policy.maxAutoRevisions !== undefined
+        && (typeof policy.maxAutoRevisions !== 'number' || !Number.isInteger(policy.maxAutoRevisions)
+          || policy.maxAutoRevisions < 1 || policy.maxAutoRevisions > 5)) {
+        details.push({ field: 'standardKb.reviewPolicy.maxAutoRevisions', code: 'out_of_range' });
+      }
+      if (policy.maxInterfaceRetries !== undefined
+        && (typeof policy.maxInterfaceRetries !== 'number' || !Number.isInteger(policy.maxInterfaceRetries)
+          || policy.maxInterfaceRetries < 0 || policy.maxInterfaceRetries > 5)) {
+        details.push({ field: 'standardKb.reviewPolicy.maxInterfaceRetries', code: 'out_of_range' });
+      }
+    }
+    // B案 §3/§8：角色模型结构校验（预设存在性由构建期活跃预设解析负责，
+    // 与 vision 的交叉校验同模式但此处只管类型/枚举）
+    if (kb.buildRoles !== undefined && (!kb.buildRoles || typeof kb.buildRoles !== 'object')) {
+      details.push({ field: 'standardKb.buildRoles', code: 'invalid_type' });
+    } else if (kb.buildRoles && typeof kb.buildRoles === 'object') {
+      const roles = kb.buildRoles as Partial<KbBuildRolesConfig>;
+      if (roles.writer !== undefined && (!roles.writer || typeof roles.writer !== 'object')) {
+        details.push({ field: 'standardKb.buildRoles.writer', code: 'invalid_type' });
+      }
+      if (roles.reviewer !== undefined && (!roles.reviewer || typeof roles.reviewer !== 'object')) {
+        details.push({ field: 'standardKb.buildRoles.reviewer', code: 'invalid_type' });
+      }
+      const roleEntries: Array<[string, KbBuildRoleConfig | undefined]> = [
+        ['writer', roles.writer],
+        ['reviewer', roles.reviewer],
+        ['integrator', roles.integrator],
+      ];
+      for (const [roleName, roleConfig] of roleEntries) {
+        if (!roleConfig || typeof roleConfig !== 'object') continue;
+        if (roleConfig.modelPresetId !== undefined && typeof roleConfig.modelPresetId !== 'string') {
+          details.push({ field: `standardKb.buildRoles.${roleName}.modelPresetId`, code: 'invalid_type' });
+        }
+        if (roleConfig.providerId !== undefined && typeof roleConfig.providerId !== 'string') {
+          details.push({ field: `standardKb.buildRoles.${roleName}.providerId`, code: 'invalid_type' });
+        }
+        if (roleConfig.thinking !== undefined && !THINKING_LEVELS.has(roleConfig.thinking)) {
+          details.push({ field: `standardKb.buildRoles.${roleName}.thinking`, code: 'invalid_value' });
+        }
+      }
+      if (roles.plannerEnabled !== undefined && typeof roles.plannerEnabled !== 'boolean') {
+        details.push({ field: 'standardKb.buildRoles.plannerEnabled', code: 'invalid_type' });
+      }
     }
   }
   if (details.length > 0) throw new InvalidConfigError(details);

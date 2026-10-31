@@ -7,6 +7,7 @@ import { RawSourceSnapshot } from './raw-source-snapshot.js';
 import { lineDiff } from './line-diff.js';
 import type { KbManifest } from '../types/agent-knowledge.js';
 import type { KbChangePreview, KbDocMerge, KbFileChange, KbVersionDto } from '../types/kb-version.js';
+import type { KnowledgeManifest } from './knowledge-schema.js';
 
 export type SourceContents = Record<string, string>;
 export const validReleaseId = (id: string) => /^[A-Za-z0-9_-]{1,120}$/.test(id);
@@ -17,6 +18,31 @@ export function captureSourceContents(snapshot: RawSourceSnapshot, root: string)
     const attachments = read.attachments.map((a, index) => `\n\n--- CSV ${index + 1} ---\n${a.content}`).join('');
     return [entry.objToken, read.content + attachments];
   }));
+}
+
+/** captureSourceContents 组合串中各资源的 UTF-8 字节区段（A 案 §5.4：
+ * evidence-resources.json 按区段标注正文/CSV，不凭 `--- CSV n ---` 位置猜
+ * 附件身份；读者先按区段还原资源再应用 selector）。 */
+export function sourceContentResourceSpans(
+  content: string,
+  attachments: Array<{ path: string; content: string }>,
+): Array<{ kind: 'text' | 'csv'; path?: string; byteOffset: number; byteLength: number; content: string }> {
+  let offset = Buffer.byteLength(content, 'utf8');
+  const spans: Array<{ kind: 'text' | 'csv'; path?: string; byteOffset: number; byteLength: number; content: string }> =
+    [{ kind: 'text', byteOffset: 0, byteLength: offset, content }];
+  attachments.forEach((attachment, index) => {
+    offset += Buffer.byteLength(`\n\n--- CSV ${index + 1} ---\n`, 'utf8');
+    const byteLength = Buffer.byteLength(attachment.content, 'utf8');
+    spans.push({
+      kind: 'csv',
+      path: attachment.path.split(/[\\/]/).pop(),
+      byteOffset: offset,
+      byteLength,
+      content: attachment.content,
+    });
+    offset += byteLength;
+  });
+  return spans;
 }
 
 export function sourceChangePreview(
@@ -67,6 +93,12 @@ export class KbVersionStore {
 
   readSourceContents(releaseId: string | null): SourceContents {
     return releaseId ? this.readJson<SourceContents>(releaseId, 'source-contents.json') ?? {} : {};
+  }
+
+  /** v2 release 的知识组织真相（A 案 §6.2）；v1/无组织段返回 null。
+   * 双写期（A 案 §10.2）：增量构建读基线对象集合用于「未解释丢失」检查。 */
+  readKnowledgeManifest(releaseId: string | null): KnowledgeManifest | null {
+    return releaseId ? this.readJson<KnowledgeManifest>(releaseId, 'knowledge.json') ?? null : null;
   }
 
   /** CURRENT的祖先链才是成功发布历史；崩溃留下的孤立release不算提交。 */

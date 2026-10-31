@@ -53,6 +53,9 @@ vi.mock('../api/client', () => {
     resumeKbBuild: state.resumeBuild.mockResolvedValue(build),
     createKbBuild: state.createBuild.mockResolvedValue(build),
     cancelKbBuild: vi.fn(), getSseAuth: vi.fn(), searchKb: vi.fn(),
+    // T5b：编排进度端点——本视图用旧式构建（无编排数据，404）锚定降级展示。
+    getKbBuildOrchestration: async () => { throw Object.assign(new APIError('构建不存在或无编排数据'), { statusCode: 404, response: { error: 'build_not_found' } }); },
+    confirmKbRelease: vi.fn(),
   };
 });
 

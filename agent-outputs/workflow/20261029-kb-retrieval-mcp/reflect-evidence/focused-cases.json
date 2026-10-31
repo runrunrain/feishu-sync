@@ -1,0 +1,295 @@
+{
+  "model-registry": [
+    {
+      "line": 31,
+      "timestamp": "2026-10-29T18:09:53.889Z",
+      "text": "[ContractError code=dispatch-failed effects=none]\nmessage: 后台启动失败（status=error）：[模型未注册] openai-codex/gpt-6.1-terra 不在 modelRegistry——请核对 provider/model 拼写；未派发。相近候选: openai-codex/gpt-5.6-terra, azure/gpt-5.6-terra, cloudflare-ai-gateway/gpt-5.6-terra, github-copilot/gpt-5.6-terra, openai/gpt-5.6-terra。\nfields: task\nrepairExamples:\n  - {\"agent\":\"<角色名>\",\"task\":\"任务书正文（目标/边界/验收）\"}\n  - {\"agent\":\"<角色名>\",\"taskFile\":\"docs/task.md\",\"delivery\":\"handle\"}\n\n[task_submit 519fb29b luban] [模型未注册] openai-codex/gpt-6.1-terra 不在 modelRegistry——请核对 provider/model 拼写；未派发。相近候选: openai-codex/gpt-5.6-terra, azure/gpt-5.6-terra, cloudflare-ai-gateway/gpt-5.6-terra, github-copilot/gpt-5.6-terra, openai/gpt-5.6-terra。"
+    },
+    {
+      "line": 140,
+      "timestamp": "2026-10-29T18:25:28.916Z",
+      "text": "[ContractError code=dispatch-failed effects=unknown]\nmessage: 后台启动失败（status=error）：[模型未注册] openai-codex/gpt-6.1-terra 不在 modelRegistry——请核对 provider/model 拼写；未派发。相近候选: openai-codex/gpt-5.6-terra, azure/gpt-5.6-terra, cloudflare-ai-gateway/gpt-5.6-terra, github-copilot/gpt-5.6-terra, openai/gpt-5.6-terra。\nfields: task\nrepairExamples:\n  - {\"agent\":\"<角色名>\",\"task\":\"任务书正文（目标/边界/验收）\"}\n  - {\"agent\":\"<角色名>\",\"taskFile\":\"docs/task.md\",\"delivery\":\"handle\"}\n\n[task_submit 02090083 luban] [模型未注册] openai-codex/gpt-6.1-terra 不在 modelRegistry——请核对 provider/model 拼写；未派发。相近候选: openai-codex/gpt-5.6-terra, azure/gpt-5.6-terra, cloudflare-ai-gateway/gpt-5.6-terra, github-copilot/gpt-5.6-terra, openai/gpt-5.6-terra。\n[worktree 现场保留] /Users/run.mao/workpace/feishu-sync/.amagi-worktrees/kb-retrieval-mcp-v2；本轮 lease 已释放，不自动删目录/分支，请核对副作用后重提。"
+    },
+    {
+      "line": 257,
+      "timestamp": "2026-10-29T18:43:37.363Z",
+      "text": "[ContractError code=resume-rejected effects=none]\nmessage: 模型校验失败\nfields: handle\nrepairExamples:\n  - {\"handle\":\"96969048-2b70-4548-a697-b0ac4bce349e\",\"message\":\"<按根因修正后续接>\"}\n\n[模型未注册] openai-codex/gpt-6.1-terra 不在 modelRegistry——请核对 provider/model 拼写；未派发。相近候选: openai-codex/gpt-5.6-terra, azure/gpt-5.6-terra, cloudflare-ai-gateway/gpt-5.6-terra, github-copilot/gpt-5.6-terra, openai/gpt-5.6-terra。"
+    },
+    {
+      "line": 379,
+      "timestamp": "2026-10-29T18:58:12.092Z",
+      "text": "[ContractError code=resume-rejected effects=none]\nmessage: 模型校验失败\nfields: handle\nrepairExamples:\n  - {\"handle\":\"96969048-2b70-4548-a697-b0ac4bce349e\",\"message\":\"<按根因修正后续接>\"}\n\n[模型未注册] openai-codex/gpt-6.1-terra 不在 modelRegistry——请核对 provider/model 拼写；未派发。相近候选: openai-codex/gpt-5.6-terra, azure/gpt-5.6-terra, cloudflare-ai-gateway/gpt-5.6-terra, github-copilot/gpt-5.6-terra, openai/gpt-5.6-terra。"
+    }
+  ],
+  "selected-context": [
+    {
+      "line": 494,
+      "timestamp": "2026-10-29T19:40:22.604Z",
+      "text": "[ContractError code=context-too-large effects=none]\nmessage: selected 用户要求与来源索引超过交接上限；未截断、未派发，请缩小任务或明示来源\nfields: contextRefs\nrepairExamples: （本错误无自动修复样例——按 message 修正后重发）"
+    }
+  ],
+  "terminal-control-misuse": [
+    {
+      "line": 792,
+      "timestamp": "2026-10-29T21:10:19.665Z",
+      "text": "[ContractError code=control-all-failed effects=none]\nmessage: resolve-external 全部失败（逐任务结果见正文——多为已终态拒绝）\nfields: handles\nrepairExamples:\n  - {\"action\":\"wait\",\"handles\":[\"181dc28f-c64c-4e31-9afd-658734fbf594\",\"f60c2dd2-db77-46f3-845c-7d76a7b5a666\",\"d16d475b-64c6-4154-ba28-0cd6b2c66bd7\",\"7f8020f1-8018-463e-91f0-9e9bf680ce68\",\"44cc0165-b90c-4b80-8974-b5b047a03764\",\"236dd084-2300-400e-b026-0aa085d37e80\",\"5877bab7-d0ad-4ab4-915c-248a710c4d76\",\"56df927c-8fb4-46be-ba40-ccb304fa3db2\",\"d6a19feb-fb64-4f93-b42d-4b5df4166f1d\",\"96969048-2b70-4548-a697-b0ac4bce349e\",\"0547ff9f-4d08-4c1e-b22c-f865b846402e\"],\"mode\":\"all\",\"timeoutMs\":5000}\n\n[task_control resolve-external · 11 任务 · 成功 0]\n  181dc28f ✗ 任务已终态（done），无需外部处置收口\n    任务 181dc28f-c64c-4e31-9afd-658734fbf594 是契约存储中的历史记录（非本会话运行；owner=amagi-leader-run.mao@402cb40e-3194-4e51-abb0-697c9d5a0a10；execution=done process=exited settlement=incomplete acceptance=unreviewed recovery=none）。历史终态，无需控制；续接走 task_resume({ handle: \"181dc28f-c64c-4e31-9afd-658734fbf594\", message })，三轴用 task_query。\n  f60c2dd2 ✗ 任务已终态（done），无需外部处置收口\n    任务 f60c2dd2-db77-46f3-845c-7d76a7b5a666 是契约存储中的历史记录（非本会话运行；owner=amagi-leader-run.mao@402cb40e-3194-4e51-abb0-697c9d5a0a10；execution=done process=exited settlement=incomplete acceptance=unreviewed recovery=none）。历史终态，无需控制；续接走 task_resume({ handle: \"f60c2dd2-db77-46f3-845c-7d76a7b5a666\", message })，三轴用 task_query。\n  d16d475b ✗ 任务已终态（answered），无需外部处置收口\n    任务 d16d475b-64c6-4154-ba28-0cd6b2c66bd7 是契约存储中的历史记录（非本会话运行；owner=amagi-leader-run.mao@402cb40e-3194-4e51-abb0-697c9d5a0a10；execution=answered process=exited settlement=pending acceptance=unreviewed recovery=none）。历史终态，无需控制；续接走 task_resume({ handle: \"d16d475b-64c6-4154-ba28-0cd6b2c66bd7\", message })，三轴用 task_query。\n  7f8020f1 ✗ 任务已终态（done），无需外部处置收口\n    任务 7f8020f1-8018-463e-91f0-9e9bf680ce68 是契约存储中的历史记录（非本会话运行；owner=amagi-leader-run.mao@402cb40e-3194-4e51-abb0-697c9d5a0a10；execution=done process=exited settlement=incomplete acceptance=unreviewed recovery=none）。历史终态，无需控制；续接走 task_resume({ handle: \"7f8020f1-8018-463e-91f0-9e9bf680ce68\", message })，三轴用 task_query。\n  44cc0165 ✗ 任务已终态（done），无需外部处置收口\n    任务 44cc0165-b90c-4b80-8974-b5b047a03764 是契约存储中的历史记录（非本会话运行；owner=amagi-leader-run.mao@402cb40e-3194-4e51-abb0-697c9d5a0a10；execution=done process=exited settlement=incomplete acceptance=unreviewed recovery=none）。历史终态，无需控制；续接走 task_resume({ handle: \"44cc0165-b90c-4b80-8"
+    }
+  ],
+  "bash-diagnostic": {
+    "line": 381,
+    "rawBeforeHint": "✗ Could not locate element with role=tab name=知识库共享\n\n\nCommand exited with code 1\n[cwd] /Users/run.mao/workpace/feishu-sync\n\n\n",
+    "hasNamesSeenInRaw": false,
+    "hintClaimsNamesSeen": true,
+    "hint": "[AMAGI Bash 诊断·软提示] 保留并阅读上方原始错误；检测到 agent-browser 按 role/name 定位未命中：元素不存在或可访问名称与预期不同（输出 Names seen 已列出当前候选）。先 `agent-browser --session <id> snapshot -i` 核对元素真实 role 与名称，按快照中的名称重试。 本提示不阻断重试。"
+  },
+  "stale-continuation": {
+    "line": 794,
+    "timestamp": "2026-10-29T21:10:36.346Z",
+    "text": "[amagi 压缩存活 · CONTINUATION_ONCE]（settle 前一次性续跑注入：压缩后的任务/blocked/artifact 状态见下。如无待续工作，以一行确认收尾，不展开新工作。）\n[amagi 压缩保真]\n\n进行中子 Agent（1）：\n- luoshen/b7a9eab9 · 目标: 最终真实Electron补验：你的card/test两文件增量已合并主树，独立打包候选包含最新前端；C安全首审02908e87已PASS。候选路径 /Users/run.mao/workpace/feishu-sync/dist-deskt…\n\n关键 artifact：\n- agent-outputs/workflow/20261029-kb-retrieval-mcp/package-report.md\n- /Users/run.mao/.pi/agent/amagi/artifacts/56df927c-8fb4-46be-ba40-ccb304fa3db2\n- /Users/run.mao/.pi/agent/amagi/artifacts/7f8020f1-8018-463e-91f0-9e9bf680ce68\n- /Users/run.mao/workpace/feishu-sync/agent-outputs/workflow/20261029-kb-retrieval-mcp/package-report.md\n- /Users/run.mao/.pi/age",
+    "priorTerminalEvidence": [
+      {
+        "line": 639,
+        "timestamp": "2026-10-29T20:24:08.971Z",
+        "projection": "\n[\"[details surfaceVersion=2 viewVersion=1 taskId=b7a9eab9-c9fa-4874-90f7-8b195863b45c revision=0 execution=done settlement=incomplete acceptance=accepted 承诺=guarded receiptRef=receipt-a23dd36b-003e-4703-8671-64f96d6917b8 nextActions=[] degraded=[]]\\n\\n[task_control accept b7a9eab9] acceptance=accepted receiptSeq=2（已接受（新回执 receiptSeq=2，沿用证据不重跑；settlement 保持原值））\\n[内核视图 v1] taskId=b7a9eab9 stateSeq=10 revision=0 execution=done settlement=incomplete acceptance=accepted 承诺=guarded receipt=receipt-a23dd36b-003e-4703-8671-64f96d6917b8(incomplete/acce"
+      }
+    ],
+    "extraFinalLine": {
+      "line": 795,
+      "timestamp": "2026-10-29T21:10:47.648Z",
+      "text": "已收尾：该“进行中”标记已过时，Electron 补验及后续修复均已完成并验收，最终提交为 `b70ac06`。"
+    }
+  },
+  "provider-transport": {
+    "errors": [
+      {
+        "line": 298,
+        "timestamp": "2026-10-29T18:48:14.603Z",
+        "error": "WebSocket closed 1000"
+      },
+      {
+        "line": 799,
+        "timestamp": "2026-10-30T03:16:49.067Z",
+        "error": "fetch failed"
+      },
+      {
+        "line": 801,
+        "timestamp": "2026-10-30T03:16:56.186Z",
+        "error": "fetch failed"
+      },
+      {
+        "line": 803,
+        "timestamp": "2026-10-30T03:17:05.291Z",
+        "error": "fetch failed"
+      },
+      {
+        "line": 805,
+        "timestamp": "2026-10-30T03:17:18.410Z",
+        "error": "fetch failed"
+      },
+      {
+        "line": 810,
+        "timestamp": "2026-10-30T03:20:22.728Z",
+        "error": "fetch failed"
+      },
+      {
+        "line": 815,
+        "timestamp": "2026-10-30T03:20:49.008Z",
+        "error": "fetch failed"
+      },
+      {
+        "line": 817,
+        "timestamp": "2026-10-30T03:20:51.206Z",
+        "error": "fetch failed"
+      },
+      {
+        "line": 819,
+        "timestamp": "2026-10-30T03:20:55.398Z",
+        "error": "fetch failed"
+      },
+      {
+        "line": 825,
+        "timestamp": "2026-10-30T03:22:10.605Z",
+        "error": "fetch failed"
+      },
+      {
+        "line": 832,
+        "timestamp": "2026-10-30T03:22:49.400Z",
+        "error": "fetch failed"
+      },
+      {
+        "line": 836,
+        "timestamp": "2026-10-30T03:23:04.633Z",
+        "error": "fetch failed"
+      },
+      {
+        "line": 838,
+        "timestamp": "2026-10-30T03:23:06.775Z",
+        "error": "fetch failed"
+      }
+    ],
+    "pushUserPrompts": [
+      {
+        "line": 798,
+        "timestamp": "2026-10-30T03:16:38.955Z",
+        "type": "push-user-prompt"
+      },
+      {
+        "line": 809,
+        "timestamp": "2026-10-30T03:20:22.480Z",
+        "type": "push-user-prompt"
+      },
+      {
+        "line": 814,
+        "timestamp": "2026-10-30T03:20:48.841Z",
+        "type": "push-user-prompt"
+      },
+      {
+        "line": 824,
+        "timestamp": "2026-10-30T03:22:10.329Z",
+        "type": "push-user-prompt"
+      },
+      {
+        "line": 829,
+        "timestamp": "2026-10-30T03:22:41.247Z",
+        "type": "push-user-prompt"
+      }
+    ],
+    "successfulPushToolResults": [
+      {
+        "line": 835,
+        "callLine": 834,
+        "timestamp": "2026-10-30T03:23:04.484Z",
+        "name": "bash",
+        "isError": false,
+        "durationMs": 4169,
+        "code": null
+      }
+    ],
+    "successfulPushFinalTimestamp": "2026-10-30T03:23:18.640Z",
+    "note": "Transport/provider/SDK cause not proven by generic error strings; not called an amagi transport bug."
+  },
+  "version-observability": {
+    "sessionHeaderFields": [
+      "type",
+      "version",
+      "id",
+      "timestamp",
+      "cwd"
+    ],
+    "sessionFormatVersion": 3,
+    "artifactMetadataInspected": 29,
+    "artifactMetadataWithoutPluginVersion": 29,
+    "collectionRepositoryPackageVersion": "2.21.23",
+    "repositoryPackagePath": "/Users/run.mao/workpace/amagi-pi/package.json",
+    "notRuntimeAttestation": true
+  },
+  "auto-verification": {
+    "uniqueAutoCheckIds": [
+      "chk-auto-baseline-test-2b72cd80",
+      "chk-auto-baseline-test-2bc94fe0",
+      "chk-auto-baseline-test-457bcc65",
+      "chk-auto-baseline-test-598d4d8f",
+      "chk-auto-baseline-test-5ad7c95c",
+      "chk-auto-baseline-test-7e344d68",
+      "chk-auto-baseline-test-84a1c666",
+      "chk-auto-baseline-test-8e69a846",
+      "chk-auto-baseline-test-a02855af",
+      "chk-auto-baseline-test-b0c7b8d9",
+      "chk-auto-baseline-test-b178ab63",
+      "chk-auto-baseline-test-b7c8b934",
+      "chk-auto-baseline-test-bb14fb6c",
+      "chk-auto-baseline-test-bf8e91de",
+      "chk-auto-baseline-test-c1653d87",
+      "chk-auto-baseline-test-c478401d",
+      "chk-auto-baseline-test-c6f82e56",
+      "chk-auto-baseline-test-c90059a1",
+      "chk-auto-baseline-test-cdff8669",
+      "chk-auto-baseline-test-cf03c470",
+      "chk-auto-baseline-test-e91ed72e"
+    ],
+    "taskSnapshotFile": "task-snapshot.json",
+    "missingMarkerNotifications": [
+      {
+        "line": 432,
+        "timestamp": "2026-10-29T19:29:34.598Z",
+        "header": "[task_submit 完成 luban/5877bab7] 状态: done｜任务: 「[TASK_TIER: complex] D客户端兼容与真实MCP挂载验证（工匠闭环，轻证据）。」",
+        "missingMarker": true,
+        "autoUnavailableIds": [
+          "chk-auto-baseline-test-e91ed72e"
+        ],
+        "execution": "done",
+        "taskId": "5877bab7-d0ad-4ab4-915c-248a710c4d76"
+      },
+      {
+        "line": 495,
+        "timestamp": "2026-10-29T19:40:22.636Z",
+        "header": "[task_resume 完成 luban/44cc0165] 状态: done｜父会话 5877bab7-d0ad-4ab4-915c-248a710c4d76",
+        "missingMarker": true,
+        "autoUnavailableIds": [
+          "chk-auto-baseline-test-84a1c666"
+        ],
+        "execution": "done",
+        "taskId": "44cc0165-b90c-4b80-8974-b5b047a03764"
+      },
+      {
+        "line": 519,
+        "timestamp": "2026-10-29T19:46:59.271Z",
+        "header": "[task_resume 完成 luoshen/56df927c] 状态: done｜父会话 0547ff9f-4d08-4c1e-b22c-f865b846402e",
+        "missingMarker": true,
+        "autoUnavailableIds": [
+          "chk-auto-baseline-test-457bcc65"
+        ],
+        "execution": "done",
+        "taskId": "56df927c-8fb4-46be-ba40-ccb304fa3db2"
+      },
+      {
+        "line": 550,
+        "timestamp": "2026-10-29T19:54:30.023Z",
+        "header": "[task_submit 完成 luban/7f8020f1] 状态: done｜任务: 「[TASK_TIER: complex] macOS arm64成品候选打包，默认模型。必读CL」",
+        "missingMarker": true,
+        "autoUnavailableIds": [
+          "chk-auto-baseline-test-c6f82e56"
+        ],
+        "execution": "done",
+        "taskId": "7f8020f1-8018-463e-91f0-9e9bf680ce68"
+      },
+      {
+        "line": 654,
+        "timestamp": "2026-10-29T20:30:32.965Z",
+        "header": "[task_resume 完成 luban/f60c2dd2] 状态: done｜父会话 d16d475b-64c6-4154-ba28-0cd6b2c66bd7",
+        "missingMarker": true,
+        "autoUnavailableIds": [
+          "chk-auto-baseline-test-cf03c470"
+        ],
+        "execution": "done",
+        "taskId": "f60c2dd2-db77-46f3-845c-7d76a7b5a666"
+      },
+      {
+        "line": 702,
+        "timestamp": "2026-10-29T20:44:38.782Z",
+        "header": "[task_resume 完成 luban/181dc28f] 状态: done｜父会话 03a528f4-f8a7-4e39-ba4d-cd358a5c3ad9",
+        "missingMarker": true,
+        "autoUnavailableIds": [
+          "chk-auto-baseline-test-c478401d"
+        ],
+        "execution": "done",
+        "taskId": "181dc28f-c64c-4e31-9afd-658734fbf594"
+      }
+    ],
+    "note": "incomplete/unavailable is honest missing evidence, not a failing product test or fake done."
+  },
+  "dependency-reuse": {
+    "source": "stage-d-fixes.md and immutable task metadata",
+    "blockedTask": "d16d475b-64c6-4154-ba28-0cd6b2c66bd7",
+    "resumedTask": "f60c2dd2-db77-46f3-845c-7d76a7b5a666",
+    "missingPackages": [
+      "@anthropic-ai/sdk",
+      "@modelcontextprotocol/sdk",
+      "csv-parser",
+      "exceljs",
+      "jszip",
+      "ssf"
+    ],
+    "recovery": "Authorized worktree-only symlinks; preserved .vite and shared native ABI; original entry 19 tests/build passed. See retained ev-20261029-3128e2 evidence."
+  }
+}

@@ -11,7 +11,7 @@ import type { KbMcpInfoDto } from '../src/types/agent-knowledge.js';
 const roots: string[] = [];
 afterEach(() => { vi.restoreAllMocks(); for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 function fixture() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-install-')); roots.push(root);
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-install-'))); roots.push(root);
   const home = path.join(root, 'home'); const dataRoot = path.join(root, 'data');
   fs.mkdirSync(home); fs.mkdirSync(dataRoot);
   const info: KbMcpInfoDto = { available: true, command: 'app.exe', args: ['mcp.cjs', '--kb-root', 'old-root'], env: { ELECTRON_RUN_AS_NODE: '1' }, alternative: { command: 'node', args: [], note: '' }, snippet: '' };

@@ -1,0 +1,33 @@
+{
+  "report": "agent-outputs/workflow/20261029-kb-retrieval-mcp/amagi-pi-知识库检索与MCP交付插件摩擦复盘-2026-10-30.md",
+  "sessionId": "01a188d4-ace4-7535-908f-abbf0c52c0e2",
+  "newItems": {
+    "F1": "ev-20261030-96c28e",
+    "F2": "ev-20261030-06002b",
+    "F3": "ev-20261030-53f52f",
+    "B2": "ev-20261030-e4391a",
+    "F4": "ev-20261030-80a69d",
+    "F5": "ev-20261030-eb26b1"
+  },
+  "reusedItems": {
+    "B1": "ev-20261029-913fb1",
+    "M1": "ev-20261029-3128e2"
+  },
+  "exemptions": {
+    "X1": "纯使用者债；无新增低成本通用防呆空间",
+    "X2": "正常探测/验证/护栏成本，不是改进项"
+  },
+  "retainedEvidence": {
+    "focused-cases.json": "sha256:ce125800611e70ad9511367a7fcbf45e66bedb5bb712d3f3a676399c2b506fd1",
+    "session-metrics.json": "sha256:ebf01c1d5df68824a6b2378279795d674592721d07a64d398d1fcc372f5c687e",
+    "collect-session.py": "sha256:e6154f27b9a9fb8ee0531aea6d49c53b97bbb8421be18806651c7b76b8fb1e34"
+  },
+  "counts": {
+    "P0": 0,
+    "P1": 0,
+    "P2": 4,
+    "P3": 2,
+    "reused": 2,
+    "exemptedGroups": 2
+  }
+}

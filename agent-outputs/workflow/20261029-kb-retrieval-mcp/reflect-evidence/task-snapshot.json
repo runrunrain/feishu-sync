@@ -1,0 +1,238 @@
+{
+  "collectedAt": "2026-10-30",
+  "source": "task_query read-only current state, not historical timing",
+  "tasks": [
+    {
+      "taskId": "d5338094-8a24-409a-8301-2f15699ad1c2",
+      "agent": "diting",
+      "execution": "done",
+      "settlement": "ready",
+      "acceptance": "accepted",
+      "revision": 0
+    },
+    {
+      "taskId": "7ad957c3-3483-4f20-ab57-f2f7ab462c55",
+      "agent": "luban",
+      "execution": "done",
+      "settlement": "incomplete",
+      "acceptance": "accepted",
+      "revision": 0
+    },
+    {
+      "taskId": "c00dda65-f4da-47eb-8355-66da5bf56418",
+      "agent": "luoshen",
+      "execution": "done",
+      "settlement": "incomplete",
+      "acceptance": "accepted",
+      "revision": 0
+    },
+    {
+      "taskId": "181dc28f-c64c-4e31-9afd-658734fbf594",
+      "agent": "luban",
+      "execution": "done",
+      "settlement": "incomplete",
+      "acceptance": "unreviewed",
+      "revision": 0
+    },
+    {
+      "taskId": "ea948f1a-0437-4b86-8dc9-d9ed5f6e879a",
+      "agent": "luban",
+      "execution": "done",
+      "settlement": "incomplete",
+      "acceptance": "accepted",
+      "revision": 0
+    },
+    {
+      "taskId": "c1ea3374-5a43-4d98-b75e-fecd9daf7c03",
+      "agent": "luoshen",
+      "execution": "done",
+      "settlement": "incomplete",
+      "acceptance": "accepted",
+      "revision": 0
+    },
+    {
+      "taskId": "f60c2dd2-db77-46f3-845c-7d76a7b5a666",
+      "agent": "luban",
+      "execution": "done",
+      "settlement": "incomplete",
+      "acceptance": "unreviewed",
+      "revision": 0
+    },
+    {
+      "taskId": "d16d475b-64c6-4154-ba28-0cd6b2c66bd7",
+      "agent": "luban",
+      "execution": "answered",
+      "settlement": "pending",
+      "acceptance": "unreviewed",
+      "revision": 0
+    },
+    {
+      "taskId": "03a528f4-f8a7-4e39-ba4d-cd358a5c3ad9",
+      "agent": "luban",
+      "execution": "done",
+      "settlement": "incomplete",
+      "acceptance": "accepted",
+      "revision": 0
+    },
+    {
+      "taskId": "b7a9eab9-c9fa-4874-90f7-8b195863b45c",
+      "agent": "luoshen",
+      "execution": "done",
+      "settlement": "incomplete",
+      "acceptance": "accepted",
+      "revision": 0
+    },
+    {
+      "taskId": "eced9633-2065-4ccc-863e-b14c8ebaa05a",
+      "agent": "luban",
+      "execution": "done",
+      "settlement": "incomplete",
+      "acceptance": "accepted",
+      "revision": 0
+    },
+    {
+      "taskId": "02908e87-bdcf-4347-bc3d-023d748a589a",
+      "agent": "diting",
+      "execution": "done",
+      "settlement": "ready",
+      "acceptance": "accepted",
+      "revision": 0
+    },
+    {
+      "taskId": "7098e081-0e3f-4d79-bd22-abb3a3f05fd2",
+      "agent": "luban",
+      "execution": "done",
+      "settlement": "incomplete",
+      "acceptance": "accepted",
+      "revision": 0
+    },
+    {
+      "taskId": "7f8020f1-8018-463e-91f0-9e9bf680ce68",
+      "agent": "luban",
+      "execution": "done",
+      "settlement": "incomplete",
+      "acceptance": "unreviewed",
+      "revision": 0
+    },
+    {
+      "taskId": "ea932685-a444-44af-81fd-23d55b2d70fd",
+      "agent": "luban",
+      "execution": "done",
+      "settlement": "incomplete",
+      "acceptance": "accepted",
+      "revision": 0
+    },
+    {
+      "taskId": "3fac3164-c30c-47f3-88fc-9e73b3dc80fa",
+      "agent": "luban",
+      "execution": "done",
+      "settlement": "incomplete",
+      "acceptance": "accepted",
+      "revision": 0
+    },
+    {
+      "taskId": "44cc0165-b90c-4b80-8974-b5b047a03764",
+      "agent": "luban",
+      "execution": "done",
+      "settlement": "incomplete",
+      "acceptance": "unreviewed",
+      "revision": 0
+    },
+    {
+      "taskId": "236dd084-2300-400e-b026-0aa085d37e80",
+      "agent": "luban",
+      "execution": "done",
+      "settlement": "incomplete",
+      "acceptance": "unreviewed",
+      "revision": 0
+    },
+    {
+      "taskId": "5877bab7-d0ad-4ab4-915c-248a710c4d76",
+      "agent": "luban",
+      "execution": "done",
+      "settlement": "incomplete",
+      "acceptance": "unreviewed",
+      "revision": 0
+    },
+    {
+      "taskId": "56df927c-8fb4-46be-ba40-ccb304fa3db2",
+      "agent": "luoshen",
+      "execution": "done",
+      "settlement": "incomplete",
+      "acceptance": "unreviewed",
+      "revision": 0
+    },
+    {
+      "taskId": "d6a19feb-fb64-4f93-b42d-4b5df4166f1d",
+      "agent": "luban",
+      "execution": "answered",
+      "settlement": "pending",
+      "acceptance": "unreviewed",
+      "revision": 0
+    },
+    {
+      "taskId": "d0d6eb69-51f8-4d09-8e50-aa51ffb9f30a",
+      "agent": "diting",
+      "execution": "done",
+      "settlement": "ready",
+      "acceptance": "accepted",
+      "revision": 0
+    },
+    {
+      "taskId": "f83d3088-52fe-4903-9164-e89db0df5e91",
+      "agent": "diting",
+      "execution": "done",
+      "settlement": "ready",
+      "acceptance": "accepted",
+      "revision": 0
+    },
+    {
+      "taskId": "96969048-2b70-4548-a697-b0ac4bce349e",
+      "agent": "luban",
+      "execution": "answered",
+      "settlement": "pending",
+      "acceptance": "unreviewed",
+      "revision": 0
+    },
+    {
+      "taskId": "0547ff9f-4d08-4c1e-b22c-f865b846402e",
+      "agent": "luoshen",
+      "execution": "done",
+      "settlement": "incomplete",
+      "acceptance": "unreviewed",
+      "revision": 0
+    },
+    {
+      "taskId": "262b51cc-3d14-4586-a703-aeae202a826e",
+      "agent": "luban",
+      "execution": "done",
+      "settlement": "incomplete",
+      "acceptance": "accepted",
+      "revision": 0
+    },
+    {
+      "taskId": "e3ceed9c-f864-4844-8fdd-361fc2c0119d",
+      "agent": "luban",
+      "execution": "done",
+      "settlement": "incomplete",
+      "acceptance": "accepted",
+      "revision": 0
+    },
+    {
+      "taskId": "8647a359-398a-4355-8bb6-599be52740d6",
+      "agent": "luban",
+      "execution": "done",
+      "settlement": "incomplete",
+      "acceptance": "accepted",
+      "revision": 0
+    },
+    {
+      "taskId": "69c9cd6e-61e8-4012-a07b-d7a54be9fb17",
+      "agent": "baize",
+      "execution": "done",
+      "settlement": "ready",
+      "acceptance": "accepted",
+      "revision": 0
+    }
+  ]
+}

@@ -130,7 +130,7 @@ export async function agentRoutes(deps: AgentRouteDeps): Promise<Hono> {
         ...status,
         externalPlugins: deps.externalPlugins?.() ?? 0,
         runtime: dto,
-        processes: { running: pool.runningCount(), max: pool.max },
+        processes: { running: pool.runningCount(), max: pool.max, build: { running: pool.buildRunningCount(), capacity: pool.buildCapacity } },
       });
     } catch (error) {
       return errorResponse(c, error);

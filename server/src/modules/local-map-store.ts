@@ -32,6 +32,41 @@ import type {
 
 const V5_RUNTIME_SCHEMA_VERSION = 'v5_runtime_state';
 
+/**
+ * kb_builds 列定义（新库 DDL 与 T2b CHECK 重建迁移共用单一来源；改动两处
+ * 同步生效——新增列仍走 applyAdditiveMigrations 的 ALTER 路径）。
+ * T2b（B 案 §7）：status CHECK 新增 awaiting_release（待确认发布）。
+ */
+const KB_BUILDS_COLUMNS_DDL = `
+        id TEXT PRIMARY KEY,
+        mode TEXT NOT NULL CHECK(mode IN ('incremental', 'full')),
+        status TEXT NOT NULL CHECK(status IN (
+          'queued', 'preflight', 'running', 'validating', 'publishing',
+          'awaiting_release',
+          'published', 'failed', 'cancelled', 'interrupted')),
+        base_release_id TEXT,
+        release_id TEXT,
+        model TEXT,
+        source_total INTEGER NOT NULL DEFAULT 0,
+        source_added INTEGER NOT NULL DEFAULT 0,
+        source_changed INTEGER NOT NULL DEFAULT 0,
+        source_removed INTEGER NOT NULL DEFAULT 0,
+        docs_written INTEGER NOT NULL DEFAULT 0,
+        docs_deleted INTEGER NOT NULL DEFAULT 0,
+        no_changes INTEGER NOT NULL DEFAULT 0,
+        parallelism INTEGER NOT NULL DEFAULT 1,
+        unit_total INTEGER NOT NULL DEFAULT 0,
+        vision_model TEXT,
+        warnings_json TEXT,
+        roles_json TEXT,
+        orchestration_json TEXT,
+        error_code TEXT,
+        error_message TEXT,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        finished_at TEXT
+`;
+
 export class LocalMapStore {
   private db: Database.Database;
   private statements: Map<string, Database.Statement> = new Map();
@@ -110,11 +145,38 @@ export class LocalMapStore {
         ['unit_total', 'ALTER TABLE kb_builds ADD COLUMN unit_total INTEGER NOT NULL DEFAULT 0'],
         ['vision_model', 'ALTER TABLE kb_builds ADD COLUMN vision_model TEXT'],
         ['warnings_json', 'ALTER TABLE kb_builds ADD COLUMN warnings_json TEXT'],
+        // 知识组织 + 构建编排（A案 §6.2 / B案 §8）：SQLite 仅摘要缓存，
+        // 真相在 release 与 checkpoint（删缓存可从 release 重建；MCP 不
+        // 依赖 SQLite）。roles_json = 冻结的角色模型快照摘要；
+        // orchestration_json = 任务/审查计数摘要（修订轮/重试/待处理等）。
+        ['roles_json', 'ALTER TABLE kb_builds ADD COLUMN roles_json TEXT'],
+        ['orchestration_json', 'ALTER TABLE kb_builds ADD COLUMN orchestration_json TEXT'],
       ];
       for (const [name, dml] of kbBuildAdditive) {
         if (!kbBuildColNames.has(name)) {
           this.db.exec(dml);
           console.info(`[LocalMapStore] Auto-migration: + kb_builds.${name}`);
+        }
+      }
+      // T2b（B 案 §7）：status CHECK 新增 awaiting_release——SQLite 无法
+      // ALTER CHECK，旧库用标准重建配方（事务内拷贝 + 索引重建；列已由
+      // 上面的 additive 段补齐）。sqlite_master DDL 不含新枚举 → 重建。
+      const kbBuildDdl = (this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='kb_builds'").get() as { sql?: string } | undefined)?.sql ?? '';
+      if (kbBuildCols.length && kbBuildDdl && !kbBuildDdl.includes("'awaiting_release'")) {
+        const colList = kbBuildCols.map((c) => `"${c.name}"`).join(', ');
+        this.db.exec('BEGIN');
+        try {
+          this.db.exec(`CREATE TABLE kb_builds_v2 (${KB_BUILDS_COLUMNS_DDL})`);
+          this.db.exec(`INSERT INTO kb_builds_v2 (${colList}) SELECT ${colList} FROM kb_builds`);
+          this.db.exec('DROP TABLE kb_builds');
+          this.db.exec('ALTER TABLE kb_builds_v2 RENAME TO kb_builds');
+          this.db.exec('CREATE INDEX IF NOT EXISTS idx_kb_builds_status ON kb_builds(status)');
+          this.db.exec('CREATE INDEX IF NOT EXISTS idx_kb_builds_created ON kb_builds(created_at)');
+          this.db.exec('COMMIT');
+          console.info('[LocalMapStore] Auto-migration: kb_builds status CHECK + awaiting_release');
+        } catch (error) {
+            this.db.exec('ROLLBACK');
+            throw error;
         }
       }
     }
@@ -2737,6 +2799,10 @@ export class LocalMapStore {
     unitTotal: number;
     visionModel: string | null;
     warningsJson: string | null;
+    /** T2a（B 案 §8）：角色模型快照摘要（冻结后不随配置变更） */
+    rolesJson: string | null;
+    /** T2a（B 案 §8）：任务/审查计数摘要缓存（真相在 release 与检查点） */
+    orchestrationJson: string | null;
   }>): void {
     const current = this.db.prepare('SELECT * FROM kb_builds WHERE id = ?').get(id) as Record<string, unknown> | undefined;
     if (!current) throw new Error(`kb_build 不存在: ${id}`);
@@ -2755,6 +2821,8 @@ export class LocalMapStore {
       unit_total: patch.unitTotal ?? current.unit_total ?? 0,
       vision_model: patch.visionModel !== undefined ? patch.visionModel : current.vision_model ?? null,
       warnings_json: patch.warningsJson !== undefined ? patch.warningsJson : current.warnings_json ?? null,
+      roles_json: patch.rolesJson !== undefined ? patch.rolesJson : current.roles_json ?? null,
+      orchestration_json: patch.orchestrationJson !== undefined ? patch.orchestrationJson : current.orchestration_json ?? null,
       error_code: patch.errorCode !== undefined ? patch.errorCode : current.error_code,
       error_message: patch.errorMessage !== undefined ? patch.errorMessage : current.error_message,
       started_at: patch.startedAt !== undefined ? patch.startedAt : current.started_at,
@@ -2764,12 +2832,14 @@ export class LocalMapStore {
       UPDATE kb_builds SET status=?, release_id=?, source_total=?, source_added=?,
         source_changed=?, source_removed=?, docs_written=?, docs_deleted=?,
         no_changes=?, parallelism=?, unit_total=?, vision_model=?, warnings_json=?,
+        roles_json=?, orchestration_json=?,
         error_code=?, error_message=?, started_at=?, finished_at=?, model=?
       WHERE id=?
     `).run(
       next.status, next.release_id, next.source_total, next.source_added,
       next.source_changed, next.source_removed, next.docs_written, next.docs_deleted,
       next.no_changes, next.parallelism, next.unit_total, next.vision_model, next.warnings_json,
+      next.roles_json, next.orchestration_json,
       next.error_code, next.error_message, next.started_at, next.finished_at, next.model,
       id,
     );
@@ -2783,16 +2853,17 @@ export class LocalMapStore {
     return this.db.prepare('SELECT * FROM kb_builds ORDER BY created_at DESC LIMIT ?').all(limit) as Array<Record<string, unknown>>;
   }
 
-  /** 当前非终态构建（queued/preflight/running/validating/publishing）。 */
+  /** 当前非终态构建（queued/preflight/running/validating/publishing + T2b awaiting_release）。 */
   getActiveKbBuild(): Record<string, unknown> | null {
     return (this.db.prepare(`
       SELECT * FROM kb_builds
-      WHERE status IN ('queued','preflight','running','validating','publishing')
+      WHERE status IN ('queued','preflight','running','validating','publishing','awaiting_release')
       ORDER BY created_at DESC LIMIT 1
     `).get() as Record<string, unknown> | undefined) ?? null;
   }
 
-  /** 启动对账：非终态 → interrupted。 */
+  /** 启动对账：非终态 → interrupted。T2b：awaiting_release 是稳定的待确认
+   * 态（候选在盘、可跨重启确认发布），不是运行中被中断，不转入 interrupted。 */
   markInterruptedKbBuilds(): string[] {
     const info = this.db.prepare(`
       UPDATE kb_builds SET status='interrupted',
@@ -3853,31 +3924,7 @@ export class LocalMapStore {
       );
 
       CREATE TABLE IF NOT EXISTS kb_builds (
-        id TEXT PRIMARY KEY,
-        mode TEXT NOT NULL CHECK(mode IN ('incremental', 'full')),
-        status TEXT NOT NULL CHECK(status IN (
-          'queued', 'preflight', 'running', 'validating', 'publishing',
-          'published', 'failed', 'cancelled', 'interrupted')),
-        base_release_id TEXT,
-        release_id TEXT,
-        model TEXT,
-        source_total INTEGER NOT NULL DEFAULT 0,
-        source_added INTEGER NOT NULL DEFAULT 0,
-        source_changed INTEGER NOT NULL DEFAULT 0,
-        source_removed INTEGER NOT NULL DEFAULT 0,
-        docs_written INTEGER NOT NULL DEFAULT 0,
-        docs_deleted INTEGER NOT NULL DEFAULT 0,
-        no_changes INTEGER NOT NULL DEFAULT 0,
-        -- S4（设计 §4.6）：并行构建列；旧库由 applyAdditiveMigrations 补齐
-        parallelism INTEGER NOT NULL DEFAULT 1,
-        unit_total INTEGER NOT NULL DEFAULT 0,
-        vision_model TEXT,
-        warnings_json TEXT,
-        error_code TEXT,
-        error_message TEXT,
-        created_at TEXT NOT NULL,
-        started_at TEXT,
-        finished_at TEXT
+        ${KB_BUILDS_COLUMNS_DDL}
       );
       CREATE INDEX IF NOT EXISTS idx_kb_builds_status ON kb_builds(status);
       CREATE INDEX IF NOT EXISTS idx_kb_builds_created ON kb_builds(created_at);

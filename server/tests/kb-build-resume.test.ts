@@ -292,3 +292,53 @@ describe('构建断点继续', () => {
     expect((await next.request(`/api/kb/builds/${data.id}`)).data.report).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// diting F01：检查点纳入知识组织与审查产物
+// ---------------------------------------------------------------------------
+
+describe('diting F01：检查点保存/恢复知识组织产物', () => {
+  it('knowledge-draft/organization-plan/read-receipts/reviews/candidate 同代入点；staging 丢失后恢复；代内损坏拒绝恢复（不重建为空）', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kb-cp-f01-'));
+    try {
+      const outputRoot = path.join(dir, 'standard');
+      const buildId = 'b_f01cp';
+      const staging = path.join(outputRoot, '.staging', buildId);
+      fs.mkdirSync(path.join(staging, 'docs', '战斗'), { recursive: true });
+      fs.mkdirSync(path.join(staging, 'reviews', 'archive'), { recursive: true });
+      fs.writeFileSync(path.join(staging, 'docs', '战斗', '规则.md'), 'feishu_sync_kb 头与正文');
+      const draftBytes = `${JSON.stringify({ schemaVersion: 1, buildId, objects: [{ objectId: 'ko_f01' }] })}\n`;
+      fs.writeFileSync(path.join(staging, 'knowledge-draft.json'), draftBytes);
+      fs.writeFileSync(path.join(staging, 'organization-plan.json'), `${JSON.stringify({ schemaVersion: 1, buildId, migrations: [] })}\n`);
+      fs.writeFileSync(path.join(staging, 'read-receipts.jsonl'), `${JSON.stringify({ readReceiptId: 'rr_1' })}\n`);
+      fs.writeFileSync(path.join(staging, 'candidate.json'), `${JSON.stringify({ schemaVersion: 1, candidateHash: 'x' })}\n`);
+      fs.writeFileSync(path.join(staging, 'reviews', 'u1.json'), `${JSON.stringify({ reportId: 'kr_1', conclusion: 'pass' })}\n`);
+      fs.writeFileSync(path.join(staging, 'reviews', 'archive', 'u1.t_review_u1_r0.json'), `${JSON.stringify({ reportId: 'kr_0' })}\n`);
+      const progress = { batchIndex: 1, batchTotal: 2, stage: 'units', units: { total: 1, done: 0, running: 0, failed: 0, retried: 0 }, workers: [], images: { total: 0, described: 0, cached: 0, unavailable: 0 } };
+      const store = new BuildCheckpointStore(outputRoot);
+      store.save({
+        schemaVersion: 1, buildId, knowledgeBaseRoot: path.join(dir, 'raw'), baseReleaseId: null,
+        requestedMode: 'full', mode: 'full', backend: 'pi', rebuildSelected: false,
+        snapshot: [], workset: [], docMeta: [], writtenPaths: ['战斗/规则.md'], preservedDocs: [],
+        requiredRewrites: [], baseDocPaths: [], finishInfo: null, imageDescriptions: [],
+        units: [], unitDone: [], claims: [], singleBatches: [[]], singleCompleted: 1,
+        unitProgress: [], workerCount: 1, wordBudget: 0, progress, updatedAt: new Date().toISOString(),
+      }, staging);
+      const checkpoint = store.read(buildId)!;
+      for (const relative of ['knowledge-draft.json', 'organization-plan.json', 'read-receipts.jsonl', 'candidate.json', 'reviews/u1.json', 'reviews/archive/u1.t_review_u1_r0.json']) {
+        expect(checkpoint.files![relative], relative).toMatch(/^[a-f0-9]{64}$/);
+      }
+      // staging 整体丢失 → 恢复逐字节还原（含 reviews 子目录）
+      fs.rmSync(staging, { recursive: true, force: true });
+      store.restore(buildId, staging);
+      expect(fs.readFileSync(path.join(staging, 'knowledge-draft.json'), 'utf-8')).toBe(draftBytes);
+      expect(JSON.parse(fs.readFileSync(path.join(staging, 'reviews', 'archive', 'u1.t_review_u1_r0.json'), 'utf-8')).reportId).toBe('kr_0');
+      // 代内产物被篡改 → read 拒绝（缺失不得重建为空或降 v1）
+      const pointer = JSON.parse(fs.readFileSync(path.join(outputRoot, '.builds', buildId, 'checkpoints', 'CURRENT.json'), 'utf-8')) as { generation: string };
+      fs.writeFileSync(path.join(outputRoot, '.builds', buildId, 'checkpoints', pointer.generation, 'knowledge-draft.json'), '{}');
+      expect(() => store.read(buildId)).toThrow('构建检查点草稿校验失败');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

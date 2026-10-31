@@ -1,0 +1,131 @@
+{
+  "scope": {
+    "session": "/Users/run.mao/.pi/agent/sessions/--Users-run.mao-workpace-feishu-sync--/2026-10-29T18-03-21-701Z_01a188d4-ace4-7535-908f-abbf0c52c0e2.jsonl",
+    "cutoffExclusiveLine": 843,
+    "lastIncludedLine": 842,
+    "firstTimestamp": "2026-10-29T18:03:21.701Z",
+    "lastHistoricalTimestamp": "2026-10-30T13:15:18.643Z",
+    "rawEntryCount": 842,
+    "excludesReflect": true,
+    "scopePrefixSha256": "2fcfa7084b0afed7011db88eb14ce17ace8ad6d0ef659190275a3f49d3f1f14a",
+    "lastHistoricalMessageTimestamp": "2026-10-30T03:23:18.640Z"
+  },
+  "topLevelToolResults": {
+    "amagi_evolution": 2,
+    "amagi_resource": 3,
+    "bash": 67,
+    "codemode": 9,
+    "edit": 71,
+    "read": 99,
+    "run_bg": 29,
+    "task_control": 30,
+    "task_query": 17,
+    "task_resume": 17,
+    "task_submit": 17,
+    "write": 18
+  },
+  "topLevelTotal": 379,
+  "topLevelErrors": 15,
+  "nestedCalls": {
+    "read": 1,
+    "task_control": 19,
+    "task_query": 8,
+    "write": 1
+  },
+  "nestedStatus": {
+    "ok": 28,
+    "error": 1
+  },
+  "nestedTotal": 29,
+  "failureByTool": {
+    "task_submit": 3,
+    "bash": 4,
+    "edit": 4,
+    "task_resume": 2,
+    "read": 1,
+    "task_control": 1
+  },
+  "providerErrors": [
+    {
+      "line": 298,
+      "timestamp": "2026-10-29T18:48:14.603Z",
+      "error": "WebSocket closed 1000"
+    },
+    {
+      "line": 799,
+      "timestamp": "2026-10-30T03:16:49.067Z",
+      "error": "fetch failed"
+    },
+    {
+      "line": 801,
+      "timestamp": "2026-10-30T03:16:56.186Z",
+      "error": "fetch failed"
+    },
+    {
+      "line": 803,
+      "timestamp": "2026-10-30T03:17:05.291Z",
+      "error": "fetch failed"
+    },
+    {
+      "line": 805,
+      "timestamp": "2026-10-30T03:17:18.410Z",
+      "error": "fetch failed"
+    },
+    {
+      "line": 810,
+      "timestamp": "2026-10-30T03:20:22.728Z",
+      "error": "fetch failed"
+    },
+    {
+      "line": 815,
+      "timestamp": "2026-10-30T03:20:49.008Z",
+      "error": "fetch failed"
+    },
+    {
+      "line": 817,
+      "timestamp": "2026-10-30T03:20:51.206Z",
+      "error": "fetch failed"
+    },
+    {
+      "line": 819,
+      "timestamp": "2026-10-30T03:20:55.398Z",
+      "error": "fetch failed"
+    },
+    {
+      "line": 825,
+      "timestamp": "2026-10-30T03:22:10.605Z",
+      "error": "fetch failed"
+    },
+    {
+      "line": 832,
+      "timestamp": "2026-10-30T03:22:49.400Z",
+      "error": "fetch failed"
+    },
+    {
+      "line": 836,
+      "timestamp": "2026-10-30T03:23:04.633Z",
+      "error": "fetch failed"
+    },
+    {
+      "line": 838,
+      "timestamp": "2026-10-30T03:23:06.775Z",
+      "error": "fetch failed"
+    }
+  ],
+  "completionNotifications": 29,
+  "missingMarkerNotifications": 6,
+  "uniqueAutoCheckIdsObserved": 21,
+  "observedAcceptedResponseOccurrences": 18,
+  "pushCommandResults": [
+    {
+      "line": 835,
+      "callLine": 834,
+      "timestamp": "2026-10-30T03:23:04.484Z",
+      "name": "bash",
+      "isError": false,
+      "durationMs": 4169,
+      "code": null
+    }
+  ],
+  "sourceVersionNote": "Session header version=3 is Pi format, not amagi version. Collection-time package version must not be called historical runtime version."
+}

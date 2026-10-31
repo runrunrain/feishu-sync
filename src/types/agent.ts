@@ -108,6 +108,35 @@ export interface AgentConfig {
   workspaces: AgentWorkspaceConfig[];
 }
 
+/** B案 §8：思考档位受控枚举（同 AgentConfig.model.thinkingLevel；server AgentThinkingLevel）。 */
+export type AgentThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
+/** B案 §8 构建角色模型：引用 llm.providers[].models[].id 的预设（密钥不入构建记录）。
+ *  modelPresetId '' = 跟随活跃预设（llm.activeProviderId/activeModelId，构建期解析）；
+ *  providerId 仅在预设 id 跨 provider 重名时定位，缺省回落 activeProviderId。 */
+export interface KbBuildRoleConfig {
+  modelPresetId: string;
+  providerId?: string;
+  thinking?: AgentThinkingLevel;
+}
+
+export interface KbBuildRolesConfig {
+  writer: KbBuildRoleConfig;
+  reviewer: KbBuildRoleConfig;
+  /** 整合者缺省跟随撰写模型（B案 §3）；键缺省 = 跟随。 */
+  integrator?: KbBuildRoleConfig;
+  /** 规划者默认关闭（B案 §1/§3）。 */
+  plannerEnabled?: boolean;
+}
+
+/** B案 §5 审查闭环预算；缺省 2/2（服务端归一保证存在）。 */
+export interface KbReviewPolicyConfig {
+  /** 每个审查对象最多自动修订轮数，1..5，默认 2；同一审查对象换稿不重置预算。 */
+  maxAutoRevisions?: number;
+  /** 模型接口失败重试次数，0..5，默认 2；与内容修订分开计数。 */
+  maxInterfaceRetries?: number;
+}
+
 export interface StandardKbConfig {
   outputRoot: string;
   retainReleases: number;
@@ -119,6 +148,16 @@ export interface StandardKbConfig {
   /** P2-S2：每批有效字数预算（0 = 按源数分批旧行为；取值域 {0}∪[4000,400000]，
    *  默认 40000。buildBatchSize 降为每批源数上限）。 */
   buildBatchWordBudget: number;
+  /** B案 §6：构建名额 N（1..8，additive 可选）——全部文本构建角色（写/审/
+   *  修订/规划/整合/最终复核）合计；未设时回落 buildParallelism。缺省不落盘
+   *  （防默认值冻结回落语义），服务端 PUT 浅合并保留已写值。 */
+  buildConcurrency?: number;
+  /** B案 §3/§8：角色模型配置（additive 可选；PUT 对 buildRoles 整体替换）。 */
+  buildRoles?: KbBuildRolesConfig;
+  /** B案 §5：审查闭环预算（additive 可选；缺省 2/2）。 */
+  reviewPolicy?: KbReviewPolicyConfig;
+  /** B案 §7：发布方式（additive 可选；缺省 auto=通过后自动整版发布）。 */
+  publishMode?: 'auto' | 'confirm';
   autoBuildAfterSync: boolean;
 }
 
@@ -210,6 +249,8 @@ export type KbBuildStatus =
   | 'running'
   | 'validating'
   | 'publishing'
+  /** T2b（B 案 §7）：publishMode=confirm 时最终候选就绪后的待确认态 */
+  | 'awaiting_release'
   | 'published'
   | 'failed'
   | 'cancelled'
@@ -219,7 +260,7 @@ export type KbBuildStatus =
 // S4 §4.6：构建进度 DTO（多 worker / 单元 / 图片维度）
 // ---------------------------------------------------------------------------
 
-export type KbBuildStage = 'snapshot' | 'describing_images' | 'units' | 'finishing' | 'validating' | 'publishing';
+export type KbBuildStage = 'snapshot' | 'describing_images' | 'units' | 'reviewing' | 'finishing' | 'validating' | 'publishing';
 
 export interface KbBuildUnitsProgress {
   total: number;
@@ -302,6 +343,63 @@ export interface KbBuildIssue {
 /** §9.2 GET /api/kb/builds/:id 的 report 扩展 */
 export interface KbBuildReportDto {
   issues: KbBuildIssue[];
+}
+
+// ---------------------------------------------------------------------------
+// T2b（B 案 §4/§5/附录 B）编排流水进度 —— server KbBuildOrchestrationDto 镜像
+// ---------------------------------------------------------------------------
+
+/** 编排任务三轴状态（role 为 server BuildRole 字符串：plan/write/review/integrate/final_review）。 */
+export interface KbBuildOrchestrationTaskDto {
+  taskId: string;
+  role: string;
+  unitId: string | null;
+  /** 任务规格修订（B 案附录 A TaskSpec.revision） */
+  revision: number;
+  /** 审查/修订轮次（write/integrate 的 r<n>；接口重试为 #<n> 后缀任务） */
+  round: number;
+  attempt: number;
+  execState: string;
+  artifactState: string;
+  acceptanceState: string;
+  /** 依赖未满足时的等待原因（taskId + 未满足条件） */
+  waitingOn: string[];
+  /** 该任务使用的角色模型（来自冻结 BuildSpec；''=跟随活跃预设） */
+  model: { modelPresetId: string; providerId?: string; thinking?: string };
+  /** 逻辑审查对象剩余自动修订预算（仅 write/integrate 任务；null=不适用） */
+  revisionBudget: { usedAutoRevisions: number; maxAutoRevisions: number } | null;
+  /** 该单元/整合范围最新审查报告的未关闭阻断问题数（无报告为 0） */
+  blockingIssues: number;
+}
+
+export interface KbBuildOrchestrationReviewSummary {
+  /** 已完成写入（产物可用）的单元数 */
+  unitsWritten: number;
+  /** 内容验收通过（含整合）的单元数 */
+  unitsReviewed: number;
+  /** 待修订/待裁定（needs_revision + pending_decision）单元数 */
+  unitsPendingRevision: number;
+  /** 整合/最终复核就绪标记与沿用文档数（B 案 §4 沿用披露） */
+  integration: { integratePassed: boolean; finalReviewDone: boolean; carriedOverDocs: number };
+}
+
+export interface KbBuildOrchestrationDto {
+  buildId: string;
+  spec: {
+    specHash: string | null;
+    publishMode: 'auto' | 'confirm';
+    concurrency: number;
+    maxAutoRevisions: number;
+    maxInterfaceRetries: number;
+  };
+  ended: boolean;
+  endReason: string | null;
+  tasks: KbBuildOrchestrationTaskDto[];
+  reviewSummary: KbBuildOrchestrationReviewSummary;
+  lateReceiptCount: number;
+  /** 接口失败重试总次数（与内容修订分开计数，B 案 §5） */
+  interfaceRetryTotal: number;
+  autoRevisionUsage: Record<string, number>;
 }
 
 /** §9.5 GET /api/kb/mcp */

@@ -68,7 +68,7 @@ import { ApprovalService } from './agent/approvals/approval-service.js';
 import { createOpsToolFamily } from './agent/tools/app-command-family.js';
 import { KbBuildService } from './kb/kb-build-service.js';
 import { projectKnowledgeDocuments, recoveredSourceCsvPaths } from './kb/local-source-projection.js';
-import { piExtensionPath, readAgentPromptAssets } from './agent/agent-assets.js';
+import { piExtensionPath, readAgentPromptAssets, readAgentPromptFile } from './agent/agent-assets.js';
 import { RuntimeInstaller } from './agent/runtime-installer.js';
 import { checkRootOverlap, type WorkspaceRootGuards } from './agent/path-guard.js';
 import { collectResolvedRuntimeProtectedRoots, collectStaticProtectedRoots } from './agent/protected-roots.js';
@@ -357,6 +357,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
     extensionPath: piExtensionPath,
     pluginStore: appPluginStore,
     promptAssets: readAgentPromptAssets,
+    reviewPrompt: () => readAgentPromptFile('standard-kb-review.md'),
     visionDescriber,
   });
   // 启动对账：非终态构建置 interrupted；CURRENT 指针为准补 DB

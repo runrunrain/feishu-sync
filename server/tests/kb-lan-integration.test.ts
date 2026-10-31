@@ -84,7 +84,7 @@ it('desktop manages the real gateway, three readers agree, notices are per sessi
   const stdio = new Client({ name: 'stdio-comparison', version: '2' });
   await stdio.connect(new StdioClientTransport({ command: process.execPath, args: [stdioScript, '--kb-root', kb, '--raw-catalog', path.join(root, 'mcp/raw-catalog.json')], env: { ...process.env, FEISHU_SYNC_HOME: root } as Record<string, string> }));
   expect((await stdio.listTools()).tools).toEqual((await a.client.listTools()).tools);
-  expect((await stdio.listTools()).tools).toHaveLength(17);
+  expect((await stdio.listTools()).tools).toHaveLength(19);
   closers.push(() => stdio.close());
   const args = { query: '暴击 伤害', limit: 10 };
   const httpSearch = JSON.parse(text(await a.client.callTool({ name: 'search_knowledge', arguments: args })));
@@ -136,7 +136,7 @@ it.skipIf(process.platform !== 'darwin' || !fs.existsSync(electron))('Node20/Ele
   let output = ''; child.stdout!.on('data', (chunk: Buffer) => { output += chunk.toString(); }); child.stderr!.resume();
   await vi.waitFor(() => expect(output).toContain('"type":"ready"'), { timeout: 5000, interval: 25 });
   const { client } = await connect(`http://127.0.0.1:${port}/mcp`, token);
-  expect((await client.listTools()).tools).toHaveLength(7);
+  expect((await client.listTools()).tools).toHaveLength(9);
   const result = JSON.parse(text(await client.callTool({ name: 'search_knowledge', arguments: { query: '暴击 伤害' } })));
   expect(result.releaseId).toBe('r20'); expect(result.results[0].docId).toBe('damage');
   const code = fs.readFileSync(gatewayScript, 'utf8'); expect(code).not.toMatch(/better-sqlite3|\.node["'`]/);

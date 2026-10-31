@@ -60,6 +60,7 @@ import type {
   AgentVisionTestResult,
   AgentWorkspaceConfig,
   KbBuildDto,
+  KbBuildOrchestrationDto,
   KbBuildReportDto,
   KbDocDto,
   KbMcpInfoDto,
@@ -1198,6 +1199,27 @@ export interface KbBuildLogEvent {
 
 export function getKbBuildLogs(id: string): Promise<{ events: KbBuildLogEvent[] }> {
   return request(`/api/kb/builds/${encodeURIComponent(id)}/logs`);
+}
+
+/** GET /api/kb/builds/:id/orchestration —— T2b 编排流水进度（同一份 BuildOrchestration
+ * 数据源派生；无编排数据/构建不存在时 404，前端降级为旧式构建展示）。 */
+export async function getKbBuildOrchestration(id: string): Promise<KbBuildOrchestrationDto> {
+  return request<KbBuildOrchestrationDto>(
+    `/api/kb/builds/${encodeURIComponent(id)}/orchestration`,
+  );
+}
+
+/** POST /api/kb/builds/:id/release-confirm —— confirm 模式确认发布（awaiting_release
+ * 时可用）。服务端重新校验候选哈希：staging 内容变化时 409 kb_confirm_stale。
+ * candidateHash 缺省由服务端按 candidate.json 复核（B 案 §7 确认绑定）。 */
+export async function confirmKbRelease(
+  id: string,
+  options: { candidateHash?: string; actor?: string } = {},
+): Promise<KbBuildDto> {
+  return request<KbBuildDto>(`/api/kb/builds/${encodeURIComponent(id)}/release-confirm`, {
+    method: 'POST',
+    body: JSON.stringify(options),
+  });
 }
 
 /** GET /api/kb/mcp —— 外部 MCP 连接信息（§9.5，供设置页复制）。 */

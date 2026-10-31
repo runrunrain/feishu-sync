@@ -28,6 +28,7 @@ import {
 } from 'lucide-react';
 import { Button } from '../common/Button';
 import { getKbBuild } from '../../api/client';
+import { BuildOrchestrationProgress } from '../knowledge/BuildOrchestrationProgress';
 import {
   KB_BUILD_ACTIVE_STEPS,
   KB_BUILD_STAGE_LABEL,
@@ -62,6 +63,8 @@ interface KbBuildPanelProps {
   onRestart?: () => void;
   resuming?: boolean;
   layout?: 'bottom' | 'sidebar';
+  /** T5b：透传给编排进度区——release-confirm 成功后父层同步构建 DTO。 */
+  onBuildUpdated?: (dto: KbBuildDto) => void;
 }
 
 const STEP_LABEL: Record<string, string> = {
@@ -89,6 +92,7 @@ export function KbBuildPanel({
   onRestart,
   resuming = false,
   layout = 'bottom',
+  onBuildUpdated,
 }: KbBuildPanelProps) {
   const logEndRef = useRef<HTMLDivElement>(null);
 
@@ -237,6 +241,9 @@ export function KbBuildPanel({
           ) : null}
         </div>
       ) : null}
+
+      {/* T5b：编排流水进度（审查/整合/最终复核任务视图 + awaiting_release 确认）。旧式构建降级说明行。 */}
+      <BuildOrchestrationProgress build={view} onBuildUpdated={onBuildUpdated} />
 
       {/* S4/S5 并行进度：单元计数 + worker 列表 + 图片维度（有数据才渲染） */}
       {showParallelStrip ? (

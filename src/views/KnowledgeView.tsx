@@ -497,7 +497,8 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
           </div> : <p className="p-4 text-xs text-ink-faint">选择文档后查看来源与文档信息。</p>
           : sidebar === 'progress' ? build ? <KbBuildPanel open build={build} issues={buildIssues} logs={buildLogs}
             onCollapse={() => setSidebar(null)} onCancel={cancelBuild} cancelling={cancelling} layout="sidebar"
-            onResume={() => setResumeConfirm(true)} onRestart={() => openBuild('sources')} resuming={resuming} />
+            onResume={() => setResumeConfirm(true)} onRestart={() => openBuild('sources')} resuming={resuming}
+            onBuildUpdated={setBuild} />
             : <p className="p-4 text-xs text-ink-faint">尚无构建记录。可在构建侧栏选择文档并发起构建。</p>
           : sidebar === 'publish' ? <KbPublishPanel
             publications={publications}

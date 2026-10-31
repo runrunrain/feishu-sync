@@ -25,6 +25,8 @@ import { AgentToolService, ToolError } from '../src/agent/agent-tool-service.js'
 import { AgentProcessPool } from '../src/agent/agent-process-pool.js';
 import { LocalMapStore } from '../src/modules/local-map-store.js';
 import { StandardKbStore } from '../src/kb/standard-kb-store.js';
+import { BuildCheckpointStore } from '../src/kb/build-checkpoint.js';
+import { BuildOrchestration } from '../src/kb/build-orchestration.js';
 import { RawSourceSnapshot } from '../src/kb/raw-source-snapshot.js';
 import Database from 'better-sqlite3';
 import type { PiRpcProcess } from '../src/agent/pi-rpc-process.js';
@@ -112,6 +114,21 @@ class FakeRpcProcess extends EventEmitter {
       return await new Promise((resolve) => {
         this.pending.push(resolve as (value: unknown) => void);
       });
+    }
+    // diting F04：任一角色显式配置或 publishMode=confirm 都启用编排流水
+    // ——writer 显式配置的旧用例也会走写→审→整合→复核，fake 需提交 pass 报告
+    if (message.includes('【单元审查') || message.includes('【最终复核】')) {
+      const unitId = message.includes('【最终复核】') ? 'all' : (/【单元审查 (u\d+)】/.exec(message)?.[1] ?? 'all');
+      const sourceRefs = [...message.matchAll(/^- (tok\S+)（/gm)].map((match) => match[1]);
+      await this.call('kb_submit_review', {
+        ...(unitId === 'all' ? {} : { unitId }),
+        coverage: { sourceRefs: sourceRefs.length > 0 ? sourceRefs.slice(0, 5) : ['tok-any'] },
+        checkedDimensions: ['事实与数值'],
+        issues: [],
+        uncheckedScope: [],
+        conclusion: 'pass',
+      });
+      return { outcome: 'completed' };
     }
     if ((message.includes('【单元') || message.includes('【批次')) && message.includes('请处理以下')) {
       return await this.actBatchPrompt(message);
@@ -500,54 +517,96 @@ describe('S4：buildParallelism=1 等价回退（全量端到端发布）', () =
     expect(fake.prompts.some((p) => p.includes('kb_finish'))).toBe(true);
   });
 
-  it('T3b-06：M=3 + 两后台占满 M-1 → 单 worker 构建排队而非立即抢槽；交互保留槽可用；释放后继续', async () => {
+  it('T2a：构建冻结 BuildSpec 并落 roles/orchestration 摘要列；检查点携带 orchestration', async () => {
+    writeRaw('编排域/x.md', `x ${FAT}`);
+    writeRaw('编排域/y.md', `y ${FAT}`);
+    documents.push(docRecord('tokOrchA', '编排域/x.md'), docRecord('tokOrchB', '编排域/y.md'));
+    const config = makeConfig({ buildParallelism: 1 });
+    // B 案 §8：角色/预算/发布方式冻结进 BuildSpec（密钥不入记录）
+    config.standardKb.buildRoles = {
+      writer: { modelPresetId: 'glm-4.7', thinking: 'high' },
+      // T2b：审查者显式配置会启用写审修订编排流水（reviewPipelineActive）；
+      // 本例只验规格冻结，审查者留空保持旧路径
+      reviewer: { modelPresetId: '' },
+      plannerEnabled: false,
+    };
+    config.standardKb.buildConcurrency = 3;
+    config.standardKb.reviewPolicy = { maxAutoRevisions: 2, maxInterfaceRetries: 1 };
+    config.standardKb.publishMode = 'auto';
+    // diting F04：writer 显式配置 → 编排流水启用；角色预设需可在 llm 注册表解析
+    config.llm.providers = [{
+      id: 'pf1', name: 'PF', enabled: true, apiKey: 'sk-fixture',
+      openAiCompatBaseUrl: 'https://pf.example/v1', protocol: 'openai-completions',
+      models: [{ id: 'glm-4.7', name: 'GLM', openAiModel: 'fake-glm', enabled: true }],
+    }];
+    const harness = makeHarness(config);
+    const dto = await harness.service.createBuild(store as never, { mode: 'full', confirm: 'BUILD' });
+    const row = await waitForTerminal(dto.id);
+    expect(String(row.status)).toBe('published');
+    // 摘要列：角色模型快照 + 任务计数摘要
+    expect(row.roles_json).toBeTruthy();
+    const roles = JSON.parse(String(row.roles_json));
+    expect(roles.writer).toEqual({ modelPresetId: 'glm-4.7', thinking: 'high' });
+    expect(row.orchestration_json).toBeTruthy();
+    const summary = JSON.parse(String(row.orchestration_json));
+    expect(summary.taskTotal).toBeGreaterThanOrEqual(1);
+    expect(summary.ended).toBe(true);
+    expect(summary.tasksByExecState.done).toBeGreaterThanOrEqual(1);
+    // 检查点携带 orchestration：specHash 冻结可恢复
+    const checkpoint = new BuildCheckpointStore(outputRoot).read(dto.id);
+    expect(checkpoint?.orchestration).toBeDefined();
+    const restored = BuildOrchestration.restore(checkpoint!.orchestration!);
+    expect(restored.spec.concurrency).toBe(3);
+    expect(restored.spec.maxInterfaceRetries).toBe(1);
+    expect(restored.spec.roles.writer.modelPresetId).toBe('glm-4.7');
+  });
+
+  it('T2a（B 案 §6/R3）：M=3 + 两后台占满 M-1 → 单 worker 构建走独立 build 通道立即获槽；交互保留槽仍可用', async () => {
     const harness = makeHarness(makeConfig({ buildParallelism: 1 }));
     // 两个后台任务占满 M-1 配额（M=3），总槽尚余 1
     const bg1 = await harness.pool.acquire('background');
     const bg2 = await harness.pool.acquire('background');
     expect(bg1 && bg2).toBeTruthy();
 
-    // 交互会话保留槽仍可用（未被单 worker 回退抢占）
+    // 交互会话保留槽仍可用（未被后台或构建抢占）
     const sessionSlot = harness.pool.reserveSlot('session');
     expect(sessionSlot).not.toBeNull();
     sessionSlot!.release();
 
     const dto = await harness.service.createBuild(store as never, { mode: 'full', confirm: 'BUILD' });
-    await new Promise((resolve) => setTimeout(resolve, 400));
-    // 排队而非立即抢最后一个总槽：未 spawn、队列深度 1、非终态
-    expect(harness.fakes).toHaveLength(0);
-    expect(harness.pool.queueDepth()).toBe(1);
-    const mid = store.getKbBuild(dto.id);
-    expect(['queued', 'preflight', 'running']).toContain(String(mid?.status));
-
-    // 释放一个后台槽 → 排队构建获得槽位并完成发布
-    bg1.release();
+    // 构建走 build 通道（容量 N 独立，不受 M-1 截断）：不排队、正常 spawn
+    const deadline = Date.now() + 5000;
+    while (harness.fakes.length === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(harness.fakes.length).toBeGreaterThanOrEqual(1);
+    expect(harness.pool.buildQueueDepth()).toBe(0);
     const row = await waitForTerminal(dto.id);
     expect(String(row.status)).toBe('published');
-    expect(harness.fakes.length).toBeGreaterThanOrEqual(1);
+    bg1.release();
     bg2.release();
   });
 
-  it('T3b-06：排队中取消 → 出队失败（cancelled），不 spawn，无残留', async () => {
+  it('T2a（B 案 §6）：build 通道满额（N=1 被占）→ 单 worker 构建排队；取消 → 出队失败（cancelled），不 spawn，无残留', async () => {
     const harness = makeHarness(makeConfig({ buildParallelism: 1 }));
-    const bg1 = await harness.pool.acquire('background');
-    const bg2 = await harness.pool.acquire('background');
+    // 占满构建容量 N=1（后台占用不影响 build 通道，故单独占）
+    const buildSlot = await harness.pool.acquire('build');
+    expect(buildSlot).toBeTruthy();
     const dto = await harness.service.createBuild(store as never, { mode: 'full', confirm: 'BUILD' });
-    // 等待进入排队（preflight 同步完成后 acquire 入队）
+    // 等待进入构建通道排队（preflight 同步完成后 acquire 入队）
     const deadline = Date.now() + 5000;
-    while (harness.pool.queueDepth() === 0 && Date.now() < deadline) {
+    while (harness.pool.buildQueueDepth() === 0 && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
-    expect(harness.pool.queueDepth()).toBe(1);
+    expect(harness.pool.buildQueueDepth()).toBe(1);
     expect(harness.fakes).toHaveLength(0);
 
     await harness.service.cancelBuild(store as never, dto.id);
     const row = await waitForTerminal(dto.id);
     expect(String(row.status)).toBe('cancelled');
     expect(harness.fakes).toHaveLength(0);
-    expect(harness.pool.queueDepth()).toBe(0);
-    bg1.release();
-    bg2.release();
+    expect(harness.pool.buildQueueDepth()).toBe(0);
+    buildSlot.release();
   });
 });
 

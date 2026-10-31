@@ -6,6 +6,7 @@ import { atomicWriteFile, resolveInside } from '../agent/path-guard.js';
 import type { BuildRunState } from '../agent/agent-tool-service.js';
 import type { ImageDescription } from '../agent/vision/vision-describer.js';
 import type { KbBuildProgressDto, RawSourceSnapshotEntry } from '../types/agent-knowledge.js';
+import type { BuildOrchestrationSnapshot } from './build-orchestration.js';
 import type { BuildUnit } from './build-units.js';
 import type { PathClaimPreload } from './path-claims.js';
 
@@ -39,6 +40,9 @@ export interface BuildCheckpoint {
   progress: KbBuildProgressDto;
   updatedAt: string;
   files?: Record<string, string>;
+  /** T2a（B 案 §8）：多模型编排骨架快照（BuildSpec + 任务集合）。
+   * additive 可选：旧检查点无此字段按旧规则恢复，不升级成新式任务。 */
+  orchestration?: BuildOrchestrationSnapshot;
 }
 
 export interface CheckpointSummary {
@@ -56,6 +60,16 @@ const validId = (id: string) => /^[A-Za-z0-9_-]{1,120}$/.test(id);
 const validGeneration = (id: string) => /^cp_[a-f0-9]{20}$/.test(id);
 const digest = (file: string) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 
+/** 检查点允许的库外声明产物相对路径（diting F01：save/restore 同集）。 */
+const KNOWLEDGE_ARTIFACTS = ['knowledge-draft.json', 'organization-plan.json', 'read-receipts.jsonl', 'candidate.json'] as const;
+
+function validCheckpointRelativePath(relative: string): boolean {
+  if (relative === '.docid-map.json' || (KNOWLEDGE_ARTIFACTS as readonly string[]).includes(relative)) return true;
+  if (relative.startsWith('docs/') && relative.endsWith('.md')) return true;
+  // reviews/ 当前报告与归档（archive）均为 .json
+  return /^reviews\/[A-Za-z0-9_.-]+\.json$/.test(relative) || /^reviews\/archive\/[A-Za-z0-9_.-]+\.json$/.test(relative);
+}
+
 function documentFiles(root: string): string[] {
   const files: string[] = [];
   const walk = (dir: string, prefix: string) => {
@@ -70,6 +84,33 @@ function documentFiles(root: string): string[] {
     }
   };
   walk(root, ''); return files.sort();
+}
+
+/** diting F01：staging 根的知识组织/审查产物清单（库外声明真相）。
+ * reviews/ 递归收集 .json（含 archive）；符号链接拒绝；总量守门。 */
+function knowledgeArtifactFiles(stagingRoot: string): string[] {
+  const files: string[] = [];
+  for (const name of KNOWLEDGE_ARTIFACTS) {
+    const full = path.join(stagingRoot, name);
+    if (!fs.existsSync(full)) continue;
+    const stat = fs.lstatSync(full);
+    if (!stat.isFile()) throw new Error(`知识产物必须是普通文件: ${name}`);
+    files.push(name);
+  }
+  const reviewsDir = path.join(stagingRoot, 'reviews');
+  const walk = (dir: string, prefix: string) => {
+    if (!fs.existsSync(dir)) return;
+    for (const name of fs.readdirSync(dir).sort()) {
+      const full = path.join(dir, name); const stat = fs.lstatSync(full);
+      if (stat.isSymbolicLink()) throw new Error('检查点不允许符号链接');
+      if (stat.isDirectory()) walk(full, `${prefix}${name}/`);
+      else if (stat.isFile() && stat.nlink === 1 && name.endsWith('.json')) files.push(`${prefix}${name}`);
+      else throw new Error('检查点 reviews/ 只允许普通 JSON 文件');
+      if (files.length > 20000) throw new Error('知识产物数量超过检查点上限');
+    }
+  };
+  walk(reviewsDir, 'reviews/');
+  return files.sort();
 }
 
 export class BuildCheckpointStore {
@@ -110,6 +151,16 @@ export class BuildCheckpointStore {
       const destination = resolveInside(target, '.docid-map.json', 'write');
       fs.copyFileSync(source, destination); files['.docid-map.json'] = digest(destination);
     }
+    // diting F01：知识组织与审查产物（声明真相、读取回执、审查报告、
+    // 待确认候选）与草稿同一代原子入点，纳入哈希清单——恢复后不得重建
+    // 为空或静默降 v1。
+    for (const relative of knowledgeArtifactFiles(stagingRoot)) {
+      const source = resolveInside(stagingRoot, relative, 'read');
+      const parent = path.posix.dirname(relative);
+      if (parent !== '.') resolveInside(target, parent, 'mkdir');
+      const destination = resolveInside(target, relative, 'write');
+      fs.copyFileSync(source, destination); files[relative] = digest(destination);
+    }
     atomicWriteFile(path.join(target, 'state.json'), JSON.stringify({ ...checkpoint, files }));
     const summary: CheckpointSummary = {
       checkpointAt: checkpoint.updatedAt, draftCount: Object.keys(files).filter((file) => file.startsWith('docs/')).length,
@@ -133,7 +184,7 @@ export class BuildCheckpointStore {
     if (checkpoint.schemaVersion !== 1 || checkpoint.buildId !== buildId || !Array.isArray(checkpoint.snapshot) || !Array.isArray(checkpoint.docMeta)
       || !Array.isArray(checkpoint.singleBatches) || !Array.isArray(checkpoint.units) || !checkpoint.files) throw new Error('构建检查点无效');
     for (const [relative, hash] of Object.entries(checkpoint.files)) {
-      if (!(relative === '.docid-map.json' || (relative.startsWith('docs/') && relative.endsWith('.md')))) throw new Error('检查点文件路径无效');
+      if (!validCheckpointRelativePath(relative)) throw new Error('检查点文件路径无效');
       if (digest(resolveInside(dir, relative, 'read')) !== hash) throw new Error('构建检查点草稿校验失败');
     }
     return checkpoint;

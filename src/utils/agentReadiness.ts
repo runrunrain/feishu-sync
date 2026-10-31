@@ -103,6 +103,8 @@ export const KB_BUILD_STATUS_LABEL: Record<string, string> = {
   running: '生成中',
   validating: '校验中',
   publishing: '发布中',
+  /** T2b：publishMode=confirm 候选就绪、等待人工确认（非终态） */
+  awaiting_release: '待确认发布',
   published: '已发布',
   failed: '失败',
   cancelled: '已取消',
@@ -123,6 +125,8 @@ export const KB_BUILD_STAGE_LABEL: Record<string, string> = {
   snapshot: '源快照',
   describing_images: '图片理解',
   units: '单元生成',
+  /** T2b：编排流水审查阶段（单元审查/整合/最终复核期间的细粒度 stage） */
+  reviewing: '审查中',
   finishing: '收尾合并',
   validating: '校验',
   publishing: '发布',

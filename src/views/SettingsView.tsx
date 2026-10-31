@@ -35,6 +35,7 @@ import {
   Terminal,
   Trash2,
   Save,
+  Workflow,
 } from 'lucide-react';
 import { SettingsDraftProvider, useSettingsDraft } from '../hooks/settingsDraft';
 import { Button } from '../components/common/Button';
@@ -50,6 +51,7 @@ import { AuthSettingsCard } from '../components/AuthSettingsCard';
 import { AppUpdateCard } from '../components/AppUpdateCard';
 import { AgentPluginsCard } from '../components/agent/AgentPluginsCard';
 import { AgentRuntimeSettingsCard, AgentKbSettingsCard } from '../components/agent/AgentSettingsCard';
+import { BuildOrchestrationSettings } from '../components/settings/BuildOrchestrationSettings';
 import { CliAccessSettingsCard } from '../components/CliAccessSettingsCard';
 import { KbLanMcpSettingsCard } from '../components/KbLanMcpSettingsCard';
 import { KbMcpLocalSettingsCard } from '../components/KbMcpLocalSettingsCard';
@@ -177,6 +179,13 @@ const SETTINGS_TABS: SettingsTabMeta[] = [
         description: '输出目录、构建参数与 Work 授权目录',
         icon: Server,
         render: () => <AgentKbSettingsCard />,
+      },
+      {
+        id: 'agent-kb-orchestration',
+        label: '构建编排',
+        description: '角色模型、构建并发、审查策略与发布方式',
+        icon: Workflow,
+        render: () => <BuildOrchestrationSettings />,
       },
       {
         id: 'agent-kb-lan',
