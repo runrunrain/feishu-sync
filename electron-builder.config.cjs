@@ -50,8 +50,27 @@ if (!["adhoc", "release"].includes(macSigningMode)) {
   throw new Error(`Unsupported DESKTOP_MAC_SIGNING: ${macSigningMode}. Expected "adhoc" or "release".`);
 }
 
+// 本机 node_modules/electron 与目标平台/架构一致时直接复用其 dist，打包不再联网下载
+// Electron 发行包（代理环境下 electron-builder 的下载会 ECONNRESET）。跨平台/跨架构
+// 打包（如在 mac 上打 win32）不命中此分支，仍走 electron-builder 默认下载。
+function resolveLocalElectronDist() {
+  if (targetPlatform !== process.platform || targetArch !== process.arch) return undefined;
+  try {
+    const electronRoot = path.dirname(require.resolve("electron/package.json"));
+    const dist = path.join(electronRoot, "dist");
+    const installed = require("electron/package.json").version;
+    const fs = require("node:fs");
+    const built = fs.readFileSync(path.join(dist, "version"), "utf8").trim();
+    return built === installed ? dist : undefined;
+  } catch {
+    return undefined;
+  }
+}
+const localElectronDist = resolveLocalElectronDist();
+
 module.exports = {
   appId: "com.yourcompany.feishu-sync",
+  ...(localElectronDist ? { electronDist: localElectronDist } : {}),
   productName: "Feishu Sync",
   forceCodeSigning: isMacRelease,
   directories: {

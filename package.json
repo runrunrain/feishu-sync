@@ -38,7 +38,7 @@
   "devDependencies": {
     "@electron/rebuild": "^4.0.4",
     "@eslint/js": "^9.0.0",
-    "@hono/node-server": "^1.14.0",
+    "@hono/node-server": "^1.19.17",
     "@tailwindcss/vite": "^4.1.12",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.15.0",
@@ -68,5 +68,16 @@
     "typescript-eslint": "^8.0.0",
     "vite": "^6.3.5",
     "vitest": "^2.1.9"
+  },
+  "allowScripts": {
+    "better-sqlite3": true,
+    "electron": true,
+    "electron-winstaller": true,
+    "esbuild": true,
+    "fsevents": true
+  },
+  "description": "飞书知识库定时检测与本地同步桌面应用，并构建标准知识库",
+  "dependencies": {
+    "hono": "^4.13.14"
   }
 }
