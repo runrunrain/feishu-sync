@@ -709,6 +709,23 @@ feishu_sync:
     return target;
   }
 
+  it('restores only a valid exported cloud version from an imported file', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'index-scan-import-'));
+    temporaryRoots.push(root);
+    const { store } = createStore();
+    const valid = writeMappedMd(root, 'valid.md', 'VALID', 'VALID_WIKI');
+    const invalid = writeMappedMd(root, 'invalid.md', 'INVALID', 'INVALID_WIKI');
+    fs.writeFileSync(valid, fs.readFileSync(valid, 'utf8').replace('  obj_type: docx',
+      '  obj_type: docx\n  last_synced_modify_time: 2026-10-08T09:38:06.000Z'));
+    fs.writeFileSync(invalid, fs.readFileSync(invalid, 'utf8').replace('  obj_type: docx',
+      '  obj_type: docx\n  last_synced_modify_time: 1970-01-21T14:52:09.205Z'));
+    const indexScanner = new IndexScanner({ localMapStore: store, larkCliClient: {}, config: { knowledgeBaseRoot: root } });
+    await indexScanner.scanKnowledgeBase(root);
+    expect(store.getDocumentByObjToken('VALID')).toMatchObject({ syncState: 'synced', syncedObjEditTime: 1791452286 });
+    expect(store.getDocumentByObjToken('INVALID')).toMatchObject({ syncState: 'pending_added', syncedObjEditTime: null });
+    store.close();
+  });
+
   it('adopts unregistered _custom subdirectories, binds rows, and stays idempotent on re-scan', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'index-scan-custom-'));
     temporaryRoots.push(root);

@@ -135,13 +135,14 @@ it('任务流水按角色分组渲染：三轴徽标、等待原因、修订轮�
   await act(async () => { root = createRoot(host); root.render(<BuildOrchestrationProgress build={makeBuild()} />); });
 
   expect(api.getKbBuildOrchestration).toHaveBeenCalledWith('kb-b1');
-  // 分组：撰写/审查/整合/最终复核存在；规划（无任务）不渲染。
+  // 所有角色均可见；尚未创建任务的角色如实标记。
   expect(host.querySelector('[data-role-group="write"]')).not.toBeNull();
   expect(host.querySelector('[data-role-group="review"]')).not.toBeNull();
   expect(host.querySelector('[data-role-group="integrate"]')).not.toBeNull();
   expect(host.querySelector('[data-role-group="final_review"]')).not.toBeNull();
-  expect(host.querySelector('[data-role-group="plan"]')).toBeNull();
-  expect(host.querySelectorAll('[data-task-id]')).toHaveLength(5);
+  expect(host.querySelector('[data-role-group="plan"]')?.textContent).toContain('未创建任务');
+  expect(host.querySelector('[data-selected-role="write"]')).not.toBeNull();
+  expect(host.querySelectorAll('[data-task-id]')).toHaveLength(2);
 
   // 三轴徽标（分色 data 属性 + 中文文案）。
   const running = host.querySelector('[data-task-id="t:write:u1:r0"]');
@@ -149,6 +150,7 @@ it('任务流水按角色分组渲染：三轴徽标、等待原因、修订轮�
   expect(running?.textContent).toContain('执行中');
   expect(running?.textContent).toContain('待生成');
   expect(running?.textContent).toContain('待审');
+  await act(async () => { (host.querySelector('[data-role-group="review"]') as HTMLButtonElement).click(); });
   const reviewed = host.querySelector('[data-task-id="t:review:u1:r0"]');
   expect(reviewed?.getAttribute('data-acceptance')).toBe('passed');
   expect(reviewed?.textContent).toContain('完成');
@@ -156,19 +158,24 @@ it('任务流水按角色分组渲染：三轴徽标、等待原因、修订轮�
   expect(reviewed?.textContent).toContain('通过');
 
   // 等待原因三分类：依赖未满足 / 名额等待 / 等待人工。
+  await act(async () => { (host.querySelector('[data-role-group="write"]') as HTMLButtonElement).click(); });
   expect(host.querySelector('[data-task-id="t:write:u2:r1"]')?.textContent).toContain('依赖未满足（1）');
   expect(host.querySelector('[data-task-id="t:write:u2:r1"]')?.getAttribute('data-waiting')).toBe('dependency');
+  await act(async () => { (host.querySelector('[data-role-group="integrate"]') as HTMLButtonElement).click(); });
   expect(host.querySelector('[data-task-id="t:integrate:r0#1"]')?.textContent).toContain('等待构建名额');
   expect(host.querySelector('[data-task-id="t:integrate:r0#1"]')?.getAttribute('data-waiting')).toBe('capacity');
+  await act(async () => { (host.querySelector('[data-role-group="final_review"]') as HTMLButtonElement).click(); });
   expect(host.querySelector('[data-task-id="t:final:all"]')?.textContent).toContain('等待人工裁定');
   expect(host.querySelector('[data-task-id="t:final:all"]')?.getAttribute('data-waiting')).toBe('human');
 
   // 修订轮次/预算/阻断计数。
+  await act(async () => { (host.querySelector('[data-role-group="write"]') as HTMLButtonElement).click(); });
   expect(host.querySelector('[data-task-id="t:write:u2:r1"]')?.textContent).toContain('修订 r1');
   expect(host.querySelector('[data-task-id="t:write:u2:r1"]')?.textContent).toContain('修订 1/2');
   expect(host.querySelector('[data-task-id="t:write:u2:r1"]')?.textContent).toContain('阻断 2');
 
   // 整合/最终复核无单元标识的展示。
+  await act(async () => { (host.querySelector('[data-role-group="integrate"]') as HTMLButtonElement).click(); });
   expect(host.querySelector('[data-task-id="t:integrate:r0#1"]')?.textContent).toContain('全部单元');
 
   // 分组头部模型：审查=跟随活跃预设；撰写带思考档位。
@@ -190,6 +197,27 @@ it('reviewSummary 四计数卡片与整合/最终复核标记', async () => {
   expect(summary?.textContent).toContain('2 篇');
   expect(summary?.textContent).toContain('整合通过');
   expect(summary?.textContent).toContain('最终复核完成');
+});
+
+it('角色总览按单元最新修订统计，保留旧轮次供明细追溯', async () => {
+  api.getKbBuildOrchestration.mockResolvedValue(makeOrch({ tasks: [
+    makeTask({ taskId: 'u1:r0', unitId: 'u1', round: 0, execState: 'failed' }),
+    makeTask({ taskId: 'u1:r1', unitId: 'u1', round: 1, execState: 'done', artifactState: 'available', acceptanceState: 'passed' }),
+  ] }));
+  await act(async () => { root = createRoot(host); root.render(<BuildOrchestrationProgress build={makeBuild()} />); });
+  expect(host.querySelector('[data-role-group="write"]')?.textContent).toContain('已完成');
+  expect(host.querySelector('[data-role-group="write"]')?.textContent).toContain('1/1');
+  expect(host.querySelectorAll('[data-task-id]')).toHaveLength(2);
+});
+
+it('构建终态时未执行任务显示已停止，不再提示等待名额', async () => {
+  api.getKbBuildOrchestration.mockResolvedValue(makeOrch({ tasks: [
+    makeTask({ execState: 'queued' }),
+  ] }));
+  await act(async () => { root = createRoot(host); root.render(<BuildOrchestrationProgress build={makeBuild({ status: 'failed' })} />); });
+  expect(host.querySelector('[data-role-group="write"]')?.textContent).toContain('已停止');
+  expect(host.querySelector('[data-task-id="t:write:u1"]')?.textContent).toContain('已停止');
+  expect(host.querySelector('[data-task-id="t:write:u1"]')?.textContent).not.toContain('等待构建名额');
 });
 
 it('spec 摘要：发布方式 / N 路 / 角色模型（冻结 BuildSpec）', async () => {

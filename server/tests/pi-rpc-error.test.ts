@@ -26,6 +26,17 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     return;
   }
   if (process.env.FIXTURE_SCENARIO === 'pending') return;
+  if (process.env.FIXTURE_SCENARIO === 'truncated') {
+    send({ type: 'message_end', message: { role: 'assistant', stopReason: 'length', content: [{ type: 'text', text: '未完成的正文' }],
+      usage: { input: 120, output: 8192, reasoning: 8000 }, providerThinkingLevel: 'max' } });
+    send({ type: 'agent_settled' });
+    return;
+  }
+  if (process.env.FIXTURE_SCENARIO === 'preview') {
+    send({ type: 'message_end', message: { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: '令牌 fixture-run-secret 密钥 fixture-api-secret' }] } });
+    send({ type: 'agent_settled' });
+    return;
+  }
   const error = process.env.FIXTURE_SCENARIO === 'quota'
     ? { role: 'assistant', stopReason: 'error', content: [], errorMessage:
         '429: {"code":"1113","message":"余额不足或无可用资源包 fixture-run-secret", "api_key":"fixture-api-secret", "token":"other-provider-token"}' }
@@ -67,6 +78,21 @@ describe('Pi RPC 模型错误传递', () => {
 
   it('错误后恢复成功时不沿用旧错误', async () => {
     expect(await run('recovered')).toMatchObject({ outcome: 'completed', lastAssistantText: '已恢复' });
+  });
+
+  it('模型达到输出长度上限时不将未完成回复当作成功', async () => {
+    expect(await run('truncated')).toMatchObject({
+      outcome: 'failed', error: { code: 'model_output_truncated' },
+      lastStopReason: 'length', assistantTextChars: 6, assistantPreview: '未完成的正文',
+      inputTokens: 120, outputTokens: 8192, reasoningTokens: 8000, providerThinkingLevel: 'max',
+    });
+  });
+
+  it('持久诊断预览会脱敏运行令牌与模型密钥', async () => {
+    const outcome = await run('preview');
+    expect(outcome.assistantPreview).toContain('[redacted]');
+    expect(outcome.assistantPreview).not.toContain('fixture-run-secret');
+    expect(outcome.assistantPreview).not.toContain('fixture-api-secret');
   });
 
   it('prompt 命令直接拒绝时也对错误脱敏', async () => {

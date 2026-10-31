@@ -43,6 +43,34 @@ function makeDocument(overrides: Partial<DocumentRecord> = {}): DocumentRecord {
 }
 
 describe('LocalMapStore runtime schema', () => {
+  it('restores a Git-imported version and keeps a newer cloud edit pending', () => {
+    const store = new LocalMapStore(createDatabasePath());
+    store.initialize();
+    const file = '/tmp/imported.md';
+    store.upsertDocument(makeDocument({ objToken: 'same', localMdPath: file }));
+    store.restoreImportedBaseline('same', file, 100);
+    expect(store.getDocumentByObjToken('same')).toMatchObject({ syncState: 'synced', syncedObjEditTime: 100 });
+
+    store.upsertDocument(makeDocument({ objToken: 'newer', localMdPath: file, observedObjEditTime: 200 }));
+    store.restoreImportedBaseline('newer', file, 100);
+    expect(store.getDocumentByObjToken('newer')).toMatchObject({ syncState: 'pending_modified', syncedObjEditTime: 100 });
+
+    store.upsertDocument(makeDocument({ objToken: 'wrong-path', localMdPath: file }));
+    store.restoreImportedBaseline('wrong-path', '/tmp/other.md', 100);
+    expect(store.getDocumentByObjToken('wrong-path')?.syncedObjEditTime).toBeNull();
+
+    store.upsertDocument(makeDocument({ objToken: 'restricted', localMdPath: file }));
+    // Simulate a failed cloud read after local indexing.
+    const restricted = store.getDocumentByObjToken('restricted')!;
+    store.recordCloudObservation({ objToken: restricted.objToken, wikiNodeToken: restricted.wikiNodeToken!,
+      objType: restricted.objType, title: restricted.title, parentNodeToken: null, spaceId: null,
+      watchedRootId: 'root', watchedRootUrl: null, observedObjEditTime: null,
+      hasChild: false, observationStatus: 'restricted', lastSeenAt: new Date().toISOString() });
+    store.upsertDocument(makeDocument({ objToken: 'restricted', localMdPath: file }));
+    store.restoreImportedBaseline('restricted', file, 100);
+    expect(store.getDocumentByObjToken('restricted')).toMatchObject({ syncState: 'restricted', syncedObjEditTime: 100 });
+    store.close();
+  });
   it('creates every runtime table on a fresh database and initializes idempotently', () => {
     const dbPath = createDatabasePath();
     const store = new LocalMapStore(dbPath);

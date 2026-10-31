@@ -684,6 +684,15 @@ describe('MappingService.getTreeDetailed (v0.2.0 structure-align Phase B)', () =
     expect(svc.getTreeDetailed({ view: 'feishu' }).nodes[0].cloud_match).toBe('synced');
   });
 
+  it('keeps a permission-restricted imported file visible even without a wiki token', () => {
+    store.rows.set('LOST', makeDoc({ objToken: 'LOST', wikiNodeToken: null,
+      title: '失权文档', localMdPath: '/kb/root/失权文档.md', watchedRootId: 'root',
+      watchedRootUrl: 'https://example.feishu.cn/wiki/root', syncState: 'restricted' }));
+    expect(svc.getTreeDetailed({ view: 'feishu' }).nodes).toContainEqual(
+      expect.objectContaining({ obj_token: 'LOST', wiki_node_token: null, title: '失权文档' }),
+    );
+  });
+
   it('feishu view filters out placeholder nodes (empty title with wiki_node_token)', () => {
     // Placeholder rows come from change-detector.upsertDocumentSeen's
     // permission-restricted branch: they have a non-empty wiki_node_token

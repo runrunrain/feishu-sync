@@ -542,8 +542,8 @@ export class MappingService {
       nodes = live
         .filter(
           (d) =>
-            d.wikiNodeToken != null &&
-            d.wikiNodeToken !== '' &&
+            ((d.wikiNodeToken != null && d.wikiNodeToken !== '') ||
+              (d.syncState === 'restricted' && !!d.localMdPath && !!d.watchedRootId)) &&
             // Custom-folder archive docs are excluded from the cloud view:
             // they are rendered by the 自定义归档 section instead. They can
             // carry a non-empty wiki_node_token (parsed from the .md header

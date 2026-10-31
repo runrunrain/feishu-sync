@@ -9,7 +9,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
-import { Activity, AlertCircle, BookOpen, ChevronLeft, ChevronRight, CloudUpload, Hammer, Link2, ListTree, Loader2, Settings2, ShieldCheck, Sparkles } from 'lucide-react';
+import { AlertCircle, BookOpen, ChevronLeft, ChevronRight, CloudUpload, Hammer, Link2, ListTree, Loader2, Settings2, ShieldCheck, Sparkles } from 'lucide-react';
 import { KbReadingControls } from '../components/kb/KbReadingControls';
 import { useKbReadingPreferences } from '../hooks/useKbReadingPreferences';
 import { KbTreePanel } from '../components/kb/KbTreePanel';
@@ -94,12 +94,14 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
   const [docError, setDocError] = useState<string | null>(null);
 
   const [build, setBuild] = useState<KbBuildDto | null>(null);
+  const [recentBuildLoading, setRecentBuildLoading] = useState(false);
   // 连接只随构建身份切换；启动时读取最新状态快照中的续传游标。
   const latestBuild = useRef(build); latestBuild.current = build;
   const [buildIssues, setBuildIssues] = useState<KbBuildIssue[]>([]);
   const [buildLogs, setBuildLogs] = useState<BuildLogLine[]>([]);
   const [directoryOpen, setDirectoryOpen] = useState(true);
-  const [sidebar, setSidebar] = useState<'sources' | 'build' | 'publish' | 'progress' | 'governance' | null>(null);
+  const [sidebar, setSidebar] = useState<'sources' | 'build' | 'publish' | 'governance' | null>(null);
+  const [buildPane, setBuildPane] = useState<'configure' | 'progress'>('configure');
   const [cancelling, setCancelling] = useState(false);
   const [confirming, setConfirming] = useState<'incremental' | 'selected' | null>(null);
   const [selectedBuildCount, setSelectedBuildCount] = useState(0);
@@ -307,6 +309,7 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
           ? await createKbBuild('incremental', { rebuildSelected: true, ...(refresh ? { refreshImages: true } : {}) })
           : await createKbBuild('incremental');
         setBuild(dto);
+        setBuildPane('progress');
         setBuildIssues([]);
         setBuildLogs([]);
         if (dto.status === 'published') {
@@ -359,7 +362,7 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
     setResuming(true);
     try {
       const dto = await resumeKbBuild(build.id);
-      setBuild(dto); setBuildIssues([]); setResumeConfirm(false);
+      setBuild(dto); setBuildPane('progress'); setBuildIssues([]); setResumeConfirm(false);
       appendLog('info', '已请求从检查点继续构建');
     } catch (error) {
       toast.push({ type: 'error', message: error instanceof Error ? error.message : '继续构建失败' });
@@ -393,15 +396,16 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
 
   useEffect(() => { if (!active) setSidebar(null); }, [active]);
   useEffect(() => {
-    if (sidebar !== 'progress' || build) return;
+    if (sidebar !== 'build' || buildPane !== 'progress' || build) return;
     let disposed = false;
+    setRecentBuildLoading(true);
     void listKbBuilds(1).then(async ({ builds }) => {
       if (!builds[0]) return;
       const detail = await getKbBuild(builds[0].id);
       if (!disposed) { setBuild(detail); setBuildIssues(detail.report?.issues ?? []); }
-    }).catch(() => undefined);
+    }).catch(() => undefined).finally(() => { if (!disposed) setRecentBuildLoading(false); });
     return () => { disposed = true; };
-  }, [sidebar, build]);
+  }, [sidebar, buildPane, build]);
 
   // ---- 派生状态 -----------------------------------------------------------
   const agentReady = agent.status?.code === 'ready' && !agent.unreachable;
@@ -412,6 +416,7 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
 
   const openBuild = (tab: KbChangeTab) => {
     setChangeTab(tab);
+    setBuildPane('configure');
     setSidebar('build');
   };
 
@@ -419,7 +424,6 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
     { id: 'sources' as const, label: '来源', name: '来源与文档信息', icon: Link2 },
     { id: 'publish' as const, label: '发布', name: '发布到飞书', icon: CloudUpload },
     { id: 'build' as const, label: '构建', name: '构建标准库', icon: Hammer },
-    { id: 'progress' as const, label: '进度', name: '构建进度', icon: Activity },
     { id: 'governance' as const, label: '治理', name: '人工复核与业务决定', icon: ShieldCheck },
   ];
 
@@ -446,7 +450,7 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
           <BookOpen className="w-4 h-4 text-seal shrink-0" />
           <h2 className="text-sm font-kai text-ink truncate flex-1">{doc?.title ?? '标准知识库'}</h2>
           {doc ? <KbReadingControls preferences={preferences} onChange={updatePreferences} storageUnavailable={storageUnavailable} active={active} /> : null}
-          {running ? <button type="button" onClick={() => setSidebar('progress')} className="shrink-0 flex items-center gap-1 text-xs text-seal">
+          {running ? <button type="button" onClick={() => { setBuildPane('progress'); setSidebar('build'); }} className="shrink-0 flex items-center gap-1 text-xs text-seal">
             <Loader2 className="w-3 h-3 animate-spin" /> 更新中
           </button> : pendingTotal > 0 ? <button type="button" onClick={() => openBuild('pending')} className="shrink-0 text-xs text-seal">{pendingTotal} 处待更新</button> : null}
         </header>
@@ -497,11 +501,6 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
             </div>
             <div className="min-h-[200px]"><KbSourcePanel docTitle={doc.title} sources={doc.sources} onOpenSource={setSource} /></div>
           </div> : <p className="p-4 text-xs text-ink-faint">选择文档后查看来源与文档信息。</p>
-          : sidebar === 'progress' ? build ? <KbBuildPanel open build={build} issues={buildIssues} logs={buildLogs}
-            onCollapse={() => setSidebar(null)} onCancel={cancelBuild} cancelling={cancelling} layout="sidebar"
-            onResume={() => setResumeConfirm(true)} onRestart={() => openBuild('sources')} resuming={resuming}
-            onBuildUpdated={setBuild} />
-            : <p className="p-4 text-xs text-ink-faint">尚无构建记录。可在构建侧栏选择文档并发起构建。</p>
           : sidebar === 'governance' ? <KbGovernancePanel />
           : sidebar === 'publish' ? <KbPublishPanel
             publications={publications}
@@ -510,7 +509,18 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
             onOpenPublish={() => setPublishModal({ open: true, tab: 'publish' })}
             onOpenHistory={() => setPublishModal({ open: true, tab: 'history' })}
             onRefresh={() => void loadPublications()} />
-          : <>
+          : <div className="flex-1 min-h-0 flex flex-col" data-testid="kb-build-sidebar-container">
+            <div className="shrink-0 flex items-center gap-1 px-3 py-2 border-b border-line/60" role="tablist" aria-label="构建侧栏视图">
+              <button type="button" role="tab" aria-selected={buildPane === 'configure'} onClick={() => setBuildPane('configure')}
+                className={`rounded px-3 py-1.5 text-xs ${buildPane === 'configure' ? 'bg-seal/10 text-seal font-medium' : 'text-ink-soft hover:bg-paper'}`}>源文档与变更</button>
+              <button type="button" role="tab" aria-selected={buildPane === 'progress'} onClick={() => setBuildPane('progress')}
+                className={`rounded px-3 py-1.5 text-xs ${buildPane === 'progress' ? 'bg-seal/10 text-seal font-medium' : 'text-ink-soft hover:bg-paper'}`}>构建进度{running ? ' · 进行中' : ''}</button>
+            </div>
+            {buildPane === 'progress' ? build ? <KbBuildPanel open build={build} issues={buildIssues} logs={buildLogs}
+              onCollapse={() => setSidebar(null)} onCancel={cancelBuild} cancelling={cancelling} layout="sidebar"
+              onResume={() => setResumeConfirm(true)} onRestart={() => openBuild('sources')} resuming={resuming}
+              onBuildUpdated={setBuild} />
+              : <p className="p-4 text-xs text-ink-faint">{recentBuildLoading ? '正在读取最近的构建记录…' : '尚无构建记录。可在“源文档与变更”中发起构建。'}</p> : <>
             {!agentReady ? <div className="shrink-0 px-4 py-2 border-b border-line/60 text-xs text-ink-soft space-y-1">
               {agent.loading ? <StatusBadge status="loading">检测中</StatusBadge> : <StatusBadge status="warning">{readiness?.reason ?? 'Agent 未就绪'}</StatusBadge>}
               {readiness?.action ? <p className="leading-relaxed">{readiness.action}</p> : null}
@@ -526,15 +536,19 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
               onBuildSelected={(count) => { setSelectedBuildCount(count); setRefreshImages(false); setConfirming('selected'); }}
               onOpenSource={(choice) => setSource({ objToken: choice.objToken, title: choice.title, relPath: choice.relPath, state: choice.excluded ? 'excluded' : 'current' })} />
           </>}
+          </div>}
       </aside> : null}
 
       <nav className="shrink-0 w-12 rounded-md border border-line bg-card-bg shadow-sm flex flex-col items-center gap-1 py-2" aria-label="标准库工具">
         {sidebarItems.map(({ id, label, name, icon: Icon }) => <button key={id} type="button" data-sidebar-trigger={id}
-          onClick={() => setSidebar((value) => value === id ? null : id)} aria-label={`${sidebar === id ? '收起' : '打开'}${name}`}
+          onClick={() => {
+            if (id === 'build' && sidebar !== 'build') setBuildPane(running ? 'progress' : 'configure');
+            setSidebar((value) => value === id ? null : id);
+          }} aria-label={`${sidebar === id ? '收起' : '打开'}${name}`}
           aria-expanded={sidebar === id} title={name}
           className={`relative w-10 min-h-[44px] flex flex-col items-center justify-center gap-1 rounded text-[10px] transition-colors ${sidebar === id ? 'bg-seal/10 text-seal' : 'text-ink-faint hover:bg-paper hover:text-ink'}`}>
-          {id === 'progress' && running ? <Loader2 className="w-4 h-4 animate-spin text-seal" /> : <Icon className="w-4 h-4" />}<span>{label}</span>
-          {id === 'build' && pendingTotal > 0 ? <span className="absolute right-1 top-1 w-1.5 h-1.5 rounded-full bg-seal" /> : null}
+          {id === 'build' && running ? <Loader2 className="w-4 h-4 animate-spin text-seal" /> : <Icon className="w-4 h-4" />}<span>{label}</span>
+          {id === 'build' && (pendingTotal > 0 || running) ? <span className="absolute right-1 top-1 w-1.5 h-1.5 rounded-full bg-seal" /> : null}
           {id === 'publish' && publishConflictCount > 0 ? <span className="absolute right-1 top-1 w-1.5 h-1.5 rounded-full bg-seal-2" aria-label={`${publishConflictCount} 篇文档发布异常`} /> : null}
         </button>)}
       </nav>
@@ -556,7 +570,9 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
       <Modal open={resumeConfirm} title="确认从断点继续" onClose={() => { if (!resuming) setResumeConfirm(false); }}>
         <div className="space-y-3 text-sm text-ink-soft leading-relaxed">
           <p>已保存 {build?.recovery?.draftCount ?? 0} 篇草稿，完成 {build?.recovery?.completedBatches ?? 0}/{build?.recovery?.totalBatches ?? 0} 批。</p>
-          <p>将跳过已完成批次，保留已写入的完整草稿，继续未完成内容，并复用已完成的图片转化结果。</p>
+          <p>{(build?.recovery?.draftCount ?? 0) === 0 && (build?.recovery?.totalBatches ?? 0) > 0 && (build?.recovery?.completedBatches ?? 0) >= (build?.recovery?.totalBatches ?? 0)
+            ? '历史批次没有草稿，将重新执行这些批次，并复用已完成的图片转化结果。'
+            : '将跳过已完成批次，保留已写入的完整草稿，继续未完成内容，并复用已完成的图片转化结果。'}</p>
           <p className="text-xs text-ink-faint">使用当前配置的构建模型继续并消耗模型额度。源文档或标准库版本已变化时需重新构建；失败不会改变当前发布版本。</p>
           <ConfirmActions confirmLabel="继续构建" busy={resuming} onConfirm={continueBuild} onCancel={() => setResumeConfirm(false)} />
         </div>

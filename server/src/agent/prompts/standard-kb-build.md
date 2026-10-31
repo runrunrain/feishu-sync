@@ -64,7 +64,7 @@
 
 标准文档不只是正文：每篇文档承载若干知识对象（overview/concept/rule/procedure/data_structure/decision 六类），对象是能独立回答一个问题、声明适用范围并接受审查的最小维护单元。写入草稿时通过 `kb_write_doc` 的可选参数一并提交对象声明。
 
-- 动笔前先查计划与已有对象：`kb_get_plan` 读取冻结的组织计划（文档分组、对象预分配 ID、依赖与迁移）；有计划的构建按计划主位置写，计划未覆盖的新主题先在规划轮用 `kb_submit_plan` 补充。
+- 动笔前可用 `kb_get_plan` 查看冻结的组织计划与已有对象。有计划时按计划主位置写；没有计划，或计划未覆盖某个主题时，直接按本单元源材料组织并调用 `kb_write_doc`。撰写单元不能调用 `kb_submit_plan`，不得等待规划轮或因缺少计划而停止写作。
 - 对象经 `kb_write_doc.objects` 声明：用 clientKey 临时标识，objectId 由 server 分配并经返回映射回填；后续 presentations/relations/evidenceClaims 都用 clientKey 或已分配 ID 引用。同 clientKey 重复提交=更新同一对象；主定义搬到另一路径时保留身份。
 - 每个对象必填 scopeKey/scopeText（适用范围）；同 familyKey+variantKey+scopeKey 不得重复登记。关键断言（公式/数值/前提/例外/状态裁定）声明为 claims，高风险断言（riskCategory=high）必须有细粒度证据。
 - 对象正文位置用 headingPath 或 bodyRange 定位，坐标以你提交的 markdown 为准；稳定锚点是服务端生成的不可见锚点（`<a id="ko_…">`），模型不写任何 HTML。

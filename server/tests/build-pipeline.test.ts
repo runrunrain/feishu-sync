@@ -49,6 +49,8 @@ interface PipelineScript {
   firstFinalReviewBlocking?: boolean;
   /** 审查 prompt 注入 model_timeout 的次数（接口失败通道） */
   reviewInterfaceFailures?: number;
+  /** 审查模型一次输出长度截断，同会话续接后提交报告。 */
+  truncatedReviewPrompts?: number;
   /** 审查执行结束但不提交报告的次数（报告缺失=执行失败） */
   reviewMissingReports?: number;
   /** 修订轮写入的正文 */
@@ -59,6 +61,13 @@ interface PipelineScript {
   hangReviewUnit?: string;
   /** 批次 prompt 注入 model_timeout 的次数（写任务接口失败） */
   batchInterfaceFailures?: number;
+  /** 模拟一次模型输出长度截断，续接提示应继续同一批。 */
+  truncatedBatchPrompts?: number;
+  /** 模拟模型正常结束回复，但不调用任何工具。 */
+  noOpBatchPrompts?: number;
+  /** 模拟模型只读取源，不写草稿；纠正轮也保持无产物。 */
+  readOnlyBatchPrompts?: number;
+  ignoreNoDraftCorrection?: boolean;
   /** 记录全部 prompt（跨进程共享） */
   prompts?: string[];
 }
@@ -69,6 +78,8 @@ const DEFAULT_INTEGRATE_MARKDOWN = '整合后的跨单元规则说明：合并�
 class FakeRpcProcess extends EventEmitter {
   exited = false;
   private pending: Array<(value: unknown) => void> = [];
+  private lastBatchPrompt = '';
+  private lastReviewPrompt = '';
 
   constructor(
     private readonly toolService: AgentToolService,
@@ -104,6 +115,10 @@ class FakeRpcProcess extends EventEmitter {
   }
 
   private async act(message: string): Promise<unknown> {
+    if (message.includes('【输出截断续接】') && message.includes('kb_submit_review') && this.lastReviewPrompt) {
+      return await this.actReview(this.lastReviewPrompt, this.lastReviewPrompt.includes('【最终复核】'));
+    }
+    if (message.includes('【输出截断续接】') && this.lastBatchPrompt) return await this.actBatch(this.lastBatchPrompt);
     if (message.includes('【单元审查')) return await this.actReview(message, false);
     if (message.includes('【最终复核】')) return await this.actReview(message, true);
     if (message.includes('【修订轮')) return await this.actRevise(message);
@@ -112,6 +127,7 @@ class FakeRpcProcess extends EventEmitter {
     if ((message.includes('【单元') || message.includes('【批次')) && message.includes('请处理以下')) {
       return await this.actBatch(message);
     }
+    if (this.script.ignoreNoDraftCorrection && message.includes('草稿数为 0')) return { outcome: 'completed' };
     if (message.includes('没有新增或变更的源')) return { outcome: 'completed' };
     if (message.includes('kb_unit_done')) {
       const unitId = /单元 (u\d+)/.exec(message)?.[1] ?? '';
@@ -127,11 +143,25 @@ class FakeRpcProcess extends EventEmitter {
 
   private async actBatch(message: string): Promise<unknown> {
     const unitId = /【单元 (u\d+)/.exec(message)?.[1] ?? '';
+    this.lastBatchPrompt = message;
+    if ((this.script.truncatedBatchPrompts ?? 0) > 0) {
+      this.script.truncatedBatchPrompts! -= 1;
+      return { outcome: 'failed', error: { code: 'model_output_truncated', message: '达到长度上限' }, lastStopReason: 'length', assistantTextChars: 0 };
+    }
+    if ((this.script.noOpBatchPrompts ?? 0) > 0) {
+      this.script.noOpBatchPrompts! -= 1;
+      return { outcome: 'completed' };
+    }
     if (this.script.batchInterfaceFailures && this.script.batchInterfaceFailures > 0) {
       this.script.batchInterfaceFailures -= 1;
       return { outcome: 'failed', error: { code: 'model_timeout', message: '脚本注入一次性接口失败' } };
     }
     const tokens = [...message.matchAll(/^\| (tok\S+) \|/gm)].map((match) => match[1]);
+    if ((this.script.readOnlyBatchPrompts ?? 0) > 0) {
+      this.script.readOnlyBatchPrompts! -= 1;
+      for (const source of tokens) await this.call('raw_read', { objToken: source });
+      return { outcome: 'completed' };
+    }
     const docs: Array<{ path: string; sources: string[] }> = [];
     for (const token of tokens) {
       const docPath = `主题/${unitId || 'u'}-${token}.md`;
@@ -156,7 +186,12 @@ class FakeRpcProcess extends EventEmitter {
 
   /** 审查轮：按脚本提交 pass / blocking 报告（经真实 kb_submit_review）。 */
   private async actReview(message: string, isFinal: boolean): Promise<unknown> {
+    this.lastReviewPrompt = message;
     const unitId = isFinal ? 'all' : (/【单元审查 (u\d+)】/.exec(message)?.[1] ?? '');
+    if ((this.script.truncatedReviewPrompts ?? 0) > 0) {
+      this.script.truncatedReviewPrompts! -= 1;
+      return { outcome: 'failed', error: { code: 'model_output_truncated', message: '达到长度上限' }, lastStopReason: 'length', assistantTextChars: 0 };
+    }
     if (!isFinal && this.script.hangReviewUnit === unitId) {
       return await new Promise((resolve) => { this.pending.push(resolve as (value: unknown) => void); });
     }
@@ -426,12 +461,91 @@ afterAll(() => {
 // ---------------------------------------------------------------------------
 
 describe('T2b：单元写→审→过→整合→最终复核→auto 发布', () => {
+  it('模型空回复不能推进批次，保留可重试断点', async () => {
+    seedTwoUnits('空回复');
+    const previous = new StandardKbStore(outputRoot).readCurrent()?.releaseId;
+    const script: PipelineScript = { noOpBatchPrompts: 100, prompts: [] };
+    const harness = makeHarness(makeOrchConfig({ parallelism: 1, maxInterfaceRetries: 0 }), script);
+    const dto = await harness.service.createBuild(store as never, { mode: 'full', confirm: 'BUILD' });
+    const row = await waitForTerminal(dto.id);
+    expect(row.status).toBe('failed');
+    expect(String(row.error_message)).toContain('不能标记批次完成');
+    expect(script.prompts?.some((prompt) => prompt.includes('未产生有效工具操作'))).toBe(true);
+    expect(new StandardKbStore(outputRoot).readCurrent()?.releaseId).toBe(previous);
+    const checkpoint = new BuildCheckpointStore(outputRoot).read(dto.id);
+    expect(checkpoint?.unitProgress?.find(([unitId]) => unitId === 'u1')?.[1] ?? 0).toBe(0);
+    await harness.close();
+  });
+
+  it('模型空回复后用新进程重试未完成批次并发布', async () => {
+    seedTwoUnits('空回复恢复');
+    const script: PipelineScript = { noOpBatchPrompts: 1, prompts: [] };
+    const harness = makeHarness(makeOrchConfig({ parallelism: 1, maxInterfaceRetries: 2 }), script);
+    const dto = await harness.service.createBuild(store as never, { mode: 'full', confirm: 'BUILD' });
+    const row = await waitForTerminal(dto.id);
+    expect(String(row.status), String(row.error_message)).toBe('published');
+    expect(script.prompts?.some((prompt) => prompt.includes('未产生有效工具操作'))).toBe(true);
+    const logs = harness.service.eventsSince(dto.id, null).filter((event) => event.event === 'build_log')
+      .map((event) => String((event.data as { message?: string }).message ?? ''));
+    expect(logs.some((message) => message.includes('kb_batch_no_tool_calls'))).toBe(true);
+    await harness.close();
+  });
+
+  it('批次只读不写时重置零草稿断点并用新进程重试', async () => {
+    seedTwoUnits('只读');
+    const script: PipelineScript = { readOnlyBatchPrompts: 1, ignoreNoDraftCorrection: true, prompts: [] };
+    const harness = makeHarness(makeOrchConfig({ parallelism: 1, maxInterfaceRetries: 2 }), script);
+    const dto = await harness.service.createBuild(store as never, { mode: 'full', confirm: 'BUILD' });
+    const row = await waitForTerminal(dto.id);
+    expect(String(row.status), String(row.error_message)).toBe('published');
+    const batchPrompts = script.prompts?.filter((prompt) => prompt.includes('请处理以下') && prompt.includes('tok只读A')) ?? [];
+    expect(batchPrompts).toHaveLength(2);
+    const logs = harness.service.eventsSince(dto.id, null).filter((event) => event.event === 'build_log')
+      .map((event) => String((event.data as { message?: string }).message ?? ''));
+    expect(logs.some((message) => message.includes('kb_unit_no_drafts'))).toBe(true);
+    await harness.close();
+  });
+
+  it('输出长度截断后在同一进程续接写作并记录轮次', async () => {
+    seedTwoUnits('截断续写');
+    const script: PipelineScript = { truncatedBatchPrompts: 1, prompts: [] };
+    const harness = makeHarness(makeOrchConfig({ parallelism: 1, maxInterfaceRetries: 0 }), script);
+    const dto = await harness.service.createBuild(store as never, { mode: 'full', confirm: 'BUILD' });
+    const row = await waitForTerminal(dto.id);
+    expect(String(row.status), String(row.error_message)).toBe('published');
+    const turns = harness.service.eventsSince(dto.id, null).filter((event) => event.event === 'model_turn')
+      .map((event) => event.data as { phase: string; continuation: number; errorCode: string | null; draftWrites: number });
+    expect(turns.some((turn) => turn.phase === 'batch' && turn.continuation === 0 && turn.errorCode === 'model_output_truncated')).toBe(true);
+    expect(turns.some((turn) => turn.phase === 'batch' && turn.continuation === 1 && turn.draftWrites > 0)).toBe(true);
+    await harness.close();
+  });
+
+  it('审查输出截断后在同一进程续接并提交报告', async () => {
+    seedTwoUnits('审查续接');
+    const script: PipelineScript = { truncatedReviewPrompts: 1, prompts: [] };
+    const harness = makeHarness(makeOrchConfig({ parallelism: 1, maxInterfaceRetries: 0 }), script);
+    const dto = await harness.service.createBuild(store as never, { mode: 'full', confirm: 'BUILD' });
+    const row = await waitForTerminal(dto.id);
+    expect(String(row.status), String(row.error_message)).toBe('published');
+    const turns = harness.service.eventsSince(dto.id, null).filter((event) => event.event === 'model_turn')
+      .map((event) => event.data as { phase: string; continuation: number; errorCode: string | null; unitDoneCalls: number });
+    expect(turns.some((turn) => turn.phase === 'review' && turn.continuation === 0 && turn.errorCode === 'model_output_truncated')).toBe(true);
+    expect(turns.some((turn) => turn.phase === 'review' && turn.continuation === 1 && turn.errorCode === null)).toBe(true);
+    expect(script.prompts?.some((prompt) => prompt.includes('【输出截断续接】') && prompt.includes('kb_submit_review'))).toBe(true);
+    await harness.close();
+  });
+
   it('全链路状态推进：全部任务 acceptance=passed、报告落盘、候选与验收记录齐全', async () => {
     seedTwoUnits('全链');
     const harness = makeHarness(makeOrchConfig());
     const dto = await harness.service.createBuild(store as never, { mode: 'full', confirm: 'BUILD' });
     const row = await waitForTerminal(dto.id);
     expect(String(row.status), String(row.error_message)).toBe('published');
+    const writerTurns = harness.service.eventsSince(dto.id, null)
+      .filter((event) => event.event === 'model_turn')
+      .map((event) => event.data as { phase: string; outcome: string; draftWrites: number; toolCalls: number });
+    expect(writerTurns.some((turn) => turn.phase === 'batch' && turn.outcome === 'completed'
+      && turn.draftWrites > 0 && turn.toolCalls >= turn.draftWrites)).toBe(true);
 
     // 编排终态：write/review/integrate/final 全部闭环
     const progress = await harness.request(`/api/kb/builds/${dto.id}/orchestration`);

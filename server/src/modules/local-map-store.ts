@@ -771,6 +771,23 @@ export class LocalMapStore {
     );
   }
 
+  /** Restore an imported file's acknowledged cloud version without claiming a new download. */
+  restoreImportedBaseline(objToken: string, localMdPath: string, syncedSeconds: number): void {
+    if (!Number.isSafeInteger(syncedSeconds) || syncedSeconds <= 0) return;
+    this.db.prepare(`
+      UPDATE documents SET
+        synced_obj_edit_time = ?,
+        sync_state = CASE WHEN sync_state = 'restricted' THEN 'restricted'
+          WHEN observed_obj_edit_time > ? THEN 'pending_modified' ELSE 'synced' END,
+        status = CASE WHEN sync_state = 'restricted' THEN 'placeholder'
+          WHEN observed_obj_edit_time > ? THEN 'changed' ELSE 'synced' END,
+        updated_at = datetime('now')
+      WHERE obj_token = ? AND local_md_path = ? AND status = 'synced'
+        AND sync_state IN ('pending_added', 'restricted') AND synced_obj_edit_time IS NULL
+        AND pending_reason IS NULL AND cloud_deleted = 0
+    `).run(syncedSeconds, syncedSeconds, syncedSeconds, objToken, localMdPath);
+  }
+
   /**
    * Get document by obj_token
    */

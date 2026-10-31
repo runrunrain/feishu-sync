@@ -69,7 +69,8 @@ it('重启后加载中断检查点和历史日志，确认后发起断点继续'
   const button = (text: string) => [...container.querySelectorAll('button')].find((item) => item.textContent?.trim() === text)!;
   try {
     await act(async () => root.render(<KnowledgeView />));
-    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="打开构建进度"]')!.click());
+    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="打开构建标准库"]')!.click());
+    await act(async () => button('构建进度').click());
     expect(container.textContent).toContain('已保存 11 篇草稿'); expect(container.textContent).toContain('之前完成第一批');
     expect(state.resumeBuild).not.toHaveBeenCalled();
     await act(async () => button('从断点继续').click());
@@ -91,7 +92,7 @@ it('左侧目录保持可用，构建、差异、版本和进度从右侧直接�
     expect(container.querySelector('[data-testid="kb-directory-panel"]')).not.toBeNull();
     expect(container.querySelector('[data-testid="kb-sidebar"]')).toBeNull();
     expect([...container.querySelectorAll('[data-sidebar-trigger]')].map((el) => el.getAttribute('data-sidebar-trigger')))
-      .toEqual(['sources', 'publish', 'build', 'progress', 'governance']);
+      .toEqual(['sources', 'publish', 'build', 'governance']);
 
     await click(button('第二篇'));
     expect(container.querySelector('[data-testid="kb-directory-panel"]')).not.toBeNull();
@@ -115,8 +116,9 @@ it('左侧目录保持可用，构建、差异、版本和进度从右侧直接�
     expect(container.querySelector('[role="dialog"]')?.textContent).not.toContain('未选源文档的内容不会保留');
     await click(button('开始构建'));
     expect(state.createBuild).toHaveBeenCalledWith('incremental', { rebuildSelected: true });
-    expect(container.querySelector('[data-testid="kb-build-sidebar"]')).not.toBeNull();
-    expect(container.querySelector('[aria-label="标准库构建进度"]')).toBeNull();
+    expect(container.querySelector('[data-testid="kb-build-sidebar"]')).toBeNull();
+    expect(container.querySelector('[aria-label="标准库构建进度"]')).not.toBeNull();
+    await click(button('源文档与变更'));
 
     await click(button('待更新差异'));
     expect(container.textContent).toContain('来源 A.md');
@@ -129,9 +131,10 @@ it('左侧目录保持可用，构建、差异、版本和进度从右侧直接�
     await click(button('开始按变更更新'));
     expect(state.createBuild).toHaveBeenCalledWith('incremental');
 
+    await click(button('源文档与变更'));
     await click(button('版本记录'));
     expect(container.querySelector('[aria-label="选择标准库版本"]')).not.toBeNull();
-    await click(label('打开构建进度'));
+    await click(button('构建进度'));
     expect(container.querySelector('[data-testid="kb-build-sidebar"]')).toBeNull();
     expect(container.querySelector('[aria-label="标准库构建进度"]')).not.toBeNull();
     expect(container.querySelector('[aria-label="收起标准库侧栏"]')).not.toBeNull();
@@ -182,7 +185,7 @@ it('首次构建入口打开源选择，进度入口按需加载最近的记录'
     expect(container.querySelector('[data-testid="kb-build-sidebar"]')).not.toBeNull();
     expect(button('构建所选文档').disabled).toBe(false);
     expect(state.listBuilds).not.toHaveBeenCalled();
-    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="打开构建进度"]')!.click());
+    await act(async () => button('构建进度').click());
     expect(state.listBuilds).toHaveBeenCalledTimes(1);
     expect(container.querySelector('[aria-label="标准库构建进度"]')?.textContent).toContain('已发布');
   } finally { act(() => root.unmount()); container.remove(); state.hasCurrent = true; }

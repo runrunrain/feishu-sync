@@ -21,7 +21,7 @@ import { AgentToolService, ToolError, validateStdDocPath, type BuildRunState } f
 import type { KnowledgeDraftFile, OrganizationPlanFile } from '../agent/agent-tool-service.js';
 import type { VisionDescriberLike } from '../agent/agent-tool-service.js';
 import { isPathInside, PathGuardError, resolveInside } from '../agent/path-guard.js';
-import { buildPiProcessEnv, PiRpcProcess } from '../agent/pi-rpc-process.js';
+import { buildPiProcessEnv, PiRpcProcess, type RunOutcome } from '../agent/pi-rpc-process.js';
 import { PiRuntimeResolver, resolveAppLlmModel } from '../agent/runtime-resolver.js';
 import { buildAppLlmRunConfig, buildFrozenRoleRunConfig } from '../agent/provider-descriptor.js';
 import { createClaudeProcess } from '../agent/claude-process-factory.js';
@@ -2127,6 +2127,7 @@ export class KbBuildService extends EventEmitter {
           phase: event.phase,
           toolName: event.toolName,
           summary: event.argsSummary || event.resultSummary || '',
+          ...(event.phase === 'end' && event.resultSummary ? { resultSummary: event.resultSummary } : {}),
           ...(event.isError !== undefined ? { isError: event.isError } : {}),
         });
       },
@@ -2394,6 +2395,7 @@ export class KbBuildService extends EventEmitter {
           phase: event.phase,
           toolName: event.toolName,
           summary: event.argsSummary || event.resultSummary || '',
+          ...(event.phase === 'end' && event.resultSummary ? { resultSummary: event.resultSummary } : {}),
           ...(event.isError !== undefined ? { isError: event.isError } : {}),
           workerId: worker.workerId,
           ...(worker.unitId ? { unitId: worker.unitId } : {}),
@@ -3307,7 +3309,10 @@ export class KbBuildService extends EventEmitter {
     const prompt = this.buildUnitReviewPrompt(unit, scopePaths, buildState, attempt);
     // S3 切片 C：机械预检疑点段（开关关闭 → null，提示词字节级不变）
     const precheckSuffix = this.mechanicalPrecheckSection(input, { kind: 'unit', unit, scopePaths });
-    const outcome = await worker.rpc!.prompt(`${this.reviewRulesText()}\n\n---\n${prompt}${precheckSuffix ? `\n\n---\n${precheckSuffix}` : ''}`, { timeoutMs: input.promptTimeoutMs });
+    const outcome = await this.promptUnitWithTrace(input.buildId, entry, worker, 'review',
+      `${this.reviewRulesText()}\n\n---\n${prompt}${precheckSuffix ? `\n\n---\n${precheckSuffix}` : ''}`,
+      input.promptTimeoutMs,
+      `审查单元 ${unit.id} 的上一轮输出被截断。请继续未完成的核查，并立即调用 kb_submit_review（unitId=${unit.id}）提交报告；已检查范围和未检查范围如实填写。`);
     if (entry.cancelRequested && outcome.outcome !== 'completed') throw new CancelledError();
     if (outcome.outcome === 'aborted') throw new CancelledError();
     if (outcome.outcome === 'failed') {
@@ -3359,20 +3364,20 @@ export class KbBuildService extends EventEmitter {
       '- skipped：工作集中未被任何文档引用的源，逐个列出 objToken 与理由（全构建范围，不限于某一单元）。',
       '注意：必须调用工具本身（tool call），不要只回复文本说明。整合阶段改写过的文档将对照原文重新审查（最终复核）。',
     ].join('\n');
-    let outcome = await worker.rpc!.prompt(
+    let outcome = await this.promptUnitWithTrace(input.buildId, entry, worker, 'integrate',
       input.systemRules ? `${finishPrompt}\n\n---\n构建规则与文风规范（适用）：\n${input.systemRules}` : finishPrompt,
-      { timeoutMs: input.promptTimeoutMs },
-    );
+      input.promptTimeoutMs,
+      '整合轮上一轮输出被截断。继续未完成的整合，立即调用 kb_finish 提交总结与未引用源；不要重写已完成内容。');
     if (outcome.outcome === 'aborted') throw new CancelledError();
     if (outcome.outcome === 'failed') {
       throw new ToolError(outcome.error?.code ?? 'model_request_failed', `整合轮失败：${outcome.error?.message ?? '未知错误'}`, 502);
     }
     if (!buildState.finishInfo) {
       this.emitLog(input.buildId, 'warn', '整合轮未检测到 kb_finish 调用，发送强制纠正提示');
-      outcome = await worker.rpc!.prompt(
+      outcome = await this.promptUnitWithTrace(input.buildId, entry, worker, 'integrate_correction',
         '系统检测到你没有调用 kb_finish 工具（工具调用记录为空）。现在请直接调用 kb_finish 工具：summary 填写整体总结；如果此前未写任何文档，skipped 列出全部源并说明理由。不要输出任何文本，直接发起工具调用。',
-        { timeoutMs: input.promptTimeoutMs },
-      );
+        input.promptTimeoutMs,
+        '整合纠正轮输出被截断。现在直接调用 kb_finish，不要输出正文。');
       if (outcome.outcome === 'aborted') throw new CancelledError();
       if (outcome.outcome === 'failed') {
         throw new ToolError(outcome.error?.code ?? 'model_request_failed', `整合轮纠正失败：${outcome.error?.message ?? '未知错误'}`, 502);
@@ -3433,7 +3438,10 @@ export class KbBuildService extends EventEmitter {
     const prompt = this.buildFinalReviewPrompt(input.units, attempt);
     // S3 切片 C：机械预检疑点段（开关关闭 → null，提示词字节级不变）
     const precheckSuffix = this.mechanicalPrecheckSection(input, { kind: 'integration' });
-    const outcome = await worker.rpc!.prompt(`${this.reviewRulesText()}\n\n---\n${prompt}${precheckSuffix ? `\n\n---\n${precheckSuffix}` : ''}`, { timeoutMs: input.promptTimeoutMs });
+    const outcome = await this.promptUnitWithTrace(input.buildId, entry, worker, 'final_review',
+      `${this.reviewRulesText()}\n\n---\n${prompt}${precheckSuffix ? `\n\n---\n${precheckSuffix}` : ''}`,
+      input.promptTimeoutMs,
+      '最终复核上一轮输出被截断。继续未完成的整版核查，立即调用 kb_submit_review（unitId=all）提交报告；已检查范围和未检查范围如实填写。');
     if (entry.cancelRequested && outcome.outcome !== 'completed') throw new CancelledError();
     if (outcome.outcome === 'aborted') throw new CancelledError();
     if (outcome.outcome === 'failed') {
@@ -3789,7 +3797,9 @@ export class KbBuildService extends EventEmitter {
   private static isInterfaceRetryable(error: unknown): boolean {
     const code = error instanceof ToolError ? error.code : '';
     return code === 'model_timeout' || code === 'model_request_failed' || code === 'pi_process_exited'
-      || code === 'pi_transport_failed' || code === 'kb_review_report_missing' || code === 'kb_review_stale_binding'
+      || code === 'pi_transport_failed' || code === 'model_output_truncated'
+      || code === 'kb_batch_no_tool_calls' || code === 'kb_unit_no_drafts'
+      || code === 'kb_review_report_missing' || code === 'kb_review_stale_binding'
       // D5（B 案 §3）：规划轮未提交计划与审查报告缺失同型（执行通道失败）
       || code === 'kb_plan_missing';
   }
@@ -4178,6 +4188,86 @@ export class KbBuildService extends EventEmitter {
     return `plan:${plan.planId}@${plan.planRevision}`;
   }
 
+  /** A model response alone is not batch progress; require a successful source read or draft write. */
+  private hasUnitBatchWork(entry: InMemoryBuild, from: number, unitId: string, batch: string[]): boolean {
+    const sourceTokens = new Set(batch);
+    return entry.events.slice(from).some((event) => {
+      if (event.event !== 'tool' || !event.data || typeof event.data !== 'object') return false;
+      const data = event.data as { phase?: string; toolName?: string; unitId?: string; isError?: boolean; summary?: string };
+      return data.unitId === unitId && data.phase === 'end' && data.isError === false
+        && (data.toolName === 'kb_write_doc'
+          || (data.toolName === 'raw_read' && sourceTokens.has(data.summary?.replace(/^objToken=/, '') ?? '')));
+    });
+  }
+
+  /** Record a bounded, credential-redacted result for every writer prompt. */
+  private async promptUnitWithTrace(
+    buildId: string,
+    entry: InMemoryBuild,
+    worker: WorkerRuntime,
+    phase: 'batch' | 'batch_correction' | 'draft_correction' | 'done_correction' | 'review' | 'integrate' | 'integrate_correction' | 'final_review',
+    prompt: string,
+    timeoutMs: number,
+    continuationPrompt?: string,
+  ): Promise<RunOutcome> {
+    const runOne = async (message: string, continuation: number): Promise<RunOutcome> => {
+      const startedAt = Date.now();
+      const eventOffset = entry.events.length;
+      let outcome: RunOutcome | undefined;
+      try {
+        outcome = await worker.rpc!.prompt(message, { timeoutMs });
+        return outcome;
+      } finally {
+        const toolEnds = entry.events.slice(eventOffset).filter((event) => {
+          if (event.event !== 'tool' || !event.data || typeof event.data !== 'object') return false;
+          const data = event.data as { phase?: string; workerId?: string };
+          return data.phase === 'end' && data.workerId === worker.workerId;
+        });
+        const countTool = (name: string) => toolEnds.filter((event) => {
+          const data = event.data as { toolName?: string; isError?: boolean };
+          return data.toolName === name && data.isError === false;
+        }).length;
+        const trace = {
+          workerId: worker.workerId,
+          unitId: worker.unitId,
+          phase,
+          continuation,
+          batch: worker.unitBatchTotal > 0 ? `${worker.unitBatchIndex + 1}/${worker.unitBatchTotal}` : null,
+          durationMs: Date.now() - startedAt,
+          outcome: outcome?.outcome ?? 'exception',
+          stopReason: outcome?.lastStopReason ?? null,
+          errorCode: outcome?.error?.code ?? null,
+          assistantTextChars: outcome?.assistantTextChars ?? outcome?.lastAssistantText?.length ?? 0,
+          assistantPreview: outcome?.assistantPreview ?? null,
+          inputTokens: outcome?.inputTokens ?? null,
+          outputTokens: outcome?.outputTokens ?? null,
+          reasoningTokens: outcome?.reasoningTokens ?? null,
+          providerThinkingLevel: outcome?.providerThinkingLevel ?? null,
+          toolCalls: toolEnds.length,
+          rawReads: countTool('raw_read'),
+          draftWrites: countTool('kb_write_doc'),
+          unitDoneCalls: countTool('kb_unit_done'),
+        };
+        this.emitBuild(buildId, 'model_turn', trace);
+        this.emitLog(buildId, trace.outcome === 'completed' ? 'info' : 'warn',
+          `模型轮次 ${phase}${trace.batch ? ` ${trace.batch}` : ''}${continuation ? ` 续接${continuation}` : ''}：${trace.outcome}`
+          + `${trace.stopReason ? `，停止原因 ${trace.stopReason}` : ''}`
+          + `${trace.errorCode ? `，错误 ${trace.errorCode}` : ''}`
+          + `，耗时 ${trace.durationMs}ms，回复 ${trace.assistantTextChars} 字`
+          + `${trace.outputTokens !== null ? `，输出 ${trace.outputTokens} tokens${trace.reasoningTokens !== null ? `（思考 ${trace.reasoningTokens}）` : ''}` : ''}`
+          + `，工具 ${trace.toolCalls} 次（读取 ${trace.rawReads}、写稿 ${trace.draftWrites}、单元完成 ${trace.unitDoneCalls}）`);
+      }
+    };
+    let outcome = await runOne(prompt, 0);
+    for (let continuation = 1; continuation <= 2 && outcome.error?.code === 'model_output_truncated'; continuation += 1) {
+      outcome = await runOne(
+        `【输出截断续接】${continuationPrompt ?? `上一轮输出达到长度上限。继续完成单元 ${worker.unitId ?? ''} 的${phase}任务，不要重新规划或复述已读内容；立即调用尚需的 raw_read、kb_write_doc 或 kb_unit_done 工具，提交实际产物。`}`,
+        continuation,
+      );
+    }
+    return outcome;
+  }
+
   /** 单元写入（轮次 0）：批次推进与既有单元阶段一致（unitProgress 断点续跑）。 */
   private async runOrchestratedUnitWrite(
     input: OrchestratedPhaseInput & { task: BuildTask },
@@ -4193,6 +4283,16 @@ export class KbBuildService extends EventEmitter {
     try {
       const unitProgress = entry.unitProgress;
       if (!unitProgress.has(unit.id)) unitProgress.set(unit.id, 0);
+      // A previous run could acknowledge every prompt while producing no
+      // artifact at all. Replaying those prompts is required on resume;
+      // asking only for kb_unit_done would certify an empty unit.
+      if (entry.resume && (unitProgress.get(unit.id) ?? 0) >= unit.batches.length
+        && !buildState.unitDone?.has(unit.id)
+        && !this.unitScopePaths(buildState, unit).some((path) => buildState.writtenPaths?.has(path))) {
+        unitProgress.set(unit.id, 0);
+        this.emitLog(input.buildId, 'warn', `单元 ${unit.id} 的历史批次没有草稿，断点继续将重新执行这些批次`);
+        this.persistCheckpoint(input.buildId);
+      }
       const batches = unit.batches;
       for (let index = unitProgress.get(unit.id) ?? 0; index < batches.length; index += 1) {
         if (entry.cancelRequested) throw new CancelledError();
@@ -4215,25 +4315,54 @@ export class KbBuildService extends EventEmitter {
           claimedDocs: buildState.claims?.ownedBy(unit.id) ?? [],
         });
         const continuation = entry.resume ? '这是断点继续：已完成单元/批次不重复执行。请用 draft_list/draft_read 检查本单元已恢复的完整草稿，保留结果并补齐未完成内容。\n\n' : '';
-        const outcome = await worker.rpc!.prompt(
+        const eventOffset = entry.events.length;
+        const outcome = await this.promptUnitWithTrace(input.buildId, entry, worker, 'batch',
           continuation + (input.systemRules ? `${batchPrompt}\n\n---\n构建规则与文风规范（每批适用）：\n${input.systemRules}` : batchPrompt),
-          { timeoutMs: input.promptTimeoutMs },
+          input.promptTimeoutMs,
         );
         if (entry.cancelRequested && outcome.outcome !== 'completed') throw new CancelledError();
         if (outcome.outcome === 'aborted') throw new CancelledError();
         if (outcome.outcome === 'failed') {
           throw new ToolError(outcome.error?.code ?? 'model_request_failed', `单元 ${unit.id} 批次 ${index + 1} 失败：${outcome.error?.message ?? '未知错误'}`, 502);
         }
+        if (batches[index].length > 0 && !this.hasUnitBatchWork(entry, eventOffset, unit.id, batches[index])) {
+          this.emitLog(input.buildId, 'warn', `单元 ${unit.id} 批次 ${index + 1} 未读取源或写入草稿，发送批次纠正提示`);
+          const corrected = await this.promptUnitWithTrace(input.buildId, entry, worker, 'batch_correction',
+            `单元 ${unit.id} 批次 ${index + 1}/${batches.length} 未产生有效工具操作。请先调用 raw_read 读取本批源（${batches[index].join('、')}），再调用 kb_write_doc 写入相应草稿；如需跨批合并，也必须先读取本批源。不要只回复文字。`,
+            input.promptTimeoutMs,
+          );
+          if (corrected.outcome === 'aborted') throw new CancelledError();
+          if (corrected.outcome === 'failed') throw new ToolError(corrected.error?.code ?? 'model_request_failed', `单元 ${unit.id} 批次纠正失败：${corrected.error?.message ?? '未知错误'}`, 502);
+          if (!this.hasUnitBatchWork(entry, eventOffset, unit.id, batches[index])) {
+            throw new ToolError('kb_batch_no_tool_calls', `单元 ${unit.id} 批次 ${index + 1} 未读取源或写入草稿，不能标记批次完成`, 502);
+          }
+        }
         this.throwIfPoisoned(buildState);
         unitProgress.set(unit.id, index + 1);
         entry.batchIndex += 1;
         this.persistCheckpoint(input.buildId);
       }
+      if (unit.sources.length > 0 && !buildState.unitDone?.has(unit.id)
+        && !this.unitScopePaths(buildState, unit).some((path) => buildState.writtenPaths?.has(path))) {
+        this.emitLog(input.buildId, 'warn', `单元 ${unit.id} 没有草稿，发送写作纠正提示`);
+        const repaired = await this.promptUnitWithTrace(input.buildId, entry, worker, 'draft_correction',
+          `单元 ${unit.id} 的批次已读取，但草稿数为 0。必须先根据本单元源（${unit.sources.join('、')}）调用 kb_write_doc 写入标准文档，再调用 kb_unit_done。只有全部源确实不适合沉淀时，才可在 kb_unit_done.skipped 中逐个说明理由。不要只回复文字。`,
+          input.promptTimeoutMs,
+        );
+        if (repaired.outcome === 'aborted') throw new CancelledError();
+        if (repaired.outcome === 'failed') throw new ToolError(repaired.error?.code ?? 'model_request_failed', `单元 ${unit.id} 写作纠正失败：${repaired.error?.message ?? '未知错误'}`, 502);
+        if (!buildState.unitDone?.has(unit.id)
+          && !this.unitScopePaths(buildState, unit).some((path) => buildState.writtenPaths?.has(path))) {
+          unitProgress.set(unit.id, 0);
+          this.persistCheckpoint(input.buildId);
+          throw new ToolError('kb_unit_no_drafts', `单元 ${unit.id} 的全部批次和写作纠正轮均未产生草稿，将在新模型进程中重试`, 502);
+        }
+      }
       if (!buildState.unitDone?.has(unit.id)) {
         this.emitLog(input.buildId, 'warn', `单元 ${unit.id} 未调用 kb_unit_done，发送纠正提示`);
-        const corrected = await worker.rpc!.prompt(
+        const corrected = await this.promptUnitWithTrace(input.buildId, entry, worker, 'done_correction',
           `本单元（${unit.id}）的全部批次已处理完。系统未检测到 kb_unit_done 调用。现在请直接调用 kb_unit_done 工具：summary 填写本单元总结；本单元未被任何文档引用的源逐个列入 skipped（objToken 须属本单元）。不要输出文本，直接发起工具调用。`,
-          { timeoutMs: input.promptTimeoutMs },
+          input.promptTimeoutMs,
         );
         if (corrected.outcome === 'aborted') throw new CancelledError();
         if (corrected.outcome === 'failed') {

@@ -34,6 +34,7 @@ import { insertionSide, reorderSiblings, siblingDropTarget } from '../utils/tree
 import { getMappingTree, reorderMapping } from '../api/client';
 import { cloudMoveFace } from './move-out/labels';
 import { normalizeExternalUrl } from '../utils/external-url';
+import { displayNodeKey, recoverDisplayHierarchy } from '../utils/displayHierarchy';
 import type { CloudMoveRecord, CustomFolder, MappingNode, TreeNavTarget, WatchedRoot } from '../types';
 
 type TreeFilter = 'all' | 'changed' | 'error' | 'orphan';
@@ -144,9 +145,7 @@ function buildTree(nodes: MappingNode[]): TreeBucket {
   const nodeByWikiToken = new Map<string, MappingNode>();
   for (const n of nodes) {
     nodeByToken.set(n.obj_token, n);
-    if (n.wiki_node_token != null) {
-      nodeByWikiToken.set(n.wiki_node_token, n);
-    }
+    nodeByWikiToken.set(displayNodeKey(n), n);
   }
 
   const childrenByParent = new Map<string | null, MappingNode[]>();
@@ -171,11 +170,7 @@ function buildTree(nodes: MappingNode[]): TreeBucket {
  * as a logical root while preserving normal in-subtree hierarchy.
  */
 export function findRenderableRoots(nodes: MappingNode[]): MappingNode[] {
-  const knownWikiNodeTokens = new Set(
-    nodes
-      .map((node) => node.wiki_node_token)
-      .filter((token): token is string => Boolean(token)),
-  );
+  const knownWikiNodeTokens = new Set(nodes.map(displayNodeKey));
   return nodes
     .filter((node) => {
       const parentToken = node.parent_node_token;
@@ -274,8 +269,10 @@ export function NodeTreeView({
     if (nodesProp !== undefined) setNodes(nodesProp);
   }, [nodesProp]);
 
-  const tree = useMemo(() => buildTree(nodes), [nodes]);
-  const roots = useMemo(() => findRenderableRoots(nodes), [nodes]);
+  const displayHierarchy = useMemo(() => recoverDisplayHierarchy(nodes), [nodes]);
+  const displayNodes = displayHierarchy.nodes;
+  const tree = useMemo(() => buildTree(displayNodes), [displayNodes]);
+  const roots = useMemo(() => findRenderableRoots(displayNodes), [displayNodes]);
 
   // Default expand logical roots and any node with changed/error status up to
   // depth 2 so changed nodes are visible.
@@ -293,7 +290,7 @@ export function NodeTreeView({
         if (r.has_child) next.add(r.obj_token);
       }
       // Also expand parents that contain changed/error children.
-      for (const n of nodes) {
+      for (const n of displayNodes) {
         if (n.status === 'changed' || n.status === 'error' || n.cloud_deleted === 1) {
           // expand the immediate parent.
           // parent_node_token is the parent's wiki_node_token (feishu form),
@@ -317,13 +314,13 @@ export function NodeTreeView({
       }
       return next;
     });
-  }, [nodes, tree]);
+  }, [nodes, displayNodes, tree]);
 
   // Filter + search match set
   const matchedTokens = useMemo(() => {
     const result = new Set<string>();
     const q = search.trim().toLowerCase();
-    for (const n of nodes) {
+    for (const n of displayNodes) {
       // Filter
       if (filter === 'changed' && !(n.status === 'changed' || n.cloud_deleted === 1)) continue;
       if (filter === 'error' && n.status !== 'error') continue;
@@ -358,7 +355,7 @@ export function NodeTreeView({
       }
     }
     return result;
-  }, [nodes, filter, search, tree, orphanPaths]);
+  }, [displayNodes, filter, search, tree, orphanPaths]);
 
   // 是否处于过滤态：搜索词非空，或选择了非「全部」过滤器。
   const isFiltering = search.trim() !== '' || filter !== 'all';
@@ -434,13 +431,14 @@ export function NodeTreeView({
     });
   };
   const handleDragStart = (e: React.DragEvent, node: MappingNode) => {
-    if (reorderBusy || multiMode) { e.preventDefault(); return; }
+    if (reorderBusy || multiMode || !node.wiki_node_token || displayHierarchy.inferred.has(node.obj_token)) { e.preventDefault(); return; }
     closeMenu(); clearDrag(); dragState.current.dragged = node; setDraggingToken(node.obj_token);
     e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', node.obj_token);
   };
   const resolveDrop = (e: React.DragEvent, node: MappingNode) => {
     const dragged = dragState.current.dragged;
     if (!dragged) return null;
+    if (!node.wiki_node_token || displayHierarchy.inferred.has(node.obj_token)) return null;
     const target = siblingDropTarget(dragged, node, tree.nodeByWikiToken);
     if (!target) return null;
     const rect = branchRefs.current.get(target.obj_token)?.getBoundingClientRect();
@@ -489,7 +487,7 @@ export function NodeTreeView({
     // a child's parent_node_token points to the parent's wiki_node_token
     // (NOT obj_token). For local-only nodes (wiki_node_token null), there
     // is no feishu-side parent linkage, so they can only be roots.
-    const childKey = node.wiki_node_token ?? null;
+    const childKey = displayNodeKey(node);
     const children = tree.childrenByParent.get(childKey) ?? [];
     // 过滤态下只递归可见子级；非过滤态与原逻辑一致（渲染全部子级）。
     const visibleChildren =
@@ -525,7 +523,7 @@ export function NodeTreeView({
           isDragging={draggingToken === node.obj_token}
           onDragEnd={clearDrag}
           onContextMenu={openNodeMenu}
-          reorderBusy={reorderBusy || multiMode}
+          reorderBusy={reorderBusy || multiMode || !node.wiki_node_token || displayHierarchy.inferred.has(node.obj_token)}
           selection={multiMode ? selectionFor(node.obj_token) : undefined}
         />
         {hasChildren && isExpanded && (
@@ -581,7 +579,7 @@ export function NodeTreeView({
       const queue = [...initial];
       for (let i = 0; i < queue.length; i++) {
         const node = queue[i]; if (output.has(node.obj_token) || (visibleTokens && !visibleTokens.has(node.obj_token))) continue;
-        output.add(node.obj_token); queue.push(...(tree.childrenByParent.get(node.wiki_node_token) ?? []));
+        output.add(node.obj_token); queue.push(...(tree.childrenByParent.get(displayNodeKey(node)) ?? []));
       }
     };
     if (groupedRoots) {
@@ -607,7 +605,7 @@ export function NodeTreeView({
       if (!isVisible(n)) return;
       out.push(n.obj_token);
       if (!expanded.has(n.obj_token)) return;
-      const childKey = n.wiki_node_token ?? null;
+      const childKey = displayNodeKey(n);
       const children = tree.childrenByParent.get(childKey) ?? [];
       for (const c of children) walk(c);
     };

@@ -458,6 +458,18 @@ export class IndexScanner {
       ...(localRelPath != null ? { localRelPath } : {}),
     });
 
+    // A Git checkout does not carry SQLite's synced_obj_edit_time. The
+    // exporter writes the exact acknowledged cloud version into the file
+    // header; restore it only for a newly indexed pending row. A date-only
+    // fetch_date is deliberately not a version and cannot establish a baseline.
+    const version = header.last_synced_modify_time;
+    if (version && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(version)) {
+      const seconds = Date.parse(version) / 1000;
+      if (Number.isSafeInteger(seconds) && seconds >= 946684800) {
+        this.localMapStore.restoreImportedBaseline?.(objToken, mdPath, seconds);
+      }
+    }
+
     console.info(`[IndexScanner] Indexed ${mdPath} (obj_token: ${objToken})`);
 
     return true;

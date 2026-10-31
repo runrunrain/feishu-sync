@@ -88,6 +88,14 @@ export interface RunOutcome {
   outcome: 'completed' | 'failed' | 'aborted';
   error?: { code: string; message: string };
   lastAssistantText?: string;
+  /** Terminal assistant message diagnostics; preview is locally redacted and bounded. */
+  lastStopReason?: string;
+  assistantTextChars?: number;
+  assistantPreview?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  reasoningTokens?: number;
+  providerThinkingLevel?: string;
 }
 
 interface PendingCommand {
@@ -127,6 +135,8 @@ export class PiRpcProcess extends EventEmitter {
     autoRetryCount: number;
     lastStopReason: string | null;
     lastAssistantText: string | null;
+    lastUsage: { input?: number; output?: number; reasoning?: number } | null;
+    lastProviderThinkingLevel: string | null;
     lastErrorText: string | null;
     settled: boolean;
     aborting: boolean;
@@ -369,11 +379,14 @@ export class PiRpcProcess extends EventEmitter {
     this.emit('event', event);
     const run = this.activeRun;
     if (event.type === 'message_end') {
-      const message = event.message as { role?: string; stopReason?: string; errorMessage?: unknown; content?: unknown } | undefined;
+      const message = event.message as { role?: string; stopReason?: string; errorMessage?: unknown; content?: unknown;
+        usage?: { input?: number; output?: number; reasoning?: number }; providerThinkingLevel?: string } | undefined;
       if (message && message.role === 'assistant') {
         if (run) {
           run.lastStopReason = message.stopReason ?? null;
           run.lastAssistantText = extractText(message.content);
+          run.lastUsage = message.usage ?? null;
+          run.lastProviderThinkingLevel = message.providerThinkingLevel ?? null;
           // Pi 将服务商错误放在 assistant.errorMessage，而非正文。每次
           // assistant 消息都更新，避免重试成功后沿用上一轮的错误。
           const errorText = typeof message.errorMessage === 'string' && message.errorMessage.trim()
@@ -432,6 +445,13 @@ export class PiRpcProcess extends EventEmitter {
         }
         if (run.lastStopReason === 'aborted') {
           this.finishActiveRun({ outcome: 'aborted' });
+          return;
+        }
+        if (run.lastStopReason === 'length') {
+          this.finishActiveRun({
+            outcome: 'failed',
+            error: { code: 'model_output_truncated', message: '模型输出达到长度上限，未完成当前任务' },
+          });
           return;
         }
         this.finishActiveRun({ outcome: 'completed' });
@@ -512,6 +532,8 @@ export class PiRpcProcess extends EventEmitter {
         autoRetryCount: 0,
         lastStopReason: null,
         lastAssistantText: null,
+        lastUsage: null,
+        lastProviderThinkingLevel: null,
         lastErrorText: null,
         settled: false,
         aborting: false,
@@ -579,6 +601,15 @@ export class PiRpcProcess extends EventEmitter {
       outcome: partial.outcome,
       ...(partial.error ? { error: partial.error } : {}),
       lastAssistantText: partial.lastAssistantText ?? run.lastAssistantText ?? undefined,
+      ...(run.lastStopReason ? { lastStopReason: run.lastStopReason } : {}),
+      assistantTextChars: (partial.lastAssistantText ?? run.lastAssistantText ?? '').length,
+      ...(Number.isFinite(run.lastUsage?.input) ? { inputTokens: run.lastUsage!.input } : {}),
+      ...(Number.isFinite(run.lastUsage?.output) ? { outputTokens: run.lastUsage!.output } : {}),
+      ...(Number.isFinite(run.lastUsage?.reasoning) ? { reasoningTokens: run.lastUsage!.reasoning } : {}),
+      ...(run.lastProviderThinkingLevel ? { providerThinkingLevel: run.lastProviderThinkingLevel } : {}),
+      ...((partial.lastAssistantText ?? run.lastAssistantText)?.trim()
+        ? { assistantPreview: this.safeErrorText(partial.lastAssistantText ?? run.lastAssistantText ?? '') }
+        : {}),
     };
     this.activeRun = null;
     run.resolve(outcome);

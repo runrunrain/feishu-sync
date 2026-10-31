@@ -100,7 +100,7 @@ export function KbBuildPanel({
   useEffect(() => {
     const el = logEndRef.current?.parentElement;
     if (el && el.scrollHeight - el.scrollTop - el.clientHeight < 160) {
-      logEndRef.current?.scrollIntoView({ block: 'end' });
+      el.scrollTop = el.scrollHeight;
     }
   }, [logs.length]);
 
@@ -137,7 +137,7 @@ export function KbBuildPanel({
 
   return (
     <section
-      className={`${layout === 'sidebar' ? 'flex-1 min-h-0' : 'shrink-0 h-[240px] min-h-[180px] border-t border-line'} bg-card-bg flex flex-col animate-fade-in`}
+      className={`${layout === 'sidebar' ? 'flex-1 min-h-0 overflow-y-auto scrollbar-thin' : 'shrink-0 h-[240px] min-h-[180px] border-t border-line'} bg-card-bg flex flex-col animate-fade-in`}
       aria-label="标准库构建进度"
       data-build-status={view.status}
     >
@@ -327,7 +327,7 @@ export function KbBuildPanel({
 
       {isTerminal && view.status !== 'published' ? <div className="shrink-0 px-4 py-3 border-b border-line/60 space-y-2" data-testid="kb-build-recovery">
         {view.recovery?.canResume ? <>
-          <p className="text-xs text-ink-soft">已保存 {view.recovery.draftCount} 篇草稿，完成 {view.recovery.completedBatches}/{view.recovery.totalBatches} 批。继续时复用已完成批次和图片描述。</p>
+          <p className="text-xs text-ink-soft">已保存 {view.recovery.draftCount} 篇草稿，完成 {view.recovery.completedBatches}/{view.recovery.totalBatches} 批。{view.recovery.draftCount === 0 && view.recovery.totalBatches > 0 && view.recovery.completedBatches >= view.recovery.totalBatches ? '历史批次没有草稿，继续时会重新执行批次并复用图片描述。' : '继续时复用已完成批次和图片描述。'}</p>
           <Button size="sm" variant="primary" onClick={onResume} loading={resuming} disabled={!onResume}>从断点继续</Button>
         </> : <>
           <p className="text-xs text-ink-soft">{view.recovery?.reason ?? '本次构建没有可用检查点，重新构建可复用已有图片缓存。'}</p>
@@ -336,7 +336,8 @@ export function KbBuildPanel({
       </div> : null}
 
       {/* 日志流 */}
-      <div className="flex-1 min-h-0 overflow-auto scrollbar-thin px-4 py-2 space-y-0.5">
+      <div className={`${layout === 'sidebar' ? 'shrink-0 max-h-[240px]' : 'flex-1 min-h-0'} overflow-auto scrollbar-thin px-4 py-3 space-y-1 border-t border-line/60`}>
+        <h4 className="text-xs font-kai font-medium text-ink mb-2">构建事件</h4>
         {logs.length === 0 ? (
           <p className="text-[11px] text-ink-faint">{isTerminal ? '暂无保存的构建日志。' : '等待构建事件…'}</p>
         ) : (
