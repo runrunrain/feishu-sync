@@ -116,6 +116,11 @@ export interface BuildSpec {
   maxInterfaceRetries: number;
   /** B 案 §7：'auto' 通过后自动整版发布；'confirm' 候选就绪后确认一次 */
   publishMode: BuildPublishMode;
+  /** S3 切片 C：审查提示词注入机械预检疑点段。additive 可选：仅显式
+   * 开启（reviewPolicy.mechanicalPrecheck === true）才写入本字段——
+   * stableStringify 过滤 undefined，缺省/关闭时 specHash 与旧版完全
+   * 一致，旧检查点可恢复。预检只做提示不做门禁。 */
+  mechanicalPrecheck?: boolean;
   /** diting N01：冻结的流水模式标记。新构建按 T7 启用门写入
    * （'orchestrated'=编排流水 / 'legacy'=旧路径）。additive 可选：缺省
    * 无字段 = T7 之前的旧检查点快照，恢复判定按旧门控语义

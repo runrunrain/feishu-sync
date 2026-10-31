@@ -192,6 +192,9 @@ export function buildSpecFromConfig(input: {
     maxAutoRevisions: clampInt(input.standardKb.reviewPolicy?.maxAutoRevisions, 2, 1, 5),
     maxInterfaceRetries: clampInt(input.standardKb.reviewPolicy?.maxInterfaceRetries, 2, 0, 5),
     publishMode,
+    // S3 切片 C：机械预检开关随 spec 冻结；仅显式 true 落键（false/缺省
+    // 都不落）→ 缺省关闭时 specHash 与旧版一致，旧检查点可恢复
+    ...(input.standardKb.reviewPolicy?.mechanicalPrecheck === true ? { mechanicalPrecheck: true } : {}),
     // diting N01：冻结流水模式（T7 启用门），恢复判定优先读标记
     pipelineMode: anyExplicit || publishMode === 'confirm' ? 'orchestrated' : 'legacy',
   };

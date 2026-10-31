@@ -60,6 +60,7 @@ const KB_BUILDS_COLUMNS_DDL = `
         warnings_json TEXT,
         roles_json TEXT,
         orchestration_json TEXT,
+        metrics_json TEXT,
         error_code TEXT,
         error_message TEXT,
         created_at TEXT NOT NULL,
@@ -151,6 +152,9 @@ export class LocalMapStore {
         // orchestration_json = 任务/审查计数摘要（修订轮/重试/待处理等）。
         ['roles_json', 'ALTER TABLE kb_builds ADD COLUMN roles_json TEXT'],
         ['orchestration_json', 'ALTER TABLE kb_builds ADD COLUMN orchestration_json TEXT'],
+        // S1（构建编排优化 §3）：构建度量缓存（units/phases/queueWaits/
+        // review/tokenUsage/reviewerSameModelAsWriter；纯诊断，采集失败为 null）
+        ['metrics_json', 'ALTER TABLE kb_builds ADD COLUMN metrics_json TEXT'],
       ];
       for (const [name, dml] of kbBuildAdditive) {
         if (!kbBuildColNames.has(name)) {
@@ -2803,6 +2807,8 @@ export class LocalMapStore {
     rolesJson: string | null;
     /** T2a（B 案 §8）：任务/审查计数摘要缓存（真相在 release 与检查点） */
     orchestrationJson: string | null;
+    /** S1（构建编排优化 §3）：构建度量 JSON 缓存（纯诊断；采集失败为 null） */
+    metricsJson: string | null;
   }>): void {
     const current = this.db.prepare('SELECT * FROM kb_builds WHERE id = ?').get(id) as Record<string, unknown> | undefined;
     if (!current) throw new Error(`kb_build 不存在: ${id}`);
@@ -2823,6 +2829,7 @@ export class LocalMapStore {
       warnings_json: patch.warningsJson !== undefined ? patch.warningsJson : current.warnings_json ?? null,
       roles_json: patch.rolesJson !== undefined ? patch.rolesJson : current.roles_json ?? null,
       orchestration_json: patch.orchestrationJson !== undefined ? patch.orchestrationJson : current.orchestration_json ?? null,
+      metrics_json: patch.metricsJson !== undefined ? patch.metricsJson : current.metrics_json ?? null,
       error_code: patch.errorCode !== undefined ? patch.errorCode : current.error_code,
       error_message: patch.errorMessage !== undefined ? patch.errorMessage : current.error_message,
       started_at: patch.startedAt !== undefined ? patch.startedAt : current.started_at,
@@ -2832,14 +2839,14 @@ export class LocalMapStore {
       UPDATE kb_builds SET status=?, release_id=?, source_total=?, source_added=?,
         source_changed=?, source_removed=?, docs_written=?, docs_deleted=?,
         no_changes=?, parallelism=?, unit_total=?, vision_model=?, warnings_json=?,
-        roles_json=?, orchestration_json=?,
+        roles_json=?, orchestration_json=?, metrics_json=?,
         error_code=?, error_message=?, started_at=?, finished_at=?, model=?
       WHERE id=?
     `).run(
       next.status, next.release_id, next.source_total, next.source_added,
       next.source_changed, next.source_removed, next.docs_written, next.docs_deleted,
       next.no_changes, next.parallelism, next.unit_total, next.vision_model, next.warnings_json,
-      next.roles_json, next.orchestration_json,
+      next.roles_json, next.orchestration_json, next.metrics_json,
       next.error_code, next.error_message, next.started_at, next.finished_at, next.model,
       id,
     );

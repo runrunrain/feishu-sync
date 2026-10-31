@@ -32,12 +32,21 @@ import { getKbQueryService } from './search/kb-query-service.js';
 import { KbVersionStore, captureSourceContents, sourceChangePreview, sourceContentResourceSpans, type SourceContents } from './kb-version-store.js';
 import { hasEditorialHistory, hasSourceMetadata } from './body-policy.js';
 import { planUnits, packBatches, type BuildUnit } from './build-units.js';
+import {
+  aggregateBuildMetrics,
+  computeRiskWarnings,
+  sameProviderModel,
+  METRICS_PHASES_CAP,
+  type BuildMetricsPhaseSpan,
+  type BuildMetricsUnitSize,
+} from './build-metrics.js';
 import { countText } from './text-stats.js';
+import { precheck as mechanicalPrecheckRun, formatFindingsForPrompt, type PrecheckDraftInput, type PrecheckFinding, type PrecheckTerm } from './mechanical-precheck.js';
 import { PathClaims } from './path-claims.js';
 import { collectWhiteboardTextsForEntries, enrichEntriesWithMedia, hashImageFile, resolveSourceImages, verifyEntryMediaHash, verifyEntryWhiteboardTextHash } from './source-images.js';
 import type { ImageDescription } from '../agent/vision/vision-describer.js';
 import { VisionDescriber } from '../agent/vision/vision-describer.js';
-import { buildDefaultAgentVisionConfig, resolveEvidenceBudgetBytes } from '../types/agent-knowledge.js';
+import { buildDefaultAgentVisionConfig, resolveEvidenceBudgetBytes, type KbBuildMetricsPrecheck } from '../types/agent-knowledge.js';
 import type { KbChangePreview, KbDocMerge, KbFileChange } from '../types/kb-version.js';
 import { sourceVersionWarning } from './search/query-metadata.js';
 import { selectKnowledgeSources } from './source-selection.js';
@@ -88,6 +97,8 @@ import {
   type AgentStatusDto,
   type KbBuildDto,
   type KbBuildImagesProgress,
+  type KbBuildMetrics,
+  type KbBuildMetricsPhaseRole,
   type KbBuildProgressDto,
   type KbBuildReportIssue,
   type KbBuildUnitsProgress,
@@ -145,6 +156,18 @@ interface WorkerRuntime {
   phase?: 'unit' | 'final' | 'plan' | 'review';
 }
 
+/** S1（构建可观测性）：构建期采集的原始度量记录（纯诊断；聚合后落
+ * kb_builds.metrics_json，采集失败不阻断构建）。 */
+interface BuildMetricsCollector {
+  units: BuildMetricsUnitSize[];
+  phases: BuildMetricsPhaseSpan[];
+  /** 采集端达到 METRICS_PHASES_CAP 后被丢弃的阶段条数（Minor-2 如实暴露） */
+  phasesDropped: number;
+  review: { blocking: number; suggestion: number };
+  /** S3 切片 C：机械预检发现计数（每审查主体一条；开关关闭时空数组） */
+  precheck: KbBuildMetricsPrecheck[];
+}
+
 interface InMemoryBuild {
   id: string;
   /** 基座在创建构建时固定，设置变更只影响之后的新构建。 */
@@ -180,6 +203,8 @@ interface InMemoryBuild {
   workerCount: number;
   wordBudget: number;
   checkpointReady: boolean;
+  /** S1：构建度量采集（失败降级 null，不影响构建语义） */
+  metrics: BuildMetricsCollector;
 }
 
 export class KbBuildService extends EventEmitter {
@@ -199,7 +224,8 @@ export class KbBuildService extends EventEmitter {
       batchIndex: 0, batchTotal: 0, buildState: null, cancelRequested: false, cancelController: null, timedOut: false,
       workers: new Map(), stage: null, units: { total: 0, done: 0, running: 0, failed: 0, retried: 0 },
       images: { total: 0, described: 0, cached: 0, unavailable: 0 }, process: null, events: [], nextSeq: 1,
-      baseReleaseId: null, singleBatches: [], singleCompleted: 0, unitProgress: new Map(), workerCount: 1, wordBudget: 0, checkpointReady: false };
+      baseReleaseId: null, singleBatches: [], singleCompleted: 0, unitProgress: new Map(), workerCount: 1, wordBudget: 0, checkpointReady: false,
+      metrics: { units: [], phases: [], phasesDropped: 0, review: { blocking: 0, suggestion: 0 }, precheck: [] } };
   }
 
   private persistCheckpoint(buildId: string): void {
@@ -355,6 +381,67 @@ export class KbBuildService extends EventEmitter {
     }
   }
 
+  /** S1：解析 metrics_json（无列/空/损坏 → null，不抛错）。 */
+  private static parseMetrics(value: unknown): KbBuildMetrics | null {
+    if (typeof value !== 'string' || !value) return null;
+    try {
+      const parsed = JSON.parse(value) as KbBuildMetrics;
+      return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** S1：记录一轮模型执行的起止（现有 emit 挂点旁的采集；失败静默，
+   * 不阻断构建）。只计模型执行段——排队等待由 queueWaits 单独统计。 */
+  private recordMetricsPhase(buildId: string, startedAt: string, role: KbBuildMetricsPhaseRole, unitId: string | null, round: number): void {
+    try {
+      const entry = this.active.get(buildId);
+      if (!entry?.metrics) return;
+      if (entry.metrics.phases.length >= METRICS_PHASES_CAP) {
+        entry.metrics.phasesDropped += 1; // 达到上限的丢弃如实计数（Minor-2）
+        return;
+      }
+      const finishedAt = new Date().toISOString();
+      entry.metrics.phases.push({ unitId, role, round, startedAt, finishedAt });
+    } catch {
+      /* 度量采集失败不阻断构建 */
+    }
+  }
+
+  /** S1：编排任务 → 度量阶段角色（write r0 首写 / r≥1 定向修订；
+   * integrate r≥1 同为 revise；final_review → final）。 */
+  private static metricsPhaseOfTask(task: BuildTask): KbBuildMetricsPhaseRole {
+    const ref = parseOrchestrationTaskId(task.taskId);
+    const round = ref?.round ?? 0;
+    if (task.role === 'plan') return 'plan';
+    if (task.role === 'review') return 'review';
+    if (task.role === 'final_review') return 'final';
+    if (task.role === 'integrate') return round > 0 ? 'revise' : 'integrate';
+    return round > 0 ? 'revise' : 'write';
+  }
+
+  /** S1：聚合本次构建度量（任何失败 → null，禁止半成品/编造数值）。 */
+  private collectBuildMetrics(entry: InMemoryBuild): KbBuildMetrics | null {
+    try {
+      const summary = entry.orchestration?.summary();
+      let revisions = 0;
+      for (const count of Object.values(summary?.autoRevisionUsage ?? {})) revisions += Number(count) || 0;
+      const resolved = entry.orchestration?.spec.resolvedRoles;
+      return aggregateBuildMetrics({
+        units: entry.metrics.units,
+        phaseSpans: entry.metrics.phases,
+        phasesDropped: entry.metrics.phasesDropped,
+        queueWaits: this.deps.pool.buildAcquireWaitStats(),
+        review: { ...entry.metrics.review, revisions },
+        reviewerSameModelAsWriter: resolved ? sameProviderModel(resolved.writer, resolved.reviewer) : null,
+        precheck: entry.metrics.precheck,
+      });
+    } catch {
+      return null;
+    }
+  }
+
   toDto(row: Record<string, unknown>, entry?: InMemoryBuild): KbBuildDto {
     entry ??= this.active.get(String(row.id));
     const recoverable = ['interrupted', 'failed', 'cancelled'].includes(String(row.status));
@@ -362,6 +449,7 @@ export class KbBuildService extends EventEmitter {
     const config = this.deps.configProvider();
     const stale = checkpoint && ((new StandardKbStore(this.outputRoot()).readCurrent()?.releaseId ?? null) !== checkpoint.baseReleaseId
       || path.resolve(config?.knowledgeBaseRoot ?? '') !== path.resolve(checkpoint.knowledgeBaseRoot));
+    const metrics = KbBuildService.parseMetrics(row.metrics_json);
     return {
       id: String(row.id),
       ...(entry ? { eventSeq: entry.nextSeq - 1 } : {}),
@@ -386,6 +474,7 @@ export class KbBuildService extends EventEmitter {
         completedBatches: checkpoint?.completedBatches ?? 0, totalBatches: checkpoint?.totalBatches ?? 0 } } : {}),
       parallelism: Number(row.parallelism ?? 1),
       warnings: KbBuildService.parseWarnings(row.warnings_json),
+      ...(metrics ? { metrics } : {}),
       error: row.error_code
         ? { code: String(row.error_code), message: String(row.error_message ?? '') }
         : null,
@@ -1033,6 +1122,9 @@ export class KbBuildService extends EventEmitter {
       // 构建上限就是多少路。
       const buildConcurrency = resolveBuildConcurrency(config.standardKb);
       this.deps.pool.configure({ buildConcurrency });
+      // S1（构建可观测性）：build 通道等待统计按本次构建重置（构建串行，
+      // 池为共享单例；诊断计数，失败忽略）
+      try { this.deps.pool.resetBuildAcquireWaitStats(); } catch { /* 诊断计数 */ }
       const workerCount = Math.max(1, Math.min(resume?.workerCount ?? buildConcurrency, units.length || 1));
       entry.workerCount = workerCount;
       localMapStore.updateKbBuild(buildId, { parallelism: workerCount, unitTotal: units.length });
@@ -1048,6 +1140,36 @@ export class KbBuildService extends EventEmitter {
       // 再走单进程/旧并行路径；旧式构建（无 orchestration/审查者未配置）
       // 路径与行为不变（B 案 §8「正在运行的旧构建保持旧流程」）。
       const orchestrated = reviewPipelineActive(entry.orchestration?.spec) && units.length > 0;
+      // S1/S2（构建编排优化 §3）：单元规模采集 + 风险告警——纯采集不改
+      // 构建语义；任何失败只降级（不告警/不落 metrics），不阻断构建。
+      try {
+        const singleProcessPath = !orchestrated && workerCount <= 1 && !resume?.units.length;
+        const unitStats = units.map((unit) => ({
+          unitId: unit.id,
+          sources: unit.sources.length,
+          words: unit.sources.reduce((sum, token) => sum + (worksetMeta.get(token)?.words ?? 0), 0),
+          bytes: unit.sources.reduce((sum, token) => sum + (worksetMeta.get(token)?.bytes ?? 0), 0),
+        }));
+        // 单进程回退路径没有单元调度语义，不落单元规模（phases 也无单元归
+        // 属）；告警计算仍用同一份 unitStats（workerCount=1 时 oversized 不
+        // 可能触发，其余两类与单元无关）。
+        if (!singleProcessPath) entry.metrics.units = unitStats;
+        const resolvedRoles = entry.orchestration?.spec.resolvedRoles;
+        const riskWarnings = computeRiskWarnings({
+          units: unitStats,
+          workerCount,
+          orchestrated,
+          reviewerSameModelAsWriter: resolvedRoles ? sameProviderModel(resolvedRoles.writer, resolvedRoles.reviewer) : null,
+          totalCapacity: this.deps.pool.totalCapacity,
+        });
+        if (riskWarnings.length > 0) {
+          buildWarnings.push(...riskWarnings);
+          localMapStore.updateKbBuild(buildId, { warningsJson: JSON.stringify(buildWarnings) });
+          for (const warning of riskWarnings) this.emitLog(buildId, 'warn', warning.message);
+        }
+      } catch {
+        /* 风险告警采集失败不阻断构建 */
+      }
       if (orchestrated) {
         // ---- 编排流水路径（与并行路径同一单元/认领状态初始化）----
         buildState.units = units;
@@ -1348,6 +1470,14 @@ export class KbBuildService extends EventEmitter {
         } catch {
           /* 摘要列写入失败不影响构建终态（诊断缓存而已） */
         }
+      }
+      // S1（构建可观测性）：finish 时落 metrics_json——聚合失败降级 null，
+      // 绝不阻断构建终态落地。
+      try {
+        const metrics = this.collectBuildMetrics(entry);
+        localMapStore.updateKbBuild(buildId, { metricsJson: metrics ? JSON.stringify(metrics) : null });
+      } catch {
+        /* 度量列写入失败不影响构建终态（诊断缓存而已） */
       }
       this.running = false;
       void currentStatus;
@@ -1858,10 +1988,16 @@ export class KbBuildService extends EventEmitter {
         }
         const continuation = '每个批次使用独立模型上下文。先用 draft_list/draft_read 检查已保存草稿，再补齐本批内容。不要覆盖无关内容。\n\n'
           + (entry.resume ? '这是中断后的断点继续，已完成批次不会重复执行；本批已成功写入的完整草稿已恢复，请保留并继续完善。\n\n' : '');
-        const outcome = await rpc.prompt(
-          continuation + (systemRules ? `${batchPrompt}\n\n---\n构建规则与文风规范（每批适用）：\n${systemRules}` : batchPrompt),
-          { timeoutMs: config.standardKb.promptTimeoutMinutes * 60_000 },
-        );
+        const phaseStart = new Date().toISOString();
+        let outcome: Awaited<ReturnType<typeof rpc.prompt>>;
+        try {
+          outcome = await rpc.prompt(
+            continuation + (systemRules ? `${batchPrompt}\n\n---\n构建规则与文风规范（每批适用）：\n${systemRules}` : batchPrompt),
+            { timeoutMs: config.standardKb.promptTimeoutMinutes * 60_000 },
+          );
+        } finally {
+          this.recordMetricsPhase(input.buildId, phaseStart, 'write', null, batchIndex + 1);
+        }
         if (entry.cancelRequested && outcome.outcome !== 'completed') throw new CancelledError();
         if (outcome.outcome === 'aborted') throw new CancelledError();
         if (outcome.outcome === 'failed') {
@@ -1896,9 +2032,17 @@ export class KbBuildService extends EventEmitter {
         '- skipped：工作集中未被任何文档引用的源，逐个列出 objToken 与理由。',
         '注意：必须调用工具本身（tool call），不要只回复文本说明。若你尚未写入任何文档，先用 kb_write_doc 写入，再调用 kb_finish。',
       ].join('\n');
-      let finishOutcome = await rpc.prompt(finishPrompt, {
-        timeoutMs: config.standardKb.promptTimeoutMinutes * 60_000,
-      });
+      let finishOutcome: Awaited<ReturnType<typeof rpc.prompt>>;
+      {
+        const phaseStart = new Date().toISOString();
+        try {
+          finishOutcome = await rpc.prompt(finishPrompt, {
+            timeoutMs: config.standardKb.promptTimeoutMinutes * 60_000,
+          });
+        } finally {
+          this.recordMetricsPhase(input.buildId, phaseStart, 'final', null, 0);
+        }
+      }
       if (finishOutcome.outcome === 'aborted') throw new CancelledError();
       if (finishOutcome.outcome === 'failed') {
         throw new ToolError(
@@ -2489,10 +2633,16 @@ export class KbBuildService extends EventEmitter {
               claimedDocs: buildState.claims?.ownedBy(unit.id) ?? [],
             });
             const continuation = entry.resume ? '这是断点继续：已完成单元/批次不重复执行。请用 draft_list/draft_read 检查本单元已恢复的完整草稿，保留结果并补齐未完成内容。\n\n' : '';
-            const outcome = await worker.rpc!.prompt(
-              continuation + (input.systemRules ? `${batchPrompt}\n\n---\n构建规则与文风规范（每批适用）：\n${input.systemRules}` : batchPrompt),
-              { timeoutMs: input.promptTimeoutMs },
-            );
+            const phaseStart = new Date().toISOString();
+            let outcome: Awaited<ReturnType<NonNullable<typeof worker.rpc>['prompt']>>;
+            try {
+              outcome = await worker.rpc!.prompt(
+                continuation + (input.systemRules ? `${batchPrompt}\n\n---\n构建规则与文风规范（每批适用）：\n${input.systemRules}` : batchPrompt),
+                { timeoutMs: input.promptTimeoutMs },
+              );
+            } finally {
+              this.recordMetricsPhase(input.buildId, phaseStart, 'write', unit.id, index + 1);
+            }
             if (entry.cancelRequested && outcome.outcome !== 'completed') throw new CancelledError();
             if (outcome.outcome === 'aborted') throw new CancelledError();
             if (outcome.outcome === 'failed') {
@@ -2712,10 +2862,18 @@ export class KbBuildService extends EventEmitter {
       '注意：必须调用工具本身（tool call），不要只回复文本说明。',
     ].join('\n');
     const rpc = worker.rpc!;
-    let outcome = await rpc.prompt(
-      input.systemRules ? `${finishPrompt}\n\n---\n构建规则与文风规范（每批适用）：\n${input.systemRules}` : finishPrompt,
-      { timeoutMs: input.promptTimeoutMs },
-    );
+    let outcome: Awaited<ReturnType<NonNullable<typeof worker.rpc>['prompt']>>;
+    {
+      const phaseStart = new Date().toISOString();
+      try {
+        outcome = await rpc.prompt(
+          input.systemRules ? `${finishPrompt}\n\n---\n构建规则与文风规范（每批适用）：\n${input.systemRules}` : finishPrompt,
+          { timeoutMs: input.promptTimeoutMs },
+        );
+      } finally {
+        this.recordMetricsPhase(input.buildId, phaseStart, 'final', null, 0);
+      }
+    }
     if (outcome.outcome === 'aborted') throw new CancelledError();
     if (outcome.outcome === 'failed') {
       throw new ToolError(outcome.error?.code ?? 'model_request_failed', `kb_finish 阶段失败：${outcome.error?.message ?? '未知错误'}`, 502);
@@ -3147,7 +3305,9 @@ export class KbBuildService extends EventEmitter {
     entry.stage = 'reviewing';
     const scopePaths = this.unitScopePaths(buildState, unit);
     const prompt = this.buildUnitReviewPrompt(unit, scopePaths, buildState, attempt);
-    const outcome = await worker.rpc!.prompt(`${this.reviewRulesText()}\n\n---\n${prompt}`, { timeoutMs: input.promptTimeoutMs });
+    // S3 切片 C：机械预检疑点段（开关关闭 → null，提示词字节级不变）
+    const precheckSuffix = this.mechanicalPrecheckSection(input, { kind: 'unit', unit, scopePaths });
+    const outcome = await worker.rpc!.prompt(`${this.reviewRulesText()}\n\n---\n${prompt}${precheckSuffix ? `\n\n---\n${precheckSuffix}` : ''}`, { timeoutMs: input.promptTimeoutMs });
     if (entry.cancelRequested && outcome.outcome !== 'completed') throw new CancelledError();
     if (outcome.outcome === 'aborted') throw new CancelledError();
     if (outcome.outcome === 'failed') {
@@ -3271,7 +3431,9 @@ export class KbBuildService extends EventEmitter {
     const { entry, buildState, task } = input;
     entry.stage = 'reviewing';
     const prompt = this.buildFinalReviewPrompt(input.units, attempt);
-    const outcome = await worker.rpc!.prompt(`${this.reviewRulesText()}\n\n---\n${prompt}`, { timeoutMs: input.promptTimeoutMs });
+    // S3 切片 C：机械预检疑点段（开关关闭 → null，提示词字节级不变）
+    const precheckSuffix = this.mechanicalPrecheckSection(input, { kind: 'integration' });
+    const outcome = await worker.rpc!.prompt(`${this.reviewRulesText()}\n\n---\n${prompt}${precheckSuffix ? `\n\n---\n${precheckSuffix}` : ''}`, { timeoutMs: input.promptTimeoutMs });
     if (entry.cancelRequested && outcome.outcome !== 'completed') throw new CancelledError();
     if (outcome.outcome === 'aborted') throw new CancelledError();
     if (outcome.outcome === 'failed') {
@@ -3309,6 +3471,16 @@ export class KbBuildService extends EventEmitter {
     orchestration.submitResult({ taskId: reviewTask.taskId, revision: reviewTask.revision, artifactState: 'available', resultRef: `review:${report.reportId}` });
     this.archiveReviewReport(stagingRoot, meta.reportUnitId, reviewTask.taskId.replace(/[^A-Za-z0-9_-]/g, '_'));
     const openBlocking = report.issues.filter((issue) => issue.severity === 'blocking' && !isIssueClosed(issue));
+    // S1：审查问题数汇总（终态 blocking/suggestion 口径；失败不影响流水）
+    try {
+      const collector = this.active.get(input.buildId)?.metrics;
+      if (collector) {
+        collector.review.blocking += report.issues.filter((issue) => issue.severity === 'blocking').length;
+        collector.review.suggestion += report.issues.filter((issue) => issue.severity === 'suggestion').length;
+      }
+    } catch {
+      /* 度量采集失败不阻断构建 */
+    }
     // 被审对象任务（review 任务的首个依赖）：write 或 integrate
     const targetTaskId = reviewTask.dependencies[0]?.taskId;
     const target = targetTaskId ? orchestration.task(targetTaskId) : null;
@@ -3425,6 +3597,123 @@ export class KbBuildService extends EventEmitter {
     return reports;
   }
 
+  // ------------------------------------------------------------------
+  // S3 切片 C（机械预检接入）：仅 spec 冻结开启时在审查提示词末尾追加
+  // 疑点段；关闭/失败一律返回 null（提示词字节级不变）。预检只做提示
+  // 不做门禁：不改变 reviewSubjectDraftHash 绑定、验证门禁与 blocking
+  // 判定语义；源变更毒化信号与 raw_read（assembleBuildRead）同语义保留。
+  // ------------------------------------------------------------------
+
+  /** 机械预检疑点段（开关关闭返回 null；草稿枚举与 reviewSubjectHash
+   * 同一staging 口径，路径由枚举产生不逃逸）。 */
+  private mechanicalPrecheckSection(
+    input: OrchestratedPhaseInput & { task: BuildTask },
+    scope: { kind: 'unit'; unit: BuildUnit; scopePaths: string[] } | { kind: 'integration' },
+  ): string | null {
+    const { entry, buildState } = input;
+    const orchestration = entry.orchestration;
+    if (!orchestration || orchestration.spec.mechanicalPrecheck !== true) return null;
+    try {
+      const stagingRoot = buildState.stagingRoot;
+      // 草稿：单元审查 = 认领路径集合；最终复核 = staging 全部（均从
+      // staging 实际文件枚举，与 reviewSubjectHash 同口径；上限同既有
+      // 审查提示词的 300 篇）
+      const stagingEntries = KbBuildService.stagingDocsEntriesOf(stagingRoot);
+      const draftPaths = scope.kind === 'unit'
+        ? stagingEntries.map((e) => e.path).filter((p) => scope.scopePaths.includes(p)).slice(0, 300)
+        : stagingEntries.map((e) => e.path).slice(0, 300);
+      const drafts: PrecheckDraftInput[] = [];
+      for (const docPath of draftPaths) {
+        drafts.push({
+          path: docPath,
+          text: fs.readFileSync(path.join(stagingRoot, 'docs', docPath), 'utf-8'),
+          sources: buildState.docMeta?.get(docPath)?.sources ?? [],
+        });
+      }
+      // 源文本：冻结快照 + readVerified（哈希校验）。单元审查 = 单元源；
+      // 最终复核 = 草稿声明源并集（与草稿引用关系一致，不做全库且乘积）
+      const sourceTokens = scope.kind === 'unit'
+        ? scope.unit.sources
+        : [...new Set(drafts.flatMap((draft) => draft.sources))];
+      const sources = new Map<string, string>();
+      let unreadable = 0;
+      for (const token of sourceTokens) {
+        try {
+          sources.set(token, buildState.snapshot.readVerified(buildState.knowledgeBaseRoot, token).content);
+        } catch (error) {
+          // 源变更毒化信号不吞（与 assembleBuildRead 同语义：poisoned 置位
+          // 后由审查路径既有 throwIfPoisoned 拦截）；其它读失败只跳过该源
+          if (error instanceof PathGuardError && error.code === 'source_changed_during_build') {
+            buildState.poisoned = { code: error.code, message: error.message };
+          }
+          unreadable += 1;
+        }
+      }
+      if (unreadable > 0) {
+        this.emitLog(input.buildId, 'warn', `机械预检：${unreadable} 个源文本不可得已跳过（预检只做提示，不影响审查与门禁）`);
+      }
+      if (drafts.length === 0 || sources.size === 0) {
+        this.emitLog(input.buildId, 'warn', '机械预检：草稿或源文本均不可得，跳过疑点注入（不影响审查）');
+        return null;
+      }
+      // terms：知识对象 aliases（staging/knowledge-draft.json；可选增强，
+      // 无声明/解析失败 → 不传，预检照常跑数值与条件词比对）
+      let terms: PrecheckTerm[] | undefined;
+      try {
+        const draftFile = path.join(stagingRoot, 'knowledge-draft.json');
+        if (fs.existsSync(draftFile)) {
+          const parsed = JSON.parse(fs.readFileSync(draftFile, 'utf-8')) as KnowledgeDraftFile;
+          const objects = Array.isArray(parsed.objects) ? parsed.objects : [];
+          terms = objects
+            .filter((obj) => obj && !obj.tombstone && typeof obj.title === 'string')
+            .map((obj) => ({
+              canonical: obj.title,
+              aliases: Array.isArray(obj.aliases) ? obj.aliases.filter((alias): alias is string => typeof alias === 'string') : [],
+            }));
+        }
+      } catch {
+        terms = undefined;
+      }
+      const result = mechanicalPrecheckRun({ sources, drafts, ...(terms ? { terms } : {}) });
+      this.recordPrecheckMetrics(input.buildId, scope.kind === 'unit' ? scope.unit.id : null, scope.kind, result);
+      // F01：计算预算/输入上限超限 → 预检降级，疑点清单可能不完整；
+      // emitLog 警告 + 提示词内如实标注（仍只做提示，不影响审查与门禁）
+      if (result.degraded) {
+        this.emitLog(input.buildId, 'warn', `机械预检：${result.skippedReason ?? '计算预算超限'}（预检只做提示，不影响审查）`);
+      }
+      return [
+        '机械预检疑点（仅供参考，逐条判定，不构成结论）：',
+        formatFindingsForPrompt(
+          result.findings,
+          40,
+          result.degraded ? { skippedReason: result.skippedReason } : undefined,
+        ),
+        ...(result.truncated > 0 ? [`（另有 ${result.truncated} 条疑点超出上限未列出）`] : []),
+      ].join('\n');
+    } catch (error) {
+      this.emitLog(input.buildId, 'warn', `机械预检失败，已跳过疑点注入（不影响审查）：${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    }
+  }
+
+  /** S3 切片 C：预检发现计数入 metrics（每审查主体一条；采集失败不阻断）。 */
+  private recordPrecheckMetrics(
+    buildId: string,
+    unitId: string | null,
+    scopeKind: 'unit' | 'integration',
+    result: { findings: PrecheckFinding[]; truncated: number },
+  ): void {
+    try {
+      const collector = this.active.get(buildId)?.metrics;
+      if (!collector) return;
+      const findingsByKind = { number_missing: 0, number_added: 0, condition_dropped: 0, term_variant: 0 };
+      for (const finding of result.findings) findingsByKind[finding.kind] += 1;
+      collector.precheck.push({ unitId, scope: scopeKind, findingsByKind, truncated: result.truncated });
+    } catch {
+      /* 度量采集失败不阻断构建 */
+    }
+  }
+
   /** 单元审查提示词（运行时注入单元范围；规则主体来自 standard-kb-review.md）。 */
   private buildUnitReviewPrompt(unit: BuildUnit, scopePaths: string[], buildState: BuildRunState, attempt: number): string {
     const lines: string[] = [];
@@ -3518,7 +3807,13 @@ export class KbBuildService extends EventEmitter {
       for (;;) {
         try {
           worker = await this.spawnOrchestratedWorker(input);
-          await this.runOrchestratedTaskOnWorker(input, worker);
+          const phaseStart = new Date().toISOString();
+          try {
+            await this.runOrchestratedTaskOnWorker(input, worker);
+          } finally {
+            // S1：一轮编排任务的模型执行段（排队等待在 queueWaits 另计）
+            this.recordMetricsPhase(input.buildId, phaseStart, KbBuildService.metricsPhaseOfTask(task), task.unitId, parseOrchestrationTaskId(task.taskId)?.round ?? 0);
+          }
           return;
         } catch (error) {
           if (error instanceof CancelledError || !KbBuildService.isInterfaceRetryable(error)) throw error;

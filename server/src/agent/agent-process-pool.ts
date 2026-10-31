@@ -75,6 +75,9 @@ interface QueueWaiter {
   signal?: AbortSignal;
   onAbort?: () => void;
   settled: boolean;
+  /** S1（构建可观测性）：入队时刻——build 通道等待毫秒采样用；
+   * 立即授予的 acquire 不入队，不产生样本。 */
+  enqueuedAt?: number;
 }
 
 function createAbortError(): Error {
@@ -133,6 +136,9 @@ export class AgentProcessPool {
   private maxProcesses: number;
   /** 构建容量 N（B 案 §6；缺省 2 = resolveBuildConcurrency 的缺省回落） */
   private buildCapacityValue: number;
+  /** S1（构建可观测性）：build 通道排队等待毫秒聚合（入队→授予的差；
+   * 纯诊断计数，不参与准入判定）。 */
+  private buildWaitStats = { count: 0, totalMs: 0, maxMs: 0 };
 
   constructor(options: { maxConcurrentProcesses?: number; idleTimeoutMinutes?: number; buildConcurrency?: number } = {}) {
     this.maxProcesses = this.clampMax(options.maxConcurrentProcesses ?? 3);
@@ -208,6 +214,7 @@ export class AgentProcessPool {
     }
     return await new Promise<PoolSlot>((resolve, reject) => {
       const waiter: QueueWaiter = { resolve, reject, settled: false };
+      if (channel === 'build') waiter.enqueuedAt = Date.now();
       const onAbort = () => {
         if (waiter.settled) return;
         waiter.settled = true;
@@ -231,6 +238,17 @@ export class AgentProcessPool {
   /** B 案 §6：构建通道排队等待数。 */
   buildQueueDepth(): number {
     return this.buildWaiters.length;
+  }
+
+  /** S1（构建可观测性）：build 通道排队等待统计（入队→授予的毫秒差聚合；
+   * 立即授予不计入）。只读快照，不改准入语义。 */
+  buildAcquireWaitStats(): { count: number; totalMs: number; maxMs: number } {
+    return { ...this.buildWaitStats };
+  }
+
+  /** S1：按构建周期重置等待统计（构建串行执行，池为共享单例；诊断专用）。 */
+  resetBuildAcquireWaitStats(): void {
+    this.buildWaitStats = { count: 0, totalMs: 0, maxMs: 0 };
   }
 
   /** 后台类并发上限：M≥2 → M−1（为交互会话保留 1 槽）；M=1 → 1（前后台互斥）。 */
@@ -277,6 +295,12 @@ export class AgentProcessPool {
   }
 
   private promote(waiter: QueueWaiter, channel: PoolChannel): void {
+    if (channel === 'build' && waiter.enqueuedAt !== undefined) {
+      const waited = Math.max(0, Date.now() - waiter.enqueuedAt);
+      this.buildWaitStats.count += 1;
+      this.buildWaitStats.totalMs += waited;
+      this.buildWaitStats.maxMs = Math.max(this.buildWaitStats.maxMs, waited);
+    }
     waiter.settled = true;
     if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener('abort', waiter.onAbort);
     waiter.resolve(this.createReservation(channel));

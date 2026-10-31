@@ -145,6 +145,11 @@ export interface KbReviewPolicyConfig {
   maxAutoRevisions?: number;
   /** 模型接口失败重试次数，0..5，默认 2（B案 §5）；与内容修订分开计数。 */
   maxInterfaceRetries?: number;
+  /** S3 切片 C：审查提示词注入机械预检疑点段（kb/mechanical-precheck）。
+   * additive 可选：缺省/旧配置无此键 = 关闭（提示词字节级不变）；仅
+   * 显式 true 开启。值随 BuildSpec 冻结（=== true 才落 spec 键 → 缺省
+   * 关闭时 specHash 不变，旧检查点可恢复）。预检结果只做提示不做门禁。 */
+  mechanicalPrecheck?: boolean;
 }
 
 /** D3（A 案 §5.4）：单 release 证据资源总量缺省预算（20MB）。 */
@@ -441,6 +446,8 @@ export interface KbBuildDto {
   parallelism: number;
   /** S4：构建警告（如 images_unavailable），随构建历史持久化 */
   warnings: KbBuildWarning[];
+  /** S1（构建编排优化 §3）：构建度量（可选——旧记录无此列时缺省） */
+  metrics?: KbBuildMetrics | null;
   error: null | { code: string; message: string };
   createdAt: string;
   startedAt: string | null;
@@ -564,6 +571,75 @@ export interface KbBuildWarning {
   code: string;
   count: number;
   message: string;
+}
+
+// ============================================================================
+// 构建度量（构建编排优化方案 S1/S2：kb_builds.metrics_json 的对象形状）
+// ============================================================================
+
+/** 阶段角色（S1 §阶段耗时）：write 首写 / review 独立审查 / revise 定向
+ * 修订（含整合修订）/ integrate 整合 / final 最终复核与收尾轮 /
+ * plan 组织规划轮（D5，仅 plannerEnabled 时出现）。 */
+export type KbBuildMetricsPhaseRole = 'write' | 'review' | 'revise' | 'integrate' | 'final' | 'plan';
+
+/** 单元规模条目（words 仅在 buildBatchWordBudget>0 时统计，否则为 0）。 */
+export interface KbBuildMetricsUnit {
+  unitId: string;
+  sources: number;
+  words: number;
+  bytes: number;
+}
+
+/** 一轮模型执行的起止与时长（来源为构建期 emit 挂点采集）。 */
+export interface KbBuildMetricsPhase {
+  unitId: string | null;
+  role: KbBuildMetricsPhaseRole;
+  round: number;
+  startedAt: string;
+  finishedAt: string;
+  ms: number;
+}
+
+/** token 用量累计；运行时事件不携带用量时为 null（如实标注未采集，
+ * 不编造）。 */
+export interface KbBuildTokenUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+}
+
+/** S3 切片 C：单次机械预检的发现计数（每审查主体一条；kind 计数与
+ * truncated 分开记录）。unitId=null 表示最终复核（整版范围）。 */
+export interface KbBuildMetricsPrecheck {
+  unitId: string | null;
+  scope: 'unit' | 'integration';
+  /** 按 finding kind 计数（截断后实际报告的条数；与 truncated 相加=total） */
+  findingsByKind: { number_missing: number; number_added: number; condition_dropped: number; term_variant: number };
+  /** 超出 maxFindings 被截断的条数 */
+  truncated: number;
+}
+
+/** S1 构建度量对象（纯诊断，随 kb_builds.metrics_json 持久化）。 */
+export interface KbBuildMetrics {
+  /** 单元规模分布与最大单元 words 占比（maxWordsShare；words 全 0 时 null） */
+  units: { total: number; perUnit: KbBuildMetricsUnit[]; maxWordsShare: number | null };
+  /** 各轮次起止与时长（仅模型执行段；排队等待另计 queueWaits） */
+  phases: KbBuildMetricsPhase[];
+  /** 超过采集/聚合上限被丢弃的阶段条数（additive 可选：未截断的旧
+   * metrics_json 不带此字段，与「没发生」可区分） */
+  phasesDropped?: number;
+  /** build 通道 acquire 排队等待（入队→授予的毫秒差；立即授予不计入） */
+  queueWaits: { count: number; totalMs: number; maxMs: number };
+  /** 审查汇总：blocking/suggestion 问题数（orchestrated）与自动修订轮数 */
+  review: { blocking: number; suggestion: number; revisions: number };
+  /** null = 本次构建无用量来源（禁止编造数值） */
+  tokenUsage: KbBuildTokenUsage | null;
+  /** writer/reviewer 解析后 provider+model 是否一致；无法判定（无冻结
+   * resolvedRoles，如 legacy/claude-code）为 null */
+  reviewerSameModelAsWriter: boolean | null;
+  /** S3 切片 C：机械预检发现计数（每审查主体一条）。additive 可选：
+   * 开关关闭（无采集）的旧 metrics_json 不带此字段。 */
+  precheck?: KbBuildMetricsPrecheck[];
 }
 
 // ============================================================================

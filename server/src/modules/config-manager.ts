@@ -464,7 +464,9 @@ function normalizeBuildRolesLoose(value: unknown, base: KbBuildRolesConfig | und
 }
 
 /** B案 §5：审查闭环预算宽容归一（maxAutoRevisions 1..5、
- * maxInterfaceRetries 0..5；非数字回落默认 2/2）。 */
+ * maxInterfaceRetries 0..5；非数字回落默认 2/2）。S3 切片 C：
+ * mechanicalPrecheck 布尔透传，非布尔/缺省不落键（旧配置归一结果与
+ * 旧版完全一致，等价关闭）。 */
 function normalizeReviewPolicyLoose(value: unknown, base: KbReviewPolicyConfig | undefined): KbReviewPolicyConfig {
   const fallback: KbReviewPolicyConfig = base ?? { maxAutoRevisions: 2, maxInterfaceRetries: 2 };
   if (!value || typeof value !== 'object') return fallback;
@@ -473,9 +475,13 @@ function normalizeReviewPolicyLoose(value: unknown, base: KbReviewPolicyConfig |
     typeof candidate === 'number' && Number.isFinite(candidate)
       ? Math.max(min, Math.min(max, Math.floor(candidate)))
       : fb;
+  const precheck = typeof raw.mechanicalPrecheck === 'boolean'
+    ? raw.mechanicalPrecheck
+    : fallback.mechanicalPrecheck;
   return {
     maxAutoRevisions: int(raw.maxAutoRevisions, fallback.maxAutoRevisions ?? 2, 1, 5),
     maxInterfaceRetries: int(raw.maxInterfaceRetries, fallback.maxInterfaceRetries ?? 2, 0, 5),
+    ...(precheck !== undefined ? { mechanicalPrecheck: precheck } : {}),
   };
 }
 
@@ -610,6 +616,10 @@ export function validateAgentAndKbConfig(value: {
         && (typeof policy.maxInterfaceRetries !== 'number' || !Number.isInteger(policy.maxInterfaceRetries)
           || policy.maxInterfaceRetries < 0 || policy.maxInterfaceRetries > 5)) {
         details.push({ field: 'standardKb.reviewPolicy.maxInterfaceRetries', code: 'out_of_range' });
+      }
+      // S3 切片 C：机械预检开关只接受布尔（缺省合法=关闭）
+      if (policy.mechanicalPrecheck !== undefined && typeof policy.mechanicalPrecheck !== 'boolean') {
+        details.push({ field: 'standardKb.reviewPolicy.mechanicalPrecheck', code: 'invalid_type' });
       }
     }
     // B案 §3/§8：角色模型结构校验（预设存在性由构建期活跃预设解析负责，
