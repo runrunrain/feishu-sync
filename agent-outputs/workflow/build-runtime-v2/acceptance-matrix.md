@@ -8,7 +8,7 @@
 | A02 | 3.2 | zhipuai静态模型；key仅env；未映射provider明确拒绝；无PI_*凭据 | R/I | pending |
 | A03 | 3.3 | 子任务仅应用MCP，精确工具授权，readOnlyHint正确，无自动codemode/tool_search | R/T/E | pending |
 | A04 | 3.4 | Leader实际白名单与激活集合一致，无应用同名task与正文/内置工具 | R/T/E | pending |
-| A05 | 3.4 | tool_call改参实际进入冻结契约，越界角色/模型拒绝 | E/R | pending |
+| A05 | 3.4 | tool_call改参实际进入冻结契约，越界角色/模型拒绝 | E/R | met（派发守卫边界）：918a4d13真实Pi+amagi v2-store冻结契约与越权模型/档位阻断通过；独立暂存快照重跑B2通过 |
 | A06 | 3.5/6 | 唯一构建skill加载；Leader规则注入；自动行为显式冻结计数 | R/I | pending |
 | A07 | 3.6 | 子任务仅amagi调度，模型池容量合计≤K，Leader只占应用一槽 | R/I | pending |
 | A08 | 4.1 | 两并行任务env身份与RPC创建事件一致；pending只读；角色不一致拒绝 | T/I | pending |
@@ -23,7 +23,7 @@
 | A17 | 9 | 先撤凭据、关闭stdin、10s宽限、实际残留核对，无双Leader | R/I | pending |
 | A18 | 9 | 会话恢复/成果级恢复明确区分，包升级不复用不兼容内部状态 | R/I/U | pending |
 | A19 | 10/13.5 | Claude原生未经同契约实测拒绝；旧checkpoint缺字段走legacy，无静默fallback | I/U | pending |
-| A20 | 12 | UI实际任务/排队原因/接受成果/问题/并发、当前计划语义，无虚构百分比/累计用量 | I/U | pending |
+| A20 | 12 | UI实际任务/排队原因/接受成果/问题/并发、当前计划语义，无虚构百分比/累计用量 | I/U | partial：fixture浏览器7场景/9截图，首轮拟定DTO不算后端接线；97e740f9继续适配 |
 | A21 | 12/13.1 | 用量未知标unknown，轮次/自动行为/时延按来源区分，不重复计数父子token | R/I/U | pending |
 | A22 | 13.2 | 临时FEISHU_SYNC_HOME真实Pi：1Leader+2并行作者+1独立审查+候选提交 | 集成验证 | pending |
 | A23 | 13.3 | 同六源快照/模型/档位/32768/并发6/热图片缓存三次对照，中位≤20min（20样本后p95） | 集成验证 | pending；正式六源合法夹具与运行成本另核实 |

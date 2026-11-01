@@ -12,6 +12,15 @@
  *   agent_settled；aborted → cancelled；最后 assistant stopReason ∈
  *   {error, aborted} → failed；auto_retry 累计 > maxRetries → abort +
  *   failed；超时 → abort + failed；进程意外退出 → failed。
+ *
+ * 构建模式增量（设计v2 §3.4/§9，普通会话零变化）：
+ * - buildMode: true → 始终传显式 --tools 白名单（不沿用外部插件全量放行），
+ *   白名单为空则拒绝启动（fail-closed）。
+ * - terminateGraceMs：terminate() 默认宽限可配（构建 Leader 建议 10s，
+ *   覆盖 amagi 子进程 TERM→2s→KILL 清理窗口）。
+ * - selfTriggeredRounds：跟踪 amagi 完成通知触发的自触发轮次，发出
+ *   round_started/round_settled；自触发轮进行中 prompt 被明确拒绝（等待
+ *   round_settled）；完成判定仍只归属宿主自己的 prompt 轮。
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -67,6 +76,13 @@ export interface RpcSpawnOptions {
   noSession?: boolean;
   /** --no-tools（探测用） */
   noTools?: boolean;
+  /**
+   * 构建模式（设计v2 §3.4）：始终传入显式 --tools 白名单。
+   * 与 allowExternalPluginTools（外部插件全量放行，不传白名单）互斥；
+   * 构建模式即使加载多路扩展也只放行白名单内工具（pi 0.68+ 白名单
+   * 同时过滤内置与扩展注册工具）。
+   */
+  buildMode?: boolean;
   model?: string;
   thinking?: string;
   cwd: string;
@@ -77,6 +93,18 @@ export interface RpcSpawnOptions {
   maxAutoRetries?: number;
   /** 限制单条 JSONL 帧，防止损坏输出或累计大消息撑爆宿主进程。 */
   maxFrameBytes?: number;
+  /**
+   * terminate() 默认宽限 ms。普通会话沿用 3s；构建 Leader 建议 10s
+   * （设计v2 §9：覆盖 amagi 对子进程 TERM→2s→KILL 的清理窗口 + pi 关闭流程）。
+   */
+  terminateGraceMs?: number;
+  /**
+   * 自触发轮次支持（构建 Leader）：后台任务完成后 amagi 经 sendMessage
+   * triggerTurn 触发新一轮，无需宿主 prompt（核查证据 Q9）。开启后跟踪
+   * 宿主未驱动的轮次并发出 round_started/round_settled 事件，完成判定
+   * 只归属宿主自己的 prompt 轮（首个 agent_settled），自触发轮不影响。普通会话不变。
+   */
+  selfTriggeredRounds?: boolean;
 }
 
 export interface RpcEventPayload {
@@ -121,12 +149,16 @@ export class PiRpcProcess extends EventEmitter {
   private pending = new Map<string, PendingCommand>();
   private nextSeq = 1;
   private exited = false;
+  private transportClosed = false;
   private exitInfo: { code: number | null; signal: NodeJS.Signals | null } | null = null;
   private stderrTail: string[] = [];
   private stdoutBuffer = '';
   private stdoutBufferedBytes = 0;
   private transportFailed = false;
   private readonly options: RpcSpawnOptions;
+  /** 自触发轮次进行中（selfTriggeredRounds 开启时跟踪；宿主未驱动的 agent 轮）。 */
+  private selfRoundActive = false;
+  private selfRoundSeq = 0;
 
   // 单次运行判定状态
   private activeRun: {
@@ -173,6 +205,12 @@ export class PiRpcProcess extends EventEmitter {
     }
     if (this.options.noTools) {
       args.push('--no-tools');
+    } else if (this.options.buildMode) {
+      // 构建模式：始终显式白名单（含/不含扩展工具都收窄到这张表）
+      if (this.options.tools.length === 0) {
+        throw new PiRpcError('build_tools_empty', '构建模式必须提供非空 --tools 白名单');
+      }
+      args.push('--tools', this.options.tools.join(','));
     } else if (this.options.tools.length > 0 && !this.options.allowExternalPluginTools) {
       args.push('--tools', this.options.tools.join(','));
     }
@@ -218,6 +256,7 @@ export class PiRpcProcess extends EventEmitter {
       pipe.on('error', (error) => this.failTransport('pi_transport_failed', error));
     }
 
+    child.once('close', () => { this.transportClosed = true; });
     child.stdout.setEncoding('utf-8');
     child.stdout.on('data', (chunk: string) => this.onStdoutData(chunk));
     child.stderr.setEncoding('utf-8');
@@ -378,6 +417,15 @@ export class PiRpcProcess extends EventEmitter {
   private handleSessionEvent(event: RpcEventPayload): void {
     this.emit('event', event);
     const run = this.activeRun;
+    // 自触发轮次跟踪（构建模式）：无宿主 run 时看到轮次活动即标记一轮开始。
+    if (this.options.selfTriggeredRounds && (!run || run.finished)) {
+      if ((event.type === 'message_update' || event.type === 'tool_execution_start' || event.type === 'message_end')
+        && !this.selfRoundActive) {
+        this.selfRoundActive = true;
+        this.selfRoundSeq += 1;
+        this.emit('round_started', { roundId: `self_${this.selfRoundSeq}`, trigger: 'extension-message' });
+      }
+    }
     if (event.type === 'message_end') {
       const message = event.message as { role?: string; stopReason?: string; errorMessage?: unknown; content?: unknown;
         usage?: { input?: number; output?: number; reasoning?: number }; providerThinkingLevel?: string } | undefined;
@@ -426,6 +474,9 @@ export class PiRpcProcess extends EventEmitter {
             },
           });
         }
+      } else {
+        // 自触发轮内重试：不影响宿主 run 判定，但保留可观测量
+        this.emit('self_round_retry', { seq: this.selfRoundSeq });
       }
       return;
     }
@@ -455,6 +506,11 @@ export class PiRpcProcess extends EventEmitter {
           return;
         }
         this.finishActiveRun({ outcome: 'completed' });
+      }
+      // 自触发轮收口：settled 且无宿主 run 时结束当前自触发轮。
+      if (this.selfRoundActive && (!this.activeRun || this.activeRun.finished)) {
+        this.selfRoundActive = false;
+        this.emit('round_settled', { roundId: `self_${this.selfRoundSeq}`, aborted: event.aborted === true });
       }
       return;
     }
@@ -521,6 +577,9 @@ export class PiRpcProcess extends EventEmitter {
     if (this.activeRun && !this.activeRun.finished) {
       throw new PiRpcError('run_in_progress', '已有运行未完成');
     }
+    if (this.options.selfTriggeredRounds && this.selfRoundActive) {
+      throw new PiRpcError('round_in_progress', '自触发轮次进行中（后台任务完成通知驱动），等待 round_settled 后再发 prompt');
+    }
     const runId = `run_${crypto.randomBytes(6).toString('hex')}`;
     const payload: Record<string, unknown> = { message };
     if (options.streamingBehavior) payload.streamingBehavior = options.streamingBehavior;
@@ -571,7 +630,7 @@ export class PiRpcProcess extends EventEmitter {
     return outcome;
   }
 
-  /** 请求中止当前运行（幂等）。 */
+  /** 请求中止当前运行（幂等；自触发轮次同样可被中止）。 */
   async abort(): Promise<void> {
     const run = this.activeRun;
     if (run && !run.finished) {
@@ -587,6 +646,16 @@ export class PiRpcProcess extends EventEmitter {
       setTimeout(() => {
         if (!run.finished) {
           this.finishActiveRun({ outcome: 'aborted' });
+        }
+      }, 2000).unref?.();
+    }
+    if (this.selfRoundActive) {
+      // 自触发轮：abort 已发给当前 run，settled 事件到达时收口；限时兜底。
+      const seq = this.selfRoundSeq;
+      setTimeout(() => {
+        if (this.selfRoundActive && this.selfRoundSeq === seq) {
+          this.selfRoundActive = false;
+          this.emit('round_settled', { roundId: `self_${seq}`, aborted: true, timeout: true });
         }
       }, 2000).unref?.();
     }
@@ -641,9 +710,19 @@ export class PiRpcProcess extends EventEmitter {
     return this.exited;
   }
 
+  /** 子进程 pid（未启动/已退出后为 null）。恢复链路用它核对旧 Leader 是否存活。 */
+  getPid(): number | null {
+    return this.child?.pid ?? null;
+  }
+
   /** 与 finishActiveRun 同步更新；存活的 idle 进程不能接受旧 run 的投递。 */
   hasActiveRun(): boolean {
     return this.activeRun !== null && !this.activeRun.finished;
+  }
+
+  /** 是否有进行中的轮次（宿主 prompt 轮或自触发轮）。构建集成方据此等待空闲。 */
+  hasActiveRound(): boolean {
+    return this.hasActiveRun() || this.selfRoundActive;
   }
 
   getExitInfo(): { code: number | null; signal: NodeJS.Signals | null } | null {
@@ -652,21 +731,26 @@ export class PiRpcProcess extends EventEmitter {
 
   /**
    * 终止进程：stdin.end() 请求有序退出，宽限后 SIGKILL。
+   * 宽限缺省 3s；RpcSpawnOptions.terminateGraceMs 可覆盖（构建建议 10s）。
    * Windows 用 taskkill /T /F（§4.5）。
    */
-  async terminate(graceMs = 3000): Promise<void> {
+  async terminate(graceMs = this.options.terminateGraceMs ?? 3000): Promise<void> {
     const child = this.child;
-    if (!child || this.exited) return;
-    const exitedPromise = new Promise<void>((resolve) => {
-      child.once('exit', () => resolve());
-      setTimeout(resolve, graceMs).unref?.();
+    if (!child || this.transportClosed) return;
+    // exit 早于 close：等管道关闭后才允许宿主删除运行目录。超时发 KILL 后也
+    // 必须等待真实关闭，不能把“已请求终止”作为“已完成清理”的回执。
+    const waitForClose = (timeoutMs: number) => new Promise<boolean>((resolve) => {
+      if (this.transportClosed) { resolve(true); return; }
+      const onClose = () => { clearTimeout(timer); resolve(true); };
+      const timer = setTimeout(() => { child.removeListener('close', onClose); resolve(false); }, timeoutMs);
+      child.once('close', onClose);
     });
     try {
       child.stdin?.end();
     } catch {
       /* stdin may already be closed */
     }
-    await exitedPromise;
+    if (await waitForClose(graceMs)) return;
     if (!this.exited && child.pid) {
       try {
         if (process.platform === 'win32') {
@@ -679,6 +763,9 @@ export class PiRpcProcess extends EventEmitter {
       } catch {
         child.kill('SIGKILL');
       }
+    }
+    if (!(await waitForClose(5_000))) {
+      throw new PiRpcError('pi_termination_unconfirmed', '终止已请求，但进程/管道尚未确认关闭');
     }
   }
 
