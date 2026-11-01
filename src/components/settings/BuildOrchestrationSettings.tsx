@@ -17,16 +17,18 @@
  * - thinking 'off' 是服务端缺省，选「关闭」时不写该键（undefined 不落盘）。
  */
 
-import { useMemo, useState } from 'react';
-import { Workflow } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import { ChevronDown, ChevronRight, Download, Loader2, RefreshCw, ShieldAlert, Workflow } from 'lucide-react';
 import { useToast } from '../common/Toast';
 import { useConfig } from '../../hooks/useConfig';
 import { useSettingsDraft } from '../../hooks/settingsDraft';
-import { APIError } from '../../api/client';
+import { APIError, getKbBuildRuntimeStatus, installKbBuildRuntime } from '../../api/client';
 import type {
   AgentThinkingLevel,
   KbBuildRoleConfig,
   KbBuildRolesConfig,
+  KbBuildRuntimeStatusDto,
+  KbOrchestrationMode,
   StandardKbConfig,
 } from '../../types/agent';
 
@@ -148,6 +150,34 @@ export function extractConfigFieldErrors(source: unknown): Record<string, string
     if (match[1].startsWith('standardKb.')) errors[match[1]] = `${match[1]}(${match[2]})`;
   }
   return errors;
+}
+
+// ---------------------------------------------------------------------------
+// v2 编排模式（设计 v2 §13.5）：legacy 缺省；pi-amagi 构建启动时由服务端校验
+// 运行时接线（未接线 503 不降级、claude-native 400 拒绝——集成切片真实行为，
+// 无独立探测端点，能力验收前不声称可用）；claude-native UI 恒不提供选择。
+// ---------------------------------------------------------------------------
+
+export const ORCHESTRATION_MODE_LABEL: Record<KbOrchestrationMode, string> = {
+  legacy: '标准流水',
+  'pi-amagi': 'Agent 编排（Pi + amagi-pi）',
+  'claude-native': 'Agent 编排（Claude 原生）',
+};
+
+/** 编排模式可选项（导出供单测锚定）。能力验收由服务端启动校验承担：
+ *  pi-amagi 可选但标注「启动时校验」；claude-native 恒不可选。 */
+export function orchestrationModeOptions(): Record<KbOrchestrationMode, { selectable: boolean; note: string | null }> {
+  return {
+    legacy: { selectable: true, note: null },
+    'pi-amagi': {
+      selectable: true,
+      note: '实验：构建启动时由服务端校验运行时接线，未接线时不启动、不降级标准流水',
+    },
+    'claude-native': {
+      selectable: false,
+      note: '未通过能力验收，服务端拒绝启动，暂不提供选择',
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -289,6 +319,27 @@ export function BuildOrchestrationSettings() {
   /** updateConfig 立即保存路径（设置草稿外）失败时，从错误提取的字段映射。 */
   const [localFieldErrors, setLocalFieldErrors] = useState<Record<string, string>>({});
 
+  // v2：构建运行宿主状态（GET /api/kb/build-runtime；宿主未接线 503 如实展示）。
+  const [runtimeStatus, setRuntimeStatus] = useState<KbBuildRuntimeStatusDto | null>(null);
+  const [runtimeUnwired, setRuntimeUnwired] = useState(false);
+  const [runtimeError, setRuntimeError] = useState<string | null>(null);
+  const [runtimeLoading, setRuntimeLoading] = useState(false);
+  const loadRuntime = () => {
+    setRuntimeLoading(true);
+    setRuntimeError(null);
+    getKbBuildRuntimeStatus()
+      .then((dto) => { setRuntimeStatus(dto); setRuntimeUnwired(false); })
+      .catch((err: unknown) => {
+        if (err instanceof APIError && err.statusCode === 503) {
+          setRuntimeUnwired(true);
+          return;
+        }
+        setRuntimeError(err instanceof Error ? err.message : '探测失败');
+      })
+      .finally(() => setRuntimeLoading(false));
+  };
+  useEffect(() => { loadRuntime(); }, []);
+
   const standardKb = config?.standardKb;
   const buildRoles = standardKb?.buildRoles;
 
@@ -426,6 +477,15 @@ export function BuildOrchestrationSettings() {
     });
   };
 
+  // ---- v2 编排模式（可选项；当前生效值） ----
+  const modeOptions = useMemo(() => orchestrationModeOptions(), []);
+  const orchestrationMode = standardKb?.orchestrationMode ?? 'legacy';
+
+  const setOrchestrationMode = (mode: KbOrchestrationMode) => {
+    if (mode === orchestrationMode || !modeOptions[mode].selectable) return;
+    void saveKb((base) => ({ ...base, orchestrationMode: mode }));
+  };
+
   // ---- 构建并发（B案 §6：1..8；未显式设置回落构建并行数） ----
   const buildParallelism = standardKb?.buildParallelism ?? 2;
   const explicitConcurrency = standardKb?.buildConcurrency;
@@ -453,6 +513,65 @@ export function BuildOrchestrationSettings() {
         </div>
       </header>
       <div className="p-4 space-y-4">
+        {/* v2 编排模式（设计 v2 §13.5）：legacy 默认；pi-amagi 启动时服务端校验；claude-native 恒禁用 */}
+        <div data-testid="orch-mode-section">
+          <FieldLabel hint="新构建生效">编排模式</FieldLabel>
+          <div className="grid grid-cols-1 gap-2">
+            {(['legacy', 'pi-amagi', 'claude-native'] as const).map((mode) => {
+              const option = modeOptions[mode];
+              const checked = orchestrationMode === mode;
+              return (
+                <label
+                  key={mode}
+                  className={`flex items-start gap-2 px-3 py-2 rounded-md border text-xs ${checked ? 'border-seal/50 bg-[rgba(158,43,37,0.05)]' : 'border-line'} ${option.selectable ? 'cursor-pointer hover:bg-paper' : 'opacity-70 cursor-not-allowed'}`}
+                >
+                  <input
+                    type="radio"
+                    name="kb-orchestration-mode"
+                    className="mt-0.5 accent-[#9e2b25]"
+                    checked={checked}
+                    disabled={!option.selectable}
+                    aria-label={`编排模式${ORCHESTRATION_MODE_LABEL[mode]}`}
+                    data-testid={`orch-mode-${mode}`}
+                    onChange={() => setOrchestrationMode(mode)}
+                  />
+                  <span className="min-w-0">
+                    <span className="flex flex-wrap items-center gap-1.5">
+                      <span className="font-medium text-ink">{ORCHESTRATION_MODE_LABEL[mode]}</span>
+                      {mode === 'legacy' ? <span className="text-[10px] text-ink-faint">当前默认 · 稳定路径</span> : null}
+                      {mode === 'pi-amagi' ? <span className="text-[10px] text-[#bf9004]">实验</span> : null}
+                      {!option.selectable ? <span className="text-[10px] text-seal-2">不可选</span> : null}
+                    </span>
+                    <span className="block mt-0.5 text-[11px] text-ink-faint leading-snug">
+                      {mode === 'legacy'
+                        ? '现有单模型流水：分批撰写 → 审查 → 整合；下方角色模型与审查预算按本流水执行。'
+                        : mode === 'pi-amagi'
+                          ? 'Leader 会话拆分主题并派发写作/审查子任务，多路并行；子任务经知识工具提交候选成果。'
+                          : 'Claude Code 原生子 agent 路径，尚未通过能力验收；验收通过前不提供选择。'}
+                    </span>
+                    {option.note ? (
+                      <span className={`block mt-0.5 text-[11px] leading-snug ${option.selectable ? 'text-ink-faint' : 'text-seal-2'}`} data-testid={`orch-mode-note-${mode}`}>{option.note}</span>
+                    ) : null}
+                  </span>
+                </label>
+              );
+            })}
+          </div>
+          <p className="mt-1 text-[11px] text-ink-faint" data-testid="orch-mode-cap-note">
+            能力验收由服务端在构建启动时校验（未接线不启动、不降级标准流水）；本页不提供独立的可用性判断，不声称新模式可用。
+          </p>
+        </div>
+
+        {/* v2 运行宿主状态与安装（真实 GET/POST /api/kb/build-runtime*） */}
+        <RuntimeStatusSection
+          status={runtimeStatus}
+          unwired={runtimeUnwired}
+          error={runtimeError}
+          loading={runtimeLoading}
+          onRefresh={loadRuntime}
+          onInstalled={() => { loadRuntime(); }}
+        />
+
         {/* 角色模型（B案 §3/§8） */}
         <div className="space-y-3">
           <RoleModelRow
@@ -621,5 +740,170 @@ export function BuildOrchestrationSettings() {
         </div>
       </div>
     </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// v2 运行宿主状态与安装（真实 GET/POST /api/kb/build-runtime*；消费集成侧
+// BuildRuntimeStatusDto。staticOk ≠ fullyVerified，安装可用 ≠ 质量验收全过）。
+// ---------------------------------------------------------------------------
+
+const PROBE_CHECK_STATE_LABEL: Record<string, string> = {
+  pass: '通过', fail: '未过', warn: '警告', 'not-measured': '未实测',
+};
+const PROBE_CHECK_STATE_CLS: Record<string, string> = {
+  pass: 'text-jade', fail: 'text-seal-2', warn: 'text-[#bf9004]', 'not-measured': 'text-ink-faint',
+};
+
+function RuntimeStatusSection({
+  status, unwired, error, loading, onRefresh, onInstalled,
+}: {
+  status: KbBuildRuntimeStatusDto | null;
+  unwired: boolean;
+  error: string | null;
+  loading: boolean;
+  onRefresh: () => void;
+  onInstalled: () => void;
+}) {
+  const toast = useToast();
+  const [sourceDir, setSourceDir] = useState('');
+  const [installBusy, setInstallBusy] = useState(false);
+  const [installError, setInstallError] = useState<string | null>(null);
+  const [checksOpen, setChecksOpen] = useState(false);
+
+  const install = async () => {
+    if (installBusy) return;
+    setInstallBusy(true);
+    setInstallError(null);
+    try {
+      const trimmed = sourceDir.trim();
+      const result = await installKbBuildRuntime(trimmed ? { sourceDir: trimmed } : {});
+      toast.push({
+        type: 'success',
+        message: `amagi-pi ${result.version} 已安装${result.fresh ? '' : '（沿用既有安装）'}；完整启用另需实测验收`,
+      });
+      onInstalled();
+    } catch (err) {
+      setInstallError(err instanceof APIError ? err.message : err instanceof Error ? err.message : '安装失败');
+    } finally {
+      setInstallBusy(false);
+    }
+  };
+
+  const amagi = status?.amagi;
+  const probe = status?.probe;
+  return (
+    <div className="rounded-md border border-line bg-paper/30 p-3 space-y-2" data-testid="orch-runtime-status">
+      <div className="flex items-center justify-between gap-2">
+        <h4 className="text-xs font-kai font-medium text-ink flex items-center gap-1.5">
+          构建运行宿主
+          {loading ? <Loader2 className="w-3.5 h-3.5 animate-spin text-ink-faint" /> : null}
+        </h4>
+        <button
+          type="button"
+          onClick={onRefresh}
+          className="inline-flex items-center gap-1 text-[11px] text-seal hover:underline"
+          data-testid="orch-runtime-refresh"
+        >
+          <RefreshCw className="w-3 h-3" /> 刷新能力状态
+        </button>
+      </div>
+
+      {unwired ? (
+        <p className="text-[11px] text-ink-faint" data-testid="orch-runtime-unwired">
+          构建运行宿主未接线（服务端未完成集成）：Agent 编排构建暂不可启动；配置可保存，启动时由服务端校验。
+        </p>
+      ) : error ? (
+        <p className="text-[11px] text-seal-2" role="alert" data-testid="orch-runtime-error">探测失败：{error}</p>
+      ) : status ? (
+        <>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px]" data-testid="orch-runtime-facts">
+            <span className="text-ink-soft">
+              Pi：{status.runtime?.piVersion ? <span className="font-mono">{status.runtime.piVersion}</span> : <span className="text-ink-faint">未探测</span>}
+            </span>
+            <span className="text-ink-soft">
+              amagi-pi（固定版本 <span className="font-mono">{amagi?.pinnedVersion ?? '—'}</span>）：
+              {amagi?.installed
+                ? <span className="text-jade" title={`${amagi.installDir ?? ''} ${amagi.contentHash ?? ''}`.trim()}>已安装 {amagi.version}</span>
+                : <span className="text-[#bf9004]">未安装</span>}
+            </span>
+            {probe ? (
+              <span className="flex items-center gap-1.5">
+                <span className={probe.staticOk ? 'text-jade' : 'text-seal-2'}>{probe.staticOk ? '静态检查通过' : '静态检查未过'}</span>
+                <span className={probe.fullyVerified ? 'text-jade' : 'text-ink-faint'} title="含实测验收；完整启用前必须为真">完整验证{probe.fullyVerified ? '通过' : '未达'}</span>
+              </span>
+            ) : (
+              <span className="text-ink-faint">探测报告未提供{status.error ? `（${status.error}）` : ''}</span>
+            )}
+          </div>
+          {probe ? (
+            <div>
+              <button
+                type="button"
+                onClick={() => setChecksOpen((value) => !value)}
+                aria-expanded={checksOpen}
+                className="flex w-full items-center gap-1 text-[11px] text-ink-soft hover:text-ink"
+                data-testid="orch-runtime-checks-toggle"
+              >
+                {checksOpen ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+                能力探测明细 · {probe.checks.length} 项（静态/实测分开判定）
+              </button>
+              {checksOpen ? (
+                <ul className="mt-1.5 space-y-1 max-h-[200px] overflow-y-auto scrollbar-thin" data-testid="orch-runtime-checks">
+                  {probe.checks.map((check) => (
+                    <li key={check.id} className="flex items-start gap-1.5 text-[11px] leading-snug">
+                      <span className={`shrink-0 font-medium ${PROBE_CHECK_STATE_CLS[check.state] ?? 'text-ink-faint'}`}>
+                        {PROBE_CHECK_STATE_LABEL[check.state] ?? check.state}
+                      </span>
+                      <span className="min-w-0">
+                        <span className="text-ink">{check.title}</span>
+                        <span className="ml-1 text-ink-faint">（{check.kind === 'measured' ? '实测' : '静态'}）</span>
+                        {check.state !== 'pass' && check.detail ? <span className="block text-ink-faint break-all">{check.detail}</span> : null}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+            </div>
+          ) : null}
+        </>
+      ) : (
+        <p className="text-[11px] text-ink-faint">能力状态加载中…</p>
+      )}
+
+      {/* 安装入口：固定版本由服务端控制；sourceDir 可选本地可信包源绝对路径 */}
+      {!unwired ? (
+        <div className="space-y-1.5 border-t border-line/60 pt-2" data-testid="orch-runtime-install">
+          <div className="flex flex-wrap items-center gap-2">
+            <input
+              type="text"
+              className={INPUT_CLS + ' flex-1 min-w-[200px]'}
+              placeholder="可选：本地 amagi-pi 包源绝对路径（仅限可信来源）"
+              value={sourceDir}
+              aria-label="本地 amagi-pi 包源绝对路径（可选）"
+              data-testid="orch-runtime-source-dir"
+              onChange={(e) => setSourceDir(e.target.value)}
+            />
+            <button
+              type="button"
+              onClick={() => void install()}
+              disabled={installBusy}
+              className="inline-flex items-center gap-1 h-9 px-3 rounded-md border border-seal/50 text-xs text-seal hover:bg-seal/5 disabled:opacity-60"
+              data-testid="orch-runtime-install-btn"
+            >
+              {installBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : amagi?.installed ? <RefreshCw className="w-3.5 h-3.5" /> : <Download className="w-3.5 h-3.5" />}
+              {amagi?.installed ? '重装/校验固定版本' : `安装 amagi-pi ${amagi?.pinnedVersion ?? ''}`.trim()}
+            </button>
+          </div>
+          {installError ? (
+            <p className="text-[11px] text-seal-2" role="alert" data-testid="orch-runtime-install-error">安装失败：{installError}</p>
+          ) : null}
+          <p className="flex items-start gap-1 text-[10px] text-ink-faint leading-relaxed">
+            <ShieldAlert className="w-3 h-3 mt-0.5 shrink-0" />
+            amagi-pi 插件是受信任的 Node 代码，以当前用户权限运行（文件围栏不是 OS 沙箱）；固定版本由服务端控制，安装可用不等于质量/恢复/性能验收全部通过（完整启用以实测验收 fullyVerified 为准）。
+          </p>
+        </div>
+      ) : null}
+    </div>
   );
 }

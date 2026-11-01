@@ -13,12 +13,19 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const useConfigMock = vi.hoisted(() => vi.fn());
+const apiRuntime = vi.hoisted(() => ({ getKbBuildRuntimeStatus: vi.fn(), installKbBuildRuntime: vi.fn() }));
 vi.mock('../../hooks/useConfig', () => ({ useConfig: useConfigMock }));
 vi.mock('../common/Toast', () => ({ useToast: () => ({ push: vi.fn() }) }));
+vi.mock('../../api/client', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../../api/client')>(),
+  getKbBuildRuntimeStatus: apiRuntime.getKbBuildRuntimeStatus,
+  installKbBuildRuntime: apiRuntime.installKbBuildRuntime,
+}));
 
 import {
   BuildOrchestrationSettings,
   extractConfigFieldErrors,
+  orchestrationModeOptions,
   resolveBuildConcurrencyClient,
   validateBuildOrchestrationInput,
 } from './BuildOrchestrationSettings';
@@ -114,7 +121,12 @@ async function clickRadio(container: HTMLElement, testid: string) {
   await act(async () => { radioEl(container, testid).click(); });
 }
 
-beforeEach(() => { updateConfig.mockClear(); });
+beforeEach(() => {
+  updateConfig.mockClear();
+  // v2 运行宿主默认「未接线 503」（旧用例不受影响：如实展示说明行）。
+  apiRuntime.getKbBuildRuntimeStatus.mockReset().mockRejectedValue(new APIError('构建运行宿主未接线（服务端未完成集成）', 503, { error: 'build_runtime_unavailable' }));
+  apiRuntime.installKbBuildRuntime.mockReset();
+});
 afterEach(() => {
   while (mounted.length) {
     const { root, container } = mounted.pop()!;
@@ -285,7 +297,150 @@ describe('校验错误展示', () => {
   });
 });
 
+describe('v2 编排模式（启动时服务端校验语义，集成切片真实行为）', () => {
+  it('默认 legacy 选中；pi-amagi 可选并标注启动时校验；不声称可用', () => {
+    const container = setup(makeConfig());
+    expect(radioEl(container, 'orch-mode-legacy').checked).toBe(true);
+    const pi = radioEl(container, 'orch-mode-pi-amagi');
+    expect(pi.disabled).toBe(false);
+    expect(container.querySelector('[data-testid="orch-mode-note-pi-amagi"]')?.textContent)
+      .toContain('构建启动时由服务端校验');
+    expect(container.querySelector('[data-testid="orch-mode-cap-note"]')?.textContent)
+      .toContain('不声称新模式可用');
+  });
+
+  it('选择 pi-amagi：payload 写入 orchestrationMode；回显选中', async () => {
+    const container = setup(makeConfig());
+    await clickRadio(container, 'orch-mode-pi-amagi');
+    expect(lastPayload().standardKb.orchestrationMode).toBe('pi-amagi');
+  });
+
+  it('已配置 pi-amagi 回显；切回 legacy 显式写 legacy（浅合并需覆盖）', async () => {
+    const container = setup(makeConfig({ standardKb: makeStandardKb({ orchestrationMode: 'pi-amagi' }) }));
+    expect(radioEl(container, 'orch-mode-pi-amagi').checked).toBe(true);
+    await clickRadio(container, 'orch-mode-legacy');
+    expect(lastPayload().standardKb.orchestrationMode).toBe('legacy');
+  });
+
+  it('claude-native 恒不可选，点击不触发保存；说明与后端拒绝启动一致', async () => {
+    const container = setup(makeConfig());
+    const native = radioEl(container, 'orch-mode-claude-native');
+    expect(native.disabled).toBe(true);
+    const calls = updateConfig.mock.calls.length;
+    await act(async () => { native.click(); });
+    expect(updateConfig.mock.calls.length).toBe(calls);
+    expect(container.querySelector('[data-testid="orch-mode-note-claude-native"]')?.textContent)
+      .toContain('未通过能力验收');
+  });
+
+  it('config 中已存 claude-native（服务端三值可存）：如实回显但不提供切换入口之外的鼓励', () => {
+    const container = setup(makeConfig({ standardKb: makeStandardKb({ orchestrationMode: 'claude-native' as 'pi-amagi' }) }));
+    // 服务端 resolveOrchestrationMode 归一后 GET 回显 claude-native 时，UI 如实标记不可选。
+    expect(radioEl(container, 'orch-mode-claude-native').checked).toBe(true);
+    expect(radioEl(container, 'orch-mode-claude-native').disabled).toBe(true);
+    expect(radioEl(container, 'orch-mode-legacy').checked).toBe(false);
+  });
+});
+
+describe('v2 运行宿主状态与安装（真实 GET/POST /api/kb/build-runtime*）', () => {
+  const makeStatus = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    orchestrationMode: 'legacy',
+    runtime: { nodePath: '/usr/local/bin/node', nodeVersion: null, piCliPath: '/usr/local/bin/pi', piVersion: '1.4.0' },
+    amagi: { pinnedVersion: '2.21.31', installed: true, version: '2.21.31', installDir: '/data/agent/runtime-packages/amagi-pi@2.21.31', contentHash: 'abc123', layout: null },
+    probe: {
+      staticOk: true, fullyVerified: false,
+      checks: [
+        { id: 'extension-load', title: '扩展加载', kind: 'static', state: 'pass', detail: '' },
+        { id: 'cancel', title: '取消残留', kind: 'measured', state: 'not-measured', detail: '待实测' },
+      ],
+    },
+    error: null,
+    ...over,
+  });
+
+  it('503 未接线：如实展示说明行，不渲染安装入口，不声称可用', async () => {
+    const container = setup(makeConfig());
+    await act(async () => {});
+    expect(container.querySelector('[data-testid="orch-runtime-unwired"]')?.textContent)
+      .toContain('未接线');
+    expect(container.querySelector('[data-testid="orch-runtime-install"]')).toBeNull();
+  });
+
+  it('正常状态：Pi/amagi 固定版本/已安装回显；staticOk 与 fullyVerified 分开呈现不混清', async () => {
+    apiRuntime.getKbBuildRuntimeStatus.mockResolvedValue(makeStatus());
+    const container = setup(makeConfig());
+    await act(async () => {});
+    const facts = container.querySelector('[data-testid="orch-runtime-facts"]');
+    expect(facts?.textContent).toContain('1.4.0');
+    expect(facts?.textContent).toContain('2.21.31');
+    expect(facts?.textContent).toContain('已安装');
+    expect(facts?.textContent).toContain('静态检查通过');
+    expect(facts?.textContent).toContain('完整验证未达'); // 不把 staticOk 冒充 fullyVerified
+    await act(async () => { (container.querySelector('[data-testid="orch-runtime-checks-toggle"]') as HTMLElement).click(); });
+    const checks = container.querySelector('[data-testid="orch-runtime-checks"]');
+    expect(checks?.textContent).toContain('扩展加载');
+    expect(checks?.textContent).toContain('未实测'); // 实测项如实标注
+  });
+
+  it('未安装：安装入口可见；安装成功后刷新状态并提示完整启用另需实测验收', async () => {
+    apiRuntime.getKbBuildRuntimeStatus.mockResolvedValue(makeStatus({
+      amagi: { pinnedVersion: '2.21.31', installed: false, version: null, installDir: null, contentHash: null, layout: null },
+    }));
+    apiRuntime.installKbBuildRuntime.mockResolvedValue({ installed: true, fresh: true, version: '2.21.31', installDir: '/data/x', contentHash: 'abc' });
+    const container = setup(makeConfig());
+    await act(async () => {});
+    const btn = container.querySelector('[data-testid="orch-runtime-install-btn"]') as HTMLButtonElement;
+    expect(btn.textContent).toContain('安装 amagi-pi 2.21.31');
+    await act(async () => { btn.click(); });
+    expect(apiRuntime.installKbBuildRuntime).toHaveBeenCalledWith({});
+    // 安装成功后重拉状态。
+    expect(apiRuntime.getKbBuildRuntimeStatus).toHaveBeenCalledTimes(2);
+  });
+
+  it('sourceDir 透传：手输绝对路径随安装请求携带；失败如实展示服务端消息', async () => {
+    apiRuntime.getKbBuildRuntimeStatus.mockResolvedValue(makeStatus());
+    apiRuntime.installKbBuildRuntime.mockRejectedValue(new APIError('sourceDir 必须是指向本地 amagi-pi 包根的绝对路径', 400, { error: 'invalid_request' }));
+    const container = setup(makeConfig());
+    await act(async () => {});
+    const input = container.querySelector('[data-testid="orch-runtime-source-dir"]') as HTMLInputElement;
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')!.set!;
+      setter.call(input, '/Users/x/amagi-pi');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await act(async () => { (container.querySelector('[data-testid="orch-runtime-install-btn"]') as HTMLElement).click(); });
+    expect(apiRuntime.installKbBuildRuntime).toHaveBeenCalledWith({ sourceDir: '/Users/x/amagi-pi' });
+    expect(container.querySelector('[data-testid="orch-runtime-install-error"]')?.textContent)
+      .toContain('sourceDir 必须是指向本地 amagi-pi 包根的绝对路径');
+  });
+
+  it('探测失败（非 503）：如实展示错误行', async () => {
+    apiRuntime.getKbBuildRuntimeStatus.mockRejectedValue(new APIError('探测执行失败', 500, { error: 'build_runtime_probe_failed' }));
+    const container = setup(makeConfig());
+    await act(async () => {});
+    expect(container.querySelector('[data-testid="orch-runtime-error"]')?.textContent).toContain('探测执行失败');
+  });
+
+  it('可信提醒：插件为受信 Node 代码非 OS 沙箱；安装可用 ≠ 验收全过', async () => {
+    apiRuntime.getKbBuildRuntimeStatus.mockResolvedValue(makeStatus());
+    const container = setup(makeConfig());
+    await act(async () => {});
+    const text = container.querySelector('[data-testid="orch-runtime-install"]')?.textContent ?? '';
+    expect(text).toContain('不是 OS 沙箱');
+    expect(text).toContain('不等于质量/恢复/性能验收全部通过');
+  });
+});
+
 describe('纯函数', () => {
+  it('orchestrationModeOptions：legacy/pi-amagi 可选，claude-native 恒不可选', () => {
+    const options = orchestrationModeOptions();
+    expect(options.legacy.selectable).toBe(true);
+    expect(options.legacy.note).toBeNull();
+    expect(options['pi-amagi'].selectable).toBe(true);
+    expect(options['pi-amagi'].note).toContain('服务端校验');
+    expect(options['claude-native'].selectable).toBe(false);
+    expect(options['claude-native'].note).toContain('未通过能力验收');
+  });
   it('resolveBuildConcurrencyClient：显式优先/回落 buildParallelism/统一钳 1..8', () => {
     expect(resolveBuildConcurrencyClient({ buildConcurrency: 4, buildParallelism: 2 })).toBe(4);
     expect(resolveBuildConcurrencyClient({ buildParallelism: 3 })).toBe(3);

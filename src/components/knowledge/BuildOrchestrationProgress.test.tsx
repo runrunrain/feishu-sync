@@ -10,9 +10,9 @@
 // @vitest-environment jsdom
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const api = vi.hoisted(() => ({ getKbBuildOrchestration: vi.fn(), confirmKbRelease: vi.fn() }));
+const api = vi.hoisted(() => ({ getKbBuildOrchestration: vi.fn(), confirmKbRelease: vi.fn(), getKbBuildLeaderProgress: vi.fn() }));
 vi.mock('../../api/client', () => ({
   ...api,
   APIError: class APIError extends Error {
@@ -28,7 +28,7 @@ vi.mock('../../api/client', () => ({
 }));
 
 import { BuildOrchestrationProgress } from './BuildOrchestrationProgress';
-import type { KbBuildDto, KbBuildOrchestrationDto, KbBuildOrchestrationTaskDto } from '../../types/agent';
+import type { KbBuildDto, KbBuildOrchestrationDto, KbBuildOrchestrationTaskDto, KbLeaderPublishRequestDto, KbLeaderRunProgressDto, KbLeaderRunTaskDto } from '../../types/agent';
 import { APIError } from '../../api/client';
 
 (globalThis as unknown as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
@@ -106,9 +106,55 @@ function button(label: string): HTMLButtonElement {
   return found as HTMLButtonElement;
 }
 
+function makeLeaderTask(over: Partial<KbLeaderRunTaskDto> = {}): KbLeaderRunTaskDto {
+  return {
+    nativeTaskId: 'b559b30e-0f40-45ea-b96e-84206aa65078',
+    role: 'luban',
+    parentTaskId: null,
+    status: 'confirmed',
+    execState: 'running',
+    lastEventAt: '2026-11-02T08:12:30Z',
+    ...over,
+  };
+}
+
+function makeLeader(
+  over: Omit<Partial<KbLeaderRunProgressDto>, 'summary' | 'publishRequest'> & {
+    summary?: Partial<KbLeaderRunProgressDto['summary']>;
+    publishRequest?: Partial<KbLeaderPublishRequestDto>;
+  } = {},
+): KbLeaderRunProgressDto {
+  const { summary, publishRequest, ...rest } = over;
+  return {
+    buildId: 'kb-v2',
+    orchestrationMode: 'pi-amagi',
+    generation: 1,
+    leader: { sessionId: 'sess-8f21c4aa9e', pid: 4310, resumeCapability: 'session' },
+    tasks: [],
+    rounds: { started: 3, ended: 2 },
+    idle: { remindedAt: null, lastActivityAt: '2026-11-02T08:12:30Z' },
+    publishRequest: null,
+    summary: {
+      acceptedDocumentCount: null,
+      openBlockingCount: null,
+      activeAssignments: null,
+      queueReason: null,
+      lastUsage: null,
+      cumulativeUsage: null,
+      ...(summary ?? {}),
+    },
+    endedReason: null,
+    eventCursor: { 'leader-rpc': 'evt-42' },
+    updatedAt: '2026-11-02T08:12:31Z',
+    ...rest,
+    ...(publishRequest !== undefined ? { publishRequest: { requestId: null, candidateRevision: 'rev-1', summary: '', accepted: false, status: null, decidedAt: '2026-11-02T08:30:00Z', ...publishRequest } } : {}),
+  };
+}
+
 beforeEach(() => {
   api.getKbBuildOrchestration.mockReset().mockResolvedValue(makeOrch());
   api.confirmKbRelease.mockReset();
+  api.getKbBuildLeaderProgress.mockReset().mockResolvedValue(makeLeader());
 });
 
 afterEach(() => {
@@ -314,4 +360,221 @@ it('终态构建只拉取一次定格（不再轮询），展示收束结果', a
   } finally {
     vi.useRealTimers();
   }
+});
+describe('v2 Leader 监督运行进度（真实契约 GET /api/kb/builds/:id/leader）', () => {
+  it('汇总三格（真实计数：已接受文档/未解决阻断/实际并发）+ Leader 行轮次；null 计数显示未知；无百分比', async () => {
+    api.getKbBuildLeaderProgress.mockResolvedValue(makeLeader({
+      tasks: [
+        makeLeaderTask({ nativeTaskId: 'task-w-01', execState: 'running' }),
+        makeLeaderTask({ nativeTaskId: 'task-r-01', role: 'diting', execState: 'done', status: 'confirmed' }),
+      ],
+      summary: { acceptedDocumentCount: 5, openBlockingCount: 2, activeAssignments: 3, queueReason: null, lastUsage: null, cumulativeUsage: null },
+    }));
+    await act(async () => {
+      root = createRoot(host);
+      root.render(<BuildOrchestrationProgress build={makeBuild({ id: 'kb-v2', orchestrationMode: 'pi-amagi' })} />);
+    });
+    expect(api.getKbBuildLeaderProgress).toHaveBeenCalledWith('kb-v2');
+    expect(api.getKbBuildOrchestration).not.toHaveBeenCalled(); // v2 不请求 B 案数据
+    const summary = host.querySelector('[data-testid="kb-runtime-summary"]');
+    expect(summary?.textContent).toContain('已接受文档');
+    expect(summary?.textContent).toContain('未解决阻断');
+    expect(summary?.textContent).toContain('实际并发');
+    expect(summary?.textContent).toContain('活动分配 3');
+    const leader = host.querySelector('[data-testid="kb-runtime-leader"]');
+    expect(leader?.textContent).toContain('监督中');
+    expect(leader?.textContent).toContain('代次 1');
+    expect(leader?.textContent).toContain('轮次 3/2（启/收）');
+    expect(leader?.textContent).toContain('sess-8f21c4');
+    expect(host.querySelector('[data-testid="kb-runtime-resume-capability"]')?.textContent)
+      .toContain('可原会话续接');
+    expect(host.querySelector('[data-testid="kb-runtime-plan-count"]')?.textContent)
+      .toContain('当前计划 2 项');
+    expect(summary?.textContent).not.toContain('%');
+    // 累计用量恒未知（不假累加）的诚实声明。
+    expect(host.querySelector('[data-testid="kb-runtime-mode-note"]')?.textContent)
+      .toContain('累计用量');
+  });
+
+  it('summary 计数 null=未知：显示未知而非 0/推测值；lastUsage 末次口径明示', async () => {
+    api.getKbBuildLeaderProgress.mockResolvedValue(makeLeader({
+      summary: { acceptedDocumentCount: null, openBlockingCount: null, activeAssignments: null, queueReason: null, lastUsage: { inputTokens: 12_400, outputTokens: 3_100, at: '2026-11-02T08:12:00Z' }, cumulativeUsage: null },
+    }));
+    await act(async () => {
+      root = createRoot(host);
+      root.render(<BuildOrchestrationProgress build={makeBuild({ id: 'kb-v2', orchestrationMode: 'pi-amagi' })} />);
+    });
+    const summary = host.querySelector('[data-testid="kb-runtime-summary"]');
+    expect(summary?.textContent).toContain('未知');
+    expect(summary?.textContent).toContain('回执数据未提供');
+    const usage = host.querySelector('[data-testid="kb-runtime-leader-usage"]');
+    expect(usage?.textContent).toContain('末次轮次用量');
+    expect(usage?.textContent).toContain('12400');
+    expect(usage?.textContent).toContain('累计未知');
+    // 未知不冒充数字：未知格不渲染 0 计数文案。
+    expect(host.querySelector('[data-testid="kb-runtime-summary"]')?.textContent).not.toContain('已接受文档 0');
+  });
+
+  it('子任务行：角色/身份状态/执行状态/排队（原因未细分）/续接链/用量未知/最近事件', async () => {
+    api.getKbBuildLeaderProgress.mockResolvedValue(makeLeader({
+      tasks: [
+        makeLeaderTask({ nativeTaskId: 'task-w-01', execState: 'running', status: 'confirmed' }),
+        makeLeaderTask({ nativeTaskId: 'task-w-02', role: 'luban', execState: 'queued', status: 'pending' }),
+        makeLeaderTask({ nativeTaskId: 'task-r-01', role: 'diting', execState: 'done', status: 'confirmed' }),
+        makeLeaderTask({ nativeTaskId: 'task-err', execState: 'error', status: 'confirmed' }),
+        makeLeaderTask({ nativeTaskId: 'task-w-03', execState: 'running', parentTaskId: 'task-w-01' }),
+        makeLeaderTask({ nativeTaskId: 'task-gone', execState: null, status: 'revoked' }),
+      ],
+    }));
+    await act(async () => {
+      root = createRoot(host);
+      root.render(<BuildOrchestrationProgress build={makeBuild({ id: 'kb-v2', orchestrationMode: 'pi-amagi' })} />);
+    });
+    const tasks = [...host.querySelectorAll('[data-testid="kb-runtime-task"]')];
+    expect(tasks).toHaveLength(6);
+    expect(host.querySelector('[data-testid="kb-runtime-plan-count"]')?.textContent).toContain('当前计划 6 项');
+    // native execState=error（真实链路实测）：中文标签 + 语气与 failed 同级（异常终态）。
+    const errored = host.querySelector('[data-task-id="task-err"]');
+    expect(errored?.textContent).toContain('异常');
+    expect(errored?.querySelector('.text-seal-2')?.textContent).toContain('异常'); // bad tone（与 failed 同级）
+    const running = host.querySelector('[data-task-id="task-w-01"]');
+    expect(running?.getAttribute('data-exec')).toBe('running');
+    expect(running?.getAttribute('data-actor-status')).toBe('confirmed');
+    expect(running?.textContent).toContain('执行中');
+    expect(running?.textContent).toContain('已确认');
+    expect(running?.textContent).toContain('鲁班（写作）');
+    expect(running?.textContent).toContain('子任务用量不经 Leader 事件');
+    expect(running?.textContent).toContain('最近事件');
+    // execState 未知原样展示；null 显示「未观测」。
+    expect(host.querySelector('[data-task-id="task-gone"]')?.textContent).toContain('未观测');
+    expect(host.querySelector('[data-task-id="task-gone"]')?.textContent).toContain('已撤销');
+    const queued = host.querySelector('[data-task-id="task-w-02"]');
+    expect(queued?.textContent).toContain('排队');
+    expect(queued?.textContent).toContain('原因未细分'); // 端点不区分准入/等待接受，如实标注
+    expect(queued?.getAttribute('data-actor-status')).toBe('pending');
+    expect(queued?.textContent).toContain('身份待确认');
+    const resumed = host.querySelector('[data-task-id="task-w-03"]');
+    expect(resumed?.textContent).toContain('续接');
+    expect(resumed?.textContent).toContain('task-w-01');
+  });
+
+  it('空闲提醒与发布申请：真实字段如实展示（leader-idle 提醒 / 候选待裁定）', async () => {
+    api.getKbBuildLeaderProgress.mockResolvedValue(makeLeader({
+      idle: { remindedAt: '2026-11-02T08:30:00Z', lastActivityAt: '2026-11-02T08:20:00Z' },
+      publishRequest: { candidateRevision: 'rev-7f3a', summary: '8 篇候选', accepted: false, status: 'pending', decidedAt: '2026-11-02T08:31:00Z' },
+      skill: { path: '/data/agent/skills/kb-build/SKILL.md', revision: 'a1b2c3d4e5f6a7b8' },
+    }));
+    await act(async () => {
+      root = createRoot(host);
+      root.render(<BuildOrchestrationProgress build={makeBuild({ id: 'kb-v2', orchestrationMode: 'pi-amagi' })} />);
+    });
+    expect(host.querySelector('[data-testid="kb-runtime-idle-reminded"]')?.textContent)
+      .toContain('空闲提醒已发送');
+    const publish = host.querySelector('[data-testid="kb-runtime-publish-request"]');
+    expect(publish?.textContent).toContain('rev-7f3a');
+    expect(publish?.textContent).toContain('待裁定');
+    // 冻结 skill 哈希可见（供核对）。
+    expect(host.querySelector('[data-testid="kb-runtime-skill"]')?.textContent).toContain('a1b2c3d4e5f6a7b8');
+  });
+
+  it('termination=cancelling：取消后台终止中横幅；queueReason 有值时排队任务显示真实原因', async () => {
+    api.getKbBuildLeaderProgress.mockResolvedValue(makeLeader({
+      termination: 'cancelling',
+      summary: { queueReason: '准入池满（writer 池 4）', lastUsage: null, cumulativeUsage: null },
+      tasks: [makeLeaderTask({ nativeTaskId: 'task-q', execState: 'queued' })],
+    }));
+    await act(async () => {
+      root = createRoot(host);
+      // 取消进行中：构建 status 仍 running，由 termination=cancelling 表达终止中。
+      root.render(<BuildOrchestrationProgress build={makeBuild({ id: 'kb-v2', orchestrationMode: 'pi-amagi', status: 'running' })} />);
+    });
+    const banner = host.querySelector('[data-testid="kb-runtime-cancelling"]');
+    expect(banner?.textContent).toContain('已请求取消');
+    expect(banner?.textContent).toContain('仍在终止后台任务');
+    expect(host.querySelector('[data-task-id="task-q"]')?.textContent).toContain('排队（准入池满（writer 池 4））');
+  });
+
+  it('leader 端点 404（终态构建，非 pi-amagi/无检查点）：如实降级说明，不渲染推测进度', async () => {
+    api.getKbBuildLeaderProgress.mockRejectedValue(new APIError('构建不存在或非 Leader 监督构建', 404, { error: 'build_not_found' }));
+    await act(async () => {
+      root = createRoot(host);
+      root.render(<BuildOrchestrationProgress build={makeBuild({ id: 'kb-v2', orchestrationMode: 'pi-amagi', status: 'failed' })} />);
+    });
+    expect(host.querySelector('[data-testid="kb-runtime-unavailable"]')?.textContent)
+      .toContain('暂不可用');
+    expect(host.querySelector('[data-testid="kb-runtime-progress"]')).toBeNull();
+  });
+
+  it('非终态构建启动窗口 404：不定格降级，后续数据就绪后恢复渲染（真实实测修复）', async () => {
+    // POST /api/kb/builds 返回后 leaderRun 尚未建立，首轮 404；随后就绪。
+    vi.useFakeTimers();
+    let calls = 0;
+    api.getKbBuildLeaderProgress.mockImplementation(async () => {
+      calls += 1;
+      if (calls === 1) throw new APIError('构建不存在或非 Leader 监督构建', 404, { error: 'build_not_found' });
+      return makeLeader({ summary: { acceptedDocumentCount: 1, openBlockingCount: 0, queueReason: null, lastUsage: null, cumulativeUsage: null } });
+    });
+    await act(async () => {
+      root = createRoot(host);
+      root.render(<BuildOrchestrationProgress build={makeBuild({ id: 'kb-v2', orchestrationMode: 'pi-amagi', status: 'running' })} />);
+    });
+    // 首拉 404 不得定格为不可用，也不渲染降级说明。
+    expect(host.querySelector('[data-testid="kb-runtime-unavailable"]')).toBeNull();
+    // 非终态保持轮询，第二次拉取成功后渲染真实进度。
+    await act(async () => { await vi.advanceTimersByTimeAsync(6000); });
+    expect(calls).toBeGreaterThanOrEqual(2);
+    expect(host.querySelector('[data-testid="kb-runtime-progress"]')).not.toBeNull();
+    expect(host.querySelector('[data-testid="kb-runtime-summary"]')?.textContent).toContain('1');
+    vi.useRealTimers();
+  });
+
+  it('legacy 构建不进入 v2 分支：仍走 B 案 orchestration 数据', async () => {
+    await act(async () => {
+      root = createRoot(host);
+      root.render(<BuildOrchestrationProgress build={makeBuild()} />);
+    });
+    expect(api.getKbBuildLeaderProgress).not.toHaveBeenCalled();
+    expect(api.getKbBuildOrchestration).toHaveBeenCalledWith('kb-b1');
+  });
+
+  it('v2 终态构建只拉取一次定格；监督结束原因与已停止任务如实展示', async () => {
+    vi.useFakeTimers();
+    try {
+      api.getKbBuildLeaderProgress.mockClear();
+      api.getKbBuildLeaderProgress.mockResolvedValue(makeLeader({
+        endedReason: 'leader-idle',
+        leader: { sessionId: 'sess-x', pid: null, resumeCapability: 'artifact' },
+        tasks: [makeLeaderTask({ nativeTaskId: 'task-x', execState: 'running' })],
+      }));
+      await act(async () => {
+        root = createRoot(host);
+        root.render(<BuildOrchestrationProgress build={makeBuild({ id: 'kb-v2', orchestrationMode: 'pi-amagi', status: 'failed' })} />);
+      });
+      expect(api.getKbBuildLeaderProgress).toHaveBeenCalledTimes(1);
+      await act(async () => { vi.advanceTimersByTime(6000); });
+      expect(api.getKbBuildLeaderProgress).toHaveBeenCalledTimes(1);
+      const leader = host.querySelector('[data-testid="kb-runtime-leader"]');
+      expect(leader?.textContent).toContain('已结束（leader-idle）');
+      expect(host.querySelector('[data-testid="kb-runtime-resume-capability"]')?.textContent)
+        .toContain('成果级恢复');
+      expect(host.querySelector('[data-task-id="task-x"]')?.textContent).toContain('已停止');
+      expect(host.querySelector('[data-task-id="task-x"]')?.textContent).not.toContain('执行中');
+      // 「已停止」=最后观测语义：title 明示未观测到 native 终态、不虚构 done。
+      expect(host.querySelector('[data-task-id="task-x"] span[title*="最后观测"]')).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('恢复能力三态：none=不支持恢复', async () => {
+    api.getKbBuildLeaderProgress.mockResolvedValue(makeLeader({
+      leader: { sessionId: null, pid: null, resumeCapability: 'none' },
+    }));
+    await act(async () => {
+      root = createRoot(host);
+      root.render(<BuildOrchestrationProgress build={makeBuild({ id: 'kb-v2', orchestrationMode: 'pi-amagi' })} />);
+    });
+    expect(host.querySelector('[data-testid="kb-runtime-resume-capability"]')?.textContent)
+      .toContain('不支持恢复');
+  });
 });

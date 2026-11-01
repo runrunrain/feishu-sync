@@ -14,6 +14,7 @@ import { createLocalPathInspector } from './local-path-state.js';
 import Database from 'better-sqlite3';
 import path from 'node:path';
 import fs from 'node:fs';
+import type { KbBuildOrchestrationMode } from '../types/agent-knowledge.js';
 import type {
   CloudNodeObservation,
   DocumentRecord,
@@ -47,6 +48,7 @@ const KB_BUILDS_COLUMNS_DDL = `
         base_release_id TEXT,
         release_id TEXT,
         model TEXT,
+        orchestration_mode TEXT NOT NULL DEFAULT 'legacy',
         source_total INTEGER NOT NULL DEFAULT 0,
         source_added INTEGER NOT NULL DEFAULT 0,
         source_changed INTEGER NOT NULL DEFAULT 0,
@@ -142,6 +144,7 @@ export class LocalMapStore {
     if (kbBuildCols.length) {
       const kbBuildColNames = new Set(kbBuildCols.map((c) => c.name));
       const kbBuildAdditive: Array<[string, string]> = [
+        ['orchestration_mode', "ALTER TABLE kb_builds ADD COLUMN orchestration_mode TEXT NOT NULL DEFAULT 'legacy'"],
         ['parallelism', 'ALTER TABLE kb_builds ADD COLUMN parallelism INTEGER NOT NULL DEFAULT 1'],
         ['unit_total', 'ALTER TABLE kb_builds ADD COLUMN unit_total INTEGER NOT NULL DEFAULT 0'],
         ['vision_model', 'ALTER TABLE kb_builds ADD COLUMN vision_model TEXT'],
@@ -2789,19 +2792,21 @@ export class LocalMapStore {
   createKbBuild(input: {
     id: string;
     mode: 'incremental' | 'full';
+    orchestrationMode?: KbBuildOrchestrationMode;
     status: string;
     baseReleaseId: string | null;
     model: string | null;
     createdAt: string;
   }): void {
     this.db.prepare(`
-      INSERT INTO kb_builds (id, mode, status, base_release_id, release_id, model, created_at)
-      VALUES (?, ?, ?, ?, NULL, ?, ?)
-    `).run(input.id, input.mode, input.status, input.baseReleaseId, input.model, input.createdAt);
+      INSERT INTO kb_builds (id, mode, status, base_release_id, release_id, model, created_at, orchestration_mode)
+      VALUES (?, ?, ?, ?, NULL, ?, ?, ?)
+    `).run(input.id, input.mode, input.status, input.baseReleaseId, input.model, input.createdAt, input.orchestrationMode ?? 'legacy');
   }
 
   updateKbBuild(id: string, patch: Partial<{
     status: string;
+    orchestrationMode: KbBuildOrchestrationMode;
     model: string | null;
     releaseId: string | null;
     sourceTotal: number;
@@ -2831,6 +2836,7 @@ export class LocalMapStore {
     if (!current) throw new Error(`kb_build 不存在: ${id}`);
     const next = {
       status: patch.status ?? current.status,
+      orchestration_mode: patch.orchestrationMode ?? current.orchestration_mode ?? 'legacy',
       model: patch.model !== undefined ? patch.model : current.model,
       release_id: patch.releaseId !== undefined ? patch.releaseId : current.release_id,
       source_total: patch.sourceTotal ?? current.source_total,
@@ -2857,14 +2863,14 @@ export class LocalMapStore {
         source_changed=?, source_removed=?, docs_written=?, docs_deleted=?,
         no_changes=?, parallelism=?, unit_total=?, vision_model=?, warnings_json=?,
         roles_json=?, orchestration_json=?, metrics_json=?,
-        error_code=?, error_message=?, started_at=?, finished_at=?, model=?
+        error_code=?, error_message=?, started_at=?, finished_at=?, model=?, orchestration_mode=?
       WHERE id=?
     `).run(
       next.status, next.release_id, next.source_total, next.source_added,
       next.source_changed, next.source_removed, next.docs_written, next.docs_deleted,
       next.no_changes, next.parallelism, next.unit_total, next.vision_model, next.warnings_json,
       next.roles_json, next.orchestration_json, next.metrics_json,
-      next.error_code, next.error_message, next.started_at, next.finished_at, next.model,
+      next.error_code, next.error_message, next.started_at, next.finished_at, next.model, next.orchestration_mode,
       id,
     );
   }

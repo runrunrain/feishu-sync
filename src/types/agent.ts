@@ -108,6 +108,15 @@ export interface AgentConfig {
   workspaces: AgentWorkspaceConfig[];
 }
 
+/** v2 编排模式（standardKb.orchestrationMode，additive 可选，缺省 legacy；
+ *  服务端 KB_ORCHESTRATION_MODES 三值可存，GET 归一回显）。每次构建冻结
+ *  该值（KbBuildDto.orchestrationMode 仅 legacy|pi-amagi 回显，设计 v2 §13.5）：
+ *  legacy = 现有单模型流水（B 案，稳定路径）；pi-amagi = Leader + amagi-pi
+ *  子任务派发（设计 v2 §3，实验；启动时服务端校验运行时接线，未接线
+ *  503 不降级）；claude-native = Claude Code 原生子 agent（设计 §10 未验收，
+ *  服务端拒绝启动，UI 恒不提供选择）。 */
+export type KbOrchestrationMode = 'legacy' | 'pi-amagi' | 'claude-native';
+
 /** B案 §8：思考档位受控枚举（同 AgentConfig.model.thinkingLevel；server AgentThinkingLevel）。 */
 export type AgentThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
@@ -158,6 +167,11 @@ export interface StandardKbConfig {
   reviewPolicy?: KbReviewPolicyConfig;
   /** B案 §7：发布方式（additive 可选；缺省 auto=通过后自动整版发布）。 */
   publishMode?: 'auto' | 'confirm';
+  /** v2：编排模式（additive 可选；缺省 legacy，服务端 GET 归一回显三值之一）。
+   *  选 legacy 时显式写 'legacy'（PUT 浅合并保留已写标量）。pi-amagi 构建
+   *  启动时由服务端校验运行时接线（未接线 503，不降级 legacy）；
+   *  claude-native 未通过能力验收，服务端拒绝启动，UI 恒不提供选择。 */
+  orchestrationMode?: KbOrchestrationMode;
   autoBuildAfterSync: boolean;
 }
 
@@ -312,6 +326,9 @@ export interface KbBuildDto {
   baseReleaseId: string | null;
   releaseId: string | null;
   model: string | null;
+  /** v2：本次构建冻结的编排模式（集成侧仅 pi-amagi 显式携带；缺省
+   *  legacy。claude-native 启动被服务端拒绝，不会出现在构建 DTO）。 */
+  orchestrationMode?: 'legacy' | 'pi-amagi';
   counts: {
     sourceTotal: number;
     added: number;
@@ -400,6 +417,131 @@ export interface KbBuildOrchestrationDto {
   /** 接口失败重试总次数（与内容修订分开计数，B 案 §5） */
   interfaceRetryTotal: number;
   autoRevisionUsage: Record<string, number>;
+}
+
+// ---------------------------------------------------------------------------
+// v2（设计 v2 §8/§12/§13.5）Leader 监督运行进度 —— 镜像集成切片真实契约：
+// server/src/types/agent-knowledge.ts 的 LeaderRunProgressDto，端点
+// GET /api/kb/builds/:id/leader（非 pi-amagi 构建 → 404 build_not_found）。
+// 用量/排队原因细分/成果计数未随端点提供：前端如实标未知，不虚构。
+// ---------------------------------------------------------------------------
+
+/** 监督视角任务行（ActorBinding 监督快照；写入授权登记在工具服务侧）。 */
+export interface KbLeaderRunTaskDto {
+  /** amagi nativeTaskId（应用从创建事件登记的任务身份）。 */
+  nativeTaskId: string;
+  /** amagi 角色（luban/diting/baize…）。 */
+  role: string;
+  /** 续接链父任务；null = 首派。 */
+  parentTaskId: string | null;
+  /** 身份状态：pending=待确认 confirmed=已确认 revoked=已撤销。 */
+  status: 'pending' | 'confirmed' | 'revoked';
+  /** amagi 执行三轴状态（queued/running/done/failed/cancelled…；未知值原样展示）。 */
+  execState: string | null;
+  lastEventAt: string;
+}
+
+/** GET /api/kb/builds/:id/leader —— Leader 监督运行进度（仅 pi-amagi 构建）。
+ *  镜像集成切片 LeaderRunProgressDto（含 summary 真实计数/termination/
+ *  skill 冻结信息）；无可靠来源的字段为 null，前端如实标未知。 */
+export interface KbLeaderRunProgressDto {
+  buildId: string;
+  orchestrationMode: 'pi-amagi';
+  /** 凭据代次。 */
+  generation: number;
+  leader: {
+    sessionId: string | null;
+    pid: number | null;
+    /** 恢复级别三态：session=原会话续接；artifact=成果级重建；none=不支持。 */
+    resumeCapability: 'session' | 'artifact' | 'none';
+  } | null;
+  /** 当前计划任务快照（数量随 Leader 分解变化，非可信总数）。 */
+  tasks: KbLeaderRunTaskDto[];
+  /** Leader 自触发轮次（首个 agent_end 不代表构建结束）。 */
+  rounds: { started: number; ended: number };
+  /** 空闲宽限：提醒已发时间与最近活动时间。 */
+  idle: { remindedAt: string | null; lastActivityAt: string | null };
+  /** 最近一次发布申请。 */
+  publishRequest: KbLeaderPublishRequestDto | null;
+  /** 成果/问题/用量汇总（无可靠来源=null，不虚构）。 */
+  summary: {
+    /** 已接受文档数（actorStore 回执去重 paths）；null=未知。 */
+    acceptedDocumentCount: number | null;
+    /** 未解决 blocking 问题数；null=未知。 */
+    openBlockingCount: number | null;
+    /** 活动输出分配数；null=未知。 */
+    activeAssignments: number | null;
+    /** 子任务排队原因细分（amagi 准入内部不可观测；如实 null）。 */
+    queueReason: string | null;
+    /** 末次 Leader 轮次用量（非累计；子任务用量不经 Leader RPC 事件）。 */
+    lastUsage: { inputTokens: number; outputTokens: number; at: string } | null;
+    /** 累计用量：父子去重后不可得，恒 null（不假累加）。 */
+    cumulativeUsage: null;
+  };
+  /** 监督结束原因（null=运行中）。 */
+  endedReason: string | null;
+  /** 终止状态：cancelling=已请求取消未落地；finished=已结束；none=运行中；
+ *  无可靠来源（仅检查点）时 null，不虚构。 */
+  termination?: 'none' | 'cancelling' | 'finished' | null;
+  /** 冻结工作流 skill（路径+内容哈希=workflowRevision；供核对）。 */
+  skill?: { path: string; revision: string } | null;
+  /** 已处理事件游标（按 source:eventId）。 */
+  eventCursor: Record<string, string>;
+  updatedAt: string;
+}
+
+/** 发布申请快照（镜像集成侧 LeaderPublishRequestSnapshot）。 */
+export interface KbLeaderPublishRequestDto {
+  requestId: string | null;
+  candidateRevision: string;
+  summary: string;
+  accepted: boolean;
+  status: 'pending' | 'accepted' | 'rejected' | 'not_wired' | null;
+  decidedAt: string;
+}
+
+// ---------------------------------------------------------------------------
+// v2 构建运行宿主状态（镜像集成侧 kb/build-runtime-host.ts BuildRuntimeStatusDto
+// 与 routes/kb.ts：GET /api/kb/build-runtime、POST /api/kb/build-runtime/install；
+// 宿主未接线 → 503 build_runtime_unavailable）。
+// ---------------------------------------------------------------------------
+
+/** GET /api/kb/build-runtime —— 能力探测/包安装/运行状态（UI 设置卡消费）。 */
+export interface KbBuildRuntimeStatusDto {
+  orchestrationMode: 'legacy' | 'pi-amagi' | 'claude-native';
+  runtime: {
+    nodePath: string | null;
+    nodeVersion: string | null;
+    piCliPath: string | null;
+    piVersion: string | null;
+  } | null;
+  amagi: {
+    /** 服务端固定的目标版本（npm 固定版本号；安装由服务端控制）。 */
+    pinnedVersion: string;
+    installed: boolean;
+    version: string | null;
+    installDir: string | null;
+    contentHash: string | null;
+    layout: string | null;
+  } | null;
+  probe: {
+    /** 静态检查全部 pass（无 fail）才为 true；warn 不阻断。 */
+    staticOk: boolean;
+    /** 完整启用（含实测）前必须为 true；staticOk ≠ fullyVerified。 */
+    fullyVerified: boolean;
+    checks: Array<{ id: string; title: string; kind: string; state: string; detail: string }>;
+  } | null;
+  /** 探测失败原因（probe=null 时非空）。 */
+  error: string | null;
+}
+
+/** POST /api/kb/build-runtime/install 响应（sourceDir 可选本地可信包源绝对路径）。 */
+export interface KbBuildRuntimeInstallResultDto {
+  installed: boolean;
+  fresh: boolean;
+  version: string;
+  installDir: string;
+  contentHash: string;
 }
 
 /** §9.5 GET /api/kb/mcp */

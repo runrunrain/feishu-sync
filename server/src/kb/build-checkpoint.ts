@@ -5,7 +5,7 @@ import path from 'node:path';
 import { atomicWriteFile, resolveInside } from '../agent/path-guard.js';
 import type { BuildRunState } from '../agent/agent-tool-service.js';
 import type { ImageDescription } from '../agent/vision/vision-describer.js';
-import type { KbBuildProgressDto, LeaderRunCheckpointState, RawSourceSnapshotEntry } from '../types/agent-knowledge.js';
+import type { KbBuildOrchestrationMode, KbBuildProgressDto, LeaderRunCheckpointState, RawSourceSnapshotEntry } from '../types/agent-knowledge.js';
 import type { BuildOrchestrationSnapshot } from './build-orchestration.js';
 import type { BuildUnit } from './build-units.js';
 import type { PathClaimPreload } from './path-claims.js';
@@ -19,6 +19,8 @@ export interface BuildCheckpoint {
   requestedMode: 'full' | 'incremental';
   mode: 'full' | 'incremental';
   backend: 'pi' | 'claude-code';
+  /** 持久构建身份；旧检查点缺省为legacy，不能从当前配置猜测。 */
+  orchestrationMode?: KbBuildOrchestrationMode;
   rebuildSelected: boolean;
   snapshot: RawSourceSnapshotEntry[];
   workset: Array<[string, 'added' | 'changed' | 'rebuild']>;

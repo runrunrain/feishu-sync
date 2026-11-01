@@ -14,14 +14,16 @@
  */
 
 import { useEffect, useState } from 'react';
-import { AlertCircle, Check, ChevronDown, ChevronRight, Loader2, RefreshCw } from 'lucide-react';
+import { AlertCircle, Check, ChevronDown, ChevronRight, CornerUpRight, FileCheck2, Loader2, RefreshCw } from 'lucide-react';
 import { Button } from '../common/Button';
-import { APIError, confirmKbRelease, getKbBuildOrchestration } from '../../api/client';
+import { APIError, confirmKbRelease, getKbBuildLeaderProgress, getKbBuildOrchestration } from '../../api/client';
 import { THINKING_LABELS } from '../settings/BuildOrchestrationSettings';
 import type {
   KbBuildDto,
   KbBuildOrchestrationDto,
   KbBuildOrchestrationTaskDto,
+  KbLeaderRunProgressDto,
+  KbLeaderRunTaskDto,
 } from '../../types/agent';
 
 interface BuildOrchestrationProgressProps {
@@ -35,6 +37,40 @@ const TERMINAL_STATUSES = new Set(['published', 'failed', 'cancelled', 'interrup
 
 /** 与 KbBuildPanel.PROGRESS_POLL_INTERVAL_MS 同节拍。 */
 const ORCHESTRATION_POLL_INTERVAL_MS = 2_500;
+
+// ---------------------------------------------------------------------------
+// v2（设计 v2 §12）：Leader 监督运行进度（GET /api/kb/builds/:id/leader，
+// 集成切片真实端点）。任务数=当前计划快照（非可信总数，不显示百分比）；
+// 用量/排队原因细分/成果计数未随端点提供：如实标未知，不虚构。
+// ---------------------------------------------------------------------------
+
+/** amagi 执行状态已知值中文映射；未知值原样展示（不猜测语义）。
+ *  'error' 为真实链路实测出现的 native 状态（子进程/执行异常终态）。 */
+export const LEADER_EXEC_STATE_LABEL: Record<string, string> = {
+  queued: '排队', running: '执行中', done: '完成', failed: '失败', cancelled: '已取消', error: '异常',
+};
+
+/** 任务身份状态（ActorBinding 监督快照）。 */
+export const LEADER_ACTOR_STATUS_LABEL: Record<string, string> = {
+  pending: '身份待确认', confirmed: '已确认', revoked: '已撤销',
+};
+
+/** 恢复能力三态（集成侧 resumeCapability：session/artifact/none）。 */
+export const LEADER_RESUME_CAPABILITY_LABEL: Record<string, string> = {
+  session: '可原会话续接',
+  artifact: '成果级恢复（重建剩余工作）',
+  none: '不支持恢复',
+};
+
+/** amagi 角色中文名（未知角色原样展示）。 */
+export const LEADER_ROLE_LABEL: Record<string, string> = {
+  luban: '鲁班（写作）', diting: '谛听（审查）', baize: '白泽（调研）',
+};
+
+/** 发布申请裁定状态（集成侧 LeaderPublishRequestSnapshot.status）。 */
+export const LEADER_PUBLISH_STATUS_LABEL: Record<string, string> = {
+  pending: '待裁定', accepted: '已接受', rejected: '已拒绝', not_wired: '发布管线未接线',
+};
 
 /** 角色分组顺序（server BuildRole）。 */
 const ROLE_GROUPS: Array<{ key: string; label: string }> = [
@@ -130,6 +166,227 @@ function latestTasksOf(tasks: KbBuildOrchestrationTaskDto[]): KbBuildOrchestrati
 }
 
 export function BuildOrchestrationProgress({ build, onBuildUpdated }: BuildOrchestrationProgressProps) {
+  // v2 分支：pi-amagi 构建渲染 Leader 监督运行进度（GET …/leader），
+  // 不再请求 B 案 orchestration 数据（两者数据源不同）。保留 legacy 原视图。
+  const mode = build.orchestrationMode ?? 'legacy';
+  if (mode === 'pi-amagi') {
+    return <BuildRuntimeProgress build={build} />;
+  }
+  return <LegacyOrchestrationProgress build={build} onBuildUpdated={onBuildUpdated} />;
+}
+
+/** v2 Leader 监督运行进度（设计 v2 §12；集成切片真实端点消费）。 */
+export function BuildRuntimeProgress({ build }: { build: KbBuildDto }) {
+  const [data, setData] = useState<KbLeaderRunProgressDto | null>(null);
+  const [unavailable, setUnavailable] = useState(false);
+  const terminal = TERMINAL_STATUSES.has(build.status);
+
+  // 轮询：非终态持续；终态补拉一次定格；404（非 pi-amagi/不存在）→ 如实降级。
+  useEffect(() => {
+    if (unavailable) return;
+    let disposed = false;
+    const load = () => {
+      void getKbBuildLeaderProgress(build.id)
+        .then((dto) => { if (!disposed && dto.buildId === build.id) setData(dto); })
+        .catch((err: unknown) => {
+          if (disposed) return;
+          if (err instanceof APIError && err.statusCode === 404) {
+            // 构建启动窗口 leaderRun 尚未建立时会短暂 404（真实实测：POST
+            // 返回后立即拉取 404，数秒后端点就绪）。非终态保持轮询等数据
+            // 就绪（界面维持「加载中」，不定格）；终态构建 404 = 确无监督
+            // 数据，才降级为不可用（不五回推测进度）。
+            if (terminal) setUnavailable(true);
+            return;
+          }
+          /* 其他失败静默保持上一帧。 */
+        });
+    };
+    load();
+    if (terminal) return () => { disposed = true; };
+    const timer = window.setInterval(load, ORCHESTRATION_POLL_INTERVAL_MS);
+    return () => { disposed = true; window.clearInterval(timer); };
+  }, [build.id, terminal, unavailable]);
+
+  if (unavailable) {
+    return (
+      <p className="flex items-center gap-1.5 px-3 py-2 text-[11px] text-ink-faint shrink-0" data-testid="kb-runtime-unavailable">
+        <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+        Leader 监督进度暂不可用：该构建无 Leader 监督运行数据（非 pi-amagi 构建或无检查点），不显示推测进度。
+      </p>
+    );
+  }
+
+  const leader = data?.leader;
+  const summary = data?.summary;
+  const runningCount = data ? data.tasks.filter((task) => task.execState === 'running').length : 0;
+  /** 真实计数（null=未知，不虚构）；实际并发=running 派生。 */
+  const acceptedDocs = summary?.acceptedDocumentCount ?? null;
+  const openBlocking = summary?.openBlockingCount ?? null;
+  const cancelling = data?.termination === 'cancelling';
+
+  return (
+    <div className="shrink-0 border-b border-line/60 px-4 py-3 space-y-3" data-testid="kb-runtime-progress">
+      {/* 取消后台终止中（集成侧 termination=cancelling：凭据已失效、后台仍在终止） */}
+      {cancelling ? (
+        <div
+          className="flex items-center gap-1.5 rounded-md border border-[#bf9004]/40 bg-[rgba(191,144,4,0.06)] px-3 py-2 text-xs text-[#8a6a00]"
+          role="status"
+          data-testid="kb-runtime-cancelling"
+        >
+          <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+          已请求取消：凭据已失效，仍在终止后台任务（Leader 与子进程退出后收束）…
+        </div>
+      ) : null}
+
+      {/* 汇总：已接受文档 / 未解决阻断 / 实际并发（真实计数；null=未知；无百分比） */}
+      {data ? (
+        <div className="grid grid-cols-3 gap-2" data-testid="kb-runtime-summary">
+          <Metric label="已接受文档" value={acceptedDocs ?? '未知'} alert={openBlocking != null && openBlocking > 0 ? false : false} hint={acceptedDocs == null ? '回执数据未提供' : '应用回执去重'} />
+          <Metric label="未解决阻断" value={openBlocking ?? '未知'} alert={Boolean(openBlocking && openBlocking > 0)} hint={openBlocking == null ? '问题清单未提供' : undefined} />
+          <Metric label="实际并发" value={runningCount} hint={`任务执行中${summary?.activeAssignments != null ? ` · 活动分配 ${summary.activeAssignments}` : ''}`} />
+        </div>
+      ) : (
+        <p className="text-[10px] text-ink-faint">运行进度加载中…</p>
+      )}
+
+      {/* Leader 行：会话/代次/轮次/末次用量/恢复能力（口径全部来自监督状态） */}
+      {data && leader ? (
+        <div className="rounded-md border border-line bg-paper/45 px-3 py-2 space-y-1" data-testid="kb-runtime-leader">
+          <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-ink">
+            <span className="font-kai font-medium">Leader 会话</span>
+            <span className={`px-1 rounded ${data.endedReason || data.termination === 'finished' ? 'bg-paper-2 text-ink-faint' : 'bg-[rgba(158,43,37,0.08)] text-seal'}`}>
+              {data.endedReason || data.termination === 'finished' ? `已结束（${data.endedReason ?? 'finished'}）` : '监督中'}
+            </span>
+            <span className="text-[11px] text-ink-faint">代次 {data.generation}</span>
+            <span className="text-[11px] text-ink-faint">轮次 {data.rounds.started}/{data.rounds.ended}（启/收）</span>
+            {leader.sessionId ? (
+              <span className="text-[10px] font-mono text-ink-faint break-all" title={`${leader.sessionId}${leader.pid != null ? ` · pid ${leader.pid}` : ''}`}>
+                {leader.sessionId.slice(0, 14)}…
+              </span>
+            ) : null}
+          </p>
+          {data.idle.remindedAt ? (
+            <p className="text-[11px] text-[#bf9004]" data-testid="kb-runtime-idle-reminded">
+              空闲提醒已发送（收口判定中；再空闲将按 leader_idle 中断）
+            </p>
+          ) : null}
+          <p className="text-[11px] text-ink-soft" data-testid="kb-runtime-leader-usage">
+            {summary?.lastUsage
+              ? `末次轮次用量：入 ${summary.lastUsage.inputTokens} / 出 ${summary.lastUsage.outputTokens}（累计未知：父子去重后不可得，不假累加）`
+              : 'Leader 用量未知（末次轮次数据未提供；累计未知）'}
+          </p>
+          <p className="text-[11px] text-ink-soft" data-testid="kb-runtime-resume-capability">
+            恢复能力：{LEADER_RESUME_CAPABILITY_LABEL[leader.resumeCapability] ?? leader.resumeCapability}
+            <span className="ml-1">（中断后按此方式续接）</span>
+          </p>
+          {data.skill ? (
+            <p className="text-[10px] text-ink-faint font-mono break-all" title={data.skill.path} data-testid="kb-runtime-skill">
+              skill {data.skill.revision.slice(0, 16)}…
+            </p>
+          ) : null}
+          {data.publishRequest ? (
+            <p className="flex flex-wrap items-center gap-1 text-[11px]" data-testid="kb-runtime-publish-request">
+              {data.publishRequest.accepted
+                ? <Check className="w-3 h-3 text-jade shrink-0" />
+                : <FileCheck2 className="w-3 h-3 text-[#bf9004] shrink-0" />}
+              <span className="text-ink-soft">发布申请 {data.publishRequest.candidateRevision}：{data.publishRequest.summary}</span>
+              <span className={data.publishRequest.accepted ? 'text-jade' : 'text-[#bf9004]'}>{LEADER_PUBLISH_STATUS_LABEL[data.publishRequest.status ?? ''] ?? data.publishRequest.status ?? ''}</span>
+            </p>
+          ) : null}
+        </div>
+      ) : null}
+
+      {/* 任务：当前计划快照（身份/执行/续接链；无百分比） */}
+      {data ? (
+        <div className="space-y-2" data-testid="kb-runtime-tasks">
+          <p className="flex items-center justify-between text-xs">
+            <span className="font-kai font-medium text-ink">子任务</span>
+            <span className="text-[11px] text-ink-faint" data-testid="kb-runtime-plan-count">
+              当前计划 {data.tasks.length} 项（随 Leader 分解变化，非总数）
+            </span>
+          </p>
+          {data.tasks.length === 0 ? (
+            <p className="text-[11px] text-ink-faint">尚无子任务；等待 Leader 拆分主题并派发。</p>
+          ) : (
+            <ul className="max-h-[280px] space-y-1.5 overflow-y-auto scrollbar-thin">
+              {data.tasks.map((task) => (
+                <RuntimeTaskRow
+                  key={task.nativeTaskId}
+                  task={task}
+                  terminal={terminal || data.termination === 'finished' || Boolean(data.endedReason)}
+                  queueReason={data.summary.queueReason}
+                />
+              ))}
+            </ul>
+          )}
+        </div>
+      ) : null}
+
+      {/* 未观测信息诚实声明：端点不提供的数据不虚构（累计用量恒未知） */}
+      <p className="text-[10px] text-ink-faint" data-testid="kb-runtime-mode-note">
+        编排模式：Pi + amagi-pi（实验）。已接受/阻断计数与应用回执同步（缺失时标未知）；
+        累计用量父子去重后不可得（恒未知，不假累加）；任务计划随 Leader 分解变化，不显示百分比。
+      </p>
+    </div>
+  );
+}
+
+function RuntimeTaskRow({ task, terminal, queueReason }: { task: KbLeaderRunTaskDto; terminal: boolean; queueReason?: string | null }) {
+  const exec = task.execState;
+  const execLabel = exec === null ? '未观测' : LEADER_EXEC_STATE_LABEL[exec] ?? exec;
+  const stopped = terminal && (exec === 'queued' || exec === 'running');
+  const stateTone = exec === 'running' ? 'active' : exec === 'failed' || exec === 'error' ? 'bad'
+    : exec === 'done' ? 'good' : 'muted';
+  const actorTone = task.status === 'confirmed' ? 'good' : task.status === 'revoked' ? 'bad' : 'warn';
+  return (
+    <li
+      className="rounded border border-line bg-card-bg px-2.5 py-2 text-[11px] leading-snug"
+      data-testid="kb-runtime-task"
+      data-task-id={task.nativeTaskId}
+      data-exec={stopped ? 'stopped' : (exec ?? 'unknown')}
+      data-actor-status={task.status}
+    >
+      <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <span className="font-mono text-xs text-ink break-all" title={task.nativeTaskId}>{shortId(task.nativeTaskId)}</span>
+        <span
+          className={`px-1 rounded ${TONE_CLASS[stateTone]}`}
+          title={stopped ? '运行时已结束；这是最后观测到的执行状态（未观测到 native 终态，不虚构 done）' : undefined}
+        >{stopped ? '已停止' : execLabel}</span>
+        <span className={`px-1 rounded ${TONE_CLASS[actorTone]}`}>{LEADER_ACTOR_STATUS_LABEL[task.status] ?? task.status}</span>
+        {exec === 'queued' && !terminal ? (
+          <span
+            className="px-1 rounded bg-paper-2 text-ink-faint"
+            title={queueReason ?? '排队原因细分不可观测（amagi 准入内部）'}
+          >
+            {queueReason ? `排队（${queueReason}）` : '排队（原因未细分）'}
+          </span>
+        ) : null}
+        {exec === 'running' && !terminal ? <Loader2 className="w-3 h-3 animate-spin text-seal shrink-0" /> : null}
+      </span>
+      <span className="mt-1 flex flex-col gap-0.5 text-ink-faint">
+        <span>
+          {LEADER_ROLE_LABEL[task.role] ?? task.role}
+          <span className="ml-1.5">· 子任务用量不经 Leader 事件（未知）</span>
+        </span>
+        <span className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+          {task.parentTaskId ? (
+            <span className="inline-flex items-center gap-0.5" title={`续接自 ${task.parentTaskId}`}>
+              <CornerUpRight className="w-3 h-3" />续接 {shortId(task.parentTaskId)}
+            </span>
+          ) : null}
+          {task.lastEventAt ? <span title={task.lastEventAt}>最近事件 {new Date(task.lastEventAt).toLocaleTimeString()}</span> : null}
+        </span>
+      </span>
+    </li>
+  );
+}
+
+function shortId(id: string): string {
+  return id.length > 18 ? `${id.slice(0, 10)}…${id.slice(-4)}` : id;
+}
+
+/** 旧版（B 案）编排流水进度：原实现整体保留。 */
+function LegacyOrchestrationProgress({ build, onBuildUpdated }: BuildOrchestrationProgressProps) {
   const [data, setData] = useState<KbBuildOrchestrationDto | null>(null);
   const [legacy, setLegacy] = useState(false);
   const [tasksOpen, setTasksOpen] = useState(true);
@@ -395,10 +652,11 @@ function roleModelOf(
   return task ? task.model : { modelPresetId: '' };
 }
 
-function Metric({ label, value, alert = false }: { label: string; value: number; alert?: boolean }) {
+function Metric({ label, value, alert = false, hint }: { label: string; value: number | string; alert?: boolean; hint?: string }) {
   return <div className={`rounded-md border px-2.5 py-2 ${alert ? 'border-seal/25 bg-seal/5' : 'border-line bg-card-bg'}`}>
     <p className="text-[11px] text-ink-faint">{label}</p>
-    <p className={`mt-1 font-mono text-xl leading-none ${alert ? 'text-seal' : 'text-ink'}`}>{value}</p>
+    <p className={`mt-1 font-mono text-xl leading-none ${alert ? 'text-seal' : typeof value === 'number' ? 'text-ink' : 'text-ink-faint'}`}>{value}</p>
+    {hint ? <p className="mt-1 text-[10px] text-ink-faint leading-snug">{hint}</p> : null}
   </div>;
 }
 

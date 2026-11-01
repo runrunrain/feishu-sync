@@ -277,7 +277,7 @@ export class KbBuildService extends EventEmitter {
     const batchesDone = units.length ? unitDone.length === units.length : entry.singleCompleted >= entry.singleBatches.length;
     try {
       new BuildCheckpointStore(this.outputRoot()).save({ schemaVersion: 1, buildId, knowledgeBaseRoot: state.knowledgeBaseRoot,
-        baseReleaseId: entry.baseReleaseId, requestedMode: entry.requestedMode, mode: state.mode, backend: entry.backend ?? 'pi', rebuildSelected: entry.rebuildSelected,
+        baseReleaseId: entry.baseReleaseId, requestedMode: entry.requestedMode, mode: state.mode, backend: entry.backend ?? 'pi', orchestrationMode: entry.orchestrationMode, rebuildSelected: entry.rebuildSelected,
         snapshot: state.snapshot.entries, workset: [...state.workset], docMeta: [...(state.docMeta ?? [])], writtenPaths: [...(state.writtenPaths ?? [])],
         preservedDocs: [...(state.preservedDocs ?? [])], requiredRewrites: [...(state.requiredRewrites ?? [])], baseDocPaths: [...(state.baseDocPaths ?? [])],
         finishInfo: batchesDone ? state.finishInfo : null, imageDescriptions: [...(state.imageDescriptions ?? [])].map(([token, values]) => [token, [...values]]),
@@ -494,7 +494,7 @@ export class KbBuildService extends EventEmitter {
     return {
       id: String(row.id),
       ...(entry ? { eventSeq: entry.nextSeq - 1 } : {}),
-      ...(entry?.orchestrationMode === 'pi-amagi' ? { orchestrationMode: 'pi-amagi' as const } : {}),
+      ...((entry?.orchestrationMode ?? row.orchestration_mode) === 'pi-amagi' ? { orchestrationMode: 'pi-amagi' as const } : {}),
       mode: row.mode as KbBuildDto['mode'],
       status: row.status as KbBuildDto['status'],
       noChanges: row.no_changes === 1,
@@ -561,7 +561,7 @@ export class KbBuildService extends EventEmitter {
 
   async createBuild(
     localMapStore: Parameters<KbBuildService['toDto']>[0] extends never ? never : {
-      createKbBuild(input: { id: string; mode: 'incremental' | 'full'; status: string; baseReleaseId: string | null; model: string | null; createdAt: string }): void;
+      createKbBuild(input: { id: string; mode: 'incremental' | 'full'; orchestrationMode?: KbBuildOrchestrationMode; status: string; baseReleaseId: string | null; model: string | null; createdAt: string }): void;
       getActiveKbBuild(): Record<string, unknown> | null;
       updateKbBuild(id: string, patch: Record<string, unknown>): void;
     },
@@ -631,6 +631,7 @@ export class KbBuildService extends EventEmitter {
     localMapStore.createKbBuild({
       id: buildId,
       mode: input.mode,
+      orchestrationMode,
       status: 'queued',
       baseReleaseId: basePointer?.releaseId ?? null,
       model,
@@ -688,12 +689,17 @@ export class KbBuildService extends EventEmitter {
     const ready = await this.deps.resolver.checkReadiness({ agentConfig: { ...config.agent, runtime: { ...config.agent.runtime, backend: checkpoint.backend } }, llmConfig: config.llm, runningProcesses: this.deps.pool.runningCount() });
     if (ready.code !== 'ready') throw new ToolError('agent_not_ready', `Agent 未就绪：${ready.message}`, 503);
     if (this.running || localMapStore.getActiveKbBuild()) throw new ToolError('kb_build_running', '已有构建正在进行', 409);
-    const entry = this.newEntry(buildId, checkpoint.backend, checkpoint.requestedMode, checkpoint.rebuildSelected, false, checkpoint.leaderRun ? 'pi-amagi' : 'legacy');
-    if (checkpoint.leaderRun) {
+    const savedMode = checkpoint.orchestrationMode ?? (checkpoint.leaderRun ? 'pi-amagi' : row.orchestration_mode ?? 'legacy');
+    if (savedMode !== 'legacy' && savedMode !== 'pi-amagi') throw new ToolError('build_mode_unavailable', '检查点运行模式不受支持，拒绝用legacy解释', 409);
+    const entry = this.newEntry(buildId, checkpoint.backend, checkpoint.requestedMode, checkpoint.rebuildSelected, false, savedMode);
+    if (savedMode === 'pi-amagi') {
       // 重构 v2：新模式检查点只走新模式恢复（会话级/成果级由流水线内
       // 监督器校验），不得用旧调度器解释新任务状态（设计 §13.5）。
       if (!this.deps.buildRuntime) {
         throw new ToolError('build_runtime_unavailable', "该构建为 pi-amagi 模式检查点，但运行适配层尚未接线，无法恢复；请等待运行时集成完成（不降级为 legacy）", 503);
+      }
+      if (resumeStrategy === 'session' && !checkpoint.leaderRun) {
+        throw new ToolError('kb_resume_not_ready', '尚无冻结Leader会话；只能选择成果级重新构建，不能冒充同会话续接', 409);
       }
       entry.leaderRun = checkpoint.leaderRun;
       // 恢复策略显式化（会话级/成果级；缺省按绑定能力自动选择，冻结
@@ -706,7 +712,7 @@ export class KbBuildService extends EventEmitter {
     entry.resume = checkpoint; entry.singleBatches = checkpoint.singleBatches; entry.singleCompleted = checkpoint.singleCompleted;
     entry.unitProgress = new Map(checkpoint.unitProgress); entry.events = this.readStoredEvents(buildId); entry.nextSeq = (entry.events.at(-1)?.seq ?? 0) + 1;
     this.active.set(buildId, entry);
-    localMapStore.updateKbBuild(buildId, { status: 'queued', model: ready.model.model, errorCode: null, errorMessage: null, finishedAt: null });
+    localMapStore.updateKbBuild(buildId, { status: 'queued', orchestrationMode: savedMode, model: ready.model.model, errorCode: null, errorMessage: null, finishedAt: null });
     void this.runPipeline(localMapStore as never, buildId, checkpoint.requestedMode).catch((error) => console.error('[KbBuildService] resume failed:', error));
     return this.toDto(localMapStore.getKbBuild(buildId)!, entry);
   }

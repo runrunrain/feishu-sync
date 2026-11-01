@@ -208,6 +208,14 @@ export function KbBuildPanel({
         构建模型：{view.model}
       </div> : null}
 
+      {/* v2：编排模式徽标（legacy/缺省不显示，保持既有展示不变） */}
+      {view.orchestrationMode === 'pi-amagi' ? (
+        <div className="shrink-0 px-3 py-1 text-[11px] text-ink-soft" data-testid="kb-build-orch-mode">
+          编排模式：Agent 编排（Pi + amagi-pi，实验）
+          <span className="ml-1.5 text-ink-faint">任务进度见下方运行面板</span>
+        </div>
+      ) : null}
+
       {/* 阶段 stepper（终态定格在失败阶段/完成态） */}
       {!failed ? (
         <div className={`flex items-center gap-1 px-4 py-1.5 shrink-0 ${layout === 'sidebar' ? 'flex-wrap gap-y-2' : 'overflow-x-auto scrollbar-thin'}`}>

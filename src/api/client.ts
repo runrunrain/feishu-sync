@@ -62,6 +62,9 @@ import type {
   KbBuildDto,
   KbBuildOrchestrationDto,
   KbBuildReportDto,
+  KbBuildRuntimeInstallResultDto,
+  KbBuildRuntimeStatusDto,
+  KbLeaderRunProgressDto,
   KbDocDto,
   KbGovernanceDecisionsDto,
   KbGovernanceDecisionDto,
@@ -1211,6 +1214,30 @@ export async function getKbBuildOrchestration(id: string): Promise<KbBuildOrches
   return request<KbBuildOrchestrationDto>(
     `/api/kb/builds/${encodeURIComponent(id)}/orchestration`,
   );
+}
+
+/** GET /api/kb/builds/:id/leader —— v2 Leader 监督运行进度（集成切片真实
+ *  端点；非 pi-amagi 构建/构建不存在 → 404 build_not_found，前端降级说明）。
+ *  用量、排队原因细分与成果计数未随端点提供，界面如实标未知。 */
+export async function getKbBuildLeaderProgress(id: string): Promise<KbLeaderRunProgressDto> {
+  return request<KbLeaderRunProgressDto>(
+    `/api/kb/builds/${encodeURIComponent(id)}/leader`,
+  );
+}
+
+/** GET /api/kb/build-runtime —— v2 构建运行宿主能力/安装状态（UI 设置卡
+ *  消费；宿主未接线 → 503 build_runtime_unavailable，前端如实展示）。 */
+export async function getKbBuildRuntimeStatus(): Promise<KbBuildRuntimeStatusDto> {
+  return request<KbBuildRuntimeStatusDto>('/api/kb/build-runtime');
+}
+
+/** POST /api/kb/build-runtime/install —— 安装固定版本 amagi-pi（固定版本由
+ *  服务端控制；sourceDir 可选本地可信包源绝对路径，缺省 npm 模式）。 */
+export async function installKbBuildRuntime(options: { sourceDir?: string } = {}): Promise<KbBuildRuntimeInstallResultDto> {
+  return request<KbBuildRuntimeInstallResultDto>('/api/kb/build-runtime/install', {
+    method: 'POST',
+    body: JSON.stringify(options),
+  });
 }
 
 /** POST /api/kb/builds/:id/release-confirm —— confirm 模式确认发布（awaiting_release
