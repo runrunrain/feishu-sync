@@ -85,6 +85,8 @@ export interface RpcSpawnOptions {
   buildMode?: boolean;
   model?: string;
   thinking?: string;
+  /** 宿主冻结的附加系统规则文本/文件；构建使用已校验的工作流规则文件。 */
+  appendSystemPrompt?: string;
   cwd: string;
   env: NodeJS.ProcessEnv;
   /** agent_settled 前单 prompt 超时（ms） */
@@ -233,6 +235,9 @@ export class PiRpcProcess extends EventEmitter {
     }
     if (this.options.thinking) {
       args.push('--thinking', this.options.thinking);
+    }
+    if (this.options.appendSystemPrompt) {
+      args.push('--append-system-prompt', this.options.appendSystemPrompt);
     }
 
     // 目录准备

@@ -76,12 +76,14 @@ describe('构建模式启动参数（buildMode）', () => {
     const rpc = new PiRpcProcess({
       ...BASE, piCliPath: pi, tools: ['task_submit', 'task_query', 'amagi_resource'],
       buildMode: true, allowExternalPluginTools: true,
+      appendSystemPrompt: '/frozen rules/leader.md',
       env: { ...BASE.env, FAKE_PI_ARGV_FILE: file },
     });
     await rpc.start();
     const argv = await readArgv(file);
     expect(argv).toContain('--tools');
     expect(argv[argv.indexOf('--tools') + 1]).toBe('task_submit,task_query,amagi_resource');
+    expect(argv[argv.indexOf('--append-system-prompt') + 1]).toBe('/frozen rules/leader.md');
     await rpc.terminate(500);
   });
 

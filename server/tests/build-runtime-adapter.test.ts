@@ -11,6 +11,7 @@
  */
 
 import { describe, expect, it, beforeEach, afterAll } from 'vitest';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -43,6 +44,7 @@ if (process.argv[2] === 'install') {
 fs.writeFileSync(path.join(process.env.PI_CODING_AGENT_DIR, 'guard-env.json'), JSON.stringify({
   spec: process.env.FEISHU_SYNC_AGENT_BUILD_SPEC_JSON,
   module: process.env.FEISHU_SYNC_BUILD_GUARD_MODULE,
+  argv: process.argv.slice(2),
 }));
 const send = (obj) => process.stdout.write(JSON.stringify(obj) + '\\n');
 send({ type: 'state', hint: 'fake-ready' });
@@ -87,6 +89,7 @@ async function prepare(root: string): Promise<{
   fs.writeFileSync(skillPath, '# skill\n');
   const spec = makeSpec();
   spec.workflowSkillPath = skillPath;
+  spec.workflowRevision = createHash('sha256').update(fs.readFileSync(skillPath)).digest('hex');
   spec.amagiPackage = {
     version: installed.version, installDir: installed.installDir,
     packageRoot: installed.packageRoot, contentHash: installed.contentHash,
@@ -135,6 +138,7 @@ describe('PiAmagiBuildRuntime（真实子进程，假 pi CLI fixture）', () => 
     expect(envelope.guard.roles.luban.mcpTools).toEqual(deps.roleMcpTools.luban);
     expect(envelope.guard.workDir).toBe(binding.workDir);
     expect(fs.existsSync(captured.module)).toBe(true);
+    expect(captured.argv[captured.argv.indexOf('--append-system-prompt') + 1]).toBe(spec.workflowSkillPath);
     const result = await runtime.cancel(binding);
     expect(result.credentialsRevoked).toBe(true);
     expect(revoked.count).toBe(1);
@@ -181,6 +185,12 @@ describe('PiAmagiBuildRuntime（真实子进程，假 pi CLI fixture）', () => 
       const second = new PiAmagiBuildRuntime(deps);
       await expect(second.resume(binding, { buildId: spec.buildId, generation: spec.generation, spec, binding, artifactReceiptRefs: [], eventCursor: null })).rejects.toThrow('仍存活');
     } finally { await first.cancel(binding); }
+  });
+
+  it('工作流规则被篡改不能注入系统提示或恢复', async () => {
+    const { spec, deps } = await prepare(root);
+    fs.appendFileSync(spec.workflowSkillPath, 'changed rules');
+    await expect(new PiAmagiBuildRuntime(deps).start(spec)).rejects.toThrow('工作流规则与冻结哈希不一致');
   });
 
   it('spec 哈希与落盘不一致 → start 明确拒绝（先 render+compute 冻结）', async () => {

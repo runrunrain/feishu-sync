@@ -15,7 +15,8 @@
  */
 
 import path from 'node:path';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { freezeGuardConfig } from './dispatch-guard.js';
 import {
@@ -30,8 +31,10 @@ import {
   type BuildDirectories,
 } from './agent-dir-config.js';
 import { buildLeaderEnv, ensureWorkLayout } from './environment.js';
-import { assertProbeUsable, runStaticProbes } from './capability-probe.js';
+import { assertProbeUsable, runStaticProbes, type StaticProbeInput } from './capability-probe.js';
 import { PiRpcProcess } from '../pi-rpc-process.js';
+import { PiRuntimeResolver } from '../runtime-resolver.js';
+import { buildDefaultAgentConfig } from '../../types/agent-knowledge.js';
 
 /** start/resume 需要的宿主事实（由集成方注入；不在此重复实现运行时发现）。 */
 export interface PiAmagiRuntimeDeps {
@@ -85,7 +88,7 @@ export class PiAmagiBuildRuntime implements BuildRuntimeAdapter {
   }
 
   /** 简化 probe 入口：复用 PiRuntimeResolver 已探测的 pi 版本并 fail-closed 断言。 */
-  async probeWith(input: ProbeInput & { piVersion: string }): Promise<CapabilityReport> {
+  async probeWith(input: StaticProbeInput): Promise<CapabilityReport> {
     const report = runStaticProbes({ ...input, piVersion: input.piVersion });
     assertProbeUsable(report);
     return report;
@@ -93,17 +96,13 @@ export class PiAmagiBuildRuntime implements BuildRuntimeAdapter {
 
   private piVersionCache: { value: string; at: number } | null = null;
   private async resolvePiVersion(): Promise<string> {
-    // 最小实现：读 pi 包 package.json（经 piCliPath 定位包根）；探测失败返回空串。
+    // 复用正式解析器（同时支持 dist/cli.js、dist/bundle/cli.js 与可执行链接），
+    // 不按固定父目录猜包根，否则合法的 bundle CLI 会被误判为版本缺失。
     if (this.piVersionCache && Date.now() - this.piVersionCache.at < 60_000) return this.piVersionCache.value;
-    let version = '';
-    try {
-      const fs = await import('node:fs');
-      const pkgRoot = path.resolve(path.dirname(this.deps.piCliPath), '..');
-      const pkg = JSON.parse(fs.readFileSync(path.join(pkgRoot, 'package.json'), 'utf-8'));
-      version = typeof pkg.version === 'string' ? pkg.version : '';
-    } catch {
-      version = '';
-    }
+    const config = buildDefaultAgentConfig(this.deps.dataRoot);
+    config.runtime = { ...config.runtime, nodePath: this.deps.nodePath, piCliPath: this.deps.piCliPath };
+    const resolved = await new PiRuntimeResolver().resolveRuntime(config);
+    const version = resolved.piVersion ?? '';
     this.piVersionCache = { value: version, at: Date.now() };
     return version;
   }
@@ -115,6 +114,7 @@ export class PiAmagiBuildRuntime implements BuildRuntimeAdapter {
     }
     // 1. 版本化包复核（哈希漂移/缺失直接失败，不静默降级）
     this.verifyFrozenPackage(spec);
+    this.verifyWorkflow(spec);
     const dirs = planBuildDirectories(this.deps.dataRoot, spec.buildId);
     // 2. agentDir 配置写入（校验内置；哈希须与 spec 冻结值一致）
     const { configHash } = writeAgentDirConfig(spec, dirs, {
@@ -168,6 +168,7 @@ export class PiAmagiBuildRuntime implements BuildRuntimeAdapter {
       sessionDir: dirs.sessionDir,
       sessionId: leaderSessionId,
       model: this.deps.getLeaderModel(spec),
+      appendSystemPrompt: spec.workflowSkillPath,
       cwd: dirs.workDir,
       env,
     });
@@ -260,6 +261,7 @@ export class PiAmagiBuildRuntime implements BuildRuntimeAdapter {
     // 核对冻结面：包哈希未漂移 + agentDir 配置容忍式比对
     // （settings.json 允许 amagi 韧性链追加字段，packages/amagi/models/mcp 必须一致）
     this.verifyFrozenPackage(checkpoint.spec);
+    this.verifyWorkflow(checkpoint.spec);
     const drift = agentDirConfigMatchesSpec(binding.agentDir, checkpoint.spec, {
       bridgeCommand: this.deps.nodePath,
       bridgeArgs: [this.deps.bridgeScriptPath],
@@ -330,6 +332,11 @@ export class PiAmagiBuildRuntime implements BuildRuntimeAdapter {
       }),
       roles,
     };
+  }
+
+  private verifyWorkflow(spec: BuildRunSpec): void {
+    const hash = createHash('sha256').update(readFileSync(spec.workflowSkillPath)).digest('hex');
+    if (hash !== spec.workflowRevision) throw new Error('构建工作流规则与冻结哈希不一致，拒绝注入系统提示或恢复');
   }
 
   private verifyFrozenPackage(spec: BuildRunSpec): void {

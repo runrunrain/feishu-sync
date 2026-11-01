@@ -17,6 +17,7 @@ import {
   readAgentDirConfigHash, renderAgentDirConfigFiles, validateRenderedConfig,
   writeAgentDirConfig, agentDirConfigMatchesSpec,
 } from '../src/agent/build-runtime/agent-dir-config.js';
+import { childPolicyFileName, renderChildPolicySource } from '../src/agent/build-runtime/child-policy.js';
 import { makeSpec } from './build-runtime-contracts.test.js';
 
 const tmpDirs: string[] = [];
@@ -36,7 +37,7 @@ function renderedFor(spec = makeSpec()) {
 }
 
 describe('renderAgentDirConfigFiles', () => {
-  it('settings.json：packages 单条本地版本化路径，资源收窄（skills/prompts/themes 空）', () => {
+  it('settings.json：packages 单条本地版本化路径，资源收窄，extensions 只声明应用 child-policy', () => {
     const { files, spec } = renderedFor();
     const settings = JSON.parse(files.settings);
     expect(settings.packages).toHaveLength(1);
@@ -44,6 +45,10 @@ describe('renderAgentDirConfigFiles', () => {
     expect(settings.packages[0].skills).toEqual([]);
     expect(settings.packages[0].prompts).toEqual([]);
     expect(settings.packages[0].themes).toEqual([]);
+    // child-policy（内容寻址文件名，相对路径按 agentDir 解析）；详见 build-runtime-child-policy.test.ts
+    expect(settings.extensions).toEqual([childPolicyFileName()]);
+    expect(settings.skills).toBeUndefined();
+    expect(settings.defaultTools).toBeUndefined();
   });
 
   it('amagi.json：角色模型带冻结档位、skills 注入构建 skill、池键去档位、MCP 路由收敛', () => {
@@ -149,7 +154,7 @@ describe('writeAgentDirConfig / 哈希', () => {
   let root: string;
   beforeEach(() => { root = tmpRoot(); });
 
-  it('落盘四文件 + readAgentDirConfigHash 与 compute 一致', () => {
+  it('落盘四文件 + child-policy 物化；readAgentDirConfigHash 与 compute 一致', () => {
     const spec = makeSpec();
     const dirs = planBuildDirectories(root, spec.buildId);
     const rendered = renderAgentDirConfigFiles(spec, dirs, BRIDGE);
@@ -160,6 +165,7 @@ describe('writeAgentDirConfig / 哈希', () => {
     for (const name of ['settings.json', 'amagi.json', 'models.json', 'mcp.json']) {
       expect(fs.existsSync(path.join(dirs.homeDir, name))).toBe(true);
     }
+    expect(fs.readFileSync(path.join(dirs.homeDir, childPolicyFileName()), 'utf-8')).toBe(renderChildPolicySource());
     expect(fs.existsSync(path.join(dirs.workDir, 'agent-outputs'))).toBe(false); // ensureWorkLayout 由环境模块负责
   });
 
@@ -181,7 +187,7 @@ describe('writeAgentDirConfig / 哈希', () => {
     expect(computeAgentDirConfigHash(a)).not.toBe(computeAgentDirConfigHash(b));
   });
 
-  it('容忍式比对：amagi 韧性链改 settings.json 追加字段仍匹配；改 amagi.json 即不匹配', () => {
+  it('容忍式比对：amagi 韧性链改 settings.json 追加字段仍匹配；改 amagi.json/未知字段即不匹配', () => {
     const spec = makeSpec();
     const dirs = planBuildDirectories(root, spec.buildId);
     const rendered = renderAgentDirConfigFiles(spec, dirs, BRIDGE);
@@ -195,6 +201,11 @@ describe('writeAgentDirConfig / 哈希', () => {
     expect(agentDirConfigMatchesSpec(dirs.homeDir, spec, BRIDGE)).toEqual({ ok: true, issues: [] });
     // packages 被换 = 不匹配
     settings.packages = [{ source: '/evil', skills: [] }];
+    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+    expect(agentDirConfigMatchesSpec(dirs.homeDir, spec, BRIDGE).ok).toBe(false);
+    // 未知字段（资源注入面）= 不匹配（字段感知完整比对，详版见 build-runtime-child-policy.test.ts）
+    settings.packages = JSON.parse(rendered.settings).packages;
+    settings.mcpServers = { evil: { command: 'evil' } };
     fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
     expect(agentDirConfigMatchesSpec(dirs.homeDir, spec, BRIDGE).ok).toBe(false);
     // amagi.json 被改 = 不匹配（核心冻结面）
@@ -218,7 +229,7 @@ describe('writeAgentDirConfig / 哈希', () => {
 });
 
 describe('buildForbiddenZones', () => {
-  it('覆盖工作目录配置面 + 数据根敏感文件 + 原始库/标准库 + 用户 .pi', () => {
+  it('覆盖工作目录配置面 + 构建 agentDir home + 数据根敏感文件 + 原始库/标准库 + 用户 .pi', () => {
     const zones = buildForbiddenZones({
       workDir: '/data/builds/b_x/work',
       dataRoot: '/data',
@@ -231,6 +242,13 @@ describe('buildForbiddenZones', () => {
     expect(zones).toContain('/data/builds/b_x/work/.mcp.json');
     expect(zones).toContain('/data/builds/b_x/work/AGENTS.md');
     expect(zones).toContain('/data/builds/b_x/work/CLAUDE.md');
+    // 构建 agentDir 配置/policy 精确禁区（不整目录禁 home：skill 正文须可读）
+    expect(zones).toContain('/data/builds/b_x/home/settings.json');
+    expect(zones).toContain('/data/builds/b_x/home/amagi.json');
+    expect(zones).toContain('/data/builds/b_x/home/models.json');
+    expect(zones).toContain('/data/builds/b_x/home/mcp.json');
+    expect(zones).toContain(`/data/builds/b_x/home/${childPolicyFileName()}`);
+    expect(zones).not.toContain('/data/builds/b_x/home');
     expect(zones).toContain('/data/config.json');
     expect(zones).toContain('/data/feishu-sync.db');
     expect(zones).toContain('/data/run');
