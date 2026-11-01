@@ -479,7 +479,7 @@ export function ModelProviderSettings() {
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
                     <p className="text-sm font-medium text-ink-soft font-serif">模型预设</p>
-                    <p className="mt-0.5 text-xs text-ink-faint">填写服务商的模型代码，并按需设置上下文窗口、输出上限与思考能力。</p>
+                    <p className="mt-0.5 text-xs text-ink-faint">填写模型代码与运行参数。最大输出留空时使用已核实型号的内置上限；未收录型号默认 32768，手填值优先。</p>
                   </div>
                   <Button variant="secondary" size="sm" onClick={() => addModel(selectedProvider)}>
                     <Plus className="h-3.5 w-3.5" />
@@ -542,7 +542,7 @@ export function ModelProviderSettings() {
                       <div className="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-2">
                         <Input label="上下文窗口（tokens）" type="number" min={1024} step={1} value={model.contextWindow ?? ''} placeholder="默认 128000"
                           onChange={(e) => updateModel(selectedProvider, model.id, { contextWindow: e.target.value ? Number(e.target.value) : undefined })} />
-                        <Input label="最大输出（tokens）" type="number" min={1} value={model.maxTokens ?? ''} placeholder="默认 8192"
+                        <Input label="最大输出（tokens）" type="number" min={1} value={model.maxTokens ?? ''} placeholder="未收录模型默认 32768"
                           onChange={(e) => updateModel(selectedProvider, model.id, { maxTokens: e.target.value ? Number(e.target.value) : undefined })} />
                         <Toggle label="支持思考模式" checked={model.reasoning ?? false} onChange={(reasoning) => updateModel(selectedProvider, model.id, { reasoning })} />
                       </div>

@@ -312,7 +312,7 @@ export function AgentRuntimeSettingsCard() {
             source: 'app-llm',
             thinkingLevel: 'off',
             contextWindow: 128000,
-            maxTokens: 8192,
+            maxTokens: 32768,
           },
           maxConcurrentProcesses: 2,
           idleTimeoutMinutes: 10,

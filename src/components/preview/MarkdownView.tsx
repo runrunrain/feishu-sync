@@ -597,7 +597,13 @@ export function renderInline(text: string, keyPrefix: string, ctx: InlineContext
       const rawHref = hrefM ? hrefM[1] ?? hrefM[2] ?? hrefM[3] ?? '' : '';
       const safeHref = sanitizeHref(rawHref);
       const inner = token.replace(/^<a\b[^>]*>/i, '').replace(/<\/a>$/i, '');
-      if (!safeHref) {
+      // 标准库编译器插入的空锚点是定位标记，不是可点击链接。
+      const anchorId = !hrefM && inner.trim() === ''
+        ? /^<a\s+id="(ko_[0-9a-f-]{36})"\s*><\/a>$/i.exec(token)?.[1]
+        : undefined;
+      if (anchorId) {
+        out.push(<span key={key} id={anchorId} />);
+      } else if (!safeHref) {
         out.push(<BlockedLink key={key} label={renderInline(inner, `${key}-a`, ctx)} />);
       } else {
         const isCsv =

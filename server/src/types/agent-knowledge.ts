@@ -37,7 +37,7 @@ export interface AgentModelConfig {
   thinkingLevel: AgentThinkingLevel;
   /** app-llm 注册 provider 用（上下文窗口），默认 128000 */
   contextWindow: number;
-  /** 默认 8192 */
+  /** 默认 32768 */
   maxTokens: number;
 }
 
@@ -205,7 +205,7 @@ export const DEFAULT_AGENT_MODEL_CONFIG: AgentModelConfig = {
   source: 'app-llm',
   thinkingLevel: 'off',
   contextWindow: 128_000,
-  maxTokens: 8192,
+  maxTokens: 32768,
 };
 
 export const DEFAULT_AGENT_VISION_TIMEOUT_MS = 120_000;

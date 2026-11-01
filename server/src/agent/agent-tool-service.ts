@@ -289,6 +289,8 @@ export interface RunContextOptions {
 export interface BuildWorkerInfo {
   workerId: string;
   unitId: string | null;
+  /** 审查后的定向修订轮；禁止通过删除已登记对象文档绕过重申门禁。 */
+  revision?: boolean;
   /** T3（A 案 §7.1/§7.2）：plan=规划轮（可 kb_submit_plan）；review=审查轮
    * （可 kb_submit_review，无草稿写入口）；final=收尾轮。 */
   phase: 'unit' | 'final' | 'plan' | 'review';
@@ -1686,23 +1688,65 @@ export class AgentToolService {
     const offset = optionalInt(args, 'offset', 0, 0, 10_000_000);
     const limit = optionalInt(args, 'limit', 800, 1, 2000);
     const stagingRoot = requireBuildState(context).stagingRoot;
-    const target = resolveInside(path.join(stagingRoot, 'docs'), docPath, 'read');
-    const raw = fs.readFileSync(target, 'utf-8');
-    const body = stripStdHeader(raw);
-    const lines = body.split('\n');
+    validateStdDocPath(docPath);
+    const docsRoot = path.join(stagingRoot, 'docs');
+    const target = resolveInside(docsRoot, docPath, 'write');
+    const missing = !fs.existsSync(target);
+    if (missing && args.includeDeclarations !== true) throw new ToolError('not_found', `草稿不存在: ${docPath}`, 404);
+    const body = missing ? '' : stripStdHeader(fs.readFileSync(resolveInside(docsRoot, docPath, 'read'), 'utf-8'));
+    const lines = missing ? [] : body.split('\n');
     const slice = lines.slice(offset, offset + limit);
-    // 哈希与返回正文来自同一快照；编辑坐标去除server头与标题行。
+    let declarationText = '';
+    if (args.includeDeclarations === true) {
+      const state = requireBuildState(context);
+      const draftFile = path.join(stagingRoot, 'knowledge-draft.json');
+      if (state.knowledgeDraft || fs.existsSync(draftFile)) {
+        const draft = this.loadKnowledgeDraft(state);
+        const objects = draft.objects.filter((object) => !object.tombstone && object.canonical?.path === docPath);
+        const ids = new Set(objects.map((object) => object.objectId));
+        const keysById = new Map(Object.entries(draft.clientKeys).map(([key, id]) => [id, key]));
+        const declarations = {
+          draftRevision: draft.docs[docPath]?.revision ?? 0,
+          objects: objects.map((object) => ({
+            clientKey: keysById.get(object.objectId) ?? object.objectId,
+            objectId: object.objectId,
+            type: object.type,
+            title: object.title,
+            aliases: object.aliases,
+            domainIds: object.domainIds,
+            familyKey: object.familyKey,
+            variantKey: object.variantKey,
+            scopeKey: object.scopeKey,
+            scopeText: object.scopeText,
+            bodyRange: object.canonical?.bodyRange,
+            claims: object.claims.map((claim) => ({ claimKey: claim.claimKey, riskCategory: claim.riskCategory, bodyRange: claim.bodyRange, evidenceIds: claim.evidenceIds })),
+          })),
+          evidence: draft.evidence.filter((item) => ids.has(item.objectId)),
+          presentations: draft.presentations.filter((item) => ids.has(item.ownerObjectId)),
+          relations: draft.relations.filter((item) => ids.has(item.fromObjectId)),
+        };
+        declarationText = `\n\n<existing_knowledge_declarations>\n${JSON.stringify(declarations, null, 2)}\n</existing_knowledge_declarations>`;
+      }
+    }
+    if (missing && !declarationText) throw new ToolError('not_found', `草稿及知识声明均不存在: ${docPath}`, 404);
+    // v2（§7）：局部编辑坐标口径的内容哈希与行数（kb_edit_doc 的
+    // expectedContentHash 同源；参数坐标 = 去 server 头与 # 标题行）。
     let editCoordinates: { contentHash: string; paramTotalLines: number } | null = null;
     try {
+      // 哈希必须与本次返回的正文来自同一字节快照，不能二次读盘混入并发更新。
       const coordinates = draftEditCoordinates(body);
       editCoordinates = { contentHash: contentResourceHash(coordinates.paramLines.join('\n')), paramTotalLines: coordinates.paramLines.length };
     } catch {
       editCoordinates = null;
     }
     return {
-      content: [{ type: 'text', text: slice.join('\n') }],
+      content: [{ type: 'text', text: (missing ? `<missing_draft path="${docPath}">正文缺失；请根据原始来源重建并重申下方对象声明。</missing_draft>` : slice.join('\n')) + declarationText }],
       details: {
-        path: docPath, offset, returnedLines: slice.length, totalLines: lines.length,
+        path: docPath,
+        offset,
+        returnedLines: slice.length,
+        totalLines: lines.length,
+        missing,
         ...(editCoordinates ? { editContentHash: editCoordinates.contentHash, editParamTotalLines: editCoordinates.paramTotalLines } : {}),
       },
     };
@@ -2056,6 +2100,16 @@ export class AgentToolService {
     // R2-04：与 kb_write_doc 同一合法规范路径门——`./`/反斜杠等别名在
     // 认领与触盘之前拒绝，防止用另一字符串认领却删除同一实际文件。
     validateStdDocPath(docPath);
+    if (context.options.worker?.revision) {
+      const draftFile = path.join(state.stagingRoot, 'knowledge-draft.json');
+      if (state.knowledgeDraft || fs.existsSync(draftFile)) {
+        const draft = this.loadKnowledgeDraft(state);
+        if (draft.objects.some((object) => !object.tombstone && object.canonical?.path === docPath)) {
+          throw new ToolError('kb_revision_delete_forbidden',
+            `修订轮不能删除已登记知识对象的文档 ${docPath} 来绕过重申门禁；请用 draft_read(includeDeclarations=true) 读取原声明，再用 kb_write_doc 定向改写并重申全部对象`, 409);
+        }
+      }
+    }
     // R2-F03-01（kb_delete_doc 授权影响面）：删除文档即移除该路径登记对象
     // 的规范主位——对象定义丢失虽由发布门禁 kb_migration_invalid 兜底，
     // 授权面在删除时点就须核：文档登记的对象族被其他活动任务独占分配时，
@@ -2746,6 +2800,14 @@ export class AgentToolService {
         }
         impactFamilyKeys.add(familyKey);
       }
+    }
+    // 覆盖映射在收尾轮已经提交。改写正文时若把原对象换成新 ID，旧映射
+    // 会一直悬空，直到发布门禁才报错；在写入点拒绝这种身份漂移。
+    const referencedRemovedIds = [...removedIds].filter((id) =>
+      draft.coverage.some((item) => item.disposition === 'mapped' && item.targetObjectIds?.includes(id)));
+    if (referencedRemovedIds.length > 0) {
+      throw new ToolError('kb_coverage_invalid',
+        `改写 ${docPath} 会移除仍被覆盖映射引用的对象 ${referencedRemovedIds.join('、')}；请用 draft_read(includeDeclarations=true) 读取原 clientKey 并重申原对象`, 409);
     }
     draft.objects = draft.objects.filter((object) => !touchedIds.has(object.objectId) && !removedIds.has(object.objectId));
     for (const [clientKey, objectId] of Object.entries(draft.clientKeys)) {

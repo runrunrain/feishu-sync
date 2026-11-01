@@ -82,7 +82,7 @@ function makeBuildState(stagingName: string): BuildRunState {
   };
 }
 
-function tokenFor(state: BuildRunState, worker?: { workerId: string; unitId: string | null; phase: 'unit' | 'final' | 'plan' | 'review' }): string {
+function tokenFor(state: BuildRunState, worker?: { workerId: string; unitId: string | null; phase: 'unit' | 'final' | 'plan' | 'review'; revision?: boolean }): string {
   return service.createRunContext({
     runKind: 'build',
     buildId: 'b_t3',
@@ -512,6 +512,64 @@ describe('kb_write_doc：原子落盘与声明', () => {
     expect(draft2.objects).toHaveLength(1);
     expect(draft2.objects[0]!.objectId).toBe(firstMap['objKeep']);
     expect(draft2.objects[0]!.revision).toBe(2);
+  });
+
+  it('draft_read 可返回修订所需的原对象身份与声明，不影响普通读取', async () => {
+    const state = makeBuildState('decl-draft-read');
+    const token = tokenFor(state);
+    const object = { clientKey: 'stableDamage', type: 'rule', title: '伤害公式', familyKey: 'damage', variantKey: 'default', scopeKey: 'pve', scopeText: 'PVE 战斗', headingPath: ['伤害公式'] };
+    const write = await service.executeTool(token, 'kb_write_doc', { ...BASE_WRITE, objects: [object] });
+    const objectId = ((write.details as Record<string, unknown>).objectMap as Record<string, string>).stableDamage;
+    const plain = await service.executeTool(token, 'draft_read', { path: '战斗/伤害规则.md' });
+    expect(plain.content[0]!.text).not.toContain('existing_knowledge_declarations');
+    const read = await service.executeTool(token, 'draft_read', { path: '战斗/伤害规则.md', includeDeclarations: true });
+    expect(read.content[0]!.text).toContain('existing_knowledge_declarations');
+    expect(read.content[0]!.text).toContain('"clientKey": "stableDamage"');
+    expect(read.content[0]!.text).toContain(`"objectId": "${objectId}"`);
+    expect(read.content[0]!.text).toContain('"draftRevision": 1');
+  });
+
+  it('修订轮不能删除已登记对象文档来绕过重申门禁', async () => {
+    const state = makeBuildState('decl-revision-delete');
+    const normal = tokenFor(state);
+    await service.executeTool(normal, 'kb_write_doc', { ...BASE_WRITE, objects: [{ clientKey: 'stableDamage', type: 'rule', title: '伤害公式', familyKey: 'damage', variantKey: 'default', scopeKey: 'pve', scopeText: 'PVE 战斗' }] });
+    const revision = tokenFor(state, { workerId: 'revise', unitId: null, phase: 'final', revision: true });
+    await expect(service.executeTool(revision, 'kb_delete_doc', { path: BASE_WRITE.path }))
+      .rejects.toMatchObject({ code: 'kb_revision_delete_forbidden', status: 409 });
+    expect(fs.existsSync(path.join(state.stagingRoot, 'docs', BASE_WRITE.path))).toBe(true);
+  });
+
+  it('改写不能丢失已被覆盖映射引用的对象身份', async () => {
+    const state = makeBuildState('decl-coverage-identity');
+    const token = tokenFor(state);
+    const original = { clientKey: 'stableDamage', type: 'rule', title: '伤害公式', familyKey: 'damage', variantKey: 'default', scopeKey: 'pve', scopeText: 'PVE 战斗' };
+    const first = await service.executeTool(token, 'kb_write_doc', { ...BASE_WRITE, objects: [original] });
+    const objectId = ((first.details as Record<string, unknown>).objectMap as Record<string, string>).stableDamage;
+    const draftFile = path.join(state.stagingRoot, 'knowledge-draft.json');
+    const draft = JSON.parse(fs.readFileSync(draftFile, 'utf-8'));
+    draft.coverage.push({ itemId: 'covered-rule', sourceRef: { sourceId: 'tokA', sourceSnapshotHash: 'h', resourceId: 'tokA', resourceHash: 'h' }, category: 'rule', importance: 'important', disposition: 'mapped', targetObjectIds: [objectId] });
+    fs.writeFileSync(draftFile, JSON.stringify(draft));
+    state.knowledgeDraft = undefined;
+    await expect(service.executeTool(token, 'kb_write_doc', {
+      ...BASE_WRITE,
+      objects: [{ ...original, clientKey: 'newDamage', familyKey: 'different' }],
+    })).rejects.toMatchObject({ code: 'kb_coverage_invalid', status: 409 });
+    const after = JSON.parse(fs.readFileSync(draftFile, 'utf-8'));
+    expect(after.objects[0].objectId).toBe(objectId);
+    expect(after.coverage[0].targetObjectIds).toEqual([objectId]);
+  });
+
+  it('正文意外缺失时，draft_read 仍可只读恢复对象声明供重建', async () => {
+    const state = makeBuildState('decl-missing-draft');
+    const token = tokenFor(state);
+    await service.executeTool(token, 'kb_write_doc', { ...BASE_WRITE, objects: [{ clientKey: 'stableDamage', type: 'rule', title: '伤害公式', familyKey: 'damage', variantKey: 'default', scopeKey: 'pve', scopeText: 'PVE 战斗' }] });
+    fs.rmSync(path.join(state.stagingRoot, 'docs', BASE_WRITE.path));
+    await expect(service.executeTool(token, 'draft_read', { path: BASE_WRITE.path }))
+      .rejects.toMatchObject({ code: 'not_found', status: 404 });
+    const read = await service.executeTool(token, 'draft_read', { path: BASE_WRITE.path, includeDeclarations: true });
+    expect(read.content[0]!.text).toContain('<missing_draft');
+    expect(read.content[0]!.text).toContain('"clientKey": "stableDamage"');
+    expect(read.details).toMatchObject({ missing: true, returnedLines: 0 });
   });
 
   it('diting F03/F06：机器审查凭据回写；载荷未变的纯重申继承审查；同族三元组新 clientKey 身份保留；旧式重写托管文档拒绝', async () => {

@@ -136,13 +136,14 @@ export const DRAFT_LIST_SPEC: AgentToolSpec = {
 export const DRAFT_READ_SPEC: AgentToolSpec = {
   name: 'draft_read',
   label: '草稿阅读',
-  description: '按路径读取本构建 staging 中的草稿文档（不含 server 生成头）。',
+  description: '按路径读取本构建 staging 中的草稿文档（不含 server 生成头）；修订已登记知识对象的文档时可请求现有声明。',
   parameters: {
     type: 'object',
     properties: {
       path: string('草稿 POSIX 相对路径'),
       offset: integer('起始行（0 基）', 0),
       limit: integer('返回行数上限', 1, 2000),
+      includeDeclarations: { type: 'boolean', description: '附上此文档的知识对象、稳定 clientKey 与关联声明，供修订时保留对象身份和证据登记' },
     },
     required: ['path'],
     additionalProperties: false,

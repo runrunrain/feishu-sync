@@ -1,5 +1,6 @@
 /** Shared provider/preset resolution for Agent, standard KB and source adaptation. */
 import type { LlmConfig, LlmProtocol } from '../types/index.js';
+import { suggestedMaxOutputTokens } from './model-output-limits.js';
 export interface ModelSelection { providerId?: string; modelId?: string; contextWindow?: number; maxTokens?: number; thinkingLevel?: import('../types/agent-knowledge.js').AgentThinkingLevel }
 export interface ResolvedProviderModel {
   providerId: string; providerName: string; presetId: string; openAiModel: string;
@@ -32,9 +33,13 @@ export function resolveProviderModel(llm: Pick<LlmConfig, 'providers' | 'activeP
     contextWindow: preset.contextWindow, maxTokens: preset.maxTokens, reasoning: preset.reasoning, thinkingLevels: preset.thinkingLevels };
 }
 
-export function providerModelParameters(model: Pick<ResolvedProviderModel, 'contextWindow' | 'maxTokens' | 'reasoning'>, defaults: ModelSelection = {}) {
+export function providerModelParameters(
+  model: Pick<ResolvedProviderModel, 'contextWindow' | 'maxTokens' | 'reasoning'> & { openAiModel?: string; directModel?: string; model?: string },
+  defaults: ModelSelection = {},
+) {
   const contextWindow = model.contextWindow ?? defaults.contextWindow ?? 128000;
-  return { contextWindow, maxTokens: Math.min(model.maxTokens ?? defaults.maxTokens ?? 8192, contextWindow), reasoning: model.reasoning ?? false };
+  const modelCode = model.openAiModel ?? model.directModel ?? model.model ?? '';
+  return { contextWindow, maxTokens: Math.min(model.maxTokens ?? defaults.maxTokens ?? suggestedMaxOutputTokens(modelCode), contextWindow), reasoning: model.reasoning ?? false };
 }
 
 /** Explicit null suppresses SDK environment fallbacks to unrelated credentials. */

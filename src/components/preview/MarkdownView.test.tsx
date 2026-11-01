@@ -270,6 +270,15 @@ describe('renderInline 链接拦截（Markdown 与 HTML 两个分支）', () => 
       'https://x.com',
     );
   });
+
+  it('标准库对象空锚点作为定位标记渲染，不显示链接拦截提示', () => {
+    const id = 'ko_105be2da-32e0-4ec5-8d5c-e543523e2218';
+    const nodes = renderInline(`<a id="${id}"></a>`, 't', ctx) as React.ReactElement<{ id?: string; title?: string }>[];
+    expect(nodes[0]?.type).toBe('span');
+    expect(nodes[0]?.props.id).toBe(id);
+    expect(nodes[0]?.props.title).toBeUndefined();
+    expect(findAnchor(nodes)).toBeUndefined();
+  });
 });
 
 describe('不可信内容远程图片策略（remoteImages="confirm"）', () => {

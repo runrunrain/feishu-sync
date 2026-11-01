@@ -1,0 +1,36 @@
+{
+  "taskId": "20261101-235559-local-mac-install",
+  "timestamp": "2026-11-01T23:55:59Z",
+  "agent": "luban",
+  "createdBy": "Leader direct execution",
+  "projectId": "feishu-sync",
+  "taskBrief": "构建并安装当前工作区到本机macOS arm64",
+  "status": "completed",
+  "upstreamArtifactReferences": [
+    "/Users/run.mao/workpace/feishu-sync/agent-outputs/workflow/build-runtime-v2/final-delivery-report.md"
+  ],
+  "validationEvidence": {
+    "buildStatus": "passed",
+    "testStatus": "passed",
+    "browserVerification": "not_applicable",
+    "commands": [
+      {
+        "command": "npm run desktop:dist:mac:arm64",
+        "exitCode": 0,
+        "summary": "0.3.50 arm64，签名通过，DMG/ZIP"
+      },
+      {
+        "command": "installed Electron native in-memory SQL + /api/health",
+        "exitCode": 0,
+        "summary": "ABI125，status=ok；开发ABI137恢复通过"
+      }
+    ]
+  },
+  "relatedFiles": [
+    "self-test-report.md"
+  ],
+  "nextSteps": {
+    "suggestedAgent": "Leader",
+    "suggestedAction": "安装已完成，应用已启动；无额外代码任务"
+  }
+}

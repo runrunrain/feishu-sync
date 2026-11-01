@@ -3144,13 +3144,14 @@ export class KbBuildService extends EventEmitter {
   }
 
   /** worker 拉取新单元/进入收尾轮时同步运行上下文（工具按 context 判定单元归属）。 */
-  private setWorkerAssignment(worker: WorkerRuntime, unitId: string | null, phase?: 'unit' | 'final'): void {
+  private setWorkerAssignment(worker: WorkerRuntime, unitId: string | null, phase?: 'unit' | 'final', revision = false): void {
     worker.unitId = unitId;
     if (worker.context) {
       worker.context.options.worker = {
         workerId: worker.workerId,
         unitId,
         phase: phase ?? (worker.workerId === 'final' ? 'final' : 'unit'),
+        revision,
       };
     }
   }
@@ -4316,14 +4317,14 @@ export class KbBuildService extends EventEmitter {
     const { entry, buildState, task } = input;
     const orchestration = entry.orchestration!;
     entry.stage = 'units';
-    this.setWorkerAssignment(worker, unit.id, 'unit');
+    this.setWorkerAssignment(worker, unit.id, 'unit', true);
     const report = this.readReviewReportFile(buildState.stagingRoot, unit.id);
     if (!report) throw new ToolError('kb_review_report_missing', `修订轮 ${task.taskId} 找不到上一轮审查报告`);
     const prompt = this.buildRevisePrompt(unit.id, round, report);
-    const outcome = await worker.rpc!.prompt(
+    const outcome = await this.promptUnitWithTrace(input.buildId, entry, worker, 'revise',
       input.systemRules ? `${prompt}\n\n---\n构建规则与文风规范（适用）：\n${input.systemRules}` : prompt,
-      { timeoutMs: input.promptTimeoutMs },
-    );
+      input.promptTimeoutMs,
+      `单元 ${unit.id} 修订轮上一轮输出被截断。继续修复审查报告中的阻断问题，仅重写相关草稿，完成后调用 kb_unit_done。`);
     if (entry.cancelRequested && outcome.outcome !== 'completed') throw new CancelledError();
     if (outcome.outcome === 'aborted') throw new CancelledError();
     if (outcome.outcome === 'failed') {
@@ -4441,23 +4442,37 @@ export class KbBuildService extends EventEmitter {
     const { entry, buildState, task } = input;
     const orchestration = entry.orchestration!;
     entry.stage = 'finishing';
-    this.setWorkerAssignment(worker, null, 'final');
+    this.setWorkerAssignment(worker, null, 'final', true);
     const report = this.readReviewReportFile(buildState.stagingRoot, 'all');
     if (!report) throw new ToolError('kb_review_report_missing', `整合修订轮 ${task.taskId} 找不到最终复核报告`);
+    const declarationFile = path.join(buildState.stagingRoot, 'knowledge-draft.json');
+    const missingManagedDocs: string[] = [];
+    if (fs.existsSync(declarationFile)) {
+      const declared = JSON.parse(fs.readFileSync(declarationFile, 'utf-8')) as { objects?: Array<{ tombstone?: boolean; canonical?: { path?: string } }> };
+      const paths = new Set((declared.objects ?? []).filter((object) => !object.tombstone)
+        .map((object) => object.canonical?.path).filter((value): value is string => typeof value === 'string'));
+      for (const docPath of paths) {
+        if (!fs.existsSync(path.join(buildState.stagingRoot, 'docs', docPath))) missingManagedDocs.push(docPath);
+      }
+    }
     const prompt = [
       `【整合修订轮】（B 案 §5）最终复核提出以下阻断/待修问题，请逐项修订整合阶段的候选草稿（跨单元合并、命名与交叉引用）：`,
       `<review_report>`,
       JSON.stringify({ issues: report.issues, uncheckedScope: report.uncheckedScope, conclusion: report.conclusion }, null, 2),
       `</review_report>`,
+      ...(missingManagedDocs.length > 0 ? [
+        `【恢复检查】以下已登记对象的草稿正文缺失，必须先恢复，不能以更少文档提交：${missingManagedDocs.join('、')}。`,
+        '对缺失路径调用 draft_read(path, includeDeclarations=true) 取回原对象与稳定 clientKey；再从 raw_read 读取来源，用 kb_write_doc 重建正文并重申该路径全部对象。不要删除其他文档。',
+      ] : []),
       '要求：',
-      '1. 逐项回应：已修复 / 有依据保留（写明依据）/ 需要补充资料（如实说明）。',
-      '2. 只修订问题与受影响内容，不要无关重写；写入不受路径限制（整合轮语义）。',
+      '1. 先用 draft_read(includeDeclarations=true) 读取报告指出的文档及其原有对象声明，再逐项回应：已修复 / 有依据保留（写明依据）/ 需要补充资料（如实说明）。',
+      '2. 只修订报告指出的问题与受影响文档，不要批量重写无关内容；写入不受路径限制（整合轮语义）。改写已有对象文档时，kb_write_doc 必须用原 clientKey 重申该文档全部对象、claims 和必要关联声明；不得把同一 familyKey+variantKey+scopeKey 拆成多个对象。根据新正文重新定位 bodyRange，并保留有效证据。',
       '3. kb_finish 已提交过、工具会拒绝重复调用——修订完成后直接结束本轮，不要再调用 kb_finish/kb_unit_done。',
     ].join('\n');
-    const outcome = await worker.rpc!.prompt(
+    const outcome = await this.promptUnitWithTrace(input.buildId, entry, worker, 'integrate_revise',
       input.systemRules ? `${prompt}\n\n---\n构建规则与文风规范（适用）：\n${input.systemRules}` : prompt,
-      { timeoutMs: input.promptTimeoutMs },
-    );
+      input.promptTimeoutMs,
+      '整合修订轮上一轮输出被截断。继续按最终复核报告修订相关草稿；kb_finish 已提交，不要重复调用。');
     if (entry.cancelRequested && outcome.outcome !== 'completed') throw new CancelledError();
     if (outcome.outcome === 'aborted') throw new CancelledError();
     if (outcome.outcome === 'failed') {
@@ -4822,8 +4837,8 @@ export class KbBuildService extends EventEmitter {
       JSON.stringify({ issues: report.issues, uncheckedScope: report.uncheckedScope, conclusion: report.conclusion }, null, 2),
       `</review_report>`,
       '要求：',
-      '1. 先用 draft_read 读回本单元草稿与问题位置，再逐项回应：已修复 / 有依据保留原文（写明依据）/ 需要补充资料（如实说明，不臆测）。',
-      '2. 只修订问题与受影响内容，不要无关重写；只能写本单元认领的路径。',
+      '1. 先用 draft_read 读回审查报告明确指出的草稿与问题位置；对需要改写的文档传 includeDeclarations=true，读取已有对象身份和声明，再逐项回应：已修复 / 有依据保留原文（写明依据）/ 需要补充资料（如实说明，不臆测）。',
+      '2. 只修订问题与受影响内容，不要批量重写无关文档；只能写本单元认领的路径。改写已有对象文档时，kb_write_doc 必须用原 clientKey 重申该文档全部对象、claims 和必要关联声明；不得把同一 familyKey+variantKey+scopeKey 拆成多个对象。根据新正文重新定位 bodyRange，并保留有效证据。',
       `3. 修订完成后调用 kb_unit_done（summary 写逐项回应摘要）。修订稿会换版本重新审查，旧报告不会批准新稿。`,
     ].join('\n');
   }
@@ -5247,7 +5262,7 @@ export class KbBuildService extends EventEmitter {
     buildId: string,
     entry: InMemoryBuild,
     worker: WorkerRuntime,
-    phase: 'batch' | 'batch_correction' | 'draft_correction' | 'done_correction' | 'review' | 'integrate' | 'integrate_correction' | 'final_review',
+    phase: 'batch' | 'batch_correction' | 'draft_correction' | 'done_correction' | 'review' | 'revise' | 'integrate' | 'integrate_correction' | 'integrate_revise' | 'final_review',
     prompt: string,
     timeoutMs: number,
     continuationPrompt?: string,

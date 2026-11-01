@@ -291,7 +291,7 @@ export default async function feishuSyncAgentExtension(/** @type {ExtensionAPI} 
         input: ['text'],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: model.contextWindow || 128000,
-        maxTokens: model.maxTokens || 8192,
+        maxTokens: model.maxTokens || 32768,
       })),
     });
     log(`provider feishu-sync-llm registered (${(descriptor.models || []).length} model(s), baseUrl=${descriptor.baseUrl})`);

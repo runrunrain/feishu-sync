@@ -161,7 +161,7 @@ export function resolveVisionContext(config: Config): ResolvedVisionContext | nu
     baseUrl: resolved.baseUrl,
     apiKey: resolved.apiKey,
     protocol: resolved.protocol,
-    maxTokens: resolved.maxTokens ?? 8192,
+    maxTokens: resolved.maxTokens ?? 32768,
     timeoutMs: vision.timeoutMs,
     maxImageBytes: vision.maxImageBytes,
     maxImagesPerBuild: vision.maxImagesPerBuild,
