@@ -238,6 +238,7 @@ export const KB_WRITE_DOC_SPEC: AgentToolSpec = {
     type: 'object',
     properties: {
       path: string('标准文档 POSIX 相对路径（.md 结尾，不以 . 开头，每段 ≤120 字符，深度 ≤6）'),
+      operationId: string('v2 编排必填（旧构建可缺省）：任务内唯一操作标识——提交成功但回执丢失时，同 ID 同载荷重放返回原回执'),
       title: string('文档标题（名词性短语）'),
       markdown: string('自然完整的知识正文，不含文件头或 # 总标题。禁止来源段落、来源标识、原始路径、来源脚注及构建信息；来源仅填sources，由侧栏展示。'),
       sources: { type: 'array', items: { type: 'string' }, description: '来源 objToken 列表（必须都在快照内）' },
@@ -371,6 +372,7 @@ export const KB_DELETE_DOC_SPEC: AgentToolSpec = {
     type: 'object',
     properties: {
       path: string('草稿 POSIX 相对路径'),
+      operationId: string('v2 编排必填（旧构建可缺省）：任务内唯一操作标识（幂等重放键）'),
     },
     required: ['path'],
     additionalProperties: false,
@@ -539,6 +541,7 @@ export const KB_SUBMIT_REVIEW_SPEC: AgentToolSpec = {
     type: 'object',
     properties: {
       unitId: string('审查对象单元 ID（缺省取当前 worker 单元；整体审查填 all）'),
+      operationId: string('v2 编排必填（旧构建可缺省）：任务内唯一操作标识（幂等重放键）'),
       coverage: {
         type: 'object',
         description: '覆盖范围：检查了哪些源材料（不能只给总分）',
@@ -840,6 +843,252 @@ export const TASK_CANCEL_SPEC: AgentToolSpec = {
   },
 };
 
+// ===========================================================================
+// v2 编排运行时工具（设计 v2 §3.4/§4/§5/§7）——成果权限闭环。Leader 面
+// 只含清单/分配/交接/问题/检查点/申请发布（无正文与对象写工具、无应用
+// task 族）；子任务面按角色下发（V2 名单见 build-actors.ts）。
+// ===========================================================================
+
+/** v2 Leader 工具名单（转发扩展白名单与 getToolSpecsForToken 同源）。 */
+export const V2_LEADER_TOOLS = [
+  'build_manifest',
+  'build_assign_output',
+  'build_revoke_output',
+  'build_handoff_list',
+  'build_issues_submit',
+  'build_issues_list',
+  'build_checkpoint',
+  'build_request_publish',
+] as const;
+
+export const KB_READ_BATCH_SPEC: AgentToolSpec = {
+  name: 'kb_read_batch',
+  label: '批量读取资源',
+  description: '一次读取任务范围内的多个资源（原始源或本构建草稿），带总量预算、分页游标与逐资源截断标记。raw 资源登记读取回执（与 raw_read 同语义，可作为证据声明依赖）；draft 资源可附现有知识声明。预算按返回行数计，超预算的请求进入 nextCursor，按原参继续。',
+  parameters: {
+    type: 'object',
+    properties: {
+      requests: {
+        type: 'array', minItems: 1, maxItems: 50,
+        description: '读取请求列表（顺序处理至预算耗尽）',
+        items: {
+          type: 'object',
+          properties: {
+            kind: { type: 'string', enum: ['raw', 'draft'], description: 'raw=原始源；draft=本构建草稿' },
+            objToken: string('raw：源 objToken'),
+            path: string('draft：草稿 POSIX 相对路径'),
+            offset: integer('起始行（0 基；raw 为拼接后输出坐标）', 0),
+            limit: integer('本资源返回行数上限', 1, 2000),
+            includeDeclarations: { type: 'boolean', description: 'draft：附现有知识对象声明（供局部编辑继承）' },
+          },
+          required: ['kind'],
+          additionalProperties: false,
+        },
+      },
+      maxLines: integer('本次总行数预算（缺省 1200）', 1, 4000),
+      cursor: string('分页游标（上一页返回的 nextCursor；携带时 requests 被忽略）'),
+    },
+    required: ['requests'],
+    additionalProperties: false,
+  },
+};
+
+export const KB_EDIT_DOC_SPEC: AgentToolSpec = {
+  name: 'kb_edit_doc',
+  label: '局部编辑草稿',
+  description: `对已有草稿做局部修改：服务端定位替换区间、继承未变声明（对象/断言/证据/呈现/关系自动平移坐标）、重算受影响对象哈希并使被改内容的旧审查失效。与 kb_write_doc 走同一校验链（编辑边界/来源声明/正文策略/声明解引用全部复用），不是绕开。定位失败返回结构化错误（候选位置与最近匹配）；expectedContentHash 不符说明草稿已变（他人或自己上一轮写入），需重读后重提。每次调用需唯一 operationId：提交成功但回执丢失时，用同 operationId 与同载荷重放即返回原回执。受影响对象（替换区间与对象区间相交）会被列出；语义变化需要调整对象归属时用 kb_write_doc 显式重申。`,
+  parameters: {
+    type: 'object',
+    properties: {
+      path: string('草稿 POSIX 相对路径（须已存在）'),
+      operationId: string('任务内唯一操作标识（幂等键；重放需同 ID 同载荷）'),
+      expectedContentHash: string('编辑基准内容哈希（draft_read 返回的 contentHash；防止草稿已变时盲写）'),
+      patches: {
+        type: 'array', minItems: 1, maxItems: 50,
+        description: '按顺序应用的补丁（后续补丁在前一补丁产生的文本上定位）',
+        items: {
+          type: 'object',
+          properties: {
+            anchor: {
+              type: 'object',
+              description: '替换区间定位（三选一；exact_text 用旧文本唯一匹配，heading_body 用标题路径取章节体，line_range 用参数坐标行区间）',
+              properties: {
+                kind: { type: 'string', enum: ['exact_text', 'heading_body', 'line_range'], description: '定位方式' },
+                oldText: string('exact_text：被替换文本（在当前文本中唯一匹配；occurrence 消歧重复命中）'),
+                occurrence: integer('exact_text：第几次命中（1 起始，缺省 1）', 1),
+                headingPath: { type: 'array', items: { type: 'string' }, description: 'heading_body：标题路径（与章节末（下一同级/更高级标题前）为替换区间）' },
+                startLine: integer('line_range：起始行（1 起始，参数坐标）', 1),
+                endLine: integer('line_range：结束行（闭区间）', 1),
+              },
+              required: ['kind'],
+              additionalProperties: false,
+            },
+            newText: string('替换文本（heading_body/line_range 会连同区间整体替换）'),
+          },
+          required: ['anchor', 'newText'],
+          additionalProperties: false,
+        },
+      },
+      titleUpdate: string('可选：更新文档标题'),
+      summaryUpdate: string('可选：更新摘要；未提供时沿用现有摘要（缺失且无 docMeta 时必填）'),
+      tagsUpdate: { type: 'array', items: { type: 'string' }, description: '可选：更新标签' },
+      sourcesAppend: { type: 'array', items: { type: 'string' }, description: '可选：追加来源 objToken（原来源保留；须在快照内）' },
+      expectedDraftRevision: integer('可选：期望的草稿修订号（乐观并发；不符拒绝）', 0),
+    },
+    required: ['path', 'operationId', 'patches'],
+    additionalProperties: false,
+  },
+};
+
+export const BUILD_MANIFEST_SPEC: AgentToolSpec = {
+  name: 'build_manifest',
+  label: '材料清单',
+  description: '列出本次构建冻结的源材料清单（objToken、标题、相对路径、类型、内容哈希、变更类型），带分页游标。只读。',
+  parameters: {
+    type: 'object',
+    properties: {
+      cursor: string('分页游标（上一页返回的 nextCursor）'),
+      limit: integer('每页条数', 1, 200),
+    },
+    additionalProperties: false,
+  },
+};
+
+export const BUILD_ASSIGN_OUTPUT_SPEC: AgentToolSpec = {
+  name: 'build_assign_output',
+  label: '分配输出目标',
+  description: '把目标文档（或对象族 family:<familyKey>）的写入资格分配给已确认的子任务。同一目标同时只有一个有效分配；目标被其他活动任务持有时返回冲突与持有者。同任务重复分配同目标幂等更新；supersedes=true 显式转移（先撤销同任务旧分配再生效）。续接产生的新任务 ID 会自动继承分配（父任务资格同步撤销）。',
+  parameters: {
+    type: 'object',
+    properties: {
+      ownerTaskId: string('子任务 ID（须已确认：创建事件已到达）'),
+      targets: { type: 'array', minItems: 1, maxItems: 200, items: { type: 'string' }, description: '目标列表：文档路径或 family:<familyKey>' },
+      supersedes: { type: 'boolean', description: '显式转移同任务旧分配（缺省：同目标重叠时幂等更新）' },
+    },
+    required: ['ownerTaskId', 'targets'],
+    additionalProperties: false,
+  },
+};
+
+export const BUILD_REVOKE_OUTPUT_SPEC: AgentToolSpec = {
+  name: 'build_revoke_output',
+  label: '收回输出分配',
+  description: '收回输出分配：按 assignmentId 或按 ownerTaskId 收回其全部活动分配。收回后该任务对相应目标失去写入资格。',
+  parameters: {
+    type: 'object',
+    properties: {
+      assignmentId: string('分配 ID（与 ownerTaskId 二选一）'),
+      ownerTaskId: string('任务 ID（与 assignmentId 二选一）'),
+    },
+    additionalProperties: false,
+  },
+};
+
+export const BUILD_HANDOFF_SUBMIT_SPEC: AgentToolSpec = {
+  name: 'build_handoff_submit',
+  label: '提交交接记录',
+  description: '子任务提交交接记录：成果引用（路径+修订）、来源范围、未解决问题与下一步所需信息。正文留在应用候选区，交接只携带可回读的引用与摘要；最终回复只给交接编号与结论。operationId 幂等：提交成功但回执丢失可同参重放。',
+  parameters: {
+    type: 'object',
+    properties: {
+      operationId: string('任务内唯一操作标识（幂等键）'),
+      summary: string('结论摘要（≤2000 字符）'),
+      artifactRefs: { type: 'array', maxItems: 200, items: { type: 'string' }, description: '成果引用（路径或路径@revision）' },
+      sourceScope: { type: 'array', maxItems: 200, items: { type: 'string' }, description: '覆盖的源 objToken' },
+      openIssues: { type: 'array', maxItems: 200, items: { type: 'string' }, description: '未解决问题（描述+位置）' },
+      nextInfo: { type: 'array', maxItems: 200, items: { type: 'string' }, description: '下一步所需信息/建议' },
+    },
+    required: ['operationId', 'summary'],
+    additionalProperties: false,
+  },
+};
+
+export const BUILD_HANDOFF_LIST_SPEC: AgentToolSpec = {
+  name: 'build_handoff_list',
+  label: '读取交接记录',
+  description: '读取子任务提交的交接记录（可按 taskId 过滤）。只读。',
+  parameters: {
+    type: 'object',
+    properties: {
+      taskId: string('按任务 ID 过滤（缺省全部）'),
+    },
+    additionalProperties: false,
+  },
+};
+
+export const BUILD_ISSUES_SUBMIT_SPEC: AgentToolSpec = {
+  name: 'build_issues_submit',
+  label: '提交问题清单',
+  description: 'Leader 提交聚合后的阻断问题与相关范围（修订子任务只接收此清单，不重读全部审查报告）。每次提交生成新 revision；问题可溯源到审查报告（fromReviewId）。',
+  parameters: {
+    type: 'object',
+    properties: {
+      summary: string('聚合说明（可选）'),
+      issues: {
+        type: 'array', maxItems: 500,
+        description: '问题清单',
+        items: {
+          type: 'object',
+          properties: {
+            issueKey: string('问题标识（修订者引用）'),
+            severity: { type: 'string', enum: ['blocking', 'suggestion'], description: '分级（blocking 未解决会阻断发布）' },
+            targetPath: string('目标草稿路径'),
+            draftLocation: string('草稿位置（章节/行区间）'),
+            sourceLocation: string('源位置（源标题+A1 区间/行区间）'),
+            description: string('问题描述与依据'),
+            fromReviewId: string('来源审查报告 ID（审查回执溯源）'),
+          },
+          required: ['issueKey', 'severity', 'description'],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: ['issues'],
+    additionalProperties: false,
+  },
+};
+
+export const BUILD_ISSUES_LIST_SPEC: AgentToolSpec = {
+  name: 'build_issues_list',
+  label: '读取问题清单',
+  description: '读取 Leader 聚合的问题清单（修订子任务用；返回最新 revision）。只读。',
+  parameters: {
+    type: 'object',
+    properties: {
+      targetPath: string('按目标路径过滤（缺省全部）'),
+    },
+    additionalProperties: false,
+  },
+};
+
+export const BUILD_CHECKPOINT_SPEC: AgentToolSpec = {
+  name: 'build_checkpoint',
+  label: '构建检查点',
+  description: '保存构建检查点（成果账本与候选区状态原子落盘）或查询检查点状态。保存后可安全断点恢复。',
+  parameters: {
+    type: 'object',
+    properties: {
+      action: { type: 'string', enum: ['save', 'status'], description: 'save=保存检查点；status=查询状态（只读）' },
+    },
+    required: ['action'],
+    additionalProperties: false,
+  },
+};
+
+export const BUILD_REQUEST_PUBLISH_SPEC: AgentToolSpec = {
+  name: 'build_request_publish',
+  label: '申请发布',
+  description: 'Leader 申请发布当前候选版本：应用锁定候选内容哈希（校验期间新写入被拒）、检查运行代次与未解决阻断问题，然后运行发布校验管线并返回结果。模型不能直接更新发布指针；最终成功以应用返回的发布结果为准。',
+  parameters: {
+    type: 'object',
+    properties: {
+      requestedRevision: string('申请的具体候选标识（缺省当前候选哈希）'),
+      summary: string('收尾说明（可选）'),
+    },
+    additionalProperties: false,
+  },
+};
+
 const ALL_SPECS: AgentToolSpec[] = [
   KB_SEARCH_SPEC,
   KB_READ_SPEC,
@@ -871,6 +1120,17 @@ const ALL_SPECS: AgentToolSpec[] = [
   TASK_QUERY_SPEC,
   TASK_RESUME_SPEC,
   TASK_CANCEL_SPEC,
+  KB_READ_BATCH_SPEC,
+  KB_EDIT_DOC_SPEC,
+  BUILD_MANIFEST_SPEC,
+  BUILD_ASSIGN_OUTPUT_SPEC,
+  BUILD_REVOKE_OUTPUT_SPEC,
+  BUILD_HANDOFF_SUBMIT_SPEC,
+  BUILD_HANDOFF_LIST_SPEC,
+  BUILD_ISSUES_SUBMIT_SPEC,
+  BUILD_ISSUES_LIST_SPEC,
+  BUILD_CHECKPOINT_SPEC,
+  BUILD_REQUEST_PUBLISH_SPEC,
 ];
 
 const SPEC_BY_NAME = new Map(ALL_SPECS.map((spec) => [spec.name, spec]));

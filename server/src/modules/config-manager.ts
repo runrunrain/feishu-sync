@@ -42,6 +42,8 @@ import {
   buildDefaultAgentOrchestrationConfig,
   EVIDENCE_BUDGET_MAX_BYTES,
   EVIDENCE_BUDGET_MIN_BYTES,
+  KB_ORCHESTRATION_MODES,
+  resolveOrchestrationMode,
   type AgentConfig,
   type AgentOrchestrationConfig,
   type AgentVisionConfig,
@@ -421,6 +423,9 @@ function normalizeStandardKbConfigLoose(value: unknown, dataRoot: string): Stand
       ? Math.max(5, Math.min(1440, Math.floor(raw.buildTimeoutMinutes)))
       : base.buildTimeoutMinutes,
     autoBuildAfterSync: raw.autoBuildAfterSync === true ? true : false,
+    // 重构 v2 §13.5：构建编排模式（additive；缺省/非法回落 legacy——保守
+    // 默认，新模式仅在真实运行门槛通过后由用户显式修改）
+    orchestrationMode: resolveOrchestrationMode(raw as Partial<StandardKbConfig>),
   };
 }
 
@@ -594,6 +599,10 @@ export function validateAgentAndKbConfig(value: {
     // B案 §7：发布方式枚举
     if (kb.publishMode !== undefined && !['auto', 'confirm'].includes(kb.publishMode)) {
       details.push({ field: 'standardKb.publishMode', code: 'invalid_value' });
+    }
+    // 重构 v2 §13.5：构建编排模式受控枚举（非法值拒绝，不静默回落）
+    if (kb.orchestrationMode !== undefined && !KB_ORCHESTRATION_MODES.has(String(kb.orchestrationMode))) {
+      details.push({ field: 'standardKb.orchestrationMode', code: 'invalid_value' });
     }
     // D3（A 案 §5.4）：证据资源预算范围（严格路径；宽容归一在
     // normalizeStandardKbConfigLoose）

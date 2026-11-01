@@ -54,6 +54,18 @@ const rolesSrc = path.join(srcRoot, 'agent', 'roles');
 const roleCount = fs.existsSync(rolesSrc) ? copyDir(rolesSrc, path.join(distRoot, 'agent', 'roles')) : 0;
 console.info(`[build-agent-assets] copied ${roleCount} role card(s)`);
 
+// 重构 v2：构建工作流 skill 包（server/src/agent/skills/** → dist/agent/skills）。
+// kb-build-service.leaderWorkflowAssets 从 dist 读取（开发态回退 src）；
+// Leader 规则注入与 workflowRevision 哈希都依赖该目录，缺包时新模式
+// 拒绝启动（不降级）。子任务经 amagi 技能白名单加载同一份文件。
+const skillsSrc = path.join(srcRoot, 'agent', 'skills');
+if (fs.existsSync(skillsSrc)) {
+  const skillCount = copyDir(skillsSrc, path.join(distRoot, 'agent', 'skills'));
+  console.info(`[build-agent-assets] copied ${skillCount} workflow skill file(s)`);
+} else {
+  console.warn('[build-agent-assets] agent/skills 缺失：pi-amagi 构建模式将拒绝启动（leader-protocol 不可注入）');
+}
+
 // 2. MCP 单文件打包（共享入口，配置见 lib/mcp-bundle.mjs）
 const { outfile, size } = await bundleMcp();
 console.info(`[build-agent-assets] bundled ${path.basename(outfile)} (${(size / 1024).toFixed(1)} KB)`);

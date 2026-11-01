@@ -67,6 +67,7 @@ import { TASK_TOOL_FAMILY_NAME, TASK_TOOL_NAMES } from './agent/tool-specs.js';
 import { ApprovalService } from './agent/approvals/approval-service.js';
 import { createOpsToolFamily } from './agent/tools/app-command-family.js';
 import { KbBuildService } from './kb/kb-build-service.js';
+import { BuildRuntimeHost } from './kb/build-runtime-host.js';
 import { projectKnowledgeDocuments, recoveredSourceCsvPaths } from './kb/local-source-projection.js';
 import { piExtensionPath, readAgentPromptAssets, readAgentPromptFile } from './agent/agent-assets.js';
 import { RuntimeInstaller } from './agent/runtime-installer.js';
@@ -285,6 +286,19 @@ export async function buildServer(options: CreateServerOptions = {}) {
   });
   // 回环内部 API 基址：端口在 startServer 监听后回填（构建/会话 spawn 前必然已知）
   const agentInternalPort = { port: null as number | null };
+  // 重构 v2：构建运行宿主（pi-amagi 模式生产入口；探测/包安装/Leader 会话）。
+  // 单构建串行不变量由 KbBuildService.running 保证；未接线时 pi-amagi 创建
+  // 即 503 拒绝（不降级 legacy）。
+  const buildRuntimeHost = new BuildRuntimeHost({
+    dataRoot: agentDataRoot,
+    resolver: runtimeResolver,
+    toolService: agentToolService,
+    pool: agentPool,
+    configProvider: () => configManager.getConfig(),
+    internalBaseUrl: () => (agentInternalPort.port ? `http://127.0.0.1:${agentInternalPort.port}` : ''),
+    knowledgeBaseRoot: () => configManager.getConfig()?.knowledgeBaseRoot ?? '',
+    outputRoot: () => configManager.getConfig()?.standardKb.outputRoot ?? '',
+  });
   const runtimeInstaller = new RuntimeInstaller(agentDataRoot, runtimeResolver, agentPool, () => configManager.getConfig()!.agent);
   if (process.env.NODE_ENV !== 'test' && !process.env.VITEST) void runtimeInstaller.ensureMissing().catch((error) => console.warn('[agent] 自动安装未完成:', error instanceof Error ? error.message : 'unknown error'));
   // F3-R02：当前配置快照的 Workspace 守卫。受保护运行根 = 静态（源码/
@@ -359,6 +373,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
     promptAssets: readAgentPromptAssets,
     reviewPrompt: () => readAgentPromptFile('standard-kb-review.md'),
     visionDescriber,
+    buildRuntime: buildRuntimeHost,
   });
   // 启动对账：非终态构建置 interrupted；CURRENT 指针为准补 DB
   const reconcile = kbBuildService.reconcileOnStartup(localMapStore);
@@ -657,6 +672,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
     localMapStore,
     documentsProvider: knowledgeDocuments,
     sheetCsvPaths,
+    buildRuntime: buildRuntimeHost,
   }));
   // P1-S8（设计 P1 §4.6）：反向发布 API（计划/执行/列表/详情/发布根）。
   app.route('/', kbPublicationsRoutes({

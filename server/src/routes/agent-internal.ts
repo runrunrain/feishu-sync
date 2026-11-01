@@ -57,11 +57,20 @@ export function agentInternalRoutes(toolService: AgentToolService): Hono {
 
   routes.get('/api/agent-internal/tools', (c) => {
     const token = c.req.header('X-Agent-Run-Token') ?? '';
-    const specs = toolService.getToolSpecsForToken(token);
+    // v2（设计 v2 §4.1）：受信身份头（桥接 env 透传，不采信模型参数）。
+    const identity = {
+      amagiTaskId: c.req.header('X-Amagi-Task-Id') || undefined,
+      amagiAgent: c.req.header('X-Amagi-Agent') || undefined,
+    };
+    const specs = toolService.getToolSpecsForToken(token, identity);
     if (specs === null) {
       return c.json({ error: 'run_token_invalid', message: '运行令牌无效或已过期' }, 401);
     }
-    return c.json(specs);
+    // MCP readOnlyHint（§3.3）：读取类工具标注 annotations，写入类不带。
+    return c.json(specs.map((spec) => ({
+      ...spec,
+      ...(toolService.isReadOnlyTool(spec.name) ? { annotations: { readOnlyHint: true } } : {}),
+    })));
   });
 
   routes.post('/api/agent-internal/tools/:name', async (c) => {
@@ -74,9 +83,14 @@ export function agentInternalRoutes(toolService: AgentToolService): Hono {
       return c.json({ error: 'invalid_json', message: '请求体必须是 JSON' }, 400);
     }
     const args = body.args && typeof body.args === 'object' ? body.args as Record<string, unknown> : {};
+    // v2（§4.1）：受信 env 身份经单独头透传（AMAGI_TASK_ID/AMAGI_AGENT）。
+    const amagiTaskId = c.req.header('X-Amagi-Task-Id');
+    const amagiAgent = c.req.header('X-Amagi-Agent');
     try {
       const result = await toolService.executeTool(token, name, args, {
         toolCallId: typeof body.toolCallId === 'string' ? body.toolCallId : undefined,
+        ...(amagiTaskId ? { amagiTaskId } : {}),
+        ...(amagiAgent ? { amagiAgent } : {}),
       });
       return c.json(result);
     } catch (error) {

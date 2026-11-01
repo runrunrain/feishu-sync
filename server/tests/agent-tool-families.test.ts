@@ -30,8 +30,13 @@ const LEGACY_WHITELISTS: Record<AgentRunKind, string[]> = {
 /** 裸服务未注册的外部族工具（ops/task 在 index.ts 按需注册）：在 pi
  * --tools 参数面（toolsForRunKind 常量）里，但不在裸服务白名单。 */
 const EXTERNAL_FAMILY_TOOLS = ['app_command'];
+/** v2 build-runtime 族中进入 build 基线面的新工具（设计 v2 §7：批量
+ * 读取对旧模式也可用；追加在基线之后，与注册序一致）。 */
+const BUILD_RUNTIME_BUILD_TOOLS = ['kb_read_batch'];
 const expectedWhitelist = (runKind: AgentRunKind): string[] =>
-  toolsForRunKind(runKind).filter((name) => !EXTERNAL_FAMILY_TOOLS.includes(name));
+  runKind === 'build'
+    ? [...toolsForRunKind(runKind).filter((name) => !EXTERNAL_FAMILY_TOOLS.includes(name)), ...BUILD_RUNTIME_BUILD_TOOLS]
+    : toolsForRunKind(runKind).filter((name) => !EXTERNAL_FAMILY_TOOLS.includes(name));
 
 describe('工具族注册：白名单等价（表驱动快照）', () => {
   const service = new AgentToolService({
@@ -39,8 +44,8 @@ describe('工具族注册：白名单等价（表驱动快照）', () => {
     documentsProvider: () => [],
   });
 
-  it('registeredFamilies：内置四族 raw/kb/draft/ws（注册序）', () => {
-    expect(service.registeredFamilies()).toEqual(['raw', 'kb', 'draft', 'ws']);
+  it('registeredFamilies：内置五族 raw/kb/draft/ws/build-runtime（注册序）', () => {
+    expect(service.registeredFamilies()).toEqual(['raw', 'kb', 'draft', 'ws', 'build-runtime']);
   });
 
   const kinds: AgentRunKind[] = ['build', 'work', 'discuss', 'probe'];

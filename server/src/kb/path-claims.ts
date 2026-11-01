@@ -49,6 +49,30 @@ export class PathClaims {
     return result.sort();
   }
 
+  /** v2（设计 v2 §4.2）：释放单条认领（输出分配收回/撤销时同步；未认领
+   * 时 no-op）。持有者从构建单元扩展到任务身份（ownerId 语义不变）。 */
+  release(path: string): void {
+    this.owners.delete(path);
+  }
+
+  /** v2（§4.2）：认领转移（续接继承/输出分配转移：新持有者接替旧持有者
+ * 对同一路径的认领；路径未被认领时等价于 claim）。 */
+  reassign(path: string, newOwnerId: string): void {
+    this.owners.set(path, newOwnerId);
+  }
+
+  /** v2（§4.2）：按持有者释放全部认领（任务撤销时同步）。 */
+  releaseAllBy(ownerId: string): number {
+    let count = 0;
+    for (const [path, owner] of this.owners) {
+      if (owner === ownerId) {
+        this.owners.delete(path);
+        count += 1;
+      }
+    }
+    return count;
+  }
+
   /** 已认领路径总数。 */
   get size(): number {
     return this.owners.size;

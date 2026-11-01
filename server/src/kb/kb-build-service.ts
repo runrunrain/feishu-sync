@@ -56,6 +56,7 @@ import {
   canPublish,
   computeCandidateHash,
   isIssueClosed,
+  type BuildPublishMode,
   type BuildRole,
   type BuildRoleModelConfig,
   type BuildSpec,
@@ -93,12 +94,14 @@ import { readAgentPromptFile } from '../agent/agent-assets.js';
 import {
   KB_MANIFEST_SCHEMA_V2,
   resolveBuildConcurrency,
+  resolveOrchestrationMode,
   toolsForRunKind,
   type AgentStatusDto,
   type KbBuildDto,
   type KbBuildImagesProgress,
   type KbBuildMetrics,
   type KbBuildMetricsPhaseRole,
+  type KbBuildOrchestrationMode,
   type KbBuildProgressDto,
   type KbBuildReportIssue,
   type KbBuildUnitsProgress,
@@ -109,8 +112,14 @@ import {
   type KbManifest,
   type KbManifestDoc,
   type KbOrganizationManifestSection,
+  type LeaderRunCheckpointState,
+  type LeaderRunProgressDto,
   type RawSourceSnapshotEntry,
 } from '../types/agent-knowledge.js';
+import type { LeaderRunOutcome } from './build-leader-supervisor.js';
+import { BuildRuntimeHost, type LeaderBuildInput, type LeaderBuildModel } from './build-runtime-host.js';
+import type { ThinkingLevel } from '../agent/build-runtime/contracts.js';
+import { serverDistRoot } from '../agent/agent-assets.js';
 import type { Config } from '../types/index.js';
 
 export interface KbBuildDeps {
@@ -136,6 +145,11 @@ export interface KbBuildDeps {
   visionDescriber?: VisionDescriberLike;
   /** S4：测试接缝——替换 PiRpcProcess 构造（假 pi 双 worker 回归用） */
   processFactory?: (options: ConstructorParameters<typeof PiRpcProcess>[0]) => PiRpcProcess;
+  /** 重构 v2：构建运行宿主（生产实现；index.ts 构造注入）。未注入时
+   * pi-amagi 模式在创建构建时显式拒绝（不降级 legacy）。 */
+  buildRuntime?: BuildRuntimeHost;
+  /** 重构 v2：空闲宽限毫秒（测试接缝；缺省 DEFAULT_LEADER_IDLE_GRACE_MS） */
+  leaderIdleGraceMs?: number;
 }
 
 interface WorkerRuntime {
@@ -172,6 +186,9 @@ interface InMemoryBuild {
   id: string;
   /** 基座在创建构建时固定，设置变更只影响之后的新构建。 */
   backend?: 'pi' | 'claude-code';
+  /** 重构 v2：构建创建时冻结的编排模式（legacy / pi-amagi；旧检查点
+   * 恢复按检查点缺省 legacy）。 */
+  orchestrationMode: KbBuildOrchestrationMode;
   /** 本次所选源文档的图片是否强制重新识别。 */
   refreshImages: boolean;
   /** 沿用当前标准库，并强制重建当前勾选的源。 */
@@ -205,6 +222,27 @@ interface InMemoryBuild {
   checkpointReady: boolean;
   /** S1：构建度量采集（失败降级 null，不影响构建语义） */
   metrics: BuildMetricsCollector;
+  /** 重构 v2：Leader 监督运行状态（随检查点原子落盘）与流水线上下文。 */
+  leaderRun?: LeaderRunCheckpointState;
+  leaderPipelineContext?: LeaderPipelineContext;
+  /** 恢复策略（用户显式选择；缺省按绑定能力自动选择） */
+  leaderResumeStrategy?: 'session' | 'rebuild';
+}
+
+/** Leader 阶段的流水线上下文（发布执行器重建发布输入用；轻量引用）。 */
+interface LeaderPipelineContext {
+  effectiveMode: 'full' | 'incremental';
+  sourceSnapshotHash: string;
+  baseReleaseId: string | null;
+  model: string | null;
+  updateKbBuild: (patch: Record<string, unknown>) => void;
+}
+
+/** pi 合法思考档位（与 agent/build-runtime contracts ThinkingLevel 同集）。 */
+const PI_THINKING_LEVEL_SET: ReadonlySet<string> = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+
+function isPiThinkingLevel(value: string | undefined): value is ThinkingLevel {
+  return typeof value === 'string' && PI_THINKING_LEVEL_SET.has(value);
 }
 
 export class KbBuildService extends EventEmitter {
@@ -219,8 +257,8 @@ export class KbBuildService extends EventEmitter {
     this.deps = deps;
   }
 
-  private newEntry(id: string, backend: 'pi' | 'claude-code', mode: 'full' | 'incremental', rebuildSelected = false, refreshImages = false): InMemoryBuild {
-    return { id, backend, requestedMode: mode, rebuildSelected, refreshImages, imageRefreshFailures: 0,
+  private newEntry(id: string, backend: 'pi' | 'claude-code', mode: 'full' | 'incremental', rebuildSelected = false, refreshImages = false, orchestrationMode: KbBuildOrchestrationMode = 'legacy'): InMemoryBuild {
+    return { id, backend, orchestrationMode, requestedMode: mode, rebuildSelected, refreshImages, imageRefreshFailures: 0,
       batchIndex: 0, batchTotal: 0, buildState: null, cancelRequested: false, cancelController: null, timedOut: false,
       workers: new Map(), stage: null, units: { total: 0, done: 0, running: 0, failed: 0, retried: 0 },
       images: { total: 0, described: 0, cached: 0, unavailable: 0 }, process: null, events: [], nextSeq: 1,
@@ -248,6 +286,9 @@ export class KbBuildService extends EventEmitter {
         unitProgress: units.map((unit) => [unit.id, entry.unitProgress.get(unit.id) ?? 0]),
         workerCount: entry.workerCount, wordBudget: entry.wordBudget, progress: this.progressOf(entry), updatedAt: new Date().toISOString(),
         orchestration: entry.orchestration?.serialize(),
+        // 重构 v2：Leader 监督状态（与 entry.leaderRun 同一引用——监督器
+        // 实例状态即检查点真相，含成果账本载荷）。
+        leaderRun: entry.leaderRun,
       }, state.stagingRoot);
     } catch (error) {
       const message = `无法保存构建检查点：${error instanceof Error ? error.message : String(error)}`;
@@ -453,6 +494,7 @@ export class KbBuildService extends EventEmitter {
     return {
       id: String(row.id),
       ...(entry ? { eventSeq: entry.nextSeq - 1 } : {}),
+      ...(entry?.orchestrationMode === 'pi-amagi' ? { orchestrationMode: 'pi-amagi' as const } : {}),
       mode: row.mode as KbBuildDto['mode'],
       status: row.status as KbBuildDto['status'],
       noChanges: row.no_changes === 1,
@@ -549,6 +591,20 @@ export class KbBuildService extends EventEmitter {
       throw new ToolError('kb_build_running', '已有构建正在进行', 409);
     }
 
+    // 重构 v2 §13.5：创建时冻结编排模式；claude-native 未经真实能力验收
+    // （设计 §10/13.1）显式拒绝；pi-amagi 需运行适配层已接线（未接线
+    // 显式失败，绝不静默回落 legacy/单 agent）。
+    const orchestrationMode = resolveOrchestrationMode(config.standardKb);
+    if (orchestrationMode === 'claude-native') {
+      throw new ToolError('build_mode_unavailable', "orchestrationMode='claude-native' 尚未通过真实能力验收（设计 §10/§13.1：子 agent 派发、事件完整性与身份链未实测），暂不可启动；请使用 'legacy' 或 'pi-amagi'", 400);
+    }
+    if (orchestrationMode === 'pi-amagi' && !this.deps.buildRuntime) {
+      throw new ToolError('build_runtime_unavailable', "orchestrationMode='pi-amagi' 的运行适配层（build-runtime contracts）尚未接线；本版本暂不可启动，不会降级为 legacy。请保持 legacy 或等待运行时集成完成", 503);
+    }
+    if (orchestrationMode === 'pi-amagi' && config.agent.runtime.backend === 'claude-code') {
+      throw new ToolError('build_mode_unavailable', "orchestrationMode='pi-amagi' 需要 pi 基座（当前为 claude-code）；Pi + amagi 派发不在 Claude Code 进程内运行", 400);
+    }
+
     // 就绪检查（不消耗额度）
     const status = await this.deps.resolver.checkReadiness({
       agentConfig: config.agent,
@@ -580,7 +636,7 @@ export class KbBuildService extends EventEmitter {
       model,
       createdAt: new Date().toISOString(),
     });
-    this.active.set(buildId, this.newEntry(buildId, config.agent.runtime.backend === 'claude-code' ? 'claude-code' : 'pi', input.mode, input.rebuildSelected === true, input.refreshImages === true));
+    this.active.set(buildId, this.newEntry(buildId, config.agent.runtime.backend === 'claude-code' ? 'claude-code' : 'pi', input.mode, input.rebuildSelected === true, input.refreshImages === true, orchestrationMode));
 
     // 异步执行
     void this.runPipeline(localMapStore as never, buildId, input.mode).catch((error) => {
@@ -591,7 +647,7 @@ export class KbBuildService extends EventEmitter {
     return this.toDto(row ?? { id: buildId, mode: input.mode, status: 'queued', created_at: new Date().toISOString() }, this.active.get(buildId));
   }
 
-  async resumeBuild(localMapStore: Parameters<KbBuildService['createBuild']>[0] & { getKbBuild(id: string): Record<string, unknown> | null }, buildId: string, confirm?: string): Promise<KbBuildDto> {
+  async resumeBuild(localMapStore: Parameters<KbBuildService['createBuild']>[0] & { getKbBuild(id: string): Record<string, unknown> | null }, buildId: string, confirm?: string, resumeStrategy?: string): Promise<KbBuildDto> {
     if (confirm !== 'RESUME') throw new ToolError('confirmation_required', '继续构建需要 confirm: "RESUME"');
     if (this.running || localMapStore.getActiveKbBuild()) throw new ToolError('kb_build_running', '已有构建正在进行', 409);
     const row = localMapStore.getKbBuild(buildId);
@@ -632,7 +688,21 @@ export class KbBuildService extends EventEmitter {
     const ready = await this.deps.resolver.checkReadiness({ agentConfig: { ...config.agent, runtime: { ...config.agent.runtime, backend: checkpoint.backend } }, llmConfig: config.llm, runningProcesses: this.deps.pool.runningCount() });
     if (ready.code !== 'ready') throw new ToolError('agent_not_ready', `Agent 未就绪：${ready.message}`, 503);
     if (this.running || localMapStore.getActiveKbBuild()) throw new ToolError('kb_build_running', '已有构建正在进行', 409);
-    const entry = this.newEntry(buildId, checkpoint.backend, checkpoint.requestedMode, checkpoint.rebuildSelected);
+    const entry = this.newEntry(buildId, checkpoint.backend, checkpoint.requestedMode, checkpoint.rebuildSelected, false, checkpoint.leaderRun ? 'pi-amagi' : 'legacy');
+    if (checkpoint.leaderRun) {
+      // 重构 v2：新模式检查点只走新模式恢复（会话级/成果级由流水线内
+      // 监督器校验），不得用旧调度器解释新任务状态（设计 §13.5）。
+      if (!this.deps.buildRuntime) {
+        throw new ToolError('build_runtime_unavailable', "该构建为 pi-amagi 模式检查点，但运行适配层尚未接线，无法恢复；请等待运行时集成完成（不降级为 legacy）", 503);
+      }
+      entry.leaderRun = checkpoint.leaderRun;
+      // 恢复策略显式化（会话级/成果级；缺省按绑定能力自动选择，冻结
+      // 不一致时由监督器拒绝会话级并提示选择成果级）。
+      if (resumeStrategy !== undefined && resumeStrategy !== 'session' && resumeStrategy !== 'rebuild') {
+        throw new ToolError('invalid_request', "resumeStrategy 必须是 'session' 或 'rebuild'", 400);
+      }
+      entry.leaderResumeStrategy = resumeStrategy as 'session' | 'rebuild' | undefined;
+    }
     entry.resume = checkpoint; entry.singleBatches = checkpoint.singleBatches; entry.singleCompleted = checkpoint.singleCompleted;
     entry.unitProgress = new Map(checkpoint.unitProgress); entry.events = this.readStoredEvents(buildId); entry.nextSeq = (entry.events.at(-1)?.seq ?? 0) + 1;
     this.active.set(buildId, entry);
@@ -655,6 +725,8 @@ export class KbBuildService extends EventEmitter {
     const entry = this.active.get(buildId);
     if (entry) {
       entry.cancelRequested = true;
+      // 重构 v2：Leader 监督模式先撤代次凭据再宽限终止（幂等；设计 §9）。
+      if (entry.leaderRun) void this.deps.buildRuntime?.activeSession(buildId)?.requestCancel();
       // S4：取消句柄集——排队中的 acquire 出队拒绝 + 全部 worker 进程 abort
       entry.cancelController?.abort();
       for (const worker of entry.workers.values()) {
@@ -676,6 +748,490 @@ export class KbBuildService extends EventEmitter {
   }
 
   // ------------------------------------------------------------------
+  // 重构 v2：Leader 监督路径（设计 §5/§8/§9）
+  // ------------------------------------------------------------------
+
+  /** 构建 skill 包资产定位（dist→src 回退；缺包时新模式拒绝启动）。 */
+  private static leaderWorkflowAssets(): { leaderRules: string; revision: string; skillPath: string; combined: string } {
+    const relatives = [
+      'knowledge-build/SKILL.md',
+      'knowledge-build/leader-protocol.md',
+      'knowledge-build/author-protocol.md',
+      'knowledge-build/reviewer-protocol.md',
+      'knowledge-build/achievement-protocol.md',
+      'knowledge-build/mcp-examples.md',
+    ];
+    const bases = [
+      path.join(serverDistRoot(), 'agent', 'skills'),
+      path.join(serverDistRoot(), '..', 'src', 'agent', 'skills'),
+    ];
+    const read = (relative: string): string | null => {
+      for (const base of bases) {
+        const file = path.join(base, relative);
+        if (fs.existsSync(file)) {
+          try { return fs.readFileSync(file, 'utf8'); } catch { /* 尝试下一处 */ }
+        }
+      }
+      return null;
+    };
+    const contents = new Map<string, string>();
+    for (const relative of relatives) {
+      const content = read(relative);
+      if (content !== null) contents.set(relative, content);
+    }
+    const leaderRules = contents.get('knowledge-build/leader-protocol.md');
+    if (leaderRules === undefined) {
+      throw new ToolError('build_runtime_unavailable', '构建工作流 skill 包缺失（agent/skills/knowledge-build/leader-protocol.md）；Leader 规则注入不依赖模型 read，缺包时 pi-amagi 模式拒绝启动', 503);
+    }
+    // skill 入口路径（子任务经 amagi.json agents.<role>.skills 加载）
+    const skillBase = bases.find((base) => fs.existsSync(path.join(base, 'knowledge-build', 'SKILL.md')));
+    if (!skillBase) {
+      throw new ToolError('build_runtime_unavailable', '构建工作流 skill 入口缺失（agent/skills/knowledge-build/SKILL.md）；子任务技能注入不可用，pi-amagi 模式拒绝启动', 503);
+    }
+    const skillPath = path.join(skillBase, 'knowledge-build', 'SKILL.md');
+    const revision = crypto.createHash('sha256')
+      .update(relatives.map((relative) => `${relative}\0${contents.get(relative) ?? ''}`).join('\n'))
+      .digest('hex');
+    // 全量拼接内容（构建专用物化用；六协议模板 + 运行时质量基线合并为单文件）
+    const combined = relatives.map((relative) => `\n\n---\n\n# ${relative}\n\n${contents.get(relative) ?? ''}`).join('');
+    return { leaderRules, revision, skillPath, combined };
+  }
+
+  /** 构建专用物化冻结 skill（steer #5）：六协议模板 + 内置 buildRules/styleGuide/
+   * reviewPrompt 全部内联单文件，子任务经 --skill 精确注入；内容哈希=workflowRevision
+   * ——质量规则变化即冻结不一致，session 恢复被拒（不静默换规则）。 */
+  private materializeWorkflowSkill(buildId: string): { leaderRules: string; revision: string; skillPath: string } {
+    const base = KbBuildService.leaderWorkflowAssets();
+    // steer #5/#11：内置 buildRules/styleGuide/reviewPrompt 必须进入冻结 skill
+    //（不受 pluginStore 门控——v1 门控只针对旧内联注入；物化基线不可丢）
+    const quality = KbBuildService.qualityBaselineSections(
+      this.deps.promptAssets(),
+      this.deps.reviewPrompt?.() ?? null,
+    ).join('\n');
+    const content = `${base.combined}${quality ? `\n${quality}\n` : ''}`;
+    // steer #11：物化到 build 专用 home 的独立 skills 目录（与 policy/config
+    // 禁区分开，允许子任务 read 但不授写；outputRoot 整体在 buildForbiddenZones
+    // 禁区内，旧路径 <outputRoot>/.builds/<id>/ 不可用）
+    const dir = path.join(this.deps.dataRoot, 'agent', 'builds', buildId, 'home', 'skills');
+    fs.mkdirSync(dir, { recursive: true });
+    const skillPath = path.join(dir, 'workflow-skill.md');
+    fs.writeFileSync(skillPath, content);
+    return { leaderRules: base.leaderRules, revision: crypto.createHash('sha256').update(content).digest('hex'), skillPath };
+  }
+
+  /** 质量基线章节（Leader 系统提示注入与子任务 skill 物化同源；不重复造新规范）。 */
+  private static qualityBaselineSections(promptAssets: { buildRules: string; styleGuide: string } | null, reviewPrompt: string | null): string[] {
+    const sections: string[] = [];
+    if (promptAssets) {
+      sections.push('', '## 内容质量基线（与子任务冻结 skill 同源）', '', promptAssets.buildRules, '', promptAssets.styleGuide);
+    }
+    if (reviewPrompt) {
+      sections.push('', '## 审查规则（派发审查任务时遵守；与审查者 skill 同源）', '', reviewPrompt);
+    }
+    return sections;
+  }
+
+  /** 解析 pi-amagi 三角色模型（OpenAI 兼容 + 单端点约束；不可解析显式拒绝）。 */
+  private resolveLeaderModels(config: Config): { models: { leader: LeaderBuildModel; writer: LeaderBuildModel; reviewer: LeaderBuildModel }; apiKey: string } {
+    const roles = config.standardKb.buildRoles ?? { writer: { modelPresetId: '' }, reviewer: { modelPresetId: '' } };
+    const toModel = (role: BuildRoleModelConfig, label: string): LeaderBuildModel => {
+      const resolved = this.describeRoleModel(config, role, 'v2-leader');
+      if (!resolved) {
+        throw new ToolError('agent_not_ready', `pi-amagi 模式需要 ${label} 角色模型可解析（当前配置缺失或无可用密钥）；请修正 buildRoles 后重试（不降级）`, 503);
+      }
+      if (resolved.protocol && resolved.protocol !== 'openai-completions') {
+        throw new ToolError('build_mode_unavailable', `pi-amagi 静态模型声明只支持 OpenAI 兼容端点（${label} 当前 ${resolved.protocol}）；请调整角色模型或使用 legacy 模式`, 400);
+      }
+      const thinking = isPiThinkingLevel(resolved.thinking) ? resolved.thinking : undefined;
+      return {
+        modelId: resolved.modelId,
+        baseUrl: resolved.baseUrl ?? '',
+        ...(thinking ? { thinking } : {}),
+        ...(resolved.thinkingLevels && resolved.thinkingLevels.length > 0 ? { thinkingLevels: [...resolved.thinkingLevels] } : {}),
+        ...(resolved.reasoning !== undefined ? { reasoning: resolved.reasoning } : {}),
+        ...(resolved.contextWindow !== undefined ? { contextWindow: resolved.contextWindow } : {}),
+        ...(resolved.maxTokens !== undefined ? { maxTokens: resolved.maxTokens } : {}),
+      };
+    };
+    const writer = toModel(roles.writer, '写作');
+    const reviewer = toModel(roles.reviewer, '审查');
+    const leader = toModel(roles.integrator ?? roles.writer, 'Leader（整合）');
+    const endpoints = new Set([leader.baseUrl, writer.baseUrl, reviewer.baseUrl]);
+    if (endpoints.size !== 1 || ![...endpoints][0]) {
+      throw new ToolError('build_mode_unavailable', `pi-amagi 模式三角色必须解析到同一 OpenAI 兼容端点（当前 ${endpoints.size} 个）；请统一 buildRoles 的 provider 或使用 legacy 模式`, 400);
+    }
+    // 密钥：以写作角色的 provider 解析（三角色同端点约束已保证一致）
+    const keyResolution = resolveProviderModel(config.llm, {
+      ...(roles.writer.providerId ? { providerId: roles.writer.providerId } : {}),
+      ...(roles.writer.modelPresetId ? { modelId: roles.writer.modelPresetId } : {}),
+    });
+    const apiKey = keyResolution?.apiKey?.trim();
+    if (!apiKey) {
+      throw new ToolError('agent_not_ready', 'pi-amagi 模式需要角色模型 provider 的 API 密钥（当前缺失或为空）；请先在模型设置中配置（不降级）', 503);
+    }
+    return { models: { leader, writer, reviewer }, apiKey };
+  }
+
+  /** Leader 阶段输入组装（应用侧模型/材料；运行层 spec 由宿主冻结）。 */
+  private buildLeaderInput(input: {
+    buildId: string;
+    entry: InMemoryBuild;
+    buildState: BuildRunState;
+    config: Config;
+    effectiveMode: 'full' | 'incremental';
+    baseReleaseId: string | null;
+    sourceSnapshotHash: string;
+    model: string | null;
+    updateKbBuild: (patch: Record<string, unknown>) => void;
+  }): LeaderBuildInput {
+    const { config } = input;
+    const { models, apiKey } = this.resolveLeaderModels(config);
+    // 构建专用物化冻结 skill（steer #11：物化到 build 专用 home 的独立 skills 目录，
+    // 与 policy/config 禁区分开，子任务可真实 read 正文；steer #12：稳定规则全文
+    // 经 --append-system-prompt 真系统注入（sha256==workflowRevision），
+    // briefing 只留本次材料/计划，不再重复粘贴全文）
+    const { revision, skillPath } = this.materializeWorkflowSkill(input.buildId);
+    const generation = input.entry.leaderRun?.generation ?? 1;
+    const briefing = [
+      '# Leader 运行交代',
+      '',
+      '稳定工作流规则与内容质量基线已由系统注入（skill 文件全文 sha256 绑定 workflowRevision）。',
+      `- 技能文件（子任务可 read 校验正文，正文与系统规则同源）：${skillPath}`,
+      '',
+      '## 本次构建交代',
+      '',
+      `- buildId：${input.buildId}`,
+      `- 模式：${input.effectiveMode === 'full' ? '全量重建' : '增量构建'}${input.baseReleaseId ? `（基准版本 ${input.baseReleaseId.slice(0, 12)}…）` : ''}`,
+      `- 发布策略：${(config.standardKb.publishMode ?? 'auto') === 'confirm' ? '候选确认（申请发布通过校验后停在待确认，由用户确认发布）' : '自动发布（申请发布通过校验后立即发布）'}`,
+      `- 并发上限：${resolveBuildConcurrency(config.standardKb)}（amagi 准入分池冻结）`,
+      '',
+      '先经 build_manifest 读取材料清单并拆分主题；首批任务具备输入后立即派发；全部成果通过审查后申请发布当前精确候选版本。子任务读取材料与提交正文都经 MCP 桥接工具（mcp_call）完成。',
+    ].join('\n');
+    const resumeBriefing = [
+      '# Leader 运行交代（续接）',
+      '',
+      '稳定工作流规则与内容质量基线已由系统注入（skill 文件全文 sha256 绑定 workflowRevision）。',
+      `- 技能文件（子任务可 read 校验正文，正文与系统规则同源）：${skillPath}`,
+      '',
+      '## 续接交代',
+      '',
+      `构建 ${input.buildId} 从检查点恢复（第 ${generation} 代）。已接受成果与未解决问题以应用账本为准：先用 build_checkpoint(action=status) 查看成果状态，再组织剩余工作（派发缺失部分的写作与审查），完成后申请发布当前精确候选版本。不要重写已接受且未受影响的草稿。`,
+    ].join('\n');
+    return {
+      buildId: input.buildId,
+      mode: input.effectiveMode,
+      generation,
+      models,
+      maxConcurrentAgents: resolveBuildConcurrency(config.standardKb),
+      publicationPolicy: config.standardKb.publishMode ?? 'auto',
+      workflowRevision: revision,
+      workflowSkillPath: skillPath,
+      apiKey,
+      leaderBriefing: briefing,
+      resumeBriefing,
+      rebuildResume: null,
+      stagingRoot: this.stagingRoot(config.standardKb.outputRoot, input.buildId),
+      buildState: input.buildState,
+      material: {
+        mode: input.effectiveMode,
+        sourceSnapshotHash: input.sourceSnapshotHash,
+        baseReleaseId: input.baseReleaseId,
+      },
+      priorState: input.entry.leaderRun ?? null,
+      resumeStrategy: input.entry.leaderResumeStrategy,
+      publishExecutor: (request) => this.executeLeaderPublishRequest(request),
+      onReady: (state) => { input.entry.leaderRun = state; },
+      onCheckpoint: () => this.persistCheckpoint(input.buildId),
+      log: (level, message) => this.emitLog(input.buildId, level, message),
+      signal: input.entry.cancelController?.signal ?? new AbortController().signal,
+    };
+  }
+
+  /** Leader 监督阶段（真实宿主：探测→spec→账本/上下文→启动→监督）。 */
+  private async runLeaderSupervisedPhase(input: {
+    buildId: string;
+    entry: InMemoryBuild;
+    buildState: BuildRunState;
+    snapshot: RawSourceSnapshot;
+    config: Config;
+    effectiveMode: 'full' | 'incremental';
+    baseReleaseId: string | null;
+    cancelController: AbortController;
+    stagingRoot: string;
+    model: string | null;
+    updateKbBuild: (patch: Record<string, unknown>) => void;
+  }): Promise<LeaderRunOutcome> {
+    const host = this.deps.buildRuntime;
+    if (!host) throw new ToolError('build_runtime_unavailable', '构建运行宿主未接线（不应到达此处：创建时已拦截）', 500);
+    const { entry, buildId } = input;
+    const snapshotHash = computeSnapshotHash(input.snapshot.entries);
+    const prior = entry.leaderRun;
+    if (prior) {
+      // 检查点恢复：源快照/基准与冻结材料不一致 → 拒绝（设计 §9 先核对）。
+      if (prior.material.sourceSnapshotHash !== snapshotHash || prior.material.baseReleaseId !== input.baseReleaseId) {
+        throw new ToolError('kb_resume_stale', '检查点冻结材料与当前快照/基准不一致，拒绝恢复；请重新构建', 409);
+      }
+    }
+    entry.leaderPipelineContext = {
+      effectiveMode: input.effectiveMode,
+      sourceSnapshotHash: snapshotHash,
+      baseReleaseId: input.baseReleaseId,
+      model: input.model,
+      updateKbBuild: input.updateKbBuild,
+    };
+    const leaderInput = this.buildLeaderInput({
+      buildId,
+      entry,
+      buildState: input.buildState,
+      config: input.config,
+      effectiveMode: input.effectiveMode,
+      baseReleaseId: input.baseReleaseId,
+      sourceSnapshotHash: snapshotHash,
+      model: input.model,
+      updateKbBuild: input.updateKbBuild,
+    });
+    if (prior && entry.leaderResumeStrategy === 'rebuild') {
+      // 成果级重建：已接受草稿与未解决问题交给新 Leader（不伪造会话续接）。
+      const accepted = [...(input.buildState.writtenPaths ?? new Set<string>())];
+      leaderInput.rebuildResume = { acceptedDrafts: accepted, openIssues: [] };
+      this.emitLog(buildId, 'info', `成果级恢复：携带 ${accepted.length} 份已接受草稿与未解决问题清单启动新 Leader（不伪造会话续接）`);
+    }
+    const run = host.runLeaderPhase(leaderInput);
+    const view = host.activeSession(buildId);
+    if (view) {
+      // 取消/进度/检查点接缝：监督状态与 entry.leaderRun 保持同一引用
+      //（cancelBuild 经 host 视图触达会话监督器；检查点随 entry 落盘）。
+      entry.leaderRun = view.state();
+    }
+    try {
+      return await run;
+    } finally {
+      const viewAfter = host.activeSession(buildId);
+      if (viewAfter) entry.leaderRun = viewAfter.state();
+    }
+  }
+
+  /** Leader 发布执行器（build_request_publish 工具回调→原发布校验管线）。 */
+  async executeLeaderPublishRequest(request: {
+    buildId: string;
+    generation: number;
+    candidateHash: string;
+    requestedRevision: string | null;
+    summary: string | null;
+  }): Promise<{ accepted: boolean; result: Record<string, unknown> }> {
+    const entry = this.active.get(request.buildId);
+    const ctx = entry?.leaderPipelineContext;
+    const buildState = entry?.buildState;
+    if (!entry || !ctx || !buildState?.snapshot) {
+      return { accepted: false, result: { reason: 'build_not_active', message: '构建不在 Leader 运行中（发布回调缺少流水线上下文）' } };
+    }
+    if ((entry.leaderRun?.generation ?? request.generation) !== request.generation) {
+      return { accepted: false, result: { reason: 'generation_mismatch', message: `发布回调代次 ${request.generation} 与当前 ${entry.leaderRun?.generation} 不一致` } };
+    }
+    if (entry.leaderRun?.publishLock) {
+      return { accepted: false, result: { reason: 'publish_window_settled', message: `本构建发布窗口已结算（候选 ${entry.leaderRun.publishLock.candidateHash.slice(0, 12)}…）；不再接受新发布申请` } };
+    }
+    const config = this.configForBuild(request.buildId);
+    const outputRoot = config.standardKb.outputRoot;
+    const stagingRoot = this.stagingRoot(outputRoot, request.buildId);
+    try {
+      // 精确 revision 锁：重算当前候选哈希（工具侧已比对一次，此处独立复核）。
+      const current = computeCandidateHash({ documents: KbBuildService.stagingDocsEntriesOf(stagingRoot) });
+      if (current !== request.candidateHash) {
+        return { accepted: false, result: { reason: 'candidate_conflict', message: `申请候选 ${request.candidateHash.slice(0, 12)}… 与当前 ${current.slice(0, 12)}… 不一致（校验期间候选被写入或已过期）`, current } };
+      }
+      buildState.finishInfo = buildState.finishInfo ?? { summary: request.summary ?? 'Leader 申请发布', skipped: [] };
+      // 权威发布前校验（steer #6：复用 runPipeline 同一入口，不绕过；失败真实返回，CURRENT 不变）
+      if (entry.cancelRequested) {
+        return { accepted: false, result: { reason: 'build_cancelled', message: '构建已请求取消，发布申请拒绝' } };
+      }
+      this.throwIfPoisoned(buildState);
+      const issues = await this.validateStaging(buildState, buildState.snapshot, buildState.docMeta ?? new Map(), outputRoot);
+      if (issues.length > 0) {
+        this.emitLog(request.buildId, 'error', `Leader 发布前校验失败（${issues.length} 个问题）：${issues.slice(0, 3).map((issue) => issue.code).join(', ')}`);
+        return { accepted: false, result: { reason: 'kb_validation_failed', details: { issues }, reasons: issues.map((issue) => issue.code) } };
+      }
+      // 快照完整性 + 源身份复核（主文档 + CSV 附件；模型最后一次 read 之后源被改，不得发布）
+      const currentPublishedTokens = new Set(this.deps.publishedTokensProvider?.() ?? []);
+      const currentDocuments = this.sourceDocuments(buildState.snapshot.entries.map((source) => source.objToken))
+        .filter((doc) => !currentPublishedTokens.has(doc.objToken));
+      let newSources = 0;
+      try {
+        newSources = verifySnapshotIntact(buildState.snapshot, config.knowledgeBaseRoot, this.deps.sheetCsvPaths, currentDocuments);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.emitLog(request.buildId, 'error', `Leader 发布前快照完整性复核失败：${message.slice(0, 200)}`);
+        return { accepted: false, result: { reason: 'source_changed_during_build', message: message.slice(0, 500) } };
+      }
+      if (newSources > 0) {
+        this.emitLog(request.buildId, 'warn', `构建期间新增 ${newSources} 篇源文档，未包含在本次发布中（下次构建处理）`);
+      }
+      const publishMode: BuildPublishMode = (entry.leaderRun?.spec.publicationPolicy ?? 'auto') === 'auto' ? 'auto' : 'confirm';
+      const candidateFile = this.assembleCandidateRelease({
+        buildId: request.buildId,
+        entry,
+        buildState,
+        snapshot: buildState.snapshot,
+        stagingRoot,
+        programChecks: { passed: true, checkIds: ['validate_staging_docs', 'verify_snapshot_intact', 'poison_check'] },
+        summary: request.summary ?? buildState.finishInfo.summary,
+        specInfo: { publishMode, sourceSnapshotHash: ctx.sourceSnapshotHash, baseReleaseId: ctx.baseReleaseId },
+      });
+      const publishCheck = canPublish({
+        candidate: candidateFile.candidate,
+        reports: KbBuildService.collectReviewReports(stagingRoot),
+        requiredReviewDraftHashes: [candidateFile.candidateHash],
+        expectedSourceSnapshotHash: ctx.sourceSnapshotHash,
+        expectedBaseReleaseId: ctx.baseReleaseId,
+      });
+      this.emitLog(request.buildId, 'info', `Leader 发布申请校验（canPublish）：${publishCheck.publishable ? '通过' : publishCheck.reasons.join(', ')}`);
+      if (publishMode === 'confirm') {
+        if (!publishCheck.publishable && !(publishCheck.reasons.length === 1 && publishCheck.reasons[0] === 'confirm_binding_stale')) {
+          return { accepted: false, result: { reason: 'kb_publish_blocked', details: publishCheck.details, reasons: publishCheck.reasons } };
+        }
+        // 停在 awaiting_release：candidate.json 已落盘，交 release-confirm 端点。
+        ctx.updateKbBuild({ status: 'awaiting_release' });
+        // 窗口结算（steer #6）：锁被接受 revision + 撤销写者，避免 return 到监督退出间被新写污染；
+        // 快照立即写入监督状态（同一引用）——不等账本事件轮询，DTO 即时可见
+        if (entry.leaderRun) {
+          entry.leaderRun.publishLock = { candidateHash: candidateFile.candidateHash, revision: null, settledAt: new Date().toISOString() };
+          entry.leaderRun.publishRequest = { requestId: null, candidateRevision: candidateFile.candidateHash, summary: request.summary ?? '', accepted: true, status: 'accepted', decidedAt: new Date().toISOString() };
+        }
+        this.deps.buildRuntime?.settlePublishWindow?.(request.buildId, request.generation, candidateFile.candidateHash);
+        // 结算立即落盘（awaiting_release 保留候选期间检查点必须带结算锁）
+        this.persistCheckpoint(request.buildId);
+        this.emitLog(request.buildId, 'info', `候选版本就绪（${candidateFile.candidate.documents.length} 篇文档，candidateHash=${candidateFile.candidateHash.slice(0, 12)}…），等待用户确认发布`);
+        return { accepted: true, result: { status: 'awaiting_release', releaseId: null, candidateHash: candidateFile.candidateHash, docs: candidateFile.candidate.documents.length } };
+      }
+      if (!publishCheck.publishable) {
+        return { accepted: false, result: { reason: 'kb_publish_blocked', details: publishCheck.details, reasons: publishCheck.reasons } };
+      }
+      // 发布前取消/代次重检（CURRENT 尚未切换，取消竞态在此拦下）
+      if (entry.cancelRequested || (entry.leaderRun?.generation ?? request.generation) !== request.generation) {
+        return { accepted: false, result: { reason: 'build_cancelled', message: '发布窗口内构建被取消或代次变化，发布中止（CURRENT 未切换）' } };
+      }
+      const releaseId = `r_${new Date().toISOString().replace(/[-:]/g, '').replace('T', 'T').slice(0, 15)}_${crypto.randomBytes(3).toString('hex')}`;
+      const baseManifest = ctx.baseReleaseId ? new StandardKbStore(outputRoot).readManifest(ctx.baseReleaseId) : null;
+      const versionStore = new KbVersionStore(outputRoot);
+      const sourceContents = captureSourceContents(buildState.snapshot, config.knowledgeBaseRoot);
+      const changePreview = sourceChangePreview(buildState.snapshot, sourceContents, baseManifest,
+        versionStore.readSourceContents(baseManifest?.releaseId ?? null),
+        new Set([...(this.deps.excludedSourcesProvider?.() ?? []), ...(ctx.effectiveMode === 'full' ? this.deps.unselectedSourcesProvider?.() ?? [] : [])]));
+      const manifest = await this.publishRelease({
+        buildId: request.buildId,
+        releaseId,
+        mode: ctx.effectiveMode,
+        baseReleaseId: ctx.baseReleaseId,
+        knowledgeBaseRoot: config.knowledgeBaseRoot,
+        model: ctx.model,
+        snapshot: buildState.snapshot,
+        stagingRoot,
+        outputRoot,
+        docMeta: buildState.docMeta ?? new Map(),
+        skippedSources: buildState.finishInfo.skipped,
+        sourceContents,
+        changePreview,
+        summary: request.summary ?? buildState.finishInfo.summary,
+        imageDescriptions: buildState.imageDescriptions,
+      });
+      // 发布后复核：候选稳定 + 窗口结算锁（写者撤销；被接受 revision 不被替换）
+      const postHash = computeCandidateHash({ documents: KbBuildService.stagingDocsEntriesOf(stagingRoot) });
+      if (postHash !== candidateFile.candidateHash) {
+        this.emitLog(request.buildId, 'error', '发布完成后候选哈希漂移（发布期间出现并行写入）；发布产物以校验时候选为准，后续发布申请将被拒绝');
+      }
+      if (entry.leaderRun) {
+        entry.leaderRun.publishLock = { candidateHash: candidateFile.candidateHash, revision: releaseId, settledAt: new Date().toISOString() };
+        entry.leaderRun.publishRequest = { requestId: null, candidateRevision: candidateFile.candidateHash, summary: request.summary ?? '', accepted: true, status: 'accepted', decidedAt: new Date().toISOString() };
+      }
+      this.deps.buildRuntime?.settlePublishWindow?.(request.buildId, request.generation, candidateFile.candidateHash);
+      // 结算立即落盘（终局后 live/entry 路径都会消失，检查点是唯一真相源）
+      this.persistCheckpoint(request.buildId);
+      ctx.updateKbBuild({ status: 'published', releaseId, finishedAt: new Date().toISOString() });
+      this.emitLog(request.buildId, 'info', `Leader 发布完成：release=${releaseId}，${manifest.docs.length} 篇文档`);
+      return { accepted: true, result: { status: 'published', releaseId, candidateHash: candidateFile.candidateHash, docs: manifest.docs.length } };
+    } catch (error) {
+      const code = error instanceof ToolError || (error instanceof PathGuardError && error.code === 'source_changed_during_build')
+        ? error.code : 'kb_build_failed';
+      const message = error instanceof Error ? error.message : String(error);
+      this.emitLog(request.buildId, 'error', `Leader 发布管线异常：${code}: ${message}`);
+      return { accepted: false, result: { reason: code, message: message.slice(0, 500) } };
+    }
+  }
+
+  /** Leader 监督进度（活动构建取宿主实时值；中断/历史构建回退检查点）。 */
+  leaderProgress(
+    localMapStore: { getKbBuild(id: string): Record<string, unknown> | null },
+    buildId: string,
+  ): LeaderRunProgressDto | null {
+    const live = this.deps.buildRuntime?.activeSession(buildId);
+    if (live) return live.progress();
+    const entry = this.active.get(buildId);
+    if (entry?.leaderRun) return KbBuildService.leaderProgressOfState(entry.leaderRun);
+    if (!localMapStore.getKbBuild(buildId)) return null;
+    const outputRoot = this.outputRoot();
+    if (!outputRoot) return null;
+    try {
+      const checkpoint = new BuildCheckpointStore(outputRoot).read(buildId);
+      const leaderRun = checkpoint?.leaderRun;
+      if (!leaderRun) return null;
+      return KbBuildService.leaderProgressOfState(leaderRun);
+    } catch {
+      return null;
+    }
+  }
+
+  /** 检查点状态 → 进度 DTO（summary 从账本载荷快照推导；无载荷如实 null）。 */
+  private static leaderProgressOfState(leaderRun: LeaderRunCheckpointState): LeaderRunProgressDto {
+    const accepted = new Set<string>();
+    let openBlocking: number | null = null;
+    let activeAssignments: number | null = null;
+    const payload = leaderRun.actorPayload;
+    if (payload) {
+      for (const receipt of payload.receipts ?? []) {
+        if (receipt.kind === 'write_doc' || receipt.kind === 'edit_doc') {
+          for (const docPath of Array.isArray(receipt.result?.paths) ? receipt.result.paths : []) {
+            if (typeof docPath === 'string') accepted.add(docPath);
+          }
+        }
+      }
+      const lists = payload.issueLists ?? [];
+      openBlocking = lists.length > 0 ? lists[lists.length - 1].issues.filter((issue) => issue.severity === 'blocking').length : 0;
+      activeAssignments = (payload.assignments ?? []).filter((item) => item.status === 'active').length;
+    }
+    const resumeLevel = leaderRun.binding
+      ? leaderRun.binding.resumeCapability.session ? 'session' : leaderRun.binding.resumeCapability.artifact ? 'artifact' : 'none'
+      : 'none';
+    return {
+      buildId: leaderRun.spec.buildId,
+      orchestrationMode: 'pi-amagi',
+      generation: leaderRun.generation,
+      leader: leaderRun.binding
+        ? { sessionId: leaderRun.binding.leaderSessionId, pid: leaderRun.binding.leaderPid, resumeCapability: resumeLevel }
+        : null,
+      tasks: leaderRun.actors.map((actor) => ({
+        nativeTaskId: actor.nativeTaskId, role: actor.role, parentTaskId: actor.parentTaskId,
+        status: actor.status, execState: actor.execState, lastEventAt: actor.lastEventAt,
+      })),
+      rounds: { started: 0, ended: 0 },
+      idle: { remindedAt: leaderRun.idleRemindedAt, lastActivityAt: null },
+      publishRequest: leaderRun.publishRequest,
+      summary: {
+        acceptedDocumentCount: payload ? accepted.size : null,
+        openBlockingCount: openBlocking,
+        activeAssignments,
+        queueReason: null,
+        lastUsage: leaderRun.lastUsage,
+        cumulativeUsage: null,
+      },
+      endedReason: leaderRun.endedReason,
+      termination: leaderRun.publishLock ? 'finished' : leaderRun.endedReason ? 'finished' : null,
+      skill: { path: leaderRun.spec.workflowSkillPath, revision: leaderRun.spec.workflowRevision },
+      eventCursor: { ...leaderRun.eventCursor },
+      updatedAt: leaderRun.updatedAt,
+    };
+  }
+
+  // ------------------------------------------------------------------
   // 流水线
   // ------------------------------------------------------------------
 
@@ -689,6 +1245,9 @@ export class KbBuildService extends EventEmitter {
   ): Promise<void> {
     const entry = this.active.get(buildId)!;
     const resume = entry.resume;
+    // 重构 v2：编排模式在创建/恢复时冻结；Leader 监督路径不走应用 worker
+    // 调度（设计 §11）。
+    const leaderMode = entry.orchestrationMode === 'pi-amagi';
     this.running = true;
     const config = this.configForBuild(buildId);
     const outputRoot = config.standardKb.outputRoot;
@@ -781,7 +1340,7 @@ export class KbBuildService extends EventEmitter {
         } catch (error) {
           throw new ToolError('kb_resume_stale', `检查点编排规格无法恢复：${error instanceof Error ? error.message : String(error)}`, 409);
         }
-      } else if (!resume) {
+      } else if (!resume && !leaderMode) {
         const promptAssets = this.deps.pluginStore ? null : this.deps.promptAssets();
         let specVersion = 'v1';
         if (promptAssets) {
@@ -1093,7 +1652,7 @@ export class KbBuildService extends EventEmitter {
       const sourceSeedSet = new Set(impactClosure.seeds.sourceChange);
       const closureLinkDocs = [...new Set([...impactClosure.closureDocs, ...impactClosure.seeds.decisionChange, ...impactClosure.seeds.migration])]
         .filter((docPath) => !sourceSeedSet.has(docPath));
-      const units = resume?.units.length ? resume.units : planUnits({
+      const units = leaderMode ? [] : resume?.units.length ? resume.units : planUnits({
         mode: effectiveMode,
         workset: worksetMeta,
         baseDocs: effectiveMode === 'incremental' && baseManifest
@@ -1133,7 +1692,9 @@ export class KbBuildService extends EventEmitter {
       // 单进程路径没有单元语义 → 登记一条代表全批的 single 任务。恢复时
       // 已在检查点里的任务不重建；已完成单元（unitDone）补终态。骨架记录
       // 失败不阻断构建主流程（warn 日志可观察）。
-      this.seedOrchestrationTasks(buildId, entry, units, resume?.unitDone ? new Map(resume.unitDone) : undefined, resume?.finishInfo ?? null);
+      // 重构 v2：Leader 监督模式不登记应用侧编排任务/就绪队列（任务身份
+      // 由监督器从运行事件登记；设计 §2/§11）。
+      if (!leaderMode) this.seedOrchestrationTasks(buildId, entry, units, resume?.unitDone ? new Map(resume.unitDone) : undefined, resume?.finishInfo ?? null);
 
       // T2b（B 案 §3–§5/§7）：审查修订流水——审查者显式配置的构建走
       // 编排调度（单元写→独立审查→定向修订→整体整合→最终复核），不
@@ -1170,7 +1731,73 @@ export class KbBuildService extends EventEmitter {
       } catch {
         /* 风险告警采集失败不阻断构建 */
       }
-      if (orchestrated) {
+      if (leaderMode) {
+        // ---- 重构 v2：Leader 监督路径（单一派发；不走 runOrchestratedPhase/
+        // 应用 worker 调度；准备/来源/图像之后只启动一个 Leader 占池 1 槽）----
+        buildState.units = [];
+        buildState.unitDone = new Map();
+        buildState.claims = new PathClaims([]);
+        entry.units = { total: 0, done: 0, running: 0, failed: 0, retried: 0 };
+        entry.batchTotal = 0; entry.batchIndex = 0;
+        entry.checkpointReady = true; this.persistCheckpoint(buildId);
+        this.emitLog(buildId, 'info', `开始 Leader 监督构建（${effectiveMode}，orchestrationMode=pi-amagi）：${workset.size} 个工作集源交由 Leader 拆分派发（子任务由 amagi 启动，不入应用进程池）`);
+        const overallTimeout = setTimeout(() => {
+          entry.timedOut = true;
+          entry.cancelRequested = true;
+          this.emitLog(buildId, 'error', `构建整体超时（${config.standardKb.buildTimeoutMinutes} 分钟）`);
+          cancelController.abort();
+        }, config.standardKb.buildTimeoutMinutes * 60_000);
+        overallTimeout.unref?.();
+        try {
+          const outcome = await this.runLeaderSupervisedPhase({
+            buildId, entry, buildState, snapshot, config,
+            effectiveMode,
+            baseReleaseId: baseManifest?.releaseId ?? null,
+            cancelController,
+            stagingRoot: stagingRootPath,
+            model: config.agent.model.source === 'app-llm' || config.agent.runtime.backend === 'claude-code'
+              ? (() => {
+                const resolution = resolveAppLlmModel(config.llm, config.agent);
+                return resolution ? `${config.agent.runtime.backend === 'claude-code' ? 'claude-code' : 'feishu-sync-llm'}/${resolution.openAiModel}` : null;
+              })()
+              : config.agent.model.piModel ?? null,
+            updateKbBuild: (patch) => localMapStore.updateKbBuild(buildId, patch),
+          });
+          if (entry.cancelRequested) throw new CancelledError();
+          if (outcome.kind === 'publish-accepted') {
+            // 发布已由真实工具回调（executeLeaderPublishRequest）在发布窗口
+            // 内完成：auto 已发布/confirm 停在 awaiting_release。此处只收尾，
+            // 不重复校验或二次发布。
+            buildState.finishInfo = buildState.finishInfo ?? { summary: outcome.summary || 'Leader 申请发布', skipped: [] };
+            const row = localMapStore.getKbBuild(buildId);
+            if (row) this.emitBuild(buildId, 'build_status', this.toDto(row, entry));
+            this.cleanupAfterPipeline(buildId);
+            return;
+          } else if (outcome.kind === 'leader-idle') {
+            // 空闲中断：保留候选与问题清单（检查点），interrupted 可恢复。
+            localMapStore.updateKbBuild(buildId, {
+              status: 'interrupted',
+              errorCode: 'kb_leader_idle',
+              errorMessage: 'Leader 收口提示后仍空闲，按 leader_idle 中断；候选与问题清单已保留在检查点，可恢复（会话级或成果级）',
+              finishedAt: null,
+            });
+            this.emitLog(buildId, 'warn', '构建以 leader_idle 中断（未发布任何变更；候选保留）');
+            const row = localMapStore.getKbBuild(buildId);
+            if (row) this.emitBuild(buildId, 'build_status', this.toDto(row, entry));
+            this.cleanupAfterPipeline(buildId);
+            return;
+          } else if (outcome.kind === 'leader-abandoned') {
+            throw new ToolError('kb_leader_abandoned', `Leader 报告无法完成：${outcome.reason}；候选与问题清单已保留，可恢复`, 400);
+          } else if (outcome.kind === 'leader-failed') {
+            throw new ToolError('kb_leader_failed', `${outcome.reason}；候选与问题清单已保留，可恢复`, 500);
+          } else {
+            throw new CancelledError();
+          }
+        } finally {
+          clearTimeout(overallTimeout);
+          await this.terminateAllWorkers(buildId, entry);
+        }
+      } else if (orchestrated) {
         // ---- 编排流水路径（与并行路径同一单元/认领状态初始化）----
         buildState.units = units;
         buildState.unitDone = new Map(resume?.unitDone ?? []);
@@ -1370,7 +1997,15 @@ export class KbBuildService extends EventEmitter {
       // 组装候选（文档清单+哈希、验收记录、沿用范围、来源去向、变更说明）
       // 并经 canPublish（T1 契约）判定；publishMode=confirm 时停在
       // awaiting_release（候选落盘，确认绑定候选哈希），auto 直接发布。
+      // 重构 v2：Leader 模式的发布在发布窗口内经真实工具回调完成
+      //（executeLeaderPublishRequest，同一 canPublish/publishRelease 标准），
+      // 不再走此处二次发布。
       if (orchestrated) {
+        const specInfo = {
+          publishMode: entry.orchestration!.spec.publishMode,
+          sourceSnapshotHash: entry.orchestration!.spec.sourceSnapshotHash,
+          baseReleaseId: entry.orchestration!.spec.baseReleaseId,
+        };
         const candidateFile = this.assembleCandidateRelease({
           buildId,
           entry,
@@ -1379,6 +2014,7 @@ export class KbBuildService extends EventEmitter {
           stagingRoot: stagingRootPath,
           programChecks: { passed: true, checkIds: ['validate_staging_docs'] },
           summary: buildState.finishInfo?.summary ?? '',
+          specInfo,
         });
         const publishCheck = canPublish({
           candidate: candidateFile.candidate,
@@ -1392,7 +2028,7 @@ export class KbBuildService extends EventEmitter {
         this.emitLog(buildId, publishCheck.publishable || (publishCheck.reasons.length === 1 && publishCheck.reasons[0] === 'confirm_binding_stale')
           ? 'info'
           : 'error', `发布条件判定（canPublish）：${publishCheck.publishable ? '通过' : publishCheck.reasons.join(', ')}`);
-        if (entry.orchestration!.spec.publishMode === 'confirm') {
+        if (specInfo.publishMode === 'confirm') {
           if (!publishCheck.publishable && !(publishCheck.reasons.length === 1 && publishCheck.reasons[0] === 'confirm_binding_stale')) {
             throw new ToolError('kb_publish_blocked', `发布条件未满足：${publishCheck.details.join('；')}`, 409);
           }
@@ -4427,9 +5063,12 @@ export class KbBuildService extends EventEmitter {
     stagingRoot: string;
     programChecks: { passed: boolean; checkIds: string[]; failed?: string[] };
     summary: string;
+    /** 冻结规格三要素（重构 v2：Leader 模式无 BuildOrchestration，改显式
+     * 传入；编排路径行为不变——同值传递）。 */
+    specInfo: { publishMode: BuildPublishMode; sourceSnapshotHash: string; baseReleaseId: string | null };
   }): { candidate: CandidateRelease; candidateHash: string } {
-    const { entry, buildState, snapshot, stagingRoot } = input;
-    const orchestration = entry.orchestration!;
+    const { buildState, snapshot, stagingRoot } = input;
+    const specInfo = input.specInfo;
     const documents = KbBuildService.stagingDocsEntriesOf(stagingRoot);
     const candidateHash = computeCandidateHash({ documents });
     const writtenPaths = buildState.writtenPaths ?? new Set<string>();
@@ -4471,15 +5110,15 @@ export class KbBuildService extends EventEmitter {
         acceptedArtifactHash: candidateHash,
         validReportIds,
         programChecks: input.programChecks,
-        decisionMode: orchestration.spec.publishMode,
-        ...(orchestration.spec.publishMode === 'auto' ? { decidedBy: 'auto-rules', decidedAt: new Date().toISOString() } : {}),
+        decisionMode: specInfo.publishMode,
+        ...(specInfo.publishMode === 'auto' ? { decidedBy: 'auto-rules', decidedAt: new Date().toISOString() } : {}),
       },
       carriedOver,
       sourceDisposition,
       changeSummary: input.summary,
-      sourceSnapshotHash: orchestration.spec.sourceSnapshotHash,
-      baseReleaseId: orchestration.spec.baseReleaseId,
-      publishMode: orchestration.spec.publishMode,
+      sourceSnapshotHash: specInfo.sourceSnapshotHash,
+      baseReleaseId: specInfo.baseReleaseId,
+      publishMode: specInfo.publishMode,
     };
     // 落盘 candidate.json（awaiting_release 的确认对象与重启后恢复源）
     fs.writeFileSync(

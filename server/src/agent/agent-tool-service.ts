@@ -30,6 +30,18 @@ import {
   KB_SUBMIT_REVIEW_SPEC,
   KB_UNIT_DONE_SPEC,
   KB_WRITE_DOC_SPEC,
+  KB_EDIT_DOC_SPEC,
+  KB_READ_BATCH_SPEC,
+  BUILD_MANIFEST_SPEC,
+  BUILD_ASSIGN_OUTPUT_SPEC,
+  BUILD_REVOKE_OUTPUT_SPEC,
+  BUILD_HANDOFF_SUBMIT_SPEC,
+  BUILD_HANDOFF_LIST_SPEC,
+  BUILD_ISSUES_SUBMIT_SPEC,
+  BUILD_ISSUES_LIST_SPEC,
+  BUILD_CHECKPOINT_SPEC,
+  BUILD_REQUEST_PUBLISH_SPEC,
+  V2_LEADER_TOOLS,
   DRAFT_LIST_SPEC,
   DRAFT_READ_SPEC,
   DRAFT_SEARCH_SPEC,
@@ -85,6 +97,13 @@ import { getKbQueryService, QueryError } from '../kb/search/kb-query-service.js'
 import { splitAnchor } from '../kb/search/outline.js';
 import { hashImageFile, inlineImageBlocks, resolveSourceImages, extractWhiteboardBypassTexts, type ImageDescriptionLike, type WhiteboardTextMap } from '../kb/source-images.js';
 import type { PathClaims } from '../kb/path-claims.js';
+import {
+  BuildActorError,
+  BuildActorStore,
+  deriveIdempotencyKey,
+  V2_CHILD_READ_TOOLS,
+  type CredentialKind,
+} from '../kb/build-actors.js';
 import type { BuildUnit } from '../kb/build-units.js';
 import type { ImageDescription } from './vision/vision-describer.js';
 import { matchGlob, parseSearchQuery } from '../kb/kb-search.js';
@@ -181,6 +200,40 @@ export interface BuildRunState {
   organizationPlan?: OrganizationPlanFile;
   /** T3（A 案 §5.3）：read-receipts.jsonl 内存镜像（真相在文件；首次访问加载） */
   readReceipts?: ReadReceiptRecord[];
+  /**
+   * v2 编排（设计 v2 §4/§8/§11）：成果权限账本与发布管线。集成者在
+   * runPipeline 的 pi-amagi 分支 running 前初始化；旧模式（legacy）
+   * 不设置，行为不变。token 级 credential 在 RunContextOptions.orchestration。
+   */
+  v2?: {
+    actorStore: BuildActorStore;
+    generation: number;
+    /** 发布校验管线（§5.4）；未接线时 build_request_publish 返回 build_publish_not_wired */
+    publishHandler?: V2PublishHandler;
+  };
+}
+
+/** v2 发布校验管线（§5.4）：锁定候选后由集成者执行全量检查（对象身份/来源
+ * 覆盖/引用目标/审查绑定/阻断问题）；返回 accepted 与结果详情。 */
+export interface V2PublishHandler {
+  (input: {
+    buildId: string;
+    generation: number;
+    candidateHash: string;
+    requestedRevision: string | null;
+    summary: string | null;
+  }): Promise<{ accepted: boolean; result: Record<string, unknown> }>;
+}
+
+/** v2 编排运行参数（设计 v2 §3.4/§4）：出现即新模式分支——按任务身份、
+ * 输出分配与成果状态判定权限，不借用旧 unit/phase 字段（不伪装 final）。 */
+export interface OrchestrationV2Options {
+  mode: 'pi-amagi';
+  buildId: string;
+  generation: number;
+  credential: CredentialKind;
+  actorStore: BuildActorStore;
+  publishHandler?: V2PublishHandler;
 }
 
 export interface RunContextOptions {
@@ -202,6 +255,11 @@ export interface RunContextOptions {
   allowedToolsOverride?: readonly string[];
   /** S6：按族名从 runKind 派生白名单中剔除（编排关闭的会话不下发 task_*）。 */
   disableToolFamilies?: readonly string[];
+  /**
+   * v2 编排（设计 v2 §3.4/§4）：存在即构建新模式。leader 凭据只有
+   * V2_LEADER_TOOLS；child 凭据按 AMAGI 身份逐次校验角色/分配/幂等。
+   */
+  orchestration?: OrchestrationV2Options;
   /**
    * S4（§4.4）：构建 worker 运行上下文。unit 轮受路径认领与 kb_finish 禁用
    * 约束；final 轮（收尾）不受认领限制、调用 kb_finish。
@@ -307,6 +365,11 @@ export interface InternalRunContext extends AgentRunContext {
 export interface ToolRequestMeta {
   /** T3b-07R：pi 分配的 toolCallId（轮次归属绑定的权威键）。 */
   toolCallId?: string;
+  /** v2（设计 v2 §4.1）：桥接从 env 读到的 AMAGI_TASK_ID（受信身份，
+   * 经 X-Amagi-Task-Id 头透传；不采信模型参数）。 */
+  amagiTaskId?: string;
+  /** v2（§4.1）：AMAGI_AGENT（角色一致性校验）。 */
+  amagiAgent?: string;
 }
 
 /** 工具族内单个工具的注册项（S1 工具族注册模型）。 */
@@ -479,7 +542,7 @@ export class AgentToolService {
         { spec: KB_READ_SPEC, runKinds: ['work', 'discuss'], execute: (context, args) => this.toolKbRead(context, args) },
         { spec: KB_GREP_SPEC, runKinds: ['work', 'discuss'], execute: (context, args) => this.toolKbGrep(context, args) },
         { spec: KB_WRITE_DOC_SPEC, runKinds: ['build'], execute: (context, args, meta) => this.toolKbWriteDoc(context, args, meta) },
-        { spec: KB_DELETE_DOC_SPEC, runKinds: ['build'], execute: (context, args) => this.toolKbDeleteDoc(context, args) },
+        { spec: KB_DELETE_DOC_SPEC, runKinds: ['build'], execute: (context, args, meta) => this.toolKbDeleteDoc(context, args, meta) },
         // S4（§4.4）：逐单元上报；kb_finish 保持单值、只在收尾轮可用
         { spec: KB_UNIT_DONE_SPEC, runKinds: ['build'], execute: (context, args) => this.toolKbUnitDone(context, args) },
         { spec: KB_FINISH_SPEC, runKinds: ['build'], execute: (context, args) => this.toolKbFinish(context, args) },
@@ -487,7 +550,7 @@ export class AgentToolService {
         // 计划只读、审查提交（审查轮；写入者无审查入口，审查者无草稿写入口）
         { spec: KB_SUBMIT_PLAN_SPEC, runKinds: ['build'], execute: (context, args) => this.toolKbSubmitPlan(context, args) },
         { spec: KB_GET_PLAN_SPEC, runKinds: ['build'], execute: (context, args) => this.toolKbGetPlan(context, args) },
-        { spec: KB_SUBMIT_REVIEW_SPEC, runKinds: ['build'], execute: (context, args) => this.toolKbSubmitReview(context, args) },
+        { spec: KB_SUBMIT_REVIEW_SPEC, runKinds: ['build'], execute: (context, args, meta) => this.toolKbSubmitReview(context, args, meta) },
       ],
     });
     // draft_*：构建 staging 读
@@ -509,6 +572,25 @@ export class AgentToolService {
         { spec: WS_WRITE_SPEC, runKinds: ['work'], execute: (context, args) => this.toolWsWrite(context, args) },
         { spec: WS_EDIT_SPEC, runKinds: ['work'], execute: (context, args) => this.toolWsEdit(context, args) },
         { spec: WS_MKDIR_SPEC, runKinds: ['work'], execute: (context, args) => this.toolWsMkdir(context, args) },
+      ],
+    });
+    // build-runtime：v2 编排工具（设计 v2 §3.4/§4/§5/§7）。不进任何旧
+    // runKind 基线面（runKinds 空数组）——仅经 allowedToolsOverride/leader
+    // 白名单显式下发；旧模式行为不变。
+    this.registerToolFamily({
+      name: 'build-runtime',
+      tools: [
+        { spec: KB_READ_BATCH_SPEC, runKinds: ['build'], execute: (context, args, meta) => this.toolKbReadBatch(context, args, meta) },
+        { spec: KB_EDIT_DOC_SPEC, runKinds: [], execute: (context, args, meta) => this.toolKbEditDoc(context, args, meta) },
+        { spec: BUILD_MANIFEST_SPEC, runKinds: [], execute: (context, args) => this.toolBuildManifest(context, args) },
+        { spec: BUILD_ASSIGN_OUTPUT_SPEC, runKinds: [], execute: (context, args) => this.toolBuildAssignOutput(context, args) },
+        { spec: BUILD_REVOKE_OUTPUT_SPEC, runKinds: [], execute: (context, args) => this.toolBuildRevokeOutput(context, args) },
+        { spec: BUILD_HANDOFF_SUBMIT_SPEC, runKinds: [], execute: (context, args, meta) => this.toolBuildHandoffSubmit(context, args, meta) },
+        { spec: BUILD_HANDOFF_LIST_SPEC, runKinds: [], execute: (context, args) => this.toolBuildHandoffList(context, args) },
+        { spec: BUILD_ISSUES_SUBMIT_SPEC, runKinds: [], execute: (context, args) => this.toolBuildIssuesSubmit(context, args) },
+        { spec: BUILD_ISSUES_LIST_SPEC, runKinds: [], execute: (context, args) => this.toolBuildIssuesList(context, args) },
+        { spec: BUILD_CHECKPOINT_SPEC, runKinds: [], execute: (context, args) => this.toolBuildCheckpoint(context, args) },
+        { spec: BUILD_REQUEST_PUBLISH_SPEC, runKinds: [], execute: (context, args) => this.toolBuildRequestPublish(context, args) },
       ],
     });
   }
@@ -589,11 +671,47 @@ export class AgentToolService {
     return this.contexts.get(token) ?? null;
   }
 
-  /** GET /tools：返回本运行允许的工具规格（族注册表派生，顺序同白名单）。 */
-  getToolSpecsForToken(token: string): AgentToolSpec[] | null {
+  /**
+   * v2（设计 v2 §4.1/§3.4）：只读工具名单（MCP readOnlyHint 与 pending
+   * 只读面共用）。旧读取类工具按工具名判定，不含任何正文/对象写工具。
+   */
+  isReadOnlyTool(toolName: string): boolean {
+    return READONLY_TOOL_NAMES.has(toolName);
+  }
+
+  /**
+   * v2（§4.1）：按调用身份解析子任务工具面。无 orchestration 时行为不变。
+   * identity 来自内部 API 身份头（受信 env）；pending/未知 → 只读子集。
+   */
+  private v2ToolNamesFor(context: InternalRunContext, identity?: { amagiTaskId?: string; amagiAgent?: string }): string[] {
+    const v2 = context.options.orchestration!;
+    if (v2.credential === 'leader') {
+      return context.allowedTools.filter((name) => (V2_LEADER_TOOLS as readonly string[]).includes(name));
+    }
+    if (identity?.amagiTaskId) {
+      const actor = v2.actorStore.lookupActor(identity.amagiTaskId)
+        ?? v2.actorStore.ensurePendingIdentity(identity.amagiTaskId, identity.amagiAgent);
+      if (actor.status === 'revoked') return V2_CHILD_READ_TOOLS.filter((name) => context.allowedTools.includes(name));
+      const toolset = actor.status === 'confirmed'
+        ? v2.actorStore.roleToolset(actor.role)
+        : null;
+      const names = toolset ? toolset.tools : V2_CHILD_READ_TOOLS;
+      return names.filter((name) => context.allowedTools.includes(name));
+    }
+    // 无身份头：v2 子任务凭据必须有受信身份——清单不下发任何工具面
+    // （与 executeTool 的 amagi_task_missing 拒绝语义一致，防误配泄露）。
+    return [];
+  }
+
+  /** GET /tools：返回本运行允许的工具规格（族注册表派生，顺序同白名单）。
+   * v2：按身份头解析角色后下发子集（§4.1 桥接调用先于创建事件 → 只读）。 */
+  getToolSpecsForToken(token: string, identity?: { amagiTaskId?: string; amagiAgent?: string }): AgentToolSpec[] | null {
     const context = this.contexts.get(token);
     if (!context) return null;
-    return context.allowedTools
+    const names = context.options.orchestration
+      ? this.v2ToolNamesFor(context, identity)
+      : context.allowedTools;
+    return names
       .map((name) => this.familyTools.get(name)?.spec)
       .filter((spec): spec is AgentToolSpec => Boolean(spec));
   }
@@ -615,6 +733,11 @@ export class AgentToolService {
     const tool = this.familyTools.get(toolName);
     if (!tool || typeof tool.execute !== 'function') {
       throw new ToolError('tool_not_allowed', `未知工具: ${toolName}`, 403);
+    }
+    // v2（设计 v2 §4）：凭据代次→身份→角色→读写级的统一前置门；
+    // 写入工具的分配/幂等在各自执行器内完成（§4.4 受控写入链）。
+    if (context.options.orchestration) {
+      this.assertV2Access(context, toolName, meta);
     }
     const argsSummary = summarizeArgs(toolName, args);
     context.options.onEvent?.({ phase: 'start', toolName, ...(meta?.toolCallId ? { toolCallId: meta.toolCallId } : {}), argsSummary });
@@ -1451,9 +1574,25 @@ export class AgentToolService {
     const body = stripStdHeader(raw);
     const lines = body.split('\n');
     const slice = lines.slice(offset, offset + limit);
+    // v2（§7）：局部编辑坐标口径的内容哈希与行数（kb_edit_doc 的
+    // expectedContentHash 同源；参数坐标 = 去 server 头与 # 标题行）。
+    let editCoordinates: { contentHash: string; paramTotalLines: number } | null = null;
+    try {
+      // 哈希必须与本次返回的正文来自同一字节快照，不能二次读盘混入并发更新。
+      const coordinates = draftEditCoordinates(body);
+      editCoordinates = { contentHash: contentResourceHash(coordinates.paramLines.join('\n')), paramTotalLines: coordinates.paramLines.length };
+    } catch {
+      editCoordinates = null;
+    }
     return {
       content: [{ type: 'text', text: slice.join('\n') }],
-      details: { path: docPath, offset, returnedLines: slice.length, totalLines: lines.length },
+      details: {
+        path: docPath,
+        offset,
+        returnedLines: slice.length,
+        totalLines: lines.length,
+        ...(editCoordinates ? { editContentHash: editCoordinates.contentHash, editParamTotalLines: editCoordinates.paramTotalLines } : {}),
+      },
     };
   }
 
@@ -1500,6 +1639,71 @@ export class AgentToolService {
   // ------------------------------------------------------------------
 
   private async toolKbWriteDoc(context: InternalRunContext, args: Record<string, unknown>, meta?: ToolRequestMeta): Promise<ToolResult> {
+    // v2（设计 v2 §4.4 + Leader steer 硬验收）：凭据代次/身份/角色/发布窗口
+    // （前置门）→ 分配 → 幂等 → 原校验链 → 成果回执，**整体置于同一受控
+    // 锁链**（与声明临界区同一把锁）：幂等预检、最终提交与回执记账之间
+    // 不存在并发窗口；锁内异步证据装配后、最终落盘前重检身份/代次/分配/
+    // 发布窗口——取消或转移后绝不写成功。Leader 凭据到不了这里（工具面
+    // 不含正文写工具）；旧模式（无 orchestration）直走原链。
+    const v2 = context.options.orchestration ?? null;
+    if (v2 && v2.credential === 'child') {
+      const state = requireBuildState(context);
+      const { actor } = this.requireV2Actor(context, meta);
+      const docPath = requireString(args, 'path', 1, 600);
+      const operationId = requireString(args, 'operationId', 1, 200);
+      const payloadHash = canonicalPayloadHash(args, ['operationId', 'expectedDraftRevision']);
+      // 声明幂等键稳定化：回执丢失（崩溃）后重放命中 knowledge-draft 的
+      // calls 账本，不重复推进 draftRevision（meta.toolCallId 每次不同，
+      // 不能作 v2 幂等键）。
+      const stableMeta: ToolRequestMeta = { ...(meta ?? {}), toolCallId: `v2_${actor.nativeTaskId}_${operationId}` };
+      return this.withKnowledgeDeclarationLock(state, async (): Promise<ToolResult> => {
+        const replay = this.v2Replay(v2, actor.nativeTaskId, operationId, payloadHash);
+        if (replay) return replay;
+        // 锁内预检：先身份后分配（取消同时撤销两者时，报告更根本原因）
+        try {
+          v2.actorStore.requireConfirmedActor(actor.nativeTaskId, meta?.amagiAgent);
+        } catch (error) {
+          throw wrapActorError(error);
+        }
+        this.assertV2OutputAssignment(v2, actor.nativeTaskId, docPath);
+        const result = await this.writeDocCore(context, args, stableMeta, {
+          lockHeld: true,
+          recheck: () => this.assertV2WriteWindow(v2, actor.nativeTaskId, meta, docPath),
+        });
+        this.v2RecordReceipt({ v2, nativeTaskId: actor.nativeTaskId, kind: 'write_doc', operationId, payloadHash, paths: [docPath], result, invalidateReviews: true });
+        return result;
+      });
+    }
+    return this.writeDocCore(context, args, meta);
+  }
+
+  /** v2（§4.4 硬验收）：锁内、最终落盘前的写入窗口重检——排队期间的
+   * 取消/换代/分配转移/发布窗口开启都使本次写入拒绝，文件不被触碰。 */
+  private assertV2WriteWindow(v2: OrchestrationV2Options, nativeTaskId: string, meta: ToolRequestMeta | undefined, docPath: string): void {
+    v2.actorStore.assertGeneration(v2.generation);
+    const actor = v2.actorStore.lookupActor(nativeTaskId);
+    if (!actor || actor.status !== 'confirmed') {
+      throw new ToolError('actor_revoked', `任务 ${nativeTaskId} 写入资格已在提交前被撤销，拒绝落盘`, 401);
+    }
+    if (meta?.amagiAgent !== undefined && actor.role !== meta.amagiAgent) {
+      throw new ToolError('actor_role_mismatch', `任务 ${nativeTaskId} 角色已变化（${actor.role}），拒绝落盘`, 403);
+    }
+    this.assertV2OutputAssignment(v2, nativeTaskId, docPath);
+    const window = v2.actorStore.publishing;
+    if (window) {
+      throw new ToolError('build_publishing', `发布校验进行中（requestId=${window.requestId}），拒绝落盘`, 409);
+    }
+  }
+
+  /** kb_write_doc / kb_edit_doc 共用校验与落盘链（v2 记账在包装层）。
+   * options.lockHeld：调用方已持有声明锁（v2 写入链）时不重复加锁；
+   * options.recheck：锁内异步准备后、最终落盘前的重检钩子（v2）。 */
+  private async writeDocCore(
+    context: InternalRunContext,
+    args: Record<string, unknown>,
+    meta?: ToolRequestMeta,
+    options?: { lockHeld?: boolean; recheck?: () => void },
+  ): Promise<ToolResult> {
     const state = requireBuildState(context);
     // T3（A 案 §7.1）：审查者没有任何草稿写入口
     this.assertNotReviewPhase(context);
@@ -1539,7 +1743,9 @@ export class AgentToolService {
     // 整包保存，覆盖并发方的 docs/objects/evidence/clientKeys/calls 登记
     //（文件级 PathClaims 不保护 knowledge-draft.json）。锁住共享
     // BuildRunState：同 build 的声明写者串行，跨 build 不相互阻塞。
-    return this.withKnowledgeDeclarationLock(state, async (): Promise<ToolResult> => {
+    // v2（§4.4 硬验收）：包装层已持锁时直入临界区（lockHeld），
+    // recheck 在异步准备后、最终落盘前重检写入窗口。
+    const coreOperation = async (): Promise<ToolResult> => {
       const baseDraft = hasDeclaration ? this.loadKnowledgeDraft(state) : null;
       if (baseDraft && meta?.toolCallId && baseDraft.calls[meta.toolCallId]) {
         // 同 toolCallId 重复提交幂等返回（A 案 §7.1）；不重复写入、不推进修订
@@ -1605,6 +1811,9 @@ export class AgentToolService {
       // T3（A 案 §7.1）：草稿与知识声明同代写入——正文成功而声明持久化失败
       // 时整体失败（毒化构建，不部分写入），先留旧字节快照供回滚。
       const previousBytes = fs.existsSync(target) ? fs.readFileSync(target) : null;
+      // v2（§4.4 硬验收）：异步证据装配后、最终提交前的重检——排队期间的
+      // 取消/换代/分配转移/发布窗口使本次写入拒绝，文件与 revision 不变。
+      options?.recheck?.();
       atomicWriteFile(target, full);
       if (declaration) {
         declaration.draft.docs[docPath] = { docId, revision: declaration.draftRevision, bodyLineOffset, basis: 'draft' };
@@ -1654,7 +1863,8 @@ export class AgentToolService {
             : {}),
         },
       };
-    });
+    };
+    return options?.lockHeld ? coreOperation() : this.withKnowledgeDeclarationLock(state, coreOperation);
   }
 
   private inheritDocId(state: BuildRunState, docPath: string): string | null {
@@ -1673,17 +1883,32 @@ export class AgentToolService {
     return null;
   }
 
-  private toolKbDeleteDoc(context: InternalRunContext, args: Record<string, unknown>): ToolResult {
+  private toolKbDeleteDoc(context: InternalRunContext, args: Record<string, unknown>, meta?: ToolRequestMeta): ToolResult {
     const state = requireBuildState(context);
     // T3（A 案 §7.1）：审查者没有任何草稿写入口
     this.assertNotReviewPhase(context);
     const docPath = requireString(args, 'path', 1, 600);
+    // v2（设计 v2 §4.4）：删除同走受控写入链（幂等/分配）；旧模式不变
+    const v2 = context.options.orchestration ?? null;
+    let v2Info: { actor: NonNullable<ReturnType<BuildActorStore["lookupActor"]>>; operationId: string; payloadHash: string } | null = null;
+    if (v2 && v2.credential === 'child') {
+      const { actor } = this.requireV2Actor(context, meta);
+      const operationId = requireString(args, 'operationId', 1, 200);
+      const payloadHash = canonicalPayloadHash(args, ['operationId']);
+      const replay = this.v2Replay(v2, actor.nativeTaskId, operationId, payloadHash);
+      if (replay) return replay;
+      this.assertV2OutputAssignment(v2, actor.nativeTaskId, docPath);
+      v2Info = { actor, operationId, payloadHash };
+    }
     // R2-04：与 kb_write_doc 同一合法规范路径门——`./`/反斜杠等别名在
     // 认领与触盘之前拒绝，防止用另一字符串认领却删除同一实际文件。
     validateStdDocPath(docPath);
     // S4（§4.3）：删除同样受路径认领约束；收尾轮不受限
     this.assertPathClaim(context, state, docPath);
     removeFileInside(path.join(state.stagingRoot, 'docs'), docPath);
+    if (v2 && v2Info?.actor) {
+      this.v2RecordReceipt({ v2, nativeTaskId: v2Info.actor!.nativeTaskId, kind: 'delete_doc', operationId: v2Info.operationId, payloadHash: v2Info.payloadHash, paths: [docPath], result: { content: [{ type: 'text', text: `已删除草稿 ${docPath}` }] }, invalidateReviews: true });
+    }
     return { content: [{ type: 'text', text: `已删除草稿 ${docPath}` }] };
   }
 
@@ -1707,6 +1932,123 @@ export class AgentToolService {
       `路径 ${docPath}（文档「${title}」）由单元 ${ownerHint} 处理；请换一个路径，或留给该单元/收尾轮改写`,
       409,
     );
+  }
+
+  // ------------------------------------------------------------------
+  // v2 编排（设计 v2 §4）：凭据代次 → 身份 → 角色 → 读写级的写入链
+  // ------------------------------------------------------------------
+
+  /** v2 统一前置门（executeTool 派发前）：代次/身份/角色/读写级。 */
+  private assertV2Access(context: InternalRunContext, toolName: string, meta?: ToolRequestMeta): void {
+    const v2 = context.options.orchestration!;
+    // 1) 凭据代次（§4.1：取消或换代立即失效）
+    try {
+      v2.actorStore.assertGeneration(v2.generation);
+    } catch (error) {
+      throw wrapActorError(error);
+    }
+    if (v2.credential === 'leader') {
+      // Leader 工具面：仅清单/分配/交接/问题/检查点/申请发布（§3.4）——
+      // 不含正文与对象写工具，也不含应用 task 族（白名单本身不含）。
+      if (!(V2_LEADER_TOOLS as readonly string[]).includes(toolName)) {
+        throw new ToolError('tool_not_allowed', `v2 Leader 工具面不含 ${toolName}（Leader 无正文写工具与 task 族）`, 403);
+      }
+      return;
+    }
+    // 2) child：身份头必须存在（受信 env，§4.1 不采信模型参数）
+    if (!meta?.amagiTaskId) {
+      throw new ToolError('amagi_task_missing', '子任务凭据必须携带任务身份头（X-Amagi-Task-Id，来自 AMAGI_TASK_ID）', 401);
+    }
+    // 3) 身份状态：桥接先于创建事件 → pending 只读
+    const actor = v2.actorStore.lookupActor(meta.amagiTaskId)
+      ?? v2.actorStore.ensurePendingIdentity(meta.amagiTaskId, meta.amagiAgent);
+    if (actor.status === 'revoked') {
+      throw new ToolError('actor_revoked', `任务 ${meta.amagiTaskId} 写入资格已撤销（${actor.revokedReason ?? 'revoked'}）`, 401);
+    }
+    if (actor.status === 'pending') {
+      if (!(V2_CHILD_READ_TOOLS as readonly string[]).includes(toolName)) {
+        throw new ToolError('actor_pending', `任务 ${meta.amagiTaskId} 身份待确认（创建事件未到达）：当前只能使用只读工具`, 403);
+      }
+      return;
+    }
+    // 4) confirmed：角色一致（AMAGI_AGENT vs 登记角色）与角色工具面
+    if (meta.amagiAgent !== undefined && actor.role !== meta.amagiAgent) {
+      throw new ToolError('actor_role_mismatch', `桥接角色 ${meta.amagiAgent} 与登记角色 ${actor.role} 不一致，拒绝调用`, 403);
+    }
+    const toolset = v2.actorStore.roleToolset(actor.role);
+    if (!toolset) {
+      throw new ToolError('actor_role_unknown', `角色不在构建角色表内: ${actor.role}`, 403);
+    }
+    if (!toolset.tools.includes(toolName)) {
+      throw new ToolError('tool_not_allowed', `角色 ${actor.role} 工具面不含 ${toolName}`, 403);
+    }
+    // 5) 写入类工具：发布校验窗口内拒绝新写入（§5.4）
+    if (toolset.writeTools.includes(toolName)) {
+      const window = v2.actorStore.publishing;
+      if (window) {
+        throw new ToolError('build_publishing', `发布校验进行中（requestId=${window.requestId}），新写入被拒；稍后重试`, 409);
+      }
+    }
+  }
+
+  /** v2 写工具身份（前置门已过；返回已确认 actor 供写入链使用）。 */
+  private requireV2Actor(context: InternalRunContext, meta: ToolRequestMeta | undefined): { v2: OrchestrationV2Options; actor: NonNullable<ReturnType<BuildActorStore["lookupActor"]>> } {
+    const v2 = context.options.orchestration!;
+    if (v2.credential !== 'child' || !meta?.amagiTaskId) {
+      throw new ToolError('amagi_task_missing', 'v2 写入需要子任务身份头（X-Amagi-Task-Id）', 401);
+    }
+    try {
+      const actor = v2.actorStore.requireConfirmedActor(meta.amagiTaskId, meta.amagiAgent);
+      return { v2, actor };
+    } catch (error) {
+      throw wrapActorError(error);
+    }
+  }
+
+  /** v2 输出分配校验（§4.2：写入前检查分配；未分配可重试 409）。 */
+  private assertV2OutputAssignment(v2: OrchestrationV2Options, nativeTaskId: string, docPath: string): void {
+    try {
+      v2.actorStore.assertOutputAssignment(nativeTaskId, docPath);
+    } catch (error) {
+      throw wrapActorError(error);
+    }
+  }
+
+  /** v2 幂等预检（§4.4）：同键同载荷重放原回执，同键异载荷拒绝。 */
+  private v2Replay(v2: OrchestrationV2Options, nativeTaskId: string, operationId: string, payloadHash: string): ToolResult | null {
+    try {
+      const prior = v2.actorStore.replayReceipt(
+        deriveIdempotencyKey(v2.actorStore.buildId, v2.generation, nativeTaskId, operationId),
+        payloadHash,
+      );
+      return prior ? replayReceiptToolResult(prior) : null;
+    } catch (error) {
+      throw wrapActorError(error);
+    }
+  }
+
+  /** v2 写入链后置（§4.4）：成果回执 + 受影响路径审查失效（§4.3）。 */
+  private v2RecordReceipt(input: {
+    v2: OrchestrationV2Options;
+    nativeTaskId: string;
+    kind: 'write_doc' | 'edit_doc' | 'delete_doc' | 'handoff' | 'review';
+    operationId: string;
+    payloadHash: string;
+    paths: string[];
+    result: ToolResult;
+    invalidateReviews?: boolean;
+  }): void {
+    input.v2.actorStore.recordReceipt({
+      authorTaskId: input.nativeTaskId,
+      kind: input.kind,
+      operationId: input.operationId,
+      payloadHash: input.payloadHash,
+      paths: input.paths,
+      result: { content: input.result.content, ...(input.result.details ? { details: input.result.details } : {}) },
+    });
+    if (input.invalidateReviews && input.paths.length > 0) {
+      input.v2.actorStore.invalidateReviewsForPaths(input.paths, 'content_revised');
+    }
   }
 
   /** S4（§4.4）：逐单元上报；objToken 须属本单元；重复调用以最后一次为准。 */
@@ -2811,21 +3153,43 @@ export class AgentToolService {
    * 改后旧报告 hash 不匹配（发布门禁比对）。审查者无草稿写入口；
    * revisionResponse/closureBasis 属修订流程字段，提交时一律不读不存。
    */
-  private toolKbSubmitReview(context: InternalRunContext, args: Record<string, unknown>): ToolResult {
+  private toolKbSubmitReview(context: InternalRunContext, args: Record<string, unknown>, meta?: ToolRequestMeta): ToolResult {
     const state = requireBuildState(context);
     const worker = context.options.worker;
     if (worker && worker.phase !== 'review') {
       throw new ToolError('kb_review_phase_forbidden',
         `kb_submit_review 仅审查轮可用（当前 phase=${worker.phase}）；撰写者不能自审`, 403);
     }
+    // v2（设计 v2 §4.3）：审查角色 + 幂等；独立性在草稿清单就绪后校验
+    const v2 = context.options.orchestration ?? null;
+    let v2Info: { v2: OrchestrationV2Options; actor: NonNullable<ReturnType<BuildActorStore["lookupActor"]>>; operationId: string; payloadHash: string } | null = null;
+    if (v2 && v2.credential === 'child') {
+      const { actor } = this.requireV2Actor(context, meta);
+      if (!v2.actorStore.roleToolset(actor.role)?.isReviewer) {
+        throw new ToolError('kb_review_role_forbidden', `角色 ${actor.role} 不是审查角色；撰写者不能自审（v2 §4.3）`, 403);
+      }
+      const operationId = requireString(args, 'operationId', 1, 200);
+      const payloadHash = canonicalPayloadHash(args, ['operationId']);
+      const replay = this.v2Replay(v2, actor.nativeTaskId, operationId, payloadHash);
+      if (replay) return replay;
+      v2Info = { v2, actor, operationId, payloadHash };
+    }
     const unitId = args.unitId !== undefined
       ? requireString(args, 'unitId', 1, 64)
-      : worker?.unitId ?? 'all';
+      : v2Info?.actor?.actorId ?? worker?.unitId ?? 'all';
     if (!/^[A-Za-z0-9_-]+$/.test(unitId)) {
       throw new ToolError('invalid_request', 'unitId 只能包含字母、数字、下划线与连字符');
     }
     const entries = this.stagingDraftEntries(state);
     const draftHash = computeCandidateHash({ documents: entries });
+    // v2（§4.3）：审查者既不是作者，也不在作者的续接链上
+    if (v2Info) {
+      try {
+        v2Info.v2.actorStore.assertReviewerIndependent(v2Info.actor!.nativeTaskId, entries.map((entry) => entry.path));
+      } catch (error) {
+        throw wrapActorError(error);
+      }
+    }
     const coverageInput = asRecord(args.coverage);
     if (!coverageInput) throw new ToolError('invalid_request', 'coverage 必须是对象');
     const sourceRefs = optStrArray(coverageInput, 'sourceRefs') ?? [];
@@ -2875,7 +3239,7 @@ export class AgentToolService {
     fs.mkdirSync(reviewsDir, { recursive: true });
     atomicWriteFile(path.join(reviewsDir, `${unitId}.json`), `${JSON.stringify(report, null, 2)}\n`);
     const blocking = issues.filter((issue) => issue.severity === 'blocking').length;
-    return {
+    const result: ToolResult = {
       content: [{
         type: 'text',
         text: `已提交审查报告 ${report.reportId}（unit=${unitId}，draftHash=${draftHash.slice(0, 12)}…，问题 ${issues.length} 项：blocking ${blocking}/suggestion ${issues.length - blocking}）`,
@@ -2889,6 +3253,25 @@ export class AgentToolService {
         path: `reviews/${unitId}.json`,
       },
     };
+    if (v2Info) {
+      // v2（§4.3/§8）：ReviewReceipt 哈希绑定（正文/来源逐路径）+ 幂等回执
+      v2Info.v2.actorStore.recordReview({
+        reviewerTaskId: v2Info.actor!.nativeTaskId,
+        draftHash,
+        dependencyHashes: Object.fromEntries(entries.map((entry) => [`doc:${entry.path}`, entry.contentHash])),
+        ruleVersion: 'kb-review/1',
+        issues: issues.map((issue) => ({
+          issueId: issue.issueId,
+          severity: issue.severity,
+          draftLocation: issue.draftLocation,
+          sourceLocation: issue.sourceLocation ?? null,
+          description: issue.description,
+        })),
+        verdict: conclusion,
+      });
+      this.v2RecordReceipt({ v2: v2Info.v2, nativeTaskId: v2Info.actor!.nativeTaskId, kind: 'review', operationId: v2Info.operationId, payloadHash: v2Info.payloadHash, paths: [], result });
+    }
+    return result;
   }
 
   /** staging 草稿清单哈希输入（path + 内容 sha256，按 path 排序；空库哈希稳定）。 */
@@ -2908,6 +3291,649 @@ export class AgentToolService {
     };
     walk(docsDir, '');
     return entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  }
+
+  // ------------------------------------------------------------------
+  // v2 build-runtime 工具（设计 v2 §3.4/§4/§5/§7）
+  // ------------------------------------------------------------------
+
+  /** build_manifest（Leader）：冻结源材料清单（§5.1），分页。 */
+  private toolBuildManifest(context: InternalRunContext, args: Record<string, unknown>): ToolResult {
+    const state = requireBuildState(context);
+    const limit = optionalInt(args, 'limit', 50, 1, 200);
+    const entries = state.snapshot.entries.map((entry) => ({
+      objToken: entry.objToken,
+      objType: entry.objType,
+      title: entry.title,
+      relPath: entry.relPath,
+      contentHash: entry.contentHash,
+      objEditTime: entry.objEditTime,
+      changeType: state.workset.get(entry.objToken) ?? (state.mode === 'full' ? 'rebuild' : null),
+    }));
+    const cursorOffset = typeof args.cursor === 'string' && args.cursor ? Number(Buffer.from(args.cursor, 'base64url').toString('utf-8')) : 0;
+    const start = Number.isInteger(cursorOffset) && cursorOffset >= 0 ? cursorOffset : 0;
+    const page = entries.slice(start, start + limit);
+    const nextCursor = start + limit < entries.length ? Buffer.from(String(start + limit), 'utf-8').toString('base64url') : null;
+    return {
+      content: [{ type: 'text', text: JSON.stringify({ buildId: context.buildId ?? state.v2?.actorStore.buildId ?? null, total: entries.length, entries: page, nextCursor }, null, 2) }],
+      details: { total: entries.length, returned: page.length, nextCursor },
+    };
+  }
+
+  /** build_assign_output（Leader，§4.2）：目标写入资格分配。 */
+  private toolBuildAssignOutput(context: InternalRunContext, args: Record<string, unknown>): ToolResult {
+    const v2 = requireV2Leader(context);
+    const ownerTaskId = requireString(args, 'ownerTaskId', 1, 120);
+    const targets = requireArray(args, 'targets');
+    if (targets.length === 0 || targets.length > 200 || !targets.every((target): target is string => typeof target === 'string' && target.length > 0)) {
+      throw new ToolError('invalid_request', 'targets 必须是 1..200 项的非空字符串数组');
+    }
+    const targetKind = targets.every((target) => target.startsWith('family:')) ? 'family'
+      : targets.every((target) => !target.startsWith('family:')) ? 'doc'
+        : (() => { throw new ToolError('invalid_request', 'targets 不能混用文档路径与 family:<familyKey>'); })();
+    const normalized = targetKind === 'family' ? targets.map((target) => target.slice('family:'.length)) : targets;
+    try {
+      const assignment = v2.actorStore.assignOutputs({
+        targets: normalized,
+        targetKind,
+        ownerTaskId,
+        ...(args.supersedes === true ? { supersedes: true } : {}),
+      });
+      return {
+        content: [{ type: 'text', text: `已分配 ${normalized.length} 个目标给任务 ${ownerTaskId}（assignmentId=${assignment.assignmentId}${assignment.supersedes ? `，接替 ${assignment.supersedes}` : ''}）` }],
+        details: { assignmentId: assignment.assignmentId, ownerTaskId, targetKind, targets: normalized },
+      };
+    } catch (error) {
+      throw wrapActorError(error);
+    }
+  }
+
+  /** build_revoke_output（Leader，§4.2）：收回分配。 */
+  private toolBuildRevokeOutput(context: InternalRunContext, args: Record<string, unknown>): ToolResult {
+    const v2 = requireV2Leader(context);
+    const assignmentId = typeof args.assignmentId === 'string' && args.assignmentId ? args.assignmentId : null;
+    const ownerTaskId = typeof args.ownerTaskId === 'string' && args.ownerTaskId ? args.ownerTaskId : null;
+    if (Number(Boolean(assignmentId)) + Number(Boolean(ownerTaskId)) !== 1) {
+      throw new ToolError('invalid_request', 'assignmentId 与 ownerTaskId 必须二选一');
+    }
+    try {
+      const count = v2.actorStore.revokeOutputs({ ...(assignmentId ? { assignmentId } : { ownerTaskId: ownerTaskId! }) });
+      return { content: [{ type: 'text', text: `已收回 ${count} 个分配` }], details: { revoked: count } };
+    } catch (error) {
+      throw wrapActorError(error);
+    }
+  }
+
+  /** build_handoff_submit（子任务，§5.2）：交接记录（幂等）。 */
+  private toolBuildHandoffSubmit(context: InternalRunContext, args: Record<string, unknown>, meta?: ToolRequestMeta): ToolResult {
+    const state = requireBuildState(context);
+    const { v2, actor } = this.requireV2Actor(context, meta);
+    const operationId = requireString(args, 'operationId', 1, 200);
+    const payloadHash = canonicalPayloadHash(args, ['operationId']);
+    const replay = this.v2Replay(v2, actor.nativeTaskId, operationId, payloadHash);
+    if (replay) return replay;
+    const summary = requireString(args, 'summary', 1, 2000);
+    const strList = (key: string): string[] => {
+      const values = args[key] === undefined ? [] : requireArray(args, key);
+      if (values.length > 200 || !values.every((value): value is string => typeof value === 'string' && value.length > 0)) {
+        throw new ToolError('invalid_request', `${key} 必须是至多 200 项的非空字符串数组`);
+      }
+      return values;
+    };
+    const record = v2.actorStore.recordHandoff({
+      taskId: actor.nativeTaskId,
+      role: actor.role,
+      summary,
+      artifactRefs: strList('artifactRefs'),
+      sourceScope: strList('sourceScope'),
+      openIssues: strList('openIssues'),
+      nextInfo: strList('nextInfo'),
+    });
+    const result: ToolResult = {
+      content: [{ type: 'text', text: `已提交交接记录 ${record.handoffId}（成果引用 ${record.artifactRefs.length}，未解决问题 ${record.openIssues.length}）；最终回复只需引用交接编号与结论` }],
+      details: { handoffId: record.handoffId, taskId: record.taskId },
+    };
+    this.v2RecordReceipt({ v2, nativeTaskId: actor.nativeTaskId, kind: 'handoff', operationId, payloadHash, paths: [], result });
+    void state;
+    return result;
+  }
+
+  /** build_handoff_list（Leader/子任务，只读）。 */
+  private toolBuildHandoffList(context: InternalRunContext, args: Record<string, unknown>): ToolResult {
+    const v2 = requireV2Orchestration(context);
+    const taskId = typeof args.taskId === 'string' && args.taskId ? args.taskId : undefined;
+    const records = v2.actorStore.listHandoffs({ ...(taskId ? { taskId } : {}) });
+    return { content: [{ type: 'text', text: JSON.stringify({ handoffs: records }, null, 2) }], details: { count: records.length } };
+  }
+
+  /** build_issues_submit（Leader，§5.3）：聚合问题清单。 */
+  private toolBuildIssuesSubmit(context: InternalRunContext, args: Record<string, unknown>): ToolResult {
+    const v2 = requireV2Leader(context);
+    const summary = typeof args.summary === 'string' ? requireString(args, 'summary', 1, 2000) : null;
+    const issueInputs = requireArray(args, 'issues');
+    if (issueInputs.length > 500) throw new ToolError('invalid_request', 'issues 至多 500 项');
+    const issues = issueInputs.map((raw) => {
+      const input = asRecord(raw);
+      if (!input) throw new ToolError('invalid_request', 'issues 每项必须是对象');
+      const issueKey = requireString(input, 'issueKey', 1, 200);
+      const severity = input.severity;
+      if (severity !== 'blocking' && severity !== 'suggestion') {
+        throw new ToolError('invalid_request', `severity 必须是 blocking|suggestion: ${String(severity)}`);
+      }
+      const targetPath = optStr(input, 'targetPath');
+      if (severity === 'blocking' && !targetPath) {
+        throw new ToolError('invalid_request', 'blocking 问题必须带 targetPath（修订任务需定位范围）');
+      }
+      return {
+        issueKey,
+        severity: severity as 'blocking' | 'suggestion',
+        targetPath: targetPath ?? null,
+        draftLocation: optStr(input, 'draftLocation') ?? null,
+        sourceLocation: optStr(input, 'sourceLocation') ?? null,
+        description: requireString(input, 'description', 1, 4000),
+        fromReviewId: optStr(input, 'fromReviewId') ?? null,
+      };
+    });
+    const record = v2.actorStore.recordIssueList({ summary, issues });
+    return {
+      content: [{ type: 'text', text: `已提交问题清单 ${record.issueListId}（revision=${record.revision}，问题 ${issues.length} 项：blocking ${issues.filter((issue) => issue.severity === 'blocking').length}）` }],
+      details: { issueListId: record.issueListId, revision: record.revision, issues: issues.length },
+    };
+  }
+
+  /** build_issues_list（Leader/修订子任务，只读；最新 revision）。 */
+  private toolBuildIssuesList(context: InternalRunContext, args: Record<string, unknown>): ToolResult {
+    const v2 = requireV2Orchestration(context);
+    const lists = v2.actorStore.listIssueLists();
+    const latest = lists[lists.length - 1] ?? null;
+    if (!latest) {
+      return { content: [{ type: 'text', text: JSON.stringify({ issueList: null, note: '尚无问题清单' }) }], details: { count: 0 } };
+    }
+    const targetPath = typeof args.targetPath === 'string' && args.targetPath ? args.targetPath : null;
+    const issues = targetPath ? latest.issues.filter((issue) => issue.targetPath === targetPath) : latest.issues;
+    return {
+      content: [{ type: 'text', text: JSON.stringify({ issueListId: latest.issueListId, revision: latest.revision, summary: latest.summary, issues }, null, 2) }],
+      details: { revision: latest.revision, issues: issues.length },
+    };
+  }
+
+  /** build_checkpoint（Leader）：保存检查点（成果账本+候选区）或查状态。 */
+  private toolBuildCheckpoint(context: InternalRunContext, args: Record<string, unknown>): ToolResult {
+    const state = requireBuildState(context);
+    const v2 = requireV2Leader(context);
+    const action = args.action;
+    const store = v2.actorStore;
+    const statusSummary = () => ({
+      buildId: store.buildId,
+      generation: store.activeGeneration,
+      actors: store.listActors().length,
+      assignments: store.listAssignments().filter((item) => item.status === 'active').length,
+      receipts: store.listReceipts().length,
+      reviews: store.listReviews().filter((review) => review.status === 'valid').length,
+      openBlockingIssues: store.openBlockingIssues(),
+      publishing: store.publishing?.requestId ?? null,
+    });
+    if (action === 'status') {
+      return { content: [{ type: 'text', text: JSON.stringify(statusSummary(), null, 2) }], details: statusSummary() };
+    }
+    if (action !== 'save') {
+      throw new ToolError('invalid_request', `action 必须是 save|status: ${String(action)}`);
+    }
+    store.persist();
+    state.onCheckpoint?.();
+    store.appendEvent({ source: 'tool-service', type: 'checkpoint_saved', payload: {} });
+    const summary = statusSummary();
+    return {
+      content: [{ type: 'text', text: `检查点已保存（generation=${summary.generation}，回执 ${summary.receipts}，有效审查 ${summary.reviews}）` }],
+      details: summary,
+    };
+  }
+
+  /** build_request_publish（Leader，§5.4）：候选锁定 + 阻断检查 + 校验管线。 */
+  private async toolBuildRequestPublish(context: InternalRunContext, args: Record<string, unknown>): Promise<ToolResult> {
+    const state = requireBuildState(context);
+    const v2 = requireV2Leader(context);
+    const requestedRevision = typeof args.requestedRevision === 'string' && args.requestedRevision ? args.requestedRevision : null;
+    const summary = typeof args.summary === 'string' ? requireString(args, 'summary', 1, 4000) : null;
+    const entries = this.stagingDraftEntries(state);
+    const candidateHash = computeCandidateHash({ documents: entries });
+    // 申请的具体候选标识与当前候选不一致 → 版本冲突（仅同形 64 位哈希
+    // 比对；非哈希标识交给发布管线解释，§5.4 锁定当前候选）。
+    if (requestedRevision && /^[a-f0-9]{64}$/.test(requestedRevision) && requestedRevision !== candidateHash) {
+      throw new ToolError('kb_publish_candidate_conflict', `申请的候选 ${requestedRevision.slice(0, 12)}… 与当前候选 ${candidateHash.slice(0, 12)}… 不一致（校验锁定当前候选；请重新申请或检查是否有并行写入）`, 409);
+    }
+    let request;
+    try {
+      request = v2.actorStore.beginPublishWindow(candidateHash, requestedRevision);
+    } catch (error) {
+      throw wrapActorError(error);
+    }
+    const blocking = v2.actorStore.openBlockingIssues();
+    if (blocking > 0) {
+      v2.actorStore.settlePublishRequest(request.requestId, 'rejected', { reason: 'blocking_issues', blocking });
+      throw new ToolError('build_blocking_issues', `存在 ${blocking} 个未解决 blocking 问题，不能申请发布（先修订并重新聚合问题清单）`, 409);
+    }
+    const handler = v2.publishHandler ?? state.v2?.publishHandler;
+    if (!handler) {
+      v2.actorStore.settlePublishRequest(request.requestId, 'not_wired', { reason: 'publish_handler_missing' });
+      throw new ToolError('build_publish_not_wired', '发布校验管线未接线（publishHandler 未注入）；候选已锁定在本窗口，请集成者接线后重试', 501);
+    }
+    try {
+      const outcome = await handler({ buildId: v2.actorStore.buildId, generation: v2.actorStore.activeGeneration, candidateHash, requestedRevision, summary });
+      v2.actorStore.settlePublishRequest(request.requestId, outcome.accepted ? 'accepted' : 'rejected', outcome.result);
+      return {
+        content: [{ type: 'text', text: `发布申请 ${request.requestId} 已结算：${outcome.accepted ? 'accepted' : 'rejected'}（候选 ${candidateHash.slice(0, 12)}…）` }],
+        details: { requestId: request.requestId, accepted: outcome.accepted, candidateHash, result: outcome.result },
+      };
+    } catch (error) {
+      v2.actorStore.settlePublishRequest(request.requestId, 'rejected', { reason: 'handler_error', message: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }
+  }
+
+  /** kb_read_batch（§7）：多资源批量读取——预算/游标/截断；raw 登记
+   * 读取回执（与 raw_read 同语义），draft 返回参数坐标正文与可选声明。 */
+  private toolKbReadBatch(context: InternalRunContext, args: Record<string, unknown>, meta?: ToolRequestMeta): ToolResult {
+    const state = requireBuildState(context);
+    if (!context.options.buildState) {
+      throw new ToolError('invalid_request', 'kb_read_batch 仅在构建态可用（会话态请用 raw_read / kb_read）');
+    }
+    const maxLines = optionalInt(args, 'maxLines', 1200, 1, 4000);
+    type BatchRequest = { kind: 'raw' | 'draft'; objToken?: string; path?: string; offset: number; limit?: number; includeDeclarations?: boolean };
+    let queue: BatchRequest[];
+    let linesUsed = 0;
+    if (typeof args.cursor === 'string' && args.cursor) {
+      try {
+        const decoded = JSON.parse(Buffer.from(args.cursor, 'base64url').toString('utf-8')) as { queue: BatchRequest[]; linesUsed: number };
+        if (!Array.isArray(decoded.queue) || typeof decoded.linesUsed !== 'number') throw new Error('shape');
+        queue = decoded.queue;
+        linesUsed = decoded.linesUsed;
+      } catch {
+        throw new ToolError('invalid_request', 'cursor 无效（请原样回传 nextCursor）');
+      }
+    } else {
+      const inputs = requireArray(args, 'requests');
+      if (inputs.length === 0 || inputs.length > 50) throw new ToolError('invalid_request', 'requests 必须是 1..50 项');
+      queue = inputs.map((raw) => {
+        const input = asRecord(raw);
+        if (!input) throw new ToolError('invalid_request', 'requests 每项必须是对象');
+        if (input.kind !== 'raw' && input.kind !== 'draft') throw new ToolError('invalid_request', `requests.kind 非法: ${String(input.kind)}`);
+        if (input.kind === 'raw' && typeof input.objToken !== 'string') throw new ToolError('invalid_request', 'raw 请求必须带 objToken');
+        if (input.kind === 'draft' && typeof input.path !== 'string') throw new ToolError('invalid_request', 'draft 请求必须带 path');
+        return {
+          kind: input.kind,
+          ...(input.kind === 'raw' ? { objToken: requireString(input, 'objToken', 1, 256) } : { path: requireString(input, 'path', 1, 600) }),
+          offset: optionalInt(input, 'offset', 0, 0, 10_000_000),
+          ...(input.limit !== undefined ? { limit: optionalInt(input, 'limit', 800, 1, 2000) } : {}),
+          ...(input.includeDeclarations === true ? { includeDeclarations: true } : {}),
+        };
+      });
+    }
+    const results: Array<Record<string, unknown>> = [];
+    const receipts: ReadReceiptRecord[] = [];
+    while (queue.length > 0 && linesUsed < maxLines) {
+      const request = queue.shift()!;
+      const budgetLeft = maxLines - linesUsed;
+      const effLimit = Math.min(request.limit ?? 800, budgetLeft, 2000);
+      if (request.kind === 'raw') {
+        const entry = state.snapshot.get(request.objToken!);
+        if (!entry) {
+          results.push({ kind: 'raw', objToken: request.objToken, error: `原始文档不存在或无成功本地版本: ${request.objToken}` });
+          continue;
+        }
+        const assembled = this.assembleBuildRead(state, entry);
+        const slice = assembled.lines.slice(request.offset, request.offset + effLimit);
+        const winStart = request.offset + 1;
+        const winEnd = request.offset + slice.length;
+        const truncated = winEnd < assembled.lines.length;
+        const segmentMap: Array<Record<string, unknown>> = [];
+        const resourceById = new Map(assembled.resources.map((resource) => [resource.resourceId, resource]));
+        for (const segment of assembled.segments) {
+          if (segment.outEnd < winStart || segment.outStart > winEnd) continue;
+          const clippedStart = Math.max(segment.outStart, winStart);
+          const clippedEnd = Math.min(segment.outEnd, winEnd);
+          if (segment.resourceId) {
+            const resource = resourceById.get(segment.resourceId)!;
+            const resStart = segment.resStart! + (clippedStart - segment.outStart);
+            const resEnd = segment.resStart! + (clippedEnd - segment.outStart);
+            const returnedText = resource.lines.slice(resStart - 1, resEnd).join('\n');
+            const readReceiptId = `rr_${crypto.randomBytes(9).toString('hex')}`;
+            receipts.push({
+              readReceiptId,
+              buildId: context.buildId ?? 'unknown',
+              unitId: context.options.worker?.unitId ?? null,
+              toolCallId: meta?.toolCallId ?? 'unknown',
+              sourceSnapshotHash: entry.contentHash,
+              resourceId: segment.resourceId,
+              selector: { kind: 'read_range', lineStart: resStart, lineEnd: resEnd },
+              returnedHash: contentResourceHash(returnedText),
+              truncated,
+            });
+            segmentMap.push({ resourceId: segment.resourceId, outStart: clippedStart, outEnd: clippedEnd, resStart, resEnd, readReceiptId });
+          } else {
+            segmentMap.push({ derived: segment.derived ?? 'derived', outStart: clippedStart, outEnd: clippedEnd });
+          }
+        }
+        linesUsed += slice.length;
+        results.push({
+          kind: 'raw',
+          objToken: entry.objToken,
+          title: entry.title,
+          relPath: entry.relPath,
+          offset: request.offset,
+          returnedLines: slice.length,
+          totalLines: assembled.lines.length,
+          truncated,
+          text: `<untrusted_source obj_token="${entry.objToken}" title="${escapeXml(entry.title)}">\n${slice.join('\n')}\n</untrusted_source>`,
+          segmentMap,
+        });
+        if (truncated) {
+          queue.unshift({ ...request, offset: request.offset + slice.length });
+        }
+      } else {
+        const docPath = request.path!;
+        try {
+          validateStdDocPath(docPath);
+        } catch (error) {
+          results.push({ kind: 'draft', path: docPath, error: error instanceof Error ? error.message : String(error) });
+          continue;
+        }
+        const target = path.join(state.stagingRoot, 'docs', docPath);
+        if (!fs.existsSync(target)) {
+          results.push({ kind: 'draft', path: docPath, error: `草稿不存在: ${docPath}` });
+          continue;
+        }
+        const coordinates = draftEditCoordinates(fs.readFileSync(target, 'utf-8'));
+        const slice = coordinates.paramLines.slice(request.offset, request.offset + effLimit);
+        const truncated = request.offset + slice.length < coordinates.paramLines.length;
+        linesUsed += slice.length;
+        results.push({
+          kind: 'draft',
+          path: docPath,
+          coordinateBasis: 'param',
+          offset: request.offset,
+          returnedLines: slice.length,
+          totalLines: coordinates.paramLines.length,
+          truncated,
+          contentHash: contentResourceHash(coordinates.paramLines.join('\n')),
+          text: slice.join('\n'),
+          ...(request.includeDeclarations ? { declarations: this.renderDraftDeclarations(state, docPath) } : {}),
+        });
+        if (truncated) {
+          queue.unshift({ ...request, offset: request.offset + slice.length });
+        }
+      }
+    }
+    if (receipts.length > 0) this.appendReadReceipts(state, receipts);
+    const nextCursor = queue.length > 0
+      ? Buffer.from(JSON.stringify({ queue, linesUsed }), 'utf-8').toString('base64url')
+      : null;
+    return {
+      content: [{ type: 'text', text: JSON.stringify({ results, nextCursor, linesUsed, budget: maxLines }, null, 2) }],
+      details: { resources: results.length, linesUsed, nextCursor, receipts: receipts.length },
+    };
+  }
+
+  /** kb_edit_doc（§7）：局部编辑——稳定定位/声明继承/结构化错误/审查失效；
+   * 复用 writeDocCore 同一校验链（不绕开）；幂等与分配在 v2 包装层。 */
+  private async toolKbEditDoc(context: InternalRunContext, args: Record<string, unknown>, meta?: ToolRequestMeta): Promise<ToolResult> {
+    const state = requireBuildState(context);
+    this.assertNotReviewPhase(context);
+    const docPath = requireString(args, 'path', 1, 600);
+    validateStdDocPath(docPath);
+    const operationId = requireString(args, 'operationId', 1, 200);
+    const v2 = context.options.orchestration ?? null;
+    let v2Info: { v2: OrchestrationV2Options; actor: NonNullable<ReturnType<BuildActorStore["lookupActor"]>>; operationId: string; payloadHash: string } | null = null;
+    if (v2 && v2.credential === 'child') {
+      const { actor } = this.requireV2Actor(context, meta);
+      const payloadHash = canonicalPayloadHash(args, ['operationId', 'expectedContentHash', 'expectedDraftRevision']);
+      const replay = this.v2Replay(v2, actor.nativeTaskId, operationId, payloadHash);
+      if (replay) return replay;
+      v2Info = { v2, actor, operationId, payloadHash };
+    }
+    const plainTarget = path.join(state.stagingRoot, 'docs', docPath);
+    if (!fs.existsSync(plainTarget) || !fs.statSync(plainTarget).isFile()) {
+      throw new ToolError('not_found', `草稿不存在: ${docPath}（局部编辑只能改已有草稿；新建用 kb_write_doc）`, 404);
+    }
+    // v2（§4.4 硬验收）：从草稿读取到落盘记账整体置于同一受控锁链（与
+    // kb_write_doc 同一把声明锁）——expectedContentHash 校验、补丁定位、
+    // 最终提交与回执记账之间无并发窗口；锁内最终落盘前重检写入窗口。
+    // 非 v2（旧模式未下发本工具；防御路径）保持直调，writeDocCore 自行加锁。
+    const editOperation = async (): Promise<ToolResult> => {
+    // v2（§4.2）：存在性与内容基准确认后再校验分配（未分配写入可重试）
+    if (v2Info?.actor) {
+      this.assertV2OutputAssignment(v2Info.v2, v2Info.actor.nativeTaskId, docPath);
+    }
+    const coordinates = draftEditCoordinates(fs.readFileSync(resolveInside(path.join(state.stagingRoot, 'docs'), docPath, 'read'), 'utf-8'));
+    if (typeof args.expectedContentHash === 'string' && args.expectedContentHash) {
+      if (contentResourceHash(coordinates.paramLines.join('\n')) !== args.expectedContentHash) {
+        throw new ToolError('kb_edit_conflict', `expectedContentHash 与当前草稿不一致（草稿已被修改；请 draft_read 重读后重提）`, 409);
+      }
+    }
+    // 顺序应用补丁（后续补丁在前一补丁产生的文本上定位）
+    const patchInputs = requireArray(args, 'patches');
+    if (patchInputs.length === 0 || patchInputs.length > 50) throw new ToolError('invalid_request', 'patches 必须是 1..50 项');
+    let current = [...coordinates.paramLines];
+    const applied: Array<{ startLine: number; endLine: number; newLineCount: number; anchor: string }> = [];
+    for (const [index, raw] of patchInputs.entries()) {
+      const input = asRecord(raw);
+      if (!input) throw new ToolError('invalid_request', `patches[${index}] 必须是对象`);
+      const anchor = asRecord(input.anchor);
+      if (!anchor) throw new ToolError('invalid_request', `patches[${index}].anchor 必须是对象`);
+      const newText = typeof input.newText === 'string' ? input.newText : requireString(input, 'newText', 1, 2_000_000);
+      const newLines = newText.split('\n');
+      let startLine = 0;
+      let endLine = 0;
+      const kind = anchor.kind;
+      if (kind === 'exact_text') {
+        const oldText = requireString(anchor, 'oldText', 1, 200_000);
+        const joined = current.join('\n');
+        const hits: number[] = [];
+        let cursor = 0;
+        while (cursor <= joined.length) {
+          const at = joined.indexOf(oldText, cursor);
+          if (at < 0) break;
+          hits.push(at);
+          cursor = at + 1;
+        }
+        if (hits.length === 0) {
+          throw new ToolError('kb_edit_anchor_not_found', `patches[${index}] oldText 未命中（正文可能已修改；请 draft_read 重读后重提）`, 409);
+        }
+        const occurrence = anchor.occurrence === undefined ? 1 : optionalInt(anchor, 'occurrence', 1, 1, 1000);
+        if (hits.length > 1 && anchor.occurrence === undefined) {
+          throw new ToolError('kb_edit_anchor_ambiguous', `patches[${index}] oldText 命中 ${hits.length} 处（行 ${hits.map((at) => joined.slice(0, at).split('\n').length).join(', ')}）；请扩大上下文使其唯一或用 occurrence 指定`, 409);
+        }
+        if (occurrence > hits.length) {
+          throw new ToolError('kb_edit_anchor_not_found', `patches[${index}] occurrence=${occurrence} 超出命中数 ${hits.length}`, 409);
+        }
+        const at = hits[occurrence - 1]!;
+        startLine = joined.slice(0, at).split('\n').length;
+        endLine = startLine + oldText.split('\n').length - 1;
+      } else if (kind === 'heading_body') {
+        const headingPath = optStrArray(anchor, 'headingPath');
+        if (!headingPath || headingPath.length === 0) throw new ToolError('invalid_request', `patches[${index}].headingPath 必填`);
+        const occurrence = anchor.occurrence === undefined ? 1 : optionalInt(anchor, 'occurrence', 1, 1, 1000);
+        const resolved = resolveHeadingBodyRange(current, headingPath, occurrence);
+        if (!resolved) {
+          throw new ToolError('kb_edit_anchor_not_found', `patches[${index}] headingPath 未命中: ${headingPath.join(' > ')}#${occurrence}`, 409);
+        }
+        startLine = resolved.startLine;
+        endLine = resolved.endLine;
+      } else if (kind === 'line_range') {
+        startLine = optionalInt(anchor, 'startLine', 1, 1, 10_000_000);
+        endLine = optionalInt(anchor, 'endLine', startLine, startLine, 10_000_000);
+      } else {
+        throw new ToolError('invalid_request', `patches[${index}].anchor.kind 非法: ${String(kind)}`);
+      }
+      if (startLine < 1 || endLine > current.length || startLine > endLine) {
+        throw new ToolError('invalid_request', `patches[${index}] 区间越界（1..${current.length}，请求 ${startLine}..${endLine}）`);
+      }
+      current = [...current.slice(0, startLine - 1), ...newLines, ...current.slice(endLine)];
+      applied.push({ startLine, endLine, newLineCount: newLines.length, anchor: `${kind}` });
+    }
+    const newMarkdown = current.join('\n');
+    // 元数据继承（缺省沿用；summary 无源时必须显式提供）
+    const summary = args.summaryUpdate !== undefined
+      ? requireString(args, 'summaryUpdate', 1, 400)
+      : state.docMeta?.get(docPath)?.summary;
+    if (!summary) {
+      throw new ToolError('kb_edit_metadata_missing', `无法继承 ${docPath} 的摘要（docMeta 缺失，常见于恢复后首编）；请传 summaryUpdate`, 400);
+    }
+    const tags = args.tagsUpdate !== undefined
+      ? requireArray(args, 'tagsUpdate').filter((tag): tag is string => typeof tag === 'string').slice(0, 20)
+      : state.docMeta?.get(docPath)?.tags ?? [];
+    const sourcesAppend = args.sourcesAppend === undefined ? [] : requireArray(args, 'sourcesAppend');
+    if (sourcesAppend.length && !sourcesAppend.every((source): source is string => typeof source === 'string')) {
+      throw new ToolError('invalid_request', 'sourcesAppend 必须是字符串数组');
+    }
+    const sources = [...new Set([...coordinates.sources, ...(sourcesAppend as string[])])];
+    const writeArgs: Record<string, unknown> = {
+      path: docPath,
+      title: args.titleUpdate !== undefined ? requireString(args, 'titleUpdate', 1, 300) : coordinates.title,
+      markdown: newMarkdown,
+      summary,
+      sources,
+      ...(tags.length ? { tags } : {}),
+      // 声明继承：未变声明自动平移；受影响对象重算哈希（payload 变化 → revision+1）
+      ...this.inheritDeclarationsForEdit(state, docPath, applied.map(({ startLine, endLine, newLineCount }) => ({ startLine, endLine, newLineCount }))),
+      ...(args.expectedDraftRevision !== undefined ? { expectedDraftRevision: optionalInt(args, 'expectedDraftRevision', 0, 0, 1_000_000_000) } : {}),
+    };
+    // 同一校验链（header/来源/正文策略/声明解引用/原子写），声明的
+    // knowledge-draft 幂等用稳定键（v2 任务内 operationId 唯一）：崩溃后
+    // 重放两层互补（calls 账本 + v2 回执账本）。
+    const editMeta: ToolRequestMeta = {
+      ...(meta ?? {}),
+      toolCallId: meta?.toolCallId ?? (v2Info?.actor ? `v2_${v2Info.actor.nativeTaskId}_${operationId}` : `edit_${operationId}`),
+    };
+    const result = await this.writeDocCore(context, writeArgs, editMeta, {
+      ...(v2Info?.actor ? { lockHeld: true, recheck: () => this.assertV2WriteWindow(v2Info.v2, v2Info.actor!.nativeTaskId, meta, docPath) } : {}),
+    });
+    const affectedObjects = (writeArgs.objects as Array<Record<string, unknown>> | undefined)?.length ?? 0;
+    const enriched: ToolResult = {
+      content: result.content,
+      details: {
+        ...(result.details ?? {}),
+        edit: { operationId, patches: applied, affectedObjects, inheritedDeclarations: affectedObjects > 0 },
+      },
+    };
+    if (v2Info?.actor) {
+      this.v2RecordReceipt({ v2: v2Info.v2, nativeTaskId: v2Info.actor!.nativeTaskId, kind: 'edit_doc', operationId: v2Info.operationId, payloadHash: v2Info.payloadHash, paths: [docPath], result: enriched, invalidateReviews: true });
+    }
+    return enriched;
+    };
+    return v2Info?.actor
+      ? this.withKnowledgeDeclarationLock(state, editOperation)
+      : editOperation();
+  }
+
+  /** draft 声明提取（draft_read 与 kb_read_batch 共用；坐标=参数坐标）。 */
+  private renderDraftDeclarations(state: BuildRunState, docPath: string): Record<string, unknown> | null {
+    const draftFile = path.join(state.stagingRoot, 'knowledge-draft.json');
+    if (!state.knowledgeDraft && !fs.existsSync(draftFile)) return null;
+    const draft = this.loadKnowledgeDraft(state);
+    const objects = draft.objects.filter((object) => !object.tombstone && object.canonical?.path === docPath);
+    const ids = new Set(objects.map((object) => object.objectId));
+    const keysById = new Map(Object.entries(draft.clientKeys).map(([key, id]) => [id, key]));
+    return {
+      draftRevision: draft.docs[docPath]?.revision ?? 0,
+      objects: objects.map((object) => ({
+        clientKey: keysById.get(object.objectId) ?? object.objectId,
+        objectId: object.objectId,
+        type: object.type,
+        title: object.title,
+        aliases: object.aliases,
+        domainIds: object.domainIds,
+        familyKey: object.familyKey,
+        variantKey: object.variantKey,
+        scopeKey: object.scopeKey,
+        scopeText: object.scopeText,
+        bodyRange: object.canonical?.bodyRange,
+        claims: object.claims.map((claim) => ({ claimKey: claim.claimKey, riskCategory: claim.riskCategory, bodyRange: claim.bodyRange, evidenceIds: claim.evidenceIds })),
+      })),
+      evidence: draft.evidence.filter((item) => ids.has(item.objectId)),
+      presentations: draft.presentations.filter((item) => ids.has(item.ownerObjectId)),
+      relations: draft.relations.filter((item) => ids.has(item.fromObjectId)),
+    };
+  }
+
+  /** kb_edit_doc 声明继承（§7）：server 继承未变声明并平移坐标；
+   * 受影响对象由 writeDocCore 重算 payloadHash（内容变 → revision+1）。 */
+  private inheritDeclarationsForEdit(
+    state: BuildRunState,
+    docPath: string,
+    patches: Array<{ startLine: number; endLine: number; newLineCount: number }>,
+  ): Record<string, unknown> {
+    const draftFile = path.join(state.stagingRoot, 'knowledge-draft.json');
+    if (!state.knowledgeDraft && !fs.existsSync(draftFile)) return {};
+    const draft = this.loadKnowledgeDraft(state);
+    const objects = draft.objects.filter((object) => !object.tombstone && object.canonical?.path === docPath);
+    if (objects.length === 0) return {};
+    const ids = new Set(objects.map((object) => object.objectId));
+    const keysById = new Map<string, string>();
+    for (const [key, id] of Object.entries(draft.clientKeys)) {
+      if (ids.has(id) && !keysById.has(id)) keysById.set(id, key);
+    }
+    const evidenceKeyById = new Map<string, string>();
+    for (const [key, id] of Object.entries(draft.evidenceKeys)) evidenceKeyById.set(id, key);
+    const refOf = (objectId: string): string => keysById.get(objectId) ?? objectId;
+    const shift = (range: BodyRange): BodyRange => shiftBodyRange(range, patches);
+    const objectInputs = objects.map((object) => ({
+      clientKey: keysById.get(object.objectId) ?? object.objectId,
+      type: object.type,
+      title: object.title,
+      ...(object.aliases && object.aliases.length ? { aliases: object.aliases } : {}),
+      ...(object.domainIds && object.domainIds.length ? { domainIds: object.domainIds } : {}),
+      familyKey: object.familyKey,
+      variantKey: object.variantKey,
+      scopeKey: object.scopeKey,
+      scopeText: object.scopeText,
+      bodyRange: shift(object.canonical!.bodyRange),
+      claims: object.claims.map((claim) => ({
+        claimKey: claim.claimKey,
+        ...(claim.riskCategory === 'high' ? { riskCategory: 'high' as const } : {}),
+        bodyRange: shift(claim.bodyRange),
+      })),
+    }));
+    const evidence = draft.evidence.filter((item) => ids.has(item.objectId));
+    const evidenceInputs = evidence.map((item) => ({
+      clientKey: evidenceKeyById.get(item.evidenceId) ?? item.evidenceId,
+      objectKey: refOf(item.objectId),
+      claimKey: item.claimKey,
+      sourceRef: { sourceId: item.sourceRef.sourceId, resourceId: item.sourceRef.resourceId },
+      selector: item.selector,
+      role: item.role,
+      nature: item.nature,
+      ...(item.readReceiptId ? { readReceiptId: item.readReceiptId } : {}),
+    }));
+    const presentationInputs = draft.presentations
+      .filter((item) => ids.has(item.ownerObjectId) && item.kind !== 'canonical')
+      .map((item) => ({
+        ownerKey: refOf(item.ownerObjectId),
+        kind: item.kind,
+        ...(item.targetObjectId ? { targetKey: refOf(item.targetObjectId) } : {}),
+        ...(item.bodyRange ? { bodyRange: shift(item.bodyRange) } : {}),
+        ...(item.targetRevision !== undefined ? { targetRevision: item.targetRevision } : {}),
+        ...(item.summaryBasis ? { summaryBasis: item.summaryBasis } : {}),
+        ...(item.fragmentKey ? { fragmentKey: item.fragmentKey } : {}),
+      }));
+    const relationInputs = draft.relations
+      .filter((item) => ids.has(item.fromObjectId))
+      .map((item) => ({
+        fromKey: refOf(item.fromObjectId),
+        toKey: refOf(item.toObjectId),
+        type: item.type,
+        scopeKey: item.scopeKey,
+        ...(item.evidenceIds.length ? { evidenceKeys: item.evidenceIds.map((id) => evidenceKeyById.get(id) ?? id) } : {}),
+        ...(item.decisionRef ? { decisionRef: item.decisionRef } : {}),
+        ...(item.validFrom ? { validFrom: item.validFrom } : {}),
+        ...(item.validUntil ? { validUntil: item.validUntil } : {}),
+      }));
+    return {
+      objects: objectInputs,
+      ...(presentationInputs.length ? { presentations: presentationInputs } : {}),
+      ...(relationInputs.length ? { relations: relationInputs } : {}),
+      ...(evidenceInputs.length ? { evidenceClaims: evidenceInputs } : {}),
+    };
   }
 
   // ------------------------------------------------------------------
@@ -3346,6 +4372,131 @@ function summarizeArgs(toolName: string, args: Record<string, unknown>): string 
 function summarizeResult(result: ToolResult): string {
   const text = result.content[0]?.text ?? '';
   return text.length > 200 ? `${text.slice(0, 200)}…` : text;
+}
+
+// ===========================================================================
+// v2 编排辅助（设计 v2 §4/§7）——工具面只读名单、幂等载荷哈希、
+// 回执重放、身份/错误适配、局部编辑坐标。
+// ===========================================================================
+
+/** 只读工具名单（MCP readOnlyHint 与 v2 pending 只读面共用；含新旧读取类）。 */
+const READONLY_TOOL_NAMES: ReadonlySet<string> = new Set<string>([
+  'kb_search',
+  'kb_read',
+  'kb_grep',
+  'raw_search',
+  'raw_read',
+  'raw_links',
+  'raw_list',
+  'raw_comments',
+  'raw_read_image',
+  'draft_list',
+  'draft_read',
+  'draft_search',
+  'kb_read_batch',
+  'kb_get_plan',
+  'ws_ls',
+  'ws_read',
+  'ws_search',
+  'build_manifest',
+  'build_handoff_list',
+  'build_issues_list',
+]);
+
+/** v2 Leader 凭据校验（Leader 工具执行器入口用）。 */
+function requireV2Leader(context: InternalRunContext): OrchestrationV2Options {
+  const v2 = context.options.orchestration;
+  if (!v2) throw new ToolError('invalid_request', '本工具仅 v2 编排运行可用（orchestration 未配置）', 400);
+  if (v2.credential !== 'leader') throw new ToolError('tool_not_allowed', '本工具仅 Leader 凭据可用（设计 v2 §3.4）', 403);
+  return v2;
+}
+
+/** v2 编排上下文（Leader/child 均可的只读工具用）。 */
+function requireV2Orchestration(context: InternalRunContext): OrchestrationV2Options {
+  const v2 = context.options.orchestration;
+  if (!v2) throw new ToolError('invalid_request', '本工具仅 v2 编排运行可用（orchestration 未配置）', 400);
+  return v2;
+}
+
+/** BuildActorError → ToolError 适配（保留 code/status）。 */
+function wrapActorError(error: unknown): ToolError {
+  if (error instanceof BuildActorError) return new ToolError(error.code, error.message, error.status);
+  if (error instanceof ToolError) return error;
+  return new ToolError('v2_actor_error', error instanceof Error ? error.message : String(error), 500);
+}
+
+/** 幂等载荷哈希：键排序的规范化 JSON（剔除并发保护/幂等键字段后的业务载荷）。 */
+function canonicalPayloadHash(args: Record<string, unknown>, omitKeys: readonly string[]): string {
+  const canonical = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(canonical);
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(
+        Object.keys(value as Record<string, unknown>).sort().map((key) => [key, canonical((value as Record<string, unknown>)[key])]),
+      );
+    }
+    return value;
+  };
+  const filtered = Object.fromEntries(
+    Object.entries(args).filter(([key]) => !omitKeys.includes(key)).map(([key, value]) => [key, canonical(value)]),
+  );
+  return crypto.createHash('sha256').update(JSON.stringify(filtered)).digest('hex');
+}
+
+/** 回执重放：从 ArtifactReceipt 恢复 ToolResult（带幂等标记）。 */
+function replayReceiptToolResult(receipt: { operationId: string; result: Record<string, unknown> }): ToolResult {
+  const stored = receipt.result as { content?: Array<{ type: string; text: string }>; details?: Record<string, unknown> };
+  return {
+    content: (Array.isArray(stored.content) ? stored.content : [{ type: 'text', text: JSON.stringify(stored) }]) as Array<{ type: 'text'; text: string }>,
+    details: { ...(stored.details ?? {}), idempotentReplay: true, operationId: receipt.operationId },
+  };
+}
+
+/** 局部编辑坐标（§7）：参数文本 = 去 server 头与 # 标题行的正文
+ * （与 kb_write_doc 的 markdown 参数同坐标）；解析 header 来源。 */
+export function draftEditCoordinates(fileText: string): { paramLines: string[]; title: string; sources: string[] } {
+  const stripped = stripStdHeader(fileText);
+  const lines = stripped.split('\n');
+  if (!lines[0]?.startsWith('# ')) {
+    throw new ToolError('invalid_request', '草稿首行不是 # 标题（可能为旧格式/托管文档）；请用 kb_write_doc 整体重写');
+  }
+  const title = lines[0]!.slice(2);
+  const paramLines = lines.slice(1);
+  const sources: string[] = [];
+  const headerMatch = /<!--\s*\nfeishu_sync_kb:\n([\s\S]*?)-->/.exec(fileText);
+  if (headerMatch) {
+    let inSources = false;
+    for (const line of headerMatch[1]!.split('\n')) {
+      const item = /^\s+-\s+(\S.*)$/.exec(line);
+      if (item && inSources) sources.push(item[1]!.trim());
+      else if (/^\s+sources:\s*$/.test(line)) inSources = true;
+      else if (/^\S/.test(line)) inSources = false;
+    }
+  }
+  return { paramLines, title, sources };
+}
+
+/** 补丁序列下的行区间平移：完全在前不变；完全在后随 delta；相交则夹取
+ * 到新内容区间（起点仅在被删区间内前移；终点覆盖新内容末行）。 */
+function shiftBodyRange(
+  range: BodyRange,
+  patches: Array<{ startLine: number; endLine: number; newLineCount: number }>,
+): BodyRange {
+  let start = range.startLine;
+  let end = range.endLine;
+  for (const patch of patches) {
+    const delta = patch.newLineCount - (patch.endLine - patch.startLine + 1);
+    if (end < patch.startLine) continue;
+    if (start > patch.endLine) {
+      start += delta;
+      end += delta;
+      continue;
+    }
+    const patchEndAfter = patch.startLine + patch.newLineCount - 1;
+    if (start >= patch.startLine) start = patch.startLine;
+    end = end <= patch.endLine ? patchEndAfter : Math.max(end + delta, patchEndAfter);
+    if (start > end) start = end;
+  }
+  return { startLine: start, endLine: end };
 }
 
 function escapeXml(value: string): string {

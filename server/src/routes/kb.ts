@@ -44,6 +44,9 @@ export interface KbRouteDeps {
   localMapStore: LocalMapStore;
   documentsProvider: () => import('../types/index.js').DocumentRecord[];
   sheetCsvPaths: (objToken: string) => string[];
+  /** 重构 v2：构建运行宿主（能力探测/包安装状态端点；未接线时不性 503
+   * 而是如实报告未接线）。 */
+  buildRuntime?: import('../kb/build-runtime-host.js').BuildRuntimeHost;
 }
 
 function errorResponse(c: Context, error: unknown): Response {
@@ -478,8 +481,8 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
   routes.post('/api/kb/builds/:id/resume', async (c) => {
     try {
       await configManager.load();
-      const body = await c.req.json() as { confirm?: string };
-      return c.json(await buildService.resumeBuild(localMapStore, c.req.param('id'), body.confirm), 202);
+      const body = await c.req.json() as { confirm?: string; resumeStrategy?: string };
+      return c.json(await buildService.resumeBuild(localMapStore, c.req.param('id'), body.confirm, body.resumeStrategy), 202);
     } catch (error) { return errorResponse(c, error); }
   });
 
@@ -523,6 +526,50 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
     const dto = buildService.orchestrationProgress(localMapStore, c.req.param('id'));
     if (!dto) return c.json({ error: 'build_not_found', message: '构建不存在或无编排数据' }, 404);
     return c.json(dto);
+  });
+
+  // 重构 v2：Leader 监督运行进度（任务身份/轮次/空闲/发布申请/事件游标）。
+  // 同一监督状态数据源；非 pi-amagi 构建 → 404（前端按模式分流）。
+  routes.get('/api/kb/builds/:id/leader', (c) => {
+    const dto = buildService.leaderProgress(localMapStore, c.req.param('id'));
+    if (!dto) return c.json({ error: 'build_not_found', message: '构建不存在或非 Leader 监督构建' }, 404);
+    return c.json(dto);
+  });
+
+  // 重构 v2：构建运行时能力/安装状态（UI 设置卡消费；不再永远 503）。
+  routes.get('/api/kb/build-runtime', async (c) => {
+    if (!deps.buildRuntime) {
+      return c.json({ error: 'build_runtime_unavailable', message: '构建运行宿主未接线（服务端未完成集成）', orchestrationMode: 'legacy' }, 503);
+    }
+    try {
+      return c.json(await deps.buildRuntime.statusDto());
+    } catch (error) {
+      return c.json({ error: 'build_runtime_probe_failed', message: error instanceof Error ? error.message : String(error) }, 500);
+    }
+  });
+
+  // 重构 v2：安装版本化 amagi-pi（npm 模式；未发布时经 sourceDir 物化安装）。
+  routes.post('/api/kb/build-runtime/install', async (c) => {
+    if (!deps.buildRuntime) {
+      return c.json({ error: 'build_runtime_unavailable', message: '构建运行宿主未接线（服务端未完成集成）' }, 503);
+    }
+    let body: { sourceDir?: unknown } = {};
+    try { body = await c.req.json() as { sourceDir?: unknown }; } catch { /* 空体缺省 npm 模式 */ }
+    const sourceDir = typeof body.sourceDir === 'string' && body.sourceDir.trim() !== '' ? body.sourceDir.trim() : undefined;
+    if (sourceDir !== undefined && (!sourceDir.startsWith('/') || !fs.existsSync(sourceDir))) {
+      return c.json({ error: 'invalid_request', message: 'sourceDir 必须是指向本地 amagi-pi 包根的绝对路径' }, 400);
+    }
+    try {
+      const installed = await deps.buildRuntime.installAmagi({
+        ...(sourceDir ? { sourceDir } : {}),
+        log: (line) => console.info(line),
+      });
+      return c.json({ installed: true, fresh: installed.fresh, version: installed.version, installDir: installed.installDir, contentHash: installed.contentHash });
+    } catch (error) {
+      const code = (error as { code?: string }).code ?? 'amagi_install_failed';
+      const status = (error as { status?: number }).status ?? 400;
+      return c.json({ error: code, message: error instanceof Error ? error.message : String(error) }, status as 400 | 500);
+    }
   });
 
   // T2b（B 案 §7）：待确认发布——确认绑定候选哈希，内容变化则失效拒绝

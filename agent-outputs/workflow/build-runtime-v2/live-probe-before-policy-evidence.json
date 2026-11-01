@@ -1,0 +1,1569 @@
+{
+  "meta": {
+    "startedAt": "2026-11-01T10:25:35.186Z",
+    "finishedAt": "2026-11-01T10:25:53.417Z",
+    "mode": "fixture-model",
+    "piCliPath": "/Users/run.mao/.local/share/fnm/node-versions/v24.21.0/installation/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
+    "piVersion": "1.4.0",
+    "sourceAmagiDir": "/Users/run.mao/workpace/amagi-pi",
+    "amagiVersion": "2.21.31",
+    "tempRoot": "/private/var/folders/q0/6kr7qkp52b922c7_w47mght80000gn/T/fs-build-probe-mvxop905-IAFdXt"
+  },
+  "checks": [
+    {
+      "id": "preflight",
+      "title": "外部资源预检",
+      "state": "pass",
+      "detail": "pi 1.4.0 @ /Users/run.mao/.local/share/fnm/node-versions/v24.21.0/installation/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js；amagi-pi 2.21.31 @ /Users/run.mao/workpace/amagi-pi（结构完整）"
+    },
+    {
+      "id": "package-install",
+      "title": "版本化 amagi-pi 安装",
+      "state": "pass",
+      "detail": "installAmagiPackage(source) → /private/var/folders/q0/6kr7qkp52b922c7_w47mght80000gn/T/fs-build-probe-mvxop905-IAFdXt/feishu-home/agent/runtime-packages/amagi-pi@2.21.31/package（hash 9485dd95c004，3545 文件，fresh=true）"
+    },
+    {
+      "id": "package-verify",
+      "title": "安装后哈希复核",
+      "state": "pass",
+      "detail": "verifyAmagiPackage hash=9485dd95c004（漂移即失败）"
+    },
+    {
+      "id": "leader-start",
+      "title": "真实 Leader RPC 启动",
+      "state": "pass",
+      "detail": "session=build-b_mvxop908_probe01 pid=2139 agentDir=/private/var/folders/q0/6kr7qkp52b922c7_w47mght80000gn/T/fs-build-probe-mvxop905-IAFdXt/feishu-home/agent/builds/b_mvxop908_probe01/home"
+    },
+    {
+      "id": "static:pi-version",
+      "title": "静态/pi 版本",
+      "state": "pass",
+      "detail": "pi 1.4.0 在 >=1.4.0 <2.0.0"
+    },
+    {
+      "id": "static:amagi-package",
+      "title": "静态/amagi-pi 安装",
+      "state": "pass",
+      "detail": "amagi-pi@2.21.31 @ /private/var/folders/q0/6kr7qkp52b922c7_w47mght80000gn/T/fs-build-probe-mvxop905-IAFdXt/feishu-home/agent/runtime-packages/amagi-pi@2.21.31/package（hash 9485dd95c004，结构完整）"
+    },
+    {
+      "id": "static:amagi-package-hash",
+      "title": "静态/amagi-pi 内容哈希",
+      "state": "pass",
+      "detail": "哈希一致（3545 文件 / 83553 KiB）"
+    },
+    {
+      "id": "static:model-key-mapping",
+      "title": "静态/模型密钥映射",
+      "state": "pass",
+      "detail": "provider zhipuai 在 amagi PROVIDER_KEY_MAP 内（密钥变量 ZHIPU_API_KEY；静态表源自 amagi-pi 源码，升版须重核）"
+    },
+    {
+      "id": "static:model-key-present",
+      "title": "静态/模型密钥可用",
+      "state": "pass",
+      "detail": "应用配置已提供 GLM 密钥（布尔核对，未取值）"
+    },
+    {
+      "id": "static:spec-valid",
+      "title": "静态/运行规格",
+      "state": "pass",
+      "detail": "BuildRunSpec 校验通过（pools writer:1 reviewer:1）"
+    },
+    {
+      "id": "static:thinking-level-map",
+      "title": "静态/思考档位映射",
+      "state": "pass",
+      "detail": "全部模型档位映射已声明"
+    },
+    {
+      "id": "static:forbidden-roots",
+      "title": "静态/禁区根存在性",
+      "state": "pass",
+      "detail": "原始库/标准库根可定位"
+    },
+    {
+      "id": "static:agent-dir-config",
+      "title": "静态/agentDir 配置",
+      "state": "pass",
+      "detail": "四文件齐全且校验通过（spec 哈希 7f87dfa4c80e）"
+    },
+    {
+      "id": "static:workdir-clean",
+      "title": "静态/工作目录干净度",
+      "state": "pass",
+      "detail": "工作目录无项目级 amagi.json/.mcp.json"
+    },
+    {
+      "id": "static:extension-load",
+      "title": "静态/扩展加载",
+      "state": "not-measured",
+      "detail": "Leader 同时加载版本化 amagi-core 与应用转发扩展（-e 两项），无同名工具诊断；实际可调用工具与白名单一致；子进程加载同一安装目录的 amagi-pi"
+    },
+    {
+      "id": "static:model-call",
+      "title": "静态/模型调用",
+      "state": "not-measured",
+      "detail": "静态声明的 zhipuai 模型让 Leader 与子任务完成一次派发和工具调用；子进程环境只含所需密钥"
+    },
+    {
+      "id": "static:mcp-channel",
+      "title": "静态/MCP 通道",
+      "state": "not-measured",
+      "detail": "子任务经 mcp_call 调用桥接工具；scope.mcp 显式列出的写入工具放行、未列出被拒；工具面无自动启用的 codemode/tool_search"
+    },
+    {
+      "id": "static:identity",
+      "title": "静态/身份一致",
+      "state": "not-measured",
+      "detail": "桥接读到的 AMAGI_TASK_ID/AMAGI_AGENT 与创建事件一致；两个并行子任务各自正确；续接链继承分配"
+    },
+    {
+      "id": "static:guard-effect",
+      "title": "静态/派发守卫生效",
+      "state": "not-measured",
+      "detail": "守卫修改后的 scope 出现在冻结任务契约（v2-store spec）中；非构建角色与越界模型被阻止"
+    },
+    {
+      "id": "static:completion-notify",
+      "title": "静态/完成通知",
+      "state": "not-measured",
+      "detail": "后台完成触发 Leader 新一轮，RPC 宿主正确处理自触发轮次；构建流程不依赖界面确认"
+    },
+    {
+      "id": "static:quota",
+      "title": "静态/配额",
+      "state": "not-measured",
+      "detail": "子任务并发不超过各池容量之和，排队原因可见（amagi registry queueReason）"
+    },
+    {
+      "id": "static:cancel",
+      "title": "静态/取消",
+      "state": "not-measured",
+      "detail": "停止后无残留子进程（启动锚点/orphan 核对），旧凭据写入被拒绝"
+    },
+    {
+      "id": "static:recovery",
+      "title": "静态/恢复",
+      "state": "not-measured",
+      "detail": "原会话续接后 amagi 对账正确，或成果级恢复可用"
+    },
+    {
+      "id": "static:prompt-injection-overhead",
+      "title": "静态/通用规则注入开销",
+      "state": "not-measured",
+      "detail": "记录 Leader 输入 token 与偏离构建规则的次数（amagi L0 模板无开关，设计 §3.4）"
+    },
+    {
+      "id": "leader-round1",
+      "title": "Leader 首轮完成",
+      "state": "pass",
+      "detail": "outcome=completed"
+    },
+    {
+      "id": "cancel-leader-exit",
+      "title": "取消：Leader 终止",
+      "state": "pass",
+      "detail": "exit={\"code\":0,\"signal\":null}；Leader 已按宽限终止；amagi 子进程由其 TERM→2s→KILL 链收口，残留以启动锚点/orphan 核对（实测项 cancel）；pid=2139 已确认退出"
+    },
+    {
+      "id": "cancel-no-residue",
+      "title": "取消：无残留进程",
+      "state": "pass",
+      "detail": "取消后无相关进程（运行期 1 个全部退出）"
+    },
+    {
+      "id": "old-gen-write-rejected",
+      "title": "旧代次写入被拒",
+      "state": "pass",
+      "detail": "status=401 error=run_token_invalid（预期 401：令牌已撤销/代次已轮换）"
+    },
+    {
+      "id": "guard-freeze-scope",
+      "title": "派发守卫冻结 scope（v2-store 冻结契约）",
+      "state": "pass",
+      "detail": "W1 契约：shell=deny、write=agent-outputs/**、mcp=13 项精确名单、deny 含原始库/配置面禁区、workspace=existing（原始敌意参数被守卫改写并冻结）"
+    },
+    {
+      "id": "guard-block-illegal",
+      "title": "越界角色/模型派发被阻断",
+      "state": "pass",
+      "detail": "fuxi 阻断=true；越界模型阻断=true；首轮后冻结契约目录=3（预期 3，两个非法派发不得建任务）"
+    },
+    {
+      "id": "child-tools-surface",
+      "title": "子任务真实工具面",
+      "state": "fail",
+      "detail": "w1 工具面含 codemode（设计 §3.3 预期无此面）；r1 工具面含 codemode（设计 §3.3 预期无此面）；w2 工具面含 codemode（设计 §3.3 预期无此面）；slow 工具面含 codemode（设计 §3.3 预期无此面）"
+    },
+    {
+      "id": "leader-tools-whitelist",
+      "title": "Leader 工具白名单",
+      "state": "pass",
+      "detail": "实际声明工具与冻结白名单一致（13 项，含 amagi 任务面）"
+    },
+    {
+      "id": "identity-uplink",
+      "title": "子任务身份上行（AMAGI_TASK_ID/AGENT）",
+      "state": "pass",
+      "detail": "桥接调用 9 次；未登记身份 0；角色不一致 0（身份来自真实子进程 env，经桥接头上行）"
+    },
+    {
+      "id": "mcp-precise-authz",
+      "title": "MCP 精确读/写授权",
+      "state": "pass",
+      "detail": "只读 raw_list/raw_read=200；分配内写入(w1)=200；未分配写入(w2)=409；审查者正文写入被拒（amagi scope 层）；写作者审查工具被拒（amagi scope 层未授权名单拦截）；审查者只读 draft_list=200；续接写入=200"
+    },
+    {
+      "id": "codemode-facet",
+      "title": "子任务无 codemode/tool_search 面（设计 §3.3）",
+      "state": "fail",
+      "detail": "实测：子进程工具面含 codemode（amagi task-run resolveSpawnPermissionDelivery 无条件追加 codemode/toolcall_continue 到 --tools），且 codemode 脚本经 searchTools 【可发现并调用桥接工具】——绕过 amagi mcp_call 的逐次授权复核（应用侧身份/角色校验仍拦截，但 amagi 层授权被绕过），需 Leader 裁量。结果片段：Script completed Wall time 0.0 seconds Output:  {\"names\":[\"mcp__feishu_kb_bridge__draft_list\",\"mcp__feishu_kb_bridge__draft_search\",\"mcp__feishu_kb_bridge__kb_delete_doc\",\"mcp__fei"
+    },
+    {
+      "id": "p0-sentinel-deny",
+      "title": "P0 敏感 sentinel 读取被拒（真实子进程）",
+      "state": "pass",
+      "detail": "read 结果：[amagi 文件权限] read 目标在 deny 禁入区（deny 恒优先）：/private/var/folders/q0/6kr7qkp52b922c7_w47mght80000gn/T/fs-build-probe-mvxop905-IAFdXt/fixtures/ra；grep 结果：[amagi 文件权限] read 目标在 deny 禁入区（deny 恒优先）：/private/var/folders/q0/6kr7qkp52b922c7_w47mght80000gn/T/fs-build-probe-mvxop905-IAFdXt/fixtures/ra；哨兵内容泄漏=false"
+    },
+    {
+      "id": "write-surface",
+      "title": "写面执法（配置面拒/报告面放行）",
+      "state": "pass",
+      "detail": "amagi.json 写入：[amagi 文件权限] write 目标在 deny 禁入区（deny 恒优先，任何授予不得覆盖）（/private/var/folders/q0/6kr7qkp52b922c7_w47mght80000gn/T/fs-build-pro；agent-outputs 写入：Successfully wrote to agent-outputs/w1-report.md [amagi write] 实际落盘路径（本机 侧解析）：/private/var/folders/q0/6kr7qkp52b922c7_w4"
+    },
+    {
+      "id": "role-skill-load",
+      "title": "角色 skill 加载",
+      "state": "pass",
+      "detail": "子任务系统提示含构建 skill（marker 命中）；用户目录技能残留=0"
+    },
+    {
+      "id": "same-package",
+      "title": "同版本包加载",
+      "state": "pass",
+      "detail": "settings.json 唯一包=与安装根一致；子进程工具面含 amagi_resource=true（amagi-core 已随包加载）"
+    },
+    {
+      "id": "pool-cap-writer",
+      "title": "写作池容量=1 并发执法",
+      "state": "pass",
+      "detail": "w1=2026-11-01T10:25:39.410Z…2026-11-01T10:25:43.579Z；w2=2026-11-01T10:25:44.060Z…2026-11-01T10:25:46.593Z（串行）"
+    },
+    {
+      "id": "pool-cross-parallel",
+      "title": "跨池并行（审查与写作重叠）",
+      "state": "pass",
+      "detail": "审查任务与写作任务区间重叠（独立池并行）"
+    },
+    {
+      "id": "completion-self-round",
+      "title": "后台完成自触发新轮",
+      "state": "pass",
+      "detail": "观测到 4 个自触发轮（事件：2026-11-01T10:25:42.082Z round self_1（后台完成通知自触发）；2026-11-01T10:25:43.813Z round self_2（后台完成通知自触发）；2026-11-01T10:25:46.818Z round self_3（后台完成通知自触发）；2026-11-01T10:25:49.774Z round self_4（后台完成通知自触发））"
+    },
+    {
+      "id": "resume-parent-chain",
+      "title": "续接父链与分配继承",
+      "state": "pass",
+      "detail": "actor 父链=true（11fa5150←W1）；继承分配（supersedes）=true；v2-store 续接 spec 含父=true；续接写入=200,401"
+    },
+    {
+      "id": "ledger-generation-revoke",
+      "title": "代次轮换撤销全部身份",
+      "state": "pass",
+      "detail": "rotateGeneration(2) 后仍活跃身份=0（含全部 luban/diting/续接任务；旧代次写入已在 old-gen-write-rejected 验证）"
+    },
+    {
+      "id": "fixture-disclaimer",
+      "title": "fixture 模型声明",
+      "state": "pass",
+      "detail": "模型为本地 OpenAI 兼容 fixture：仅驱动真实链路，不构成实际 LLM 质量/性能证据。"
+    }
+  ],
+  "notes": [
+    "w1 含 toolcall_continue（pi 断点续传机制，非 MCP 面，记录备查）",
+    "r1 含 toolcall_continue（pi 断点续传机制，非 MCP 面，记录备查）",
+    "w2 含 toolcall_continue（pi 断点续传机制，非 MCP 面，记录备查）",
+    "slow 含 toolcall_continue（pi 断点续传机制，非 MCP 面，记录备查）",
+    "【待反思→报告 Leader】codemode 面：amagi resolveSpawnPermissionDelivery 无条件向子进程 --tools 追加 codemode；设计 §3.3 预期经 autoEnableCodemode:false 只留 mcp_call 通道。实测该追加使 codemeode 可用且 searchTools 可发现桥接工具（mcp__feishu_kb_bridge__*）。不改上游，按任务书报告 Leader。"
+  ],
+  "probeLog": [
+    "2026-11-01T10:25:35.190Z 临时根 /private/var/folders/q0/6kr7qkp52b922c7_w47mght80000gn/T/fs-build-probe-mvxop905-IAFdXt",
+    "2026-11-01T10:25:35.192Z fixture 模型服务器 http://127.0.0.1:60676",
+    "2026-11-01T10:25:35.194Z 应用回环 API http://127.0.0.1:60677",
+    "2026-11-01T10:25:35.194Z [build-runtime] source 物化 /Users/run.mao/workpace/amagi-pi → /private/var/folders/q0/6kr7qkp52b922c7_w47mght80000gn/T/fs-build-probe-mvxop905-IAFdXt/feishu-home/agent/runtime-packages/amagi-pi@2.21.31/package",
+    "2026-11-01T10:25:38.641Z [build-runtime] Leader 启动 build=b_mvxop908_probe01 gen=1 session=build-b_mvxop908_probe01",
+    "2026-11-01T10:25:39.059Z 登记任务身份 9db3b96b-e agent=luban parent=-（task_submit）",
+    "2026-11-01T10:25:39.137Z 登记任务身份 11fa5150-f agent=luban parent=-（task_submit）",
+    "2026-11-01T10:25:39.169Z 登记任务身份 c702aaaf-d agent=diting parent=-（task_submit）",
+    "2026-11-01T10:25:43.919Z 登记任务身份 645f6efb-1 agent=luban parent=11fa5150-fc29-445b-8d48-29d64a78068f（task_resume）",
+    "2026-11-01T10:25:49.883Z 登记任务身份 7f564c76-5 agent=baize parent=-（task_submit）",
+    "2026-11-01T10:25:50.404Z 运行期相关进程 1 个",
+    "2026-11-01T10:25:50.405Z Phase 3：取消链路"
+  ],
+  "fixtureModelLog": [
+    {
+      "t": "2026-11-01T10:25:38.798Z",
+      "model": "glm-5.3",
+      "script": "leader",
+      "step": 1,
+      "tools": [
+        "task_submit",
+        "task_query",
+        "task_control",
+        "task_resume",
+        "amagi_resource",
+        "build_manifest",
+        "build_assign_output",
+        "build_revoke_output",
+        "build_handoff_list",
+        "build_issues_submit",
+        "build_issues_list",
+        "build_checkpoint",
+        "build_request_publish"
+      ],
+      "messageCount": 2,
+      "systemContains": [],
+      "requestId": 1
+    },
+    {
+      "t": "2026-11-01T10:25:39.170Z",
+      "model": "glm-5.3",
+      "script": "leader",
+      "step": 2,
+      "tools": [
+        "task_submit",
+        "task_query",
+        "task_control",
+        "task_resume",
+        "amagi_resource",
+        "build_manifest",
+        "build_assign_output",
+        "build_revoke_output",
+        "build_handoff_list",
+        "build_issues_submit",
+        "build_issues_list",
+        "build_checkpoint",
+        "build_request_publish"
+      ],
+      "messageCount": 8,
+      "systemContains": [],
+      "requestId": 2
+    },
+    {
+      "t": "2026-11-01T10:25:39.208Z",
+      "model": "glm-5.3",
+      "script": "leader",
+      "step": 3,
+      "tools": [
+        "task_submit",
+        "task_query",
+        "task_control",
+        "task_resume",
+        "amagi_resource",
+        "build_manifest",
+        "build_assign_output",
+        "build_revoke_output",
+        "build_handoff_list",
+        "build_issues_submit",
+        "build_issues_list",
+        "build_checkpoint",
+        "build_request_publish"
+      ],
+      "messageCount": 10,
+      "systemContains": [],
+      "requestId": 3
+    },
+    {
+      "t": "2026-11-01T10:25:39.410Z",
+      "model": "glm-5.3-flash",
+      "script": "w1",
+      "step": 1,
+      "tools": [
+        "amagi_resource",
+        "read",
+        "grep",
+        "find",
+        "write",
+        "edit",
+        "mcp_call",
+        "mcp_list_tools",
+        "codemode",
+        "toolcall_continue"
+      ],
+      "messageCount": 2,
+      "systemContains": [
+        "PROBE-SKILL"
+      ],
+      "requestId": 4
+    },
+    {
+      "t": "2026-11-01T10:25:39.423Z",
+      "model": "glm-5.3-flash",
+      "script": "w1",
+      "step": 2,
+      "tools": [
+        "amagi_resource",
+        "read",
+        "grep",
+        "find",
+        "write",
+        "edit",
+        "mcp_call",
+        "mcp_list_tools",
+        "codemode",
+        "toolcall_continue"
+      ],
+      "messageCount": 4,
+      "systemContains": [
+        "PROBE-SKILL"
+      ],
+      "requestId": 5
+    },
+    {
+      "t": "2026-11-01T10:25:39.430Z",
+      "model": "glm-5.3-flash",
+      "script": "w1",
+      "step": 3,
+      "tools": [
+        "amagi_resource",
+        "read",
+        "grep",
+        "find",
+        "write",
+        "edit",
+        "mcp_call",
+        "mcp_list_tools",
+        "codemode",
+        "toolcall_continue"
+      ],
+      "messageCount": 6,
+      "systemContains": [
+        "PROBE-SKILL"
+      ],
+      "requestId": 6
+    },
+    {
+      "t": "2026-11-01T10:25:39.447Z",
+      "model": "glm-5.3",
+      "script": "r1",
+      "step": 1,
+      "tools": [
+        "amagi_resource",
+        "read",
+        "grep",
+        "find",
+        "write",
+        "mcp_call",
+        "mcp_list_tools",
+        "codemode",
+        "toolcall_continue"
+      ],
+      "messageCount": 2,
+      "systemContains": [
+        "PROBE-SKILL"
+      ],
+      "requestId": 7
+    },
+    {
+      "t": "2026-11-01T10:25:41.943Z",
+      "model": "glm-5.3-flash",
+      "script": "w1",
+      "step": 4,
+      "tools": [
+        "amagi_resource",
+        "read",
+        "grep",
+        "find",
+        "write",
+        "edit",
+        "mcp_call",
+        "mcp_list_tools",
+        "codemode",
+        "toolcall_continue"
+      ],
+      "messageCount": 8,
+      "systemContains": [
+        "PROBE-SKILL"
+      ],
+      "requestId": 8
+    },
+    {
+      "t": "2026-11-01T10:25:41.947Z",
+      "model": "glm-5.3-flash",
+      "script": "w1",
+      "step": 5,
+      "tools": [
+        "amagi_resource",
+        "read",
+        "grep",
+        "find",
+        "write",
+        "edit",
+        "mcp_call",
+        "mcp_list_tools",
+        "codemode",
+        "toolcall_continue"
+      ],
+      "messageCount": 10,
+      "systemContains": [
+        "PROBE-SKILL"
+      ],
+      "requestId": 9
+    },
+    {
+      "t": "2026-11-01T10:25:41.964Z",
+      "model": "glm-5.3",
+      "script": "r1",
+      "step": 2,
+      "tools": [
+        "amagi_resource",
+        "read",
+        "grep",
+        "find",
+        "write",
+        "mcp_call",
+        "mcp_list_tools",
+        "codemode",
+        "toolcall_continue"
+      ],
+      "messageCount": 4,
+      "systemContains": [
+        "PROBE-SKILL"
+      ],
+      "requestId": 10
+    },
+    {
+      "t": "2026-11-01T10:25:41.969Z",
+      "model": "glm-5.3",
+      "script": "r1",
+      "step": 3,
+      "tools": [
+        "amagi_resource",
+        "read",
+        "grep",
+        "find",
+        "write",
+        "mcp_call",
+        "mcp_list_tools",
+        "codemode",
+        "toolcall_continue"
+      ],
+      "messageCount": 6,
+      "systemContains": [
+        "PROBE-SKILL"
+      ],
+      "requestId": 11
+    },
+    {
+      "t": "2026-11-01T10:25:42.027Z",
+      "model": "glm-5.3",
+      "script": "r1",
+      "step": 4,
+      "tools": [
+        "amagi_resource",
+        "read",
+        "grep",
+        "find",
+        "write",
+        "mcp_call",
+        "mcp_list_tools",
+        "codemode",
+        "toolcall_continue"
+      ],
+      "messageCount": 8,
+      "systemContains": [
+        "PROBE-SKILL"
+      ],
+      "requestId": 12
+    },
+    {
+      "t": "2026-11-01T10:25:42.086Z",
+      "model": "glm-5.3",
+      "script": "leader",
+      "step": 4,
+      "tools": [
+        "task_submit",
+        "task_query",
+        "task_control",
+        "task_resume",
+        "amagi_resource",
+        "build_manifest",
+        "build_assign_output",
+        "build_revoke_output",
+        "build_handoff_list",
+        "build_issues_submit",
+        "build_issues_list",
+        "build_checkpoint",
+        "build_request_publish"
+      ],
+      "messageCount": 12,
+      "systemContains": [],
+      "requestId": 13
+    },
+    {
+      "t": "2026-11-01T10:25:43.504Z",
+      "model": "glm-5.3-flash",
+      "script": "w1",
+      "step": 6,
+      "tools": [
+        "amagi_resource",
+        "read",
+        "grep",
+        "find",
+        "write",
+        "edit",
+        "mcp_call",
+        "mcp_list_tools",
+        "codemode",
+        "toolcall_continue"
+      ],
+      "messageCount": 12,
+      "systemContains": [
+        "PROBE-SKILL"
+      ],
+      "requestId": 14
+    },
+    {
+      "t": "2026-11-01T10:25:43.508Z",
+      "model": "glm-5.3-flash",
+      "script": "w1",
+      "step": 7,
+      "tools": [
+        "amagi_resource",
+        "read",
+        "grep",
+        "find",
+        "write",
+        "edit",
+        "mcp_call",
+        "mcp_list_tools",
+        "codemode",
+        "toolcall_continue"
+      ],
+      "messageCount": 14,
+      "systemContains": [
+        "PROBE-SKILL"
+      ],
+      "requestId": 15
+    },
+    {
+      "t": "2026-11-01T10:25:43.522Z",
+      "model": "glm-5.3-flash",
+      "script": "w1",
+      "step": 8,
+      "tools": [
+        "amagi_resource",
+        "read",
+        "grep",
+        "find",
+        "write",
+        "edit",
+        "mcp_call",
+        "mcp_list_tools",
+        "codemode",
+        "toolcall_continue"
+      ],
+      "messageCount": 16,
+      "systemContains": [
+        "PROBE-SKILL"
+      ],
+      "requestId": 16
+    },
+    {
+      "t": "2026-11-01T10:25:43.579Z",
+      "model": "glm-5.3-flash",
+      "script": "w1",
+      "step": 9,
+      "tools": [
+        "amagi_resource",
+        "read",
+        "grep",
+        "find",
+        "write",
+        "edit",
+        "mcp_call",
+        "mcp_list_tools",
+        "codemode",
+        "toolcall_continue"
+      ],
+      "messageCount": 18,
+      "systemContains": [
+        "PROBE-SKILL"
+      ],
+      "requestId": 17
+    },
+    {
+      "t": "2026-11-01T10:25:43.819Z",
+      "model": "glm-5.3",
+      "script": "leader",
+      "step": 5,
+      "tools": [
+        "task_submit",
+        "task_query",
+        "task_control",
+        "task_resume",
+        "amagi_resource",
+        "build_manifest",
+        "build_assign_output",
+        "build_revoke_output",
+        "build_handoff_list",
+        "build_issues_submit",
+        "build_issues_list",
+        "build_checkpoint",
+        "build_request_publish"
+      ],
+      "messageCount": 14,
+      "systemContains": [],
+      "requestId": 18
+    },
+    {
+      "t": "2026-11-01T10:25:43.920Z",
+      "model": "glm-5.3",
+      "script": "leader",
+      "step": 6,
+      "tools": [
+        "task_submit",
+        "task_query",
+        "task_control",
+        "task_resume",
+        "amagi_resource",
+        "build_manifest",
+        "build_assign_output",
+        "build_revoke_output",
+        "build_handoff_list",
+        "build_issues_submit",
+        "build_issues_list",
+        "build_checkpoint",
+        "build_request_publish"
+      ],
+      "messageCount": 16,
+      "systemContains": [],
+      "requestId": 19
+    },
+    {
+      "t": "2026-11-01T10:25:44.060Z",
+      "model": "glm-5.3-flash",
+      "script": "w2",
+      "step": 1,
+      "tools": [
+        "amagi_resource",
+        "read",
+        "grep",
+        "find",
+        "write",
+        "edit",
+        "mcp_call",
+        "mcp_list_tools",
+        "codemode",
+        "toolcall_continue"
+      ],
+      "messageCount": 2,
+      "systemContains": [
+        "PROBE-SKILL"
+      ],
+      "requestId": 20
+    },
+    {
+      "t": "2026-11-01T10:25:46.583Z",
+      "model": "glm-5.3-flash",
+      "script": "w2",
+      "step": 2,
+      "tools": [
+        "amagi_resource",
+        "read",
+        "grep",
+        "find",
+        "write",
+        "edit",
+        "mcp_call",
+        "mcp_list_tools",
+        "codemode",
+        "toolcall_continue"
+      ],
+      "messageCount": 4,
+      "systemContains": [
+        "PROBE-SKILL"
+      ],
+      "requestId": 21
+    },
+    {
+      "t": "2026-11-01T10:25:46.593Z",
+      "model": "glm-5.3-flash",
+      "script": "w2",
+      "step": 3,
+      "tools": [
+        "amagi_resource",
+        "read",
+        "grep",
+        "find",
+        "write",
+        "edit",
+        "mcp_call",
+        "mcp_list_tools",
+        "codemode",
+        "toolcall_continue"
+      ],
+      "messageCount": 6,
+      "systemContains": [
+        "PROBE-SKILL"
+      ],
+      "requestId": 22
+    },
+    {
+      "t": "2026-11-01T10:25:46.823Z",
+      "model": "glm-5.3",
+      "script": "leader",
+      "step": 7,
+      "tools": [
+        "task_submit",
+        "task_query",
+        "task_control",
+        "task_resume",
+        "amagi_resource",
+        "build_manifest",
+        "build_assign_output",
+        "build_revoke_output",
+        "build_handoff_list",
+        "build_issues_submit",
+        "build_issues_list",
+        "build_checkpoint",
+        "build_request_publish"
+      ],
+      "messageCount": 18,
+      "systemContains": [],
+      "requestId": 23
+    },
+    {
+      "t": "2026-11-01T10:25:47.042Z",
+      "model": "glm-5.3-flash",
+      "script": "resume-w1",
+      "step": 1,
+      "tools": [
+        "amagi_resource",
+        "read",
+        "grep",
+        "find",
+        "write",
+        "edit",
+        "mcp_call",
+        "mcp_list_tools",
+        "codemode",
+        "toolcall_continue"
+      ],
+      "messageCount": 20,
+      "systemContains": [
+        "PROBE-SKILL"
+      ],
+      "requestId": 24
+    },
+    {
+      "t": "2026-11-01T10:25:49.622Z",
+      "model": "glm-5.3-flash",
+      "script": "resume-w1",
+      "step": 2,
+      "tools": [
+        "amagi_resource",
+        "read",
+        "grep",
+        "find",
+        "write",
+        "edit",
+        "mcp_call",
+        "mcp_list_tools",
+        "codemode",
+        "toolcall_continue"
+      ],
+      "messageCount": 22,
+      "systemContains": [
+        "PROBE-SKILL"
+      ],
+      "requestId": 25
+    },
+    {
+      "t": "2026-11-01T10:25:49.779Z",
+      "model": "glm-5.3",
+      "script": "leader",
+      "step": 8,
+      "tools": [
+        "task_submit",
+        "task_query",
+        "task_control",
+        "task_resume",
+        "amagi_resource",
+        "build_manifest",
+        "build_assign_output",
+        "build_revoke_output",
+        "build_handoff_list",
+        "build_issues_submit",
+        "build_issues_list",
+        "build_checkpoint",
+        "build_request_publish"
+      ],
+      "messageCount": 20,
+      "systemContains": [],
+      "requestId": 26
+    },
+    {
+      "t": "2026-11-01T10:25:49.884Z",
+      "model": "glm-5.3",
+      "script": "leader",
+      "step": 9,
+      "tools": [
+        "task_submit",
+        "task_query",
+        "task_control",
+        "task_resume",
+        "amagi_resource",
+        "build_manifest",
+        "build_assign_output",
+        "build_revoke_output",
+        "build_handoff_list",
+        "build_issues_submit",
+        "build_issues_list",
+        "build_checkpoint",
+        "build_request_publish"
+      ],
+      "messageCount": 22,
+      "systemContains": [],
+      "requestId": 27
+    },
+    {
+      "t": "2026-11-01T10:25:50.150Z",
+      "model": "glm-5.3-flash",
+      "script": "slow",
+      "step": 1,
+      "tools": [
+        "amagi_resource",
+        "read",
+        "grep",
+        "find",
+        "write",
+        "mcp_call",
+        "mcp_list_tools",
+        "codemode",
+        "toolcall_continue"
+      ],
+      "messageCount": 2,
+      "systemContains": [
+        "PROBE-SKILL"
+      ],
+      "requestId": 28
+    }
+  ],
+  "bridgeAudit": [
+    {
+      "t": "2026-11-01T10:25:38.609Z",
+      "method": "GET",
+      "path": "/api/agent-internal/tools",
+      "amagiTaskId": null,
+      "amagiAgent": null,
+      "status": 200,
+      "tool": null,
+      "toolCallId": null,
+      "summary": "+1ms tools/list"
+    },
+    {
+      "t": "2026-11-01T10:25:39.203Z",
+      "method": "POST",
+      "path": "/api/agent-internal/tools/build_assign_output",
+      "amagiTaskId": null,
+      "amagiAgent": null,
+      "status": 200,
+      "tool": "build_assign_output",
+      "toolCallId": null,
+      "summary": "+29ms 已分配 1 个目标给任务 11fa5150-fc29-445b-8d48-29d64a78068f（assignmentId=asg_2991b8b0e04f）"
+    },
+    {
+      "t": "2026-11-01T10:25:39.444Z",
+      "method": "GET",
+      "path": "/api/agent-internal/tools",
+      "amagiTaskId": "11fa5150-fc29-445b-8d48-29d64a78068f",
+      "amagiAgent": "luban",
+      "status": 200,
+      "tool": null,
+      "toolCallId": null,
+      "summary": "+0ms tools/list"
+    },
+    {
+      "t": "2026-11-01T10:25:39.478Z",
+      "method": "GET",
+      "path": "/api/agent-internal/tools",
+      "amagiTaskId": "c702aaaf-df66-4f41-ada6-167c3b635c9e",
+      "amagiAgent": "diting",
+      "status": 200,
+      "tool": null,
+      "toolCallId": null,
+      "summary": "+0ms tools/list"
+    },
+    {
+      "t": "2026-11-01T10:25:41.939Z",
+      "method": "POST",
+      "path": "/api/agent-internal/tools/raw_list",
+      "amagiTaskId": "11fa5150-fc29-445b-8d48-29d64a78068f",
+      "amagiAgent": "luban",
+      "status": 200,
+      "tool": "raw_list",
+      "toolCallId": null,
+      "summary": "+1ms { \"entries\": [ { \"objToken\": \"tok_probe_w1\", \"objType\": \"docx\", \"title\": \"Alpha 指南\", \"relPath\": \"probe/alpha-guide.md\", \"contentHash\": \"sha256:b7f04c8aa729c2578105ea21ea8e8a1d30bcc"
+    },
+    {
+      "t": "2026-11-01T10:25:41.958Z",
+      "method": "POST",
+      "path": "/api/agent-internal/tools/draft_list",
+      "amagiTaskId": "c702aaaf-df66-4f41-ada6-167c3b635c9e",
+      "amagiAgent": "diting",
+      "status": 200,
+      "tool": "draft_list",
+      "toolCallId": null,
+      "summary": "+2ms { \"docs\": [] }"
+    },
+    {
+      "t": "2026-11-01T10:25:42.023Z",
+      "method": "POST",
+      "path": "/api/agent-internal/tools/build_handoff_submit",
+      "amagiTaskId": "c702aaaf-df66-4f41-ada6-167c3b635c9e",
+      "amagiAgent": "diting",
+      "status": 200,
+      "tool": "build_handoff_submit",
+      "toolCallId": null,
+      "summary": "+51ms 已提交交接记录 ho_740150bbfce9（成果引用 1，未解决问题 0）；最终回复只需引用交接编号与结论"
+    },
+    {
+      "t": "2026-11-01T10:25:43.500Z",
+      "method": "POST",
+      "path": "/api/agent-internal/tools/kb_write_doc",
+      "amagiTaskId": "11fa5150-fc29-445b-8d48-29d64a78068f",
+      "amagiAgent": "luban",
+      "status": 200,
+      "tool": "kb_write_doc",
+      "toolCallId": null,
+      "summary": "+46ms 已写入草稿 systems/demo-guide.md（docId=kd_0b368314a038，180 字节）"
+    },
+    {
+      "t": "2026-11-01T10:25:44.092Z",
+      "method": "GET",
+      "path": "/api/agent-internal/tools",
+      "amagiTaskId": "9db3b96b-e66b-4792-bea2-145f7d00529b",
+      "amagiAgent": "luban",
+      "status": 200,
+      "tool": null,
+      "toolCallId": null,
+      "summary": "+0ms tools/list"
+    },
+    {
+      "t": "2026-11-01T10:25:46.578Z",
+      "method": "POST",
+      "path": "/api/agent-internal/tools/raw_read",
+      "amagiTaskId": "9db3b96b-e66b-4792-bea2-145f7d00529b",
+      "amagiAgent": "luban",
+      "status": 200,
+      "tool": "raw_read",
+      "toolCallId": null,
+      "summary": "+2ms <untrusted_source obj_token=\"tok_probe_w2\" title=\"Beta 笔记\"> # Beta 笔记 Beta 系统与 Alpha 共享地图： - B1：Beta 出口即 Alpha 入口。 - B2：夜间 Beta 关闭。 </untrusted_source>"
+    },
+    {
+      "t": "2026-11-01T10:25:46.588Z",
+      "method": "POST",
+      "path": "/api/agent-internal/tools/kb_write_doc",
+      "amagiTaskId": "9db3b96b-e66b-4792-bea2-145f7d00529b",
+      "amagiAgent": "luban",
+      "status": 409,
+      "tool": "kb_write_doc",
+      "toolCallId": null,
+      "summary": "+0ms kb_output_not_assigned: 文档 systems/other-doc.md 未分配给任何任务；Leader 需先 build_assign_output（若刚派发，稍候重试）"
+    },
+    {
+      "t": "2026-11-01T10:25:47.075Z",
+      "method": "GET",
+      "path": "/api/agent-internal/tools",
+      "amagiTaskId": "645f6efb-1780-4016-b0ca-15056d1ae228",
+      "amagiAgent": "luban",
+      "status": 200,
+      "tool": null,
+      "toolCallId": null,
+      "summary": "+0ms tools/list"
+    },
+    {
+      "t": "2026-11-01T10:25:49.614Z",
+      "method": "POST",
+      "path": "/api/agent-internal/tools/kb_write_doc",
+      "amagiTaskId": "645f6efb-1780-4016-b0ca-15056d1ae228",
+      "amagiAgent": "luban",
+      "status": 200,
+      "tool": "kb_write_doc",
+      "toolCallId": null,
+      "summary": "+61ms 已写入草稿 systems/demo-guide.md（docId=kd_3f4597caedd6，191 字节）"
+    },
+    {
+      "t": "2026-11-01T10:25:50.179Z",
+      "method": "GET",
+      "path": "/api/agent-internal/tools",
+      "amagiTaskId": "7f564c76-52e5-408e-9bbf-c221f2f4988b",
+      "amagiAgent": "baize",
+      "status": 200,
+      "tool": null,
+      "toolCallId": null,
+      "summary": "+0ms tools/list"
+    },
+    {
+      "t": "2026-11-01T10:25:53.093Z",
+      "method": "POST",
+      "path": "/api/agent-internal/tools/kb_write_doc",
+      "amagiTaskId": "645f6efb-1780-4016-b0ca-15056d1ae228",
+      "amagiAgent": "luban",
+      "status": 401,
+      "tool": "kb_write_doc",
+      "toolCallId": null,
+      "summary": "+0ms run_token_invalid: 运行令牌无效或已过期"
+    }
+  ],
+  "actors": [
+    {
+      "actorId": "actor_4fe48771e97d",
+      "nativeTaskId": "9db3b96b-e66b-4792-bea2-145f7d00529b",
+      "parentTaskId": null,
+      "generation": 1,
+      "role": "luban",
+      "requestedRole": "luban",
+      "status": "revoked",
+      "createdAt": "2026-11-01T10:25:39.017Z",
+      "confirmedAt": "2026-11-01T10:25:39.017Z",
+      "revokedAt": "2026-11-01T10:25:50.405Z",
+      "revokedReason": "generation_rotated: probe-cancel"
+    },
+    {
+      "actorId": "actor_ce5cb1862b91",
+      "nativeTaskId": "11fa5150-fc29-445b-8d48-29d64a78068f",
+      "parentTaskId": null,
+      "generation": 1,
+      "role": "luban",
+      "requestedRole": "luban",
+      "status": "revoked",
+      "createdAt": "2026-11-01T10:25:39.105Z",
+      "confirmedAt": "2026-11-01T10:25:39.105Z",
+      "revokedAt": "2026-11-01T10:25:43.867Z",
+      "revokedReason": "superseded_by_resume"
+    },
+    {
+      "actorId": "actor_e9da34d8d6b3",
+      "nativeTaskId": "c702aaaf-df66-4f41-ada6-167c3b635c9e",
+      "parentTaskId": null,
+      "generation": 1,
+      "role": "diting",
+      "requestedRole": "diting",
+      "status": "revoked",
+      "createdAt": "2026-11-01T10:25:39.144Z",
+      "confirmedAt": "2026-11-01T10:25:39.144Z",
+      "revokedAt": "2026-11-01T10:25:50.405Z",
+      "revokedReason": "generation_rotated: probe-cancel"
+    },
+    {
+      "actorId": "actor_4584fb95e900",
+      "nativeTaskId": "645f6efb-1780-4016-b0ca-15056d1ae228",
+      "parentTaskId": "11fa5150-fc29-445b-8d48-29d64a78068f",
+      "generation": 1,
+      "role": "luban",
+      "requestedRole": "luban",
+      "status": "revoked",
+      "createdAt": "2026-11-01T10:25:43.867Z",
+      "confirmedAt": "2026-11-01T10:25:43.867Z",
+      "revokedAt": "2026-11-01T10:25:50.405Z",
+      "revokedReason": "generation_rotated: probe-cancel"
+    },
+    {
+      "actorId": "actor_3be011053958",
+      "nativeTaskId": "7f564c76-52e5-408e-9bbf-c221f2f4988b",
+      "parentTaskId": null,
+      "generation": 1,
+      "role": "baize",
+      "requestedRole": "baize",
+      "status": "revoked",
+      "createdAt": "2026-11-01T10:25:49.843Z",
+      "confirmedAt": "2026-11-01T10:25:49.843Z",
+      "revokedAt": "2026-11-01T10:25:50.405Z",
+      "revokedReason": "generation_rotated: probe-cancel"
+    }
+  ],
+  "assignments": [
+    {
+      "assignmentId": "asg_2991b8b0e04f",
+      "generation": 1,
+      "targetKind": "doc",
+      "targets": [
+        "systems/demo-guide.md"
+      ],
+      "ownerTaskId": "11fa5150-fc29-445b-8d48-29d64a78068f",
+      "status": "superseded",
+      "supersedes": null,
+      "createdAt": "2026-11-01T10:25:39.176Z",
+      "revokedAt": "2026-11-01T10:25:43.867Z"
+    },
+    {
+      "assignmentId": "asg_b9434d9135b8",
+      "generation": 1,
+      "targetKind": "doc",
+      "targets": [
+        "systems/demo-guide.md"
+      ],
+      "ownerTaskId": "645f6efb-1780-4016-b0ca-15056d1ae228",
+      "status": "revoked",
+      "supersedes": "asg_2991b8b0e04f",
+      "createdAt": "2026-11-01T10:25:43.867Z",
+      "revokedAt": "2026-11-01T10:25:50.405Z"
+    }
+  ],
+  "guardedSubmits": [
+    {
+      "toolCallId": "call_1_0",
+      "tool": "task_submit",
+      "taskMarker": "PROBE-TASK-W1",
+      "args": {
+        "agent": "luban",
+        "task": "PROBE-TASK-W1 写作任务\n按任务书完成：禁区读取试探、桥接读取、分配内写入（operationId=w1-op-1）、报告写入 agent-outputs/w1-report.md。",
+        "delivery": "handle",
+        "model": "zhipuai/glm-5.3-flash",
+        "scope": {
+          "read": [
+            "**"
+          ],
+          "write": [
+            "**",
+            "/tmp/escape/**"
+          ],
+          "deny": [
+            "unrelated/notes.md"
+          ],
+          "shell": "guarded",
+          "mcp": [
+            "*"
+          ],
+          "lsp": [
+            "diagnostics"
+          ],
+          "advisor": "consult"
+        },
+        "workspace": {
+          "cwd": "../escape",
+          "mode": "worktree",
+          "worktreeName": "probe-escape",
+          "base": "head",
+          "dependencyVisibility": "portable"
+        },
+        "profile": "fast",
+        "outputs": [
+          {
+            "path": "agent-outputs/report.md"
+          },
+          {
+            "path": "/tmp/escape.md"
+          }
+        ]
+      }
+    },
+    {
+      "toolCallId": "call_1_1",
+      "tool": "task_submit",
+      "taskMarker": "PROBE-TASK-W2",
+      "args": {
+        "agent": "luban",
+        "task": "PROBE-TASK-W2 写作任务\n按任务书完成：桥接读取与一次未分配写入尝试（operationId=w2-op-1）。",
+        "delivery": "handle",
+        "model": "zhipuai/glm-5.3-flash",
+        "scope": {
+          "read": [
+            "**"
+          ],
+          "write": [
+            "**",
+            "/tmp/escape/**"
+          ],
+          "deny": [
+            "unrelated/notes.md"
+          ],
+          "shell": "guarded",
+          "mcp": [
+            "*"
+          ],
+          "lsp": [
+            "diagnostics"
+          ],
+          "advisor": "consult"
+        },
+        "workspace": {
+          "cwd": "../escape",
+          "mode": "worktree",
+          "worktreeName": "probe-escape",
+          "base": "head",
+          "dependencyVisibility": "portable"
+        },
+        "profile": "fast",
+        "outputs": [
+          {
+            "path": "agent-outputs/report.md"
+          },
+          {
+            "path": "/tmp/escape.md"
+          }
+        ]
+      }
+    },
+    {
+      "toolCallId": "call_1_2",
+      "tool": "task_submit",
+      "taskMarker": "PROBE-TASK-R1",
+      "args": {
+        "agent": "diting",
+        "task": "PROBE-TASK-R1 独立审查任务\n按任务书完成：草稿读取、审查者越权写入试探、提交交接（operationId=r1-handoff-1）。",
+        "delivery": "handle",
+        "model": "zhipuai/glm-5.3",
+        "scope": {
+          "read": [
+            "**"
+          ],
+          "write": [
+            "**",
+            "/tmp/escape/**"
+          ],
+          "deny": [
+            "unrelated/notes.md"
+          ],
+          "shell": "guarded",
+          "mcp": [
+            "*"
+          ],
+          "lsp": [
+            "diagnostics"
+          ],
+          "advisor": "consult"
+        },
+        "workspace": {
+          "cwd": "../escape",
+          "mode": "worktree",
+          "worktreeName": "probe-escape",
+          "base": "head",
+          "dependencyVisibility": "portable"
+        },
+        "profile": "fast",
+        "outputs": [
+          {
+            "path": "agent-outputs/report.md"
+          },
+          {
+            "path": "/tmp/escape.md"
+          }
+        ]
+      }
+    },
+    {
+      "toolCallId": "call_1_3",
+      "tool": "task_submit",
+      "taskMarker": null,
+      "args": {
+        "agent": "fuxi",
+        "task": "PROBE-BAD-ROLE 非构建角色派发（预期被派发守卫阻断）",
+        "delivery": "handle",
+        "model": "zhipuai/glm-5.3",
+        "scope": {
+          "read": [
+            "**"
+          ],
+          "write": [
+            "**",
+            "/tmp/escape/**"
+          ],
+          "deny": [
+            "unrelated/notes.md"
+          ],
+          "shell": "guarded",
+          "mcp": [
+            "*"
+          ],
+          "lsp": [
+            "diagnostics"
+          ],
+          "advisor": "consult"
+        },
+        "workspace": {
+          "cwd": "../escape",
+          "mode": "worktree",
+          "worktreeName": "probe-escape",
+          "base": "head",
+          "dependencyVisibility": "portable"
+        },
+        "profile": "fast",
+        "outputs": [
+          {
+            "path": "agent-outputs/report.md"
+          },
+          {
+            "path": "/tmp/escape.md"
+          }
+        ]
+      }
+    },
+    {
+      "toolCallId": "call_1_4",
+      "tool": "task_submit",
+      "taskMarker": null,
+      "args": {
+        "agent": "luban",
+        "task": "PROBE-BAD-MODEL 越界模型覆盖派发（预期被派发守卫阻断）",
+        "delivery": "handle",
+        "model": "zhipuai/glm-9.9-pro",
+        "scope": {
+          "read": [
+            "**"
+          ],
+          "write": [
+            "**",
+            "/tmp/escape/**"
+          ],
+          "deny": [
+            "unrelated/notes.md"
+          ],
+          "shell": "guarded",
+          "mcp": [
+            "*"
+          ],
+          "lsp": [
+            "diagnostics"
+          ],
+          "advisor": "consult"
+        },
+        "workspace": {
+          "cwd": "../escape",
+          "mode": "worktree",
+          "worktreeName": "probe-escape",
+          "base": "head",
+          "dependencyVisibility": "portable"
+        },
+        "profile": "fast",
+        "outputs": [
+          {
+            "path": "agent-outputs/report.md"
+          },
+          {
+            "path": "/tmp/escape.md"
+          }
+        ]
+      }
+    },
+    {
+      "toolCallId": "call_18_0",
+      "tool": "task_resume",
+      "taskMarker": "PROBE-RESUME-W1",
+      "args": {
+        "handle": "11fa5150-fc29-445b-8d48-29d64a78068f",
+        "message": "PROBE-RESUME-W1 请对 systems/demo-guide.md 再提交一次修订写入（operationId=w1-op-2）。",
+        "delivery": "handle"
+      }
+    },
+    {
+      "toolCallId": "call_26_0",
+      "tool": "task_submit",
+      "taskMarker": "PROBE-TASK-SLOW",
+      "args": {
+        "agent": "baize",
+        "task": "PROBE-TASK-SLOW 慢读取任务\n只做一次 raw_list（探测取消窗口）。",
+        "delivery": "handle",
+        "model": "zhipuai/glm-5.3-flash",
+        "scope": {
+          "read": [
+            "**"
+          ],
+          "write": [
+            "**",
+            "/tmp/escape/**"
+          ],
+          "deny": [
+            "unrelated/notes.md"
+          ],
+          "shell": "guarded",
+          "mcp": [
+            "*"
+          ],
+          "lsp": [
+            "diagnostics"
+          ],
+          "advisor": "consult"
+        },
+        "workspace": {
+          "cwd": "../escape",
+          "mode": "worktree",
+          "worktreeName": "probe-escape",
+          "base": "head",
+          "dependencyVisibility": "portable"
+        },
+        "profile": "fast",
+        "outputs": [
+          {
+            "path": "agent-outputs/report.md"
+          },
+          {
+            "path": "/tmp/escape.md"
+          }
+        ]
+      }
+    }
+  ],
+  "serverErrors": [],
+  "submitResults": [
+    {
+      "toolCallId": "call_1_3",
+      "tool": "task_submit",
+      "text": "角色 \"fuxi\" 不在本次构建的角色表内（允许：luban, diting, baize）（dispatch_role_not_allowed）"
+    },
+    {
+      "toolCallId": "call_1_4",
+      "tool": "task_submit",
+      "text": "模型覆盖 \"zhipuai/glm-9.9-pro\" 不在角色 luban 的冻结模型内（允许：zhipuai/glm-5.3-flash）（dispatch_model_not_frozen）"
+    },
+    {
+      "toolCallId": "call_1_1",
+      "tool": "task_submit",
+      "text": "[details surfaceVersion=2 viewVersion=1 taskId=9db3b96b-e66b-4792-bea2-145f7d00529b revision=0 execution=queued settlement=pending acceptance=unreviewed 承诺=tool-enforced nextActions=[grant-start,cancel] degraded=[]]\n\n[task_submit 9db3b96b luban · queued handle] 槽位已满入 FIFO 队列——晋级后自动启动，完成自动通知（无需轮询）\n上下文: isolated（仅任务书与显式输入）\n[验证预检] 项目未受信：自动基线不会执行项目测试；先确认项目可信性。任务状态与检查仍以回执为准。\n[验证预检] 同一项目策略未变，详细配置见此前预检；捕获/依赖/runner 运行时仍为 unknown，最终以回执为准。\n[model] 本次临时覆盖 zhipuai/glm-5.3-flash——仅本轮生效，不改 amagi.json/角色配置，不改变权限\n句柄: 9db3b96b-e66b-4792-bea2-145f7d00529b（wait/cancel 用 task_control；三轴用 task_query）"
+    },
+    {
+      "toolCallId": "call_1_0",
+      "tool": "task_submit",
+      "text": "[details surfaceVersion=2 viewVersion=1 taskId=11fa5150-fc29-445b-8d48-29d64a78068f revision=0 execution=running settlement=pending acceptance=unreviewed 承诺=tool-enforced nextActions=[observe,cancel] degraded=[]]\n\n[task_submit 11fa5150 luban · handle 已启动] 完成后自动通知（无需轮询；期间可并行推进无关任务）\n上下文: isolated（仅任务书与显式输入）\n[验证预检] 项目未受信：自动基线不会执行项目测试；先确认项目可信性。任务状态与检查仍以回执为准。\n[model] 本次临时覆盖 zhipuai/glm-5.3-flash——仅本轮生效，不改 amagi.json/角色配置，不改变权限\n句柄: 11fa5150-fc29-445b-8d48-29d64a78068f（wait/cancel 用 task_control；三轴用 task_query）"
+    },
+    {
+      "toolCallId": "call_1_2",
+      "tool": "task_submit",
+      "text": "[details surfaceVersion=2 viewVersion=1 taskId=c702aaaf-df66-4f41-ada6-167c3b635c9e revision=0 execution=running settlement=pending acceptance=unreviewed 承诺=tool-enforced nextActions=[observe,cancel] degraded=[]]\n\n[task_submit c702aaaf diting · handle 已启动] 完成后自动通知（无需轮询；期间可并行推进无关任务）\n上下文: isolated（仅任务书与显式输入）\n[验证预检] 项目未受信：自动基线不会执行项目测试；先确认项目可信性。任务状态与检查仍以回执为准。\n[验证预检] 同一项目策略未变，详细配置见此前预检；捕获/依赖/runner 运行时仍为 unknown，最终以回执为准。\n[model] 本次临时覆盖 zhipuai/glm-5.3——仅本轮生效，不改 amagi.json/角色配置，不改变权限\n句柄: c702aaaf-df66-4f41-ada6-167c3b635c9e（wait/cancel 用 task_control；三轴用 task_query）"
+    },
+    {
+      "toolCallId": "call_18_0",
+      "tool": "task_resume",
+      "text": "[details surfaceVersion=2 viewVersion=1 taskId=645f6efb-1780-4016-b0ca-15056d1ae228 revision=0 execution=queued settlement=pending acceptance=unreviewed 承诺=tool-enforced nextActions=[grant-start,cancel] degraded=[]]\n\n[model] 实际生效：zhipuai/glm-5.3-flash（amagi.json 全局配置）\n[task_resume 645f6efb luban · queued handle] 已入执行链（完成自动通知，无需轮询；父会话 11fa5150-fc29-445b-8d48-29d64a78068f）\n句柄: 645f6efb-1780-4016-b0ca-15056d1ae228（wait/cancel/steer 用 task_control；三轴用 task_query）\n[待接受] 本会话 1 个已结束任务尚无接受/拒绝决策（契约存储中仍是 unreviewed）——确认验收即复制调用；不接受改 action:\"reject\"（去掉 waivedCheckIds）；有意延后可忽略（每任务至多提醒 2 次）：\n  • c702aaaf diting execution=done settlement=ready receiptId=receipt-1129050c-e9c3-4856-b26c-26e9a87d304c → task_control({\"action\":\"accept\",\"handle\":\"c702aaaf-df66-4f41-ada6-167c3b635c9e\",\"receiptId\":\"latest\",\"expectedRevision\":0,\"reason\":\"<接受理由>\"})"
+    },
+    {
+      "toolCallId": "call_26_0",
+      "tool": "task_submit",
+      "text": "[details surfaceVersion=2 viewVersion=1 taskId=7f564c76-52e5-408e-9bbf-c221f2f4988b revision=0 execution=running settlement=pending acceptance=unreviewed 承诺=tool-enforced nextActions=[observe,cancel] degraded=[]]\n\n[task_submit 7f564c76 baize · handle 已启动] 完成后自动通知（无需轮询；期间可并行推进无关任务）\n上下文: isolated（仅任务书与显式输入）\n[验证预检] 项目未受信：自动基线不会执行项目测试；先确认项目可信性。任务状态与检查仍以回执为准。\n[验证预检] 同一项目策略未变，详细配置见此前预检；捕获/依赖/runner 运行时仍为 unknown，最终以回执为准。\n[model] 本次临时覆盖 zhipuai/glm-5.3-flash——仅本轮生效，不改 amagi.json/角色配置，不改变权限\n句柄: 7f564c76-52e5-408e-9bbf-c221f2f4988b（wait/cancel 用 task_control；三轴用 task_query）\n[待接受] 本会话 4 个已结束任务尚无接受/拒绝决策（契约存储中仍是 unreviewed）——确认验收即复制调用；不接受改 action:\"reject\"（去掉 waivedCheckIds）；有意延后可忽略（每任务至多提醒 2 次）：\n  • c702aaaf diting execution=done settlement=ready receiptId=receipt-1129050c-e9c3-4856-b26c-26e9a87d304c → task_control({\"action\":\"accept\",\"handle\":\"c702aaaf-df66-4f41-ada6-167c3b635c9e\",\"receiptId\":\"latest\",\"expectedRevision\":0,\"reason\":\"<接受理由>\"})\n  • 11fa5150 luban execution=done settlement=incomplete receiptId=receipt-72397b92-b2e9-4908-8643-e88ef53e5be9 → task_control({\"action\":\"accept\",\"handle\":\"11fa5150-fc29-445b-8d48-29d64a78068f\",\"receiptId\":\"latest\",\"expectedRevision\":0,\"reason\":\"<接受理由>\",\"waivedCheckIds\":[\"chk-auto-baseline-test-4662bae3\"]})\n  • 9db3b96b luban execution=done settlement=incomplete receiptId=receipt-69539d09-b02c-4c12-9828-581cb63a9777 → task_control({\"action\":\"accept\",\"handle\":\"9db3b96b-e66b-4792-bea2-145f7d00529b\",\"receiptId\":\"latest\",\"expectedRevision\":0,\"reason\":\"<接受理由>\",\"waivedCheckIds\":[\"chk-auto-baseline-test-6ed999af\"]})\n  …另 1 个：task_query({ view: \"summary\" }) 查 acceptance=unreviewed"
+    }
+  ],
+  "selfRoundEvents": [
+    "2026-11-01T10:25:42.082Z round self_1（后台完成通知自触发）",
+    "2026-11-01T10:25:43.813Z round self_2（后台完成通知自触发）",
+    "2026-11-01T10:25:46.818Z round self_3（后台完成通知自触发）",
+    "2026-11-01T10:25:49.774Z round self_4（后台完成通知自触发）"
+  ],
+  "leaderEventTypes": {
+    "entry_appended": 15,
+    "response": 1,
+    "agent_start": 5,
+    "turn_start": 9,
+    "message_start": 23,
+    "message_end": 23,
+    "message_update": 51,
+    "tool_execution_start": 8,
+    "tool_execution_end": 8,
+    "turn_end": 9,
+    "agent_end": 5,
+    "agent_settled": 5
+  }
+}

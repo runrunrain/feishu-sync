@@ -6,6 +6,9 @@
  * LocalMapStore / 路由层共享。
  */
 
+import type { BuildRunSpec, RuntimeBinding } from '../agent/build-runtime/contracts.js';
+import type { BuildActorCheckpointPayload } from '../kb/build-actors.js';
+
 // ============================================================================
 // 配置段（Config 新增 agent + standardKb）
 // ============================================================================
@@ -81,6 +84,23 @@ export interface AgentOrchestrationConfig {
   taskTimeoutMinutes: number;
 }
 
+export type KbBuildOrchestrationMode = 'legacy' | 'pi-amagi' | 'claude-native';
+
+/** 构建编排模式受控枚举（重构设计 v2 §13.5：每次构建冻结 orchestrationMode）。
+ * `legacy` = 既有编排流水/单进程/并行路径；`pi-amagi` = Pi + amagi-pi
+ * 单一派发（Leader 监督）；`claude-native` = Claude Code 原生子 agent
+ * （未经 13.1 能力验收前拒绝启动，配置值可存）。additive 可选：旧配置
+ * 无此字段 → legacy（保守默认；新模式仅在真实运行达到质量/恢复/性能
+ * 门槛后才可改默认）。 */
+export const KB_ORCHESTRATION_MODES: ReadonlySet<string> = new Set(['legacy', 'pi-amagi', 'claude-native']);
+
+/** 解析构建编排模式（未设/非法回落 legacy——保守默认，绝不静默启用新模式）。 */
+export function resolveOrchestrationMode(config: Pick<StandardKbConfig, 'orchestrationMode'> | null | undefined): KbBuildOrchestrationMode {
+  return config?.orchestrationMode === 'pi-amagi' || config?.orchestrationMode === 'claude-native'
+    ? config.orchestrationMode
+    : 'legacy';
+}
+
 export interface StandardKbConfig {
   outputRoot: string;
   retainReleases: number;
@@ -115,6 +135,10 @@ export interface StandardKbConfig {
   evidenceBudgetBytes?: number;
   /** 第一阶段固定 false（字段预留） */
   autoBuildAfterSync: boolean;
+  /** 重构设计 v2 §13.5：构建编排模式冻结（additive 可选；缺省 legacy）。
+   * 旧检查点无该字段按 legacy 恢复；claude-native 在真实能力验收前拒绝
+   * 启动（见 createBuild 的显式拒绝）。 */
+  orchestrationMode?: KbBuildOrchestrationMode;
 }
 
 /** B案 §8 角色模型选择：引用 llm 注册表的 provider+model 预设，密钥不入
@@ -452,6 +476,9 @@ export interface KbBuildDto {
   createdAt: string;
   startedAt: string | null;
   finishedAt: string | null;
+  /** 重构 v2：构建创建时冻结的编排模式（additive：legacy 缺省；历史行
+   * 无活动条目时不回填，前端按缺省=legacy 处理）。 */
+  orchestrationMode?: 'legacy' | 'pi-amagi';
   /** 当前状态已包含至此的事件；重启/恢复连接据此跳过旧终态。 */
   eventSeq?: number;
   recovery?: { canResume: boolean; reason: string | null; checkpointAt: string | null; draftCount: number; completedBatches: number; totalBatches: number };
@@ -565,6 +592,131 @@ export interface KbBuildOrchestrationDto {
   /** 接口失败重试总次数（与内容修订分开计数，B 案 §5） */
   interfaceRetryTotal: number;
   autoRevisionUsage: Record<string, number>;
+}
+
+// ============================================================================
+// 重构 v2：Leader 监督构建（设计 §8 接口与持久化结构）
+//
+// 运行层契约（BuildRunSpec/RuntimeBinding/RuntimeEvent/CapabilityReport/
+// CancelResult/BuildRuntimeAdapter）以 agent/build-runtime/contracts.ts 为
+// 唯一规范，本文件不再维护同名兼容形状；此处只保留应用侧监督快照
+// （检查点）与进度 DTO。claude-native 未经能力验收前不得启动。
+// ============================================================================
+
+/** 监督视角的任务身份快照（观测展示与恢复记录；写入授权真相在
+ * BuildActorStore 的 ActorBinding，两侧按 nativeTaskId 对齐）。 */
+export interface LeaderActorRecord {
+  nativeTaskId: string;
+  parentTaskId: string | null;
+  generation: number;
+  role: string;
+  status: 'pending' | 'confirmed' | 'revoked';
+  execState: string | null;
+  lastEventAt: string;
+}
+
+/** 最近一次发布申请的监督快照（裁定真相在 BuildActorStore.publishRequests
+ * 与发布校验管线回执）。 */
+export interface LeaderPublishRequestSnapshot {
+  requestId: string | null;
+  candidateRevision: string;
+  summary: string;
+  accepted: boolean;
+  status: 'pending' | 'accepted' | 'rejected' | 'not_wired' | null;
+  decidedAt: string;
+}
+
+/** 材料冻结面（恢复前置比对：源快照哈希与基准版本；运行层 spec 不携带）。 */
+export interface LeaderRunMaterial {
+  mode: 'full' | 'incremental';
+  sourceSnapshotHash: string;
+  baseReleaseId: string | null;
+}
+
+/**
+ * Leader 监督运行的持久化状态（检查点 leaderRun 字段）。
+ *
+ * schemaVersion 2：spec/binding 直接采用运行层 runtime contracts 形状
+ * （版本 1 的自造契约已废弃，旧检查点按无效拒读，不伪造恢复）；成果
+ * 账本以 actorPayload 全量随检查点落盘——恢复时以 staging build-actors
+ * 文件为权威、payload 为兜底（两源 buildId/generation 校验后回灌）。
+ */
+export interface LeaderRunCheckpointState {
+  schemaVersion: 2;
+  orchestrationMode: 'pi-amagi';
+  generation: number;
+  spec: BuildRunSpec;
+  /** 材料冻结面（恢复时与当前快照/基准比对；不一致拒绝恢复） */
+  material: LeaderRunMaterial;
+  binding: RuntimeBinding | null;
+  /** 已处理事件游标（source → 游标值；跨代次重启后按代次键去重） */
+  eventCursor: Record<string, string>;
+  /** 监督视角身份快照（观测；权威在 BuildActorStore） */
+  actors: LeaderActorRecord[];
+  /** BuildActorStore.exportCheckpointPayload() 全量（回执/审查/分配/交接/
+   * 问题清单/发布申请；恢复兜底用，文件才是权威） */
+  actorPayload: BuildActorCheckpointPayload | null;
+  /** 空闲提醒只发一次（再空闲即 leader_idle） */
+  idleRemindedAt: string | null;
+  publishRequest: LeaderPublishRequestSnapshot | null;
+  /** 发布窗口结算锁（发布被接受后写入：不再接受新发布申请；子任务写令牌已撤销） */
+  publishLock?: { candidateHash: string; revision: string | null; settledAt: string } | null;
+  /** Leader 末次轮次用量（runtime 事件 usage；非累计口径，不冒充累计） */
+  lastUsage: { inputTokens: number; outputTokens: number; at: string } | null;
+  /** 结束原因（监督结束时写入；恢复时用于展示） */
+  endedReason: string | null;
+  updatedAt: string;
+}
+
+/**
+ * Leader 运行进度 DTO（侧栏/诊断端点）。无可靠来源的字段如实为 null，
+ * 不虚构百分比/累计用量/排队原因。
+ */
+export interface LeaderRunProgressDto {
+  buildId: string;
+  orchestrationMode: 'pi-amagi';
+  generation: number;
+  leader: {
+    sessionId: string | null;
+    pid: number | null;
+    /** 恢复级别（runtime BuildResumeCapability 投影）：session=原会话续接；
+     * artifact=成果级重建；none=不支持。 */
+    resumeCapability: 'session' | 'artifact' | 'none';
+  } | null;
+  tasks: Array<{
+    nativeTaskId: string;
+    role: string;
+    parentTaskId: string | null;
+    status: LeaderActorRecord['status'];
+    execState: string | null;
+    lastEventAt: string;
+  }>;
+  rounds: { started: number; ended: number };
+  idle: { remindedAt: string | null; lastActivityAt: string | null };
+  publishRequest: LeaderPublishRequestSnapshot | null;
+  /** 成果/问题/用量汇总（来源 actorStore 与 runtime 事件；无可靠来源=null） */
+  summary: {
+    /** 已接受文档数（actorStore 回执去重 paths） */
+    acceptedDocumentCount: number | null;
+    /** 未解决 blocking 问题数（最新问题清单） */
+    openBlockingCount: number | null;
+    /** 活动输出分配数 */
+    activeAssignments: number | null;
+    /** 子任务排队原因细分（amagi 准入内部不可观测；如实 null） */
+    queueReason: string | null;
+    /** 末次 Leader 轮次用量（非累计；子任务用量不经 Leader RPC 事件） */
+    lastUsage: { inputTokens: number; outputTokens: number; at: string } | null;
+    /** 累计用量（父子去重后不可得；如实 null，不重复计数父子 token） */
+    cumulativeUsage: null;
+  };
+  endedReason: string | null;
+  /** 终止状态（监督视角）：cancelling=已请求取消未落地；finished=已结束；
+   * none=运行中；无可靠来源（仅检查点）时 null，不虚构 */
+  termination?: 'none' | 'cancelling' | 'finished' | null;
+  /** 冻结工作流 skill（构建专用物化：路径 + 内容哈希=workflowRevision；供 probe/UI 核对） */
+  skill?: { path: string; revision: string } | null;
+  eventCursor: Record<string, string>;
+  updatedAt: string;
 }
 
 export interface KbBuildWarning {

@@ -5,7 +5,7 @@ import path from 'node:path';
 import { atomicWriteFile, resolveInside } from '../agent/path-guard.js';
 import type { BuildRunState } from '../agent/agent-tool-service.js';
 import type { ImageDescription } from '../agent/vision/vision-describer.js';
-import type { KbBuildProgressDto, RawSourceSnapshotEntry } from '../types/agent-knowledge.js';
+import type { KbBuildProgressDto, LeaderRunCheckpointState, RawSourceSnapshotEntry } from '../types/agent-knowledge.js';
 import type { BuildOrchestrationSnapshot } from './build-orchestration.js';
 import type { BuildUnit } from './build-units.js';
 import type { PathClaimPreload } from './path-claims.js';
@@ -43,6 +43,10 @@ export interface BuildCheckpoint {
   /** T2a（B 案 §8）：多模型编排骨架快照（BuildSpec + 任务集合）。
    * additive 可选：旧检查点无此字段按旧规则恢复，不升级成新式任务。 */
   orchestration?: BuildOrchestrationSnapshot;
+  /** 重构 v2：Leader 监督运行状态（新模式的成果/分配/事件游标/运行版本）。
+   * additive 可选：旧检查点无此字段 → 按 legacy 路径恢复；存在该字段
+   * 的检查点只走新模式恢复（会话级或成果级），不得用旧调度器解释。 */
+  leaderRun?: LeaderRunCheckpointState;
 }
 
 export interface CheckpointSummary {
@@ -68,6 +72,23 @@ function validCheckpointRelativePath(relative: string): boolean {
   if (relative.startsWith('docs/') && relative.endsWith('.md')) return true;
   // reviews/ 当前报告与归档（archive）均为 .json
   return /^reviews\/[A-Za-z0-9_.-]+\.json$/.test(relative) || /^reviews\/archive\/[A-Za-z0-9_.-]+\.json$/.test(relative);
+}
+
+/** 重构 v2：leaderRun 检查点结构校验（schemaVersion 2；宽松必需字段；
+ * 不合法即拒读，避免伪造恢复。版本 1（已废弃的自造契约）一律拒读）。 */
+function isValidLeaderRunCheckpoint(value: unknown): value is LeaderRunCheckpointState {
+  if (!value || typeof value !== 'object') return false;
+  const state = value as Partial<LeaderRunCheckpointState>;
+  return state.schemaVersion === 2
+    && state.orchestrationMode === 'pi-amagi'
+    && typeof state.generation === 'number' && Number.isInteger(state.generation) && state.generation >= 1
+    && !!state.spec && typeof state.spec === 'object' && typeof (state.spec as { buildId?: unknown }).buildId === 'string'
+    && !!state.material && typeof state.material === 'object'
+    && typeof state.eventCursor === 'object' && state.eventCursor !== null && !Array.isArray(state.eventCursor)
+    && Array.isArray(state.actors)
+    && (state.binding === null || state.binding === undefined || (typeof state.binding === 'object' && typeof (state.binding as { buildId?: unknown }).buildId === 'string'))
+    && (state.actorPayload === null || state.actorPayload === undefined || typeof state.actorPayload === 'object')
+    && typeof state.updatedAt === 'string';
 }
 
 function documentFiles(root: string): string[] {
@@ -183,6 +204,10 @@ export class BuildCheckpointStore {
     const checkpoint = JSON.parse(fs.readFileSync(file, 'utf8')) as BuildCheckpoint;
     if (checkpoint.schemaVersion !== 1 || checkpoint.buildId !== buildId || !Array.isArray(checkpoint.snapshot) || !Array.isArray(checkpoint.docMeta)
       || !Array.isArray(checkpoint.singleBatches) || !Array.isArray(checkpoint.units) || !checkpoint.files) throw new Error('构建检查点无效');
+    // 重构 v2：leaderRun 形状校验（存在即新模式检查点；不伪造字段）
+    if (checkpoint.leaderRun !== undefined && !isValidLeaderRunCheckpoint(checkpoint.leaderRun)) {
+      throw new Error('Leader 运行检查点无效');
+    }
     for (const [relative, hash] of Object.entries(checkpoint.files)) {
       if (!validCheckpointRelativePath(relative)) throw new Error('检查点文件路径无效');
       if (digest(resolveInside(dir, relative, 'read')) !== hash) throw new Error('构建检查点草稿校验失败');
