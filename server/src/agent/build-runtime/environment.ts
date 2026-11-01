@@ -30,6 +30,17 @@ export const BUILD_SPEC_ENV = 'FEISHU_SYNC_AGENT_BUILD_SPEC_JSON';
 export const BUILD_GUARD_MODULE_ENV = 'FEISHU_SYNC_BUILD_GUARD_MODULE';
 /** FrozenDispatchConfig 序列化 JSON（guardTaskSubmit/guardTaskResume 输入）。 */
 export const BUILD_GUARD_CONFIG_ENV = 'FEISHU_SYNC_BUILD_GUARD_CONFIG_JSON';
+/**
+ * F12-R1 增补（child native 根约束元数据）：child-policy 扩展消费的冻结信封根
+ * （PI_* 前缀经 amagi 子任务 env 全量透传——task-run buildMinimalEnv 已核；
+ * FEISHU_SYNC_* 不在 amagi 白名单到不了子进程，故用 PI_ 命名）。
+ * 数据源 = 冻结 spec + dirs（workflowSkillPath/workDir 均在 agentDirConfigHash
+ * 与 dispatch-guard 冻结链内）；写入面仅报告根（与 freezeGuardConfig 默认
+ * reportRoot='agent-outputs' 同源——adapter 从不传自定义 reportRoot，若未来
+ * 可自定义需同步本处与 child-policy，属最小接口变更）。
+ * 子任务侧缺此元数据 → child-policy 对 read/write/edit fail-closed 全阻断。
+ */
+export const BUILD_CHILD_ROOTS_ENV = 'PI_BUILD_CHILD_ROOTS_JSON';
 
 export interface LeaderEnvInput {
   parentEnv: NodeJS.ProcessEnv;
@@ -77,6 +88,11 @@ export function buildLeaderEnv(input: LeaderEnvInput): NodeJS.ProcessEnv {
   env.PI_OFFLINE = '1';
   env.PI_SKIP_VERSION_CHECK = '1';
   env.PI_TELEMETRY = '0';
+  // F12-R1：冻结信封根元数据（read=skill 同目录协议+任务工作区；write/edit=仅报告根）
+  env[BUILD_CHILD_ROOTS_ENV] = JSON.stringify({
+    readRoots: [path.dirname(path.resolve(input.spec.workflowSkillPath)), path.resolve(input.dirs.workDir)],
+    writeRoots: [path.resolve(input.dirs.workDir, 'agent-outputs')],
+  });
 
   // 模型密钥（Leader 直接使用；amagi 只转交给 zhipuai 子任务）
   env[ZHIPU_API_KEY_ENV] = input.zhipuApiKey;

@@ -334,10 +334,43 @@ describe('pi-amagi 端到端接入试验（真实 pi/amagi/桥接；fixture 模�
   afterAll(async () => {
     if (prevHome === undefined) delete process.env.FEISHU_SYNC_HOME;
     else process.env.FEISHU_SYNC_HOME = prevHome;
+    // ENOTEMPTY 根因收口（与 fix-e2e 同一链）：先走正式服务级关闭链
+    // （取消活动构建并等 OS 级收口），再关 HTTP/fixture。修正轮：只有
+    // shutdown 报告 quiesced=true（OS 级确认，含持久/内存终止对账）才允许
+    // 删 home；未收口/报告不可得时保留现场并明确标记，不用重试/rm 冒充退出。
+    let shutdownReport: { quiesced: boolean; unsettled: string[]; unconfirmedTerminations: Array<{ buildId: string; source: string; note: string }> } | null = null;
+    try {
+      shutdownReport = await (app as unknown as { __shutdownServices?: () => Promise<typeof shutdownReport> } | null)?.__shutdownServices?.() ?? null;
+    } catch (error) {
+      console.error('[e2e] shutdownServices failed:', error);
+    }
     await new Promise<void>((resolve) => { httpServer?.close(() => resolve()); if (!httpServer) resolve(); });
     await new Promise<void>((resolve) => { fixture?.server.close(() => resolve()); if (!fixture) resolve(); });
-    if (home && !keepHomeOnFailure) fs.rmSync(home, { recursive: true, force: true });
-    else if (home) console.error('[kept-home]', home);
+    if (home && !keepHomeOnFailure) {
+      if (!shutdownReport?.quiesced) {
+        keepHomeOnFailure = true;
+        console.error('[kept-home:shutdown-unsettled]', home,
+          shutdownReport
+            ? `超时未收口=${shutdownReport.unsettled.join(',') || '无'}；终止未确认=${shutdownReport.unconfirmedTerminations.map((item) => `${item.buildId}(${item.source}:${item.note.slice(0, 120)})`).join(',') || '无'}`
+            : '（shutdownServices 报告不可得）');
+      } else {
+        let removed = false;
+        let lastError: unknown = null;
+        for (let attempt = 0; attempt < 3 && !removed; attempt += 1) {
+          try {
+            fs.rmSync(home, { recursive: true, force: true });
+            removed = true;
+          } catch (error) {
+            lastError = error;
+            await new Promise((resolve) => setTimeout(resolve, 500));
+          }
+        }
+        if (!removed) {
+          keepHomeOnFailure = true;
+          console.error('[kept-home:rm-failed]', home, String(lastError));
+        }
+      }
+    } else if (home) console.error('[kept-home]', home);
   });
 
   it.runIf(runE2e)('环境前置', () => {

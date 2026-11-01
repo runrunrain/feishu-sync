@@ -15,9 +15,13 @@
  */
 
 import { createHash } from 'node:crypto';
+import { isAbsolute } from 'node:path';
+// F12：仅类型引入（编译后擦除，不产生运行时相对 import——本模块保持零运行时
+// 依赖，可被 pi/jiti 单文件加载；运行时核验模块由扩展按同目录路径另行装载）。
+import type { RuntimeIntegrityRefs } from './runtime-integrity.js';
 
 /** 守卫配置 schema 版本；形状变更时递增并保持旧字段兼容或显式拒绝。 */
-export const DISPATCH_GUARD_SCHEMA_VERSION = 1;
+export const DISPATCH_GUARD_SCHEMA_VERSION = 2;
 
 /** 守卫冻结配置（应用在启动 Leader 前生成，注入扩展环境）。 */
 export interface FrozenDispatchConfig {
@@ -39,6 +43,12 @@ export interface FrozenDispatchConfig {
     /** 该角色 scope.mcp 的精确知识工具名（空数组 = 不授予 MCP 工具）。 */
     mcpTools: string[];
   }>;
+  /**
+   * F12（审核修复）：派发前重核验的冻结引用（settings/policy/包/四配置）。
+   * 必填——旧代次信封（schemaVersion 1 无 integrity）会被 fail-closed 拒绝；
+   * 扩展在每次 task_submit/task_resume 前调 verifyRuntimeIntegrity，不 ok 即阻断。
+   */
+  integrity: RuntimeIntegrityRefs;
 }
 
 /** 守卫审计记录（作为运行事件上报；不含任务正文，只含哈希）。 */
@@ -72,7 +82,7 @@ export function validateGuardConfig(config: FrozenDispatchConfig): string[] {
   if (config.schemaVersion !== DISPATCH_GUARD_SCHEMA_VERSION) issues.push(`schemaVersion 不支持（期望 ${DISPATCH_GUARD_SCHEMA_VERSION}）`);
   if (!config.buildId) issues.push('buildId 缺失');
   if (!Number.isInteger(config.generation) || config.generation < 1) issues.push('generation 非法');
-  if (!config.workDir || !config.workDir.startsWith('/')) issues.push('workDir 须为绝对路径');
+  if (!config.workDir || !isAbsolute(config.workDir)) issues.push(`workDir 须为绝对路径（与宿主平台一致：${process.platform === 'win32' ? '盘符/UNC' : 'POSIX /…'}）`);
   if (!config.reportRoot || config.reportRoot.includes('..')) issues.push('reportRoot 非法');
   if (!Array.isArray(config.forbiddenZones)) issues.push('forbiddenZones 须为数组');
   const roleNames = Object.keys(config.roles ?? {});
@@ -84,6 +94,36 @@ export function validateGuardConfig(config: FrozenDispatchConfig): string[] {
     if (!Array.isArray(role.mcpTools)) issues.push(`roles.${name}.mcpTools 须为数组`);
     if (!role.key) issues.push(`roles.${name}.key 缺失`);
   }
+  // F12：完整性引用必填（缺失/形状非法 → 信封整体非法，扩展装载即 fail-closed）。
+  // 形状检查为信封装载子集（与 runtime-integrity.validateRuntimeIntegrityRefs 同文案；
+  // 权威逐次触盘核验在 verifyRuntimeIntegrity，派发前由扩展强制执行）。
+  if (!config.integrity || typeof config.integrity !== 'object') {
+    issues.push('integrity 缺失（F12 运行期完整性重核验引用必须随信封冻结）');
+  } else {
+    const refs = config.integrity as RuntimeIntegrityRefs;
+    if (refs.schemaVersion !== 1) issues.push(`integrity.schemaVersion 不支持（期望 1）`);
+    if (!refs.homeDir || !isAbsolute(refs.homeDir)) issues.push('integrity.homeDir 须为绝对路径');
+    const files = refs.expectedFiles as Record<string, unknown> | undefined;
+    for (const key of ['settings', 'amagi', 'models', 'mcp']) {
+      if (typeof files?.[key] !== 'string' || (files[key] as string).length === 0) {
+        issues.push(`integrity.expectedFiles.${key} 缺失`);
+      }
+    }
+    if (!/^child-policy-[0-9a-f]{12}\.js$/.test(refs.childPolicy?.fileName ?? '')) {
+      issues.push('integrity.childPolicy.fileName 须为内容寻址 child-policy-<hash12>.js');
+    }
+    if (!/^[0-9a-f]{64}$/.test(refs.childPolicy?.sha256 ?? '')) issues.push('integrity.childPolicy.sha256 须为 hex64');
+    if (!refs.amagiPackage?.packageRoot || !isAbsolute(refs.amagiPackage.packageRoot)) {
+      issues.push('integrity.amagiPackage.packageRoot 须为绝对路径');
+    }
+    if (!refs.amagiPackage?.contentHash) issues.push('integrity.amagiPackage.contentHash 缺失');
+    if (!refs.workflowSkill?.path || !isAbsolute(refs.workflowSkill?.path ?? '')) {
+      issues.push('integrity.workflowSkill.path 须为绝对路径');
+    }
+    if (!/^[0-9a-f]{64}$/.test(refs.workflowSkill?.sha256 ?? '')) {
+      issues.push('integrity.workflowSkill.sha256 须为 hex64（= spec.workflowRevision）');
+    }
+  }
   return issues;
 }
 
@@ -93,27 +133,36 @@ function sha256(text: string): string {
   return createHash('sha256').update(text, 'utf-8').digest('hex');
 }
 
+/** 比较用规范化：统一分隔符为 / 并去尾部重复斜杠（Windows 盘符/UNC 与 POSIX 条目同口径比较）。 */
+function normPathForCompare(p: string): string {
+  return p.replace(/\\/g, '/').replace(/\/+$/, '');
+}
+
 function isInsideDir(target: string, dir: string): boolean {
-  if (target === dir) return true;
-  return target.startsWith(dir.endsWith('/') ? dir : `${dir}/`);
+  const t = normPathForCompare(target);
+  const d = normPathForCompare(dir);
+  if (t === d) return true;
+  return t.startsWith(d.endsWith('/') ? d : `${d}/`);
 }
 
 /** 路径条目是否落在报告写面内（支持 `agent-outputs/**`、`agent-outputs`、`agent-outputs/x.md`）。 */
 function withinReportSurface(entry: string, reportRoot: string): boolean {
-  const normalized = entry.replace(/\\/g, '/').replace(/^\.\//, '');
-  if (normalized === reportRoot || normalized === `${reportRoot}/**`) return true;
-  return isInsideDir(normalized, reportRoot);
+  const normalized = normPathForCompare(entry).replace(/^\.\//, '');
+  const root = normPathForCompare(reportRoot);
+  if (normalized === root || normalized === `${root}/**`) return true;
+  return isInsideDir(normalized, root);
 }
 
 function isAbsoluteLike(p: string): boolean {
   return p.startsWith('/') || /^[A-Za-z]:[\\/]/.test(p) || p.startsWith('\\\\');
 }
 
-/** 路径条目（绝对或相对）是否越出固定工作目录。 */
+/** 路径条目（绝对或相对）是否越出固定工作目录（workDir 与条目同口径规范化后比较；
+ * 任意位置含 .. 段即拒绝——前缀内嵌 .. 同样是逃逸，F13 规范化收口）。 */
 function escapesWorkDir(entry: string, workDir: string): boolean {
-  const normalized = entry.replace(/\\/g, '/');
-  if (isAbsoluteLike(normalized)) return !isInsideDir(normalized, workDir);
+  const normalized = normPathForCompare(entry);
   if (normalized.split('/').includes('..')) return true;
+  if (isAbsoluteLike(normalized)) return !isInsideDir(normalized, workDir);
   return false;
 }
 
@@ -313,7 +362,7 @@ export function guardTaskResume(
 
 // ── 冻结配置构造（server 侧便捷入口；扩展侧只消费 JSON） ──────────────
 
-/** 由 BuildRunSpec 形状生成守卫冻结配置（角色模型/工具名单由调用方补齐）。 */
+/** 由 BuildRunSpec 形状生成守卫冻结配置（角色模型/工具名单与完整性引用由调用方补齐）。 */
 export function freezeGuardConfig(input: {
   buildId: string;
   generation: number;
@@ -321,6 +370,7 @@ export function freezeGuardConfig(input: {
   reportRoot?: string;
   forbiddenZones: string[];
   roles: Record<string, { key: string; models: string[]; mcpTools: string[] }>;
+  integrity: RuntimeIntegrityRefs;
 }): FrozenDispatchConfig {
   const config: FrozenDispatchConfig = {
     schemaVersion: DISPATCH_GUARD_SCHEMA_VERSION,
@@ -330,6 +380,7 @@ export function freezeGuardConfig(input: {
     reportRoot: input.reportRoot ?? 'agent-outputs',
     forbiddenZones: sortedUnique(input.forbiddenZones),
     roles: input.roles,
+    integrity: input.integrity,
   };
   const issues = validateGuardConfig(config);
   if (issues.length > 0) {

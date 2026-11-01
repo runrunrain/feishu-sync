@@ -66,7 +66,7 @@ import { taskToolFamily } from './agent/tasks/task-tools.js';
 import { TASK_TOOL_FAMILY_NAME, TASK_TOOL_NAMES } from './agent/tool-specs.js';
 import { ApprovalService } from './agent/approvals/approval-service.js';
 import { createOpsToolFamily } from './agent/tools/app-command-family.js';
-import { KbBuildService } from './kb/kb-build-service.js';
+import { KbBuildService, type KbShutdownReport } from './kb/kb-build-service.js';
 import { BuildRuntimeHost } from './kb/build-runtime-host.js';
 import { projectKnowledgeDocuments, recoveredSourceCsvPaths } from './kb/local-source-projection.js';
 import { piExtensionPath, readAgentPromptAssets, readAgentPromptFile } from './agent/agent-assets.js';
@@ -708,6 +708,12 @@ export async function buildServer(options: CreateServerOptions = {}) {
   (app as any).__agentToolService = agentToolService;
   (app as any).__cliEndpoint = cliEndpoint;
   (app as any).__kbLanGateway = kbLanGateway;
+  // F10/ENOTEMPTY：服务级关闭链（与 startServer.close 同一实现；裸 buildServer
+  // 的测试/嵌入方必须调 __shutdownServices 而不是只关 HTTP——否则活动构建的
+  // Leader/子任务/桥被孤儿化，异步写者在删目录/退进程期间继续写盘）。
+  (app as any).__kbBuildService = kbBuildService;
+  (app as any).__localMapStore = localMapStore;
+  (app as any).__shutdownServices = () => shutdownServices(app);
   (app as any).__refreshRawMcpCatalog = () => {
     const root = configManager.getConfig()?.knowledgeBaseRoot ?? '';
     try { writeRawCatalog(rawCatalogPath(agentDataRoot), root, root ? knowledgeDocuments() : [], sheetCsvPaths, (doc) => ({
@@ -801,26 +807,16 @@ export async function startServer(options: CreateServerOptions & {
     if (closed) return;
     closed = true;
     clearInterval(rawCatalogTimer);
-    await kbLanGateway.close();
-    // S10：先取消全部 pending 批准（挂起的工具调用立即失败），
-    // 再回收 pi 子进程。
-    const approvals = (app as any).__approvalService as { close: () => void } | undefined;
-    approvals?.close();
-    // P0-S4：停云端回滚轮询器（未收敛行留 revert_state='running'，重启对账续查）。
-    const cloudHistory = (app as any).__cloudHistoryService as { stopPoller: () => void } | undefined;
-    cloudHistory?.stopPoller();
-    // P2-S6：停移出轮询器（未收敛行留 state='moving'，重启对账续查）。
-    const cloudMoves = (app as any).__cloudMoveService as { stopPoller: () => void } | undefined;
-    cloudMoves?.stopPoller();
-    // 先回收 pi 子进程（SIGTERM → 3s → SIGKILL / Windows taskkill），
-    // 再关 HTTP：内部工具 API 必须在子进程存续期间可达。
-    const agentPool = (app as any).__agentPool as { closeAll: () => Promise<void> } | undefined;
-    if (agentPool?.closeAll) {
-      try {
-        await agentPool.closeAll();
-      } catch (error) {
-        console.warn('[server] agent pool close failed:', error);
-      }
+    // S12/F10：服务级关闭统一链（取消知识构建并等 OS 级收口 → 批准/轮询器
+    // → agent 池 → LAN 网关）；HTTP 随后关闭，CLI 端点最后撤销。
+    const shutdownReport = await shutdownServices(app);
+    if (shutdownReport && !shutdownReport.quiesced) {
+      // 修正轮：未 OS 级收口如实暴露——不删任何运行目录、不发裸 PID 信号，
+      // 保留现场交重启 reconcileOnStartup 对账。
+      console.warn('[server] close：kb 构建未确认收口（可能仍有活写者）——保留运行目录现场，不删除：',
+        `超时未收口=${shutdownReport.unsettled.join(',') || '无'}`,
+        `准入未返回=${shutdownReport.unsettledAdmissions.map((fact) => `${fact.operation}@${fact.startedAt}`).join(',') || '无'}`,
+        `终止未确认=${shutdownReport.unconfirmedTerminations.map((item) => `${item.buildId}(${item.source}:${item.note.slice(0, 120)})`).join(',') || '无'}`);
     }
     await new Promise<void>((resolve) => {
       let settled = false;
@@ -876,6 +872,73 @@ export async function startServer(options: CreateServerOptions & {
     port: actualPort,
     close,
   };
+}
+
+/**
+ * 服务级关闭（S12/F10/ENOTEMPTY quiescence）：startServer.close 与裸
+ * buildServer 消费方（测试/嵌入）共用的唯一 await 链。
+ *
+ * 顺序（业务 cancelled ≠ OS 退出，逐层等真实收口）：
+ * 1. 取消进行中的知识构建并等待流水线收口（KbBuildService.shutdown：
+ *    Leader 宽限终止 + 残留回收对账；子进程存活期间内部 API 仍可达）；
+ * 2. 取消全部 pending 批准（挂起的工具调用立即失败）；
+ * 3. 停云端回滚/移出轮询器（未收敛行留库内待重启对账）；
+ * 4. 回收 agent 会话池（SIGTERM → 3s → SIGKILL）；
+ * 5. 关 LAN MCP 网关。
+ * HTTP 监听与 CLI 端点撤销由 startServer.close 在本函数之后处理（裸
+ * buildServer 消费方自行关 HTTP）。
+ */
+export async function shutdownServices(app: Hono): Promise<KbShutdownReport | null> {
+  const kbBuild = (app as any).__kbBuildService as
+    | { shutdown: (store: unknown, options?: { timeoutMs?: number }) => Promise<KbShutdownReport> }
+    | undefined;
+  let kbReport: KbShutdownReport | null = null;
+  if (typeof kbBuild?.shutdown === 'function') {
+    try {
+      const report = await kbBuild.shutdown((app as any).__localMapStore, { timeoutMs: 120_000 });
+      kbReport = report;
+      // 修正轮：收口判定看 OS 级事实（持久/内存 termination-unconfirmed），
+      // 不把 cancelled/流水线完成当退出；报告返回给消费方（e2e/嵌入方）裁决。
+      if (!report.quiesced) {
+        console.warn('[server] kb build shutdown 未 OS 级收口（保留现场、不删运行目录，待重启对账）：',
+          `超时未收口=${report.unsettled.join(',') || '无'}`,
+          `准入未返回=${report.unsettledAdmissions.map((fact) => `${fact.operation}@${fact.startedAt}`).join(',') || '无'}`,
+          `终止未确认=${report.unconfirmedTerminations.map((item) => `${item.buildId}(${item.source}:${item.note.slice(0, 120)})`).join(',') || '无'}`);
+      }
+    } catch (error) {
+      console.warn('[server] kb build shutdown failed:', error);
+    }
+  }
+  // S10：先取消全部 pending 批准（挂起的工具调用立即失败），
+  // 再回收 pi 子进程。
+  const approvals = (app as any).__approvalService as { close: () => void } | undefined;
+  approvals?.close();
+  // P0-S4：停云端回滚轮询器（未收敛行留 revert_state='running'，重启对账续查）。
+  const cloudHistory = (app as any).__cloudHistoryService as { stopPoller: () => void } | undefined;
+  cloudHistory?.stopPoller();
+  // P2-S6：停移出轮询器（未收敛行留 state='moving'，重启对账续查）。
+  const cloudMoves = (app as any).__cloudMoveService as { stopPoller: () => void } | undefined;
+  cloudMoves?.stopPoller();
+  // 先回收 pi 子进程（SIGTERM → 3s → SIGKILL / Windows taskkill），
+  // 再关 HTTP：内部工具 API 必须在子进程存续期间可达。
+  const agentPool = (app as any).__agentPool as { closeAll: () => Promise<void> } | undefined;
+  if (agentPool?.closeAll) {
+    try {
+      await agentPool.closeAll();
+    } catch (error) {
+      console.warn('[server] agent pool close failed:', error);
+    }
+  }
+  // LAN MCP 网关（独立固定端口子进程；失败不阻断退出）。
+  const kbLanGateway = (app as any).__kbLanGateway as { close: () => Promise<void> } | undefined;
+  if (kbLanGateway) {
+    try {
+      await kbLanGateway.close();
+    } catch (error) {
+      console.warn('[server] LAN gateway close failed:', error);
+    }
+  }
+  return kbReport;
 }
 
 // ============================================================================

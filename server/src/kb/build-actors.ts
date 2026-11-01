@@ -83,9 +83,15 @@ export interface ReviewReceipt {
   reviewerTaskId: string;
   /** 审查时全部 staging 草稿的候选哈希（computeCandidateHash 同形） */
   draftHash: string;
-  /** 依赖哈希绑定：正文/对象/证据/来源（键名→sha256） */
+  /** 依赖哈希绑定：正文（doc:<path>）+ 对象/证据声明（knowledge-declaration）
+   * + 来源快照（source-snapshot）+ 冻结 workflow 规则（workflow-rules），
+   * 键名→sha256（F08：metadata-only 声明变化/来源漂移/规则漂移均使回执失效）。 */
   dependencyHashes: Record<string, string>;
   ruleVersion: string;
+  /** 报告文件绑定（F07）：unitId = reviews/<unitId>.json 文件名；reportId
+   * 与文件内 reportId 双向绑定（报告被覆盖/删除时回执不再覆盖候选）。 */
+  reportUnitId?: string;
+  reportId?: string;
   issues: Array<{
     issueId: string;
     severity: 'blocking' | 'suggestion';
@@ -570,9 +576,13 @@ export class BuildActorStore {
     const owner = this.requireConfirmedActor(input.ownerTaskId, undefined);
     const targetKind = input.targetKind ?? 'doc';
     const normalized = [...new Set(input.targets)];
-    // 冲突检查：目标已被其他活动任务持有 → 返回冲突与持有者（§4.2）
+    // 冲突检查：目标已被其他活动任务持有 → 返回冲突与持有者（§4.2）。
+    // F03：family 目标统一按 `family:<familyKey>` 归一化探测——targets 存储
+    // 已剥前缀，此前用剥前缀 key 探测导致同族分配互相不报冲突（归一化
+    // 仅收口在 activeAssignmentFor/activeFamilyAssignmentFor 两侧）。
     for (const target of normalized) {
-      const holder = this.activeAssignmentFor(target);
+      const probe = targetKind === 'family' ? `family:${target}` : target;
+      const holder = this.activeAssignmentFor(probe);
       if (holder && holder.ownerTaskId !== input.ownerTaskId) {
         throw new BuildActorError(
           'kb_output_assignment_conflict',
@@ -630,6 +640,28 @@ export class BuildActorStore {
       if (assignment.status !== 'active') continue;
       if (assignment.targetKind === 'doc' && assignment.targets.includes(target)) return assignment;
       if (assignment.targetKind === 'family' && target.startsWith('family:') && assignment.targets.includes(target.slice('family:'.length))) return assignment;
+    }
+    return null;
+  }
+
+  /** F03：familyKey 的活动分配探测（`family:` 前缀归一化唯一收口）。 */
+  activeFamilyAssignmentFor(familyKey: string): OutputAssignment | null {
+    return this.activeAssignmentFor(`family:${familyKey}`);
+  }
+
+  /** F03（对象声明影响面授权）：actor 是否对文档路径或对象族
+   * family:<familyKey> 持有当前有效分配。跨路径重申/迁移既有对象
+   * （clientKey 或 family 三元组命中沿用 objectId）时，写者须对旧主定义
+   * 文档或该对象族持有分配——两条显式授权通道任一命中即可（Leader 用
+   * build_assign_output 显式授予，合法迁移能力保留）。 */
+  authorizedForDeclarationTarget(nativeTaskId: string, target: { docPath?: string; familyKey?: string }): OutputAssignment | null {
+    if (target.docPath) {
+      const docAssignment = this.activeAssignmentFor(target.docPath);
+      if (docAssignment?.ownerTaskId === nativeTaskId) return docAssignment;
+    }
+    if (target.familyKey) {
+      const familyAssignment = this.activeFamilyAssignmentFor(target.familyKey);
+      if (familyAssignment?.ownerTaskId === nativeTaskId) return familyAssignment;
     }
     return null;
   }

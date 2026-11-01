@@ -11,9 +11,27 @@ import {
   DISPATCH_GUARD_SCHEMA_VERSION, freezeGuardConfig, guardTaskResume, guardTaskSubmit,
   validateGuardConfig, type FrozenDispatchConfig,
 } from '../src/agent/build-runtime/dispatch-guard.js';
+import { RUNTIME_INTEGRITY_SCHEMA_VERSION, type RuntimeIntegrityRefs } from '../src/agent/build-runtime/runtime-integrity.js';
 import { createHash } from 'node:crypto';
 
 const WORK_DIR = '/data/builds/b_demo/work';
+
+/** F12 完整性引用 fixture（形状合法；触盘核验在 build-runtime-integrity.test 覆盖）。 */
+function makeIntegrity(): RuntimeIntegrityRefs {
+  return {
+    schemaVersion: RUNTIME_INTEGRITY_SCHEMA_VERSION,
+    homeDir: '/data/builds/b_demo/home',
+    expectedFiles: {
+      settings: '{"packages":[]}\n',
+      amagi: '{"agents":{}}\n',
+      models: '{"providers":{}}\n',
+      mcp: '{"mcpServers":{}}\n',
+    },
+    childPolicy: { fileName: `child-policy-${'a'.repeat(12)}.js`, sha256: 'b'.repeat(64) },
+    amagiPackage: { packageRoot: '/data/agent/runtime-packages/amagi-pi@2.21.31/package', contentHash: 'c'.repeat(64) },
+    workflowSkill: { path: '/data/skills/kb-build/SKILL.md', sha256: 'd'.repeat(64) },
+  };
+}
 
 function makeConfig(overrides: Partial<FrozenDispatchConfig> = {}): FrozenDispatchConfig {
   return freezeGuardConfig({
@@ -26,6 +44,7 @@ function makeConfig(overrides: Partial<FrozenDispatchConfig> = {}): FrozenDispat
       diting: { key: 'reviewer', models: ['zhipuai/glm-5.3'], mcpTools: ['kb_read_sources', 'kb_submit_review'] },
       baize: { key: 'research', models: ['zhipuai/glm-5.3'], mcpTools: ['kb_read_sources'] },
     },
+    integrity: makeIntegrity(),
     ...overrides,
   });
 }
@@ -36,11 +55,61 @@ describe('validateGuardConfig / freezeGuardConfig', () => {
     expect(() => freezeGuardConfig({
       buildId: 'b_x', generation: 1, workDir: 'relative/path', forbiddenZones: [],
       roles: { luban: { key: 'writer', models: [], mcpTools: [] } },
+      integrity: makeIntegrity(),
     })).toThrow('workDir');
   });
 
-  it('schemaVersion 冻结', () => {
+  it('schemaVersion 冻结（v2：integrity 必填）', () => {
     expect(makeConfig().schemaVersion).toBe(DISPATCH_GUARD_SCHEMA_VERSION);
+    expect(DISPATCH_GUARD_SCHEMA_VERSION).toBe(2);
+  });
+
+  it('F12：integrity 缺失/形状非法 → 信封整体非法（旧代次信封 fail-closed）', () => {
+    const noIntegrity = { ...makeConfig() } as Partial<FrozenDispatchConfig>;
+    delete noIntegrity.integrity;
+    expect(validateGuardConfig(noIntegrity as FrozenDispatchConfig).join('\n')).toContain('integrity 缺失');
+    const badShape = { ...makeConfig(), integrity: { ...makeIntegrity(), childPolicy: { fileName: 'evil.js', sha256: 'zz' } } };
+    expect(validateGuardConfig(badShape).join('\n')).toContain('childPolicy.fileName');
+    const badHome = { ...makeConfig(), integrity: { ...makeIntegrity(), homeDir: 'relative/home' } };
+    expect(validateGuardConfig(badHome).join('\n')).toContain('homeDir');
+    expect(() => freezeGuardConfig({
+      buildId: 'b_x', generation: 1, workDir: WORK_DIR, forbiddenZones: [],
+      roles: { luban: { key: 'writer', models: [], mcpTools: [] } },
+      // @ts-expect-error 旧代次输入形状（无 integrity）应被拒
+      integrity: undefined,
+    })).toThrow('integrity');
+  });
+
+  it('F13：workDir 绝对路径判定与宿主平台一致（POSIX 宿主拒绝 Windows 盘符字符串）', () => {
+    const windowsWorkDir = {
+      buildId: 'b_x', generation: 1, workDir: 'C:\\build\\work', forbiddenZones: [],
+      roles: { luban: { key: 'writer', models: [], mcpTools: [] } },
+      integrity: makeIntegrity(),
+    };
+    if (process.platform !== 'win32') {
+      // POSIX 宿主：盘符字符串不是本机合法绝对路径 → 拒绝（不把 Windows 字符串当本机路径）
+      expect(() => freezeGuardConfig(windowsWorkDir)).toThrow('workDir');
+    } else {
+      // win32 真机分支（本仓未在 Windows 真机跑过，静态形状断言）
+      expect(validateGuardConfig(freezeGuardConfig(windowsWorkDir))).toEqual([]);
+    }
+  });
+
+  it('F13：分隔符规范化比较——混合分隔符条目不逃逸同目录 workDir（Windows 路径形态数据；非宿主验证）', () => {
+    // 绕过 freezeGuardConfig 的宿主平台校验（guardTaskSubmit 不重复校验，只做路径比较）
+    const config: FrozenDispatchConfig = { ...makeConfig(), workDir: 'C:\\data\\builds\\b_demo\\work' };
+    expect(guardTaskSubmit(config, {
+      agent: 'luban', task: 'x',
+      workspace: { cwd: 'C:/data/builds/b_demo/work/sub', mode: 'existing' },
+    }).decision).toBe('allow');
+    const blocked = guardTaskSubmit(config, {
+      agent: 'luban', taskFile: 'C:/data/builds/b_demo/work/../escape.md',
+    }) as { decision: string };
+    expect(blocked.decision).toBe('block');
+    const inside = guardTaskSubmit(config, {
+      agent: 'luban', taskFile: 'C:\\data\\builds\\b_demo\\work\\docs\\task.md',
+    }) as { decision: string };
+    expect(inside.decision).toBe('allow');
   });
 });
 

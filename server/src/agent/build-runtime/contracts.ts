@@ -132,6 +132,12 @@ export interface BuildLimits {
 
 export const DEFAULT_LEADER_TERMINATE_GRACE_MS = 10_000;
 
+/**
+ * F10：子进程回收宽限（SIGTERM → 等待 → 复核身份 → SIGKILL）。
+ * 与 amagi 自身清理链同量级（TERM→2s→KILL），覆盖其内部清理窗口。
+ */
+export const DEFAULT_CHILD_REAP_GRACE_MS = 3_000;
+
 /** 版本化 amagi-pi 安装记录（见 amagi-package.ts）。 */
 export interface AmagiPackageRef {
   /** 包版本（npm 固定版本号）。 */
@@ -171,17 +177,42 @@ export interface BuildRunSpec {
   publicationPolicy: 'auto' | 'manual';
 }
 
-/** 定位一次运行与其恢复方式（设计 §8）。 */
+/** 定位一次运行与其恢复方式（设计 §8；F09：epoch/launch 身份持久化）。 */
 export interface RuntimeBinding {
   buildId: string;
   generation: number;
+  /**
+   * F09：运行 epoch（Pi 会话/amagi 内部库边界）。fresh 从 1 起；成果级 rebuild
+   * 递增；原会话续接保持不变。每个 epoch 独立 home/work/sessions 与全新
+   * amagi 内部存储（v2-store/process-audits），rebuild 不复用旧会话或内部库。
+   * 旧检查点缺省 undefined → 按 legacy 布局（<buildRoot>/home|work）解释。
+   */
+  runtimeEpoch?: number;
+  /**
+   * F09：每次进程启动身份（同一 epoch 内多次启动各异；进程账本关联键）。
+   * 业务租约是 generation，进程边界是 runtimeEpoch，单次启动是 launchId——
+   * 三者分开，不用 generation 冒充进程身份。
+   */
+  launchId: string;
   /** 构建 agentDir（PI_CODING_AGENT_DIR）。 */
   agentDir: string;
   /** Leader 与子任务工作目录。 */
   workDir: string;
-  /** Leader 会话 id（pi --session-id；恢复依据）。 */
+  /** F09：会话目录持久化（resume 路径核对；legacy binding 可能缺省）。 */
+  sessionDir: string | null;
+  /** Leader 会话 id（pi --session-id；epoch 内稳定，rebuild 换新）。 */
   leaderSessionId: string | null;
   leaderPid: number | null;
+  /**
+   * F09：Leader 进程启动时刻（ISO）。pid 复用评估与残留核对的时间基准；
+   * 只作对账参考，不单独作为身份证明。
+   */
+  leaderStartedAt?: string | null;
+  /**
+   * F10：本绑定最近一次终止对账结果（持久化在检查点；unconfirmed 阻断
+   * 第二个 Leader——换 epoch 也不能绕过）。null=尚未终止或已确认清理。
+   */
+  termination?: TerminationOutcome | null;
   resumeCapability: BuildResumeCapability;
 }
 
@@ -229,13 +260,46 @@ export interface CapabilityReport {
   checkedAt: string;
 }
 
-/** 取消结果（设计 §9）。 */
+/**
+ * F10：子进程/桥残留核对的单个个体结论。
+ * verdict 语义：exited=已证明退出（自然退出或 pid 复用排除）；reaped=核对身份
+ * 后回收；not-ours=身份不匹配（pid 被无关进程复用，绝不发信号）；
+ * unconfirmed=无法证明归属或退出——不杀、不假装已退出，阻断新 Leader。
+ */
+export interface ChildProcessFinding {
+  /** amagi 原生任务 id（anchor 来源；ledger 来源时为 null）。 */
+  taskId: string | null;
+  pid: number;
+  /** 证据来源：anchor=受信原生启动锚点；ledger=应用进程账本；v2-store=派发意图扫描。 */
+  source: 'anchor' | 'ledger' | 'v2-store';
+  verdict: 'exited' | 'reaped' | 'not-ours' | 'unconfirmed';
+  /** 身份证明等级：birth-token=内核出生令牌精确匹配；pgid-invariant=POSIX
+   * 进程组不变量（组长 pid 存续期间不复用）；none=无可用证明。 */
+  proof: 'birth-token' | 'pgid-invariant' | 'none';
+  detail: string;
+}
+
+/** F10：终止对账结果（随 CancelResult/检查点持久化；贯穿 supervisor/host）。 */
+export interface TerminationOutcome {
+  /** confirmed=全部已知个体已证明退出；unconfirmed=存在未证明个体（阻断新 Leader）。 */
+  state: 'confirmed' | 'unconfirmed';
+  at: string;
+  /** Leader 退出事实（不可得时 null，不伪称）。 */
+  leaderExit: { code: number | null; signal: string | null } | null;
+  /** 子进程/桥个体结论明细。 */
+  children: ChildProcessFinding[];
+  note: string;
+}
+
+/** 取消结果（设计 §9；F10 增补终止对账）。 */
 export interface CancelResult {
   leaderExit: { code: number | null; signal: string | null } | null;
   /** 凭据是否已按代次撤销（由注入的撤销钩子回报）。 */
   credentialsRevoked: boolean;
   /** 残留子进程处置说明；amagi 子进程由其自身 TERM→KILL 链收口。 */
   residualNote: string;
+  /** F10：结构化终止对账（unconfirmed 时消费方必须阻断第二 Leader）。 */
+  termination?: TerminationOutcome | null;
 }
 
 /** 恢复检查点（应用侧持久化结构的最小面；内容归接线切片扩展）。 */
@@ -249,13 +313,25 @@ export interface BuildCheckpoint {
   eventCursor: string | null;
 }
 
+/** start 的 epoch 输入（F09：epoch 由集成方按检查点分配，adapter 不自行递增）。 */
+export interface AdapterStartOptions {
+  /** 运行 epoch（≥1；fresh=1，rebuild=检查点 epoch+1；缺省按 1 处理）。 */
+  runtimeEpoch?: number;
+}
+
 /** 运行适配层唯一入口（设计 §8；不新增 scheduleTasks/角色队列）。 */
 export interface BuildRuntimeAdapter {
   probe(input: ProbeInput): Promise<CapabilityReport>;
-  start(spec: BuildRunSpec): Promise<RuntimeBinding>;
+  start(spec: BuildRunSpec, options?: AdapterStartOptions): Promise<RuntimeBinding>;
   observe(binding: RuntimeBinding, after?: string): AsyncIterable<RuntimeEvent>;
   resume(binding: RuntimeBinding, checkpoint: BuildCheckpoint): Promise<RuntimeBinding>;
   cancel(binding: RuntimeBinding): Promise<CancelResult>;
+  /**
+   * F10：残留对账（observe/reap）。读取受信原生启动锚点 + 应用进程账本，
+   * 以 OS 出生身份/进程组不变量交叉核验后回收可证明个体；无法证明的个体
+   * 不发信号，返回 unconfirmed。reap=true 时才允许对已证明个体发信号。
+   */
+  reconcileResiduals(binding: RuntimeBinding, options?: { reap?: boolean }): Promise<TerminationOutcome>;
 }
 
 /** probe 输入：运行时定位 + 应用侧路径与凭据可用性（不含密钥值）。 */

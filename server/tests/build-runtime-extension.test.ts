@@ -22,6 +22,11 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { PiRuntimeResolver } from '../src/agent/runtime-resolver.js';
 import { buildDefaultAgentConfig } from '../src/types/agent-knowledge.js';
 import { PiRpcProcess } from '../src/agent/pi-rpc-process.js';
+import { computePackageContentHash } from '../src/agent/build-runtime/amagi-package.js';
+import { renderChildPolicySource } from '../src/agent/build-runtime/child-policy.js';
+import { RUNTIME_INTEGRITY_SCHEMA_VERSION, type RuntimeIntegrityRefs } from '../src/agent/build-runtime/runtime-integrity.js';
+import { createHash } from 'node:crypto';
+import type { FrozenDispatchConfig } from '../src/agent/build-runtime/dispatch-guard.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const EXTENSION_PATH = path.join(HERE, '../src/agent/pi-extension/feishu-sync-agent.js');
@@ -116,9 +121,50 @@ function fakePi(externalTools: { name: string; sourceInfo?: { path?: string } }[
   return { pi, state };
 }
 
+// ── F12 完整性 fixture：真实磁盘（homeDir/四配置/policy/包）供 verifyRuntimeIntegrity 触盘比对 ──
+// 形状刻意最小（settings 不声明 extensions——派发期核验不做该交叉检查，真实渲染形状的
+// 全量验证在 build-runtime-integrity.test 用 renderAgentDirConfigFiles+writeAgentDirConfig 覆盖）。
+const INTEGRITY_TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-ext-integrity-'));
+
+function buildIntegrityFixture(): RuntimeIntegrityRefs {
+  const homeDir = path.join(INTEGRITY_TMP, 'home');
+  fs.mkdirSync(homeDir, { recursive: true });
+  const expectedFiles = {
+    settings: `${JSON.stringify({ $schema: 'https://pi.dev/schemas/settings.schema.json', packages: [] }, null, 2)}\n`,
+    amagi: '{"agents":{}}\n',
+    models: '{"providers":{}}\n',
+    mcp: '{"mcpServers":{},"autoEnableCodemode":false}\n',
+  };
+  const policySource = renderChildPolicySource();
+  const sha256 = createHash('sha256').update(policySource, 'utf-8').digest('hex');
+  const fileName = `child-policy-${sha256.slice(0, 12)}.js`;
+  fs.writeFileSync(path.join(homeDir, fileName), policySource, { mode: 0o600 });
+  fs.writeFileSync(path.join(homeDir, 'settings.json'), expectedFiles.settings);
+  fs.writeFileSync(path.join(homeDir, 'amagi.json'), expectedFiles.amagi);
+  fs.writeFileSync(path.join(homeDir, 'models.json'), expectedFiles.models);
+  fs.writeFileSync(path.join(homeDir, 'mcp.json'), expectedFiles.mcp);
+  const packageRoot = path.join(INTEGRITY_TMP, 'fixture-pkg');
+  fs.mkdirSync(path.join(packageRoot, 'extensions', 'amagi-core'), { recursive: true });
+  fs.writeFileSync(path.join(packageRoot, 'extensions', 'amagi-core', 'index.ts'), '// fixture package\n');
+  const { contentHash } = computePackageContentHash(packageRoot);
+  // Leader steer：冻结工作流规则实文件（child 读此文件、F08 回执绑 workflowRevision）
+  const skillPath = path.join(INTEGRITY_TMP, 'skill', 'SKILL.md');
+  fs.mkdirSync(path.dirname(skillPath), { recursive: true });
+  fs.writeFileSync(skillPath, '---\nname: kb-build\ndescription: fixture。\n---\n\n# 内容质量基线\n');
+  const skillSha256 = createHash('sha256').update(fs.readFileSync(skillPath)).digest('hex');
+  return {
+    schemaVersion: RUNTIME_INTEGRITY_SCHEMA_VERSION,
+    homeDir,
+    expectedFiles,
+    childPolicy: { fileName, sha256 },
+    amagiPackage: { packageRoot, contentHash },
+    workflowSkill: { path: skillPath, sha256: skillSha256 },
+  };
+}
+
 /** FrozenDispatchConfig fixture（形状=运行时 contracts；角色模型为精确名单，含 thinking 档位）。 */
-const GUARD_CONFIG = {
-  schemaVersion: 1,
+const GUARD_CONFIG: FrozenDispatchConfig = {
+  schemaVersion: 2,
   buildId: 'b_fixture',
   generation: 1,
   workDir: `${os.tmpdir()}/feishu-build-fixture/work`,
@@ -129,7 +175,8 @@ const GUARD_CONFIG = {
     diting: { key: 'reviewer', models: ['zhipuai/glm-5.3'], mcpTools: ['kb_submit_review'] },
     baize: { key: 'research', models: ['zhipuai/glm-5.3'], mcpTools: [] },
   },
-} as const;
+  integrity: buildIntegrityFixture(),
+};
 
 const BUILD_TOOLS = ['task_submit', 'task_query', 'task_control', 'task_resume', 'amagi_resource', 'kb_build_probe'];
 
@@ -174,12 +221,15 @@ describe('A1 parseBuildSpecEnvelope（信封校验，fail closed）', () => {
 });
 
 /** A2/A3 共用：装载构建模式 factory（真实运行时 dispatch-guard 模块注入）。 */
-async function loadBuildFactory(specJson: string, guardModule: string, mockApiUrl: string) {
+async function loadBuildFactory(specJson: string, guardModule: string, mockApiUrl: string, extraEnv: Record<string, string> = {}) {
   const mod = await loadExtension({
     FEISHU_SYNC_AGENT_URL: mockApiUrl,
     FEISHU_SYNC_AGENT_RUN_TOKEN: 'fixture-token',
     FEISHU_SYNC_AGENT_BUILD_SPEC_JSON: specJson,
     FEISHU_SYNC_BUILD_GUARD_MODULE: guardModule,
+    // F12 接线：Leader agentDir 与冻结引用一致性（派发钩子逐次核对）
+    PI_CODING_AGENT_DIR: GUARD_CONFIG.integrity.homeDir,
+    ...extraEnv,
   });
   return mod;
 }
@@ -259,6 +309,145 @@ describe('A2 守卫接缝（真实运行时 dispatch-guard 语义经扩展 tool_
     expect('scope' in smuggled).toBe(false);
     expect('workspace' in smuggled).toBe(false);
     expect('profile' in smuggled).toBe(false);
+  });
+});
+
+describe('A2b F12 派发前运行期完整性重核验（真实磁盘 fixture，逐次派发触盘比对）', () => {
+  const guardModule = resolveDispatchGuardModule();
+  beforeAll(() => {
+    if (!guardModule) console.warn('[build-runtime-extension] 未定位到运行时 dispatch-guard 模块，A2b 跳过');
+  });
+
+  /** 装载 factory 并返回 tool_call handler（可覆盖 env / guard）。 */
+  async function integrityHandler(opts: { env?: Record<string, string>; guard?: FrozenDispatchConfig } = {}) {
+    if (!guardModule) return null;
+    const api = await startMockApi([
+      { name: 'task_submit', label: 'App task', description: '应用 task 工具（构建模式跳过注册）', parameters: { type: 'object' } },
+      { name: 'kb_build_probe', label: '构建', description: '应用构建工具', parameters: { type: 'object' } },
+    ]);
+    try {
+      const mod = await loadBuildFactory(
+        JSON.stringify({ tools: BUILD_TOOLS, guard: opts.guard ?? GUARD_CONFIG }),
+        guardModule,
+        api.url,
+        opts.env,
+      );
+      const fake = fakePi();
+      await mod.default(fake.pi);
+      return { handler: fake.state.handlers.tool_call[0] };
+    } finally {
+      await api.close();
+    }
+  }
+
+  it('基线：冻结面完整时派发照常进入参数守卫（guard_amended 语义不变）', async () => {
+    const wired = await integrityHandler();
+    if (!wired) return;
+    expect(wired.handler({ toolName: 'task_submit', input: { agent: 'luban', task: 'x' } })).toBeUndefined();
+  });
+
+  it('policy 缺失 → 阻断派发（issue 点名 child-policy；不是只测 helper 返回 false）', async () => {
+    const wired = await integrityHandler();
+    if (!wired) return;
+    const policyPath = path.join(GUARD_CONFIG.integrity.homeDir, GUARD_CONFIG.integrity.childPolicy.fileName);
+    const backup = fs.readFileSync(policyPath, 'utf-8');
+    try {
+      fs.rmSync(policyPath);
+      const blocked = wired.handler({ toolName: 'task_submit', input: { agent: 'luban', task: 'x' } }) as { block: boolean; reason: string };
+      expect(blocked.block).toBe(true);
+      expect(blocked.reason).toContain('runtime_integrity_violation');
+      expect(blocked.reason).toContain('child-policy');
+    } finally {
+      fs.writeFileSync(policyPath, backup, { mode: 0o600 });
+    }
+  });
+
+  it('settings 资源注入（未知字段 resources）→ 阻断派发', async () => {
+    const wired = await integrityHandler();
+    if (!wired) return;
+    const settingsPath = path.join(GUARD_CONFIG.integrity.homeDir, 'settings.json');
+    const backup = fs.readFileSync(settingsPath, 'utf-8');
+    try {
+      fs.writeFileSync(settingsPath, `${JSON.stringify({ ...JSON.parse(backup), resources: ['evil-skill'] }, null, 2)}\n`);
+      const blocked = wired.handler({ toolName: 'task_resume', input: { handle: 'h1', message: 'm' } }) as { block: boolean; reason: string };
+      expect(blocked.block).toBe(true);
+      expect(blocked.reason).toContain('未知字段 resources');
+    } finally {
+      fs.writeFileSync(settingsPath, backup);
+    }
+  });
+
+  it('settings 移除冻结键（packages）→ 阻断；retry 容忍形状不阻断（与 agentDirConfigMatchesSpec 同口径）', async () => {
+    const wired = await integrityHandler();
+    if (!wired) return;
+    const settingsPath = path.join(GUARD_CONFIG.integrity.homeDir, 'settings.json');
+    const backup = fs.readFileSync(settingsPath, 'utf-8');
+    try {
+      const noPackages = { ...JSON.parse(backup) } as Record<string, unknown>;
+      delete noPackages.packages;
+      fs.writeFileSync(settingsPath, `${JSON.stringify(noPackages, null, 2)}\n`);
+      const removed = wired.handler({ toolName: 'task_submit', input: { agent: 'luban', task: 'x' } }) as { block: boolean; reason: string };
+      expect(removed.block).toBe(true);
+      expect(removed.reason).toContain('packages');
+      // doctor 写入的 retry 容忍形状：照常放行
+      fs.writeFileSync(settingsPath, `${JSON.stringify({ ...JSON.parse(backup), retry: { provider: { timeoutMs: 180000 } } }, null, 2)}\n`);
+      expect(wired.handler({ toolName: 'task_submit', input: { agent: 'luban', task: 'x' } })).toBeUndefined();
+    } finally {
+      fs.writeFileSync(settingsPath, backup);
+    }
+  });
+
+  it('包内容漂移（新增文件改变全量哈希）→ 阻断派发', async () => {
+    const wired = await integrityHandler();
+    if (!wired) return;
+    const injected = path.join(GUARD_CONFIG.integrity.amagiPackage.packageRoot, 'injected.ts');
+    try {
+      fs.writeFileSync(injected, '// tamper\n');
+      const blocked = wired.handler({ toolName: 'task_submit', input: { agent: 'luban', task: 'x' } }) as { block: boolean; reason: string };
+      expect(blocked.block).toBe(true);
+      expect(blocked.reason).toContain('哈希漂移');
+    } finally {
+      fs.rmSync(injected);
+    }
+  });
+
+  it('workflow skill 运行中篡改 → 阻断派发（Leader steer 冻结资源接缝）', async () => {
+    const wired = await integrityHandler();
+    if (!wired) return;
+    const skillPath = GUARD_CONFIG.integrity.workflowSkill.path;
+    const backup = fs.readFileSync(skillPath, 'utf-8');
+    try {
+      fs.writeFileSync(skillPath, `${backup}\n<!-- 运行中注入的规则改动 -->`);
+      const blocked = wired.handler({ toolName: 'task_submit', input: { agent: 'luban', task: 'x' } }) as { block: boolean; reason: string };
+      expect(blocked.block).toBe(true);
+      expect(blocked.reason).toContain('workflow skill 内容与冻结 workflowRevision 不一致');
+    } finally {
+      fs.writeFileSync(skillPath, backup);
+    }
+  });
+
+  it('Leader agentDir 与冻结引用不一致 → 装载即 fail-closed（PI_CODING_AGENT_DIR 交叉核对）', async () => {
+    if (!guardModule) return;
+    // 启动面即拒绝（不再等到派发）：agentDir 不一致时 Leader 根本不起来
+    await expect((async () => {
+      const mod = await loadBuildFactory(
+        JSON.stringify({ tools: BUILD_TOOLS, guard: GUARD_CONFIG }),
+        guardModule,
+        'http://127.0.0.1:9',
+        { PI_CODING_AGENT_DIR: '/elsewhere/home' },
+      );
+      await mod.default(fakePi().pi);
+    })()).rejects.toThrow(/agentDir/);
+  });
+
+  it('旧代次信封（无 integrity）→ 装载即 fail-closed（validateGuardConfig 拒绝）', async () => {
+    if (!guardModule) return;
+    const legacy = { ...GUARD_CONFIG, schemaVersion: 1 } as Partial<FrozenDispatchConfig>;
+    delete legacy.integrity;
+    await expect((async () => {
+      const mod = await loadBuildFactory(JSON.stringify({ tools: BUILD_TOOLS, guard: legacy }), guardModule, 'http://127.0.0.1:9');
+      await mod.default(fakePi().pi);
+    })()).rejects.toThrow(/integrity/);
   });
 });
 
@@ -360,6 +549,7 @@ afterAll(async () => {
   // amagi 终态诊断文件可能在子进程退出通知后完成；仅清理阶段允许有界重试，
   // 不把异步落盘竞争误判为工具授权断言失败。持续写入仍会令清理失败。
   await fs.promises.rm(bRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  await fs.promises.rm(INTEGRITY_TMP, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 const bPiAvailable = () => Boolean(bRuntime?.nodePath && bRuntime?.piCliPath);
@@ -463,6 +653,8 @@ export default function (pi) {
     const guardConfig = { ...GUARD_CONFIG, workDir };
     const env = baseLeaderEnv(bRoot, {
       PROBE_DIR: bRoot,
+      // F12：派发前完整性重核验需要 Leader agentDir 与冻结引用一致且磁盘完整
+      PI_CODING_AGENT_DIR: GUARD_CONFIG.integrity.homeDir,
       FEISHU_SYNC_AGENT_URL: api.url,
       FEISHU_SYNC_AGENT_RUN_TOKEN: 'fixture-token',
       FEISHU_SYNC_AGENT_API_KEY: 'fixture-key',
@@ -563,6 +755,8 @@ describe('B2 真实 amagi-core 派发（守卫改参落入 amagi 冻结契约）
     };
     const env = baseLeaderEnv(bRoot, {
       FEISHU_SYNC_AGENT_URL: api.url,
+      // F12：派发前完整性重核验（agentDir 与冻结引用一致 + 磁盘完整；v2-store 也落在该 home）
+      PI_CODING_AGENT_DIR: GUARD_CONFIG.integrity.homeDir,
       FEISHU_SYNC_AGENT_RUN_TOKEN: 'fixture-token',
       FEISHU_SYNC_AGENT_API_KEY: 'fixture-key',
       FEISHU_SYNC_AGENT_PROVIDER_JSON: JSON.stringify({ api: 'openai-completions', baseUrl: `${openai.url}/v1`, models: [
@@ -608,7 +802,7 @@ describe('B2 真实 amagi-core 派发（守卫改参落入 amagi 冻结契约）
       expect(declared).not.toContain('bash');
       // 2) 守卫改参后 amagi 真实冻结契约：仅一个任务（两次越界被拦截未建任务）
       const specFiles: { file: string; spec: Record<string, any> }[] = [];
-      const v2Root = path.join(agentDir, 'amagi', 'v2-store');
+      const v2Root = path.join(GUARD_CONFIG.integrity.homeDir, 'amagi', 'v2-store');
       if (fs.existsSync(v2Root)) {
         for (const entry of fs.readdirSync(v2Root)) {
           const taskDir = path.join(v2Root, entry);

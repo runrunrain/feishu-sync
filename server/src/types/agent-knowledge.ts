@@ -6,7 +6,7 @@
  * LocalMapStore / 路由层共享。
  */
 
-import type { BuildRunSpec, RuntimeBinding } from '../agent/build-runtime/contracts.js';
+import type { BuildRunSpec, RuntimeBinding, TerminationOutcome } from '../agent/build-runtime/contracts.js';
 import type { BuildActorCheckpointPayload } from '../kb/build-actors.js';
 
 // ============================================================================
@@ -609,6 +609,9 @@ export interface LeaderActorRecord {
   nativeTaskId: string;
   parentTaskId: string | null;
   generation: number;
+  /** F09：登记时的运行 epoch（旧记录缺省；跨 epoch 旧任务仅作历史，
+   * 不参与当前活跃/idle 判定）。 */
+  runtimeEpoch?: number;
   role: string;
   status: 'pending' | 'confirmed' | 'revoked';
   execState: string | null;
@@ -645,6 +648,9 @@ export interface LeaderRunCheckpointState {
   schemaVersion: 2;
   orchestrationMode: 'pi-amagi';
   generation: number;
+  /** F09：运行 epoch（Pi 会话/amagi 内部库边界；fresh=1、rebuild 递增、
+   * 原会话续接不变；旧检查点缺省 → legacy 目录布局解释）。 */
+  runtimeEpoch?: number;
   spec: BuildRunSpec;
   /** 材料冻结面（恢复时与当前快照/基准比对；不一致拒绝恢复） */
   material: LeaderRunMaterial;
@@ -656,6 +662,11 @@ export interface LeaderRunCheckpointState {
   /** BuildActorStore.exportCheckpointPayload() 全量（回执/审查/分配/交接/
    * 问题清单/发布申请；恢复兜底用，文件才是权威） */
   actorPayload: BuildActorCheckpointPayload | null;
+  /** F15：轮次计数持久化（跨恢复累计；旧检查点缺省 → 未知，不得回退为 0/0）。 */
+  rounds?: { started: number; ended: number } | null;
+  /** F10：最近一次终止对账（unconfirmed 阻断第二 Leader，换 epoch 也不能
+   * 绕过；旧检查点缺省 → 无终止记录，不伪造）。 */
+  termination?: TerminationOutcome | null;
   /** 空闲提醒只发一次（再空闲即 leader_idle） */
   idleRemindedAt: string | null;
   publishRequest: LeaderPublishRequestSnapshot | null;
@@ -676,6 +687,8 @@ export interface LeaderRunProgressDto {
   buildId: string;
   orchestrationMode: 'pi-amagi';
   generation: number;
+  /** F09：当前运行 epoch（旧检查点缺省 → null；历史任务按 task.runtimeEpoch 过滤）。 */
+  runtimeEpoch: number | null;
   leader: {
     sessionId: string | null;
     pid: number | null;
@@ -690,10 +703,25 @@ export interface LeaderRunProgressDto {
     status: LeaderActorRecord['status'];
     execState: string | null;
     lastEventAt: string;
+    /** F09：登记时 epoch/generation（历史任务 ≠ 当前 runtimeEpoch，前端不得计入当前并发）。 */
+    runtimeEpoch: number | null;
+    generation: number;
   }>;
-  rounds: { started: number; ended: number };
+  rounds: { started: number; ended: number } | null;
   idle: { remindedAt: string | null; lastActivityAt: string | null };
   publishRequest: LeaderPublishRequestSnapshot | null;
+  /**
+   * F10：进程终止对账安全摘要（不含个体合令牌等细节）。unconfirmed 时
+   * termination='termination-unconfirmed' 且恢复受阻（前端需显式提示）。
+   * null=无终止记录（运行中或旧检查点）。
+   */
+  processTermination: {
+    state: 'confirmed' | 'unconfirmed';
+    at: string;
+    note: string;
+    /** 未确认个体 pid（含 pid 未知项的 0 占位）；空=全部收口。 */
+    unconfirmedPids: number[];
+  } | null;
   /** 成果/问题/用量汇总（来源 actorStore 与 runtime 事件；无可靠来源=null） */
   summary: {
     /** 已接受文档数（actorStore 回执去重 paths） */
@@ -712,7 +740,12 @@ export interface LeaderRunProgressDto {
   endedReason: string | null;
   /** 终止状态（监督视角）：cancelling=已请求取消未落地；finished=已结束；
    * none=运行中；无可靠来源（仅检查点）时 null，不虚构 */
-  termination?: 'none' | 'cancelling' | 'finished' | null;
+  /**
+   * 终止状态：none=运行中；cancelling=取消已请求；finished=已结束且对账无
+   * 未确认项；termination-unconfirmed（F10）=已结束但终止对账未确认（恢复
+   * 受阻，需人工确认残留）——优先于 finished 呈现，不把未确认回收当完成。
+   */
+  termination?: 'none' | 'cancelling' | 'finished' | 'termination-unconfirmed' | null;
   /** 冻结工作流 skill（构建专用物化：路径 + 内容哈希=workflowRevision；供 probe/UI 核对） */
   skill?: { path: string; revision: string } | null;
   eventCursor: Record<string, string>;

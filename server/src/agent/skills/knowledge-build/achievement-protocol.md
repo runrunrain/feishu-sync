@@ -10,12 +10,12 @@
 
 ## 交接记录（handoff）
 
-子任务完成或受阻时提交交接记录，字段：
+子任务完成或受阻时经 `build_handoff_submit` 提交交接记录（`operationId` 幂等；`summary` 必填），字段：
 
-- `artifacts`：成果引用（文档路径 + revision、对象 ID、审查报告 ID）。
-- `sourceScope`：本次覆盖的来源（objToken 列表或章节范围）。
+- `artifactRefs`：成果引用（文档路径或路径@revision、对象 ID、审查报告 ID）。
+- `sourceScope`：本次覆盖的来源（objToken 列表）。
 - `openIssues`：未解决问题（含依赖与影响面描述）。
-- `needsFromLeader`：下一步所需信息或裁定。
+- `nextInfo`：下一步所需信息或建议（调用示例见 `mcp-examples.md`）。
 
 正文留在应用候选区；交接只携带可回读引用与必要摘要。
 

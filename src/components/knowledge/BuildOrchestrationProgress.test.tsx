@@ -34,7 +34,7 @@ import { APIError } from '../../api/client';
 (globalThis as unknown as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
 const host = document.createElement('div');
 document.body.appendChild(host);
-let root: Root = createRoot(host);
+let root: Root;
 
 function makeTask(over: Partial<KbBuildOrchestrationTaskDto> = {}): KbBuildOrchestrationTaskDto {
   return {
@@ -158,8 +158,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  act(() => root.unmount());
-  root = createRoot(host);
+  act(() => root?.unmount());
 });
 
 it('任务流水按角色分组渲染：三轴徽标、等待原因、修订轮次/预算、阻断计数', async () => {
@@ -394,6 +393,62 @@ describe('v2 Leader 监督运行进度（真实契约 GET /api/kb/builds/:id/lea
     // 累计用量恒未知（不假累加）的诚实声明。
     expect(host.querySelector('[data-testid="kb-runtime-mode-note"]')?.textContent)
       .toContain('累计用量');
+  });
+
+  it.each([null, { started: null, ended: null }])('终局只显示历史并发，缺失轮次为未知而不是0/0（%#）', async (rounds) => {
+    api.getKbBuildLeaderProgress.mockResolvedValue(makeLeader({
+      termination: 'finished',
+      rounds,
+      tasks: [makeLeaderTask({ execState: 'running' })],
+    }));
+    await act(async () => {
+      root = createRoot(host);
+      root.render(<BuildOrchestrationProgress build={makeBuild({ id: 'kb-v2', status: 'published', orchestrationMode: 'pi-amagi' })} />);
+    });
+    const summary = host.querySelector('[data-testid="kb-runtime-summary"]');
+    expect(summary?.textContent).toContain('末次观测并发');
+    expect(summary?.textContent).toContain('非当前活跃');
+    expect(summary?.textContent).not.toContain('实际并发');
+    expect(host.querySelector('[data-testid="kb-runtime-leader"]')?.textContent).toContain('轮次 未知/未知');
+    expect(host.querySelector('[data-testid="kb-runtime-task"]')?.getAttribute('data-exec')).toBe('stopped');
+  });
+
+  it('旧epoch/代次任务仅作历史，不计当前计划与并发', async () => {
+    api.getKbBuildLeaderProgress.mockResolvedValue(makeLeader({
+      generation: 3, runtimeEpoch: 2,
+      tasks: [
+        makeLeaderTask({ nativeTaskId: 'old', generation: 1, runtimeEpoch: 1, execState: 'running' }),
+        makeLeaderTask({ nativeTaskId: 'new', generation: 3, runtimeEpoch: 2, execState: 'running' }),
+      ],
+    }));
+    await act(async () => {
+      root = createRoot(host);
+      root.render(<BuildOrchestrationProgress build={makeBuild({ id: 'kb-v2', orchestrationMode: 'pi-amagi' })} />);
+    });
+    expect(host.querySelector('[data-testid="kb-runtime-plan-count"]')?.textContent).toContain('当前计划 1 项');
+    expect(host.querySelector('[data-testid="kb-runtime-plan-count"]')?.textContent).toContain('历史 1 项');
+    expect(host.querySelector('[data-testid="kb-runtime-summary"]')?.children[2]?.textContent).toContain('已观测）1');
+    expect(host.querySelector('[data-task-id="old"]')?.getAttribute('data-exec')).toBe('stopped');
+    expect(host.querySelector('[data-task-id="old"]')?.textContent).toContain('历史任务');
+    expect(host.querySelector('[data-task-id="new"]')?.getAttribute('data-exec')).toBe('running');
+  });
+
+  it('进程终止未确认独立于业务终态，不伪称已退出或可直接恢复', async () => {
+    api.getKbBuildLeaderProgress.mockResolvedValue(makeLeader({
+      termination: 'termination-unconfirmed', endedReason: 'leader-failed',
+      processTermination: { state: 'unconfirmed', at: '2026-11-01T00:00:00Z', note: '缺少进程归属证明', unconfirmedPids: [0] },
+      tasks: [makeLeaderTask({ execState: 'running' })],
+    }));
+    await act(async () => {
+      root = createRoot(host);
+      root.render(<BuildOrchestrationProgress build={makeBuild({ id: 'kb-v2', status: 'failed', orchestrationMode: 'pi-amagi' })} />);
+    });
+    expect(host.querySelector('[data-testid="kb-runtime-termination-unconfirmed"]')?.textContent).toContain('尚未确认所有进程退出');
+    expect(host.querySelector('[data-testid="kb-runtime-leader"]')?.textContent).toContain('终止未确认');
+    expect(host.querySelector('[data-testid="kb-runtime-resume-capability"]')?.textContent).toContain('需先确认后台终止');
+    expect(host.querySelector('[data-testid="kb-runtime-task"]')?.getAttribute('data-exec')).toBe('termination-unconfirmed');
+    expect(host.querySelector('[data-testid="kb-runtime-task"]')?.textContent).not.toContain('已停止');
+    expect(host.querySelector('[data-testid="kb-runtime-summary"]')?.textContent).toContain('末次观测并发');
   });
 
   it('summary 计数 null=未知：显示未知而非 0/推测值；lastUsage 末次口径明示', async () => {

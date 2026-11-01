@@ -556,8 +556,11 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
     let body: { sourceDir?: unknown } = {};
     try { body = await c.req.json() as { sourceDir?: unknown }; } catch { /* 空体缺省 npm 模式 */ }
     const sourceDir = typeof body.sourceDir === 'string' && body.sourceDir.trim() !== '' ? body.sourceDir.trim() : undefined;
-    if (sourceDir !== undefined && (!sourceDir.startsWith('/') || !fs.existsSync(sourceDir))) {
-      return c.json({ error: 'invalid_request', message: 'sourceDir 必须是指向本地 amagi-pi 包根的绝对路径' }, 400);
+    // F13（审核修复）：绝对路径判定与实际宿主平台一致（win32 接受盘符/UNC，
+    // POSIX 只接受 / 开头）——不再硬编码 startsWith('/') 把 Windows 合法路径拒死；
+    // 相对路径与不存在路径仍拒绝。Windows 真机安装链路未实测（如实记录）。
+    if (sourceDir !== undefined && (!path.isAbsolute(sourceDir) || !fs.existsSync(sourceDir))) {
+      return c.json({ error: 'invalid_request', message: `sourceDir 必须是指向本地 amagi-pi 包根的绝对路径（与宿主平台一致：${process.platform === 'win32' ? '盘符/UNC' : 'POSIX /…'}）` }, 400);
     }
     try {
       const installed = await deps.buildRuntime.installAmagi({

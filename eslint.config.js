@@ -16,6 +16,8 @@ export default tseslint.config(
       'release*/**',
       'build/**',
       'amagi-task/**',
+      // 报告/归档反例按原字节保留（含SHA256证据），不作为应用源码改写或lint。
+      'agent-outputs/**',
       '.amagi-worktrees/**',
       '.amagi-reports/**',
       'projects-memory/**',

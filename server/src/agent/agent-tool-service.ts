@@ -93,6 +93,13 @@ import {
   loadWorkbookEvidenceResource,
 } from '../kb/evidence-resources.js';
 import { computeCandidateHash, type ReviewIssue, type ReviewReport } from '../kb/orchestration-contracts.js';
+import {
+  REVIEW_DEP_DECLARATION,
+  REVIEW_DEP_SOURCE_SNAPSHOT,
+  REVIEW_DEP_WORKFLOW_RULES,
+  resolveCurrentReviewDependencies,
+  type ReviewDependencyValues,
+} from '../kb/review-authority.js';
 import { getKbQueryService, QueryError } from '../kb/search/kb-query-service.js';
 import { splitAnchor } from '../kb/search/outline.js';
 import { hashImageFile, inlineImageBlocks, resolveSourceImages, extractWhiteboardBypassTexts, type ImageDescriptionLike, type WhiteboardTextMap } from '../kb/source-images.js';
@@ -211,10 +218,19 @@ export interface BuildRunState {
     /** 发布校验管线（§5.4）；未接线时 build_request_publish 返回 build_publish_not_wired */
     publishHandler?: V2PublishHandler;
   };
+  /** v2 冻结 workflow 规则哈希（F08：materializeWorkflowSkill 的 sha256，
+  * 即 leaderRun.spec.workflowRevision）。集成者在 runLeaderSupervisedPhase
+  * 设置；审查回执依赖绑定与发布核验共用（null = 未提供，见 review-authority）。 */
+  v2WorkflowRulesHash?: string | null;
 }
 
 /** v2 发布校验管线（§5.4）：锁定候选后由集成者执行全量检查（对象身份/来源
- * 覆盖/引用目标/审查绑定/阻断问题）；返回 accepted 与结果详情。 */
+ * 覆盖/引用目标/审查绑定/阻断问题）；返回 accepted 与结果详情。
+ *
+ * F11 补强：authorityLease = 本次工具调用的 Leader ctx 租约闭包（服务端
+ * 内部构造，不经模型 JSON；不携带 token/secret，不落盘不进 checkpoint）。
+ * 发布管线在真正指针提交点调用 validate()——token 被撤（取消/换代/收尾
+ * 的 revokeToken/revokeSessionTokens）或 ctx 被标记 revoked 后拒绝提交。 */
 export interface V2PublishHandler {
   (input: {
     buildId: string;
@@ -222,6 +238,8 @@ export interface V2PublishHandler {
     candidateHash: string;
     requestedRevision: string | null;
     summary: string | null;
+    /** F11 补强：ctx 租约闭包（服务端构造；缺省视为无证明，提交点拒绝） */
+    authorityLease?: { validate: () => void };
   }): Promise<{ accepted: boolean; result: Record<string, unknown> }>;
 }
 
@@ -320,7 +338,9 @@ export interface KnowledgeDraftFile {
   relations: KnowledgeRelation[];
   evidence: Evidence[];
   coverage: CoverageItem[];
-  /** toolCallId 幂等账本（进程重启后由文件恢复；A 案 §7.1） */
+  /** toolCallId 幂等账本（进程重启后由文件恢复；A 案 §7.1）。payloadHash
+   * （F06）：v2 写入链在原子落盘时记录的稳定语义载荷哈希——崩溃重放
+   * 命中同键时必须比较（同载荷才重放；旧账本缺哈希不可盲重放）。 */
   calls: Record<string, {
     path: string;
     at: string;
@@ -329,6 +349,7 @@ export interface KnowledgeDraftFile {
     bytes: number;
     objectIdMap: Record<string, string>;
     evidenceIdMap: Record<string, string>;
+    payloadHash?: string;
   }>;
 }
 
@@ -359,6 +380,12 @@ export interface OrganizationPlanFile {
 
 export interface InternalRunContext extends AgentRunContext {
   options: RunContextOptions;
+  /** F01（撤销租约）：revokeToken/revokeBySession/revokeByBuild 置位。
+   * contexts 表删除只能拦后续 executeTool，拦不住已持 ctx 引用的在途
+   * 调用（声明锁排队/异步证据装配中的写入）——在途链在最终落盘与回执
+   * 前检查本租约（assertRunLeaseActive）。null = 未撤销。 */
+  revokedAt?: number | null;
+  revokedScope?: string | null;
 }
 
 /** 单次工具请求的调用侧元数据（内部 API 透传；不进模型可见面）。 */
@@ -370,6 +397,26 @@ export interface ToolRequestMeta {
   amagiTaskId?: string;
   /** v2（§4.1）：AMAGI_AGENT（角色一致性校验）。 */
   amagiAgent?: string;
+}
+
+/** F03-R1：单次知识声明的授权影响面——装配期（buildKnowledgeDeclaration
+ * 对象段）记录，最终同步提交段重核。声明装配含真实 await 让出（工作簿/
+ * 图片证据、资源解引用），期间 Leader 可经 assignOutputs/revokeOutputs
+ * 转移族归属或撤回旧主路径授权；装配期快照不足以代表提交时点。 */
+export interface DeclarationAuthImpact {
+  /** 本次声明涉及的全部对象族——新对象入族、既有对象重申（含编辑继承
+   * 重申），以及被本次改写移出旧族/未重申删除对象登记的旧族（R2-F03-01：
+   * 移出与删除同样改写该族对象面，装配期已过同一族排他检查）；提交期
+   * 要求活动持有人仍为空或本人。 */
+  familyKeys: string[];
+  /** 跨路径重申/迁移：clientKey/三元组命中的既有对象的主定义登记
+   * （装配期已过旧主路径/族授权检查）；提交期要求授权仍有效。 */
+  crossPathMigrations: Array<{
+    clientKey: string;
+    objectId: string;
+    priorPath: string;
+    familyKey: string;
+  }>;
 }
 
 /** 工具族内单个工具的注册项（S1 工具族注册模型）。 */
@@ -643,32 +690,102 @@ export class AgentToolService {
       workspaceRoot: options.workspaceRoot,
       allowedTools,
       createdAt: Date.now(),
+      revokedAt: null,
+      revokedScope: null,
       options,
     };
     this.contexts.set(token, context);
     return { token, context };
   }
 
-  /** 撤销令牌（模式切换 / 进程退出时）。 */
+  /** 撤销令牌（模式切换 / 进程退出 / 取消）。
+   * F01：除从 contexts 表删除（拦新调用）外，同步标记撤销租约——已持
+   * ctx 的在途写入（锁排队/异步准备中）在最终落盘前被拒，不能落盘或
+   * 登记新回执。 */
   revokeToken(token: string): void {
+    const context = this.contexts.get(token);
+    if (context && context.revokedAt == null) {
+      context.revokedAt = Date.now();
+      context.revokedScope = 'token';
+    }
     this.contexts.delete(token);
   }
 
-  /** 按会话撤销（模式切换 / 会话删除时）。 */
+  /** 按会话撤销（模式切换 / 会话删除时）。F01：同 revokeToken 标记租约。 */
   revokeBySession(sessionId: string): void {
     for (const [token, context] of this.contexts) {
-      if (context.sessionId === sessionId) this.contexts.delete(token);
+      if (context.sessionId === sessionId) {
+        if (context.revokedAt == null) {
+          context.revokedAt = Date.now();
+          context.revokedScope = 'session';
+        }
+        this.contexts.delete(token);
+      }
     }
   }
 
+  /** 按构建撤销（构建取消/收尾）。F01：同 revokeToken 标记租约。 */
   revokeByBuild(buildId: string): void {
     for (const [token, context] of this.contexts) {
-      if (context.buildId === buildId) this.contexts.delete(token);
+      if (context.buildId === buildId) {
+        if (context.revokedAt == null) {
+          context.revokedAt = Date.now();
+          context.revokedScope = 'build';
+        }
+        this.contexts.delete(token);
+      }
     }
   }
 
   getContext(token: string): AgentRunContext | null {
     return this.contexts.get(token) ?? null;
+  }
+
+  /** F01：在途调用撤销租约终检——声明锁排队/异步证据装配窗口内令牌被
+   * 撤销（生产 requestCancel → revokeSessionTokens 等）时，最终落盘与
+   * 回执登记前拒绝；文件、revision 与回执账本保持不变。 */
+  private assertRunLeaseActive(context: InternalRunContext): void {
+    if (context.revokedAt != null) {
+      throw new ToolError(
+        'run_token_revoked',
+        `运行令牌已撤销（scope=${context.revokedScope ?? 'token'}，撤销于 ${new Date(context.revokedAt).toISOString()}），在途写入终止`,
+        401,
+      );
+    }
+  }
+
+  /** F06：calls 幂等账本崩溃重放核验——稳定键命中后必须比较语义载荷哈希：
+   * 异载荷报幂等冲突（同键不可假成功）；本修复前写入的旧账本缺哈希，
+   * 无法核验同载荷 → 明确拒绝并指引修复路径（原操作已落盘，结果以
+   * knowledge-draft/docs 为准；换新 operationId 重提）。payloadHash
+   * 未提供（非 v2 调用侧键重试）时保持旧语义直接重放。 */
+  private verifyCallsLedgerPayload(entry: { payloadHash?: string; at: string }, operationLabel: string, payloadHash: string | undefined): void {
+    if (payloadHash === undefined) return;
+    if (entry.payloadHash === undefined) {
+      throw new ToolError(
+        'kb_idempotency_unverifiable',
+        `操作 ${operationLabel} 的旧幂等账本缺少载荷哈希（旧代次写入），无法核验同载荷重放；请更换 operationId 重提（原操作已落盘，结果以 knowledge-draft/docs 为准）`,
+        409,
+      );
+    }
+    if (entry.payloadHash !== payloadHash) {
+      throw new ToolError(
+        'kb_idempotency_conflict',
+        `operationId 已用于不同载荷（calls 账本核验，首次提交 ${entry.at}）；换一个 operationId`,
+        409,
+      );
+    }
+  }
+
+  /** F11 补强：run context 是否仍有效（引用比对 + revokedAt 标记双检；
+   * revokeToken 从 Map 删除即失效；若撤租改为标记 revokedAt（27/b18 方向），
+   * 同样拒绝。不暴露 token，不落盘。） */
+  private isContextLive(context: InternalRunContext): boolean {
+    if (context.revokedAt != null) return false;
+    for (const live of this.contexts.values()) {
+      if (live === context) return true;
+    }
+    return false;
   }
 
   /**
@@ -1574,11 +1691,9 @@ export class AgentToolService {
     const body = stripStdHeader(raw);
     const lines = body.split('\n');
     const slice = lines.slice(offset, offset + limit);
-    // v2（§7）：局部编辑坐标口径的内容哈希与行数（kb_edit_doc 的
-    // expectedContentHash 同源；参数坐标 = 去 server 头与 # 标题行）。
+    // 哈希与返回正文来自同一快照；编辑坐标去除server头与标题行。
     let editCoordinates: { contentHash: string; paramTotalLines: number } | null = null;
     try {
-      // 哈希必须与本次返回的正文来自同一字节快照，不能二次读盘混入并发更新。
       const coordinates = draftEditCoordinates(body);
       editCoordinates = { contentHash: contentResourceHash(coordinates.paramLines.join('\n')), paramTotalLines: coordinates.paramLines.length };
     } catch {
@@ -1587,10 +1702,7 @@ export class AgentToolService {
     return {
       content: [{ type: 'text', text: slice.join('\n') }],
       details: {
-        path: docPath,
-        offset,
-        returnedLines: slice.length,
-        totalLines: lines.length,
+        path: docPath, offset, returnedLines: slice.length, totalLines: lines.length,
         ...(editCoordinates ? { editContentHash: editCoordinates.contentHash, editParamTotalLines: editCoordinates.paramTotalLines } : {}),
       },
     };
@@ -1655,7 +1767,7 @@ export class AgentToolService {
       // 声明幂等键稳定化：回执丢失（崩溃）后重放命中 knowledge-draft 的
       // calls 账本，不重复推进 draftRevision（meta.toolCallId 每次不同，
       // 不能作 v2 幂等键）。
-      const stableMeta: ToolRequestMeta = { ...(meta ?? {}), toolCallId: `v2_${actor.nativeTaskId}_${operationId}` };
+      const stableMeta: ToolRequestMeta = { ...(meta ?? {}), toolCallId: stableV2CallKey(actor.nativeTaskId, operationId) };
       return this.withKnowledgeDeclarationLock(state, async (): Promise<ToolResult> => {
         const replay = this.v2Replay(v2, actor.nativeTaskId, operationId, payloadHash);
         if (replay) return replay;
@@ -1669,6 +1781,7 @@ export class AgentToolService {
         const result = await this.writeDocCore(context, args, stableMeta, {
           lockHeld: true,
           recheck: () => this.assertV2WriteWindow(v2, actor.nativeTaskId, meta, docPath),
+          idempotency: { payloadHash },
         });
         this.v2RecordReceipt({ v2, nativeTaskId: actor.nativeTaskId, kind: 'write_doc', operationId, payloadHash, paths: [docPath], result, invalidateReviews: true });
         return result;
@@ -1697,12 +1810,15 @@ export class AgentToolService {
 
   /** kb_write_doc / kb_edit_doc 共用校验与落盘链（v2 记账在包装层）。
    * options.lockHeld：调用方已持有声明锁（v2 写入链）时不重复加锁；
-   * options.recheck：锁内异步准备后、最终落盘前的重检钩子（v2）。 */
+   * options.recheck：锁内异步准备后、最终落盘前的重检钩子（v2）；
+   * options.idempotency.payloadHash（F06）：v2 调用方语义载荷哈希——
+   * calls 账本命中同键时必须比较（同载荷才重放），并在原子落盘时随
+   * calls 条目记录，供回执丢失后的崩溃重放核验。 */
   private async writeDocCore(
     context: InternalRunContext,
     args: Record<string, unknown>,
     meta?: ToolRequestMeta,
-    options?: { lockHeld?: boolean; recheck?: () => void },
+    options?: { lockHeld?: boolean; recheck?: () => void; idempotency?: { payloadHash: string } },
   ): Promise<ToolResult> {
     const state = requireBuildState(context);
     // T3（A 案 §7.1）：审查者没有任何草稿写入口
@@ -1748,8 +1864,11 @@ export class AgentToolService {
     const coreOperation = async (): Promise<ToolResult> => {
       const baseDraft = hasDeclaration ? this.loadKnowledgeDraft(state) : null;
       if (baseDraft && meta?.toolCallId && baseDraft.calls[meta.toolCallId]) {
-        // 同 toolCallId 重复提交幂等返回（A 案 §7.1）；不重复写入、不推进修订
+        // 同 toolCallId 重复提交幂等返回（A 案 §7.1）；不重复写入、不推进修订。
+        // F06：v2 调用（idempotency 在场）命中同键必须先核验载荷——异载荷
+        // 报幂等冲突，旧账本缺哈希明确拒绝（不可盲重放）；非 v2 旧语义不变。
         const call = baseDraft.calls[meta.toolCallId]!;
+        this.verifyCallsLedgerPayload(call, meta.toolCallId, options?.idempotency?.payloadHash);
         return {
           content: [{ type: 'text', text: `已写入草稿 ${call.path}（幂等重放，docId=${call.docId}，draftRevision=${call.draftRevision}）` }],
           details: {
@@ -1787,7 +1906,7 @@ export class AgentToolService {
       }
       // 声明解析与校验（写入即拒；正文尚未落盘，任何拒绝都不产生部分写入）
       const declaration = baseDraft
-        ? await this.buildKnowledgeDeclaration(context, state, baseDraft, docPath, docId, args, markdown)
+        ? await this.buildKnowledgeDeclaration(context, state, baseDraft, docPath, docId, args, markdown, meta)
         : null;
 
       const buildId = context.buildId ?? 'unknown';
@@ -1802,8 +1921,42 @@ export class AgentToolService {
       ].join('\n');
       const body = markdown.replace(/^\s*\n/, '');
       const full = `${header}\n# ${title}\n${body}\n`;
-      // 深路径先建父目录（mkdir intent 逐级复核），再裁决写入
+      // 深路径父目录（mkdir intent 逐级复核）。
       const parentRel = docPath.includes('/') ? docPath.slice(0, docPath.lastIndexOf('/')) : null;
+      // v2（§4.4 硬验收）：异步证据装配后、最终提交前的重检——排队期间的
+      // 取消/换代/分配转移/发布窗口使本次写入拒绝，文件与 revision 不变。
+      // F01：撤销租约终检在前（生产取消链 revokeToken 不动 actor/generation，
+      // 仅靠 v2 重检拦不住被撤销令牌的在途写入；v2 与旧模式共用本检查点）。
+      // 此后的 mkdir/目标解析/写入/记账均为同步段，无再让出窗口；目录
+      // 创建也统一在租约终检之后（提前建目录同样是共享 staging 变更）。
+      this.assertRunLeaseActive(context);
+      options?.recheck?.();
+      // Leader steer（Advisor 不变量补强·基线漂移守卫）：冻结集合重核之外，
+      // 还须证明旧声明/索引基线未在装配 await 期间漂移——声明锁串行本构建
+      // 的全部声明写者（kb_write_doc/kb_edit_doc/审查回写），合法路径不会
+      // 漂移；但任何绕锁写者造成的漂移若被放行，本次整包保存会覆盖其登记
+      // 变更（丢失更新），冻结影响面也建立在旧基线上（不能重核旧集合却
+      // 漏掉基线已变的新旧族）。提交段重读当前登记与装配起点基线逐字比对，
+      // 漂移即拒绝（不静默合并/覆盖；调用方重读草稿后重提）。
+      if (declaration?.baselineSignature) {
+        const currentDraft = this.loadKnowledgeDraft(state);
+        if (JSON.stringify(currentDraft) !== declaration.baselineSignature) {
+          throw new ToolError(
+            'kb_declaration_baseline_drifted',
+            `文档 ${docPath} 的声明基线在装配期间已被其他写者修改（knowledge-draft 登记/索引漂移）；请重读草稿后基于最新基线重提，本次不覆盖他人登记`,
+            409,
+          );
+        }
+      }
+      // F03-R1：声明影响面授权提交期重核——recheck 只重检 ctx 与目标文档
+      // 分配，但本次声明的完整影响面（族排他 + 跨路径迁移旧主路径授权）
+      // 可能在上方 await 让出窗口内被 Leader 转移/撤回；装配期检查不足以
+      // 代表提交时点。本检查与后续写入同为同步段（见方法注释），与分配
+      // 变更不再交错形成窗口。kb_write_doc / kb_edit_doc（含继承声明重申）
+      // 全部经本段，单一收口。旧模式无 v2 凭据时内部不设防（行为不变）。
+      if (declaration?.authImpact) {
+        this.assertDeclarationImpactAuthorized(context, meta, declaration.authImpact);
+      }
       if (parentRel) {
         resolveInside(path.join(state.stagingRoot, 'docs'), parentRel, 'mkdir');
       }
@@ -1811,9 +1964,6 @@ export class AgentToolService {
       // T3（A 案 §7.1）：草稿与知识声明同代写入——正文成功而声明持久化失败
       // 时整体失败（毒化构建，不部分写入），先留旧字节快照供回滚。
       const previousBytes = fs.existsSync(target) ? fs.readFileSync(target) : null;
-      // v2（§4.4 硬验收）：异步证据装配后、最终提交前的重检——排队期间的
-      // 取消/换代/分配转移/发布窗口使本次写入拒绝，文件与 revision 不变。
-      options?.recheck?.();
       atomicWriteFile(target, full);
       if (declaration) {
         declaration.draft.docs[docPath] = { docId, revision: declaration.draftRevision, bodyLineOffset, basis: 'draft' };
@@ -1827,6 +1977,9 @@ export class AgentToolService {
             bytes,
             objectIdMap: declaration.objectIdMap,
             evidenceIdMap: declaration.evidenceIdMap,
+            // F06：原子落盘时记录稳定语义载荷哈希（同 v2 回执同口径），
+            // 供回执丢失后的崩溃重放核验；非 v2 调用不记录（旧语义不变）。
+            ...(options?.idempotency ? { payloadHash: options.idempotency.payloadHash } : {}),
           };
         }
         try {
@@ -1903,6 +2056,36 @@ export class AgentToolService {
     // R2-04：与 kb_write_doc 同一合法规范路径门——`./`/反斜杠等别名在
     // 认领与触盘之前拒绝，防止用另一字符串认领却删除同一实际文件。
     validateStdDocPath(docPath);
+    // R2-F03-01（kb_delete_doc 授权影响面）：删除文档即移除该路径登记对象
+    // 的规范主位——对象定义丢失虽由发布门禁 kb_migration_invalid 兜底，
+    // 授权面在删除时点就须核：文档登记的对象族被其他活动任务独占分配时，
+    // Doc 写权不覆盖 Family 排他（与 kb_write_doc 移出/删除旧族同判）。
+    // 本工具无 await，核权与 removeFileInside 同处同步段（核权→落盘无
+    // 窗口）；旧模式不设防（与写路径一致）。
+    if (v2 && v2Info?.actor) {
+      const deleterTaskId = v2Info.actor.nativeTaskId;
+      const draftFile = path.join(state.stagingRoot, 'knowledge-draft.json');
+      if (state.knowledgeDraft || fs.existsSync(draftFile)) {
+        const draft = this.loadKnowledgeDraft(state);
+        const familyObjectIds = new Map<string, string[]>();
+        for (const object of draft.objects) {
+          if (object.tombstone || object.canonical?.path !== docPath) continue;
+          const list = familyObjectIds.get(object.familyKey) ?? [];
+          list.push(object.objectId);
+          familyObjectIds.set(object.familyKey, list);
+        }
+        for (const [familyKey, objectIds] of familyObjectIds) {
+          const holder = v2.actorStore.activeFamilyAssignmentFor(familyKey);
+          if (holder && holder.ownerTaskId !== deleterTaskId) {
+            throw new ToolError(
+              'kb_object_not_authorized',
+              `文档 ${docPath} 登记了对象族 family:${familyKey} 的对象（${objectIds.join('、')}），该族已由任务 ${holder.ownerTaskId} 持有写入分配；任务 ${deleterTaskId} 不能以删除文档移除其对象，如需调整请 Leader 先收回/转移分配`,
+              403,
+            );
+          }
+        }
+      }
+    }
     // S4（§4.3）：删除同样受路径认领约束；收尾轮不受限
     this.assertPathClaim(context, state, docPath);
     removeFileInside(path.join(state.stagingRoot, 'docs'), docPath);
@@ -2011,6 +2194,61 @@ export class AgentToolService {
       v2.actorStore.assertOutputAssignment(nativeTaskId, docPath);
     } catch (error) {
       throw wrapActorError(error);
+    }
+  }
+
+  /** F03：对象声明影响面授权守卫。v2 child 凭据 + 受信身份头时返回
+   * 检查器；旧模式/无身份 → null（不设防，既有迁移行为不变）。上游
+   * requireV2Actor 已确认身份；此处只取授权面，不重复身份校验。 */
+  private v2DeclarationAuth(context: InternalRunContext, meta: ToolRequestMeta | undefined): { store: BuildActorStore; nativeTaskId: string } | null {
+    const v2 = context.options.orchestration;
+    if (!v2 || v2.credential !== 'child' || !meta?.amagiTaskId) return null;
+    return { store: v2.actorStore, nativeTaskId: meta.amagiTaskId };
+  }
+
+  /** F03-R1（对象影响面授权提交期重核）：装配期（buildKnowledgeDeclaration
+   * 对象段的族排他与跨路径迁移检查）与最终落盘之间存在异步声明准备窗口
+   * （工作簿/图片证据装配 await 让出）；Leader 可在窗口内经 assignOutputs/
+   * revokeOutputs 把族转移给他人或撤回旧主路径授权，在途声明若按装配期
+   * 快照放行即越权落盘。本方法在同步提交段对装配期记录的完整影响面
+   * （DeclarationAuthImpact）重新核权，判据与装配期完全一致：
+   * - 族排他：family 活动持有人不得已变为他人（覆盖新族与被移出/
+   *   删除对象的旧族，同一完整冻结集合）；
+   * - 跨路径迁移：旧主定义文档或对象族的授权必须仍有效。
+   * 合法显式授权迁移保留（窗口内把族转给写者本人 → 持有人=本人，放行）；
+   * 旧模式（无 v2 child 凭据）不设防，既有迁移行为不变。本检查之后的
+   * mkdir/原子写入/声明持久化均为同步段，与 Leader 的分配变更（同步
+   * 方法）不再交错——权限转移与提交不形成新窗口。 */
+  private assertDeclarationImpactAuthorized(
+    context: InternalRunContext,
+    meta: ToolRequestMeta | undefined,
+    impact: DeclarationAuthImpact,
+  ): void {
+    if (impact.familyKeys.length === 0 && impact.crossPathMigrations.length === 0) return;
+    const auth = this.v2DeclarationAuth(context, meta);
+    if (!auth) return; // 旧模式/Leader 凭据：不设防（与装配期一致）
+    for (const familyKey of impact.familyKeys) {
+      const holder = auth.store.activeFamilyAssignmentFor(familyKey);
+      if (holder && holder.ownerTaskId !== auth.nativeTaskId) {
+        throw new ToolError(
+          'kb_object_not_authorized',
+          `对象族 family:${familyKey} 已由任务 ${holder.ownerTaskId} 持有写入分配（声明准备期间归属已变化），任务 ${auth.nativeTaskId} 的本次提交拒绝落盘；如需调整归属请 Leader 先收回/转移分配`,
+          403,
+        );
+      }
+    }
+    for (const migration of impact.crossPathMigrations) {
+      const authorized = auth.store.authorizedForDeclarationTarget(
+        auth.nativeTaskId,
+        { docPath: migration.priorPath, familyKey: migration.familyKey },
+      );
+      if (!authorized) {
+        throw new ToolError(
+          'kb_object_not_authorized',
+          `对象 ${migration.clientKey}（${migration.objectId}）主定义登记于 ${migration.priorPath}，任务 ${auth.nativeTaskId} 对该文档或对象族 family:${migration.familyKey} 的写入分配已在声明准备期间失效；跨路径重申/迁移需 Leader 先 build_assign_output 显式授权`,
+          403,
+        );
+      }
     }
   }
 
@@ -2247,14 +2485,28 @@ export class AgentToolService {
     docId: string,
     args: Record<string, unknown>,
     markdown: string,
+    meta?: ToolRequestMeta,
   ): Promise<{
     draft: KnowledgeDraftFile;
     objectIdMap: Record<string, string>;
     evidenceIdMap: Record<string, string>;
     draftRevision: number;
+    /** F03-R1：本次声明的授权影响面（装配期记录，提交期重核）。 */
+    authImpact: DeclarationAuthImpact;
+    /** Leader steer（Advisor 不变量补强·基线漂移守卫）：装配起点旧声明
+     * 基线的规范串——提交段重读当前登记比对，检测装配 await 期间绕过
+     * 声明锁的登记/索引漂移（拒绝/重提，不静默覆盖）。 */
+    baselineSignature: string;
   }> {
-    void context;
+    // F03（对象声明影响面授权）：v2 child + 受信身份时启用守卫；旧模式
+    // 不设防（既有迁移机制保留，行为不变）。守卫在 priorId 决策点执行，
+    // 与实际写入的对象登记同源（不另建一份解析）。
+    const declarationAuth = this.v2DeclarationAuth(context, meta);
     const draft: KnowledgeDraftFile = JSON.parse(JSON.stringify(base)) as KnowledgeDraftFile;
+    // Leader steer：装配起点旧声明基线签名（本函数不 mutate base；提交段
+    // 与重读的当前登记比对，判据见 writeDocCore 终检段）。基线串只用于
+    // 逐字比对，不参与任何授权判定。
+    const baselineSignature = JSON.stringify(base);
     const markdownLines = markdown.split('\n');
 
     // ---- 乐观并发与计划一致性（A 案 §7.1）----
@@ -2285,6 +2537,16 @@ export class AgentToolService {
     const objectIdMap: Record<string, string> = {};
     const submissionClientKeys = new Map<string, string>();
     const existingById = new Map(draft.objects.map((object) => [object.objectId, object] as const));
+    // F03-R1：装配期记录本次声明的授权影响面——族排他与跨路径迁移检查在
+    // 本段通过后，后续证据装配（工作簿/图片/资源解引用）还会 await 让出；
+    // 最终同步提交段对以下记录重核（assertDeclarationImpactAuthorized）。
+    const impactFamilyKeys = new Set<string>();
+    const impactCrossPath: DeclarationAuthImpact['crossPathMigrations'] = [];
+    // R2-F03-01：完整影响面还含旧族——同路径重申把既有对象移出旧族
+    // （familyKey 变更）与未重申对象的删除（含 objects:[] 整体删除）都
+    // 改写旧族对象面；先按旧族归并受影响对象键，装配期统一核权后并入
+    // 冻结集合（与新族同一判据）。
+    const impactPriorFamilies = new Map<string, string[]>();
     for (const raw of objectInputs) {
       const input = asRecord(raw);
       if (!input) throw new ToolError('invalid_request', 'objects 每项必须是对象');
@@ -2332,6 +2594,58 @@ export class AgentToolService {
           && object.scopeKey === scopeKey)?.objectId
         ?? null;
       const objectId = priorId ?? `ko_${crypto.randomUUID()}`;
+      // F03（对象影响面授权·跨路径重申）：clientKey/三元组命中既有对象且
+      // 其主定义在他人文档 → 本声明会改写该对象登记（canonical 迁移到
+      // 本文档）。要求写者对旧主定义文档或该对象族持有当前分配（Leader
+      // 显式授权），否则拒绝——不能仅凭自己文档的分配夺取他人对象身份。
+      if (declarationAuth && priorId != null) {
+        const priorRegistration = existingById.get(priorId) ?? null;
+        if (priorRegistration && !priorRegistration.tombstone && priorRegistration.canonical?.path) {
+          if (priorRegistration.canonical.path !== docPath) {
+            const authorized = declarationAuth.store.authorizedForDeclarationTarget(
+              declarationAuth.nativeTaskId,
+              { docPath: priorRegistration.canonical.path, familyKey: priorRegistration.familyKey },
+            );
+            if (!authorized) {
+              throw new ToolError(
+                'kb_object_not_authorized',
+                `对象 ${clientKey}（${objectId}）主定义登记于 ${priorRegistration.canonical.path}，任务 ${declarationAuth.nativeTaskId} 未持有该文档或对象族 family:${priorRegistration.familyKey} 的写入分配；跨路径重申/迁移需 Leader 先 build_assign_output 显式授权`,
+                403,
+              );
+            }
+            impactCrossPath.push({
+              clientKey,
+              objectId,
+              priorPath: priorRegistration.canonical.path,
+              familyKey: priorRegistration.familyKey,
+            });
+          }
+          if (priorRegistration.familyKey !== familyKey) {
+            // 移出旧族与canonical迁移是正交影响：即使跨path已通过旧Doc授权，
+            // 同时改族仍须核旧族；Doc通道不能覆盖旧族被他人独占的排他权。
+            // familyKey 改为另一族——对象身份保留、族归属变更，
+            // 旧族对象面被改写。旧族入影响面（装配期/提交期均要求其活动
+            // 持有人为空或本人；本文档的 Doc 写权不覆盖 Family 排他）。
+            const list = impactPriorFamilies.get(priorRegistration.familyKey) ?? [];
+            list.push(clientKey);
+            impactPriorFamilies.set(priorRegistration.familyKey, list);
+          }
+        }
+      }
+      // F03（对象影响面授权·族排他）：声明的 familyKey 已被其他活动任务
+      // 独占分配时，本声明（新对象入族或既有对象重申）改写该族对象面，
+      // 拒绝；未分配的族不设限（常规新对象声明路径不变）。
+      const familyHolder = declarationAuth
+        ? declarationAuth.store.activeFamilyAssignmentFor(familyKey)
+        : null;
+      if (familyHolder && familyHolder.ownerTaskId !== declarationAuth?.nativeTaskId) {
+        throw new ToolError(
+          'kb_object_not_authorized',
+          `对象族 family:${familyKey} 已由任务 ${familyHolder.ownerTaskId} 持有写入分配，任务 ${declarationAuth?.nativeTaskId} 不能在该族内声明对象（${clientKey}）；如需调整归属请 Leader 先收回/转移分配`,
+          403,
+        );
+      }
+      impactFamilyKeys.add(familyKey);
       for (const other of [...draft.objects, ...newObjects]) {
         if (other.objectId === objectId) continue;
         if (other.familyKey === familyKey && other.variantKey === variantKey && other.scopeKey === scopeKey) {
@@ -2399,11 +2713,39 @@ export class AgentToolService {
       objectIdMap[clientKey] = objectId;
       submissionClientKeys.set(clientKey, objectId);
     }
-    // 同路径未重新声明的旧对象移除（连同其 clientKey 登记）；重声明对象替换
+    // 同路径未重新声明的旧对象移除（连同其 clientKey 登记）；重声明对象替换。
+    // R2-F03-01（objects:[] 删除）：未重申被移除的对象若登记于某旧族，删除
+    // 同样改写该族对象面——旧族并入影响面（整体 objects:[] 与部分遗漏重申
+    // 两种形态同判）。
     const touchedIds = new Set(newObjects.map((object) => object.objectId));
     const removedIds = new Set<string>();
     for (const object of draft.objects) {
-      if (object.canonical?.path === docPath && !touchedIds.has(object.objectId)) removedIds.add(object.objectId);
+      if (object.canonical?.path === docPath && !touchedIds.has(object.objectId)) {
+        removedIds.add(object.objectId);
+        if (!object.tombstone && declarationAuth) {
+          const list = impactPriorFamilies.get(object.familyKey) ?? [];
+          list.push(object.objectId);
+          impactPriorFamilies.set(object.familyKey, list);
+        }
+      }
+    }
+    // R2-F03-01 装配期旧族排他核权（判据与新族一致，均在任何证据装配
+    // await 之前的同步段）：移出/删除的旧族被其他活动任务独占分配 →
+    // 拒绝；未分配或本人持有放行（合法移族/删除由 Leader 显式授权或族
+    // 未分配时保留，不靠禁用功能解决）。核权通过后旧族并入冻结集合，
+    // 提交段（assertDeclarationImpactAuthorized）同判重核。
+    if (declarationAuth) {
+      for (const [familyKey, affectedKeys] of impactPriorFamilies) {
+        const holder = declarationAuth.store.activeFamilyAssignmentFor(familyKey);
+        if (holder && holder.ownerTaskId !== declarationAuth.nativeTaskId) {
+          throw new ToolError(
+            'kb_object_not_authorized',
+            `对象族 family:${familyKey} 已由任务 ${holder.ownerTaskId} 持有写入分配，任务 ${declarationAuth.nativeTaskId} 的本次改写将移出/删除该族对象（${affectedKeys.join('、')}）；如需调整归属请 Leader 先收回/转移分配`,
+            403,
+          );
+        }
+        impactFamilyKeys.add(familyKey);
+      }
     }
     draft.objects = draft.objects.filter((object) => !touchedIds.has(object.objectId) && !removedIds.has(object.objectId));
     for (const [clientKey, objectId] of Object.entries(draft.clientKeys)) {
@@ -2832,7 +3174,7 @@ export class AgentToolService {
         object.reviewedAt = prior.reviewedAt;
       }
     }
-    return { draft, objectIdMap, evidenceIdMap, draftRevision };
+    return { draft, objectIdMap, evidenceIdMap, draftRevision, authImpact: { familyKeys: [...impactFamilyKeys], crossPathMigrations: impactCrossPath }, baselineSignature };
   }
 
   /**
@@ -2848,23 +3190,70 @@ export class AgentToolService {
    * 的「读旧副本→await→整包保存」窗口内被覆盖丢失。
    */
   async markObjectsMachineReviewed(state: BuildRunState, scopePaths: string[] | null, reportId: string): Promise<number> {
+    return this.withKnowledgeDeclarationLock(state, () =>
+      this.markObjectsMachineReviewedLocked(state, scopePaths, reportId));
+  }
+
+  /** markObjectsMachineReviewed 的无锁内核（调用方必须已持声明锁）。 */
+  private markObjectsMachineReviewedLocked(state: BuildRunState, scopePaths: string[] | null, reportId: string): number {
+    const draft = this.loadKnowledgeDraft(state);
+    const scope = scopePaths ? new Set(scopePaths) : null;
+    const reviewedAt = new Date().toISOString();
+    let marked = 0;
+    for (const object of draft.objects) {
+      if (object.tombstone || !object.canonical) continue;
+      if (scope && !scope.has(object.canonical.path)) continue;
+      if (object.reviewStatus === 'passed' && object.reviewerId === reportId) continue; // 幂等
+      object.reviewStatus = 'passed';
+      object.reviewActorKind = 'machine';
+      object.reviewerId = reportId;
+      object.reviewedAt = reviewedAt;
+      marked += 1;
+    }
+    if (marked > 0) this.saveKnowledgeDraft(state, draft);
+    return marked;
+  }
+
+  /**
+   * v2 F08：权威回执驱动的对象凭据回写——同一声明锁临界区内重算当前
+   * 依赖并与审查提交时值精确核验（正文候选哈希 + 声明语义哈希 + 来源
+   * 快照 + 冻结规则）；全部匹配才回写。任何漂移返回 deferredReason，
+   * 不标记（对象保持 pending；发布侧 collectAuthorityValidatedReports
+   * 以同一组依赖拦截，双保险）。禁止无条件 mark passed。
+   */
+  private async markObjectsReviewedForAuthorityReceipt(
+    context: InternalRunContext,
+    expected: ReviewDependencyValues & { draftHash: string },
+    reportId: string,
+    meta?: ToolRequestMeta,
+  ): Promise<{ marked: number; deferredReason: string | null }> {
+    const state = requireBuildState(context);
     return this.withKnowledgeDeclarationLock(state, () => {
-      const draft = this.loadKnowledgeDraft(state);
-      const scope = scopePaths ? new Set(scopePaths) : null;
-      const reviewedAt = new Date().toISOString();
-      let marked = 0;
-      for (const object of draft.objects) {
-        if (object.tombstone || !object.canonical) continue;
-        if (scope && !scope.has(object.canonical.path)) continue;
-        if (object.reviewStatus === 'passed' && object.reviewerId === reportId) continue; // 幂等
-        object.reviewStatus = 'passed';
-        object.reviewActorKind = 'machine';
-        object.reviewerId = reportId;
-        object.reviewedAt = reviewedAt;
-        marked += 1;
+      // 审查凭据也是受控知识写入：重检ctx、actor、代次及发布窗口。
+      this.assertRunLeaseActive(context);
+      this.assertV2Access(context, 'kb_submit_review', meta);
+      const entriesNow = this.stagingDraftEntries(state);
+      if (computeCandidateHash({ documents: entriesNow }) !== expected.draftHash) {
+        return { marked: 0, deferredReason: 'draft_changed_since_review' };
       }
-      if (marked > 0) this.saveKnowledgeDraft(state, draft);
-      return marked;
+      const current = resolveCurrentReviewDependencies({
+        stagingRoot: state.stagingRoot,
+        snapshot: state.snapshot,
+        workflowRulesHash: state.v2WorkflowRulesHash ?? null,
+      });
+      if (current.declarationHash !== expected.declarationHash) {
+        return { marked: 0, deferredReason: 'knowledge_declaration_changed_since_review' };
+      }
+      if (current.sourceSnapshotHash !== expected.sourceSnapshotHash) {
+        return { marked: 0, deferredReason: 'source_snapshot_changed_since_review' };
+      }
+      if (current.workflowRulesHash === null || expected.workflowRulesHash === null
+        || current.workflowRulesHash !== expected.workflowRulesHash) {
+        // F08 补强：v2 权威规则哈希缺失即 fail-closed（缺证明不回写）
+        return { marked: 0, deferredReason: 'workflow_rules_changed_since_review' };
+      }
+      const marked = this.markObjectsMachineReviewedLocked(state, null, reportId);
+      return { marked, deferredReason: null };
     });
   }
 
@@ -3153,7 +3542,7 @@ export class AgentToolService {
    * 改后旧报告 hash 不匹配（发布门禁比对）。审查者无草稿写入口；
    * revisionResponse/closureBasis 属修订流程字段，提交时一律不读不存。
    */
-  private toolKbSubmitReview(context: InternalRunContext, args: Record<string, unknown>, meta?: ToolRequestMeta): ToolResult {
+  private async toolKbSubmitReview(context: InternalRunContext, args: Record<string, unknown>, meta?: ToolRequestMeta): Promise<ToolResult> {
     const state = requireBuildState(context);
     const worker = context.options.worker;
     if (worker && worker.phase !== 'review') {
@@ -3182,6 +3571,15 @@ export class AgentToolService {
     }
     const entries = this.stagingDraftEntries(state);
     const draftHash = computeCandidateHash({ documents: entries });
+    // v2 F08：审查依赖绑定——对象/证据声明 + 来源快照 + 冻结 workflow 规则
+    //（正文经 doc:* 逐路径与 draftHash 双重绑定）；发布侧同一权威核验。
+    const reviewDeps = v2Info
+      ? resolveCurrentReviewDependencies({
+        stagingRoot: state.stagingRoot,
+        snapshot: state.snapshot,
+        workflowRulesHash: state.v2WorkflowRulesHash ?? null,
+      })
+      : null;
     // v2（§4.3）：审查者既不是作者，也不在作者的续接链上
     if (v2Info) {
       try {
@@ -3255,11 +3653,21 @@ export class AgentToolService {
     };
     if (v2Info) {
       // v2（§4.3/§8）：ReviewReceipt 哈希绑定（正文/来源逐路径）+ 幂等回执
+      // F08：绑定扩展为「正文 + 对象/证据声明 + 来源快照 + 冻结 workflow 规则」
+      // 精确哈希；报告文件经 reportUnitId/reportId 双向绑定（F07 回执驱动源）。
+      const deps = reviewDeps!;
       v2Info.v2.actorStore.recordReview({
         reviewerTaskId: v2Info.actor!.nativeTaskId,
         draftHash,
-        dependencyHashes: Object.fromEntries(entries.map((entry) => [`doc:${entry.path}`, entry.contentHash])),
+        dependencyHashes: {
+          ...Object.fromEntries(entries.map((entry) => [`doc:${entry.path}`, entry.contentHash])),
+          [REVIEW_DEP_DECLARATION]: deps.declarationHash,
+          [REVIEW_DEP_SOURCE_SNAPSHOT]: deps.sourceSnapshotHash,
+          ...(deps.workflowRulesHash ? { [REVIEW_DEP_WORKFLOW_RULES]: deps.workflowRulesHash } : {}),
+        },
         ruleVersion: 'kb-review/1',
+        reportUnitId: unitId,
+        reportId: report.reportId,
         issues: issues.map((issue) => ({
           issueId: issue.issueId,
           severity: issue.severity,
@@ -3270,6 +3678,27 @@ export class AgentToolService {
         verdict: conclusion,
       });
       this.v2RecordReceipt({ v2: v2Info.v2, nativeTaskId: v2Info.actor!.nativeTaskId, kind: 'review', operationId: v2Info.operationId, payloadHash: v2Info.payloadHash, paths: [], result });
+    }
+    // v2 F08：pass 且无未关闭 blocking → 声明锁内按提交时依赖核验当前状态后
+    // 原子回写对象级机器审查凭据；任何漂移（正文/声明/来源/规则）都不回写
+    //（不无条件 mark passed；对象保持 pending，发布侧同一权威拦截）。
+    let credentialMarked = 0;
+    let credentialDeferred: string | null = null;
+    if (v2Info && conclusion === 'pass' && blocking === 0) {
+      const outcome = await this.markObjectsReviewedForAuthorityReceipt(
+        context,
+        { draftHash, ...reviewDeps! },
+        report.reportId,
+        meta,
+      );
+      credentialMarked = outcome.marked;
+      credentialDeferred = outcome.deferredReason;
+    }
+    if (credentialDeferred) {
+      (result.details as Record<string, unknown>).credentialDeferred = credentialDeferred;
+    }
+    if (credentialMarked > 0) {
+      (result.details as Record<string, unknown>).credentialMarked = credentialMarked;
     }
     return result;
   }
@@ -3519,7 +3948,16 @@ export class AgentToolService {
       throw new ToolError('build_publish_not_wired', '发布校验管线未接线（publishHandler 未注入）；候选已锁定在本窗口，请集成者接线后重试', 501);
     }
     try {
-      const outcome = await handler({ buildId: v2.actorStore.buildId, generation: v2.actorStore.activeGeneration, candidateHash, requestedRevision, summary });
+      // F11 补强：把本次工具调用的 Leader ctx 租约闭包随请求传递（服务端
+      // 内部引用比对，不经模型 JSON；wrapPublishExecutor 原样透传）。
+      const authorityLease = {
+        validate: () => {
+          if (!this.isContextLive(context)) {
+            throw new ToolError('run_token_invalid', '发布提交点：Leader 运行上下文已撤销（取消/换代/收尾），发布中止（CURRENT 未切换）', 401);
+          }
+        },
+      };
+      const outcome = await handler({ buildId: v2.actorStore.buildId, generation: v2.actorStore.activeGeneration, candidateHash, requestedRevision, summary, authorityLease });
       v2.actorStore.settlePublishRequest(request.requestId, outcome.accepted ? 'accepted' : 'rejected', outcome.result);
       return {
         content: [{ type: 'text', text: `发布申请 ${request.requestId} 已结算：${outcome.accepted ? 'accepted' : 'rejected'}（候选 ${candidateHash.slice(0, 12)}…）` }],
@@ -3540,34 +3978,38 @@ export class AgentToolService {
     }
     const maxLines = optionalInt(args, 'maxLines', 1200, 1, 4000);
     type BatchRequest = { kind: 'raw' | 'draft'; objToken?: string; path?: string; offset: number; limit?: number; includeDeclarations?: boolean };
+    const normalizeRequest = (raw: unknown, label: string): BatchRequest => {
+      const input = asRecord(raw);
+      if (!input) throw new ToolError('invalid_request', `${label} 每项必须是对象`);
+      if (input.kind !== 'raw' && input.kind !== 'draft') throw new ToolError('invalid_request', `${label}.kind 非法: ${String(input.kind)}`);
+      if (input.kind === 'raw' && typeof input.objToken !== 'string') throw new ToolError('invalid_request', 'raw 请求必须带 objToken');
+      if (input.kind === 'draft' && typeof input.path !== 'string') throw new ToolError('invalid_request', 'draft 请求必须带 path');
+      return {
+        kind: input.kind,
+        ...(input.kind === 'raw' ? { objToken: requireString(input, 'objToken', 1, 256) } : { path: requireString(input, 'path', 1, 600) }),
+        offset: optionalInt(input, 'offset', 0, 0, 10_000_000),
+        ...(input.limit !== undefined ? { limit: optionalInt(input, 'limit', 800, 1, 2000) } : {}),
+        ...(input.includeDeclarations === true ? { includeDeclarations: true } : {}),
+      };
+    };
     let queue: BatchRequest[];
+    // F05：每请求预算重置——cursor 只携带剩余队列与位置，不携带跨请求
+    // linesUsed（此前原样恢复导致续页 while(linesUsed<maxLines) 恒假，返回
+    // 空结果与相同 cursor，游标永久死锁）；携带旧版 linesUsed 字段时忽略。
     let linesUsed = 0;
     if (typeof args.cursor === 'string' && args.cursor) {
       try {
-        const decoded = JSON.parse(Buffer.from(args.cursor, 'base64url').toString('utf-8')) as { queue: BatchRequest[]; linesUsed: number };
-        if (!Array.isArray(decoded.queue) || typeof decoded.linesUsed !== 'number') throw new Error('shape');
-        queue = decoded.queue;
-        linesUsed = decoded.linesUsed;
-      } catch {
+        const decoded = JSON.parse(Buffer.from(args.cursor, 'base64url').toString('utf-8')) as { queue?: unknown };
+        if (!Array.isArray(decoded.queue) || decoded.queue.length === 0 || decoded.queue.length > 50) throw new Error('shape');
+        queue = decoded.queue.map((raw) => normalizeRequest(raw, 'cursor.queue'));
+      } catch (error) {
+        if (error instanceof ToolError) throw error;
         throw new ToolError('invalid_request', 'cursor 无效（请原样回传 nextCursor）');
       }
     } else {
       const inputs = requireArray(args, 'requests');
       if (inputs.length === 0 || inputs.length > 50) throw new ToolError('invalid_request', 'requests 必须是 1..50 项');
-      queue = inputs.map((raw) => {
-        const input = asRecord(raw);
-        if (!input) throw new ToolError('invalid_request', 'requests 每项必须是对象');
-        if (input.kind !== 'raw' && input.kind !== 'draft') throw new ToolError('invalid_request', `requests.kind 非法: ${String(input.kind)}`);
-        if (input.kind === 'raw' && typeof input.objToken !== 'string') throw new ToolError('invalid_request', 'raw 请求必须带 objToken');
-        if (input.kind === 'draft' && typeof input.path !== 'string') throw new ToolError('invalid_request', 'draft 请求必须带 path');
-        return {
-          kind: input.kind,
-          ...(input.kind === 'raw' ? { objToken: requireString(input, 'objToken', 1, 256) } : { path: requireString(input, 'path', 1, 600) }),
-          offset: optionalInt(input, 'offset', 0, 0, 10_000_000),
-          ...(input.limit !== undefined ? { limit: optionalInt(input, 'limit', 800, 1, 2000) } : {}),
-          ...(input.includeDeclarations === true ? { includeDeclarations: true } : {}),
-        };
-      });
+      queue = inputs.map((raw) => normalizeRequest(raw, 'requests'));
     }
     const results: Array<Record<string, unknown>> = [];
     const receipts: ReadReceiptRecord[] = [];
@@ -3666,7 +4108,7 @@ export class AgentToolService {
     }
     if (receipts.length > 0) this.appendReadReceipts(state, receipts);
     const nextCursor = queue.length > 0
-      ? Buffer.from(JSON.stringify({ queue, linesUsed }), 'utf-8').toString('base64url')
+      ? Buffer.from(JSON.stringify({ queue }), 'utf-8').toString('base64url')
       : null;
     return {
       content: [{ type: 'text', text: JSON.stringify({ results, nextCursor, linesUsed, budget: maxLines }, null, 2) }],
@@ -3687,8 +4129,9 @@ export class AgentToolService {
     if (v2 && v2.credential === 'child') {
       const { actor } = this.requireV2Actor(context, meta);
       const payloadHash = canonicalPayloadHash(args, ['operationId', 'expectedContentHash', 'expectedDraftRevision']);
-      const replay = this.v2Replay(v2, actor.nativeTaskId, operationId, payloadHash);
-      if (replay) return replay;
+      // F06：幂等预检移入锁内（editOperation 首步）——锁外预检时并发同键
+      // 调用会双双看到无回执，第二个持锁者不再重查、在已变更正文上二次
+      // 编辑（重复改/锚点丢失）；与 kb_write_doc 的锁内预检对齐。
       v2Info = { v2, actor, operationId, payloadHash };
     }
     const plainTarget = path.join(state.stagingRoot, 'docs', docPath);
@@ -3700,6 +4143,35 @@ export class AgentToolService {
     // 最终提交与回执记账之间无并发窗口；锁内最终落盘前重检写入窗口。
     // 非 v2（旧模式未下发本工具；防御路径）保持直调，writeDocCore 自行加锁。
     const editOperation = async (): Promise<ToolResult> => {
+    // F06：锁内幂等重查——排队期间同键同载荷已提交 → 重放原回执；
+    // 同键异载荷 → kb_idempotency_conflict（v2Replay 语义不变，仅时机后移）。
+    if (v2Info?.actor) {
+      const replay = this.v2Replay(v2Info.v2, v2Info.actor.nativeTaskId, v2Info.operationId, v2Info.payloadHash);
+      if (replay) return replay;
+      // F06：崩溃重放第二层——v2 回执丢失（崩溃重启语义，新 store 从盘
+      // 恢复而 receipts 未持久）时，声明幂等账本 calls（稳定键
+      // v2_<task>_<operationId>，不依赖桥接随机 toolCallId）已登记 = 本
+      // 操作正文已落盘。重放前必须核验载荷哈希（原子落盘时随 calls 条目
+      // 记录）：同载荷才重放原结果；异载荷报幂等冲突（同键不可假成功）；
+      // 旧账本缺哈希明确拒绝。必须在 expectedContentHash 校验之前（重试
+      // 携带的是编辑前基准，正文已变，否则误报冲突）。
+      const draftFile = path.join(state.stagingRoot, 'knowledge-draft.json');
+      if (state.knowledgeDraft || fs.existsSync(draftFile)) {
+        const pendingCalls = this.loadKnowledgeDraft(state).calls;
+        const priorCall = pendingCalls[stableV2CallKey(v2Info.actor.nativeTaskId, operationId)];
+        if (priorCall) {
+          this.verifyCallsLedgerPayload(priorCall, operationId, v2Info.payloadHash);
+          return {
+            content: [{ type: 'text', text: `已重放局部编辑 ${docPath}（幂等重放，docId=${priorCall.docId}，draftRevision=${priorCall.draftRevision}）` }],
+            details: {
+              path: priorCall.path, docId: priorCall.docId, bytes: priorCall.bytes,
+              idempotentReplay: true, draftRevision: priorCall.draftRevision,
+              edit: { operationId, patches: [], affectedObjects: Object.keys(priorCall.objectIdMap ?? {}).length, inheritedDeclarations: true, callsLedgerReplay: true },
+            },
+          };
+        }
+      }
+    }
     // v2（§4.2）：存在性与内容基准确认后再校验分配（未分配写入可重试）
     if (v2Info?.actor) {
       this.assertV2OutputAssignment(v2Info.v2, v2Info.actor.nativeTaskId, docPath);
@@ -3747,8 +4219,21 @@ export class AgentToolService {
           throw new ToolError('kb_edit_anchor_not_found', `patches[${index}] occurrence=${occurrence} 超出命中数 ${hits.length}`, 409);
         }
         const at = hits[occurrence - 1]!;
-        startLine = joined.slice(0, at).split('\n').length;
-        endLine = startLine + oldText.split('\n').length - 1;
+        // F04：字符区间精确替换——只动 oldText 命中的字符，行内前后缀与
+        // 多行边界内容一律保全（此前按起止行整行 splice，会把同行未选中的
+        // prefix/suffix 一并删除）。applied 坐标供声明平移（shiftBodyRange）
+        // 使用：旧行区间 = 命中首行..末行，新行数 = 前缀+newText+后缀的行数。
+        const before = joined.slice(0, at);
+        const after = joined.slice(at + oldText.length);
+        const hitStartLine = before.split('\n').length;
+        const hitEndLine = hitStartLine + oldText.split('\n').length - 1;
+        const spanPrefix = before.slice(before.lastIndexOf('\n') + 1);
+        const nextBreak = after.indexOf('\n');
+        const spanSuffix = after.slice(0, nextBreak < 0 ? after.length : nextBreak);
+        const spanLineCount = (spanPrefix + newText + spanSuffix).split('\n').length;
+        current = (before + newText + after).split('\n');
+        applied.push({ startLine: hitStartLine, endLine: hitEndLine, newLineCount: spanLineCount, anchor: `${kind}` });
+        continue;
       } else if (kind === 'heading_body') {
         const headingPath = optStrArray(anchor, 'headingPath');
         if (!headingPath || headingPath.length === 0) throw new ToolError('invalid_request', `patches[${index}].headingPath 必填`);
@@ -3803,10 +4288,22 @@ export class AgentToolService {
     // 重放两层互补（calls 账本 + v2 回执账本）。
     const editMeta: ToolRequestMeta = {
       ...(meta ?? {}),
-      toolCallId: meta?.toolCallId ?? (v2Info?.actor ? `v2_${v2Info.actor.nativeTaskId}_${operationId}` : `edit_${operationId}`),
+      // F06：v2 声明幂等账本（calls）用稳定键 v2_<task>_<operationId>——
+      // 桥接每次调用的 toolCallId 是随机 ID，回执丢失后的崩溃重放不能落
+      // 在随机键上（与 kb_write_doc 的 stableMeta 同口径）；非 v2 保持原
+      // 语义（调用侧 toolCallId 优先，缺省 edit_<operationId>）。
+      toolCallId: v2Info?.actor
+        ? stableV2CallKey(v2Info.actor.nativeTaskId, operationId)
+        : (meta?.toolCallId ?? `edit_${operationId}`),
     };
     const result = await this.writeDocCore(context, writeArgs, editMeta, {
-      ...(v2Info?.actor ? { lockHeld: true, recheck: () => this.assertV2WriteWindow(v2Info.v2, v2Info.actor!.nativeTaskId, meta, docPath) } : {}),
+      ...(v2Info?.actor
+        ? {
+          lockHeld: true,
+          recheck: () => this.assertV2WriteWindow(v2Info.v2, v2Info.actor!.nativeTaskId, meta, docPath),
+          idempotency: { payloadHash: v2Info.payloadHash },
+        }
+        : {}),
     });
     const affectedObjects = (writeArgs.objects as Array<Record<string, unknown>> | undefined)?.length ?? 0;
     const enriched: ToolResult = {
@@ -4440,6 +4937,12 @@ function canonicalPayloadHash(args: Record<string, unknown>, omitKeys: readonly 
     Object.entries(args).filter(([key]) => !omitKeys.includes(key)).map(([key, value]) => [key, canonical(value)]),
   );
   return crypto.createHash('sha256').update(JSON.stringify(filtered)).digest('hex');
+}
+
+/** v2 写入链声明幂等账本（calls）的稳定键：任务+operationId，不依赖
+ * 桥接每次随机分配的 toolCallId（F06；kb_write_doc/kb_edit_doc 共用）。 */
+function stableV2CallKey(nativeTaskId: string, operationId: string): string {
+  return `v2_${nativeTaskId}_${operationId}`;
 }
 
 /** 回执重放：从 ArtifactReceipt 恢复 ToolResult（带幂等标记）。 */

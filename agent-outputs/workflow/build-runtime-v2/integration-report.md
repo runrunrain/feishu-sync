@@ -43,3 +43,52 @@
 - 模型为本地 fixture（确定性脚本）——**非真实模型质量**；真实 LLM 性能未测。
 - codemode 防御（#8/#9）归 child-policy 任务；root native probe 已绿，本切片不重复。
 - UI 适配由 Leader 续接（DTO 字段已 additive 就位）。
+
+## 六、§13.2 取消/恢复硬验收 e2e（已完成：6/6 全绿）
+
+实测命令（cwd=server）：`AMAGI_PI_SOURCE_DIR=<amagi-pi 源> npx vitest run tests/build-runtime-e2e.test.ts` → **Tests 6 passed (6)**（~16s；最终复跑 /tmp/e2e-final2.log EXIT=0；fixture 模型无真实凭据）。
+
+| 用例 | 硬验收 | 关键证据 |
+| --- | --- | --- |
+| ① 正例升级版（7.1s） | 1 Leader + 2 真实 writer 并发产 2 篇 + 独立 reviewer + 真实候选发布 | `buildConcurrency=3`（host 分池 writer 槽 K−1=2）；fixture 记录每请求 `{t, doc}`，断言 A(overview)/B(details) 模型请求时间区间**双向重叠**（min(A)<max(B) ∧ min(B)<max(A)，queued 串行不重叠）；保留真实 system/skill 读取（read 正文验证「内容质量基线」marker 后才写）；acceptedDocumentCount=2；双文档进 release；终局 `GET build` `orchestrationMode='pi-amagi'` |
+| ② 运行中取消（5.0s） | ≥1 草稿已提交后取消：旧凭据拒绝、CURRENT 不切、Leader/child/桥退出 | status=cancelled；CURRENT 指针保持取消前 releaseId 不变；Leader 旧 pid ESRCH；权威账本 `staging build-actors/events.jsonl` 含 `generation_revoked`；**旧凭据拒绝直接证据（steer #4②）**：取消前经 `BuildRuntimeHost.listChildBridgeTokens`（新增诊断方法）取证真实已签发且被 write_doc 回执证明使用的桥令牌，取消后重放 `POST /api/agent-internal/tools/build_manifest`（X-Agent-Run-Token）→ **401 `run_token_invalid`** |
+| ③ checkpoint 真实恢复（2.6s） | 漂移拒同会话 → 成果级恢复 → 双文档发布且 A 不重写 | provider baseUrl 漂移 → session 恢复被拒（build failed，error `kb_resume_runtime_changed`）；还原后 `resume(rebuild)` 202 → 新 Leader（成果级，代次≥2）→ 补写 details.md → diting 审查 → **published**；release 含双文档且 overview 正文为 run1 原文；权威账本 write_doc 回执 overview=1 次（不重写）/details=1 次；终局 DTO `orchestrationMode='pi-amagi'` |
+| ④ 重启后保留（~1s） | 持久模式跨实例 | 新 `buildServer` 实例（同 config/home）GET build → status=published、`orchestrationMode='pi-amagi'` |
+
+**steer #2 同步与适配（root c985790）**：`local-map-store.ts`（kb_builds.orchestration_mode 列）/`build-checkpoint.ts`（optional mode）只读副本已同步（chmod 444）；KBservice 六小段适配（saveCheckpoint 记 mode、toDto fallback `row.orchestration_mode`、createBuild 传模式、resumeBuild savedMode 优先 checkpoint→leaderRun→DB + 不受支持拒绝 + session 无冻结拒绝），未覆盖本树取消/恢复修复；root `build-runtime-persisted-mode.test.ts` 4 例同步后本树实测 **4/4**。
+
+**恢复 300s 卡死根因（steer #4③ 澄清）**：非 read-receipts/kb_evidence_invalid（未复现）——实为成果级恢复复用同一 pi 会话：resume 判定误锚首条 user（原始任务）走 fresh 分支，且 diting 派发计数把取消前已终止的派发算作在途 → 永等被杀子任务。修复：resume 判定锚定**末条** user（续接 briefing）+ 派发/审查计数只统计 briefing 之后切片。产品门禁零删改。
+
+**多轮实测修复（均 fixture 行为不当）**：amagi 死循环保护（同参连续 4 次调用即终止子任务）×3 → read 垫拍交替/递增路径/调用计数控制时长；桥结果文本词序（`已提交交接记录 ho_`/`已提交审查报告 kr_` 与旧断言不符）→ 按真实文本匹配；角色判定被技能正文词汇污染（diting 误入 writer 分支调未授权工具）→ 锚定首条 user；fixture 步数上限 60→200。
+
+## 七、最终验证汇总（本切片增量）
+
+- `npx tsc --noEmit` EXIT=0；`npx eslint`（改动 5 文件）EXIT=0
+- e2e **6/6**（install/正例并发/取消/恢复/重启保留）；persisted-mode 4/4 + 自有 integration 16 + checkpoint 4 = **24/24**
+- 未整体重跑：前轮兄弟+回归批次 335/335 在最后三处 additive 改动（host 诊断方法/index 挂钩/KBservice 模式段，root 已于其环境验证）后未再全套重跑，如需由 Leader 统一回归
+- 模型为本地 fixture（确定性脚本）——**非真实模型质量**；UI 复验归 Leader（root 侧已过）
+
+## 八、阶段交付（steer #5：停止 fixture 迭代，保存现场移交 findings 修复批）
+
+### 本轮产品代码变化（对照主链终版；注：仓库无 `c593` git 对象，锚定主树 `c985790→25cc0b4` 系列）
+
+产品源码仅 3 处、均为 additive：
+1. `server/src/kb/build-runtime-host.ts`：+`listChildBridgeTokens(buildId)` 诊断方法（~6 行；e2e 旧凭据重放取证用，撤销后立即失效，不新增授权面）
+2. `server/src/index.ts`：+`__listChildBridgeTokens` 挂钩（2 行，与 `__agentToolService` 同区，仅诊断出口）
+3. `server/src/kb/kb-build-service.ts`：root c985790 模式持久化 6 小段适配（saveCheckpoint 记 orchestrationMode / toDto fallback `row.orchestration_mode` / createBuild 签名+传模式 / resumeBuild savedMode 优先 checkpoint→leaderRun→DB + 不受支持拒绝 + session 无冻结拒绝 + updateKbBuild 传模式）——未覆盖本树取消/恢复逻辑
+
+整文件同步（root 版本，chmod 444）：`local-map-store.ts`（kb_builds.orchestration_mode 列）、`build-checkpoint.ts`（optional orchestrationMode）；测试副本 `build-runtime-persisted-mode.test.ts`（本树 4/4 实测过）。
+
+### 并发用词纠正（steer #5 要求）
+
+早前 K=2 轮次（buildConcurrency=2 → host 分池 writer 槽=1）A/B 为**串行**（amagi 后台单槽排队，B 等 A settle 后才启动）——此前若表述「并发」不成立，予以纠正。终版 K=3（writer 槽=2）后为真实重叠：fixture 记录每请求 `{t, doc}`，正例断言 A(overview)/B(details) 模型请求时间区间双向重叠（min(A)<max(B) ∧ min(B)<max(A)）实测通过；未把 queued 计为并发。
+
+### F09/F10/F11 如实移交（e2e 绿 ≠ 产品闭环）
+
+- **F09**（rebuild 同 home+固定 sessionId 复用旧会话；旧 actors running 未清）：本树恢复用例通过依赖 fixture 侧适配（resume 判定锚定末条 user、派发计数取 briefing 切片），**未修产品根因**；修复归 findings 批，修后可直接复用本套 e2e（断言覆盖漂移拒同会话/成果保留/不重写已接受稿/双文档发布/代次≥2）。
+- **F10/F11**：本树未触碰；取消用例的 401 重放证据与既有四断言（cancelled/CURRENT 不切/ESRCH/账本 generation_revoked）可在产品修复后复验。
+- F01–F08 等其余 findings 不在本切片写面，未触碰。
+
+### 清理与现场
+
+专用 Pi/桥进程零残留（`pgrep -f 'build-b_'` 0）；e2e 临时 home 由 afterAll 常规清理，失败轮次日志保留于 `/tmp/e2e-ext*.log`；工作树改动未提交（Leader 统一回流）；兄弟只读副本未改动。

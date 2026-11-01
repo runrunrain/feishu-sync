@@ -39,6 +39,7 @@ import type {
   CancelResult,
   RuntimeBinding,
   RuntimeEvent,
+  TerminationOutcome,
 } from '../agent/build-runtime/contracts.js';
 import type {
   LeaderActorRecord,
@@ -72,6 +73,9 @@ export interface LeaderSupervisorCallbacks {
   nudge: (binding: RuntimeBinding | null, message: string) => Promise<void>;
   /** 当前运行环境冻结值（会话恢复比对；宿主探测产出）。 */
   currentRuntimeFreeze: () => { piVersion: string; amagiContentHash: string; agentDirConfigHash: string; workflowRevision: string };
+  /** F10：残留对账（宿主→adapter；返回 null=无 binding 可对账）。
+  * prepareResume 遇到未确认终止记录时重试对账；仍 unconfirmed → 拒绝启动。 */
+  reconcileResiduals?: (binding: RuntimeBinding | null) => Promise<TerminationOutcome | null>;
   /** 成果账本快照计数（进度 DTO 汇总；真相在 BuildActorStore）。 */
   actorSnapshot: () => { acceptedDocumentCount: number; openBlockingCount: number; activeAssignments: number };
   /** 检查点导出钩子（同步 actorStore 全量载荷进检查点；可选）。 */
@@ -144,18 +148,21 @@ export function runtimeFreezeMismatches(
   return mismatches;
 }
 
-/** 初始监督状态（新构建；generation 从 1 起）。 */
+/** 初始监督状态（新构建；generation 从 1 起；F09：epoch 同样从 1 起）。 */
 export function freshLeaderRunState(spec: BuildRunSpec, material: LeaderRunMaterial): LeaderRunCheckpointState {
   return {
     schemaVersion: 2,
     orchestrationMode: 'pi-amagi',
     generation: spec.generation,
+    runtimeEpoch: 1,
     spec,
     material,
     binding: null,
     eventCursor: {},
     actors: [],
     actorPayload: null,
+    rounds: { started: 0, ended: 0 },
+    termination: null,
     idleRemindedAt: null,
     publishRequest: null,
     lastUsage: null,
@@ -178,14 +185,23 @@ export class BuildLeaderSupervisor {
   private readonly idleGraceMs: number;
   private readonly idleTickMs: number;
 
+  private readonly resumeReconcileTimeoutMs: number;
+
   constructor(
     private readonly cb: LeaderSupervisorCallbacks,
     /** 监督状态（随构建 entry 共享引用；恢复时传入检查点还原）。 */
     public state: LeaderRunCheckpointState,
-    options: { idleGraceMs?: number; idleTickMs?: number } = {},
+    options: { idleGraceMs?: number; idleTickMs?: number; resumeReconcileTimeoutMs?: number } = {},
   ) {
     this.idleGraceMs = options.idleGraceMs ?? DEFAULT_LEADER_IDLE_GRACE_MS;
     this.idleTickMs = options.idleTickMs ?? 1_000;
+    // 裁决 #5 后生产不主动发信号：残留个体依赖自然退出收敛，恢复门控在
+    // 期限内重试对账（每 2s 一次；仍 unconfirmed → 拒绝，不弱化证明）。
+    this.resumeReconcileTimeoutMs = options.resumeReconcileTimeoutMs ?? 15_000;
+    // F15：轮次计数从检查点恢复（旧检查点缺省 → 从 0 计，DTO 口径在服务层
+    // 以 rounds 字段有无区分真实计数与未知，不在监督器伪造）。
+    this.roundsStarted = this.state.rounds?.started ?? 0;
+    this.roundsEnded = this.state.rounds?.ended ?? 0;
   }
 
   /** 旧 Leader 是否仍存活（恢复前守卫：活着即拒绝第二个 Leader）。 */
@@ -204,10 +220,12 @@ export class BuildLeaderSupervisor {
   /** 进度 DTO（侧栏/诊断；来源=监督状态 + 宿主成果快照，不虚构字段）。 */
   progress(): LeaderRunProgressDto {
     const snapshot = this.cb.actorSnapshot();
+    const terminationSummary = BuildLeaderSupervisor.processTerminationSummaryOf(this.state.termination);
     return {
       buildId: this.state.spec.buildId,
       orchestrationMode: 'pi-amagi',
       generation: this.state.generation,
+      runtimeEpoch: this.state.runtimeEpoch ?? null,
       leader: this.state.binding
         ? {
           sessionId: this.state.binding.leaderSessionId,
@@ -222,10 +240,13 @@ export class BuildLeaderSupervisor {
         status: actor.status,
         execState: actor.execState,
         lastEventAt: actor.lastEventAt,
+        runtimeEpoch: actor.runtimeEpoch ?? null,
+        generation: actor.generation,
       })),
       rounds: { started: this.roundsStarted, ended: this.roundsEnded },
       idle: { remindedAt: this.state.idleRemindedAt, lastActivityAt: new Date(this.lastActivityAt).toISOString() },
       publishRequest: this.state.publishRequest,
+      processTermination: terminationSummary,
       summary: {
         acceptedDocumentCount: snapshot.acceptedDocumentCount,
         openBlockingCount: snapshot.openBlockingCount,
@@ -235,10 +256,29 @@ export class BuildLeaderSupervisor {
         cumulativeUsage: null,
       },
       endedReason: this.state.endedReason,
-      termination: this.cancelRequested ? 'cancelling' : this.state.endedReason ? 'finished' : 'none',
+      // F10：未确认终止优先于 finished 呈现（不把未确认回收当完成；恢复受阻）；
+      // cancelling 仅在取消进行中（未终局）时显示
+      termination: this.cancelRequested && !this.state.endedReason
+        ? 'cancelling'
+        : terminationSummary?.state === 'unconfirmed'
+          ? 'termination-unconfirmed'
+          : this.state.endedReason ? 'finished' : 'none',
       skill: { path: this.state.spec.workflowSkillPath, revision: this.state.spec.workflowRevision },
       eventCursor: { ...this.state.eventCursor },
       updatedAt: this.state.updatedAt,
+    };
+  }
+
+  /** F10：终止对账安全摘要（不含个体细节；供 DTO 消费）。 */
+  private static processTerminationSummaryOf(termination: LeaderRunCheckpointState['termination']): LeaderRunProgressDto['processTermination'] {
+    if (!termination) return null;
+    return {
+      state: termination.state,
+      at: termination.at,
+      note: termination.note,
+      unconfirmedPids: termination.children
+        .filter((child) => child.verdict === 'unconfirmed')
+        .map((child) => child.pid),
     };
   }
 
@@ -259,10 +299,24 @@ export class BuildLeaderSupervisor {
           leaderExit: null,
           credentialsRevoked: false,
           residualNote: `终止异常：${error instanceof Error ? error.message : String(error)}`,
+          // F10：终止异常也必须有持久化对账记录——unconfirmed 阻断第二 Leader，
+          // 不因异常路径丢失结果（此前 catch 后仅记日志，重启后无据可查）。
+          termination: {
+            state: 'unconfirmed',
+            at: new Date().toISOString(),
+            leaderExit: null,
+            children: [],
+            note: `终止异常：${error instanceof Error ? error.message : String(error)}`,
+          },
         };
       }
       if (this.cancelResult && !this.cancelResult.credentialsRevoked) {
         this.cb.log('warn', `运行层报告凭据未确认撤销（${this.cancelResult.residualNote}）；应用侧令牌已先行撤销`);
+      }
+      // F10：终止对账结果贯穿持久化（state.termination 随检查点落盘；
+      // unconfirmed 时后续 resume 守卫拒绝第二 Leader）。
+      if (this.cancelResult?.termination) {
+        this.state.termination = this.cancelResult.termination;
       }
       return this.cancelResult;
     })();
@@ -296,13 +350,75 @@ export class BuildLeaderSupervisor {
     }
   }
 
-  /** 会话级恢复前置校验：冻结比对 + 第二 Leader 守卫（不通过抛 ToolError）。 */
-  private prepareResume(options: LeaderRunOptions): void {
-    if (options.resumeMode === 'fresh') return;
+  /** 启动前置校验：第二 Leader 守卫 + 新鲜终止对账（一切模式；不通过抛 ToolError）+ 冻结比对（恢复模式）。 */
+  private async prepareResume(options: LeaderRunOptions): Promise<void> {
+    // 模式归一（run() 传原始 options；生产 fresh 调用面 resumeMode 未定义——
+    // 归一后 fresh 不再落入恢复换代/冻结比对分支，与显式 'fresh' 同语义）。
+    const resumeMode = options.resumeMode ?? 'fresh';
+    // F09：第二 Leader 守卫必须先于一切回收——旧 Leader 还活着时，
+    // 其子任务不是残留，绝不能在对账里误杀（fresh 检查点无 binding 恒跳过；
+    // binding 未落盘的窗口由账本存活检测兑底，见宿主对账）。
     if (this.isOldLeaderAlive()) {
       throw new ToolError('kb_leader_alive', `上一个 Leader 进程（pid=${this.state.binding?.leaderPid ?? '未知'}）仍在运行，不得启动第二个 Leader；请先取消旧构建或等待其退出`, 409);
     }
-    if (options.resumeMode === 'session') {
+    // F10-R3（steer 调整 #1）：一切带旧运行事实的启动（session/rebuild/**
+    // fresh 带事实**）都必须先取得**新鲜**残留对账证明，且在推进 epoch/
+    // 换代/启动新 Leader 之前完成，不可命中过窄：
+    // - termination 缺失/null 不是 confirmed（应用硬崩来不及写终止记录的
+    //   窗口：binding 未落盘但账本/旧 epoch 目录已有事实）；
+    // - 已 confirmed 也可能陈旧，启动前重新证明；
+    // - 宿主对账为构建级跨 epoch（rebuild 换目录不能绕过旧 epoch 残留），
+    //   并含账本未收口 Leader 存活检测（其子任务不是残留）；
+    // - 全新构建（新 buildId 无任何事实）宿主返回 null，零成本跳过。
+    // 仍 unconfirmed → 拒绝启动（含成果级 rebuild——换 epoch 也不能绕过）。
+    const attemptReconcile = () => this.cb.reconcileResiduals
+      ? this.cb.reconcileResiduals(this.state.binding).catch((error: unknown) => {
+        this.cb.log('warn', `残留对账重试失败：${error instanceof Error ? error.message : String(error)}`);
+        return null;
+      })
+      : Promise.resolve(null);
+    let recheck = await attemptReconcile();
+    // 期限内有界重试：生产零信号裁决 #5 后，存活残留依赖自然退出——
+    // 每 2s 重对账直至 confirmed 或超期（不弱化证明，只等收敛）。
+    const reconcileDeadline = Date.now() + this.resumeReconcileTimeoutMs;
+    while (recheck && recheck.state === 'unconfirmed' && Date.now() < reconcileDeadline) {
+      // 有界等待（不 unref：恢复门控是调用方正在等待的关键路径，期限 ≤15s）
+      await new Promise((resolve) => { setTimeout(resolve, 2_000); });
+      recheck = await attemptReconcile();
+    }
+    if (recheck) {
+      // 恢复路径（session/rebuild）：一律落盘——重试清障要覆盖旧的 unconfirmed
+      // 记录，不能留陈旧阻断。fresh：仅在有实质内容时落盘（全新构建宿主返回
+      // null；带事实但无个体 的空对账不伪造启动前终止记录）。
+      const resumeLike = resumeMode !== 'fresh';
+      if (resumeLike || recheck.state === 'unconfirmed' || recheck.children.length > 0) {
+        this.state.termination = recheck;
+      }
+    }
+    const recordedState = this.state.termination?.state ?? this.state.binding?.termination?.state ?? null;
+    if (!recheck) {
+      // 宿主对账不可得（未接线或判定无旧运行事实）：存在未确认记录 → fail-closed
+      if (recordedState === 'unconfirmed') {
+        const note = this.state.termination?.note ?? this.state.binding?.termination?.note ?? '无对账结果';
+        throw new ToolError(
+          'kb_termination_unconfirmed',
+          `上次终止对账未确认（${note}）且本次无法重新对账；已阻断第二个 Leader（含成果级重建）。请人工确认残留进程后重试`,
+          409,
+        );
+      }
+    } else if (recheck.state === 'unconfirmed') {
+      throw new ToolError(
+        'kb_termination_unconfirmed',
+        `残留对账未确认（${recheck.note}）；已阻断第二个 Leader（含成果级重建）。请人工确认残留进程后重试`,
+        409,
+      );
+    } else if (recordedState === 'unconfirmed') {
+      this.cb.log('info', '残留对账重试成功，未确认记录已解除');
+    }
+    // fresh 到此为止：无恢复语义（无冻结比对/换代/换 epoch）；带旧运行事实的
+    // fresh（如崩溃未落 leaderRun 的恢复）已在上面对账门控中覆盖。
+    if (resumeMode === 'fresh') return;
+    if (resumeMode === 'session') {
       const binding = this.state.binding;
       if (!binding || !binding.leaderSessionId || !binding.resumeCapability.session) {
         throw new ToolError('kb_resume_unsupported', '该运行的运行时绑定不支持原会话续接（会话 ID 缺失或能力不足）；请选择成果级恢复或重新构建', 409);
@@ -322,6 +438,14 @@ export class BuildLeaderSupervisor {
     this.state.spec = { ...this.state.spec, generation };
     this.state.endedReason = null;
     this.state.idleRemindedAt = null;
+    // F09：成果级重建换新 epoch（全新 agentDir/会话/amagi 内部库）；
+    // 原会话续接保持原 epoch（legacy 检查点无 epoch → rebuild 从 1 起）。
+    if (resumeMode === 'rebuild') {
+      this.state.runtimeEpoch = (this.state.runtimeEpoch ?? 0) + 1;
+      // 旧 epoch 任务归历史：不参与新 epoch 活跃/idle 判定（evaluateIdle 按
+      // epoch 过滤；记录保留在 actors 列表作历史展示）。
+      this.cb.log('info', `成果级重建：epoch ${this.state.runtimeEpoch - 1} → ${this.state.runtimeEpoch}（全新 agentDir/会话/amagi 内部库；旧任务仅作历史）`);
+    }
     options.spec = { ...options.spec, generation };
     this.cb.rotateGeneration?.(generation, '恢复换代（账本/宿主同步 rotate）');
     this.credentialsRevoked = false; // 新代次凭据由宿主在 startLeader 签发
@@ -336,10 +460,11 @@ export class BuildLeaderSupervisor {
     if (signal.aborted) void this.requestCancel();
     else signal.addEventListener('abort', onAbort, { once: true });
     try {
-      // 1. 恢复守卫（会话级冻结比对 + 第二 Leader 守卫 + 换代）。
-      this.prepareResume(options);
+      // 1. 恢复守卫（终止对账 + 会话级冻结比对 + 第二 Leader 守卫 + 换代/换 epoch）。
+      await this.prepareResume(options);
 
       // 2. Leader 占进程池 build 通道 1 个槽位（子任务由 amagi 启动，不入池）。
+      // 取消竞态由外层 catch 统一按取消收口（F10 取消语义修复）。
       this.slot = await this.acquireSlot(signal);
 
       // 3. 启动/续接 Leader（宿主：探测 + 上下文签发 + 初始 prompt）。
@@ -353,16 +478,45 @@ export class BuildLeaderSupervisor {
 
       // 4. 事件监督循环。
       outcome = await this.supervise(signal);
+    } catch (error) {
+      // 取消竞态（F10 取消语义）：run 主体任一环节因 abort 抛错（cancelBuild
+      // 触发，如池排队 AbortError/派发中 abort）时按取消收口，不把 AbortError
+      // 裸抛成 kb_build_failed；非取消异常原样上抛不伪装。
+      if (signal.aborted) {
+        this.cancelRequested = true;
+        this.cb.log('info', `监督在取消信号后中断（${error instanceof Error ? error.message : String(error)}），按取消收口`);
+        outcome = { kind: 'cancelled' };
+      } else {
+        throw error;
+      }
     } finally {
       signal.removeEventListener('abort', onAbort);
       // 终局撤凭据：发布申请后进入校验/发布，不再接受任何模型写入。
       this.revokeCredentials('监督结束');
       // Leader 进程一并关闭（任何终局——含发布成功——都不再需要它；
       // 宽限终止幂等；已走 requestCancel 的路径不重复）。
+      // F10：非取消终局的终止结果同样持久化（此前被丢弃 → 重启后无据可查、
+      // 残留无人对账）；异常退出路径的残留对账在这里闭环。
       if (this.activeBinding && !this.cancelResult) {
         try {
-          await this.cb.cancelLeader(this.activeBinding);
-        } catch { /* 已尽力：残留由取消结果如实暴露 */ }
+          const finalCancel = await this.cb.cancelLeader(this.activeBinding);
+          if (finalCancel?.termination) {
+            this.state.termination = finalCancel.termination;
+            if (finalCancel.termination.state === 'unconfirmed') {
+              this.cb.log('warn', `终局终止对账未确认（${finalCancel.termination.note}）；已持久化并阻断后续 Leader`);
+            }
+          }
+        } catch (error) {
+          // 终止异常也必须留下持久化未确认记录，不能 catch 后无声丢弃
+          this.state.termination = {
+            state: 'unconfirmed',
+            at: new Date().toISOString(),
+            leaderExit: null,
+            children: [],
+            note: `终局终止异常：${error instanceof Error ? error.message : String(error)}`,
+          };
+          this.cb.log('error', `终局 Leader 终止异常（已按未确认持久化）：${error instanceof Error ? error.message : String(error)}`);
+        }
       }
       this.state.endedReason = this.state.endedReason ?? (outcome ? outcome.kind : 'error');
       // 原地更新（保引用）：entry.leaderRun 与服务侧直写始终可见同一对象。
@@ -397,7 +551,7 @@ export class BuildLeaderSupervisor {
     }
   }
 
-  private upsertActor(record: Partial<Omit<LeaderActorRecord, 'generation' | 'lastEventAt'>> & { nativeTaskId: string }): void {
+  private upsertActor(record: Partial<Omit<LeaderActorRecord, 'generation' | 'lastEventAt' | 'runtimeEpoch'>> & { nativeTaskId: string }): void {
     const now = new Date().toISOString();
     const existing = this.state.actors.find((actor) => actor.nativeTaskId === record.nativeTaskId);
     if (existing) {
@@ -412,6 +566,8 @@ export class BuildLeaderSupervisor {
       nativeTaskId: record.nativeTaskId,
       parentTaskId: record.parentTaskId ?? null,
       generation: this.state.generation,
+      // F09：登记时打上 epoch 戳（旧 epoch 任务跨 rebuild 不再计入活跃/idle）。
+      ...(this.state.runtimeEpoch !== undefined ? { runtimeEpoch: this.state.runtimeEpoch } : {}),
       role: record.role ?? 'unknown',
       status: record.status ?? 'pending',
       execState: record.execState ?? null,
@@ -436,11 +592,13 @@ export class BuildLeaderSupervisor {
       case 'round_started':
         this.roundActive = true;
         this.roundsStarted += 1;
+        this.state.rounds = { started: this.roundsStarted, ended: this.roundsEnded }; // F15：随检查点持久化
         return { critical: false, outcome: null };
       case 'round_ended':
         // 首个 agent_end 不代表构建结束（后台完成会触发 Leader 新一轮）。
         this.roundActive = false;
         this.roundsEnded += 1;
+        this.state.rounds = { started: this.roundsStarted, ended: this.roundsEnded }; // F15：随检查点持久化
         this.cb.log('info', `Leader 第 ${this.roundsEnded} 轮结束（agent_end ≠ 构建结束），继续监督`);
         return { critical: true, outcome: null };
       case 'task_created': {
@@ -568,8 +726,17 @@ export class BuildLeaderSupervisor {
    * 桥接无活动，持续超过宽限。首次只提醒一次；再次空闲 → leader_idle。 */
   private evaluateIdle(): LeaderRunOutcome | null {
     if (this.roundActive) return null;
+    // F09：旧 epoch 任务仅作历史——不参与当前活跃判定（否则 rebuild 后
+    // 新代次收不到旧通知，永远达不到空闲收口）。
+    // F09-R1：与前端 isHistoricalRuntimeTask 同一口径——同 epoch 的旧代次
+    // actor（session 续接换代后其完成通知永不再来）同样只作历史，不得挂住
+    // 两段空闲收口；历史记录仍在 actors 列表供 DTO/前端展示。
+    const currentEpoch = this.state.runtimeEpoch;
     const activeActors = this.state.actors.filter(
-      (actor) => actor.status !== 'revoked' && ACTIVE_EXEC_STATES.has(actor.execState ?? ''),
+      (actor) => actor.status !== 'revoked'
+        && (actor.runtimeEpoch === undefined ? currentEpoch === undefined : actor.runtimeEpoch === currentEpoch)
+        && (actor.generation === undefined || actor.generation === this.state.generation)
+        && ACTIVE_EXEC_STATES.has(actor.execState ?? ''),
     );
     if (activeActors.length > 0) return null;
     if (Date.now() - this.lastActivityAt < this.idleGraceMs) return null;

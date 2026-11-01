@@ -24,6 +24,11 @@
  *     按 Pi tool_call 契约把守卫产物【原地写回 event.input】（mutate in place，
  *     修改后不重校验，执行时参数即修改后参数），非法角色/越界模型覆盖直接 block。
  *     守卫审计（DispatchGuardAudit）以单行 JSON 写 stderr。
+ *   - F12 派发前运行期完整性重核验：每次 task_submit/task_resume 先经
+ *     guardApi.verifyRuntimeIntegrity（磁盘冻结面 vs 信封冻结引用：四配置/
+ *     child-policy/包全量哈希）+ Leader agentDir 一致性核对，不 ok 即 block——
+ *     防 Leader 启动后 policy 缺失/settings 资源注入被静默跳过（Pi 对
+ *     settings 缺失扩展静默 skip 已实测复现）。
  *
  * 构建环境契约（两个 env 都必填；字段由集成方与 build-runtime 配置契约对齐）：
  *   FEISHU_SYNC_BUILD_GUARD_MODULE = <dispatch-guard 模块绝对路径>
@@ -55,6 +60,9 @@ const API_KEY_ENV = 'FEISHU_SYNC_AGENT_API_KEY';
 const PROVIDER_JSON = process.env.FEISHU_SYNC_AGENT_PROVIDER_JSON || '';
 const BUILD_SPEC_JSON = process.env.FEISHU_SYNC_AGENT_BUILD_SPEC_JSON || '';
 const BUILD_GUARD_MODULE = process.env.FEISHU_SYNC_BUILD_GUARD_MODULE || '';
+// F12：Leader agentDir 在模块装载时快照（真实 pi 进程 env 装载前已定且全程稳定；
+// 与 BUILD_SPEC_JSON 等其他 env 同一读取时机，避免工厂调用时点差异）。
+const AGENT_DIR_AT_LOAD = process.env.PI_CODING_AGENT_DIR || '';
 
 /** 应用 task 工具族（tool-specs.ts TASK_TOOL_NAMES）：构建模式绝不由本扩展注册。 */
 const APP_TASK_TOOL_FAMILY = new Set(['task_submit', 'task_query', 'task_resume', 'task_cancel']);
@@ -127,6 +135,31 @@ async function apiPost(path, payload) {
 /** 运行时 dispatch-guard 模块需要的导出面（guardTaskSubmit/guardTaskResume/validateGuardConfig）。 */
 const REQUIRED_GUARD_EXPORTS = ['guardTaskSubmit', 'guardTaskResume', 'validateGuardConfig'];
 
+/** F12 运行期完整性核验模块需要的导出面（与 guard 模块同目录装载，独立单文件依赖约束）。 */
+const REQUIRED_INTEGRITY_EXPORTS = ['verifyRuntimeIntegrity', 'validateRuntimeIntegrityRefs'];
+
+/** amagi-package 需要的导出面（全量包哈希 walker，注入 verifyRuntimeIntegrity）。 */
+const REQUIRED_AMAGI_EXPORTS = ['computePackageContentHash'];
+
+/** 由 FEISHU_SYNC_BUILD_GUARD_MODULE 推导同目录姊妹模块路径（保持 .ts/.js 后缀）。 */
+function deriveSiblingModulePath(guardModulePath, sibling) {
+  return guardModulePath.replace(/dispatch-guard(\.[cm]?js|\.ts)$/, `${sibling}$1`);
+}
+
+async function loadModuleAtPath(modulePath, label, requiredExports) {
+  let mod;
+  try {
+    mod = await import(pathToFileURL(modulePath).href);
+  } catch (error) {
+    throw new Error(`${label} 模块加载失败（${modulePath}）：${error instanceof Error ? error.message : String(error)}`);
+  }
+  const missing = requiredExports.filter((name) => typeof mod[name] !== 'function');
+  if (missing.length > 0) {
+    throw new Error(`${label} 模块缺少导出：${missing.join(', ')}（${modulePath}）`);
+  }
+  return mod;
+}
+
 /**
  * 解析构建 spec 信封：{ tools, guard }。只校验扩展自身的白名单字段；
  * guard 的全部语义校验委托运行时 validateGuardConfig（不在本文件复制权限逻辑）。
@@ -169,17 +202,7 @@ async function loadDispatchGuard(modulePath) {
   if (!modulePath || !path.isAbsolute(modulePath)) {
     throw new Error('构建模式缺少 FEISHU_SYNC_BUILD_GUARD_MODULE（运行时 dispatch-guard 模块绝对路径）');
   }
-  let guard;
-  try {
-    guard = await import(pathToFileURL(modulePath).href);
-  } catch (error) {
-    throw new Error(`dispatch-guard 模块加载失败（${modulePath}）：${error instanceof Error ? error.message : String(error)}`);
-  }
-  const missing = REQUIRED_GUARD_EXPORTS.filter((name) => typeof guard[name] !== 'function');
-  if (missing.length > 0) {
-    throw new Error(`dispatch-guard 模块缺少导出：${missing.join(', ')}（${modulePath}）`);
-  }
-  return guard;
+  return loadModuleAtPath(modulePath, 'dispatch-guard', REQUIRED_GUARD_EXPORTS);
 }
 
 /** 把守卫产物原地写回 event.input（Pi tool_call 契约：原地修改才进入执行；对象身份不变）。 */
@@ -207,11 +230,29 @@ export default async function feishuSyncAgentExtension(/** @type {ExtensionAPI} 
     }
     const envelope = parseBuildSpecEnvelope(BUILD_SPEC_JSON);
     const guardApi = await loadDispatchGuard(BUILD_GUARD_MODULE);
+    const integrityApi = await loadModuleAtPath(deriveSiblingModulePath(BUILD_GUARD_MODULE, 'runtime-integrity'), 'runtime-integrity', REQUIRED_INTEGRITY_EXPORTS);
+    const amagiApi = await loadModuleAtPath(deriveSiblingModulePath(BUILD_GUARD_MODULE, 'amagi-package'), 'amagi-package', REQUIRED_AMAGI_EXPORTS);
+    const verifyIntegrity = (refs) => integrityApi.verifyRuntimeIntegrity(refs, { computePackageContentHash: amagiApi.computePackageContentHash });
     const issues = guardApi.validateGuardConfig(envelope.guard);
     if (issues.length > 0) {
       throw new Error(`FEISHU_SYNC_AGENT_BUILD_SPEC_JSON.guard 无效（dispatch-guard validateGuardConfig）：${issues.join('；')}`);
     }
-    buildSpec = { tools: envelope.tools, guard: envelope.guard, guardApi };
+    // F12 启动面：完整性引用权威形状校验 + 磁盘冻结面全量核验 + Leader agentDir
+    // 一致性（启动即 fail-closed；逐次派发前还会重核——防启动后篡改）。
+    const integrityRefs = envelope.guard.integrity;
+    const shapeIssues = integrityApi.validateRuntimeIntegrityRefs(integrityRefs);
+    if (shapeIssues.length > 0) {
+      throw new Error(`FEISHU_SYNC_AGENT_BUILD_SPEC_JSON.guard.integrity 无效（runtime-integrity）：${shapeIssues.join('；')}`);
+    }
+    const agentDirEnv = AGENT_DIR_AT_LOAD;
+    if (agentDirEnv !== integrityRefs.homeDir) {
+      throw new Error(`Leader PI_CODING_AGENT_DIR（${agentDirEnv || '(未设置)'}）与冻结 agentDir（${integrityRefs.homeDir}）不一致，拒绝以未冻结 agentDir 启动构建 Leader`);
+    }
+    const startupVerdict = verifyIntegrity(integrityRefs);
+    if (!startupVerdict.ok) {
+      throw new Error(`构建 agentDir 运行期完整性核验失败，拒绝启动 Leader：${startupVerdict.issues.join('；')}`);
+    }
+    buildSpec = { tools: envelope.tools, guard: envelope.guard, guardApi, integrityApi, verifyIntegrity };
     if (process.env.FEISHU_SYNC_AGENT_EXTERNAL_PLUGINS === '1') {
       log('build mode: 忽略 FEISHU_SYNC_AGENT_EXTERNAL_PLUGINS 开关（构建只认冻结白名单，不放行外部插件全部工具）');
     }
@@ -312,6 +353,33 @@ export default async function feishuSyncAgentExtension(/** @type {ExtensionAPI} 
         // Pi tool_call 事件契约：event.input 原地可变，修改后不重校验，
         // 执行时参数即修改后参数。策略唯一来源：运行时 dispatch-guard（不在本扩展复制）；
         // 守卫返回新 args 对象，此处原地写回 event.input（对象身份不变）才真正生效。
+        //
+        // F12（审核修复）：纯参数守卫不等于运行期校验——每次真实派发/续接前
+        // 重核冻结 settings/policy/包/四配置（verifyRuntimeIntegrity 读盘），
+        // 缺失/篡改/资源注入 → 阻断 child 模型请求（Pi 对 settings 缺失扩展会
+        // 静默跳过，缺失 policy 的子任务仍会请求模型——已实测复现）。
+        // 另核 Leader 实际 agentDir 与冻结引用一致（子任务从同一目录加载配置面）。
+        const integrityRefs = buildSpec.guard.integrity;
+        if (!integrityRefs) {
+          logBuildGuardEvent('integrity_blocked', {
+            tool: name,
+            issues: ['guard 信封缺少冻结完整性引用（runtime_integrity_refs_missing，schemaVersion<2 旧代次信封）'],
+          });
+          return { block: true, reason: '构建派发守卫：guard 信封缺少 F12 冻结完整性引用（runtime_integrity_refs_missing），拒绝派发' };
+        }
+        const agentDirEnv = AGENT_DIR_AT_LOAD;
+        if (agentDirEnv !== integrityRefs.homeDir) {
+          logBuildGuardEvent('integrity_blocked', {
+            tool: name,
+            issues: [`Leader PI_CODING_AGENT_DIR（${agentDirEnv || '(未设置)'}）与冻结 agentDir（${integrityRefs.homeDir}）不一致`],
+          });
+          return { block: true, reason: `构建派发守卫：Leader agentDir 与冻结引用不一致（${agentDirEnv || '(未设置)'} ≠ ${integrityRefs.homeDir}），拒绝派发` };
+        }
+        const verdict = buildSpec.verifyIntegrity(integrityRefs);
+        if (!verdict.ok) {
+          logBuildGuardEvent('integrity_blocked', { tool: name, issues: verdict.issues });
+          return { block: true, reason: `运行期完整性核验失败，拒绝派发（runtime_integrity_violation）：${verdict.issues.join('；')}` };
+        }
         const input = event.input;
         if (!input || typeof input !== 'object' || Array.isArray(input)) {
           return { block: true, reason: `构建派发守卫：${name} 参数必须是对象` };

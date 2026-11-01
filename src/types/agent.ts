@@ -439,6 +439,9 @@ export interface KbLeaderRunTaskDto {
   /** amagi 执行三轴状态（queued/running/done/failed/cancelled…；未知值原样展示）。 */
   execState: string | null;
   lastEventAt: string;
+  /** 历史DTO可能缺省；已知时用于区分历史任务与当前运行。 */
+  runtimeEpoch?: number | null;
+  generation?: number;
 }
 
 /** GET /api/kb/builds/:id/leader —— Leader 监督运行进度（仅 pi-amagi 构建）。
@@ -449,6 +452,7 @@ export interface KbLeaderRunProgressDto {
   orchestrationMode: 'pi-amagi';
   /** 凭据代次。 */
   generation: number;
+  runtimeEpoch?: number | null;
   leader: {
     sessionId: string | null;
     pid: number | null;
@@ -458,7 +462,7 @@ export interface KbLeaderRunProgressDto {
   /** 当前计划任务快照（数量随 Leader 分解变化，非可信总数）。 */
   tasks: KbLeaderRunTaskDto[];
   /** Leader 自触发轮次（首个 agent_end 不代表构建结束）。 */
-  rounds: { started: number; ended: number };
+  rounds: { started: number | null; ended: number | null } | null;
   /** 空闲宽限：提醒已发时间与最近活动时间。 */
   idle: { remindedAt: string | null; lastActivityAt: string | null };
   /** 最近一次发布申请。 */
@@ -482,7 +486,14 @@ export interface KbLeaderRunProgressDto {
   endedReason: string | null;
   /** 终止状态：cancelling=已请求取消未落地；finished=已结束；none=运行中；
  *  无可靠来源（仅检查点）时 null，不虚构。 */
-  termination?: 'none' | 'cancelling' | 'finished' | null;
+  termination?: 'none' | 'cancelling' | 'finished' | 'termination-unconfirmed' | null;
+  /** 生命周期核验而非业务成功状态；缺省不推断已退出。 */
+  processTermination?: {
+    state: 'confirmed' | 'unconfirmed';
+    at: string;
+    note: string;
+    unconfirmedPids: number[];
+  } | null;
   /** 冻结工作流 skill（路径+内容哈希=workflowRevision；供核对）。 */
   skill?: { path: string; revision: string } | null;
   /** 已处理事件游标（按 source:eventId）。 */

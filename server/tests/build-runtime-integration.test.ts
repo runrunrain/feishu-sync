@@ -130,7 +130,7 @@ function scriptedCallbacks(order: string[], overrides: Partial<Parameters<typeof
 }
 
 function makeSupervisor(cb: Parameters<typeof BuildLeaderSupervisor>[0], state?: LeaderRunCheckpointState, options: { idleGraceMs?: number } = {}) {
-  return new BuildLeaderSupervisor(cb, state ?? freshLeaderRunState(specFixture(), materialFixture()), { idleGraceMs: options.idleGraceMs ?? 50, idleTickMs: 10 });
+  return new BuildLeaderSupervisor(cb, state ?? freshLeaderRunState(specFixture(), materialFixture()), { idleGraceMs: options.idleGraceMs ?? 50, idleTickMs: 10, resumeReconcileTimeoutMs: 0 });
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs = 3000): Promise<void> {
@@ -550,3 +550,323 @@ describe('executeLeaderPublishRequest 门禁', () => {
 });
 
 void ToolError;
+
+// ---------------------------------------------------------------------------
+// F09/F10/F15：epoch 分层 / 终止对账阻断 / 轮次持久化
+// ---------------------------------------------------------------------------
+
+describe('F09/F10/F15：epoch、终止对账与轮次持久化', () => {
+  it('F15：轮次计数随事件更新并持久化到 state.rounds；新监督器从检查点恢复计数', async () => {
+    const order: string[] = [];
+    const { cb, harness } = scriptedCallbacks(order);
+    const supervisor = makeSupervisor(cb, undefined, { idleGraceMs: 10_000 });
+    const controller = new AbortController();
+    const runPromise = supervisor.run({ spec: specFixture(), signal: controller.signal, resumeMode: 'fresh' });
+    await waitFor(() => harness.calls.includes('events'));
+    harness.events.push(
+      event('round_started'),
+      event('round_ended'),
+      event('round_started'),
+      event('round_ended'),
+    );
+    await waitFor(() => (supervisor.state.rounds?.ended ?? 0) >= 2);
+    expect(supervisor.state.rounds).toEqual({ started: 2, ended: 2 });
+    expect(supervisor.progress().rounds).toEqual({ started: 2, ended: 2 });
+    await supervisor.requestCancel();
+    await runPromise;
+    // 恢复：同一 state 传给新监督器（检查点路径）→ 计数延续而非归零
+    const resumed = makeSupervisor(cb, supervisor.state, { idleGraceMs: 10_000 });
+    expect(resumed.progress().rounds).toEqual({ started: 2, ended: 2 });
+  });
+
+  it('F15/F10-DTO：轮次持久化与终止对账摘要贯通（runtimeEpoch/processTermination/termination-unconfirmed）', async () => {
+    const order: string[] = [];
+    const unconfirmed = {
+      state: 'unconfirmed' as const,
+      at: new Date().toISOString(),
+      leaderExit: null,
+      children: [{ taskId: 't1', pid: 5556, source: 'anchor' as const, verdict: 'unconfirmed' as const, proof: 'none' as const, detail: '无法证明' }],
+      note: '存在 1 个未确认项，阻断新 Leader',
+    };
+    const { cb, harness } = scriptedCallbacks(order);
+    harness.cancelResult = { leaderExit: null, credentialsRevoked: true, residualNote: 'fixture', termination: unconfirmed };
+    const supervisor = makeSupervisor(cb, undefined, { idleGraceMs: 10_000 });
+    const controller = new AbortController();
+    const runPromise = supervisor.run({ spec: specFixture(), signal: controller.signal, resumeMode: 'fresh' });
+    await waitFor(() => harness.calls.includes('events'));
+    harness.events.push(
+      event('round_started'),
+      event('task_created', { payload: { nativeTaskId: 't-new', role: 'luban' } }),
+      event('round_ended'),
+    );
+    await waitFor(() => (supervisor.state.rounds?.ended ?? 0) >= 1);
+    expect(supervisor.progress().rounds).toEqual({ started: 1, ended: 1 });
+    // epoch 贯通：顶层 + 任务级（新任务带当前 epoch；缺省状态为 null）
+    expect(supervisor.progress().runtimeEpoch).toBe(1);
+    expect(supervisor.progress().tasks.find((task) => task.nativeTaskId === 't-new')).toMatchObject({ runtimeEpoch: 1, generation: 1 });
+    await supervisor.requestCancel();
+    await runPromise;
+    // 取消后 DTO：终止对账摘要 + 未确认优先于 finished
+    const after = supervisor.progress();
+    expect(after.processTermination).toMatchObject({ state: 'unconfirmed', unconfirmedPids: [5556] });
+    expect(after.processTermination?.note).toContain('阻断');
+    expect(after.termination).toBe('termination-unconfirmed');
+  });
+
+  it('F10：终止对账 unconfirmed 阻断 session 与 rebuild（换 epoch 也不能绕过）；重试成功解除', async () => {
+    const order: string[] = [];
+    const unconfirmed = {
+      state: 'unconfirmed' as const,
+      at: new Date().toISOString(),
+      leaderExit: null,
+      children: [{ taskId: 't1', pid: 5555, source: 'anchor' as const, verdict: 'unconfirmed' as const, proof: 'none' as const, detail: '无法证明' }],
+      note: '存在 1 个未确认个体（pid：5555）',
+    };
+    let reconcileCount = 0;
+    const { cb } = scriptedCallbacks(order, {
+      reconcileResiduals: async () => {
+        reconcileCount += 1;
+        return unconfirmed;
+      },
+    });
+    const state = freshLeaderRunState(specFixture(), materialFixture());
+    state.binding = {
+      buildId: 'b_leaderrun01', generation: 1, launchId: 'l_1', agentDir: '/tmp/ad', workDir: '/tmp/wd',
+      sessionDir: '/tmp/sd', leaderSessionId: 's-1', leaderPid: null, resumeCapability: { session: true, artifact: true },
+    };
+    state.termination = unconfirmed;
+    const supervisor = makeSupervisor(cb, state);
+    await expect(supervisor.run({ spec: specFixture(), signal: new AbortController().signal, resumeMode: 'session' }))
+      .rejects.toMatchObject({ code: 'kb_termination_unconfirmed' });
+    await expect(supervisor.run({ spec: specFixture(), signal: new AbortController().signal, resumeMode: 'rebuild' }))
+      .rejects.toMatchObject({ code: 'kb_termination_unconfirmed' });
+    expect(reconcileCount).toBe(2); // 两次恢复尝试都先重试对账
+    expect(state.runtimeEpoch).toBe(1); // fresh 基线 epoch 未被推进（拒绝在前）
+    // 对账转 confirmed → 恢复放行
+    const { cb: cbOk } = scriptedCallbacks([], {
+      reconcileResiduals: async () => ({ ...unconfirmed, state: 'confirmed' as const, note: '重试成功' }),
+    });
+    const supervisorOk = makeSupervisor(cbOk, state);
+    const runOk = supervisorOk.run({ spec: specFixture(), signal: new AbortController().signal, resumeMode: 'rebuild' });
+    await expect(runOk).resolves.toBeTruthy();
+    expect(state.runtimeEpoch).toBe(2); // fresh 基线 epoch1 → rebuild epoch2
+    expect(state.generation).toBe(2);
+  });
+
+  it('F10：requestCancel 终止异常也留下持久化 unconfirmed 记录（不因异常丢结果）', async () => {
+    const order: string[] = [];
+    const { cb, harness } = scriptedCallbacks(order);
+    harness.cancelResult = {
+      leaderExit: null, credentialsRevoked: true, residualNote: 'fixture',
+      termination: { state: 'unconfirmed', at: new Date().toISOString(), leaderExit: null, children: [], note: '终止异常：fixture' },
+    };
+    const supervisor = makeSupervisor(cb, undefined, { idleGraceMs: 10_000 });
+    const controller = new AbortController();
+    const runPromise = supervisor.run({ spec: specFixture(), signal: controller.signal, resumeMode: 'fresh' });
+    await waitFor(() => harness.calls.includes('events'));
+    await supervisor.requestCancel();
+    await runPromise;
+    expect(supervisor.state.termination?.state).toBe('unconfirmed');
+    expect(supervisor.state.termination?.note).toContain('终止异常');
+  });
+
+  it('F10：取消竞态——池排队 AbortError 在 signal 已断时按取消收口（不裸抛 kb_build_failed）', async () => {
+    const order: string[] = [];
+    const controller = new AbortController();
+    const abortError = Object.assign(new Error('等待进程槽位已被取消'), { name: 'AbortError' });
+    const { cb, harness } = scriptedCallbacks(order, {
+      startLeader: async () => { throw new Error('不应启动 Leader（取消在授槽前到达）'); },
+    });
+    // 池 acquire 立即拒绝（cancelBuild 先 abort 后入队/已在队中的时序）
+    cb.pool.acquire = (async () => {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      controller.abort();
+      throw abortError;
+    }) as typeof cb.pool.acquire;
+    const supervisor = makeSupervisor(cb, undefined, { idleGraceMs: 10_000 });
+    const outcome = await supervisor.run({ spec: specFixture(), signal: controller.signal, resumeMode: 'fresh' });
+    expect(outcome).toEqual({ kind: 'cancelled' });
+    expect(supervisor.state.endedReason).toBe('cancelled');
+    expect(harness.calls).not.toContain('start');
+    void harness;
+  });
+
+  it('F09：rebuild 换新 epoch，旧 epoch 任务不计入当前活跃/idle；session 保持 epoch', async () => {
+    const order: string[] = [];
+    const { cb, harness } = scriptedCallbacks(order);
+    const state = freshLeaderRunState(specFixture(), materialFixture());
+    state.runtimeEpoch = 1;
+    // 旧 epoch 任务：running（其完成通知永不再来）
+    state.actors.push({
+      nativeTaskId: 't-old', parentTaskId: null, generation: 1, runtimeEpoch: 1,
+      role: 'luban', status: 'confirmed', execState: 'running', lastEventAt: new Date().toISOString(),
+    });
+    const supervisor = makeSupervisor(cb, state, { idleGraceMs: 30 });
+    const runPromise = supervisor.run({ spec: specFixture(), signal: new AbortController().signal, resumeMode: 'rebuild' });
+    await waitFor(() => harness.calls.includes('events'));
+    // 新 epoch 任务：done（正常结算）
+    harness.events.push(
+      event('task_created', { payload: { nativeTaskId: 't-new', role: 'luban' } }),
+      event('task_state', { payload: { nativeTaskId: 't-new', status: 'done' } }),
+    );
+    await waitFor(() => supervisor.state.actors.some((actor) => actor.nativeTaskId === 't-new'));
+    expect(supervisor.state.runtimeEpoch).toBe(2); // rebuild 递增
+    expect(supervisor.state.generation).toBe(2);
+    // 新任务带新 epoch 戳；旧任务保留为历史
+    expect(supervisor.state.actors.find((actor) => actor.nativeTaskId === 't-new')?.runtimeEpoch).toBe(2);
+    expect(supervisor.state.actors.find((actor) => actor.nativeTaskId === 't-old')?.runtimeEpoch).toBe(1);
+    const outcome = await runPromise;
+    // 旧 running 任务不再阻断 idle（否则永收不了口）
+    expect(outcome).toEqual({ kind: 'leader-idle' });
+    expect(harness.nudges).toHaveLength(1);
+    // 对照：session 恢复保持 epoch（同 epoch 任务仍计入活跃）
+    const state2 = freshLeaderRunState(specFixture(), materialFixture());
+    state2.runtimeEpoch = 1;
+    state2.binding = {
+      buildId: 'b_leaderrun01', generation: 1, launchId: 'l_2', agentDir: '/tmp/ad', workDir: '/tmp/wd',
+      sessionDir: '/tmp/sd', leaderSessionId: 's-1', leaderPid: null, resumeCapability: { session: true, artifact: true },
+    };
+    state2.actors.push({
+      // F09-R1 口径更新：同 epoch 且**当前代次**的 running 任务仍计入活跃
+      // （session 续接换代后，旧代次任务归历史——见 F09-R1 专项用例）。
+      nativeTaskId: 't-same-epoch', parentTaskId: null, generation: 2, runtimeEpoch: 1,
+      role: 'luban', status: 'confirmed', execState: 'running', lastEventAt: new Date().toISOString(),
+    });
+    const { cb: cb2, harness: harness2 } = scriptedCallbacks([]);
+    const supervisor2 = makeSupervisor(cb2, state2, { idleGraceMs: 30 });
+    const run2 = supervisor2.run({ spec: specFixture(), signal: new AbortController().signal, resumeMode: 'session' });
+    await waitFor(() => harness2.calls.includes('events'));
+    // 同 epoch running 任务仍活跃：宽限内不触发 idle 提示（对照旧 epoch 过滤）
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(harness2.nudges).toHaveLength(0);
+    await supervisor2.requestCancel();
+    await run2;
+    expect(supervisor2.state.runtimeEpoch).toBe(1);
+  });
+
+  it('F10：非取消终局的终止结果也持久化（run finally 捕获 cancelLeader 结果）', async () => {
+    const order: string[] = [];
+    const { cb, harness } = scriptedCallbacks(order);
+    harness.cancelResult = {
+      leaderExit: { code: 0, signal: null }, credentialsRevoked: true, residualNote: 'fixture',
+      termination: { state: 'confirmed', at: new Date().toISOString(), leaderExit: { code: 0, signal: null }, children: [], note: '全部退出' },
+    };
+    const supervisor = makeSupervisor(cb, undefined, { idleGraceMs: 30 });
+    const runPromise = supervisor.run({ spec: specFixture(), signal: new AbortController().signal, resumeMode: 'fresh' });
+    await waitFor(() => harness.calls.includes('events'));
+    harness.events.push(event('leader_prompt_failed', { payload: { message: '模型错误' } }));
+    const outcome = await runPromise;
+    expect(outcome).toMatchObject({ kind: 'leader-failed' });
+    expect(supervisor.state.termination?.state).toBe('confirmed'); // 此前被丢弃，现在持久化
+  });
+
+  it('F09-R1：session 续接换代后，同 epoch 旧代次任务不挂 idle（与前端 isHistoricalRuntimeTask 同口径）', async () => {
+    // 场景（增量复审 resume-probe 复现）：epoch=1 的 generation 1→2 会话续接，
+    // 旧代次 actor 最后观测 running/confirmed，其完成通知永不再来——UI 已按
+    // generation 排除为历史，后端 idle 活跃集合必须同样排除（保留历史记录）。
+    const state = freshLeaderRunState(specFixture(), materialFixture());
+    state.runtimeEpoch = 1;
+    state.binding = {
+      buildId: 'b_leaderrun01', generation: 1, launchId: 'l_4', agentDir: '/tmp/ad', workDir: '/tmp/wd',
+      sessionDir: '/tmp/sd', leaderSessionId: 's-1', leaderPid: null, resumeCapability: { session: true, artifact: true },
+    };
+    state.actors.push({
+      nativeTaskId: 't-oldgen', parentTaskId: null, generation: 1, runtimeEpoch: 1,
+      role: 'luban', status: 'confirmed', execState: 'running', lastEventAt: new Date(0).toISOString(),
+    });
+    const { cb, harness } = scriptedCallbacks([]);
+    const supervisor = makeSupervisor(cb, state, { idleGraceMs: 30 });
+    const runPromise = supervisor.run({ spec: specFixture(), signal: new AbortController().signal, resumeMode: 'session' });
+    await waitFor(() => harness.calls.includes('events'));
+    // prepareResume 已换代（generation 1→2），session 续接保持 epoch 不变
+    expect(state.generation).toBe(2);
+    expect(state.runtimeEpoch).toBe(1);
+    // 旧代次 actor 保留为历史（DTO/前端仍可见），但不计入当前活跃集合
+    expect(state.actors.some((actor) => actor.nativeTaskId === 't-oldgen')).toBe(true);
+    const outcome = await runPromise;
+    expect(outcome).toEqual({ kind: 'leader-idle' }); // 两段空闲收口可达（此前旧代次永远挂住）
+    expect(harness.nudges).toHaveLength(1);
+  });
+
+  it('F10-R3：termination 缺失/null 的 rebuild 也先新鲜对账——未确认阻断且不推进 epoch/换代', async () => {
+    // 场景（增量复审 resume-probe 复现）：应用硬崩没来得及写终止记录，旧
+    // binding 在案；rebuild 不得绕过残留对账直接换 epoch 启动第二 Leader。
+    let reconcileCount = 0;
+    const { cb } = scriptedCallbacks([], {
+      reconcileResiduals: async () => {
+        reconcileCount += 1;
+        return { state: 'unconfirmed' as const, at: new Date().toISOString(), leaderExit: null, children: [], note: 'fixture：残留个体存活' };
+      },
+    });
+    const state = freshLeaderRunState(specFixture(), materialFixture());
+    state.runtimeEpoch = 1;
+    state.binding = {
+      buildId: 'b_leaderrun01', generation: 1, launchId: 'l_5', agentDir: '/tmp/ad', workDir: '/tmp/wd',
+      sessionDir: '/tmp/sd', leaderSessionId: 's-1', leaderPid: null, resumeCapability: { session: true, artifact: true },
+      termination: null,
+    };
+    state.termination = null; // 崩溃未落终止记录（null ≠ confirmed）
+    const supervisor = makeSupervisor(cb, state);
+    await expect(supervisor.run({ spec: specFixture(), signal: new AbortController().signal, resumeMode: 'rebuild' }))
+      .rejects.toMatchObject({ code: 'kb_termination_unconfirmed' });
+    expect(reconcileCount).toBe(1); // 缺失记录也触发新鲜对账（不是只在 unconfirmed 时重试）
+    expect(state.runtimeEpoch).toBe(1); // 拒绝发生在推进 epoch 之前
+    expect(state.generation).toBe(1); // 拒绝发生在换代之前
+    // 对账转 confirmed → 取得新鲜证明后放行（epoch/换代才推进）
+    const { cb: cbOk } = scriptedCallbacks([], {
+      reconcileResiduals: async () => ({ state: 'confirmed' as const, at: new Date().toISOString(), leaderExit: null, children: [], note: '重试成功' }),
+    });
+    const supervisorOk = makeSupervisor(cbOk, state);
+    const runOk = supervisorOk.run({ spec: specFixture(), signal: new AbortController().signal, resumeMode: 'rebuild' });
+    await expect(runOk).resolves.toBeTruthy();
+    expect(state.runtimeEpoch).toBe(2);
+    expect(state.generation).toBe(2);
+  });
+
+  it('F10-R3（steer 调整 #1）：fresh 启动也过对账门——带事实未确认即阻断；无事实正常起步且不再误入恢复换代', async () => {
+    // 场景：崩溃未落 leaderRun 的检查点恢复可能以未定义 resumeMode（归一 fresh）
+    // 走启动路径；带旧运行事实（账本存活 Leader/旧 epoch 残留）时不得绕过对账。
+    const state = freshLeaderRunState(specFixture(), materialFixture());
+    const { cb } = scriptedCallbacks([], {
+      reconcileResiduals: async () => ({ state: 'unconfirmed' as const, at: new Date().toISOString(), leaderExit: null, children: [], note: 'fixture：账本存活 Leader' }),
+    });
+    const supervisor = makeSupervisor(cb, state);
+    await expect(supervisor.run({ spec: specFixture(), signal: new AbortController().signal }))
+      .rejects.toMatchObject({ code: 'kb_termination_unconfirmed' });
+    // 无事实（宿主返回 null）→ 正常起步；且未定义 resumeMode 的 fresh 不再落入
+    // 恢复换代分支（预存 quirk：generation 不会被 +1）。用全新状态（无历史记录）
+    // 验证 fresh 新构建路径。
+    const state2 = freshLeaderRunState(specFixture(), materialFixture());
+    const { cb: cb2, harness: harness2 } = scriptedCallbacks([], { reconcileResiduals: async () => null });
+    const supervisor2 = makeSupervisor(cb2, state2, { idleGraceMs: 30 });
+    const run2 = supervisor2.run({ spec: specFixture(), signal: new AbortController().signal });
+    await waitFor(() => harness2.calls.includes('events'));
+    expect(state2.generation).toBe(1);
+    const outcome = await run2;
+    expect(outcome).toEqual({ kind: 'leader-idle' });
+  });
+
+  it('F10-R3：已记录 confirmed 也可能陈旧——恢复前仍重新对账，未确认即阻断', async () => {
+    const staleConfirmed = { state: 'confirmed' as const, at: new Date(0).toISOString(), leaderExit: null, children: [], note: '旧确认（可能陈旧）' };
+    let calls = 0;
+    const { cb } = scriptedCallbacks([], {
+      reconcileResiduals: async () => {
+        calls += 1;
+        return { ...staleConfirmed, state: 'unconfirmed' as const, note: '新鲜对账发现残留' };
+      },
+    });
+    const state = freshLeaderRunState(specFixture(), materialFixture());
+    state.runtimeEpoch = 1;
+    state.binding = {
+      buildId: 'b_leaderrun01', generation: 1, launchId: 'l_6', agentDir: '/tmp/ad', workDir: '/tmp/wd',
+      sessionDir: '/tmp/sd', leaderSessionId: 's-1', leaderPid: null, resumeCapability: { session: true, artifact: true },
+    };
+    state.termination = staleConfirmed;
+    const supervisor = makeSupervisor(cb, state);
+    await expect(supervisor.run({ spec: specFixture(), signal: new AbortController().signal, resumeMode: 'session' }))
+      .rejects.toMatchObject({ code: 'kb_termination_unconfirmed' });
+    expect(calls).toBe(1); // confirmed 记录不再走快捷通道：恢复前重新证明
+    expect(state.runtimeEpoch).toBe(1);
+    expect(state.generation).toBe(1);
+  });
+});

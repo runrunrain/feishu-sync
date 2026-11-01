@@ -108,11 +108,24 @@ function checkPiPackageRoot(packageRoot: string): PiCandidateCheck {
     const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf-8')) as {
       name?: string;
       version?: string;
+      bin?: string | Record<string, unknown>;
     };
     const nameOk = pkg.name === PI_PACKAGE_NAME;
+    // 宿主版本探测以 package.bin 的真实入口识别运行中的Pi；先选旧wrapper
+    // 会让amagi把受支持宿主误判为未知并关闭continuation等能力。
+    const declaredBin = typeof pkg.bin === 'string' ? pkg.bin : pkg.bin?.pi;
+    const binPath = typeof declaredBin === 'string' && declaredBin.trim()
+      ? path.resolve(packageRoot, declaredBin) : null;
+    if (binPath) {
+      const relative = path.relative(packageRoot, binPath);
+      if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+        return { packageRoot, cliPath: null, version: typeof pkg.version === 'string' ? pkg.version : null, nameOk };
+      }
+    }
     const cliCandidates = [
-      path.join(packageRoot, 'dist', 'cli.js'),
+      ...(binPath ? [binPath] : []),
       path.join(packageRoot, 'dist', 'bundle', 'cli.js'),
+      path.join(packageRoot, 'dist', 'cli.js'),
     ];
     const cliPath = cliCandidates.find((candidate) => fs.existsSync(candidate)) ?? null;
     return {

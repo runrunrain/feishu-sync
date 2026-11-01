@@ -858,7 +858,8 @@ describe('kb_submit_review：报告绑定与审查者写入口封锁', () => {
     // 但审查 phase 的写执行被服务端拒绝——协议靠服务端裁决而非提示词
     const reviewToken = tokenFor(state, { workerId: 'wr', unitId: 'u1', phase: 'review' });
     const context = service.getContext(reviewToken)!;
-    expect(context.allowedTools).toEqual(toolsForRunKind('build'));
+    // v2（§7）kb_read_batch 追加进 build 基线面（旧模式也可用；末尾追加）
+    expect(context.allowedTools).toEqual([...toolsForRunKind('build'), 'kb_read_batch']);
     expect(context.allowedTools).toContain('kb_submit_review');
     expect(context.allowedTools).toContain('kb_write_doc');
     await expect(service.executeTool(reviewToken, 'kb_write_doc', BASE_WRITE))

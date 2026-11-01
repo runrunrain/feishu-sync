@@ -218,7 +218,10 @@ export function BuildRuntimeProgress({ build }: { build: KbBuildDto }) {
 
   const leader = data?.leader;
   const summary = data?.summary;
-  const runningCount = data ? data.tasks.filter((task) => task.execState === 'running').length : 0;
+  const processUnconfirmed = data?.termination === 'termination-unconfirmed' || data?.processTermination?.state === 'unconfirmed';
+  const runtimeEnded = terminal || data?.termination === 'finished' || Boolean(data?.endedReason) || processUnconfirmed;
+  const currentTasks = data?.tasks.filter((task) => !isHistoricalRuntimeTask(task, data)) ?? [];
+  const runningCount = currentTasks.filter((task) => task.execState === 'running').length;
   /** 真实计数（null=未知，不虚构）；实际并发=running 派生。 */
   const acceptedDocs = summary?.acceptedDocumentCount ?? null;
   const openBlocking = summary?.openBlockingCount ?? null;
@@ -226,6 +229,12 @@ export function BuildRuntimeProgress({ build }: { build: KbBuildDto }) {
 
   return (
     <div className="shrink-0 border-b border-line/60 px-4 py-3 space-y-3" data-testid="kb-runtime-progress">
+      {processUnconfirmed ? (
+        <div role="alert" className="rounded border border-seal/30 bg-paper-2 px-3 py-2 text-xs text-seal break-words" data-testid="kb-runtime-termination-unconfirmed">
+          后台终止未确认：凭据已撤销，但尚未确认所有进程退出；恢复会先重新对账，未确认前不启动新 Leader。
+          {data?.processTermination?.note ? <p className="mt-1">{data.processTermination.note}</p> : null}
+        </div>
+      ) : null}
       {/* 取消后台终止中（集成侧 termination=cancelling：凭据已失效、后台仍在终止） */}
       {cancelling ? (
         <div
@@ -243,7 +252,7 @@ export function BuildRuntimeProgress({ build }: { build: KbBuildDto }) {
         <div className="grid grid-cols-3 gap-2" data-testid="kb-runtime-summary">
           <Metric label="已接受文档" value={acceptedDocs ?? '未知'} alert={openBlocking != null && openBlocking > 0 ? false : false} hint={acceptedDocs == null ? '回执数据未提供' : '应用回执去重'} />
           <Metric label="未解决阻断" value={openBlocking ?? '未知'} alert={Boolean(openBlocking && openBlocking > 0)} hint={openBlocking == null ? '问题清单未提供' : undefined} />
-          <Metric label="实际并发" value={runningCount} hint={`任务执行中${summary?.activeAssignments != null ? ` · 活动分配 ${summary.activeAssignments}` : ''}`} />
+          <Metric label={runtimeEnded ? '末次观测并发' : '实际并发（已观测）'} value={runningCount} hint={runtimeEnded ? '历史观测，非当前活跃；后台残留以终止核验为准' : `任务执行中（仅已观测）${summary?.activeAssignments != null ? ` · 活动分配 ${summary.activeAssignments}` : ''}`} />
         </div>
       ) : (
         <p className="text-[10px] text-ink-faint">运行进度加载中…</p>
@@ -255,10 +264,10 @@ export function BuildRuntimeProgress({ build }: { build: KbBuildDto }) {
           <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-ink">
             <span className="font-kai font-medium">Leader 会话</span>
             <span className={`px-1 rounded ${data.endedReason || data.termination === 'finished' ? 'bg-paper-2 text-ink-faint' : 'bg-[rgba(158,43,37,0.08)] text-seal'}`}>
-              {data.endedReason || data.termination === 'finished' ? `已结束（${data.endedReason ?? 'finished'}）` : '监督中'}
+              {processUnconfirmed ? '终止未确认' : data.endedReason || data.termination === 'finished' ? `已结束（${data.endedReason ?? 'finished'}）` : '监督中'}
             </span>
             <span className="text-[11px] text-ink-faint">代次 {data.generation}</span>
-            <span className="text-[11px] text-ink-faint">轮次 {data.rounds.started}/{data.rounds.ended}（启/收）</span>
+            <span className="text-[11px] text-ink-faint">轮次 {data.rounds?.started ?? '未知'}/{data.rounds?.ended ?? '未知'}（启/收）</span>
             {leader.sessionId ? (
               <span className="text-[10px] font-mono text-ink-faint break-all" title={`${leader.sessionId}${leader.pid != null ? ` · pid ${leader.pid}` : ''}`}>
                 {leader.sessionId.slice(0, 14)}…
@@ -276,8 +285,8 @@ export function BuildRuntimeProgress({ build }: { build: KbBuildDto }) {
               : 'Leader 用量未知（末次轮次数据未提供；累计未知）'}
           </p>
           <p className="text-[11px] text-ink-soft" data-testid="kb-runtime-resume-capability">
-            恢复能力：{LEADER_RESUME_CAPABILITY_LABEL[leader.resumeCapability] ?? leader.resumeCapability}
-            <span className="ml-1">（中断后按此方式续接）</span>
+            恢复能力：{processUnconfirmed ? '需先确认后台终止' : LEADER_RESUME_CAPABILITY_LABEL[leader.resumeCapability] ?? leader.resumeCapability}
+            <span className="ml-1">（{processUnconfirmed ? '重新对账前不承诺可续接' : '中断后按此方式续接'}）</span>
           </p>
           {data.skill ? (
             <p className="text-[10px] text-ink-faint font-mono break-all" title={data.skill.path} data-testid="kb-runtime-skill">
@@ -302,7 +311,7 @@ export function BuildRuntimeProgress({ build }: { build: KbBuildDto }) {
           <p className="flex items-center justify-between text-xs">
             <span className="font-kai font-medium text-ink">子任务</span>
             <span className="text-[11px] text-ink-faint" data-testid="kb-runtime-plan-count">
-              当前计划 {data.tasks.length} 项（随 Leader 分解变化，非总数）
+              当前计划 {currentTasks.length} 项（随 Leader 分解变化，非总数）{data.tasks.length > currentTasks.length ? ` · 历史 ${data.tasks.length - currentTasks.length} 项` : ''}
             </span>
           </p>
           {data.tasks.length === 0 ? (
@@ -313,7 +322,9 @@ export function BuildRuntimeProgress({ build }: { build: KbBuildDto }) {
                 <RuntimeTaskRow
                   key={task.nativeTaskId}
                   task={task}
-                  terminal={terminal || data.termination === 'finished' || Boolean(data.endedReason)}
+                  terminal={runtimeEnded || isHistoricalRuntimeTask(task, data)}
+                  historical={isHistoricalRuntimeTask(task, data)}
+                  processUnconfirmed={processUnconfirmed}
                   queueReason={data.summary.queueReason}
                 />
               ))}
@@ -331,11 +342,18 @@ export function BuildRuntimeProgress({ build }: { build: KbBuildDto }) {
   );
 }
 
-function RuntimeTaskRow({ task, terminal, queueReason }: { task: KbLeaderRunTaskDto; terminal: boolean; queueReason?: string | null }) {
+function isHistoricalRuntimeTask(task: KbLeaderRunTaskDto, data: KbLeaderRunProgressDto): boolean {
+  return (task.runtimeEpoch != null && data.runtimeEpoch != null && task.runtimeEpoch !== data.runtimeEpoch)
+    || (task.generation != null && task.generation !== data.generation);
+}
+
+function RuntimeTaskRow({ task, terminal, queueReason, historical = false, processUnconfirmed = false }: {
+  task: KbLeaderRunTaskDto; terminal: boolean; queueReason?: string | null; historical?: boolean; processUnconfirmed?: boolean;
+}) {
   const exec = task.execState;
   const execLabel = exec === null ? '未观测' : LEADER_EXEC_STATE_LABEL[exec] ?? exec;
   const stopped = terminal && (exec === 'queued' || exec === 'running');
-  const stateTone = exec === 'running' ? 'active' : exec === 'failed' || exec === 'error' ? 'bad'
+  const stateTone = stopped ? (processUnconfirmed ? 'warn' : 'muted') : exec === 'running' ? 'active' : exec === 'failed' || exec === 'error' ? 'bad'
     : exec === 'done' ? 'good' : 'muted';
   const actorTone = task.status === 'confirmed' ? 'good' : task.status === 'revoked' ? 'bad' : 'warn';
   return (
@@ -343,15 +361,16 @@ function RuntimeTaskRow({ task, terminal, queueReason }: { task: KbLeaderRunTask
       className="rounded border border-line bg-card-bg px-2.5 py-2 text-[11px] leading-snug"
       data-testid="kb-runtime-task"
       data-task-id={task.nativeTaskId}
-      data-exec={stopped ? 'stopped' : (exec ?? 'unknown')}
+      data-exec={stopped ? (processUnconfirmed ? 'termination-unconfirmed' : 'stopped') : (exec ?? 'unknown')}
       data-actor-status={task.status}
     >
       <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
         <span className="font-mono text-xs text-ink break-all" title={task.nativeTaskId}>{shortId(task.nativeTaskId)}</span>
         <span
           className={`px-1 rounded ${TONE_CLASS[stateTone]}`}
-          title={stopped ? '运行时已结束；这是最后观测到的执行状态（未观测到 native 终态，不虚构 done）' : undefined}
-        >{stopped ? '已停止' : execLabel}</span>
+          title={stopped ? (processUnconfirmed ? '这是最后观测；后台清理未确认，不表示进程已退出或任务完成' : '运行时已结束；这是最后观测到的执行状态（未观测到 native 终态，不虚构 done）') : undefined}
+        >{stopped ? (processUnconfirmed ? '终止未确认' : '已停止') : execLabel}</span>
+        {historical ? <span className="text-ink-faint">历史任务</span> : null}
         <span className={`px-1 rounded ${TONE_CLASS[actorTone]}`}>{LEADER_ACTOR_STATUS_LABEL[task.status] ?? task.status}</span>
         {exec === 'queued' && !terminal ? (
           <span

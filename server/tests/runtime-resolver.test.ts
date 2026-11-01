@@ -71,6 +71,42 @@ describe('compareVersions / satisfiesPiRange', () => {
 });
 
 describe('resolveRuntime（fixture）', () => {
+  it.each(['object', 'string'] as const)('优先使用package声明的%s bin而非并存的旧cli wrapper', async (kind) => {
+    const base = path.join(fixtureRoot, `declared-bin-${kind}`);
+    const nodePath = makeFakeNode(path.join(base, 'bin'), '24.21.0');
+    const pkgRoot = makeFakePiAtLibNodeModules(base, '1.4.0');
+    fs.mkdirSync(path.join(pkgRoot, 'dist', 'bundle'), { recursive: true });
+    const cli = path.join(pkgRoot, 'dist', 'bundle', 'cli.js');
+    fs.writeFileSync(cli, '// declared CLI fixture');
+    fs.writeFileSync(path.join(pkgRoot, 'package.json'), JSON.stringify({
+      name: PI_PACKAGE_NAME, version: '1.4.0',
+      bin: kind === 'object' ? { pi: './dist/bundle/cli.js' } : './dist/bundle/cli.js',
+    }));
+    const config = buildDefaultAgentConfig(fixtureRoot);
+    config.runtime.nodePath = nodePath;
+    config.runtime.piCliPath = path.join(pkgRoot, 'dist', 'cli.js');
+    const resolver = new PiRuntimeResolver({
+      env: { PATH: '' }, execNodeVersion: async (candidate) => candidate === nodePath ? '24.21.0' : null,
+    });
+    expect((await resolver.resolveRuntime(config)).piCliPath).toBe(cli);
+  });
+
+  it('package bin逃出包根时拒绝，不执行或静默改选wrapper', async () => {
+    const base = path.join(fixtureRoot, 'escaping-bin');
+    const nodePath = makeFakeNode(path.join(base, 'bin'), '24.21.0');
+    const pkgRoot = makeFakePiAtLibNodeModules(base, '1.4.0');
+    fs.writeFileSync(path.join(pkgRoot, 'package.json'), JSON.stringify({
+      name: PI_PACKAGE_NAME, version: '1.4.0', bin: { pi: '../foreign.js' },
+    }));
+    const config = buildDefaultAgentConfig(fixtureRoot);
+    config.runtime.nodePath = nodePath;
+    config.runtime.piCliPath = pkgRoot;
+    const resolver = new PiRuntimeResolver({
+      env: { PATH: '' }, execNodeVersion: async (candidate) => candidate === nodePath ? '24.21.0' : null,
+    });
+    expect((await resolver.resolveRuntime(config)).piCliPath).toBeNull();
+  });
+
   it('标准布局、缺pi回退及显式pi均不执行npm symlink入口', async () => {
     const fixture = makeRuntimeInstallation(path.join(fixtureRoot, 'npm-symlink'));
     const resolver = new PiRuntimeResolver({ env: { PATH: '' }, execNodeVersion: async (candidate) => candidate === fixture.nodePath ? '24.21.0' : null });

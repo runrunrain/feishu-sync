@@ -37,6 +37,7 @@ import {
   type CancelResult,
   type RuntimeBinding,
   type RuntimeEvent,
+  type TerminationOutcome,
   type ThinkingLevel,
 } from '../agent/build-runtime/contracts.js';
 import { assertProbeUsable, runStaticProbes } from '../agent/build-runtime/capability-probe.js';
@@ -861,7 +862,9 @@ export class BuildRuntimeHost {
             artifactReceiptRefs: [],
             eventCursor: null,
           })
-          : await session.adapter.start(runSpec);
+          // F09：fresh/rebuild 都走 start；epoch 由监督器状态分配（rebuild 已
+          // 递增）——新 epoch = 全新 agentDir/会话/amagi 内部库，不打开旧会话。
+          : await session.adapter.start(runSpec, { runtimeEpoch: state.runtimeEpoch ?? 1 });
         session.binding = binding;
         const rpc = session.adapter.getRpcProcess(binding);
         if (!rpc) {
@@ -902,6 +905,18 @@ export class BuildRuntimeHost {
         await rpc.sendCommand('follow_up', { message }, 15_000);
       },
       currentRuntimeFreeze: freeze,
+      // F10-R3：残留对账回调（prepareResume 一切模式的新鲜对账用）——构建级跨
+      // epoch 对账：binding 可空（应用硬崩未落 binding 但账本/旧 epoch 目录
+      // 已有事实时也要对账，不能凭"无 binding"绕过）；含账本未收口 Leader
+      // 存活检测（其子任务不是残留）。无任何旧运行事实时适配层返回 null。
+      // 落盘由监督器按模式统一处理（恢复一律落盘覆盖旧记录；fresh 仅实质
+      // 内容落盘），此处不重复写。
+      reconcileResiduals: async (binding: RuntimeBinding | null): Promise<TerminationOutcome | null> => {
+        return session.adapter.reconcileBuildResiduals(
+          { buildId: session.buildId, binding: binding ?? state.binding },
+          { reap: true, includeLeaders: false },
+        );
+      },
       actorSnapshot: () => BuildRuntimeHost.actorSnapshotOf(session.actorStore),
       exportActorPayload: () => session.actorStore.exportCheckpointPayload(),
     }, state, {});

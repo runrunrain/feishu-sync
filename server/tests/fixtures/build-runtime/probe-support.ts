@@ -101,6 +101,12 @@ export interface ProbeTempEnv {
   skillDir: string;
   /** 敏感 sentinel 文件（P0：真实子进程 read/grep 必须被拒）。 */
   sentinelFile: string;
+  /** F12-R1：raw 禁区的祖先目录（搜索根不落 deny 的递归泄漏反例搜索根）。 */
+  ancestorDir: string;
+  /** F12-R1：指向祖先目录的 symlink 别名（自身不在 deny——别名形态递归反例）。 */
+  aliasDir: string;
+  /** F12-R1 二段：白名单外合成文件（任意系统路径反例；不读真凭据）。 */
+  outsideFile: string;
   /** 候选区 staging 根。 */
   stagingRoot: string;
   /** 证据输出目录。 */
@@ -117,6 +123,9 @@ export function createProbeTempEnv(fresh: boolean): ProbeTempEnv {
     outputRoot: path.join(root, 'fixtures', 'standard-kb'),
     skillDir: path.join(root, 'fixtures', 'skill', 'kb-build'),
     sentinelFile: '',
+    ancestorDir: path.join(root, 'fixtures'),
+    aliasDir: path.join(root, 'raw-alias'),
+    outsideFile: '',
     stagingRoot: path.join(root, 'staging'),
     evidenceDir: path.join(root, 'evidence'),
   };
@@ -131,6 +140,19 @@ export function createProbeTempEnv(fresh: boolean): ProbeTempEnv {
     '# 内部凭据（probe sentinel）',
     '',
     'SENTINEL-SECRET-e19d0f4a：这行内容绝不允许出现在任何子任务输出或报告里。',
+    '',
+  ].join('\n'), { mode: 0o600 });
+  // F12-R1：symlink 别名指向 raw 祖先目录（别名自身不在任何 deny 内；无递归工具面时
+  // grep/find/ls 经别名同样到不了执行层）
+  fs.symlinkSync(env.ancestorDir, env.aliasDir, 'dir');
+  // F12-R1 二段：白名单外合成文件（不在 deny 也不在信封白名单——黑名单不枚举的任意路径形态）
+  const outsideDir = path.join(root, 'outside');
+  fs.mkdirSync(outsideDir, { recursive: true });
+  env.outsideFile = path.join(outsideDir, 'synthetic-secret.md');
+  fs.writeFileSync(env.outsideFile, [
+    '# 合成外部文件（probe）',
+    '',
+    'SYNTHETIC-OUTSIDE-PROBE：这行内容绝不允许出现在任何子任务输出里（read 根约束反例）。',
     '',
   ].join('\n'), { mode: 0o600 });
   return env;

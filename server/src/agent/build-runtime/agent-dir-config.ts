@@ -30,6 +30,7 @@ import path from 'node:path';
 import {
   childPolicyFileName, materializeChildPolicyFile, verifyChildPolicyFile,
 } from './child-policy.js';
+import { settingsFrozenSurfaceIssues } from './runtime-integrity.js';
 import {
   BUILD_MCP_SERVER_NAME, BUILD_MCP_TOKEN_ENV, BUILD_MCP_URL_ENV,
   BUILD_MODEL_PROVIDER, ZHIPU_API_KEY_ENV,
@@ -45,23 +46,49 @@ export class AgentDirConfigError extends Error {
 }
 
 export interface BuildDirectories {
-  /** 构建根（<dataRoot>/agent/builds/<buildId>）。 */
+  /** 构建根（<dataRoot>/agent/builds/<buildId>；跨 epoch 共享，进程账本在此）。 */
   buildRoot: string;
+  /** epoch 根（epoch≥1：<buildRoot>/epochs/e<N>；legacy 布局 = buildRoot）。 */
+  epochRoot: string;
   /** PI_CODING_AGENT_DIR。 */
   homeDir: string;
   /** Leader 与子任务工作目录。 */
   workDir: string;
   /** 会话目录（pi --session-dir，位于 agentDir 内随构建保留）。 */
   sessionDir: string;
+  /** 计划使用的 epoch（legacy 布局为 null）。 */
+  runtimeEpoch: number | null;
 }
 
-export function planBuildDirectories(dataRoot: string, buildId: string): BuildDirectories {
+/**
+ * 规划构建目录（F09：epoch 分层）。
+ * - epoch ≥ 1（新代码路径）：<buildRoot>/epochs/e<N>/{home,work,home/sessions}——
+ *   每次成果级 rebuild 递增 epoch，新 home 即全新 amagi 内部库（v2-store/
+ *   process-audits/sessions），不复用旧会话与内部状态；原会话续接保持同 epoch。
+ * - epoch 缺省/0（legacy）：旧检查点 binding 的 <buildRoot>/{home,work} 布局，
+ *   仅由旧 binding 恢复路径使用；新启动一律传 ≥1。
+ */
+export function planBuildDirectories(dataRoot: string, buildId: string, epoch?: number): BuildDirectories {
   const buildRoot = path.join(dataRoot, 'agent', 'builds', buildId);
+  const runtimeEpoch = typeof epoch === 'number' && Number.isInteger(epoch) && epoch >= 1 ? epoch : null;
+  if (runtimeEpoch === null) {
+    return {
+      buildRoot,
+      epochRoot: buildRoot,
+      homeDir: path.join(buildRoot, 'home'),
+      workDir: path.join(buildRoot, 'work'),
+      sessionDir: path.join(buildRoot, 'home', 'sessions'),
+      runtimeEpoch: null,
+    };
+  }
+  const epochRoot = path.join(buildRoot, 'epochs', `e${runtimeEpoch}`);
   return {
     buildRoot,
-    homeDir: path.join(buildRoot, 'home'),
-    workDir: path.join(buildRoot, 'work'),
-    sessionDir: path.join(buildRoot, 'home', 'sessions'),
+    epochRoot,
+    homeDir: path.join(epochRoot, 'home'),
+    workDir: path.join(epochRoot, 'work'),
+    sessionDir: path.join(epochRoot, 'home', 'sessions'),
+    runtimeEpoch,
   };
 }
 
@@ -361,32 +388,11 @@ export function readAgentDirConfigHash(homeDir: string): string | null {
  * 容忍式漂移核对（resume/probe 用）：
  * - amagi.json / models.json 逐字节比对 spec 渲染结果；
  * - mcp.json：提供 bridge 时逐字节比对，否则跳过字节比对（形状由 validateRenderedConfig 保障）；
- * - settings.json 字段感知完整比对（资源注入缺口收口）：
- *   · 冻结资源/工具面键 $schema/packages/extensions/skills/prompts/themes/defaultTools
- *     必须与 spec 渲染结果深度一致（含“不存在即不得出现”——未知资源字段不得放过）；
- *   · 唯一容忍键 retry：仅 amagi doctor 实测写入的 retry.provider.timeoutMs 正数
- *     （terminal-doctor.ts mergeProviderTimeout 只补这一条路径，其余原样保留；
- *     本配置不写 retry，出现的 retry 只能来自 doctor，且形状必须精确到无多余键）；
- *   · 其余任何键 → 不匹配。
+ * - settings.json 字段感知完整比对（比对口径与 runtime-integrity.settingsFrozenSurfaceIssues
+ *   同一实现——冻结键深度一致 + retry 容忍 + 未知键拒绝，两处不得分叉）；
  * - child-policy 文件本体字节级核验（加载前验内容，防“只记 hash 不验证”）：
  *   缺失/篡改 → 不匹配（resume/probe fail-closed）。
  */
-const SETTINGS_FROZEN_KEYS = ['$schema', 'packages', 'extensions', 'skills', 'prompts', 'themes', 'defaultTools'] as const;
-const SETTINGS_TOLERATED_KEYS = new Set(['retry']);
-
-/** retry 容忍形状：{ provider: { timeoutMs: <正有限数> } } 且无任何多余键。 */
-function isToleratedRetryShape(value: unknown): boolean {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const retry = value as Record<string, unknown>;
-  if (Object.keys(retry).length !== 1) return false;
-  const provider = retry.provider;
-  if (!provider || typeof provider !== 'object' || Array.isArray(provider)) return false;
-  const providerRecord = provider as Record<string, unknown>;
-  if (Object.keys(providerRecord).length !== 1) return false;
-  const timeoutMs = providerRecord.timeoutMs;
-  return typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs > 0;
-}
-
 export function agentDirConfigMatchesSpec(
   homeDir: string,
   spec: BuildRunSpec,
@@ -409,34 +415,7 @@ export function agentDirConfigMatchesSpec(
   if (settingsRaw === null) {
     issues.push('缺少 settings.json');
   } else {
-    try {
-      const actual = JSON.parse(settingsRaw) as Record<string, unknown>;
-      const expectedSettings = JSON.parse(expected.settings) as Record<string, unknown>;
-      // 1) 冻结键深度比对（含“spec 未写 → 磁盘不得出现”）
-      for (const key of SETTINGS_FROZEN_KEYS) {
-        const a = actual[key];
-        const e = expectedSettings[key];
-        const aMissing = a === undefined;
-        const eMissing = e === undefined;
-        if (aMissing !== eMissing) {
-          issues.push(`settings.json ${key} 冻结面被${eMissing ? '新增' : '移除'}（资源/工具注入面收口）`);
-        } else if (!aMissing && JSON.stringify(a) !== JSON.stringify(e)) {
-          issues.push(`settings.json ${key} 与 spec 渲染结果不一致（构建冻结面被改动）`);
-        }
-      }
-      // 2) 容忍键 retry：仅实测 doctor 写入的精确形状
-      if (actual.retry !== undefined && !isToleratedRetryShape(actual.retry)) {
-        issues.push('settings.json retry 键形状超出已实测可接受项（仅 amagi doctor 写入的 provider.timeoutMs）');
-      }
-      // 3) 未知键拒绝（不在冻结/容忍清单内的字段一律根出）
-      for (const key of Object.keys(actual)) {
-        if (!SETTINGS_TOLERATED_KEYS.has(key) && !(SETTINGS_FROZEN_KEYS as readonly string[]).includes(key)) {
-          issues.push(`settings.json 出现未知字段 ${key}（不在冻结/容忍清单，疑似资源注入）`);
-        }
-      }
-    } catch (error) {
-      issues.push(`settings.json 解析失败: ${error instanceof Error ? error.message : String(error)}`);
-    }
+    issues.push(...settingsFrozenSurfaceIssues(settingsRaw, expected.settings));
   }
   // child-policy 文件本体核验（settings 含 hash 文件名，这里验内容——加载前把关）
   issues.push(...verifyChildPolicyFile(homeDir).issues);

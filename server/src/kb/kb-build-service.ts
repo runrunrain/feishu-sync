@@ -17,7 +17,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { AgentProcessPool, AgentBusyError, type PoolSlot } from '../agent/agent-process-pool.js';
+import { reconcileBuildRootResiduals } from '../agent/build-runtime/adapter.js';
 import { AgentToolService, ToolError, validateStdDocPath, type BuildRunState } from '../agent/agent-tool-service.js';
+import { BuildActorStore } from '../kb/build-actors.js';
 import type { KnowledgeDraftFile, OrganizationPlanFile } from '../agent/agent-tool-service.js';
 import type { VisionDescriberLike } from '../agent/agent-tool-service.js';
 import { isPathInside, PathGuardError, resolveInside } from '../agent/path-guard.js';
@@ -66,6 +68,7 @@ import {
   type ResolvedRoleModel,
   type ReviewReport,
 } from './orchestration-contracts.js';
+import { collectAuthorityValidatedReports, resolveCurrentReviewDependencies } from './review-authority.js';
 import { contentResourceHash, verifyEvidence } from './evidence-locator.js';
 import type { EvidenceReadReceipt, EvidenceResource } from './evidence-locator.js';
 // D3（A案 §5.2/§5.4）：工作簿/图片证据资源装配与 evidence/ 落盘规划
@@ -245,9 +248,130 @@ function isPiThinkingLevel(value: string | undefined): value is ThinkingLevel {
   return typeof value === 'string' && PI_THINKING_LEVEL_SET.has(value);
 }
 
+/** shutdown 内存终止事实（active 条目 60s 保留；hasLeader=false 的排队/早期失败构建无 OS 写者，不参与）。 */
+export interface KbShutdownMemoryFact {
+  buildId: string;
+  hasLeader: boolean;
+  /** null = 有 Leader 但无对账结果（崩溃未落记录窗口）——不能当已收口。 */
+  terminationState: 'confirmed' | 'unconfirmed' | null;
+}
+
+/** shutdown 持久事实扫描结果（磁盘锚点/账本新鲜只读对账）。 */
+export interface KbShutdownDiskOutcome {
+  buildId: string;
+  outcome: 'confirmed' | 'unconfirmed' | 'no-facts' | 'unavailable';
+  note?: string;
+}
+
+/** R2-LC-01：shutdown 封印后仍未返回的准入/发布入口（在途新写者候选）。
+ * 等待截止后仍未返回即进入未收口报告——它们仍可能在重核点之后执行，
+ * 不能出具 quiesced。 */
+export interface KbShutdownAdmissionFact {
+  /** 入口操作名（新建构建/恢复构建/确认发布）。 */
+  operation: string;
+  startedAt: string;
+}
+
+/**
+ * OS 级关闭收口报告（修正轮）：quiesced=true 是唯一允许消费方删除运行
+ * home 的条件——pipelineRuns 清空只是必要条件，不是充分条件。
+ * R2-LC-01：quiesced 同时覆盖准入接缝——封印后仍有在途准入/发布入口
+ * 未返回时必须为 false（它们可能启动新流水线/提交知识文件）。
+ */
+export interface KbShutdownReport {
+  cancelled: string[];
+  /** 流水线 Promise 未收口（超时）——不是 OS 退出事实。 */
+  unsettled: string[];
+  /** R2-LC-01：等待截止后仍在执行的准入/发布入口（可能的新写者）。 */
+  unsettledAdmissions: KbShutdownAdmissionFact[];
+  timedOut: boolean;
+  /** 终止对账未确认（内存/持久事实）——存在潜在活写者，禁止清理。 */
+  unconfirmedTerminations: Array<{ buildId: string; source: 'memory' | 'disk-reconcile' | 'scan-unavailable'; note: string }>;
+  /** true = 全部构建 OS 级确认收口。 */
+  quiesced: boolean;
+}
+
+/**
+ * 纯判定（可测）：内存未确认仅被**同构建的磁盘新鲜对账 confirmed** 下调
+ * （OS 级证据覆盖旧内存结论）；磁盘对账 unconfirmed/unavailable/扫描整体
+ * 失败均保守保留。cancelled/流水线完成本身不算 OS 退出。
+ */
+export function resolveKbShutdownQuiescence(input: {
+  cancelled: string[];
+  unsettledRuns: string[];
+  memoryFacts: KbShutdownMemoryFact[];
+  diskOutcomes: KbShutdownDiskOutcome[] | null;
+  /** R2-LC-01：等待截止后仍在执行的准入/发布入口（缺省无）。 */
+  unsettledAdmissions?: KbShutdownAdmissionFact[];
+}): KbShutdownReport {
+  const unconfirmed = new Map<string, { source: KbShutdownReport['unconfirmedTerminations'][number]['source']; note: string }>();
+  // 内存事实：有 Leader 且终止未确认/无对账结果 → 候选未收口
+  for (const fact of input.memoryFacts) {
+    if (!fact.hasLeader) continue;
+    if (fact.terminationState === 'confirmed') continue;
+    unconfirmed.set(fact.buildId, {
+      source: 'memory',
+      note: fact.terminationState === 'unconfirmed'
+        ? '终止对账未确认（内存）：存在无法证明已退出的残留个体'
+        : '有 Leader 但无终止对账结果（崩溃未落记录窗口）：不能当已收口',
+    });
+  }
+  // 持久事实：新鲜对账 unconfirmed/unavailable → 未收口；confirmed → 下调内存候选
+  const disk = input.diskOutcomes ?? [];
+  for (const outcome of disk) {
+    if (outcome.outcome === 'confirmed') {
+      unconfirmed.delete(outcome.buildId);
+      continue;
+    }
+    if (outcome.outcome === 'unconfirmed') {
+      unconfirmed.set(outcome.buildId, { source: 'disk-reconcile', note: outcome.note ?? '磁盘锚点/账本对账未确认' });
+      continue;
+    }
+    if (outcome.outcome === 'unavailable') {
+      unconfirmed.set(outcome.buildId, { source: 'scan-unavailable', note: outcome.note ?? '持久事实对账不可得' });
+    }
+    // no-facts：磁盘无锚点/账本事实——不凭空制造未收口，也不下调内存候选
+  }
+  // 扫描整体失败：内存候选保留并标注扫描不可得（fail-closed）
+  if (input.diskOutcomes === null) {
+    // active已过保留期也可能有旧运行；整体扫描失败本身就是未知事实，
+    // 不能仅在仍有内存候选时阻断，否则空active会误报quiesced。
+    unconfirmed.set('*', { source: 'scan-unavailable', note: '持久事实扫描整体不可得（fail-closed）：无法排除已退出内存保留期的构建写者' });
+    for (const [buildId, entry] of [...unconfirmed.entries()]) {
+      if (entry.source === 'memory') unconfirmed.set(buildId, { ...entry, note: `${entry.note}；持久事实扫描整体不可得（fail-closed）` });
+    }
+  }
+  const unconfirmedTerminations = [...unconfirmed.entries()]
+    .map(([buildId, entry]) => ({ buildId, source: entry.source, note: entry.note }))
+    .sort((a, b) => a.buildId.localeCompare(b.buildId));
+  const unsettledAdmissions = [...(input.unsettledAdmissions ?? [])];
+  return {
+    cancelled: input.cancelled,
+    unsettled: [...input.unsettledRuns],
+    unsettledAdmissions,
+    // 诚实超时：准入等待或流水线等待任一截止未清空都算超时。
+    timedOut: input.unsettledRuns.length > 0 || unsettledAdmissions.length > 0,
+    unconfirmedTerminations,
+    quiesced: input.unsettledRuns.length === 0 && unsettledAdmissions.length === 0 && unconfirmedTerminations.length === 0,
+  };
+}
+
 export class KbBuildService extends EventEmitter {
   private readonly deps: KbBuildDeps;
   private readonly active = new Map<string, InMemoryBuild>();
+  /** 进行中的流水线 Promise（F10/ENOTEMPTY quiescence：shutdown 等待其收口；
+  * 业务 cancelled/interrupted 状态落地 ≠ Leader/子任务 OS 级退出完成）。 */
+  private readonly pipelineRuns = new Map<string, Promise<void>>();
+  /** R2-LC-01：关闭准入封印——shutdown 第一同步步置位；此后会启动新流水
+  * 线/提交知识文件的公开入口（createBuild/resumeBuild/releaseConfirm）
+  * 一律拒绝，在途准入在最终入列/启动/落盘前重核同一租约（见
+  * acquireAdmission）。内部 cancel/shutdown 不受封印影响（不产生新写者，
+  * 关闭链自身必须可执行，不引入死锁面）。 */
+  private admissionSealed = false;
+  private shutdownTask: Promise<KbShutdownReport> | null = null;
+  private admissionSeq = 0;
+  /** 在途准入登记：shutdown 有界等待的数据源，截止未清空即进未收口报告。 */
+  private readonly inFlightAdmissions = new Map<string, KbShutdownAdmissionFact>();
   private running = false;
   /** S3：未注入 visionDescriber 时的懒建默认实例 */
   private defaultDescriber?: VisionDescriberLike;
@@ -567,6 +691,21 @@ export class KbBuildService extends EventEmitter {
     },
     input: { mode?: string; confirm?: string; refreshImages?: boolean; rebuildSelected?: boolean },
   ): Promise<KbBuildDto> {
+    // R2-LC-01：新写者准入——shutdown 封印后首部即拒；跨 await 后在
+    // 入列/落盘前重核同一租约（finally 释放，在途时由 shutdown 有界等待收编）。
+    const admission = this.acquireAdmission('新建构建');
+    try {
+      return await this.createBuildAdmitted(localMapStore, input, admission);
+    } finally {
+      admission.release();
+    }
+  }
+
+  private async createBuildAdmitted(
+    localMapStore: Parameters<KbBuildService['createBuild']>[0],
+    input: { mode?: string; confirm?: string; refreshImages?: boolean; rebuildSelected?: boolean },
+    admission: { validate: () => void },
+  ): Promise<KbBuildDto> {
     const config = this.deps.configProvider();
     if (!config) throw new ToolError('invalid_request', '配置不可用');
     if (input.confirm !== 'BUILD') {
@@ -628,6 +767,10 @@ export class KbBuildService extends EventEmitter {
     const model = status.model.model;
     const basePointer = new StandardKbStore(outputRoot).readCurrent();
     const buildId = `b_${new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0, 14)}_${crypto.randomBytes(3).toString('hex')}`;
+    // R2-LC-01：跨 readiness await 后重核准入租约——封印后拒绝（不写库、
+    // 不登记 active、不启动流水线）；本行到 launchPipeline 为同步段，
+    // 封印不可能插入其间。
+    admission.validate();
     localMapStore.createKbBuild({
       id: buildId,
       mode: input.mode,
@@ -639,8 +782,8 @@ export class KbBuildService extends EventEmitter {
     });
     this.active.set(buildId, this.newEntry(buildId, config.agent.runtime.backend === 'claude-code' ? 'claude-code' : 'pi', input.mode, input.rebuildSelected === true, input.refreshImages === true, orchestrationMode));
 
-    // 异步执行
-    void this.runPipeline(localMapStore as never, buildId, input.mode).catch((error) => {
+    // 异步执行（登记 Promise 供 shutdown 等待收口）
+    this.launchPipeline(buildId, this.runPipeline(localMapStore as never, buildId, input.mode), (error) => {
       console.error('[KbBuildService] pipeline crashed:', error);
     });
 
@@ -649,6 +792,22 @@ export class KbBuildService extends EventEmitter {
   }
 
   async resumeBuild(localMapStore: Parameters<KbBuildService['createBuild']>[0] & { getKbBuild(id: string): Record<string, unknown> | null }, buildId: string, confirm?: string, resumeStrategy?: string): Promise<KbBuildDto> {
+    // R2-LC-01：新写者准入——恢复也是新流水线写者，封印后首部即拒。
+    const admission = this.acquireAdmission('恢复构建');
+    try {
+      return await this.resumeBuildAdmitted(localMapStore, buildId, confirm, admission, resumeStrategy);
+    } finally {
+      admission.release();
+    }
+  }
+
+  private async resumeBuildAdmitted(
+    localMapStore: Parameters<KbBuildService['resumeBuild']>[0],
+    buildId: string,
+    confirm: string | undefined,
+    admission: { validate: () => void },
+    resumeStrategy?: string,
+  ): Promise<KbBuildDto> {
     if (confirm !== 'RESUME') throw new ToolError('confirmation_required', '继续构建需要 confirm: "RESUME"');
     if (this.running || localMapStore.getActiveKbBuild()) throw new ToolError('kb_build_running', '已有构建正在进行', 409);
     const row = localMapStore.getKbBuild(buildId);
@@ -689,6 +848,9 @@ export class KbBuildService extends EventEmitter {
     const ready = await this.deps.resolver.checkReadiness({ agentConfig: { ...config.agent, runtime: { ...config.agent.runtime, backend: checkpoint.backend } }, llmConfig: config.llm, runningProcesses: this.deps.pool.runningCount() });
     if (ready.code !== 'ready') throw new ToolError('agent_not_ready', `Agent 未就绪：${ready.message}`, 503);
     if (this.running || localMapStore.getActiveKbBuild()) throw new ToolError('kb_build_running', '已有构建正在进行', 409);
+    // R2-LC-01：跨 readiness await 后重核准入租约——封印后拒绝（不置
+    // queued、不登记 active、不启动流水线）；本行到 launchPipeline 为同步段。
+    admission.validate();
     const savedMode = checkpoint.orchestrationMode ?? (checkpoint.leaderRun ? 'pi-amagi' : row.orchestration_mode ?? 'legacy');
     if (savedMode !== 'legacy' && savedMode !== 'pi-amagi') throw new ToolError('build_mode_unavailable', '检查点运行模式不受支持，拒绝用legacy解释', 409);
     const entry = this.newEntry(buildId, checkpoint.backend, checkpoint.requestedMode, checkpoint.rebuildSelected, false, savedMode);
@@ -713,7 +875,7 @@ export class KbBuildService extends EventEmitter {
     entry.unitProgress = new Map(checkpoint.unitProgress); entry.events = this.readStoredEvents(buildId); entry.nextSeq = (entry.events.at(-1)?.seq ?? 0) + 1;
     this.active.set(buildId, entry);
     localMapStore.updateKbBuild(buildId, { status: 'queued', orchestrationMode: savedMode, model: ready.model.model, errorCode: null, errorMessage: null, finishedAt: null });
-    void this.runPipeline(localMapStore as never, buildId, checkpoint.requestedMode).catch((error) => console.error('[KbBuildService] resume failed:', error));
+    this.launchPipeline(buildId, this.runPipeline(localMapStore as never, buildId, checkpoint.requestedMode), (error) => console.error('[KbBuildService] resume failed:', error));
     return this.toDto(localMapStore.getKbBuild(buildId)!, entry);
   }
 
@@ -751,6 +913,151 @@ export class KbBuildService extends EventEmitter {
     }
     const updated = localMapStore.getKbBuild(buildId);
     return updated ? this.toDto(updated, this.active.get(buildId)) : null;
+  }
+
+  /**
+   * R2-LC-01：新写者准入租约。createBuild/resumeBuild/releaseConfirm 等会
+   * 启动新流水线或提交知识文件的公开入口在方法首部同步 acquire（已封
+   * 印即拒，503）；跨 readiness/锁/其它 await 后，在最终入列/启动/落盘
+   * 前的同步段 validate 重核同一租约——封印后抛出，请求不得越过关闭
+   * 边界写库/落盘。validate 到入列/启动之间不得再 await（单线程同步段
+   * 保证封印不可能插入其间）。内部 cancelBuild/shutdown 与流水线内发布
+   * 执行器不走此租约：前者不产生新写者且关闭链自身必须可执行；后者
+   * 属已登记流水线（pipelineRuns 跟踪收口，取消链在发布提交点拦下）。
+   */
+  private acquireAdmission(operation: string): { validate: () => void; release: () => void } {
+    if (this.admissionSealed) {
+      throw new ToolError('kb_shutdown_in_progress', `服务正在关闭，不再接受${operation}（新写者准入已封印）`, 503);
+    }
+    const id = `adm_${(this.admissionSeq += 1)}`;
+    this.inFlightAdmissions.set(id, { operation, startedAt: new Date().toISOString() });
+    return {
+      validate: () => {
+        if (this.admissionSealed) {
+          throw new ToolError('kb_shutdown_in_progress', `服务正在关闭，${operation}在等待期间被拒（关闭边界内不得入列/启动/落盘新写者）`, 503);
+        }
+      },
+      release: () => { this.inFlightAdmissions.delete(id); },
+    };
+  }
+
+  /** 登记进行中的流水线 Promise（shutdown 等待收口；错误回调保留原行为）。 */
+  private launchPipeline(buildId: string, run: Promise<void>, onError: (error: unknown) => void): Promise<void> {
+    this.pipelineRuns.set(buildId, run);
+    run.catch(onError);
+    void run.finally(() => {
+      if (this.pipelineRuns.get(buildId) === run) this.pipelineRuns.delete(buildId);
+    }).catch(() => undefined);
+    return run;
+  }
+
+  /**
+   * 应用关闭收尾（F10/ENOTEMPTY quiescence + R2-LC-01 准入接缝）：
+   * ①第一同步步封印新写者准入（createBuild/resumeBuild/releaseConfirm
+   * 首部即拒；在途准入有界等待，各自在重核点被拒或自然完成后清空——
+   * 否则停在 readiness/发布确认 await 中的请求会在 quiesced 判定后继续
+   * 入列新流水线/提交知识文件，推翻已发布的收口结论）；
+   * ②取消全部活动构建并等待流水线收口（含 Leader 宽限终止与残留回收
+   * 对账；业务 cancelled ≠ OS 退出）；
+   * ③把持久/内存 termination-unconfirmed 纳入收口判定（修正轮：
+   * pipelineRuns 清空 ≠ quiescence）。
+   * 总等待有界（诚实超时）：timeoutMs 覆盖在途准入与流水线两段等待的
+   * 同一 deadline，超时不无限阻塞进程退出，如实返回未收口清单（未收口
+   * 构建在下次启动由 reconcileOnStartup 标记 interrupted，不假装已收敛）。
+   * quiesced=true 是唯一允许消费方删除运行 home 的条件。
+   */
+  async shutdown(
+    localMapStore: Parameters<KbBuildService['cancelBuild']>[0],
+    options: { timeoutMs?: number } = {},
+  ): Promise<KbShutdownReport> {
+    // R2-LC-01：封印必须在任何 await/快照之前（并发 shutdown 共用同一
+    // 封印事实；幂等重复置位无害）。
+    this.admissionSealed = true;
+    // 同实例并发关闭共享同一收口过程，避免重复cancel/扫描。先存Promise
+    // 再进入关闭内核，也覆盖同步取消回调中的重入；准入封印仍立即生效。
+    this.shutdownTask ??= Promise.resolve().then(() => this.shutdownSealed(localMapStore, options));
+    return this.shutdownTask;
+  }
+
+  private async shutdownSealed(
+    localMapStore: Parameters<KbBuildService['cancelBuild']>[0],
+    options: { timeoutMs?: number },
+  ): Promise<KbShutdownReport> {
+    const timeoutMs = options.timeoutMs ?? 120_000;
+    const deadline = Date.now() + timeoutMs;
+    // 在途准入有界等待：封印后它们只会在下一次重核点被拒或自然完成，
+    // 不会产生新写者；等待是为了不在它们仍可能在途时出具 quiesced。
+    while (this.inFlightAdmissions.size > 0 && Date.now() < deadline) {
+      await new Promise((resolve) => { setTimeout(resolve, 50); });
+    }
+    const unsettledAdmissions = [...this.inFlightAdmissions.values()].map((fact) => ({ ...fact }));
+    const buildIds = [...this.active.keys()];
+    for (const buildId of buildIds) {
+      try {
+        await this.cancelBuild(localMapStore, buildId);
+      } catch (error) {
+        console.error('[KbBuildService] shutdown cancel failed:', buildId, error);
+      }
+    }
+    while (this.pipelineRuns.size > 0 && Date.now() < deadline) {
+      await Promise.race([
+        Promise.allSettled([...this.pipelineRuns.values()]),
+        new Promise((resolve) => { setTimeout(resolve, 200); }),
+      ]);
+    }
+    // 修正轮：流水线清空后还得看终止对账事实——内存（active 条目 60s 保留）
+    // + 持久（磁盘上锚点/账本的新鲜只读对账，含已退出 this.active 的构建）。
+    const memoryFacts: KbShutdownMemoryFact[] = [...this.active.values()].map((entry) => ({
+      buildId: entry.id,
+      hasLeader: entry.leaderRun !== null && entry.leaderRun !== undefined,
+      terminationState: entry.leaderRun?.termination
+        ? (entry.leaderRun.termination.state === 'confirmed' ? 'confirmed' : 'unconfirmed')
+        : null,
+    }));
+    let diskOutcomes: KbShutdownDiskOutcome[] | null;
+    try {
+      diskOutcomes = await this.scanDiskResidualFacts();
+    } catch (error) {
+      console.warn('[KbBuildService] shutdown 持久事实扫描失败（fail-closed）：', error instanceof Error ? error.message : String(error));
+      diskOutcomes = null;
+    }
+    return resolveKbShutdownQuiescence({
+      cancelled: buildIds,
+      unsettledRuns: [...this.pipelineRuns.keys()],
+      unsettledAdmissions,
+      memoryFacts,
+      diskOutcomes,
+    });
+  }
+
+  /**
+   * 持久事实扫描：枚举 `<dataRoot>/agent/builds/<buildId>`，逐构建跑只读
+   * 残留对账（锚点/账本跨 epoch；无事实 → no-facts）。扫描本身失败抛出由
+   * 调用方 fail-closed（diskOutcomes=null → 有内存候选即未收口）。
+   */
+  private async scanDiskResidualFacts(): Promise<KbShutdownDiskOutcome[]> {
+    const buildsRoot = path.join(this.deps.dataRoot, 'agent', 'builds');
+    let ids: string[];
+    try {
+      ids = fs.readdirSync(buildsRoot);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+      throw error;
+    }
+    const outcomes: KbShutdownDiskOutcome[] = [];
+    for (const buildId of ids) {
+      if (!/^[A-Za-z0-9_-]{1,120}$/.test(buildId)) continue;
+      const buildRoot = path.join(buildsRoot, buildId);
+      try {
+        const outcome = await reconcileBuildRootResiduals({ buildId, buildRoot, binding: null }, { reap: false, includeLeaders: false });
+        outcomes.push(outcome
+          ? { buildId, outcome: outcome.state === 'confirmed' ? 'confirmed' : 'unconfirmed', note: outcome.note }
+          : { buildId, outcome: 'no-facts', note: '无锚点/账本事实' });
+      } catch (error) {
+        outcomes.push({ buildId, outcome: 'unavailable', note: `对账失败：${error instanceof Error ? error.message : String(error)}` });
+      }
+    }
+    return outcomes;
   }
 
   // ------------------------------------------------------------------
@@ -996,6 +1303,8 @@ export class KbBuildService extends EventEmitter {
       model: input.model,
       updateKbBuild: input.updateKbBuild,
     });
+    // v2 F08：冻结 workflow 规则哈希上链（审查回执依赖绑定与发布核验共用）。
+    input.buildState.v2WorkflowRulesHash = leaderInput.workflowRevision ?? null;
     if (prior && entry.leaderResumeStrategy === 'rebuild') {
       // 成果级重建：已接受草稿与未解决问题交给新 Leader（不伪造会话续接）。
       const accepted = [...(input.buildState.writtenPaths ?? new Set<string>())];
@@ -1040,6 +1349,8 @@ export class KbBuildService extends EventEmitter {
     const config = this.configForBuild(request.buildId);
     const outputRoot = config.standardKb.outputRoot;
     const stagingRoot = this.stagingRoot(outputRoot, request.buildId);
+    // F11：本次发布尝试的 releaseId（catch 段按 CURRENT 指针收敛用）
+    let attemptedReleaseId: string | null = null;
     try {
       // 精确 revision 锁：重算当前候选哈希（工具侧已比对一次，此处独立复核）。
       const current = computeCandidateHash({ documents: KbBuildService.stagingDocsEntriesOf(stagingRoot) });
@@ -1117,12 +1428,18 @@ export class KbBuildService extends EventEmitter {
         return { accepted: false, result: { reason: 'build_cancelled', message: '发布窗口内构建被取消或代次变化，发布中止（CURRENT 未切换）' } };
       }
       const releaseId = `r_${new Date().toISOString().replace(/[-:]/g, '').replace('T', 'T').slice(0, 15)}_${crypto.randomBytes(3).toString('hex')}`;
+      attemptedReleaseId = releaseId;
       const baseManifest = ctx.baseReleaseId ? new StandardKbStore(outputRoot).readManifest(ctx.baseReleaseId) : null;
       const versionStore = new KbVersionStore(outputRoot);
       const sourceContents = captureSourceContents(buildState.snapshot, config.knowledgeBaseRoot);
       const changePreview = sourceChangePreview(buildState.snapshot, sourceContents, baseManifest,
         versionStore.readSourceContents(baseManifest?.releaseId ?? null),
         new Set([...(this.deps.excludedSourcesProvider?.() ?? []), ...(ctx.effectiveMode === 'full' ? this.deps.unselectedSourcesProvider?.() ?? [] : [])]));
+      // F11 补强：真正指针提交点（CURRENT rename 紧前）运行租约核验——
+      // ①真实 Leader ctx 租约（工具层服务端闭包，缺证明拒绝）；②取消；
+      // ③整体超时；④代次。任一失败即中止（CURRENT 未切，安全回滚）；
+      // 通过后提交，后续失败按已发布收敛（见下方 catch 收敛段）。
+      const authorityLease = (request as { authorityLease?: { validate: () => void } }).authorityLease;
       const manifest = await this.publishRelease({
         buildId: request.buildId,
         releaseId,
@@ -1139,6 +1456,16 @@ export class KbBuildService extends EventEmitter {
         changePreview,
         summary: request.summary ?? buildState.finishInfo.summary,
         imageDescriptions: buildState.imageDescriptions,
+        preCommitLease: () => {
+          if (!authorityLease) {
+            throw new ToolError('run_token_invalid', '发布提交点缺 ctx 租约证明（发布管线未从工具层携带 authorityLease），拒绝提交', 401);
+          }
+          authorityLease.validate();
+          if (entry.cancelRequested || entry.timedOut) throw new CancelledError();
+          if ((entry.leaderRun?.generation ?? request.generation) !== request.generation) {
+            throw new ToolError('generation_mismatch', `发布提交点代次核验失败（当前 ${entry.leaderRun?.generation}，申请 ${request.generation}）`, 409);
+          }
+        },
       });
       // 发布后复核：候选稳定 + 窗口结算锁（写者撤销；被接受 revision 不被替换）
       const postHash = computeCandidateHash({ documents: KbBuildService.stagingDocsEntriesOf(stagingRoot) });
@@ -1156,11 +1483,50 @@ export class KbBuildService extends EventEmitter {
       this.emitLog(request.buildId, 'info', `Leader 发布完成：release=${releaseId}，${manifest.docs.length} 篇文档`);
       return { accepted: true, result: { status: 'published', releaseId, candidateHash: candidateFile.candidateHash, docs: manifest.docs.length } };
     } catch (error) {
+      // F11：CURRENT 已切（指针指向本次 release）→ 按发布真相收敛 published：
+      // 不落 accepted:false/failed，不回滚删除 current release；发布回执与
+      // 状态尽力落盘（指针是权威，收尾失败只记日志不改变真相）。
+      if (attemptedReleaseId && this.publishAlreadyCommitted(outputRoot, attemptedReleaseId, request.buildId)) {
+        try {
+          if (entry.leaderRun) {
+            entry.leaderRun.publishLock = { candidateHash: request.candidateHash, revision: attemptedReleaseId, settledAt: new Date().toISOString() };
+            entry.leaderRun.publishRequest = { requestId: null, candidateRevision: request.candidateHash, summary: request.summary ?? '', accepted: true, status: 'accepted', decidedAt: new Date().toISOString() };
+          }
+          this.deps.buildRuntime?.settlePublishWindow?.(request.buildId, request.generation, request.candidateHash);
+          this.persistCheckpoint(request.buildId);
+          ctx.updateKbBuild({ status: 'published', releaseId: attemptedReleaseId, finishedAt: new Date().toISOString() });
+        } catch (settleError) {
+          this.emitLog(request.buildId, 'error', `发布后收尾落盘失败（CURRENT 已提交，发布真相以指针为准）：${settleError instanceof Error ? settleError.message : String(settleError)}`);
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        this.emitLog(request.buildId, 'warn', `发布收尾异常但 CURRENT 已提交（release=${attemptedReleaseId}），按已发布收敛：${message.slice(0, 300)}`);
+        return { accepted: true, result: { status: 'published', releaseId: attemptedReleaseId, candidateHash: request.candidateHash, warning: `发布收尾异常但指针已提交，按已发布收敛：${message.slice(0, 300)}` } };
+      }
+      if (error instanceof CancelledError) {
+        this.emitLog(request.buildId, 'warn', '发布提交点租约核验拦下取消（CURRENT 未切换，发布中止）');
+        return { accepted: false, result: { reason: 'build_cancelled', message: '发布提交点检测到构建取消或代次变化，发布中止（CURRENT 未切换）' } };
+      }
       const code = error instanceof ToolError || (error instanceof PathGuardError && error.code === 'source_changed_during_build')
         ? error.code : 'kb_build_failed';
       const message = error instanceof Error ? error.message : String(error);
       this.emitLog(request.buildId, 'error', `Leader 发布管线异常：${code}: ${message}`);
       return { accepted: false, result: { reason: code, message: message.slice(0, 500) } };
+    }
+  }
+
+  /** F11：发布指针是否已提交到指定 release（CURRENT 真相 + manifest 归属
+   * 双重精确比对；防「他 build 已切指针」误判为本 build 发布成功）。 */
+  private publishAlreadyCommitted(outputRoot: string, releaseId: string, buildId?: string): boolean {
+    try {
+      const store = new StandardKbStore(outputRoot);
+      if (store.readCurrent()?.releaseId !== releaseId) return false;
+      if (buildId !== undefined) {
+        const manifest = store.readManifest(releaseId);
+        if (!manifest || manifest.buildId !== buildId) return false;
+      }
+      return true;
+    } catch {
+      return false;
     }
   }
 
@@ -1211,16 +1577,31 @@ export class KbBuildService extends EventEmitter {
       buildId: leaderRun.spec.buildId,
       orchestrationMode: 'pi-amagi',
       generation: leaderRun.generation,
+      runtimeEpoch: leaderRun.runtimeEpoch ?? null,
       leader: leaderRun.binding
         ? { sessionId: leaderRun.binding.leaderSessionId, pid: leaderRun.binding.leaderPid, resumeCapability: resumeLevel }
         : null,
       tasks: leaderRun.actors.map((actor) => ({
         nativeTaskId: actor.nativeTaskId, role: actor.role, parentTaskId: actor.parentTaskId,
         status: actor.status, execState: actor.execState, lastEventAt: actor.lastEventAt,
+        runtimeEpoch: actor.runtimeEpoch ?? null, generation: actor.generation,
       })),
-      rounds: { started: 0, ended: 0 },
+      // F15 后端：轮次计数来自检查点持久化；旧状态缺字段 → null（未知），
+      // 不得回退为看似实测的 0/0（DTO 契约：rounds 可空，前端按未知展示）。
+      rounds: leaderRun.rounds ?? null,
       idle: { remindedAt: leaderRun.idleRemindedAt, lastActivityAt: null },
       publishRequest: leaderRun.publishRequest,
+      // F10：终止对账安全摘要（与活会话 progress() 同口径；null=无记录）
+      processTermination: leaderRun.termination
+        ? {
+          state: leaderRun.termination.state,
+          at: leaderRun.termination.at,
+          note: leaderRun.termination.note,
+          unconfirmedPids: leaderRun.termination.children
+            .filter((child) => child.verdict === 'unconfirmed')
+            .map((child) => child.pid),
+        }
+        : null,
       summary: {
         acceptedDocumentCount: payload ? accepted.size : null,
         openBlockingCount: openBlocking,
@@ -1230,7 +1611,10 @@ export class KbBuildService extends EventEmitter {
         cumulativeUsage: null,
       },
       endedReason: leaderRun.endedReason,
-      termination: leaderRun.publishLock ? 'finished' : leaderRun.endedReason ? 'finished' : null,
+      // F10：未确认终止优先于 finished（不把未确认回收当完成；恢复受阻）
+      termination: leaderRun.termination?.state === 'unconfirmed'
+        ? 'termination-unconfirmed'
+        : leaderRun.publishLock ? 'finished' : leaderRun.endedReason ? 'finished' : null,
       skill: { path: leaderRun.spec.workflowSkillPath, revision: leaderRun.spec.workflowRevision },
       eventCursor: { ...leaderRun.eventCursor },
       updatedAt: leaderRun.updatedAt,
@@ -1769,16 +2153,32 @@ export class KbBuildService extends EventEmitter {
               : config.agent.model.piModel ?? null,
             updateKbBuild: (patch) => localMapStore.updateKbBuild(buildId, patch),
           });
-          if (entry.cancelRequested) throw new CancelledError();
-          if (outcome.kind === 'publish-accepted') {
+          // F11（审核修复）：发布真相优先——publishLock.revision 非空表示
+          // CURRENT 已提交（executeLeaderPublishRequest 已切指针/发布回执落
+          // 盘），此时无论监督终局为何（含取消竞态）都按已发布收敛，绝不落
+          // cancelled/「未发布」或回滚删除 current release。awaiting_release
+          //（revision=null）不在此列：待确认候选可取消，CURRENT 未切。
+          const publishedRevision = entry.leaderRun?.publishLock?.revision ?? null;
+          const acceptedSummary = outcome.kind === 'publish-accepted' ? outcome.summary : null;
+          if (outcome.kind === 'publish-accepted' || publishedRevision) {
+            if (outcome.kind !== 'publish-accepted') {
+              this.emitLog(buildId, 'warn', `监督终局为 ${outcome.kind} 但发布已提交（release=${publishedRevision}），按指针/发布回执收敛为 published`);
+              localMapStore.updateKbBuild(buildId, {
+                status: 'published',
+                releaseId: publishedRevision,
+                finishedAt: new Date().toISOString(),
+              });
+            }
             // 发布已由真实工具回调（executeLeaderPublishRequest）在发布窗口
             // 内完成：auto 已发布/confirm 停在 awaiting_release。此处只收尾，
             // 不重复校验或二次发布。
-            buildState.finishInfo = buildState.finishInfo ?? { summary: outcome.summary || 'Leader 申请发布', skipped: [] };
+            buildState.finishInfo = buildState.finishInfo ?? { summary: acceptedSummary || 'Leader 申请发布', skipped: [] };
             const row = localMapStore.getKbBuild(buildId);
             if (row) this.emitBuild(buildId, 'build_status', this.toDto(row, entry));
             this.cleanupAfterPipeline(buildId);
             return;
+          } else if (entry.cancelRequested) {
+            throw new CancelledError();
           } else if (outcome.kind === 'leader-idle') {
             // 空闲中断：保留候选与问题清单（检查点），interrupted 可恢复。
             localMapStore.updateKbBuild(buildId, {
@@ -5101,13 +5501,42 @@ export class KbBuildService extends EventEmitter {
           : '',
     }));
     // 验收记录：每单元最终轮报告 + 最终复核报告（有效报告集合，B 案 §7）
-    const validReportIds: string[] = [];
-    for (const unit of buildState.units ?? []) {
-      const report = this.readReviewReportFile(stagingRoot, unit.id);
-      if (report) validReportIds.push(report.reportId);
+    // 验收记录：有效报告集合（B 案 §7）。
+    // 重构 v2（F07）：pi-amagi 构建由 BuildActorStore 权威审查回执驱动
+    //（collectAuthorityValidatedReports：回执 valid + 报告文件双向绑定 +
+    // 正文/声明/来源/规则依赖全匹配），不再依赖 legacy 的 all 文件约定；
+    // 多审查者各自入选，旧模式（units + all）行为不变。
+    let validReportIds: string[];
+    const v2Store = buildState.v2?.actorStore ?? null;
+    if (v2Store) {
+      // F08：规则哈希权威源 = 冻结规格（entry.leaderRun.spec.workflowRevision）；
+      // BuildRunState.v2WorkflowRulesHash 为工具侧（kb_submit_review 回执绑定）
+      // 镜像，两者同源（runLeaderSupervisedPhase 物化后同步）。
+      const workflowRulesHash = input.entry?.leaderRun?.spec?.workflowRevision
+        ?? buildState.v2WorkflowRulesHash ?? null;
+      const authority = collectAuthorityValidatedReports({
+        stagingRoot,
+        store: v2Store,
+        current: resolveCurrentReviewDependencies({
+          stagingRoot,
+          snapshot,
+          workflowRulesHash,
+        }),
+        documentHashes: new Map(documents.map((doc) => [doc.path, doc.contentHash])),
+      });
+      validReportIds = authority.validReportIds;
+      if (authority.skipped.length > 0) {
+        this.emitLog(input.buildId, 'info', `审查回执核验：${authority.validReportIds.length} 份有效；${authority.skipped.length} 份未入选（${authority.skipped.slice(0, 3).map((item) => `${item.reviewId}:${item.reason}`).join(', ')}${authority.skipped.length > 3 ? '…' : ''}）`);
+      }
+    } else {
+      validReportIds = [];
+      for (const unit of buildState.units ?? []) {
+        const report = this.readReviewReportFile(stagingRoot, unit.id);
+        if (report) validReportIds.push(report.reportId);
+      }
+      const finalReport = this.readReviewReportFile(stagingRoot, 'all');
+      if (finalReport) validReportIds.push(finalReport.reportId);
     }
-    const finalReport = this.readReviewReportFile(stagingRoot, 'all');
-    if (finalReport) validReportIds.push(finalReport.reportId);
     const candidate: CandidateRelease = {
       buildId: input.buildId,
       documents,
@@ -5145,6 +5574,22 @@ export class KbBuildService extends EventEmitter {
     buildId: string,
     confirmInput: { candidateHash?: string; actor?: string } = {},
   ): Promise<KbBuildDto> {
+    // R2-LC-01：新写者准入——确认发布是知识文件提交入口，shutdown 封印
+    // 后首部即拒；指针提交点（releaseLease）重核同一租约。
+    const admission = this.acquireAdmission('确认发布');
+    try {
+      return await this.releaseConfirmAdmitted(localMapStore, buildId, confirmInput, admission);
+    } finally {
+      admission.release();
+    }
+  }
+
+  private async releaseConfirmAdmitted(
+    localMapStore: Parameters<KbBuildService['releaseConfirm']>[0],
+    buildId: string,
+    confirmInput: { candidateHash?: string; actor?: string },
+    admission: { validate: () => void },
+  ): Promise<KbBuildDto> {
     const row = localMapStore.getKbBuild(buildId);
     if (!row) throw new ToolError('build_not_found', '构建记录不存在', 404);
     if (String(row.status) !== 'awaiting_release') {
@@ -5165,13 +5610,30 @@ export class KbBuildService extends EventEmitter {
     if (!candidateFile?.candidate || typeof candidateFile.candidateHash !== 'string') {
       throw new ToolError('kb_release_unavailable', '候选文件损坏', 409);
     }
+    // R2-LC-01：占位前重核准入租约（封印后拒绝，状态不占位 publishing；
+    // 本段到首个 await 为同步段）。
+    admission.validate();
     // 占位 publishing：串行化并发确认（第二次确认 409），失败回落待确认
     localMapStore.updateKbBuild(buildId, { status: 'publishing' });
     try {
       await this.releaseConfirmInner(localMapStore, buildId, confirmInput, {
-        checkpoint, candidateFile, stagingRoot, config, outputRoot,
+        checkpoint, candidateFile, stagingRoot, config, outputRoot, admission,
       });
     } catch (error) {
+      // F11（审核修复·同类面）：指针已切且**确属本 build**（manifest.buildId
+      // 精确归属；他 build 指针已变但本 build 提交前失败时不得假 published）
+      // → 按发布真相收敛 published，不回落 awaiting_release，也不回滚删除
+      // current release。
+      const committedNow = new StandardKbStore(outputRoot).readCurrent()?.releaseId ?? null;
+      const committedOwnsBuild = committedNow !== null && committedNow !== checkpoint.baseReleaseId
+        && (() => { try { return new StandardKbStore(outputRoot).readManifest(committedNow)?.buildId === buildId; } catch { return false; } })();
+      if (committedOwnsBuild) {
+        this.emitLog(buildId, 'warn', `确认发布收尾异常但 CURRENT 已提交（release=${committedNow}），按已发布收敛：${error instanceof Error ? error.message : String(error)}`);
+        try {
+          localMapStore.updateKbBuild(buildId, { status: 'published', releaseId: committedNow, finishedAt: new Date().toISOString() });
+        } catch { /* 指针是权威；落库失败只留日志 */ }
+        throw error;
+      }
       if (String(localMapStore.getKbBuild(buildId)?.status ?? '') === 'publishing') {
         localMapStore.updateKbBuild(buildId, { status: 'awaiting_release' });
       }
@@ -5191,9 +5653,11 @@ export class KbBuildService extends EventEmitter {
       stagingRoot: string;
       config: Config;
       outputRoot: string;
+      /** R2-LC-01：指针提交点重核的关闭准入租约。 */
+      admission: { validate: () => void };
     },
   ): Promise<void> {
-    const { checkpoint, candidateFile, stagingRoot, config, outputRoot } = context;
+    const { checkpoint, candidateFile, stagingRoot, config, outputRoot, admission } = context;
     const row = localMapStore.getKbBuild(buildId)!;
     if (!checkpoint.finishInfo) throw new ToolError('kb_release_unavailable', '检查点缺少整体收尾信息，无法复核发布材料', 409);
     const entries = KbBuildService.stagingDocsEntriesOf(stagingRoot);
@@ -5239,8 +5703,42 @@ export class KbBuildService extends EventEmitter {
     if (!publishCheck.publishable) {
       throw new ToolError('kb_publish_blocked', `发布条件未满足：${publishCheck.details.join('；')}`, 409);
     }
+    // F08 补强：pi-amagi 检查点（冷启动/无内存 entry）不退回 legacy 文件池——
+    // 以 staging 账本（权威回执）+ 冻结规则哈希重新核验候选引用的每份报告
+    // 当前仍有效（确认等待期间依赖漂移 → 拒绝，与 auto 发布同一 authority）。
+    if (checkpoint.leaderRun) {
+      const actorStore = new BuildActorStore({ buildId, stagingRoot, generation: checkpoint.leaderRun.generation });
+      actorStore.load();
+      const authority = collectAuthorityValidatedReports({
+        stagingRoot,
+        store: actorStore,
+        current: resolveCurrentReviewDependencies({
+          stagingRoot,
+          snapshot: state.snapshot,
+          workflowRulesHash: checkpoint.leaderRun.spec?.workflowRevision ?? null,
+        }),
+        documentHashes: new Map(entries.map((doc) => [doc.path, doc.contentHash])),
+      });
+      const authorityIds = new Set(authority.validReportIds);
+      const staleIds = candidate.acceptance.validReportIds.filter((reportId) => !authorityIds.has(reportId));
+      if (staleIds.length > 0) {
+        throw new ToolError('kb_publish_blocked', `确认时审查回执已失效（依赖漂移，v2 权威核验不退回文件池）：${staleIds.join(', ')}${authority.skipped.length ? `（未入选回执：${authority.skipped.slice(0, 3).map((item) => `${item.reviewId}:${item.reason}`).join(', ')}…）` : ''}`, 409);
+      }
+    }
     // 发布（沿用既有原子发布：manifest + CURRENT rename + 保留策略）
     const releaseId = `r_${new Date().toISOString().replace(/[-:]/g, '').replace('T', 'T').slice(0, 15)}_${crypto.randomBytes(3).toString('hex')}`;
+    // F11 补强：manual 确认无内存 entry——DB 行状态是权威运行租约；异步
+    // 准备期间用户 cancel（行落 cancelled）→ 提交点拒绝（CURRENT 未切）。
+    const releaseLease = (): void => {
+      // R2-LC-01：指针提交点重核关闭封印（同一准入租约；封印后中止，
+      // CURRENT 未切，安全回滚——与取消/DB 状态核验同一提交点契约）。
+      admission.validate();
+      const rowNow = localMapStore.getKbBuild(buildId);
+      const statusNow = rowNow ? String(rowNow.status) : '';
+      if (statusNow !== 'publishing') {
+        throw new ToolError('build_cancelled', `确认发布提交点状态核验失败（当前 ${statusNow || 'missing'}），发布中止（CURRENT 未切换）`, 409);
+      }
+    };
     const baseManifest = checkpoint.baseReleaseId ? store.readManifest(checkpoint.baseReleaseId) : null;
     const versionStore = new KbVersionStore(outputRoot);
     const sourceContents = captureSourceContents(state.snapshot, config.knowledgeBaseRoot);
@@ -5268,6 +5766,7 @@ export class KbBuildService extends EventEmitter {
         changePreview,
         summary: checkpoint.finishInfo.summary,
         imageDescriptions: state.imageDescriptions,
+        preCommitLease: releaseLease,
       });
     } catch (error) {
       if (!(error instanceof ToolError) || error.code !== 'kb_governance_changed') throw error;
@@ -5289,9 +5788,23 @@ export class KbBuildService extends EventEmitter {
         changePreview,
         summary: checkpoint.finishInfo.summary,
         imageDescriptions: state.imageDescriptions,
+        preCommitLease: releaseLease,
       });
     }
-    localMapStore.updateKbBuild(buildId, { status: 'published', releaseId, finishedAt: new Date().toISOString() });
+    // F11 补强：收尾落库异常时按「本次 release 精确归属」收敛（指针 +
+    // manifest.buildId 双验证；他 build 指针已变不假 published），不静默
+    // 回落 awaiting_release 谎称未发布。
+    try {
+      localMapStore.updateKbBuild(buildId, { status: 'published', releaseId, finishedAt: new Date().toISOString() });
+    } catch (error) {
+      if (this.publishAlreadyCommitted(outputRoot, releaseId, buildId)) {
+        this.emitLog(buildId, 'warn', `确认发布收尾异常但 CURRENT 已提交（release=${releaseId}），按已发布收敛：${error instanceof Error ? error.message : String(error)}`);
+        try {
+          localMapStore.updateKbBuild(buildId, { status: 'published', releaseId, finishedAt: new Date().toISOString() });
+        } catch { /* 指针是权威；落库失败只留日志 */ }
+      }
+      throw error;
+    }
     this.emitLog(buildId, 'info', `确认发布完成：release=${releaseId}，${manifest.docs.length} 篇文档`);
     void row;
   }
@@ -5482,6 +5995,11 @@ export class KbBuildService extends EventEmitter {
      * 的 quoteHash 复核与描述快照留存需要；有 media_region 证据而缺描述
      * 时发布期 blocking。两个发布入口（流水/确认）均从构建状态传入。 */
     imageDescriptions?: Map<string, Map<string, ImageDescription>>;
+    /** F11（审核修复）：真正指针提交点（CURRENT rename 紧前）运行租约核验。
+     * 抛错则发布中止（CURRENT 未切，未提交的 release 目录由外层 catch 清理；
+     * staging 草稿从未被移动，原字节可重试——F11-R1 根因修正）；通过后
+     * CURRENT 提交，后续任何失败按已发布收敛，不回滚。 */
+    preCommitLease?: () => void;
   }): Promise<KbManifest> {
     const { outputRoot, releaseId, stagingRoot } = input;
     const docsDir = path.join(stagingRoot, 'docs');
@@ -5502,7 +6020,9 @@ export class KbBuildService extends EventEmitter {
       }
       return manifest;
     } catch (error) {
-      // 指针 rename 之前失败：删除未被引用的 release 目录，CURRENT 不动
+      // 指针 rename 之前失败：删除未被引用的 release 目录，CURRENT 不动。
+      // F11-R1（根因修正）：v1/v2 的 release 均为 staging 的副本/编译产物
+      // ——staging 草稿从未离位，删除的只是未提交副本，无数据丢失面。
       fs.rmSync(releaseDir, { recursive: true, force: true });
       throw error;
     }
@@ -6048,8 +6568,15 @@ export class KbBuildService extends EventEmitter {
     }
 
     if (!knowledgePlan) {
-      // v1：docs/ 目录整体 rename 进 release（同卷原子；读取后移入，行为不变）
-      fs.renameSync(docsDir, path.join(releaseDir, 'docs'));
+      // F11-R1（R2 根因修正）：提交前不移走唯一草稿——v1 把 staging/docs
+      // 逐文件复制进 release（staging 原字节保留，取消/撤租/超时/异常/
+      // 硬崩都不会触碰草稿原件，rmSync(releaseDir) 只删未提交副本）；
+      // 成功发布后 staging 草稿保留供恢复（与 v2 语义一致）。
+      for (const { file, full } of docFiles) {
+        const target = path.join(releaseDir, 'docs', file);
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.copyFileSync(full, target);
+      }
     }
 
     const manifest = {
@@ -6083,9 +6610,12 @@ export class KbBuildService extends EventEmitter {
       input.docMerges ?? this.active.get(input.buildId)?.buildState?.finishInfo?.docMerges ?? []);
 
     // CURRENT.json 原子发布：tmp → rename
-    // 【F3-R10 指针提交点】rename 成功即发布完成；此后任何失败（清理、
+    // 【F3-R10 指针提交点 + F11 运行租约】rename 前最后一次租约核验：
+    // 异步准备/知识编译期间的取消或代次变化在此拦下（CURRENT 未切，
+    // 安全回滚）；通过后 rename 成功即发布完成，此后任何失败（清理、
     // 日志、统计）都不得回滚——旧 release 与 CURRENT 的清理/维护均在
     // publishRelease 外层尽力而为进行。
+    input.preCommitLease?.();
     const pointerPath = path.join(outputRoot, 'CURRENT.json');
     const tmpPath = `${pointerPath}.tmp`;
     fs.writeFileSync(tmpPath, JSON.stringify({

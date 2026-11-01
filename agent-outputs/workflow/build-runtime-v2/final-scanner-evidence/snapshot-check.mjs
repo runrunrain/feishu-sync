@@ -1,0 +1,11 @@
+import fs from 'node:fs';
+import {execFileSync} from 'node:child_process';
+import {createHash} from 'node:crypto';
+const cwd='/Users/run.mao/workpace/feishu-sync';
+const env={...process.env,GIT_INDEX_FILE:'/tmp/feishu-build-v2-r4/feature.index'};
+const git=(args)=>execFileSync('git',args,{cwd,env});
+const patch=git(['diff','--cached','--binary','HEAD']);
+const paths=git(['diff','--cached','--name-only','HEAD']).toString().trim().split('\n');
+const mismatches=paths.filter(p=>!git(['show',':'+p]).equals(fs.readFileSync('/tmp/feishu-build-v2-r4/feature-final/'+p)));
+console.log(JSON.stringify({head:git(['rev-parse','HEAD']).toString().trim(),sha256:createHash('sha256').update(patch).digest('hex'),paths:paths.length,mismatches}));
+if(mismatches.length)process.exitCode=1;

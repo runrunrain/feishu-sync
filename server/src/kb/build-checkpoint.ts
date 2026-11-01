@@ -77,13 +77,22 @@ function validCheckpointRelativePath(relative: string): boolean {
 }
 
 /** 重构 v2：leaderRun 检查点结构校验（schemaVersion 2；宽松必需字段；
- * 不合法即拒读，避免伪造恢复。版本 1（已废弃的自造契约）一律拒读）。 */
+ * 不合法即拒读，避免伪造恢复。版本 1（已废弃的自造契约）一律拒读）。
+ * F09/F10/F15 additive 字段（runtimeEpoch/rounds/termination）可选，
+ * 出现时只做形状核对——旧检查点缺省按 legacy/未知解释，不伪造。 */
 function isValidLeaderRunCheckpoint(value: unknown): value is LeaderRunCheckpointState {
   if (!value || typeof value !== 'object') return false;
   const state = value as Partial<LeaderRunCheckpointState>;
+  const roundsOk = state.rounds === undefined || state.rounds === null
+    || (typeof state.rounds === 'object' && Number.isSafeInteger(state.rounds.started) && Number.isSafeInteger(state.rounds.ended));
+  const epochOk = state.runtimeEpoch === undefined
+    || (Number.isSafeInteger(state.runtimeEpoch) && (state.runtimeEpoch as number) >= 1);
+  const terminationOk = state.termination === undefined || state.termination === null
+    || (typeof state.termination === 'object' && (state.termination as { state?: unknown }).state === 'confirmed' || (state.termination as { state?: unknown }).state === 'unconfirmed');
   return state.schemaVersion === 2
     && state.orchestrationMode === 'pi-amagi'
     && typeof state.generation === 'number' && Number.isInteger(state.generation) && state.generation >= 1
+    && roundsOk && epochOk && terminationOk
     && !!state.spec && typeof state.spec === 'object' && typeof (state.spec as { buildId?: unknown }).buildId === 'string'
     && !!state.material && typeof state.material === 'object'
     && typeof state.eventCursor === 'object' && state.eventCursor !== null && !Array.isArray(state.eventCursor)

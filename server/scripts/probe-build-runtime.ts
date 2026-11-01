@@ -34,6 +34,7 @@ import {
   type BuildRunSpec, type BuildModelDescriptor, type RuntimeBinding,
 } from '../src/agent/build-runtime/contracts.js';
 import { PiAmagiBuildRuntime, type PiAmagiRuntimeDeps } from '../src/agent/build-runtime/adapter.js';
+import { CHILD_POLICY_DISABLED_TOOLS } from '../src/agent/build-runtime/child-policy.js';
 import { V2_LEADER_TOOLS } from '../src/agent/tool-specs.js';
 import { V2_WRITER_TOOLS, V2_REVIEWER_TOOLS, V2_RESEARCH_TOOLS } from '../src/kb/build-actors.js';
 import { FixtureModelServer, type ParsedHistory } from '../tests/fixtures/build-runtime/fixture-model-server.js';
@@ -166,6 +167,22 @@ class ProbeRun {
 interface ProbeScriptConfig {
   sentinelFile: string;
   sentinelDir: string;
+  /** F12-R1：raw 祖先目录（搜索根不落 deny 的递归反例）。 */
+  ancestorDir: string;
+  /** F12-R1：指向祖先目录的 symlink 别名。 */
+  aliasDir: string;
+  /** F12-R1：从子任务 workDir 出发指向祖先目录的相对路径。 */
+  relativeGrepPath: string;
+  /** F12-R1 二段：白名单外合成文件（read 根约束反例）。 */
+  outsideFile: string;
+  /** F12-R1 二段：从 workDir 到合成文件的相对路径。 */
+  relativeOutsidePath: string;
+  /** F12-R1 二段：workDir 内指向合成文件目录的 symlink 别名。 */
+  outsideAliasRel: string;
+  /** F12-R1 二段：冻结 skill 正文（read 白名单正例）。 */
+  skillFile: string;
+  /** F12-R1 二段：workDir 预置工作文件（read 白名单正例）。 */
+  workFile: string;
 }
 
 function hostileScope(): Record<string, unknown> {
@@ -205,8 +222,30 @@ function buildFixtureModelConfig(cfg: ProbeScriptConfig): FixtureServerBundle {
 
   const scripts: Record<string, Array<{ toolCalls?: Array<{ name: string; args: Record<string, unknown> }>; text?: string; delayMs?: number }>> = {
     w1: [
+      // ── F12-R1 反例面（七种形态全部必须被拒：直接禁区读/直接禁区 grep/祖先递归/相对路径/别名/find/ls；
+      //    上游 amagi 2.21.31 只校验搜索根——这些调用在旧面（grep 可用）下会真实泄漏 sentinel 正文）
       { toolCalls: [{ name: 'read', args: { path: cfg.sentinelFile } }] },
       { toolCalls: [{ name: 'grep', args: { pattern: SENTINEL_SECRET, path: cfg.sentinelDir } }] },
+      { toolCalls: [{ name: 'grep', args: { pattern: SENTINEL_SECRET, path: cfg.ancestorDir } }] },
+      { toolCalls: [{ name: 'grep', args: { pattern: SENTINEL_SECRET, path: cfg.relativeGrepPath } }] },
+      { toolCalls: [{ name: 'grep', args: { pattern: SENTINEL_SECRET, path: cfg.aliasDir } }] },
+      { toolCalls: [{ name: 'find', args: { pattern: 'secret-*', path: cfg.ancestorDir } }] },
+      { toolCalls: [{ name: 'ls', args: { path: cfg.ancestorDir } }] },
+      // ── F12-R1 二段：read 根约束反例（白名单外合成文件：绝对/相对/symlink 别名；不读真凭据）
+      { toolCalls: [{ name: 'read', args: { path: cfg.outsideFile } }] },
+      { toolCalls: [{ name: 'read', args: { path: cfg.relativeOutsidePath } }] },
+      { toolCalls: [{ name: 'read', args: { path: cfg.outsideAliasRel } }] },
+      // ── read 根约束正例（skill 同目录协议 + 任务工作区）与 write 越报告根反例
+      { toolCalls: [{ name: 'read', args: { path: cfg.skillFile } }] },
+      { toolCalls: [{ name: 'read', args: { path: cfg.workFile } }] },
+      { toolCalls: [{ name: 'write', args: { path: 'config-face.md', content: 'probe-write-outside-report-尝试' } }] },
+      // ── Leader 边界①：write 经父 symlink 新建到外部 / dangling leaf / edit 经 symlink 不改外部（落点解析）
+      { toolCalls: [{ name: 'write', args: { path: 'agent-outputs/symdir-to-outside/new.md', content: 'x' } }] },
+      { toolCalls: [{ name: 'write', args: { path: 'agent-outputs/dangling-leaf', content: 'x' } }] },
+      { toolCalls: [{ name: 'edit', args: { path: 'agent-outputs/symdir-to-outside/edit-target.md', oldText: 'ORIGINAL', newText: 'PWNED' } }] },
+      // 正例：报告根嵌套新目录首次 write（最近既存祖先=报告根，落点可证 → 放行）
+      { toolCalls: [{ name: 'write', args: { path: 'agent-outputs/nested/sub/first.md', content: 'PROBE-NESTED-REPORT-OK' } }] },
+      // ── 正常授权链（MCP 桥接与报告面不受工具面收窄影响）
       { toolCalls: [mcp('raw_list', { filter: 'all' })], delayMs: 2500 },
       { toolCalls: [mcp('kb_submit_review', { unitId: 'probe-w1', report: '越权审查尝试' })] },
       { toolCalls: [mcp('kb_write_doc', { path: DOC_W1, title: '演示指南', markdown: w1Markdown, summary: 'Alpha 规则演示文档', sources: ['tok_probe_w1'], operationId: 'w1-op-1' })], delayMs: 1500 },
@@ -228,6 +267,10 @@ function buildFixtureModelConfig(cfg: ProbeScriptConfig): FixtureServerBundle {
       { toolCalls: [mcp('raw_list', { filter: 'all' })], delayMs: 25_000 },
     ],
     'resume-w1': [
+      // F12-R1：task_resume 续轮反例（祖先递归在续接会话同样被拒）
+      { toolCalls: [{ name: 'grep', args: { pattern: SENTINEL_SECRET, path: cfg.ancestorDir } }] },
+      // F12-R1 二段：续轮 read 根约束反例（相对路径越白名单）
+      { toolCalls: [{ name: 'read', args: { path: cfg.relativeOutsidePath } }] },
       { toolCalls: [mcp('kb_write_doc', { path: DOC_W1, title: '演示指南', markdown: w1MarkdownV2, summary: '续接修订写入', sources: ['tok_probe_w1'], operationId: 'w1-op-2' })], delayMs: 2500 },
     ],
   };
@@ -356,8 +399,20 @@ async function main(): Promise<number> {
   let psDuring: string[] = [];
   let psAfter: string[] = [];
 
-  const cleanup = async (): Promise<void> => {
-    try { if (bindingRef && adapterRef) await adapterRef.cancel(bindingRef).catch(() => undefined); } catch { /* 已终止 */ }
+  let cleanupPromise: Promise<void> | null = null;
+  const cleanup = (): Promise<void> => cleanupPromise ??= (async () => {
+    if (adapterRef) {
+      try {
+        const cancellation = bindingRef ? await adapterRef.cancel(bindingRef) : null;
+        if (cancellation?.termination?.state !== 'confirmed') {
+          tempKeep = true;
+          run.notes.push(`退出未确认，保留临时目录，不以rm成功冒充quiescence：${tempRoot}`);
+        }
+      } catch (error) {
+        tempKeep = true;
+        run.notes.push(`终止对账失败，保留现场：${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     try { await modelServerRef?.stop(); } catch { /* ignore */ }
     try { await stackRef?.stop(); } catch { /* ignore */ }
     if (tempRoot && !tempKeep) {
@@ -369,7 +424,7 @@ async function main(): Promise<number> {
         }
       }
     }
-  };
+  })();
   process.once('SIGINT', () => { tempKeep = true; void cleanup().finally(() => process.exit(130)); });
 
   try {
@@ -401,6 +456,11 @@ async function main(): Promise<number> {
     // ── fixture 模型服务器（真实模型模式跳过）──
     let modelBaseUrl: string;
     let zhipuKey: string;
+    const buildId = `b_${Date.now().toString(36)}_probe01`;
+    // F12-R1：提前算构建目录（纯路径函数）供相对路径反例构造；后续 dirs 复用同一结果。
+    // epoch=1 与 adapter.start 的 options.runtimeEpoch ?? 1 对齐——预置文件/symlink 必须落在
+    // 实际 epoch workDir（环境注入的信封根也来自 adapter 的同一 dirs）。
+    const dirsEarly = planBuildDirectories(temp.feishuHome, buildId, 1);
     if (args.realModel) {
       zhipuKey = process.env.ZHIPU_API_KEY ?? '';
       if (!zhipuKey) throw new Error('--real-model 需要环境变量 ZHIPU_API_KEY（不打印值）');
@@ -408,7 +468,29 @@ async function main(): Promise<number> {
       run.say('real-model 模式：真实端点（fixture 脚本断言将标 not-measured）');
     } else {
       zhipuKey = 'probe-fixture-not-a-real-key';
-      const bundle = buildFixtureModelConfig({ sentinelFile: temp.sentinelFile, sentinelDir: path.dirname(temp.sentinelFile) });
+      // F12-R1 二段：workDir 预置正例文件 + 指向白名单外的 symlink 别名（真实落点双判反例）
+      fs.mkdirSync(dirsEarly.workDir, { recursive: true });
+      const probeWorkFile = path.join(dirsEarly.workDir, 'probe-workfile.md');
+      fs.writeFileSync(probeWorkFile, 'PROBE-WORKFILE-MARKER（read 根约束正例）\n');
+      fs.symlinkSync(path.dirname(temp.outsideFile), path.join(dirsEarly.workDir, 'alias-to-outside'), 'dir');
+      // Leader 边界①：报告根内 symlink 目录→外部 + dangling leaf + 外部既有 edit 目标（write/edit 落点反例）
+      const probeReportRoot = path.join(dirsEarly.workDir, 'agent-outputs');
+      fs.mkdirSync(probeReportRoot, { recursive: true });
+      fs.symlinkSync(path.dirname(temp.outsideFile), path.join(probeReportRoot, 'symdir-to-outside'), 'dir');
+      fs.symlinkSync(path.join(path.dirname(temp.outsideFile), 'never-exists.md'), path.join(probeReportRoot, 'dangling-leaf'));
+      fs.writeFileSync(path.join(path.dirname(temp.outsideFile), 'edit-target.md'), 'ORIGINAL-CONTENT');
+      const bundle = buildFixtureModelConfig({
+        sentinelFile: temp.sentinelFile,
+        sentinelDir: path.dirname(temp.sentinelFile),
+        ancestorDir: temp.ancestorDir,
+        aliasDir: temp.aliasDir,
+        relativeGrepPath: path.relative(dirsEarly.workDir, temp.ancestorDir),
+        outsideFile: temp.outsideFile,
+        relativeOutsidePath: path.relative(dirsEarly.workDir, temp.outsideFile),
+        outsideAliasRel: 'alias-to-outside/synthetic-secret.md',
+        skillFile: path.join(temp.skillDir, 'SKILL.md'),
+        workFile: probeWorkFile,
+      });
       const server = new FixtureModelServer({
         scripts: bundle.scripts,
         finals: bundle.finals,
@@ -422,7 +504,6 @@ async function main(): Promise<number> {
     }
 
     // ── 应用侧真实栈（桥接目标）──
-    const buildId = `b_${Date.now().toString(36)}_probe01`;
     const leaderToolList = [...new Set([...AMAGI_TASK_TOOLS, ...V2_LEADER_TOOLS])];
     const stack = await buildProbeAppStack({
       dataRoot: temp.feishuHome,
@@ -454,7 +535,7 @@ async function main(): Promise<number> {
       `verifyAmagiPackage hash=${verified.contentHash.slice(0, 12)}（漂移即失败）`);
 
     // ── BuildRunSpec 冻结（render → hash → spec）──
-    const dirs = planBuildDirectories(temp.feishuHome, buildId);
+    const dirs = dirsEarly;
     const descriptors: BuildModelDescriptor[] = [
       { id: 'glm-5.3', baseUrl: modelBaseUrl, api: 'openai-completions', reasoning: false, contextWindow: 128_000, maxTokens: 8192 },
       { id: 'glm-5.3-flash', baseUrl: modelBaseUrl, api: 'openai-completions', reasoning: false, contextWindow: 128_000, maxTokens: 8192 },
@@ -710,15 +791,16 @@ async function main(): Promise<number> {
       for (const [script, tools] of toolsets) {
         for (const banned of ['bash', 'amagi_advisor', 'lsp']) if (tools.includes(banned)) issues.push(`${script} 含 ${banned}`);
         for (const tool of tools) if (tool.startsWith('mcp__')) issues.push(`${script} 含直连 MCP 工具 ${tool}`);
-        for (const banned of ['codemode', 'tool_search']) if (tools.includes(banned)) issues.push(`${script} 工具面含 ${banned}（设计 §3.3 预期无此面）`);
+        // F12-R1：codemode/tool_search（§3.3）+ grep/find/ls（递归/目录工具收窄）都不得在面内
+        for (const banned of CHILD_POLICY_DISABLED_TOOLS) if (tools.includes(banned)) issues.push(`${script} 工具面含 ${banned}（§3.3+F12-R1 预期无此面）`);
         if (tools.includes('toolcall_continue')) notesExtra.push(`${script} 含 toolcall_continue（pi 断点续传机制，非 MCP 面，记录备查）`);
-        for (const required of ['read', 'grep', 'write', 'amagi_resource', 'mcp_call', 'mcp_list_tools']) {
+        for (const required of ['read', 'write', 'amagi_resource', 'mcp_call', 'mcp_list_tools']) {
           if (!tools.includes(required)) issues.push(`${script} 缺 ${required}`);
         }
       }
       if (notesExtra.length > 0) run.notes.push(...notesExtra);
       run.checks[issues.length === 0 ? 'pass' : 'fail']('child-tools-surface', '子任务真实工具面',
-        issues.length === 0 ? `观测 ${toolsets.size} 个子任务请求：无 bash/advisor/lsp/codemode/tool_search/直连 mcp__*，含 read/write/mcp_call 等授权工具` : issues.join('；'));
+        issues.length === 0 ? `观测 ${toolsets.size} 个子任务请求：无 bash/advisor/lsp/codemode/tool_search/grep/find/ls/直连 mcp__*，含 read/write/mcp_call 等授权工具（F12-R1 递归工具面收窄生效；检索走 mcp 桥受控工具）` : issues.join('；'));
     } else {
       run.checks.notMeasured('child-tools-surface', '子任务真实工具面', args.realModel ? 'real-model 模式无 fixture 观测面' : '未捕获子任务模型请求（子任务未真实启动？）');
     }
@@ -824,7 +906,10 @@ async function main(): Promise<number> {
       run.checks.notMeasured('codemode-facet', '子任务无 codemode/tool_search 面（设计 §3.3）', '未捕获 codemode 试探结果');
     }
 
-    // F. P0 敏感 sentinel：真实子进程 read/grep 被拒（子任务工具结果证据）
+    // F. P0/F12-R1 敏感 sentinel 全形态反例（真实子任务工具结果证据）：
+    //    直接禁区 read（上游 deny 执法正例）+ 禁区根/祖先目录/相对路径/symlink 别名 grep +
+    //    祖先 find/ls（F12-R1 工具面收窄）——七种形态每个都必须有明确「被拒/工具不存在」证据，
+    //    不接受空结果或静默成功；全 history（首/续轮）零 sentinel 正文。
     const w1Messages = (histories.get('w1') ?? []) as Array<{ role?: string; content?: unknown }>;
     const toolTexts = w1Messages.filter((message) => message.role === 'tool').map((message) => {
       const content = message.content;
@@ -833,20 +918,96 @@ async function main(): Promise<number> {
       return content.map((block) => (block && typeof block === 'object' && (block as { type?: string }).type === 'text' ? String((block as { text?: string }).text ?? '') : '')).join('');
     });
     const denied = (text: string): boolean => /拒绝|deny|denied|禁|permission|blocked|not allowed|无法|invalid|forbid/i.test(text);
-    if (toolTexts.length >= 2) {
-      const readResult = toolTexts[0] ?? '';
-      const grepResult = toolTexts[1] ?? '';
-      const leak = w1Messages.map((message) => JSON.stringify(message.content ?? '')).join('').includes(SENTINEL_SECRET);
-      run.checks[denied(readResult) && denied(grepResult) && !leak ? 'pass' : 'fail']('p0-sentinel-deny', 'P0 敏感 sentinel 读取被拒（真实子进程）',
-        `read 结果：${readResult.slice(0, 140).replace(/\n/g, ' ')}；grep 结果：${grepResult.slice(0, 140).replace(/\n/g, ' ')}；哨兵内容泄漏=${leak}`);
-    } else {
-      run.checks.notMeasured('p0-sentinel-deny', 'P0 敏感 sentinel 读取被拒（真实子进程）', args.realModel ? 'real-model 模式无 fixture 历史' : 'W1 会话历史不完整');
+    // F12-R1 强断言：递归/目录工具调用必须能说出「怎么被拒的」（child-policy 阻断理由或工具
+    // 不存在/未激活），而不是空文本或被容忍成成功；且任何消息不得含 sentinel 正文。
+    const recursiveRejected = (text: string): boolean =>
+      /child-policy|not (?:available|found|active)|unknown tool|no such tool|不(?:存在|可用|在.*面)|未激活|not in the active tool set/i.test(text);
+    {
+      const resumeMessages = (histories.get('resume-w1') ?? []) as Array<{ role?: string; content?: unknown }>;
+      const resumeToolTexts = resumeMessages.filter((message) => message.role === 'tool').map((message) => {
+        const content = message.content;
+        if (typeof content === 'string') return content;
+        if (!Array.isArray(content)) return '';
+        return content.map((block) => (block && typeof block === 'object' && (block as { type?: string }).type === 'text' ? String((block as { text?: string }).text ?? '') : '')).join('');
+      });
+      const w1All = w1Messages.map((message) => JSON.stringify(message.content ?? '')).join('');
+      const resumeAll = resumeMessages.map((message) => JSON.stringify(message.content ?? '')).join('');
+      const w1Leak = w1All.includes(SENTINEL_SECRET) || w1All.includes('SYNTHETIC-OUTSIDE-PROBE');
+      const resumeLeak = resumeAll.includes(SENTINEL_SECRET) || resumeAll.includes('SYNTHETIC-OUTSIDE-PROBE');
+      // F12-R1 二段：read/write 根约束拒绝证据（信封根理由文案）与正例判定（无拒绝词、内容可读）
+      const rootRejected = (text: string): boolean => /child-policy|冻结信封根|fail-closed/i.test(text);
+      // 正例判定：无 policy 阻断理由 + 期望内容标记（不否决正文里的普通字样）
+      const succeeded = (text: string): boolean => !rootRejected(text) && !/child-policy/.test(text);
+      // W1 反例/正例序列（按序）：
+      // 0 read禁区 / 1-6 grep·find·ls 七形态 / 7-9 read outside 绝对·相对·symlink 别名 /
+      // 10 read skill 正例 / 11 read workFile 正例 / 12 write 越报告根
+      const expected: Array<{ label: string; ok: (text: string) => boolean }> = [
+        { label: 'read 禁区（deny+根约束）', ok: (text) => denied(text) || rootRejected(text) },
+        { label: 'grep 禁区根', ok: recursiveRejected },
+        { label: 'grep 祖先目录（F12-R1 主反例）', ok: recursiveRejected },
+        { label: 'grep 相对路径', ok: recursiveRejected },
+        { label: 'grep symlink 别名', ok: recursiveRejected },
+        { label: 'find 祖先目录', ok: recursiveRejected },
+        { label: 'ls 祖先目录', ok: recursiveRejected },
+        { label: 'read 合成外部文件（绝对）', ok: rootRejected },
+        { label: 'read 合成外部文件（相对）', ok: rootRejected },
+        { label: 'read 合成外部文件（symlink 别名）', ok: rootRejected },
+        { label: 'read skill 正文（白名单正例）', ok: (text) => succeeded(text) && text.includes(SKILL_MARKER) },
+        { label: 'read 工作区文件（白名单正例）', ok: (text) => succeeded(text) && text.includes('PROBE-WORKFILE-MARKER') },
+        { label: 'write 越报告根（工作区根）', ok: rootRejected },
+        { label: 'write 经父 symlink 新建到外部（Leader 边界①）', ok: rootRejected },
+        { label: 'write dangling leaf（fail-closed 落点不可证）', ok: rootRejected },
+        { label: 'edit 经 symlink 指向外部既有文件', ok: rootRejected },
+        { label: 'write 报告根嵌套新建（落点正例）', ok: (text) => succeeded(text) && /nested|wrote|写入/i.test(text) },
+      ];
+      const parts: string[] = [];
+      let allOk = true;
+      if (toolTexts.length >= expected.length) {
+        for (let i = 0; i < expected.length; i += 1) {
+          const text = toolTexts[i] ?? '';
+          const pass = expected[i].ok(text);
+          if (!pass) allOk = false;
+          parts.push(`${expected[i].label}=${pass ? ([10, 11, 16].includes(i) ? '过' : '拒') : `异常「${text.slice(0, 80).replace(/\n/g, ' ')}」`}`);
+        }
+      } else {
+        allOk = false;
+        parts.push(`W1 工具结果不足（${toolTexts.length}/${expected.length}）`);
+      }
+      // task_resume 续轮反例：grep 祖先 + read outside 相对。resume 会话继承 W1 全史
+      //（role=tool 消息含 W1 的旧结果），因此取末尾 3 个（resume 新增：grep/read/kb_write_doc）。
+      let resumeOk = false;
+      if (resumeToolTexts.length >= 3) {
+        const [resumeGrep, resumeRead] = resumeToolTexts.slice(-3);
+        const resumeGrepOk = recursiveRejected(resumeGrep ?? '');
+        const resumeReadOk = rootRejected(resumeRead ?? '');
+        resumeOk = resumeGrepOk && resumeReadOk;
+        parts.push(`task_resume 续轮 grep 祖先=${resumeGrepOk ? '拒' : `异常「${(resumeGrep ?? '').slice(0, 60)}」`}；read 外部相对=${resumeReadOk ? '拒' : `异常「${(resumeRead ?? '').slice(0, 60)}」`}`);
+      } else {
+        parts.push('task_resume 续轮反例未观测');
+      }
+      const noLeak = !w1Leak && !resumeLeak;
+      parts.push(`敏感内容泄漏（sentinel+合成外部，首/续轮全量）=${w1Leak || resumeLeak}`);
+      // Leader 边界①物理断言：外部目录零新增（new.md/never-exists.md 未产生）、外部既有文件未改、
+      // 报告根嵌套新建真实落盘——拒绝证据之外补「未发生写入副作用」的磁盘事实
+      const outsideDirNow = path.dirname(temp.outsideFile);
+      const outsideEntries = fs.existsSync(outsideDirNow) ? fs.readdirSync(outsideDirNow).sort() : [];
+      const outsideIntact = outsideEntries.join(',') === ['edit-target.md', 'synthetic-secret.md'].sort().join(',')
+        && fs.readFileSync(path.join(outsideDirNow, 'edit-target.md'), 'utf-8') === 'ORIGINAL-CONTENT';
+      const nestedReport = path.join(dirsEarly.workDir, 'agent-outputs', 'nested', 'sub', 'first.md');
+      const nestedWritten = fs.existsSync(nestedReport) && fs.readFileSync(nestedReport, 'utf-8').includes('PROBE-NESTED-REPORT-OK');
+      parts.push(`外部目录未产生新文件/未篡改=${outsideIntact}；报告嵌套新建落盘=${nestedWritten}`);
+      run.checks[allOk && noLeak && resumeOk && outsideIntact && nestedWritten ? 'pass' : 'fail']('p0-sentinel-deny', 'P0/F12-R1 sentinel+根约束+落点解析全形态反例（真实子任务）',
+        parts.join('；'));
     }
-    // 配置面写拒 + 报告写成功（同一历史的第 6/7 个工具结果）
-    if (toolTexts.length >= 7) {
-      const configWrite = toolTexts[5] ?? '';
-      const reportWrite = toolTexts[6] ?? '';
-      run.checks[denied(configWrite) && !denied(reportWrite) ? 'pass' : 'fail']('write-surface', '写面执法（配置面拒/报告面放行）',
+    // 配置面写拒 + 报告写成功（Leader 边界①序列后移：amagi.json/报告写 = 第 21/22 个工具结果）
+    if (toolTexts.length >= 22) {
+      const configWrite = toolTexts[20] ?? '';
+      const reportWrite = toolTexts[21] ?? '';
+      // 配置面写拒：child-policy 根约束（write 仅报告根，amagi.json 在工作区根）与上游 deny
+      // 双层均可拦——接受任一层拒绝证据；报告面写成功 = 无拒绝词且无根约束理由
+      const configDenied = denied(configWrite) || /child-policy|冻结信封根/.test(configWrite);
+      const reportOk = !denied(reportWrite) && !/child-policy|冻结信封根/.test(reportWrite);
+      run.checks[configDenied && reportOk ? 'pass' : 'fail']('write-surface', '写面执法（配置面拒/报告面放行）',
         `amagi.json 写入：${configWrite.slice(0, 120).replace(/\n/g, ' ')}；agent-outputs 写入：${reportWrite.slice(0, 120).replace(/\n/g, ' ')}`);
     } else {
       run.checks.notMeasured('write-surface', '写面执法（配置面拒/报告面放行）', 'W1 会话工具结果不足');

@@ -58,3 +58,25 @@
 | 进程收尾/临时数据 | 浏览器/vite/hold（SIGTERM→closed）全停；端口 5173/54643/54642 无监听；pi/amagi 子进程 0 残留；~/.feishu-sync mtime 不变 | ✅ |
 
 本轮新增前端小修（叠加写面）：`RuntimeTaskRow` stopped 标签补「最后观测」title（§三回滚说明同样适用）。附带真实观察：忘选模式时 legacy 构建走 fixture 不适配的 prompt 会 failed，UI 恢复提示（recovery.canResume=true）如实渲染（顺带验证恢复提示真字段，legacy 路径）。新增截图：shot-17/18（终局 v2 持久视图）。
+
+## 七、追加轮 2：F15 终审修复后的最终真实浏览器增量验证（同任务范围）
+
+F15 前端已由 Leader 修入主树（末次观测并发/历史 epoch 过滤/rounds null→未知/新 DTO runtimeEpoch·task.generation·task.runtimeEpoch·processTermination/termination-unconfirmed）。本轮零前端改动、零后端改动，纯真实验证。复用 hold-server.ts（新临时 HOME，fixture 模型），构建 `b_20261101144714_39f7a0` 真实 published（r_20261101T144718_3807ee）。
+
+**关键真实事件：正常 published 链路收尾对账真实输出 `termination-unconfirmed`**（processTermination：state=unconfirmed，note「存在 4 个未确认项（含 pid 未知项），阻断新 Leader」，unconfirmedPids=[0,0,0,0]——v2-store 活跃意图无锚点覆盖，个体不可发现）。**未做任何故障注入即获得真实 unconfirmed 场景**（反馈原计划的 kill -9 + 破坏 launch-anchor 注入未启用；不假造 DTO）；构建域残留进程实测 0（unconfirmedPids 全 0=不可发现而非已知活 PID）。
+
+| 验收 | 证据 | 状态 |
+|---|---|---|
+| 1) published 终局：模式 pi-amagi、无伪百分比 | GET DTO `status=published \| orchestrationMode=pi-amagi`；shot-19 视觉确认无百分比、步骰离散节点 | ✅ |
+| 终局并发为历史口径 | Metric 标签「末次观测并发=5」+注脚「历史观测，非当前活跃；后台残留以终止核验为准」（视觉逐字）；DTO 当前 epoch 7 任务中 5 running | ✅ |
+| 轮次真值 | 「轮次 1/0（启/收）」（DTO rounds.started=1/ended=0 真值；whole-null/field-null→未知由 F15 单测覆盖，真实数据无 null 不假造） | ✅ |
+| 历史 epoch/代次不计当前计划 | DTO 全 7 任务 gen=2/epoch=1（当前），「当前计划 7 项」；过滤逻辑（task.runtimeEpoch≠data.runtimeEpoch 或 task.generation≠data.generation）单测覆盖 | ✅ |
+| 2) 真实 processTermination.unconfirmed → UI 警示 | 横幅逐字：「后台终止未确认：凭据已撤销，但尚未确认所有进程退出；恢复会先重新对账，未确认前不启动新 Leader」+ note「存在 4 个未确认项（含 pid 未知项），阻断新 Leader」（shot-19 视觉逐字） | ✅ |
+| 任务不显示已停止/完成 | 任务行标签「终止未确认」（warn tone，视觉逐字 shot-20）+ DOM `data-exec="termination-unconfirmed"`；error 任务仍真「异常」；无「已停止」「完成」冒充 | ✅ |
+| 未知轮次不变 0 | rounds 真值 1/0 原样；恢复能力「需先确认后台终止（重新对账前不承诺可续接）」（DOM 逐字） | ✅ |
+| 复测 | `BuildOrchestrationProgress.test.tsx` **25/25**（F15 新增用例含 termination-unconfirmed）、tsc EXIT=0；本轮零代码改动 | ✅ |
+| 收尾 | 仅 kill 本任务 PID（vite 54400/hold 54321）；浏览器会话关闭；端口 0 监听；build 子进程 0；~/.feishu-sync mtime 不变；未 pkill 任何通用进程 | ✅ |
+
+**给 Leader 的后端/amagi 侧观察（不修，仅报告）**：正常成功链路（fixture 模型，~4s 完成）在 Leader 收尾 terminate 对账时即报 4 个 v2-store 未确认项——怀疑 amagi 子任务完成后 v2-store current.json 的 execution 状态翻转为非活跃的时机晚于应用侧收尾对账扫描，或任务完成时 process-audits 锚点目录被清理；影响：published 构建检查点持久化 termination=unconfirmed，若该构建后续可 resume 将被先拒绝重试对账。建议后端复核收尾对账与 amagi v2-store 状态更新的时序。
+
+新增截图：shot-19（真实 unconfirmed 终局全视口）、shot-20（子任务行「终止未确认」/「异常」+「已确认」组合）。

@@ -7,6 +7,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
+import path from 'node:path';
 import { applyAutoRoundsEnv, buildLeaderEnv, envAuditIssues } from '../src/agent/build-runtime/environment.js';
 import { planBuildDirectories } from '../src/agent/build-runtime/agent-dir-config.js';
 import { makeSpec } from './build-runtime-contracts.test.js';
@@ -45,7 +46,20 @@ describe('buildLeaderEnv', () => {
     expect(env.FEISHU_SYNC_AGENT_API_KEY).toBeUndefined();
   });
 
-  it('PI 基础变量：agentDir 指向构建 home，offline/telemetry 固定', () => {
+  it('F12-R1 二段：PI_BUILD_CHILD_ROOTS_JSON 与冻结 spec 同源（readRoots=skill 目录+workDir；writeRoots=仅报告根）且过凭据审计', () => {
+    const spec = makeSpec();
+    const env = envFor(spec);
+    const roots = JSON.parse(String(env.PI_BUILD_CHILD_ROOTS_JSON)) as { readRoots: string[]; writeRoots: string[] };
+    expect(roots.readRoots).toEqual([
+      path.dirname(path.resolve(spec.workflowSkillPath)),
+      path.resolve(DIRS.workDir),
+    ]);
+    expect(roots.writeRoots).toEqual([path.resolve(DIRS.workDir, 'agent-outputs')]);
+    // PI_* 凭据审计不误伤（ROOTS 非凭据名）
+    expect(envAuditIssues(env)).toEqual([]);
+  });
+
+  it('PI 基础变量：agentDir 指向构建 home，offline/telemetry 固定；F12-R1 冻结信封根元数据注入（skill 同目录+工作区读，仅报告写）', () => {
     const env = envFor();
     expect(env.PI_CODING_AGENT_DIR).toBe(DIRS.homeDir);
     expect(env.PI_OFFLINE).toBe('1');

@@ -10,14 +10,18 @@
  * - spec 哈希与落盘不一致 → start 明确拒绝。
  */
 
-import { describe, expect, it, beforeEach, afterAll } from 'vitest';
+import { describe, expect, it, beforeEach, afterAll, vi } from 'vitest';
 import { createHash } from 'node:crypto';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { installAmagiPackage } from '../src/agent/build-runtime/amagi-package.js';
+import { appendProcessLedgerEntry, readProcessLedger } from '../src/agent/build-runtime/process-ledger.js';
+import { PiRpcProcess } from '../src/agent/pi-rpc-process.js';
+import { readBirthIdentities } from '../src/agent/build-runtime/process-identity.js';
 import {
-  computeAgentDirConfigHash, planBuildDirectories, renderAgentDirConfigFiles,
+  computeAgentDirConfigHash, planBuildDirectories, renderAgentDirConfigFiles, writeAgentDirConfig,
 } from '../src/agent/build-runtime/agent-dir-config.js';
 import { PiAmagiBuildRuntime, type PiAmagiRuntimeDeps } from '../src/agent/build-runtime/adapter.js';
 import type { BuildRunSpec } from '../src/agent/build-runtime/contracts.js';
@@ -68,6 +72,25 @@ function makeMiniAmagiSource(root: string): string {
   for (const a of ['luban', 'diting', 'baize']) fs.writeFileSync(path.join(src, 'agents', `${a}.md`), 'x\n');
   return src;
 }
+
+it('Leader在跨入spawn前持久化意图；PID登记前断流不能被当无旧事实', async () => {
+  const root = tmpRoot();
+  const { spec, deps } = await prepare(root);
+  const buildRoot = planBuildDirectories(root, spec.buildId, 1).buildRoot;
+  const spy = vi.spyOn(PiRpcProcess.prototype, 'start').mockImplementationOnce(async () => {
+    expect(readProcessLedger(buildRoot).entries).toEqual([
+      expect.objectContaining({ pid: 0, launchState: 'intent', kind: 'leader' }),
+    ]);
+    throw new Error('INJECTED_SPAWN_GAP'); // 故障夹具，不宣称真实硬崩测试
+  });
+  try {
+    await expect(new PiAmagiBuildRuntime(deps).start(spec)).rejects.toThrow('INJECTED_SPAWN_GAP');
+  } finally { spy.mockRestore(); }
+  const restarted = new PiAmagiBuildRuntime(deps);
+  const result = await restarted.reconcileBuildResiduals({ buildId: spec.buildId, binding: null });
+  expect(result?.state).toBe('unconfirmed');
+  expect(result?.note).toContain('启动意图');
+});
 
 function pidAlive(pid: number | null): boolean {
   if (pid === null) return false;
@@ -143,7 +166,9 @@ describe('PiAmagiBuildRuntime（真实子进程，假 pi CLI fixture）', () => 
     expect(result.credentialsRevoked).toBe(true);
     expect(revoked.count).toBe(1);
     expect(result.leaderExit).not.toBeNull();
-    expect(result.residualNote).toContain('已确认退出');
+    // F10：终止对账结构化结果（fixture 无锚点 → 无个体可对账，如实 confirmed）
+    expect(result.termination?.state).toBe('confirmed');
+    expect(result.residualNote).toContain('Leader 已终止');
     expect(pidAlive(binding.leaderPid)).toBe(false);
   });
 
@@ -200,6 +225,69 @@ describe('PiAmagiBuildRuntime（真实子进程，假 pi CLI fixture）', () => 
     await expect(runtime.start(bad)).rejects.toThrow('先以相同 deps');
   });
 
+  it.runIf(process.platform === 'darwin' || process.platform === 'linux')('F10-R3：reconcileBuildResiduals 跨 epoch 对账（旧 epoch 锚点不因换目录被绕过；无事实返回 null）', async () => {
+    const { spec, deps } = await prepare(root);
+    const buildRoot = planBuildDirectories(deps.dataRoot, spec.buildId, 1).buildRoot;
+    // 旧 epoch（e1）锚点指向无关存活进程（令牌不匹配 → not-ours 不杀）；
+    // 账本登记旧 Leader（归因锚点 + 旧运行事实，includeLeaders=false 不回收它）
+    const audits = path.join(buildRoot, 'epochs', 'e1', 'home', 'amagi', 'data', 'process-audits', 'old');
+    fs.mkdirSync(audits, { recursive: true });
+    appendProcessLedgerEntry(buildRoot, {
+      launchId: 'l_old', buildId: spec.buildId, runtimeEpoch: 1, generation: 1, kind: 'leader',
+      pid: process.pid, startedAt: new Date().toISOString(), cwd: '/w',
+    });
+    const victim = spawn(process.execPath, ['-e', 'setInterval(()=>{},60000)'], { stdio: 'ignore' });
+    try {
+      fs.writeFileSync(path.join(audits, 'launch-anchor.json'), JSON.stringify({
+        version: 1,
+        taskId: 'old-task',
+        runs: [{ rootPid: victim.pid, pgid: victim.pid, rootIdentityToken: 'darwin:1:1', leaderPid: process.pid, at: Date.now() }],
+      }));
+      // 新 epoch（e2）v2-store 活跃任务无锚点（spawn→锚点窗口硬崩形态）
+      const v2dir = path.join(buildRoot, 'epochs', 'e2', 'home', 'amagi', 'v2-store', 'task-x');
+      fs.mkdirSync(v2dir, { recursive: true });
+      fs.writeFileSync(path.join(v2dir, 'current.json'), JSON.stringify({ execution: 'running', processState: 'alive' }));
+      const runtime = new PiAmagiBuildRuntime(deps);
+      const outcome = await runtime.reconcileBuildResiduals({ buildId: spec.buildId, binding: null }, { reap: true });
+      expect(outcome).not.toBeNull();
+      expect(outcome?.state).toBe('unconfirmed'); // 两个 epoch 各自的缺口都可见
+      expect(outcome?.note).toContain('跨 2 个 epoch');
+      expect(outcome?.children.some((child) => child.pid === victim.pid && child.verdict === 'not-ours')).toBe(true);
+      expect(outcome?.children.some((child) => child.taskId === 'task-x' && child.source === 'v2-store')).toBe(true);
+      try { process.kill(victim.pid!, 0); } catch { throw new Error('not-ours 个体不应被发信号'); }
+      // 无任何旧运行事实（无 home/账本/binding）→ null（fresh 构建无据可对，不冒充 confirmed）
+      const empty = await runtime.reconcileBuildResiduals({ buildId: 'b_nofacts', binding: null }, { reap: true });
+      expect(empty).toBeNull();
+    } finally {
+      try { victim.kill('SIGKILL'); } catch { /* 已退出 */ }
+    }
+  }, 30_000);
+
+  it.runIf(process.platform === 'darwin' || process.platform === 'linux')('F10-R3（steer 调整 #1）：账本未收口 Leader 存活 → 守卫对账阻断（binding 未落盘窗口，不发信号）', async () => {
+    const { spec, deps } = await prepare(root);
+    const buildRoot = planBuildDirectories(deps.dataRoot, spec.buildId, 1).buildRoot;
+    const victim = spawn(process.execPath, ['-e', 'setInterval(()=>{},60000)'], { stdio: 'ignore' });
+    try {
+      const tokens = await readBirthIdentities([victim.pid!]);
+      const token = tokens.get(victim.pid!);
+      expect(token).toBeTruthy();
+      // 模拟硬崩：Leader 启动登记账本（含真实出生令牌）但 binding/exit 均未落
+      appendProcessLedgerEntry(buildRoot, {
+        launchId: 'l_alive', buildId: spec.buildId, runtimeEpoch: 1, generation: 1, kind: 'leader',
+        pid: victim.pid!, startedAt: new Date().toISOString(), cwd: '/w', birthToken: token,
+      });
+      const runtime = new PiAmagiBuildRuntime(deps);
+      const outcome = await runtime.reconcileBuildResiduals({ buildId: spec.buildId, binding: null }, { reap: true });
+      expect(outcome?.state).toBe('unconfirmed');
+      const finding = outcome?.children.find((child) => child.pid === victim.pid);
+      expect(finding).toMatchObject({ source: 'ledger', verdict: 'unconfirmed' });
+      expect(finding?.detail).toContain('仍存活');
+      try { process.kill(victim.pid!, 0); } catch { throw new Error('存活 Leader 不应被发信号'); }
+    } finally {
+      try { victim.kill('SIGKILL'); } catch { /* 已退出 */ }
+    }
+  }, 30_000);
+
   it('probeWith：静态面就绪（fixture 包）且 fail-closed 断言可用', async () => {
     const { spec, deps } = await prepare(root);
     const runtime = new PiAmagiBuildRuntime(deps);
@@ -221,6 +309,79 @@ describe('PiAmagiBuildRuntime（真实子进程，假 pi CLI fixture）', () => 
     expect(failed).toBeInstanceOf(Error);
     expect((failed as Error).message).toContain('拒绝启用');
     void spec;
+  });
+
+  it('F09：start 绑定 epoch 目录与 epoch 唯一会话 id；不同 epoch 不同 agentDir/sessionId', async () => {
+    const { spec, deps } = await prepare(root);
+    const runtime = new PiAmagiBuildRuntime(deps);
+    const binding1 = await runtime.start(spec);
+    expect(binding1.runtimeEpoch).toBe(1);
+    expect(binding1.agentDir).toBe(path.join(root, 'agent', 'builds', spec.buildId, 'epochs', 'e1', 'home'));
+    expect(binding1.workDir).toBe(path.join(root, 'agent', 'builds', spec.buildId, 'epochs', 'e1', 'work'));
+    expect(binding1.sessionDir).toBe(path.join(root, 'agent', 'builds', spec.buildId, 'epochs', 'e1', 'home', 'sessions'));
+    expect(binding1.leaderSessionId).toBe(`build-${spec.buildId}-e1`);
+    expect(binding1.launchId).toMatch(/^l_[0-9a-f]+$/);
+    await runtime.cancel(binding1);
+    // 同一 build 第二 epoch：全新 agentDir（全新 amagi 内部库）与新会话 id
+    const binding2 = await runtime.start(spec, { runtimeEpoch: 2 });
+    expect(binding2.agentDir).toBe(path.join(root, 'agent', 'builds', spec.buildId, 'epochs', 'e2', 'home'));
+    expect(binding2.leaderSessionId).toBe(`build-${spec.buildId}-e2`);
+    expect(binding2.leaderSessionId).not.toBe(binding1.leaderSessionId);
+    // 两 epoch 配置各自存在且互不影响（rebuild 不复用旧内部库）
+    expect(fs.existsSync(path.join(binding1.agentDir, 'settings.json'))).toBe(true);
+    expect(fs.existsSync(path.join(binding2.agentDir, 'settings.json'))).toBe(true);
+    // 进程账本登记两次启动（跨 epoch 共享、launchId 各异）
+    const ledger = JSON.parse(fs.readFileSync(path.join(root, 'agent', 'builds', spec.buildId, 'process-ledger.json'), 'utf8')) as { entries: Array<{ launchId: string; runtimeEpoch: number | null; pid: number }> };
+    expect(ledger.entries).toHaveLength(2);
+    expect(new Set(ledger.entries.map((entry) => entry.launchId)).size).toBe(2);
+    expect(ledger.entries.map((entry) => entry.runtimeEpoch).sort()).toEqual([1, 2]);
+    await runtime.cancel(binding2);
+  });
+
+  it('F09：原会话续接复用同 epoch/同 sessionId；rebuild 换 epoch 后不打开旧会话', async () => {
+    const { spec, deps } = await prepare(root);
+    const first = new PiAmagiBuildRuntime(deps);
+    const binding1 = await first.start(spec);
+    await first.cancel(binding1);
+    const second = new PiAmagiBuildRuntime(deps);
+    const checkpoint = { buildId: spec.buildId, generation: spec.generation, spec, binding: binding1, artifactReceiptRefs: [], eventCursor: null };
+    const bindingResumed = await second.resume(binding1, checkpoint);
+    // 原会话续接：同 epoch、同 sessionId、新 launchId
+    expect(bindingResumed.runtimeEpoch).toBe(1);
+    expect(bindingResumed.leaderSessionId).toBe(binding1.leaderSessionId);
+    expect(bindingResumed.launchId).not.toBe(binding1.launchId);
+    await second.cancel(bindingResumed);
+    // rebuild：host 传新 epoch → 全新会话 id（Pi --session-id 存在即打开，
+    // 新 id 保证不会带回旧对话）
+    const third = new PiAmagiBuildRuntime(deps);
+    const bindingRebuild = await third.start(spec, { runtimeEpoch: 2 });
+    expect(bindingRebuild.leaderSessionId).not.toBe(binding1.leaderSessionId);
+    expect(bindingRebuild.agentDir).not.toBe(binding1.agentDir);
+    await third.cancel(bindingRebuild);
+  });
+
+  it('F09：legacy binding（无 epoch）按旧布局路径恢复（旧检查点兼容）', async () => {
+    const { spec, deps } = await prepare(root);
+    const runtime = new PiAmagiBuildRuntime(deps);
+    // 旧布局：手写配置到 <buildRoot>/home，构造无 epoch 的 legacy binding
+    const legacyDirs = planBuildDirectories(root, spec.buildId);
+    const bridge = { bridgeCommand: process.execPath, bridgeArgs: [path.join(root, 'bridge.cjs')] };
+    writeAgentDirConfig(spec, legacyDirs, bridge);
+    const legacyBinding = {
+      buildId: spec.buildId,
+      generation: spec.generation,
+      launchId: 'legacy',
+      agentDir: legacyDirs.homeDir,
+      workDir: legacyDirs.workDir,
+      sessionDir: legacyDirs.sessionDir,
+      leaderSessionId: `build-${spec.buildId}`,
+      leaderPid: null,
+      resumeCapability: { session: true, artifact: true },
+    };
+    // leaderPid=null：无法安全会话恢复（如实拒绝，不伪造）
+    await expect(runtime.resume(legacyBinding, { buildId: spec.buildId, generation: spec.generation, spec, binding: legacyBinding, artifactReceiptRefs: [], eventCursor: null }))
+      .rejects.toThrow('缺少进程身份');
+    void runtime;
   });
 
   it('observe：RPC 记录包装为 RuntimeEvent（e<N> 游标单调）', async () => {

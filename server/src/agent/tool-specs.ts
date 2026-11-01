@@ -864,13 +864,13 @@ export const V2_LEADER_TOOLS = [
 export const KB_READ_BATCH_SPEC: AgentToolSpec = {
   name: 'kb_read_batch',
   label: '批量读取资源',
-  description: '一次读取任务范围内的多个资源（原始源或本构建草稿），带总量预算、分页游标与逐资源截断标记。raw 资源登记读取回执（与 raw_read 同语义，可作为证据声明依赖）；draft 资源可附现有知识声明。预算按返回行数计，超预算的请求进入 nextCursor，按原参继续。',
+  description: '一次读取任务范围内的多个资源（原始源或本构建草稿），带总量预算、分页游标与逐资源截断标记。raw 资源登记读取回执（与 raw_read 同语义，可作为证据声明依赖）；draft 资源可附现有知识声明。预算按单次请求计（每页重置）：超预算的请求进入 nextCursor，携带 cursor 续读时按剩余位置继续。',
   parameters: {
     type: 'object',
     properties: {
       requests: {
         type: 'array', minItems: 1, maxItems: 50,
-        description: '读取请求列表（顺序处理至预算耗尽）',
+        description: '读取请求列表（首次调用必填；携带 cursor 时被忽略）',
         items: {
           type: 'object',
           properties: {
@@ -885,10 +885,12 @@ export const KB_READ_BATCH_SPEC: AgentToolSpec = {
           additionalProperties: false,
         },
       },
-      maxLines: integer('本次总行数预算（缺省 1200）', 1, 4000),
-      cursor: string('分页游标（上一页返回的 nextCursor；携带时 requests 被忽略）'),
+      maxLines: integer('单次请求（每页）总行数预算（缺省 1200；续页预算重置）', 1, 4000),
+      cursor: string('分页游标（上一页返回的 nextCursor；携带时忽略 requests，单独携带 cursor 即可续页）'),
     },
-    required: ['requests'],
+    // F05：requests 与 cursor 二选一（带 cursor 续页无需重复 requests；
+    // 同时携带时 cursor 优先、requests 被忽略，与服务端解析顺序一致）。
+    anyOf: [{ required: ['requests'] }, { required: ['cursor'] }],
     additionalProperties: false,
   },
 };
@@ -914,7 +916,7 @@ export const KB_EDIT_DOC_SPEC: AgentToolSpec = {
               description: '替换区间定位（三选一；exact_text 用旧文本唯一匹配，heading_body 用标题路径取章节体，line_range 用参数坐标行区间）',
               properties: {
                 kind: { type: 'string', enum: ['exact_text', 'heading_body', 'line_range'], description: '定位方式' },
-                oldText: string('exact_text：被替换文本（在当前文本中唯一匹配；occurrence 消歧重复命中）'),
+                oldText: string('exact_text：被替换文本（在当前文本中唯一匹配；occurrence 消歧重复命中）。只替换命中的精确字符区间，同行前后内容保留'),
                 occurrence: integer('exact_text：第几次命中（1 起始，缺省 1）', 1),
                 headingPath: { type: 'array', items: { type: 'string' }, description: 'heading_body：标题路径（与章节末（下一同级/更高级标题前）为替换区间）' },
                 startLine: integer('line_range：起始行（1 起始，参数坐标）', 1),

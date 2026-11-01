@@ -1,0 +1,47 @@
+{
+  "taskId": "20261101-154545-build-runtime-v2-fix-integration",
+  "timestamp": "2026-11-01T15:45:45Z",
+  "agent": "luban",
+  "createdBy": "Leader integration",
+  "projectId": "feishu-sync",
+  "taskBrief": "F01–F15统一修复、R1增量审核与主上授权R2闭环",
+  "status": "completed",
+  "currentPhase": "known-review-findings-closed",
+  "finalReport": "final-delivery-report.md",
+  "finalScannerReview": {"taskId": "d62dfd56-6f65-4473-a6c3-3b715de48933", "initialTask": "596f155f-4394-4a80-a37d-7a9dd7dc9133", "initialVerdict": "FIX", "status": "PASS", "artifactAccepted": true, "closed": 15, "partial": 0, "candidateSha256": "33d9919363a8be40fb06587c965c3d7c2aa8285f905e4e1fab04f25bcddc80d4"},
+  "continuation": "主上收到延迟advisor55ae后明确要求继续原任务；既有成员封存建议已采纳，本轮仅补剩余scanner/schema四类漏判",
+  "productGate": "PASS-known-findings",
+  "remainingMajor": [],
+  "externalValidationLimits": ["A23六源2/6 sheet缺失", "Windows/UNC真机", "setsid整链", "全FS TOCTOU", "远程真实模型质量/性能基准"],
+  "r2Incremental": {"taskId": "1b5f488c-031a-470e-a01e-90fa14850290", "pathClarificationTask": "b13dbbc5-e26c-4052-9232-eb0611250db2", "status": "FIX", "artifactAccepted": true, "closed": 14, "partial": 1, "remainingMajor": 1, "candidateSha256": "f0e8da6aec7c132d9fdf8f1fac37cadb10a3481eebcb1204f1b28dcfca830aa6"},
+  "r2Gate": {"taskId": "8ab9e825-a149-4ad6-a353-928af35d45f3", "status": "FIX", "artifactAccepted": true, "closed": 13, "partial": 2, "remainingMajor": 4, "candidateSha256": "02d8c85415b870cac60bc75c84dd04dcb968179c53e4b99705f7d074bcabeef6", "repairTasks": ["3aa28cce", "dd537581", "39495c8e"], "nextReview": "R2唯一增量复审"},
+  "upstreamArtifactReferences": [
+    "/Users/run.mao/workpace/feishu-sync/agent-outputs/workflow/build-runtime-v2/review-report.md",
+    "/Users/run.mao/workpace/feishu-sync/agent-outputs/workflow/build-runtime-v2/runtime-fix-guidance.md"
+  ],
+  "validationEvidence": {
+    "buildStatus": "passed",
+    "testStatus": "passed",
+    "browserVerification": "verified",
+    "commands": [
+      {"command": "Final same-suite lint/typecheck + tests --no-file-parallelism + build", "exitCode": 0, "summary": "前端519/server3080通过、16skip；不改断言/timeout，旧并行夹具失败保留"},
+      {"command": "Final pure-feature typecheck/build + direct tests/native", "exitCode": 0, "summary": "58路径与冻结index一致，不夹用户14路径；204定向、34真实原生；unknown home保留"},
+      {"command": "Independent final-scanner review d62dfd56", "exitCode": 0, "summary": "PASS：四类closed；独立204定向/34原生/89项取证，无新增finding；artifact accepted"},
+      {"command": "R2 final-candidate lint/typecheck + all tests --no-file-parallelism + build", "exitCode": 0, "summary": "相同全量与原断言/timeout：前端519/server3007、16skip，构建通过；默认并行曾有legacy5s/F02 500ms夹具抖动，失败与隔离日志保留，不冒充默认CI零失败"},
+      {"command": "R2 incremental pure-feature typecheck/build + unit/native + original probes", "exitCode": 0, "summary": "14文件343过4skip、原生34过；原4Major在纯feature回放均拒权/unknown/拒迟到准入；未夹用户14路径"},
+      {"command": "R2 final npm run check && npm run build:all", "exitCode": 0, "summary": "最终静场前端519/server2948通过，16skip；lint/typecheck/build通过"},
+      {"command": "R2 final frozen native suites + standalone probe", "exitCode": 0, "summary": "6文件123通过；probe36pass/0fail/10not-measured；最终unknown保留目录，不冒充全部OS退出"},
+      {"command": "R2 feature-only typecheck/build + 11-file unit + real native", "exitCode": 0, "summary": "不依赖用户12+2；编译构建通过，284过4skip、原生34过；unknown现场真实保留"},
+      {"command": "R2 integrated npm run check && npm run build:all", "exitCode": 0, "summary": "首轮R2集成静场：前端519/server2934通过、16跳过，lint/typecheck/build通过；最终quiescence结果传播修正仍在进行，之后复验与新Gate"},
+      {"command": "R2 frozen 2.21.31 native child-policy/environment/runtime-resolver suite", "exitCode": 0, "summary": "89/89，含真实Pi @路径/file URL强制读取零外部正文，正常skill/work/report/MCP正例；首次后台PATH缺rg的对照失败已留档，显式提供rg后原断言通过"},
+      {"command": "npm run check", "exitCode": 0, "summary": "主树静场全量：前端519、server2886通过，16跳过；随后新增queued严格反例在纯feature验证覆盖"},
+      {"command": "npm run build:all", "exitCode": 0, "summary": "前端/server及agent资产、独立MCP/CLI构建通过"},
+      {"command": "feature-only npm run typecheck + 7-file vitest", "exitCode": 0, "summary": "移除用户WIP后独立编译，148例通过"},
+      {"command": "feature-only real pi/amagi native 3-file suite", "exitCode": 1, "summary": "34用例本体全过，afterAll临时home清理ENOTEMPTY待审核归因，不能声称最新suite全绿"}
+    ]
+  },
+  "tags": ["build-runtime-v2", "fix-integration", "known-review-findings-closed", "strict-process-proof", "quiescence-not-business-state"],
+  "relatedFiles": ["final-delivery-report.md", "final-scanner-review.md", "final-scanner-review-initial.md", "fix4-scanner-report.md", "final-scanner-fixed-candidate.patch", "r2-incremental-review-report.md", "r2-full-review-report.md", "fix3-integration-report.md", "fix3-invariants.md", "r2-incremental-candidate.patch", "r2-review-report.md", "fix2-integration-report.md", "r2-candidate-feature.patch", "fix2-runtime-report.md", "fix2-security-report.md", "fix-integration-report.md", "fix-map.md", "incremental-review-report.md", "incremental-review-evidence/README.md", "candidate-feature.patch", "ui-real-api-acceptance.md", "acceptance-matrix.md"],
+  "review": {"taskId": "7fa31cae-b986-40e3-ae97-8318a22ee15e", "artifactAccepted": true, "productGate": "FIX", "closed": 9, "partial": 5, "open": 1, "remainingMajor": 7, "remainingMinor": 1},
+  "nextSteps": {"suggestedAgent": "Leader", "suggestedAction": "本批已知审核发现闭环交付；仅提交纯feature与本批报告，不夹用户12+2。legacy默认不切换；后续A23/Windows/setsid/真实模型质量须单独真实验证"}
+}
