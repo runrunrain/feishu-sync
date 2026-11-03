@@ -3274,6 +3274,10 @@ export class AgentToolService {
       // 服务端重新解引用：selector 解析 → hash 对账 + 回执范围 + quoteHash 复核
       const resolution = resolveSelector(resource, selector);
       if (!resolution.ok) throw new ToolError('kb_evidence_unresolved', resolution.message);
+      if (selector.kind === 'csv_cells' && role !== 'context' && resolution.nonEmptyCellCount === 0) {
+        throw new ToolError('kb_evidence_unresolved',
+          `CSV 证据选中的单元格全为空：逻辑 record ${selector.recordStart}–${selector.recordEnd}，列 ${selector.columns.join(', ')}。raw_read 的 R 是物理行、C 是逻辑 record；请用 raw_csv_cells 核对真实单元格后重选。空白范围只能作为 context，不能直接支撑或反驳断言`);
+      }
       const verification = verifyEvidence({
         evidence: {
           sourceRef: { sourceId, sourceSnapshotHash: pack.sourceSnapshotHash, resourceId, resourceHash: resource.resourceHash },

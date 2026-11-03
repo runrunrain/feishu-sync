@@ -96,6 +96,8 @@ export interface SelectorResolution {
   fragment: string;
   /** 规范化片段 hash（sha256: 前缀） */
   quoteHash: string;
+  /** CSV only: number of selected cells with content. A comma-only fragment is not supporting evidence. */
+  nonEmptyCellCount?: number;
 }
 
 export interface SelectorResolutionFailure {
@@ -297,12 +299,17 @@ function resolveCsvCells(resource: EvidenceCsvResource, selector: CsvCellsSelect
     colIndexes.push(index);
   }
   const rows: string[] = [];
+  let nonEmptyCellCount = 0;
   for (let recordNo = selector.recordStart; recordNo <= selector.recordEnd; recordNo += 1) {
     const record = records[recordNo - 1]!;
-    rows.push(colIndexes.map((index) => record[index] ?? '').join(','));
+    rows.push(colIndexes.map((index) => {
+      const value = record[index] ?? '';
+      if (value.trim()) nonEmptyCellCount += 1;
+      return value;
+    }).join(','));
   }
   const fragment = rows.join('\n');
-  return { ok: true, fragment, quoteHash: computeQuoteHash(fragment) };
+  return { ok: true, fragment, quoteHash: computeQuoteHash(fragment), nonEmptyCellCount };
 }
 
 /** WorkbookCells：sheet + A1 区间 + 合并主格 + 公式/缓存值性质。 */

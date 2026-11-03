@@ -48,7 +48,7 @@ const writeRaw = (rel: string, content: string): string => {
 
 const CSV_NAME = '表.csv';
 let CSV_PATH = '';
-const CSV_CONTENT = '列,值\n1,"多行\n内容"\n3,三\n';
+const CSV_CONTENT = '列,值,空列\n1,"多行\n内容",\n3,三,\n';
 
 function entry(objToken: string, relPath: string, csvPaths: string[] = []): RawSourceSnapshotEntry {
   return {
@@ -168,7 +168,7 @@ describe('evidence-locator：CsvCells（引号内换行不等于新记录）', (
   };
   it('parseCsvRecords：record 2 跨两个物理行', () => {
     const { records, recordSpans } = parseCsvRecords(CSV_CONTENT);
-    expect(records[1]).toEqual(['1', '多行\n内容']);
+    expect(records[1]).toEqual(['1', '多行\n内容', '']);
     expect(recordSpans[1]).toEqual({ startLine: 2, lineCount: 2 });
     expect(records).toHaveLength(3);
   });
@@ -619,6 +619,21 @@ describe('kb_write_doc：原子落盘与声明', () => {
       evidence: Array<{ readReceiptId: string; sourceRef: { resourceId: string } }>;
     };
     expect(draft.evidence[0]).toMatchObject({ readReceiptId: csvReceipt.readReceiptId, sourceRef: { resourceId: 'tokB#csv:表.csv' } });
+  });
+
+  it('拒绝用全空 CSV 单元格为断言提供直接支撑', async () => {
+    const state = makeBuildState('empty-csv-evidence');
+    const token = tokenFor(state);
+    await service.executeTool(token, 'raw_read', { objToken: 'tokB', offset: 0, limit: 20 });
+    await expect(service.executeTool(token, 'kb_write_doc', {
+      path: '战斗/空列.md', markdown: '## 空列\n这里有一条非空断言。',
+      sources: ['tokB'], summary: '空列测试',
+      objects: [{ clientKey: 'value', type: 'data_structure', title: '空列', familyKey: 'empty-column',
+        scopeText: '空列', claims: [{ claimKey: 'value-cell' }] }],
+      evidenceClaims: [{ objectKey: 'value', claimKey: 'value-cell', selector: {
+        kind: 'csv_cells', resourcePath: CSV_NAME, parserVersion: 'v1', recordStart: 2, recordEnd: 3, columns: ['空列'],
+      } }],
+    })).rejects.toThrow(/选中的单元格全为空.*逻辑 record 2–3/);
   });
 
   it('CSV 行由服务端导入正文并登记覆盖整表的真实回执', async () => {
