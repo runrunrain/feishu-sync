@@ -794,6 +794,7 @@ describe('审查（§4.3）与交接/问题/发布（§5）', () => {
   it('交接提交/读取（子任务交、Leader 收）', async () => {
     const setup = makeV2('b-handoff');
     setup.store.registerTaskCreation({ nativeTaskId: 'w1', requestedRole: 'luban' });
+    setup.store.registerTaskCreation({ nativeTaskId: 'w2', requestedRole: 'luban' });
     const submit = await call(setup.child.token, 'build_handoff_submit', { summary: '完成定位文档', artifactRefs: ['docs/h.md@1'], openIssues: ['公式未覆盖'] }, meta('w1', 'luban'));
     expect(submit.details!.handoffId).toBeTruthy();
     const replay = await call(setup.child.token, 'build_handoff_submit', { summary: '完成定位文档', artifactRefs: ['docs/h.md@1'], openIssues: ['公式未覆盖'] }, meta('w1', 'luban'));
@@ -802,6 +803,21 @@ describe('审查（§4.3）与交接/问题/发布（§5）', () => {
     const body = JSON.parse(list.content[0]!.text);
     expect(body.handoffs).toHaveLength(1);
     expect(body.handoffs[0].role).toBe('luban');
+    expect(body.summaryOnly).toBe(true);
+    const longSummary = `完成第二篇：${'规则和证据。'.repeat(90)}`;
+    await call(setup.child.token, 'build_handoff_submit', {
+      summary: longSummary, artifactRefs: ['docs/second.md@1'], openIssues: ['待复核公式完整范围'],
+    }, meta('w2', 'luban'));
+    const firstPage = JSON.parse((await call(setup.leader.token, 'build_handoff_list', { limit: 1 })).content[0]!.text);
+    expect(firstPage.total).toBe(2);
+    expect(firstPage.nextOffset).toBe(1);
+    const secondPage = JSON.parse((await call(setup.leader.token, 'build_handoff_list', { offset: 1, limit: 1 })).content[0]!.text);
+    expect(secondPage.handoffs[0].summary.length).toBe(240);
+    expect(secondPage.handoffs[0].summaryTruncated).toBe(true);
+    expect(secondPage.handoffs[0].openIssueCount).toBe(1);
+    const detail = JSON.parse((await call(setup.leader.token, 'build_handoff_list', { taskId: 'w2' })).content[0]!.text);
+    expect(detail.handoffs[0].summary).toBe(longSummary);
+    expect(detail.summaryOnly).toBeUndefined();
   });
 
   it('问题清单：blocking 阻止发布；清零后发布管线结算 accepted；发布窗口内写入被拒', async () => {

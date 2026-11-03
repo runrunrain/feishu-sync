@@ -210,6 +210,18 @@ describe('guardTaskSubmit', () => {
     if (blocked.decision === 'block') expect(blocked.code).toBe('dispatch_writer_scope_too_broad');
   });
 
+  it('少量锚点但跨三张大表累计 629 行的写作任务也在启动前拦截', () => {
+    const blocked = guardTaskSubmit(makeConfig(), { agent: 'luban', task: [
+      '【写作】人塔寨补给与克制机制',
+      '②Concept 子表 L1428-1652；③-1 分析拆解 L1655-1858；日志 L3506-3705。',
+      '正文归纳克制原则、补给状态和版本变化，提交完整文档。',
+    ].join('\n') });
+    expect(blocked.decision).toBe('block');
+    if (blocked.decision === 'block') expect(blocked.message).toContain('629 行');
+    const imported = guardTaskSubmit(makeConfig(), { agent: 'luban', task: '【写作】明细表 L1-600，使用 csvTableImports 服务端导入。' });
+    expect(imported.decision).toBe('allow');
+  });
+
   it('taskFile 越出工作目录 → 阻止（../ 与绝对路径）', () => {
     expect(guardTaskSubmit(makeConfig(), { agent: 'luban', taskFile: '../escape.md' }).decision).toBe('block');
     expect(guardTaskSubmit(makeConfig(), { agent: 'luban', taskFile: '/etc/passwd' }).decision).toBe('block');

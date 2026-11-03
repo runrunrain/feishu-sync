@@ -177,6 +177,19 @@ function sortedUnique(values: readonly string[]): string[] {
  */
 function writerScopeIssue(task: string): string | null {
   const assignment = task.split('[当前任务书]').at(-1) ?? task;
+  const ranges = [...assignment.matchAll(/\bL(\d+)\s*[-–—~～]\s*(?:L)?(\d+)\b/g)]
+    .map((match) => [Number(match[1]), Number(match[2])] as const)
+    .filter(([start, end]) => Number.isSafeInteger(start) && Number.isSafeInteger(end) && start > 0 && end >= start)
+    .sort(([a], [b]) => a - b);
+  let coveredLines = 0;
+  let coveredEnd = 0;
+  for (const [start, end] of ranges) {
+    coveredLines += Math.max(0, end - Math.max(start, coveredEnd + 1) + 1);
+    coveredEnd = Math.max(coveredEnd, end);
+  }
+  if (coveredLines > 350 && !assignment.includes('csvTableImports')) {
+    return `写作任务明确分配了 ${coveredLines} 行来源区间，单轮读写范围过宽；请按主题拆成多篇约 100–150 行的完整文档。纯明细表由 csvTableImports 服务端导入`;
+  }
   const anchors = [...new Set([...assignment.matchAll(/\bL(\d+)\b/g)].map((match) => Number(match[1])))]
     .filter((line) => Number.isSafeInteger(line) && line > 0);
   const span = anchors.length > 0 ? Math.max(...anchors) - Math.min(...anchors) : 0;

@@ -1078,11 +1078,13 @@ export const BUILD_HANDOFF_SUBMIT_SPEC: AgentToolSpec = {
 export const BUILD_HANDOFF_LIST_SPEC: AgentToolSpec = {
   name: 'build_handoff_list',
   label: '读取交接记录',
-  description: '读取子任务提交的交接记录（可按 taskId 过滤）。只读。',
+  description: '缺省分页返回紧凑交接目录；按 taskId 读取该任务完整交接。先看检查点和目录，只精读仍需处理的任务。只读。',
   parameters: {
     type: 'object',
     properties: {
-      taskId: string('按任务 ID 过滤（缺省全部）'),
+      taskId: string('按任务 ID 精读完整交接（缺省返回紧凑目录）'),
+      offset: integer('目录/交接列表起始偏移（缺省 0）', 0),
+      limit: integer('单页条数（缺省 25，最多 100）', 1, 100),
     },
     additionalProperties: false,
   },

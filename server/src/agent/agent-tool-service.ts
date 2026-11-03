@@ -4235,7 +4235,35 @@ export class AgentToolService {
     const v2 = requireV2Orchestration(context);
     const taskId = typeof args.taskId === 'string' && args.taskId ? args.taskId : undefined;
     const records = v2.actorStore.listHandoffs({ ...(taskId ? { taskId } : {}) });
-    return { content: [{ type: 'text', text: JSON.stringify({ handoffs: records }, null, 2) }], details: { count: records.length } };
+    // 恢复时先读目录级摘要。完整交接可能含 2k 摘要和大量来源坐标，整批
+    // 返回会让 Leader 在一次 high 思考里反复消化历史文本；按 taskId 精读。
+    const offset = args.offset === undefined ? 0 : Number(args.offset);
+    const limit = args.limit === undefined ? 25 : Number(args.limit);
+    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new ToolError('invalid_request', 'offset 须为非负整数，limit 须为 1–100 的整数');
+    }
+    const page = records.slice(offset, offset + limit);
+    const handoffs = taskId ? page : page.map((record) => ({
+      handoffId: record.handoffId,
+      taskId: record.taskId,
+      role: record.role,
+      summary: record.summary.slice(0, 240),
+      summaryTruncated: record.summary.length > 240,
+      artifactRefs: record.artifactRefs.slice(0, 5),
+      artifactRefCount: record.artifactRefs.length,
+      sourceScope: record.sourceScope.slice(0, 5),
+      sourceScopeCount: record.sourceScope.length,
+      openIssues: record.openIssues.slice(0, 2).map((item) => item.slice(0, 180)),
+      openIssueCount: record.openIssues.length,
+      nextInfoCount: record.nextInfo.length,
+      createdAt: record.createdAt,
+    }));
+    const nextOffset = offset + page.length < records.length ? offset + page.length : null;
+    return {
+      content: [{ type: 'text', text: JSON.stringify({ handoffs, total: records.length, nextOffset,
+        ...(taskId ? {} : { summaryOnly: true, detailHint: '按 taskId 再调用 build_handoff_list 读取完整交接' }) }) }],
+      details: { count: page.length, total: records.length, nextOffset },
+    };
   }
 
   /** build_issues_submit（Leader，§5.3）：聚合问题清单。 */
