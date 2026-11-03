@@ -12,6 +12,8 @@
 6. 局部修改优先：只提交变化的部分，服务端计算稳定位置；已有证据仅需更换 selector 时，用 `kb_edit_doc.evidenceSelectorUpdates` 按 `draft_read` 返回的 `evidenceId` 更新。已有覆盖项只改去向时，用 `kb_edit_doc.coverageUpdates` 指定原 `itemId`、新 `disposition` 和必要的 `targetKeys`；来源、分类、重要性及未变声明由服务端继承，不重填整篇。**本篇重复对象并入另一篇已有对象时用 `kb_edit_doc.objectMerges` 给旧/后继 objectId 与合并理由；服务端继承其余声明并把旧对象的覆盖映射转向后继，不把有效规则大批量标成 `excluded_nonknowledge`，也不重发整篇 JSON。** 对象拆分或断言结构变化仍须显式提交迁移意图与完整声明。跨构建旧证据的回执不可凭猜测继承；`kb_edit_doc` 报 `kb_evidence_unresolved` 时按当前源重读，再局部更新 selector 或一次完整 `kb_write_doc` 重申本篇，不以无效字段或半篇正文探测续传。
 
 `build_manifest.sourceShape` 的章节与 CSV 附件坐标由应用从冻结源生成。任务书给出本篇范围和坐标时，可直接用 `raw_read(offset=起始行-1, limit=...)` 跳读目标范围，再按该页 `next_offset` 续读；不要从第 0 行顺序翻过不属于本篇的其他子表。CSV 的 `outputStart/outputEnd` 是输出行坐标，证据 selector 仍须使用回执的资源内行列坐标。
+
+`kb_write_doc` 若因声明校验被拒，应用会在错误中给出 `retryOf`：下一次只传原 `path`、该令牌和需修正的顶层字段，服务端复用上次正文、来源和其他未变声明，再走完整校验与原子落盘。令牌仅本任务 30 分钟有效；没有令牌或令牌过期才重发全文。不要把 `retryOf` 当作已写草稿或已发布成果。
 定位 CSV 源文短语时优先批量调用 `raw_csv_find(objToken, resourceId, queries)`，直接取得逻辑 record、`@` 列、selector 和读取回执；已知 record 区间才调用 `raw_csv_cells(objToken, resourceId, recordStart, recordEnd)` 查看逐格内容。不要目测数逗号或根据 raw_read 的物理行猜列位；未列出的列为空。
    正文含「全部记录」「第 N 列起」「无缺号」等全称或连续范围断言时，证据 selector 必须覆盖同一完整范围；首尾与中间抽样只能支持抽样结论，不能补足全称断言。若无需保留该断言，就把正文与 claim 一起收窄到已证范围。
 7. 完成后提交交接记录（见 `achievement-protocol.md`）：成果引用、版本、来源范围、未解决问题与下一步所需信息。**最终回复只给交接记录编号与结论**，不回传整篇正文。

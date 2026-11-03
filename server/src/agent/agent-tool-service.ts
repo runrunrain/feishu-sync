@@ -173,6 +173,8 @@ export interface BuildRunState {
   /** 工作集（objToken → 变更类型；full 时含快照全部源，changeType='rebuild'） */
   workset: Map<string, 'added' | 'changed' | 'rebuild'>;
   stagingRoot: string;
+  /** 校验拒绝后短期复用正文；仅内存，不参与发布或检查点。 */
+  failedWriteAttempts?: Map<string, { owner: string; path: string; args: Record<string, unknown>; expiresAt: number }>;
   /** kb_write_doc 写入时同步更新（标题/摘要/标签，manifest 生成用） */
   docMeta?: Map<string, { title: string; summary: string; tags: string[]; sources: string[] }>;
   finishInfo: { summary: string; skipped: Array<{ objToken: string; reason: string }>; docMerges?: Array<{ path: string; mergedInto: string[] }> } | null;
@@ -395,6 +397,8 @@ export interface OrganizationPlanFile {
 
 export interface InternalRunContext extends AgentRunContext {
   options: RunContextOptions;
+  /** 仅内存的当前运行凭据标识；用于旧模式的失败正文隔离，不返回模型。 */
+  runToken?: string;
   /** F01（撤销租约）：revokeToken/revokeBySession/revokeByBuild 置位。
    * contexts 表删除只能拦后续 executeTool，拦不住已持 ctx 引用的在途
    * 调用（声明锁排队/异步证据装配中的写入）——在途链在最终落盘与回执
@@ -721,6 +725,7 @@ export class AgentToolService {
       workspaceRoot: options.workspaceRoot,
       allowedTools,
       createdAt: Date.now(),
+      runToken: token,
       revokedAt: null,
       revokedScope: null,
       options,
@@ -898,15 +903,20 @@ export class AgentToolService {
     if (context.options.orchestration) {
       this.assertV2Access(context, toolName, meta);
     }
-    const argsSummary = summarizeArgs(toolName, args);
+    const effectiveArgs = toolName === 'kb_write_doc' ? this.resolveWriteRetryArgs(context, args, meta) : args;
+    const argsSummary = summarizeArgs(toolName, effectiveArgs);
     context.options.onEvent?.({ phase: 'start', toolName, ...(meta?.toolCallId ? { toolCallId: meta.toolCallId } : {}), argsSummary });
+    let writeCommitted = false;
     try {
-      const result = await tool.execute(context, args, meta);
+      const result = await tool.execute(context, effectiveArgs, meta);
+      writeCommitted = true;
+      if (toolName === 'kb_write_doc') this.clearFailedWrites(context, effectiveArgs, meta);
       if (['kb_write_doc', 'kb_delete_doc', 'kb_unit_done', 'kb_finish', 'kb_submit_plan', 'kb_submit_review'].includes(toolName)) context.options.buildState?.onCheckpoint?.();
       const resultSummary = summarizeResult(result);
       context.options.onEvent?.({ phase: 'end', toolName, ...(meta?.toolCallId ? { toolCallId: meta.toolCallId } : {}), argsSummary, resultSummary, isError: false });
       return result;
     } catch (error) {
+      if (toolName === 'kb_write_doc' && !writeCommitted) this.rememberFailedWrite(context, effectiveArgs, meta, error);
       const message = error instanceof Error ? error.message : String(error);
       context.options.onEvent?.({
         phase: 'end',
@@ -918,6 +928,54 @@ export class AgentToolService {
       });
       throw error;
     }
+  }
+
+  /** 上次失败正文只在原任务的短期内存中复用；仍走完整写入权限、声明校验与原子落盘链。 */
+  private resolveWriteRetryArgs(context: InternalRunContext, args: Record<string, unknown>, meta?: ToolRequestMeta): Record<string, unknown> {
+    if (args.retryOf === undefined) return args;
+    const state = requireBuildState(context);
+    const retryOf = requireString(args, 'retryOf', 1, 80);
+    const docPath = requireString(args, 'path', 1, 600);
+    const cached = state.failedWriteAttempts?.get(retryOf);
+    const owner = meta?.amagiTaskId ?? context.runToken ?? '';
+    if (!cached || cached.owner !== owner || cached.path !== docPath || cached.expiresAt < Date.now()) {
+      throw new ToolError('kb_write_retry_unavailable', '失败正文暂存令牌不存在、已过期或不属于本任务；请重新提交完整 kb_write_doc', 409);
+    }
+    const merged = { ...cached.args, ...args };
+    delete merged.retryOf;
+    // 修正后的业务载荷必须得到新的幂等键；显式新键仍由调用者掌控。
+    if (!Object.hasOwn(args, 'operationId')) delete merged.operationId;
+    return merged;
+  }
+
+  private clearFailedWrites(context: InternalRunContext, args: Record<string, unknown>, meta?: ToolRequestMeta): void {
+    const cache = context.options.buildState?.failedWriteAttempts;
+    if (!cache) return;
+    const owner = meta?.amagiTaskId ?? context.runToken ?? '';
+    for (const [token, item] of cache) {
+      if (item.owner === owner && item.path === args.path) cache.delete(token);
+    }
+  }
+
+  private rememberFailedWrite(context: InternalRunContext, args: Record<string, unknown>, meta: ToolRequestMeta | undefined, error: unknown): void {
+    const state = context.options.buildState;
+    const markdown = args.markdown;
+    if (!state || !(error instanceof ToolError) || error.status < 400 || error.status >= 500
+      || ['kb_write_retry_unavailable', 'kb_draft_revision_conflict', 'kb_source_empty_placeholder', 'kb_doc_too_large'].includes(error.code)
+      || typeof markdown !== 'string' || !markdown || Buffer.byteLength(markdown, 'utf8') > 512_000
+      || typeof args.path !== 'string') return;
+    const owner = meta?.amagiTaskId ?? context.runToken ?? '';
+    if (!owner) return;
+    const cache = state.failedWriteAttempts ?? new Map();
+    state.failedWriteAttempts = cache;
+    const now = Date.now();
+    for (const [token, item] of cache) {
+      if (item.expiresAt < now || (item.owner === owner && item.path === args.path)) cache.delete(token);
+    }
+    while (cache.size >= 8) cache.delete(cache.keys().next().value!);
+    const retryOf = `wr_${crypto.randomBytes(12).toString('hex')}`;
+    cache.set(retryOf, { owner, path: args.path, args: structuredClone(args), expiresAt: now + 30 * 60_000 });
+    error.message += `；正文与未变声明已暂存（不落盘）。修正后调用 kb_write_doc({path:${JSON.stringify(args.path)},retryOf:${JSON.stringify(retryOf)},报错字段:新值})，无需重发 markdown/sources/summary；令牌 30 分钟有效`;
   }
 
   // ------------------------------------------------------------------

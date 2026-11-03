@@ -272,11 +272,12 @@ const sourceRefSchema: Record<string, unknown> = {
 export const KB_WRITE_DOC_SPEC: AgentToolSpec = {
   name: 'kb_write_doc',
   label: '写入标准文档草稿',
-  description: `写入一篇标准文档草稿到本构建 staging（同路径覆盖）。server 从 path 生成标题，从载荷生成幂等键，并补齐对象/证据/覆盖声明的机械字段；模型负责正文、对象语义、断言、证据定位和覆盖裁定。${KB_DECLARATION_CONSTRAINTS}`,
+  description: `写入一篇标准文档草稿到本构建 staging（同路径覆盖）。校验拒绝时返回 retryOf 令牌；下次只需传 path、retryOf 和报错字段的新值，服务端复用上次正文及未变声明，不必重发整篇。令牌仅限原任务和本构建，30 分钟有效；原失败不落盘。server 从 path 生成标题，从载荷生成幂等键，并补齐对象/证据/覆盖声明的机械字段；模型负责正文、对象语义、断言、证据定位和覆盖裁定。${KB_DECLARATION_CONSTRAINTS}`,
   parameters: {
     type: 'object',
     properties: {
       path: string('标准文档 POSIX 相对路径（.md 结尾，不以 . 开头，每段 ≤120 字符，深度 ≤6）'),
+      retryOf: string('上次校验拒绝返回的 retryOf 令牌；与 path 和需修正的顶层字段一起提交，其余字段（含正文）由服务端复用'),
       operationId: string('可选；省略时 server 从规范化载荷生成稳定幂等键。显式提供时同 ID 同载荷重放返回原回执'),
       title: string('可选；省略时取 path 文件名（不含 .md）'),
       markdown: string('自然完整的知识正文，不含文件头或 # 总标题。禁止来源段落、来源标识、原始路径、来源脚注及构建信息；来源仅填sources，由侧栏展示。'),
@@ -416,7 +417,8 @@ export const KB_WRITE_DOC_SPEC: AgentToolSpec = {
         },
       },
     },
-    required: ['path', 'markdown', 'sources', 'summary'],
+    required: ['path'],
+    anyOf: [{ required: ['markdown', 'sources', 'summary'] }, { required: ['retryOf'] }],
     additionalProperties: false,
   },
 };

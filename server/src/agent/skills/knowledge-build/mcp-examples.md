@@ -137,4 +137,5 @@ Leader 的工具面没有 `mcp_call`——应用构建工具（材料清单/分�
 
 - 未分配目标写入 → 可重试错误：先完成阅读，确认分配后再写。
 - 参数结构不符 → 调用一次 `kb_tool_schema` 读取真实参数契约，再按结构化反馈修正；同类错误连发时交接问题，不盲试。
+- `kb_write_doc` 声明校验拒绝并返回 `retryOf` → 原任务调用 `{"server":"feishu-kb-bridge","tool":"kb_write_doc","arguments":{"path":"规则/行动.md","retryOf":"<错误中的 wr_ 令牌>","objects":[{"clientKey":"action","type":"rule","title":"行动次数","familyKey":"action-count","scopeText":"战斗回合","headingPath":["行动次数"]}]}}`；这里只重传报错字段（示例为修正后的完整 `objects` 数组），正文、来源和未变数组由服务端短期复用，提交仍须通过原权限与全部校验。
 - 版本冲突 → 按返回的当前 revision 重读后重试，不覆盖。

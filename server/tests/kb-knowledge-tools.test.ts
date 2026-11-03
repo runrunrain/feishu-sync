@@ -976,6 +976,33 @@ describe('kb_write_doc：原子落盘与声明', () => {
 describe('kb_write_doc：写入即拒（错误码复用 kb_* 系列）', () => {
   const baseObject = { clientKey: 'o1', type: 'rule', title: '规则', familyKey: 'f', variantKey: 'default', scopeKey: 's', scopeText: '范围' };
 
+  it('声明校验失败后只重发修正字段即可复用正文，令牌隔离且成功后失效', async () => {
+    const state = makeBuildState('retry-write-body');
+    const token = tokenFor(state);
+    const markdown = '## 规则\n一篇较长的正文和准确来源证据应当保留。';
+    let rejected: { code?: string; message?: string } | null = null;
+    try {
+      await service.executeTool(token, 'kb_write_doc', {
+        ...BASE_WRITE, markdown,
+        objects: [{ ...baseObject, scopeKey: '' }],
+      });
+    } catch (error) {
+      rejected = error as { code?: string; message?: string };
+    }
+    expect(rejected?.code).toBe('kb_scope_unresolved');
+    const retryOf = rejected?.message?.match(/retryOf:"(wr_[a-f0-9]+)"/)?.[1];
+    expect(retryOf).toMatch(/^wr_/);
+    expect(fs.existsSync(path.join(state.stagingRoot, 'docs', BASE_WRITE.path))).toBe(false);
+    const patch = { path: BASE_WRITE.path, retryOf, objects: [{ ...baseObject, scopeKey: 's' }] };
+    await expect(service.executeTool(tokenFor(state), 'kb_write_doc', patch))
+      .rejects.toMatchObject({ code: 'kb_write_retry_unavailable' });
+    const result = await service.executeTool(token, 'kb_write_doc', patch);
+    expect(result.content[0]!.text).toContain('已写入草稿');
+    expect(fs.readFileSync(path.join(state.stagingRoot, 'docs', BASE_WRITE.path), 'utf8')).toContain(markdown);
+    await expect(service.executeTool(token, 'kb_write_doc', patch))
+      .rejects.toMatchObject({ code: 'kb_write_retry_unavailable' });
+  });
+
   it('scopeKey 缺失 → kb_scope_unresolved；不产生 knowledge-draft.json', async () => {
     const state = makeBuildState('rej-scope');
     const token = tokenFor(state);
