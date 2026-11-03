@@ -866,6 +866,7 @@ describe.skipIf(!PI_CLI || !SOURCE_AMAGI)('真实 pi + 真实 amagi 子进程工
         });
         const entries = env.model.requestsFor('CHILD-POLICY-LIVE');
         expect(entries.length).toBeGreaterThanOrEqual(20); // 含SDK路径别名反例的多轮证据
+        expect(JSON.stringify(entries[0]?.messages)).toContain('ROLE-LIVE-INJECTED-luban');
         for (const entry of entries) {
           for (const banned of CHILD_POLICY_DISABLED_TOOLS) {
             expect(entry.tools, `step${entry.step} 工具面含禁用名 ${banned}`).not.toContain(banned);
@@ -1063,6 +1064,8 @@ interface LiveEnv {
   outsideDir: string;
   /** F12-R1 二段：注入子进程的冻结信封根元数据（与生产 buildLeaderEnv 同构）。 */
   rootsJson: string;
+  workflowSkillPath: string;
+  workflowRevision: string;
   model: LiveModelServer;
   dispose: () => Promise<void>;
 }
@@ -1085,7 +1088,16 @@ async function prepareLiveEnv(mode: 'ctrl' | 'live'): Promise<LiveEnv> {
   spec.modelDescriptors = spec.modelDescriptors.map((descriptor) => ({ ...descriptor, baseUrl: model.baseUrl }));
   spec.workflowSkillPath = path.join(root, 'skill', 'kb-build', 'SKILL.md');
   fs.mkdirSync(path.dirname(spec.workflowSkillPath), { recursive: true });
-  fs.writeFileSync(spec.workflowSkillPath, '---\nname: kb-build\ndescription: live child-policy 验证 skill。\n---\n\n# live\n');
+  const digest = (value: string) => crypto.createHash('sha256').update(value).digest('hex');
+  const roles = ['luban', 'diting', 'baize'] as const;
+  const roleMarkers = roles.map((role) => {
+    const body = `ROLE-LIVE-INJECTED-${role}: 冻结角色规则与示例。`;
+    fs.writeFileSync(path.join(path.dirname(spec.workflowSkillPath), `role-${role}.md`), body);
+    return `<!--ROLE_SKILL ${role} sha256=${digest(body)} path=role-${role}.md-->`;
+  });
+  const skillContent = `---\nname: kb-build\ndescription: live child-policy 验证 skill。\n---\n\n# live\n${roleMarkers.join('\n')}\n`;
+  fs.writeFileSync(spec.workflowSkillPath, skillContent);
+  spec.workflowRevision = digest(skillContent);
   spec.amagiPackage = { version: install.version, installDir: install.installDir, packageRoot: install.packageRoot, contentHash: install.contentHash };
   const dirs = planBuildDirectories(dataRoot, spec.buildId);
   fs.mkdirSync(dirs.workDir, { recursive: true });
@@ -1139,6 +1151,8 @@ async function prepareLiveEnv(mode: 'ctrl' | 'live'): Promise<LiveEnv> {
     skillDir,
     outsideDir: path.dirname(outsideFile),
     rootsJson,
+    workflowSkillPath: spec.workflowSkillPath,
+    workflowRevision: spec.workflowRevision,
     model,
     dispose: async () => { await model.stop(); },
   };
@@ -1167,6 +1181,9 @@ async function runLiveChild(
       AMAGI_SUBAGENT: '1',
       AMAGI_PERMISSION_CWD: env.workDir,
       PI_BUILD_CHILD_ROOTS_JSON: env.rootsJson,
+      PI_BUILD_WORKFLOW_SKILL_PATH: env.workflowSkillPath,
+      PI_BUILD_WORKFLOW_REVISION: env.workflowRevision,
+      PI_BUILD_ROLE_SKILL_REQUIRED: '1',
       ZHIPU_API_KEY: 'fixture-dummy-key',
       FEISHU_SYNC_BUILD_MCP_URL: 'http://127.0.0.1:9',
       FEISHU_SYNC_BUILD_MCP_TOKEN: 'fixture-dummy-token',
