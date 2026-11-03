@@ -129,9 +129,9 @@ export interface StandardKbConfig {
   /** B案 §7：发布方式。additive 可选：缺省 'auto'（通过后自动整版发布）；
    * 'confirm' 只在最终候选版本就绪后确认一次（绑定候选版本）。 */
   publishMode?: 'auto' | 'confirm';
-  /** D3（A 案 §5.4）：单 release 证据资源（evidence/ 内工作簿区间快照 +
-   * 图片本体）总量上限（字节）。additive 可选：未设时用缺省 20MB；
-   * 超限发布期 blocking（kb_evidence_unresolved，列出各资源体量）。 */
+  /** D3（A 案 §5.4）：显式配置时为单 release 证据资源总量上限。
+   * 未设时增量构建按原始发布基线额外预留 20 MiB，避免已发布资源占满
+   * 后续阶段发布额度；完整重建仍使用 20 MiB。超限阻断发布。 */
   evidenceBudgetBytes?: number;
   /** 第一阶段固定 false（字段预留） */
   autoBuildAfterSync: boolean;

@@ -56,7 +56,7 @@ import { PathClaims } from './path-claims.js';
 import { collectWhiteboardTextsForEntries, enrichEntriesWithMedia, hashImageFile, resolveSourceImages, verifyEntryMediaHash, verifyEntryWhiteboardTextHash, type WhiteboardTextMap } from './source-images.js';
 import type { ImageDescription } from '../agent/vision/vision-describer.js';
 import { VisionDescriber } from '../agent/vision/vision-describer.js';
-import { buildDefaultAgentVisionConfig, resolveEvidenceBudgetBytes, type KbBuildMetricsPrecheck } from '../types/agent-knowledge.js';
+import { buildDefaultAgentVisionConfig, type KbBuildMetricsPrecheck } from '../types/agent-knowledge.js';
 import type { KbChangePreview, KbDocMerge, KbFileChange } from '../types/kb-version.js';
 import { sourceVersionWarning } from './search/query-metadata.js';
 import { selectKnowledgeSources } from './source-selection.js';
@@ -87,6 +87,7 @@ import {
   type ImageEvidencePayload,
   type WorkbookEvidencePayload,
 } from './evidence-resources.js';
+import { evidenceBudgetForPublication } from './evidence-budget.js';
 import {
   compileKnowledgeRelease,
   type CompilerDocInput,
@@ -6685,6 +6686,7 @@ export class KbBuildService extends EventEmitter {
   private async prepareKnowledgePublish(input: {
     buildId: string;
     releaseId: string;
+    mode: 'incremental' | 'full';
     stagingRoot: string;
     outputRoot: string;
     snapshot: RawSourceSnapshot;
@@ -7028,11 +7030,17 @@ export class KbBuildService extends EventEmitter {
       }
     }
     const evidencePlan = planReleaseEvidenceFiles({ evidence, workbookPayloads: wbPayloads, imagePayloads: imgPayloads });
-    const evidenceBudget = resolveEvidenceBudgetBytes(this.deps.configProvider()?.standardKb);
+    const evidenceBudget = evidenceBudgetForPublication({
+      config: this.deps.configProvider()?.standardKb,
+      mode: input.mode,
+      outputRoot: input.outputRoot,
+      baseReleaseId: input.baseReleaseId,
+      buildId: input.buildId,
+    });
     if (evidencePlan.totalBytes > evidenceBudget) {
       evidenceBlocking.push({
         code: 'kb_evidence_unresolved', field: 'evidenceFiles',
-        message: `证据资源总量 ${evidencePlan.totalBytes} 字节超过预算 ${evidenceBudget} 字节（A案 §5.4：无法保留则阻止发布）。各资源体量：${evidencePlan.files.map((file) => `${file.path}=${file.bytes.length}`).join(', ')}——请收窄引用区间或减少图片证据`,
+        message: `证据资源总量 ${evidencePlan.totalBytes} 字节超过预算 ${evidenceBudget} 字节（A案 §5.4：无法保留则阻止发布）。最大资源：${[...new Map(evidencePlan.files.map((file) => [file.path, file.bytes.length])).entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([name, bytes]) => `${name}=${bytes}`).join(', ')}——请收窄引用区间或减少图片证据`,
         severity: 'blocking',
       });
     }
@@ -7172,7 +7180,7 @@ export class KbBuildService extends EventEmitter {
     }
     return {
       compiled, knowledgeBytes, evidenceBytes, governanceBytes, organization, evidenceSection, governanceSection,
-      evidenceFileWrites: evidencePlan.files.map((file) => ({ path: file.path, bytes: file.bytes })),
+      evidenceFileWrites: [...new Map(evidencePlan.files.map((file) => [file.path, { path: file.path, bytes: file.bytes }])).values()],
     };
   }
 
@@ -7190,6 +7198,7 @@ export class KbBuildService extends EventEmitter {
     const knowledgePlan = await this.prepareKnowledgePublish({
       buildId: input.buildId,
       releaseId,
+      mode: input.mode,
       stagingRoot,
       outputRoot,
       snapshot: input.snapshot,

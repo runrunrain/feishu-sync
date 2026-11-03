@@ -23,16 +23,39 @@ import type { LlmProtocol } from '../../types/index.js';
 import type { AgentVisionConfig } from '../../types/agent-knowledge.js';
 import { buildDefaultAgentVisionConfig } from '../../types/agent-knowledge.js';
 import { VisionChannel, type VisionImageMime, type VisionRequest, type VisionCallOptions, type VisionResult } from './vision-channel.js';
+import { createVisionImageTiles } from './vision-image-tiles.js';
 
 /** One transient upstream failure must not make a source image permanently unavailable. */
 async function describeWithTransientRetry(channel: VisionChannel, request: VisionRequest, options: VisionCallOptions): Promise<VisionResult> {
   let result = await channel.describe(request, options);
+  if (result.finishReason === 'timeout' && !options.signal?.aborted) {
+    const tiles = await createVisionImageTiles(request);
+    if (tiles.length) {
+      const startedAt = Date.now();
+      const parts = await Promise.all(tiles.map((tile, index) => channel.describe({
+        ...request,
+        bytes: tile.bytes,
+        mime: tile.mime,
+        prompt: `${request.prompt}\n\n这是原图按阅读顺序裁出的第 ${index + 1}/${tiles.length} 个区域。只描述此区域真实可见的内容；跨区域关系不确定时明确说明。`,
+      }, options)));
+      if (parts.every((part) => (part.finishReason === 'stop' || part.finishReason === 'length') && part.text.trim())) {
+        return {
+          text: parts.map((part, index) => `### 图像区域 ${index + 1}/${tiles.length}\n${part.text.trim()}`).join('\n\n'),
+          finishReason: 'stop',
+          model: parts[0].model,
+          latencyMs: result.latencyMs + Date.now() - startedAt,
+        };
+      }
+      const failed = parts.findIndex((part) => !((part.finishReason === 'stop' || part.finishReason === 'length') && part.text.trim()));
+      return { ...parts[failed], errorMessage: `图像分片 ${failed + 1}/${tiles.length} 未完成：${parts[failed].errorMessage ?? '没有有效描述'}` };
+    }
+    // Standalone Node or unsupported image format: retain one original retry.
+    if (!options.signal?.aborted) return channel.describe(request, options);
+  }
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const status = result.statusCode;
     const transientStatus = status === 429 || status !== undefined && status >= 500;
-    // 识图服务偶发在单图超时后恢复；只给 timeout 一次补试，避免无限等待。
-    const transientTimeout = result.finishReason === 'timeout' && attempt === 0;
-    if (options.signal?.aborted || !transientStatus && !transientTimeout) break;
+    if (options.signal?.aborted || !transientStatus) break;
     await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
     if (options.signal?.aborted) break;
     result = await channel.describe(request, options);

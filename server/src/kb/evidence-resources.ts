@@ -352,5 +352,15 @@ export function planReleaseEvidenceFiles(input: {
     });
   }
   files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-  return { files, totalBytes: files.reduce((sum, file) => sum + file.bytes.length, 0) };
+  // Different source resource IDs can point to identical image bytes. The
+  // evidence index retains every ID, but the release writes that path once.
+  const physicalFiles = new Map<string, ReleaseEvidenceFilePlan>();
+  for (const file of files) {
+    const previous = physicalFiles.get(file.path);
+    if (previous && (previous.hash !== file.hash || previous.bytes.length !== file.bytes.length)) {
+      throw new Error(`证据资源路径冲突：${file.path}`);
+    }
+    physicalFiles.set(file.path, file);
+  }
+  return { files, totalBytes: [...physicalFiles.values()].reduce((sum, file) => sum + file.bytes.length, 0) };
 }
