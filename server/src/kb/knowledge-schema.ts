@@ -957,6 +957,10 @@ export function validateKnowledgeGraph(km: KnowledgeManifest): ValidationIssue[]
     } else if (!item.reason || !item.reason.trim()) {
       issues.push(issue('kb_coverage_invalid', 'reason',
         `排除必须给理由：${item.itemId}（disposition=${item.disposition}）`, 'warning', refs));
+    } else if (item.disposition === 'excluded_nonknowledge'
+      && /改由|归属.{0,40}篇|由.{0,40}篇.{0,20}承接|转移至.{0,40}篇|另一篇|其他篇/.test(item.reason)) {
+      issues.push(issue('kb_coverage_invalid', 'reason',
+        `覆盖项仍属知识且由其他文档承接，不能标成非知识排除：${item.itemId}；请映射到承接对象`, 'blocking', refs));
     }
   }
 

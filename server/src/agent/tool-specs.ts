@@ -924,7 +924,7 @@ export const KB_READ_BATCH_SPEC: AgentToolSpec = {
 export const KB_EDIT_DOC_SPEC: AgentToolSpec = {
   name: 'kb_edit_doc',
   label: '局部编辑草稿',
-  description: `对已有草稿做局部修改：服务端定位替换区间、继承未变声明（对象/断言/证据/呈现/关系自动平移坐标）。evidenceSelectorUpdates 可只替换证据范围；coverageUpdates 可按稳定 itemId 只修覆盖去向，无需手填整篇声明。三种更新至少提供一项。所有证据仍经冻结来源、读回执与声明解引用校验；修改使旧审查失效。expectedContentHash 不符说明草稿已变，需重读后重提。operationId 可省略，由 server 按载荷生成稳定幂等键；回执丢失时原样重放。对象身份或断言结构变化仍用 kb_write_doc 显式重申。`,
+  description: `对已有草稿做局部修改：服务端定位替换区间、继承未变声明（对象/断言/证据/呈现/关系自动平移坐标）。evidenceSelectorUpdates 只替换证据范围；coverageUpdates 按稳定 itemId 修覆盖去向；objectMerges 把本篇重复对象并入已有后继对象，由服务端移除旧对象及其证据并把覆盖映射转向后继，无需手填整篇声明。至少提供一项更新。所有证据仍经冻结来源、读回执与声明解引用校验；修改使旧审查失效。expectedContentHash 不符需重读后重提。operationId 可省略，由 server 按载荷生成稳定幂等键；回执丢失时原样重放。对象拆分或断言结构变化仍用 kb_write_doc 显式重申。`,
   parameters: {
     type: 'object',
     properties: {
@@ -968,6 +968,20 @@ export const KB_EDIT_DOC_SPEC: AgentToolSpec = {
             readReceiptId: string('可选：覆盖新 selector 的读取回执；省略则服务端在本构建回执中查找'),
           },
           required: ['evidenceId', 'selector'],
+          additionalProperties: false,
+        },
+      },
+      objectMerges: {
+        type: 'array', minItems: 1, maxItems: 20,
+        description: '可选：把本篇重复对象合并到已登记的后继对象。两者须有共同来源证据，且旧对象无其他对象的关系或呈现入边；服务端自动转移映射到旧对象的覆盖项并继承其余声明。',
+        items: {
+          type: 'object',
+          properties: {
+            fromObjectId: string('draft_read 返回的本篇旧对象 objectId'),
+            toObjectId: string('已有后继对象 objectId，可在对应草稿 draft_read 声明中获取'),
+            reason: string('合并原因与语义等价依据'),
+          },
+          required: ['fromObjectId', 'toObjectId', 'reason'],
           additionalProperties: false,
         },
       },

@@ -2057,7 +2057,8 @@ export class AgentToolService {
     context: InternalRunContext,
     args: Record<string, unknown>,
     meta?: ToolRequestMeta,
-    options?: { lockHeld?: boolean; recheck?: () => void; idempotency?: { payloadHash: string } },
+    options?: { lockHeld?: boolean; recheck?: () => void; idempotency?: { payloadHash: string };
+      objectMerges?: Array<{ fromObjectId: string; toObjectId: string }> },
   ): Promise<ToolResult> {
     const state = requireBuildState(context);
     // T3（A 案 §7.1）：审查者没有任何草稿写入口
@@ -2160,7 +2161,7 @@ export class AgentToolService {
       }
       // 声明解析与校验（写入即拒；正文尚未落盘，任何拒绝都不产生部分写入）
       const declaration = baseDraft
-        ? await this.buildKnowledgeDeclaration(context, state, baseDraft, docPath, docId, args, markdown, meta)
+        ? await this.buildKnowledgeDeclaration(context, state, baseDraft, docPath, docId, args, markdown, meta, options?.objectMerges ?? [])
         : null;
 
       const buildId = context.buildId ?? 'unknown';
@@ -2754,6 +2755,7 @@ export class AgentToolService {
     args: Record<string, unknown>,
     markdown: string,
     meta?: ToolRequestMeta,
+    objectMerges: readonly { fromObjectId: string; toObjectId: string }[] = [],
   ): Promise<{
     draft: KnowledgeDraftFile;
     objectIdMap: Record<string, string>;
@@ -2995,6 +2997,20 @@ export class AgentToolService {
           list.push(object.objectId);
           impactPriorFamilies.set(object.familyKey, list);
         }
+      }
+    }
+    for (const merge of objectMerges) {
+      if (!removedIds.has(merge.fromObjectId)) {
+        throw new ToolError('kb_object_merge_invalid', `待合并对象未从本篇声明移除: ${merge.fromObjectId}`, 409);
+      }
+      if (!draft.objects.some((object) => !object.tombstone && object.objectId === merge.toObjectId
+        && !removedIds.has(object.objectId))) {
+        throw new ToolError('kb_object_merge_invalid', `后继对象不存在或将被移除: ${merge.toObjectId}`, 409);
+      }
+      for (const item of draft.coverage) {
+        if (!item.targetObjectIds.includes(merge.fromObjectId)) continue;
+        item.targetObjectIds = [...new Set(item.targetObjectIds.map((id) =>
+          id === merge.fromObjectId ? merge.toObjectId : id))];
       }
     }
     // R2-F03-01 装配期旧族排他核权（判据与新族一致，均在任何证据装配
@@ -4662,9 +4678,43 @@ export class AgentToolService {
     const patchInputs = args.patches === undefined ? [] : requireArray(args, 'patches');
     const evidenceSelectorUpdates = args.evidenceSelectorUpdates === undefined ? [] : requireArray(args, 'evidenceSelectorUpdates');
     const coverageUpdates = args.coverageUpdates === undefined ? [] : requireArray(args, 'coverageUpdates');
-    if (patchInputs.length > 50 || evidenceSelectorUpdates.length > 20 || coverageUpdates.length > 20
-      || (patchInputs.length === 0 && evidenceSelectorUpdates.length === 0 && coverageUpdates.length === 0)) {
-      throw new ToolError('invalid_request', 'patches、evidenceSelectorUpdates 与 coverageUpdates 至少一项非空，且分别不超过 50/20/20 项');
+    const mergeInputs = args.objectMerges === undefined ? [] : requireArray(args, 'objectMerges');
+    if (patchInputs.length > 50 || evidenceSelectorUpdates.length > 20 || coverageUpdates.length > 20 || mergeInputs.length > 20
+      || (patchInputs.length === 0 && evidenceSelectorUpdates.length === 0 && coverageUpdates.length === 0 && mergeInputs.length === 0)) {
+      throw new ToolError('invalid_request', 'patches、evidenceSelectorUpdates、coverageUpdates 与 objectMerges 至少一项非空，且分别不超过 50/20/20/20 项');
+    }
+    const objectMerges: Array<{ fromObjectId: string; toObjectId: string; reason: string }> = [];
+    if (mergeInputs.length > 0) {
+      const draft = this.loadKnowledgeDraft(state);
+      const seen = new Set<string>();
+      for (const [index, raw] of mergeInputs.entries()) {
+        const input = asRecord(raw);
+        if (!input) throw new ToolError('invalid_request', `objectMerges[${index}] 必须是对象`);
+        const fromObjectId = requireString(input, 'fromObjectId', 1, 200);
+        const toObjectId = requireString(input, 'toObjectId', 1, 200);
+        const reason = requireString(input, 'reason', 4, 500);
+        if (fromObjectId === toObjectId || seen.has(fromObjectId)) {
+          throw new ToolError('kb_object_merge_invalid', `objectMerges[${index}] 对象相同或来源重复`, 409);
+        }
+        seen.add(fromObjectId);
+        const from = draft.objects.find((object) => !object.tombstone && object.objectId === fromObjectId
+          && object.canonical?.path === docPath);
+        const to = draft.objects.find((object) => !object.tombstone && object.objectId === toObjectId);
+        if (!from || !to) throw new ToolError('kb_object_merge_invalid', `合并对象必须是本篇现有对象与已登记后继对象: ${fromObjectId} → ${toObjectId}`, 409);
+        if (draft.relations.some((relation) => relation.toObjectId === fromObjectId && relation.fromObjectId !== fromObjectId)
+          || draft.presentations.some((presentation) => presentation.targetObjectId === fromObjectId && presentation.ownerObjectId !== fromObjectId)) {
+          throw new ToolError('kb_object_merge_invalid', `对象 ${fromObjectId} 被其他对象关系或呈现引用；请先处理引用，不能自动合并`, 409);
+        }
+        const successorSources = new Set(draft.evidence.filter((evidence) => evidence.objectId === toObjectId)
+          .map((evidence) => evidence.sourceRef.sourceId));
+        if (successorSources.size === 0 || !draft.evidence.some((evidence) => evidence.objectId === fromObjectId
+          && successorSources.has(evidence.sourceRef.sourceId))
+          || draft.coverage.some((item) => item.targetObjectIds.includes(fromObjectId)
+            && !successorSources.has(item.sourceRef.sourceId))) {
+          throw new ToolError('kb_object_merge_invalid', `对象 ${fromObjectId} 与后继 ${toObjectId} 缺少共同来源证据，不能自动转移覆盖项`, 409);
+        }
+        objectMerges.push({ fromObjectId, toObjectId, reason });
+      }
     }
     let current = [...coordinates.paramLines];
     const applied: Array<{ startLine: number; endLine: number; newLineCount: number; anchor: string }> = [];
@@ -4758,7 +4808,8 @@ export class AgentToolService {
     }
     const sources = [...new Set([...coordinates.sources, ...(sourcesAppend as string[])])];
     const inheritedDeclarations = this.inheritDeclarationsForEdit(state, docPath,
-      applied.map(({ startLine, endLine, newLineCount }) => ({ startLine, endLine, newLineCount })));
+      applied.map(({ startLine, endLine, newLineCount }) => ({ startLine, endLine, newLineCount })),
+      new Set(objectMerges.map((merge) => merge.fromObjectId)));
     const inheritedCoverage: Array<Record<string, unknown>> = [];
     if (coverageUpdates.length > 0) {
       const draft = this.loadKnowledgeDraft(state);
@@ -4778,6 +4829,10 @@ export class AgentToolService {
         if (update.category !== undefined && update.category !== old.category)
           throw new ToolError('kb_coverage_invalid', `覆盖项 ${itemId} 的分类不可变`);
         const disposition = requireString(update, 'disposition', 1, 40);
+        if (old.importance === 'important' && old.disposition === 'mapped'
+          && old.targetObjectIds.length > 0 && disposition === 'excluded_nonknowledge') {
+          throw new ToolError('kb_coverage_invalid', `覆盖项 ${itemId} 已映射重要知识，不能用 excluded_nonknowledge 绕过对象归属；重复对象请用 objectMerges 转移映射，真正来源更正须在重新审查中处理`, 409);
+        }
         const targetKeys = update.targetKeys === undefined ? old.targetObjectIds : optStrArray(update, 'targetKeys') ?? [];
         for (const key of targetKeys) {
           const id = draft.clientKeys[key] ?? key;
@@ -4850,15 +4905,17 @@ export class AgentToolService {
           lockHeld: true,
           recheck: () => this.assertV2WriteWindow(v2Info.v2, v2Info.actor!.nativeTaskId, meta, docPath),
           idempotency: { payloadHash: v2Info.payloadHash },
+          objectMerges,
         }
-        : {}),
+        : { objectMerges }),
     });
     const affectedObjects = (writeArgs.objects as Array<Record<string, unknown>> | undefined)?.length ?? 0;
     const enriched: ToolResult = {
       content: result.content,
       details: {
         ...(result.details ?? {}),
-        edit: { operationId, patches: applied, affectedObjects, inheritedDeclarations: affectedObjects > 0 },
+        edit: { operationId, patches: applied, affectedObjects, inheritedDeclarations: affectedObjects > 0,
+          objectMerges: objectMerges.map(({ fromObjectId, toObjectId, reason }) => ({ fromObjectId, toObjectId, reason })) },
       },
     };
     if (v2Info?.actor) {
@@ -4929,11 +4986,13 @@ export class AgentToolService {
     state: BuildRunState,
     docPath: string,
     patches: Array<{ startLine: number; endLine: number; newLineCount: number }>,
+    excludedObjectIds: ReadonlySet<string> = new Set(),
   ): Record<string, unknown> {
     const draftFile = path.join(state.stagingRoot, 'knowledge-draft.json');
     if (!state.knowledgeDraft && !fs.existsSync(draftFile)) return {};
     const draft = this.loadKnowledgeDraft(state);
-    const objects = draft.objects.filter((object) => !object.tombstone && object.canonical?.path === docPath);
+    const objects = draft.objects.filter((object) => !object.tombstone && object.canonical?.path === docPath
+      && !excludedObjectIds.has(object.objectId));
     if (objects.length === 0) return {};
     const ids = new Set(objects.map((object) => object.objectId));
     const keysById = new Map<string, string>();

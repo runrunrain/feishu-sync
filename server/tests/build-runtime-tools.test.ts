@@ -431,7 +431,7 @@ describe('写入链（§4.2/§4.4）', () => {
 });
 
 describe('kb_edit_doc（§7 局部编辑）', () => {
-  async function writeDraftWithObject(setup: V2Setup, taskId: string, withCoverage = false): Promise<void> {
+  async function writeDraftWithObject(setup: V2Setup, taskId: string, withCoverage = false, mergeTarget = false): Promise<void> {
     await call(setup.leader.token, 'build_assign_output', { ownerTaskId: taskId, targets: ['docs/edit.md'] });
     // 先 raw_read 拿真实回执（证据声明 hard 约束：text_span 必须带 readReceiptId）
     const read = await call(setup.child.token, 'raw_read', { objToken: 'tokA', limit: 10 }, meta(taskId, 'luban'));
@@ -452,7 +452,10 @@ describe('kb_edit_doc（§7 局部编辑）', () => {
         scopeKey: 'scope',
         scopeText: '范围',
         headingPath: ['目标节'],
-      }],
+      }, ...(mergeTarget ? [{
+        clientKey: 'obj-successor', type: 'concept', title: '后继对象', familyKey: 'fam-successor',
+        variantKey: 'default', scopeKey: 'scope', scopeText: '范围', headingPath: ['其他节'],
+      }] : [])],
       evidenceClaims: [{
         clientKey: 'ev-1',
         objectKey: 'obj-main',
@@ -462,9 +465,15 @@ describe('kb_edit_doc（§7 局部编辑）', () => {
         role: 'supports',
         nature: 'direct',
         readReceiptId,
-      }],
+      }, ...(mergeTarget ? [{
+        clientKey: 'ev-successor', objectKey: 'obj-successor', claimKey: 'no-claim',
+        sourceRef: { sourceId: 'tokA', resourceId: 'tokA' },
+        selector: { kind: 'text_span', lineStart: 3, lineEnd: 3 },
+        role: 'supports', nature: 'direct', readReceiptId,
+      }] : [])],
       ...(withCoverage ? { coverageUpdates: [{ itemId: 'cov-main', sourceId: 'tokA', category: 'rule',
-        importance: 'important', disposition: 'unresolved', reason: '待映射' }] } : {}),
+        importance: 'important', disposition: mergeTarget ? 'mapped' : 'unresolved',
+        ...(mergeTarget ? { targetKeys: ['obj-main'] } : { reason: '待映射' }) }] } : {}),
     }, meta(taskId, 'luban'));
     expect(write.details!.objectMap).toBeTruthy();
   }
@@ -586,6 +595,31 @@ describe('kb_edit_doc（§7 局部编辑）', () => {
       path: 'docs/edit.md', operationId: 'op-coverage-bad',
       coverageUpdates: [{ itemId: 'cov-main', sourceId: 'other', disposition: 'mapped', targetKeys: ['obj-main'] }],
     }, meta('w1', 'luban')), 'kb_coverage_invalid');
+  });
+
+  it('重复对象局部合并由服务端转移覆盖映射，不重填整篇声明或虚假排除', async () => {
+    const setup = makeV2('b-edit-merge');
+    setup.store.registerTaskCreation({ nativeTaskId: 'w1', requestedRole: 'luban' });
+    await writeDraftWithObject(setup, 'w1', true, true);
+    const draftPath = path.join(setup.state.stagingRoot, 'knowledge-draft.json');
+    const before = JSON.parse(fs.readFileSync(draftPath, 'utf-8'));
+    const fromObjectId = before.clientKeys['obj-main'] as string;
+    const toObjectId = before.clientKeys['obj-successor'] as string;
+    await expectToolError(() => call(setup.child.token, 'kb_edit_doc', {
+      path: 'docs/edit.md', operationId: 'op-false-exclusion',
+      coverageUpdates: [{ itemId: 'cov-main', disposition: 'excluded_nonknowledge', reason: '已转到别篇' }],
+    }, meta('w1', 'luban')), 'kb_coverage_invalid');
+    const result = await call(setup.child.token, 'kb_edit_doc', {
+      path: 'docs/edit.md', operationId: 'op-merge',
+      objectMerges: [{ fromObjectId, toObjectId, reason: '同源重复对象由后继持有规则' }],
+    }, meta('w1', 'luban'));
+    expect(result.details?.edit).toMatchObject({ objectMerges: [{ fromObjectId, toObjectId }] });
+    const after = JSON.parse(fs.readFileSync(draftPath, 'utf-8'));
+    expect(after.objects.some((object: { objectId: string }) => object.objectId === fromObjectId)).toBe(false);
+    expect(after.objects.some((object: { objectId: string }) => object.objectId === toObjectId)).toBe(true);
+    expect(after.coverage.find((item: { itemId: string }) => item.itemId === 'cov-main'))
+      .toMatchObject({ disposition: 'mapped', targetObjectIds: [toObjectId] });
+    expect(after.evidence.some((evidence: { objectId: string }) => evidence.objectId === fromObjectId)).toBe(false);
   });
 
   it('expectedContentHash 防漂移：草稿已变 → 结构化冲突；幂等键不漂移（排除该字段）', async () => {
