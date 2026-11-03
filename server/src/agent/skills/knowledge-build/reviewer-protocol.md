@@ -13,7 +13,7 @@
 - 先按文档和来源分段读取正文，单次 `kb_read_batch` 控制在约 120 行。先完成正文与来源的事实、数值、条件、遗漏和术语核对，记录**发现的差异**，不要在推理中逐行重建全文或枚举所有证据声明。应用发布门会校验声明的结构与引用有效性；只有正文对照发现具体对象、归属或证据疑点时，才用 `includeDeclarations=true` 定位核实。大型声明会先返回 `summaryOnly` 索引；用 `declarationObjectKey` 或 `declarationClaimKey` 取对应详情，不读取 Pi 截断输出保存的临时文件。声明读取不能随正文分页，避免为了无明确疑点的全面重算而消耗完整输出预算。
 - 对「全部记录」「所有列」「无缺号」等全称断言，用 `draft_read` 的 `includeDeclarations=true` 和 `declarationClaimKey=<对应 claimKey>` 只读取该断言的对象与证据，复核 selector 的行列范围是否覆盖正文所说的完整范围；首尾与中间抽样不支持全称结论。事实在源中为真也不能代替可追溯的完整证据范围；即使上一轮审查曾放行，也须以当前声明为准。若工具输出被截断或具体 selector 未成功读到，不得提交 `pass`；改用上述筛选读取，仍不可得时报告未核范围。不要为单个疑点获取整篇声明，更不要以 `kb_read_batch` 的 `limit=1` 重复获取整篇声明。
 - 复核图片事实时，`raw_read` 的 `<image_description>`/`<whiteboard_text>` 是临时插入的派生展示段，不能用它们的输出行号去修 `text_span`。图片描述及白板原始节点文字所支持的事实应有图片资源上的 `media_region` 且 `nature=machine_description`；白板旁路文字不能证明图形布局。若仅有正文 `text_span`，指出应改为图片资源证据，不建议把 selector 改到派生展示行。
-- 复核 CSV `csv_cells` 列位时，使用 `raw_csv_cells(objToken, resourceId, recordStart, recordEnd)` 读取服务端解析的准确 `@A/@B/...` 单元格；引号内换行属于同一逻辑 record，不靠目测前导逗号判断列位。返回的读取回执可用于该物理行范围内的证据核验。
+- 复核 CSV `csv_cells` 支撑内容时，先用 `raw_csv_find(objToken, resourceId, queries)` 批量定位断言短语并取得准确 selector/回执；再用 `raw_csv_cells(objToken, resourceId, recordStart, recordEnd)` 核对原 selector 选中的单元格。引号内换行属于同一逻辑 record，不靠目测前导逗号判断列位，也不能把物理行号当成 record。
 
 ## 输出
 

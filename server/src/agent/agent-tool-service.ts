@@ -57,6 +57,7 @@ import {
   RAW_READ_IMAGE_SPEC,
   RAW_READ_SPEC,
   RAW_CSV_CELLS_SPEC,
+  RAW_CSV_FIND_SPEC,
   RAW_SEARCH_SPEC,
   WS_EDIT_SPEC,
   WS_LS_SPEC,
@@ -599,6 +600,7 @@ export class AgentToolService {
         // T3（A 案 §5.3）：raw_read build 态返回 segmentMap/资源表并登记读取回执
         { spec: RAW_READ_SPEC, runKinds: ['build', 'work', 'discuss'], execute: (context, args, meta) => this.toolRawRead(context, args, meta) },
         { spec: RAW_CSV_CELLS_SPEC, runKinds: ['build'], execute: (context, args, meta) => this.toolRawCsvCells(context, args, meta) },
+        { spec: RAW_CSV_FIND_SPEC, runKinds: ['build'], execute: (context, args, meta) => this.toolRawCsvFind(context, args, meta) },
         { spec: RAW_SEARCH_SPEC, runKinds: ['build', 'work', 'discuss'], execute: (context, args) => this.toolRawSearch(context, args) },
         // P1-S4（§2.4）：引用关系查询（只读），Discuss/Work/构建均可用
         { spec: RAW_LINKS_SPEC, runKinds: ['build', 'work', 'discuss'], execute: (context, args) => this.toolRawLinks(context, args) },
@@ -1292,6 +1294,77 @@ export class AgentToolService {
       content: [{ type: 'text', text: `<read_receipt id="${readReceiptId}" resource_id="${resourceId}" lines="${lineStart}-${lineEnd}" />\n<untrusted_source>\n${serialized}\n</untrusted_source>` }],
       details: { readReceiptId, resourceId, lineStart, lineEnd, recordStart, recordEnd, totalRecords: parsed.records.length },
     };
+  }
+
+  /** Batch phrase lookup over parsed cells. It gives the model an exact selector
+   * and read receipt, leaving semantic relevance to the writer or reviewer. */
+  private toolRawCsvFind(context: InternalRunContext, args: Record<string, unknown>, meta?: ToolRequestMeta): ToolResult {
+    const state = requireBuildState(context);
+    const objToken = requireString(args, 'objToken', 1, 256);
+    const resourceId = requireString(args, 'resourceId', 1, 512);
+    const queries = requireArray(args, 'queries');
+    if (queries.length < 1 || queries.length > 8 || queries.some((value) => typeof value !== 'string' || value.trim().length < 3 || value.length > 200)) {
+      throw new ToolError('invalid_request', 'queries 须为 1–8 个长度 3–200 的非空短语');
+    }
+    const entry = state.snapshot.get(objToken);
+    if (!entry) throw new ToolError('not_found', `原始文档不存在或无成功本地版本: ${objToken}`, 404);
+    const assembled = this.assembleBuildRead(state, entry);
+    const resource = assembled.resources.find((item) => item.resourceId === resourceId && item.kind === 'csv');
+    if (!resource) throw new ToolError('not_found', `冻结源没有该 CSV 资源: ${resourceId}`, 404);
+    const parsed = parseCsvRecords(resource.lines.join('\n'));
+    const columnName = (index: number): string => {
+      let n = index + 1;
+      let name = '';
+      while (n > 0) { n -= 1; name = String.fromCharCode(65 + n % 26) + name; n = Math.floor(n / 26); }
+      return `@${name}`;
+    };
+    const receiptByRecord = new Map<number, string>();
+    const results = (queries as string[]).map((rawQuery) => {
+      const query = rawQuery.trim();
+      const matches: Array<Record<string, unknown>> = [];
+      let totalMatches = 0;
+      for (let recordIndex = 0; recordIndex < parsed.records.length; recordIndex += 1) {
+        const fields = parsed.records[recordIndex]!;
+        for (let column = 0; column < fields.length; column += 1) {
+          const value = fields[column]!;
+          const foundAt = value.indexOf(query);
+          if (foundAt < 0) continue;
+          totalMatches += 1;
+          if (matches.length >= 5) continue;
+          const recordNumber = recordIndex + 1;
+          const span = parsed.recordSpans[recordIndex]!;
+          const lineStart = span.startLine;
+          const lineEnd = span.startLine + span.lineCount - 1;
+          let readReceiptId = receiptByRecord.get(recordNumber);
+          if (!readReceiptId) {
+            readReceiptId = `rr_${crypto.randomBytes(9).toString('hex')}`;
+            receiptByRecord.set(recordNumber, readReceiptId);
+            this.appendReadReceipts(state, [{
+              readReceiptId,
+              buildId: context.buildId ?? 'unknown',
+              unitId: context.options.worker?.unitId ?? null,
+              toolCallId: meta?.toolCallId ?? 'unknown',
+              sourceSnapshotHash: entry.contentHash,
+              resourceId,
+              selector: { kind: 'read_range', lineStart, lineEnd },
+              returnedHash: contentResourceHash(resource.lines.slice(lineStart - 1, lineEnd).join('\n')),
+              truncated: false,
+            }]);
+          }
+          matches.push({
+            recordNumber, column: columnName(column), physicalLineStart: lineStart, physicalLineEnd: lineEnd,
+            readReceiptId,
+            selector: { kind: 'csv_cells', resourcePath: resource.label, parserVersion: 'rfc4180-v1',
+              recordStart: recordNumber, recordEnd: recordNumber, columns: [columnName(column)] },
+            valuePreview: value.length <= 300 ? value : `${value.slice(Math.max(0, foundAt - 80), foundAt + query.length + 120)}…`,
+          });
+        }
+      }
+      return { query, totalMatches, matches };
+    });
+    const payload = { objToken, resourceId, resourceHash: resource.resourceHash,
+      totalRecords: parsed.records.length, results };
+    return { content: [{ type: 'text', text: `<untrusted_source>\n${JSON.stringify(payload)}\n</untrusted_source>` }], details: payload };
   }
 
   /** raw_read 输出渲染（build 态附 segmentMap/资源表/回执；末页引用块共用）。 */
@@ -5550,6 +5623,8 @@ function summarizeArgs(toolName: string, args: Record<string, unknown>): string 
       return `objToken=${String(args.objToken ?? '')}`;
     case 'raw_csv_cells':
       return `objToken=${String(args.objToken ?? '')} resourceId=${String(args.resourceId ?? '')} records=${String(args.recordStart ?? '')}..${String(args.recordEnd ?? '')}`;
+    case 'raw_csv_find':
+      return `objToken=${String(args.objToken ?? '')} resourceId=${String(args.resourceId ?? '')} queries=${Array.isArray(args.queries) ? args.queries.length : 0}`;
     case 'raw_links':
       return `objToken=${String(args.objToken ?? '')} direction=${String(args.direction ?? 'both')}`;
     case 'raw_read_image':
@@ -5596,6 +5671,7 @@ const READONLY_TOOL_NAMES: ReadonlySet<string> = new Set<string>([
   'raw_search',
   'raw_read',
   'raw_csv_cells',
+  'raw_csv_find',
   'raw_links',
   'raw_list',
   'raw_comments',

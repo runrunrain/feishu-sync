@@ -126,6 +126,23 @@ export const RAW_CSV_CELLS_SPEC: AgentToolSpec = {
   },
 };
 
+export const RAW_CSV_FIND_SPEC: AgentToolSpec = {
+  name: 'raw_csv_find',
+  label: '冻结 CSV 内容定位',
+  description: '在冻结 CSV 的已解析单元格中批量查找短语，返回准确逻辑 record、@列、物理行和读取回执。无需模型手数 CSV 逗号或把物理行猜成 record。',
+  parameters: {
+    type: 'object',
+    properties: {
+      objToken: string('源文档 objToken'),
+      resourceId: string('raw_read 资源表中的完整 #csv: 资源 ID'),
+      queries: { type: 'array', items: { type: 'string', minLength: 3, maxLength: 200 }, minItems: 1, maxItems: 8,
+        description: '待定位的源文短语，逐格子串匹配；每项最多返回前 5 处' },
+    },
+    required: ['objToken', 'resourceId', 'queries'],
+    additionalProperties: false,
+  },
+};
+
 export const RAW_LIST_SPEC: AgentToolSpec = {
   name: 'raw_list',
   label: '原始源清单',
@@ -1202,6 +1219,7 @@ const ALL_SPECS: AgentToolSpec[] = [
   RAW_SEARCH_SPEC,
   RAW_READ_SPEC,
   RAW_CSV_CELLS_SPEC,
+  RAW_CSV_FIND_SPEC,
   RAW_LINKS_SPEC,
   RAW_LIST_SPEC,
   RAW_COMMENTS_SPEC,

@@ -636,6 +636,33 @@ describe('kb_write_doc：原子落盘与声明', () => {
     })).rejects.toThrow(/选中的单元格全为空.*逻辑 record 2–3/);
   });
 
+  it('批量查找冻结 CSV 短语并返回可直接使用的准确 selector 和回执', async () => {
+    const state = makeBuildState('csv-find');
+    const result = await service.executeTool(tokenFor(state), 'raw_csv_find', {
+      objToken: 'tokB', resourceId: 'tokB#csv:表.csv', queries: ['多行\n内容', '不存在'],
+    });
+    const details = result.details as { results: Array<{ totalMatches: number; matches: Array<{
+      recordNumber: number; column: string; readReceiptId: string; selector: Record<string, unknown>;
+    }> }> };
+    expect(details.results[0]!.totalMatches).toBe(1);
+    expect(details.results[0]!.matches[0]).toMatchObject({
+      recordNumber: 2, column: '@B', selector: { kind: 'csv_cells', resourcePath: CSV_NAME,
+        recordStart: 2, recordEnd: 2, columns: ['@B'] },
+    });
+    expect(details.results[0]!.matches[0]!.readReceiptId).toMatch(/^rr_/);
+    expect(details.results[1]!.totalMatches).toBe(0);
+    const match = details.results[0]!.matches[0]!;
+    const written = await service.executeTool(tokenFor(state), 'kb_write_doc', {
+      path: '战斗/查找证据.md', markdown: '## 查找证据\n包含多行内容。',
+      sources: ['tokB'], summary: '查找证据测试',
+      objects: [{ clientKey: 'value', type: 'data_structure', title: '查找证据', familyKey: 'found-value',
+        scopeText: '多行内容', claims: [{ claimKey: 'value-cell' }] }],
+      evidenceClaims: [{ objectKey: 'value', claimKey: 'value-cell', selector: match.selector,
+        readReceiptId: match.readReceiptId }],
+    });
+    expect(written.content[0]!.text).toContain('已写入草稿');
+  });
+
   it('CSV 行由服务端导入正文并登记覆盖整表的真实回执', async () => {
     const state = makeBuildState('scripted-csv-table');
     const token = tokenFor(state);
@@ -1249,7 +1276,7 @@ describe('kb_submit_review：报告绑定与审查者写入口封锁', () => {
     const reviewToken = tokenFor(state, { workerId: 'wr', unitId: 'u1', phase: 'review' });
     const context = service.getContext(reviewToken)!;
     // v2（§7）kb_read_batch 追加进 build 基线面（旧模式也可用；末尾追加）
-    expect(context.allowedTools).toEqual([...toolsForRunKind('build'), 'raw_csv_cells', 'kb_read_batch']);
+    expect(context.allowedTools).toEqual([...toolsForRunKind('build'), 'raw_csv_cells', 'raw_csv_find', 'kb_read_batch']);
     expect(context.allowedTools).toContain('kb_submit_review');
     expect(context.allowedTools).toContain('kb_write_doc');
     await expect(service.executeTool(reviewToken, 'kb_write_doc', BASE_WRITE))
