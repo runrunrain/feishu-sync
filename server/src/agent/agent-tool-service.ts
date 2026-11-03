@@ -487,7 +487,7 @@ export interface VisionDescriberLike {
   status(): Promise<{ state: 'disabled' | 'ready' | 'invalid'; model: string | null; message: string }>;
   lookup(imageHash: string): Promise<string | null>;
   describeOne(file: string, src: string, signal?: AbortSignal): Promise<ImageDescription>;
-  describeMany(items: Array<{ file: string; src: string }>, opts: { signal: AbortSignal; onProgress: (p: { done: number; total: number }) => void; refreshCached?: boolean }): Promise<Map<string, ImageDescription>>;
+  describeMany(items: Array<{ file: string; src: string }>, opts: { signal: AbortSignal; onProgress: (p: { done: number; total: number; described?: number; cached?: number; unavailable?: number }) => void; refreshCached?: boolean }): Promise<Map<string, ImageDescription>>;
 }
 
 function publishValidationIssues(result: Record<string, unknown> | null): Array<{ path: string; code: string; message: string }> {

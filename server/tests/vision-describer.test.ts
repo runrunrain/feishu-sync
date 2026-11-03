@@ -329,7 +329,7 @@ describe('VisionDescriber.describeMany', () => {
     // 预热 A 的缓存
     await describer.describeOne(fileA, 'images/a');
 
-    const progress: Array<{ done: number; total: number }> = [];
+    const progress: Array<{ done: number; total: number; described?: number; cached?: number; unavailable?: number }> = [];
     const results = await describer.describeMany(
       [
         { file: fileA, src: 'images/a' },
@@ -342,7 +342,7 @@ describe('VisionDescriber.describeMany', () => {
     expect(fixture.count()).toBe(2); // 预热 1 次 + describeMany 只补 B
     const dones = progress.map((p) => p.done);
     expect([...dones].sort((x, y) => x - y)).toEqual(dones);
-    expect(progress.at(-1)).toEqual({ done: 2, total: 2 });
+    expect(progress.at(-1)).toEqual({ done: 2, total: 2, described: 1, cached: 1, unavailable: 0 });
   });
 
   it('maxImagesPerBuild=0 → 未缓存全部标 limit，不触网', async () => {

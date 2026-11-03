@@ -3447,7 +3447,17 @@ export class KbBuildService extends EventEmitter {
       : `图片预描述：${items.length} 张（命中缓存不调远端）`);
     const composed = await input.describer.describeMany(
       items.map((item) => ({ file: item.file, src: `${item.objToken}::${item.src}` })),
-      { signal: input.signal, onProgress: () => undefined, refreshCached: input.entry.refreshImages },
+      { signal: input.signal, onProgress: (progress) => {
+        // The panel polls this in-memory DTO during preflight. A large image
+        // batch must show completed/cache/unavailable counts as calls settle,
+        // rather than staying at 0 until the last remote request returns.
+        input.entry.images = {
+          total: progress.total,
+          described: progress.described ?? input.entry.images.described,
+          cached: progress.cached ?? input.entry.images.cached,
+          unavailable: progress.unavailable ?? input.entry.images.unavailable,
+        };
+      }, refreshCached: input.entry.refreshImages },
     );
     let described = 0;
     let cached = 0;

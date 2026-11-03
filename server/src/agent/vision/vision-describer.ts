@@ -300,7 +300,7 @@ export class VisionDescriber {
    */
   async describeMany(
     items: Array<{ file: string; src: string }>,
-    opts: { signal: AbortSignal; onProgress: (p: { done: number; total: number }) => void; refreshCached?: boolean },
+    opts: { signal: AbortSignal; onProgress: (p: { done: number; total: number; described?: number; cached?: number; unavailable?: number }) => void; refreshCached?: boolean },
   ): Promise<Map<string, ImageDescription>> {
     const results = new Map<string, ImageDescription>();
     const context = await this.resolveContext();
@@ -308,7 +308,15 @@ export class VisionDescriber {
     const vision: AgentVisionConfig = config.agent?.vision ?? buildDefaultAgentVisionConfig();
     let done = 0;
     const total = items.length;
-    const progress = () => opts.onProgress({ done, total });
+    const progress = () => {
+      let described = 0; let cached = 0; let unavailable = 0;
+      for (const result of results.values()) {
+        if (result.state === 'described') described += 1;
+        else if (result.state === 'cached') cached += 1;
+        else unavailable += 1;
+      }
+      opts.onProgress({ done, total, described, cached, unavailable });
+    };
     const quota = Math.max(0, Math.min(vision.maxImagesPerBuild, 5000));
     const maxBytes = Math.min(vision.maxImageBytes, 20 * 1024 * 1024);
 
