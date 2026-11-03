@@ -411,8 +411,8 @@ function normalizeStandardKbConfigLoose(value: unknown, dataRoot: string): Stand
     reviewPolicy: normalizeReviewPolicyLoose(raw.reviewPolicy, base.reviewPolicy),
     // B案 §7：发布方式（非法值回落默认 auto）
     publishMode: raw.publishMode === 'confirm' ? 'confirm' : 'auto',
-    // D3（A 案 §5.4）：证据资源预算（非数字/非法保持 undefined → 缺省
-    // 20MB，resolveEvidenceBudgetBytes 统一解析）
+    // D3（A 案 §5.4）：证据资源预算（非数字/非法保持 undefined →
+    // 发布时按冻结工作集来源数使用默认额度）
     evidenceBudgetBytes: typeof raw.evidenceBudgetBytes === 'number' && Number.isFinite(raw.evidenceBudgetBytes)
       ? Math.max(EVIDENCE_BUDGET_MIN_BYTES, Math.min(EVIDENCE_BUDGET_MAX_BYTES, Math.floor(raw.evidenceBudgetBytes)))
       : undefined,

@@ -42,6 +42,17 @@ describe('incremental evidence budget', () => {
     });
     expect(evidenceBudgetForPublication({ ...input, config: { evidenceBudgetBytes: 1024 * 1024 } })).toEqual({ limit: 1024 * 1024 });
     expect(evidenceBudgetForPublication({ ...input, mode: 'full', config: {} })).toEqual({ limit: DEFAULT_EVIDENCE_BUDGET_BYTES });
+    expect(evidenceBudgetForPublication({ ...input, buildSourceCount: 1, config: {} })).toEqual({
+      limit: 18 * 1024 * 1024 + 200 + 64 * 1024 * 1024,
+      originBytes: 18 * 1024 * 1024 + 200,
+    });
+    expect(evidenceBudgetForPublication({ ...input, buildSourceCount: 19, config: {} })).toEqual({
+      limit: 18 * 1024 * 1024 + 200 + 19 * 8 * 1024 * 1024,
+      originBytes: 18 * 1024 * 1024 + 200,
+    });
+    expect(evidenceBudgetForPublication({ ...input, buildSourceCount: 19, config: { evidenceBudgetBytes: 1024 * 1024 } })).toEqual({ limit: 1024 * 1024 });
+    expect(evidenceBudgetForPublication({ ...input, mode: 'full', buildSourceCount: 19, config: {} })).toEqual({ limit: 19 * 8 * 1024 * 1024 });
+    expect(evidenceBudgetForPublication({ ...input, mode: 'full', buildSourceCount: 1000, config: {} })).toEqual({ limit: 2 * 1024 * 1024 * 1024 });
     fs.rmSync(path.join(root, 'releases', 'origin'), { recursive: true });
     expect(evidenceBudgetForPublication({ ...input, config: {} })).toEqual({
       limit: 18 * 1024 * 1024 + 500 + DEFAULT_EVIDENCE_BUDGET_BYTES,

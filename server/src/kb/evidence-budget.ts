@@ -57,12 +57,23 @@ export function evidenceBudgetForPublication(input: {
   outputRoot: string;
   baseReleaseId: string | null;
   buildId: string;
+  /** Frozen workset size, shared by all progressive publications of this build. */
+  buildSourceCount?: number;
 }): { limit: number; originBytes?: number } {
   const configured = resolveEvidenceBudgetBytes(input.config);
   // An explicit limit keeps its original absolute per-release meaning.
-  if (input.config?.evidenceBudgetBytes !== undefined || input.mode !== 'incremental') return { limit: configured };
+  if (input.config?.evidenceBudgetBytes !== undefined) return { limit: configured };
+  // A fixed 20 MiB limit blocks valid image-rich documents in a large batch.
+  // Allow 64 MiB for a single visual source, then 8 MiB per selected source;
+  // retain the hard 2 GiB ceiling and the legacy default when no workset is
+  // available (e.g. direct publication tests and older callers).
+  const count = input.buildSourceCount;
+  const allowance = Number.isSafeInteger(count) && count! > 0
+    ? Math.min(EVIDENCE_BUDGET_MAX_BYTES, Math.max(64 * 1024 * 1024, count! * 8 * 1024 * 1024))
+    : DEFAULT_EVIDENCE_BUDGET_BYTES;
+  if (input.mode !== 'incremental') return { limit: allowance };
   // The default is a per-build allowance above the immutable origin. Following
   // the release chain avoids resetting that allowance after each stage.
   const carried = originEvidenceBytes(input.outputRoot, input.baseReleaseId, input.buildId);
-  return { limit: Math.min(EVIDENCE_BUDGET_MAX_BYTES, carried + DEFAULT_EVIDENCE_BUDGET_BYTES), originBytes: carried };
+  return { limit: Math.min(EVIDENCE_BUDGET_MAX_BYTES, carried + allowance), originBytes: carried };
 }

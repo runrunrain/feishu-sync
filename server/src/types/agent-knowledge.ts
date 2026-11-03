@@ -130,8 +130,8 @@ export interface StandardKbConfig {
    * 'confirm' 只在最终候选版本就绪后确认一次（绑定候选版本）。 */
   publishMode?: 'auto' | 'confirm';
   /** D3（A 案 §5.4）：显式配置时为单 release 证据资源总量上限。
-   * 未设时增量构建按原始发布基线额外预留 20 MiB，避免已发布资源占满
-   * 后续阶段发布额度；完整重建仍使用 20 MiB。超限阻断发布。 */
+   * 未设时按本次构建的冻结来源数分配额度；增量构建在原始发布基线
+   * 上增加该额度。超限仍阻断发布。 */
   evidenceBudgetBytes?: number;
   /** 第一阶段固定 false（字段预留） */
   autoBuildAfterSync: boolean;

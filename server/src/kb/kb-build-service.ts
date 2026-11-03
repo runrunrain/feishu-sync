@@ -1788,6 +1788,7 @@ export class KbBuildService extends EventEmitter {
       const changePreview = sourceChangePreview(snapshot, sourceContents, baseManifest,
         versionStore.readSourceContents(baseReleaseId), new Set(this.deps.excludedSourcesProvider?.() ?? []));
       await this.publishRelease({ buildId, releaseId, mode: 'incremental', baseReleaseId,
+        buildSourceCount: state.workset.size,
         knowledgeBaseRoot: config.knowledgeBaseRoot, model: ctx.model, snapshot,
         stagingRoot: tempRoot, outputRoot, docMeta: stageMeta, sourceContents, changePreview,
         imageDescriptions: state.imageDescriptions, whiteboardTexts: state.whiteboardTexts, summary: candidate.changeSummary,
@@ -1980,6 +1981,7 @@ export class KbBuildService extends EventEmitter {
       const authorityLease = (request as { authorityLease?: { validate: () => void } }).authorityLease;
       const manifest = await this.publishRelease({
         buildId: request.buildId,
+        buildSourceCount: buildState.workset.size,
         releaseId,
         mode: ctx.effectiveMode,
         baseReleaseId: ctx.baseReleaseId,
@@ -3067,6 +3069,7 @@ export class KbBuildService extends EventEmitter {
       }
       const manifest = await this.publishRelease({
         buildId,
+        buildSourceCount: buildState.workset.size,
         releaseId,
         mode: effectiveMode,
         baseReleaseId: baseManifest?.releaseId ?? null,
@@ -6420,6 +6423,7 @@ export class KbBuildService extends EventEmitter {
     try {
       manifest = await this.publishRelease({
         buildId,
+        buildSourceCount: checkpoint.workset.length,
         releaseId,
         mode: checkpoint.mode,
         baseReleaseId: checkpoint.baseReleaseId,
@@ -6443,6 +6447,7 @@ export class KbBuildService extends EventEmitter {
       this.freezeOrRefreshGovernanceSnapshot(buildId, outputRoot, stagingRoot, true);
       manifest = await this.publishRelease({
         buildId,
+        buildSourceCount: checkpoint.workset.length,
         releaseId,
         mode: checkpoint.mode,
         baseReleaseId: checkpoint.baseReleaseId,
@@ -6665,6 +6670,7 @@ export class KbBuildService extends EventEmitter {
   /** 发布 release（public 供单测：manifest 生成 + 原子 CURRENT + 保留策略）。 */
   async publishRelease(input: {
     buildId: string;
+    buildSourceCount?: number;
     releaseId: string;
     mode: 'incremental' | 'full';
     baseReleaseId: string | null;
@@ -6748,6 +6754,7 @@ export class KbBuildService extends EventEmitter {
    */
   private async prepareKnowledgePublish(input: {
     buildId: string;
+    buildSourceCount?: number;
     releaseId: string;
     mode: 'incremental' | 'full';
     stagingRoot: string;
@@ -7100,6 +7107,7 @@ export class KbBuildService extends EventEmitter {
       outputRoot: input.outputRoot,
       baseReleaseId: input.baseReleaseId,
       buildId: input.buildId,
+      buildSourceCount: input.buildSourceCount,
     });
     const evidenceBudget = budget.limit;
     if (evidencePlan.totalBytes > evidenceBudget) {
@@ -7263,6 +7271,7 @@ export class KbBuildService extends EventEmitter {
     //（发布正文为编译产物；staging 草稿保留供恢复）；无声明 → v1 不变。
     const knowledgePlan = await this.prepareKnowledgePublish({
       buildId: input.buildId,
+      buildSourceCount: input.buildSourceCount,
       releaseId,
       mode: input.mode,
       stagingRoot,
