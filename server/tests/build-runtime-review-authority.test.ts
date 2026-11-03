@@ -179,6 +179,23 @@ afterAll(() => {
 });
 
 describe('F07/F08：真实 objects/claims/readReceipt → 默认审查 → 发布成功链', () => {
+  it('增量候选只要求本轮工作集来源的去向，不要求旧权限占位源', async () => {
+    const fixture = makeFixture('candidate-workset-disposition');
+    await writeDeclaredDoc(fixture);
+    fs.writeFileSync(path.join(kbRoot, 'old-denied.md'), '该文档在飞书侧权限受限。API 返回 40403 no permission，请向文档所有者申请权限。');
+    fixture.state.snapshot = RawSourceSnapshot.fromEntries([
+      ...fixture.state.snapshot.entries,
+      { objToken: 'oldDenied', objType: 'docx', title: '旧权限源', relPath: 'old-denied.md',
+        contentHash: computeSourceHash(path.join(kbRoot, 'old-denied.md'), [], kbRoot), objEditTime: null },
+    ], { knowledgeBaseRoot: kbRoot, sheetCsvPaths: () => [] });
+    const assembled = (buildService as unknown as { assembleCandidateRelease: (input: unknown) => { candidate: { sourceDisposition: Array<{ sourceId: string; disposition: string }> } } })
+      .assembleCandidateRelease({ buildId: 'b_candidate-workset-disposition', entry: {}, buildState: fixture.state,
+        snapshot: fixture.state.snapshot, stagingRoot: fixture.state.stagingRoot,
+        programChecks: { passed: true, checkIds: ['fixture'] }, summary: 's',
+        specInfo: { publishMode: 'auto', sourceSnapshotHash: 'hash', baseReleaseId: null } });
+    expect(assembled.candidate.sourceDisposition).toEqual([{ sourceId: 'tokA', disposition: 'referenced' }]);
+  });
+
   it.each([
     ['ctx', 'run_token_revoked'], ['actor', 'actor_revoked'],
     ['generation', 'credential_generation_revoked'], ['publishing', 'build_publishing'],

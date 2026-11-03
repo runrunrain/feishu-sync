@@ -64,8 +64,23 @@ function frozenSourcesFromRelease(input: {
 }): Map<string, FrozenSource> {
   if (input.tokens.size === 0) return new Map();
   const indexPath = path.join(input.releaseRoot, 'evidence-resources.json');
-  const indexBytes = fs.readFileSync(indexPath);
   const expectedHash = input.manifest.evidence?.hash;
+  if (!expectedHash) {
+    // Legacy v1 releases have a verified source-contents sidecar but no
+    // evidence index. A text-only source can be carried exactly as published;
+    // CSV split boundaries cannot be reconstructed safely without the index.
+    const frozen = new Map<string, FrozenSource>();
+    for (const token of input.tokens) {
+      const combined = input.sourceContents[token];
+      if (!input.manifest.sourceSnapshot.some((entry) => entry.objToken === token) || typeof combined !== 'string'
+        || combined.includes('\n\n--- CSV 1 ---\n')) {
+        throw new Error(`阶段发布缺少基准来源证据区段：${token}`);
+      }
+      frozen.set(token, { content: combined, attachments: [] });
+    }
+    return frozen;
+  }
+  const indexBytes = fs.readFileSync(indexPath);
   const actualHash = `sha256:${crypto.createHash('sha256').update(indexBytes).digest('hex')}`;
   if (!expectedHash || actualHash !== expectedHash) throw new Error('阶段发布冻结证据索引与基准版本不一致');
   const index = JSON.parse(indexBytes.toString('utf8')) as EvidenceResourcesFile;
@@ -136,8 +151,10 @@ export function progressiveSourceSnapshot(input: {
   const baseKnowledgePath = input.releaseRoot && path.join(input.releaseRoot, 'knowledge.json');
   if (frozen.size && baseKnowledgePath && fs.existsSync(baseKnowledgePath)) {
     const knowledge = JSON.parse(fs.readFileSync(baseKnowledgePath, 'utf8')) as { evidence?: Array<{ sourceRef?: { sourceId?: string }; selector?: { kind?: string } }> };
-    const indexed = new Set(JSON.parse(fs.readFileSync(path.join(input.releaseRoot!, 'evidence-resources.json'), 'utf8'))
-      .resources.map((item: { sourceId: string }) => item.sourceId));
+    const indexed = input.manifest?.evidence?.hash
+      ? new Set<string>(JSON.parse(fs.readFileSync(path.join(input.releaseRoot!, 'evidence-resources.json'), 'utf8'))
+        .resources.map((item: { sourceId: string }) => item.sourceId))
+      : new Set<string>();
     if (knowledge.evidence?.some((item) => frozen.has(item.sourceRef?.sourceId ?? '')
       && (!indexed.has(item.sourceRef?.sourceId ?? '')
         || (item.selector?.kind !== 'text_span' && item.selector?.kind !== 'csv_cells'

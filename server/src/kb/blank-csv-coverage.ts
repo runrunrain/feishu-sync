@@ -5,6 +5,34 @@ import { resolveInside } from '../agent/path-guard.js';
 import type { CoverageItem } from './knowledge-schema.js';
 import type { RawSourceSnapshot } from './raw-source-snapshot.js';
 
+/** A reconstructed sheet with only its generated wrapper and wholly blank CSV
+ * tabs contains no knowledge to write. Require every linked tab to be present
+ * in the verified snapshot; any inline note or nonblank cell keeps the source
+ * subject to normal coverage review. */
+export function isBlankWorkbookPlaceholder(source: ReturnType<RawSourceSnapshot['readVerified']>): boolean {
+  const body = source.content.replace(/^\s*<!--\s*[\s\S]*?-->\s*/, '');
+  const lines = body.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const links: string[] = [];
+  let titleCount = 0;
+  let tabCount = 0;
+  for (const line of lines) {
+    if (/^> 只读接口重建画板：\[Excel 工作簿\]\([^)]+\)。以下文本供检索使用。$/.test(line)) continue;
+    if (/^# [^#].+$/.test(line)) { titleCount += 1; continue; }
+    if (/^## 子表: .+$/.test(line)) { tabCount += 1; continue; }
+    const link = line.match(/^\[CSV 原始数据\]\(([^)]+\.csv)\)$/);
+    if (link) { links.push(link[1]!); continue; }
+    return false;
+  }
+  if (titleCount !== 1 || tabCount === 0 || links.length !== tabCount
+    || source.attachments.length !== links.length) return false;
+  try {
+    const expected = new Set(links.map((href) => path.resolve(path.dirname(source.realPath), decodeURIComponent(href))));
+    if (expected.size !== links.length || source.attachments.some((attachment) => !expected.has(fs.realpathSync.native(attachment.path)))) return false;
+    return source.attachments.every((attachment) =>
+      parseCsvRecords(attachment.content).records.every((record) => record.every((cell) => !cell.trim())));
+  } catch { return false; }
+}
+
 /** A blank workbook tab is a source placeholder, not an unread important rule.
  * Only reconcile a coverage item when the named tab exists, its CSV has no
  * nonempty cells, and the reconstructed Markdown tab has no inline content. */

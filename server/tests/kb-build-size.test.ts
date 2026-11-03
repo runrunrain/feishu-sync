@@ -5,6 +5,8 @@ import path from 'node:path';
 import { validateStagingDocs } from '../src/kb/kb-build-service.js';
 import { RawSourceSnapshot, computeSourceHash } from '../src/kb/raw-source-snapshot.js';
 import type { BuildRunState } from '../src/agent/agent-tool-service.js';
+import { MAX_STANDARD_DOC_BYTES } from '../src/kb/standard-doc-limits.js';
+import { isBlankWorkbookPlaceholder } from '../src/kb/blank-csv-coverage.js';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
@@ -54,12 +56,18 @@ it('counts CSV companions and whiteboard text, without double counting vision or
   expect(g.issues().map((issue) => issue.code)).toContain('total_too_large');
 });
 
-it('still blocks genuine expansion, splitting to inflate the floor, and files above 1 MiB', () => {
+it('allows a source-backed CSV import larger than 1 MiB while retaining the aggregate expansion budget', () => {
+  const f = fixture(1, 'x'.repeat(1_800_000));
+  f.write('a'.repeat(1_750_000));
+  expect(f.issues()).toEqual([]);
+});
+
+it('still blocks genuine expansion, splitting to inflate the floor, and files above the shared limit', () => {
   const f = fixture(); f.write('a'.repeat(4097));
   expect(f.issues().map((issue) => issue.code)).toContain('total_too_large');
   f.write('a'.repeat(2500)); f.write('a'.repeat(2500), '另一篇.md');
   expect(f.issues().map((issue) => issue.code)).toContain('total_too_large');
-  f.write('a'.repeat(1024 * 1024 + 1));
+  f.write('a'.repeat(MAX_STANDARD_DOC_BYTES + 1));
   expect(f.issues().map((issue) => issue.code)).toContain('file_too_large');
 });
 
@@ -67,4 +75,40 @@ it('refuses changed source content instead of letting it inflate the budget', ()
   const f = fixture(); f.write('a'.repeat(6000));
   fs.appendFileSync(path.join(f.state.knowledgeBaseRoot, '0.md'), 'expanded'.repeat(2000));
   expect(f.issues).toThrow(/构建期间被修改/);
+});
+
+it('records a wholly blank reconstructed workbook as skipped, but still blocks meaningful unhandled sources', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kb-blank-source-')); roots.push(root);
+  const raw = path.join(root, 'raw');
+  const stagingRoot = path.join(root, 'stage');
+  fs.mkdirSync(raw); fs.mkdirSync(path.join(stagingRoot, 'docs'), { recursive: true });
+  const md = path.join(raw, 'workbook.md');
+  const csvDir = path.join(raw, 'workbook.csv-data'); fs.mkdirSync(csvDir);
+  const csv = path.join(csvDir, 'Sheet1.csv');
+  const wrapper = '<!--\nfeishu_sync:\n  obj_type: "sheet"\n-->\n'
+    + '> 只读接口重建画板：[Excel 工作簿](workbook.xlsx)。以下文本供检索使用。\n\n'
+    + '# 人物古籍匹配\n\n## 子表: Sheet1\n\n[CSV 原始数据](workbook.csv-data/Sheet1.csv)\n';
+  const makeState = (content: string, cells: string) => {
+    fs.writeFileSync(md, content); fs.writeFileSync(csv, cells);
+    const snapshot = RawSourceSnapshot.fromEntries([{
+      objToken: 'tokBlank', objType: 'sheet', title: '人物古籍匹配', relPath: 'workbook.md',
+      contentHash: computeSourceHash(md, [csv], raw), objEditTime: null,
+    }], { knowledgeBaseRoot: raw, sheetCsvPaths: () => [csv] });
+    const state: BuildRunState = { knowledgeBaseRoot: raw, snapshot, mode: 'incremental', stagingRoot,
+      workset: new Map([['tokBlank', 'added']]), finishInfo: { summary: '完成', skipped: [] } };
+    return { state, issues: () => validateStagingDocs(state, snapshot) };
+  };
+  const blank = makeState(wrapper, ' , ,\n , ,\n');
+  const verifiedBlank = blank.state.snapshot.readVerified(raw, 'tokBlank');
+  expect(verifiedBlank.attachments).toHaveLength(1);
+  expect(isBlankWorkbookPlaceholder(verifiedBlank)).toBe(true);
+  expect(blank.issues()).toEqual([]);
+  expect(blank.state.finishInfo?.skipped).toEqual([expect.objectContaining({ objToken: 'tokBlank', reason: expect.stringContaining('空白 CSV') })]);
+  const populated = makeState(wrapper, '姓名,朝代\n曹操,东汉\n');
+  expect(populated.issues().map((issue) => issue.code)).toContain('source_not_covered');
+  const inline = makeState(`${wrapper}\n人物匹配规则：按时代核对。\n`, ' , ,\n');
+  expect(inline.issues().map((issue) => issue.code)).toContain('source_not_covered');
+  const falselyCited = makeState(wrapper, ' , ,\n');
+  fs.writeFileSync(path.join(stagingRoot, 'docs', '误引.md'), '<!--\nfeishu_sync_kb:\n  doc_id: kd_false\n  sources:\n    - tokBlank\n  build_id: b_blank\n-->\n# 误引\n正文\n');
+  expect(falselyCited.issues().map((issue) => issue.code)).toContain('source_blank_workbook');
 });

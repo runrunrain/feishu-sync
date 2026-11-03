@@ -33,7 +33,7 @@ afterAll(() => {
 });
 
 /** 可直接计数的 fixture 句柄 */
-async function fixtureWithCounter(mode: { fail?: boolean; failFirst?: number; empty?: boolean } = {}): Promise<{ port: number; count: () => number }> {
+async function fixtureWithCounter(mode: { fail?: boolean; failFirst?: number; empty?: boolean; delayFirstMs?: number } = {}): Promise<{ port: number; count: () => number }> {
   let calls = 0;
   const server = http.createServer((req, res) => {
     let raw = '';
@@ -46,12 +46,16 @@ async function fixtureWithCounter(mode: { fail?: boolean; failFirst?: number; em
         return;
       }
       const body = JSON.parse(raw || '{}');
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        id: 'c', object: 'chat.completion', model: body.model,
-        choices: [{ index: 0, message: { role: 'assistant', content: mode.empty ? '   ' : `DESC(${calls})` }, finish_reason: 'stop' }],
-        usage: { total_tokens: 10 },
-      }));
+      const reply = () => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          id: 'c', object: 'chat.completion', model: body.model,
+          choices: [{ index: 0, message: { role: 'assistant', content: mode.empty ? '   ' : `DESC(${calls})` }, finish_reason: 'stop' }],
+          usage: { total_tokens: 10 },
+        }));
+      };
+      if (calls === 1 && mode.delayFirstMs) setTimeout(reply, mode.delayFirstMs);
+      else reply();
     });
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -266,6 +270,15 @@ describe('VisionDescriber.describeOne + 缓存', () => {
     const root = newTmpRoot();
     const describer = new VisionDescriber({ dataRoot: root, config: () => makeConfig(fixture.port) });
     const result = await describer.describeOne(writeImage(root, 'retry.png', TINY_PNG), 'images/retry');
+    expect(result.state).toBe('described');
+    expect(fixture.count()).toBe(2);
+  });
+
+  it('单图首次超时后补试一次并成功缓存', async () => {
+    const fixture = await fixtureWithCounter({ delayFirstMs: 120 });
+    const root = newTmpRoot();
+    const describer = new VisionDescriber({ dataRoot: root, config: () => makeConfig(fixture.port, { timeoutMs: 40 }) });
+    const result = await describer.describeOne(writeImage(root, 'timeout.png', TINY_PNG), 'images/timeout');
     expect(result.state).toBe('described');
     expect(fixture.count()).toBe(2);
   });

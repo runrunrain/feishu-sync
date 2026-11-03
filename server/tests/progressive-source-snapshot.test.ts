@@ -57,6 +57,24 @@ function fixture() {
 }
 
 describe('progressive source snapshot', () => {
+  it('carries a legacy text-only release without inventing a missing evidence index', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kb-progressive-legacy-'));
+    roots.push(root);
+    const oldPath = path.join(root, 'old.md');
+    fs.writeFileSync(oldPath, 'updated live text\n');
+    const base = { objToken: 'old', objType: 'docx', title: '旧规则', relPath: 'old.md',
+      contentHash: 'frozen-old-hash', objEditTime: null } as RawSourceSnapshotEntry;
+    const live = RawSourceSnapshot.fromEntries([{ ...base, contentHash: computeSourceHash(oldPath, [], root) }]);
+    const manifest = { sourceSnapshot: [base] } as KbManifest;
+    const input = { entries: [base], live, manifest, releaseRoot: root,
+      sourceContents: { old: 'original published text\n' }, promotedSources: new Set<string>() };
+    const frozen = progressiveSourceSnapshot(input);
+    expect(captureSourceContents(frozen, root)).toEqual({ old: 'original published text\n' });
+    expect(() => progressiveSourceSnapshot({ ...input, sourceContents: {
+      old: 'original published text\n\n--- CSV 1 ---\nkey,value\n',
+    } })).toThrow('缺少基准来源证据区段');
+  });
+
   it('uses frozen baseline text and CSV while verifying the newly promoted source live', () => {
     const { sourceRoot, releaseRoot, manifest, live, combined, liveNew } = fixture();
     const snapshot = progressiveSourceSnapshot({ entries: [...manifest.sourceSnapshot, liveNew], live, manifest,

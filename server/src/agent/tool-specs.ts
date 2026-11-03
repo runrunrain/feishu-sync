@@ -137,13 +137,14 @@ export const DRAFT_LIST_SPEC: AgentToolSpec = {
 export const DRAFT_READ_SPEC: AgentToolSpec = {
   name: 'draft_read',
   label: '草稿阅读',
-  description: '按路径读取本构建 staging 中的草稿文档（不含 server 生成头）；修订已登记知识对象的文档时可请求现有声明。',
+  description: '按路径读取本构建 staging 中的草稿文档（不含 server 生成头）；metadataOnly=true 可低成本读取来源、覆盖项与编辑哈希，修订已登记知识对象的文档时可请求现有声明。',
   parameters: {
     type: 'object',
     properties: {
       path: string('草稿 POSIX 相对路径'),
       offset: integer('起始行（0 基）', 0),
       limit: integer('返回行数上限', 1, 2000),
+      metadataOnly: { type: 'boolean', description: '仅返回小型元数据：sources、coverage itemId/disposition、editContentHash、draftRevision；大草稿修订前先用此项，避免整篇声明输出截断' },
       includeDeclarations: { type: 'boolean', description: '附上此文档的知识对象、稳定 clientKey 与关联声明，供修订时保留对象身份和证据登记' },
       declarationClaimKey: string('可选：includeDeclarations=true 时只返回含此 claimKey 的对象、该断言及其证据；审查单个疑点时避免整篇声明过大'),
       declarationObjectKey: string('可选：includeDeclarations=true 时按稳定 clientKey 或 objectId 只返回此对象的完整声明；先读摘要再按对象读取'),

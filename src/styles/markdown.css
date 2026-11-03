@@ -144,6 +144,26 @@
   border: 1px solid #dfdedb;
   border-radius: 8px;
 }
+.markdown-table-container { max-width: 100%; }
+.markdown-table-pagination {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.55rem;
+  margin: 0.4rem 0 1rem;
+  color: var(--ink-faint);
+  font-size: 0.78em;
+}
+.markdown-table-pagination button {
+  padding: 0.2rem 0.55rem;
+  border: 1px solid #dfdedb;
+  border-radius: 5px;
+  color: var(--ink);
+  background: var(--paper);
+  cursor: pointer;
+}
+.markdown-table-pagination button:disabled { opacity: 0.45; cursor: default; }
+.markdown-table-pagination button:not(:disabled):hover { border-color: var(--jade); }
 .markdown-table-wrap:focus-visible { outline: 2px solid var(--jade); outline-offset: 2px; }
 .markdown-table {
   width: max-content;

@@ -318,6 +318,37 @@ describe('child 身份链（§4.1）', () => {
 });
 
 describe('写入链（§4.2/§4.4）', () => {
+  it('automatically removes a verified blank workbook from source metadata on write and edit', async () => {
+    const setup = makeV2('b-blank-source-filter');
+    const md = writeRaw('blank.md', '# 空表\n\n## 子表: Sheet1\n\n[CSV 原始数据](blank.csv-data/Sheet1.csv)\n');
+    const csvDir = path.join(kbRoot, 'blank.csv-data'); fs.mkdirSync(csvDir);
+    const csv = path.join(csvDir, 'Sheet1.csv'); fs.writeFileSync(csv, ' , ,\n');
+    setup.state.snapshot = RawSourceSnapshot.fromEntries([
+      ...setup.state.snapshot.entries,
+      { objToken: 'tokBlank', objType: 'sheet', title: '空表', relPath: 'blank.md',
+        contentHash: computeSourceHash(md, [csv], kbRoot), objEditTime: null },
+    ], { knowledgeBaseRoot: kbRoot, sheetCsvPaths: (token) => token === 'tokBlank' ? [csv] : [] });
+    setup.state.workset.set('tokBlank', 'added');
+    setup.store.registerTaskCreation({ nativeTaskId: 'w-blank', requestedRole: 'luban' });
+    const docPath = 'docs/normalized.md';
+    await call(setup.leader.token, 'build_assign_output', { ownerTaskId: 'w-blank', targets: [docPath] });
+    await expectToolError(() => call(setup.child.token, 'kb_write_doc', {
+      path: docPath, title: '空表', markdown: '正文', sources: ['tokBlank'], summary: '摘要', operationId: 'blank-only',
+    }, meta('w-blank', 'luban')), 'kb_source_empty_placeholder');
+    await call(setup.child.token, 'kb_write_doc', {
+      path: docPath, title: '正文', markdown: '正文', sources: ['tokA', 'tokBlank'], summary: '摘要', operationId: 'mixed',
+    }, meta('w-blank', 'luban'));
+    const file = path.join(setup.state.stagingRoot, 'docs', docPath);
+    expect(fs.readFileSync(file, 'utf8')).toContain('    - tokA');
+    expect(fs.readFileSync(file, 'utf8')).not.toContain('tokBlank');
+    // Simulate an older draft whose header still cites the empty workbook.
+    fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace('    - tokA', '    - tokA\n    - tokBlank'));
+    await call(setup.child.token, 'kb_edit_doc', {
+      path: docPath, patches: [{ anchor: { kind: 'exact_text', oldText: '正文' }, newText: '正文修订' }], operationId: 'normalize-old',
+    }, meta('w-blank', 'luban'));
+    expect(fs.readFileSync(file, 'utf8')).not.toContain('tokBlank');
+  });
+
   it('新目录尚无草稿时返回 not_found，随后可在该目录写入', async () => {
     const setup = makeV2('b-new-directory');
     setup.store.registerTaskCreation({ nativeTaskId: 'w1', requestedRole: 'luban' });
@@ -452,6 +483,17 @@ describe('kb_edit_doc（§7 局部编辑）', () => {
     } finally {
       read.mockRestore();
     }
+  });
+
+  it('draft_read metadataOnly 给出可见的编辑哈希和来源且不输出长正文', async () => {
+    const setup = makeV2('b-read-metadata');
+    setup.store.registerTaskCreation({ nativeTaskId: 'w1', requestedRole: 'luban' });
+    await writeDraftWithObject(setup, 'w1');
+    const result = await call(setup.child.token, 'draft_read', { path: 'docs/edit.md', metadataOnly: true }, meta('w1', 'luban'));
+    expect(result.content[0]!.text).toContain('<draft_metadata>');
+    expect(result.content[0]!.text).toContain('"editContentHash"');
+    expect(result.content[0]!.text).toContain('"sources":["tokA"]');
+    expect(result.content[0]!.text).not.toContain('甲节内容行1');
   });
 
   it('exact_text 编辑：声明继承（objectId 稳定、坐标平移）、审查失效、幂等', async () => {

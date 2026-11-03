@@ -12,8 +12,9 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { reconcileBlankCsvCoverage } from '../kb/blank-csv-coverage.js';
+import { isBlankWorkbookPlaceholder, reconcileBlankCsvCoverage } from '../kb/blank-csv-coverage.js';
 import { renderCsvTableImport } from '../kb/csv-table-import.js';
+import { MAX_STANDARD_DOC_BYTES } from '../kb/standard-doc-limits.js';
 import { annotateRawReadPage, skipBlankCsvContinuation, type BlankCsvSkip } from '../kb/csv-read-compact.js';
 import { isPermissionDeniedSourcePlaceholder } from '../kb/source-availability.js';
 import {
@@ -1780,6 +1781,10 @@ export class AgentToolService {
 
   private toolDraftRead(context: InternalRunContext, args: Record<string, unknown>): ToolResult {
     const docPath = requireString(args, 'path', 1, 600);
+    const metadataOnly = args.metadataOnly === true;
+    if (metadataOnly && args.includeDeclarations === true) {
+      throw new ToolError('invalid_request', 'metadataOnly 与 includeDeclarations 不能同时使用');
+    }
     const offset = optionalInt(args, 'offset', 0, 0, 10_000_000);
     const limit = optionalInt(args, 'limit', 800, 1, 2000);
     const declarationClaimKey = args.declarationClaimKey === undefined ? null : requireString(args, 'declarationClaimKey', 1, 200);
@@ -1800,9 +1805,10 @@ export class AgentToolService {
     }
     const missing = target === null;
     if (missing && args.includeDeclarations !== true) throw new ToolError('not_found', `草稿不存在: ${docPath}`, 404);
-    const body = target === null ? '' : stripStdHeader(fs.readFileSync(target, 'utf-8'));
+    const fileText = target === null ? '' : fs.readFileSync(target, 'utf-8');
+    const body = stripStdHeader(fileText);
     const lines = missing ? [] : body.split('\n');
-    const slice = lines.slice(offset, offset + limit);
+    const slice = metadataOnly ? [] : lines.slice(offset, offset + limit);
     let declarationText = '';
     if (args.includeDeclarations === true) {
       const state = requireBuildState(context);
@@ -1822,8 +1828,25 @@ export class AgentToolService {
     } catch {
       editCoordinates = null;
     }
+    let metadataText = '';
+    if (metadataOnly) {
+      const header = target ? parseStdHeader(fileText) : null;
+      const state = requireBuildState(context);
+      const draftFile = path.join(stagingRoot, 'knowledge-draft.json');
+      const draft = state.knowledgeDraft ?? (fs.existsSync(draftFile) ? this.loadKnowledgeDraft(state) : null);
+      const sources = header?.sources ?? [];
+      const metadata = {
+        path: docPath,
+        sources,
+        editContentHash: editCoordinates?.contentHash ?? null,
+        draftRevision: draft?.docs[docPath]?.revision ?? 0,
+        coverageItems: (draft?.coverage ?? []).filter((item) => sources.includes(item.sourceRef.sourceId))
+          .slice(0, 100).map((item) => ({ itemId: item.itemId, sourceId: item.sourceRef.sourceId, disposition: item.disposition })),
+      };
+      metadataText = `<draft_metadata>${JSON.stringify(metadata)}</draft_metadata>`;
+    }
     return {
-      content: [{ type: 'text', text: (missing ? `<missing_draft path="${docPath}">正文缺失；请根据原始来源重建并重申下方对象声明。</missing_draft>` : slice.join('\n')) + declarationText }],
+      content: [{ type: 'text', text: metadataOnly ? metadataText : (missing ? `<missing_draft path="${docPath}">正文缺失；请根据原始来源重建并重申下方对象声明。</missing_draft>` : slice.join('\n')) + declarationText }],
       details: {
         path: docPath,
         offset,
@@ -2010,6 +2033,9 @@ export class AgentToolService {
         throw new ToolError('invalid_request', `正文须恰好包含一次 ${marker}`);
       }
       markdown = markdown.replace(marker, rendered.markdown);
+      if (Buffer.byteLength(markdown, 'utf-8') > MAX_STANDARD_DOC_BYTES) {
+        throw new ToolError('kb_doc_too_large', `脚本导入后文档超过 ${MAX_STANDARD_DOC_BYTES} 字节；请按主题或 CSV 记录范围拆成多篇独立标准文档`, 400);
+      }
       const returnedText = resource.lines.slice(rendered.lineStart - 1, rendered.lineEnd).join('\n');
       receipts.push({
         readReceiptId: `rr_${crypto.randomBytes(9).toString('hex')}`,
@@ -2039,19 +2065,33 @@ export class AgentToolService {
     args = this.materializeCsvTableImports(context, state, args, meta);
     const docPath = requireString(args, 'path', 1, 600);
     const title = requireString(args, 'title', 1, 300);
-    const markdown = requireString(args, 'markdown', 1, 2_000_000);
+    // csvTableImports expands short model-authored text into verified CSV rows.
+    // Edits must also be able to resubmit a previously imported long document.
+    const markdown = requireString(args, 'markdown', 1, MAX_STANDARD_DOC_BYTES);
     const summary = requireString(args, 'summary', 1, 400);
     if (hasEditorialHistory(markdown) || hasEditorialHistory(summary)) {
       throw new ToolError('body_contains_change_history', '正文与文档摘要必须为当前规则的一次成型表述；移除版本头、修订记录和本版/上版对比。变更说明仅放在kb_finish.summary。');
     }
-    const sources = args.sources;
-    if (!Array.isArray(sources) || sources.length === 0 || !sources.every((source) => typeof source === 'string')) {
+    const suppliedSources = args.sources;
+    if (!Array.isArray(suppliedSources) || suppliedSources.length === 0 || !suppliedSources.every((source) => typeof source === 'string')) {
       throw new ToolError('invalid_request', 'sources 必须是非空字符串数组');
     }
-    for (const source of sources) {
-      if (!state.snapshot.has(source as string)) {
+    for (const source of suppliedSources) {
+      if (!state.snapshot.has(source)) {
         throw new ToolError('invalid_request', `来源不在快照内: ${source}`);
       }
+    }
+    // Source metadata must not claim an empty workbook or a Feishu permission
+    // placeholder as evidence. Remove these deterministic placeholders before
+    // generating the header; the final validator records their skip reasons.
+    const sources = suppliedSources.filter((source): source is string => {
+      const entry = state.snapshot.get(source);
+      const verified = state.snapshot.readVerified(state.knowledgeBaseRoot, source);
+      return !isPermissionDeniedSourcePlaceholder(verified.content)
+        && !(entry?.objType === 'sheet' && isBlankWorkbookPlaceholder(verified));
+    });
+    if (sources.length === 0) {
+      throw new ToolError('kb_source_empty_placeholder', 'sources 仅包含权限占位或全空工作簿；本次没有可写的知识，发布校验会自动登记跳过', 400);
     }
     const sourceIdentifiers = state.snapshot.entries.flatMap((entry) => [entry.objToken, entry.relPath]);
     if ([title, markdown, summary].some((text) => hasSourceMetadata(text, sourceIdentifiers))) {
@@ -2135,6 +2175,10 @@ export class AgentToolService {
       ].join('\n');
       const body = markdown.replace(/^\s*\n/, '');
       const full = `${header}\n# ${title}\n${body}\n`;
+      const fullBytes = Buffer.byteLength(full, 'utf-8');
+      if (fullBytes > MAX_STANDARD_DOC_BYTES) {
+        throw new ToolError('kb_doc_too_large', `文档 ${docPath} 为 ${fullBytes} 字节，超过 ${MAX_STANDARD_DOC_BYTES} 字节上限；请按主题或 CSV 记录范围拆成多篇独立标准文档`, 400);
+      }
       // 深路径父目录（mkdir intent 逐级复核）。
       const parentRel = docPath.includes('/') ? docPath.slice(0, docPath.lastIndexOf('/')) : null;
       // v2（§4.4 硬验收）：异步证据装配后、最终提交前的重检——排队期间的

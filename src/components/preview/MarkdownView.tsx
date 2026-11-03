@@ -30,7 +30,7 @@
  *     `<sheet>`（含无属性裸形态）兑底为提示块
  */
 
-import { Fragment, useEffect, useState, type JSX, type ReactNode } from 'react';
+import { Fragment, useEffect, useMemo, useState, type JSX, type ReactNode } from 'react';
 import { ImageIcon, Loader2 } from 'lucide-react';
 import { getMediaBlobUrl, getSyncedReference } from '../../api/client';
 import {
@@ -1215,6 +1215,64 @@ function SyncedReference({ token, blockId, feishuHost, autoLoad }: { token: stri
   </div>;
 }
 
+const TABLE_PAGE_SIZE = 100;
+
+/** Keep all imported rows in the document, but mount only one page of cells.
+ * A 10,000-row CSV table otherwise creates tens of thousands of DOM nodes. */
+function PagedMarkdownTable({ block, tableKey, ctx }: {
+  block: Extract<Block, { type: 'table' }>;
+  tableKey: string;
+  ctx: InlineContext;
+}): JSX.Element {
+  const [page, setPage] = useState(0);
+  useEffect(() => { setPage(0); }, [block.rows]);
+  const total = block.rows.length;
+  const pageCount = Math.max(1, Math.ceil(total / TABLE_PAGE_SIZE));
+  const currentPage = Math.min(page, pageCount - 1);
+  const start = currentPage * TABLE_PAGE_SIZE;
+  const visibleRows = total > TABLE_PAGE_SIZE
+    ? block.rows.slice(start, start + TABLE_PAGE_SIZE)
+    : block.rows;
+  return (
+    <div data-md-block="table" className="markdown-table-container">
+      <div className="markdown-table-wrap scrollbar-thin" tabIndex={0} role="region" aria-label="表格，内容过宽时可横向滚动">
+        <table className="markdown-table">
+          <thead>
+            <tr>
+              {block.header.map((cell, ci) => (
+                <th key={ci} className={ALIGN_CLASS[block.aligns[ci] ?? 'left']}>
+                  {renderInline(cell, `${tableKey}-h${ci}`, ctx)}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {visibleRows.map((row, index) => {
+              const ri = start + index;
+              return (
+                <tr key={ri} data-md-empty-row={row.every((cell) => !cell.trim()) ? 'true' : undefined}>
+                  {row.map((cell, ci) => (
+                    <td key={ci} className={ALIGN_CLASS[block.aligns[ci] ?? 'left']}>
+                      {renderInline(cell, `${tableKey}-r${ri}c${ci}`, ctx)}
+                    </td>
+                  ))}
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      {total > TABLE_PAGE_SIZE && (
+        <nav className="markdown-table-pagination" aria-label="表格分页">
+          <span aria-live="polite">第 {currentPage + 1}/{pageCount} 页 · 第 {start + 1}–{Math.min(start + TABLE_PAGE_SIZE, total)} 行，共 {total} 行</span>
+          <button type="button" disabled={currentPage === 0} onClick={() => setPage(currentPage - 1)}>上一页</button>
+          <button type="button" disabled={currentPage === pageCount - 1} onClick={() => setPage(currentPage + 1)}>下一页</button>
+        </nav>
+      )}
+    </div>
+  );
+}
+
 function renderBlock(block: Block, index: number, ctx: InlineContext): ReactNode {
   const key = `b-${index}`;
   switch (block.type) {
@@ -1242,38 +1300,7 @@ function renderBlock(block: Block, index: number, ctx: InlineContext): ReactNode
         </div>
       );
     case 'table':
-      return (
-        <div key={key} data-md-block="table" className="markdown-table-wrap scrollbar-thin" tabIndex={0} role="region" aria-label="表格，内容过宽时可横向滚动">
-          <table className="markdown-table">
-            <thead>
-              <tr>
-                {block.header.map((cell, ci) => (
-                  <th
-                    key={ci}
-                    className={ALIGN_CLASS[block.aligns[ci] ?? 'left']}
-                  >
-                    {renderInline(cell, `${key}-h${ci}`, ctx)}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {block.rows.map((row, ri) => (
-                <tr key={ri} data-md-empty-row={row.every((cell) => !cell.trim()) ? 'true' : undefined}>
-                  {row.map((cell, ci) => (
-                    <td
-                      key={ci}
-                      className={ALIGN_CLASS[block.aligns[ci] ?? 'left']}
-                    >
-                      {renderInline(cell, `${key}-r${ri}c${ci}`, ctx)}
-                    </td>
-                  ))}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      );
+      return <PagedMarkdownTable key={key} block={block} tableKey={key} ctx={ctx} />;
     case 'html_table':
       // 需求 1：受控 HTML 表格渲染，保留 colspan/rowspan，样式与 Markdown 表格一致
       return (
@@ -1438,7 +1465,7 @@ export function MarkdownView({
   remoteImages = 'auto',
   variant = 'preview',
 }: MarkdownViewProps) {
-  const blocks = parseBlocks(preprocess(content));
+  const blocks = useMemo(() => parseBlocks(preprocess(content)), [content]);
   const ctx: InlineContext = { baseDir, onNavigateCsv, onNavigateDoc, feishuHost, remoteImages, resolveSyncedReferences };
   return (
     <div className={`markdown-body ${variant === 'reading' ? 'markdown-reading' : 'markdown-preview'}`}>

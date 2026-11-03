@@ -29,7 +29,10 @@ async function describeWithTransientRetry(channel: VisionChannel, request: Visio
   let result = await channel.describe(request, options);
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const status = result.statusCode;
-    if (options.signal?.aborted || status !== 429 && !(status !== undefined && status >= 500)) break;
+    const transientStatus = status === 429 || status !== undefined && status >= 500;
+    // 识图服务偶发在单图超时后恢复；只给 timeout 一次补试，避免无限等待。
+    const transientTimeout = result.finishReason === 'timeout' && attempt === 0;
+    if (options.signal?.aborted || !transientStatus && !transientTimeout) break;
     await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
     if (options.signal?.aborted) break;
     result = await channel.describe(request, options);

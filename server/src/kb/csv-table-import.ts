@@ -1,4 +1,5 @@
 import { parseCsvRecords } from './evidence-locator.js';
+import { MAX_STANDARD_DOC_BYTES } from './standard-doc-limits.js';
 
 export interface CsvTableImportOptions {
   columns: number[];
@@ -37,17 +38,21 @@ export function renderCsvTableImport(content: string, options: CsvTableImportOpt
   }
   const header = columns.map((column, index) => cell(records[headerRecord - 1]?.[column] || `列 ${index + 1}`));
   const rows: string[] = [];
+  let renderedBytes = Buffer.byteLength(`| ${header.join(' | ')} |\n| ${header.map(() => '---').join(' | ')} |`, 'utf8');
   let lastIncluded = headerRecord;
   for (let recordNo = firstRecord; recordNo <= lastRecord; recordNo += 1) {
     const values = columns.map((column) => records[recordNo - 1]?.[column] ?? '');
     if (values.every((value) => !value.trim())) continue;
-    rows.push(`| ${values.map(cell).join(' | ')} |`);
+    const renderedRow = `| ${values.map(cell).join(' | ')} |`;
+    renderedBytes += 1 + Buffer.byteLength(renderedRow, 'utf8');
+    if (renderedBytes > MAX_STANDARD_DOC_BYTES) {
+      throw new Error(`CSV 导入表格超过 ${MAX_STANDARD_DOC_BYTES} 字节，请按记录范围拆成多篇文档`);
+    }
+    rows.push(renderedRow);
     lastIncluded = recordNo;
-    if (rows.length > 2_000) throw new Error('CSV 导入超过 2000 条有效记录，请拆分文档');
   }
   if (!rows.length) throw new Error('CSV 导入范围没有有效记录');
   const markdown = [`| ${header.join(' | ')} |`, `| ${header.map(() => '---').join(' | ')} |`, ...rows].join('\n');
-  if (Buffer.byteLength(markdown, 'utf8') > 1_000_000) throw new Error('CSV 导入表格超过 1 MB，请缩小范围');
   const firstSpan = recordSpans[headerRecord - 1]!;
   const lastSpan = recordSpans[lastIncluded - 1]!;
   return {

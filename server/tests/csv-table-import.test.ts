@@ -12,4 +12,11 @@ describe('scripted CSV table import', () => {
     expect(table.markdown).toContain('| 2 | &lt;待定&gt; |');
     expect(table.markdown).not.toContain('|  |  |');
   });
+  it('imports more than 2000 records with one script request instead of making the model specify chunks', () => {
+    const csv = ['id,value', ...Array.from({ length: 2300 }, (_, i) => `${i + 1},记录${i + 1}`)].join('\n');
+    const table = renderCsvTableImport(csv, { columns: [0, 1], headerRecord: 1, firstRecord: 2 });
+    expect(table.importedRows).toBe(2300);
+    expect(table.lineEnd).toBe(2301);
+    expect(table.markdown).toContain('| 2300 | 记录2300 |');
+  });
 });

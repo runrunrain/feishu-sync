@@ -22,17 +22,19 @@ import { AgentToolService, ToolError, validateStdDocPath, type BuildRunState } f
 import { BuildActorStore, type BuildActorCheckpointPayload } from '../kb/build-actors.js';
 import type { KnowledgeDraftFile, OrganizationPlanFile } from '../agent/agent-tool-service.js';
 import type { VisionDescriberLike } from '../agent/agent-tool-service.js';
-import { isPathInside, PathGuardError, resolveInside } from '../agent/path-guard.js';
+import { atomicWriteFile, isPathInside, PathGuardError, resolveInside } from '../agent/path-guard.js';
 import { buildPiProcessEnv, PiRpcProcess, type RunOutcome } from '../agent/pi-rpc-process.js';
 import { PiRuntimeResolver, resolveAppLlmModel } from '../agent/runtime-resolver.js';
 import { buildAppLlmRunConfig, buildFrozenRoleRunConfig } from '../agent/provider-descriptor.js';
 import { createClaudeProcess } from '../agent/claude-process-factory.js';
 import { RawSourceSnapshot, collectSourceCandidates, computeSourceHash } from './raw-source-snapshot.js';
 import { isPermissionDeniedSourcePlaceholder } from './source-availability.js';
+import { MAX_STANDARD_DOC_BYTES } from './standard-doc-limits.js';
 import { isReleaseInUse } from './publication-service.js';
 import { StandardKbStore, parseStdHeader, stripStdHeader } from './standard-kb-store.js';
 import { loadReleaseKnowledge, resolveRelease } from './search/release-reader.js';
-import { reconcileBlankCsvCoverage } from './blank-csv-coverage.js';
+import { isBlankWorkbookPlaceholder, reconcileBlankCsvCoverage } from './blank-csv-coverage.js';
+import { repairPlaceholderDraftSources } from './placeholder-draft-recovery.js';
 import { selectProgressiveCoverage } from './progressive-coverage.js';
 import { finalDraftEvidenceScopePaths, selectProgressiveKnowledgeDraft } from './progressive-knowledge-draft.js';
 import { getKbQueryService } from './search/kb-query-service.js';
@@ -371,6 +373,9 @@ export class KbBuildService extends EventEmitter {
   private readonly progressiveJobs = new Map<string, Promise<void>>();
   private readonly progressiveDirty = new Set<string>();
   private readonly finalizingBuilds = new Set<string>();
+  /** Bounded recovery of transient Leader/runtime failures; attempts live on disk
+   * so a desktop restart cannot create an unbounded retry loop. */
+  private readonly autoResumeTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /** R2-LC-01：关闭准入封印——shutdown 第一同步步置位；此后会启动新流水
   * 线/提交知识文件的公开入口（createBuild/resumeBuild/releaseConfirm）
   * 一律拒绝，在途准入在最终入列/启动/落盘前重核同一租约（见
@@ -877,6 +882,15 @@ export class KbBuildService extends EventEmitter {
     // R2-LC-01：跨 readiness await 后重核准入租约——封印后拒绝（不置
     // queued、不登记 active、不启动流水线）；本行到 launchPipeline 为同步段。
     admission.validate();
+    // A user-initiated resume supersedes a pending automatic retry. The
+    // timer removes itself before invoking resumeBuild, so it cannot reach
+    // this branch and silently reset its own retry budget.
+    const pendingAutoResume = this.autoResumeTimers.get(buildId);
+    if (pendingAutoResume) {
+      clearTimeout(pendingAutoResume);
+      this.autoResumeTimers.delete(buildId);
+      this.clearAutoResumeAttempts(buildId);
+    }
     const savedMode = checkpoint.orchestrationMode ?? (checkpoint.leaderRun ? 'pi-amagi' : row.orchestration_mode ?? 'legacy');
     if (savedMode !== 'legacy' && savedMode !== 'pi-amagi') throw new ToolError('build_mode_unavailable', '检查点运行模式不受支持，拒绝用legacy解释', 409);
     const entry = this.newEntry(buildId, checkpoint.backend, checkpoint.requestedMode, checkpoint.rebuildSelected, false, savedMode);
@@ -977,6 +991,74 @@ export class KbBuildService extends EventEmitter {
     return run;
   }
 
+  private autoResumeStatePath(buildId: string): string {
+    if (!/^[A-Za-z0-9_-]{1,120}$/.test(buildId)) throw new Error('无效构建标识');
+    return path.join(this.buildsRoot(this.outputRoot()), buildId, 'auto-resume.json');
+  }
+
+  private autoResumeAttempts(buildId: string): number {
+    try {
+      const value = JSON.parse(fs.readFileSync(this.autoResumeStatePath(buildId), 'utf-8')) as { attempts?: unknown };
+      return Number.isSafeInteger(value.attempts) && (value.attempts as number) >= 0
+        ? value.attempts as number : 2;
+    } catch {
+      // A missing state starts at zero; a damaged one must fail closed.
+      return fs.existsSync(this.autoResumeStatePath(buildId)) ? 2 : 0;
+    }
+  }
+
+  private clearAutoResumeAttempts(buildId: string): void {
+    try { fs.rmSync(this.autoResumeStatePath(buildId), { force: true }); }
+    catch { /* A failed reset only narrows future retries; it cannot affect published data. */ }
+  }
+
+  private autoResumeEligible(row: Record<string, unknown>): boolean {
+    if (row.orchestration_mode !== 'pi-amagi') return false;
+    const status = String(row.status);
+    const code = String(row.error_code ?? '');
+    const message = String(row.error_message ?? '');
+    if (status === 'interrupted' && (code === 'kb_leader_idle' || code === 'interrupted')) return true;
+    return status === 'failed' && code === 'kb_leader_failed'
+      && /(?:model_timeout|model_request_failed|pi_process_exited|pi_transport_failed)/.test(message);
+  }
+
+  private scheduleAutoResume(
+    localMapStore: Parameters<KbBuildService['resumeBuild']>[0],
+    buildId: string,
+  ): void {
+    if (this.admissionSealed || this.running || this.autoResumeTimers.has(buildId)
+      || localMapStore.getActiveKbBuild()) return;
+    const row = localMapStore.getKbBuild(buildId);
+    if (!row || !this.autoResumeEligible(row)) return;
+    if (!new BuildCheckpointStore(this.outputRoot()).summary(buildId)) return;
+    const attempts = this.autoResumeAttempts(buildId);
+    if (attempts >= 2) {
+      this.emitLog(buildId, 'warn', '自动续跑已达 2 次上限；检查点与问题清单保留，可由用户从断点继续');
+      return;
+    }
+    const nextAttempt = attempts + 1;
+    const delayMs = nextAttempt === 1 ? 10_000 : 30_000;
+    try {
+      const statePath = this.autoResumeStatePath(buildId);
+      fs.mkdirSync(path.dirname(statePath), { recursive: true });
+      atomicWriteFile(statePath, JSON.stringify({ attempts: nextAttempt, scheduledAt: new Date().toISOString() }));
+    } catch (error) {
+      this.emitLog(buildId, 'error', `自动续跑状态保存失败：${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+    this.emitLog(buildId, 'warn', `检测到可恢复的 Leader 运行中断，${Math.round(delayMs / 1000)} 秒后自动从检查点续跑（${nextAttempt}/2）；已有正式文档保持可读`);
+    const timer = setTimeout(() => {
+      this.autoResumeTimers.delete(buildId);
+      if (this.admissionSealed || this.running || localMapStore.getActiveKbBuild()) return;
+      void this.resumeBuild(localMapStore, buildId, 'RESUME', 'rebuild').catch((error) => {
+        this.emitLog(buildId, 'warn', `自动续跑未启动：${error instanceof Error ? error.message : String(error)}`);
+        this.scheduleAutoResume(localMapStore, buildId);
+      });
+    }, delayMs);
+    timer.unref?.();
+    this.autoResumeTimers.set(buildId, timer);
+  }
+
   /**
    * 应用关闭收尾（F10/ENOTEMPTY quiescence + R2-LC-01 准入接缝）：
    * ①第一同步步封印新写者准入（createBuild/resumeBuild/releaseConfirm
@@ -999,6 +1081,8 @@ export class KbBuildService extends EventEmitter {
     // R2-LC-01：封印必须在任何 await/快照之前（并发 shutdown 共用同一
     // 封印事实；幂等重复置位无害）。
     this.admissionSealed = true;
+    for (const timer of this.autoResumeTimers.values()) clearTimeout(timer);
+    this.autoResumeTimers.clear();
     // 同实例并发关闭共享同一收口过程，避免重复cancel/扫描。先存Promise
     // 再进入关闭内核，也覆盖同步取消回调中的重入；准入封印仍立即生效。
     this.shutdownTask ??= Promise.resolve().then(() => this.shutdownSealed(localMapStore, options));
@@ -1233,6 +1317,15 @@ export class KbBuildService extends EventEmitter {
     // briefing 只留本次材料/计划，不再重复粘贴全文）
     const { revision, skillPath } = this.materializeWorkflowSkill(input.buildId);
     const generation = input.entry.leaderRun?.generation ?? 1;
+    const automaticSkips = [...(input.buildState.workset?.keys() ?? [])].flatMap((token) => {
+      const source = input.buildState.snapshot.readVerified(config.knowledgeBaseRoot, token);
+      if (isPermissionDeniedSourcePlaceholder(source.content)) return [`${token}（权限占位）`];
+      if (source.entry.objType === 'sheet' && isBlankWorkbookPlaceholder(source)) return [`${token}（全空工作簿）`];
+      return [];
+    });
+    const skipBriefing = automaticSkips.length > 0
+      ? `- 程序已核验以下来源没有可转换正文，发布校验会自动登记跳过：${automaticSkips.join('、')}。不要派写作、不要把它们挂入任何文档 sources；旧草稿若误引，请移除后重新审查。`
+      : '';
     const briefing = [
       '# Leader 运行交代',
       '',
@@ -1245,6 +1338,7 @@ export class KbBuildService extends EventEmitter {
       `- 模式：${input.effectiveMode === 'full' ? '全量重建' : '增量构建'}${input.baseReleaseId ? `（基准版本 ${input.baseReleaseId.slice(0, 12)}…）` : ''}`,
       `- 发布策略：${(config.standardKb.publishMode ?? 'auto') === 'confirm' ? '候选确认（申请发布通过校验后停在待确认，由用户确认发布）' : '自动发布（申请发布通过校验后立即发布）'}`,
       `- 并发上限：${resolveBuildConcurrency(config.standardKb)}（amagi 准入分池冻结）`,
+      ...(skipBriefing ? [skipBriefing] : []),
       '',
       '先经 build_manifest 默认 scope=workset 读取本轮唯一派发范围；scope=all 仅供背景查询，不为未变化基准源派任务。新增长文/表格按一篇目标文档一个写作任务派发，单篇读完即写，多个任务并发。不同主题的大表尽量分成不同目标文档；CSV 明细必须优先用 kb_write_doc.csvTableImports 从冻结附件自动导入，不让作者逐行复制到工具 JSON。每份子任务书第一条必须要求调用原生 read 读取上方冻结 SKILL.md，再调用 MCP 桥接；Pi 的 --skill 只提示技能路径，不自动注入全文。objToken 只在任务正文和 MCP 调用中使用，不是 task_submit.inputs.required 的本地路径。首批任务具备输入后立即派发；全部成果通过审查后申请发布当前精确候选版本。',
     ].join('\n');
@@ -1257,6 +1351,7 @@ export class KbBuildService extends EventEmitter {
       '## 续接交代',
       '',
       `构建 ${input.buildId} 从检查点恢复（第 ${generation} 代）。已接受成果与未解决问题以应用账本为准：先用 build_checkpoint(action=status) 查看成果状态，再组织剩余工作。旧式整库范围审查凭据已作废；现有草稿若尚无有效单篇审查回执，须安排独立审查，不必重写正文。每篇审查通过后应用会自动阶段发布，其他任务继续；全部完成后再申请最终发布当前精确候选版本。不要重写已接受且未受影响的草稿。`,
+      ...(skipBriefing ? [skipBriefing] : []),
     ].join('\n');
     return {
       buildId: input.buildId,
@@ -1343,6 +1438,27 @@ export class KbBuildService extends EventEmitter {
         prior.actorPayload ?? null);
       if (stalePaths.length > 0) {
         leaderInput.resumeBriefing += `\n本次工作流规则版本变化，以下候选草稿的旧审查已失效；正文可复用，但必须重新派独立审查：${stalePaths.join('、')}。`;
+      }
+    }
+    if (prior) {
+      const repaired = repairPlaceholderDraftSources({
+        stagingRoot: input.stagingRoot, snapshot: input.snapshot,
+        knowledgeBaseRoot: input.config.knowledgeBaseRoot, workset: input.buildState.workset,
+      });
+      if (repaired.length > 0) {
+        input.buildState.knowledgeDraft = undefined;
+        for (const item of repaired) {
+          const meta = input.buildState.docMeta?.get(item.path);
+          if (meta) meta.sources = meta.sources.filter((source) => !item.removedSources.includes(source));
+        }
+        const actorStore = new BuildActorStore({ buildId, stagingRoot: input.stagingRoot });
+        actorStore.load();
+        actorStore.invalidateReviewsForPaths(repaired.map((item) => item.path), 'placeholder_source_removed');
+        prior.actorPayload = actorStore.exportCheckpointPayload();
+        const paths = repaired.map((item) => item.path);
+        this.emitLog(buildId, 'info', `恢复时自动修正 ${paths.length} 篇草稿的空白/权限占位来源；正文与真实证据保持原样，旧审查已失效，待独立复审：${paths.join('、')}`);
+        leaderInput.resumeBriefing += `\n程序已从以下草稿的 sources 移除经核验的空白/权限占位来源，正文未改。不要再派写作；请只派独立审查，通过后可阶段发布：${paths.join('、')}。`;
+        this.persistCheckpoint(buildId);
       }
     }
     if (prior && entry.leaderResumeStrategy === 'rebuild') {
@@ -1639,6 +1755,9 @@ export class KbBuildService extends EventEmitter {
       if (entry.leaderRun) entry.leaderRun.material.baseReleaseId = releaseId;
       ctx.updateKbBuild({ releaseId, docsWritten: state.writtenPaths?.size ?? 0 });
       this.persistCheckpoint(buildId);
+      // Each formal publication is concrete forward progress. Give a later
+      // unrelated transient failure its own bounded recovery budget.
+      this.clearAutoResumeAttempts(buildId);
       this.emitLog(buildId, 'info', `阶段发布完成：${newPaths.length} 篇文档已进入正式标准库（release=${releaseId}）；其余任务继续构建`);
       this.emitBuild(buildId, 'build_progressive_published', { releaseId, paths: newPaths });
       // The first eligible document can unblock another one whose carried
@@ -2365,16 +2484,30 @@ export class KbBuildService extends EventEmitter {
       entry.stage = 'describing_images';
       const cancelController = new AbortController();
       entry.cancelController = cancelController;
-      buildState.imageDescriptions = resume ? new Map(resume.imageDescriptions.map(([token, values]) => [token, new Map(values)])) : await this.describeWorksetImages({
-        buildId,
-        entry,
-        snapshot,
-        workset,
-        describer: visionDescriber,
-        visionReady,
-        signal: cancelController.signal,
-      });
-      if (resume) { entry.images = resume.progress.images; this.emitLog(buildId, 'info', `已恢复检查点：${resume.writtenPaths.length} 份已写草稿，复用 ${entry.images.described + entry.images.cached} 个图片转化结果；从未完成部分继续。`); }
+      if (resume) {
+        const saved = new Map(resume.imageDescriptions.map(([token, values]) => [token, new Map(values)]));
+        const retryUnavailable = visionReady && [...workset.keys()].some((token) =>
+          [...(saved.get(token)?.values() ?? [])].some((description) => description.state === 'unavailable'));
+        if (retryUnavailable) {
+          // 恢复时缓存已有描述，只对仍 unavailable 的图片重新请求远端。
+          // describeMany 按图片哈希命中成功缓存，不会重复扣已完成图片的额度。
+          const refreshed = await this.describeWorksetImages({
+            buildId, entry, snapshot, workset, describer: visionDescriber,
+            visionReady, signal: cancelController.signal,
+          });
+          for (const [token, values] of refreshed) saved.set(token, values);
+          this.emitLog(buildId, 'info', `检查点中有未理解图片，已复用缓存并补试；当前 ${entry.images.unavailable}/${entry.images.total} 张仍未理解`);
+        } else {
+          entry.images = resume.progress.images;
+        }
+        buildState.imageDescriptions = saved;
+        this.emitLog(buildId, 'info', `已恢复检查点：${resume.writtenPaths.length} 份已写草稿，复用 ${entry.images.described + entry.images.cached} 个图片转化结果；从未完成部分继续。`);
+      } else {
+        buildState.imageDescriptions = await this.describeWorksetImages({
+          buildId, entry, snapshot, workset, describer: visionDescriber,
+          visionReady, signal: cancelController.signal,
+        });
+      }
       if (entry.rebuildSelected && !resume) await this.includeRetainedImageCache(buildState, visionDescriber, cancelController.signal);
       buildState.visionReady = visionReady;
       if (entry.cancelRequested) throw new CancelledError();
@@ -2949,6 +3082,9 @@ export class KbBuildService extends EventEmitter {
         /* 度量列写入失败不影响构建终态（诊断缓存而已） */
       }
       this.running = false;
+      if (!entry.cancelRequested) {
+        this.scheduleAutoResume(localMapStore as Parameters<KbBuildService['resumeBuild']>[0], buildId);
+      }
       void currentStatus;
     }
   }
@@ -5934,7 +6070,11 @@ export class KbBuildService extends EventEmitter {
       for (const item of report.skipped) skippedReason.set(item.objToken, item.reason);
     }
     for (const item of buildState.finishInfo?.skipped ?? []) skippedReason.set(item.objToken, item.reason);
-    const sourceDisposition = snapshot.entries.map((source) => ({
+    // Candidate disposition covers this build's workset. The snapshot also
+    // contains unchanged background sources used as read-only context; asking
+    // the Leader to invent skip decisions for them blocks a valid incremental
+    // release (notably older Feishu permission placeholders).
+    const sourceDisposition = snapshot.entries.filter((source) => buildState.workset.has(source.objToken)).map((source) => ({
       sourceId: source.objToken,
       disposition: referenced.has(source.objToken)
         ? 'referenced'
@@ -7299,6 +7439,13 @@ export class KbBuildService extends EventEmitter {
         }
       }
     }
+    // If the desktop process exited while a recoverable Leader was running,
+    // continue from its verified checkpoint after startup without UI action.
+    const recoveryStore = localMapStore as Parameters<KbBuildService['resumeBuild']>[0] & {
+      listKbBuilds(limit?: number): Array<Record<string, unknown>>;
+    };
+    const latest = recoveryStore.listKbBuilds?.(1)?.[0];
+    if (latest) this.scheduleAutoResume(recoveryStore, String(latest.id));
     return { interruptedBuildIds: interrupted };
   }
 }
@@ -7511,16 +7658,19 @@ export function validateStagingDocs(
   // 也不应迫使 Leader 为了通过覆盖校验把占位源挂到正式文档。仅处理本轮
   // 工作集，并把确定性跳过原因写入收尾记录，供候选与发布清单使用。
   const permissionDenied = new Set<string>();
+  const blankWorkbooks = new Set<string>();
   for (const [token] of state.workset) {
     if (!snapshot.has(token)) continue;
     const source = snapshot.readVerified(state.knowledgeBaseRoot, token);
-    if (!isPermissionDeniedSourcePlaceholder(source.content)) continue;
-    permissionDenied.add(token);
+    const denied = isPermissionDeniedSourcePlaceholder(source.content);
+    const blank = !denied && source.entry.objType === 'sheet' && isBlankWorkbookPlaceholder(source);
+    if (!denied && !blank) continue;
+    if (denied) permissionDenied.add(token);
+    if (blank) blankWorkbooks.add(token);
     if (state.finishInfo && !state.finishInfo.skipped.some((item) => item.objToken === token)) {
-      state.finishInfo.skipped.push({
-        objToken: token,
-        reason: '飞书侧 40403 权限受限，本地仅有权限占位；本轮跳过，待权限恢复后补建',
-      });
+      state.finishInfo.skipped.push({ objToken: token, reason: denied
+        ? '飞书侧 40403 权限受限，本地仅有权限占位；本轮跳过，待权限恢复后补建'
+        : '源工作簿只有生成的标题与空白 CSV 子表，无可转换知识；待填入有效数据后补建' });
     }
   }
   const docsDir = path.join(state.stagingRoot, 'docs');
@@ -7563,9 +7713,9 @@ export function validateStagingDocs(
     }
     const full = path.join(docsDir, file);
     const stat = fs.statSync(full);
-    if (stat.size > 1024 * 1024) {
+    if (stat.size > MAX_STANDARD_DOC_BYTES) {
       totalBytes += stat.size;
-      issues.push({ path: file, code: 'file_too_large', message: `单文件超过 1MB（${stat.size} 字节）` });
+      issues.push({ path: file, code: 'file_too_large', message: `单文件超过 ${MAX_STANDARD_DOC_BYTES} 字节（当前 ${stat.size} 字节）` });
       continue;
     }
     const content = fs.readFileSync(full, 'utf-8');
@@ -7596,6 +7746,8 @@ export function validateStagingDocs(
         issues.push({ path: file, objToken: token, code: 'source_not_in_snapshot', message: `来源不在快照内: ${token}` });
       } else if (permissionDenied.has(token)) {
         issues.push({ path: file, objToken: token, code: 'source_permission_denied', message: '该来源只有飞书 40403 权限占位，不能作为正式文档证据；请从 sources 移除，本轮自动记为跳过' });
+      } else if (blankWorkbooks.has(token)) {
+        issues.push({ path: file, objToken: token, code: 'source_blank_workbook', message: '该来源只有全空 CSV 子表，不能作为正文依据；请从 sources 移除，本轮自动记为跳过' });
       } else {
         referencedSources.add(token);
       }
@@ -7648,7 +7800,7 @@ export function validateStagingDocs(
   }
   for (const item of state.finishInfo?.skipped ?? []) skipped.add(item.objToken);
   for (const [token] of state.workset) {
-    if (!referencedSources.has(token) && !skipped.has(token)) {
+    if (!referencedSources.has(token) && !skipped.has(token) && !blankWorkbooks.has(token)) {
       issues.push({ objToken: token, code: 'source_not_covered', message: '源既未被文档引用也未列入 skipped' });
     }
   }
