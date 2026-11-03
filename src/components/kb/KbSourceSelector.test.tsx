@@ -58,6 +58,14 @@ it('父节点自身也是源文档：预览、计数和批量勾选都包含父�
     expect(checkbox('父文档').indeterminate).toBe(true);
     await act(async () => button('构建所选文档').click());
     expect(state.build).toHaveBeenLastCalledWith(1);
+    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="取消本文：父文档"]')!.click());
+    expect(state.selection).toHaveBeenLastCalledWith(['a'], 'exclude');
+    expect(button('构建所选文档').disabled).toBe(true);
+    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="只选本文：父文档"]')!.click());
+    expect(state.selection).toHaveBeenLastCalledWith(['a'], 'include');
+    expect(checkbox('子文档').checked).toBe(false);
+    await act(async () => button('构建所选文档').click());
+    expect(state.build).toHaveBeenLastCalledWith(1);
   } finally { act(() => root.unmount()); container.remove(); state.parentSource = false; }
 });
 
