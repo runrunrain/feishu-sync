@@ -246,6 +246,22 @@ describe('guardTaskSubmit', () => {
     expect(imported.decision).toBe('allow');
   });
 
+  it('输出坐标加多子表不能因提及 csvTableImports 绕过拆分', () => {
+    const task = [
+      '【写作】人塔寨综合战术工作表：总输出 3707 行。',
+      '②Concept 输出 1428–1652；③-1 分析拆解 输出 1655–1858；',
+      '③-2 主流程 输出 1861–2060；④Detail-1 规则与交互 输出 2265–2500；',
+      '①idea 输出 1226–1425。③-1 明细可用 csvTableImports 导入。',
+      '本篇还需归纳概念、主流程、规则、表现和交互，并登记全部子表覆盖。',
+    ].join('\n');
+    const result = guardTaskSubmit(makeConfig(), { agent: 'luban', task });
+    expect(result.decision).toBe('block');
+    if (result.decision === 'block') {
+      expect(result.code).toBe('dispatch_writer_scope_too_broad');
+      expect(result.message).toContain('1065 行');
+    }
+  });
+
   it('taskFile 越出工作目录 → 阻止（../ 与绝对路径）', () => {
     expect(guardTaskSubmit(makeConfig(), { agent: 'luban', taskFile: '../escape.md' }).decision).toBe('block');
     expect(guardTaskSubmit(makeConfig(), { agent: 'luban', taskFile: '/etc/passwd' }).decision).toBe('block');
