@@ -1240,9 +1240,9 @@ export class AgentToolService {
       throw new ToolError('invalid_request', 'recordStart 和 recordEnd 均为必填');
     }
     const recordStart = optionalInt(args, 'recordStart', 1, 1, 10_000_000);
-    const recordEnd = optionalInt(args, 'recordEnd', recordStart, 1, 10_000_000);
-    if (recordEnd < recordStart || recordEnd - recordStart >= 20) {
-      throw new ToolError('invalid_request', 'recordStart..recordEnd 须为最多 20 条的闭区间');
+    const requestedRecordEnd = optionalInt(args, 'recordEnd', recordStart, 1, 10_000_000);
+    if (requestedRecordEnd < recordStart) {
+      throw new ToolError('invalid_request', 'recordStart..recordEnd 须为非空闭区间');
     }
     const entry = state.snapshot.get(objToken);
     if (!entry) throw new ToolError('not_found', `原始文档不存在或无成功本地版本: ${objToken}`, 404);
@@ -1250,9 +1250,12 @@ export class AgentToolService {
     const resource = assembled.resources.find((item) => item.resourceId === resourceId && item.kind === 'csv');
     if (!resource) throw new ToolError('not_found', `冻结源没有该 CSV 资源: ${resourceId}`, 404);
     const parsed = parseCsvRecords(resource.lines.join('\n'));
-    if (recordEnd > parsed.records.length) {
-      throw new ToolError('invalid_request', `CSV 共 ${parsed.records.length} 条逻辑 record，结束位置 ${recordEnd} 越界`);
+    if (recordStart > parsed.records.length) {
+      throw new ToolError('invalid_request', `CSV 共 ${parsed.records.length} 条逻辑 record，起始位置 ${recordStart} 越界`);
     }
+    const recordEnd = Math.min(requestedRecordEnd, parsed.records.length, recordStart + 19);
+    const nextRecordStart = recordEnd < requestedRecordEnd && recordEnd < parsed.records.length
+      ? recordEnd + 1 : null;
     const columnName = (index: number): string => {
       let n = index + 1;
       let name = '';
@@ -1271,7 +1274,7 @@ export class AgentToolService {
       };
     });
     const payload = { objToken, resourceId, resourceHash: resource.resourceHash,
-      totalRecords: parsed.records.length, recordStart, recordEnd, records };
+      totalRecords: parsed.records.length, recordStart, recordEnd, requestedRecordEnd, nextRecordStart, records };
     const serialized = JSON.stringify(payload);
     if (serialized.length > 16_000) {
       throw new ToolError('raw_csv_cells_too_large', '目标记录超过 16000 字符；请缩小 record 区间后重读', 409);
@@ -1292,7 +1295,7 @@ export class AgentToolService {
     }]);
     return {
       content: [{ type: 'text', text: `<read_receipt id="${readReceiptId}" resource_id="${resourceId}" lines="${lineStart}-${lineEnd}" />\n<untrusted_source>\n${serialized}\n</untrusted_source>` }],
-      details: { readReceiptId, resourceId, lineStart, lineEnd, recordStart, recordEnd, totalRecords: parsed.records.length },
+      details: { readReceiptId, resourceId, lineStart, lineEnd, recordStart, recordEnd, requestedRecordEnd, nextRecordStart, totalRecords: parsed.records.length },
     };
   }
 
@@ -1303,8 +1306,8 @@ export class AgentToolService {
     const objToken = requireString(args, 'objToken', 1, 256);
     const resourceId = requireString(args, 'resourceId', 1, 512);
     const queries = requireArray(args, 'queries');
-    if (queries.length < 1 || queries.length > 8 || queries.some((value) => typeof value !== 'string' || value.trim().length < 3 || value.length > 200)) {
-      throw new ToolError('invalid_request', 'queries 须为 1–8 个长度 3–200 的非空短语');
+    if (queries.length < 1 || queries.length > 8 || queries.some((value) => typeof value !== 'string' || value.trim().length < 2 || value.length > 200)) {
+      throw new ToolError('invalid_request', 'queries 须为 1–8 个长度 2–200 的非空短语');
     }
     const entry = state.snapshot.get(objToken);
     if (!entry) throw new ToolError('not_found', `原始文档不存在或无成功本地版本: ${objToken}`, 404);

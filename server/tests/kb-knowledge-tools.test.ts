@@ -390,6 +390,27 @@ describe('raw_read：readReceiptId 登记与 segmentMap（多资源拼接）', (
     })).rejects.toMatchObject({ code: 'invalid_request' });
   });
 
+  it('较大的 CSV 请求自动分页，每页回执只覆盖实际返回的记录', async () => {
+    writeRaw(CSV_NAME, ['列,值', ...Array.from({ length: 25 }, (_, i) => `${i + 1},值${i + 1}`)].join('\n') + '\n');
+    try {
+      const state = makeBuildState('csv-cells-paged');
+      const token = tokenFor(state);
+      const first = await service.executeTool(token, 'raw_csv_cells', {
+        objToken: 'tokB', resourceId: 'tokB#csv:表.csv', recordStart: 1, recordEnd: 99,
+      });
+      expect(first.details).toMatchObject({ recordStart: 1, recordEnd: 20, requestedRecordEnd: 99, nextRecordStart: 21 });
+      expect((first.details as { lineEnd: number }).lineEnd).toBe(20);
+      const next = await service.executeTool(token, 'raw_csv_cells', {
+        objToken: 'tokB', resourceId: 'tokB#csv:表.csv', recordStart: 21, recordEnd: 99,
+      });
+      expect(next.details).toMatchObject({ recordStart: 21, recordEnd: 26, nextRecordStart: null, totalRecords: 26 });
+      expect(state.readReceipts?.at(-2)?.selector).toMatchObject({ lineStart: 1, lineEnd: 20 });
+      expect(state.readReceipts?.at(-1)?.selector).toMatchObject({ lineStart: 21, lineEnd: 26 });
+    } finally {
+      writeRaw(CSV_NAME, CSV_CONTENT);
+    }
+  });
+
   it('有内容的 CSV 中连续空白记录默认折叠，回执和页界仍覆盖原文，按需可逐字重读', async () => {
     writeRaw(CSV_NAME, '列,值\n1,一\n,\n,\n,\n2,二\n');
     try {
@@ -639,7 +660,7 @@ describe('kb_write_doc：原子落盘与声明', () => {
   it('批量查找冻结 CSV 短语并返回可直接使用的准确 selector 和回执', async () => {
     const state = makeBuildState('csv-find');
     const result = await service.executeTool(tokenFor(state), 'raw_csv_find', {
-      objToken: 'tokB', resourceId: 'tokB#csv:表.csv', queries: ['多行\n内容', '不存在'],
+      objToken: 'tokB', resourceId: 'tokB#csv:表.csv', queries: ['多行\n内容', '不存在', '多行'],
     });
     const details = result.details as { results: Array<{ totalMatches: number; matches: Array<{
       recordNumber: number; column: string; readReceiptId: string; selector: Record<string, unknown>;
@@ -651,6 +672,7 @@ describe('kb_write_doc：原子落盘与声明', () => {
     });
     expect(details.results[0]!.matches[0]!.readReceiptId).toMatch(/^rr_/);
     expect(details.results[1]!.totalMatches).toBe(0);
+    expect(details.results[2]!.totalMatches).toBe(1);
     const match = details.results[0]!.matches[0]!;
     const written = await service.executeTool(tokenFor(state), 'kb_write_doc', {
       path: '战斗/查找证据.md', markdown: '## 查找证据\n包含多行内容。',

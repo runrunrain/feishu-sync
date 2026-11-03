@@ -112,14 +112,14 @@ export const RAW_READ_SPEC: AgentToolSpec = {
 export const RAW_CSV_CELLS_SPEC: AgentToolSpec = {
   name: 'raw_csv_cells',
   label: '冻结 CSV 单元格阅读',
-  description: '按逻辑 record 读取冻结 CSV 的准确列位和值，服务端解析引号内换行并登记物理行读取回执。只返回非空单元格；未列出的列为空。用于核对 csv_cells 证据，避免人工数逗号。',
+  description: '按逻辑 record 读取冻结 CSV 的准确列位和值，服务端解析引号内换行并登记物理行读取回执。一次最多返回 20 条；较大范围自动分页并给出 nextRecordStart。只返回非空单元格；未列出的列为空。用于核对 csv_cells 证据，避免人工数逗号。',
   parameters: {
     type: 'object',
     properties: {
       objToken: string('源文档 objToken'),
       resourceId: string('raw_read 资源表中的完整 #csv: 资源 ID'),
       recordStart: integer('起始逻辑 record（1 基）', 1),
-      recordEnd: integer('结束逻辑 record（1 基，闭区间；单次最多 20 条）', 1),
+      recordEnd: integer('期望结束的逻辑 record（1 基，闭区间；超过 20 条自动分页）', 1),
     },
     required: ['objToken', 'resourceId', 'recordStart', 'recordEnd'],
     additionalProperties: false,
@@ -135,7 +135,7 @@ export const RAW_CSV_FIND_SPEC: AgentToolSpec = {
     properties: {
       objToken: string('源文档 objToken'),
       resourceId: string('raw_read 资源表中的完整 #csv: 资源 ID'),
-      queries: { type: 'array', items: { type: 'string', minLength: 3, maxLength: 200 }, minItems: 1, maxItems: 8,
+      queries: { type: 'array', items: { type: 'string', minLength: 2, maxLength: 200 }, minItems: 1, maxItems: 8,
         description: '待定位的源文短语，逐格子串匹配；每项最多返回前 5 处' },
     },
     required: ['objToken', 'resourceId', 'queries'],
