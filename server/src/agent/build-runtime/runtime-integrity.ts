@@ -258,9 +258,30 @@ export function verifyRuntimeIntegrity(
     } else if (!skillStat.isFile()) {
       issues.push(`workflow skill 不是常规文件（${skillPath}），拒绝派发`);
     } else {
-      const skillHash = createHash('sha256').update(fs.readFileSync(skillPath)).digest('hex');
+      const skillContent = fs.readFileSync(skillPath, 'utf8');
+      const skillHash = createHash('sha256').update(skillContent).digest('hex');
       if (skillHash !== refs.workflowSkill.sha256) {
         issues.push(`workflow skill 内容与冻结 workflowRevision 不一致（${skillPath}，冻结 ${refs.workflowSkill.sha256.slice(0, 12)}，当前 ${skillHash.slice(0, 12)}）——child 将读到被改规则而回执仍绑旧版本，拒绝派发`);
+      }
+      const roleEntries = [...skillContent.matchAll(/^<!--ROLE_SKILL (luban|diting|baize) sha256=([0-9a-f]{64}) path=(role-(?:luban|diting|baize)\.md)-->$/gm)];
+      if (skillContent.includes('<!--ROLE_SKILL ') && (roleEntries.length !== 3
+        || new Set(roleEntries.map((entry) => entry[1])).size !== 3)) {
+        issues.push('workflow skill 角色文件清单不完整，拒绝派发');
+      }
+      for (const [, role, expectedHash, fileName] of roleEntries) {
+        if (fileName !== `role-${role}.md`) {
+          issues.push(`workflow skill 角色文件名不匹配（${role}），拒绝派发`);
+          continue;
+        }
+        const rolePath = path.join(path.dirname(skillPath), fileName);
+        try {
+          const stat = fs.lstatSync(rolePath);
+          if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('不是常规文件');
+          const actualHash = createHash('sha256').update(fs.readFileSync(rolePath)).digest('hex');
+          if (actualHash !== expectedHash) throw new Error('内容哈希不匹配');
+        } catch (error) {
+          issues.push(`workflow skill 角色文件 ${role} 校验失败（${error instanceof Error ? error.message : String(error)}），拒绝派发`);
+        }
       }
     }
   }

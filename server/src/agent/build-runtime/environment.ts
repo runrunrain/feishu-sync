@@ -15,7 +15,7 @@
  * Leader 转发扩展两变量 + amagi 自动行为开关。
  */
 
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import {
   BUILD_MCP_TOKEN_ENV, BUILD_MCP_URL_ENV, ZHIPU_API_KEY_ENV,
@@ -96,6 +96,10 @@ export function buildLeaderEnv(input: LeaderEnvInput): NodeJS.ProcessEnv {
   // 子任务启动时由内容寻址 child-policy 强制读取这份冻结技能，避免
   // --skill 只展示摘要却让模型直接猜 kb_write_doc 参数。
   env.PI_BUILD_WORKFLOW_SKILL_PATH = path.resolve(input.spec.workflowSkillPath);
+  const roleSkillDir = path.dirname(env.PI_BUILD_WORKFLOW_SKILL_PATH);
+  if (['luban', 'diting', 'baize'].every((role) => existsSync(path.join(roleSkillDir, `role-${role}.md`)))) {
+    env.PI_BUILD_ROLE_SKILL_REQUIRED = '1';
+  }
 
   // 模型密钥（Leader 直接使用；amagi 只转交给 zhipuai 子任务）
   env[ZHIPU_API_KEY_ENV] = input.zhipuApiKey;

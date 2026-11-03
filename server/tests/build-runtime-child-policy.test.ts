@@ -176,6 +176,40 @@ describe('child-policy 扩展行为', () => {
     expect(await fake.emit('tool_call', write)).toBeUndefined();
   });
 
+  it('启用角色技能后，仅读主 SKILL 前 14 行仍不能写入，须再读对应角色文件', async () => {
+    const previousRole = process.env.AMAGI_AGENT;
+    const previousRequired = process.env.PI_BUILD_ROLE_SKILL_REQUIRED;
+    try {
+      process.env.AMAGI_TASK_ID = 'unit-role-protocol-read';
+      process.env.AMAGI_AGENT = 'luban';
+      process.env.PI_BUILD_ROLE_SKILL_REQUIRED = '1';
+      const root = tmpRoot();
+      const skillDir = path.join(root, 'skills', 'knowledge-build');
+      fs.mkdirSync(skillDir, { recursive: true });
+      const skillPath = path.join(skillDir, 'SKILL.md');
+      const rolePath = path.join(skillDir, 'role-luban.md');
+      fs.writeFileSync(skillPath, '# role index\n');
+      fs.writeFileSync(rolePath, '# writer protocol\n');
+      process.env.PI_BUILD_WORKFLOW_SKILL_PATH = skillPath;
+      process.env.PI_BUILD_CHILD_ROOTS_JSON = JSON.stringify({ readRoots: [skillDir], writeRoots: [path.join(root, 'agent-outputs')] });
+      const mod = await loadPolicyModule();
+      const fake = makeFakePi();
+      mod.default(fake.pi);
+      const write = { toolName: 'mcp_call', input: { tool: 'kb_write_doc', arguments: {} } };
+      await fake.emit('tool_call', { toolName: 'read', input: { path: skillPath } });
+      await fake.emit('tool_result', { toolName: 'read', input: { path: skillPath }, isError: false });
+      expect(await fake.emit('tool_call', write)).toMatchObject({ block: true });
+      await fake.emit('tool_call', { toolName: 'read', input: { path: rolePath } });
+      await fake.emit('tool_result', { toolName: 'read', input: { path: rolePath }, isError: false });
+      expect(await fake.emit('tool_call', write)).toBeUndefined();
+    } finally {
+      if (previousRole === undefined) delete process.env.AMAGI_AGENT;
+      else process.env.AMAGI_AGENT = previousRole;
+      if (previousRequired === undefined) delete process.env.PI_BUILD_ROLE_SKILL_REQUIRED;
+      else process.env.PI_BUILD_ROLE_SKILL_REQUIRED = previousRequired;
+    }
+  });
+
   it('多锚点面过滤：session_start/before_agent_start/turn_start/turn_end/agent_end/tool_result/message_end/message_start 均重放', async () => {
     process.env.AMAGI_TASK_ID = 'unit-task-1';
     const mod = await loadPolicyModule();

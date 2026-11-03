@@ -3865,15 +3865,39 @@ export class AgentToolService {
     if (!coverageInput) throw new ToolError('invalid_request', 'coverage 必须是对象');
     const sourceRefs = optStrArray(coverageInput, 'sourceRefs') ?? [];
     const allEntries = this.stagingDraftEntries(state);
-    // The server derives the review scope from the report's source coverage and
-    // the actual document headers. The model does not supply document hashes.
-    const scopePaths = v2Info ? allEntries.filter((entry) => {
+    // A source may produce many independently publishable documents. Bind a
+    // review to the exact document paths when supplied; derive all documents
+    // from sourceRefs only for older callers. The server still computes every
+    // content/declaration hash and checks the declared source set.
+    const requestedPaths = coverageInput.docPaths === undefined ? null : optStrArray(coverageInput, 'docPaths');
+    if (v2Info && coverageInput.docPaths !== undefined && (!requestedPaths || requestedPaths.length === 0)) {
+      throw new ToolError('kb_review_scope_missing', 'coverage.docPaths 必须列出至少一篇待审草稿', 400);
+    }
+    const sourceSet = new Set(sourceRefs);
+    const available = new Map(allEntries.map((entry) => [entry.path, entry]));
+    if (v2Info && requestedPaths && (new Set(requestedPaths).size !== requestedPaths.length
+      || requestedPaths.some((docPath) => !available.has(docPath)))) {
+      throw new ToolError('kb_review_scope_missing', 'coverage.docPaths 含重复或不存在的草稿路径', 400);
+    }
+    const scopePaths = v2Info ? (requestedPaths ?? allEntries.filter((entry) => {
       const content = fs.readFileSync(path.join(state.stagingRoot, 'docs', entry.path), 'utf8');
       const header = parseStdHeader(content);
-      return header?.sources.some((source) => sourceRefs.includes(source)) ?? false;
-    }).map((entry) => entry.path) : [];
+      return header?.sources.some((source) => sourceSet.has(source)) ?? false;
+    }).map((entry) => entry.path)) : [];
     if (v2Info && (sourceRefs.length === 0 || scopePaths.length === 0)) {
       throw new ToolError('kb_review_scope_missing', '审查范围必须包含实际草稿引用的来源；请在 coverage.sourceRefs 填写所审来源', 400);
+    }
+    if (v2Info && requestedPaths) {
+      const actualSources = new Set<string>();
+      for (const docPath of scopePaths) {
+        const content = fs.readFileSync(path.join(state.stagingRoot, 'docs', docPath), 'utf8');
+        const header = parseStdHeader(content);
+        if (!header?.sources.length) throw new ToolError('kb_review_scope_missing', `草稿缺少来源声明：${docPath}`, 400);
+        header.sources.forEach((source) => actualSources.add(source));
+      }
+      if (actualSources.size !== sourceSet.size || [...actualSources].some((source) => !sourceSet.has(source))) {
+        throw new ToolError('kb_review_scope_missing', 'coverage.sourceRefs 必须恰好包含 coverage.docPaths 中草稿声明的全部来源', 400);
+      }
     }
     const entries = v2Info ? allEntries.filter((entry) => scopePaths.includes(entry.path)) : allEntries;
     const draftHash = computeCandidateHash({ documents: entries });

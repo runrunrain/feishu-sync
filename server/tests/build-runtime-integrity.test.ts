@@ -223,6 +223,27 @@ describe('runtime-integrity 单元（真实渲染/落盘/包哈希）', () => {
     });
   });
 
+  it('角色技能文件篡改会在子任务派发前被内容哈希拦截', async () => {
+    await withFixture((fixture) => {
+      const skillPath = fixture.refs.workflowSkill.path;
+      const roleDir = path.dirname(skillPath);
+      const roles = ['luban', 'diting', 'baize'] as const;
+      const entries = roles.map((role) => {
+        const fileName = `role-${role}.md`;
+        const body = `# ${role} 协议\n`;
+        fs.writeFileSync(path.join(roleDir, fileName), body);
+        return `<!--ROLE_SKILL ${role} sha256=${createHash('sha256').update(body).digest('hex')} path=${fileName}-->`;
+      });
+      const main = `${fs.readFileSync(skillPath, 'utf8')}\n${entries.join('\n')}\n`;
+      fs.writeFileSync(skillPath, main);
+      const refs = { ...fixture.refs, workflowSkill: { ...fixture.refs.workflowSkill,
+        sha256: createHash('sha256').update(main).digest('hex') } };
+      expect(verifyRuntimeIntegrity(refs, hasherDeps).ok).toBe(true);
+      fs.appendFileSync(path.join(roleDir, 'role-luban.md'), '篡改');
+      expect(verifyRuntimeIntegrity(refs, hasherDeps).issues.join('\n')).toContain('角色文件 luban 校验失败');
+    });
+  });
+
   it('引用形状非法（schemaVersion/homeDir/childPolicy 名/哈希）→ 触盘前即拒', async () => {
     await withFixture((fixture) => {
       const bad = { ...fixture.refs, schemaVersion: 99 } as RuntimeIntegrityRefs;

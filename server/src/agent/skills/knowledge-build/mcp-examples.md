@@ -100,7 +100,7 @@ CSV 证据不能用 `text_span`：在对应 `evidenceClaims` 项使用 `"sourceR
 ## 提交审查报告（仅审查身份）
 
 ```json
-{"server": "feishu-kb-bridge", "tool": "kb_submit_review", "arguments": {"coverage": {"sourceRefs": ["<token>"]}, "checkedDimensions": ["完整性", "事实与数值", "来源忠实性"], "issues": [{"draftLocation": "combat/actions.md 怒气消耗节", "sourceLocation": "《战斗系统》源表 3", "description": "怒气消耗数值与来源表 3 不符（读取回执 rr_123）", "severity": "blocking"}], "uncheckedScope": [], "conclusion": "needs_revision"}}
+{"server": "feishu-kb-bridge", "tool": "kb_submit_review", "arguments": {"coverage": {"docPaths": ["combat/actions.md"], "sourceRefs": ["<token>"]}, "checkedDimensions": ["完整性", "事实与数值", "来源忠实性"], "issues": [{"draftLocation": "combat/actions.md 怒气消耗节", "sourceLocation": "《战斗系统》源表 3", "description": "怒气消耗数值与来源表 3 不符（读取回执 rr_123）", "severity": "blocking"}], "uncheckedScope": [], "conclusion": "needs_revision"}}
 ```
 
 - `conclusion` 取 `pass`/`needs_revision`/`insufficient_material`/`fail`；blocking 问题必须带 `sourceLocation`。

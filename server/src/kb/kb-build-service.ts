@@ -1176,7 +1176,7 @@ export class KbBuildService extends EventEmitter {
   // ------------------------------------------------------------------
 
   /** 构建 skill 包资产定位（dist→src 回退；缺包时新模式拒绝启动）。 */
-  private static leaderWorkflowAssets(): { leaderRules: string; revision: string; skillPath: string; combined: string } {
+  private static leaderWorkflowAssets(): { leaderRules: string; revision: string; skillPath: string; combined: string; contents: Map<string, string> } {
     const relatives = [
       'knowledge-build/SKILL.md',
       'knowledge-build/leader-protocol.md',
@@ -1218,7 +1218,7 @@ export class KbBuildService extends EventEmitter {
       .digest('hex');
     // 全量拼接内容（构建专用物化用；六协议模板 + 运行时质量基线合并为单文件）
     const combined = relatives.map((relative) => `\n\n---\n\n# ${relative}\n\n${contents.get(relative) ?? ''}`).join('');
-    return { leaderRules, revision, skillPath, combined };
+    return { leaderRules, revision, skillPath, combined, contents };
   }
 
   /** 构建专用物化冻结 skill（steer #5）：六协议模板 + 内置 buildRules/styleGuide/
@@ -1228,18 +1228,52 @@ export class KbBuildService extends EventEmitter {
     const base = KbBuildService.leaderWorkflowAssets();
     // steer #5/#11：内置 buildRules/styleGuide/reviewPrompt 必须进入冻结 skill
     //（不受 pluginStore 门控——v1 门控只针对旧内联注入；物化基线不可丢）
-    const quality = KbBuildService.qualityBaselineSections(
-      this.deps.promptAssets(),
-      this.deps.reviewPrompt?.() ?? null,
-    ).join('\n');
+    const promptAssets = this.deps.promptAssets();
+    const reviewPrompt = this.deps.reviewPrompt?.() ?? null;
+    const quality = KbBuildService.qualityBaselineSections(promptAssets, reviewPrompt).join('\n');
     // Pi --skill 只发现带 frontmatter 的 SKILL.md，且启动时仅展示技能摘要；
     // 旧 workflow-skill.md 从分隔符起头，子任务实际上没有发现该技能。
-    const content = `---\nname: knowledge-build\ndescription: 飞书同步标准知识库构建。写作、审查与调研子任务在处理来源、提交草稿或审查前必须读取本技能。\n---\n${base.combined}${quality ? `\n${quality}\n` : ''}`;
     // steer #11：物化到 build 专用 home 的独立 skills 目录（与 policy/config
     // 禁区分开，允许子任务 read 但不授写；outputRoot 整体在 buildForbiddenZones
     // 禁区内，旧路径 <outputRoot>/.builds/<id>/ 不可用）
     const dir = path.join(this.deps.dataRoot, 'agent', 'builds', buildId, 'home', 'skills', 'knowledge-build');
     fs.mkdirSync(dir, { recursive: true });
+    const template = (name: string): string => base.contents.get(`knowledge-build/${name}`) ?? '';
+    const examples = template('mcp-examples.md');
+    const part = (from: string, until?: string): string => {
+      const first = examples.indexOf(from);
+      if (first < 0) throw new ToolError('build_runtime_unavailable', `冻结 MCP 示例缺少 ${from}`, 503);
+      const last = until ? examples.indexOf(until, first + from.length) : examples.length;
+      if (last < 0) throw new ToolError('build_runtime_unavailable', `冻结 MCP 示例缺少 ${until}`, 503);
+      return examples.slice(first, last);
+    };
+    const readExamples = part('# MCP 桥接调用示例', '## 写正文与声明（仅写作身份）');
+    const toolErrors = part('## 常见错误');
+    const sharedQuality = KbBuildService.qualityBaselineSections(promptAssets, null).join('\n');
+    const roleContents: Record<'luban' | 'diting' | 'baize', string> = {
+      luban: [template('SKILL.md'), template('author-protocol.md'), template('achievement-protocol.md'),
+        readExamples, part('## 写正文与声明（仅写作身份）', '## 提交审查报告（仅审查身份）'),
+        toolErrors, sharedQuality].join('\n\n---\n\n'),
+      diting: [template('SKILL.md'), template('reviewer-protocol.md'), template('achievement-protocol.md'),
+        readExamples, part('## 提交审查报告（仅审查身份）', '## Leader 工具（仅 Leader 身份）'),
+        toolErrors, quality].join('\n\n---\n\n'),
+      baize: [template('SKILL.md'), template('achievement-protocol.md'), readExamples, toolErrors, sharedQuality]
+        .join('\n\n---\n\n'),
+    };
+    const roleEntries = (Object.entries(roleContents) as Array<[keyof typeof roleContents, string]>).map(([role, body]) => {
+      const name = `role-${role}.md`;
+      const hash = crypto.createHash('sha256').update(body).digest('hex');
+      fs.writeFileSync(path.join(dir, name), body);
+      return { role, name, hash };
+    });
+    // The Leader keeps the full frozen system prompt. Child role files are
+    // content-addressed by this SKILL.md and verified before each dispatch.
+    const guide = ['# 子任务按角色读取',
+      '第一步用原生 read 只读本文件前 14 行，再读取下列本角色文件全文；其他角色协议无需读取。',
+      ...roleEntries.map(({ role, name }) => `${role}: ${path.join(dir, name)}`),
+      ...roleEntries.map(({ role, name, hash }) => `<!--ROLE_SKILL ${role} sha256=${hash} path=${name}-->`),
+    ].join('\n');
+    const content = `---\nname: knowledge-build\ndescription: 飞书同步标准知识库构建。写作、审查与调研子任务在处理来源、提交草稿或审查前必须读取本技能。\n---\n\n${guide}${base.combined}${quality ? `\n${quality}\n` : ''}`;
     const skillPath = path.join(dir, 'SKILL.md');
     fs.writeFileSync(skillPath, content);
     return { leaderRules: base.leaderRules, revision: crypto.createHash('sha256').update(content).digest('hex'), skillPath };
@@ -1341,7 +1375,7 @@ export class KbBuildService extends EventEmitter {
       `- 并发上限：${resolveBuildConcurrency(config.standardKb)}（amagi 准入分池冻结）`,
       ...(skipBriefing ? [skipBriefing] : []),
       '',
-      '先经 build_manifest 默认 scope=workset 读取本轮唯一派发范围；scope=all 仅供背景查询，不为未变化基准源派任务。新增长文/表格按一篇目标文档一个写作任务派发，单篇读完即写，多个任务并发。不同主题的大表尽量分成不同目标文档；CSV 明细必须优先用 kb_write_doc.csvTableImports 从冻结附件自动导入，不让作者逐行复制到工具 JSON。每份子任务书第一条必须要求调用原生 read 读取上方冻结 SKILL.md，再调用 MCP 桥接；Pi 的 --skill 只提示技能路径，不自动注入全文。objToken 只在任务正文和 MCP 调用中使用，不是 task_submit.inputs.required 的本地路径。首批任务具备输入后立即派发；全部成果通过审查后申请发布当前精确候选版本。',
+      '先经 build_manifest 默认 scope=workset 读取本轮唯一派发范围；scope=all 仅供背景查询，不为未变化基准源派任务。新增长文/表格按一篇目标文档一个写作任务派发，单篇读完即写，多个任务并发。不同主题的大表尽量分成不同目标文档；CSV 明细必须优先用 kb_write_doc.csvTableImports 从冻结附件自动导入，不让作者逐行复制到工具 JSON。每份子任务书第一条必须要求原生 read 读取上方冻结 SKILL.md 前 14 行，再读取列出的本角色文件全文后调用 MCP 桥接；Pi 的 --skill 只提示技能路径，不自动注入全文。objToken 只在任务正文和 MCP 调用中使用，不是 task_submit.inputs.required 的本地路径。首批任务具备输入后立即派发；每篇写入后尽快派单篇审查并阶段发布，全部成果通过审查后申请发布当前精确候选版本。',
     ].join('\n');
     const resumeBriefing = [
       '# Leader 运行交代（续接）',

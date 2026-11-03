@@ -570,6 +570,7 @@ export const KB_SUBMIT_REVIEW_SPEC: AgentToolSpec = {
         description: '覆盖范围：检查了哪些源材料（不能只给总分）',
         properties: {
           sourceRefs: { type: 'array', items: { type: 'string' }, description: '覆盖的源 objToken 列表' },
+          docPaths: { type: 'array', items: { type: 'string' }, description: '本次实际审查的草稿完整 .md 路径；同一来源拆成多篇时逐篇填写，省略时兼容按来源覆盖全部草稿' },
         },
         required: ['sourceRefs'],
         additionalProperties: false,

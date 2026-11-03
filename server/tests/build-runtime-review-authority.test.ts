@@ -171,11 +171,33 @@ beforeAll(() => {
   toolService = new AgentToolService({ dataRoot, documentsProvider: () => [] });
   buildService = new KbBuildService({
     dataRoot, configProvider: () => ({ standardKb: { outputRoot }, knowledgeBaseRoot: kbRoot }) as never,
+    promptAssets: () => ({ buildRules: '构建规则', styleGuide: '文风规范' }),
+    reviewPrompt: () => '审查规则',
   } as never);
 });
 
 afterAll(() => {
   for (const dir of [dataRoot, kbRoot, outputRoot]) fs.rmSync(dir, { recursive: true, force: true });
+});
+
+it('冻结技能为子任务生成精简角色文件，Leader 主文件仍包含全部规则', () => {
+  const skill = (buildService as unknown as { materializeWorkflowSkill: (buildId: string) => { skillPath: string } })
+    .materializeWorkflowSkill('b_role-read-guide');
+  const full = fs.readFileSync(skill.skillPath, 'utf8');
+  const dir = path.dirname(skill.skillPath);
+  const writer = fs.readFileSync(path.join(dir, 'role-luban.md'), 'utf8');
+  const reviewer = fs.readFileSync(path.join(dir, 'role-diting.md'), 'utf8');
+  expect(full).toContain('<!--ROLE_SKILL luban sha256=');
+  expect(full).toContain('# Leader 协议');
+  expect(writer).toContain('# 写作子任务协议');
+  expect(writer).toContain('"tool": "kb_write_doc"');
+  expect(writer).not.toContain('# 独立审查协议');
+  expect(writer).not.toContain('# Leader 协议');
+  expect(reviewer).toContain('# 独立审查协议');
+  expect(reviewer).toContain('kb_submit_review');
+  expect(reviewer).not.toContain('# 写作子任务协议');
+  expect(writer.length).toBeLessThan(full.length);
+  expect(reviewer.length).toBeLessThan(full.length);
 });
 
 describe('F07/F08：真实 objects/claims/readReceipt → 默认审查 → 发布成功链', () => {
@@ -383,6 +405,42 @@ describe('F07/F08：审查有效性约束', () => {
     expect(validReportIds).toContain((r1.details as Record<string, unknown>).reportId);
     expect(validReportIds).toContain((r2.details as Record<string, unknown>).reportId);
     expect(gate.publishable).toBe(true);
+  });
+
+  it('同源多篇可逐篇独立审查，未审篇保持 pending 且后续写入不撤销已审篇', async () => {
+    const fixture = makeFixture('same-source-scoped-docs');
+    await writeDeclaredDoc(fixture);
+    const secondPath = 'combat/movement.md';
+    fixture.store.assignOutputs({ ownerTaskId: 'task-w1', targets: [secondPath] });
+    const second = {
+      path: secondPath,
+      title: '移动规则',
+      markdown: '## 移动次数\n每回合移动一次。\n',
+      summary: '移动次数规则',
+      operationId: 'op-write-movement-1',
+      objects: [{ clientKey: 'actMovement', type: 'rule', title: '移动次数', familyKey: 'movement',
+        variantKey: 'default', scopeKey: 'pve', scopeText: 'PVE 战斗', headingPath: ['移动次数'],
+        claims: [{ claimKey: 'movement-once', riskCategory: 'normal' }] }],
+      evidenceClaims: [{ clientKey: 'evMovement', objectKey: 'actMovement', claimKey: 'movement-once',
+        sourceRef: { sourceId: 'tokA', resourceId: 'tokA' },
+        selector: { kind: 'text_span', lineStart: 2, lineEnd: 2, colStart: 1, colEnd: 0 },
+        role: 'supports', nature: 'direct' }],
+    };
+    await writeDeclaredDoc(fixture, second);
+    const review = await submitReview(fixture, 'pass', {
+      coverage: { docPaths: [DOC_PATH], sourceRefs: ['tokA'] },
+    });
+    expect(fixture.store.listReviews()[0]?.scopePaths).toEqual([DOC_PATH]);
+    const objects = readDraftObjects(fixture);
+    expect(objects.find((object) => object.canonical?.path === DOC_PATH)?.reviewStatus).toBe('passed');
+    expect(objects.find((object) => object.canonical?.path === secondPath)?.reviewStatus).toBe('pending');
+    expect(candidateGate(fixture).validReportIds).toContain(review.reportId);
+    await writeDeclaredDoc(fixture, { ...second, operationId: 'op-write-movement-2',
+      markdown: '## 移动次数\n每回合可移动一次。\n' });
+    expect(candidateGate(fixture).validReportIds).toContain(review.reportId);
+    await expect(submitReview(fixture, 'pass', {
+      coverage: { docPaths: [secondPath, 'combat/missing.md'], sourceRefs: ['tokA'] },
+    })).rejects.toMatchObject({ code: 'kb_review_scope_missing' });
   });
 });
 

@@ -153,6 +153,13 @@ const ROOTS_ENV = 'PI_BUILD_CHILD_ROOTS_JSON';
 const SKILL_PATH_ENV = 'PI_BUILD_WORKFLOW_SKILL_PATH';
 const PROTOCOL_GATED_TOOLS = new Set(['kb_write_doc', 'kb_edit_doc', 'kb_delete_doc', 'kb_submit_review', 'build_handoff_submit']);
 let protocolRead = false;
+let roleProtocolRead = false;
+function roleSkillPath() {
+  const expected = process.env[SKILL_PATH_ENV];
+  const role = process.env.AMAGI_AGENT;
+  if (!expected || !['luban', 'diting', 'baize'].includes(role)) return null;
+  return expected.replace(/SKILL\.md$/, 'role-' + role + '.md');
+}
 const ROOT_REASON = 'child-policy（F12-R1 根约束）：文件工具目标越出冻结信封根——' +
   '知识读取请走 mcp_call 桥受控工具（raw_read/raw_search 等）；本地文件仅限任务工作区、' +
   'skill 同目录协议与报告根（词法/symlink 落点双判）。';
@@ -280,7 +287,7 @@ export default function childPolicy(pi) {
     const skillPath = process.env[SKILL_PATH_ENV];
     if (sections && typeof sections === 'object' && skillPath) {
       sections.feishu_build_child_protocol = '你是飞书标准库构建子任务。第一步用原生 read 读取冻结技能 ' + skillPath +
-        '，再按本角色协议与 mcp-examples.md 的完整参数形状调用桥接工具。Pi 的 --skill 只展示摘要，不自动注入正文；读取前的写入和交接调用会被阻断。';
+        ' 的前 14 行，再读取顶部列出的本角色文件全文后调用桥接工具。Pi 的 --skill 只展示摘要，不自动注入正文；读取前的写入和交接调用会被阻断。';
     }
   });
   // —— 轮次收尾链（「上一轮末尾 → 下一请求快照前」的重激活在这里清掉）：
@@ -294,6 +301,8 @@ export default function childPolicy(pi) {
     if (event && event.toolName === 'read' && event.isError === false && expected && typeof actual === 'string') {
       const P = pathModule;
       if (P && P.resolve(actual) === P.resolve(expected)) protocolRead = true;
+      const roleFile = roleSkillPath();
+      if (P && roleFile && P.resolve(actual) === P.resolve(roleFile)) roleProtocolRead = true;
     }
   });
   pi.on('turn_end', filterActiveFace);
@@ -315,10 +324,11 @@ export default function childPolicy(pi) {
     if (name === 'mcp_call') {
       const requested = event && event.input && typeof event.input.tool === 'string' ? event.input.tool : '';
       const tool = requested.split('__').pop();
-      if (PROTOCOL_GATED_TOOLS.has(tool) && !protocolRead) {
+      if (PROTOCOL_GATED_TOOLS.has(tool) && (!protocolRead
+        || (process.env.PI_BUILD_ROLE_SKILL_REQUIRED === '1' && !roleProtocolRead))) {
         return { block: true, reason: '构建协议未读取：先用原生 read 读取 ' +
           String(process.env[SKILL_PATH_ENV] || '(缺失的冻结 SKILL.md)') +
-          '，再按 mcp-examples.md 的精确 schema 提交 ' + tool + '。不要猜字段。' };
+          ' 前 14 行，再读取顶部列出的本角色文件全文，按示例提交 ' + tool + '。不要猜字段。' };
       }
     }
     if (FILE_TOOLS.has(name)) {
