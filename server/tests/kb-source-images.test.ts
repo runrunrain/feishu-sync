@@ -55,6 +55,15 @@ describe('extractImageRefs', () => {
     ].join('\n');
     expect(extractImageRefs(md)).toEqual(['images/01-a', 'images/02-b', 'images/03-c', 'images/04-d']);
   });
+
+  it('keeps balanced parentheses and spaces in Feishu image filenames', () => {
+    const filename = 'images/③-1(Framwork)分析拆解（确定复杂度）_B63_DbT4OWAt8s.png';
+    const markdown = `![图片: B63](${filename})\n![带标题](images/普通图.png "图示")`;
+    expect(extractImageRefs(markdown)).toEqual([filename, 'images/普通图.png']);
+    write(`source/${filename}`, TINY_PNG);
+    const resolved = resolveSourceImages(kbRoot, 'source/doc.md', markdown);
+    expect(resolved[0]?.file).toBe(fs.realpathSync.native(path.join(kbRoot, 'source', filename)));
+  });
 });
 
 describe('resolveSourceImages', () => {

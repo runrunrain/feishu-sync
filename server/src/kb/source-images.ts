@@ -55,8 +55,42 @@ export function extractImageRefs(markdown: string): string[] {
     seen.add(src);
     refs.push(src);
   };
-  const mdImage = /!\[[^\]]*\]\(\s*([^)\s]+)\s*(?:"[^"]*")?\)/g;
-  for (const match of markdown.matchAll(mdImage)) push(match[1]);
+  // Feishu sheet images often have parentheses and Unicode spaces in the
+  // generated filename. A `[^)]` regex cuts `images/③-1(Framework)...` at
+  // the inner `)`, then reports a healthy image as missing. Parse balanced
+  // Markdown delimiters instead; the path guard below still owns filesystem
+  // containment.
+  let cursor = 0;
+  while (cursor < markdown.length) {
+    const open = markdown.indexOf('![', cursor);
+    if (open < 0) break;
+    let index = open + 2;
+    let altDepth = 1;
+    for (; index < markdown.length && altDepth > 0; index += 1) {
+      if (markdown[index] === '\\') { index += 1; continue; }
+      if (markdown[index] === '[') altDepth += 1;
+      else if (markdown[index] === ']') altDepth -= 1;
+    }
+    if (altDepth !== 0 || markdown[index] !== '(') { cursor = open + 2; continue; }
+    index += 1;
+    const destinationStart = index;
+    let parenDepth = 0;
+    for (; index < markdown.length; index += 1) {
+      if (markdown[index] === '\\') { index += 1; continue; }
+      if (markdown[index] === '(') parenDepth += 1;
+      else if (markdown[index] === ')') {
+        if (parenDepth === 0) break;
+        parenDepth -= 1;
+      }
+    }
+    if (index >= markdown.length) { cursor = open + 2; continue; }
+    let destination = markdown.slice(destinationStart, index).trim();
+    const angle = /^<([^>]+)>(?:\s+(?:"[^"]*"|'[^']*'))?$/.exec(destination);
+    if (angle) destination = angle[1]!;
+    else destination = destination.replace(/\s+(?:"[^"]*"|'[^']*')$/, '');
+    push(destination.replace(/\\([()\\])/g, '$1'));
+    cursor = index + 1;
+  }
   const tagImage = /<(?:img|image)\b[^>]*>/gi;
   for (const tagMatch of markdown.matchAll(tagImage)) {
     const tag = tagMatch[0];
