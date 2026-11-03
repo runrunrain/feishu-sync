@@ -47,7 +47,7 @@ const ORCHESTRATION_POLL_INTERVAL_MS = 2_500;
 /** amagi 执行状态已知值中文映射；未知值原样展示（不猜测语义）。
  *  'error' 为真实链路实测出现的 native 状态（子进程/执行异常终态）。 */
 export const LEADER_EXEC_STATE_LABEL: Record<string, string> = {
-  queued: '排队', running: '执行中', done: '完成', failed: '失败', cancelled: '已取消', error: '异常',
+  queued: '排队', running: '已派发', done: '完成', failed: '失败', cancelled: '已取消', error: '异常',
 };
 
 /** 任务身份状态（ActorBinding 监督快照）。 */
@@ -221,8 +221,10 @@ export function BuildRuntimeProgress({ build }: { build: KbBuildDto }) {
   const processUnconfirmed = data?.termination === 'termination-unconfirmed' || data?.processTermination?.state === 'unconfirmed';
   const runtimeEnded = terminal || data?.termination === 'finished' || Boolean(data?.endedReason) || processUnconfirmed;
   const currentTasks = data?.tasks.filter((task) => !isHistoricalRuntimeTask(task, data)) ?? [];
-  const runningCount = currentTasks.filter((task) => task.execState === 'running').length;
-  /** 真实计数（null=未知，不虚构）；实际并发=running 派生。 */
+  // task_created records dispatch acceptance, not a started Pi process.
+  // amagi can keep many accepted handles waiting behind its admission pool.
+  const unfinishedCount = currentTasks.filter((task) => ['queued', 'running', 'pending', 'blocked'].includes(task.execState ?? '')).length;
+  /** 真实回执计数；进程并发没有进入此 DTO，不从任务句柄猜测。 */
   const acceptedDocs = summary?.acceptedDocumentCount ?? null;
   const openBlocking = summary?.openBlockingCount ?? null;
   const cancelling = data?.termination === 'cancelling';
@@ -247,12 +249,12 @@ export function BuildRuntimeProgress({ build }: { build: KbBuildDto }) {
         </div>
       ) : null}
 
-      {/* 汇总：已接受文档 / 未解决阻断 / 实际并发（真实计数；null=未知；无百分比） */}
+      {/* 汇总：已接受文档 / 未解决阻断 / 未结束任务（不推测进程并发） */}
       {data ? (
         <div className="grid grid-cols-3 gap-2" data-testid="kb-runtime-summary">
           <Metric label="已接受文档" value={acceptedDocs ?? '未知'} alert={openBlocking != null && openBlocking > 0 ? false : false} hint={acceptedDocs == null ? '回执数据未提供' : '应用回执去重'} />
           <Metric label="未解决阻断" value={openBlocking ?? '未知'} alert={Boolean(openBlocking && openBlocking > 0)} hint={openBlocking == null ? '问题清单未提供' : undefined} />
-          <Metric label={runtimeEnded ? '末次观测并发' : '实际并发（已观测）'} value={runningCount} hint={runtimeEnded ? '历史观测，非当前活跃；后台残留以终止核验为准' : `任务执行中（仅已观测）${summary?.activeAssignments != null ? ` · 活动分配 ${summary.activeAssignments}` : ''}`} />
+          <Metric label={runtimeEnded ? '末次观测未结任务' : '已派发未结任务'} value={unfinishedCount} hint={runtimeEnded ? '历史观测，非当前活跃；后台残留以终止核验为准' : `含等待准入的任务；实际进程并发未知${summary?.activeAssignments != null ? ` · 活动分配 ${summary.activeAssignments}` : ''}`} />
         </div>
       ) : (
         <p className="text-[10px] text-ink-faint">运行进度加载中…</p>
@@ -380,7 +382,7 @@ function RuntimeTaskRow({ task, terminal, queueReason, historical = false, proce
             {queueReason ? `排队（${queueReason}）` : '排队（原因未细分）'}
           </span>
         ) : null}
-        {exec === 'running' && !terminal ? <Loader2 className="w-3 h-3 animate-spin text-seal shrink-0" /> : null}
+        {exec === 'running' && !terminal ? <span className="text-ink-faint" title="已派发；是否已获运行名额未观测">待完成</span> : null}
       </span>
       <span className="mt-1 flex flex-col gap-0.5 text-ink-faint">
         <span>

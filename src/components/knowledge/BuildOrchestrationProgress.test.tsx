@@ -361,7 +361,7 @@ it('终态构建只拉取一次定格（不再轮询），展示收束结果', a
   }
 });
 describe('v2 Leader 监督运行进度（真实契约 GET /api/kb/builds/:id/leader）', () => {
-  it('汇总三格（真实计数：已接受文档/未解决阻断/实际并发）+ Leader 行轮次；null 计数显示未知；无百分比', async () => {
+  it('汇总三格（已接受文档/未解决阻断/已派发未结任务）+ Leader 行轮次；不把句柄数冒充进程并发', async () => {
     api.getKbBuildLeaderProgress.mockResolvedValue(makeLeader({
       tasks: [
         makeLeaderTask({ nativeTaskId: 'task-w-01', execState: 'running' }),
@@ -378,7 +378,8 @@ describe('v2 Leader 监督运行进度（真实契约 GET /api/kb/builds/:id/lea
     const summary = host.querySelector('[data-testid="kb-runtime-summary"]');
     expect(summary?.textContent).toContain('已接受文档');
     expect(summary?.textContent).toContain('未解决阻断');
-    expect(summary?.textContent).toContain('实际并发');
+    expect(summary?.textContent).toContain('已派发未结任务');
+    expect(summary?.textContent).toContain('实际进程并发未知');
     expect(summary?.textContent).toContain('活动分配 3');
     const leader = host.querySelector('[data-testid="kb-runtime-leader"]');
     expect(leader?.textContent).toContain('监督中');
@@ -395,7 +396,7 @@ describe('v2 Leader 监督运行进度（真实契约 GET /api/kb/builds/:id/lea
       .toContain('累计用量');
   });
 
-  it.each([null, { started: null, ended: null }])('终局只显示历史并发，缺失轮次为未知而不是0/0（%#）', async (rounds) => {
+  it.each([null, { started: null, ended: null }])('终局只显示历史未结任务，缺失轮次为未知而不是0/0（%#）', async (rounds) => {
     api.getKbBuildLeaderProgress.mockResolvedValue(makeLeader({
       termination: 'finished',
       rounds,
@@ -406,14 +407,14 @@ describe('v2 Leader 监督运行进度（真实契约 GET /api/kb/builds/:id/lea
       root.render(<BuildOrchestrationProgress build={makeBuild({ id: 'kb-v2', status: 'published', orchestrationMode: 'pi-amagi' })} />);
     });
     const summary = host.querySelector('[data-testid="kb-runtime-summary"]');
-    expect(summary?.textContent).toContain('末次观测并发');
+    expect(summary?.textContent).toContain('末次观测未结任务');
     expect(summary?.textContent).toContain('非当前活跃');
     expect(summary?.textContent).not.toContain('实际并发');
     expect(host.querySelector('[data-testid="kb-runtime-leader"]')?.textContent).toContain('轮次 未知/未知');
     expect(host.querySelector('[data-testid="kb-runtime-task"]')?.getAttribute('data-exec')).toBe('stopped');
   });
 
-  it('旧epoch/代次任务仅作历史，不计当前计划与并发', async () => {
+  it('旧epoch/代次任务仅作历史，不计当前计划与未结任务', async () => {
     api.getKbBuildLeaderProgress.mockResolvedValue(makeLeader({
       generation: 3, runtimeEpoch: 2,
       tasks: [
@@ -427,7 +428,7 @@ describe('v2 Leader 监督运行进度（真实契约 GET /api/kb/builds/:id/lea
     });
     expect(host.querySelector('[data-testid="kb-runtime-plan-count"]')?.textContent).toContain('当前计划 1 项');
     expect(host.querySelector('[data-testid="kb-runtime-plan-count"]')?.textContent).toContain('历史 1 项');
-    expect(host.querySelector('[data-testid="kb-runtime-summary"]')?.children[2]?.textContent).toContain('已观测）1');
+    expect(host.querySelector('[data-testid="kb-runtime-summary"]')?.children[2]?.textContent).toContain('已派发未结任务1');
     expect(host.querySelector('[data-task-id="old"]')?.getAttribute('data-exec')).toBe('stopped');
     expect(host.querySelector('[data-task-id="old"]')?.textContent).toContain('历史任务');
     expect(host.querySelector('[data-task-id="new"]')?.getAttribute('data-exec')).toBe('running');
@@ -448,7 +449,7 @@ describe('v2 Leader 监督运行进度（真实契约 GET /api/kb/builds/:id/lea
     expect(host.querySelector('[data-testid="kb-runtime-resume-capability"]')?.textContent).toContain('需先确认后台终止');
     expect(host.querySelector('[data-testid="kb-runtime-task"]')?.getAttribute('data-exec')).toBe('termination-unconfirmed');
     expect(host.querySelector('[data-testid="kb-runtime-task"]')?.textContent).not.toContain('已停止');
-    expect(host.querySelector('[data-testid="kb-runtime-summary"]')?.textContent).toContain('末次观测并发');
+    expect(host.querySelector('[data-testid="kb-runtime-summary"]')?.textContent).toContain('末次观测未结任务');
   });
 
   it('summary 计数 null=未知：显示未知而非 0/推测值；lastUsage 末次口径明示', async () => {
@@ -495,7 +496,8 @@ describe('v2 Leader 监督运行进度（真实契约 GET /api/kb/builds/:id/lea
     const running = host.querySelector('[data-task-id="task-w-01"]');
     expect(running?.getAttribute('data-exec')).toBe('running');
     expect(running?.getAttribute('data-actor-status')).toBe('confirmed');
-    expect(running?.textContent).toContain('执行中');
+    expect(running?.textContent).toContain('已派发');
+    expect(running?.textContent).toContain('待完成');
     expect(running?.textContent).toContain('已确认');
     expect(running?.textContent).toContain('鲁班（写作）');
     expect(running?.textContent).toContain('子任务用量不经 Leader 事件');
