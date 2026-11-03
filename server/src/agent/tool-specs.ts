@@ -146,11 +146,12 @@ export const RAW_CSV_FIND_SPEC: AgentToolSpec = {
 export const RAW_LIST_SPEC: AgentToolSpec = {
   name: 'raw_list',
   label: '原始源清单',
-  description: '列出本次构建工作集（或全部原始源）的快照记录与变更类型，每页 50 条。',
+  description: '列出本次构建工作集（或全部原始源）的快照记录与变更类型，每页 50 条；可按 objToken 精确取一项。',
   parameters: {
     type: 'object',
     properties: {
       filter: { type: 'string', description: 'workset=仅本批工作集；all=全部原始源', enum: ['workset', 'all'] },
+      objToken: string('可选，精确筛选一个来源；仍受 filter 和本任务工作集限制'),
       cursor: string('分页游标（上一页返回的 nextCursor）'),
     },
     additionalProperties: false,
@@ -238,7 +239,7 @@ const evidenceSelectorSchema: Record<string, unknown> = {
     parserVersion: string('csv_cells：解析器版本标注'),
     recordStart: integer('csv_cells：起始逻辑 record 行（1 起始；引号内换行不算新记录）', 1),
     recordEnd: integer('csv_cells：结束逻辑 record 行', 1),
-    columns: { type: 'array', items: { type: 'string' }, description: 'csv_cells：首条 record 的列名；空白/重复表头用显式列坐标 @A、@B、@C' },
+    columns: { type: 'array', items: { type: 'string' }, description: 'csv_cells 必填：首条 record 的列名；空白/重复表头用显式列坐标 @A、@B、@C；可直接复用 raw_csv_find 返回的 selector.columns' },
     businessKeys: { type: 'array', items: { type: 'string' }, description: 'csv_cells：稳定业务键（可选）' },
     // workbook_cells
     workbookName: string('workbook_cells：冻结工作簿名'),

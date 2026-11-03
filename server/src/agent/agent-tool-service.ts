@@ -1932,6 +1932,10 @@ export class AgentToolService {
       entries = entries.filter((entry) =>
         unitSources ? unitSources.has(entry.objToken) : state.workset.has(entry.objToken));
     }
+    if (args.objToken !== undefined) {
+      const objToken = requireString(args, 'objToken', 1, 256);
+      entries = entries.filter((entry) => entry.objToken === objToken);
+    }
     entries = entries.slice().sort((a, b) => a.relPath.localeCompare(b.relPath));
     let startIndex = 0;
     if (cursor) {

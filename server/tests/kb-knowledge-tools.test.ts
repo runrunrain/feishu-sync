@@ -120,6 +120,16 @@ afterAll(() => {
 // evidence-locator（纯函数）
 // ============================================================================
 
+it('raw_list 可按 objToken 精确筛选，未知来源返回空清单', async () => {
+  const state = makeBuildState('raw-list-exact');
+  const token = tokenFor(state);
+  const found = await service.executeTool(token, 'raw_list', { filter: 'workset', objToken: 'tokB' });
+  const page = JSON.parse(found.content[0]!.text) as { entries: Array<{ objToken: string }> };
+  expect(page.entries.map((entry) => entry.objToken)).toEqual(['tokB']);
+  const missing = await service.executeTool(token, 'raw_list', { filter: 'workset', objToken: 'missing' });
+  expect((JSON.parse(missing.content[0]!.text) as { entries: unknown[] }).entries).toEqual([]);
+});
+
 const textResource: EvidenceResource = {
   resourceId: 'tokA',
   sourceId: 'tokA',
