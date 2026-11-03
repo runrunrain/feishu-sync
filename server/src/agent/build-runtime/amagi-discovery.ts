@@ -1,7 +1,7 @@
 /**
  * build-runtime/amagi-discovery.ts — 已安装 amagi 候选只读发现
  *
- * 构建运行包是私有 runtime-packages 中的不可变副本；Pi home 已配置的本地
+ * 构建运行包是私有 runtime-packages 中的不可变副本；Pi home 已配置并安装的
  * amagi-pi 是下一次构建的候选。只读发现提供候选事实，构建启动时选择较新稳定版
  * 并独立安装，当前构建仍使用自己的冻结哈希。
  *
@@ -68,13 +68,15 @@ export function compareAmagiVersions(left: string, right: string): number {
   return 0;
 }
 
-/** Only a locally configured, SDK resolved package can become the next build's source. */
-export function preferredLocalAmagi(candidates: readonly AmagiCandidate[], minimumVersion: string): AmagiCandidate | null {
-  const eligible = candidates.filter((candidate) => candidate.sourceType === 'local'
-    && candidate.packagePath && path.isAbsolute(candidate.packagePath)
+/** Only an already installed, SDK resolved package can become the next build's source.
+ * Git/npm declarations with no local entity are never fetched during discovery. */
+export function preferredConfiguredAmagi(candidates: readonly AmagiCandidate[], minimumVersion: string): AmagiCandidate | null {
+  const eligible = candidates.filter((candidate) => candidate.packagePath && path.isAbsolute(candidate.packagePath)
     && candidate.version && /^\d+\.\d+\.\d+$/.test(candidate.version)
     && compareAmagiVersions(candidate.version, minimumVersion) > 0);
+  const sourceOrder: Record<AmagiCandidate['sourceType'], number> = { local: 0, git: 1, npm: 2 };
   eligible.sort((a, b) => compareAmagiVersions(b.version!, a.version!)
+    || sourceOrder[a.sourceType] - sourceOrder[b.sourceType]
     || a.origin.localeCompare(b.origin) || a.packagePath!.localeCompare(b.packagePath!));
   return eligible[0] ?? null;
 }

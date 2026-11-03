@@ -46,7 +46,7 @@ import {
   installAmagiFromGit, installAmagiPackage, readPackageVersion, verifyAmagiPackage,
 } from '../agent/build-runtime/amagi-package.js';
 import {
-  compareAmagiVersions, piSdkAvailable, preferredLocalAmagi,
+  compareAmagiVersions, piSdkAvailable, preferredConfiguredAmagi,
   resolveAppPiAgentDir, resolveGlobalPiAgentDir, scanAmagiHome,
   type AmagiCandidate,
 } from '../agent/build-runtime/amagi-discovery.js';
@@ -138,7 +138,7 @@ export interface BuildRuntimeStatusDto {
   runtime: { nodePath: string | null; nodeVersion: string | null; piCliPath: string | null; piVersion: string | null } | null;
   amagi: {
     pinnedVersion: string;
-    /** 新构建自动优选的已配置本地包；null 使用内置 Git 回退版本。 */
+    /** 新构建自动优选的已配置安装实体；null 使用内置 Git 回退版本。 */
     selectedSource: string | null;
     installed: boolean;
     version: string | null;
@@ -148,7 +148,7 @@ export interface BuildRuntimeStatusDto {
     /** 私有安装事实：installed=已装且记录可校；missing=未装；broken=目录/记录损坏（带 detail）。 */
     installState: 'installed' | 'missing' | 'broken';
     installDetail: string | null;
-    /** 无较新本地候选时使用的官方 Git 回退来源。 */
+    /** 无较新已配置候选时使用的官方 Git 回退来源。 */
     gitSource: string;
     commit: string;
     repoUrl: string;
@@ -274,7 +274,7 @@ export class BuildRuntimeHost {
     discovery: Awaited<ReturnType<BuildRuntimeHost['discoverAmagi']>>;
   }> {
     const discovery = await this.discoverAmagi(facts);
-    const candidate = preferredLocalAmagi(discovery.candidates, AMAGI_PI_PINNED_VERSION);
+    const candidate = preferredConfiguredAmagi(discovery.candidates, AMAGI_PI_PINNED_VERSION);
     return {
       version: candidate?.version ?? AMAGI_PI_PINNED_VERSION,
       sourceDir: candidate?.packagePath ?? null,
@@ -463,7 +463,7 @@ export class BuildRuntimeHost {
 
   /** 安装版本化 amagi-pi。
    * - 显式 sourceDir → 读取真实 manifest 版本并独立冻结；
-   * - 默认优先已在 Pi home 声明的较新本地包，否则用已验证的 Git 回退版本；
+   * - 默认优先已在 Pi home 安装的较新版本（本地/Git/npm），否则用已验证的 Git 回退版本；
    * - 已有安装记录 → 完整哈希校验复用（「校验」而非虚假重装）；
    * - 安装/校验串行化（busy 409），防双写 staging/aside 冲突。 */
   async installAmagi(input: { sourceDir?: string; log?: (line: string) => void } = {}): Promise<AmagiPackageRef & { record: unknown; fresh: boolean }> {
@@ -481,7 +481,7 @@ export class BuildRuntimeHost {
           if (!/^\d+\.\d+\.\d+$/.test(version)
             || compareAmagiVersions(version, AMAGI_PI_PINNED_VERSION) < 0) {
             throw new AmagiPackageError('amagi_version_unsupported',
-              `本地 amagi-pi@${version} 低于已验证基线 ${AMAGI_PI_PINNED_VERSION} 或不是稳定版本`);
+              `amagi-pi@${version} 低于已验证基线 ${AMAGI_PI_PINNED_VERSION} 或不是稳定版本`);
           }
           return await installAmagiPackage({
             nodePath: facts.nodePath,

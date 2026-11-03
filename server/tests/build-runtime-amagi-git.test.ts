@@ -467,6 +467,13 @@ process.exit(1);
       expect(fs.existsSync(path.join(probed.amagiPackage.packageRoot, 'agent-outputs'))).toBe(false);
       expect(fs.existsSync(path.join(f.root, 'agent', 'runtime-packages', 'amagi-pi@2.21.31'))).toBe(false);
       expect((await host.statusDto()).amagi).toMatchObject({ pinnedVersion: '2.21.36', installed: true, version: '2.21.36' });
+      // 同一应用进程内更新已配置插件 manifest：下次新构建自动采用新版本，
+      // 已冻结的旧版本仍可供会话恢复。
+      fs.writeFileSync(path.join(globalPkg, 'package.json'), JSON.stringify({ name: 'amagi-pi', version: '2.21.37' }));
+      expect((await host.statusDto()).amagi).toMatchObject({ pinnedVersion: '2.21.37', selectedSource: globalPkg, installed: false });
+      const upgraded = await (host as unknown as { probeOrFail: (key: string) => Promise<{ amagiPackage: { version: string } }> }).probeOrFail('fixture-key');
+      expect(upgraded.amagiPackage.version).toBe('2.21.37');
+      expect(fs.existsSync(path.join(f.root, 'agent', 'runtime-packages', 'amagi-pi@2.21.36'))).toBe(true);
       await host.installAmagi({ sourceDir: makeMiniSource(f.root) });
       const resumed = await (host as unknown as { probeOrFail: (key: string, version: string) => Promise<{ amagiPackage: { version: string } }> }).probeOrFail('fixture-key', '2.21.31');
       expect(resumed.amagiPackage.version).toBe('2.21.31');

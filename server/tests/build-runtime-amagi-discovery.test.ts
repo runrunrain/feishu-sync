@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  piSdkAvailable, preferredLocalAmagi, resolveAppPiAgentDir, resolveGlobalPiAgentDir, scanAmagiHome,
+  piSdkAvailable, preferredConfiguredAmagi, resolveAppPiAgentDir, resolveGlobalPiAgentDir, scanAmagiHome,
 } from '../src/agent/build-runtime/amagi-discovery.js';
 import { makeFakePiSdk } from './helpers/fake-pi-git-sdk.js';
 import { piWorkbenchPackageRoot } from '../src/agent/agent-assets.js';
@@ -60,16 +60,17 @@ function makeLocalPackage(root: string, name: string, version: string): string {
   return dir;
 }
 
-it('自动优选最高稳定本地版本，忽略远端声明和预发布版', () => {
-  const candidate = (version: string, sourceType: 'local' | 'git' = 'local') => ({
+it('自动优选已安装的最高稳定版本；无实体声明、预发布版和旧版不参与', () => {
+  const candidate = (version: string, sourceType: 'local' | 'git' | 'npm' = 'local', packagePath: string | null = `/pkg/${version}`) => ({
     origin: 'global-pi-home' as const, source: `/pkg/${version}`, sourceType,
-    packagePath: `/pkg/${version}`, version, matchesPin: false,
+    packagePath, version, matchesPin: false,
   });
-  const selected = preferredLocalAmagi([
-    candidate('2.21.36'), candidate('2.21.38-rc.1'), candidate('2.21.37', 'git'), candidate('2.21.35'),
+  const selected = preferredConfiguredAmagi([
+    candidate('2.21.36'), candidate('2.21.38-rc.1'), candidate('2.21.37', 'git'), candidate('2.21.39', 'npm', null), candidate('2.21.35'),
   ], '2.21.31');
-  expect(selected?.version).toBe('2.21.36');
-  expect(preferredLocalAmagi([candidate('2.21.30')], '2.21.31')).toBeNull();
+  expect(selected?.version).toBe('2.21.37');
+  expect(preferredConfiguredAmagi([candidate('2.21.30')], '2.21.31')).toBeNull();
+  expect(preferredConfiguredAmagi([candidate('2.21.36', 'npm'), candidate('2.21.36', 'local')], '2.21.31')?.sourceType).toBe('local');
 });
 
 describe('scanAmagiHome（只读发现）', () => {
@@ -116,6 +117,23 @@ describe('scanAmagiHome（只读发现）', () => {
     fs.writeFileSync(path.join(entity, 'package.json'), JSON.stringify({ name: 'amagi-pi', version: '2.21.31' }));
     const result = await scan(root, agentDir, sdkRoot);
     expect(result.candidates[0]).toMatchObject({ sourceType: 'git', packagePath: entity, version: '2.21.31', matchesPin: true });
+  });
+
+  it('已安装的 Git/npm 新版可自动优选；未安装的更高声明不触发获取', async () => {
+    const gitSource = 'git:github.com/runrunrain/amagi-pi@newer';
+    const npmSource = 'npm:amagi-pi@2.21.37';
+    const { agentDir, sdkRoot } = setupHome({ root, settings: { packages: [gitSource, npmSource, 'git:github.com/other/amagi-pi@future'] } });
+    const gitEntity = path.join(agentDir, 'git', 'github.com', 'runrunrain', 'amagi-pi');
+    const npmEntity = path.join(agentDir, 'npm', 'node_modules', 'amagi-pi');
+    for (const [entity, version] of [[gitEntity, '2.21.36'], [npmEntity, '2.21.37']]) {
+      fs.mkdirSync(entity, { recursive: true });
+      fs.writeFileSync(path.join(entity, 'package.json'), JSON.stringify({ name: 'amagi-pi', version }));
+    }
+    const result = await scan(root, agentDir, sdkRoot);
+    expect(result.status).toBe('ok');
+    expect(result.candidates).toHaveLength(3);
+    expect(preferredConfiguredAmagi(result.candidates, '2.21.31')).toMatchObject({ sourceType: 'npm', packagePath: npmEntity, version: '2.21.37' });
+    expect(result.candidates.find((item) => item.source.includes('future'))?.packagePath).toBeNull();
   });
 
   it('settings.json 损坏 → settingsErrors 显式透出（不静默当未声明）', async () => {

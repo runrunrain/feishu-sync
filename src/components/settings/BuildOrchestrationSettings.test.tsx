@@ -534,7 +534,20 @@ describe('plugin-install-fix 安装检测与默认来源', () => {
     await act(async () => {});
     expect(container.querySelector('[data-testid="orch-runtime-facts"]')?.textContent).toContain('新构建优选 2.21.36');
     expect(container.querySelector('[data-testid="orch-runtime-candidates"]')?.textContent).toContain('下一次构建自动采用并冻结');
-    expect(container.querySelector('[data-testid="orch-runtime-install-btn"]')?.textContent).toContain('已配置本地版');
+    expect(container.querySelector('[data-testid="orch-runtime-install-btn"]')?.textContent).toContain('已配置版本');
+  });
+
+  it('较新 Git 版被选中时，同样标出下一次构建自动采用', async () => {
+    const source = '/Users/x/.pi/agent/git/github.com/runrunrain/amagi-pi';
+    apiRuntime.getKbBuildRuntimeStatus.mockResolvedValue(statusWith({
+      pinnedVersion: '2.21.37', selectedSource: source,
+      installed: false, version: null, installDir: null, contentHash: null, installState: 'missing',
+      candidates: [{ origin: 'global-pi-home', source: 'git:github.com/runrunrain/amagi-pi@ref', sourceType: 'git', packagePath: source, version: '2.21.37', matchesPin: false }],
+    }));
+    const container = setup(makeConfig());
+    await act(async () => {});
+    expect(container.querySelector('[data-testid="orch-runtime-candidates"]')?.textContent).toContain('下一次构建自动采用并冻结');
+    expect(container.querySelector('[data-testid="orch-runtime-install-btn"]')?.textContent).toContain('已配置版本');
   });
 
   it('发现异常（unavailable/error）单独表达，不谎称未安装', async () => {

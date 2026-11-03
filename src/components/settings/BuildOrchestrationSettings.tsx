@@ -848,7 +848,7 @@ function RuntimeStatusSection({
   const candidates = amagi?.candidates ?? [];
   const discoveryIssues = amagi?.discoveryIssues ?? [];
   const recommended = candidates.find((item) => item.packagePath === amagi?.selectedSource)
-    ?? candidates.find((item) => item.matchesPin && item.sourceType === 'local' && item.packagePath) ?? null;
+    ?? candidates.find((item) => item.matchesPin && item.packagePath) ?? null;
   const trimmedSource = sourceDir.trim();
   const canSelectDir = typeof window !== 'undefined' && Boolean(window.desktop?.selectDirectory);
   const errorParts = installError ? splitInstallErrorMessage(installError) : null;
@@ -943,7 +943,7 @@ function RuntimeStatusSection({
                     ) : item.matchesPin ? (
                       <>
                         <span className="text-jade">与固定版本一致</span>
-                        {item.sourceType === 'local' && item.packagePath && item.packagePath !== trimmedSource ? (
+                        {item.packagePath && item.packagePath !== trimmedSource ? (
                           <button
                             type="button"
                             className="text-seal hover:underline"
@@ -1015,7 +1015,7 @@ function RuntimeStatusSection({
                 : trimmedSource
                   ? `从目录安装 amagi-pi ${amagi?.pinnedVersion ?? ''}`.trim()
                   : amagi?.selectedSource
-                    ? `安装 amagi-pi ${amagi.pinnedVersion}（已配置本地版）`
+                    ? `安装 amagi-pi ${amagi.pinnedVersion}（已配置版本）`
                     : `安装 amagi-pi ${amagi?.pinnedVersion ?? ''}（官方 Git · ${(amagi?.commit ?? '').slice(0, 7)}）`.trim()}
             </button>
           </div>
@@ -1044,7 +1044,7 @@ function RuntimeStatusSection({
               : amagi?.selectedSource
                 ? `新构建将自动从已配置的 ${amagi.selectedSource} 冻结版本 ${amagi.pinnedVersion}；在跑构建继续使用原版本。`
                 : `未填目录时默认从官方仓库 ${amagi?.repoUrl ?? ''} 固定 commit ${amagi?.commit ?? ''} 经 Pi CLI 获取安装（需本机 git 与网络；失败时可改填本地目录，不回退 npm/latest）。`}
-            {recommended && !amagi?.selectedSource ? ` 检测到与回退版本一致的本地来源：${recommended.packagePath}。` : ''}
+            {recommended && !amagi?.selectedSource ? ` 检测到与回退版本一致的已配置来源：${recommended.packagePath}。` : ''}
           </p>
           <p className="flex items-start gap-1 text-[10px] text-ink-faint leading-relaxed">
             <ShieldAlert className="w-3 h-3 mt-0.5 shrink-0" />
