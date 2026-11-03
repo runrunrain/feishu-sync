@@ -109,6 +109,23 @@ export const RAW_READ_SPEC: AgentToolSpec = {
   },
 };
 
+export const RAW_CSV_CELLS_SPEC: AgentToolSpec = {
+  name: 'raw_csv_cells',
+  label: '冻结 CSV 单元格阅读',
+  description: '按逻辑 record 读取冻结 CSV 的准确列位和值，服务端解析引号内换行并登记物理行读取回执。只返回非空单元格；未列出的列为空。用于核对 csv_cells 证据，避免人工数逗号。',
+  parameters: {
+    type: 'object',
+    properties: {
+      objToken: string('源文档 objToken'),
+      resourceId: string('raw_read 资源表中的完整 #csv: 资源 ID'),
+      recordStart: integer('起始逻辑 record（1 基）', 1),
+      recordEnd: integer('结束逻辑 record（1 基，闭区间；单次最多 20 条）', 1),
+    },
+    required: ['objToken', 'resourceId', 'recordStart', 'recordEnd'],
+    additionalProperties: false,
+  },
+};
+
 export const RAW_LIST_SPEC: AgentToolSpec = {
   name: 'raw_list',
   label: '原始源清单',
@@ -1184,6 +1201,7 @@ const ALL_SPECS: AgentToolSpec[] = [
   KB_GREP_SPEC,
   RAW_SEARCH_SPEC,
   RAW_READ_SPEC,
+  RAW_CSV_CELLS_SPEC,
   RAW_LINKS_SPEC,
   RAW_LIST_SPEC,
   RAW_COMMENTS_SPEC,

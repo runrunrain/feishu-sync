@@ -12,6 +12,7 @@
 
 ```json
 {"server": "feishu-kb-bridge", "tool": "raw_read", "arguments": {"objToken": "<token>", "offset": 0, "limit": 120}}
+{"server": "feishu-kb-bridge", "tool": "raw_csv_cells", "arguments": {"objToken": "<token>", "resourceId": "<token>#csv:表.csv", "recordStart": 184, "recordEnd": 187}}
 ```
 
 `raw_read` 的 `<read_receipts>` 块位于正文前，含 `readReceiptId`、`resourceId` 与该资源本地行范围。单次限制 120 行以免正文被工具输出截断；继续读时增加 `offset`。重要事实在声明中引用实际回执。

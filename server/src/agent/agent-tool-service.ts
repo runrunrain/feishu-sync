@@ -56,6 +56,7 @@ import {
   RAW_COMMENTS_SPEC,
   RAW_READ_IMAGE_SPEC,
   RAW_READ_SPEC,
+  RAW_CSV_CELLS_SPEC,
   RAW_SEARCH_SPEC,
   WS_EDIT_SPEC,
   WS_LS_SPEC,
@@ -597,6 +598,7 @@ export class AgentToolService {
         { spec: RAW_LIST_SPEC, runKinds: ['build'], execute: (context, args) => this.toolRawList(context, args) },
         // T3（A 案 §5.3）：raw_read build 态返回 segmentMap/资源表并登记读取回执
         { spec: RAW_READ_SPEC, runKinds: ['build', 'work', 'discuss'], execute: (context, args, meta) => this.toolRawRead(context, args, meta) },
+        { spec: RAW_CSV_CELLS_SPEC, runKinds: ['build'], execute: (context, args, meta) => this.toolRawCsvCells(context, args, meta) },
         { spec: RAW_SEARCH_SPEC, runKinds: ['build', 'work', 'discuss'], execute: (context, args) => this.toolRawSearch(context, args) },
         // P1-S4（§2.4）：引用关系查询（只读），Discuss/Work/构建均可用
         { spec: RAW_LINKS_SPEC, runKinds: ['build', 'work', 'discuss'], execute: (context, args) => this.toolRawLinks(context, args) },
@@ -1223,6 +1225,73 @@ export class AgentToolService {
     lines = content.split('\n');
     const slice = lines.slice(offset, offset + limit);
     return this.renderRawReadPage(context, entry, lines, slice, offset, null, false);
+  }
+
+  /** Read exact parsed CSV cells without asking a model to count delimiters.
+   * The returned sparse row contains every nonempty field; missing columns are
+   * empty, and the receipt covers the complete physical records shown. */
+  private toolRawCsvCells(context: InternalRunContext, args: Record<string, unknown>, meta?: ToolRequestMeta): ToolResult {
+    const state = requireBuildState(context);
+    const objToken = requireString(args, 'objToken', 1, 256);
+    const resourceId = requireString(args, 'resourceId', 1, 512);
+    if (args.recordStart === undefined || args.recordEnd === undefined) {
+      throw new ToolError('invalid_request', 'recordStart 和 recordEnd 均为必填');
+    }
+    const recordStart = optionalInt(args, 'recordStart', 1, 1, 10_000_000);
+    const recordEnd = optionalInt(args, 'recordEnd', recordStart, 1, 10_000_000);
+    if (recordEnd < recordStart || recordEnd - recordStart >= 20) {
+      throw new ToolError('invalid_request', 'recordStart..recordEnd 须为最多 20 条的闭区间');
+    }
+    const entry = state.snapshot.get(objToken);
+    if (!entry) throw new ToolError('not_found', `原始文档不存在或无成功本地版本: ${objToken}`, 404);
+    const assembled = this.assembleBuildRead(state, entry);
+    const resource = assembled.resources.find((item) => item.resourceId === resourceId && item.kind === 'csv');
+    if (!resource) throw new ToolError('not_found', `冻结源没有该 CSV 资源: ${resourceId}`, 404);
+    const parsed = parseCsvRecords(resource.lines.join('\n'));
+    if (recordEnd > parsed.records.length) {
+      throw new ToolError('invalid_request', `CSV 共 ${parsed.records.length} 条逻辑 record，结束位置 ${recordEnd} 越界`);
+    }
+    const columnName = (index: number): string => {
+      let n = index + 1;
+      let name = '';
+      while (n > 0) { n -= 1; name = String.fromCharCode(65 + n % 26) + name; n = Math.floor(n / 26); }
+      return `@${name}`;
+    };
+    const records = parsed.records.slice(recordStart - 1, recordEnd).map((fields, index) => {
+      const recordNumber = recordStart + index;
+      const span = parsed.recordSpans[recordNumber - 1]!;
+      return {
+        recordNumber,
+        physicalLineStart: span.startLine,
+        physicalLineEnd: span.startLine + span.lineCount - 1,
+        width: fields.length,
+        cells: fields.flatMap((value, column) => value === '' ? [] : [{ column: columnName(column), value }]),
+      };
+    });
+    const payload = { objToken, resourceId, resourceHash: resource.resourceHash,
+      totalRecords: parsed.records.length, recordStart, recordEnd, records };
+    const serialized = JSON.stringify(payload);
+    if (serialized.length > 16_000) {
+      throw new ToolError('raw_csv_cells_too_large', '目标记录超过 16000 字符；请缩小 record 区间后重读', 409);
+    }
+    const lineStart = records[0]!.physicalLineStart;
+    const lineEnd = records[records.length - 1]!.physicalLineEnd;
+    const readReceiptId = `rr_${crypto.randomBytes(9).toString('hex')}`;
+    this.appendReadReceipts(state, [{
+      readReceiptId,
+      buildId: context.buildId ?? 'unknown',
+      unitId: context.options.worker?.unitId ?? null,
+      toolCallId: meta?.toolCallId ?? 'unknown',
+      sourceSnapshotHash: entry.contentHash,
+      resourceId,
+      selector: { kind: 'read_range', lineStart, lineEnd },
+      returnedHash: contentResourceHash(resource.lines.slice(lineStart - 1, lineEnd).join('\n')),
+      truncated: recordEnd < parsed.records.length,
+    }]);
+    return {
+      content: [{ type: 'text', text: `<read_receipt id="${readReceiptId}" resource_id="${resourceId}" lines="${lineStart}-${lineEnd}" />\n<untrusted_source>\n${serialized}\n</untrusted_source>` }],
+      details: { readReceiptId, resourceId, lineStart, lineEnd, recordStart, recordEnd, totalRecords: parsed.records.length },
+    };
   }
 
   /** raw_read 输出渲染（build 态附 segmentMap/资源表/回执；末页引用块共用）。 */
@@ -5474,6 +5543,8 @@ function summarizeArgs(toolName: string, args: Record<string, unknown>): string 
       return `path=${String(args.path ?? '')}`;
     case 'raw_read':
       return `objToken=${String(args.objToken ?? '')}`;
+    case 'raw_csv_cells':
+      return `objToken=${String(args.objToken ?? '')} resourceId=${String(args.resourceId ?? '')} records=${String(args.recordStart ?? '')}..${String(args.recordEnd ?? '')}`;
     case 'raw_links':
       return `objToken=${String(args.objToken ?? '')} direction=${String(args.direction ?? 'both')}`;
     case 'raw_read_image':
@@ -5519,6 +5590,7 @@ const READONLY_TOOL_NAMES: ReadonlySet<string> = new Set<string>([
   'kb_grep',
   'raw_search',
   'raw_read',
+  'raw_csv_cells',
   'raw_links',
   'raw_list',
   'raw_comments',

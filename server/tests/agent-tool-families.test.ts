@@ -32,7 +32,7 @@ const LEGACY_WHITELISTS: Record<AgentRunKind, string[]> = {
 const EXTERNAL_FAMILY_TOOLS = ['app_command'];
 /** v2 build-runtime 族中进入 build 基线面的新工具（设计 v2 §7：批量
  * 读取对旧模式也可用；追加在基线之后，与注册序一致）。 */
-const BUILD_RUNTIME_BUILD_TOOLS = ['kb_read_batch'];
+const BUILD_RUNTIME_BUILD_TOOLS = ['raw_csv_cells', 'kb_read_batch'];
 const expectedWhitelist = (runKind: AgentRunKind): string[] =>
   runKind === 'build'
     ? [...toolsForRunKind(runKind).filter((name) => !EXTERNAL_FAMILY_TOOLS.includes(name)), ...BUILD_RUNTIME_BUILD_TOOLS]

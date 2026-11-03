@@ -363,6 +363,33 @@ describe('evidence-locator：MediaRegion 与 verifyEvidence', () => {
 // ============================================================================
 
 describe('raw_read：readReceiptId 登记与 segmentMap（多资源拼接）', () => {
+  it('按逻辑 record 返回冻结 CSV 的准确列位和多行单元格，并登记可用于证据的回执', async () => {
+    const state = makeBuildState('csv-cells-exact');
+    const token = tokenFor(state);
+    const result = await service.executeTool(token, 'raw_csv_cells', {
+      objToken: 'tokB', resourceId: 'tokB#csv:表.csv', recordStart: 2, recordEnd: 2,
+    }, { toolCallId: 'call-csv-cells' });
+    const body = result.content[0]?.text ?? '';
+    expect(body).toContain('"recordNumber":2');
+    expect(body).toContain('"physicalLineStart":2');
+    expect(body).toContain('"physicalLineEnd":3');
+    expect(body).toContain('"column":"@B","value":"多行\\n内容"');
+    const details = result.details as { readReceiptId: string; lineStart: number; lineEnd: number };
+    expect(details).toMatchObject({ lineStart: 2, lineEnd: 3 });
+    expect(body).toContain(details.readReceiptId);
+    expect(state.readReceipts?.at(-1)).toMatchObject({
+      readReceiptId: details.readReceiptId,
+      resourceId: 'tokB#csv:表.csv',
+      selector: { kind: 'read_range', lineStart: 2, lineEnd: 3 },
+    });
+    await expect(service.executeTool(token, 'raw_csv_cells', {
+      objToken: 'tokB', resourceId: 'tokB#csv:不存在.csv', recordStart: 2, recordEnd: 2,
+    })).rejects.toMatchObject({ code: 'not_found' });
+    await expect(service.executeTool(token, 'raw_csv_cells', {
+      objToken: 'tokB', resourceId: 'tokB#csv:表.csv', recordStart: 2,
+    })).rejects.toMatchObject({ code: 'invalid_request' });
+  });
+
   it('有内容的 CSV 中连续空白记录默认折叠，回执和页界仍覆盖原文，按需可逐字重读', async () => {
     writeRaw(CSV_NAME, '列,值\n1,一\n,\n,\n,\n2,二\n');
     try {
@@ -1202,7 +1229,7 @@ describe('kb_submit_review：报告绑定与审查者写入口封锁', () => {
     const reviewToken = tokenFor(state, { workerId: 'wr', unitId: 'u1', phase: 'review' });
     const context = service.getContext(reviewToken)!;
     // v2（§7）kb_read_batch 追加进 build 基线面（旧模式也可用；末尾追加）
-    expect(context.allowedTools).toEqual([...toolsForRunKind('build'), 'kb_read_batch']);
+    expect(context.allowedTools).toEqual([...toolsForRunKind('build'), 'raw_csv_cells', 'kb_read_batch']);
     expect(context.allowedTools).toContain('kb_submit_review');
     expect(context.allowedTools).toContain('kb_write_doc');
     await expect(service.executeTool(reviewToken, 'kb_write_doc', BASE_WRITE))

@@ -191,6 +191,7 @@ export interface BuildActorCheckpointPayload {
 export const V2_CHILD_READ_TOOLS = [
   'raw_list',
   'raw_read',
+  'raw_csv_cells',
   'raw_search',
   'raw_links',
   'draft_list',
