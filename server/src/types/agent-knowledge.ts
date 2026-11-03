@@ -364,6 +364,8 @@ export interface KbManifest {
   promotedPaths?: string[];
   /** Hashes of the reviewed staging bytes, before release compilation. */
   promotionHashes?: Record<string, string>;
+  /** Default incremental evidence allowance origin, frozen across stage releases. */
+  evidenceBudgetOriginBytes?: number;
   /** A案 §10.2 manifest v2：组织元数据（knowledge.json 的版本/哈希与覆盖
    * 模式）。v2 = schemaVersion:2 且必含 organization（isKbManifestV2）；
    * 旧读者遇 v2 应报不支持，禁止静默读无状态内容。 */

@@ -10,7 +10,7 @@ import { DEFAULT_EVIDENCE_BUDGET_BYTES } from '../src/types/agent-knowledge.js';
 const roots: string[] = [];
 afterAll(() => roots.forEach((root) => fs.rmSync(root, { recursive: true, force: true })));
 
-function release(root: string, releaseId: string, buildId: string, baseReleaseId: string | null, evidenceFiles?: Array<{ path: string; bytes: number }>): void {
+function release(root: string, releaseId: string, buildId: string, baseReleaseId: string | null, evidenceFiles?: Array<{ path: string; bytes: number }>, originBytes?: number): void {
   const dir = path.join(root, 'releases', releaseId);
   fs.mkdirSync(dir, { recursive: true });
   const index = Buffer.from(`${JSON.stringify({ evidenceFiles })}\n`);
@@ -19,6 +19,7 @@ function release(root: string, releaseId: string, buildId: string, baseReleaseId
     schemaVersion: 2, releaseId, buildId, baseReleaseId, publishedAt: new Date().toISOString(),
     mode: 'incremental', model: null, docs: [], sourceSnapshot: [],
     organization: { path: 'knowledge.json', schemaVersion: 1, hash: 'sha256:fixture', coverageMode: 'managed' },
+    ...(originBytes !== undefined ? { evidenceBudgetOriginBytes: originBytes } : {}),
     ...(evidenceFiles ? { evidence: { resourcesPath: 'evidence-resources.json', hash: `sha256:${crypto.createHash('sha256').update(index).digest('hex')}` } } : {}),
   }));
 }
@@ -32,12 +33,22 @@ describe('incremental evidence budget', () => {
       { path: 'evidence/one.bin', bytes: 18 * 1024 * 1024 },
       { path: 'evidence/two.bin', bytes: 200 },
     ]);
-    release(root, 'stage1', 'current-build', 'origin');
+    release(root, 'stage1', 'current-build', 'origin', [{ path: 'evidence/one.bin', bytes: 18 * 1024 * 1024 + 500 }]);
     release(root, 'stage2', 'current-build', 'stage1');
     const input = { outputRoot: root, baseReleaseId: 'stage2', buildId: 'current-build', mode: 'incremental' as const };
-    expect(evidenceBudgetForPublication({ ...input, config: {} })).toBe(18 * 1024 * 1024 + 200 + DEFAULT_EVIDENCE_BUDGET_BYTES);
-    expect(evidenceBudgetForPublication({ ...input, config: { evidenceBudgetBytes: 1024 * 1024 } })).toBe(1024 * 1024);
-    expect(evidenceBudgetForPublication({ ...input, mode: 'full', config: {} })).toBe(DEFAULT_EVIDENCE_BUDGET_BYTES);
+    expect(evidenceBudgetForPublication({ ...input, config: {} })).toEqual({
+      limit: 18 * 1024 * 1024 + 200 + DEFAULT_EVIDENCE_BUDGET_BYTES,
+      originBytes: 18 * 1024 * 1024 + 200,
+    });
+    expect(evidenceBudgetForPublication({ ...input, config: { evidenceBudgetBytes: 1024 * 1024 } })).toEqual({ limit: 1024 * 1024 });
+    expect(evidenceBudgetForPublication({ ...input, mode: 'full', config: {} })).toEqual({ limit: DEFAULT_EVIDENCE_BUDGET_BYTES });
+    fs.rmSync(path.join(root, 'releases', 'origin'), { recursive: true });
+    expect(evidenceBudgetForPublication({ ...input, config: {} })).toEqual({
+      limit: 18 * 1024 * 1024 + 500 + DEFAULT_EVIDENCE_BUDGET_BYTES,
+      originBytes: 18 * 1024 * 1024 + 500,
+    });
+    release(root, 'stage3', 'current-build', 'stage2', undefined, 18 * 1024 * 1024 + 200);
+    expect(evidenceBudgetForPublication({ ...input, baseReleaseId: 'stage3', config: {} }).originBytes).toBe(18 * 1024 * 1024 + 200);
   });
 
   it('charges identical image bytes once while retaining both resource IDs', () => {

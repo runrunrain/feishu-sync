@@ -3047,7 +3047,13 @@ export class KbBuildService extends EventEmitter {
           status: 'cancelled',
           finishedAt: new Date().toISOString(),
         });
-        this.emitLog(buildId, 'warn', '构建已取消（未发布任何变更）');
+        const currentReleaseId = new StandardKbStore(outputRoot).readCurrent()?.releaseId ?? null;
+        const currentManifest = currentReleaseId ? new StandardKbStore(outputRoot).readManifest(currentReleaseId) : null;
+        const promoted = currentManifest?.buildId === buildId && currentManifest.publicationStage === 'progressive'
+          ? currentManifest.promotedPaths?.length ?? 0 : 0;
+        this.emitLog(buildId, 'warn', promoted > 0
+          ? `构建已取消；${promoted} 篇阶段发布的正式文档保留，其余成果可从检查点恢复`
+          : '构建已取消（未发布任何变更；候选成果可从检查点恢复）');
         const row = localMapStore.getKbBuild(buildId);
         if (row) this.emitBuild(buildId, 'build_status', this.toDto(row, entry));
         this.deps.toolService.revokeByBuild(buildId);
@@ -6707,6 +6713,7 @@ export class KbBuildService extends EventEmitter {
     governanceSection: { path: string; hash: string };
     /** D3（A案 §5.4）：evidence/ 子目录写盘清单（已过体量预算门禁） */
     evidenceFileWrites: Array<{ path: string; bytes: Buffer }>;
+    evidenceBudgetOriginBytes?: number;
   } | null> {
     const draftFile = path.join(input.stagingRoot, 'knowledge-draft.json');
     if (!fs.existsSync(draftFile)) return null;
@@ -7030,13 +7037,14 @@ export class KbBuildService extends EventEmitter {
       }
     }
     const evidencePlan = planReleaseEvidenceFiles({ evidence, workbookPayloads: wbPayloads, imagePayloads: imgPayloads });
-    const evidenceBudget = evidenceBudgetForPublication({
+    const budget = evidenceBudgetForPublication({
       config: this.deps.configProvider()?.standardKb,
       mode: input.mode,
       outputRoot: input.outputRoot,
       baseReleaseId: input.baseReleaseId,
       buildId: input.buildId,
     });
+    const evidenceBudget = budget.limit;
     if (evidencePlan.totalBytes > evidenceBudget) {
       evidenceBlocking.push({
         code: 'kb_evidence_unresolved', field: 'evidenceFiles',
@@ -7181,6 +7189,7 @@ export class KbBuildService extends EventEmitter {
     return {
       compiled, knowledgeBytes, evidenceBytes, governanceBytes, organization, evidenceSection, governanceSection,
       evidenceFileWrites: [...new Map(evidencePlan.files.map((file) => [file.path, { path: file.path, bytes: file.bytes }])).values()],
+      ...(budget.originBytes !== undefined ? { evidenceBudgetOriginBytes: budget.originBytes } : {}),
     };
   }
 
@@ -7288,6 +7297,8 @@ export class KbBuildService extends EventEmitter {
           organization: knowledgePlan.organization,
           evidence: knowledgePlan.evidenceSection,
           governance: knowledgePlan.governanceSection,
+          ...(knowledgePlan.evidenceBudgetOriginBytes !== undefined
+            ? { evidenceBudgetOriginBytes: knowledgePlan.evidenceBudgetOriginBytes } : {}),
         }
         : { schemaVersion: 1 }),
       releaseId,
