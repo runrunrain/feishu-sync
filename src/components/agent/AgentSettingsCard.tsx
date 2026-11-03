@@ -662,6 +662,24 @@ export function AgentRuntimeSettingsCard() {
           </div>
         </div>
 
+        <div className="flex items-center gap-2 flex-wrap text-xs text-ink-soft">
+          <FieldLabel>识图单图上限</FieldLabel>
+          <select
+            className={INPUT_CLS + ' w-auto min-w-[110px]'}
+            value={vision.maxImageBytes}
+            disabled={saving}
+            onChange={(e) => saveAgent({ vision: { maxImageBytes: Number(e.target.value) } })}
+            aria-label="识图单图上限"
+            data-testid="vision-max-image-bytes"
+          >
+            {![5, 10, 20].some((size) => size * 1024 * 1024 === vision.maxImageBytes) ? (
+              <option value={vision.maxImageBytes} disabled>当前 {Math.round(vision.maxImageBytes / 1024 / 1024)} MB</option>
+            ) : null}
+            {[5, 10, 20].map((size) => <option key={size} value={size * 1024 * 1024}>{size} MB</option>)}
+          </select>
+          <span className="text-[11px] text-ink-faint">超出上限的图片会标记为未理解；增大上限后，下次构建会补试。</span>
+        </div>
+
         <div className="flex items-center gap-2 flex-wrap">
           <Button
             size="sm"

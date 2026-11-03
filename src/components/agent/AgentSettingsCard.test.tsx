@@ -170,6 +170,8 @@ describe('AgentRuntimeSettingsCard 图片理解段（S2/S5）', () => {
     expect(testButton).toContain('测试识图');
     expect(testButton).not.toContain('disabled=""');
     expect(html).toContain('图片发送到所选端点');
+    expect(element(html, 'select', 'vision-max-image-bytes')).toContain('识图单图上限');
+    expect(html).toContain('20 MB');
   });
 
   it('模型下拉：supportsImages 标注与置灰，未标注不置灰', () => {
