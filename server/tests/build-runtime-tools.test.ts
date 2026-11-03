@@ -829,9 +829,9 @@ describe('审查（§4.3）与交接/问题/发布（§5）', () => {
     const setup = makeV2('b-handoff');
     setup.store.registerTaskCreation({ nativeTaskId: 'w1', requestedRole: 'luban' });
     setup.store.registerTaskCreation({ nativeTaskId: 'w2', requestedRole: 'luban' });
-    const submit = await call(setup.child.token, 'build_handoff_submit', { summary: '完成定位文档', artifactRefs: ['docs/h.md@1'], openIssues: ['公式未覆盖'] }, meta('w1', 'luban'));
+    const submit = await call(setup.child.token, 'build_handoff_submit', { summary: '完成定位文档', artifactRefs: ['docs/h.md@1'], openIssues: ['公式未覆盖'], nextInfo: '请独立复核公式' }, meta('w1', 'luban'));
     expect(submit.details!.handoffId).toBeTruthy();
-    const replay = await call(setup.child.token, 'build_handoff_submit', { summary: '完成定位文档', artifactRefs: ['docs/h.md@1'], openIssues: ['公式未覆盖'] }, meta('w1', 'luban'));
+    const replay = await call(setup.child.token, 'build_handoff_submit', { summary: '完成定位文档', artifactRefs: ['docs/h.md@1'], openIssues: ['公式未覆盖'], nextInfo: ['请独立复核公式'] }, meta('w1', 'luban'));
     expect(replay.details!.idempotentReplay).toBe(true);
     const list = await call(setup.leader.token, 'build_handoff_list', {});
     const body = JSON.parse(list.content[0]!.text);

@@ -786,6 +786,11 @@ describe('kb_write_doc：原子落盘与声明', () => {
     expect(payload.objects[0]!.claims.map((claim) => claim.claimKey)).toEqual(['target']);
     expect(payload.evidence.map((item) => item.claimKey)).toEqual(['target']);
     expect(result.content[0]!.text).not.toContain('"claimKey": "other"');
+    const implicit = await service.executeTool(token, 'draft_read', {
+      path: BASE_WRITE.path, offset: 0, limit: 1, declarationClaimKey: 'target',
+    });
+    expect(implicit.content[0]!.text).toContain('existing_knowledge_declarations');
+    expect(implicit.content[0]!.text).not.toContain('"claimKey": "other"');
   });
 
   it('大量声明先返回有界索引，再按对象读取完整声明，避免 Pi 临时文件截断', async () => {

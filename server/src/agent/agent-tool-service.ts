@@ -1852,15 +1852,13 @@ export class AgentToolService {
   private toolDraftRead(context: InternalRunContext, args: Record<string, unknown>): ToolResult {
     const docPath = requireString(args, 'path', 1, 600);
     const metadataOnly = args.metadataOnly === true;
-    if (metadataOnly && args.includeDeclarations === true) {
-      throw new ToolError('invalid_request', 'metadataOnly 与 includeDeclarations 不能同时使用');
-    }
     const offset = optionalInt(args, 'offset', 0, 0, 10_000_000);
     const limit = optionalInt(args, 'limit', 800, 1, 2000);
     const declarationClaimKey = args.declarationClaimKey === undefined ? null : requireString(args, 'declarationClaimKey', 1, 200);
     const declarationObjectKey = args.declarationObjectKey === undefined ? null : requireString(args, 'declarationObjectKey', 1, 200);
-    if ((declarationClaimKey || declarationObjectKey) && args.includeDeclarations !== true) {
-      throw new ToolError('invalid_request', 'declarationClaimKey/declarationObjectKey 需要 includeDeclarations=true');
+    const includeDeclarations = args.includeDeclarations === true || Boolean(declarationClaimKey || declarationObjectKey);
+    if (metadataOnly && includeDeclarations) {
+      throw new ToolError('invalid_request', 'metadataOnly 与声明筛选不能同时使用');
     }
     const stagingRoot = requireBuildState(context).stagingRoot;
     validateStdDocPath(docPath);
@@ -1874,13 +1872,13 @@ export class AgentToolService {
       if (!(error instanceof PathGuardError) || error.code !== 'not_found') throw error;
     }
     const missing = target === null;
-    if (missing && args.includeDeclarations !== true) throw new ToolError('not_found', `草稿不存在: ${docPath}`, 404);
+    if (missing && !includeDeclarations) throw new ToolError('not_found', `草稿不存在: ${docPath}`, 404);
     const fileText = target === null ? '' : fs.readFileSync(target, 'utf-8');
     const body = stripStdHeader(fileText);
     const lines = missing ? [] : body.split('\n');
     const slice = metadataOnly ? [] : lines.slice(offset, offset + limit);
     let declarationText = '';
-    if (args.includeDeclarations === true) {
+    if (includeDeclarations) {
       const state = requireBuildState(context);
       const declarations = this.renderDraftDeclarations(state, docPath, declarationClaimKey, declarationObjectKey);
       if (declarations) {
@@ -4310,6 +4308,9 @@ export class AgentToolService {
 
   /** build_handoff_submit（子任务，§5.2）：交接记录（幂等）。 */
   private toolBuildHandoffSubmit(context: InternalRunContext, args: Record<string, unknown>, meta?: ToolRequestMeta): ToolResult {
+    // A single next step is common in child handoffs; normalize the short form
+    // before deriving the operation ID so replays have one canonical payload.
+    if (typeof args.nextInfo === 'string') args = { ...args, nextInfo: [args.nextInfo] };
     args = withAutoOperationId(args);
     const state = requireBuildState(context);
     const { v2, actor } = this.requireV2Actor(context, meta);

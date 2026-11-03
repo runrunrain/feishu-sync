@@ -83,6 +83,7 @@ CSV 证据不能用 `text_span`：在对应 `evidenceClaims` 项使用 `"sourceR
 当 `coverageUpdates[].disposition` 为 `excluded_template` 或 `excluded_nonknowledge` 时，**该项还必须有非空 `reason` 字段**；不要因缺少理由让整次写入失败。
 
 审查某一条断言的证据范围时，`draft_read` 可只取该 `claimKey` 的对象和证据，避免整篇声明超过桥接输出额度。下面只读取正文首行与该断言声明；若只需替换已有证据的 selector，用该结果中的 `evidenceId` 调用 `kb_edit_doc.evidenceSelectorUpdates`，无需读取或重填整篇声明。
+填写 `declarationClaimKey` 或 `declarationObjectKey` 时，服务端自动开启声明读取；`includeDeclarations` 可以省略。
 
 ```json
 {"server":"feishu-kb-bridge","tool":"draft_read","arguments":{"path":"规则/行动.md","offset":0,"limit":1,"includeDeclarations":true,"declarationClaimKey":"once-per-turn"}}
