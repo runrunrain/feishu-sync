@@ -26,6 +26,9 @@ import { buildServer } from '../src/index.js';
 import { BuildCheckpointStore } from '../src/kb/build-checkpoint.js';
 
 const AMAGI_SOURCE_DIR = process.env.AMAGI_PI_SOURCE_DIR || '';
+const AMAGI_SOURCE_VERSION = AMAGI_SOURCE_DIR && fs.existsSync(path.join(AMAGI_SOURCE_DIR, 'package.json'))
+  ? String((JSON.parse(fs.readFileSync(path.join(AMAGI_SOURCE_DIR, 'package.json'), 'utf-8')) as { version?: string }).version ?? '')
+  : '';
 const DESKTOP_TOKEN = 'e2e-desktop-token';
 const DOC_PATH = 'combat/overview.md';
 
@@ -63,6 +66,7 @@ function toolResultsOf(messages: Array<Record<string, unknown>>): string {
 /** 由会话推导下一个动作（Leader/写作者/审查者三态机）。 */
 function nextAction(messages: Array<Record<string, unknown>>): { text?: string; calls?: FixtureCall[] } {
   const all = messages.map((message) => textOf(message as { content?: unknown })).join('\n');
+  const latestUserText = textOf(([...messages].reverse().find((message) => message.role === 'user') ?? {}) as { content?: unknown });
   const results = toolResultsOf(messages);
   const lastToolResult = [...messages].reverse().find((message) => message.role === 'tool');
   const lastResultText = lastToolResult ? textOf(lastToolResult as { content?: unknown }) : '';
@@ -90,7 +94,7 @@ function nextAction(messages: Array<Record<string, unknown>>): { text?: string; 
     if (all.includes('[task_submit 完成 luban/')) {
       return { calls: [{ name: 'task_submit', args: {
         agent: 'diting',
-        task: '审查任务：对 staging 草稿 combat/overview.md 做独立审查。经 mcp_call 调用 kb_submit_review 提交审查报告（conclusion=pass，coverage.sourceRefs=["tok1"]），然后经 mcp_call 调用 build_handoff_submit 提交交接。',
+        task: `审查任务：对 staging 草稿 ${DOC_PATH} 做独立审查。coverage.docPaths=["${DOC_PATH}"]。经 mcp_call 调用 kb_submit_review 提交审查报告（conclusion=pass，coverage.sourceRefs=["tok1"]），然后经 mcp_call 调用 build_handoff_submit 提交交接。`,
         delivery: 'handle',
       } }] };
     }
@@ -118,9 +122,9 @@ function nextAction(messages: Array<Record<string, unknown>>): { text?: string; 
       delivery: 'handle',
     } }] };
   }
-  if (all.includes('写作任务')) {
+  if (latestUserText.includes('写作任务')) {
     // ---- 写作者状态机（先真实 read 技能正文并验证规则标记，再写）----
-    if (results.includes('handoffId=')) return { text: '写作完成。' };
+    if (results.includes('handoffId=') || /已提交交接记录 ho_/.test(results)) return { text: '写作完成。' };
     if (lastCallName === 'mcp_call' && /kb_output_not_assigned|actor_pending/.test(lastResultText)) {
       const prior = (lastAssistant as { tool_calls?: Array<{ function?: { arguments?: string } }> } | undefined)?.tool_calls?.[0]?.function?.arguments;
       if (prior) return { calls: [{ name: 'mcp_call', args: JSON.parse(prior) as Record<string, unknown> }] };
@@ -166,9 +170,9 @@ function nextAction(messages: Array<Record<string, unknown>>): { text?: string; 
       },
     } }] };
   }
-  if (all.includes('审查任务')) {
+  if (latestUserText.includes('审查任务')) {
     // ---- 审查者状态机 ----
-    if (results.includes('handoffId=')) return { text: '审查完成。' };
+    if (results.includes('handoffId=') || /已提交交接记录 ho_/.test(results)) return { text: '审查完成。' };
     if (results.includes('krev_') || results.includes('审查报告已提交') || lastCallName === 'kb_submit_review') {
       return { calls: [{ name: 'mcp_call', args: {
         server: 'feishu-kb-bridge', tool: 'build_handoff_submit',
@@ -200,11 +204,20 @@ function startFixtureModel(): Promise<{ server: http.Server; port: number; reque
     }
     let body = '';
     req.on('data', (chunk: Buffer) => { body += chunk.toString('utf-8'); });
-    req.on('end', () => {
+    req.on('end', async () => {
       let parsed: { model?: string; stream?: boolean; messages?: Array<Record<string, unknown>> } = {};
       try { parsed = JSON.parse(body) as typeof parsed; } catch { /* 空体 */ }
+      const messages = parsed.messages ?? [];
+      // Real models take time before their first child tool call. The fixture
+      // responds in microseconds, earlier than amagi's asynchronous MCP
+      // discovery, and can trip its same-call loop guard before connection.
+      if (!messages.some((message) => message.role === 'assistant')
+        && messages.some((message) => message.role === 'user'
+          && /写作任务|审查任务/.test(textOf(message)))) {
+        await new Promise((resolve) => setTimeout(resolve, 750));
+      }
       requests.push({ model: parsed.model });
-      const action = nextAction(parsed.messages ?? []);
+      const action = nextAction(messages);
       const id = `chatcmpl-fixture-${requests.length}`;
       const message = {
         role: 'assistant',
@@ -389,7 +402,7 @@ describe('pi-amagi 端到端接入试验（真实 pi/amagi/桥接；fixture 模�
       expect(response.status).toBe(200);
       const body = await response.json() as { installed: boolean; version: string; contentHash: string };
       expect(body.installed).toBe(true);
-      expect(body.version).toBe('2.21.31');
+      expect(body.version).toBe(AMAGI_SOURCE_VERSION);
       expect(body.contentHash).toMatch(/^[0-9a-f]{64}$/);
     },
     240_000,

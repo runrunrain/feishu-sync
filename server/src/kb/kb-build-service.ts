@@ -1641,7 +1641,12 @@ export class KbBuildService extends EventEmitter {
     const liveRoot = state.stagingRoot;
     const entries = KbBuildService.stagingDocsEntriesOf(liveRoot);
     const hashes = new Map(entries.map((item) => [item.path, item.contentHash]));
-    const liveDraft = JSON.parse(fs.readFileSync(path.join(liveRoot, 'knowledge-draft.json'), 'utf8')) as KnowledgeDraftFile;
+    const draftFile = path.join(liveRoot, 'knowledge-draft.json');
+    // An accepted writer receipt can precede object declarations. This is a
+    // normal in-progress state, so leave publication pending until the draft
+    // exists instead of emitting a warning on every child/tool event.
+    if (!fs.existsSync(draftFile)) return;
+    const liveDraft = JSON.parse(fs.readFileSync(draftFile, 'utf8')) as KnowledgeDraftFile;
     const authority = collectAuthorityValidatedReports({
       stagingRoot: liveRoot,
       store: state.v2.actorStore,
