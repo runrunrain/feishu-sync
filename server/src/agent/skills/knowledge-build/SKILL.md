@@ -10,9 +10,9 @@ description: 标准知识库构建工作流（Pi + amagi 派发）。Leader 用�
 ## 角色与章节
 
 - **Leader**：读 `leader-protocol.md`（应用在系统提示注入，不依赖本文件读取）。
-- **写作/修订子任务（luban）**：读 `author-protocol.md` 与 `achievement-protocol.md`、`mcp-examples.md`。
-- **独立审查子任务（diting）**：读 `reviewer-protocol.md` 与 `achievement-protocol.md`、`mcp-examples.md`。
-- 材料调研（baize，按需）：只读取证，不提交正文；读 `achievement-protocol.md` 的交接记录部分。
+- **写作/修订子任务（luban）**：本角色协议、交接规则和工具示例经哈希校验后由应用注入系统提示。
+- **独立审查子任务（diting）**：本角色协议、交接规则和工具示例经哈希校验后由应用注入系统提示。
+- 材料调研（baize，按需）：只读取证，不提交正文；本角色交接规则由应用注入系统提示。
 
 内容质量规则、文风规范与审查细则由应用随任务提供（构建规则与文风提示词），本 skill 只管协作方法，不重复其内容。
 

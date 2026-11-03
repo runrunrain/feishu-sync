@@ -154,6 +154,8 @@ const SKILL_PATH_ENV = 'PI_BUILD_WORKFLOW_SKILL_PATH';
 const PROTOCOL_GATED_TOOLS = new Set(['kb_write_doc', 'kb_edit_doc', 'kb_delete_doc', 'kb_submit_review', 'build_handoff_submit']);
 let protocolRead = false;
 let roleProtocolRead = false;
+let protocolInjected = false;
+let protocolInvalidReason = null;
 // A length stop before any tool call discards a long reasoning pass. Carry a
 // bounded tail into one next request; never repeat indefinitely.
 let lengthDraft = null;
@@ -165,6 +167,37 @@ function roleSkillPath() {
   const role = process.env.AMAGI_AGENT;
   if (!expected || !['luban', 'diting', 'baize'].includes(role)) return null;
   return expected.replace(/SKILL\.md$/, 'role-' + role + '.md');
+}
+async function frozenRoleProtocol() {
+  const skillPath = process.env[SKILL_PATH_ENV];
+  const rolePath = roleSkillPath();
+  const revision = process.env.PI_BUILD_WORKFLOW_REVISION;
+  const role = process.env.AMAGI_AGENT;
+  if (!skillPath || !rolePath || !revision || !['luban', 'diting', 'baize'].includes(role)) return null;
+  protocolInvalidReason = null;
+  try {
+    const fs = await import('node:fs');
+    const crypto = await import('node:crypto');
+    if (!fs.statSync(skillPath).isFile() || fs.lstatSync(skillPath).isSymbolicLink()
+      || !fs.statSync(rolePath).isFile() || fs.lstatSync(rolePath).isSymbolicLink()) {
+      throw new Error('冻结规则文件类型无效');
+    }
+    const skill = fs.readFileSync(skillPath, 'utf8');
+    const digest = (content) => crypto.createHash('sha256').update(content).digest('hex');
+    if (digest(skill) !== revision) throw new Error('冻结技能版本哈希不符');
+    const marker = '<!--ROLE_SKILL ' + role + ' sha256=';
+    const start = skill.indexOf(marker);
+    const expected = start >= 0 ? skill.slice(start + marker.length, start + marker.length + 64) : '';
+    if (!/^[a-f0-9]{64}$/.test(expected) || !skill.includes(marker + expected + ' path=role-' + role + '.md-->')) {
+      throw new Error('角色规则哈希索引缺失');
+    }
+    const body = fs.readFileSync(rolePath, 'utf8');
+    if (digest(body) !== expected) throw new Error('角色规则内容哈希不符');
+    return body;
+  } catch (error) {
+    protocolInvalidReason = error && error.message ? error.message : String(error);
+    return null;
+  }
 }
 const ROOT_REASON = 'child-policy（F12-R1 根约束）：文件工具目标越出冻结信封根——' +
   '知识读取请走 mcp_call 桥受控工具（raw_read/raw_search 等）；本地文件仅限任务工作区、' +
@@ -287,13 +320,20 @@ export default function childPolicy(pi) {
     }
   };
   pi.on('session_start', filterActiveFace);
-  pi.on('before_agent_start', (event) => {
+  pi.on('before_agent_start', async (event) => {
     filterActiveFace();
+    protocolInjected = false;
     const sections = event && event.systemPromptOptions && event.systemPromptOptions.sections;
     const skillPath = process.env[SKILL_PATH_ENV];
-    if (sections && typeof sections === 'object' && skillPath) {
-      sections.feishu_build_child_protocol = '你是飞书标准库构建子任务。第一步用原生 read 读取冻结技能 ' + skillPath +
-        ' 的前 14 行，再读取顶部列出的本角色文件全文后调用桥接工具。Pi 的 --skill 只展示摘要，不自动注入正文；读取前的写入和交接调用会被阻断。';
+    if (sections && typeof sections === 'object') {
+      const frozen = await frozenRoleProtocol();
+      if (frozen) {
+        sections.feishu_build_child_protocol = '你是飞书标准库构建子任务。以下是已验证哈希的本角色完整工作流与质量规则，直接按规则使用桥接工具，无需先读取技能文件。\\n\\n' + frozen;
+        protocolInjected = true;
+      } else if (skillPath && !protocolInvalidReason) {
+        sections.feishu_build_child_protocol = '第一步用原生 read 读取冻结技能 ' + skillPath +
+          ' 的前 14 行，再读取顶部列出的本角色文件全文后调用桥接工具。读取前的写入和交接调用会被阻断。';
+      }
     }
   });
   // —— 轮次收尾链（「上一轮末尾 → 下一请求快照前」的重激活在这里清掉）：
@@ -358,7 +398,10 @@ export default function childPolicy(pi) {
     if (name === 'mcp_call') {
       const requested = event && event.input && typeof event.input.tool === 'string' ? event.input.tool : '';
       const tool = requested.split('__').pop();
-      if (PROTOCOL_GATED_TOOLS.has(tool) && (!protocolRead
+      if (PROTOCOL_GATED_TOOLS.has(tool) && protocolInvalidReason) {
+        return { block: true, reason: '冻结构建协议完整性校验失败：' + protocolInvalidReason + '；停止写入并交回 Leader。' };
+      }
+      if (PROTOCOL_GATED_TOOLS.has(tool) && !protocolInjected && (!protocolRead
         || (process.env.PI_BUILD_ROLE_SKILL_REQUIRED === '1' && !roleProtocolRead))) {
         return { block: true, reason: '构建协议未读取：先用原生 read 读取 ' +
           String(process.env[SKILL_PATH_ENV] || '(缺失的冻结 SKILL.md)') +

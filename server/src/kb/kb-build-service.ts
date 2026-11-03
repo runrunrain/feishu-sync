@@ -1268,12 +1268,12 @@ export class KbBuildService extends EventEmitter {
     });
     // The Leader keeps the full frozen system prompt. Child role files are
     // content-addressed by this SKILL.md and verified before each dispatch.
-    const guide = ['# 子任务按角色读取',
-      '第一步用原生 read 只读本文件前 14 行，再读取下列本角色文件全文；其他角色协议无需读取。',
+    const guide = ['# 子任务按角色注入',
+      '应用在每次子任务模型调用前校验下列本角色文件哈希，并将完整规则直接注入系统提示；无需模型先调用文件工具。',
       ...roleEntries.map(({ role, name }) => `${role}: ${path.join(dir, name)}`),
       ...roleEntries.map(({ role, name, hash }) => `<!--ROLE_SKILL ${role} sha256=${hash} path=${name}-->`),
     ].join('\n');
-    const content = `---\nname: knowledge-build\ndescription: 飞书同步标准知识库构建。写作、审查与调研子任务在处理来源、提交草稿或审查前必须读取本技能。\n---\n\n${guide}${base.combined}${quality ? `\n${quality}\n` : ''}`;
+    const content = `---\nname: knowledge-build\ndescription: 飞书同步标准知识库构建。应用校验冻结角色规则并注入子任务系统提示。\n---\n\n${guide}${base.combined}${quality ? `\n${quality}\n` : ''}`;
     const skillPath = path.join(dir, 'SKILL.md');
     fs.writeFileSync(skillPath, content);
     return { leaderRules: base.leaderRules, revision: crypto.createHash('sha256').update(content).digest('hex'), skillPath };
@@ -1376,7 +1376,7 @@ export class KbBuildService extends EventEmitter {
       ...(skipBriefing ? [skipBriefing] : []),
       '',
       'build_manifest 工作集每页最多 12 个来源：读到首页就派发已有明确输入的任务；每轮最多 4 个 task_submit、每份任务书约 1500 字以内，其余任务后续轮次派发；再按 nextCursor 逐页读完，最终发布前确认 nextCursor=null。',
-      '先经 build_manifest 默认 scope=workset 读取本轮唯一派发范围；scope=all 仅供背景查询，不为未变化基准源派任务。新增长文/表格按一篇目标文档一个写作任务派发，单篇读完即写，多个任务并发。不同主题的大表尽量分成不同目标文档；CSV 明细必须优先用 kb_write_doc.csvTableImports 从冻结附件自动导入，不让作者逐行复制到工具 JSON。每份子任务书第一条必须要求原生 read 读取上方冻结 SKILL.md 前 14 行，再读取列出的本角色文件全文后调用 MCP 桥接；Pi 的 --skill 只提示技能路径，不自动注入全文。objToken 只在任务正文和 MCP 调用中使用，不是 task_submit.inputs.required 的本地路径。首批任务具备输入后立即派发；每篇写入后尽快派单篇审查并阶段发布，全部成果通过审查后申请发布当前精确候选版本。',
+      '先经 build_manifest 默认 scope=workset 读取本轮唯一派发范围；scope=all 仅供背景查询，不为未变化基准源派任务。新增长文/表格按一篇目标文档一个写作任务派发，单篇读完即写，多个任务并发。不同主题的大表尽量分成不同目标文档；CSV 明细必须优先用 kb_write_doc.csvTableImports 从冻结附件自动导入，不让作者逐行复制到工具 JSON。子任务完整角色规则与示例由应用校验冻结哈希后直接注入系统提示，任务书给出本篇来源 token、目标路径和范围即可，不要求先读技能文件。objToken 只在任务正文和 MCP 调用中使用，不是 task_submit.inputs.required 的本地路径。首批任务具备输入后立即派发；每篇写入后尽快派单篇审查并阶段发布，全部成果通过审查后申请发布当前精确候选版本。',
     ].join('\n');
     const resumeBriefing = [
       '# Leader 运行交代（续接）',

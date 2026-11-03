@@ -60,11 +60,13 @@ describe('buildLeaderEnv', () => {
   });
 
   it('PI 基础变量：agentDir 指向构建 home，offline/telemetry 固定；F12-R1 冻结信封根元数据注入（skill 同目录+工作区读，仅报告写）', () => {
-    const env = envFor();
+    const spec = makeSpec();
+    const env = envFor(spec);
     expect(env.PI_CODING_AGENT_DIR).toBe(DIRS.homeDir);
     expect(env.PI_OFFLINE).toBe('1');
     expect(env.PI_SKIP_VERSION_CHECK).toBe('1');
     expect(env.PI_TELEMETRY).toBe('0');
+    expect(env.PI_BUILD_WORKFLOW_REVISION).toBe(spec.workflowRevision);
   });
 
   it('Leader 转发扩展与 MCP 桥接变量注入（桥接变量名固定，供 amagi envRefs 交付）', () => {

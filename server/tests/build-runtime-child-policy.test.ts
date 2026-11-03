@@ -18,6 +18,7 @@
 
 import { describe, expect, it, beforeEach, afterAll } from 'vitest';
 import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -132,6 +133,7 @@ describe('child-policy 扩展行为', () => {
   const prevCwd = process.env.AMAGI_PERMISSION_CWD;
   const hadSkill = Object.prototype.hasOwnProperty.call(process.env, 'PI_BUILD_WORKFLOW_SKILL_PATH');
   const prevSkill = process.env.PI_BUILD_WORKFLOW_SKILL_PATH;
+  const prevRevision = process.env.PI_BUILD_WORKFLOW_REVISION;
   afterAll(() => {
     if (hadTaskId) process.env.AMAGI_TASK_ID = prevTaskId;
     else delete process.env.AMAGI_TASK_ID;
@@ -141,6 +143,8 @@ describe('child-policy 扩展行为', () => {
     else delete process.env.AMAGI_PERMISSION_CWD;
     if (hadSkill) process.env.PI_BUILD_WORKFLOW_SKILL_PATH = prevSkill;
     else delete process.env.PI_BUILD_WORKFLOW_SKILL_PATH;
+    if (prevRevision === undefined) delete process.env.PI_BUILD_WORKFLOW_REVISION;
+    else process.env.PI_BUILD_WORKFLOW_REVISION = prevRevision;
   });
 
   it('无 AMAGI_TASK_ID：工厂零注册（非 amagi 子任务零行为）', async () => {
@@ -176,6 +180,45 @@ describe('child-policy 扩展行为', () => {
     expect(await fake.emit('agent_before_settle', settle)).toMatchObject({ continue: true });
     await turn('aborted');
     expect(await fake.emit('agent_before_settle', { ...settle, outcome: 'aborted' })).toBeUndefined();
+  });
+
+  it('已冻结的角色规则直接注入系统提示，免去读技能轮次；哈希漂移时停止写入', async () => {
+    const previousRole = process.env.AMAGI_AGENT;
+    const previousRequired = process.env.PI_BUILD_ROLE_SKILL_REQUIRED;
+    try {
+      process.env.AMAGI_TASK_ID = 'unit-injected-protocol';
+      process.env.AMAGI_AGENT = 'luban';
+      process.env.PI_BUILD_ROLE_SKILL_REQUIRED = '1';
+      const root = tmpRoot();
+      const skillDir = path.join(root, 'skills', 'knowledge-build');
+      fs.mkdirSync(skillDir, { recursive: true });
+      const skillPath = path.join(skillDir, 'SKILL.md');
+      const rolePath = path.join(skillDir, 'role-luban.md');
+      const body = '完整写作规则与 kb_write_doc 示例';
+      const digest = (value: string) => crypto.createHash('sha256').update(value).digest('hex');
+      fs.writeFileSync(rolePath, body);
+      const skill = `# 冻结技能\n<!--ROLE_SKILL luban sha256=${digest(body)} path=role-luban.md-->`;
+      fs.writeFileSync(skillPath, skill);
+      process.env.PI_BUILD_WORKFLOW_SKILL_PATH = skillPath;
+      process.env.PI_BUILD_WORKFLOW_REVISION = digest(skill);
+      const mod = await loadPolicyModule();
+      const fake = makeFakePi();
+      mod.default(fake.pi);
+      const sections: Record<string, string> = {};
+      await fake.emit('before_agent_start', { systemPromptOptions: { sections } });
+      expect(sections.feishu_build_child_protocol).toContain(body);
+      const write = { toolName: 'mcp_call', input: { tool: 'kb_write_doc', arguments: {} } };
+      expect(await fake.emit('tool_call', write)).toBeUndefined();
+      fs.writeFileSync(rolePath, '被篡改的角色规则');
+      await fake.emit('before_agent_start', { systemPromptOptions: { sections: {} } });
+      expect(await fake.emit('tool_call', write)).toMatchObject({ block: true, reason: expect.stringContaining('完整性校验失败') });
+    } finally {
+      if (previousRole === undefined) delete process.env.AMAGI_AGENT;
+      else process.env.AMAGI_AGENT = previousRole;
+      if (previousRequired === undefined) delete process.env.PI_BUILD_ROLE_SKILL_REQUIRED;
+      else process.env.PI_BUILD_ROLE_SKILL_REQUIRED = previousRequired;
+      delete process.env.PI_BUILD_WORKFLOW_REVISION;
+    }
   });
 
   it('子任务未实际读取冻结技能前不能提交正文，成功读取后可调用桥接', async () => {
