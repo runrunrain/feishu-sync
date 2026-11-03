@@ -151,6 +151,33 @@ describe('child-policy 扩展行为', () => {
     expect(fake.registeredEvents()).toEqual([]);
   });
 
+  it('无工具输出截断时只回灌有界推演草稿，连续恢复至多两次', async () => {
+    process.env.AMAGI_TASK_ID = 'unit-length-recovery';
+    const mod = await loadPolicyModule();
+    const fake = makeFakePi();
+    mod.default(fake.pi);
+    await fake.emit('agent_start', {});
+    const settle = { entries: [], continue: false, outcome: 'completed' };
+    const turn = (thinking: string, content: unknown[] = [{ type: 'thinking', thinking }]) =>
+      fake.emit('turn_end', { message: { role: 'assistant', stopReason: 'length', content }, toolResults: [] });
+    await turn('a'.repeat(30000));
+    const first = await fake.emit('agent_before_settle', settle) as { continue: boolean; entries: Array<{ content: string; display: boolean }> };
+    expect(first.continue).toBe(true);
+    expect(first.entries[0].display).toBe(false);
+    expect(first.entries[0].content).toContain('a'.repeat(24000));
+    expect(first.entries[0].content).not.toContain('a'.repeat(24001));
+    await turn('second');
+    expect(await fake.emit('agent_before_settle', settle)).toMatchObject({ continue: true });
+    await turn('third');
+    expect(await fake.emit('agent_before_settle', settle)).toBeUndefined();
+    await turn('not-recovered', [{ type: 'thinking', thinking: 'not-recovered' }, { type: 'toolCall', name: 'mcp_call' }]);
+    expect(await fake.emit('agent_before_settle', settle)).toBeUndefined();
+    await turn('after tool');
+    expect(await fake.emit('agent_before_settle', settle)).toMatchObject({ continue: true });
+    await turn('aborted');
+    expect(await fake.emit('agent_before_settle', { ...settle, outcome: 'aborted' })).toBeUndefined();
+  });
+
   it('子任务未实际读取冻结技能前不能提交正文，成功读取后可调用桥接', async () => {
     process.env.AMAGI_TASK_ID = 'unit-protocol-read';
     const root = tmpRoot();
@@ -215,7 +242,7 @@ describe('child-policy 扩展行为', () => {
     const mod = await loadPolicyModule();
     const fake = makeFakePi();
     mod.default(fake.pi);
-    expect(fake.registeredEvents().sort()).toEqual(['agent_end', 'before_agent_start', 'message_end', 'message_start', 'session_start', 'tool_call', 'tool_result', 'turn_end', 'turn_start']);
+    expect(fake.registeredEvents().sort()).toEqual(['agent_before_settle', 'agent_end', 'agent_start', 'before_agent_start', 'message_end', 'message_start', 'session_start', 'tool_call', 'tool_result', 'turn_end', 'turn_start']);
     await fake.emit('session_start', undefined);
     expect(fake.activeTools()).toEqual(['read', 'write', 'toolcall_continue']);
     // 运行中被重新激活（模拟宿主注册表重建/长度截断恢复对 --tools 点名工具的重激活，
@@ -645,6 +672,31 @@ const SOURCE_AMAGI = process.env.PI_PROBE_SOURCE_AMAGI ?? '';
 
 describe.skipIf(!PI_CLI || !SOURCE_AMAGI)('真实 pi + 真实 amagi 子进程工具面（live）', () => {
   it(
+    '无工具的长度截断会将有限草稿送进下一轮并发出工具调用',
+    { timeout: 180_000 },
+    async () => {
+      const env = await prepareLiveEnv('live');
+      try {
+        await runLiveChild(env, {
+          marker: 'CHILD-POLICY-LENGTH',
+          steps: [
+            { finishReason: 'length', toolCalls: [] },
+            { toolCalls: [{ name: 'mcp_call', args: { server: 'feishu-kb-bridge', tool: 'kb_echo', arguments: { text: 'length-recovered' } } }] },
+          ],
+          final: 'LENGTH-DONE',
+        });
+        const requests = env.model.requestsFor('CHILD-POLICY-LENGTH');
+        expect(requests.length).toBeGreaterThanOrEqual(3);
+        expect(requests.map((request) => request.step).slice(0, 3)).toEqual([1, 2, 3]);
+        expect(JSON.stringify(requests[1].messages)).toContain('上一轮达到输出上限');
+        expect(JSON.stringify(requests[2].messages)).toContain('"name":"mcp_call"');
+      } finally {
+        await env.dispose();
+      }
+    },
+  );
+
+  it(
     '对照组：无 policy 时 amagi 交付面把 codemode/grep 送进模型工具面且可执行（复现缺口）',
     { timeout: 180_000 },
     async () => {
@@ -881,6 +933,11 @@ class LiveModelServer {
       if (message.role !== 'assistant') continue;
       const match = LiveModelServer.textOf(message).match(/live-step:(\d+)/);
       if (match) priorSteps = Math.max(priorSteps, Number(match[1]));
+    }
+    // Pi may omit a length-stopped assistant message from the next model
+    // context. Count fixture requests for this recovery case instead.
+    if (cfg?.marker === 'CHILD-POLICY-LENGTH') {
+      priorSteps = this.entries.filter((entry) => entry.marker === cfg.marker).length;
     }
     const tools = Array.isArray(body.tools)
       ? body.tools.map((tool) => {

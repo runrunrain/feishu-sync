@@ -154,6 +154,12 @@ const SKILL_PATH_ENV = 'PI_BUILD_WORKFLOW_SKILL_PATH';
 const PROTOCOL_GATED_TOOLS = new Set(['kb_write_doc', 'kb_edit_doc', 'kb_delete_doc', 'kb_submit_review', 'build_handoff_submit']);
 let protocolRead = false;
 let roleProtocolRead = false;
+// A length stop before any tool call discards a long reasoning pass. Carry a
+// bounded tail into one next request; never repeat indefinitely.
+let lengthDraft = null;
+let lengthRecoveries = 0;
+const MAX_LENGTH_RECOVERIES = 2;
+const LENGTH_DRAFT_CHARS = 24000;
 function roleSkillPath() {
   const expected = process.env[SKILL_PATH_ENV];
   const role = process.env.AMAGI_AGENT;
@@ -305,7 +311,35 @@ export default function childPolicy(pi) {
       if (P && roleFile && P.resolve(actual) === P.resolve(roleFile)) roleProtocolRead = true;
     }
   });
-  pi.on('turn_end', filterActiveFace);
+  pi.on('agent_start', () => { lengthDraft = null; lengthRecoveries = 0; });
+  pi.on('turn_end', (event) => {
+    filterActiveFace();
+    const message = event && event.message;
+    const blocks = message && Array.isArray(message.content) ? message.content : [];
+    const hasToolCall = blocks.some((block) => block && block.type === 'toolCall');
+    if (hasToolCall) lengthRecoveries = 0;
+    lengthDraft = null;
+    if (!message || message.role !== 'assistant' || message.stopReason !== 'length'
+      || hasToolCall || (event.toolResults && event.toolResults.length > 0)) return;
+    const draft = blocks.filter((block) => block && (block.type === 'thinking' || block.type === 'text'))
+      .map((block) => typeof block.thinking === 'string' ? block.thinking : block.text)
+      .filter((value) => typeof value === 'string' && value.trim()).join('\\n');
+    if (draft) lengthDraft = draft.slice(-LENGTH_DRAFT_CHARS);
+  });
+  pi.on('agent_before_settle', (event) => {
+    if (!lengthDraft || lengthRecoveries >= MAX_LENGTH_RECOVERIES
+      || event.continue || event.outcome !== 'completed') return;
+    const draft = lengthDraft;
+    lengthDraft = null;
+    lengthRecoveries += 1;
+    return {
+      entries: [...event.entries, {
+        type: 'custom_message', customType: 'feishu-build:length-draft', display: false,
+        content: '上一轮达到输出上限，尚未调用工具。以下是上一轮推演的尾段，仅作过程草稿，不能替代冻结来源证据。沿用已核实的结论，直接完成当前任务所需的工具调用；不要从头重复推演。\\n\\n' + draft,
+      }],
+      continue: true,
+    };
+  });
   pi.on('message_end', (event) => {
     const message = event && event.message;
     if (message && message.role === 'assistant') filterActiveFace();

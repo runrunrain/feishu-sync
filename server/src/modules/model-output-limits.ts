@@ -3,6 +3,8 @@ export const DEFAULT_MAX_OUTPUT_TOKENS = 32_768;
 
 /** Exact API model IDs only. Keep entries tied to a vendor model specification. */
 export const VERIFIED_MODEL_OUTPUT_LIMITS: Readonly<Record<string, { maxTokens: number; source: string }>> = {
+  'glm-5.3': { maxTokens: 131_072, source: 'https://docs.bigmodel.cn/cn/guide/models/text/glm-5.3' },
+  'glm-5.3-flash': { maxTokens: 131_072, source: 'https://docs.bigmodel.cn/cn/guide/models/vlm/glm-5.3-flash' },
   'gpt-4.1': { maxTokens: 32_768, source: 'https://developers.openai.com/api/docs/models/gpt-4.1' },
   'gpt-4.1-mini': { maxTokens: 32_768, source: 'https://developers.openai.com/api/docs/models/gpt-4.1-mini' },
   'gpt-5.1': { maxTokens: 128_000, source: 'https://developers.openai.com/api/docs/models/gpt-5.1' },
