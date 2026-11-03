@@ -200,6 +200,21 @@ describe('审查回执（§4.3）', () => {
     expect(store.invalidateReviewsForPaths(['docs/c.md'], 'content_revised')).toBe(0);
   });
 
+  it('恢复到新工作流时仅撤销旧规则审查，保留现行规则审查', () => {
+    const store = freshStore();
+    const old = store.recordReview({ reviewerTaskId: 'old', draftHash: 'h1', scopePaths: ['docs/a.md'],
+      dependencyHashes: { 'doc:docs/a.md': 'ha', 'workflow-rules': 'old' },
+      ruleVersion: 'kb-review/1', issues: [], verdict: 'pass', reportId: 'report-old' });
+    const current = store.recordReview({ reviewerTaskId: 'current', draftHash: 'h2', scopePaths: ['docs/b.md'],
+      dependencyHashes: { 'doc:docs/b.md': 'hb', 'workflow-rules': 'new' },
+      ruleVersion: 'kb-review/1', issues: [], verdict: 'pass', reportId: 'report-new' });
+    expect(store.invalidateReviewsForWorkflowRevision('new', new Set(['docs/b.md']))).toEqual([]);
+    expect(store.invalidateReviewsForWorkflowRevision('new', new Set(['docs/a.md'])).map((review) => review.reviewId)).toEqual([old.reviewId]);
+    expect(store.listReviews().find((review) => review.reviewId === old.reviewId)?.staleReason).toBe('workflow_rules_changed');
+    expect(store.listReviews().find((review) => review.reviewId === current.reviewId)?.status).toBe('valid');
+    expect(store.invalidateReviewsForWorkflowRevision('new')).toEqual([]);
+  });
+
   it('openBlockingIssues 取最新问题清单', () => {
     const store = freshStore();
     expect(store.openBlockingIssues()).toBe(0);

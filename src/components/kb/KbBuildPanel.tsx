@@ -134,6 +134,8 @@ export function KbBuildPanel({
   const images = progress.images;
   const warnings = view.warnings;
   const showParallelStrip = units.total > 0 || workers.length > 0 || images.total > 0;
+  const partialRelease = view.status !== 'published' && view.releaseId && view.releaseId !== view.baseReleaseId
+    ? view.releaseId : null;
 
   return (
     <section
@@ -156,6 +158,9 @@ export function KbBuildPanel({
           ) : null}
           构建 · {KB_BUILD_STATUS_LABEL[view.status] ?? view.status}
         </span>
+        {partialRelease ? <span className="text-[11px] text-jade" title={`正式标准库版本 ${partialRelease}`}>
+          已分批发布 · {partialRelease}
+        </span> : null}
         <span className="min-w-0 flex-1 text-[10px] text-ink-faint font-mono truncate" title={view.id}>{view.id}</span>
 
         {!isTerminal && progress.stage ? (
@@ -312,7 +317,9 @@ export function KbBuildPanel({
         <div className="px-4 py-2 shrink-0 border-b border-line/60 bg-[rgba(192,57,43,0.04)]">
           <p className="text-xs text-seal-2 leading-relaxed">
             构建失败{view.error ? `（${view.error.code}）：${view.error.message}` : ''}。
-            <span className="text-ink-soft">当前已发布的标准库版本未受影响，仍可正常阅读。</span>
+            <span className="text-ink-soft">{partialRelease
+              ? `已分批发布的正式文档保留在版本 ${partialRelease}，可在左侧目录阅读；未通过的文档仍保留为草稿。`
+              : '当前已发布的标准库版本仍可正常阅读。'}</span>
           </p>
           {issues.length > 0 ? (
             <ul className="mt-1.5 space-y-1 max-h-[72px] overflow-auto scrollbar-thin">
@@ -334,6 +341,7 @@ export function KbBuildPanel({
       ) : null}
 
       {isTerminal && view.status !== 'published' ? <div className="shrink-0 px-4 py-3 border-b border-line/60 space-y-2" data-testid="kb-build-recovery">
+        {partialRelease ? <p className="text-xs text-jade">已分批发布版本 {partialRelease}；完成的正式文档可直接从左侧目录阅读。</p> : null}
         {view.recovery?.canResume ? <>
           <p className="text-xs text-ink-soft">已保存 {view.recovery.draftCount} 篇草稿，完成 {view.recovery.completedBatches}/{view.recovery.totalBatches} 批。{view.recovery.draftCount === 0 && view.recovery.totalBatches > 0 && view.recovery.completedBatches >= view.recovery.totalBatches ? '历史批次没有草稿，继续时会重新执行批次并复用图片描述。' : '继续时复用已完成批次和图片描述。'}</p>
           <Button size="sm" variant="primary" onClick={onResume} loading={resuming} disabled={!onResume}>从断点继续</Button>

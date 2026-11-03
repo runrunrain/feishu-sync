@@ -9,8 +9,8 @@
  *   为 EvidenceWorkbookResource（sheet 感知；公式文本与缓存值性质由
  *   cell().formula 区分）。
  * - 图片：快照内被引用图片（resolveSourceImages），只登记已有识图描述
- *   （described/cached 且有文本）的图片——unavailable 的图片不得充当
- *   支撑（A 案 §5.1），引用未描述图片在资源表层即被拒。
+ *   或白板旁路文字的图片；两者均绑定实际图片字节。没有描述/旁路文字
+ *   的图片不得充当支撑（A 案 §5.1），引用时在资源表层即被拒。
  *
  * 发布规划（planReleaseEvidenceFiles）：工作簿只保留被证据引用区间的
  * 最小充分快照（单元格值/公式/合并信息 JSON 化，附源工作簿 hash 与原始
@@ -25,7 +25,7 @@ import path from 'node:path';
 import type { Evidence, WorkbookCellsSelector } from './knowledge-schema.js';
 import type { EvidenceImageResource, EvidenceWorkbookResource } from './evidence-locator.js';
 import { loadRawWorkbook, rawCellText } from './raw-workbook.js';
-import { resolveSourceImages } from './source-images.js';
+import { resolveSourceImages, type WhiteboardTextMap } from './source-images.js';
 import type { RawSourceSnapshotEntry } from '../types/agent-knowledge.js';
 import type { ImageDescription } from '../agent/vision/vision-describer.js';
 
@@ -131,22 +131,23 @@ export interface ImageEvidencePayload {
 }
 
 /**
- * 装配源内被引用图片的证据资源。只登记已有描述（described/cached 且有
- * 文本）的图片：resourceHash/imageHash = sha256(图片字节)（sha256: 前缀，
- * 与 hashImageFile 同摘要）；caption = 识图描述文本（参与 quoteHash）。
- * 缺失/不可读文件与未描述图片不进资源表（引用即 kb_evidence_unresolved）。
+ * 装配源内被引用图片的证据资源。识图描述与白板旁路文字都可成为
+ * caption（参与 quoteHash），并绑定同一图片本体字节 hash。白板旁路
+ * 文字已在冻结快照中校验 whiteboardTextHash，不重复调用 vision。
+ * 缺失/不可读文件与无任何派生文字的图片不进资源表。
  */
 export function collectImageEvidenceResources(
   knowledgeBaseRoot: string,
   entry: RawSourceSnapshotEntry,
   content: string,
   descriptions: Map<string, ImageDescription> | undefined,
+  whiteboards?: WhiteboardTextMap,
 ): ImageEvidencePayload[] {
   const result: ImageEvidencePayload[] = [];
   for (const image of resolveSourceImages(knowledgeBaseRoot, entry.relPath, content)) {
     const description = descriptions?.get(image.src);
-    if (!description || (description.state !== 'described' && description.state !== 'cached')) continue;
-    const text = (description.text ?? '').trim();
+    const whiteboard = whiteboards?.get(image.src);
+    const text = (whiteboard?.text ?? (description?.state === 'described' || description?.state === 'cached' ? description.text : '') ?? '').trim();
     if (!text) continue;
     let bytes: Buffer;
     try {
@@ -168,6 +169,7 @@ export function collectImageEvidenceResources(
         resourceHash: imageHash,
         imageHash,
         caption: text,
+        ...(whiteboard ? { describerVersion: `whiteboard_text:${whiteboard.origin}${whiteboard.truncated ? ':truncated' : ''}` } : {}),
       },
     });
   }
@@ -345,6 +347,7 @@ export function planReleaseEvidenceFiles(input: {
         src: payload.src,
         imageHash: payload.resource.imageHash,
         caption: payload.resource.caption ?? '',
+        ...(payload.resource.describerVersion ? { describerVersion: payload.resource.describerVersion } : {}),
       },
     });
   }

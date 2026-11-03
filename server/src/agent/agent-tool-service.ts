@@ -12,6 +12,10 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { reconcileBlankCsvCoverage } from '../kb/blank-csv-coverage.js';
+import { renderCsvTableImport } from '../kb/csv-table-import.js';
+import { annotateRawReadPage, skipBlankCsvContinuation, type BlankCsvSkip } from '../kb/csv-read-compact.js';
+import { isPermissionDeniedSourcePlaceholder } from '../kb/source-availability.js';
 import {
   atomicWriteFile,
   listDirInside,
@@ -31,6 +35,7 @@ import {
   KB_UNIT_DONE_SPEC,
   KB_WRITE_DOC_SPEC,
   KB_EDIT_DOC_SPEC,
+  KB_TOOL_SCHEMA_SPEC,
   KB_READ_BATCH_SPEC,
   BUILD_MANIFEST_SPEC,
   BUILD_ASSIGN_OUTPUT_SPEC,
@@ -60,7 +65,9 @@ import {
 } from './tool-specs.js';
 import { TASK_TOOL_FAMILY_NAME } from './tool-specs.js';
 import { RawSourceSnapshot, collectSourceCandidates } from '../kb/raw-source-snapshot.js';
-import { StandardKbStore, stripStdHeader } from '../kb/standard-kb-store.js';
+import { StandardKbStore, parseStdHeader, stripStdHeader } from '../kb/standard-kb-store.js';
+import { KbVersionStore } from '../kb/kb-version-store.js';
+import { finalDraftEvidenceScopePaths } from '../kb/progressive-knowledge-draft.js';
 import {
   computePayloadHash,
   computeReviewSubjectHash,
@@ -81,6 +88,7 @@ import {
 } from '../kb/knowledge-schema.js';
 import {
   contentResourceHash,
+  parseCsvRecords,
   resolveSelector,
   verifyEvidence,
   type EvidenceReadReceipt,
@@ -98,6 +106,7 @@ import {
   REVIEW_DEP_SOURCE_SNAPSHOT,
   REVIEW_DEP_WORKFLOW_RULES,
   resolveCurrentReviewDependencies,
+  scopedReviewDeclarationHash,
   type ReviewDependencyValues,
 } from '../kb/review-authority.js';
 import { getKbQueryService, QueryError } from '../kb/search/kb-query-service.js';
@@ -480,6 +489,19 @@ export interface VisionDescriberLike {
   describeMany(items: Array<{ file: string; src: string }>, opts: { signal: AbortSignal; onProgress: (p: { done: number; total: number }) => void; refreshCached?: boolean }): Promise<Map<string, ImageDescription>>;
 }
 
+function publishValidationIssues(result: Record<string, unknown> | null): Array<{ path: string; code: string; message: string }> {
+  const details = result?.details;
+  const raw = details && typeof details === 'object' && !Array.isArray(details)
+    ? (details as Record<string, unknown>).issues : null;
+  if (!Array.isArray(raw)) return [];
+  return raw.slice(0, 8).filter((item): item is Record<string, unknown> =>
+    !!item && typeof item === 'object' && !Array.isArray(item)).map((item) => ({
+      path: typeof item.path === 'string' ? item.path : '',
+      code: typeof item.code === 'string' ? item.code : 'unknown',
+      message: typeof item.message === 'string' ? item.message : '',
+    }));
+}
+
 export class AgentToolService {
   private readonly contexts = new Map<string, InternalRunContext>();
   private readonly stores = new Map<string, StandardKbStore>();
@@ -631,6 +653,7 @@ export class AgentToolService {
       tools: [
         { spec: KB_READ_BATCH_SPEC, runKinds: ['build'], execute: (context, args, meta) => this.toolKbReadBatch(context, args, meta) },
         { spec: KB_EDIT_DOC_SPEC, runKinds: [], execute: (context, args, meta) => this.toolKbEditDoc(context, args, meta) },
+        { spec: KB_TOOL_SCHEMA_SPEC, runKinds: [], execute: (context, args, meta) => this.toolKbToolSchema(context, args, meta) },
         { spec: BUILD_MANIFEST_SPEC, runKinds: [], execute: (context, args) => this.toolBuildManifest(context, args) },
         { spec: BUILD_ASSIGN_OUTPUT_SPEC, runKinds: [], execute: (context, args) => this.toolBuildAssignOutput(context, args) },
         { spec: BUILD_REVOKE_OUTPUT_SPEC, runKinds: [], execute: (context, args) => this.toolBuildRevokeOutput(context, args) },
@@ -833,6 +856,17 @@ export class AgentToolService {
     return names
       .map((name) => this.familyTools.get(name)?.spec)
       .filter((spec): spec is AgentToolSpec => Boolean(spec));
+  }
+
+  private toolKbToolSchema(context: InternalRunContext, args: Record<string, unknown>, meta?: ToolRequestMeta): ToolResult {
+    const name = typeof args.name === 'string' ? args.name : '';
+    const allowed = context.options.orchestration
+      ? this.v2ToolNamesFor(context, { amagiTaskId: meta?.amagiTaskId, amagiAgent: meta?.amagiAgent })
+      : context.allowedTools;
+    if (!allowed.includes(name)) throw new ToolError('tool_not_allowed', `工具 ${name} 不在当前角色工具面`, 403);
+    const spec = this.familyTools.get(name)?.spec;
+    if (!spec) throw new ToolError('tool_not_allowed', `未知工具: ${name}`, 403);
+    return { content: [{ type: 'text', text: JSON.stringify(spec) }] };
   }
 
   /** POST /tools/:name 执行入口（meta：内部 API 透传的调用侧元数据）。 */
@@ -1089,6 +1123,9 @@ export class AgentToolService {
     const objToken = requireString(args, 'objToken', 1, 256);
     const offset = optionalInt(args, 'offset', 0, 0, 10_000_000);
     const limit = optionalInt(args, 'limit', 800, 1, 2000);
+    if (args.includeBlankCsvRows !== undefined && typeof args.includeBlankCsvRows !== 'boolean') {
+      throw new ToolError('invalid_request', 'includeBlankCsvRows 必须是布尔值');
+    }
     const entry = context.options.buildState
       ? context.options.buildState.snapshot.get(objToken)
       : this.rawEntriesForDiscuss(context).find((candidate) => candidate.objToken === objToken) ?? null;
@@ -1098,7 +1135,8 @@ export class AgentToolService {
     let lines: string[];
     let readTrail: {
       receipts: Array<{ readReceiptId: string; resourceId: string; lineStart: number; lineEnd: number }>;
-      resources: Array<{ resourceId: string; kind: 'text' | 'csv'; label: string; resourceHash: string; totalLines: number }>;
+      resources: Array<{ resourceId: string; kind: 'text' | 'csv'; label: string; resourceHash: string; totalLines: number; nonEmptyCells?: number }>;
+      imageResources: Array<{ resourceId: string; imageHash: string; derivedFrom: string }>;
       segmentMap: Array<Record<string, unknown>>;
     } | null = null;
     if (context.options.buildState) {
@@ -1157,12 +1195,22 @@ export class AgentToolService {
           lineStart: receipt.selector.lineStart,
           lineEnd: receipt.selector.lineEnd,
         })),
-        resources: assembled.resources.map(({ resourceId, kind, label, resourceHash, lines: resourceLines }) => ({
+        resources: assembled.resources.map(({ resourceId, kind, label, resourceHash, lines: resourceLines, nonEmptyCells }) => ({
           resourceId, kind, label, resourceHash, totalLines: resourceLines.length,
+          ...(nonEmptyCells !== undefined ? { nonEmptyCells } : {}),
         })),
+        imageResources: assembled.imageResources
+          .filter((resource) => slice.some((line) => line.includes(resource.src)))
+          .map(({ resourceId, imageHash, derivedFrom }) => ({ resourceId, imageHash, derivedFrom })),
         segmentMap,
       };
-      return this.renderRawReadPage(context, entry, lines, slice, offset, readTrail, truncated);
+      const displayLines = annotateRawReadPage(
+        slice, offset, assembled.segments, assembled.resources, args.includeBlankCsvRows === true,
+      );
+      const continuation = args.includeBlankCsvRows === true
+        ? { nextOffset: truncated ? offset + slice.length : null, skipped: null }
+        : skipBlankCsvContinuation(offset + slice.length, lines.length, assembled.segments, assembled.resources);
+      return this.renderRawReadPage(context, entry, lines, slice, offset, readTrail, truncated, displayLines, continuation);
     }
     // S3（§3.5）：会话态原路径（无回执、无 segmentMap）
     const content = await this.inlineSessionImageDescriptions(
@@ -1184,16 +1232,41 @@ export class AgentToolService {
     offset: number,
     readTrail: {
       receipts: Array<{ readReceiptId: string; resourceId: string; lineStart: number; lineEnd: number }>;
-      resources: Array<{ resourceId: string; kind: 'text' | 'csv'; label: string; resourceHash: string; totalLines: number }>;
+      resources: Array<{ resourceId: string; kind: 'text' | 'csv'; label: string; resourceHash: string; totalLines: number; nonEmptyCells?: number }>;
+      imageResources: Array<{ resourceId: string; imageHash: string; derivedFrom: string }>;
       segmentMap: Array<Record<string, unknown>>;
     } | null,
     truncated: boolean,
+    displayLines: string[] = slice,
+    continuation?: BlankCsvSkip,
   ): ToolResult {
     // P1-S4（§2.4）：末页追加 <source_links>（非末页不追加，避免翻页重复）；
     // 无引用边或未注入引用图时不追加，输出与旧版逐字一致。
-    const isLastPage = offset + slice.length >= lines.length;
+    const nextOffset = continuation ? continuation.nextOffset
+      : offset + slice.length >= lines.length ? null : offset + slice.length;
+    const isLastPage = nextOffset === null;
     const sourceLinks = isLastPage ? this.buildSourceLinksBlock(context, entry.objToken) : null;
-    const wrapped = `<untrusted_source obj_token="${entry.objToken}" title="${escapeXml(entry.title)}">\n${slice.join('\n')}\n</untrusted_source>`
+    // Pi MCP only exposes content blocks to the model. A receipt kept solely in
+    // ToolResult.details is invisible to writers, so evidence declarations cannot
+    // cite it. Put the compact trusted receipt header first, ahead of long source
+    // text that may be truncated by the task tool output budget.
+    const receiptHeader = readTrail
+      ? `<read_receipts source_id="${entry.objToken}">${JSON.stringify(readTrail.receipts)}</read_receipts>\n`
+      : '';
+    const imageHeader = readTrail?.imageResources.length
+      ? `<image_resources>${JSON.stringify(readTrail.imageResources)}</image_resources>\n`
+      : '';
+    const blankCsv = readTrail?.resources.filter((resource) => resource.kind === 'csv' && resource.nonEmptyCells === 0)
+      .map(({ resourceId, label, totalLines }) => ({ resourceId, label, totalLines })) ?? [];
+    const blankCsvHeader = blankCsv.length ? `<blank_csv_resources>${JSON.stringify(blankCsv)}</blank_csv_resources>\n` : '';
+    // MCP exposes content, not ToolResult.details. Give the writer an exact
+    // continuation offset so large sheets do not trigger guessed/repeated reads.
+    const pageHeader = `<raw_page offset="${offset}" returned="${slice.length}" total="${lines.length}" next_offset="${nextOffset ?? 'end'}" />\n`
+      + (readTrail ? '<raw_coordinates O="output-line" R="resource-line" C="csv-record" />\n' : '');
+    const skippedHeader = continuation?.skipped
+      ? `<skipped_blank_csv_rows resource_id="${escapeXml(continuation.skipped.resourceId)}" output_lines="${continuation.skipped.outputStart}-${continuation.skipped.outputEnd}" resource_lines="${continuation.skipped.resourceStart}-${continuation.skipped.resourceEnd}" count="${continuation.skipped.outputEnd - continuation.skipped.outputStart + 1}" />\n`
+      : '';
+    const wrapped = `${receiptHeader}${imageHeader}${blankCsvHeader}${pageHeader}${skippedHeader}<untrusted_source obj_token="${entry.objToken}" title="${escapeXml(entry.title)}">\n${displayLines.join('\n')}\n</untrusted_source>`
       + (sourceLinks ? `\n${sourceLinks.text}` : '');
     return {
       content: [{ type: 'text', text: wrapped }],
@@ -1204,6 +1277,7 @@ export class AgentToolService {
         offset,
         returnedLines: slice.length,
         totalLines: lines.length,
+        nextOffset,
         ...(readTrail
           ? {
             // T3（A 案 §5.3）：模型只能引用回执中的范围；quoteHash 复核在
@@ -1211,6 +1285,7 @@ export class AgentToolService {
             readReceiptId: readTrail.receipts[0]?.readReceiptId ?? null,
             readReceipts: readTrail.receipts,
             resources: readTrail.resources,
+            imageResources: readTrail.imageResources,
             segmentMap: readTrail.segmentMap,
             truncated,
           }
@@ -1238,7 +1313,9 @@ export class AgentToolService {
       sourceId: string;
       sourceSnapshotHash: string;
       lines: string[];
+      nonEmptyCells?: number;
     }>;
+    imageResources: Array<{ resourceId: string; imageHash: string; derivedFrom: string; src: string }>;
   } {
     let verified;
     try {
@@ -1259,6 +1336,16 @@ export class AgentToolService {
       return described?.get(src) ?? { src, state: 'unavailable', reason: fallbackReason };
     };
     const wbText = (src: string) => whiteboard?.get(src);
+    // MediaRegion 不要求文本读取回执，但模型需要看见图片资源 ID。
+    // 使用与写入/发布相同的装配器，避免只展示旁路文字却遗漏图片本体。
+    const imageResources = collectImageEvidenceResources(
+      state.knowledgeBaseRoot, entry, verified.content, described, whiteboard,
+    ).map((payload) => ({
+      resourceId: payload.resource.resourceId,
+      imageHash: payload.resource.imageHash,
+      derivedFrom: payload.resource.describerVersion?.startsWith('whiteboard_text:') ? 'whiteboard_text' : 'image_description',
+      src: payload.src,
+    }));
 
     const lines: string[] = [];
     const labels: Array<{ resourceId?: string; derived?: string }> = [];
@@ -1292,6 +1379,7 @@ export class AgentToolService {
       sourceId: string;
       sourceSnapshotHash: string;
       lines: string[];
+      nonEmptyCells?: number;
     }> = [{
       resourceId: entry.objToken,
       kind: 'text',
@@ -1304,12 +1392,18 @@ export class AgentToolService {
     for (const attachment of verified.attachments) {
       const base = path.basename(attachment.path);
       const resourceId = `${entry.objToken}#csv:${base}`;
-      // 与 readRawContent 旧拼接逐字节一致：'' + '<!-- 附件 x -->' + csv 行
-      lines.push('', `<!-- 附件 ${base} -->`);
-      labels.push({ derived: 'attachment_header' }, { derived: 'attachment_header' });
       const csvLines = attachment.content.split('\n');
-      lines.push(...csvLines);
-      for (let i = 0; i < csvLines.length; i += 1) labels.push({ resourceId });
+      const nonEmptyCells = parseCsvRecords(attachment.content).records.reduce((count, record) =>
+        count + record.filter((cell) => cell.trim().length > 0).length, 0);
+      // Empty sheets are common workbook placeholders (often hundreds of
+      // comma-only rows). Keep their verified resource metadata while omitting
+      // the empty rows from model context and page budgets.
+      lines.push('', nonEmptyCells === 0 ? `<!-- 空白 CSV 附件 ${base}：0 个有效单元格 -->` : `<!-- 附件 ${base} -->`);
+      labels.push({ derived: 'attachment_header' }, { derived: 'attachment_header' });
+      if (nonEmptyCells > 0) {
+        lines.push(...csvLines);
+        for (let i = 0; i < csvLines.length; i += 1) labels.push({ resourceId });
+      }
       resources.push({
         resourceId,
         kind: 'csv',
@@ -1318,6 +1412,7 @@ export class AgentToolService {
         sourceId: entry.objToken,
         sourceSnapshotHash: entry.contentHash,
         lines: csvLines,
+        nonEmptyCells,
       });
     }
     // 相邻同标签行合并为段（segmentMap 输出形）；资源行号按资源内计数
@@ -1347,7 +1442,7 @@ export class AgentToolService {
           : {}),
       });
     }
-    return { lines, segments, resources };
+    return { lines, segments, resources, imageResources };
   }
 
   /** 追加读取回执到 staging/<buildId>/read-receipts.jsonl 与内存镜像。 */
@@ -1687,44 +1782,32 @@ export class AgentToolService {
     const docPath = requireString(args, 'path', 1, 600);
     const offset = optionalInt(args, 'offset', 0, 0, 10_000_000);
     const limit = optionalInt(args, 'limit', 800, 1, 2000);
+    const declarationClaimKey = args.declarationClaimKey === undefined ? null : requireString(args, 'declarationClaimKey', 1, 200);
+    const declarationObjectKey = args.declarationObjectKey === undefined ? null : requireString(args, 'declarationObjectKey', 1, 200);
+    if ((declarationClaimKey || declarationObjectKey) && args.includeDeclarations !== true) {
+      throw new ToolError('invalid_request', 'declarationClaimKey/declarationObjectKey 需要 includeDeclarations=true');
+    }
     const stagingRoot = requireBuildState(context).stagingRoot;
     validateStdDocPath(docPath);
     const docsRoot = path.join(stagingRoot, 'docs');
-    const target = resolveInside(docsRoot, docPath, 'write');
-    const missing = !fs.existsSync(target);
+    // 读取尚未创建的目标时，父目录也可能不存在。write 意图要求父目录
+    // 已存在，会把普通的「尚无草稿」误报为 path_escape。
+    let target: string | null = null;
+    try {
+      target = resolveInside(docsRoot, docPath, 'read');
+    } catch (error) {
+      if (!(error instanceof PathGuardError) || error.code !== 'not_found') throw error;
+    }
+    const missing = target === null;
     if (missing && args.includeDeclarations !== true) throw new ToolError('not_found', `草稿不存在: ${docPath}`, 404);
-    const body = missing ? '' : stripStdHeader(fs.readFileSync(resolveInside(docsRoot, docPath, 'read'), 'utf-8'));
+    const body = target === null ? '' : stripStdHeader(fs.readFileSync(target, 'utf-8'));
     const lines = missing ? [] : body.split('\n');
     const slice = lines.slice(offset, offset + limit);
     let declarationText = '';
     if (args.includeDeclarations === true) {
       const state = requireBuildState(context);
-      const draftFile = path.join(stagingRoot, 'knowledge-draft.json');
-      if (state.knowledgeDraft || fs.existsSync(draftFile)) {
-        const draft = this.loadKnowledgeDraft(state);
-        const objects = draft.objects.filter((object) => !object.tombstone && object.canonical?.path === docPath);
-        const ids = new Set(objects.map((object) => object.objectId));
-        const keysById = new Map(Object.entries(draft.clientKeys).map(([key, id]) => [id, key]));
-        const declarations = {
-          draftRevision: draft.docs[docPath]?.revision ?? 0,
-          objects: objects.map((object) => ({
-            clientKey: keysById.get(object.objectId) ?? object.objectId,
-            objectId: object.objectId,
-            type: object.type,
-            title: object.title,
-            aliases: object.aliases,
-            domainIds: object.domainIds,
-            familyKey: object.familyKey,
-            variantKey: object.variantKey,
-            scopeKey: object.scopeKey,
-            scopeText: object.scopeText,
-            bodyRange: object.canonical?.bodyRange,
-            claims: object.claims.map((claim) => ({ claimKey: claim.claimKey, riskCategory: claim.riskCategory, bodyRange: claim.bodyRange, evidenceIds: claim.evidenceIds })),
-          })),
-          evidence: draft.evidence.filter((item) => ids.has(item.objectId)),
-          presentations: draft.presentations.filter((item) => ids.has(item.ownerObjectId)),
-          relations: draft.relations.filter((item) => ids.has(item.fromObjectId)),
-        };
+      const declarations = this.renderDraftDeclarations(state, docPath, declarationClaimKey, declarationObjectKey);
+      if (declarations) {
         declarationText = `\n\n<existing_knowledge_declarations>\n${JSON.stringify(declarations, null, 2)}\n</existing_knowledge_declarations>`;
       }
     }
@@ -1795,6 +1878,9 @@ export class AgentToolService {
   // ------------------------------------------------------------------
 
   private async toolKbWriteDoc(context: InternalRunContext, args: Record<string, unknown>, meta?: ToolRequestMeta): Promise<ToolResult> {
+    // 机械字段由服务端从已给的语义输入确定。规范化必须在幂等哈希前完成，
+    // 同载荷重放与首次提交看到同一份业务参数；显式字段始终优先。
+    args = normalizeKbWriteDocArgs(args);
     // v2（设计 v2 §4.4 + Leader steer 硬验收）：凭据代次/身份/角色/发布窗口
     // （前置门）→ 分配 → 幂等 → 原校验链 → 成果回执，**整体置于同一受控
     // 锁链**（与声明临界区同一把锁）：幂等预检、最终提交与回执记账之间
@@ -1858,6 +1944,89 @@ export class AgentToolService {
    * options.idempotency.payloadHash（F06）：v2 调用方语义载荷哈希——
    * calls 账本命中同键时必须比较（同载荷才重放），并在原子落盘时随
    * calls 条目记录，供回执丢失后的崩溃重放核验。 */
+  private materializeCsvTableImports(
+    context: InternalRunContext,
+    state: BuildRunState,
+    args: Record<string, unknown>,
+    meta?: ToolRequestMeta,
+  ): Record<string, unknown> {
+    if (args.csvTableImports === undefined) return args;
+    const imports = args.csvTableImports;
+    if (!Array.isArray(imports) || imports.length === 0 || imports.length > 10) {
+      throw new ToolError('invalid_request', 'csvTableImports 必须包含 1 至 10 个表格导入');
+    }
+    const sources = new Set(Array.isArray(args.sources) ? args.sources : []);
+    let markdown = requireString(args, 'markdown', 1, 2_000_000);
+    const receipts: ReadReceiptRecord[] = [];
+    const assembledBySource = new Map<string, ReturnType<AgentToolService['assembleBuildRead']>>();
+    const usedKeys = new Set<string>();
+    for (const raw of imports) {
+      const item = asRecord(raw);
+      if (!item) throw new ToolError('invalid_request', 'csvTableImports 项目必须为对象');
+      const key = requireString(item, 'key', 1, 40);
+      if (!/^[A-Za-z0-9_-]+$/.test(key) || usedKeys.has(key)) {
+        throw new ToolError('invalid_request', 'CSV 表格占位键格式无效或重复');
+      }
+      usedKeys.add(key);
+      const sourceId = requireString(item, 'sourceId', 1, 256);
+      const csvName = requireString(item, 'csvName', 1, 255);
+      if (path.basename(csvName) !== csvName || !/\.csv$/i.test(csvName) || !sources.has(sourceId)) {
+        throw new ToolError('invalid_request', 'CSV 附件名称无效，或来源未列入 sources');
+      }
+      const entry = state.snapshot.get(sourceId);
+      if (!entry) throw new ToolError('invalid_request', `CSV 来源不在快照内：${sourceId}`);
+      let assembled = assembledBySource.get(sourceId);
+      if (!assembled) {
+        assembled = this.assembleBuildRead(state, entry);
+        assembledBySource.set(sourceId, assembled);
+      }
+      const resourceId = `${sourceId}#csv:${csvName}`;
+      const resource = assembled.resources.find((candidate) => candidate.resourceId === resourceId && candidate.kind === 'csv');
+      if (!resource) throw new ToolError('invalid_request', `CSV 附件不在冻结来源中：${resourceId}`);
+      if (!Array.isArray(item.columns) || item.columns.length === 0 || item.columns.length > 20
+        || item.columns.some((column) => !Number.isSafeInteger(column))) {
+        throw new ToolError('invalid_request', 'CSV 导入列坐标无效');
+      }
+      const headerRecord = item.headerRecord === undefined ? 1 : item.headerRecord;
+      const firstRecord = item.firstRecord === undefined ? (headerRecord as number) + 1 : item.firstRecord;
+      const lastRecord = item.lastRecord;
+      if (!Number.isSafeInteger(headerRecord) || !Number.isSafeInteger(firstRecord)
+        || (lastRecord !== undefined && !Number.isSafeInteger(lastRecord))) {
+        throw new ToolError('invalid_request', 'CSV 导入记录范围无效');
+      }
+      let rendered;
+      try {
+        rendered = renderCsvTableImport(resource.lines.join('\n'), {
+          columns: item.columns as number[],
+          headerRecord: headerRecord as number,
+          firstRecord: firstRecord as number,
+          ...(lastRecord === undefined ? {} : { lastRecord: lastRecord as number }),
+        });
+      } catch (error) {
+        throw new ToolError('invalid_request', error instanceof Error ? error.message : 'CSV 表格导入失败');
+      }
+      const marker = `{{kb-csv-table:${key}}}`;
+      if (markdown.split(marker).length !== 2) {
+        throw new ToolError('invalid_request', `正文须恰好包含一次 ${marker}`);
+      }
+      markdown = markdown.replace(marker, rendered.markdown);
+      const returnedText = resource.lines.slice(rendered.lineStart - 1, rendered.lineEnd).join('\n');
+      receipts.push({
+        readReceiptId: `rr_${crypto.randomBytes(9).toString('hex')}`,
+        buildId: context.buildId ?? 'unknown',
+        unitId: context.options.worker?.unitId ?? null,
+        toolCallId: meta?.toolCallId ?? 'csv-table-import',
+        sourceSnapshotHash: entry.contentHash,
+        resourceId,
+        selector: { kind: 'read_range', lineStart: rendered.lineStart, lineEnd: rendered.lineEnd },
+        returnedHash: contentResourceHash(returnedText),
+        truncated: false,
+      });
+    }
+    this.appendReadReceipts(state, receipts);
+    return { ...args, markdown };
+  }
+
   private async writeDocCore(
     context: InternalRunContext,
     args: Record<string, unknown>,
@@ -1867,6 +2036,7 @@ export class AgentToolService {
     const state = requireBuildState(context);
     // T3（A 案 §7.1）：审查者没有任何草稿写入口
     this.assertNotReviewPhase(context);
+    args = this.materializeCsvTableImports(context, state, args, meta);
     const docPath = requireString(args, 'path', 1, 600);
     const title = requireString(args, 'title', 1, 300);
     const markdown = requireString(args, 'markdown', 1, 2_000_000);
@@ -2890,7 +3060,7 @@ export class AgentToolService {
       // 图片不得充当支撑；未描述图片不在资源表，引用即拒。
       if ([...referenced].some((id) => id.startsWith(`${sourceId}${IMAGE_RESOURCE_PREFIX}`))) {
         for (const payload of collectImageEvidenceResources(
-          state.knowledgeBaseRoot, entry, verified.content, state.imageDescriptions?.get(sourceId),
+          state.knowledgeBaseRoot, entry, verified.content, state.imageDescriptions?.get(sourceId), state.whiteboardTexts?.get(sourceId),
         )) {
           resources.push(payload.resource);
         }
@@ -2949,12 +3119,29 @@ export class AgentToolService {
       if (nature !== 'direct' && nature !== 'derived' && nature !== 'machine_description') {
         throw new ToolError('invalid_request', `evidenceClaims.nature 非法: ${String(nature)}`);
       }
-      if (selector.kind === 'media_region' && nature === 'direct') {
-        throw new ToolError('kb_evidence_unresolved', '图片描述证据不得标 direct（A 案 §5.2）');
+      if (selector.kind === 'media_region' && nature !== 'machine_description') {
+        throw new ToolError('kb_evidence_unresolved', '图片描述证据必须标 machine_description（A 案 §5.2）');
       }
-      const readReceiptId = optStr(input, 'readReceiptId');
+      if (nature === 'machine_description' && selector.kind !== 'media_region') {
+        throw new ToolError('kb_evidence_unresolved', 'machine_description 证据必须使用 media_region 和图片资源 ID；正文 text_span 不会包含 raw_read 临时插入的图片描述');
+      }
+      let readReceiptId = optStr(input, 'readReceiptId');
+      if (!readReceiptId && selector.kind === 'text_span') {
+        readReceiptId = receipts.find((receipt) => receipt.resourceId === resourceId
+          && receipt.lineStart <= selector.lineStart && receipt.lineEnd >= selector.lineEnd)?.readReceiptId;
+      }
+      if (!readReceiptId && selector.kind === 'csv_cells' && resource.kind === 'csv') {
+        const { recordSpans } = parseCsvRecords(resource.content);
+        const first = recordSpans[selector.recordStart - 1];
+        const last = recordSpans[selector.recordEnd - 1];
+        if (first && last) {
+          const endLine = last.startLine + last.lineCount - 1;
+          readReceiptId = receipts.find((receipt) => receipt.resourceId === resourceId
+            && receipt.lineStart <= first.startLine && receipt.lineEnd >= endLine)?.readReceiptId;
+        }
+      }
       if ((selector.kind === 'text_span' || selector.kind === 'csv_cells') && !readReceiptId) {
-        throw new ToolError('kb_evidence_unresolved', '文本/CSV 证据必须携带 raw_read 返回的 readReceiptId（A 案 §5.3：只能引用回执中的范围）');
+        throw new ToolError('kb_evidence_unresolved', '文本/CSV 证据没有覆盖所选范围的 raw_read 回执；请先读取该资源和行范围，或显式提供有效 readReceiptId（A 案 §5.3）');
       }
       // 服务端重新解引用：selector 解析 → hash 对账 + 回执范围 + quoteHash 复核
       const resolution = resolveSelector(resource, selector);
@@ -2985,18 +3172,13 @@ export class AgentToolService {
         ...(readReceiptId ? { readReceiptId } : {}),
       });
     }
-    // diting F06：来源快照已变化的旧证据不随重声明存活——它无法通过发布门
-    // 禁的重解引用（源已变），留着只会阻断发布；未重报即失效。来源未变且
-    // 未重报的旧证据保留（同构建内跨提交沿用同一 evidenceId 替换）。
+    // kb_write_doc 是整篇声明替换：被重申对象的证据以本次 evidenceClaims
+    // 为准。旧证据即使来源快照未变，也可能指向旧正文的断言或错误坐标；
+    // 未重报就必须移除。仅未触及的对象保留原证据。相同 clientKey 的新证据
+    // 复用原 evidenceId，保持身份稳定。
     const newEvidenceIds = new Set(newEvidence.map((evidence) => evidence.evidenceId));
-    const snapshotHashOf = (sourceId: string): string | null => state.snapshot.get(sourceId)?.contentHash ?? null;
-    draft.evidence = draft.evidence.filter((evidence) => {
-      if (!touchedIds.has(evidence.objectId)) return true;
-      if (newEvidenceIds.has(evidence.evidenceId)) return true;
-      return snapshotHashOf(evidence.sourceRef.sourceId) === evidence.sourceRef.sourceSnapshotHash;
-    });
-    draft.evidence = draft.evidence.filter((evidence) => !removedIds.has(evidence.objectId));
-    draft.evidence = draft.evidence.filter((evidence) => !newEvidenceIds.has(evidence.evidenceId));
+    draft.evidence = draft.evidence.filter((evidence) => !touchedIds.has(evidence.objectId)
+      && !removedIds.has(evidence.objectId) && !newEvidenceIds.has(evidence.evidenceId));
     draft.evidence.push(...newEvidence);
     for (const [clientKey, evidenceId] of submissionEvidenceKeys) draft.evidenceKeys[clientKey] = evidenceId;
     for (const [clientKey, evidenceId] of Object.entries(draft.evidenceKeys)) {
@@ -3207,6 +3389,9 @@ export class AgentToolService {
     const newItemIds = new Set(newCoverage.map((item) => item.itemId));
     draft.coverage = draft.coverage.filter((item) => !newItemIds.has(item.itemId));
     draft.coverage.push(...newCoverage);
+    // Source reconstruction appends CSV attachments after the Markdown body.
+    // The model must not guess whether a blank tab is an unread design gap.
+    reconcileBlankCsvCoverage(draft.coverage, state.snapshot, state.knowledgeBaseRoot);
 
     // ---- 审查主体哈希：受影响对象的绑定面变化使旧审查失效（A 案 §2.3）----
     for (const object of newObjects) {
@@ -3285,7 +3470,7 @@ export class AgentToolService {
    */
   private async markObjectsReviewedForAuthorityReceipt(
     context: InternalRunContext,
-    expected: ReviewDependencyValues & { draftHash: string },
+    expected: ReviewDependencyValues & { draftHash: string; scopePaths: string[]; sourceRefs: string[] },
     reportId: string,
     meta?: ToolRequestMeta,
   ): Promise<{ marked: number; deferredReason: string | null }> {
@@ -3294,7 +3479,7 @@ export class AgentToolService {
       // 审查凭据也是受控知识写入：重检ctx、actor、代次及发布窗口。
       this.assertRunLeaseActive(context);
       this.assertV2Access(context, 'kb_submit_review', meta);
-      const entriesNow = this.stagingDraftEntries(state);
+      const entriesNow = this.stagingDraftEntries(state).filter((entry) => expected.scopePaths.includes(entry.path));
       if (computeCandidateHash({ documents: entriesNow }) !== expected.draftHash) {
         return { marked: 0, deferredReason: 'draft_changed_since_review' };
       }
@@ -3303,7 +3488,7 @@ export class AgentToolService {
         snapshot: state.snapshot,
         workflowRulesHash: state.v2WorkflowRulesHash ?? null,
       });
-      if (current.declarationHash !== expected.declarationHash) {
+      if (scopedReviewDeclarationHash(state.stagingRoot, expected.scopePaths, expected.sourceRefs) !== expected.declarationHash) {
         return { marked: 0, deferredReason: 'knowledge_declaration_changed_since_review' };
       }
       if (current.sourceSnapshotHash !== expected.sourceSnapshotHash) {
@@ -3314,7 +3499,7 @@ export class AgentToolService {
         // F08 补强：v2 权威规则哈希缺失即 fail-closed（缺证明不回写）
         return { marked: 0, deferredReason: 'workflow_rules_changed_since_review' };
       }
-      const marked = this.markObjectsMachineReviewedLocked(state, null, reportId);
+      const marked = this.markObjectsMachineReviewedLocked(state, expected.scopePaths, reportId);
       return { marked, deferredReason: null };
     });
   }
@@ -3605,6 +3790,7 @@ export class AgentToolService {
    * revisionResponse/closureBasis 属修订流程字段，提交时一律不读不存。
    */
   private async toolKbSubmitReview(context: InternalRunContext, args: Record<string, unknown>, meta?: ToolRequestMeta): Promise<ToolResult> {
+    args = withAutoOperationId(args);
     const state = requireBuildState(context);
     const worker = context.options.worker;
     if (worker && worker.phase !== 'review') {
@@ -3631,7 +3817,21 @@ export class AgentToolService {
     if (!/^[A-Za-z0-9_-]+$/.test(unitId)) {
       throw new ToolError('invalid_request', 'unitId 只能包含字母、数字、下划线与连字符');
     }
-    const entries = this.stagingDraftEntries(state);
+    const coverageInput = asRecord(args.coverage);
+    if (!coverageInput) throw new ToolError('invalid_request', 'coverage 必须是对象');
+    const sourceRefs = optStrArray(coverageInput, 'sourceRefs') ?? [];
+    const allEntries = this.stagingDraftEntries(state);
+    // The server derives the review scope from the report's source coverage and
+    // the actual document headers. The model does not supply document hashes.
+    const scopePaths = v2Info ? allEntries.filter((entry) => {
+      const content = fs.readFileSync(path.join(state.stagingRoot, 'docs', entry.path), 'utf8');
+      const header = parseStdHeader(content);
+      return header?.sources.some((source) => sourceRefs.includes(source)) ?? false;
+    }).map((entry) => entry.path) : [];
+    if (v2Info && (sourceRefs.length === 0 || scopePaths.length === 0)) {
+      throw new ToolError('kb_review_scope_missing', '审查范围必须包含实际草稿引用的来源；请在 coverage.sourceRefs 填写所审来源', 400);
+    }
+    const entries = v2Info ? allEntries.filter((entry) => scopePaths.includes(entry.path)) : allEntries;
     const draftHash = computeCandidateHash({ documents: entries });
     // v2 F08：审查依赖绑定——对象/证据声明 + 来源快照 + 冻结 workflow 规则
     //（正文经 doc:* 逐路径与 draftHash 双重绑定）；发布侧同一权威核验。
@@ -3642,17 +3842,18 @@ export class AgentToolService {
         workflowRulesHash: state.v2WorkflowRulesHash ?? null,
       })
       : null;
+    if (reviewDeps && v2Info) {
+      reviewDeps.declarationHash = scopedReviewDeclarationHash(state.stagingRoot, scopePaths, sourceRefs)
+        ?? reviewDeps.declarationHash;
+    }
     // v2（§4.3）：审查者既不是作者，也不在作者的续接链上
     if (v2Info) {
       try {
-        v2Info.v2.actorStore.assertReviewerIndependent(v2Info.actor!.nativeTaskId, entries.map((entry) => entry.path));
+        v2Info.v2.actorStore.assertReviewerIndependent(v2Info.actor!.nativeTaskId, scopePaths);
       } catch (error) {
         throw wrapActorError(error);
       }
     }
-    const coverageInput = asRecord(args.coverage);
-    if (!coverageInput) throw new ToolError('invalid_request', 'coverage 必须是对象');
-    const sourceRefs = optStrArray(coverageInput, 'sourceRefs') ?? [];
     const checkedDimensions = optStrArray(args, 'checkedDimensions') ?? [];
     const issueInputs = requireArray(args, 'issues');
     if (issueInputs.length > 500) throw new ToolError('invalid_request', 'issues 至多 500 项');
@@ -3683,6 +3884,15 @@ export class AgentToolService {
     const conclusion = args.conclusion;
     if (conclusion !== 'pass' && conclusion !== 'needs_revision' && conclusion !== 'insufficient_material' && conclusion !== 'fail') {
       throw new ToolError('invalid_request', `conclusion 非法: ${String(conclusion)}`);
+    }
+    if (v2Info && conclusion === 'pass') {
+      const unresolved = this.loadKnowledgeDraft(state).coverage.filter((item) =>
+        sourceRefs.includes(item.sourceRef.sourceId)
+        && item.importance === 'important' && item.disposition === 'unresolved');
+      if (unresolved.length > 0) {
+        throw new ToolError('kb_review_coverage_blocked',
+          `本范围仍有重要未解决覆盖项，不能提交 pass：${unresolved.slice(0, 5).map((item) => item.itemId).join('、')}；请提交 needs_revision 并交给作者修订`, 409);
+      }
     }
     const report: ReviewReport = {
       reportId: `kr_${crypto.randomBytes(8).toString('hex')}`,
@@ -3721,6 +3931,7 @@ export class AgentToolService {
       v2Info.v2.actorStore.recordReview({
         reviewerTaskId: v2Info.actor!.nativeTaskId,
         draftHash,
+        scopePaths,
         dependencyHashes: {
           ...Object.fromEntries(entries.map((entry) => [`doc:${entry.path}`, entry.contentHash])),
           [REVIEW_DEP_DECLARATION]: deps.declarationHash,
@@ -3749,7 +3960,7 @@ export class AgentToolService {
     if (v2Info && conclusion === 'pass' && blocking === 0) {
       const outcome = await this.markObjectsReviewedForAuthorityReceipt(
         context,
-        { draftHash, ...reviewDeps! },
+        { draftHash, ...reviewDeps!, scopePaths, sourceRefs },
         report.reportId,
         meta,
       );
@@ -3784,6 +3995,44 @@ export class AgentToolService {
     return entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   }
 
+  /** Show the Leader which documents are already formal in the current release.
+   * A restored draft registration or seed review is not a request to re-review
+   * every carried document. Use the same body/declaration comparison as final
+   * publication so status cannot falsely call changed declarations promoted. */
+  private buildDocumentWorkStatus(context: InternalRunContext, state: BuildRunState): {
+    carriedPublishedPaths: string[];
+    promotedUnchangedPaths: string[];
+    unpublishedDraftPaths: string[];
+    pendingRequiredRewrites: string[];
+  } {
+    const entries = this.stagingDraftEntries(state);
+    const manifest = this.storeFor(context.options.outputRoot).readManifest();
+    let draft: KnowledgeDraftFile | null = null;
+    try {
+      draft = JSON.parse(fs.readFileSync(path.join(state.stagingRoot, 'knowledge-draft.json'), 'utf8')) as KnowledgeDraftFile;
+    } catch { /* The candidate may not have any declarations yet. */ }
+    const carriedPublishedPaths = entries.filter(({ path: docPath }) => draft?.docs?.[docPath]?.basis === 'published').map(({ path: docPath }) => docPath);
+    const ownProgressive = !!manifest && manifest.buildId === (context.buildId ?? state.v2?.actorStore.buildId)
+      && manifest.publicationStage === 'progressive';
+    const promotedHashes = ownProgressive ? manifest.promotionHashes ?? {} : {};
+    const baselineKnowledge = ownProgressive && manifest
+      ? new KbVersionStore(context.options.outputRoot).readKnowledgeManifest(manifest.releaseId) : null;
+    const changedPaths = draft && baselineKnowledge ? finalDraftEvidenceScopePaths({
+      buildId: context.buildId ?? state.v2?.actorStore.buildId ?? '',
+      liveDraft: draft,
+      candidateDocs: entries,
+      baselineManifest: manifest,
+      baselineKnowledge,
+    }) : undefined;
+    const promotedUnchangedPaths = entries.filter(({ path: docPath, contentHash }) =>
+      draft?.docs?.[docPath]?.basis !== 'published' && promotedHashes[docPath] === contentHash
+      && changedPaths !== undefined && !changedPaths.includes(docPath)).map(({ path: docPath }) => docPath);
+    const alreadyFormal = new Set([...carriedPublishedPaths, ...promotedUnchangedPaths]);
+    const unpublishedDraftPaths = entries.filter(({ path: docPath }) => !alreadyFormal.has(docPath)).map(({ path: docPath }) => docPath);
+    const pendingRequiredRewrites = unpublishedDraftPaths.filter((docPath) => state.requiredRewrites?.has(docPath));
+    return { carriedPublishedPaths, promotedUnchangedPaths, unpublishedDraftPaths, pendingRequiredRewrites };
+  }
+
   // ------------------------------------------------------------------
   // v2 build-runtime 工具（设计 v2 §3.4/§4/§5/§7）
   // ------------------------------------------------------------------
@@ -3792,22 +4041,66 @@ export class AgentToolService {
   private toolBuildManifest(context: InternalRunContext, args: Record<string, unknown>): ToolResult {
     const state = requireBuildState(context);
     const limit = optionalInt(args, 'limit', 50, 1, 200);
-    const entries = state.snapshot.entries.map((entry) => ({
-      objToken: entry.objToken,
-      objType: entry.objType,
-      title: entry.title,
-      relPath: entry.relPath,
-      contentHash: entry.contentHash,
-      objEditTime: entry.objEditTime,
-      changeType: state.workset.get(entry.objToken) ?? (state.mode === 'full' ? 'rebuild' : null),
-    }));
+    const published = this.storeFor(context.options.outputRoot).readManifest();
+    const publishedSourceByToken = new Map((published?.sourceSnapshot ?? []).map((source) => [source.objToken, source] as const));
+    // 增量重建时把已发布主题的路径交给 Leader，避免仅凭源标题猜新路径，
+    // 把同一主题写成第二篇。这里只读取本构建 staging 中的受控文档头。
+    const existingDocPathsBySource = new Map<string, string[]>();
+    for (const doc of this.stagingDraftEntries(state)) {
+      const file = resolveInside(path.join(state.stagingRoot, 'docs'), doc.path, 'read');
+      const header = parseStdHeader(fs.readFileSync(file, 'utf-8'));
+      if (!header) continue;
+      for (const token of header.sources) {
+        const paths = existingDocPathsBySource.get(token) ?? [];
+        paths.push(doc.path);
+        existingDocPathsBySource.set(token, paths);
+      }
+    }
+    // Leader 的默认清单只列本轮工作集。完整冻结快照仍可显式查询，
+    // 但不能把未变化的基准来源误当作需要派发的审查/写作任务。
+    const scope = args.scope === 'all' ? 'all' : 'workset';
+    const sourceEntries = scope === 'all'
+      ? state.snapshot.entries
+      : state.snapshot.entries.filter((entry) => state.mode === 'full' || state.workset.has(entry.objToken));
+    const entries = sourceEntries.map((entry) => {
+      const previous = publishedSourceByToken.get(entry.objToken);
+      const changeType = state.workset.get(entry.objToken) ?? (state.mode === 'full' ? 'rebuild' : null);
+      const assembled = this.assembleBuildRead(state, entry);
+      const sourceAvailability = isPermissionDeniedSourcePlaceholder(assembled.resources[0]?.lines.join('\n') ?? '')
+        ? 'permission_denied_placeholder' : 'available';
+      return {
+        objToken: entry.objToken,
+        objType: entry.objType,
+        title: entry.title,
+        relPath: entry.relPath,
+        contentHash: entry.contentHash,
+        objEditTime: entry.objEditTime,
+        changeType,
+        sourceAvailability,
+        // Mechanical size/outline hints let the Leader split multi-topic sheets
+        // before a writer consumes an entire large source in one model turn.
+        sourceShape: summarizeRawSourceShape(assembled),
+        existingDocPaths: (existingDocPathsBySource.get(entry.objToken) ?? []).sort(),
+        // contentHash 不含图片和白板旁路文字；同 hash 仍可能是本轮 changed。
+        // 不能让 Leader 据此跳过实际进入工作集的来源。
+        unchangedFromPublished: previous
+          ? changeType !== 'changed'
+            && previous.contentHash === entry.contentHash
+            && (!previous.mediaHash || !entry.mediaHash || previous.mediaHash === entry.mediaHash)
+            && (previous.whiteboardTextHash ?? '') === (entry.whiteboardTextHash ?? '')
+          : null,
+      };
+    });
     const cursorOffset = typeof args.cursor === 'string' && args.cursor ? Number(Buffer.from(args.cursor, 'base64url').toString('utf-8')) : 0;
     const start = Number.isInteger(cursorOffset) && cursorOffset >= 0 ? cursorOffset : 0;
     const page = entries.slice(start, start + limit);
     const nextCursor = start + limit < entries.length ? Buffer.from(String(start + limit), 'utf-8').toString('base64url') : null;
     return {
-      content: [{ type: 'text', text: JSON.stringify({ buildId: context.buildId ?? state.v2?.actorStore.buildId ?? null, total: entries.length, entries: page, nextCursor }, null, 2) }],
-      details: { total: entries.length, returned: page.length, nextCursor },
+      content: [{ type: 'text', text: JSON.stringify({ buildId: context.buildId ?? state.v2?.actorStore.buildId ?? null,
+        scope, total: entries.length, requiredRewrites: [...(state.requiredRewrites ?? [])].sort(),
+        documentWorkStatus: this.buildDocumentWorkStatus(context, state),
+        entries: page, nextCursor }, null, 2) }],
+      details: { scope, total: entries.length, returned: page.length, nextCursor },
     };
   }
 
@@ -3822,6 +4115,9 @@ export class AgentToolService {
     const targetKind = targets.every((target) => target.startsWith('family:')) ? 'family'
       : targets.every((target) => !target.startsWith('family:')) ? 'doc'
         : (() => { throw new ToolError('invalid_request', 'targets 不能混用文档路径与 family:<familyKey>'); })();
+    if (targetKind === 'doc') {
+      for (const target of targets) validateStdDocPath(target);
+    }
     const normalized = targetKind === 'family' ? targets.map((target) => target.slice('family:'.length)) : targets;
     try {
       const assignment = v2.actorStore.assignOutputs({
@@ -3857,6 +4153,7 @@ export class AgentToolService {
 
   /** build_handoff_submit（子任务，§5.2）：交接记录（幂等）。 */
   private toolBuildHandoffSubmit(context: InternalRunContext, args: Record<string, unknown>, meta?: ToolRequestMeta): ToolResult {
+    args = withAutoOperationId(args);
     const state = requireBuildState(context);
     const { v2, actor } = this.requireV2Actor(context, meta);
     const operationId = requireString(args, 'operationId', 1, 200);
@@ -3962,7 +4259,15 @@ export class AgentToolService {
       receipts: store.listReceipts().length,
       reviews: store.listReviews().filter((review) => review.status === 'valid').length,
       openBlockingIssues: store.openBlockingIssues(),
+      documentWorkStatus: this.buildDocumentWorkStatus(context, state),
       publishing: store.publishing?.requestId ?? null,
+      lastPublishRejection: (() => {
+        const request = store.latestPublishRequest();
+        return request?.status === 'rejected'
+          ? { requestId: request.requestId, reason: request.result?.reason ?? 'unknown',
+            message: typeof request.result?.message === 'string' ? request.result.message : null,
+            issues: publishValidationIssues(request.result) } : null;
+      })(),
     });
     if (action === 'status') {
       return { content: [{ type: 'text', text: JSON.stringify(statusSummary(), null, 2) }], details: statusSummary() };
@@ -4021,8 +4326,14 @@ export class AgentToolService {
       };
       const outcome = await handler({ buildId: v2.actorStore.buildId, generation: v2.actorStore.activeGeneration, candidateHash, requestedRevision, summary, authorityLease });
       v2.actorStore.settlePublishRequest(request.requestId, outcome.accepted ? 'accepted' : 'rejected', outcome.result);
+      const reasons = Array.isArray(outcome.result.reasons) ? outcome.result.reasons.map(String) : [];
+      const details = Array.isArray(outcome.result.details) ? outcome.result.details.map(String) : [];
+      const issues = publishValidationIssues(outcome.result).map((item) =>
+        `${item.code}${item.path ? ` [${item.path}]` : ''}${item.message ? `：${item.message}` : ''}`);
+      const message = typeof outcome.result.message === 'string' ? outcome.result.message : '';
+      const rejection = outcome.accepted ? '' : `；原因：${[String(outcome.result.reason ?? 'unknown'), ...reasons, ...details.slice(0, 8), ...issues, ...(message ? [message] : [])].join('；')}`;
       return {
-        content: [{ type: 'text', text: `发布申请 ${request.requestId} 已结算：${outcome.accepted ? 'accepted' : 'rejected'}（候选 ${candidateHash.slice(0, 12)}…）` }],
+        content: [{ type: 'text', text: `发布申请 ${request.requestId} 已结算：${outcome.accepted ? 'accepted' : 'rejected'}（候选 ${candidateHash.slice(0, 12)}…）${rejection}` }],
         details: { requestId: request.requestId, accepted: outcome.accepted, candidateHash, result: outcome.result },
       };
     } catch (error) {
@@ -4039,7 +4350,7 @@ export class AgentToolService {
       throw new ToolError('invalid_request', 'kb_read_batch 仅在构建态可用（会话态请用 raw_read / kb_read）');
     }
     const maxLines = optionalInt(args, 'maxLines', 1200, 1, 4000);
-    type BatchRequest = { kind: 'raw' | 'draft'; objToken?: string; path?: string; offset: number; limit?: number; includeDeclarations?: boolean };
+    type BatchRequest = { kind: 'raw' | 'draft'; objToken?: string; path?: string; offset: number; limit?: number; includeDeclarations?: boolean; declarationClaimKey?: string; declarationObjectKey?: string };
     const normalizeRequest = (raw: unknown, label: string): BatchRequest => {
       const input = asRecord(raw);
       if (!input) throw new ToolError('invalid_request', `${label} 每项必须是对象`);
@@ -4052,6 +4363,8 @@ export class AgentToolService {
         offset: optionalInt(input, 'offset', 0, 0, 10_000_000),
         ...(input.limit !== undefined ? { limit: optionalInt(input, 'limit', 800, 1, 2000) } : {}),
         ...(input.includeDeclarations === true ? { includeDeclarations: true } : {}),
+        ...(input.declarationClaimKey !== undefined ? { declarationClaimKey: requireString(input, 'declarationClaimKey', 1, 200) } : {}),
+        ...(input.declarationObjectKey !== undefined ? { declarationObjectKey: requireString(input, 'declarationObjectKey', 1, 200) } : {}),
       };
     };
     let queue: BatchRequest[];
@@ -4075,7 +4388,11 @@ export class AgentToolService {
     }
     const results: Array<Record<string, unknown>> = [];
     const receipts: ReadReceiptRecord[] = [];
-    while (queue.length > 0 && linesUsed < maxLines) {
+    // 每个原始请求在本次调用中最多返回一页。续页放入 nextCursor，不能
+    // 在同一调用中反复执行 limit=1 的请求（尤其 includeDeclarations=true
+    // 会把整份声明重复序列化数百次，放大为数百万 token）。
+    const pageRequests = queue.length;
+    for (let requestIndex = 0; requestIndex < pageRequests && queue.length > 0 && linesUsed < maxLines; requestIndex += 1) {
       const request = queue.shift()!;
       const budgetLeft = maxLines - linesUsed;
       const effLimit = Math.min(request.limit ?? 800, budgetLeft, 2000);
@@ -4132,7 +4449,7 @@ export class AgentToolService {
           segmentMap,
         });
         if (truncated) {
-          queue.unshift({ ...request, offset: request.offset + slice.length });
+          queue.push({ ...request, offset: request.offset + slice.length });
         }
       } else {
         const docPath = request.path!;
@@ -4161,10 +4478,10 @@ export class AgentToolService {
           truncated,
           contentHash: contentResourceHash(coordinates.paramLines.join('\n')),
           text: slice.join('\n'),
-          ...(request.includeDeclarations ? { declarations: this.renderDraftDeclarations(state, docPath) } : {}),
+          ...(request.includeDeclarations ? { declarations: this.renderDraftDeclarations(state, docPath, request.declarationClaimKey ?? null, request.declarationObjectKey ?? null) } : {}),
         });
         if (truncated) {
-          queue.unshift({ ...request, offset: request.offset + slice.length });
+          queue.push({ ...request, offset: request.offset + slice.length, includeDeclarations: false });
         }
       }
     }
@@ -4181,6 +4498,7 @@ export class AgentToolService {
   /** kb_edit_doc（§7）：局部编辑——稳定定位/声明继承/结构化错误/审查失效；
    * 复用 writeDocCore 同一校验链（不绕开）；幂等与分配在 v2 包装层。 */
   private async toolKbEditDoc(context: InternalRunContext, args: Record<string, unknown>, meta?: ToolRequestMeta): Promise<ToolResult> {
+    args = withAutoOperationId(args);
     const state = requireBuildState(context);
     this.assertNotReviewPhase(context);
     const docPath = requireString(args, 'path', 1, 600);
@@ -4245,8 +4563,13 @@ export class AgentToolService {
       }
     }
     // 顺序应用补丁（后续补丁在前一补丁产生的文本上定位）
-    const patchInputs = requireArray(args, 'patches');
-    if (patchInputs.length === 0 || patchInputs.length > 50) throw new ToolError('invalid_request', 'patches 必须是 1..50 项');
+    const patchInputs = args.patches === undefined ? [] : requireArray(args, 'patches');
+    const evidenceSelectorUpdates = args.evidenceSelectorUpdates === undefined ? [] : requireArray(args, 'evidenceSelectorUpdates');
+    const coverageUpdates = args.coverageUpdates === undefined ? [] : requireArray(args, 'coverageUpdates');
+    if (patchInputs.length > 50 || evidenceSelectorUpdates.length > 20 || coverageUpdates.length > 20
+      || (patchInputs.length === 0 && evidenceSelectorUpdates.length === 0 && coverageUpdates.length === 0)) {
+      throw new ToolError('invalid_request', 'patches、evidenceSelectorUpdates 与 coverageUpdates 至少一项非空，且分别不超过 50/20/20 项');
+    }
     let current = [...coordinates.paramLines];
     const applied: Array<{ startLine: number; endLine: number; newLineCount: number; anchor: string }> = [];
     for (const [index, raw] of patchInputs.entries()) {
@@ -4318,7 +4641,11 @@ export class AgentToolService {
       current = [...current.slice(0, startLine - 1), ...newLines, ...current.slice(endLine)];
       applied.push({ startLine, endLine, newLineCount: newLines.length, anchor: `${kind}` });
     }
-    const newMarkdown = current.join('\n');
+    // writeDocCore appends one terminal newline. Evidence-only edits must not
+    // accumulate an extra blank line on every metadata revision.
+    const newMarkdown = patchInputs.length === 0 && current.at(-1) === ''
+      ? current.slice(0, -1).join('\n')
+      : current.join('\n');
     // 元数据继承（缺省沿用；summary 无源时必须显式提供）
     const summary = args.summaryUpdate !== undefined
       ? requireString(args, 'summaryUpdate', 1, 400)
@@ -4334,6 +4661,68 @@ export class AgentToolService {
       throw new ToolError('invalid_request', 'sourcesAppend 必须是字符串数组');
     }
     const sources = [...new Set([...coordinates.sources, ...(sourcesAppend as string[])])];
+    const inheritedDeclarations = this.inheritDeclarationsForEdit(state, docPath,
+      applied.map(({ startLine, endLine, newLineCount }) => ({ startLine, endLine, newLineCount })));
+    const inheritedCoverage: Array<Record<string, unknown>> = [];
+    if (coverageUpdates.length > 0) {
+      const draft = this.loadKnowledgeDraft(state);
+      const seen = new Set<string>();
+      for (const [index, raw] of coverageUpdates.entries()) {
+        const update = asRecord(raw);
+        if (!update) throw new ToolError('invalid_request', `coverageUpdates[${index}] 必须是对象`);
+        const itemId = requireString(update, 'itemId', 1, 200);
+        if (seen.has(itemId)) throw new ToolError('invalid_request', `coverageUpdates.itemId 重复: ${itemId}`);
+        seen.add(itemId);
+        const old = draft.coverage.find((item) => item.itemId === itemId);
+        if (!old) throw new ToolError('kb_coverage_invalid', `覆盖项不存在: ${itemId}`);
+        if (!coordinates.sources.includes(old.sourceRef.sourceId))
+          throw new ToolError('kb_coverage_invalid', `覆盖项 ${itemId} 不属于草稿 ${docPath} 的来源`);
+        if (update.sourceId !== undefined && update.sourceId !== old.sourceRef.sourceId)
+          throw new ToolError('kb_coverage_invalid', `覆盖项 ${itemId} 的来源不可变`);
+        if (update.category !== undefined && update.category !== old.category)
+          throw new ToolError('kb_coverage_invalid', `覆盖项 ${itemId} 的分类不可变`);
+        const disposition = requireString(update, 'disposition', 1, 40);
+        const targetKeys = update.targetKeys === undefined ? old.targetObjectIds : optStrArray(update, 'targetKeys') ?? [];
+        for (const key of targetKeys) {
+          const id = draft.clientKeys[key] ?? key;
+          if (!draft.objects.some((object) => !object.tombstone && object.objectId === id && object.canonical?.path === docPath))
+            throw new ToolError('kb_coverage_invalid', `覆盖项 ${itemId} 的目标对象不属于草稿 ${docPath}: ${key}`);
+        }
+        inheritedCoverage.push({
+          itemId, sourceId: old.sourceRef.sourceId, category: old.category,
+          importance: update.importance ?? old.importance,
+          disposition,
+          ...((update.targetKeys !== undefined || disposition === 'mapped')
+            ? { targetKeys } : {}),
+          ...((update.reason !== undefined || disposition === 'excluded_template' || disposition === 'excluded_nonknowledge' || disposition === 'unresolved')
+            ? { reason: update.reason ?? old.reason } : {}),
+        });
+      }
+    }
+    if (evidenceSelectorUpdates.length > 0) {
+      const evidenceInputs = inheritedDeclarations.evidenceClaims as Array<Record<string, unknown>> | undefined;
+      if (!evidenceInputs) throw new ToolError('invalid_request', '草稿没有可更新的证据声明');
+      const draft = this.loadKnowledgeDraft(state);
+      const keyById = new Map(Object.entries(draft.evidenceKeys).map(([key, id]) => [id, key]));
+      const seen = new Set<string>();
+      for (const [index, raw] of evidenceSelectorUpdates.entries()) {
+        const update = asRecord(raw);
+        if (!update) throw new ToolError('invalid_request', `evidenceSelectorUpdates[${index}] 必须是对象`);
+        const evidenceId = requireString(update, 'evidenceId', 1, 200);
+        if (seen.has(evidenceId)) throw new ToolError('invalid_request', `evidenceSelectorUpdates.evidenceId 重复: ${evidenceId}`);
+        seen.add(evidenceId);
+        const key = keyById.get(evidenceId) ?? evidenceId;
+        const target = evidenceInputs.find((item) => item.clientKey === key);
+        if (!target) throw new ToolError('invalid_request', `证据 ${evidenceId} 不属于草稿 ${docPath}`);
+        // 只允许替换 selector。来源、对象和断言身份由原声明继承；新的
+        // 行列范围仍由 writeDocCore 使用冻结资源与当前读回执重新校验。
+        target.selector = parseSelector(update.selector);
+        delete target.readReceiptId;
+        if (update.readReceiptId !== undefined) {
+          target.readReceiptId = requireString(update, 'readReceiptId', 1, 200);
+        }
+      }
+    }
     const writeArgs: Record<string, unknown> = {
       path: docPath,
       title: args.titleUpdate !== undefined ? requireString(args, 'titleUpdate', 1, 300) : coordinates.title,
@@ -4342,7 +4731,8 @@ export class AgentToolService {
       sources,
       ...(tags.length ? { tags } : {}),
       // 声明继承：未变声明自动平移；受影响对象重算哈希（payload 变化 → revision+1）
-      ...this.inheritDeclarationsForEdit(state, docPath, applied.map(({ startLine, endLine, newLineCount }) => ({ startLine, endLine, newLineCount }))),
+      ...inheritedDeclarations,
+      ...(inheritedCoverage.length ? { coverageUpdates: inheritedCoverage } : {}),
       ...(args.expectedDraftRevision !== undefined ? { expectedDraftRevision: optionalInt(args, 'expectedDraftRevision', 0, 0, 1_000_000_000) } : {}),
     };
     // 同一校验链（header/来源/正文策略/声明解引用/原子写），声明的
@@ -4386,14 +4776,16 @@ export class AgentToolService {
   }
 
   /** draft 声明提取（draft_read 与 kb_read_batch 共用；坐标=参数坐标）。 */
-  private renderDraftDeclarations(state: BuildRunState, docPath: string): Record<string, unknown> | null {
+  private renderDraftDeclarations(state: BuildRunState, docPath: string, claimKey: string | null = null, objectKey: string | null = null): Record<string, unknown> | null {
     const draftFile = path.join(state.stagingRoot, 'knowledge-draft.json');
     if (!state.knowledgeDraft && !fs.existsSync(draftFile)) return null;
     const draft = this.loadKnowledgeDraft(state);
-    const objects = draft.objects.filter((object) => !object.tombstone && object.canonical?.path === docPath);
-    const ids = new Set(objects.map((object) => object.objectId));
     const keysById = new Map(Object.entries(draft.clientKeys).map(([key, id]) => [id, key]));
-    return {
+    const objects = draft.objects.filter((object) => !object.tombstone && object.canonical?.path === docPath
+      && (!claimKey || object.claims.some((claim) => claim.claimKey === claimKey))
+      && (!objectKey || object.objectId === objectKey || keysById.get(object.objectId) === objectKey));
+    const ids = new Set(objects.map((object) => object.objectId));
+    const result = {
       draftRevision: draft.docs[docPath]?.revision ?? 0,
       objects: objects.map((object) => ({
         clientKey: keysById.get(object.objectId) ?? object.objectId,
@@ -4407,11 +4799,31 @@ export class AgentToolService {
         scopeKey: object.scopeKey,
         scopeText: object.scopeText,
         bodyRange: object.canonical?.bodyRange,
-        claims: object.claims.map((claim) => ({ claimKey: claim.claimKey, riskCategory: claim.riskCategory, bodyRange: claim.bodyRange, evidenceIds: claim.evidenceIds })),
+        claims: object.claims.filter((claim) => !claimKey || claim.claimKey === claimKey)
+          .map((claim) => ({ claimKey: claim.claimKey, riskCategory: claim.riskCategory, bodyRange: claim.bodyRange, evidenceIds: claim.evidenceIds })),
       })),
-      evidence: draft.evidence.filter((item) => ids.has(item.objectId)),
-      presentations: draft.presentations.filter((item) => ids.has(item.ownerObjectId)),
-      relations: draft.relations.filter((item) => ids.has(item.fromObjectId)),
+      evidence: draft.evidence.filter((item) => ids.has(item.objectId) && (!claimKey || item.claimKey === claimKey)),
+      presentations: claimKey ? [] : draft.presentations.filter((item) => ids.has(item.ownerObjectId)),
+      relations: claimKey ? [] : draft.relations.filter((item) => ids.has(item.fromObjectId)),
+    };
+    if (claimKey || objectKey || JSON.stringify(result).length <= 18_000) return result;
+    // Pi may redirect oversized MCP output to a temporary file outside a
+    // child's read envelope. Return a bounded index; callers can retrieve one
+    // object's full declarations with declarationObjectKey.
+    return {
+      draftRevision: result.draftRevision,
+      summaryOnly: true,
+      objectCount: result.objects.length,
+      evidenceCount: result.evidence.length,
+      presentationCount: result.presentations.length,
+      relationCount: result.relations.length,
+      objects: result.objects.map((object) => ({
+        clientKey: object.clientKey,
+        objectId: object.objectId,
+        title: object.title,
+        claimKeys: object.claims.map((claim) => claim.claimKey),
+      })),
+      nextAction: '用 includeDeclarations=true + declarationObjectKey=<clientKey 或 objectId> 逐对象读取完整声明；正文用 offset/limit 分页读取',
     };
   }
 
@@ -4953,6 +5365,7 @@ const READONLY_TOOL_NAMES: ReadonlySet<string> = new Set<string>([
   'draft_read',
   'draft_search',
   'kb_read_batch',
+  'kb_tool_schema',
   'kb_get_plan',
   'ws_ls',
   'ws_read',
@@ -4999,6 +5412,131 @@ function canonicalPayloadHash(args: Record<string, unknown>, omitKeys: readonly 
     Object.entries(args).filter(([key]) => !omitKeys.includes(key)).map(([key, value]) => [key, canonical(value)]),
   );
   return crypto.createHash('sha256').update(JSON.stringify(filtered)).digest('hex');
+}
+
+function withAutoOperationId(args: Record<string, unknown>): Record<string, unknown> {
+  if (args.operationId !== undefined) return args;
+  return {
+    ...args,
+    operationId: `op_auto_${canonicalPayloadHash(args, ['operationId']).slice(0, 32)}`,
+  };
+}
+
+/** Small, deterministic outline for build_manifest. It uses the exact
+ * assembled raw_read output coordinates, including derived image lines and
+ * compacted blank CSV attachments, without sending full source text. */
+function summarizeRawSourceShape(input: {
+  lines: string[];
+  segments: Array<{ resourceId?: string; outStart: number; outEnd: number }>;
+  resources: Array<{ resourceId: string; kind: 'text' | 'csv'; label: string; lines: string[]; nonEmptyCells?: number }>;
+}): {
+  totalLines: number;
+  attachmentCount: number;
+  sectionCount: number;
+  sections: Array<{ line: number; heading: string }>;
+  attachments: Array<{ label: string; lines: number; nonEmptyCells: number; outputStart: number | null; outputEnd: number | null }>;
+} {
+  const sections: Array<{ line: number; heading: string }> = [];
+  let sectionCount = 0;
+  const primaryResourceId = input.resources[0]?.resourceId;
+  let segmentIndex = 0;
+  for (let i = 0; i < input.lines.length; i += 1) {
+    while (segmentIndex + 1 < input.segments.length && input.segments[segmentIndex]!.outEnd < i + 1) segmentIndex += 1;
+    if (input.segments[segmentIndex]?.resourceId !== primaryResourceId) continue;
+    const heading = /^#{2,3} (.+)$/.exec(input.lines[i]!)?.[1]?.trim();
+    if (!heading) continue;
+    sectionCount += 1;
+    if (sections.length < 24) sections.push({ line: i + 1, heading: heading.slice(0, 120) });
+  }
+  const attachments = input.resources.filter((resource) => resource.kind === 'csv').map((resource) => {
+    const segment = input.segments.find((item) => item.resourceId === resource.resourceId);
+    return {
+      label: resource.label,
+      lines: resource.lines.length,
+      nonEmptyCells: resource.nonEmptyCells ?? 0,
+      outputStart: segment?.outStart ?? null,
+      outputEnd: segment?.outEnd ?? null,
+    };
+  });
+  return { totalLines: input.lines.length, attachmentCount: attachments.length, sectionCount, sections, attachments };
+}
+
+/** kb_write_doc 的机械参数补全。只使用调用已声明的路径、来源、语义键与
+ * selector；不推测对象类型、业务族、适用范围、来源事实或覆盖去向。 */
+function normalizeKbWriteDocArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const normalized: Record<string, unknown> = { ...args };
+  const docPath = typeof args.path === 'string' ? args.path : '';
+  if (normalized.title === undefined && docPath) {
+    normalized.title = path.posix.basename(docPath).replace(/\.md$/i, '');
+  }
+  if (Array.isArray(args.objects)) {
+    normalized.objects = args.objects.map((raw) => {
+      const object = asRecord(raw);
+      if (!object) return raw;
+      const copy: Record<string, unknown> = { ...object };
+      if (copy.variantKey === undefined) copy.variantKey = 'default';
+      if (copy.scopeKey === undefined && typeof copy.scopeText === 'string' && copy.scopeText.trim()) {
+        copy.scopeKey = `scope_auto_${canonicalPayloadHash({ path: docPath, scopeText: copy.scopeText }, []).slice(0, 20)}`;
+      }
+      return copy;
+    });
+  }
+  const sourceIds = Array.isArray(args.sources)
+    ? args.sources.filter((source): source is string => typeof source === 'string') : [];
+  if (Array.isArray(args.evidenceClaims)) {
+    const evidenceOrdinal = new Map<string, number>();
+    normalized.evidenceClaims = args.evidenceClaims.map((raw) => {
+      const evidence = asRecord(raw);
+      if (!evidence) return raw;
+      const copy: Record<string, unknown> = { ...evidence };
+      const selector = asRecord(copy.selector);
+      const ref = asRecord(copy.sourceRef);
+      const sourceId = typeof ref?.sourceId === 'string' ? ref.sourceId
+        : sourceIds.length === 1 ? sourceIds[0] : undefined;
+      if (sourceId && (!ref || ref.sourceId === undefined || ref.resourceId === undefined)) {
+        const resourceId = typeof ref?.resourceId === 'string' ? ref.resourceId
+          : selector?.kind === 'text_span' ? sourceId
+            : selector?.kind === 'csv_cells' && typeof selector.resourcePath === 'string'
+              ? `${sourceId}#csv:${path.posix.basename(selector.resourcePath)}`
+              : selector?.kind === 'workbook_cells' && typeof selector.workbookName === 'string'
+                ? `${sourceId}#workbook:${selector.workbookName}` : undefined;
+        copy.sourceRef = { ...ref, sourceId, ...(resourceId ? { resourceId } : {}) };
+      }
+      if (copy.role === undefined) copy.role = 'supports';
+      if (copy.nature === undefined) copy.nature = selector?.kind === 'media_region' ? 'machine_description' : 'direct';
+      if (copy.clientKey === undefined) {
+        const identity = canonicalPayloadHash({ objectKey: copy.objectKey, claimKey: copy.claimKey, sourceRef: copy.sourceRef }, []);
+        const ordinal = (evidenceOrdinal.get(identity) ?? 0) + 1;
+        evidenceOrdinal.set(identity, ordinal);
+        copy.clientKey = `ev_auto_${canonicalPayloadHash({
+          objectKey: copy.objectKey, claimKey: copy.claimKey,
+          sourceRef: copy.sourceRef, ordinal,
+        }, []).slice(0, 20)}`;
+      }
+      return copy;
+    });
+  }
+  if (Array.isArray(args.coverageUpdates)) {
+    const coverageOrdinal = new Map<string, number>();
+    normalized.coverageUpdates = args.coverageUpdates.map((raw) => {
+      const coverage = asRecord(raw);
+      if (!coverage) return raw;
+      const copy: Record<string, unknown> = { ...coverage };
+      if (copy.itemId === undefined) {
+        const identity = canonicalPayloadHash({ sourceId: copy.sourceId, category: copy.category }, []);
+        const ordinal = (coverageOrdinal.get(identity) ?? 0) + 1;
+        coverageOrdinal.set(identity, ordinal);
+        copy.itemId = `cov_auto_${canonicalPayloadHash({
+          sourceId: copy.sourceId, category: copy.category, ordinal,
+        }, []).slice(0, 20)}`;
+      }
+      return copy;
+    });
+  }
+  if (normalized.operationId === undefined) {
+    normalized.operationId = `op_auto_${canonicalPayloadHash(normalized, ['operationId', 'expectedDraftRevision']).slice(0, 32)}`;
+  }
+  return normalized;
 }
 
 /** v2 写入链声明幂等账本（calls）的稳定键：任务+operationId，不依赖

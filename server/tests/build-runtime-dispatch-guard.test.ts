@@ -145,6 +145,7 @@ describe('guardTaskSubmit', () => {
     const workspace = result.args.workspace as Record<string, unknown>;
     expect(workspace).toEqual({ cwd: WORK_DIR, mode: 'existing' });
     expect(result.args.profile).toBeUndefined();
+    expect(result.args.delivery).toBe('handle');
     expect(result.args.outputs).toEqual(['agent-outputs/out1.md']);
     // 审计：任务书只留哈希
     expect(result.audit.agent).toBe('luban');
@@ -221,7 +222,14 @@ describe('guardTaskResume', () => {
     if (result.decision !== 'allow') return;
     expect(result.args.scope).toBeUndefined();
     expect(result.args.model).toBe('zhipuai/glm-5.3');
+    expect(result.args.delivery).toBe('handle');
     expect(result.audit.changes.join()).toContain('删除 scope');
+  });
+
+  it('等待式续接被改为立即返回句柄，避免运行中的子任务始终只有只读面', () => {
+    const result = guardTaskResume(makeConfig(), { handle: 'task-123', message: '请继续', delivery: 'wait' });
+    expect(result.decision).toBe('allow');
+    if (result.decision === 'allow') expect(result.args.delivery).toBe('handle');
   });
 
   it('模型覆盖不在任何角色冻结集 → 阻止', () => {

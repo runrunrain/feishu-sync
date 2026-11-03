@@ -1,0 +1,711 @@
+diff --git a/server/src/agent/build-runtime/amagi-package.ts b/server/src/agent/build-runtime/amagi-package.ts
+index 1f3e4cd..bbd324e 100644
+--- a/server/src/agent/build-runtime/amagi-package.ts
++++ b/server/src/agent/build-runtime/amagi-package.ts
+@@ -14,10 +14,20 @@
+  * 布局（`<dataRoot>/agent/runtime-packages/amagi-pi@<版本>/`）：
+  * - npm 模式：pi 落 `<目录>/npm/node_modules/amagi-pi`（实测 404：2.21.31 未发布公共
+  *   npm，包发布后可用；pi 真实命令行 `npm install … --prefix <目录>/npm` 已实测锚点）。
++ *   plugin-install-fix 后默认安装不再走 npm（已知 404），改走 installAmagiFromGit。
+  * - source 模式：应用物化拷贝到 `<目录>/package/`（staging 验证后 rename，不覆盖已
+  *   冻结版本），pi 对 local source 本就不复制（packages.md），拷贝是应用侧的版本化
+- *   物化动作，pi install 负责登记与校验。
++ *   物化动作，pi install 负责登记与校验。Git 获取链 includeDependencies=true：连带
++ *   冻结 pi git install 装好的 node_modules 运行依赖（amagi LSP 开箱即用依赖包内
++ *   node_modules/.bin；用户手填 sourceDir 仍不拷 node_modules，沿用旧语义）。
+  * - 安装后目录视为不可变（“装好后不原地修改”）；清理走整目录删除。
++ *
++ * Git 官方获取链（plugin-install-fix，installAmagiFromGit）：
++ * 临时获取 home（runtime-packages/.acquire-*）→ 正式 pi CLI `pi install git:…@<完整
++ * commit>`（pi 自会 clone + checkout + npm install 依赖，见 pi packages.md/git install）
++ * → SDK list 模式解析真实实体包根 → 容器约束/HEAD commit/manifest 版本三重校验 →
++ * 沿既有 source 冻结链（含依赖）+ 正式 pi local install 登记 → acquisition 溯源入记录。
++ * 失败/超时绝不宣称装好；获取临时目录无论成败都清理。
+  */
+ 
+ import { execFile } from 'node:child_process';
+@@ -41,12 +51,48 @@ export interface AmagiPackageInstallRecord {
+   installedVia: { nodePath: string; piCliPath: string; sourceDir?: string; piInstallArgs: string[] };
+   /** pi 写入安装 home settings.json 的 packages 声明（审计；source 模式必填核对）。 */
+   piSettingsPackages?: unknown[];
++  /** source 模式是否连同 node_modules 运行依赖一起冻结（Git 获取链为 true）。 */
++  dependenciesIncluded?: boolean;
++  /** Git 官方获取溯源（默认安装链）：临时获取 home 内 pi git install 的真实事实。 */
++  acquisition?: AmagiGitAcquisition;
+   contentHash: string;
+   /** 哈希覆盖的文件数/字节数（审计）。 */
+   hashedFiles: number;
+   hashedBytes: number;
+ }
+ 
++/** Git 官方获取事实（写入安装记录的 acquisition 字段）。 */
++export interface AmagiGitAcquisition {
++  via: 'pi-git-install';
++  /** 实际传给 pi install 的 git 源 spec（含完整 commit）。 */
++  gitSource: string;
++  /** 仓库 URL（展示用）。 */
++  repoUrl: string;
++  /** 获取后验证过的 checkout HEAD（完整 commit）。 */
++  commit: string;
++  acquiredAt: string;
++  /** SDK（inspect-packages list 模式）解析出的实体包根。 */
++  acquiredPackageRoot: string;
++  /** 实际执行的获取命令（审计与复现；不含密钥）。 */
++  piInstallArgs: string[];
++}
++
++/**
++ * 官方 Git 获取源（plugin-install-fix）：npm:amagi-pi@2.21.31 实测 404 未发布，
++ * 默认安装不再走 npm，改经正式 Pi CLI 从官方仓库固定 commit 获取（无 tag，
++ * 禁止追 latest；升级须同时重核能力探测）。语法锚定 pi docs packages.md
++ * （`git:github.com/owner/repo@ref`，ref 为完整 commit 时即 pinned）。
++ */
++export const AMAGI_PI_GIT_REPO_URL = 'https://github.com/runrunrain/amagi-pi.git';
++export const AMAGI_PI_GIT_COMMIT = '929000ecbd8725e72b191493345d6abeef51c147';
++
++export function amagiGitSourceSpec(commit: string = AMAGI_PI_GIT_COMMIT): string {
++  if (!/^[0-9a-f]{40}$/.test(commit)) {
++    throw new AmagiPackageError('amagi_git_ref_invalid', `git ref 必须是完整 40 位 commit（拒绝 tag/分支/latest）: ${commit}`);
++  }
++  return `git:github.com/runrunrain/amagi-pi@${commit}`;
++}
++
+ export const INSTALL_RECORD_FILENAME = 'install-record.json';
+ 
+ /** 内容哈希预算：超出即明确拒绝（fail-closed），不产出截断哈希。 */
+@@ -208,13 +254,18 @@ export function verifyAmagiPackage(input: {
+   return ref;
+ }
+ 
+-/** 安装子进程环境：继承父环境但剔除应用凭据面，注入专用安装 home。 */
++/** 安装子进程环境：继承父环境但剔除应用凭据面，注入专用安装 home。
++ * 安装是显式联网授权动作（npm/git/local 登记）：显式解除 PI_OFFLINE，
++ * 防父环境残留 offline 让安装静默降级失败；遥测/版本检查同步关闭。 */
+ function buildInstallEnv(installDir: string): NodeJS.ProcessEnv {
+   const env: NodeJS.ProcessEnv = { ...process.env, PI_CODING_AGENT_DIR: installDir };
+   for (const key of Object.keys(env)) {
+     if (/^FEISHU_SYNC_(AGENT_API_KEY|BUILD_MCP_TOKEN|AGENT_RUN_TOKEN)$/.test(key)) delete env[key];
+   }
+   delete env.ZHIPU_API_KEY;
++  delete env.PI_OFFLINE;
++  env.PI_SKIP_VERSION_CHECK = '1';
++  env.PI_TELEMETRY = '0';
+   return env;
+ }
+ 
+@@ -258,6 +309,10 @@ export async function installAmagiPackage(input: {
+   version: string;
+   /** 本地 amagi-pi 包根（未发布 npm 时用；source 模式）。 */
+   sourceDir?: string;
++  /** 连同 node_modules 运行依赖冻结（Git 获取链用；手填 sourceDir 不启用）。 */
++  includeDependencies?: boolean;
++  /** Git 获取溯源（写入安装记录；Git 默认安装链由 installAmagiFromGit 传入）。 */
++  acquisition?: AmagiGitAcquisition;
+   npmRegistry?: string;
+   timeoutMs?: number;
+   log?: (line: string) => void;
+@@ -307,19 +362,71 @@ async function installFromNpm(
+ 
+ const SOURCE_COPY_EXCLUDE = new Set(['node_modules', '.git', '.agent-outputs', 'amagi-task', '.amagi-worktrees']);
+ 
+-/** 拷贝阶段与哈希同规则：源内 symlink 一律拒绝（不静默丢弃——丢弃即留下与源不一致的包）。 */
+-function copyTreeFiltered(from: string, to: string): void {
++/**
++ * 拷贝阶段与哈希同规则：源内 symlink 一律拒绝（不静默丢弃——丢弃即留下与源不一致的包）。
++ * includeNodeModules（Git 获取链）：连带冻结 node_modules 运行依赖。npm 布局的
++ * node_modules/.bin shim 是指向包内真实文件的 symlink——物化为**稳定 launcher 转发
++ * shim**（POSIX sh exec wrapper）：exec 目标于其原包内位置。不能用字节拷贝冒充——
++ * 实测（Leader 真机 + 复现）：typescript-language-server 从自身文件位置向上找
++ * package.json（findUpSync），拷到 .bin 后 `../package.json` 变成
++ * node_modules/package.json → ENOENT exit 1（相对 import/import.meta.url 同理漂移）。
++ * exec 转发则保持目标在原位置运行：ESM import.meta.url、CJS require.main、
++ * 相对定位全部不漂移；转发目标用相对 .bin 的路径（随冻结包移动，不残留获取
++ * 临时目录绝对路径）；目标必须仍在包内，指向包外的一律拒绝；其余位置 symlink
++ * 仍拒绝。Windows npm .bin 为常规 .cmd/.ps1 文件（非 symlink），不走本分支。
++ */
++
++/** 双引号 shell 上下文安全转义（路径含空格/引号/`$`/反引号时不注入不漂移）。 */
++function shDoubleQuoteEscape(value: string): string {
++  return value.replace(/([\\"`$])/g, '\\$1');
++}
++
++/** 生成 .bin 转发 shim：#!/bin/sh，exec 包内目标于原位置（相对路径 + 运行时 $0 定位）。 */
++function writeBinForwardingShim(dest: string, srcLink: string): void {
++  // 相对路径在源树内计算（两侧 realpath 归一，防 /tmp→/private/tmp 别名互算）；
++  // 冻结拷贝保持同构布局，相对路径在新位置同样成立。
++  const targetReal = fs.realpathSync(srcLink);
++  const binDirReal = fs.realpathSync(path.dirname(srcLink));
++  const rel = path.relative(binDirReal, targetReal).split(path.sep).join('/');
++  if (!rel || rel.startsWith('/') || path.isAbsolute(rel)) {
++    throw new AmagiPackageError('amagi_symlink_in_source',
++      `node_modules/.bin shim 相对目标计算失败: ${srcLink} → ${targetReal}`);
++  }
++  const script = `#!/bin/sh\nexec "$(dirname "$0")/${shDoubleQuoteEscape(rel)}" "$@"\n`;
++  fs.writeFileSync(dest, script, { mode: 0o755 });
++}
++
++function copyTreeFiltered(from: string, to: string, options: { includeNodeModules?: boolean } = {}, packageRoot?: string): void {
++  const root = packageRoot ?? from;
++  // realpath 对齐两侧（macOS /var→/private/var 等）：symlink 目标经 realpath 解析，
++  // 包根也必须同样归一，否则同一路径会被误判为包外。
++  const rootReal = fs.existsSync(root) ? fs.realpathSync(root) : path.resolve(root);
+   for (const entry of fs.readdirSync(from, { withFileTypes: true })) {
+-    if (SOURCE_COPY_EXCLUDE.has(entry.name)) continue;
++    const excluded = SOURCE_COPY_EXCLUDE.has(entry.name) && !(options.includeNodeModules && entry.name === 'node_modules');
++    if (excluded) continue;
+     const src = path.join(from, entry.name);
+     const dest = path.join(to, entry.name);
+     if (entry.isSymbolicLink()) {
+-      throw new AmagiPackageError('amagi_symlink_in_source',
+-        `源目录存在 symlink（拒绝物化，防包外可变入口）: ${src}`);
++      const inNpmBin = path.basename(path.dirname(src)) === '.bin' && path.basename(path.dirname(path.dirname(src))) === 'node_modules';
++      if (!(options.includeNodeModules && inNpmBin)) {
++        throw new AmagiPackageError('amagi_symlink_in_source',
++          `源目录存在 symlink（拒绝物化，防包外可变入口）: ${src}`);
++      }
++      const target = fs.realpathSync(src);
++      if (!isInsideOrEqual(target, rootReal)) {
++        throw new AmagiPackageError('amagi_symlink_in_source',
++          `node_modules/.bin shim 指向包外（拒绝物化）: ${src} → ${target}`);
++      }
++      if (!fs.statSync(target).isFile()) {
++        throw new AmagiPackageError('amagi_symlink_in_source',
++          `node_modules/.bin shim 目标不是常规文件（拒绝物化）: ${src} → ${target}`);
++      }
++      writeBinForwardingShim(dest, src);
++      continue;
+     }
+     if (entry.isDirectory()) {
+       fs.mkdirSync(dest, { recursive: true });
+-      copyTreeFiltered(src, dest);
++      copyTreeFiltered(src, dest, options, root);
+     } else if (entry.isFile()) {
+       fs.copyFileSync(src, dest);
+     }
+@@ -342,7 +449,7 @@ function isInsideOrEqual(a: string, b: string): boolean {
+  * 6) 写安装记录（installedVia 含实际 pi 命令）。
+  */
+ async function installFromSource(
+-  input: { nodePath: string; piCliPath: string; dataRoot: string; version: string; sourceDir?: string; npmRegistry?: string; timeoutMs?: number; log?: (line: string) => void },
++  input: { nodePath: string; piCliPath: string; dataRoot: string; version: string; sourceDir?: string; includeDependencies?: boolean; acquisition?: AmagiGitAcquisition; npmRegistry?: string; timeoutMs?: number; log?: (line: string) => void },
+   installDir: string,
+ ): Promise<AmagiPackageRef & { record: AmagiPackageInstallRecord; fresh: boolean }> {
+   const sourceDir = path.resolve(input.sourceDir!);
+@@ -362,7 +469,7 @@ async function installFromSource(
+   try {
+     fs.mkdirSync(stagingPackage, { recursive: true, mode: 0o700 });
+     input.log?.(`[build-runtime] source 物化 ${sourceDir} → ${stagingPackage}（staging，验证后 rename）`);
+-    copyTreeFiltered(sourceDir, stagingPackage);
++    copyTreeFiltered(sourceDir, stagingPackage, input.includeDependencies ? { includeNodeModules: true } : {});
+     const stagedVersion = readPackageVersion(stagingPackage);
+     if (stagedVersion !== input.version) {
+       throw new AmagiPackageError('amagi_version_mismatch', `物化结果版本 ${stagedVersion} ≠ ${input.version}`);
+@@ -411,6 +518,8 @@ async function installFromSource(
+       layout: 'source',
+       installedVia: { nodePath: input.nodePath, piCliPath: input.piCliPath, sourceDir, piInstallArgs },
+       piSettingsPackages: piSettingsPackages.entries,
++      ...(input.includeDependencies ? { dependenciesIncluded: true } : {}),
++      ...(input.acquisition ? { acquisition: input.acquisition } : {}),
+       contentHash: final.contentHash,
+       hashedFiles: final.files,
+       hashedBytes: final.bytes,
+@@ -460,3 +569,209 @@ export function inspectAmagiPackageLayout(packageRoot: string): { ok: boolean; i
+   if (!fs.existsSync(path.join(packageRoot, 'agents', 'luban.md'))) issues.push('缺少 agents/luban.md');
+   return { ok: issues.length === 0, issues };
+ }
++
++// ---------------------------------------------------------------------------
++// Git 官方获取链（plugin-install-fix 默认安装）：正式 pi CLI git install 到临时
++// 获取 home → SDK 解析真实包根 → 三重校验（容器约束/HEAD commit/manifest 版本）。
++// ---------------------------------------------------------------------------
++
++/** 只读解析 pi 写入获取 home settings.json 的包声明，返回实体路径（SDK list 模式）。 */
++async function resolveAcquiredPackageRoot(input: {
++  nodePath: string; helperPackageRoot: string; piPackageRoot: string | null;
++  acquisitionRoot: string; gitSource: string; timeoutMs?: number; log?: (line: string) => void;
++}): Promise<string> {
++  const helper = path.join(input.helperPackageRoot, 'inspect-packages.mjs');
++  const env = buildInstallEnv(input.acquisitionRoot);
++  env.PI_OFFLINE = '1'; // 获取已完成，解析只读；缺失即显式失败，绝不触发补装
++  if (!input.piPackageRoot) {
++    throw new AmagiPackageError('amagi_acquisition_incomplete', 'Pi 包根缺失，无法解析获取实体');
++  }
++  const { stdout } = await run(input.nodePath, [helper, input.piPackageRoot, input.acquisitionRoot, 'list'], {
++    cwd: input.acquisitionRoot,
++    env,
++    timeout: Math.min(input.timeoutMs ?? INSTALL_TIMEOUT_MS, 60_000),
++    windowsHide: true,
++    maxBuffer: 8 * 1024 * 1024,
++  });
++  const line = stdout.split('\n').find((value) => value.startsWith('FEISHU_PACKAGES_JSON='));
++  if (!line) throw new AmagiPackageError('amagi_acquisition_incomplete', '获取 home 内 SDK 未能解析包清单');
++  const data = JSON.parse(line.slice('FEISHU_PACKAGES_JSON='.length)) as {
++    packages?: Array<{ source?: unknown; installedPath?: unknown }>;
++  };
++  const hit = (Array.isArray(data.packages) ? data.packages : []).find((entry) => entry?.source === input.gitSource);
++  const installedPath = typeof hit?.installedPath === 'string' ? hit.installedPath : '';
++  if (!installedPath) {
++    throw new AmagiPackageError('amagi_acquisition_incomplete',
++      `SDK 未在获取 home 解析到 ${input.gitSource} 的实体（声明缺失或实体未落地）`);
++  }
++  input.log?.(`[build-runtime] SDK 解析获取实体: ${installedPath}`);
++  return installedPath;
++}
++
++/**
++ * 官方 Git 获取：在临时获取 home 内真实执行 `pi install git:…@<完整 commit>`。
++ * pi 按 packages.md 语义 clone + checkout + 安装 dependencies（跳过 host peers）；
++ * 获取后用 SDK 解析真实包根并验证：路径在获取 root 内、HEAD 恰为期望 commit、
++ * manifest 是 amagi-pi 且版本恰为 pin（全局 36 ≠ 31，不受其影响）。
++ * 任何失败抛错并如实报告，绝不返回半成品；临时目录清理由调用方（finally）。
++ */
++export async function acquireAmagiFromGit(input: {
++  nodePath: string;
++  piCliPath: string;
++  /** inspect-packages.mjs 所在包根（应用工作台内置包）。 */
++  helperPackageRoot: string;
++  /** Pi 包根（SDK 来源；不可用则显式拒绝，不猜路径）。 */
++  piPackageRoot: string | null;
++  dataRoot: string;
++  /** 期望的 amagi-pi 版本（构建 pin）。 */
++  version: string;
++  /** 缺省官方源；测试可注入（须与 expectedCommit 同源）。 */
++  gitSource?: string;
++  expectedCommit?: string;
++  timeoutMs?: number;
++  log?: (line: string) => void;
++}): Promise<{ packageRoot: string; acquisitionRoot: string; acquisition: AmagiGitAcquisition }> {
++  const gitSource = input.gitSource ?? amagiGitSourceSpec();
++  const expectedCommit = (input.expectedCommit ?? AMAGI_PI_GIT_COMMIT).toLowerCase();
++  if (!/^[0-9a-f]{40}$/.test(expectedCommit)) {
++    throw new AmagiPackageError('amagi_git_ref_invalid', `期望 commit 必须是完整 40 位: ${expectedCommit}`);
++  }
++  if (!input.piPackageRoot || !fs.existsSync(path.join(input.piPackageRoot, 'dist', 'core', 'package-manager.js'))) {
++    throw new AmagiPackageError('amagi_acquisition_failed',
++      'Pi 包管理 SDK 不可用（无法解析 Git 获取结果）；请先在「运行时与模型」确认 Pi 运行时就绪，或改填本地 amagi-pi 目录安装');
++  }
++  const acquisitionRoot = path.join(runtimePackagesRoot(input.dataRoot), `.acquire-${process.pid}-${crypto.randomBytes(3).toString('hex')}`);
++  fs.mkdirSync(acquisitionRoot, { recursive: true, mode: 0o700 });
++  input.log?.(`[build-runtime] Git 获取 ${gitSource} → 临时获取 home ${acquisitionRoot}`);
++  // 失败自清理：临时获取目录是本函数的私有工作区，任何失败都不得残留；
++  // 成功后由调用方（installAmagiFromGit finally）在冻结完成后回收。
++  try {
++    return await acquireIntoRoot(input, acquisitionRoot, gitSource, expectedCommit);
++  } catch (error) {
++    fs.rmSync(acquisitionRoot, { recursive: true, force: true });
++    throw error;
++  }
++}
++
++async function acquireIntoRoot(
++  input: Parameters<typeof acquireAmagiFromGit>[0] & object,
++  acquisitionRoot: string,
++  gitSource: string,
++  expectedCommit: string,
++): Promise<{ packageRoot: string; acquisitionRoot: string; acquisition: AmagiGitAcquisition }> {
++  let piInstallArgs: string[];
++  try {
++    piInstallArgs = await runPiInstall({ ...input, installDir: acquisitionRoot, packageArg: gitSource });
++  } catch (error) {
++    throw new AmagiPackageError('amagi_acquisition_failed',
++      `Git 获取失败（需本机可用 git 与网络；也可改填本地 amagi-pi 目录安装）: ${error instanceof Error ? error.message : String(error)}`);
++  }
++  // SDK 解析真实包根（只读 list 模式）
++  let packageRoot: string;
++  try {
++    packageRoot = await resolveAcquiredPackageRoot({ ...input, acquisitionRoot, gitSource });
++  } catch (error) {
++    if (error instanceof AmagiPackageError) throw error;
++    throw new AmagiPackageError('amagi_acquisition_incomplete',
++      `获取实体解析失败: ${error instanceof Error ? error.message : String(error)}`);
++  }
++  // 约束 1：实体必须在临时获取 root 内且在 git/ 布局下（防预期包被调包）
++  const sdkPackageRoot = packageRoot;
++  const resolveContainedPackage = (): string => {
++    try {
++      if (fs.lstatSync(acquisitionRoot).isSymbolicLink()) throw new Error('获取根不能为链接');
++      const root = fs.realpathSync.native(acquisitionRoot);
++      const gitRoot = fs.realpathSync.native(path.join(root, 'git'));
++      const actual = fs.realpathSync.native(sdkPackageRoot);
++      const rel = path.relative(gitRoot, actual);
++      if (path.relative(root, gitRoot) !== 'git' || rel === ''
++        || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
++        throw new Error('实体未严格包含于实际 git/ 容器');
++      }
++      return actual;
++    } catch (error) {
++      throw new AmagiPackageError('amagi_acquisition_incomplete',
++        `获取实体不在临时获取 root 的实际 git/ 布局内: ${sdkPackageRoot}（${error instanceof Error ? error.message : String(error)}）`);
++    }
++  };
++  packageRoot = resolveContainedPackage();
++  // 约束 2：checkout HEAD 恰为期望完整 commit（git clone/checkout 由 pi 执行；此处复核）
++  let head: string;
++  try {
++    const { stdout } = await run('git', ['rev-parse', 'HEAD'], { cwd: packageRoot, timeout: 30_000, windowsHide: true, maxBuffer: 4096 });
++    head = stdout.trim().toLowerCase();
++  } catch (error) {
++    throw new AmagiPackageError('amagi_acquisition_failed',
++      `获取实体无法验证 HEAD commit（需本机 git）: ${error instanceof Error ? error.message : String(error)}`);
++  }
++  if (head !== expectedCommit) {
++    throw new AmagiPackageError('amagi_acquisition_commit_mismatch',
++      `获取实体 HEAD ${head} ≠ 期望 commit ${expectedCommit}（拒绝非预期内容）`);
++  }
++  // git 子进程等待期间不得更换实体；后续物化沿用同一实际路径。
++  if (resolveContainedPackage() !== packageRoot) {
++    throw new AmagiPackageError('amagi_acquisition_incomplete', '获取实体在 HEAD 校验期间发生变化');
++  }
++  // 约束 3：manifest 是 amagi-pi 且版本恰为 pin（全局 36 / 其他版本一律拒绝）
++  const actualVersion = readPackageVersion(packageRoot);
++  if (actualVersion !== input.version) {
++    throw new AmagiPackageError('amagi_version_mismatch',
++      `Git 获取结果版本 ${actualVersion} ≠ 请求版本 ${input.version}（固定版本不接受其他版本；本机全局安装的其他 amagi-pi 不影响构建）`);
++  }
++  return {
++    packageRoot,
++    acquisitionRoot,
++    acquisition: {
++      via: 'pi-git-install',
++      gitSource,
++      repoUrl: AMAGI_PI_GIT_REPO_URL,
++      commit: head,
++      acquiredAt: new Date().toISOString(),
++      acquiredPackageRoot: packageRoot,
++      piInstallArgs,
++    },
++  };
++}
++
++/**
++ * 默认安装链（plugin-install-fix）：
++ * 1) 已有安装记录 → 完整校验复用（幂等；漂移抛 amagi_content_drift，不覆盖不重装）；
++ * 2) 否则官方 Git 固定 commit 获取（真实 pi CLI + 网络）→ 沿既有 source 冻结链
++ *    （含 node_modules 运行依赖）→ 正式 pi local install 登记 → acquisition 入记录；
++ * 3) 获取临时目录无论成败都清理（finally）；不走已知 404 的 npm 默认路径。
++ */
++export async function installAmagiFromGit(input: {
++  nodePath: string;
++  piCliPath: string;
++  helperPackageRoot: string;
++  piPackageRoot: string | null;
++  dataRoot: string;
++  version: string;
++  gitSource?: string;
++  expectedCommit?: string;
++  timeoutMs?: number;
++  log?: (line: string) => void;
++}): Promise<AmagiPackageRef & { record: AmagiPackageInstallRecord; fresh: boolean }> {
++  const installDir = amagiInstallDir(input.dataRoot, input.version);
++  if (fs.existsSync(path.join(installDir, INSTALL_RECORD_FILENAME))) {
++    const existing = verifyAmagiPackage({ dataRoot: input.dataRoot, version: input.version });
++    return { ...existing, fresh: false };
++  }
++  fs.mkdirSync(path.dirname(installDir), { recursive: true });
++  const acquired = await acquireAmagiFromGit(input);
++  try {
++    return await installAmagiPackage({
++      nodePath: input.nodePath,
++      piCliPath: input.piCliPath,
++      dataRoot: input.dataRoot,
++      version: input.version,
++      sourceDir: acquired.packageRoot,
++      includeDependencies: true,
++      acquisition: acquired.acquisition,
++      timeoutMs: input.timeoutMs,
++      log: input.log,
++    });
++  } finally {
++    fs.rmSync(acquired.acquisitionRoot, { recursive: true, force: true });
++  }
++}
+diff --git a/src/components/settings/BuildOrchestrationSettings.tsx b/src/components/settings/BuildOrchestrationSettings.tsx
+index 17f267f..3f23355 100644
+--- a/src/components/settings/BuildOrchestrationSettings.tsx
++++ b/src/components/settings/BuildOrchestrationSettings.tsx
+@@ -17,7 +17,7 @@
+  * - thinking 'off' 是服务端缺省，选「关闭」时不写该键（undefined 不落盘）。
+  */
+ 
+-import { useEffect, useMemo, useState } from 'react';
++import { useEffect, useMemo, useRef, useState } from 'react';
+ import { ChevronDown, ChevronRight, Download, Loader2, RefreshCw, ShieldAlert, Workflow } from 'lucide-react';
+ import { useToast } from '../common/Toast';
+ import { useConfig } from '../../hooks/useConfig';
+@@ -324,19 +324,31 @@ export function BuildOrchestrationSettings() {
+   const [runtimeUnwired, setRuntimeUnwired] = useState(false);
+   const [runtimeError, setRuntimeError] = useState<string | null>(null);
+   const [runtimeLoading, setRuntimeLoading] = useState(false);
++  // latest-request-wins（steer #5）：加载/手刷的旧 GET 不得在安装成功触发的新 GET
++  // 之后返回并覆盖最新状态（否则「已装」被旧「未装」回写）。序号失配的迟到响应丢弃。
++  const runtimeSeqRef = useRef(0);
+   const loadRuntime = () => {
++    const seq = runtimeSeqRef.current + 1;
++    runtimeSeqRef.current = seq;
+     setRuntimeLoading(true);
+     setRuntimeError(null);
+     getKbBuildRuntimeStatus()
+-      .then((dto) => { setRuntimeStatus(dto); setRuntimeUnwired(false); })
++      .then((dto) => {
++        if (seq !== runtimeSeqRef.current) return; // 迟到响应丢弃
++        setRuntimeStatus(dto);
++        setRuntimeUnwired(false);
++      })
+       .catch((err: unknown) => {
++        if (seq !== runtimeSeqRef.current) return;
+         if (err instanceof APIError && err.statusCode === 503) {
+           setRuntimeUnwired(true);
+           return;
+         }
+         setRuntimeError(err instanceof Error ? err.message : '探测失败');
+       })
+-      .finally(() => setRuntimeLoading(false));
++      .finally(() => {
++        if (seq === runtimeSeqRef.current) setRuntimeLoading(false);
++      });
+   };
+   useEffect(() => { loadRuntime(); }, []);
+ 
+@@ -746,6 +758,10 @@ export function BuildOrchestrationSettings() {
+ // ---------------------------------------------------------------------------
+ // v2 运行宿主状态与安装（真实 GET/POST /api/kb/build-runtime*；消费集成侧
+ // BuildRuntimeStatusDto。staticOk ≠ fullyVerified，安装可用 ≠ 质量验收全过）。
++// plugin-install-fix：构建专用固定版本与「全局/应用 Pi home 的其他 amagi-pi」
++// 分开呈现——检测到的 2.21.36 不冒充固定 2.21.31、也不因版本更高被采用；默认
++// 安装走服务端官方 Git 固定 commit 获取链（无匹配不回退 npm/latest）；已装则
++// 按钮语义为「校验」（完整哈希复用核对），不假装重装。
+ // ---------------------------------------------------------------------------
+ 
+ const PROBE_CHECK_STATE_LABEL: Record<string, string> = {
+@@ -755,6 +771,25 @@ const PROBE_CHECK_STATE_CLS: Record<string, string> = {
+   pass: 'text-jade', fail: 'text-seal-2', warn: 'text-[#bf9004]', 'not-measured': 'text-ink-faint',
+ };
+ 
++const AMAGI_ORIGIN_LABEL: Record<'global-pi-home' | 'app-pi-home', string> = {
++  'global-pi-home': '全局 Pi',
++  'app-pi-home': '应用插件目录',
++};
++const AMAGI_SOURCE_TYPE_LABEL: Record<'npm' | 'git' | 'local', string> = {
++  npm: 'npm', git: 'Git', local: '本地目录',
++};
++
++/** 安装错误消息拆分：主提示=首行（≤180 字符，可操作），其余进折叠详情。 */
++export function splitInstallErrorMessage(message: string): { main: string; detail: string | null } {
++  const normalized = message.trim();
++  if (!normalized) return { main: '安装失败（未知错误）', detail: null };
++  const firstLine = normalized.split('\n', 1)[0].trim();
++  const main = firstLine.length > 180 ? `${firstLine.slice(0, 180)}…` : firstLine;
++  const remainder = normalized.slice(firstLine.length).trim();
++  if (main.endsWith('…')) return { main, detail: normalized };
++  return { main, detail: remainder || null };
++}
++
+ function RuntimeStatusSection({
+   status, unwired, error, loading, onRefresh, onInstalled,
+ }: {
+@@ -770,21 +805,39 @@ function RuntimeStatusSection({
+   const [installBusy, setInstallBusy] = useState(false);
+   const [installError, setInstallError] = useState<string | null>(null);
+   const [checksOpen, setChecksOpen] = useState(false);
++  const [errorDetailOpen, setErrorDetailOpen] = useState(false);
++
++  // 被动状态响应不能清除较新的安装错误；仅显式刷新/新安装动作清错。
++  // 点击刷新即清除旧错误（不依赖响应对象身份；失败重查时旧错误不误导）。
++  const handleRefresh = () => {
++    setInstallError(null);
++    setErrorDetailOpen(false);
++    onRefresh();
++  };
++
++  const selectDir = async () => {
++    if (typeof window === 'undefined' || !window.desktop?.selectDirectory) return;
++    try {
++      const dir = await window.desktop.selectDirectory();
++      if (dir) setSourceDir(dir); // 用户取消（null）→ 保持原值
++    } catch { /* 桥接异常不影响手填路径 */ }
++  };
+ 
+   const install = async () => {
+     if (installBusy) return;
+     setInstallBusy(true);
+     setInstallError(null);
++    setErrorDetailOpen(false);
+     try {
+       const trimmed = sourceDir.trim();
+       const result = await installKbBuildRuntime(trimmed ? { sourceDir: trimmed } : {});
+       toast.push({
+         type: 'success',
+-        message: `amagi-pi ${result.version} 已安装${result.fresh ? '' : '（沿用既有安装）'}；完整启用另需实测验收`,
++        message: `amagi-pi ${result.version} ${result.fresh ? '已安装' : '完整校验通过（沿用既有安装）'}；完整启用另需实测验收`,
+       });
+       onInstalled();
+     } catch (err) {
+-      setInstallError(err instanceof APIError ? err.message : err instanceof Error ? err.message : '安装失败');
++      setInstallError(err instanceof Error ? err.message : '安装失败');
+     } finally {
+       setInstallBusy(false);
+     }
+@@ -792,6 +845,14 @@ function RuntimeStatusSection({
+ 
+   const amagi = status?.amagi;
+   const probe = status?.probe;
++  // 旧 DTO 兼容：新字段缺省时按 installed 布尔推导（不因缺字段崩渲染）。
++  const installState: 'installed' | 'missing' | 'broken' = amagi?.installState ?? (amagi?.installed ? 'installed' : 'missing');
++  const candidates = amagi?.candidates ?? [];
++  const discoveryIssues = amagi?.discoveryIssues ?? [];
++  const recommended = candidates.find((item) => item.matchesPin && item.sourceType === 'local' && item.packagePath) ?? null;
++  const trimmedSource = sourceDir.trim();
++  const canSelectDir = typeof window !== 'undefined' && Boolean(window.desktop?.selectDirectory);
++  const errorParts = installError ? splitInstallErrorMessage(installError) : null;
+   return (
+     <div className="rounded-md border border-line bg-paper/30 p-3 space-y-2" data-testid="orch-runtime-status">
+       <div className="flex items-center justify-between gap-2">
+@@ -801,7 +862,7 @@ function RuntimeStatusSection({
+         </h4>
+         <button
+           type="button"
+-          onClick={onRefresh}
++          onClick={handleRefresh}
+           className="inline-flex items-center gap-1 text-[11px] text-seal hover:underline"
+           data-testid="orch-runtime-refresh"
+         >
+@@ -822,10 +883,12 @@ function RuntimeStatusSection({
+               Pi：{status.runtime?.piVersion ? <span className="font-mono">{status.runtime.piVersion}</span> : <span className="text-ink-faint">未探测</span>}
+             </span>
+             <span className="text-ink-soft">
+-              amagi-pi（固定版本 <span className="font-mono">{amagi?.pinnedVersion ?? '—'}</span>）：
+-              {amagi?.installed
+-                ? <span className="text-jade" title={`${amagi.installDir ?? ''} ${amagi.contentHash ?? ''}`.trim()}>已安装 {amagi.version}</span>
+-                : <span className="text-[#bf9004]">未安装</span>}
++              构建专用 amagi-pi（固定 <span className="font-mono">{amagi?.pinnedVersion ?? '—'}</span>）：
++              {installState === 'installed'
++                ? <span className="text-jade" title={`${amagi?.installDir ?? ''} ${amagi?.contentHash ?? ''}`.trim()}>已安装 {amagi?.version ?? amagi?.pinnedVersion}</span>
++                : installState === 'broken'
++                  ? <span className="text-seal-2">安装损坏{amagi?.installDetail ? `（${amagi.installDetail}）` : ''}——删除版本化目录后重装</span>
++                  : <span className="text-[#bf9004]">未安装——构建不会使用其他来源的 amagi-pi</span>}
+             </span>
+             {probe ? (
+               <span className="flex items-center gap-1.5">
+@@ -866,24 +929,78 @@ function RuntimeStatusSection({
+               ) : null}
+             </div>
+           ) : null}
++          {/* 只读发现：全局/应用 Pi home 的其他 amagi-pi（如实区分，不参与构建 pin） */}
++          {candidates.length > 0 || discoveryIssues.length > 0 ? (
++            <div className="border-t border-line/60 pt-1.5 space-y-1" data-testid="orch-runtime-candidates">
++              <p className="text-[11px] text-ink-soft">检测到的其他 amagi-pi（只读发现，不用于构建）：</p>
++              <ul className="space-y-0.5">
++                {candidates.map((item) => (
++                  <li key={`${item.origin}:${item.source}`} className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px] leading-snug" data-testid="orch-runtime-candidate">
++                    <span className="text-ink-soft">{AMAGI_ORIGIN_LABEL[item.origin]}</span>
++                    <span className="font-mono">{item.version ?? '版本未知'}</span>
++                    <span className="text-ink-faint break-all">（{AMAGI_SOURCE_TYPE_LABEL[item.sourceType]}{item.packagePath ? ` · ${item.packagePath}` : ' · 实体缺失'}）</span>
++                    {item.matchesPin ? (
++                      <>
++                        <span className="text-jade">与固定版本一致</span>
++                        {item.sourceType === 'local' && item.packagePath && item.packagePath !== trimmedSource ? (
++                          <button
++                            type="button"
++                            className="text-seal hover:underline"
++                            data-testid="orch-runtime-candidate-adopt"
++                            onClick={() => setSourceDir(item.packagePath!)}
++                          >
++                            用作安装来源
++                          </button>
++                        ) : null}
++                      </>
++                    ) : (
++                      <span className="text-[#bf9004]">≠ 固定版本 {amagi?.pinnedVersion ?? ''}，不用于构建</span>
++                    )}
++                  </li>
++                ))}
++              </ul>
++              {discoveryIssues.length > 0 ? (
++                <ul className="space-y-0.5" data-testid="orch-runtime-discovery-issues">
++                  {discoveryIssues.map((issue) => (
++                    <li key={issue.origin} className="text-[11px] text-[#bf9004] leading-snug">
++                      {AMAGI_ORIGIN_LABEL[issue.origin]}候选检测{issue.status === 'unavailable' ? '不可用' : '失败'}（不代表未安装）
++                      {issue.detail ? `：${issue.detail}` : ''}
++                      {issue.settingsErrors.length > 0 ? `；settings ${issue.settingsErrors.map((se) => `${se.scope}: ${se.message}`).join('；')}` : ''}
++                    </li>
++                  ))}
++                </ul>
++              ) : null}
++            </div>
++          ) : null}
+         </>
+       ) : (
+         <p className="text-[11px] text-ink-faint">能力状态加载中…</p>
+       )}
+ 
+-      {/* 安装入口：固定版本由服务端控制；sourceDir 可选本地可信包源绝对路径 */}
++      {/* 安装入口：默认=服务端官方 Git 固定 commit 获取；显式 sourceDir 优先严格安装 */}
+       {!unwired ? (
+         <div className="space-y-1.5 border-t border-line/60 pt-2" data-testid="orch-runtime-install">
+           <div className="flex flex-wrap items-center gap-2">
+             <input
+               type="text"
+               className={INPUT_CLS + ' flex-1 min-w-[200px]'}
+-              placeholder="可选：本地 amagi-pi 包源绝对路径（仅限可信来源）"
++              placeholder="可选：本地 amagi-pi 包源绝对路径（优先于默认 Git 来源）"
+               value={sourceDir}
+               aria-label="本地 amagi-pi 包源绝对路径（可选）"
+               data-testid="orch-runtime-source-dir"
+               onChange={(e) => setSourceDir(e.target.value)}
+             />
++            {canSelectDir ? (
++              <button
++                type="button"
++                onClick={() => void selectDir()}
++                disabled={installBusy}
++                className="inline-flex items-center gap-1 h-9 px-3 rounded-md border border-line text-xs text-ink hover:bg-paper disabled:opacity-60"
++                data-testid="orch-runtime-source-dir-pick"
++              >
++                选择目录
++              </button>
++            ) : null}
+             <button
+               type="button"
+               onClick={() => void install()}
+@@ -892,12 +1009,38 @@ function RuntimeStatusSection({
+               data-testid="orch-runtime-install-btn"
+             >
+               {installBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : amagi?.installed ? <RefreshCw className="w-3.5 h-3.5" /> : <Download className="w-3.5 h-3.5" />}
+-              {amagi?.installed ? '重装/校验固定版本' : `安装 amagi-pi ${amagi?.pinnedVersion ?? ''}`.trim()}
++              {installState === 'installed'
++                ? `校验固定版本 ${amagi?.pinnedVersion ?? ''}`.trim()
++                : trimmedSource
++                  ? `从目录安装 amagi-pi ${amagi?.pinnedVersion ?? ''}`.trim()
++                  : `安装 amagi-pi ${amagi?.pinnedVersion ?? ''}（官方 Git · ${(amagi?.commit ?? '').slice(0, 7)}）`.trim()}
+             </button>
+           </div>
+-          {installError ? (
+-            <p className="text-[11px] text-seal-2" role="alert" data-testid="orch-runtime-install-error">安装失败：{installError}</p>
++          {errorParts ? (
++            <div className="text-[11px] leading-snug" data-testid="orch-runtime-install-error">
++              <p className="text-seal-2" role="alert">{installState === 'installed' ? '校验失败：' : '安装失败：'}{errorParts.main}</p>
++              {errorParts.detail ? (
++                <button
++                  type="button"
++                  onClick={() => setErrorDetailOpen((value) => !value)}
++                  aria-expanded={errorDetailOpen}
++                  className="mt-0.5 text-ink-faint hover:text-ink underline"
++                  data-testid="orch-runtime-install-error-toggle"
++                >
++                  {errorDetailOpen ? '收起详细错误' : '展开详细错误'}
++                </button>
++              ) : null}
++              {errorParts.detail && errorDetailOpen ? (
++                <pre className="mt-1 max-h-[160px] overflow-y-auto scrollbar-thin whitespace-pre-wrap break-all rounded border border-line bg-card-bg p-2 text-[10px] text-ink-faint" data-testid="orch-runtime-install-error-detail">{errorParts.detail}</pre>
++              ) : null}
++            </div>
+           ) : null}
++          <p className="text-[10px] text-ink-faint leading-relaxed" data-testid="orch-runtime-install-hint">
++            {trimmedSource
++              ? '已填本地目录：将严格按该源安装（版本与内容哈希校验不放松）。'
++              : `未填目录时默认从官方仓库 ${amagi?.repoUrl ?? ''} 固定 commit ${amagi?.commit ?? ''} 经 Pi CLI 获取安装（需本机 git 与网络；失败时可改填本地目录，不回退 npm/latest）。`}
++            {recommended ? ` 检测到与固定版本一致的本地来源：${recommended.packagePath}。` : ''}
++          </p>
+           <p className="flex items-start gap-1 text-[10px] text-ink-faint leading-relaxed">
+             <ShieldAlert className="w-3 h-3 mt-0.5 shrink-0" />
+             amagi-pi 插件是受信任的 Node 代码，以当前用户权限运行（文件围栏不是 OS 沙箱）；固定版本由服务端控制，安装可用不等于质量/恢复/性能验收全部通过（完整启用以实测验收 fullyVerified 为准）。

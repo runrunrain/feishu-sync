@@ -39,6 +39,8 @@ export interface VisionResult {
   model: string;
   latencyMs: number;
   errorMessage?: string;
+  /** SDK HTTP status, when available. The describer retries only transient responses. */
+  statusCode?: number;
 }
 
 export interface VisionCallOptions {
@@ -62,12 +64,13 @@ export class VisionChannel {
   async describe(req: VisionRequest, opts: VisionCallOptions): Promise<VisionResult> {
     const startedAt = Date.now();
     const model = this.llm.directModel || this.llm.model;
-    const error = (message: string, finishReason: VisionFinishReason): VisionResult => ({
+    const error = (message: string, finishReason: VisionFinishReason, statusCode?: number): VisionResult => ({
       text: '',
       finishReason,
       model,
       latencyMs: Date.now() - startedAt,
       errorMessage: `VisionChannel: ${this.redact(message)}`,
+      ...(statusCode ? { statusCode } : {}),
     });
 
     // 配置缺失时跳过网络调用，立即返回配置错误（与 DirectChannel 一致）
@@ -183,7 +186,9 @@ export class VisionChannel {
         return error('aborted by caller', 'error');
       }
       const rawMessage = err instanceof Error ? err.message : String(err);
-      return error(`SDK call failed - ${rawMessage}`, 'error');
+      const statusCode = typeof err === 'object' && err !== null && 'status' in err && typeof err.status === 'number'
+        ? err.status : undefined;
+      return error(`SDK call failed - ${rawMessage}`, 'error', statusCode);
     } finally {
       clearTimeout(timer);
       opts.signal?.removeEventListener('abort', onExternalAbort);

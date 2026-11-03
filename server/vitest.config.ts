@@ -6,6 +6,9 @@
 import { defineConfig } from 'vitest/config'
 
 export default defineConfig({
+  // Server tests do not transform CSS. Avoid loading the desktop root's
+  // PostCSS/Tailwind config when running with Electron's Node ABI.
+  css: { postcss: { plugins: [] } },
   test: {
     include: ['tests/**/*.test.ts'],
     environment: 'node',

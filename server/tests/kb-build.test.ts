@@ -17,6 +17,7 @@ import path from 'node:path';
 import {
   cleanupOldStaging,
   computeChangeset,
+  mergeSelectedSourceEntries,
   KbBuildService,
   validateOutputRoot,
   validateStagingDocs,
@@ -150,6 +151,16 @@ describe('CSV 附件与主文档使用同一原始库围栏', () => {
 });
 
 describe('computeChangeset（§6.4）', () => {
+  it('所选增量只纳入所选来源，保留其他批次尚未发布的基线版本', () => {
+    const base = [entry('old-pending', 'old.md', 'published'), entry('stable', 'stable.md', 'stable')];
+    const live = [entry('old-pending', 'old.md', 'unpublished'), entry('stable', 'stable.md', 'stable'),
+      entry('selected', 'selected.md', 'new')];
+    const merged = mergeSelectedSourceEntries(base, live, new Set(['selected']));
+    const changeset = computeChangeset(merged, { sourceSnapshot: base } as never);
+    expect(changeset).toMatchObject({ added: ['selected'], changed: [], removed: [] });
+    expect(merged.find((source) => source.objToken === 'old-pending')?.contentHash).toBe('published');
+  });
+
   it('按 objToken 比较 contentHash：added/changed/removed', () => {
     const current = [entry('a', 'a.md', 'h1'), entry('b', 'b.md', 'h2b'), entry('c', 'c.md', 'h3')];
     const base = {
@@ -166,6 +177,14 @@ describe('computeChangeset（§6.4）', () => {
     const current = [entry('a', 'a.md', 'h1')];
     const base = { sourceSnapshot: [entry('a', 'a.md', 'h1')] };
     expect(computeChangeset(current, base as never).isEmpty()).toBe(true);
+  });
+
+  it('只有来源标题或本地路径变化时不重写已发布知识正文', () => {
+    const original = entry('a', '旧目录/旧标题.md', 'same-content');
+    const renamed = { ...original, title: '新标题', relPath: '新目录/新标题.md' };
+    const changeset = computeChangeset([renamed], { sourceSnapshot: [original] } as never);
+    expect(changeset.changed).toEqual([]);
+    expect(changeset.isEmpty()).toBe(true);
   });
 });
 
@@ -250,6 +269,29 @@ describe('staging 校验（§6.5 validating）', () => {
     expect(issues).toEqual([]);
     fs.rmSync(dir, { recursive: true, force: true });
   });
+
+  it('权限占位源自动记为跳过，且不能被正式文档引用', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kbval-permission-'));
+    const state = makeState(dir);
+    writeRaw('src-denied.md', '# 权限受限\n\n> **注意**: 该文档在飞书侧权限受限（当前账号无访问权限，API 返回 40403 no permission），无法获取内容。\n\n> 如需查阅，请在飞书中向文档所有者申请权限后重新获取。');
+    state.snapshot = RawSourceSnapshot.fromEntries([
+      ...state.snapshot.entries,
+      entry('tokDenied', 'src-denied.md', computeSourceHash(path.join(kbRoot, 'src-denied.md'), [])),
+    ], { knowledgeBaseRoot: kbRoot });
+    state.workset.set('tokDenied', 'added');
+    state.finishInfo = { summary: '完成可读来源', skipped: [] };
+    fs.writeFileSync(path.join(state.stagingRoot, 'docs', '可读.md'), '<!--\nfeishu_sync_kb:\n  doc_id: kd_readable\n  sources:\n    - tokA\n  build_id: b1\n-->\n# 可读\n正文');
+
+    expect(validateStagingDocs(state, state.snapshot)).toEqual([]);
+    expect(state.finishInfo.skipped).toEqual([{ objToken: 'tokDenied', reason: expect.stringContaining('40403') }]);
+    expect(validateStagingDocs(state, state.snapshot)).toEqual([]);
+    expect(state.finishInfo.skipped).toHaveLength(1);
+
+    fs.writeFileSync(path.join(state.stagingRoot, 'docs', '误引.md'), '<!--\nfeishu_sync_kb:\n  doc_id: kd_invalid\n  sources:\n    - tokDenied\n  build_id: b1\n-->\n# 误引\n正文');
+    const issues = validateStagingDocs(state, state.snapshot);
+    expect(issues.some((issue) => issue.code === 'source_permission_denied' && issue.objToken === 'tokDenied')).toBe(true);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
 });
 
 describe('发布原子性与对账（§6.5 publishing / §5.3）', () => {
@@ -278,6 +320,17 @@ describe('发布原子性与对账（§6.5 publishing / §5.3）', () => {
       promptAssets: () => null,
     });
   }
+
+  it('构建物化的技能可被 Pi --skill 发现且内容哈希绑定全文', () => {
+    const service = makeService();
+    const skill = (service as unknown as { materializeWorkflowSkill(id: string): { skillPath: string; revision: string } })
+      .materializeWorkflowSkill('b-skill-discovery');
+    const content = fs.readFileSync(skill.skillPath, 'utf-8');
+    expect(skill.skillPath).toMatch(/\/skills\/knowledge-build\/SKILL\.md$/);
+    expect(content).toMatch(/^---\nname: knowledge-build\ndescription: .+\n---\n/);
+    expect(content).toContain('mcp-examples.md');
+    expect(skill.revision).toMatch(/^[0-9a-f]{64}$/);
+  });
 
   function stageReleaseFiles(buildId: string, docs: Array<{ path: string; docId: string; sources: string[]; body: string }>): string {
     const stagingRoot = path.join(outputRoot, '.staging', buildId);

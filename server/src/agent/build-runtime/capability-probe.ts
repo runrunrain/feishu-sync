@@ -110,7 +110,7 @@ export function runStaticProbes(input: StaticProbeInput): CapabilityReport {
     }
   } catch (error) {
     const detail = error instanceof AmagiPackageError ? `${error.code}: ${error.message}` : String(error);
-    push({ id: 'amagi-package', title: 'amagi-pi 安装', kind: 'static', state: 'fail', detail: `版本化安装不可用（${detail}）——先经 pi CLI 安装 npm:amagi-pi@${input.amagiVersion}` });
+    push({ id: 'amagi-package', title: 'amagi-pi 安装', kind: 'static', state: 'fail', detail: `版本化安装不可用（${detail}）——在设置「构建编排」卡安装：默认官方 Git 固定 commit 获取，或填本地 amagi-pi@${input.amagiVersion} 目录` });
   }
 
   // 3. 模型密钥映射（静态知识对账）

@@ -10,7 +10,7 @@
 
 ## 交接记录（handoff）
 
-子任务完成或受阻时经 `build_handoff_submit` 提交交接记录（`operationId` 幂等；`summary` 必填），字段：
+子任务完成或受阻时经 `build_handoff_submit` 提交交接记录（`operationId` 可省略，由服务端按载荷生成幂等键；`summary` 必填），字段：
 
 - `artifactRefs`：成果引用（文档路径或路径@revision、对象 ID、审查报告 ID）。
 - `sourceScope`：本次覆盖的来源（objToken 列表）。

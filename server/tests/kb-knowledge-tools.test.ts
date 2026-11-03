@@ -190,6 +190,20 @@ describe('evidence-locator：CsvCells（引号内换行不等于新记录）', (
     });
     expect(result.ok).toBe(false);
   });
+  it('空白首行的飞书 sheet CSV 可用显式列坐标定位证据', () => {
+    const sparse = { ...csvResource, content: ',,,\n,项目,数值,\n,兵力,30,\n' };
+    const result = resolveSelector(sparse, {
+      kind: 'csv_cells', resourcePath: CSV_NAME, parserVersion: 'rfc4180-v1',
+      recordStart: 3, recordEnd: 3, columns: ['@B', '@C'],
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.fragment).toBe('兵力,30');
+    const outOfRange = resolveSelector(sparse, {
+      kind: 'csv_cells', resourcePath: CSV_NAME, parserVersion: 'rfc4180-v1',
+      recordStart: 3, recordEnd: 3, columns: ['@Z'],
+    });
+    expect(outOfRange.ok).toBe(false);
+  });
 });
 
 describe('evidence-locator：WorkbookCells', () => {
@@ -349,6 +363,57 @@ describe('evidence-locator：MediaRegion 与 verifyEvidence', () => {
 // ============================================================================
 
 describe('raw_read：readReceiptId 登记与 segmentMap（多资源拼接）', () => {
+  it('有内容的 CSV 中连续空白记录默认折叠，回执和页界仍覆盖原文，按需可逐字重读', async () => {
+    writeRaw(CSV_NAME, '列,值\n1,一\n,\n,\n,\n2,二\n');
+    try {
+      const state = makeBuildState('compact-partial-csv');
+      const token = tokenFor(state);
+      const compact = await service.executeTool(token, 'raw_read', { objToken: 'tokB', limit: 100 });
+      const visible = compact.content[0]?.text ?? '';
+      expect(visible).toContain('<blank_csv_rows resource_id="tokB#csv:表.csv" resource_lines="3-5" output_lines="8-10" count="3" />');
+      expect(visible).toContain('<raw_page offset="0" returned="12" total="12" next_offset="end" />');
+      expect(visible).toContain('[O6/R1/C1] 列,值');
+      expect(visible).toContain('[O11/R6/C6] 2,二');
+      expect((compact.details as { readReceipts: Array<{ resourceId: string; lineStart: number; lineEnd: number }> }).readReceipts)
+        .toContainEqual(expect.objectContaining({ resourceId: 'tokB#csv:表.csv', lineStart: 1, lineEnd: 7 }));
+      const full = await service.executeTool(token, 'raw_read', { objToken: 'tokB', limit: 100, includeBlankCsvRows: true });
+      expect(full.content[0]?.text).not.toContain('<blank_csv_rows');
+      expect(full.content[0]?.text).toContain('[O7/R2/C2] 1,一\n[O8/R3/C3] ,\n[O9/R4/C4] ,\n[O10/R5/C5] ,\n[O11/R6/C6] 2,二');
+    } finally { writeRaw(CSV_NAME, CSV_CONTENT); }
+  });
+
+  it('长空白 CSV 只需两页即可读到尾部非空记录，逐字模式仍逐页读取', async () => {
+    writeRaw(CSV_NAME, `列,值\n1,一\n${',\n'.repeat(240)}2,二\n`);
+    try {
+      const state = makeBuildState('compact-cursor');
+      const token = tokenFor(state);
+      const first = await service.executeTool(token, 'raw_read', { objToken: 'tokB', limit: 10 });
+      const next = (first.details as { nextOffset: number | null }).nextOffset;
+      expect(next).not.toBeNull();
+      expect(next).toBeGreaterThan(200);
+      expect(first.content[0]?.text).toContain('<skipped_blank_csv_rows');
+      const second = await service.executeTool(token, 'raw_read', { objToken: 'tokB', offset: next!, limit: 10 });
+      expect(second.content[0]?.text).toContain('2,二');
+      expect((second.details as { nextOffset: number | null }).nextOffset).toBeNull();
+      const literal = await service.executeTool(token, 'raw_read', { objToken: 'tokB', limit: 10, includeBlankCsvRows: true });
+      expect((literal.details as { nextOffset: number | null }).nextOffset).toBe(10);
+    } finally { writeRaw(CSV_NAME, CSV_CONTENT); }
+  });
+
+  it('空白 CSV 由解析器识别并在模型可见页眉标出，避免把占位表当成待读取内容', async () => {
+    writeRaw(CSV_NAME, ',,\n,,\n');
+    try {
+      const state = makeBuildState('blank-csv');
+      const result = await service.executeTool(tokenFor(state), 'raw_read', { objToken: 'tokB', limit: 20 });
+      const visible = result.content[0]?.type === 'text' ? result.content[0].text : '';
+      expect(visible).toContain('<blank_csv_resources>');
+      expect(visible).toContain('tokB#csv:表.csv');
+      expect(visible).toContain('空白 CSV 附件 表.csv：0 个有效单元格');
+      expect(visible).not.toContain(',,\n,,');
+      expect((result.details as { resources: Array<{ nonEmptyCells?: number }> }).resources[1]?.nonEmptyCells).toBe(0);
+    } finally { writeRaw(CSV_NAME, CSV_CONTENT); }
+  });
+
   it('全量读：主文档+CSV 附件各登记一条回执；segmentMap 标注派生行', async () => {
     const state = makeBuildState('receipt-full');
     const token = tokenFor(state);
@@ -359,6 +424,10 @@ describe('raw_read：readReceiptId 登记与 segmentMap（多资源拼接）', (
     expect(receipts[0]).toMatchObject({ resourceId: 'tokB', lineStart: 1, lineEnd: 3 });
     expect(receipts[1]).toMatchObject({ resourceId: 'tokB#csv:表.csv', lineStart: 1, lineEnd: 5 });
     expect(details.readReceiptId).toBe(receipts[0]!.readReceiptId);
+    const visibleText = result.content[0]?.type === 'text' ? result.content[0].text : '';
+    expect(visibleText).toMatch(/^<read_receipts source_id="tokB">/);
+    expect(visibleText.indexOf(receipts[0]!.readReceiptId)).toBeLessThan(visibleText.indexOf('<untrusted_source'));
+    expect(visibleText).toContain(receipts[1]!.readReceiptId);
     // 资源表：主文档 + CSV
     const resources = details.resources as Array<{ resourceId: string; kind: string }>;
     expect(resources.map((r) => r.resourceId)).toEqual(['tokB', 'tokB#csv:表.csv']);
@@ -386,6 +455,8 @@ describe('raw_read：readReceiptId 登记与 segmentMap（多资源拼接）', (
     const page1 = await service.executeTool(token, 'raw_read', { objToken: 'tokB', offset: 0, limit: 4 }, { toolCallId: 'call-p1' });
     const d1 = page1.details as Record<string, unknown>;
     expect(d1.truncated).toBe(true);
+    expect(d1.nextOffset).toBe(4);
+    expect(page1.content[0]?.text).toContain('<raw_page offset="0" returned="4" total="10" next_offset="4" />');
     const seg1 = d1.segmentMap as Array<Record<string, unknown>>;
     expect(seg1).toHaveLength(2);
     expect(seg1[0]).toMatchObject({ resourceId: 'tokB', outStart: 1, outEnd: 3, resStart: 1, resEnd: 3 });
@@ -396,6 +467,8 @@ describe('raw_read：readReceiptId 登记与 segmentMap（多资源拼接）', (
     // 第二页从 CSV 头开始，只命中 CSV 资源
     const page2 = await service.executeTool(token, 'raw_read', { objToken: 'tokB', offset: 4, limit: 100 }, { toolCallId: 'call-p2' });
     const d2 = page2.details as Record<string, unknown>;
+    expect(d2.nextOffset).toBeNull();
+    expect(page2.content[0]?.text).toContain('next_offset="end"');
     const receipts2 = d2.readReceipts as Array<{ resourceId: string; lineStart: number; lineEnd: number }>;
     expect(receipts2).toHaveLength(1);
     expect(receipts2[0]).toMatchObject({ resourceId: 'tokB#csv:表.csv', lineStart: 1, lineEnd: 5 });
@@ -416,6 +489,138 @@ describe('raw_read：readReceiptId 登记与 segmentMap（多资源拼接）', (
 // ============================================================================
 
 describe('kb_write_doc：原子落盘与声明', () => {
+  it('紧凑提交由服务端补齐标题、常规对象键、证据回执与覆盖项键', async () => {
+    const state = makeBuildState('compact-write');
+    const token = tokenFor(state);
+    const read = await service.executeTool(token, 'raw_read', { objToken: 'tokA', offset: 0, limit: 10 });
+    const receipt = ((read.details as Record<string, unknown>).readReceipts as ReadReceiptRecord[])[0]!;
+    const compactArgs = {
+      path: '战斗/伤害规则.md',
+      markdown: '## 伤害公式\n基础倍率为 2.0。',
+      sources: ['tokA'],
+      summary: '基础伤害倍率',
+      objects: [{
+        clientKey: 'damage', type: 'rule', title: '伤害公式', familyKey: 'damage',
+        scopeText: '基础伤害计算', headingPath: ['伤害公式'],
+        claims: [{ claimKey: 'multiplier', riskCategory: 'high' }],
+      }],
+      evidenceClaims: [{
+        objectKey: 'damage', claimKey: 'multiplier',
+        selector: { kind: 'text_span', lineStart: 2, lineEnd: 2 },
+      }],
+      coverageUpdates: [{
+        sourceId: 'tokA', category: 'rule', disposition: 'mapped', targetKeys: ['damage'],
+      }],
+    };
+    const result = await service.executeTool(token, 'kb_write_doc', compactArgs);
+    expect(result.content[0]!.text).toContain('已写入草稿');
+    const body = fs.readFileSync(path.join(state.stagingRoot, 'docs', '战斗', '伤害规则.md'), 'utf-8');
+    expect(body).toContain('# 伤害规则\n## 伤害公式');
+    const draft = JSON.parse(fs.readFileSync(path.join(state.stagingRoot, 'knowledge-draft.json'), 'utf-8')) as {
+      objects: Array<{ variantKey: string; scopeKey: string }>;
+      evidence: Array<{ evidenceId: string; readReceiptId: string; sourceRef: { sourceId: string; resourceId: string }; role: string; nature: string }>;
+      coverage: Array<{ itemId: string }>;
+    };
+    expect(draft.objects[0]).toMatchObject({ variantKey: 'default' });
+    expect(draft.objects[0]!.scopeKey).toMatch(/^scope_auto_/);
+    expect(draft.evidence[0]).toMatchObject({
+      readReceiptId: receipt.readReceiptId,
+      sourceRef: { sourceId: 'tokA', resourceId: 'tokA' },
+      role: 'supports', nature: 'direct',
+    });
+    expect(draft.coverage[0]!.itemId).toMatch(/^cov_auto_/);
+
+    await service.executeTool(token, 'kb_write_doc', {
+      ...compactArgs,
+      evidenceClaims: [{ objectKey: 'damage', claimKey: 'multiplier', selector: { kind: 'text_span', lineStart: 3, lineEnd: 3 } }],
+      coverageUpdates: [{ sourceId: 'tokA', category: 'rule', disposition: 'unresolved', reason: '待核对数值' }],
+    });
+    const revised = JSON.parse(fs.readFileSync(path.join(state.stagingRoot, 'knowledge-draft.json'), 'utf-8')) as {
+      evidence: Array<{ evidenceId: string; selector: { lineStart: number } }>;
+      coverage: Array<{ itemId: string; disposition: string }>;
+    };
+    expect(revised.evidence).toHaveLength(1);
+    expect(revised.evidence[0]!.evidenceId).toBe(draft.evidence[0]!.evidenceId);
+    expect(revised.evidence[0]!.selector.lineStart).toBe(3);
+    expect(revised.coverage).toHaveLength(1);
+    expect(revised.coverage[0]!.itemId).toBe(draft.coverage[0]!.itemId);
+    expect(revised.coverage[0]!.disposition).toBe('unresolved');
+
+    // 整篇重写以本次证据声明为准；换键或省略旧证据都不能让过期选择器
+    // 在同一源快照下积累到断言上。
+    await service.executeTool(token, 'kb_write_doc', {
+      ...compactArgs,
+      evidenceClaims: [{ clientKey: 'replacement', objectKey: 'damage', claimKey: 'multiplier',
+        selector: { kind: 'text_span', lineStart: 2, lineEnd: 2 } }],
+    });
+    const replaced = JSON.parse(fs.readFileSync(path.join(state.stagingRoot, 'knowledge-draft.json'), 'utf-8')) as {
+      evidence: Array<{ evidenceId: string }>;
+      evidenceKeys: Record<string, string>;
+      objects: Array<{ claims: Array<{ evidenceIds: string[] }> }>;
+    };
+    expect(replaced.evidence).toHaveLength(1);
+    expect(replaced.evidence[0]!.evidenceId).toBe(replaced.evidenceKeys.replacement);
+    expect(replaced.objects[0]!.claims[0]!.evidenceIds).toEqual([replaced.evidenceKeys.replacement]);
+
+    await service.executeTool(token, 'kb_write_doc', { ...compactArgs, evidenceClaims: [] });
+    const cleared = JSON.parse(fs.readFileSync(path.join(state.stagingRoot, 'knowledge-draft.json'), 'utf-8')) as {
+      evidence: unknown[];
+      evidenceKeys: Record<string, string>;
+      objects: Array<{ claims: Array<{ evidenceIds: string[] }> }>;
+    };
+    expect(cleared.evidence).toEqual([]);
+    expect(cleared.evidenceKeys).toEqual({});
+    expect(cleared.objects[0]!.claims[0]!.evidenceIds).toEqual([]);
+  });
+
+  it('紧凑 CSV 证据从资源路径与物理行自动匹配读取回执', async () => {
+    const state = makeBuildState('compact-csv');
+    const token = tokenFor(state);
+    const read = await service.executeTool(token, 'raw_read', { objToken: 'tokB', offset: 0, limit: 20 });
+    const csvReceipt = ((read.details as Record<string, unknown>).readReceipts as ReadReceiptRecord[])
+      .find((receipt) => receipt.resourceId === 'tokB#csv:表.csv')!;
+    const result = await service.executeTool(token, 'kb_write_doc', {
+      path: '战斗/表格规则.md', markdown: '## 表格值\n值为多行内容。',
+      sources: ['tokB'], summary: '表格值说明',
+      objects: [{ clientKey: 'value', type: 'data_structure', title: '表格值', familyKey: 'table-value', scopeText: '表格记录', claims: [{ claimKey: 'value-cell' }] }],
+      evidenceClaims: [{ objectKey: 'value', claimKey: 'value-cell', selector: {
+        kind: 'csv_cells', resourcePath: CSV_NAME, parserVersion: 'v1', recordStart: 2, recordEnd: 2, columns: ['值'],
+      } }],
+    });
+    expect(result.content[0]!.text).toContain('已写入草稿');
+    const draft = JSON.parse(fs.readFileSync(path.join(state.stagingRoot, 'knowledge-draft.json'), 'utf-8')) as {
+      evidence: Array<{ readReceiptId: string; sourceRef: { resourceId: string } }>;
+    };
+    expect(draft.evidence[0]).toMatchObject({ readReceiptId: csvReceipt.readReceiptId, sourceRef: { resourceId: 'tokB#csv:表.csv' } });
+  });
+
+  it('CSV 行由服务端导入正文并登记覆盖整表的真实回执', async () => {
+    const state = makeBuildState('scripted-csv-table');
+    const token = tokenFor(state);
+    const result = await service.executeTool(token, 'kb_write_doc', {
+      path: '战斗/表格清单.md', markdown: '## 数据清单\n{{kb-csv-table:values}}',
+      csvTableImports: [{ key: 'values', sourceId: 'tokB', csvName: CSV_NAME,
+        columns: [0, 1], headerRecord: 1, firstRecord: 2 }],
+      sources: ['tokB'], summary: '表格字段与两条记录',
+      objects: [{ clientKey: 'table', type: 'data_structure', title: '数据清单', familyKey: 'table-list',
+        scopeText: '两条记录', headingPath: ['数据清单'], claims: [{ claimKey: 'rows' }] }],
+      evidenceClaims: [{ objectKey: 'table', claimKey: 'rows', selector: {
+        kind: 'csv_cells', resourcePath: CSV_NAME, parserVersion: 'v1',
+        recordStart: 2, recordEnd: 3, columns: ['列', '值'],
+      } }],
+    });
+    expect(result.content[0]!.text).toContain('已写入草稿');
+    const body = fs.readFileSync(path.join(state.stagingRoot, 'docs/战斗/表格清单.md'), 'utf8');
+    expect(body).toContain('| 列 | 值 |');
+    expect(body).toContain('| 1 | 多行<br>内容 |');
+    expect(body).toContain('| 3 | 三 |');
+    expect(body).not.toContain('{{kb-csv-table:values}}');
+    const draft = JSON.parse(fs.readFileSync(path.join(state.stagingRoot, 'knowledge-draft.json'), 'utf8')) as {
+      evidence: Array<{ readReceiptId: string }>;
+    };
+    expect(draft.evidence[0]!.readReceiptId).toMatch(/^rr_/);
+  });
+
   it('旧式调用完全兼容：不带新参数不产生 knowledge-draft.json', async () => {
     const state = makeBuildState('legacy');
     const token = tokenFor(state);
@@ -527,6 +732,71 @@ describe('kb_write_doc：原子落盘与声明', () => {
     expect(read.content[0]!.text).toContain('"clientKey": "stableDamage"');
     expect(read.content[0]!.text).toContain(`"objectId": "${objectId}"`);
     expect(read.content[0]!.text).toContain('"draftRevision": 1');
+  });
+
+  it('draft_read 按 claimKey 只返回目标断言与对应证据', async () => {
+    const state = makeBuildState('decl-claim-filter');
+    const token = tokenFor(state);
+    await service.executeTool(token, 'raw_read', { objToken: 'tokA', offset: 0, limit: 20 });
+    await service.executeTool(token, 'kb_write_doc', {
+      ...BASE_WRITE,
+      objects: [{ clientKey: 'damage', type: 'rule', title: '伤害公式', familyKey: 'damage',
+        scopeText: 'PVE 战斗', headingPath: ['伤害公式'], claims: [{ claimKey: 'target' }, { claimKey: 'other' }] }],
+      evidenceClaims: [
+        { objectKey: 'damage', claimKey: 'target', selector: { kind: 'text_span', lineStart: 1, lineEnd: 1 } },
+        { objectKey: 'damage', claimKey: 'other', selector: { kind: 'text_span', lineStart: 2, lineEnd: 2 } },
+      ],
+    });
+    const result = await service.executeTool(token, 'draft_read', {
+      path: BASE_WRITE.path, offset: 0, limit: 1, includeDeclarations: true, declarationClaimKey: 'target',
+    });
+    const payload = JSON.parse(result.content[0]!.text.split('<existing_knowledge_declarations>\n')[1]!
+      .split('\n</existing_knowledge_declarations>')[0]!) as {
+      objects: Array<{ claims: Array<{ claimKey: string }> }>;
+      evidence: Array<{ claimKey: string }>;
+    };
+    expect(payload.objects).toHaveLength(1);
+    expect(payload.objects[0]!.claims.map((claim) => claim.claimKey)).toEqual(['target']);
+    expect(payload.evidence.map((item) => item.claimKey)).toEqual(['target']);
+    expect(result.content[0]!.text).not.toContain('"claimKey": "other"');
+  });
+
+  it('大量声明先返回有界索引，再按对象读取完整声明，避免 Pi 临时文件截断', async () => {
+    const state = makeBuildState('decl-bounded-read');
+    const token = tokenFor(state);
+    const objectInputs = Array.from({ length: 4 }, (_, index) => ({
+      clientKey: `largeObject${index}`, type: 'rule', title: `对象${index}`, familyKey: `large${index}`,
+      scopeText: '范围', claims: [{ claimKey: `claim${index}` }],
+    }));
+    const write = await service.executeTool(token, 'kb_write_doc', { ...BASE_WRITE, objects: objectInputs });
+    const objectMap = (write.details as { objectMap: Record<string, string> }).objectMap;
+    const draftFile = path.join(state.stagingRoot, 'knowledge-draft.json');
+    const draft = JSON.parse(fs.readFileSync(draftFile, 'utf8'));
+    for (let index = 0; index < 4; index += 1) {
+      for (let n = 0; n < 20; n += 1) draft.evidence.push({
+        evidenceId: `ev-${index}-${n}`, objectId: objectMap[`largeObject${index}`], claimKey: `claim${index}`,
+        sourceRef: { sourceId: 'tokA', sourceSnapshotHash: 'sha256:source', resourceId: 'tokA', resourceHash: 'sha256:resource' },
+        selector: { kind: 'text_span', lineStart: 1, lineEnd: 2 }, quoteHash: `sha256:${'a'.repeat(64)}`,
+        role: 'supports', nature: 'direct', readReceiptId: `rr-${index}-${n}`,
+      });
+    }
+    fs.writeFileSync(draftFile, JSON.stringify(draft));
+    state.knowledgeDraft = undefined;
+    const parseDeclarations = (text: string) => JSON.parse(text.split('<existing_knowledge_declarations>\n')[1]!
+      .split('\n</existing_knowledge_declarations>')[0]!);
+    const index = parseDeclarations((await service.executeTool(token, 'draft_read', {
+      path: BASE_WRITE.path, offset: 0, limit: 1, includeDeclarations: true,
+    })).content[0]!.text);
+    expect(index.summaryOnly).toBe(true);
+    expect(index.objectCount).toBe(4);
+    expect(index.evidenceCount).toBe(80);
+    expect(index.objects.map((object: { clientKey: string }) => object.clientKey)).toEqual(objectInputs.map((object) => object.clientKey));
+    const detail = parseDeclarations((await service.executeTool(token, 'draft_read', {
+      path: BASE_WRITE.path, offset: 0, limit: 1, includeDeclarations: true, declarationObjectKey: 'largeObject2',
+    })).content[0]!.text);
+    expect(detail.summaryOnly).toBeUndefined();
+    expect(detail.objects.map((object: { clientKey: string }) => object.clientKey)).toEqual(['largeObject2']);
+    expect(detail.evidence).toHaveLength(20);
   });
 
   it('修订轮不能删除已登记对象文档来绕过重申门禁', async () => {
@@ -666,6 +936,21 @@ describe('kb_write_doc：写入即拒（错误码复用 kb_* 系列）', () => {
     await expect(service.executeTool(token2, 'kb_write_doc', {
       ...BASE_WRITE, objects: [baseObject], evidenceClaims: [{ ...evidence, readReceiptId: undefined }],
     })).rejects.toMatchObject({ code: 'kb_evidence_unresolved' });
+  });
+
+  it('图片机器描述不可伪装成正文 text_span 证据', async () => {
+    const state = makeBuildState('rej-image-text-span');
+    const token = tokenFor(state);
+    const read = await service.executeTool(token, 'raw_read', { objToken: 'tokA' });
+    const readReceiptId = (read.details as Record<string, unknown>).readReceiptId as string;
+    await expect(service.executeTool(token, 'kb_write_doc', {
+      ...BASE_WRITE, objects: [baseObject],
+      evidenceClaims: [{ objectKey: 'o1', claimKey: 'k',
+        sourceRef: { sourceId: 'tokA', resourceId: 'tokA' },
+        selector: { kind: 'text_span', lineStart: 2, lineEnd: 2 },
+        nature: 'machine_description', readReceiptId }],
+    })).rejects.toMatchObject({ code: 'kb_evidence_unresolved',
+      message: expect.stringContaining('media_region') });
   });
 
   it('exact 片段目标未注册 → kb_include_invalid', async () => {

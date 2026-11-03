@@ -36,9 +36,10 @@ export function projectKnowledgeDocuments(root: string, documents: DocumentRecor
   });
 }
 
-/** 历史表格缺少子表索引时，同时冻结其同名 CSV 附件，避免只构建摘要。 */
+/** 子表索引可能缺失于正常同步记录和历史记录；同名 CSV 附件都必须
+ * 进入来源快照，供 raw_read 与证据门禁读取并在构建期间校验变更。 */
 export function recoveredSourceCsvPaths(root: string, doc: DocumentRecord | undefined, mapped: string[]): string[] {
-  if (!doc?.recoveredLocalVersion || !doc.localRelPath || !['sheet', 'bitable'].includes(doc.objType)) return mapped;
+  if (!doc?.localRelPath || !['sheet', 'bitable'].includes(doc.objType)) return mapped;
   const rel = doc.localRelPath.replace(/\\/g, '/');
   const csvDir = path.posix.join(path.posix.dirname(rel), `${path.posix.basename(rel).replace(/\.md$/i, '')}.csv-data`);
   const state = localPathState(root, csvDir, 'directory');

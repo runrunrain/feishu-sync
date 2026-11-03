@@ -96,20 +96,19 @@ describe('F14：冻结 skill 示例契约检查（schema + 调用者工具面）
           allErrors.push(`${file}: JSON 解析失败 ${String(error)}`);
           continue;
         }
-        const call = parsed as { tool?: string; arguments?: { server?: string; tool?: string; arguments?: Record<string, unknown> } };
+        const call = parsed as { server?: string; tool?: string; arguments?: Record<string, unknown> };
         if (!call?.tool || !call.arguments || typeof call.arguments !== 'object') {
           allErrors.push(`${file}: 非工具调用结构的 json 块需单独说明：${block.slice(0, 80)}`);
           continue;
         }
         exampleCount += 1;
-        if (call.tool === 'mcp_call') {
-          // 子任务路径：mcp_call 外壳 → 桥接 server + 子任务真实工具面
-          const args = call.arguments as { server?: string; tool?: string; arguments?: Record<string, unknown> };
-          if (args.server !== BUILD_MCP_SERVER_NAME) {
-            allErrors.push(`${file}: server 名 ${String(args.server)} ≠ ${BUILD_MCP_SERVER_NAME}`);
+        if (call.server !== undefined) {
+          // 文档代码块就是 mcp_call 的参数对象；不包含外层原生工具名。
+          if (call.server !== BUILD_MCP_SERVER_NAME) {
+            allErrors.push(`${file}: server 名 ${String(call.server)} ≠ ${BUILD_MCP_SERVER_NAME}`);
             continue;
           }
-          const inner = String(args.tool);
+          const inner = call.tool;
           if (!(V2_CHILD_ALL_TOOLS as readonly string[]).includes(inner)) {
             allErrors.push(`${file}: mcp_call 内层工具 ${inner} 不在子任务桥真实工具面（V2_CHILD_ALL_TOOLS）——子任务不可达`);
             continue;
@@ -119,7 +118,7 @@ describe('F14：冻结 skill 示例契约检查（schema + 调用者工具面）
             allErrors.push(`${file}: 工具 ${inner} 未注册（不在 tool-specs）`);
             continue;
           }
-          allErrors.push(...validateAgainstSchema(args.arguments ?? {}, spec.parameters as JsonSchemaLike, `${file}:${inner}`));
+          allErrors.push(...validateAgainstSchema(call.arguments, spec.parameters as JsonSchemaLike, `${file}:${inner}`));
         } else {
           // Leader 路径：原生直接调用 → 外层工具必须在真实生产 Leader 白名单
           if (!(LEADER_TOOL_WHITELIST as readonly string[]).includes(call.tool)) {
@@ -139,24 +138,36 @@ describe('F14：冻结 skill 示例契约检查（schema + 调用者工具面）
     expect(allErrors).toEqual([]);
   });
 
-  it('关键工具示例覆盖：write 带 title、review 用 conclusion/coverage、交接用 artifactRefs/nextInfo', () => {
+  it('关键工具示例覆盖：write 使用服务端补全的紧凑声明、review 与交接保留语义字段', () => {
     const examples = extractJsonBlocks(fs.readFileSync(path.join(skillsDir, 'mcp-examples.md'), 'utf8'))
-      .map((block) => JSON.parse(block) as { tool: string; arguments: { tool?: string; arguments?: Record<string, unknown> } | Record<string, unknown> })
-      .filter((call) => call.tool === 'mcp_call');
+      .map((block) => JSON.parse(block) as { server?: string; tool: string; arguments: Record<string, unknown> })
+      .filter((call) => call.server === BUILD_MCP_SERVER_NAME);
     const innerArgs = (tool: string): Record<string, unknown> | undefined =>
-      examples.map((call) => (call.arguments as { tool?: string; arguments?: Record<string, unknown> }))
-        .find((args) => args.tool === tool)?.arguments;
+      examples.find((call) => call.tool === tool)?.arguments;
     const write = innerArgs('kb_write_doc');
-    expect(write).toMatchObject({ title: '行动规则', operationId: expect.any(String) });
+    expect(write).toMatchObject({
+      path: '规则/行动.md', markdown: expect.any(String), sources: expect.any(Array), summary: expect.any(String),
+      objects: [expect.objectContaining({ familyKey: expect.any(String), scopeText: expect.any(String) })],
+      evidenceClaims: [expect.objectContaining({ selector: expect.any(Object) })],
+      coverageUpdates: [expect.objectContaining({ disposition: 'mapped', targetKeys: expect.any(Array) })],
+    });
+    expect(write).not.toHaveProperty('title');
+    expect(write).not.toHaveProperty('operationId');
+    expect(innerArgs('kb_tool_schema')).toEqual({ name: 'kb_edit_doc' });
+    expect(innerArgs('kb_edit_doc')).toMatchObject({
+      path: '规则/行动.md', expectedContentHash: expect.any(String),
+      patches: [expect.objectContaining({ anchor: { kind: 'exact_text', oldText: expect.any(String) }, newText: expect.any(String) })],
+    });
     const review = innerArgs('kb_submit_review');
     expect(review).toMatchObject({
-      operationId: expect.any(String),
       conclusion: expect.stringMatching(/^(pass|needs_revision|insufficient_material|fail)$/),
       coverage: { sourceRefs: expect.any(Array) },
       issues: expect.any(Array),
     });
+    expect(review).not.toHaveProperty('operationId');
     const handoff = innerArgs('build_handoff_submit');
-    expect(handoff).toMatchObject({ operationId: expect.any(String), summary: expect.any(String), artifactRefs: expect.any(Array), nextInfo: expect.any(Array) });
+    expect(handoff).toMatchObject({ summary: expect.any(String), artifactRefs: expect.any(Array), nextInfo: expect.any(Array) });
+    expect(handoff).not.toHaveProperty('operationId');
   });
 
   it('F14-R1：Leader 示例为直接工具调用且全部在真实生产 Leader 白名单内（不投 mcp_call 权限）', () => {

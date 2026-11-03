@@ -249,6 +249,13 @@ export function guardTaskSubmit(
     ? sha256(args.task)
     : typeof args.taskFile === 'string' ? sha256(`taskFile:${args.taskFile}`) : null;
 
+  // 创建回执携带原生 taskId；wait 模式直到子任务终态才返回，期间身份始终
+  // pending，应用只能下发只读 MCP 面。构建必须先拿句柄并确认身份。
+  if (args.delivery !== 'handle') {
+    changes.push(`delivery ${String(args.delivery ?? '(缺省)')} → handle（先登记任务身份）`);
+    args.delivery = 'handle';
+  }
+
   // 4. workspace 固定
   const workspace = (args.workspace && typeof args.workspace === 'object' ? { ...(args.workspace as Record<string, unknown>) } : {});
   if (workspace.cwd !== undefined && workspace.cwd !== config.workDir) changes.push(`workspace.cwd ${String(workspace.cwd)} → ${config.workDir}`);
@@ -342,6 +349,10 @@ export function guardTaskResume(
   };
   if (typeof args.handle !== 'string' || !args.handle) {
     return { decision: 'block', code: 'dispatch_resume_handle_missing', message: 'task_resume 缺少 handle', audit };
+  }
+  if (args.delivery !== 'handle') {
+    changes.push(`delivery ${String(args.delivery ?? '(缺省)')} → handle（先登记续接身份）`);
+    args.delivery = 'handle';
   }
   if (args.model !== undefined) {
     const requested = String(args.model);

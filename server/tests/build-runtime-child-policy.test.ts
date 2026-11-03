@@ -130,6 +130,8 @@ describe('child-policy 扩展行为', () => {
   const prevRoots = process.env.PI_BUILD_CHILD_ROOTS_JSON;
   const hadCwd = Object.prototype.hasOwnProperty.call(process.env, 'AMAGI_PERMISSION_CWD');
   const prevCwd = process.env.AMAGI_PERMISSION_CWD;
+  const hadSkill = Object.prototype.hasOwnProperty.call(process.env, 'PI_BUILD_WORKFLOW_SKILL_PATH');
+  const prevSkill = process.env.PI_BUILD_WORKFLOW_SKILL_PATH;
   afterAll(() => {
     if (hadTaskId) process.env.AMAGI_TASK_ID = prevTaskId;
     else delete process.env.AMAGI_TASK_ID;
@@ -137,6 +139,8 @@ describe('child-policy 扩展行为', () => {
     else delete process.env.PI_BUILD_CHILD_ROOTS_JSON;
     if (hadCwd) process.env.AMAGI_PERMISSION_CWD = prevCwd;
     else delete process.env.AMAGI_PERMISSION_CWD;
+    if (hadSkill) process.env.PI_BUILD_WORKFLOW_SKILL_PATH = prevSkill;
+    else delete process.env.PI_BUILD_WORKFLOW_SKILL_PATH;
   });
 
   it('无 AMAGI_TASK_ID：工厂零注册（非 amagi 子任务零行为）', async () => {
@@ -145,6 +149,31 @@ describe('child-policy 扩展行为', () => {
     const fake = makeFakePi();
     mod.default(fake.pi);
     expect(fake.registeredEvents()).toEqual([]);
+  });
+
+  it('子任务未实际读取冻结技能前不能提交正文，成功读取后可调用桥接', async () => {
+    process.env.AMAGI_TASK_ID = 'unit-protocol-read';
+    const root = tmpRoot();
+    const skillDir = path.join(root, 'skills', 'knowledge-build');
+    fs.mkdirSync(skillDir, { recursive: true });
+    const skillPath = path.join(skillDir, 'SKILL.md');
+    fs.writeFileSync(skillPath, '---\nname: knowledge-build\ndescription: 构建协议\n---\n');
+    process.env.PI_BUILD_WORKFLOW_SKILL_PATH = skillPath;
+    process.env.PI_BUILD_CHILD_ROOTS_JSON = JSON.stringify({ readRoots: [skillDir], writeRoots: [path.join(root, 'agent-outputs')] });
+    const mod = await loadPolicyModule();
+    const fake = makeFakePi();
+    mod.default(fake.pi);
+    const sections: Record<string, string> = {};
+    await fake.emit('before_agent_start', { systemPromptOptions: { sections } });
+    expect(sections.feishu_build_child_protocol).toContain(skillPath);
+    const write = { toolName: 'mcp_call', input: { tool: 'kb_write_doc', arguments: {} } };
+    expect(await fake.emit('tool_call', write)).toMatchObject({ block: true, reason: expect.stringContaining('构建协议未读取') });
+    expect(await fake.emit('tool_call', { toolName: 'mcp_call', input: { tool: 'raw_read' } })).toBeUndefined();
+    expect(await fake.emit('tool_call', { toolName: 'read', input: { path: skillPath } })).toBeUndefined();
+    await fake.emit('tool_result', { toolName: 'read', input: { path: skillPath }, isError: true });
+    expect(await fake.emit('tool_call', write)).toMatchObject({ block: true });
+    await fake.emit('tool_result', { toolName: 'read', input: { path: skillPath }, isError: false });
+    expect(await fake.emit('tool_call', write)).toBeUndefined();
   });
 
   it('多锚点面过滤：session_start/before_agent_start/turn_start/turn_end/agent_end/tool_result/message_end/message_start 均重放', async () => {

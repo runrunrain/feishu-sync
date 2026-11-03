@@ -527,13 +527,24 @@ export interface KbBuildRuntimeStatusDto {
     piVersion: string | null;
   } | null;
   amagi: {
-    /** 服务端固定的目标版本（npm 固定版本号；安装由服务端控制）。 */
+    /** 服务端固定的目标版本（构建专用；与全局/应用安装无关）。 */
     pinnedVersion: string;
     installed: boolean;
     version: string | null;
     installDir: string | null;
     contentHash: string | null;
     layout: string | null;
+    /** 私有安装事实（installed=已装可校；missing=未装；broken=目录/记录损坏）。 */
+    installState: 'installed' | 'missing' | 'broken';
+    installDetail: string | null;
+    /** 官方 Git 默认安装来源（未安装时的确定来源）。 */
+    gitSource: string;
+    commit: string;
+    repoUrl: string;
+    /** 只读发现的 amagi-pi 候选（全局 Pi home / 应用 pi-home）。 */
+    candidates: KbAmagiCandidateDto[];
+    /** 发现异常（unavailable/error 不代表未安装，单独表达）。 */
+    discoveryIssues: KbAmagiDiscoveryIssueDto[];
   } | null;
   probe: {
     /** 静态检查全部 pass（无 fail）才为 true；warn 不阻断。 */
@@ -546,13 +557,35 @@ export interface KbBuildRuntimeStatusDto {
   error: string | null;
 }
 
-/** POST /api/kb/build-runtime/install 响应（sourceDir 可选本地可信包源绝对路径）。 */
+/** 只读发现的单个 amagi-pi 候选（其他 Pi home 里真实存在的安装）。 */
+export interface KbAmagiCandidateDto {
+  origin: 'global-pi-home' | 'app-pi-home';
+  source: string;
+  sourceType: 'npm' | 'git' | 'local';
+  packagePath: string | null;
+  version: string | null;
+  matchesPin: boolean;
+}
+
+/** 单个 Pi home 的发现异常状态。 */
+export interface KbAmagiDiscoveryIssueDto {
+  origin: 'global-pi-home' | 'app-pi-home';
+  status: 'unavailable' | 'error';
+  detail: string | null;
+  settingsErrors: Array<{ scope: string; path: string | null; message: string }>;
+}
+
+/** POST /api/kb/build-runtime/install 响应（sourceDir 可选本地可信包源绝对路径；
+ * 缺省走官方 Git 固定 commit 获取链；已装则完整校验复用 fresh=false）。 */
 export interface KbBuildRuntimeInstallResultDto {
   installed: boolean;
   fresh: boolean;
   version: string;
   installDir: string;
   contentHash: string;
+  layout: string | null;
+  dependenciesIncluded: boolean;
+  acquisition?: { gitSource: string; commit: string; repoUrl: string; acquiredPackageRoot: string };
 }
 
 /** §9.5 GET /api/kb/mcp */

@@ -48,6 +48,9 @@ const extensionCount = copyDir(extensionSrc, path.join(distRoot, 'agent', 'pi-ex
 fs.copyFileSync(path.join(srcRoot, 'agent', 'claude-bridge.cjs'), path.join(distRoot, 'agent', 'claude-bridge.cjs'));
 console.info(`[build-agent-assets] copied ${promptCount} prompt file(s), ${extensionCount} extension file(s)`);
 
+// 固定 amagi Git commit 的本地修复补丁由安装器校验 SHA-256 后应用。
+copyDir(path.join(serverRoot, 'patches'), path.join(distRoot, 'patches'));
+
 // S6 任务编排：角色卡（server/src/agent/roles/*.md → dist/agent/roles）。
 // RoleRegistry 从 dist 读取（开发态 tsx 回退 src）；缺目录时 0 张并告警。
 const rolesSrc = path.join(srcRoot, 'agent', 'roles');

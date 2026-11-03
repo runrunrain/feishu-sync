@@ -6,7 +6,7 @@ afterEach(() => vi.unstubAllGlobals());
 it('断点继续使用独立确认并提供历史日志读取', async () => {
   const fetchMock = vi.fn(async () => new Response('{}')); vi.stubGlobal('fetch', fetchMock);
   await resumeKbBuild('build /one'); await getKbBuildLogs('build /one');
-  expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/kb/builds/build%20%2Fone/resume', expect.objectContaining({ method: 'POST', body: '{"confirm":"RESUME"}' }));
+  expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/kb/builds/build%20%2Fone/resume', expect.objectContaining({ method: 'POST', body: '{"confirm":"RESUME","resumeStrategy":"rebuild"}' }));
   expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/kb/builds/build%20%2Fone/logs', expect.any(Object));
 });
 

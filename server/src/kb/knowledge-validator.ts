@@ -93,6 +93,8 @@ export interface GateSidecarInput {
 
 export interface KnowledgeGateInput {
   compiled: KnowledgeCompileResult;
+  /** 本次写入的草稿路径；继承旧版文档沿用旧版证据语义。 */
+  draftDocPaths?: ReadonlySet<string>;
   /** candidate.json 反序列化结果；无知识声明验收记录时为 null（→ blocking） */
   candidate: CandidateRelease | null;
   /** 全量报告池（canPublish 同源） */
@@ -423,7 +425,21 @@ function checkEvidence(input: KnowledgeGateInput): ValidationIssue[] {
   if (input.compiled.knowledge.evidence.length === 0) return issues;
   const resourcePacks = new Map<string, EvidenceResource[]>();
   const receipts = input.receipts ?? [];
+  const draftedObjectPaths = new Map(input.compiled.knowledge.objects
+    .filter((object) => object.canonical)
+    .map((object) => [object.objectId, object.canonical!.path]));
   for (const evidence of input.compiled.knowledge.evidence) {
+    if (input.draftDocPaths?.has(draftedObjectPaths.get(evidence.objectId) ?? '')) {
+      const isImageEvidence = evidence.selector.kind === 'media_region';
+      if ((isImageEvidence && evidence.nature !== 'machine_description')
+          || (!isImageEvidence && evidence.nature === 'machine_description')) {
+        issues.push({
+          code: 'kb_evidence_unresolved', field: 'nature',
+          message: `新草稿证据性质与资源类型不符：${evidence.evidenceId}（图片描述须使用 media_region + machine_description；正文/表格不能标机器图片描述）`,
+          severity: 'blocking', objectId: evidence.objectId,
+        });
+      }
+    }
     let pack = input.resourcePacks?.get(evidence.sourceRef.sourceId) ?? resourcePacks.get(evidence.sourceRef.sourceId);
     if (!pack) {
       const entry = input.snapshot.get(evidence.sourceRef.sourceId);

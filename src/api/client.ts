@@ -1192,9 +1192,9 @@ export async function cancelKbBuild(id: string): Promise<KbBuildDto> {
   });
 }
 
-export async function resumeKbBuild(id: string): Promise<KbBuildDto> {
+export async function resumeKbBuild(id: string, resumeStrategy: 'session' | 'rebuild' = 'rebuild'): Promise<KbBuildDto> {
   return request<KbBuildDto>(`/api/kb/builds/${encodeURIComponent(id)}/resume`, {
-    method: 'POST', body: JSON.stringify({ confirm: 'RESUME' }),
+    method: 'POST', body: JSON.stringify({ confirm: 'RESUME', resumeStrategy }),
   });
 }
 

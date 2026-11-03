@@ -174,6 +174,8 @@ export class PiRpcProcess extends EventEmitter {
     lastErrorText: string | null;
     settled: boolean;
     aborting: boolean;
+    timeoutMs: number;
+    toolRunning: number;
     timeoutTimer?: NodeJS.Timeout;
     finished: boolean;
   } | null = null;
@@ -422,6 +424,18 @@ export class PiRpcProcess extends EventEmitter {
   private handleSessionEvent(event: RpcEventPayload): void {
     this.emit('event', event);
     const run = this.activeRun;
+    if (run && !run.finished) {
+      if (event.type === 'tool_execution_start') {
+        run.toolRunning += 1;
+        if (run.timeoutTimer) clearTimeout(run.timeoutTimer);
+        run.timeoutTimer = undefined;
+      } else if (event.type === 'tool_execution_end') {
+        run.toolRunning = Math.max(0, run.toolRunning - 1);
+        if (run.toolRunning === 0) this.armRunTimeout(run);
+      } else if (run.toolRunning === 0 && (event.type === 'message_update' || event.type === 'message_end')) {
+        this.armRunTimeout(run);
+      }
+    }
     // 自触发轮次跟踪（构建模式）：无宿主 run 时看到轮次活动即标记一轮开始。
     if (this.options.selfTriggeredRounds && (!run || run.finished)) {
       if ((event.type === 'message_update' || event.type === 'tool_execution_start' || event.type === 'message_end')
@@ -589,6 +603,7 @@ export class PiRpcProcess extends EventEmitter {
     const payload: Record<string, unknown> = { message };
     if (options.streamingBehavior) payload.streamingBehavior = options.streamingBehavior;
 
+    const timeoutMs = options.timeoutMs ?? this.options.promptTimeoutMs ?? DEFAULT_PROMPT_TIMEOUT_MS;
     const outcomePromise = new Promise<RunOutcome>((resolve) => {
       this.activeRun = {
         runId,
@@ -601,22 +616,15 @@ export class PiRpcProcess extends EventEmitter {
         lastErrorText: null,
         settled: false,
         aborting: false,
+        timeoutMs,
+        toolRunning: 0,
         finished: false,
       };
     });
+    if (this.options.selfTriggeredRounds) this.emit('round_started', { roundId: runId, trigger: 'host-prompt' });
     // 命令本身的 response（success:false）走 handleResponseForRun 立即结束运行。
-    const timeoutMs = options.timeoutMs ?? this.options.promptTimeoutMs ?? DEFAULT_PROMPT_TIMEOUT_MS;
     const run = this.activeRun!;
-    run.timeoutTimer = setTimeout(() => {
-      if (run.finished) return;
-      run.aborting = true;
-      this.sendCommand('abort', {}).catch(() => undefined);
-      this.finishActiveRun({
-        outcome: 'failed',
-        error: { code: 'model_timeout', message: `模型响应超时（${Math.round(timeoutMs / 1000)}s）` },
-      });
-    }, timeoutMs);
-    run.timeoutTimer.unref?.();
+    this.armRunTimeout(run);
 
     // 管道可能在 prompt 的确认帧之前关闭；命令拒绝也统一结算为运行失败，
     // 不留下独立的 rejected promise 或等待已经退出的进程。
@@ -666,6 +674,22 @@ export class PiRpcProcess extends EventEmitter {
     }
   }
 
+  /** 模型静默窗口；工具执行（尤其 task_control wait）不消耗模型超时。 */
+  private armRunTimeout(run: NonNullable<PiRpcProcess['activeRun']>): void {
+    if (run.timeoutTimer) clearTimeout(run.timeoutTimer);
+    if (run.finished || run.toolRunning > 0) return;
+    run.timeoutTimer = setTimeout(() => {
+      if (run.finished || run.toolRunning > 0) return;
+      run.aborting = true;
+      this.sendCommand('abort', {}).catch(() => undefined);
+      this.finishActiveRun({
+        outcome: 'failed',
+        error: { code: 'model_timeout', message: `模型响应超时（${Math.round(run.timeoutMs / 1000)}s 无模型活动）` },
+      });
+    }, run.timeoutMs);
+    run.timeoutTimer.unref?.();
+  }
+
   private finishActiveRun(partial: Omit<RunOutcome, 'lastAssistantText'> & { lastAssistantText?: string }): void {
     const run = this.activeRun;
     if (!run || run.finished) return;
@@ -686,6 +710,7 @@ export class PiRpcProcess extends EventEmitter {
         : {}),
     };
     this.activeRun = null;
+    if (this.options.selfTriggeredRounds) this.emit('round_settled', { roundId: run.runId, aborted: outcome.outcome === 'aborted' });
     run.resolve(outcome);
     this.emit('run_finished', outcome);
   }

@@ -136,6 +136,26 @@ afterAll(() => {
   fs.rmSync(outputRoot, { recursive: true, force: true });
 });
 
+describe('v2 紧凑写入的服务端幂等键', () => {
+  it('省略 operationId 的同载荷重放不推进修订，改正文生成新操作', async () => {
+    const setup = makeV2('compact-auto-operation');
+    setup.store.registerTaskCreation({ nativeTaskId: 'w1', requestedRole: 'luban' });
+    setup.store.assignOutputs({ targets: ['x.md'], ownerTaskId: 'w1' });
+    const args = {
+      path: 'x.md', markdown: '## 规则\n正文', sources: ['tok'], summary: '规则说明',
+      objects: [{ clientKey: 'rule', type: 'rule', title: '规则', familyKey: 'rule', scopeText: '本文规则', headingPath: ['规则'] }],
+    };
+    const first = await call(setup.child.token, 'kb_write_doc', args, meta('w1'));
+    expect((first.details as Record<string, unknown>).draftRevision).toBe(1);
+    const replay = await call(setup.child.token, 'kb_write_doc', args, meta('w1'));
+    expect((replay.details as Record<string, unknown>).idempotentReplay).toBe(true);
+    expect((replay.details as Record<string, unknown>).draftRevision).toBe(1);
+    const changed = await call(setup.child.token, 'kb_write_doc', { ...args, markdown: '## 规则\n修订正文' }, meta('w1'));
+    expect((changed.details as Record<string, unknown>).draftRevision).toBe(2);
+    expect(setup.store.listReceipts().filter((receipt) => receipt.kind === 'write_doc')).toHaveLength(2);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // F01：生产 revokeToken（非 store.revokeActor 替身）必须使在途写入失效
 // ---------------------------------------------------------------------------
@@ -197,6 +217,15 @@ describe('F01 撤销租约：已持 ctx 的在途写入在最终落盘前失效'
 // F03：对象声明影响面授权（对象/族/旧 canonical 路径）；合法迁移仍可用
 // ---------------------------------------------------------------------------
 describe('F03 对象影响面授权与 family 归一化', () => {
+  it('Leader 材料清单给出同源现有文档路径，重建时可沿用原路径', async () => {
+    const { leader, state } = makeV2('manifest-existing-path');
+    const doc = path.join(state.stagingRoot, 'docs', '系统框架', '旧主题.md');
+    fs.mkdirSync(path.dirname(doc), { recursive: true });
+    fs.writeFileSync(doc, '<!--\nfeishu_sync_kb:\n  doc_id: kd_existing\n  sources:\n    - tok\n  build_id: old\n-->\n# 旧主题\n正文\n');
+    const result = await call(leader.token, 'build_manifest', { limit: 50 });
+    const payload = JSON.parse(result.content[0]!.text!) as { entries: Array<{ objToken: string; existingDocPaths: string[] }> };
+    expect(payload.entries.find((entry) => entry.objToken === 'tok')?.existingDocPaths).toEqual(['系统框架/旧主题.md']);
+  });
   async function seedAuthorA(setup: V2Setup): Promise<string> {
     setup.store.registerTaskCreation({ nativeTaskId: 'a', requestedRole: 'luban' });
     setup.store.registerTaskCreation({ nativeTaskId: 'b', requestedRole: 'luban' });
@@ -290,6 +319,14 @@ describe('F03 对象影响面授权与 family 归一化', () => {
     // 同 owner 重复分配同族 = 幂等更新（不冲突）
     const again = await call(setup.leader.token, 'build_assign_output', { ownerTaskId: 'a', targets: ['family:foo'] });
     expect(again.details!.targetKind).toBe('family');
+  });
+
+  it('文档分配拒绝目录前缀，避免作者持有无效目标后一直写入失败', async () => {
+    const setup = makeV2('doc-path-assignment');
+    setup.store.registerTaskCreation({ nativeTaskId: 'a', requestedRole: 'luban' });
+    await expectToolError(() => call(setup.leader.token, 'build_assign_output', { ownerTaskId: 'a', targets: ['系统框架/'] }), 'invalid_request');
+    const assigned = await call(setup.leader.token, 'build_assign_output', { ownerTaskId: 'a', targets: ['系统框架/回合世界规则.md'] });
+    expect(assigned.details!.targets).toEqual(['系统框架/回合世界规则.md']);
   });
 
   it('旧模式（无 orchestration）不设防：跨路径对象迁移机制原样可用', async () => {

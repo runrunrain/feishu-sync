@@ -236,6 +236,7 @@ function gatesOf(options: {
   reviews?: ReviewReport[];
   sidecars?: GateSidecarInput | false;
   previousObjectIds?: string[];
+  draftEvidenceScopePaths?: string[];
 } = {}) {
   const snap = snapshot();
   const draft = options.draft ?? happyDraft();
@@ -253,6 +254,8 @@ function gatesOf(options: {
   });
   return runKnowledgeGates({
     compiled,
+    draftDocPaths: new Set(options.draftEvidenceScopePaths ?? Object.entries(draft.docs)
+      .filter(([, entry]) => entry.basis === 'draft').map(([docPath]) => docPath)),
     candidate: options.candidate === undefined ? candidateOf(draft) : options.candidate,
     reviews: options.reviews ?? reviewPool(),
     snapshot: snap,
@@ -422,6 +425,19 @@ describe('diting F02/F07：坐标基准与围栏状态机', () => {
 // ---------------------------------------------------------------------------
 
 describe('门禁：runKnowledgeGates', () => {
+  it('新草稿把正文范围冒充图片机器描述时阻止发布，继承文档仍可保留旧证据', () => {
+    const invalid = happyDraft((draft) => {
+      draft.docs['damage.md']!.basis = 'draft';
+      draft.evidence[0]!.nature = 'machine_description';
+    });
+    expect(gatesOf({ draft: invalid }).blocking).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'kb_evidence_unresolved', field: 'nature' }),
+    ]));
+    expect(gatesOf({ draft: invalid, draftEvidenceScopePaths: ['units/unit.md'] }).blocking
+      .some((issue) => issue.field === 'nature')).toBe(false);
+    invalid.docs['damage.md']!.basis = 'published';
+    expect(gatesOf({ draft: invalid }).blocking.some((issue) => issue.field === 'nature')).toBe(false);
+  });
   it('合法全链路零 blocking（结构 + 链接 + 凭据 + sidecar + 证据重解引用）', () => {
     const gates = gatesOf();
     expect(gates.blocking).toEqual([]);

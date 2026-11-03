@@ -75,8 +75,39 @@ export function selectPublishedDoc(nodes: KbTreeNode[], previous: string | null)
   return previous && contains(nodes) ? previous : firstDocId(nodes);
 }
 
+/** Resolve a Markdown link inside the published library, without constructing
+ * a file:// URL relative to Electron's app.asar page. */
+export function resolveKnowledgeDocPath(currentPath: string, href: string): string | null {
+  const rawPath = href.split(/[?#]/, 1)[0] ?? '';
+  if (!rawPath) return href.startsWith('#') ? currentPath : null;
+  if (rawPath.startsWith('/') || rawPath.includes('\\')) return null;
+  let decoded: string;
+  try { decoded = decodeURIComponent(rawPath); } catch { return null; }
+  if (decoded.startsWith('/') || decoded.includes('\\')) return null;
+  const parts = currentPath.split('/').slice(0, -1);
+  for (const part of decoded.split('/')) {
+    if (!part || part === '.') continue;
+    if (part === '..') {
+      if (parts.length === 0) return null;
+      parts.pop();
+    } else parts.push(part);
+  }
+  return parts.join('/');
+}
+
+function publishedDocIdAtPath(nodes: KbTreeNode[], targetPath: string): string | null {
+  for (const node of nodes) {
+    if (node.type === 'doc' && node.path === targetPath) return node.docId ?? null;
+    if (node.children) {
+      const found = publishedDocIdAtPath(node.children, targetPath);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
 export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublishSettings }: KnowledgeViewProps) {
-  const toast = useToast();
+  const { push: pushToast } = useToast();
   const { preferences, updatePreferences, storageUnavailable } = useKbReadingPreferences();
   const agent = useAgentStatus(active);
 
@@ -116,6 +147,8 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
   const [publicationsLoading, setPublicationsLoading] = useState(false);
   const [publishModal, setPublishModal] = useState<{ open: boolean; tab: KbPublishModalTab }>({ open: false, tab: 'publish' });
   const docReqSeq = useRef(0);
+  const readingBodyRef = useRef<HTMLDivElement>(null);
+  const pendingDocAnchor = useRef<{ path: string; anchor: string } | null>(null);
   const buildConnRef = useRef<SseConnection | null>(null);
   const logSeq = useRef(0);
 
@@ -156,13 +189,13 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
         setTree(null); // 未发布：正常空状态
       } else {
         setTree(null);
-        toast.push({ type: 'warning', message: '标准库目录加载失败', hint: String(err) });
+        pushToast({ type: 'warning', message: '标准库目录加载失败', hint: String(err) });
       }
       return null;
     } finally {
       setTreeLoading(false);
     }
-  }, [toast]);
+  }, [pushToast]);
 
   // ---- 反向发布记录（P1-S9：树/详情徽标 + 发布历史数据面） ---------------
   const loadPublications = useCallback(async () => {
@@ -196,12 +229,9 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
     const status = await loadStatus();
     if (status?.current) {
       const nextTree = await loadTree();
-      if (nextTree && !selectedDocId) {
-        const first = firstDocId(nextTree.nodes);
-        if (first) setSelectedDocId(first);
-      }
+      if (nextTree) setSelectedDocId((previous) => selectPublishedDoc(nextTree.nodes, previous));
     }
-  }, [loadStatus, loadTree, selectedDocId]);
+  }, [loadStatus, loadTree]);
 
   // 每次发布换树都复核选择；同一docId也可能有新正文。
   useEffect(() => {
@@ -259,9 +289,9 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
             if (TERMINAL_BUILD.has(next.status)) {
               if (next.status === 'published') {
                 if (next.noChanges) {
-                  toast.push({ type: 'info', message: '原始库无变更，未生成新发布' });
+                  pushToast({ type: 'info', message: '原始库无变更，未生成新发布' });
                 } else {
-                  toast.push({ type: 'success', message: `标准库已发布：${next.releaseId ?? ''}` });
+                  pushToast({ type: 'success', message: `标准库已发布：${next.releaseId ?? ''}` });
                 }
                 void refreshPublished();
               }
@@ -276,6 +306,10 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
           }
           case 'build_log':
             appendLog(payload?.level ?? 'info', String(payload?.message ?? ''), payload?.at, m.id ? Number(m.id) : undefined);
+            break;
+          case 'build_progressive_published':
+            pushToast({ type: 'success', message: `${Array.isArray(payload?.paths) ? payload.paths.length : 0} 篇文档已进入正式标准库，其余继续构建` });
+            void refreshPublished();
             break;
           case 'tool':
             appendLog(
@@ -298,7 +332,7 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
       connection.stop();
       if (buildConnRef.current === connection) buildConnRef.current = null;
     };
-  }, [active, buildId, appendLog, refreshPublished, toast]);
+  }, [active, buildId, appendLog, refreshPublished, pushToast]);
 
   // ---- 构建动作 -----------------------------------------------------------
   const startBuild = useCallback(
@@ -315,7 +349,7 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
         if (dto.status === 'published') {
           // 立即终态（如 no_changes 直接 published）。
           if (dto.noChanges) {
-            toast.push({ type: 'info', message: '原始库无变更，未生成新发布' });
+            pushToast({ type: 'info', message: '原始库无变更，未生成新发布' });
           }
           void refreshPublished();
         }
@@ -325,22 +359,22 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
         if (err instanceof APIError) {
           const code = (err.response as { error?: string } | undefined)?.error;
           if (code === 'agent_not_ready') {
-            toast.push({ type: 'warning', message: `Agent 未就绪：${err.message}` });
+            pushToast({ type: 'warning', message: `Agent 未就绪：${err.message}` });
             agent.refresh();
           } else if (code === 'kb_build_running') {
-            toast.push({ type: 'warning', message: '已有构建正在进行' });
+            pushToast({ type: 'warning', message: '已有构建正在进行' });
             void loadStatus();
           } else {
-            toast.push({ type: 'error', message: `构建启动失败：${err.message}` });
+            pushToast({ type: 'error', message: `构建启动失败：${err.message}` });
           }
         } else {
-          toast.push({ type: 'error', message: '构建启动失败' });
+          pushToast({ type: 'error', message: '构建启动失败' });
         }
       } finally {
         setStarting(false);
       }
     },
-    [agent, loadStatus, refreshPublished, toast],
+    [agent, loadStatus, refreshPublished, pushToast],
   );
 
   const cancelBuild = useCallback(async () => {
@@ -349,13 +383,13 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
     try {
       const dto = await cancelKbBuild(build.id);
       setBuild(dto);
-      toast.push({ type: 'info', message: '已请求取消，等待构建停止' });
+      pushToast({ type: 'info', message: '已请求取消，等待构建停止' });
     } catch (err) {
-      toast.push({ type: 'error', message: err instanceof APIError ? err.message : '取消失败' });
+      pushToast({ type: 'error', message: err instanceof APIError ? err.message : '取消失败' });
     } finally {
       setCancelling(false);
     }
-  }, [build, toast]);
+  }, [build, pushToast]);
 
   const continueBuild = async () => {
     if (!build) return;
@@ -365,7 +399,7 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
       setBuild(dto); setBuildPane('progress'); setBuildIssues([]); setResumeConfirm(false);
       appendLog('info', '已请求从检查点继续构建');
     } catch (error) {
-      toast.push({ type: 'error', message: error instanceof Error ? error.message : '继续构建失败' });
+      pushToast({ type: 'error', message: error instanceof Error ? error.message : '继续构建失败' });
       const code = error instanceof APIError ? (error.response as { error?: string } | undefined)?.error : null;
       if (code && ['source_changed_during_build', 'kb_resume_stale', 'kb_resume_unavailable'].includes(code)) {
         setResumeConfirm(false);
@@ -430,6 +464,43 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
   const docPublication = doc ? publicationsByPath.get(doc.path) ?? null : null;
   const publishConflictCount = publications.filter((row) => row.state === 'conflict' || row.state === 'unknown').length;
 
+  const scrollToPublishedAnchor = useCallback((anchor: string) => {
+    const target = [...(readingBodyRef.current?.querySelectorAll('[id]') ?? [])].find((element) => element.id === anchor);
+    target?.scrollIntoView({ block: 'start' });
+  }, []);
+  const navigatePublishedLink = useCallback((href: string): boolean => {
+    if (!doc || !tree) return false;
+    const targetPath = resolveKnowledgeDocPath(doc.path, href);
+    if (!targetPath) {
+      pushToast({ type: 'warning', message: '标准库链接路径无效' });
+      return true;
+    }
+    const targetDocId = publishedDocIdAtPath(tree.nodes, targetPath);
+    if (!targetDocId) {
+      pushToast({ type: 'warning', message: `链接目标不在当前标准库：${targetPath}` });
+      return true;
+    }
+    const hash = href.indexOf('#');
+    let anchor = '';
+    if (hash >= 0) {
+      try { anchor = decodeURIComponent(href.slice(hash + 1)); } catch { /* An invalid fragment has no scroll target. */ }
+    }
+    if (targetDocId === selectedDocId) {
+      if (anchor) scrollToPublishedAnchor(anchor);
+    } else {
+      pendingDocAnchor.current = anchor ? { path: targetPath, anchor } : null;
+      setSelectedDocId(targetDocId);
+    }
+    return true;
+  }, [doc, tree, selectedDocId, pushToast, scrollToPublishedAnchor]);
+  useEffect(() => {
+    const pending = pendingDocAnchor.current;
+    if (doc && pending?.path === doc.path) {
+      pendingDocAnchor.current = null;
+      scrollToPublishedAnchor(pending.anchor);
+    }
+  }, [doc, scrollToPublishedAnchor]);
+
   return (
     <div className="relative flex h-full min-h-0 min-w-0 gap-2" data-view="knowledge">
       {directoryOpen ? <aside className="absolute left-0 inset-y-0 z-20 md:static shrink-0 h-full min-h-0 rounded-md border border-line bg-card-bg shadow-lg md:shadow-sm flex flex-col overflow-hidden"
@@ -473,9 +544,9 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
             {Array.from({ length: 10 }).map((_, i) => <div key={i} className="h-3 bg-paper-2 rounded" />)}
           </div> : docError ? <EmptyCard icon={<AlertCircle className="w-8 h-8 text-seal-2" />} title="文档加载失败" description={docError}
             action={<Button size="sm" variant="secondary" onClick={() => { void refreshPublished().then(() => setDocReload((n) => n + 1)); }}>重试</Button>} />
-          : doc ? <div className="flex-1 min-h-0 overflow-auto scrollbar-thin" data-testid="kb-reading-body">
+          : doc ? <div ref={readingBodyRef} className="flex-1 min-h-0 overflow-auto scrollbar-thin" data-testid="kb-reading-body">
             <div className="kb-reading-page" style={{ '--kb-font-size': `${preferences.fontSize}px`, '--kb-line-height': preferences.lineHeight } as CSSProperties}>
-              <MarkdownView variant="reading" content={doc.markdown} baseDir={doc.path.split('/').slice(0, -1).join('/')} remoteImages="confirm" />
+              <MarkdownView variant="reading" content={doc.markdown} baseDir={doc.path.split('/').slice(0, -1).join('/')} onNavigateDoc={navigatePublishedLink} remoteImages="confirm" />
             </div>
           </div> : <EmptyCard icon={<BookOpen className="w-8 h-8 text-ink-faint" />} title="选择文档开始阅读"
             description="通过左侧目录和搜索选择文档。"
@@ -573,7 +644,7 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
           <p>{(build?.recovery?.draftCount ?? 0) === 0 && (build?.recovery?.totalBatches ?? 0) > 0 && (build?.recovery?.completedBatches ?? 0) >= (build?.recovery?.totalBatches ?? 0)
             ? '历史批次没有草稿，将重新执行这些批次，并复用已完成的图片转化结果。'
             : '将跳过已完成批次，保留已写入的完整草稿，继续未完成内容，并复用已完成的图片转化结果。'}</p>
-          <p className="text-xs text-ink-faint">使用当前配置的构建模型继续并消耗模型额度。源文档或标准库版本已变化时需重新构建；失败不会改变当前发布版本。</p>
+          <p className="text-xs text-ink-faint">从已保存成果启动新 Leader，并使用当前工作流规则与构建模型。独立审查通过的文档会逐步进入正式标准库；未通过的文档继续留在候选区。</p>
           <ConfirmActions confirmLabel="继续构建" busy={resuming} onConfirm={continueBuild} onCancel={() => setResumeConfirm(false)} />
         </div>
       </Modal>

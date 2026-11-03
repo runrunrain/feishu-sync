@@ -78,6 +78,42 @@ export function knowledgeDeclarationHash(draft: KnowledgeDraftFile): string {
   return crypto.createHash('sha256').update(stableStringify(semantic), 'utf8').digest('hex');
 }
 
+/** Bind a unit review to the declarations that can affect its documents. A
+ * concurrent writer changing another document must not invalidate this unit. */
+export function scopedKnowledgeDeclarationHash(draft: KnowledgeDraftFile, paths: readonly string[], sourceIds: readonly string[]): string {
+  const scope = new Set(paths);
+  const sources = new Set(sourceIds);
+  const objects = draft.objects.filter((object) => object.canonical && scope.has(object.canonical.path));
+  const ids = new Set(objects.map((object) => object.objectId));
+  const relations = draft.relations.filter((relation) => ids.has(relation.fromObjectId) || ids.has(relation.toObjectId));
+  const evidence = draft.evidence.filter((item) => ids.has(item.objectId));
+  const evidenceIds = new Set(evidence.map((item) => item.evidenceId));
+  const semantic = {
+    schemaVersion: draft.schemaVersion,
+    docs: Object.fromEntries(Object.entries(draft.docs).filter(([docPath]) => scope.has(docPath))),
+    clientKeys: Object.fromEntries(Object.entries(draft.clientKeys).filter(([, id]) => ids.has(id))),
+    evidenceKeys: Object.fromEntries(Object.entries(draft.evidenceKeys).filter(([, id]) => evidenceIds.has(id))),
+    objects: objects.map(stripObjectReviewCredential),
+    presentations: draft.presentations.filter((item) => ids.has(item.ownerObjectId)
+      || (item.targetObjectId !== undefined && ids.has(item.targetObjectId))),
+    relations,
+    evidence,
+    coverage: draft.coverage.filter((item) => sources.has(item.sourceRef.sourceId)
+      && item.targetObjectIds.every((id) => ids.has(id))),
+  };
+  return crypto.createHash('sha256').update(stableStringify(semantic), 'utf8').digest('hex');
+}
+
+export function scopedReviewDeclarationHash(stagingRoot: string, paths: readonly string[], sourceIds: readonly string[]): string | null {
+  try {
+    const file = path.join(stagingRoot, 'knowledge-draft.json');
+    if (!fs.existsSync(file)) return emptyKnowledgeDeclarationHash();
+    const draft = JSON.parse(fs.readFileSync(file, 'utf8')) as KnowledgeDraftFile;
+    if (draft.schemaVersion !== 1) return null;
+    return scopedKnowledgeDeclarationHash(draft, paths, sourceIds);
+  } catch { return null; }
+}
+
 /** 无声明文件时的空声明哈希（形状与 loadKnowledgeDraft 新建空 draft 一致）。 */
 export function emptyKnowledgeDeclarationHash(): string {
   return knowledgeDeclarationHash({
@@ -177,11 +213,19 @@ export function collectAuthorityValidatedReports(input: {
       continue;
     }
     const report = readReport(receipt.reportUnitId);
-    if (!report || report.reportId !== receipt.reportId || report.draftHash !== receipt.draftHash) {
+    if (!report || report.reportId !== receipt.reportId || report.draftHash !== receipt.draftHash
+      || report.conclusion !== receipt.verdict) {
       skipped.push({ reviewId: receipt.reviewId, reviewerTaskId: receipt.reviewerTaskId, reason: 'report_file_binding_mismatch' });
       continue;
     }
-    if (!reviewDependenciesMatch(receipt, input.current)) {
+    const scoped = Array.isArray(receipt.scopePaths) && receipt.scopePaths.length > 0;
+    const declarationHash = scoped
+      ? scopedReviewDeclarationHash(input.stagingRoot, receipt.scopePaths!, report.coverage.sourceRefs)
+      : input.current.declarationHash;
+    const deps = receipt.dependencyHashes ?? {};
+    if (!declarationHash || deps[REVIEW_DEP_DECLARATION] !== declarationHash
+      || deps[REVIEW_DEP_SOURCE_SNAPSHOT] !== input.current.sourceSnapshotHash
+      || !input.current.workflowRulesHash || deps[REVIEW_DEP_WORKFLOW_RULES] !== input.current.workflowRulesHash) {
       skipped.push({ reviewId: receipt.reviewId, reviewerTaskId: receipt.reviewerTaskId, reason: 'dependency_stale' });
       continue;
     }
@@ -198,4 +242,28 @@ export function collectAuthorityValidatedReports(input: {
     }
   }
   return { validReportIds, skipped };
+}
+
+/** Final v2 publication accepts independently reviewed documents. A document
+ * already committed by this build's progressive release can be carried when
+ * its staging hash still matches the committed promotion hash. */
+export function missingScopedPassReviewPaths(input: {
+  writtenPaths: Iterable<string>;
+  documentHashes: ReadonlyMap<string, string>;
+  basePromotionHashes: Readonly<Record<string, string>>;
+  validReportIds: ReadonlySet<string>;
+  receipts: readonly ReviewReceipt[];
+}): string[] {
+  const covered = new Set<string>();
+  for (const receipt of input.receipts) {
+    if (receipt.status !== 'valid' || receipt.verdict !== 'pass' || !receipt.reportId
+      || !input.validReportIds.has(receipt.reportId)) continue;
+    for (const docPath of receipt.scopePaths ?? []) {
+      if (input.documentHashes.get(docPath) === receipt.dependencyHashes?.[`doc:${docPath}`]) covered.add(docPath);
+    }
+  }
+  return [...input.writtenPaths].filter((docPath) => {
+    const hash = input.documentHashes.get(docPath);
+    return hash !== undefined && !covered.has(docPath) && input.basePromotionHashes[docPath] !== hash;
+  });
 }

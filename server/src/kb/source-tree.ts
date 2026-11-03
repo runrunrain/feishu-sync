@@ -17,6 +17,12 @@ function documentFolderKeys(relPath: string): string[] {
   return keys.map((key) => process.platform === 'win32' ? key.toLowerCase() : key);
 }
 
+function parentPathContainsChild(parentPath: string | null | undefined, childPath: string | null | undefined): boolean {
+  if (!parentPath || !childPath) return true;
+  const child = process.platform === 'win32' ? childPath.replace(/\\/g, '/').toLowerCase() : childPath.replace(/\\/g, '/');
+  return documentFolderKeys(parentPath).some((folder) => child.startsWith(`${folder}/`));
+}
+
 /**
  * 无父链的本地源会创建目录节点，真实云文档也可能代表同一目录。
  * 只在路径唯一且两者位于同一层（或文档直接位于该目录内）时合并，
@@ -86,6 +92,17 @@ export function buildSourceTree(documents: DocumentRecord[], choices: KbSourceCh
     while (true) {
       const parent = aliases.get(records.get(token)?.parentNodeToken ?? '');
       if (!parent || seen.has(parent)) break;
+      // A stale wiki parent token can contradict the verified local path. In
+      // that case use the local folder tree; otherwise selecting an unrelated
+      // cloud branch silently includes the wrong source documents.
+      // Recovered historical files can live outside the current mirrored
+      // folder while the wiki parent edge is still authoritative. Compare
+      // only the indexed local paths, not best-effort recovered choice paths.
+      const childPath = records.get(token)?.localRelPath;
+      const parentPath = records.get(parent)?.localRelPath;
+      if (records.get(parent)?.recoveredLocalVersion !== true
+        && records.get(token)?.recoveredLocalVersion !== true
+        && !parentPathContainsChild(parentPath, childPath)) break;
       make(parent); parents.set(token, parent); seen.add(parent); token = parent;
     }
   }

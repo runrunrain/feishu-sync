@@ -97,11 +97,13 @@ describe('runStaticProbes', () => {
     expect(() => assertProbeUsable(report)).toThrow(BuildRuntimeProbeError);
   });
 
-  it('包未安装 → amagi-package fail（明确要求先经 pi CLI 安装）', () => {
+  it('包未安装 → amagi-package fail（提示指向设置卡默认 Git 安装/本地目录，不再指向已知 404 的 npm）', () => {
     const report = runStaticProbes(probeInput(root));
     const check = report.checks.find((c) => c.id === 'amagi-package')!;
     expect(check.state).toBe('fail');
-    expect(check.detail).toContain('pi CLI');
+    expect(check.detail).toContain('构建编排');
+    expect(check.detail).toContain('官方 Git');
+    expect(check.detail).not.toContain('npm:amagi-pi');
     expect(() => assertProbeUsable(report)).toThrow('拒绝启用');
   });
 

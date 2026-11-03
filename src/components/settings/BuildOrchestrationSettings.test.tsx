@@ -27,6 +27,7 @@ import {
   extractConfigFieldErrors,
   orchestrationModeOptions,
   resolveBuildConcurrencyClient,
+  splitInstallErrorMessage,
   validateBuildOrchestrationInput,
 } from './BuildOrchestrationSettings';
 import { APIError } from '../../api/client';
@@ -475,5 +476,203 @@ describe('纯函数', () => {
     expect(extractConfigFieldErrors(withDetails)).toEqual({ 'standardKb.buildRoles.writer': 'standardKb.buildRoles.writer(invalid_type)' });
     expect(extractConfigFieldErrors('无关错误')).toEqual({});
     expect(extractConfigFieldErrors(null)).toEqual({});
+  });
+});
+
+// ---------------------------------------------------------------------------
+// plugin-install-fix：构建固定版本 vs 全局/应用候选的诚实呈现；默认安装来源、
+// 目录选择桥接、错误折叠与刷新清错。splitInstallErrorMessage 导出锚定。
+// ---------------------------------------------------------------------------
+
+describe('plugin-install-fix 安装检测与默认来源', () => {
+  const COMMIT = '929000ecbd8725e72b191493345d6abeef51c147';
+  // 上一 describe 的 makeStatus 是块级作用域；此处独立组一个完整状态工厂。
+  const makeLocalStatus = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    orchestrationMode: 'legacy',
+    runtime: { nodePath: '/usr/local/bin/node', nodeVersion: null, piCliPath: '/usr/local/bin/pi', piVersion: '1.4.0' },
+    probe: { staticOk: true, fullyVerified: false, checks: [] },
+    error: null,
+    ...over,
+  });
+  const amagiBase = (over: Record<string, unknown> = {}) => ({
+    pinnedVersion: '2.21.31', installed: true, version: '2.21.31',
+    installDir: '/data/agent/runtime-packages/amagi-pi@2.21.31', contentHash: 'abc123', layout: 'source',
+    installState: 'installed', installDetail: null,
+    gitSource: `git:github.com/runrunrain/amagi-pi@${COMMIT}`,
+    commit: COMMIT, repoUrl: 'https://github.com/runrunrain/amagi-pi.git',
+    candidates: [], discoveryIssues: [],
+    ...over,
+  });
+  const statusWith = (amagiOver: Record<string, unknown>, over: Record<string, unknown> = {}) => makeLocalStatus({
+    amagi: amagiBase(amagiOver),
+    ...over,
+  });
+
+  it('全局 2.21.36 候选如实展示：来源标签/版本/≠固定版本/不用于构建', async () => {
+    apiRuntime.getKbBuildRuntimeStatus.mockResolvedValue(statusWith({
+      candidates: [{ origin: 'global-pi-home', source: '/Users/x/amagi-pi', sourceType: 'local', packagePath: '/Users/x/amagi-pi', version: '2.21.36', matchesPin: false }],
+    }));
+    const container = setup(makeConfig());
+    await act(async () => {});
+    const block = container.querySelector('[data-testid="orch-runtime-candidates"]');
+    expect(block?.textContent).toContain('全局 Pi');
+    expect(block?.textContent).toContain('2.21.36');
+    expect(block?.textContent).toContain('本地目录');
+    expect(block?.textContent).toContain('≠ 固定版本 2.21.31');
+    expect(block?.textContent).toContain('不用于构建');
+    // 构建专用固定版本仍是 31 已装，不被 36 冒充
+    expect(container.querySelector('[data-testid="orch-runtime-facts"]')?.textContent).toContain('已安装 2.21.31');
+  });
+
+  it('发现异常（unavailable/error）单独表达，不谎称未安装', async () => {
+    apiRuntime.getKbBuildRuntimeStatus.mockResolvedValue(statusWith({
+      candidates: [],
+      discoveryIssues: [{ origin: 'app-pi-home', status: 'unavailable', detail: 'Pi 运行时或包管理 SDK 不可用', settingsErrors: [] }],
+    }));
+    const container = setup(makeConfig());
+    await act(async () => {});
+    const issues = container.querySelector('[data-testid="orch-runtime-discovery-issues"]');
+    expect(issues?.textContent).toContain('应用插件目录候选检测不可用');
+    expect(issues?.textContent).toContain('不代表未安装');
+  });
+
+  it('已装 → 按钮为「校验固定版本」；未装 → 默认官方 Git 标签与提示', async () => {
+    apiRuntime.getKbBuildRuntimeStatus.mockResolvedValue(statusWith({}));
+    const installed = setup(makeConfig());
+    await act(async () => {});
+    expect((installed.querySelector('[data-testid="orch-runtime-install-btn"]') as HTMLElement).textContent).toContain('校验固定版本 2.21.31');
+    apiRuntime.getKbBuildRuntimeStatus.mockResolvedValue(statusWith({
+      installed: false, version: null, installDir: null, contentHash: null, layout: null, installState: 'missing',
+    }));
+    const fresh = setup(makeConfig());
+    await act(async () => {});
+    const btn = fresh.querySelector('[data-testid="orch-runtime-install-btn"]') as HTMLElement;
+    expect(btn.textContent).toContain('安装 amagi-pi 2.21.31');
+    expect(btn.textContent).toContain('官方 Git');
+    expect(fresh.querySelector('[data-testid="orch-runtime-install-hint"]')?.textContent).toContain('不回退 npm/latest');
+  });
+
+  it('精确匹配 pin 的本地候选 → 推荐来源可见，「用作安装来源」回填目录', async () => {
+    const path36 = '/Users/x/amagi-pi-31';
+    apiRuntime.getKbBuildRuntimeStatus.mockResolvedValue(statusWith({
+      installed: false, version: null, installDir: null, contentHash: null, layout: null, installState: 'missing',
+      candidates: [{ origin: 'global-pi-home', source: path36, sourceType: 'local', packagePath: path36, version: '2.21.31', matchesPin: true }],
+    }));
+    apiRuntime.installKbBuildRuntime.mockResolvedValue({ installed: true, fresh: true, version: '2.21.31', installDir: '/d', contentHash: 'h', layout: 'source', dependenciesIncluded: false });
+    const container = setup(makeConfig());
+    await act(async () => {});
+    expect(container.querySelector('[data-testid="orch-runtime-candidates"]')?.textContent).toContain('与固定版本一致');
+    await act(async () => { (container.querySelector('[data-testid="orch-runtime-candidate-adopt"]') as HTMLElement).click(); });
+    expect((container.querySelector('[data-testid="orch-runtime-source-dir"]') as HTMLInputElement).value).toBe(path36);
+    await act(async () => { (container.querySelector('[data-testid="orch-runtime-install-btn"]') as HTMLElement).click(); });
+    expect(apiRuntime.installKbBuildRuntime).toHaveBeenCalledWith({ sourceDir: path36 });
+  });
+
+  it('desktop.selectDirectory：选中回填；取消（null）保持；无桥不渲染按钮仍可手填', async () => {
+    apiRuntime.getKbBuildRuntimeStatus.mockResolvedValue(statusWith({}));
+    const desktop = { selectDirectory: vi.fn() };
+    (window as unknown as { desktop: unknown }).desktop = desktop;
+    try {
+      desktop.selectDirectory.mockResolvedValue('/chosen/amagi-pi');
+      const container = setup(makeConfig());
+      await act(async () => {});
+      await act(async () => { (container.querySelector('[data-testid="orch-runtime-source-dir-pick"]') as HTMLElement).click(); });
+      expect((container.querySelector('[data-testid="orch-runtime-source-dir"]') as HTMLInputElement).value).toBe('/chosen/amagi-pi');
+
+      desktop.selectDirectory.mockResolvedValue(null); // 用户取消
+      await act(async () => { (container.querySelector('[data-testid="orch-runtime-source-dir-pick"]') as HTMLElement).click(); });
+      expect((container.querySelector('[data-testid="orch-runtime-source-dir"]') as HTMLInputElement).value).toBe('/chosen/amagi-pi');
+    } finally {
+      delete (window as unknown as { desktop: unknown }).desktop;
+    }
+    // 无桥（浏览器）：无按钮，手填可用
+    const container2 = setup(makeConfig());
+    await act(async () => {});
+    expect(container2.querySelector('[data-testid="orch-runtime-source-dir-pick"]')).toBeNull();
+    const input = container2.querySelector('[data-testid="orch-runtime-source-dir"]') as HTMLInputElement;
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')!.set!;
+      setter.call(input, '/manual/amagi-pi');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    expect(input.value).toBe('/manual/amagi-pi');
+  });
+
+  it('长错误折叠：主提示可读，详情默认收起、点击展开', async () => {
+    apiRuntime.getKbBuildRuntimeStatus.mockResolvedValue(statusWith({}));
+    apiRuntime.installKbBuildRuntime.mockRejectedValue(new APIError(
+      'amagi_install_failed: Git 获取失败（需本机可用 git 与网络；也可改填本地 amagi-pi 目录安装）\nstderr: fatal: could not read from remote repository\n长详细输出…',
+      400,
+      { error: 'amagi_install_failed' },
+    ));
+    const container = setup(makeConfig());
+    await act(async () => {});
+    await act(async () => { (container.querySelector('[data-testid="orch-runtime-install-btn"]') as HTMLElement).click(); });
+    const error = container.querySelector('[data-testid="orch-runtime-install-error"]');
+    expect(error?.textContent).toContain('Git 获取失败');
+    expect(container.querySelector('[data-testid="orch-runtime-install-error-detail"]')).toBeNull(); // 默认折叠
+    await act(async () => { (container.querySelector('[data-testid="orch-runtime-install-error-toggle"]') as HTMLElement).click(); });
+    const detail = container.querySelector('[data-testid="orch-runtime-install-error-detail"]');
+    expect(detail?.textContent).toContain('fatal: could not read from remote repository');
+  });
+
+  it('刷新清除旧错误（成功状态到达后不残留）', async () => {
+    apiRuntime.getKbBuildRuntimeStatus.mockResolvedValue(statusWith({}));
+    apiRuntime.installKbBuildRuntime.mockRejectedValue(new APIError('amagi_install_failed: 一次失败', 400, { error: 'amagi_install_failed' }));
+    const container = setup(makeConfig());
+    await act(async () => {});
+    await act(async () => { (container.querySelector('[data-testid="orch-runtime-install-btn"]') as HTMLElement).click(); });
+    expect(container.querySelector('[data-testid="orch-runtime-install-error"]')).not.toBeNull();
+    apiRuntime.installKbBuildRuntime.mockResolvedValue({ installed: true, fresh: false, version: '2.21.31', installDir: '/d', contentHash: 'h', layout: 'source', dependenciesIncluded: true });
+    await act(async () => { (container.querySelector('[data-testid="orch-runtime-refresh"]') as HTMLElement).click(); });
+    await act(async () => {});
+    expect(container.querySelector('[data-testid="orch-runtime-install-error"]')).toBeNull();
+  });
+
+  it('splitInstallErrorMessage：单行短消息无详情；多行/超长消息拆分', () => {
+    expect(splitInstallErrorMessage('短错误')).toEqual({ main: '短错误', detail: null });
+    const multi = splitInstallErrorMessage('第一行主因\nstderr: 详细');
+    expect(multi.main).toBe('第一行主因');
+    expect(multi.detail).toBe('stderr: 详细');
+    const long = splitInstallErrorMessage('x'.repeat(300));
+    expect(long.main.length).toBeLessThanOrEqual(181);
+    expect(long.main.endsWith('…')).toBe(true);
+    expect(long.detail).toBe('x'.repeat(300));
+    expect(splitInstallErrorMessage('  ')).toEqual({ main: '安装失败（未知错误）', detail: null });
+  });
+
+  it('安装前挂起GET不能清掉其后新安装错误，显式刷新才清错', async () => {
+    let resolveOld!: (value: unknown) => void;
+    apiRuntime.getKbBuildRuntimeStatus.mockImplementationOnce(() => new Promise(resolve => { resolveOld = resolve; }));
+    apiRuntime.installKbBuildRuntime.mockRejectedValue(new APIError('本轮安装失败：保留原因', 400));
+    const container = setup(makeConfig());
+    await act(async () => {});
+    await act(async () => { (container.querySelector('[data-testid="orch-runtime-install-btn"]') as HTMLElement).click(); });
+    expect(container.querySelector('[data-testid="orch-runtime-install-error"]')?.textContent).toContain('本轮安装失败：保留原因');
+    await act(async () => { resolveOld(statusWith({ installed: false, installState: 'missing' })); });
+    expect(container.querySelector('[data-testid="orch-runtime-install-error"]')?.textContent).toContain('本轮安装失败：保留原因');
+    apiRuntime.getKbBuildRuntimeStatus.mockResolvedValue(statusWith({}));
+    await act(async () => { (container.querySelector('[data-testid="orch-runtime-refresh"]') as HTMLElement).click(); });
+    expect(container.querySelector('[data-testid="orch-runtime-install-error"]')).toBeNull();
+  });
+
+  it('latest-request-wins：安装成功的新 GET 之后，先前加载/手刷的旧 GET 迟到返回不回写旧状态', async () => {
+    // 手动挂起两个 GET：旧（未装）与新（已装）；旧响应后到，不得覆盖新状态。
+    const deferreds: Array<(value: unknown) => void> = [];
+    apiRuntime.getKbBuildRuntimeStatus.mockImplementation(() => new Promise((resolve) => { deferreds.push(resolve); }));
+    apiRuntime.installKbBuildRuntime.mockResolvedValue({ installed: true, fresh: true, version: '2.21.31', installDir: '/d', contentHash: 'h', layout: 'source', dependenciesIncluded: true });
+    const container = setup(makeConfig());
+    await act(async () => {});
+    expect(deferreds).toHaveLength(1); // 挂载加载（旧请求，保持挂起）
+    // 挂起期间用户直接点安装（安装区不依赖探测结果渲染）
+    await act(async () => { (container.querySelector('[data-testid="orch-runtime-install-btn"]') as HTMLElement).click(); });
+    expect(deferreds).toHaveLength(2); // 安装成功 → onInstalled 发起新 GET
+    await act(async () => { deferreds[1](statusWith({})); }); // 新请求先完成：已装
+    expect((container.querySelector('[data-testid="orch-runtime-install-btn"]') as HTMLElement).textContent).toContain('校验固定版本');
+    expect(container.querySelector('[data-testid="orch-runtime-facts"]')?.textContent).toContain('已安装 2.21.31');
+    // 旧请求（挂载加载）此时才返回「未装」：迟到响应必须丢弃，不得回写
+    await act(async () => { deferreds[0](statusWith({ installed: false, version: null, installDir: null, contentHash: null, layout: null, installState: 'missing' })); });
+    expect((container.querySelector('[data-testid="orch-runtime-install-btn"]') as HTMLElement).textContent).toContain('校验固定版本');
+    expect(container.querySelector('[data-testid="orch-runtime-facts"]')?.textContent).toContain('已安装 2.21.31');
   });
 });

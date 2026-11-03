@@ -41,7 +41,14 @@ import {
   type ThinkingLevel,
 } from '../agent/build-runtime/contracts.js';
 import { assertProbeUsable, runStaticProbes } from '../agent/build-runtime/capability-probe.js';
-import { AmagiPackageError, installAmagiPackage, verifyAmagiPackage } from '../agent/build-runtime/amagi-package.js';
+import {
+  AMAGI_PI_GIT_COMMIT, AMAGI_PI_GIT_REPO_URL, AmagiPackageError, amagiGitSourceSpec,
+  installAmagiFromGit, installAmagiPackage, verifyAmagiPackage,
+} from '../agent/build-runtime/amagi-package.js';
+import {
+  piSdkAvailable, resolveAppPiAgentDir, resolveGlobalPiAgentDir, scanAmagiHome,
+  type AmagiCandidate,
+} from '../agent/build-runtime/amagi-discovery.js';
 import {
   computeAgentDirConfigHash,
   planBuildDirectories,
@@ -55,7 +62,7 @@ import type { AgentProcessPool } from '../agent/agent-process-pool.js';
 import { ToolError, type AgentToolService, type BuildRunState, type V2PublishHandler } from '../agent/agent-tool-service.js';
 import type { PiRuntimeResolver } from '../agent/runtime-resolver.js';
 import { resolveProviderModel } from '../modules/model-selection.js';
-import { claudeBridgePath, piExtensionPath } from '../agent/agent-assets.js';
+import { claudeBridgePath, piExtensionPath, piWorkbenchPackageRoot } from '../agent/agent-assets.js';
 import type { Config } from '../types/index.js';
 import type { LeaderRunCheckpointState, LeaderRunMaterial } from '../types/agent-knowledge.js';
 import {
@@ -123,11 +130,32 @@ export interface LeaderBuildInput {
   signal: AbortSignal;
 }
 
-/** 运行时状态 DTO（GET /api/kb/build-runtime；UI 消费）。 */
+/** 运行时状态 DTO（GET /api/kb/build-runtime；UI 消费）。
+ * plugin-install-fix：amagi 段拆分「受管固定版本安装事实」与「全局/应用只读发现」，
+ * 两者不得互相冒充——installed 只描述私有 runtime-packages 冻结安装；candidates
+ * 描述其他 Pi home 里真实存在的 amagi-pi（如全局 2.21.36），不影响构建 pin。 */
 export interface BuildRuntimeStatusDto {
   orchestrationMode: 'legacy' | 'pi-amagi' | 'claude-native';
   runtime: { nodePath: string | null; nodeVersion: string | null; piCliPath: string | null; piVersion: string | null } | null;
-  amagi: { pinnedVersion: string; installed: boolean; version: string | null; installDir: string | null; contentHash: string | null; layout: string | null } | null;
+  amagi: {
+    pinnedVersion: string;
+    installed: boolean;
+    version: string | null;
+    installDir: string | null;
+    contentHash: string | null;
+    layout: string | null;
+    /** 私有安装事实：installed=已装且记录可校；missing=未装；broken=目录/记录损坏（带 detail）。 */
+    installState: 'installed' | 'missing' | 'broken';
+    installDetail: string | null;
+    /** 官方 Git 默认安装来源（未安装时的确定来源；不追 latest/npm）。 */
+    gitSource: string;
+    commit: string;
+    repoUrl: string;
+    /** 只读发现（全局 Pi home + 应用 pi-home）的 amagi-pi 候选。 */
+    candidates: AmagiCandidate[];
+    /** 发现异常状态（unavailable/error 不代表未安装，单独表达）。 */
+    discoveryIssues: Array<{ origin: 'global-pi-home' | 'app-pi-home'; status: 'unavailable' | 'error'; detail: string | null; settingsErrors: Array<{ scope: string; path: string | null; message: string }> }>;
+  } | null;
   probe: { staticOk: boolean; fullyVerified: boolean; checks: Array<{ id: string; title: string; kind: string; state: string; detail: string }> } | null;
   error: string | null;
 }
@@ -210,6 +238,8 @@ function asAsyncIterable(iterator: AsyncIterator<RuntimeEvent>): AsyncIterable<R
 export class BuildRuntimeHost {
   private readonly sessions = new Map<string, HostSession>();
   private eventSeq = 0;
+  /** amagi 安装/校验串行门（同版本并发防护）。 */
+  private installInFlight = false;
 
   constructor(private readonly deps: BuildRuntimeHostDeps) {}
 
@@ -224,7 +254,7 @@ export class BuildRuntimeHost {
   }
 
   /** Node/pi 事实解析（PiRuntimeResolver 唯一发现链；失败显式 503）。 */
-  async runtimeFacts(): Promise<{ nodePath: string; piCliPath: string; piVersion: string }> {
+  async runtimeFacts(): Promise<{ nodePath: string; piCliPath: string; piVersion: string; piPackageRoot: string | null }> {
     const config = this.config();
     let resolved: Awaited<ReturnType<PiRuntimeResolver['resolveRuntime']>> = null as never;
     try {
@@ -235,11 +265,11 @@ export class BuildRuntimeHost {
     if (!resolved.nodePath || !resolved.piCliPath || !resolved.piVersion) {
       throw new ToolError('build_runtime_unavailable', `Pi 运行时未就绪（node=${resolved.nodePath ?? '未发现'}，pi=${resolved.piCliPath ?? '未发现'}，版本=${resolved.piVersion ?? '未知'}）；请先在设置中安装/配置 Pi 运行时`, 503);
     }
-    return { nodePath: resolved.nodePath, piCliPath: resolved.piCliPath, piVersion: resolved.piVersion };
+    return { nodePath: resolved.nodePath, piCliPath: resolved.piCliPath, piVersion: resolved.piVersion, piPackageRoot: resolved.piPackageRoot };
   }
 
   /** 静态能力探测（不断言；构建路径用 probeOrFail，状态端点用本方法）。 */
-  async probeReport(apiKeyOverride?: string): Promise<{ report: CapabilityReport; facts: { nodePath: string; piCliPath: string; piVersion: string } }> {
+  async probeReport(apiKeyOverride?: string): Promise<{ report: CapabilityReport; facts: { nodePath: string; piCliPath: string; piVersion: string; piPackageRoot: string | null } }> {
     const facts = await this.runtimeFacts();
     const config = this.config();
     const report = runStaticProbes({
@@ -274,11 +304,70 @@ export class BuildRuntimeHost {
     return Boolean(resolution && resolution.apiKey && resolution.apiKey.trim() !== '');
   }
 
-  /** 状态 DTO（UI：能力探测/包安装/运行状态；探测失败如实带回错误）。 */
+  /** 私有固定版本安装事实（快速核对；不依赖 Pi 运行时，探测失败也不掩埋）。 */
+  private installedFact(): { state: 'installed' | 'missing' | 'broken'; detail: string | null; ref: (AmagiPackageRef & { record: unknown }) | null } {
+    try {
+      const ref = verifyAmagiPackage({ dataRoot: this.deps.dataRoot, version: AMAGI_PI_PINNED_VERSION, verifyHash: false });
+      return { state: 'installed', detail: null, ref };
+    } catch (error) {
+      const code = error instanceof AmagiPackageError ? error.code : 'amagi_package_invalid';
+      if (code === 'amagi_record_missing') {
+        return { state: 'missing', detail: null, ref: null };
+      }
+      return { state: 'broken', detail: `${code}: ${error instanceof Error ? error.message : String(error)}`, ref: null };
+    }
+  }
+
+  /** 只读发现（全局 + 应用 Pi home；SDK 不可用如实 unavailable，不抛）。 */
+  private async discoverAmagi(facts: { nodePath: string; piPackageRoot: string | null } | null): Promise<{
+    candidates: AmagiCandidate[];
+    issues: NonNullable<BuildRuntimeStatusDto['amagi']>['discoveryIssues'];
+  }> {
+    const homes: Array<{ origin: 'global-pi-home' | 'app-pi-home'; agentDir: string }> = [
+      { origin: 'global-pi-home', agentDir: resolveGlobalPiAgentDir() },
+      { origin: 'app-pi-home', agentDir: resolveAppPiAgentDir(this.deps.dataRoot) },
+    ];
+    let helperPackageRoot: string | null = null;
+    try {
+      helperPackageRoot = piWorkbenchPackageRoot();
+    } catch {
+      helperPackageRoot = null;
+    }
+    const sdkReady = Boolean(facts && helperPackageRoot && piSdkAvailable(facts.piPackageRoot, facts.nodePath));
+    const issues: Array<{ origin: 'global-pi-home' | 'app-pi-home'; status: 'unavailable' | 'error'; detail: string | null; settingsErrors: Array<{ scope: string; path: string | null; message: string }> }> = [];
+    const candidates: AmagiCandidate[] = [];
+    for (const home of homes) {
+      if (!sdkReady) {
+        issues.push({ origin: home.origin, status: 'unavailable', detail: 'Pi 运行时或包管理 SDK 不可用（仅无法发现该处候选，不代表未安装）', settingsErrors: [] });
+        continue;
+      }
+      const scan = await scanAmagiHome({
+        nodePath: facts!.nodePath,
+        helperPackageRoot: helperPackageRoot!,
+        piPackageRoot: facts!.piPackageRoot!,
+        agentDir: home.agentDir,
+        origin: home.origin,
+        pinnedVersion: AMAGI_PI_PINNED_VERSION,
+      });
+      if (scan.status !== 'ok') {
+        issues.push({ origin: scan.origin, status: scan.status, detail: scan.detail, settingsErrors: scan.settingsErrors });
+      } else if (scan.settingsErrors.length > 0) {
+        issues.push({ origin: scan.origin, status: 'error', detail: `Pi settings 载入异常（声明不吞作未装）`, settingsErrors: scan.settingsErrors });
+      }
+      candidates.push(...scan.candidates);
+    }
+    return { candidates, issues };
+  }
+
+  /** 状态 DTO（UI：能力探测/包安装/运行状态；探测失败如实带回错误，但已装事实
+   * 与发现结果不因探测失败被抹成「未安装」——plugin-install-fix 核心修正）。 */
   async statusDto(): Promise<BuildRuntimeStatusDto> {
     const mode = this.config().standardKb.orchestrationMode ?? 'legacy';
+    const fact = this.installedFact();
+    const gitSource = amagiGitSourceSpec();
     try {
       const { report, facts } = await this.probeReport();
+      const discovery = await this.discoverAmagi(facts);
       const amagiRef = report.amagiPackage;
       return {
         orchestrationMode: mode,
@@ -289,7 +378,14 @@ export class BuildRuntimeHost {
           version: amagiRef?.version ?? null,
           installDir: amagiRef?.installDir ?? null,
           contentHash: amagiRef?.contentHash ?? null,
-          layout: null,
+          layout: fact.state === 'installed' ? String((fact.ref?.record as { layout?: string } | null)?.layout ?? 'source') : null,
+          installState: amagiRef !== null ? 'installed' : fact.state,
+          installDetail: amagiRef !== null ? null : fact.detail,
+          gitSource,
+          commit: AMAGI_PI_GIT_COMMIT,
+          repoUrl: AMAGI_PI_GIT_REPO_URL,
+          candidates: discovery.candidates,
+          discoveryIssues: discovery.issues,
         },
         probe: {
           staticOk: report.staticOk,
@@ -299,33 +395,72 @@ export class BuildRuntimeHost {
         error: null,
       };
     } catch (error) {
+      // 探测失败：runtime/probe 无法给出，但安装事实与发现状态仍如实带回。
+      const discovery = await this.discoverAmagi(null);
       return {
         orchestrationMode: mode,
         runtime: null,
-        amagi: { pinnedVersion: AMAGI_PI_PINNED_VERSION, installed: false, version: null, installDir: null, contentHash: null, layout: null },
+        amagi: {
+          pinnedVersion: AMAGI_PI_PINNED_VERSION,
+          installed: fact.state === 'installed',
+          version: fact.ref?.version ?? null,
+          installDir: fact.ref?.installDir ?? null,
+          contentHash: fact.ref?.contentHash ?? null,
+          layout: fact.state === 'installed' ? String((fact.ref?.record as { layout?: string } | null)?.layout ?? 'source') : null,
+          installState: fact.state,
+          installDetail: fact.detail,
+          gitSource,
+          commit: AMAGI_PI_GIT_COMMIT,
+          repoUrl: AMAGI_PI_GIT_REPO_URL,
+          candidates: discovery.candidates,
+          discoveryIssues: discovery.issues,
+        },
         probe: null,
         error: error instanceof Error ? error.message : String(error),
       };
     }
   }
 
-  /** 安装版本化 amagi-pi（npm 模式；未发布时经 sourceDir 物化安装）。 */
-  async installAmagi(input: { sourceDir?: string; log?: (line: string) => void } = {}): Promise<AmagiPackageRef & { fresh: boolean }> {
-    const facts = await this.runtimeFacts();
+  /** 安装版本化 amagi-pi。plugin-install-fix：
+   * - 显式 sourceDir → 严格 source 模式（版本/哈希校验同旧）；
+   * - 默认（无 sourceDir）→ 官方 Git 固定 commit 获取链（不再走已知 404 的 npm 默认）；
+   * - 已有安装记录 → 完整哈希校验复用（「校验」而非虚假重装）；
+   * - 同版本并发安装/校验串行化（busy 409），防双写 staging/aside 冲突。 */
+  async installAmagi(input: { sourceDir?: string; log?: (line: string) => void } = {}): Promise<AmagiPackageRef & { record: unknown; fresh: boolean }> {
+    if (this.installInFlight) {
+      throw new ToolError('amagi_install_busy', '已有 amagi-pi 安装/校验进行中，请稍后重试（同版本安装串行执行）', 409);
+    }
+    this.installInFlight = true;
     try {
-      return await installAmagiPackage({
-        nodePath: facts.nodePath,
-        piCliPath: facts.piCliPath,
-        dataRoot: this.deps.dataRoot,
-        version: AMAGI_PI_PINNED_VERSION,
-        ...(input.sourceDir ? { sourceDir: input.sourceDir } : {}),
-        log: input.log,
-      });
-    } catch (error) {
-      if (error instanceof AmagiPackageError) {
-        throw new ToolError('amagi_install_failed', `${error.code}: ${error.message}`, 400);
+      const facts = await this.runtimeFacts();
+      try {
+        if (input.sourceDir) {
+          return await installAmagiPackage({
+            nodePath: facts.nodePath,
+            piCliPath: facts.piCliPath,
+            dataRoot: this.deps.dataRoot,
+            version: AMAGI_PI_PINNED_VERSION,
+            sourceDir: input.sourceDir,
+            log: input.log,
+          });
+        }
+        return await installAmagiFromGit({
+          nodePath: facts.nodePath,
+          piCliPath: facts.piCliPath,
+          helperPackageRoot: piWorkbenchPackageRoot(),
+          piPackageRoot: facts.piPackageRoot,
+          dataRoot: this.deps.dataRoot,
+          version: AMAGI_PI_PINNED_VERSION,
+          log: input.log,
+        });
+      } catch (error) {
+        if (error instanceof AmagiPackageError) {
+          throw new ToolError('amagi_install_failed', `${error.code}: ${error.message}`, 400);
+        }
+        throw error;
       }
-      throw error;
+    } finally {
+      this.installInFlight = false;
     }
   }
 

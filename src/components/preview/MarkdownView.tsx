@@ -435,6 +435,7 @@ function unescapeInline(s: string): string {
 interface InlineContext {
   baseDir: string;
   onNavigateCsv?: (href: string) => boolean;
+  onNavigateDoc?: (href: string) => boolean;
   feishuHost?: string;
   /** 远程图片策略（见 AuthImageProps.remotePolicy）；默认 'auto' 保留旧行为。 */
   remoteImages?: 'auto' | 'confirm';
@@ -478,19 +479,19 @@ export function renderInline(text: string, keyPrefix: string, ctx: InlineContext
       } else {
         const isCsv =
           !isRemoteUrl(safeHref) && safeHref.split(/[?#]/)[0].toLowerCase().endsWith('.csv');
+        const isDoc =
+          safeHref.startsWith('#') || (!isRemoteUrl(safeHref) && safeHref.split(/[?#]/)[0].toLowerCase().endsWith('.md'));
         out.push(
           <a
             key={key}
             href={safeHref}
-            target={isCsv ? undefined : '_blank'}
-            rel={isCsv ? undefined : 'noopener noreferrer'}
+            target={isCsv || (isDoc && ctx.onNavigateDoc) ? undefined : '_blank'}
+            rel={isCsv || (isDoc && ctx.onNavigateDoc) ? undefined : 'noopener noreferrer'}
             onClick={(e) => {
-              if (isCsv && ctx.onNavigateCsv) {
-                const handled = ctx.onNavigateCsv(safeHref);
-                if (handled) {
-                  e.preventDefault();
-                  e.stopPropagation();
-                }
+              const handled = isCsv ? ctx.onNavigateCsv?.(safeHref) : isDoc ? ctx.onNavigateDoc?.(safeHref) : false;
+              if (handled) {
+                e.preventDefault();
+                e.stopPropagation();
               }
             }}
             className="text-jade hover:text-seal underline underline-offset-2 decoration-line hover:decoration-seal transition-colors cursor-pointer"
@@ -608,19 +609,19 @@ export function renderInline(text: string, keyPrefix: string, ctx: InlineContext
       } else {
         const isCsv =
           !isRemoteUrl(safeHref) && safeHref.split(/[?#]/)[0].toLowerCase().endsWith('.csv');
+        const isDoc =
+          safeHref.startsWith('#') || (!isRemoteUrl(safeHref) && safeHref.split(/[?#]/)[0].toLowerCase().endsWith('.md'));
         out.push(
           <a
             key={key}
             href={safeHref}
-            target={isCsv ? undefined : '_blank'}
-            rel={isCsv ? undefined : 'noopener noreferrer'}
+            target={isCsv || (isDoc && ctx.onNavigateDoc) ? undefined : '_blank'}
+            rel={isCsv || (isDoc && ctx.onNavigateDoc) ? undefined : 'noopener noreferrer'}
             onClick={(e) => {
-              if (isCsv && ctx.onNavigateCsv) {
-                const handled = ctx.onNavigateCsv(safeHref);
-                if (handled) {
-                  e.preventDefault();
-                  e.stopPropagation();
-                }
+              const handled = isCsv ? ctx.onNavigateCsv?.(safeHref) : isDoc ? ctx.onNavigateDoc?.(safeHref) : false;
+              if (handled) {
+                e.preventDefault();
+                e.stopPropagation();
               }
             }}
             className="text-jade hover:text-seal underline underline-offset-2 decoration-line hover:decoration-seal transition-colors cursor-pointer"
@@ -1410,6 +1411,8 @@ export interface MarkdownViewProps {
   baseDir?: string;
   /** 点击相对 .csv 链接时的拦截处理器：返回 true 表示已命中本地子表并阻止浏览器默认跳转。 */
   onNavigateCsv?: (href: string) => boolean;
+  /** 标准库阅读器按已发布目录切换相对 .md 链接，避免 Electron 把它解析到 app.asar。 */
+  onNavigateDoc?: (href: string) => boolean;
   /** 飞书租户域名（如 "qcnbafdrjx7n.feishu.cn"），用于生成并打开 wiki 超链接。 */
   feishuHost?: string;
   /** 仅本地源文档预览自动读取飞书同步引用；其他不可信内容须用户主动加载。 */
@@ -1429,13 +1432,14 @@ export function MarkdownView({
   content,
   baseDir = '',
   onNavigateCsv,
+  onNavigateDoc,
   feishuHost,
   resolveSyncedReferences = false,
   remoteImages = 'auto',
   variant = 'preview',
 }: MarkdownViewProps) {
   const blocks = parseBlocks(preprocess(content));
-  const ctx: InlineContext = { baseDir, onNavigateCsv, feishuHost, remoteImages, resolveSyncedReferences };
+  const ctx: InlineContext = { baseDir, onNavigateCsv, onNavigateDoc, feishuHost, remoteImages, resolveSyncedReferences };
   return (
     <div className={`markdown-body ${variant === 'reading' ? 'markdown-reading' : 'markdown-preview'}`}>
       {blocks.map((b, i) => (

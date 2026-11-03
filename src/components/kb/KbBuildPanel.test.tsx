@@ -74,6 +74,16 @@ it('中断后显示实际检查点与继续入口；旧构建明确说明无法�
   expect(legacy).toContain('旧版本没有保存检查点'); expect(legacy).not.toContain('从断点继续');
 });
 
+it('中断时明确保留已分批发布的正式版本', () => {
+  const html = render(makeBuild({ status: 'interrupted', baseReleaseId: 'r_old', releaseId: 'r_stage',
+    error: { code: 'kb_leader_idle', message: 'Leader 空闲' } }));
+  expect(html).toContain('已分批发布 · r_stage');
+  expect(html).toContain('完成的正式文档可直接从左侧目录阅读');
+  const failed = render(makeBuild({ status: 'failed', baseReleaseId: 'r_old', releaseId: 'r_stage',
+    error: { code: 'kb_leader_failed', message: 'Leader 失败' } }));
+  expect(failed).toContain('已分批发布的正式文档保留在版本 r_stage');
+});
+
 describe('KbBuildPanel 并行进度（S4/S5）', () => {
   it('多 worker 运行态：并行度、细粒度阶段、单元计数与 worker 徽标', () => {
     const html = render(makeBuild());

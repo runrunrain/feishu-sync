@@ -263,7 +263,9 @@ function resolveTextSpan(content: string, selector: TextSpanSelector): SelectorR
 }
 
 /**
- * CsvCells：1 起始逻辑 record 行 + 列名（取自首 record 表头）→ 单元格值。
+ * CsvCells：1 起始逻辑 record 行 + 列名（取自首 record 表头）或显式
+ * @A/@B 列坐标 → 单元格值。飞书 sheet 导出的 CSV 可在前几行留空，
+ * 不能把首行误当作唯一可用表头而令证据无法定位。
  * CSV 引号内换行不等于新记录（parseCsvRecords）；文本显示行号不能冒充
  * 逻辑 record 行号。
  */
@@ -283,10 +285,14 @@ function resolveCsvCells(resource: EvidenceCsvResource, selector: CsvCellsSelect
   }
   const header = records[0]!;
   const colIndexes: number[] = [];
+  const width = records.reduce((max, record) => Math.max(max, record.length), 0);
   for (const column of selector.columns) {
-    const index = header.indexOf(column);
-    if (index < 0) {
-      return { ok: false, code: 'kb_evidence_unresolved', message: `CsvCells 列不存在: ${column}（表头 ${header.join(',')}）` };
+    let index = header.indexOf(column);
+    if (index < 0 && /^@[A-Z]+$/i.test(column)) {
+      index = (parseA1Cell(`${column.slice(1)}1`)?.col ?? 0) - 1;
+    }
+    if (index < 0 || index >= width) {
+      return { ok: false, code: 'kb_evidence_unresolved', message: `CsvCells 列不存在: ${column}（表头 ${header.join(',')}；空白/重复表头可用 @A、@B 等列坐标）` };
     }
     colIndexes.push(index);
   }

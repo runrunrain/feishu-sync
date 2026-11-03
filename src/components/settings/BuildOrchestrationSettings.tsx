@@ -17,7 +17,7 @@
  * - thinking 'off' 是服务端缺省，选「关闭」时不写该键（undefined 不落盘）。
  */
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronDown, ChevronRight, Download, Loader2, RefreshCw, ShieldAlert, Workflow } from 'lucide-react';
 import { useToast } from '../common/Toast';
 import { useConfig } from '../../hooks/useConfig';
@@ -324,19 +324,31 @@ export function BuildOrchestrationSettings() {
   const [runtimeUnwired, setRuntimeUnwired] = useState(false);
   const [runtimeError, setRuntimeError] = useState<string | null>(null);
   const [runtimeLoading, setRuntimeLoading] = useState(false);
+  // latest-request-wins（steer #5）：加载/手刷的旧 GET 不得在安装成功触发的新 GET
+  // 之后返回并覆盖最新状态（否则「已装」被旧「未装」回写）。序号失配的迟到响应丢弃。
+  const runtimeSeqRef = useRef(0);
   const loadRuntime = () => {
+    const seq = runtimeSeqRef.current + 1;
+    runtimeSeqRef.current = seq;
     setRuntimeLoading(true);
     setRuntimeError(null);
     getKbBuildRuntimeStatus()
-      .then((dto) => { setRuntimeStatus(dto); setRuntimeUnwired(false); })
+      .then((dto) => {
+        if (seq !== runtimeSeqRef.current) return; // 迟到响应丢弃
+        setRuntimeStatus(dto);
+        setRuntimeUnwired(false);
+      })
       .catch((err: unknown) => {
+        if (seq !== runtimeSeqRef.current) return;
         if (err instanceof APIError && err.statusCode === 503) {
           setRuntimeUnwired(true);
           return;
         }
         setRuntimeError(err instanceof Error ? err.message : '探测失败');
       })
-      .finally(() => setRuntimeLoading(false));
+      .finally(() => {
+        if (seq === runtimeSeqRef.current) setRuntimeLoading(false);
+      });
   };
   useEffect(() => { loadRuntime(); }, []);
 
@@ -746,6 +758,10 @@ export function BuildOrchestrationSettings() {
 // ---------------------------------------------------------------------------
 // v2 运行宿主状态与安装（真实 GET/POST /api/kb/build-runtime*；消费集成侧
 // BuildRuntimeStatusDto。staticOk ≠ fullyVerified，安装可用 ≠ 质量验收全过）。
+// plugin-install-fix：构建专用固定版本与「全局/应用 Pi home 的其他 amagi-pi」
+// 分开呈现——检测到的 2.21.36 不冒充固定 2.21.31、也不因版本更高被采用；默认
+// 安装走服务端官方 Git 固定 commit 获取链（无匹配不回退 npm/latest）；已装则
+// 按钮语义为「校验」（完整哈希复用核对），不假装重装。
 // ---------------------------------------------------------------------------
 
 const PROBE_CHECK_STATE_LABEL: Record<string, string> = {
@@ -754,6 +770,25 @@ const PROBE_CHECK_STATE_LABEL: Record<string, string> = {
 const PROBE_CHECK_STATE_CLS: Record<string, string> = {
   pass: 'text-jade', fail: 'text-seal-2', warn: 'text-[#bf9004]', 'not-measured': 'text-ink-faint',
 };
+
+const AMAGI_ORIGIN_LABEL: Record<'global-pi-home' | 'app-pi-home', string> = {
+  'global-pi-home': '全局 Pi',
+  'app-pi-home': '应用插件目录',
+};
+const AMAGI_SOURCE_TYPE_LABEL: Record<'npm' | 'git' | 'local', string> = {
+  npm: 'npm', git: 'Git', local: '本地目录',
+};
+
+/** 安装错误消息拆分：主提示=首行（≤180 字符，可操作），其余进折叠详情。 */
+export function splitInstallErrorMessage(message: string): { main: string; detail: string | null } {
+  const normalized = message.trim();
+  if (!normalized) return { main: '安装失败（未知错误）', detail: null };
+  const firstLine = normalized.split('\n', 1)[0].trim();
+  const main = firstLine.length > 180 ? `${firstLine.slice(0, 180)}…` : firstLine;
+  const remainder = normalized.slice(firstLine.length).trim();
+  if (main.endsWith('…')) return { main, detail: normalized };
+  return { main, detail: remainder || null };
+}
 
 function RuntimeStatusSection({
   status, unwired, error, loading, onRefresh, onInstalled,
@@ -770,21 +805,39 @@ function RuntimeStatusSection({
   const [installBusy, setInstallBusy] = useState(false);
   const [installError, setInstallError] = useState<string | null>(null);
   const [checksOpen, setChecksOpen] = useState(false);
+  const [errorDetailOpen, setErrorDetailOpen] = useState(false);
+
+  // 被动状态响应不能清除较新的安装错误；仅显式刷新/新安装动作清错。
+  // 点击刷新即清除旧错误（不依赖响应对象身份；失败重查时旧错误不误导）。
+  const handleRefresh = () => {
+    setInstallError(null);
+    setErrorDetailOpen(false);
+    onRefresh();
+  };
+
+  const selectDir = async () => {
+    if (typeof window === 'undefined' || !window.desktop?.selectDirectory) return;
+    try {
+      const dir = await window.desktop.selectDirectory();
+      if (dir) setSourceDir(dir); // 用户取消（null）→ 保持原值
+    } catch { /* 桥接异常不影响手填路径 */ }
+  };
 
   const install = async () => {
     if (installBusy) return;
     setInstallBusy(true);
     setInstallError(null);
+    setErrorDetailOpen(false);
     try {
       const trimmed = sourceDir.trim();
       const result = await installKbBuildRuntime(trimmed ? { sourceDir: trimmed } : {});
       toast.push({
         type: 'success',
-        message: `amagi-pi ${result.version} 已安装${result.fresh ? '' : '（沿用既有安装）'}；完整启用另需实测验收`,
+        message: `amagi-pi ${result.version} ${result.fresh ? '已安装' : '完整校验通过（沿用既有安装）'}；完整启用另需实测验收`,
       });
       onInstalled();
     } catch (err) {
-      setInstallError(err instanceof APIError ? err.message : err instanceof Error ? err.message : '安装失败');
+      setInstallError(err instanceof Error ? err.message : '安装失败');
     } finally {
       setInstallBusy(false);
     }
@@ -792,6 +845,14 @@ function RuntimeStatusSection({
 
   const amagi = status?.amagi;
   const probe = status?.probe;
+  // 旧 DTO 兼容：新字段缺省时按 installed 布尔推导（不因缺字段崩渲染）。
+  const installState: 'installed' | 'missing' | 'broken' = amagi?.installState ?? (amagi?.installed ? 'installed' : 'missing');
+  const candidates = amagi?.candidates ?? [];
+  const discoveryIssues = amagi?.discoveryIssues ?? [];
+  const recommended = candidates.find((item) => item.matchesPin && item.sourceType === 'local' && item.packagePath) ?? null;
+  const trimmedSource = sourceDir.trim();
+  const canSelectDir = typeof window !== 'undefined' && Boolean(window.desktop?.selectDirectory);
+  const errorParts = installError ? splitInstallErrorMessage(installError) : null;
   return (
     <div className="rounded-md border border-line bg-paper/30 p-3 space-y-2" data-testid="orch-runtime-status">
       <div className="flex items-center justify-between gap-2">
@@ -801,7 +862,7 @@ function RuntimeStatusSection({
         </h4>
         <button
           type="button"
-          onClick={onRefresh}
+          onClick={handleRefresh}
           className="inline-flex items-center gap-1 text-[11px] text-seal hover:underline"
           data-testid="orch-runtime-refresh"
         >
@@ -822,10 +883,12 @@ function RuntimeStatusSection({
               Pi：{status.runtime?.piVersion ? <span className="font-mono">{status.runtime.piVersion}</span> : <span className="text-ink-faint">未探测</span>}
             </span>
             <span className="text-ink-soft">
-              amagi-pi（固定版本 <span className="font-mono">{amagi?.pinnedVersion ?? '—'}</span>）：
-              {amagi?.installed
-                ? <span className="text-jade" title={`${amagi.installDir ?? ''} ${amagi.contentHash ?? ''}`.trim()}>已安装 {amagi.version}</span>
-                : <span className="text-[#bf9004]">未安装</span>}
+              构建专用 amagi-pi（固定 <span className="font-mono">{amagi?.pinnedVersion ?? '—'}</span>）：
+              {installState === 'installed'
+                ? <span className="text-jade" title={`${amagi?.installDir ?? ''} ${amagi?.contentHash ?? ''}`.trim()}>已安装 {amagi?.version ?? amagi?.pinnedVersion}</span>
+                : installState === 'broken'
+                  ? <span className="text-seal-2">安装损坏{amagi?.installDetail ? `（${amagi.installDetail}）` : ''}——删除版本化目录后重装</span>
+                  : <span className="text-[#bf9004]">未安装——构建不会使用其他来源的 amagi-pi</span>}
             </span>
             {probe ? (
               <span className="flex items-center gap-1.5">
@@ -866,24 +929,78 @@ function RuntimeStatusSection({
               ) : null}
             </div>
           ) : null}
+          {/* 只读发现：全局/应用 Pi home 的其他 amagi-pi（如实区分，不参与构建 pin） */}
+          {candidates.length > 0 || discoveryIssues.length > 0 ? (
+            <div className="border-t border-line/60 pt-1.5 space-y-1" data-testid="orch-runtime-candidates">
+              <p className="text-[11px] text-ink-soft">检测到的其他 amagi-pi（只读发现，不用于构建）：</p>
+              <ul className="space-y-0.5">
+                {candidates.map((item) => (
+                  <li key={`${item.origin}:${item.source}`} className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px] leading-snug" data-testid="orch-runtime-candidate">
+                    <span className="text-ink-soft">{AMAGI_ORIGIN_LABEL[item.origin]}</span>
+                    <span className="font-mono">{item.version ?? '版本未知'}</span>
+                    <span className="text-ink-faint break-all">（{AMAGI_SOURCE_TYPE_LABEL[item.sourceType]}{item.packagePath ? ` · ${item.packagePath}` : ' · 实体缺失'}）</span>
+                    {item.matchesPin ? (
+                      <>
+                        <span className="text-jade">与固定版本一致</span>
+                        {item.sourceType === 'local' && item.packagePath && item.packagePath !== trimmedSource ? (
+                          <button
+                            type="button"
+                            className="text-seal hover:underline"
+                            data-testid="orch-runtime-candidate-adopt"
+                            onClick={() => setSourceDir(item.packagePath!)}
+                          >
+                            用作安装来源
+                          </button>
+                        ) : null}
+                      </>
+                    ) : (
+                      <span className="text-[#bf9004]">≠ 固定版本 {amagi?.pinnedVersion ?? ''}，不用于构建</span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+              {discoveryIssues.length > 0 ? (
+                <ul className="space-y-0.5" data-testid="orch-runtime-discovery-issues">
+                  {discoveryIssues.map((issue) => (
+                    <li key={issue.origin} className="text-[11px] text-[#bf9004] leading-snug">
+                      {AMAGI_ORIGIN_LABEL[issue.origin]}候选检测{issue.status === 'unavailable' ? '不可用' : '失败'}（不代表未安装）
+                      {issue.detail ? `：${issue.detail}` : ''}
+                      {issue.settingsErrors.length > 0 ? `；settings ${issue.settingsErrors.map((se) => `${se.scope}: ${se.message}`).join('；')}` : ''}
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+            </div>
+          ) : null}
         </>
       ) : (
         <p className="text-[11px] text-ink-faint">能力状态加载中…</p>
       )}
 
-      {/* 安装入口：固定版本由服务端控制；sourceDir 可选本地可信包源绝对路径 */}
+      {/* 安装入口：默认=服务端官方 Git 固定 commit 获取；显式 sourceDir 优先严格安装 */}
       {!unwired ? (
         <div className="space-y-1.5 border-t border-line/60 pt-2" data-testid="orch-runtime-install">
           <div className="flex flex-wrap items-center gap-2">
             <input
               type="text"
               className={INPUT_CLS + ' flex-1 min-w-[200px]'}
-              placeholder="可选：本地 amagi-pi 包源绝对路径（仅限可信来源）"
+              placeholder="可选：本地 amagi-pi 包源绝对路径（优先于默认 Git 来源）"
               value={sourceDir}
               aria-label="本地 amagi-pi 包源绝对路径（可选）"
               data-testid="orch-runtime-source-dir"
               onChange={(e) => setSourceDir(e.target.value)}
             />
+            {canSelectDir ? (
+              <button
+                type="button"
+                onClick={() => void selectDir()}
+                disabled={installBusy}
+                className="inline-flex items-center gap-1 h-9 px-3 rounded-md border border-line text-xs text-ink hover:bg-paper disabled:opacity-60"
+                data-testid="orch-runtime-source-dir-pick"
+              >
+                选择目录
+              </button>
+            ) : null}
             <button
               type="button"
               onClick={() => void install()}
@@ -892,12 +1009,38 @@ function RuntimeStatusSection({
               data-testid="orch-runtime-install-btn"
             >
               {installBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : amagi?.installed ? <RefreshCw className="w-3.5 h-3.5" /> : <Download className="w-3.5 h-3.5" />}
-              {amagi?.installed ? '重装/校验固定版本' : `安装 amagi-pi ${amagi?.pinnedVersion ?? ''}`.trim()}
+              {installState === 'installed'
+                ? `校验固定版本 ${amagi?.pinnedVersion ?? ''}`.trim()
+                : trimmedSource
+                  ? `从目录安装 amagi-pi ${amagi?.pinnedVersion ?? ''}`.trim()
+                  : `安装 amagi-pi ${amagi?.pinnedVersion ?? ''}（官方 Git · ${(amagi?.commit ?? '').slice(0, 7)}）`.trim()}
             </button>
           </div>
-          {installError ? (
-            <p className="text-[11px] text-seal-2" role="alert" data-testid="orch-runtime-install-error">安装失败：{installError}</p>
+          {errorParts ? (
+            <div className="text-[11px] leading-snug" data-testid="orch-runtime-install-error">
+              <p className="text-seal-2" role="alert">{installState === 'installed' ? '校验失败：' : '安装失败：'}{errorParts.main}</p>
+              {errorParts.detail ? (
+                <button
+                  type="button"
+                  onClick={() => setErrorDetailOpen((value) => !value)}
+                  aria-expanded={errorDetailOpen}
+                  className="mt-0.5 text-ink-faint hover:text-ink underline"
+                  data-testid="orch-runtime-install-error-toggle"
+                >
+                  {errorDetailOpen ? '收起详细错误' : '展开详细错误'}
+                </button>
+              ) : null}
+              {errorParts.detail && errorDetailOpen ? (
+                <pre className="mt-1 max-h-[160px] overflow-y-auto scrollbar-thin whitespace-pre-wrap break-all rounded border border-line bg-card-bg p-2 text-[10px] text-ink-faint" data-testid="orch-runtime-install-error-detail">{errorParts.detail}</pre>
+              ) : null}
+            </div>
           ) : null}
+          <p className="text-[10px] text-ink-faint leading-relaxed" data-testid="orch-runtime-install-hint">
+            {trimmedSource
+              ? '已填本地目录：将严格按该源安装（版本与内容哈希校验不放松）。'
+              : `未填目录时默认从官方仓库 ${amagi?.repoUrl ?? ''} 固定 commit ${amagi?.commit ?? ''} 经 Pi CLI 获取安装（需本机 git 与网络；失败时可改填本地目录，不回退 npm/latest）。`}
+            {recommended ? ` 检测到与固定版本一致的本地来源：${recommended.packagePath}。` : ''}
+          </p>
           <p className="flex items-start gap-1 text-[10px] text-ink-faint leading-relaxed">
             <ShieldAlert className="w-3 h-3 mt-0.5 shrink-0" />
             amagi-pi 插件是受信任的 Node 代码，以当前用户权限运行（文件围栏不是 OS 沙箱）；固定版本由服务端控制，安装可用不等于质量/恢复/性能验收全部通过（完整启用以实测验收 fullyVerified 为准）。

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { isValidElement, type ReactElement } from 'react';
 import { parseBlocks, renderInline, resolveMediaPath } from './MarkdownView';
 import type { HtmlTableBlock } from '../../utils/html-table';
@@ -234,7 +234,7 @@ describe('renderInline 链接拦截（Markdown 与 HTML 两个分支）', () => 
 
   const findAnchor = (nodes: ReturnType<typeof renderInline>) =>
     (nodes as React.ReactElement[]).find((n) => isValidElement(n) && n.type === 'a') as
-      | React.ReactElement<{ href?: string }>
+      | React.ReactElement<{ href?: string; target?: string; onClick?: (event: { preventDefault: () => void; stopPropagation: () => void }) => void }>
       | undefined;
 
   it('markdown 链接：javascript: 降级为纯文本（无 <a>）', () => {
@@ -242,6 +242,23 @@ describe('renderInline 链接拦截（Markdown 与 HTML 两个分支）', () => 
     expect(findAnchor(nodes)).toBeUndefined();
     // 降级文本仍可读（不丢内容）
     expect((nodes as React.ReactElement[]).some((n) => isValidElement(n))).toBe(true);
+  });
+
+  it('已发布文档的相对链接交给标准库阅读器导航', () => {
+    const visited: string[] = [];
+    const nodes = renderInline('[作战单元](作战单元数据结构.md#ko_123)', 't', {
+      baseDir: '数据化战斗',
+      onNavigateDoc: (href) => { visited.push(href); return true; },
+    });
+    const link = findAnchor(nodes);
+    expect(link?.props.href).toBe('作战单元数据结构.md#ko_123');
+    expect(link?.props.target).toBeUndefined();
+    const preventDefault = vi.fn();
+    const stopPropagation = vi.fn();
+    link?.props.onClick?.({ preventDefault, stopPropagation });
+    expect(visited).toEqual(['作战单元数据结构.md#ko_123']);
+    expect(preventDefault).toHaveBeenCalledOnce();
+    expect(stopPropagation).toHaveBeenCalledOnce();
   });
 
   it('markdown 链接：data: 拒绝、https: 放行', () => {

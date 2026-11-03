@@ -27,7 +27,7 @@ afterAll(() => { for (const dir of tmpDirs) fs.rmSync(dir, { recursive: true, fo
  * - env FAKE_PI_SCRIPT=events 时，就绪后先发一轮自触发事件
  *   （message_update → agent_settled）。
  */
-function makeFakePi(root: string, script: 'idle' | 'events' = 'idle'): string {
+function makeFakePi(root: string, script: 'idle' | 'events' | 'slow-tool' = 'idle'): string {
   const file = path.join(root, `fake-pi-${script}.mjs`);
   fs.writeFileSync(file, `#!/usr/bin/env node
 const fs = await import('node:fs');
@@ -43,6 +43,11 @@ const rl = readline.createInterface({ input: process.stdin });
 rl.on('line', (line) => {
   let cmd; try { cmd = JSON.parse(line); } catch { return; }
   send({ type: 'response', id: cmd.id, command: cmd.type, success: true, data: {} });
+  if (cmd.type === 'prompt' && process.env.FAKE_PI_SCRIPT === 'slow-tool') {
+    setTimeout(() => send({ type: 'tool_execution_start', toolCallId: 'wait-1', toolName: 'task_control' }), 10);
+    setTimeout(() => send({ type: 'tool_execution_end', toolCallId: 'wait-1', toolName: 'task_control' }), 140);
+    setTimeout(() => send({ type: 'agent_settled' }), 165);
+  }
 });
 rl.on('close', () => process.exit(0));
 `, { mode: 0o755 });
@@ -172,6 +177,40 @@ describe('自触发轮次（selfTriggeredRounds）', () => {
     rpc.on('round_settled', () => events.push('settled'));
     await new Promise((r) => setTimeout(r, 100));
     expect(events).toEqual([]);
+    await rpc.terminate(500);
+  });
+});
+
+describe('Leader prompt 模型静默超时', () => {
+  it('长时间等待子任务工具不计入模型静默，且宿主轮次通知监督器', async () => {
+    const root = tmpRoot();
+    const pi = makeFakePi(root, 'slow-tool');
+    const rpc = new PiRpcProcess({
+      ...BASE, piCliPath: pi, tools: ['task_control'], buildMode: true,
+      selfTriggeredRounds: true, promptTimeoutMs: 80,
+      env: { ...BASE.env, FAKE_PI_ARGV_FILE: argvFile(root), FAKE_PI_SCRIPT: 'slow-tool' },
+    });
+    await rpc.start();
+    const rounds: string[] = [];
+    rpc.on('round_started', () => rounds.push('started'));
+    rpc.on('round_settled', () => rounds.push('settled'));
+    const outcome = await rpc.prompt('wait');
+    expect(outcome.outcome).toBe('completed');
+    expect(rounds).toEqual(['started', 'settled']);
+    await rpc.terminate(500);
+  });
+
+  it('模型持续静默仍按配置超时', async () => {
+    const root = tmpRoot();
+    const pi = makeFakePi(root);
+    const rpc = new PiRpcProcess({
+      ...BASE, piCliPath: pi, tools: ['task_control'], buildMode: true,
+      selfTriggeredRounds: true, promptTimeoutMs: 60,
+      env: { ...BASE.env, FAKE_PI_ARGV_FILE: argvFile(root) },
+    });
+    await rpc.start();
+    const outcome = await rpc.prompt('silent');
+    expect(outcome.error?.code).toBe('model_timeout');
     await rpc.terminate(500);
   });
 });

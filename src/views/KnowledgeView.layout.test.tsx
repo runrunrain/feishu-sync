@@ -11,13 +11,22 @@ const state = vi.hoisted(() => ({
   createBuild: vi.fn(),
   resumeBuild: vi.fn(),
   interrupted: false,
+  activeBuild: null as any,
+  sseStarts: 0,
   toast: { push: vi.fn(), dismiss: vi.fn(), toasts: [] },
   agent: { status: { code: 'ready' }, unreachable: false, loading: false, rechecking: false, recheck: vi.fn(), refresh: vi.fn() },
 }));
 
 vi.mock('../hooks/useAgentStatus', () => ({ useAgentStatus: () => state.agent }));
-vi.mock('../components/common/Toast', () => ({ useToast: () => state.toast }));
-vi.mock('../components/preview/MarkdownView', () => ({ MarkdownView: ({ content }: { content: string }) => <p>{content}</p> }));
+// ToastProvider creates a new context value whenever notifications change.
+vi.mock('../components/common/Toast', () => ({ useToast: () => ({ ...state.toast }) }));
+vi.mock('../utils/sseStream', () => ({ SseConnection: class {
+  constructor() { state.sseStarts += 1; }
+  start() { return Promise.resolve(); }
+  stop() { /* no-op */ }
+} }));
+vi.mock('../components/preview/MarkdownView', () => ({ MarkdownView: ({ content, onNavigateDoc }: { content: string; onNavigateDoc?: (href: string) => boolean }) =>
+  <p>{content}{content.startsWith('first') ? <a href="第二篇.md" onClick={(event) => { if (onNavigateDoc?.('第二篇.md')) event.preventDefault(); }}>阅读第二篇</a> : null}</p> }));
 vi.mock('../components/kb/RawSourceDrawer', () => ({ RawSourceDrawer: () => null }));
 vi.mock('../components/kb/KbPublishModal', () => ({ KbPublishModal: () => null }));
 vi.mock('../components/kb/KbPublishPanel', () => ({ KbPublishPanel: () => <p>发布面板</p> }));
@@ -32,12 +41,12 @@ vi.mock('../api/client', () => {
   class APIError extends Error { statusCode = 500; response = {}; }
   return {
     APIError,
-    getKbStatus: async () => ({ current: state.hasCurrent ? { releaseId: 'r1', docCount: 2, sourceCount: 2 } : null, pending: { added: 0, changed: 1, removed: 0 }, activeBuild: null }),
+    getKbStatus: async () => ({ current: state.hasCurrent ? { releaseId: 'r1', docCount: 2, sourceCount: 2 } : null, pending: { added: 0, changed: 1, removed: 0 }, activeBuild: state.activeBuild }),
     getKbTree: async () => ({ releaseId: 'r1', nodes: [{ name: '分类', path: '分类', type: 'dir', children: [
       { name: '第一篇', title: '第一篇', path: '分类/第一篇.md', type: 'doc', docId: 'first' },
       { name: '第二篇', title: '第二篇', path: '分类/第二篇.md', type: 'doc', docId: 'second' },
     ] }] }),
-    getKbDoc: async (id: string) => ({ docId: id, title: id === 'first' ? '第一篇' : '第二篇', path: `分类/${id}.md`, summary: '', tags: [], markdown: `${id} 正文`, releaseId: 'r1', sources: state.deletedSource ? [{ objToken: 'a', title: '已删除来源', relPath: 'a.md', state: 'deleted' }] : [] }),
+    getKbDoc: async (id: string) => ({ docId: id, title: id === 'first' ? '第一篇' : '第二篇', path: `分类/${id === 'first' ? '第一篇' : '第二篇'}.md`, summary: '', tags: [], markdown: `${id} 正文`, releaseId: 'r1', sources: state.deletedSource ? [{ objToken: 'a', title: '已删除来源', relPath: 'a.md', state: 'deleted' }] : [] }),
     listKbPublications: async () => ({ publications: [] }),
     getKbSourceTree: async () => ({ root: 'root', total: 2, nodes: [{ id: 'folder', title: '源目录', children: ['a', 'b'].map((id) => ({
       id, title: `来源 ${id.toUpperCase()}`, children: [], source: { objToken: id, title: `来源 ${id.toUpperCase()}`, relPath: `${id}.md`, included: state.included.has(id), pending: 'changed' },
@@ -59,9 +68,52 @@ vi.mock('../api/client', () => {
   };
 });
 
-import { KnowledgeView } from './KnowledgeView';
+import { KnowledgeView, resolveKnowledgeDocPath } from './KnowledgeView';
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 Element.prototype.scrollIntoView = vi.fn();
+
+it('库内 Markdown 链接按当前文档路径解析，拒绝越界路径', () => {
+  expect(resolveKnowledgeDocPath('数据化战斗/模型数据结构.md', '作战单元数据结构.md#ko_123'))
+    .toBe('数据化战斗/作战单元数据结构.md');
+  expect(resolveKnowledgeDocPath('数据化战斗/模型数据结构.md', '../系统框架/总览.md'))
+    .toBe('系统框架/总览.md');
+  expect(resolveKnowledgeDocPath('数据化战斗/模型数据结构.md', '#ko_123'))
+    .toBe('数据化战斗/模型数据结构.md');
+  expect(resolveKnowledgeDocPath('数据化战斗/模型数据结构.md', '../../escape.md')).toBeNull();
+  expect(resolveKnowledgeDocPath('数据化战斗/模型数据结构.md', '%2Fetc/passwd.md')).toBeNull();
+});
+
+it('点击已发布文档相对链接后在阅读区打开目标文档', async () => {
+  state.activeBuild = null;
+  const container = document.createElement('div'); document.body.append(container);
+  const root = createRoot(container);
+  try {
+    await act(async () => root.render(<KnowledgeView />));
+    expect(container.querySelector('[data-testid="kb-reading-body"]')?.textContent).toContain('first 正文');
+    await act(async () => container.querySelector<HTMLAnchorElement>('a[href="第二篇.md"]')!.click());
+    expect(container.querySelector('[data-testid="kb-reading-body"]')?.textContent).toContain('second 正文');
+    expect([...container.querySelectorAll('button')].find((button) => button.textContent?.trim() === '第二篇')?.getAttribute('aria-current')).toBe('true');
+  } finally {
+    await act(async () => root.unmount());
+    container.remove();
+  }
+});
+
+it('阶段构建期间切换文档保持正文可读，通知值变化不重建事件连接', async () => {
+  state.activeBuild = { id: 'running-build', status: 'running', eventSeq: 4 };
+  state.sseStarts = 0;
+  const container = document.createElement('div'); document.body.append(container);
+  const root = createRoot(container);
+  try {
+    await act(async () => root.render(<KnowledgeView />));
+    expect(state.sseStarts).toBe(1);
+    await act(async () => [...container.querySelectorAll('button')].find((item) => item.textContent?.trim() === '第二篇')!.click());
+    expect(container.querySelector('[data-testid="kb-reading-body"]')?.textContent).toContain('second 正文');
+    expect(state.sseStarts).toBe(1);
+  } finally {
+    act(() => root.unmount()); container.remove(); state.activeBuild = null;
+  }
+});
 
 it('重启后加载中断检查点和历史日志，确认后发起断点继续', async () => {
   state.interrupted = true; state.resumeBuild.mockClear();

@@ -82,3 +82,22 @@ it('历史表格的 CSV 附件进入构建快照并接受变更校验', () => {
   fs.writeFileSync(csv, '名称,数值\n消耗,20');
   expect(() => snapshot.readVerified(root, 'object-a')).toThrow(/构建期间被修改/);
 });
+
+it('已同步表格缺失子表索引时也冻结同名 CSV 附件', () => {
+  const root = fixture();
+  const file = path.join(root, '正常表.md');
+  fs.writeFileSync(file, header('object-a').replace('slides', 'sheet'));
+  const csv = path.join(root, '正常表.csv-data', '配置.csv');
+  fs.mkdirSync(path.dirname(csv)); fs.writeFileSync(csv, '字段,值\n速度,10');
+  const record: DocumentRecord = { ...doc, objType: 'sheet', title: '正常表', localMdPath: file,
+    localRelPath: '正常表.md', lastSyncedAt: '2026-11-02', lastSyncedModifyTime: '2026-11-02', status: 'synced' };
+  const projected = projectKnowledgeDocuments(root, [record]);
+  expect(projected[0]?.recoveredLocalVersion).toBeUndefined();
+  const resolveCsv = () => recoveredSourceCsvPaths(root, projected[0], []);
+  expect(resolveCsv()).toEqual([fs.realpathSync.native(csv)]);
+  const snapshot = RawSourceSnapshot.fromEntries(RawSourceSnapshot.scan(root, projected, resolveCsv).entries,
+    { sheetCsvPaths: resolveCsv });
+  expect(snapshot.readVerified(root, 'object-a').attachments[0]?.content).toContain('速度,10');
+  fs.writeFileSync(csv, '字段,值\n速度,20');
+  expect(() => snapshot.readVerified(root, 'object-a')).toThrow(/构建期间被修改/);
+});

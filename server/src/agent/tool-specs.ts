@@ -102,6 +102,7 @@ export const RAW_READ_SPEC: AgentToolSpec = {
       objToken: string('飞书对象 token'),
       offset: integer('起始行（0 基）', 0),
       limit: integer('返回行数上限', 1, 2000),
+      includeBlankCsvRows: { type: 'boolean', description: '可选；默认折叠连续 3 行以上已验证全空的 CSV 记录，保留原始行号、分页和读回执；需要逐字查看空行时设 true' },
     },
     required: ['objToken'],
     additionalProperties: false,
@@ -144,6 +145,8 @@ export const DRAFT_READ_SPEC: AgentToolSpec = {
       offset: integer('起始行（0 基）', 0),
       limit: integer('返回行数上限', 1, 2000),
       includeDeclarations: { type: 'boolean', description: '附上此文档的知识对象、稳定 clientKey 与关联声明，供修订时保留对象身份和证据登记' },
+      declarationClaimKey: string('可选：includeDeclarations=true 时只返回含此 claimKey 的对象、该断言及其证据；审查单个疑点时避免整篇声明过大'),
+      declarationObjectKey: string('可选：includeDeclarations=true 时按稳定 clientKey 或 objectId 只返回此对象的完整声明；先读摘要再按对象读取'),
     },
     required: ['path'],
     additionalProperties: false,
@@ -200,7 +203,7 @@ const evidenceSelectorSchema: Record<string, unknown> = {
     parserVersion: string('csv_cells：解析器版本标注'),
     recordStart: integer('csv_cells：起始逻辑 record 行（1 起始；引号内换行不算新记录）', 1),
     recordEnd: integer('csv_cells：结束逻辑 record 行', 1),
-    columns: { type: 'array', items: { type: 'string' }, description: 'csv_cells：列名（取自表头 record）' },
+    columns: { type: 'array', items: { type: 'string' }, description: 'csv_cells：首条 record 的列名；空白/重复表头用显式列坐标 @A、@B、@C' },
     businessKeys: { type: 'array', items: { type: 'string' }, description: 'csv_cells：稳定业务键（可选）' },
     // workbook_cells
     workbookName: string('workbook_cells：冻结工作簿名'),
@@ -222,26 +225,44 @@ const evidenceSelectorSchema: Record<string, unknown> = {
 
 const sourceRefSchema: Record<string, unknown> = {
   type: 'object',
-  description: '证据来源引用（sourceSnapshotHash/resourceHash 由 server 按快照与资源表补齐复核，不需要也不接受自报）',
+  description: '证据来源引用；单来源文本证据可省略，server 从 sources 补齐。CSV/工作簿可只给 resourceId。哈希由 server 复核。',
   properties: {
     sourceId: string('来源 objToken（必须在快照内）'),
     resourceId: string('资源 ID：主文档=objToken；CSV 附件=<objToken>#csv:<文件名>；声明工作簿=<objToken>#workbook:<xlsx 名>；图片=<objToken>#image:<md 内 src>（未描述图片不登记）'),
   },
-  required: ['sourceId', 'resourceId'],
+  required: [],
   additionalProperties: false,
 };
 
 export const KB_WRITE_DOC_SPEC: AgentToolSpec = {
   name: 'kb_write_doc',
   label: '写入标准文档草稿',
-  description: `写入一篇标准文档草稿到本构建 staging（同路径覆盖）。server 生成文件头（doc_id/sources/build_id），你只需提供正文、标题、来源与摘要。${KB_DECLARATION_CONSTRAINTS}`,
+  description: `写入一篇标准文档草稿到本构建 staging（同路径覆盖）。server 从 path 生成标题，从载荷生成幂等键，并补齐对象/证据/覆盖声明的机械字段；模型负责正文、对象语义、断言、证据定位和覆盖裁定。${KB_DECLARATION_CONSTRAINTS}`,
   parameters: {
     type: 'object',
     properties: {
       path: string('标准文档 POSIX 相对路径（.md 结尾，不以 . 开头，每段 ≤120 字符，深度 ≤6）'),
-      operationId: string('v2 编排必填（旧构建可缺省）：任务内唯一操作标识——提交成功但回执丢失时，同 ID 同载荷重放返回原回执'),
-      title: string('文档标题（名词性短语）'),
+      operationId: string('可选；省略时 server 从规范化载荷生成稳定幂等键。显式提供时同 ID 同载荷重放返回原回执'),
+      title: string('可选；省略时取 path 文件名（不含 .md）'),
       markdown: string('自然完整的知识正文，不含文件头或 # 总标题。禁止来源段落、来源标识、原始路径、来源脚注及构建信息；来源仅填sources，由侧栏展示。'),
+      csvTableImports: {
+        type: 'array', maxItems: 10,
+        description: '可选：由 server 从冻结 CSV 逐行生成 Markdown 表格，替换正文中的 {{kb-csv-table:key}}。模型只选列和记录范围，不手抄表格行；导入会登记真实读取回执。',
+        items: {
+          type: 'object',
+          properties: {
+            key: string('占位键，正文使用 {{kb-csv-table:key}}'),
+            sourceId: string('来源 objToken，必须列在 sources 中'),
+            csvName: string('CSV 附件文件名，不能包含路径'),
+            columns: { type: 'array', minItems: 1, maxItems: 20, items: integer('0 起始列坐标', 0, 99) },
+            headerRecord: integer('标题所在逻辑记录，1 起始；缺省 1', 1),
+            firstRecord: integer('首条数据所在逻辑记录；缺省标题下一条', 1),
+            lastRecord: integer('末条数据所在逻辑记录；缺省至末尾；空白行自动跳过', 1),
+          },
+          required: ['key', 'sourceId', 'csvName', 'columns'],
+          additionalProperties: false,
+        },
+      },
       sources: { type: 'array', items: { type: 'string' }, description: '来源 objToken 列表（必须都在快照内）' },
       summary: string('≤200字的内容概要，只概括本文规则或机制。例如“战斗行动的回合次数、先手判定与怒气消耗”。禁止“新增/补充/生成/撰写标准文档”“依据新增源”“本次更新”等写作动作、来源变动与修订对比。更新总结只填kb_finish.summary。'),
       tags: { type: 'array', items: { type: 'string' }, description: '标签列表' },
@@ -260,8 +281,8 @@ export const KB_WRITE_DOC_SPEC: AgentToolSpec = {
             aliases: { type: 'array', items: { type: 'string' }, description: '受控别名（只帮助查找，不自动合并）' },
             domainIds: { type: 'array', items: { type: 'string' }, description: '领域标注' },
             familyKey: string('同一业务问题的聚合键（规划提出）'),
-            variantKey: string('方案区分键（无变体填 default）'),
-            scopeKey: string('适用范围键（必填；每对象一个）'),
+            variantKey: string('方案区分键；无变体可省略，由 server 填 default'),
+            scopeKey: string('可选；省略时 server 从本文档路径和 scopeText 生成稳定键'),
             scopeText: string('可读范围说明'),
             headingPath: { type: 'array', items: { type: 'string' }, description: 'canonical 主位置：markdown 内的标题路径（定位对象章节；与 bodyRange 二选一）' },
             occurrence: integer('headingPath 命中重复标题时的次序（1 起始，缺省 1）', 1),
@@ -281,7 +302,7 @@ export const KB_WRITE_DOC_SPEC: AgentToolSpec = {
               },
             },
           },
-          required: ['clientKey', 'type', 'title', 'familyKey', 'variantKey', 'scopeKey', 'scopeText'],
+          required: ['clientKey', 'type', 'title', 'familyKey', 'scopeText'],
           additionalProperties: false,
         },
       },
@@ -328,16 +349,16 @@ export const KB_WRITE_DOC_SPEC: AgentToolSpec = {
         items: {
           type: 'object',
           properties: {
-            clientKey: string('证据临时标识（relations.evidenceKeys 用它引用）'),
+            clientKey: string('可选；省略时 server 按对象、断言、来源和同组序号生成稳定键。若关系要引用本证据则显式填写'),
             objectKey: string('所属对象引用（clientKey 或 objectId）'),
             claimKey: string('对象内断言键（对应 objects.claims.claimKey）'),
             sourceRef: sourceRefSchema,
             selector: evidenceSelectorSchema,
-            role: { type: 'string', enum: ['supports', 'contradicts', 'context'], description: '证据角色' },
-            nature: { type: 'string', enum: ['direct', 'derived', 'machine_description'], description: '证据性质（图片描述只能 machine_description，不得标 direct）' },
-            readReceiptId: string('raw_read 返回的回执 ID（text/csv 证据必填）'),
+            role: { type: 'string', enum: ['supports', 'contradicts', 'context'], description: '可选，默认 supports；反证和背景须显式标注' },
+            nature: { type: 'string', enum: ['direct', 'derived', 'machine_description'], description: '可选，文本默认 direct、图片默认 machine_description；推导须显式标注 derived' },
+            readReceiptId: string('可选；省略时 server 按 selector 从本构建 raw_read 回执中选覆盖范围的回执，未读则拒绝'),
           },
-          required: ['clientKey', 'objectKey', 'claimKey', 'sourceRef', 'selector', 'role', 'nature'],
+          required: ['objectKey', 'claimKey', 'selector'],
           additionalProperties: false,
         },
       },
@@ -347,7 +368,7 @@ export const KB_WRITE_DOC_SPEC: AgentToolSpec = {
         items: {
           type: 'object',
           properties: {
-            itemId: string('覆盖项 ID（源内稳定标识）'),
+            itemId: string('可选；省略时 server 按来源、分类和同组序号生成稳定 ID。修订时若会插入/重排同类覆盖项，应显式给稳定 itemId'),
             sourceId: string('来源 objToken（须在快照内）'),
             category: string('分类（如 formula/exception/conflict）'),
             importance: { type: 'string', enum: ['important', 'normal'], description: '重要性（重要项无去向阻止发布）' },
@@ -355,12 +376,12 @@ export const KB_WRITE_DOC_SPEC: AgentToolSpec = {
             targetKeys: { type: 'array', items: { type: 'string' }, description: 'mapped 目标对象引用（clientKey 或 objectId）' },
             reason: string('排除/未处理理由（排除项必填）'),
           },
-          required: ['itemId', 'sourceId', 'category', 'disposition'],
+          required: ['sourceId', 'category', 'disposition'],
           additionalProperties: false,
         },
       },
     },
-    required: ['path', 'title', 'markdown', 'sources', 'summary'],
+    required: ['path', 'markdown', 'sources', 'summary'],
     additionalProperties: false,
   },
 };
@@ -542,7 +563,7 @@ export const KB_SUBMIT_REVIEW_SPEC: AgentToolSpec = {
     type: 'object',
     properties: {
       unitId: string('审查对象单元 ID（缺省取当前 worker 单元；整体审查填 all）'),
-      operationId: string('v2 编排必填（旧构建可缺省）：任务内唯一操作标识（幂等重放键）'),
+      operationId: string('可选；省略时 server 按审查载荷生成稳定幂等键'),
       coverage: {
         type: 'object',
         description: '覆盖范围：检查了哪些源材料（不能只给总分）',
@@ -881,6 +902,8 @@ export const KB_READ_BATCH_SPEC: AgentToolSpec = {
             offset: integer('起始行（0 基；raw 为拼接后输出坐标）', 0),
             limit: integer('本资源返回行数上限', 1, 2000),
             includeDeclarations: { type: 'boolean', description: 'draft：附现有知识对象声明（供局部编辑继承）' },
+            declarationClaimKey: string('draft：只附此 claimKey 的对象、断言和证据；需同时设 includeDeclarations=true'),
+            declarationObjectKey: string('draft：只附此 clientKey/objectId 对象的完整声明；需同时设 includeDeclarations=true'),
           },
           required: ['kind'],
           additionalProperties: false,
@@ -899,12 +922,12 @@ export const KB_READ_BATCH_SPEC: AgentToolSpec = {
 export const KB_EDIT_DOC_SPEC: AgentToolSpec = {
   name: 'kb_edit_doc',
   label: '局部编辑草稿',
-  description: `对已有草稿做局部修改：服务端定位替换区间、继承未变声明（对象/断言/证据/呈现/关系自动平移坐标）、重算受影响对象哈希并使被改内容的旧审查失效。与 kb_write_doc 走同一校验链（编辑边界/来源声明/正文策略/声明解引用全部复用），不是绕开。定位失败返回结构化错误（候选位置与最近匹配）；expectedContentHash 不符说明草稿已变（他人或自己上一轮写入），需重读后重提。每次调用需唯一 operationId：提交成功但回执丢失时，用同 operationId 与同载荷重放即返回原回执。受影响对象（替换区间与对象区间相交）会被列出；语义变化需要调整对象归属时用 kb_write_doc 显式重申。`,
+  description: `对已有草稿做局部修改：服务端定位替换区间、继承未变声明（对象/断言/证据/呈现/关系自动平移坐标）。evidenceSelectorUpdates 可只替换证据范围；coverageUpdates 可按稳定 itemId 只修覆盖去向，无需手填整篇声明。三种更新至少提供一项。所有证据仍经冻结来源、读回执与声明解引用校验；修改使旧审查失效。expectedContentHash 不符说明草稿已变，需重读后重提。operationId 可省略，由 server 按载荷生成稳定幂等键；回执丢失时原样重放。对象身份或断言结构变化仍用 kb_write_doc 显式重申。`,
   parameters: {
     type: 'object',
     properties: {
       path: string('草稿 POSIX 相对路径（须已存在）'),
-      operationId: string('任务内唯一操作标识（幂等键；重放需同 ID 同载荷）'),
+      operationId: string('可选；省略时 server 按编辑载荷生成稳定幂等键'),
       expectedContentHash: string('编辑基准内容哈希（draft_read 返回的 contentHash；防止草稿已变时盲写）'),
       patches: {
         type: 'array', minItems: 1, maxItems: 50,
@@ -932,13 +955,57 @@ export const KB_EDIT_DOC_SPEC: AgentToolSpec = {
           additionalProperties: false,
         },
       },
+      evidenceSelectorUpdates: {
+        type: 'array', minItems: 1, maxItems: 20,
+        description: '可选：按现有 evidenceId 替换 selector；其余对象、来源、断言与未改证据由服务端继承。新范围必须有覆盖的读回执。',
+        items: {
+          type: 'object',
+          properties: {
+            evidenceId: string('draft_read 声明中现有证据的 evidenceId'),
+            selector: evidenceSelectorSchema,
+            readReceiptId: string('可选：覆盖新 selector 的读取回执；省略则服务端在本构建回执中查找'),
+          },
+          required: ['evidenceId', 'selector'],
+          additionalProperties: false,
+        },
+      },
+      coverageUpdates: {
+        type: 'array', minItems: 1, maxItems: 20,
+        description: '可选：以已有 itemId 更新覆盖项，未列出的覆盖项与对象/证据声明由服务端继承。',
+        items: {
+          type: 'object',
+          properties: {
+            itemId: string('现有覆盖项的稳定 itemId'),
+            sourceId: string('可选；省略时服务端继承原来源，填写时必须与原项一致'),
+            category: string('可选；省略时服务端继承原分类，填写时必须与原项一致'),
+            importance: { type: 'string', enum: ['important', 'normal'] },
+            disposition: { type: 'string', enum: ['mapped', 'excluded_template', 'excluded_nonknowledge', 'unresolved'] },
+            targetKeys: { type: 'array', items: { type: 'string' }, description: 'mapped 对象引用（clientKey 或 objectId）' },
+            reason: string('排除/未处理理由（排除项必填）'),
+          },
+          required: ['itemId', 'disposition'],
+          additionalProperties: false,
+        },
+      },
       titleUpdate: string('可选：更新文档标题'),
       summaryUpdate: string('可选：更新摘要；未提供时沿用现有摘要（缺失且无 docMeta 时必填）'),
       tagsUpdate: { type: 'array', items: { type: 'string' }, description: '可选：更新标签' },
       sourcesAppend: { type: 'array', items: { type: 'string' }, description: '可选：追加来源 objToken（原来源保留；须在快照内）' },
       expectedDraftRevision: integer('可选：期望的草稿修订号（乐观并发；不符拒绝）', 0),
     },
-    required: ['path', 'operationId', 'patches'],
+    required: ['path'],
+    additionalProperties: false,
+  },
+};
+
+export const KB_TOOL_SCHEMA_SPEC: AgentToolSpec = {
+  name: 'kb_tool_schema',
+  label: '读取工具参数契约',
+  description: '只读返回当前角色有权调用的一个知识工具的完整 JSON 参数 schema。mcp_list_tools 仅显示名称与简介；遇到未知字段时读取本契约，不通过失败调用猜测字段。',
+  parameters: {
+    type: 'object',
+    properties: { name: string('要查看的知识工具名，如 kb_edit_doc') },
+    required: ['name'],
     additionalProperties: false,
   },
 };
@@ -946,10 +1013,11 @@ export const KB_EDIT_DOC_SPEC: AgentToolSpec = {
 export const BUILD_MANIFEST_SPEC: AgentToolSpec = {
   name: 'build_manifest',
   label: '材料清单',
-  description: '列出本次构建冻结的源材料清单（objToken、标题、相对路径、类型、内容哈希、变更类型），带分页游标。只读。',
+  description: '默认只列本轮工作集源；scope=all 才列完整冻结快照。每项含 objToken、标题、路径、内容哈希、变更类型、源可用性、已关联标准文档路径、有效内容是否与已发布版相同（含图片及白板旁路变化）。带分页游标，只读。',
   parameters: {
     type: 'object',
     properties: {
+      scope: { type: 'string', enum: ['workset', 'all'], description: '默认 workset；all 仅用于查找背景来源，不代表派发范围' },
       cursor: string('分页游标（上一页返回的 nextCursor）'),
       limit: integer('每页条数', 1, 200),
     },
@@ -990,18 +1058,18 @@ export const BUILD_REVOKE_OUTPUT_SPEC: AgentToolSpec = {
 export const BUILD_HANDOFF_SUBMIT_SPEC: AgentToolSpec = {
   name: 'build_handoff_submit',
   label: '提交交接记录',
-  description: '子任务提交交接记录：成果引用（路径+修订）、来源范围、未解决问题与下一步所需信息。正文留在应用候选区，交接只携带可回读的引用与摘要；最终回复只给交接编号与结论。operationId 幂等：提交成功但回执丢失可同参重放。',
+  description: '子任务提交交接记录：成果引用（路径+修订）、来源范围、未解决问题与下一步所需信息。正文留在应用候选区，交接只携带可回读的引用与摘要；最终回复只给交接编号与结论。operationId 可省略，server 按载荷生成稳定幂等键；回执丢失可同参重放。',
   parameters: {
     type: 'object',
     properties: {
-      operationId: string('任务内唯一操作标识（幂等键）'),
+      operationId: string('可选；省略时 server 按交接载荷生成稳定幂等键'),
       summary: string('结论摘要（≤2000 字符）'),
       artifactRefs: { type: 'array', maxItems: 200, items: { type: 'string' }, description: '成果引用（路径或路径@revision）' },
       sourceScope: { type: 'array', maxItems: 200, items: { type: 'string' }, description: '覆盖的源 objToken' },
       openIssues: { type: 'array', maxItems: 200, items: { type: 'string' }, description: '未解决问题（描述+位置）' },
       nextInfo: { type: 'array', maxItems: 200, items: { type: 'string' }, description: '下一步所需信息/建议' },
     },
-    required: ['operationId', 'summary'],
+    required: ['summary'],
     additionalProperties: false,
   },
 };
@@ -1125,6 +1193,7 @@ const ALL_SPECS: AgentToolSpec[] = [
   TASK_CANCEL_SPEC,
   KB_READ_BATCH_SPEC,
   KB_EDIT_DOC_SPEC,
+  KB_TOOL_SCHEMA_SPEC,
   BUILD_MANIFEST_SPEC,
   BUILD_ASSIGN_OUTPUT_SPEC,
   BUILD_REVOKE_OUTPUT_SPEC,

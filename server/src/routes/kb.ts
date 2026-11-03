@@ -548,13 +548,16 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
     }
   });
 
-  // 重构 v2：安装版本化 amagi-pi（npm 模式；未发布时经 sourceDir 物化安装）。
+  // 重构 v2 + plugin-install-fix：安装版本化 amagi-pi。显式 sourceDir → 严格
+  // source 模式；默认（空体）→ 官方 Git 固定 commit 获取链（npm:2.21.31 实测
+  // 404，不再作默认）；已装记录 → 完整校验复用（响应 fresh=false）。并发串行
+  // （busy 409）。响应携带 layout 与 Git 获取溯源供 UI 呈现。
   routes.post('/api/kb/build-runtime/install', async (c) => {
     if (!deps.buildRuntime) {
       return c.json({ error: 'build_runtime_unavailable', message: '构建运行宿主未接线（服务端未完成集成）' }, 503);
     }
     let body: { sourceDir?: unknown } = {};
-    try { body = await c.req.json() as { sourceDir?: unknown }; } catch { /* 空体缺省 npm 模式 */ }
+    try { body = await c.req.json() as { sourceDir?: unknown }; } catch { /* 空体缺省 Git 官方获取链 */ }
     const sourceDir = typeof body.sourceDir === 'string' && body.sourceDir.trim() !== '' ? body.sourceDir.trim() : undefined;
     // F13（审核修复）：绝对路径判定与实际宿主平台一致（win32 接受盘符/UNC，
     // POSIX 只接受 / 开头）——不再硬编码 startsWith('/') 把 Windows 合法路径拒死；
@@ -567,11 +570,21 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
         ...(sourceDir ? { sourceDir } : {}),
         log: (line) => console.info(line),
       });
-      return c.json({ installed: true, fresh: installed.fresh, version: installed.version, installDir: installed.installDir, contentHash: installed.contentHash });
+      const record = installed.record as { layout?: string; dependenciesIncluded?: boolean; acquisition?: { gitSource: string; commit: string; repoUrl: string; acquiredPackageRoot: string } } | null;
+      return c.json({
+        installed: true,
+        fresh: installed.fresh,
+        version: installed.version,
+        installDir: installed.installDir,
+        contentHash: installed.contentHash,
+        layout: record?.layout ?? null,
+        dependenciesIncluded: record?.dependenciesIncluded === true,
+        ...(record?.acquisition ? { acquisition: { gitSource: record.acquisition.gitSource, commit: record.acquisition.commit, repoUrl: record.acquisition.repoUrl, acquiredPackageRoot: record.acquisition.acquiredPackageRoot } } : {}),
+      });
     } catch (error) {
       const code = (error as { code?: string }).code ?? 'amagi_install_failed';
       const status = (error as { status?: number }).status ?? 400;
-      return c.json({ error: code, message: error instanceof Error ? error.message : String(error) }, status as 400 | 500);
+      return c.json({ error: code, message: error instanceof Error ? error.message : String(error) }, status as 400 | 409 | 500);
     }
   });
 

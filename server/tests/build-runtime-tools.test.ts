@@ -18,6 +18,9 @@ import { AgentToolService, type BuildRunState, ToolError, draftEditCoordinates }
 import { RawSourceSnapshot, computeSourceHash } from '../src/kb/raw-source-snapshot.js';
 import { BuildActorStore, V2_CHILD_ALL_TOOLS } from '../src/kb/build-actors.js';
 import { contentResourceHash } from '../src/kb/evidence-locator.js';
+import { StandardKbStore } from '../src/kb/standard-kb-store.js';
+import { KbVersionStore } from '../src/kb/kb-version-store.js';
+import { collectAuthorityValidatedReports, resolveCurrentReviewDependencies, scopedReviewDeclarationHash } from '../src/kb/review-authority.js';
 import { V2_LEADER_TOOLS } from '../src/agent/tool-specs.js';
 import type { RawSourceSnapshotEntry } from '../src/types/agent-knowledge.js';
 
@@ -147,14 +150,100 @@ describe('Leader 工具面（§3.4）', () => {
 
   it('build_manifest 分页与 workset changeType', async () => {
     const setup = makeV2('b-leader3');
+    setup.state.requiredRewrites = new Set(['docs/rebuild.md']);
     const page1 = await call(setup.leader.token, 'build_manifest', { limit: 1 });
     const body1 = JSON.parse(page1.content[0]!.text);
     expect(body1.entries).toHaveLength(1);
+    expect(body1.requiredRewrites).toEqual(['docs/rebuild.md']);
     expect(body1.entries[0].changeType).toBe('added');
     expect(body1.nextCursor).toBeTruthy();
     const page2 = await call(setup.leader.token, 'build_manifest', { limit: 1, cursor: body1.nextCursor });
     expect(JSON.parse(page2.content[0]!.text).entries).toHaveLength(1);
     expect(JSON.parse(page2.content[0]!.text).nextCursor).toBeNull();
+  });
+
+  it('build_manifest 提前给出长源规模和子表边界，不传全文', async () => {
+    const longSource = ['# 长表', '## 子表: ①规则', ...Array.from({ length: 1250 }, () => '规则行'), '## 子表: ②配置', '配置行'].join('\n');
+    writeRaw('src-b.md', longSource);
+    try {
+      const setup = makeV2('b-manifest-shape');
+      const body = JSON.parse((await call(setup.leader.token, 'build_manifest', {})).content[0]!.text);
+      const shape = body.entries.find((source: { objToken: string }) => source.objToken === 'tokB')?.sourceShape;
+      expect(shape).toMatchObject({ totalLines: 1254, sectionCount: 2, attachmentCount: 0,
+        sections: [{ line: 2, heading: '子表: ①规则' }, { line: 1253, heading: '子表: ②配置' }] });
+      expect(body.entries.find((source: { objToken: string }) => source.objToken === 'tokB')).not.toHaveProperty('content');
+    } finally { writeRaw('src-b.md', RAW_B); }
+  });
+
+  it('build_manifest 给出 CSV 附件的 raw_read 跳读坐标并识别空白附件', async () => {
+    const markdown = '# 源B\n## 子表: ①规则\n正文';
+    const csv = writeRaw('rules.csv', '字段,值\n步长,1\n');
+    const blank = writeRaw('blank.csv', ' , \n');
+    const source = writeRaw('src-b.md', markdown);
+    try {
+      const setup = makeV2('b-manifest-csv-shape');
+      const other = setup.state.snapshot.get('tokA')!;
+      setup.state.snapshot = RawSourceSnapshot.fromEntries([
+        other, { ...entry('tokB', 'src-b.md'), objType: 'sheet', contentHash: computeSourceHash(source, [csv, blank], kbRoot) },
+      ], { knowledgeBaseRoot: kbRoot, sheetCsvPaths: (token) => token === 'tokB' ? [csv, blank] : [] });
+      const body = JSON.parse((await call(setup.leader.token, 'build_manifest', {})).content[0]!.text);
+      const shape = body.entries.find((item: { objToken: string }) => item.objToken === 'tokB')?.sourceShape;
+      expect(shape).toMatchObject({ totalLines: 10, attachmentCount: 2, sections: [{ line: 2, heading: '子表: ①规则' }] });
+      expect(shape.attachments[0]).toMatchObject({ label: 'rules.csv', outputStart: 6, outputEnd: 8 });
+      expect(shape.attachments[1]).toMatchObject({ label: 'blank.csv', nonEmptyCells: 0, outputStart: null, outputEnd: null });
+    } finally {
+      writeRaw('src-b.md', RAW_B);
+      fs.rmSync(csv, { force: true });
+      fs.rmSync(blank, { force: true });
+    }
+  });
+
+  it('build_manifest 在派发前标记飞书权限占位源', async () => {
+    writeRaw('src-b.md', '# 源B\n\n> **注意**: 该文档在飞书侧权限受限（当前账号无访问权限，API 返回 40403 no permission），无法获取内容。\n\n> 如需查阅，请在飞书中向文档所有者申请权限后重新获取。');
+    try {
+      const setup = makeV2('b-manifest-permission');
+      const body = JSON.parse((await call(setup.leader.token, 'build_manifest', {})).content[0]!.text);
+      expect(body.entries.find((source: { objToken: string }) => source.objToken === 'tokB')?.sourceAvailability)
+        .toBe('permission_denied_placeholder');
+      expect(body.entries.find((source: { objToken: string }) => source.objToken === 'tokA')?.sourceAvailability)
+        .toBe('available');
+    } finally { writeRaw('src-b.md', RAW_B); }
+  });
+
+  it('build_manifest 不把图片变化的工作集来源标为已发布版未变', async () => {
+    const setup = makeV2('b-manifest-media-change');
+    const original = setup.state.snapshot.get('tokA')!;
+    setup.state.snapshot = RawSourceSnapshot.fromEntries([
+      { ...original, mediaHash: 'sha256:new' },
+      setup.state.snapshot.get('tokB')!,
+    ], { knowledgeBaseRoot: kbRoot, sheetCsvPaths: () => [] });
+    setup.state.workset.set('tokA', 'changed');
+    const readManifest = vi.spyOn(StandardKbStore.prototype, 'readManifest').mockReturnValue({
+      sourceSnapshot: [{ ...original, mediaHash: 'sha256:old' }],
+      docs: [],
+    } as never);
+    try {
+      const manifest = JSON.parse((await call(setup.leader.token, 'build_manifest', {})).content[0]!.text);
+      expect(manifest.entries.find((source: { objToken: string }) => source.objToken === 'tokA')).toMatchObject({
+        changeType: 'changed',
+        unchangedFromPublished: false,
+      });
+    } finally {
+      readManifest.mockRestore();
+    }
+  });
+
+  it('增量构建默认清单只含工作集，完整快照必须显式查询', async () => {
+    const setup = makeV2('b-manifest-workset');
+    setup.state.workset.delete('tokB');
+    const workset = JSON.parse((await call(setup.leader.token, 'build_manifest', {})).content[0]!.text);
+    expect(workset.scope).toBe('workset');
+    expect(workset.total).toBe(1);
+    expect(workset.entries.map((entry: { objToken: string }) => entry.objToken)).toEqual(['tokA']);
+    const all = JSON.parse((await call(setup.leader.token, 'build_manifest', { scope: 'all' })).content[0]!.text);
+    expect(all.scope).toBe('all');
+    expect(all.total).toBe(2);
+    expect(all.entries.find((entry: { objToken: string }) => entry.objToken === 'tokB')?.changeType).toBeNull();
   });
 });
 
@@ -199,6 +288,7 @@ describe('child 身份链（§4.1）', () => {
     const pendingSpecs = service.getToolSpecsForToken(setup.child.token, { amagiTaskId: 'p1', amagiAgent: 'luban' })!.map((s) => s.name);
     expect(pendingSpecs).not.toContain('kb_write_doc');
     expect(pendingSpecs).toContain('raw_read');
+    expect(pendingSpecs).toContain('kb_tool_schema');
     // 无身份头 → 空面（与 amagi_task_missing 拒绝一致）
     const noIdentity = service.getToolSpecsForToken(setup.child.token)!.map((s) => s.name);
     expect(noIdentity).toEqual([]);
@@ -207,10 +297,40 @@ describe('child 身份链（§4.1）', () => {
     expect(service.isReadOnlyTool('kb_write_doc')).toBe(false);
     expect(service.isReadOnlyTool('kb_edit_doc')).toBe(false);
     expect(service.isReadOnlyTool('build_handoff_list')).toBe(true);
+    expect(service.isReadOnlyTool('kb_tool_schema')).toBe(true);
+  });
+
+  it('工具契约只对当前角色可见，写作可查 edit schema 而审查不可查', async () => {
+    const setup = makeV2('b-tool-schema');
+    setup.store.registerTaskCreation({ nativeTaskId: 'w1', requestedRole: 'luban' });
+    setup.store.registerTaskCreation({ nativeTaskId: 'r1', requestedRole: 'diting' });
+    const result = await call(setup.child.token, 'kb_tool_schema', { name: 'kb_edit_doc' }, meta('w1', 'luban'));
+    const spec = JSON.parse(result.content[0]!.text!) as { name: string; parameters: unknown };
+    expect(spec.name).toBe('kb_edit_doc');
+    expect(spec.parameters).toMatchObject({ properties: { evidenceSelectorUpdates: { items: { properties: {
+      evidenceId: { type: 'string' }, selector: { type: 'object' },
+    } } } } });
+    expect(spec.parameters).toMatchObject({ properties: { patches: { items: { properties: { anchor: { properties: { kind: {
+      enum: ['exact_text', 'heading_body', 'line_range'],
+    } } } } } } } });
+    await expectToolError(() => call(setup.child.token, 'kb_tool_schema', { name: 'kb_edit_doc' }, meta('r1', 'diting')), 'tool_not_allowed');
   });
 });
 
 describe('写入链（§4.2/§4.4）', () => {
+  it('新目录尚无草稿时返回 not_found，随后可在该目录写入', async () => {
+    const setup = makeV2('b-new-directory');
+    setup.store.registerTaskCreation({ nativeTaskId: 'w1', requestedRole: 'luban' });
+    const path = '数据化舞台/地图数据结构.md';
+    await expectToolError(() => call(setup.child.token, 'draft_read', { path }, meta('w1', 'luban')), 'not_found');
+    await call(setup.leader.token, 'build_assign_output', { ownerTaskId: 'w1', targets: [path] });
+    await call(setup.child.token, 'kb_write_doc', {
+      path, title: '地图数据结构', markdown: '地图正文', sources: ['tokA'], summary: '地图摘要', operationId: 'op-new-directory',
+    }, meta('w1', 'luban'));
+    const draft = await call(setup.child.token, 'draft_read', { path }, meta('w1', 'luban'));
+    expect(draft.content[0]!.text).toContain('地图正文');
+  });
+
   it('未分配 → 可重试 409；分配后写入成功并留回执；重放返回原回执；异载荷拒绝', async () => {
     const setup = makeV2('b-write1');
     setup.store.registerTaskCreation({ nativeTaskId: 'w1', requestedRole: 'luban' });
@@ -280,7 +400,7 @@ describe('写入链（§4.2/§4.4）', () => {
 });
 
 describe('kb_edit_doc（§7 局部编辑）', () => {
-  async function writeDraftWithObject(setup: V2Setup, taskId: string): Promise<void> {
+  async function writeDraftWithObject(setup: V2Setup, taskId: string, withCoverage = false): Promise<void> {
     await call(setup.leader.token, 'build_assign_output', { ownerTaskId: taskId, targets: ['docs/edit.md'] });
     // 先 raw_read 拿真实回执（证据声明 hard 约束：text_span 必须带 readReceiptId）
     const read = await call(setup.child.token, 'raw_read', { objToken: 'tokA', limit: 10 }, meta(taskId, 'luban'));
@@ -312,6 +432,8 @@ describe('kb_edit_doc（§7 局部编辑）', () => {
         nature: 'direct',
         readReceiptId,
       }],
+      ...(withCoverage ? { coverageUpdates: [{ itemId: 'cov-main', sourceId: 'tokA', category: 'rule',
+        importance: 'important', disposition: 'unresolved', reason: '待映射' }] } : {}),
     }, meta(taskId, 'luban'));
     expect(write.details!.objectMap).toBeTruthy();
   }
@@ -366,6 +488,62 @@ describe('kb_edit_doc（§7 局部编辑）', () => {
     }, meta('w1', 'luban'));
     expect(replay.details!.idempotentReplay).toBe(true);
     void contentHash;
+  });
+
+  it('只更新已有证据的 selector：服务端继承其余声明并重新校验来源', async () => {
+    const setup = makeV2('b-edit-evidence');
+    setup.store.registerTaskCreation({ nativeTaskId: 'w1', requestedRole: 'luban' });
+    await writeDraftWithObject(setup, 'w1');
+    const draftPath = path.join(setup.state.stagingRoot, 'knowledge-draft.json');
+    const bodyPath = path.join(setup.state.stagingRoot, 'docs', 'docs', 'edit.md');
+    const before = JSON.parse(fs.readFileSync(draftPath, 'utf-8'));
+    const body = fs.readFileSync(bodyPath, 'utf-8');
+    const evidenceId = before.evidenceKeys['ev-1'] as string;
+    const objectId = before.clientKeys['obj-main'] as string;
+
+    const edited = await call(setup.child.token, 'kb_edit_doc', {
+      path: 'docs/edit.md', operationId: 'op-evidence',
+      evidenceSelectorUpdates: [{ evidenceId, selector: { kind: 'text_span', lineStart: 4, lineEnd: 4 } }],
+    }, meta('w1', 'luban'));
+    expect(edited.details).toMatchObject({ edit: { inheritedDeclarations: true, patches: [] } });
+    const after = JSON.parse(fs.readFileSync(draftPath, 'utf-8'));
+    expect(fs.readFileSync(bodyPath, 'utf-8')).toBe(body);
+    expect(after.evidenceKeys['ev-1']).toBe(evidenceId);
+    expect(after.evidence.find((item: { evidenceId: string }) => item.evidenceId === evidenceId).selector)
+      .toMatchObject({ kind: 'text_span', lineStart: 4, lineEnd: 4 });
+    expect(after.objects.find((item: { objectId: string }) => item.objectId === objectId).reviewSubjectHash)
+      .not.toBe(before.objects.find((item: { objectId: string }) => item.objectId === objectId).reviewSubjectHash);
+
+    await expectToolError(() => call(setup.child.token, 'kb_edit_doc', {
+      path: 'docs/edit.md', operationId: 'op-evidence-bad',
+      evidenceSelectorUpdates: [{ evidenceId: 'kev_other', selector: { kind: 'text_span', lineStart: 4, lineEnd: 4 } }],
+    }, meta('w1', 'luban')), 'invalid_request');
+  });
+
+  it('只更新已有覆盖项去向：服务端继承来源、分类与对象证据', async () => {
+    const setup = makeV2('b-edit-coverage');
+    setup.store.registerTaskCreation({ nativeTaskId: 'w1', requestedRole: 'luban' });
+    await writeDraftWithObject(setup, 'w1', true);
+    const draftPath = path.join(setup.state.stagingRoot, 'knowledge-draft.json');
+    const bodyPath = path.join(setup.state.stagingRoot, 'docs', 'docs', 'edit.md');
+    const before = JSON.parse(fs.readFileSync(draftPath, 'utf-8'));
+    const body = fs.readFileSync(bodyPath, 'utf-8');
+    const objectId = before.clientKeys['obj-main'];
+    await call(setup.child.token, 'kb_edit_doc', {
+      path: 'docs/edit.md', operationId: 'op-coverage',
+      coverageUpdates: [{ itemId: 'cov-main', disposition: 'mapped', targetKeys: ['obj-main'] }],
+    }, meta('w1', 'luban'));
+    const after = JSON.parse(fs.readFileSync(draftPath, 'utf-8'));
+    expect(fs.readFileSync(bodyPath, 'utf-8')).toBe(body);
+    expect(after.evidenceKeys).toEqual(before.evidenceKeys);
+    expect(after.clientKeys['obj-main']).toBe(objectId);
+    expect(after.coverage.find((item: { itemId: string }) => item.itemId === 'cov-main')).toMatchObject({
+      category: 'rule', importance: 'important', disposition: 'mapped', targetObjectIds: [objectId],
+    });
+    await expectToolError(() => call(setup.child.token, 'kb_edit_doc', {
+      path: 'docs/edit.md', operationId: 'op-coverage-bad',
+      coverageUpdates: [{ itemId: 'cov-main', sourceId: 'other', disposition: 'mapped', targetKeys: ['obj-main'] }],
+    }, meta('w1', 'luban')), 'kb_coverage_invalid');
   });
 
   it('expectedContentHash 防漂移：草稿已变 → 结构化冲突；幂等键不漂移（排除该字段）', async () => {
@@ -469,13 +647,83 @@ describe('kb_read_batch（§7 批量读取）', () => {
     expect(draft.text).toContain('## H');
     expect(draft.declarations).toBeTruthy();
   });
+
+  it('小 limit 的 draft 只返回一页且续页不重复声明', async () => {
+    const setup = makeV2('b-batch-declarations');
+    setup.store.registerTaskCreation({ nativeTaskId: 'w1', requestedRole: 'luban' });
+    await call(setup.leader.token, 'build_assign_output', { ownerTaskId: 'w1', targets: ['docs/long.md'] });
+    await call(setup.child.token, 'kb_write_doc', {
+      path: 'docs/long.md', title: '长稿', markdown: '第一行\n第二行\n第三行',
+      sources: ['tokA'], summary: '分页声明', operationId: 'op-long',
+    }, meta('w1', 'luban'));
+    const first = JSON.parse((await call(setup.child.token, 'kb_read_batch', {
+      requests: [{ kind: 'draft', path: 'docs/long.md', limit: 1, includeDeclarations: true }],
+      maxLines: 400,
+    }, meta('w1', 'luban'))).content[0]!.text);
+    expect(first.results).toHaveLength(1);
+    expect(first.linesUsed).toBe(1);
+    expect(first.results[0].declarations).toBeTruthy();
+    expect(first.nextCursor).toBeTruthy();
+    const second = JSON.parse((await call(setup.child.token, 'kb_read_batch', {
+      requests: [], cursor: first.nextCursor, maxLines: 400,
+    }, meta('w1', 'luban'))).content[0]!.text);
+    expect(second.results).toHaveLength(1);
+    expect(second.results[0].offset).toBe(1);
+    expect(second.results[0].declarations).toBeUndefined();
+  });
 });
 
 describe('审查（§4.3）与交接/问题/发布（§5）', () => {
-  async function seedDraft(setup: V2Setup, taskId: string, docPath: string): Promise<void> {
+  async function seedDraft(setup: V2Setup, taskId: string, docPath: string, source = 'tokA'): Promise<void> {
     await call(setup.leader.token, 'build_assign_output', { ownerTaskId: taskId, targets: [docPath] });
-    await call(setup.child.token, 'kb_write_doc', { path: docPath, title: 'T', markdown: `# 内容 ${docPath}\n正文`, sources: ['tokA'], summary: 's', operationId: `op-${docPath}` }, meta(taskId, 'luban'));
+    await call(setup.child.token, 'kb_write_doc', { path: docPath, title: 'T', markdown: `# 内容 ${docPath}\n正文`, sources: [source], summary: 's', operationId: `op-${docPath}` }, meta(taskId, 'luban'));
   }
+
+  it('单篇审查只绑定其来源与正文；其他文档写入不使回执失效', async () => {
+    const setup = makeV2('b-review-scope');
+    setup.state.v2WorkflowRulesHash = 'test-workflow-hash';
+    setup.store.registerTaskCreation({ nativeTaskId: 'w1', requestedRole: 'luban' });
+    setup.store.registerTaskCreation({ nativeTaskId: 'w2', requestedRole: 'luban' });
+    setup.store.registerTaskCreation({ nativeTaskId: 'r1', requestedRole: 'diting' });
+    await seedDraft(setup, 'w1', 'docs/a.md', 'tokA');
+    const scopedBefore = scopedReviewDeclarationHash(setup.state.stagingRoot, ['docs/a.md'], ['tokA']);
+    await call(setup.child.token, 'kb_submit_review', { coverage: { sourceRefs: ['tokA'] }, issues: [], conclusion: 'pass' }, meta('r1', 'diting'));
+    const receipt = setup.store.listReviews()[0]!;
+    expect(receipt.scopePaths).toEqual(['docs/a.md']);
+    expect(receipt.dependencyHashes['doc:docs/a.md']).toBeTruthy();
+    expect(receipt.dependencyHashes['doc:docs/b.md']).toBeUndefined();
+    await seedDraft(setup, 'w2', 'docs/b.md', 'tokB');
+    expect(setup.store.listReviews()[0]!.status).toBe('valid');
+    expect(scopedReviewDeclarationHash(setup.state.stagingRoot, ['docs/a.md'], ['tokA'])).toBe(scopedBefore);
+    const authority = collectAuthorityValidatedReports({
+      stagingRoot: setup.state.stagingRoot,
+      store: setup.store,
+      current: resolveCurrentReviewDependencies({ stagingRoot: setup.state.stagingRoot,
+        snapshot: setup.state.snapshot, workflowRulesHash: setup.state.v2WorkflowRulesHash }),
+      documentHashes: new Map(['a', 'b'].map((name) => {
+        const docPath = `docs/${name}.md`;
+        return [docPath, computeSourceHash(path.join(setup.state.stagingRoot, 'docs', docPath), [])];
+      })),
+    });
+    expect(authority.skipped).toEqual([]);
+    expect(authority.validReportIds).toEqual([setup.store.listReviews()[0]!.reportId]);
+  });
+
+  it('重要未解决覆盖项在复审提交时即阻止 pass，而不是拖到整批发布', async () => {
+    const setup = makeV2('b-review-unresolved');
+    setup.store.registerTaskCreation({ nativeTaskId: 'w1', requestedRole: 'luban' });
+    setup.store.registerTaskCreation({ nativeTaskId: 'r1', requestedRole: 'diting' });
+    await seedDraft(setup, 'w1', 'docs/a.md');
+    setup.state.knowledgeDraft = { schemaVersion: 1, buildId: 'b-review-unresolved', docs: {}, clientKeys: {},
+      evidenceKeys: {}, objects: [], presentations: [], relations: [], evidence: [], calls: {},
+      coverage: [{ itemId: 'empty-sheet', sourceRef: { sourceId: 'tokA' },
+        category: '占位配置表', importance: 'important', disposition: 'unresolved', targetObjectIds: [], reason: '待确认' }],
+    } as any;
+    await expectToolError(() => call(setup.child.token, 'kb_submit_review',
+      { coverage: { sourceRefs: ['tokA'] }, issues: [], conclusion: 'pass' }, meta('r1', 'diting')),
+    'kb_review_coverage_blocked');
+    expect(setup.store.listReviews()).toHaveLength(0);
+  });
 
   it('reviewer 提交审查：绑定 draftHash 与 ReviewReceipt；作者自审被拒；修订后审查失效', async () => {
     const setup = makeV2('b-review');
@@ -486,12 +734,13 @@ describe('审查（§4.3）与交接/问题/发布（§5）', () => {
       coverage: { sourceRefs: ['tokA'] },
       issues: [{ draftLocation: 'docs/r1.md#L2', sourceLocation: '源A#甲节', description: '描述', severity: 'blocking' }],
       conclusion: 'needs_revision',
-      operationId: 'rev-1',
     };
     // 作者自审 → 拒
     await expectToolError(() => call(setup.child.token, 'kb_submit_review', reviewArgs, meta('w1', 'luban')), 'tool_not_allowed');
     const review = await call(setup.child.token, 'kb_submit_review', reviewArgs, meta('r1', 'diting'));
     expect(review.details!.draftHash).toBeTruthy();
+    const replayedReview = await call(setup.child.token, 'kb_submit_review', reviewArgs, meta('r1', 'diting'));
+    expect(replayedReview.details!.idempotentReplay).toBe(true);
     expect(setup.store.listReviews()).toHaveLength(1);
     expect(setup.store.listReviews()[0]!.status).toBe('valid');
     expect(setup.store.listReviews()[0]!.dependencyHashes['doc:docs/r1.md']).toBeTruthy();
@@ -503,9 +752,9 @@ describe('审查（§4.3）与交接/问题/发布（§5）', () => {
   it('交接提交/读取（子任务交、Leader 收）', async () => {
     const setup = makeV2('b-handoff');
     setup.store.registerTaskCreation({ nativeTaskId: 'w1', requestedRole: 'luban' });
-    const submit = await call(setup.child.token, 'build_handoff_submit', { operationId: 'ho-1', summary: '完成定位文档', artifactRefs: ['docs/h.md@1'], openIssues: ['公式未覆盖'] }, meta('w1', 'luban'));
+    const submit = await call(setup.child.token, 'build_handoff_submit', { summary: '完成定位文档', artifactRefs: ['docs/h.md@1'], openIssues: ['公式未覆盖'] }, meta('w1', 'luban'));
     expect(submit.details!.handoffId).toBeTruthy();
-    const replay = await call(setup.child.token, 'build_handoff_submit', { operationId: 'ho-1', summary: '完成定位文档', artifactRefs: ['docs/h.md@1'], openIssues: ['公式未覆盖'] }, meta('w1', 'luban'));
+    const replay = await call(setup.child.token, 'build_handoff_submit', { summary: '完成定位文档', artifactRefs: ['docs/h.md@1'], openIssues: ['公式未覆盖'] }, meta('w1', 'luban'));
     expect(replay.details!.idempotentReplay).toBe(true);
     const list = await call(setup.leader.token, 'build_handoff_list', {});
     const body = JSON.parse(list.content[0]!.text);
@@ -562,6 +811,19 @@ describe('审查（§4.3）与交接/问题/发布（§5）', () => {
     expect(after.details!.path).toBe('docs/w1.md');
   });
 
+  it('发布校验拒绝时把具体文档路径和问题写进模型可读正文与检查点', async () => {
+    const setup = makeV2('b-publish-details', async () => ({ accepted: false, result: {
+      reason: 'kb_validation_failed', reasons: ['affected_doc_not_updated'],
+      details: { issues: [{ path: 'docs/old.md', code: 'affected_doc_not_updated', message: '来源已变化，需重写正文' }] },
+    } }));
+    setup.store.registerTaskCreation({ nativeTaskId: 'w1', requestedRole: 'luban' });
+    await seedDraft(setup, 'w1', 'docs/old.md');
+    const publish = await call(setup.leader.token, 'build_request_publish', {});
+    expect(publish.content[0]!.text).toContain('affected_doc_not_updated [docs/old.md]：来源已变化，需重写正文');
+    const status = await call(setup.leader.token, 'build_checkpoint', { action: 'status' });
+    expect(JSON.parse(status.content[0]!.text).lastPublishRejection.issues[0].path).toBe('docs/old.md');
+  });
+
   it('build_checkpoint save/status', async () => {
     const setup = makeV2('b-ckpt');
     let saved = 0;
@@ -572,6 +834,47 @@ describe('审查（§4.3）与交接/问题/发布（§5）', () => {
     expect(saved).toBe(1);
     const status = await call(setup.leader.token, 'build_checkpoint', { action: 'status' });
     expect(JSON.parse(status.content[0]!.text).buildId).toBe('b-ckpt');
+  });
+
+  it('Leader 只把未发布草稿列为待处理，正式承接与未变化的阶段发布文档不触发补审', async () => {
+    const setup = makeV2('b-document-work-status');
+    const docs = { carried: 'docs/carried.md', promoted: 'docs/promoted.md', pending: 'docs/pending.md' };
+    for (const docPath of Object.values(docs)) {
+      const file = path.join(setup.state.stagingRoot, 'docs', docPath);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, `# ${docPath}\n`, 'utf8');
+    }
+    const promotedHash = contentResourceHash(fs.readFileSync(path.join(setup.state.stagingRoot, 'docs', docs.promoted), 'utf8'));
+    const draft = { schemaVersion: 1, buildId: 'b-document-work-status', docs: {
+      [docs.carried]: { docId: 'c', revision: 0, basis: 'published' },
+      [docs.promoted]: { docId: 'p', revision: 2, basis: 'draft' },
+      [docs.pending]: { docId: 'n', revision: 1, basis: 'draft' },
+    }, objects: [] as Array<Record<string, unknown>> };
+    fs.writeFileSync(path.join(setup.state.stagingRoot, 'knowledge-draft.json'), JSON.stringify(draft));
+    setup.state.requiredRewrites = new Set([docs.promoted, docs.pending]);
+    const manifestSpy = vi.spyOn(StandardKbStore.prototype, 'readManifest').mockReturnValue({
+      buildId: 'b-document-work-status', releaseId: 'r_status', publicationStage: 'progressive',
+      promotionHashes: { [docs.promoted]: promotedHash }, sourceSnapshot: [],
+    } as never);
+    const knowledgeSpy = vi.spyOn(KbVersionStore.prototype, 'readKnowledgeManifest').mockReturnValue({ objects: [] } as never);
+    try {
+      const manifest = JSON.parse((await call(setup.leader.token, 'build_manifest', {})).content[0]!.text);
+      const status = JSON.parse((await call(setup.leader.token, 'build_checkpoint', { action: 'status' })).content[0]!.text);
+      for (const value of [manifest.documentWorkStatus, status.documentWorkStatus]) {
+        expect(value.carriedPublishedPaths).toEqual([docs.carried]);
+        expect(value.promotedUnchangedPaths).toEqual([docs.promoted]);
+        expect(value.unpublishedDraftPaths).toEqual([docs.pending]);
+        expect(value.pendingRequiredRewrites).toEqual([docs.pending]);
+      }
+      draft.objects.push({ objectId: 'o1', canonical: { path: docs.promoted }, reviewSubjectHash: 'changed' });
+      fs.writeFileSync(path.join(setup.state.stagingRoot, 'knowledge-draft.json'), JSON.stringify(draft));
+      const changed = JSON.parse((await call(setup.leader.token, 'build_checkpoint', { action: 'status' })).content[0]!.text);
+      expect(changed.documentWorkStatus.promotedUnchangedPaths).toEqual([]);
+      expect(changed.documentWorkStatus.unpublishedDraftPaths).toEqual([docs.pending, docs.promoted]);
+    } finally {
+      manifestSpy.mockRestore();
+      knowledgeSpy.mockRestore();
+    }
   });
 });
 

@@ -83,6 +83,9 @@ export interface ReviewReceipt {
   reviewerTaskId: string;
   /** 审查时全部 staging 草稿的候选哈希（computeCandidateHash 同形） */
   draftHash: string;
+  /** v2 scoped review: only these documents were checked. Older receipts without
+   * this field retain their original whole-candidate semantics. */
+  scopePaths?: string[];
   /** 依赖哈希绑定：正文（doc:<path>）+ 对象/证据声明（knowledge-declaration）
    * + 来源快照（source-snapshot）+ 冻结 workflow 规则（workflow-rules），
    * 键名→sha256（F08：metadata-only 声明变化/来源漂移/规则漂移均使回执失效）。 */
@@ -194,6 +197,7 @@ export const V2_CHILD_READ_TOOLS = [
   'draft_read',
   'draft_search',
   'kb_read_batch',
+  'kb_tool_schema',
   'build_issues_list',
 ] as const;
 
@@ -800,6 +804,28 @@ export class BuildActorStore {
     return count;
   }
 
+  /** A recovered Leader can use a newer frozen workflow. Old review reports
+   * remain on disk for audit, but may no longer authorize a publication. */
+  invalidateReviewsForWorkflowRevision(revision: string, pendingPaths?: ReadonlySet<string>): ReviewReceipt[] {
+    const invalidated: ReviewReceipt[] = [];
+    for (const review of this.reviews.values()) {
+      if (review.status !== 'valid' || review.dependencyHashes['workflow-rules'] === revision) continue;
+      if (pendingPaths && review.scopePaths?.length
+        && !review.scopePaths.some((docPath) => pendingPaths.has(docPath))) continue;
+      review.status = 'stale';
+      review.staleReason = 'workflow_rules_changed';
+      invalidated.push(review);
+    }
+    if (invalidated.length > 0) {
+      this.appendEvent({ source: 'tool-service', type: 'reviews_invalidated', payload: {
+        reason: 'workflow_rules_changed', count: invalidated.length,
+        paths: [...new Set(invalidated.flatMap((review) => review.scopePaths ?? []))],
+      } });
+      this.persist();
+    }
+    return invalidated;
+  }
+
   listReviews(): ReviewReceipt[] {
     return [...this.reviews.values()];
   }
@@ -848,6 +874,10 @@ export class BuildActorStore {
   /** 发布窗口（§5.4：校验期间到达的新写入被拒）。 */
   get publishing(): { draftHash: string; requestId: string } | null {
     return this.publishWindow;
+  }
+
+  latestPublishRequest(): PublishRequestRecord | null {
+    return this.publishRequests.at(-1) ?? null;
   }
 
   /** 开启发布窗口并登记 pending 申请（返回 requestId）。 */

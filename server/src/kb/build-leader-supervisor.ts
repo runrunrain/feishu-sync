@@ -743,7 +743,7 @@ export class BuildLeaderSupervisor {
     if (!this.state.idleRemindedAt) {
       this.state.idleRemindedAt = new Date().toISOString();
       // 提示只陈述现状，不指定下一项任务（设计 §5.4）。
-      const message = '当前没有运行中的轮次，已知子任务均已收到完成通知，且尚未申请发布。请收口：申请发布具体候选版本，或经工具报告无法完成的原因。';
+      const message = '当前没有运行中的轮次，已知子任务均已收到完成通知，构建尚未完成。请核对候选与阻断项：可申请发布具体候选版本，或经工具报告无法完成的原因。';
       this.lastActivityAt = Date.now();
       void this.cb.nudge(this.activeBinding, message).catch((error) => {
         this.cb.log('warn', `收口提示注入失败：${error instanceof Error ? error.message : String(error)}`);

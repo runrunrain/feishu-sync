@@ -1,0 +1,49 @@
+{
+  "taskId": "plugin-install-fix",
+  "timestamp": "2026-11-02T01:16:15.380Z",
+  "agent": "luban",
+  "createdBy": "Leader integration and device acceptance",
+  "projectId": "feishu-sync",
+  "taskBrief": "修复插件检测与默认安装404并更新当前设备",
+  "status": "completed",
+  "baseCommit": "e5bb904a8c9279323e880f7bd7f230c00594fb46",
+  "codeCommitted": false,
+  "review": {
+    "taskId": "c3021b31-0f5b-4aa6-8f1b-67ed0a1fa6e2",
+    "verdict": "PASS",
+    "accepted": true,
+    "openFindings": 0
+  },
+  "upstreamArtifactReferences": [
+    "agent-outputs/workflow/plugin-install-fix/research-report.md",
+    "agent-outputs/workflow/plugin-install-fix/implementation-report.md",
+    "agent-outputs/workflow/plugin-install-fix/review-report.md"
+  ],
+  "validationEvidence": {
+    "buildStatus": "passed",
+    "testStatus": "passed",
+    "browserVerification": "verified",
+    "commands": [
+      {
+        "command": "same full suites --no-file-parallelism + lint/typecheck/build",
+        "exitCode": 0,
+        "summary": "前端529/server3117通过，16skip"
+      },
+      {
+        "command": "real Pi CLI Git install/native fixture probe + installed Electron UI",
+        "exitCode": 0,
+        "summary": "固定31已装/重复校验/global36不变，native36/0；设备healthy且debug关闭，ABI125/开发137通过"
+      }
+    ]
+  },
+  "relatedFiles": [
+    "final-report.md",
+    "browser-acceptance.md",
+    "electron-installed.png",
+    "review-fixes.md"
+  ],
+  "nextSteps": {
+    "suggestedAgent": "Leader",
+    "suggestedAction": "本轮已交付；若需Git提交请按用户指示，未自行提交。完整设计/平台/真实资料验收不由安装成功替代"
+  }
+}

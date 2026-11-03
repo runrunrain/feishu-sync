@@ -1,0 +1,202 @@
+diff --git a/extensions/amagi-core/task-background.ts b/extensions/amagi-core/task-background.ts
+index 05d1ab5..9b33302 100644
+--- a/extensions/amagi-core/task-background.ts
++++ b/extensions/amagi-core/task-background.ts
+@@ -44,7 +44,7 @@ function declaredOutputPathsOf(opts: { outputs?: ReadonlyArray<{ path: string }>
+  * v1.5.188 自动续跑门控：done 且未按完成契约结束的 work/expert 任务应续跑。
+  * blocked/error/fast 型不续跑（blocked 由 Leader 回答；fast 型无契约要求）。
+  */
+-export function shouldAutoContinue(agent: AgentConfig, rr: RunResult, opts?: { zeroOutputStreak?: number }): boolean {
++export function shouldAutoContinue(agent: AgentConfig, rr: Pick<RunResult, "status" | "blocked" | "output"> & Pick<RunResult, "terminatedBy">, opts?: { zeroOutputStreak?: number }): boolean {
+ 	if (rr.status !== "done" || rr.blocked) return false;
+ 	if (agent.type !== "work" && agent.type !== "expert") return false;
+ 	// 8月迭代 F6c：doom-loop 终止不自动续跑——同 nudge 续跑大概率再 doom（纯烧 token）；
+@@ -233,7 +233,10 @@ export async function runBackgroundTask(agent: AgentConfig, task: string, opts:
+ 		// 第二次仍 400 才真正收口（有界一次；fresh 后再 400 通常是新写入损坏，交回 Leader）。
+ 		let _toolOrderRetried = false;
+ 		let _formatRepaired = false;
+-		const onFinalizeWithRepair = (r: { taskId: string; agent: string; status: TaskStatus; output: string; blocked: boolean; blockReason?: "questions" | "needs-handoff"; errorMessage?: string; sessionId?: string; model?: string; completionAnnotation?: string; dispatchRevision?: number; /** ev-20260910-8fbe4e（C）：连接类中断现场报告（仅 error+providerError 终态携带）。 */ interruptionReport?: string; /** F5（diting，附录 B.1）：本轮运行标识与工具观测（payload 重建时透传）。 */ runKey?: string; _toolExecutions?: ReadonlyArray<ToolExecutionObservation>; /** pi 1.1.0 S2-B2：宿主/控制面中止事实——抑制自动修复重派（与 task-tool.ts runTask 同款口径）。 */ aborted?: boolean }): void => {
++		let _autoContinued = 0;
++		let _zeroOutputStreak = 0;
++		const _autoMax = Math.max(0, parseInt(process.env.AMAGI_AUTO_CONTINUE_ROUNDS ?? "2", 10) || 0);
++		const onFinalizeWithRepair = (r: { taskId: string; agent: string; status: TaskStatus; output: string; blocked: boolean; blockReason?: "questions" | "needs-handoff"; errorMessage?: string; sessionId?: string; model?: string; stopReason?: string; terminatedBy?: string; completionAnnotation?: string; dispatchRevision?: number; /** ev-20260910-8fbe4e（C）：连接类中断现场报告（仅 error+providerError 终态携带）。 */ interruptionReport?: string; /** F5（diting，附录 B.1）：本轮运行标识与工具观测（payload 重建时透传）。 */ runKey?: string; _toolExecutions?: ReadonlyArray<ToolExecutionObservation>; /** pi 1.1.0 S2-B2：宿主/控制面中止事实——抑制自动修复重派（与 task-tool.ts runTask 同款口径）。 */ aborted?: boolean }): void => {
+ 			if (r.status === "error" && !r.aborted && r.sessionId && !_toolOrderRetried
+ 					&& Math.max(0, parseInt(process.env.AMAGI_SESSION_REPAIR_ROUNDS ?? "1", 10) || 0) > 0
+ 					&& sessionRepairEnabled() && isToolOrder400(r.errorMessage || "")) {
+@@ -302,6 +305,33 @@ export async function runBackgroundTask(agent: AgentConfig, task: string, opts:
+ 				})();
+ 				return; // 延迟收口：交由补正轮回调（再经本函数，_formatRepaired 已置位不再补正）
+ 			}
++			// task_submit 的后台句柄路径也必须续接 length/早停。此前只有同步路径
++			// runTask 调 shouldAutoContinue：高思考耗尽 max_tokens 后只留下 thinking，
++			// 后台路径却把空结果回报 done，Leader 只能逐个手动 task_resume。
++			if (!_formatRepaired && _autoContinued < _autoMax && r.sessionId
++				&& shouldAutoContinue(agent, r, { zeroOutputStreak: _zeroOutputStreak })) {
++				_autoContinued++;
++				const stopNote = r.stopReason === "length"
++					? (r.output.trim().length < 8
++						? "上一轮推理已达输出上限且没有正文。不要重读材料或从头推导，直接完成尚未提交的工具调用与交付。"
++						: "上一轮输出达到上限，从断点继续完成交付。")
++					: "上一轮未提交完成契约；已完成的材料读取与工具调用无需重做。";
++				const nudge = `${EXECUTION_DISCIPLINE_REMINDER}\n\n[amagi 后台自动续跑 ${_autoContinued}/${_autoMax}] ${stopNote}完成后按原任务书提交成果，并以 ACHIEVEMENT 清单及末行 ${AMAGI_DONE_MARKER} 收口。`;
++				const resumeArgs = ["--session", r.sessionId, "--mode", "json", "-p", "--name", sessionName, "--tools", tools.join(","), ...(tmpFile ? ["--append-system-prompt", tmpFile] : []), ...(effModel ? ["--model", effModel] : []), nudge];
++				void (async () => {
++					try {
++						registry.reopenForAutoContinue(taskId);
++						await runPiTask(agent, resumeArgs, { cwd: opts.cwd, model: effModel, timeoutMs: opts.timeoutMs, command: opts.command, background: true, onStall: opts.onStall, dispatchTime: Date.now(), dispatchRevision, taskCategory: _cat, baselineArtifactRefs: _baselineRefs, fuseWarn: _fuse, protectedPaths: opts.protectedPaths, allowedPaths: opts.allowedPaths, declaredOutputPaths: declaredOutputPathsOf(opts), onFinalize: (r2) => {
++							_zeroOutputStreak = r2.output.trim().length < 8 ? _zeroOutputStreak + 1 : 0;
++							onFinalizeWithRepair(r2);
++						} }, taskId, sessionName);
++					} catch (error) {
++						_autoContinued = _autoMax;
++						onFinalizeWithRepair({ ...r, completionAnnotation: `${r.completionAnnotation ? `${r.completionAnnotation}\n` : ""}[后台自动续跑] 启动失败：${String(error)}` });
++					}
++				})();
++				return; // 同 taskId 保持准入槽位与交付回调，直到续跑收口
++			}
+ 			// 常规收口（含修复失败/重派后仍 400：finalErrorMessage 已带定向提示）
+ 			releaseAdmission(taskId); // v2 批次B：终局归还槽位（含 cancelled 前置路径）——finalize once 守卫保证恰好一次
+ 			snapshotForPersist(undefined); // snapshot 在 execute 层传 pi；此处仅做内部清理
+diff --git a/extensions/amagi-core/task-run.ts b/extensions/amagi-core/task-run.ts
+index 5df2747..6fa72ce 100644
+--- a/extensions/amagi-core/task-run.ts
++++ b/extensions/amagi-core/task-run.ts
+@@ -56,7 +56,7 @@ export type { RunObservationTarget };
+ // P4（amagi-pi v2，方案 §5.1/§5.2/§8.3-P4）：子进程权限交付——冻结授权从 v2-store 读取
+ //（task-service 面读，引擎不直连 task-store：K8c 单写者门禁），派生 --tools 严格名单与
+ // AMAGI_PERMISSION_GRANT/CWD/DIGEST env（子端 file-permission bootstrap 校验 digest 一致才激活）。
+-import { createDefaultJsonObservation, getFrozenPermissionGrant, getLeaderSessionStamp, type WorktreeDispatchFacts } from "./task-service.ts";
++import { cancelTask, createDefaultJsonObservation, getFrozenPermissionGrant, getLeaderSessionStamp, getTaskKernel, type WorktreeDispatchFacts } from "./task-service.ts";
+ import { findDispatchRequirementGaps } from "./dispatch-preflight.ts";
+ import { PERMISSION_CWD_ENV, PERMISSION_DIGEST_ENV, PERMISSION_GRANT_ENV, permissionGrantDigest } from "./file-permission.ts";
+ import type { PermissionGrant } from "./contracts/permission.ts";
+@@ -2879,6 +2879,27 @@ async function verifiedShutdownSignal(child: any, taskId: string, signal: NodeJS
+ }
+ 
+ export async function cleanupChildrenOnShutdown(graceMs = 2000, deps: ShutdownCleanupDeps = {}): Promise<void> {
++	// Release of a running child promotes the next admission waiter. Fence every
++	// queued task first, including a waiter that was just promoted but has not
++	// entered its continuation yet. Otherwise shutdown can grant-start/spawn new
++	// children while it is trying to close the old ones.
++	const waiting = registry.list().filter((task) => task.status === "queued");
++	for (const task of waiting) cancelTask(task.taskId, "session shutdown before child cleanup");
++	for (const task of waiting) {
++		// No launch intent is a durable proof that this task never reached spawn.
++		// Persist the physical closure too; the next Leader's residual guard must
++		// not mistake the cancelled admission record for an untracked child.
++		const kernel = getTaskKernel();
++		const view = kernel.get(task.taskId);
++		if (!view || view.run.execution !== "cancelled" || view.run.launchIntent
++			|| view.run.processState !== "not-started") continue;
++		await kernel.applyQuiet({
++			type: "reconcile",
++			key: { ownerId: view.run.ownerId, taskId: task.taskId, revision: view.revision },
++			facts: [{ code: "shutdown-never-spawned", detail: "Queued task was cancelled before child cleanup; no launchIntent was granted" }],
++			disposition: "confirm-exited",
++		});
++	}
+ 	const running = registry.getRunningChildren();
+ 	const children = running.map(({ child }) => child);
+ 	for (let i = 0; i < running.length; i++) {
+diff --git a/tests/ev-20261021-e476e9-completion-format-repair.test.mjs b/tests/ev-20261021-e476e9-completion-format-repair.test.mjs
+index a0a6acc..d4681af 100644
+--- a/tests/ev-20261021-e476e9-completion-format-repair.test.mjs
++++ b/tests/ev-20261021-e476e9-completion-format-repair.test.mjs
+@@ -75,6 +75,23 @@ test("e476e9 后台端到端：拼错终稿 → 同会话定向补正一轮 →
+ 	assert.doesNotMatch(completed.completionAnnotation, /完成契约缺失/, "补正成功不再挂未自证告警");
+ });
+ 
++test("后台句柄高思考耗尽输出额度：空正文 length 自动续接同一会话后交付", async () => {
++	const { start, completed } = await runBg("length-thinking-then-marker");
++	assert.ok(completed, "后台回调须等续跑完成才触发");
++	assert.equal(completed.status, "done");
++	assert.match(completed.output, /续跑写入并交接完成/);
++	assert.equal(hasDoneMarker(completed.output), true);
++	assert.equal(registry.get(start.taskId)?.status, "done");
++});
++
++test("后台句柄连续空正文 length：只续接一次，避免无效推理循环", async () => {
++	const { completed } = await runBg("length-thinking-always");
++	assert.ok(completed);
++	assert.equal(completed.status, "done");
++	assert.equal(completed.output, "");
++	assert.match(completed.completionAnnotation, /完成契约缺失/);
++});
++
+ test("e476e9 后台端到端负例：补正后仍不合规 → 有界一次，如实挂未自证告警（不放宽）", async () => {
+ 	const { completed } = await runBg("typo-always");
+ 	assert.ok(completed);
+diff --git a/tests/helpers/fake-runner.mjs b/tests/helpers/fake-runner.mjs
+index dbc928e..42293cb 100644
+--- a/tests/helpers/fake-runner.mjs
++++ b/tests/helpers/fake-runner.mjs
+@@ -40,6 +40,19 @@ const KEEP_ALIVE = new Set(["sigterm-exit", "partial-hang", "ignore-sigterm", "h
+ 			await writeLineAsync({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: isResume ? "续跑完成全部工作。\n\nACHIEVEMENT:\n- 验收1→测试通过→done\n\n<!--AMAGI:DONE-->" : "现在让我查看一下相关文件：" }], stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } });
+ 			break;
+ 		}
++		case "length-thinking-then-marker":
++		case "length-thinking-always": {
++			const isResume = process.argv.includes("--session");
++			await sessionAsync();
++			const finished = isResume && mode === "length-thinking-then-marker";
++			await writeLineAsync({ type: "message_end", message: {
++				role: "assistant",
++				content: finished ? [{ type: "text", text: "续跑写入并交接完成。\n\nACHIEVEMENT:\n- 回执→已核验→done\n\n<!--AMAGI:DONE-->" }] : [{ type: "thinking", thinking: "预算耗尽" }],
++				stopReason: finished ? "stop" : "length",
++				usage: { input: 1, output: 32768, reasoning: 32768, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
++			} });
++			break;
++		}
+ 		case "tool-order-400-clean": // 2026-08-19：干净会话被 provider 瞬时误拒 400——与 tool-order-400 同行为，区别在测试预置 session 无孤儿/悬挂（sanitize 零清除，走 transient-retry 分支）
+ 		case "tool-order-400": {
+ 			// 2026-08-16 复盘 P0-1：首轮 provider 400 tool 消息序（孤儿 tool 消息签名）；修复重派轮（--session）输出完整契约
+diff --git a/tests/ev-20261102-shutdown-queued-recovery.test.mjs b/tests/ev-20261102-shutdown-queued-recovery.test.mjs
+new file mode 100644
+index 0000000..af294e6
+--- /dev/null
++++ b/tests/ev-20261102-shutdown-queued-recovery.test.mjs
+@@ -0,0 +1,44 @@
++import assert from 'node:assert/strict';
++import { after, test } from 'node:test';
++import fs from 'node:fs';
++import os from 'node:os';
++import path from 'node:path';
++
++const root = fs.mkdtempSync(path.join(os.tmpdir(), 'amagi-shutdown-queue-'));
++process.env.AMAGI_CONTRACT_ROOT = path.join(root, 'v2-store');
++process.env.AMAGI_DATA_DIR = path.join(root, 'data');
++
++const { registry } = await import('../extensions/amagi-core/task-registry.ts');
++const { submitTaskKernel, getTaskKernel } = await import('../extensions/amagi-core/task-service.ts');
++const { tryOccupy, waitForGrant, release, _setAdmissionCapacityForTest, resetAdmissionForTest } = await import('../extensions/amagi-core/admission.ts');
++const { cleanupChildrenOnShutdown } = await import('../extensions/amagi-core/task-run.ts');
++
++after(() => {
++  registry.setShuttingDown(false);
++  resetAdmissionForTest();
++  fs.rmSync(root, { recursive: true, force: true });
++});
++
++test('shutdown closes queued tasks before releasing slots and persists no-process proof', async () => {
++  _setAdmissionCapacityForTest(1);
++  assert.equal(tryOccupy('busy-holder'), 'running');
++  const ids = ['shutdown-waiting-1', 'shutdown-waiting-2'];
++  for (const taskId of ids) {
++    const submit = await submitTaskKernel({ taskId, agent: 'luban', assignment: 'queued shutdown fixture', cwd: root, mode: 'background' });
++    assert.equal(submit.ok, true, submit.message);
++    assert.equal(tryOccupy(taskId), 'queued');
++  }
++  const waits = ids.map((id) => waitForGrant(id));
++  registry.setShuttingDown(true);
++  await cleanupChildrenOnShutdown(10);
++  release('busy-holder');
++  assert.deepEqual(await Promise.all(waits), ['cancelled', 'cancelled']);
++  for (const taskId of ids) {
++    const run = getTaskKernel().get(taskId)?.run;
++    assert.equal(run?.execution, 'cancelled');
++    assert.equal(run?.processState, 'exited');
++    assert.equal(run?.launchIntent, undefined);
++    const disk = JSON.parse(fs.readFileSync(path.join(root, 'v2-store', taskId, 'current.json'), 'utf8'));
++    assert.equal(disk.processState, 'exited');
++  }
++});

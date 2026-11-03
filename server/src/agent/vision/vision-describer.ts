@@ -22,7 +22,20 @@ import { resolveProviderModel } from '../../modules/model-selection.js';
 import type { LlmProtocol } from '../../types/index.js';
 import type { AgentVisionConfig } from '../../types/agent-knowledge.js';
 import { buildDefaultAgentVisionConfig } from '../../types/agent-knowledge.js';
-import { VisionChannel, type VisionImageMime } from './vision-channel.js';
+import { VisionChannel, type VisionImageMime, type VisionRequest, type VisionCallOptions, type VisionResult } from './vision-channel.js';
+
+/** One transient upstream failure must not make a source image permanently unavailable. */
+async function describeWithTransientRetry(channel: VisionChannel, request: VisionRequest, options: VisionCallOptions): Promise<VisionResult> {
+  let result = await channel.describe(request, options);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const status = result.statusCode;
+    if (options.signal?.aborted || status !== 429 && !(status !== undefined && status >= 500)) break;
+    await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+    if (options.signal?.aborted) break;
+    result = await channel.describe(request, options);
+  }
+  return result;
+}
 
 export type ImageUnavailableReason =
   | 'vision_unconfigured'
@@ -264,7 +277,7 @@ export class VisionDescriber {
     if (!context) return { src, imageHash, state: 'unavailable', reason: 'vision_unconfigured' };
     // VisionChannel 内部会按 selection 从 providers 重新解析 apiKey/baseUrl/protocol
     const channel = new VisionChannel(config.llm, { providerId: context.providerId, modelId: context.presetId });
-    const result = await channel.describe(
+    const result = await describeWithTransientRetry(channel,
       { bytes, mime, prompt: context.prompt },
       { timeoutMs: context.timeoutMs, signal },
     );
@@ -384,10 +397,10 @@ export class VisionDescriber {
     const worker = async () => {
       while (cursor < toDescribe.length) {
         const item = toDescribe[cursor++];
-        const result = opts.signal.aborted ? { finishReason: 'error', text: '', errorMessage: '图片识别已取消' } : await new VisionChannel(
+        const result = opts.signal.aborted ? { finishReason: 'error', text: '', errorMessage: '图片识别已取消' } : await describeWithTransientRetry(new VisionChannel(
           config.llm,
           { providerId: context.providerId, modelId: context.presetId },
-        ).describe({ bytes: item.bytes, mime: item.mime, prompt: context.prompt }, { timeoutMs: context.timeoutMs, signal: opts.signal });
+        ), { bytes: item.bytes, mime: item.mime, prompt: context.prompt }, { timeoutMs: context.timeoutMs, signal: opts.signal });
         const hasText = typeof result.text === 'string' && Boolean(result.text.trim());
         const success = !opts.signal.aborted && (result.finishReason === 'stop' || result.finishReason === 'length') && hasText;
         const saved = success && this.writeCache({ imageHash: item.imageHash, modelKey: context.modelKey, model: context.modelAlias, promptVersion: context.promptVersion, text: result.text });

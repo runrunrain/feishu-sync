@@ -399,6 +399,36 @@ describe('图片证据端到端（A 案 §5.1/§5.4）', () => {
     expect(new StandardKbStore(outputRoot).readCurrent()!.releaseId).toBe('r_d3img');
   });
 
+  it('白板旁路文字在没有识图描述时仍可写入和发布图片证据', async () => {
+    const entries = [imageEntry()];
+    const state = makeBuildState('whiteboard-e2e', entries);
+    const whiteboardTexts = new Map([[IMG_TOKEN, new Map([[IMG_SRC, {
+      origin: 'raw' as const, text: IMG_CAPTION, truncated: false,
+    }]])]]);
+    state.whiteboardTexts = whiteboardTexts;
+    const read = await toolService.executeTool(tokenFor(state), 'raw_read', { objToken: IMG_TOKEN });
+    expect(read.content[0]?.text).toContain('<image_resources>');
+    expect(read.content[0]?.text).toContain(IMG_RESOURCE_ID);
+    expect(read.content[0]?.text).toContain('whiteboard_text');
+    await writeImageClaim(state);
+
+    const manifest = await makeService().publishRelease({
+      ...publishArgs(state.stagingRoot, 'r_d3whiteboard', entries),
+      whiteboardTexts,
+    });
+    expect(manifest.schemaVersion).toBe(2);
+    const releaseDir = path.join(outputRoot, 'releases', 'r_d3whiteboard');
+    const evidenceIndex = JSON.parse(fs.readFileSync(path.join(releaseDir, 'evidence-resources.json'), 'utf8')) as {
+      evidenceFiles: Array<{ path: string; image?: { imageHash: string; caption: string; describerVersion?: string } }>;
+    };
+    expect(evidenceIndex.evidenceFiles).toHaveLength(1);
+    const file = evidenceIndex.evidenceFiles[0]!;
+    expect(file.image).toMatchObject({
+      imageHash: shaOf(TINY_PNG), caption: IMG_CAPTION, describerVersion: 'whiteboard_text:raw',
+    });
+    expect(fs.readFileSync(path.join(releaseDir, file.path)).equals(TINY_PNG)).toBe(true);
+  });
+
   it('超预算 → kb_evidence_unresolved blocking、CURRENT 不动、report 列出各资源体量', async () => {
     // 1.2MB 图片 + 预算压到下限 1MB → 超限
     const bigImage = Buffer.alloc(EVIDENCE_BUDGET_MIN_BYTES + 200 * 1024, 7);
@@ -417,7 +447,7 @@ describe('图片证据端到端（A 案 §5.1/§5.4）', () => {
     expect(budgetIssue).toBeTruthy();
     expect(budgetIssue!.message).toContain('image-');
     // CURRENT 仍指向上一次成功发布；半成品 release 清理
-    expect(new StandardKbStore(outputRoot).readCurrent()!.releaseId).toBe('r_d3img');
+    expect(new StandardKbStore(outputRoot).readCurrent()!.releaseId).toBe('r_d3whiteboard');
     expect(fs.existsSync(path.join(outputRoot, 'releases', 'r_d3big'))).toBe(false);
     // 恢复小图供后续用例
     writeRaw(IMG_SRC, TINY_PNG);
