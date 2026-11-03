@@ -1707,12 +1707,17 @@ export class KbBuildService extends EventEmitter {
       releaseRoot: baseReleaseId ? resolveRelease(outputRoot, baseReleaseId).releaseDir : null,
       sourceContents: versionStore.readSourceContents(baseReleaseId), promotedSources,
     });
-    // Keep the already published coverage from the immutable release. Pending
-    // declarations for other sources must not block an unrelated reviewed doc.
-    const selectedCoverage = selectProgressiveCoverage(baselineKnowledge?.coverage ?? [], liveDraft.coverage, promotedSources);
     const filteredDraft = selectProgressiveKnowledgeDraft({ buildId, liveDraft, baselineKnowledge,
-      baselineDocs: baseManifest?.docs ?? [], allPaths, newPaths: new Set(newPaths), coverage: selectedCoverage });
+      baselineDocs: baseManifest?.docs ?? [], allPaths, newPaths: new Set(newPaths), coverage: [] });
     const objectIds = new Set(filteredDraft.objects.map((object) => object.objectId));
+    const promotedObjectIds = new Set(filteredDraft.objects.filter((object) => object.canonical && newPaths.includes(object.canonical.path))
+      .map((object) => object.objectId));
+    const retainedSources = new Set((baseManifest?.docs ?? []).filter((doc) => !newPaths.includes(doc.path))
+      .flatMap((doc) => doc.sources));
+    const selectedCoverage = selectProgressiveCoverage(baselineKnowledge?.coverage ?? [], liveDraft.coverage, {
+      promotedSources, includedObjectIds: objectIds, promotedObjectIds, retainedSources,
+    });
+    filteredDraft.coverage = selectedCoverage;
     if (selectedCoverage.some((item) => item.targetObjectIds.some((id) => !objectIds.has(id)))) return;
     const releaseId = `r_${new Date().toISOString().replace(/[-:]/g, '').replace('T', 'T').slice(0, 15)}_${crypto.randomBytes(3).toString('hex')}`;
     const tempRoot = fs.mkdtempSync(path.join(this.buildsRoot(outputRoot), `${buildId}-progressive-`));

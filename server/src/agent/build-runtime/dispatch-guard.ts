@@ -204,6 +204,37 @@ function writerScopeIssue(task: string): string | null {
   return null;
 }
 
+/**
+ * 审查回执按文档独立发布。任务书必须给出唯一、字面可核对的目标路径，
+ * 不能让一个审查任务等待同一来源的其他草稿并把它们锁在同一回执里。
+ * 只检查构建审查任务（普通通用派发不受此工作流约束）。
+ */
+function reviewerScopeIssue(task: string): string | null {
+  const assignment = task.split('[当前任务书]').at(-1) ?? task;
+  if (!/【独立审查】|审查对象|kb_submit_review/.test(assignment)) return null;
+  const declaration = /coverage\.docPaths\s*=\s*(\[[^\]\n]*\])/.exec(assignment);
+  if (!declaration) {
+    return '审查任务书须明确写入 coverage.docPaths=["唯一目标路径.md"]；每篇文档单独派发和审查，不得以“上述多篇”代替精确范围';
+  }
+  let paths: unknown;
+  try { paths = JSON.parse(declaration[1]); } catch { /* Invalid or illustrative list. */ }
+  if (!Array.isArray(paths) || paths.length !== 1 || typeof paths[0] !== 'string'
+    || !paths[0].endsWith('.md') || paths[0].startsWith('/') || paths[0].includes('..')) {
+    return 'coverage.docPaths 必须是仅含一个相对 .md 路径的 JSON 数组；多篇请分别派发审查任务';
+  }
+  const targetMarker = assignment.indexOf('审查对象');
+  if (targetMarker >= 0) {
+    const afterMarker = assignment.slice(targetMarker + '审查对象'.length);
+    const sectionEnd = afterMarker.search(/\n(?:来源|审查要点|kb_submit_review)[:：]/);
+    const reviewTargets = sectionEnd >= 0 ? afterMarker.slice(0, sectionEnd) : afterMarker.split('\n').slice(0, 6).join('\n');
+    const listedCount = [...reviewTargets.matchAll(/\.md\b/g)].length;
+    if (listedCount > 1 || (listedCount === 1 && !reviewTargets.includes(paths[0]))) {
+      return '审查对象与 coverage.docPaths 必须指向同一篇文档；多篇目标请分别派发';
+    }
+  }
+  return null;
+}
+
 // ── task_submit 守卫 ───────────────────────────────────────────
 
 /**
@@ -288,6 +319,15 @@ export function guardTaskSubmit(
     if (issue) {
       return { decision: 'block', code: 'dispatch_writer_scope_too_broad', message: issue, audit: baseAudit };
     }
+  }
+  if (role.key === 'reviewer' && typeof args.task === 'string') {
+    const issue = reviewerScopeIssue(args.task);
+    if (issue) {
+      return { decision: 'block', code: 'dispatch_reviewer_scope_too_broad', message: issue, audit: baseAudit };
+    }
+  }
+  if (role.key === 'reviewer' && typeof args.task !== 'string') {
+    return { decision: 'block', code: 'dispatch_reviewer_scope_too_broad', message: '审查任务须在 task 正文中给出唯一目标和 coverage.docPaths；不可用不可核对的 taskFile 派发', audit: baseAudit };
   }
 
   // 创建回执携带原生 taskId；wait 模式直到子任务终态才返回，期间身份始终

@@ -48,8 +48,25 @@ describe('mechanical coverage reconciliation', () => {
     const carried = { ...item('old', 'definition'), disposition: 'mapped' as const, targetObjectIds: ['object'] };
     const ready = { ...item('ready', 'rule'), disposition: 'mapped' as const, targetObjectIds: ['ready-object'] };
     const blocked = item('pending', 'missing');
-    expect(selectProgressiveCoverage([carried], [ready, blocked], new Set(['ready'])))
+    expect(selectProgressiveCoverage([carried], [ready, blocked], {
+      promotedSources: new Set(['ready']), includedObjectIds: new Set(['object', 'ready-object']),
+      promotedObjectIds: new Set(['ready-object']), retainedSources: new Set(['old']),
+    }))
       .toEqual([carried, ready]);
+  });
+
+  it('同一来源仅晋级已审文档的覆盖项，保留正式兄弟文档的覆盖项', () => {
+    const from = (name: string, objectIds: string[]) => ({
+      ...item('shared', name), disposition: 'mapped' as const, targetObjectIds: objectIds,
+    });
+    const carried = from('carried', ['old-object']);
+    const ready = from('ready', ['ready-object']);
+    const unfinished = from('unfinished', ['draft-object']);
+    const selected = selectProgressiveCoverage([carried], [ready, unfinished], {
+      promotedSources: new Set(['shared']), includedObjectIds: new Set(['old-object', 'ready-object']),
+      promotedObjectIds: new Set(['ready-object']), retainedSources: new Set(['shared']),
+    });
+    expect(selected).toEqual([carried, ready]);
   });
 
   it('reads a linked sibling CSV when the old sheet index omitted its attachment', () => {

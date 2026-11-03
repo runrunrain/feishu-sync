@@ -202,6 +202,26 @@ describe('guardTaskSubmit', () => {
     expect(guardTaskSubmit(makeConfig(), { agent: 'diting', task: broad }).decision).toBe('allow');
   });
 
+  it('同源多篇审查在派发前拆为单篇，精确单篇范围放行', () => {
+    const grouped = [
+      '【独立审查】部队移动验证两篇草稿',
+      '审查对象：',
+      '1. 战斗系统R/部队移动验证部队与军团规则.md',
+      '2. 战斗系统R/部队移动验证军阵流体与碰撞规则.md',
+      'kb_submit_review：coverage.docPaths=上述 2 个完整路径',
+    ].join('\n');
+    const blocked = guardTaskSubmit(makeConfig(), { agent: 'diting', task: grouped });
+    expect(blocked.decision).toBe('block');
+    if (blocked.decision === 'block') expect(blocked.code).toBe('dispatch_reviewer_scope_too_broad');
+    const multiple = guardTaskSubmit(makeConfig(), { agent: 'diting', task: '【独立审查】coverage.docPaths=["A.md","B.md"]' });
+    expect(multiple.decision).toBe('block');
+    const misleading = guardTaskSubmit(makeConfig(), { agent: 'diting', task: grouped.replace('上述 2 个完整路径', '["战斗系统R/部队移动验证部队与军团规则.md"]') });
+    expect(misleading.decision).toBe('block');
+    const one = guardTaskSubmit(makeConfig(), { agent: 'diting', task: '【独立审查】审查对象：A.md\nkb_submit_review：coverage.docPaths=["A.md"]' });
+    expect(one.decision).toBe('allow');
+    expect(guardTaskSubmit(makeConfig(), { agent: 'diting', taskFile: 'docs/review-task.md' }).decision).toBe('block');
+  });
+
   it('明确要求通读长源的写作任务即使未列章节坐标也被拦截', () => {
     const blocked = guardTaskSubmit(makeConfig(), {
       agent: 'luban', task: '【写作】整篇规则。主要来源：docx 文档，342 行。请覆盖全文后一次写入。',
