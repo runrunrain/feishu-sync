@@ -2499,7 +2499,13 @@ export class KbBuildService extends EventEmitter {
       // kb_write_doc 写入时同步 docMeta（通过 onEvent 钩子后校验阶段重建也可），
       // 校验阶段以解析 staging 文件头为准，meta 仅作标题/摘要补充源。
       this.patchBuildStateMeta(buildState, docMeta);
-      buildState.onCheckpoint = () => this.persistCheckpoint(buildId);
+      // Child MCP writes and reviews checkpoint through buildState directly.
+      // A Leader-only checkpoint callback never fires for an independently
+      // completed review while the Leader is waiting on other tasks.
+      buildState.onCheckpoint = () => {
+        this.persistCheckpoint(buildId);
+        this.scheduleProgressivePublish(buildId);
+      };
       setStatus('running');
 
       // D5（A 案 §7.2）：requiredRewrites = 种子 ∪ 语义闭包（旧 affectedDocs

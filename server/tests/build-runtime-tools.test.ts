@@ -846,9 +846,10 @@ describe('审查（§4.3）与交接/问题/发布（§5）', () => {
     expect(firstPage.total).toBe(2);
     expect(firstPage.nextOffset).toBe(1);
     const secondPage = JSON.parse((await call(setup.leader.token, 'build_handoff_list', { offset: 1, limit: 1 })).content[0]!.text);
-    expect(secondPage.handoffs[0].summary.length).toBe(240);
-    expect(secondPage.handoffs[0].summaryTruncated).toBe(true);
-    expect(secondPage.handoffs[0].openIssueCount).toBe(1);
+    expect(firstPage.handoffs[0].summary.length).toBe(160);
+    expect(firstPage.handoffs[0].summaryTruncated).toBe(true);
+    expect(firstPage.handoffs[0].openIssueCount).toBe(1);
+    expect(secondPage.handoffs[0].summary).toBe('完成定位文档');
     const detail = JSON.parse((await call(setup.leader.token, 'build_handoff_list', { taskId: 'w2' })).content[0]!.text);
     expect(detail.handoffs[0].summary).toBe(longSummary);
     expect(detail.summaryOnly).toBeUndefined();

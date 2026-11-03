@@ -212,7 +212,9 @@ function writerScopeIssue(task: string): string | null {
 function reviewerScopeIssue(task: string): string | null {
   const assignment = task.split('[当前任务书]').at(-1) ?? task;
   if (!/【独立审查】|审查对象|kb_submit_review/.test(assignment)) return null;
-  const declaration = /coverage\.docPaths\s*=\s*(\[[^\]\n]*\])/.exec(assignment);
+  // Task briefs often describe the literal value as "coverage.docPaths 字面 = [...]".
+  // Parse that wording as a declaration; the JSON path check below still enforces one doc.
+  const declaration = /coverage\.docPaths(?:\s*(?:字面|字段|应为|为))?\s*(?:=|：|:)\s*(\[[^\]\n]*\])/.exec(assignment);
   if (!declaration) {
     return '审查任务书须明确写入 coverage.docPaths=["唯一目标路径.md"]；每篇文档单独派发和审查，不得以“上述多篇”代替精确范围';
   }
@@ -225,7 +227,7 @@ function reviewerScopeIssue(task: string): string | null {
   const targetMarker = assignment.indexOf('审查对象');
   if (targetMarker >= 0) {
     const afterMarker = assignment.slice(targetMarker + '审查对象'.length);
-    const sectionEnd = afterMarker.search(/\n(?:来源|审查要点|kb_submit_review)[:：]/);
+    const sectionEnd = afterMarker.search(/\n(?:来源|背景|审查要点|提交|kb_submit_review)[:：]/);
     const reviewTargets = sectionEnd >= 0 ? afterMarker.slice(0, sectionEnd) : afterMarker.split('\n').slice(0, 6).join('\n');
     const listedCount = [...reviewTargets.matchAll(/\.md\b/g)].length;
     if (listedCount > 1 || (listedCount === 1 && !reviewTargets.includes(paths[0]))) {

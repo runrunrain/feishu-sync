@@ -219,6 +219,10 @@ describe('guardTaskSubmit', () => {
     expect(misleading.decision).toBe('block');
     const one = guardTaskSubmit(makeConfig(), { agent: 'diting', task: '【独立审查】审查对象：A.md\nkb_submit_review：coverage.docPaths=["A.md"]' });
     expect(one.decision).toBe('allow');
+    const literalWording = guardTaskSubmit(makeConfig(), { agent: 'diting', task: '【独立审查】审查对象：A.md\n提交：kb_submit_review，coverage.docPaths 字面 = ["A.md"]' });
+    expect(literalWording.decision).toBe('allow');
+    const literalMultiple = guardTaskSubmit(makeConfig(), { agent: 'diting', task: '【独立审查】coverage.docPaths 字面 = ["A.md", "B.md"]' });
+    expect(literalMultiple.decision).toBe('block');
     expect(guardTaskSubmit(makeConfig(), { agent: 'diting', taskFile: 'docs/review-task.md' }).decision).toBe('block');
   });
 

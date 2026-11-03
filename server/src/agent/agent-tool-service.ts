@@ -72,6 +72,7 @@ import { finalDraftEvidenceScopePaths } from '../kb/progressive-knowledge-draft.
 import {
   computePayloadHash,
   computeReviewSubjectHash,
+  coverageReasonImpliesKnowledgeTransfer,
   KNOWLEDGE_OBJECT_TYPES,
   KNOWLEDGE_RELATION_TYPES,
   type BodyRange,
@@ -3430,6 +3431,9 @@ export class AgentToolService {
       if ((disposition === 'excluded_template' || disposition === 'excluded_nonknowledge') && !reason) {
         throw new ToolError('kb_coverage_invalid', `排除必须给理由: ${itemId}（不能把漏掉的规则统一标成模板）`);
       }
+      if (disposition === 'excluded_nonknowledge' && reason && coverageReasonImpliesKnowledgeTransfer(reason)) {
+        throw new ToolError('kb_coverage_invalid', `覆盖项 ${itemId} 仍属知识且由其他文档承接；请映射到承接对象，不要标成 excluded_nonknowledge`, 409);
+      }
       const mainResource = pack.resources[0]!;
       newCoverage.push({
         itemId,
@@ -4278,22 +4282,25 @@ export class AgentToolService {
     // 恢复时先读目录级摘要。完整交接可能含 2k 摘要和大量来源坐标，整批
     // 返回会让 Leader 在一次 high 思考里反复消化历史文本；按 taskId 精读。
     const offset = args.offset === undefined ? 0 : Number(args.offset);
-    const limit = args.limit === undefined ? 25 : Number(args.limit);
+    const limit = args.limit === undefined ? 8 : Number(args.limit);
     if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
       throw new ToolError('invalid_request', 'offset 须为非负整数，limit 须为 1–100 的整数');
     }
-    const page = records.slice(offset, offset + limit);
+    // Recovery usually needs the latest author/reviewer handoffs. Returning the
+    // oldest 25 records made one read tens of kilobytes and delayed first dispatch.
+    const ordered = taskId ? records : [...records].reverse();
+    const page = ordered.slice(offset, offset + limit);
     const handoffs = taskId ? page : page.map((record) => ({
       handoffId: record.handoffId,
       taskId: record.taskId,
       role: record.role,
-      summary: record.summary.slice(0, 240),
-      summaryTruncated: record.summary.length > 240,
-      artifactRefs: record.artifactRefs.slice(0, 5),
+      summary: record.summary.slice(0, 160),
+      summaryTruncated: record.summary.length > 160,
+      artifactRefs: record.artifactRefs.slice(0, 3),
       artifactRefCount: record.artifactRefs.length,
-      sourceScope: record.sourceScope.slice(0, 5),
+      sourceScope: record.sourceScope.slice(0, 2),
       sourceScopeCount: record.sourceScope.length,
-      openIssues: record.openIssues.slice(0, 2).map((item) => item.slice(0, 180)),
+      openIssues: record.openIssues.slice(0, 1).map((item) => item.slice(0, 120)),
       openIssueCount: record.openIssues.length,
       nextInfoCount: record.nextInfo.length,
       createdAt: record.createdAt,

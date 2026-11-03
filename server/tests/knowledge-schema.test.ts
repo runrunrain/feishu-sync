@@ -504,12 +504,14 @@ describe('validateKnowledgeGraph（A 案 §7.4）', () => {
     expectBlocking(mutated((m) => { m.coverage[0]!.targetObjectIds = []; }), 'kb_coverage_invalid');
   });
 
-  it('由另一篇承接的知识不能伪装为非知识排除', () => {
-    expectBlocking(mutated((m) => {
+  it('既有发布版的错误排除提示修复，但不阻断无关增量发布', () => {
+    const issues = validateKnowledgeGraph(mutated((m) => {
       m.coverage[0]!.disposition = 'excluded_nonknowledge';
       m.coverage[0]!.targetObjectIds = [];
       m.coverage[0]!.reason = '旗手规则改由另一篇文档承接';
-    }), 'kb_coverage_invalid');
+    }));
+    expect(issues).toEqual(expect.arrayContaining([expect.objectContaining({ code: 'kb_coverage_invalid', severity: 'warning' })]));
+    expect(issues.some((item) => item.severity === 'blocking')).toBe(false);
   });
 
   it('warning 通道：普通 unresolved 与排除无理由为 warning，不阻断', () => {

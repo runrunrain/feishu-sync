@@ -958,11 +958,17 @@ export function validateKnowledgeGraph(km: KnowledgeManifest): ValidationIssue[]
       issues.push(issue('kb_coverage_invalid', 'reason',
         `排除必须给理由：${item.itemId}（disposition=${item.disposition}）`, 'warning', refs));
     } else if (item.disposition === 'excluded_nonknowledge'
-      && /改由|归属.{0,40}篇|由.{0,40}篇.{0,20}承接|转移至.{0,40}篇|另一篇|其他篇/.test(item.reason)) {
+      && coverageReasonImpliesKnowledgeTransfer(item.reason)) {
       issues.push(issue('kb_coverage_invalid', 'reason',
-        `覆盖项仍属知识且由其他文档承接，不能标成非知识排除：${item.itemId}；请映射到承接对象`, 'blocking', refs));
+        `覆盖项仍属知识且由其他文档承接，不应标成非知识排除：${item.itemId}；请映射到承接对象`, 'warning', refs));
     }
   }
 
   return issues;
+}
+
+/** New writes are rejected at the tool boundary. Published legacy coverage is
+ * reported as a warning so it cannot block unrelated incremental releases. */
+export function coverageReasonImpliesKnowledgeTransfer(reason: string): boolean {
+  return /改由|归属.{0,40}篇|由.{0,40}篇.{0,20}承接|转移至.{0,40}篇|另一篇|其他篇/.test(reason);
 }
