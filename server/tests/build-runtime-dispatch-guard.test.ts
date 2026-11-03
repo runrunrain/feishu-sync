@@ -172,6 +172,44 @@ describe('guardTaskSubmit', () => {
     expect(allowed.decision).toBe('allow');
   });
 
+  it('真实 342 行多章节写作在派发前要求拆分，稀疏引用及审查任务仍可派发', () => {
+    const broad = [
+      '[当前任务书]',
+      '【写作】战斗系统R/部队移动与军阵物理规则.md',
+      '主要来源：Lj9DdZpCTozpvkx5MQxcqNHBn2f —— docx，342 行。',
+      '跳读坐标：一 L103；1.1 L105；1.2 L111；二 L121；2.1 L125；2.2 L134；2.3 L144；',
+      '三 L162；3.1 L166；3.2 L180；四 L198；4.1 L202；4.2 L213；4.3 L223；',
+      '4.4 L228；4.5 L241；五 L258；5.1 L262；5.2 L269；5.3 L283；六 L298；',
+      '6.1 L302；6.2 L318；6.3 L332。',
+    ].join('\n');
+    const blocked = guardTaskSubmit(makeConfig(), { agent: 'luban', task: broad });
+    expect(blocked.decision).toBe('block');
+    if (blocked.decision === 'block') {
+      expect(blocked.code).toBe('dispatch_writer_scope_too_broad');
+      expect(blocked.message).toContain('100–150 行');
+      expect(JSON.stringify(blocked.audit)).not.toContain('部队移动');
+    }
+    const splitButStillDense = guardTaskSubmit(makeConfig(), { agent: 'luban', task: [
+      '【写作】军阵流体物理与配置',
+      '四 L198、4.1 L202、4.2 L213、4.3 L223、4.4 L228、4.5 L241、',
+      '五 L258、5.1 L262、5.2 L269、5.3 L283、六 L298、6.1 L302、6.2 L318、6.3 L332',
+    ].join('\n') });
+    expect(splitButStillDense.decision).toBe('block');
+    const narrow = guardTaskSubmit(makeConfig(), { agent: 'luban', task: '【写作】部队指挥规则：二 L121、2.1 L125、2.2 L134、2.3 L144' });
+    expect(narrow.decision).toBe('allow');
+    const sparse = guardTaskSubmit(makeConfig(), { agent: 'luban', task: '【写作】方阵：参考定义 L100；目标规则 L900' });
+    expect(sparse.decision).toBe('allow');
+    expect(guardTaskSubmit(makeConfig(), { agent: 'diting', task: broad }).decision).toBe('allow');
+  });
+
+  it('明确要求通读长源的写作任务即使未列章节坐标也被拦截', () => {
+    const blocked = guardTaskSubmit(makeConfig(), {
+      agent: 'luban', task: '【写作】整篇规则。主要来源：docx 文档，342 行。请覆盖全文后一次写入。',
+    });
+    expect(blocked.decision).toBe('block');
+    if (blocked.decision === 'block') expect(blocked.code).toBe('dispatch_writer_scope_too_broad');
+  });
+
   it('taskFile 越出工作目录 → 阻止（../ 与绝对路径）', () => {
     expect(guardTaskSubmit(makeConfig(), { agent: 'luban', taskFile: '../escape.md' }).decision).toBe('block');
     expect(guardTaskSubmit(makeConfig(), { agent: 'luban', taskFile: '/etc/passwd' }).decision).toBe('block');

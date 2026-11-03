@@ -170,6 +170,27 @@ function sortedUnique(values: readonly string[]): string[] {
   return [...new Set(values)].sort();
 }
 
+/**
+ * 写作任务的章节坐标是应用 build_manifest 给出的机械索引。长源若把大量章节
+ * 塞进同一轮 high 思考，模型可能在调用 kb_write_doc 前耗尽输出额度。这里仅
+ * 拒绝可确定过宽的任务书；稀疏的跨段引用和明细表不按首末坐标跨度误判。
+ */
+function writerScopeIssue(task: string): string | null {
+  const assignment = task.split('[当前任务书]').at(-1) ?? task;
+  const anchors = [...new Set([...assignment.matchAll(/\bL(\d+)\b/g)].map((match) => Number(match[1])))]
+    .filter((line) => Number.isSafeInteger(line) && line > 0);
+  const span = anchors.length > 0 ? Math.max(...anchors) - Math.min(...anchors) : 0;
+  if (anchors.length > 12 || (anchors.length >= 10 && span > 160)) {
+    return `写作任务包含 ${anchors.length} 个章节定位、跨度 ${span} 行，单轮范围过宽；请按独立主题拆为更窄的单篇任务（每篇约 100–150 行，至多 12 个规则章节），只列本篇需要读取的坐标`;
+  }
+  const sourceLines = /(?:来源|源文档|正文)[^\n]{0,100}?(\d{3,5})\s*行/.exec(assignment);
+  if (sourceLines && Number(sourceLines[1]) > 250
+    && /通读全文|阅读全文|覆盖全文|从头到尾|读完全部/.test(assignment)) {
+    return `写作任务要求通读 ${sourceLines[1]} 行长源；请先按独立主题拆分，任务书只指定本篇约 100–150 行的目标区段`;
+  }
+  return null;
+}
+
 // ── task_submit 守卫 ───────────────────────────────────────────
 
 /**
@@ -248,6 +269,13 @@ export function guardTaskSubmit(
   baseAudit.taskSha256 = typeof args.task === 'string' && args.task
     ? sha256(args.task)
     : typeof args.taskFile === 'string' ? sha256(`taskFile:${args.taskFile}`) : null;
+
+  if (role.key === 'writer' && typeof args.task === 'string') {
+    const issue = writerScopeIssue(args.task);
+    if (issue) {
+      return { decision: 'block', code: 'dispatch_writer_scope_too_broad', message: issue, audit: baseAudit };
+    }
+  }
 
   // 创建回执携带原生 taskId；wait 模式直到子任务终态才返回，期间身份始终
   // pending，应用只能下发只读 MCP 面。构建必须先拿句柄并确认身份。
