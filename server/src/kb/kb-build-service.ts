@@ -56,6 +56,7 @@ import { PathClaims } from './path-claims.js';
 import { collectWhiteboardTextsForEntries, enrichEntriesWithMedia, hashImageFile, resolveSourceImages, verifyEntryMediaHash, verifyEntryWhiteboardTextHash, type WhiteboardTextMap } from './source-images.js';
 import type { ImageDescription } from '../agent/vision/vision-describer.js';
 import { VisionDescriber } from '../agent/vision/vision-describer.js';
+import { versionedPublishedSources, visionDescriptionImproved, visionDescriptionVersion } from './vision-description-version.js';
 import { buildDefaultAgentVisionConfig, type KbBuildMetricsPrecheck } from '../types/agent-knowledge.js';
 import type { KbChangePreview, KbDocMerge, KbFileChange } from '../types/kb-version.js';
 import { sourceVersionWarning } from './search/query-metadata.js';
@@ -2528,9 +2529,8 @@ export class KbBuildService extends EventEmitter {
         && [...workset.values()].every((change) => change === 'rebuild')
         && changeset.added.length === 0 && changeset.changed.length === 0 && changeset.removed.length === 0
         && impactClosure.seeds.decisionChange.length === 0 && impactClosure.seeds.migration.length === 0;
-      buildState.requiredRewrites = new Set(reviewedCarryEligible ? [] : (resume?.requiredRewrites ?? impactClosure.requiredRewrites)
+      buildState.requiredRewrites = new Set((resume?.requiredRewrites ?? (reviewedCarryEligible ? [] : impactClosure.requiredRewrites))
         .filter((docPath) => fs.existsSync(path.join(stagingRootPath, 'docs', docPath))));
-      if (reviewedCarryEligible) this.emitLog(buildId, 'info', '所选来源与已发布版内容相同：允许沿用候选经本轮独立审查后发布；发现问题仍可定向修订');
       if (resume) {
         buildState.preservedDocs = new Map(resume.preservedDocs);
       } else if (entry.rebuildSelected && baseManifest) {
@@ -2578,6 +2578,23 @@ export class KbBuildService extends EventEmitter {
       if (entry.rebuildSelected && !resume) await this.includeRetainedImageCache(buildState, visionDescriber, cancelController.signal);
       buildState.visionReady = visionReady;
       if (entry.cancelRequested) throw new CancelledError();
+
+      // An unchanged source file can gain usable image evidence after a larger
+      // image limit, restored vision service, or new cache entry. Previous
+      // releases did not record this version; selected image sources therefore
+      // need one real rewrite before they can be carried again.
+      const publishedSourceByToken = new Map(baseManifest?.sourceSnapshot.map((source) => [source.objToken, source]) ?? []);
+      const visionChangedTokens = [...workset.keys()].filter((token) => visionDescriptionImproved(
+        publishedSourceByToken.get(token), visionDescriptionVersion(buildState.imageDescriptions?.get(token))));
+      if (visionChangedTokens.length && baseManifest && !resume) {
+        const changed = new Set(visionChangedTokens);
+        const rewritePaths = baseManifest.docs.filter((doc) => doc.sources.some((token) => changed.has(token)))
+          .map((doc) => doc.path);
+        for (const docPath of rewritePaths) buildState.requiredRewrites?.add(docPath);
+        this.emitLog(buildId, 'info', `识图证据已更新：${visionChangedTokens.length} 个来源涉及 ${rewritePaths.length} 篇正式文档，需重写后才可承接新描述`);
+      } else if (reviewedCarryEligible && !resume && buildState.requiredRewrites?.size === 0) {
+        this.emitLog(buildId, 'info', '所选来源与已发布版证据相同：允许沿用已发布文档；发现问题仍可定向修订');
+      }
 
       const buildWarnings: KbBuildDto['warnings'] = [];
       if (permissionDeniedSources.length > 0) {
@@ -7372,6 +7389,14 @@ export class KbBuildService extends EventEmitter {
       }
     }
 
+    const versionStore = new KbVersionStore(outputRoot);
+    const baseManifest = input.baseReleaseId ? new StandardKbStore(outputRoot).readManifest(input.baseReleaseId) : null;
+    const committedPaths = input.publicationStage === 'progressive'
+      ? new Set(input.promotedPaths ?? [])
+      : this.active.get(input.buildId)?.buildState?.writtenPaths ?? new Set<string>();
+    const sourceSnapshot = versionedPublishedSources({
+      entries: input.snapshot.entries, baseManifest, docs, committedPaths, descriptions: input.imageDescriptions,
+    });
     const manifest = {
       ...(knowledgePlan
         ? {
@@ -7391,7 +7416,7 @@ export class KbBuildService extends EventEmitter {
       baseReleaseId: input.baseReleaseId,
       publishedAt: new Date().toISOString(),
       model: input.model,
-      sourceSnapshot: input.snapshot.entries,
+      sourceSnapshot,
       docs,
       skippedSources: input.skippedSources ?? this.active.get(input.buildId)?.buildState?.finishInfo?.skipped ?? [],
       ...(input.publicationStage ? { publicationStage: input.publicationStage } : {}),
@@ -7399,8 +7424,6 @@ export class KbBuildService extends EventEmitter {
       ...(input.promotionHashes ? { promotionHashes: input.promotionHashes } : {}),
     };
     fs.writeFileSync(path.join(releaseDir, 'manifest.json'), JSON.stringify(manifest, null, 2));
-    const versionStore = new KbVersionStore(outputRoot);
-    const baseManifest = input.baseReleaseId ? new StandardKbStore(outputRoot).readManifest(input.baseReleaseId) : null;
     const sourceContents = input.sourceContents ?? {};
     versionStore.writeVersion(manifest, baseManifest, sourceContents,
       input.changePreview ?? sourceChangePreview(input.snapshot, sourceContents, baseManifest,

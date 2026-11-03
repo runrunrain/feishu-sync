@@ -45,8 +45,10 @@ async function fixture(visionDescriber?: VisionDescriberLike) {
     pool: new AgentProcessPool(), resolver, toolService: tools, internalBaseUrl: () => '', extensionPath: () => null, promptAssets: () => null, visionDescriber });
   let behavior: 'normal' | 'drop' | 'overwrite' | 'merge' = 'normal';
   const worksets: string[][] = [];
+  const rewrites: string[][] = [];
   Object.assign(service, { spawnBuildProcess: async (buildId: string, state: BuildRunState) => {
     worksets.push([...state.workset.keys()].sort());
+    rewrites.push([...(state.requiredRewrites ?? [])].sort());
     const { token } = tools.createRunContext({ runKind: 'build', buildId, outputRoot: config.getConfig()!.standardKb.outputRoot, knowledgeBaseRoot: raw, buildState: state });
     let batches = 0;
     return Object.assign(new EventEmitter(), {
@@ -90,7 +92,7 @@ async function fixture(visionDescriber?: VisionDescriberLike) {
     const kb = published(); const manifest = kb.readManifest()!;
     return kb.readReleaseDoc(manifest.releaseId, manifest.docs.find((doc) => doc.path === docPath)!).markdown;
   };
-  return { raw, store, output, select, build, request, worksets, published, markdown, setBehavior: (value: typeof behavior) => { behavior = value; } };
+  return { raw, store, output, select, build, request, worksets, rewrites, published, markdown, setBehavior: (value: typeof behavior) => { behavior = value; } };
 }
 
 describe('所选源在现有标准库上继续构建', () => {
@@ -125,12 +127,15 @@ describe('所选源在现有标准库上继续构建', () => {
     expect(f.markdown('a.md')).toContain('行动按回合执行'); expect(f.markdown('b.md')).toBe(preserved);
   });
 
-  it('继续构建时也更新已有来源的真实变更，避免将旧正文标记为最新', async () => {
+  it('分批构建冻结未选来源，后续单独选中时再更新正式正文', async () => {
     const f = await fixture(); f.select(['a', 'b']); await f.build(); const preserved = f.markdown('a.md');
     f.output.b = '技能消耗二十点怒气，怒气不足时不能使用。'.repeat(8); fs.writeFileSync(path.join(f.raw, 'b.md'), f.output.b);
     f.select(['c']); expect((await f.build()).status).toBe('published');
-    expect(f.worksets.at(-1)).toEqual(['b', 'c']);
-    expect(f.markdown('a.md')).toBe(preserved); expect(f.markdown('b.md')).toContain('二十点怒气');
+    expect(f.worksets.at(-1)).toEqual(['c']);
+    expect(f.markdown('a.md')).toBe(preserved); expect(f.markdown('b.md')).toContain('十点怒气');
+    f.select(['b']); expect((await f.build()).status).toBe('published');
+    expect(f.worksets.at(-1)).toEqual(['b']);
+    expect(f.markdown('b.md')).toContain('二十点怒气');
     expect(f.published().readManifest()!.docs).toHaveLength(3);
     expect((await f.request('/api/kb/changes')).data.sources).toEqual([]);
   });
@@ -150,6 +155,32 @@ describe('所选源在现有标准库上继续构建', () => {
     expect(lookup).toHaveBeenCalledWith(imageHash); expect(f.markdown('a.md')).toBe(preserved);
   });
 
+  it('原图字节未变而识图补齐时，重建真实文档并更新发布证据版本', async () => {
+    const bytes = Buffer.from('89504e470d0a1a0a00000000', 'hex');
+    const imageHash = crypto.createHash('sha256').update(bytes).digest('hex');
+    let available = false;
+    const vision: VisionDescriberLike = {
+      status: async () => ({ state: 'ready', model: 'fixture/vision', message: '' }),
+      lookup: async () => null,
+      describeOne: async () => ({ src: 'figure.png', imageHash, state: 'unavailable', reason: 'too_large' }),
+      describeMany: async (items) => new Map(items.map((item) => [item.src, available
+        ? { src: item.src, imageHash, state: 'described' as const, text: '图中新增结算规则' }
+        : { src: item.src, imageHash, state: 'unavailable' as const, reason: 'too_large' as const }])),
+    };
+    const f = await fixture(vision);
+    fs.writeFileSync(path.join(f.raw, 'figure.png'), bytes);
+    fs.writeFileSync(path.join(f.raw, 'a.md'), '# 图示\n![结算规则](figure.png)');
+    f.select(['a']); expect((await f.build()).status).toBe('published');
+    const first = f.published().readManifest()!.sourceSnapshot.find((entry) => entry.objToken === 'a')!;
+    available = true; f.output.a = '图中新增结算规则。'.repeat(8);
+    f.select(['a']); expect((await f.build()).status).toBe('published');
+    const second = f.published().readManifest()!.sourceSnapshot.find((entry) => entry.objToken === 'a')!;
+    expect(f.rewrites.at(-1)).toContain('a.md');
+    expect(second.visionDescriptionHash).not.toBe(first.visionDescriptionHash);
+    expect(second.visionDescribedCount).toBe(1);
+    expect(f.markdown('a.md')).toContain('图中新增结算规则');
+  });
+
   it.each(['drop', 'overwrite'] as const)('模型误%s未受影响的旧文档时拒绝发布，旧版本与已构建状态不变', async (behavior) => {
     const f = await fixture(); f.select(['a']); await f.build(); const old = f.published().readCurrent()!.releaseId;
     const preserved = f.markdown('a.md'); f.select(['b']); f.setBehavior(behavior);
@@ -167,11 +198,11 @@ describe('所选源在现有标准库上继续构建', () => {
     expect(f.markdown('b.md')).toContain('每回合执行一次行动');
   });
 
-  it('真正删除的来源不会被继续构建恢复；无所选源时拒绝执行', async () => {
+  it('未选来源在分批构建中保持冻结；无所选源时拒绝执行', async () => {
     const f = await fixture(); f.select(['a', 'b']); await f.build();
     f.store.markLocalSourceDeleted(f.raw, f.store.getDocumentByObjToken('a')!);
     f.select(['b']); expect((await f.build()).status).toBe('published');
-    expect(f.published().readManifest()!.sourceSnapshot.map((source) => source.objToken)).toEqual(['b']);
+    expect(f.published().readManifest()!.sourceSnapshot.map((source) => source.objToken)).toEqual(['a', 'b']);
     const release = f.published().readCurrent()!.releaseId;
     f.select([]); const failed = await f.build(); expect(failed.status).toBe('failed'); expect(failed.error.code).toBe('no_sources_selected');
     expect(f.published().readCurrent()!.releaseId).toBe(release);

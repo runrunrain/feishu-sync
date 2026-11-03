@@ -662,7 +662,7 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
               {kbStatus?.current ? `在现有 ${kbStatus.current.docCount} 篇标准文档的基础上继续构建，合并更新相关内容，保留未受影响的文档。` : '本次将创建标准知识库。'}
               构建会消耗已配置模型的额度。
             </p>
-            {kbStatus?.current && pending && (pending.changed > 0 || pending.removed > 0) ? <p className="text-xs text-ink-faint">已有来源的待更新内容也会一并处理。</p> : null}
+            {kbStatus?.current && pending && (pending.changed > 0 || pending.removed > 0) ? <p className="text-xs text-ink-faint">未选中的待更新来源继续沿用当前正式版，可在后续批次处理。</p> : null}
             <p className="text-xs text-ink-faint">
               发布前旧版本保持可用；任何失败都不会改变当前已发布的版本。
             </p>

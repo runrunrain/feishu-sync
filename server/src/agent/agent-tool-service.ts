@@ -70,6 +70,7 @@ import { TASK_TOOL_FAMILY_NAME } from './tool-specs.js';
 import { RawSourceSnapshot, collectSourceCandidates } from '../kb/raw-source-snapshot.js';
 import { StandardKbStore, parseStdHeader, stripStdHeader } from '../kb/standard-kb-store.js';
 import { KbVersionStore } from '../kb/kb-version-store.js';
+import { visionDescriptionImproved, visionDescriptionVersion } from '../kb/vision-description-version.js';
 import { finalDraftEvidenceScopePaths } from '../kb/progressive-knowledge-draft.js';
 import {
   computePayloadHash,
@@ -4308,7 +4309,8 @@ export class AgentToolService {
     try {
       draft = JSON.parse(fs.readFileSync(path.join(state.stagingRoot, 'knowledge-draft.json'), 'utf8')) as KnowledgeDraftFile;
     } catch { /* The candidate may not have any declarations yet. */ }
-    const carriedPublishedPaths = entries.filter(({ path: docPath }) => draft?.docs?.[docPath]?.basis === 'published').map(({ path: docPath }) => docPath);
+    const carriedPublishedPaths = entries.filter(({ path: docPath }) => draft?.docs?.[docPath]?.basis === 'published'
+      && (!state.requiredRewrites?.has(docPath) || state.writtenPaths?.has(docPath))).map(({ path: docPath }) => docPath);
     const ownProgressive = !!manifest && manifest.buildId === (context.buildId ?? state.v2?.actorStore.buildId)
       && manifest.publicationStage === 'progressive';
     const promotedHashes = ownProgressive ? manifest.promotionHashes ?? {} : {};
@@ -4326,7 +4328,8 @@ export class AgentToolService {
       && changedPaths !== undefined && !changedPaths.includes(docPath)).map(({ path: docPath }) => docPath);
     const alreadyFormal = new Set([...carriedPublishedPaths, ...promotedUnchangedPaths]);
     const unpublishedDraftPaths = entries.filter(({ path: docPath }) => !alreadyFormal.has(docPath)).map(({ path: docPath }) => docPath);
-    const pendingRequiredRewrites = unpublishedDraftPaths.filter((docPath) => state.requiredRewrites?.has(docPath));
+    const pendingRequiredRewrites = unpublishedDraftPaths.filter((docPath) => state.requiredRewrites?.has(docPath)
+      && !state.writtenPaths?.has(docPath));
     return { carriedPublishedPaths, promotedUnchangedPaths, unpublishedDraftPaths, pendingRequiredRewrites };
   }
 
@@ -4365,6 +4368,8 @@ export class AgentToolService {
       : state.snapshot.entries.filter((entry) => state.mode === 'full' || state.workset.has(entry.objToken));
     const entries = sourceEntries.map((entry) => {
       const previous = publishedSourceByToken.get(entry.objToken);
+      const visionImproved = visionDescriptionImproved(previous,
+        visionDescriptionVersion(state.imageDescriptions?.get(entry.objToken)));
       const changeType = state.workset.get(entry.objToken) ?? (state.mode === 'full' ? 'rebuild' : null);
       const assembled = this.assembleBuildRead(state, entry);
       const sourceAvailability = isPermissionDeniedSourcePlaceholder(assembled.resources[0]?.lines.join('\n') ?? '')
@@ -4389,6 +4394,7 @@ export class AgentToolService {
             && previous.contentHash === entry.contentHash
             && (!previous.mediaHash || !entry.mediaHash || previous.mediaHash === entry.mediaHash)
             && (previous.whiteboardTextHash ?? '') === (entry.whiteboardTextHash ?? '')
+            && !visionImproved
           : null,
       };
     });

@@ -257,6 +257,24 @@ describe('Leader 工具面（§3.4）', () => {
     }
   });
 
+  it('build_manifest 不把新识别的旧图片证据当作已发布版未变', async () => {
+    const setup = makeV2('b-manifest-vision-improved');
+    const original = setup.state.snapshot.get('tokA')!;
+    setup.state.workset.set('tokA', 'rebuild');
+    setup.state.imageDescriptions = new Map([['tokA', new Map([['diagram.png', {
+      src: 'diagram.png', imageHash: 'image-hash', state: 'cached' as const, text: '图中的新规则',
+    }]])]]);
+    const readManifest = vi.spyOn(StandardKbStore.prototype, 'readManifest').mockReturnValue({
+      sourceSnapshot: [original], docs: [],
+    } as never);
+    try {
+      const manifest = JSON.parse((await call(setup.leader.token, 'build_manifest', {})).content[0]!.text);
+      expect(manifest.entries.find((source: { objToken: string }) => source.objToken === 'tokA')).toMatchObject({
+        changeType: 'rebuild', unchangedFromPublished: false,
+      });
+    } finally { readManifest.mockRestore(); }
+  });
+
   it('增量构建默认清单只含工作集，完整快照必须显式查询', async () => {
     const setup = makeV2('b-manifest-workset');
     setup.state.workset.delete('tokB');
@@ -1011,6 +1029,12 @@ describe('审查（§4.3）与交接/问题/发布（§5）', () => {
         expect(value.unpublishedDraftPaths).toEqual([docs.pending]);
         expect(value.pendingRequiredRewrites).toEqual([docs.pending]);
       }
+      setup.state.requiredRewrites.add(docs.carried);
+      const visionRewrite = JSON.parse((await call(setup.leader.token, 'build_manifest', {})).content[0]!.text);
+      expect(visionRewrite.documentWorkStatus.carriedPublishedPaths).toEqual([]);
+      expect(visionRewrite.documentWorkStatus.unpublishedDraftPaths).toContain(docs.carried);
+      expect(visionRewrite.documentWorkStatus.pendingRequiredRewrites).toContain(docs.carried);
+      setup.state.requiredRewrites.delete(docs.carried);
       draft.objects.push({ objectId: 'o1', canonical: { path: docs.promoted }, reviewSubjectHash: 'changed' });
       fs.writeFileSync(path.join(setup.state.stagingRoot, 'knowledge-draft.json'), JSON.stringify(draft));
       const changed = JSON.parse((await call(setup.leader.token, 'build_checkpoint', { action: 'status' })).content[0]!.text);

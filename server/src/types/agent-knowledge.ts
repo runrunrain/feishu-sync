@@ -334,6 +334,10 @@ export interface RawSourceSnapshotEntry {
    * 旁路文件不进 contentHash/mediaHash——contentHash 公式不变，升级不
    * 触发全量 changed；旧 manifest 无此字段视为未变（additive 兼容） */
   whiteboardTextHash?: string;
+  /** Descriptions actually incorporated into the published documents. This is
+   * updated only after all documents depending on this source are rewritten. */
+  visionDescriptionHash?: string;
+  visionDescribedCount?: number;
 }
 
 export interface KbManifestDoc {
