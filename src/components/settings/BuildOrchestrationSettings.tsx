@@ -758,10 +758,8 @@ export function BuildOrchestrationSettings() {
 // ---------------------------------------------------------------------------
 // v2 运行宿主状态与安装（真实 GET/POST /api/kb/build-runtime*；消费集成侧
 // BuildRuntimeStatusDto。staticOk ≠ fullyVerified，安装可用 ≠ 质量验收全过）。
-// plugin-install-fix：构建专用固定版本与「全局/应用 Pi home 的其他 amagi-pi」
-// 分开呈现——检测到的 2.21.36 不冒充固定 2.21.31、也不因版本更高被采用；默认
-// 安装走服务端官方 Git 固定 commit 获取链（无匹配不回退 npm/latest）；已装则
-// 按钮语义为「校验」（完整哈希复用核对），不假装重装。
+// 构建专用冻结副本与 Pi home 中的候选来源分开呈现。较新稳定本地版本在下一次
+// 构建前自动安装并冻结；没有候选时使用内置 Git 回退来源。
 // ---------------------------------------------------------------------------
 
 const PROBE_CHECK_STATE_LABEL: Record<string, string> = {
@@ -849,7 +847,8 @@ function RuntimeStatusSection({
   const installState: 'installed' | 'missing' | 'broken' = amagi?.installState ?? (amagi?.installed ? 'installed' : 'missing');
   const candidates = amagi?.candidates ?? [];
   const discoveryIssues = amagi?.discoveryIssues ?? [];
-  const recommended = candidates.find((item) => item.matchesPin && item.sourceType === 'local' && item.packagePath) ?? null;
+  const recommended = candidates.find((item) => item.packagePath === amagi?.selectedSource)
+    ?? candidates.find((item) => item.matchesPin && item.sourceType === 'local' && item.packagePath) ?? null;
   const trimmedSource = sourceDir.trim();
   const canSelectDir = typeof window !== 'undefined' && Boolean(window.desktop?.selectDirectory);
   const errorParts = installError ? splitInstallErrorMessage(installError) : null;
@@ -883,12 +882,12 @@ function RuntimeStatusSection({
               Pi：{status.runtime?.piVersion ? <span className="font-mono">{status.runtime.piVersion}</span> : <span className="text-ink-faint">未探测</span>}
             </span>
             <span className="text-ink-soft">
-              构建专用 amagi-pi（固定 <span className="font-mono">{amagi?.pinnedVersion ?? '—'}</span>）：
+              构建专用 amagi-pi（{amagi?.selectedSource ? '新构建优选' : '离线回退'} <span className="font-mono">{amagi?.pinnedVersion ?? '—'}</span>）：
               {installState === 'installed'
                 ? <span className="text-jade" title={`${amagi?.installDir ?? ''} ${amagi?.contentHash ?? ''}`.trim()}>已安装 {amagi?.version ?? amagi?.pinnedVersion}</span>
                 : installState === 'broken'
                   ? <span className="text-seal-2">安装损坏{amagi?.installDetail ? `（${amagi.installDetail}）` : ''}——删除版本化目录后重装</span>
-                  : <span className="text-[#bf9004]">未安装——构建不会使用其他来源的 amagi-pi</span>}
+                  : <span className="text-[#bf9004]">未安装——新构建启动时会自动安装并验证</span>}
             </span>
             {probe ? (
               <span className="flex items-center gap-1.5">
@@ -929,17 +928,19 @@ function RuntimeStatusSection({
               ) : null}
             </div>
           ) : null}
-          {/* 只读发现：全局/应用 Pi home 的其他 amagi-pi（如实区分，不参与构建 pin） */}
+          {/* 只读发现：新版本在下一次构建前复制并冻结，不热切换在跑任务。 */}
           {candidates.length > 0 || discoveryIssues.length > 0 ? (
             <div className="border-t border-line/60 pt-1.5 space-y-1" data-testid="orch-runtime-candidates">
-              <p className="text-[11px] text-ink-soft">检测到的其他 amagi-pi（只读发现，不用于构建）：</p>
+              <p className="text-[11px] text-ink-soft">Pi 中已配置的 amagi-pi：</p>
               <ul className="space-y-0.5">
                 {candidates.map((item) => (
                   <li key={`${item.origin}:${item.source}`} className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px] leading-snug" data-testid="orch-runtime-candidate">
                     <span className="text-ink-soft">{AMAGI_ORIGIN_LABEL[item.origin]}</span>
                     <span className="font-mono">{item.version ?? '版本未知'}</span>
                     <span className="text-ink-faint break-all">（{AMAGI_SOURCE_TYPE_LABEL[item.sourceType]}{item.packagePath ? ` · ${item.packagePath}` : ' · 实体缺失'}）</span>
-                    {item.matchesPin ? (
+                    {item.packagePath === amagi?.selectedSource ? (
+                      <span className="text-jade">下一次构建自动采用并冻结</span>
+                    ) : item.matchesPin ? (
                       <>
                         <span className="text-jade">与固定版本一致</span>
                         {item.sourceType === 'local' && item.packagePath && item.packagePath !== trimmedSource ? (
@@ -954,7 +955,7 @@ function RuntimeStatusSection({
                         ) : null}
                       </>
                     ) : (
-                      <span className="text-[#bf9004]">≠ 固定版本 {amagi?.pinnedVersion ?? ''}，不用于构建</span>
+                      <span className="text-[#bf9004]">未被选为新构建版本</span>
                     )}
                   </li>
                 ))}
@@ -1010,10 +1011,12 @@ function RuntimeStatusSection({
             >
               {installBusy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : amagi?.installed ? <RefreshCw className="w-3.5 h-3.5" /> : <Download className="w-3.5 h-3.5" />}
               {installState === 'installed'
-                ? `校验固定版本 ${amagi?.pinnedVersion ?? ''}`.trim()
+                ? `校验构建版本 ${amagi?.pinnedVersion ?? ''}`.trim()
                 : trimmedSource
                   ? `从目录安装 amagi-pi ${amagi?.pinnedVersion ?? ''}`.trim()
-                  : `安装 amagi-pi ${amagi?.pinnedVersion ?? ''}（官方 Git · ${(amagi?.commit ?? '').slice(0, 7)}）`.trim()}
+                  : amagi?.selectedSource
+                    ? `安装 amagi-pi ${amagi.pinnedVersion}（已配置本地版）`
+                    : `安装 amagi-pi ${amagi?.pinnedVersion ?? ''}（官方 Git · ${(amagi?.commit ?? '').slice(0, 7)}）`.trim()}
             </button>
           </div>
           {errorParts ? (
@@ -1038,8 +1041,10 @@ function RuntimeStatusSection({
           <p className="text-[10px] text-ink-faint leading-relaxed" data-testid="orch-runtime-install-hint">
             {trimmedSource
               ? '已填本地目录：将严格按该源安装（版本与内容哈希校验不放松）。'
-              : `未填目录时默认从官方仓库 ${amagi?.repoUrl ?? ''} 固定 commit ${amagi?.commit ?? ''} 经 Pi CLI 获取安装（需本机 git 与网络；失败时可改填本地目录，不回退 npm/latest）。`}
-            {recommended ? ` 检测到与固定版本一致的本地来源：${recommended.packagePath}。` : ''}
+              : amagi?.selectedSource
+                ? `新构建将自动从已配置的 ${amagi.selectedSource} 冻结版本 ${amagi.pinnedVersion}；在跑构建继续使用原版本。`
+                : `未填目录时默认从官方仓库 ${amagi?.repoUrl ?? ''} 固定 commit ${amagi?.commit ?? ''} 经 Pi CLI 获取安装（需本机 git 与网络；失败时可改填本地目录，不回退 npm/latest）。`}
+            {recommended && !amagi?.selectedSource ? ` 检测到与回退版本一致的本地来源：${recommended.packagePath}。` : ''}
           </p>
           <p className="flex items-start gap-1 text-[10px] text-ink-faint leading-relaxed">
             <ShieldAlert className="w-3 h-3 mt-0.5 shrink-0" />

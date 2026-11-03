@@ -106,9 +106,9 @@ export interface HashBudget {
   maxTotalBytes: number;
 }
 
-/** 缺省预算：amagi-pi 2.21.31 source 物化实测约 3545 文件 / 85.5 MiB，留足余量。 */
+/** 缺省预算覆盖含本地依赖的新版 source；超限仍明确拒绝。 */
 export const DEFAULT_HASH_BUDGET: HashBudget = {
-  maxFiles: 20_000,
+  maxFiles: 30_000,
   maxTotalBytes: 512 * 1024 * 1024,
 };
 
@@ -209,7 +209,7 @@ export function computePackageContentHash(
   return { contentHash: chain.digest('hex'), files: relFiles.length, bytes };
 }
 
-function readPackageVersion(packageRoot: string): string {
+export function readPackageVersion(packageRoot: string): string {
   try {
     const pkg = JSON.parse(fs.readFileSync(path.join(packageRoot, 'package.json'), 'utf-8'));
     if (pkg?.name !== 'amagi-pi' || typeof pkg.version !== 'string') {
@@ -365,7 +365,7 @@ async function installFromNpm(
   return writeRecord(installDir, record, packageRoot);
 }
 
-const SOURCE_COPY_EXCLUDE = new Set(['node_modules', '.git', '.agent-outputs', 'amagi-task', '.amagi-worktrees']);
+const SOURCE_COPY_EXCLUDE = new Set(['node_modules', '.git', '.agent-outputs', 'agent-outputs', 'amagi-task', '.amagi-worktrees']);
 
 /**
  * 拷贝阶段与哈希同规则：源内 symlink 一律拒绝（不静默丢弃——丢弃即留下与源不一致的包）。

@@ -43,10 +43,11 @@ import {
 import { assertProbeUsable, runStaticProbes } from '../agent/build-runtime/capability-probe.js';
 import {
   AMAGI_PI_GIT_COMMIT, AMAGI_PI_GIT_REPO_URL, AmagiPackageError, amagiGitSourceSpec,
-  installAmagiFromGit, installAmagiPackage, verifyAmagiPackage,
+  installAmagiFromGit, installAmagiPackage, readPackageVersion, verifyAmagiPackage,
 } from '../agent/build-runtime/amagi-package.js';
 import {
-  piSdkAvailable, resolveAppPiAgentDir, resolveGlobalPiAgentDir, scanAmagiHome,
+  compareAmagiVersions, piSdkAvailable, preferredLocalAmagi,
+  resolveAppPiAgentDir, resolveGlobalPiAgentDir, scanAmagiHome,
   type AmagiCandidate,
 } from '../agent/build-runtime/amagi-discovery.js';
 import {
@@ -71,7 +72,7 @@ import {
   type LeaderRunOutcome,
 } from './build-leader-supervisor.js';
 
-/** 版本化 amagi-pi 固定版本（设计 §3.1；升级须重核能力探测后修改）。 */
+/** 已验证的离线回退版本；新构建可自动采用 Pi home 已声明的较新本地版本。 */
 export const AMAGI_PI_PINNED_VERSION = '2.21.31';
 
 /** Leader 工具白名单：amagi 任务面 + 应用构建工具（剔除应用 task 族与正文写工具）。 */
@@ -131,14 +132,14 @@ export interface LeaderBuildInput {
 }
 
 /** 运行时状态 DTO（GET /api/kb/build-runtime；UI 消费）。
- * plugin-install-fix：amagi 段拆分「受管固定版本安装事实」与「全局/应用只读发现」，
- * 两者不得互相冒充——installed 只描述私有 runtime-packages 冻结安装；candidates
- * 描述其他 Pi home 里真实存在的 amagi-pi（如全局 2.21.36），不影响构建 pin。 */
+ * installed 只描述目标版本的私有冻结副本；candidates 描述 Pi home 中的来源。 */
 export interface BuildRuntimeStatusDto {
   orchestrationMode: 'legacy' | 'pi-amagi' | 'claude-native';
   runtime: { nodePath: string | null; nodeVersion: string | null; piCliPath: string | null; piVersion: string | null } | null;
   amagi: {
     pinnedVersion: string;
+    /** 新构建自动优选的已配置本地包；null 使用内置 Git 回退版本。 */
+    selectedSource: string | null;
     installed: boolean;
     version: string | null;
     installDir: string | null;
@@ -147,7 +148,7 @@ export interface BuildRuntimeStatusDto {
     /** 私有安装事实：installed=已装且记录可校；missing=未装；broken=目录/记录损坏（带 detail）。 */
     installState: 'installed' | 'missing' | 'broken';
     installDetail: string | null;
-    /** 官方 Git 默认安装来源（未安装时的确定来源；不追 latest/npm）。 */
+    /** 无较新本地候选时使用的官方 Git 回退来源。 */
     gitSource: string;
     commit: string;
     repoUrl: string;
@@ -268,24 +269,60 @@ export class BuildRuntimeHost {
     return { nodePath: resolved.nodePath, piCliPath: resolved.piCliPath, piVersion: resolved.piVersion, piPackageRoot: resolved.piPackageRoot };
   }
 
-  /** 静态能力探测（不断言；构建路径用 probeOrFail，状态端点用本方法）。 */
-  async probeReport(apiKeyOverride?: string): Promise<{ report: CapabilityReport; facts: { nodePath: string; piCliPath: string; piVersion: string; piPackageRoot: string | null } }> {
-    const facts = await this.runtimeFacts();
+  private async preferredAmagi(facts: { nodePath: string; piPackageRoot: string | null }): Promise<{
+    version: string; sourceDir: string | null;
+    discovery: Awaited<ReturnType<BuildRuntimeHost['discoverAmagi']>>;
+  }> {
+    const discovery = await this.discoverAmagi(facts);
+    const candidate = preferredLocalAmagi(discovery.candidates, AMAGI_PI_PINNED_VERSION);
+    return {
+      version: candidate?.version ?? AMAGI_PI_PINNED_VERSION,
+      sourceDir: candidate?.packagePath ?? null,
+      discovery,
+    };
+  }
+
+  private staticReport(facts: { piVersion: string }, version: string, apiKeyOverride?: string): CapabilityReport {
     const config = this.config();
-    const report = runStaticProbes({
+    return runStaticProbes({
       dataRoot: this.deps.dataRoot,
-      amagiVersion: AMAGI_PI_PINNED_VERSION,
+      amagiVersion: version,
       knowledgeBaseRoot: this.deps.knowledgeBaseRoot(),
       outputRoot: this.deps.outputRoot(),
       hasZhipuApiKey: apiKeyOverride !== undefined ? apiKeyOverride.trim() !== '' : this.hasActiveApiKey(config),
       piVersion: facts.piVersion,
     });
-    return { report, facts };
+  }
+
+  /** 静态能力探测（不断言；构建路径用 probeOrFail，状态端点用本方法）。 */
+  async probeReport(apiKeyOverride?: string): Promise<{
+    report: CapabilityReport;
+    facts: { nodePath: string; piCliPath: string; piVersion: string; piPackageRoot: string | null };
+    selected: Awaited<ReturnType<BuildRuntimeHost['preferredAmagi']>>;
+  }> {
+    const facts = await this.runtimeFacts();
+    const selected = await this.preferredAmagi(facts);
+    return { report: this.staticReport(facts, selected.version, apiKeyOverride), facts, selected };
   }
 
   /** 探测并 fail-closed 断言（构建路径；静态 fail → 明确 503，不降级）。 */
-  private async probeOrFail(apiKeyOverride?: string): Promise<{ report: CapabilityReport; amagiPackage: AmagiPackageRef; piVersion: string }> {
-    const { report, facts } = await this.probeReport(apiKeyOverride);
+  private async probeOrFail(apiKeyOverride?: string, frozenVersion?: string): Promise<{ report: CapabilityReport; amagiPackage: AmagiPackageRef; piVersion: string }> {
+    const probed = frozenVersion
+      ? { facts: await this.runtimeFacts(), selected: { version: frozenVersion, sourceDir: null } }
+      : await this.probeReport(apiKeyOverride);
+    const { facts, selected } = probed;
+    const initial = 'report' in probed ? probed.report : this.staticReport(facts, selected.version, apiKeyOverride);
+    if (selected.sourceDir && !initial.amagiPackage) {
+      // Upgrade only at a new build boundary. The running build retains its
+      // immutable package path and content hash in BuildRunSpec.
+      const installed = await this.installAmagi({ sourceDir: selected.sourceDir });
+      if (installed.version !== selected.version) {
+        throw new ToolError('amagi_source_changed',
+          `已配置 amagi-pi 在发现与安装间从 ${selected.version} 变成 ${installed.version}；请重试构建`, 409);
+      }
+    }
+    const report = selected.sourceDir && !initial.amagiPackage
+      ? this.staticReport(facts, selected.version, apiKeyOverride) : initial;
     try {
       assertProbeUsable(report);
     } catch (error) {
@@ -293,7 +330,7 @@ export class BuildRuntimeHost {
       throw new ToolError('build_runtime_unavailable', `构建运行时探测未通过，pi-amagi 模式拒绝启动（不降级 legacy）：${failures.join('；') || (error instanceof Error ? error.message : String(error))}`, 503);
     }
     if (!report.amagiPackage) {
-      throw new ToolError('build_runtime_unavailable', `amagi-pi@${AMAGI_PI_PINNED_VERSION} 版本化安装缺失；请先经 POST /api/kb/build-runtime/install 安装`, 503);
+      throw new ToolError('build_runtime_unavailable', `amagi-pi@${selected.version} 版本化安装缺失；请先经 POST /api/kb/build-runtime/install 安装`, 503);
     }
     return { report, amagiPackage: report.amagiPackage, piVersion: facts.piVersion };
   }
@@ -305,9 +342,9 @@ export class BuildRuntimeHost {
   }
 
   /** 私有固定版本安装事实（快速核对；不依赖 Pi 运行时，探测失败也不掩埋）。 */
-  private installedFact(): { state: 'installed' | 'missing' | 'broken'; detail: string | null; ref: (AmagiPackageRef & { record: unknown }) | null } {
+  private installedFact(version = AMAGI_PI_PINNED_VERSION): { state: 'installed' | 'missing' | 'broken'; detail: string | null; ref: (AmagiPackageRef & { record: unknown }) | null } {
     try {
-      const ref = verifyAmagiPackage({ dataRoot: this.deps.dataRoot, version: AMAGI_PI_PINNED_VERSION, verifyHash: false });
+      const ref = verifyAmagiPackage({ dataRoot: this.deps.dataRoot, version, verifyHash: false });
       return { state: 'installed', detail: null, ref };
     } catch (error) {
       const code = error instanceof AmagiPackageError ? error.code : 'amagi_package_invalid';
@@ -363,17 +400,19 @@ export class BuildRuntimeHost {
    * 与发现结果不因探测失败被抹成「未安装」——plugin-install-fix 核心修正）。 */
   async statusDto(): Promise<BuildRuntimeStatusDto> {
     const mode = this.config().standardKb.orchestrationMode ?? 'legacy';
-    const fact = this.installedFact();
+    let fact = this.installedFact();
     const gitSource = amagiGitSourceSpec();
     try {
-      const { report, facts } = await this.probeReport();
-      const discovery = await this.discoverAmagi(facts);
+      const { report, facts, selected } = await this.probeReport();
+      const discovery = selected.discovery;
+      fact = this.installedFact(selected.version);
       const amagiRef = report.amagiPackage;
       return {
         orchestrationMode: mode,
         runtime: { nodePath: facts.nodePath, nodeVersion: null, piCliPath: facts.piCliPath, piVersion: facts.piVersion },
         amagi: {
-          pinnedVersion: AMAGI_PI_PINNED_VERSION,
+          pinnedVersion: selected.version,
+          selectedSource: selected.sourceDir,
           installed: amagiRef !== null,
           version: amagiRef?.version ?? null,
           installDir: amagiRef?.installDir ?? null,
@@ -402,6 +441,7 @@ export class BuildRuntimeHost {
         runtime: null,
         amagi: {
           pinnedVersion: AMAGI_PI_PINNED_VERSION,
+          selectedSource: null,
           installed: fact.state === 'installed',
           version: fact.ref?.version ?? null,
           installDir: fact.ref?.installDir ?? null,
@@ -421,11 +461,11 @@ export class BuildRuntimeHost {
     }
   }
 
-  /** 安装版本化 amagi-pi。plugin-install-fix：
-   * - 显式 sourceDir → 严格 source 模式（版本/哈希校验同旧）；
-   * - 默认（无 sourceDir）→ 官方 Git 固定 commit 获取链（不再走已知 404 的 npm 默认）；
+  /** 安装版本化 amagi-pi。
+   * - 显式 sourceDir → 读取真实 manifest 版本并独立冻结；
+   * - 默认优先已在 Pi home 声明的较新本地包，否则用已验证的 Git 回退版本；
    * - 已有安装记录 → 完整哈希校验复用（「校验」而非虚假重装）；
-   * - 同版本并发安装/校验串行化（busy 409），防双写 staging/aside 冲突。 */
+   * - 安装/校验串行化（busy 409），防双写 staging/aside 冲突。 */
   async installAmagi(input: { sourceDir?: string; log?: (line: string) => void } = {}): Promise<AmagiPackageRef & { record: unknown; fresh: boolean }> {
     if (this.installInFlight) {
       throw new ToolError('amagi_install_busy', '已有 amagi-pi 安装/校验进行中，请稍后重试（同版本安装串行执行）', 409);
@@ -434,13 +474,22 @@ export class BuildRuntimeHost {
     try {
       const facts = await this.runtimeFacts();
       try {
-        if (input.sourceDir) {
+        const selected = input.sourceDir ? null : await this.preferredAmagi(facts);
+        const sourceDir = input.sourceDir ?? selected?.sourceDir ?? undefined;
+        if (sourceDir) {
+          const version = readPackageVersion(sourceDir);
+          if (!/^\d+\.\d+\.\d+$/.test(version)
+            || compareAmagiVersions(version, AMAGI_PI_PINNED_VERSION) < 0) {
+            throw new AmagiPackageError('amagi_version_unsupported',
+              `本地 amagi-pi@${version} 低于已验证基线 ${AMAGI_PI_PINNED_VERSION} 或不是稳定版本`);
+          }
           return await installAmagiPackage({
             nodePath: facts.nodePath,
             piCliPath: facts.piCliPath,
             dataRoot: this.deps.dataRoot,
-            version: AMAGI_PI_PINNED_VERSION,
-            sourceDir: input.sourceDir,
+            version,
+            sourceDir,
+            includeDependencies: true,
             log: input.log,
           });
         }
@@ -841,7 +890,9 @@ export class BuildRuntimeHost {
       throw new ToolError('build_runtime_busy', `构建 ${input.buildId} 已有进行中的 Leader 会话`, 409);
     }
     // 1. 探测（fail-closed；密钥以本次构建解析为准）。
-    const { amagiPackage, piVersion } = await this.probeOrFail(input.apiKey);
+    const frozenVersion = input.resumeStrategy === 'session'
+      ? input.priorState?.spec.amagiPackage.version : undefined;
+    const { amagiPackage, piVersion } = await this.probeOrFail(input.apiKey, frozenVersion);
     // 2. 资产定位（转发扩展/桥接脚本/skill；缺失明确失败）。
     const forwardingExtensionPath = piExtensionPath();
     if (!forwardingExtensionPath) {

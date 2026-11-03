@@ -508,7 +508,7 @@ describe('plugin-install-fix 安装检测与默认来源', () => {
     ...over,
   });
 
-  it('全局 2.21.36 候选如实展示：来源标签/版本/≠固定版本/不用于构建', async () => {
+  it('服务端仍选择回退版时，如实标出未采用的全局候选', async () => {
     apiRuntime.getKbBuildRuntimeStatus.mockResolvedValue(statusWith({
       candidates: [{ origin: 'global-pi-home', source: '/Users/x/amagi-pi', sourceType: 'local', packagePath: '/Users/x/amagi-pi', version: '2.21.36', matchesPin: false }],
     }));
@@ -518,10 +518,23 @@ describe('plugin-install-fix 安装检测与默认来源', () => {
     expect(block?.textContent).toContain('全局 Pi');
     expect(block?.textContent).toContain('2.21.36');
     expect(block?.textContent).toContain('本地目录');
-    expect(block?.textContent).toContain('≠ 固定版本 2.21.31');
-    expect(block?.textContent).toContain('不用于构建');
+    expect(block?.textContent).toContain('未被选为新构建版本');
     // 构建专用固定版本仍是 31 已装，不被 36 冒充
     expect(container.querySelector('[data-testid="orch-runtime-facts"]')?.textContent).toContain('已安装 2.21.31');
+  });
+
+  it('较新本地版被选中后，显示下一次构建自动采用并冻结', async () => {
+    const source = '/Users/x/amagi-pi';
+    apiRuntime.getKbBuildRuntimeStatus.mockResolvedValue(statusWith({
+      pinnedVersion: '2.21.36', selectedSource: source,
+      installed: false, version: null, installDir: null, contentHash: null, installState: 'missing',
+      candidates: [{ origin: 'global-pi-home', source, sourceType: 'local', packagePath: source, version: '2.21.36', matchesPin: false }],
+    }));
+    const container = setup(makeConfig());
+    await act(async () => {});
+    expect(container.querySelector('[data-testid="orch-runtime-facts"]')?.textContent).toContain('新构建优选 2.21.36');
+    expect(container.querySelector('[data-testid="orch-runtime-candidates"]')?.textContent).toContain('下一次构建自动采用并冻结');
+    expect(container.querySelector('[data-testid="orch-runtime-install-btn"]')?.textContent).toContain('已配置本地版');
   });
 
   it('发现异常（unavailable/error）单独表达，不谎称未安装', async () => {
@@ -536,11 +549,11 @@ describe('plugin-install-fix 安装检测与默认来源', () => {
     expect(issues?.textContent).toContain('不代表未安装');
   });
 
-  it('已装 → 按钮为「校验固定版本」；未装 → 默认官方 Git 标签与提示', async () => {
+  it('已装 → 按钮为「校验构建版本」；未装 → 默认官方 Git 标签与提示', async () => {
     apiRuntime.getKbBuildRuntimeStatus.mockResolvedValue(statusWith({}));
     const installed = setup(makeConfig());
     await act(async () => {});
-    expect((installed.querySelector('[data-testid="orch-runtime-install-btn"]') as HTMLElement).textContent).toContain('校验固定版本 2.21.31');
+    expect((installed.querySelector('[data-testid="orch-runtime-install-btn"]') as HTMLElement).textContent).toContain('校验构建版本 2.21.31');
     apiRuntime.getKbBuildRuntimeStatus.mockResolvedValue(statusWith({
       installed: false, version: null, installDir: null, contentHash: null, layout: null, installState: 'missing',
     }));
@@ -668,11 +681,11 @@ describe('plugin-install-fix 安装检测与默认来源', () => {
     await act(async () => { (container.querySelector('[data-testid="orch-runtime-install-btn"]') as HTMLElement).click(); });
     expect(deferreds).toHaveLength(2); // 安装成功 → onInstalled 发起新 GET
     await act(async () => { deferreds[1](statusWith({})); }); // 新请求先完成：已装
-    expect((container.querySelector('[data-testid="orch-runtime-install-btn"]') as HTMLElement).textContent).toContain('校验固定版本');
+    expect((container.querySelector('[data-testid="orch-runtime-install-btn"]') as HTMLElement).textContent).toContain('校验构建版本');
     expect(container.querySelector('[data-testid="orch-runtime-facts"]')?.textContent).toContain('已安装 2.21.31');
     // 旧请求（挂载加载）此时才返回「未装」：迟到响应必须丢弃，不得回写
     await act(async () => { deferreds[0](statusWith({ installed: false, version: null, installDir: null, contentHash: null, layout: null, installState: 'missing' })); });
-    expect((container.querySelector('[data-testid="orch-runtime-install-btn"]') as HTMLElement).textContent).toContain('校验固定版本');
+    expect((container.querySelector('[data-testid="orch-runtime-install-btn"]') as HTMLElement).textContent).toContain('校验构建版本');
     expect(container.querySelector('[data-testid="orch-runtime-facts"]')?.textContent).toContain('已安装 2.21.31');
   });
 });

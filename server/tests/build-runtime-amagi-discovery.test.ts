@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  piSdkAvailable, resolveAppPiAgentDir, resolveGlobalPiAgentDir, scanAmagiHome,
+  piSdkAvailable, preferredLocalAmagi, resolveAppPiAgentDir, resolveGlobalPiAgentDir, scanAmagiHome,
 } from '../src/agent/build-runtime/amagi-discovery.js';
 import { makeFakePiSdk } from './helpers/fake-pi-git-sdk.js';
 import { piWorkbenchPackageRoot } from '../src/agent/agent-assets.js';
@@ -59,6 +59,18 @@ function makeLocalPackage(root: string, name: string, version: string): string {
   fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'amagi-pi', version }));
   return dir;
 }
+
+it('自动优选最高稳定本地版本，忽略远端声明和预发布版', () => {
+  const candidate = (version: string, sourceType: 'local' | 'git' = 'local') => ({
+    origin: 'global-pi-home' as const, source: `/pkg/${version}`, sourceType,
+    packagePath: `/pkg/${version}`, version, matchesPin: false,
+  });
+  const selected = preferredLocalAmagi([
+    candidate('2.21.36'), candidate('2.21.38-rc.1'), candidate('2.21.37', 'git'), candidate('2.21.35'),
+  ], '2.21.31');
+  expect(selected?.version).toBe('2.21.36');
+  expect(preferredLocalAmagi([candidate('2.21.30')], '2.21.31')).toBeNull();
+});
 
 describe('scanAmagiHome（只读发现）', () => {
   let root: string;

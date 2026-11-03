@@ -1,10 +1,9 @@
 /**
  * build-runtime/amagi-discovery.ts — 已安装 amagi 候选只读发现
  *
- * 背景（plugin-install-fix）：构建固定 amagi-pi 版本（私有 runtime-packages 冻结
- * 安装）与用户在本机其他 Pi home 装的 amagi-pi（如全局 ~/.pi/agent 声明的本地
- * 2.21.36）是两回事。此前状态端点只看私有安装，用户「明明装过 amagi」却被报
- * 未安装，且无从区分来源；本模块用正式 Pi SDK 把两边都如实带出。
+ * 构建运行包是私有 runtime-packages 中的不可变副本；Pi home 已配置的本地
+ * amagi-pi 是下一次构建的候选。只读发现提供候选事实，构建启动时选择较新稳定版
+ * 并独立安装，当前构建仍使用自己的冻结哈希。
  *
  * 只读承诺（steer #3）：
  * - 复用 PiPluginService 的 inspect-packages.mjs 助手（正式 SDK
@@ -54,6 +53,30 @@ export interface AmagiHomeScan {
   /** settings.json 载入错误（broken declaration 不吞作未装）。 */
   settingsErrors: Array<{ scope: string; path: string | null; message: string }>;
   candidates: AmagiCandidate[];
+}
+
+/** Compare stable package versions without treating an unknown/prerelease tag as an automatic upgrade. */
+export function compareAmagiVersions(left: string, right: string): number {
+  const parse = (value: string): number[] | null => /^\d+\.\d+\.\d+$/.test(value)
+    ? value.split('.').map(Number) : null;
+  const a = parse(left);
+  const b = parse(right);
+  if (!a || !b) return 0;
+  for (let index = 0; index < 3; index += 1) {
+    if (a[index] !== b[index]) return a[index] < b[index] ? -1 : 1;
+  }
+  return 0;
+}
+
+/** Only a locally configured, SDK resolved package can become the next build's source. */
+export function preferredLocalAmagi(candidates: readonly AmagiCandidate[], minimumVersion: string): AmagiCandidate | null {
+  const eligible = candidates.filter((candidate) => candidate.sourceType === 'local'
+    && candidate.packagePath && path.isAbsolute(candidate.packagePath)
+    && candidate.version && /^\d+\.\d+\.\d+$/.test(candidate.version)
+    && compareAmagiVersions(candidate.version, minimumVersion) > 0);
+  eligible.sort((a, b) => compareAmagiVersions(b.version!, a.version!)
+    || a.origin.localeCompare(b.origin) || a.packagePath!.localeCompare(b.packagePath!));
+  return eligible[0] ?? null;
 }
 
 /** 官方全局 Pi agent home 解析（pi config.getAgentDir 同语义）。 */

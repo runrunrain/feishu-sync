@@ -548,9 +548,9 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
     }
   });
 
-  // 重构 v2 + plugin-install-fix：安装版本化 amagi-pi。显式 sourceDir → 严格
-  // source 模式；默认（空体）→ 官方 Git 固定 commit 获取链（npm:2.21.31 实测
-  // 404，不再作默认）；已装记录 → 完整校验复用（响应 fresh=false）。并发串行
+  // 安装版本化 amagi-pi。显式 sourceDir → 读取 manifest 并冻结；默认（空体）
+  // 优先 Pi home 中已配置的较新本地包，否则用官方 Git 回退来源；已装记录 →
+  // 完整校验复用（响应 fresh=false）。并发串行
   // （busy 409）。响应携带 layout 与 Git 获取溯源供 UI 呈现。
   routes.post('/api/kb/build-runtime/install', async (c) => {
     if (!deps.buildRuntime) {

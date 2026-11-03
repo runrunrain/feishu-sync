@@ -527,8 +527,9 @@ export interface KbBuildRuntimeStatusDto {
     piVersion: string | null;
   } | null;
   amagi: {
-    /** 服务端固定的目标版本（构建专用；与全局/应用安装无关）。 */
+    /** 新构建目标版本；优先已配置的较新本地包，缺省为内置回退版本。 */
     pinnedVersion: string;
+    selectedSource?: string | null;
     installed: boolean;
     version: string | null;
     installDir: string | null;

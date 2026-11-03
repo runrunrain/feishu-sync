@@ -435,7 +435,7 @@ process.exit(1);
     expect(dto.amagi?.candidates).toEqual([]);
   });
 
-  it('statusDto：全局发现如实带回候选（36≠31 不冒充 pin）', async (ctx) => {
+  it('已配置的较新本地版会在新构建探测时自动冻结，旧回退版不被覆盖', async (ctx) => {
     needsGit(ctx);
     const f = await makeFixture();
     // 假全局 home：settings 声明本地 amagi-pi 2.21.36（manifest 落盘）
@@ -443,6 +443,12 @@ process.exit(1);
     const globalPkg = path.join(f.root, 'user-amagi-2.21.36');
     fs.mkdirSync(globalPkg, { recursive: true });
     fs.writeFileSync(path.join(globalPkg, 'package.json'), JSON.stringify({ name: 'amagi-pi', version: '2.21.36' }));
+    fs.mkdirSync(path.join(globalPkg, 'agents'), { recursive: true });
+    fs.writeFileSync(path.join(globalPkg, 'agents', 'luban.md'), '# luban\n');
+    fs.mkdirSync(path.join(globalPkg, 'extensions', 'amagi-core'), { recursive: true });
+    fs.writeFileSync(path.join(globalPkg, 'extensions', 'amagi-core', 'index.ts'), 'export default () => {};\n');
+    fs.mkdirSync(path.join(globalPkg, 'agent-outputs'), { recursive: true });
+    fs.symlinkSync(f.root, path.join(globalPkg, 'agent-outputs', 'transient-link'), 'dir');
     fs.mkdirSync(globalHome, { recursive: true });
     fs.writeFileSync(path.join(globalHome, 'settings.json'), JSON.stringify({ packages: [globalPkg] }));
     const prev = process.env.PI_CODING_AGENT_DIR;
@@ -454,6 +460,16 @@ process.exit(1);
       const globalCandidates = dto.amagi?.candidates.filter((item) => item.origin === 'global-pi-home') ?? [];
       expect(globalCandidates).toHaveLength(1);
       expect(globalCandidates[0]).toMatchObject({ version: '2.21.36', matchesPin: false, sourceType: 'local', packagePath: globalPkg });
+      expect(dto.amagi).toMatchObject({ pinnedVersion: '2.21.36', selectedSource: globalPkg, installed: false });
+      const probed = await (host as unknown as { probeOrFail: (key: string) => Promise<{ amagiPackage: { version: string; packageRoot: string } }> }).probeOrFail('fixture-key');
+      expect(probed.amagiPackage.version).toBe('2.21.36');
+      expect(probed.amagiPackage.packageRoot).toContain('amagi-pi@2.21.36');
+      expect(fs.existsSync(path.join(probed.amagiPackage.packageRoot, 'agent-outputs'))).toBe(false);
+      expect(fs.existsSync(path.join(f.root, 'agent', 'runtime-packages', 'amagi-pi@2.21.31'))).toBe(false);
+      expect((await host.statusDto()).amagi).toMatchObject({ pinnedVersion: '2.21.36', installed: true, version: '2.21.36' });
+      await host.installAmagi({ sourceDir: makeMiniSource(f.root) });
+      const resumed = await (host as unknown as { probeOrFail: (key: string, version: string) => Promise<{ amagiPackage: { version: string } }> }).probeOrFail('fixture-key', '2.21.31');
+      expect(resumed.amagiPackage.version).toBe('2.21.31');
     } finally {
       if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = prev;
