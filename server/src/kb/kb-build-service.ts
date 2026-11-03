@@ -1670,6 +1670,18 @@ export class KbBuildService extends EventEmitter {
       && hashes.get(docPath) !== oldPromotionHashes[docPath]
       && hashes.get(docPath) !== baseManifest?.docs.find((doc) => doc.path === docPath)?.contentHash);
     if (newPaths.length === 0) return;
+    // A blocked source or declaration in one document must not hold other
+    // reviewed documents behind a multi-document stage's early-return gates.
+    // Each commit advances CURRENT before the next document is evaluated.
+    if (!onlyPath && newPaths.length > 1) {
+      for (const docPath of newPaths) {
+        try { await this.publishProgressiveIfReady(buildId, docPath); }
+        catch (error) {
+          this.emitLog(buildId, 'warn', `阶段发布暂缓（${docPath}）：${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      return;
+    }
     const promoted = new Set([...(baseManifest?.buildId === buildId ? baseManifest.promotedPaths ?? [] : []), ...newPaths]);
     const allPaths = new Set([...(baseManifest?.docs.map((doc) => doc.path) ?? []), ...promoted]);
     // Legacy releases lack a knowledge sidecar to carry immutable declarations.
