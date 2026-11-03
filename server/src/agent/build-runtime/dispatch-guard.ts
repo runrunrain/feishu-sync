@@ -189,10 +189,18 @@ function writerScopeIssue(task: string): string | null {
     coveredLines += Math.max(0, end - Math.max(start, coveredEnd + 1) + 1);
     coveredEnd = Math.max(coveredEnd, end);
   }
-  // Importing one pure detail table does not ask the model to write its rows.
-  // Mentioning csvTableImports in a brief with several substantive ranges is
-  // not evidence that the other ranges have been offloaded.
-  const singleImportedTable = ranges.length === 1 && assignment.includes('csvTableImports');
+  // A conditional "can use csvTableImports" is not an actual offload. The
+  // task must explicitly direct the server to import the table.
+  const explicitTableImport = /(?:必须|直接|使用)\s*(?:kb_write_doc\.)?csvTableImports\b/.test(assignment);
+  const singleImportedTable = ranges.length === 1 && explicitTableImport;
+  const nonEmptyCells = [...assignment.matchAll(/(\d{3,5})\s*个非空单元格/g)]
+    .map((match) => Number(match[1]));
+  if (nonEmptyCells.some((count) => count > 400) && !singleImportedTable) {
+    return `写作任务含 ${Math.max(...nonEmptyCells)} 个非空 CSV 单元格，单篇规则阅读与声明载荷过大；请按独立规则拆成更窄的完整文档，纯明细则明确要求 csvTableImports 服务端导入`;
+  }
+  if (coveredLines > 220 && /#csv:|CSV\s*附件|\.csv/.test(assignment) && !singleImportedTable) {
+    return `写作任务分配了 ${coveredLines} 行 CSV 规则范围，单篇阅读过宽；请按独立主题拆至约 100–150 行，纯明细则明确要求 csvTableImports 服务端导入`;
+  }
   if (coveredLines > 350 && !singleImportedTable) {
     return `写作任务明确分配了 ${coveredLines} 行来源区间，单轮读写范围过宽；请按主题拆成多篇约 100–150 行的完整文档。纯明细表由 csvTableImports 服务端导入`;
   }
@@ -202,9 +210,11 @@ function writerScopeIssue(task: string): string | null {
   if (anchors.length > 12 || (anchors.length >= 10 && span > 160)) {
     return `写作任务包含 ${anchors.length} 个章节定位、跨度 ${span} 行，单轮范围过宽；请按独立主题拆为更窄的单篇任务（每篇约 100–150 行，至多 12 个规则章节），只列本篇需要读取的坐标`;
   }
-  const sourceLines = /(?:来源|源文档|正文)[^\n]{0,100}?(\d{3,5})\s*行/.exec(assignment);
+  const sourceLines = /(?:来源|源文档|正文)[^\n]{0,100}?(\d{3,5})\s*行/.exec(assignment)
+    ?? /(?:整篇|全文)[^\n]{0,120}?(?:约|共)?\s*(\d{3,5})\s*行/.exec(assignment)
+    ?? /(?:约|共)\s*(\d{3,5})\s*行/.exec(assignment);
   if (sourceLines && Number(sourceLines[1]) > 250
-    && /通读全文|阅读全文|覆盖全文|从头到尾|读完全部/.test(assignment)) {
+    && /通读全文|阅读全文|覆盖全文|从头到尾|读完全部|整篇读完|全文读完/.test(assignment)) {
     return `写作任务要求通读 ${sourceLines[1]} 行长源；请先按独立主题拆分，任务书只指定本篇约 100–150 行的目标区段`;
   }
   return null;

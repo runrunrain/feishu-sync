@@ -2746,13 +2746,24 @@ export class KbBuildService extends EventEmitter {
         entry.batchTotal = 0; entry.batchIndex = 0;
         entry.checkpointReady = true; this.persistCheckpoint(buildId);
         this.emitLog(buildId, 'info', `开始 Leader 监督构建（${effectiveMode}，orchestrationMode=pi-amagi）：${workset.size} 个工作集源交由 Leader 拆分派发（子任务由 amagi 启动，不入应用进程池）`);
-        const overallTimeout = setTimeout(() => {
+        // Large worksets publish documents progressively. A fixed wall clock
+        // limit would abort a healthy build with active child completions after
+        // 180 minutes. For Leader mode the configured limit measures lack of
+        // runtime progress; each supervised event refreshes lastActivityAt.
+        const noProgressTimeoutMs = config.standardKb.buildTimeoutMinutes * 60_000;
+        const supervisionStartedAt = Date.now();
+        this.emitLog(buildId, 'info', `Leader 模式无进展时限：${config.standardKb.buildTimeoutMinutes} 分钟；有子任务或工具活动时继续构建`);
+        const progressTimeout = setInterval(() => {
+          if (entry.cancelRequested || entry.timedOut) return;
+          const observedAt = Date.parse(this.deps.buildRuntime?.activeSession(buildId)?.progress().idle.lastActivityAt ?? '');
+          const lastActivityAt = Number.isFinite(observedAt) ? observedAt : supervisionStartedAt;
+          if (Date.now() - lastActivityAt < noProgressTimeoutMs) return;
           entry.timedOut = true;
           entry.cancelRequested = true;
-          this.emitLog(buildId, 'error', `构建整体超时（${config.standardKb.buildTimeoutMinutes} 分钟）`);
+          this.emitLog(buildId, 'error', `Leader 运行连续 ${config.standardKb.buildTimeoutMinutes} 分钟无进展，构建超时`);
           cancelController.abort();
-        }, config.standardKb.buildTimeoutMinutes * 60_000);
-        overallTimeout.unref?.();
+        }, 60_000);
+        progressTimeout.unref?.();
         try {
           const outcome = await this.runLeaderSupervisedPhase({
             buildId, entry, buildState, snapshot, config,
@@ -2819,7 +2830,7 @@ export class KbBuildService extends EventEmitter {
             throw new CancelledError();
           }
         } finally {
-          clearTimeout(overallTimeout);
+          clearInterval(progressTimeout);
           await this.terminateAllWorkers(buildId, entry);
         }
       } else if (orchestrated) {

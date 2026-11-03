@@ -262,6 +262,26 @@ describe('guardTaskSubmit', () => {
     }
   });
 
+  it('高密度规则表不能凭可选导入提示绕过分篇', () => {
+    const broad = guardTaskSubmit(makeConfig(), { agent: 'luban', task: [
+      '【写作】经济体模拟器功能规则，一篇目标文档。',
+      '来源：②功能规则.csv，约 267 行、667 个非空单元格。',
+      '按输出区间 2296–2562 分页读完，归纳触发条件、参数、流程与边界。',
+      '明细行数多且属纯数据清单时可用 kb_write_doc.csvTableImports。',
+    ].join('\n') });
+    expect(broad.decision).toBe('block');
+    if (broad.decision === 'block') expect(broad.message).toContain('667 个非空');
+    const imported = guardTaskSubmit(makeConfig(), { agent: 'luban', task:
+      '【写作】单张纯明细表，输出 2296–2562，667 个非空单元格；必须使用 csvTableImports 服务端导入全部记录，只解读表头和少量示例。' });
+    expect(imported.decision).toBe('allow');
+  });
+
+  it('明确通读 272 行正文的写作任务须先分篇', () => {
+    const result = guardTaskSubmit(makeConfig(), { agent: 'luban', task:
+      '【写作】主界面设计。来源（唯一主要来源，整篇读完）：docx《主界面设计》，约 272 行；raw_read 翻到文末后一次写入。' });
+    expect(result.decision).toBe('block');
+  });
+
   it('taskFile 越出工作目录 → 阻止（../ 与绝对路径）', () => {
     expect(guardTaskSubmit(makeConfig(), { agent: 'luban', taskFile: '../escape.md' }).decision).toBe('block');
     expect(guardTaskSubmit(makeConfig(), { agent: 'luban', taskFile: '/etc/passwd' }).decision).toBe('block');
