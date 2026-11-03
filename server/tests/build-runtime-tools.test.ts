@@ -148,6 +148,53 @@ describe('Leader 工具面（§3.4）', () => {
     expect(JSON.parse(manifest.content[0]!.text).total).toBe(2);
   });
 
+  it('Leader 可对已消失的旧对象登记经共同来源核验的迁移，清单同步消除身份缺口', async () => {
+    const localOutput = path.join(dataRoot, 'migration-output');
+    const releaseId = 'migration-base';
+    fs.mkdirSync(path.join(localOutput, 'releases', releaseId), { recursive: true });
+    fs.writeFileSync(path.join(localOutput, 'CURRENT.json'), JSON.stringify({ releaseId, publishedAt: new Date().toISOString() }));
+    fs.writeFileSync(path.join(localOutput, 'releases', releaseId, 'manifest.json'), JSON.stringify({
+      schemaVersion: 1, releaseId, buildId: 'prior-build', publishedAt: new Date().toISOString(),
+      mode: 'full', baseReleaseId: null, model: null, docs: [], sourceSnapshot: [],
+    }));
+    fs.writeFileSync(path.join(localOutput, 'releases', releaseId, 'knowledge.json'), JSON.stringify({
+      schemaVersion: 1, documents: [], objects: [{ objectId: 'ko_old', title: '灾荒事件', familyKey: 'old-event',
+        canonical: { path: '旧篇.md' } }], evidence: [{ objectId: 'ko_old', sourceRef: { sourceId: 'tokA' } }],
+      presentations: [], relations: [], coverage: [], migrations: [],
+    }));
+    const setup = makeV2('b-leader-migration');
+    const leader = service.createRunContext({
+      runKind: 'build', buildId: 'b-leader-migration', outputRoot: localOutput, knowledgeBaseRoot: kbRoot,
+      buildState: setup.state, allowedToolsOverride: [...V2_LEADER_TOOLS],
+      orchestration: { mode: 'pi-amagi', buildId: 'b-leader-migration', generation: 1,
+        credential: 'leader', actorStore: setup.store },
+    });
+    fs.writeFileSync(path.join(setup.state.stagingRoot, 'knowledge-draft.json'), JSON.stringify({
+      schemaVersion: 1, buildId: 'b-leader-migration', docs: { '新篇.md': { docId: 'kd_new', revision: 1 } },
+      clientKeys: {}, evidenceKeys: {}, objects: [{ objectId: 'ko_new', title: '灾荒事件', familyKey: 'new-event',
+        canonical: { path: '新篇.md' } }], evidence: [{ objectId: 'ko_new', sourceRef: { sourceId: 'tokA' } }],
+      presentations: [], relations: [], coverage: [], calls: {},
+    }));
+    const before = JSON.parse((await call(leader.token, 'build_manifest', {})).content[0]!.text);
+    expect(before.identityGapCount).toBe(1);
+    expect(before.identityGaps[0].candidates[0].objectId).toBe('ko_new');
+    await expectToolError(() => call(leader.token, 'build_register_migrations', { migrations: [{
+      objectId: 'ko_old', kind: 'merge', successorObjectIds: ['ko_missing'], reason: '规则迁往新篇',
+    }] }), 'kb_migration_invalid');
+    const recorded = await call(leader.token, 'build_register_migrations', { migrations: [{
+      objectId: 'ko_old', kind: 'merge', successorObjectIds: ['ko_new'], reason: '规则迁往新篇',
+    }] });
+    expect(recorded.details?.accepted).toBe(1);
+    const replay = await call(leader.token, 'build_register_migrations', { migrations: [{
+      objectId: 'ko_old', kind: 'merge', successorObjectIds: ['ko_new'], reason: '规则迁往新篇',
+    }] });
+    expect(replay.details?.reused).toBe(1);
+    const plan = JSON.parse(fs.readFileSync(path.join(setup.state.stagingRoot, 'organization-plan.json'), 'utf8'));
+    expect(plan.migrations).toEqual([{ objectId: 'ko_old', kind: 'merge', successorObjectIds: ['ko_new'], reason: '规则迁往新篇' }]);
+    const after = JSON.parse((await call(leader.token, 'build_manifest', {})).content[0]!.text);
+    expect(after.identityGapCount).toBe(0);
+  });
+
   it('build_manifest 分页与 workset changeType', async () => {
     const setup = makeV2('b-leader3');
     setup.state.requiredRewrites = new Set(['docs/rebuild.md']);

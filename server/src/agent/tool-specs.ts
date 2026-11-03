@@ -919,6 +919,7 @@ export const V2_LEADER_TOOLS = [
   'build_issues_submit',
   'build_issues_list',
   'build_checkpoint',
+  'build_register_migrations',
   'build_request_publish',
 ] as const;
 
@@ -1201,6 +1202,33 @@ export const BUILD_CHECKPOINT_SPEC: AgentToolSpec = {
   },
 };
 
+export const BUILD_REGISTER_MIGRATIONS_SPEC: AgentToolSpec = {
+  name: 'build_register_migrations',
+  label: '登记对象迁移',
+  description: 'Leader 在改写文档改变知识对象身份时，登记旧对象到已写入后继对象的语义迁移。应用校验旧对象确已消失、后继存在且有共同来源证据，并保存迁移；缺失对象与候选后继由 build_manifest.identityGaps 给出。只需判断语义去向，不重填正文或证据。',
+  parameters: {
+    type: 'object',
+    properties: {
+      migrations: {
+        type: 'array', minItems: 1, maxItems: 50,
+        items: {
+          type: 'object',
+          properties: {
+            objectId: string('旧 release 中已消失的对象 ID'),
+            kind: { type: 'string', enum: ['merge', 'split'], description: 'merge=并入一个后继；split=拆分到至少两个后继' },
+            successorObjectIds: { type: 'array', minItems: 1, maxItems: 20, items: { type: 'string' } },
+            reason: string('具体语义迁移原因'),
+          },
+          required: ['objectId', 'kind', 'successorObjectIds', 'reason'],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: ['migrations'],
+    additionalProperties: false,
+  },
+};
+
 export const BUILD_REQUEST_PUBLISH_SPEC: AgentToolSpec = {
   name: 'build_request_publish',
   label: '申请发布',
@@ -1259,6 +1287,7 @@ const ALL_SPECS: AgentToolSpec[] = [
   BUILD_ISSUES_SUBMIT_SPEC,
   BUILD_ISSUES_LIST_SPEC,
   BUILD_CHECKPOINT_SPEC,
+  BUILD_REGISTER_MIGRATIONS_SPEC,
   BUILD_REQUEST_PUBLISH_SPEC,
 ];
 

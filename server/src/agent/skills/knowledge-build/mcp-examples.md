@@ -131,6 +131,12 @@ Leader 的工具面没有 `mcp_call`——应用构建工具（材料清单/分�
 {"tool": "build_request_publish", "arguments": {"requestedRevision": "<候选哈希>", "summary": "全部主题通过独立审查，申请发布"}}
 ```
 
+旧对象在重写时换篇或并入新对象，`build_manifest.identityGaps` 会列出旧 ID、旧标题、原路径及同来源候选。Leader 核实正文后只提交语义去向；应用补写组织计划并继续执行原发布校验。示例：
+
+```json
+{"tool":"build_register_migrations","arguments":{"migrations":[{"objectId":"ko_旧对象ID","kind":"merge","successorObjectIds":["ko_新对象ID"],"reason":"原规则已完整归入新的主题对象，后继保留同一来源证据"}]}}
+```
+
 `mcp_call`/`feishu-kb-bridge` 外壳仅子任务身份可用；Leader 若包一层 mcp_call 会被拒（工具面不可达，不是参数错误）。
 
 ## 常见错误

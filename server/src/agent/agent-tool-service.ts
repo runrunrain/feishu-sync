@@ -46,6 +46,7 @@ import {
   BUILD_ISSUES_SUBMIT_SPEC,
   BUILD_ISSUES_LIST_SPEC,
   BUILD_CHECKPOINT_SPEC,
+  BUILD_REGISTER_MIGRATIONS_SPEC,
   BUILD_REQUEST_PUBLISH_SPEC,
   V2_LEADER_TOOLS,
   DRAFT_LIST_SPEC,
@@ -72,6 +73,7 @@ import { StandardKbStore, parseStdHeader, stripStdHeader } from '../kb/standard-
 import { KbVersionStore } from '../kb/kb-version-store.js';
 import { visionDescriptionImproved, visionDescriptionVersion } from '../kb/vision-description-version.js';
 import { finalDraftEvidenceScopePaths } from '../kb/progressive-knowledge-draft.js';
+import { objectMigrationGaps, validateObjectMigrationRegistration } from '../kb/object-migration-reconciliation.js';
 import {
   computePayloadHash,
   computeReviewSubjectHash,
@@ -88,6 +90,7 @@ import {
   type KnowledgeObjectType,
   type KnowledgeRelation,
   type KnowledgeRelationType,
+  type ObjectMigration,
   type Presentation,
   type ReviewStatus,
 } from '../kb/knowledge-schema.js';
@@ -673,6 +676,7 @@ export class AgentToolService {
         { spec: BUILD_ISSUES_SUBMIT_SPEC, runKinds: [], execute: (context, args) => this.toolBuildIssuesSubmit(context, args) },
         { spec: BUILD_ISSUES_LIST_SPEC, runKinds: [], execute: (context, args) => this.toolBuildIssuesList(context, args) },
         { spec: BUILD_CHECKPOINT_SPEC, runKinds: [], execute: (context, args) => this.toolBuildCheckpoint(context, args) },
+        { spec: BUILD_REGISTER_MIGRATIONS_SPEC, runKinds: [], execute: (context, args) => this.toolBuildRegisterMigrations(context, args) },
         { spec: BUILD_REQUEST_PUBLISH_SPEC, runKinds: [], execute: (context, args) => this.toolBuildRequestPublish(context, args) },
       ],
     });
@@ -912,7 +916,7 @@ export class AgentToolService {
       const result = await tool.execute(context, effectiveArgs, meta);
       writeCommitted = true;
       if (toolName === 'kb_write_doc') this.clearFailedWrites(context, effectiveArgs, meta);
-      if (['kb_write_doc', 'kb_delete_doc', 'kb_unit_done', 'kb_finish', 'kb_submit_plan', 'kb_submit_review'].includes(toolName)) context.options.buildState?.onCheckpoint?.();
+      if (['kb_write_doc', 'kb_delete_doc', 'kb_unit_done', 'kb_finish', 'kb_submit_plan', 'kb_submit_review', 'build_register_migrations'].includes(toolName)) context.options.buildState?.onCheckpoint?.();
       const resultSummary = summarizeResult(result);
       context.options.onEvent?.({ phase: 'end', toolName, ...(meta?.toolCallId ? { toolCallId: meta.toolCallId } : {}), argsSummary, resultSummary, isError: false });
       return result;
@@ -4402,12 +4406,79 @@ export class AgentToolService {
     const start = Number.isInteger(cursorOffset) && cursorOffset >= 0 ? cursorOffset : 0;
     const page = entries.slice(start, start + limit);
     const nextCursor = start + limit < entries.length ? Buffer.from(String(start + limit), 'utf-8').toString('base64url') : null;
+    const migrationPlan = this.loadOrganizationPlan(state, context.buildId ?? 'unknown');
+    const priorKnowledge = published
+      ? new KbVersionStore(context.options.outputRoot).readKnowledgeManifest(published.releaseId) : null;
+    const bodyCache = new Map<string, string>();
+    const identityGaps = objectMigrationGaps({
+      previous: priorKnowledge, draft: this.loadKnowledgeDraft(state), plan: migrationPlan,
+      docBody: (docPath) => {
+        if (!bodyCache.has(docPath)) {
+          try { bodyCache.set(docPath, stripStdHeader(fs.readFileSync(resolveInside(path.join(state.stagingRoot, 'docs'), docPath, 'read'), 'utf8'))); }
+          catch { bodyCache.set(docPath, ''); }
+        }
+        return bodyCache.get(docPath)!;
+      },
+    });
     return {
       content: [{ type: 'text', text: JSON.stringify({ buildId: context.buildId ?? state.v2?.actorStore.buildId ?? null,
         scope, total: entries.length, requiredRewrites: [...(state.requiredRewrites ?? [])].sort(),
         documentWorkStatus: this.buildDocumentWorkStatus(context, state),
+        identityGapCount: identityGaps.length, identityGaps: identityGaps.slice(0, 30),
         entries: page, nextCursor }, null, 2) }],
       details: { scope, total: entries.length, returned: page.length, nextCursor },
+    };
+  }
+
+  /** Register a reviewed semantic identity decision without making the model
+   * reconstruct document metadata or edit release files. Publication still runs
+   * the normal migration, evidence and coverage gates. */
+  private toolBuildRegisterMigrations(context: InternalRunContext, args: Record<string, unknown>): ToolResult {
+    const state = requireBuildState(context);
+    requireV2Leader(context);
+    const published = this.storeFor(context.options.outputRoot).readManifest();
+    const previous = published
+      ? new KbVersionStore(context.options.outputRoot).readKnowledgeManifest(published.releaseId) : null;
+    if (!previous) throw new ToolError('kb_migration_invalid', '当前没有可对账的正式知识对象版本', 409);
+    const draft = this.loadKnowledgeDraft(state);
+    const plan = this.loadOrganizationPlan(state, context.buildId ?? 'unknown');
+    const proposals: ObjectMigration[] = requireArray(args, 'migrations').map((raw, index) => {
+      const item = asRecord(raw);
+      if (!item) throw new ToolError('invalid_request', `migrations[${index}] 必须是对象`);
+      const objectId = requireString(item, 'objectId', 1, 200);
+      const reason = requireString(item, 'reason', 4, 500);
+      const kind = item.kind;
+      if (kind !== 'merge' && kind !== 'split') throw new ToolError('invalid_request', `migrations[${index}].kind 必须是 merge|split`);
+      const successorObjectIds = requireArray(item, 'successorObjectIds');
+      if (!successorObjectIds.every((id): id is string => typeof id === 'string' && id.startsWith('ko_'))) {
+        throw new ToolError('invalid_request', `migrations[${index}].successorObjectIds 必须是对象 ID 数组`);
+      }
+      return { objectId, kind, successorObjectIds, reason };
+    });
+    if (proposals.length === 0 || proposals.length > 50) throw new ToolError('invalid_request', 'migrations 每次提交 1..50 项');
+    const priorById = new Map(plan.migrations.map((migration) => [migration.objectId, migration] as const));
+    const pending = proposals.filter((proposal) => {
+      const prior = priorById.get(proposal.objectId);
+      if (!prior) return true;
+      if (prior.kind !== proposal.kind || prior.reason !== proposal.reason
+        || JSON.stringify(prior.successorObjectIds) !== JSON.stringify(proposal.successorObjectIds)) {
+        throw new ToolError('kb_migration_invalid', `${proposal.objectId} 已登记不同迁移去向；不能覆盖旧映射`, 409);
+      }
+      return false;
+    });
+    const errors = validateObjectMigrationRegistration({ previous, draft, existing: plan.migrations, proposed: pending });
+    if (errors.length > 0) throw new ToolError('kb_migration_invalid', errors.slice(0, 8).join('；'), 409);
+    this.assertRunLeaseActive(context);
+    if (pending.length > 0) {
+      plan.migrations = [...plan.migrations, ...pending];
+      plan.planRevision += 1;
+      plan.updatedAt = new Date().toISOString();
+      this.saveOrganizationPlan(state, plan);
+    }
+    const remaining = objectMigrationGaps({ previous, draft, plan });
+    return {
+      content: [{ type: 'text', text: `已登记 ${pending.length} 项对象迁移，复用 ${proposals.length - pending.length} 项相同记录（planRevision=${plan.planRevision}）；仍有 ${remaining.length} 个未解释旧对象。发布前继续按 build_manifest.identityGaps 核对其语义去向。` }],
+      details: { accepted: pending.length, reused: proposals.length - pending.length, planRevision: plan.planRevision, remaining: remaining.length },
     };
   }
 
