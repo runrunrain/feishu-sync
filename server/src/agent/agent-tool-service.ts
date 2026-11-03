@@ -4529,10 +4529,16 @@ export class AgentToolService {
       publishing: store.publishing?.requestId ?? null,
       lastPublishRejection: (() => {
         const request = store.latestPublishRequest();
-        return request?.status === 'rejected'
-          ? { requestId: request.requestId, reason: request.result?.reason ?? 'unknown',
-            message: typeof request.result?.message === 'string' ? request.result.message : null,
-            issues: publishValidationIssues(request.result) } : null;
+        if (request?.status !== 'rejected' || request.generation !== store.activeGeneration) return null;
+        // A progressive publication can resolve a prior rejection without
+        // changing the candidate draft. Do not send that obsolete failure back
+        // to the Leader as actionable work after CURRENT has advanced.
+        const current = this.storeFor(context.options.outputRoot).readManifest();
+        if (current?.buildId === store.buildId && request.settledAt
+          && Date.parse(current.publishedAt) > Date.parse(request.settledAt)) return null;
+        return { requestId: request.requestId, reason: request.result?.reason ?? 'unknown',
+          message: typeof request.result?.message === 'string' ? request.result.message : null,
+          issues: publishValidationIssues(request.result) };
       })(),
     });
     if (action === 'status') {

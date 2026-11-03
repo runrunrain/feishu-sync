@@ -917,6 +917,34 @@ describe('审查（§4.3）与交接/问题/发布（§5）', () => {
     expect(JSON.parse(status.content[0]!.text).lastPublishRejection.issues[0].path).toBe('docs/old.md');
   });
 
+  it('检查点不把已由阶段发布解决或上一代的拒绝当作当前阻断', async () => {
+    const setup = makeV2('b-stale-publish-rejection');
+    const request = setup.store.beginPublishWindow('candidate', null);
+    setup.store.settlePublishRequest(request.requestId, 'rejected', {
+      reason: 'kb_publish_blocked', message: '旧证据预算已超限',
+    });
+    const statusOf = async (token: string) => JSON.parse((await call(token, 'build_checkpoint', { action: 'status' })).content[0]!.text);
+    expect((await statusOf(setup.leader.token)).lastPublishRejection.message).toContain('旧证据预算');
+
+    const manifestSpy = vi.spyOn(StandardKbStore.prototype, 'readManifest').mockReturnValue({
+      buildId: 'b-stale-publish-rejection', publishedAt: new Date(Date.now() + 60_000).toISOString(),
+      docs: [], sourceSnapshot: [],
+    } as never);
+    try {
+      expect((await statusOf(setup.leader.token)).lastPublishRejection).toBeNull();
+    } finally { manifestSpy.mockRestore(); }
+
+    setup.store.rotateGeneration(2, 'resume');
+    setup.state.v2!.generation = 2;
+    const resumed = service.createRunContext({
+      runKind: 'build', buildId: 'b-stale-publish-rejection', outputRoot, knowledgeBaseRoot: kbRoot,
+      buildState: setup.state, allowedToolsOverride: [...V2_LEADER_TOOLS],
+      orchestration: { mode: 'pi-amagi', buildId: 'b-stale-publish-rejection', generation: 2,
+        credential: 'leader', actorStore: setup.store },
+    });
+    expect((await statusOf(resumed.token)).lastPublishRejection).toBeNull();
+  });
+
   it('build_checkpoint save/status', async () => {
     const setup = makeV2('b-ckpt');
     let saved = 0;
