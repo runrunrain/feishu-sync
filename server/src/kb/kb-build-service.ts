@@ -1375,6 +1375,7 @@ export class KbBuildService extends EventEmitter {
       `- 并发上限：${resolveBuildConcurrency(config.standardKb)}（amagi 准入分池冻结）`,
       ...(skipBriefing ? [skipBriefing] : []),
       '',
+      'build_manifest 工作集每页最多 12 个来源：读到首页就派发已有明确输入的任务，再按 nextCursor 逐页读完；最终发布前确认 nextCursor=null。',
       '先经 build_manifest 默认 scope=workset 读取本轮唯一派发范围；scope=all 仅供背景查询，不为未变化基准源派任务。新增长文/表格按一篇目标文档一个写作任务派发，单篇读完即写，多个任务并发。不同主题的大表尽量分成不同目标文档；CSV 明细必须优先用 kb_write_doc.csvTableImports 从冻结附件自动导入，不让作者逐行复制到工具 JSON。每份子任务书第一条必须要求原生 read 读取上方冻结 SKILL.md 前 14 行，再读取列出的本角色文件全文后调用 MCP 桥接；Pi 的 --skill 只提示技能路径，不自动注入全文。objToken 只在任务正文和 MCP 调用中使用，不是 task_submit.inputs.required 的本地路径。首批任务具备输入后立即派发；每篇写入后尽快派单篇审查并阶段发布，全部成果通过审查后申请发布当前精确候选版本。',
     ].join('\n');
     const resumeBriefing = [
@@ -1386,6 +1387,7 @@ export class KbBuildService extends EventEmitter {
       '## 续接交代',
       '',
       `构建 ${input.buildId} 从检查点恢复（第 ${generation} 代）。已接受成果与未解决问题以应用账本为准：先用 build_checkpoint(action=status) 查看成果状态，再组织剩余工作。旧式整库范围审查凭据已作废；现有草稿若尚无有效单篇审查回执，须安排独立审查，不必重写正文。每篇审查通过后应用会自动阶段发布，其他任务继续；全部完成后再申请最终发布当前精确候选版本。不要重写已接受且未受影响的草稿。`,
+      '若需重新读取 build_manifest，工作集每页最多 12 个来源；按 nextCursor 逐页读取，并优先派发已有明确输入的首批任务。',
       ...(skipBriefing ? [skipBriefing] : []),
     ].join('\n');
     return {

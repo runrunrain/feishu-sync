@@ -162,6 +162,30 @@ describe('Leader 工具面（§3.4）', () => {
     expect(JSON.parse(page2.content[0]!.text).nextCursor).toBeNull();
   });
 
+  it('工作集清单按 12 项封顶，避免大批量首轮阻塞派发', async () => {
+    const setup = makeV2('b-manifest-first-page');
+    const sources = Array.from({ length: 13 }, (_, index) => {
+      const token = `page-${index}`;
+      const relPath = `manifest-page-${index}.md`;
+      writeRaw(relPath, `# 来源 ${index}\n\n独立规则 ${index}\n`);
+      return entry(token, relPath);
+    });
+    setup.state.snapshot = RawSourceSnapshot.fromEntries(sources, { knowledgeBaseRoot: kbRoot, sheetCsvPaths: () => [] });
+    setup.state.workset = new Map(sources.map((source) => [source.objToken, 'added'] as const));
+
+    const first = JSON.parse((await call(setup.leader.token, 'build_manifest', {})).content[0]!.text);
+    expect(first.total).toBe(13);
+    expect(first.entries).toHaveLength(12);
+    expect(first.nextCursor).toBeTruthy();
+    const requestedWide = JSON.parse((await call(setup.leader.token, 'build_manifest', { limit: 50 })).content[0]!.text);
+    expect(requestedWide.entries).toHaveLength(12);
+    const last = JSON.parse((await call(setup.leader.token, 'build_manifest', { cursor: first.nextCursor })).content[0]!.text);
+    expect(last.entries).toHaveLength(1);
+    expect(last.nextCursor).toBeNull();
+    const background = JSON.parse((await call(setup.leader.token, 'build_manifest', { scope: 'all', limit: 50 })).content[0]!.text);
+    expect(background.entries).toHaveLength(13);
+  });
+
   it('build_manifest 提前给出长源规模和子表边界，不传全文', async () => {
     const longSource = ['# 长表', '## 子表: ①规则', ...Array.from({ length: 1250 }, () => '规则行'), '## 子表: ②配置', '配置行'].join('\n');
     writeRaw('src-b.md', longSource);

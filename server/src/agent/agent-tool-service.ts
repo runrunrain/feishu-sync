@@ -4272,7 +4272,12 @@ export class AgentToolService {
   /** build_manifest（Leader）：冻结源材料清单（§5.1），分页。 */
   private toolBuildManifest(context: InternalRunContext, args: Record<string, unknown>): ToolResult {
     const state = requireBuildState(context);
-    const limit = optionalInt(args, 'limit', 50, 1, 200);
+    const scope = args.scope === 'all' ? 'all' : 'workset';
+    // Large worksets can return tens of kilobytes of outlines in one model
+    // turn. Bound the active page so the Leader can dispatch the first child
+    // before reading every source; background lookups keep their wider limit.
+    const requestedLimit = optionalInt(args, 'limit', 12, 1, 200);
+    const limit = scope === 'workset' ? Math.min(requestedLimit, 12) : requestedLimit;
     const published = this.storeFor(context.options.outputRoot).readManifest();
     const publishedSourceByToken = new Map((published?.sourceSnapshot ?? []).map((source) => [source.objToken, source] as const));
     // 增量重建时把已发布主题的路径交给 Leader，避免仅凭源标题猜新路径，
@@ -4290,7 +4295,6 @@ export class AgentToolService {
     }
     // Leader 的默认清单只列本轮工作集。完整冻结快照仍可显式查询，
     // 但不能把未变化的基准来源误当作需要派发的审查/写作任务。
-    const scope = args.scope === 'all' ? 'all' : 'workset';
     const sourceEntries = scope === 'all'
       ? state.snapshot.entries
       : state.snapshot.entries.filter((entry) => state.mode === 'full' || state.workset.has(entry.objToken));

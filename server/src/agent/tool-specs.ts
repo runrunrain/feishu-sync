@@ -1063,13 +1063,13 @@ export const KB_TOOL_SCHEMA_SPEC: AgentToolSpec = {
 export const BUILD_MANIFEST_SPEC: AgentToolSpec = {
   name: 'build_manifest',
   label: '材料清单',
-  description: '默认只列本轮工作集源；scope=all 才列完整冻结快照。每项含 objToken、标题、路径、内容哈希、变更类型、源可用性、已关联标准文档路径、有效内容是否与已发布版相同（含图片及白板旁路变化）。带分页游标，只读。',
+  description: '默认只列本轮工作集源，每页最多 12 项；按 nextCursor 逐页读取并在首批具备输入后派发。scope=all 才列完整冻结快照。每项含 objToken、标题、路径、内容哈希、变更类型、源可用性、已关联标准文档路径、有效内容是否与已发布版相同（含图片及白板旁路变化）。带分页游标，只读。',
   parameters: {
     type: 'object',
     properties: {
       scope: { type: 'string', enum: ['workset', 'all'], description: '默认 workset；all 仅用于查找背景来源，不代表派发范围' },
       cursor: string('分页游标（上一页返回的 nextCursor）'),
-      limit: integer('每页条数', 1, 200),
+      limit: integer('每页条数；workset 最多 12 项，all 最多 200 项', 1, 200),
     },
     additionalProperties: false,
   },
