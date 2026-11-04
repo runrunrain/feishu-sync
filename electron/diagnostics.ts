@@ -1,6 +1,19 @@
 /** 本地退出诊断；不上传，不改变未捕获异常的退出语义。 */
 import fs from 'node:fs';
 import path from 'node:path';
+import { monitorEventLoopDelay } from 'node:perf_hooks';
+
+/** Local, bounded diagnostics for future CPU stalls; no prompts, tool contents or network telemetry. */
+export function startResponsivenessDiagnostics(record: (kind: string, details: Record<string, unknown>) => void, processName: string) {
+  const delay = monitorEventLoopDelay({ resolution: 20 }); delay.enable();
+  const timer = setInterval(() => {
+    const maxMs = delay.max / 1e6;
+    if (maxMs > 200) record('event-loop-stall', { process: processName, maxMs: Math.round(maxMs), p99Ms: Math.round(delay.percentile(99) / 1e6) });
+    delay.reset();
+  }, 15_000);
+  timer.unref();
+  return () => { clearInterval(timer); delay.disable(); };
+}
 
 export function createDesktopDiagnostics(dataRoot: string) {
   const directory = path.join(dataRoot, 'diagnostics');

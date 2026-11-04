@@ -362,6 +362,16 @@ export function checkRootOverlap(
  * 树与凭据目录、外部 Node 安装根——否则 ws_write 可改写
  * pi-extension/models.json 或 node 二进制把「无 shell」绕成本机任意代码执行）。
  */
+/** A native Pi working directory is a starting location, not an access fence. */
+export function validateWorkingDirectory(directory: string): { ok: true; realPath: string } | { ok: false; code: string; message: string } {
+  if (!path.isAbsolute(directory)) return { ok: false, code: 'workspace_path_invalid', message: '工作目录必须是绝对路径' };
+  try {
+    const realPath = fs.realpathSync(directory);
+    if (fs.statSync(realPath).isDirectory()) return { ok: true, realPath };
+  } catch { /* Return a stable validation error for missing/inaccessible paths. */ }
+  return { ok: false, code: 'workspace_path_invalid', message: `工作目录不存在或不是目录: ${directory}` };
+}
+
 export function validateWorkspacePath(
   workspacePath: string,
   guards: WorkspaceRootGuards,

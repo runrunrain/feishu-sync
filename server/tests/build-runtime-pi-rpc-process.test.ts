@@ -36,6 +36,7 @@ fs.writeFileSync(process.env.FAKE_PI_ARGV_FILE, JSON.stringify(process.argv.slic
 const send = (obj) => process.stdout.write(JSON.stringify(obj) + '\\n');
 send({ type: 'state', hint: 'fake-ready' });
 if (process.env.FAKE_PI_SCRIPT === 'events') {
+  setTimeout(() => send({ type: 'message_update', assistantMessageEvent: { type: 'thinking_delta', delta: 'native thinking' } }), 100);
   setTimeout(() => send({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'self' } }), 150);
   setTimeout(() => send({ type: 'agent_settled' }), 300);
 }
@@ -150,6 +151,7 @@ describe('自触发轮次（selfTriggeredRounds）', () => {
       ...BASE, piCliPath: pi, tools: ['t'], buildMode: true, selfTriggeredRounds: true,
       env: { ...BASE.env, FAKE_PI_ARGV_FILE: file, FAKE_PI_SCRIPT: 'events' },
     });
+    const thinking = new Promise<string>((resolve) => rpc.once('thinking_delta', resolve));
     await rpc.start();
     const started = new Promise<{ roundId: string }>((resolve) => rpc.once('round_started', resolve));
     const settled = new Promise<{ roundId: string }>((resolve) => rpc.once('round_settled', resolve));
@@ -157,6 +159,7 @@ describe('自触发轮次（selfTriggeredRounds）', () => {
     expect(rpc.hasActiveRound()).toBe(true);
     await expect(rpc.prompt('hi')).rejects.toSatisfy((error: unknown) => (error as { code?: string }).code === 'round_in_progress');
     await settled;
+    expect(await thinking).toBe('native thinking');
     expect(rpc.hasActiveRound()).toBe(false);
     expect(rpc.hasActiveRun()).toBe(false);
     await rpc.terminate(500);

@@ -33,7 +33,6 @@ import os from 'node:os';
 import path from 'node:path';
 import { resolveDataRoot } from './data-root.js';
 import { defaultLanConfig, normalizeLanConfig, validateLanConfig } from '../kb-lan/network.js';
-import { validateWorkspacesAgainstConfig } from '../agent/protected-roots.js';
 import {
   buildDefaultAgentConfig,
   buildDefaultStandardKbConfig,
@@ -1344,24 +1343,8 @@ export class ConfigManager {
           whiteboardExport: { enabled: true },
         }),
     };
-    // F3-R02：合并后配置交叉校验——已授权 Workspace 与新 knowledgeBaseRoot /
-    // outputRoot / dataRoot / 静态受保护运行资源（源码树/node_modules/Electron/
-    // pi 凭据目录）冲突时拒绝保存（InvalidConfigError → 400 invalid_config），
-    // 而不是让冲突配置落盘后在能力使用时才暴露；同步启动不受影响（load
-    // 保持宽容，只拒绝保存）。pi/Node 安装根依赖运行时发现，由路由层
-    // （routes/config.ts，有 resolver 可用）在保存前补充校验。
-    const workspaceConflicts = validateWorkspacesAgainstConfig({
-      workspaces: updatedConfig.agent.workspaces,
-      knowledgeBaseRoot: updatedConfig.knowledgeBaseRoot,
-      outputRoot: updatedConfig.standardKb.outputRoot,
-      dataRoot: resolveDataRoot(),
-    });
-    if (workspaceConflicts.length > 0) {
-      throw new InvalidConfigError(workspaceConflicts.map((detail) => ({
-        field: detail.field,
-        code: 'workspace_path_forbidden',
-      })));
-    }
+    // Workspaces are starting directories, so they may contain source,
+    // output or runtime paths. Individual application tools keep their fences.
     // S2（设计 §3.1）：vision.enabled=true 时引用的 provider/预设必须存在且启用
     validateVisionProviderReference(updatedConfig.agent, updatedConfig.llm);
     // T4b-03：发布根↔watchedRoots 候选态联合校验收敛点——feishuPublish 段

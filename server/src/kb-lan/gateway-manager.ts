@@ -1,5 +1,6 @@
 /** Parent lifecycle owner: no LAN listener runs in the Electron/Hono event loop. */
 import fs from 'node:fs';
+import { runtimeExecutable } from '../modules/runtime-executable.js';
 import path from 'node:path';
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
 import { serverDistRoot } from '../agent/agent-assets.js';
@@ -168,7 +169,7 @@ export class KbLanGatewayManager {
     this.heartbeat = new HeartbeatDeadline(this.now(), this.timing.tickMs, this.timing.heartbeatMs, this.timing.driftMs);
     let child: ChildProcess;
     try {
-      child = (this.options.spawn ?? spawn)(this.options.executable ?? process.execPath, [this.artifact(), '--kb-root', this.options.config.getConfig()!.standardKb.outputRoot, '--raw-catalog', rawCatalogPath(this.options.dataRoot), '--host', this.host, '--port', String(config.port), '--max-sessions', String(config.maxSessions), '--allow-cidrs', (config.allowCidrs ?? DEFAULT_CIDRS).join(',')], { env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+      child = (this.options.spawn ?? spawn)(this.options.executable ?? runtimeExecutable(), [this.artifact(), '--kb-root', this.options.config.getConfig()!.standardKb.outputRoot, '--raw-catalog', rawCatalogPath(this.options.dataRoot), '--host', this.host, '--port', String(config.port), '--max-sessions', String(config.maxSessions), '--allow-cidrs', (config.allowCidrs ?? DEFAULT_CIDRS).join(',')], { env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
     } catch { this.failure('failed', 'spawn_failed'); this.scheduleRestart(); return; }
     this.child = child;
     let buffer = '';

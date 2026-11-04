@@ -634,6 +634,8 @@ export interface AgentAttachmentDto {
 }
 
 export interface AgentMessageDto {
+  /** Native Pi thinking blocks, retained separately from assistant prose. */
+  thinking?: string;
   id: string;
   role: 'user' | 'assistant' | 'tool' | 'notice';
   at: string;
@@ -722,6 +724,7 @@ export type AgentSessionEvent =
   | { type: 'session_state'; session: AgentSessionDto }
   | { type: 'run_start'; runId: string }
   | { type: 'text_delta'; runId: string; delta: string }
+  | { type: 'thinking_delta'; runId: string; delta: string }
   | {
       type: 'tool';
       runId: string;

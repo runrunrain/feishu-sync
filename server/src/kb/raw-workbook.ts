@@ -18,7 +18,9 @@ export async function loadRawWorkbook(catalog: RawCatalog, entry: RawCatalogEntr
     md = resolveInside(catalog.root, entry.relPath, 'read');
     const mdStat = fs.statSync(md);
     if (!mdStat.isFile() || mdStat.size > 8 * 1024 * 1024) throw Error();
-    header = fs.readFileSync(md, 'utf8').slice(0, 16_384);
+    const fd = fs.openSync(md, 'r');
+    try { const bytes = Buffer.alloc(16_384); header = bytes.toString('utf8', 0, fs.readSync(fd, bytes, 0, bytes.length, 0)); }
+    finally { fs.closeSync(fd); }
   } catch { throw new QueryError('raw_unreadable', '源文档不可读取，请重新同步后重试'); }
   const marker = /^\s+source_workbook:\s*("[^\n]+")\s*$/m.exec(header)?.[1];
   if (!marker && !/^\s+source_workbook\s*:/m.test(header)) {
@@ -37,12 +39,13 @@ export async function loadRawWorkbook(catalog: RawCatalog, entry: RawCatalogEntr
     try { stat = fs.statSync(file); } catch { throw new QueryError('raw_workbook_unreadable', '已登记的 Excel 文件缺失或不可读取；可使用 raw_read 查看已有文本和 CSV。', { reason: 'missing_or_unreadable' }); }
     if (!stat.isFile() || stat.size === 0) throw new QueryError('raw_workbook_unreadable', 'Excel 文件为空或不是普通文件。', { reason: 'invalid_file' });
     if (stat.size > 64 * 1024 * 1024) throw new QueryError('raw_workbook_unreadable', 'Excel 文件超过 64 MiB 读取上限；可使用 raw_read 查看已有文本和 CSV。', { reason: 'file_too_large' });
-    const bytes = fs.readFileSync(file);
-    const contentHash = crypto.createHash('sha256').update(bytes).digest('hex');
-    const key = `${file}\0${contentHash}`;
+    // Validate the managed path/header on every call, but do not reread and hash an unchanged workbook.
+    const key = `${file}\0${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
     let promise = pending.get(key);
     if (!promise) {
       promise = (async () => {
+        const bytes = await fs.promises.readFile(file);
+        const contentHash = crypto.createHash('sha256').update(bytes).digest('hex');
         let zip: JSZip;
         try { zip = await JSZip.loadAsync(bytes); } catch { throw new QueryError('raw_workbook_unreadable', 'Excel 文件的 ZIP 结构无法解析；可使用 raw_read 查看已有文本和 CSV。', { reason: 'invalid_archive' }); }
         const files = Object.values(zip.files);

@@ -11,7 +11,6 @@ import { app, BrowserWindow, clipboard, dialog, ipcMain, session, shell, globalS
 import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
 import fs from 'node:fs';
 
 // Type declaration for CJS __dirname provided by Node.js runtime
@@ -27,17 +26,18 @@ import { ConfigManager } from '../server/src/modules/config-manager.js';
 import type { QuitReason } from './contracts.js';
 import { externalNavigationUrl } from '../src/utils/external-url.js';
 import { writeClipboardText } from './clipboard-service.js';
-import { createDesktopDiagnostics } from './diagnostics.js';
+import { createDesktopDiagnostics, startResponsivenessDiagnostics } from './diagnostics.js';
+import { startServerProcess } from './server-process.js';
 
 // ============================================================================
 // Constants and Configuration
 // ============================================================================
 
-const LOOPBACK_HOST = '127.0.0.1';
 const DESKTOP_TOKEN_HEADER = 'X-Desktop-Token';
 const HEALTH_TIMEOUT_MS = 15_000;
 const HEALTH_POLL_INTERVAL_MS = 250;
 const recordDiagnostic = createDesktopDiagnostics(process.env.FEISHU_SYNC_HOME || path.join(os.homedir(), '.feishu-sync'));
+const stopResponsivenessDiagnostics = startResponsivenessDiagnostics(recordDiagnostic, 'main');
 process.on('uncaughtExceptionMonitor', (error, origin) => recordDiagnostic('uncaught-exception', { origin, message: error.message, stack: error.stack }));
 app.on('render-process-gone', (_event, _contents, details) => recordDiagnostic('renderer-exit', details));
 app.on('child-process-gone', (_event, details) => recordDiagnostic('child-exit', details));
@@ -156,53 +156,21 @@ function resolveServerEntryPath() {
 
 async function startEmbeddedServer(token: string) {
   const serverEntryPath = resolveServerEntryPath();
-
-  console.info('[Electron] Loading server module from:', serverEntryPath);
-
-  // Verify file exists before import
   if (!fs.existsSync(serverEntryPath)) {
     throw new Error(`Server entry file not found: ${serverEntryPath}`);
   }
-
-  // 动态 import server 模块（ESM）
-  const serverModuleUrl = pathToFileURL(serverEntryPath).href;
-  console.info('[Electron] Server module URL:', serverModuleUrl);
-
-  let serverModule: any;
-  try {
-    serverModule = await import(serverModuleUrl);
-    console.info('[Electron] Server module loaded successfully, exports:', Object.keys(serverModule));
-  } catch (error) {
-    console.error('[Electron] Failed to load server module:', error);
-    throw new Error(`Server module import failed: ${sanitizeDesktopError(error)}`);
-  }
-
-  // A 段契约：buildServer(options: CreateServerOptions) 返回 Hono app
-  // 但我们需要 startServer 来获取实际启动的 server with url/close
-  // 根据 server/src/index.ts，startServer 返回 { url, port, close }
-  if (typeof serverModule.startServer !== 'function') {
-    throw new Error('Server module contract failed: startServer export is missing');
-  }
-
-  // dev:desktop 模式下窗口加载 vite(http://localhost:5173)，前端跨域调 server(3001)；
-  // 必须 corsDevMode=true 才允许 localhost:5173 origin（见 server/src/index.ts:44-58）。
-  // 生产打包后窗口加载 app:// 同源，不需要 dev gate。
   const isDevMode = !app.isPackaged || process.env.NODE_ENV === 'development';
-  console.info('[Electron] Starting server with options:', { desktopMode: true, hostname: LOOPBACK_HOST, port: 0, corsDevMode: isDevMode });
-  const started = await serverModule.startServer({
-    desktopMode: true,
+  startedServer = await startServerProcess({
+    entryPath: path.join(__dirname, 'server-process-entry.cjs'),
+    serverPath: serverEntryPath,
     desktopToken: token,
-    hostname: LOOPBACK_HOST,
-    port: 0, // Auto-select available port
     corsDevMode: isDevMode,
+    onUnexpectedExit: (code) => {
+      recordDiagnostic('backend-exit', { code });
+      console.error(`[Electron] Backend unexpectedly exited (${code}); window and application controls remain available`);
+    },
   });
-
-  if (!started || !started.url || typeof started.close !== 'function') {
-    throw new Error('Server start contract failed: invalid result structure');
-  }
-
-  startedServer = started;
-  console.info(`[Electron] Embedded server started on ${started.url}`);
+  console.info(`[Electron] Backend service started on ${startedServer.url}`);
 }
 
 async function waitForHealth(serverUrl: string) {
@@ -344,6 +312,7 @@ function getQuitCoordinator() {
       closeServer,
       sanitizeError: sanitizeDesktopError,
       onBeforeQuit: (_reason: QuitReason) => {
+        stopResponsivenessDiagnostics();
         // 退出前先切断所有指向内嵌 server 的连接来源：停掉主进程的
         // 变更检测轮询、销毁渲染窗口——渲染层每 30s 轮询鉴权状态会
         // 持续维持 keep-alive 连接，让 server.close() 永远等不完。

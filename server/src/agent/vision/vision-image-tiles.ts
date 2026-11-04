@@ -8,6 +8,23 @@ import type { VisionImageMime, VisionRequest } from './vision-channel.js';
 export interface VisionTileRect { x: number; y: number; width: number; height: number }
 export interface VisionImageTile { bytes: Buffer; mime: VisionImageMime }
 
+type ImagePort = { on(name: string, handler: (event: { data: Record<string, unknown> }) => void): void; postMessage(data: unknown): void };
+const imagePort = (process as NodeJS.Process & { parentPort?: ImagePort }).parentPort;
+let nextTileRequest = 0;
+const tileRequests = new Map<number, (tiles: VisionImageTile[]) => void>();
+imagePort?.on('message', ({ data }) => {
+  if (data.type !== 'vision_tiles_result' || typeof data.id !== 'number') return;
+  const finish = tileRequests.get(data.id); if (!finish) return;
+  const tiles: VisionImageTile[] = [];
+  if (Array.isArray(data.tiles)) for (const value of data.tiles as unknown[]) {
+    const tile = value as { bytes?: unknown; mime?: unknown } | null;
+    if (tile?.bytes instanceof Uint8Array && ['image/png', 'image/jpeg', 'image/webp'].includes(String(tile.mime))) {
+      tiles.push({ bytes: Buffer.from(tile.bytes), mime: tile.mime as VisionImageMime });
+    }
+  }
+  finish(tiles);
+});
+
 /** The bitmap is BGRA on Electron's supported desktop platforms. */
 export function occupiedImageBounds(bitmap: Buffer, width: number, height: number): VisionTileRect {
   const full = { x: 0, y: 0, width, height };
@@ -59,9 +76,13 @@ export function planVisionImageTiles(bounds: VisionTileRect, imageWidth: number,
 }
 
 export async function createVisionImageTiles(request: VisionRequest): Promise<VisionImageTile[]> {
-  // The embedded server runs in Electron's main process. In standalone Node,
-  // keep the original retry behavior because nativeImage is unavailable.
   if (!process.versions.electron || request.mime === 'image/gif') return [];
+  if (imagePort) return new Promise((resolve) => {
+    const id = ++nextTileRequest;
+    const timer = setTimeout(() => { tileRequests.delete(id); resolve([]); }, 15_000);
+    tileRequests.set(id, (tiles) => { clearTimeout(timer); tileRequests.delete(id); resolve(tiles); });
+    imagePort.postMessage({ type: 'vision_tiles', id, bytes: request.bytes, mime: request.mime });
+  });
   try {
     const electron = await import('electron');
     const nativeImage = electron.nativeImage ?? electron.default?.nativeImage;

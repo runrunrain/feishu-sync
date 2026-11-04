@@ -49,7 +49,9 @@ it('真实Pi插件快照进入system；运行中编辑不改变当前任务，�
         if (res.writableEnded || res.destroyed) return;
         const frame = (delta: unknown, finish_reason: string | null) => `data: ${JSON.stringify({ id: 'plugin-local', object: 'chat.completion.chunk', created: 1, model: 'fixture', choices: [{ index: 0, delta, finish_reason }] })}\n\n`;
         res.writeHead(200, { 'Content-Type': 'text/event-stream' });
-        res.end(requests.length === 4
+        res.end(requests.length === 8
+          ? frame({role:'assistant',tool_calls:[{index:0,id:'work_bash_1',type:'function',function:{name:'bash',arguments:'{"command":"pwd","timeout":5}'}}]},null)+frame({},'tool_calls')+'data: [DONE]\n\n'
+          : requests.length === 4
           ? frame({role:'assistant',tool_calls:[{index:0,id:'native_tool_1',type:'function',function:{name:'plugin_echo',arguments:'{"message":"NATIVE_TOOL_PAYLOAD"}'}}]},null)+frame({},'tool_calls')+'data: [DONE]\n\n'
           : frame({ role: 'assistant', content: 'PLUGIN_FIXTURE_OK' }, null) + frame({}, 'stop') + 'data: [DONE]\n\n');
       };
@@ -74,6 +76,13 @@ it('真实Pi插件快照进入system；运行中编辑不改变当前任务，�
   const service = new SessionService({ dataRoot: root, pool, toolService: tools, resolver, configProvider: () => config,
     internalBaseUrl: () => `http://127.0.0.1:${port}`, extensionPath: piExtensionPath, pluginStore: plugins,
     workspaceGuards: () => ({ dataRoot: root, knowledgeBaseRoot: '', outputRoot: '' }) });
+  let workBashStart = 0;
+  let workBashElapsed = Infinity;
+  service.on('sse', ({ event, data }) => {
+    if (event !== 'tool' || data.toolName !== 'bash') return;
+    if (data.phase === 'start') workBashStart = Date.now();
+    else if (workBashStart) workBashElapsed = Date.now() - workBashStart;
+  });
   const session = service.create(store, { title: '插件验收', backend: 'pi' });
   expect(session.backend).toBe('pi');
   const complete = async (message: string, count: number) => {
@@ -115,6 +124,27 @@ it('真实Pi插件快照进入system；运行中编辑不改变当前任务，�
     expect(allowed).toContain('plugin_echo');
     expect(systems(0)).toContain('NATIVE_EXTERNAL_CONTEXT');
     expect(allowed).not.toContain('bash'); expect(allowed).not.toContain('ws_write');
+
+    // Work discovers the real installed amagi package and app context once,
+    // and does not register the app's conflicting task family or ws tools.
+    config.agent.workspaces = [{ id: 'native-start', name: 'Native Work', path: root, createdAt: new Date().toISOString() }];
+    config.agent.model.contextWindow = 128000;
+    await service.switchMode(store, session.id, { mode: 'work', workspaceId: 'native-start', confirm: 'WORK' });
+    await complete('完整 Pi Work 能力', 9);
+    const workTools = requests[7].tools.map((tool: any) => tool.function.name);
+    expect(workTools).toEqual(expect.arrayContaining(['read', 'write', 'edit', 'bash', 'task_submit', 'plugin_echo', 'kb_search']));
+    expect(workTools).not.toContain('ws_write');
+    expect(new Set(workTools).size).toBe(workTools.length);
+    expect(systems(7)).toContain('Pi 通用工作助手');
+    expect(systems(7).split('NATIVE_EXTERNAL_CONTEXT')).toHaveLength(2);
+    expect(systems(7)).not.toContain('子任务是受限执行者');
+    expect(workBashElapsed).toBeLessThan(5000);
+    expect(JSON.stringify(requests[8].messages)).toContain(root);
+    const state = await pool.get(session.id)!.sendCommand('get_state');
+    expect((state.data as { cwd?: string }).cwd ?? root).toBe(root);
+    await service.switchMode(store, session.id, { mode: 'discuss' });
+    await complete('切回 Chat', 10);
+    expect(requests[9].tools.map((tool: any) => tool.function.name)).not.toContain('bash');
   } finally {
     releaseFirst?.(); await pool.closeAll();
     await new Promise<void>((resolve) => internal.close(() => resolve()));

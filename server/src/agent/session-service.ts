@@ -12,7 +12,10 @@ import crypto from 'node:crypto';
 import type { AppPluginStore, AppPluginSnapshot } from './app-plugin-store.js';
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { EventEmitter } from 'node:events';
+import { SessionHistoryCache, parseSessionJsonl, toAssistantMessageDto, toToolMessageDto } from './session-history.js';
+export { parseSessionJsonl, toAssistantMessageDto } from './session-history.js';
 import { AgentProcessPool } from './agent-process-pool.js';
 import { AgentToolService, ToolError } from './agent-tool-service.js';
 import { buildPiProcessEnv, PiRpcProcess } from './pi-rpc-process.js';
@@ -23,7 +26,7 @@ import { ClaudeCodeProcess } from './claude-code-process.js';
 import type { SessionModelConfig } from '../types/agent-knowledge.js';
 import { modelRevision } from './model-revision.js';
 import { ChatAttachmentStore, type ChatImageContent } from './chat-attachments.js';
-import { checkRootOverlap, type WorkspaceRootGuards } from './path-guard.js';
+import { checkRootOverlap, validateWorkingDirectory, type WorkspaceRootGuards } from './path-guard.js';
 import {
   toolsForRunKind,
   type AgentMessageDto,
@@ -43,6 +46,8 @@ interface ActiveRun {
   runId: string;
   sessionId: string;
   phase: 'starting' | 'running' | 'settling';
+  autonomous?: boolean;
+  error?: { code: string; message: string };
 }
 
 export interface SessionServiceDeps {
@@ -90,6 +95,8 @@ export interface SessionStoreApi {
 const SSE_BUFFER_SIZE = 1000;
 
 export class SessionService extends EventEmitter {
+  private readonly history = new SessionHistoryCache();
+  private readonly pendingText = new Map<string, { runId: string; event: 'text_delta' | 'thinking_delta'; deltas: string[]; timer: ReturnType<typeof setTimeout> }>();
   readonly attachments: ChatAttachmentStore;
   private readonly deps: SessionServiceDeps;
   private readonly sseBuffers = new Map<string, SessionSseEvent[]>();
@@ -102,6 +109,7 @@ export class SessionService extends EventEmitter {
   private readonly abortSignals = new Map<string, Set<AbortController>>();
   private readonly modelRevisions = new WeakMap<PiRpcProcess, string>();
   private readonly pluginRevisions = new WeakMap<PiRpcProcess, string>();
+  private readonly nativeSessionProcesses = new WeakSet<PiRpcProcess>();
   private readonly sessionStates = new Map<string, 'starting' | 'streaming'>();
   /**
    * T3b-07R：toolCallId → 所属 runId（server 权威轮次归属，从 pi
@@ -329,13 +337,17 @@ export class SessionService extends EventEmitter {
       if (body.confirm !== 'WORK') {
         throw new ToolError('confirmation_required', '切换到 Work 模式需要 confirm: "WORK"（用户显式授权）');
       }
-      const workspace = config?.agent.workspaces.find((candidate) => candidate.id === body.workspaceId);
-      if (!workspace) {
+      const workspaceId = body.workspaceId ?? row.workspace_id;
+      const workspace = this.workspaceOf(config, workspaceId);
+      if (workspaceId && !workspace) {
         throw new ToolError('workspace_not_found', 'Workspace 不存在或未绑定', 404);
+      }
+      if (row.runtime_backend === 'claude-code' && !workspace) {
+        throw new ToolError('workspace_not_found', 'Claude Code Work 会话需要选择工作目录', 400);
       }
       await this.deps.pool.terminate(id);
       this.deps.toolService.revokeBySession(id);
-      localMapStore.updateAgentSession(id, { mode: 'work', workspaceId: workspace.id });
+      localMapStore.updateAgentSession(id, { mode: 'work', workspaceId: workspace?.id ?? null });
       this.emitSessionState(id, localMapStore);
       return this.get(localMapStore, config, id);
     }
@@ -383,7 +395,7 @@ export class SessionService extends EventEmitter {
       // 个 run、不重挂监听器（旧实现会 removeAllListeners 抹掉原 run 的
       // SSE 转发后 prompt 再报 run_in_progress，消息实际丢失）。
       const process = this.deps.pool.get(id);
-      if (existingRun.phase !== 'running' || !process || process.isExited() || !process.hasActiveRun()) {
+      if (existingRun.phase !== 'running' || !process || process.isExited() || !(process.hasActiveRun() || process.hasActiveRound?.())) {
         // run 记录尚未被 executeRun 的 finally 清理（收尾窗口）：短暂 409
         // 比伪造投递更诚实。
         throw new ToolError('session_busy', '会话正在收尾，请稍后重试', 409);
@@ -436,7 +448,7 @@ export class SessionService extends EventEmitter {
     if (!config) throw new ToolError('invalid_request', '配置不可用');
 
     const workspace = this.workspaceOf(config, row.workspace_id);
-    if (mode === 'work' && !workspace) {
+    if (mode === 'work' && row.workspace_id && !workspace) {
       throw new ToolError('workspace_not_found', 'Work 会话的 Workspace 已被删除，请切换回 Discuss', 404);
     }
 
@@ -450,7 +462,7 @@ export class SessionService extends EventEmitter {
     this.emitSessionState(sessionId, localMapStore);
 
     try {
-      const pluginSnapshot = this.deps.pluginStore?.snapshot(mode, { includeNative: config.agent.runtime.backend !== 'claude-code' });
+      const pluginSnapshot = this.deps.pluginStore?.snapshot(mode, { includeNative: config.agent.runtime.backend !== 'claude-code', nativeWork: mode === 'work' && config.agent.runtime.backend !== 'claude-code' });
       let process = this.deps.pool.get(sessionId);
       if (process && ((pluginSnapshot && this.pluginRevisions.get(process) !== pluginSnapshot.revision)
         || this.modelRevisions.get(process) !== modelRevision(config))) {
@@ -476,14 +488,56 @@ export class SessionService extends EventEmitter {
       }
 
       const attachForwarders = (rpc: PiRpcProcess) => {
+        const currentRunId = () => this.runs.get(sessionId)?.runId ?? runId;
+        if (mode === 'work' && config.agent.runtime.backend !== 'claude-code') {
+          const finishNativeRound = (event: { aborted?: boolean; error?: { code: string; message: string } }) => {
+            const nativeRun = this.runs.get(sessionId);
+            if (!nativeRun?.autonomous) return;
+            const error = event.error ?? nativeRun.error;
+            localMapStore.updateAgentSession(sessionId, { lastErrorCode: error?.code ?? null, lastErrorMessage: error?.message ?? null });
+            this.emitSse(sessionId, 'run_end', { runId: nativeRun.runId, outcome: error ? 'failed' : event.aborted ? 'aborted' : 'completed', ...(error ? { error } : {}) });
+            this.runs.delete(sessionId);
+            this.sessionStates.delete(sessionId);
+            this.abortRequested.delete(sessionId);
+            this.deps.pool.setBusy(sessionId, false);
+            this.emitSessionState(sessionId, localMapStore);
+          };
+          if (!this.nativeSessionProcesses.has(rpc)) {
+            this.nativeSessionProcesses.add(rpc);
+            rpc.once('exit', () => finishNativeRound({ error: { code: 'pi_process_exited', message: 'Pi 进程在后台续跑期间退出，可重新发送消息恢复会话' } }));
+          }
+          rpc.removeAllListeners('round_started');
+          rpc.removeAllListeners('round_settled');
+          rpc.on('round_started', () => {
+            if (rpc.hasActiveRun()) return; // The user prompt is managed below.
+            const nativeRun: ActiveRun = { runId: `r_native_${crypto.randomUUID()}`, sessionId, phase: 'running', autonomous: true };
+            this.runs.set(sessionId, nativeRun);
+            this.abortRequested.delete(sessionId);
+            this.sessionStates.set(sessionId, 'streaming');
+            this.deps.pool.setBusy(sessionId, true);
+            this.emitSse(sessionId, 'run_start', { runId: nativeRun.runId });
+            this.emitSessionState(sessionId, localMapStore);
+          });
+          rpc.on('round_settled', finishNativeRound);
+        }
         rpc.removeAllListeners('text_delta');
+        rpc.removeAllListeners('thinking_delta');
         rpc.removeAllListeners('tool_execution_start');
         rpc.removeAllListeners('tool_execution_end');
         rpc.removeAllListeners('assistant_message_end');
-        rpc.on('text_delta', (delta: string) => {
-          this.emitSse(sessionId, 'text_delta', { runId, delta });
-        });
+        rpc.removeAllListeners('other_message_end');
+        const queueDelta = (event: 'text_delta' | 'thinking_delta', delta: string) => {
+          const runId = currentRunId();
+          const pending = this.pendingText.get(sessionId);
+          if (pending && pending.runId === runId && pending.event === event) { pending.deltas.push(delta); return; }
+          this.flushText(sessionId);
+          const timer = setTimeout(() => this.flushText(sessionId), 40);
+          this.pendingText.set(sessionId, { runId, event, deltas: [delta], timer });
+        };
+        rpc.on('text_delta', (delta: string) => queueDelta('text_delta', delta));
+        rpc.on('thinking_delta', (delta: string) => queueDelta('thinking_delta', delta));
         rpc.on('tool_execution_start', (event) => {
+          const runId = currentRunId();
           const toolCallId = String((event as { toolCallId?: unknown }).toolCallId ?? '');
           // T3b-07R：记录 toolCall 的权威轮次归属（有界，迭代序=插入序）
           if (toolCallId) {
@@ -507,6 +561,7 @@ export class SessionService extends EventEmitter {
           });
         });
         rpc.on('tool_execution_end', (event) => {
+          const runId = currentRunId();
           const isError = (event as { isError?: unknown }).isError === true;
           this.emitSse(sessionId, 'tool', {
             runId,
@@ -518,10 +573,20 @@ export class SessionService extends EventEmitter {
           });
         });
         rpc.on('assistant_message_end', (message) => {
+          const runId = currentRunId();
+          const nativeRun = this.runs.get(sessionId);
+          if (nativeRun?.autonomous) nativeRun.error = message?.stopReason === 'error' || message?.stopReason === 'length'
+            ? { code: message.stopReason === 'length' ? 'model_output_truncated' : 'model_request_failed', message: message.stopReason === 'length' ? 'Pi 后台续跑达到输出上限，未完成当前任务' : 'Pi 后台续跑请求失败，可重新发送消息恢复会话' } : undefined;
           this.emitSse(sessionId, 'message_end', {
             runId,
             message: toAssistantMessageDto(message, `live_${runId}_${crypto.randomBytes(6).toString('hex')}`),
           });
+        });
+        rpc.on('other_message_end', (message) => {
+          const runId = currentRunId();
+          if (message?.role !== 'toolResult') return;
+          this.emitSse(sessionId, 'message_end', { runId,
+            message: toToolMessageDto(message, `live_tool_${runId}_${message.toolCallId ?? crypto.randomUUID()}`) });
         });
       };
 
@@ -568,11 +633,15 @@ export class SessionService extends EventEmitter {
       // Claude's run token must never survive into another run. Its CLI is
       // resumed with a new capability context on the next message.
       if (config.agent.runtime.backend === 'claude-code') await this.deps.pool.terminate(sessionId).catch((error) => console.error('[SessionService] Claude cleanup failed:', error));
-      this.runs.delete(sessionId);
-      this.abortRequested.delete(sessionId);
-      this.sessionStates.delete(sessionId);
-      this.deps.pool.setBusy(sessionId, false);
-      this.emitSessionState(sessionId, localMapStore);
+      // An extension may start its next turn before the prompt's get_state
+      // roundtrip finishes. Only the owner of this run can clear its state.
+      if (this.runs.get(sessionId) === run) {
+        this.runs.delete(sessionId);
+        this.abortRequested.delete(sessionId);
+        this.sessionStates.delete(sessionId);
+        this.deps.pool.setBusy(sessionId, false);
+        this.emitSessionState(sessionId, localMapStore);
+      }
     }
   }
 
@@ -590,9 +659,15 @@ export class SessionService extends EventEmitter {
       throw new ToolError('agent_not_ready', 'Agent 运行时未就绪（Node 或 pi 缺失），请检查设置', 503);
     }
     const runKind = mode === 'work' ? 'work' : 'discuss';
+    const nativeWork = mode === 'work' && config.agent.runtime.backend !== 'claude-code';
+    const cwd = nativeWork ? workspaceRoot ?? os.homedir() : this.emptyCwd();
+    if (nativeWork) {
+      const verdict = validateWorkingDirectory(cwd);
+      if (!verdict.ok) throw new ToolError(verdict.code, verdict.message, 400);
+    }
     // F3-R02：能力使用时动态复核 Workspace——授权后配置可能已变（手工改
     // 配置文件/旧版落盘），冲突即拒绝 spawn，不让旧授权永久生效。
-    if (workspaceRoot) {
+    if (workspaceRoot && !nativeWork) {
       const guards = this.deps.workspaceGuards();
       const verdict = checkRootOverlap(workspaceRoot, guards);
       if (!verdict.ok) {
@@ -607,13 +682,14 @@ export class SessionService extends EventEmitter {
     }
     // S6：编排启用的会话下发 task_*；关闭时按族从白名单剔除
     const taskFace = this.deps.taskTools?.() ?? null;
-    const orchestrationOn = taskFace?.enabled === true;
+    const orchestrationOn = !nativeWork && taskFace?.enabled === true;
     const { token } = this.deps.toolService.createRunContext({
       runKind,
       sessionId,
       outputRoot: config.standardKb.outputRoot,
       knowledgeBaseRoot: config.knowledgeBaseRoot,
       workspaceRoot,
+      ...(nativeWork ? { allowedToolsOverride: toolsForRunKind('discuss') } : {}),
       ...(taskFace && !orchestrationOn ? { disableToolFamilies: [taskFace.family] } : {}),
       onEvent: (event) => {
         // Pi already forwards its native execution events with authoritative call IDs.
@@ -690,6 +766,7 @@ export class SessionService extends EventEmitter {
       runToken: token,
       apiKey,
       preserveUploadedImages: true,
+      nativeWork,
     });
     if (providerJson) {
       env.FEISHU_SYNC_AGENT_PROVIDER_JSON = providerJson;
@@ -705,7 +782,11 @@ export class SessionService extends EventEmitter {
       nodePath: runtime.nodePath,
       piCliPath: runtime.piCliPath!,
       ...(extensionPath ? { extensionPath } : {}),
-      ...(pluginSnapshot ? { additionalExtensionPaths: pluginSnapshot.extensionPaths ?? [pluginSnapshot.extensionPath], allowExternalPluginTools: pluginSnapshot.externalPlugins, additionalSkillPaths: pluginSnapshot.skillPaths, additionalPromptPaths: pluginSnapshot.promptPaths, additionalThemePaths: pluginSnapshot.themePaths } : {}),
+      // Native Work discovers packages/resources from the application Pi home
+      // and cwd. Loading the same package again by -e causes duplicate tools.
+      ...(pluginSnapshot && !nativeWork ? { additionalExtensionPaths: pluginSnapshot.extensionPaths ?? [pluginSnapshot.extensionPath], allowExternalPluginTools: pluginSnapshot.externalPlugins, additionalSkillPaths: pluginSnapshot.skillPaths, additionalPromptPaths: pluginSnapshot.promptPaths, additionalThemePaths: pluginSnapshot.themePaths } : {}),
+      nativeWork,
+      selfTriggeredRounds: nativeWork,
       tools: orchestrationOn
         ? [...toolsForRunKind(runKind), ...taskFace!.names]
         : toolsForRunKind(runKind),
@@ -713,7 +794,7 @@ export class SessionService extends EventEmitter {
       sessionId,
       model,
       thinking: config.agent.model.thinkingLevel,
-      cwd: this.emptyCwd(),
+      cwd,
       env,
       promptTimeoutMs: config.standardKb.promptTimeoutMinutes * 60_000,
       // User image frames can include up to 20 MB of bytes encoded as base64.
@@ -725,7 +806,7 @@ export class SessionService extends EventEmitter {
     try {
       await rpc.start();
       // 自动重试交由宿主判定（§4.4 auto_retry 上限）
-      await rpc.sendCommand('set_auto_retry', { enabled: false }).catch(() => undefined);
+      if (!nativeWork) await rpc.sendCommand('set_auto_retry', { enabled: false }).catch(() => undefined);
       this.deps.pool.register(sessionId, rpc, 'session', slot);
       this.modelRevisions.set(rpc, revision);
       if (pluginSnapshot) this.pluginRevisions.set(rpc, pluginSnapshot.revision);
@@ -827,6 +908,7 @@ export class SessionService extends EventEmitter {
   // ------------------------------------------------------------------
 
   emitSse(sessionId: string, event: string, data: unknown): void {
+    if (event !== 'text_delta' && event !== 'thinking_delta') this.flushText(sessionId);
     let buffer = this.sseBuffers.get(sessionId);
     if (!buffer) {
       buffer = [];
@@ -839,6 +921,12 @@ export class SessionService extends EventEmitter {
       buffer.splice(0, buffer.length - SSE_BUFFER_SIZE);
     }
     this.emit('sse', { sessionId, event, data });
+  }
+
+  private flushText(sessionId: string): void {
+    const pending = this.pendingText.get(sessionId); if (!pending) return;
+    clearTimeout(pending.timer); this.pendingText.delete(sessionId);
+    this.emitSse(sessionId, pending.event, { runId: pending.runId, delta: pending.deltas.join('') });
   }
 
   private emitSessionState(sessionId: string, localMapStore: SessionStoreApi): void {
@@ -875,139 +963,23 @@ export class SessionService extends EventEmitter {
     }
     return this.attachments.decorate(sessionId, parseSessionJsonl(fs.readFileSync(sessionFile, 'utf-8')));
   }
+
+  async messagesAsync(store: { getAgentSession(id: string): Record<string, unknown> | null }, sessionId: string): Promise<AgentMessageDto[]> {
+    const row = store.getAgentSession(sessionId);
+    if (!row) throw new ToolError('session_not_found', '会话不存在', 404);
+    let messages: AgentMessageDto[] = [];
+    if (row.pi_session_file) {
+      try { messages = await this.history.read(String(row.pi_session_file)); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    }
+    return this.attachments.decorate(sessionId, messages);
+  }
 }
 
 // ===========================================================================
 // pi 会话 JSONL 解析（v3 树 → 当前分支线性消息）
 // ===========================================================================
 
-interface SessionEntry {
-  type: string;
-  id: string;
-  parentId: string | null;
-  timestamp: string;
-  message?: {
-    role?: string;
-    content?: unknown;
-    toolCallId?: string;
-    toolName?: string;
-    isError?: boolean;
-    stopReason?: string;
-    model?: string;
-    timestamp?: number;
-  };
-}
-
-/**
- * 解析 JSONL：首行 header 跳过；树回溯索引【全部】带 id/parentId 的
- * 节点（F3-R11）。若只索引 message，compaction/model_change 等夹在
- * 消息链中间时 parentId 链断在非消息节点，更早的分支被截断丢失；
- * 回溯起点取文件顺序最后一个节点（当前叶子，可能是 compaction 等
- * 非消息节点），分支输出阶段才过滤为消息。
- */
-export function parseSessionJsonl(content: string): AgentMessageDto[] {
-  const indexed: SessionEntry[] = [];
-  for (const line of content.split('\n')) {
-    if (!line.trim()) continue;
-    try {
-      const parsed = JSON.parse(line) as SessionEntry;
-      if (parsed.type === 'session') continue; // header
-      if (parsed.id) {
-        indexed.push(parsed);
-      }
-    } catch {
-      /* 跳过损坏行 */
-    }
-  }
-  if (indexed.length === 0) return [];
-
-  // 树回溯：从文件顺序最后一个节点沿 parentId 回溯当前分支
-  const byId = new Map(indexed.map((entry) => [entry.id, entry]));
-  const branch: SessionEntry[] = [];
-  let cursor: SessionEntry | undefined = indexed[indexed.length - 1];
-  const visited = new Set<string>();
-  while (cursor && !visited.has(cursor.id)) {
-    visited.add(cursor.id);
-    branch.unshift(cursor);
-    cursor = cursor.parentId ? byId.get(cursor.parentId) : undefined;
-  }
-
-  const result: AgentMessageDto[] = [];
-  for (const entry of branch) {
-    if (entry.type !== 'message') continue; // 非消息节点只参与树结构，不进消息流
-    const message = entry.message;
-    if (!message?.role) continue;
-    const at = new Date(typeof message.timestamp === 'number' ? message.timestamp : Date.parse(entry.timestamp) || Date.now()).toISOString();
-    if (message.role === 'user') {
-      const text = typeof message.content === 'string'
-        ? message.content
-        : Array.isArray(message.content)
-          ? message.content.map((block) => (block && typeof block === 'object' && (block as { type?: string }).type === 'text' ? String((block as { text?: string }).text ?? '') : '')).join('')
-          : '';
-      result.push({ id: entry.id, role: 'user', at, text });
-    } else if (message.role === 'assistant') {
-      const dto = toAssistantMessageDto(message, entry.id);
-      result.push({ ...dto, at });
-    } else if (message.role === 'toolResult') {
-      const text = Array.isArray(message.content)
-        ? message.content.map((block) => (block && typeof block === 'object' && (block as { type?: string }).type === 'text' ? String((block as { text?: string }).text ?? '') : '')).join('')
-        : '';
-      result.push({
-        id: entry.id,
-        role: 'tool',
-        at,
-        tool: {
-          callId: String(message.toolCallId ?? ''),
-          name: String(message.toolName ?? ''),
-          isError: message.isError === true,
-          resultSummary: text.length > 300 ? `${text.slice(0, 300)}…` : text,
-        },
-      });
-    } else if (message.role === 'system') {
-      result.push({ id: entry.id, role: 'notice', at, text: '系统消息（工具装载/提示变化）' });
-    }
-    // 未知 role 跳过
-  }
-  return result;
-}
-
-export function toAssistantMessageDto(message: unknown, id: string): AgentMessageDto {
-  const msg = (message && typeof message === 'object' ? message : {}) as {
-    content?: unknown;
-    stopReason?: string;
-    model?: string;
-    usage?: unknown;
-  };
-  const blocks = Array.isArray(msg.content) ? msg.content : [];
-  const textParts: string[] = [];
-  const toolCalls: AgentMessageDto['toolCalls'] = [];
-  for (const block of blocks) {
-    if (!block || typeof block !== 'object') continue;
-    const typed = block as { type?: string; text?: string; id?: string; name?: string; arguments?: unknown };
-    if (typed.type === 'text' && typeof typed.text === 'string') {
-      textParts.push(typed.text);
-    } else if (typed.type === 'toolCall') {
-      toolCalls.push({
-        id: String(typed.id ?? ''),
-        name: String(typed.name ?? ''),
-        argsSummary: JSON.stringify(typed.arguments ?? {}).slice(0, 200),
-      });
-    }
-  }
-  const error = msg.stopReason === 'error'
-    ? { code: 'model_request_failed', message: textParts.join('').slice(0, 300) || '模型返回 error' }
-    : undefined;
-  return {
-    // RPC Message 没有持久 entry id；live id 仅用于本轮UI，run_end后由JSONL权威历史替换。
-    id,
-    role: 'assistant',
-    at: new Date().toISOString(),
-    ...(textParts.length > 0 ? { text: textParts.join('') } : {}),
-    ...(toolCalls ? { toolCalls } : {}),
-    ...(error ? { error } : {}),
-    ...(msg.model ? { model: msg.model } : {}),
-  };
-}
 
 function summarizeToolArgs(event: unknown): string {
   const args = (event as { args?: unknown }).args;

@@ -74,6 +74,8 @@ export interface RpcSpawnOptions {
   extensionPath?: string;
   additionalExtensionPaths?: string[];
   allowExternalPluginTools?: boolean;
+  /** Interactive Work sessions use Pi's native tools and resource discovery. */
+  nativeWork?: boolean;
   additionalSkillPaths?: string[];
   additionalPromptPaths?: string[];
   additionalThemePaths?: string[];
@@ -199,7 +201,14 @@ export class PiRpcProcess extends EventEmitter {
     if (this.child) throw new PiRpcError('already_started', '进程已启动');
 
     const args: string[] = [this.options.piCliPath, '--mode', 'rpc'];
-    args.push(
+    if (this.options.nativeWork && this.options.buildMode) {
+      throw new PiRpcError('invalid_runtime_mode', '原生 Work 与构建模式不能同时启用');
+    }
+    if (this.options.nativeWork) {
+      // Workspace is cwd, not a filesystem boundary. Trust project resources
+      // just as an explicitly approved local Pi session does.
+      args.push('--approve');
+    } else args.push(
       '--no-extensions',
       '--no-skills',
       '--no-prompt-templates',
@@ -223,7 +232,7 @@ export class PiRpcProcess extends EventEmitter {
         throw new PiRpcError('build_tools_empty', '构建模式必须提供非空 --tools 白名单');
       }
       args.push('--tools', this.options.tools.join(','));
-    } else if (this.options.tools.length > 0 && !this.options.allowExternalPluginTools) {
+    } else if (!this.options.nativeWork && this.options.tools.length > 0 && !this.options.allowExternalPluginTools) {
       args.push('--tools', this.options.tools.join(','));
     }
     for (const extension of new Set([this.options.extensionPath, ...(this.options.additionalExtensionPaths ?? [])])) {
@@ -446,7 +455,8 @@ export class PiRpcProcess extends EventEmitter {
     }
     // 自触发轮次跟踪（构建模式）：无宿主 run 时看到轮次活动即标记一轮开始。
     if (this.options.selfTriggeredRounds && (!run || run.finished)) {
-      if ((event.type === 'message_update' || event.type === 'tool_execution_start' || event.type === 'message_end')
+      if ((event.type === 'message_update' || event.type === 'tool_execution_start'
+        || (event.type === 'message_end' && (event.message as { role?: string } | undefined)?.role === 'assistant'))
         && !this.selfRoundActive) {
         this.selfRoundActive = true;
         this.selfRoundSeq += 1;
@@ -477,8 +487,8 @@ export class PiRpcProcess extends EventEmitter {
     }
     if (event.type === 'message_update') {
       const assistantEvent = event.assistantMessageEvent as { type?: string; delta?: string } | undefined;
-      if (assistantEvent?.type === 'text_delta' && typeof assistantEvent.delta === 'string') {
-        this.emit('text_delta', assistantEvent.delta);
+      if ((assistantEvent?.type === 'text_delta' || assistantEvent?.type === 'thinking_delta') && typeof assistantEvent.delta === 'string') {
+        this.emit(assistantEvent.type, assistantEvent.delta);
       }
       return;
     }
@@ -865,6 +875,7 @@ export function buildPiProcessEnv(input: {
   runToken: string;
   apiKey?: string;
   preserveUploadedImages?: boolean;
+  nativeWork?: boolean;
 }): NodeJS.ProcessEnv {
   const dangerous = new Set([
     'NODE_OPTIONS',
@@ -875,7 +886,7 @@ export function buildPiProcessEnv(input: {
   ]);
   const feishuSensitive = /^FEISHU_SYNC_AGENT_/;
   let env: NodeJS.ProcessEnv;
-  if (input.mode === 'app-llm') {
+  if (input.mode === 'app-llm' && !input.nativeWork) {
     const whitelist = new Set([
       'PATH', 'Path', 'HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA',
       'TMPDIR', 'TEMP', 'TMP', 'LANG', 'LC_ALL', 'SystemRoot', 'SystemDrive',
@@ -922,7 +933,10 @@ export function buildPiProcessEnv(input: {
       fs.renameSync(temporary, settingsFile);
     }
   }
-  env.PI_OFFLINE = '1';
+  if (input.nativeWork) {
+    delete env.PI_OFFLINE;
+    env.FEISHU_SYNC_AGENT_WORK_MODE = 'native';
+  } else env.PI_OFFLINE = '1';
   env.PI_SKIP_VERSION_CHECK = '1';
   env.PI_TELEMETRY = '0';
   env.FEISHU_SYNC_AGENT_URL = input.agentUrl;

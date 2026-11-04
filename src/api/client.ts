@@ -1580,11 +1580,11 @@ export async function getAgentTaskMessages(id: string): Promise<AgentMessageDto[
 
 /**
  * POST /api/agent/sessions/:id/mode —— 模式切换。
- * 切到 Work 必须带 workspaceId + confirm:'WORK'（§7.6）。
+ * 切到 Work 需 confirm:'WORK'；workspaceId 可选，仅指定起始目录。
  */
 export async function switchAgentSessionMode(
   id: string,
-  body: { mode: 'discuss' } | { mode: 'work'; workspaceId: string; confirm: 'WORK' },
+  body: { mode: 'discuss' } | { mode: 'work'; workspaceId?: string; confirm: 'WORK' },
 ): Promise<AgentSessionDto> {
   return request<AgentSessionDto>(`/api/agent/sessions/${encodeURIComponent(id)}/mode`, {
     method: 'POST',

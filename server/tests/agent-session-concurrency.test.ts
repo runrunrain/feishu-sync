@@ -312,24 +312,52 @@ describe('R04：steer/followUp 投递同一活跃 RPC 运行', () => {
   });
 });
 
-describe('R01：spawn前复用完整运行根策略', () => {
-  it('旧Work绑定在npm包内：resolve后立即拒绝，不spawn、不发能力令牌', async () => {
-    const { service, store, pool, config } = makeService();
-    const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'spawn-npm-'));
-    temporaryRoots.push(fixtureRoot);
-    const fixture = makeRuntimeInstallation(fixtureRoot);
-    config.agent.runtime = { nodePath: fixture.nodePath };
-    config.agent.workspaces = [{ id: 'old-npm', name: '旧授权', path: fixture.npmRoot, createdAt: new Date().toISOString() }];
-    createSession(store, 'old-work');
-    store.updateAgentSession('old-work', { mode: 'work', workspaceId: 'old-npm' });
-    const ended = captureRunEnd(service, 'old-work');
-    await service.sendMessage(store, 'old-work', { text: '不能改写运行代码' });
-    const event = await ended;
-    expect(event.outcome).toBe('failed');
-    expect(event.error).toMatchObject({ code: 'workspace_path_forbidden' });
-    expect(pool.runningCount()).toBe(0);
-    expect(pool.loadCount()).toBe(0);
-    expect(fs.existsSync(fixture.marker)).toBe(false);
+describe('原生 Work 后台续跑', () => {
+  it('插件续跑先于原 prompt 收尾时保留新轮次、转发工具并正常结束', async () => {
+    const { service, store, pool } = makeService();
+    createSession(store, 'native');
+    store.updateAgentSession('native', { mode: 'work' });
+    const fake = new FakeRpcProcess();
+    pool.register('native', fake as unknown as PiRpcProcess, 'session');
+    let releaseState!: (value: unknown) => void;
+    fake.stateGate = new Promise((resolve) => { releaseState = resolve; });
+    await service.sendMessage(store, 'native', { text: '后台工作' });
+    await flush();
+    fake.resolvePrompt({ outcome: 'completed' });
+    await flush();
+    fake.emit('round_started', { roundId: 'self_1' });
+    const nativeId = service.currentRunId('native');
+    expect(nativeId).toMatch(/^r_native_/);
+    releaseState({ success: true, data: {} });
+    await flush();
+    expect(service.currentRunId('native')).toBe(nativeId);
+    fake.emit('text_delta', '后台结果');
+    fake.emit('tool_execution_start', { toolCallId: 'native-call', toolName: 'read', args: { path: '/outside' } });
+    expect(service.runOfToolCall('native', 'native-call')).toBe(nativeId);
+    fake.emit('round_settled', { roundId: 'self_1', aborted: false });
+    expect(service.isRunning('native')).toBe(false);
+    expect(service.sseSince('native', null).events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ event: 'text_delta', data: { runId: nativeId, delta: '后台结果' } }),
+      expect.objectContaining({ event: 'run_end', data: { runId: nativeId, outcome: 'completed' } }),
+    ]));
+    await pool.closeAll();
+  });
+
+  it('后台续跑意外退出时收尾，避免会话永久显示生成中', async () => {
+    const { service, store, pool } = makeService();
+    createSession(store, 'native-exit');
+    store.updateAgentSession('native-exit', { mode: 'work' });
+    const fake = new FakeRpcProcess();
+    pool.register('native-exit', fake as unknown as PiRpcProcess, 'session');
+    await service.sendMessage(store, 'native-exit', { text: '开始' });
+    await flush();
+    fake.resolvePrompt({ outcome: 'completed' });
+    await flush();
+    fake.emit('round_started', { roundId: 'self_1' });
+    expect(service.isRunning('native-exit')).toBe(true);
+    fake.emit('exit', { code: 1 });
+    expect(service.isRunning('native-exit')).toBe(false);
+    expect(service.get(store, null, 'native-exit')?.lastError?.code).toBe('pi_process_exited');
     await pool.closeAll();
   });
 });
@@ -418,4 +446,21 @@ describe('R06：busy/idle 生命周期', () => {
       vi.useRealTimers();
     }
   });
+});
+
+it('forwards Pi thinking separately, flushes it in order, and retains it in the final message', async () => {
+  const { service, store, pool } = makeService();
+  createSession(store, 'thinking');
+  const fake = new FakeRpcProcess(); pool.register('thinking', fake as unknown as PiRpcProcess, 'session');
+  try {
+    await service.sendMessage(store, 'thinking', { text: '检查' }); await flush();
+    fake.emit('thinking_delta', '先'); fake.emit('thinking_delta', '检查');
+    fake.emit('text_delta', '结论');
+    fake.emit('assistant_message_end', { role: 'assistant', content: [{ type: 'thinking', thinking: '先检查' }, { type: 'text', text: '结论' }] });
+    const events = service.sseSince('thinking', null).events.filter((event) => ['thinking_delta', 'text_delta', 'message_end'].includes(event.event));
+    expect(events.map((event) => event.event)).toEqual(['thinking_delta', 'text_delta', 'message_end']);
+    expect(events[0].data).toMatchObject({ delta: '先检查' });
+    expect(events[2].data).toMatchObject({ message: { thinking: '先检查', text: '结论' } });
+    fake.resolvePrompt({ outcome: 'completed' }); await flush();
+  } finally { await pool.closeAll(); }
 });

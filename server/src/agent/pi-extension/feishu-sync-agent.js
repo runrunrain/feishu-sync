@@ -66,6 +66,7 @@ const AGENT_DIR_AT_LOAD = process.env.PI_CODING_AGENT_DIR || '';
 
 /** 应用 task 工具族（tool-specs.ts TASK_TOOL_NAMES）：构建模式绝不由本扩展注册。 */
 const APP_TASK_TOOL_FAMILY = new Set(['task_submit', 'task_query', 'task_resume', 'task_cancel']);
+const NATIVE_WORK = process.env.FEISHU_SYNC_AGENT_WORK_MODE === 'native';
 
 // Pi's authHeader adds Authorization but also leaves apiKey set, causing its
 // Anthropic adapter to send x-api-key as well. Delegate to that same adapter
@@ -306,7 +307,7 @@ export default async function feishuSyncAgentExtension(/** @type {ExtensionAPI} 
   for (const spec of specs) {
     // 构建模式剔除应用 task 工具族：构建 Leader 由 amagi-core 注册同名任务工具，
     // 双方同时注册 pi 以 error 诊断退出（设计 §1.2 工具重名）。
-    if (buildSpec && APP_TASK_TOOL_FAMILY.has(spec.name)) {
+    if ((buildSpec || NATIVE_WORK) && APP_TASK_TOOL_FAMILY.has(spec.name)) {
       log(`build mode: 跳过应用 task 工具 ${spec.name}（同名任务工具由 amagi-core 提供）`);
       continue;
     }
@@ -339,7 +340,7 @@ export default async function feishuSyncAgentExtension(/** @type {ExtensionAPI} 
       // 构建模式：激活集合=冻结白名单（未注册名被 pi 忽略）；
       // 与 tool_call 放行集合同源，绝不沿用外部插件全量放行。
       pi.setActiveTools(buildSpec.tools);
-    } else if (process.env.FEISHU_SYNC_AGENT_EXTERNAL_PLUGINS === '1') {
+    } else if (!NATIVE_WORK && process.env.FEISHU_SYNC_AGENT_EXTERNAL_PLUGINS === '1') {
       pi.setActiveTools([...new Set([...selfTools, ...external()])]);
     }
   });
@@ -396,6 +397,9 @@ export default async function feishuSyncAgentExtension(/** @type {ExtensionAPI} 
       }
       return undefined;
     }
+    // Work adds application tools to Pi; Pi owns its native/plugin/MCP tools.
+    // Do not freeze their names here, so newer Pi/plugin versions keep working.
+    if (NATIVE_WORK) return undefined;
     if (typeof name === 'string' && (selfTools.has(name) || external().has(name))) return undefined;
     return { block: true, reason: `工具 ${name} 未由应用或已启用插件提供` };
   });

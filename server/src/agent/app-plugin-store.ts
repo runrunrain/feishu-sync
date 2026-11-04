@@ -12,6 +12,8 @@ export interface AppPluginSnapshot { revision: string; path: string; extensionPa
 const SCOPES = new Set(['discuss', 'work', 'build']);
 const REGISTRY = 'agent/plugins/registry.json';
 const MAX_CONTENT = 64 * 1024;
+const NATIVE_WORK_CONTEXT = '你是 Pi 通用工作助手。使用 Pi 原生文件读写、编辑、命令、技能、插件与 MCP 能力完成用户任务。Workspace 是起始目录和会话分组，可按任务需要操作其他目录；实际访问遵循当前系统用户权限。飞书同步、知识库检索与应用操作是附加工具，按需要调用。以工具实际结果确认完成，不虚构文件变化。';
+const SCOPED_WORK_CONTEXT = '你是本地知识工作助手。使用应用工具读写绑定的 Workspace，以工具实际结果确认完成。';
 
 export class AppPluginStore {
   constructor(readonly dataRoot: string, private assets = readAgentPromptAssets, private nativeResources?: () => { sources: string[]; revision: string; external: boolean; skills?: string[]; prompts?: string[]; themes?: string[] }) {}
@@ -25,7 +27,7 @@ export class AppPluginStore {
       plugin('discuss-context', '知识库对话上下文', '设计讨论、检索与回答方式', ['discuss'],
         '你是知识库设计讨论助手。优先检索标准知识库，按需要核对原始文档。区分已有事实、推断和建议；来源不足时直接说明，保留具体问题。来源追溯使用文档标题，避免在自然回答中堆放内部标识。对话模式只读，不声称已修改任何文件。'),
       plugin('work-context', 'Work 工作上下文', '本地工作方式与写入说明', ['work'],
-        '你是本地知识工作助手。先检索知识库与相关工作文件，再完成用户要求的修改。原始知识库和标准知识库只读，写入仅限当前授权Workspace。以工具实际结果确认完成，不虚构文件变化。当前应用不提供shell工具。'),
+        NATIVE_WORK_CONTEXT),
       plugin('kb-build-rules', '标准库构建规则', '源读取、主题组织与构建流程', ['build'], assets.buildRules),
       plugin('kb-style', '标准库文风', '自然完整的知识表述、排版与来源纪律', ['build'], assets.styleGuide),
       // 任务编排默认启用；启用后向 Discuss/Work 会话注入
@@ -173,12 +175,14 @@ export class AppPluginStore {
     };
   }
 
-  snapshot(scope: AgentPluginScope, options: { includeNative?: boolean } = {}): AppPluginSnapshot {
+  snapshot(scope: AgentPluginScope, options: { includeNative?: boolean; nativeWork?: boolean } = {}): AppPluginSnapshot {
     const extensionPath = piContextExtensionPath();
     if (!extensionPath) throw new ToolError('plugin_assets_missing', 'Pi上下文扩展缺失，请重新构建应用', 503);
     const { plugins } = this.list();
     const native = options.includeNative === false ? undefined : this.nativeResources?.();
-    const content = JSON.stringify({ schemaVersion: 1, scope, nativeRevision: native?.revision, plugins: plugins.filter((p) => p.enabled && p.scopes.includes(scope)) });
+    const selected = plugins.filter((p) => p.enabled && p.scopes.includes(scope) && !(options.nativeWork && p.id === 'orchestration'))
+      .map((p) => !options.nativeWork && p.id === 'work-context' && p.content === NATIVE_WORK_CONTEXT ? { ...p, content: SCOPED_WORK_CONTEXT } : p);
+    const content = JSON.stringify({ schemaVersion: 1, scope, nativeRevision: native?.revision, plugins: selected });
     const revision = crypto.createHash('sha256').update(content).digest('hex');
     resolveInside(this.dataRoot, 'agent/plugins/snapshots', 'mkdir');
     const target = resolveInside(this.dataRoot, `agent/plugins/snapshots/${revision}.json`, 'write');

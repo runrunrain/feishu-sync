@@ -23,6 +23,7 @@
  */
 
 import fs from 'node:fs';
+import { runtimeExecutable } from '../modules/runtime-executable.js';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -134,7 +135,7 @@ function runtimeCommand(): { command: string; env: Record<string, string> } {
   // 与 kb-mcp 推荐配置一致）；开发/standalone：当前 Node。
   const isElectron = Boolean(process.versions.electron);
   return {
-    command: process.execPath,
+    command: runtimeExecutable(),
     env: isElectron ? { ELECTRON_RUN_AS_NODE: '1' } : {},
   };
 }

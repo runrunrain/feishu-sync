@@ -875,6 +875,8 @@ export interface AgentAttachmentDto {
 }
 
 export interface AgentMessageDto {
+  /** Native Pi thinking blocks, retained separately from assistant prose. */
+  thinking?: string;
   id: string;
   role: 'user' | 'assistant' | 'tool' | 'notice';
   at: string;

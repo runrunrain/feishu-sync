@@ -145,8 +145,8 @@ export const AgentComposer = forwardRef<AgentComposerHandle, AgentComposerProps>
     const el = textareaRef.current;
     if (!el) return;
     el.style.height = 'auto';
-    el.style.height = `${Math.min(Math.max(el.scrollHeight, 56), 220)}px`;
-  }, [text]);
+    el.style.height = `${Math.min(Math.max(el.scrollHeight, session?.mode === 'work' ? 81 : 56), 220)}px`;
+  }, [text, session?.mode]);
 
   const doSend = async (delivery?: 'steer' | 'followUp') => {
     if (!canSend) return;
@@ -163,7 +163,7 @@ export const AgentComposer = forwardRef<AgentComposerHandle, AgentComposerProps>
 
   return (
     <div className="min-w-0 shrink-0 border-t border-line bg-card-bg/70 px-3 py-3 sm:px-6 lg:px-8" data-testid="agent-composer">
-      <div className="w-full min-w-0 max-w-3xl mx-auto">
+      <div className="agent-composer-column w-full min-w-0 max-w-3xl mx-auto">
         {disabled ? (
           <div
             className="mb-2 flex flex-wrap items-start gap-2 px-3 py-2 rounded-md border border-[rgba(180,83,9,0.3)] bg-[rgba(180,83,9,0.05)]"
@@ -192,7 +192,7 @@ export const AgentComposer = forwardRef<AgentComposerHandle, AgentComposerProps>
           </div>
         ) : null}
 
-        <div className="rounded-xl border border-line bg-card-bg p-2 focus-within:border-seal/50">
+        <div className="agent-input-card rounded-xl border border-line bg-card-bg p-2 focus-within:border-seal/50">
           <input ref={fileInputRef} type="file" multiple className="hidden" aria-label="选择图片或文件"
             onChange={(event) => { addFiles(Array.from(event.target.files ?? [])); event.target.value = ''; }} />
           {draft.files.length ? <div className="flex gap-2 overflow-x-auto scrollbar-thin px-1 pb-2" aria-label="待发送附件">
@@ -232,13 +232,13 @@ export const AgentComposer = forwardRef<AgentComposerHandle, AgentComposerProps>
                 ? '输入不可用'
                 : running
                   ? session?.backend === 'claude-code' ? 'Claude Code 正在生成，请等待本轮结束…' : 'Agent 正在生成——可插话或排队下一条…'
-                  : '描述你的设计问题，Enter 发送，Shift+Enter 换行'
+                  : session?.mode === 'work' ? '描述要完成的工作，Enter 发送，Shift+Enter 换行' : '描述你的设计问题，Enter 发送，Shift+Enter 换行'
             }
             className="block w-full resize-none border-0 bg-transparent px-2 py-2 text-sm text-ink placeholder:text-ink-faint focus:outline-none focus:border-seal/50 disabled:bg-paper-2 disabled:text-ink-faint scrollbar-thin"
             aria-label="消息输入"
             data-testid="agent-composer-input"
           />
-          <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+          <div className="agent-input-foot flex flex-wrap items-center justify-between gap-2 pt-1">
             <div className="flex flex-wrap items-center gap-2">
               <button type="button" aria-label="添加图片或文件" title="添加图片或文件，也可以拖拽或粘贴图片" disabled={disabled || sending}
                 className="rounded-full p-1.5 text-ink-soft hover:bg-paper disabled:opacity-40" onClick={() => fileInputRef.current?.click()}><Plus className="h-4 w-4" /></button>

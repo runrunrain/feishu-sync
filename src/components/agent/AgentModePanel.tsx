@@ -1,10 +1,7 @@
 /**
  * AgentModePanel —— 模式与权限面板（AgentView 右栏，§11.3）
  *
- * 当前模式徽标 + 能力说明；Work 会话展示 Workspace 信息与写入记录
- * （§7.4 已知剩余风险的可见性：用户对 Workspace 的授权即对风险的接受）。
- * 切换到 Work：Modal 选择有效 Workspace + 风险文案 + confirm:'WORK'。
- * 不把 cwd / workspace 称为「沙箱」；Work 无 shell 如实说明。
+ * Pi Work uses native tools; a Workspace selects cwd and groups sessions.
  */
 
 import { useEffect, useMemo, useState } from 'react';
@@ -27,7 +24,7 @@ interface AgentModePanelProps {
   session: AgentSessionDto | null;
   busy: boolean;
   onSwitchMode: (
-    body: { mode: 'discuss' } | { mode: 'work'; workspaceId: string; confirm: 'WORK' },
+    body: { mode: 'discuss' } | { mode: 'work'; workspaceId?: string; confirm: 'WORK' },
   ) => Promise<boolean>;
   writeRecords: WriteRecord[];
   onWorkspacesChanged?: () => void;
@@ -47,6 +44,7 @@ export function AgentModePanel({ session, busy, onSwitchMode, onWorkspacesChange
   const [addBusy, setAddBusy] = useState(false);
 
   const isWork = session?.mode === 'work';
+  const nativeWork = session?.backend !== 'claude-code';
   const running = busy || session?.state === 'streaming' || session?.state === 'starting';
 
   const loadWorkspaces = async () => {
@@ -72,7 +70,7 @@ export function AgentModePanel({ session, busy, onSwitchMode, onWorkspacesChange
   useEffect(() => {
     if (!modalOpen) return;
     void loadWorkspaces().then((list) => {
-      if (list.length > 0 && !list.some((w) => w.id === selectedWs)) {
+      if (!nativeWork && list.length > 0 && !list.some((w) => w.id === selectedWs)) {
         setSelectedWs(list[0].id);
       }
     });
@@ -80,14 +78,14 @@ export function AgentModePanel({ session, busy, onSwitchMode, onWorkspacesChange
   }, [modalOpen]);
 
   const validSelection = useMemo(
-    () => workspaces?.some((w) => w.id === selectedWs) ?? false,
-    [workspaces, selectedWs],
+    () => (nativeWork && !selectedWs) || (workspaces?.some((w) => w.id === selectedWs) ?? false),
+    [nativeWork, workspaces, selectedWs],
   );
 
   const confirmSwitchToWork = async () => {
     if (!validSelection) return;
     setSwitching(true);
-    const ok = await onSwitchMode({ mode: 'work', workspaceId: selectedWs, confirm: 'WORK' });
+    const ok = await onSwitchMode({ mode: 'work', ...(selectedWs ? { workspaceId: selectedWs } : {}), confirm: 'WORK' });
     setSwitching(false);
     if (ok) {
       setModalOpen(false);
@@ -153,7 +151,7 @@ export function AgentModePanel({ session, busy, onSwitchMode, onWorkspacesChange
   return (
     <>
       <button type="button" disabled={!session || running || switching} aria-label="切换会话模式"
-        title={isWork ? '切换到 Chat（只读）' : '切换到 Work（可写工作区）'}
+        title={isWork ? '切换到 Chat' : nativeWork ? '切换到 Work（Pi 完整能力）' : '切换到 Work（可写工作区）'}
         className="inline-flex items-center gap-1 px-2 py-1 rounded border border-line text-xs text-ink-soft hover:text-seal hover:border-seal/50 disabled:opacity-50"
         onClick={() => { if (isWork) void switchBackToDiscuss(); else if (session?.workspace) { setSwitching(true); void onSwitchMode({ mode: 'work', workspaceId: session.workspace.id, confirm: 'WORK' }).then((ok) => { if (!ok) toast.push({ type: 'error', message: '切换 Work 失败，请重试' }); }).finally(() => setSwitching(false)); } else setModalOpen(true); }}>
         {isWork ? <Hammer className="w-3 h-3" /> : <MessageCircle className="w-3 h-3" />} {isWork ? 'Work' : 'Chat'}
@@ -166,15 +164,13 @@ export function AgentModePanel({ session, busy, onSwitchMode, onWorkspacesChange
         contentClassName="max-w-lg"
       >
         <div className="space-y-4">
-          <div className="px-3 py-2.5 rounded-md border border-[rgba(180,83,9,0.35)] bg-[rgba(180,83,9,0.05)] text-xs leading-relaxed text-ink-soft">
-            Agent 将可以在所选目录内<b className="text-ink">创建、修改文件</b>。它
-            <b className="text-ink">不能执行任何命令</b>（不提供 shell）；原始库与标准库对它只读。
-            请只授权你接受其被修改的工作目录。
+          <div className="text-xs leading-relaxed text-ink-soft">
+            {nativeWork ? '使用 Pi 的文件、命令、技能、插件与 MCP 能力，可跨目录操作。' : '使用应用工具读写所选工作目录。'}
           </div>
 
           <div>
             <div className="flex items-center justify-between mb-1.5">
-              <span className="text-xs font-medium text-ink">选择 Workspace</span>
+              <span className="text-xs font-medium text-ink">起始目录</span>
               <button
                 type="button"
                 onClick={() => setAdding((v) => !v)}
@@ -226,6 +222,7 @@ export function AgentModePanel({ session, busy, onSwitchMode, onWorkspacesChange
               </div>
             ) : null}
 
+            {nativeWork && <label className="flex items-center gap-2 px-3 py-2 mb-1.5 rounded-md border border-line text-xs cursor-pointer"><input type="radio" name="workspace" checked={!selectedWs} onChange={() => setSelectedWs('')} />用户主目录（默认）</label>}
             {wsLoading ? (
               <p className="flex items-center gap-2 text-xs text-ink-faint py-3">
                 <Loader2 className="w-3.5 h-3.5 animate-spin" /> 正在读取 Workspace…
@@ -270,7 +267,7 @@ export function AgentModePanel({ session, busy, onSwitchMode, onWorkspacesChange
               </ul>
             ) : (
               <p className="text-xs text-ink-faint py-2">
-                还没有 Workspace。点击「新增 Workspace」授权一个工作目录（桌面端可用目录选择器）。
+                可添加常用目录，按工作区组织会话。
               </p>
             )}
           </div>
@@ -280,7 +277,7 @@ export function AgentModePanel({ session, busy, onSwitchMode, onWorkspacesChange
               取消
             </Button>
             <Button size="sm" variant="primary" onClick={confirmSwitchToWork} loading={switching} disabled={!validSelection}>
-              确认切换（授权写入）
+              启用 Work
             </Button>
           </div>
         </div>

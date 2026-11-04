@@ -42,6 +42,7 @@ import type {
   AgentTaskNotice,
 } from '../types/agent';
 import { SseConnection, type SseStatus } from '../utils/sseStream';
+import { applyDraftUpdates, type DraftUpdate } from '../utils/agentStreamBatch';
 
 /** 流式中的工具行（SSE tool 事件即时态；message_end 后由权威消息接管）。 */
 export interface LiveToolEvent {
@@ -55,6 +56,7 @@ export interface LiveToolEvent {
 
 /** 当前 run 的流式草稿（runId 维度；message_end/run_end 时落地）。 */
 export interface RunDraft {
+  thinking?: string;
   runId: string;
   text: string;
   tools: LiveToolEvent[];
@@ -166,7 +168,7 @@ export interface UseAgentSessionsResult {
   send: (text: string, delivery?: 'steer' | 'followUp', attachments?: AgentAttachmentDto[]) => Promise<boolean>;
   stop: () => Promise<void>;
   switchMode: (
-    body: { mode: 'discuss' } | { mode: 'work'; workspaceId: string; confirm: 'WORK' },
+    body: { mode: 'discuss' } | { mode: 'work'; workspaceId?: string; confirm: 'WORK' },
   ) => Promise<boolean>;
   writeRecords: WriteRecord[];
 }
@@ -230,6 +232,16 @@ export function mergeMessageIntoList(
   return next;
 }
 
+/** Reuse unchanged rows after a history refresh so completed Markdown stays mounted and memoized. */
+export function reconcileMessageSnapshot(previous: AgentMessageDto[], incoming: AgentMessageDto[]): AgentMessageDto[] {
+  const byId = new Map(previous.map((message) => [message.id, message]));
+  return incoming.map((message) => {
+    const old = byId.get(message.id);
+    return old && old.role === message.role && old.at === message.at && old.text === message.text && old.thinking === message.thinking && old.model === message.model
+      && JSON.stringify([old.toolCalls, old.tool, old.error, old.attachments]) === JSON.stringify([message.toolCalls, message.tool, message.error, message.attachments]) ? old : message;
+  });
+}
+
 /** argsSummary/resultSummary 内提取首个路径样 token（server 生成，含路径）。导出供单测。 */
 export function extractPath(summary: string): string {
   // 前导允许空白/引号/全角冒号等包围字符，兼容「路径：/x」与 "path": "/x" 摘要风格。
@@ -257,6 +269,20 @@ export function useAgentSessions(active: boolean): UseAgentSessionsResult {
 
   const activeIdRef = useRef<string | null>(null);
   const connectionRef = useRef<SseConnection | null>(null);
+  const draftUpdates = useRef<DraftUpdate[]>([]);
+  const draftTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const completedToolCalls = useRef(new Set<string>());
+  const flushDraft = useCallback(() => {
+    if (draftTimer.current) clearTimeout(draftTimer.current);
+    draftTimer.current = null;
+    const updates = draftUpdates.current; draftUpdates.current = [];
+    if (updates.length) setDraft((current) => applyDraftUpdates(current, updates));
+  }, []);
+  const clearDraftUpdates = useCallback(() => {
+    if (draftTimer.current) clearTimeout(draftTimer.current);
+    draftTimer.current = null; draftUpdates.current = [];
+    completedToolCalls.current.clear();
+  }, []);
   /** 任务列表镜像：SSE 回调内读取前值推导提示行，避免在 setState 更新器里做副作用。 */
   const tasksRef = useRef<AgentTaskDto[]>([]);
   /** 乐观 user 消息的本地 id 前缀（权威数据落地时合并）。 */
@@ -302,7 +328,7 @@ export function useAgentSessions(active: boolean): UseAgentSessionsResult {
     try {
       const list = await getAgentSessionMessages(sessionId);
       if (activeIdRef.current !== sessionId) return;
-      setMessages(list);
+      setMessages((previous) => reconcileMessageSnapshot(previous, list));
     } catch {
       // 权威拉取失败：保留现有内容，SSE/重试会再给机会。
     }
@@ -388,6 +414,7 @@ export function useAgentSessions(active: boolean): UseAgentSessionsResult {
 
     return () => {
       disposed = true;
+      clearDraftUpdates();
       connection.stop();
       if (connectionRef.current === connection) connectionRef.current = null;
     };
@@ -411,42 +438,22 @@ export function useAgentSessions(active: boolean): UseAgentSessionsResult {
 
   const handleSseEvent = useCallback(
     (sessionId: string, event: string, payload: any) => {
+      if (event === 'text_delta' || event === 'thinking_delta' || event === 'tool') {
+        if (event === 'tool' && completedToolCalls.current.has(String(payload?.callId ?? ''))) return;
+        draftUpdates.current.push({ event, payload: payload ?? {} });
+        if (!draftTimer.current) draftTimer.current = setTimeout(flushDraft, 50);
+        return;
+      }
+      // Final messages, approvals and terminal state must observe all preceding deltas immediately.
+      flushDraft();
       switch (event) {
         case 'session_state': {
           if (payload && typeof payload === 'object') patchSession(payload as AgentSessionDto);
           break;
         }
         case 'run_start': {
+          completedToolCalls.current.clear();
           setDraft({ runId: String(payload?.runId ?? ''), text: '', tools: [] });
-          break;
-        }
-        case 'text_delta': {
-          const delta = typeof payload?.delta === 'string' ? payload.delta : '';
-          setDraft((cur) =>
-            cur && cur.runId === String(payload?.runId ?? '')
-              ? { ...cur, text: cur.text + delta }
-              : cur,
-          );
-          break;
-        }
-        case 'tool': {
-          const callId = String(payload?.callId ?? '');
-          setDraft((cur) => {
-            if (!cur || cur.runId !== String(payload?.runId ?? '')) return cur;
-            const tools = [...cur.tools];
-            const idx = tools.findIndex((t) => t.callId === callId);
-            const row: LiveToolEvent = {
-              callId,
-              name: String(payload?.toolName ?? ''),
-              argsSummary: String(payload?.argsSummary ?? ''),
-              phase: payload?.phase === 'end' ? 'end' : 'start',
-              resultSummary: payload?.resultSummary != null ? String(payload.resultSummary) : undefined,
-              isError: payload?.isError === true,
-            };
-            if (idx === -1) tools.push(row);
-            else tools[idx] = { ...row, argsSummary: row.argsSummary || tools[idx].argsSummary };
-            return { ...cur, tools };
-          });
           break;
         }
         case 'message_end': {
@@ -461,7 +468,11 @@ export function useAgentSessions(active: boolean): UseAgentSessionsResult {
           setMessages((prev) => mergeMessageIntoList(prev, message, optimisticPrefix));
           if (message.role === 'assistant') {
             // 一个run可以有多轮工具调用；message_end只结束当前消息，不能丢掉后续流的run锚点。
-            setDraft((cur) => (cur && cur.runId === String(payload?.runId ?? '') ? { ...cur, text: '' } : cur));
+            setDraft((cur) => (cur && cur.runId === String(payload?.runId ?? '') ? { ...cur, text: '', thinking: '' } : cur));
+          }
+          if (message.role === 'tool' && message.tool) {
+            completedToolCalls.current.add(message.tool.callId);
+            setDraft((current) => current ? { ...current, tools: current.tools.filter((tool) => tool.callId !== message.tool!.callId) } : current);
           }
           break;
         }
@@ -517,7 +528,7 @@ export function useAgentSessions(active: boolean): UseAgentSessionsResult {
           break;
       }
     },
-    [patchSession, refetchMessages, applyTaskUpdate],
+    [patchSession, refetchMessages, applyTaskUpdate, flushDraft],
   );
 
   const decideApproval = useCallback(async (id: string, decision: 'approve' | 'reject'): Promise<boolean> => {
@@ -697,7 +708,7 @@ export function useAgentSessions(active: boolean): UseAgentSessionsResult {
   }, []);
 
   const switchMode = useCallback(
-    async (body: { mode: 'discuss' } | { mode: 'work'; workspaceId: string; confirm: 'WORK' }) => {
+    async (body: { mode: 'discuss' } | { mode: 'work'; workspaceId?: string; confirm: 'WORK' }) => {
       const id = activeIdRef.current;
       if (!id) return false;
       try {

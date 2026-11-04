@@ -194,6 +194,15 @@ describe('SessionService（内存 store）', () => {
     expect(back?.workspace?.id).toBe('ws_test1');
   });
 
+  it('Pi Work 无需绑定 Workspace；已有分组可以继续作为起始目录', async () => {
+    const { service, store } = makeService(makeConfig());
+    const session = service.create(store, {});
+    const work = await service.switchMode(store, session.id, { mode: 'work', confirm: 'WORK' });
+    expect(work).toMatchObject({ mode: 'work', workspace: null });
+    await service.switchMode(store, session.id, { mode: 'discuss' });
+    expect(service.get(store, makeConfig(), session.id)?.mode).toBe('discuss');
+  });
+
   it('Workspace 删除时绑定的 Work 会话自动切回 discuss', async () => {
     const { service, store } = makeService(makeConfig());
     const session = service.create(store, {});

@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { serverDistRoot } from '../agent/agent-assets.js';
 import type { KbMcpInfoDto } from '../types/agent-knowledge.js';
+import { runtimeExecutable } from '../modules/runtime-executable.js';
 
 /** The same executable and arguments are used for copying and installing MCP. */
 export function kbMcpInfo(kbRoot: string, rawCatalog?: string): KbMcpInfoDto {
@@ -10,7 +11,7 @@ export function kbMcpInfo(kbRoot: string, rawCatalog?: string): KbMcpInfoDto {
   const script = path.join(dist, 'mcp', 'kb-mcp.cjs');
   const env: Record<string, string> = process.versions.electron ? { ELECTRON_RUN_AS_NODE: '1' } : {};
   const entry = {
-    command: process.execPath,
+    command: runtimeExecutable(),
     args: [script, '--kb-root', kbRoot, ...(rawCatalog ? ['--raw-catalog', rawCatalog] : [])],
     ...(Object.keys(env).length ? { env } : {}),
   };

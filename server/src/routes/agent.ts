@@ -18,8 +18,7 @@ import type { SessionService } from '../agent/session-service.js';
 import { ToolError, type AgentToolService } from '../agent/agent-tool-service.js';
 import type { AgentProcessPool } from '../agent/agent-process-pool.js';
 import type { PiRuntimeResolver } from '../agent/runtime-resolver.js';
-import { validateWorkspacePath } from '../agent/path-guard.js';
-import { collectResolvedRuntimeProtectedRoots, collectStaticProtectedRoots } from '../agent/protected-roots.js';
+import { validateWorkingDirectory } from '../agent/path-guard.js';
 import { probeAvailableModels } from '../agent/runtime-probe.js';
 import type { LocalMapStore } from '../modules/local-map-store.js';
 import type { ConfigManager } from '../modules/config-manager.js';
@@ -279,9 +278,9 @@ export async function agentRoutes(deps: AgentRouteDeps): Promise<Hono> {
     }
   });
 
-  routes.get('/api/agent/sessions/:id/messages', (c) => {
+  routes.get('/api/agent/sessions/:id/messages', async (c) => {
     try {
-      const messages = sessionService.messages(localMapStore, c.req.param('id'));
+      const messages = await sessionService.messagesAsync(localMapStore, c.req.param('id'));
       return c.json({ messages });
     } catch (error) {
       return errorResponse(c, error);
@@ -478,26 +477,7 @@ export async function agentRoutes(deps: AgentRouteDeps): Promise<Hono> {
       }
       const config = await configManager.load();
       const candidate = String(body.path ?? '').trim();
-      // 受保护运行资源（F3-R01）：应用完整运行依赖树（server 源码/构建
-      // 产物、根目录与子包 node_modules、electron/、dist-electron、Electron
-      // 打包资源）、pi 凭据目录（~/.pi/agent + PI_CODING_AGENT_DIR）、外部
-      // Node 安装根与 pi 包根——ws_write 触达任一即可改写下次 spawn 的
-      // 代码/二进制。发现失败时静态保护根仍生效（resolver 的错误在 spawn
-      // 时另有明确报错）。
-      const protectedRoots: string[] = [...collectStaticProtectedRoots()];
-      try {
-        await resolver.resolveRuntime(config.agent);
-      } catch {
-        /* 主三重 guard + 静态保护根仍生效 */
-      }
-      protectedRoots.push(...collectResolvedRuntimeProtectedRoots(resolver), ...(deps.pluginProtectedRoots?.() ?? []));
-      const guards = {
-        knowledgeBaseRoot: config.knowledgeBaseRoot,
-        outputRoot: config.standardKb.outputRoot,
-        dataRoot: resolveDataRoot(),
-        protectedRoots,
-      };
-      const verdict = validateWorkspacePath(candidate, guards);
+      const verdict = validateWorkingDirectory(candidate);
       if (!verdict.ok) {
         return c.json({ error: verdict.code, message: verdict.message }, 400);
       }
