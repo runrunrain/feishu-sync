@@ -2410,9 +2410,18 @@ export class KbBuildService extends EventEmitter {
       // exception_to 把重述宿主/消费者文档加入重写面，去重到固定点。
       // 闭包文档的支撑源作为只读输入纳入单元，不能误计成云端新增。
       const baselineKnowledge = baseManifest ? new KbVersionStore(outputRoot).readKnowledgeManifest(baseManifest.releaseId) : null;
+      // In Pi builds an unchanged, explicitly selected source is available for
+      // review or image-evidence refresh, but it is not itself a content-change
+      // seed. Keep the real added/changed sources (and governance/migration
+      // seeds below) in the closure, including when a batch mixes both kinds.
+      const carryUnchangedSelected = entry.orchestrationMode === 'pi-amagi'
+        && entry.rebuildSelected && effectiveMode === 'incremental' && baseManifest !== null;
+      const impactTokens = new Set([...workset]
+        .filter(([, change]) => !carryUnchangedSelected || change !== 'rebuild')
+        .map(([token]) => token));
       const affectedDocs = effectiveMode === 'incremental' && baseManifest
         ? baseManifest.docs
-            .filter((doc) => doc.sources.some((token) => workset.has(token) || changeset.removed.includes(token)))
+            .filter((doc) => doc.sources.some((token) => impactTokens.has(token) || changeset.removed.includes(token)))
             .map((doc) => ({ path: doc.path, title: doc.title }))
         : [];
       const emptyClosure: ImpactClosureResult = {
@@ -2520,16 +2529,10 @@ export class KbBuildService extends EventEmitter {
 
       // D5（A 案 §7.2）：requiredRewrites = 种子 ∪ 语义闭包（旧 affectedDocs
       // 口径包含在种子内）；preservedDocs 相应收缩（闭包内文档不再 preserved）。
-      // 用户选中已发布且内容哈希未变的来源时，v2 可先对沿用候选做新的独立审查。
-      // 这不是源变化：没有治理决定/迁移种子时，不把技术性 rebuild 误作必改写。
+      // 用户选中已发布且内容哈希未变的来源时，不把技术性 rebuild
+      // 误作必改写；即使同批还有新增/变更源，也只重写真实影响闭包。
       // preservedDocs 仍按完整影响面计算，若审查发现问题，作者可以定向修订。
-      const reviewedCarryEligible = entry.orchestrationMode === 'pi-amagi'
-        && entry.rebuildSelected && effectiveMode === 'incremental' && baseManifest !== null
-        && workset.size > 0
-        && [...workset.values()].every((change) => change === 'rebuild')
-        && changeset.added.length === 0 && changeset.changed.length === 0 && changeset.removed.length === 0
-        && impactClosure.seeds.decisionChange.length === 0 && impactClosure.seeds.migration.length === 0;
-      buildState.requiredRewrites = new Set((resume?.requiredRewrites ?? (reviewedCarryEligible ? [] : impactClosure.requiredRewrites))
+      buildState.requiredRewrites = new Set((resume?.requiredRewrites ?? impactClosure.requiredRewrites)
         .filter((docPath) => fs.existsSync(path.join(stagingRootPath, 'docs', docPath))));
       if (resume) {
         buildState.preservedDocs = new Map(resume.preservedDocs);
@@ -2592,8 +2595,8 @@ export class KbBuildService extends EventEmitter {
           .map((doc) => doc.path);
         for (const docPath of rewritePaths) buildState.requiredRewrites?.add(docPath);
         this.emitLog(buildId, 'info', `识图证据已更新：${visionChangedTokens.length} 个来源涉及 ${rewritePaths.length} 篇正式文档，需重写后才可承接新描述`);
-      } else if (reviewedCarryEligible && !resume && buildState.requiredRewrites?.size === 0) {
-        this.emitLog(buildId, 'info', '所选来源与已发布版证据相同：允许沿用已发布文档；发现问题仍可定向修订');
+      } else if (carryUnchangedSelected && !resume && [...workset.values()].some((change) => change === 'rebuild')) {
+        this.emitLog(buildId, 'info', `所选的 ${[...workset.values()].filter((change) => change === 'rebuild').length} 个未变化来源沿用已发布文档；只对新增/变更来源与证据增量派发写作`);
       }
 
       const buildWarnings: KbBuildDto['warnings'] = [];
