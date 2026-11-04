@@ -166,7 +166,7 @@ function roleSkillPath() {
   const expected = process.env[SKILL_PATH_ENV];
   const role = process.env.AMAGI_AGENT;
   if (!expected || !['luban', 'diting', 'baize'].includes(role)) return null;
-  return expected.replace(/SKILL\.md$/, 'role-' + role + '.md');
+  return expected.replace(/SKILL.md$/, 'role-' + role + '.md');
 }
 async function frozenRoleProtocol() {
   const skillPath = process.env[SKILL_PATH_ENV];

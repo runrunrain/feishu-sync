@@ -97,7 +97,8 @@ describe('renderChildPolicySource / 哈希 / 文件名', () => {
 function loadPolicyModule(): Promise<{ default: (pi: unknown) => void }> {
   const file = path.join(tmpRoot(), childPolicyFileName());
   fs.writeFileSync(file, renderChildPolicySource());
-  return import(pathToFileURL(file).href);
+  // Vite resolves filesystem paths; file URLs escape Windows 8.3 aliases (~).
+  return import(file.replace(/\\/g, '/'));
 }
 
 function makeFakePi() {
@@ -691,10 +692,11 @@ describe('agentDir 配置 × child-policy', () => {
   });
 
   it('buildForbiddenZones：配置/policy 精确入禁区；home 其余（如 skills）不禁——子任务可读冻结 skill 正文', () => {
-    const dirs = planBuildDirectories('/data', 'b_x');
+    const dataRoot = path.resolve('/data');
+    const dirs = planBuildDirectories(dataRoot, 'b_x');
     const zones = buildForbiddenZones({
       workDir: dirs.workDir,
-      dataRoot: '/data',
+      dataRoot,
       knowledgeBaseRoot: '/kb/raw',
       outputRoot: '/kb/std',
       userHome: '/home/u',

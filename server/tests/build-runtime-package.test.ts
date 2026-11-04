@@ -360,7 +360,7 @@ const path = await import('node:path');
 const [,, cmd, source] = process.argv;
 if (cmd === 'install' && path.isAbsolute(source) && fs.existsSync(source)) {
   fs.writeFileSync(path.join(process.env.PI_CODING_AGENT_DIR, 'settings.json'), JSON.stringify({ packages: [path.relative(process.env.PI_CODING_AGENT_DIR, source)] }));
-  fs.writeFileSync('${outFile}', JSON.stringify({ env: process.env }));
+  fs.writeFileSync(${JSON.stringify(outFile)}, JSON.stringify({ env: process.env }));
 }
 `, { mode: 0o755 });
     await installAmagiPackage({
