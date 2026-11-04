@@ -57,7 +57,7 @@ export function repairPlaceholderDraftSources(input: {
         return !isPermissionDeniedSourcePlaceholder(verified.content)
           && !(verified.entry.objType === 'sheet' && isBlankWorkbookPlaceholder(verified));
       })) continue;
-      const next = content.replace(/(^  sources:\n)(?:    - [^\n]+\n)+/m,
+      const next = content.replace(/(^ {2}sources:\n)(?: {4}- [^\n]+\n)+/m,
         (_, label: string) => `${label}${retained.map((token) => `    - ${token}\n`).join('')}`);
       if (next === content || parseStdHeader(next)?.sources.join('\0') !== retained.join('\0')) continue;
       const temp = `${fullPath}.placeholder-repair.tmp`;

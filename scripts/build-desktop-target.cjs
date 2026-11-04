@@ -209,6 +209,15 @@ async function main() {
       }
     }
 
+    // A previous package build prunes server devDependencies. Restore the type
+    // declarations before tsc so consecutive desktop builds work on the same checkout.
+    if (!skipServerDeps) {
+      logStep('Step 0: Restore server build dependencies');
+      checkSuccess(run('npm install --include=dev --ignore-scripts', {
+        cwd: path.resolve(rootDir, 'server'),
+      }), 'Server build dependencies');
+    }
+
     // Step 1: Build frontend + server
     logStep('Step 1: Build frontend (vite) + server (tsc)');
     const buildAllResult = run('npm run build:all');
@@ -233,8 +242,10 @@ async function main() {
 
     // Step 4: Install server production dependencies (skipped if --skip-server-deps)
     logStep('Step 4: Install server production dependencies (npm install --omit=dev)');
-    const serverInstallResult = run('npm install --omit=dev', { cwd: path.resolve(rootDir, 'server') });
-    checkSuccess(serverInstallResult, 'Server dependencies');
+    if (!skipServerDeps) {
+      const serverInstallResult = run('npm install --omit=dev', { cwd: path.resolve(rootDir, 'server') });
+      checkSuccess(serverInstallResult, 'Server dependencies');
+    }
 
     // Step 5: Rebuild native modules (better-sqlite3 for Electron 31)
     //
@@ -369,7 +380,7 @@ async function main() {
     // Verify extraResources (icons)
     if (platform === 'win32') {
       logStep('Step 8: Verify extraResources (tray icons)');
-      const unpackedResourcesDir = path.resolve(outputDir, 'resources');
+      const unpackedResourcesDir = path.resolve(outputDir, 'win-unpacked', 'resources');
       if (fs.existsSync(unpackedResourcesDir)) {
         const iconPath = path.resolve(unpackedResourcesDir, 'build/tray-icon.ico');
         if (fs.existsSync(iconPath)) {
