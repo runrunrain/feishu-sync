@@ -86,19 +86,14 @@ export interface AgentOrchestrationConfig {
 
 export type KbBuildOrchestrationMode = 'legacy' | 'pi-amagi' | 'claude-native';
 
-/** 构建编排模式受控枚举（重构设计 v2 §13.5：每次构建冻结 orchestrationMode）。
- * `legacy` = 既有编排流水/单进程/并行路径；`pi-amagi` = Pi + amagi-pi
- * 单一派发（Leader 监督）；`claude-native` = Claude Code 原生子 agent
- * （未经 13.1 能力验收前拒绝启动，配置值可存）。additive 可选：旧配置
- * 无此字段 → legacy（保守默认；新模式仅在真实运行达到质量/恢复/性能
- * 门槛后才可改默认）。 */
-export const KB_ORCHESTRATION_MODES: ReadonlySet<string> = new Set(['legacy', 'pi-amagi', 'claude-native']);
+/** 新配置只接受 Pi 编排；旧值仍保留在历史构建和检查点契约中供读取。 */
+export const KB_ORCHESTRATION_MODES: ReadonlySet<string> = new Set(['pi-amagi']);
 
-/** 解析构建编排模式（未设/非法回落 legacy——保守默认，绝不静默启用新模式）。 */
+/** 新构建缺省 Pi；显式旧值仅供历史兼容，不由配置接口写入。 */
 export function resolveOrchestrationMode(config: Pick<StandardKbConfig, 'orchestrationMode'> | null | undefined): KbBuildOrchestrationMode {
-  return config?.orchestrationMode === 'pi-amagi' || config?.orchestrationMode === 'claude-native'
+  return config?.orchestrationMode === 'legacy' || config?.orchestrationMode === 'claude-native'
     ? config.orchestrationMode
-    : 'legacy';
+    : 'pi-amagi';
 }
 
 export interface StandardKbConfig {
@@ -135,9 +130,7 @@ export interface StandardKbConfig {
   evidenceBudgetBytes?: number;
   /** 第一阶段固定 false（字段预留） */
   autoBuildAfterSync: boolean;
-  /** 重构设计 v2 §13.5：构建编排模式冻结（additive 可选；缺省 legacy）。
-   * 旧检查点无该字段按 legacy 恢复；claude-native 在真实能力验收前拒绝
-   * 启动（见 createBuild 的显式拒绝）。 */
+  /** 新配置固定 pi-amagi；旧模式只用于历史构建和检查点兼容。 */
   orchestrationMode?: KbBuildOrchestrationMode;
 }
 
@@ -261,6 +254,7 @@ export function buildDefaultStandardKbConfig(dataRoot: string): StandardKbConfig
     reviewPolicy: { maxAutoRevisions: 2, maxInterfaceRetries: 2 },
     publishMode: 'auto',
     autoBuildAfterSync: false,
+    orchestrationMode: 'pi-amagi',
   };
 }
 

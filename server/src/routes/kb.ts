@@ -635,7 +635,7 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
   // 重构 v2：构建运行时能力/安装状态（UI 设置卡消费；不再永远 503）。
   routes.get('/api/kb/build-runtime', async (c) => {
     if (!deps.buildRuntime) {
-      return c.json({ error: 'build_runtime_unavailable', message: '构建运行宿主未接线（服务端未完成集成）', orchestrationMode: 'legacy' }, 503);
+      return c.json({ error: 'build_runtime_unavailable', message: '构建运行宿主未接线（服务端未完成集成）', orchestrationMode: 'pi-amagi' }, 503);
     }
     try {
       return c.json(await deps.buildRuntime.statusDto());

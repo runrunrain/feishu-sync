@@ -43,7 +43,6 @@ import {
   EVIDENCE_BUDGET_MAX_BYTES,
   EVIDENCE_BUDGET_MIN_BYTES,
   KB_ORCHESTRATION_MODES,
-  resolveOrchestrationMode,
   type AgentConfig,
   type AgentOrchestrationConfig,
   type AgentVisionConfig,
@@ -423,9 +422,8 @@ function normalizeStandardKbConfigLoose(value: unknown, dataRoot: string): Stand
       ? Math.max(5, Math.min(1440, Math.floor(raw.buildTimeoutMinutes)))
       : base.buildTimeoutMinutes,
     autoBuildAfterSync: raw.autoBuildAfterSync === true ? true : false,
-    // 重构 v2 §13.5：构建编排模式（additive；缺省/非法回落 legacy——保守
-    // 默认，新模式仅在真实运行门槛通过后由用户显式修改）
-    orchestrationMode: resolveOrchestrationMode(raw as Partial<StandardKbConfig>),
+    // 旧配置的 legacy/claude-native 统一迁移到当前唯一开放的 Pi 编排。
+    orchestrationMode: 'pi-amagi',
   };
 }
 
@@ -600,7 +598,7 @@ export function validateAgentAndKbConfig(value: {
     if (kb.publishMode !== undefined && !['auto', 'confirm'].includes(kb.publishMode)) {
       details.push({ field: 'standardKb.publishMode', code: 'invalid_value' });
     }
-    // 重构 v2 §13.5：构建编排模式受控枚举（非法值拒绝，不静默回落）
+    // 新写入只接受 Pi 编排；历史旧值在 load() 时迁移。
     if (kb.orchestrationMode !== undefined && !KB_ORCHESTRATION_MODES.has(String(kb.orchestrationMode))) {
       details.push({ field: 'standardKb.orchestrationMode', code: 'invalid_value' });
     }
@@ -1562,6 +1560,9 @@ export class ConfigManager {
 
     // F1 additive：旧配置缺 agent/standardKb 段时补默认并写回一次。
     migrated = migrated || raw.agent === undefined || raw.standardKb === undefined;
+
+    // 退役两种旧编排模式：启动时归一且一次性落盘，避免重启后回退。
+    migrated = migrated || raw.standardKb?.orchestrationMode !== 'pi-amagi';
 
     // 2026-10 scope 退役清理：2026-09 的 additive 迁移曾把 docs:document:read
     // 追加进存量配置；该名现已在上游失效，带上它发起授权会被整单拒绝。

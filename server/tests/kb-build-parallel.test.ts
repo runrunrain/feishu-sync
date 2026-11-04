@@ -272,6 +272,7 @@ function makeConfig(overrides: { buildParallelism?: number; buildBatchWordBudget
       workspaces: [],
     },
     standardKb: {
+      orchestrationMode: 'legacy', // 旧并行流水线兼容测试
       outputRoot, retainReleases: 3, buildBatchSize: 10,
       // P2-S2：缺省 0 = 旧行为（既有用例零回归）；新用例显式传预算
       buildBatchWordBudget: overrides.buildBatchWordBudget ?? 0,

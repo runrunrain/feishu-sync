@@ -25,7 +25,6 @@ vi.mock('../../api/client', async (importOriginal) => ({
 import {
   BuildOrchestrationSettings,
   extractConfigFieldErrors,
-  orchestrationModeOptions,
   resolveBuildConcurrencyClient,
   splitInstallErrorMessage,
   validateBuildOrchestrationInput,
@@ -298,48 +297,20 @@ describe('校验错误展示', () => {
   });
 });
 
-describe('v2 编排模式（启动时服务端校验语义，集成切片真实行为）', () => {
-  it('默认 legacy 选中；pi-amagi 可选并标注启动时校验；不声称可用', () => {
+describe('Pi 编排固定入口', () => {
+  it('设置卡不显示编排模式选择，也不提示废弃模式', () => {
     const container = setup(makeConfig());
-    expect(radioEl(container, 'orch-mode-legacy').checked).toBe(true);
-    const pi = radioEl(container, 'orch-mode-pi-amagi');
-    expect(pi.disabled).toBe(false);
-    expect(container.querySelector('[data-testid="orch-mode-note-pi-amagi"]')?.textContent)
-      .toContain('构建启动时由服务端校验');
-    expect(container.querySelector('[data-testid="orch-mode-cap-note"]')?.textContent)
-      .toContain('不声称新模式可用');
+    expect(container.querySelector('[data-testid="orch-mode-section"]')).toBeNull();
+    expect(container.querySelector('[name="kb-orchestration-mode"]')).toBeNull();
+    expect(container.textContent).not.toContain('标准流水');
+    expect(container.textContent).not.toContain('Claude 原生');
   });
 
-  it('选择 pi-amagi：payload 写入 orchestrationMode；回显选中', async () => {
-    const container = setup(makeConfig());
-    await clickRadio(container, 'orch-mode-pi-amagi');
+  it.each(['legacy', 'claude-native'] as const)('旧配置 %s 改其他构建设置时强制写 Pi', async (mode) => {
+    const container = setup(makeConfig({ standardKb: makeStandardKb({ orchestrationMode: mode }) }));
+    await changeSelect(container, 'orch-concurrency-select', '4');
+    expect(lastPayload().standardKb.buildConcurrency).toBe(4);
     expect(lastPayload().standardKb.orchestrationMode).toBe('pi-amagi');
-  });
-
-  it('已配置 pi-amagi 回显；切回 legacy 显式写 legacy（浅合并需覆盖）', async () => {
-    const container = setup(makeConfig({ standardKb: makeStandardKb({ orchestrationMode: 'pi-amagi' }) }));
-    expect(radioEl(container, 'orch-mode-pi-amagi').checked).toBe(true);
-    await clickRadio(container, 'orch-mode-legacy');
-    expect(lastPayload().standardKb.orchestrationMode).toBe('legacy');
-  });
-
-  it('claude-native 恒不可选，点击不触发保存；说明与后端拒绝启动一致', async () => {
-    const container = setup(makeConfig());
-    const native = radioEl(container, 'orch-mode-claude-native');
-    expect(native.disabled).toBe(true);
-    const calls = updateConfig.mock.calls.length;
-    await act(async () => { native.click(); });
-    expect(updateConfig.mock.calls.length).toBe(calls);
-    expect(container.querySelector('[data-testid="orch-mode-note-claude-native"]')?.textContent)
-      .toContain('未通过能力验收');
-  });
-
-  it('config 中已存 claude-native（服务端三值可存）：如实回显但不提供切换入口之外的鼓励', () => {
-    const container = setup(makeConfig({ standardKb: makeStandardKb({ orchestrationMode: 'claude-native' as 'pi-amagi' }) }));
-    // 服务端 resolveOrchestrationMode 归一后 GET 回显 claude-native 时，UI 如实标记不可选。
-    expect(radioEl(container, 'orch-mode-claude-native').checked).toBe(true);
-    expect(radioEl(container, 'orch-mode-claude-native').disabled).toBe(true);
-    expect(radioEl(container, 'orch-mode-legacy').checked).toBe(false);
   });
 });
 
@@ -433,15 +404,6 @@ describe('v2 运行宿主状态与安装（真实 GET/POST /api/kb/build-runtime
 });
 
 describe('纯函数', () => {
-  it('orchestrationModeOptions：legacy/pi-amagi 可选，claude-native 恒不可选', () => {
-    const options = orchestrationModeOptions();
-    expect(options.legacy.selectable).toBe(true);
-    expect(options.legacy.note).toBeNull();
-    expect(options['pi-amagi'].selectable).toBe(true);
-    expect(options['pi-amagi'].note).toContain('服务端校验');
-    expect(options['claude-native'].selectable).toBe(false);
-    expect(options['claude-native'].note).toContain('未通过能力验收');
-  });
   it('resolveBuildConcurrencyClient：显式优先/回落 buildParallelism/统一钳 1..8', () => {
     expect(resolveBuildConcurrencyClient({ buildConcurrency: 4, buildParallelism: 2 })).toBe(4);
     expect(resolveBuildConcurrencyClient({ buildParallelism: 3 })).toBe(3);

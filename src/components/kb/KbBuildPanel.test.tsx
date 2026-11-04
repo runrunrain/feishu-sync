@@ -238,11 +238,11 @@ describe('KbBuildPanel 零值与终态', () => {
   });
 });
 
-describe('v2 编排模式徽标（设计 v2 §13.5；构建 DTO 仅 legacy|pi-amagi）', () => {
-  it('pi-amagi 构建显示编排模式徽标；legacy/缺省构建不显示（保持既有展示）', () => {
+describe('固定 Pi 编排不展示模式徽标', () => {
+  it('新旧构建都不显示模式选择信息', () => {
     const v2 = render(makeBuild({ orchestrationMode: 'pi-amagi' }), 'sidebar');
-    expect(v2).toContain('data-testid="kb-build-orch-mode"');
-    expect(v2).toContain('Agent 编排（Pi + amagi-pi，实验）');
+    expect(v2).not.toContain('data-testid="kb-build-orch-mode"');
+    expect(v2).not.toContain('编排模式：');
     const legacy = render(makeBuild());
     expect(legacy).not.toContain('data-testid="kb-build-orch-mode"');
     const explicitLegacy = render(makeBuild({ orchestrationMode: 'legacy' }));

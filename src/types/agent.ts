@@ -108,13 +108,7 @@ export interface AgentConfig {
   workspaces: AgentWorkspaceConfig[];
 }
 
-/** v2 编排模式（standardKb.orchestrationMode，additive 可选，缺省 legacy；
- *  服务端 KB_ORCHESTRATION_MODES 三值可存，GET 归一回显）。每次构建冻结
- *  该值（KbBuildDto.orchestrationMode 仅 legacy|pi-amagi 回显，设计 v2 §13.5）：
- *  legacy = 现有单模型流水（B 案，稳定路径）；pi-amagi = Leader + amagi-pi
- *  子任务派发（设计 v2 §3，实验；启动时服务端校验运行时接线，未接线
- *  503 不降级）；claude-native = Claude Code 原生子 agent（设计 §10 未验收，
- *  服务端拒绝启动，UI 恒不提供选择）。 */
+/** 新配置只使用 pi-amagi；旧模式值保留用于历史记录兼容。 */
 export type KbOrchestrationMode = 'legacy' | 'pi-amagi' | 'claude-native';
 
 /** B案 §8：思考档位受控枚举（同 AgentConfig.model.thinkingLevel；server AgentThinkingLevel）。 */
@@ -167,10 +161,7 @@ export interface StandardKbConfig {
   reviewPolicy?: KbReviewPolicyConfig;
   /** B案 §7：发布方式（additive 可选；缺省 auto=通过后自动整版发布）。 */
   publishMode?: 'auto' | 'confirm';
-  /** v2：编排模式（additive 可选；缺省 legacy，服务端 GET 归一回显三值之一）。
-   *  选 legacy 时显式写 'legacy'（PUT 浅合并保留已写标量）。pi-amagi 构建
-   *  启动时由服务端校验运行时接线（未接线 503，不降级 legacy）；
-   *  claude-native 未通过能力验收，服务端拒绝启动，UI 恒不提供选择。 */
+  /** 服务端固定为 pi-amagi；旧模式只读兼容，前端不提供选择。 */
   orchestrationMode?: KbOrchestrationMode;
   autoBuildAfterSync: boolean;
 }

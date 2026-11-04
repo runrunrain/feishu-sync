@@ -337,7 +337,7 @@ export function BuildRuntimeProgress({ build }: { build: KbBuildDto }) {
 
       {/* 未观测信息诚实声明：端点不提供的数据不虚构（累计用量恒未知） */}
       <p className="text-[10px] text-ink-faint" data-testid="kb-runtime-mode-note">
-        编排模式：Pi + amagi-pi（实验）。已接受/阻断计数与应用回执同步（缺失时标未知）；
+        已接受/阻断计数与应用回执同步（缺失时标未知）；
         累计用量父子去重后不可得（恒未知，不假累加）；任务计划随 Leader 分解变化，不显示百分比。
       </p>
     </div>

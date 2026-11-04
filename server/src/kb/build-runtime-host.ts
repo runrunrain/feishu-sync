@@ -415,7 +415,7 @@ export class BuildRuntimeHost {
   /** 状态 DTO（UI：能力探测/包安装/运行状态；探测失败如实带回错误，但已装事实
    * 与发现结果不因探测失败被抹成「未安装」——plugin-install-fix 核心修正）。 */
   async statusDto(): Promise<BuildRuntimeStatusDto> {
-    const mode = this.config().standardKb.orchestrationMode ?? 'legacy';
+    const mode = this.config().standardKb.orchestrationMode ?? 'pi-amagi';
     const bundle = this.bundle();
     let fact = this.installedFact(bundle?.version, bundle?.contentHash);
     const gitSource = amagiGitSourceSpec();

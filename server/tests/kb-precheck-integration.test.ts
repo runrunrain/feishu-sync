@@ -184,6 +184,7 @@ function makeConfig(mechanicalPrecheck?: boolean): Config {
       maxConcurrentProcesses: 3, idleTimeoutMinutes: 10, workspaces: [],
     },
     standardKb: {
+      orchestrationMode: 'legacy', // 旧预检流水线兼容测试
       outputRoot, retainReleases: 3, buildBatchSize: 10, buildBatchWordBudget: 0,
       promptTimeoutMinutes: 15, buildTimeoutMinutes: 30,
       buildParallelism: 2, autoBuildAfterSync: false,

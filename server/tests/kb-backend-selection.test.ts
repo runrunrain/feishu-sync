@@ -24,7 +24,7 @@ it('基础能力基座在创建构建时固定，设置更改只影响后续构�
   vi.spyOn(resolver, 'checkReadiness').mockResolvedValue({ code: 'ready', model: { model: 'fixture' } } as never);
   const resolve = vi.spyOn(resolver, 'resolveRuntime').mockRejectedValue(new Error('停止在运行时探测'));
   const service = new KbBuildService({ dataRoot: root, pool: new AgentProcessPool(), resolver,
-    toolService: new AgentToolService({ dataRoot: root, documentsProvider: () => [] }), configProvider: () => manager.getConfig(),
+    toolService: new AgentToolService({ dataRoot: root, documentsProvider: () => [] }), configProvider: () => ({ ...manager.getConfig(), standardKb: { ...manager.getConfig().standardKb, orchestrationMode: 'legacy' as const } }),
     documentsProvider: () => [], sheetCsvPaths: () => [], internalBaseUrl: () => '', extensionPath: () => null, promptAssets: () => null });
   const internal = service as unknown as {
     runPipeline: () => Promise<void>;

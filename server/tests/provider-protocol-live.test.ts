@@ -92,6 +92,7 @@ it.for<LlmProtocol>(['openai-completions', 'openai-responses', 'anthropic-messag
   const app = new Hono(); app.route('/', agentInternalRoutes(tools)); let internalPort = 0;
   const internal = await new Promise<ReturnType<typeof serve>>((resolve) => { const s = serve({ fetch: app.fetch, hostname: '127.0.0.1', port: 0 }, (info) => { internalPort = info.port; resolve(s); }); });
   config.knowledgeBaseRoot = raw; config.standardKb.outputRoot = path.join(root, 'standard');
+  config.standardKb.orchestrationMode = 'legacy'; // 旧单进程构建协议兼容测试
   config.agent.model.source = 'app-llm'; config.agent.model.providerId = 'gateway'; config.agent.model.modelId = 'preset';
   config.llm.providers = [{ id: 'gateway', name: 'Fixture', enabled: true, protocol: api, apiKey: 'protocol-fixture-key', openAiCompatBaseUrl: `http://127.0.0.1:${port}${api === 'anthropic-messages' ? '' : '/v1'}`, defaultModelId: 'preset', models: [{ id: 'preset', name: 'Fixture', enabled: true, openAiModel: 'protocol-model', contextWindow: 64000, maxTokens: 2048 }] }];
   const shared = { dataRoot: root, pool, toolService: tools, resolver, configProvider: () => config, internalBaseUrl: () => `http://127.0.0.1:${internalPort}`, extensionPath: piExtensionPath };

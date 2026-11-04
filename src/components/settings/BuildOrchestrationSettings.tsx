@@ -28,7 +28,6 @@ import type {
   KbBuildRoleConfig,
   KbBuildRolesConfig,
   KbBuildRuntimeStatusDto,
-  KbOrchestrationMode,
   StandardKbConfig,
 } from '../../types/agent';
 
@@ -50,6 +49,7 @@ export const MISSING_PRESET_VALUE = '__missing__';
 const FALLBACK_STANDARD_KB: StandardKbConfig = {
   outputRoot: '', retainReleases: 3, buildBatchSize: 10, buildBatchWordBudget: 40_000,
   promptTimeoutMinutes: 15, buildTimeoutMinutes: 180, buildParallelism: 2, autoBuildAfterSync: false,
+  orchestrationMode: 'pi-amagi',
 };
 
 /** B案 §6 构建名额解析的只读镜像（server resolveBuildConcurrency 同款语义）：
@@ -150,34 +150,6 @@ export function extractConfigFieldErrors(source: unknown): Record<string, string
     if (match[1].startsWith('standardKb.')) errors[match[1]] = `${match[1]}(${match[2]})`;
   }
   return errors;
-}
-
-// ---------------------------------------------------------------------------
-// v2 编排模式（设计 v2 §13.5）：legacy 缺省；pi-amagi 构建启动时由服务端校验
-// 运行时接线（未接线 503 不降级、claude-native 400 拒绝——集成切片真实行为，
-// 无独立探测端点，能力验收前不声称可用）；claude-native UI 恒不提供选择。
-// ---------------------------------------------------------------------------
-
-export const ORCHESTRATION_MODE_LABEL: Record<KbOrchestrationMode, string> = {
-  legacy: '标准流水',
-  'pi-amagi': 'Agent 编排（Pi + amagi-pi）',
-  'claude-native': 'Agent 编排（Claude 原生）',
-};
-
-/** 编排模式可选项（导出供单测锚定）。能力验收由服务端启动校验承担：
- *  pi-amagi 可选但标注「启动时校验」；claude-native 恒不可选。 */
-export function orchestrationModeOptions(): Record<KbOrchestrationMode, { selectable: boolean; note: string | null }> {
-  return {
-    legacy: { selectable: true, note: null },
-    'pi-amagi': {
-      selectable: true,
-      note: '实验：构建启动时由服务端校验运行时接线，未接线时不启动、不降级标准流水',
-    },
-    'claude-native': {
-      selectable: false,
-      note: '未通过能力验收，服务端拒绝启动，暂不提供选择',
-    },
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -413,6 +385,8 @@ export function BuildOrchestrationSettings() {
       buildRoles: base.buildRoles ? { ...base.buildRoles } : undefined,
       reviewPolicy: base.reviewPolicy ? { ...base.reviewPolicy } : undefined,
     });
+    // 编排模式由服务端固定为 Pi；旧客户端缓存的模式值随其他设置保存时一并迁移。
+    next.orchestrationMode = 'pi-amagi';
     const issues = validateBuildOrchestrationInput({ standardKb: next, presets: presetOptions });
     if (issues.length > 0) {
       setLocalFieldErrors(Object.fromEntries(issues.map((issue) => [issue.field, issue.message])));
@@ -489,15 +463,6 @@ export function BuildOrchestrationSettings() {
     });
   };
 
-  // ---- v2 编排模式（可选项；当前生效值） ----
-  const modeOptions = useMemo(() => orchestrationModeOptions(), []);
-  const orchestrationMode = standardKb?.orchestrationMode ?? 'legacy';
-
-  const setOrchestrationMode = (mode: KbOrchestrationMode) => {
-    if (mode === orchestrationMode || !modeOptions[mode].selectable) return;
-    void saveKb((base) => ({ ...base, orchestrationMode: mode }));
-  };
-
   // ---- 构建并发（B案 §6：1..8；未显式设置回落构建并行数） ----
   const buildParallelism = standardKb?.buildParallelism ?? 2;
   const explicitConcurrency = standardKb?.buildConcurrency;
@@ -525,55 +490,6 @@ export function BuildOrchestrationSettings() {
         </div>
       </header>
       <div className="p-4 space-y-4">
-        {/* v2 编排模式（设计 v2 §13.5）：legacy 默认；pi-amagi 启动时服务端校验；claude-native 恒禁用 */}
-        <div data-testid="orch-mode-section">
-          <FieldLabel hint="新构建生效">编排模式</FieldLabel>
-          <div className="grid grid-cols-1 gap-2">
-            {(['legacy', 'pi-amagi', 'claude-native'] as const).map((mode) => {
-              const option = modeOptions[mode];
-              const checked = orchestrationMode === mode;
-              return (
-                <label
-                  key={mode}
-                  className={`flex items-start gap-2 px-3 py-2 rounded-md border text-xs ${checked ? 'border-seal/50 bg-[rgba(158,43,37,0.05)]' : 'border-line'} ${option.selectable ? 'cursor-pointer hover:bg-paper' : 'opacity-70 cursor-not-allowed'}`}
-                >
-                  <input
-                    type="radio"
-                    name="kb-orchestration-mode"
-                    className="mt-0.5 accent-[#9e2b25]"
-                    checked={checked}
-                    disabled={!option.selectable}
-                    aria-label={`编排模式${ORCHESTRATION_MODE_LABEL[mode]}`}
-                    data-testid={`orch-mode-${mode}`}
-                    onChange={() => setOrchestrationMode(mode)}
-                  />
-                  <span className="min-w-0">
-                    <span className="flex flex-wrap items-center gap-1.5">
-                      <span className="font-medium text-ink">{ORCHESTRATION_MODE_LABEL[mode]}</span>
-                      {mode === 'legacy' ? <span className="text-[10px] text-ink-faint">当前默认 · 稳定路径</span> : null}
-                      {mode === 'pi-amagi' ? <span className="text-[10px] text-[#bf9004]">实验</span> : null}
-                      {!option.selectable ? <span className="text-[10px] text-seal-2">不可选</span> : null}
-                    </span>
-                    <span className="block mt-0.5 text-[11px] text-ink-faint leading-snug">
-                      {mode === 'legacy'
-                        ? '现有单模型流水：分批撰写 → 审查 → 整合；下方角色模型与审查预算按本流水执行。'
-                        : mode === 'pi-amagi'
-                          ? 'Leader 会话拆分主题并派发写作/审查子任务，多路并行；子任务经知识工具提交候选成果。'
-                          : 'Claude Code 原生子 agent 路径，尚未通过能力验收；验收通过前不提供选择。'}
-                    </span>
-                    {option.note ? (
-                      <span className={`block mt-0.5 text-[11px] leading-snug ${option.selectable ? 'text-ink-faint' : 'text-seal-2'}`} data-testid={`orch-mode-note-${mode}`}>{option.note}</span>
-                    ) : null}
-                  </span>
-                </label>
-              );
-            })}
-          </div>
-          <p className="mt-1 text-[11px] text-ink-faint" data-testid="orch-mode-cap-note">
-            能力验收由服务端在构建启动时校验（未接线不启动、不降级标准流水）；本页不提供独立的可用性判断，不声称新模式可用。
-          </p>
-        </div>
-
         {/* v2 运行宿主状态与安装（真实 GET/POST /api/kb/build-runtime*） */}
         <RuntimeStatusSection
           status={runtimeStatus}
@@ -871,7 +787,7 @@ function RuntimeStatusSection({
 
       {unwired ? (
         <p className="text-[11px] text-ink-faint" data-testid="orch-runtime-unwired">
-          构建运行宿主未接线（服务端未完成集成）：Agent 编排构建暂不可启动；配置可保存，启动时由服务端校验。
+          构建运行宿主未接线（服务端未完成集成）：构建暂不可启动。请先修复运行环境。
         </p>
       ) : error ? (
         <p className="text-[11px] text-seal-2" role="alert" data-testid="orch-runtime-error">探测失败：{error}</p>

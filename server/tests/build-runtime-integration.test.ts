@@ -2,7 +2,7 @@
  * 重构 v2：Leader 监督集成测试（宿主回调假件 + 真实 BuildRuntimeHost 探测门禁）。
  *
  * 覆盖：
- * - 编排模式冻结：缺省 legacy / 非法回落 / claude-native 拒绝 / 宿主未接线拒绝
+ * - 编排模式冻结：新配置缺省 Pi / 旧配置迁移 / 废弃模式写入拒绝 / 宿主未接线拒绝
  *   （不降级）；宿主已接线但运行时探测失败（真实 probe 链）显式失败；
  * - 监督状态机：首个 agent_end 不结束、空闲一次提醒再 leader_idle、真实
  *   publish_completed 终局、拒绝后重试、取消顺序（先撤凭据→宽限终止）、
@@ -338,30 +338,40 @@ describe('BuildLeaderSupervisor 监督状态机', () => {
 // ---------------------------------------------------------------------------
 
 describe('编排模式冻结与服务门禁', () => {
-  it('resolveOrchestrationMode：缺省/非法回落 legacy，显式 pi-amagi 通过', () => {
-    expect(resolveOrchestrationMode(undefined)).toBe('legacy');
-    expect(resolveOrchestrationMode({})).toBe('legacy');
-    expect(resolveOrchestrationMode({ orchestrationMode: 'bogus' as never })).toBe('legacy');
+  it('resolveOrchestrationMode：缺省/非法回落 Pi，历史显式模式可读取', () => {
+    expect(resolveOrchestrationMode(undefined)).toBe('pi-amagi');
+    expect(resolveOrchestrationMode({})).toBe('pi-amagi');
+    expect(resolveOrchestrationMode({ orchestrationMode: 'bogus' as never })).toBe('pi-amagi');
     expect(resolveOrchestrationMode({ orchestrationMode: 'pi-amagi' })).toBe('pi-amagi');
+    expect(resolveOrchestrationMode({ orchestrationMode: 'legacy' })).toBe('legacy');
     expect(resolveOrchestrationMode({ orchestrationMode: 'claude-native' })).toBe('claude-native');
   });
 
-  it('ConfigManager：orchestrationMode 受控枚举（非法拒绝、合法落盘）', async () => {
+  it('ConfigManager：旧模式迁移为 Pi，配置接口拒绝废弃模式', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kb-mode-'));
     try {
-      const manager = new ConfigManager(path.join(root, 'config.json'));
+      const configPath = path.join(root, 'config.json');
+      const manager = new ConfigManager(configPath);
       await manager.load();
-      expect(manager.getConfig().standardKb.orchestrationMode ?? 'legacy').toBe('legacy');
-      await manager.updateConfig({ standardKb: { orchestrationMode: 'pi-amagi' } } as never);
       expect(manager.getConfig().standardKb.orchestrationMode).toBe('pi-amagi');
-      await expect(manager.updateConfig({ standardKb: { orchestrationMode: 'bogus' } } as never)).rejects.toThrow();
+      const stored = manager.getConfig();
+      fs.writeFileSync(configPath, JSON.stringify({ ...stored, standardKb: { ...stored.standardKb, orchestrationMode: 'legacy' } }));
+      const migrated = new ConfigManager(configPath);
+      await migrated.load();
+      expect(migrated.getConfig().standardKb.orchestrationMode).toBe('pi-amagi');
+      expect(JSON.parse(fs.readFileSync(configPath, 'utf8')).standardKb.orchestrationMode).toBe('pi-amagi');
+      await expect(migrated.updateConfig({ standardKb: { orchestrationMode: 'legacy' } } as never)).rejects.toThrow();
+      await expect(migrated.updateConfig({ standardKb: { orchestrationMode: 'claude-native' } } as never)).rejects.toThrow();
+      await expect(migrated.updateConfig({ standardKb: { orchestrationMode: 'bogus' } } as never)).rejects.toThrow();
+      expect(migrated.getConfig().standardKb.orchestrationMode).toBe('pi-amagi');
+      await manager.updateConfig({ standardKb: { orchestrationMode: 'pi-amagi' } } as never);
       expect(manager.getConfig().standardKb.orchestrationMode).toBe('pi-amagi');
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
-  it('createBuild：claude-native 显式拒绝；pi-amagi 宿主未接线显式拒绝（不降级）', async () => {
+  it('createBuild：默认 Pi 且宿主未接线时拒绝，不回落旧流水', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kb-gate-'));
     const raw = path.join(root, 'raw');
     fs.mkdirSync(raw);
@@ -380,18 +390,8 @@ describe('编排模式冻结与服务门禁', () => {
         internalBaseUrl: () => '', extensionPath: () => null, promptAssets: () => null,
       });
 
-      await manager.updateConfig({ standardKb: { orchestrationMode: 'claude-native' } } as never);
-      await expect(service.createBuild(store, { mode: 'full', confirm: 'BUILD' })).rejects.toMatchObject({ code: 'build_mode_unavailable' });
-
-      await manager.updateConfig({ standardKb: { orchestrationMode: 'pi-amagi' } } as never);
       await expect(service.createBuild(store, { mode: 'full', confirm: 'BUILD' })).rejects.toMatchObject({ code: 'build_runtime_unavailable' });
-
-      await manager.updateConfig({ standardKb: { orchestrationMode: 'legacy' } } as never);
-      const internal = service as unknown as { runPipeline: () => Promise<void> };
-      vi.spyOn(internal, 'runPipeline').mockResolvedValue(undefined);
-      const dto = await service.createBuild(store, { mode: 'full', confirm: 'BUILD' });
-      expect(dto.id).toMatch(/^b_/);
-      expect(dto.orchestrationMode).toBeUndefined();
+      expect(store.getActiveKbBuild()).toBeNull();
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

@@ -51,7 +51,7 @@ async function fixture() {
   vi.spyOn(resolver, 'checkReadiness').mockResolvedValue({ code: 'ready', model: { model: 'fixture/model' } } as never);
   const service = new KbBuildService({
     dataRoot: root, pool: new AgentProcessPool(), toolService: tools, resolver,
-    configProvider: () => configManager.getConfig(), documentsProvider,
+    configProvider: () => ({ ...configManager.getConfig(), standardKb: { ...configManager.getConfig().standardKb, orchestrationMode: 'legacy' as const } }), documentsProvider,
     excludedSourcesProvider: () => store.listKbExplicitlyExcludedSources(raw),
     unselectedSourcesProvider: () => store.listKbExcludedSources(raw), sheetCsvPaths,
     internalBaseUrl: () => '', extensionPath: () => null, promptAssets: () => null,

@@ -353,6 +353,7 @@ function makeConfig(overrides: { publishMode?: 'auto' | 'confirm'; plannerEnable
       maxConcurrentProcesses: 3, idleTimeoutMinutes: 10, workspaces: [],
     },
     standardKb: {
+      orchestrationMode: 'legacy', // 旧调度器兼容测试
       outputRoot, retainReleases: 5, buildBatchSize: 10, buildBatchWordBudget: 0,
       promptTimeoutMinutes: 15, buildTimeoutMinutes: 30,
       buildParallelism: 1, autoBuildAfterSync: false,

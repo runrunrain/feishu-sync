@@ -397,7 +397,7 @@ export class KbBuildService extends EventEmitter {
     this.deps = deps;
   }
 
-  private newEntry(id: string, backend: 'pi' | 'claude-code', mode: 'full' | 'incremental', rebuildSelected = false, refreshImages = false, orchestrationMode: KbBuildOrchestrationMode = 'legacy'): InMemoryBuild {
+  private newEntry(id: string, backend: 'pi' | 'claude-code', mode: 'full' | 'incremental', rebuildSelected = false, refreshImages = false, orchestrationMode: KbBuildOrchestrationMode = 'pi-amagi'): InMemoryBuild {
     return { id, backend, orchestrationMode, requestedMode: mode, rebuildSelected, refreshImages, imageRefreshFailures: 0,
       batchIndex: 0, batchTotal: 0, buildState: null, cancelRequested: false, cancelController: null, timedOut: false,
       workers: new Map(), stage: null, units: { total: 0, done: 0, running: 0, failed: 0, retried: 0 },
@@ -750,15 +750,13 @@ export class KbBuildService extends EventEmitter {
       throw new ToolError('kb_build_running', '已有构建正在进行', 409);
     }
 
-    // 重构 v2 §13.5：创建时冻结编排模式；claude-native 未经真实能力验收
-    // （设计 §10/13.1）显式拒绝；pi-amagi 需运行适配层已接线（未接线
-    // 显式失败，绝不静默回落 legacy/单 agent）。
+    // 新配置统一 Pi 编排；历史兼容调用如显式带旧值仍拒绝未实现的模式。
     const orchestrationMode = resolveOrchestrationMode(config.standardKb);
     if (orchestrationMode === 'claude-native') {
-      throw new ToolError('build_mode_unavailable', "orchestrationMode='claude-native' 尚未通过真实能力验收（设计 §10/§13.1：子 agent 派发、事件完整性与身份链未实测），暂不可启动；请使用 'legacy' 或 'pi-amagi'", 400);
+      throw new ToolError('build_mode_unavailable', "orchestrationMode='claude-native' 已废弃；新构建只支持 Pi 编排", 400);
     }
     if (orchestrationMode === 'pi-amagi' && !this.deps.buildRuntime) {
-      throw new ToolError('build_runtime_unavailable', "orchestrationMode='pi-amagi' 的运行适配层（build-runtime contracts）尚未接线；本版本暂不可启动，不会降级为 legacy。请保持 legacy 或等待运行时集成完成", 503);
+      throw new ToolError('build_runtime_unavailable', 'Pi 构建运行宿主未接线，请安装或修复运行环境后重试', 503);
     }
     if (orchestrationMode === 'pi-amagi' && config.agent.runtime.backend === 'claude-code') {
       throw new ToolError('build_mode_unavailable', "orchestrationMode='pi-amagi' 需要 pi 基座（当前为 claude-code）；Pi + amagi 派发不在 Claude Code 进程内运行", 400);
@@ -1301,7 +1299,7 @@ export class KbBuildService extends EventEmitter {
         throw new ToolError('agent_not_ready', `pi-amagi 模式需要 ${label} 角色模型可解析（当前配置缺失或无可用密钥）；请修正 buildRoles 后重试（不降级）`, 503);
       }
       if (resolved.protocol && resolved.protocol !== 'openai-completions') {
-        throw new ToolError('build_mode_unavailable', `pi-amagi 静态模型声明只支持 OpenAI 兼容端点（${label} 当前 ${resolved.protocol}）；请调整角色模型或使用 legacy 模式`, 400);
+        throw new ToolError('build_mode_unavailable', `Pi 编排的角色模型只支持 OpenAI 兼容端点（${label} 当前 ${resolved.protocol}）；请调整角色模型`, 400);
       }
       const thinking = isPiThinkingLevel(resolved.thinking) ? resolved.thinking : undefined;
       return {
@@ -1319,7 +1317,7 @@ export class KbBuildService extends EventEmitter {
     const leader = toModel(roles.integrator ?? roles.writer, 'Leader（整合）');
     const endpoints = new Set([leader.baseUrl, writer.baseUrl, reviewer.baseUrl]);
     if (endpoints.size !== 1 || ![...endpoints][0]) {
-      throw new ToolError('build_mode_unavailable', `pi-amagi 模式三角色必须解析到同一 OpenAI 兼容端点（当前 ${endpoints.size} 个）；请统一 buildRoles 的 provider 或使用 legacy 模式`, 400);
+      throw new ToolError('build_mode_unavailable', `Pi 编排的三角色必须解析到同一 OpenAI 兼容端点（当前 ${endpoints.size} 个）；请统一角色模型的提供商`, 400);
     }
     // 密钥：以写作角色的 provider 解析（三角色同端点约束已保证一致）
     const keyResolution = resolveProviderModel(config.llm, {

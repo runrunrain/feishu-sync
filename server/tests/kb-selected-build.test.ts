@@ -40,7 +40,7 @@ async function fixture(visionDescriber?: VisionDescriberLike) {
   const documentsProvider = () => filterDeletedLocalDocuments(store, raw, store.getAllDocuments());
   const tools = new AgentToolService({ dataRoot: dir, documentsProvider, sheetCsvPaths: () => [] });
   const resolver = new PiRuntimeResolver(); vi.spyOn(resolver, 'checkReadiness').mockResolvedValue({ code: 'ready', model: { model: 'fixture/model' } } as never);
-  const service = new KbBuildService({ dataRoot: dir, configProvider: () => config.getConfig(), documentsProvider, sheetCsvPaths: () => [],
+  const service = new KbBuildService({ dataRoot: dir, configProvider: () => ({ ...config.getConfig(), standardKb: { ...config.getConfig().standardKb, orchestrationMode: 'legacy' as const } }), documentsProvider, sheetCsvPaths: () => [],
     excludedSourcesProvider: () => store.listKbExplicitlyExcludedSources(raw), unselectedSourcesProvider: () => store.listKbExcludedSources(raw),
     pool: new AgentProcessPool(), resolver, toolService: tools, internalBaseUrl: () => '', extensionPath: () => null, promptAssets: () => null, visionDescriber });
   let behavior: 'normal' | 'drop' | 'overwrite' | 'merge' = 'normal';

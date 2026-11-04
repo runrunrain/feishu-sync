@@ -438,6 +438,7 @@ describe('KbBuildService：metrics 采集端到端', () => {
         maxConcurrentProcesses: 3, idleTimeoutMinutes: 10, workspaces: [],
       },
       standardKb: {
+        orchestrationMode: 'legacy', // 旧流水线指标兼容测试
         outputRoot, retainReleases: 3, buildBatchSize: 10, buildBatchWordBudget: 0,
         promptTimeoutMinutes: 15, buildTimeoutMinutes: 30,
         buildParallelism: overrides.parallelism ?? 1, autoBuildAfterSync: false,

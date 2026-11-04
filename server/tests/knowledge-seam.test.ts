@@ -265,6 +265,7 @@ function makeSeamConfig(publishMode: 'auto' | 'confirm' = 'auto'): Config {
     standardKb: {
       outputRoot, retainReleases: 5, buildBatchSize: 10, buildBatchWordBudget: 0,
       promptTimeoutMinutes: 15, buildTimeoutMinutes: 30, buildParallelism: 1, autoBuildAfterSync: false,
+      orchestrationMode: 'legacy',
       buildRoles: { writer: { modelPresetId: '' }, reviewer: { modelPresetId: 'rev-model' }, plannerEnabled: false },
       reviewPolicy: { maxAutoRevisions: 2, maxInterfaceRetries: 2 },
       publishMode,

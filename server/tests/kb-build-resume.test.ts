@@ -65,7 +65,7 @@ async function fixture(count = 32, parallelism = 1) {
     const pool = new AgentProcessPool({ maxConcurrentProcesses: 3, idleTimeoutMinutes: 10 }); pools.push(pool);
     const documentsProvider = () => store.getAllDocuments();
     const tools = new AgentToolService({ dataRoot: dir, documentsProvider, sheetCsvPaths: () => [] });
-    const service = new KbBuildService({ dataRoot: dir, configProvider: () => config.getConfig(), documentsProvider, sheetCsvPaths: () => [],
+    const service = new KbBuildService({ dataRoot: dir, configProvider: () => ({ ...config.getConfig(), standardKb: { ...config.getConfig().standardKb, orchestrationMode: 'legacy' as const } }), documentsProvider, sheetCsvPaths: () => [],
       excludedSourcesProvider: () => excluded, unselectedSourcesProvider: () => unselected,
       pool, resolver, toolService: tools, internalBaseUrl: () => '', extensionPath: () => null, promptAssets: () => null, visionDescriber: vision,
       processFactory: (options) => {

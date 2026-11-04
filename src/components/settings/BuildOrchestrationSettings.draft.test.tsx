@@ -82,6 +82,7 @@ it('卡内修改先进草稿，总保存提交完整 standardKb 段（含未变�
     expect(Object.keys(outbound)).toEqual(['standardKb']);
     expect(outbound.standardKb.buildConcurrency).toBe(4);
     expect(outbound.standardKb.publishMode).toBe('confirm');
+    expect(outbound.standardKb.orchestrationMode).toBe('pi-amagi');
     // 完整段：未变更的基础字段一并携带（服务端整体替换语义）
     expect(outbound.standardKb.outputRoot).toBe('/tmp/standard-kb');
     expect(outbound.standardKb.reviewPolicy).toEqual({ maxAutoRevisions: 2, maxInterfaceRetries: 2 });
