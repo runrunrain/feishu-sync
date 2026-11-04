@@ -2370,6 +2370,20 @@ export class AgentToolService {
           );
         }
       }
+      // A full rewrite that silently omits the evidence array can erase every
+      // verified citation on an otherwise retained document. Keep intentional
+      // evidence removal explicit; incremental additions belong in kb_edit_doc.
+      if (baseDraft && args.evidenceClaims === undefined && Array.isArray(args.objects)
+        && args.objects.length > 0) {
+        const priorObjectIds = new Set(baseDraft.objects
+          .filter((object) => !object.tombstone && object.canonical?.path === docPath)
+          .map((object) => object.objectId));
+        const priorEvidenceCount = baseDraft.evidence.filter((evidence) => priorObjectIds.has(evidence.objectId)).length;
+        if (priorEvidenceCount > 0) {
+          throw new ToolError('kb_evidence_registry_stale',
+            `文档 ${docPath} 已有 ${priorEvidenceCount} 条证据；整体重写须显式重申 evidenceClaims。只补新证据请用 kb_edit_doc.evidenceClaimsAdd，服务端会继承原有声明`, 409);
+        }
+      }
       // 声明解析与校验（写入即拒；正文尚未落盘，任何拒绝都不产生部分写入）
       const declaration = baseDraft
         ? await this.buildKnowledgeDeclaration(context, state, baseDraft, docPath, docId, args, markdown, meta, options?.objectMerges ?? [])
@@ -4982,12 +4996,13 @@ export class AgentToolService {
     }
     // 顺序应用补丁（后续补丁在前一补丁产生的文本上定位）
     const patchInputs = args.patches === undefined ? [] : requireArray(args, 'patches');
+    const evidenceClaimsAdd = args.evidenceClaimsAdd === undefined ? [] : requireArray(args, 'evidenceClaimsAdd');
     const evidenceSelectorUpdates = args.evidenceSelectorUpdates === undefined ? [] : requireArray(args, 'evidenceSelectorUpdates');
     const coverageUpdates = args.coverageUpdates === undefined ? [] : requireArray(args, 'coverageUpdates');
     const mergeInputs = args.objectMerges === undefined ? [] : requireArray(args, 'objectMerges');
-    if (patchInputs.length > 50 || evidenceSelectorUpdates.length > 20 || coverageUpdates.length > 20 || mergeInputs.length > 20
-      || (patchInputs.length === 0 && evidenceSelectorUpdates.length === 0 && coverageUpdates.length === 0 && mergeInputs.length === 0)) {
-      throw new ToolError('invalid_request', 'patches、evidenceSelectorUpdates、coverageUpdates 与 objectMerges 至少一项非空，且分别不超过 50/20/20/20 项');
+    if (patchInputs.length > 50 || evidenceClaimsAdd.length > 50 || evidenceSelectorUpdates.length > 20 || coverageUpdates.length > 20 || mergeInputs.length > 20
+      || (patchInputs.length === 0 && evidenceClaimsAdd.length === 0 && evidenceSelectorUpdates.length === 0 && coverageUpdates.length === 0 && mergeInputs.length === 0)) {
+      throw new ToolError('invalid_request', 'patches、evidenceClaimsAdd、evidenceSelectorUpdates、coverageUpdates 与 objectMerges 至少一项非空，且分别不超过 50/50/20/20/20 项');
     }
     const objectMerges: Array<{ fromObjectId: string; toObjectId: string; reason: string }> = [];
     if (mergeInputs.length > 0) {
@@ -5180,6 +5195,22 @@ export class AgentToolService {
         }
       }
     }
+    if (evidenceClaimsAdd.length > 0) {
+      const objectInputs = inheritedDeclarations.objects as Array<Record<string, unknown>> | undefined;
+      if (!objectInputs?.length) throw new ToolError('invalid_request', `草稿 ${docPath} 没有可追加证据的本篇对象`);
+      const draft = this.loadKnowledgeDraft(state);
+      const objectKeys = new Set(objectInputs.flatMap((object) =>
+        [object.clientKey, draft.clientKeys[String(object.clientKey)]]
+          .filter((value): value is string => typeof value === 'string')));
+      for (const [index, raw] of evidenceClaimsAdd.entries()) {
+        const input = asRecord(raw);
+        if (!input) throw new ToolError('invalid_request', `evidenceClaimsAdd[${index}] 必须是对象`);
+        const objectKey = requireString(input, 'objectKey', 1, 200);
+        if (!objectKeys.has(objectKey)) throw new ToolError('invalid_request', `evidenceClaimsAdd[${index}] 的 objectKey 不属于草稿 ${docPath}: ${objectKey}`);
+      }
+      const existing = inheritedDeclarations.evidenceClaims as Array<Record<string, unknown>> | undefined;
+      inheritedDeclarations.evidenceClaims = [...(existing ?? []), ...evidenceClaimsAdd];
+    }
     const writeArgs: Record<string, unknown> = {
       path: docPath,
       title: args.titleUpdate !== undefined ? requireString(args, 'titleUpdate', 1, 300) : coordinates.title,
@@ -5192,6 +5223,17 @@ export class AgentToolService {
       ...(inheritedCoverage.length ? { coverageUpdates: inheritedCoverage } : {}),
       ...(args.expectedDraftRevision !== undefined ? { expectedDraftRevision: optionalInt(args, 'expectedDraftRevision', 0, 0, 1_000_000_000) } : {}),
     };
+    const normalizedWriteArgs = normalizeKbWriteDocArgs(writeArgs);
+    if (evidenceClaimsAdd.length > 0) {
+      const additions = (normalizedWriteArgs.evidenceClaims as Array<Record<string, unknown>>).slice(-evidenceClaimsAdd.length);
+      for (const [index, addition] of additions.entries()) {
+        const sourceId = asRecord(addition.sourceRef)?.sourceId;
+        if (typeof sourceId !== 'string' || !sources.includes(sourceId)) {
+          throw new ToolError('kb_evidence_unresolved',
+            `evidenceClaimsAdd[${index}] 的来源不属于 ${docPath}；请先用 sourcesAppend 追加来源`, 409);
+        }
+      }
+    }
     // 同一校验链（header/来源/正文策略/声明解引用/原子写），声明的
     // knowledge-draft 幂等用稳定键（v2 任务内 operationId 唯一）：崩溃后
     // 重放两层互补（calls 账本 + v2 回执账本）。
@@ -5205,7 +5247,7 @@ export class AgentToolService {
         ? stableV2CallKey(v2Info.actor.nativeTaskId, operationId)
         : (meta?.toolCallId ?? `edit_${operationId}`),
     };
-    const result = await this.writeDocCore(context, writeArgs, editMeta, {
+    const result = await this.writeDocCore(context, normalizedWriteArgs, editMeta, {
       ...(v2Info?.actor
         ? {
           lockHeld: true,
@@ -5221,6 +5263,7 @@ export class AgentToolService {
       details: {
         ...(result.details ?? {}),
         edit: { operationId, patches: applied, affectedObjects, inheritedDeclarations: affectedObjects > 0,
+          evidenceAdded: evidenceClaimsAdd.length,
           objectMerges: objectMerges.map(({ fromObjectId, toObjectId, reason }) => ({ fromObjectId, toObjectId, reason })) },
       },
     };

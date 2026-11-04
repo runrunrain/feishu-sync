@@ -660,6 +660,53 @@ describe('kb_edit_doc（§7 局部编辑）', () => {
     }, meta('w1', 'luban')), 'invalid_request');
   });
 
+  it('只追加新证据时保留旧证据、对象身份和正文，并拒绝其他文档对象', async () => {
+    const setup = makeV2('b-edit-evidence-add');
+    setup.store.registerTaskCreation({ nativeTaskId: 'w1', requestedRole: 'luban' });
+    await writeDraftWithObject(setup, 'w1');
+    const draftPath = path.join(setup.state.stagingRoot, 'knowledge-draft.json');
+    const bodyPath = path.join(setup.state.stagingRoot, 'docs', 'docs', 'edit.md');
+    const before = JSON.parse(fs.readFileSync(draftPath, 'utf-8'));
+    const body = fs.readFileSync(bodyPath, 'utf-8');
+    const firstEvidenceId = before.evidenceKeys['ev-1'] as string;
+    const objectId = before.clientKeys['obj-main'] as string;
+
+    const args = { path: 'docs/edit.md', operationId: 'op-evidence-add', evidenceClaimsAdd: [{
+      objectKey: 'obj-main', claimKey: 'no-claim',
+      selector: { kind: 'text_span', lineStart: 4, lineEnd: 4 },
+    }] };
+    const edited = await call(setup.child.token, 'kb_edit_doc', args, meta('w1', 'luban'));
+    expect(edited.details).toMatchObject({ edit: { inheritedDeclarations: true, evidenceAdded: 1 } });
+    const after = JSON.parse(fs.readFileSync(draftPath, 'utf-8'));
+    expect(fs.readFileSync(bodyPath, 'utf-8')).toBe(body);
+    expect(after.clientKeys['obj-main']).toBe(objectId);
+    expect(after.evidenceKeys['ev-1']).toBe(firstEvidenceId);
+    expect(after.evidence.filter((item: { objectId: string }) => item.objectId === objectId)).toHaveLength(2);
+    expect(after.evidence.find((item: { evidenceId: string }) => item.evidenceId === firstEvidenceId)).toBeTruthy();
+    const replay = await call(setup.child.token, 'kb_edit_doc', args, meta('w1', 'luban'));
+    expect(replay.details!.idempotentReplay).toBe(true);
+
+    await expectToolError(() => call(setup.child.token, 'kb_edit_doc', {
+      path: 'docs/edit.md', operationId: 'op-evidence-wrong-object',
+      evidenceClaimsAdd: [{ objectKey: 'ko_other', claimKey: 'no-claim', selector: { kind: 'text_span', lineStart: 4, lineEnd: 4 } }],
+    }, meta('w1', 'luban')), 'invalid_request');
+  });
+
+  it('整体重写遗漏证据数组时拒绝清空已登记证据', async () => {
+    const setup = makeV2('b-write-evidence-guard');
+    setup.store.registerTaskCreation({ nativeTaskId: 'w1', requestedRole: 'luban' });
+    await writeDraftWithObject(setup, 'w1');
+    const draftPath = path.join(setup.state.stagingRoot, 'knowledge-draft.json');
+    const before = fs.readFileSync(draftPath, 'utf-8');
+    await expectToolError(() => call(setup.child.token, 'kb_write_doc', {
+      path: 'docs/edit.md', title: '编辑测试', markdown: '## 目标节\n\n重写正文',
+      sources: ['tokA'], summary: '重写摘要', operationId: 'op-omit-evidence',
+      objects: [{ clientKey: 'obj-main', type: 'concept', title: '主对象', familyKey: 'fam',
+        variantKey: 'default', scopeKey: 'scope', scopeText: '范围', headingPath: ['目标节'] }],
+    }, meta('w1', 'luban')), 'kb_evidence_registry_stale');
+    expect(fs.readFileSync(draftPath, 'utf-8')).toBe(before);
+  });
+
   it('只更新已有覆盖项去向：服务端继承来源、分类与对象证据', async () => {
     const setup = makeV2('b-edit-coverage');
     setup.store.registerTaskCreation({ nativeTaskId: 'w1', requestedRole: 'luban' });
