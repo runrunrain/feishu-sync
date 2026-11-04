@@ -1,0 +1,26 @@
+{
+  "targeted": {
+    "passed": 116,
+    "skipped": 1
+  },
+  "fullServerScan": {
+    "passed": 3258,
+    "failed": 13,
+    "skipped": 17
+  },
+  "baselineReproduction": {
+    "existingFailures": 12,
+    "isolatedTimeoutRerun": {
+      "passed": 28,
+      "failed": 0
+    }
+  },
+  "typecheck": "passed",
+  "changedFilesEslint": "passed",
+  "serverBuild": "passed",
+  "liveMcpChecks": {
+    "passed": 9,
+    "failed": 0
+  },
+  "installedApplicationUpdated": false
+}

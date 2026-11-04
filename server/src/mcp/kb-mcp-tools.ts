@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { KbQueryService, QueryError } from '../kb/search/kb-query-service.js';
 import { RawQueryService } from '../kb/raw-query-service.js';
+import { withOutputSchema } from './kb-mcp-output.js';
 
 export interface KbMcpSessionState { lastServedCurrent?: string }
 
@@ -161,6 +162,13 @@ function validate(value: unknown, rule: Record<string, unknown>, field: string):
   }
   if (rule.enum && !(rule.enum as unknown[]).includes(value)) fail();
 }
+function structuredResult(text: string, payload: object, compact: boolean) {
+  const response = { content: [{ type: 'text' as const, text }], structuredContent: payload as Record<string, unknown> };
+  if (compact && Buffer.byteLength(JSON.stringify(response), 'utf8') > 19_000) {
+    throw new QueryError('invalid_request', '结构化结果超出当前客户端预算，请缩小读取范围或 limit；对象过大时可用 get_knowledge 阅读对应章节。');
+  }
+  return response;
+}
 function result(text: string, isError = false) {
   return { content: [{ type: 'text' as const, text }], ...(isError ? { isError: true } : {}) };
 }
@@ -176,15 +184,15 @@ export function kbMcpError(error: unknown, maxChars = 20000) {
 
 /** Keeps notices outside the query engine. One state object per stdio process / LAN session. */
 export function registerKbTools(server: Server, queryService: KbQueryService, sessionState: KbMcpSessionState, raw?: RawQueryService, options?: { currentSourceRoot?: string }): void {
-  const tools = raw ? [...KB_MCP_TOOLS, ...RAW_MCP_TOOLS, SEARCH_ALL_MCP_TOOL] : KB_MCP_TOOLS;
+  const tools = (raw ? [...KB_MCP_TOOLS, ...RAW_MCP_TOOLS, SEARCH_ALL_MCP_TOOL] : KB_MCP_TOOLS).map(withOutputSchema);
   // A案 §8.3：当前源根注入（调用方显式传入优先；否则按应用 config 有界推导）
   const currentSourceRoot = options?.currentSourceRoot ?? resolveEvidenceSourceRoot(queryService.kbRoot);
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const tool = tools.find((item) => item.name === request.params.name);
     const clientName = server.getClientVersion()?.name.toLowerCase() ?? '';
-    // pi direct truncates around 20KB, not 20k characters. At most 3 UTF-8 bytes
-    // per UTF-16 unit: 6000 chars keeps even Chinese pages below that threshold.
+    // Pi truncates around 20KB. JSON fallbacks and structured content both count:
+    // individual pages use 2800 chars; combined search also checks serialized bytes.
     // Apply per session without cloning the shared index/service in LAN mode.
     const clientMax = clientName === 'pi' || clientName.includes('pi-coding-agent')
       ? Math.min(queryService.maxChars, 6000) : queryService.maxChars;
@@ -219,15 +227,15 @@ export function registerKbTools(server: Server, queryService: KbQueryService, se
         return response;
       }
       if (raw && tool.name.startsWith('raw_')) {
-        const value = await raw.call(tool.name, args, clientMax - 512) as Record<string, unknown>;
+        const value = await raw.call(tool.name, args, (clientMax <= 6000 ? Math.min(clientMax, 2800) : clientMax) - 512) as Record<string, unknown>;
         if (tool.name === 'raw_read_image' && typeof value.data === 'string') {
           const { data, ...metadata } = value;
           const image = value.image as { mimeType: string };
-          return { content: [{ type: 'text' as const, text: JSON.stringify(metadata) }, { type: 'image' as const, data, mimeType: image.mimeType }] };
+          return { content: [{ type: 'text' as const, text: JSON.stringify(metadata) }, { type: 'image' as const, data, mimeType: image.mimeType }], structuredContent: metadata };
         }
-        return result(JSON.stringify(value));
+        return structuredResult(JSON.stringify(value), value, clientMax <= 6000);
       }
-      const cap = Math.min(clientMax, typeof args.maxChars === 'number' ? args.maxChars : Infinity,
+      const cap = Math.min(clientMax <= 6000 && tool.name !== 'get_object' ? Math.min(clientMax, 2800) : clientMax, typeof args.maxChars === 'number' ? args.maxChars : Infinity,
         tool.name === 'search_knowledge' || tool.name === 'get_outline' || tool.name === 'list_knowledge' ? 8000 : tool.name === 'grep_knowledge' ? 12000 : Infinity);
       // The shared facade reserves fixed transport headroom on every page, so version
       // notices never alter cursor digests or split the UI / built-in / MCP query paths.
@@ -276,8 +284,9 @@ export function registerKbTools(server: Server, queryService: KbQueryService, se
         ? `知识库已更新：${old} → ${page.releaseId}${published}。此前获得的行号仅对 ${old} 有效；锚点仍可用。需要对照旧版本可传 releaseId=${old}（若未被清理）。` : undefined;
       const text = typeof page.text === 'string' ? (notice ? `[notice] ${notice}\n` : '') + page.text : JSON.stringify({ ...page, ...(notice ? { notice } : {}) });
       if (text.length > cap) throw new QueryError('invalid_request', '版本告知与本页内容超出预算，请显式传 releaseId 或增加预算', { field: 'maxChars', releaseId: page.releaseId });
+      const response = structuredResult(text, { ...page, ...(notice ? { notice } : {}) }, clientMax <= 6000);
       if (following) sessionState.lastServedCurrent = page.releaseId;
-      return result(text);
+      return response;
     } catch (error) { return kbMcpError(error, clientMax); }
   });
 }

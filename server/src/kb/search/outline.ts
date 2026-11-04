@@ -40,8 +40,14 @@ export function buildOutline(lines: string[], docPath: string, title: string): K
     const match = /^(#{1,6})\s+(.+?)\s*#*\s*$/.exec(line);
     if (!match) continue;
     const level = match[1].length;
-    if (level === 2) { h2 = match[2]; add(2, match[2], match[2], i + 1); }
-    if (level === 3) add(3, match[2], h2 ? `${h2} › ${match[2]}` : match[2], i + 1);
+    // An object anchor belongs to its following heading, even without a valid
+    // knowledge manifest. Keep intervening blank lines with that section too.
+    let startLine = i + 1;
+    let before = i - 1;
+    while (before >= 0 && !lines[before].trim()) before--;
+    if (/^\s*<a\s+id=["']ko_[^"']+["']\s*><\/a>\s*$/.test(lines[before] ?? '')) startLine = before + 1;
+    if (level === 2) { h2 = match[2]; add(2, match[2], match[2], startLine); }
+    if (level === 3) add(3, match[2], h2 ? `${h2} › ${match[2]}` : match[2], startLine);
   }
   for (let i = 0; i < sections.length; i++) {
     const s = sections[i];

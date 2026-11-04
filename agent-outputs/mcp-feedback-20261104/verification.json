@@ -1,0 +1,127 @@
+{
+  "verifiedAt": "2026-11-04T13:11:05.705Z",
+  "checks": [
+    {
+      "name": "structured-output-contracts",
+      "pass": true,
+      "toolCount": 20,
+      "schemaCount": 20
+    },
+    {
+      "name": "reported-rich-text-workbook",
+      "pass": true,
+      "sheetCount": 6,
+      "contentHash": "b1e2641e433bc08a52f6fe798136806eafe7e448b3c3f7583ad55c0b76fb815f",
+      "compatibility": "mixed_shared_string_prefix"
+    },
+    {
+      "name": "canvas-meaningful-cells",
+      "pass": true,
+      "cells": 13,
+      "nextOffset": null,
+      "contentHash": "f70b82473dfab6fcca92cc3c7dad9c889fe0d4982e577e321cbdcbc387125f5d"
+    },
+    {
+      "name": "out-of-range-merge-master",
+      "pass": true,
+      "addresses": [
+        "C3"
+      ]
+    },
+    {
+      "name": "section-object-boundaries",
+      "pass": true,
+      "releaseId": "r_20261104T020619_ca20cc",
+      "startLine": 35,
+      "endLine": 60,
+      "knowledgeStatus": {
+        "scope": "page",
+        "state": "available",
+        "objectRefs": [
+          {
+            "objectId": "ko_a1314120-d7f8-4f61-95cf-a146d6771fb1",
+            "businessStatus": "unknown",
+            "reviewStatus": "passed",
+            "evidenceCount": 7
+          }
+        ],
+        "note": "仅表示本页关联对象的状态；发布、机器审查通过和业务批准不同。缺少证据时需回源核对；对象证据位置使用 get_object 获取。"
+      }
+    },
+    {
+      "name": "operational-governance-remains-explicit",
+      "pass": true,
+      "queries": [
+        {
+          "query": "任务 看板",
+          "total": 0,
+          "excluded": {
+            "not_approved": 1043
+          },
+          "next": null,
+          "hints": [
+            "任务看板",
+            "任务看板机制",
+            "任务内容填写",
+            "任务性质与频率",
+            "任务清单",
+            "无满足 operational 资格的对象命中（excluded 为原因计数，不自动退回 candidate）。可用 browse 查看候选、get_object 读取状态与证据，或回源核实；业务批准在治理中登记，并于下一次成功发布后进入正式版本。"
+          ]
+        },
+        {
+          "query": "农业 农忙",
+          "total": 0,
+          "excluded": {
+            "not_approved": 1043
+          },
+          "next": null,
+          "hints": [
+            "农业",
+            "农业自动增长率",
+            "农业规则配置",
+            "无满足 operational 资格的对象命中（excluded 为原因计数，不自动退回 candidate）。可用 browse 查看候选、get_object 读取状态与证据，或回源核实；业务批准在治理中登记，并于下一次成功发布后进入正式版本。"
+          ]
+        },
+        {
+          "query": "战斗 技能",
+          "total": 0,
+          "excluded": {
+            "not_approved": 1043
+          },
+          "next": null,
+          "hints": [
+            "战斗技能系统设计",
+            "战斗技能细节设计",
+            "兵种战斗属性与定位",
+            "可实现的技能方向",
+            "战斗",
+            "无满足 operational 资格的对象命中（excluded 为原因计数，不自动退回 candidate）。可用 browse 查看候选、get_object 读取状态与证据，或回源核实；业务批准在治理中登记，并于下一次成功发布后进入正式版本。"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "natural-phrase-recall-labeled",
+      "pass": true,
+      "total": 22,
+      "warning": "未找到完整关键词；以下为片段回退候选，不能视为完整命中，请继续核对原文。",
+      "matchTypes": [
+        "fallback",
+        "fallback",
+        "fallback"
+      ]
+    },
+    {
+      "name": "permission-placeholder-state",
+      "pass": true,
+      "sourceAvailability": "permission_denied_placeholder",
+      "usableAsEvidence": false
+    },
+    {
+      "name": "combined-search-source-labels",
+      "pass": true,
+      "standardTotal": 34,
+      "rawTotal": 31
+    }
+  ]
+}

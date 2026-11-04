@@ -173,7 +173,7 @@ it('keeps Pi worksheet pages within its byte budget while returning every reques
         endColumn: 1, offset, ...(contentHash ? { contentHash } : {}) } });
       expect(result.isError).not.toBe(true);
       const text = (result.content as Array<{ text: string }>)[0].text;
-      expect(Buffer.byteLength(text, 'utf8')).toBeLessThan(20_000);
+      expect(Buffer.byteLength(JSON.stringify(result), 'utf8')).toBeLessThan(19_000);
       const data = JSON.parse(text); contentHash = data.contentHash; addresses.push(...data.cells.map((cell: { address: string }) => cell.address));
       offset = data.nextOffset; pages++; expect(pages).toBeLessThan(20);
     } while (offset !== null);

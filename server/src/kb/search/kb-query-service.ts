@@ -187,7 +187,12 @@ export interface BundleParams extends PageParams { pathPrefix?: string; paths?: 
 export interface ListParams extends PageParams { pathPrefix?: string; depth?: number; includeSummary?: boolean }
 export interface ReleaseInfoParams extends PageParams { includeChanges?: boolean }
 export interface TextPage { releaseId: string; text: string; next: string|null }
-export interface ReadPage { releaseId: string; text: string; next: number|null; startLine: number; endLine: number }
+export interface ReadKnowledgeStatus {
+  scope: 'page'; state: 'available' | 'legacy-unclassified' | 'unavailable';
+  objectRefs: Array<{ objectId: string; businessStatus: BusinessStatus; reviewStatus: ReviewStatus; evidenceCount: number }>;
+  note: string;
+}
+export interface ReadPage { releaseId: string; text: string; next: number|null; startLine: number; endLine: number; knowledgeStatus: ReadKnowledgeStatus }
 export interface ReleaseInfoResult {
   releaseId: string; buildId: string; mode: KbManifest['mode']; baseReleaseId: string|null; publishedAt: string; model: string|null;
   docCount: number; sourceCount: number; bodyChars: number; ranker: 'lex-v1'|'l1'; toolsVersion: '2';
@@ -923,7 +928,7 @@ export class KbQueryService {
     if (knowledgeActive && !view) {
       // A案 §8.1：旧 schema 内容标 legacy-unclassified；operational 不把未分类当已批准，不自动退回
       if (usage === 'operational' || types !== undefined || businessStatuses !== undefined || reviewStatuses !== undefined || domainIds !== undefined) {
-        const empty = { releaseId: release.releaseId, ranker, rankerVersion: ranker, query, total: 0, results: [], unmatchedUnits,
+        const empty = { releaseId: release.releaseId, ranker, rankerVersion: ranker, query, total: 0, results: [], next: null, unmatchedUnits,
           usage: usage ?? 'browse', legacy: 'legacy-unclassified' as const, excluded: { legacy_unclassified: index.docs.length },
           hint: [usage === 'operational'
             ? '当前 release 为 v1（未组织化），全部内容按 legacy-unclassified 处理，不能作为已批准规则回答。可改用 browse 浏览、get_knowledge 阅读原文或回源原始库。'
@@ -1031,33 +1036,27 @@ export class KbQueryService {
     const range = section ? sectionRange(doc.sections, section, doc.lines.length) : { start: 1, end: doc.lines.length };
     let view: KbKnowledgeIndex | null = null;
     try { view = this.knowledgeView(release); } catch { /* Text remains readable even if optional organization is damaged. */ }
-    if (section && view) {
-      const objectAnchor = (line: string | undefined) => /^\s*<a\s+id=["'](ko_[^"']+)["']\s*><\/a>\s*$/.exec(line ?? '')?.[1];
-      const beforeId = objectAnchor(doc.lines[range.start - 2]);
-      const before = beforeId ? view.objectsById.get(beforeId) : undefined;
-      if (before?.canonical?.path === doc.path && before.canonical.bodyRange.startLine === range.start - 1
-        && before.canonical.bodyRange.endLine >= range.start) range.start--;
-      const trailingId = objectAnchor(doc.lines[range.end - 1]);
-      const trailing = trailingId ? view.objectsById.get(trailingId) : undefined;
-      if (trailing?.canonical?.path === doc.path && trailing.canonical.bodyRange.startLine === range.end
-        && /^#{2,3}\s/.test(doc.lines[range.end] ?? '')) range.end--;
-    }
     const start = range.start + startLine - 1;
     if (start > range.end) invalid('startLine', '行号超出目标文档或章节');
     const sources = includeSources ? this.sourcesText(release.manifest, doc) : '';
     let end = Math.min(range.end, start + maxLines - 1);
     let text = '', continuation: number|null = null;
+    let knowledgeStatus: ReadKnowledgeStatus;
     for (;;) {
       continuation = end < range.end ? end - range.start + 2 : null;
       const matching = (view?.objectsByDoc.get(doc.path) ?? []).filter((object) => object.canonical
         && object.canonical.bodyRange.startLine <= end && object.canonical.bodyRange.endLine >= start);
+      knowledgeStatus = { scope: 'page', state: view ? 'available' : release.manifest.schemaVersion === 1 ? 'legacy-unclassified' : 'unavailable',
+        objectRefs: matching.map((object) => ({ objectId: object.objectId, businessStatus: object.businessStatus,
+          reviewStatus: object.reviewStatus, evidenceCount: view!.evidenceByObject.get(object.objectId)?.length ?? 0 })),
+        note: '仅表示本页关联对象的状态；发布、机器审查通过和业务批准不同。缺少证据时需回源核对；对象证据位置使用 get_object 获取。' };
       const status = matching.length ? `knowledge_status: ${matching.slice(0, 3).map((object) => `${object.objectId} business=${object.businessStatus} review=${object.reviewStatus} evidence=${view!.evidenceByObject.get(object.objectId)?.length ?? 0}`).join('; ')}${matching.length > 3 ? `; 另有 ${matching.length - 3} 个对象` : ''}。业务未批准或缺少证据时需核对，详见 get_object。\n`
         : view ? 'knowledge_status: 本页未关联知识对象，不能据此判断业务批准状态。\n' : 'knowledge_status: 对象状态不可用，请回源核对。\n';
       text = frame(doc, release.releaseId, start, end, true, section?.headingPath) + sources + status + (continuation ? `next: startLine=${continuation} releaseId=${release.releaseId}\n` : '');
-      if (text.length <= budget) break;
+      if (JSON.stringify({ text, knowledgeStatus }).length <= budget) break;
       if (--end < start) invalid('maxChars', '预算不足以容纳一行及文档帧');
     }
-    return { releaseId: release.releaseId, text, next: continuation, startLine: start, endLine: end };
+    return { releaseId: release.releaseId, text, next: continuation, startLine: start, endLine: end, knowledgeStatus };
   }
   private sourcesText(manifest: KbManifest, doc: KbIndexDoc): string {
     if (!doc.sources.length) return '';

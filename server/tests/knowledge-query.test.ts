@@ -152,6 +152,7 @@ it('section reads include their own object anchor and exclude the following sect
   expect(read.text).not.toContain('ko_second');
   expect(read.text).toContain('business=unknown');
   expect(read.text).toContain('evidence=0');
+  expect(read.knowledgeStatus).toMatchObject({ scope: 'page', state: 'available', objectRefs: [{ objectId: 'ko_first', businessStatus: 'unknown', evidenceCount: 0 }] });
   const search = await service.search({ query: '第一节', releaseId: 'r_anchors' });
   expect(search.results[0].knowledgeStatus).toMatchObject({ scope: 'document', objectCount: 2, businessStatuses: { unknown: 1, approved: 1 }, withoutEvidence: 2 });
 });
@@ -448,4 +449,29 @@ describe('A案 §8.1 内置工具与 HTTP 端点透传（共用实现验证）',
       tools.revokeToken(token);
     }
   });
+});
+
+it('keeps object anchors with their headings across blank lines without requiring a knowledge manifest', async () => {
+  const body = ['# 文档', '<a id="ko_first"></a>', '', '## 第一节', '正文一', '', "<a id='ko_second'></a>", '', '', '## 第二节', '正文二'].join('\n');
+  writeSearchRelease(home, 'r_legacy_anchors', [{ path: '边界.md', body }]);
+  const first = await service.read({ path: '边界.md', section: '第一节', releaseId: 'r_legacy_anchors' });
+  expect(first.text).toContain('ko_first'); expect(first.text).not.toContain('ko_second');
+  expect(first.knowledgeStatus).toMatchObject({ state: 'legacy-unclassified', objectRefs: [] });
+  const second = await service.read({ path: '边界.md', section: '第二节', releaseId: 'r_legacy_anchors' });
+  expect(second.text).toContain('ko_second'); expect(second.text).not.toContain('正文一');
+  const outline = await service.outline({ path: '边界.md', releaseId: 'r_legacy_anchors' });
+  expect(outline.text).toContain('第一节');
+});
+
+it('retains section boundaries when v2 object status cannot be loaded', async () => {
+  const docPath = '状态损坏/锚点.md';
+  const body = ['# 文档', '<a id="ko_first"></a>', '', '## 第一节', '正文一', '<a id="ko_second"></a>', '', '## 第二节', '正文二'].join('\n');
+  const knowledge: KnowledgeManifest = { schemaVersion: 1, releaseId: 'r_broken_anchors', documents: [{ docId: 'kd_broken', path: docPath }],
+    objects: [makeObject('ko_first', '第一节', 'kd_broken', docPath, 2, 5), makeObject('ko_second', '第二节', 'kd_broken', docPath, 6, 9)],
+    presentations: [], relations: [], evidence: [], coverage: [], migrations: [] };
+  writeKnowledgeRelease(home, 'r_broken_anchors', [{ path: docPath, docId: 'kd_broken', body }], knowledge);
+  fs.writeFileSync(path.join(home, 'releases/r_broken_anchors/knowledge.json'), '{broken');
+  const read = await service.read({ path: docPath, section: '第一节', releaseId: 'r_broken_anchors' });
+  expect(read.text).toContain('ko_first'); expect(read.text).not.toContain('ko_second');
+  expect(read.knowledgeStatus).toMatchObject({ state: 'unavailable', objectRefs: [] });
 });

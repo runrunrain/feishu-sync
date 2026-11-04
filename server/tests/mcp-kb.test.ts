@@ -20,6 +20,7 @@ beforeEach(async () => {
   client = new Client({ name: 'synthetic-test-client', version: '2' }, { capabilities: {} });
   await client.connect(new StdioClientTransport({ command: process.execPath, args: [script, '--kb-root', root],
     env: { ...process.env, FEISHU_SYNC_HOME: root } as Record<string, string> }));
+  await client.listTools(); // SDK validates successful structured output against every advertised schema.
 });
 afterEach(async () => { await client.close(); fs.rmSync(root, { recursive: true, force: true }); });
 const docs = [
@@ -30,12 +31,12 @@ const docs = [
 function publish(id = 'r1') { return writeSearchRelease(root, id, docs); }
 async function call(name: string, args: Record<string, unknown> = {}, cap = 20000) {
   const response = await client.callTool({ name, arguments: args });
-  expect(response).not.toHaveProperty('structuredContent');
+  if (!response.isError) expect(response.structuredContent).toMatchObject({ releaseId: expect.any(String) });
   const content = response.content as Array<{ type: string; text: string }>;
   expect(content).toHaveLength(1); expect(content[0].type).toBe('text'); expect(content[0].text.length).toBeLessThanOrEqual(cap);
   return { response, text: content[0].text };
 }
-async function json(name: string, args: Record<string, unknown> = {}, cap = 20000) { const value = await call(name, args, cap); return { ...value, data: JSON.parse(value.text) }; }
+async function json(name: string, args: Record<string, unknown> = {}, cap = 20000) { const value = await call(name, args, cap); const data = JSON.parse(value.text); if (!value.response.isError) expect(value.response.structuredContent).toEqual(data); return { ...value, data }; }
 async function error(name: string, args: Record<string, unknown>, code: string) { const value = await json(name, args); expect(value.response.isError).toBe(true); expect(value.data.error.code).toBe(code); return value.data.error; }
 
 describe('seven read-only MCP tools', () => {
@@ -60,6 +61,7 @@ describe('seven read-only MCP tools', () => {
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual(['compare_knowledge', 'get_knowledge', 'get_knowledge_bundle', 'get_object', 'get_outline', 'get_release_info', 'grep_knowledge', 'list_knowledge', 'search_knowledge']);
     for (const tool of tools) {
+      expect(tool.outputSchema).toMatchObject({ type: 'object', required: expect.any(Array) });
       expect(tool.annotations).toEqual({ readOnlyHint: true, idempotentHint: true, openWorldHint: false });
       for (const keyword of ['oneOf', 'anyOf', 'allOf']) expect(tool.inputSchema).not.toHaveProperty(keyword);
     }
@@ -188,7 +190,7 @@ describe('seven read-only MCP tools', () => {
     const restored: string[] = [];
     for (;;) {
       const page = await call('get_knowledge', { docId: 'long', startLine, maxLines: 2000, releaseId: 'pi_long' }, 6000);
-      expect(Buffer.byteLength(page.text, 'utf8')).toBeLessThan(20000);
+      expect(Buffer.byteLength(JSON.stringify(page.response), 'utf8')).toBeLessThan(19000);
       for (const line of page.text.split('\n')) { const match = /^\s*\d+\t(.*)$/.exec(line); if (match) restored.push(match[1]); }
       const next = /next: startLine=(\d+)/.exec(page.text);
       expect(++pages).toBeLessThan(20);
