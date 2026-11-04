@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { KbManifest, RawSourceSnapshotEntry } from '../src/types/agent-knowledge.js';
 import { contentResourceHash, computeQuoteHash } from '../src/kb/evidence-locator.js';
 import { captureSourceContents } from '../src/kb/kb-version-store.js';
-import { progressiveSourceSnapshot, seedProgressiveCarriedReceipts } from '../src/kb/progressive-source-snapshot.js';
+import { progressiveSourceSnapshot, rebindBaselineImageEvidence, seedProgressiveCarriedReceipts } from '../src/kb/progressive-source-snapshot.js';
 import { computeSourceHash, RawSourceSnapshot } from '../src/kb/raw-source-snapshot.js';
 
 const roots: string[] = [];
@@ -143,7 +143,18 @@ describe('progressive source snapshot', () => {
       baselineReleaseRoot: releaseRoot, baselineEvidenceHash: indexHash };
     expect(seedProgressiveCarriedReceipts(input)).toBe(1);
     expect(draft.evidence[0]!.readReceiptId).toMatch(/^krr_stage_/);
+    const carried = rebindBaselineImageEvidence({ buildId: 'following-build', draft, snapshot: input.snapshot,
+      releaseRoot, evidenceIndexHash: indexHash });
+    expect(draft.evidence[0]!.readReceiptId).toMatch(/^krr_seed_/);
+    expect(carried).toHaveLength(1);
+    expect(JSON.parse(carried[0]!)).toMatchObject({ readReceiptId: draft.evidence[0]!.readReceiptId,
+      buildId: 'following-build', toolCallId: 'baseline-carry-image', resourceId });
+    const changed = new RawSourceSnapshot([{ ...manifest.sourceSnapshot[0]!, contentHash: 'changed-source' }]);
+    expect(rebindBaselineImageEvidence({ buildId: 'changed-build', draft, snapshot: changed,
+      releaseRoot, evidenceIndexHash: indexHash })).toEqual([]);
     fs.writeFileSync(path.join(releaseRoot, imagePath), 'tampered');
     expect(() => seedProgressiveCarriedReceipts(input)).toThrow('图片证据文件损坏');
+    expect(() => rebindBaselineImageEvidence({ buildId: 'next-build', draft, snapshot: input.snapshot,
+      releaseRoot, evidenceIndexHash: indexHash })).toThrow('图片证据文件损坏');
   });
 });

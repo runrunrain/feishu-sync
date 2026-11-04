@@ -261,3 +261,44 @@ export function seedProgressiveCarriedReceipts(input: {
   if (lines.length) fs.appendFileSync(path.join(input.stagingRoot, 'read-receipts.jsonl'), `${lines.join('\n')}\n`);
   return lines.length;
 }
+
+/** A progressive release stores stage-scoped image receipts. Rebind only
+ * unchanged published image evidence to the next build after verifying the
+ * immutable image bytes and caption against the release index. Changed source
+ * evidence stays untouched so the normal publish gate requires a rewrite. */
+export function rebindBaselineImageEvidence(input: {
+  buildId: string;
+  draft: KnowledgeDraftFile;
+  snapshot: RawSourceSnapshot;
+  releaseRoot: string;
+  evidenceIndexHash: string | null;
+}): string[] {
+  const eligible = input.draft.evidence.filter((evidence) => evidence.selector.kind === 'media_region'
+    && input.snapshot.get(evidence.sourceRef.sourceId)?.contentHash === evidence.sourceRef.sourceSnapshotHash);
+  if (eligible.length === 0) return [];
+  if (!input.evidenceIndexHash) throw new Error('基线图片证据缺少发布索引，无法接续回执');
+  const publishedImages = loadProgressiveBaselineImages({
+    releaseRoot: input.releaseRoot,
+    evidenceIndexHash: input.evidenceIndexHash,
+    resourceIds: new Set(eligible.map((evidence) => evidence.sourceRef.resourceId)),
+  });
+  return eligible.map((evidence) => {
+    const entry = input.snapshot.get(evidence.sourceRef.sourceId)!;
+    const resource = publishedImages.get(evidence.sourceRef.resourceId)?.resource;
+    if (!resource) throw new Error(`基线图片证据资源缺失：${evidence.evidenceId}`);
+    const readReceiptId = `krr_seed_${crypto.createHash('sha256')
+      .update(`${input.buildId}\0${evidence.evidenceId}\0${entry.contentHash}`).digest('hex').slice(0, 20)}`;
+    const verification = verifyEvidence({
+      evidence: { evidenceId: evidence.evidenceId, sourceRef: evidence.sourceRef,
+        selector: evidence.selector, quoteHash: evidence.quoteHash, readReceiptId },
+      resources: [resource],
+      receipts: [{ readReceiptId, resourceId: resource.resourceId, lineStart: 1, lineEnd: 1 }],
+    });
+    if (!verification.ok) throw new Error(`基线图片证据复核失败：${evidence.evidenceId} — ${verification.message}`);
+    evidence.readReceiptId = readReceiptId;
+    return JSON.stringify({ readReceiptId, buildId: input.buildId, unitId: null,
+      toolCallId: 'baseline-carry-image', sourceSnapshotHash: entry.contentHash,
+      resourceId: resource.resourceId, selector: { kind: 'read_range', lineStart: 1, lineEnd: 1 },
+      returnedHash: resource.resourceHash, truncated: false });
+  });
+}

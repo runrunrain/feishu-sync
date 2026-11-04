@@ -39,7 +39,7 @@ import { selectProgressiveCoverage } from './progressive-coverage.js';
 import { finalDraftEvidenceScopePaths, selectProgressiveKnowledgeDraft } from './progressive-knowledge-draft.js';
 import { getKbQueryService } from './search/kb-query-service.js';
 import { KbVersionStore, captureSourceContents, sourceChangePreview, sourceContentResourceSpans, type SourceContents } from './kb-version-store.js';
-import { loadProgressiveBaselineImages, progressiveSourceSnapshot, seedProgressiveCarriedReceipts } from './progressive-source-snapshot.js';
+import { loadProgressiveBaselineImages, progressiveSourceSnapshot, rebindBaselineImageEvidence, seedProgressiveCarriedReceipts } from './progressive-source-snapshot.js';
 import { hasEditorialHistory, hasSourceMetadata } from './body-policy.js';
 import { planUnits, packBatches, type BuildUnit } from './build-units.js';
 import {
@@ -2496,7 +2496,8 @@ export class KbBuildService extends EventEmitter {
       if (!resume && baseManifest) {
         const baselineKnowledge = new KbVersionStore(outputRoot).readKnowledgeManifest(baseManifest.releaseId);
         if (baselineKnowledge && baselineKnowledge.objects.length > 0) {
-          const seeded = this.seedBaselineKnowledge(buildId, stagingRootPath, baselineKnowledge, snapshot, config.knowledgeBaseRoot);
+          const seeded = this.seedBaselineKnowledge(buildId, stagingRootPath, baselineKnowledge, snapshot,
+            config.knowledgeBaseRoot, path.join(outputRoot, 'releases', baseManifest.releaseId), baseManifest.evidence?.hash ?? null);
           if (seeded > 0) {
             this.emitLog(buildId, 'info', `基线组织登记已装载：${seeded} 个对象进入工具注册表（身份与有效审查保留，未变对象不重声明；diting F06/A 案 §7.2）`);
           }
@@ -3208,7 +3209,7 @@ export class KbBuildService extends EventEmitter {
    *   有效审查随对象保留；重声明时按实际载荷失效/继承）。
    * - 复制到 staging 的托管文档：docs[path] 标 basis='published'（编译直
    *   通行发布坐标）并记 carriedHash（发布前复核未被旧式重写）。
-   * - text/csv 证据：对新快照重新解引用，通过后以 baseline-carry 回执接续
+   * - text/csv/image 证据：对新快照或冻结发布图片重新解引用，通过后以 baseline-carry 回执接续
    *   读取轨迹（回执范围即证据选择范围；源已变化则保持原样，由发布门禁
    *   显式失败）；readReceiptId 更新不影响 payload/reviewSubjectHash。
    * - 迁移：累积映射预置进 organization-plan.json（kb_submit_plan 只替换
@@ -3221,6 +3222,8 @@ export class KbBuildService extends EventEmitter {
     baseline: KnowledgeManifest,
     snapshot: RawSourceSnapshot,
     knowledgeBaseRoot: string,
+    baselineReleaseRoot: string,
+    baselineEvidenceHash: string | null,
   ): number {
     const draft: KnowledgeDraftFile = {
       schemaVersion: 1,
@@ -3262,8 +3265,11 @@ export class KbBuildService extends EventEmitter {
     draft.coverage = (baseline.coverage ?? []).map((item) => JSON.parse(JSON.stringify(item)));
     draft.evidence = (baseline.evidence ?? []).map((item) => JSON.parse(JSON.stringify(item)));
 
+    // 阶段发布的图片回执也绑定旧 build；先从不可变发布产物验证本体和描述，
+    // 再接续为本 build 的回执。源已变化时保留旧声明，由发布门禁要求重写。
+    const receiptLines = rebindBaselineImageEvidence({ buildId, draft, snapshot,
+      releaseRoot: baselineReleaseRoot, evidenceIndexHash: baselineEvidenceHash });
     // text/csv 证据回执接续（源未变时验证通过 → baseline-carry 回执替换旧 id）
-    const receiptLines: string[] = [];
     for (const evidence of draft.evidence) {
       if (evidence.selector.kind !== 'text_span' && evidence.selector.kind !== 'csv_cells') continue;
       const entry = snapshot.get(evidence.sourceRef.sourceId);
