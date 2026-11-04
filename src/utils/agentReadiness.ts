@@ -162,6 +162,7 @@ export const KB_SOURCE_STATE_LABEL: Record<string, string> = {
   missing: '已缺失',
   deleted: '已删除',
   excluded: '已排除',
+  packaged: '共享包快照',
 };
 
 /** 相对时间（会话列表/构建历史）；只做展示级近似。 */

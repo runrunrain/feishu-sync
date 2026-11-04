@@ -1,24 +1,22 @@
 /**
  * KnowledgeView —— 标准知识库主区（F2，设计 §11.2）
  *
- * 布局：左侧常驻目录，右侧按需展开来源、发布、构建和进度。
+ * 布局：左侧常驻目录，右侧按需展开来源、共享、构建和进度。
  *
  * 状态覆盖：加载骨架 / 未发布（Agent 就绪→引导构建；未就绪→原因+跳转）/
  * 服务不可达 / 文档加载失败 / 构建运行中（按钮禁用+取消）/ 构建失败
  * （issues + 「当前发布版本未变」）。不渲染任何假数据。
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
-import { AlertCircle, BookOpen, ChevronLeft, ChevronRight, CloudUpload, Hammer, Link2, ListTree, Loader2, Settings2, ShieldCheck, Sparkles } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react';
+import { Activity, AlertCircle, BookOpen, ChevronLeft, ChevronRight, Hammer, Link2, ListTree, Loader2, Settings2, Share2, ShieldCheck, Sparkles } from 'lucide-react';
 import { KbReadingControls } from '../components/kb/KbReadingControls';
 import { useKbReadingPreferences } from '../hooks/useKbReadingPreferences';
 import { KbTreePanel } from '../components/kb/KbTreePanel';
 import { KbSourcePanel } from '../components/kb/KbSourcePanel';
 import { KbChangesPanel, type KbChangeTab } from '../components/kb/KbChangesPanel';
 import { KbBuildPanel, type BuildLogLine } from '../components/kb/KbBuildPanel';
-import { KbPublishPanel } from '../components/kb/KbPublishPanel';
-import { KbPublishModal, type KbPublishModalTab } from '../components/kb/KbPublishModal';
-import { KbPublishStateBadge } from '../components/kb/KbPublishStateBadge';
+import { KbTransferPanel } from '../components/kb/KbTransferPanel';
 import { KbGovernancePanel } from '../components/kb/KbGovernancePanel';
 import { RawSourceDrawer } from '../components/kb/RawSourceDrawer';
 import { MarkdownView } from '../components/preview/MarkdownView';
@@ -38,20 +36,15 @@ import {
   getKbTree,
   getSseAuth,
   listKbBuilds,
-  listKbPublications,
   resumeKbBuild,
 } from '../api/client';
 import type { KbBuildDto, KbBuildIssue, KbDocDto, KbDocSourceRef, KbStatusDto, KbTreeNode } from '../types/agent';
-import type { KbPublicationRowDto } from '../types/kb-publish';
 import { SseConnection } from '../utils/sseStream';
 import { describeReadinessCode as describeReadiness } from '../utils/agentReadiness';
-import { flattenDocPaths } from '../utils/kbPublish';
 
 interface KnowledgeViewProps {
   active?: boolean;
   onJumpToSettings?: () => void;
-  /** P1-S9：发布门控/发布根设置的直达入口（设置 → 飞书认证 → 飞书发布）。 */
-  onJumpToPublishSettings?: () => void;
 }
 
 const TERMINAL_BUILD = new Set(['published', 'failed', 'cancelled', 'interrupted']);
@@ -106,7 +99,7 @@ function publishedDocIdAtPath(nodes: KbTreeNode[], targetPath: string): string |
   return null;
 }
 
-export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublishSettings }: KnowledgeViewProps) {
+export function KnowledgeView({ active = true, onJumpToSettings }: KnowledgeViewProps) {
   const { push: pushToast } = useToast();
   const { preferences, updatePreferences, storageUnavailable } = useKbReadingPreferences();
   const agent = useAgentStatus(active);
@@ -131,8 +124,7 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
   const [buildIssues, setBuildIssues] = useState<KbBuildIssue[]>([]);
   const [buildLogs, setBuildLogs] = useState<BuildLogLine[]>([]);
   const [directoryOpen, setDirectoryOpen] = useState(true);
-  const [sidebar, setSidebar] = useState<'sources' | 'build' | 'publish' | 'governance' | null>(null);
-  const [buildPane, setBuildPane] = useState<'configure' | 'progress'>('configure');
+  const [sidebar, setSidebar] = useState<'sources' | 'share' | 'build' | 'progress' | 'governance' | null>(null);
   const [cancelling, setCancelling] = useState(false);
   const [confirming, setConfirming] = useState<'incremental' | 'selected' | null>(null);
   const [selectedBuildCount, setSelectedBuildCount] = useState(0);
@@ -143,9 +135,6 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
 
   const [changeTab, setChangeTab] = useState<KbChangeTab>('sources');
   const [source, setSource] = useState<KbDocSourceRef | null>(null);
-  const [publications, setPublications] = useState<KbPublicationRowDto[]>([]);
-  const [publicationsLoading, setPublicationsLoading] = useState(false);
-  const [publishModal, setPublishModal] = useState<{ open: boolean; tab: KbPublishModalTab }>({ open: false, tab: 'publish' });
   const docReqSeq = useRef(0);
   const readingBodyRef = useRef<HTMLDivElement>(null);
   const pendingDocAnchor = useRef<{ path: string; anchor: string } | null>(null);
@@ -197,32 +186,12 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
     }
   }, [pushToast]);
 
-  // ---- 反向发布记录（P1-S9：树/详情徽标 + 发布历史数据面） ---------------
-  const loadPublications = useCallback(async () => {
-    setPublicationsLoading(true);
-    try {
-      const data = await listKbPublications();
-      setPublications(data.publications ?? []);
-    } catch {
-      // 旧版本服务端无该端点时静默降级：无徽标，不阻断阅读主链路。
-      setPublications([]);
-    } finally {
-      setPublicationsLoading(false);
-    }
-  }, []);
-
   useEffect(() => {
     if (!active) return;
     void loadStatus().then((status) => {
       if (status?.current) void loadTree();
     });
-    void loadPublications();
-  }, [active, loadStatus, loadTree, loadPublications]);
-
-  const publicationsByPath = useMemo(
-    () => new Map(publications.map((row) => [row.kbPath, { state: row.state, cloudUrl: row.cloudUrl }])),
-    [publications],
-  );
+  }, [active, loadStatus, loadTree]);
 
   // 发布完成后刷新：状态 + 新树。
   const refreshPublished = useCallback(async () => {
@@ -343,7 +312,7 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
           ? await createKbBuild('incremental', { rebuildSelected: true, ...(refresh ? { refreshImages: true } : {}) })
           : await createKbBuild('incremental');
         setBuild(dto);
-        setBuildPane('progress');
+        setSidebar('progress');
         setBuildIssues([]);
         setBuildLogs([]);
         if (dto.status === 'published') {
@@ -396,7 +365,7 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
     setResuming(true);
     try {
       const dto = await resumeKbBuild(build.id);
-      setBuild(dto); setBuildPane('progress'); setBuildIssues([]); setResumeConfirm(false);
+      setBuild(dto); setSidebar('progress'); setBuildIssues([]); setResumeConfirm(false);
       appendLog('info', '已请求从检查点继续构建');
     } catch (error) {
       pushToast({ type: 'error', message: error instanceof Error ? error.message : '继续构建失败' });
@@ -430,7 +399,7 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
 
   useEffect(() => { if (!active) setSidebar(null); }, [active]);
   useEffect(() => {
-    if (sidebar !== 'build' || buildPane !== 'progress' || build) return;
+    if (sidebar !== 'progress' || build) return;
     let disposed = false;
     setRecentBuildLoading(true);
     void listKbBuilds(1).then(async ({ builds }) => {
@@ -439,7 +408,7 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
       if (!disposed) { setBuild(detail); setBuildIssues(detail.report?.issues ?? []); }
     }).catch(() => undefined).finally(() => { if (!disposed) setRecentBuildLoading(false); });
     return () => { disposed = true; };
-  }, [sidebar, buildPane, build]);
+  }, [sidebar, build]);
 
   // ---- 派生状态 -----------------------------------------------------------
   const agentReady = agent.status?.code === 'ready' && !agent.unreachable;
@@ -450,24 +419,34 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
 
   const openBuild = (tab: KbChangeTab) => {
     setChangeTab(tab);
-    setBuildPane('configure');
     setSidebar('build');
   };
 
   const sidebarItems = [
     { id: 'sources' as const, label: '来源', name: '来源与文档信息', icon: Link2 },
-    { id: 'publish' as const, label: '发布', name: '发布到飞书', icon: CloudUpload },
+    { id: 'share' as const, label: '共享', name: '标准库导入导出', icon: Share2 },
     { id: 'build' as const, label: '构建', name: '构建标准库', icon: Hammer },
+    { id: 'progress' as const, label: '进度', name: '构建进度', icon: Activity },
     { id: 'governance' as const, label: '治理', name: '人工复核与业务决定', icon: ShieldCheck },
   ];
-
-  const docPublication = doc ? publicationsByPath.get(doc.path) ?? null : null;
-  const publishConflictCount = publications.filter((row) => row.state === 'conflict' || row.state === 'unknown').length;
 
   const scrollToPublishedAnchor = useCallback((anchor: string) => {
     const target = [...(readingBodyRef.current?.querySelectorAll('[id]') ?? [])].find((element) => element.id === anchor);
     target?.scrollIntoView({ block: 'start' });
   }, []);
+  const openGovernanceDoc = useCallback((path: string, anchor: string | null) => {
+    const targetDocId = tree ? publishedDocIdAtPath(tree.nodes, path) : null;
+    if (!targetDocId) {
+      pushToast({ type: 'warning', message: `正式文档未找到：${path}` });
+      return;
+    }
+    if (targetDocId === selectedDocId) {
+      if (anchor) scrollToPublishedAnchor(anchor);
+      return;
+    }
+    pendingDocAnchor.current = anchor ? { path, anchor } : null;
+    setSelectedDocId(targetDocId);
+  }, [tree, selectedDocId, pushToast, scrollToPublishedAnchor]);
   const navigatePublishedLink = useCallback((href: string): boolean => {
     if (!doc || !tree) return false;
     const targetPath = resolveKnowledgeDocPath(doc.path, href);
@@ -510,7 +489,7 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
           <button type="button" onClick={() => setDirectoryOpen(false)} aria-label="收起目录" title="收起目录" className="p-1 text-ink-faint hover:text-ink"><ChevronLeft className="w-4 h-4" /></button>
         </header>
         {tree ? <KbTreePanel nodes={tree.nodes} selectedDocId={selectedDocId} onSelectDoc={setSelectedDocId}
-          releaseId={tree.releaseId} publicationsByPath={publicationsByPath} />
+          releaseId={tree.releaseId} />
           : <p className="p-4 text-xs text-ink-faint">发布后在此浏览目录和搜索。</p>}
       </aside> : <div className="shrink-0 w-9 rounded-md border border-line bg-card-bg shadow-sm flex justify-center pt-2">
         <button type="button" onClick={() => setDirectoryOpen(true)} aria-label="打开目录" title="打开目录" className="self-start p-2 rounded text-ink-faint hover:bg-paper hover:text-ink"><ListTree className="w-4 h-4" /></button>
@@ -521,10 +500,13 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
           <BookOpen className="w-4 h-4 text-seal shrink-0" />
           <h2 className="text-sm font-kai text-ink truncate flex-1">{doc?.title ?? '标准知识库'}</h2>
           {doc ? <KbReadingControls preferences={preferences} onChange={updatePreferences} storageUnavailable={storageUnavailable} active={active} /> : null}
-          {running ? <button type="button" onClick={() => { setBuildPane('progress'); setSidebar('build'); }} className="shrink-0 flex items-center gap-1 text-xs text-seal">
+          {running ? <button type="button" onClick={() => setSidebar('progress')} className="shrink-0 flex items-center gap-1 text-xs text-seal">
             <Loader2 className="w-3 h-3 animate-spin" /> 更新中
           </button> : pendingTotal > 0 ? <button type="button" onClick={() => openBuild('pending')} className="shrink-0 text-xs text-seal">{pendingTotal} 处待更新</button> : null}
         </header>
+        {kbStatus?.current?.imported ? <div role="status" className="shrink-0 px-5 py-2 border-b border-jade/20 bg-jade/5 text-xs text-ink-soft">
+          当前阅读共享包导入版本。来源追溯使用包内快照；本机原始文档与同步账号未被替换。
+        </div> : null}
         {doc?.sources.some((source) => source.state === 'deleted') ? <div role="status" className="shrink-0 px-5 py-2 border-b border-seal-2/20 bg-seal-2/5 text-xs text-seal-2 flex flex-wrap items-center gap-2">
           <span>本文引用的原始文档已删除，当前内容可能过时。</span>
           <button type="button" className="underline" onClick={() => openBuild('pending')}>查看差异并更新构建</button>
@@ -554,7 +536,7 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
       </article>
 
       {sidebar ? <aside className="absolute right-14 inset-y-0 z-30 xl:static shrink-0 h-full min-h-0 rounded-md border border-line bg-card-bg shadow-lg xl:shadow-sm flex flex-col overflow-hidden"
-        style={{ width: sidebar === 'build' ? 'min(440px, calc(100vw - 104px))' : 'min(320px, calc(100vw - 104px))' }} aria-label="标准库侧栏" data-testid="kb-sidebar">
+        style={{ width: sidebar === 'build' || sidebar === 'progress' || sidebar === 'governance' ? 'min(440px, calc(100vw - 104px))' : 'min(320px, calc(100vw - 104px))' }} aria-label="标准库侧栏" data-testid="kb-sidebar">
         <header className="shrink-0 h-11 px-3 border-b border-line/60 flex items-center justify-between">
           <h3 className="text-sm font-kai text-ink">{sidebarItems.find((item) => item.id === sidebar)?.name}</h3>
           <button type="button" onClick={() => setSidebar(null)} aria-label="收起标准库侧栏" title="收起侧栏" className="p-1 text-ink-faint hover:text-ink"><ChevronRight className="w-4 h-4" /></button>
@@ -565,33 +547,23 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
               <p className="text-ink-faint break-all">{doc.path}</p>
               {doc.tags.length ? <p className="text-jade">{doc.tags.join(' · ')}</p> : null}
               <p className="font-mono text-[10px] break-all text-ink-faint">{doc.releaseId}</p>
-              <div className="flex items-center gap-2 pt-1" data-testid="kb-doc-publish-state">
-                <span className="text-ink-faint">飞书发布</span>
-                {docPublication ? <KbPublishStateBadge state={docPublication.state} showAllStates cloudUrl={docPublication.cloudUrl} /> : <span className="text-ink-faint">未发布</span>}
-              </div>
             </div>
             <div className="min-h-[200px]"><KbSourcePanel docTitle={doc.title} sources={doc.sources} onOpenSource={setSource} /></div>
           </div> : <p className="p-4 text-xs text-ink-faint">选择文档后查看来源与文档信息。</p>
-          : sidebar === 'governance' ? <KbGovernancePanel />
-          : sidebar === 'publish' ? <KbPublishPanel
-            publications={publications}
-            loading={publicationsLoading}
-            docCount={tree ? flattenDocPaths(tree.nodes).length : 0}
-            onOpenPublish={() => setPublishModal({ open: true, tab: 'publish' })}
-            onOpenHistory={() => setPublishModal({ open: true, tab: 'history' })}
-            onRefresh={() => void loadPublications()} />
-          : <div className="flex-1 min-h-0 flex flex-col" data-testid="kb-build-sidebar-container">
-            <div className="shrink-0 flex items-center gap-1 px-3 py-2 border-b border-line/60" role="tablist" aria-label="构建侧栏视图">
-              <button type="button" role="tab" aria-selected={buildPane === 'configure'} onClick={() => setBuildPane('configure')}
-                className={`rounded px-3 py-1.5 text-xs ${buildPane === 'configure' ? 'bg-seal/10 text-seal font-medium' : 'text-ink-soft hover:bg-paper'}`}>源文档与变更</button>
-              <button type="button" role="tab" aria-selected={buildPane === 'progress'} onClick={() => setBuildPane('progress')}
-                className={`rounded px-3 py-1.5 text-xs ${buildPane === 'progress' ? 'bg-seal/10 text-seal font-medium' : 'text-ink-soft hover:bg-paper'}`}>构建进度{running ? ' · 进行中' : ''}</button>
-            </div>
-            {buildPane === 'progress' ? build ? <KbBuildPanel open build={build} issues={buildIssues} logs={buildLogs}
+          : sidebar === 'governance' ? <KbGovernancePanel onOpenDoc={openGovernanceDoc} />
+          : sidebar === 'share' ? <div className="flex-1 min-h-0 overflow-auto scrollbar-thin p-4 text-xs text-ink-soft">
+            <KbTransferPanel
+              releaseId={kbStatus?.current?.releaseId ?? null}
+              activeBuild={running}
+              onChanged={() => { void refreshPublished(); setDocReload((n) => n + 1); }} />
+          </div>
+          : sidebar === 'progress' ? <div className="flex-1 min-h-0 flex flex-col" data-testid="kb-progress-sidebar-container">
+            {build ? <KbBuildPanel open build={build} issues={buildIssues} logs={buildLogs}
               onCollapse={() => setSidebar(null)} onCancel={cancelBuild} cancelling={cancelling} layout="sidebar"
               onResume={() => setResumeConfirm(true)} onRestart={() => openBuild('sources')} resuming={resuming}
               onBuildUpdated={setBuild} />
-              : <p className="p-4 text-xs text-ink-faint">{recentBuildLoading ? '正在读取最近的构建记录…' : '尚无构建记录。可在“源文档与变更”中发起构建。'}</p> : <>
+              : <p className="p-4 text-xs text-ink-faint">{recentBuildLoading ? '正在读取最近的构建记录…' : '尚无构建记录。可在“构建”中发起。'}</p>}
+          </div> : <div className="flex-1 min-h-0 flex flex-col" data-testid="kb-build-sidebar-container">
             {!agentReady ? <div className="shrink-0 px-4 py-2 border-b border-line/60 text-xs text-ink-soft space-y-1">
               {agent.loading ? <StatusBadge status="loading">检测中</StatusBadge> : <StatusBadge status="warning">{readiness?.reason ?? 'Agent 未就绪'}</StatusBadge>}
               {readiness?.action ? <p className="leading-relaxed">{readiness.action}</p> : null}
@@ -606,37 +578,23 @@ export function KnowledgeView({ active = true, onJumpToSettings, onJumpToPublish
               onUpdate={() => setConfirming('incremental')}
               onBuildSelected={(count) => { setSelectedBuildCount(count); setRefreshImages(false); setConfirming('selected'); }}
               onOpenSource={(choice) => setSource({ objToken: choice.objToken, title: choice.title, relPath: choice.relPath, state: choice.excluded ? 'excluded' : 'current' })} />
-          </>}
           </div>}
       </aside> : null}
 
       <nav className="shrink-0 w-12 rounded-md border border-line bg-card-bg shadow-sm flex flex-col items-center gap-1 py-2" aria-label="标准库工具">
         {sidebarItems.map(({ id, label, name, icon: Icon }) => <button key={id} type="button" data-sidebar-trigger={id}
           onClick={() => {
-            if (id === 'build' && sidebar !== 'build') setBuildPane(running ? 'progress' : 'configure');
             setSidebar((value) => value === id ? null : id);
           }} aria-label={`${sidebar === id ? '收起' : '打开'}${name}`}
           aria-expanded={sidebar === id} title={name}
           className={`relative w-10 min-h-[44px] flex flex-col items-center justify-center gap-1 rounded text-[10px] transition-colors ${sidebar === id ? 'bg-seal/10 text-seal' : 'text-ink-faint hover:bg-paper hover:text-ink'}`}>
-          {id === 'build' && running ? <Loader2 className="w-4 h-4 animate-spin text-seal" /> : <Icon className="w-4 h-4" />}<span>{label}</span>
-          {id === 'build' && (pendingTotal > 0 || running) ? <span className="absolute right-1 top-1 w-1.5 h-1.5 rounded-full bg-seal" /> : null}
-          {id === 'publish' && publishConflictCount > 0 ? <span className="absolute right-1 top-1 w-1.5 h-1.5 rounded-full bg-seal-2" aria-label={`${publishConflictCount} 篇文档发布异常`} /> : null}
+          {id === 'progress' && running ? <Loader2 className="w-4 h-4 animate-spin text-seal" /> : <Icon className="w-4 h-4" />}<span>{label}</span>
+          {id === 'build' && pendingTotal > 0 ? <span className="absolute right-1 top-1 w-1.5 h-1.5 rounded-full bg-seal" /> : null}
+          {id === 'progress' && running ? <span className="absolute right-1 top-1 w-1.5 h-1.5 rounded-full bg-seal" /> : null}
         </button>)}
       </nav>
 
       <RawSourceDrawer source={source} onClose={() => setSource(null)} />
-
-      {/* 反向发布弹窗（P1-S9）：发布流四步 + 发布历史 */}
-      <KbPublishModal
-        open={publishModal.open}
-        initialTab={publishModal.tab}
-        onClose={() => setPublishModal((value) => ({ ...value, open: false }))}
-        nodes={tree?.nodes ?? []}
-        publications={publications}
-        publicationsLoading={publicationsLoading}
-        onPublicationsChanged={() => void loadPublications()}
-        onJumpToSettings={onJumpToPublishSettings}
-      />
 
       <Modal open={resumeConfirm} title="确认从断点继续" onClose={() => { if (!resuming) setResumeConfirm(false); }}>
         <div className="space-y-3 text-sm text-ink-soft leading-relaxed">

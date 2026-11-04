@@ -280,21 +280,21 @@ describe('人工复核 / 快照 / 待治理联查', () => {
     expect(after.revision).toBe(1);
   });
 
-  it('pendingGovernanceWork：高风险无人审 / candidate / 决定过期分组', () => {
+  it('pendingGovernanceWork：单纯高风险不列为问题；候选、决定过期和明确复核拒绝才列出', () => {
     const stale = objectOf('ko_objStale', { businessStatus: 'candidate', claims: [{ claimKey: 'cap-x', bodyRange: { startLine: 2, endLine: 2 }, riskCategory: 'high', evidenceIds: [] }] });
     const service = makeService([...manifestObjects, stale]);
     // objStale 的旧决定绑定别的载荷 → payloadMismatch 分组
     service.recordDecision(decisionInput(stale, { payloadHash: 'sha256:old' }));
     const view = service.pendingGovernanceWork();
     expect(view.releaseId).toBe('r_gov1');
-    expect(view.highRisk.map((item) => item.objectId).sort()).toEqual(['ko_objA', 'ko_objStale']);
+    expect(view.highRisk).toEqual([]);
     expect(view.candidates.map((item) => item.objectId)).toContain('ko_objA');
     expect(view.staleDecisions.map((item) => item.objectId)).toEqual(['ko_objStale']);
     expect(view.candidates.find((item) => item.objectId === 'ko_objA')!.allowedDecisionTargets).toEqual(['approved']);
-    // 人工复核后移出 highRisk 分组
-    service.recordHumanReview({ objectId: 'ko_objA', reviewSubjectHash: manifestObjects[0]!.reviewSubjectHash, passed: true });
+    service.recordHumanReview({ objectId: 'ko_objA', reviewSubjectHash: manifestObjects[0]!.reviewSubjectHash, passed: false, note: '正文和源不一致' });
     const reviewed = service.pendingGovernanceWork();
-    expect(reviewed.highRisk.map((item) => item.objectId)).toEqual(['ko_objStale']);
+    expect(reviewed.highRisk.map((item) => item.objectId)).toEqual(['ko_objA']);
+    expect(reviewed.highRisk[0]!.reviewRejection).toBe('正文和源不一致');
   });
 });
 
@@ -433,7 +433,7 @@ function govDraft(mutate?: (draft: KnowledgeDeclarationSet) => void): KnowledgeD
   return draft;
 }
 
-function govGates(draft: KnowledgeDeclarationSet, governance?: GovernanceSnapshotForBuild) {
+function govGates(draft: KnowledgeDeclarationSet, governance?: GovernanceSnapshotForBuild, draftDocPaths?: ReadonlySet<string>) {
   const docs: CompilerDocInput[] = [{ path: 'rules.md', content: `${GOV_HEADER}${RULES_BODY}\n` }];
   const compiled = compileKnowledgeRelease({ docs, knowledgeDraft: draft, releaseId: 'r_govt', evidenceResources: [] });
   return runKnowledgeGates({
@@ -443,6 +443,7 @@ function govGates(draft: KnowledgeDeclarationSet, governance?: GovernanceSnapsho
     snapshot: { entries: [], get: () => undefined, readVerified: () => { throw new Error('unused'); }, size: 0 } as never,
     knowledgeBaseRoot: dataRoot,
     ...(governance ? { governance } : {}),
+    ...(draftDocPaths ? { draftDocPaths } : {}),
   });
 }
 
@@ -514,6 +515,34 @@ describe('validator：决定门禁（治理快照传入时）', () => {
     const carried = govDraft((d) => { d.objects[0]!.reviewActorKind = 'human'; });
     const carriedGates = govGates(carried, govSnapshot([]));
     expect(carriedGates.blocking.some((item) => item.code === 'kb_review_human_missing')).toBe(false);
+  });
+
+  it('增量构建只要求本次写入或本次批准的高风险对象人审；旧版未改对象不整批阻断', () => {
+    const draft = govDraft();
+    const empty = new Set<string>();
+    const carried = govGates(draft, govSnapshot([]), empty);
+    expect([...carried.blocking, ...carried.warnings].some((issue) => issue.code === 'kb_review_human_missing')).toBe(false);
+
+    const changed = govGates(draft, govSnapshot([]), new Set(['rules.md']));
+    expect(changed.blocking.some((issue) => issue.code === 'kb_review_human_missing' && issue.objectId === 'ko_objA')).toBe(true);
+
+    const object = draft.objects[0]!;
+    const approval = {
+      decisionId: 'kbd_approved', createdAt: '2026-11-01T00:00:00Z', actor: '主上',
+      objectId: object.objectId, payloadHash: object.payloadHash, scopeKey: object.scopeKey,
+      businessStatus: 'approved' as const, rationale: '已核对业务规则',
+    };
+    const approved = govGates(draft, govSnapshot([approval]), empty);
+    expect(approved.blocking.some((issue) => issue.code === 'kb_review_human_missing' && issue.objectId === 'ko_objA')).toBe(true);
+
+    const staleApproval = govGates(draft, govSnapshot([{ ...approval, payloadHash: 'sha256:old' }]), empty);
+    expect(staleApproval.blocking.some((issue) => issue.code === 'kb_review_human_missing')).toBe(false);
+
+    const rejected = govGates(draft, govSnapshot([], [{
+      reviewId: 'kbr_reject', createdAt: '2026-11-01T00:00:00Z', actor: '主上',
+      objectId: object.objectId, reviewSubjectHash: object.reviewSubjectHash, passed: false,
+    }]), empty);
+    expect(rejected.blocking.some((issue) => issue.code === 'kb_review_human_rejected' && issue.objectId === 'ko_objA')).toBe(true);
   });
 
   it('supersedes 边 decisionRef 不解析 / 非有效决定 → kb_decision_invalid blocking；解析到有效决定 → 通过', () => {
@@ -683,7 +712,7 @@ describe('路由：/api/kb/governance/*', () => {
       transitionTable: Record<string, string[]>;
     };
     expect(pending.releaseId).toBe('r_gov1');
-    expect(pending.highRisk.map((item) => item.objectId)).toContain('ko_objA');
+    expect(pending.highRisk).toEqual([]);
     expect(pending.transitionTable.unknown).toEqual(['approved']);
   });
 });

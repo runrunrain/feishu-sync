@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import { PiRpcProcess, type RunOutcome } from './pi-rpc-process.js';
+import { PiRpcProcess, type RunOutcome, type AgentPromptOptions } from './pi-rpc-process.js';
 import { inspectClaudeCode } from './claude-runtime.js';
 
 export interface ClaudeCodeOptions {
@@ -148,7 +148,7 @@ export class ClaudeCodeProcess extends PiRpcProcess {
       isError: event.isError === true, content: [{ type: 'text', text: event.resultSummary ?? '' }] });
   }
 
-  override async prompt(message: string, options: { streamingBehavior?: 'steer' | 'followUp'; timeoutMs?: number } = {}): Promise<RunOutcome> {
+  override async prompt(message: string, options: AgentPromptOptions = {}): Promise<RunOutcome> {
     if (this.closed || !this.configDir) throw new Error('Claude Code 未启动');
     if (this.running) throw new Error('已有运行未完成');
     this.running = true; this.aborted = false;
@@ -157,6 +157,7 @@ export class ClaudeCodeProcess extends PiRpcProcess {
       '--mcp-config', path.join(this.configDir, 'mcp.json'), '--permission-mode', 'dontAsk',
       '--allowedTools', this.settings.tools.map((name) => `mcp__feishu_sync__${name}`).join(','),
       '--output-format', 'stream-json', '--include-partial-messages', '--verbose', '--model', this.settings.model,
+      ...(options.images?.length ? ['--input-format', 'stream-json'] : []),
       '--system-prompt-snapshot', 'off',
       ...(this.contextText ? ['--append-system-prompt-file', path.join(this.configDir, 'context.txt')] : []),
       ...(fs.existsSync(this.sessionMarker) ? ['--resume', this.claudeId] : ['--session-id', this.claudeId]),
@@ -248,7 +249,10 @@ export class ClaudeCodeProcess extends PiRpcProcess {
     child.stderr?.setEncoding('utf8');
     child.stderr?.on('data', (chunk: string) => { stderr = (stderr + chunk).slice(-4000); });
     child.stdin?.on('error', () => undefined);
-    child.stdin?.end(message);
+    child.stdin?.end(options.images?.length ? JSON.stringify({ type: 'user', message: { role: 'user', content: [
+      { type: 'text', text: message },
+      ...options.images.map((image) => ({ type: 'image', source: { type: 'base64', media_type: image.mimeType, data: image.data } })),
+    ] } }) + '\n' : message);
     const timeout = setTimeout(() => { timedOut = true; void this.abort(); }, options.timeoutMs ?? this.settings.promptTimeoutMs ?? 900_000);
     timeout.unref?.();
     const exit = await new Promise<{ code: number | null; error?: Error }>((resolve) => {

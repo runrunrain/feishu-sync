@@ -14,6 +14,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { bundleMcp, bundleGateway } from './lib/mcp-bundle.mjs';
 import { bundleCli } from './lib/cli-bundle.mjs';
+import { bundleAmagi } from './lib/bundled-amagi.mjs';
 
 const serverRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const srcRoot = path.join(serverRoot, 'src');
@@ -47,6 +48,9 @@ const promptCount = copyDir(promptsSrc, path.join(distRoot, 'agent', 'prompts'))
 const extensionCount = copyDir(extensionSrc, path.join(distRoot, 'agent', 'pi-extension'));
 fs.copyFileSync(path.join(srcRoot, 'agent', 'claude-bridge.cjs'), path.join(distRoot, 'agent', 'claude-bridge.cjs'));
 console.info(`[build-agent-assets] copied ${promptCount} prompt file(s), ${extensionCount} extension file(s)`);
+
+// Private plugin is bundled at build time, including locked production dependencies.
+await bundleAmagi();
 
 // 固定 amagi Git commit 的本地修复补丁由安装器校验 SHA-256 后应用。
 copyDir(path.join(serverRoot, 'patches'), path.join(distRoot, 'patches'));

@@ -9,6 +9,8 @@ import type { SessionModelConfig } from '../types/agent-knowledge.js';
 
 import { Hono } from 'hono';
 import { streamSSE } from 'hono/streaming';
+import { bodyLimit } from 'hono/body-limit';
+import { ChatAttachmentError, CHAT_MAX_FILE_BYTES } from '../agent/chat-attachments.js';
 import type { Context } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import crypto from 'node:crypto';
@@ -50,7 +52,7 @@ export interface AgentRouteDeps {
   runtimeInstaller?: RuntimeInstaller;
 }
 function errorResponse(c: Context, error: unknown): Response {
-  if (error instanceof ToolError) {
+  if (error instanceof ToolError || error instanceof ChatAttachmentError) {
     const details = (error as ToolError & { details?: unknown }).details;
     return c.json(
       {
@@ -286,12 +288,43 @@ export async function agentRoutes(deps: AgentRouteDeps): Promise<Hono> {
     }
   });
 
+  routes.post('/api/agent/sessions/:id/attachments', bodyLimit({ maxSize: CHAT_MAX_FILE_BYTES + 64 * 1024,
+    onError: (c) => c.json({ error: 'attachment_size_limit', message: '每个文件不能超过 20 MB' }, 413) }), async (c) => {
+    try {
+      const id = c.req.param('id');
+      if (!localMapStore.getAgentSession(id)) throw new ToolError('session_not_found', '会话不存在', 404);
+      const form = await c.req.formData();
+      const file = form.get('file');
+      if (!(file instanceof File)) throw new ToolError('invalid_request', '请选择一个文件');
+      if (file.size > CHAT_MAX_FILE_BYTES) throw new ChatAttachmentError('attachment_size_limit', '每个文件不能超过 20 MB', 413);
+      const attachment = await sessionService.attachments.add(id, file.name, Buffer.from(await file.arrayBuffer()));
+      return c.json({ attachment }, 201);
+    } catch (error) { return errorResponse(c, error); }
+  });
+  routes.get('/api/agent/sessions/:id/attachments/:attachmentId', (c) => {
+    try {
+      const id = c.req.param('id');
+      if (!localMapStore.getAgentSession(id)) throw new ToolError('session_not_found', '会话不存在', 404);
+      const { attachment, bytes } = sessionService.attachments.original(id, c.req.param('attachmentId'));
+      return c.body(new Uint8Array(bytes), 200, { 'Content-Type': attachment.mimeType, 'X-Content-Type-Options': 'nosniff',
+        'Cache-Control': 'private, no-store', 'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(attachment.name)}` });
+    } catch (error) { return errorResponse(c, error); }
+  });
+  routes.delete('/api/agent/sessions/:id/attachments/:attachmentId', (c) => {
+    try {
+      const id = c.req.param('id');
+      if (!localMapStore.getAgentSession(id)) throw new ToolError('session_not_found', '会话不存在', 404);
+      return c.json({ removed: sessionService.attachments.removePending(id, c.req.param('attachmentId')) });
+    } catch (error) { return errorResponse(c, error); }
+  });
+
   routes.post('/api/agent/sessions/:id/messages', async (c) => {
     try {
-      const body = await c.req.json() as { text?: string; delivery?: string };
+      const body = await c.req.json() as { text?: string; delivery?: string; attachmentIds?: unknown };
       const result = await sessionService.sendMessage(localMapStore, c.req.param('id'), {
         text: String(body.text ?? ''),
         delivery: body.delivery,
+        attachmentIds: body.attachmentIds,
       });
       return c.json(result, 202);
     } catch (error) {

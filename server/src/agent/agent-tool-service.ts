@@ -12,6 +12,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { createChatAttachmentFamily } from './tools/chat-attachment-family.js';
 import { isBlankWorkbookPlaceholder, reconcileBlankCsvCoverage } from '../kb/blank-csv-coverage.js';
 import { renderCsvTableImport } from '../kb/csv-table-import.js';
 import { MAX_STANDARD_DOC_BYTES } from '../kb/standard-doc-limits.js';
@@ -680,6 +681,7 @@ export class AgentToolService {
         { spec: BUILD_REQUEST_PUBLISH_SPEC, runKinds: [], execute: (context, args) => this.toolBuildRequestPublish(context, args) },
       ],
     });
+    this.registerToolFamily(createChatAttachmentFamily(this.dataRoot));
   }
 
   private storeFor(outputRoot: string): StandardKbStore {

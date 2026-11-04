@@ -22,10 +22,12 @@ const STATE_BADGE: Record<string, string> = {
   missing: 'bg-seal-2/10 text-seal-2 border-seal-2/20',
   deleted: 'bg-seal-2/10 text-seal-2 border-seal-2/20',
   excluded: 'bg-paper-2 text-ink-faint border-line',
+  packaged: 'bg-jade/10 text-jade border-jade/20',
 };
 
 export function KbSourcePanel({ docTitle, sources, onOpenSource }: KbSourcePanelProps) {
-  const stale = sources.filter((s) => s.state !== 'current').length;
+  const stale = sources.filter((s) => !['current', 'packaged'].includes(s.state)).length;
+  const packaged = sources.some((s) => s.state === 'packaged');
   return (
     <div className="flex flex-col h-full min-h-0">
       <div className="px-4 py-3 border-b border-line/60 shrink-0">
@@ -34,7 +36,7 @@ export function KbSourcePanel({ docTitle, sources, onOpenSource }: KbSourcePanel
           来源追溯
         </h3>
         <p className="mt-1 text-[11px] leading-snug text-ink-faint">
-          {sources.length} 个原始来源{stale > 0 ? ` · ${stale} 个已变动，正文可能过时` : ' · 均为当前版本'}
+          {sources.length} 个原始来源{packaged ? ' · 使用共享包内的构建快照' : stale > 0 ? ` · ${stale} 个已变动，正文可能过时` : ' · 均为当前版本'}
         </p>
       </div>
       <div className="flex-1 min-h-0 overflow-auto scrollbar-thin p-3 space-y-2">
@@ -45,14 +47,14 @@ export function KbSourcePanel({ docTitle, sources, onOpenSource }: KbSourcePanel
             onClick={() => onOpenSource(s)}
             disabled={s.state === 'deleted'}
             className="w-full text-left px-3 py-2 rounded-md border border-line/70 bg-card-bg hover:border-jade/40 hover:shadow-sm transition-all group"
-            title={`打开原始文档：${s.relPath}`}
+            title={`${s.state === 'packaged' ? '打开共享包来源快照' : '打开原始文档'}：${s.relPath}`}
           >
             <div className="flex items-start justify-between gap-2">
               <span className="text-xs font-medium text-ink leading-snug break-all">{s.title || '未命名文档'}</span>
               <span
                 className={`shrink-0 inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] border font-sans ${STATE_BADGE[s.state] ?? STATE_BADGE.current}`}
               >
-                {s.state !== 'current' ? <AlertTriangle className="w-2.5 h-2.5" /> : null}
+                {!['current', 'packaged'].includes(s.state) ? <AlertTriangle className="w-2.5 h-2.5" /> : null}
                 {KB_SOURCE_STATE_LABEL[s.state] ?? s.state}
               </span>
             </div>
@@ -62,7 +64,7 @@ export function KbSourcePanel({ docTitle, sources, onOpenSource }: KbSourcePanel
             </div>
             <div className="mt-1 flex items-center gap-1 text-[11px] text-ink-faint text-jade">
               <FileSearch className="w-3 h-3" />
-              {s.state === 'deleted' ? '原始文档已删除' : '查看原始内容'}
+              {s.state === 'deleted' ? '原始文档已删除' : s.state === 'packaged' ? '查看构建时来源快照' : '查看原始内容'}
             </div>
           </button>
         ))}

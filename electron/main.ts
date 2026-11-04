@@ -408,6 +408,30 @@ ipcMain.handle('desktop:select-directory', async (event) => {
   return result.filePaths[0];
 });
 
+ipcMain.handle('desktop:choose-kb-export-path', async (event, suggestedName: unknown) => {
+  const parentWindow = BrowserWindow.fromWebContents(event.sender) ?? mainWindow;
+  if (!parentWindow) return null;
+  const safeName = typeof suggestedName === 'string' && /^[A-Za-z0-9_.-]{1,100}\.fskb$/.test(suggestedName)
+    ? suggestedName : 'FeishuSync-standard-kb.fskb';
+  const result = await dialog.showSaveDialog(parentWindow, {
+    title: '导出标准库共享包',
+    defaultPath: path.join(app.getPath('downloads'), safeName),
+    filters: [{ name: 'Feishu Sync 标准库共享包', extensions: ['fskb'] }],
+  });
+  return result.canceled ? null : result.filePath ?? null;
+});
+
+ipcMain.handle('desktop:choose-kb-import-path', async (event) => {
+  const parentWindow = BrowserWindow.fromWebContents(event.sender) ?? mainWindow;
+  if (!parentWindow) return null;
+  const result = await dialog.showOpenDialog(parentWindow, {
+    title: '导入标准库共享包',
+    properties: ['openFile'],
+    filters: [{ name: 'Feishu Sync 标准库共享包', extensions: ['fskb', 'zip'] }],
+  });
+  return result.canceled ? null : result.filePaths[0] ?? null;
+});
+
 ipcMain.handle('desktop:open-config-file', async () => {
   // P4: server and desktop share ~/.feishu-sync (not Electron userData).
   const configPath = path.join(

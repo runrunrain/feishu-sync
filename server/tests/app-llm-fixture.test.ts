@@ -206,6 +206,7 @@ async function spawnFixturePi(options: SpawnOptions): Promise<PiRpcProcess> {
     agentUrl: `http://127.0.0.1:${internalPort}`,
     runToken: token,
     apiKey: SENTINEL_KEY,
+    preserveUploadedImages: true,
   });
   env.FEISHU_SYNC_AGENT_PI_PACKAGE_ROOT = runtime!.piPackageRoot!;
   if (!options.sharedHome) {
@@ -259,6 +260,20 @@ for (const anthropicAuth of ['api-key', 'auth-token'] as const) {
 }
 
 describe('R03：app-llm provider 注入（真实 pi + 本地 OpenAI 兼容 fixture）', () => {
+  it('图片实际进入模型请求，不被文本专用模型声明静默丢弃', async (ctx) => {
+    if (!piAvailable()) { ctx.skip(); return; }
+    llmMode = 'text';
+    const start = llmRequests.length;
+    const rpc = await spawnFixturePi({ runKind: 'discuss' });
+    const data = 'iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAb0lEQVR4nO3PAQkAAAyEwO9feoshgnABdLep8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3IPanc8OLDQitxAAAAAElFTkSuQmCC';
+    try {
+      expect((await rpc.prompt('Describe the attached image', { images: [{ type: 'image', mimeType: 'image/png', data }], timeoutMs: 40_000 })).outcome).toBe('completed');
+      const request = llmRequests.slice(start).find((call) => call.url.includes('/chat/completions'));
+      expect(JSON.stringify(request?.body.messages)).toContain('data:image/png;base64,');
+      expect(JSON.stringify(request?.body.messages)).toContain(data);
+    } finally { await rpc.terminate(); }
+  }, TEST_TIMEOUT_MS);
+
   it('模型额度不足时返回具体原因并隐藏服务商回显的密钥', async (ctx) => {
     if (!piAvailable()) { ctx.skip(); return; }
     llmMode = 'quota';
@@ -340,7 +355,7 @@ describe('R04：steer 投递同一活跃 RPC 运行（真实 pi 官方队列语�
       const promptPromise = rpc.prompt('第一轮任务：调用 kb_search 工具', { timeoutMs: 60_000 });
       await waitFor(() => llmRequests.length >= 1, 30_000, '第一轮 LLM 请求');
       // 流式运行中发官方 steer 命令
-      const steerResp = await rpc.sendCommand('steer', { message: 'STEER_TEXT_补充指令：完成后回答加 OK' }, 20_000) as { success?: boolean; data?: { disposition?: string } };
+      const steerResp = await rpc.sendCommand('steer', { message: 'STEER_TEXT_补充指令：完成后回答加 OK', images: [{ type: 'image', mimeType: 'image/png', data: 'iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAb0lEQVR4nO3PAQkAAAyEwO9feoshgnABdLep8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3IPanc8OLDQitxAAAAAElFTkSuQmCC' }] }, 20_000) as { success?: boolean; data?: { disposition?: string } };
       expect(steerResp.success).toBe(true);
       expect(['queued', 'handled']).toContain(String(steerResp.data?.disposition));
       steerSent = true;
@@ -354,6 +369,7 @@ describe('R04：steer 投递同一活跃 RPC 运行（真实 pi 官方队列语�
       expect(second).toBeTruthy();
       expect(second.auth).toBe(`Bearer ${SENTINEL_KEY}`);
       expect(JSON.stringify(second.body?.messages)).toContain('STEER_TEXT_补充指令');
+      expect(JSON.stringify(second.body?.messages)).toContain('data:image/png;base64,');
       expect(JSON.stringify(second.body?.messages)).toContain('call_fix1'); // 工具轮真实执行
       // 历史：两条 user（原始 + steer）都在当前分支
       const state = await rpc.sendCommand('get_state', {}) as { success?: boolean; data?: { sessionFile?: string } };

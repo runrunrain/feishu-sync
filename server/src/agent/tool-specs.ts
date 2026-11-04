@@ -1262,7 +1262,21 @@ export const BUILD_REQUEST_PUBLISH_SPEC: AgentToolSpec = {
   },
 };
 
+export const CHAT_ATTACHMENT_READ_SPEC: AgentToolSpec = {
+  name: 'chat_attachment_read', label: '读取会话附件',
+  description: '读取用户已发送到本会话的文档附件文字。附件编号在用户消息中；offset 为 0 基行偏移，按 nextOffset 继续。只读本会话的附件，图片已作为视觉输入提供。',
+  parameters: {
+    type: 'object', additionalProperties: false, required: ['attachmentId'],
+    properties: {
+      attachmentId: string('用户消息中的 att_ 附件编号'),
+      offset: integer('起始行偏移，默认 0', 0),
+      limit: integer('行数，默认 200', 1, 500),
+    },
+  },
+};
+
 const ALL_SPECS: AgentToolSpec[] = [
+  CHAT_ATTACHMENT_READ_SPEC,
   KB_SEARCH_SPEC,
   KB_READ_SPEC,
   KB_GREP_SPEC,

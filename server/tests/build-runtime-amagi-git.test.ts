@@ -363,6 +363,7 @@ function fixtureHost(root: string, sdkRoot: string, cliPath: string, options: { 
     } as never);
   }
   const host = new BuildRuntimeHost({
+    bundledAmagi: () => null, // This suite specifically verifies the legacy Git acquisition fallback.
     dataRoot: root,
     resolver,
     toolService: null as never,
@@ -474,8 +475,8 @@ process.exit(1);
       const upgraded = await (host as unknown as { probeOrFail: (key: string) => Promise<{ amagiPackage: { version: string } }> }).probeOrFail('fixture-key');
       expect(upgraded.amagiPackage.version).toBe('2.21.37');
       expect(fs.existsSync(path.join(f.root, 'agent', 'runtime-packages', 'amagi-pi@2.21.36'))).toBe(true);
-      await host.installAmagi({ sourceDir: makeMiniSource(f.root) });
-      const resumed = await (host as unknown as { probeOrFail: (key: string, version: string) => Promise<{ amagiPackage: { version: string } }> }).probeOrFail('fixture-key', '2.21.31');
+      const frozen = await host.installAmagi({ sourceDir: makeMiniSource(f.root) });
+      const resumed = await (host as unknown as { probeOrFail: (key: string, ref: { version: string; contentHash: string }) => Promise<{ amagiPackage: { version: string } }> }).probeOrFail('fixture-key', frozen);
       expect(resumed.amagiPackage.version).toBe('2.21.31');
     } finally {
       if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;

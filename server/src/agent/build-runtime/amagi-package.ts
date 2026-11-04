@@ -127,11 +127,14 @@ export function runtimePackagesRoot(dataRoot: string): string {
   return path.join(dataRoot, 'agent', 'runtime-packages');
 }
 
-export function amagiInstallDir(dataRoot: string, version: string): string {
+export function amagiInstallDir(dataRoot: string, version: string, contentHash?: string): string {
   if (!/^\d+\.\d+\.\d+(-[A-Za-z0-9.-]+)?$/.test(version)) {
     throw new AmagiPackageError('amagi_version_invalid', `amagi-pi 版本号形式非法: ${version}`);
   }
-  return path.join(runtimePackagesRoot(dataRoot), `amagi-pi@${version}`);
+  if (contentHash !== undefined && !/^[a-f0-9]{64}$/.test(contentHash)) {
+    throw new AmagiPackageError('amagi_hash_invalid', 'amagi-pi 内容标识必须是 SHA-256');
+  }
+  return path.join(runtimePackagesRoot(dataRoot), `amagi-pi@${version}${contentHash ? `+${contentHash}` : ''}`);
 }
 
 export function amagiPackageRoot(installDir: string): string {
@@ -226,10 +229,19 @@ export function readPackageVersion(packageRoot: string): string {
 export function verifyAmagiPackage(input: {
   dataRoot: string;
   version: string;
+  /** 同版本的内置包更新按完整内容哈希并存，旧构建继续用原目录。 */
+  contentHash?: string;
+  /** 恢复时优先使用原 spec 的目录，避免同内容的两种历史布局互相替代。 */
+  installDir?: string;
   /** 校验内容哈希（默认 true=完整重算；false 仅快速存在性核对，调用方自担）。 */
   verifyHash?: boolean;
 }): AmagiPackageRef & { record: AmagiPackageInstallRecord } {
-  const installDir = amagiInstallDir(input.dataRoot, input.version);
+  const revisionDir = input.contentHash ? amagiInstallDir(input.dataRoot, input.version, input.contentHash) : null;
+  const legacyDir = amagiInstallDir(input.dataRoot, input.version);
+  if (input.installDir && ![legacyDir, revisionDir].includes(path.resolve(input.installDir))) {
+    throw new AmagiPackageError('amagi_install_dir_invalid', '冻结包目录不在该版本的应用受管路径中');
+  }
+  const installDir = input.installDir ? path.resolve(input.installDir) : revisionDir && fs.existsSync(revisionDir) ? revisionDir : legacyDir;
   const recordPath = path.join(installDir, INSTALL_RECORD_FILENAME);
   let record: AmagiPackageInstallRecord;
   try {
@@ -238,6 +250,9 @@ export function verifyAmagiPackage(input: {
     throw new AmagiPackageError('amagi_record_missing', `缺少安装记录 ${recordPath}（目录可能被外部改动，删除后重装）`);
   }
   const packageRoot = locatePackageRoot(installDir, record.layout ?? 'npm');
+  if (input.contentHash && record.contentHash !== input.contentHash) {
+    throw new AmagiPackageError('amagi_content_drift', '安装记录与冻结的 amagi-pi 内容标识不一致');
+  }
   const actualVersion = readPackageVersion(packageRoot);
   if (actualVersion !== input.version) {
     throw new AmagiPackageError('amagi_version_mismatch', `安装目录版本 ${actualVersion} ≠ 请求版本 ${input.version}`);
@@ -312,6 +327,8 @@ export async function installAmagiPackage(input: {
   piCliPath: string;
   dataRoot: string;
   version: string;
+  /** 内置包内容寻址安装，不能覆盖任何既有构建的冻结包。 */
+  expectedContentHash?: string;
   /** 本地 amagi-pi 包根（未发布 npm 时用；source 模式）。 */
   sourceDir?: string;
   /** 连同 node_modules 运行依赖冻结（Git 获取链用；手填 sourceDir 不启用）。 */
@@ -322,10 +339,10 @@ export async function installAmagiPackage(input: {
   timeoutMs?: number;
   log?: (line: string) => void;
 }): Promise<AmagiPackageRef & { record: AmagiPackageInstallRecord; fresh: boolean }> {
-  const installDir = amagiInstallDir(input.dataRoot, input.version);
+  const installDir = amagiInstallDir(input.dataRoot, input.version, input.expectedContentHash);
   if (fs.existsSync(path.join(installDir, INSTALL_RECORD_FILENAME))) {
     // 完整校验（默认）：篡改包在这里失败，复用才可信
-    const existing = verifyAmagiPackage({ dataRoot: input.dataRoot, version: input.version });
+    const existing = verifyAmagiPackage({ dataRoot: input.dataRoot, version: input.version, contentHash: input.expectedContentHash });
     return { ...existing, fresh: false };
   }
   fs.mkdirSync(path.dirname(installDir), { recursive: true });
@@ -401,7 +418,7 @@ function writeBinForwardingShim(dest: string, srcLink: string): void {
   fs.writeFileSync(dest, script, { mode: 0o755 });
 }
 
-function copyTreeFiltered(from: string, to: string, options: { includeNodeModules?: boolean } = {}, packageRoot?: string): void {
+export function copyTreeFiltered(from: string, to: string, options: { includeNodeModules?: boolean } = {}, packageRoot?: string): void {
   const root = packageRoot ?? from;
   // realpath 对齐两侧（macOS /var→/private/var 等）：symlink 目标经 realpath 解析，
   // 包根也必须同样归一，否则同一路径会被误判为包外。
@@ -454,7 +471,7 @@ function isInsideOrEqual(a: string, b: string): boolean {
  * 6) 写安装记录（installedVia 含实际 pi 命令）。
  */
 async function installFromSource(
-  input: { nodePath: string; piCliPath: string; dataRoot: string; version: string; sourceDir?: string; includeDependencies?: boolean; acquisition?: AmagiGitAcquisition; npmRegistry?: string; timeoutMs?: number; log?: (line: string) => void },
+  input: { nodePath: string; piCliPath: string; dataRoot: string; version: string; expectedContentHash?: string; sourceDir?: string; includeDependencies?: boolean; acquisition?: AmagiGitAcquisition; npmRegistry?: string; timeoutMs?: number; log?: (line: string) => void },
   installDir: string,
 ): Promise<AmagiPackageRef & { record: AmagiPackageInstallRecord; fresh: boolean }> {
   const sourceDir = path.resolve(input.sourceDir!);
@@ -480,12 +497,15 @@ async function installFromSource(
       throw new AmagiPackageError('amagi_version_mismatch', `物化结果版本 ${stagedVersion} ≠ ${input.version}`);
     }
     const staged = computePackageContentHash(stagingPackage);
+    if (input.expectedContentHash && staged.contentHash !== input.expectedContentHash) {
+      throw new AmagiPackageError('amagi_content_drift', '内置包物化后的内容与应用清单不一致');
+    }
 
     // ── 入位：不覆盖已冻结版本；无记录残留移 aside ──
     if (fs.existsSync(installDir)) {
       if (fs.existsSync(path.join(installDir, INSTALL_RECORD_FILENAME))) {
         // 并发安装已完成（或上一轮已装）：丢弃 staging，走完整校验复用
-        const existing = verifyAmagiPackage({ dataRoot: input.dataRoot, version: input.version });
+        const existing = verifyAmagiPackage({ dataRoot: input.dataRoot, version: input.version, contentHash: input.expectedContentHash });
         return { ...existing, fresh: false };
       }
       const aside = `${installDir}.stale-${Date.now()}`;

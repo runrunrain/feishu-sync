@@ -66,7 +66,7 @@
 
 - 动笔前可用 `kb_get_plan` 查看冻结的组织计划与已有对象。有计划时按计划主位置写；没有计划，或计划未覆盖某个主题时，直接按本单元源材料组织并调用 `kb_write_doc`。撰写单元不能调用 `kb_submit_plan`，不得等待规划轮或因缺少计划而停止写作。
 - 对象经 `kb_write_doc.objects` 声明：用 clientKey 临时标识，objectId 由 server 分配并经返回映射回填；后续 presentations/relations/evidenceClaims 都用 clientKey 或已分配 ID 引用。同 clientKey 重复提交=更新同一对象；主定义搬到另一路径时保留身份。
-- 每个对象必填 scopeKey/scopeText（适用范围）；同 familyKey+variantKey+scopeKey 不得重复登记。关键断言（公式/数值/前提/例外/状态裁定）声明为 claims，高风险断言（riskCategory=high）必须有细粒度证据。
+- 每个对象必填 scopeKey/scopeText（适用范围）；同 familyKey+variantKey+scopeKey 不得重复登记。关键断言（公式/数值/前提/例外/状态裁定）声明为 claims，且都要绑定可核对的证据。riskCategory 表示误写后的业务后果，而非句子是否包含数字：只有错误会直接改变结算结果、硬性约束、状态裁定、冲突取舍或跨文档强制依赖的断言才标 high；一般概念定义、结构说明、示例数字和直接转述的非关键参数标 normal。不要把一篇文档的全部断言一律标 high；high 必须有细粒度证据，并说明适用边界。
 - 对象正文位置用 headingPath 或 bodyRange 定位，坐标以你提交的 markdown 为准；稳定锚点是服务端生成的不可见锚点（`<a id="ko_…">`），模型不写任何 HTML。
 - 并行写作时 `expectedDraftRevision` 做乐观并发：写入前带上 server 返回的 draftRevision，不符会返回冲突且不覆盖他人成果——此时重读草稿合并后再提交。同一次调用重复提交（同 toolCallId）幂等返回。
 

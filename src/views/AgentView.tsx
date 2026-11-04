@@ -16,10 +16,11 @@ import {
   RefreshCw,
   Wifi,
   WifiOff,
+  Upload,
 } from 'lucide-react';
 import { SessionListPanel } from '../components/agent/SessionListPanel';
 import { MessageStream } from '../components/agent/MessageStream';
-import { AgentComposer } from '../components/agent/AgentComposer';
+import { AgentComposer, type AgentComposerHandle } from '../components/agent/AgentComposer';
 import { AgentModePanel } from '../components/agent/AgentModePanel';
 import { useToast } from '../components/common/Toast';
 import { Button } from '../components/common/Button';
@@ -27,7 +28,7 @@ import { Modal } from '../components/common/Modal';
 import { useSessionAgentStatus } from '../hooks/useSessionAgentStatus';
 import { useAgentSessions } from '../hooks/useAgentSessions';
 import { describeReadinessCode as describeReadiness } from '../utils/agentReadiness';
-import type { AgentBackend, AgentWorkspaceConfig } from '../types/agent';
+import type { AgentAttachmentDto, AgentBackend, AgentWorkspaceConfig } from '../types/agent';
 import { addAgentWorkspace, listAgentWorkspaces } from '../api/client';
 
 interface AgentViewProps {
@@ -49,8 +50,12 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
   const [workspaceBusy, setWorkspaceBusy] = useState(false);
   const [workspaceError, setWorkspaceError] = useState('');
   const [targetWorkspace, setTargetWorkspace] = useState<string | undefined>();
+  const composerRef = useRef<AgentComposerHandle>(null);
+  const dragDepth = useRef(0);
+  const [draggingFiles, setDraggingFiles] = useState(false);
   useEffect(() => { if (active) void listAgentWorkspaces().then(setWorkspaces).catch(() => {}); }, [active]);
   useEffect(() => { if (!active) setCreateOpen(false); }, [active]);
+  useEffect(() => { dragDepth.current = 0; setDraggingFiles(false); }, [active, sessions.activeId]);
 
   const session = sessions.activeSession;
   const agent = useSessionAgentStatus(session, active);
@@ -68,8 +73,8 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
     } finally { createLock.current = false; setCreatingSession(false); }
   };
 
-  const handleSend = async (text: string, delivery?: 'steer' | 'followUp') => {
-    const ok = await sessions.send(text, delivery);
+  const handleSend = async (text: string, delivery?: 'steer' | 'followUp', attachments?: AgentAttachmentDto[]) => {
+    const ok = await sessions.send(text, delivery, attachments);
     if (!ok) {
       // 具体错误已写入 streamErrors；此处轻提示。
       toast.push({ type: 'warning', message: '发送失败，详见消息流中的错误行' });
@@ -81,6 +86,24 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
     <div
       className="relative h-full min-h-0 min-w-0 grid grid-cols-1 gap-3 lg:grid-cols-[200px_minmax(0,1fr)]"
       data-view="agent"
+      onDragEnter={(event) => {
+        if (!active || !Array.from(event.dataTransfer.types).includes('Files')) return;
+        event.preventDefault(); dragDepth.current++; setDraggingFiles(true);
+      }}
+      onDragOver={(event) => {
+        if (!active || !Array.from(event.dataTransfer.types).includes('Files')) return;
+        event.preventDefault(); event.dataTransfer.dropEffect = 'copy';
+      }}
+      onDragLeave={(event) => {
+        if (!draggingFiles) return;
+        event.preventDefault(); dragDepth.current = Math.max(0, dragDepth.current - 1);
+        if (dragDepth.current === 0) setDraggingFiles(false);
+      }}
+      onDrop={(event) => {
+        if (!active || !Array.from(event.dataTransfer.types).includes('Files')) return;
+        event.preventDefault(); event.stopPropagation(); dragDepth.current = 0; setDraggingFiles(false);
+        composerRef.current?.addFiles(Array.from(event.dataTransfer.files));
+      }}
     >
       {/* 左：会话列表 */}
       <div className="hidden lg:block min-h-0 rounded-md border border-line bg-card-bg shadow-sm overflow-hidden">
@@ -165,6 +188,7 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
         {(agent.status?.externalPlugins ?? 0) > 0 ? <p role="note" className="px-4 py-2 text-xs text-seal border-b border-line">已启用第三方Pi插件；其代码以当前用户权限运行，可访问文件与网络，能力范围由插件本身决定。</p> : null}
 
         <MessageStream
+          sessionId={session?.id}
           messages={sessions.messages}
           draft={sessions.draft}
           streamErrors={sessions.streamErrors}
@@ -185,6 +209,7 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
         />
 
         <AgentComposer
+          ref={composerRef}
           session={session}
           agentStatus={agent.status}
           agentUnreachable={agent.unreachable}
@@ -200,6 +225,10 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
         />
       </div>
 
+      {draggingFiles ? <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center rounded-lg border-2 border-dashed border-seal bg-card-bg/95" data-testid="agent-file-drop-overlay">
+        <div className="text-center space-y-2"><Upload className="h-9 w-9 text-seal mx-auto" /><p className="text-ink font-medium">松开以添加图片或文件</p><p className="text-xs text-ink-faint">文件会添加到当前会话的输入框</p></div>
+      </div> : null}
+
       <Modal open={createWorkspace} title="新建工作区" onClose={workspaceBusy ? undefined : () => setCreateWorkspace(false)}>
         <div className="space-y-3">
           <input aria-label="工作区名称" placeholder="工作区名称" value={workspaceName} onChange={(e) => setWorkspaceName(e.target.value)} className="w-full rounded border border-line bg-card-bg px-3 py-2 text-sm" />
@@ -214,9 +243,9 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
           {targetWorkspace && <p className="text-xs text-ink-soft">将在所选工作区创建 Work 会话，允许应用自带工具写入该目录。</p>}
           <div className="grid gap-2 sm:grid-cols-2">
             <button type="button" disabled={creatingSession} onClick={() => void createWithBackend('pi')} aria-label="新建 Pi 会话"
-              className="rounded-md border border-line bg-paper/40 px-3 py-3 text-left hover:border-seal hover:bg-seal/5 disabled:opacity-50">
-              <span className="block text-sm font-medium text-ink">Pi</span>
-              <span className="mt-1 block text-xs text-ink-faint">使用应用提供商或本地 Pi 模型。</span>
+              className="rounded-md border border-seal bg-seal/5 px-3 py-3 text-left hover:border-seal hover:bg-seal/10 disabled:opacity-50">
+              <span className="block text-sm font-medium text-ink">Pi · 默认</span>
+              <span className="mt-1 block text-xs text-ink-faint">内置 amagi-pi，使用应用提供商或本地 Pi 模型。</span>
             </button>
             <button type="button" disabled={creatingSession} onClick={() => void createWithBackend('claude-code')} aria-label="新建 Claude Code 会话"
               className="rounded-md border border-line bg-paper/40 px-3 py-3 text-left hover:border-seal hover:bg-seal/5 disabled:opacity-50">

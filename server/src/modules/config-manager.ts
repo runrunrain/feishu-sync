@@ -302,7 +302,7 @@ function normalizeAgentConfigLoose(value: unknown, dataRoot: string): AgentConfi
   const runtimeRaw: Partial<AgentConfig['runtime']> = raw.runtime && typeof raw.runtime === 'object' ? raw.runtime : {};
   return {
     runtime: {
-      backend: runtimeRaw.backend === 'pi' ? 'pi' : 'claude-code',
+      backend: runtimeRaw.backend === 'claude-code' ? 'claude-code' : 'pi',
       nodePath: typeof runtimeRaw.nodePath === 'string' && runtimeRaw.nodePath.trim() ? runtimeRaw.nodePath.trim() : undefined,
       piCliPath: typeof runtimeRaw.piCliPath === 'string' && runtimeRaw.piCliPath.trim() ? runtimeRaw.piCliPath.trim() : undefined,
       claudeCliPath: typeof runtimeRaw.claudeCliPath === 'string' && runtimeRaw.claudeCliPath.trim() ? runtimeRaw.claudeCliPath.trim() : undefined,

@@ -29,8 +29,16 @@ import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { parse as parseJsonc, type ParseError } from 'jsonc-parser';
 import { piThinkingLevels } from './thinking-capabilities.js';
 import type { AgentThinkingLevel } from '../types/agent-knowledge.js';
+import type { ChatImageContent } from './chat-attachments.js';
+
+export interface AgentPromptOptions {
+  streamingBehavior?: 'steer' | 'followUp';
+  timeoutMs?: number;
+  images?: ChatImageContent[];
+}
 
 /** RPC 命令白名单（§4.3）。 */
 export const RPC_COMMAND_WHITELIST: ReadonlySet<string> = new Set([
@@ -592,7 +600,7 @@ export class PiRpcProcess extends EventEmitter {
    * 发送 prompt 并等待运行完成（§4.4 完成判定）。
    * streamingBehavior 由调用方按运行态决定（运行中需 steer/followUp）。
    */
-  async prompt(message: string, options: { streamingBehavior?: 'steer' | 'followUp'; timeoutMs?: number } = {}): Promise<RunOutcome> {
+  async prompt(message: string, options: AgentPromptOptions = {}): Promise<RunOutcome> {
     if (this.activeRun && !this.activeRun.finished) {
       throw new PiRpcError('run_in_progress', '已有运行未完成');
     }
@@ -601,6 +609,7 @@ export class PiRpcProcess extends EventEmitter {
     }
     const runId = `run_${crypto.randomBytes(6).toString('hex')}`;
     const payload: Record<string, unknown> = { message };
+    if (options.images?.length) payload.images = options.images;
     if (options.streamingBehavior) payload.streamingBehavior = options.streamingBehavior;
 
     const timeoutMs = options.timeoutMs ?? this.options.promptTimeoutMs ?? DEFAULT_PROMPT_TIMEOUT_MS;
@@ -855,6 +864,7 @@ export function buildPiProcessEnv(input: {
   agentUrl: string;
   runToken: string;
   apiKey?: string;
+  preserveUploadedImages?: boolean;
 }): NodeJS.ProcessEnv {
   const dangerous = new Set([
     'NODE_OPTIONS',
@@ -896,6 +906,22 @@ export function buildPiProcessEnv(input: {
   }
   env.PI_CODING_AGENT_DIR = path.join(input.dataRoot, 'agent', 'pi-home');
   fs.mkdirSync(env.PI_CODING_AGENT_DIR, { recursive: true, mode: 0o700 });
+  // Uploaded images are already bounded by the application. Some Pi builds
+  // silently replace valid prompt images when their optional resize backend
+  // cannot initialize. Keep original bytes in our private home, not ~/.pi.
+  if (input.preserveUploadedImages) {
+    const settingsFile = path.join(env.PI_CODING_AGENT_DIR, 'settings.json');
+    const errors: ParseError[] = [];
+    const settings = fs.existsSync(settingsFile) ? parseJsonc(fs.readFileSync(settingsFile, 'utf8'), errors) as Record<string, unknown> : {};
+    if (errors.length || !settings || typeof settings !== 'object' || Array.isArray(settings)) throw new PiRpcError('pi_settings_invalid', '应用 Pi 设置文件无效，请检查 agent/pi-home/settings.json');
+    const images = settings.images && typeof settings.images === 'object' && !Array.isArray(settings.images)
+      ? settings.images as Record<string, unknown> : {};
+    if (images.autoResize !== false) {
+      const temporary = `${settingsFile}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+      fs.writeFileSync(temporary, JSON.stringify({ ...settings, images: { ...images, autoResize: false } }, null, 2), { mode: 0o600 });
+      fs.renameSync(temporary, settingsFile);
+    }
+  }
   env.PI_OFFLINE = '1';
   env.PI_SKIP_VERSION_CHECK = '1';
   env.PI_TELEMETRY = '0';

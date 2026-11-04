@@ -72,6 +72,7 @@ export function AgentPluginsCard() {
         <Button size="sm" disabled={busy || !data} onClick={() => setAdding(!adding)}><Plus className="w-3.5 h-3.5" />添加 Pi 插件</Button>
       </div>
       <p className="text-sm text-ink-soft leading-relaxed">按Pi原生package管理，支持npm、git、本地包目录或扩展脚本。配置与安装缓存仅保存在本应用的Pi目录，通用Pi不受影响。</p>
+      <p className="text-xs text-ink-soft">amagi-pi 随应用内置，启动时自动离线安装，随应用版本更新；无需仓库访问权限或手动填写插件来源。</p>
       <p className="text-xs text-ink-faint leading-relaxed">Pi插件会执行本机代码，可能访问文件和网络，请只添加可信来源。第三方插件以当前用户权限运行；应用目录隔离限定配置与加载范围。新增/更新/启停将在下次运行加载；有任务运行时请先完成或停止。</p>
       {stageAction ? <p className="text-xs text-ink-faint">插件启停需点击顶部保存；安装、更新和移除会立即执行。</p> : null}
       {data ? <p className="text-[11px] font-mono text-ink-faint break-all">{data.agentDir}</p> : null}
@@ -91,7 +92,7 @@ export function AgentPluginsCard() {
       </button>)}</nav>
       {current ? <div className="rounded border border-line bg-card-bg p-4 space-y-3">
         <div className="flex items-center gap-2 flex-wrap"><h3 className="text-base font-kai text-ink flex-1">{current.name}</h3>
-          <Button size="sm" variant="secondary" disabled={busy} onClick={() => void act('toggle')}>{currentEnabled ? '停用插件' : '启用插件'}</Button>
+          {current.managed ? <span className="text-xs text-ink-faint">随应用维护</span> : <Button size="sm" variant="secondary" disabled={busy} onClick={() => void act('toggle')}>{currentEnabled ? '停用插件' : '启用插件'}</Button>}
           {current.sourceType !== 'builtin' ? <>
             <Button size="sm" variant="secondary" disabled={busy} onClick={() => void act('update')}>{current.sourceType === 'local' ? '重新加载' : '更新插件'}</Button>
             <Button size="sm" variant="danger" disabled={busy} onClick={() => void act('remove')}>移除插件</Button>
@@ -103,7 +104,7 @@ export function AgentPluginsCard() {
           <ul className="mt-2 space-y-1">{current.resources.map((resource) => <li key={`${resource.type}:${resource.path}`} className="break-all font-mono">{resource.type} · {resource.path}</li>)}</ul>
         </details>
       </div> : null}
-      {data.packages.some((pkg) => pkg.sourceType === 'builtin') ? <div hidden={current?.sourceType !== 'builtin'}><BuiltinContextsEditor /></div> : null}
+      {data.packages.some((pkg) => pkg.sourceType === 'builtin' && !pkg.managed) ? <div hidden={current?.sourceType !== 'builtin' || current.managed}><BuiltinContextsEditor /></div> : null}
     </> : null}
   </section>;
 }

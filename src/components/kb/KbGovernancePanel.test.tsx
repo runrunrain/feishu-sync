@@ -41,20 +41,24 @@ import type { KbGovernancePendingDto, KbGovernancePendingObjectDto } from '../..
 (globalThis as unknown as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
 const host = document.createElement('div');
 document.body.appendChild(host);
-let root: Root = createRoot(host);
+let root: Root;
 
 function makeObject(over: Partial<KbGovernancePendingObjectDto> = {}): KbGovernancePendingObjectDto {
   return {
     objectId: 'ko_objA',
     title: '普攻伤害上限',
     type: 'rule',
+    docPath: '战斗/普攻规则.md',
+    anchor: 'ko_objA',
     scopeKey: 'combat-global',
     businessStatus: 'candidate',
     reviewStatus: 'passed',
     payloadHash: 'sha256:payload-a',
     reviewSubjectHash: 'sha256:subject-a',
     highRiskClaims: ['cap-300'],
+    claimPreviews: [{ claimKey: 'cap-300', excerpt: '普攻伤害上限为 300。', evidenceSources: ['200-战斗数值框架'] }],
     humanReviewed: false,
+    reviewRejection: null,
     effectiveDecision: null,
     allowedDecisionTargets: ['approved'],
     ...over,
@@ -85,10 +89,15 @@ function setTextareaValue(textarea: HTMLTextAreaElement, value: string): void {
   textarea.dispatchEvent(new Event('input', { bubbles: true }));
 }
 
-async function renderPanel() {
+function setInputValue(input: HTMLInputElement, value: string): void {
+  Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, value);
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+async function renderPanel(onOpenDoc?: (path: string, anchor: string | null) => void) {
   await act(async () => {
     root = createRoot(host);
-    root.render(<KbGovernancePanel />);
+    root.render(<KbGovernancePanel onOpenDoc={onOpenDoc} />);
   });
 }
 
@@ -101,10 +110,9 @@ beforeEach(() => {
 
 afterEach(() => {
   act(() => root.unmount());
-  root = createRoot(host);
 });
 
-it('待治理分组渲染：高风险人审 / 待裁定提示（candidate+stale）/ 可操作对象（governable 全量）', async () => {
+it('默认只展示真实待办；高风险无问题不成清单，主动查找仍可核对证据', async () => {
   const highRisk = makeObject();
   const candidate = makeObject({
     objectId: 'ko_objB', title: '作战单元', type: 'concept', highRiskClaims: [],
@@ -120,39 +128,62 @@ it('待治理分组渲染：高风险人审 / 待裁定提示（candidate+stale�
     effectiveDecision: { decisionId: 'kbd_old', businessStatus: 'approved', createdAt: '2026-11-01T00:00:00Z', payloadMismatch: true },
   });
   api.getKbGovernancePending.mockResolvedValue(
-    makePending({ highRisk: [highRisk], candidates: [candidate], staleDecisions: [stale] }, [highRisk, candidate, stale, unknown]),
+    makePending({ candidates: [candidate], staleDecisions: [stale] }, [highRisk, candidate, stale, unknown]),
   );
 
   await renderPanel();
 
   expect(api.getKbGovernancePending).toHaveBeenCalled();
   const highRiskSection = host.querySelector('[data-testid="kb-gov-highrisk"]');
-  expect(highRiskSection?.textContent).toContain('高风险人工复核');
-  expect(highRiskSection?.textContent).toContain('cap-300');
-  expect(highRiskSection?.querySelector('[data-testid="kb-gov-object-ko_objA"]')).not.toBeNull();
-  // diting S-F04：candidate + stale 进入待裁定提示（提示语义，无表单）
+  expect(highRiskSection).toBeNull();
+  expect(host.textContent).not.toContain('608');
   const alerts = host.querySelector('[data-testid="kb-gov-alerts"]');
   expect(alerts?.querySelector('[data-testid="kb-gov-object-ko_objB"]')).not.toBeNull();
   expect(alerts?.querySelector('[data-testid="kb-gov-object-ko_objC"]')).not.toBeNull();
-  expect(alerts?.textContent).toContain('决定过期');
-  expect(alerts?.querySelector('textarea')).toBeNull();
-  // 可操作对象：governable 全量（含 unknown 与高风险对象——业务决定通道合法）
+  expect(alerts?.textContent).toContain('已有业务决定绑定的是旧版内容');
+  expect(alerts?.textContent).toContain('下一次成功发布');
+  expect(alerts?.querySelector('textarea')).not.toBeNull();
   const decisions = host.querySelector('[data-testid="kb-gov-decisions"]');
-  expect(decisions?.querySelector('[data-testid="kb-gov-object-ko_objA"]')).not.toBeNull();
-  expect(decisions?.querySelector('[data-testid="kb-gov-object-ko_objC"]')).not.toBeNull();
+  expect(decisions?.querySelector('li')).toBeNull();
+  await act(async () => { setInputValue(host.querySelector<HTMLInputElement>('input[aria-label="查找治理对象"]')!, '普攻伤害上限'); });
+  expect(decisions?.textContent).toContain('普攻伤害上限为 300');
+  expect(decisions?.textContent).toContain('关联断言');
+  expect(decisions?.textContent).not.toContain('需核对的断言');
+  expect(decisions?.textContent).toContain('200-战斗数值框架');
+  expect(decisions?.textContent).toContain('高风险标签本身不表示内容有错');
+  await act(async () => { setInputValue(host.querySelector<HTMLInputElement>('input[aria-label="查找治理对象"]')!, '未定规则'); });
   expect(decisions?.querySelector('[data-testid="kb-gov-object-ko_objD"]')).not.toBeNull();
-  expect(decisions?.textContent).toContain('取代旧决定');
 });
 
 it('人工复核提交：通过按钮绑定 objectId + reviewSubjectHash，成功后刷新', async () => {
-  api.getKbGovernancePending.mockResolvedValue(makePending({ highRisk: [makeObject()] }, [makeObject()]));
+  const rejected = makeObject({ reviewRejection: '正文数值与来源不一致。' });
+  api.getKbGovernancePending.mockResolvedValue(makePending({ highRisk: [rejected] }, [rejected]));
   await renderPanel();
 
+  expect(host.querySelector('[data-testid="kb-gov-highrisk"]')?.textContent).toContain('正文数值与来源不一致');
   await act(async () => { button('复核通过').click(); });
   expect(api.recordKbHumanReview).toHaveBeenCalledWith({
     objectId: 'ko_objA', reviewSubjectHash: 'sha256:subject-a', passed: true,
   });
   expect(host.querySelector('[data-testid="kb-gov-notice"]')?.textContent).toContain('复核通过');
+});
+
+it('断言可打开正式正文；拒绝必须说明问题并记录复核说明', async () => {
+  const onOpenDoc = vi.fn();
+  const rejected = makeObject({ reviewRejection: '待核对数值。' });
+  api.getKbGovernancePending.mockResolvedValue(makePending({ highRisk: [rejected] }, [rejected]));
+  await renderPanel(onOpenDoc);
+  await act(async () => { button('查看正文').click(); });
+  expect(onOpenDoc).toHaveBeenCalledWith('战斗/普攻规则.md', 'ko_objA');
+  await act(async () => { button('复核拒绝').click(); });
+  expect(api.recordKbHumanReview).not.toHaveBeenCalled();
+  expect(host.querySelector('[data-testid="kb-gov-notice"]')?.textContent).toContain('写明正文或证据的问题');
+  await act(async () => { setTextareaValue(host.querySelector<HTMLTextAreaElement>('textarea[aria-label="复核说明 ko_objA"]')!, '来源数值和正文不一致'); });
+  await act(async () => { button('复核拒绝').click(); });
+  expect(api.recordKbHumanReview).toHaveBeenCalledWith({
+    objectId: 'ko_objA', reviewSubjectHash: 'sha256:subject-a', passed: false,
+    note: '来源数值和正文不一致',
+  });
 });
 
 it('业务决定提交：空理由拦截；填写后按 expectedRevision 提交并提示待发布生效', async () => {
@@ -196,6 +227,7 @@ it('diting S-F04：unknown 对象出现在可操作分区，按服务端 targets
   await renderPanel();
 
   // unknown → approved（治理生命周期入口：真实服务 targets = ['approved']）
+  await act(async () => { setInputValue(host.querySelector<HTMLInputElement>('input[aria-label="查找治理对象"]')!, '未定规则'); });
   const rationaleD = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="决定理由 ko_objD"]')!;
   await act(async () => { setTextareaValue(rationaleD, '批准未定规则。'); });
   await act(async () => {
@@ -206,6 +238,7 @@ it('diting S-F04：unknown 对象出现在可操作分区，按服务端 targets
     objectId: 'ko_objD', businessStatus: 'approved', rationale: '批准未定规则。',
   }));
 
+  await act(async () => { setInputValue(host.querySelector<HTMLInputElement>('input[aria-label="查找治理对象"]')!, '旧规则'); });
   // stale 分支：payloadMismatch=true 也必须携带旧决定 ID（服务端按有效链裁决）；
   // 默认目标为链状态 targets[0]=deprecated，先切换到 approved 验证选择器交互
   const selectC = host.querySelector<HTMLSelectElement>('#kb-gov-target-ko_objC')!;

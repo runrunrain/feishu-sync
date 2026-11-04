@@ -288,7 +288,7 @@ export default async function feishuSyncAgentExtension(/** @type {ExtensionAPI} 
         name: model.name || model.id,
         reasoning: model.reasoning === true,
         ...(model.thinkingLevelMap ? { thinkingLevelMap: model.thinkingLevelMap } : {}),
-        input: ['text'],
+        input: ['text', 'image'],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: model.contextWindow || 128000,
         maxTokens: model.maxTokens || 32768,

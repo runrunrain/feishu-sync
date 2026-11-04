@@ -89,7 +89,6 @@ function AppShell() {
             <KnowledgeView
               active={currentArea === 'knowledge'}
               onJumpToSettings={() => handleJumpToSettings('agent')}
-              onJumpToPublishSettings={() => handleJumpToSettings('auth')}
             />
           </div>
           <div className={currentArea === 'agent' ? 'flex-1 min-h-0 flex flex-col animate-fade-in' : 'hidden'}>

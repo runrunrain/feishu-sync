@@ -1,71 +1,48 @@
-/**
- * KbGovernancePanel —— 标准库侧栏「治理」面板（D1，A 案 §4.2/§5.1）。
- *
- * 人工复核与业务决定入口（仅 desktop 人工通道；CLI/Agent 不获得写权限）：
- * - 高风险人审：riskCategory=high 且无绑定当前载荷 human 凭据的对象，
- *   「通过/拒绝」提交人工内容复核（A 案 §5.1：高风险断言至少一次人工复核；
- *   diting S-F03：最新拒绝覆盖历史通过，拒绝即阻断下次发布）；
- * - 待裁定提示（diting S-F04）：candidate 对象与决定过期对象的紧凑提示分区
- *  （无表单——操作统一在「可操作对象」分区完成）；
- * - 可操作对象（diting S-F04）：当前 release 全部活跃对象（governable，
- *   含 unknown/approved/deprecated）的业务决定表单——合法转移目标由服务端
- *   按有效决定链状态计算（diting S-F05，与 recordDecision 同源）；存在有效
- *   决定时提交始终携带 supersedesDecisionId（payloadMismatch 与否都带，
- *   服务端按有效链裁决），消灭「targets=approved 但服务要求 supersede」的
- *   两端不一致；
- * - 决定对标准库消费者的生效点是下一次成功发布（UI 明示「决定待发布」，
- *   不把运行期决定叠加进旧 release，A 案 §4.2）。
- * 数据源：GET /api/kb/governance/pending + decisions（revision 随行）；
- * UI 模式对齐 KbPublishPanel/BuildOrchestrationProgress（jsdom 测试锚定）。
- */
-
-import { useCallback, useEffect, useState } from 'react';
+/** Human decisions and content reviews for the published knowledge library. */
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { AlertTriangle, Check, Loader2, RefreshCw, X } from 'lucide-react';
 import { Button } from '../common/Button';
 import {
-  APIError,
-  getKbGovernancePending,
-  listKbGovernanceDecisions,
-  recordKbHumanReview,
-  submitKbGovernanceDecision,
+  APIError, getKbGovernancePending, listKbGovernanceDecisions,
+  recordKbHumanReview, submitKbGovernanceDecision,
 } from '../../api/client';
-import type {
-  KbGovernancePendingDto,
-  KbGovernancePendingObjectDto,
-} from '../../types/agent';
+import type { KbGovernancePendingDto, KbGovernancePendingObjectDto } from '../../types/agent';
 
 const STATUS_LABEL: Record<string, string> = {
   unknown: '未定', candidate: '候选', approved: '已批准', disputed: '有争议', deprecated: '已停用',
 };
+const PAGE_SIZE = 20;
+interface DecisionDraft { target: string; rationale: string }
 
-function shortHash(hash: string): string {
-  return hash ? `${hash.slice(0, 10)}…` : '';
+function decisionEffect(target: string): string {
+  if (target === 'approved') return '批准后，这项内容会在下一次成功发布时成为已批准的正式规则。';
+  if (target === 'deprecated') return '停用后，这项内容会在下一次成功发布时标为已停用，不再作为现行规则使用。';
+  return '决定会在下一次成功发布时生效。';
 }
 
-function ObjectRow({ object, children }: { object: KbGovernancePendingObjectDto; children?: React.ReactNode }) {
-  return (
-    <li className="rounded border border-line bg-paper px-2.5 py-2 space-y-1.5" data-testid={`kb-gov-object-${object.objectId}`}>
-      <div className="flex items-baseline justify-between gap-2">
-        <span className="text-ink truncate" title={object.objectId}>{object.title || object.objectId}</span>
-        <span className="text-[10px] text-ink-faint shrink-0">{object.objectId}</span>
+function ObjectRow({ object, onOpenDoc, children }: {
+  object: KbGovernancePendingObjectDto;
+  onOpenDoc?: (path: string, anchor: string | null) => void;
+  children?: React.ReactNode;
+}) {
+  return <li className="rounded border border-line bg-paper px-3 py-2.5 space-y-2" data-testid={`kb-gov-object-${object.objectId}`}>
+    <div className="flex items-start justify-between gap-2">
+      <div className="min-w-0">
+        <p className="font-medium text-ink break-words">{object.title || object.objectId}</p>
+        <p className="text-[10px] text-ink-faint break-all">{object.docPath ?? object.scopeKey} · {STATUS_LABEL[object.businessStatus] ?? object.businessStatus}</p>
       </div>
-      <div className="flex flex-wrap gap-x-2 gap-y-0.5 text-[10px] text-ink-faint">
-        <span>业务状态 {STATUS_LABEL[object.businessStatus] ?? object.businessStatus}</span>
-        <span>审查 {object.reviewStatus}</span>
-        <span className="break-all">范围 {object.scopeKey}</span>
-        {object.highRiskClaims.length > 0 ? <span className="text-seal-2">高风险断言 {object.highRiskClaims.join(', ')}</span> : null}
-      </div>
-      {children}
-    </li>
-  );
+      {object.docPath && onOpenDoc ? <button type="button" className="text-seal shrink-0 underline" onClick={() => onOpenDoc(object.docPath!, object.anchor)}>查看正文</button> : null}
+    </div>
+    {object.claimPreviews.map((claim) => <div key={claim.claimKey} className="rounded bg-card-bg border border-line/70 px-2.5 py-2 space-y-1">
+      <p className="text-[10px] text-seal-2">{object.reviewRejection ? '复核未通过的断言' : '关联断言'} · {claim.claimKey}</p>
+      <p className="text-ink leading-relaxed break-words">{claim.excerpt || '未能提取正文片段，请打开正式文档核对这一断言。'}</p>
+      <p className="text-[10px] text-ink-faint break-words">来源：{claim.evidenceSources.length ? claim.evidenceSources.join('、') : '未关联来源，请核对证据'}</p>
+    </div>)}
+    {children}
+  </li>;
 }
 
-interface DecisionDraft {
-  target: string;
-  rationale: string;
-}
-
-export function KbGovernancePanel() {
+export function KbGovernancePanel({ onOpenDoc }: { onOpenDoc?: (path: string, anchor: string | null) => void }) {
   const [pending, setPending] = useState<KbGovernancePendingDto | null>(null);
   const [revision, setRevision] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -74,25 +51,23 @@ export function KbGovernancePanel() {
   const [conflict, setConflict] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<Record<string, DecisionDraft>>({});
+  const [reviewNotes, setReviewNotes] = useState<Record<string, string>>({});
+  const [reviewLimit, setReviewLimit] = useState(PAGE_SIZE);
+  const [actionLimit, setActionLimit] = useState(PAGE_SIZE);
+  const [objectQuery, setObjectQuery] = useState('');
+  const [objectLimit, setObjectLimit] = useState(PAGE_SIZE);
 
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const [pendingData, decisions] = await Promise.all([
-        getKbGovernancePending(),
-        listKbGovernanceDecisions(),
-      ]);
+      const [pendingData, decisions] = await Promise.all([getKbGovernancePending(), listKbGovernanceDecisions()]);
       setPending(pendingData);
       setRevision(decisions.revision);
       setConflict(false);
-    } catch (err) {
-      setError(err instanceof APIError ? err.message : '治理状态加载失败');
-    } finally {
-      setLoading(false);
-    }
+    } catch (err) { setError(err instanceof APIError ? err.message : '治理状态加载失败'); }
+    finally { setLoading(false); }
   }, []);
-
   useEffect(() => { void load(); }, [load]);
 
   const draftOf = (object: KbGovernancePendingObjectDto): DecisionDraft =>
@@ -100,170 +75,124 @@ export function KbGovernancePanel() {
 
   const submitDecision = async (object: KbGovernancePendingObjectDto) => {
     const draft = draftOf(object);
-    if (!draft.rationale.trim()) {
-      setNotice('业务决定必须填写实质理由（rationale 必填）。');
-      return;
-    }
+    if (!draft.rationale.trim()) { setNotice('业务决定必须填写实质理由。'); return; }
     setBusy(object.objectId);
     setNotice(null);
     try {
       await submitKbGovernanceDecision({
-        objectId: object.objectId,
-        payloadHash: object.payloadHash,
-        scopeKey: object.scopeKey,
+        objectId: object.objectId, payloadHash: object.payloadHash, scopeKey: object.scopeKey,
         businessStatus: draft.target as KbGovernancePendingObjectDto['businessStatus'],
         rationale: draft.rationale.trim(),
-        // diting S-F05：存在有效决定（含旧载荷 stale 决定）时始终携带被取
-        // 代决定的 decisionId——服务端按有效决定链裁决重绑；旧实现仅在
-        // 非 payloadMismatch 时携带，恰在需要重绑的 stale 分支缺失导致 400。
         ...(object.effectiveDecision ? { supersedesDecisionId: object.effectiveDecision.decisionId } : {}),
         expectedRevision: revision,
       });
       setDrafts((prev) => { const next = { ...prev }; delete next[object.objectId]; return next; });
-      setNotice(`已登记业务决定（${object.title || object.objectId} → ${STATUS_LABEL[draft.target] ?? draft.target}）；决定待发布——生效点是下一次成功构建发布。`);
+      setNotice(`已登记业务决定（${object.title || object.objectId} → ${STATUS_LABEL[draft.target] ?? draft.target}）；决定待发布，下一次成功构建发布后生效。`);
       await load();
     } catch (err) {
       if (err instanceof APIError && err.statusCode === 409) {
         setConflict(true);
-        setNotice('决定集已被并发修改（版本冲突），请刷新后基于最新状态重试。');
-      } else {
-        setNotice(err instanceof APIError ? err.message : '决定提交失败');
-      }
-    } finally {
-      setBusy(null);
-    }
+        setNotice('决定集已被并发修改，请刷新后基于最新状态重试。');
+      } else setNotice(err instanceof APIError ? err.message : '决定提交失败');
+    } finally { setBusy(null); }
   };
 
   const submitReview = async (object: KbGovernancePendingObjectDto, passed: boolean) => {
+    const note = reviewNotes[object.objectId]?.trim() ?? '';
+    if (!passed && !note) { setNotice('复核拒绝时请写明正文或证据的问题，方便后续修订。'); return; }
     setBusy(object.objectId);
     setNotice(null);
     try {
-      await recordKbHumanReview({ objectId: object.objectId, reviewSubjectHash: object.reviewSubjectHash, passed });
-      setNotice(`已记录人工复核${passed ? '通过' : '拒绝'}（${object.title || object.objectId}）。`);
+      await recordKbHumanReview({ objectId: object.objectId, reviewSubjectHash: object.reviewSubjectHash, passed, ...(note ? { note } : {}) });
+      setReviewNotes((prev) => { const next = { ...prev }; delete next[object.objectId]; return next; });
+      setNotice(`已记录人工复核${passed ? '通过' : '拒绝'}（${object.title || object.objectId}）。${passed ? '凭据绑定当前内容；新内容仍需复核。' : '该内容在下一次发布时将被阻断，修订并重新复核后可继续。'}当前正式版不变。`);
       await load();
-    } catch (err) {
-      setNotice(err instanceof APIError ? err.message : '人工复核提交失败');
-    } finally {
-      setBusy(null);
-    }
+    } catch (err) { setNotice(err instanceof APIError ? err.message : '人工复核提交失败'); }
+    finally { setBusy(null); }
   };
 
-  const highRisk = pending?.highRisk ?? [];
+  const rejectedReviews = pending?.highRisk ?? [];
   const candidates = pending?.candidates ?? [];
   const stale = pending?.staleDecisions ?? [];
-  // diting S-F04：可操作对象 = 服务端 governable 列表（当前 release 全部
-  // 活跃对象）；旧后端未返回该字段时回退 candidates+stale（兼容窗口）。
   const governable = pending?.governable ?? [...new Map([...candidates, ...stale].map((object) => [object.objectId, object])).values()];
-  const alertObjects = [...new Map([...candidates, ...stale].map((object) => [object.objectId, object])).values()];
+  const alertObjects = useMemo(() => [...new Map([...candidates, ...stale].map((object) => [object.objectId, object])).values()], [candidates, stale]);
+  const alertIds = new Set(alertObjects.map((object) => object.objectId));
+  const reviewProblems = rejectedReviews.filter((object) => !alertIds.has(object.objectId));
+  const filterObjects = (items: KbGovernancePendingObjectDto[], query: string) => {
+    const normalized = query.trim().toLocaleLowerCase();
+    return normalized ? items.filter((object) => `${object.title} ${object.objectId} ${object.docPath ?? ''} ${object.scopeKey}`.toLocaleLowerCase().includes(normalized)) : items;
+  };
+  const matchingObjects = objectQuery.trim() ? filterObjects(governable, objectQuery) : [];
 
-  return (
-    <div className="flex-1 min-h-0 overflow-auto scrollbar-thin p-4 space-y-4 text-xs text-ink-soft" data-testid="kb-governance-panel">
-      <p className="leading-relaxed">
-        人工复核与业务裁定（A 案 §4.2/§5.1）：高风险断言至少一次人工内容复核；批准/停用/恢复使用由人工决定产生。
-        决定生效点是<b className="text-ink">下一次成功发布</b>，不叠加进旧版本。
-      </p>
-
-      {conflict ? <div role="alert" className="rounded border border-seal-2/30 bg-seal-2/5 px-2.5 py-2 text-seal-2 flex items-start gap-1.5" data-testid="kb-gov-conflict">
-        <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
-        <span>决定版本冲突（409）：他人或其它窗口已先提交决定，请刷新后重试。</span>
-      </div> : null}
-      {notice ? <p role="status" data-testid="kb-gov-notice" className="rounded border border-line bg-paper px-2.5 py-2 text-ink-soft">{notice}</p> : null}
-      {error ? <div role="alert" className="rounded border border-seal-2/30 bg-seal-2/5 px-2.5 py-2 text-seal-2">{error}</div> : null}
-
-      <section className="space-y-2" data-testid="kb-gov-highrisk">
-        <h4 className="text-ink font-medium flex items-center gap-1.5">
-          高风险人工复核 <span className="text-seal-2">{highRisk.length}</span>
-        </h4>
-        {loading && highRisk.length === 0 ? <p className="text-ink-faint">加载中…</p>
-          : highRisk.length === 0 ? <p className="text-ink-faint">无待复核的高风险对象。</p>
-            : <ul className="space-y-2">
-              {highRisk.map((object) => (
-                <ObjectRow key={object.objectId} object={object}>
-                  <div className="flex items-center gap-2">
-                    <Button size="sm" disabled={busy === object.objectId} onClick={() => void submitReview(object, true)}>
-                      {busy === object.objectId ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}复核通过
-                    </Button>
-                    <Button size="sm" variant="secondary" disabled={busy === object.objectId} onClick={() => void submitReview(object, false)}>
-                      <X className="w-3.5 h-3.5" />复核拒绝
-                    </Button>
-                    <span className="text-[10px] text-ink-faint">绑定载荷 {shortHash(object.reviewSubjectHash)}</span>
-                  </div>
-                </ObjectRow>
-              ))}
-            </ul>}
-      </section>
-
-      <section className="space-y-2 border-t border-line pt-3" data-testid="kb-gov-alerts">
-        <h4 className="text-ink font-medium flex items-center gap-1.5">
-          待裁定提示 <span className="text-seal-2">{alertObjects.length}</span>
-        </h4>
-        {(pending && pending.releaseId) ? null : <p className="text-[10px] text-ink-faint">标准库尚未发布：发布后可对对象做业务决定。</p>}
-        {alertObjects.length === 0 ? (loading ? <p className="text-ink-faint">加载中…</p> : <p className="text-ink-faint">无待裁定的对象。</p>)
-          : <ul className="space-y-1.5">
-            {alertObjects.map((object) => (
-              <ObjectRow key={object.objectId} object={object}>
-                {object.effectiveDecision?.payloadMismatch ? (
-                  <p className="text-[10px] text-seal-2">决定过期：现有决定绑定旧载荷（{shortHash(object.effectiveDecision.decisionId)}），需在下方「可操作对象」重新决定。</p>
-                ) : (
-                  <p className="text-[10px] text-ink-faint">候选对象待业务决定：在下方「可操作对象」分区提交。</p>
-                )}
-              </ObjectRow>
-            ))}
-          </ul>}
-      </section>
-
-      <section className="space-y-2 border-t border-line pt-3" data-testid="kb-gov-decisions">
-        <h4 className="text-ink font-medium flex items-center gap-1.5">
-          可操作对象 <span className="text-seal-2">{governable.length}</span>
-          <span className="text-[10px] text-ink-faint font-normal">（决定集 revision {revision}）</span>
-        </h4>
-        {(pending && pending.releaseId) ? null : <p className="text-[10px] text-ink-faint">标准库尚未发布：发布后可对对象做业务决定。</p>}
-        {governable.length === 0 ? (loading ? <p className="text-ink-faint">加载中…</p> : <p className="text-ink-faint">无可操作对象（当前 release 无活跃对象）。</p>)
-          : <ul className="space-y-2">
-            {governable.map((object) => {
-              const draft = draftOf(object);
-              return (
-                <ObjectRow key={object.objectId} object={object}>
-                  {object.effectiveDecision?.payloadMismatch ? (
-                    <p className="text-[10px] text-seal-2">现有决定绑定旧载荷（{shortHash(object.effectiveDecision.decisionId)}），本次提交将取代旧决定并在新载荷上生效。</p>
-                  ) : null}
-                  <div className="flex flex-col gap-1.5">
-                    <div className="flex items-center gap-2">
-                      <label className="text-ink-faint shrink-0" htmlFor={`kb-gov-target-${object.objectId}`}>裁定</label>
-                      <select
-                        id={`kb-gov-target-${object.objectId}`}
-                        className="rounded border border-line bg-card-bg px-1.5 py-1 text-xs text-ink"
-                        value={draft.target}
-                        onChange={(event) => setDrafts((prev) => ({ ...prev, [object.objectId]: { ...draft, target: event.target.value } }))}
-                      >
-                        {object.allowedDecisionTargets.map((target) => (
-                          <option key={target} value={target}>{STATUS_LABEL[target] ?? target}</option>
-                        ))}
-                      </select>
-                    </div>
-                    <textarea
-                      className="rounded border border-line bg-card-bg px-2 py-1 text-xs text-ink min-h-[44px]"
-                      placeholder="实质理由（必填）：批准/停用的依据，随 release 冻结"
-                      aria-label={`决定理由 ${object.objectId}`}
-                      value={draft.rationale}
-                      onChange={(event) => setDrafts((prev) => ({ ...prev, [object.objectId]: { ...draft, rationale: event.target.value } }))}
-                    />
-                    <div className="flex items-center gap-2">
-                      <Button size="sm" disabled={busy === object.objectId} onClick={() => void submitDecision(object)}>
-                        {busy === object.objectId ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null}提交决定
-                      </Button>
-                      <span className="text-[10px] text-ink-faint">提交后待发布生效</span>
-                    </div>
-                  </div>
-                </ObjectRow>
-              );
-            })}
-          </ul>}
-      </section>
-
-      <Button size="sm" variant="ghost" onClick={() => void load()} loading={loading}>
-        <RefreshCw className="w-3.5 h-3.5" />刷新治理状态
-      </Button>
+  const reviewControls = (object: KbGovernancePendingObjectDto) => <div className="space-y-2 border-t border-line/70 pt-2">
+    <p className="text-ink-soft leading-relaxed">{object.reviewRejection
+      ? `问题：人工复核未通过。${object.reviewRejection} 请核对上面的正文与来源。`
+      : '这项断言被标为高风险。若要批准当前内容，发布前需要人工核对正文与来源；高风险标签本身不表示内容有错。'}</p>
+    <p className="text-[10px] text-ink-faint">通过：记录或更新此版内容的复核结论。拒绝：阻断这项内容的下一次发布，并记录具体原因。当前正式版保持可读。</p>
+    <textarea className="w-full rounded border border-line bg-card-bg px-2 py-1.5 text-xs text-ink min-h-[42px]" aria-label={`复核说明 ${object.objectId}`} placeholder="复核说明；拒绝时必填具体问题"
+      value={reviewNotes[object.objectId] ?? ''} onChange={(event) => setReviewNotes((prev) => ({ ...prev, [object.objectId]: event.target.value }))} />
+    <div className="flex gap-2">
+      <Button size="sm" disabled={busy === object.objectId} onClick={() => void submitReview(object, true)}>{busy === object.objectId ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}复核通过</Button>
+      <Button size="sm" variant="secondary" disabled={busy === object.objectId} onClick={() => void submitReview(object, false)}><X className="w-3.5 h-3.5" />复核拒绝</Button>
     </div>
-  );
+  </div>;
+
+  const decisionControls = (object: KbGovernancePendingObjectDto) => {
+    const draft = draftOf(object);
+    return <div className="space-y-2 border-t border-line/70 pt-2">
+      <p className="text-ink-soft leading-relaxed">{object.effectiveDecision?.payloadMismatch
+        ? '问题：已有业务决定绑定的是旧版内容，不能自动用于当前内容。请重新核对并决定。'
+        : object.businessStatus === 'candidate' ? '问题：这是候选表述，尚未有人工业务批准；请核对正文与来源后再决定是否批准。'
+          : '此对象当前没有待裁定问题。可在此主动调整业务状态。'}</p>
+      <div className="flex items-center gap-2">
+        <label className="shrink-0 text-ink-faint" htmlFor={`kb-gov-target-${object.objectId}`}>处理方式</label>
+        <select id={`kb-gov-target-${object.objectId}`} className="rounded border border-line bg-card-bg px-1.5 py-1 text-xs text-ink" value={draft.target}
+          onChange={(event) => setDrafts((prev) => ({ ...prev, [object.objectId]: { ...draft, target: event.target.value } }))}>
+          {object.allowedDecisionTargets.map((target) => <option key={target} value={target}>{STATUS_LABEL[target] ?? target}</option>)}
+        </select>
+      </div>
+      <p className="text-[10px] text-ink-faint">{decisionEffect(draft.target)}当前正式版不变。{object.highRiskClaims.length && draft.target === 'approved' && !object.humanReviewed ? '此对象还有高风险断言，发布前需完成人工复核。' : ''}</p>
+      <textarea className="w-full rounded border border-line bg-card-bg px-2 py-1.5 text-xs text-ink min-h-[48px]" placeholder="决定依据（必填）：说明为何批准或停用" aria-label={`决定理由 ${object.objectId}`}
+        value={draft.rationale} onChange={(event) => setDrafts((prev) => ({ ...prev, [object.objectId]: { ...draft, rationale: event.target.value } }))} />
+      <Button size="sm" disabled={busy === object.objectId || object.allowedDecisionTargets.length === 0} onClick={() => void submitDecision(object)}>
+        {busy === object.objectId ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null}提交决定
+      </Button>
+    </div>;
+  };
+
+  return <div className="flex-1 min-h-0 overflow-auto scrollbar-thin p-4 space-y-5 text-xs text-ink-soft" data-testid="kb-governance-panel">
+    <p className="leading-relaxed">这里处理需要人工判断的候选内容和过期决定。人工决定与复核记录会在下一次成功发布时进入正式版；当前正式文档可以继续阅读。</p>
+    {conflict ? <div role="alert" className="rounded border border-seal-2/30 bg-seal-2/5 px-2.5 py-2 text-seal-2 flex items-start gap-1.5" data-testid="kb-gov-conflict"><AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" /><span>决定版本冲突：其他窗口已先提交决定，请刷新后重试。</span></div> : null}
+    {notice ? <p role="status" data-testid="kb-gov-notice" className="rounded border border-line bg-paper px-2.5 py-2">{notice}</p> : null}
+    {error ? <div role="alert" className="rounded border border-seal-2/30 bg-seal-2/5 px-2.5 py-2 text-seal-2">{error}</div> : null}
+    <section className="space-y-2" data-testid="kb-gov-alerts">
+      <h4 className="text-ink font-medium">需要业务裁定 <span className="text-seal-2">{alertObjects.length}</span></h4>
+      {!pending?.releaseId ? <p className="text-ink-faint">标准库尚未发布；发布后可以处理业务决定。</p> : null}
+      {loading && !pending ? <p className="text-ink-faint">加载中…</p> : alertObjects.length === 0 ? <p className="rounded border border-line bg-paper px-3 py-3 text-ink-faint">当前没有需要业务裁定的对象。</p> : <>
+        <ul className="space-y-2">{alertObjects.slice(0, actionLimit).map((object) => <ObjectRow key={object.objectId} object={object} onOpenDoc={onOpenDoc}>
+          {object.reviewRejection || (object.highRiskClaims.length && !object.humanReviewed && draftOf(object).target === 'approved') ? reviewControls(object) : null}{decisionControls(object)}
+        </ObjectRow>)}</ul>
+        {alertObjects.length > actionLimit ? <Button size="sm" variant="ghost" onClick={() => setActionLimit((limit) => limit + PAGE_SIZE)}>再显示 {Math.min(PAGE_SIZE, alertObjects.length - actionLimit)} 项</Button> : null}
+      </>}
+    </section>
+    {reviewProblems.length ? <section className="space-y-2 border-t border-line pt-3" data-testid="kb-gov-highrisk">
+      <h4 className="font-medium text-seal-2">内容复核未通过 {reviewProblems.length}</h4>
+      <ul className="space-y-2">{reviewProblems.slice(0, reviewLimit).map((object) => <ObjectRow key={object.objectId} object={object} onOpenDoc={onOpenDoc}>{reviewControls(object)}</ObjectRow>)}</ul>
+      {reviewProblems.length > reviewLimit ? <Button size="sm" variant="ghost" onClick={() => setReviewLimit((limit) => limit + PAGE_SIZE)}>再显示 {Math.min(PAGE_SIZE, reviewProblems.length - reviewLimit)} 项</Button> : null}
+    </section> : null}
+    <section className="space-y-2 border-t border-line pt-3" data-testid="kb-gov-decisions">
+      <h4 className="font-medium text-ink">查找其他对象</h4>
+      <p className="text-[11px] text-ink-faint">需要主动批准、停用或恢复某项规则时，在 {governable.length} 个正式对象中搜索。未搜索时不展开全部对象。</p>
+      <input className="w-full rounded border border-line bg-card-bg px-2 py-1.5 text-xs text-ink" aria-label="查找治理对象" placeholder="输入标题、文档路径或对象编号" value={objectQuery}
+        onChange={(event) => { setObjectQuery(event.target.value); setObjectLimit(PAGE_SIZE); }} />
+      {objectQuery.trim() ? <>
+        <p className="text-[10px] text-ink-faint">匹配 {matchingObjects.length} 项，当前显示 {Math.min(matchingObjects.length, objectLimit)} 项</p>
+        <ul className="space-y-2">{matchingObjects.slice(0, objectLimit).map((object) => <ObjectRow key={object.objectId} object={object} onOpenDoc={onOpenDoc}>
+          {object.reviewRejection || (object.highRiskClaims.length && !object.humanReviewed && draftOf(object).target === 'approved') ? reviewControls(object) : null}{decisionControls(object)}
+        </ObjectRow>)}</ul>
+        {matchingObjects.length > objectLimit ? <Button size="sm" variant="ghost" onClick={() => setObjectLimit((limit) => limit + PAGE_SIZE)}>再显示 {Math.min(PAGE_SIZE, matchingObjects.length - objectLimit)} 项</Button> : null}
+      </> : null}
+    </section>
+    <Button size="sm" variant="ghost" onClick={() => void load()} loading={loading}><RefreshCw className="w-3.5 h-3.5" />刷新治理状态</Button>
+  </div>;
 }

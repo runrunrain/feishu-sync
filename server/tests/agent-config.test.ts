@@ -47,7 +47,7 @@ describe('旧配置兼容（additive 默认合并）', () => {
     const manager = new ConfigManager(configPath);
     const config = await manager.load();
     expect(config.agent).toBeTruthy();
-    expect(config.agent.runtime.backend).toBe('claude-code');
+    expect(config.agent.runtime.backend).toBe('pi');
     expect(config.agent.model.source).toBe('app-llm');
     expect(config.agent.model.thinkingLevel).toBe('off');
     expect(config.agent.maxConcurrentProcesses).toBe(3);
@@ -91,7 +91,7 @@ describe('旧配置兼容（additive 默认合并）', () => {
     const manager = new ConfigManager(configPath);
     const config = await manager.load();
     expect(config.agent.model.source).toBe('pi-agent-dir');
-    expect(config.agent.runtime.backend).toBe('claude-code');
+    expect(config.agent.runtime.backend).toBe('pi');
     expect(config.agent.model.thinkingLevel).toBe('off'); // 缺省补默认
     expect(config.agent.maxConcurrentProcesses).toBe(3);
   });

@@ -44,7 +44,9 @@ import { assertProbeUsable, runStaticProbes } from '../agent/build-runtime/capab
 import {
   AMAGI_PI_GIT_COMMIT, AMAGI_PI_GIT_REPO_URL, AmagiPackageError, amagiGitSourceSpec,
   installAmagiFromGit, installAmagiPackage, readPackageVersion, verifyAmagiPackage,
+  amagiInstallDir,
 } from '../agent/build-runtime/amagi-package.js';
+import { readBundledAmagi, installBundledAmagi, bundledAmagiPackageRoot, type BundledAmagi } from '../agent/bundled-amagi.js';
 import {
   compareAmagiVersions, piSdkAvailable, preferredConfiguredAmagi,
   resolveAppPiAgentDir, resolveGlobalPiAgentDir, scanAmagiHome,
@@ -140,6 +142,7 @@ export interface BuildRuntimeStatusDto {
     pinnedVersion: string;
     /** 新构建自动优选的已配置安装实体；null 使用内置 Git 回退版本。 */
     selectedSource: string | null;
+    distribution?: 'bundled' | 'configured' | 'git';
     installed: boolean;
     version: string | null;
     installDir: string | null;
@@ -163,6 +166,7 @@ export interface BuildRuntimeStatusDto {
 
 export interface BuildRuntimeHostDeps {
   dataRoot: string;
+  bundledAmagi?: () => BundledAmagi | null;
   resolver: PiRuntimeResolver;
   toolService: AgentToolService;
   pool: AgentProcessPool;
@@ -271,22 +275,33 @@ export class BuildRuntimeHost {
 
   private async preferredAmagi(facts: { nodePath: string; piPackageRoot: string | null }): Promise<{
     version: string; sourceDir: string | null;
+    contentHash?: string; bundle: BundledAmagi | null;
     discovery: Awaited<ReturnType<BuildRuntimeHost['discoverAmagi']>>;
   }> {
     const discovery = await this.discoverAmagi(facts);
     const candidate = preferredConfiguredAmagi(discovery.candidates, AMAGI_PI_PINNED_VERSION);
+    const bundle = this.bundle();
+    if (bundle && (!candidate || compareAmagiVersions(bundle.version, candidate.version!) >= 0)) {
+      return { version: bundle.version, sourceDir: bundledAmagiPackageRoot(this.deps.dataRoot, bundle),
+        contentHash: bundle.contentHash, bundle, discovery };
+    }
     return {
       version: candidate?.version ?? AMAGI_PI_PINNED_VERSION,
       sourceDir: candidate?.packagePath ?? null,
+      bundle: null,
       discovery,
     };
   }
 
-  private staticReport(facts: { piVersion: string }, version: string, apiKeyOverride?: string): CapabilityReport {
+  private bundle(): BundledAmagi | null { return (this.deps.bundledAmagi ?? readBundledAmagi)(); }
+
+  private staticReport(facts: { piVersion: string }, version: string, apiKeyOverride?: string, contentHash?: string, installDir?: string): CapabilityReport {
     const config = this.config();
     return runStaticProbes({
       dataRoot: this.deps.dataRoot,
       amagiVersion: version,
+      amagiContentHash: contentHash,
+      amagiInstallDir: installDir,
       knowledgeBaseRoot: this.deps.knowledgeBaseRoot(),
       outputRoot: this.deps.outputRoot(),
       hasZhipuApiKey: apiKeyOverride !== undefined ? apiKeyOverride.trim() !== '' : this.hasActiveApiKey(config),
@@ -302,16 +317,16 @@ export class BuildRuntimeHost {
   }> {
     const facts = await this.runtimeFacts();
     const selected = await this.preferredAmagi(facts);
-    return { report: this.staticReport(facts, selected.version, apiKeyOverride), facts, selected };
+    return { report: this.staticReport(facts, selected.version, apiKeyOverride, selected.contentHash), facts, selected };
   }
 
   /** 探测并 fail-closed 断言（构建路径；静态 fail → 明确 503，不降级）。 */
-  private async probeOrFail(apiKeyOverride?: string, frozenVersion?: string): Promise<{ report: CapabilityReport; amagiPackage: AmagiPackageRef; piVersion: string }> {
-    const probed = frozenVersion
-      ? { facts: await this.runtimeFacts(), selected: { version: frozenVersion, sourceDir: null } }
+  private async probeOrFail(apiKeyOverride?: string, frozenPackage?: Pick<AmagiPackageRef, 'version' | 'contentHash'> & { installDir?: string }): Promise<{ report: CapabilityReport; amagiPackage: AmagiPackageRef; piVersion: string }> {
+    const probed = frozenPackage
+      ? { facts: await this.runtimeFacts(), selected: { version: frozenPackage.version, contentHash: frozenPackage.contentHash, sourceDir: null, installDir: frozenPackage.installDir } }
       : await this.probeReport(apiKeyOverride);
     const { facts, selected } = probed;
-    const initial = 'report' in probed ? probed.report : this.staticReport(facts, selected.version, apiKeyOverride);
+    const initial = 'report' in probed ? probed.report : this.staticReport(facts, selected.version, apiKeyOverride, selected.contentHash, 'installDir' in selected ? selected.installDir : undefined);
     if (selected.sourceDir && !initial.amagiPackage) {
       // Upgrade only at a new build boundary. The running build retains its
       // immutable package path and content hash in BuildRunSpec.
@@ -322,7 +337,7 @@ export class BuildRuntimeHost {
       }
     }
     const report = selected.sourceDir && !initial.amagiPackage
-      ? this.staticReport(facts, selected.version, apiKeyOverride) : initial;
+      ? this.staticReport(facts, selected.version, apiKeyOverride, selected.contentHash) : initial;
     try {
       assertProbeUsable(report);
     } catch (error) {
@@ -342,9 +357,10 @@ export class BuildRuntimeHost {
   }
 
   /** 私有固定版本安装事实（快速核对；不依赖 Pi 运行时，探测失败也不掩埋）。 */
-  private installedFact(version = AMAGI_PI_PINNED_VERSION): { state: 'installed' | 'missing' | 'broken'; detail: string | null; ref: (AmagiPackageRef & { record: unknown }) | null } {
+  private installedFact(version = AMAGI_PI_PINNED_VERSION, contentHash?: string): { state: 'installed' | 'missing' | 'broken'; detail: string | null; ref: (AmagiPackageRef & { record: unknown }) | null } {
+    if (contentHash && !fs.existsSync(amagiInstallDir(this.deps.dataRoot, version, contentHash))) return { state: 'missing', detail: null, ref: null };
     try {
-      const ref = verifyAmagiPackage({ dataRoot: this.deps.dataRoot, version, verifyHash: false });
+      const ref = verifyAmagiPackage({ dataRoot: this.deps.dataRoot, version, contentHash, verifyHash: false });
       return { state: 'installed', detail: null, ref };
     } catch (error) {
       const code = error instanceof AmagiPackageError ? error.code : 'amagi_package_invalid';
@@ -400,12 +416,13 @@ export class BuildRuntimeHost {
    * 与发现结果不因探测失败被抹成「未安装」——plugin-install-fix 核心修正）。 */
   async statusDto(): Promise<BuildRuntimeStatusDto> {
     const mode = this.config().standardKb.orchestrationMode ?? 'legacy';
-    let fact = this.installedFact();
+    const bundle = this.bundle();
+    let fact = this.installedFact(bundle?.version, bundle?.contentHash);
     const gitSource = amagiGitSourceSpec();
     try {
       const { report, facts, selected } = await this.probeReport();
       const discovery = selected.discovery;
-      fact = this.installedFact(selected.version);
+      fact = this.installedFact(selected.version, selected.contentHash);
       const amagiRef = report.amagiPackage;
       return {
         orchestrationMode: mode,
@@ -413,6 +430,7 @@ export class BuildRuntimeHost {
         amagi: {
           pinnedVersion: selected.version,
           selectedSource: selected.sourceDir,
+          distribution: selected.bundle ? 'bundled' : selected.sourceDir ? 'configured' : 'git',
           installed: amagiRef !== null,
           version: amagiRef?.version ?? null,
           installDir: amagiRef?.installDir ?? null,
@@ -440,8 +458,9 @@ export class BuildRuntimeHost {
         orchestrationMode: mode,
         runtime: null,
         amagi: {
-          pinnedVersion: AMAGI_PI_PINNED_VERSION,
-          selectedSource: null,
+          pinnedVersion: bundle?.version ?? AMAGI_PI_PINNED_VERSION,
+          selectedSource: bundle ? bundledAmagiPackageRoot(this.deps.dataRoot, bundle) : null,
+          distribution: bundle ? 'bundled' : 'git',
           installed: fact.state === 'installed',
           version: fact.ref?.version ?? null,
           installDir: fact.ref?.installDir ?? null,
@@ -476,6 +495,10 @@ export class BuildRuntimeHost {
       try {
         const selected = input.sourceDir ? null : await this.preferredAmagi(facts);
         const sourceDir = input.sourceDir ?? selected?.sourceDir ?? undefined;
+        const bundle = selected?.bundle ?? this.bundle();
+        if (bundle && sourceDir === bundledAmagiPackageRoot(this.deps.dataRoot, bundle)) {
+          return await installBundledAmagi({ ...facts, dataRoot: this.deps.dataRoot, bundle, log: input.log });
+        }
         if (sourceDir) {
           const version = readPackageVersion(sourceDir);
           if (!/^\d+\.\d+\.\d+$/.test(version)
@@ -516,7 +539,8 @@ export class BuildRuntimeHost {
   /** 已安装包复核（构建路径与状态端点共用；verifyHash 缺省全量）。 */
   verifyInstalled(): (AmagiPackageRef & { record: unknown }) | null {
     try {
-      return verifyAmagiPackage({ dataRoot: this.deps.dataRoot, version: AMAGI_PI_PINNED_VERSION, verifyHash: false });
+      const bundle = this.bundle();
+      return verifyAmagiPackage({ dataRoot: this.deps.dataRoot, version: bundle?.version ?? AMAGI_PI_PINNED_VERSION, contentHash: bundle?.contentHash, verifyHash: false });
     } catch {
       return null;
     }
@@ -890,9 +914,9 @@ export class BuildRuntimeHost {
       throw new ToolError('build_runtime_busy', `构建 ${input.buildId} 已有进行中的 Leader 会话`, 409);
     }
     // 1. 探测（fail-closed；密钥以本次构建解析为准）。
-    const frozenVersion = input.resumeStrategy === 'session'
-      ? input.priorState?.spec.amagiPackage.version : undefined;
-    const { amagiPackage, piVersion } = await this.probeOrFail(input.apiKey, frozenVersion);
+    const frozenPackage = input.resumeStrategy === 'session'
+      ? input.priorState?.spec.amagiPackage : undefined;
+    const { amagiPackage, piVersion } = await this.probeOrFail(input.apiKey, frozenPackage);
     // 2. 资产定位（转发扩展/桥接脚本/skill；缺失明确失败）。
     const forwardingExtensionPath = piExtensionPath();
     if (!forwardingExtensionPath) {

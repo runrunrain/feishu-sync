@@ -972,6 +972,8 @@ export interface DesktopAPI {
   openDataDirectory: () => Promise<DesktopActionResult>;
   /** F2 Agent Workspace：原生目录选择（设计 §9.4）；取消返回 null。路径合法性只由后端校验。 */
   selectDirectory: () => Promise<string | null>;
+  chooseKbExportPath: (suggestedName: string) => Promise<string | null>;
+  chooseKbImportPath: () => Promise<string | null>;
   openConfigFile: () => Promise<DesktopActionResult>;
   /** 在系统默认浏览器打开外部 URL（仅 http/https，与 electron/main.ts 白名单对应）。 */
   openExternal: (url: string) => Promise<DesktopActionResult>;

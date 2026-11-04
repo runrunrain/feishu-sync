@@ -13,8 +13,7 @@ import { Drawer } from '../common/Drawer';
 import { MarkdownView } from '../preview/MarkdownView';
 import { CsvTableView } from '../preview/CsvTableView';
 import { WorkbookView } from '../preview/WorkbookView';
-import { SourceEditControls } from '../SourceEditControls';
-import { getDocumentContent, APIError } from '../../api/client';
+import { getDocumentContent, getPortableKbSource, APIError } from '../../api/client';
 import type { DocumentContent } from '../../types';
 import type { KbDocSourceRef } from '../../types/agent';
 
@@ -25,18 +24,19 @@ interface RawSourceDrawerProps {
 
 export function RawSourceDrawer({ source, onClose }: RawSourceDrawerProps) {
   const [content, setContent] = useState<DocumentContent | null>(null);
+  const [packagedContent, setPackagedContent] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [view, setView] = useState<'md' | 'csv' | 'xlsx'>('md');
   const [csvIndex, setCsvIndex] = useState(0);
-  /** 放弃/写回后重载正文（S13）。 */
-  const [reloadNonce, setReloadNonce] = useState(0);
 
   const objToken = source?.objToken ?? null;
+  const packaged = source?.state === 'packaged';
 
   useEffect(() => {
     if (!objToken) {
       setContent(null);
+      setPackagedContent(null);
       setError(null);
       return;
     }
@@ -44,14 +44,19 @@ export function RawSourceDrawer({ source, onClose }: RawSourceDrawerProps) {
     setLoading(true);
     setError(null);
     setContent(null);
+    setPackagedContent(null);
     setView('md');
     setCsvIndex(0);
-    getDocumentContent(objToken)
+    (packaged ? getPortableKbSource(objToken) : getDocumentContent(objToken))
       .then((data) => {
         if (cancelled) return;
-        setContent(data);
-        if (data.workbook) setView('xlsx');
-        else if (!data.mdContent && data.csvTables.length > 0) setView('csv');
+        if (packaged) setPackagedContent((data as { markdown: string }).markdown);
+        else {
+          const local = data as DocumentContent;
+          setContent(local);
+          if (local.workbook) setView('xlsx');
+          else if (!local.mdContent && local.csvTables.length > 0) setView('csv');
+        }
       })
       .catch((err) => {
         if (cancelled) return;
@@ -63,27 +68,32 @@ export function RawSourceDrawer({ source, onClose }: RawSourceDrawerProps) {
     return () => {
       cancelled = true;
     };
-  }, [objToken, reloadNonce]);
+  }, [objToken, packaged]);
 
   return (
     <Drawer
       open={source !== null}
       onClose={onClose}
-      title={source ? `原始文档 · ${source.title || '未命名'}` : '原始文档'}
+      title={source ? `${packaged ? '来源快照' : '原始文档'} · ${source.title || '未命名'}` : '原始文档'}
       subtitle={source?.relPath}
       widthClass={view === 'xlsx' ? 'w-[1080px] max-w-[94vw]' : 'w-[620px] max-w-[92vw]'}
     >
       {loading ? (
         <div className="flex flex-col items-center justify-center gap-3 py-20 text-ink-faint">
           <Loader2 className="w-6 h-6 animate-spin" />
-          <p className="text-xs">正在读取本地原始文档…</p>
+          <p className="text-xs">正在读取{packaged ? '共享包来源快照' : '本地原始文档'}…</p>
         </div>
       ) : error ? (
         <div className="flex flex-col items-center justify-center gap-3 py-16 px-6 text-center">
           <FileWarning className="w-8 h-8 text-seal-2" />
-          <p className="text-sm text-ink font-medium">原始文档读取失败</p>
+          <p className="text-sm text-ink font-medium">{packaged ? '来源快照' : '原始文档'}读取失败</p>
           <p className="text-xs text-ink-soft leading-relaxed max-w-sm">{error}</p>
-          <p className="text-[11px] text-ink-faint">该来源可能尚未同步到本地，或本地文件已缺失。</p>
+          <p className="text-[11px] text-ink-faint">{packaged ? '共享包可能缺少该来源快照。' : '该来源可能尚未同步到本地，或本地文件已缺失。'}</p>
+        </div>
+      ) : packagedContent !== null ? (
+        <div className="p-4 space-y-2">
+          <p className="text-xs text-ink-faint">此内容是构建时封存的来源快照，可追溯正文依据。</p>
+          <MarkdownView content={packagedContent} remoteImages="confirm" />
         </div>
       ) : content ? (
         <div className="flex flex-col">
@@ -130,17 +140,6 @@ export function RawSourceDrawer({ source, onClose }: RawSourceDrawerProps) {
             ) : null}
             {content.mdTruncated ? (
               <span className="ml-auto text-[11px] text-ink-faint">内容过长已截断</span>
-            ) : null}
-            {/* 源文档状态/写回入口（与 DocPreviewPanel 共用组件） */}
-            {objToken && content.mdContent != null && content.objType === 'docx' ? (
-              <span className={content.mdTruncated ? '' : 'ml-auto'}>
-                <SourceEditControls
-                  objToken={objToken}
-                  objType={content.objType}
-                  mdContent={content.mdContent}
-                  onContentChanged={() => setReloadNonce((n) => n + 1)}
-                />
-              </span>
             ) : null}
           </div>
           {view === 'xlsx' && content.workbook ? (

@@ -81,6 +81,9 @@ export interface DesktopAPI {
    * Path validity is validated server-side only (§7.3).
    */
   selectDirectory: () => Promise<string | null>;
+  /** Native path pickers for a self-contained standard KB bundle. */
+  chooseKbExportPath: (suggestedName: string) => Promise<string | null>;
+  chooseKbImportPath: () => Promise<string | null>;
 
   /**
    * Open application configuration file in default editor

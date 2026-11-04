@@ -20,6 +20,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { KbBuildService } from '../kb/kb-build-service.js';
 import { StandardKbStore, KbNotPublishedError } from '../kb/standard-kb-store.js';
+import { exportPortableKb, importPortableKb, inspectPortableKb, isImportedRelease, PortableKbError, previousLocalReleaseId, restorePreviousLocalKb } from '../kb/portable-kb-service.js';
 import { QueryError, getKbQueryService } from '../kb/search/kb-query-service.js';
 import { RawSourceSnapshot, collectSourceCandidates } from '../kb/raw-source-snapshot.js';
 import { KbVersionStore, captureSourceContents, sourceChangePreview, validReleaseId } from '../kb/kb-version-store.js';
@@ -50,6 +51,9 @@ export interface KbRouteDeps {
 }
 
 function errorResponse(c: Context, error: unknown): Response {
+  if (error instanceof PortableKbError) {
+    return c.json({ error: error.code, message: error.message }, error.status as ContentfulStatusCode) as unknown as Response;
+  }
   if (error instanceof QueryError) {
     const status = error.code.startsWith('invalid_') ? 400 : ['kb_not_published', 'kb_release_unavailable', 'kb_not_found'].includes(error.code) ? 404 : 500;
     return c.json({ error: error.code, message: error.message, details: error.details }, status) as unknown as Response;
@@ -162,6 +166,76 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
     return { store: queryStore, config };
   }
 
+  // A portable bundle can read/write arbitrary user-selected paths. Keep the
+  // endpoint exclusive to the desktop bridge, not CLI forwarding.
+  const portableDesktopOnly = (c: Context): Response | null =>
+    (c as any).cliActor === true || c.req.header('X-Feishu-Sync-Actor') !== undefined || c.req.header('X-Cli-Token') !== undefined
+      ? c.json({ error: 'kb_portable_forbidden', message: '标准库共享仅接受桌面应用操作' }, 403) as unknown as Response
+      : null;
+  let portableMutationActive = false;
+  const assertPortableIdle = () => {
+    if (buildService.activeBuild(localMapStore)) throw new PortableKbError('kb_build_active', '构建正在进行，请等待结束后导入或恢复', 409);
+  };
+
+  routes.post('/api/kb/portable/preview', async (c) => {
+    const denied = portableDesktopOnly(c); if (denied) return denied;
+    try {
+      const body = await c.req.json() as { path?: string };
+      if (typeof body.path !== 'string') throw new PortableKbError('invalid_request', '请选择共享包');
+      const { config } = await loadStore();
+      return c.json(await inspectPortableKb(config.standardKb.outputRoot, body.path));
+    } catch (error) { return errorResponse(c, error); }
+  });
+
+  routes.post('/api/kb/portable/export', async (c) => {
+    const denied = portableDesktopOnly(c); if (denied) return denied;
+    try {
+      const body = await c.req.json() as { path?: string };
+      if (typeof body.path !== 'string') throw new PortableKbError('invalid_request', '请选择导出位置');
+      const { config } = await loadStore();
+      return c.json(await exportPortableKb(config.standardKb.outputRoot, body.path));
+    } catch (error) { return errorResponse(c, error); }
+  });
+
+  routes.post('/api/kb/portable/import', async (c) => {
+    const denied = portableDesktopOnly(c); if (denied) return denied;
+    if (portableMutationActive) return c.json({ error: 'kb_portable_busy', message: '标准库导入或恢复正在进行' }, 409);
+    portableMutationActive = true;
+    try {
+      const body = await c.req.json() as { path?: string; confirm?: string; expectedCurrentReleaseId?: string | null };
+      if (body.confirm !== 'IMPORT' || typeof body.path !== 'string'
+        || (typeof body.expectedCurrentReleaseId !== 'string' && body.expectedCurrentReleaseId !== null)) {
+        throw new PortableKbError('invalid_request', '请先预览并确认导入');
+      }
+      const { config } = await loadStore();
+      return c.json(await importPortableKb(config.standardKb.outputRoot, body.path, body.expectedCurrentReleaseId, assertPortableIdle));
+    } catch (error) { return errorResponse(c, error); }
+    finally { portableMutationActive = false; }
+  });
+
+  routes.get('/api/kb/portable/restore', async (c) => {
+    const denied = portableDesktopOnly(c); if (denied) return denied;
+    try {
+      const { store, config } = await loadStore();
+      const current = store.readCurrent()?.releaseId ?? null;
+      return c.json({ previousReleaseId: current ? previousLocalReleaseId(config.standardKb.outputRoot, current) : null });
+    } catch (error) { return errorResponse(c, error); }
+  });
+
+  routes.post('/api/kb/portable/restore', async (c) => {
+    const denied = portableDesktopOnly(c); if (denied) return denied;
+    if (portableMutationActive) return c.json({ error: 'kb_portable_busy', message: '标准库导入或恢复正在进行' }, 409);
+    portableMutationActive = true;
+    try {
+      const body = await c.req.json() as { confirm?: string };
+      if (body.confirm !== 'RESTORE') throw new PortableKbError('invalid_request', '请确认恢复导入前版本');
+      assertPortableIdle();
+      const { config } = await loadStore();
+      return c.json(restorePreviousLocalKb(config.standardKb.outputRoot));
+    } catch (error) { return errorResponse(c, error); }
+    finally { portableMutationActive = false; }
+  });
+
   const sourceDocuments = (root: string, published: Iterable<string> = []) => {
     return selectKnowledgeSources(filterDeletedLocalDocuments(localMapStore, root, deps.documentsProvider()), {
       unselected: localMapStore.listKbExcludedSources(root),
@@ -179,12 +253,12 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
       const { store, config } = await loadStore();
       const current = store.readCurrent();
       const manifest = store.readManifest();
-      const scan = RawSourceSnapshot.scan(
+      const imported = Boolean(manifest && isImportedRelease(config.standardKb.outputRoot, manifest.releaseId));
+      const pending = imported ? { added: 0, changed: 0, removed: 0 } : compareSources(manifest, RawSourceSnapshot.scan(
         config.knowledgeBaseRoot,
         sourceDocuments(config.knowledgeBaseRoot, manifest?.sourceSnapshot.map((source) => source.objToken)),
         deps.sheetCsvPaths,
-      );
-      const { pending } = compareSources(manifest, scan.entries, deps.sheetCsvPaths, config.knowledgeBaseRoot);
+      ).entries, deps.sheetCsvPaths, config.knowledgeBaseRoot).pending;
       const dto: KbStatusDto = {
         outputRoot: config.standardKb.outputRoot,
         current: current && manifest
@@ -195,6 +269,7 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
             docCount: manifest.docs.length,
             sourceCount: manifest.sourceSnapshot.length,
             model: manifest.model,
+            imported,
           }
           : null,
         pending,
@@ -233,19 +308,21 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
       const loaded = store.readReleaseDoc(manifest.releaseId, doc);
       // 源状态：与当前原始库比较
       const config = await configManager.load();
-      const scan = RawSourceSnapshot.scan(
+      const imported = isImportedRelease(config.standardKb.outputRoot, manifest.releaseId);
+      const scan = imported ? null : RawSourceSnapshot.scan(
         config.knowledgeBaseRoot,
         sourceDocuments(config.knowledgeBaseRoot, manifest.sourceSnapshot.map((source) => source.objToken)),
         deps.sheetCsvPaths,
       );
-      const currentByToken = new Map(scan.entries.map((entry) => [entry.objToken, entry.contentHash]));
-      const excluded = new Set(localMapStore.listKbExplicitlyExcludedSources(config.knowledgeBaseRoot));
-      const deleted = new Set(localMapStore.listLocalSourceDeletions?.(config.knowledgeBaseRoot).map((item) => item.objToken) ?? []);
+      const currentByToken = new Map(scan?.entries.map((entry) => [entry.objToken, entry.contentHash]) ?? []);
+      const excluded = imported ? new Set<string>() : new Set(localMapStore.listKbExplicitlyExcludedSources(config.knowledgeBaseRoot));
+      const deleted = imported ? new Set<string>() : new Set(localMapStore.listLocalSourceDeletions?.(config.knowledgeBaseRoot).map((item) => item.objToken) ?? []);
       const sources = doc.sources.map((objToken) => {
         const snapshotEntry = manifest.sourceSnapshot.find((candidate) => candidate.objToken === objToken);
         const currentHash = currentByToken.get(objToken);
-        let state: KbSourceState = 'current';
-        if (deleted.has(objToken)) state = 'deleted';
+        let state: KbSourceState = imported ? 'packaged' : 'current';
+        if (imported) { /* shared release traces its packaged snapshot */ }
+        else if (deleted.has(objToken)) state = 'deleted';
         else if (excluded.has(objToken)) state = 'excluded';
         else if (currentHash === undefined) state = 'missing';
         else if (snapshotEntry && snapshotEntry.contentHash !== currentHash) state = 'changed';
@@ -271,6 +348,23 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
     } catch (error) {
       return errorResponse(c, error);
     }
+  });
+
+  routes.get('/api/kb/portable/sources/:objToken', async (c) => {
+    try {
+      const { store, config } = await loadStore();
+      const manifest = store.readManifest();
+      if (!manifest || !isImportedRelease(config.standardKb.outputRoot, manifest.releaseId)) {
+        return c.json({ error: 'kb_source_not_packaged', message: '当前不是导入的共享版本' }, 404);
+      }
+      const token = c.req.param('objToken');
+      const source = manifest.sourceSnapshot.find((item) => item.objToken === token);
+      if (!source) return c.json({ error: 'kb_source_not_found', message: '共享包中没有该来源' }, 404);
+      const contents = new KbVersionStore(config.standardKb.outputRoot).readSourceContents(manifest.releaseId);
+      const markdown = contents[token];
+      if (typeof markdown !== 'string') return c.json({ error: 'kb_source_not_found', message: '共享包未包含该来源原文' }, 404);
+      return c.json({ objToken: token, title: source.title, markdown });
+    } catch (error) { return errorResponse(c, error); }
   });
 
   routes.get('/api/kb/search', async (c) => {
@@ -463,6 +557,7 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
 
   routes.post('/api/kb/builds', async (c) => {
     try {
+      if (portableMutationActive) throw new PortableKbError('kb_portable_busy', '标准库导入或恢复正在进行，请稍后构建', 409);
       const body = await c.req.json() as { mode?: string; confirm?: string; refreshImages?: boolean; rebuildSelected?: boolean };
       const dto = await buildService.createBuild(localMapStore as never, body);
       return c.json(dto, 202);
@@ -480,6 +575,7 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
 
   routes.post('/api/kb/builds/:id/resume', async (c) => {
     try {
+      if (portableMutationActive) throw new PortableKbError('kb_portable_busy', '标准库导入或恢复正在进行，请稍后继续构建', 409);
       await configManager.load();
       const body = await c.req.json() as { confirm?: string; resumeStrategy?: string };
       return c.json(await buildService.resumeBuild(localMapStore, c.req.param('id'), body.confirm, body.resumeStrategy), 202);

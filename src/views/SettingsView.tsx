@@ -18,7 +18,6 @@ import type { LucideIcon } from 'lucide-react';
 import {
   Bot,
   BookOpen,
-  CloudUpload,
   Database,
   FolderArchive,
   FolderTree,
@@ -26,7 +25,6 @@ import {
   Info,
   KeyRound,
   Network,
-  PenLine,
   Puzzle,
   Server,
   Settings,
@@ -55,8 +53,6 @@ import { BuildOrchestrationSettings } from '../components/settings/BuildOrchestr
 import { CliAccessSettingsCard } from '../components/CliAccessSettingsCard';
 import { KbLanMcpSettingsCard } from '../components/KbLanMcpSettingsCard';
 import { KbMcpLocalSettingsCard } from '../components/KbMcpLocalSettingsCard';
-import { FeishuWriteSettingsCard } from '../components/FeishuWriteSettingsCard';
-import { FeishuPublishSettingsCard } from '../components/FeishuPublishSettingsCard';
 
 type SettingsTab = 'knowledge' | 'models' | 'agent' | 'auth' | 'application';
 
@@ -200,7 +196,7 @@ const SETTINGS_TABS: SettingsTabMeta[] = [
   {
     id: 'auth',
     label: '飞书认证',
-    description: 'lark-cli 登录状态、权限范围、文档写入与反向发布授权',
+    description: 'lark-cli 登录状态与权限范围',
     icon: ShieldCheck,
     items: [
       {
@@ -209,20 +205,6 @@ const SETTINGS_TABS: SettingsTabMeta[] = [
         description: 'lark-cli 登录状态与权限范围',
         icon: KeyRound,
         render: () => <AuthSettingsCard />,
-      },
-      {
-        id: 'auth-feishu-write',
-        label: '飞书写入',
-        description: '写回飞书开关与文档写入权限增量授权（S13）',
-        icon: PenLine,
-        render: () => <FeishuWriteSettingsCard />,
-      },
-      {
-        id: 'auth-feishu-publish',
-        label: '飞书发布',
-        description: '反向发布开关与发布根校验（P1-S9）',
-        icon: CloudUpload,
-        render: () => <FeishuPublishSettingsCard />,
       },
     ],
   },

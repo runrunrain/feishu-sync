@@ -419,6 +419,7 @@ describe('BuildRuntimeHost 探测门禁', () => {
       piCliPath: path.join(root, 'fake-pi.mjs'), piVersion: '1.4.0', claudeCliPath: null,
     } as never);
     return new BuildRuntimeHost({
+      bundledAmagi: () => null,
       dataRoot: root,
       resolver,
       toolService: new AgentToolService({ dataRoot: root, documentsProvider: () => [] }),

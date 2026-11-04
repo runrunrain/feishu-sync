@@ -7,6 +7,7 @@ export interface PiPackagePlugin {
   description: string;
   installPath: string;
   enabled: boolean;
+  managed?: boolean;
   resources: { type: string; path: string; enabled?: boolean }[];
 }
 export interface PiPluginsDto { revision: string; agentDir: string; packages: PiPackagePlugin[]; busy: boolean }

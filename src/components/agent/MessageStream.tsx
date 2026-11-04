@@ -13,8 +13,10 @@ import type { RunDraft } from '../../hooks/useAgentSessions';
 import type { AgentApprovalDto, AgentMessageDto, AgentTaskNotice } from '../../types/agent';
 import { MarkdownView } from '../preview/MarkdownView';
 import { ApprovalCard } from './ApprovalCard';
+import { ChatAttachmentCards } from './ChatAttachmentCards';
 
 interface MessageStreamProps {
+  sessionId?: string;
   messages: AgentMessageDto[];
   draft: RunDraft | null;
   streamErrors: Array<{ id: string; code: string; message: string }>;
@@ -30,7 +32,7 @@ interface MessageStreamProps {
   taskNotices?: AgentTaskNotice[];
 }
 
-export function MessageStream({ messages, draft, streamErrors, loading, emptyHint, approvals, onApprovalDecision, approvalBusyId, taskNotices }: MessageStreamProps) {
+export function MessageStream({ sessionId, messages, draft, streamErrors, loading, emptyHint, approvals, onApprovalDecision, approvalBusyId, taskNotices }: MessageStreamProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
 
@@ -64,7 +66,7 @@ export function MessageStream({ messages, draft, streamErrors, loading, emptyHin
         ) : !hasContent ? (
           <div className="py-12 text-center">{emptyHint}</div>
         ) : (
-          messages.map((m) => <MessageRow key={m.id} message={m} />)
+          messages.map((m) => <MessageRow key={m.id} message={m} sessionId={sessionId} />)
         )}
 
         {/* 流式草稿：tool 行 + 正在生成的文本 */}
@@ -143,12 +145,13 @@ export function MessageStream({ messages, draft, streamErrors, loading, emptyHin
   );
 }
 
-const MessageRow = memo(function MessageRow({ message }: { message: AgentMessageDto }) {
+const MessageRow = memo(function MessageRow({ message, sessionId }: { message: AgentMessageDto; sessionId?: string }) {
   if (message.role === 'user') {
     return (
       <div className="flex justify-end" data-role="user">
         <div className="max-w-[85%] px-4 py-2.5 rounded-md rounded-tr-sm bg-paper-2 border border-line">
-          <p className="text-sm text-ink leading-relaxed whitespace-pre-wrap break-words">{message.text}</p>
+          {sessionId && message.attachments?.length ? <ChatAttachmentCards sessionId={sessionId} attachments={message.attachments} /> : null}
+          {message.text ? <p className="text-sm text-ink leading-relaxed whitespace-pre-wrap break-words">{message.text}</p> : null}
         </div>
       </div>
     );

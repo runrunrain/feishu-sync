@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "bundlerVersion": 2,
+  "package": "amagi-pi",
+  "version": "2.21.36",
+  "sourceHash": "dc441efa7673c2c74756e0b0ba23c76bc4cc4379f5d72b026e68e20509828827",
+  "sourceCommit": "929000ecbd8725e72b191493345d6abeef51c147",
+  "contentHash": "87ebc3b16916c97b5e504ccd80ada6cda3aa2f09e07516c09566080daab62273",
+  "files": 487,
+  "bytes": 33830978,
+  "archiveSha256": "134595bd8073445fd9ca068cc7e1aff38cba4422f624d3fa9e91112a8420766d",
+  "archiveBytes": 7713215
+}

@@ -34,6 +34,7 @@ it('真实 Git 获取→冻结安装→状态已装→重复完整校验（官�
     return;
   }
   const host = new BuildRuntimeHost({
+    bundledAmagi: () => null, // Explicit Git installation acceptance, independent of the shipped offline bundle.
     dataRoot: root,
     resolver,
     toolService: null as never, // 本用例只触达 install/status 路径，不消费

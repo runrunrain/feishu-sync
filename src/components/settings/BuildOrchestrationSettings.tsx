@@ -882,7 +882,7 @@ function RuntimeStatusSection({
               Pi：{status.runtime?.piVersion ? <span className="font-mono">{status.runtime.piVersion}</span> : <span className="text-ink-faint">未探测</span>}
             </span>
             <span className="text-ink-soft">
-              构建专用 amagi-pi（{amagi?.selectedSource ? '新构建优选' : '离线回退'} <span className="font-mono">{amagi?.pinnedVersion ?? '—'}</span>）：
+              构建专用 amagi-pi（{amagi?.distribution === 'bundled' ? '应用内置' : amagi?.selectedSource ? '新构建优选' : '离线回退'} <span className="font-mono">{amagi?.pinnedVersion ?? '—'}</span>）：
               {installState === 'installed'
                 ? <span className="text-jade" title={`${amagi?.installDir ?? ''} ${amagi?.contentHash ?? ''}`.trim()}>已安装 {amagi?.version ?? amagi?.pinnedVersion}</span>
                 : installState === 'broken'
@@ -985,7 +985,7 @@ function RuntimeStatusSection({
             <input
               type="text"
               className={INPUT_CLS + ' flex-1 min-w-[200px]'}
-              placeholder="可选：本地 amagi-pi 包源绝对路径（优先于默认 Git 来源）"
+              placeholder="可选：本地 amagi-pi 包源绝对路径（覆盖内置来源）"
               value={sourceDir}
               aria-label="本地 amagi-pi 包源绝对路径（可选）"
               data-testid="orch-runtime-source-dir"
@@ -1014,6 +1014,8 @@ function RuntimeStatusSection({
                 ? `校验构建版本 ${amagi?.pinnedVersion ?? ''}`.trim()
                 : trimmedSource
                   ? `从目录安装 amagi-pi ${amagi?.pinnedVersion ?? ''}`.trim()
+                  : amagi?.distribution === 'bundled'
+                    ? `安装内置 amagi-pi ${amagi.pinnedVersion}`
                   : amagi?.selectedSource
                     ? `安装 amagi-pi ${amagi.pinnedVersion}（已配置版本）`
                     : `安装 amagi-pi ${amagi?.pinnedVersion ?? ''}（官方 Git · ${(amagi?.commit ?? '').slice(0, 7)}）`.trim()}
@@ -1041,6 +1043,8 @@ function RuntimeStatusSection({
           <p className="text-[10px] text-ink-faint leading-relaxed" data-testid="orch-runtime-install-hint">
             {trimmedSource
               ? '已填本地目录：将严格按该源安装（版本与内容哈希校验不放松）。'
+              : amagi?.distribution === 'bundled'
+                ? `amagi-pi ${amagi.pinnedVersion} 随应用内置，启动时自动离线安装；应用更新后，新构建使用内置新版，已有构建保留原版本。无需 Git、仓库权限或手动填写目录。`
               : amagi?.selectedSource
                 ? `新构建将自动从已配置的 ${amagi.selectedSource} 冻结版本 ${amagi.pinnedVersion}；在跑构建继续使用原版本。`
                 : `未填目录时默认从官方仓库 ${amagi?.repoUrl ?? ''} 固定 commit ${amagi?.commit ?? ''} 经 Pi CLI 获取安装（需本机 git 与网络；失败时可改填本地目录，不回退 npm/latest）。`}

@@ -22,6 +22,7 @@ import { createClaudeProcess } from './claude-process-factory.js';
 import { ClaudeCodeProcess } from './claude-code-process.js';
 import type { SessionModelConfig } from '../types/agent-knowledge.js';
 import { modelRevision } from './model-revision.js';
+import { ChatAttachmentStore, type ChatImageContent } from './chat-attachments.js';
 import { checkRootOverlap, type WorkspaceRootGuards } from './path-guard.js';
 import {
   toolsForRunKind,
@@ -89,6 +90,7 @@ export interface SessionStoreApi {
 const SSE_BUFFER_SIZE = 1000;
 
 export class SessionService extends EventEmitter {
+  readonly attachments: ChatAttachmentStore;
   private readonly deps: SessionServiceDeps;
   private readonly sseBuffers = new Map<string, SessionSseEvent[]>();
   private readonly sseSeq = new Map<string, number>();
@@ -112,6 +114,7 @@ export class SessionService extends EventEmitter {
   constructor(deps: SessionServiceDeps) {
     super();
     this.deps = deps;
+    this.attachments = new ChatAttachmentStore(deps.dataRoot);
   }
 
   private sessionDir(): string {
@@ -359,20 +362,21 @@ export class SessionService extends EventEmitter {
   async sendMessage(
     localMapStore: SessionStoreApi,
     id: string,
-    body: { text: string; delivery?: string },
+    body: { text: string; delivery?: string; attachmentIds?: unknown },
   ): Promise<{ accepted: true; runId: string }> {
     const row = localMapStore.getAgentSession(id);
     if (!row) {
       throw new ToolError('session_not_found', '会话不存在', 404);
     }
-    if (typeof body.text !== 'string' || body.text.trim().length < 1 || body.text.length > 20_000) {
-      throw new ToolError('invalid_request', '消息长度必须在 1..20000');
+    if (typeof body.text !== 'string' || body.text.length > 20_000 || (!body.text.trim() && !(Array.isArray(body.attachmentIds) && body.attachmentIds.length))) {
+      throw new ToolError('invalid_request', '请输入消息或添加附件，消息不能超过 20000 字符');
     }
     const existingRun = this.runs.get(id);
     const delivery = body.delivery === 'steer' || body.delivery === 'followUp' ? body.delivery : undefined;
     if (existingRun && !delivery) {
       throw new ToolError('session_busy', '会话运行中：发送消息需 delivery: steer 或 followUp', 409);
     }
+    const prepared = this.attachments.prepare(id, body.text, body.attachmentIds);
     if (existingRun && delivery) {
       // F3-R04：投递必须进入同一活跃 RPC 运行——直接向当前运行中的 pi
       // 进程发官方 steer/follow_up 命令（pi 自带队列语义），不新建第二
@@ -386,7 +390,7 @@ export class SessionService extends EventEmitter {
       }
       const response = await process.sendCommand(
         delivery === 'steer' ? 'steer' : 'follow_up',
-        { message: body.text },
+        { message: prepared.message, ...(prepared.images.length ? { images: prepared.images } : {}) },
         30_000,
       );
       if (!response.success) {
@@ -396,6 +400,7 @@ export class SessionService extends EventEmitter {
           409,
         );
       }
+      this.attachments.commit(id, prepared);
       this.emitSse(id, 'delivery_queued', {
         runId: existingRun.runId,
         delivery,
@@ -405,12 +410,13 @@ export class SessionService extends EventEmitter {
     }
 
     if (row.title === '新会话') {
-      const title = body.text.trim().replace(/\s+/g, ' ').slice(0, 40);
+      const title = (body.text.trim() || prepared.attachments.map((attachment) => attachment.name).join('、')).replace(/\s+/g, ' ').slice(0, 40);
       if (title) { localMapStore.updateAgentSession(id, { title, updatedAt: new Date().toISOString() }); this.emitSessionState(id, localMapStore); }
     }
     const runId = `run_${crypto.randomBytes(6).toString('hex')}`;
+    this.attachments.commit(id, prepared);
     // 异步执行；错误经 SSE 与 last_error 落地
-    void this.executeRun(localMapStore, id, body.text, runId).catch((error) => {
+    void this.executeRun(localMapStore, id, prepared.message, runId, prepared.images).catch((error) => {
       console.error('[SessionService] run failed:', error);
     });
     return { accepted: true, runId };
@@ -421,6 +427,7 @@ export class SessionService extends EventEmitter {
     sessionId: string,
     text: string,
     runId: string,
+    images: ChatImageContent[] = [],
   ): Promise<void> {
     const row = localMapStore.getAgentSession(sessionId);
     if (!row) return;
@@ -460,6 +467,13 @@ export class SessionService extends EventEmitter {
       this.deps.pool.setBusy(sessionId, true);
       this.sessionStates.set(sessionId, 'streaming');
       this.emitSessionState(sessionId, localMapStore);
+
+      if (images.length && config.agent.runtime.backend !== 'claude-code') {
+        const state = await process.sendCommand<{ model?: { input?: string[] } }>('get_state');
+        if (state.data?.model?.input && !state.data.model.input.includes('image')) {
+          throw new ToolError('model_image_unsupported', '当前 Pi 模型不支持图片输入，请选择支持视觉的模型后重试', 400);
+        }
+      }
 
       const attachForwarders = (rpc: PiRpcProcess) => {
         rpc.removeAllListeners('text_delta');
@@ -515,6 +529,7 @@ export class SessionService extends EventEmitter {
       run.phase = 'running';
       const outcome = await process.prompt(text, {
         timeoutMs: config.standardKb.promptTimeoutMinutes * 60_000,
+        ...(images.length ? { images } : {}),
       });
       // 在 run_end 和任何异步 get_state 回填前关闭投递；RPC activeRun
       // 守卫还覆盖 agent_settled 到本 await continuation 的微任务窗口。
@@ -674,6 +689,7 @@ export class SessionService extends EventEmitter {
       agentUrl: this.deps.internalBaseUrl(),
       runToken: token,
       apiKey,
+      preserveUploadedImages: true,
     });
     if (providerJson) {
       env.FEISHU_SYNC_AGENT_PROVIDER_JSON = providerJson;
@@ -700,6 +716,8 @@ export class SessionService extends EventEmitter {
       cwd: this.emptyCwd(),
       env,
       promptTimeoutMs: config.standardKb.promptTimeoutMinutes * 60_000,
+      // User image frames can include up to 20 MB of bytes encoded as base64.
+      maxFrameBytes: 40 * 1024 * 1024,
     });
     // F3-R05：token 与进程同生命周期——任何退出路径（正常结束、idle 回收、
     // terminate、崩溃）都回收令牌；后续消息会用新 spawn 的新令牌。
@@ -853,9 +871,9 @@ export class SessionService extends EventEmitter {
     }
     const sessionFile = row.pi_session_file ? String(row.pi_session_file) : null;
     if (!sessionFile || !fs.existsSync(sessionFile)) {
-      return [];
+      return this.attachments.decorate(sessionId, []);
     }
-    return parseSessionJsonl(fs.readFileSync(sessionFile, 'utf-8'));
+    return this.attachments.decorate(sessionId, parseSessionJsonl(fs.readFileSync(sessionFile, 'utf-8')));
   }
 }
 

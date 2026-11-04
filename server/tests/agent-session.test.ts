@@ -279,9 +279,22 @@ describe('SessionService（内存 store）', () => {
   it('消息校验：空/超长拒绝', async () => {
     const { service, store } = makeService(makeConfig());
     const session = service.create(store, {});
-    await expect(service.sendMessage(store, session.id, { text: '' })).rejects.toThrow(/1\.\.20000/);
-    await expect(service.sendMessage(store, session.id, { text: 'x'.repeat(20_001) })).rejects.toThrow(/1\.\.20000/);
+    await expect(service.sendMessage(store, session.id, { text: '' })).rejects.toThrow(/请输入消息或添加附件/);
+    await expect(service.sendMessage(store, session.id, { text: 'x'.repeat(20_001) })).rejects.toThrow(/消息不能超过 20000 字符/);
     await expect(service.sendMessage(store, 's_missing', { text: 'hi' })).rejects.toThrow(/会话不存在/);
+  });
+
+  it('附件可单独发送，服务端解析的图像字节进入运行参数且不能跨会话引用', async () => {
+    const { service, store } = makeService(makeConfig());
+    const session = service.create(store, {});
+    const image = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAb0lEQVR4nO3PAQkAAAyEwO9feoshgnABdLep8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3IPanc8OLDQitxAAAAAElFTkSuQmCC', 'base64');
+    const attachment = await service.attachments.add(session.id, '示例.png', image);
+    const execute = vi.spyOn(service as any, 'executeRun').mockResolvedValue(undefined);
+    await service.sendMessage(store, session.id, { text: '', attachmentIds: [attachment.id] });
+    expect(execute).toHaveBeenCalledWith(store, session.id, expect.stringContaining(attachment.id), expect.any(String), [{ type: 'image', mimeType: 'image/png', data: image.toString('base64') }]);
+    expect(service.messages(store, session.id)[0]).toMatchObject({ text: '', attachments: [attachment] });
+    const other = service.create(store, {});
+    await expect(service.sendMessage(store, other.id, { text: 'read', attachmentIds: [attachment.id] })).rejects.toMatchObject({ code: 'attachment_not_found' });
   });
 });
 

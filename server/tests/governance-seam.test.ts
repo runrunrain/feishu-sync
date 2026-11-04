@@ -198,8 +198,8 @@ describe('diting D6：治理链闭环（真实工具→发布→governable→决
 
   it('S-F04：unknown 对象出现在 governable 且可提交 approved 决定（真实服务 round-trip）', async () => {
     const view = governance().pendingGovernanceWork();
-    // E2 UNKNOWN_PANEL 反转：高风险人审提示在（无凭据），但对象可操作
-    expect(view.highRisk.map((item) => item.objectId)).toEqual([objectId]);
+    // 单纯的高风险标签不是治理问题；对象仍可主动查找并批准。
+    expect(view.highRisk).toEqual([]);
     expect(view.candidates).toEqual([]);
     expect(view.staleDecisions).toEqual([]);
     const governable = view.governable.find((item) => item.objectId === objectId)!;
@@ -207,6 +207,12 @@ describe('diting D6：治理链闭环（真实工具→发布→governable→决
     expect(governable.allowedDecisionTargets).toEqual(['approved']);
     expect(governable.effectiveDecision).toBeNull();
     expect(governable.payloadHash).toBe(objectPayloadHash);
+    expect(governable.docPath).toBe(DOC_PATH);
+    expect(governable.anchor).toBe(objectId);
+    expect(governable.claimPreviews).toEqual([expect.objectContaining({
+      claimKey: 'cap-300', excerpt: expect.stringContaining('普攻伤害上限为 300%'),
+      evidenceSources: ['拼点设计'],
+    })]);
 
     // 面板动作 → 服务登记（expectedRevision 日志序起点 0，S-F02）
     const { decision } = governance().recordDecision({

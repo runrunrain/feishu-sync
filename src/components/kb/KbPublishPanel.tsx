@@ -12,6 +12,7 @@ import { Button } from '../common/Button';
 import { formatDateTime } from '../../utils/agentReadiness';
 import type { KbPublicationRowDto } from '../../types/kb-publish';
 import { KbPublishStateBadge } from './KbPublishStateBadge';
+import { KbTransferPanel } from './KbTransferPanel';
 
 export interface KbPublishPanelProps {
   publications: KbPublicationRowDto[];
@@ -20,6 +21,9 @@ export interface KbPublishPanelProps {
   onOpenPublish: () => void;
   onOpenHistory: () => void;
   onRefresh: () => void;
+  releaseId: string | null;
+  activeBuild: boolean;
+  onKbChanged: () => void;
 }
 
 export function KbPublishPanel({
@@ -29,6 +33,9 @@ export function KbPublishPanel({
   onOpenPublish,
   onOpenHistory,
   onRefresh,
+  releaseId,
+  activeBuild,
+  onKbChanged,
 }: KbPublishPanelProps) {
   const counts = useMemo(() => {
     let published = 0;
@@ -74,6 +81,8 @@ export function KbPublishPanel({
           <RefreshCw className="w-3.5 h-3.5" />刷新发布状态
         </Button>
       </div>
+
+      <KbTransferPanel releaseId={releaseId} activeBuild={activeBuild} onChanged={onKbChanged} />
 
       <div className="space-y-1 border-t border-line pt-3">
         <h4 className="text-ink font-medium">最近发布</h4>

@@ -215,6 +215,7 @@ export interface KbStatusDto {
     docCount: number;
     sourceCount: number;
     model: string | null;
+    imported?: boolean;
   };
   pending: { added: number; changed: number; removed: number };
   activeBuild: KbBuildDto | null;
@@ -233,7 +234,7 @@ export interface KbDocSourceRef {
   objToken: string;
   title: string;
   relPath: string;
-  state: 'current' | 'changed' | 'missing' | 'excluded' | 'deleted';
+  state: 'current' | 'changed' | 'missing' | 'excluded' | 'deleted' | 'packaged';
 }
 
 /** §9.2 GET /api/kb/docs/:docId */
@@ -530,6 +531,7 @@ export interface KbBuildRuntimeStatusDto {
     /** 新构建目标版本；优先已配置的较新本地包，缺省为内置回退版本。 */
     pinnedVersion: string;
     selectedSource?: string | null;
+    distribution?: 'bundled' | 'configured' | 'git';
     installed: boolean;
     version: string | null;
     installDir: string | null;
@@ -629,11 +631,23 @@ export interface AgentToolCallRef {
   argsSummary: string;
 }
 
+export interface AgentAttachmentDto {
+  id: string;
+  name: string;
+  size: number;
+  mimeType: string;
+  kind: 'image' | 'document';
+  textLength: number;
+  lineCount: number;
+  note?: string;
+}
+
 export interface AgentMessageDto {
   id: string;
   role: 'user' | 'assistant' | 'tool' | 'notice';
   at: string;
   text?: string;
+  attachments?: AgentAttachmentDto[];
   toolCalls?: AgentToolCallRef[];
   tool?: {
     callId: string;
@@ -800,13 +814,17 @@ export interface KbGovernancePendingObjectDto {
   objectId: string;
   title: string;
   type: string;
+  docPath: string | null;
+  anchor: string | null;
   scopeKey: string;
   businessStatus: KbGovernanceBusinessStatus;
   reviewStatus: string;
   payloadHash: string;
   reviewSubjectHash: string;
   highRiskClaims: string[];
+  claimPreviews: Array<{ claimKey: string; excerpt: string; evidenceSources: string[] }>;
   humanReviewed: boolean;
+  reviewRejection: string | null;
   effectiveDecision: {
     decisionId: string;
     businessStatus: KbGovernanceBusinessStatus;
@@ -818,6 +836,7 @@ export interface KbGovernancePendingObjectDto {
 
 export interface KbGovernancePendingDto {
   releaseId: string | null;
+  /** Only an explicit rejected human review is an actionable content problem. */
   highRisk: KbGovernancePendingObjectDto[];
   candidates: KbGovernancePendingObjectDto[];
   staleDecisions: KbGovernancePendingObjectDto[];

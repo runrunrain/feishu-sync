@@ -606,7 +606,7 @@ export class PiAmagiBuildRuntime implements BuildRuntimeAdapter {
   }
 
   private verifyFrozenPackage(spec: BuildRunSpec): void {
-    const actual = verifyAmagiPackage({ dataRoot: this.deps.dataRoot, version: spec.amagiPackage.version });
+    const actual = verifyAmagiPackage({ dataRoot: this.deps.dataRoot, version: spec.amagiPackage.version, contentHash: spec.amagiPackage.contentHash, installDir: spec.amagiPackage.installDir });
     if (actual.contentHash !== spec.amagiPackage.contentHash
       || path.resolve(actual.packageRoot) !== path.resolve(spec.amagiPackage.packageRoot)
       || path.resolve(actual.installDir) !== path.resolve(spec.amagiPackage.installDir)) {

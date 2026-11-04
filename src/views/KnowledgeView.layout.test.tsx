@@ -13,6 +13,7 @@ const state = vi.hoisted(() => ({
   interrupted: false,
   activeBuild: null as any,
   sseStarts: 0,
+  listPublications: vi.fn(),
   toast: { push: vi.fn(), dismiss: vi.fn(), toasts: [] },
   agent: { status: { code: 'ready' }, unreachable: false, loading: false, rechecking: false, recheck: vi.fn(), refresh: vi.fn() },
 }));
@@ -28,8 +29,7 @@ vi.mock('../utils/sseStream', () => ({ SseConnection: class {
 vi.mock('../components/preview/MarkdownView', () => ({ MarkdownView: ({ content, onNavigateDoc }: { content: string; onNavigateDoc?: (href: string) => boolean }) =>
   <p>{content}{content.startsWith('first') ? <a href="第二篇.md" onClick={(event) => { if (onNavigateDoc?.('第二篇.md')) event.preventDefault(); }}>阅读第二篇</a> : null}</p> }));
 vi.mock('../components/kb/RawSourceDrawer', () => ({ RawSourceDrawer: () => null }));
-vi.mock('../components/kb/KbPublishModal', () => ({ KbPublishModal: () => null }));
-vi.mock('../components/kb/KbPublishPanel', () => ({ KbPublishPanel: () => <p>发布面板</p> }));
+vi.mock('../components/kb/KbTransferPanel', () => ({ KbTransferPanel: () => <p data-testid="kb-transfer-panel">本地共享与迁移</p> }));
 vi.mock('../api/client', () => {
   const changes = [{ key: 'a', title: '来源 A', path: '来源 A.md', kind: 'changed', beforeAvailable: true, patch: '-旧\n+新', additions: 1, deletions: 1, truncated: false }];
   const build = {
@@ -47,7 +47,7 @@ vi.mock('../api/client', () => {
       { name: '第二篇', title: '第二篇', path: '分类/第二篇.md', type: 'doc', docId: 'second' },
     ] }] }),
     getKbDoc: async (id: string) => ({ docId: id, title: id === 'first' ? '第一篇' : '第二篇', path: `分类/${id === 'first' ? '第一篇' : '第二篇'}.md`, summary: '', tags: [], markdown: `${id} 正文`, releaseId: 'r1', sources: state.deletedSource ? [{ objToken: 'a', title: '已删除来源', relPath: 'a.md', state: 'deleted' }] : [] }),
-    listKbPublications: async () => ({ publications: [] }),
+    listKbPublications: state.listPublications.mockResolvedValue({ publications: [] }),
     getKbSourceTree: async () => ({ root: 'root', total: 2, nodes: [{ id: 'folder', title: '源目录', children: ['a', 'b'].map((id) => ({
       id, title: `来源 ${id.toUpperCase()}`, children: [], source: { objToken: id, title: `来源 ${id.toUpperCase()}`, relPath: `${id}.md`, included: state.included.has(id), pending: 'changed' },
     })) }] }),
@@ -121,8 +121,7 @@ it('重启后加载中断检查点和历史日志，确认后发起断点继续'
   const button = (text: string) => [...container.querySelectorAll('button')].find((item) => item.textContent?.trim() === text)!;
   try {
     await act(async () => root.render(<KnowledgeView />));
-    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="打开构建标准库"]')!.click());
-    await act(async () => button('构建进度').click());
+    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="打开构建进度"]')!.click());
     expect(container.textContent).toContain('已保存 11 篇草稿'); expect(container.textContent).toContain('之前完成第一批');
     expect(state.resumeBuild).not.toHaveBeenCalled();
     await act(async () => button('从断点继续').click());
@@ -144,7 +143,13 @@ it('左侧目录保持可用，构建、差异、版本和进度从右侧直接�
     expect(container.querySelector('[data-testid="kb-directory-panel"]')).not.toBeNull();
     expect(container.querySelector('[data-testid="kb-sidebar"]')).toBeNull();
     expect([...container.querySelectorAll('[data-sidebar-trigger]')].map((el) => el.getAttribute('data-sidebar-trigger')))
-      .toEqual(['sources', 'publish', 'build', 'governance']);
+      .toEqual(['sources', 'share', 'build', 'progress', 'governance']);
+    expect(container.textContent).not.toContain('飞书发布');
+    expect(state.listPublications).not.toHaveBeenCalled();
+    await click(label('打开标准库导入导出'));
+    expect(container.querySelector('[data-testid="kb-transfer-panel"]')?.textContent).toBe('本地共享与迁移');
+    expect(container.textContent).not.toContain('发布到飞书');
+    await click(label('收起标准库导入导出'));
 
     await click(button('第二篇'));
     expect(container.querySelector('[data-testid="kb-directory-panel"]')).not.toBeNull();
@@ -168,9 +173,9 @@ it('左侧目录保持可用，构建、差异、版本和进度从右侧直接�
     expect(container.querySelector('[role="dialog"]')?.textContent).not.toContain('未选源文档的内容不会保留');
     await click(button('开始构建'));
     expect(state.createBuild).toHaveBeenCalledWith('incremental', { rebuildSelected: true });
-    expect(container.querySelector('[data-testid="kb-build-sidebar"]')).toBeNull();
+    expect(container.querySelector('[data-testid="kb-progress-sidebar-container"]')).not.toBeNull();
     expect(container.querySelector('[aria-label="标准库构建进度"]')).not.toBeNull();
-    await click(button('源文档与变更'));
+    await click(label('打开构建标准库'));
 
     await click(button('待更新差异'));
     expect(container.textContent).toContain('来源 A.md');
@@ -183,11 +188,11 @@ it('左侧目录保持可用，构建、差异、版本和进度从右侧直接�
     await click(button('开始按变更更新'));
     expect(state.createBuild).toHaveBeenCalledWith('incremental');
 
-    await click(button('源文档与变更'));
+    await click(label('打开构建标准库'));
     await click(button('版本记录'));
     expect(container.querySelector('[aria-label="选择标准库版本"]')).not.toBeNull();
-    await click(button('构建进度'));
-    expect(container.querySelector('[data-testid="kb-build-sidebar"]')).toBeNull();
+    await click(label('打开构建进度'));
+    expect(container.querySelector('[data-testid="kb-progress-sidebar-container"]')).not.toBeNull();
     expect(container.querySelector('[aria-label="标准库构建进度"]')).not.toBeNull();
     expect(container.querySelector('[aria-label="收起标准库侧栏"]')).not.toBeNull();
     expect(container.querySelector('[aria-label="收起进度面板"]')).toBeNull();
@@ -237,7 +242,7 @@ it('首次构建入口打开源选择，进度入口按需加载最近的记录'
     expect(container.querySelector('[data-testid="kb-build-sidebar"]')).not.toBeNull();
     expect(button('构建所选文档').disabled).toBe(false);
     expect(state.listBuilds).not.toHaveBeenCalled();
-    await act(async () => button('构建进度').click());
+    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="打开构建进度"]')!.click());
     expect(state.listBuilds).toHaveBeenCalledTimes(1);
     expect(container.querySelector('[aria-label="标准库构建进度"]')?.textContent).toContain('已发布');
   } finally { act(() => root.unmount()); container.remove(); state.hasCurrent = true; }

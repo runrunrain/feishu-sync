@@ -7481,6 +7481,16 @@ export class KbBuildService extends EventEmitter {
     if (!fs.existsSync(releasesDir)) return;
     const store = new StandardKbStore(outputRoot);
     const current = store.readCurrent();
+    const importPredecessors = new Set<string>();
+    try {
+      const importDir = path.join(outputRoot, 'imports');
+      for (const name of fs.readdirSync(importDir).filter((entry) => /^[A-Za-z0-9_.-]{1,80}\.json$/.test(entry))) {
+        const marker = JSON.parse(fs.readFileSync(path.join(importDir, name), 'utf8')) as { previousLocalReleaseId?: string };
+        if (marker.previousLocalReleaseId && /^[A-Za-z0-9_.-]{1,80}$/.test(marker.previousLocalReleaseId)) {
+          importPredecessors.add(marker.previousLocalReleaseId);
+        }
+      }
+    } catch { /* no imported releases */ }
     // F3-R10：目录扫描本身可能失败（权限/并发删除）——清理是尽力而为，
     // 不能因维护性动作破坏发布链路。
     let entries: Array<{ name: string; full: string; mtimeMs: number }>;
@@ -7497,7 +7507,7 @@ export class KbBuildService extends EventEmitter {
       return;
     }
     for (const entry of entries.slice(retain)) {
-      if (current?.releaseId === entry.name) continue;
+      if (current?.releaseId === entry.name || importPredecessors.has(entry.name)) continue;
       // P1-S8（设计 P1 §4.6）：发布任务使用中的 release 跳过清理（发布
       // 固定 releaseId，release 不可变；执行期间被清理会读到半删目录）。
       if (isReleaseInUse(entry.name)) {

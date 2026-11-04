@@ -30,7 +30,6 @@ import { Card } from './common/Card';
 import { MarkdownView, resolveMediaPath } from './preview/MarkdownView';
 import { CsvTableView } from './preview/CsvTableView';
 import { WorkbookView } from './preview/WorkbookView';
-import { SourceEditControls } from './SourceEditControls';
 import { SourceCommentsSection } from './SourceCommentsSection';
 import { DocReferenceSection } from './DocReferenceSection';
 import { getDocumentContent, refreshSheet } from '../api/client';
@@ -312,16 +311,6 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
             <span className="hidden xl:inline">打开</span>
           </button>
 
-          {/* 源文档状态/写回入口：仅 docx 且有本地 md 时渲染（sheet/slides
-              为导出投影不支持受控编辑；未同步无正文可编辑） */}
-          {objToken && node.obj_type === 'docx' && content?.mdContent != null && !loading && !error && (
-            <SourceEditControls
-              objToken={objToken}
-              objType={node.obj_type}
-              mdContent={content.mdContent}
-              onContentChanged={() => objToken && loadContent(objToken)}
-            />
-          )}
         </div>
 
         {/* 格式页签：MD / CSV（下划线常驻渲染 + scaleX 过渡，与 TopBar 一致） */}

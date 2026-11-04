@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { isPathInside } from '../agent/path-guard.js';
 import { StandardKbStore } from './standard-kb-store.js';
+import { previousLocalReleaseId } from './portable-kb-service.js';
 import { RawSourceSnapshot } from './raw-source-snapshot.js';
 import { lineDiff } from './line-diff.js';
 import type { KbManifest } from '../types/agent-knowledge.js';
@@ -10,7 +11,7 @@ import type { KbChangePreview, KbDocMerge, KbFileChange, KbVersionDto } from '..
 import type { KnowledgeManifest } from './knowledge-schema.js';
 
 export type SourceContents = Record<string, string>;
-export const validReleaseId = (id: string) => /^[A-Za-z0-9_-]{1,120}$/.test(id);
+export const validReleaseId = (id: string) => /^[A-Za-z0-9_.-]{1,80}$/.test(id) && id !== '.' && id !== '..';
 
 export function captureSourceContents(snapshot: RawSourceSnapshot, root: string): SourceContents {
   return Object.fromEntries(snapshot.entries.map((entry) => {
@@ -108,7 +109,10 @@ export class KbVersionStore {
     while (id && validReleaseId(id) && !result.includes(id) && result.length < 50) {
       const manifest: KbManifest | null = this.readJson<KbManifest>(id, 'manifest.json');
       if (!manifest || manifest.releaseId !== id) break;
-      result.push(id); id = manifest.baseReleaseId;
+      result.push(id);
+      // A portable release keeps its original manifest unchanged. Its sender's
+      // baseReleaseId may not exist here, so follow the local import predecessor.
+      id = previousLocalReleaseId(this.root, id) ?? manifest.baseReleaseId;
     }
     return result;
   }

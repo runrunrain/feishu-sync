@@ -300,7 +300,6 @@ export async function buildServer(options: CreateServerOptions = {}) {
     outputRoot: () => configManager.getConfig()?.standardKb.outputRoot ?? '',
   });
   const runtimeInstaller = new RuntimeInstaller(agentDataRoot, runtimeResolver, agentPool, () => configManager.getConfig()!.agent);
-  if (process.env.NODE_ENV !== 'test' && !process.env.VITEST) void runtimeInstaller.ensureMissing().catch((error) => console.warn('[agent] 自动安装未完成:', error instanceof Error ? error.message : 'unknown error'));
   // F3-R02：当前配置快照的 Workspace 守卫。受保护运行根 = 静态（源码/
   // node_modules/Electron）+ 服务生命周期已发现的运行时根（node/pi/npm）。
   // 切换配置不会终止旧进程，因此旧安装根到服务重启前也不能开放为Workspace。
@@ -334,6 +333,10 @@ export async function buildServer(options: CreateServerOptions = {}) {
     retireIdle: () => agentPool.retireIdle(),
   });
   await piPlugins.refresh().catch(() => { console.warn('[server] Pi插件资源暂不可用，可在设置中刷新；其他功能继续启动'); });
+  if (process.env.NODE_ENV !== 'test' && !process.env.VITEST) {
+    void runtimeInstaller.ensureMissing(() => piPlugins.refresh())
+      .catch((error) => console.warn('[agent] 自动安装未完成:', error instanceof Error ? error.message : 'unknown error'));
+  }
   const appPluginStore: AppPluginStore = new AppPluginStore(agentDataRoot, readAgentPromptAssets, () => piPlugins.runtimeResources());
   // S6 任务编排：TaskService 在 sessionService 之后构造（SSE 事件出口回
   // 挂到 sessionService.emitSse）；taskTools 在每次 spawn 时求值，插件开关

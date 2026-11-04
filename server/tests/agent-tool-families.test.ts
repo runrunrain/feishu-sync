@@ -44,8 +44,8 @@ describe('工具族注册：白名单等价（表驱动快照）', () => {
     documentsProvider: () => [],
   });
 
-  it('registeredFamilies：内置五族 raw/kb/draft/ws/build-runtime（注册序）', () => {
-    expect(service.registeredFamilies()).toEqual(['raw', 'kb', 'draft', 'ws', 'build-runtime']);
+  it('registeredFamilies：内置工具族含会话附件（注册序）', () => {
+    expect(service.registeredFamilies()).toEqual(['raw', 'kb', 'draft', 'ws', 'build-runtime', 'chat-attachments']);
   });
 
   const kinds: AgentRunKind[] = ['build', 'work', 'discuss', 'probe'];

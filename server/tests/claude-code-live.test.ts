@@ -77,6 +77,24 @@ beforeAll(async () => {
 afterAll(async () => { await new Promise<void>((resolve) => server.close(() => resolve())); fs.rmSync(root, { recursive: true, force: true }); });
 
 describe('Claude Code with an app-configured Anthropic provider', () => {
+  it.skipIf(!exe)('passes images through stream-json input to the actual Claude Code model request', async () => {
+    const start = requests.length;
+    const previousToolCalls = toolCalls;
+    const rpc = new ClaudeCodeProcess({ executable: exe!, nodePath: processExecPath(), bridgePath: path.resolve('src/agent/claude-bridge.cjs'),
+      cwd: path.join(root, 'cwd-image'), sessionDir: path.join(root, 'sessions'), sessionId: 'image-session',
+      tools: ['kb_search'], model: 'fixture-model', baseUrl: `http://127.0.0.1:${port}`, apiKey: key,
+      agentUrl: `http://127.0.0.1:${port}`, runToken: 'test-run-token', parentEnv: globalThis.process.env, thinking: 'off' });
+    const data = 'iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAb0lEQVR4nO3PAQkAAAyEwO9feoshgnABdLep8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3IPanc8OLDQitxAAAAAElFTkSuQmCC';
+    await rpc.start();
+    try {
+      const outcome = await rpc.prompt('Describe the attached image', { images: [{ type: 'image', mimeType: 'image/png', data }], timeoutMs: 45_000 });
+      expect(outcome.outcome).toBe('completed');
+      const body = requests.slice(start).find((request) => JSON.stringify(request.body.messages).includes('Describe the attached image'))?.body;
+      expect(JSON.stringify(body?.messages)).toContain('"type":"image"');
+      expect(JSON.stringify(body?.messages)).toContain(data);
+    } finally { await rpc.terminate(); toolCalls = previousToolCalls; requests.splice(start); }
+  }, 60_000);
+
   it('upgrades existing session records to the Pi backend without changing their history path', () => {
     const dbPath = path.join(root, 'legacy.db');
     const db = new Database(dbPath);

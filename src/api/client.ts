@@ -52,6 +52,7 @@ import type {
   AgentBackend,
   ClaudeConnectionTestResult,
   AgentApprovalDto,
+  AgentAttachmentDto,
   AgentMessageDto,
   AgentSessionDto,
   AgentStatusDto,
@@ -178,7 +179,7 @@ async function request<T>(
       ...fetchOptions,
       signal,
       headers: {
-        'Content-Type': 'application/json',
+        ...(typeof FormData !== 'undefined' && fetchOptions.body instanceof FormData ? {} : { 'Content-Type': 'application/json' }),
         ...headers,
         ...fetchOptions.headers,
       },
@@ -1142,6 +1143,37 @@ export async function getKbStatus(): Promise<KbStatusDto> {
   return request<KbStatusDto>('/api/kb/status');
 }
 
+export interface PortableKbPreview {
+  releaseId: string;
+  docCount: number;
+  sourceCount: number;
+  fileCount: number;
+  unpackedBytes: number;
+  archiveBytes: number;
+  currentReleaseId: string | null;
+  alreadyInstalled: boolean;
+}
+export function previewPortableKb(path: string): Promise<PortableKbPreview> {
+  return request('/api/kb/portable/preview', { method: 'POST', body: JSON.stringify({ path }) });
+}
+export function exportPortableKb(path: string): Promise<PortableKbPreview & { path: string }> {
+  return request('/api/kb/portable/export', { method: 'POST', body: JSON.stringify({ path }) });
+}
+export function importPortableKb(path: string, expectedCurrentReleaseId: string | null): Promise<PortableKbPreview & { previousReleaseId: string | null }> {
+  return request('/api/kb/portable/import', {
+    method: 'POST', body: JSON.stringify({ path, expectedCurrentReleaseId, confirm: 'IMPORT' }),
+  });
+}
+export function getPortableKbRestore(): Promise<{ previousReleaseId: string | null }> {
+  return request('/api/kb/portable/restore');
+}
+export function restorePreviousLocalKb(): Promise<{ releaseId: string; previousReleaseId: string }> {
+  return request('/api/kb/portable/restore', { method: 'POST', body: JSON.stringify({ confirm: 'RESTORE' }) });
+}
+export function getPortableKbSource(objToken: string): Promise<{ objToken: string; title: string; markdown: string }> {
+  return request(`/api/kb/portable/sources/${encodeURIComponent(objToken)}`);
+}
+
 /** GET /api/kb/tree —— 发布目录树；未发布抛 APIError(404 kb_not_published)。 */
 export async function getKbTree(): Promise<{ releaseId: string; nodes: KbTreeNode[] }> {
   return request<{ releaseId: string; nodes: KbTreeNode[] }>('/api/kb/tree');
@@ -1440,12 +1472,35 @@ export async function getAgentSessionMessages(id: string): Promise<AgentMessageD
  */
 export async function sendAgentMessage(
   id: string,
-  body: { text: string; delivery?: 'steer' | 'followUp' },
+  body: { text: string; delivery?: 'steer' | 'followUp'; attachmentIds?: string[] },
 ): Promise<{ accepted: true; runId: string }> {
   return request<{ accepted: true; runId: string }>(
     `/api/agent/sessions/${encodeURIComponent(id)}/messages`,
     { method: 'POST', body: JSON.stringify(body) },
   );
+}
+
+export async function uploadAgentAttachment(id: string, file: File, signal?: AbortSignal): Promise<AgentAttachmentDto> {
+  const form = new FormData();
+  form.append('file', file);
+  const result = await request<{ attachment: AgentAttachmentDto }>(`/api/agent/sessions/${encodeURIComponent(id)}/attachments`, {
+    method: 'POST', body: form, signal, timeoutMs: 120_000,
+  });
+  return result.attachment;
+}
+
+export async function removeAgentAttachment(id: string, attachmentId: string): Promise<void> {
+  await request(`/api/agent/sessions/${encodeURIComponent(id)}/attachments/${encodeURIComponent(attachmentId)}`, { method: 'DELETE' });
+}
+
+export async function getAgentAttachmentBlob(id: string, attachmentId: string, signal?: AbortSignal): Promise<Blob> {
+  const [headers, baseUrl] = await Promise.all([getApiHeaders(), getBaseUrl()]);
+  const response = await fetch(`${baseUrl}/api/agent/sessions/${encodeURIComponent(id)}/attachments/${encodeURIComponent(attachmentId)}`, { headers, signal });
+  if (!response.ok) {
+    const error = await response.json().catch(() => null) as { message?: string } | null;
+    throw new APIError(error?.message ?? '附件读取失败', response.status);
+  }
+  return response.blob();
 }
 
 /** POST /api/agent/sessions/:id/abort —— 停止当前运行。 */

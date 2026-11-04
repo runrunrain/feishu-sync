@@ -66,6 +66,8 @@ const desktopApi: DesktopAPI = {
   selectDirectory: async (): Promise<string | null> => {
     return ipcRenderer.invoke('desktop:select-directory');
   },
+  chooseKbExportPath: (suggestedName: string): Promise<string | null> => ipcRenderer.invoke('desktop:choose-kb-export-path', suggestedName),
+  chooseKbImportPath: (): Promise<string | null> => ipcRenderer.invoke('desktop:choose-kb-import-path'),
 
   openConfigFile: async (): Promise<DesktopActionResult> => {
     return ipcRenderer.invoke('desktop:open-config-file');

@@ -15,13 +15,16 @@ export class RuntimeInstaller {
   private pending: Promise<void> | null = null;
   constructor(private readonly root: string, private readonly resolver: PiRuntimeResolver, private readonly pool: AgentProcessPool, private readonly config: () => AgentConfig) {}
 
-  async ensureMissing(): Promise<void> {
-    for (const backend of ['claude-code', 'pi'] as const) {
+  async ensureMissing(onPiReady?: () => Promise<unknown>): Promise<void> {
+    // Pi also backs the bundled build plugin. Claude is installed automatically only when selected.
+    const backends: RuntimeBackend[] = this.config().runtime.backend === 'claude-code' ? ['pi', 'claude-code'] : ['pi'];
+    for (const backend of backends) {
       const config = this.config();
       const runtime = await this.resolver.resolveRuntime(config);
       if (!runtime.nodePath) return;
-      if (backend === 'pi' ? !!runtime.piCliPath || !!config.runtime.piCliPath : !!resolveClaudeCodePath(config.runtime.claudeCliPath) || !!config.runtime.claudeCliPath) continue;
-      await this.install(backend).catch((error) => console.warn(`[agent] ${backend} 自动安装失败:`, error instanceof Error ? error.message : 'unknown error'));
+      const found = backend === 'pi' ? !!runtime.piCliPath || !!config.runtime.piCliPath : !!resolveClaudeCodePath(config.runtime.claudeCliPath) || !!config.runtime.claudeCliPath;
+      if (!found) await this.install(backend).catch((error) => console.warn(`[agent] ${backend} 自动安装失败:`, error instanceof Error ? error.message : 'unknown error'));
+      if (backend === 'pi') await onPiReady?.();
     }
   }
 

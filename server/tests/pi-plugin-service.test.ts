@@ -24,7 +24,7 @@ it('原生Pi包安装/资源解析/启停/更新/移除，保留本地文件与�
   fs.writeFileSync(path.join(pkg, 'package.json'), JSON.stringify({ name: '@fixture/native-pi', version: '1.0.0', pi: { extensions: ['./extensions/index.ts'], skills: ['./skills'] } }));
   const before = fs.readFileSync(path.join(pkg, 'extensions/index.ts'), 'utf8');
   let running = false; let retired = 0;
-  const service = new PiPluginService({ dataRoot: data, resolver, agentConfig: () => config, running: () => running, retireIdle: async () => { retired++; } });
+  const service = new PiPluginService({ dataRoot: data, resolver, agentConfig: () => config, running: () => running, retireIdle: async () => { retired++; }, bundledAmagi: null });
   const initial = await service.refresh(); expect(initial.packages).toHaveLength(1); expect(initial.packages[0].sourceType).toBe('builtin');
   let installed = await service.mutate('install', { expectedRevision: initial.revision, source: pkg });
   expect(installed.packages).toHaveLength(2); const plugin = installed.packages.find((p) => p.name === '@fixture/native-pi')!;

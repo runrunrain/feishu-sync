@@ -36,6 +36,7 @@ import type {
   AgentBackend,
   AgentApprovalDto,
   AgentMessageDto,
+  AgentAttachmentDto,
   AgentSessionDto,
   AgentTaskDto,
   AgentTaskNotice,
@@ -162,7 +163,7 @@ export interface UseAgentSessionsResult {
   createSession: (backend?: AgentBackend, workspaceId?: string) => Promise<AgentSessionDto | null>;
   renameSession: (id: string, title: string) => Promise<boolean>;
   removeSession: (id: string) => Promise<boolean>;
-  send: (text: string, delivery?: 'steer' | 'followUp') => Promise<boolean>;
+  send: (text: string, delivery?: 'steer' | 'followUp', attachments?: AgentAttachmentDto[]) => Promise<boolean>;
   stop: () => Promise<void>;
   switchMode: (
     body: { mode: 'discuss' } | { mode: 'work'; workspaceId: string; confirm: 'WORK' },
@@ -214,7 +215,8 @@ export function mergeMessageIntoList(
         m.id.startsWith(optimisticPrefix) &&
         m.role === 'user' &&
         message.role === 'user' &&
-        m.text === message.text
+        m.text === message.text &&
+        (m.attachments ?? []).map((attachment) => attachment.id).join(',') === (message.attachments ?? []).map((attachment) => attachment.id).join(',')
       ),
   );
   const idx = next.findIndex((m) => m.id === message.id);
@@ -643,7 +645,7 @@ export function useAgentSessions(active: boolean): UseAgentSessionsResult {
   }, [loadSessions]);
 
   const send = useCallback(
-    async (text: string, delivery?: 'steer' | 'followUp') => {
+    async (text: string, delivery?: 'steer' | 'followUp', attachments: AgentAttachmentDto[] = []) => {
       if (!activeIdRef.current) return false;
       const sessionId = activeIdRef.current;
       setSending(true);
@@ -653,10 +655,11 @@ export function useAgentSessions(active: boolean): UseAgentSessionsResult {
         role: 'user',
         at: new Date().toISOString(),
         text,
+        ...(attachments.length ? { attachments } : {}),
       };
       setMessages((prev) => [...prev, optimistic]);
       try {
-        await sendAgentMessage(sessionId, { text, ...(delivery ? { delivery } : {}) });
+        await sendAgentMessage(sessionId, { text, ...(delivery ? { delivery } : {}), ...(attachments.length ? { attachmentIds: attachments.map((attachment) => attachment.id) } : {}) });
         return true;
       } catch (err) {
         // 失败：撤回乐观行，错误由调用方 toast + streamErrors 呈现。

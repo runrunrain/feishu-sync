@@ -62,6 +62,8 @@ export function piVersionInRange(version: string): boolean {
 }
 
 export interface StaticProbeInput extends ProbeInput {
+  amagiContentHash?: string;
+  amagiInstallDir?: string;
   /** 已解析的 pi 版本（PiRuntimeResolver 探测值）。 */
   piVersion: string;
   /** 期望冻结的 spec（可选：探测阶段可能尚未构造完整 spec，缺省跳过 spec 相关项）。 */
@@ -89,7 +91,8 @@ export function runStaticProbes(input: StaticProbeInput): CapabilityReport {
   // 2. amagi 包安装
   let amagiPackage: AmagiPackageRef | null = null;
   try {
-    const verified = verifyAmagiPackage({ dataRoot: input.dataRoot, version: input.amagiVersion, verifyHash: false });
+    const verified = verifyAmagiPackage({ dataRoot: input.dataRoot, version: input.amagiVersion,
+      contentHash: input.amagiContentHash, installDir: input.amagiInstallDir ?? input.spec?.amagiPackage.installDir, verifyHash: false });
     amagiPackage = { version: verified.version, installDir: verified.installDir, packageRoot: verified.packageRoot, contentHash: verified.contentHash };
     const layout = inspectAmagiPackageLayout(verified.packageRoot);
     if (layout.ok) {

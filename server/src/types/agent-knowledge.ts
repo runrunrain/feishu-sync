@@ -231,7 +231,7 @@ export function buildDefaultAgentOrchestrationConfig(): AgentOrchestrationConfig
 
 export function buildDefaultAgentConfig(_dataRoot: string): AgentConfig {
   return {
-    runtime: { backend: 'claude-code' },
+    runtime: { backend: 'pi' },
     model: { ...DEFAULT_AGENT_MODEL_CONFIG },
     vision: buildDefaultAgentVisionConfig(),
     orchestration: buildDefaultAgentOrchestrationConfig(),
@@ -405,7 +405,7 @@ export interface KbCurrentPointer {
   publishedAt: string;
 }
 
-export type KbSourceState = 'current' | 'changed' | 'missing' | 'excluded' | 'deleted';
+export type KbSourceState = 'current' | 'changed' | 'missing' | 'excluded' | 'deleted' | 'packaged';
 
 export interface KbStatusDto {
   outputRoot: string;
@@ -416,6 +416,7 @@ export interface KbStatusDto {
     docCount: number;
     sourceCount: number;
     model: string | null;
+    imported?: boolean;
   };
   pending: { added: number; changed: number; removed: number };
   activeBuild: KbBuildDto | null;
@@ -868,11 +869,23 @@ export interface AgentToolCallDto {
   argsSummary: string;
 }
 
+export interface AgentAttachmentDto {
+  id: string;
+  name: string;
+  size: number;
+  mimeType: string;
+  kind: 'image' | 'document';
+  textLength: number;
+  lineCount: number;
+  note?: string;
+}
+
 export interface AgentMessageDto {
   id: string;
   role: 'user' | 'assistant' | 'tool' | 'notice';
   at: string;
   text?: string;
+  attachments?: AgentAttachmentDto[];
   toolCalls?: AgentToolCallDto[];
   tool?: {
     callId: string;
@@ -976,7 +989,7 @@ export interface AgentRunContext {
 // T3（A 案 §7.1/§7.2）：知识协议三工具追加进 build 面——kb_submit_plan
 // （仅规划轮 phase 内部约束）、kb_get_plan（只读）、kb_submit_review
 // （仅审查轮；审查者无草稿写入口）。白名单进入面与族注册同步。
-export const DISCUSS_TOOLS = ['kb_search', 'kb_read', 'kb_grep', 'raw_search', 'raw_read', 'raw_read_image', 'raw_links', 'raw_comments', 'app_command'] as const;
+export const DISCUSS_TOOLS = ['kb_search', 'kb_read', 'kb_grep', 'raw_search', 'raw_read', 'raw_read_image', 'raw_links', 'raw_comments', 'app_command', 'chat_attachment_read'] as const;
 export const WORK_TOOLS = [
   ...DISCUSS_TOOLS,
   'ws_ls',

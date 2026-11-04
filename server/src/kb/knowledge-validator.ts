@@ -259,9 +259,12 @@ function checkReviewCredentials(
 function checkHighRiskHumanReview(
   knowledge: KnowledgeCompileResult['knowledge'],
   governance?: GovernanceSnapshotForBuild,
+  draftDocPaths?: ReadonlySet<string>,
 ): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
-  const severity = governance ? 'blocking' : 'warning';
+  const currentApprovals = new Map(governance?.effectiveDecisions
+    .filter((decision) => decision.businessStatus === 'approved')
+    .map((decision) => [decision.objectId, decision] as const) ?? []);
   for (const object of knowledge.objects) {
     if (object.tombstone) continue;
     const hasHighRiskClaim = (object.claims ?? []).some((claim) => claim.riskCategory === 'high');
@@ -280,6 +283,16 @@ function checkHighRiskHumanReview(
     }
     if (latest?.passed) continue;
     if (object.reviewActorKind === 'human') continue;
+    // An incremental candidate must not turn every unchanged, already published
+    // high-risk marker into a new blocker merely because one governance record
+    // was added. The current document or an approval of this object is the
+    // actionable scope. Omitted draftDocPaths retains the strict full check.
+    const approval = currentApprovals.get(object.objectId);
+    const inCurrentScope = draftDocPaths === undefined
+      || draftDocPaths.has(object.canonical?.path ?? '')
+      || (approval?.payloadHash === object.payloadHash && approval.scopeKey === object.scopeKey);
+    if (!inCurrentScope) continue;
+    const severity = governance ? 'blocking' : 'warning';
     issues.push({
       code: 'kb_review_human_missing', field: 'claims.riskCategory',
       message: governance
@@ -535,7 +548,7 @@ export function runKnowledgeGates(input: KnowledgeGateInput): KnowledgeGateResul
   // 4. 内容审查凭据（diting F03：pending 收紧为 blocking）
   collect(checkReviewCredentials(input.candidate, input.reviews, input.compiled.knowledge));
   // 4b. 高风险人审强制点（A 案 §5.1；治理快照传入时 blocking，D1）
-  collect(checkHighRiskHumanReview(input.compiled.knowledge, input.governance));
+  collect(checkHighRiskHumanReview(input.compiled.knowledge, input.governance, input.draftDocPaths));
   // 4c. 人工业务决定门禁 + supersedes 边决定解引用（A 案 §4.2/§6.1；治理
   // 快照传入时生效——D5 接线构建冻结，单测传当前快照）
   if (input.governance) {

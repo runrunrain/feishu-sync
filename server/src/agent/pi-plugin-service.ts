@@ -11,6 +11,8 @@ import { ToolError } from './agent-tool-service.js';
 import type { PiRuntimeResolver } from './runtime-resolver.js';
 import type { AgentConfig } from '../types/agent-knowledge.js';
 import type { PiPackagePlugin, PiPluginsDto } from '../types/pi-plugin.js';
+import { installBundledAmagi, readBundledAmagi, type BundledAmagi } from './bundled-amagi.js';
+import { runtimePackagesRoot } from './build-runtime/amagi-package.js';
 
 const run = promisify(execFile);
 type Declaration = string | { source: string; extensions?: string[]; skills?: string[]; prompts?: string[]; themes?: string[] };
@@ -24,8 +26,12 @@ export class PiPluginService {
   private mutating = false;
   private revision = '';
   private generation = 0;
+  private readonly bundle: BundledAmagi | null;
+  private bundledReady = false;
+  private bundlePending: Promise<void> | null = null;
   constructor(private deps: { dataRoot: string; resolver: PiRuntimeResolver; agentConfig: () => AgentConfig;
-    running: () => boolean; retireIdle: () => Promise<void> }) {
+    running: () => boolean; retireIdle: () => Promise<void>; bundledAmagi?: BundledAmagi | null }) {
+    this.bundle = deps.bundledAmagi === undefined ? readBundledAmagi() : deps.bundledAmagi;
     this.agentDir = resolveInside(deps.dataRoot, 'agent/pi-home', 'mkdir');
     this.builtinRoot = resolveInside(deps.dataRoot, 'agent/plugins/knowledge-workbench', 'mkdir');
     for (const name of ['package.json', 'feishu-sync-context.js']) {
@@ -39,6 +45,39 @@ export class PiPluginService {
     }
     this.cache = [this.describe(this.builtinRoot, this.builtinRoot, false, [])];
     this.updateRevision();
+  }
+  private isManagedAmagi(source: string): boolean {
+    const full = path.resolve(this.agentDir, source);
+    const rel = path.relative(runtimePackagesRoot(this.deps.dataRoot), full).split(path.sep).join('/');
+    return /^amagi-pi@\d+\.\d+\.\d+\+[a-f0-9]{64}\/package$/.test(rel);
+  }
+  /** Idempotent first-launch provisioning; registration happens only after complete package verification. */
+  async ensureBundled(): Promise<void> {
+    if (!this.bundle || this.bundledReady) return;
+    if (this.bundlePending) return this.bundlePending;
+    this.bundlePending = (async () => {
+      const runtime = await this.deps.resolver.resolveRuntime(this.deps.agentConfig());
+      if (!runtime.nodePath || !runtime.piCliPath) return; // RuntimeInstaller completion retries this path.
+      const installed = await installBundledAmagi({ dataRoot: this.deps.dataRoot, nodePath: runtime.nodePath,
+        piCliPath: runtime.piCliPath, bundle: this.bundle!, log: (line) => console.info(line) });
+      const settings = this.settings();
+      const entries = this.declarations(settings);
+      const previous = entries.find((entry) => this.isManagedAmagi(sourceOf(entry)));
+      const next: Declaration = previous && typeof previous === 'object'
+        ? { ...previous, source: installed.packageRoot } : installed.packageRoot;
+      const packages = [...entries.filter((entry) => !this.isManagedAmagi(sourceOf(entry))), next];
+      if (JSON.stringify(packages) !== JSON.stringify(entries)) {
+        settings.packages = packages; this.saveSettings(settings);
+        const filters = this.savedFilters();
+        if (previous && filters[sourceOf(previous)]) {
+          const restored = filters[sourceOf(previous)]; delete filters[sourceOf(previous)];
+          filters[installed.packageRoot] = typeof restored === 'object' ? { ...restored, source: installed.packageRoot } : installed.packageRoot;
+          this.saveFilters(filters);
+        }
+      }
+      this.bundledReady = true;
+    })().finally(() => { this.bundlePending = null; });
+    return this.bundlePending;
   }
   private settings(): Record<string, unknown> {
     const target = resolveInside(this.agentDir, 'settings.json', 'write');
@@ -74,12 +113,14 @@ export class PiPluginService {
     if (fs.existsSync(installPath) && fs.statSync(installPath).isDirectory()) {
       try { manifest = JSON.parse(fs.readFileSync(path.join(installPath, 'package.json'), 'utf8')); } catch { /* 单文件/约定目录包可无manifest */ }
     }
-    const builtin = path.resolve(installPath) === this.builtinRoot;
+    const workbench = path.resolve(installPath) === this.builtinRoot;
+    const amagi = this.isManagedAmagi(source);
+    const builtin = workbench || amagi;
     return { id: crypto.createHash('sha256').update(source).digest('hex').slice(0, 24), source,
       sourceType: builtin ? 'builtin' : source.startsWith('npm:') ? 'npm' : /^(git:|https?:|git@)/.test(source) ? 'git' : 'local',
-      name: builtin ? '知识库工作台' : typeof manifest.name === 'string' ? manifest.name : path.basename(installPath || source),
-      description: typeof manifest.description === 'string' ? manifest.description : '', version: typeof manifest.version === 'string' ? manifest.version : '',
-      enabled: !off, installPath, resources };
+      name: workbench ? '知识库工作台' : typeof manifest.name === 'string' ? manifest.name : path.basename(installPath || source),
+      description: amagi ? '应用内置的构建编排插件，启动时自动安装，随应用更新。构建运行时按角色加载；普通会话使用应用自己的任务工具。' : typeof manifest.description === 'string' ? manifest.description : '', version: typeof manifest.version === 'string' ? manifest.version : '',
+      enabled: !off, installPath, resources, ...(amagi ? { managed: true } : {}) };
   }
   private env() {
     const env = buildPiProcessEnv({ mode: 'app-llm', parentEnv: process.env, dataRoot: this.deps.dataRoot, agentUrl: '', runToken: '' });
@@ -90,6 +131,7 @@ export class PiPluginService {
   }
   async refresh(): Promise<PiPluginsDto> {
     if (this.mutating) throw new ToolError('plugin_busy', '正在管理插件，请稍后重试', 409);
+    await this.ensureBundled();
     return this.inspect();
   }
   private async inspect(): Promise<PiPluginsDto> {
@@ -126,7 +168,10 @@ export class PiPluginService {
   runtimeResources() {
     if (this.mutating) throw new ToolError('plugin_busy', '插件管理进行中，请完成后再启动对话或构建', 409);
     if (this.cache.length !== this.declarations().length) throw new ToolError('plugin_refresh_required', '插件资源尚未就绪，请先在设置中刷新插件', 409);
-    const enabled = this.cache.filter((pkg) => pkg.enabled);
+    if (this.bundle && !this.bundledReady) throw new ToolError('plugin_not_ready', '内置 amagi-pi 正在等待 Pi 运行时安装，请稍后重试', 503);
+    // amagi task_submit/query/resume conflict with the app task family. Dedicated BuildRuntimeHost
+    // loads its frozen copy with its own policy; ordinary sessions keep the existing controlled tools.
+    const enabled = this.cache.filter((pkg) => pkg.enabled && !this.isManagedAmagi(pkg.source));
     const hash = crypto.createHash('sha256').update(this.revision);
     for (const pkg of enabled) {
       const files = new Set([path.join(pkg.installPath, 'package.json'), ...pkg.resources.filter((r) => r.enabled !== false).map((r) => r.path)]);
@@ -150,6 +195,7 @@ export class PiPluginService {
     const selected = this.cache.find((pkg) => pkg.id === input.id);
     if (action !== 'install' && !selected) throw new ToolError('plugin_not_found', '插件不存在', 404);
     if ((action === 'remove' || action === 'update') && selected?.sourceType === 'builtin') throw new ToolError('invalid_request', '内置插件由应用维护，可配置或停用');
+    if (action === 'toggle' && selected?.managed) throw new ToolError('invalid_request', '内置构建编排插件由应用维护，无需手动启停');
     if (action === 'toggle' && typeof input.enabled !== 'boolean') throw new ToolError('invalid_request', '启用状态必须为布尔值');
     const source = action === 'install' ? this.validSource(input.source) : selected!.source;
     const previous = this.settings();

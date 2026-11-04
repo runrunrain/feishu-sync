@@ -111,6 +111,8 @@ export interface KbGovernancePendingObject {
   objectId: string;
   title: string;
   type: KnowledgeObject['type'];
+  docPath: string | null;
+  anchor: string | null;
   scopeKey: string;
   businessStatus: BusinessStatus;
   reviewStatus: KnowledgeObject['reviewStatus'];
@@ -118,8 +120,12 @@ export interface KbGovernancePendingObject {
   reviewSubjectHash: string;
   /** 高风险 claim 键（空数组 = 无高风险断言） */
   highRiskClaims: string[];
+  /** Published statements and source titles for the claims requiring human review. */
+  claimPreviews: Array<{ claimKey: string; excerpt: string; evidenceSources: string[] }>;
   /** 存在绑定当前 reviewSubjectHash 的 passed 人工复核 */
   humanReviewed: boolean;
+  /** 当前内容最近一次人工复核明确拒绝时的问题说明；高风险标签本身不是问题。 */
+  reviewRejection: string | null;
   effectiveDecision: {
     decisionId: string;
     businessStatus: BusinessStatus;
@@ -134,7 +140,7 @@ export interface KbGovernancePendingObject {
 
 export interface GovernancePendingView {
   releaseId: string | null;
-  /** 高风险 claim 且无绑定当前载荷的人工复核 */
+  /** 当前内容已被人工复核明确拒绝的对象；不把单纯高风险视为待处理问题。 */
   highRisk: KbGovernancePendingObject[];
   /** candidate 对象（待业务决定） */
   candidates: KbGovernancePendingObject[];
@@ -431,6 +437,27 @@ export class KnowledgeGovernanceService {
     const reviews = this.humanReviews();
     const view: GovernancePendingView = { releaseId: manifest?.releaseId ?? null, highRisk: [], candidates: [], staleDecisions: [], governable: [] };
     if (!manifest) return view;
+    const releaseStore = new StandardKbStore(this.outputRoot);
+    const releaseManifest = manifest.releaseId ? releaseStore.readManifest(manifest.releaseId) : null;
+    const releaseDocs = new Map((releaseManifest?.docs ?? []).map((doc) => [doc.path, doc]));
+    const sourceTitles = new Map((releaseManifest?.sourceSnapshot ?? []).map((source) => [source.objToken, source.title]));
+    const evidenceById = new Map(manifest.evidence.map((item) => [item.evidenceId, item]));
+    const docLines = new Map<string, string[]>();
+    const excerptFor = (object: KnowledgeObject, range: { startLine: number; endLine: number }): string => {
+      const docPath = object.canonical?.path;
+      if (!docPath || !manifest.releaseId) return '';
+      let lines = docLines.get(docPath);
+      if (!lines) {
+        const doc = releaseDocs.get(docPath);
+        if (!doc) return '';
+        try { lines = releaseStore.readReleaseDoc(manifest.releaseId, doc).markdown.split('\n'); }
+        catch { return ''; }
+        docLines.set(docPath, lines);
+      }
+      return lines.slice(Math.max(0, range.startLine - 1), range.endLine)
+        .filter((line) => !/^<a\s+id=/.test(line.trim()))
+        .join(' ').replace(/\s+/g, ' ').trim().slice(0, 280);
+    };
     for (const object of manifest.objects) {
       if (object.tombstone) continue;
       const decision = effective.get(object.objectId) ?? null;
@@ -443,13 +470,26 @@ export class KnowledgeGovernanceService {
         objectId: object.objectId,
         title: object.title,
         type: object.type,
+        docPath: object.canonical?.path ?? null,
+        anchor: object.canonical?.anchor ?? null,
         scopeKey: object.scopeKey,
         businessStatus: object.businessStatus,
         reviewStatus: object.reviewStatus,
         payloadHash: object.payloadHash,
         reviewSubjectHash: object.reviewSubjectHash,
         highRiskClaims: (object.claims ?? []).filter((claim) => claim.riskCategory === 'high').map((claim) => claim.claimKey),
+        claimPreviews: (object.claims ?? []).filter((claim) => claim.riskCategory === 'high').map((claim) => ({
+          claimKey: claim.claimKey,
+          excerpt: excerptFor(object, claim.bodyRange),
+          evidenceSources: [...new Set(claim.evidenceIds
+            .map((id) => evidenceById.get(id)?.sourceRef.sourceId)
+            .filter((id): id is string => !!id)
+            .map((id) => sourceTitles.get(id) ?? id))],
+        })),
         humanReviewed,
+        reviewRejection: latestReview && !latestReview.passed
+          ? latestReview.note?.trim() || '人工复核已拒绝，但未填写具体原因。请核对正文与证据。'
+          : null,
         effectiveDecision: decision ? {
           decisionId: decision.decisionId,
           businessStatus: decision.businessStatus,
@@ -461,7 +501,7 @@ export class KnowledgeGovernanceService {
         // supersede」的两端不一致；无有效决定回退 release 对象状态。
         allowedDecisionTargets: allowedDecisionTargets(decision?.businessStatus ?? object.businessStatus),
       };
-      if (entry.highRiskClaims.length > 0 && !humanReviewed) view.highRisk.push(entry);
+      if (entry.reviewRejection) view.highRisk.push(entry);
       if (object.businessStatus === 'candidate') view.candidates.push(entry);
       if (decision && decision.payloadHash !== object.payloadHash) view.staleDecisions.push(entry);
       view.governable.push(entry); // diting S-F04：全部活跃对象可操作（含 unknown/approved/deprecated）
