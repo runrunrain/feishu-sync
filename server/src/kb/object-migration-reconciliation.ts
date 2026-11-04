@@ -42,18 +42,23 @@ export function objectMigrationGaps(input: {
   if (!previous || !draft) return [];
   const currentIds = new Set(draft.objects.filter((object) => !object.tombstone).map((object) => object.objectId));
   const mappedIds = new Set(plan?.migrations.map((migration) => migration.objectId) ?? []);
+  const missing = previous.objects.filter((old) => !old.tombstone && !currentIds.has(old.objectId) && !mappedIds.has(old.objectId));
+  if (missing.length === 0) return [];
   const candidates = draft.objects.filter((object): object is KnowledgeObject & { canonical: NonNullable<KnowledgeObject['canonical']> } =>
     !object.tombstone && !!object.canonical);
-  return previous.objects.filter((old) => !old.tombstone && !currentIds.has(old.objectId) && !mappedIds.has(old.objectId))
-    .map((old) => {
+  const candidateFacts = candidates.map((candidate) => {
+    const fullBody = input.docBody?.(candidate.canonical.path) ?? '';
+    const range = candidate.canonical.bodyRange;
+    const offset = draft.docs[candidate.canonical.path]?.bodyLineOffset ?? 0;
+    return { candidate, title: normalizedTitle(candidate.title),
+      body: range ? fullBody.split('\n').slice(range.startLine + offset - 1, range.endLine + offset).join('\n') : fullBody,
+      sources: evidenceSources(draft, candidate.objectId) };
+  });
+  return missing.map((old) => {
       const oldTitle = normalizedTitle(old.title);
-      const ranked = candidates.map((candidate) => {
-        const common = sharedSources(previous, old.objectId, draft, candidate.objectId);
-        const title = normalizedTitle(candidate.title);
-        const fullBody = input.docBody?.(candidate.canonical.path) ?? '';
-        const range = candidate.canonical.bodyRange;
-        const offset = draft.docs[candidate.canonical.path]?.bodyLineOffset ?? 0;
-        const body = range ? fullBody.split('\n').slice(range.startLine + offset - 1, range.endLine + offset).join('\n') : fullBody;
+      const oldSources = evidenceSources(previous, old.objectId);
+      const ranked = candidateFacts.map(({ candidate, title, body, sources }) => {
+        const common = [...sources].filter((source) => oldSources.has(source)).sort();
         const titleMatch = oldTitle === title ? 100 : oldTitle.includes(title) || title.includes(oldTitle) ? 50 : 0;
         const bodyMatch = bodyMentionsTitle(old.title, body) ? 25 : 0;
         const score = titleMatch + bodyMatch + (common.length > 0 ? 20 : 0)
