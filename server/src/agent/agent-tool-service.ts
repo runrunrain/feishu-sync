@@ -16,7 +16,7 @@ import { isBlankWorkbookPlaceholder, reconcileBlankCsvCoverage } from '../kb/bla
 import { renderCsvTableImport } from '../kb/csv-table-import.js';
 import { MAX_STANDARD_DOC_BYTES } from '../kb/standard-doc-limits.js';
 import { annotateRawReadPage, skipBlankCsvContinuation, type BlankCsvSkip } from '../kb/csv-read-compact.js';
-import { isPermissionDeniedSourcePlaceholder } from '../kb/source-availability.js';
+import { isPermissionDeniedSourcePlaceholder, isUnresolvedSyncedReferencePlaceholder } from '../kb/source-availability.js';
 import {
   atomicWriteFile,
   listDirInside,
@@ -2300,10 +2300,11 @@ export class AgentToolService {
       const entry = state.snapshot.get(source);
       const verified = state.snapshot.readVerified(state.knowledgeBaseRoot, source);
       return !isPermissionDeniedSourcePlaceholder(verified.content)
+        && !(entry?.objType === 'docx' && isUnresolvedSyncedReferencePlaceholder(verified.content))
         && !(entry?.objType === 'sheet' && isBlankWorkbookPlaceholder(verified));
     });
     if (sources.length === 0) {
-      throw new ToolError('kb_source_empty_placeholder', 'sources 仅包含权限占位或全空工作簿；本次没有可写的知识，发布校验会自动登记跳过', 400);
+      throw new ToolError('kb_source_empty_placeholder', 'sources 仅包含权限占位、全空工作簿或未展开同步引用；本次没有可写的知识，发布校验会自动登记跳过', 400);
     }
     const sourceIdentifiers = state.snapshot.entries.flatMap((entry) => [entry.objToken, entry.relPath]);
     if ([title, markdown, summary].some((text) => hasSourceMetadata(text, sourceIdentifiers))) {
@@ -4391,7 +4392,9 @@ export class AgentToolService {
       const changeType = state.workset.get(entry.objToken) ?? (state.mode === 'full' ? 'rebuild' : null);
       const assembled = this.assembleBuildRead(state, entry);
       const sourceAvailability = isPermissionDeniedSourcePlaceholder(assembled.resources[0]?.lines.join('\n') ?? '')
-        ? 'permission_denied_placeholder' : 'available';
+        ? 'permission_denied_placeholder'
+        : isUnresolvedSyncedReferencePlaceholder(assembled.resources[0]?.lines.join('\n') ?? '')
+          ? 'unresolved_reference_placeholder' : 'available';
       return {
         objToken: entry.objToken,
         objType: entry.objType,

@@ -9,6 +9,8 @@
 
 ## 派发纪律
 
+`build_manifest.entries[].sourceAvailability=unresolved_reference_placeholder` 表示本地只有未展开的飞书同步引用及指向另一篇设计的提示。应用会在发布时核验并自动登记跳过；不要派写作、不要把它挂入任何标准文档的 sources。待被引正文完成同步后再补建。
+
 `build_manifest` 的工作集清单每页最多 12 个来源。读到首页便派发输入已明确的首批任务，再按 `nextCursor` 逐页读完；申请最终发布前须确认遍历到 `nextCursor=null`。不要等全部来源都读完才启动第一篇。
 
 规则型 CSV 即使只有一张子表，若本篇要读超过 220 行或超过 400 个非空单元格，也须按独立规则再分篇；只有明确要求 `csvTableImports` 在服务端导入整张纯明细表时才可整表派发。任务书里写“可用导入”不算已卸载模型的逐格工作。

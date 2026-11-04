@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { isPermissionDeniedSourcePlaceholder } from '../src/kb/source-availability.js';
+import { isPermissionDeniedSourcePlaceholder, isUnresolvedSyncedReferencePlaceholder } from '../src/kb/source-availability.js';
 
 describe('permission denied source placeholder', () => {
   it('recognizes the generated Feishu 40403 placeholder', () => {
@@ -8,5 +8,20 @@ describe('permission denied source placeholder', () => {
 
   it('does not flag an ordinary discussion of a permission error', () => {
     expect(isPermissionDeniedSourcePlaceholder('本文讨论 40403 no permission 的处理；请向文档所有者申请权限。')).toBe(false);
+  });
+});
+
+describe('unresolved synced reference placeholder', () => {
+  const shell = '<!--\nfeishu_sync:\n  obj_type: "docx"\n-->\n# 300-【概述】治理风格系统（T）\n\n引用200的设计\n\n<synced_reference src-block-id="block" src-token="source"></synced_reference>\n';
+
+  it('recognizes a source containing only a reference to another design', () => {
+    expect(isUnresolvedSyncedReferencePlaceholder(shell)).toBe(true);
+  });
+
+  it('keeps sources with substantive text, images, or expanded references available', () => {
+    expect(isUnresolvedSyncedReferencePlaceholder(`${shell}\n治理风格由三类数值组成。`)).toBe(false);
+    expect(isUnresolvedSyncedReferencePlaceholder(`${shell}\n![结构图](diagram.png)`)).toBe(false);
+    expect(isUnresolvedSyncedReferencePlaceholder(shell.replace('></synced_reference>', '>规则正文</synced_reference>'))).toBe(false);
+    expect(isUnresolvedSyncedReferencePlaceholder(shell.replace('引用200的设计', '治理风格的计算规则'))).toBe(false);
   });
 });

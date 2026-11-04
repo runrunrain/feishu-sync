@@ -292,6 +292,29 @@ describe('staging 校验（§6.5 validating）', () => {
     expect(issues.some((issue) => issue.code === 'source_permission_denied' && issue.objToken === 'tokDenied')).toBe(true);
     fs.rmSync(dir, { recursive: true, force: true });
   });
+
+  it('未展开的同步引用自动记为跳过，且不能被正式文档引用', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kbval-reference-'));
+    const state = makeState(dir);
+    writeRaw('src-reference.md', '<!--\nfeishu_sync:\n  obj_type: "docx"\n-->\n# 治理风格\n\n引用200的设计\n\n<synced_reference src-token="ref200"></synced_reference>');
+    state.snapshot = RawSourceSnapshot.fromEntries([
+      ...state.snapshot.entries,
+      entry('tokReference', 'src-reference.md', computeSourceHash(path.join(kbRoot, 'src-reference.md'), [])),
+    ], { knowledgeBaseRoot: kbRoot });
+    state.workset.set('tokReference', 'added');
+    state.finishInfo = { summary: '完成可读来源', skipped: [] };
+    fs.writeFileSync(path.join(state.stagingRoot, 'docs', '可读.md'), '<!--\nfeishu_sync_kb:\n  doc_id: kd_readable\n  sources:\n    - tokA\n  build_id: b1\n-->\n# 可读\n正文');
+
+    expect(validateStagingDocs(state, state.snapshot)).toEqual([]);
+    expect(state.finishInfo.skipped).toEqual([{ objToken: 'tokReference', reason: expect.stringContaining('未展开') }]);
+    expect(validateStagingDocs(state, state.snapshot)).toEqual([]);
+    expect(state.finishInfo.skipped).toHaveLength(1);
+
+    fs.writeFileSync(path.join(state.stagingRoot, 'docs', '误引.md'), '<!--\nfeishu_sync_kb:\n  doc_id: kd_invalid\n  sources:\n    - tokReference\n  build_id: b1\n-->\n# 误引\n正文');
+    const issues = validateStagingDocs(state, state.snapshot);
+    expect(issues.some((issue) => issue.code === 'source_unresolved_reference' && issue.objToken === 'tokReference')).toBe(true);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
 });
 
 describe('发布原子性与对账（§6.5 publishing / §5.3）', () => {

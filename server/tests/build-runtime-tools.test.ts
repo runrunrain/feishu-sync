@@ -281,6 +281,16 @@ describe('Leader 工具面（§3.4）', () => {
     } finally { writeRaw('src-b.md', RAW_B); }
   });
 
+  it('build_manifest 在派发前标记未展开的同步引用', async () => {
+    writeRaw('src-b.md', '<!--\nfeishu_sync:\n  obj_type: "docx"\n-->\n# 治理风格\n\n引用200的设计\n\n<synced_reference src-token="ref200"></synced_reference>');
+    try {
+      const setup = makeV2('b-manifest-unresolved-reference');
+      const body = JSON.parse((await call(setup.leader.token, 'build_manifest', {})).content[0]!.text);
+      expect(body.entries.find((source: { objToken: string }) => source.objToken === 'tokB')?.sourceAvailability)
+        .toBe('unresolved_reference_placeholder');
+    } finally { writeRaw('src-b.md', RAW_B); }
+  });
+
   it('build_manifest 不把图片变化的工作集来源标为已发布版未变', async () => {
     const setup = makeV2('b-manifest-media-change');
     const original = setup.state.snapshot.get('tokA')!;

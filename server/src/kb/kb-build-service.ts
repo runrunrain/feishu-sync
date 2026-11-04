@@ -28,7 +28,7 @@ import { PiRuntimeResolver, resolveAppLlmModel } from '../agent/runtime-resolver
 import { buildAppLlmRunConfig, buildFrozenRoleRunConfig } from '../agent/provider-descriptor.js';
 import { createClaudeProcess } from '../agent/claude-process-factory.js';
 import { RawSourceSnapshot, collectSourceCandidates, computeSourceHash } from './raw-source-snapshot.js';
-import { isPermissionDeniedSourcePlaceholder } from './source-availability.js';
+import { isPermissionDeniedSourcePlaceholder, isUnresolvedSyncedReferencePlaceholder } from './source-availability.js';
 import { MAX_STANDARD_DOC_BYTES } from './standard-doc-limits.js';
 import { isReleaseInUse } from './publication-service.js';
 import { StandardKbStore, parseStdHeader, stripStdHeader } from './standard-kb-store.js';
@@ -1357,6 +1357,7 @@ export class KbBuildService extends EventEmitter {
       const source = input.buildState.snapshot.readVerified(config.knowledgeBaseRoot, token);
       if (isPermissionDeniedSourcePlaceholder(source.content)) return [`${token}（权限占位）`];
       if (source.entry.objType === 'sheet' && isBlankWorkbookPlaceholder(source)) return [`${token}（全空工作簿）`];
+      if (source.entry.objType === 'docx' && isUnresolvedSyncedReferencePlaceholder(source.content)) return [`${token}（仅含未展开的同步引用）`];
       return [];
     });
     const skipBriefing = automaticSkips.length > 0
@@ -7799,18 +7800,23 @@ export function validateStagingDocs(
   // 工作集，并把确定性跳过原因写入收尾记录，供候选与发布清单使用。
   const permissionDenied = new Set<string>();
   const blankWorkbooks = new Set<string>();
+  const unresolvedReferences = new Set<string>();
   for (const [token] of state.workset) {
     if (!snapshot.has(token)) continue;
     const source = snapshot.readVerified(state.knowledgeBaseRoot, token);
     const denied = isPermissionDeniedSourcePlaceholder(source.content);
     const blank = !denied && source.entry.objType === 'sheet' && isBlankWorkbookPlaceholder(source);
-    if (!denied && !blank) continue;
+    const referenceOnly = !denied && source.entry.objType === 'docx'
+      && isUnresolvedSyncedReferencePlaceholder(source.content);
+    if (!denied && !blank && !referenceOnly) continue;
     if (denied) permissionDenied.add(token);
     if (blank) blankWorkbooks.add(token);
+    if (referenceOnly) unresolvedReferences.add(token);
     if (state.finishInfo && !state.finishInfo.skipped.some((item) => item.objToken === token)) {
       state.finishInfo.skipped.push({ objToken: token, reason: denied
         ? '飞书侧 40403 权限受限，本地仅有权限占位；本轮跳过，待权限恢复后补建'
-        : '源工作簿只有生成的标题与空白 CSV 子表，无可转换知识；待填入有效数据后补建' });
+        : blank ? '源工作簿只有生成的标题与空白 CSV 子表，无可转换知识；待填入有效数据后补建'
+          : '本地源只有未展开的飞书同步引用及“引用某设计”提示，无可核实正文；待同步被引文档后补建' });
     }
   }
   const docsDir = path.join(state.stagingRoot, 'docs');
@@ -7888,6 +7894,8 @@ export function validateStagingDocs(
         issues.push({ path: file, objToken: token, code: 'source_permission_denied', message: '该来源只有飞书 40403 权限占位，不能作为正式文档证据；请从 sources 移除，本轮自动记为跳过' });
       } else if (blankWorkbooks.has(token)) {
         issues.push({ path: file, objToken: token, code: 'source_blank_workbook', message: '该来源只有全空 CSV 子表，不能作为正文依据；请从 sources 移除，本轮自动记为跳过' });
+      } else if (unresolvedReferences.has(token)) {
+        issues.push({ path: file, objToken: token, code: 'source_unresolved_reference', message: '该来源只有未展开的同步引用，没有可核实正文；请从 sources 移除，本轮自动记为跳过' });
       } else {
         referencedSources.add(token);
       }
@@ -7940,7 +7948,7 @@ export function validateStagingDocs(
   }
   for (const item of state.finishInfo?.skipped ?? []) skipped.add(item.objToken);
   for (const [token] of state.workset) {
-    if (!referencedSources.has(token) && !skipped.has(token) && !blankWorkbooks.has(token)) {
+    if (!referencedSources.has(token) && !skipped.has(token) && !blankWorkbooks.has(token) && !unresolvedReferences.has(token)) {
       issues.push({ objToken: token, code: 'source_not_covered', message: '源既未被文档引用也未列入 skipped' });
     }
   }
