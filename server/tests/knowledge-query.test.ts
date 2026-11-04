@@ -139,6 +139,23 @@ beforeEach(() => {
 });
 afterEach(() => { fs.rmSync(home, { recursive: true, force: true }); });
 
+it('section reads include their own object anchor and exclude the following section anchor', async () => {
+  const docPath = '测试/锚点.md';
+  const body = ['# 文档', '<a id="ko_first"></a>', '## 第一节', '第一节正文', '<a id="ko_second"></a>', '## 第二节', '第二节正文'].join('\n');
+  const first = makeObject('ko_first', '第一节', 'kd_anchor', docPath, 2, 4, { businessStatus: 'unknown' });
+  const second = makeObject('ko_second', '第二节', 'kd_anchor', docPath, 5, 7);
+  const knowledge: KnowledgeManifest = { schemaVersion: 1, releaseId: 'r_anchors', documents: [{ docId: 'kd_anchor', path: docPath }],
+    objects: [first, second], presentations: [], relations: [], evidence: [], coverage: [], migrations: [] };
+  writeKnowledgeRelease(home, 'r_anchors', [{ path: docPath, docId: 'kd_anchor', body }], knowledge);
+  const read = await service.read({ path: docPath, section: '第一节', releaseId: 'r_anchors' });
+  expect(read.text).toContain('ko_first');
+  expect(read.text).not.toContain('ko_second');
+  expect(read.text).toContain('business=unknown');
+  expect(read.text).toContain('evidence=0');
+  const search = await service.search({ query: '第一节', releaseId: 'r_anchors' });
+  expect(search.results[0].knowledgeStatus).toMatchObject({ scope: 'document', objectCount: 2, businessStatuses: { unknown: 1, approved: 1 }, withoutEvidence: 2 });
+});
+
 /** 按预算分页取尽对象列表（行较大时单页装不下全部） */
 async function allObjects(service: KbQueryService, params: Record<string, unknown>): Promise<Awaited<ReturnType<KbQueryService['objects']>>['objects']> {
   const rows: Awaited<ReturnType<KbQueryService['objects']>>['objects'] = [];

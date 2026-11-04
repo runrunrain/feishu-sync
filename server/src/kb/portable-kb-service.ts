@@ -3,7 +3,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { finished, pipeline } from 'node:stream/promises';
+import { pipeline } from 'node:stream/promises';
 import { Transform } from 'node:stream';
 import archiver from 'archiver';
 import unzipper from 'unzipper';
@@ -101,9 +101,21 @@ function currentId(root: string): string | null {
   } catch { return null; }
 }
 
-export async function exportPortableKb(root: string, destination: string): Promise<PortableKbPreview & { path: string }> {
+function exportTargetStat(destination: string): fs.Stats | undefined {
+  const stat = fs.lstatSync(destination, { throwIfNoEntry: false });
+  if (stat && !stat.isFile()) throw new PortableKbError('invalid_kb_export_target', '导出目标是文件夹或符号链接，请选择普通文件');
+  return stat;
+}
+function exportExistsError(): PortableKbError {
+  return new PortableKbError('kb_bundle_exists', '目标文件已存在，请重新选择并确认替换', 409);
+}
+
+export async function exportPortableKb(
+  root: string, destination: string, options: { overwrite?: boolean } = {},
+): Promise<PortableKbPreview & { path: string }> {
   assertPathOutsideRoot(root, destination);
-  if (fs.existsSync(destination)) throw new PortableKbError('kb_bundle_exists', '目标文件已存在，请另选文件名', 409);
+  const existing = exportTargetStat(destination);
+  if (existing && !options.overwrite) throw exportExistsError();
   const release = resolveRelease(root);
   const files = await listReleaseFiles(release.releaseDir);
   const bundle: Bundle = {
@@ -112,20 +124,35 @@ export async function exportPortableKb(root: string, destination: string): Promi
     sourceCount: release.manifest.sourceSnapshot.length, files,
   };
   const temp = `${destination}.${randomUUID()}.tmp`;
+  const archive = archiver('zip', { zlib: { level: 6 } });
+  const output = fs.createWriteStream(temp, { flags: 'wx' });
+  // Attach stream failure handlers before archiving starts; disk/write errors
+  // must reject this request and leave the previously exported archive intact.
+  const writing = pipeline(archive, output);
+  archive.on('warning', (error) => archive.destroy(error));
   try {
-    const output = fs.createWriteStream(temp, { flags: 'wx' });
-    const archive = archiver('zip', { zlib: { level: 6 } });
-    archive.on('error', (error) => output.destroy(error));
-    archive.on('warning', (error) => output.destroy(error));
-    archive.pipe(output);
     archive.append(JSON.stringify(bundle), { name: 'bundle.json' });
     for (const item of files) archive.file(path.join(release.releaseDir, item.path), { name: `release/${item.path}` });
-    await archive.finalize();
-    await finished(output);
-    // link is an atomic create-if-absent; rename would silently replace a file
-    // selected by another process after the initial existence check.
-    await fs.promises.link(temp, destination);
-    await fs.promises.unlink(temp);
+    await Promise.all([archive.finalize(), writing]);
+    if (existing) {
+      const current = exportTargetStat(destination);
+      if (!current || current.dev !== existing.dev || current.ino !== existing.ino
+        || current.size !== existing.size || current.mtimeMs !== existing.mtimeMs || current.ctimeMs !== existing.ctimeMs) {
+        throw new PortableKbError('kb_export_target_changed', '导出期间目标文件已变化，请重新选择并确认替换', 409);
+      }
+      // Native SaveDialog already obtained overwrite approval. Only replace the
+      // directory entry after the complete ZIP stream has closed successfully.
+      await fs.promises.rename(temp, destination);
+    } else {
+      // A file created by another operation while we archive was never approved
+      // for replacement, even when this request came from the save dialog.
+      try { await fs.promises.link(temp, destination); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw exportExistsError();
+        throw error;
+      }
+      await fs.promises.unlink(temp);
+    }
     const stat = await fs.promises.stat(destination);
     return {
       path: destination, releaseId: release.releaseId, docCount: bundle.docCount,
@@ -134,6 +161,9 @@ export async function exportPortableKb(root: string, destination: string): Promi
       currentReleaseId: currentId(root), alreadyInstalled: true,
     };
   } catch (error) {
+    archive.destroy();
+    output.destroy();
+    await writing.catch(() => undefined);
     fs.rmSync(temp, { force: true });
     throw error;
   }

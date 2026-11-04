@@ -30,6 +30,7 @@
     "jsonc-parser": "^3.3.1",
     "jszip": "^3.10.1",
     "openai": "^4.89.0",
+    "smol-toml": "^1.9.1",
     "ssf": "^0.11.2",
     "unpdf": "1.9.1",
     "unzipper": "^0.10.14"

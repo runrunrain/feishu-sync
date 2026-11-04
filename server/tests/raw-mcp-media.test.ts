@@ -7,6 +7,7 @@ import crypto from 'node:crypto';
 import net from 'node:net';
 import { spawn, type ChildProcess } from 'node:child_process';
 import ExcelJS from 'exceljs';
+import JSZip from 'jszip';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
@@ -66,8 +67,13 @@ it('reads actual worksheet cells, formulas, values, links, merges and verifies w
     expect.objectContaining({ address: 'C2', text: '85', formula: 'B2*2' }),
     expect.objectContaining({ address: 'D2', text: '来源链接', hyperlink: 'https://example.test/doc' }),
     expect.objectContaining({ address: 'A3', text: '世界规则' }),
-    expect.objectContaining({ address: 'B4', mergedInto: 'A4' }),
+    expect.objectContaining({ address: 'A4', text: '合并内容', mergeRange: 'A4:B4' }),
   ]));
+  expect(page.cells.find((cell: { address: string }) => cell.address === 'B4')).toBeUndefined();
+  const inside: any = await svc().call('raw_read_sheet', { objToken: 'src', sheet: '设计', startRow: 4, endRow: 4, startColumn: 2, endColumn: 2 }, 6000);
+  expect(inside.cells).toEqual([expect.objectContaining({ address: 'A4', text: '合并内容', mergeRange: 'A4:B4', outsideRequestedRange: true })]);
+  const grid: any = await svc().call('raw_read_sheet', { objToken: 'src', sheet: '设计', startRow: 4, endRow: 4, startColumn: 1, endColumn: 2, includeMergedFollowers: true }, 6000);
+  expect(grid.cells).toEqual(expect.arrayContaining([expect.objectContaining({ address: 'B4', mergedInto: 'A4', mergeRange: 'A4:B4' })]));
   const searched: any = await svc().call('raw_search_sheet', { objToken: 'src', query: '攻击力' }, 6000);
   expect(searched).toMatchObject({ complete: true, cells: [{ sheet: '设计', address: 'A2', text: '攻击力' }] });
   const formula: any = await svc().call('raw_search_sheet', { objToken: 'src', query: 'b2*2', sheet: '设计' }, 6000);
@@ -76,6 +82,28 @@ it('reads actual worksheet cells, formulas, values, links, merges and verifies w
   await expect(svc().call('raw_list_sheets', { objToken: 'dest' }, 6000)).rejects.toMatchObject({ code: 'raw_workbook_unavailable' });
   const next = new ExcelJS.Workbook(); await next.xlsx.readFile(workbook); next.getWorksheet('设计')!.getCell('A1').value = '已变化'; await next.xlsx.writeFile(workbook);
   await expect(svc().call('raw_read_sheet', { objToken: 'src', sheet: '设计', contentHash: page.contentHash }, 6000)).rejects.toMatchObject({ code: 'raw_changed' });
+});
+
+it.each([
+  { prefix: '<t></t>', expected: '世界规则' },
+  { prefix: '<t/>', expected: '世界规则' },
+  { prefix: '<t>前缀 </t>', expected: '前缀 世界规则' },
+])('reads mixed shared strings ($prefix) without modifying the workbook', async ({ prefix, expected }) => {
+  const { workbook } = await fixture();
+  const zip = await JSZip.loadAsync(fs.readFileSync(workbook));
+  const xml = await zip.file('xl/sharedStrings.xml')!.async('string');
+  const altered = xml.replace(/(<si>)(?=<r>)/, `$1${prefix}`);
+  expect(altered).not.toBe(xml);
+  zip.file('xl/sharedStrings.xml', altered);
+  fs.writeFileSync(workbook, await zip.generateAsync({ type: 'nodebuffer' }));
+  const before = crypto.createHash('sha256').update(fs.readFileSync(workbook)).digest('hex');
+  const page: any = await svc().call('raw_read_sheet', { objToken: 'src', sheet: '设计', endRow: 5, endColumn: 5 }, 6000);
+  expect(page).toMatchObject({ contentHash: before, workbookCompatibility: 'mixed_shared_string_prefix' });
+  expect(page.cells).toEqual(expect.arrayContaining([
+    expect.objectContaining({ address: 'A3', text: expected }),
+    expect.objectContaining({ address: 'C2', formula: 'B2*2', text: '85' }),
+  ]));
+  expect(crypto.createHash('sha256').update(fs.readFileSync(workbook)).digest('hex')).toBe(before);
 });
 
 it('finds cached descriptions, reads document and XLSX images, rejects missing or unreferenced paths', async () => {

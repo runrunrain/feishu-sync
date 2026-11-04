@@ -132,7 +132,7 @@ import {
 import type { BuildUnit } from '../kb/build-units.js';
 import type { ImageDescription } from './vision/vision-describer.js';
 import { matchGlob, parseSearchQuery } from '../kb/kb-search.js';
-import { scoreRawText } from '../kb/raw-search-score.js';
+import { rawFallbackTerms, scoreRawFallback, scoreRawText } from '../kb/raw-search-score.js';
 import {
   renderSourceLinksBlock,
   resolveSourceLinks,
@@ -1125,6 +1125,7 @@ export class AgentToolService {
       ? context.options.buildState.snapshot.entries
       : this.rawEntriesForDiscuss(context);
     const hits: Array<{ result: Record<string, unknown>; score: number; relPath: string }> = [];
+    const fallback: typeof hits = [], fragments = rawFallbackTerms(query);
     for (const entry of entries) {
       let content = '';
       try {
@@ -1145,10 +1146,19 @@ export class AgentToolService {
           },
         });
       }
+      if (fragments.length) {
+        const candidate = scoreRawFallback(entry.title, entry.relPath, content, fragments);
+        if (candidate.score > 0) fallback.push({ score: candidate.score, relPath: entry.relPath, result: {
+          objToken: entry.objToken, title: entry.title, relPath: entry.relPath,
+          ...(candidate.snippet ? { snippet: candidate.snippet } : {}), matchType: 'fallback', matchedFragments: candidate.matchedFragments,
+        } });
+      }
     }
-    hits.sort((a, b) => b.score - a.score || (a.relPath < b.relPath ? -1 : a.relPath > b.relPath ? 1 : 0));
-    const results = hits.slice(0, limit).map((hit) => hit.result);
-    return { content: [{ type: 'text', text: JSON.stringify({ results }, null, 2) }] };
+    const usingFallback = !hits.length && fallback.length > 0;
+    const ranked = usingFallback ? fallback : hits;
+    ranked.sort((a, b) => b.score - a.score || (a.relPath < b.relPath ? -1 : a.relPath > b.relPath ? 1 : 0));
+    const results = ranked.slice(0, limit).map((hit) => hit.result);
+    return { content: [{ type: 'text', text: JSON.stringify({ results, ...(usingFallback ? { warning: '未找到完整关键词；以下为片段回退候选，请继续核对原文。' } : {}) }, null, 2) }] };
   }
 
   private readRawContent(context: InternalRunContext, objToken: string): string {

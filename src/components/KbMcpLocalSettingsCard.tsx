@@ -66,6 +66,7 @@ export function KbMcpLocalSettingsCard() {
             <select aria-label="MCP 安装目标" value={target} disabled={busy} onChange={(event) => { setTarget(event.target.value as McpClientTarget); setFeedback(null); }} className="w-full rounded border border-line bg-paper px-2 py-2 text-sm text-ink">
               <option value="agents">.agents（兼容客户端）</option>
               <option value="claude">Claude Code（用户级）</option>
+              <option value="codex">Codex（用户级）</option>
             </select>
           </label>
           <Button size="sm" disabled={loading || busy || !canInstall} onClick={() => void apply('install')}>
@@ -83,7 +84,7 @@ export function KbMcpLocalSettingsCard() {
           {info && !info.available ? <p role="note" className="text-seal">本地 MCP 程序未就绪，无法安装；已安装的配置仍可清理。</p> : null}
         </div> : null}
         <p>操作立即生效。只管理本应用安装且未被外部修改的 <code>feishu-kb</code> 条目；其它配置会保留。</p>
-        <p>Amagi Pi 等兼容客户端读取 <code>~/.agents/.mcp.json</code>；Claude Code 的用户级 MCP 配置实际位于 <code>~/.claude.json</code>。安装或清理后请重启相应客户端。</p>
+        <p>Amagi Pi 等兼容客户端读取 <code>~/.agents/.mcp.json</code>；Claude Code 读取 <code>~/.claude.json</code>；Codex 读取 <code>~/.codex/config.toml</code>。安装或清理后请重新启动相应客户端或会话。</p>
         {feedback ? <p role={feedback.error ? 'alert' : 'status'} className={feedback.error ? 'text-seal-2' : 'text-jade'}>{feedback.text}</p> : null}
         {info ? <details className="border-t border-line/60 pt-3">
           <summary className="cursor-pointer font-medium text-ink">手动配置</summary>

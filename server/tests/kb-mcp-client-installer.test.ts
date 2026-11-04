@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { parse as parseToml } from 'smol-toml';
 import { Hono } from 'hono';
 import { McpClientInstaller } from '../src/kb/mcp-client-installer.js';
 import { kbMcpInstallRoutes } from '../src/routes/kb-mcp-install.js';
@@ -16,7 +17,7 @@ function fixture() {
   fs.mkdirSync(home); fs.mkdirSync(dataRoot);
   const info: KbMcpInfoDto = { available: true, command: 'app.exe', args: ['mcp.cjs', '--kb-root', 'old-root'], env: { ELECTRON_RUN_AS_NODE: '1' }, alternative: { command: 'node', args: [], note: '' }, snippet: '' };
   const installer = new McpClientInstaller({ homeDir: home, dataRoot, info: () => info });
-  return { root, home, dataRoot, info, installer, agents: path.join(home, '.agents', '.mcp.json'), claude: path.join(home, '.claude.json') };
+  return { root, home, dataRoot, info, installer, agents: path.join(home, '.agents', '.mcp.json'), claude: path.join(home, '.claude.json'), codex: path.join(home, '.codex', 'config.toml') };
 }
 function read(file: string) { return JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '')); }
 
@@ -47,6 +48,41 @@ describe('用户级 MCP 安装与清理', () => {
     expect(read(f.claude).mcpServers['feishu-kb'].args).toEqual(f.info.args);
     f.installer.remove('claude');
     expect(read(f.claude)).toEqual({ projects: { original: { enabled: true } }, unknown: 17 });
+  });
+
+  it('Codex TOML 安装、更新和清理保留其他服务与用户配置', () => {
+    const f = fixture(); fs.mkdirSync(path.dirname(f.codex));
+    const original = '# 用户原有配置\r\nmodel = "example"\r\n[mcp_servers.other]\r\ncommand = "other tool"\r\n';
+    fs.writeFileSync(f.codex, original);
+    f.info.command = '/应用/Feishu Sync'; f.info.args = ['含 空格', '引号"路径'];
+    expect(f.installer.install('codex')).toMatchObject({ path: f.codex, state: 'installed' });
+    let text = fs.readFileSync(f.codex, 'utf8');
+    expect(text.startsWith(original)).toBe(true);
+    expect(text.replaceAll('\r\n', '')).not.toContain('\n');
+    let parsed: any = parseToml(text);
+    expect(parsed.mcp_servers.other.command).toBe('other tool');
+    expect(parsed.mcp_servers['feishu-kb']).toMatchObject({ command: f.info.command, args: f.info.args, env: { ELECTRON_RUN_AS_NODE: '1' } });
+    f.info.args = ['new-root'];
+    expect(f.installer.status().find((item) => item.target === 'codex')?.state).toBe('needs_update');
+    f.installer.install('codex');
+    text = fs.readFileSync(f.codex, 'utf8'); parsed = parseToml(text);
+    expect(parsed.mcp_servers['feishu-kb'].args).toEqual(['new-root']);
+    expect(f.installer.remove('codex').state).toBe('not_installed');
+    expect(fs.readFileSync(f.codex, 'utf8')).toBe(original);
+  });
+
+  it('Codex 同名配置或安装块被修改时拒绝覆盖和清理', () => {
+    const f = fixture(); fs.mkdirSync(path.dirname(f.codex));
+    const foreign = '[mcp_servers."feishu-kb"]\ncommand = "mine"\n'; fs.writeFileSync(f.codex, foreign);
+    expect(f.installer.status().find((item) => item.target === 'codex')?.state).toBe('conflict');
+    expect(() => f.installer.install('codex')).toThrow();
+    expect(fs.readFileSync(f.codex, 'utf8')).toBe(foreign);
+    fs.writeFileSync(f.codex, 'model = "example"\n'); f.installer.install('codex');
+    const modified = fs.readFileSync(f.codex, 'utf8').replace('command = "app.exe"', 'command = "my-command"');
+    fs.writeFileSync(f.codex, modified);
+    expect(f.installer.status().find((item) => item.target === 'codex')?.state).toBe('modified');
+    expect(() => f.installer.remove('codex')).toThrow();
+    expect(fs.readFileSync(f.codex, 'utf8')).toBe(modified);
   });
 
   it('用户在应用创建的 MCP 容器中新增条目后，清理保留该容器和新增条目', () => {
@@ -190,7 +226,7 @@ describe('用户级 MCP 安装与清理', () => {
   it('用户目录不可用时安装功能报错，但不会阻止服务构造', () => {
     const f = fixture();
     const installer = new McpClientInstaller({ homeDir: path.join(f.root, 'missing-home'), dataRoot: f.dataRoot, info: () => f.info });
-    expect(installer.status().map((item) => item.state)).toEqual(['invalid', 'invalid']);
+    expect(installer.status().map((item) => item.state)).toEqual(['invalid', 'invalid', 'invalid']);
     expect(() => installer.install('claude')).toThrow(/用户目录不可用/);
   });
 

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -15,7 +15,10 @@ function temp(): string {
   tempRoots.push(dir);
   return dir;
 }
-afterEach(() => { for (const dir of tempRoots.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
+afterEach(() => {
+  vi.restoreAllMocks();
+  for (const dir of tempRoots.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+});
 
 describe('portable standard KB', () => {
   it('exports a complete release, imports to another library, reads it, and restores the previous release', async () => {
@@ -82,6 +85,68 @@ describe('portable standard KB', () => {
     const result = await importPortableKb(root, output, 'r_same');
     expect(result.previousReleaseId).toBeNull();
     expect(() => restorePreviousLocalKb(root)).toThrow(/没有可恢复/);
+  });
+
+  it('replaces an existing archive after native save confirmation, through the export API', async () => {
+    const root = temp(), output = path.join(temp(), 'share.fskb');
+    writeSearchRelease(root, 'r_old', [{ path: 'a.md', body: '# 旧版本' }]);
+    await exportPortableKb(root, output);
+    const before = fs.readFileSync(output);
+    writeSearchRelease(root, 'r_new', [{ path: 'a.md', body: '# 新版本\n确认覆盖后导出' }]);
+    const routes = kbRoutes({
+      buildService: {} as never, localMapStore: {} as never,
+      configManager: { load: async () => ({ standardKb: { outputRoot: root } }) } as never,
+      documentsProvider: () => [], sheetCsvPaths: () => [],
+    });
+    const response = await routes.request('/api/kb/portable/export', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: output, overwrite: true }),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ releaseId: 'r_new', docCount: 1, path: output });
+    expect(fs.readFileSync(output)).not.toEqual(before);
+    expect(await inspectPortableKb(temp(), output)).toMatchObject({ releaseId: 'r_new', docCount: 1 });
+    const receiver = temp();
+    await importPortableKb(receiver, output, null);
+    const store = new StandardKbStore(receiver);
+    expect(store.readReleaseDoc('r_new', store.readManifest()!.docs[0]).markdown).toContain('确认覆盖后导出');
+  });
+
+  it('keeps an existing archive when overwrite is not authorized', async () => {
+    const root = temp(), output = path.join(temp(), 'share.fskb');
+    writeSearchRelease(root, 'r_old', [{ path: 'a.md', body: '# 旧版本' }]);
+    await exportPortableKb(root, output);
+    const before = fs.readFileSync(output);
+    await expect(exportPortableKb(root, output)).rejects.toMatchObject({ code: 'kb_bundle_exists', status: 409 });
+    expect(fs.readFileSync(output)).toEqual(before);
+  });
+
+  it('keeps the previous archive and removes the temporary package if replacement fails', async () => {
+    const root = temp(), outputDir = temp(), output = path.join(outputDir, 'share.fskb');
+    writeSearchRelease(root, 'r_old', [{ path: 'a.md', body: '# 旧版本' }]);
+    await exportPortableKb(root, output);
+    const before = fs.readFileSync(output);
+    writeSearchRelease(root, 'r_new', [{ path: 'a.md', body: '# 新版本' }]);
+    vi.spyOn(fs.promises, 'rename').mockRejectedValueOnce(Object.assign(new Error('模拟无写入权限'), { code: 'EACCES' }));
+    await expect(exportPortableKb(root, output, { overwrite: true })).rejects.toThrow('模拟无写入权限');
+    expect(fs.readFileSync(output)).toEqual(before);
+    expect(fs.readdirSync(outputDir)).toEqual(['share.fskb']);
+  });
+
+  it('rejects directories and symbolic links as overwrite targets', async () => {
+    const root = temp(), outputDir = temp(), folder = path.join(outputDir, 'folder.fskb');
+    writeSearchRelease(root, 'r_source', [{ path: 'a.md', body: '# 正文' }]);
+    fs.mkdirSync(folder);
+    await expect(exportPortableKb(root, folder, { overwrite: true })).rejects.toMatchObject({ code: 'invalid_kb_export_target' });
+    expect(fs.statSync(folder).isDirectory()).toBe(true);
+    if (process.platform !== 'win32') {
+      const file = path.join(outputDir, 'original.txt'), link = path.join(outputDir, 'link.fskb');
+      fs.writeFileSync(file, '原文件');
+      fs.symlinkSync(file, link);
+      await expect(exportPortableKb(root, link, { overwrite: true })).rejects.toMatchObject({ code: 'invalid_kb_export_target' });
+      expect(fs.readFileSync(file, 'utf8')).toBe('原文件');
+      expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+    }
   });
 
   it('rejects an archive path traversal before extraction', async () => {

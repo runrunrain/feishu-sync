@@ -190,10 +190,12 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
   routes.post('/api/kb/portable/export', async (c) => {
     const denied = portableDesktopOnly(c); if (denied) return denied;
     try {
-      const body = await c.req.json() as { path?: string };
-      if (typeof body.path !== 'string') throw new PortableKbError('invalid_request', '请选择导出位置');
+      const body = await c.req.json() as { path?: string; overwrite?: boolean };
+      if (typeof body.path !== 'string' || (body.overwrite !== undefined && typeof body.overwrite !== 'boolean')) {
+        throw new PortableKbError('invalid_request', '请选择导出位置并确认是否替换同名文件');
+      }
       const { config } = await loadStore();
-      return c.json(await exportPortableKb(config.standardKb.outputRoot, body.path));
+      return c.json(await exportPortableKb(config.standardKb.outputRoot, body.path, { overwrite: body.overwrite === true }));
     } catch (error) { return errorResponse(c, error); }
   });
 

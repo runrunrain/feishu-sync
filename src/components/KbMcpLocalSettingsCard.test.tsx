@@ -13,6 +13,7 @@ import { KbMcpLocalSettingsCard } from './KbMcpLocalSettingsCard';
 const targets: McpInstallStatus[] = [
   { target: 'agents', path: '/home/user/.agents/.mcp.json', state: 'not_installed' },
   { target: 'claude', path: '/home/user/.claude.json', state: 'not_installed' },
+  { target: 'codex', path: '/home/user/.codex/config.toml', state: 'not_installed' },
 ];
 beforeEach(() => {
   vi.clearAllMocks();
@@ -20,6 +21,20 @@ beforeEach(() => {
   api.status.mockResolvedValue({ targets });
   api.install.mockImplementation(async (target: string) => ({ ...targets.find((item) => item.target === target), state: 'installed' }));
   api.remove.mockImplementation(async (target: string) => ({ ...targets.find((item) => item.target === target), state: 'not_installed' }));
+});
+
+it('可选择 Codex 并安装到其用户配置', async () => {
+  const container = document.createElement('div'); document.body.append(container);
+  const root = createRoot(container);
+  try {
+    await act(async () => root.render(<KbMcpLocalSettingsCard />));
+    const select = container.querySelector<HTMLSelectElement>('[aria-label="MCP 安装目标"]')!;
+    await act(async () => { select.value = 'codex'; select.dispatchEvent(new Event('change', { bubbles: true })); });
+    expect(container.textContent).toContain('/home/user/.codex/config.toml');
+    const install = [...container.querySelectorAll('button')].find((item) => item.textContent === '一键安装')!;
+    await act(async () => install.click());
+    expect(api.install).toHaveBeenCalledWith('codex');
+  } finally { act(() => root.unmount()); container.remove(); }
 });
 
 it('在知识库共享的本机安装卡中选择 Claude 并安装、清理', async () => {

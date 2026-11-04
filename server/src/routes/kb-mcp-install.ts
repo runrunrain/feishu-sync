@@ -20,8 +20,8 @@ export function kbMcpInstallRoutes(deps: { installer: McpClientInstaller; deskto
   routes.get('/api/kb-mcp-install/status', (c) => c.json({ targets: deps.installer.status() }));
   const parseTarget = async (c: any): Promise<McpClientTarget> => {
     const body: unknown = await c.req.json();
-    if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some((key) => key !== 'target') || !('target' in body) || !['agents', 'claude'].includes(String(body.target))) {
-      throw new McpInstallError('invalid_target', '请选择 .agents 或 Claude Code。');
+    if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some((key) => key !== 'target') || !('target' in body) || !['agents', 'claude', 'codex'].includes(String(body.target))) {
+      throw new McpInstallError('invalid_target', '请选择 .agents、Claude Code 或 Codex。');
     }
     return body.target as McpClientTarget;
   };

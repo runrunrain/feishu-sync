@@ -170,8 +170,10 @@ export interface SearchParams extends PageParams { query: string; limit?: number
 }
 export interface SearchResultHit { docId: string; path: string; title: string; summary: string; snippet: string; score?: number; coverage?: number; matchedUnits?: string[]; fallbackUnits?: string[]; matchType?: 'exact'|'fallback'; hits?: SnippetHit[];
   /** 对象感知模式：命中文档内通过过滤的对象及其状态（A案 §8.1 标签随结果流转） */
-  objectRefs?: Array<{ objectId: string; businessStatus: BusinessStatus; reviewStatus: ReviewStatus }> }
+  objectRefs?: Array<{ objectId: string; businessStatus: BusinessStatus; reviewStatus: ReviewStatus }>;
+  knowledgeStatus?: { scope: 'document'; objectCount: number; businessStatuses: Record<string, number>; reviewStatuses: Record<string, number>; withoutEvidence: number } }
 export interface SearchResult { releaseId: string; ranker: 'lex-v1'|'l1'; rankerVersion: 'lex-v1'|'l1'; query: ReturnType<typeof parseQuery>; total: number; results: SearchResultHit[]; next: string|null; unmatchedUnits: string[]; warning?: string; hint?: string[];
+  knowledgeStatusWarning?: string;
   usage?: KbUsage;
   /** v1 release / 旧 schema 内容：未分类，不能看起来像已批准（A案 §8.1） */
   legacy?: 'legacy-unclassified';
@@ -368,6 +370,18 @@ export class KbQueryService {
     }
     this.knowledgeCache.set(key, view);
     return view;
+  }
+
+  private documentKnowledgeStatus(view: KbKnowledgeIndex | null, docPath: string): SearchResultHit['knowledgeStatus'] {
+    if (!view) return undefined;
+    const objects = view.objectsByDoc.get(docPath) ?? [];
+    const businessStatuses: Record<string, number> = {}, reviewStatuses: Record<string, number> = {};
+    for (const object of objects) {
+      businessStatuses[object.businessStatus] = (businessStatuses[object.businessStatus] ?? 0) + 1;
+      reviewStatuses[object.reviewStatus] = (reviewStatuses[object.reviewStatus] ?? 0) + 1;
+    }
+    return { scope: 'document', objectCount: objects.length, businessStatuses, reviewStatuses,
+      withoutEvidence: objects.filter((object) => !(view.evidenceByObject.get(object.objectId)?.length)).length };
   }
 
   private async begin(tool: string, params: PageParams, normalized: unknown, pinned?: { evaluatedAt?: number }): Promise<{ release: ResolvedRelease; index: KbIndex; offset: number; evaluatedAt: number | undefined; next: (o: number) => string }> {
@@ -837,6 +851,11 @@ export class KbQueryService {
           ...(asOfMs !== undefined ? { asOf: asOf!.normalized } : {}) } : {}) },
       knowledgeActive && evaluatedAt !== undefined ? { evaluatedAt } : undefined);
     const { release, index, offset, next } = state;
+    let browseView: KbKnowledgeIndex | null = null;
+    if (!knowledgeActive) {
+      // A damaged optional sidecar must not prevent ordinary document search.
+      try { browseView = this.knowledgeView(release); } catch { /* Text remains readable; no state is asserted. */ }
+    }
     const ranker = process.env.FEISHU_KB_RANKER === 'l1' ? 'l1' : 'lex-v1';
     let query = parsed, results: Array<() => SearchResultHit>;
     const selected = (doc: KbIndexDoc) => matchesPrefix(doc.path, pathPrefix) && tags.every((t) => doc.tags.includes(t));
@@ -870,7 +889,7 @@ export class KbQueryService {
       const l1 = l1SearchDocs(docs.map((d) => ({ ...d, headings: d.sections.map((s) => s.headingPath) })), params.query, Number.MAX_SAFE_INTEGER,
         (d) => index.docs[index.byPath.get(d.path)!].lines.join('\n'), true);
       results = (knowledge ? l1.filter((hit) => knowledge.docQualifying.has(hit.path)) : l1).map((hit) => {
-        if (!knowledge) return () => hit;
+        if (!knowledge) return () => ({ ...hit, ...(browseView ? { knowledgeStatus: this.documentKnowledgeStatus(browseView, hit.path) } : {}) });
         const knowledgeState = knowledge;
         return () => this.knowledgeAwareL1Hit(hit, knowledgeState, index, maxSnippets, query);
       });
@@ -885,7 +904,8 @@ export class KbQueryService {
               const hits = r.sections.filter((s, i) => s.score > 0 || i === 0).slice(0, maxSnippets).map((s) => makeSnippet(r.doc, s.section, query));
               hit = { docId: r.doc.docId, path: r.doc.path, title: r.doc.title, summary: r.doc.summary.slice(0, 120),
                 snippet: hits[0]?.snippet ?? '', hits, score: Math.round(r.score * 100) / 100, coverage: r.coverage,
-                matchedUnits: r.matchedUnits, fallbackUnits: r.fallbackUnits, matchType: r.matchedUnits.length ? 'exact' : 'fallback' };
+                matchedUnits: r.matchedUnits, fallbackUnits: r.fallbackUnits, matchType: r.matchedUnits.length ? 'exact' : 'fallback',
+                ...(browseView ? { knowledgeStatus: this.documentKnowledgeStatus(browseView, r.doc.path) } : {}) };
             }
             return hit;
           };
@@ -913,10 +933,11 @@ export class KbQueryService {
     }
     const hints = !results.length ? queryHints(query, index.vocab) : [];
     if (knowledge?.mode === 'operational' && !results.length) {
-      hints.push('无满足 operational 资格的对象命中（excluded 为原因计数，不自动退回 candidate）。可用 browse 查看候选、get_object 直接读取对象（不受屏蔽），或回源原始库核实。');
+      hints.push('无满足 operational 资格的对象命中（excluded 为原因计数，不自动退回 candidate）。可用 browse 查看候选、get_object 读取状态与证据，或回源核实；业务批准在治理中登记，并于下一次成功发布后进入正式版本。');
     }
     if (asOfMs !== undefined) hints.push(`asOf=${asOf!.normalized} 按业务日期尽力判定（关系 validFrom/validUntil）；对象缺少时间范围标 timeUnknown，不冒充完整 as-of 推理。`);
     const base = { releaseId: release.releaseId, ranker, rankerVersion: ranker, query, total: results.length, unmatchedUnits,
+      ...(!knowledgeActive && !browseView ? { knowledgeStatusWarning: '对象状态不可用；普通检索结果不能据此认定为已批准规则。' } : {}),
       ...(knowledgeActive && asOfMs !== undefined ? { asOf: asOf!.normalized } : {}),
       ...(unmatchedUnits.length ? { warning: '部分完整关键词在当前检索范围内未命中；回退片段仅供改写查询参考，不代表已覆盖所问主题。' } : {}),
       ...(!results.length || hints.length ? { hint: hints } : {}),
@@ -1008,6 +1029,19 @@ export class KbQueryService {
     if (sectionName !== undefined && !sectionName.length) invalid('section');
     const section = sectionName ? resolveAnchor(doc.sections, sectionName) : undefined;
     const range = section ? sectionRange(doc.sections, section, doc.lines.length) : { start: 1, end: doc.lines.length };
+    let view: KbKnowledgeIndex | null = null;
+    try { view = this.knowledgeView(release); } catch { /* Text remains readable even if optional organization is damaged. */ }
+    if (section && view) {
+      const objectAnchor = (line: string | undefined) => /^\s*<a\s+id=["'](ko_[^"']+)["']\s*><\/a>\s*$/.exec(line ?? '')?.[1];
+      const beforeId = objectAnchor(doc.lines[range.start - 2]);
+      const before = beforeId ? view.objectsById.get(beforeId) : undefined;
+      if (before?.canonical?.path === doc.path && before.canonical.bodyRange.startLine === range.start - 1
+        && before.canonical.bodyRange.endLine >= range.start) range.start--;
+      const trailingId = objectAnchor(doc.lines[range.end - 1]);
+      const trailing = trailingId ? view.objectsById.get(trailingId) : undefined;
+      if (trailing?.canonical?.path === doc.path && trailing.canonical.bodyRange.startLine === range.end
+        && /^#{2,3}\s/.test(doc.lines[range.end] ?? '')) range.end--;
+    }
     const start = range.start + startLine - 1;
     if (start > range.end) invalid('startLine', '行号超出目标文档或章节');
     const sources = includeSources ? this.sourcesText(release.manifest, doc) : '';
@@ -1015,7 +1049,11 @@ export class KbQueryService {
     let text = '', continuation: number|null = null;
     for (;;) {
       continuation = end < range.end ? end - range.start + 2 : null;
-      text = frame(doc, release.releaseId, start, end, true, section?.headingPath) + sources + (continuation ? `next: startLine=${continuation} releaseId=${release.releaseId}\n` : '');
+      const matching = (view?.objectsByDoc.get(doc.path) ?? []).filter((object) => object.canonical
+        && object.canonical.bodyRange.startLine <= end && object.canonical.bodyRange.endLine >= start);
+      const status = matching.length ? `knowledge_status: ${matching.slice(0, 3).map((object) => `${object.objectId} business=${object.businessStatus} review=${object.reviewStatus} evidence=${view!.evidenceByObject.get(object.objectId)?.length ?? 0}`).join('; ')}${matching.length > 3 ? `; 另有 ${matching.length - 3} 个对象` : ''}。业务未批准或缺少证据时需核对，详见 get_object。\n`
+        : view ? 'knowledge_status: 本页未关联知识对象，不能据此判断业务批准状态。\n' : 'knowledge_status: 对象状态不可用，请回源核对。\n';
+      text = frame(doc, release.releaseId, start, end, true, section?.headingPath) + sources + status + (continuation ? `next: startLine=${continuation} releaseId=${release.releaseId}\n` : '');
       if (text.length <= budget) break;
       if (--end < start) invalid('maxChars', '预算不足以容纳一行及文档帧');
     }

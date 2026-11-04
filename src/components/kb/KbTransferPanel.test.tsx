@@ -54,3 +54,18 @@ it('blocks import while a build is running but still permits export of the forma
   expect(button('校验并导入').disabled).toBe(true);
   expect(button('导出标准库').disabled).toBe(false);
 });
+
+it('carries the native save confirmation to the export API', async () => {
+  api.exportPortableKb.mockResolvedValue({ ...preview, path: '/tmp/share.fskb' });
+  await act(async () => root.render(<KbTransferPanel releaseId="r_local" activeBuild={false} onChanged={vi.fn()} />));
+  await act(async () => button('导出标准库').dispatchEvent(new MouseEvent('click', { bubbles: true })));
+  expect(api.exportPortableKb).toHaveBeenCalledWith('/tmp/share.fskb', { overwrite: true });
+  expect(host.textContent).toContain('在文件夹中查看共享包');
+});
+
+it('does not export when the native save or replacement dialog is cancelled', async () => {
+  vi.mocked(window.desktop!.chooseKbExportPath).mockResolvedValue(null);
+  await act(async () => root.render(<KbTransferPanel releaseId="r_local" activeBuild={false} onChanged={vi.fn()} />));
+  await act(async () => button('导出标准库').dispatchEvent(new MouseEvent('click', { bubbles: true })));
+  expect(api.exportPortableKb).not.toHaveBeenCalled();
+});

@@ -39,7 +39,8 @@ export function KbTransferPanel({ releaseId, activeBuild, onChanged }: Props) {
     if (!path) return;
     setBusy('export'); setError(null); setExportedPath(null);
     try {
-      const result = await exportPortableKb(path);
+      // A returned native SaveDialog path includes its replacement confirmation.
+      const result = await exportPortableKb(path, { overwrite: true });
       setExportedPath(result.path);
       pushToast({ type: 'success', message: `标准库已导出：${result.docCount} 篇文档` });
     } catch (cause) { setError(messageOf(cause)); }

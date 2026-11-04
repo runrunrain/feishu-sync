@@ -417,6 +417,7 @@ ipcMain.handle('desktop:choose-kb-export-path', async (event, suggestedName: unk
     title: '导出标准库共享包',
     defaultPath: path.join(app.getPath('downloads'), safeName),
     filters: [{ name: 'Feishu Sync 标准库共享包', extensions: ['fskb'] }],
+    properties: ['showOverwriteConfirmation'],
   });
   return result.canceled ? null : result.filePath ?? null;
 });

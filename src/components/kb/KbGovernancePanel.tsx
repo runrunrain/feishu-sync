@@ -1,5 +1,5 @@
 /** Human decisions and content reviews for the published knowledge library. */
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, Check, Loader2, RefreshCw, X } from 'lucide-react';
 import { Button } from '../common/Button';
 import {
@@ -56,6 +56,9 @@ export function KbGovernancePanel({ onOpenDoc }: { onOpenDoc?: (path: string, an
   const [actionLimit, setActionLimit] = useState(PAGE_SIZE);
   const [objectQuery, setObjectQuery] = useState('');
   const [objectLimit, setObjectLimit] = useState(PAGE_SIZE);
+  const [selectedObjects, setSelectedObjects] = useState<string[]>([]);
+  const [batchRationale, setBatchRationale] = useState('');
+  const batchRunning = useRef(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -115,7 +118,7 @@ export function KbGovernancePanel({ onOpenDoc }: { onOpenDoc?: (path: string, an
   const candidates = pending?.candidates ?? [];
   const stale = pending?.staleDecisions ?? [];
   const governable = pending?.governable ?? [...new Map([...candidates, ...stale].map((object) => [object.objectId, object])).values()];
-  const alertObjects = useMemo(() => [...new Map([...candidates, ...stale].map((object) => [object.objectId, object])).values()], [candidates, stale]);
+  const alertObjects = useMemo(() => [...new Map([...(pending?.candidates ?? []), ...(pending?.staleDecisions ?? [])].map((object) => [object.objectId, object])).values()], [pending]);
   const alertIds = new Set(alertObjects.map((object) => object.objectId));
   const reviewProblems = rejectedReviews.filter((object) => !alertIds.has(object.objectId));
   const filterObjects = (items: KbGovernancePendingObjectDto[], query: string) => {
@@ -123,6 +126,43 @@ export function KbGovernancePanel({ onOpenDoc }: { onOpenDoc?: (path: string, an
     return normalized ? items.filter((object) => `${object.title} ${object.objectId} ${object.docPath ?? ''} ${object.scopeKey}`.toLocaleLowerCase().includes(normalized)) : items;
   };
   const matchingObjects = objectQuery.trim() ? filterObjects(governable, objectQuery) : [];
+  const eligibleForBatch = (object: KbGovernancePendingObjectDto) =>
+    (object.businessStatus === 'unknown' || object.businessStatus === 'candidate')
+    && object.reviewStatus === 'passed' && !object.reviewRejection && !object.effectiveDecision
+    && object.allowedDecisionTargets.includes('approved');
+  const visibleBatchObjects = matchingObjects.slice(0, objectLimit).filter(eligibleForBatch);
+
+  const submitBatch = async () => {
+    if (batchRunning.current) return;
+    const chosen = matchingObjects.filter((object) => selectedObjects.includes(object.objectId) && eligibleForBatch(object));
+    if (!chosen.length) { setNotice('请先选择要批准的对象。'); return; }
+    if (!batchRationale.trim()) { setNotice('批量批准需要填写共同的核对依据。'); return; }
+    batchRunning.current = true; setBusy('batch'); setNotice(null);
+    let completed = 0;
+    try {
+      const [fresh, decisions] = await Promise.all([getKbGovernancePending(), listKbGovernanceDecisions()]);
+      if (fresh.releaseId !== pending?.releaseId) throw new Error('正式版本已变化，请重新核对所选对象。');
+      const current = new Map((fresh.governable ?? []).map((object) => [object.objectId, object]));
+      if (chosen.some((object) => {
+        const item = current.get(object.objectId);
+        return !item || !eligibleForBatch(item) || item.payloadHash !== object.payloadHash || item.scopeKey !== object.scopeKey;
+      })) throw new Error('所选对象或其状态已变化，请刷新后重新核对。');
+      let nextRevision = decisions.revision;
+      for (const object of chosen) {
+        const result = await submitKbGovernanceDecision({ objectId: object.objectId, payloadHash: object.payloadHash, scopeKey: object.scopeKey,
+          businessStatus: 'approved', rationale: batchRationale.trim(), expectedRevision: nextRevision });
+        nextRevision = result.revision;
+        completed++;
+      }
+      setSelectedObjects([]); setBatchRationale('');
+      await load();
+      setNotice(`已登记 ${completed} 项业务批准；决定将在下一次成功发布后生效。高风险内容的人工复核仍按各自要求处理。`);
+    } catch (err) {
+      await load();
+      setSelectedObjects([]);
+      setNotice(`已登记 ${completed}/${chosen.length} 项，后续项目未提交。${err instanceof Error ? err.message : '请刷新后重试。'}`);
+    } finally { batchRunning.current = false; setBusy(null); }
+  };
 
   const reviewControls = (object: KbGovernancePendingObjectDto) => <div className="space-y-2 border-t border-line/70 pt-2">
     <p className="text-ink-soft leading-relaxed">{object.reviewRejection
@@ -132,8 +172,8 @@ export function KbGovernancePanel({ onOpenDoc }: { onOpenDoc?: (path: string, an
     <textarea className="w-full rounded border border-line bg-card-bg px-2 py-1.5 text-xs text-ink min-h-[42px]" aria-label={`复核说明 ${object.objectId}`} placeholder="复核说明；拒绝时必填具体问题"
       value={reviewNotes[object.objectId] ?? ''} onChange={(event) => setReviewNotes((prev) => ({ ...prev, [object.objectId]: event.target.value }))} />
     <div className="flex gap-2">
-      <Button size="sm" disabled={busy === object.objectId} onClick={() => void submitReview(object, true)}>{busy === object.objectId ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}复核通过</Button>
-      <Button size="sm" variant="secondary" disabled={busy === object.objectId} onClick={() => void submitReview(object, false)}><X className="w-3.5 h-3.5" />复核拒绝</Button>
+      <Button size="sm" disabled={busy !== null} onClick={() => void submitReview(object, true)}>{busy === object.objectId ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}复核通过</Button>
+      <Button size="sm" variant="secondary" disabled={busy !== null} onClick={() => void submitReview(object, false)}><X className="w-3.5 h-3.5" />复核拒绝</Button>
     </div>
   </div>;
 
@@ -154,7 +194,7 @@ export function KbGovernancePanel({ onOpenDoc }: { onOpenDoc?: (path: string, an
       <p className="text-[10px] text-ink-faint">{decisionEffect(draft.target)}当前正式版不变。{object.highRiskClaims.length && draft.target === 'approved' && !object.humanReviewed ? '此对象还有高风险断言，发布前需完成人工复核。' : ''}</p>
       <textarea className="w-full rounded border border-line bg-card-bg px-2 py-1.5 text-xs text-ink min-h-[48px]" placeholder="决定依据（必填）：说明为何批准或停用" aria-label={`决定理由 ${object.objectId}`}
         value={draft.rationale} onChange={(event) => setDrafts((prev) => ({ ...prev, [object.objectId]: { ...draft, rationale: event.target.value } }))} />
-      <Button size="sm" disabled={busy === object.objectId || object.allowedDecisionTargets.length === 0} onClick={() => void submitDecision(object)}>
+      <Button size="sm" disabled={busy !== null || object.allowedDecisionTargets.length === 0} onClick={() => void submitDecision(object)}>
         {busy === object.objectId ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null}提交决定
       </Button>
     </div>;
@@ -183,11 +223,21 @@ export function KbGovernancePanel({ onOpenDoc }: { onOpenDoc?: (path: string, an
     <section className="space-y-2 border-t border-line pt-3" data-testid="kb-gov-decisions">
       <h4 className="font-medium text-ink">查找其他对象</h4>
       <p className="text-[11px] text-ink-faint">需要主动批准、停用或恢复某项规则时，在 {governable.length} 个正式对象中搜索。未搜索时不展开全部对象。</p>
-      <input className="w-full rounded border border-line bg-card-bg px-2 py-1.5 text-xs text-ink" aria-label="查找治理对象" placeholder="输入标题、文档路径或对象编号" value={objectQuery}
-        onChange={(event) => { setObjectQuery(event.target.value); setObjectLimit(PAGE_SIZE); }} />
+      <input className="w-full rounded border border-line bg-card-bg px-2 py-1.5 text-xs text-ink" aria-label="查找治理对象" placeholder="输入标题、文档路径或对象编号" value={objectQuery} disabled={busy === 'batch'}
+        onChange={(event) => { setObjectQuery(event.target.value); setObjectLimit(PAGE_SIZE); setSelectedObjects([]); }} />
       {objectQuery.trim() ? <>
         <p className="text-[10px] text-ink-faint">匹配 {matchingObjects.length} 项，当前显示 {Math.min(matchingObjects.length, objectLimit)} 项</p>
+        {visibleBatchObjects.length ? <div className="rounded border border-line bg-paper px-3 py-2 space-y-2">
+          <p>核对正文与来源后，可批量批准本次选中的对象。业务批准与人工内容复核分别记录，决定在下一次成功发布后生效。</p>
+          <Button size="sm" variant="secondary" disabled={busy !== null} onClick={() => setSelectedObjects((current) => [...new Set([...current, ...visibleBatchObjects.map((object) => object.objectId)])])}>选择当前显示的可批准对象</Button>
+          <span className="ml-2">已选 {selectedObjects.length} 项</span>
+          {selectedObjects.length ? <>
+            <textarea className="w-full rounded border border-line bg-card-bg px-2 py-1.5 text-xs text-ink min-h-[48px]" aria-label="批量批准依据" placeholder="填写已核对所选内容的共同依据" value={batchRationale} disabled={busy !== null} onChange={(event) => setBatchRationale(event.target.value)} />
+            <Button size="sm" disabled={busy !== null} onClick={() => void submitBatch()}>批准所选 {selectedObjects.length} 项</Button>
+          </> : null}
+        </div> : null}
         <ul className="space-y-2">{matchingObjects.slice(0, objectLimit).map((object) => <ObjectRow key={object.objectId} object={object} onOpenDoc={onOpenDoc}>
+          {eligibleForBatch(object) ? <label className="flex items-center gap-1.5"><input type="checkbox" aria-label={`选择批准 ${object.title || object.objectId}`} disabled={busy !== null} checked={selectedObjects.includes(object.objectId)} onChange={(event) => { const checked = event.target.checked; setSelectedObjects((current) => checked ? [...new Set([...current, object.objectId])] : current.filter((id) => id !== object.objectId)); }} />选择此对象</label> : null}
           {object.reviewRejection || (object.highRiskClaims.length && !object.humanReviewed && draftOf(object).target === 'approved') ? reviewControls(object) : null}{decisionControls(object)}
         </ObjectRow>)}</ul>
         {matchingObjects.length > objectLimit ? <Button size="sm" variant="ghost" onClick={() => setObjectLimit((limit) => limit + PAGE_SIZE)}>再显示 {Math.min(PAGE_SIZE, matchingObjects.length - objectLimit)} 项</Button> : null}

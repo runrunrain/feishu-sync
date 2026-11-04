@@ -298,12 +298,7 @@ export const AgentComposer = forwardRef<AgentComposerHandle, AgentComposerProps>
         </div>
         {approvalError && <p role="alert" className="mt-1 text-xs text-seal-2">{approvalError}</p>}
         {attachmentError && <p role="alert" className="mt-1 text-xs text-seal-2">{attachmentError}</p>}
-        <p className="mt-1 text-[10px] text-ink-faint">支持拖拽文件、粘贴图片；每条最多 10 个附件、合计 20 MB。图片上限 5 MB，需要当前模型支持视觉。</p>
-        {session?.mode === 'work' && <p className="mt-1 text-[10px] text-ink-faint">审批方式控制应用命令；免审批允许本会话直接执行写入、删除和云端写操作。重启应用后恢复逐次审批。</p>}
-        <p className="mt-1.5 text-[10px] text-ink-faint">
-          {text.length > MAX_TEXT * 0.8 ? `${text.length}/${MAX_TEXT} 字符 · ` : ''}
-          应用自带工具：Discuss 只读；Work 仅可写绑定 Workspace，无 shell。{session?.backend === 'claude-code' ? 'Claude Code 不加载 Pi 专用扩展。' : '第三方 Pi 插件按其自身能力运行。'}
-        </p>
+        {text.length > MAX_TEXT * 0.8 ? <p className="mt-1 text-[10px] text-ink-faint">{text.length}/{MAX_TEXT} 字符</p> : null}
       </div>
     </div>
   );

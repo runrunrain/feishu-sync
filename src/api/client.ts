@@ -1156,8 +1156,8 @@ export interface PortableKbPreview {
 export function previewPortableKb(path: string): Promise<PortableKbPreview> {
   return request('/api/kb/portable/preview', { method: 'POST', body: JSON.stringify({ path }) });
 }
-export function exportPortableKb(path: string): Promise<PortableKbPreview & { path: string }> {
-  return request('/api/kb/portable/export', { method: 'POST', body: JSON.stringify({ path }) });
+export function exportPortableKb(path: string, options: { overwrite?: boolean } = {}): Promise<PortableKbPreview & { path: string }> {
+  return request('/api/kb/portable/export', { method: 'POST', body: JSON.stringify({ path, ...options }) });
 }
 export function importPortableKb(path: string, expectedCurrentReleaseId: string | null): Promise<PortableKbPreview & { previousReleaseId: string | null }> {
   return request('/api/kb/portable/import', {

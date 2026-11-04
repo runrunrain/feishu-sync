@@ -1,8 +1,10 @@
 # 在可信内网共享标准知识库
 
-本机 stdio MCP 和内网 MCP 使用相同的 17 个只读工具，查询相同的已发布标准库及已同步原始库。原始库通过 `raw_list` 浏览目录路径、`raw_search` 检索、`raw_read` 阅读，包含未参与标准库构建的源文档及已登记 CSV 附件，不需要先发布标准库。不提供 Workspace 写入、应用命令或会话操作。
+本机 stdio MCP 和内网 MCP 使用相同的 20 个只读工具，查询相同的已发布标准库及已同步原始库。`search_all_knowledge` 分别检索两类来源；原始库也可通过 `raw_list` 浏览目录、`raw_search` 检索、`raw_read` 阅读，不需要先发布标准库。不提供 Workspace 写入、应用命令或会话操作。
 
-Excel 原件和只读重建的工作簿可用 `raw_list_sheets` 列工作表、`raw_search_sheet` 检索单元格、`raw_read_sheet` 按工作表和行列范围读取。结果包含单元格坐标、格式化文本以及存在时的公式、超链接和合并关系；公式使用文件中的缓存值，不会重新计算。未取得或未纳管 Excel 的旧文档仍可通过 `raw_read` 阅读现有 Markdown/CSV。图表、透视表和形状不是单元格，不能保证由单元格查询还原。
+Excel 原件和只读重建的工作簿可用 `raw_list_sheets` 列工作表、`raw_search_sheet` 检索单元格、`raw_read_sheet` 按工作表和行列范围读取。默认返回有效主格与 `mergeRange`；请求范围只包含合并从属格时会带回范围外主格，显式设置 `includeMergedFollowers=true` 可取得从属格。公式使用缓存值，不会重新计算。对于已知的空共享字符串前缀兼容问题，读取时只在内存中修正，文件和内容哈希不变。未取得或未纳管 Excel 的旧文档仍可通过 `raw_read` 阅读现有 Markdown/CSV；图表、透视表和形状不能保证由单元格还原。
+
+`raw_read` 的 `sourceSegments` 把拼接后的虚拟行号映射到原 Markdown 或 CSV 的物理行号；CSV 的物理行与记录号可能不同。权限受限占位文档带 `sourceAvailability` 与 `usableAsEvidence=false`，不应当作实际源文档内容。
 
 `raw_search_images` 检索文档引用和工作簿内嵌图片的文件名、工作表、替代文字和已有识图缓存；按 `nextOffset` 翻完当前批后，用 `nextSourceOffset` 扫描下一批源文档。未识图的图片无法按视觉内容检索。`raw_list_images` 同时列出指定文档引用的本地图片与其工作簿内嵌图片，`raw_read_image` 返回图片内容及已有缓存描述。不会自动调用模型；图片原图超过 4 MiB 时可用 `includeImage=false` 读取不超过 20 MiB 图片的已有描述，支持 PNG、JPEG、GIF 和 WebP，其他格式会说明不可用。
 

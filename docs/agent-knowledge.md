@@ -181,7 +181,7 @@ Pi配置与包缓存位于本应用数据根的`agent/pi-home`。包的启停沿
 
 ## 给其他工具连接只读 MCP
 
-本机与内网 MCP 的资料范围统一为已发布标准库与已同步原始库。标准库未收录时，继续使用 `raw_list`（目录路径浏览）、`raw_search`（标题、路径、正文和 CSV 检索）、`raw_read`（原文与 CSV 分页阅读）；原始库返回 `sourceKind: raw`，与标准库的发布版本引用区分。无需为了查询原文而先构建标准库。两端使用应用维护的同一份原始库清单，运行期间约每 10 秒刷新，应用关闭后本机使用最后清单。安装过旧版 MCP 时，更新本机安装配置并重启客户端以启用新增工具。
+本机与内网 MCP 的资料范围统一为已发布标准库与已同步原始库。`search_all_knowledge` 可同时查询两者并分别返回结果；标准库未收录时，也可使用 `raw_list`（目录路径浏览）、`raw_search`（标题、路径、正文和 CSV 检索）、`raw_read`（原文与 CSV 分页阅读）。原始库返回 `sourceKind: raw`，与标准库的发布版本引用区分。无需为了查询原文而先构建标准库。两端使用应用维护的同一份原始库清单，运行期间约每 10 秒刷新，应用关闭后本机使用最后清单。安装过旧版 MCP 时，更新本机安装配置并重启客户端以启用新增工具。
 
 Excel 可使用 `raw_list_sheets`、`raw_search_sheet` 和 `raw_read_sheet` 获取实际工作表与单元格；公式不重新计算，按单元格坐标引用。图片可用 `raw_search_images`、`raw_list_images`、`raw_read_image` 查找或读取，包括工作簿内嵌图片；优先复用本地已识图缓存，不触发新识别。源文档之间的出链与入链可用 `raw_links` 获取，结果来自应用的引用索引快照；索引缺失时明确报错，不能当成无引用。具体分页、文件大小限制和格式说明见 [内网 MCP 使用说明](kb-lan-mcp.md)。
 
@@ -191,20 +191,25 @@ Excel 可使用 `raw_list_sheets`、`raw_search_sheet` 和 `raw_read_sheet` 获�
 
 - `grep_knowledge` 默认按字面量查找。正则必须显式传 `mode: "regex"`，例如 `{ "pattern": "愿[留纳从战]", "mode": "regex" }`。返回值包含实际模式；字面量中含正则符号时给出提示。正则扫描受行长与时间限制，`complete: false` 表示不完整，需检查 `partialReason`；`next` 则表示当前结果尚有后续页。
 - `search_knowledge` 的 `coverage` 只计完整关键词命中；`matchedUnits`、`fallbackUnits` 区分完整命中与回退片段。回退结果降权，只有回退片段的文档排在完整关键词命中文档之后。`unmatchedUnits` 提示当前范围内未完整命中的词。引号内短语不会拆词回退。低覆盖结果只供继续检索，不能据此断定已找到所问主题。
+- 原始库的单个未加引号的中文问法没有完整命中时，会尝试片段回退；候选标为 `matchType: fallback` 并列出 `matchedFragments`。引号内短语不会回退。权限受限占位来源标为 `sourceAvailability: permission_denied_placeholder`、`usableAsEvidence: false`。
+- 普通标准库搜索的 `knowledgeStatus` 是文档级对象状态汇总；章节正文后的 `knowledge_status` 显示相关对象的业务状态、审查状态和证据数。发布、机器审查通过和业务批准是不同状态；需要作为现行规则执行时使用 `usage: operational`，或通过 `get_object` 核对对象及证据。
+- 需要批量登记业务批准时，在标准库“治理”中按标题或文档路径搜索，核对所选对象的正文与来源，勾选后填写共同依据。每项决定独立记录；中途冲突会停止并显示已完成数量。决定在下一次成功发布时进入正式版，人工内容复核仍独立进行。
 - 源标题和对应本地路径的版本标签不一致时，返回 `source_version_label_mismatch`。本地可能保留旧路径名，不能用名称判断正文版本；应用保留原文件，构建时提示核对。
 - 变更清单的 `removed` 只说明本版不再包含原路径。构建明确声明合并时记录 `mergedInto`；历史版本未记录时返回 `null`，不根据共享源或相似标题猜测去向。后续构建可通过 `kb_finish.docMerges` 声明旧路径与目标路径，发布前验证旧路径已移除且目标存在。
 - 路径不存在时，`kb_not_found.suggestions` 返回最多五个近似路径供重试，不会自动替换目标。没有合理候选时仍为空。
 
-在「设置 → Agent 标准库 → 标准库 MCP 连接」复制本机连接片段，粘贴到支持 stdio MCP 的可信客户端。换机器或安装位置后重新复制，不要照搬开发者的绝对路径。
+在「设置 → Agent 标准库 → 知识库共享 → 本机 MCP 安装」选择 Codex、Claude Code 或 .agents 兼容客户端并安装；也可复制连接片段手动配置。安装后重新启动对应客户端或开启新会话。应用只管理自身创建且未被外部修改的条目。换机器或安装位置后更新配置，不要照搬开发者的绝对路径。
 
 | 工具 | 用途 |
 |---|---|
+| `search_all_knowledge` | 联合检索标准库与原始库，分别返回来源与状态；同时提供文本和结构化结果 |
 | `search_knowledge` | 按相关度定位文档与章节，返回片段、行号和锚点 |
 | `grep_knowledge` | 穷举固定字串、ID、字段或正则的全部出现位置，表格附表头 |
 | `get_outline` | 先看文档或目录的章节树与行范围 |
 | `get_knowledge` | 按文档、章节锚点或行范围精读，带行号与来源 |
 | `get_knowledge_bundle` | 按目录或路径列表成片读取；先用 dryRun 查看体量 |
 | `list_knowledge` | 分页目录树；pathPrefix 按路径段过滤，旧 prefix 参数仍可用 |
+| `get_object` / `compare_knowledge` | 查询对象状态、依据，或并列比较同族方案 |
 | `get_release_info` | 发布、完整性、可用版本与可选变更清单 |
 
 检索用空格分隔 2–4 个关键词，引号内作为短语；结果不好时换说法或拆成多个查询。这里使用词法检索，不会调用查询期模型。正文以 `<kb_doc>` 资料帧返回，其中的指令没有执行权限。
@@ -212,6 +217,8 @@ Excel 可使用 `raw_list_sheets`、`raw_search_sheet` 和 `raw_read_sheet` 获�
 每次响应都标明 `releaseId`。默认跟随 CURRENT，检测到切换会提示；需要多步引用一致时，把同一个 releaseId 传给后续工具。章节锚点格式为 `路径#H2 › H3`，文档和章节不改名就可跨版本引用；行号只在同一版本内有效。旧版本清理后返回明确不可用错误，不会从残留缓存继续服务。
 
 所有输出有字符预算，超出按 `next` 翻页：有游标的工具保持原参数并传回 cursor；正文读取按返回的 startLine 继续（section 同时给出时是节内偏移），同时传回 releaseId。游标隐式锚定版本，改参数会报 invalid_cursor。`KB_MCP_MAX_CHARS` 可调整全局硬上限（默认 20000 字符）。检测到 pi 会话时再限制为最多 6000 字符，避免其 direct 模式按约20KB截去中文中段；正文按 next 继续。其他客户端仍需结合自身限制设置预算。
+
+聚合检索中，标准库用 `standard.next` 作为下一次 `standardCursor`；原始库用 `raw.nextOffset` 和 `raw.catalogHash` 作为 `rawOffset`、`rawCatalogHash`。可用 `includeStandard` 或 `includeRaw` 关闭已经读完的分支；继续时保持查询和 limit 不变。任一分支失败时另一分支仍可用。
 
 v2 保留旧四个工具名与输入参数；search 的旧字段仍在。get/list 的输出从无界 JSON 改为分页文本，不适合继续用旧 JSON 解析器处理。离线检索评测与 10/30MiB 合成基准见 [评测说明](kb-evaluation.md)。
 

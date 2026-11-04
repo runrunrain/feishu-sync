@@ -5,9 +5,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { applyEdits, findNodeAtLocation, modify, parseTree, type Node as JsonNode } from 'jsonc-parser';
+import { parse as parseToml } from 'smol-toml';
 import type { KbMcpInfoDto } from '../types/agent-knowledge.js';
 
-export type McpClientTarget = 'agents' | 'claude';
+export type McpClientTarget = 'agents' | 'claude' | 'codex';
 export type McpInstallState = 'not_installed' | 'installed' | 'needs_update' | 'conflict' | 'modified' | 'invalid';
 export interface McpInstallStatus { target: McpClientTarget; path: string; state: McpInstallState; message?: string }
 type OwnedEntry = { path: string; digest: string; createdServers: boolean; installId: string };
@@ -130,6 +131,56 @@ function patchConfig(text: string, entry: unknown, removeContainer = false): str
   return changed;
 }
 
+function parseCodex(before: Snapshot): { text: string; servers: Record<string, unknown> } {
+  const text = before.exists ? before.text : '';
+  let data: unknown;
+  try { data = parseToml(text); } catch { return problem('invalid_config', 'Codex 配置不是有效的 TOML，原文件未修改。'); }
+  if (!object(data) || (data.mcp_servers !== undefined && !object(data.mcp_servers))) {
+    return problem('invalid_config', 'Codex 的 mcp_servers 不是表，原文件未修改。');
+  }
+  return { text, servers: (data.mcp_servers as Record<string, unknown> | undefined) ?? {} };
+}
+
+/** Only the uniquely marked block created by this installer may be changed. */
+function codexBlockRange(text: string, installId: string): { start: number; end: number } | null {
+  const begin = `# feishu-sync-mcp begin ${installId}`;
+  const end = `# feishu-sync-mcp end ${installId}`;
+  const lines = text.split(/(?<=\n)/);
+  let offset = 0, start = -1, finish = -1, begins = 0, ends = 0;
+  for (const line of lines) {
+    const trimmed = line.replace(/\r?\n$/, '');
+    if (trimmed === begin) { begins++; start = offset; }
+    if (trimmed === end) { ends++; finish = offset + line.length; }
+    offset += line.length;
+  }
+  return begins === 1 && ends === 1 && start >= 0 && finish > start ? { start, end: finish } : null;
+}
+
+function codexBlock(entry: Record<string, unknown>, installId: string, newline: string): string {
+  const env = entry.env as Record<string, string>;
+  return [
+    `# feishu-sync-mcp begin ${installId}`,
+    '[mcp_servers."feishu-kb"]',
+    `command = ${JSON.stringify(entry.command)}`,
+    `args = ${JSON.stringify(entry.args)}`,
+    '[mcp_servers."feishu-kb".env]',
+    ...Object.entries(env).map(([key, value]) => `${JSON.stringify(key)} = ${JSON.stringify(value)}`),
+    `# feishu-sync-mcp end ${installId}`,
+    '',
+  ].join(newline);
+}
+
+function patchCodex(text: string, entry: Record<string, unknown> | undefined, installId: string, existing: boolean): string {
+  const range = existing ? codexBlockRange(text, installId) : null;
+  if (existing && !range) return problem('modified', 'Codex 安装标记已被修改，应用不会覆盖或清理。');
+  const newline = text.includes('\r\n') ? '\r\n' : '\n';
+  const block = entry ? codexBlock(entry, installId, newline) : '';
+  const next = range ? text.slice(0, range.start) + block + text.slice(range.end)
+    : text + (text && !text.endsWith('\n') ? newline : '') + block;
+  parseCodex({ exists: true, text: next, mode: 0o600 });
+  return next;
+}
+
 export class McpClientInstaller {
   private readonly home: string;
   private readonly registryFile: string;
@@ -142,7 +193,8 @@ export class McpClientInstaller {
   private targetPath(target: McpClientTarget): string {
     if (target === 'agents') return path.join(this.home, '.agents', '.mcp.json');
     if (target === 'claude') return path.join(this.home, '.claude.json');
-    return problem('invalid_target', '请选择 .agents 或 Claude Code。');
+    if (target === 'codex') return path.join(this.home, '.codex', 'config.toml');
+    return problem('invalid_target', '请选择 .agents、Claude Code 或 Codex。');
   }
   private checkTargetDirectory(target: McpClientTarget, create: boolean): void {
     try {
@@ -151,11 +203,11 @@ export class McpClientInstaller {
       if (error instanceof McpInstallError) throw error;
       return problem('home_unavailable', '用户目录不可用，请检查后重试。');
     }
-    if (target !== 'agents') return;
-    const dir = path.join(this.home, '.agents');
+    if (target === 'claude') return;
+    const dir = path.join(this.home, target === 'agents' ? '.agents' : '.codex');
     try {
       const stat = fs.lstatSync(dir);
-      if (stat.isSymbolicLink() || !stat.isDirectory()) return problem('unsafe_directory', '.agents 不是安全的普通目录，请手动检查。');
+      if (stat.isSymbolicLink() || !stat.isDirectory()) return problem('unsafe_directory', '客户端配置目录不是安全的普通目录，请手动检查。');
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
       if (create) fs.mkdirSync(dir, { mode: 0o700 });
@@ -182,12 +234,13 @@ export class McpClientInstaller {
     const file = this.targetPath(target);
     try {
       this.checkTargetDirectory(target, false);
-      const parsed = parseConfig(snapshot(file));
+      const parsed = target === 'codex' ? parseCodex(snapshot(file)) : parseConfig(snapshot(file));
       const current = parsed.servers[SERVER_NAME];
       if (current === undefined) return { target, path: file, state: 'not_installed' };
       const owned = registry.entries[target];
       if (!owned || owned.path !== file) return { target, path: file, state: 'conflict', message: '已有同名配置，应用不会覆盖或清理。' };
       if (digest(current) !== owned.digest) return { target, path: file, state: 'modified', message: '配置已被其他程序或用户修改，应用不会覆盖或清理。' };
+      if (target === 'codex' && !codexBlockRange(parsed.text, owned.installId)) return { target, path: file, state: 'modified', message: 'Codex 安装标记已被修改，应用不会覆盖或清理。' };
       return { target, path: file, state: digest(current) === digest(this.entry(info, owned.installId)) ? 'installed' : 'needs_update' };
     } catch (error) {
       return { target, path: file, state: 'invalid', message: error instanceof McpInstallError ? error.message : '无法读取配置文件。' };
@@ -196,7 +249,7 @@ export class McpClientInstaller {
   status(): McpInstallStatus[] {
     const { data } = this.registry();
     const info = this.options.info();
-    return (['agents', 'claude'] as const).map((target) => this.inspect(target, data, info));
+    return (['agents', 'claude', 'codex'] as const).map((target) => this.inspect(target, data, info));
   }
   install(target: McpClientTarget): McpInstallStatus {
     const file = this.targetPath(target);
@@ -209,7 +262,7 @@ export class McpClientInstaller {
     }
     this.checkTargetDirectory(target, true);
     const before = snapshot(file);
-    const parsed = parseConfig(before);
+    const parsed = target === 'codex' ? parseCodex(before) : parseConfig(before);
     // Recheck after directory creation so a newly created user entry is never overwritten.
     const present = parsed.servers[SERVER_NAME];
     const owned = registry.data.entries[target];
@@ -217,8 +270,8 @@ export class McpClientInstaller {
     const stillOwned = present !== undefined && owned?.path === file;
     const installId = stillOwned ? owned.installId : crypto.randomUUID();
     const entry = this.entry(info, installId);
-    const nextText = parsed.bom + patchConfig(parsed.text, entry);
-    const next: Registry = { version: 1, entries: { ...registry.data.entries, [target]: { path: file, digest: digest(entry), installId, createdServers: stillOwned ? owned.createdServers : parsed.data.mcpServers === undefined } } };
+    const nextText = target === 'codex' ? patchCodex(parsed.text, entry, installId, stillOwned) : ('bom' in parsed ? parsed.bom : '') + patchConfig(parsed.text, entry);
+    const next: Registry = { version: 1, entries: { ...registry.data.entries, [target]: { path: file, digest: digest(entry), installId, createdServers: stillOwned ? owned.createdServers : target === 'codex' ? false : (parsed as ReturnType<typeof parseConfig>).data.mcpServers === undefined } } };
     this.commit(file, before, nextText, registry.before, next);
     return this.inspect(target, next, info);
   }
@@ -231,13 +284,13 @@ export class McpClientInstaller {
     const owned = registry.data.entries[target];
     if (!owned || owned.path !== file) return state;
     const before = snapshot(file);
-    const parsed = parseConfig(before);
+    const parsed = target === 'codex' ? parseCodex(before) : parseConfig(before);
     const current = parsed.servers[SERVER_NAME];
     if (current !== undefined && digest(current) !== owned.digest) return problem('concurrent_change', '配置刚刚发生变化，请刷新后重试。');
     let nextText = before.text;
     if (current !== undefined) {
       const removeContainer = owned.createdServers && Object.keys(parsed.servers).length === 1;
-      nextText = parsed.bom + patchConfig(parsed.text, undefined, removeContainer);
+      nextText = target === 'codex' ? patchCodex(parsed.text, undefined, owned.installId, true) : ('bom' in parsed ? parsed.bom : '') + patchConfig(parsed.text, undefined, removeContainer);
     }
     const entries = { ...registry.data.entries }; delete entries[target];
     const next: Registry = { version: 1, entries };

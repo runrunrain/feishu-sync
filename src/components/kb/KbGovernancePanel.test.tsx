@@ -155,6 +155,54 @@ it('默认只展示真实待办；高风险无问题不成清单，主动查找�
   expect(decisions?.querySelector('[data-testid="kb-gov-object-ko_objD"]')).not.toBeNull();
 });
 
+it('搜索并人工选择对象后，可用同一依据逐项登记业务批准', async () => {
+  const first = makeObject({ objectId: 'ko_one', title: '规则一', businessStatus: 'unknown', highRiskClaims: [] });
+  const second = makeObject({ objectId: 'ko_two', title: '规则二', businessStatus: 'unknown', highRiskClaims: [] });
+  api.getKbGovernancePending.mockResolvedValue(makePending({}, [first, second]));
+  api.listKbGovernanceDecisions.mockResolvedValue({ records: [], effective: [], revision: 5 });
+  api.submitKbGovernanceDecision.mockResolvedValueOnce({ revision: 6 }).mockResolvedValueOnce({ revision: 7 });
+  await renderPanel();
+  expect(host.querySelector('[aria-label="批量批准依据"]')).toBeNull();
+  await act(async () => { setInputValue(host.querySelector<HTMLInputElement>('input[aria-label="查找治理对象"]')!, '战斗/普攻规则'); });
+  await act(async () => { button('选择当前显示的可批准对象').click(); });
+  expect(host.textContent).toContain('已选 2 项');
+  await act(async () => { button('批准所选').click(); });
+  expect(api.submitKbGovernanceDecision).not.toHaveBeenCalled();
+  await act(async () => { setTextareaValue(host.querySelector<HTMLTextAreaElement>('textarea[aria-label="批量批准依据"]')!, '已核对这两项正文与来源。'); });
+  await act(async () => { button('批准所选').click(); });
+  expect(api.submitKbGovernanceDecision).toHaveBeenNthCalledWith(1, expect.objectContaining({ objectId: 'ko_one', businessStatus: 'approved', expectedRevision: 5 }));
+  expect(api.submitKbGovernanceDecision).toHaveBeenNthCalledWith(2, expect.objectContaining({ objectId: 'ko_two', businessStatus: 'approved', expectedRevision: 6 }));
+  expect(host.querySelector('[data-testid="kb-gov-notice"]')?.textContent).toContain('已登记 2 项业务批准');
+  expect(host.querySelector('[data-testid="kb-gov-notice"]')?.textContent).toContain('下一次成功发布');
+});
+
+it('批量批准中途发生冲突时停止并报告已完成数量', async () => {
+  const first = makeObject({ objectId: 'ko_one', title: '规则一', businessStatus: 'unknown', highRiskClaims: [] });
+  const second = makeObject({ objectId: 'ko_two', title: '规则二', businessStatus: 'unknown', highRiskClaims: [] });
+  api.getKbGovernancePending.mockResolvedValue(makePending({}, [first, second]));
+  api.submitKbGovernanceDecision.mockResolvedValueOnce({ revision: 1 }).mockRejectedValueOnce(new APIError('版本冲突', 409));
+  await renderPanel();
+  await act(async () => { setInputValue(host.querySelector<HTMLInputElement>('input[aria-label="查找治理对象"]')!, '战斗/普攻规则'); });
+  await act(async () => { button('选择当前显示的可批准对象').click(); });
+  await act(async () => { setTextareaValue(host.querySelector<HTMLTextAreaElement>('textarea[aria-label="批量批准依据"]')!, '已核对正文和来源。'); });
+  await act(async () => { button('批准所选').click(); });
+  expect(api.submitKbGovernanceDecision).toHaveBeenCalledTimes(2);
+  expect(host.querySelector('[data-testid="kb-gov-notice"]')?.textContent).toContain('已登记 1/2 项，后续项目未提交');
+});
+
+it('批量批准前发现正式版本变化时不提交决定', async () => {
+  const object = makeObject({ objectId: 'ko_one', title: '规则一', businessStatus: 'unknown', highRiskClaims: [] });
+  api.getKbGovernancePending.mockResolvedValueOnce(makePending({}, [object]))
+    .mockResolvedValue(makePending({ releaseId: 'r_new' }, [object]));
+  await renderPanel();
+  await act(async () => { setInputValue(host.querySelector<HTMLInputElement>('input[aria-label="查找治理对象"]')!, '战斗/普攻规则'); });
+  await act(async () => { button('选择当前显示的可批准对象').click(); });
+  await act(async () => { setTextareaValue(host.querySelector<HTMLTextAreaElement>('textarea[aria-label="批量批准依据"]')!, '已核对正文和来源。'); });
+  await act(async () => { button('批准所选').click(); });
+  expect(api.submitKbGovernanceDecision).not.toHaveBeenCalled();
+  expect(host.querySelector('[data-testid="kb-gov-notice"]')?.textContent).toContain('正式版本已变化');
+});
+
 it('人工复核提交：通过按钮绑定 objectId + reviewSubjectHash，成功后刷新', async () => {
   const rejected = makeObject({ reviewRejection: '正文数值与来源不一致。' });
   api.getKbGovernancePending.mockResolvedValue(makePending({ highRisk: [rejected] }, [rejected]));

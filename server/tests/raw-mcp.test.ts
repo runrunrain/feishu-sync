@@ -14,6 +14,7 @@ import { createHttpGateway } from '../src/kb-lan/http-gateway.js';
 import { tokenDigest } from '../src/kb-lan/token-store.js';
 import { AgentToolService } from '../src/agent/agent-tool-service.js';
 import type { DocumentRecord } from '../src/types/index.js';
+import { writeSearchRelease } from './helpers/kb-search-fixture.js';
 
 let root: string, raw: string, catalog: string, records: DocumentRecord[];
 beforeAll(async () => { const { bundleMcp } = await import('../scripts/lib/mcp-bundle.mjs'); await bundleMcp(); });
@@ -31,7 +32,7 @@ it('old app-owned stdio entries gain raw tools, but unrelated standard roots do 
   const standard = path.join(root, 'standard');
   fs.writeFileSync(path.join(root, 'config.json'), JSON.stringify({ standardKb: { outputRoot: standard } }));
   writeRawCatalog(path.join(root, 'mcp/raw-catalog.json'), raw, records, () => []);
-  for (const [kbRoot, count] of [[standard, 19], [path.join(root, 'unrelated'), 9]] as const) {
+  for (const [kbRoot, count] of [[standard, 20], [path.join(root, 'unrelated'), 9]] as const) {
     const client = new Client({ name: 'legacy-config', version: '1' });
     try {
       await client.connect(new StdioClientTransport({ command: process.execPath, args: [path.resolve('dist/mcp/kb-mcp.cjs'), '--kb-root', kbRoot],
@@ -39,6 +40,20 @@ it('old app-owned stdio entries gain raw tools, but unrelated standard roots do 
       expect((await client.listTools()).tools).toHaveLength(count);
     } finally { await client.close(); }
   }
+});
+
+it('returns labelled fragment candidates only when an unquoted exact raw search has no match', async () => {
+  add('战斗规则.md', '战斗中由任务看板分发任务。');
+  add('农业规则.md', '农业生产。'); publish();
+  const fallback: any = await query().call('raw_search', { query: '战斗任务' }, 6000);
+  expect(fallback.results).toEqual([expect.objectContaining({ objToken: 't0', matchType: 'fallback', matchedFragments: expect.arrayContaining(['战斗', '任务']) })]);
+  expect(fallback.warning).toContain('不能视为完整命中');
+  const phrase: any = await query().call('raw_search', { query: '"战斗任务"' }, 6000);
+  expect(phrase.total).toBe(0);
+  add('直接命中.md', '战斗任务是一个明确术语。'); publish();
+  const exact: any = await query().call('raw_search', { query: '战斗任务' }, 6000);
+  expect(exact.results).toHaveLength(1); expect(exact.results[0].objToken).toBe('t2');
+  expect(exact.results[0]).not.toHaveProperty('matchType');
 });
 
 it('uses app candidates, skips trash/unsynced, reads retained local files despite current cloud permission errors', async () => {
@@ -49,6 +64,19 @@ it('uses app candidates, skips trash/unsynced, reads retained local files despit
   expect(await query().call('raw_read', { objToken: 't0' }, 6000)).toMatchObject({ lines: [{ line: 1, text: '100 是概念层' }] });
   fs.unlinkSync(path.join(raw, '100/设计.md'));
   expect(await query().call('raw_list', {}, 6000)).toMatchObject({ total: 0 });
+});
+
+it('marks a permission placeholder as unusable evidence across list, search and read', async () => {
+  add('受限.md', '# 受限\n> **注意**: 该文档在飞书侧权限受限（当前账号无访问权限，API 返回 40403 no permission），无法获取内容。\n> 如需查阅，请在飞书中向文档所有者申请权限后重新获取。');
+  add('正常.md', '正文讨论权限受限，但这不是占位文档。');
+  publish();
+  const list: any = await query().call('raw_list', {}, 6000);
+  expect(list.results.find((item: any) => item.objToken === 't0')).toMatchObject({ sourceAvailability: 'permission_denied_placeholder', usableAsEvidence: false });
+  expect(list.results.find((item: any) => item.objToken === 't1')).not.toHaveProperty('sourceAvailability');
+  const search: any = await query().call('raw_search', { query: '受限' }, 6000);
+  expect(search.results.find((item: any) => item.objToken === 't0')).toMatchObject({ sourceAvailability: 'permission_denied_placeholder', usableAsEvidence: false });
+  expect(await query().call('raw_read', { objToken: 't0' }, 6000)).toMatchObject({ sourceAvailability: 'permission_denied_placeholder', usableAsEvidence: false });
+  await expect(query().call('raw_list_sheets', { objToken: 't0' }, 6000)).rejects.toMatchObject({ code: 'raw_workbook_unavailable', details: { reason: 'permission_denied_placeholder' } });
 });
 
 it('fences catalog entries, symlinks, and CSV attachments; no arbitrary client path reads', async () => {
@@ -68,6 +96,10 @@ it('paginates reads and searches with change checks, includes registered CSV, pr
   expect(first.nextOffset).toBe(2);
   const second: any = await query().call('raw_read', { objToken: 't0', offset: first.nextOffset, contentHash: first.contentHash }, 1800);
   expect(JSON.stringify(second)).toContain('200,模型');
+  const csvLine = second.lines.find((item: { text: string }) => item.text === '200,模型');
+  const csvSegment = second.sourceSegments.find((item: { kind: string }) => item.kind === 'csv');
+  expect(csvSegment).toMatchObject({ path: '数据.csv' });
+  expect(csvLine.line - csvSegment.startLine + csvSegment.sourceStartLine).toBe(2);
   fs.appendFileSync(path.join(raw, '数据.csv'), '\n300,系统');
   await expect(query().call('raw_read', { objToken: 't0', offset: 2, contentHash: first.contentHash }, 1800)).rejects.toMatchObject({ code: 'raw_changed' });
   const listed: any = await query().call('raw_list', { limit: 1 }, 1800);
@@ -87,7 +119,7 @@ it('real stdio and authenticated HTTP expose identical raw tools/results, matchi
     await local.connect(new StdioClientTransport({ command: process.execPath, args: [path.resolve('dist/mcp/kb-mcp.cjs'), '--kb-root', standard.kbRoot, '--raw-catalog', catalog], stderr: 'pipe' }));
     await remote.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${(gateway.server.address() as AddressInfo).port}/mcp`), { requestInit: { headers: { Authorization: `Bearer ${token}` } } }));
     expect((await local.listTools()).tools).toEqual((await remote.listTools()).tools);
-    expect((await local.listTools()).tools).toHaveLength(19);
+    expect((await local.listTools()).tools).toHaveLength(20);
     for (const [name, args] of [['raw_list', { pathPrefix: '200' }], ['raw_search', { query: '200 数据结构' }], ['raw_read', { objToken: 't1' }]] as const) {
       const request = { name, arguments: args }; const a = await local.callTool(request), b = await remote.callTool(request);
       expect(a.isError).not.toBe(true); expect(a).toEqual(b);
@@ -100,5 +132,35 @@ it('real stdio and authenticated HTTP expose identical raw tools/results, matchi
       expect(outside.results.map(({ score: _score, ...rest }: any) => rest)).toEqual(inside.results);
     } finally { app.revokeToken(ctx.token); }
     const invalid = await local.callTool({ name: 'raw_read', arguments: { path: '../secret.md' } }); expect(invalid.isError).toBe(true);
+    const combined = await local.callTool({ name: 'search_all_knowledge', arguments: { query: '数据结构' } });
+    const combinedRemote = await remote.callTool({ name: 'search_all_knowledge', arguments: { query: '数据结构' } });
+    expect(combinedRemote).toEqual(combined);
+    const combinedValue = JSON.parse((combined.content as Array<{ text: string }>)[0].text);
+    expect(combinedValue.standard.error.code).toBe('kb_not_published');
+    expect(combinedValue.raw.results[0].title).toBe('结构.md');
   } finally { await local.close(); await remote.close(); await gateway.close(); }
+});
+
+it('combined search preserves both sources and independent pagination', async () => {
+  add('甲.md', '战斗规则甲'); add('乙.md', '战斗规则乙'); publish();
+  const standard = path.join(root, 'standard');
+  writeSearchRelease(standard, 'r_test', [{ path: '规则甲.md', body: '# 战斗规则甲\n战斗规则甲' }, { path: '规则乙.md', body: '# 战斗规则乙\n战斗规则乙' }]);
+  const client = new Client({ name: 'combined-test', version: '1' });
+  try {
+    await client.connect(new StdioClientTransport({ command: process.execPath, args: [path.resolve('dist/mcp/kb-mcp.cjs'), '--kb-root', standard, '--raw-catalog', catalog], stderr: 'pipe' }));
+    const tool = (await client.listTools()).tools.find((item) => item.name === 'search_all_knowledge');
+    expect(tool?.outputSchema).toBeDefined();
+    const call = async (args: Record<string, unknown>) => {
+      const response = await client.callTool({ name: 'search_all_knowledge', arguments: args });
+      const parsed = JSON.parse((response.content as Array<{ text: string }>)[0].text);
+      expect(response.structuredContent).toEqual(parsed);
+      return parsed;
+    };
+    const first = await call({ query: '战斗', limit: 1 });
+    expect(first.standard).toMatchObject({ sourceKind: 'standard', releaseId: 'r_test', total: 2 });
+    expect(first.raw).toMatchObject({ sourceKind: 'raw', total: 2, nextOffset: 1 });
+    const next = await call({ query: '战斗', limit: 1, standardCursor: first.standard.next, rawOffset: first.raw.nextOffset, rawCatalogHash: first.raw.catalogHash });
+    expect(next.standard.results[0].path).not.toBe(first.standard.results[0].path);
+    expect(next.raw.results[0].objToken).not.toBe(first.raw.results[0].objToken);
+  } finally { await client.close(); }
 });
