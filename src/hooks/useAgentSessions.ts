@@ -609,6 +609,7 @@ export function useAgentSessions(active: boolean): UseAgentSessionsResult {
   const refreshSessions = useCallback(() => setSessionNonce((n) => n + 1), []);
 
   const createSession = useCallback(async (backend?: AgentBackend, workspaceId?: string) => {
+    setSessionsError(null);
     try {
       let created = await createAgentSession(undefined, backend, workspaceId);
       if (workspaceId) {

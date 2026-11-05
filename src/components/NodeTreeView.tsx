@@ -57,6 +57,7 @@ interface NodeTreeViewProps {
   onSelect: (objToken: string) => void;
   onSyncNode?: (objToken: string) => void;
   onOpenFolder?: (localPath: string) => void;
+  onCopyLocalPath?: (localPath: string) => void;
   onRefreshed?: () => void;
   /** 文档右键与归档删除入口，由父层显示本地文件/屏蔽选项并刷新树。 */
   onDeleteDoc?: (doc: { objToken: string; title: string }) => void;
@@ -185,6 +186,7 @@ export function NodeTreeView({
   onSelect,
   onSyncNode,
   onOpenFolder,
+  onCopyLocalPath,
   onRefreshed,
   businessMarksByToken,
   orphanPaths,
@@ -416,8 +418,9 @@ export function NodeTreeView({
     dropRef.current = null; dragState.current.dragged = null;
     setDragOver(null); setDraggingToken(null);
   };
+  const hasNodeMenu = onDeleteDoc || onSyncNode || onOpenFolder || onCopyLocalPath;
   const openNodeMenu = (e: React.MouseEvent, node: MappingNode) => {
-    if (!onDeleteDoc && !onSyncNode && !onOpenFolder) return;
+    if (!hasNodeMenu) return;
     e.preventDefault(); e.stopPropagation(); onSelect(node.obj_token);
     // P2-S7 移出入口本地资格（watchedRoot 成员叶子；服务端八分支兜底）：
     // 结构树成员 = wiki_node_token 非空；叶子 = 云端无子且本地未观测到子行。
@@ -764,7 +767,7 @@ export function NodeTreeView({
                           role="treeitem"
                           aria-selected={multiMode ? chosen.has(doc.objToken) : selected}
                           tabIndex={0}
-                          onContextMenu={(e) => { if (!onDeleteDoc && !onSyncNode && !onOpenFolder) return; e.preventDefault(); e.stopPropagation(); onSelect(doc.objToken); setContextMenu({ objToken: doc.objToken, title: doc.title, localPath: doc.localRelPath, canSync: false, x: e.clientX, y: e.clientY }); }}
+                          onContextMenu={(e) => { if (!hasNodeMenu) return; e.preventDefault(); e.stopPropagation(); onSelect(doc.objToken); setContextMenu({ objToken: doc.objToken, title: doc.title, localPath: doc.localRelPath, canSync: false, x: e.clientX, y: e.clientY }); }}
                           onClick={(e) => handleRowClick(doc.objToken, e)}
                           onKeyDown={(e) => {
                             if (e.target !== e.currentTarget) return;
@@ -1065,7 +1068,7 @@ export function NodeTreeView({
     <div ref={rootRef} className="min-h-0 min-w-0 h-full">
       <SourceNodeMenu target={contextMenu} count={contextTokens.length} onClose={closeMenu}
         onDelete={(doc) => { if (onBatchAction && contextTokens.length > 1) onBatchAction(contextTokens, 'delete'); else onDeleteDoc?.(doc); }}
-        onSyncNode={onSyncNode} onOpenFolder={onOpenFolder ? (localPath) => {
+        onSyncNode={onSyncNode} onCopyLocalPath={onCopyLocalPath} onOpenFolder={onOpenFolder ? (localPath) => {
           if (!localPath) { toast.push({ type: 'warning', message: '该节点尚未同步到本地' }); return; }
           onOpenFolder(localPath);
         } : undefined} />

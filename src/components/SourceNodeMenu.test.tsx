@@ -11,24 +11,28 @@ describe('source node context menu', () => {
   let root: ReturnType<typeof createRoot> | undefined;
   afterEach(() => { if (root) act(() => root!.unmount()); container?.remove(); root = undefined; container = undefined; });
 
-  it('routes sync and folder actions to the right-clicked node', () => {
+  it('routes sync, open and copy actions to the right-clicked node', () => {
     container = document.createElement('div'); document.body.append(container); root = createRoot(container);
-    const onSyncNode = vi.fn(), onOpenFolder = vi.fn(), onClose = vi.fn();
+    const onSyncNode = vi.fn(), onOpenFolder = vi.fn(), onCopyLocalPath = vi.fn(), onClose = vi.fn();
     const props = { target: { objToken: 'clicked', title: '节点', x: 20, y: 20, localPath: 'folder/doc.md', canSync: true },
-      onClose, onDelete: vi.fn(), onSyncNode, onOpenFolder };
+      onClose, onDelete: vi.fn(), onSyncNode, onOpenFolder, onCopyLocalPath };
     act(() => root!.render(<SourceNodeMenu {...props} />));
     const buttons = [...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')];
     act(() => buttons.find((b) => b.textContent === '同步此节点')!.click());
     expect(onSyncNode).toHaveBeenCalledWith('clicked'); expect(onClose).toHaveBeenCalledTimes(1);
     act(() => buttons.find((b) => b.textContent === '在文件夹中打开')!.click());
     expect(onOpenFolder).toHaveBeenCalledWith('folder/doc.md');
+    act(() => buttons.find((b) => b.textContent === '复制本地路径')!.click());
+    expect(onCopyLocalPath).toHaveBeenCalledWith('folder/doc.md');
+    expect(onClose).toHaveBeenCalledTimes(3);
   });
 
-  it('keeps synchronization disabled for an unchanged node', () => {
+  it('disables sync and copy for a node without changes or a local path', () => {
     container = document.createElement('div'); document.body.append(container); root = createRoot(container);
-    act(() => root!.render(<SourceNodeMenu target={{ objToken: 'unchanged', title: '节点', x: 0, y: 0, canSync: false }} onClose={vi.fn()} onDelete={vi.fn()} onSyncNode={vi.fn()} />));
-    const button = [...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find((b) => b.textContent === '同步此节点');
-    expect(button?.disabled).toBe(true);
+    act(() => root!.render(<SourceNodeMenu target={{ objToken: 'unchanged', title: '节点', x: 0, y: 0, canSync: false }} onClose={vi.fn()} onDelete={vi.fn()} onSyncNode={vi.fn()} onCopyLocalPath={vi.fn()} />));
+    const buttons = [...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')];
+    expect(buttons.find((b) => b.textContent === '同步此节点')?.disabled).toBe(true);
+    expect(buttons.find((b) => b.textContent === '复制本地路径')?.disabled).toBe(true);
   });
 
   it.each([1, 3])('keeps delete without block or cloud move entries (selection: %s)', (count) => {

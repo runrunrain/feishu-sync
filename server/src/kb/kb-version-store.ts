@@ -59,7 +59,7 @@ export function sourceChangePreview(
   const sources: KbFileChange[] = [];
   for (const token of [...new Set([...current.keys(), ...before.keys()])].sort()) {
     const old = before.get(token); const next = current.get(token);
-    if (old && next && !sourceContentsChanged(old, next) && old.relPath === next.relPath && old.title === next.title) continue;
+    if (old && next && !sourceEntryChanged(old, next)) continue;
     const kind = !old ? 'added' : !next ? 'removed' : 'changed';
     const beforeAvailable = !old || Object.hasOwn(previous, token);
     sources.push({
@@ -76,6 +76,13 @@ export function sourceChangePreview(
     affectedDocs: (base?.docs ?? []).filter((doc) => doc.sources.some((token) => touched.has(token)))
       .map(({ docId, path: docPath, title }) => ({ docId, path: docPath, title })),
   };
+}
+
+/** One preview predicate for the status counter and detailed change list. */
+export function sourceEntryChanged(old: import('../types/agent-knowledge.js').RawSourceSnapshotEntry,
+  next: import('../types/agent-knowledge.js').RawSourceSnapshotEntry): boolean {
+  return sourceContentsChanged(old, next) || old.relPath !== next.relPath || old.title !== next.title
+    || (old.whiteboardTextHash ?? '') !== (next.whiteboardTextHash ?? '');
 }
 
 export class KbVersionStore {

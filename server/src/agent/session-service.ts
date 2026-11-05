@@ -25,6 +25,9 @@ import { createClaudeProcess } from './claude-process-factory.js';
 import { ClaudeCodeProcess } from './claude-code-process.js';
 import type { SessionModelConfig } from '../types/agent-knowledge.js';
 import { modelRevision } from './model-revision.js';
+import { configuredThinkingLevels } from './thinking-capabilities.js';
+import type { LocalMapStore } from '../modules/local-map-store.js';
+import { resolveProviderModel } from '../modules/model-selection.js';
 import { ChatAttachmentStore, type ChatImageContent } from './chat-attachments.js';
 import { checkRootOverlap, validateWorkingDirectory, type WorkspaceRootGuards } from './path-guard.js';
 import {
@@ -84,6 +87,7 @@ export interface SessionStoreApi {
     workspaceId: string | null;
     piSessionFile: string | null;
     modelConfig: string | null;
+    approvalMode: 'ask' | 'auto';
     localResources: boolean;
     lastErrorCode: string | null;
     lastErrorMessage: string | null;
@@ -103,7 +107,6 @@ export class SessionService extends EventEmitter {
   private readonly sseBuffers = new Map<string, SessionSseEvent[]>();
   private readonly sseSeq = new Map<string, number>();
   private readonly runs = new Map<string, ActiveRun>();
-  private readonly approvalModes = new Map<string, 'ask' | 'auto'>();
   /** T3b-07：停止已请求但尚未 run_end 的会话（abort ACK 窗口标记）。 */
   private readonly abortRequested = new Set<string>();
   /** T3e-R3-02：会话停止信号源（app_command 批准后异步复核链取消用）。 */
@@ -147,7 +150,7 @@ export class SessionService extends EventEmitter {
     const errorMessage = row.last_error_message ? String(row.last_error_message) : null;
     return {
       id: sessionId,
-      approvalMode: this.approvalModes.get(sessionId) ?? 'ask',
+      approvalMode: this.readApprovalMode(row),
       localResources: row.local_resources === 1,
       backend: row.runtime_backend === 'claude-code' ? 'claude-code' : 'pi',
       model: this.readSessionModel(row),
@@ -175,9 +178,7 @@ export class SessionService extends EventEmitter {
   }
 
   create(
-    localMapStore: {
-      createAgentSession(input: { id: string; title: string; mode: 'discuss' | 'work'; workspaceId: string | null; backend?: 'pi' | 'claude-code'; createdAt: string; updatedAt: string }): void;
-    },
+    localMapStore: Pick<LocalMapStore, 'createAgentSession' | 'getAgentSessionDefaults'>,
     input: { title?: string; mode?: string; backend?: string; workspaceId?: string },
   ): AgentSessionDto {
     if (input.mode !== undefined && input.mode !== 'discuss') {
@@ -191,14 +192,21 @@ export class SessionService extends EventEmitter {
     const now = new Date().toISOString();
     // The explicit choice belongs to this conversation. Older callers that
     // omit it retain the configured application backend as their default.
-    const backend = input.backend ?? (this.currentConfig()?.agent.runtime.backend === 'claude-code' ? 'claude-code' : 'pi');
-    const workspace = input.workspaceId ? this.workspaceOf(this.currentConfig(), input.workspaceId) : null;
+    const config = this.currentConfig();
+    const backend = input.backend ?? (config?.agent.runtime.backend === 'claude-code' ? 'claude-code' : 'pi');
+    const workspace = input.workspaceId ? this.workspaceOf(config, input.workspaceId) : null;
     if (input.workspaceId && !workspace) throw new ToolError('workspace_not_found', 'Workspace 不存在或未绑定', 404);
-    localMapStore.createAgentSession({ id, title, mode: 'discuss', workspaceId: workspace?.id ?? null, backend, createdAt: now, updatedAt: now });
+    const defaults = localMapStore.getAgentSessionDefaults(backend);
+    const model = this.resolveDefaultModel(defaults.modelConfig, backend, config);
+    localMapStore.createAgentSession({
+      id, title, mode: 'discuss', workspaceId: workspace?.id ?? null, backend,
+      approvalMode: defaults.approvalMode, modelConfig: model ? JSON.stringify(model) : null,
+      createdAt: now, updatedAt: now,
+    });
     fs.mkdirSync(this.sessionDir(), { recursive: true });
     return {
       id, title, mode: 'discuss', workspace: workspace ? { id: workspace.id, name: workspace.name, path: workspace.path } : null, state: 'idle', lastError: null, backend,
-      createdAt: now, updatedAt: now,
+      createdAt: now, updatedAt: now, approvalMode: 'ask', model,
     };
   }
 
@@ -227,6 +235,19 @@ export class SessionService extends EventEmitter {
     try { return JSON.parse(row.model_config_json) as SessionModelConfig; } catch { throw new ToolError('invalid_request', '会话模型配置损坏'); }
   }
 
+  private resolveDefaultModel(saved: string | null, backend: 'pi' | 'claude-code', config: Config | null): SessionModelConfig | null {
+    if (!saved || !config) return null;
+    let model: SessionModelConfig | null;
+    try { model = JSON.parse(saved); } catch { return null; }
+    if (!model) return null;
+    if (model.source === 'pi-agent-dir') return backend === 'pi' ? model : null;
+    if (model.source !== 'app-llm' || !model.providerId || !model.modelId) return null;
+    const resolved = resolveProviderModel(config.llm, model, backend === 'claude-code' ? 'anthropic-messages' : undefined);
+    if (!resolved?.apiKey) return null;
+    const levels = configuredThinkingLevels(resolved.thinkingLevels, resolved.reasoning, backend);
+    return model.thinkingLevel === 'off' || levels?.includes(model.thinkingLevel) ? model : { ...model, thinkingLevel: 'off' };
+  }
+
   configForSession(store: Pick<SessionStoreApi, 'getAgentSession'>, id: string, base = this.currentConfig()): Config {
     const row = store.getAgentSession(id);
     if (!row) throw new ToolError('session_not_found', '会话不存在', 404);
@@ -238,22 +259,28 @@ export class SessionService extends EventEmitter {
     return { ...base, agent: { ...base.agent, runtime: { ...base.agent.runtime, backend }, model: resolvedModel } };
   }
 
-  setModel(store: SessionStoreApi, id: string, model: SessionModelConfig | null): AgentSessionDto {
+  setModel(store: SessionStoreApi & Pick<LocalMapStore, 'saveAgentSessionPreferences'>, id: string, model: SessionModelConfig | null): AgentSessionDto {
     if (!store.getAgentSession(id)) throw new ToolError('session_not_found', '会话不存在', 404);
     if (this.isRunning(id) || this.deps.pool.isBusy(id)) throw new ToolError('session_busy', '运行结束后可切换模型与思考强度', 409);
-    store.updateAgentSession(id, { modelConfig: model ? JSON.stringify(model) : null });
+    store.saveAgentSessionPreferences(id, { modelConfig: model ? JSON.stringify(model) : null });
     this.emitSessionState(id, store);
     return this.get(store, this.currentConfig(), id)!;
   }
 
-  approvalMode(id: string): 'ask' | 'auto' { return this.approvalModes.get(id) ?? 'ask'; }
+  private readApprovalMode(row: Record<string, unknown> | null): 'ask' | 'auto' {
+    return row?.mode === 'work' && row.approval_mode === 'auto' ? 'auto' : 'ask';
+  }
 
-  setApprovalMode(store: SessionStoreApi, id: string, mode: 'ask' | 'auto'): AgentSessionDto {
+  approvalMode(store: Pick<SessionStoreApi, 'getAgentSession'>, id: string): 'ask' | 'auto' {
+    return this.readApprovalMode(store.getAgentSession(id));
+  }
+
+  setApprovalMode(store: SessionStoreApi & Pick<LocalMapStore, 'saveAgentSessionPreferences'>, id: string, mode: 'ask' | 'auto'): AgentSessionDto {
     const row = store.getAgentSession(id);
     if (!row) throw new ToolError('session_not_found', '会话不存在', 404);
     if (row.mode !== 'work') throw new ToolError('invalid_request', '只有 Work 会话可设置审批方式');
     if (this.isRunning(id) || this.deps.pool.isBusy(id)) throw new ToolError('session_busy', '请在运行结束后切换审批方式', 409);
-    if (mode === 'auto') this.approvalModes.set(id, mode); else this.approvalModes.delete(id);
+    store.saveAgentSessionPreferences(id, { approvalMode: mode });
     this.emitSessionState(id, store);
     return this.get(store, this.currentConfig(), id)!;
   }
@@ -282,7 +309,6 @@ export class SessionService extends EventEmitter {
       throw new ToolError('session_busy', '会话运行中，请先停止', 409);
     }
     await this.deps.pool.terminate(id);
-    this.approvalModes.delete(id);
     this.deps.toolService.revokeBySession(id);
     localMapStore.updateAgentSession(id, { deletedAt: new Date().toISOString() });
     // JSONL 移到 sessions/.deleted/
@@ -341,7 +367,6 @@ export class SessionService extends EventEmitter {
       await this.deps.pool.terminate(id);
       this.deps.toolService.revokeBySession(id);
       localMapStore.updateAgentSession(id, { mode: 'discuss' });
-      this.approvalModes.delete(id);
       this.emitSessionState(id, localMapStore);
       return this.get(localMapStore, config, id);
     }
@@ -372,10 +397,9 @@ export class SessionService extends EventEmitter {
     workspaceId: string,
   ): Promise<void> {
     for (const row of localMapStore.listSessionsByWorkspace(workspaceId)) {
-      this.approvalModes.delete(String(row.id));
       await this.deps.pool.terminate(String(row.id));
       this.deps.toolService.revokeBySession(String(row.id));
-      localMapStore.updateAgentSession(String(row.id), { mode: 'discuss', workspaceId: null });
+      localMapStore.updateAgentSession(String(row.id), { mode: 'discuss', workspaceId: null, approvalMode: 'ask' });
     }
   }
 

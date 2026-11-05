@@ -46,33 +46,27 @@ it('文件可拖入整个会话页，显示投放提示并交给当前输入框'
   } finally { act(() => root.unmount()); container.remove(); }
 });
 
-it('新建会话仅提供 Pi，创建时显式使用 Pi 基座', async () => {
+it('单击新建直接创建 Pi 会话', async () => {
   const container = document.createElement('div'); document.body.append(container); const root = createRoot(container);
   const click = async (selector: string) => act(async () => (container.querySelector(selector) as HTMLButtonElement).click());
   try {
     await act(async () => root.render(<AgentView />));
     await click('[aria-label="新建会话"]');
-    expect(container.querySelector('[role="dialog"]')?.textContent).toContain('应用能力的基座在设置中单独配置');
-    await click('[aria-label="新建 Pi 会话"]');
-    expect(create).toHaveBeenLastCalledWith('pi');
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(create).toHaveBeenLastCalledWith('pi', undefined);
     expect(container.querySelector('[role="dialog"]')).toBeNull();
-    await click('[aria-label="新建会话"]');
-    expect(container.querySelector('[aria-label="新建 Claude Code 会话"]')).toBeNull();
-    await click('[aria-label="新建 Pi 会话"]');
-    expect(create).toHaveBeenLastCalledWith('pi');
   } finally { act(() => root.unmount()); container.remove(); }
 });
 
-it('创建失败时保留选择弹窗并允许重试', async () => {
+it('创建失败在对话页显示错误，再点新建可重试', async () => {
   create.mockResolvedValueOnce(null).mockResolvedValueOnce({ id: 'retry' });
   const container = document.createElement('div'); document.body.append(container); const root = createRoot(container);
   const click = async (selector: string) => act(async () => (container.querySelector(selector) as HTMLButtonElement).click());
   try {
     await act(async () => root.render(<AgentView />));
     await click('[aria-label="新建会话"]');
-    await click('[aria-label="新建 Pi 会话"]');
-    expect(container.querySelector('[role="dialog"] [role="alert"]')?.textContent).toBe('服务不可用');
-    await click('[aria-label="新建 Pi 会话"]');
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain('服务不可用');
+    await click('[aria-label="新建会话"]');
     expect(create).toHaveBeenCalledTimes(2);
     expect(container.querySelector('[role="dialog"]')).toBeNull();
   } finally { act(() => root.unmount()); container.remove(); }

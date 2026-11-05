@@ -78,7 +78,7 @@ function isDeletedSource(deps: ContentDependencies, doc: NonNullable<ReturnType<
 }
 
 /** Read a UTF-8 text file with a hard byte cap; null when unreadable. */
-function readTextCapped(
+export function readTextCapped(
   absolutePath: string,
 ): { content: string; truncated: boolean } | null {
   let stat: fs.Stats;

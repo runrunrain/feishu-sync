@@ -11,7 +11,7 @@ afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursiv
 function setup() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sync-reference-')); roots.push(root);
   fs.mkdirSync(path.join(root, 'source', 'images'), { recursive: true });
-  fs.writeFileSync(path.join(root, 'source', 'doc.md'), '本地源文档');
+  fs.writeFileSync(path.join(root, 'source', 'doc.md'), '');
   fs.writeFileSync(path.join(root, 'source', 'images', '03-BoardToken.jpg'), 'fixture');
   const fetchSyncedReference = vi.fn(async () => ({ data: { document: { content: '<fragment mode="range"><synced-source id="Block"><whiteboard token="BoardToken"></whiteboard></synced-source></fragment>' } } }));
   const app = new Hono();
@@ -24,6 +24,25 @@ function setup() {
   app.route('/', mappingRoutes);
   return { app, root, fetchSyncedReference };
 }
+
+it('reads only the matching local block and skips the cloud', async () => {
+  const { app, root, fetchSyncedReference } = setup();
+  fs.writeFileSync(path.join(root, 'source', 'doc.md'), '<synced-source id="Other">其他块</synced-source>\n<synced-source id="Block1">![白板](images/03-BoardToken.jpg)</synced-source>');
+  const res = await app.request('/api/mapping/synced-reference?token=Source1&block=Block1');
+  expect(res.status).toBe(200);
+  expect(await res.json()).toEqual({ source: 'local-block', baseDir: 'source', content: '![白板](images/03-BoardToken.jpg)' });
+  expect(fetchSyncedReference).not.toHaveBeenCalled();
+});
+
+it('provides the local document without guessing a block when the export omits IDs', async () => {
+  const { app, root, fetchSyncedReference } = setup();
+  const content = '# 本地原文\n<synced-source>第一个块</synced-source>\n<synced-source>第二个块</synced-source>';
+  fs.writeFileSync(path.join(root, 'source', 'doc.md'), content);
+  const res = await app.request('/api/mapping/synced-reference?token=Source1&block=Block1');
+  expect(res.status).toBe(200);
+  expect(await res.json()).toEqual({ source: 'local-document', baseDir: 'source', content, truncated: false });
+  expect(fetchSyncedReference).not.toHaveBeenCalled();
+});
 
 it('reads the exact referenced block and maps a uniquely matching local whiteboard', async () => {
   const { app, fetchSyncedReference } = setup();

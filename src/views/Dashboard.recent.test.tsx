@@ -4,8 +4,8 @@ import { createRoot } from 'react-dom/client';
 import { expect, it, vi } from 'vitest';
 import { Dashboard } from './Dashboard';
 
-const config = { watchedRootUrls: ['https://example.feishu.cn/wiki/root'] };
-const state = vi.hoisted(() => ({ showCustom: false, deleted: false, folderRequests: 0 }));
+const config = { watchedRootUrls: ['https://example.feishu.cn/wiki/root'], knowledgeBaseRoot: '' };
+const state = vi.hoisted(() => ({ showCustom: false, deleted: false, folderRequests: 0, localPath: 'mapped.md' }));
 vi.mock('../hooks/useConfig', () => ({ useConfig: () => ({ config }) }));
 vi.mock('../components/common/Toast', () => ({ useToast: () => toast }));
 const toast = { push: vi.fn() };
@@ -16,12 +16,15 @@ vi.mock('../api/client', () => ({
     { objToken: 'deleted', objType: 'docx', title: '已删除的变更', changeType: 'added', localDeleted: true },
   ], deleted: [] }),
   getMappingIndex: async () => ({ orphan_files: [] }),
-  getMappingTreeDetailed: async () => ({ nodes: [{ obj_token: 'mapped', title: '已有文档', obj_type: 'docx', local_path: 'mapped.md' }] }),
+  getMappingTreeDetailed: async () => ({ nodes: [{ obj_token: 'mapped', title: '已有文档', obj_type: 'docx', local_path: state.localPath }] }),
   listCustomFolders: async () => { state.folderRequests++; return state.showCustom && !state.deleted ? [{ id: 'f', name: '归档', docs: [{ objToken: 'archive', title: '归档文档' }] }] : []; }, listCloudMoves: async () => ({ moves: [] }),
   manualDeleteDoc: vi.fn(async () => { state.deleted = true; return { ok: true }; }), previewSourceBatch: vi.fn(),
 }));
 vi.mock('../components/DocPreviewPanel', () => ({ DocPreviewPanel: ({ node }: any) => <div data-testid="preview">{node?.obj_token ?? 'none'}:{node?.local_path}</div> }));
-vi.mock('../components/NodeTreeView', () => ({ NodeTreeView: ({ customFolders, onDeleteDoc }: any) => customFolders?.length ? <button onClick={() => onDeleteDoc({ objToken: 'archive', title: '归档文档' })}>删除归档文档</button> : null }));
+vi.mock('../components/NodeTreeView', () => ({ NodeTreeView: ({ customFolders, onDeleteDoc, onCopyLocalPath, nodes }: any) => <>
+  {customFolders?.length ? <button onClick={() => onDeleteDoc({ objToken: 'archive', title: '归档文档' })}>删除归档文档</button> : null}
+  <button onClick={() => onCopyLocalPath(nodes[0].local_path)}>复制本地路径</button>
+</> }));
 vi.mock('../components/GlobalStatusBar', () => ({ GlobalStatusBar: () => null }));
 vi.mock('../components/VersionUpdateAlert', () => ({ VersionUpdateAlert: () => null }));
 vi.mock('../components/QuickAddDocDialog', () => ({ QuickAddDocDialog: () => null }));
@@ -67,4 +70,35 @@ it('单篇删除后刷新自定义归档，页面立即移除该文档', async (
     expect(state.folderRequests).toBeGreaterThan(requestsBefore);
     expect([...container.querySelectorAll('button')].some((element) => element.textContent?.trim() === '删除归档文档')).toBe(false);
   } finally { act(() => root.unmount()); container.remove(); vi.unstubAllGlobals(); state.showCustom = false; state.deleted = false; }
+});
+
+it.each([
+  ['/知识库/', '分组/文档.md', '/知识库/分组'],
+  ['/知识库', '/旧知识库/归档/文档.md', '/旧知识库/归档'],
+  ['C:\\知识库', '分组/文档.md', 'C:\\知识库\\分组'],
+  ['C:\\知识库', 'C:\\文档.md', 'C:\\'],
+  ['\\\\server\\share', '分组/文档.md', '\\\\server\\share\\分组'],
+])('copies the containing folder with root %s and local path %s', async (rootPath, localPath, expected) => {
+  (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
+  vi.stubGlobal('ResizeObserver', class { observe() {} disconnect() {} });
+  vi.stubGlobal('matchMedia', () => ({ matches: false, addEventListener() {}, removeEventListener() {} }));
+  const writeClipboardText = vi.fn(async () => {});
+  vi.stubGlobal('desktop', { writeClipboardText });
+  state.localPath = localPath;
+  config.knowledgeBaseRoot = rootPath;
+  const container = document.createElement('div');
+  document.body.append(container);
+  const root = createRoot(container);
+  try {
+    await act(async () => root.render(<Dashboard onJumpToSync={() => {}} />));
+    const button = [...container.querySelectorAll('button')].find((element) => element.textContent === '复制本地路径')!;
+    await act(async () => button.click());
+    expect(writeClipboardText.mock.calls).toEqual([[expected]]);
+  } finally {
+    act(() => root.unmount());
+    container.remove();
+    state.localPath = 'mapped.md';
+    config.knowledgeBaseRoot = '';
+    vi.unstubAllGlobals();
+  }
 });

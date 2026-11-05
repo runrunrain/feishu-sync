@@ -116,6 +116,19 @@ describe('所选源在现有标准库上继续构建', () => {
     expect(version.docChanges.map((change) => change.path)).toEqual(['b.md']);
   });
 
+  it('从无 digest 的旧版本分批构建时为精确未变的继承源补齐 digest', async () => {
+    const f = await fixture(); f.select(['a']); expect((await f.build()).status).toBe('published');
+    const store = f.published(); const original = store.readManifest()!;
+    const legacyFile = path.join(store.outputRootPath, 'releases', original.releaseId, 'manifest.json');
+    // Synthetic legacy release predating comparisonHash; no production release is modified.
+    delete original.sourceSnapshot[0].comparisonHash;
+    fs.writeFileSync(legacyFile, JSON.stringify(original));
+    f.select(['b']); expect((await f.build()).status).toBe('published');
+    const inherited = f.published().readManifest()!.sourceSnapshot.find(source => source.objToken === 'a')!;
+    expect(inherited.contentHash).toBe(original.sourceSnapshot[0].contentHash);
+    expect(inherited.comparisonHash).toMatch(/^v1:[a-f0-9]{64}$/);
+  });
+
   it('已构建源可主动重新构建，原文未变也会执行，并保留其他文档', async () => {
     const f = await fixture(); f.select(['a', 'b']); await f.build();
     const old = f.published().readManifest()!; const preserved = f.markdown('b.md');

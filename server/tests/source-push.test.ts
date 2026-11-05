@@ -1786,10 +1786,11 @@ class RecheckFakeRpc extends EventEmitter {
   async terminate(): Promise<void> { this.exited = true; this.emit('exit'); }
 }
 
-function recheckStore(): SessionStoreApi {
+function recheckStore() {
   const rows = new Map<string, Record<string, unknown>>();
   return {
     getAgentSession: (id) => (rows.get(id) ? { ...rows.get(id)! } : null),
+    getAgentSessionDefaults: () => ({ approvalMode: 'ask', modelConfig: null }),
     createAgentSession: (input) => {
       rows.set(input.id, {
         id: input.id, title: input.title, mode: input.mode, workspace_id: input.workspaceId,
@@ -1813,7 +1814,7 @@ function recheckStore(): SessionStoreApi {
       rows.set(id, { ...row, ...mapped });
     },
     listSessionsByWorkspace: () => [],
-  } as SessionStoreApi;
+  } satisfies SessionStoreApi & Parameters<SessionService['create']>[0] & Record<string, unknown>;
 }
 
 function recheckConfig(): Config {

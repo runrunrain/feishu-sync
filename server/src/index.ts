@@ -514,7 +514,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
     // 必须等于会话当前可执行轮；跨轮迟到请求拒绝，旧轮批准不被新轮洗白）
     toolCallRun: (sessionId, toolCallId) => sessionService.runOfToolCall(sessionId, toolCallId),
     currentRunId: (sessionId) => sessionService.currentRunId(sessionId),
-    approvalMode: (sessionId) => sessionService.approvalMode(sessionId),
+    approvalMode: (sessionId) => sessionService.approvalMode(localMapStore, sessionId),
     // T3e-R3-02：停止信号（批准后异步复核链取消源；abort 时触发）
     sessionAbortSignal: (sessionId) => sessionService.abortSignal(sessionId),
   }));

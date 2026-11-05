@@ -505,10 +505,11 @@ class RoundFakeRpc extends EventEmitter {
   async terminate(): Promise<void> { this.exited = true; this.emit('exit'); }
 }
 
-function roundStore(): SessionStoreApi {
+function roundStore() {
   const rows = new Map<string, Record<string, unknown>>();
   return {
     getAgentSession: (id) => (rows.get(id) ? { ...rows.get(id)! } : null),
+    getAgentSessionDefaults: () => ({ approvalMode: 'ask', modelConfig: null }),
     createAgentSession: (input) => {
       rows.set(input.id, {
         id: input.id, title: input.title, mode: input.mode, workspace_id: input.workspaceId,
@@ -532,7 +533,7 @@ function roundStore(): SessionStoreApi {
       rows.set(id, { ...row, ...mapped });
     },
     listSessionsByWorkspace: () => [],
-  } as SessionStoreApi;
+  } satisfies SessionStoreApi & Parameters<SessionService['create']>[0] & Record<string, unknown>;
 }
 
 function roundConfig(): Config {

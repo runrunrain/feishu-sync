@@ -10,22 +10,29 @@ import unzipper from 'unzipper';
 import { isPathInside } from '../agent/path-guard.js';
 import { buildKbIndex } from './search/kb-index.js';
 import { loadReleaseKnowledge, resolveRelease, validateReleaseId } from './search/release-reader.js';
+import { resolveInside } from '../agent/path-guard.js';
+import { SOURCE_COMPARISON_CACHE, sourceComparisonHash, sourceComparisonKey, withSourceComparisonBaseline } from './source-comparison.js';
+import { visitSourceFiles } from './raw-source-snapshot.js';
 import type { KbCurrentPointer, KbManifest } from '../types/agent-knowledge.js';
 
 const FORMAT = 'feishu-sync-standard-kb';
 const MAX_FILES = 100_000;
 const MAX_BYTES = 20 * 1024 ** 3;
 const MAX_BUNDLE_JSON = 32 * 1024 ** 2;
+const MAX_PROOF_BYTES = 8 * 1024 ** 2;
+const PROOF_PATH = 'source-comparison-v1.json';
+const isDigest = (value: unknown): value is string => typeof value === 'string' && /^v1:[a-f0-9]{64}$/.test(value);
 
 interface BundleFile { path: string; size: number; sha256: string }
 interface Bundle {
   format: typeof FORMAT;
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   releaseId: string;
   exportedAt: string;
   docCount: number;
   sourceCount: number;
   files: BundleFile[];
+  proof?: BundleFile;
 }
 export interface PortableKbPreview {
   releaseId: string;
@@ -111,17 +118,38 @@ function exportExistsError(): PortableKbError {
 }
 
 export async function exportPortableKb(
-  root: string, destination: string, options: { overwrite?: boolean } = {},
+  root: string, destination: string, options: { overwrite?: boolean; knowledgeBaseRoot?: string; sheetCsvPaths?: (token: string) => string[] } = {},
 ): Promise<PortableKbPreview & { path: string }> {
   assertPathOutsideRoot(root, destination);
   const existing = exportTargetStat(destination);
   if (existing && !options.overwrite) throw exportExistsError();
   const release = resolveRelease(root);
   const files = await listReleaseFiles(release.releaseDir);
+  let proofBytes: Buffer | undefined;
+  if (options.knowledgeBaseRoot !== undefined) {
+    const proof: Record<string, string> = Object.create(null);
+    // Preserve manifest digests first, then exact-key cached proofs (including
+    // imported proofs), and only then recompute from the local exact bytes.
+    const baseline = withSourceComparisonBaseline(release.manifest, root)!;
+    for (const entry of baseline.sourceSnapshot) {
+      let digest = entry.comparisonHash;
+      if (!isDigest(digest) && options.knowledgeBaseRoot) {
+        try {
+          const source = resolveInside(options.knowledgeBaseRoot, entry.relPath, 'read');
+          digest = await sourceComparisonHash(entry.contentHash, visit => visitSourceFiles(
+            source, options.sheetCsvPaths?.(entry.objToken) ?? [], options.knowledgeBaseRoot!, visit));
+        } catch { /* Unreadable or changed sources cannot establish a baseline. */ }
+      }
+      if (isDigest(digest)) proof[sourceComparisonKey(entry)] = digest;
+    }
+    proofBytes = Buffer.from(JSON.stringify(proof));
+    if (proofBytes.length > MAX_PROOF_BYTES) invalid('共享包对比证明超过大小上限');
+  }
   const bundle: Bundle = {
-    format: FORMAT, schemaVersion: 1, releaseId: release.releaseId,
+    format: FORMAT, schemaVersion: proofBytes ? 2 : 1, releaseId: release.releaseId,
     exportedAt: new Date().toISOString(), docCount: release.manifest.docs.length,
     sourceCount: release.manifest.sourceSnapshot.length, files,
+    ...(proofBytes ? { proof: { path: PROOF_PATH, size: proofBytes.length, sha256: createHash('sha256').update(proofBytes).digest('hex') } } : {}),
   };
   const temp = `${destination}.${randomUUID()}.tmp`;
   const archive = archiver('zip', { zlib: { level: 6 } });
@@ -132,6 +160,7 @@ export async function exportPortableKb(
   archive.on('warning', (error) => archive.destroy(error));
   try {
     archive.append(JSON.stringify(bundle), { name: 'bundle.json' });
+    if (proofBytes) archive.append(proofBytes, { name: PROOF_PATH });
     for (const item of files) archive.file(path.join(release.releaseDir, item.path), { name: `release/${item.path}` });
     await Promise.all([archive.finalize(), writing]);
     if (existing) {
@@ -175,11 +204,11 @@ async function openBundle(archivePath: string): Promise<{ bundle: Bundle; entrie
   if (!stat.isFile() || stat.isSymbolicLink()) invalid('共享包不是普通文件');
   if (stat.size > MAX_BYTES || stat.size === 0) invalid('共享包大小无效');
   const zip = await unzipper.Open.file(archivePath).catch(() => invalid('共享包不是有效 ZIP 文件'));
-  if (zip.files.length > MAX_FILES + 1) invalid('共享包文件过多');
+  if (zip.files.length > MAX_FILES + 2) invalid('共享包文件过多');
   const entries = new Map<string, unzipper.File>();
   for (const entry of zip.files) {
     if (entry.type !== 'File' || entries.has(entry.path)) invalid('共享包含目录或重复条目');
-    if (entry.path !== 'bundle.json') {
+    if (entry.path !== 'bundle.json' && entry.path !== PROOF_PATH) {
       if (!entry.path.startsWith('release/')) invalid('共享包含未知条目');
       assertSafeRelative(entry.path.slice('release/'.length));
     }
@@ -206,11 +235,17 @@ async function openBundle(archivePath: string): Promise<{ bundle: Bundle; entrie
     if (error instanceof PortableKbError) throw error;
     return invalid('共享包清单不是合法 JSON');
   }
-  if (bundle.format !== FORMAT || bundle.schemaVersion !== 1 || !Array.isArray(bundle.files)
+  if (bundle.format !== FORMAT || (bundle.schemaVersion !== 1 && bundle.schemaVersion !== 2) || !Array.isArray(bundle.files)
     || !Number.isSafeInteger(bundle.docCount) || bundle.docCount < 0
     || !Number.isSafeInteger(bundle.sourceCount) || bundle.sourceCount < 0) invalid('共享包格式或版本不支持');
   try { validateReleaseId(bundle.releaseId); } catch { invalid('版本标识无效'); }
-  if (bundle.files.length !== entries.size - 1 || bundle.files.length > MAX_FILES || !bundle.files.length) invalid('共享包文件清单不匹配');
+  if (bundle.schemaVersion === 2) {
+    const proof = bundle.proof;
+    if (!proof || proof.path !== PROOF_PATH || !Number.isSafeInteger(proof.size) || proof.size < 0 || proof.size > MAX_PROOF_BYTES
+      || typeof proof.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(proof.sha256)
+      || entries.get(PROOF_PATH)?.uncompressedSize !== proof.size) invalid('共享包对比证明清单无效');
+  } else if (bundle.proof !== undefined || entries.has(PROOF_PATH)) invalid('共享包对比证明版本无效');
+  if (bundle.files.length !== entries.size - 1 - (bundle.schemaVersion === 2 ? 1 : 0) || bundle.files.length > MAX_FILES || !bundle.files.length) invalid('共享包文件清单不匹配');
   let bytes = 0;
   const seen = new Set<string>();
   for (const item of bundle.files) {
@@ -273,6 +308,51 @@ async function verifyRelease(stagingRoot: string, bundle: Bundle): Promise<KbMan
   }
 }
 
+// A bundle's proof is trusted at the same level as its sender and release:
+// format, SHA and keys do not authenticate the digest's binding to old bytes.
+// It influences pending previews/incremental comparison, not build-time
+// readVerified or the exact-byte validation before publication.
+async function readProof(bundle: Bundle, entries: Map<string, unzipper.File>, manifest: KbManifest): Promise<Record<string, string> | undefined> {
+  if (!bundle.proof) return undefined;
+  const chunks: Buffer[] = [];
+  let size = 0;
+  const hash = createHash('sha256');
+  for await (const chunk of entries.get(PROOF_PATH)!.stream()) {
+    const bytes = chunk as Buffer;
+    size += bytes.length;
+    if (size > bundle.proof.size || size > MAX_PROOF_BYTES) invalid('共享包对比证明过大');
+    hash.update(bytes); chunks.push(bytes);
+  }
+  if (size !== bundle.proof.size || hash.digest('hex') !== bundle.proof.sha256) invalid('共享包对比证明校验失败');
+  let parsed: unknown;
+  try { parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return invalid('共享包对比证明不是合法 JSON'); }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) invalid('共享包对比证明结构无效');
+  const allowed = new Set(manifest.sourceSnapshot.map(sourceComparisonKey));
+  for (const [key, value] of Object.entries(parsed)) {
+    if (!allowed.has(key) || !isDigest(value)) invalid('共享包对比证明条目无效');
+  }
+  return parsed as Record<string, string>;
+}
+
+// Imported proofs retain the sender's trust level when merged or forwarded;
+// they cannot replace readVerified or publication's exact-byte checks.
+function mergeProof(root: string, proof: Record<string, string>): void {
+  const target = path.join(root, SOURCE_COMPARISON_CACHE);
+  let previous: Record<string, unknown> = {};
+  try {
+    const parsed: unknown = JSON.parse(fs.readFileSync(target, 'utf8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('invalid local proof');
+    previous = parsed as Record<string, unknown>;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  const temp = `${target}.${randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(temp, JSON.stringify({ ...proof, ...previous }), { flag: 'wx' });
+    fs.renameSync(temp, target);
+  } finally { fs.rmSync(temp, { force: true }); }
+}
+
 /** Install only after all streamed entries and release references pass validation. */
 export async function importPortableKb(
   root: string, archivePath: string, expectedCurrentReleaseId: string | null,
@@ -308,6 +388,7 @@ export async function importPortableKb(
     if (manifestRaw.releaseId !== bundle.releaseId) invalid('共享包版本标识不一致');
     await fs.promises.writeFile(path.join(stage, 'CURRENT.json'), JSON.stringify(pointerFor(manifestRaw)));
     const manifest = await verifyRelease(stage, bundle);
+    const proof = await readProof(bundle, entries, manifest);
     assertIdle();
     if (currentId(root) !== before) throw new PortableKbError('kb_current_changed', '当前标准库已变化，请重新预览后导入', 409);
     const targetDir = path.join(root, 'releases', bundle.releaseId);
@@ -333,6 +414,10 @@ export async function importPortableKb(
       await fs.promises.rename(markerTemp, marker);
     }
     writePointer(root, pointerFor(manifest));
+    if (proof) {
+      try { mergeProof(root, proof); }
+      catch (error) { console.warn('[kb] imported comparison proof could not be merged:', error); }
+    }
     return {
       releaseId: bundle.releaseId, docCount: bundle.docCount, sourceCount: bundle.sourceCount,
       fileCount: bundle.files.length, unpackedBytes: bundle.files.reduce((n, item) => n + item.size, 0),

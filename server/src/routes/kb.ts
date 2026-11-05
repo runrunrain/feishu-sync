@@ -24,9 +24,9 @@ import { exportPortableKb, importPortableKb, inspectPortableKb, isImportedReleas
 import { QueryError, getKbQueryService } from '../kb/search/kb-query-service.js';
 import { RawSourceSnapshot, collectSourceCandidates } from '../kb/raw-source-snapshot.js';
 import { addSourceComparisonHashes, sourceContentsChanged, withSourceComparisonBaseline } from '../kb/source-comparison.js';
-import { KbVersionStore, captureSourceContents, sourceChangePreview, validReleaseId } from '../kb/kb-version-store.js';
+import { KbVersionStore, captureSourceContents, sourceChangePreview, sourceEntryChanged, validReleaseId } from '../kb/kb-version-store.js';
 import type { KbChangePreview } from '../types/kb-version.js';
-import { computeChangeset } from '../kb/kb-build-service.js';
+
 import { KnowledgeGovernanceService, allowedDecisionTargets } from '../kb/knowledge-governance-service.js';
 import { enrichEntriesWithMedia, enrichEntriesWithWhiteboardTextHash, hashImageFile, resolveSourceImages } from '../kb/source-images.js';
 import { ToolError } from '../agent/agent-tool-service.js';
@@ -98,12 +98,16 @@ async function compareSources(
   // 非空 manifest 值恒不等而虚报 changed；先补算再比较（mediaHash 语义不变）。
   enrichEntriesWithWhiteboardTextHash(knowledgeBaseRoot, currentEntries);
   await prepareSourcePreview(currentEntries, manifest, knowledgeBaseRoot, sheetCsvPaths);
-  const changeset = computeChangeset(currentEntries, manifest);
+  const before = new Map(manifest.sourceSnapshot.map(entry => [entry.objToken, entry]));
+  const current = new Map(currentEntries.map(entry => [entry.objToken, entry]));
   return {
     pending: {
-      added: changeset.added.length,
-      changed: changeset.changed.length,
-      removed: changeset.removed.length,
+      added: currentEntries.filter(entry => !before.has(entry.objToken)).length,
+      changed: currentEntries.filter(entry => {
+        const prior = before.get(entry.objToken);
+        return !!prior && sourceEntryChanged(prior, entry);
+      }).length,
+      removed: manifest.sourceSnapshot.filter(entry => !current.has(entry.objToken)).length,
     },
   };
 }
@@ -210,7 +214,9 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
         throw new PortableKbError('invalid_request', '请选择导出位置并确认是否替换同名文件');
       }
       const { config } = await loadStore();
-      return c.json(await exportPortableKb(config.standardKb.outputRoot, body.path, { overwrite: body.overwrite === true }));
+      return c.json(await exportPortableKb(config.standardKb.outputRoot, body.path, {
+        overwrite: body.overwrite === true, knowledgeBaseRoot: config.knowledgeBaseRoot, sheetCsvPaths: deps.sheetCsvPaths,
+      }));
     } catch (error) { return errorResponse(c, error); }
   });
 
@@ -271,7 +277,7 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
       const current = store.readCurrent();
       const manifest = store.readManifest();
       const imported = Boolean(manifest && isImportedRelease(config.standardKb.outputRoot, manifest.releaseId));
-      const pending = imported ? { added: 0, changed: 0, removed: 0 } : (await compareSources(
+      const pending = (await compareSources(
         withSourceComparisonBaseline(manifest, config.standardKb.outputRoot), RawSourceSnapshot.scan(
         config.knowledgeBaseRoot,
         sourceDocuments(config.knowledgeBaseRoot, manifest?.sourceSnapshot.map((source) => source.objToken)),
@@ -543,6 +549,7 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
       const { store, config } = await loadStore();
       const manifest = withSourceComparisonBaseline(store.readManifest(), config.standardKb.outputRoot);
       const scan = RawSourceSnapshot.scan(config.knowledgeBaseRoot, sourceDocuments(config.knowledgeBaseRoot, manifest?.sourceSnapshot.map((source) => source.objToken)), deps.sheetCsvPaths);
+      enrichEntriesWithWhiteboardTextHash(config.knowledgeBaseRoot, scan.entries);
       await prepareSourcePreview(scan.entries, manifest, config.knowledgeBaseRoot, deps.sheetCsvPaths);
       const snapshot = RawSourceSnapshot.fromEntries(scan.entries, { sheetCsvPaths: deps.sheetCsvPaths });
       const contents = captureSourceContents(snapshot, config.knowledgeBaseRoot);

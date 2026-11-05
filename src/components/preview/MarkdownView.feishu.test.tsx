@@ -68,3 +68,17 @@ it('renders referenced content, and lets the user retry after a read error', asy
     expect(container.textContent).not.toContain('<synced-source');
   } finally { act(() => root.unmount()); }
 });
+
+it('offers the local source preview without a Feishu link when the exact block is unavailable', async () => {
+  (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  api.getSyncedReference.mockReset().mockResolvedValue({ source: 'local-document', content: '# 本地原文', baseDir: 'source' });
+  const container = document.createElement('div'); const root = createRoot(container);
+  try {
+    await act(async () => root.render(<MarkdownView content={sample} resolveSyncedReferences feishuHost="example.feishu.cn" />));
+    expect(container.textContent).not.toContain('无法加载引用内容');
+    expect(container.textContent).not.toContain('查看飞书原文');
+    expect(container.querySelector('[data-md-block="synced-reference"] h1')).toBeNull();
+    await act(async () => [...container.querySelectorAll('button')].find((button) => button.textContent === '查看本地源文档')!.click());
+    expect(container.textContent).toContain('本地原文');
+  } finally { act(() => root.unmount()); }
+});

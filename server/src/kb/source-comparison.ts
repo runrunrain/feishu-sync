@@ -72,8 +72,11 @@ export function sourceComparisonKey(entry: Pick<RawSourceSnapshotEntry, 'objToke
   return JSON.stringify([entry.objToken, entry.contentHash, entry.relPath]);
 }
 
-/** Old releases stay immutable. Optional local proof is keyed to their exact
- * source version and is absent when the original bundle could not be verified. */
+/** Old releases stay immutable. Local proof is keyed to the exact source
+ * version; imported values are as trustworthy as the bundle sender, not
+ * independently verified against old source bytes. They affect pending previews
+ * and incremental comparison, never build-time readVerified or the exact-byte
+ * validation before publication. */
 export function withSourceComparisonBaseline(base: KbManifest | null, outputRoot: string): KbManifest | null {
   if (!base || base.sourceSnapshot.every(entry => isDigest(entry.comparisonHash))) return base;
   let proof: Record<string, unknown>;
@@ -84,6 +87,20 @@ export function withSourceComparisonBaseline(base: KbManifest | null, outputRoot
     const digest = proof[sourceComparisonKey(entry)];
     return !isDigest(entry.comparisonHash) && isDigest(digest) ? { ...entry, comparisonHash: digest } : entry;
   }) };
+}
+
+/** Fill missing proofs only when the complete source still matches this exact version. */
+export async function captureMissingSourceComparisonHashes(entries: RawSourceSnapshotEntry[], root: string,
+  csvPaths: (token: string) => string[]): Promise<void> {
+  for (const entry of entries) {
+    if (isDigest(entry.comparisonHash)) continue;
+    try {
+      const realPath = resolveInside(root, entry.relPath, 'read');
+      const digest = await sourceComparisonHash(entry.contentHash,
+        visit => visitSourceFiles(realPath, csvPaths(entry.objToken), root, visit));
+      if (digest) entry.comparisonHash = digest;
+    } catch { /* Missing or unsupported sources retain exact-byte comparison. */ }
+  }
 }
 
 const liveDigests = new Map<string, string>();

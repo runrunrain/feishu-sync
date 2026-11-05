@@ -20,21 +20,25 @@ import { PiRuntimeResolver } from '../src/agent/runtime-resolver.js';
 import type { SessionStoreApi } from '../src/agent/session-service.js';
 import type { Config } from '../src/types/index.js';
 
-function makeStore(): SessionStoreApi & {
-  rows: Map<string, Record<string, unknown>>;
-} {
+function makeStore() {
   const rows = new Map<string, Record<string, unknown>>();
   return {
     rows,
     getAgentSession: (id: string) => (rows.get(id) ? { ...rows.get(id)! } : null),
-    createAgentSession: (input: { id: string; title: string; mode: string; workspaceId: string | null; createdAt: string; updatedAt: string }) => {
+    createAgentSession: (input: Parameters<import('../src/modules/local-map-store.js').LocalMapStore['createAgentSession']>[0]) => {
       rows.set(input.id, {
         id: input.id, title: input.title, mode: input.mode, workspace_id: input.workspaceId,
+        approval_mode: input.approvalMode, model_config_json: input.modelConfig,
         pi_session_file: null, last_error_code: null, last_error_message: null,
         created_at: input.createdAt, updated_at: input.updatedAt, deleted_at: null,
       });
     },
     listAgentSessions: () => [...rows.values()].filter((row) => !row.deleted_at),
+    getAgentSessionDefaults: () => ({ approvalMode: 'ask' as const, modelConfig: null }),
+    saveAgentSessionPreferences: (id: string, patch: { approvalMode?: 'ask' | 'auto'; modelConfig?: string | null }) => {
+      if (patch.approvalMode !== undefined) rows.get(id)!.approval_mode = patch.approvalMode;
+      if (patch.modelConfig !== undefined) rows.get(id)!.model_config_json = patch.modelConfig;
+    },
     updateAgentSession: (id: string, patch: Record<string, unknown>) => {
       const row = rows.get(id);
       if (!row) throw new Error(`agent_session 不存在: ${id}`);
@@ -42,6 +46,7 @@ function makeStore(): SessionStoreApi & {
       const mapped: Record<string, unknown> = {};
       if ('title' in patch) mapped.title = patch.title;
       if ('mode' in patch) mapped.mode = patch.mode;
+      if ('approvalMode' in patch) mapped.approval_mode = patch.approvalMode;
       if ('workspaceId' in patch) mapped.workspace_id = patch.workspaceId;
       if ('piSessionFile' in patch) mapped.pi_session_file = patch.piSessionFile;
       if ('lastErrorCode' in patch) mapped.last_error_code = patch.lastErrorCode;
@@ -52,7 +57,7 @@ function makeStore(): SessionStoreApi & {
     },
     listSessionsByWorkspace: (workspaceId: string) =>
       [...rows.values()].filter((row) => row.workspace_id === workspaceId && !row.deleted_at),
-  } as ReturnType<typeof makeStore>;
+  } satisfies SessionStoreApi & Record<string, unknown>;
 }
 
 const temporaryRoots: string[] = [];
@@ -109,9 +114,9 @@ it('审批方式仅适用于 Work，会话隔离并在移除工作区后恢复�
   expect(() => service.setApprovalMode(store, first.id, 'auto')).toThrow(/Work/);
   store.updateAgentSession(first.id, { mode: 'work', workspaceId: 'ws_test1' });
   expect(service.setApprovalMode(store, first.id, 'auto').approvalMode).toBe('auto');
-  expect(service.approvalMode(second.id)).toBe('ask');
+  expect(service.approvalMode(store, second.id)).toBe('ask');
   await service.demoteSessionsOnWorkspaceRemoval(store, 'ws_test1');
-  expect(service.approvalMode(first.id)).toBe('ask');
+  expect(service.approvalMode(store, first.id)).toBe('ask');
 });
 
 it('按工作区创建只读会话并用首条消息命名，不覆盖手动标题', async () => {

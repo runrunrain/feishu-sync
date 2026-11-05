@@ -27,6 +27,7 @@ interface SessionListPanelProps {
   activeId: string | null;
   onSelect: (id: string) => void;
   onCreate: (workspaceId?: string) => void;
+  creating?: boolean;
   workspaces?: AgentWorkspaceConfig[];
   onAddWorkspace?: () => void;
   workspaceMode?: boolean;
@@ -47,6 +48,7 @@ export function SessionListPanel({
   activeId,
   onSelect,
   onCreate,
+  creating = false,
   onRename,
   onDelete,
   workspaces = [],
@@ -82,7 +84,7 @@ export function SessionListPanel({
     <div className="flex flex-col h-full min-h-0" data-testid="agent-session-list">
       <div className="flex items-center justify-between px-3 py-2.5 border-b border-line/60 shrink-0">
         <span className="text-sm font-kai font-medium text-ink">会话</span>
-        <Button size="sm" variant="ghost" onClick={() => onCreate()} aria-label="新建会话">
+        <Button size="sm" variant="ghost" loading={creating} onClick={() => onCreate()} aria-label="新建会话">
           <Plus className="w-4 h-4" />
           新建
         </Button>
@@ -103,7 +105,7 @@ export function SessionListPanel({
               <br />
               新建一个，开始与 Agent 讨论设计。
             </p>
-            <Button size="sm" variant="secondary" className="mt-3" onClick={() => onCreate()}>
+            <Button size="sm" variant="secondary" className="mt-3" disabled={creating} onClick={() => onCreate()}>
               新建会话
             </Button>
           </div>
@@ -111,7 +113,7 @@ export function SessionListPanel({
           [...(workspaceMode ? workspaces.map((workspace) => ({ id: workspace.id, name: workspace.name, items: sessions.filter((s) => s.workspace?.id === workspace.id) })) : []),
             { id: '', name: workspaceMode ? '未分组' : '', items: workspaceMode ? sessions.filter((s) => !s.workspace || !workspaces.some((workspace) => workspace.id === s.workspace?.id)) : sessions }]
           .filter((group) => group.id || group.items.length).map((group) => <div key={group.id}>
-            {group.name && <div className="flex items-center gap-1 px-3 py-2 text-xs text-ink-faint"><span className="min-w-0 flex-1 truncate">{group.name}</span>{group.id && <button aria-label={`在 ${group.name} 新建会话`} onClick={() => onCreate(group.id)} className="p-1 hover:text-seal"><Plus className="w-3.5 h-3.5" /></button>}</div>}
+            {group.name && <div className="flex items-center gap-1 px-3 py-2 text-xs text-ink-faint"><span className="min-w-0 flex-1 truncate">{group.name}</span>{group.id && <button type="button" disabled={creating} aria-label={`在 ${group.name} 新建会话`} onClick={() => onCreate(group.id)} className="p-1 hover:text-seal disabled:opacity-50"><Plus className="w-3.5 h-3.5" /></button>}</div>}
           {group.items.map((s) => {
             const active = s.id === activeId;
             return (

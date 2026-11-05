@@ -337,7 +337,7 @@ export function AgentRuntimeSettingsCard() {
     <CardShell
       icon={<Bot className="w-4 h-4" />}
       title="Agent 运行时与模型"
-      description="选择标准知识库构建等应用基础能力使用的基座；新会话可单独选择，已有会话保持原基座"
+      description="选择标准知识库构建等应用能力使用的基座。对话页新建会话使用 Pi。"
     >
       <div>
         <FieldLabel>应用基础能力的 Agent 基座</FieldLabel>

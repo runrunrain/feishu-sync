@@ -58,7 +58,7 @@ export function ConversationModelPicker({ session, busy, onChanged }: { session:
     ? current.piModel ? { source: 'pi-agent-dir', piModel: current.piModel, thinkingLevel: thinking } : null
     : currentProvider && currentPreset ? { source: 'app-llm', providerId: currentProvider, modelId: currentPreset, thinkingLevel: thinking } : null;
   return <div ref={root} className="relative flex items-center gap-1 min-w-0" data-testid="conversation-model-picker">
-    <button type="button" aria-label="切换会话模型" aria-expanded={open === 'models'} disabled={disabled} title={busy ? '运行结束后可切换' : '仅当前会话生效，保留历史'}
+    <button type="button" aria-label="切换会话模型" aria-expanded={open === 'models'} disabled={disabled} title={busy ? '运行结束后可切换' : '为当前会话选择模型，同时记为新会话默认'}
       className="inline-flex min-w-0 items-center gap-1 rounded-full px-2.5 py-1 text-xs text-ink-soft hover:bg-paper-2 disabled:opacity-45"
       onClick={() => { setSource(session?.backend === 'claude-code' ? 'app-llm' : current?.source ?? 'app-llm'); setOpen(open === 'models' ? null : 'models'); }}><span className="max-w-[180px] truncate">{label}</span><ChevronDown className="h-3 w-3 shrink-0" /></button>
     <button type="button" aria-label="调整模型思考强度" aria-expanded={open === 'effort'} disabled={disabled || !activeChoice() || !reasoning} title={reasoning ? '调整当前会话的思考强度' : levels ? '该模型没有可选的思考档位' : '无法探测档位，请在模型预设中配置'}
@@ -77,7 +77,7 @@ export function ConversationModelPicker({ session, busy, onChanged }: { session:
         <p className="my-2 text-xs text-center text-ink-soft truncate">{label}</p>
         <div className="flex flex-wrap gap-1 rounded-xl bg-paper-2 p-1" role="group" aria-label="选择思考强度">
           {levels?.map((level) => <button key={level} aria-pressed={thinking === level} aria-label={`${LABELS[level]}思考`} className={`flex-1 rounded-full px-2 py-2 text-[11px] ${thinking === level ? 'bg-seal text-white' : 'text-ink-soft hover:bg-seal/10'}`} onClick={() => { const choice = activeChoice(); if (choice) void save({ ...choice, thinkingLevel: level }); }}>{LABELS[level]}</button>)}
-        </div><p className="mt-2 text-[10px] text-ink-faint">仅当前会话生效；下一次发送使用所选强度。</p>
+        </div><p className="mt-2 text-[10px] text-ink-faint">下一次发送使用所选强度，新会话也会沿用。</p>
       </>}
     </div> : null}
   </div>;

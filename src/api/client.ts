@@ -698,10 +698,17 @@ export async function getDocumentContent(objToken: string): Promise<DocumentCont
   );
 }
 
-/** Read a referenced Feishu block on demand; the source file stays unchanged. */
-export function getSyncedReference(token: string, block: string): Promise<{ content: string; baseDir?: string }> {
+export interface SyncedReferenceContent {
+  content: string;
+  baseDir?: string;
+  source?: 'local-block' | 'local-document';
+  truncated?: boolean;
+}
+
+/** Prefer the referenced content from the local source copy. */
+export function getSyncedReference(token: string, block: string): Promise<SyncedReferenceContent> {
   const query = new URLSearchParams({ token, block });
-  return request<{ content: string }>(`/api/mapping/synced-reference?${query}`);
+  return request<SyncedReferenceContent>(`/api/mapping/synced-reference?${query}`);
 }
 
 /**

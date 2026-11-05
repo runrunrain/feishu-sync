@@ -128,7 +128,7 @@ describe('Agent 基座选择', () => {
       model: { ...agent.model, source: 'pi-agent-dir', piModel: 'pi/model' } }, llm: { providers: [...PROVIDERS, anthropic] } }));
     const html = renderToStaticMarkup(<AgentRuntimeSettingsCard />);
     expect(html).toContain('应用基础能力的 Agent 基座');
-    expect(html).toContain('新会话可单独选择');
+    expect(html).toContain('对话页新建会话使用 Pi');
     expect(html).toContain('Claude Code 路径覆盖');
     expect(html).toContain('pi 路径覆盖');
     expect(html).toContain('更新 Pi');

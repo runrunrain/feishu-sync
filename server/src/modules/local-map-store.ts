@@ -139,6 +139,7 @@ export class LocalMapStore {
     if (sessionCols.length && !sessionCols.some((c) => c.name === 'model_config_json')) this.db.exec('ALTER TABLE agent_sessions ADD COLUMN model_config_json TEXT');
     if (sessionCols.length && !sessionCols.some((c) => c.name === 'runtime_backend')) this.db.exec("ALTER TABLE agent_sessions ADD COLUMN runtime_backend TEXT NOT NULL DEFAULT 'pi'");
     if (sessionCols.length && !sessionCols.some((c) => c.name === 'local_resources')) this.db.exec('ALTER TABLE agent_sessions ADD COLUMN local_resources INTEGER NOT NULL DEFAULT 0');
+    if (sessionCols.length && !sessionCols.some((c) => c.name === 'approval_mode')) this.db.exec("ALTER TABLE agent_sessions ADD COLUMN approval_mode TEXT NOT NULL DEFAULT 'ask' CHECK(approval_mode IN ('ask', 'auto'))");
     // S4（设计 §4.6）：kb_builds 并行构建新列——PRAGMA 守卫 + SAVEPOINT 外
     // 逐列 ALTER（与 documents 段同模式，但列 DEFAULT 已覆盖旧行）。
     const kbBuildCols = this.db.prepare('PRAGMA table_info(kb_builds)').all() as Array<{ name: string }>;
@@ -2913,13 +2914,32 @@ export class LocalMapStore {
     mode: 'discuss' | 'work';
     workspaceId: string | null;
     backend?: 'pi' | 'claude-code';
+    approvalMode?: 'ask' | 'auto';
+    modelConfig?: string | null;
     createdAt: string;
     updatedAt: string;
   }): void {
     this.db.prepare(`
-      INSERT INTO agent_sessions (id, title, mode, workspace_id, created_at, updated_at, runtime_backend)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(input.id, input.title, input.mode, input.workspaceId, input.createdAt, input.updatedAt, input.backend ?? 'pi');
+      INSERT INTO agent_sessions (id, title, mode, workspace_id, created_at, updated_at, runtime_backend, approval_mode, model_config_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(input.id, input.title, input.mode, input.workspaceId, input.createdAt, input.updatedAt, input.backend ?? 'pi', input.approvalMode ?? 'ask', input.modelConfig ?? null);
+  }
+
+  getAgentSessionDefaults(backend: 'pi' | 'claude-code'): { approvalMode: 'ask' | 'auto'; modelConfig: string | null } {
+    const read = this.db.prepare('SELECT value FROM agent_session_preferences WHERE key = ?').pluck();
+    const modelConfig = read.get(`model:${backend}`) as string | null | undefined;
+    return { approvalMode: read.get('approval') === 'auto' ? 'auto' : 'ask', modelConfig: modelConfig ?? null };
+  }
+
+  saveAgentSessionPreferences(id: string, patch: { approvalMode?: 'ask' | 'auto'; modelConfig?: string | null }): void {
+    this.db.transaction(() => {
+      const row = this.getAgentSession(id);
+      if (!row) throw new Error(`agent_session 不存在: ${id}`);
+      this.updateAgentSession(id, patch);
+      const save = this.db.prepare('INSERT INTO agent_session_preferences (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value');
+      if (patch.approvalMode !== undefined) save.run('approval', patch.approvalMode);
+      if (patch.modelConfig !== undefined) save.run(`model:${row.runtime_backend}`, patch.modelConfig);
+    })();
   }
 
   getAgentSession(id: string): Record<string, unknown> | null {
@@ -2938,6 +2958,7 @@ export class LocalMapStore {
     workspaceId: string | null;
     piSessionFile: string | null;
     modelConfig: string | null;
+    approvalMode: 'ask' | 'auto';
     localResources: boolean;
     lastErrorCode: string | null;
     lastErrorMessage: string | null;
@@ -2948,7 +2969,7 @@ export class LocalMapStore {
     if (!current) throw new Error(`agent_session 不存在: ${id}`);
     this.db.prepare(`
       UPDATE agent_sessions SET title=?, mode=?, workspace_id=?, pi_session_file=?,
-        last_error_code=?, last_error_message=?, updated_at=?, deleted_at=?, model_config_json=?, local_resources=?
+        last_error_code=?, last_error_message=?, updated_at=?, deleted_at=?, model_config_json=?, local_resources=?, approval_mode=?
       WHERE id=?
     `).run(
       patch.title ?? current.title,
@@ -2961,6 +2982,7 @@ export class LocalMapStore {
       patch.deletedAt !== undefined ? patch.deletedAt : current.deleted_at,
       patch.modelConfig !== undefined ? patch.modelConfig : current.model_config_json,
       patch.localResources !== undefined ? Number(patch.localResources) : current.local_resources,
+      patch.approvalMode ?? current.approval_mode,
       id,
     );
   }
@@ -3973,6 +3995,7 @@ export class LocalMapStore {
         model_config_json TEXT,
         runtime_backend TEXT NOT NULL DEFAULT 'pi',
         local_resources INTEGER NOT NULL DEFAULT 0,
+        approval_mode TEXT NOT NULL DEFAULT 'ask' CHECK(approval_mode IN ('ask', 'auto')),
         last_error_code TEXT,
         last_error_message TEXT,
         created_at TEXT NOT NULL,
@@ -3980,6 +4003,10 @@ export class LocalMapStore {
         deleted_at TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_agent_sessions_updated ON agent_sessions(updated_at);
+      CREATE TABLE IF NOT EXISTS agent_session_preferences (
+        key TEXT PRIMARY KEY,
+        value TEXT
+      );
 
       -- =====================================================================
       -- 源库受控编辑（S11，设计 §7.4）。新表：CREATE TABLE IF NOT EXISTS 对

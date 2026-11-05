@@ -27,17 +27,58 @@ import { Hono } from 'hono';
 import { MappingService, MappingValidationError, CrossParentReorderError } from '../modules/mapping-service.js';
 import { SnapshotService } from '../modules/snapshot-service.js';
 import { IndexScanner } from '../modules/index-scanner.js';
+import { toPortableRelative } from '../modules/path-resolver.js';
+import { recoverLocalDocument } from '../modules/recover-local-document.js';
+import { readTextCapped } from './content.js';
+import type { LocalMapStore } from '../modules/local-map-store.js';
 import type { ReorderRequest } from '../types/index.js';
 
 const mappingRoutes = new Hono();
 
-/** Read one Feishu synced block without modifying the local source document. */
+function findSyncedSourceFile(root: string, store: Pick<LocalMapStore, 'getDocumentByObjToken' | 'isLocalSourceDeleted'>, token: string): string | null {
+  const record = store.getDocumentByObjToken(token);
+  if (record?.pendingReason === 'local_deleted' || store.isLocalSourceDeleted?.(root, token)) return null;
+  const resolveMarkdown = (file: string | null | undefined) => {
+    if (!file || !/\.md$/i.test(file)) return null;
+    const relative = toPortableRelative(root, file);
+    if (!relative) return null;
+    try { return resolveInside(root, relative, 'read'); } catch { return null; }
+  };
+  return resolveMarkdown(record?.localRelPath) ?? resolveMarkdown(record?.localMdPath)
+    ?? resolveMarkdown(recoverLocalDocument(root, {
+      objToken: token, wikiNodeToken: record?.wikiNodeToken, localMdPath: '',
+    }, { allowAnyState: true }));
+}
+
+/** Some Markdown exports omit block IDs. An unlabelled block cannot identify a reference. */
+function findLocalSyncedBlock(content: string, block: string): string | null {
+  const matches = [...content.matchAll(/<synced-source\b([^>]*)>([\s\S]*?)<\/synced-source\s*>/gi)]
+    .filter((match) => /(?:^|\s)(?:id|block-id)\s*=\s*(?:"([^"]*)"|'([^']*)')/i.exec(match[1])?.slice(1).includes(block));
+  return matches.length === 1 ? matches[0][2] : null;
+}
+
+/** Prefer the synced local copy, with a cloud block request when the copy is unavailable. */
 mappingRoutes.get('/api/mapping/synced-reference', async (c) => {
   const token = c.req.query('token') ?? '';
   const block = c.req.query('block') ?? '';
   if (!/^[A-Za-z0-9]{1,128}$/.test(token) || !/^[A-Za-z0-9]{1,128}$/.test(block)) {
     return c.json({ error: 'invalid_reference', message: '同步引用标识无效' }, 400);
   }
+  let baseDir: string | null = null;
+  const root = (c as any).configManager?.getConfig()?.knowledgeBaseRoot;
+  try {
+    const file = root && findSyncedSourceFile(root, (c as any).localMapStore, token);
+    if (file) {
+      baseDir = path.relative(fs.realpathSync.native(root), path.dirname(file)).replace(/\\/g, '/');
+      const local = readTextCapped(file);
+      if (local?.content.trim()) {
+        const blockContent = local.truncated ? null : findLocalSyncedBlock(local.content, block);
+        if (blockContent !== null) return c.json({ source: 'local-block', content: blockContent, baseDir });
+        return c.json({ source: 'local-document', ...local, baseDir });
+      }
+    }
+  } catch { /* An unreadable local copy can still be resolved from Feishu. */ }
+
   try {
     const result = await (c as any).larkCliClient.fetchSyncedReference(token, block);
     let content = result?.data?.document?.content;
@@ -46,13 +87,8 @@ mappingRoutes.get('/api/mapping/synced-reference', async (c) => {
     // A cloud block may contain whiteboard tokens while the indexed source
     // already has their rendered images. Only use a unique, confined local
     // token match; never guess a different image when it is missing.
-    let baseDir = '';
     try {
-      const root = (c as any).configManager.getConfig()?.knowledgeBaseRoot;
-      const record = (c as any).localMapStore.getDocumentByObjToken(token);
-      if (root && record?.localRelPath) {
-        const source = resolveInside(root, record.localRelPath, 'read');
-        baseDir = path.relative(fs.realpathSync.native(root), path.dirname(source)).replace(/\\/g, '/');
+      if (root && baseDir !== null) {
         const imageDir = resolveInside(root, path.join(baseDir, 'images'), 'read');
         const files = fs.readdirSync(imageDir, { withFileTypes: true }).filter((item) => item.isFile()).map((item) => item.name);
         content = content.replace(/<whiteboard\b([^>]*?)(?:\/\s*>|>\s*<\/whiteboard\s*>)/gi, (whole: string, attrs: string) => {
@@ -64,7 +100,7 @@ mappingRoutes.get('/api/mapping/synced-reference', async (c) => {
         });
       }
     } catch { /* Missing/unsafe local media remains an explicit placeholder. */ }
-    return c.json({ content, baseDir });
+    return c.json({ content, baseDir: baseDir ?? '' });
   } catch (error) {
     const code = (error as { code?: string })?.code;
     return c.json({ error: code ?? 'reference_unavailable', message: code === 'permission' ? '暂无同步引用访问权限' : '无法读取同步引用，请检查网络或飞书访问权限' }, code === 'permission' ? 403 : 502);

@@ -71,17 +71,74 @@ it('将 Excel 操作放在格式页签行，切换格式后仍可缩放与下载
   }
 });
 
-it('独立画板保留缩放和下载入口', async () => {
+it('独立画板可用 Ctrl＋滚轮连续缩放，并保留光标下的位置', async () => {
   vi.stubGlobal('ResizeObserver', class { observe() {} disconnect() {} });
   api.getWorkbookPreview.mockResolvedValue({ sheets: [{ index: 0, name: 'Sheet1', state: 'visible' }], sheet: {
-    index: 0, name: 'Sheet1', rows: [20], columns: [80], cells: [], merges: [], images: [], showGridLines: false, warnings: [],
+    index: 0, name: 'Sheet1', rows: [800], columns: [900], cells: [], merges: [], images: [], showGridLines: false, warnings: [],
   } });
   const container = document.createElement('div'); document.body.append(container);
   const root = createRoot(container);
   try {
     await act(async () => root.render(<WorkbookView objToken="s1" fileName="s.xlsx" />));
-    expect(container.querySelector('[aria-label="Excel 缩放比例"]')).not.toBeNull();
+    const viewport = container.querySelector<HTMLDivElement>('[aria-label="Sheet1 Excel 画板"]')!;
+    Object.defineProperties(viewport, { clientWidth: { value: 200 }, clientHeight: { value: 150 } });
+    viewport.scrollLeft = 80;
+    viewport.scrollTop = 70;
+    const wheel = (ctrlKey: boolean) => viewport.dispatchEvent(new WheelEvent('wheel', {
+      bubbles: true, cancelable: true, ctrlKey, deltaY: -20, clientX: 100, clientY: 50,
+    }));
+    await act(async () => { expect(wheel(false)).toBe(true); });
+    expect(viewport.scrollLeft).toBe(80);
+    await act(async () => {
+      expect(wheel(true)).toBe(false);
+      expect(wheel(true)).toBe(false);
+    });
+    const select = container.querySelector<HTMLSelectElement>('[aria-label="Excel 缩放比例"]')!;
+    const zoom = Number(select.value);
+    expect(zoom).toBeGreaterThan(1.05);
+    expect(zoom).toBeLessThan(1.15);
+    expect((viewport.scrollLeft + 100) / zoom).toBeCloseTo(180);
+    expect((viewport.scrollTop + 50) / zoom).toBeCloseTo(120);
+    expect(select.selectedOptions[0].textContent).toBe(`${Math.round(zoom * 100)}%`);
     expect(container.textContent).toContain('下载 Excel');
+  } finally { act(() => root.unmount()); container.remove(); vi.unstubAllGlobals(); }
+});
+
+it('点击画板图片可在独立窗口拖动和滚轮缩放，关闭后回到图片', async () => {
+  vi.stubGlobal('ResizeObserver', class { observe() {} disconnect() {} });
+  const container = document.createElement('div'); document.body.append(container);
+  const root = createRoot(container);
+  const pointer = (target: Element, type: string, clientX: number, clientY: number) =>
+    target.dispatchEvent(Object.assign(new Event(type, { bubbles: true, cancelable: true }), {
+      clientX, clientY, pointerId: 4, pointerType: 'mouse', isPrimary: true, button: 0,
+    }));
+  try {
+    const src = 'data:image/png;base64,AA==';
+    await act(async () => root.render(<WorkbookCanvas sheet={{
+      index: 0, name: '画板', rows: [80], columns: [90], cells: [], merges: [],
+      images: [{ id: 'img', x: 0, y: 0, width: 60, height: 40, dataUrl: src }], showGridLines: false, warnings: [],
+    }} />));
+    const opener = container.querySelector<HTMLButtonElement>('[aria-label="查看画板 图片 1"]')!;
+    await act(async () => opener.click());
+    const dialog = document.querySelector('[role="dialog"]')!;
+    const viewport = dialog.querySelector<HTMLDivElement>('[aria-label="图片查看区域"]')!;
+    const image = viewport.querySelector('img')!;
+    expect(image.getAttribute('src')).toBe(src);
+    Object.defineProperty(viewport, 'setPointerCapture', { value: vi.fn() });
+    await act(async () => {
+      pointer(viewport, 'pointerdown', 20, 30);
+      pointer(viewport, 'pointermove', 40, 60);
+      pointer(viewport, 'pointerup', 40, 60);
+      pointer(viewport, 'pointermove', 70, 80);
+    });
+    expect(image.style.transform).toBe('translate(20px, 30px) scale(1)');
+    await act(async () => {
+      expect(viewport.dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: -50 }))).toBe(false);
+    });
+    expect(Number(dialog.querySelector('output')?.textContent?.replace('%', ''))).toBeGreaterThan(100);
+    await act(async () => window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' })));
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(document.activeElement).toBe(opener);
   } finally { act(() => root.unmount()); container.remove(); vi.unstubAllGlobals(); }
 });
 

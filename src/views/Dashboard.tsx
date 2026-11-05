@@ -44,6 +44,7 @@ import {
   previewSourceBatch,
 } from '../api/client';
 import { appLogger } from '../utils/appLogger';
+import { writeClipboardText } from '../utils/clipboard';
 import { onDiffChanged } from '../utils/syncEvents';
 import { isUsableWikiUrl, pickFirstValidWikiUrl } from '../utils/wikiUrl';
 import type {
@@ -455,22 +456,39 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
     return map;
   }, [activeNodes]);
 
+  const resolveLocalPath = (localPath: string) => {
+    // 旧索引可能已经存有绝对路径。
+    if (/^(?:[A-Za-z]:[\\/]|\\\\|\/)/.test(localPath)) return localPath;
+    const root = config?.knowledgeBaseRoot;
+    if (!root) {
+      toast.push({ type: 'warning', message: '本地根目录未配置' });
+      return null;
+    }
+    return root.replace(/[\\/]+$/, '') + '/' + localPath.replace(/^[\\/]+/, '');
+  };
+
+  const handleCopyLocalPath = async (localPath: string) => {
+    const absolutePath = resolveLocalPath(localPath);
+    if (!absolutePath) return;
+    const isWindowsPath = /^(?:[A-Za-z]:[\\/]|[\\/]{2})/.test(absolutePath);
+    const filePath = isWindowsPath ? absolutePath.replace(/\\/g, '/') : absolutePath;
+    const separator = filePath.lastIndexOf('/');
+    // POSIX 根目录和 Windows 盘符根目录都需要保留末尾分隔符。
+    const isRoot = separator === 0 || (isWindowsPath && separator === 2);
+    const folder = filePath.slice(0, isRoot ? separator + 1 : separator);
+    try {
+      await writeClipboardText(isWindowsPath ? folder.replace(/\//g, '\\') : folder);
+      toast.push({ type: 'success', message: '已复制本地文件夹路径' });
+    } catch (err) {
+      appLogger.error('dashboard', 'copy local folder path failed', err);
+      toast.push({ type: 'error', message: '复制本地路径失败' });
+    }
+  };
+
   const handleOpenFolder = async (localPath: string) => {
-    // 2026-09 修复：此前误调 openDataDirectory（打开数据目录而非文档所在
-    // 目录）。现在把相对 local_path 拼上 knowledgeBaseRoot 得绝对路径，
-    // 走 reveal-in-folder（Win 资源管理器 / mac Finder 定位选中）。
-    // 二次修复：local_path 存在 legacy 绝对路径形态（snapshot P2-05 前的
-    // 旧库），绝对时直接用不再拼前缀；后端返回错误时明确 toast，不再
-    // 静默无反馈。
     if (typeof window !== 'undefined' && window.desktop?.revealInFolder) {
-      const isAbsolute = /^(?:[A-Za-z]:[\\/]|\\\\|\/)/.test(localPath);
-      const abs = isAbsolute
-        ? localPath
-        : `${(config?.knowledgeBaseRoot ?? '').replace(/[\\/]+$/, '')}/${localPath.replace(/^[\\/]+/, '')}`;
-      if (!isAbsolute && !config?.knowledgeBaseRoot) {
-        toast.push({ type: 'warning', message: '本地根目录未配置' });
-        return;
-      }
+      const abs = resolveLocalPath(localPath);
+      if (!abs) return;
       try {
         const res = await window.desktop.revealInFolder(abs);
         if (!res.ok) {
@@ -537,6 +555,7 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
               onJumpToSync();
             }}
             onOpenFolder={handleOpenFolder}
+            onCopyLocalPath={handleCopyLocalPath}
             businessMarksByToken={businessMarksByToken}
             orphanPaths={orphanPaths}
             watchedRoots={watchedRoots}

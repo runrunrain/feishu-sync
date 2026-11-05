@@ -32,7 +32,7 @@
 
 import { Fragment, useEffect, useMemo, useState, type JSX, type ReactNode } from 'react';
 import { ImageIcon, Loader2 } from 'lucide-react';
-import { getMediaBlobUrl, getSyncedReference } from '../../api/client';
+import { getMediaBlobUrl, getSyncedReference, type SyncedReferenceContent } from '../../api/client';
 import {
   decodeHtmlEntities,
   extractHtmlTableBlocks,
@@ -1176,8 +1176,8 @@ function renderList(
   return renderListNodes(buildListTree(block.items), keyPrefix, ctx);
 }
 
-// Only simultaneous reads are shared; completed results are not kept as stale cloud data.
-const pendingReferences = new Map<string, Promise<{ content: string; baseDir?: string }>>();
+// Share in-flight reads so the next preview can pick up changes on disk.
+const pendingReferences = new Map<string, Promise<SyncedReferenceContent>>();
 function readReference(token: string, blockId: string) {
   const key = `${token}:${blockId}`;
   const existing = pendingReferences.get(key);
@@ -1188,14 +1188,15 @@ function readReference(token: string, blockId: string) {
 }
 
 function SyncedReference({ token, blockId, feishuHost, autoLoad }: { token: string; blockId: string; feishuHost?: string; autoLoad?: boolean }) {
-  const [content, setContent] = useState<{ content: string; baseDir?: string } | null>(null);
+  const [content, setContent] = useState<SyncedReferenceContent | null>(null);
   const [status, setStatus] = useState<'idle' | 'loading' | 'error'>('idle');
   const [attempt, setAttempt] = useState(0);
+  const [showLocalDocument, setShowLocalDocument] = useState(false);
   const valid = /^[A-Za-z0-9]{1,128}$/.test(token) && /^[A-Za-z0-9]{1,128}$/.test(blockId);
   useEffect(() => {
     if (!valid || (!autoLoad && attempt === 0)) return;
     let cancelled = false;
-    setStatus('loading'); setContent(null);
+    setStatus('loading'); setContent(null); setShowLocalDocument(false);
     readReference(token, blockId).then((result) => {
       if (!cancelled) { setContent(result); setStatus('idle'); }
     }).catch(() => { if (!cancelled) setStatus('error'); });
@@ -1206,12 +1207,23 @@ function SyncedReference({ token, blockId, feishuHost, autoLoad }: { token: stri
     <div className="flex flex-wrap items-center gap-2 text-xs text-ink-faint">
       <span>同步引用</span>
       {status === 'loading' && <span role="status">正在加载引用内容…</span>}
-      {status === 'error' && <span role="status">无法加载引用内容，请检查网络或飞书访问权限。</span>}
+      {status === 'error' && <span role="status">无法加载引用内容。未能读取本地源文档，飞书引用也暂不可用。</span>}
       {!valid && <span>引用信息不完整，无法加载内容。</span>}
       {valid && status !== 'loading' && content === null && <button type="button" className="text-seal underline" onClick={() => setAttempt((value) => value + 1)}>{status === 'error' ? '重试' : '加载引用内容'}</button>}
-      {sourceUrl && <button type="button" className="text-jade underline" onClick={() => openExternalUrl(sourceUrl)}>查看飞书原文</button>}
+      {sourceUrl && !content?.source && (!autoLoad || status === 'error' || content) && <button type="button" className="text-jade underline" onClick={() => openExternalUrl(sourceUrl)}>查看飞书原文</button>}
+      {content?.source === 'local-document' && <>
+        <span>本地副本无法定位到引用块。</span>
+        <button type="button" aria-expanded={showLocalDocument} className="text-jade underline" onClick={() => setShowLocalDocument((value) => !value)}>
+          {showLocalDocument ? '收起本地源文档' : '查看本地源文档'}
+        </button>
+      </>}
     </div>
-    {content !== null && (content.content.trim() ? <MarkdownView content={content.content} baseDir={content.baseDir} feishuHost={feishuHost} remoteImages="confirm" /> : <p className="mt-2 text-xs text-ink-faint">引用内容为空。</p>)}
+    {content && (content.source !== 'local-document' || showLocalDocument) && (
+      content.content.trim() ? <>
+        <MarkdownView content={content.content} baseDir={content.baseDir} feishuHost={feishuHost} remoteImages="confirm" />
+        {content.truncated && <p className="mt-2 text-xs text-ink-faint">仅预览本地源文档的前 512 KB。</p>}
+      </> : <p className="mt-2 text-xs text-ink-faint">引用内容为空。</p>
+    )}
   </div>;
 }
 
@@ -1277,7 +1289,7 @@ function renderBlock(block: Block, index: number, ctx: InlineContext): ReactNode
   const key = `b-${index}`;
   switch (block.type) {
     case 'synced_reference':
-      return <SyncedReference key={key} token={block.token} blockId={block.blockId} feishuHost={ctx.feishuHost} autoLoad={ctx.resolveSyncedReferences} />;
+      return <SyncedReference key={`${key}-${block.token}-${block.blockId}`} token={block.token} blockId={block.blockId} feishuHost={ctx.feishuHost} autoLoad={ctx.resolveSyncedReferences} />;
     case 'heading': {
       const Heading = `h${block.level}` as 'h1' | 'h2' | 'h3' | 'h4' | 'h5' | 'h6';
       return (

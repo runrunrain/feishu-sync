@@ -38,8 +38,6 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
   const toast = useToast();
   const sessions = useAgentSessions(active);
   const [creatingSession, setCreatingSession] = useState(false);
-  const [createOpen, setCreateOpen] = useState(false);
-  const [createFailed, setCreateFailed] = useState(false);
   const createLock = useRef(false);
   const [workspaces, setWorkspaces] = useState<AgentWorkspaceConfig[]>([]);
   const [createWorkspace, setCreateWorkspace] = useState(false);
@@ -47,12 +45,10 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
   const [workspacePath, setWorkspacePath] = useState('');
   const [workspaceBusy, setWorkspaceBusy] = useState(false);
   const [workspaceError, setWorkspaceError] = useState('');
-  const [targetWorkspace, setTargetWorkspace] = useState<string | undefined>();
   const composerRef = useRef<AgentComposerHandle>(null);
   const dragDepth = useRef(0);
   const [draggingFiles, setDraggingFiles] = useState(false);
   useEffect(() => { if (active) void listAgentWorkspaces().then(setWorkspaces).catch(() => {}); }, [active]);
-  useEffect(() => { if (!active) setCreateOpen(false); }, [active]);
   useEffect(() => { dragDepth.current = 0; setDraggingFiles(false); }, [active, sessions.activeId]);
 
   const session = sessions.activeSession;
@@ -61,13 +57,11 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
   const isWork = session?.mode === 'work';
   const running = session?.state === 'streaming' || session?.state === 'starting';
 
-  const openCreate = (workspaceId?: string) => { setTargetWorkspace(workspaceId); setCreateFailed(false); setCreateOpen(true); };
-  const createPiSession = async () => {
+  const createPiSession = async (workspaceId?: string) => {
     if (createLock.current) return;
-    createLock.current = true; setCreatingSession(true); setCreateFailed(false);
+    createLock.current = true; setCreatingSession(true);
     try {
-      const created = targetWorkspace ? await sessions.createSession('pi', targetWorkspace) : await sessions.createSession('pi');
-      if (created) setCreateOpen(false); else setCreateFailed(true);
+      await sessions.createSession('pi', workspaceId);
     } finally { createLock.current = false; setCreatingSession(false); }
   };
 
@@ -111,7 +105,8 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
           loading={sessions.sessionsLoading}
           activeId={sessions.activeId}
           onSelect={sessions.selecting}
-          onCreate={openCreate}
+          onCreate={createPiSession}
+          creating={creatingSession}
           workspaces={workspaces}
           workspaceMode={isWork}
           onAddWorkspace={() => { setWorkspaceError(''); setCreateWorkspace(true); }}
@@ -143,7 +138,7 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
           <div className="flex items-center gap-1 lg:hidden">
             <select aria-label="选择会话" className="max-w-[90px] rounded border border-line bg-card-bg px-1 py-1 text-[11px] text-ink-soft" value={sessions.activeId ?? ''} onChange={(e) => sessions.selecting(e.target.value)}>
               <option value="" disabled>选择会话</option>{sessions.sessions.map((s) => <option key={s.id} value={s.id}>{s.title}</option>)}
-            </select><button className="px-1 text-xs text-seal" onClick={() => openCreate()} aria-label="新建会话">新建</button>
+            </select><button type="button" className="px-1 text-xs text-seal disabled:opacity-50" disabled={creatingSession} onClick={() => void createPiSession()} aria-label="新建会话">新建</button>
           </div>
           {/* SSE 连接指示 */}
           {session ? (
@@ -216,21 +211,6 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
           <div className="flex gap-2"><input aria-label="工作区目录" placeholder="目录绝对路径" value={workspacePath} onChange={(e) => setWorkspacePath(e.target.value)} className="min-w-0 flex-1 rounded border border-line bg-card-bg px-3 py-2 text-sm" /><Button size="sm" variant="secondary" onClick={() => { void window.desktop?.selectDirectory?.().then((path) => { if (path) setWorkspacePath(path); }); }}>选择目录</Button></div>
           {workspaceError && <p role="alert" className="text-xs text-seal-2">{workspaceError}</p>}
           <div className="flex justify-end"><Button size="sm" loading={workspaceBusy} disabled={!workspaceName.trim() || !workspacePath.trim()} onClick={() => { setWorkspaceBusy(true); setWorkspaceError(''); void addAgentWorkspace({ name: workspaceName.trim(), path: workspacePath.trim() }).then((workspace) => { setWorkspaces((items) => [...items, workspace]); setWorkspaceName(''); setWorkspacePath(''); setCreateWorkspace(false); }).catch((error) => setWorkspaceError(error instanceof Error ? error.message : '创建失败')).finally(() => setWorkspaceBusy(false)); }}>创建</Button></div>
-        </div>
-      </Modal>
-      <Modal open={createOpen} title="新建会话" onClose={creatingSession ? undefined : () => setCreateOpen(false)}>
-        <div className="space-y-3">
-          <p className="text-sm text-ink-soft">新会话使用 Pi 基座。标准知识库构建等应用能力的基座在设置中单独配置。</p>
-          {targetWorkspace && <p className="text-xs text-ink-soft">将在所选目录启动 Work 会话。</p>}
-          <div className="grid gap-2">
-            <button type="button" disabled={creatingSession} onClick={() => void createPiSession()} aria-label="新建 Pi 会话"
-              className="rounded-md border border-seal bg-seal/5 px-3 py-3 text-left hover:border-seal hover:bg-seal/10 disabled:opacity-50">
-              <span className="block text-sm font-medium text-ink">Pi · 默认</span>
-              <span className="mt-1 block text-xs text-ink-faint">内置 amagi-pi，使用应用提供商或本地 Pi 模型。</span>
-            </button>
-          </div>
-          {createFailed ? <p role="alert" className="text-xs text-seal-2">{sessions.sessionsError || '新建会话失败，请重试。'}</p> : null}
-          <div className="flex justify-end"><Button size="sm" variant="secondary" disabled={creatingSession} onClick={() => setCreateOpen(false)}>取消</Button></div>
         </div>
       </Modal>
     </div>

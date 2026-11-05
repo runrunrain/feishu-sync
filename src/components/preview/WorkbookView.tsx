@@ -1,9 +1,79 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { Download, Loader2, RefreshCw } from 'lucide-react';
 import { getWorkbookBlob, getWorkbookPreview } from '../../api/client';
+import { Modal } from '../common/Modal';
 import type { WorkbookCell, WorkbookFont, WorkbookPreview, WorkbookSheetLayout } from '../../types/workbook';
 import { prepareWorkbookLayout } from './workbook-layout';
+
+const ZOOM_PRESETS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2];
+const useBeforePaint = typeof window === 'undefined' ? useEffect : useLayoutEffect;
+
+function wheelZoom(event: WheelEvent, zoom: number, min: number, max: number, pageHeight: number) {
+  const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? pageHeight : 1;
+  return Math.min(max, Math.max(min, zoom * Math.exp(-event.deltaY * unit * 0.002)));
+}
+
+function WorkbookImageViewer({ src, title, onClose }: { src: string; title: string; onClose: () => void }) {
+  const viewport = useRef<HTMLDivElement>(null);
+  const pan = useRef<{ pointerId: number; x: number; y: number } | null>(null);
+  const [view, setView] = useState({ x: 0, y: 0, zoom: 1 });
+  const [dragging, setDragging] = useState(false);
+  useEffect(() => {
+    const element = viewport.current;
+    if (!element) return;
+    const zoomImage = (event: WheelEvent) => {
+      if (event.deltaY === 0) return;
+      event.preventDefault();
+      const rect = element.getBoundingClientRect();
+      const x = event.clientX - rect.left - rect.width / 2;
+      const y = event.clientY - rect.top - rect.height / 2;
+      setView((previous) => {
+        const zoom = wheelZoom(event, previous.zoom, 0.25, 12, rect.height);
+        const ratio = zoom / previous.zoom;
+        return { zoom, x: x - (x - previous.x) * ratio, y: y - (y - previous.y) * ratio };
+      });
+    };
+    element.addEventListener('wheel', zoomImage, { passive: false });
+    return () => element.removeEventListener('wheel', zoomImage);
+  }, []);
+  const endPan = (event: PointerEvent<HTMLDivElement>) => {
+    if (pan.current?.pointerId !== event.pointerId) return;
+    pan.current = null;
+    setDragging(false);
+  };
+  return createPortal(
+    <Modal open title={title} onClose={onClose} contentClassName="max-w-6xl" bodyClassName="flex flex-col gap-2">
+      <div className="flex shrink-0 items-center gap-3 text-xs text-ink-soft">
+        <span className="mr-auto">拖动平移 · 滚轮缩放</span>
+        <output aria-label="图片缩放比例">{Math.round(view.zoom * 100)}%</output>
+        <button type="button" className="rounded border border-line px-2 py-1 hover:bg-paper-2" onClick={() => setView({ x: 0, y: 0, zoom: 1 })}>适合窗口</button>
+        <button autoFocus type="button" className="rounded border border-line px-2 py-1 hover:bg-paper-2" onClick={onClose}>关闭</button>
+      </div>
+      <div ref={viewport} aria-label="图片查看区域"
+        className={`flex h-[70dvh] min-h-0 touch-none select-none items-center justify-center overflow-hidden overscroll-contain rounded bg-paper-2 p-4 ${dragging ? 'cursor-grabbing' : 'cursor-grab'}`}
+        onPointerDown={(event) => {
+          if (event.button !== 0 || !event.isPrimary) return;
+          event.currentTarget.setPointerCapture(event.pointerId);
+          pan.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY };
+          setDragging(true);
+        }}
+        onPointerMove={(event) => {
+          const start = pan.current;
+          if (!start || start.pointerId !== event.pointerId) return;
+          const dx = event.clientX - start.x, dy = event.clientY - start.y;
+          start.x = event.clientX; start.y = event.clientY;
+          setView((previous) => ({ ...previous, x: previous.x + dx, y: previous.y + dy }));
+        }}
+        onPointerUp={endPan} onPointerCancel={endPan} onLostPointerCapture={endPan}
+      >
+        <img alt={title} src={src} draggable={false} className="pointer-events-none max-h-full max-w-full object-contain"
+          style={{ transform: `translate(${view.x}px, ${view.y}px) scale(${view.zoom})` }} />
+      </div>
+    </Modal>,
+    document.body,
+  );
+}
 
 function fontStyle(font: WorkbookFont): CSSProperties {
   return {
@@ -28,11 +98,44 @@ function borderStyle(cell: WorkbookCell): CSSProperties {
 }
 
 /** Virtualized read-only canvas. Cells retain native geometry at every zoom. */
-export function WorkbookCanvas({ sheet, zoom = 1 }: { sheet: WorkbookSheetLayout; zoom?: number }) {
+export function WorkbookCanvas({ sheet, zoom = 1, onZoom }: { sheet: WorkbookSheetLayout; zoom?: number; onZoom?: (zoom: number) => void }) {
   const viewport = useRef<HTMLDivElement>(null);
+  const pendingZoom = useRef<{ zoom: number; left: number; top: number } | null>(null);
   const pan = useRef<{ pointerId: number; x: number; y: number; left: number; top: number } | null>(null);
+  const [imagePreview, setImagePreview] = useState<{ src: string; title: string; opener: HTMLButtonElement } | null>(null);
   const [view, setView] = useState({ left: 0, top: 0, width: 1200, height: 600 });
   const layout = useMemo(() => prepareWorkbookLayout(sheet), [sheet]);
+  useEffect(() => {
+    const element = viewport.current;
+    if (!element || !onZoom) return;
+    const zoomCanvas = (event: WheelEvent) => {
+      if (!event.ctrlKey || event.deltaY === 0) return;
+      event.preventDefault();
+      const previous = pendingZoom.current ?? { zoom, left: element.scrollLeft, top: element.scrollTop };
+      const nextZoom = wheelZoom(event, previous.zoom, 0.05, 4, element.clientHeight);
+      if (nextZoom === previous.zoom) return;
+      const ratio = nextZoom / previous.zoom;
+      const rect = element.getBoundingClientRect();
+      const x = event.clientX - rect.left, y = event.clientY - rect.top;
+      pendingZoom.current = {
+        zoom: nextZoom,
+        left: Math.max(0, Math.min((previous.left + x) * ratio - x, layout.width * nextZoom - element.clientWidth)),
+        top: Math.max(0, Math.min((previous.top + y) * ratio - y, layout.height * nextZoom - element.clientHeight)),
+      };
+      onZoom(nextZoom);
+    };
+    element.addEventListener('wheel', zoomCanvas, { passive: false });
+    return () => element.removeEventListener('wheel', zoomCanvas);
+  }, [zoom, onZoom, layout.width, layout.height]);
+  useBeforePaint(() => {
+    const element = viewport.current;
+    const pending = pendingZoom.current;
+    pendingZoom.current = null;
+    if (!element || pending?.zoom !== zoom) return;
+    element.scrollLeft = pending.left;
+    element.scrollTop = pending.top;
+    setView({ left: element.scrollLeft, top: element.scrollTop, width: element.clientWidth, height: element.clientHeight });
+  }, [zoom]);
   useEffect(() => {
     const element = viewport.current;
     if (!element) return;
@@ -114,12 +217,23 @@ export function WorkbookCanvas({ sheet, zoom = 1 }: { sheet: WorkbookSheetLayout
                 </span>
               </div>
             ))}
-            {sheet.images.filter((image) => image.x < right && image.x + image.width > left && image.y < bottom && image.y + image.height > top).map((image, index) => (
-              <img key={image.id} alt={`${sheet.name} 图片 ${index + 1}`} src={image.dataUrl} draggable={false} style={{ position: 'absolute', zIndex: 2, left: image.x, top: image.y, width: image.width, height: image.height, maxWidth: 'none', objectFit: 'fill' }} />
-            ))}
+            {sheet.images.map((image, index) => {
+              if (image.x >= right || image.x + image.width <= left || image.y >= bottom || image.y + image.height <= top) return null;
+              const title = `${sheet.name} 图片 ${index + 1}`;
+              return <button key={image.id} type="button" aria-label={`查看${title}`} className="cursor-zoom-in focus-visible:outline focus-visible:outline-2 focus-visible:outline-seal"
+                onPointerDown={(event) => event.stopPropagation()}
+                onClick={(event) => setImagePreview({ src: image.dataUrl, title, opener: event.currentTarget })}
+                style={{ position: 'absolute', zIndex: 2, left: image.x, top: image.y, width: image.width, height: image.height }}>
+                <img alt={title} src={image.dataUrl} draggable={false} className="block h-full w-full max-w-none object-fill" />
+              </button>;
+            })}
           </div>
         </div>
       </div>
+      {imagePreview && <WorkbookImageViewer src={imagePreview.src} title={imagePreview.title} onClose={() => {
+        imagePreview.opener.focus({ preventScroll: true });
+        setImagePreview(null);
+      }} />}
     </div>
   );
 }
@@ -172,9 +286,10 @@ export function WorkbookView({ objToken, fileName, toolbarTarget }: { objToken: 
   const toolbar = (
       <div className="flex items-center justify-end gap-3 text-xs text-ink-soft">
         <label className="flex items-center gap-1.5">缩放
-          <select aria-label="Excel 缩放比例" value={zoom} onChange={(e) => setZoom(e.target.value === 'fit' ? 'fit' : Number(e.target.value))} className="rounded border border-line bg-card-bg px-1 py-1">
+          <select aria-label="Excel 缩放比例" title="在画板上按住 Ctrl 滚动可连续缩放" value={zoom} onChange={(e) => setZoom(e.target.value === 'fit' ? 'fit' : Number(e.target.value))} className="rounded border border-line bg-card-bg px-1 py-1">
             <option value="fit">适合宽度</option>
-            {[0.25, 0.5, 0.75, 1, 1.25, 1.5, 2].map((value) => <option key={value} value={value}>{value * 100}%</option>)}
+            {ZOOM_PRESETS.map((value) => <option key={value} value={value}>{value * 100}%</option>)}
+            {typeof zoom === 'number' && !ZOOM_PRESETS.includes(zoom) && <option value={zoom}>{Math.round(zoom * 100)}%</option>}
           </select>
         </label>
         <button type="button" disabled={downloading} onClick={() => void download()} className="inline-flex items-center gap-1.5 hover:text-seal disabled:opacity-50">
@@ -191,7 +306,7 @@ export function WorkbookView({ objToken, fileName, toolbarTarget }: { objToken: 
       {loading ? <div className="flex min-h-0 flex-1 items-center justify-center gap-2 text-xs text-ink-faint"><Loader2 className="h-4 w-4 animate-spin" />正在读取 Excel 布局…</div> : preview && !error ? (
         <>
           {preview.sheet.warnings.length > 0 && <div className="shrink-0 max-h-24 overflow-auto border-b border-line bg-paper px-3 py-2 text-[11px] text-ink-soft">{preview.sheet.warnings.map((warning, index) => <p key={index}>{warning}</p>)}</div>}
-          <WorkbookCanvas key={`${objToken}-${sheetIndex}-${retry}`} sheet={preview.sheet} zoom={actualZoom} />
+          <WorkbookCanvas key={`${objToken}-${sheetIndex}-${retry}`} sheet={preview.sheet} zoom={actualZoom} onZoom={setZoom} />
         </>
       ) : null}
       {preview && <div className="flex shrink-0 overflow-x-auto gap-1 border-t border-line bg-paper/70 px-2 py-1.5" role="tablist" aria-label="Excel 工作表">

@@ -40,7 +40,7 @@ import { selectProgressiveCoverage } from './progressive-coverage.js';
 import { finalDraftEvidenceScopePaths, selectProgressiveKnowledgeDraft } from './progressive-knowledge-draft.js';
 import { getKbQueryService } from './search/kb-query-service.js';
 import { KbVersionStore, captureSourceContents, sourceChangePreview, sourceContentResourceSpans, type SourceContents } from './kb-version-store.js';
-import { addSourceComparisonHashes, sourceContentsChanged, withSourceComparisonBaseline } from './source-comparison.js';
+import { addSourceComparisonHashes, captureMissingSourceComparisonHashes, sourceContentsChanged, withSourceComparisonBaseline } from './source-comparison.js';
 import { loadProgressiveBaselineImages, progressiveSourceSnapshot, rebindBaselineImageEvidence, seedProgressiveCarriedReceipts } from './progressive-source-snapshot.js';
 import { hasEditorialHistory, hasSourceMetadata } from './body-policy.js';
 import { planUnits, packBatches, type BuildUnit } from './build-units.js';
@@ -2372,6 +2372,9 @@ export class KbBuildService extends EventEmitter {
             promotedSources: selectedTokens,
           })
         : liveSnapshot;
+      // Selected builds can carry old entries instead of the freshly scanned ones.
+      // Recover their digest only from the exact original bytes, never a new version.
+      await captureMissingSourceComparisonHashes(snapshot.entries, config.knowledgeBaseRoot, this.deps.sheetCsvPaths);
       if (resume) verifyBuildSnapshotIntact(snapshot, config.knowledgeBaseRoot, this.deps.sheetCsvPaths,
         buildDocuments, selectedTokens);
       if (resume && computeSnapshotHash(snapshot.entries) !== computeSnapshotHash(resume.snapshot)) {

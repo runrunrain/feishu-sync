@@ -18,14 +18,22 @@ async function fixture() {
     { id: 'deep', name: 'Deep', openAiModel: 'deep-code', enabled: true, reasoning: true, thinkingLevels: ['low', 'high', 'xhigh', 'max'] },
     { id: 'disabled', name: 'Disabled', openAiModel: 'disabled-code', enabled: false },
   ] }], activeProviderId: 'fixture', activeModelId: 'fast' } } as never);
-  const store = new LocalMapStore(path.join(root, 'db.sqlite')); store.initialize(); const pool = new AgentProcessPool(); const resolver = new PiRuntimeResolver();
+  const dbPath = path.join(root, 'db.sqlite');
+  let store = new LocalMapStore(dbPath); store.initialize(); const pool = new AgentProcessPool(); const resolver = new PiRuntimeResolver();
   const tools = new AgentToolService({ dataRoot: root, documentsProvider: () => [] });
-  const service = new SessionService({ dataRoot: root, pool, resolver, toolService: tools, configProvider: () => manager.getConfig(), internalBaseUrl: () => '', extensionPath: () => null, workspaceGuards: () => ({ dataRoot: root, knowledgeBaseRoot: '', outputRoot: '' }) });
+  const makeService = () => new SessionService({ dataRoot: root, pool, resolver, toolService: tools, configProvider: () => manager.getConfig(), internalBaseUrl: () => '', extensionPath: () => null, workspaceGuards: () => ({ dataRoot: root, knowledgeBaseRoot: '', outputRoot: '' }) });
+  const service = makeService();
   const app = await agentRoutes({ sessionService: service, resolver, toolService: tools, pool, configManager: manager, localMapStore: store, internalPort: () => null });
   cleanups.push(() => { store.close(); fs.rmSync(root, { recursive: true, force: true }); });
   const session = service.create(store, { title: 'Fixture' }); const other = service.create(store, { title: 'Other' });
   const patch = (model: unknown, id = session.id) => app.fetch(new Request(`http://x/api/agent/sessions/${id}/model`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model }) }));
-  return { app, manager, store, service, session, other, patch };
+  const restart = () => {
+    store.close();
+    store = new LocalMapStore(dbPath);
+    store.initialize();
+    return { store, service: makeService() };
+  };
+  return { app, manager, store, service, session, other, patch, restart };
 }
 it('local resources route accepts only idle Pi work sessions and persists the choice', async () => {
   const f = await fixture();
@@ -54,6 +62,30 @@ it('catalog exposes only usable presets; model/effort persists per session witho
   expect(f.service.configForSession(f.store, f.session.id).agent.model.thinkingLevel).toBe('high');
   expect((await f.patch({ source: 'app-llm', providerId: 'fixture', modelId: 'deep', thinkingLevel: 'max' })).status).toBe(200);
   expect((await f.patch(null)).status).toBe(200); expect(f.service.get(f.store, f.manager.getConfig(), f.session.id)?.model).toBeNull();
+  expect(f.service.create(f.store, { backend: 'pi' }).model).toBeNull();
+});
+
+it('restores session choices from disk and inherits the latest preferences in new sessions', async () => {
+  const f = await fixture();
+  const model = { source: 'app-llm', providerId: 'fixture', modelId: 'deep', thinkingLevel: 'high' };
+  expect((await f.patch(model)).status).toBe(200);
+  await f.service.switchMode(f.store, f.session.id, { mode: 'work', confirm: 'WORK' });
+  f.service.setApprovalMode(f.store, f.session.id, 'auto');
+
+  const { store, service } = f.restart();
+  expect(service.get(store, f.manager.getConfig(), f.session.id)).toMatchObject({ model, approvalMode: 'auto' });
+  expect(service.approvalMode(store, f.session.id)).toBe('auto');
+  expect(service.get(store, f.manager.getConfig(), f.other.id)).toMatchObject({ model: null, approvalMode: 'ask' });
+  expect(service.create(store, { backend: 'claude-code' }).model).toBeNull();
+
+  const created = service.create(store, { backend: 'pi' });
+  expect(created).toMatchObject({ model, mode: 'discuss', approvalMode: 'ask' });
+  expect(service.approvalMode(store, created.id)).toBe('ask');
+  expect((await service.switchMode(store, created.id, { mode: 'work', confirm: 'WORK' }))?.approvalMode).toBe('auto');
+  service.setApprovalMode(store, created.id, 'ask');
+  expect(service.approvalMode(store, f.session.id)).toBe('auto');
+  const next = service.create(store, { backend: 'pi' });
+  expect((await service.switchMode(store, next.id, { mode: 'work', confirm: 'WORK' }))?.approvalMode).toBe('ask');
 });
 it('rejects missing/disabled/unconfigured models, invalid levels and busy switches without writing stale choices', async () => {
   const f = await fixture();
