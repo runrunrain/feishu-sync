@@ -1,0 +1,13 @@
+会话事件：用户明确指令「清理实验数据」。目标为本会话子 Agent（baize 2a090cf4、diting 08d934ee、luban e585b619/71205a78）在 /private/tmp 与 $TMPDIR 下自建的临时实验目录。
+
+[调用1] bash: rm -rf /private/tmp/kb-diff-test /private/tmp/kb-forward-* ... $T/amagi-trash.Qvchkl $T/kb-review-probe-*
+→ [AMAGI 守卫] 已阻止递归删除未清点目录（/private/tmp/kb-diff-test 清点到 200 个条目：98 文件/102 子目录（清单已截断……））……建议处置：先逐一处置（mv 归位/确认归属），确认目录内已无未处置文件后再删。对照：清点可见项不等于授权；改写成单文件/通配形态删除虽不经本门，但不会改变「目录内有未处置文件被删」的事实……如需保留后处置，可改用移动保留……mv '/private/tmp/kb-diff-test' "$trash/"
+
+[调用2] Leader 清点核验（证据）：find -type l → symlinks=0；find -links +1 → 无硬链接；
+  diff -rq --exclude=.git <真实知识库> kb-a → 0 行差异（kb-a 为逐字节副本）；
+  各子目录：fake-out 176M/315 文件、home-a 176M/317、home-m 176M/318、home-m2 176M/316、kb-a 1.0G/1847、kb-m 1.0G/1847、out 325M/2（share.zip、share-digest.zip）。全部可再生副本。
+
+[调用3] bash: cd /private/tmp/kb-diff-test && rm -rf kb-a kb-m home-a home-m home-m2 out fake-out && rmdir ...
+→ [AMAGI 守卫] 已阻止递归删除未清点目录（kb-a 清点到 200 个条目：121 文件/79 子目录……）……（同样建议逐一处置或 mv 到 trash）
+
+结果：守卫没有提供「已清点 + 用户已明确授权」的放行通道；mv 到 $TMPDIR/amagi-trash 不释放空间（上一轮 baize 已把 1.8G 作废现场 mv 进 amagi-trash.Qvchkl，反而累积）。最终 Leader 只能把 rm 命令交给用户手工执行，约 4.8G 未清理。

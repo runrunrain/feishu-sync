@@ -16,9 +16,28 @@ function wheelZoom(event: WheelEvent, zoom: number, min: number, max: number, pa
 
 function WorkbookImageViewer({ src, title, onClose }: { src: string; title: string; onClose: () => void }) {
   const viewport = useRef<HTMLDivElement>(null);
+  const image = useRef<HTMLImageElement>(null);
   const pan = useRef<{ pointerId: number; x: number; y: number } | null>(null);
   const [view, setView] = useState({ x: 0, y: 0, zoom: 1 });
+  const [fitScale, setFitScale] = useState<number | null>(null);
   const [dragging, setDragging] = useState(false);
+  useBeforePaint(() => {
+    const element = image.current;
+    if (!element) return;
+    const measure = () => {
+      if (element.naturalWidth && element.naturalHeight && element.clientWidth && element.clientHeight) {
+        setFitScale(Math.min(element.clientWidth / element.naturalWidth, element.clientHeight / element.naturalHeight));
+      }
+    };
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    element.addEventListener('load', measure);
+    measure();
+    return () => {
+      observer.disconnect();
+      element.removeEventListener('load', measure);
+    };
+  }, []);
   useEffect(() => {
     const element = viewport.current;
     if (!element) return;
@@ -52,7 +71,7 @@ function WorkbookImageViewer({ src, title, onClose }: { src: string; title: stri
         (event.shiftKey ? close : reset).focus();
       }}>
         <span className="mr-auto">拖动平移 · 滚轮缩放</span>
-        <output aria-label="图片缩放比例">{Math.round(view.zoom * 100)}%</output>
+        <output aria-label="图片缩放比例">{fitScale === null ? '适合窗口' : `${Math.round(fitScale * view.zoom * 100)}%`}</output>
         <button type="button" className="rounded border border-line px-2 py-1 hover:bg-paper-2" onClick={() => setView({ x: 0, y: 0, zoom: 1 })}>适合窗口</button>
         <button autoFocus type="button" className="rounded border border-line px-2 py-1 hover:bg-paper-2" onClick={onClose}>关闭</button>
       </div>
@@ -73,7 +92,7 @@ function WorkbookImageViewer({ src, title, onClose }: { src: string; title: stri
         }}
         onPointerUp={endPan} onPointerCancel={endPan} onLostPointerCapture={endPan}
       >
-        <img alt={title} src={src} draggable={false} className="pointer-events-none max-h-full max-w-full object-contain"
+        <img ref={image} alt={title} src={src} draggable={false} className="pointer-events-none flex-none max-h-full max-w-full object-contain"
           style={{ transform: `translate(${view.x}px, ${view.y}px) scale(${view.zoom})` }} />
       </div>
     </Modal>,
@@ -104,7 +123,12 @@ function borderStyle(cell: WorkbookCell): CSSProperties {
 }
 
 /** Virtualized read-only canvas. Cells retain native geometry at every zoom. */
-export function WorkbookCanvas({ sheet, zoom = 1, onZoom }: { sheet: WorkbookSheetLayout; zoom?: number; onZoom?: (zoom: number) => void }) {
+export function WorkbookCanvas({ sheet, zoom = 1, onZoom, onViewportWidth }: {
+  sheet: WorkbookSheetLayout;
+  zoom?: number;
+  onZoom?: (zoom: number) => void;
+  onViewportWidth?: (width: number) => void;
+}) {
   const viewport = useRef<HTMLDivElement>(null);
   const pendingZoom = useRef<{ zoom: number; left: number; top: number } | null>(null);
   const [zoomAnchor, setZoomAnchor] = useState<typeof pendingZoom.current>(null);
@@ -144,15 +168,19 @@ export function WorkbookCanvas({ sheet, zoom = 1, onZoom }: { sheet: WorkbookShe
     element.scrollTop = zoomAnchor.top;
     setView({ left: element.scrollLeft, top: element.scrollTop, width: element.clientWidth, height: element.clientHeight });
   }, [zoom, zoomAnchor]);
-  useEffect(() => {
+  useBeforePaint(() => {
     const element = viewport.current;
     if (!element) return;
-    const update = () => setView({ left: element.scrollLeft, top: element.scrollTop, width: element.clientWidth, height: element.clientHeight });
+    const update = () => {
+      const width = element.clientWidth;
+      setView({ left: element.scrollLeft, top: element.scrollTop, width, height: element.clientHeight });
+      onViewportWidth?.(width);
+    };
     const observer = new ResizeObserver(update);
     observer.observe(element);
     update();
     return () => observer.disconnect();
-  }, []);
+  }, [onViewportWidth]);
   const left = view.left / zoom - 100, top = view.top / zoom - 100;
   const right = (view.left + view.width) / zoom + 100, bottom = (view.top + view.height) / zoom + 100;
   const visible = layout.cells.filter((item) => item.width > 0 && item.height > 0 && item.x < right && item.x + item.textWidth > left && item.y < bottom && item.y + item.height > top);
@@ -175,7 +203,7 @@ export function WorkbookCanvas({ sheet, zoom = 1, onZoom }: { sheet: WorkbookShe
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       <div
         ref={viewport}
-        className="min-h-0 min-w-0 flex-1 overflow-auto overscroll-contain bg-white scrollbar-thin"
+        className="min-h-0 min-w-0 flex-1 overflow-auto overscroll-contain bg-white scrollbar-thin [scrollbar-gutter:stable]"
         aria-label={`${sheet.name} Excel 画板`}
         tabIndex={0}
         onPointerMove={(event) => {
@@ -258,24 +286,17 @@ export function WorkbookCanvas({ sheet, zoom = 1, onZoom }: { sheet: WorkbookShe
 export function WorkbookView({ objToken, fileName, toolbarTarget }: { objToken: string; fileName: string; toolbarTarget?: HTMLElement | null }) {
   const [preview, setPreview] = useState<WorkbookPreview | null>(null);
   const [sheetIndex, setSheetIndex] = useState(0);
-  const [zoom, setZoom] = useState<number | 'fit'>(1);
-  const panel = useRef<HTMLDivElement>(null);
-  const [panelWidth, setPanelWidth] = useState(800);
+  const [zoom, setZoom] = useState<number | 'auto' | 'fit'>(1);
+  const [viewportWidth, setViewportWidth] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [downloading, setDownloading] = useState(false);
   const [retry, setRetry] = useState(0);
-  useEffect(() => {
-    if (!panel.current) return;
-    const element = panel.current;
-    const update = () => setPanelWidth(element.clientWidth);
-    const observer = new ResizeObserver(update);
-    observer.observe(element);
-    update();
-    return () => observer.disconnect();
-  }, []);
-  const canvasWidth = useMemo(() => preview ? prepareWorkbookLayout(preview.sheet).width : 800, [preview]);
-  const actualZoom = zoom === 'fit' ? Math.min(2, Math.max(0.05, (panelWidth - 18) / canvasWidth)) : zoom;
+  const canvasWidth = useMemo(() => preview ? prepareWorkbookLayout(preview.sheet).width : 0, [preview]);
+  const widthRatio = viewportWidth > 0 && canvasWidth > 0 ? viewportWidth / canvasWidth : 1;
+  // Keep text readable in auto mode even on sheets much wider than the viewport.
+  const actualZoom = zoom === 'auto' ? Math.min(1, Math.max(0.5, widthRatio))
+    : zoom === 'fit' ? Math.min(2, Math.max(0.05, widthRatio)) : zoom;
   useEffect(() => {
     const controller = new AbortController();
     setLoading(true);
@@ -303,8 +324,12 @@ export function WorkbookView({ objToken, fileName, toolbarTarget }: { objToken: 
   const toolbar = (
       <div className="flex items-center justify-end gap-3 text-xs text-ink-soft">
         <label className="flex items-center gap-1.5">缩放
-          <select aria-label="Excel 缩放比例" title="在画板上按住 Ctrl 滚动可连续缩放" value={zoom} onChange={(e) => setZoom(e.target.value === 'fit' ? 'fit' : Number(e.target.value))} className="rounded border border-line bg-card-bg px-1 py-1">
-            <option value="fit">适合宽度</option>
+          <select aria-label="Excel 缩放比例" title="在画板上按住 Ctrl 滚动可连续缩放" value={zoom} onChange={(e) => {
+            const value = e.target.value;
+            setZoom(value === 'auto' || value === 'fit' ? value : Number(value));
+          }} className="rounded border border-line bg-card-bg px-1 py-1">
+            <option value="auto">自动{zoom === 'auto' ? `（${Math.round(actualZoom * 100)}%）` : ''}</option>
+            <option value="fit">适合宽度{zoom === 'fit' ? `（${Math.round(actualZoom * 100)}%）` : ''}</option>
             {ZOOM_PRESETS.map((value) => <option key={value} value={value}>{value * 100}%</option>)}
             {typeof zoom === 'number' && !ZOOM_PRESETS.includes(zoom) && <option value={zoom}>{Math.round(zoom * 100)}%</option>}
           </select>
@@ -315,7 +340,7 @@ export function WorkbookView({ objToken, fileName, toolbarTarget }: { objToken: 
       </div>
   );
   return (
-    <div ref={panel} className="flex h-full min-h-0 min-w-0 flex-col">
+    <div className="flex h-full min-h-0 min-w-0 flex-col">
       {toolbarTarget === undefined
         ? <div className="shrink-0 border-b border-line bg-paper/60 px-3 py-2">{toolbar}</div>
         : toolbarTarget ? createPortal(toolbar, toolbarTarget) : null}
@@ -323,7 +348,7 @@ export function WorkbookView({ objToken, fileName, toolbarTarget }: { objToken: 
       {loading ? <div className="flex min-h-0 flex-1 items-center justify-center gap-2 text-xs text-ink-faint"><Loader2 className="h-4 w-4 animate-spin" />正在读取 Excel 布局…</div> : preview && !error ? (
         <>
           {preview.sheet.warnings.length > 0 && <div className="shrink-0 max-h-24 overflow-auto border-b border-line bg-paper px-3 py-2 text-[11px] text-ink-soft">{preview.sheet.warnings.map((warning, index) => <p key={index}>{warning}</p>)}</div>}
-          <WorkbookCanvas key={`${objToken}-${sheetIndex}-${retry}`} sheet={preview.sheet} zoom={actualZoom} onZoom={setZoom} />
+          <WorkbookCanvas key={`${objToken}-${sheetIndex}-${retry}`} sheet={preview.sheet} zoom={actualZoom} onZoom={setZoom} onViewportWidth={setViewportWidth} />
         </>
       ) : null}
       {preview && <div className="flex shrink-0 overflow-x-auto gap-1 border-t border-line bg-paper/70 px-2 py-1.5" role="tablist" aria-label="Excel 工作表">

@@ -78,9 +78,17 @@ it('独立画板可用 Ctrl＋滚轮连续缩放，并保留光标下的位置',
   } });
   const container = document.createElement('div'); document.body.append(container);
   const root = createRoot(container);
+  const width = vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(600);
   try {
     await act(async () => root.render(<WorkbookView objToken="s1" fileName="s.xlsx" />));
     const viewport = container.querySelector<HTMLDivElement>('[aria-label="Sheet1 Excel 画板"]')!;
+    const select = container.querySelector<HTMLSelectElement>('[aria-label="Excel 缩放比例"]')!;
+    expect(select.selectedOptions[0].textContent).toBe('100%');
+    expect(viewport.querySelector('[style*="scale(1)"]')).not.toBeNull();
+    await act(async () => { select.value = 'auto'; select.dispatchEvent(new Event('change', { bubbles: true })); });
+    expect(select.selectedOptions[0].textContent).toBe('自动（67%）');
+    expect(viewport.querySelector('[style*="scale(0.6666666666666666)"]')).not.toBeNull();
+    await act(async () => { select.value = '1'; select.dispatchEvent(new Event('change', { bubbles: true })); });
     Object.defineProperties(viewport, { clientWidth: { value: 200 }, clientHeight: { value: 150 } });
     viewport.scrollLeft = 80;
     viewport.scrollTop = 70;
@@ -93,7 +101,6 @@ it('独立画板可用 Ctrl＋滚轮连续缩放，并保留光标下的位置',
       expect(wheel(true)).toBe(false);
       expect(wheel(true)).toBe(false);
     });
-    const select = container.querySelector<HTMLSelectElement>('[aria-label="Excel 缩放比例"]')!;
     const zoom = Number(select.value);
     expect(zoom).toBeGreaterThan(1.05);
     expect(zoom).toBeLessThan(1.15);
@@ -101,7 +108,7 @@ it('独立画板可用 Ctrl＋滚轮连续缩放，并保留光标下的位置',
     expect((viewport.scrollTop + 50) / zoom).toBeCloseTo(120);
     expect(select.selectedOptions[0].textContent).toBe(`${Math.round(zoom * 100)}%`);
     expect(container.textContent).toContain('下载 Excel');
-  } finally { act(() => root.unmount()); container.remove(); vi.unstubAllGlobals(); }
+  } finally { act(() => root.unmount()); container.remove(); width.mockRestore(); vi.unstubAllGlobals(); }
 });
 
 it('点击画板图片可在独立窗口拖动和滚轮缩放，关闭后回到图片', async () => {
@@ -124,6 +131,12 @@ it('点击画板图片可在独立窗口拖动和滚轮缩放，关闭后回到�
     const viewport = dialog.querySelector<HTMLDivElement>('[aria-label="图片查看区域"]')!;
     const image = viewport.querySelector('img')!;
     expect(image.getAttribute('src')).toBe(src);
+    Object.defineProperties(image, {
+      naturalWidth: { value: 1600 }, naturalHeight: { value: 1200 },
+      clientWidth: { value: 800 }, clientHeight: { value: 600 },
+    });
+    await act(async () => image.dispatchEvent(new Event('load')));
+    expect(dialog.querySelector('output')?.textContent).toBe('50%');
     Object.defineProperty(viewport, 'setPointerCapture', { value: vi.fn() });
     await act(async () => {
       pointer(viewport, 'pointerdown', 20, 30);
@@ -135,7 +148,7 @@ it('点击画板图片可在独立窗口拖动和滚轮缩放，关闭后回到�
     await act(async () => {
       expect(viewport.dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: -50 }))).toBe(false);
     });
-    expect(Number(dialog.querySelector('output')?.textContent?.replace('%', ''))).toBeGreaterThan(100);
+    expect(Number(dialog.querySelector('output')?.textContent?.replace('%', ''))).toBeGreaterThan(50);
     await act(async () => window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' })));
     expect(document.querySelector('[role="dialog"]')).toBeNull();
     expect(document.activeElement).toBe(opener);

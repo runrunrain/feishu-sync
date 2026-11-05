@@ -1196,9 +1196,13 @@ function SyncedReference({ token, blockId, feishuHost, autoLoad }: { token: stri
   useEffect(() => {
     if (!valid || (!autoLoad && attempt === 0)) return;
     let cancelled = false;
-    setStatus('loading'); setContent(null); setShowLocalDocument(false);
+    setStatus('loading'); setContent(null);
     readReference(token, blockId).then((result) => {
-      if (!cancelled) { setContent(result); setStatus('idle'); }
+      if (!cancelled) {
+        setContent(result);
+        setShowLocalDocument(result.source === 'local-document');
+        setStatus('idle');
+      }
     }).catch(() => { if (!cancelled) setStatus('error'); });
     return () => { cancelled = true; };
   }, [token, blockId, autoLoad, attempt, valid]);
