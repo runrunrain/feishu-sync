@@ -15,7 +15,7 @@
  * 如实标注降级（⚠ 不完整），线性比对照常、构建不阻断。
  */
 
-import { describe, expect, it, beforeAll, afterAll } from 'vitest';
+import { describe, expect, it, beforeAll, afterAll, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -361,17 +361,21 @@ describe('S3 切片 C：机械预检接入审查提示词', () => {
 
   it('源文本不可得：跳过注入 + warn 日志，不阻断审查与发布', async () => {
     seedTwoUnits('缺A');
-    // 故障窗口 = 首批次（快照已冻结）→整合轮：审查期预检读不到源 →
-    // warn+跳过注入；整合轮恢复源文件，validate/publish 照常通过。
-    const harness = makeHarness(makeConfig(true), {
-      onFirstBatch: () => {
+    // 仅在单元预检期间模拟源文件不可读，验证 warn+跳过注入；
+    // 预检结束即恢复源文件，使后续读取与 validate/publish 照常进行。
+    const harness = makeHarness(makeConfig(true), {});
+    const service = harness.service as unknown as { mechanicalPrecheckSection: (...args: any[]) => string | null };
+    const originalPrecheck = service.mechanicalPrecheckSection.bind(service);
+    vi.spyOn(service, 'mechanicalPrecheckSection').mockImplementation((...args) => {
+      if (args[1].kind !== 'unit') return originalPrecheck(...args);
+      try {
         fs.rmSync(path.join(kbRoot, '缺AA/a.md'), { force: true });
         fs.rmSync(path.join(kbRoot, '缺AB/b.md'), { force: true });
-      },
-      onIntegrate: () => {
+        return originalPrecheck(...args);
+      } finally {
         writeRaw('缺AA/a.md', `a ${FAT} ${SOURCE_NUMERIC}`);
         writeRaw('缺AB/b.md', `b ${FAT} ${SOURCE_NUMERIC}`);
-      },
+      }
     });
     try {
       const dto = await harness.service.createBuild(store as never, { mode: 'full', confirm: 'BUILD' });

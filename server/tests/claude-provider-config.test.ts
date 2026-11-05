@@ -71,11 +71,12 @@ it.skipIf(!executable).each(['api-key', 'auth-token'] as const)('saved app confi
   try {
     const result = await testClaudeConnection(input);
     expect(result).toMatchObject({ ok: true, providerName: '应用提供商', model: 'app-configured-model' });
-    expect(calls.length).toBeGreaterThan(0);
-    expect(calls.every((call) => call.url.startsWith('/anthropic/v1/messages'))).toBe(true);
-    expect(calls.at(-1)?.body.model).toBe('app-configured-model');
-    expect(calls.at(-1)?.body.max_tokens).toBe(512);
-    expect(calls.at(-1)?.body.tools ?? []).toHaveLength(0);
+    const requests = calls.filter((call) => call.url.startsWith('/anthropic/v1/messages'));
+    expect(requests.length).toBeGreaterThan(0);
+    expect(calls.every((call) => call.url.startsWith('/anthropic/api/hello') || call.url.startsWith('/anthropic/v1/messages'))).toBe(true);
+    expect(requests.at(-1)?.body.model).toBe('app-configured-model');
+    expect(requests.at(-1)?.body.max_tokens).toBe(512);
+    expect(requests.at(-1)?.body.tools ?? []).toHaveLength(0);
     expect(manager.getConfig().agent.runtime.backend).toBe('pi');
     expect(pool.loadCount()).toBe(0);
     const token = context.mock.results[0].value.token;

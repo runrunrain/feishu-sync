@@ -19,6 +19,8 @@ function documentFolderKeys(relPath: string): string[] {
 
 function parentPathContainsChild(parentPath: string | null | undefined, childPath: string | null | undefined): boolean {
   if (!parentPath || !childPath) return true;
+  if (!parentPath.includes('/') && !parentPath.includes('\\')
+    && !childPath.includes('/') && !childPath.includes('\\')) return true;
   const child = process.platform === 'win32' ? childPath.replace(/\\/g, '/').toLowerCase() : childPath.replace(/\\/g, '/');
   return documentFolderKeys(parentPath).some((folder) => child.startsWith(`${folder}/`));
 }

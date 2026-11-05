@@ -18,9 +18,13 @@ import {
 } from '../src/agent/build-runtime/amagi-package.js';
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'amagi-git-live-'));
+const previousPiHome = process.env.PI_CODING_AGENT_DIR;
 process.env.FEISHU_SYNC_HOME = root; // 隔离：任何 resolveDataRoot 缺省都指回临时根
+process.env.PI_CODING_AGENT_DIR = path.join(root, 'isolated-pi-home');
 afterAll(() => {
   delete process.env.FEISHU_SYNC_HOME;
+  if (previousPiHome === undefined) delete process.env.PI_CODING_AGENT_DIR;
+  else process.env.PI_CODING_AGENT_DIR = previousPiHome;
   fs.rmSync(root, { recursive: true, force: true });
 });
 

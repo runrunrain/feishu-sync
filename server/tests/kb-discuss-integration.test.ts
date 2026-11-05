@@ -88,7 +88,7 @@ it('forwards search, section read and literal grep through a real Discuss sessio
     expect(requests).toHaveLength(4);
     expect(requests.every((r) => r.model === 'fixture')).toBe(true);
     const allowed = requests[0].tools.map((t) => t.function.name);
-    expect(allowed.sort()).toEqual(['kb_grep', 'kb_read', 'kb_search', 'raw_comments', 'raw_links', 'raw_read', 'raw_read_image', 'raw_search'].sort());
+    expect(allowed.sort()).toEqual(['chat_attachment_read', 'kb_grep', 'kb_read', 'kb_search', 'raw_comments', 'raw_links', 'raw_read', 'raw_read_image', 'raw_search'].sort());
     expect(forwarded.map((f) => f.name)).toEqual(steps.map((s) => s.name));
     for (const [i, item] of forwarded.entries()) {
       expect(item.status).toBe(200);

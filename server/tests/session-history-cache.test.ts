@@ -63,7 +63,7 @@ it('a concurrent history request sees entries appended while the first snapshot 
 
 it('restores native thinking blocks from both fresh and incremental history reads', async () => {
   const file = path.join(root, 'thinking.jsonl'); const cache = new SessionHistoryCache();
-  const thought = JSON.stringify({ type: 'message', id: 'thought', parentId: 'a', message: { role: 'assistant', content: [
+  const thought = JSON.stringify({ type: 'message', id: 'thought', parentId: 'a', timestamp: '2026-11-04T00:00:01Z', message: { role: 'assistant', content: [
     { type: 'thinking', thinking: '先核对目录。' }, { type: 'thinking', thinking: '再修改。' }, { type: 'text', text: '开始处理。' },
   ] } }) + '\n';
   fs.writeFileSync(file, line('a', null, 'previous')); await cache.read(file); fs.appendFileSync(file, thought);

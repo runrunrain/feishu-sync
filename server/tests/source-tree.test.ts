@@ -81,15 +81,15 @@ describe('本地目录与真实文档节点合并', () => {
     expect(folder.children).toHaveLength(3);
   });
 
-  it('不同飞书父链下的同路径目录不会跨分支合并', () => {
+  it('飞书父链与本地路径冲突时按本地路径归位', () => {
     const root = { ...record('root'), title: '其他分支', localRelPath: '策划/其他/其他.md' };
     const child = { ...record('system', 'wiki-root'), title: '系统', localRelPath: '策划/系统/系统.md' };
     const local = { ...record('local'), wikiNodeToken: null, title: '本地文档', localRelPath: '策划/系统/本地.md' };
     const tree = buildSourceTree([root, child, local], [root, child, local].map((doc) => ({ ...choice(doc.objToken, doc.localRelPath!), title: doc.title })));
     expect(tree[0].title).toBe('策划');
     const other = tree[0].children.find((node) => node.source?.objToken === 'root')!;
-    const folder = tree[0].children.find((node) => node.title === '系统' && !node.source)!;
-    expect(other.children[0].source?.objToken).toBe('system');
+    const folder = tree[0].children.find((node) => node.source?.objToken === 'system')!;
+    expect(other.children).toHaveLength(0);
     expect(folder.children[0].source?.objToken).toBe('local');
     expect(tokensIn(tree)).toEqual(['local', 'root', 'system']);
   });
