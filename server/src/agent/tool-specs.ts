@@ -612,7 +612,7 @@ export const KB_SUBMIT_REVIEW_SPEC: AgentToolSpec = {
         required: ['sourceRefs'],
         additionalProperties: false,
       },
-      checkedDimensions: { type: 'array', items: { type: 'string' }, description: '检查维度（见审查提示词七维度）' },
+      checkedDimensions: { type: 'array', items: { type: 'string' }, description: '检查维度（见审查提示词检查维度）' },
       issues: {
         type: 'array', maxItems: 500,
         description: '问题清单（每条必须带草稿位置与源位置）',
