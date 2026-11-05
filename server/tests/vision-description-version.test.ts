@@ -19,9 +19,19 @@ describe('published vision evidence version', () => {
       ['b.png', descriptions.get('b.png')!],
       ['a.png', { ...descriptions.get('a.png')!, state: 'described' }],
     ]))!.hash);
-    expect(visionDescriptionImproved(source, version)).toBe(true); // old manifest had no stamp
+    expect(visionDescriptionImproved(source, version)).toBe(false); // missing legacy stamp is not a cache change
+    const fresh = visionDescriptionVersion(new Map([
+      ['a.png', { ...descriptions.get('a.png')!, state: 'described' }],
+      ['b.png', descriptions.get('b.png')!],
+    ]))!;
+    expect(visionDescriptionImproved(source, fresh)).toBe(true);
     expect(visionDescriptionImproved({ ...source, visionDescriptionHash: version.hash, visionDescribedCount: 1 }, version)).toBe(false);
     expect(visionDescriptionImproved({ ...source, visionDescriptionHash: 'old', visionDescribedCount: 2 }, version)).toBe(false);
+  });
+
+  it('still detects changed cached evidence when a published version is known', () => {
+    const old = { ...source, visionDescriptionHash: 'sha256:old', visionDescribedCount: 1 };
+    expect(visionDescriptionImproved(old, visionDescriptionVersion(descriptions))).toBe(true);
   });
 
   it('keeps the old stamp through partial stage publication, then advances after every dependent doc lands', () => {

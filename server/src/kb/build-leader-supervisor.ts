@@ -23,8 +23,7 @@
  * - task_created{nativeTaskId,role,requestedRole?,parentTaskId?}——宿主
  *   已在 BuildActorStore.registerTaskCreation 登记成功（真实原生创建结果，
  *   非 RPC 参数推断）；task_resumed{nativeTaskId,role,parentTaskId} 同理。
- * - task_state{nativeTaskId,status}——完成通知/状态观测（amagi 注入的
- *   用户消息解析；短 id 由宿主回解全 id）。
+ * - task_state{nativeTaskId,status}——完成通知/状态观测（amagi 原生自定义通知或兼容旧用户消息解析；短 id 由宿主回解全 id）。
  * - task_activity{nativeTaskId}——桥接工具活动（actorStore 事件）。
  * - publish_window_opened{requestId,candidateRevision} / publish_completed
  *   {requestId,accepted,candidateRevision,summary,status,publication?}——
@@ -76,6 +75,8 @@ export interface LeaderSupervisorCallbacks {
   /** F10：残留对账（宿主→adapter；返回 null=无 binding 可对账）。
   * prepareResume 遇到未确认终止记录时重试对账；仍 unconfirmed → 拒绝启动。 */
   reconcileResiduals?: (binding: RuntimeBinding | null) => Promise<TerminationOutcome | null>;
+  /** 宿主只补齐原生历史中的执行观测，不改变身份/分配权限。 */
+  restoreTaskObservations?: (binding: RuntimeBinding | null, actors: LeaderActorRecord[]) => void;
   /** 成果账本快照计数（进度 DTO 汇总；真相在 BuildActorStore）。 */
   actorSnapshot: () => { acceptedDocumentCount: number; openBlockingCount: number; activeAssignments: number };
   /** 检查点导出钩子（同步 actorStore 全量载荷进检查点；可选）。 */
@@ -220,6 +221,7 @@ export class BuildLeaderSupervisor {
   /** 进度 DTO（侧栏/诊断；来源=监督状态 + 宿主成果快照，不虚构字段）。 */
   progress(): LeaderRunProgressDto {
     const snapshot = this.cb.actorSnapshot();
+    this.cb.restoreTaskObservations?.(this.state.binding, this.state.actors);
     const terminationSummary = BuildLeaderSupervisor.processTerminationSummaryOf(this.state.termination);
     return {
       buildId: this.state.spec.buildId,
@@ -402,14 +404,14 @@ export class BuildLeaderSupervisor {
         const note = this.state.termination?.note ?? this.state.binding?.termination?.note ?? '无对账结果';
         throw new ToolError(
           'kb_termination_unconfirmed',
-          `上次终止对账未确认（${note}）且本次无法重新对账；已阻断第二个 Leader（含成果级重建）。请人工确认残留进程后重试`,
+          `自动恢复暂未完成（${note}），本次系统进程核验不可用；请稍后重试`,
           409,
         );
       }
     } else if (recheck.state === 'unconfirmed') {
       throw new ToolError(
         'kb_termination_unconfirmed',
-        `残留对账未确认（${recheck.note}）；已阻断第二个 Leader（含成果级重建）。请人工确认残留进程后重试`,
+        `自动恢复暂未完成（${recheck.note}）；应用仍在核验和清理本构建进程，请稍后重试`,
         409,
       );
     } else if (recordedState === 'unconfirmed') {
@@ -608,7 +610,7 @@ export class BuildLeaderSupervisor {
           role: typeof payload.role === 'string' ? payload.role : 'unknown',
           parentTaskId: typeof payload.parentTaskId === 'string' ? payload.parentTaskId : null,
           status: 'confirmed',
-          execState: 'running',
+          execState: typeof payload.execState === 'string' ? payload.execState : 'running',
         });
         return { critical: true, outcome: null };
       }
@@ -622,7 +624,7 @@ export class BuildLeaderSupervisor {
           role: typeof payload.role === 'string' ? payload.role : parentRole ?? 'unknown',
           parentTaskId: parent,
           status: 'confirmed',
-          execState: 'running',
+          execState: typeof payload.execState === 'string' ? payload.execState : 'running',
         });
         if (parent) {
           const parentActor = this.state.actors.find((actor) => actor.nativeTaskId === parent);
@@ -731,6 +733,7 @@ export class BuildLeaderSupervisor {
     // F09-R1：与前端 isHistoricalRuntimeTask 同一口径——同 epoch 的旧代次
     // actor（session 续接换代后其完成通知永不再来）同样只作历史，不得挂住
     // 两段空闲收口；历史记录仍在 actors 列表供 DTO/前端展示。
+    this.cb.restoreTaskObservations?.(this.state.binding, this.state.actors);
     const currentEpoch = this.state.runtimeEpoch;
     const activeActors = this.state.actors.filter(
       (actor) => actor.status !== 'revoked'

@@ -1,3 +1,4 @@
+import { dispatchedTaskState, taskCompletionObservation, restoreTaskCompletionObservations } from './amagi-task-observations.js';
 /**
  * build-runtime-host — 构建重构 v2 生产宿主（设计 §2/§3/§4/§5/§8/§9）
  *
@@ -718,6 +719,7 @@ export class BuildRuntimeHost {
               nativeTaskId,
               role: actor.role,
               requestedRole,
+              execState: dispatchedTaskState(payload.result),
               parentTaskId: actor.parentTaskId,
             }, event));
           } catch (error) {
@@ -758,6 +760,7 @@ export class BuildRuntimeHost {
               nativeTaskId,
               role: actor.role,
               parentTaskId: parent,
+              execState: dispatchedTaskState(payload.result),
             }, event));
           } catch (error) {
             session.queue.push(this.makeEvent(session, 'task_registration_rejected', {
@@ -790,24 +793,8 @@ export class BuildRuntimeHost {
         }
         return;
       }
-      // 用户消息：amagi 后台完成通知（`[task_submit 完成 <agent>/<8hex>] 状态: …`）
-      const text = Array.isArray((message as { content?: unknown }).content)
-        ? ((message as { content: Array<{ type?: string; text?: string }> }).content)
-            .filter((block) => block?.type === 'text' && typeof block.text === 'string')
-            .map((block) => block.text).join('\n')
-        : typeof (message as { text?: unknown }).text === 'string' ? (message as { text: string }).text : '';
-      for (const match of text.matchAll(/\[task_(?:submit|resume) 完成 ([a-z-]+)\/([0-9a-fA-F]{8})\]\s*状态:\s*([\w-]+)/g)) {
-        const [, agentName, shortId, status] = match;
-        const actor = session.actorStore.listActors().find(
-          (candidate) => candidate.role === agentName && candidate.nativeTaskId.toLowerCase().startsWith(shortId.toLowerCase()),
-        );
-        if (actor) {
-          session.queue.push(this.makeEvent(session, 'task_state', {
-            nativeTaskId: actor.nativeTaskId,
-            status,
-          }, event));
-        }
-      }
+      const observation = taskCompletionObservation(message, session.actorStore.listActors());
+      if (observation) session.queue.push(this.makeEvent(session, 'task_state', { nativeTaskId: observation.nativeTaskId, status: observation.status }, event));
       return;
     }
   }
@@ -998,6 +985,11 @@ export class BuildRuntimeHost {
         this.revokeSessionTokens(session);
         return true;
       },
+      fenceBuildCredentials: (buildId: string): boolean => {
+        this.deps.toolService.revokeByBuild(buildId);
+        session.tokens.clear(); session.childTokens.clear();
+        return true;
+      },
       leaderTools: [...LEADER_TOOL_WHITELIST],
       roleMcpTools: BuildRuntimeHost.roleMcpTools(),
       getLeaderModel: (specRef: BuildRunSpec): string => specRef.models.leader,
@@ -1127,6 +1119,7 @@ export class BuildRuntimeHost {
           { reap: true, includeLeaders: false },
         );
       },
+      restoreTaskObservations: restoreTaskCompletionObservations,
       actorSnapshot: () => BuildRuntimeHost.actorSnapshotOf(session.actorStore),
       exportActorPayload: () => session.actorStore.exportCheckpointPayload(),
     }, state, {});

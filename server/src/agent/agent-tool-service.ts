@@ -14,6 +14,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createChatAttachmentFamily } from './tools/chat-attachment-family.js';
 import { isBlankWorkbookPlaceholder, reconcileBlankCsvCoverage } from '../kb/blank-csv-coverage.js';
+import { sourceChangeBaseline, summarizeSourceChanges, type SourceChangeBaseline } from '../kb/source-change-summary.js';
 import { renderCsvTableImport } from '../kb/csv-table-import.js';
 import { MAX_STANDARD_DOC_BYTES } from '../kb/standard-doc-limits.js';
 import { annotateRawReadPage, skipBlankCsvContinuation, type BlankCsvSkip } from '../kb/csv-read-compact.js';
@@ -180,6 +181,8 @@ export interface BuildRunState {
   stagingRoot: string;
   /** 校验拒绝后短期复用正文；仅内存，不参与发布或检查点。 */
   failedWriteAttempts?: Map<string, { owner: string; path: string; args: Record<string, unknown>; expiresAt: number }>;
+  /** Ephemeral, verified baseline for compact incremental reading hints. */
+  sourceChangeBaseline?: SourceChangeBaseline;
   /** kb_write_doc 写入时同步更新（标题/摘要/标签，manifest 生成用） */
   docMeta?: Map<string, { title: string; summary: string; tags: string[]; sources: string[] }>;
   finishInfo: { summary: string; skipped: Array<{ objToken: string; reason: string }>; docMerges?: Array<{ path: string; mergedInto: string[] }> } | null;
@@ -4379,6 +4382,11 @@ export class AgentToolService {
     const limit = scope === 'workset' ? Math.min(requestedLimit, 12) : requestedLimit;
     const published = this.storeFor(context.options.outputRoot).readManifest();
     const publishedSourceByToken = new Map((published?.sourceSnapshot ?? []).map((source) => [source.objToken, source] as const));
+    if (published && state.sourceChangeBaseline?.releaseId !== published.releaseId) {
+      state.sourceChangeBaseline = sourceChangeBaseline(
+        path.join(context.options.outputRoot, 'releases', published.releaseId), published,
+        new KbVersionStore(context.options.outputRoot).readSourceContents(published.releaseId));
+    }
     // 增量重建时把已发布主题的路径交给 Leader，避免仅凭源标题猜新路径，
     // 把同一主题写成第二篇。这里只读取本构建 staging 中的受控文档头。
     const existingDocPathsBySource = new Map<string, string[]>();
@@ -4419,6 +4427,8 @@ export class AgentToolService {
         // Mechanical size/outline hints let the Leader split multi-topic sheets
         // before a writer consumes an entire large source in one model turn.
         sourceShape: summarizeRawSourceShape(assembled),
+        ...(state.mode === 'incremental' && changeType === 'changed'
+          ? { changeSummary: summarizeSourceChanges(state.sourceChangeBaseline ?? null, assembled) } : {}),
         existingDocPaths: (existingDocPathsBySource.get(entry.objToken) ?? []).sort(),
         // contentHash 不含图片和白板旁路文字；同 hash 仍可能是本轮 changed。
         // 不能让 Leader 据此跳过实际进入工作集的来源。
@@ -4441,6 +4451,7 @@ export class AgentToolService {
     const bodyCache = new Map<string, string>();
     const identityGaps = objectMigrationGaps({
       previous: priorKnowledge, draft: this.loadKnowledgeDraft(state), plan: migrationPlan,
+      previousDocSources: new Map(published?.docs?.map((doc) => [doc.path, doc.sources]) ?? []),
       docBody: (docPath) => {
         if (!bodyCache.has(docPath)) {
           try { bodyCache.set(docPath, stripStdHeader(fs.readFileSync(resolveInside(path.join(state.stagingRoot, 'docs'), docPath, 'read'), 'utf8'))); }
@@ -4449,11 +4460,33 @@ export class AgentToolService {
         return bodyCache.get(docPath)!;
       },
     });
+    // Publication failures can concern carried sources outside the workset.
+    // Expose the saved gate report through the authorized bridge so recovery
+    // does not depend on the Leader reading application-private files.
+    let lastPublicationReport: Record<string, unknown> | null = null;
+    try {
+      const id = context.buildId ?? state.v2?.actorStore.buildId;
+      const file = id && path.join(context.options.outputRoot, '.builds', id, 'report.json');
+      if (file && fs.statSync(file).size <= 8 * 1024 * 1024) {
+        const report = JSON.parse(fs.readFileSync(file, 'utf8')) as { generatedAt?: string; issues?: Array<{ code?: string; message?: string }> };
+        const groups = new Map<string, { code: string; count: number; examples: string[] }>();
+        for (const issue of report.issues ?? []) {
+          if (typeof issue.code !== 'string' || typeof issue.message !== 'string') continue;
+          const group = groups.get(issue.code) ?? { code: issue.code, count: 0, examples: [] };
+          group.count += 1;
+          if (group.examples.length < 4) group.examples.push(issue.message.slice(0, 600));
+          groups.set(issue.code, group);
+        }
+        lastPublicationReport = { generatedAt: report.generatedAt ?? null, groups: [...groups.values()],
+          note: '上次门禁记录，含警告；当前结果以再次校验为准。它不是通过凭据。' };
+      }
+    } catch { /* no previous report, or unreadable legacy diagnostics */ }
     return {
       content: [{ type: 'text', text: JSON.stringify({ buildId: context.buildId ?? state.v2?.actorStore.buildId ?? null,
         scope, total: entries.length, requiredRewrites: [...(state.requiredRewrites ?? [])].sort(),
         documentWorkStatus: this.buildDocumentWorkStatus(context, state),
         identityGapCount: identityGaps.length, identityGaps: identityGaps.slice(0, 30),
+        lastPublicationReport,
         entries: page, nextCursor }, null, 2) }],
       details: { scope, total: entries.length, returned: page.length, nextCursor },
     };
@@ -4495,7 +4528,8 @@ export class AgentToolService {
       }
       return false;
     });
-    const errors = validateObjectMigrationRegistration({ previous, draft, existing: plan.migrations, proposed: pending });
+    const errors = validateObjectMigrationRegistration({ previous, draft, existing: plan.migrations, proposed: pending,
+      previousDocSources: new Map(published?.docs?.map((doc) => [doc.path, doc.sources]) ?? []) });
     if (errors.length > 0) throw new ToolError('kb_migration_invalid', errors.slice(0, 8).join('；'), 409);
     this.assertRunLeaseActive(context);
     if (pending.length > 0) {

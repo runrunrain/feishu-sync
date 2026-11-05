@@ -1,0 +1,1014 @@
+{
+  "buildId": "b_20261104133247_9481ce",
+  "observedAt": "2026-11-04T15:17:04.747267+00:00",
+  "completedArtifacts": 66,
+  "byRole": {
+    "diting": 27,
+    "luban": 39
+  },
+  "outputTokens": 1839531,
+  "toolCalls": {
+    "raw_read": 266,
+    "draft_read": 316,
+    "kb_tool_schema": 61,
+    "kb_write_doc": 118,
+    "build_handoff_submit": 75,
+    "mcp_list_tools": 6,
+    "raw_search": 143,
+    "kb_submit_review": 36,
+    "kb_get_plan": 6,
+    "raw_csv_find": 26,
+    "raw_csv_cells": 114,
+    "build_issues_list": 10,
+    "draft_list": 9,
+    "draft_search": 5,
+    "kb_edit_doc": 27,
+    "kb_read_batch": 6,
+    "read": 2,
+    "raw_list": 3,
+    "raw_links": 4
+  },
+  "toolErrors": {
+    "kb_coverage_invalid": 45,
+    "kb_evidence_unresolved": 13,
+    "[amagi-mcp] 权限拒绝：feishu-kb-bridge/kb_get_plan 未在任务授权名单（已授权": 6,
+    "invalid_request": 7,
+    "Validation failed for tool \"mcp__feishu_kb_bridge__build_handoff_submit\"": 8,
+    "tool_not_allowed": 1,
+    "Validation failed for tool \"mcp__feishu_kb_bridge__raw_search\"": 26,
+    "Validation failed for tool \"mcp__feishu_kb_bridge__raw_read\"": 2,
+    "Validation failed for tool \"mcp__feishu_kb_bridge__draft_list\"": 1,
+    "Validation failed for tool \"mcp__feishu_kb_bridge__kb_read_batch\"": 2,
+    "kb_review_coverage_blocked": 6,
+    "child-policy（F12-R1 根约束）：文件工具目标越出冻结信封根——知识读取请走 mcp_call 桥受控工具（raw_read/raw_search 等）；本地文件仅": 2,
+    "Validation failed for tool \"mcp__feishu_kb_bridge__kb_write_doc\"": 7,
+    "Validation failed for tool \"mcp__feishu_kb_bridge__raw_csv_find\"": 3,
+    "kb_object_not_authorized": 1,
+    "Validation failed for tool \"mcp__feishu_kb_bridge__build_issues_list\"": 2,
+    "Validation failed for tool \"mcp__feishu_kb_bridge__kb_edit_doc\"": 2,
+    "kb_object_merge_invalid": 1,
+    "kb_output_owned_by_other_task": 1,
+    "Validation failed for tool \"mcp__feishu_kb_bridge__raw_csv_cells\"": 1,
+    "Validation failed for tool \"mcp__feishu_kb_bridge__draft_read\"": 5,
+    "kb_object_duplicate": 3,
+    "kb_output_not_assigned": 24,
+    "kb_write_retry_unavailable": 2,
+    "kb_review_scope_missing": 1
+  },
+  "tasks": [
+    {
+      "taskId": "9aa4f0de-4224-468f-9ef5-879e06284375",
+      "agent": "diting",
+      "status": "done",
+      "seconds": 333.3,
+      "outputTokens": 17024,
+      "thinkingCharacters": 24459,
+      "fullWrites": 0,
+      "localEdits": 0,
+      "errors": {}
+    },
+    {
+      "taskId": "8dcac167-ccc3-45a0-8de1-244d39da3d58",
+      "agent": "diting",
+      "status": "done",
+      "seconds": 368.2,
+      "outputTokens": 15677,
+      "thinkingCharacters": 26501,
+      "fullWrites": 0,
+      "localEdits": 0,
+      "errors": {
+        "Validation failed for tool \"mcp__feishu_kb_bridge__draft_read\"": 1,
+        "kb_review_coverage_blocked": 1
+      }
+    },
+    {
+      "taskId": "fb6a9876-c3e9-4f3d-8618-620d1c9c13a4",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 74.8,
+      "outputTokens": 47980,
+      "thinkingCharacters": 100808,
+      "fullWrites": 4,
+      "localEdits": 4,
+      "errors": {
+        "kb_coverage_invalid": 3,
+        "invalid_request": 1
+      }
+    },
+    {
+      "taskId": "7531fcfd-70f4-48d1-a887-c309f196ab3a",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 42.8,
+      "outputTokens": 48764,
+      "thinkingCharacters": 99142,
+      "fullWrites": 4,
+      "localEdits": 4,
+      "errors": {
+        "Validation failed for tool \"mcp__feishu_kb_bridge__raw_search\"": 3,
+        "kb_coverage_invalid": 5
+      }
+    },
+    {
+      "taskId": "1370c285-95e6-4380-bfb1-c274962a37ec",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 1420.0,
+      "outputTokens": 137267,
+      "thinkingCharacters": 183569,
+      "fullWrites": 6,
+      "localEdits": 0,
+      "errors": {
+        "kb_coverage_invalid": 2,
+        "kb_evidence_unresolved": 2,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__build_handoff_submit\"": 1
+      }
+    },
+    {
+      "taskId": "2c83d823-fdb0-466f-8182-c26989942351",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 725.0,
+      "outputTokens": 37076,
+      "thinkingCharacters": 68751,
+      "fullWrites": 2,
+      "localEdits": 4,
+      "errors": {
+        "Validation failed for tool \"mcp__feishu_kb_bridge__raw_search\"": 4,
+        "kb_object_not_authorized": 1,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__build_issues_list\"": 1,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__kb_edit_doc\"": 1
+      }
+    },
+    {
+      "taskId": "38a4160c-a5d3-4272-a5cd-1eaeaaaea987",
+      "agent": "diting",
+      "status": "done",
+      "seconds": 586.1,
+      "outputTokens": 34254,
+      "thinkingCharacters": 51297,
+      "fullWrites": 0,
+      "localEdits": 0,
+      "errors": {}
+    },
+    {
+      "taskId": "7800d025-6037-4002-bae9-700f0616eef7",
+      "agent": "diting",
+      "status": "done",
+      "seconds": 726.6,
+      "outputTokens": 24098,
+      "thinkingCharacters": 32571,
+      "fullWrites": 0,
+      "localEdits": 0,
+      "errors": {
+        "Validation failed for tool \"mcp__feishu_kb_bridge__draft_read\"": 1,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__raw_search\"": 1,
+        "kb_review_coverage_blocked": 1
+      }
+    },
+    {
+      "taskId": "27abc4b1-0ec8-4f3d-a1aa-77e49ad59dce",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 1438.6,
+      "outputTokens": 122209,
+      "thinkingCharacters": 109416,
+      "fullWrites": 12,
+      "localEdits": 1,
+      "errors": {
+        "kb_object_duplicate": 3,
+        "kb_coverage_invalid": 4,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__kb_write_doc\"": 1,
+        "kb_evidence_unresolved": 3
+      }
+    },
+    {
+      "taskId": "72679d56-424b-46d1-8071-62ab57f67c5f",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 32.1,
+      "outputTokens": 78743,
+      "thinkingCharacters": 162921,
+      "fullWrites": 4,
+      "localEdits": 5,
+      "errors": {
+        "kb_coverage_invalid": 2,
+        "kb_object_merge_invalid": 1,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__build_handoff_submit\"": 1,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__build_issues_list\"": 1,
+        "kb_output_owned_by_other_task": 1
+      }
+    },
+    {
+      "taskId": "2cf5f2ec-3786-406a-999d-a915aa996cf7",
+      "agent": "diting",
+      "status": "done",
+      "seconds": 641.5,
+      "outputTokens": 20843,
+      "thinkingCharacters": 31459,
+      "fullWrites": 0,
+      "localEdits": 0,
+      "errors": {
+        "Validation failed for tool \"mcp__feishu_kb_bridge__draft_read\"": 1
+      }
+    },
+    {
+      "taskId": "20aee215-9f8c-4804-a931-c70568578d29",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 431.8,
+      "outputTokens": 137267,
+      "thinkingCharacters": 183569,
+      "fullWrites": 6,
+      "localEdits": 0,
+      "errors": {
+        "kb_coverage_invalid": 2,
+        "kb_evidence_unresolved": 2,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__build_handoff_submit\"": 1
+      }
+    },
+    {
+      "taskId": "91cde5a5-91b2-4c4b-8687-de64c56b3a20",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 1052.8,
+      "outputTokens": 65535,
+      "thinkingCharacters": 158787,
+      "fullWrites": 5,
+      "localEdits": 0,
+      "errors": {
+        "[amagi-mcp] 权限拒绝：feishu-kb-bridge/kb_get_plan 未在任务授权名单（已授权": 1,
+        "kb_coverage_invalid": 3,
+        "invalid_request": 1
+      }
+    },
+    {
+      "taskId": "1162d48f-fc06-4ace-b6ad-a4d81aaded82",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 21.7,
+      "outputTokens": 78743,
+      "thinkingCharacters": 162921,
+      "fullWrites": 4,
+      "localEdits": 5,
+      "errors": {
+        "kb_coverage_invalid": 2,
+        "kb_object_merge_invalid": 1,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__build_handoff_submit\"": 1,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__build_issues_list\"": 1,
+        "kb_output_owned_by_other_task": 1
+      }
+    },
+    {
+      "taskId": "f212c7b6-a2d5-4427-a59d-a7a37461fe1f",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 1212.4,
+      "outputTokens": 116448,
+      "thinkingCharacters": 117760,
+      "fullWrites": 6,
+      "localEdits": 0,
+      "errors": {
+        "kb_coverage_invalid": 2,
+        "kb_evidence_unresolved": 2,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__build_handoff_submit\"": 2
+      }
+    },
+    {
+      "taskId": "ed689090-bfa7-417b-929d-18cebe3843b8",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 462.9,
+      "outputTokens": 80344,
+      "thinkingCharacters": 79434,
+      "fullWrites": 21,
+      "localEdits": 0,
+      "errors": {
+        "kb_output_not_assigned": 15,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__kb_write_doc\"": 1,
+        "[amagi-mcp] 权限拒绝：feishu-kb-bridge/kb_get_plan 未在任务授权名单（已授权": 1,
+        "kb_write_retry_unavailable": 1,
+        "kb_coverage_invalid": 3
+      }
+    },
+    {
+      "taskId": "50f0631a-b605-435d-9cf6-88f299903801",
+      "agent": "diting",
+      "status": "done",
+      "seconds": 428.8,
+      "outputTokens": 17773,
+      "thinkingCharacters": 24561,
+      "fullWrites": 0,
+      "localEdits": 0,
+      "errors": {
+        "Validation failed for tool \"mcp__feishu_kb_bridge__raw_search\"": 1
+      }
+    },
+    {
+      "taskId": "5249c860-2133-4ca2-b557-866aecd55972",
+      "agent": "diting",
+      "status": "done",
+      "seconds": 687.7,
+      "outputTokens": 9924,
+      "thinkingCharacters": 14159,
+      "fullWrites": 0,
+      "localEdits": 0,
+      "errors": {
+        "kb_review_coverage_blocked": 1,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__raw_search\"": 1
+      }
+    },
+    {
+      "taskId": "607baedf-b9c9-4964-a9b7-864691b0addb",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 74.0,
+      "outputTokens": 28345,
+      "thinkingCharacters": 59985,
+      "fullWrites": 1,
+      "localEdits": 1,
+      "errors": {
+        "Validation failed for tool \"mcp__feishu_kb_bridge__build_handoff_submit\"": 1
+      }
+    },
+    {
+      "taskId": "4073fe24-a1b0-4259-b1b2-7fedb98126a7",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 68.9,
+      "outputTokens": 48764,
+      "thinkingCharacters": 99142,
+      "fullWrites": 4,
+      "localEdits": 4,
+      "errors": {
+        "Validation failed for tool \"mcp__feishu_kb_bridge__raw_search\"": 3,
+        "kb_coverage_invalid": 5
+      }
+    },
+    {
+      "taskId": "8ca78c3c-f109-422b-ac78-7a9fbd9fb446",
+      "agent": "diting",
+      "status": "done",
+      "seconds": 11.8,
+      "outputTokens": 27834,
+      "thinkingCharacters": 41698,
+      "fullWrites": 0,
+      "localEdits": 0,
+      "errors": {
+        "tool_not_allowed": 1
+      }
+    },
+    {
+      "taskId": "c6af1d59-7199-42d6-b151-111df754f029",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 931.8,
+      "outputTokens": 78743,
+      "thinkingCharacters": 162921,
+      "fullWrites": 4,
+      "localEdits": 5,
+      "errors": {
+        "kb_coverage_invalid": 2,
+        "kb_object_merge_invalid": 1,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__build_handoff_submit\"": 1,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__build_issues_list\"": 1,
+        "kb_output_owned_by_other_task": 1
+      }
+    },
+    {
+      "taskId": "0addee20-074a-4dbb-8346-b5135c317cb0",
+      "agent": "diting",
+      "status": "done",
+      "seconds": 172.9,
+      "outputTokens": 6250,
+      "thinkingCharacters": 12183,
+      "fullWrites": 0,
+      "localEdits": 0,
+      "errors": {
+        "invalid_request": 1
+      }
+    },
+    {
+      "taskId": "c4c6b746-298b-4401-8519-d2bf5e859e84",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 19.7,
+      "outputTokens": 47980,
+      "thinkingCharacters": 100808,
+      "fullWrites": 4,
+      "localEdits": 4,
+      "errors": {
+        "kb_coverage_invalid": 3,
+        "invalid_request": 1
+      }
+    },
+    {
+      "taskId": "64a71942-a078-470d-ba48-50948dbcc331",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 37.5,
+      "outputTokens": 122209,
+      "thinkingCharacters": 109416,
+      "fullWrites": 12,
+      "localEdits": 1,
+      "errors": {
+        "kb_object_duplicate": 3,
+        "kb_coverage_invalid": 4,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__kb_write_doc\"": 1,
+        "kb_evidence_unresolved": 3
+      }
+    },
+    {
+      "taskId": "bd5056ff-7037-4398-bff9-1ad13deafd6a",
+      "agent": "diting",
+      "status": "done",
+      "seconds": 467.6,
+      "outputTokens": 21326,
+      "thinkingCharacters": 31340,
+      "fullWrites": 0,
+      "localEdits": 0,
+      "errors": {}
+    },
+    {
+      "taskId": "34cc9d19-f1b8-42d8-82f0-29a8b8b2857e",
+      "agent": "diting",
+      "status": "done",
+      "seconds": 419.7,
+      "outputTokens": 23284,
+      "thinkingCharacters": 34710,
+      "fullWrites": 0,
+      "localEdits": 0,
+      "errors": {
+        "Validation failed for tool \"mcp__feishu_kb_bridge__draft_read\"": 1,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__raw_search\"": 1,
+        "invalid_request": 1
+      }
+    },
+    {
+      "taskId": "69c3e36e-b289-4dc7-9291-5c36a52d7909",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 1153.6,
+      "outputTokens": 77271,
+      "thinkingCharacters": 172449,
+      "fullWrites": 8,
+      "localEdits": 2,
+      "errors": {
+        "Validation failed for tool \"mcp__feishu_kb_bridge__raw_csv_find\"": 2,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__kb_write_doc\"": 1,
+        "kb_coverage_invalid": 6,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__kb_edit_doc\"": 1,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__build_handoff_submit\"": 1
+      }
+    },
+    {
+      "taskId": "91f522fa-b892-498f-baac-2691e3b24c88",
+      "agent": "diting",
+      "status": "done",
+      "seconds": 403.6,
+      "outputTokens": 14413,
+      "thinkingCharacters": 18324,
+      "fullWrites": 0,
+      "localEdits": 0,
+      "errors": {
+        "kb_review_scope_missing": 1
+      }
+    },
+    {
+      "taskId": "2011ceec-51e3-4c4b-8f85-cc1eaefb1553",
+      "agent": "diting",
+      "status": "done",
+      "seconds": 499.4,
+      "outputTokens": 27439,
+      "thinkingCharacters": 71916,
+      "fullWrites": 0,
+      "localEdits": 0,
+      "errors": {
+        "child-policy（F12-R1 根约束）：文件工具目标越出冻结信封根——知识读取请走 mcp_call 桥受控工具（raw_read/raw_search 等）；本地文件仅": 1,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__raw_search\"": 1
+      }
+    },
+    {
+      "taskId": "ef9f74c8-57ed-4035-a763-7107ff91c332",
+      "agent": "diting",
+      "status": "done",
+      "seconds": 356.1,
+      "outputTokens": 8364,
+      "thinkingCharacters": 20905,
+      "fullWrites": 0,
+      "localEdits": 0,
+      "errors": {}
+    },
+    {
+      "taskId": "2ef3289b-8560-469b-97a3-87d4598541dd",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 13.8,
+      "outputTokens": 37076,
+      "thinkingCharacters": 68751,
+      "fullWrites": 2,
+      "localEdits": 4,
+      "errors": {
+        "Validation failed for tool \"mcp__feishu_kb_bridge__raw_search\"": 4,
+        "kb_object_not_authorized": 1,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__build_issues_list\"": 1,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__kb_edit_doc\"": 1
+      }
+    },
+    {
+      "taskId": "ec65d2d2-b07f-4bdb-b23e-78fe8698b243",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 1234.0,
+      "outputTokens": 123417,
+      "thinkingCharacters": 113826,
+      "fullWrites": 7,
+      "localEdits": 0,
+      "errors": {
+        "Validation failed for tool \"mcp__feishu_kb_bridge__kb_write_doc\"": 1,
+        "kb_coverage_invalid": 2,
+        "kb_evidence_unresolved": 2
+      }
+    },
+    {
+      "taskId": "396d2021-c4de-4fbc-ad7e-a29e13139a92",
+      "agent": "diting",
+      "status": "done",
+      "seconds": 315.2,
+      "outputTokens": 20089,
+      "thinkingCharacters": 30058,
+      "fullWrites": 0,
+      "localEdits": 0,
+      "errors": {}
+    },
+    {
+      "taskId": "0cef07a7-420c-43c2-b7bb-31b50dff3557",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 254.7,
+      "outputTokens": 123417,
+      "thinkingCharacters": 113826,
+      "fullWrites": 7,
+      "localEdits": 0,
+      "errors": {
+        "Validation failed for tool \"mcp__feishu_kb_bridge__kb_write_doc\"": 1,
+        "kb_coverage_invalid": 2,
+        "kb_evidence_unresolved": 2
+      }
+    },
+    {
+      "taskId": "670ca941-bdeb-417b-ad0d-318374c0dae3",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 347.8,
+      "outputTokens": 28345,
+      "thinkingCharacters": 59985,
+      "fullWrites": 1,
+      "localEdits": 1,
+      "errors": {
+        "Validation failed for tool \"mcp__feishu_kb_bridge__build_handoff_submit\"": 1
+      }
+    },
+    {
+      "taskId": "f45e6765-2d63-45be-90be-39d93508051a",
+      "agent": "diting",
+      "status": "done",
+      "seconds": 453.1,
+      "outputTokens": 18622,
+      "thinkingCharacters": 28866,
+      "fullWrites": 0,
+      "localEdits": 0,
+      "errors": {
+        "kb_review_coverage_blocked": 1
+      }
+    },
+    {
+      "taskId": "42ec1f4c-255e-4c40-87fc-76d944b78e48",
+      "agent": "diting",
+      "status": "done",
+      "seconds": 405.1,
+      "outputTokens": 19730,
+      "thinkingCharacters": 30067,
+      "fullWrites": 0,
+      "localEdits": 0,
+      "errors": {}
+    },
+    {
+      "taskId": "57b7d4fb-d0a2-4a21-bfe7-e069c3e361c5",
+      "agent": "diting",
+      "status": "done",
+      "seconds": 374.4,
+      "outputTokens": 22780,
+      "thinkingCharacters": 35995,
+      "fullWrites": 0,
+      "localEdits": 0,
+      "errors": {
+        "Validation failed for tool \"mcp__feishu_kb_bridge__raw_csv_cells\"": 1
+      }
+    },
+    {
+      "taskId": "1e27cf8f-8aeb-4ffe-8a71-091034859d04",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 44.3,
+      "outputTokens": 78743,
+      "thinkingCharacters": 162921,
+      "fullWrites": 4,
+      "localEdits": 5,
+      "errors": {
+        "kb_coverage_invalid": 2,
+        "kb_object_merge_invalid": 1,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__build_handoff_submit\"": 1,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__build_issues_list\"": 1,
+        "kb_output_owned_by_other_task": 1
+      }
+    },
+    {
+      "taskId": "b4583816-89da-42f8-bd6f-5a8d055a5f15",
+      "agent": "diting",
+      "status": "done",
+      "seconds": 281.5,
+      "outputTokens": 13628,
+      "thinkingCharacters": 19488,
+      "fullWrites": 0,
+      "localEdits": 0,
+      "errors": {}
+    },
+    {
+      "taskId": "6fcb20ef-293d-46c6-bb65-eef139edff96",
+      "agent": "diting",
+      "status": "done",
+      "seconds": 462.0,
+      "outputTokens": 4341,
+      "thinkingCharacters": 6998,
+      "fullWrites": 0,
+      "localEdits": 0,
+      "errors": {}
+    },
+    {
+      "taskId": "6fa80948-7bdb-4280-9229-1d5bac7b33e6",
+      "agent": "diting",
+      "status": "done",
+      "seconds": 524.7,
+      "outputTokens": 24831,
+      "thinkingCharacters": 36601,
+      "fullWrites": 0,
+      "localEdits": 0,
+      "errors": {
+        "Validation failed for tool \"mcp__feishu_kb_bridge__raw_search\"": 1
+      }
+    },
+    {
+      "taskId": "5b5a9ca6-a510-421e-b0ab-49a0d1f5b625",
+      "agent": "diting",
+      "status": "done",
+      "seconds": 427.1,
+      "outputTokens": 10433,
+      "thinkingCharacters": 14415,
+      "fullWrites": 0,
+      "localEdits": 0,
+      "errors": {
+        "Validation failed for tool \"mcp__feishu_kb_bridge__raw_search\"": 1
+      }
+    },
+    {
+      "taskId": "b98e5c9a-0479-41d0-bd3c-0437e8f21a56",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 1588.5,
+      "outputTokens": 100487,
+      "thinkingCharacters": 201883,
+      "fullWrites": 10,
+      "localEdits": 4,
+      "errors": {
+        "Validation failed for tool \"mcp__feishu_kb_bridge__raw_search\"": 4,
+        "kb_coverage_invalid": 7,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__kb_write_doc\"": 1,
+        "[amagi-mcp] 权限拒绝：feishu-kb-bridge/kb_get_plan 未在任务授权名单（已授权": 1,
+        "invalid_request": 1,
+        "kb_evidence_unresolved": 1
+      }
+    },
+    {
+      "taskId": "6487a58b-b8f8-4677-9ef2-8129b4736441",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 213.5,
+      "outputTokens": 42394,
+      "thinkingCharacters": 77431,
+      "fullWrites": 14,
+      "localEdits": 0,
+      "errors": {
+        "Validation failed for tool \"mcp__feishu_kb_bridge__kb_write_doc\"": 1,
+        "kb_output_not_assigned": 9,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__build_handoff_submit\"": 1,
+        "kb_write_retry_unavailable": 1,
+        "kb_coverage_invalid": 2
+      }
+    },
+    {
+      "taskId": "68acffab-386d-419c-9902-eb127e357301",
+      "agent": "luban",
+      "status": "blocked",
+      "seconds": 416.7,
+      "outputTokens": 42394,
+      "thinkingCharacters": 77431,
+      "fullWrites": 14,
+      "localEdits": 0,
+      "errors": {
+        "Validation failed for tool \"mcp__feishu_kb_bridge__kb_write_doc\"": 1,
+        "kb_output_not_assigned": 9,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__build_handoff_submit\"": 1,
+        "kb_write_retry_unavailable": 1,
+        "kb_coverage_invalid": 2
+      }
+    },
+    {
+      "taskId": "2727a63b-3b03-4c1b-969e-4d1444613aa3",
+      "agent": "diting",
+      "status": "done",
+      "seconds": 9.8,
+      "outputTokens": 15164,
+      "thinkingCharacters": 22173,
+      "fullWrites": 0,
+      "localEdits": 0,
+      "errors": {
+        "[amagi-mcp] 权限拒绝：feishu-kb-bridge/kb_get_plan 未在任务授权名单（已授权": 1
+      }
+    },
+    {
+      "taskId": "571a06e2-c111-4026-a922-f90b60b28d36",
+      "agent": "diting",
+      "status": "done",
+      "seconds": 243.2,
+      "outputTokens": 12619,
+      "thinkingCharacters": 18898,
+      "fullWrites": 0,
+      "localEdits": 0,
+      "errors": {
+        "Validation failed for tool \"mcp__feishu_kb_bridge__raw_read\"": 2,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__raw_search\"": 1
+      }
+    },
+    {
+      "taskId": "ffd8ea64-510f-4f74-ae51-d2e280d76ba6",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 523.7,
+      "outputTokens": 36205,
+      "thinkingCharacters": 45323,
+      "fullWrites": 4,
+      "localEdits": 1,
+      "errors": {
+        "invalid_request": 2,
+        "kb_evidence_unresolved": 1,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__build_handoff_submit\"": 1,
+        "child-policy（F12-R1 根约束）：文件工具目标越出冻结信封根——知识读取请走 mcp_call 桥受控工具（raw_read/raw_search 等）；本地文件仅": 1
+      }
+    },
+    {
+      "taskId": "c42d4392-6ec4-4804-a7ec-769cabd39570",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 647.0,
+      "outputTokens": 47980,
+      "thinkingCharacters": 100808,
+      "fullWrites": 4,
+      "localEdits": 4,
+      "errors": {
+        "kb_coverage_invalid": 3,
+        "invalid_request": 1
+      }
+    },
+    {
+      "taskId": "e6086558-2c64-4da2-a536-952d6cf55cf5",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 111.0,
+      "outputTokens": 36205,
+      "thinkingCharacters": 45323,
+      "fullWrites": 4,
+      "localEdits": 1,
+      "errors": {
+        "invalid_request": 2,
+        "kb_evidence_unresolved": 1,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__build_handoff_submit\"": 1,
+        "child-policy（F12-R1 根约束）：文件工具目标越出冻结信封根——知识读取请走 mcp_call 桥受控工具（raw_read/raw_search 等）；本地文件仅": 1
+      }
+    },
+    {
+      "taskId": "d7b88f28-5b2d-4b6c-acf0-cc22fd5043a3",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 1217.7,
+      "outputTokens": 102587,
+      "thinkingCharacters": 101019,
+      "fullWrites": 4,
+      "localEdits": 0,
+      "errors": {
+        "kb_coverage_invalid": 2,
+        "kb_evidence_unresolved": 1
+      }
+    },
+    {
+      "taskId": "97097004-f26b-410b-af65-e2290170012d",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 737.2,
+      "outputTokens": 48764,
+      "thinkingCharacters": 99142,
+      "fullWrites": 4,
+      "localEdits": 4,
+      "errors": {
+        "Validation failed for tool \"mcp__feishu_kb_bridge__raw_search\"": 3,
+        "kb_coverage_invalid": 5
+      }
+    },
+    {
+      "taskId": "a648769b-da1b-488d-89be-c0cee2be3253",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 225.7,
+      "outputTokens": 116448,
+      "thinkingCharacters": 117760,
+      "fullWrites": 6,
+      "localEdits": 0,
+      "errors": {
+        "kb_coverage_invalid": 2,
+        "kb_evidence_unresolved": 2,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__build_handoff_submit\"": 2
+      }
+    },
+    {
+      "taskId": "a75d105d-2721-4fd5-9bc8-c096dc55f598",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 637.5,
+      "outputTokens": 43519,
+      "thinkingCharacters": 99091,
+      "fullWrites": 4,
+      "localEdits": 1,
+      "errors": {
+        "Validation failed for tool \"mcp__feishu_kb_bridge__raw_search\"": 6,
+        "kb_coverage_invalid": 2,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__kb_write_doc\"": 1
+      }
+    },
+    {
+      "taskId": "c6e8be16-6e96-455f-940a-3ff95ebb4f94",
+      "agent": "diting",
+      "status": "done",
+      "seconds": 375.4,
+      "outputTokens": 14051,
+      "thinkingCharacters": 19721,
+      "fullWrites": 0,
+      "localEdits": 0,
+      "errors": {
+        "Validation failed for tool \"mcp__feishu_kb_bridge__kb_read_batch\"": 1,
+        "[amagi-mcp] 权限拒绝：feishu-kb-bridge/kb_get_plan 未在任务授权名单（已授权": 1,
+        "kb_review_coverage_blocked": 1,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__raw_search\"": 1
+      }
+    },
+    {
+      "taskId": "4599e684-ed43-4df3-bf83-83828082aed3",
+      "agent": "diting",
+      "status": "done",
+      "seconds": 690.1,
+      "outputTokens": 15646,
+      "thinkingCharacters": 23665,
+      "fullWrites": 0,
+      "localEdits": 0,
+      "errors": {
+        "kb_review_coverage_blocked": 1
+      }
+    },
+    {
+      "taskId": "7b105f22-80fe-4d0f-b32b-0dffe9630f3d",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 176.2,
+      "outputTokens": 78743,
+      "thinkingCharacters": 162921,
+      "fullWrites": 4,
+      "localEdits": 5,
+      "errors": {
+        "kb_coverage_invalid": 2,
+        "kb_object_merge_invalid": 1,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__build_handoff_submit\"": 1,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__build_issues_list\"": 1,
+        "kb_output_owned_by_other_task": 1
+      }
+    },
+    {
+      "taskId": "04c7974a-b7c5-4390-81ac-bb88712a08c4",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 12.9,
+      "outputTokens": 37076,
+      "thinkingCharacters": 68751,
+      "fullWrites": 2,
+      "localEdits": 4,
+      "errors": {
+        "Validation failed for tool \"mcp__feishu_kb_bridge__raw_search\"": 4,
+        "kb_object_not_authorized": 1,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__build_issues_list\"": 1,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__kb_edit_doc\"": 1
+      }
+    },
+    {
+      "taskId": "48686787-5cfb-49c3-bf7f-3c69e103b903",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 81.2,
+      "outputTokens": 43519,
+      "thinkingCharacters": 99091,
+      "fullWrites": 4,
+      "localEdits": 1,
+      "errors": {
+        "Validation failed for tool \"mcp__feishu_kb_bridge__raw_search\"": 6,
+        "kb_coverage_invalid": 2,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__kb_write_doc\"": 1
+      }
+    },
+    {
+      "taskId": "4a2bf250-b22a-497a-95c7-baae398ab62e",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 462.8,
+      "outputTokens": 28953,
+      "thinkingCharacters": 64426,
+      "fullWrites": 2,
+      "localEdits": 0,
+      "errors": {
+        "kb_evidence_unresolved": 1
+      }
+    },
+    {
+      "taskId": "229228a8-0d34-48fd-94fc-03b84fa44492",
+      "agent": "luban",
+      "status": "blocked",
+      "seconds": 91.1,
+      "outputTokens": 78743,
+      "thinkingCharacters": 162921,
+      "fullWrites": 4,
+      "localEdits": 5,
+      "errors": {
+        "kb_coverage_invalid": 2,
+        "kb_object_merge_invalid": 1,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__build_handoff_submit\"": 1,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__build_issues_list\"": 1,
+        "kb_output_owned_by_other_task": 1
+      }
+    },
+    {
+      "taskId": "f7e4b4b9-f59d-438c-9bd1-415b731b2894",
+      "agent": "luban",
+      "status": "blocked",
+      "seconds": 610.3,
+      "outputTokens": 80344,
+      "thinkingCharacters": 79434,
+      "fullWrites": 21,
+      "localEdits": 0,
+      "errors": {
+        "kb_output_not_assigned": 15,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__kb_write_doc\"": 1,
+        "[amagi-mcp] 权限拒绝：feishu-kb-bridge/kb_get_plan 未在任务授权名单（已授权": 1,
+        "kb_write_retry_unavailable": 1,
+        "kb_coverage_invalid": 3
+      }
+    },
+    {
+      "taskId": "a7288e0a-f90d-4c40-8e26-0fcdcea2b59c",
+      "agent": "luban",
+      "status": "done",
+      "seconds": 122.2,
+      "outputTokens": 37076,
+      "thinkingCharacters": 68751,
+      "fullWrites": 2,
+      "localEdits": 4,
+      "errors": {
+        "Validation failed for tool \"mcp__feishu_kb_bridge__raw_search\"": 4,
+        "kb_object_not_authorized": 1,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__build_issues_list\"": 1,
+        "Validation failed for tool \"mcp__feishu_kb_bridge__kb_edit_doc\"": 1
+      }
+    },
+    {
+      "taskId": "3e3ca803-a190-4df2-b66c-f5e4267db58c",
+      "agent": "diting",
+      "status": "done",
+      "seconds": 276.6,
+      "outputTokens": 18002,
+      "thinkingCharacters": 26216,
+      "fullWrites": 0,
+      "localEdits": 0,
+      "errors": {
+        "Validation failed for tool \"mcp__feishu_kb_bridge__draft_read\"": 1
+      }
+    }
+  ],
+  "thinkingCharacters": 2851338,
+  "deduplicatedHistoryEntries": 0,
+  "taskMetricsNote": "Per-task session totals may include inherited resume history. Global totals deduplicated by native entry id."
+}

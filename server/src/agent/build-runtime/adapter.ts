@@ -39,6 +39,7 @@ import { assertProbeUsable, runStaticProbes, type StaticProbeInput } from './cap
 import { appendProcessLedgerEntry, commandFingerprint, markLedgerExit, patchLedgerBirthToken, readProcessLedger } from './process-ledger.js';
 import { findAliveLedgerLeaders, listBuildHomeDirs, reconcileResidualProcesses, type ResidualDeps } from './process-residual.js';
 import { readBirthIdentities } from './process-identity.js';
+import { recoverOrphanDispatches, type AutomaticRecoveryDeps } from './automatic-recovery.js';
 import { PiRpcProcess } from '../pi-rpc-process.js';
 import { PiRuntimeResolver } from '../runtime-resolver.js';
 import { buildDefaultAgentConfig } from '../../types/agent-knowledge.js';
@@ -78,6 +79,8 @@ export interface PiAmagiRuntimeDeps {
   log?: (line: string) => void;
   /** 残留对账探测依赖（可注入便于测试；缺省真实 ps/libproc）。 */
   residualDeps?: ResidualDeps;
+  /** Application-owned orphan recovery; no human exit attestation is required. */
+  fenceBuildCredentials?: (buildId: string) => boolean;
 }
 
 interface BindingState {
@@ -98,7 +101,7 @@ interface BindingState {
  */
 export async function reconcileBuildRootResiduals(
   input: { buildId: string; buildRoot: string; binding: RuntimeBinding | null },
-  options: { reap?: boolean; includeLeaders?: boolean } = {},
+  options: { reap?: boolean; includeLeaders?: boolean; fenceBuildCredentials?: () => boolean; recoveryDeps?: AutomaticRecoveryDeps } = {},
   residualDeps: Partial<ResidualDeps> = {},
 ): Promise<TerminationOutcome | null> {
   const ledger = readProcessLedger(input.buildRoot);
@@ -176,13 +179,17 @@ export async function reconcileBuildRootResiduals(
       includeLeaderEntries: options.includeLeaders === true,
     }, { reap: options.reap === true }, residualDeps));
   }
-  return {
+  const merged: TerminationOutcome = {
     state: outcomes.some((outcome) => outcome.state === 'unconfirmed') ? 'unconfirmed' : 'confirmed',
     at: new Date().toISOString(),
     leaderExit: null, // Leader 退出事实由调用层合并（cancel 侧 rpc.getExitInfo）
     children: outcomes.flatMap((outcome) => outcome.children),
     note: `${homeDirs.length > 1 ? `跨 ${homeDirs.length} 个 epoch/agentDir 对账；` : ''}${outcomes.map((outcome) => outcome.note).join('；')}`,
   };
+  return options.fenceBuildCredentials && aliveLeaders.length === 0 && merged.state === 'unconfirmed'
+    ? recoverOrphanDispatches({ buildId: input.buildId, buildRoot: input.buildRoot,
+      homes: homeDirs, outcome: merged, fence: options.fenceBuildCredentials }, options.recoveryDeps)
+    : merged;
 }
 
 export class PiAmagiBuildRuntime implements BuildRuntimeAdapter {
@@ -494,7 +501,7 @@ export class PiAmagiBuildRuntime implements BuildRuntimeAdapter {
     const residualNote = terminateError
       ? `Leader 终止异常（${terminateError}）；${termination.note}`
       : unconfirmedCount > 0
-        ? `${termination.note}；凭据已撤销不影响候选区，但需人工确认残留后才能再次启动 Leader`
+        ? `${termination.note}；凭据已撤销，应用将继续自动核验和清理后恢复`
         : `Leader 已终止；${termination.note}`;
     this.deps.log?.(`[build-runtime] Leader 终止对账 build=${binding.buildId} state=${termination.state} children=${termination.children.length} pid=${pid ?? '未知'}`);
     return { leaderExit, credentialsRevoked, residualNote, termination };
@@ -537,7 +544,8 @@ export class PiAmagiBuildRuntime implements BuildRuntimeAdapter {
   ): Promise<TerminationOutcome | null> {
     const merged = await reconcileBuildRootResiduals(
       { ...input, buildRoot: planBuildDirectories(this.deps.dataRoot, input.buildId, 1).buildRoot },
-      options,
+      { ...options, ...(this.deps.fenceBuildCredentials
+        ? { fenceBuildCredentials: () => this.deps.fenceBuildCredentials!(input.buildId) } : {}) },
       this.deps.residualDeps ?? {},
     );
     if (options.reap && input.binding && merged) {

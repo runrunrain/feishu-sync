@@ -87,6 +87,7 @@ it('新提供商自动使用 Bearer 认证，无需选择认证方式', async ()
     expect(fixture.save).toHaveBeenCalledTimes(1);
     expect(fixture.save.mock.calls[0][0].llm.providers[1]).toEqual(expect.objectContaining({
       name: '新提供商', anthropicAuthType: 'auth-token',
+      models: [expect.objectContaining({ contextWindow: 200_000, maxTokens: 130_000 })],
     }));
   } finally { act(() => root.unmount()); container.remove(); }
 });

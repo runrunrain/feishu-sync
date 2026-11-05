@@ -272,16 +272,17 @@ export interface ChildProcessFinding {
   pid: number;
   /** 证据来源：anchor=受信原生启动锚点；ledger=应用进程账本；v2-store=派发意图扫描。 */
   source: 'anchor' | 'ledger' | 'v2-store';
-  verdict: 'exited' | 'reaped' | 'not-ours' | 'unconfirmed';
+  verdict: 'exited' | 'reaped' | 'not-ours' | 'unconfirmed' | 'abandoned';
   /** 身份证明等级：birth-token=内核出生令牌精确匹配；pgid-invariant=POSIX
    * 进程组不变量（组长 pid 存续期间不复用）；none=无可用证明。 */
-  proof: 'birth-token' | 'pgid-invariant' | 'none';
+  proof: 'birth-token' | 'pgid-invariant' | 'none' | 'scope-scan';
   detail: string;
 }
 
 /** F10：终止对账结果（随 CancelResult/检查点持久化；贯穿 supervisor/host）。 */
 export interface TerminationOutcome {
-  /** confirmed=全部已知个体已证明退出；unconfirmed=存在未证明个体（阻断新 Leader）。 */
+  /** confirmed=已核验退出或完成撤权后的自动隔离；abandoned 不声称物理退出。
+   * unconfirmed=自动清理尚未收敛或系统探测失败（暂不启动第二个 Leader）。 */
   state: 'confirmed' | 'unconfirmed';
   at: string;
   /** Leader 退出事实（不可得时 null，不伪称）。 */

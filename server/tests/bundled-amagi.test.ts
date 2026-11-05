@@ -93,6 +93,19 @@ it('application builds can reuse the frozen private bundle without a source chec
   const result = await bundleAmagi({ sourceDir: false, destination });
   expect(readBundledAmagi(destination)?.contentHash).toBe(result.contentHash);
   expect(sha(fs.readFileSync(path.join(destination, 'package.zip')))).toBe(result.archiveSha256);
+  expect(result.bundlerVersion).toBe(3);
+  expect(result.localPatchSha256).toBe(sha(fs.readFileSync(path.resolve('patches/amagi-pi-2.21.31-background-continue.patch'))));
+  const zip = await JSZip.loadAsync(fs.readFileSync(path.join(destination, 'package.zip')));
+  const shutdown = await zip.file('extensions/amagi-core/task-run.ts')!.async('string');
+  expect(shutdown).toContain('shutdown-never-spawned');
+  expect(shutdown.indexOf('session shutdown before child cleanup')).toBeLessThan(shutdown.indexOf('const running = registry.getRunningChildren();', shutdown.indexOf('export async function cleanupChildrenOnShutdown')));
+});
+
+it('a valid older frozen archive cannot silently bypass required native shutdown fixes', async () => {
+  const { bundleAmagi } = await import('../scripts/lib/bundled-amagi.mjs');
+  const old = await fixture();
+  await expect(bundleAmagi({ sourceDir: false, bundleDir: path.dirname(old.archivePath), destination: temp() }))
+    .rejects.toThrow('lacks the required continuation/shutdown patch');
 });
 
 it('next application version replaces only the managed declaration and keeps old frozen packages', async (ctx) => {

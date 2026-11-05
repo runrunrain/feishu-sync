@@ -210,6 +210,8 @@ export interface V2StoreScanResult {
   /** v2-store 目录不可枚举（非 ENOENT 读取失败）→ 证据不可得（调用方
  *  fail-closed）；ENOENT 是合法契约（无 v2-store=无派发意图事实）。 */
   degraded: boolean;
+  /** Native initial queue records prove no launch was ever granted. */
+  unstartedTasks?: string[];
 }
 
 /**
@@ -230,6 +232,7 @@ export function scanV2StoreIntents(homeDir: string, anchoredTaskIds: ReadonlySet
   }
   const anchorlessActiveTasks: string[] = [];
   const unreadableTasks: string[] = [];
+  const unstartedTasks: string[] = [];
   let storePresent = false;
   for (const entry of names) {
     const { name } = entry;
@@ -243,9 +246,9 @@ export function scanV2StoreIntents(homeDir: string, anchoredTaskIds: ReadonlySet
       continue;
     }
     storePresent = true;
-    let current: { execution?: unknown; processState?: unknown } | null;
+    let current: Record<string, unknown> | null;
     try {
-      current = JSON.parse(fs.readFileSync(path.join(storeRoot, name, 'current.json'), 'utf-8')) as { execution?: unknown; processState?: unknown };
+      current = JSON.parse(fs.readFileSync(path.join(storeRoot, name, 'current.json'), 'utf-8')) as Record<string, unknown>;
     } catch {
       current = null;
     }
@@ -257,13 +260,26 @@ export function scanV2StoreIntents(homeDir: string, anchoredTaskIds: ReadonlySet
     }
     const exitedProcess = current.processState === 'exited';
     if (exitedProcess) continue; // 运行实体已由 amagi 登记退出（意图活跃但无进程）
+    // amagi's native v1 contract persists grant-start + launchIntent before
+    // spawning. Only its complete initial record (seq=1, revision=0) proves an
+    // unexecuted queue item; a bare/legacy "not-started" flag proves nothing.
+    if (!anchorsUntrusted && current.version === 1 && current.taskId === name && current.specId === name
+      && typeof current.ownerId === 'string' && current.ownerId.length > 0
+      && current.stateSeq === 1 && current.revision === 0
+      && current.execution === 'queued' && current.processState === 'not-started'
+      && typeof current.queuedAt === 'number' && Number.isFinite(current.queuedAt) && current.queuedAt > 0
+      && current.launchIntent === undefined) {
+      unstartedTasks.push(name);
+      continue;
+    }
     // done/error/truncated等业务终态不代替物理退出；not-started也覆盖
     // grant-start→started记账的微窗口。无独立未派发证明时保持unknown。
     if (!anchoredTaskIds.has(name) || anchorsUntrusted) {
       anchorlessActiveTasks.push(name);
     }
   }
-  return { anchorlessActiveTasks, storePresent, unreadableTasks, degraded: false };
+  return { anchorlessActiveTasks, storePresent, unreadableTasks, degraded: false,
+    ...(unstartedTasks.length ? { unstartedTasks } : {}) };
 }
 
 /**

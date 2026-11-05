@@ -316,7 +316,7 @@ describe('BuildLeaderSupervisor 监督状态机', () => {
     const runPromise = supervisor.run({ spec: specFixture(), signal: new AbortController().signal, resumeMode: 'fresh' });
     await waitFor(() => harness.calls.includes('events'));
     harness.events.push(
-      event('task_created', { payload: { nativeTaskId: 't1', role: 'luban' } }),
+      event('task_created', { payload: { nativeTaskId: 't1', role: 'luban', execState: 'queued' } }),
       event('task_resumed', { payload: { nativeTaskId: 't1-r1', role: 'luban', parentTaskId: 't1' } }),
       event('task_state', { payload: { nativeTaskId: 't1-r1', status: 'done' } }),
       event('publish_completed', {

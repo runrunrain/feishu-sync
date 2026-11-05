@@ -10,6 +10,11 @@ production dependencies, excluding Git metadata, developer tools and local state
 The app unpacks and verifies the bundle, then registers it through the existing Pi
 local-package installer under the app's private data directory.
 
+The 2.21.36 bundle also applies the app's reviewed background-continuation and
+queued-shutdown patch in an isolated staging directory. Its digest participates
+in the cache key and release manifest. A stale frozen bundle without that patch
+is rejected during builds; the original source checkout is never modified.
+
 Updates follow application releases. Each content revision has its own immutable
 installation directory; builds already started retain their original package.
 The build runtime loads amagi's native task tools. Ordinary chat sessions retain

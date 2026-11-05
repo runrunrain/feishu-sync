@@ -168,6 +168,29 @@ describe('构建断点继续', () => {
     expect(events.every((event, index) => !index || event.seq > events[index - 1].seq)).toBe(true);
   });
 
+  it('恢复保持冻结来源集合，既有未勾选来源和后续新增来源不会阻断或混入旧构建', async () => {
+    const f = await fixture(13);
+    f.unselected.push('tok12');
+    const first = f.makeService();
+    const { data } = await first.request('/api/kb/builds', { mode: 'full', confirm: 'BUILD' });
+    expect((await f.terminal(data.id)).status).toBe('failed');
+    expect(new BuildCheckpointStore(f.outputRoot).read(data.id)!.snapshot).toHaveLength(12);
+    const extra = path.join(f.raw, 'tok99.md');
+    fs.writeFileSync(extra, '后续新增规则，仅进入下一轮构建。');
+    f.store.upsertDocument({ objToken: 'tok99', title: '后续新增规则', objType: 'docx', wikiNodeToken: null,
+      localRelPath: 'tok99.md', localMdPath: extra, lastSyncedAt: new Date().toISOString(),
+      lastSyncedModifyTime: '', status: 'synced' } as DocumentRecord);
+    f.stopFailing();
+    const next = f.makeService();
+    expect((await next.request(`/api/kb/builds/${data.id}/resume`, { confirm: 'RESUME' })).status).toBe(202);
+    expect((await f.terminal(data.id)).status).toBe('published');
+    const manifest = new StandardKbStore(f.outputRoot).readManifest()!;
+    expect(manifest.sourceSnapshot).toHaveLength(12);
+    expect(manifest.docs).toHaveLength(12);
+    expect(manifest.sourceSnapshot.some((source) => source.objToken === 'tok12' || source.objToken === 'tok99')).toBe(false);
+    expect(f.written).not.toContain('tok12'); expect(f.written).not.toContain('tok99');
+  });
+
   it.each(['changed', 'excluded', 'version', 'tampered'] as const)('恢复前拒绝%s输入，不调用模型也不修改发布指针', async (scenario) => {
     const f = await fixture(12); const first = f.makeService();
     const { data } = await first.request('/api/kb/builds', { mode: 'full', confirm: 'BUILD' }); await f.terminal(data.id);

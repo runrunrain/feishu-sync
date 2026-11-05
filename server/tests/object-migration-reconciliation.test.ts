@@ -40,4 +40,21 @@ describe('object migration reconciliation', () => {
     expect(validateObjectMigrationRegistration({ previous, draft: dangling, existing: [], proposed: [migration] }))
       .toContain('ko_old: 草稿仍有引用，先由写作任务处理引用与覆盖归属');
   });
+
+  it('supports legacy formal objects using frozen document provenance, while requiring current successor evidence', () => {
+    const { previous, draft } = fixture();
+    previous.evidence = [];
+    const previousDocSources = new Map([['旧篇.md', ['source-1']]]);
+    expect(objectMigrationGaps({ previous, draft, plan: null, previousDocSources })[0]).toMatchObject({
+      priorDocumentSources: ['source-1'], candidates: [{ objectId: 'ko_new', sharedSources: ['source-1'] }],
+    });
+    const migration = { objectId: 'ko_old', kind: 'merge' as const, successorObjectIds: ['ko_new'], reason: '同一规则迁往新篇，原正式文档载明共同来源' };
+    expect(validateObjectMigrationRegistration({ previous, draft, existing: [], proposed: [migration], previousDocSources })).toEqual([]);
+    expect(validateObjectMigrationRegistration({ previous, draft: { ...draft, evidence: [] }, existing: [], proposed: [migration], previousDocSources }))
+      .toContain('ko_old: 后继 ko_new 与旧对象缺少共同来源证据');
+    // A broad old document header must never override a specific, different old evidence source.
+    previous.evidence = [{ objectId: 'ko_old', sourceRef: { sourceId: 'different-source' } }] as KnowledgeManifest['evidence'];
+    expect(validateObjectMigrationRegistration({ previous, draft, existing: [], proposed: [migration], previousDocSources }))
+      .toContain('ko_old: 后继 ko_new 与旧对象缺少共同来源证据');
+  });
 });

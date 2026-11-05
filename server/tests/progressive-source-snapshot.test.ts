@@ -8,6 +8,7 @@ import { contentResourceHash, computeQuoteHash } from '../src/kb/evidence-locato
 import { captureSourceContents } from '../src/kb/kb-version-store.js';
 import { progressiveSourceSnapshot, rebindBaselineImageEvidence, seedProgressiveCarriedReceipts } from '../src/kb/progressive-source-snapshot.js';
 import { computeSourceHash, RawSourceSnapshot } from '../src/kb/raw-source-snapshot.js';
+import { compileKnowledgeRelease } from '../src/kb/knowledge-compiler.js';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
@@ -90,6 +91,56 @@ describe('progressive source snapshot', () => {
     expect(() => progressiveSourceSnapshot({ entries: [...manifest.sourceSnapshot, liveNew], live, manifest,
       releaseRoot, sourceContents: { old: combined }, promotedSources: new Set(['new']) }))
       .toThrow('证据索引与基准版本不一致');
+  });
+
+  it('publishes all source spans, including an uncited blank CSV, for the next incremental stage', () => {
+    const { sourceRoot, releaseRoot, manifest, live, combined, liveNew } = fixture();
+    const index = JSON.parse(fs.readFileSync(path.join(releaseRoot, 'evidence-resources.json'), 'utf8'));
+    const original = Buffer.from(combined);
+    const extra = ',,\n,,\n';
+    const full = combined + '\n\n--- CSV 2 ---\n' + extra;
+    const compiled = compileKnowledgeRelease({ docs: [], knowledgeDraft: {
+      schemaVersion: 1, buildId: 'index', docs: {}, objects: [], evidence: [], coverage: [], presentations: [], relations: [],
+    }, evidenceResources: [
+      ...index.resources.map((item: { resourceId: string; kind: 'text' | 'csv'; resourceHash: string; path?: string; byteOffset: number; byteLength: number }) => ({
+        resource: { ...item, content: original.subarray(item.byteOffset, item.byteOffset + item.byteLength).toString('utf8'),
+          sourceId: 'old', sourceSnapshotHash: manifest.sourceSnapshot[0]!.contentHash },
+        span: { byteOffset: item.byteOffset, byteLength: item.byteLength },
+      })),
+      { resource: { resourceId: 'old#csv:blank.csv', kind: 'csv', path: 'blank.csv', content: extra,
+        sourceId: 'old', sourceSnapshotHash: manifest.sourceSnapshot[0]!.contentHash, resourceHash: contentResourceHash(extra) },
+        span: { byteOffset: Buffer.byteLength(full) - Buffer.byteLength(extra), byteLength: Buffer.byteLength(extra) } },
+    ] });
+    expect(compiled.evidenceResources.resources).toHaveLength(3);
+    const bytes = JSON.stringify(compiled.evidenceResources);
+    fs.writeFileSync(path.join(releaseRoot, 'evidence-resources.json'), bytes);
+    manifest.evidence!.hash = `sha256:${crypto.createHash('sha256').update(bytes).digest('hex')}`;
+    const snapshot = progressiveSourceSnapshot({ entries: [...manifest.sourceSnapshot, liveNew], live, manifest,
+      releaseRoot, sourceContents: { old: full }, promotedSources: new Set(['new']) });
+    expect(captureSourceContents(snapshot, sourceRoot).old).toBe(full);
+    expect(snapshot.readVerified(sourceRoot, 'old').attachments.map((item) => item.path)).toEqual(['old.csv', 'blank.csv']);
+  });
+
+  it('recovers an old partial CSV index using only frozen links and verifies every indexed span', () => {
+    const { sourceRoot, releaseRoot, manifest, live, liveNew } = fixture();
+    const text = '[CSV 原始数据](old.csv)\n\n[CSV 原始数据](blank.csv)\n';
+    const csv = 'key,value\na,1\n';
+    const combined = text + '\n\n--- CSV 1 ---\n' + csv + '\n\n--- CSV 2 ---\n,,\n';
+    const index = JSON.parse(fs.readFileSync(path.join(releaseRoot, 'evidence-resources.json'), 'utf8'));
+    Object.assign(index.resources[0], { resourceHash: contentResourceHash(text), byteLength: Buffer.byteLength(text) });
+    index.resources[1].byteOffset = Buffer.byteLength(text + '\n\n--- CSV 1 ---\n');
+    const bytes = JSON.stringify(index);
+    fs.writeFileSync(path.join(releaseRoot, 'evidence-resources.json'), bytes);
+    manifest.evidence!.hash = `sha256:${crypto.createHash('sha256').update(bytes).digest('hex')}`;
+    const input = { entries: [...manifest.sourceSnapshot, liveNew], live, manifest,
+      releaseRoot, sourceContents: { old: combined }, promotedSources: new Set(['new']) };
+    const snapshot = progressiveSourceSnapshot(input);
+    expect(captureSourceContents(snapshot, sourceRoot).old).toBe(combined);
+    expect(snapshot.readVerified(sourceRoot, 'old').attachments.map((item) => item.path)).toEqual(['old.csv', 'blank.csv']);
+    // A literal duplicate boundary is ambiguous; never guess a split.
+    expect(() => progressiveSourceSnapshot({ ...input, sourceContents: {
+      old: combined + '\n\n--- CSV 2 ---\nambiguous',
+    } })).toThrow('来源区段不完整');
   });
 
   it('rechecks carried citations and replaces stale cross-build read receipts', () => {

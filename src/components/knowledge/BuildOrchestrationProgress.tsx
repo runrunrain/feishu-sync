@@ -324,6 +324,7 @@ export function BuildRuntimeProgress({ build }: { build: KbBuildDto }) {
                 <RuntimeTaskRow
                   key={task.nativeTaskId}
                   task={task}
+                  successor={task.status === 'revoked' ? data.tasks.find((candidate) => candidate.parentTaskId === task.nativeTaskId) : undefined}
                   terminal={runtimeEnded || isHistoricalRuntimeTask(task, data)}
                   historical={isHistoricalRuntimeTask(task, data)}
                   processUnconfirmed={processUnconfirmed}
@@ -345,19 +346,19 @@ export function BuildRuntimeProgress({ build }: { build: KbBuildDto }) {
 }
 
 function isHistoricalRuntimeTask(task: KbLeaderRunTaskDto, data: KbLeaderRunProgressDto): boolean {
-  return (task.runtimeEpoch != null && data.runtimeEpoch != null && task.runtimeEpoch !== data.runtimeEpoch)
+  return task.status === 'revoked' || (task.runtimeEpoch != null && data.runtimeEpoch != null && task.runtimeEpoch !== data.runtimeEpoch)
     || (task.generation != null && task.generation !== data.generation);
 }
 
-function RuntimeTaskRow({ task, terminal, queueReason, historical = false, processUnconfirmed = false }: {
-  task: KbLeaderRunTaskDto; terminal: boolean; queueReason?: string | null; historical?: boolean; processUnconfirmed?: boolean;
+function RuntimeTaskRow({ task, successor, terminal, queueReason, historical = false, processUnconfirmed = false }: {
+  task: KbLeaderRunTaskDto; successor?: KbLeaderRunTaskDto; terminal: boolean; queueReason?: string | null; historical?: boolean; processUnconfirmed?: boolean;
 }) {
   const exec = task.execState;
   const execLabel = exec === null ? '未观测' : LEADER_EXEC_STATE_LABEL[exec] ?? exec;
   const stopped = terminal && (exec === 'queued' || exec === 'running');
   const stateTone = stopped ? (processUnconfirmed ? 'warn' : 'muted') : exec === 'running' ? 'active' : exec === 'failed' || exec === 'error' ? 'bad'
     : exec === 'done' ? 'good' : 'muted';
-  const actorTone = task.status === 'confirmed' ? 'good' : task.status === 'revoked' ? 'bad' : 'warn';
+  const actorTone = successor ? 'muted' : task.status === 'confirmed' ? 'good' : task.status === 'revoked' ? 'bad' : 'warn';
   return (
     <li
       className="rounded border border-line bg-card-bg px-2.5 py-2 text-[11px] leading-snug"
@@ -371,9 +372,9 @@ function RuntimeTaskRow({ task, terminal, queueReason, historical = false, proce
         <span
           className={`px-1 rounded ${TONE_CLASS[stateTone]}`}
           title={stopped ? (processUnconfirmed ? '这是最后观测；后台清理未确认，不表示进程已退出或任务完成' : '运行时已结束；这是最后观测到的执行状态（未观测到 native 终态，不虚构 done）') : undefined}
-        >{stopped ? (processUnconfirmed ? '终止未确认' : '已停止') : execLabel}</span>
+        >{successor && stopped ? '已被接替' : stopped ? (processUnconfirmed ? '终止未确认' : '已停止') : execLabel}</span>
         {historical ? <span className="text-ink-faint">历史任务</span> : null}
-        <span className={`px-1 rounded ${TONE_CLASS[actorTone]}`}>{LEADER_ACTOR_STATUS_LABEL[task.status] ?? task.status}</span>
+        <span className={`px-1 rounded ${TONE_CLASS[actorTone]}`}>{successor ? '已续接' : LEADER_ACTOR_STATUS_LABEL[task.status] ?? task.status}</span>
         {exec === 'queued' && !terminal ? (
           <span
             className="px-1 rounded bg-paper-2 text-ink-faint"
@@ -390,6 +391,7 @@ function RuntimeTaskRow({ task, terminal, queueReason, historical = false, proce
           <span className="ml-1.5">· 子任务用量不经 Leader 事件（未知）</span>
         </span>
         <span className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+          {successor ? <span title={`续接任务 ${successor.nativeTaskId}`}>由 {shortId(successor.nativeTaskId)} 继续处理</span> : null}
           {task.parentTaskId ? (
             <span className="inline-flex items-center gap-0.5" title={`续接自 ${task.parentTaskId}`}>
               <CornerUpRight className="w-3 h-3" />续接 {shortId(task.parentTaskId)}

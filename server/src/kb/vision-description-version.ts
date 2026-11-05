@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import type { ImageDescription } from '../agent/vision/vision-describer.js';
 import type { KbManifest, KbManifestDoc, RawSourceSnapshotEntry } from '../types/agent-knowledge.js';
 
-export interface VisionDescriptionVersion { hash: string; describedCount: number }
+export interface VisionDescriptionVersion { hash: string; describedCount: number; newlyDescribedCount: number }
 
 /** Cache state (newly described vs reused) is not part of the evidence version. */
 export function visionDescriptionVersion(descriptions: ReadonlyMap<string, ImageDescription> | undefined): VisionDescriptionVersion | null {
@@ -15,6 +15,7 @@ export function visionDescriptionVersion(descriptions: ReadonlyMap<string, Image
   return {
     hash: `sha256:${crypto.createHash('sha256').update(JSON.stringify(rows)).digest('hex')}`,
     describedCount: rows.filter((row) => row[2] !== null).length,
+    newlyDescribedCount: [...descriptions.values()].filter((description) => description.state === 'described').length,
   };
 }
 
@@ -22,6 +23,9 @@ export function visionDescriptionVersion(descriptions: ReadonlyMap<string, Image
 export function visionDescriptionImproved(previous: RawSourceSnapshotEntry | undefined,
   current: VisionDescriptionVersion | null): boolean {
   return !!previous && !!current && current.describedCount > 0
+    // A legacy manifest without a stamp proves no change. Reusing an existing
+    // cache must not turn an ordinary incremental build into a library rewrite.
+    && (!!previous.visionDescriptionHash || current.newlyDescribedCount > 0)
     && current.describedCount >= (previous.visionDescribedCount ?? 0)
     && previous.visionDescriptionHash !== current.hash;
 }

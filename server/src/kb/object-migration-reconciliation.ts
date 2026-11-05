@@ -7,8 +7,18 @@ function evidenceSources(owner: EvidenceOwner, objectId: string): Set<string> {
   return new Set(owner.evidence.filter((item) => item.objectId === objectId).map((item) => item.sourceRef.sourceId));
 }
 
-function sharedSources(prior: EvidenceOwner, oldId: string, draft: EvidenceOwner, newId: string): string[] {
-  const before = evidenceSources(prior, oldId);
+function priorSources(prior: KnowledgeManifest, objectId: string, docSources?: ReadonlyMap<string, string[]>): Set<string> {
+  const evidence = evidenceSources(prior, objectId);
+  if (evidence.size > 0) return evidence;
+  // Legacy formal objects may predate claim-level evidence registration. Their
+  // immutable document's declared sources remain provenance, not read receipts.
+  const docPath = prior.objects.find((object) => object.objectId === objectId)?.canonical?.path;
+  return new Set(docPath ? docSources?.get(docPath) ?? [] : []);
+}
+
+function sharedSources(prior: KnowledgeManifest, oldId: string, draft: EvidenceOwner, newId: string,
+  docSources?: ReadonlyMap<string, string[]>): string[] {
+  const before = priorSources(prior, oldId, docSources);
   return [...evidenceSources(draft, newId)].filter((source) => before.has(source)).sort();
 }
 
@@ -33,9 +43,11 @@ export function objectMigrationGaps(input: {
   previous: KnowledgeManifest | null;
   draft: KnowledgeDraftFile | null;
   plan: Pick<OrganizationPlanFile, 'migrations'> | null;
+  previousDocSources?: ReadonlyMap<string, string[]>;
   docBody?: (path: string) => string;
 }): Array<{
   objectId: string; title: string; priorPath: string | null;
+  priorDocumentSources?: string[];
   candidates: Array<{ objectId: string; title: string; path: string; sharedSources: string[] }>;
 }> {
   const { previous, draft, plan } = input;
@@ -56,7 +68,8 @@ export function objectMigrationGaps(input: {
   });
   return missing.map((old) => {
       const oldTitle = normalizedTitle(old.title);
-      const oldSources = evidenceSources(previous, old.objectId);
+      const oldEvidenceSources = evidenceSources(previous, old.objectId);
+      const oldSources = priorSources(previous, old.objectId, input.previousDocSources);
       const ranked = candidateFacts.map(({ candidate, title, body, sources }) => {
         const common = [...sources].filter((source) => oldSources.has(source)).sort();
         const titleMatch = oldTitle === title ? 100 : oldTitle.includes(title) || title.includes(oldTitle) ? 50 : 0;
@@ -68,7 +81,9 @@ export function objectMigrationGaps(input: {
       }).filter((candidate) => candidate.sharedSources.length > 0 && candidate.score > 20)
         .sort((a, b) => b.score - a.score || a.path.localeCompare(b.path) || a.objectId.localeCompare(b.objectId))
         .slice(0, 5).map(({ score: _score, ...candidate }) => candidate);
-      return { objectId: old.objectId, title: old.title, priorPath: old.canonical?.path ?? null, candidates: ranked };
+      return { objectId: old.objectId, title: old.title, priorPath: old.canonical?.path ?? null,
+        ...(oldEvidenceSources.size === 0 && oldSources.size > 0 ? { priorDocumentSources: [...oldSources].sort() } : {}),
+        candidates: ranked };
     });
 }
 
@@ -78,6 +93,7 @@ export function validateObjectMigrationRegistration(input: {
   draft: KnowledgeDraftFile;
   existing: readonly ObjectMigration[];
   proposed: readonly ObjectMigration[];
+  previousDocSources?: ReadonlyMap<string, string[]>;
 }): string[] {
   const errors: string[] = [];
   const previousById = new Map(input.previous.objects.map((object) => [object.objectId, object] as const));
@@ -99,7 +115,7 @@ export function validateObjectMigrationRegistration(input: {
     for (const successor of successorObjectIds) {
       if (successor === objectId || !currentById.has(successor)) {
         errors.push(`${objectId}: 后继 ${successor} 不在当前草稿`);
-      } else if (sharedSources(input.previous, objectId, input.draft, successor).length === 0) {
+      } else if (sharedSources(input.previous, objectId, input.draft, successor, input.previousDocSources).length === 0) {
         errors.push(`${objectId}: 后继 ${successor} 与旧对象缺少共同来源证据`);
       }
     }

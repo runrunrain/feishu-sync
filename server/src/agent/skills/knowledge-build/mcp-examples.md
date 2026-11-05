@@ -12,7 +12,13 @@
 
 ```json
 {"server": "feishu-kb-bridge", "tool": "raw_read", "arguments": {"objToken": "<token>", "offset": 0, "limit": 120}}
+```
+
+```json
 {"server": "feishu-kb-bridge", "tool": "raw_csv_cells", "arguments": {"objToken": "<token>", "resourceId": "<token>#csv:表.csv", "recordStart": 184, "recordEnd": 187}}
+```
+
+```json
 {"server": "feishu-kb-bridge", "tool": "raw_csv_find", "arguments": {"objToken": "<token>", "resourceId": "<token>#csv:表.csv", "queries": ["建造大营", "补给概念"]}}
 ```
 

@@ -695,6 +695,64 @@ describe('发布布局：v1 基线与 v2 sidecar', () => {
     expect(index.objectsByDoc.get('damage.md')!.map((o) => o.objectId)).toContain('ko_objDamage');
   });
 
+  it('最终发布继承未变化文档的冻结图片；新草稿不能借旧图片绕过证据装配', async () => {
+    const service = makeService();
+    const snap = snapshot();
+    const baseId = 'r_carried_images';
+    const releaseRoot = path.join(outputRoot, 'releases', baseId);
+    fs.cpSync(path.join(outputRoot, 'releases', 'r_kp2'), releaseRoot, { recursive: true });
+    const manifest = JSON.parse(fs.readFileSync(path.join(releaseRoot, 'manifest.json'), 'utf8'));
+    const knowledge = JSON.parse(fs.readFileSync(path.join(releaseRoot, 'knowledge.json'), 'utf8'));
+    const index = JSON.parse(fs.readFileSync(path.join(releaseRoot, 'evidence-resources.json'), 'utf8'));
+    const bytes = Buffer.from('immutable published image');
+    const hash = contentResourceHash(bytes.toString('utf8'));
+    const resourceId = 'tokSrc#image:diagram.png';
+    const imagePath = `evidence/image-${hash.slice(7, 23)}.bin`;
+    fs.mkdirSync(path.join(releaseRoot, 'evidence'), { recursive: true });
+    fs.writeFileSync(path.join(releaseRoot, imagePath), bytes);
+    const imageEvidence = knowledge.evidence[0];
+    imageEvidence.sourceRef = { sourceId: 'tokSrc', sourceSnapshotHash: snap.entries[0]!.contentHash,
+      resourceId, resourceHash: hash };
+    imageEvidence.selector = { kind: 'media_region', imageHash: hash };
+    imageEvidence.nature = 'machine_description';
+    imageEvidence.quoteHash = computeQuoteHash('published diagram rules');
+    delete imageEvidence.readReceiptId;
+    const object = knowledge.objects.find((item: KnowledgeObject) => item.objectId === imageEvidence.objectId)!;
+    object.reviewSubjectHash = computeReviewSubjectHash({ payloadHash: object.payloadHash,
+      evidence: [imageEvidence], relations: knowledge.relations.filter((item: { fromObjectId: string }) => item.fromObjectId === object.objectId) });
+    index.resources.push({ resourceId, sourceId: 'tokSrc', sourceSnapshotHash: snap.entries[0]!.contentHash,
+      kind: 'image', resourceHash: hash });
+    index.evidenceFiles.push({ resourceId, path: imagePath, hash, bytes: bytes.length, kind: 'image',
+      evidenceIds: [imageEvidence.evidenceId], image: { src: 'diagram.png', imageHash: hash, caption: 'published diagram rules' } });
+    const knowledgeBytes = JSON.stringify(knowledge);
+    const indexBytes = JSON.stringify(index);
+    fs.writeFileSync(path.join(releaseRoot, 'knowledge.json'), knowledgeBytes);
+    fs.writeFileSync(path.join(releaseRoot, 'evidence-resources.json'), indexBytes);
+    manifest.releaseId = baseId;
+    manifest.organization.hash = contentResourceHash(knowledgeBytes);
+    manifest.evidence.hash = contentResourceHash(indexBytes);
+    fs.writeFileSync(path.join(releaseRoot, 'manifest.json'), JSON.stringify(manifest));
+    const staging = stageBuild('b_final_image_carry');
+    fs.cpSync(path.join(releaseRoot, 'docs'), path.join(staging, 'docs'), { recursive: true });
+    const draft: KnowledgeDeclarationSet = { schemaVersion: 1, buildId: 'b_final_image_carry',
+      docs: Object.fromEntries(manifest.docs.map((doc: { path: string; docId: string; contentHash: string }) =>
+        [doc.path, { docId: doc.docId, revision: 0, basis: 'published', bodyLineOffset: 0, carriedHash: doc.contentHash }])),
+      objects: knowledge.objects, evidence: knowledge.evidence, coverage: knowledge.coverage,
+      relations: knowledge.relations, presentations: knowledge.presentations.filter((item: { kind: string }) => item.kind !== 'canonical') };
+    fs.writeFileSync(path.join(staging, 'knowledge-draft.json'), JSON.stringify(draft));
+    const prepare = (service as unknown as { prepareKnowledgePublish: (input: Record<string, unknown>) => Promise<{
+      evidenceFileWrites: Array<{ path: string; bytes: Buffer }> }> }).prepareKnowledgePublish.bind(service);
+    const args = { ...publishArgs('b_final_image_carry', 'r_image_final', staging, baseId, snap),
+      mode: 'incremental', publicationStage: 'final', imageDescriptions: new Map(), draftEvidenceScopePaths: [] };
+    const result = await prepare(args);
+    expect(result.evidenceFileWrites.find((item) => item.path === imagePath)?.bytes).toEqual(bytes);
+    await expect(prepare({ ...args, draftEvidenceScopePaths: ['damage.md'] })).rejects.toMatchObject({
+      code: 'kb_publish_blocked', details: { groups: expect.arrayContaining([expect.objectContaining({ code: 'kb_evidence_unresolved' })]) },
+    });
+    fs.appendFileSync(path.join(releaseRoot, imagePath), 'tampered');
+    await expect(prepare(args)).rejects.toThrow('继承图片证据文件损坏');
+  });
+
   it('门禁 blocking → 发布失败保留 staging、CURRENT 不动、半成品 release 清理', async () => {
     const service = makeService();
     const snap = snapshot();

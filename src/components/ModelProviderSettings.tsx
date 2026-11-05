@@ -27,6 +27,7 @@ import { revealProviderApiKey } from '../api/client';
 import type { LlmConfig, LlmModelPreset, LlmProviderConfig } from '../types';
 
 const NEW_PRESET_CONTEXT_WINDOW = 200_000;
+const NEW_PRESET_MAX_OUTPUT_TOKENS = 130_000;
 
 function cloneLlmConfig(llm: LlmConfig): LlmConfig {
   return {
@@ -67,6 +68,7 @@ function makeProvider(existing: LlmProviderConfig[]): LlmProviderConfig {
       openAiModel: '',
       enabled: true,
       contextWindow: NEW_PRESET_CONTEXT_WINDOW,
+      maxTokens: NEW_PRESET_MAX_OUTPUT_TOKENS,
     }],
   };
 }
@@ -233,6 +235,7 @@ export function ModelProviderSettings() {
       openAiModel: '',
       enabled: true,
       contextWindow: NEW_PRESET_CONTEXT_WINDOW,
+      maxTokens: NEW_PRESET_MAX_OUTPUT_TOKENS,
     };
     updateProvider(provider.id, (current) => ({
       ...current,
@@ -479,7 +482,7 @@ export function ModelProviderSettings() {
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
                     <p className="text-sm font-medium text-ink-soft font-serif">模型预设</p>
-                    <p className="mt-0.5 text-xs text-ink-faint">填写模型代码与运行参数。最大输出留空时使用已核实型号的内置上限；未收录型号默认 32768，手填值优先。</p>
+                    <p className="mt-0.5 text-xs text-ink-faint">新预设默认最大输出 130000 tokens。清空后使用已核实型号的内置上限；未收录型号回落到 32768，手填值优先。</p>
                   </div>
                   <Button variant="secondary" size="sm" onClick={() => addModel(selectedProvider)}>
                     <Plus className="h-3.5 w-3.5" />

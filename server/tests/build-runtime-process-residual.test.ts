@@ -332,6 +332,20 @@ describe('v2-store 派发意图扫描（spawn→锚点窗口硬崩/旧版 amagi�
     expect(fixture.signals).toHaveLength(0);
   });
 
+  it('完整原生初始排队记录证明尚未取得启动许可；有启动意图或状态已推进仍阻断', async () => {
+    const fixture = makeFixture();
+    const current = { version: 1, taskId: 'native-queued', specId: 'native-queued', ownerId: 'leader',
+      stateSeq: 1, revision: 0, queuedAt: Date.now(), execution: 'queued', processState: 'not-started' };
+    writeV2Current(fixture, 'native-queued', current);
+    const input = { homeDir: fixture.homeDir, buildRoot: fixture.buildRoot, leaderPids: LEADER_PIDS() };
+    expect((await reconcileResidualProcesses(input, { reap: true }, fixture.deps)).state).toBe('confirmed');
+    for (const change of [{ launchIntent: { at: Date.now(), nonce: 'intent' } }, { stateSeq: 3 }, { execution: 'running' }]) {
+      writeV2Current(fixture, 'native-queued', { ...current, ...change });
+      expect((await reconcileResidualProcesses(input, { reap: true }, fixture.deps)).state).toBe('unconfirmed');
+    }
+    expect(fixture.signals).toHaveLength(0);
+  });
+
   it('活跃任务无锚点覆盖 → 不假 confirmed（个体不可发现即不可证明无残留）', async () => {
     const fixture = makeFixture();
     writeV2Current(fixture, 'task-noanchor', { execution: 'running', processState: 'alive' });

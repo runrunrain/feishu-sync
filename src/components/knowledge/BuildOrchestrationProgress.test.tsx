@@ -488,7 +488,7 @@ describe('v2 Leader 监督运行进度（真实契约 GET /api/kb/builds/:id/lea
     });
     const tasks = [...host.querySelectorAll('[data-testid="kb-runtime-task"]')];
     expect(tasks).toHaveLength(6);
-    expect(host.querySelector('[data-testid="kb-runtime-plan-count"]')?.textContent).toContain('当前计划 6 项');
+    expect(host.querySelector('[data-testid="kb-runtime-plan-count"]')?.textContent).toContain('当前计划 5 项');
     // native execState=error（真实链路实测）：中文标签 + 语气与 failed 同级（异常终态）。
     const errored = host.querySelector('[data-task-id="task-err"]');
     expect(errored?.textContent).toContain('异常');
@@ -634,4 +634,18 @@ describe('v2 Leader 监督运行进度（真实契约 GET /api/kb/builds/:id/lea
     expect(host.querySelector('[data-testid="kb-runtime-resume-capability"]')?.textContent)
       .toContain('不支持恢复');
   });
+});
+
+it('续接旧任务显示历史与后继，不计当前未结且不显示待完成', async () => {
+  api.getKbBuildLeaderProgress.mockResolvedValue(makeLeader({ tasks: [
+    makeLeaderTask({ nativeTaskId: 'old-writer', execState: 'running', status: 'revoked' }),
+    makeLeaderTask({ nativeTaskId: 'new-writer', parentTaskId: 'old-writer', execState: 'running' }),
+  ] }));
+  await act(async () => { root = createRoot(host); root.render(<BuildOrchestrationProgress build={makeBuild({ id: 'kb-v2', orchestrationMode: 'pi-amagi' })} />); });
+  expect(host.querySelector('[data-testid="kb-runtime-plan-count"]')?.textContent).toContain('当前计划 1 项');
+  expect(host.querySelector('[data-testid="kb-runtime-plan-count"]')?.textContent).toContain('历史 1 项');
+  const old = host.querySelector('[data-task-id="old-writer"]');
+  expect(old?.textContent).toContain('已续接'); expect(old?.textContent).toContain('由 new-writer 继续处理');
+  expect(old?.textContent).not.toContain('待完成');
+  expect(host.querySelector('[data-task-id="new-writer"]')?.textContent).toContain('待完成');
 });

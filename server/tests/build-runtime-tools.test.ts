@@ -148,29 +148,32 @@ describe('Leader 工具面（§3.4）', () => {
     expect(JSON.parse(manifest.content[0]!.text).total).toBe(2);
   });
 
-  it('Leader 可对已消失的旧对象登记经共同来源核验的迁移，清单同步消除身份缺口', async () => {
-    const localOutput = path.join(dataRoot, 'migration-output');
+  it.each([false, true])('Leader 可登记经共同来源核验的迁移（旧对象无逐条证据=%s）', async (legacy) => {
+    const buildId = `b-leader-migration-${legacy}`;
+    const localOutput = path.join(dataRoot, `migration-output-${legacy}`);
     const releaseId = 'migration-base';
     fs.mkdirSync(path.join(localOutput, 'releases', releaseId), { recursive: true });
     fs.writeFileSync(path.join(localOutput, 'CURRENT.json'), JSON.stringify({ releaseId, publishedAt: new Date().toISOString() }));
     fs.writeFileSync(path.join(localOutput, 'releases', releaseId, 'manifest.json'), JSON.stringify({
       schemaVersion: 1, releaseId, buildId: 'prior-build', publishedAt: new Date().toISOString(),
-      mode: 'full', baseReleaseId: null, model: null, docs: [], sourceSnapshot: [],
+      mode: 'full', baseReleaseId: null, model: null,
+      docs: [{ path: '旧篇.md', docId: 'kd_old', title: '旧篇', summary: '旧正式文档', tags: [],
+        contentHash: 'sha256:fixture', sources: ['tokA'], bytes: 10 }], sourceSnapshot: [],
     }));
     fs.writeFileSync(path.join(localOutput, 'releases', releaseId, 'knowledge.json'), JSON.stringify({
       schemaVersion: 1, documents: [], objects: [{ objectId: 'ko_old', title: '灾荒事件', familyKey: 'old-event',
-        canonical: { path: '旧篇.md' } }], evidence: [{ objectId: 'ko_old', sourceRef: { sourceId: 'tokA' } }],
+        canonical: { path: '旧篇.md' } }], evidence: legacy ? [] : [{ objectId: 'ko_old', sourceRef: { sourceId: 'tokA' } }],
       presentations: [], relations: [], coverage: [], migrations: [],
     }));
-    const setup = makeV2('b-leader-migration');
+    const setup = makeV2(buildId);
     const leader = service.createRunContext({
-      runKind: 'build', buildId: 'b-leader-migration', outputRoot: localOutput, knowledgeBaseRoot: kbRoot,
+      runKind: 'build', buildId, outputRoot: localOutput, knowledgeBaseRoot: kbRoot,
       buildState: setup.state, allowedToolsOverride: [...V2_LEADER_TOOLS],
-      orchestration: { mode: 'pi-amagi', buildId: 'b-leader-migration', generation: 1,
+      orchestration: { mode: 'pi-amagi', buildId, generation: 1,
         credential: 'leader', actorStore: setup.store },
     });
     fs.writeFileSync(path.join(setup.state.stagingRoot, 'knowledge-draft.json'), JSON.stringify({
-      schemaVersion: 1, buildId: 'b-leader-migration', docs: { '新篇.md': { docId: 'kd_new', revision: 1 } },
+      schemaVersion: 1, buildId, docs: { '新篇.md': { docId: 'kd_new', revision: 1 } },
       clientKeys: {}, evidenceKeys: {}, objects: [{ objectId: 'ko_new', title: '灾荒事件', familyKey: 'new-event',
         canonical: { path: '新篇.md' } }], evidence: [{ objectId: 'ko_new', sourceRef: { sourceId: 'tokA' } }],
       presentations: [], relations: [], coverage: [], calls: {},
@@ -178,6 +181,7 @@ describe('Leader 工具面（§3.4）', () => {
     const before = JSON.parse((await call(leader.token, 'build_manifest', {})).content[0]!.text);
     expect(before.identityGapCount).toBe(1);
     expect(before.identityGaps[0].candidates[0].objectId).toBe('ko_new');
+    if (legacy) expect(before.identityGaps[0].priorDocumentSources).toEqual(['tokA']);
     await expectToolError(() => call(leader.token, 'build_register_migrations', { migrations: [{
       objectId: 'ko_old', kind: 'merge', successorObjectIds: ['ko_missing'], reason: '规则迁往新篇',
     }] }), 'kb_migration_invalid');
@@ -314,12 +318,48 @@ describe('Leader 工具面（§3.4）', () => {
     }
   });
 
+  it('build_manifest 给增量任务当前变化的资源与跳读坐标', async () => {
+    const setup = makeV2('b-manifest-source-delta');
+    setup.state.workset.set('tokA', 'changed');
+    const original = setup.state.snapshot.get('tokA')!;
+    const readManifest = vi.spyOn(StandardKbStore.prototype, 'readManifest').mockReturnValue({
+      releaseId: 'r_delta', sourceSnapshot: [{ ...original, contentHash: 'old' }], docs: [],
+    } as never);
+    const readContents = vi.spyOn(KbVersionStore.prototype, 'readSourceContents').mockReturnValue({
+      tokA: RAW_A.replace('甲节内容行1', '旧规则'),
+    });
+    try {
+      const manifest = JSON.parse((await call(setup.leader.token, 'build_manifest', {})).content[0]!.text);
+      expect(manifest.entries.find((source: { objToken: string }) => source.objToken === 'tokA')).toMatchObject({
+        changeSummary: { baselineAvailable: true, unchangedResources: 0,
+          changes: [{ resourceId: 'tokA', change: 'changed', outputStart: expect.any(Number), outputEnd: expect.any(Number) }] },
+      });
+      // The hints do not manufacture a read receipt or mark a document written.
+      expect(setup.state.writtenPaths?.size ?? 0).toBe(0);
+    } finally { readManifest.mockRestore(); readContents.mockRestore(); }
+  });
+
+  it('build_manifest 公开按类型归组的发布诊断，不把旧报告当作通过凭据', async () => {
+    const setup = makeV2('b-manifest-gate-report');
+    const root = path.join(outputRoot, '.builds', 'b-manifest-gate-report');
+    fs.mkdirSync(root, { recursive: true });
+    fs.writeFileSync(path.join(root, 'report.json'), JSON.stringify({ generatedAt: '2026-11-04T16:00:00Z',
+      issues: [{ code: 'kb_migration_invalid', message: 'missing old identity' },
+        { code: 'kb_migration_invalid', message: 'missing another identity' },
+        { code: 'kb_coverage_invalid', message: 'ordinary warning' }] }));
+    const manifest = JSON.parse((await call(setup.leader.token, 'build_manifest', {})).content[0]!.text);
+    expect(manifest.lastPublicationReport).toMatchObject({ generatedAt: '2026-11-04T16:00:00Z',
+      groups: [{ code: 'kb_migration_invalid', count: 2, examples: ['missing old identity', 'missing another identity'] },
+        { code: 'kb_coverage_invalid', count: 1 }] });
+    expect(manifest.lastPublicationReport.note).toContain('不是通过凭据');
+  });
+
   it('build_manifest 不把新识别的旧图片证据当作已发布版未变', async () => {
     const setup = makeV2('b-manifest-vision-improved');
     const original = setup.state.snapshot.get('tokA')!;
     setup.state.workset.set('tokA', 'rebuild');
     setup.state.imageDescriptions = new Map([['tokA', new Map([['diagram.png', {
-      src: 'diagram.png', imageHash: 'image-hash', state: 'cached' as const, text: '图中的新规则',
+      src: 'diagram.png', imageHash: 'image-hash', state: 'described' as const, text: '图中的新规则',
     }]])]]);
     const readManifest = vi.spyOn(StandardKbStore.prototype, 'readManifest').mockReturnValue({
       sourceSnapshot: [original], docs: [],
@@ -608,6 +648,8 @@ describe('kb_edit_doc（§7 局部编辑）', () => {
     const setup = makeV2('b-edit1');
     setup.store.registerTaskCreation({ nativeTaskId: 'w1', requestedRole: 'luban' });
     await writeDraftWithObject(setup, 'w1');
+    setup.state.requiredRewrites = new Set(['docs/edit.md']);
+    setup.state.writtenPaths = new Set();
     // 审查者在编辑后提交 → 失效旧审查
     setup.store.registerTaskCreation({ nativeTaskId: 'r1', requestedRole: 'diting' });
     const draftRead = await call(setup.child.token, 'draft_read', { path: 'docs/edit.md' }, meta('r1', 'diting'));
@@ -621,6 +663,7 @@ describe('kb_edit_doc（§7 局部编辑）', () => {
     }, meta('w1', 'luban'));
     expect(edit.details!.edit).toBeTruthy();
     expect(edit.details).toMatchObject({ edit: { inheritedDeclarations: true } });
+    expect(setup.state.writtenPaths.has('docs/edit.md')).toBe(true);
     // 正文生效
     const after = fs.readFileSync(path.join(setup.state.stagingRoot, 'docs', 'docs', 'edit.md'), 'utf-8');
     expect(after).toContain('目标内容乙-改');

@@ -782,8 +782,23 @@ export function compileKnowledgeRelease(input: CompileKnowledgeReleaseInput): Kn
     evidenceFiles: [],
   };
   const resourcesById = new Map((input.evidenceResources ?? []).map((entry) => [entry.resource.resourceId, entry] as const));
+  // source-contents contains every attachment, including blank/unquoted CSVs.
+  // Keep their spans too: progressive publication must reconstruct the whole
+  // immutable source, not only the subset cited by the current knowledge.
+  const indexedIds = new Set<string>();
+  for (const { resource, span } of resourcesById.values()) {
+    if (!span || (resource.kind !== 'text' && resource.kind !== 'csv')) continue;
+    indexedIds.add(resource.resourceId);
+    evidenceResources.resources.push({
+      resourceId: resource.resourceId, sourceId: resource.sourceId,
+      sourceSnapshotHash: resource.sourceSnapshotHash, kind: resource.kind,
+      resourceHash: resource.resourceHash,
+      ...(resource.kind === 'csv' && 'path' in resource && resource.path ? { path: resource.path } : {}),
+      byteOffset: span.byteOffset, byteLength: span.byteLength,
+    });
+  }
   for (const evidence of knowledge.evidence) {
-    if (evidenceResources.resources.some((entry) => entry.resourceId === evidence.sourceRef.resourceId)) continue;
+    if (indexedIds.has(evidence.sourceRef.resourceId)) continue;
     const entry = resourcesById.get(evidence.sourceRef.resourceId);
     if (!entry) {
       issues.push(issue('kb_evidence_unresolved', 'sourceRef.resourceId',
@@ -792,6 +807,7 @@ export function compileKnowledgeRelease(input: CompileKnowledgeReleaseInput): Kn
       continue;
     }
     const { resource, span } = entry;
+    indexedIds.add(resource.resourceId);
     evidenceResources.resources.push({
       resourceId: resource.resourceId,
       sourceId: resource.sourceId,

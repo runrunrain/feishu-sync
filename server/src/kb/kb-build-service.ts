@@ -1,3 +1,4 @@
+import { restoreTaskCompletionObservations } from './amagi-task-observations.js';
 /**
  * KbBuildService — 标准库构建流水线（设计 §6.5）
  *
@@ -1159,7 +1160,10 @@ export class KbBuildService extends EventEmitter {
       if (!/^[A-Za-z0-9_-]{1,120}$/.test(buildId)) continue;
       const buildRoot = path.join(buildsRoot, buildId);
       try {
-        const outcome = await reconcileBuildRootResiduals({ buildId, buildRoot, binding: null }, { reap: false, includeLeaders: false });
+        const outcome = await reconcileBuildRootResiduals({ buildId, buildRoot, binding: null }, {
+          reap: false, includeLeaders: false,
+          fenceBuildCredentials: () => { this.deps.toolService.revokeByBuild(buildId); return true; },
+        });
         outcomes.push(outcome
           ? { buildId, outcome: outcome.state === 'confirmed' ? 'confirmed' : 'unconfirmed', note: outcome.note }
           : { buildId, outcome: 'no-facts', note: '无锚点/账本事实' });
@@ -1387,6 +1391,7 @@ export class KbBuildService extends EventEmitter {
       '## 续接交代',
       '',
       `构建 ${input.buildId} 从检查点恢复（第 ${generation} 代）。已接受成果与未解决问题以应用账本为准：先用 build_checkpoint(action=status) 查看成果状态，再组织剩余工作。旧式整库范围审查凭据已作废；现有草稿若尚无有效单篇审查回执，须安排独立审查，不必重写正文。每篇审查通过后应用会自动阶段发布，其他任务继续；全部完成后再申请最终发布当前精确候选版本。不要重写已接受且未受影响的草稿。`,
+      '恢复时同时看 build_manifest.identityGaps 与 lastPublicationReport。承接文档的图片证据由应用从不可变正式版本读取并验证，不需要为此重写承接文档。旧的应用侧发布错误须结合当前门禁结果复核，确认解决后更新问题清单；剩余身份去向须核对正文和共同来源后登记迁移。不要把已解决的旧故障永久保留为阻断，也不要重复提交未变化的失败候选。',
       '若需重新读取 build_manifest，工作集每页最多 12 个来源；按 nextCursor 逐页读取，并优先派发已有明确输入的首批任务。',
       ...(skipBriefing ? [skipBriefing] : []),
     ].join('\n');
@@ -2058,7 +2063,9 @@ export class KbBuildService extends EventEmitter {
         ? error.code : 'kb_build_failed';
       const message = error instanceof Error ? error.message : String(error);
       this.emitLog(request.buildId, 'error', `Leader 发布管线异常：${code}: ${message}`);
-      return { accepted: false, result: { reason: code, message: message.slice(0, 500) } };
+      const details = error instanceof ToolError ? (error as ToolError & { details?: unknown }).details : undefined;
+      return { accepted: false, result: { reason: code, message: message.slice(0, 500),
+        ...(details ? { details } : {}) } };
     }
   }
 
@@ -2102,6 +2109,7 @@ export class KbBuildService extends EventEmitter {
 
   /** 检查点状态 → 进度 DTO（summary 从账本载荷快照推导；无载荷如实 null）。 */
   private static leaderProgressOfState(leaderRun: LeaderRunCheckpointState): LeaderRunProgressDto {
+    restoreTaskCompletionObservations(leaderRun.binding, leaderRun.actors);
     const accepted = new Set<string>();
     let openBlocking: number | null = null;
     let activeAssignments: number | null = null;
@@ -2230,7 +2238,13 @@ export class KbBuildService extends EventEmitter {
       entry.baseReleaseId = basePointer?.releaseId ?? null;
       const retainedSources = mode === 'incremental' ? baseManifest?.sourceSnapshot.map((source) => source.objToken) ?? [] : [];
       const excludedForResume = new Set(this.deps.excludedSourcesProvider?.() ?? []);
-      const documents = resume ? this.deps.documentsProvider().filter((doc) => !excludedForResume.has(doc.objToken)) : this.sourceDocuments(retainedSources);
+      // A resume continues the frozen source set. Scanning every currently
+      // available document pulled unselected/new sources into old checkpoints
+      // and rejected unchanged work as a snapshot mismatch. Original sources
+      // still pass the full byte/media/path integrity checks below.
+      const resumeTokens = resume ? new Set(resume.snapshot.map((source) => source.objToken)) : null;
+      const documents = resume ? this.deps.documentsProvider().filter((doc) =>
+        resumeTokens!.has(doc.objToken) && !excludedForResume.has(doc.objToken)) : this.sourceDocuments(retainedSources);
       // P1-S8（设计 P1 §4.1 防线 2）：发布产物不进构建快照——用户把已发布
       // 文档移进监听树时，同步会如实镜像，但构建必须排除（防自我喂养），
       // 并给构建警告 published_doc_in_sources。排除只作用于构建，不影响同步。
@@ -3267,32 +3281,39 @@ export class KbBuildService extends EventEmitter {
     // 再接续为本 build 的回执。源已变化时保留旧声明，由发布门禁要求重写。
     const receiptLines = rebindBaselineImageEvidence({ buildId, draft, snapshot,
       releaseRoot: baselineReleaseRoot, evidenceIndexHash: baselineEvidenceHash });
-    // text/csv 证据回执接续（源未变时验证通过 → baseline-carry 回执替换旧 id）
+    // Cache verified source resources once. A workbook may back hundreds of
+    // claims; reopening and hashing it for every inherited claim is redundant.
+    const baselineResources = new Map<string, EvidenceResource>();
+    const loadedSources = new Set<string>();
+    const resourceFor = (sourceId: string, resourceId: string): EvidenceResource | undefined => {
+      if (!loadedSources.has(sourceId)) {
+        loadedSources.add(sourceId);
+        const entry = snapshot.get(sourceId);
+        if (!entry) return undefined;
+        try {
+          const verified = snapshot.readVerified(knowledgeBaseRoot, sourceId);
+          for (const item of [{ resourceId: sourceId, kind: 'text' as const, content: verified.content },
+            ...verified.attachments.map((attachment) => ({ resourceId: `${sourceId}#csv:${path.basename(attachment.path)}`,
+              kind: 'csv' as const, content: attachment.content, path: path.basename(attachment.path) }))]) {
+            baselineResources.set(item.resourceId, { ...item, sourceId, sourceSnapshotHash: entry.contentHash,
+              resourceHash: contentResourceHash(item.content) });
+          }
+        } catch { /* source changes remain explicit publication failures */ }
+      }
+      return baselineResources.get(resourceId);
+    };
+    // A changed workbook does not change every text/CSV resource. Rebind only
+    // byte-identical resources, then verify the old quote and issue this build's
+    // mechanical receipt. Changed resources still require a fresh author read.
     for (const evidence of draft.evidence) {
       if (evidence.selector.kind !== 'text_span' && evidence.selector.kind !== 'csv_cells') continue;
       const entry = snapshot.get(evidence.sourceRef.sourceId);
       if (!entry) continue;
-      let verified: { content: string; attachments: Array<{ path: string; content: string }> };
-      try {
-        verified = snapshot.readVerified(knowledgeBaseRoot, evidence.sourceRef.sourceId);
-      } catch {
-        continue; // 源已变化/不可读：保持原登记，发布门禁显式失败
-      }
-      const csvBase = evidence.sourceRef.resourceId.includes('#csv:')
-        ? evidence.sourceRef.resourceId.split('#csv:')[1] ?? '' : '';
-      const content = csvBase
-        ? verified.attachments.find((attachment) => path.basename(attachment.path) === csvBase)?.content
-        : verified.content;
-      if (content === undefined) continue;
-      const resource: EvidenceResource = {
-        resourceId: evidence.sourceRef.resourceId,
-        kind: csvBase ? 'csv' : 'text',
-        content,
-        ...(csvBase ? { path: csvBase } : {}),
-        sourceId: evidence.sourceRef.sourceId,
-        sourceSnapshotHash: entry.contentHash,
-        resourceHash: contentResourceHash(content),
-      };
+      const resource = resourceFor(evidence.sourceRef.sourceId, evidence.sourceRef.resourceId);
+      if (!resource || !('content' in resource)) continue;
+      const content = resource.content;
+      const sourceRef = evidence.sourceRef.resourceHash === resource.resourceHash
+        ? { ...evidence.sourceRef, sourceSnapshotHash: entry.contentHash } : evidence.sourceRef;
       const receiptRange = evidence.selector.kind === 'text_span'
         ? { lineStart: evidence.selector.lineStart, lineEnd: evidence.selector.lineEnd }
         : { lineStart: 1, lineEnd: content.split('\n').length };
@@ -3306,7 +3327,7 @@ export class KbBuildService extends EventEmitter {
       const verification = verifyEvidence({
         evidence: {
           evidenceId: evidence.evidenceId,
-          sourceRef: evidence.sourceRef,
+          sourceRef,
           selector: evidence.selector,
           quoteHash: evidence.quoteHash,
           readReceiptId: candidate,
@@ -3315,6 +3336,7 @@ export class KbBuildService extends EventEmitter {
         receipts,
       });
       if (verification.ok) {
+        evidence.sourceRef = sourceRef;
         evidence.readReceiptId = candidate;
         receiptLines.push(JSON.stringify({
           readReceiptId: candidate,
@@ -3327,6 +3349,12 @@ export class KbBuildService extends EventEmitter {
           returnedHash: resource.resourceHash,
           truncated: false,
         }));
+      }
+    }
+    for (const item of draft.coverage) {
+      const resource = resourceFor(item.sourceRef.sourceId, item.sourceRef.resourceId);
+      if (resource && item.sourceRef.resourceHash === resource.resourceHash) {
+        item.sourceRef = { ...item.sourceRef, sourceSnapshotHash: resource.sourceSnapshotHash };
       }
     }
 
@@ -6964,8 +6992,10 @@ export class KbBuildService extends EventEmitter {
       if (claim.selector.kind === 'workbook_cells') workbookSourceIds.add(claim.sourceRef.sourceId);
       else if (claim.selector.kind === 'media_region') {
         imageSourceIds.add(claim.sourceRef.sourceId);
-        if (input.publicationStage === 'progressive'
-          && !draftedPaths.has(objectPaths.get(claim.objectId) ?? '')) carriedImageIds.add(claim.sourceRef.resourceId);
+        // Final publication carries unchanged documents too. Only the workset
+        // has live image descriptions; resolve every carried citation from its
+        // verified immutable release instead of treating it as new evidence.
+        if (!draftedPaths.has(objectPaths.get(claim.objectId) ?? '')) carriedImageIds.add(claim.sourceRef.resourceId);
       }
     }
     const carriedImages = carriedImageIds.size && input.baseReleaseId
@@ -7275,8 +7305,20 @@ export class KbBuildService extends EventEmitter {
         ...blocking.map(KbBuildService.knowledgeIssueToReport),
         ...gates.warnings.map(KbBuildService.knowledgeIssueToReport),
       ]);
-      throw new ToolError('kb_publish_blocked',
-        `知识发布门禁未通过（${blocking.length} 个阻断问题，详见 report）：${blocking.slice(0, 3).map((issue) => `${issue.code} ${issue.message}`).join('；')}`, 409);
+      // A large first category used to hide every other blocker behind a
+      // truncated message, leaving the Leader retrying an unchanged candidate.
+      const groups = new Map<string, { code: string; count: number; examples: string[] }>();
+      for (const issue of blocking) {
+        const group = groups.get(issue.code) ?? { code: issue.code, count: 0, examples: [] };
+        group.count += 1;
+        if (group.examples.length < 4) group.examples.push(issue.message);
+        groups.set(issue.code, group);
+      }
+      throw Object.assign(new ToolError('kb_publish_blocked',
+        `知识发布门禁未通过（${blocking.length} 个阻断问题，详见 report）：${[...groups.values()].map((group) => `${group.code}×${group.count}`).join('；')}`, 409),
+      { details: { blockingCount: blocking.length, groups: [...groups.values()],
+        reportPath: path.join(input.outputRoot, '.builds', input.buildId, 'report.json'),
+        nextAction: '按每类阻断修订；对象身份问题先检查 build_manifest.identityGaps 并登记语义迁移。候选与凭据未变化时不要重复申请。' } });
     }
     if (gates.warnings.length <= 8) {
       for (const warning of gates.warnings) {
@@ -7890,7 +7932,7 @@ export function validateStagingDocs(
       issues.push({ path: file, code: 'body_contains_source_metadata', message: '正文不得含来源说明、来源标识、原始路径或构建信息；请自然重写知识内容，来源仅通过sources字段交给侧栏展示。' });
     }
     if (state.requiredRewrites?.has(file) && !state.writtenPaths?.has(file)) {
-      issues.push({ path: file, code: 'affected_doc_not_updated', message: '该文档来源已变化，必须重新生成完整正文，不能原样沿用旧草稿。' });
+      issues.push({ path: file, code: 'affected_doc_not_updated', message: '该文档来源已变化，须核对变化并提交修订、独立审查；已有结构优先用 kb_edit_doc 局部修改并继承未变声明，不能未经核对沿用旧草稿。' });
     }
     const header = parseStdHeader(content);
     if (!header) {

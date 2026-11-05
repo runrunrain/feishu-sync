@@ -21,6 +21,28 @@ interface FrozenSource {
   attachments: Array<{ path: string; content: string }>;
 }
 
+/** Older compilers omitted unquoted CSVs from the resource index. Recover only
+ * when the frozen, verified main text names every attachment unambiguously.
+ * Never read newer live bytes or guess names from the current workbook. */
+function recoverLegacyAttachments(content: string, combined: string): FrozenSource['attachments'] | null {
+  const names: string[] = [];
+  for (const match of content.matchAll(/^\[CSV 原始数据\]\((.+)\)\s*$/gm)) {
+    let name: string;
+    try { name = path.posix.basename(decodeURIComponent(match[1]!.replace(/\\/g, '/'))); }
+    catch { return null; }
+    if (!name || name === '.' || name === '..' || !name.endsWith('.csv') || names.includes(name)) return null;
+    names.push(name);
+  }
+  if (!names.length || !combined.startsWith(content)) return null;
+  const markers = names.map((_, index) => `\n\n--- CSV ${index + 1} ---\n`);
+  const offsets = markers.map((marker) => combined.indexOf(marker, content.length));
+  if (offsets[0] !== content.length || offsets.some((offset, index) => offset < 0
+    || (index > 0 && offset <= offsets[index - 1]!)
+    || combined.indexOf(markers[index]!, offset + 1) !== -1)) return null;
+  return names.map((name, index) => ({ path: name,
+    content: combined.slice(offsets[index]! + markers[index]!.length, offsets[index + 1] ?? combined.length) }));
+}
+
 /** Load published image evidence from the immutable release, including its
  * caption. Progressive publication must not substitute newer live image bytes
  * for a carried document's already published source version. */
@@ -116,14 +138,32 @@ function frozenSourcesFromRelease(input: {
       return value;
     };
     const content = read(text[0]!);
-    const attachments = resources.filter((item) => item.kind === 'csv')
+    let attachments = resources.filter((item) => item.kind === 'csv')
       .sort((a, b) => a.byteOffset! - b.byteOffset!)
       .map((item) => {
         if (!item.path || path.basename(item.path) !== item.path) throw new Error(`阶段发布基准 CSV 路径无效：${token}`);
         return { path: item.path, content: read(item) };
       });
-    const recombined = content + attachments.map((attachment, index) => `\n\n--- CSV ${index + 1} ---\n${attachment.content}`).join('');
-    if (recombined !== combined) throw new Error(`阶段发布基准来源区段不完整：${token}`);
+    const recombine = (items: FrozenSource['attachments']) => content
+      + items.map((attachment, index) => `\n\n--- CSV ${index + 1} ---\n${attachment.content}`).join('');
+    if (recombine(attachments) !== combined) {
+      const recovered = recoverLegacyAttachments(content, combined);
+      // All existing indexed spans and names must agree with the reconstruction.
+      // Missing spans may be filled, but a bad indexed span is never repaired.
+      let offset = Buffer.byteLength(content, 'utf8');
+      const recoveredSpans = recovered?.map((attachment, index) => {
+        offset += Buffer.byteLength(`\n\n--- CSV ${index + 1} ---\n`);
+        const span = { ...attachment, byteOffset: offset, byteLength: Buffer.byteLength(attachment.content, 'utf8') };
+        offset += span.byteLength;
+        return span;
+      });
+      if (!recovered || recombine(recovered) !== combined || resources.some((item) => item.kind === 'csv'
+        && !recoveredSpans?.some((span) => span.path === item.path && span.byteOffset === item.byteOffset
+          && span.byteLength === item.byteLength && contentResourceHash(span.content) === item.resourceHash))) {
+        throw new Error(`阶段发布基准来源区段不完整：${token}`);
+      }
+      attachments = recovered;
+    }
     frozen.set(token, { content, attachments });
   }
   return frozen;
