@@ -44,7 +44,13 @@ function WorkbookImageViewer({ src, title, onClose }: { src: string; title: stri
   };
   return createPortal(
     <Modal open title={title} onClose={onClose} contentClassName="max-w-6xl" bodyClassName="flex flex-col gap-2">
-      <div className="flex shrink-0 items-center gap-3 text-xs text-ink-soft">
+      <div className="flex shrink-0 items-center gap-3 text-xs text-ink-soft" onKeyDown={(event) => {
+        if (event.key !== 'Tab') return;
+        const [reset, close] = event.currentTarget.querySelectorAll('button');
+        if (event.target !== (event.shiftKey ? reset : close)) return;
+        event.preventDefault();
+        (event.shiftKey ? close : reset).focus();
+      }}>
         <span className="mr-auto">拖动平移 · 滚轮缩放</span>
         <output aria-label="图片缩放比例">{Math.round(view.zoom * 100)}%</output>
         <button type="button" className="rounded border border-line px-2 py-1 hover:bg-paper-2" onClick={() => setView({ x: 0, y: 0, zoom: 1 })}>适合窗口</button>
@@ -101,7 +107,8 @@ function borderStyle(cell: WorkbookCell): CSSProperties {
 export function WorkbookCanvas({ sheet, zoom = 1, onZoom }: { sheet: WorkbookSheetLayout; zoom?: number; onZoom?: (zoom: number) => void }) {
   const viewport = useRef<HTMLDivElement>(null);
   const pendingZoom = useRef<{ zoom: number; left: number; top: number } | null>(null);
-  const pan = useRef<{ pointerId: number; x: number; y: number; left: number; top: number } | null>(null);
+  const [zoomAnchor, setZoomAnchor] = useState<typeof pendingZoom.current>(null);
+  const pan = useRef<{ pointerId: number; x: number; y: number; left: number; top: number; captured: boolean } | null>(null);
   const [imagePreview, setImagePreview] = useState<{ src: string; title: string; opener: HTMLButtonElement } | null>(null);
   const [view, setView] = useState({ left: 0, top: 0, width: 1200, height: 600 });
   const layout = useMemo(() => prepareWorkbookLayout(sheet), [sheet]);
@@ -122,6 +129,7 @@ export function WorkbookCanvas({ sheet, zoom = 1, onZoom }: { sheet: WorkbookShe
         left: Math.max(0, Math.min((previous.left + x) * ratio - x, layout.width * nextZoom - element.clientWidth)),
         top: Math.max(0, Math.min((previous.top + y) * ratio - y, layout.height * nextZoom - element.clientHeight)),
       };
+      setZoomAnchor(pendingZoom.current);
       onZoom(nextZoom);
     };
     element.addEventListener('wheel', zoomCanvas, { passive: false });
@@ -129,13 +137,13 @@ export function WorkbookCanvas({ sheet, zoom = 1, onZoom }: { sheet: WorkbookShe
   }, [zoom, onZoom, layout.width, layout.height]);
   useBeforePaint(() => {
     const element = viewport.current;
-    const pending = pendingZoom.current;
+    if (!element || !zoomAnchor || pendingZoom.current !== zoomAnchor) return;
     pendingZoom.current = null;
-    if (!element || pending?.zoom !== zoom) return;
-    element.scrollLeft = pending.left;
-    element.scrollTop = pending.top;
+    if (zoomAnchor.zoom !== zoom) return;
+    element.scrollLeft = zoomAnchor.left;
+    element.scrollTop = zoomAnchor.top;
     setView({ left: element.scrollLeft, top: element.scrollTop, width: element.clientWidth, height: element.clientHeight });
-  }, [zoom]);
+  }, [zoom, zoomAnchor]);
   useEffect(() => {
     const element = viewport.current;
     if (!element) return;
@@ -152,10 +160,13 @@ export function WorkbookCanvas({ sheet, zoom = 1, onZoom }: { sheet: WorkbookShe
     const element = viewport.current;
     if (!element || event.button !== 0 || event.pointerType === 'touch' || !event.isPrimary) return;
     if (element.scrollWidth <= element.clientWidth && element.scrollHeight <= element.clientHeight) return;
-    event.preventDefault();
-    element.focus({ preventScroll: true });
-    element.setPointerCapture(event.pointerId);
-    pan.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, left: element.scrollLeft, top: element.scrollTop };
+    const imageButton = event.target instanceof Element && event.target.closest('button');
+    if (!imageButton) {
+      event.preventDefault();
+      element.focus({ preventScroll: true });
+      element.setPointerCapture(event.pointerId);
+    }
+    pan.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, left: element.scrollLeft, top: element.scrollTop, captured: !imageButton };
   };
   const endPan = (event: PointerEvent<HTMLDivElement>) => {
     if (pan.current?.pointerId === event.pointerId) pan.current = null;
@@ -170,12 +181,19 @@ export function WorkbookCanvas({ sheet, zoom = 1, onZoom }: { sheet: WorkbookShe
         onPointerMove={(event) => {
           const start = pan.current;
           if (!start || start.pointerId !== event.pointerId) return;
-          event.currentTarget.scrollLeft = start.left + start.x - event.clientX;
-          event.currentTarget.scrollTop = start.top + start.y - event.clientY;
+          const dx = start.x - event.clientX, dy = start.y - event.clientY;
+          if (!start.captured) {
+            if (Math.hypot(dx, dy) < 4) return;
+            event.currentTarget.setPointerCapture(event.pointerId);
+            start.captured = true;
+          }
+          event.currentTarget.scrollLeft = start.left + dx;
+          event.currentTarget.scrollTop = start.top + dy;
         }}
         onPointerUp={endPan}
         onPointerCancel={endPan}
         onLostPointerCapture={endPan}
+        onPointerLeave={(event) => { if (!pan.current?.captured) endPan(event); }}
         onScroll={(event) => {
           const element = event.currentTarget;
           setView({ left: element.scrollLeft, top: element.scrollTop, width: element.clientWidth, height: element.clientHeight });
@@ -221,7 +239,6 @@ export function WorkbookCanvas({ sheet, zoom = 1, onZoom }: { sheet: WorkbookShe
               if (image.x >= right || image.x + image.width <= left || image.y >= bottom || image.y + image.height <= top) return null;
               const title = `${sheet.name} 图片 ${index + 1}`;
               return <button key={image.id} type="button" aria-label={`查看${title}`} className="cursor-zoom-in focus-visible:outline focus-visible:outline-2 focus-visible:outline-seal"
-                onPointerDown={(event) => event.stopPropagation()}
                 onClick={(event) => setImagePreview({ src: image.dataUrl, title, opener: event.currentTarget })}
                 style={{ position: 'absolute', zIndex: 2, left: image.x, top: image.y, width: image.width, height: image.height }}>
                 <img alt={title} src={image.dataUrl} draggable={false} className="block h-full w-full max-w-none object-fill" />

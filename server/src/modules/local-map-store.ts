@@ -32,6 +32,7 @@ import type {
 } from '../types/index.js';
 
 const V5_RUNTIME_SCHEMA_VERSION = 'v5_runtime_state';
+const approvalPreferenceKey = (workspaceId: string | null) => `approval:${JSON.stringify(workspaceId)}`;
 
 /**
  * kb_builds 列定义（新库 DDL 与 T2b CHECK 重建迁移共用单一来源；改动两处
@@ -2925,10 +2926,10 @@ export class LocalMapStore {
     `).run(input.id, input.title, input.mode, input.workspaceId, input.createdAt, input.updatedAt, input.backend ?? 'pi', input.approvalMode ?? 'ask', input.modelConfig ?? null);
   }
 
-  getAgentSessionDefaults(backend: 'pi' | 'claude-code'): { approvalMode: 'ask' | 'auto'; modelConfig: string | null } {
+  getAgentSessionDefaults(backend: 'pi' | 'claude-code', workspaceId: string | null): { approvalMode: 'ask' | 'auto'; modelConfig: string | null } {
     const read = this.db.prepare('SELECT value FROM agent_session_preferences WHERE key = ?').pluck();
     const modelConfig = read.get(`model:${backend}`) as string | null | undefined;
-    return { approvalMode: read.get('approval') === 'auto' ? 'auto' : 'ask', modelConfig: modelConfig ?? null };
+    return { approvalMode: read.get(approvalPreferenceKey(workspaceId)) === 'auto' ? 'auto' : 'ask', modelConfig: modelConfig ?? null };
   }
 
   saveAgentSessionPreferences(id: string, patch: { approvalMode?: 'ask' | 'auto'; modelConfig?: string | null }): void {
@@ -2937,7 +2938,10 @@ export class LocalMapStore {
       if (!row) throw new Error(`agent_session 不存在: ${id}`);
       this.updateAgentSession(id, patch);
       const save = this.db.prepare('INSERT INTO agent_session_preferences (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value');
-      if (patch.approvalMode !== undefined) save.run('approval', patch.approvalMode);
+      if (patch.approvalMode !== undefined) {
+        const workspaceId = typeof row.workspace_id === 'string' ? row.workspace_id : null;
+        save.run(approvalPreferenceKey(workspaceId), patch.approvalMode);
+      }
       if (patch.modelConfig !== undefined) save.run(`model:${row.runtime_backend}`, patch.modelConfig);
     })();
   }

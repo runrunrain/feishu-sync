@@ -33,7 +33,7 @@ async function fixture() {
     store.initialize();
     return { store, service: makeService() };
   };
-  return { app, manager, store, service, session, other, patch, restart };
+  return { app, manager, store, service, session, other, patch, restart, root };
 }
 it('local resources route accepts only idle Pi work sessions and persists the choice', async () => {
   const f = await fixture();
@@ -86,6 +86,28 @@ it('restores session choices from disk and inherits the latest preferences in ne
   expect(service.approvalMode(store, f.session.id)).toBe('auto');
   const next = service.create(store, { backend: 'pi' });
   expect((await service.switchMode(store, next.id, { mode: 'work', confirm: 'WORK' }))?.approvalMode).toBe('ask');
+});
+
+it('keeps auto approval in the workspace where it was selected', async () => {
+  const { manager, service, store, root } = await fixture();
+  const config = manager.getConfig();
+  const workspace = (id: string) => {
+    const directory = path.join(root, id);
+    fs.mkdirSync(directory);
+    return { id, name: id, path: fs.realpathSync(directory), createdAt: new Date().toISOString() };
+  };
+  const firstWorkspace = workspace('ws_first01');
+  const secondWorkspace = workspace('ws_second02');
+  await manager.updateConfig({ agent: { ...config.agent, workspaces: [firstWorkspace, secondWorkspace] } });
+  const start = async (workspaceId: string) => {
+    const session = service.create(store, { backend: 'pi', workspaceId });
+    return (await service.switchMode(store, session.id, { mode: 'work', confirm: 'WORK' }))!;
+  };
+  const first = await start(firstWorkspace.id);
+  service.setApprovalMode(store, first.id, 'auto');
+  expect((await start(firstWorkspace.id)).approvalMode).toBe('auto');
+  expect((await start(secondWorkspace.id)).approvalMode).toBe('ask');
+  expect((await service.switchMode(store, first.id, { mode: 'work', workspaceId: secondWorkspace.id, confirm: 'WORK' }))?.approvalMode).toBe('ask');
 });
 it('rejects missing/disabled/unconfigured models, invalid levels and busy switches without writing stale choices', async () => {
   const f = await fixture();

@@ -8,7 +8,7 @@ import type { DocumentRecord } from '../types/index.js';
 type Candidate = { file: string; wiki?: string };
 const cache = new Map<string, { at: number; candidates: Map<string, Candidate[]> }>();
 const parser = new IndexScanner({ localMapStore: null, larkCliClient: null, config: null });
-function readIdentity(file: string) {
+export function readLocalDocumentIdentity(file: string) {
   const fd = fs.openSync(file, 'r');
   try { const bytes = Buffer.alloc(64 * 1024); const n = fs.readSync(fd, bytes, 0, bytes.length, 0); return parser.parseMetadata(bytes.subarray(0, n).toString('utf8')); }
   finally { fs.closeSync(fd); }
@@ -32,7 +32,7 @@ export function recoverLocalDocument(root: string, doc: Pick<DocumentRecord, 'ob
         if (entry.isDirectory() && !ScanPolicy.shouldSkipDirectory(entry.name)) queue.push(file);
         else if (entry.isFile() && /\.md$/i.test(entry.name) && !ScanPolicy.shouldSkipFile(entry.name)) {
           try {
-            const meta = readIdentity(file);
+            const meta = readLocalDocumentIdentity(file);
             if (meta?.obj_token) candidates.set(meta.obj_token, [...(candidates.get(meta.obj_token) ?? []), { file, wiki: meta.wiki_node_token }]);
           } catch { complete = false; }
         }
@@ -48,7 +48,7 @@ export function recoverLocalDocument(root: string, doc: Pick<DocumentRecord, 'ob
     const rootReal = fs.realpathSync.native(resolvedRoot);
     const fileReal = fs.realpathSync.native(matches[0].file);
     if (!isPathInsideRoot(rootReal, fileReal) || !fs.statSync(fileReal).isFile()) return null;
-    const meta = readIdentity(fileReal);
+    const meta = readLocalDocumentIdentity(fileReal);
     if (meta?.obj_token !== doc.objToken || (meta.wiki_node_token && doc.wikiNodeToken && meta.wiki_node_token !== doc.wikiNodeToken)) return null;
     return matches[0].file;
   } catch { return null; }

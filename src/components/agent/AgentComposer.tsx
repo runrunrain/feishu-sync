@@ -244,7 +244,7 @@ export const AgentComposer = forwardRef<AgentComposerHandle, AgentComposerProps>
               <button type="button" aria-label="添加图片或文件" title="添加图片或文件，也可以拖拽或粘贴图片" disabled={disabled || sending}
                 className="rounded-full p-1.5 text-ink-soft hover:bg-paper disabled:opacity-40" onClick={() => fileInputRef.current?.click()}><Plus className="h-4 w-4" /></button>
               <ConversationModelPicker session={session} busy={running || sending} onChanged={onModelChanged} />
-              {session?.mode === 'work' && <select aria-label="Work 审批方式" title="为当前 Work 会话设置审批方式，同时记为新会话默认" value={session.approvalMode ?? 'ask'} disabled={running || sending || approvalSaving}
+              {session?.mode === 'work' && <select aria-label="Work 审批方式" title="记住当前会话和同一工作区新会话的审批方式" value={session.approvalMode ?? 'ask'} disabled={running || sending || approvalSaving}
                 className="rounded border border-line bg-card-bg px-2 py-1 text-xs text-ink-soft"
                 onChange={(event) => {
                   const mode = event.target.value as 'ask' | 'auto'; setApprovalError(''); setApprovalSaving(true);

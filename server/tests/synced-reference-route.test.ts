@@ -34,6 +34,27 @@ it('reads only the matching local block and skips the cloud', async () => {
   expect(fetchSyncedReference).not.toHaveBeenCalled();
 });
 
+it('ignores example tags and keeps nested content inside the matching block', async () => {
+  const { app, root, fetchSyncedReference } = setup();
+  const body = '正文\n<synced-source>内层</synced-source>\n结尾';
+  fs.writeFileSync(path.join(root, 'source', 'doc.md'),
+    ['~~~xml', '<synced-source id="Block1">示例</synced-source>', '~~~', '<!-- <synced-source id="Block1">注释</synced-source> -->',
+      `<synced-source id="Block1">${body}</synced-source>`].join('\n'));
+  const response = await app.request('/api/mapping/synced-reference?token=Source1&block=Block1');
+  expect(await response.json()).toEqual({ source: 'local-block', baseDir: 'source', content: body });
+  expect(fetchSyncedReference).not.toHaveBeenCalled();
+});
+
+it('finds the moved source by identity when its indexed path has been reused', async () => {
+  const { app, root, fetchSyncedReference } = setup();
+  const withIdentity = (token: string, text: string) => `<!--\nfeishu_sync:\n  obj_token: "${token}"\n-->\n${text}`;
+  fs.writeFileSync(path.join(root, 'source', 'doc.md'), withIdentity('Other', '其他文档'));
+  fs.writeFileSync(path.join(root, 'moved.md'), withIdentity('Source1', '<synced-source id="Block1">原文</synced-source>'));
+  const response = await app.request('/api/mapping/synced-reference?token=Source1&block=Block1');
+  expect(await response.json()).toEqual({ source: 'local-block', baseDir: '', content: '原文' });
+  expect(fetchSyncedReference).not.toHaveBeenCalled();
+});
+
 it('provides the local document without guessing a block when the export omits IDs', async () => {
   const { app, root, fetchSyncedReference } = setup();
   const content = '# 本地原文\n<synced-source>第一个块</synced-source>\n<synced-source>第二个块</synced-source>';

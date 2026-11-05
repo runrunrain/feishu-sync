@@ -25,7 +25,7 @@ import { createClaudeProcess } from './claude-process-factory.js';
 import { ClaudeCodeProcess } from './claude-code-process.js';
 import type { SessionModelConfig } from '../types/agent-knowledge.js';
 import { modelRevision } from './model-revision.js';
-import { configuredThinkingLevels } from './thinking-capabilities.js';
+import { configuredThinkingLevels, THINKING_LEVELS } from './thinking-capabilities.js';
 import type { LocalMapStore } from '../modules/local-map-store.js';
 import { resolveProviderModel } from '../modules/model-selection.js';
 import { ChatAttachmentStore, type ChatImageContent } from './chat-attachments.js';
@@ -196,7 +196,7 @@ export class SessionService extends EventEmitter {
     const backend = input.backend ?? (config?.agent.runtime.backend === 'claude-code' ? 'claude-code' : 'pi');
     const workspace = input.workspaceId ? this.workspaceOf(config, input.workspaceId) : null;
     if (input.workspaceId && !workspace) throw new ToolError('workspace_not_found', 'Workspace 不存在或未绑定', 404);
-    const defaults = localMapStore.getAgentSessionDefaults(backend);
+    const defaults = localMapStore.getAgentSessionDefaults(backend, workspace?.id ?? null);
     const model = this.resolveDefaultModel(defaults.modelConfig, backend, config);
     localMapStore.createAgentSession({
       id, title, mode: 'discuss', workspaceId: workspace?.id ?? null, backend,
@@ -239,9 +239,12 @@ export class SessionService extends EventEmitter {
     if (!saved || !config) return null;
     let model: SessionModelConfig | null;
     try { model = JSON.parse(saved); } catch { return null; }
-    if (!model) return null;
-    if (model.source === 'pi-agent-dir') return backend === 'pi' ? model : null;
-    if (model.source !== 'app-llm' || !model.providerId || !model.modelId) return null;
+    if (!model || !THINKING_LEVELS.includes(model.thinkingLevel)) return null;
+    if (model.source === 'pi-agent-dir') {
+      return backend === 'pi' && typeof model.piModel === 'string' && model.piModel.includes('/') ? model : null;
+    }
+    if (model.source !== 'app-llm' || typeof model.providerId !== 'string' || !model.providerId.trim()
+      || typeof model.modelId !== 'string' || !model.modelId.trim()) return null;
     const resolved = resolveProviderModel(config.llm, model, backend === 'claude-code' ? 'anthropic-messages' : undefined);
     if (!resolved?.apiKey) return null;
     const levels = configuredThinkingLevels(resolved.thinkingLevels, resolved.reasoning, backend);
@@ -384,7 +387,13 @@ export class SessionService extends EventEmitter {
       }
       await this.deps.pool.terminate(id);
       this.deps.toolService.revokeBySession(id);
-      localMapStore.updateAgentSession(id, { mode: 'work', workspaceId: workspace?.id ?? null });
+      const nextWorkspaceId = workspace?.id ?? null;
+      const current = localMapStore.getAgentSession(id);
+      if (!current) return null;
+      localMapStore.updateAgentSession(id, {
+        mode: 'work', workspaceId: nextWorkspaceId,
+        ...(nextWorkspaceId !== (current.workspace_id ?? null) && { approvalMode: 'ask' }),
+      });
       this.emitSessionState(id, localMapStore);
       return this.get(localMapStore, config, id);
     }

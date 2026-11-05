@@ -28,7 +28,7 @@ import { MappingService, MappingValidationError, CrossParentReorderError } from 
 import { SnapshotService } from '../modules/snapshot-service.js';
 import { IndexScanner } from '../modules/index-scanner.js';
 import { toPortableRelative } from '../modules/path-resolver.js';
-import { recoverLocalDocument } from '../modules/recover-local-document.js';
+import { readLocalDocumentIdentity, recoverLocalDocument } from '../modules/recover-local-document.js';
 import { readTextCapped } from './content.js';
 import type { LocalMapStore } from '../modules/local-map-store.js';
 import type { ReorderRequest } from '../types/index.js';
@@ -42,7 +42,14 @@ function findSyncedSourceFile(root: string, store: Pick<LocalMapStore, 'getDocum
     if (!file || !/\.md$/i.test(file)) return null;
     const relative = toPortableRelative(root, file);
     if (!relative) return null;
-    try { return resolveInside(root, relative, 'read'); } catch { return null; }
+    try {
+      const resolved = resolveInside(root, relative, 'read');
+      if (!/\.md$/i.test(resolved) || !fs.statSync(resolved).isFile()) return null;
+      const meta = readLocalDocumentIdentity(resolved);
+      if (meta?.obj_token && meta.obj_token !== token) return null;
+      if (meta?.wiki_node_token && record?.wikiNodeToken && meta.wiki_node_token !== record.wikiNodeToken) return null;
+      return resolved;
+    } catch { return null; }
   };
   return resolveMarkdown(record?.localRelPath) ?? resolveMarkdown(record?.localMdPath)
     ?? resolveMarkdown(recoverLocalDocument(root, {
@@ -52,9 +59,29 @@ function findSyncedSourceFile(root: string, store: Pick<LocalMapStore, 'getDocum
 
 /** Some Markdown exports omit block IDs. An unlabelled block cannot identify a reference. */
 function findLocalSyncedBlock(content: string, block: string): string | null {
-  const matches = [...content.matchAll(/<synced-source\b([^>]*)>([\s\S]*?)<\/synced-source\s*>/gi)]
-    .filter((match) => /(?:^|\s)(?:id|block-id)\s*=\s*(?:"([^"]*)"|'([^']*)')/i.exec(match[1])?.slice(1).includes(block));
-  return matches.length === 1 ? matches[0][2] : null;
+  const markers = /<!--[\s\S]*?(?:-->|$)|^ {0,3}(~{3,}|\x60{3,})([^\r\n]*)|(\x60+)[^\r\n]*?\3|<(\/?)synced-source(?=\s|>)([^>]*)>/gim;
+  const openBlocks: Array<{ start: number; matches: boolean }> = [];
+  let fence: string | null = null;
+  let result: string | null = null;
+  for (const marker of content.matchAll(markers)) {
+    const [tag, fenceMarker, fenceTail, , closing, attrs] = marker;
+    if (fenceMarker) {
+      if (!fence) fence = fenceMarker;
+      else if (fenceMarker[0] === fence[0] && fenceMarker.length >= fence.length && !fenceTail.trim()) fence = null;
+      continue;
+    }
+    if (fence || attrs === undefined) continue;
+    if (closing) {
+      const start = openBlocks.pop();
+      if (!start?.matches) continue;
+      if (result !== null) return null;
+      result = content.slice(start.start, marker.index);
+    } else if (!/\/\s*$/.test(attrs)) {
+      const id = /(?:^|\s)(?:id|block-id)\s*=\s*(?:"([^"]*)"|'([^']*)')/i.exec(attrs);
+      openBlocks.push({ start: marker.index + tag.length, matches: (id?.[1] ?? id?.[2]) === block });
+    }
+  }
+  return openBlocks.some((item) => item.matches) ? null : result;
 }
 
 /** Prefer the synced local copy, with a cloud block request when the copy is unavailable. */

@@ -70,6 +70,11 @@ const DEFAULT_LEFT_WIDTH = 320;
 const LEFT_WIDTH_KEY = 'feishu.layout.leftWidth';
 const RIGHT_COLLAPSED_KEY = 'feishu.layout.rightCollapsed';
 
+function isWindowsLocalPath(path: string): boolean {
+  return /^(?:[A-Za-z]:[\\/]|\\\\)/.test(path)
+    || (path.startsWith('//') && /^Win/i.test(navigator.platform));
+}
+
 function readLeftWidth(): number {
   try {
     const raw = localStorage.getItem(LEFT_WIDTH_KEY);
@@ -464,13 +469,14 @@ export function Dashboard({ onJumpToSync, onJumpToSettings }: DashboardProps) {
       toast.push({ type: 'warning', message: '本地根目录未配置' });
       return null;
     }
-    return root.replace(/[\\/]+$/, '') + '/' + localPath.replace(/^[\\/]+/, '');
+    if (isWindowsLocalPath(root)) return root.replace(/[\\/]+$/, '') + '/' + localPath.replace(/^[\\/]+/, '');
+    return root.replace(/\/+$/, '') + '/' + localPath;
   };
 
   const handleCopyLocalPath = async (localPath: string) => {
     const absolutePath = resolveLocalPath(localPath);
     if (!absolutePath) return;
-    const isWindowsPath = /^(?:[A-Za-z]:[\\/]|[\\/]{2})/.test(absolutePath);
+    const isWindowsPath = isWindowsLocalPath(absolutePath);
     const filePath = isWindowsPath ? absolutePath.replace(/\\/g, '/') : absolutePath;
     const separator = filePath.lastIndexOf('/');
     // POSIX 根目录和 Windows 盘符根目录都需要保留末尾分隔符。
