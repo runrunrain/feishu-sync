@@ -15,6 +15,7 @@ let repoRoot: string;
 let plainWs: string;
 let conflictWs: string;
 let dynamicWs: string;
+let knowledgeWs: string;
 let originalKnowledgeRoot: string;
 
 async function call(
@@ -41,8 +42,10 @@ beforeAll(async () => {
   plainWs = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-plain-'));
   conflictWs = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-conflict-'));
   dynamicWs = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-dynamic-'));
+  knowledgeWs = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-knowledge-'));
   const configResp = await call('GET', '/api/config', undefined);
   originalKnowledgeRoot = String(configResp.json?.knowledgeBaseRoot ?? '');
+  await call('PUT', '/api/config', { knowledgeBaseRoot: knowledgeWs });
 });
 
 afterAll(async () => {
@@ -54,7 +57,7 @@ afterAll(async () => {
   if (originalKnowledgeRoot) {
     await call('PUT', '/api/config', { knowledgeBaseRoot: originalKnowledgeRoot }).catch(() => undefined);
   }
-  for (const dir of [plainWs, conflictWs, dynamicWs]) fs.rmSync(dir, { recursive: true, force: true });
+  for (const dir of [plainWs, conflictWs, dynamicWs, knowledgeWs]) fs.rmSync(dir, { recursive: true, force: true });
 });
 
 describe('Workspace 起始目录', () => {

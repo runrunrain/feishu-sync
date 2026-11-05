@@ -51,7 +51,10 @@ export function parseScopedProcesses(raw: string, homes: readonly string[], uid:
 export async function scanScopedProcesses(homes: readonly string[]): Promise<ScopedProcess[] | null> {
   if (process.platform !== 'darwin' && process.platform !== 'linux') return null;
   const raw = await new Promise<string | null>(resolve => {
-    execFile('ps', ['eww', '-axo', 'pid=,ppid=,uid=,command='],
+    const args = process.platform === 'linux'
+      ? ['axeww', '-o', 'pid=,ppid=,uid=,args=']
+      : ['eww', '-axo', 'pid=,ppid=,uid=,command='];
+    execFile('ps', args,
       { encoding: 'utf8', timeout: 8_000, maxBuffer: 64 * 1024 * 1024 }, (error, stdout) => resolve(error ? null : stdout));
   });
   if (raw === null) return null;

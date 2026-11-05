@@ -49,7 +49,8 @@ app.whenReady().then(async()=>{let server;try{
 }catch(e){console.error(e.stack);if(server)await server.close();app.exit(1)}});
 `);
     const env = { ...process.env, FEISHU_SYNC_HOME: path.join(root, 'profile') }; delete env.ELECTRON_RUN_AS_NODE;
-    const { stdout } = await promisify(execFile)(executable, [path.join(root, 'main.cjs')], { env, timeout: 90_000, maxBuffer: 2 * 1024 * 1024 });
+    const args = process.platform === 'linux' && process.env.CI ? ['--no-sandbox'] : [];
+    const { stdout } = await promisify(execFile)(executable, [...args, path.join(root, 'main.cjs')], { env, timeout: 90_000, maxBuffer: 2 * 1024 * 1024 });
     const result = JSON.parse(stdout.split('\n').find((line) => line.startsWith('DESKTOP_PERF='))!.slice('DESKTOP_PERF='.length));
     console.info('Desktop workbook performance:', JSON.stringify(result));
     expect(result.backendPid).not.toBe(result.mainPid);
