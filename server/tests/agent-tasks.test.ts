@@ -216,7 +216,9 @@ describe('RoleRegistry（角色卡装载）', () => {
     const registry = new RoleRegistry(rolesDir);
     const analyst = registry.get('kb-analyst');
     expect(analyst?.requiresMode).toBe('any');
-    expect(analyst?.tools).toEqual(['kb_search', 'kb_read', 'raw_search', 'raw_read', 'raw_read_image']);
+    expect(analyst?.tools).toEqual(['kb_search', 'kb_grep', 'kb_read', 'raw_search', 'raw_read', 'raw_links', 'raw_read_image', 'raw_comments']);
+    // 审校员只读：可读 Workspace 稿件，不获写工具
+    expect(registry.get('kb-reviewer')?.tools.some((tool) => /^ws_(write|edit|mkdir)$/.test(tool))).toBe(false);
     expect(registry.get('kb-converter')?.requiresMode).toBe('work');
     expect(registry.get('kb-converter')?.tools).toContain('ws_write');
     expect(registry.get('kb-reviewer')?.tools).toContain('ws_search');
