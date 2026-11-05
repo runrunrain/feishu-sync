@@ -63,10 +63,12 @@ function resolveAttachment(root: string, csvPath: string): string {
   return resolved;
 }
 
-export function computeSourceHash(realPath: string, csvPaths: string[], root = path.dirname(realPath)): string {
-  const combined = crypto.createHash('sha256');
+export type SourceFileKind = 'markdown' | 'workbook' | 'external' | 'csv';
+
+export function visitSourceFiles(realPath: string, csvPaths: string[], root: string,
+  visit: (kind: SourceFileKind, name: string, bytes: Buffer) => void): void {
   const bytes = fs.readFileSync(realPath);
-  combined.update(bytes);
+  visit('markdown', path.basename(realPath), bytes);
   // A text derivative can stay byte-identical when only images/layout change.
   // Pin the actual XLSX source as part of every raw-source snapshot as well.
   const sourceMarker = /^\s+source_workbook: ("[^\n]+")\s*$/m.exec(bytes.toString('utf-8'))?.[1];
@@ -76,7 +78,7 @@ export function computeSourceHash(realPath: string, csvPaths: string[], root = p
       throw new PathGuardError('path_escape', 'Excel 原始源路径无效');
     }
     const workbookPath = path.join(path.dirname(realPath), sourceName);
-    combined.update(fs.readFileSync(resolveAttachment(root, workbookPath)));
+    visit('workbook', sourceName, fs.readFileSync(resolveAttachment(root, workbookPath)));
     // Reconstructed sheets can have external source attachments (e.g. videos).
     // Include their bytes so a changed/missing attachment cannot reuse a build
     // snapshot that was created from an intact workbook bundle.
@@ -93,13 +95,19 @@ export function computeSourceHash(realPath: string, csvPaths: string[], root = p
         }
         if (seen.has(attachment.relativePath)) continue;
         seen.add(attachment.relativePath);
-        combined.update(fs.readFileSync(resolveAttachment(root, path.join(path.dirname(realPath), attachment.relativePath))));
+        visit('external', attachment.relativePath,
+          fs.readFileSync(resolveAttachment(root, path.join(path.dirname(realPath), attachment.relativePath))));
       }
     }
   }
   for (const csv of csvPaths) {
-    combined.update(fs.readFileSync(resolveAttachment(root, csv)));
+    visit('csv', path.basename(csv), fs.readFileSync(resolveAttachment(root, csv)));
   }
+}
+
+export function computeSourceHash(realPath: string, csvPaths: string[], root = path.dirname(realPath)): string {
+  const combined = crypto.createHash('sha256');
+  visitSourceFiles(realPath, csvPaths, root, (_kind, _name, bytes) => { combined.update(bytes); });
   return `sha256:${combined.digest('hex')}`;
 }
 

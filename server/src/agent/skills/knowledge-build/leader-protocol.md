@@ -13,7 +13,7 @@
 ## Flow
 1. **盘点**。`build_manifest` 读工作集（每页最多 12 个来源，按 `nextCursor` 读到 `null`；读到首页就可以开始派发）。`carriedPublishedPaths`、`promotedUnchangedPaths` 已是正式文档，不重写也不重审；`unpublishedDraftPaths`、`pendingRequiredRewrites`、`pendingIndependentReviewPaths` 和 `stageBlockedPaths` 是待办。权限占位、未展开引用或空白工作簿不派写作、不挂进 sources，应用会自动登记跳过。`scope=all` 仅供背景查询，未进入工作集的来源不派写作。
 2. **拆主题**。一篇目标文档对应一个写作任务。用 `sourceShape` 估量阅读量：作者要能在一次回复内读完本篇材料并提交。规则密集的长源按独立主题拆成多篇（经验值：每篇约 100–150 行规则正文）；纯明细表让作者用 `csvTableImports` 由服务端导入。重建同一主题时沿用 `existingDocPaths`。公共定义可以共读，共享对象的修改只交给一个任务。
-3. **派写**。`task_submit` 给 luban，之后立即 `build_assign_output`，分配同一个完整 `.md` 路径（不支持目录或通配符）。任务书写目标路径、来源 token、章节或 CSV 坐标、完成条件。`requiredRewrites` 中的文档要求对照变化用 `kb_edit_doc` 定向修订，不要求全文重写。多个任务可以同时派；在确认原生 amagi 子任务的并发准入前，建议分批派发，避免突发。objToken 是桥接标识，不是本地文件路径。
+3. **派写**。`task_submit` 给 luban，之后立即 `build_assign_output`，分配同一个完整 `.md` 路径（不支持目录或通配符）。任务书写目标路径、来源 token、章节或 CSV 坐标、完成条件。`requiredRewrites` 中的文档要求对照变化用 `kb_edit_doc` 定向修订，不要求全文重写。多个任务可以同时派；在确认原生 amagi 子任务的并发准入前，建议分批派发，避免突发。objToken 和 staging 草稿路径都是应用桥接资源，不是子任务工作目录中的本地文件。将它们写入任务书正文，由子任务用 `raw_read` / `draft_read` 读取；不要放进 `inputs`、`inputPaths`、`contextRefs` 或 `outputPaths`。这些路径参数只用于真实本地文件，`inputs.required=true` 的文件必须在派发时已存在。
 4. **派审**。某篇写作取得应用写入回执后，立即派 diting 独立审查该篇：给出路径与来源 token，每个审查任务建议只审一篇。不必等同一来源的其他篇。按工具结果确认审查范围与回执有效性。
 5. **收敛**。读审查回执、`stageBlockedPaths` 与发布报告中的 `blockingGroups`，只针对阻断问题派定向修订：用 `kb_edit_doc` 的 patches、evidenceSelectorUpdates、coverageUpdates、objectMerges，按问题位置修改，然后依应用当前回执状态复审受影响的篇。`warningGroups` 只是披露，不要为它扩大改写。审查通过的篇章由应用自动阶段发布。作者声称已修复不能关闭问题，以复核结论为准。
 6. **身份**。`build_manifest.identityGaps` 列出本轮消失的旧对象。核对正文与共同来源后，语义上确有去向的用 `build_register_migrations` 登记（merge、split、remove，写明实际理由）；不确定的不要为了凑数合并。是否阻断以发布返回为准。确属遗漏的知识，派写作补回并复审。

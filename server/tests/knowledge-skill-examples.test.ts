@@ -199,6 +199,34 @@ describe('F14：冻结 skill 示例契约检查（schema + 调用者工具面）
     }
   });
 
+  it('Leader 区分桥接资源和真实文件，避免 staging 路径触发 required-input-missing', () => {
+    const text = fs.readFileSync(path.join(skillsDir, 'leader-protocol.md'), 'utf8');
+    const dispatch = text.slice(text.indexOf('3. **派写**'), text.indexOf('4. **派审**'));
+    expect(dispatch).toContain('objToken 和 staging 草稿路径都是应用桥接资源');
+    expect(dispatch).toContain('`raw_read` / `draft_read`');
+    expect(dispatch).toContain('不要放进 `inputs`、`inputPaths`、`contextRefs` 或 `outputPaths`');
+    expect(dispatch).toContain('`inputs.required=true` 的文件必须在派发时已存在');
+  });
+
+  it('审查读取契约明确元数据与声明互斥，并限制 schema 查询为本角色工具面', () => {
+    const spec = getToolSpec('draft_read')!.parameters as JsonSchemaLike;
+    const description = spec.properties!.metadataOnly!.description;
+    expect(description).toContain('不能与 includeDeclarations=true、declarationClaimKey 或 declarationObjectKey 同时使用');
+    expect(description).toContain('读取声明时省略 metadataOnly');
+    const protocol = fs.readFileSync(path.join(skillsDir, 'reviewer-protocol.md'), 'utf8');
+    expect(protocol).toContain('只查询本角色可用工具');
+    expect(protocol).toContain('用 `draft_read` 的声明筛选读取');
+  });
+
+  it('问题清单 schema 说明条件必填范围和最新版本读取参数', () => {
+    const submit = getToolSpec('build_issues_submit')!.parameters as JsonSchemaLike;
+    expect(submit.properties!.issues!.items!.properties!.targetPath!.description)
+      .toContain('severity=blocking 时必填');
+    const list = getToolSpec('build_issues_list')!;
+    expect(list.description).toContain('不接收 listId、issueListId 或 revision 参数');
+    expect(Object.keys((list.parameters as JsonSchemaLike).properties!)).toEqual(['targetPath']);
+  });
+
   it('交接 prose 字段与真实 schema 一致（achievement-protocol 不再使用 artifacts/needsFromLeader）', () => {
     const text = fs.readFileSync(path.join(skillsDir, 'achievement-protocol.md'), 'utf8');
     expect(text).toContain('`artifactRefs`');

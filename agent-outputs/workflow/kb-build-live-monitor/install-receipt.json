@@ -1,0 +1,35 @@
+{
+  "installedAt": "2026-11-05T10:32:36.915Z",
+  "version": "0.3.51",
+  "baseCommit": "b2b1447df90db8427688850df74e5ea95a9c9036",
+  "patchSha256": "13eb3dc7b11263baec681012b572cee118b9b22f6d26a02b44521264750e2e9e",
+  "backup": "/Applications/Feishu Sync.backup-20261105T103225Z.app",
+  "source": "/Users/run.mao/workpace/feishu-sync/dist-desktop/darwin-arm64/mac-arm64/Feishu Sync.app",
+  "oldMainPid": 97346,
+  "oldServerPid": 97354,
+  "currentBefore": {
+    "schemaVersion": 1,
+    "releaseId": "r_20261105T101438_b67104",
+    "publishedAt": "2026-11-05T10:14:39.658Z"
+  },
+  "currentHashBefore": "c60928547e4929ceeb3f3f3c130fd978c9aaa3958f9568a9f09b42010e1b0a82",
+  "configHashBefore": "0f6b1de99f634398e01ab8424ce0edf1ba64f7fbc7f384448406925f6c70650f",
+  "signatureVerified": true,
+  "packagedFilesVerified": 4,
+  "externalMcpProcessPreserved": true,
+  "newServerPid": 14211,
+  "newMainPids": [
+    14197
+  ],
+  "healthHttp": 200,
+  "kbStatusOk": true,
+  "activeBuildAfter": null,
+  "currentAfter": {
+    "schemaVersion": 1,
+    "releaseId": "r_20261105T101438_b67104",
+    "publishedAt": "2026-11-05T10:14:39.658Z"
+  },
+  "currentUnchanged": true,
+  "configUnchanged": true,
+  "startupVerified": true
+}

@@ -21,6 +21,7 @@ import { AgentProcessPool } from '../src/agent/agent-process-pool.js';
 import { PiRuntimeResolver } from '../src/agent/runtime-resolver.js';
 import { kbRoutes } from '../src/routes/kb.js';
 import type { DocumentRecord } from '../src/types/index.js';
+import ExcelJS from 'exceljs';
 
 const roots: string[] = [];
 const openedStores: LocalMapStore[] = [];
@@ -45,7 +46,11 @@ async function fixture() {
   fs.writeFileSync(path.join(raw, 'b.md'), '规则B：速度高者先手。\n' + '双方各行动一次，以速度决定行动顺序。\n'.repeat(8));
   for (const doc of documents) store.upsertDocument(doc);
   const documentsProvider = () => projectKnowledgeDocuments(raw, filterDeletedLocalDocuments(store, raw, documents));
-  const sheetCsvPaths = (token: string) => recoveredSourceCsvPaths(raw, documentsProvider().find((doc) => doc.objToken === token), []);
+  let reverseCsv = false;
+  const sheetCsvPaths = (token: string) => {
+    const files = recoveredSourceCsvPaths(raw, documentsProvider().find((doc) => doc.objToken === token), []);
+    return reverseCsv ? files.reverse() : files;
+  };
   const tools = new AgentToolService({ dataRoot: root, documentsProvider, sheetCsvPaths });
   const resolver = new PiRuntimeResolver();
   vi.spyOn(resolver, 'checkReadiness').mockResolvedValue({ code: 'ready', model: { model: 'fixture/model' } } as never);
@@ -97,6 +102,7 @@ async function fixture() {
     return result;
   }
   return { root, raw, store, call, build, prompts, configManager, documents, service, tools,
+    setReverseCsv: (value: boolean) => { reverseCsv = value; },
     setGenerated: (value: { markdown?: string; summary?: string }) => { generated = value; }, setSkip: (value: boolean) => { skipWrites = value; },
     setEditorial: (value: boolean) => { editorial = value; }, setBeforeFinish: (fn: () => void) => { beforeFinish = fn; },
     published: () => new StandardKbStore(configManager.getConfig()!.standardKb.outputRoot),
@@ -119,6 +125,44 @@ it('构建路由传递重新识图选项并拒绝无效参数', async () => {
 });
 
 describe('源选择 → 源diff → 按变更更新 → 独立版本', () => {
+  it('工作簿重新导出只改变时间与 CSV 枚举顺序时不派发，实际单元格变化仍进入更新', async () => {
+    const f = await fixture();
+    f.documents[0]!.objType = 'sheet';
+    const body = fs.readFileSync(path.join(f.raw, 'a.md'), 'utf8');
+    f.setGenerated({ markdown: body + '\n' + fs.readFileSync(path.join(f.raw, 'b.md'), 'utf8') });
+    const exportSheet = async (day: string, value: string) => {
+      fs.writeFileSync(path.join(f.raw, 'a.md'), [
+        '<!--', 'feishu_sync:', '  obj_token: "a"', '  source_workbook: "a.xlsx"',
+        '  fetch_date: "' + day + '"', '  last_synced_modify_time: "' + day + 'T00:00:00.000Z"', '-->', body,
+      ].join('\n'));
+      const workbook = new ExcelJS.Workbook();
+      workbook.created = workbook.modified = new Date(day);
+      workbook.addWorksheet('规则').getCell('A1').value = value;
+      await workbook.xlsx.writeFile(path.join(f.raw, 'a.xlsx'));
+    };
+    const csvDir = path.join(f.raw, 'a.csv-data');
+    fs.mkdirSync(csvDir);
+    fs.writeFileSync(path.join(csvDir, '规则.csv'), '规则,怒气\n消耗,10\n');
+    fs.writeFileSync(path.join(csvDir, '日志.csv'), '日期,备注\n2026-01-01,发布\n');
+    await exportSheet('2026-01-01', '消耗 10 点');
+    const initial = await f.build('full');
+    expect(initial.status, JSON.stringify(initial)).toBe('published');
+    const manifest = f.published().readManifest()!;
+    expect(manifest.sourceSnapshot[0]?.comparisonHash).toMatch(/^v1:/);
+    const prompts = f.prompts.length;
+    await exportSheet('2026-01-02', '消耗 10 点');
+    f.setReverseCsv(true);
+    expect((await f.call('/api/kb/changes')).data.sources).toEqual([]);
+    expect((await f.call('/api/kb/status')).data.pending.changed).toBe(0);
+    expect((await f.call('/api/kb/sources')).data.sources.find((source: any) => source.objToken === 'a').pending).toBe('unchanged');
+    expect((await f.call('/api/kb/docs/' + manifest.docs[0]!.docId)).data.sources[0].state).toBe('current');
+    expect((await f.build()).noChanges).toBe(true);
+    expect(f.prompts).toHaveLength(prompts);
+    expect(f.published().readCurrent()?.releaseId).toBe(initial.releaseId);
+    await exportSheet('2026-01-03', '消耗 12 点');
+    expect((await f.call('/api/kb/changes')).data.sources).toMatchObject([{ key: 'a', kind: 'changed' }]);
+    expect((await f.call('/api/kb/status')).data.pending.changed).toBe(1);
+  });
   it('混合来源排除/重新参与，正文同步重写；标记持久且原始字节不变', async () => {
     const f = await fixture();
     const rawBefore = ['a', 'b'].map((name) => fs.readFileSync(path.join(f.raw, `${name}.md`), 'utf8'));

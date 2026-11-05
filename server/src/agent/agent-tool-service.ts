@@ -76,6 +76,7 @@ import { RawSourceSnapshot, collectSourceCandidates } from '../kb/raw-source-sna
 import { StandardKbStore, parseStdHeader, stripStdHeader } from '../kb/standard-kb-store.js';
 import { KbVersionStore } from '../kb/kb-version-store.js';
 import { visionDescriptionImproved, visionDescriptionVersion } from '../kb/vision-description-version.js';
+import { sourceContentsChanged, withSourceComparisonBaseline } from '../kb/source-comparison.js';
 import { finalDraftEvidenceScopePaths } from '../kb/progressive-knowledge-draft.js';
 import { objectMigrationGaps, validateObjectMigrationRegistration } from '../kb/object-migration-reconciliation.js';
 import {
@@ -4524,7 +4525,7 @@ export class AgentToolService {
     // before reading every source; background lookups keep their wider limit.
     const requestedLimit = optionalInt(args, 'limit', 12, 1, 200);
     const limit = scope === 'workset' ? Math.min(requestedLimit, 12) : requestedLimit;
-    const published = this.storeFor(context.options.outputRoot).readManifest();
+    const published = withSourceComparisonBaseline(this.storeFor(context.options.outputRoot).readManifest(), context.options.outputRoot);
     const publishedSourceByToken = new Map((published?.sourceSnapshot ?? []).map((source) => [source.objToken, source] as const));
     if (published && state.sourceChangeBaseline?.releaseId !== published.releaseId) {
       state.sourceChangeBaseline = sourceChangeBaseline(
@@ -4578,7 +4579,7 @@ export class AgentToolService {
         // 不能让 Leader 据此跳过实际进入工作集的来源。
         unchangedFromPublished: previous
           ? changeType !== 'changed'
-            && previous.contentHash === entry.contentHash
+            && !sourceContentsChanged(previous, entry)
             && (!previous.mediaHash || !entry.mediaHash || previous.mediaHash === entry.mediaHash)
             && (previous.whiteboardTextHash ?? '') === (entry.whiteboardTextHash ?? '')
             && !visionImproved

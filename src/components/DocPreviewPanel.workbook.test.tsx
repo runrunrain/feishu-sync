@@ -13,7 +13,7 @@ vi.mock('./common/Toast', () => ({ useToast: () => ({ push: vi.fn() }) }));
 vi.mock('./SourceCommentsSection', () => ({ SourceCommentsSection: () => null }));
 vi.mock('./SourceEditControls', () => ({ SourceEditControls: () => null }));
 import { DocPreviewPanel } from './DocPreviewPanel';
-import { WorkbookView } from './preview/WorkbookView';
+import { WorkbookCanvas, WorkbookView } from './preview/WorkbookView';
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -82,5 +82,36 @@ it('独立画板保留缩放和下载入口', async () => {
     await act(async () => root.render(<WorkbookView objToken="s1" fileName="s.xlsx" />));
     expect(container.querySelector('[aria-label="Excel 缩放比例"]')).not.toBeNull();
     expect(container.textContent).toContain('下载 Excel');
+  } finally { act(() => root.unmount()); container.remove(); vi.unstubAllGlobals(); }
+});
+
+it('按住画板双轴平移，取消捕获后移动鼠标不再滚动', async () => {
+  vi.stubGlobal('ResizeObserver', class { observe() {} disconnect() {} });
+  const container = document.createElement('div'); document.body.append(container);
+  const root = createRoot(container);
+  const pointer = (target: Element, type: string, clientX: number, clientY: number) =>
+    target.dispatchEvent(Object.assign(new Event(type, { bubbles: true, cancelable: true }), {
+      clientX, clientY, pointerId: 4, pointerType: 'mouse', isPrimary: true, button: 0,
+    }));
+  try {
+    await act(async () => root.render(<WorkbookCanvas zoom={0.5} sheet={{
+      index: 0, name: '画板', rows: [800], columns: [900], cells: [], merges: [],
+      images: [], showGridLines: false, warnings: [],
+    }} />));
+    const viewport = container.querySelector<HTMLDivElement>('[aria-label="画板 Excel 画板"]')!;
+    Object.defineProperties(viewport, {
+      clientWidth: { value: 200 }, clientHeight: { value: 150 },
+      scrollWidth: { value: 450 }, scrollHeight: { value: 400 },
+      setPointerCapture: { value: vi.fn() },
+    });
+    viewport.scrollLeft = 20;
+    viewport.scrollTop = 30;
+    pointer(viewport.firstElementChild!, 'pointerdown', 150, 130);
+    pointer(viewport, 'pointermove', 110, 70);
+    expect(viewport.setPointerCapture).toHaveBeenCalledWith(4);
+    expect([viewport.scrollLeft, viewport.scrollTop]).toEqual([60, 90]);
+    pointer(viewport, 'lostpointercapture', 110, 70);
+    pointer(viewport, 'pointermove', 50, 50);
+    expect([viewport.scrollLeft, viewport.scrollTop]).toEqual([60, 90]);
   } finally { act(() => root.unmount()); container.remove(); vi.unstubAllGlobals(); }
 });

@@ -1,0 +1,13 @@
+{
+  "installedAt": "2026-11-05T03:38:24.400091+00:00",
+  "target": "/Applications/Feishu Sync.app",
+  "backup": "/Users/run.mao/workpace/feishu-sync/release-builds/install-backups/a6b5d99a-656d-4b3a-9c0c-580452ca5367/Feishu Sync.app",
+  "fixes": [
+    "automatic-orphan-recovery-without-human-attestation",
+    "patched-bundled-pi",
+    "authority-validated-review-worklist",
+    "semantic-remove-migrations",
+    "preserved-issue-severity-and-unknown-groups",
+    "legacy-same-document-source-provenance-compatibility"
+  ]
+}

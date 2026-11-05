@@ -128,14 +128,17 @@ function ChangeList({ changes }: { changes: KbFileChange[] }) {
   return <div className="space-y-2">{changes.map((change) => <details key={change.key} className="rounded border border-line bg-paper/40">
     <summary className="cursor-pointer p-3 text-sm text-ink break-all">
       <span className="mr-2 text-xs text-seal">{LABEL[change.kind]}{change.reason === 'excluded' ? ' · 用户排除' : ''}</span>
-      {change.path}<span className="ml-3 text-xs text-jade">+{change.additions}</span><span className="ml-2 text-xs text-seal-2">-{change.deletions}</span>
+      {change.path}{change.wholeBlock
+        ? <span className="ml-3 text-xs text-ink-faint">整段差异</span>
+        : <><span className="ml-3 text-xs text-jade">+{change.additions}</span><span className="ml-2 text-xs text-seal-2">-{change.deletions}</span></>}
     </summary>
     <div className="border-t border-line p-3">
       {!change.beforeAvailable ? <p className="text-xs text-ink-faint">历史版本尚未保存原文，仅有hash；本次开始保存完整源快照，不推测缺失的旧差异。</p>
-        : !change.patch ? <p className="text-xs text-ink-faint">正文未变化；路径、标题或来源等元数据已更新。</p>
+        : !change.patch ? <p className="text-xs text-ink-faint">无可显示的文本差异。工作簿、附件或文档信息可能已更新。</p>
           : <pre className="text-xs font-mono overflow-x-auto leading-relaxed" aria-label={`差异：${change.title}`}>
             {change.patch.split('\n').map((line, i) => <div key={i} className={line.startsWith('+') ? 'text-jade bg-jade/5' : line.startsWith('-') ? 'text-seal-2 bg-seal-2/5' : 'text-ink-soft'}>{line || ' '}</div>)}
           </pre>}
+      {change.wholeBlock ? <p className="text-xs text-ink-faint mt-2">差异范围较大，按整段预览，其中可能包含未改动的行。</p> : null}
       {change.truncated ? <p className="text-xs text-seal mt-2">差异过长，已截断显示；构建仍读取完整源文档。</p> : null}
     </div>
   </details>)}</div>;

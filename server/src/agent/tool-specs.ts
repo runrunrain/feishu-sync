@@ -179,7 +179,7 @@ export const DRAFT_READ_SPEC: AgentToolSpec = {
       path: string('草稿 POSIX 相对路径'),
       offset: integer('起始行（0 基）', 0),
       limit: integer('返回行数上限', 1, 2000),
-      metadataOnly: { type: 'boolean', description: '仅返回小型元数据：sources、coverage itemId/disposition、editContentHash、draftRevision；大草稿修订前先用此项，避免整篇声明输出截断' },
+      metadataOnly: { type: 'boolean', description: '仅返回小型元数据：sources、coverage itemId/disposition、editContentHash、draftRevision；大草稿修订前先用此项。不能与 includeDeclarations=true、declarationClaimKey 或 declarationObjectKey 同时使用；读取声明时省略 metadataOnly' },
       includeDeclarations: { type: 'boolean', description: '附上此文档的知识对象、稳定 clientKey 与关联声明，供修订时保留对象身份和证据登记' },
       declarationClaimKey: string('可选：只返回含此 claimKey 的对象、该断言及其证据；自动启用 includeDeclarations，审查单个疑点时避免整篇声明过大'),
       declarationObjectKey: string('可选：includeDeclarations=true 时按稳定 clientKey 或 objectId 只返回此对象的完整声明；先读摘要再按对象读取'),
@@ -1178,7 +1178,7 @@ export const BUILD_ISSUES_SUBMIT_SPEC: AgentToolSpec = {
           properties: {
             issueKey: string('问题标识（修订者引用）'),
             severity: { type: 'string', enum: ['blocking', 'suggestion'], description: '分级（blocking 未解决会阻断发布）' },
-            targetPath: string('目标草稿路径'),
+            targetPath: string('目标草稿完整 .md 路径；severity=blocking 时必填，draftLocation 不能代替此字段'),
             draftLocation: string('草稿位置（章节/行区间）'),
             sourceLocation: string('源位置（源标题+A1 区间/行区间）'),
             description: string('问题描述与依据'),
@@ -1197,7 +1197,7 @@ export const BUILD_ISSUES_SUBMIT_SPEC: AgentToolSpec = {
 export const BUILD_ISSUES_LIST_SPEC: AgentToolSpec = {
   name: 'build_issues_list',
   label: '读取问题清单',
-  description: '读取 Leader 聚合的问题清单（修订子任务用；返回最新 revision）。只读。',
+  description: '读取 Leader 聚合的最新问题清单（修订子任务用）。只读；空参数返回全部，或仅用 targetPath 过滤。不接收 listId、issueListId 或 revision 参数。',
   parameters: {
     type: 'object',
     properties: {

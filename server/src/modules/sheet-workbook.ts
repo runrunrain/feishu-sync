@@ -25,7 +25,13 @@ export async function readWorkbookPackage(absolutePath: string): Promise<JSZip> 
   if (!stat.isFile() || stat.size === 0 || stat.size > MAX_WORKBOOK_BYTES) {
     throw new Error('Excel 原件为空或超过 64 MB 读取上限');
   }
-  const bytes = fs.readFileSync(absolutePath);
+  return parseWorkbookPackage(fs.readFileSync(absolutePath));
+}
+
+export async function parseWorkbookPackage(bytes: Buffer): Promise<JSZip> {
+  if (bytes.length === 0 || bytes.length > MAX_WORKBOOK_BYTES) {
+    throw new Error('Excel 原件为空或超过 64 MB 读取上限');
+  }
   if (bytes.length < 4 || bytes.readUInt16LE(0) !== 0x4b50) throw new Error('导出文件不是有效的 XLSX 工作簿');
   const zip = await JSZip.loadAsync(bytes);
   const entries = Object.values(zip.files);

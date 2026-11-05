@@ -320,6 +320,8 @@ export interface RawSourceSnapshotEntry {
   relPath: string;
   contentHash: string;
   objEditTime: string | null;
+  /** Versioned payload digest for change detection. Integrity still uses contentHash. */
+  comparisonHash?: string;
   /** S3：源关联图片合并哈希（按 src 排序逐图 sha256 再合并）；无图 null。
    * contentHash 公式不变；旧 manifest 无此字段视为未变（U4） */
   mediaHash?: string | null;

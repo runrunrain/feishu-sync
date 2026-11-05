@@ -28,6 +28,17 @@ describe('Excel canvas geometry and safe rendering', () => {
     expect(layout.xs.slice(0, 5)).toEqual([0, 80, 180, 300, 380]);
   });
 
+  it('flows across styled blanks but stops at an occupied formula cell', () => {
+    const sheet = fixture();
+    const text = sheet.cells[0];
+    sheet.cells = [
+      { ...text, fill: '#D9DCE1' },
+      { ...text, address: 'B1', column: 1, text: '', fill: '#D9DCE1' },
+      { ...text, address: 'C1', column: 2, text: '', formula: 'IF(TRUE,"",1)' },
+    ];
+    expect(prepareWorkbookLayout(sheet).cells[0].textWidth).toBe(180);
+  });
+
   it('renders literal source text safely and overlays the original image at its stored position', () => {
     const html = renderToStaticMarkup(<WorkbookCanvas sheet={fixture()} />);
     expect(html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');

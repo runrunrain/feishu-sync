@@ -624,6 +624,10 @@ describe('S4：双 worker 并行 + 路径认领', () => {
     const dto = await harness.service.createBuild(store as never, { mode: 'incremental', confirm: 'BUILD', rebuildSelected: true });
     const row = await waitForTerminal(dto.id);
     expect(row.status, String(row.error_message)).toBe('published'); expect(row.parallelism).toBe(2);
+    expect(harness.service.eventsSince(dto.id, null).filter((e) => e.event === 'build_log')
+      .map((e) => (e.data as { message: string }).message)).toContainEqual(
+      expect.stringMatching(/^保留来源图片缓存扫描完成：耗时 \d+ms（仅本地缓存，不请求识图）$/),
+    );
     const manifest = new StandardKbStore(outputRoot).readManifest()!;
     expect(manifest.docs.find((doc) => doc.path === '已有/保留.md')).toMatchObject({ docId: 'kd_keep', sources: ['tokKeep'] });
     expect(manifest.docs.some((doc) => doc.sources.includes('tokNewA'))).toBe(true);
@@ -781,6 +785,10 @@ describe('所选源文档的图片重新生成', () => {
     expect(JSON.parse(String(refreshed.warnings_json))).toEqual(expect.arrayContaining([
       expect.objectContaining({ code: 'images_refresh_incomplete', count: 1 }),
     ]));
+    expect(harness.service.eventsSince(accepted.id, null).filter((e) => e.event === 'build_log')
+      .map((e) => (e.data as { message: string }).message)).toContainEqual(
+      expect.stringMatching(/^图片预描述完成：新描述 0，缓存 1，未理解 0，刷新失败 1；耗时 \d+ms$/),
+    );
   });
 
   it('拒绝非布尔值和增量构建中的重新生成选项', async () => {
@@ -818,6 +826,10 @@ describe('S3：vision 关闭 → unavailable 内联 + images_unavailable 警告'
       expect(rawReadCapture.get('tokCachedDisabled')).toContain('reason="vision_unconfigured"');
       const warnings = JSON.parse(String(row.warnings_json ?? '[]')) as Array<{ code: string; count: number }>;
       expect(warnings).toContainEqual(expect.objectContaining({ code: 'images_unavailable', count: 1 }));
+      expect(harness.service.eventsSince(String(row.id), null).filter((e) => e.event === 'build_log')
+        .map((e) => (e.data as { message: string }).message)).toContainEqual(
+        expect.stringMatching(/^图片预描述完成：新描述 0，缓存 1，未理解 1，刷新失败 0；耗时 \d+ms$/),
+      );
       const refresh = await harness.service.createBuild(store as never, { mode: 'full', confirm: 'BUILD', refreshImages: true });
       const refreshed = await waitForTerminal(refresh.id);
       expect(rawReadCapture.get('tokCachedDisabled')).toContain('先前识别的图片');
@@ -878,6 +890,12 @@ describe('小批次图文源：按识图文本校验体积并保持发布保护'
     const harness = makeHarness(config, script, vision);
     const published = await createAndRun(harness, 'full');
     expect(published.status).toBe('published');
+    const imageLogs = harness.service.eventsSince(String(published.id), null).filter((e) => e.event === 'build_log')
+      .map((e) => (e.data as { message: string }).message);
+    expect(imageLogs).toContain(`图片预描述：${count} 张（优先复用缓存，未命中时请求识图）`);
+    expect(imageLogs).toContainEqual(expect.stringMatching(
+      new RegExp(`^图片预描述完成：新描述 ${count}，缓存 0，未理解 0，刷新失败 0；耗时 \\d+ms$`),
+    ));
     expect(harness.fakes).toHaveLength(1);
     const pointer = new StandardKbStore(outputRoot).readCurrent()!;
     expect(new StandardKbStore(outputRoot).readManifest(pointer.releaseId)?.docs).toHaveLength(count);

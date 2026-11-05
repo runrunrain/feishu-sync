@@ -23,12 +23,12 @@ import { StandardKbStore, KbNotPublishedError } from '../kb/standard-kb-store.js
 import { exportPortableKb, importPortableKb, inspectPortableKb, isImportedRelease, PortableKbError, previousLocalReleaseId, restorePreviousLocalKb } from '../kb/portable-kb-service.js';
 import { QueryError, getKbQueryService } from '../kb/search/kb-query-service.js';
 import { RawSourceSnapshot, collectSourceCandidates } from '../kb/raw-source-snapshot.js';
+import { addSourceComparisonHashes, sourceContentsChanged, withSourceComparisonBaseline } from '../kb/source-comparison.js';
 import { KbVersionStore, captureSourceContents, sourceChangePreview, validReleaseId } from '../kb/kb-version-store.js';
 import type { KbChangePreview } from '../types/kb-version.js';
 import { computeChangeset } from '../kb/kb-build-service.js';
 import { KnowledgeGovernanceService, allowedDecisionTargets } from '../kb/knowledge-governance-service.js';
-import { enrichEntriesWithWhiteboardTextHash } from '../kb/source-images.js';
-import { hashImageFile, resolveSourceImages } from '../kb/source-images.js';
+import { enrichEntriesWithMedia, enrichEntriesWithWhiteboardTextHash, hashImageFile, resolveSourceImages } from '../kb/source-images.js';
 import { ToolError } from '../agent/agent-tool-service.js';
 import type { LocalMapStore } from '../modules/local-map-store.js';
 import type { ConfigManager } from '../modules/config-manager.js';
@@ -37,7 +37,7 @@ import { kbMcpInfo } from '../kb/mcp-info.js';
 import { rawCatalogPath } from '../kb/raw-mcp-catalog.js';
 import type { BusinessStatus, KnowledgeObjectType, ReviewStatus } from '../kb/knowledge-schema.js';
 import { BUSINESS_STATUSES } from '../kb/knowledge-schema.js';
-import type { KbDocDto, KbSourceState, KbStatusDto } from '../types/agent-knowledge.js';
+import type { KbDocDto, KbManifest, KbSourceState, KbStatusDto, RawSourceSnapshotEntry } from '../types/agent-knowledge.js';
 
 export interface KbRouteDeps {
   buildService: KbBuildService;
@@ -68,22 +68,37 @@ function errorResponse(c: Context, error: unknown): Response {
   return c.json({ error: 'internal_error', message }, 500) as unknown as Response;
 }
 
+async function prepareSourcePreview(
+  entries: RawSourceSnapshotEntry[],
+  base: KbManifest | null,
+  root: string,
+  csvPaths: KbRouteDeps['sheetCsvPaths'],
+): Promise<void> {
+  await addSourceComparisonHashes({ entries, base, root, csvPaths });
+  const byToken = new Map(base?.sourceSnapshot.map(entry => [entry.objToken, entry]));
+  // Before suppressing byte drift, make sure linked media and whiteboard
+  // content did not change alongside the export. Only scan those candidates.
+  enrichEntriesWithMedia(root, entries.filter(entry => {
+    const prior = byToken.get(entry.objToken);
+    return !!prior && prior.contentHash !== entry.contentHash && !sourceContentsChanged(prior, entry);
+  }));
+}
+
 /** 当前原始源 vs manifest 快照的源状态与 pending 计数。 */
-function compareSources(
-  manifest: { sourceSnapshot: Array<{ objToken: string; contentHash: string }> } | null,
-  currentEntries: Array<{ objToken: string; contentHash: string }>,
+async function compareSources(
+  manifest: KbManifest | null,
+  currentEntries: RawSourceSnapshotEntry[],
   sheetCsvPaths: (objToken: string) => string[],
   knowledgeBaseRoot: string,
-): { pending: { added: number; changed: number; removed: number } } {
+) {
   if (!manifest) {
     return { pending: { added: currentEntries.length, changed: 0, removed: 0 } };
   }
   // P0-S7：status 预览同样按白板旁路文字判定——scan 条目缺该字段时会与
   // 非空 manifest 值恒不等而虚报 changed；先补算再比较（mediaHash 语义不变）。
-  enrichEntriesWithWhiteboardTextHash(knowledgeBaseRoot, currentEntries as never);
-  const changeset = computeChangeset(currentEntries as never, manifest as never);
-  void sheetCsvPaths;
-  void knowledgeBaseRoot;
+  enrichEntriesWithWhiteboardTextHash(knowledgeBaseRoot, currentEntries);
+  await prepareSourcePreview(currentEntries, manifest, knowledgeBaseRoot, sheetCsvPaths);
+  const changeset = computeChangeset(currentEntries, manifest);
   return {
     pending: {
       added: changeset.added.length,
@@ -256,11 +271,12 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
       const current = store.readCurrent();
       const manifest = store.readManifest();
       const imported = Boolean(manifest && isImportedRelease(config.standardKb.outputRoot, manifest.releaseId));
-      const pending = imported ? { added: 0, changed: 0, removed: 0 } : compareSources(manifest, RawSourceSnapshot.scan(
+      const pending = imported ? { added: 0, changed: 0, removed: 0 } : (await compareSources(
+        withSourceComparisonBaseline(manifest, config.standardKb.outputRoot), RawSourceSnapshot.scan(
         config.knowledgeBaseRoot,
         sourceDocuments(config.knowledgeBaseRoot, manifest?.sourceSnapshot.map((source) => source.objToken)),
         deps.sheetCsvPaths,
-      ).entries, deps.sheetCsvPaths, config.knowledgeBaseRoot).pending;
+      ).entries, deps.sheetCsvPaths, config.knowledgeBaseRoot)).pending;
       const dto: KbStatusDto = {
         outputRoot: config.standardKb.outputRoot,
         current: current && manifest
@@ -316,18 +332,20 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
         sourceDocuments(config.knowledgeBaseRoot, manifest.sourceSnapshot.map((source) => source.objToken)),
         deps.sheetCsvPaths,
       );
-      const currentByToken = new Map(scan?.entries.map((entry) => [entry.objToken, entry.contentHash]) ?? []);
+      const baseline = withSourceComparisonBaseline(manifest, config.standardKb.outputRoot)!;
+      if (scan) await prepareSourcePreview(scan.entries, baseline, config.knowledgeBaseRoot, deps.sheetCsvPaths);
+      const currentByToken = new Map(scan?.entries.map((entry) => [entry.objToken, entry]) ?? []);
       const excluded = imported ? new Set<string>() : new Set(localMapStore.listKbExplicitlyExcludedSources(config.knowledgeBaseRoot));
       const deleted = imported ? new Set<string>() : new Set(localMapStore.listLocalSourceDeletions?.(config.knowledgeBaseRoot).map((item) => item.objToken) ?? []);
       const sources = doc.sources.map((objToken) => {
-        const snapshotEntry = manifest.sourceSnapshot.find((candidate) => candidate.objToken === objToken);
-        const currentHash = currentByToken.get(objToken);
+        const snapshotEntry = baseline.sourceSnapshot.find((candidate) => candidate.objToken === objToken);
+        const currentSource = currentByToken.get(objToken);
         let state: KbSourceState = imported ? 'packaged' : 'current';
         if (imported) { /* shared release traces its packaged snapshot */ }
         else if (deleted.has(objToken)) state = 'deleted';
         else if (excluded.has(objToken)) state = 'excluded';
-        else if (currentHash === undefined) state = 'missing';
-        else if (snapshotEntry && snapshotEntry.contentHash !== currentHash) state = 'changed';
+        else if (!currentSource) state = 'missing';
+        else if (snapshotEntry && sourceContentsChanged(snapshotEntry, currentSource)) state = 'changed';
         return {
           objToken,
           title: snapshotEntry?.title ?? objToken,
@@ -441,7 +459,9 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
         unselected, excluded, published: manifest?.sourceSnapshot.map((source) => source.objToken),
       }), deps.sheetCsvPaths);
       const current = new Map(scan.entries.map((entry) => [entry.objToken, entry]));
-      const base = new Map((manifest?.sourceSnapshot ?? []).map((entry) => [entry.objToken, entry]));
+      const baseline = withSourceComparisonBaseline(manifest, config.standardKb.outputRoot);
+      await prepareSourcePreview(scan.entries, baseline, config.knowledgeBaseRoot, deps.sheetCsvPaths);
+      const base = new Map((baseline?.sourceSnapshot ?? []).map((entry) => [entry.objToken, entry]));
       const candidates = new Map(collectSourceCandidates(documents).map((doc) => [doc.objToken, { title: doc.title, relPath: doc.localRelPath!, recovered: doc.recoveredLocalVersion === true }]));
       const referencedCounts = countIncomingReferences(localMapStore, documents);
       // 当前选择仅列实际存在的本地源；旧版本引用留在差异/版本入口。
@@ -451,7 +471,7 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
         const old = base.get(objToken); const next = current.get(objToken);
         const isExcluded = excluded.has(objToken);
         const pending = isExcluded ? (old ? 'removed' : 'excluded') : !next ? (old ? 'removed' : 'excluded')
-          : !old ? 'added' : next.contentHash !== old.contentHash || next.relPath !== old.relPath || next.title !== old.title ? 'changed' : 'unchanged';
+          : !old ? 'added' : sourceContentsChanged(old, next) || next.relPath !== old.relPath || next.title !== old.title ? 'changed' : 'unchanged';
         return { objToken, title: doc.title || objToken, relPath: doc.relPath, included: !unselected.has(objToken), excluded: isExcluded, published: Boolean(old), pending, ...(doc.recovered ? { recovered: true } : {}),
           referencedBy: referencedCounts.get(objToken) ?? 0 };
       });
@@ -521,8 +541,9 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
   routes.get('/api/kb/changes', async (c) => {
     try {
       const { store, config } = await loadStore();
-      const manifest = store.readManifest();
+      const manifest = withSourceComparisonBaseline(store.readManifest(), config.standardKb.outputRoot);
       const scan = RawSourceSnapshot.scan(config.knowledgeBaseRoot, sourceDocuments(config.knowledgeBaseRoot, manifest?.sourceSnapshot.map((source) => source.objToken)), deps.sheetCsvPaths);
+      await prepareSourcePreview(scan.entries, manifest, config.knowledgeBaseRoot, deps.sheetCsvPaths);
       const snapshot = RawSourceSnapshot.fromEntries(scan.entries, { sheetCsvPaths: deps.sheetCsvPaths });
       const contents = captureSourceContents(snapshot, config.knowledgeBaseRoot);
       const versions = new KbVersionStore(config.standardKb.outputRoot);

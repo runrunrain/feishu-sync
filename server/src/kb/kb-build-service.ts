@@ -40,6 +40,7 @@ import { selectProgressiveCoverage } from './progressive-coverage.js';
 import { finalDraftEvidenceScopePaths, selectProgressiveKnowledgeDraft } from './progressive-knowledge-draft.js';
 import { getKbQueryService } from './search/kb-query-service.js';
 import { KbVersionStore, captureSourceContents, sourceChangePreview, sourceContentResourceSpans, type SourceContents } from './kb-version-store.js';
+import { addSourceComparisonHashes, sourceContentsChanged, withSourceComparisonBaseline } from './source-comparison.js';
 import { loadProgressiveBaselineImages, progressiveSourceSnapshot, rebindBaselineImageEvidence, seedProgressiveCarriedReceipts } from './progressive-source-snapshot.js';
 import { hasEditorialHistory, hasSourceMetadata } from './body-policy.js';
 import { planUnits, packBatches, type BuildUnit } from './build-units.js';
@@ -2320,7 +2321,7 @@ export class KbBuildService extends EventEmitter {
 
       const store = new StandardKbStore(outputRoot);
       const basePointer: KbCurrentPointer | null = store.readCurrent();
-      const baseManifest: KbManifest | null = basePointer ? store.readManifest(basePointer.releaseId) : null;
+      const baseManifest = withSourceComparisonBaseline(basePointer ? store.readManifest(basePointer.releaseId) : null, outputRoot);
       if (resume && (basePointer?.releaseId ?? null) !== resume.baseReleaseId) throw new ToolError('kb_resume_stale', '标准库基准版本已变化，请重新构建', 409);
       entry.baseReleaseId = basePointer?.releaseId ?? null;
       const retainedSources = mode === 'incremental' ? baseManifest?.sourceSnapshot.map((source) => source.objToken) ?? [] : [];
@@ -2347,6 +2348,8 @@ export class KbBuildService extends EventEmitter {
         ? documents.filter((doc) => !publishedTokens.has(doc.objToken))
         : documents;
       const snapshotResult = RawSourceSnapshot.scan(config.knowledgeBaseRoot, buildDocuments, this.deps.sheetCsvPaths);
+      await addSourceComparisonHashes({ entries: snapshotResult.entries, base: baseManifest, root: config.knowledgeBaseRoot,
+        csvPaths: this.deps.sheetCsvPaths, capture: true });
       // S3（§3.4）：为全部条目补充 mediaHash/imageCount（contentHash 公式不变）
       enrichEntriesWithMedia(config.knowledgeBaseRoot, snapshotResult.entries);
       const liveSnapshot = RawSourceSnapshot.fromEntries(snapshotResult.entries, {
@@ -2476,7 +2479,7 @@ export class KbBuildService extends EventEmitter {
         message: '图片理解状态不可用',
       }));
       const visionReady = visionStatus.state === 'ready';
-      // 变更集（§6.4：本地字节比较，云端状态变化不参与）
+      // Dispatch only for source content changes. The frozen snapshot keeps byte hashes.
       const changeset = computeChangeset(snapshot.entries, baseManifest, { visionEnabled: visionReady });
       // F3-R07：full 工作集 = 快照全部源——重复 full / 部分变化 full 都必须
       // 重建全库（重复执行、只 finish 不得借 skip 发布空或局部库）；增量
@@ -2681,7 +2684,13 @@ export class KbBuildService extends EventEmitter {
           visionReady, signal: cancelController.signal,
         });
       }
-      if (entry.rebuildSelected && !resume) await this.includeRetainedImageCache(buildState, visionDescriber, cancelController.signal);
+      if (entry.rebuildSelected && !resume) {
+        const retainedCacheStarted = performance.now();
+        await this.includeRetainedImageCache(buildState, visionDescriber, cancelController.signal);
+        if (!cancelController.signal.aborted) {
+          this.emitLog(buildId, 'info', `保留来源图片缓存扫描完成：耗时 ${Math.round(performance.now() - retainedCacheStarted)}ms（仅本地缓存，不请求识图）`);
+        }
+      }
       buildState.visionReady = visionReady;
       if (entry.cancelRequested) throw new CancelledError();
 
@@ -3675,7 +3684,8 @@ export class KbBuildService extends EventEmitter {
       ? `图片预描述：${items.length} 张（识图服务未就绪，仅复用已有缓存）`
       : input.entry.refreshImages
       ? `图片预描述：${items.length} 张（重新生成本次处理源文档的图片描述）`
-      : `图片预描述：${items.length} 张（命中缓存不调远端）`);
+      : `图片预描述：${items.length} 张（优先复用缓存，未命中时请求识图）`);
+    const describeStarted = performance.now();
     const composed = await input.describer.describeMany(
       items.map((item) => ({ file: item.file, src: `${item.objToken}::${item.src}` })),
       { signal: input.signal, onProgress: (progress) => {
@@ -3714,6 +3724,7 @@ export class KbBuildService extends EventEmitter {
     }
     input.entry.images = { total: items.length, described, cached, unavailable };
     input.entry.imageRefreshFailures = refreshFailures;
+    this.emitLog(input.buildId, 'info', `图片预描述完成：新描述 ${described}，缓存 ${cached}，未理解 ${unavailable}，刷新失败 ${refreshFailures}；耗时 ${Math.round(performance.now() - describeStarted)}ms`);
     return result;
   }
 
@@ -7117,6 +7128,16 @@ export class KbBuildService extends EventEmitter {
     const draftedPaths = new Set(draftEvidenceScopePaths ?? Object.entries(draft.docs)
       .filter(([, doc]) => doc.basis !== 'published').map(([docPath]) => docPath));
     const objectPaths = new Map(draft.objects.map((object) => [object.objectId, object.canonical?.path]));
+    const baselineManifest = withSourceComparisonBaseline(input.baseReleaseId
+      ? new StandardKbStore(input.outputRoot).readManifest(input.baseReleaseId) : null, input.outputRoot);
+    const oldSources = new Map((baselineManifest?.sourceSnapshot ?? []).map(source => [source.objToken, source]));
+    const exportOnlySources = new Map(input.snapshot.entries.flatMap((source) => {
+      const old = oldSources.get(source.objToken);
+      return old && old.contentHash !== source.contentHash && !sourceContentsChanged(old, source)
+        && (old.mediaHash ?? '') === (source.mediaHash ?? '')
+        && (old.whiteboardTextHash ?? '') === (source.whiteboardTextHash ?? '')
+        ? [[source.objToken, old] as const] : [];
+    }));
     const carriedImageIds = new Set<string>();
     for (const claim of draft.evidence) {
       if (claim.selector.kind === 'workbook_cells') workbookSourceIds.add(claim.sourceRef.sourceId);
@@ -7200,17 +7221,60 @@ export class KbBuildService extends EventEmitter {
         }
         for (const [resourceId, payload] of carriedImages) {
           if (payload.resource.sourceId !== sourceId) continue;
-          if (payload.resource.sourceSnapshotHash !== entry.contentHash) {
+          const prior = exportOnlySources.get(sourceId);
+          const canCarry = prior?.mediaHash && payload.resource.sourceSnapshotHash === prior.contentHash;
+          if (payload.resource.sourceSnapshotHash !== entry.contentHash && !canCarry) {
             evidenceBlocking.push({ code: 'kb_evidence_unresolved', field: 'sourceRef.sourceSnapshotHash',
               message: `继承图片证据与冻结来源版本不符: ${resourceId}`, severity: 'blocking' });
             continue;
           }
-          imgPayloads.set(resourceId, payload);
-          pack.push(payload.resource);
-          evidenceResources.push({ resource: payload.resource });
+          const resource = { ...payload.resource, sourceSnapshotHash: entry.contentHash };
+          imgPayloads.set(resourceId, { ...payload, resource });
+          pack.push(resource);
+          evidenceResources.push({ resource });
         }
       }
       gateResourcePacks.set(sourceId, pack);
+    }
+
+    // A carried citation may cross an equivalent export only after its exact
+    // published selector and quote have been checked against the new resource.
+    const exportCarryReceipts: EvidenceReadReceipt[] = [];
+    if (exportOnlySources.size > 0 && previousKnowledge) {
+      const previousEvidence = new Map(previousKnowledge.evidence.map(item => [item.evidenceId, item]));
+      const resources = new Map(evidenceResources.map(({ resource }) => [resource.resourceId, resource]));
+      for (const item of draft.evidence) {
+        if (draftedPaths.has(objectPaths.get(item.objectId) ?? '')) continue;
+        const old = exportOnlySources.get(item.sourceRef.sourceId);
+        const resource = resources.get(item.sourceRef.resourceId);
+        const prior = previousEvidence.get(item.evidenceId);
+        if (!old || !resource || resource.sourceId !== old.objToken || !prior
+          || prior.sourceRef.sourceSnapshotHash !== old.contentHash
+          || prior.sourceRef.resourceId !== item.sourceRef.resourceId
+          || prior.objectId !== item.objectId || prior.quoteHash !== item.quoteHash
+          || prior.claimKey !== item.claimKey || prior.role !== item.role || prior.nature !== item.nature
+          || JSON.stringify(prior.selector) !== JSON.stringify(item.selector)) continue;
+        const sourceRef = { ...item.sourceRef, sourceSnapshotHash: resource.sourceSnapshotHash, resourceHash: resource.resourceHash };
+        const receipt = { readReceiptId: 'krr_export_' + crypto.randomBytes(8).toString('hex'),
+          resourceId: resource.resourceId, lineStart: 1,
+          lineEnd: 'content' in resource ? resource.content.split('\n').length : 1 };
+        const check = verifyEvidence({ evidence: { ...item, sourceRef, readReceiptId: receipt.readReceiptId },
+          resources: [resource], receipts: [receipt] });
+        if (!check.ok) continue;
+        item.sourceRef = sourceRef;
+        item.readReceiptId = receipt.readReceiptId;
+        exportCarryReceipts.push(receipt);
+      }
+      const previousCoverage = new Map(previousKnowledge.coverage.map(item => [item.itemId, item]));
+      for (const item of draft.coverage) {
+        const old = exportOnlySources.get(item.sourceRef.sourceId);
+        const resource = resources.get(item.sourceRef.resourceId);
+        const prior = previousCoverage.get(item.itemId);
+        if (old && resource?.sourceId === old.objToken && item.sourceRef.sourceSnapshotHash === old.contentHash
+          && prior?.sourceRef.resourceId === item.sourceRef.resourceId && prior.sourceRef.sourceSnapshotHash === old.contentHash) {
+          item.sourceRef = { ...item.sourceRef, sourceSnapshotHash: resource.sourceSnapshotHash, resourceHash: resource.resourceHash };
+        }
+      }
     }
 
     const compiled = compileKnowledgeRelease({
@@ -7394,7 +7458,7 @@ export class KbBuildService extends EventEmitter {
     const governanceSection = { path: 'governance.json', hash: sha(governanceBytes) };
 
     // 读取回执（read-receipts.jsonl；文本/CSV 证据复核，A案 §5.3）
-    const receipts: EvidenceReadReceipt[] = [];
+    const receipts: EvidenceReadReceipt[] = [...exportCarryReceipts];
     const receiptFile = path.join(input.stagingRoot, 'read-receipts.jsonl');
     if (fs.existsSync(receiptFile)) {
       for (const line of fs.readFileSync(receiptFile, 'utf8').split('\n')) {
@@ -7440,12 +7504,9 @@ export class KbBuildService extends EventEmitter {
       const paths = sourcePaths.get(source) ?? new Set<string>();
       paths.add(doc.path); sourcePaths.set(source, paths);
     }
-    const baselineManifest = input.baseReleaseId
-      ? new StandardKbStore(input.outputRoot).readManifest(input.baseReleaseId) : null;
-    const oldSources = new Map((baselineManifest?.sourceSnapshot ?? []).map(source => [source.objToken, source]));
     const changedSources = baselineManifest ? new Set(input.snapshot.entries.filter(source => {
       const old = oldSources.get(source.objToken);
-      return !old || old.contentHash !== source.contentHash || old.mediaHash !== source.mediaHash;
+      return !old || sourceContentsChanged(old, source) || old.mediaHash !== source.mediaHash;
     }).map(source => source.objToken)) : undefined;
     for (const old of oldSources.keys()) if (!input.snapshot.get(old)) changedSources?.add(old);
     for (const source of this.active.get(input.buildId)?.buildState?.workset.keys() ?? []) changedSources?.add(source);
@@ -8204,7 +8265,7 @@ export function computeChangeset(
     if (!base) added.push(token);
     // 标题和本地镜像路径属于来源元数据；内容/媒体未变时由新发布快照
     // 更新即可，不让纯重命名触发已有知识文档的全量重写。
-    else if (base.contentHash !== entry.contentHash) changed.push(token);
+    else if (sourceContentsChanged(base, entry)) changed.push(token);
     // S3（U4）：vision 启用时变更判定含 mediaHash——双方均非空且不等才算变更；
     // 旧 manifest 无 mediaHash 视为未变（升级后首次增量不触发全量 changed）
     else if (opts?.visionEnabled && base.mediaHash && entry.mediaHash && base.mediaHash !== entry.mediaHash) changed.push(token);

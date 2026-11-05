@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { Download, Loader2, RefreshCw } from 'lucide-react';
 import { getWorkbookBlob, getWorkbookPreview } from '../../api/client';
@@ -30,6 +30,7 @@ function borderStyle(cell: WorkbookCell): CSSProperties {
 /** Virtualized read-only canvas. Cells retain native geometry at every zoom. */
 export function WorkbookCanvas({ sheet, zoom = 1 }: { sheet: WorkbookSheetLayout; zoom?: number }) {
   const viewport = useRef<HTMLDivElement>(null);
+  const pan = useRef<{ pointerId: number; x: number; y: number; left: number; top: number } | null>(null);
   const [view, setView] = useState({ left: 0, top: 0, width: 1200, height: 600 });
   const layout = useMemo(() => prepareWorkbookLayout(sheet), [sheet]);
   useEffect(() => {
@@ -44,20 +45,44 @@ export function WorkbookCanvas({ sheet, zoom = 1 }: { sheet: WorkbookSheetLayout
   const left = view.left / zoom - 100, top = view.top / zoom - 100;
   const right = (view.left + view.width) / zoom + 100, bottom = (view.top + view.height) / zoom + 100;
   const visible = layout.cells.filter((item) => item.width > 0 && item.height > 0 && item.x < right && item.x + item.textWidth > left && item.y < bottom && item.y + item.height > top);
+  const startPan = (event: PointerEvent<HTMLDivElement>) => {
+    const element = viewport.current;
+    if (!element || event.button !== 0 || event.pointerType === 'touch' || !event.isPrimary) return;
+    if (element.scrollWidth <= element.clientWidth && element.scrollHeight <= element.clientHeight) return;
+    event.preventDefault();
+    element.focus({ preventScroll: true });
+    element.setPointerCapture(event.pointerId);
+    pan.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, left: element.scrollLeft, top: element.scrollTop };
+  };
+  const endPan = (event: PointerEvent<HTMLDivElement>) => {
+    if (pan.current?.pointerId === event.pointerId) pan.current = null;
+  };
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       <div
         ref={viewport}
-        className="min-h-[320px] flex-1 overflow-auto bg-white scrollbar-thin"
-        style={{ height: 'min(62vh, 680px)' }}
+        className="min-h-0 min-w-0 flex-1 overflow-auto overscroll-contain bg-white scrollbar-thin"
         aria-label={`${sheet.name} Excel 画板`}
         tabIndex={0}
+        onPointerMove={(event) => {
+          const start = pan.current;
+          if (!start || start.pointerId !== event.pointerId) return;
+          event.currentTarget.scrollLeft = start.left + start.x - event.clientX;
+          event.currentTarget.scrollTop = start.top + start.y - event.clientY;
+        }}
+        onPointerUp={endPan}
+        onPointerCancel={endPan}
+        onLostPointerCapture={endPan}
         onScroll={(event) => {
           const element = event.currentTarget;
           setView({ left: element.scrollLeft, top: element.scrollTop, width: element.clientWidth, height: element.clientHeight });
         }}
       >
-        <div style={{ position: 'relative', width: layout.width * zoom, height: layout.height * zoom }}>
+        <div
+          className="relative cursor-grab select-none overflow-hidden active:cursor-grabbing"
+          style={{ width: layout.width * zoom, height: layout.height * zoom }}
+          onPointerDown={startPan}
+        >
           <div style={{ position: 'absolute', width: layout.width, height: layout.height, transform: `scale(${zoom})`, transformOrigin: 'top left', color: '#000', background: '#fff' }}>
             {sheet.showGridLines && (
               <svg aria-hidden style={{ position: 'absolute', inset: 0, width: layout.width, height: layout.height, pointerEvents: 'none' }}>
@@ -158,12 +183,12 @@ export function WorkbookView({ objToken, fileName, toolbarTarget }: { objToken: 
       </div>
   );
   return (
-    <div ref={panel} className="flex min-h-[460px] h-full flex-col">
+    <div ref={panel} className="flex h-full min-h-0 min-w-0 flex-col">
       {toolbarTarget === undefined
         ? <div className="shrink-0 border-b border-line bg-paper/60 px-3 py-2">{toolbar}</div>
         : toolbarTarget ? createPortal(toolbar, toolbarTarget) : null}
       {error ? <div role="alert" className="px-4 py-6 text-xs text-seal">{error}<button type="button" onClick={() => setRetry((value) => value + 1)} className="ml-3 inline-flex items-center gap-1"><RefreshCw className="h-3 w-3" />重试</button></div> : null}
-      {loading ? <div className="flex min-h-[320px] flex-1 items-center justify-center gap-2 text-xs text-ink-faint"><Loader2 className="h-4 w-4 animate-spin" />正在读取 Excel 布局…</div> : preview && !error ? (
+      {loading ? <div className="flex min-h-0 flex-1 items-center justify-center gap-2 text-xs text-ink-faint"><Loader2 className="h-4 w-4 animate-spin" />正在读取 Excel 布局…</div> : preview && !error ? (
         <>
           {preview.sheet.warnings.length > 0 && <div className="shrink-0 max-h-24 overflow-auto border-b border-line bg-paper px-3 py-2 text-[11px] text-ink-soft">{preview.sheet.warnings.map((warning, index) => <p key={index}>{warning}</p>)}</div>}
           <WorkbookCanvas key={`${objToken}-${sheetIndex}-${retry}`} sheet={preview.sheet} zoom={actualZoom} />

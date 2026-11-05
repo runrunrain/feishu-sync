@@ -1,0 +1,10 @@
+{
+  "stage": null,
+  "backup": "/Users/run.mao/workpace/feishu-sync/release-builds/install-backups/b3594663-6642-4776-95fc-5fb8dc9c1c12/Feishu Sync.app",
+  "fixes": [
+    "all-automatic-recovery-and-document-scope-fixes",
+    "old-formal-claim-excerpts-for-semantic-migrations"
+  ],
+  "installedAt": "2026-11-05T04:11:53.188901+00:00",
+  "target": "/Applications/Feishu Sync.app"
+}

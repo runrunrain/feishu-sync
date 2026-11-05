@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import type { ImageDescription } from '../agent/vision/vision-describer.js';
 import type { KbManifest, KbManifestDoc, RawSourceSnapshotEntry } from '../types/agent-knowledge.js';
+import { sourceContentsChanged } from './source-comparison.js';
 
 export interface VisionDescriptionVersion { hash: string; describedCount: number; newlyDescribedCount: number }
 
@@ -52,7 +53,7 @@ export function versionedPublishedSources(input: {
     if (version && allRewritten && publishedTokens.has(entry.objToken)) {
       return { ...entry, visionDescriptionHash: version.hash, visionDescribedCount: version.describedCount };
     }
-    if (prior?.visionDescriptionHash && prior.contentHash === entry.contentHash
+    if (prior?.visionDescriptionHash && !sourceContentsChanged(prior, entry)
       && (prior.mediaHash ?? '') === (entry.mediaHash ?? '')
       && (prior.whiteboardTextHash ?? '') === (entry.whiteboardTextHash ?? '')) {
       return { ...entry, visionDescriptionHash: prior.visionDescriptionHash,

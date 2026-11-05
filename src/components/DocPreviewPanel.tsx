@@ -363,7 +363,7 @@ export function DocPreviewPanel({ node, onOpenFolder, className = '' }: DocPrevi
       </div>
 
       {/* 内容区 */}
-      <div className="min-h-0 flex-1 overflow-y-auto scrollbar-thin overscroll-contain">
+      <div className={`min-h-0 flex-1 ${formatTab === 'xlsx' && content?.workbook ? 'overflow-hidden' : 'overflow-y-auto scrollbar-thin overscroll-contain'}`}>
         {loading ? (
           <LoadingSkeleton />
         ) : error ? (

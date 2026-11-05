@@ -12,7 +12,8 @@ export function lineDiff(before: string, after: string, maxChars = 64_000) {
   const right = b.slice(prefix, b.length - suffix);
   const edits: Array<{ kind: ' ' | '+' | '-'; text: string }> = [];
   for (const text of a.slice(Math.max(0, prefix - 3), prefix)) edits.push({ kind: ' ', text });
-  if ((left.length + 1) * (right.length + 1) <= 1_000_000) {
+  const wholeBlock = left.length > 0 && right.length > 0 && (left.length + 1) * (right.length + 1) > 1_000_000;
+  if (!wholeBlock && left.length && right.length) {
     const width = right.length + 1;
     const table = new Uint32Array((left.length + 1) * width);
     for (let i = left.length - 1; i >= 0; i--)
@@ -55,5 +56,6 @@ export function lineDiff(before: string, after: string, maxChars = 64_000) {
     additions: edits.filter((e) => e.kind === '+').length,
     deletions: edits.filter((e) => e.kind === '-').length,
     truncated: patch.length > maxChars,
+    ...(wholeBlock ? { wholeBlock: true } : {}),
   };
 }

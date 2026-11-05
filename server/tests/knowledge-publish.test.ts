@@ -825,6 +825,7 @@ describe('发布布局：v1 基线与 v2 sidecar', () => {
       relations: knowledge.relations, presentations: knowledge.presentations.filter((item: { kind: string }) => item.kind !== 'canonical') };
     fs.writeFileSync(path.join(staging, 'knowledge-draft.json'), JSON.stringify(draft));
     const prepare = (service as unknown as { prepareKnowledgePublish: (input: Record<string, unknown>) => Promise<{
+      compiled: { knowledge: KnowledgeManifest };
       evidenceFileWrites: Array<{ path: string; bytes: Buffer }> }> }).prepareKnowledgePublish.bind(service);
     const args = { ...publishArgs('b_final_image_carry', 'r_image_final', staging, baseId, snap),
       mode: 'incremental', publicationStage: 'final', imageDescriptions: new Map(), draftEvidenceScopePaths: [] };
@@ -833,6 +834,29 @@ describe('发布布局：v1 基线与 v2 sidecar', () => {
     await expect(prepare({ ...args, draftEvidenceScopePaths: ['damage.md'] })).rejects.toMatchObject({
       code: 'kb_publish_blocked', details: { groups: expect.arrayContaining([expect.objectContaining({ code: 'kb_evidence_unresolved' })]) },
     });
+    // Simulate a preflight-proven equivalent export and check the actual
+    // publication gate. The earlier integration test verifies the digest.
+    const oldSource = manifest.sourceSnapshot[0];
+    const comparisonHash = 'v1:' + 'a'.repeat(64);
+    const mediaHash = 'sha256:' + 'b'.repeat(64);
+    fs.writeFileSync(path.join(releaseRoot, 'manifest.json'), JSON.stringify({
+      ...manifest, sourceSnapshot: [{ ...oldSource, comparisonHash, mediaHash }],
+    }));
+    const sourceFile = path.join(kbRoot, SRC_REL);
+    try {
+      fs.appendFileSync(sourceFile, '\n');
+      const newSource = { ...snap.entries[0]!, comparisonHash, mediaHash,
+        contentHash: computeSourceHash(sourceFile, [], kbRoot) };
+      const reexported = RawSourceSnapshot.fromEntries([newSource], { knowledgeBaseRoot: kbRoot });
+      const carried = await prepare({ ...args, snapshot: reexported });
+      expect(carried.compiled.knowledge.evidence.find(item => item.evidenceId === imageEvidence.evidenceId)
+        ?.sourceRef.sourceSnapshotHash).toBe(newSource.contentHash);
+      expect(carried.evidenceFileWrites.find(item => item.path === imagePath)?.bytes).toEqual(bytes);
+      newSource.mediaHash = 'sha256:' + 'c'.repeat(64);
+      await expect(prepare({ ...args, snapshot: reexported })).rejects.toMatchObject({ code: 'kb_publish_blocked' });
+    } finally {
+      fs.writeFileSync(sourceFile, SRC_CONTENT);
+    }
     fs.appendFileSync(path.join(releaseRoot, imagePath), 'tampered');
     await expect(prepare(args)).rejects.toThrow('继承图片证据文件损坏');
   });

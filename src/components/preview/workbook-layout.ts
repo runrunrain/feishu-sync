@@ -38,7 +38,9 @@ export function prepareWorkbookLayout(sheet: WorkbookSheetLayout) {
     occupied.set(row, list);
   };
   for (const cell of sheet.cells) {
-    if (cell.text || cell.fill) occupy(cell.row, cell.column, cell.column);
+    // Formatting alone does not occupy a cell. In Excel, unwrapped text
+    // can flow across empty cells even when they have a background fill.
+    if (cell.text || cell.formula) occupy(cell.row, cell.column, cell.column);
   }
   for (const merge of sheet.merges) {
     for (let row = merge.top; row <= Math.min(merge.bottom, sheet.rows.length - 1); row++) occupy(row, merge.left, merge.right);

@@ -96,8 +96,8 @@ export function RawSourceDrawer({ source, onClose }: RawSourceDrawerProps) {
           <MarkdownView content={packagedContent} remoteImages="confirm" />
         </div>
       ) : content ? (
-        <div className="flex flex-col">
-          <div className="flex items-center gap-2 px-4 py-2 border-b border-line/60 bg-paper/50">
+        <div className={`flex flex-col ${view === 'xlsx' ? 'h-full min-h-0' : ''}`}>
+          <div className="flex shrink-0 items-center gap-2 px-4 py-2 border-b border-line/60 bg-paper/50">
             {content.workbook && (
               <button type="button" onClick={() => setView('xlsx')} className={`px-2.5 py-1 rounded text-xs ${view === 'xlsx' ? 'bg-card-bg border border-line text-ink' : 'text-ink-faint hover:text-ink'}`}>Excel 画板</button>
             )}

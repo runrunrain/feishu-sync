@@ -9,6 +9,7 @@ export interface KbFileChange {
   additions: number;
   deletions: number;
   truncated: boolean;
+  wholeBlock?: boolean;
 }
 
 export interface KbChangePreview {
