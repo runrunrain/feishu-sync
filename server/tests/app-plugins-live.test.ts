@@ -22,6 +22,8 @@ const root = fs.mkdtempSync(path.join(os.tmpdir(), 'app-plugin-live-'));
 afterAll(() => fs.rmSync(root, { recursive: true, force: true }));
 
 it('真实Pi插件快照进入system；运行中编辑不改变当前任务，后续运行重启且停用不残留，未变则复用', async (ctx) => {
+  const localHome = path.join(root, 'local-pi'); fs.mkdirSync(localHome, { recursive: true });
+  vi.stubEnv('HOME', root); vi.stubEnv('PI_CODING_AGENT_DIR', localHome);
   const manager = new ConfigManager(path.join(root, 'config.json')); const config = await manager.load();
   const resolver = new PiRuntimeResolver(); const runtime = await resolver.resolveRuntime(config.agent);
   if (!runtime.nodePath || !runtime.piCliPath) { ctx.skip(); return; }
@@ -87,7 +89,7 @@ it('真实Pi插件快照进入system；运行中编辑不改变当前任务，�
   expect(session.backend).toBe('pi');
   const complete = async (message: string, count: number) => {
     await service.sendMessage(store, session.id, { text: message });
-    await vi.waitFor(() => { expect(requests).toHaveLength(count); expect(service.isRunning(session.id)).toBe(false); }, { timeout: 35000, interval: 25 });
+    await vi.waitFor(() => { expect(requests, `Pi session error: ${JSON.stringify(service.get(store, config, session.id)?.lastError)}`).toHaveLength(count); expect(service.isRunning(session.id)).toBe(false); }, { timeout: 35000, interval: 25 });
     expect(service.get(store, config, session.id)?.lastError).toBeFalsy();
     return pool.get(session.id)!.id;
   };
@@ -142,12 +144,20 @@ it('真实Pi插件快照进入system；运行中编辑不改变当前任务，�
     expect(JSON.stringify(requests[8].messages)).toContain(root);
     const state = await pool.get(session.id)!.sendCommand('get_state');
     expect((state.data as { cwd?: string }).cwd ?? root).toBe(root);
+    service.setLocalResources(store, session.id, true);
+    const localId = await complete('启用本机资源', 10);
+    fs.mkdirSync(path.join(root, '.pi'), { recursive: true });
+    fs.writeFileSync(path.join(root, '.pi/settings.json'), JSON.stringify({ extensions: [] }));
+    const settingsId = await complete('项目设置变更', 11); expect(settingsId).not.toBe(localId);
+    fs.writeFileSync(path.join(root, '.pi/mcp.json'), JSON.stringify({ mcpServers: {} }));
+    const mcpId = await complete('项目 MCP 变更', 12); expect(mcpId).not.toBe(settingsId);
     await service.switchMode(store, session.id, { mode: 'discuss' });
-    await complete('切回 Chat', 10);
-    expect(requests[9].tools.map((tool: any) => tool.function.name)).not.toContain('bash');
+    await complete('切回 Chat', 13);
+    expect(requests[12].tools.map((tool: any) => tool.function.name)).not.toContain('bash');
   } finally {
     releaseFirst?.(); await pool.closeAll();
     await new Promise<void>((resolve) => internal.close(() => resolve()));
     await new Promise<void>((resolve) => llm.close(() => resolve()));
+    vi.unstubAllEnvs();
   }
 }, 120000);

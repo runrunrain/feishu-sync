@@ -17,7 +17,7 @@ import { CornerDownLeft, FileText, ListPlus, Loader2, Plus, RefreshCw, Send, Set
 import { Button } from '../common/Button';
 import type { AgentAttachmentDto, AgentSessionDto, AgentStatusDto } from '../../types/agent';
 import type { ReadinessCopy } from '../../utils/agentReadiness';
-import { removeAgentAttachment, setSessionApprovalMode, uploadAgentAttachment } from '../../api/client';
+import { removeAgentAttachment, setSessionApprovalMode, setSessionLocalResources, uploadAgentAttachment } from '../../api/client';
 
 export interface AgentComposerHandle { addFiles: (files: File[]) => void }
 interface DraftAttachment {
@@ -71,6 +71,7 @@ export const AgentComposer = forwardRef<AgentComposerHandle, AgentComposerProps>
   const text = draft.text;
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [approvalSaving, setApprovalSaving] = useState(false);
+  const [localSaving, setLocalSaving] = useState(false);
   const [approvalError, setApprovalError] = useState('');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -251,6 +252,11 @@ export const AgentComposer = forwardRef<AgentComposerHandle, AgentComposerProps>
                 }}>
                 <option value="ask">逐次审批</option><option value="auto">免审批</option>
               </select>}
+              {session?.mode === 'work' && session.backend !== 'claude-code' && <label title="启用本机 ~/.pi 与 .agents 下的插件、skill、MCP；关闭时仅使用应用内插件" className="flex items-center gap-1 text-xs text-ink-soft">
+                <input type="checkbox" aria-label="本机插件" checked={session.localResources ?? false} disabled={running || sending || localSaving}
+                  onChange={(event) => { setApprovalError(''); setLocalSaving(true);
+                    void setSessionLocalResources(session.id, event.target.checked).then(() => onModelChanged()).catch((error) => setApprovalError(error instanceof Error ? error.message : '本机插件切换失败')).finally(() => setLocalSaving(false)); }} />本机插件
+              </label>}
             </div>
           <div className="flex flex-wrap items-center gap-1.5 shrink-0">
             {running ? (

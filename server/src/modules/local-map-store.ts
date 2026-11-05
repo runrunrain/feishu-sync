@@ -138,6 +138,7 @@ export class LocalMapStore {
     const sessionCols = this.db.prepare('PRAGMA table_info(agent_sessions)').all() as Array<{ name: string }>;
     if (sessionCols.length && !sessionCols.some((c) => c.name === 'model_config_json')) this.db.exec('ALTER TABLE agent_sessions ADD COLUMN model_config_json TEXT');
     if (sessionCols.length && !sessionCols.some((c) => c.name === 'runtime_backend')) this.db.exec("ALTER TABLE agent_sessions ADD COLUMN runtime_backend TEXT NOT NULL DEFAULT 'pi'");
+    if (sessionCols.length && !sessionCols.some((c) => c.name === 'local_resources')) this.db.exec('ALTER TABLE agent_sessions ADD COLUMN local_resources INTEGER NOT NULL DEFAULT 0');
     // S4（设计 §4.6）：kb_builds 并行构建新列——PRAGMA 守卫 + SAVEPOINT 外
     // 逐列 ALTER（与 documents 段同模式，但列 DEFAULT 已覆盖旧行）。
     const kbBuildCols = this.db.prepare('PRAGMA table_info(kb_builds)').all() as Array<{ name: string }>;
@@ -2937,6 +2938,7 @@ export class LocalMapStore {
     workspaceId: string | null;
     piSessionFile: string | null;
     modelConfig: string | null;
+    localResources: boolean;
     lastErrorCode: string | null;
     lastErrorMessage: string | null;
     updatedAt: string;
@@ -2946,7 +2948,7 @@ export class LocalMapStore {
     if (!current) throw new Error(`agent_session 不存在: ${id}`);
     this.db.prepare(`
       UPDATE agent_sessions SET title=?, mode=?, workspace_id=?, pi_session_file=?,
-        last_error_code=?, last_error_message=?, updated_at=?, deleted_at=?, model_config_json=?
+        last_error_code=?, last_error_message=?, updated_at=?, deleted_at=?, model_config_json=?, local_resources=?
       WHERE id=?
     `).run(
       patch.title ?? current.title,
@@ -2958,6 +2960,7 @@ export class LocalMapStore {
       patch.updatedAt ?? new Date().toISOString(),
       patch.deletedAt !== undefined ? patch.deletedAt : current.deleted_at,
       patch.modelConfig !== undefined ? patch.modelConfig : current.model_config_json,
+      patch.localResources !== undefined ? Number(patch.localResources) : current.local_resources,
       id,
     );
   }
@@ -3969,6 +3972,7 @@ export class LocalMapStore {
         pi_session_file TEXT,
         model_config_json TEXT,
         runtime_backend TEXT NOT NULL DEFAULT 'pi',
+        local_resources INTEGER NOT NULL DEFAULT 0,
         last_error_code TEXT,
         last_error_message TEXT,
         created_at TEXT NOT NULL,

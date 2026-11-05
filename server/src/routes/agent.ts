@@ -268,6 +268,14 @@ export async function agentRoutes(deps: AgentRouteDeps): Promise<Hono> {
     } catch (error) { return errorResponse(c, error); }
   });
 
+  routes.put('/api/agent/sessions/:id/local-resources', async (c) => {
+    try {
+      const body = await c.req.json().catch(() => null) as { enabled?: unknown } | null;
+      if (typeof body?.enabled !== 'boolean') throw new ToolError('invalid_request', 'enabled 必须为布尔值');
+      return c.json(sessionService.setLocalResources(localMapStore, c.req.param('id'), body.enabled));
+    } catch (error) { return errorResponse(c, error); }
+  });
+
   routes.delete('/api/agent/sessions/:id', async (c) => {
     try {
       const ok = await sessionService.delete(localMapStore, c.req.param('id'));

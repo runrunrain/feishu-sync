@@ -76,6 +76,8 @@ export interface RpcSpawnOptions {
   allowExternalPluginTools?: boolean;
   /** Interactive Work sessions use Pi's native tools and resource discovery. */
   nativeWork?: boolean;
+  localResources?: boolean;
+  additionalBuiltinExtensions?: string[];
   additionalSkillPaths?: string[];
   additionalPromptPaths?: string[];
   additionalThemePaths?: string[];
@@ -204,10 +206,11 @@ export class PiRpcProcess extends EventEmitter {
     if (this.options.nativeWork && this.options.buildMode) {
       throw new PiRpcError('invalid_runtime_mode', '原生 Work 与构建模式不能同时启用');
     }
-    if (this.options.nativeWork) {
-      // Workspace is cwd, not a filesystem boundary. Trust project resources
-      // just as an explicitly approved local Pi session does.
+    if (this.options.nativeWork && this.options.localResources) {
       args.push('--approve');
+    } else if (this.options.nativeWork) {
+      args.push('--no-extensions', '--no-skills', '--no-prompt-templates', '--no-themes', '--no-approve');
+      for (const builtin of this.options.additionalBuiltinExtensions ?? []) args.push('-e', builtin);
     } else args.push(
       '--no-extensions',
       '--no-skills',
@@ -876,6 +879,7 @@ export function buildPiProcessEnv(input: {
   apiKey?: string;
   preserveUploadedImages?: boolean;
   nativeWork?: boolean;
+  nativeWorkAgentDir?: string;
 }): NodeJS.ProcessEnv {
   const dangerous = new Set([
     'NODE_OPTIONS',
@@ -915,7 +919,7 @@ export function buildPiProcessEnv(input: {
   if (input.mode === 'pi-agent-dir') {
     env.FEISHU_SYNC_AGENT_SHARED_PI_HOME = path.resolve(input.parentEnv.PI_CODING_AGENT_DIR || path.join(os.homedir(), '.pi', 'agent'));
   }
-  env.PI_CODING_AGENT_DIR = path.join(input.dataRoot, 'agent', 'pi-home');
+  env.PI_CODING_AGENT_DIR = input.nativeWork && input.nativeWorkAgentDir ? input.nativeWorkAgentDir : path.join(input.dataRoot, 'agent', 'pi-home');
   fs.mkdirSync(env.PI_CODING_AGENT_DIR, { recursive: true, mode: 0o700 });
   // Uploaded images are already bounded by the application. Some Pi builds
   // silently replace valid prompt images when their optional resize backend
@@ -934,9 +938,13 @@ export function buildPiProcessEnv(input: {
     }
   }
   if (input.nativeWork) {
-    delete env.PI_OFFLINE;
+    // A desktop session is not a child task of the process that launched the app.
+    // Inheriting these dispatch markers makes amagi enforce the parent's model.
+    delete env.AMAGI_SUBAGENT; delete env.AMAGI_DISPATCH_MODEL;
     env.FEISHU_SYNC_AGENT_WORK_MODE = 'native';
-  } else env.PI_OFFLINE = '1';
+  }
+  if (input.nativeWork && input.nativeWorkAgentDir) delete env.PI_OFFLINE;
+  else env.PI_OFFLINE = '1';
   env.PI_SKIP_VERSION_CHECK = '1';
   env.PI_TELEMETRY = '0';
   env.FEISHU_SYNC_AGENT_URL = input.agentUrl;

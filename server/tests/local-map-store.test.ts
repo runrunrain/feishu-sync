@@ -43,6 +43,27 @@ function makeDocument(overrides: Partial<DocumentRecord> = {}): DocumentRecord {
 }
 
 describe('LocalMapStore runtime schema', () => {
+  it('migrates old agent sessions with local resources disabled and persists changes', () => {
+    const dbPath = createDatabasePath();
+    const initial = new LocalMapStore(dbPath);
+    initial.initialize();
+    initial.createAgentSession({ id: 'old', title: '旧会话', mode: 'work', workspaceId: null, createdAt: '2026-01-01', updatedAt: '2026-01-01' });
+    initial.close();
+    const legacy = new Database(dbPath);
+    legacy.exec('ALTER TABLE agent_sessions DROP COLUMN local_resources');
+    legacy.close();
+    const store = new LocalMapStore(dbPath);
+    store.initialize();
+    store.initialize();
+    expect(store.getAgentSession('old')?.local_resources).toBe(0);
+    store.updateAgentSession('old', { localResources: true });
+    store.updateAgentSession('old', { title: '修改标题' });
+    expect(store.getAgentSession('old')).toMatchObject({ local_resources: 1, title: '修改标题' });
+    store.updateAgentSession('old', { localResources: false });
+    expect(store.getAgentSession('old')?.local_resources).toBe(0);
+    store.close();
+  });
+
   it('restores a Git-imported version and keeps a newer cloud edit pending', () => {
     const store = new LocalMapStore(createDatabasePath());
     store.initialize();

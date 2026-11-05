@@ -1691,6 +1691,9 @@ export interface AgentModelOption {
 export function setSessionApprovalMode(id: string, mode: 'ask' | 'auto'): Promise<AgentSessionDto> {
   return request(`/api/agent/sessions/${encodeURIComponent(id)}/approval-mode`, { method: 'PUT', body: JSON.stringify({ mode }) });
 }
+export function setSessionLocalResources(id: string, enabled: boolean): Promise<AgentSessionDto> {
+  return request(`/api/agent/sessions/${encodeURIComponent(id)}/local-resources`, { method: 'PUT', body: JSON.stringify({ enabled }) });
+}
 export function listConversationModels(source: 'app-llm' | 'pi-agent-dir', refresh = false, backend?: 'pi' | 'claude-code'): Promise<{ items: AgentModelOption[]; message: string }> {
   return request(`/api/agent/models?source=${source}${refresh ? '&refresh=1' : ''}${backend ? `&backend=${backend}` : ''}`);
 }

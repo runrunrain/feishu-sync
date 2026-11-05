@@ -27,6 +27,20 @@ async function fixture() {
   const patch = (model: unknown, id = session.id) => app.fetch(new Request(`http://x/api/agent/sessions/${id}/model`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model }) }));
   return { app, manager, store, service, session, other, patch };
 }
+it('local resources route accepts only idle Pi work sessions and persists the choice', async () => {
+  const f = await fixture();
+  const put = (id: string, enabled: unknown) => f.app.fetch(new Request(`http://x/api/agent/sessions/${id}/local-resources`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }) }));
+  expect((await put(f.session.id, true)).status).toBe(400);
+  f.store.updateAgentSession(f.session.id, { mode: 'work' });
+  expect((await put(f.session.id, 'true')).status).toBe(400);
+  const result = await put(f.session.id, true); expect(result.status).toBe(200); expect((await result.json()).localResources).toBe(true);
+  expect(f.store.getAgentSession(f.session.id)?.local_resources).toBe(1);
+  const claude = f.service.create(f.store, { backend: 'claude-code' }); f.store.updateAgentSession(claude.id, { mode: 'work' });
+  expect((await put(claude.id, true)).status).toBe(400);
+  vi.spyOn(f.service, 'isRunning').mockReturnValue(true);
+  expect((await put(f.session.id, false)).status).toBe(409);
+  expect(f.store.getAgentSession(f.session.id)?.local_resources).toBe(1);
+});
 it('catalog exposes only usable presets; model/effort persists per session without changing global config or another session', async () => {
   const f = await fixture(); const before = fs.readFileSync((f.manager as unknown as { configPath: string }).configPath, 'utf8');
   const catalog = await f.app.fetch(new Request('http://x/api/agent/models')); const data = await catalog.json();

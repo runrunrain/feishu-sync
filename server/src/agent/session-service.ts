@@ -84,6 +84,7 @@ export interface SessionStoreApi {
     workspaceId: string | null;
     piSessionFile: string | null;
     modelConfig: string | null;
+    localResources: boolean;
     lastErrorCode: string | null;
     lastErrorMessage: string | null;
     updatedAt: string;
@@ -147,6 +148,7 @@ export class SessionService extends EventEmitter {
     return {
       id: sessionId,
       approvalMode: this.approvalModes.get(sessionId) ?? 'ask',
+      localResources: row.local_resources === 1,
       backend: row.runtime_backend === 'claude-code' ? 'claude-code' : 'pi',
       model: this.readSessionModel(row),
       title: String(row.title),
@@ -252,6 +254,16 @@ export class SessionService extends EventEmitter {
     if (row.mode !== 'work') throw new ToolError('invalid_request', '只有 Work 会话可设置审批方式');
     if (this.isRunning(id) || this.deps.pool.isBusy(id)) throw new ToolError('session_busy', '请在运行结束后切换审批方式', 409);
     if (mode === 'auto') this.approvalModes.set(id, mode); else this.approvalModes.delete(id);
+    this.emitSessionState(id, store);
+    return this.get(store, this.currentConfig(), id)!;
+  }
+
+  setLocalResources(store: SessionStoreApi, id: string, enabled: boolean): AgentSessionDto {
+    const row = store.getAgentSession(id);
+    if (!row) throw new ToolError('session_not_found', '会话不存在', 404);
+    if (row.mode !== 'work' || row.runtime_backend === 'claude-code') throw new ToolError('invalid_request', '仅 Pi Work 会话可设置本机资源');
+    if (this.isRunning(id) || this.deps.pool.isBusy(id)) throw new ToolError('session_busy', '请在运行结束后切换本机资源', 409);
+    store.updateAgentSession(id, { localResources: enabled });
     this.emitSessionState(id, store);
     return this.get(store, this.currentConfig(), id)!;
   }
@@ -462,9 +474,16 @@ export class SessionService extends EventEmitter {
     this.emitSessionState(sessionId, localMapStore);
 
     try {
-      const pluginSnapshot = this.deps.pluginStore?.snapshot(mode, { includeNative: config.agent.runtime.backend !== 'claude-code', nativeWork: mode === 'work' && config.agent.runtime.backend !== 'claude-code' });
+      const nativeWork = mode === 'work' && config.agent.runtime.backend !== 'claude-code';
+      const localResources = nativeWork && row.local_resources === 1;
+      const pluginSnapshot = this.deps.pluginStore?.snapshot(mode, { includeNative: config.agent.runtime.backend !== 'claude-code', nativeWork, localResources });
+      const workResources = nativeWork ? this.deps.pluginStore?.workResources?.() : undefined;
+      const localAgentDir = path.resolve(globalThis.process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), '.pi', 'agent'));
+      const nativeCwd = workspace?.path ?? os.homedir();
+      const workRevision = nativeWork ? (localResources ? await workResources?.localWorkRevision?.(localAgentDir, nativeCwd) : workResources?.nativeWorkPackages?.().revision) : undefined;
+      const pluginRevision = nativeWork ? crypto.createHash('sha256').update(JSON.stringify([pluginSnapshot?.revision, localResources, workRevision])).digest('hex') : pluginSnapshot?.revision;
       let process = this.deps.pool.get(sessionId);
-      if (process && ((pluginSnapshot && this.pluginRevisions.get(process) !== pluginSnapshot.revision)
+      if (process && ((pluginRevision && this.pluginRevisions.get(process) !== pluginRevision)
         || this.modelRevisions.get(process) !== modelRevision(config))) {
         await this.deps.pool.terminate(sessionId);
         this.deps.toolService.revokeBySession(sessionId);
@@ -472,7 +491,7 @@ export class SessionService extends EventEmitter {
       }
       if (!process) {
         await this.deps.waitForInternalApi?.();
-        process = await this.spawnSessionProcess(sessionId, mode, mode === 'work' ? workspace?.path : undefined, pluginSnapshot, config);
+        process = await this.spawnSessionProcess(sessionId, mode, mode === 'work' ? workspace?.path : undefined, pluginSnapshot, config, { localResources, localAgentDir, workRevision, pluginRevision, workResources });
       }
       // F3-R06：运行期间挂起 idle 回收；结束（成功/失败/异常）后重起完整
       // idle 窗口——复用进程若已空闲 9 分钟，一次新 prompt 也必须获得全窗口。
@@ -651,6 +670,7 @@ export class SessionService extends EventEmitter {
     workspaceRoot: string | undefined,
     pluginSnapshot?: AppPluginSnapshot,
     runConfig?: Config,
+    nativeOptions?: { localResources: boolean; localAgentDir: string; workRevision?: string; pluginRevision?: string; workResources?: ReturnType<AppPluginStore['workResources']> },
   ): Promise<PiRpcProcess> {
     const config = runConfig ?? this.currentConfig()!;
     const revision = modelRevision(config);
@@ -674,6 +694,12 @@ export class SessionService extends EventEmitter {
         throw new ToolError('workspace_path_forbidden', `Workspace 已与新配置冲突，请重新授权：${verdict.message}`, 403);
       }
     }
+    const workPackages = nativeWork ? nativeOptions?.workResources?.nativeWorkPackages?.() : undefined;
+    const overlay = nativeWork && nativeOptions?.localResources ? await nativeOptions.workResources?.prepareLocalWorkHome?.(nativeOptions.localAgentDir, cwd) : undefined;
+    const builtins = nativeWork && !nativeOptions?.localResources ? await nativeOptions?.workResources?.enabledWorkBuiltins?.() : undefined;
+    if (nativeWork && nativeOptions?.localResources && !overlay) throw new ToolError('agent_not_ready', '本机 Pi 资源尚未就绪', 503);
+    // 稳定快照的最终比较到下方 Pi rpc.start() 之间不可加入 await；Claude 分支互斥。
+    if (nativeWork && nativeOptions?.localResources && nativeOptions.workRevision !== await nativeOptions.workResources?.localWorkRevision?.(nativeOptions.localAgentDir, cwd)) throw new ToolError('plugin_busy', '本机 Pi 配置发生变化，请重试', 409);
     // F3-R05：容量先预留后 spawn——预留失败不 spawn（池满不少占、不留
     // 无主进程）；token 与进程同生命周期，任何退出路径都回收令牌。
     const slot = this.deps.pool.reserveSlot();
@@ -728,7 +754,7 @@ export class SessionService extends EventEmitter {
       try {
         await rpc.start(); this.deps.pool.register(sessionId, rpc, 'session', slot);
         this.modelRevisions.set(rpc, revision);
-        if (pluginSnapshot) this.pluginRevisions.set(rpc, pluginSnapshot.revision);
+        if (nativeOptions?.pluginRevision) this.pluginRevisions.set(rpc, nativeOptions.pluginRevision);
       } catch (error) { slot.release(); await rpc.terminate().catch(() => undefined); this.deps.toolService.revokeToken(token); throw error; }
       return rpc;
     }
@@ -767,6 +793,7 @@ export class SessionService extends EventEmitter {
       apiKey,
       preserveUploadedImages: true,
       nativeWork,
+      ...(overlay ? { nativeWorkAgentDir: overlay } : {}),
     });
     if (providerJson) {
       env.FEISHU_SYNC_AGENT_PROVIDER_JSON = providerJson;
@@ -786,6 +813,14 @@ export class SessionService extends EventEmitter {
       // and cwd. Loading the same package again by -e causes duplicate tools.
       ...(pluginSnapshot && !nativeWork ? { additionalExtensionPaths: pluginSnapshot.extensionPaths ?? [pluginSnapshot.extensionPath], allowExternalPluginTools: pluginSnapshot.externalPlugins, additionalSkillPaths: pluginSnapshot.skillPaths, additionalPromptPaths: pluginSnapshot.promptPaths, additionalThemePaths: pluginSnapshot.themePaths } : {}),
       nativeWork,
+      localResources: nativeOptions?.localResources,
+      additionalBuiltinExtensions: builtins,
+      ...(nativeWork && !nativeOptions?.localResources && workPackages ? {
+        additionalExtensionPaths: workPackages.packages.flatMap((pkg) => pkg.extensions),
+        additionalSkillPaths: workPackages.packages.flatMap((pkg) => pkg.skills),
+        additionalPromptPaths: workPackages.packages.flatMap((pkg) => pkg.prompts),
+        additionalThemePaths: workPackages.packages.flatMap((pkg) => pkg.themes),
+      } : {}),
       selfTriggeredRounds: nativeWork,
       tools: orchestrationOn
         ? [...toolsForRunKind(runKind), ...taskFace!.names]
@@ -809,7 +844,7 @@ export class SessionService extends EventEmitter {
       if (!nativeWork) await rpc.sendCommand('set_auto_retry', { enabled: false }).catch(() => undefined);
       this.deps.pool.register(sessionId, rpc, 'session', slot);
       this.modelRevisions.set(rpc, revision);
-      if (pluginSnapshot) this.pluginRevisions.set(rpc, pluginSnapshot.revision);
+      if (nativeOptions?.pluginRevision) this.pluginRevisions.set(rpc, nativeOptions.pluginRevision);
     } catch (error) {
       // start/register 任一步失败：释放预留 + 终结半启动进程 + 回收令牌，
       // 不留无主 OS 子进程。

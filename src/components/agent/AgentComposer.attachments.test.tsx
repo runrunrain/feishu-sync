@@ -3,7 +3,7 @@ import { act, createRef } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type { AgentAttachmentDto, AgentSessionDto } from '../../types/agent';
-const api = vi.hoisted(() => ({ uploadAgentAttachment: vi.fn(), removeAgentAttachment: vi.fn(), setSessionApprovalMode: vi.fn() }));
+const api = vi.hoisted(() => ({ uploadAgentAttachment: vi.fn(), removeAgentAttachment: vi.fn(), setSessionApprovalMode: vi.fn(), setSessionLocalResources: vi.fn() }));
 vi.mock('../../api/client', () => api);
 vi.mock('./ConversationModelPicker', () => ({ ConversationModelPicker: () => null }));
 import { AgentComposer, type AgentComposerHandle } from './AgentComposer';
@@ -38,6 +38,20 @@ beforeEach(() => {
   Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: vi.fn() });
 });
 afterEach(() => { act(() => root.unmount()); host.remove(); });
+
+it('本机插件仅显示在 Pi Work，会话运行时禁用并在切换失败时显示错误', async () => {
+  const changed = vi.fn();
+  const renderWork = (backend: 'pi' | 'claude-code', busy = false) => root.render(<AgentComposer session={{ ...session('s-one'), mode: 'work', backend }} agentStatus={{ code: 'ready' } as never} agentUnreachable={false} readiness={null} busy={busy} sending={false} onSend={send} onStop={() => {}} onRecheck={() => {}} rechecking={false} onModelChanged={changed} />);
+  api.setSessionLocalResources.mockReset().mockResolvedValueOnce({}).mockRejectedValueOnce(new Error('切换失败'));
+  await act(async () => renderWork('pi'));
+  await act(async () => host.querySelector<HTMLInputElement>('[aria-label="本机插件"]')!.click());
+  expect(api.setSessionLocalResources).toHaveBeenCalledWith('s-one', true); expect(changed).toHaveBeenCalledOnce();
+  await act(async () => host.querySelector<HTMLInputElement>('[aria-label="本机插件"]')!.click());
+  expect(host.querySelector('[role="alert"]')?.textContent).toContain('切换失败');
+  await act(async () => renderWork('pi', true)); expect(host.querySelector<HTMLInputElement>('[aria-label="本机插件"]')?.disabled).toBe(true);
+  await act(async () => renderWork('claude-code')); expect(host.querySelector('[aria-label="本机插件"]')).toBeNull();
+  await act(async () => render()); expect(host.querySelector('[aria-label="本机插件"]')).toBeNull();
+});
 
 it('plus opens the picker; uploads block send, attachment-only messages work, and failed sends retain the draft', async () => {
   let resolveUpload!: (value: AgentAttachmentDto) => void;

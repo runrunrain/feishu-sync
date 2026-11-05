@@ -9,6 +9,8 @@ import type { AgentContextPlugin, AgentPluginsDto, AgentPluginInput, AgentPlugin
 
 type Registry = { schemaVersion: 1; overrides: Record<string, AgentPluginInput>; custom: AgentContextPlugin[] };
 export interface AppPluginSnapshot { revision: string; path: string; extensionPath: string; extensionPaths?: string[]; externalPlugins?: boolean; skillPaths?: string[]; promptPaths?: string[]; themePaths?: string[] }
+type WorkPackages = { revision: string; packages: Array<{ packageName: string; extensions: string[]; skills: string[]; prompts: string[]; themes: string[] }> };
+type NativeResources = { sources: string[]; revision: string; external: boolean; skills?: string[]; prompts?: string[]; themes?: string[]; nativeWorkPackages?: () => WorkPackages; localWorkRevision?: (dir: string, cwd?: string) => string | Promise<string>; prepareLocalWorkHome?: (dir: string, cwd?: string) => Promise<string>; enabledWorkBuiltins?: () => Promise<string[]> };
 const SCOPES = new Set(['discuss', 'work', 'build']);
 const REGISTRY = 'agent/plugins/registry.json';
 const MAX_CONTENT = 64 * 1024;
@@ -16,7 +18,9 @@ const NATIVE_WORK_CONTEXT = '你是 Pi 通用工作助手。使用 Pi 原生文�
 const SCOPED_WORK_CONTEXT = '你是本地知识工作助手。使用应用工具读写绑定的 Workspace，以工具实际结果确认完成。';
 
 export class AppPluginStore {
-  constructor(readonly dataRoot: string, private assets = readAgentPromptAssets, private nativeResources?: () => { sources: string[]; revision: string; external: boolean; skills?: string[]; prompts?: string[]; themes?: string[] }) {}
+  constructor(readonly dataRoot: string, private assets = readAgentPromptAssets, private nativeResources?: () => NativeResources) {}
+
+  workResources(): NativeResources | undefined { return this.nativeResources?.(); }
 
   private defaults(): AgentContextPlugin[] {
     const assets = this.assets();
@@ -175,13 +179,14 @@ export class AppPluginStore {
     };
   }
 
-  snapshot(scope: AgentPluginScope, options: { includeNative?: boolean; nativeWork?: boolean } = {}): AppPluginSnapshot {
+  snapshot(scope: AgentPluginScope, options: { includeNative?: boolean; nativeWork?: boolean; localResources?: boolean } = {}): AppPluginSnapshot {
     const extensionPath = piContextExtensionPath();
     if (!extensionPath) throw new ToolError('plugin_assets_missing', 'Pi上下文扩展缺失，请重新构建应用', 503);
     const { plugins } = this.list();
     const native = options.includeNative === false ? undefined : this.nativeResources?.();
     const selected = plugins.filter((p) => p.enabled && p.scopes.includes(scope) && !(options.nativeWork && p.id === 'orchestration'))
-      .map((p) => !options.nativeWork && p.id === 'work-context' && p.content === NATIVE_WORK_CONTEXT ? { ...p, content: SCOPED_WORK_CONTEXT } : p);
+      .map((p) => p.id === 'work-context' && p.content === NATIVE_WORK_CONTEXT
+        ? { ...p, content: !options.nativeWork ? SCOPED_WORK_CONTEXT : `${p.content} ${options.localResources ? '本机插件资源已启用。' : '本机插件资源未启用；仅加载应用插件。'}` } : p);
     const content = JSON.stringify({ schemaVersion: 1, scope, nativeRevision: native?.revision, plugins: selected });
     const revision = crypto.createHash('sha256').update(content).digest('hex');
     resolveInside(this.dataRoot, 'agent/plugins/snapshots', 'mkdir');

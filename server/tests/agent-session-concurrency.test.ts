@@ -17,6 +17,7 @@ import { modelRevision } from '../src/agent/model-revision.js';
 
 import { describe, expect, it, afterAll, vi } from 'vitest';
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
@@ -85,6 +86,7 @@ function makeStore(): SessionStoreApi {
       const mapped: Record<string, unknown> = {};
       if ('title' in patch) mapped.title = patch.title;
       if ('mode' in patch) mapped.mode = patch.mode;
+      if ('localResources' in patch) mapped.local_resources = patch.localResources ? 1 : 0;
       if ('workspaceId' in patch) mapped.workspace_id = patch.workspaceId;
       if ('piSessionFile' in patch) mapped.pi_session_file = patch.piSessionFile;
       if ('lastErrorCode' in patch) mapped.last_error_code = patch.lastErrorCode;
@@ -152,6 +154,10 @@ function makeService(options: { maxConcurrentProcesses?: number; idleTimeoutMinu
   const register = pool.register.bind(pool);
   vi.spyOn(pool, 'register').mockImplementation((...args) => {
     (service as unknown as { modelRevisions: WeakMap<PiRpcProcess, string> }).modelRevisions.set(args[1], modelRevision(config));
+    if (store.getAgentSession(args[0])?.mode === 'work') {
+      const revision = crypto.createHash('sha256').update(JSON.stringify([undefined, false, undefined])).digest('hex');
+      (service as unknown as { pluginRevisions: WeakMap<PiRpcProcess, string> }).pluginRevisions.set(args[1], revision);
+    }
     return register(...args);
   });
   return { service, store, pool, config };
@@ -313,6 +319,21 @@ describe('R04：steer/followUp 投递同一活跃 RPC 运行', () => {
 });
 
 describe('原生 Work 后台续跑', () => {
+  it('会话开关变更后不能复用旧 Pi 进程', async () => {
+    const { service, store, pool } = makeService(); createSession(store, 'toggle');
+    store.updateAgentSession('toggle', { mode: 'work' });
+    const first = new FakeRpcProcess(); pool.register('toggle', first as unknown as PiRpcProcess, 'session');
+    await service.sendMessage(store, 'toggle', { text: 'first' }); await flush();
+    first.resolvePrompt({ outcome: 'completed' }); await flush();
+    service.setLocalResources(store, 'toggle', true);
+    const second = new FakeRpcProcess();
+    const spawn = vi.spyOn(service as any, 'spawnSessionProcess').mockImplementation(async () => {
+      pool.register('toggle', second as unknown as PiRpcProcess, 'session'); return second;
+    });
+    await service.sendMessage(store, 'toggle', { text: 'second' }); await flush();
+    expect(first.terminated).toBe(true); expect(spawn).toHaveBeenCalledOnce(); expect(second.prompts).toEqual(['second']);
+    second.resolvePrompt({ outcome: 'completed' }); await flush(); await pool.closeAll();
+  });
   it('插件续跑先于原 prompt 收尾时保留新轮次、转发工具并正常结束', async () => {
     const { service, store, pool } = makeService();
     createSession(store, 'native');
