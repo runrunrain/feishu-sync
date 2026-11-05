@@ -20,15 +20,23 @@ const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 /** Only exact inherited runtime-home labels identify roots. Arbitrary mentions
  * of a path in a shell command, another app, or this scanner do not identify it. */
-export function parseScopedProcesses(raw: string, homes: readonly string[], uid: number): ScopedProcess[] | null {
+export function parseScopedProcesses(raw: string, homes: readonly string[], uid: number,
+  workingDirectories: ReadonlyMap<number, string> = new Map()): ScopedProcess[] | null {
   const rows = raw.split('\n').filter(line => line.trim()).map(line => {
     const m = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(.*)$/);
     return m ? { pid: Number(m[1]), ppid: Number(m[2]), uid: Number(m[3]), command: m[4] } : null;
   });
   if (!rows.length || rows.some(row => row === null)) return null;
   const labels = homes.map(home => new RegExp(`(?:^|\\s)PI_CODING_AGENT_DIR=${escape(home)}(?=\\s|$)`));
+  const scopes = homes.map(home => {
+    try { return path.dirname(fs.realpathSync.native(home)); } catch { return path.dirname(path.resolve(home)); }
+  });
+  const inScope = (pid: number) => {
+    const cwd = workingDirectories.get(pid);
+    return cwd && scopes.some(scope => cwd === scope || cwd.startsWith(scope + path.sep));
+  };
   const ours = new Set(rows.filter(row => row!.uid === uid && row!.pid !== process.pid
-    && labels.some(label => label.test(row!.command))).map(row => row!.pid));
+    && (inScope(row!.pid) || labels.some(label => label.test(row!.command)))).map(row => row!.pid));
   let changed = true;
   while (changed) {
     changed = false;
@@ -46,8 +54,40 @@ export async function scanScopedProcesses(homes: readonly string[]): Promise<Sco
     execFile('ps', ['eww', '-axo', 'pid=,ppid=,uid=,command='],
       { encoding: 'utf8', timeout: 8_000, maxBuffer: 64 * 1024 * 1024 }, (error, stdout) => resolve(error ? null : stdout));
   });
+  if (raw === null) return null;
+  const uid = process.getuid?.() ?? -1;
+  const candidates = raw.split('\n').map(line => line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(.*)$/))
+    .filter((match): match is RegExpMatchArray => !!match && Number(match[3]) === uid);
+  const cwds = new Map<number, string>();
+  if (process.platform === 'darwin') {
+    // Pi overwrites process.title, and macOS then hides both argv and env from
+    // ps. Inspect kernel cwd records too; an empty ps label search is not proof.
+    const listing = await new Promise<string | null>(resolve => {
+      execFile('/usr/sbin/lsof', ['-w', '-a', '-u', String(uid), '-d', 'cwd', '-Fpn'],
+        { encoding: 'utf8', timeout: 8_000, maxBuffer: 16 * 1024 * 1024 },
+        (error, stdout) => resolve(error && !stdout ? null : stdout));
+    });
+    if (listing === null) return null;
+    let pid = 0;
+    for (const line of listing.split('\n')) {
+      if (/^p\d+$/.test(line)) pid = Number(line.slice(1));
+      else if (line.startsWith('n/') && pid > 1) cwds.set(pid, line.slice(1));
+    }
+  } else {
+    for (const match of candidates) {
+      try { cwds.set(Number(match[1]), fs.readlinkSync(`/proc/${match[1]}/cwd`)); } catch { /* exited or inaccessible; checked below */ }
+    }
+  }
+  const opaqueRuntimes = candidates.filter(match => /^(?:\S*\/)?(?:pi|node|nodejs|bun)(?:\s|$)/.test(match[4]));
+  for (const match of opaqueRuntimes) {
+    const pid = Number(match[1]);
+    if (pid === process.pid || cwds.has(pid)) continue;
+    try { process.kill(pid, 0); return null; } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') return null;
+    }
+  }
   // Never log or persist raw process environments (they may contain credentials).
-  return raw === null ? null : parseScopedProcesses(raw, homes, process.getuid?.() ?? -1);
+  return parseScopedProcesses(raw, homes, uid, cwds);
 }
 
 function recoverable(finding: ChildProcessFinding, homes: readonly string[]): boolean {

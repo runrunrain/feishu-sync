@@ -1392,6 +1392,7 @@ export class KbBuildService extends EventEmitter {
       '',
       `构建 ${input.buildId} 从检查点恢复（第 ${generation} 代）。已接受成果与未解决问题以应用账本为准：先用 build_checkpoint(action=status) 查看成果状态，再组织剩余工作。旧式整库范围审查凭据已作废；现有草稿若尚无有效单篇审查回执，须安排独立审查，不必重写正文。每篇审查通过后应用会自动阶段发布，其他任务继续；全部完成后再申请最终发布当前精确候选版本。不要重写已接受且未受影响的草稿。`,
       '恢复时同时看 build_manifest.identityGaps 与 lastPublicationReport。承接文档的图片证据由应用从不可变正式版本读取并验证，不需要为此重写承接文档。旧的应用侧发布错误须结合当前门禁结果复核，确认解决后更新问题清单；剩余身份去向须核对正文和共同来源后登记迁移。不要把已解决的旧故障永久保留为阻断，也不要重复提交未变化的失败候选。',
+      'documentWorkStatus.pendingIndependentReviewPaths 是仍缺当前有效单篇审查的精确列表：旧交接中的 pass 可能已经过期，不能据此跳过。优先并行派发该列表的独立审查，同时处理迁移。经独立核对确认来源不再支持的已移出对象，可以 build_register_migrations(kind=remove, successorObjectIds=[]) 登记具体移除依据；不得为通过门禁删除仍有效的知识，也不虚构后继。',
       '若需重新读取 build_manifest，工作集每页最多 12 个来源；按 nextCursor 逐页读取，并优先派发已有明确输入的首批任务。',
       ...(skipBriefing ? [skipBriefing] : []),
     ].join('\n');

@@ -117,6 +117,8 @@ import {
   REVIEW_DEP_WORKFLOW_RULES,
   resolveCurrentReviewDependencies,
   scopedReviewDeclarationHash,
+  collectAuthorityValidatedReports,
+  missingScopedPassReviewPaths,
   type ReviewDependencyValues,
 } from '../kb/review-authority.js';
 import { getKbQueryService, QueryError } from '../kb/search/kb-query-service.js';
@@ -4336,6 +4338,8 @@ export class AgentToolService {
     promotedUnchangedPaths: string[];
     unpublishedDraftPaths: string[];
     pendingRequiredRewrites: string[];
+    pendingIndependentReviewPaths: string[];
+    reviewedUnpublishedDraftPaths: string[];
   } {
     const entries = this.stagingDraftEntries(state);
     const manifest = this.storeFor(context.options.outputRoot).readManifest();
@@ -4364,7 +4368,19 @@ export class AgentToolService {
     const unpublishedDraftPaths = entries.filter(({ path: docPath }) => !alreadyFormal.has(docPath)).map(({ path: docPath }) => docPath);
     const pendingRequiredRewrites = unpublishedDraftPaths.filter((docPath) => state.requiredRewrites?.has(docPath)
       && !state.writtenPaths?.has(docPath));
-    return { carriedPublishedPaths, promotedUnchangedPaths, unpublishedDraftPaths, pendingRequiredRewrites };
+    let pendingIndependentReviewPaths = [...unpublishedDraftPaths];
+    if (state.v2 && unpublishedDraftPaths.length > 0) {
+      const documentHashes = new Map(entries.map(entry => [entry.path, entry.contentHash]));
+      const authority = collectAuthorityValidatedReports({ stagingRoot: state.stagingRoot, store: state.v2.actorStore,
+        current: resolveCurrentReviewDependencies({ stagingRoot: state.stagingRoot, snapshot: state.snapshot,
+          workflowRulesHash: state.v2WorkflowRulesHash ?? null }), documentHashes });
+      pendingIndependentReviewPaths = missingScopedPassReviewPaths({ writtenPaths: unpublishedDraftPaths,
+        documentHashes, basePromotionHashes: {}, validReportIds: new Set(authority.validReportIds),
+        receipts: state.v2.actorStore.listReviews() });
+    }
+    const needsReview = new Set(pendingIndependentReviewPaths);
+    return { carriedPublishedPaths, promotedUnchangedPaths, unpublishedDraftPaths, pendingRequiredRewrites,
+      pendingIndependentReviewPaths, reviewedUnpublishedDraftPaths: unpublishedDraftPaths.filter(docPath => !needsReview.has(docPath)) };
   }
 
   // ------------------------------------------------------------------
@@ -4510,7 +4526,7 @@ export class AgentToolService {
       const objectId = requireString(item, 'objectId', 1, 200);
       const reason = requireString(item, 'reason', 4, 500);
       const kind = item.kind;
-      if (kind !== 'merge' && kind !== 'split') throw new ToolError('invalid_request', `migrations[${index}].kind 必须是 merge|split`);
+      if (kind !== 'merge' && kind !== 'split' && kind !== 'remove') throw new ToolError('invalid_request', `migrations[${index}].kind 必须是 merge|split|remove`);
       const successorObjectIds = requireArray(item, 'successorObjectIds');
       if (!successorObjectIds.every((id): id is string => typeof id === 'string' && id.startsWith('ko_'))) {
         throw new ToolError('invalid_request', `migrations[${index}].successorObjectIds 必须是对象 ID 数组`);

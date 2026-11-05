@@ -57,4 +57,15 @@ describe('object migration reconciliation', () => {
     expect(validateObjectMigrationRegistration({ previous, draft, existing: [], proposed: [migration], previousDocSources }))
       .toContain('ko_old: 后继 ko_new 与旧对象缺少共同来源证据');
   });
+
+  it('records source-backed semantic removal without inventing a successor, while rejecting dangling references', () => {
+    const { previous, draft } = fixture();
+    const removal = { objectId: 'ko_old', kind: 'remove' as const, successorObjectIds: [],
+      reason: '独立核对 source-1 当前版本后确认原规则已撤销，草稿与引用已移除' };
+    expect(validateObjectMigrationRegistration({ previous, draft, existing: [], proposed: [removal] })).toEqual([]);
+    expect(validateObjectMigrationRegistration({ previous, draft, existing: [], proposed: [{ ...removal, successorObjectIds: ['ko_new'] }] }))
+      .toContain('ko_old: merge 必须一个后继，split 至少两个后继，remove 后继必须为空');
+    expect(validateObjectMigrationRegistration({ previous, draft: { ...draft, relations: [{ fromObjectId: 'ko_old', toObjectId: 'ko_new' }] } as KnowledgeDraftFile,
+      existing: [], proposed: [removal] })).toContain('ko_old: 草稿仍有引用，先由写作任务处理引用与覆盖归属');
+  });
 });

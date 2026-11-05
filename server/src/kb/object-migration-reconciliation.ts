@@ -108,8 +108,9 @@ export function validateObjectMigrationRegistration(input: {
     if (!previousById.has(objectId) || currentById.has(objectId)) errors.push(`${objectId}: 必须是上一正式版存在、当前草稿已移出的对象`);
     if (existing.has(objectId)) errors.push(`${objectId}: 已登记迁移，禁止覆盖旧去向`);
     if (!reason.trim() || reason.trim().length < 4) errors.push(`${objectId}: 需要具体迁移原因`);
-    if (kind === 'merge' ? successorObjectIds.length !== 1 : kind === 'split' ? successorObjectIds.length < 2 : true) {
-      errors.push(`${objectId}: merge 必须一个后继，split 至少两个后继`);
+    if (kind === 'merge' ? successorObjectIds.length !== 1 : kind === 'split' ? successorObjectIds.length < 2
+      : kind === 'remove' ? successorObjectIds.length !== 0 : true) {
+      errors.push(`${objectId}: merge 必须一个后继，split 至少两个后继，remove 后继必须为空`);
     }
     if (new Set(successorObjectIds).size !== successorObjectIds.length) errors.push(`${objectId}: 后继重复`);
     for (const successor of successorObjectIds) {

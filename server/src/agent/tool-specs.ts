@@ -1224,7 +1224,7 @@ export const BUILD_CHECKPOINT_SPEC: AgentToolSpec = {
 export const BUILD_REGISTER_MIGRATIONS_SPEC: AgentToolSpec = {
   name: 'build_register_migrations',
   label: '登记对象迁移',
-  description: 'Leader 在改写文档改变知识对象身份时，登记旧对象到已写入后继对象的语义迁移。应用校验旧对象确已消失、后继存在且有共同来源证据，并保存迁移；缺失对象与候选后继由 build_manifest.identityGaps 给出。只需判断语义去向，不重填正文或证据。',
+  description: 'Leader 登记旧对象的合并、拆分或移除。合并/拆分校验后继存在且有共同来源证据；remove 用于当前来源不再支持或明确撤销的旧知识，后继为空，必须说明核对的来源与具体原因。旧对象必须已移出草稿且无悬挂引用。缺口由 build_manifest.identityGaps 给出；不得为通过门禁移除仍有效的知识。',
   parameters: {
     type: 'object',
     properties: {
@@ -1234,8 +1234,8 @@ export const BUILD_REGISTER_MIGRATIONS_SPEC: AgentToolSpec = {
           type: 'object',
           properties: {
             objectId: string('旧 release 中已消失的对象 ID'),
-            kind: { type: 'string', enum: ['merge', 'split'], description: 'merge=并入一个后继；split=拆分到至少两个后继' },
-            successorObjectIds: { type: 'array', minItems: 1, maxItems: 20, items: { type: 'string' } },
+            kind: { type: 'string', enum: ['merge', 'split', 'remove'], description: 'merge=一个后继；split=至少两个后继；remove=来源不再支持，后继为空' },
+            successorObjectIds: { type: 'array', minItems: 0, maxItems: 20, items: { type: 'string' } },
             reason: string('具体语义迁移原因'),
           },
           required: ['objectId', 'kind', 'successorObjectIds', 'reason'],

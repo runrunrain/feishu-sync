@@ -264,7 +264,8 @@ export interface CapabilityReport {
  * F10：子进程/桥残留核对的单个个体结论。
  * verdict 语义：exited=已证明退出（自然退出或 pid 复用排除）；reaped=核对身份
  * 后回收；not-ours=身份不匹配（pid 被无关进程复用，绝不发信号）；
- * unconfirmed=无法证明归属或退出——不杀、不假装已退出，阻断新 Leader。
+ * abandoned=已撤权并自动清理专属进程范围的未完成派发，不声称物理退出或成功；
+ * unconfirmed=系统核验或自动清理尚未收敛，暂不启动新 Leader。
  */
 export interface ChildProcessFinding {
   /** amagi 原生任务 id（anchor 来源；ledger 来源时为 null）。 */

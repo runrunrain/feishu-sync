@@ -2,7 +2,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { parseScopedProcesses, recoverOrphanDispatches } from '../src/agent/build-runtime/automatic-recovery.js';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { parseScopedProcesses, recoverOrphanDispatches, scanScopedProcesses } from '../src/agent/build-runtime/automatic-recovery.js';
 import type { TerminationOutcome } from '../src/agent/build-runtime/contracts.js';
 import { reconcileBuildRootResiduals } from '../src/agent/build-runtime/adapter.js';
 
@@ -32,6 +34,10 @@ describe('application automatic orphan recovery', () => {
     ]);
     expect(parseScopedProcesses('', ['/private/build/home'], 501)).toBeNull();
     expect(parseScopedProcesses('invalid output', ['/private/build/home'], 501)).toBeNull();
+    // macOS pi process.title makes ps omit argv and environment entirely.
+    expect(parseScopedProcesses('21 1 501 pi\n22 1 501 pi', ['/private/build/epochs/e2/home'], 501,
+      new Map([[21, '/private/build/epochs/e2/work'], [22, '/private/build-other/epochs/e2/work']])))
+      .toEqual([{ pid: 21, ppid: 1, uid: 501 }]);
   });
 
   it('revokes old writes and retires missing-anchor records without human attestation or native success/exit mutation', async () => {
@@ -82,4 +88,23 @@ describe('application automatic orphan recovery', () => {
     expect(f.fence).toHaveBeenCalledOnce(); expect(result?.state).toBe('confirmed');
     expect(result?.children.find(child => child.taskId === 'old-dispatch')?.verdict).toBe('abandoned');
   });
+
+  it('detects and reaps an actual renamed Pi process in the private workspace', async ctx => {
+    if (!['darwin', 'linux'].includes(process.platform)) { ctx.skip(); return; }
+    const f = fixture(); const work = path.join(path.dirname(f.home), 'work'); fs.mkdirSync(work);
+    const child = spawn(process.execPath, ['-e', "process.title='pi'; process.send('ready'); setInterval(()=>{},1000)"],
+      { cwd: work, env: { ...process.env, PI_CODING_AGENT_DIR: f.home }, stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
+    const closed = once(child, 'exit');
+    try {
+      await once(child, 'message');
+      expect(await scanScopedProcesses(f.homes)).toEqual(expect.arrayContaining([expect.objectContaining({ pid: child.pid })]));
+      const result = await recoverOrphanDispatches(f);
+      expect(result.state).toBe('confirmed'); expect(f.fence).toHaveBeenCalledOnce();
+      expect((await closed)[1]).toBe('SIGTERM');
+      expect(await scanScopedProcesses(f.homes)).toEqual([]);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      await closed;
+    }
+  }, 15_000);
 });

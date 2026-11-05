@@ -233,7 +233,7 @@ export function BuildRuntimeProgress({ build }: { build: KbBuildDto }) {
     <div className="shrink-0 border-b border-line/60 px-4 py-3 space-y-3" data-testid="kb-runtime-progress">
       {processUnconfirmed ? (
         <div role="alert" className="rounded border border-seal/30 bg-paper-2 px-3 py-2 text-xs text-seal break-words" data-testid="kb-runtime-termination-unconfirmed">
-          后台终止未确认：凭据已撤销，但尚未确认所有进程退出；恢复会先重新对账，未确认前不启动新 Leader。
+          后台正在自动核验和清理：旧写入资格已收回，应用会检查本构建进程后恢复，无需人工确认。
           {data?.processTermination?.note ? <p className="mt-1">{data.processTermination.note}</p> : null}
         </div>
       ) : null}
@@ -287,8 +287,8 @@ export function BuildRuntimeProgress({ build }: { build: KbBuildDto }) {
               : 'Leader 用量未知（末次轮次数据未提供；累计未知）'}
           </p>
           <p className="text-[11px] text-ink-soft" data-testid="kb-runtime-resume-capability">
-            恢复能力：{processUnconfirmed ? '需先确认后台终止' : LEADER_RESUME_CAPABILITY_LABEL[leader.resumeCapability] ?? leader.resumeCapability}
-            <span className="ml-1">（{processUnconfirmed ? '重新对账前不承诺可续接' : '中断后按此方式续接'}）</span>
+            恢复能力：{processUnconfirmed ? '自动清理后恢复' : LEADER_RESUME_CAPABILITY_LABEL[leader.resumeCapability] ?? leader.resumeCapability}
+            <span className="ml-1">（{processUnconfirmed ? '应用自行核验，无需人工确认' : '中断后按此方式续接'}）</span>
           </p>
           {data.skill ? (
             <p className="text-[10px] text-ink-faint font-mono break-all" title={data.skill.path} data-testid="kb-runtime-skill">

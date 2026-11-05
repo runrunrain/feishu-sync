@@ -148,9 +148,9 @@ describe('Leader 工具面（§3.4）', () => {
     expect(JSON.parse(manifest.content[0]!.text).total).toBe(2);
   });
 
-  it.each([false, true])('Leader 可登记经共同来源核验的迁移（旧对象无逐条证据=%s）', async (legacy) => {
-    const buildId = `b-leader-migration-${legacy}`;
-    const localOutput = path.join(dataRoot, `migration-output-${legacy}`);
+  it.each([[false, 'merge'], [true, 'merge'], [true, 'remove']] as const)('Leader 可登记有依据的迁移（旧对象无逐条证据=%s，类型=%s）', async (legacy, kind) => {
+    const buildId = `b-leader-migration-${legacy}-${kind}`;
+    const localOutput = path.join(dataRoot, `migration-output-${legacy}-${kind}`);
     const releaseId = 'migration-base';
     fs.mkdirSync(path.join(localOutput, 'releases', releaseId), { recursive: true });
     fs.writeFileSync(path.join(localOutput, 'CURRENT.json'), JSON.stringify({ releaseId, publishedAt: new Date().toISOString() }));
@@ -185,16 +185,14 @@ describe('Leader 工具面（§3.4）', () => {
     await expectToolError(() => call(leader.token, 'build_register_migrations', { migrations: [{
       objectId: 'ko_old', kind: 'merge', successorObjectIds: ['ko_missing'], reason: '规则迁往新篇',
     }] }), 'kb_migration_invalid');
-    const recorded = await call(leader.token, 'build_register_migrations', { migrations: [{
-      objectId: 'ko_old', kind: 'merge', successorObjectIds: ['ko_new'], reason: '规则迁往新篇',
-    }] });
+    const migration = { objectId: 'ko_old', kind, successorObjectIds: kind === 'remove' ? [] : ['ko_new'],
+      reason: kind === 'remove' ? '核对 tokA 当前来源与独立审查后确认旧规则无据，已从正文和引用中移除' : '规则迁往新篇' };
+    const recorded = await call(leader.token, 'build_register_migrations', { migrations: [migration] });
     expect(recorded.details?.accepted).toBe(1);
-    const replay = await call(leader.token, 'build_register_migrations', { migrations: [{
-      objectId: 'ko_old', kind: 'merge', successorObjectIds: ['ko_new'], reason: '规则迁往新篇',
-    }] });
+    const replay = await call(leader.token, 'build_register_migrations', { migrations: [migration] });
     expect(replay.details?.reused).toBe(1);
     const plan = JSON.parse(fs.readFileSync(path.join(setup.state.stagingRoot, 'organization-plan.json'), 'utf8'));
-    expect(plan.migrations).toEqual([{ objectId: 'ko_old', kind: 'merge', successorObjectIds: ['ko_new'], reason: '规则迁往新篇' }]);
+    expect(plan.migrations).toEqual([migration]);
     const after = JSON.parse((await call(leader.token, 'build_manifest', {})).content[0]!.text);
     expect(after.identityGapCount).toBe(0);
   });
@@ -1175,6 +1173,8 @@ describe('审查（§4.3）与交接/问题/发布（§5）', () => {
         expect(value.promotedUnchangedPaths).toEqual([docs.promoted]);
         expect(value.unpublishedDraftPaths).toEqual([docs.pending]);
         expect(value.pendingRequiredRewrites).toEqual([docs.pending]);
+        expect(value.pendingIndependentReviewPaths).toEqual([docs.pending]);
+        expect(value.reviewedUnpublishedDraftPaths).toEqual([]);
       }
       setup.state.requiredRewrites.add(docs.carried);
       const visionRewrite = JSON.parse((await call(setup.leader.token, 'build_manifest', {})).content[0]!.text);

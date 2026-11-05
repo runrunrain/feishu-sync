@@ -444,9 +444,9 @@ describe('v2 Leader 监督运行进度（真实契约 GET /api/kb/builds/:id/lea
       root = createRoot(host);
       root.render(<BuildOrchestrationProgress build={makeBuild({ id: 'kb-v2', status: 'failed', orchestrationMode: 'pi-amagi' })} />);
     });
-    expect(host.querySelector('[data-testid="kb-runtime-termination-unconfirmed"]')?.textContent).toContain('尚未确认所有进程退出');
+    expect(host.querySelector('[data-testid="kb-runtime-termination-unconfirmed"]')?.textContent).toContain('无需人工确认');
     expect(host.querySelector('[data-testid="kb-runtime-leader"]')?.textContent).toContain('终止未确认');
-    expect(host.querySelector('[data-testid="kb-runtime-resume-capability"]')?.textContent).toContain('需先确认后台终止');
+    expect(host.querySelector('[data-testid="kb-runtime-resume-capability"]')?.textContent).toContain('自动清理后恢复');
     expect(host.querySelector('[data-testid="kb-runtime-task"]')?.getAttribute('data-exec')).toBe('termination-unconfirmed');
     expect(host.querySelector('[data-testid="kb-runtime-task"]')?.textContent).not.toContain('已停止');
     expect(host.querySelector('[data-testid="kb-runtime-summary"]')?.textContent).toContain('末次观测未结任务');
