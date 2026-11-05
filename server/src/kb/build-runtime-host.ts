@@ -586,6 +586,7 @@ export class BuildRuntimeHost {
     const writerPool = samePool ? reviewerPool : Math.max(1, max - reviewerPool);
     const spec: BuildRunSpec = {
       buildId: input.buildId,
+      strictGates: input.buildState.gatePolicy?.strict ?? true,
       generation: input.generation,
       orchestrationMode: 'pi-amagi',
       mode: input.mode,

@@ -434,7 +434,7 @@ export class PiAmagiBuildRuntime implements BuildRuntimeAdapter {
     // F10-R3：构建级跨 epoch 对账（旧 epoch 的锚点/v2-store 不因换目录被绕过）。
     const guard = await this.reconcileBuildResiduals({ buildId: binding.buildId, binding }, { reap: true, includeLeaders: false });
     if (guard && guard.state === 'unconfirmed') {
-      throw new Error(`残留对账未确认，拒绝原会话续接（先人工确认残留或重试对账）：${guard.note}`);
+      throw new Error(`残留自动核验暂未完成，保留断点并暂缓原会话续接：${guard.note}`);
     }
     // 核对冻结面：包哈希未漂移 + agentDir 配置容忍式比对
     // （settings.json 允许 amagi 韧性链追加字段，packages/amagi/models/mcp 必须一致）
@@ -569,6 +569,7 @@ export class PiAmagiBuildRuntime implements BuildRuntimeAdapter {
    */
   buildGuardConfigInput(spec: BuildRunSpec, dirs: BuildDirectories, roleMcpTools: Record<string, string[]>): {
     buildId: string; generation: number; workDir: string; forbiddenZones: string[];
+    strictGates?: boolean;
     roles: Record<string, { key: string; models: string[]; mcpTools: string[] }>;
     integrity: import('./runtime-integrity.js').RuntimeIntegrityRefs;
   } {
@@ -595,6 +596,7 @@ export class PiAmagiBuildRuntime implements BuildRuntimeAdapter {
     });
     return {
       buildId: spec.buildId,
+      strictGates: spec.strictGates,
       generation: spec.generation,
       workDir: dirs.workDir,
       forbiddenZones: buildForbiddenZones({

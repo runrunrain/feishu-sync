@@ -873,7 +873,9 @@ describe('小批次图文源：按识图文本校验体积并保持发布保护'
       },
     };
     const script: FakeScript = { outputMarkdown: '图示规则的完整说明。'.repeat(180) };
-    const harness = makeHarness(makeConfig({ buildParallelism: 1 }), script, vision);
+    const config = makeConfig({ buildParallelism: 1 });
+    config.standardKb.strictGates = true;
+    const harness = makeHarness(config, script, vision);
     const published = await createAndRun(harness, 'full');
     expect(published.status).toBe('published');
     expect(harness.fakes).toHaveLength(1);
@@ -885,6 +887,8 @@ describe('小批次图文源：按识图文本校验体积并保持发布保护'
     expect(rejected.error_code).toBe('kb_validation_failed');
     expect(rejected.error_message).toContain('total_too_large');
     expect(new StandardKbStore(outputRoot).readCurrent()?.releaseId).toBe(pointer.releaseId);
+    config.standardKb.strictGates = false;
+    expect((await createAndRun(harness, 'full')).status).toBe('published');
     expect(fs.readFileSync(path.join(kbRoot, '短图文/图示0.md'), 'utf8')).toBe('# 图示\n![](images/diagram.png)\n');
   });
 });

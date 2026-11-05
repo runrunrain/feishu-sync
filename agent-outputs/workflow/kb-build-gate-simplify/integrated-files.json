@@ -1,0 +1,158 @@
+{
+  "base": "aa69abd4807c6b03e984cf6aaa0c7dcf58b88230",
+  "note": "Includes three previously present parallel-line files; these were preserved, not attributed as this task changes.",
+  "files": [
+    {
+      "path": "server/src/agent/agent-tool-service.ts",
+      "sha256": "d5e07da058c11679b7c0bfc05c54bd750555e480ae8f76f78f20433343dd8f7a"
+    },
+    {
+      "path": "server/src/agent/build-runtime/adapter.ts",
+      "sha256": "5af608b68c9be802c27ab975a4aeae33d4698861e407d8c1a50ed571a5b51cb6"
+    },
+    {
+      "path": "server/src/agent/build-runtime/contracts.ts",
+      "sha256": "7639bd878f0bd2fd3dcb597eef434909f4edd282f6a5726008ce52d0329d71d5"
+    },
+    {
+      "path": "server/src/agent/build-runtime/dispatch-guard.ts",
+      "sha256": "894282c2e358561bb76a61e2a1b2e447e80781c6bb007111041e951e97876f7c"
+    },
+    {
+      "path": "server/src/agent/skills/knowledge-build/SKILL.md",
+      "sha256": "a79536dc614cb41762a17b3b595767e6737a612bac96dae921fb9ebb947c9ecc"
+    },
+    {
+      "path": "server/src/agent/skills/knowledge-build/author-protocol.md",
+      "sha256": "3b53e8e19464c2dd13a6398030ea4ed4968a0a8e5106925e8bcd30480a57a502"
+    },
+    {
+      "path": "server/src/agent/skills/knowledge-build/leader-protocol.md",
+      "sha256": "17ccce476df6a3e21cc9c1c94c4287e812e81e2f0cff9a936e93596bcbcf7a41"
+    },
+    {
+      "path": "server/src/agent/skills/knowledge-build/reviewer-protocol.md",
+      "sha256": "1ccd7dcf979cb7bae28e89d94b7d9df2857793aec7675f88740d28d4a9560158"
+    },
+    {
+      "path": "server/src/agent/tool-specs.ts",
+      "sha256": "9d9ae9c22e8e9efea0c62a2532431b8eef0caa6b6ae10352f574f2dc97a0c453"
+    },
+    {
+      "path": "server/src/kb/build-actors.ts",
+      "sha256": "8512d0e8bb2fcb808fe7eb7ea00c26a8a422426f704e35f3135274e7561b7e71"
+    },
+    {
+      "path": "server/src/kb/build-checkpoint.ts",
+      "sha256": "5caae1b3f700e89e2a756841ea0e8e37b05006627b8049e879386f7ed191d399"
+    },
+    {
+      "path": "server/src/kb/build-runtime-host.ts",
+      "sha256": "a19894d5237b3d125baa5320566edf063d73d44ff47afda0bf18ec85d11b21d8"
+    },
+    {
+      "path": "server/src/kb/gate-attribution.ts",
+      "sha256": "600bf7a0ed8d26a208f408c9cc8125343a87ef0616c0155baa63a6f052664278"
+    },
+    {
+      "path": "server/src/kb/gate-policy.ts",
+      "sha256": "64be49cc7d95e4aa0cab6f007da4504b04fd29ca3c714e7eaf571511177666f5"
+    },
+    {
+      "path": "server/src/kb/kb-build-service.ts",
+      "sha256": "c067e2acd2c8dd32bb36748a5d69a68e386e465e2704bf851e292b3c3a2ae329"
+    },
+    {
+      "path": "server/src/kb/knowledge-compiler.ts",
+      "sha256": "6ff92ae51b76f27190e6c438044993ac42b716bbb826a7a2893344793b63a239"
+    },
+    {
+      "path": "server/src/kb/knowledge-schema.ts",
+      "sha256": "86bb8510a7a7aeb88deee277541d061e0c1e83ed7e7d4b36614a959fd8d62e03"
+    },
+    {
+      "path": "server/src/kb/knowledge-validator.ts",
+      "sha256": "3db0ba41d9a7cc22a00749114529c3cc66d4f0841850ece3300523f0d25fbfcb"
+    },
+    {
+      "path": "server/src/kb/link-repair.ts",
+      "sha256": "b34470c9f6827c87b4a6cd1edcc2d02e6f1252ae5cf12c0615e4eaaf78bb5a58"
+    },
+    {
+      "path": "server/src/kb/object-migration-reconciliation.ts",
+      "sha256": "3661f795ad1d0df6d8346c7e7b5832eed862442ec2fb91d647c85a1cc695472c"
+    },
+    {
+      "path": "server/src/kb/review-authority.ts",
+      "sha256": "d1e454a30a4088fc71cc69284d4415ebc563e84fa275fc90387b9638f5750d8c"
+    },
+    {
+      "path": "server/src/kb/verified-evidence.ts",
+      "sha256": "badda472659dd62938c0d06e69ca4b9bf42190f1b5204f3d3291b9d4ff43157b"
+    },
+    {
+      "path": "server/src/modules/config-manager.ts",
+      "sha256": "5bbfe4188f036866a8aa9f926f31ec435788931b4332a7f54a66bdc0893b0746"
+    },
+    {
+      "path": "server/src/types/agent-knowledge.ts",
+      "sha256": "fce93c8ee777df9daa753935ee71670fb3f3d50019ac900a7229268dded94621"
+    },
+    {
+      "path": "server/tests/build-runtime-dispatch-guard.test.ts",
+      "sha256": "229101967d64a0f973c23ff570da85d349af6bdaf447772434d681f7373a6dbd"
+    },
+    {
+      "path": "server/tests/build-runtime-tools.test.ts",
+      "sha256": "0e809f72c0f4533e5079742bac5c6b56e10e3b420fbef335275b5aba9f4f38e3"
+    },
+    {
+      "path": "server/tests/config-manager.test.ts",
+      "sha256": "794aa8dcee635fa6892a1781db5e2935864f86bb2ad29bb8b7a3f1fca0d0f536"
+    },
+    {
+      "path": "server/tests/gate-policy.test.ts",
+      "sha256": "0e5a5439ae53f7e38db8fb2ae1764b148ef46a699711430963d179b6bb037514"
+    },
+    {
+      "path": "server/tests/kb-build-parallel.test.ts",
+      "sha256": "33057b9e95b74161412785d617cba2c0a751b8f617d0516775227e41914ad1cd"
+    },
+    {
+      "path": "server/tests/kb-build-resume.test.ts",
+      "sha256": "ec63771977d42e93aede99d518ae5c82acf780542c82c7b3619dea73ec58559e"
+    },
+    {
+      "path": "server/tests/kb-knowledge-tools.test.ts",
+      "sha256": "1cd98b81adbff052bf3dc3e4407d277d530cb36b7451485ee7cd3f18d0ae9521"
+    },
+    {
+      "path": "server/tests/kb-version.test.ts",
+      "sha256": "ab40d6e2eb06ffec3394677c22f491f2ed4d29b2124f94b6dc75d3af0f31f5a2"
+    },
+    {
+      "path": "server/tests/knowledge-publish.test.ts",
+      "sha256": "3142c8549cc90fdd1d3c233ae7da14c720bd38ca933ad0b6f2a1c89f4f12fe5d"
+    },
+    {
+      "path": "server/tests/link-repair.test.ts",
+      "sha256": "e90fef845168ffbb1739a2de6588796d01ce97e6b3e6aba91ea681101f89eaf5"
+    },
+    {
+      "path": "server/tests/object-migration-reconciliation.test.ts",
+      "sha256": "162fe1bd6dc20af8cf8454864ea01c7ce1d39d4614a54b6f4c587829b6389d31"
+    },
+    {
+      "path": "server/tests/review-declaration-scope.test.ts",
+      "sha256": "35fc274cfc90746adefb9fa3d75efc12f8bff9a9af33bb8882374133786f8caf"
+    },
+    {
+      "path": "server/tests/review-subject-standard.test.ts",
+      "sha256": "f878c2a1bcabcf3a98aa6d7d381c026b851b7add3c57972b345a5a10fe25f9cc"
+    },
+    {
+      "path": "docs/agent-knowledge.md",
+      "sha256": "f3470f87f01734043bd7c0debb4bf4fd16d6c793f3c1c2ea9a9b02b48a5321ff"
+    }
+  ]
+}

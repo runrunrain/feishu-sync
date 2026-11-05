@@ -49,6 +49,19 @@ afterEach(() => {
   }
 });
 
+describe('standard KB gate configuration', () => {
+  it('defaults to standard, persists a boolean and rejects non-booleans', async () => {
+    const manager = new ConfigManager(createTempConfigPath());
+    const initial = await manager.load();
+    expect(initial.standardKb.strictGates ?? false).toBe(false);
+    await manager.updateConfig({ standardKb: { ...initial.standardKb, strictGates: true } });
+    expect((await manager.load()).standardKb.strictGates).toBe(true);
+    await expect(manager.updateConfig({ standardKb: { ...initial.standardKb, strictGates: 'false' } as never }))
+      .rejects.toThrow(/strictGates/);
+    expect((await manager.load()).standardKb.strictGates).toBe(true);
+  });
+});
+
 describe('config secret retain semantics (P4)', () => {
   it('retains apiKey when partial update sends masked ***', async () => {
     const configPath = createTempConfigPath();

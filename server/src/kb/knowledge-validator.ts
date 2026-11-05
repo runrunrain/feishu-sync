@@ -43,6 +43,7 @@ import type { KnowledgeCompileResult } from './knowledge-compiler.js';
 import { FenceTracker } from './knowledge-compiler.js';
 import type { EvidenceResource, EvidenceReadReceipt } from './evidence-locator.js';
 import { verifyEvidence } from './evidence-locator.js';
+import { verifiedEvidenceKey } from './verified-evidence.js';
 import type { CandidateRelease, ReviewReport } from './orchestration-contracts.js';
 import type { RawSourceSnapshot } from './raw-source-snapshot.js';
 import type { GovernanceSnapshotForBuild } from './knowledge-governance-service.js';
@@ -104,6 +105,8 @@ export interface KnowledgeGateInput {
   knowledgeBaseRoot: string;
   /** 读取回执（read-receipts.jsonl；文本/CSV 证据复核） */
   receipts?: EvidenceReadReceipt[];
+  /** 服务端写时校验成功的本进程内凭据；缺省全部重新解引用。 */
+  verifiedEvidence?: ReadonlySet<string>;
   sidecars?: GateSidecarInput;
   /** D3（A 案 §5.2/§5.4）：预装配资源包（sourceId → 含工作簿/图片的资源
    * 表）。工作簿 ExcelJS 解析是异步的，由调用方（kb-build-service 发布段）
@@ -165,6 +168,7 @@ function checkInternalLinks(compiled: KnowledgeCompileResult): ValidationIssue[]
         if (!docPaths.has(resolved)) {
           issues.push({
             code: 'kb_link_invalid', field: 'body',
+            rule: 'link_target_missing', docPath: doc.path,
             message: `内部链接目标文档不存在：${doc.path} → ${dest}（解析为 ${resolved}）`,
             severity: 'blocking',
           });
@@ -173,6 +177,7 @@ function checkInternalLinks(compiled: KnowledgeCompileResult): ValidationIssue[]
         if (anchor && !anchorsByDoc.get(resolved)?.has(anchor)) {
           issues.push({
             code: 'kb_link_invalid', field: 'body',
+            rule: 'link_anchor_missing', docPath: doc.path,
             message: `内部链接锚点未登记：${doc.path} → ${dest}（文档 ${resolved} 无对象锚点 ${anchor}）`,
             severity: 'blocking',
           });
@@ -295,6 +300,7 @@ function checkHighRiskHumanReview(
     const severity = governance ? 'blocking' : 'warning';
     issues.push({
       code: 'kb_review_human_missing', field: 'claims.riskCategory',
+      ...(!governance ? { rule: 'human_review_unconfigured' } : {}),
       message: governance
         ? `对象含高风险 claim 但无绑定当前载荷的人工复核凭据：${object.objectId}（A 案 §5.1：高风险断言至少一次人工内容复核）`
         : `对象含高风险 claim 但无人工复核凭据（当前最高机器审）：${object.objectId}——治理快照未传入，D5 接线前仅披露不阻断（A 案 §5.1）`,
@@ -437,6 +443,7 @@ function checkEvidence(input: KnowledgeGateInput): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
   if (input.compiled.knowledge.evidence.length === 0) return issues;
   const resourcePacks = new Map<string, EvidenceResource[]>();
+  const verifiedSources = new Set<string>();
   const receipts = input.receipts ?? [];
   const draftedObjectPaths = new Map(input.compiled.knowledge.objects
     .filter((object) => object.canonical)
@@ -496,6 +503,30 @@ function checkEvidence(input: KnowledgeGateInput): ValidationIssue[] {
         });
       }
       resourcePacks.set(evidence.sourceRef.sourceId, pack);
+    }
+    if (input.verifiedEvidence?.has(verifiedEvidenceKey(evidence))) {
+      const entry = input.snapshot.get(evidence.sourceRef.sourceId);
+      if (!entry) {
+        issues.push({ code: 'kb_evidence_unresolved', field: 'sourceRef.sourceId',
+          message: `证据来源不在本构建快照内：${evidence.evidenceId}`, severity: 'blocking', objectId: evidence.objectId });
+        continue;
+      }
+      if (!verifiedSources.has(entry.objToken)) {
+        try {
+          input.snapshot.readVerified(input.knowledgeBaseRoot, entry.objToken);
+          verifiedSources.add(entry.objToken);
+        } catch (error) {
+          issues.push({ code: 'kb_evidence_unresolved', field: 'sourceRef',
+            message: `证据来源读取失败：${evidence.evidenceId} → ${error instanceof Error ? error.message : String(error)}`,
+            severity: 'blocking', objectId: evidence.objectId });
+          continue;
+        }
+      }
+      const resource = pack.find(item => item.resourceId === evidence.sourceRef.resourceId
+        && item.sourceId === evidence.sourceRef.sourceId);
+      if (resource && entry.contentHash === evidence.sourceRef.sourceSnapshotHash
+        && resource.sourceSnapshotHash === evidence.sourceRef.sourceSnapshotHash
+        && resource.resourceHash === evidence.sourceRef.resourceHash) continue;
     }
     const verification = verifyEvidence({
       evidence: {

@@ -148,9 +148,19 @@ describe('Leader 工具面（§3.4）', () => {
     expect(JSON.parse(manifest.content[0]!.text).total).toBe(2);
   });
 
-  it.each([[false, 'merge'], [true, 'merge'], [true, 'remove']] as const)('Leader 可登记有依据的迁移（旧对象无逐条证据=%s，类型=%s）', async (legacy, kind) => {
-    const buildId = `b-leader-migration-${legacy}-${kind}`;
-    const localOutput = path.join(dataRoot, `migration-output-${legacy}-${kind}`);
+  it('build_manifest exposes remembered stage blockers without the internal cache key', async () => {
+    const setup = makeV2('b-stage-blocked-status');
+    setup.state.progressiveBlocked = new Map([['rules.md', { key: 'private-key', at: '2026-01-01',
+      groups: [{ code: 'kb_link_invalid', count: 1, examples: ['missing.md'] }] }]]);
+    const manifest = JSON.parse((await call(setup.leader.token, 'build_manifest', {})).content[0]!.text);
+    expect(manifest.documentWorkStatus.stageBlockedPaths).toEqual([
+      { path: 'rules.md', groups: [{ code: 'kb_link_invalid', count: 1, examples: ['missing.md'] }] },
+    ]);
+  });
+
+  it.each([[false, 'merge', false], [true, 'merge', false], [true, 'remove', false], [true, 'merge', true]] as const)('Leader 可登记有依据的迁移（旧对象无逐条证据=%s，类型=%s，同文档来源细化=%s）', async (legacy, kind, sourceCorrection) => {
+    const buildId = `b-leader-migration-${legacy}-${kind}-${sourceCorrection}`;
+    const localOutput = path.join(dataRoot, `migration-output-${legacy}-${kind}-${sourceCorrection}`);
     const releaseId = 'migration-base';
     fs.mkdirSync(path.join(localOutput, 'releases', releaseId), { recursive: true });
     fs.writeFileSync(path.join(localOutput, 'CURRENT.json'), JSON.stringify({ releaseId, publishedAt: new Date().toISOString() }));
@@ -162,10 +172,14 @@ describe('Leader 工具面（§3.4）', () => {
     }));
     fs.writeFileSync(path.join(localOutput, 'releases', releaseId, 'knowledge.json'), JSON.stringify({
       schemaVersion: 1, documents: [], objects: [{ objectId: 'ko_old', title: '灾荒事件', familyKey: 'old-event',
-        canonical: { path: '旧篇.md' } }], evidence: legacy ? [] : [{ objectId: 'ko_old', sourceRef: { sourceId: 'tokA' } }],
+        canonical: { path: '旧篇.md' }, claims: [{ claimKey: 'old-event-trigger', bodyRange: { startLine: 2, endLine: 2 }, evidenceIds: [] }] }], evidence: legacy ? [] : [{ objectId: 'ko_old', sourceRef: { sourceId: 'tokA' } }],
       presentations: [], relations: [], coverage: [], migrations: [],
     }));
+    fs.mkdirSync(path.join(localOutput, 'releases', releaseId, 'docs'), { recursive: true });
+    fs.writeFileSync(path.join(localOutput, 'releases', releaseId, 'docs', '旧篇.md'), '# 旧篇\n旧版灾荒触发规则。\n');
     const setup = makeV2(buildId);
+    const nextPath = sourceCorrection ? '旧篇.md' : '新篇.md';
+    if (sourceCorrection) setup.state.docMeta!.set(nextPath, { title: '新篇', summary: '来源精确化', tags: [], sources: ['tokA', 'tokB'] });
     const leader = service.createRunContext({
       runKind: 'build', buildId, outputRoot: localOutput, knowledgeBaseRoot: kbRoot,
       buildState: setup.state, allowedToolsOverride: [...V2_LEADER_TOOLS],
@@ -173,13 +187,14 @@ describe('Leader 工具面（§3.4）', () => {
         credential: 'leader', actorStore: setup.store },
     });
     fs.writeFileSync(path.join(setup.state.stagingRoot, 'knowledge-draft.json'), JSON.stringify({
-      schemaVersion: 1, buildId, docs: { '新篇.md': { docId: 'kd_new', revision: 1 } },
+      schemaVersion: 1, buildId, docs: { [nextPath]: { docId: 'kd_new', revision: 1 } },
       clientKeys: {}, evidenceKeys: {}, objects: [{ objectId: 'ko_new', title: '灾荒事件', familyKey: 'new-event',
-        canonical: { path: '新篇.md' } }], evidence: [{ objectId: 'ko_new', sourceRef: { sourceId: 'tokA' } }],
+        canonical: { path: nextPath } }], evidence: [{ objectId: 'ko_new', sourceRef: { sourceId: sourceCorrection ? 'tokB' : 'tokA' } }],
       presentations: [], relations: [], coverage: [], calls: {},
     }));
     const before = JSON.parse((await call(leader.token, 'build_manifest', {})).content[0]!.text);
     expect(before.identityGapCount).toBe(1);
+    expect(before.identityGaps[0].priorClaims).toEqual([{ claimKey: 'old-event-trigger', text: '旧版灾荒触发规则。' }]);
     expect(before.identityGaps[0].candidates[0].objectId).toBe('ko_new');
     if (legacy) expect(before.identityGaps[0].priorDocumentSources).toEqual(['tokA']);
     await expectToolError(() => call(leader.token, 'build_register_migrations', { migrations: [{
@@ -195,6 +210,20 @@ describe('Leader 工具面（§3.4）', () => {
     expect(plan.migrations).toEqual([migration]);
     const after = JSON.parse((await call(leader.token, 'build_manifest', {})).content[0]!.text);
     expect(after.identityGapCount).toBe(0);
+  });
+
+  it('build_manifest distinguishes blocking publication failures from historical warnings', async () => {
+    const buildId = 'b-publication-severity'; const setup = makeV2(buildId);
+    const reportDir = path.join(outputRoot, '.builds', buildId); fs.mkdirSync(reportDir, { recursive: true });
+    fs.writeFileSync(path.join(reportDir, 'report.json'), JSON.stringify({ issues: [
+      { code: 'kb_evidence_unresolved', severity: 'blocking', message: 'missing current evidence' },
+      { code: 'kb_evidence_unresolved', severity: 'warning', message: 'legacy nonblocking evidence warning' },
+      { code: 'kb_migration_invalid', message: 'old report omitted severity' },
+    ] }));
+    const body = JSON.parse((await call(setup.leader.token, 'build_manifest', {})).content[0]!.text);
+    expect(body.lastPublicationReport).toMatchObject({ blockingCount: 1, warningCount: 1, unknownSeverityCount: 1,
+      blockingGroups: [{ code: 'kb_evidence_unresolved', severity: 'blocking', examples: ['missing current evidence'] }],
+      warningGroups: [{ code: 'kb_evidence_unresolved', severity: 'warning', examples: ['legacy nonblocking evidence warning'] }] });
   });
 
   it('build_manifest 分页与 workset changeType', async () => {
@@ -1066,6 +1095,17 @@ describe('审查（§4.3）与交接/问题/发布（§5）', () => {
     setup2.store.registerTaskCreation({ nativeTaskId: 'w1', requestedRole: 'luban' });
     await seedDraft(setup2, 'w1', 'docs/p2.md');
     await expectToolError(() => call(setup2.leader.token, 'build_request_publish', {}), 'build_publish_not_wired');
+  });
+
+  it('跳过声明只接受工作集来源并原样传递到发布管线', async () => {
+    const handler = vi.fn(async (_input: { skipped?: Array<{ objToken: string; reason: string }> }) => ({ accepted: true, result: {} }));
+    const setup = makeV2('b-publish-skipped', handler);
+    await expectToolError(() => call(setup.leader.token, 'build_request_publish', { skipped: [{ objToken: 'outside', reason: '空白' }] }), 'invalid_request');
+    await expectToolError(() => call(setup.leader.token, 'build_request_publish', { skipped: [{ objToken: 'tokA', reason: '  ' }] }), 'invalid_request');
+    expect(handler).not.toHaveBeenCalled();
+    const result = await call(setup.leader.token, 'build_request_publish', { skipped: [{ objToken: 'tokA', reason: '无知识' }] });
+    expect(result.details?.accepted).toBe(true);
+    expect(handler.mock.calls[0]?.[0]).toMatchObject({ skipped: [{ objToken: 'tokA', reason: '无知识' }] });
   });
 
   it('发布校验窗口内写入被拒（窗口由 handler 异步耗时暴露）', async () => {

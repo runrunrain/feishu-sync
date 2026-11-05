@@ -19,7 +19,7 @@ describe('object migration reconciliation', () => {
     const { previous, draft } = fixture();
     const gaps = objectMigrationGaps({ previous, draft, plan: { migrations: [] }, docBody: () => '灾荒事件在下一回合触发' });
     expect(gaps).toEqual([{
-      objectId: 'ko_old', title: '灾荒事件', priorPath: '旧篇.md',
+      objectId: 'ko_old', title: '灾荒事件', priorPath: '旧篇.md', priorClaimCount: 0, priorClaims: [],
       candidates: [{ objectId: 'ko_new', title: '灾荒事件', path: '新篇.md', sharedSources: ['source-1'] }],
     }]);
     expect(objectMigrationGaps({ previous, draft, plan: { migrations: [{
@@ -67,5 +67,22 @@ describe('object migration reconciliation', () => {
       .toContain('ko_old: merge 必须一个后继，split 至少两个后继，remove 后继必须为空');
     expect(validateObjectMigrationRegistration({ previous, draft: { ...draft, relations: [{ fromObjectId: 'ko_old', toObjectId: 'ko_new' }] } as KnowledgeDraftFile,
       existing: [], proposed: [removal] })).toContain('ko_old: 草稿仍有引用，先由写作任务处理引用与覆盖归属');
+  });
+
+  it('preserves coarse legacy provenance for same-document splits, without broadening specific old evidence', () => {
+    const { previous, draft } = fixture(); previous.evidence = [];
+    draft.objects[0].canonical!.path = '旧篇.md';
+    draft.evidence[0].sourceRef.sourceId = 'source-2';
+    const provenance = { previousDocSources: new Map([['旧篇.md', ['source-1']]]),
+      currentDocSources: new Map([['旧篇.md', ['source-1', 'source-2']]]) };
+    const migration = { objectId: 'ko_old', kind: 'merge' as const, successorObjectIds: ['ko_new'], reason: '同文档知识经独立取证承接，旧版只有文档级来源，新版已精确到真实来源二' };
+    expect(validateObjectMigrationRegistration({ previous, draft, existing: [], proposed: [migration], ...provenance })).toEqual([]);
+    expect(objectMigrationGaps({ previous, draft, plan: null, ...provenance })[0].candidates[0].objectId).toBe('ko_new');
+    expect(validateObjectMigrationRegistration({ previous, draft: { ...draft, evidence: [] }, existing: [], proposed: [migration], ...provenance })).not.toEqual([]);
+    expect(validateObjectMigrationRegistration({ previous, draft, existing: [], proposed: [migration], ...provenance,
+      currentDocSources: new Map([['旧篇.md', ['source-1']]]) })).not.toEqual([]);
+    previous.evidence = [{ objectId: 'ko_old', sourceRef: { sourceId: 'source-1' } }] as KnowledgeManifest['evidence'];
+    expect(validateObjectMigrationRegistration({ previous, draft, existing: [], proposed: [migration], ...provenance }))
+      .toContain('ko_old: 后继 ko_new 与旧对象缺少共同来源证据');
   });
 });

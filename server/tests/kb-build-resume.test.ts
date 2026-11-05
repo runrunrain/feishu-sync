@@ -303,7 +303,9 @@ describe('构建断点继续', () => {
   });
 
   it('校验失败后保留已完成批次，将上次问题交给收尾轮修复，通过后清理过期报告', async () => {
-    const f = await fixture(1); f.damageOnFinish(true); const initial = f.makeService();
+    const f = await fixture(1);
+    await f.config.updateConfig({ standardKb: { ...f.config.getConfig().standardKb, strictGates: true } });
+    f.damageOnFinish(true); const initial = f.makeService();
     const { data } = await initial.request('/api/kb/builds', { mode: 'full', confirm: 'BUILD' });
     expect((await f.terminal(data.id)).error_code).toBe('kb_validation_failed');
     expect(new BuildCheckpointStore(f.outputRoot).read(data.id)!.finishInfo).not.toBeNull();
@@ -313,6 +315,51 @@ describe('构建断点继续', () => {
     const prompts = f.prompts.filter((prompt) => prompt.generation === 2);
     expect(prompts).toHaveLength(1); expect(prompts[0].text).toContain('total_too_large');
     expect((await next.request(`/api/kb/builds/${data.id}`)).data.report).toBeUndefined();
+  });
+
+  it('标准门禁披露产出体量问题但不阻断发布', async () => {
+    const f = await fixture(1); f.damageOnFinish(true);
+    const initial = f.makeService();
+    const { data } = await initial.request('/api/kb/builds', { mode: 'full', confirm: 'BUILD' });
+    const result = await f.terminal(data.id);
+    expect(result.status).toBe('published');
+    const report = (await initial.request(`/api/kb/builds/${data.id}`)).data.report;
+    expect(report.issues).toContainEqual(expect.objectContaining({ code: 'total_too_large', severity: 'warning', demotedFrom: 'blocking' }));
+    expect(new BuildCheckpointStore(f.outputRoot).read(data.id)?.gatePolicy).toEqual({ strict: false, version: 1 });
+  });
+
+  it('旧检查点没有 gatePolicy 时恢复为严格模式', async () => {
+    const f = await fixture(1);
+    await f.config.updateConfig({ standardKb: { ...f.config.getConfig().standardKb, strictGates: true } });
+    f.damageOnFinish(true);
+    const first = f.makeService();
+    const { data } = await first.request('/api/kb/builds', { mode: 'full', confirm: 'BUILD' });
+    expect((await f.terminal(data.id)).error_code).toBe('kb_validation_failed');
+    const cpDir = path.join(f.outputRoot, '.builds', data.id, 'checkpoints');
+    const pointer = JSON.parse(fs.readFileSync(path.join(cpDir, 'CURRENT.json'), 'utf8'));
+    const statePath = path.join(cpDir, pointer.generation, 'state.json');
+    const checkpoint = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    delete checkpoint.gatePolicy;
+    fs.writeFileSync(statePath, JSON.stringify(checkpoint));
+    await f.config.updateConfig({ standardKb: { ...f.config.getConfig().standardKb, strictGates: false } });
+    const resumed = f.makeService();
+    expect((await resumed.request(`/api/kb/builds/${data.id}/resume`, { confirm: 'RESUME' })).status).toBe(202);
+    expect((await f.terminal(data.id)).error_code).toBe('kb_validation_failed');
+    expect(new BuildCheckpointStore(f.outputRoot).read(data.id)?.gatePolicy).toEqual({ strict: true, version: 1 });
+  });
+
+  it('恢复时沿用构建冻结的严格模式，不随当前配置放宽', async () => {
+    const f = await fixture(1);
+    await f.config.updateConfig({ standardKb: { ...f.config.getConfig().standardKb, strictGates: true } });
+    f.damageOnFinish(true);
+    const first = f.makeService();
+    const { data } = await first.request('/api/kb/builds', { mode: 'full', confirm: 'BUILD' });
+    expect((await f.terminal(data.id)).error_code).toBe('kb_validation_failed');
+    await f.config.updateConfig({ standardKb: { ...f.config.getConfig().standardKb, strictGates: false } });
+    const restarted = f.makeService();
+    expect((await restarted.request(`/api/kb/builds/${data.id}/resume`, { confirm: 'RESUME' })).status).toBe(202);
+    expect((await f.terminal(data.id)).error_code).toBe('kb_validation_failed');
+    expect(new BuildCheckpointStore(f.outputRoot).read(data.id)?.gatePolicy).toEqual({ strict: true, version: 1 });
   });
 });
 

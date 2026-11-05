@@ -747,7 +747,7 @@ export async function reconcileResidualProcesses(
     if (!ctx.kill) {
       findings.push({
         taskId, pid, source: individual.source, verdict: 'unconfirmed', proof: 'birth-token',
-        detail: '归属可证（出生令牌在案）且个体存活，但生产无稳定自有引用：不向历史发现/仅数字 PID 目标自动发信号（裁决 #5）；自有句柄路径（Leader 自身 terminate）不受影响，其余交自然退出/人工确认',
+        detail: '归属可证（出生令牌在案）且个体存活，但本层无稳定自有引用：不按历史 PID 发信号；交由上层撤销旧写入资格并扫描构建专属进程范围后自动回收',
       });
     } else {
       const ok = await reapIndividual(pid, ctx, reverifyRoot);
@@ -959,7 +959,7 @@ async function reapRecordedMembers(
       // 裁决 #5：生产无稳定自有引用，封存组员同样零信号（报告归属即可）
       findings.push({
         taskId, pid: member.pid, source: 'anchor', verdict: 'unconfirmed', proof: 'birth-token',
-        detail: '组员归属时序证明成立（双夹逼+session 前提）且存活，但生产无稳定自有引用：不自动发信号（裁决 #5），交自然退出/人工确认',
+        detail: '组员归属时序证明成立（双夹逼+session 前提）且存活，但本层无稳定自有引用：交由上层扫描构建专属进程范围后自动回收',
       });
       continue;
     }

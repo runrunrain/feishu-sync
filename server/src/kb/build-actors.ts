@@ -786,14 +786,18 @@ export class BuildActorStore {
     return review;
   }
 
-  /** 作者提交修订后：绑定受影响路径的审查失效（draftHash 亦不再匹配）。 */
-  invalidateReviewsForPaths(paths: string[], reason: string): number {
+  /** 作者提交修订后：绑定受影响路径的审查失效（draftHash 亦不再匹配）。
+   * retain（F01，仅标准门禁由调用方提供）：返回 true 的回执保持 valid——
+   * 调用方须已证明其在 coveredPaths 上的审查主体摘要未变。 */
+  invalidateReviewsForPaths(paths: string[], reason: string,
+    retain?: (review: ReviewReceipt, coveredPaths: string[]) => boolean): number {
     const affected = new Set(paths);
     let count = 0;
     for (const review of this.reviews.values()) {
       if (review.status !== 'valid') continue;
       const coveredPaths = Object.keys(review.dependencyHashes).filter((key) => key.startsWith('doc:') && affected.has(key.slice('doc:'.length)));
-      if (coveredPaths.length > 0) {
+      if (coveredPaths.length > 0
+        && !retain?.(review, coveredPaths.map((key) => key.slice('doc:'.length)))) {
         review.status = 'stale';
         review.staleReason = `${reason}（受影响: ${coveredPaths.join(', ')}）`;
         count += 1;
@@ -807,13 +811,16 @@ export class BuildActorStore {
   }
 
   /** A recovered Leader can use a newer frozen workflow. Old review reports
-   * remain on disk for audit, but may no longer authorize a publication. */
-  invalidateReviewsForWorkflowRevision(revision: string, pendingPaths?: ReadonlySet<string>): ReviewReceipt[] {
+   * remain on disk for audit, but may no longer authorize a publication.
+   * retain（F01，仅标准门禁）：返回 true 的回执不因规则升级撤销。 */
+  invalidateReviewsForWorkflowRevision(revision: string, pendingPaths?: ReadonlySet<string>,
+    retain?: (review: ReviewReceipt) => boolean): ReviewReceipt[] {
     const invalidated: ReviewReceipt[] = [];
     for (const review of this.reviews.values()) {
       if (review.status !== 'valid' || review.dependencyHashes['workflow-rules'] === revision) continue;
       if (pendingPaths && review.scopePaths?.length
         && !review.scopePaths.some((docPath) => pendingPaths.has(docPath))) continue;
+      if (retain?.(review)) continue;
       review.status = 'stale';
       review.staleReason = 'workflow_rules_changed';
       invalidated.push(review);

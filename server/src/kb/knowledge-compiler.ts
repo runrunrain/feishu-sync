@@ -443,7 +443,8 @@ function expandInclude(
   objectId: string,
 ): string[] {
   const emit = (code: string, message: string, severity: ValidationIssue['severity'] = 'blocking'): void => {
-    context.issues.push(issue(code, 'targetObjectId', message, severity, { objectId }));
+    context.issues.push(issue(code, 'targetObjectId', message, severity,
+      { objectId, ...(code === 'kb_restatement_stale' ? { edgeId: presentation.presentationId } : {}) }));
   };
   const target = context.objectsById.get(targetId);
   if (!target || target.tombstone || !target.canonical) {

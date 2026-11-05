@@ -97,6 +97,8 @@ export function resolveOrchestrationMode(config: Pick<StandardKbConfig, 'orchest
 }
 
 export interface StandardKbConfig {
+  /** 默认 false；true 恢复严格门禁，构建创建时冻结。 */
+  strictGates?: boolean;
   outputRoot: string;
   retainReleases: number;
   buildBatchSize: number;
@@ -491,10 +493,15 @@ export interface KbBuildDto {
 }
 
 export interface KbBuildReportIssue {
+  rule?: string;
+  docPath?: string;
+  demotedFrom?: 'blocking';
   path?: string;
   objToken?: string;
   code: string;
   message: string;
+  /** Legacy reports may omit this; missing severity must not be called a warning. */
+  severity?: 'blocking' | 'warning';
 }
 
 // ============================================================================

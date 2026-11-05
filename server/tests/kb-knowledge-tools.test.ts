@@ -734,6 +734,38 @@ describe('kb_write_doc：原子落盘与声明', () => {
     expect(fs.existsSync(path.join(state.stagingRoot, 'knowledge-draft.json'))).toBe(false);
   });
 
+  it('标准写入自动修复唯一相对链接，payloadHash 按修复后正文计算；严格模式不改写', async () => {
+    const object = { clientKey: 'obj', type: 'rule', title: '伤害公式', familyKey: 'damage',
+      variantKey: 'default', scopeKey: 'pve', scopeText: 'PVE 战斗', headingPath: ['伤害公式'] };
+    const body = '## 伤害公式\n参考 [规则](参考.md#heading)';
+    const corrected = '## 伤害公式\n参考 [规则](../公共/参考.md#heading)';
+    const hashes: string[] = [];
+    for (const [name, strict, markdown] of [['link-repair-standard', false, body], ['link-repair-corrected', true, corrected], ['link-repair-strict', true, body]] as const) {
+      const state = makeBuildState(name); state.gatePolicy = { strict, version: 1 };
+      state.baseDocPaths = new Set(['公共/参考.md']);
+      const result = await service.executeTool(tokenFor(state), 'kb_write_doc', { ...BASE_WRITE, markdown, objects: [object] });
+      const text = fs.readFileSync(path.join(state.stagingRoot, 'docs', BASE_WRITE.path), 'utf8');
+      const draft = JSON.parse(fs.readFileSync(path.join(state.stagingRoot, 'knowledge-draft.json'), 'utf8'));
+      hashes.push(draft.objects[0].payloadHash);
+      if (!strict) {
+        expect(text).toContain(corrected);
+        expect(result.details?.linkRepairs).toEqual([{ from: '参考.md#heading', to: '../公共/参考.md#heading' }]);
+      } else expect(text).toContain(markdown);
+    }
+    expect(hashes[0]).toBe(hashes[1]);
+    expect(hashes[0]).not.toBe(hashes[2]);
+  });
+
+  it.each([false, true])('写工具不会修改代码示例中的链接（strict=%s）', async strict => {
+    const state = makeBuildState(`link-code-${strict}`);
+    state.gatePolicy = { strict, version: 1 };
+    state.baseDocPaths = new Set(['公共/参考.md']);
+    const markdown = '## 伤害公式\n\n    [缩进](参考.md)\n\n`跨行代码\n[链接](参考.md)\n结束`';
+    const result = await service.executeTool(tokenFor(state), 'kb_write_doc', { ...BASE_WRITE, markdown });
+    expect(fs.readFileSync(path.join(state.stagingRoot, 'docs', BASE_WRITE.path), 'utf8')).toContain(markdown);
+    expect(result.details?.linkRepairs ?? []).toEqual([]);
+  });
+
   it('带声明写入：正文与 knowledge-draft.json 同代落盘；clientKey→objectId 映射；headingPath 解析正文范围', async () => {
     const state = makeBuildState('decl-1');
     const token = tokenFor(state);
@@ -1148,6 +1180,7 @@ describe('kb_write_doc：证据声明闭环（真实回执 → 服务端复核�
     expect(draft.evidence).toHaveLength(1);
     expect(draft.evidence[0]!.quoteHash).toBe(computeQuoteHash('倍率 2.0'));
     expect(draft.evidence[0]!.readReceiptId).toBe(receiptId);
+    expect(state.verifiedEvidence?.size).toBe(1);
     // claim 证据绑定回填
     expect(draft.objects[0]!.claims[0]!.evidenceIds).toEqual([evidenceMap['evRate']]);
   });
@@ -1168,6 +1201,7 @@ describe('kb_write_doc：证据声明闭环（真实回执 → 服务端复核�
         role: 'supports', nature: 'direct', readReceiptId: receipts.readReceiptId,
       }],
     })).rejects.toMatchObject({ code: 'kb_evidence_unresolved' });
+    expect(state.verifiedEvidence?.size ?? 0).toBe(0);
   });
 });
 

@@ -15,6 +15,13 @@
  * 声明语义哈希剔除对象上的审查凭据字段（reviewStatus/reviewActorKind/
  * reviewerId/reviewedAt）与 calls 幂等账本：回写凭据本身不得改变声明
  * 哈希（自失效），幂等重放也不得使既有有效审查失效。
+ *
+ * F01（P2 §2.3，仅标准门禁 gatePolicy.strict=false）：回执另记
+ * `subject:<path>` = 审查主体摘要（规范化正文 + 头部来源 + 该路径对象/
+ * 断言结构 + 触及关系/呈现）。证据 selector/坐标、覆盖去向/目标、docs
+ * 元数据与 workflow 规则不入摘要——它们由写时机械校验与发布结构门禁
+ * 保证。携带完整 subject 键的回执在标准模式下按主体比较（另核报告文件
+ * 绑定与来源快照）；严格模式与无 subject 键的旧回执完全走上述精确规则。
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -24,11 +31,17 @@ import type { KnowledgeDraftFile } from '../agent/agent-tool-service.js';
 import type { RawSourceSnapshot } from './raw-source-snapshot.js';
 import { computeSnapshotHash } from './build-orchestration.js';
 import type { ReviewReport } from './orchestration-contracts.js';
+import type { GatePolicy } from './gate-policy.js';
 
 /** dependencyHashes 保留键（doc:<path> 前缀键之外的三类聚合依赖）。 */
 export const REVIEW_DEP_DECLARATION = 'knowledge-declaration';
+export const REVIEW_DEP_DECLARATION_SCOPE = 'declaration-scope';
+export const DOCUMENT_DECLARATION_SCOPE = 'document-v2';
 export const REVIEW_DEP_SOURCE_SNAPSHOT = 'source-snapshot';
 export const REVIEW_DEP_WORKFLOW_RULES = 'workflow-rules';
+/** F01（P2 §2.3）：审查主体依赖键前缀（`subject:<path>`）。additive：
+ * 回执照写旧四类键；仅标准门禁（gatePolicy.strict=false）读取本键。 */
+export const REVIEW_DEP_SUBJECT_PREFIX = 'subject:';
 
 /** 当前依赖值（候选组装/对象回写核验用；与回执 dependencyHashes 比对）。 */
 export interface ReviewDependencyValues {
@@ -80,7 +93,7 @@ export function knowledgeDeclarationHash(draft: KnowledgeDraftFile): string {
 
 /** Bind a unit review to the declarations that can affect its documents. A
  * concurrent writer changing another document must not invalidate this unit. */
-export function scopedKnowledgeDeclarationHash(draft: KnowledgeDraftFile, paths: readonly string[], sourceIds: readonly string[]): string {
+export function scopedKnowledgeDeclarationHash(draft: KnowledgeDraftFile, paths: readonly string[], sourceIds: readonly string[], legacy = false): string {
   const scope = new Set(paths);
   const sources = new Set(sourceIds);
   const objects = draft.objects.filter((object) => object.canonical && scope.has(object.canonical.path));
@@ -98,8 +111,13 @@ export function scopedKnowledgeDeclarationHash(draft: KnowledgeDraftFile, paths:
       || (item.targetObjectId !== undefined && ids.has(item.targetObjectId))),
     relations,
     evidence,
+    // An unassigned source item has no document owner yet. Its later assignment
+    // elsewhere must not invalidate every review sharing that source. Global
+    // unresolved coverage remains checked by submission/publication gates.
+    // Multi-document mappings belong to every document they actually touch.
     coverage: draft.coverage.filter((item) => sources.has(item.sourceRef.sourceId)
-      && item.targetObjectIds.every((id) => ids.has(id))),
+      && (legacy ? item.targetObjectIds.every((id) => ids.has(id))
+        : item.targetObjectIds.some((id) => ids.has(id)))),
   };
   return crypto.createHash('sha256').update(stableStringify(semantic), 'utf8').digest('hex');
 }
@@ -112,6 +130,54 @@ export function scopedReviewDeclarationHash(stagingRoot: string, paths: readonly
     if (draft.schemaVersion !== 1) return null;
     return scopedKnowledgeDeclarationHash(draft, paths, sourceIds);
   } catch { return null; }
+}
+
+/** Upgrade legacy receipt bindings only from an exact old declaration digest.
+ * The compact proof survives checkpoint retention; it does not create a review
+ * or change its verdict, body/source/rule bindings, or reviewed declarations. */
+function legacyScopedDeclarationMatches(input: {
+  stagingRoot: string; receipt: ReviewReceipt; sourceIds: string[]; draft: KnowledgeDraftFile;
+}): boolean {
+  const { receipt, draft, sourceIds, stagingRoot } = input;
+  if (!receipt.scopePaths?.length || !/^[A-Za-z0-9_-]{1,100}$/.test(receipt.reviewId)) return false;
+  const expected = receipt.dependencyHashes[REVIEW_DEP_DECLARATION];
+  const local = scopedKnowledgeDeclarationHash(draft, receipt.scopePaths, sourceIds);
+  const proofFile = path.join(stagingRoot, 'reviews', `declaration-binding-${receipt.reviewId}.json`);
+  try {
+    const proof = JSON.parse(fs.readFileSync(proofFile, 'utf8'));
+    if (proof.version === 1 && proof.reviewId === receipt.reviewId && proof.boundReportId === receipt.reportId
+      && proof.legacyHash === expected && proof.localHash === local) return true;
+  } catch { /* No verified compatibility binding yet. */ }
+  const bind = (previous: KnowledgeDraftFile): boolean => {
+    if (previous.buildId !== receipt.buildId
+      || scopedKnowledgeDeclarationHash(previous, receipt.scopePaths!, sourceIds, true) !== expected
+      || scopedKnowledgeDeclarationHash(previous, receipt.scopePaths!, sourceIds) !== local) return false;
+    try {
+      fs.mkdirSync(path.dirname(proofFile), { recursive: true });
+      const temporary = `${proofFile}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+      fs.writeFileSync(temporary, JSON.stringify({ version: 1, reviewId: receipt.reviewId,
+        boundReportId: receipt.reportId, legacyHash: expected, localHash: local }) + '\n');
+      fs.renameSync(temporary, proofFile);
+    } catch { /* The exact digest proof still holds for this invocation. */ }
+    return true;
+  };
+  if (bind(draft)) return true;
+  // Older releases did not save document-local declaration bindings. Use only
+  // this build's persisted checkpoints, never a model-supplied replacement.
+  if (path.basename(path.dirname(stagingRoot)) !== '.staging'
+    || path.basename(stagingRoot) !== receipt.buildId) return false;
+  const checkpoints = path.join(path.dirname(path.dirname(stagingRoot)), '.builds', receipt.buildId, 'checkpoints');
+  try {
+    for (const name of fs.readdirSync(checkpoints).filter(name => /^cp_[A-Za-z0-9_-]+$/.test(name)).slice(0, 8)) {
+      try {
+        const file = path.join(checkpoints, name, 'knowledge-draft.json');
+        if (fs.statSync(file).size > 16 * 1024 * 1024) continue;
+        const previous = JSON.parse(fs.readFileSync(file, 'utf8')) as KnowledgeDraftFile;
+        if (previous.schemaVersion === 1 && bind(previous)) return true;
+      } catch { /* Missing or invalid historical declaration cannot prove reuse. */ }
+    }
+  } catch { /* No checkpoint evidence: keep the old receipt stale. */ }
+  return false;
 }
 
 /** 无声明文件时的空声明哈希（形状与 loadKnowledgeDraft 新建空 draft 一致）。 */
@@ -128,6 +194,139 @@ export function emptyKnowledgeDeclarationHash(): string {
     evidence: [],
     coverage: [],
     calls: {},
+  });
+}
+
+const STD_HEADER_BLOCK = /^<!--\s*\nfeishu_sync_kb:\n([\s\S]*?)\n-->[ \t]*(?:\n|$)/;
+
+/** 审查主体正文规范化（P2 §2.3）：CRLF→LF；去 std 文件头（头部来源单列）；
+ * 每行去行尾空白；去首部空行；连续 3 个以上空行压成 2 个；去末尾换行。 */
+export function normalizeReviewSubjectContent(content: string): { body: string; sources: string[] } {
+  const text = content.replace(/\r\n?/g, '\n');
+  const header = STD_HEADER_BLOCK.exec(text);
+  const sources: string[] = [];
+  if (header) {
+    let inSources = false;
+    for (const line of header[1]!.split('\n')) {
+      if (/^\s{2}sources:\s*$/.test(line)) { inSources = true; continue; }
+      const item = inSources ? /^\s{4}-\s*(\S+)\s*$/.exec(line) : null;
+      if (item) sources.push(item[1]!);
+      else inSources = false;
+    }
+  }
+  const body = (header ? text.slice(header[0].length) : text)
+    .split('\n').map((line) => line.replace(/[ \t]+$/, '')).join('\n')
+    .replace(/^\n+/, '')
+    .replace(/\n{4,}/g, '\n\n\n')
+    .replace(/\n+$/, '');
+  return { body, sources: [...new Set(sources)].sort() };
+}
+
+/** 审查主体摘要（P2 §2.3）。纳入：规范化正文、头部来源、本路径非 tombstone
+ * 对象的语义字段与断言结构（claimKey/riskCategory）、触及这些对象的关系
+ * 与呈现的语义字段。不纳入：evidence（selector/回执/哈希）、coverage、
+ * docs 元数据、clientKeys/evidenceKeys、payloadHash/reviewSubjectHash、
+ * canonical/claim bodyRange、revision/locationRevision、审查凭据、workflow
+ * 规则——这些由写时机械校验或发布结构门禁保证。 */
+export function reviewSubjectDigest(draft: KnowledgeDraftFile | null, docPath: string, content: string): string {
+  const { body, sources } = normalizeReviewSubjectContent(content);
+  const objects = (draft?.objects ?? [])
+    .filter((object) => !object.tombstone && object.canonical?.path === docPath)
+    .sort((a, b) => (a.objectId < b.objectId ? -1 : a.objectId > b.objectId ? 1 : 0));
+  const ids = new Set(objects.map((object) => object.objectId));
+  const sortedStrings = (values: unknown[]): string[] => values.map(stableStringify).sort();
+  const subject = {
+    version: 1,
+    path: docPath,
+    body,
+    sources,
+    objects: objects.map((object) => ({
+      objectId: object.objectId,
+      type: object.type,
+      title: object.title,
+      aliases: object.aliases,
+      domainIds: object.domainIds,
+      familyKey: object.familyKey,
+      variantKey: object.variantKey,
+      scopeKey: object.scopeKey,
+      scopeText: object.scopeText,
+      businessStatus: object.businessStatus,
+      claims: sortedStrings((object.claims ?? []).map((claim) => ({
+        claimKey: claim.claimKey, riskCategory: claim.riskCategory,
+      }))),
+    })),
+    relations: sortedStrings((draft?.relations ?? [])
+      .filter((relation) => ids.has(relation.fromObjectId) || ids.has(relation.toObjectId))
+      .map((relation) => ({
+        type: relation.type, fromObjectId: relation.fromObjectId, toObjectId: relation.toObjectId,
+        scopeKey: relation.scopeKey, decisionRef: relation.decisionRef,
+        validFrom: relation.validFrom, validUntil: relation.validUntil,
+      }))),
+    presentations: sortedStrings((draft?.presentations ?? [])
+      .filter((item) => ids.has(item.ownerObjectId)
+        || (item.targetObjectId !== undefined && ids.has(item.targetObjectId)))
+      .map((item) => ({
+        kind: item.kind, ownerObjectId: item.ownerObjectId, targetObjectId: item.targetObjectId,
+        fragmentKey: item.fragmentKey, summaryBasis: item.summaryBasis,
+      }))),
+  };
+  return crypto.createHash('sha256').update(stableStringify(subject), 'utf8').digest('hex');
+}
+
+/** 当前 staging 的主体摘要解析器（按路径记忆；每次核验新建）。草稿不存在 →
+ * null；声明文件存在但不可解析 → 一律 null（缺证明即不按主体放行）。 */
+export function createReviewSubjectResolver(stagingRoot: string): (docPath: string) => string | null {
+  const docsDir = path.resolve(stagingRoot, 'docs');
+  const draftFile = path.join(stagingRoot, 'knowledge-draft.json');
+  let draft: KnowledgeDraftFile | null | undefined;
+  let draftBroken = false;
+  const cache = new Map<string, string | null>();
+  const loadDraft = (): void => {
+    if (draft !== undefined || draftBroken) return;
+    if (!fs.existsSync(draftFile)) { draft = null; return; }
+    try {
+      const parsed = JSON.parse(fs.readFileSync(draftFile, 'utf8')) as KnowledgeDraftFile;
+      if (parsed?.schemaVersion !== 1) throw new Error('schema');
+      draft = parsed;
+    } catch { draftBroken = true; }
+  };
+  return (docPath: string): string | null => {
+    if (cache.has(docPath)) return cache.get(docPath)!;
+    let digest: string | null = null;
+    const file = path.resolve(docsDir, docPath);
+    if (file.startsWith(`${docsDir}${path.sep}`)) {
+      loadDraft();
+      if (!draftBroken) {
+        try { digest = reviewSubjectDigest(draft ?? null, docPath, fs.readFileSync(file, 'utf8')); }
+        catch { digest = null; }
+      }
+    }
+    cache.set(docPath, digest);
+    return digest;
+  };
+}
+
+/** 标准门禁才返回主体解析器；严格模式或旧检查点（无策略）返回 undefined，
+ * 调用方据此完全走精确规则。 */
+export function standardReviewSubjectResolver(stagingRoot: string, policy: GatePolicy | null | undefined):
+  ((docPath: string) => string | null) | undefined {
+  return policy?.strict === false ? createReviewSubjectResolver(stagingRoot) : undefined;
+}
+
+/** 回执是否为每个 scopePath 都记录了主体摘要（部分缺失按旧回执处理）。 */
+export function receiptHasSubjectBinding(receipt: ReviewReceipt): boolean {
+  const deps = receipt.dependencyHashes ?? {};
+  return !!receipt.scopePaths?.length
+    && receipt.scopePaths.every((docPath) => typeof deps[`${REVIEW_DEP_SUBJECT_PREFIX}${docPath}`] === 'string');
+}
+
+/** 标准模式：回执在给定路径上的主体摘要仍等于当前值。 */
+export function receiptSubjectMatches(receipt: ReviewReceipt, paths: readonly string[],
+  subjectOf: (docPath: string) => string | null): boolean {
+  if (!receiptHasSubjectBinding(receipt)) return false;
+  return paths.every((docPath) => {
+    const digest = subjectOf(docPath);
+    return digest !== null && receipt.dependencyHashes[`${REVIEW_DEP_SUBJECT_PREFIX}${docPath}`] === digest;
   });
 }
 
@@ -182,6 +381,8 @@ export interface AuthorityReviewSelection {
  *    当前内容与回执一致（reportId + draftHash 双绑定；报告被覆盖/删除不入选）；
  * 3. 聚合依赖（声明/来源快照/规则）与当前值精确匹配；
  * 4. doc:* 逐路径与 staging 当前正文一致。
+ * 标准门禁（input.subjectOf）下携带完整 subject 键的回执以 1、2、来源快照
+ * 与 subject:* 主体摘要替代 3/4 的声明、规则与正文字节比对（F01）。
  * 多审查者各自入选；报告文件被新审查覆盖时旧回执因 reportId 不匹配自然出局。
  */
 export function collectAuthorityValidatedReports(input: {
@@ -190,6 +391,9 @@ export function collectAuthorityValidatedReports(input: {
   current: ReviewDependencyValues;
   /** 正文逐路径哈希（path → contentHash；发布侧由 stagingDocsEntriesOf 提供）。 */
   documentHashes: Map<string, string>;
+  /** F01：仅标准门禁提供（standardReviewSubjectResolver）。携带完整 subject
+   * 键的回执改按主体摘要 + 来源快照核验；缺省 = 严格模式精确规则。 */
+  subjectOf?: (docPath: string) => string | null;
 }): AuthorityReviewSelection {
   const reviewsDir = path.join(input.stagingRoot, 'reviews');
   const readReport = (unitId: string): ReviewReport | null => {
@@ -203,6 +407,8 @@ export function collectAuthorityValidatedReports(input: {
   const skipped: AuthorityReviewSelection['skipped'] = [];
   const validReportIds: string[] = [];
   const seenReports = new Set<string>();
+  let draft: KnowledgeDraftFile | null = null;
+  try { draft = JSON.parse(fs.readFileSync(path.join(input.stagingRoot, 'knowledge-draft.json'), 'utf8')); } catch { /* checked below */ }
   for (const receipt of input.store.listReviews()) {
     if (receipt.status !== 'valid') {
       skipped.push({ reviewId: receipt.reviewId, reviewerTaskId: receipt.reviewerTaskId, reason: `receipt_status_${receipt.status}` });
@@ -218,12 +424,31 @@ export function collectAuthorityValidatedReports(input: {
       skipped.push({ reviewId: receipt.reviewId, reviewerTaskId: receipt.reviewerTaskId, reason: 'report_file_binding_mismatch' });
       continue;
     }
+    if (input.subjectOf && receiptHasSubjectBinding(receipt)) {
+      // 标准模式主体绑定：declaration/doc:*/workflow-rules 三项不比对；
+      // 正文、对象/断言结构或关系变化都会改变主体摘要而失效。
+      if (receipt.dependencyHashes[REVIEW_DEP_SOURCE_SNAPSHOT] !== input.current.sourceSnapshotHash
+        || !receiptSubjectMatches(receipt, receipt.scopePaths!, input.subjectOf)) {
+        skipped.push({ reviewId: receipt.reviewId, reviewerTaskId: receipt.reviewerTaskId, reason: 'subject_stale' });
+        continue;
+      }
+      if (!seenReports.has(report.reportId)) {
+        seenReports.add(report.reportId);
+        validReportIds.push(report.reportId);
+      }
+      continue;
+    }
     const scoped = Array.isArray(receipt.scopePaths) && receipt.scopePaths.length > 0;
     const declarationHash = scoped
       ? scopedReviewDeclarationHash(input.stagingRoot, receipt.scopePaths!, report.coverage.sourceRefs)
       : input.current.declarationHash;
     const deps = receipt.dependencyHashes ?? {};
-    if (!declarationHash || deps[REVIEW_DEP_DECLARATION] !== declarationHash
+    const declarationMatches = scoped && deps[REVIEW_DEP_DECLARATION_SCOPE] === undefined
+      ? !!draft && legacyScopedDeclarationMatches({ stagingRoot: input.stagingRoot, receipt,
+        sourceIds: report.coverage.sourceRefs, draft })
+      : (!scoped || deps[REVIEW_DEP_DECLARATION_SCOPE] === DOCUMENT_DECLARATION_SCOPE)
+        && !!declarationHash && deps[REVIEW_DEP_DECLARATION] === declarationHash;
+    if (!declarationMatches
       || deps[REVIEW_DEP_SOURCE_SNAPSHOT] !== input.current.sourceSnapshotHash
       || !input.current.workflowRulesHash || deps[REVIEW_DEP_WORKFLOW_RULES] !== input.current.workflowRulesHash) {
       skipped.push({ reviewId: receipt.reviewId, reviewerTaskId: receipt.reviewerTaskId, reason: 'dependency_stale' });
@@ -253,13 +478,18 @@ export function missingScopedPassReviewPaths(input: {
   basePromotionHashes: Readonly<Record<string, string>>;
   validReportIds: ReadonlySet<string>;
   receipts: readonly ReviewReceipt[];
+  /** F01：仅标准门禁提供；带 subject 键的回执按主体摘要判定覆盖。 */
+  subjectOf?: (docPath: string) => string | null;
 }): string[] {
   const covered = new Set<string>();
   for (const receipt of input.receipts) {
     if (receipt.status !== 'valid' || receipt.verdict !== 'pass' || !receipt.reportId
       || !input.validReportIds.has(receipt.reportId)) continue;
+    const bySubject = !!input.subjectOf && receiptHasSubjectBinding(receipt);
     for (const docPath of receipt.scopePaths ?? []) {
-      if (input.documentHashes.get(docPath) === receipt.dependencyHashes?.[`doc:${docPath}`]) covered.add(docPath);
+      if (bySubject
+        ? input.documentHashes.has(docPath) && receiptSubjectMatches(receipt, [docPath], input.subjectOf!)
+        : input.documentHashes.get(docPath) === receipt.dependencyHashes?.[`doc:${docPath}`]) covered.add(docPath);
     }
   }
   return [...input.writtenPaths].filter((docPath) => {

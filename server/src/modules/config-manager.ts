@@ -409,6 +409,7 @@ function normalizeStandardKbConfigLoose(value: unknown, dataRoot: string): Stand
     reviewPolicy: normalizeReviewPolicyLoose(raw.reviewPolicy, base.reviewPolicy),
     // B案 §7：发布方式（非法值回落默认 auto）
     publishMode: raw.publishMode === 'confirm' ? 'confirm' : 'auto',
+    strictGates: typeof raw.strictGates === 'boolean' ? raw.strictGates : false,
     // D3（A 案 §5.4）：证据资源预算（非数字/非法保持 undefined →
     // 发布时按冻结工作集来源数使用默认额度）
     evidenceBudgetBytes: typeof raw.evidenceBudgetBytes === 'number' && Number.isFinite(raw.evidenceBudgetBytes)
@@ -576,6 +577,9 @@ export function validateAgentAndKbConfig(value: {
     details.push({ field: 'standardKb', code: 'invalid_type' });
   } else if (value.standardKb && typeof value.standardKb === 'object') {
     const kb = value.standardKb as Partial<StandardKbConfig>;
+    if (kb.strictGates !== undefined && typeof kb.strictGates !== 'boolean') {
+      details.push({ field: 'standardKb.strictGates', code: 'invalid_type' });
+    }
     if (kb.outputRoot !== undefined && (typeof kb.outputRoot !== 'string' || !kb.outputRoot.trim())) {
       details.push({ field: 'standardKb.outputRoot', code: 'invalid_value' });
     }

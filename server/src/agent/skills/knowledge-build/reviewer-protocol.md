@@ -18,7 +18,7 @@
 ## 输出
 
 - 经桥接提交审查报告（见 `mcp-examples.md` 的审查工具调用示例）：问题分级（blocking/suggestion）、定位（路径/对象/行）、依据（读取回执）与结论。
-- 应用会在提交 `pass` 时检查本范围是否仍有 `important + unresolved` 覆盖项；如返回 `kb_review_coverage_blocked`，提交 `needs_revision` 并写明具体覆盖项，不反复重试相同 `pass`。空白 CSV 可依据 `raw_read` 的 `blank_csv_resources` 机械判定，是否属于可排除占位表仍要对照正文确认。
+- 如工具拒绝 `pass` 并给出覆盖原因，提交 `needs_revision` 并写明具体覆盖项；工具的覆盖警告应如实披露。空白 CSV 可依据 `raw_read` 的 `blank_csv_resources` 机械判定，是否属于可排除占位表仍要对照正文确认。
 - 阅读核对完成后，在下一轮优先调用 `kb_submit_review`，再交接；审查回执中列差异与未核范围，不重述所有已匹配条目。回复保持简短，不在模型回复中重写全文、完整证据表或长篇思考过程。
 - 作者声明已修复不能关闭问题——只有你的复核结论能关闭问题。
 - 你没有草稿写入口；不要代作者改稿，把问题写清楚交给 Leader 聚合派发。

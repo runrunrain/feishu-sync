@@ -1257,6 +1257,12 @@ export const BUILD_REQUEST_PUBLISH_SPEC: AgentToolSpec = {
     properties: {
       requestedRevision: string('申请的具体候选标识（缺省当前候选哈希）'),
       summary: string('收尾说明（可选）'),
+      skipped: { type: 'array', description: '本轮确认无需整理的工作集来源及理由', items: {
+        type: 'object', properties: {
+          objToken: { type: 'string', minLength: 1, maxLength: 256 },
+          reason: { type: 'string', minLength: 1, maxLength: 500 },
+        }, required: ['objToken', 'reason'], additionalProperties: false,
+      } },
     },
     additionalProperties: false,
   },

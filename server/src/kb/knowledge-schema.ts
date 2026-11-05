@@ -531,6 +531,9 @@ export function computeReviewSubjectHash(input: ReviewSubjectInput): string {
 export type IssueSeverity = 'blocking' | 'warning';
 
 export interface ValidationIssue {
+  rule?: string;
+  docPath?: string;
+  demotedFrom?: 'blocking';
   code: string;
   objectId?: string;
   edgeId?: string;
@@ -566,7 +569,7 @@ function issue(
   field: string,
   message: string,
   severity: IssueSeverity,
-  refs?: { objectId?: string; edgeId?: string },
+  refs?: { objectId?: string; edgeId?: string; rule?: string },
 ): ValidationIssue {
   return { code, field, message, severity, ...refs };
 }
@@ -771,7 +774,7 @@ export function validateKnowledgeGraph(km: KnowledgeManifest): ValidationIssue[]
       if (target && target.revision > p.targetRevision) {
         issues.push(issue('kb_restatement_stale', 'targetRevision',
           `${p.kind} 呈现绑定的目标 revision(${p.targetRevision}) 落后于当前 revision(${target.revision})：${p.presentationId}`,
-          'blocking', { objectId: p.ownerObjectId }));
+          'blocking', { objectId: p.ownerObjectId, edgeId: p.presentationId }));
       }
     }
   }
@@ -922,7 +925,7 @@ export function validateKnowledgeGraph(km: KnowledgeManifest): ValidationIssue[]
     for (const previousId of km.previousObjectIds) {
       if (!objectIds.has(previousId) && !migrationTargets.has(previousId)) {
         issues.push(issue('kb_migration_invalid', 'objectId',
-          `未解释的对象丢失：${previousId} 不在本 release 且无迁移映射`, 'blocking', { objectId: previousId }));
+          `未解释的对象丢失：${previousId} 不在本 release 且无迁移映射`, 'blocking', { objectId: previousId, rule: 'migration_unexplained_loss' }));
       }
     }
   }
@@ -943,13 +946,13 @@ export function validateKnowledgeGraph(km: KnowledgeManifest): ValidationIssue[]
       for (const targetId of item.targetObjectIds) {
         if (!byId.has(targetId)) {
           issues.push(issue('kb_coverage_invalid', 'targetObjectIds',
-            `mapped 目标对象不存在：${item.itemId} → ${targetId}`, 'blocking', refs));
+            `mapped 目标对象不存在：${item.itemId} → ${targetId}`, 'blocking', { ...refs, edgeId: item.itemId, rule: 'coverage_target_missing' }));
         }
       }
     } else if (item.disposition === 'unresolved') {
       if (item.importance === 'important') {
         issues.push(issue('kb_coverage_invalid', 'disposition',
-          `高风险 unresolved 阻止发布：${item.itemId}（category=${item.category}）`, 'blocking', refs));
+          `高风险 unresolved 阻止发布：${item.itemId}（category=${item.category}）`, 'blocking', { ...refs, rule: 'coverage_important_unresolved' }));
       } else {
         issues.push(issue('kb_coverage_invalid', 'disposition',
           `普通未处理项（warning，进覆盖元数据）：${item.itemId}`, 'warning', refs));

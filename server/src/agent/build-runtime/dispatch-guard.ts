@@ -26,6 +26,8 @@ export const DISPATCH_GUARD_SCHEMA_VERSION = 2;
 /** 守卫冻结配置（应用在启动 Leader 前生成，注入扩展环境）。 */
 export interface FrozenDispatchConfig {
   schemaVersion: number;
+  /** 历史信封缺省按严格模式处理。 */
+  strictGates?: boolean;
   buildId: string;
   generation: number;
   /** 固定工作目录（workspace.cwd 强制值，绝对路径）。 */
@@ -79,6 +81,7 @@ export type GuardDecision =
 
 export function validateGuardConfig(config: FrozenDispatchConfig): string[] {
   const issues: string[] = [];
+  if (config.strictGates !== undefined && typeof config.strictGates !== 'boolean') issues.push('strictGates 非法');
   if (config.schemaVersion !== DISPATCH_GUARD_SCHEMA_VERSION) issues.push(`schemaVersion 不支持（期望 ${DISPATCH_GUARD_SCHEMA_VERSION}）`);
   if (!config.buildId) issues.push('buildId 缺失');
   if (!Number.isInteger(config.generation) || config.generation < 1) issues.push('generation 非法');
@@ -335,17 +338,21 @@ export function guardTaskSubmit(
   if (role.key === 'writer' && typeof args.task === 'string') {
     const issue = writerScopeIssue(args.task);
     if (issue) {
-      return { decision: 'block', code: 'dispatch_writer_scope_too_broad', message: issue, audit: baseAudit };
+      if (config.strictGates !== false) return { decision: 'block', code: 'dispatch_writer_scope_too_broad', message: issue, audit: baseAudit };
+      changes.push(`advisory: ${issue}`);
     }
   }
   if (role.key === 'reviewer' && typeof args.task === 'string') {
     const issue = reviewerScopeIssue(args.task);
     if (issue) {
-      return { decision: 'block', code: 'dispatch_reviewer_scope_too_broad', message: issue, audit: baseAudit };
+      if (config.strictGates !== false) return { decision: 'block', code: 'dispatch_reviewer_scope_too_broad', message: issue, audit: baseAudit };
+      changes.push(`advisory: ${issue}`);
     }
   }
   if (role.key === 'reviewer' && typeof args.task !== 'string') {
-    return { decision: 'block', code: 'dispatch_reviewer_scope_too_broad', message: '审查任务须在 task 正文中给出唯一目标和 coverage.docPaths；不可用不可核对的 taskFile 派发', audit: baseAudit };
+    const message = '审查任务须在 task 正文中给出唯一目标和 coverage.docPaths；不可用不可核对的 taskFile 派发';
+    if (config.strictGates !== false) return { decision: 'block', code: 'dispatch_reviewer_scope_too_broad', message, audit: baseAudit };
+    changes.push(`advisory: ${message}`);
   }
 
   // 创建回执携带原生 taskId；wait 模式直到子任务终态才返回，期间身份始终
@@ -475,6 +482,7 @@ export function guardTaskResume(
 /** 由 BuildRunSpec 形状生成守卫冻结配置（角色模型/工具名单与完整性引用由调用方补齐）。 */
 export function freezeGuardConfig(input: {
   buildId: string;
+  strictGates?: boolean;
   generation: number;
   workDir: string;
   reportRoot?: string;
@@ -484,6 +492,7 @@ export function freezeGuardConfig(input: {
 }): FrozenDispatchConfig {
   const config: FrozenDispatchConfig = {
     schemaVersion: DISPATCH_GUARD_SCHEMA_VERSION,
+    strictGates: input.strictGates,
     buildId: input.buildId,
     generation: input.generation,
     workDir: input.workDir,

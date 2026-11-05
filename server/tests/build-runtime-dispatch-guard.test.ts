@@ -234,6 +234,19 @@ describe('guardTaskSubmit', () => {
     if (blocked.decision === 'block') expect(blocked.code).toBe('dispatch_writer_scope_too_broad');
   });
 
+  it('标准模式只提示写作范围，并保留审查 taskFile 围栏', () => {
+    const config = makeConfig({ strictGates: false });
+    expect(config.strictGates).toBe(false);
+    const writer = guardTaskSubmit(config, { agent: 'luban', task: '来源 docx 正文 342 行，请覆盖全文。' });
+    expect(writer.decision).toBe('allow');
+    expect(writer.audit.changes.some(change => change.startsWith('advisory:'))).toBe(true);
+    expect(guardTaskSubmit(config, { agent: 'diting', task: '审查 A.md 与 B.md' }).decision).toBe('allow');
+    const reviewerFile = guardTaskSubmit(config, { agent: 'diting', taskFile: 'docs/review.md' });
+    expect(reviewerFile.decision).toBe('allow');
+    expect(reviewerFile.audit.changes.some(change => change.startsWith('advisory:'))).toBe(true);
+    expect(guardTaskSubmit(config, { agent: 'diting', taskFile: '../escape.md' }).decision).toBe('block');
+  });
+
   it('少量锚点但跨三张大表累计 629 行的写作任务也在启动前拦截', () => {
     const blocked = guardTaskSubmit(makeConfig(), { agent: 'luban', task: [
       '【写作】人塔寨补给与克制机制',

@@ -153,6 +153,8 @@ export interface AmagiPackageRef {
 /** 冻结一次运行的输入与执行组合（设计 §8）。 */
 export interface BuildRunSpec {
   buildId: string;
+  /** 构建冻结门禁；缺失按严格处理。 */
+  strictGates?: boolean;
   generation: number;
   orchestrationMode: 'pi-amagi';
   mode: 'full' | 'incremental';

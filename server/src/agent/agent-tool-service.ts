@@ -17,6 +17,8 @@ import { isBlankWorkbookPlaceholder, reconcileBlankCsvCoverage } from '../kb/bla
 import { sourceChangeBaseline, summarizeSourceChanges, type SourceChangeBaseline } from '../kb/source-change-summary.js';
 import { renderCsvTableImport } from '../kb/csv-table-import.js';
 import { MAX_STANDARD_DOC_BYTES } from '../kb/standard-doc-limits.js';
+import { repairRelativeMdLinks } from '../kb/link-repair.js';
+import { verifiedEvidenceKey } from '../kb/verified-evidence.js';
 import { annotateRawReadPage, skipBlankCsvContinuation, type BlankCsvSkip } from '../kb/csv-read-compact.js';
 import { isPermissionDeniedSourcePlaceholder, isUnresolvedSyncedReferencePlaceholder } from '../kb/source-availability.js';
 import {
@@ -113,12 +115,19 @@ import {
 import { computeCandidateHash, type ReviewIssue, type ReviewReport } from '../kb/orchestration-contracts.js';
 import {
   REVIEW_DEP_DECLARATION,
+  REVIEW_DEP_DECLARATION_SCOPE,
+  DOCUMENT_DECLARATION_SCOPE,
   REVIEW_DEP_SOURCE_SNAPSHOT,
   REVIEW_DEP_WORKFLOW_RULES,
   resolveCurrentReviewDependencies,
   scopedReviewDeclarationHash,
   collectAuthorityValidatedReports,
   missingScopedPassReviewPaths,
+  REVIEW_DEP_SUBJECT_PREFIX,
+  reviewSubjectDigest,
+  receiptSubjectMatches,
+  scopedKnowledgeDeclarationHash,
+  standardReviewSubjectResolver,
   type ReviewDependencyValues,
 } from '../kb/review-authority.js';
 import { getKbQueryService, QueryError } from '../kb/search/kb-query-service.js';
@@ -131,6 +140,7 @@ import {
   deriveIdempotencyKey,
   V2_CHILD_READ_TOOLS,
   type CredentialKind,
+  type ReviewReceipt,
 } from '../kb/build-actors.js';
 import type { BuildUnit } from '../kb/build-units.js';
 import type { ImageDescription } from './vision/vision-describer.js';
@@ -150,6 +160,7 @@ import type {
   AgentRunKind,
   AgentToolSpec,
   RawSourceSnapshotEntry,
+  KbBuildReportIssue,
 } from '../types/agent-knowledge.js';
 import { toolsForRunKind } from '../types/agent-knowledge.js';
 import type { DocumentRecord } from '../types/index.js';
@@ -174,6 +185,12 @@ export class ToolError extends Error {
 const RAW_LINKS_LIMIT = 200;
 
 export interface BuildRunState {
+  /** 冻结构建门禁；旧检查点缺失时调用方须按严格模式处理。 */
+  gatePolicy?: import('../kb/gate-policy.js').GatePolicy;
+  progressiveBlocked?: Map<string, { key: string; groups: Array<{ code: string; count: number; examples: string[] }>; at: string }>;
+  /** 内存中仅记录本进程写时校验并落盘成功的证据；重启后回退完整校验。 */
+  verifiedEvidence?: Set<string>;
+  validationWarnings?: KbBuildReportIssue[];
   knowledgeBaseRoot: string;
   snapshot: RawSourceSnapshot;
   /** F3-R07：工作集语义（objToken → 变更类型；full = 全量重建） */
@@ -263,6 +280,7 @@ export interface V2PublishHandler {
     candidateHash: string;
     requestedRevision: string | null;
     summary: string | null;
+    skipped?: Array<{ objToken: string; reason: string }>;
     /** F11 补强：ctx 租约闭包（服务端构造；缺省视为无证明，提交点拒绝） */
     authorityLease?: { validate: () => void };
   }): Promise<{ accepted: boolean; result: Record<string, unknown> }>;
@@ -2164,7 +2182,7 @@ export class AgentToolService {
           recheck: () => this.assertV2WriteWindow(v2, actor.nativeTaskId, meta, docPath),
           idempotency: { payloadHash },
         });
-        this.v2RecordReceipt({ v2, nativeTaskId: actor.nativeTaskId, kind: 'write_doc', operationId, payloadHash, paths: [docPath], result, invalidateReviews: true });
+        this.v2RecordReceipt({ v2, nativeTaskId: actor.nativeTaskId, kind: 'write_doc', operationId, payloadHash, paths: [docPath], result, invalidateReviews: true, subjectState: state });
         return result;
       });
     }
@@ -2296,7 +2314,21 @@ export class AgentToolService {
     const title = requireString(args, 'title', 1, 300);
     // csvTableImports expands short model-authored text into verified CSV rows.
     // Edits must also be able to resubmit a previously imported long document.
-    const markdown = requireString(args, 'markdown', 1, MAX_STANDARD_DOC_BYTES);
+    const rawMarkdown = requireString(args, 'markdown', 1, MAX_STANDARD_DOC_BYTES);
+    const repaired = state.gatePolicy?.strict === false
+      ? repairRelativeMdLinks(rawMarkdown, docPath, new Set([
+        ...this.stagingDraftEntries(state).map(entry => entry.path),
+        ...(state.baseDocPaths ?? []),
+        ...(state.v2?.actorStore.listAssignments().filter(item => item.status === 'active' && item.targetKind === 'doc').flatMap(item => item.targets) ?? []),
+      ]))
+      : { markdown: rawMarkdown, repairs: [] };
+    const markdown = repaired.markdown;
+    const coverageWarnings = state.gatePolicy?.strict === false && Array.isArray(args.coverageUpdates)
+      ? args.coverageUpdates.flatMap(raw => {
+        const item = asRecord(raw);
+        return item?.disposition === 'excluded_nonknowledge' && typeof item.reason === 'string' && coverageReasonImpliesKnowledgeTransfer(item.reason)
+          ? [`覆盖项 ${String(item.itemId ?? '')} 的排除理由可能描述知识转移，请核对去向`] : [];
+      }) : [];
     const summary = requireString(args, 'summary', 1, 400);
     if (hasEditorialHistory(markdown) || hasEditorialHistory(summary)) {
       throw new ToolError('body_contains_change_history', '正文与文档摘要必须为当前规则的一次成型表述；移除版本头、修订记录和本版/上版对比。变更说明仅放在kb_finish.summary。');
@@ -2486,6 +2518,11 @@ export class AgentToolService {
         }
         try {
           this.saveKnowledgeDraft(state, declaration.draft);
+          const verifiedIds = new Set(Object.values(declaration.evidenceIdMap));
+          state.verifiedEvidence ??= new Set();
+          for (const evidence of declaration.draft.evidence) {
+            if (verifiedIds.has(evidence.evidenceId)) state.verifiedEvidence.add(verifiedEvidenceKey(evidence));
+          }
         } catch (error) {
           // 回滚正文，不部分写入；回滚本身失败则保持毒化由批循环终止
           try {
@@ -2508,6 +2545,8 @@ export class AgentToolService {
         details: {
           path: docPath,
           docId,
+          ...(repaired.repairs.length ? { linkRepairs: repaired.repairs } : {}),
+          ...(coverageWarnings.length ? { warnings: coverageWarnings } : {}),
           bytes: Buffer.byteLength(full, 'utf-8'),
           ...(declaration
             ? {
@@ -2787,6 +2826,9 @@ export class AgentToolService {
     paths: string[];
     result: ToolResult;
     invalidateReviews?: boolean;
+    /** F01：kb_write_doc/kb_edit_doc 传入（调用方持声明锁、写入已落盘）。
+     * 仅当其 gatePolicy.strict=false 时按审查主体摘要决定是否失效。 */
+    subjectState?: BuildRunState;
   }): void {
     input.v2.actorStore.recordReceipt({
       authorTaskId: input.nativeTaskId,
@@ -2797,8 +2839,60 @@ export class AgentToolService {
       result: { content: input.result.content, ...(input.result.details ? { details: input.result.details } : {}) },
     });
     if (input.invalidateReviews && input.paths.length > 0) {
-      input.v2.actorStore.invalidateReviewsForPaths(input.paths, 'content_revised');
+      const state = input.subjectState;
+      const subjectOf = state ? standardReviewSubjectResolver(state.stagingRoot, state.gatePolicy) : undefined;
+      if (!state || !subjectOf) {
+        input.v2.actorStore.invalidateReviewsForPaths(input.paths, 'content_revised');
+        return;
+      }
+      // 标准门禁（P2 §2.3-2）：写后主体摘要与回执 subject:<path> 相等的回执
+      // 保持有效（仅证据/覆盖等机械元数据修订）；旧回执与主体变化照旧失效。
+      const retained: ReviewReceipt[] = [];
+      input.v2.actorStore.invalidateReviewsForPaths(input.paths, 'content_revised', (review, covered) => {
+        const keep = receiptSubjectMatches(review, covered, subjectOf);
+        if (keep) retained.push(review);
+        return keep;
+      });
+      this.reattachSubjectReviewCredentialsLocked(state, input.paths, retained, subjectOf);
     }
+  }
+
+  /** P2 §2.3-5 凭据重挂（调用方必须已持声明锁）：主体未变而保留的 pass 回执，
+   * 对因 reviewSubjectHash（证据集合等）变化被重置的对象回写同一 reportId 的
+   * machine 凭据。只作用于未通过且未被拒绝的对象；每路径取最新可用回执；
+   * 来源快照或主体不再匹配、含 blocking 问题时不回写。 */
+  private reattachSubjectReviewCredentialsLocked(state: BuildRunState, paths: string[],
+    retained: ReviewReceipt[], subjectOf: (docPath: string) => string | null): number {
+    if (retained.length === 0) return 0;
+    const snapshotHash = resolveCurrentReviewDependencies({ stagingRoot: state.stagingRoot,
+      snapshot: state.snapshot, workflowRulesHash: null }).sourceSnapshotHash;
+    const reportByPath = new Map<string, string>();
+    for (const docPath of paths) {
+      const receipt = retained
+        .filter((review) => review.status === 'valid' && review.verdict === 'pass' && !!review.reportId
+          && review.scopePaths?.includes(docPath)
+          && !review.issues.some((issue) => issue.severity === 'blocking')
+          && review.dependencyHashes[REVIEW_DEP_SOURCE_SNAPSHOT] === snapshotHash
+          && receiptSubjectMatches(review, [docPath], subjectOf))
+        .sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0))
+        .at(-1);
+      if (receipt?.reportId) reportByPath.set(docPath, receipt.reportId);
+    }
+    if (reportByPath.size === 0) return 0;
+    const draft = this.loadKnowledgeDraft(state);
+    const reviewedAt = new Date().toISOString();
+    let marked = 0;
+    for (const object of draft.objects) {
+      const reportId = object.canonical && !object.tombstone ? reportByPath.get(object.canonical.path) : undefined;
+      if (!reportId || object.reviewStatus === 'passed' || object.reviewStatus === 'rejected') continue;
+      object.reviewStatus = 'passed';
+      object.reviewActorKind = 'machine';
+      object.reviewerId = reportId;
+      object.reviewedAt = reviewedAt;
+      marked += 1;
+    }
+    if (marked > 0) this.saveKnowledgeDraft(state, draft);
+    return marked;
   }
 
   /** S4（§4.4）：逐单元上报；objToken 须属本单元；重复调用以最后一次为准。 */
@@ -3677,7 +3771,7 @@ export class AgentToolService {
       if ((disposition === 'excluded_template' || disposition === 'excluded_nonknowledge') && !reason) {
         throw new ToolError('kb_coverage_invalid', `排除必须给理由: ${itemId}（不能把漏掉的规则统一标成模板）`);
       }
-      if (disposition === 'excluded_nonknowledge' && reason && coverageReasonImpliesKnowledgeTransfer(reason)) {
+      if (state.gatePolicy?.strict !== false && disposition === 'excluded_nonknowledge' && reason && coverageReasonImpliesKnowledgeTransfer(reason)) {
         throw new ToolError('kb_coverage_invalid', `覆盖项 ${itemId} 仍属知识且由其他文档承接；请映射到承接对象，不要标成 excluded_nonknowledge`, 409);
       }
       const mainResource = pack.resources[0]!;
@@ -4219,13 +4313,15 @@ export class AgentToolService {
     if (conclusion !== 'pass' && conclusion !== 'needs_revision' && conclusion !== 'insufficient_material' && conclusion !== 'fail') {
       throw new ToolError('invalid_request', `conclusion 非法: ${String(conclusion)}`);
     }
+    let coverageWarning: string | null = null;
     if (v2Info && conclusion === 'pass') {
       const unresolved = this.loadKnowledgeDraft(state).coverage.filter((item) =>
         sourceRefs.includes(item.sourceRef.sourceId)
         && item.importance === 'important' && item.disposition === 'unresolved');
       if (unresolved.length > 0) {
-        throw new ToolError('kb_review_coverage_blocked',
-          `本范围仍有重要未解决覆盖项，不能提交 pass：${unresolved.slice(0, 5).map((item) => item.itemId).join('、')}；请提交 needs_revision 并交给作者修订`, 409);
+        const message = `本范围仍有重要未解决覆盖项：${unresolved.slice(0, 5).map((item) => item.itemId).join('、')}`;
+        if (state.gatePolicy?.strict !== false) throw new ToolError('kb_review_coverage_blocked', `${message}；请提交 needs_revision 并交给作者修订`, 409);
+        coverageWarning = message;
       }
     }
     const report: ReviewReport = {
@@ -4246,7 +4342,7 @@ export class AgentToolService {
     const result: ToolResult = {
       content: [{
         type: 'text',
-        text: `已提交审查报告 ${report.reportId}（unit=${unitId}，draftHash=${draftHash.slice(0, 12)}…，问题 ${issues.length} 项：blocking ${blocking}/suggestion ${issues.length - blocking}）`,
+        text: `已提交审查报告 ${report.reportId}（unit=${unitId}，draftHash=${draftHash.slice(0, 12)}…，问题 ${issues.length} 项：blocking ${blocking}/suggestion ${issues.length - blocking}）${coverageWarning ? `；警告：${coverageWarning}` : ''}`,
       }],
       details: {
         reportId: report.reportId,
@@ -4262,6 +4358,9 @@ export class AgentToolService {
       // F08：绑定扩展为「正文 + 对象/证据声明 + 来源快照 + 冻结 workflow 规则」
       // 精确哈希；报告文件经 reportUnitId/reportId 双向绑定（F07 回执驱动源）。
       const deps = reviewDeps!;
+      // F01（P2 §2.3-1）：标准门禁另记 subject:<path>（严格模式回执保持原样）。
+      const subjectDeps = state.gatePolicy?.strict === false
+        ? this.reviewSubjectDependencies(state, entries, deps.declarationHash, scopePaths, sourceRefs) : {};
       v2Info.v2.actorStore.recordReview({
         reviewerTaskId: v2Info.actor!.nativeTaskId,
         draftHash,
@@ -4269,8 +4368,10 @@ export class AgentToolService {
         dependencyHashes: {
           ...Object.fromEntries(entries.map((entry) => [`doc:${entry.path}`, entry.contentHash])),
           [REVIEW_DEP_DECLARATION]: deps.declarationHash,
+          [REVIEW_DEP_DECLARATION_SCOPE]: DOCUMENT_DECLARATION_SCOPE,
           [REVIEW_DEP_SOURCE_SNAPSHOT]: deps.sourceSnapshotHash,
           ...(deps.workflowRulesHash ? { [REVIEW_DEP_WORKFLOW_RULES]: deps.workflowRulesHash } : {}),
+          ...subjectDeps,
         },
         ruleVersion: 'kb-review/1',
         reportUnitId: unitId,
@@ -4310,6 +4411,30 @@ export class AgentToolService {
     return result;
   }
 
+  /** F01：审查主体依赖键。只在同一份读到的正文与声明能证明与回执其余绑定
+   * （doc:* 正文哈希、作用域声明哈希）一致时登记；任一不一致（并发写入
+   * 窗口）返回空，回执退回精确规则，不把未审内容记成主体。 */
+  private reviewSubjectDependencies(state: BuildRunState, entries: Array<{ path: string; contentHash: string }>,
+    declarationHash: string, scopePaths: string[], sourceRefs: string[]): Record<string, string> {
+    try {
+      const draftFile = path.join(state.stagingRoot, 'knowledge-draft.json');
+      if (!fs.existsSync(draftFile)) return {};
+      const draft = JSON.parse(fs.readFileSync(draftFile, 'utf8')) as KnowledgeDraftFile;
+      if (draft?.schemaVersion !== 1
+        || scopedKnowledgeDeclarationHash(draft, scopePaths, sourceRefs) !== declarationHash) return {};
+      const subjects: Record<string, string> = {};
+      for (const entry of entries) {
+        const content = fs.readFileSync(resolveInside(path.join(state.stagingRoot, 'docs'), entry.path, 'read'), 'utf-8');
+        if (contentResourceHash(content) !== entry.contentHash) return {};
+        subjects[`${REVIEW_DEP_SUBJECT_PREFIX}${entry.path}`] = reviewSubjectDigest(draft, entry.path, content);
+      }
+      return scopePaths.length > 0 && scopePaths.every((docPath) => subjects[`${REVIEW_DEP_SUBJECT_PREFIX}${docPath}`] !== undefined)
+        ? subjects : {};
+    } catch {
+      return {};
+    }
+  }
+
   /** staging 草稿清单哈希输入（path + 内容 sha256，按 path 排序；空库哈希稳定）。 */
   private stagingDraftEntries(state: BuildRunState): Array<{ path: string; contentHash: string }> {
     const docsDir = path.join(state.stagingRoot, 'docs');
@@ -4340,6 +4465,7 @@ export class AgentToolService {
     pendingRequiredRewrites: string[];
     pendingIndependentReviewPaths: string[];
     reviewedUnpublishedDraftPaths: string[];
+    stageBlockedPaths: Array<{ path: string; groups: Array<{ code: string; count: number; examples: string[] }> }>;
   } {
     const entries = this.stagingDraftEntries(state);
     const manifest = this.storeFor(context.options.outputRoot).readManifest();
@@ -4371,16 +4497,18 @@ export class AgentToolService {
     let pendingIndependentReviewPaths = [...unpublishedDraftPaths];
     if (state.v2 && unpublishedDraftPaths.length > 0) {
       const documentHashes = new Map(entries.map(entry => [entry.path, entry.contentHash]));
+      const subjectOf = standardReviewSubjectResolver(state.stagingRoot, state.gatePolicy);
       const authority = collectAuthorityValidatedReports({ stagingRoot: state.stagingRoot, store: state.v2.actorStore,
         current: resolveCurrentReviewDependencies({ stagingRoot: state.stagingRoot, snapshot: state.snapshot,
-          workflowRulesHash: state.v2WorkflowRulesHash ?? null }), documentHashes });
+          workflowRulesHash: state.v2WorkflowRulesHash ?? null }), documentHashes, subjectOf });
       pendingIndependentReviewPaths = missingScopedPassReviewPaths({ writtenPaths: unpublishedDraftPaths,
         documentHashes, basePromotionHashes: {}, validReportIds: new Set(authority.validReportIds),
-        receipts: state.v2.actorStore.listReviews() });
+        receipts: state.v2.actorStore.listReviews(), subjectOf });
     }
     const needsReview = new Set(pendingIndependentReviewPaths);
     return { carriedPublishedPaths, promotedUnchangedPaths, unpublishedDraftPaths, pendingRequiredRewrites,
-      pendingIndependentReviewPaths, reviewedUnpublishedDraftPaths: unpublishedDraftPaths.filter(docPath => !needsReview.has(docPath)) };
+      pendingIndependentReviewPaths, reviewedUnpublishedDraftPaths: unpublishedDraftPaths.filter(docPath => !needsReview.has(docPath)),
+      stageBlockedPaths: [...(state.progressiveBlocked ?? [])].map(([docPath, value]) => ({ path: docPath, groups: value.groups })) };
   }
 
   // ------------------------------------------------------------------
@@ -4468,6 +4596,13 @@ export class AgentToolService {
     const identityGaps = objectMigrationGaps({
       previous: priorKnowledge, draft: this.loadKnowledgeDraft(state), plan: migrationPlan,
       previousDocSources: new Map(published?.docs?.map((doc) => [doc.path, doc.sources]) ?? []),
+      currentDocSources: new Map([...(state.docMeta ?? [])].map(([docPath, meta]) => [docPath, meta.sources])),
+      previousDocBody: (docPath) => {
+        if (!published) return '';
+        try { return stripStdHeader(fs.readFileSync(resolveInside(path.join(context.options.outputRoot,
+          'releases', published.releaseId, 'docs'), docPath, 'read'), 'utf8')); }
+        catch { return ''; }
+      },
       docBody: (docPath) => {
         if (!bodyCache.has(docPath)) {
           try { bodyCache.set(docPath, stripStdHeader(fs.readFileSync(resolveInside(path.join(state.stagingRoot, 'docs'), docPath, 'read'), 'utf8'))); }
@@ -4484,17 +4619,26 @@ export class AgentToolService {
       const id = context.buildId ?? state.v2?.actorStore.buildId;
       const file = id && path.join(context.options.outputRoot, '.builds', id, 'report.json');
       if (file && fs.statSync(file).size <= 8 * 1024 * 1024) {
-        const report = JSON.parse(fs.readFileSync(file, 'utf8')) as { generatedAt?: string; issues?: Array<{ code?: string; message?: string }> };
-        const groups = new Map<string, { code: string; count: number; examples: string[] }>();
+        const report = JSON.parse(fs.readFileSync(file, 'utf8')) as { generatedAt?: string; issues?: Array<{ code?: string; message?: string; severity?: string }> };
+        const groups = new Map<string, { code: string; severity: string; count: number; examples: string[] }>();
         for (const issue of report.issues ?? []) {
           if (typeof issue.code !== 'string' || typeof issue.message !== 'string') continue;
-          const group = groups.get(issue.code) ?? { code: issue.code, count: 0, examples: [] };
+          const severity = issue.severity ?? 'unknown';
+          const key = `${severity}:${issue.code}`;
+          const group = groups.get(key) ?? { code: issue.code, severity, count: 0, examples: [] };
           group.count += 1;
           if (group.examples.length < 4) group.examples.push(issue.message.slice(0, 600));
-          groups.set(issue.code, group);
+          groups.set(key, group);
         }
-        lastPublicationReport = { generatedAt: report.generatedAt ?? null, groups: [...groups.values()],
-          note: '上次门禁记录，含警告；当前结果以再次校验为准。它不是通过凭据。' };
+        const allGroups = [...groups.values()];
+        const blockingGroups = allGroups.filter(group => group.severity === 'blocking');
+        const warningGroups = allGroups.filter(group => group.severity === 'warning');
+        const unknownGroups = allGroups.filter(group => !['blocking', 'warning'].includes(group.severity));
+        lastPublicationReport = { generatedAt: report.generatedAt ?? null, groups: allGroups,
+          blockingCount: blockingGroups.reduce((sum, group) => sum + group.count, 0), blockingGroups,
+          warningCount: warningGroups.reduce((sum, group) => sum + group.count, 0), warningGroups,
+          unknownSeverityCount: unknownGroups.reduce((sum, group) => sum + group.count, 0), unknownGroups,
+          note: '上次门禁记录，不是通过凭据，当前结果以再次校验为准。blockingGroups 是已知阻断；warningGroups 仅披露；unknownGroups 是缺少严重级别的旧记录，须用当前门禁重新核验，不可当作警告。' };
       }
     } catch { /* no previous report, or unreadable legacy diagnostics */ }
     return {
@@ -4545,7 +4689,8 @@ export class AgentToolService {
       return false;
     });
     const errors = validateObjectMigrationRegistration({ previous, draft, existing: plan.migrations, proposed: pending,
-      previousDocSources: new Map(published?.docs?.map((doc) => [doc.path, doc.sources]) ?? []) });
+      previousDocSources: new Map(published?.docs?.map((doc) => [doc.path, doc.sources]) ?? []),
+      currentDocSources: new Map([...(state.docMeta ?? [])].map(([docPath, meta]) => [docPath, meta.sources])) });
     if (errors.length > 0) throw new ToolError('kb_migration_invalid', errors.slice(0, 8).join('；'), 409);
     this.assertRunLeaseActive(context);
     if (pending.length > 0) {
@@ -4788,6 +4933,15 @@ export class AgentToolService {
     const v2 = requireV2Leader(context);
     const requestedRevision = typeof args.requestedRevision === 'string' && args.requestedRevision ? args.requestedRevision : null;
     const summary = typeof args.summary === 'string' ? requireString(args, 'summary', 1, 4000) : null;
+    const skipped = args.skipped === undefined ? [] : requireArray(args, 'skipped').map((raw, index) => {
+      const item = asRecord(raw);
+      if (!item) throw new ToolError('invalid_request', `skipped[${index}] 必须是对象`);
+      const objToken = requireString(item, 'objToken', 1, 256);
+      const reason = requireString(item, 'reason', 1, 500).trim();
+      if (!reason || !state.workset.has(objToken)) throw new ToolError('invalid_request', `skipped[${index}] 理由为空或来源不在工作集`);
+      return { objToken, reason };
+    });
+    if (new Set(skipped.map(item => item.objToken)).size !== skipped.length) throw new ToolError('invalid_request', 'skipped 来源重复');
     const entries = this.stagingDraftEntries(state);
     const candidateHash = computeCandidateHash({ documents: entries });
     // 申请的具体候选标识与当前候选不一致 → 版本冲突（仅同形 64 位哈希
@@ -4821,7 +4975,7 @@ export class AgentToolService {
           }
         },
       };
-      const outcome = await handler({ buildId: v2.actorStore.buildId, generation: v2.actorStore.activeGeneration, candidateHash, requestedRevision, summary, authorityLease });
+      const outcome = await handler({ buildId: v2.actorStore.buildId, generation: v2.actorStore.activeGeneration, candidateHash, requestedRevision, summary, skipped, authorityLease });
       v2.actorStore.settlePublishRequest(request.requestId, outcome.accepted ? 'accepted' : 'rejected', outcome.result);
       const reasons = Array.isArray(outcome.result.reasons) ? outcome.result.reasons.map(String) : [];
       const details = Array.isArray(outcome.result.details) ? outcome.result.details.map(String) : [];
@@ -5333,7 +5487,7 @@ export class AgentToolService {
       },
     };
     if (v2Info?.actor) {
-      this.v2RecordReceipt({ v2: v2Info.v2, nativeTaskId: v2Info.actor!.nativeTaskId, kind: 'edit_doc', operationId: v2Info.operationId, payloadHash: v2Info.payloadHash, paths: [docPath], result: enriched, invalidateReviews: true });
+      this.v2RecordReceipt({ v2: v2Info.v2, nativeTaskId: v2Info.actor!.nativeTaskId, kind: 'edit_doc', operationId: v2Info.operationId, payloadHash: v2Info.payloadHash, paths: [docPath], result: enriched, invalidateReviews: true, subjectState: state });
     }
     return enriched;
     };

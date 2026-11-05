@@ -212,7 +212,9 @@ describe('源选择 → 源diff → 按变更更新 → 独立版本', () => {
   });
 
   it('发布前检查绕过工具写入的来源说明，并保留原始规则和来源追溯', async () => {
-    const f = await fixture(); expect((await f.build('full')).status).toBe('published');
+    const f = await fixture();
+    await f.configManager.updateConfig({ standardKb: { ...f.configManager.getConfig().standardKb, strictGates: true } });
+    expect((await f.build('full')).status).toBe('published');
     const manifest = f.published().readManifest()!;
     const doc = (await f.call(`/api/kb/docs/${manifest.docs[0].docId}`)).data;
     expect(doc.markdown).toContain('怒气不足时不能释放技能');

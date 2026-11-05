@@ -13,6 +13,9 @@ import type { PathClaimPreload } from './path-claims.js';
 type DocMeta = { title: string; summary: string; tags: string[]; sources: string[] };
 export interface BuildCheckpoint {
   schemaVersion: 1;
+  /** 缺失或无效的历史字段按严格门禁恢复。 */
+  gatePolicy?: import('./gate-policy.js').GatePolicy;
+  progressiveBlocked?: Array<[string, { key: string; groups: Array<{ code: string; count: number; examples: string[] }>; at: string }]>;
   buildId: string;
   knowledgeBaseRoot: string;
   baseReleaseId: string | null;

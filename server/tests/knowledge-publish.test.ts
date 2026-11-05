@@ -17,6 +17,10 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { compileKnowledgeRelease, type CompilerDocInput, type KnowledgeDeclarationSet } from '../src/kb/knowledge-compiler.js';
 import { runKnowledgeGates, type GateSidecarInput } from '../src/kb/knowledge-validator.js';
+import { verifiedEvidenceKey } from '../src/kb/verified-evidence.js';
+import { gateAttribution } from '../src/kb/gate-attribution.js';
+import { applyGatePolicy } from '../src/kb/gate-policy.js';
+import { validateKnowledgeGraph, type KnowledgeManifest } from '../src/kb/knowledge-schema.js';
 import { KbBuildService } from '../src/kb/kb-build-service.js';
 import { RawSourceSnapshot, computeSourceHash } from '../src/kb/raw-source-snapshot.js';
 import { StandardKbStore } from '../src/kb/standard-kb-store.js';
@@ -237,6 +241,9 @@ function gatesOf(options: {
   sidecars?: GateSidecarInput | false;
   previousObjectIds?: string[];
   draftEvidenceScopePaths?: string[];
+  verifiedEvidence?: ReadonlySet<string>;
+  receipts?: import('../src/kb/evidence-locator.js').EvidenceReadReceipt[];
+  beforeGate?: () => void;
 } = {}) {
   const snap = snapshot();
   const draft = options.draft ?? happyDraft();
@@ -252,6 +259,7 @@ function gatesOf(options: {
     }],
     ...(options.previousObjectIds ? { previousObjectIds: options.previousObjectIds } : {}),
   });
+  options.beforeGate?.();
   return runKnowledgeGates({
     compiled,
     draftDocPaths: new Set(options.draftEvidenceScopePaths ?? Object.entries(draft.docs)
@@ -260,7 +268,8 @@ function gatesOf(options: {
     reviews: options.reviews ?? reviewPool(),
     snapshot: snap,
     knowledgeBaseRoot: kbRoot,
-    receipts: [{ readReceiptId: 'krr_1', resourceId: 'tokSrc', lineStart: 1, lineEnd: 3 }],
+    receipts: options.receipts ?? [{ readReceiptId: 'krr_1', resourceId: 'tokSrc', lineStart: 1, lineEnd: 3 }],
+    verifiedEvidence: options.verifiedEvidence,
     ...(options.sidecars === false ? {} : { sidecars: options.sidecars ?? sidecarsOf(compiled) }),
   });
 }
@@ -425,6 +434,44 @@ describe('diting F02/F07：坐标基准与围栏状态机', () => {
 // ---------------------------------------------------------------------------
 
 describe('门禁：runKnowledgeGates', () => {
+  it('增量仅对可证明完全承接的历史 stale 作用域降级，改动面与全局结构不降级', () => {
+    const draft = happyDraft();
+    draft.objects[0]!.revision = 2;
+    const previous: KnowledgeManifest = { schemaVersion: 1, documents: Object.entries(draft.docs).map(([path, doc]) => ({ path, docId: doc.docId })),
+      objects: draft.objects, presentations: draft.presentations, relations: draft.relations,
+      evidence: draft.evidence, coverage: draft.coverage, migrations: [] };
+    const current = structuredClone(previous);
+    const stale = validateKnowledgeGraph(current).find(issue => issue.code === 'kb_restatement_stale')!;
+    expect(stale).toBeDefined();
+    const policy = { strict: false, version: 1 as const };
+    const classify = (paths: string[]) => applyGatePolicy([stale], policy,
+      gateAttribution({ current, previous, draftPaths: new Set(paths),
+        sourcePaths: new Map([['tokSrc', new Set(['damage.md', 'combat/overview.md'])]]), changedSources: new Set() }));
+    expect(classify(['units/unit.md']).warnings).toHaveLength(1);
+    expect(classify(['damage.md']).blocking).toHaveLength(1);
+    expect(classify(['combat/overview.md']).blocking).toHaveLength(1);
+    const changed = gateAttribution({ current, previous, draftPaths: new Set(),
+      sourcePaths: new Map([['tokSrc', new Set(['damage.md', 'combat/overview.md'])]]), changedSources: new Set(['tokSrc']) });
+    expect(applyGatePolicy([stale], policy, changed).blocking).toHaveLength(1);
+    const global = { ...stale, code: 'kb_relation_invalid' };
+    expect(applyGatePolicy([global], policy, () => false).blocking).toHaveLength(1);
+    expect(applyGatePolicy([stale], policy, gateAttribution({ current, previous: null, draftPaths: new Set(), sourcePaths: new Map() })).blocking).toHaveLength(1);
+  });
+  it('仅服务端标记的未变证据可复用写时校验；改证据或源仍阻断', () => {
+    const draft = happyDraft();
+    const proof = new Set([verifiedEvidenceKey(draft.evidence[0]!)]);
+    const valid = gatesOf({ draft, verifiedEvidence: proof, receipts: [] });
+    expect(valid.blocking.filter(issue => issue.code === 'kb_evidence_unresolved')).toEqual([]);
+    const strict = gatesOf({ draft, receipts: [] });
+    expect(strict.blocking.some(issue => issue.code === 'kb_evidence_unresolved')).toBe(true);
+    const altered = structuredClone(draft);
+    altered.evidence[0]!.quoteHash = 'sha256:forged';
+    expect(gatesOf({ draft: altered, verifiedEvidence: proof, receipts: [] }).blocking.some(issue => issue.code === 'kb_evidence_unresolved')).toBe(true);
+    try {
+      const changed = gatesOf({ draft, verifiedEvidence: proof, receipts: [], beforeGate: () => fs.writeFileSync(path.join(kbRoot, SRC_REL), '源已变化') });
+      expect(changed.blocking.some(issue => issue.code === 'kb_evidence_unresolved')).toBe(true);
+    } finally { fs.writeFileSync(path.join(kbRoot, SRC_REL), SRC_CONTENT); }
+  });
   it('新草稿把正文范围冒充图片机器描述时阻止发布，继承文档仍可保留旧证据', () => {
     const invalid = happyDraft((draft) => {
       draft.docs['damage.md']!.basis = 'draft';
@@ -533,7 +580,7 @@ describe('门禁：runKnowledgeGates', () => {
   });
 
   it('diting F03：高风险 claim 无人工复核凭据 → kb_review_human_missing warning（缩范围：披露不阻断）', () => {
-    const gates = gatesOf();
+    const gates = gatesOf({ draftEvidenceScopePaths: ['damage.md'] });
     // happy fixture 的 ko_objDamage 携带高风险 claim，且只有机器审凭据
     const warnings = gates.warnings.filter((item) => item.code === 'kb_review_human_missing');
     expect(warnings).toHaveLength(1);
@@ -695,6 +742,43 @@ describe('发布布局：v1 基线与 v2 sidecar', () => {
     expect(index.objectsByDoc.get('damage.md')!.map((o) => o.objectId)).toContain('ko_objDamage');
   });
 
+  it('普通增量历史 exact stale：strict 阻断，standard 保守阻断未展开片段并披露 graph 警告', async () => {
+    const service = makeService();
+    const snap = snapshot();
+    // 测试 fixture：构造先前规则可产生 stale 的 CURRENT，不代表真实生产 release。
+    const pointerPath = path.join(outputRoot, 'CURRENT.json');
+    const previousPointer = fs.existsSync(pointerPath) ? fs.readFileSync(pointerPath) : null;
+    try {
+    const base = 'r_stale_fixture';
+    const originalStage = stageBuild('b_stale_base');
+    await service.publishRelease(publishArgs('b_stale_base', base, originalStage, null, snap));
+    const baseRoot = path.join(outputRoot, 'releases', base);
+    const prior = JSON.parse(fs.readFileSync(path.join(baseRoot, 'knowledge.json'), 'utf8'));
+    prior.objects.find((obj: KnowledgeObject) => obj.objectId === 'ko_objDamage').revision = 2;
+    const priorBytes = `${JSON.stringify(prior, null, 2)}\n`;
+    fs.writeFileSync(path.join(baseRoot, 'knowledge.json'), priorBytes);
+    const manifest = JSON.parse(fs.readFileSync(path.join(baseRoot, 'manifest.json'), 'utf8'));
+    manifest.releaseId = base;
+    manifest.organization.hash = `sha256:${crypto.createHash('sha256').update(priorBytes).digest('hex')}`;
+    fs.writeFileSync(path.join(baseRoot, 'manifest.json'), JSON.stringify(manifest));
+    for (const strict of [true, false]) {
+      const buildId = `b_stale_${strict}`;
+      const draft = happyDraft(); draft.objects[0]!.revision = 2;
+      const staging = stageBuild(buildId, { draft });
+      await expect(service.publishRelease({ ...publishArgs(buildId, `r_stale_${strict}`, staging, base, snap),
+        mode: 'incremental', gatePolicy: { strict, version: 1 }, writtenPaths: new Set(['syntax.md']) }))
+        .rejects.toMatchObject({ code: 'kb_publish_blocked' });
+      const report = JSON.parse(fs.readFileSync(path.join(outputRoot, '.builds', buildId, 'report.json'), 'utf8'));
+      const stale = report.issues.filter((issue: { code: string }) => issue.code === 'kb_restatement_stale');
+      expect(stale.some((issue: { message: string; severity: string }) => issue.message.includes('exact 片段') && issue.severity === 'blocking')).toBe(true);
+      expect(stale.some((issue: { message: string; severity: string }) => issue.message.includes('呈现绑定') && issue.severity === (strict ? 'blocking' : 'warning')), JSON.stringify(stale)).toBe(true);
+    }
+    } finally {
+      if (previousPointer) fs.writeFileSync(pointerPath, previousPointer);
+      else fs.rmSync(pointerPath, { force: true });
+    }
+  });
+
   it('最终发布继承未变化文档的冻结图片；新草稿不能借旧图片绕过证据装配', async () => {
     const service = makeService();
     const snap = snapshot();
@@ -768,8 +852,10 @@ describe('发布布局：v1 基线与 v2 sidecar', () => {
     expect(new StandardKbStore(outputRoot).readCurrent()!.releaseId).toBe('r_kp2');
     expect(fs.existsSync(path.join(staging, 'knowledge-draft.json'))).toBe(true);
     expect(fs.existsSync(path.join(outputRoot, 'releases', 'r_kp3'))).toBe(false);
-    const report = JSON.parse(fs.readFileSync(path.join(outputRoot, '.builds', 'b_kp_dup', 'report.json'), 'utf8')) as { issues: Array<{ code: string }> };
-    expect(report.issues.some((issue) => issue.code === 'kb_object_duplicate')).toBe(true);
+    const report = JSON.parse(fs.readFileSync(path.join(outputRoot, '.builds', 'b_kp_dup', 'report.json'), 'utf8')) as { issues: Array<{ code: string; severity?: string }> };
+    const duplicates = report.issues.filter(issue => issue.code === 'kb_object_duplicate');
+    expect(duplicates.length).toBeGreaterThan(0);
+    expect(duplicates.every(issue => issue.severity === 'blocking')).toBe(true);
   });
 
   it('审查凭据缺失（无 candidate.json）→ 知识化发布阻断', async () => {

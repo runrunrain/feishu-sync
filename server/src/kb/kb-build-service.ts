@@ -78,7 +78,7 @@ import {
   type ResolvedRoleModel,
   type ReviewReport,
 } from './orchestration-contracts.js';
-import { collectAuthorityValidatedReports, missingScopedPassReviewPaths, resolveCurrentReviewDependencies } from './review-authority.js';
+import { collectAuthorityValidatedReports, missingScopedPassReviewPaths, receiptHasSubjectBinding, resolveCurrentReviewDependencies, standardReviewSubjectResolver } from './review-authority.js';
 import { contentResourceHash, verifyEvidence } from './evidence-locator.js';
 import type { EvidenceReadReceipt, EvidenceResource } from './evidence-locator.js';
 // D3（A案 §5.2/§5.4）：工作簿/图片证据资源装配与 evidence/ 落盘规划
@@ -90,6 +90,9 @@ import {
   type WorkbookEvidencePayload,
 } from './evidence-resources.js';
 import { evidenceBudgetForPublication } from './evidence-budget.js';
+import { applyGatePolicy } from './gate-policy.js';
+import { gateAttribution } from './gate-attribution.js';
+import { EVIDENCE_BUDGET_MAX_BYTES } from '../types/agent-knowledge.js';
 import {
   compileKnowledgeRelease,
   type CompilerDocInput,
@@ -198,6 +201,7 @@ interface BuildMetricsCollector {
 
 interface InMemoryBuild {
   id: string;
+  gatePolicy: import('./gate-policy.js').GatePolicy;
   /** 基座在创建构建时固定，设置变更只影响之后的新构建。 */
   backend?: 'pi' | 'claude-code';
   /** 重构 v2：构建创建时冻结的编排模式（legacy / pi-amagi；旧检查点
@@ -399,7 +403,7 @@ export class KbBuildService extends EventEmitter {
   }
 
   private newEntry(id: string, backend: 'pi' | 'claude-code', mode: 'full' | 'incremental', rebuildSelected = false, refreshImages = false, orchestrationMode: KbBuildOrchestrationMode = 'pi-amagi'): InMemoryBuild {
-    return { id, backend, orchestrationMode, requestedMode: mode, rebuildSelected, refreshImages, imageRefreshFailures: 0,
+    return { id, gatePolicy: { strict: true, version: 1 }, backend, orchestrationMode, requestedMode: mode, rebuildSelected, refreshImages, imageRefreshFailures: 0,
       batchIndex: 0, batchTotal: 0, buildState: null, cancelRequested: false, cancelController: null, timedOut: false,
       workers: new Map(), stage: null, units: { total: 0, done: 0, running: 0, failed: 0, retried: 0 },
       images: { total: 0, described: 0, cached: 0, unavailable: 0 }, process: null, events: [], nextSeq: 1,
@@ -418,6 +422,8 @@ export class KbBuildService extends EventEmitter {
     const batchesDone = units.length ? unitDone.length === units.length : entry.singleCompleted >= entry.singleBatches.length;
     try {
       new BuildCheckpointStore(this.outputRoot()).save({ schemaVersion: 1, buildId, knowledgeBaseRoot: state.knowledgeBaseRoot,
+        gatePolicy: entry.gatePolicy,
+        progressiveBlocked: [...(state.progressiveBlocked ?? [])],
         baseReleaseId: entry.baseReleaseId, requestedMode: entry.requestedMode, mode: state.mode, backend: entry.backend ?? 'pi', orchestrationMode: entry.orchestrationMode, rebuildSelected: entry.rebuildSelected,
         snapshot: state.snapshot.entries, workset: [...state.workset], docMeta: [...(state.docMeta ?? [])], writtenPaths: [...(state.writtenPaths ?? [])],
         preservedDocs: [...(state.preservedDocs ?? [])], requiredRewrites: [...(state.requiredRewrites ?? [])], baseDocPaths: [...(state.baseDocPaths ?? [])],
@@ -800,6 +806,7 @@ export class KbBuildService extends EventEmitter {
       createdAt: new Date().toISOString(),
     });
     this.active.set(buildId, this.newEntry(buildId, config.agent.runtime.backend === 'claude-code' ? 'claude-code' : 'pi', input.mode, input.rebuildSelected === true, input.refreshImages === true, orchestrationMode));
+    this.active.get(buildId)!.gatePolicy = { strict: config.standardKb.strictGates === true, version: 1 };
 
     // 异步执行（登记 Promise 供 shutdown 等待收口）
     this.launchPipeline(buildId, this.runPipeline(localMapStore as never, buildId, input.mode), (error) => {
@@ -895,6 +902,8 @@ export class KbBuildService extends EventEmitter {
     const savedMode = checkpoint.orchestrationMode ?? (checkpoint.leaderRun ? 'pi-amagi' : row.orchestration_mode ?? 'legacy');
     if (savedMode !== 'legacy' && savedMode !== 'pi-amagi') throw new ToolError('build_mode_unavailable', '检查点运行模式不受支持，拒绝用legacy解释', 409);
     const entry = this.newEntry(buildId, checkpoint.backend, checkpoint.requestedMode, checkpoint.rebuildSelected, false, savedMode);
+    entry.gatePolicy = checkpoint.gatePolicy?.version === 1 && checkpoint.gatePolicy.strict === false
+      ? { strict: false, version: 1 } : { strict: true, version: 1 };
     if (savedMode === 'pi-amagi') {
       // 重构 v2：新模式检查点只走新模式恢复（会话级/成果级由流水线内
       // 监督器校验），不得用旧调度器解释新任务状态（设计 §13.5）。
@@ -1379,8 +1388,7 @@ export class KbBuildService extends EventEmitter {
       `- 并发上限：${resolveBuildConcurrency(config.standardKb)}（amagi 准入分池冻结）`,
       ...(skipBriefing ? [skipBriefing] : []),
       '',
-      'build_manifest 工作集每页最多 12 个来源：读到首页就派发已有明确输入的任务；每轮最多 4 个 task_submit、每份任务书约 1500 字以内，其余任务后续轮次派发；再按 nextCursor 逐页读完，最终发布前确认 nextCursor=null。',
-      '先经 build_manifest 默认 scope=workset 读取本轮唯一派发范围；scope=all 仅供背景查询，不为未变化基准源派任务。新增长文/表格按一篇目标文档一个写作任务派发，单篇读完即写，多个任务并发。不同主题的大表尽量分成不同目标文档；CSV 明细必须优先用 kb_write_doc.csvTableImports 从冻结附件自动导入，不让作者逐行复制到工具 JSON。子任务完整角色规则与示例由应用校验冻结哈希后直接注入系统提示，任务书给出本篇来源 token、目标路径和范围即可，不要求先读技能文件。objToken 只在任务正文和 MCP 调用中使用，不是 task_submit.inputs.required 的本地路径。首批任务具备输入后立即派发；每篇写入后尽快派单篇审查并阶段发布，全部成果通过审查后申请发布当前精确候选版本。',
+      '从 build_manifest 工作集开始，读到首页即可派发，按 nextCursor 读完；每篇明确来源与目标并分配完整路径，写入后尽快派独立审查。规则密集材料按可交付主题拆分，纯明细表可用 csvTableImports 导入。最终以应用发布结果为准。',
     ].join('\n');
     const resumeBriefing = [
       '# Leader 运行交代（续接）',
@@ -1390,10 +1398,11 @@ export class KbBuildService extends EventEmitter {
       '',
       '## 续接交代',
       '',
-      `构建 ${input.buildId} 从检查点恢复（第 ${generation} 代）。已接受成果与未解决问题以应用账本为准：先用 build_checkpoint(action=status) 查看成果状态，再组织剩余工作。旧式整库范围审查凭据已作废；现有草稿若尚无有效单篇审查回执，须安排独立审查，不必重写正文。每篇审查通过后应用会自动阶段发布，其他任务继续；全部完成后再申请最终发布当前精确候选版本。不要重写已接受且未受影响的草稿。`,
-      '恢复时同时看 build_manifest.identityGaps 与 lastPublicationReport。承接文档的图片证据由应用从不可变正式版本读取并验证，不需要为此重写承接文档。旧的应用侧发布错误须结合当前门禁结果复核，确认解决后更新问题清单；剩余身份去向须核对正文和共同来源后登记迁移。不要把已解决的旧故障永久保留为阻断，也不要重复提交未变化的失败候选。',
-      'documentWorkStatus.pendingIndependentReviewPaths 是仍缺当前有效单篇审查的精确列表：旧交接中的 pass 可能已经过期，不能据此跳过。优先并行派发该列表的独立审查，同时处理迁移。经独立核对确认来源不再支持的已移出对象，可以 build_register_migrations(kind=remove, successorObjectIds=[]) 登记具体移除依据；不得为通过门禁删除仍有效的知识，也不虚构后继。',
-      '若需重新读取 build_manifest，工作集每页最多 12 个来源；按 nextCursor 逐页读取，并优先派发已有明确输入的首批任务。',
+      `构建 ${input.buildId} 从检查点恢复（第 ${generation} 代）；先用 build_checkpoint(action=status) 对账已接受成果与待办。`,
+      '按 documentWorkStatus.pendingIndependentReviewPaths 和 stageBlockedPaths 处理仍需审查或被阻断的路径；正式承接文档不因旧回执失效而重写。',
+      '恢复派发前读取 build_handoff_list：来源、正文与声明未变的取证结论应复用；仅具体依赖变化或交接明确缺证时定向补查。审查权限以应用当前有效回执为准。',
+      '发布报告按 blockingGroups 定向处理，warningGroups、范围外提示和 normal 级未解决覆盖项仅披露，不扩大调查或改写。旧报告缺严重级别时重跑当前校验，不凭旧文本猜测阻断。',
+      '核对 identityGaps 后再登记有实际依据的迁移；来源不再支持的对象可登记 remove，不删除有效知识、不虚构后继，不重复申请未变化的失败候选。',
       ...(skipBriefing ? [skipBriefing] : []),
     ].join('\n');
     return {
@@ -1583,7 +1592,19 @@ export class KbBuildService extends EventEmitter {
     const pendingPaths = new Set(KbBuildService.stagingDocsEntriesOf(state.stagingRoot)
       .filter((doc) => state.writtenPaths?.has(doc.path) && promotionHashes[doc.path] !== doc.contentHash)
       .map((doc) => doc.path));
-    const invalidated = store.invalidateReviewsForWorkflowRevision(revision, pendingPaths);
+    // F01（P2 §2.3-6）：标准门禁下规则升级不使已绑定审查主体的内容审查失效；
+    // 无 subject 键的旧回执与严格模式照旧撤销。
+    const standard = state.gatePolicy?.strict === false;
+    let retained = 0;
+    const invalidated = store.invalidateReviewsForWorkflowRevision(revision, pendingPaths,
+      standard ? (review) => {
+        const keep = receiptHasSubjectBinding(review);
+        if (keep) retained += 1;
+        return keep;
+      } : undefined);
+    if (retained > 0) {
+      this.emitLog(buildId, 'info', `工作流规则版本变化（→ ${revision.slice(0, 12)}）：标准门禁保留 ${retained} 份已绑定审查主体的回执，不要求重审`);
+    }
     if (invalidated.length === 0) return [];
     const invalidReportIds = new Set(invalidated.map((review) => review.reportId).filter((id): id is string => !!id));
     const file = path.join(state.stagingRoot, 'knowledge-draft.json');
@@ -1659,6 +1680,8 @@ export class KbBuildService extends EventEmitter {
       current: resolveCurrentReviewDependencies({ stagingRoot: liveRoot, snapshot: state.snapshot,
         workflowRulesHash: entry.leaderRun?.spec.workflowRevision ?? state.v2WorkflowRulesHash ?? null }),
       documentHashes: hashes,
+      // F01：标准门禁下带 subject 键的回执按审查主体核验（passReports 同源）。
+      subjectOf: standardReviewSubjectResolver(liveRoot, state.gatePolicy),
     });
     const validIds = new Set(authority.validReportIds);
     const passReports = new Map<string, ReviewReport>();
@@ -1679,9 +1702,35 @@ export class KbBuildService extends EventEmitter {
         && objects.every((object) => object.reviewStatus === 'passed' && object.reviewerId === report.reportId);
     });
     const oldPromotionHashes = baseManifest?.buildId === buildId ? baseManifest.promotionHashes ?? {} : {};
-    const newPaths = ready.filter((docPath) => (!onlyPath || docPath === onlyPath)
+    let newPaths = ready.filter((docPath) => (!onlyPath || docPath === onlyPath)
       && hashes.get(docPath) !== oldPromotionHashes[docPath]
       && hashes.get(docPath) !== baseManifest?.docs.find((doc) => doc.path === docPath)?.contentHash);
+    // Conservatively include the whole candidate: another document can repair a
+    // shared blocker, so a document-only key could suppress a valid retry.
+    const fileFingerprint = (file: string): string | null => {
+      try { return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex'); }
+      catch { return null; }
+    };
+    const commonKey = crypto.createHash('sha256').update(JSON.stringify({
+      baseReleaseId, entries, draft: liveDraft, snapshot: state.snapshot.entries,
+      policy: state.gatePolicy, reviews: state.v2.actorStore.listReviews(),
+      receipts: fileFingerprint(path.join(liveRoot, 'read-receipts.jsonl')),
+      plan: fileFingerprint(path.join(liveRoot, 'organization-plan.json')),
+      governance: fileFingerprint(path.join(liveRoot, 'governance-freeze.json')),
+      reports: state.v2.actorStore.listReviews().map(review => [review.reportUnitId,
+        review.reportUnitId ? fileFingerprint(path.join(liveRoot, 'reviews', `${review.reportUnitId}.json`)) : null]),
+      descriptions: [...(state.imageDescriptions ?? [])].map(([source, values]) => [source, [...values]]),
+    })).digest('hex');
+    const blockKeys = new Map(newPaths.map(docPath => [docPath,
+      crypto.createHash('sha256').update(`${docPath}\0${commonKey}`).digest('hex')]));
+    state.progressiveBlocked ??= new Map();
+    newPaths = newPaths.filter(docPath => {
+      const old = state.progressiveBlocked!.get(docPath);
+      if (!old) return true;
+      if (old.key === blockKeys.get(docPath)) return false;
+      state.progressiveBlocked!.delete(docPath);
+      return true;
+    });
     if (newPaths.length === 0) return;
     // A blocked source or declaration in one document must not hold other
     // reviewed documents behind a multi-document stage's early-return gates.
@@ -1795,12 +1844,16 @@ export class KbBuildService extends EventEmitter {
         const meta = state.docMeta?.get(docPath);
         if (meta) stageMeta.set(docPath, meta);
       }
-      const issues = validateStagingDocs(stageState, snapshot, { docMeta: stageMeta, outputRoot });
-      if (issues.length > 0) throw new ToolError('kb_progressive_validation_failed', issues.slice(0, 3).map((item) => item.code).join(', '), 409);
+      const issues = this.validateStaging(stageState, snapshot, stageMeta, outputRoot);
+      if (issues.length > 0) throw Object.assign(new ToolError('kb_progressive_validation_failed', issues.slice(0, 3).map((item) => item.code).join(', '), 409),
+        { details: { groups: issues.map(item => ({ code: item.code, count: 1, examples: [item.message] })) } });
       const sourceContents = captureSourceContents(snapshot, config.knowledgeBaseRoot);
       const changePreview = sourceChangePreview(snapshot, sourceContents, baseManifest,
         versionStore.readSourceContents(baseReleaseId), new Set(this.deps.excludedSourcesProvider?.() ?? []));
       await this.publishRelease({ buildId, releaseId, mode: 'incremental', baseReleaseId,
+        reportWarnings: stageState.validationWarnings,
+        gatePolicy: state.gatePolicy,
+        verifiedEvidence: state.verifiedEvidence,
         buildSourceCount: state.workset.size,
         knowledgeBaseRoot: config.knowledgeBaseRoot, model: ctx.model, snapshot,
         stagingRoot: tempRoot, outputRoot, docMeta: stageMeta, sourceContents, changePreview,
@@ -1817,6 +1870,7 @@ export class KbBuildService extends EventEmitter {
         },
       });
       entry.baseReleaseId = releaseId;
+      for (const docPath of newPaths) state.progressiveBlocked.delete(docPath);
       ctx.baseReleaseId = releaseId;
       if (entry.leaderRun) entry.leaderRun.material.baseReleaseId = releaseId;
       ctx.updateKbBuild({ releaseId, docsWritten: state.writtenPaths?.size ?? 0 });
@@ -1830,6 +1884,17 @@ export class KbBuildService extends EventEmitter {
       // baseline changed. Re-evaluate against the new CURRENT in the same job.
       this.progressiveDirty.add(buildId);
     } catch (error) {
+      if (error instanceof ToolError && (error.code === 'kb_publish_blocked' || error.code === 'kb_progressive_validation_failed')) {
+        const details = (error as ToolError & { details?: { groups?: Array<{ code: string; count: number; examples: string[] }> } }).details;
+        const groups = (details?.groups ?? [{ code: error.code, count: 1, examples: [error.message] }])
+          .map(group => ({ code: group.code, count: group.count, examples: group.examples.slice(0, 2) }));
+        const deterministic = new Set(['kb_link_invalid', 'kb_coverage_invalid', 'kb_migration_invalid', 'kb_restatement_stale', 'body_contains_change_history', 'body_contains_source_metadata']);
+        if (groups.length > 0 && groups.every(group => deterministic.has(group.code))) {
+          for (const docPath of newPaths) state.progressiveBlocked.set(docPath, { key: blockKeys.get(docPath)!, groups, at: new Date().toISOString() });
+          this.persistCheckpoint(buildId);
+          this.emitBuild(buildId, 'build_progressive_blocked', { paths: newPaths, groups });
+        }
+      }
       // One blocked document must not hold back unrelated reviewed documents.
       // Re-evaluate each path against the newest CURRENT after every success.
       if (!onlyPath && newPaths.length > 1
@@ -1852,6 +1917,7 @@ export class KbBuildService extends EventEmitter {
   /** The final publication owns the pointer after any in-flight stage settles. */
   async executeLeaderPublishRequest(request: {
     buildId: string; generation: number; candidateHash: string; requestedRevision: string | null; summary: string | null;
+    skipped?: Array<{ objToken: string; reason: string }>;
   }): Promise<{ accepted: boolean; result: Record<string, unknown> }> {
     this.finalizingBuilds.add(request.buildId);
     try {
@@ -1869,6 +1935,7 @@ export class KbBuildService extends EventEmitter {
     candidateHash: string;
     requestedRevision: string | null;
     summary: string | null;
+    skipped?: Array<{ objToken: string; reason: string }>;
   }): Promise<{ accepted: boolean; result: Record<string, unknown> }> {
     const entry = this.active.get(request.buildId);
     const ctx = entry?.leaderPipelineContext;
@@ -1894,6 +1961,19 @@ export class KbBuildService extends EventEmitter {
         return { accepted: false, result: { reason: 'candidate_conflict', message: `申请候选 ${request.candidateHash.slice(0, 12)}… 与当前 ${current.slice(0, 12)}… 不一致（校验期间候选被写入或已过期）`, current } };
       }
       buildState.finishInfo = buildState.finishInfo ?? { summary: request.summary ?? 'Leader 申请发布', skipped: [] };
+      if (request.skipped?.length) {
+        const seen = new Set<string>();
+        for (const item of request.skipped) {
+          if (!buildState.workset.has(item.objToken) || !item.reason.trim() || item.reason.length > 500 || seen.has(item.objToken)) {
+            return { accepted: false, result: { reason: 'invalid_skipped', message: '跳过声明必须属于工作集、理由非空且不能重复' } };
+          }
+          seen.add(item.objToken);
+        }
+        const merged = new Map(buildState.finishInfo.skipped.map(item => [item.objToken, item]));
+        for (const item of request.skipped) merged.set(item.objToken, item);
+        buildState.finishInfo.skipped = [...merged.values()];
+        this.persistCheckpoint(request.buildId);
+      }
       // 权威发布前校验（steer #6：复用 runPipeline 同一入口，不绕过；失败真实返回，CURRENT 不变）
       if (entry.cancelRequested) {
         return { accepted: false, result: { reason: 'build_cancelled', message: '构建已请求取消，发布申请拒绝' } };
@@ -1901,6 +1981,7 @@ export class KbBuildService extends EventEmitter {
       this.throwIfPoisoned(buildState);
       const issues = await this.validateStaging(buildState, buildState.snapshot, buildState.docMeta ?? new Map(), outputRoot);
       if (issues.length > 0) {
+        writeReport(outputRoot, request.buildId, [...issues, ...(buildState.validationWarnings ?? [])]);
         this.emitLog(request.buildId, 'error', `Leader 发布前校验失败（${issues.length} 个问题）：${issues.slice(0, 3).map((issue) => issue.code).join(', ')}`);
         return { accepted: false, result: { reason: 'kb_validation_failed', details: { issues }, reasons: issues.map((issue) => issue.code) } };
       }
@@ -1940,6 +2021,7 @@ export class KbBuildService extends EventEmitter {
           basePromotionHashes: base?.buildId === request.buildId ? base.promotionHashes ?? {} : {},
           validReportIds: new Set(candidateFile.candidate.acceptance.validReportIds),
           receipts: v2Store.listReviews(),
+          subjectOf: standardReviewSubjectResolver(stagingRoot, buildState.gatePolicy),
         });
         if (missing.length > 0) {
           return { accepted: false, result: { reason: 'kb_publish_blocked', reasons: ['review_missing'],
@@ -1994,6 +2076,10 @@ export class KbBuildService extends EventEmitter {
       const authorityLease = (request as { authorityLease?: { validate: () => void } }).authorityLease;
       const manifest = await this.publishRelease({
         buildId: request.buildId,
+        writtenPaths: buildState.writtenPaths,
+        reportWarnings: buildState.validationWarnings,
+        gatePolicy: buildState.gatePolicy,
+        verifiedEvidence: buildState.verifiedEvidence,
         buildSourceCount: buildState.workset.size,
         releaseId,
         mode: ctx.effectiveMode,
@@ -2519,6 +2605,8 @@ export class KbBuildService extends EventEmitter {
 
       // ============ running ============
       entry.buildState = {
+        gatePolicy: entry.gatePolicy,
+        progressiveBlocked: new Map(resume?.progressiveBlocked ?? []),
         knowledgeBaseRoot: config.knowledgeBaseRoot,
         snapshot,
         mode: effectiveMode,
@@ -3034,7 +3122,7 @@ export class KbBuildService extends EventEmitter {
       this.emitLog(buildId, 'info', '开始确定性校验');
       const issues = await this.validateStaging(buildState, snapshot, docMeta, outputRoot);
       if (issues.length > 0) {
-        writeReport(outputRoot, buildId, issues);
+        writeReport(outputRoot, buildId, [...issues, ...(buildState.validationWarnings ?? [])]);
         throw new ToolError(
           'kb_validation_failed',
           `校验失败（${issues.length} 个问题，详见 report）：${issues.slice(0, 3).map((issue) => issue.code).join(', ')}`,
@@ -3123,6 +3211,10 @@ export class KbBuildService extends EventEmitter {
       const manifest = await this.publishRelease({
         buildId,
         buildSourceCount: buildState.workset.size,
+        writtenPaths: buildState.writtenPaths,
+        reportWarnings: buildState.validationWarnings,
+        gatePolicy: buildState.gatePolicy,
+        verifiedEvidence: buildState.verifiedEvidence,
         releaseId,
         mode: effectiveMode,
         baseReleaseId: baseManifest?.releaseId ?? null,
@@ -6254,6 +6346,7 @@ export class KbBuildService extends EventEmitter {
           workflowRulesHash,
         }),
         documentHashes: new Map(documents.map((doc) => [doc.path, doc.contentHash])),
+        subjectOf: standardReviewSubjectResolver(stagingRoot, buildState.gatePolicy),
       });
       validReportIds = authority.validReportIds;
       if (authority.skipped.length > 0) {
@@ -6410,7 +6503,7 @@ export class KbBuildService extends EventEmitter {
       currentDocuments, checkpoint.rebuildSelected ? new Set(checkpoint.workset.map(([token]) => token)) : null);
     const issues = this.validateStaging(state, state.snapshot, state.docMeta ?? new Map(), outputRoot);
     if (issues.length > 0) {
-      writeReport(outputRoot, buildId, issues);
+      writeReport(outputRoot, buildId, [...issues, ...(state.validationWarnings ?? [])]);
       throw new ToolError('kb_publish_blocked', `确认前确定性校验未通过（${issues.length} 个问题，详见 report）`, 409);
     }
     const confirmedAt = new Date().toISOString();
@@ -6450,6 +6543,7 @@ export class KbBuildService extends EventEmitter {
           workflowRulesHash: checkpoint.leaderRun.spec?.workflowRevision ?? null,
         }),
         documentHashes: new Map(entries.map((doc) => [doc.path, doc.contentHash])),
+        subjectOf: standardReviewSubjectResolver(stagingRoot, state.gatePolicy),
       });
       const authorityIds = new Set(authority.validReportIds);
       const staleIds = candidate.acceptance.validReportIds.filter((reportId) => !authorityIds.has(reportId));
@@ -6463,6 +6557,7 @@ export class KbBuildService extends EventEmitter {
         basePromotionHashes: base?.buildId === buildId ? base.promotionHashes ?? {} : {},
         validReportIds: authorityIds,
         receipts: actorStore.listReviews(),
+        subjectOf: standardReviewSubjectResolver(stagingRoot, state.gatePolicy),
       });
       if (missing.length > 0) {
         throw new ToolError('kb_publish_blocked', `确认时缺少当前版本的独立通过复审：${missing.join('、')}`, 409);
@@ -6495,7 +6590,10 @@ export class KbBuildService extends EventEmitter {
     try {
       manifest = await this.publishRelease({
         buildId,
+        writtenPaths: state.writtenPaths,
         buildSourceCount: checkpoint.workset.length,
+        reportWarnings: [...(state.validationWarnings ?? [])],
+        gatePolicy: state.gatePolicy,
         releaseId,
         mode: checkpoint.mode,
         baseReleaseId: checkpoint.baseReleaseId,
@@ -6519,7 +6617,10 @@ export class KbBuildService extends EventEmitter {
       this.freezeOrRefreshGovernanceSnapshot(buildId, outputRoot, stagingRoot, true);
       manifest = await this.publishRelease({
         buildId,
+        writtenPaths: state.writtenPaths,
         buildSourceCount: checkpoint.workset.length,
+        reportWarnings: [...(state.validationWarnings ?? [])],
+        gatePolicy: state.gatePolicy,
         releaseId,
         mode: checkpoint.mode,
         baseReleaseId: checkpoint.baseReleaseId,
@@ -6560,6 +6661,9 @@ export class KbBuildService extends EventEmitter {
   private rebuildBuildStateFromCheckpoint(checkpoint: BuildCheckpoint, stagingRoot: string, knowledgeBaseRoot: string): BuildRunState {
     const snapshot = this.restoreCheckpointSnapshot(checkpoint, knowledgeBaseRoot, this.outputRoot());
     return {
+      gatePolicy: checkpoint.gatePolicy?.version === 1 && checkpoint.gatePolicy.strict === false
+        ? { strict: false, version: 1 } : { strict: true, version: 1 },
+      progressiveBlocked: new Map(checkpoint.progressiveBlocked ?? []),
       knowledgeBaseRoot,
       snapshot,
       mode: checkpoint.mode,
@@ -6724,7 +6828,11 @@ export class KbBuildService extends EventEmitter {
     docMeta: Map<string, { title: string; summary: string; tags: string[]; sources: string[] }>,
     outputRoot: string,
   ): KbBuildReportIssue[] {
-    return validateStagingDocs(state, snapshot, { docMeta, outputRoot });
+    const issues = validateStagingDocs(state, snapshot, { docMeta, outputRoot });
+    const result = applyGatePolicy(issues, state.gatePolicy ?? { strict: true, version: 1 });
+    state.validationWarnings = result.warnings;
+    for (const warning of result.warnings) this.emit('log', `构建校验警告 ${warning.code}：${warning.message}`);
+    return result.blocking;
   }
 
   /**
@@ -6742,6 +6850,10 @@ export class KbBuildService extends EventEmitter {
   /** 发布 release（public 供单测：manifest 生成 + 原子 CURRENT + 保留策略）。 */
   async publishRelease(input: {
     buildId: string;
+    writtenPaths?: ReadonlySet<string>;
+    reportWarnings?: KbBuildReportIssue[];
+    gatePolicy?: import('./gate-policy.js').GatePolicy;
+    verifiedEvidence?: ReadonlySet<string>;
     buildSourceCount?: number;
     releaseId: string;
     mode: 'incremental' | 'full';
@@ -6778,6 +6890,7 @@ export class KbBuildService extends EventEmitter {
      * CURRENT 提交，后续任何失败按已发布收敛，不回滚。 */
     preCommitLease?: () => void;
   }): Promise<KbManifest> {
+    input.reportWarnings ??= [];
     const { outputRoot, releaseId, stagingRoot } = input;
     const docsDir = path.join(stagingRoot, 'docs');
     const releaseDir = path.join(outputRoot, 'releases', releaseId);
@@ -6786,6 +6899,11 @@ export class KbBuildService extends EventEmitter {
 
     try {
       const manifest = await this.publishReleaseInner(input, docsDir, releaseDir);
+      if (input.reportWarnings?.length) writeReport(outputRoot, input.buildId, input.reportWarnings);
+      else {
+        try { fs.rmSync(path.join(outputRoot, '.builds', input.buildId, 'report.json'), { force: true }); }
+        catch { /* 报告清理不改变已提交的 CURRENT。 */ }
+      }
       // F3-R10：指针提交点（publishReleaseInner 末尾的 CURRENT rename）
       // 之后的清理是尽力而为：任何异常不得冒泡到外层 catch（那会删除
       // 刚发布的 current release，把发布真相毁掉）；失败只记日志，多余
@@ -6810,6 +6928,10 @@ export class KbBuildService extends EventEmitter {
   private static knowledgeIssueToReport(issue: ValidationIssue): KbBuildReportIssue {
     return {
       code: issue.code,
+      severity: issue.severity,
+      ...(issue.rule ? { rule: issue.rule } : {}),
+      ...(issue.docPath ? { docPath: issue.docPath } : {}),
+      ...(issue.demotedFrom ? { demotedFrom: issue.demotedFrom } : {}),
       message: `${issue.field ? `[${issue.field}] ` : ''}${issue.message}`,
       ...(issue.objectId ? { objToken: issue.objectId } : {}),
     };
@@ -6826,6 +6948,10 @@ export class KbBuildService extends EventEmitter {
    */
   private async prepareKnowledgePublish(input: {
     buildId: string;
+    writtenPaths?: ReadonlySet<string>;
+    reportWarnings?: KbBuildReportIssue[];
+    gatePolicy?: import('./gate-policy.js').GatePolicy;
+    verifiedEvidence?: ReadonlySet<string>;
     buildSourceCount?: number;
     releaseId: string;
     mode: 'incremental' | 'full';
@@ -6945,7 +7071,7 @@ export class KbBuildService extends EventEmitter {
       baselineManifest: input.baseReleaseId
         ? new StandardKbStore(input.outputRoot).readManifest(input.baseReleaseId) : null,
       baselineKnowledge: previousKnowledge,
-    });
+    }) ?? (input.mode === 'incremental' && input.writtenPaths ? [...input.writtenPaths] : undefined);
 
     // 证据资源表 + source-contents 区段（A案 §5.4）；readVerified 遇源中途
     // 变化抛 source_changed_during_build，原样传播终止发布
@@ -6986,7 +7112,10 @@ export class KbBuildService extends EventEmitter {
     const evidenceBlocking: ValidationIssue[] = [];
     const workbookSourceIds = new Set<string>();
     const imageSourceIds = new Set<string>();
-    const draftedPaths = new Set(draftEvidenceScopePaths ?? []);
+    // 缺省范围表示全部草稿，而不是全部承接；否则首次构建会把新图片
+    // 当作继承图片跳过，且无基准 release 可供加载。
+    const draftedPaths = new Set(draftEvidenceScopePaths ?? Object.entries(draft.docs)
+      .filter(([, doc]) => doc.basis !== 'published').map(([docPath]) => docPath));
     const objectPaths = new Map(draft.objects.map((object) => [object.objectId, object.canonical?.path]));
     const carriedImageIds = new Set<string>();
     for (const claim of draft.evidence) {
@@ -7187,6 +7316,8 @@ export class KbBuildService extends EventEmitter {
     if (evidencePlan.totalBytes > evidenceBudget) {
       evidenceBlocking.push({
         code: 'kb_evidence_unresolved', field: 'evidenceFiles',
+        rule: this.deps.configProvider()?.standardKb.evidenceBudgetBytes !== undefined || evidencePlan.totalBytes > EVIDENCE_BUDGET_MAX_BYTES
+          ? 'evidence_budget_hard' : 'evidence_budget_exceeded',
         message: `证据资源总量 ${evidencePlan.totalBytes} 字节超过预算 ${evidenceBudget} 字节（A案 §5.4：无法保留则阻止发布）。最大资源：${[...new Map(evidencePlan.files.map((file) => [file.path, file.bytes.length])).entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([name, bytes]) => `${name}=${bytes}`).join(', ')}——请收窄引用区间或减少图片证据`,
         severity: 'blocking',
       });
@@ -7292,6 +7423,7 @@ export class KbBuildService extends EventEmitter {
       snapshot: input.snapshot,
       knowledgeBaseRoot: input.knowledgeBaseRoot,
       receipts,
+      ...(input.gatePolicy?.strict === false && input.verifiedEvidence ? { verifiedEvidence: input.verifiedEvidence } : {}),
       ...(gateResourcePacks.size > 0 ? { resourcePacks: gateResourcePacks } : {}),
       ...(governanceActive ? { governance: governanceFreeze } : {}),
       sidecars: {
@@ -7300,11 +7432,35 @@ export class KbBuildService extends EventEmitter {
         governance: { path: governanceSection.path, hash: governanceSection.hash, bytes: governanceBytes },
       },
     });
-    const blocking = [...evidenceBlocking, ...gates.blocking];
+    const policy = input.gatePolicy ?? this.active.get(input.buildId)?.buildState?.gatePolicy
+      ?? this.active.get(input.buildId)?.gatePolicy
+      ?? { strict: true, version: 1 as const };
+    const sourcePaths = new Map<string, Set<string>>();
+    for (const doc of docs) for (const source of parseStdHeader(doc.content)?.sources ?? []) {
+      const paths = sourcePaths.get(source) ?? new Set<string>();
+      paths.add(doc.path); sourcePaths.set(source, paths);
+    }
+    const baselineManifest = input.baseReleaseId
+      ? new StandardKbStore(input.outputRoot).readManifest(input.baseReleaseId) : null;
+    const oldSources = new Map((baselineManifest?.sourceSnapshot ?? []).map(source => [source.objToken, source]));
+    const changedSources = baselineManifest ? new Set(input.snapshot.entries.filter(source => {
+      const old = oldSources.get(source.objToken);
+      return !old || old.contentHash !== source.contentHash || old.mediaHash !== source.mediaHash;
+    }).map(source => source.objToken)) : undefined;
+    for (const old of oldSources.keys()) if (!input.snapshot.get(old)) changedSources?.add(old);
+    for (const source of this.active.get(input.buildId)?.buildState?.workset.keys() ?? []) changedSources?.add(source);
+    const attributable = gateAttribution({ current: compiled.knowledge, previous: previousKnowledge,
+      draftPaths: input.mode === 'incremental' && draftEvidenceScopePaths !== undefined
+        ? new Set(draftEvidenceScopePaths) : undefined, sourcePaths, changedSources });
+    const classified = applyGatePolicy([...evidenceBlocking, ...gates.blocking, ...gates.warnings], policy, attributable);
+    const blocking = classified.blocking;
+    const warnings = classified.warnings;
+    input.reportWarnings?.push(...warnings.map(KbBuildService.knowledgeIssueToReport));
+    if (classified.dropped > 0) this.emitLog(input.buildId, 'info', `高风险断言 ${classified.dropped} 项（治理未启用，不要求人审）`);
     if (blocking.length > 0) {
       writeReport(input.outputRoot, input.buildId, [
         ...blocking.map(KbBuildService.knowledgeIssueToReport),
-        ...gates.warnings.map(KbBuildService.knowledgeIssueToReport),
+        ...(input.reportWarnings ?? warnings.map(KbBuildService.knowledgeIssueToReport)),
       ]);
       // A large first category used to hide every other blocker behind a
       // truncated message, leaving the Leader retrying an unchanged candidate.
@@ -7321,13 +7477,13 @@ export class KbBuildService extends EventEmitter {
         reportPath: path.join(input.outputRoot, '.builds', input.buildId, 'report.json'),
         nextAction: '按每类阻断修订；对象身份问题先检查 build_manifest.identityGaps 并登记语义迁移。候选与凭据未变化时不要重复申请。' } });
     }
-    if (gates.warnings.length <= 8) {
-      for (const warning of gates.warnings) {
+    if (warnings.length <= 8) {
+      for (const warning of warnings) {
         this.emitLog(input.buildId, 'warn', `知识门禁警告 ${warning.code}：${warning.message}`);
       }
     } else {
       const byCode = new Map<string, ValidationIssue[]>();
-      for (const warning of gates.warnings) {
+      for (const warning of warnings) {
         const group = byCode.get(warning.code) ?? [];
         group.push(warning);
         byCode.set(warning.code, group);
@@ -7357,6 +7513,10 @@ export class KbBuildService extends EventEmitter {
     //（发布正文为编译产物；staging 草稿保留供恢复）；无声明 → v1 不变。
     const knowledgePlan = await this.prepareKnowledgePublish({
       buildId: input.buildId,
+      writtenPaths: input.writtenPaths,
+      reportWarnings: input.reportWarnings,
+      gatePolicy: input.gatePolicy,
+      verifiedEvidence: input.verifiedEvidence,
       buildSourceCount: input.buildSourceCount,
       releaseId,
       mode: input.mode,
