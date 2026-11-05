@@ -14,7 +14,7 @@ const hash = (bytes: string | Buffer) => crypto.createHash('sha256').update(byte
 
 export function withoutSyncTimestamps(markdown: string): string {
   return markdown.replace(/^\uFEFF?<!--\r?\nfeishu_sync:\r?\n[\s\S]*?-->/, header =>
-    header.replace(/^(  (?:fetch_date|last_synced_modify_time): )"[^"\r\n]*"/gm, '$1""'));
+    header.replace(/^( {2}(?:fetch_date|last_synced_modify_time): )"[^"\r\n]*"/gm, '$1""'));
 }
 
 function markdownDigest(bytes: Buffer): string {
