@@ -464,9 +464,10 @@ describe('claude-bridge.cjs F02 同连接受控刷新（§3.3 + MCP tools/list_c
       const first = lists;
       await new Promise((resolve) => setTimeout(resolve, 500));
       const growth = lists - first;
-      expect(growth).toBeGreaterThanOrEqual(1); // 低频段仍在观测（迟到确认可刷新）
       // 低频退避约束：500ms 窗口内新增 ≤ ceil(500/150)+1=5（基频上界；实际因倍增更少）
       expect(growth).toBeLessThanOrEqual(5);
+      // 退避上限为 1200ms，500ms 窗口不一定包含请求；等待真实下一次观测。
+      await expect.poll(() => lists, { timeout: 3000, interval: 50 }).toBeGreaterThan(first);
       expect(bridge.frames.some((frame) => frame.method === 'notifications/tools/list_changed')).toBe(false); // 面未变不发通知
       bridge.proc.stdin.end(); // 清理：低频段中 stdin 关闭即退（unref 定时器不阻退出）
       await new Promise<void>((resolve, reject) => {
@@ -482,8 +483,9 @@ describe('claude-bridge.cjs F02 同连接受控刷新（§3.3 + MCP tools/list_c
       bridgeAuth.send({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
       await bridgeAuth.waitFor((frame) => frame.id === 2);
       await new Promise((resolve) => setTimeout(resolve, 150)); // 快窗中若干次观测
+      const beforeExpiry = lists;
       tokenDead = true; // 令牌失效
-      await new Promise((resolve) => setTimeout(resolve, 500)); // 观测遇到 401 → 永久停止
+      await expect.poll(() => lists, { timeout: 3000, interval: 50 }).toBeGreaterThan(beforeExpiry); // 实际遇到 401
       const authSample = lists;
       await new Promise((resolve) => setTimeout(resolve, 600));
       expect(lists).toBe(authSample); // 已死：不再轮询
