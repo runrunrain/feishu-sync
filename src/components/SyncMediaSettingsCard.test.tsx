@@ -83,10 +83,10 @@ describe('SyncMediaSettingsCard 渲染与缺省态', () => {
     expect(html).toContain('同步媒体选项');
     expect(html).toContain('幻灯片整页截图');
     expect(html).toContain('白板矢量导出');
-    expect(html).toContain('不会阻断文档同步');
+    expect(html).toContain('正文照常同步');
     // 白板开关开启态由 bg-seal 表达；截图关闭态为 border 包裹。
     expect(html).toMatch(/relative inline-flex[^>]*bg-seal/);
-    expect(html).toContain('.wb.svg');
+    expect(html).toContain('SVG 导出失败时改用原始 JSON');
   });
 
   it('旧配置缺 whiteboardExport 段时 svgTimeoutMs 高级项仍显示（缺省开启）', () => {
@@ -117,7 +117,7 @@ describe('slidesScreenshot scope 提示态（P1-S5 契约）', () => {
     expect(html).toContain('未授权');
     expect(html).toContain('data-testid="slides-scope-hint"');
     expect(html).toContain('飞书认证');
-    expect(html).toContain('自动跳过截图');
+    expect(html).toContain('同步时会跳过截图');
   });
 
   it('已授权：徽标为已授权，无引导警示条', () => {

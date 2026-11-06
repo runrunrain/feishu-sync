@@ -34,7 +34,7 @@ async function fixture(count = 32, parallelism = 1) {
   const config = new ConfigManager(path.join(dir, 'config.json')); await config.load();
   await config.updateConfig({ knowledgeBaseRoot: raw,
     agent: { runtime: { backend: 'pi' }, model: { source: 'pi-agent-dir', piModel: 'fixture/model' }, maxConcurrentProcesses: 3 },
-    standardKb: { outputRoot, buildParallelism: parallelism, buildBatchSize: 10, buildBatchWordBudget: 0 },
+    standardKb: { outputRoot, buildConcurrency: parallelism, buildBatchSize: 10, buildBatchWordBudget: 0 },
   } as never);
   const store = new LocalMapStore(path.join(dir, 'db.sqlite')); store.initialize();
   const pools: AgentProcessPool[] = []; fixtures.push({ dir, store, pools });

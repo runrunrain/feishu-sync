@@ -3,7 +3,7 @@
  *
  * 沿用 kb-build-parallel 的 FakeRpcProcess 模式（不起真模型）：prompt 按
  * 内容标记脚本化，工具经真实 AgentToolService 执行。新流水启用条件
- * （diting F04）= 任一角色显式配置 或 publishMode='confirm'
+ * = 任一角色显式配置
  * （reviewPipelineActive）。覆盖：
  * - 单元写→独立审查→通过→整合→最终复核→auto 发布全链路
  * - blocking → 定向修订 → 复审通过（旧报告不批准新稿、预算消耗）
@@ -15,7 +15,7 @@
  * - 进度端点 DTO 形状（同一份 BuildOrchestration 数据源）
  */
 
-import { describe, expect, it, beforeAll, afterAll } from 'vitest';
+import { describe, expect, it, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -27,6 +27,7 @@ import { AgentProcessPool } from '../src/agent/agent-process-pool.js';
 import { LocalMapStore } from '../src/modules/local-map-store.js';
 import { StandardKbStore } from '../src/kb/standard-kb-store.js';
 import { BuildCheckpointStore } from '../src/kb/build-checkpoint.js';
+import * as orchestration from '../src/kb/build-orchestration.js';
 import { buildSpecFromConfig, reviewPipelineActive } from '../src/kb/build-orchestration.js';
 import { kbRoutes } from '../src/routes/kb.js';
 import { ConfigManager } from '../src/modules/config-manager.js';
@@ -34,7 +35,7 @@ import type { PiRpcProcess } from '../src/agent/pi-rpc-process.js';
 import type { PiRuntimeResolver } from '../src/agent/runtime-resolver.js';
 import type { Config } from '../src/types/index.js';
 import type { DocumentRecord } from '../src/types/index.js';
-import type { ReviewReport } from '../src/kb/orchestration-contracts.js';
+import { computeBuildSpecHash, type ReviewReport } from '../src/kb/orchestration-contracts.js';
 
 // ---------------------------------------------------------------------------
 // 假 pi 进程：按 prompt 标记分派（批次/审查/修订/整合/最终复核）
@@ -320,7 +321,6 @@ function makeOrchConfig(overrides: {
   parallelism?: number;
   maxAutoRevisions?: number;
   maxInterfaceRetries?: number;
-  publishMode?: 'auto' | 'confirm';
 } = {}): Config {
   return {
     llm: {
@@ -343,11 +343,10 @@ function makeOrchConfig(overrides: {
       orchestrationMode: 'legacy', // 旧审查流水线兼容测试
       outputRoot, retainReleases: 3, buildBatchSize: 10, buildBatchWordBudget: 0,
       promptTimeoutMinutes: 15, buildTimeoutMinutes: 30,
-      buildParallelism: overrides.parallelism ?? 2, autoBuildAfterSync: false,
+      buildConcurrency: overrides.parallelism ?? 2, autoBuildAfterSync: false,
       // T2b：审查者显式配置 → 启用编排流水（reviewPipelineActive）
       buildRoles: { writer: { modelPresetId: '' }, reviewer: { modelPresetId: 'rev-model' }, plannerEnabled: false },
       reviewPolicy: { maxAutoRevisions: overrides.maxAutoRevisions ?? 2, maxInterfaceRetries: overrides.maxInterfaceRetries ?? 2 },
-      publishMode: overrides.publishMode ?? 'auto',
     },
     pollIntervalMinutes: 30,
     knowledgeBaseRoot: kbRoot,
@@ -755,10 +754,19 @@ describe('T2b：接口失败与内容修订分开计数（B 案 §5）', () => {
   });
 });
 
-describe('T2b：confirm 模式（B 案 §7）', () => {
+describe('旧冻结候选的确认兼容', () => {
+  beforeEach(() => {
+    const createSpec = buildSpecFromConfig;
+    vi.spyOn(orchestration, 'buildSpecFromConfig').mockImplementationOnce(input => {
+      const spec = { ...createSpec(input), publishMode: 'confirm' as const };
+      return { ...spec, specHash: computeBuildSpecHash(spec) };
+    });
+  });
+  afterEach(() => vi.mocked(buildSpecFromConfig).mockRestore());
+
   it('停在 awaiting_release；确认后发布；期间不能再建构建', async () => {
     seedTwoUnits('确认');
-    const harness = makeHarness(makeOrchConfig({ publishMode: 'confirm' }));
+    const harness = makeHarness(makeOrchConfig());
     const dto = await harness.service.createBuild(store as never, { mode: 'full', confirm: 'BUILD' });
     const awaiting = await waitForStatus(dto.id, 'awaiting_release');
     expect(String(awaiting.status)).toBe('awaiting_release');
@@ -783,7 +791,7 @@ describe('T2b：confirm 模式（B 案 §7）', () => {
 
   it('确认后内容变化失效拒绝（kb_confirm_stale），状态保持待确认', async () => {
     seedTwoUnits('失效');
-    const harness = makeHarness(makeOrchConfig({ publishMode: 'confirm' }));
+    const harness = makeHarness(makeOrchConfig());
     const dto = await harness.service.createBuild(store as never, { mode: 'full', confirm: 'BUILD' });
     await waitForStatus(dto.id, 'awaiting_release');
     // 篡改草稿内容 → 候选哈希不匹配（从候选清单取具体文件路径）
@@ -889,7 +897,7 @@ describe('T2b：取消与恢复（B 案 §8）', () => {
 });
 
 describe('T2b：旧路径回归（reviewPipelineActive 关闭）', () => {
-  it('无任何角色显式配置且 publishMode=auto → 不进入编排流水，行为同旧并行路径（diting F04：空值不再单独关闭流水——任一显式角色或 confirm 都启用）', async () => {
+  it('无角色显式配置时沿用旧并行路径', async () => {
     seedTwoUnits('回归');
     const config = makeOrchConfig();
     config.standardKb.buildRoles = { writer: { modelPresetId: '' }, reviewer: { modelPresetId: '' }, plannerEnabled: false };
@@ -910,7 +918,7 @@ describe('T2b：旧路径回归（reviewPipelineActive 关闭）', () => {
 });
 
 describe('T2b：diting F04——启用门与空值语义', () => {
-  it('跨层：设置 → buildSpecFromConfig → reviewPipelineActive（显式 confirm / 任一角色显式均启用；全空且 auto 才关闭）', async () => {
+  it('跨层：设置 → buildSpecFromConfig → reviewPipelineActive（任一角色显式启用；旧发布字段不影响新构建）', async () => {
     // 设置层形状：与 BuildOrchestrationSettings 落库同构（StandardKbConfig 片段）
     const base = {
       buildId: 'b_f04',
@@ -923,18 +931,17 @@ describe('T2b：diting F04——启用门与空值语义', () => {
       standardKb: {
         buildRoles: { writer: { modelPresetId: '' }, reviewer: { modelPresetId: '' }, plannerEnabled: false },
         reviewPolicy: { maxAutoRevisions: 2, maxInterfaceRetries: 2 },
-        publishMode: 'confirm',
+        ...{ publishMode: 'confirm' },
       },
     });
-    expect(reviewPipelineActive(confirmSpec)).toBe(true); // 显式 confirm 必须 await 释放屏障
-    expect(confirmSpec.publishMode).toBe('confirm');
+    expect(reviewPipelineActive(confirmSpec)).toBe(false);
+    expect(confirmSpec.publishMode).toBe('auto');
     // ② writer 显式（reviewer 空值）→ 启用
     const writerSpec = buildSpecFromConfig({
       ...base,
       standardKb: {
         buildRoles: { writer: { modelPresetId: 'glm-4.7' }, reviewer: { modelPresetId: '' }, plannerEnabled: false },
         reviewPolicy: { maxAutoRevisions: 2, maxInterfaceRetries: 2 },
-        publishMode: 'auto',
       },
     });
     expect(reviewPipelineActive(writerSpec)).toBe(true);
@@ -944,7 +951,6 @@ describe('T2b：diting F04——启用门与空值语义', () => {
       standardKb: {
         buildRoles: { writer: { modelPresetId: '' }, reviewer: { modelPresetId: '' }, integrator: { modelPresetId: 'glm-4.7' }, plannerEnabled: false },
         reviewPolicy: { maxAutoRevisions: 2, maxInterfaceRetries: 2 },
-        publishMode: 'auto',
       },
     });
     expect(reviewPipelineActive(integratorSpec)).toBe(true);
@@ -954,28 +960,22 @@ describe('T2b：diting F04——启用门与空值语义', () => {
       standardKb: {
         buildRoles: { writer: { modelPresetId: '' }, reviewer: { modelPresetId: '' }, plannerEnabled: false },
         reviewPolicy: { maxAutoRevisions: 2, maxInterfaceRetries: 2 },
-        publishMode: 'auto',
       },
     });
     expect(reviewPipelineActive(legacySpec)).toBe(false);
   });
 
-  it('端到端：reviewer 空值 + publishMode=confirm → 编排流水生效并停在 awaiting_release（确认屏障不被空值关闭）', async () => {
-    seedTwoUnits('确认屏');
-    const config = makeOrchConfig({ publishMode: 'confirm' });
-    config.standardKb.buildRoles = { writer: { modelPresetId: '' }, reviewer: { modelPresetId: '' }, plannerEnabled: false };
+  it('端到端：旧确认字段不影响新构建审查通过后自动发布', async () => {
+    seedTwoUnits('自动发布');
+    const config = makeOrchConfig();
+    Object.assign(config.standardKb, { publishMode: 'confirm' });
     const harness = makeHarness(config, { prompts: [] });
     const dto = await harness.service.createBuild(store as never, { mode: 'full', confirm: 'BUILD' });
-    await waitForStatus(dto.id, 'awaiting_release');
-    // 走了完整编排流水（写→审→整合→最终复核），等待用户确认释放
-    const prompts = harness.script.prompts ?? [];
-    expect(prompts.some((message) => message.includes('【单元审查'))).toBe(true);
-    expect(prompts.some((message) => message.includes('【最终复核】'))).toBe(true);
-    // 确认后发布成功
-    const confirmed = await harness.request(`/api/kb/builds/${dto.id}/release-confirm`, {});
-    expect(confirmed.status, JSON.stringify(confirmed.data)).toBe(200);
     const final = await waitForTerminal(dto.id);
     expect(String(final.status), String(final.error_message)).toBe('published');
+    const prompts = harness.script.prompts ?? [];
+    expect(prompts.some(message => message.includes('【单元审查'))).toBe(true);
+    expect(prompts.some(message => message.includes('【最终复核】'))).toBe(true);
     await harness.close();
   });
 });

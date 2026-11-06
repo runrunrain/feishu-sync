@@ -18,11 +18,12 @@ import path from 'node:path';
 import { buildServer } from '../src/index.js';
 import { CliEndpoint } from '../src/cli-endpoint.js';
 import type { CliEndpointFile } from '../src/cli-endpoint.js';
+import type { LocalMapStore } from '../src/modules/local-map-store.js';
 import type { Hono } from 'hono';
 
 const DESKTOP_TOKEN = 'test-desktop-token-0123456789abcdef';
 
-let app: Hono;
+let app: Hono & { __shutdownServices: () => Promise<unknown>; __localMapStore: LocalMapStore };
 let cliEndpoint: CliEndpoint;
 let home: string;
 let previousHome: string | undefined;
@@ -64,12 +65,14 @@ function readEndpointFile(dir: string): CliEndpointFile {
 
 beforeAll(async () => {
   home = isolateHome();
-  app = await buildServer({ desktopMode: true, desktopToken: DESKTOP_TOKEN }) as unknown as Hono;
+  app = await buildServer({ desktopMode: true, desktopToken: DESKTOP_TOKEN, configPath: path.join(home, 'config.json') }) as unknown as typeof app;
   cliEndpoint = (app as unknown as { __cliEndpoint: CliEndpoint }).__cliEndpoint;
 });
 
-afterAll(() => {
+afterAll(async () => {
   try { cliEndpoint?.revoke(); } catch { /* ignore */ }
+  await app?.__shutdownServices();
+  app?.__localMapStore.close();
   if (previousHome === undefined) delete process.env.FEISHU_SYNC_HOME;
   else process.env.FEISHU_SYNC_HOME = previousHome;
   fs.rmSync(home, { recursive: true, force: true });

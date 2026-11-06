@@ -45,7 +45,6 @@ export function ModelDefaultsSettings() {
             <Settings className="mt-0.5 h-4 w-4 shrink-0 text-seal" />
             <div>
               <h2 className="text-base font-kai font-medium text-ink">默认模型与文档整理</h2>
-              <p className="mt-0.5 text-xs text-ink-faint">设置应用默认模型，以及同步时是否整理原始文档。</p>
             </div>
           </div>
         </div>
@@ -55,7 +54,7 @@ export function ModelDefaultsSettings() {
           标准库构建设置：{agent.model.source === 'pi-agent-dir' && agent.runtime.backend !== 'claude-code'
             ? `本地 Pi · ${agent.model.piModel || '未选择模型'}`
             : `${agentProvider?.name || '未选择提供商'} · ${agentPreset?.name || '未选择模型'}${agent.model.providerId || agent.model.modelId ? '（Agent 单独指定）' : '（跟随应用默认）'}`}。
-          {draft?.dirty ? '草稿保存后生效。' : ''}可在「Agent 标准库 → 运行时与模型」调整。
+          {draft?.dirty ? '草稿保存后生效。' : ''}
         </p> : null}
         {providers.length === 0 ? (
           <p className="text-sm text-ink-soft">请先在「模型提供商与预设」中配置并启用提供商。</p>
@@ -77,7 +76,7 @@ export function ModelDefaultsSettings() {
           </div>
         )}
         <Toggle label="同步时整理原始文档" ariaLabel="同步时整理原始文档" checked={adaptationEnabled}
-          onChange={setAdaptationEnabled} helperText="使用相同的应用提供商与模型预设；整理失败时保留确定性转换结果。" />
+          onChange={setAdaptationEnabled} helperText="使用默认模型，失败时保留原始转换结果。" />
       </CardBody>
     </Card>
   );

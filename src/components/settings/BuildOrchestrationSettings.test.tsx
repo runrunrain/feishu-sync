@@ -25,7 +25,6 @@ vi.mock('../../api/client', async (importOriginal) => ({
 import {
   BuildOrchestrationSettings,
   extractConfigFieldErrors,
-  resolveBuildConcurrencyClient,
   splitInstallErrorMessage,
   validateBuildOrchestrationInput,
 } from './BuildOrchestrationSettings';
@@ -56,7 +55,7 @@ function makeStandardKb(over: Partial<StandardKbConfig> = {}): StandardKbConfig 
     buildBatchSize: 10,
     promptTimeoutMinutes: 15,
     buildTimeoutMinutes: 180,
-    buildParallelism: 2,
+    buildConcurrency: 2,
     buildBatchWordBudget: 40_000,
     autoBuildAfterSync: false,
     ...over,
@@ -106,10 +105,6 @@ function setup(config: Config | null): HTMLElement {
 function selectEl(container: HTMLElement, testid: string): HTMLSelectElement {
   return container.querySelector(`[data-testid="${testid}"]`) as HTMLSelectElement;
 }
-function radioEl(container: HTMLElement, testid: string): HTMLInputElement {
-  return container.querySelector(`[data-testid="${testid}"]`) as HTMLInputElement;
-}
-
 async function changeSelect(container: HTMLElement, testid: string, value: string) {
   const select = selectEl(container, testid);
   await act(async () => {
@@ -117,10 +112,6 @@ async function changeSelect(container: HTMLElement, testid: string, value: strin
     select.dispatchEvent(new Event('change', { bubbles: true }));
   });
 }
-async function clickRadio(container: HTMLElement, testid: string) {
-  await act(async () => { radioEl(container, testid).click(); });
-}
-
 beforeEach(() => {
   updateConfig.mockClear();
   // v2 运行宿主默认「未接线 503」（旧用例不受影响：如实展示说明行）。
@@ -149,22 +140,19 @@ describe('渲染与默认值（未配置编排字段 = 后端缺省行为展示�
     }
   });
 
-  it('构建并发回落构建并行数、修订/重试默认 2、发布方式默认自动', () => {
+  it('只展示 1–6 路构建并发与审查预算', () => {
     const container = setup(makeConfig());
     expect(selectEl(container, 'orch-concurrency-select').value).toBe('2');
-    expect(container.innerHTML).toContain('未显式设置时按「构建并行数」2 生效');
+    expect([...selectEl(container, 'orch-concurrency-select').options].map(option => Number(option.value))).toEqual([1, 2, 3, 4, 5, 6]);
     expect(selectEl(container, 'orch-revisions-select').value).toBe('2');
     expect(selectEl(container, 'orch-retries-select').value).toBe('2');
-    expect(radioEl(container, 'orch-publish-auto').checked).toBe(true);
-    expect(radioEl(container, 'orch-publish-confirm').checked).toBe(false);
-    expect(container.innerHTML).toContain('未显式设置时的后端缺省行为');
+    expect(container.textContent).not.toContain('发布方式');
   });
 
-  it('显式配置后回显：并发 4、confirm、writer/integrator 具体预设与档位', () => {
+  it('显式配置后回显：并发 4、writer/integrator 具体预设与档位', () => {
     const container = setup(makeConfig({
       standardKb: makeStandardKb({
         buildConcurrency: 4,
-        publishMode: 'confirm',
         reviewPolicy: { maxAutoRevisions: 3, maxInterfaceRetries: 0 },
         buildRoles: {
           writer: { modelPresetId: 'glm-r', providerId: 'vp', thinking: 'high' },
@@ -175,7 +163,6 @@ describe('渲染与默认值（未配置编排字段 = 后端缺省行为展示�
       }),
     }));
     expect(selectEl(container, 'orch-concurrency-select').value).toBe('4');
-    expect(radioEl(container, 'orch-publish-confirm').checked).toBe(true);
     expect(selectEl(container, 'orch-revisions-select').value).toBe('3');
     expect(selectEl(container, 'orch-retries-select').value).toBe('0');
     expect(selectEl(container, 'orch-writer-preset').value).toBe('vp::glm-r');
@@ -200,7 +187,7 @@ describe('变更提交 payload 形状（PUT standardKb 段整体替换语义）'
     });
     expect('integrator' in (payload.buildRoles ?? {})).toBe(false);
     expect(payload.outputRoot).toBe('/tmp/standard-kb');
-    expect(payload.buildConcurrency).toBeUndefined();
+    expect(payload.buildConcurrency).toBe(2);
   });
 
   it('integrator 选「跟随撰写」：payload 省略 integrator 键（整体替换移除旧覆盖）', async () => {
@@ -248,29 +235,20 @@ describe('变更提交 payload 形状（PUT standardKb 段整体替换语义）'
     expect(lastPayload().standardKb.reviewPolicy).toEqual({ maxAutoRevisions: 2, maxInterfaceRetries: 0 });
   });
 
-  it('发布方式：选待确认写入 confirm；已是 auto 时再点 auto 不触发保存', async () => {
-    const container = setup(makeConfig());
-    await clickRadio(container, 'orch-publish-confirm');
-    expect(lastPayload().standardKb.publishMode).toBe('confirm');
-    const containerAuto = setup(makeConfig({ standardKb: makeStandardKb({ publishMode: 'auto' }) }));
-    const calls = updateConfig.mock.calls.length;
-    await clickRadio(containerAuto, 'orch-publish-auto');
-    expect(updateConfig.mock.calls.length).toBe(calls);
-  });
+
 });
 
 describe('校验错误展示', () => {
   it('后端 400 message（config_validation_failed）映射到对应表单项', async () => {
     updateConfig.mockRejectedValueOnce(new APIError(
-      '配置校验失败：standardKb.buildConcurrency(out_of_range), standardKb.publishMode(invalid_value)',
+      '配置校验失败：standardKb.buildConcurrency(out_of_range)',
       400,
-      { error: 'config_validation_failed', message: '配置校验失败：standardKb.buildConcurrency(out_of_range), standardKb.publishMode(invalid_value)' },
+      { error: 'config_validation_failed', message: '配置校验失败：standardKb.buildConcurrency(out_of_range)' },
     ));
     const container = setup(makeConfig());
     await changeSelect(container, 'orch-concurrency-select', '4');
     const alerts = [...container.querySelectorAll('[role="alert"]')].map((node) => node.textContent);
     expect(alerts.join('\n')).toContain('standardKb.buildConcurrency');
-    expect(alerts.join('\n')).toContain('standardKb.publishMode');
   });
 
   it('APIError.response.details 数组形态优先映射', async () => {
@@ -334,7 +312,7 @@ describe('v2 运行宿主状态与安装（真实 GET/POST /api/kb/build-runtime
     const container = setup(makeConfig());
     await act(async () => {});
     expect(container.querySelector('[data-testid="orch-runtime-unwired"]')?.textContent)
-      .toContain('未接线');
+      .toContain('构建运行宿主不可用');
     expect(container.querySelector('[data-testid="orch-runtime-install"]')).toBeNull();
   });
 
@@ -347,7 +325,7 @@ describe('v2 运行宿主状态与安装（真实 GET/POST /api/kb/build-runtime
     expect(facts?.textContent).toContain('2.21.31');
     expect(facts?.textContent).toContain('已安装');
     expect(facts?.textContent).toContain('静态检查通过');
-    expect(facts?.textContent).toContain('完整验证未达'); // 不把 staticOk 冒充 fullyVerified
+    expect(facts?.textContent).toContain('待实测'); // 不把 staticOk 冒充 fullyVerified
     await act(async () => { (container.querySelector('[data-testid="orch-runtime-checks-toggle"]') as HTMLElement).click(); });
     const checks = container.querySelector('[data-testid="orch-runtime-checks"]');
     expect(checks?.textContent).toContain('扩展加载');
@@ -362,7 +340,7 @@ describe('v2 运行宿主状态与安装（真实 GET/POST /api/kb/build-runtime
     const container = setup(makeConfig());
     await act(async () => {});
     const btn = container.querySelector('[data-testid="orch-runtime-install-btn"]') as HTMLButtonElement;
-    expect(btn.textContent).toContain('安装 amagi-pi 2.21.31');
+    expect(btn.textContent).toContain('安装 amagi-pi');
     await act(async () => { btn.click(); });
     expect(apiRuntime.installKbBuildRuntime).toHaveBeenCalledWith({});
     // 安装成功后重拉状态。
@@ -393,34 +371,25 @@ describe('v2 运行宿主状态与安装（真实 GET/POST /api/kb/build-runtime
     expect(container.querySelector('[data-testid="orch-runtime-error"]')?.textContent).toContain('探测执行失败');
   });
 
-  it('可信提醒：插件为受信 Node 代码非 OS 沙箱；安装可用 ≠ 验收全过', async () => {
+  it('管理操作默认收起', async () => {
     apiRuntime.getKbBuildRuntimeStatus.mockResolvedValue(makeStatus());
     const container = setup(makeConfig());
     await act(async () => {});
-    const text = container.querySelector('[data-testid="orch-runtime-install"]')?.textContent ?? '';
-    expect(text).toContain('不是 OS 沙箱');
-    expect(text).toContain('不等于质量/恢复/性能验收全部通过');
+    const management = container.querySelector('[data-testid="orch-runtime-install"]')?.closest('details');
+    expect(management?.open).toBe(false);
+    expect(management?.querySelector('summary')?.textContent).toBe('管理运行宿主');
   });
 });
 
 describe('纯函数', () => {
-  it('resolveBuildConcurrencyClient：显式优先/回落 buildParallelism/统一钳 1..8', () => {
-    expect(resolveBuildConcurrencyClient({ buildConcurrency: 4, buildParallelism: 2 })).toBe(4);
-    expect(resolveBuildConcurrencyClient({ buildParallelism: 3 })).toBe(3);
-    expect(resolveBuildConcurrencyClient({})).toBe(2);
-    expect(resolveBuildConcurrencyClient(undefined)).toBe(2);
-    expect(resolveBuildConcurrencyClient({ buildConcurrency: 99 })).toBe(8);
-    expect(resolveBuildConcurrencyClient({ buildConcurrency: 0 })).toBe(1);
-    expect(resolveBuildConcurrencyClient({ buildParallelism: 99 })).toBe(8);
-  });
+
 
   it('validateBuildOrchestrationInput：范围/枚举/预设引用；合法输入零 issue', () => {
     const presets = [{ providerId: 'vp', presetId: 'glm-t' }];
-    expect(validateBuildOrchestrationInput({ standardKb: { buildConcurrency: 4, buildRoles: { writer: { modelPresetId: '' }, reviewer: { modelPresetId: 'glm-t' } }, reviewPolicy: { maxAutoRevisions: 2, maxInterfaceRetries: 0 }, publishMode: 'auto' }, presets })).toEqual([]);
-    expect(validateBuildOrchestrationInput({ standardKb: { buildConcurrency: 9 }, presets })[0].field).toBe('standardKb.buildConcurrency');
+    expect(validateBuildOrchestrationInput({ standardKb: { buildConcurrency: 4, buildRoles: { writer: { modelPresetId: '' }, reviewer: { modelPresetId: 'glm-t' } }, reviewPolicy: { maxAutoRevisions: 2, maxInterfaceRetries: 0 } }, presets })).toEqual([]);
+    expect(validateBuildOrchestrationInput({ standardKb: { buildConcurrency: 7 }, presets })[0].field).toBe('standardKb.buildConcurrency');
     expect(validateBuildOrchestrationInput({ standardKb: { reviewPolicy: { maxAutoRevisions: 0 } }, presets })[0].field).toBe('standardKb.reviewPolicy.maxAutoRevisions');
     expect(validateBuildOrchestrationInput({ standardKb: { reviewPolicy: { maxInterfaceRetries: 6 } }, presets })[0].field).toBe('standardKb.reviewPolicy.maxInterfaceRetries');
-    expect(validateBuildOrchestrationInput({ standardKb: { publishMode: 'both' as 'auto' }, presets })[0].field).toBe('standardKb.publishMode');
     const gonePreset = validateBuildOrchestrationInput({ standardKb: { buildRoles: { writer: { modelPresetId: 'gone' }, reviewer: { modelPresetId: '' } } }, presets });
     expect(gonePreset[0].field).toBe('standardKb.buildRoles.writer.modelPresetId');
     expect(validateBuildOrchestrationInput({ standardKb: { buildRoles: { writer: { modelPresetId: 'glm-t', thinking: 'ultra' as 'high' }, reviewer: { modelPresetId: '' } } }, presets })[0].field).toBe('standardKb.buildRoles.writer.thinking');
@@ -429,9 +398,8 @@ describe('纯函数', () => {
   it('extractConfigFieldErrors：message 解析只回收 standardKb.*；details 数组优先', () => {
     expect(extractConfigFieldErrors(new Error('配置校验失败：standardKb.buildConcurrency(out_of_range), agent.model.source(invalid_value)')))
       .toEqual({ 'standardKb.buildConcurrency': 'standardKb.buildConcurrency(out_of_range)' });
-    expect(extractConfigFieldErrors('配置校验失败：standardKb.reviewPolicy.maxAutoRevisions(out_of_range), standardKb.publishMode(invalid_value)')).toEqual({
+    expect(extractConfigFieldErrors('配置校验失败：standardKb.reviewPolicy.maxAutoRevisions(out_of_range)')).toEqual({
       'standardKb.reviewPolicy.maxAutoRevisions': 'standardKb.reviewPolicy.maxAutoRevisions(out_of_range)',
-      'standardKb.publishMode': 'standardKb.publishMode(invalid_value)',
     });
     const withDetails = new Error('配置校验失败');
     (withDetails as unknown as { response: unknown }).response = { details: [{ field: 'standardKb.buildRoles.writer', code: 'invalid_type' }] };
@@ -482,7 +450,7 @@ describe('plugin-install-fix 安装检测与默认来源', () => {
     expect(block?.textContent).toContain('本地目录');
     expect(block?.textContent).toContain('未被选为新构建版本');
     // 构建专用固定版本仍是 31 已装，不被 36 冒充
-    expect(container.querySelector('[data-testid="orch-runtime-facts"]')?.textContent).toContain('已安装 2.21.31');
+    expect(container.querySelector('[data-testid="orch-runtime-facts"]')?.textContent).toContain('2.21.31 · 已安装');
   });
 
   it('较新本地版被选中后，显示下一次构建自动采用并冻结', async () => {
@@ -494,9 +462,9 @@ describe('plugin-install-fix 安装检测与默认来源', () => {
     }));
     const container = setup(makeConfig());
     await act(async () => {});
-    expect(container.querySelector('[data-testid="orch-runtime-facts"]')?.textContent).toContain('新构建优选 2.21.36');
+    expect(container.querySelector('[data-testid="orch-runtime-facts"]')?.textContent).toContain('2.21.36 · 未安装');
     expect(container.querySelector('[data-testid="orch-runtime-candidates"]')?.textContent).toContain('下一次构建自动采用并冻结');
-    expect(container.querySelector('[data-testid="orch-runtime-install-btn"]')?.textContent).toContain('已配置版本');
+    expect(container.querySelector('[data-testid="orch-runtime-install-btn"]')?.textContent).toContain('安装 amagi-pi');
   });
 
   it('较新 Git 版被选中时，同样标出下一次构建自动采用', async () => {
@@ -509,7 +477,7 @@ describe('plugin-install-fix 安装检测与默认来源', () => {
     const container = setup(makeConfig());
     await act(async () => {});
     expect(container.querySelector('[data-testid="orch-runtime-candidates"]')?.textContent).toContain('下一次构建自动采用并冻结');
-    expect(container.querySelector('[data-testid="orch-runtime-install-btn"]')?.textContent).toContain('已配置版本');
+    expect(container.querySelector('[data-testid="orch-runtime-install-btn"]')?.textContent).toContain('安装 amagi-pi');
   });
 
   it('发现异常（unavailable/error）单独表达，不谎称未安装', async () => {
@@ -520,7 +488,7 @@ describe('plugin-install-fix 安装检测与默认来源', () => {
     const container = setup(makeConfig());
     await act(async () => {});
     const issues = container.querySelector('[data-testid="orch-runtime-discovery-issues"]');
-    expect(issues?.textContent).toContain('应用插件目录候选检测不可用');
+    expect(issues?.textContent).toContain('应用插件目录来源检测不可用');
     expect(issues?.textContent).toContain('不代表未安装');
   });
 
@@ -528,16 +496,15 @@ describe('plugin-install-fix 安装检测与默认来源', () => {
     apiRuntime.getKbBuildRuntimeStatus.mockResolvedValue(statusWith({}));
     const installed = setup(makeConfig());
     await act(async () => {});
-    expect((installed.querySelector('[data-testid="orch-runtime-install-btn"]') as HTMLElement).textContent).toContain('校验构建版本 2.21.31');
+    expect((installed.querySelector('[data-testid="orch-runtime-install-btn"]') as HTMLElement).textContent).toContain('校验安装');
     apiRuntime.getKbBuildRuntimeStatus.mockResolvedValue(statusWith({
       installed: false, version: null, installDir: null, contentHash: null, layout: null, installState: 'missing',
     }));
     const fresh = setup(makeConfig());
     await act(async () => {});
     const btn = fresh.querySelector('[data-testid="orch-runtime-install-btn"]') as HTMLElement;
-    expect(btn.textContent).toContain('安装 amagi-pi 2.21.31');
-    expect(btn.textContent).toContain('官方 Git');
-    expect(fresh.querySelector('[data-testid="orch-runtime-install-hint"]')?.textContent).toContain('不回退 npm/latest');
+    expect(btn.textContent).toContain('安装 amagi-pi');
+    expect(fresh.querySelector('[data-testid="orch-runtime-install-hint"]')?.textContent).toContain('留空使用默认安装来源');
   });
 
   it('精确匹配 pin 的本地候选 → 推荐来源可见，「用作安装来源」回填目录', async () => {
@@ -656,11 +623,11 @@ describe('plugin-install-fix 安装检测与默认来源', () => {
     await act(async () => { (container.querySelector('[data-testid="orch-runtime-install-btn"]') as HTMLElement).click(); });
     expect(deferreds).toHaveLength(2); // 安装成功 → onInstalled 发起新 GET
     await act(async () => { deferreds[1](statusWith({})); }); // 新请求先完成：已装
-    expect((container.querySelector('[data-testid="orch-runtime-install-btn"]') as HTMLElement).textContent).toContain('校验构建版本');
-    expect(container.querySelector('[data-testid="orch-runtime-facts"]')?.textContent).toContain('已安装 2.21.31');
+    expect((container.querySelector('[data-testid="orch-runtime-install-btn"]') as HTMLElement).textContent).toContain('校验安装');
+    expect(container.querySelector('[data-testid="orch-runtime-facts"]')?.textContent).toContain('2.21.31 · 已安装');
     // 旧请求（挂载加载）此时才返回「未装」：迟到响应必须丢弃，不得回写
     await act(async () => { deferreds[0](statusWith({ installed: false, version: null, installDir: null, contentHash: null, layout: null, installState: 'missing' })); });
-    expect((container.querySelector('[data-testid="orch-runtime-install-btn"]') as HTMLElement).textContent).toContain('校验构建版本');
-    expect(container.querySelector('[data-testid="orch-runtime-facts"]')?.textContent).toContain('已安装 2.21.31');
+    expect((container.querySelector('[data-testid="orch-runtime-install-btn"]') as HTMLElement).textContent).toContain('校验安装');
+    expect(container.querySelector('[data-testid="orch-runtime-facts"]')?.textContent).toContain('2.21.31 · 已安装');
   });
 });

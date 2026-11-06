@@ -36,6 +36,7 @@ import { defaultLanConfig, normalizeLanConfig, validateLanConfig } from '../kb-l
 import {
   buildDefaultAgentConfig,
   buildDefaultStandardKbConfig,
+  resolveBuildConcurrency,
   buildDefaultAgentVisionConfig,
   VISION_MAX_IMAGE_BYTES_CEILING,
   buildDefaultAgentOrchestrationConfig,
@@ -379,7 +380,7 @@ function isValidWorkspaceEntry(value: unknown): value is AgentWorkspaceConfig {
 function normalizeStandardKbConfigLoose(value: unknown, dataRoot: string): StandardKbConfig {
   const base = buildDefaultStandardKbConfig(dataRoot);
   if (!value || typeof value !== 'object') return base;
-  const raw = value as Partial<StandardKbConfig>;
+  const raw = value as Partial<StandardKbConfig> & { buildParallelism?: number };
   return {
     outputRoot: typeof raw.outputRoot === 'string' && raw.outputRoot.trim() ? raw.outputRoot.trim() : base.outputRoot,
     retainReleases: typeof raw.retainReleases === 'number'
@@ -394,22 +395,13 @@ function normalizeStandardKbConfigLoose(value: unknown, dataRoot: string): Stand
       raw.buildBatchWordBudget,
       base.buildBatchWordBudget,
     ),
-    // S4（设计 §4.6）：并行构建 worker 数 1..6；旧配置缺省回落默认值
-    buildParallelism: typeof raw.buildParallelism === 'number'
-      ? Math.max(1, Math.min(6, Math.floor(raw.buildParallelism)))
-      : base.buildParallelism,
-    // B案 §6：构建名额 N（1..6，全部文本构建角色合计；运行时 BuildRunSpec
-    // 上限与 Agent 进程池一致为 6，超过会在构建启动时被拒）；非数字保持
-    // undefined → 回落 buildParallelism（resolveBuildConcurrency 统一解析）
-    buildConcurrency: typeof raw.buildConcurrency === 'number' && Number.isFinite(raw.buildConcurrency)
-      ? Math.max(1, Math.min(6, Math.floor(raw.buildConcurrency)))
-      : undefined,
+    buildConcurrency: resolveBuildConcurrency({
+      buildConcurrency: Number.isFinite(raw.buildConcurrency) ? raw.buildConcurrency : raw.buildParallelism,
+    }),
     // B案 §3/§8：角色模型（宽容归一；严格校验在 validateAgentAndKbConfig）
     buildRoles: normalizeBuildRolesLoose(raw.buildRoles, base.buildRoles),
     // B案 §5：审查闭环预算
     reviewPolicy: normalizeReviewPolicyLoose(raw.reviewPolicy, base.reviewPolicy),
-    // B案 §7：发布方式（非法值回落默认 auto）
-    publishMode: raw.publishMode === 'confirm' ? 'confirm' : 'auto',
     strictGates: typeof raw.strictGates === 'boolean' ? raw.strictGates : false,
     // D3（A 案 §5.4）：证据资源预算（非数字/非法保持 undefined →
     // 发布时按冻结工作集来源数使用默认额度）
@@ -585,24 +577,13 @@ export function validateAgentAndKbConfig(value: {
       details.push({ field: 'standardKb.outputRoot', code: 'invalid_value' });
     }
     // S4：并行数范围校验（严格路径；宽容归一在 normalizeStandardKbConfigLoose）
-    if (kb.buildParallelism !== undefined
-      && (typeof kb.buildParallelism !== 'number'
-        || !Number.isInteger(kb.buildParallelism)
-        || kb.buildParallelism < 1 || kb.buildParallelism > 6)) {
-      details.push({ field: 'standardKb.buildParallelism', code: 'out_of_range' });
-    }
-    // B案 §6：构建名额 N（1..8；严格路径；宽容归一在 normalizeStandardKbConfigLoose）
     if (kb.buildConcurrency !== undefined
       && (typeof kb.buildConcurrency !== 'number'
         || !Number.isInteger(kb.buildConcurrency)
-        || kb.buildConcurrency < 1 || kb.buildConcurrency > 8)) {
+        || kb.buildConcurrency < 1 || kb.buildConcurrency > 6)) {
       details.push({ field: 'standardKb.buildConcurrency', code: 'out_of_range' });
     }
     // B案 §7：发布方式枚举
-    if (kb.publishMode !== undefined && !['auto', 'confirm'].includes(kb.publishMode)) {
-      details.push({ field: 'standardKb.publishMode', code: 'invalid_value' });
-    }
-    // 新写入只接受 Pi 编排；历史旧值在 load() 时迁移。
     if (kb.orchestrationMode !== undefined && !KB_ORCHESTRATION_MODES.has(String(kb.orchestrationMode))) {
       details.push({ field: 'standardKb.orchestrationMode', code: 'invalid_value' });
     }
@@ -876,9 +857,9 @@ const DEFAULT_CONFIG: Config = {
   llm: buildDefaultLlmConfig(),
   agent: buildDefaultAgentConfig(resolveDataRoot()),
   standardKb: buildDefaultStandardKbConfig(resolveDataRoot()),
-  // S8（additive）：命令行访问默认关闭；旧配置无此段时内存补默认。
+  // 缺省开启；保留已有配置中明确保存的关闭状态。
   // S12（additive）：飞书写回默认关闭（设计 §7.6）。
-  cli: { enabled: false },
+  cli: { enabled: true },
   kbLanMcp: defaultLanConfig(),
   // S12（additive）：飞书写回默认关闭；旧配置无此段时内存补默认。
   feishuWrite: { enabled: false },
@@ -1319,7 +1300,7 @@ export class ConfigManager {
         ? normalizeLanConfig(partial.kbLanMcp)
         : (currentConfig.kbLanMcp ?? defaultLanConfig()),
       cli: partial.cli !== undefined
-        ? normalizeCliConfigLoose({ ...(currentConfig.cli ?? { enabled: false }), ...partial.cli })
+        ? normalizeCliConfigLoose({ ...currentConfig.cli, ...partial.cli })
         : (currentConfig.cli ?? { enabled: false }),
       // S12（additive）：feishuWrite 段同 S8 cli 模式（显式提供时采用，
       // 否则保留当前值；旧配置内存态默认 {enabled:false}）。
@@ -1551,6 +1532,9 @@ export class ConfigManager {
 
     // 退役两种旧编排模式：启动时归一且一次性落盘，避免重启后回退。
     migrated = migrated || raw.standardKb?.orchestrationMode !== 'pi-amagi';
+    if (raw.standardKb && (Object.hasOwn(raw.standardKb, 'buildParallelism') || Object.hasOwn(raw.standardKb, 'publishMode'))) {
+      migrated = true;
+    }
 
     // 2026-10 scope 退役清理：2026-09 的 additive 迁移曾把 docs:document:read
     // 追加进存量配置；该名现已在上游失效，带上它发起授权会被整单拒绝。
@@ -1795,14 +1779,15 @@ export class ConfigManager {
 }
 
 // ============================================================================
-// S8 追加：CLI 配置段归一与严格校验（命令行访问，默认关闭）
+// CLI 配置段归一与严格校验（命令行访问，默认开启）
 // ============================================================================
 
-/** 宽容归一：缺失/非法 → 默认关闭（load 路径，不拒绝启动）。 */
+/** 缺省开启，显式关闭跨启动保留。 */
 function normalizeCliConfigLoose(value: unknown): CliConfig {
-  if (!value || typeof value !== 'object') return { enabled: false };
-  const raw = value as Partial<CliConfig>;
-  return { enabled: raw.enabled === true ? true : false };
+  if (value === undefined) return { enabled: true };
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return { enabled: false };
+  const { enabled } = value as Partial<CliConfig>;
+  return { enabled: enabled === undefined || enabled === true };
 }
 
 /**

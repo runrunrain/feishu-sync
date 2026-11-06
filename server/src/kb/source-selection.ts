@@ -10,11 +10,13 @@ export function selectKnowledgeSources(
     unselected: Iterable<string>;
     excluded: Iterable<string>;
     published?: Iterable<string>;
+    retainUnselectedPublished?: boolean;
   },
 ): DocumentRecord[] {
   const unselected = new Set(options.unselected);
   const excluded = new Set(options.excluded);
   const published = new Set(options.published);
   return documents.filter((doc) => !excluded.has(doc.objToken)
-    && (!unselected.has(doc.objToken) || published.has(doc.objToken)));
+    && (published.has(doc.objToken) || (doc.cloudDeleted !== 1 && doc.syncState !== 'deleted_confirmed'))
+    && (!unselected.has(doc.objToken) || (options.retainUnselectedPublished !== false && published.has(doc.objToken))));
 }

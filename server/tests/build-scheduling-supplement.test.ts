@@ -336,7 +336,7 @@ function seedGovernanceCorpus(): void {
   documents.push(docRecord('tokGov', '治理/规则源.md'));
 }
 
-function makeConfig(overrides: { publishMode?: 'auto' | 'confirm'; plannerEnabled?: boolean } = {}): Config {
+function makeConfig(overrides: { plannerEnabled?: boolean } = {}): Config {
   return {
     llm: {
       openAiCompatBaseUrl: '', apiKey: '', model: '', temperature: 0.2, primaryChannel: 'direct', fallbackOnFailure: false,
@@ -356,10 +356,9 @@ function makeConfig(overrides: { publishMode?: 'auto' | 'confirm'; plannerEnable
       orchestrationMode: 'legacy', // 旧调度器兼容测试
       outputRoot, retainReleases: 5, buildBatchSize: 10, buildBatchWordBudget: 0,
       promptTimeoutMinutes: 15, buildTimeoutMinutes: 30,
-      buildParallelism: 1, autoBuildAfterSync: false,
+      buildConcurrency: 1, autoBuildAfterSync: false,
       buildRoles: { writer: { modelPresetId: '' }, reviewer: { modelPresetId: 'rev-model' }, plannerEnabled: overrides.plannerEnabled ?? false },
       reviewPolicy: { maxAutoRevisions: 2, maxInterfaceRetries: 2 },
-      publishMode: overrides.publishMode ?? 'auto',
     },
     pollIntervalMinutes: 30, knowledgeBaseRoot: kbRoot, watchedRoots: [], watchedRootUrls: [], requiredScopes: [],
   } as unknown as Config;

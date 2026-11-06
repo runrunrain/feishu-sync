@@ -28,7 +28,7 @@ async function fixture(visionDescriber?: VisionDescriberLike) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kb-selected-'));
   const raw = path.join(dir, 'raw'); fs.mkdirSync(raw);
   const config = new ConfigManager(path.join(dir, 'config.json')); await config.load();
-  await config.updateConfig({ knowledgeBaseRoot: raw, standardKb: { outputRoot: path.join(dir, 'standard'), buildParallelism: 1 } } as never);
+  await config.updateConfig({ knowledgeBaseRoot: raw, standardKb: { outputRoot: path.join(dir, 'standard'), buildConcurrency: 1 } } as never);
   const store = new LocalMapStore(path.join(dir, 'db.sqlite')); store.initialize(); fixtures.push({ dir, store });
   const output: Record<string, string> = {};
   for (const [token, title, rule] of [['a', '行动规则', '每回合执行一次行动，行动结束后进入结算。'], ['b', '费用规则', '技能消耗十点怒气，怒气不足时不能使用。'], ['c', '世界规则', '城市归属于国家，国家拥有各自的城市。']]) {
@@ -126,7 +126,7 @@ describe('所选源在现有标准库上继续构建', () => {
     f.select(['b']); expect((await f.build()).status).toBe('published');
     const inherited = f.published().readManifest()!.sourceSnapshot.find(source => source.objToken === 'a')!;
     expect(inherited.contentHash).toBe(original.sourceSnapshot[0].contentHash);
-    expect(inherited.comparisonHash).toMatch(/^v1:[a-f0-9]{64}$/);
+    expect(inherited.comparisonHash).toMatch(/^v2:[a-f0-9]{64}$/);
   });
 
   it('已构建源可主动重新构建，原文未变也会执行，并保留其他文档', async () => {

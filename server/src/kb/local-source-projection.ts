@@ -4,9 +4,49 @@ import path from 'node:path';
 import { resolveInside } from '../agent/path-guard.js';
 import { localPathState } from '../modules/local-path-state.js';
 import { toPortableRelative } from '../modules/path-resolver.js';
-import { recoverLocalDocument } from '../modules/recover-local-document.js';
+import { readLocalDocumentIdentity, recoverLocalDocument } from '../modules/recover-local-document.js';
+import type { RawSourceSnapshotEntry } from '../types/agent-knowledge.js';
 import type { DocumentRecord } from '../types/index.js';
 import { hasSuccessfulLocalVersion } from './raw-source-snapshot.js';
+
+/** A published identity can outlive its local index row, e.g. after removal of
+ * a watched root. Reattach only a matching file at its published location. */
+export function recoverPublishedSource(root: string, source: RawSourceSnapshotEntry): DocumentRecord | null {
+  try {
+    const file = resolveInside(root, source.relPath, 'read');
+    if (!fs.statSync(file).isFile()) return null;
+    const identity = readLocalDocumentIdentity(file);
+    if (identity?.obj_token !== source.objToken) return null;
+    const type = source.objType;
+    return {
+      objToken: source.objToken, title: source.title,
+      objType: type === 'docx' || type === 'sheet' || type === 'slides' || type === 'bitable' ? type : 'unknown',
+      wikiNodeToken: identity.wiki_node_token ?? null, originalLink: identity.original_link ?? null,
+      localMdPath: file, localRelPath: source.relPath,
+      lastSyncedAt: '', lastSyncedModifyTime: '', status: 'synced', recoveredLocalVersion: true,
+    };
+  } catch { return null; }
+}
+
+export function recoverUnindexedPublishedSources(root: string, documents: DocumentRecord[],
+  published: RawSourceSnapshotEntry[], deleted: ReadonlySet<string>): DocumentRecord[] {
+  if (!root || !published.length) return documents;
+  const tokens = new Set(documents.map(doc => doc.objToken));
+  const pathKey = (file: string) => process.platform === 'win32' ? path.normalize(file).toLowerCase() : path.normalize(file);
+  const occupied = new Set(documents.flatMap(doc => doc.localRelPath ? [pathKey(doc.localRelPath)]
+    : doc.localMdPath ? [pathKey(path.relative(root, doc.localMdPath))] : []));
+  const recovered = [];
+  for (const source of published) {
+    const key = pathKey(source.relPath);
+    if (tokens.has(source.objToken) || deleted.has(source.objToken) || occupied.has(key)) continue;
+    const doc = recoverPublishedSource(root, source);
+    if (!doc) continue;
+    recovered.push(doc);
+    occupied.add(key);
+    tokens.add(source.objToken);
+  }
+  return [...documents, ...recovered];
+}
 
 export function projectKnowledgeDocuments(root: string, documents: DocumentRecord[]): DocumentRecord[] {
   if (!root) return documents;

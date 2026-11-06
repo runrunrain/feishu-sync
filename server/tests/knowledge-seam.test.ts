@@ -246,7 +246,7 @@ class SeamFakeRpc extends EventEmitter {
 // harness
 // ---------------------------------------------------------------------------
 
-function makeSeamConfig(publishMode: 'auto' | 'confirm' = 'auto'): Config {
+function makeSeamConfig(): Config {
   return {
     llm: {
       openAiCompatBaseUrl: '', apiKey: '', model: '', temperature: 0.2, primaryChannel: 'direct', fallbackOnFailure: false,
@@ -264,11 +264,10 @@ function makeSeamConfig(publishMode: 'auto' | 'confirm' = 'auto'): Config {
     },
     standardKb: {
       outputRoot, retainReleases: 5, buildBatchSize: 10, buildBatchWordBudget: 0,
-      promptTimeoutMinutes: 15, buildTimeoutMinutes: 30, buildParallelism: 1, autoBuildAfterSync: false,
+      promptTimeoutMinutes: 15, buildTimeoutMinutes: 30, buildConcurrency: 1, autoBuildAfterSync: false,
       orchestrationMode: 'legacy',
       buildRoles: { writer: { modelPresetId: '' }, reviewer: { modelPresetId: 'rev-model' }, plannerEnabled: false },
       reviewPolicy: { maxAutoRevisions: 2, maxInterfaceRetries: 2 },
-      publishMode,
     },
     pollIntervalMinutes: 30, knowledgeBaseRoot: kbRoot, watchedRoots: [], watchedRootUrls: [], requiredScopes: [],
   } as unknown as Config;
@@ -287,12 +286,12 @@ interface Harness {
   close: () => Promise<void>;
 }
 
-function makeHarness(script: SeamScript, publishMode: 'auto' | 'confirm' = 'auto'): Harness {
+function makeHarness(script: SeamScript): Harness {
   const pool = new AgentProcessPool({ maxConcurrentProcesses: 3, idleTimeoutMinutes: 10 });
   const toolService = new AgentToolService({ dataRoot, documentsProvider: () => documents, sheetCsvPaths: () => [] });
   const service = new KbBuildService({
     dataRoot, pool, toolService, resolver: stubResolver(),
-    configProvider: () => makeSeamConfig(publishMode),
+    configProvider: () => makeSeamConfig(),
     documentsProvider: () => documents,
     excludedSourcesProvider: () => [], sheetCsvPaths: () => [],
     internalBaseUrl: () => 'http://127.0.0.1:39999', extensionPath: () => null, promptAssets: () => null,
@@ -534,14 +533,15 @@ describe('seam 增量（F06）', () => {
 // ===========================================================================
 
 describe('seam 锚点：F04/F07/F08', () => {
-  it('F04：设置 → buildSpecFromConfig → reviewPipelineActive（confirm/任一角色显式均启用）', () => {
+  it('F04：设置 → buildSpecFromConfig → reviewPipelineActive（仅由角色配置决定是否启用）', () => {
     const standardKb = {
       buildRoles: { writer: { modelPresetId: '' }, reviewer: { modelPresetId: '' }, plannerEnabled: false },
       reviewPolicy: { maxAutoRevisions: 2, maxInterfaceRetries: 2 },
       publishMode: 'confirm' as const,
     };
     const spec = buildSpecFromConfig({ buildId: 'b_anchor', snapshotEntries: [], baseReleaseId: null, standardKb });
-    expect(reviewPipelineActive(spec)).toBe(true); // 显式 confirm 必须 await 释放屏障
+    expect(spec.publishMode).toBe('auto');
+    expect(reviewPipelineActive(spec)).toBe(false);
     const writerOnly = buildSpecFromConfig({
       buildId: 'b_anchor', snapshotEntries: [], baseReleaseId: null,
       standardKb: { ...standardKb, publishMode: 'auto' as const, buildRoles: { writer: { modelPresetId: 'glm-4.7' }, reviewer: { modelPresetId: '' }, plannerEnabled: false } },

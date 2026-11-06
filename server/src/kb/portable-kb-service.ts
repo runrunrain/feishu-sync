@@ -137,7 +137,7 @@ export async function exportPortableKb(
         try {
           const source = resolveInside(options.knowledgeBaseRoot, entry.relPath, 'read');
           digest = await sourceComparisonHash(entry.contentHash, visit => visitSourceFiles(
-            source, options.sheetCsvPaths?.(entry.objToken) ?? [], options.knowledgeBaseRoot!, visit));
+            source, options.sheetCsvPaths?.(entry.objToken) ?? [], options.knowledgeBaseRoot!, visit), 1);
         } catch { /* Unreadable or changed sources cannot establish a baseline. */ }
       }
       if (isDigest(digest)) proof[sourceComparisonKey(entry)] = digest;

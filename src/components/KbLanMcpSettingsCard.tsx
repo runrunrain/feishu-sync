@@ -366,7 +366,7 @@ export function KbLanMcpSettingsCard() {
         <div>
           <h3 className="text-sm font-kai font-medium text-ink">知识库共享（内网 MCP）</h3>
           <p className="mt-1 text-xs text-ink-soft leading-relaxed">
-            让可信内网设备上的 Agent 只读检索已发布标准库；不开放原始库、写入或应用管理权限。
+            只读共享已发布标准库和已同步原始文档。HTTP 未加密，仅在可信内网启用。
           </p>
         </div>
       </header>
@@ -449,7 +449,7 @@ export function KbLanMcpSettingsCard() {
               服务诊断：{status.lastError.replace(/fskb_[A-Za-z0-9_-]+/g, '[令牌已隐藏]')}
             </p>
           ) : null}
-          <p>默认关闭。这里的操作立即生效，不需要顶部「保存」。停用会关闭监听并断开全部会话。</p>
+          <p>本区操作立即生效。</p>
         </div>
         {busy ? <p role="status">正在处理共享请求，请稍候…</p> : null}
         {feedback ? (
@@ -464,7 +464,7 @@ export function KbLanMcpSettingsCard() {
           <div className="border-t border-line/60 pt-4 space-y-4">
             <div className="space-y-2">
               <h4 className="font-medium text-ink">连接地址</h4>
-              {status.state !== 'running' ? <p className="text-seal-2">服务未运行，下列地址仅供排障，不能用于连接。</p> : null}
+              {status.state !== 'running' ? <p className="text-seal-2">服务未运行，下列地址仅供排障。</p> : null}
               {urls.length ? (
                 urls.map((url) => (
                   <div key={url} className="flex items-start gap-2 min-w-0">
@@ -483,11 +483,10 @@ export function KbLanMcpSettingsCard() {
                   </div>
                 ))
               ) : (
-                <p>网关尚未提供可用地址；请等待启动或检查下方排障。</p>
+                <p>暂无可用地址。</p>
               )}
-              {loopbackOnly ? <p>当前仅监听本机回环地址，其他设备无法连接；.local 主机名通常解析为网卡地址，不适用于此监听。请在本机使用回环地址。</p> : <p>
-                优先使用服务提供的 .local 地址；若使用 IP，建议在路由器设置 DHCP
-                地址保留。地址变化后请更新客户端配置。
+              {loopbackOnly ? <p>当前仅本机可连接，请使用回环地址。</p> : <p>
+                优先使用 .local 地址。
               </p>}
             </div>
             <div className="space-y-2">
@@ -529,7 +528,7 @@ export function KbLanMcpSettingsCard() {
                 </Button>
               </div>
               <p>
-                显示或复制会记入审计。令牌可读取标准库全文，请仅交给可信设备；离开卡片或窗口失焦会隐藏明文。轮换后旧令牌立即失效。
+                仅向可信设备提供令牌。显示或复制令牌会记入访问记录。
               </p>
             </div>
             <div className="space-y-2">
@@ -573,13 +572,12 @@ export function KbLanMcpSettingsCard() {
                 </Button>
               </div>
               <p>
-                在客户端设备的 shell 或密钥管理器中设置 <code>FEISHU_KB_TOKEN</code>{' '}
-                环境变量，再从同一环境启动客户端。请勿把令牌提交到 Git。
+                设置 <code>FEISHU_KB_TOKEN</code> 环境变量后，从同一环境启动客户端。
               </p>
               <p>
                 {client === 'pi'
-                  ? '合并到 ~/.pi/agent/mcp.json；保留文件中其它 mcpServers 条目。'
-                  : '合并到项目 .mcp.json；保留其它 mcpServers 条目，按客户端提示批准项目 MCP。'}
+                  ? '合并到 ~/.pi/agent/mcp.json，保留现有条目。'
+                  : '合并到项目 .mcp.json，按提示批准 MCP。'}
               </p>
               {selectedUrl ? (
                 <pre
@@ -594,8 +592,7 @@ export function KbLanMcpSettingsCard() {
                 <p>网关提供地址后可生成配置。</p>
               )}
               <p>
-                配置仅引用 <code>{'${FEISHU_KB_TOKEN}'}</code>
-                ，不会嵌入明文。不要使用会把令牌在添加时展开写入文件的 --header 命令。
+                配置文件和 Git 中请勿写入明文令牌。
               </p>
             </div>
           </div>
@@ -618,7 +615,6 @@ export function KbLanMcpSettingsCard() {
             ) : (
               <form onSubmit={saveSettings} className="space-y-3">
                 <fieldset disabled={blocked || !!settingsError} className="space-y-3">
-                  <p className="text-xs text-muted">内网与本机 MCP 使用相同资料范围：已发布标准库＋已同步原始文档，均为只读。</p>
                   <label className="block space-y-1">
                     <span>绑定网卡</span>
                     <select
@@ -697,12 +693,10 @@ export function KbLanMcpSettingsCard() {
                     />
                   </label>
                   <p className="break-words">
-                    留空使用默认私网段：{DEFAULT_KB_LAN_CIDRS.join('、')}
-                    。填写后替换默认列表；只允许收窄到默认段的子集，公网段会被服务端拒绝。
+                    留空使用默认私网段：{DEFAULT_KB_LAN_CIDRS.join('、')}。手动填写只允许缩小范围。
                   </p>
                   <p>
-                    运行时修改会重启网关、断开所有会话。需要加密请绑定 Tailscale / WireGuard 接口
-                    IP。
+                    应用修改会重启网关并断开会话。
                   </p>
                   <div className="flex flex-wrap gap-2 items-center">
                     <Button
@@ -749,7 +743,7 @@ export function KbLanMcpSettingsCard() {
           {audit === null ? (
             <p>正在读取访问记录…</p>
           ) : audit.length === 0 ? (
-            <p>暂无访问记录。启用、令牌查看与客户端访问后会在此显示。</p>
+            <p>暂无访问记录。</p>
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full text-left text-xs">
@@ -851,22 +845,18 @@ export function KbLanMcpSettingsCard() {
           {confirm === 'enable' ? (
             <>
               <p className="text-seal-2 font-medium">
-                传输未加密：HTTP 会传送令牌与知识库正文，同网段嗅探可能截获内容。
+                传输未加密。HTTP 会明文传送令牌和知识库正文。
               </p>
               <p>
-                只在家庭、公司有线网或可信 Wi-Fi 上开启；公共或访客 Wi-Fi 请勿开启。需要加密请绑定
-                Tailscale / WireGuard 地址。
+                仅在可信内网启用。需要加密时请绑定 Tailscale 或 WireGuard 地址。
               </p>
-              <p>共享范围与本机 MCP 一致：已发布标准库和已同步原始文档（含未参与构建的文档）。仅允许只读检索与阅读，不开放写操作或应用管理权限。</p>
-              <p>
-                随时可在本卡点击「停用共享」关闭监听；怀疑令牌泄露时选择轮换，或停用并作废令牌。
-              </p>
+              <p>只读共享已发布标准库和已同步原始文档。</p>
               {dirty ? <p className="text-seal-2">高级设置尚未应用，本次使用已保存配置。</p> : null}
             </>
           ) : null}
           {confirm === 'disable' ? (
             <>
-              <p>将关闭监听并断开全部会话。默认保留令牌，下次启用无需重新配置设备。</p>
+              <p>停用将断开所有会话。默认保留令牌。</p>
               <label className="flex gap-2 items-center">
                 <input
                   type="checkbox"
@@ -880,13 +870,12 @@ export function KbLanMcpSettingsCard() {
           ) : null}
           {confirm === 'rotate' ? (
             <p>
-              所有已配置设备将断开，需要更新令牌。旧令牌立即失效，无宽限期；本操作不会自动显示新令牌。
+              旧令牌立即失效，客户端需更新令牌。
             </p>
           ) : null}
           {confirm === 'wildcard' ? (
             <p className="text-seal-2">
-              {wildcard} 会在所有网卡上监听，包括
-              VPN、热点与虚拟机网桥，可能扩大暴露范围。源地址放行段仍然生效。确认后仍需点击「应用高级设置」才会生效。
+              {wildcard} 会监听所有网卡。源地址限制仍生效，点击「应用高级设置」后启用。
             </p>
           ) : null}
         </SharingConfirm>

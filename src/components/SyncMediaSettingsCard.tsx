@@ -127,8 +127,7 @@ export function SyncMediaSettingsCard() {
 
       <CardBody className="space-y-4">
         <p className="text-xs text-ink-soft leading-relaxed">
-          媒体采集是同步的旁路能力：采集失败只记录警告，不会阻断文档同步与基线推进。
-          变更开关后对下一次同步生效。
+          设置在下次同步生效。采集失败时，正文照常同步。
         </p>
 
         {/* ---- 幻灯片整页截图（P1-S5） ---- */}
@@ -139,7 +138,7 @@ export function SyncMediaSettingsCard() {
             disabled={saving || savingSlides}
             onChange={(v) => void handleSlidesToggle(v)}
             ariaLabel="幻灯片整页截图开关"
-            helperText="同步幻灯片时逐页采集 PNG 截图存入 images/ 并在正文插入引用；单次采集按页批处理，任一页失败则本文档全部跳过"
+            helperText="逐页采集截图。任一页失败时跳过该文档的全部截图。"
           />
 
           {optionalScopes && (
@@ -162,8 +161,7 @@ export function SyncMediaSettingsCard() {
               role="alert"
               data-testid="slides-scope-hint"
             >
-              截图采集已开启，但当前飞书授权尚未包含截图权限：请在「飞书认证」中重新认证并同意所请求的权限，之后才会实际采集；
-              未授权期间同步会自动跳过截图（记警告），文档正文照常同步。
+              缺少截图权限，同步时会跳过截图。请在「飞书认证」中重新授权。
             </div>
           )}
         </div>
@@ -176,7 +174,7 @@ export function SyncMediaSettingsCard() {
             disabled={saving || savingWb}
             onChange={(v) => void handleWbToggle(v)}
             ariaLabel="白板矢量导出开关"
-            helperText="同步含白板的文档时旁路导出 .wb.svg 矢量文件（SVG 失败自动降级 raw JSON），供标准库构建读取白板文字；不影响正文引用"
+            helperText="供标准库读取白板文字。SVG 导出失败时改用原始 JSON。"
           />
 
           {wbEnabled && (

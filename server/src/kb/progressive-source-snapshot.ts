@@ -16,7 +16,7 @@ import type { ImageEvidencePayload } from './evidence-resources.js';
 import type { SourceContents } from './kb-version-store.js';
 import { RawSourceSnapshot } from './raw-source-snapshot.js';
 
-interface FrozenSource {
+export interface FrozenSource {
   content: string;
   attachments: Array<{ path: string; content: string }>;
 }
@@ -78,11 +78,12 @@ export function loadProgressiveBaselineImages(input: {
   return result;
 }
 
-function frozenSourcesFromRelease(input: {
+export function frozenSourcesFromRelease(input: {
   releaseRoot: string;
   manifest: KbManifest;
   sourceContents: SourceContents;
   tokens: ReadonlySet<string>;
+  skipUnavailable?: boolean;
 }): Map<string, FrozenSource> {
   if (input.tokens.size === 0) return new Map();
   const indexPath = path.join(input.releaseRoot, 'evidence-resources.json');
@@ -96,6 +97,7 @@ function frozenSourcesFromRelease(input: {
       const combined = input.sourceContents[token];
       if (!input.manifest.sourceSnapshot.some((entry) => entry.objToken === token) || typeof combined !== 'string'
         || combined.includes('\n\n--- CSV 1 ---\n')) {
+        if (input.skipUnavailable) continue;
         throw new Error(`阶段发布缺少基准来源证据区段：${token}`);
       }
       frozen.set(token, { content: combined, attachments: [] });
@@ -111,7 +113,7 @@ function frozenSourcesFromRelease(input: {
   }
   const baseEntries = new Map(input.manifest.sourceSnapshot.map((entry) => [entry.objToken, entry]));
   const frozen = new Map<string, FrozenSource>();
-  for (const token of input.tokens) {
+  const readSource = (token: string): FrozenSource => {
     const entry = baseEntries.get(token);
     const combined = input.sourceContents[token];
     if (!entry || typeof combined !== 'string') throw new Error(`阶段发布缺少基准来源快照：${token}`);
@@ -122,8 +124,7 @@ function frozenSourcesFromRelease(input: {
     // carried source without evidence still has its exact combined bytes in
     // source-contents.json; accept that as text only when no CSV split is needed.
     if (resources.length === 0 && !combined.includes('\n\n--- CSV 1 ---\n')) {
-      frozen.set(token, { content: combined, attachments: [] });
-      continue;
+      return { content: combined, attachments: [] };
     }
     if (text.length !== 1) throw new Error(`阶段发布缺少基准来源正文区段：${token}`);
     const read = (item: typeof resources[number]): string => {
@@ -164,7 +165,11 @@ function frozenSourcesFromRelease(input: {
       }
       attachments = recovered;
     }
-    frozen.set(token, { content, attachments });
+    return { content, attachments };
+  };
+  for (const token of input.tokens) {
+    try { frozen.set(token, readSource(token)); }
+    catch (error) { if (!input.skipUnavailable) throw error; }
   }
   return frozen;
 }

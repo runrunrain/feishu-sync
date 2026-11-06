@@ -1,7 +1,7 @@
 /**
  * AgentSettingsCard 组件测试（S5）—— renderToStaticMarkup 锚定：
  * 图片理解段（开关/提供商/模型下拉 + supportsImages 标记与置灰/测试按钮
- * 可用条件）、构建并行数下拉（1..6 + 后台配额提示）。数据 hook 与 vision
+ * 可用条件）。数据 hook 与 vision
  * API 全 mock（CliAccessSettingsCard.test.tsx 同法：SSR 不跑 effect，
  * 状态展示细节由导出的纯函数 describeVisionStatus/describeVisionTestResult
  * 单测锚定）；点击保存链路由 server 侧 agent-config / vision 路由测试锚定，
@@ -81,7 +81,7 @@ function makeConfig(over: { agent?: Partial<Config['agent']>; llm?: Partial<Conf
       buildBatchWordBudget: 40000,
       promptTimeoutMinutes: 15,
       buildTimeoutMinutes: 180,
-      buildParallelism: 2,
+      buildConcurrency: 2,
       autoBuildAfterSync: false,
       ...over.standardKb,
     },
@@ -128,12 +128,12 @@ describe('Agent 基座选择', () => {
       model: { ...agent.model, source: 'pi-agent-dir', piModel: 'pi/model' } }, llm: { providers: [...PROVIDERS, anthropic] } }));
     const html = renderToStaticMarkup(<AgentRuntimeSettingsCard />);
     expect(html).toContain('应用基础能力的 Agent 基座');
-    expect(html).toContain('对话页新建会话使用 Pi');
+    expect(html).toContain('新对话使用 Pi');
     expect(html).toContain('Claude Code 路径覆盖');
     expect(html).toContain('pi 路径覆盖');
     expect(html).toContain('更新 Pi');
     expect(html).toContain('更新 Claude Code');
-    expect(html).toContain('预设上下文窗口用于自动压缩');
+    expect(html).toContain('Claude Code 需要 Anthropic Messages 兼容提供商');
     expect(html).not.toContain('本地 Agent 配置（Pi）');
     const providerSelect = html.match(/<select[^>]*aria-label="选择提供商"[^>]*>[\s\S]*?<\/select>/)?.[0] ?? '';
     expect(providerSelect).toContain('兼容 Anthropic');
@@ -223,28 +223,11 @@ describe('AgentRuntimeSettingsCard 图片理解段（S2/S5）', () => {
   });
 });
 
-describe('AgentKbSettingsCard 构建并行数（S4/S5）', () => {
-  it('1..6 下拉、当前值选中、后台配额提示', () => {
-    setup(makeConfig());
-    const html = renderToStaticMarkup(<AgentKbSettingsCard />);
-    expect(html).toContain('构建并行数');
-    for (const n of [1, 2, 3, 4, 5, 6]) {
-      const opt = option(html, String(n));
-      expect(opt.length, `option ${n}`).toBeGreaterThan(0);
-    }
-    expect(option(html, '2')).toContain('selected');
-    expect(option(html, '1')).toContain('单进程，行为与旧版一致');
-    expect(html).toContain('data-testid="build-parallelism-hint"');
-    expect(html).toContain('maxConcurrentProcesses');
-  });
-
-  it('旧配置缺 buildParallelism 时缺省显示 2（服务端归一默认）', () => {
-    const config = makeConfig();
-    delete (config.standardKb as Partial<NonNullable<Config['standardKb']>>).buildParallelism;
-    setup(config);
-    const html = renderToStaticMarkup(<AgentKbSettingsCard />);
-    expect(option(html, '2')).toContain('selected');
-  });
+it('标准库与 Workspace 不再重复展示构建并发', () => {
+  setup(makeConfig());
+  const html = renderToStaticMarkup(<AgentKbSettingsCard />);
+  expect(html).not.toContain('构建并行数');
+  expect(html).not.toContain('构建并发');
 });
 
 describe('AgentKbSettingsCard 每批字数预算（P2-S3）', () => {
@@ -260,7 +243,7 @@ describe('AgentKbSettingsCard 每批字数预算（P2-S3）', () => {
     expect(html).toContain('请输入数字（0 或 4000–400000）');
     expect(html).toContain('0 = 按源数分批');
     expect(html).toContain('4000–400000');
-    expect(html).toContain('有效字数');
+    expect(html).toContain('字数含正文和图片描述');
   });
 
   it('clampBuildBatchWordBudget 对齐 server 链制语义', () => {

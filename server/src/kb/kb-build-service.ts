@@ -475,12 +475,13 @@ export class KbBuildService extends EventEmitter {
   // 目录布局
   // ------------------------------------------------------------------
 
-  private sourceDocuments(published: Iterable<string> = []) {
+  private sourceDocuments(published: Iterable<string> = [], retainUnselectedPublished = true) {
     const excluded = this.deps.excludedSourcesProvider?.() ?? [];
     return selectKnowledgeSources(this.deps.documentsProvider(), {
       unselected: this.deps.unselectedSourcesProvider?.() ?? excluded,
       excluded,
       published,
+      retainUnselectedPublished,
     });
   }
 
@@ -1365,6 +1366,7 @@ export class KbBuildService extends EventEmitter {
     // briefing 只留本次材料/计划，不再重复粘贴全文）
     const { revision, skillPath } = this.materializeWorkflowSkill(input.buildId);
     const generation = input.entry.leaderRun?.generation ?? 1;
+    const publicationPolicy = input.entry.leaderRun?.spec.publicationPolicy === 'manual' ? 'confirm' : 'auto';
     const automaticSkips = [...(input.buildState.workset?.keys() ?? [])].flatMap((token) => {
       const source = input.buildState.snapshot.readVerified(config.knowledgeBaseRoot, token);
       if (isPermissionDeniedSourcePlaceholder(source.content)) return [`${token}（权限占位）`];
@@ -1385,7 +1387,7 @@ export class KbBuildService extends EventEmitter {
       '',
       `- buildId：${input.buildId}`,
       `- 模式：${input.effectiveMode === 'full' ? '全量重建' : '增量构建'}${input.baseReleaseId ? `（基准版本 ${input.baseReleaseId.slice(0, 12)}…）` : ''}`,
-      `- 发布策略：${(config.standardKb.publishMode ?? 'auto') === 'confirm' ? '候选确认（申请发布通过校验后停在待确认，由用户确认发布）' : '自动发布（申请发布通过校验后立即发布）'}`,
+      `- 发布策略：${publicationPolicy === 'confirm' ? '沿用检查点的候选确认方式' : '通过发布校验后自动发布'}`,
       `- 并发上限：${resolveBuildConcurrency(config.standardKb)}（amagi 准入分池冻结）`,
       ...(skipBriefing ? [skipBriefing] : []),
       '',
@@ -1412,7 +1414,7 @@ export class KbBuildService extends EventEmitter {
       generation,
       models,
       maxConcurrentAgents: resolveBuildConcurrency(config.standardKb),
-      publicationPolicy: config.standardKb.publishMode ?? 'auto',
+      publicationPolicy,
       workflowRevision: revision,
       workflowSkillPath: skillPath,
       apiKey,
@@ -2324,7 +2326,8 @@ export class KbBuildService extends EventEmitter {
       const baseManifest = withSourceComparisonBaseline(basePointer ? store.readManifest(basePointer.releaseId) : null, outputRoot);
       if (resume && (basePointer?.releaseId ?? null) !== resume.baseReleaseId) throw new ToolError('kb_resume_stale', '标准库基准版本已变化，请重新构建', 409);
       entry.baseReleaseId = basePointer?.releaseId ?? null;
-      const retainedSources = mode === 'incremental' ? baseManifest?.sourceSnapshot.map((source) => source.objToken) ?? [] : [];
+      const publishedSources = baseManifest?.sourceSnapshot.map((source) => source.objToken) ?? [];
+      const retainUnselectedPublished = mode === 'incremental';
       const excludedForResume = new Set(this.deps.excludedSourcesProvider?.() ?? []);
       // A resume continues the frozen source set. Scanning every currently
       // available document pulled unselected/new sources into old checkpoints
@@ -2332,7 +2335,8 @@ export class KbBuildService extends EventEmitter {
       // still pass the full byte/media/path integrity checks below.
       const resumeTokens = resume ? new Set(resume.snapshot.map((source) => source.objToken)) : null;
       const documents = resume ? this.deps.documentsProvider().filter((doc) =>
-        resumeTokens!.has(doc.objToken) && !excludedForResume.has(doc.objToken)) : this.sourceDocuments(retainedSources);
+        resumeTokens!.has(doc.objToken) && !excludedForResume.has(doc.objToken))
+        : this.sourceDocuments(publishedSources, retainUnselectedPublished);
       // P1-S8（设计 P1 §4.1 防线 2）：发布产物不进构建快照——用户把已发布
       // 文档移进监听树时，同步会如实镜像，但构建必须排除（防自我喂养），
       // 并给构建警告 published_doc_in_sources。排除只作用于构建，不影响同步。
@@ -2349,7 +2353,7 @@ export class KbBuildService extends EventEmitter {
         : documents;
       const snapshotResult = RawSourceSnapshot.scan(config.knowledgeBaseRoot, buildDocuments, this.deps.sheetCsvPaths);
       await addSourceComparisonHashes({ entries: snapshotResult.entries, base: baseManifest, root: config.knowledgeBaseRoot,
-        csvPaths: this.deps.sheetCsvPaths, capture: true });
+        csvPaths: this.deps.sheetCsvPaths, capture: true, outputRoot });
       // S3（§3.4）：为全部条目补充 mediaHash/imageCount（contentHash 公式不变）
       enrichEntriesWithMedia(config.knowledgeBaseRoot, snapshotResult.entries);
       const liveSnapshot = RawSourceSnapshot.fromEntries(snapshotResult.entries, {
@@ -2819,10 +2823,7 @@ export class KbBuildService extends EventEmitter {
       // 单进程流水线（全局批切分 + kb_finish 单轮，不引入单元语义）——
       // 保证 N 缺省/为 1 时行为与现状等价（含
       // spawnBuildProcess 测试接缝与既有提示词序列）。
-      // T2a（B 案 §6/R3）：构建容量 N = resolveBuildConcurrency
-      // （buildConcurrency 优先回落 buildParallelism），同步进进程池 build
-      // 通道；workerCount 不再被 maxConcurrentProcesses−M 截断——配置多少
-      // 构建上限就是多少路。
+      // 构建并发同步到进程池的独立构建通道。
       const buildConcurrency = resolveBuildConcurrency(config.standardKb);
       this.deps.pool.configure({ buildConcurrency });
       // S1（构建可观测性）：build 通道等待统计按本次构建重置（构建串行，
@@ -3152,7 +3153,8 @@ export class KbBuildService extends EventEmitter {
       // 只复核本次快照中的源；构建期间新同步的文档留待下一次构建。
       // 快照创建和发布前必须使用同一条发布产物排除规则，避免把排除项误判为新增源。
       const currentPublishedTokens = new Set(this.deps.publishedTokensProvider?.() ?? []);
-      const currentDocuments = this.sourceDocuments(resume ? snapshot.entries.map((source) => source.objToken) : retainedSources)
+      const currentDocuments = this.sourceDocuments(resume ? snapshot.entries.map((source) => source.objToken) : publishedSources,
+        Boolean(resume) || retainUnselectedPublished)
         .filter((doc) => !currentPublishedTokens.has(doc.objToken));
       const newSources = verifyBuildSnapshotIntact(snapshot, config.knowledgeBaseRoot, this.deps.sheetCsvPaths,
         currentDocuments, entry.rebuildSelected ? new Set(buildState.workset.keys()) : null);
@@ -3760,7 +3762,7 @@ export class KbBuildService extends EventEmitter {
   /**
    * S4 等价回退路径（§4.1 “行为与现状等价”）：单进程全局批切分 +
    * kb_finish 单轮。保留既有 spawnBuildProcess 测试接缝与提示词序列，
-   * 既有构建语义回归（buildParallelism 缺省/为 1）不改动全绿。
+   * 既有构建语义回归（buildConcurrency 为 1）不改动全绿。
    */
   private async runSingleProcessPhase(input: {
     buildId: string;

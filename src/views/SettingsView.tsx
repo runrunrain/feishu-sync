@@ -60,7 +60,6 @@ type SettingsTab = 'knowledge' | 'models' | 'agent' | 'auth' | 'application';
 interface SettingsSubItem {
   id: string;
   label: string;
-  description: string;
   icon: LucideIcon;
   render: () => React.ReactNode;
   /** 敏感管理卡离开即卸载，不保留明文/异步请求。 */
@@ -70,7 +69,6 @@ interface SettingsSubItem {
 interface SettingsTabMeta {
   id: SettingsTab;
   label: string;
-  description: string;
   icon: LucideIcon;
   /** 该分组下的侧栏项（子卡片）。顺序即侧栏自上而下的展示顺序。 */
   items: SettingsSubItem[];
@@ -80,48 +78,41 @@ const SETTINGS_TABS: SettingsTabMeta[] = [
   {
     id: 'knowledge',
     label: '知识库与同步',
-    description: '本地知识库、轮询与同步根目录',
     icon: BookOpen,
     items: [
       {
         id: 'kb-base',
         label: '知识库设置',
-        description: '本地根目录、轮询间隔与 lark-cli 路径',
         icon: Database,
         render: () => <KnowledgeSettingsCard />,
       },
       {
         id: 'kb-roots',
         label: '同步根目录',
-        description: '飞书同步根 URL 与本地目录',
         icon: FolderTree,
         render: () => <WatchedRootsCard />,
       },
       {
         id: 'kb-sync-media',
         label: '同步媒体选项',
-        description: '幻灯片整页截图与白板矢量导出的采集开关',
         icon: ImageIcon,
         render: () => <SyncMediaSettingsCard />,
       },
       {
         id: 'kb-orphan-files',
         label: '孤立文件清理',
-        description: '已移除同步根残留的本地同步产物，一键回收到 .trash-bin',
         icon: Trash2,
         render: () => <OrphanFilesCard />,
       },
       {
         id: 'kb-sync-blocklist',
         label: '同步屏蔽名单',
-        description: '查看屏蔽文档，多选移出后恢复检测与同步',
         icon: ShieldCheck,
         render: () => <SyncBlocklistCard />,
       },
       {
         id: 'kb-custom-archive',
         label: '自定义归档',
-        description: '快捷添加的零散云文档与分类文件夹管理',
         icon: FolderArchive,
         render: () => <CustomArchiveSettingsCard />,
       },
@@ -130,20 +121,17 @@ const SETTINGS_TABS: SettingsTabMeta[] = [
   {
     id: 'models',
     label: '服务提供商与模型',
-    description: '应用模型提供商与模型预设，供 Agent 与文档整理使用',
     icon: Sparkles,
     items: [
       {
         id: 'md-provider',
         label: '模型提供商与预设',
-        description: 'Chat Completions、Responses、Anthropic 与模型预设',
         icon: Server,
         render: () => <ModelProviderSettings />,
       },
       {
         id: 'md-defaults',
         label: '默认模型与文档整理',
-        description: '应用默认提供商、模型预设与同步整理',
         icon: Settings,
         render: () => <ModelDefaultsSettings />,
       },
@@ -152,41 +140,35 @@ const SETTINGS_TABS: SettingsTabMeta[] = [
   {
     id: 'agent',
     label: 'Agent 标准库',
-    description: 'Pi / Claude Code 运行时、模型来源、标准库目录、Workspace 与 MCP',
     icon: Bot,
     items: [
       {
         id: 'agent-runtime',
         label: '运行时与模型',
-        description: 'Node、Pi / Claude Code 路径、模型来源与思考档位',
         icon: Bot,
         render: () => <AgentRuntimeSettingsCard />,
       },
       {
         id: 'agent-plugins',
         label: '应用插件',
-        description: 'Pi包安装、启停与内置插件配置',
         icon: Puzzle,
         render: () => <AgentPluginsCard />,
       },
       {
         id: 'agent-kb',
         label: '标准库与 Workspace',
-        description: '输出目录、构建参数与 Work 授权目录',
         icon: Server,
         render: () => <AgentKbSettingsCard />,
       },
       {
         id: 'agent-kb-orchestration',
         label: '构建编排',
-        description: '角色模型、构建并发、审查策略与发布方式',
         icon: Workflow,
         render: () => <BuildOrchestrationSettings />,
       },
       {
         id: 'agent-kb-lan',
         label: '知识库共享',
-        description: '本机 MCP 安装与内网知识库共享',
         icon: Network,
         render: () => <div className="space-y-3"><KbMcpLocalSettingsCard /><KbLanMcpSettingsCard /></div>,
         unmountOnLeave: true,
@@ -196,13 +178,11 @@ const SETTINGS_TABS: SettingsTabMeta[] = [
   {
     id: 'auth',
     label: '飞书认证',
-    description: 'lark-cli 登录状态与权限范围',
     icon: ShieldCheck,
     items: [
       {
         id: 'auth-status',
         label: '飞书认证',
-        description: 'lark-cli 登录状态与权限范围',
         icon: KeyRound,
         render: () => <AuthSettingsCard />,
       },
@@ -211,20 +191,17 @@ const SETTINGS_TABS: SettingsTabMeta[] = [
   {
     id: 'application',
     label: '应用',
-    description: '更新、自启动与通知',
     icon: Settings,
     items: [
       {
         id: 'app-about',
         label: '关于与更新',
-        description: '版本、更新、自启动与通知',
         icon: Info,
         render: () => <AppUpdateCard />,
       },
       {
         id: 'app-cli',
         label: '命令行访问',
-        description: '终端调用 feishu-sync 命令：开关、令牌轮换与 feishu-sync 入口生成',
         icon: Terminal,
         render: () => <CliAccessSettingsCard />,
       },
@@ -281,7 +258,6 @@ function SettingsContent({ focusTabId, focusNonce, active }: SettingsViewProps) 
     if (contentRef.current) contentRef.current.scrollTop = 0;
   }, [activeSubId]);
 
-  const TabIcon = currentTabMeta.icon;
 
   return (
     <div className="max-w-6xl space-y-3">
@@ -292,7 +268,6 @@ function SettingsContent({ focusTabId, focusNonce, active }: SettingsViewProps) 
         >
           设置
         </h1>
-        <p className="mt-1 text-xs leading-relaxed text-ink-soft">{currentTabMeta.description}</p>
       </div>
 
       {/* 分类导航在窄窗口换行，避免入口移出可见范围。 */}
@@ -332,7 +307,7 @@ function SettingsContent({ focusTabId, focusNonce, active }: SettingsViewProps) 
         </div>
       </div>
       {draft.saveError ? <div role="alert" className="flex flex-wrap items-center gap-2 text-xs text-seal-2">
-        <span>保存失败：{draft.saveError}。修改仍保留，可修正后重试。</span>
+        <span>保存失败：{draft.saveError}。修改已保留。</span>
         {draft.conflict ? <Button size="sm" variant="secondary" loading={draft.saving} onClick={() => void draft.allowConflictOverwrite()}>允许下次保存覆盖该列表</Button> : null}
       </div> : null}
 
@@ -348,12 +323,6 @@ function SettingsContent({ focusTabId, focusNonce, active }: SettingsViewProps) 
           className="flex w-full shrink-0 self-start flex-col md:w-44 rounded-md border border-line bg-paper-2/60 p-2"
           aria-label={`${currentTabMeta.label} 子项`}
         >
-          {/* 侧栏头部：当前分组 + 图标，让侧栏自带语境 */}
-          <div className="hidden md:flex items-center gap-2 px-2 py-2 text-xs font-medium text-ink-faint font-serif">
-            <TabIcon className="h-3.5 w-3.5" />
-            <span className="truncate">{currentTabMeta.label}</span>
-          </div>
-
           {/* 侧栏项列表：溢出时在自己视口内滚 */}
           <nav
             className="flex flex-wrap gap-1 md:flex-col"
@@ -369,7 +338,6 @@ function SettingsContent({ focusTabId, focusNonce, active }: SettingsViewProps) 
                   role="tab"
                   aria-selected={selected}
                   onClick={() => { draft.stageForm(currentSub.id); setActiveSubId(item.id); }}
-                  title={item.description}
                   className={`flex items-center gap-1.5 rounded px-2.5 py-1.5 text-left text-xs leading-5 transition-colors ${
                     selected
                       ? 'bg-card-bg text-seal shadow-sm'

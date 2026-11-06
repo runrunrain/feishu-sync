@@ -357,10 +357,9 @@ export function AppUpdateCard() {
                 toast.push({ type: 'error', message: '设置保存失败', hint: err instanceof Error ? err.message : '' });
               }
             }}
-            helperText="开机时自动启动应用"
           />
           <Toggle
-            label="同步完成通知"
+            label="同步结果通知"
             checked={config?.enableNotifications ?? false}
             onChange={async (v) => {
               try {
@@ -370,7 +369,6 @@ export function AppUpdateCard() {
                 toast.push({ type: 'error', message: '设置保存失败', hint: err instanceof Error ? err.message : '' });
               }
             }}
-            helperText="同步完成或失败时弹出系统通知"
           />
         </div>
       </CardBody>

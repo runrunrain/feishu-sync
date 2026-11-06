@@ -7,6 +7,16 @@
  * 0600 端点文件与请求头，永不经 renderer 展示）。
  */
 
+export type CliSkillTarget = 'agents' | 'claude' | 'codex';
+export interface CliInstallStatus {
+  path: string;
+  state: 'not_installed' | 'installed' | 'needs_update' | 'conflict' | 'invalid';
+  message?: string;
+}
+export interface CliSkillStatus extends CliInstallStatus {
+  target: CliSkillTarget;
+}
+
 export interface CliInfoDto {
   /** 命令行访问是否开启（config.cli.enabled）。 */
   enabled: boolean;
@@ -20,6 +30,9 @@ export interface CliInfoDto {
   /** shim 是否已安装（bin/feishu-sync 或 .cmd 任一存在）。 */
   shimInstalled: boolean;
   shimPath: string;
+  shim: CliInstallStatus;
+  skillAvailable: boolean;
+  skillTargets: CliSkillStatus[];
   /** 调起 CLI 的运行时（开发=当前 Node；打包=Electron RunAsNode）。 */
   command: string;
   args: string[];

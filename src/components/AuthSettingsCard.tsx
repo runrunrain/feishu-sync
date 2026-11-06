@@ -187,7 +187,6 @@ export function AuthSettingsCard() {
             <Button variant="secondary" size="sm" disabled={authActive || configActive || setup.installing} onClick={() => void setup.startAuth('switch_account')}>
               切换飞书账号
             </Button>
-            <p className="w-full text-xs text-ink-soft">认证过期时重新认证当前账号；旧账号被停用或撤权时，可切换为获准访问的新账号。</p>
           </div>
         )}
 
@@ -236,14 +235,13 @@ export function AuthSettingsCard() {
               <p className="text-sm text-ink leading-relaxed">
                 请在浏览器授权页确认当前飞书账号
                 {`（${setup.authSession.previousAccount.name || setup.authSession.previousAccount.id}）`}并同意授权。
-                完成后将自动联网验证账号和同步权限。
               </p>
             )}
             {setup.authMode === 'switch_account' && (
               <p className="text-sm text-ink leading-relaxed">
                 请在浏览器授权页选择新飞书账号
                 {setup.authSession.previousAccount?.name ? `（原账号：${setup.authSession.previousAccount.name}）` : ''}。
-                本次仅申请同步所需权限。新账号须获准使用当前应用；若属于另一组织，请先确认该组织的应用授权。
+                新账号须有应用使用权限。
               </p>
             )}
             <div className="flex items-center gap-2">
@@ -274,11 +272,11 @@ export function AuthSettingsCard() {
               </Button>
             </div>
             <p className="text-xs text-ink-soft leading-relaxed border-t border-seal/20 pt-2">
-              ⚠ 授权页会列出权限勾选列表
+              请勾选授权页上的全部权限
               {setup.authSession.requestedScopes?.length
                 ? `（本次申请 ${setup.authSession.requestedScopes.length} 项权限）`
                 : ''}
-              ——请确认全部权限项已勾选后再点「同意授权」；未勾选的权限会被静默丢弃且不报错。
+              ，再点击「同意授权」。
             </p>
               </>
             )}
@@ -388,7 +386,7 @@ export function AuthSettingsCard() {
                   </div>
                 )}
                 <p className="text-xs text-ink-faint">
-                  初始化会在飞书开放平台创建/绑定 CLI 应用；完成后将自动进入认证引导。
+                  此步骤会创建或绑定飞书 CLI 应用。
                 </p>
                 <Button variant="secondary" size="sm" onClick={setup.cancelConfigInit}>
                   取消
@@ -410,8 +408,7 @@ export function AuthSettingsCard() {
             ) : (
               <>
                 <p className="text-sm text-ink leading-relaxed">
-                  lark-cli 已安装但尚未完成初始配置（首次使用需在浏览器创建 CLI 应用授权）。
-                  点击下方按钮开始，配置完成后将自动进入认证引导。
+                  首次使用需在浏览器授权 CLI 应用。
                 </p>
                 <Button
                   variant="primary"
@@ -439,8 +436,8 @@ export function AuthSettingsCard() {
               {toolStatus.missingScopes && toolStatus.missingScopes.length > 0
                 ? `已安装 lark-cli 但缺少必需权限：${toolStatus.missingScopes.join('、')}。点击上方「${authActionLabel}」并在浏览器确认即可补齐。`
                 : hasAccount
-                  ? '当前账号认证未就绪。点击上方「重新认证」，在浏览器确认当前账号并同意授权；完成后将自动验证。'
-                  : '已安装 lark-cli，尚未完成飞书认证。点击上方「开始飞书认证」，在浏览器确认授权后自动完成。'}
+                  ? '请重新认证当前账号。'
+                  : '请完成飞书认证。'}
             </p>
           </div>
         )}

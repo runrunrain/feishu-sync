@@ -110,7 +110,7 @@ afterEach(() => {
 })
 
 describe('内网 MCP 设置交互（模拟管理 API）', () => {
-  it('默认关闭；开启必须确认明文风险/只读范围/停用方式，并刷新权威状态', async () => {
+  it('默认关闭；开启必须确认明文风险和只读范围，并刷新权威状态', async () => {
     await mount()
     expect(container.textContent).toContain('已停用')
     expect(api.reveal).not.toHaveBeenCalled()
@@ -119,12 +119,12 @@ describe('内网 MCP 设置交互（模拟管理 API）', () => {
     const dialog = container.querySelector('[role=dialog]')!
     expect(dialog.textContent).toContain('传输未加密')
     expect(dialog.textContent).toContain('只读')
-    expect(dialog.textContent).toContain('停用共享')
     expect(document.activeElement).toBe(button('取消'))
     api.status.mockResolvedValue(running)
     await click('确认开启')
     expect(api.enable).toHaveBeenCalledWith()
     expect(container.textContent).toContain('共享运行中')
+    expect(button('停用共享').disabled).toBe(false)
     expect(api.status.mock.calls.length).toBeGreaterThan(1)
     expect(container.textContent).toContain('会话 3 · 在途 0 · 排队 2')
     expect(api.reveal).not.toHaveBeenCalled()
@@ -198,7 +198,7 @@ describe('内网 MCP 设置交互（模拟管理 API）', () => {
   it('轮换确认、取消、成功后不自动显示新令牌', async () => {
     await mount(running)
     await click('轮换令牌')
-    expect(container.textContent).toContain('所有已配置设备将断开')
+    expect(container.textContent).toContain('旧令牌立即失效')
     await click('取消')
     expect(api.rotate).not.toHaveBeenCalled()
     await click('轮换令牌')
@@ -242,7 +242,7 @@ describe('内网 MCP 设置交互（模拟管理 API）', () => {
   it('回环监听时不误导复制 .local；异常状态的地址不得复制', async () => {
     const loopback = { ...running, bindAddress: '127.0.0.1', resolvedHost: '127.0.0.1', urls: ['http://127.0.0.1:47391/mcp', running.urls[1]] }
     await mount(loopback)
-    expect(container.textContent).toContain('其他设备无法连接')
+    expect(container.textContent).toContain('仅本机可连接')
     expect(container.querySelector<HTMLButtonElement>('[aria-label="复制地址 http://studio.local:47391/mcp"]')!.disabled).toBe(true)
     expect((container.querySelectorAll('select')[1] as HTMLSelectElement).value).toBe(loopback.urls[0])
     expect((container.querySelectorAll('select')[1].options[1] as HTMLOptionElement).disabled).toBe(true)
@@ -265,7 +265,7 @@ describe('内网 MCP 设置交互（模拟管理 API）', () => {
     const bind = container.querySelectorAll('select')[2]
     await change(bind, '0.0.0.0')
     expect(api.save).not.toHaveBeenCalled()
-    expect(container.querySelector('[role=dialog]')!.textContent).toContain('虚拟机网桥')
+    expect(container.querySelector('[role=dialog]')!.textContent).toContain('会监听所有网卡')
     await click('取消')
     expect(bind.value).toBe('auto')
     await change(bind, '::')

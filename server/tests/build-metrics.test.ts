@@ -441,7 +441,7 @@ describe('KbBuildService：metrics 采集端到端', () => {
         orchestrationMode: 'legacy', // 旧流水线指标兼容测试
         outputRoot, retainReleases: 3, buildBatchSize: 10, buildBatchWordBudget: 0,
         promptTimeoutMinutes: 15, buildTimeoutMinutes: 30,
-        buildParallelism: overrides.parallelism ?? 1, autoBuildAfterSync: false,
+        buildConcurrency: overrides.parallelism ?? 1, autoBuildAfterSync: false,
         buildRoles: overrides.buildRoles,
         reviewPolicy: { maxAutoRevisions: 2, maxInterfaceRetries: 2 },
         publishMode: 'auto',

@@ -759,23 +759,21 @@ describe('BuildSpec 冻结与修订预算（B 案 §5/§8）', () => {
 // ============================================================================
 
 describe('StandardKbConfig 新字段默认值与解析（B 案 §3/§5/§6/§7/§8）', () => {
-  it('buildDefaultStandardKbConfig：角色/预算/发布方式默认值；buildConcurrency 不落默认', () => {
+  it('buildDefaultStandardKbConfig：角色、审查预算与构建并发默认值', () => {
     const config = buildDefaultStandardKbConfig('/tmp/data');
     expect(config.buildRoles?.writer.modelPresetId).toBe('');
     expect(config.buildRoles?.reviewer.modelPresetId).toBe('');
     expect(config.buildRoles?.plannerEnabled).toBe(false);
     expect(config.reviewPolicy).toEqual({ maxAutoRevisions: 2, maxInterfaceRetries: 2 });
-    expect(config.publishMode).toBe('auto');
-    expect(config.buildConcurrency).toBeUndefined();
-    // 既有字段不动
-    expect(config.buildParallelism).toBe(2);
+    expect(config.buildConcurrency).toBe(2);
+    expect(config).not.toHaveProperty('publishMode');
   });
 
-  it('resolveBuildConcurrency：buildConcurrency 优先，未设回落 buildParallelism，越界钳制', () => {
-    expect(resolveBuildConcurrency({ buildParallelism: 3 })).toBe(3);
-    expect(resolveBuildConcurrency({ buildParallelism: 3, buildConcurrency: 5 })).toBe(5);
-    expect(resolveBuildConcurrency({ buildParallelism: 3, buildConcurrency: 99 })).toBe(8);
-    expect(resolveBuildConcurrency({ buildParallelism: 3, buildConcurrency: 0 })).toBe(1);
+  it('resolveBuildConcurrency：默认 2，越界钳制到 1–6', () => {
+    expect(resolveBuildConcurrency({})).toBe(2);
+    expect(resolveBuildConcurrency({ buildConcurrency: 5 })).toBe(5);
+    expect(resolveBuildConcurrency({ buildConcurrency: 99 })).toBe(6);
+    expect(resolveBuildConcurrency({ buildConcurrency: 0 })).toBe(1);
   });
 });
 
@@ -784,7 +782,6 @@ describe('validateAgentAndKbConfig 新字段严格校验', () => {
     expect(() => validateAgentAndKbConfig({
       standardKb: {
         buildConcurrency: 5,
-        publishMode: 'confirm',
         reviewPolicy: { maxAutoRevisions: 3, maxInterfaceRetries: 1 },
         buildRoles: {
           writer: { modelPresetId: 'glm-4.7', thinking: 'high' },
@@ -794,9 +791,8 @@ describe('validateAgentAndKbConfig 新字段严格校验', () => {
     })).not.toThrow();
   });
 
-  it('buildConcurrency 越界 / publishMode 非法 / 预算越界 / thinking 非法分别报错', () => {
-    expect(() => validateAgentAndKbConfig({ standardKb: { buildConcurrency: 9 } })).toThrowError(/buildConcurrency/);
-    expect(() => validateAgentAndKbConfig({ standardKb: { publishMode: 'yes' as never } })).toThrowError(/publishMode/);
+  it('buildConcurrency 越界 / 预算越界 / thinking 非法分别报错', () => {
+    expect(() => validateAgentAndKbConfig({ standardKb: { buildConcurrency: 7 } })).toThrowError(/buildConcurrency/);
     expect(() => validateAgentAndKbConfig({ standardKb: { reviewPolicy: { maxAutoRevisions: 6 } } })).toThrowError(/maxAutoRevisions/);
     expect(() => validateAgentAndKbConfig({ standardKb: { reviewPolicy: { maxInterfaceRetries: 6 } } })).toThrowError(/maxInterfaceRetries/);
     expect(() => validateAgentAndKbConfig({
@@ -829,7 +825,6 @@ describe('ConfigManager round-trip（standardKb 新字段宽容归一与持久�
     const saved = await manager.updateConfig({
       standardKb: {
         buildConcurrency: 5,
-        publishMode: 'confirm',
         reviewPolicy: { maxAutoRevisions: 3 },
         buildRoles: {
           writer: { modelPresetId: 'glm-4.7', thinking: 'high' },
@@ -839,7 +834,7 @@ describe('ConfigManager round-trip（standardKb 新字段宽容归一与持久�
       },
     });
     expect(saved.standardKb.buildConcurrency).toBe(5);
-    expect(saved.standardKb.publishMode).toBe('confirm');
+    expect(saved.standardKb).not.toHaveProperty('publishMode');
     expect(saved.standardKb.reviewPolicy).toEqual({ maxAutoRevisions: 3, maxInterfaceRetries: 2 });
     expect(saved.standardKb.buildRoles?.writer).toEqual({ modelPresetId: 'glm-4.7', thinking: 'high' });
     expect(saved.standardKb.buildRoles?.plannerEnabled).toBe(true);
@@ -854,19 +849,20 @@ describe('ConfigManager round-trip（standardKb 新字段宽容归一与持久�
     await expect(manager.updateConfig({ standardKb: { buildConcurrency: 99 } })).rejects.toThrow();
   });
 
-  it('旧配置（无新字段）加载后回落默认且 buildConcurrency 保持未设（回落 buildParallelism）', async () => {
+  it.each([[undefined, 4], [6, 6]] as const)('旧配置并发 %s 迁移到唯一字段并清理发布方式', async (current, expected) => {
     const configPath = createTempConfigPath();
     const legacy = {
       llm: { openAiCompatBaseUrl: 'https://open.bigmodel.cn/api/paas/v4', apiKey: '', model: 'glm-4-flash', temperature: 0.2 },
-      standardKb: { outputRoot: '/tmp/legacy-kb', buildParallelism: 4 },
+      standardKb: { outputRoot: '/tmp/legacy-kb', orchestrationMode: 'pi-amagi', buildParallelism: 4, buildConcurrency: current, publishMode: 'confirm' },
     };
     fs.writeFileSync(configPath, JSON.stringify(legacy));
     const manager = new ConfigManager(configPath);
     const config = await manager.load();
-    expect(config.standardKb.buildParallelism).toBe(4);
-    expect(config.standardKb.buildConcurrency).toBeUndefined();
-    expect(resolveBuildConcurrency(config.standardKb)).toBe(4);
-    expect(config.standardKb.publishMode).toBe('auto');
+    expect(config.standardKb.buildConcurrency).toBe(expected);
+    const persisted = JSON.parse(fs.readFileSync(configPath, 'utf8')).standardKb;
+    expect(persisted.buildConcurrency).toBe(expected);
+    expect(persisted).not.toHaveProperty('buildParallelism');
+    expect(persisted).not.toHaveProperty('publishMode');
     expect(config.standardKb.reviewPolicy).toEqual({ maxAutoRevisions: 2, maxInterfaceRetries: 2 });
   });
 });

@@ -35,11 +35,9 @@ let standardKb: Record<string, unknown> = {
   buildBatchWordBudget: 40_000,
   promptTimeoutMinutes: 15,
   buildTimeoutMinutes: 180,
-  buildParallelism: 2,
   buildConcurrency: 4,
   buildRoles: { writer: { modelPresetId: 'glm-r', providerId: 'vp', thinking: 'high' }, reviewer: { modelPresetId: '' }, plannerEnabled: false },
   reviewPolicy: { maxAutoRevisions: 2, maxInterfaceRetries: 2 },
-  publishMode: 'confirm',
   orchestrationMode: 'pi-amagi',
   autoBuildAfterSync: false,
 }

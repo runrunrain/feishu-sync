@@ -28,7 +28,8 @@ parent.on('message', (event) => {
     if (typeof data.desktopExecutable === 'string') process.env.FEISHU_SYNC_DESKTOP_EXECUTABLE = data.desktopExecutable;
     const server = await import(pathToFileURL(data.serverPath).href);
     started = await server.startServer({ desktopMode: true, desktopToken: data.desktopToken,
-      hostname: '127.0.0.1', port: 0, corsDevMode: data.corsDevMode === true });
+      hostname: '127.0.0.1', port: 0, corsDevMode: data.corsDevMode === true,
+      cliLocalInstall: { defaults: data.corsDevMode === false } });
     parent.postMessage({ type: 'ready', url: started!.url, port: started!.port, pid: process.pid });
   })().catch((error) => {
     parent.postMessage({ type: 'startup_error', message: error instanceof Error ? error.message : String(error) });

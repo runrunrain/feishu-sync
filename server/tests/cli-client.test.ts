@@ -14,13 +14,14 @@
  *  - shim：install-shim 端点（desktop token 域）写盘 + shim 真实调起
  */
 
-import { describe, expect, it, beforeAll, afterAll } from 'vitest';
+import { describe, expect, it, beforeAll, afterAll, vi } from 'vitest';
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { startServer, type StartedServer } from '../src/index.js';
+import { LocalMapStore } from '../src/modules/local-map-store.js';
 import { fileURLToPath } from 'node:url';
 
 const exec = promisify(execFile);
@@ -30,6 +31,7 @@ const DESKTOP_TOKEN = 'test-desktop-token-s9-0123456789abcdef';
 const CLI_SCRIPT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'dist', 'cli', 'feishu-sync-cli.cjs');
 
 let server: StartedServer;
+let store: LocalMapStore | undefined;
 let home: string;
 let previousHome: string | undefined;
 
@@ -85,21 +87,38 @@ beforeAll(async () => {
   // configPath 显式指定：ConfigManager 缺省路径在模块求值期冻结，与并行
   // 套件（cli-endpoint.test.ts 同样改 FEISHU_SYNC_HOME）在同 worker 内
   // 存在 env 竞态；显式路径使本套件配置读写始终落在自己的隔离根。
-  server = await startServer({
-    desktopMode: true,
-    desktopToken: DESKTOP_TOKEN,
-    configPath: path.join(home, 'config.json'),
-    port: 0,
-    hostname: '127.0.0.1',
+  const agentHome = path.join(home, 'isolated-agent-home');
+  fs.mkdirSync(agentHome);
+  const initialize = LocalMapStore.prototype.initialize;
+  const spy = vi.spyOn(LocalMapStore.prototype, 'initialize').mockImplementation(function (this: LocalMapStore) {
+    // Keep the test database available for teardown on Windows.
+    // eslint-disable-next-line @typescript-eslint/no-this-alias
+    store = this;
+    initialize.call(this);
   });
-  // 开启命令行访问（desktop token 域）→ 发布 endpoint.json
-  const enabled = await api('POST', '/api/cli/enable', { enabled: true });
-  expect(enabled.status).toBe(200);
+  try {
+    server = await startServer({
+      desktopMode: true,
+      desktopToken: DESKTOP_TOKEN,
+      configPath: path.join(home, 'config.json'),
+      port: 0,
+      hostname: '127.0.0.1',
+      cliLocalInstall: { defaults: true, homeDir: agentHome },
+    });
+  } finally {
+    spy.mockRestore();
+  }
+  // Fresh installations publish the endpoint on startup.
+  const info = (await api('GET', '/api/cli/info')).json;
+  expect(info).toMatchObject({ enabled: true, endpointPublished: true, shimInstalled: true });
+  expect(info.skillTargets[0]).toMatchObject({ target: 'agents', state: 'installed',
+    path: path.join(agentHome, '.agents', 'skills', 'feishu-sync', 'SKILL.md') });
   expect(fs.existsSync(endpointFile(home))).toBe(true);
 }, 240_000);
 
 afterAll(async () => {
-  await server.close().catch(() => undefined);
+  await server?.close().catch(() => undefined);
+  store?.close();
   if (previousHome === undefined) delete process.env.FEISHU_SYNC_HOME;
   else process.env.FEISHU_SYNC_HOME = previousHome;
   fs.rmSync(home, { recursive: true, force: true });
@@ -334,9 +353,12 @@ describe('CLI shim 安装（POST /api/cli/install-shim + GET /api/cli/info）', 
   }, 30_000);
 
   it('shim 真实调起：status --json 经 shim 出站', async () => {
-    if (process.platform === 'win32') return; // POSIX sh shim 在 Windows 不适用
     const info = await api('GET', '/api/cli/info');
-    const { stdout } = await exec(info.json.shimPath, ['--json', 'status'], { timeout: 60_000 });
+    const shim = info.json.shim.path;
+    const { stdout } = process.platform === 'win32'
+      ? await exec(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', '""' + shim + '" --json status"'],
+        { windowsVerbatimArguments: true, timeout: 60_000 })
+      : await exec(shim, ['--json', 'status'], { timeout: 60_000 });
     const envelope = JSON.parse(stdout);
     expect(envelope.ok).toBe(true);
     expect(envelope.data.health.status).toBe('ok');

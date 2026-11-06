@@ -38,6 +38,7 @@ import { McpClientInstaller } from './kb/mcp-client-installer.js';
 import { kbMcpInfo } from './kb/mcp-info.js';
 import { rawCatalogPath, writeRawCatalog } from './kb/raw-mcp-catalog.js';
 import { cliAdminRoutes } from './routes/cli-admin.js';
+import { CliLocalInstaller } from './cli/local-install.js';
 import { healthRoutes } from './routes/health.js';
 import { configRoutes } from './routes/config.js';
 import { detectRoutes } from './routes/detect.js';
@@ -68,7 +69,8 @@ import { ApprovalService } from './agent/approvals/approval-service.js';
 import { createOpsToolFamily } from './agent/tools/app-command-family.js';
 import { KbBuildService, type KbShutdownReport } from './kb/kb-build-service.js';
 import { BuildRuntimeHost } from './kb/build-runtime-host.js';
-import { projectKnowledgeDocuments, recoveredSourceCsvPaths } from './kb/local-source-projection.js';
+import { projectKnowledgeDocuments, recoveredSourceCsvPaths, recoverPublishedSource, recoverUnindexedPublishedSources } from './kb/local-source-projection.js';
+import { StandardKbStore } from './kb/standard-kb-store.js';
 import { piExtensionPath, readAgentPromptAssets, readAgentPromptFile } from './agent/agent-assets.js';
 import { RuntimeInstaller } from './agent/runtime-installer.js';
 import { checkRootOverlap, type WorkspaceRootGuards } from './agent/path-guard.js';
@@ -87,6 +89,8 @@ export interface CreateServerOptions {
   desktopMode?: boolean;
   desktopToken?: string;
   configPath?: string;
+  /** Desktop bootstrap enables defaults. Embedded callers can supply an isolated home. */
+  cliLocalInstall?: { defaults?: boolean; homeDir?: string };
   /**
    * P0-bug-1 fix (v0.2.0 P5): independently control the CORS dev gate.
    *
@@ -240,19 +244,31 @@ export async function buildServer(options: CreateServerOptions = {}) {
     maxConcurrentProcesses: config.agent.maxConcurrentProcesses,
     idleTimeoutMinutes: config.agent.idleTimeoutMinutes,
   });
+  const publishedSources = () => {
+    const outputRoot = configManager.getConfig()?.standardKb.outputRoot;
+    return outputRoot ? new StandardKbStore(outputRoot).readManifest()?.sourceSnapshot ?? [] : [];
+  };
   const knowledgeDocuments = () => {
     const root = configManager.getConfig()?.knowledgeBaseRoot ?? '';
     reconcileLocalIndex(localMapStore, root, () => new SnapshotService(localMapStore, configManager, { larkCliClient, config: configManager.getConfig() }).generate());
-    return projectKnowledgeDocuments(root, filterDeletedLocalDocuments(localMapStore, root, localMapStore.getAllDocuments()));
+    const indexed = localMapStore.getAllDocuments();
+    const live = filterDeletedLocalDocuments(localMapStore, root, indexed);
+    const deleted = new Set(localMapStore.listLocalSourceDeletions(root).map(doc => doc.objToken));
+    for (const doc of indexed) if (doc.pendingReason === 'local_deleted') deleted.add(doc.objToken);
+    return recoverUnindexedPublishedSources(root, projectKnowledgeDocuments(root, live), publishedSources(), deleted);
   };
   const sheetCsvPaths = (objToken: string): string[] => {
     const mapped = localMapStore.getSheetSheets(objToken)
       .map((sheet) => sheet.local_csv_path)
       .filter((csvPath) => typeof csvPath === 'string' && csvPath.length > 0);
-    const record = localMapStore.getDocumentByObjToken(objToken);
-    if (!record || (record.objType !== 'sheet' && record.objType !== 'bitable')) return mapped;
     const root = configManager.getConfig()?.knowledgeBaseRoot ?? '';
-    return recoveredSourceCsvPaths(root, projectKnowledgeDocuments(root, [record])[0], mapped);
+    const record = localMapStore.getDocumentByObjToken(objToken);
+    if (record) return record.objType === 'sheet' || record.objType === 'bitable'
+      ? recoveredSourceCsvPaths(root, projectKnowledgeDocuments(root, [record])[0], mapped) : mapped;
+    const source = publishedSources().find(doc => doc.objToken === objToken);
+    const recovered = root && source && (source.objType === 'sheet' || source.objType === 'bitable')
+      ? recoverPublishedSource(root, source) : null;
+    return recoveredSourceCsvPaths(root, recovered ?? undefined, mapped);
   };
   // S3：共享 VisionDescriber（会话内联/raw_read_image + 构建预描述 + changes 计数）
   const visionDescriber = new VisionDescriber({
@@ -603,11 +619,15 @@ export async function buildServer(options: CreateServerOptions = {}) {
   // 挂在 cliRoutes **之前**——cliRoutes 内 use('/api/cli/*') 的 CLI 令牌
   // 中间件按注册顺序在其后，本文件静态路由先返回即不受其拦截（与
   // cliRoutes 内 enable/rotate 先注册再挂 use 的策略一致）。
+  const cliInstaller = new CliLocalInstaller(agentDataRoot, options.cliLocalInstall?.homeDir);
+  if (options.cliLocalInstall?.defaults) {
+    cliInstaller.installDefaults(error => console.warn('[server] CLI default install failed:', error));
+  }
   app.route('/', cliAdminRoutes({
     desktopToken,
     cliEndpoint,
     configManager,
-    dataRoot: agentDataRoot,
+    installer: cliInstaller,
   }));
   console.info('[server] CLI admin routes registered (pre-auth, desktop token domain)');
   app.route('/', cliRoutes({

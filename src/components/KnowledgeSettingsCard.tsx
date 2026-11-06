@@ -184,13 +184,6 @@ export function KnowledgeSettingsCard() {
               打开目录
             </Button>
           </div>
-          <p className="mt-1.5 text-xs text-ink-faint font-serif">
-            启动时自动创建默认目录：Windows 优先 D 盘，再尝试 C 盘；macOS/Linux 放在用户 Documents 下。已有路径保持不变，也可在此修改。
-          </p>
-        </div>
-
-        <div className="rounded-md border border-line bg-card-bg p-3 text-xs text-ink-faint font-serif">
-          飞书同步根目录（URL、本地目录和布局）请在下方“同步根目录与布局”卡片中统一管理。
         </div>
 
         {/* Poll interval */}
@@ -201,13 +194,13 @@ export function KnowledgeSettingsCard() {
           step="5"
           value={String(cur.pollIntervalMinutes)}
           onChange={(e) => set('pollIntervalMinutes', parseInt(e.target.value, 10) || 30)}
-          helperText="范围 5-1440 分钟；默认 30 分钟"
+          helperText="5–1440 分钟，默认 30"
         />
 
-        <div className="rounded-md border border-line bg-card-bg p-3 text-xs text-ink-faint font-serif">
-          lark-cli 由应用自动发现（系统 PATH 与常见安装位置），无需手动配置路径；
-          如需指定可启动前设置 LARK_CLI_PATH 环境变量。
-        </div>
+        <details className="text-xs text-ink-faint">
+          <summary className="cursor-pointer">lark-cli 路径</summary>
+          <p className="mt-2">默认自动查找。可在启动前设置 <code>LARK_CLI_PATH</code> 指定路径。</p>
+        </details>
 
       </CardBody>
     </Card>

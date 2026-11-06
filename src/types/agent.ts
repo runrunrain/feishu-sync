@@ -146,21 +146,15 @@ export interface StandardKbConfig {
   buildBatchSize: number;
   promptTimeoutMinutes: number;
   buildTimeoutMinutes: number;
-  /** S4：并行构建 worker 数（1..6，默认 2；实际受 Agent 进程池后台配额约束） */
-  buildParallelism: number;
   /** P2-S2：每批有效字数预算（0 = 按源数分批旧行为；取值域 {0}∪[4000,400000]，
    *  默认 40000。buildBatchSize 降为每批源数上限）。 */
   buildBatchWordBudget: number;
-  /** B案 §6：构建名额 N（1..8，additive 可选）——全部文本构建角色（写/审/
-   *  修订/规划/整合/最终复核）合计；未设时回落 buildParallelism。缺省不落盘
-   *  （防默认值冻结回落语义），服务端 PUT 浅合并保留已写值。 */
-  buildConcurrency?: number;
+  /** 全部文本构建任务共享的并发上限，1..6，默认 2。 */
+  buildConcurrency: number;
   /** B案 §3/§8：角色模型配置（additive 可选；PUT 对 buildRoles 整体替换）。 */
   buildRoles?: KbBuildRolesConfig;
   /** B案 §5：审查闭环预算（additive 可选；缺省 2/2）。 */
   reviewPolicy?: KbReviewPolicyConfig;
-  /** B案 §7：发布方式（additive 可选；缺省 auto=通过后自动整版发布）。 */
-  publishMode?: 'auto' | 'confirm';
   /** 服务端固定为 pi-amagi；旧模式只读兼容，前端不提供选择。 */
   orchestrationMode?: KbOrchestrationMode;
   autoBuildAfterSync: boolean;

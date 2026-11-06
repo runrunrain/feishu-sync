@@ -109,24 +109,13 @@ export interface StandardKbConfig {
    * 4000..400000；缺省 40000（ConfigManager 归一保证存在；越界钳制到边界）。
    * full 模式单元字数上限 = 该值 ×3（U44）。 */
   buildBatchWordBudget: number;
-  /** S4：并行构建 worker 数（1..6，默认 2；实际受 Agent 进程池后台配额约束）。
-   * 缺省/旧配置无此字段 → 默认 2（可设为 1 得到等价单 worker 的旧行为回退）。
-   * 继续有效：未设 buildConcurrency 时的回落来源（见 resolveBuildConcurrency）。 */
-  buildParallelism: number;
-  /** B案 §6：构建名额 N 的新语义入口——全部文本构建角色（写/审/修订/
-   * 规划/整合/最终复核）合计 N 路，交互等保底名额额外计算，不再被另一
-   * 道应用总上限压低。additive 可选：1..6（与 Agent 进程池/BuildRunSpec
-   * 上限一致）；**优先于 buildParallelism**，未设时回落 buildParallelism
-   * （resolveBuildConcurrency 统一解析）。 */
-  buildConcurrency?: number;
+  /** 全部文本构建任务共享的并发上限，1..6，默认 2。 */
+  buildConcurrency: number;
   /** B案 §3/§8：角色模型配置（撰写/审查必选，整合缺省跟随撰写，规划者
    * 缺省关闭）。additive 可选：旧配置无此字段 → 跟随活跃预设。 */
   buildRoles?: KbBuildRolesConfig;
   /** B案 §5：审查闭环预算。additive 可选：缺省 2/2。 */
   reviewPolicy?: KbReviewPolicyConfig;
-  /** B案 §7：发布方式。additive 可选：缺省 'auto'（通过后自动整版发布）；
-   * 'confirm' 只在最终候选版本就绪后确认一次（绑定候选版本）。 */
-  publishMode?: 'auto' | 'confirm';
   /** D3（A 案 §5.4）：显式配置时为单 release 证据资源总量上限。
    * 未设时按本次构建的冻结来源数分配额度；增量构建在原始发布基线
    * 上增加该额度。超限仍阻断发布。 */
@@ -185,16 +174,9 @@ export function resolveEvidenceBudgetBytes(config: Pick<StandardKbConfig, 'evide
   return Math.min(EVIDENCE_BUDGET_MAX_BYTES, Math.max(EVIDENCE_BUDGET_MIN_BYTES, Math.floor(value)));
 }
 
-/** B案 §6 构建名额解析：buildConcurrency 优先，未设时回落 buildParallelism；
- * 统一钳制到 1..8。后续调度/配额改造均应从此入口取 N，不各自读字段。 */
-export function resolveBuildConcurrency(config: Pick<StandardKbConfig, 'buildConcurrency' | 'buildParallelism'>): number {
-  if (typeof config.buildConcurrency === 'number' && Number.isFinite(config.buildConcurrency)) {
-    return Math.min(8, Math.max(1, Math.floor(config.buildConcurrency)));
-  }
-  const fallback = typeof config.buildParallelism === 'number' && Number.isFinite(config.buildParallelism)
-    ? config.buildParallelism
-    : 2;
-  return Math.min(8, Math.max(1, Math.floor(fallback)));
+export function resolveBuildConcurrency(config: Partial<Pick<StandardKbConfig, 'buildConcurrency'>>): number {
+  const value = config.buildConcurrency;
+  return typeof value === 'number' && Number.isFinite(value) ? Math.min(6, Math.max(1, Math.floor(value))) : 2;
 }
 
 export const DEFAULT_AGENT_MODEL_CONFIG: AgentModelConfig = {
@@ -245,17 +227,13 @@ export function buildDefaultStandardKbConfig(dataRoot: string): StandardKbConfig
     buildBatchWordBudget: 40_000,
     promptTimeoutMinutes: 15,
     buildTimeoutMinutes: 180,
-    buildParallelism: 2,
-    // B案 §6：buildConcurrency 不设默认值——未设时回落 buildParallelism
-    // （resolveBuildConcurrency），避免默认值冻结回落语义。
-    // B案 §3/§8/§5/§7：角色/审查预算/发布方式默认值（旧配置 additive 兼容）
+    buildConcurrency: 2,
     buildRoles: {
       writer: { modelPresetId: '' },
       reviewer: { modelPresetId: '' },
       plannerEnabled: false,
     },
     reviewPolicy: { maxAutoRevisions: 2, maxInterfaceRetries: 2 },
-    publishMode: 'auto',
     autoBuildAfterSync: false,
     orchestrationMode: 'pi-amagi',
   };

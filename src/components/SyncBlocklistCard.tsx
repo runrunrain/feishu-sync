@@ -19,7 +19,7 @@ export function SyncBlocklistCard() {
   };
   return <div className="rounded border border-line bg-card-bg p-4">
     <h3 className="text-base text-ink mb-2">同步屏蔽名单</h3>
-    <p className="text-sm text-ink-soft mb-4">已屏蔽的文档不会进入待同步列表。移出后恢复检测资格；有效上级下的文档可重新同步，其他文档可通过后续检测或重新添加恢复。</p>
+    <p className="text-sm text-ink-soft mb-4">移出名单后恢复检测。需要时可重新添加文档。</p>
     {error ? <p role="alert" className="text-sm text-seal-2 mb-3">{error}</p> : null}
     {notice ? <p role="status" className="text-sm text-jade mb-3">{notice}</p> : null}
     <input aria-label="搜索屏蔽文档" placeholder="搜索文档名或标识" className="w-full rounded border border-line bg-paper p-2 text-sm mb-3" value={q} onChange={(e) => setQ(e.target.value)} />

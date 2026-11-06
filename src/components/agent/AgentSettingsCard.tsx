@@ -45,19 +45,16 @@ import type {
   AgentVisionStatusDto,
   AgentVisionTestResult,
   AgentWorkspaceConfig,
-  StandardKbConfig,
 } from '../../types/agent';
 
 /** 设置卡骨架（对齐既有设置卡片视觉：标题 + 描述 + 内容区）。 */
 function CardShell({
   icon,
   title,
-  description,
   children,
 }: {
   icon: React.ReactNode;
   title: string;
-  description: string;
   children: React.ReactNode;
 }) {
   return (
@@ -66,7 +63,6 @@ function CardShell({
         <div className="mt-0.5 text-ink-faint">{icon}</div>
         <div className="min-w-0">
           <h3 className="text-sm font-kai font-medium text-ink">{title}</h3>
-          <p className="mt-0.5 text-xs text-ink-faint leading-snug">{description}</p>
         </div>
       </header>
       <div className="p-4 space-y-3">{children}</div>
@@ -337,7 +333,6 @@ export function AgentRuntimeSettingsCard() {
     <CardShell
       icon={<Bot className="w-4 h-4" />}
       title="Agent 运行时与模型"
-      description="选择标准知识库构建等应用能力使用的基座。对话页新建会话使用 Pi。"
     >
       <div>
         <FieldLabel>应用基础能力的 Agent 基座</FieldLabel>
@@ -345,6 +340,7 @@ export function AgentRuntimeSettingsCard() {
           onChange={(e) => { setConfigBackend(backend); void saveAgent({ runtime: { backend: e.target.value as 'pi' | 'claude-code' } }); }}>
           <option value="pi">Pi</option><option value="claude-code">Claude Code</option>
         </select>
+        <p className="mt-1 text-[11px] text-ink-faint">用于标准库构建。新对话使用 Pi。</p>
       </div>
       <div>
         <FieldLabel>查看基座配置</FieldLabel>
@@ -352,11 +348,10 @@ export function AgentRuntimeSettingsCard() {
           <Button size="sm" variant={backend === 'pi' ? 'primary' : 'secondary'} onClick={() => setConfigBackend('pi')}>Pi 配置</Button>
           <Button size="sm" variant={backend === 'claude-code' ? 'primary' : 'secondary'} onClick={() => setConfigBackend('claude-code')}>Claude Code 配置</Button>
         </div>
-        <p className="mt-1 text-[11px] text-ink-faint">切换配置视图不会改变应用基座。应用提供商、模型预设及思考设置由两个基座共用。</p>
-        {backend === 'claude-code' && <p className="mt-1 text-[11px] text-ink-faint">使用应用内 Anthropic Messages 兼容提供商。应用上下文与受控工具可用；Pi 专用扩展不会加载。预设上下文窗口用于自动压缩，实际窗口受 Claude Code 和模型限制。</p>}
+        <p className="mt-1 text-[11px] text-ink-faint">此处仅切换配置视图。</p>
+        {backend === 'claude-code' && <p className="mt-1 text-[11px] text-ink-faint">Claude Code 需要 Anthropic Messages 兼容提供商。Pi 插件仅适用于 Pi。</p>}
       </div>
       {/* 就绪状态 */}
-      <p className="text-[11px] text-ink-faint">运行状态显示已保存的应用基础能力基座。</p>
       <div className="flex items-center gap-3 flex-wrap px-3 py-2.5 rounded-md border border-line bg-paper/40">
         {agentStatus.loading ? (
           <StatusBadge status="loading">检测中…</StatusBadge>
@@ -402,7 +397,7 @@ export function AgentRuntimeSettingsCard() {
           ) : null}
         </div>
       </div>
-      {draft?.dirty ? <p className="text-[11px] text-ink-faint">运行状态基于已保存的配置；保存后可重新检测。</p> : null}
+      {draft?.dirty ? <p className="text-[11px] text-ink-faint">保存后可检测新配置。</p> : null}
       <div className="space-y-2">
         <div className="flex flex-wrap items-center gap-2">
           <Button size="sm" variant="secondary" loading={testingConnection} disabled={saving || Boolean(draft?.dirty)} onClick={() => {
@@ -410,7 +405,7 @@ export function AgentRuntimeSettingsCard() {
             void testClaudeConnection().then(setConnectionTest).catch((error) => setConnectionTest({ ok: false, providerName: '', model: '', latencyMs: 0,
               errorMessage: error instanceof Error ? error.message : '连接测试失败' })).finally(() => setTestingConnection(false));
           }}>测试 Claude Code 连接</Button>
-          <span className="text-[11px] text-ink-faint">使用已保存的应用提供商与预设，发送简短消息，会产生少量模型用量。</span>
+          <span className="text-[11px] text-ink-faint">测试使用已保存的模型，会消耗额度。</span>
         </div>
         {connectionTest ? <p role={connectionTest.ok ? 'status' : 'alert'} className={`text-xs ${connectionTest.ok ? 'text-jade' : 'text-seal-2'}`}>
           {connectionTest.ok ? `连接成功 · ${connectionTest.providerName} / ${connectionTest.model} · ${(connectionTest.latencyMs / 1000).toFixed(1)} 秒`
@@ -569,9 +564,6 @@ export function AgentRuntimeSettingsCard() {
               <RefreshCw className="w-3.5 h-3.5" /> 刷新模型
             </Button>
           </div>
-          <p className="mt-1 text-[11px] text-ink-faint">
-            通过 pi 加载配置与认证后列出可用模型，按提供商分组；修改后请点击顶部保存。认证由 Pi 在本地只读解析，不会复制密钥或改写通用 Pi 配置；未配置认证的内置目录不会列出。实际连通性以调用结果为准。
-          </p>
           {invalidPiModel ? <p className="mt-1 text-xs text-seal-2" role="alert">原模型已不在可用列表中，请重新选择。</p> : null}
           {!loadingModels && piModels.length === 0 ? (
             <p className="mt-1 text-xs text-ink-soft">{localModelsError ? '模型列表读取失败，请刷新重试。' : '请检查本机 pi 配置与认证，然后刷新模型。'}</p>
@@ -677,7 +669,7 @@ export function AgentRuntimeSettingsCard() {
             ) : null}
             {[5, 10, 20].map((size) => <option key={size} value={size * 1024 * 1024}>{size} MB</option>)}
           </select>
-          <span className="text-[11px] text-ink-faint">超出上限的图片会标记为未理解；增大上限后，下次构建会补试。</span>
+          <span className="text-[11px] text-ink-faint">超限图片标记为「未理解」，提高上限后下次构建补试。</span>
         </div>
 
         <div className="flex items-center gap-2 flex-wrap">
@@ -691,7 +683,7 @@ export function AgentRuntimeSettingsCard() {
           >
             测试识图
           </Button>
-          <span className="text-[11px] text-ink-faint">用内置测试图实测所选模型（真实调用远端，消耗少量额度）</span>
+          <span className="text-[11px] text-ink-faint">测试会调用所选端点并消耗额度。</span>
         </div>
 
         {visionTest ? (
@@ -704,8 +696,7 @@ export function AgentRuntimeSettingsCard() {
         ) : null}
 
         <p className="text-[11px] text-ink-faint leading-relaxed">
-          启用后，标准库构建与 Work 会话会把源文档中的图片发送到所选端点生成文字描述，结果按图片内容缓存；
-          未启用时构建仍可复用已有图片描述；未缓存的图片会插入「未理解」标记。凭证取自所选提供商，不在此重复输入。
+          启用后，构建与 Work 会话会把图片发送到所选端点。关闭时仍可复用已有描述。
         </p>
       </div>
 
@@ -741,7 +732,7 @@ export function AgentRuntimeSettingsCard() {
 
 export function AgentKbSettingsCard() {
   const toast = useToast();
-  const { config, updateConfig } = useConfig();
+  const { config } = useConfig();
   const draft = useSettingsDraft();
 
   const [outputRoot, setOutputRoot] = useState('');
@@ -789,28 +780,6 @@ export function AgentKbSettingsCard() {
     return { standardKb: { ...base, outputRoot: outputRoot.trim(), ...(budgetChanged ? { buildBatchWordBudget: clampBuildBatchWordBudget(budgetInput) } : {}) } };
   });
 
-  // S4 §4.6：构建并行数（1..6；进入设置草稿，服务端严格校验并夹取）。
-  const buildParallelism = config?.standardKb?.buildParallelism ?? 2;
-  const saveBuildParallelism = async (value: number) => {
-    try {
-      const base: StandardKbConfig =
-        config?.standardKb ?? {
-          outputRoot: '',
-          retainReleases: 3,
-          buildBatchSize: 10,
-          buildBatchWordBudget: BUILD_BATCH_WORD_BUDGET_DEFAULT,
-          promptTimeoutMinutes: 15,
-          buildTimeoutMinutes: 180,
-          buildParallelism: 2,
-          autoBuildAfterSync: false,
-        };
-      await updateConfig({ standardKb: { ...base, buildParallelism: value } });
-      if (!draft) toast.push({ type: 'success', message: `构建并行数已设为 ${value}` });
-    } catch (err) {
-      toast.push({ type: 'error', message: err instanceof APIError ? err.message : '保存失败' });
-    }
-  };
-
   const pickDirectory = async () => {
     if (typeof window !== 'undefined' && window.desktop?.selectDirectory) {
       const dir = await window.desktop.selectDirectory();
@@ -853,7 +822,6 @@ export function AgentKbSettingsCard() {
       <CardShell
         icon={<Database className="w-4 h-4" />}
         title="标准库输出目录与 Workspace"
-        description="标准库必须位于原始库之外；Workspace 是 Work 会话唯一可写的授权目录"
       >
         <div>
           <FieldLabel hint="默认 ~/.feishu-sync/standard-kb">标准库输出目录</FieldLabel>
@@ -866,29 +834,7 @@ export function AgentKbSettingsCard() {
               aria-label="标准库输出目录"
             />
           </div>
-          <p className="mt-1 text-[11px] text-ink-faint">目录不得位于原始知识库内；已有内容且非标准库结构时会被拒绝。</p>
-        </div>
-
-        {/* S4 §4.6：构建并行数 */}
-        <div>
-          <FieldLabel hint="1..6">构建并行数</FieldLabel>
-          <select
-            className={INPUT_CLS}
-            value={String(buildParallelism)}
-            onChange={(e) => void saveBuildParallelism(Number(e.target.value))}
-            aria-label="构建并行数"
-            data-testid="build-parallelism-select"
-          >
-            {[1, 2, 3, 4, 5, 6].map((n) => (
-              <option key={n} value={n}>
-                {n} 路{n === 1 ? '（单进程，行为与旧版一致）' : ''}
-              </option>
-            ))}
-          </select>
-          <p className="mt-1 text-[11px] text-ink-faint" data-testid="build-parallelism-hint">
-            实际并行受 Agent 进程上限（maxConcurrentProcesses 的后台配额）与工作单元数约束；
-            1 路为单进程等价回退，多路只在多单元构建时生效。
-          </p>
+          <p className="mt-1 text-[11px] text-ink-faint">请选择原始库之外的空目录或已有标准库目录。</p>
         </div>
 
         {/* P2-S3：每批字数预算（字数预算制分批；0 = 按源数分批旧行为） */}
@@ -919,15 +865,13 @@ export function AgentKbSettingsCard() {
             </p>
           ) : null}
           <p className="mt-1 text-[11px] text-ink-faint leading-relaxed" data-testid="build-word-budget-hint">
-            0 = 按源数分批（旧行为）；范围 4000–400000，越界保存时按边界链制，非数字回落缺省 40000。
-            构建分批按有效字数（源正文 + 已描述图片文字）装箱，与模型上下文消耗同量纲，
-            单源超预算时独占一批；「每批源数上限」仍由构建批次大小约束。
+            0 = 按源数分批。字数含正文和图片描述，单篇超限时单独成批。
           </p>
         </div>
 
         <div>
           <FieldLabel>Workspace（Work 模式可写目录）</FieldLabel>
-          {draft ? <p className="mb-2 text-[11px] text-ink-faint">添加或移除 Workspace 会立即更改授权；其他设置在顶部保存后生效。</p> : null}
+          {draft ? <p className="mb-2 text-[11px] text-ink-faint">添加或移除目录立即生效。</p> : null}
           {wsLoading ? (
             <p className="flex items-center gap-2 text-xs text-ink-faint py-2">
               <Loader2 className="w-3.5 h-3.5 animate-spin" /> 读取中…
@@ -956,7 +900,7 @@ export function AgentKbSettingsCard() {
               ))}
             </ul>
           ) : (
-            <p className="text-xs text-ink-faint mb-2">尚无 Workspace。Work 会话需要至少一个授权目录。</p>
+            <p className="text-xs text-ink-faint mb-2">Work 会话需要至少一个可写目录。</p>
           )}
           <div className="p-3 rounded-md border border-line bg-paper/40 space-y-2">
             <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_minmax(0,2fr)] gap-2">

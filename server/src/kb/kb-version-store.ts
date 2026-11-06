@@ -6,7 +6,7 @@ import { StandardKbStore } from './standard-kb-store.js';
 import { previousLocalReleaseId } from './portable-kb-service.js';
 import { RawSourceSnapshot } from './raw-source-snapshot.js';
 import { lineDiff } from './line-diff.js';
-import { sourceContentsChanged, withoutSyncTimestamps } from './source-comparison.js';
+import { sourceContentsChanged, sourceDiffTexts, withoutSyncTimestamps } from './source-comparison.js';
 import type { KbManifest } from '../types/agent-knowledge.js';
 import type { KbChangePreview, KbDocMerge, KbFileChange, KbVersionDto } from '../types/kb-version.js';
 import type { KnowledgeManifest } from './knowledge-schema.js';
@@ -62,11 +62,14 @@ export function sourceChangePreview(
     if (old && next && !sourceEntryChanged(old, next)) continue;
     const kind = !old ? 'added' : !next ? 'removed' : 'changed';
     const beforeAvailable = !old || Object.hasOwn(previous, token);
+    const texts = old && next ? sourceDiffTexts(old, next) : undefined;
     sources.push({
       key: token, title: (next ?? old)!.title, path: (next ?? old)!.relPath, kind,
       reason: !next ? (excluded.has(token) ? 'excluded' : 'missing') : 'content',
       beforeAvailable,
-      ...(beforeAvailable ? lineDiff(withoutSyncTimestamps(old ? previous[token] : ''), withoutSyncTimestamps(next ? contents[token] ?? '' : ''))
+      ...(beforeAvailable ? lineDiff(
+        texts?.before ?? withoutSyncTimestamps(old ? previous[token].replace(/\r\n/g, '\n') : ''),
+        texts?.after ?? withoutSyncTimestamps(next ? (contents[token] ?? '').replace(/\r\n/g, '\n') : ''))
         : { patch: '', additions: 0, deletions: 0, truncated: false }),
     });
   }

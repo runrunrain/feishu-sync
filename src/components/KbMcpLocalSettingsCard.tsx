@@ -40,7 +40,7 @@ export function KbMcpLocalSettingsCard() {
     try {
       const result = await (action === 'install' ? installKbMcp(target) : removeKbMcp(target));
       setTargets((current) => current.map((item) => item.target === target ? result : item));
-      setFeedback({ error: false, text: action === 'install' ? '安装完成，重启对应客户端后生效。' : '已清理本应用安装的 MCP 配置。' });
+      setFeedback({ error: false, text: action === 'install' ? '安装完成，重启对应客户端后生效。' : '已清理 MCP 配置，重新启动客户端后生效。' });
     } catch (error) {
       setFeedback({ error: true, text: error instanceof Error ? error.message : '操作失败，请刷新后重试。' });
       try { setTargets((await getKbMcpInstallStatus()).targets); } catch { /* Preserve the operation error. */ }
@@ -56,7 +56,7 @@ export function KbMcpLocalSettingsCard() {
       <header className="px-4 py-3 border-b border-line/60 flex items-start gap-3">
         <Server className="w-4 h-4 mt-0.5 shrink-0 text-ink-soft" />
         <div><h3 className="text-sm font-kai font-medium text-ink">本机 MCP 安装</h3>
-          <p className="mt-1 text-xs text-ink-soft">让本机 Agent 通过只读 MCP 访问标准库与已同步的原始文档。</p>
+          <p className="mt-1 text-xs text-ink-soft">只读访问标准库与已同步原始文档。</p>
         </div>
       </header>
       <div className="p-4 space-y-3 text-xs text-ink-soft">
@@ -81,10 +81,9 @@ export function KbMcpLocalSettingsCard() {
             <span className="break-all font-mono select-text">{selected.path}</span>
           </div>
           {selected.message ? <p role="note" className="text-seal">{selected.message}</p> : null}
-          {info && !info.available ? <p role="note" className="text-seal">本地 MCP 程序未就绪，无法安装；已安装的配置仍可清理。</p> : null}
+          {info && !info.available ? <p role="note" className="text-seal">MCP 程序未就绪，暂无法安装。</p> : null}
         </div> : null}
-        <p>操作立即生效。只管理本应用安装且未被外部修改的 <code>feishu-kb</code> 条目；其它配置会保留。</p>
-        <p>Amagi Pi 等兼容客户端读取 <code>~/.agents/.mcp.json</code>；Claude Code 读取 <code>~/.claude.json</code>；Codex 读取 <code>~/.codex/config.toml</code>。安装或清理后请重新启动相应客户端或会话。</p>
+        <p>操作立即生效。清理仅删除本应用安装且未修改的条目。</p>
         {feedback ? <p role={feedback.error ? 'alert' : 'status'} className={feedback.error ? 'text-seal-2' : 'text-jade'}>{feedback.text}</p> : null}
         {info ? <details className="border-t border-line/60 pt-3">
           <summary className="cursor-pointer font-medium text-ink">手动配置</summary>
@@ -92,7 +91,7 @@ export function KbMcpLocalSettingsCard() {
             <pre aria-label="本地 MCP 配置" className="max-h-48 overflow-auto scrollbar-thin rounded border border-line bg-paper/50 p-3 text-[11px] leading-relaxed select-text">{info.snippet}</pre>
             <Button size="sm" variant="secondary" className="absolute right-2 top-2" onClick={() => void copy()}><Copy className="w-3.5 h-3.5" />复制</Button>
           </div>
-          <p className="mt-2">原始库不需要先构建标准库。应用运行时约每 10 秒刷新源清单；关闭后沿用最后清单读取本地文件。升级启动应用后，旧安装可自动识别同一应用的源清单；自定义配置可点击更新并重启客户端。</p>
+          <p className="mt-2">应用关闭后，客户端使用上次刷新时的源文档清单。</p>
         </details> : null}
       </div>
     </section>

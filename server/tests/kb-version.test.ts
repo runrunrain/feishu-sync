@@ -11,7 +11,9 @@ import { LocalMapStore } from '../src/modules/local-map-store.js';
 import { KbBuildService } from '../src/kb/kb-build-service.js';
 import { StandardKbStore } from '../src/kb/standard-kb-store.js';
 import { KbVersionStore } from '../src/kb/kb-version-store.js';
-import { projectKnowledgeDocuments, recoveredSourceCsvPaths } from '../src/kb/local-source-projection.js';
+import { projectKnowledgeDocuments, recoveredSourceCsvPaths, recoverUnindexedPublishedSources } from '../src/kb/local-source-projection.js';
+import { sourceComparisonHash } from '../src/kb/source-comparison.js';
+import { visitSourceFiles } from '../src/kb/raw-source-snapshot.js';
 import { filterDeletedLocalDocuments } from '../src/modules/local-index-reconcile.js';
 import { planSourceBatch, executeSourceBatch } from '../src/modules/source-batch.js';
 import { lineDiff } from '../src/kb/line-diff.js';
@@ -45,7 +47,10 @@ async function fixture() {
   fs.writeFileSync(path.join(raw, 'a.md'), '规则A：怒气消耗10。\n' + '怒气不足时不能释放技能，规则按当前配置生效。\n'.repeat(8));
   fs.writeFileSync(path.join(raw, 'b.md'), '规则B：速度高者先手。\n' + '双方各行动一次，以速度决定行动顺序。\n'.repeat(8));
   for (const doc of documents) store.upsertDocument(doc);
-  const documentsProvider = () => projectKnowledgeDocuments(raw, filterDeletedLocalDocuments(store, raw, documents));
+  const documentsProvider = () => recoverUnindexedPublishedSources(raw,
+    projectKnowledgeDocuments(raw, filterDeletedLocalDocuments(store, raw, documents)),
+    new StandardKbStore(configManager.getConfig()!.standardKb.outputRoot).readManifest()?.sourceSnapshot ?? [],
+    new Set(store.listLocalSourceDeletions(raw).map(doc => doc.objToken)));
   let reverseCsv = false;
   const sheetCsvPaths = (token: string) => {
     const files = recoveredSourceCsvPaths(raw, documentsProvider().find((doc) => doc.objToken === token), []);
@@ -125,7 +130,7 @@ it('构建路由传递重新识图选项并拒绝无效参数', async () => {
 });
 
 describe('源选择 → 源diff → 按变更更新 → 独立版本', () => {
-  it('工作簿重新导出只改变时间与 CSV 枚举顺序时不派发，实际单元格变化仍进入更新', async () => {
+  it.each([1, 2] as const)('v%i 工作簿基线忽略换行、导出时间与 CSV 顺序，保留真实改动', async (version) => {
     const f = await fixture();
     f.documents[0]!.objType = 'sheet';
     const body = fs.readFileSync(path.join(f.raw, 'a.md'), 'utf8');
@@ -134,7 +139,7 @@ describe('源选择 → 源diff → 按变更更新 → 独立版本', () => {
       fs.writeFileSync(path.join(f.raw, 'a.md'), [
         '<!--', 'feishu_sync:', '  obj_token: "a"', '  source_workbook: "a.xlsx"',
         '  fetch_date: "' + day + '"', '  last_synced_modify_time: "' + day + 'T00:00:00.000Z"', '-->', body,
-      ].join('\n'));
+      ].join('\n').replace(/\r?\n/g, day === '2026-01-01' ? '\n' : '\r\n'));
       const workbook = new ExcelJS.Workbook();
       workbook.created = workbook.modified = new Date(day);
       workbook.addWorksheet('规则').getCell('A1').value = value;
@@ -148,9 +153,19 @@ describe('源选择 → 源diff → 按变更更新 → 独立版本', () => {
     const initial = await f.build('full');
     expect(initial.status, JSON.stringify(initial)).toBe('published');
     const manifest = f.published().readManifest()!;
-    expect(manifest.sourceSnapshot[0]?.comparisonHash).toMatch(/^v1:/);
+    const source = manifest.sourceSnapshot.find(entry => entry.objToken === 'a')!;
+    expect(source.comparisonHash).toMatch(/^v2:/);
+    if (version === 1) {
+      const csv = recoveredSourceCsvPaths(f.raw, f.documents[0], []);
+      source.comparisonHash = await sourceComparisonHash(source.contentHash,
+        visit => visitSourceFiles(path.join(f.raw, 'a.md'), csv, f.raw, visit), 1);
+      expect(source.comparisonHash).toMatch(/^v1:/);
+      const outputRoot = f.configManager.getConfig()!.standardKb.outputRoot;
+      fs.writeFileSync(path.join(outputRoot, 'releases', manifest.releaseId, 'manifest.json'), JSON.stringify(manifest));
+    }
     const prompts = f.prompts.length;
     await exportSheet('2026-01-02', '消耗 10 点');
+    fs.writeFileSync(path.join(csvDir, '规则.csv'), '规则,怒气\r\n消耗,10\r\n');
     f.setReverseCsv(true);
     expect((await f.call('/api/kb/changes')).data.sources).toEqual([]);
     expect((await f.call('/api/kb/status')).data.pending.changed).toBe(0);
@@ -162,6 +177,30 @@ describe('源选择 → 源diff → 按变更更新 → 独立版本', () => {
     await exportSheet('2026-01-03', '消耗 12 点');
     expect((await f.call('/api/kb/changes')).data.sources).toMatchObject([{ key: 'a', kind: 'changed' }]);
     expect((await f.call('/api/kb/status')).data.pending.changed).toBe(1);
+    fs.writeFileSync(path.join(csvDir, '规则.csv'), '规则,怒气\r\n消耗,12\r\n');
+    const updated = await f.build();
+    expect(updated.status, JSON.stringify(updated)).toBe('published');
+    expect(updated.noChanges).not.toBe(true);
+    expect(f.prompts.length).toBeGreaterThan(prompts);
+  });
+  it('已发布的同身份本地文件可补回，回收站副本不会成为新增源', async () => {
+    const f = await fixture();
+    const a = f.documents[0]!;
+    const b = f.documents[1]!;
+    const original = fs.readFileSync(a.localMdPath, 'utf8');
+    fs.writeFileSync(a.localMdPath, '<!--\nfeishu_sync:\n  obj_token: "a"\n-->\n' + original);
+    f.setGenerated({ markdown: original + '\n' + fs.readFileSync(b.localMdPath, 'utf8') });
+    expect((await f.build('full')).status).toBe('published');
+    f.documents.shift();
+    const trash = { ...b, objToken: 'trash', title: 'trash', localMdPath: path.join(f.raw, 'trash.md'),
+      localRelPath: 'trash.md', cloudDeleted: 1, syncState: 'deleted_confirmed' as const };
+    fs.copyFileSync(b.localMdPath, trash.localMdPath);
+    f.documents.push(trash);
+    b.cloudDeleted = 1;
+    expect((await f.call('/api/kb/changes')).data.sources).toEqual([]);
+    expect((await f.build()).noChanges).toBe(true);
+    fs.writeFileSync(a.localMdPath, '<!--\nfeishu_sync:\n  obj_token: "other"\n-->\n' + original);
+    expect((await f.call('/api/kb/changes')).data.sources).toMatchObject([{ key: 'a', kind: 'removed' }]);
   });
   it('混合来源排除/重新参与，正文同步重写；标记持久且原始字节不变', async () => {
     const f = await fixture();

@@ -76,9 +76,7 @@ export function OrphanFilesCard() {
         <div className="min-w-0 flex-1 basis-52">
           <h2 className="text-base font-medium text-ink">孤立文件清理</h2>
           <p className="text-xs text-ink-faint mt-1 leading-relaxed">
-            同步根被移除后残留在本地的同步产物目录/散档（含 feishu_sync 头）；
-            与任何已配置同步根、自定义归档有对应关系的内容不会列出。清理为
-            移动到 <code className="text-[11px]">.trash-bin/orphan-*</code> 回收站，可恢复。
+            列出已移除同步根留下的文件。清理后可从回收站恢复。
           </p>
         </div>
         <Button variant="ghost" onClick={() => void refresh()} loading={loading}>

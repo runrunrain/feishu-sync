@@ -151,7 +151,7 @@ export class AgentProcessPool {
     return Math.max(1, Math.min(6, value));
   }
 
-  /** B 案 §6：构建容量 1..8（与 resolveBuildConcurrency 同界；不受 M 截断）。 */
+  /** 构建通道与交互通道分开计数；此处保留旧调度器的内部容量上限。 */
   private clampBuildCapacity(value: number): number {
     return Math.max(1, Math.min(8, Math.floor(value)));
   }

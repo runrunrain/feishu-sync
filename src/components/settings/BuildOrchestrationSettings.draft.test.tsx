@@ -46,8 +46,8 @@ function serverConfig() {
     standardKb: {
       outputRoot: '/tmp/standard-kb', retainReleases: 3, buildBatchSize: 10,
       buildBatchWordBudget: 40_000, promptTimeoutMinutes: 15, buildTimeoutMinutes: 180,
-      buildParallelism: 2, buildRoles: { writer: { modelPresetId: '' }, reviewer: { modelPresetId: '' }, plannerEnabled: false },
-      reviewPolicy: { maxAutoRevisions: 2, maxInterfaceRetries: 2 }, publishMode: 'auto', autoBuildAfterSync: false,
+      buildConcurrency: 2, buildRoles: { writer: { modelPresetId: '' }, reviewer: { modelPresetId: '' }, plannerEnabled: false },
+      reviewPolicy: { maxAutoRevisions: 2, maxInterfaceRetries: 2 }, autoBuildAfterSync: false,
     },
     pollIntervalMinutes: 30, knowledgeBaseRoot: '/tmp/kb', watchedRoots: [], watchedRootUrls: [],
     requiredScopes: [], enableAutoStart: false, enableNotifications: false,
@@ -66,12 +66,11 @@ it('卡内修改先进草稿，总保存提交完整 standardKb 段（含未变�
   try {
     await act(async () => root.render(<SettingsDraftProvider><Save /><BuildOrchestrationSettings /></SettingsDraftProvider>));
     const concurrency = container.querySelector('[data-testid="orch-concurrency-select"]') as HTMLSelectElement;
-    expect(concurrency.value).toBe('2'); // 未显式设置 → 回落 buildParallelism
+    expect(concurrency.value).toBe('2');
     await act(async () => {
       concurrency.value = '4';
       concurrency.dispatchEvent(new Event('change', { bubbles: true }));
     });
-    await act(async () => { (container.querySelector('[data-testid="orch-publish-confirm"]') as HTMLInputElement).click(); });
     // 只进草稿：尚未提交
     expect(api.save).not.toHaveBeenCalled();
     await act(async () => {
@@ -81,12 +80,12 @@ it('卡内修改先进草稿，总保存提交完整 standardKb 段（含未变�
     const outbound = api.save.mock.calls[0][0] as { standardKb: Record<string, unknown> };
     expect(Object.keys(outbound)).toEqual(['standardKb']);
     expect(outbound.standardKb.buildConcurrency).toBe(4);
-    expect(outbound.standardKb.publishMode).toBe('confirm');
+    expect(outbound.standardKb).not.toHaveProperty('publishMode');
     expect(outbound.standardKb.orchestrationMode).toBe('pi-amagi');
     // 完整段：未变更的基础字段一并携带（服务端整体替换语义）
     expect(outbound.standardKb.outputRoot).toBe('/tmp/standard-kb');
     expect(outbound.standardKb.reviewPolicy).toEqual({ maxAutoRevisions: 2, maxInterfaceRetries: 2 });
-    expect(outbound.standardKb.buildParallelism).toBe(2);
+    expect(outbound.standardKb).not.toHaveProperty('buildParallelism');
   } finally {
     await act(async () => root.unmount());
     container.remove();

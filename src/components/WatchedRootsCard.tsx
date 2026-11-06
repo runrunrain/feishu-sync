@@ -258,10 +258,6 @@ export function WatchedRootsCard() {
         </div>
       </CardHeader>
       <CardBody className="space-y-4">
-        <p className="text-xs text-ink-faint font-sans-ui">
-          每个同步根目录声明飞书根节点与本地对应目录（目录布局固定为镜像标题文件）。停用后会保留历史映射与状态，但不会参与检测、轮询或同步。
-        </p>
-
         {/* 子页侧边栏模式：左根目录列表（动态增删）+ 右选中项编辑器 */}
         <div className="flex flex-col gap-3 xl:flex-row">
           {/* Left: root list sidebar */}
@@ -390,7 +386,7 @@ export function WatchedRootsCard() {
                       label="启用此同步根目录"
                       checked={selectedRow.root.enabled}
                       onChange={(enabled) => updateRoot(clampedSelectedIndex, { enabled })}
-                      helperText="停用后不遍历、不检测，也不写入本地文件。"
+                      helperText="停用后暂停检测与同步，保留本地文件。"
                     />
                   </div>
                 </div>

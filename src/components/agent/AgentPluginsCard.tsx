@@ -71,10 +71,8 @@ export function AgentPluginsCard() {
         <Button size="sm" variant="secondary" disabled={busy || Object.keys(pendingEnabled).length > 0} onClick={() => void refresh()}><RefreshCw className="w-3.5 h-3.5" />刷新</Button>
         <Button size="sm" disabled={busy || !data} onClick={() => setAdding(!adding)}><Plus className="w-3.5 h-3.5" />添加 Pi 插件</Button>
       </div>
-      <p className="text-sm text-ink-soft leading-relaxed">按Pi原生package管理，支持npm、git、本地包目录或扩展脚本。配置与安装缓存仅保存在本应用的Pi目录，通用Pi不受影响。</p>
-      <p className="text-xs text-ink-soft">amagi-pi 随应用内置，启动时自动离线安装，随应用版本更新；无需仓库访问权限或手动填写插件来源。</p>
-      <p className="text-xs text-ink-faint leading-relaxed">Pi插件会执行本机代码，可能访问文件和网络，请只添加可信来源。第三方插件以当前用户权限运行；应用目录隔离限定配置与加载范围。新增/更新/启停将在下次运行加载；有任务运行时请先完成或停止。</p>
-      {stageAction ? <p className="text-xs text-ink-faint">插件启停需点击顶部保存；安装、更新和移除会立即执行。</p> : null}
+      <p className="text-xs text-ink-faint leading-relaxed">插件以当前用户权限运行，可访问文件和网络。请只安装可信插件。</p>
+      {stageAction ? <p className="text-xs text-ink-faint">启停需保存。安装、更新和移除立即执行，下次运行时加载。</p> : null}
       {data ? <p className="text-[11px] font-mono text-ink-faint break-all">{data.agentDir}</p> : null}
       {adding ? <div className="border-t border-line pt-3 space-y-3">
         <label className="block text-sm text-ink">插件来源<input aria-label="Pi插件来源" className="block mt-2 w-full rounded border border-line p-2 text-sm bg-paper/30" value={source} disabled={busy}

@@ -376,8 +376,7 @@ export function CustomArchiveSettingsCard() {
         )}
 
         <p className="text-xs text-ink-faint font-serif">
-          删除文件夹仅解除文档的归档归属；「移出」把单篇文档移出归档。两者都保留本地文件与同步基线，
-          重新添加同一链接时会识别为已存在。
+          删除归档文件夹或移出文档时，保留本地文件。
         </p>
       </CardBody>
     </Card>

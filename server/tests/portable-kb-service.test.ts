@@ -154,7 +154,7 @@ describe('portable source comparison proof', () => {
     const entries = [f.entry, { ...f.entry, objToken: 'changed', contentHash: `sha256:${'0'.repeat(64)}` }];
     const before = computeSnapshotHash(entries);
     await captureMissingSourceComparisonHashes(entries, f.sourceA, () => []);
-    expect(entries[0]).toHaveProperty('comparisonHash', expect.stringMatching(/^v1:/));
+    expect(entries[0]).toHaveProperty('comparisonHash', expect.stringMatching(/^v2:/));
     expect(entries[1]).not.toHaveProperty('comparisonHash');
     expect(computeSnapshotHash(entries)).toBe(before);
   });

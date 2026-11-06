@@ -206,14 +206,15 @@ describe('diting F05-R：完整有效参数冻结（单元层，复现基线反�
 
 /** 伪造 T7 前旧形状快照 spec：剥掉 pipelineMode（构造器重算 specHash 保持自洽）。 */
 function legacySnapshotSpec(buildRoles: { writer: { modelPresetId: string }; reviewer: { modelPresetId: string } }, publishMode: 'auto' | 'confirm'): BuildSpec {
-  const spec = buildSpecFromConfig({ buildId: 'old', snapshotEntries: [], baseReleaseId: null, standardKb: { buildRoles, publishMode } as never });
+  const spec = buildSpecFromConfig({ buildId: 'old', snapshotEntries: [], baseReleaseId: null, standardKb: { buildRoles } });
   const { specHash: _hash, pipelineMode: _mode, ...legacy } = spec;
   void _hash; void _mode;
-  return { ...legacy, specHash: computeBuildSpecHash(legacy) } as BuildSpec;
+  const frozen = { ...legacy, publishMode };
+  return { ...frozen, specHash: computeBuildSpecHash(frozen) };
 }
 
 describe('diting N01：旧检查点恢复切旧调度器（单元层）', () => {
-  it('新构建按 T7 门写 pipelineMode：任一角色显式或 confirm → orchestrated；全空+auto → legacy；恢复按标记走', () => {
+  it('新构建按 T7 门写 pipelineMode：任一角色显式 → orchestrated；全空 → legacy；恢复按标记走', () => {
     const orchestrated = buildSpecFromConfig({
       buildId: 'n1', snapshotEntries: [], baseReleaseId: null,
       standardKb: { buildRoles: { writer: { modelPresetId: 'w' }, reviewer: { modelPresetId: '' } }, publishMode: 'auto' } as never,
@@ -224,8 +225,8 @@ describe('diting N01：旧检查点恢复切旧调度器（单元层）', () => 
       buildId: 'n2', snapshotEntries: [], baseReleaseId: null,
       standardKb: { buildRoles: { writer: { modelPresetId: '' }, reviewer: { modelPresetId: '' } }, publishMode: 'confirm' } as never,
     });
-    expect(confirmOnly.pipelineMode).toBe('orchestrated');
-    expect(reviewPipelineActive(confirmOnly)).toBe(true);
+    expect(confirmOnly.publishMode).toBe('auto');
+    expect(confirmOnly.pipelineMode).toBe('legacy');
     const legacy = buildSpecFromConfig({
       buildId: 'n3', snapshotEntries: [], baseReleaseId: null,
       standardKb: { buildRoles: { writer: { modelPresetId: '' }, reviewer: { modelPresetId: '' } }, publishMode: 'auto' } as never,
@@ -287,7 +288,7 @@ function seedTwoUnits(prefix: string): void {
   }
 }
 
-function makeConfig(overrides: { publishMode?: 'auto' | 'confirm'; buildRoles?: Config['standardKb']['buildRoles'] } = {}): Config {
+function makeConfig(overrides: { buildRoles?: Config['standardKb']['buildRoles'] } = {}): Config {
   return {
     llm: {
       openAiCompatBaseUrl: '', apiKey: '', model: '', temperature: 0.2, primaryChannel: 'direct', fallbackOnFailure: false,
@@ -307,10 +308,9 @@ function makeConfig(overrides: { publishMode?: 'auto' | 'confirm'; buildRoles?: 
       orchestrationMode: 'legacy', // 冻结的旧检查点兼容测试
       outputRoot, retainReleases: 3, buildBatchSize: 10, buildBatchWordBudget: 0,
       promptTimeoutMinutes: 15, buildTimeoutMinutes: 30,
-      buildParallelism: 2, autoBuildAfterSync: false,
+      buildConcurrency: 2, autoBuildAfterSync: false,
       buildRoles: overrides.buildRoles ?? { writer: { modelPresetId: '' }, reviewer: { modelPresetId: 'rev-model' }, plannerEnabled: false },
       reviewPolicy: { maxAutoRevisions: 2, maxInterfaceRetries: 2 },
-      publishMode: overrides.publishMode ?? 'auto',
     },
     pollIntervalMinutes: 30, knowledgeBaseRoot: kbRoot, watchedRoots: [], watchedRootUrls: [], requiredScopes: [],
   } as unknown as Config;

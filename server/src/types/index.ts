@@ -28,7 +28,7 @@ export interface WatchedRootConfig {
 import type { AgentConfig, StandardKbConfig } from './agent-knowledge.js';
 
 /**
- * CLI 命令行访问配置段（S8，additive）：缺省关闭；旧配置无此段时由
+ * CLI 命令行访问配置段：缺省开启；旧配置无此段时由
  * ConfigManager 读取时补默认（内存态），不主动回写磁盘。
  */
 export interface CliConfig {

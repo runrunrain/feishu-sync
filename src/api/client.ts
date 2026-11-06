@@ -1,7 +1,7 @@
 import type { KbLanMcpStatus, KbLanMcpSettings, KbLanMcpAuditEntry } from '../types/kb-lan-mcp';
 import type { McpClientTarget, McpInstallStatus } from '../types/kb-mcp-install';
 import type { SourceBatchRequest, SourceBatchPreview, SourceBatchResult } from '../types/source-batch';
-import type { CliEnableResult, CliInfoDto, CliRotateResult, CliShimInstallResult } from '../types/cli';
+import type { CliEnableResult, CliInfoDto, CliInstallStatus, CliRotateResult, CliShimInstallResult, CliSkillStatus, CliSkillTarget } from '../types/cli';
 import type { PiPluginsDto } from '../types/pi-plugin';
 import type { AgentPluginsDto, AgentPluginInput } from '../types/agent-plugin';
 import type { KbSourceTreeDto, KbSourceChoice, KbChangePreview, KbVersionDto } from '../types/kb-version';
@@ -1768,6 +1768,14 @@ export function rotateCliToken(): Promise<CliRotateResult> {
 /** POST /api/cli/install-shim —— 生成 <dataRoot>/bin/feishu-sync 可执行入口。 */
 export function installCliShim(): Promise<CliShimInstallResult> {
   return request<CliShimInstallResult>('/api/cli/install-shim', { method: 'POST', body: JSON.stringify({}) });
+}
+
+export function removeCliShim(): Promise<CliInstallStatus> {
+  return request('/api/cli/remove-shim', { method: 'POST' });
+}
+
+export function updateCliSkill(target: CliSkillTarget, install: boolean): Promise<CliSkillStatus> {
+  return request('/api/cli/skill/' + encodeURIComponent(target), { method: install ? 'PUT' : 'DELETE' });
 }
 
 // ---------------------------------------------------------------------------

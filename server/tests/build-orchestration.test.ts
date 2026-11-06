@@ -592,7 +592,7 @@ describe('buildSpecFromConfig 冻结（B 案 §8）', () => {
   it('diting F05：resolveRoleModel 冻结实际非密钥模型参数进 resolvedRoles，specHash 覆盖', () => {
     const entries = snapshotEntries(1);
     const standardKb = {
-      buildParallelism: 2,
+      buildConcurrency: 2,
       buildRoles: {
         writer: { modelPresetId: 'glm-4.7', thinking: 'high' as const },
         reviewer: { modelPresetId: '' },
@@ -625,10 +625,9 @@ describe('buildSpecFromConfig 冻结（B 案 §8）', () => {
     expect(again.specHash).toBe(frozen.specHash);
   });
 
-  it('角色/预算/发布方式从配置映射；buildConcurrency 优先回落 buildParallelism；哈希稳定', () => {
+  it('冻结角色、预算和并发；旧发布字段不影响自动发布', () => {
     const entries = snapshotEntries(3);
     const standardKb = {
-      buildParallelism: 2,
       buildConcurrency: 5,
       buildRoles: {
         writer: { modelPresetId: 'glm-4.7', thinking: 'high' as const },
@@ -642,7 +641,7 @@ describe('buildSpecFromConfig 冻结（B 案 §8）', () => {
     expect(spec.concurrency).toBe(5);
     expect(spec.maxAutoRevisions).toBe(3);
     expect(spec.maxInterfaceRetries).toBe(1);
-    expect(spec.publishMode).toBe('confirm');
+    expect(spec.publishMode).toBe('auto');
     expect(spec.baseReleaseId).toBe('r_base');
     expect(spec.sourceSnapshotHash).toBe(computeSnapshotHash(entries));
     expect(spec.roles.writer).toEqual({ modelPresetId: 'glm-4.7', thinking: 'high' });
@@ -656,7 +655,7 @@ describe('buildSpecFromConfig 冻结（B 案 §8）', () => {
       specVersion: 'v1:abcd',
     });
     expect(changed.specHash).not.toBe(spec.specHash);
-    // 未设 buildConcurrency → 回落 buildParallelism
+    // 未设置时使用默认并发
     const fallback = buildSpecFromConfig({
       buildId: 'b1', snapshotEntries: entries, baseReleaseId: null,
       standardKb: { ...standardKb, buildConcurrency: undefined },

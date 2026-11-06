@@ -4,7 +4,7 @@
  * 用 processFactory 测试接缝注入假 pi 进程（FakeRpcProcess）：不真实调
  * 模型，prompt 按提示词内容脚本化地经真实 AgentToolService 执行工具。
  * 覆盖：
- * - buildParallelism=1 全量构建端到端发布（等价回退）
+ * - buildConcurrency=1 全量构建端到端发布（等价回退）
  * - 双 worker 并行：他单元预认领路径写入被拒（kb_path_owned_by_other_unit）
  * - 单元失败（重试后仍败）→ kb_unit_failed，CURRENT 不动
  * - 可重试错误自动重试 1 次成功 → 发布
@@ -260,7 +260,7 @@ function writeRaw(rel: string, content: string): void {
   fs.writeFileSync(full, content);
 }
 
-function makeConfig(overrides: { buildParallelism?: number; buildBatchWordBudget?: number } = {}): Config {
+function makeConfig(overrides: { buildConcurrency?: number; buildBatchWordBudget?: number } = {}): Config {
   return {
     llm: { openAiCompatBaseUrl: '', apiKey: '', model: '', temperature: 0.2, primaryChannel: 'direct', fallbackOnFailure: false },
     agent: {
@@ -277,7 +277,7 @@ function makeConfig(overrides: { buildParallelism?: number; buildBatchWordBudget
       // P2-S2：缺省 0 = 旧行为（既有用例零回归）；新用例显式传预算
       buildBatchWordBudget: overrides.buildBatchWordBudget ?? 0,
       promptTimeoutMinutes: 15, buildTimeoutMinutes: 180,
-      buildParallelism: overrides.buildParallelism ?? 1, autoBuildAfterSync: false,
+      buildConcurrency: overrides.buildConcurrency ?? 1, autoBuildAfterSync: false,
     },
     pollIntervalMinutes: 30,
     knowledgeBaseRoot: kbRoot,
@@ -498,12 +498,12 @@ describe('发布前复核所选源快照', () => {
 // 用例
 // ---------------------------------------------------------------------------
 
-describe('S4：buildParallelism=1 等价回退（全量端到端发布）', () => {
+describe('S4：buildConcurrency=1 等价回退（全量端到端发布）', () => {
   it('单 worker 全量构建：发布成功、CURRENT 切换、parallelism=1 落库', async () => {
     writeRaw('战报/a.md', `a ${FAT}`);
     writeRaw('战报/b.md', `b ${FAT}`);
     documents.push(docRecord('tokA', '战报/a.md'), docRecord('tokB', '战报/b.md'));
-    const harness = makeHarness(makeConfig({ buildParallelism: 1 }));
+    const harness = makeHarness(makeConfig({ buildConcurrency: 1 }));
     const row = await createAndRun(harness, 'full');
     expect(String(row.status)).toBe('published');
     expect(Number(row.parallelism)).toBe(1);
@@ -522,7 +522,7 @@ describe('S4：buildParallelism=1 等价回退（全量端到端发布）', () =
     writeRaw('编排域/x.md', `x ${FAT}`);
     writeRaw('编排域/y.md', `y ${FAT}`);
     documents.push(docRecord('tokOrchA', '编排域/x.md'), docRecord('tokOrchB', '编排域/y.md'));
-    const config = makeConfig({ buildParallelism: 1 });
+    const config = makeConfig({ buildConcurrency: 1 });
     // B 案 §8：角色/预算/发布方式冻结进 BuildSpec（密钥不入记录）
     config.standardKb.buildRoles = {
       writer: { modelPresetId: 'glm-4.7', thinking: 'high' },
@@ -533,7 +533,6 @@ describe('S4：buildParallelism=1 等价回退（全量端到端发布）', () =
     };
     config.standardKb.buildConcurrency = 3;
     config.standardKb.reviewPolicy = { maxAutoRevisions: 2, maxInterfaceRetries: 1 };
-    config.standardKb.publishMode = 'auto';
     // diting F04：writer 显式配置 → 编排流水启用；角色预设需可在 llm 注册表解析
     config.llm.providers = [{
       id: 'pf1', name: 'PF', enabled: true, apiKey: 'sk-fixture',
@@ -563,7 +562,7 @@ describe('S4：buildParallelism=1 等价回退（全量端到端发布）', () =
   });
 
   it('T2a（B 案 §6/R3）：M=3 + 两后台占满 M-1 → 单 worker 构建走独立 build 通道立即获槽；交互保留槽仍可用', async () => {
-    const harness = makeHarness(makeConfig({ buildParallelism: 1 }));
+    const harness = makeHarness(makeConfig({ buildConcurrency: 1 }));
     // 两个后台任务占满 M-1 配额（M=3），总槽尚余 1
     const bg1 = await harness.pool.acquire('background');
     const bg2 = await harness.pool.acquire('background');
@@ -589,7 +588,7 @@ describe('S4：buildParallelism=1 等价回退（全量端到端发布）', () =
   });
 
   it('T2a（B 案 §6）：build 通道满额（N=1 被占）→ 单 worker 构建排队；取消 → 出队失败（cancelled），不 spawn，无残留', async () => {
-    const harness = makeHarness(makeConfig({ buildParallelism: 1 }));
+    const harness = makeHarness(makeConfig({ buildConcurrency: 1 }));
     // 占满构建容量 N=1（后台占用不影响 build 通道，故单独占）
     const buildSlot = await harness.pool.acquire('build');
     expect(buildSlot).toBeTruthy();
@@ -618,7 +617,7 @@ describe('S4：双 worker 并行 + 路径认领', () => {
     const second = docRecord('tokNewB', 'branchB/source.md');
     for (const doc of [original, first, second]) writeRaw(doc.localRelPath!, FAT);
     documents.length = 0; documents.push(original, first, second);
-    const harness = makeHarness(makeConfig({ buildParallelism: 2 }), {}, undefined, [], [], ['tokKeep']);
+    const harness = makeHarness(makeConfig({ buildConcurrency: 2 }), {}, undefined, [], [], ['tokKeep']);
     const releaseId = await publishBase(harness, [{ path: '已有/保留.md', docId: 'kd_keep', sources: ['tokKeep'], body: '保留的独立规则。' }], RawSourceSnapshot.scan(kbRoot, [original]).entries);
     const bytes = fs.readFileSync(path.join(outputRoot, 'releases', releaseId, 'docs', '已有/保留.md'));
     const dto = await harness.service.createBuild(store as never, { mode: 'incremental', confirm: 'BUILD', rebuildSelected: true });
@@ -644,7 +643,7 @@ describe('S4：双 worker 并行 + 路径认领', () => {
     const recB = docRecord('tokB', 'dir2/b.md');
     documents.length = 0;
     documents.push(recA, recB);
-    let harness = makeHarness(makeConfig({ buildParallelism: 1 }));
+    let harness = makeHarness(makeConfig({ buildConcurrency: 1 }));
     const baseEntries = RawSourceSnapshot.scan(kbRoot, documents).entries;
     await publishBase(harness, [
       { path: '已有/共享.md', docId: 'kd_shared', sources: ['tokA'] },
@@ -658,7 +657,7 @@ describe('S4：双 worker 并行 + 路径认领', () => {
       claimRejections: claimRejected,
       foreignClaimAttempt: { unitId: 'u2', path: '已有/共享.md' },
     };
-    harness = makeHarness(makeConfig({ buildParallelism: 2 }), script);
+    harness = makeHarness(makeConfig({ buildConcurrency: 2 }), script);
     const dto = await harness.service.createBuild(store as never, { mode: 'incremental', confirm: 'BUILD' });
     const row = await waitForTerminal(dto.id);
     const claimError = claimRejected.find((error): error is ToolError => error instanceof ToolError && error.code === 'kb_path_owned_by_other_unit');
@@ -683,7 +682,7 @@ describe('S4：单元失败 → CURRENT 不动 / 重试成功', () => {
     writeRaw('额度域二/b.md', `示例源 B ${FAT}`);
     documents.length = 0;
     documents.push(docRecord('tokQuotaA', '额度域一/a.md'), docRecord('tokQuotaB', '额度域二/b.md'));
-    const harness = makeHarness(makeConfig({ buildParallelism: parallelism }), {
+    const harness = makeHarness(makeConfig({ buildConcurrency: parallelism }), {
       failBatchAlwaysWithCode: 'model_quota_exceeded', failBatchMessage: '429: 1113 余额不足或无可用资源包',
     });
     const row = await createAndRun(harness, 'full');
@@ -702,7 +701,7 @@ describe('S4：单元失败 → CURRENT 不动 / 重试成功', () => {
     writeRaw('失败域二/y.md', `y ${FAT}`);
     documents.length = 0;
     documents.push(docRecord('tokFail', '失败域/x.md'), docRecord('tokFail2', '失败域二/y.md'));
-    const harness = makeHarness(makeConfig({ buildParallelism: 2 }), { failBatchAlwaysWithCode: 'model_timeout', claimRejections: [] });
+    const harness = makeHarness(makeConfig({ buildConcurrency: 2 }), { failBatchAlwaysWithCode: 'model_timeout', claimRejections: [] });
     const row = await createAndRun(harness, 'full');
     expect(String(row.status)).toBe('failed');
     expect(String(row.error_code)).toBe('kb_unit_failed');
@@ -717,7 +716,7 @@ describe('S4：单元失败 → CURRENT 不动 / 重试成功', () => {
     writeRaw('重试域二/z.md', `z ${FAT}`);
     documents.length = 0;
     documents.push(docRecord('tokRetry', '重试域/y.md'), docRecord('tokRetry2', '重试域二/z.md'));
-    const harness = makeHarness(makeConfig({ buildParallelism: 2 }), { failBatchOnceWithCode: 'model_timeout', claimRejections: [] });
+    const harness = makeHarness(makeConfig({ buildConcurrency: 2 }), { failBatchOnceWithCode: 'model_timeout', claimRejections: [] });
     const row = await createAndRun(harness, 'full');
     expect(String(row.status)).toBe('published');
     expect(harness.fakes.length).toBeGreaterThanOrEqual(3); // 2 worker + 至少 1 次重试新进程
@@ -731,7 +730,7 @@ describe('S4：取消终止全部进程', () => {
     writeRaw('取消域/w.md', `w ${FAT}`);
     documents.length = 0;
     documents.push(docRecord('tokC1', '取消域/z.md'), docRecord('tokC2', '取消域/w.md'));
-    const harness = makeHarness(makeConfig({ buildParallelism: 2 }), { hangUntilAbort: true });
+    const harness = makeHarness(makeConfig({ buildConcurrency: 2 }), { hangUntilAbort: true });
     const dto = await harness.service.createBuild(store as never, { mode: 'full', confirm: 'BUILD' });
     // 等待至少一个 fake 进入 prompt 挂起
     const deadline = Date.now() + 5000;
@@ -819,7 +818,7 @@ describe('S3：vision 关闭 → unavailable 内联 + images_unavailable 警告'
     try {
       const rawReadCapture = new Map<string, string>();
       const describer = new VisionDescriber({ dataRoot, config: () => makeConfig() });
-      const harness = makeHarness(makeConfig({ buildParallelism: 1 }), { rawReadCapture }, describer);
+      const harness = makeHarness(makeConfig({ buildConcurrency: 1 }), { rawReadCapture }, describer);
       const row = await createAndRun(harness, 'full');
       expect(String(row.status)).toBe('published');
       expect(rawReadCapture.get('tokCachedDisabled')).toContain('先前识别的图片');
@@ -848,7 +847,7 @@ describe('S3：vision 关闭 → unavailable 内联 + images_unavailable 警告'
     documents.length = 0;
     documents.push(docRecord('tokImg', '图域/img-doc.md'));
     const rawReadCapture = new Map<string, string>();
-    const harness = makeHarness(makeConfig({ buildParallelism: 1 }), { rawReadCapture });
+    const harness = makeHarness(makeConfig({ buildConcurrency: 1 }), { rawReadCapture });
     const row = await createAndRun(harness, 'full');
     expect(String(row.status)).toBe('published');
     const captured = rawReadCapture.get('tokImg') ?? '';
@@ -885,7 +884,7 @@ describe('小批次图文源：按识图文本校验体积并保持发布保护'
       },
     };
     const script: FakeScript = { outputMarkdown: '图示规则的完整说明。'.repeat(180) };
-    const config = makeConfig({ buildParallelism: 1 });
+    const config = makeConfig({ buildConcurrency: 1 });
     config.standardKb.strictGates = true;
     const harness = makeHarness(config, script, vision);
     const published = await createAndRun(harness, 'full');
@@ -1027,7 +1026,7 @@ describe('S4：DTO 契约', () => {
     writeRaw('契约域/c.md', `c ${FAT}`);
     documents.length = 0;
     documents.push(docRecord('tokDto', '契约域/c.md'));
-    const harness = makeHarness(makeConfig({ buildParallelism: 1 }));
+    const harness = makeHarness(makeConfig({ buildConcurrency: 1 }));
     const dto = await harness.service.createBuild(store as never, { mode: 'full', confirm: 'BUILD' });
     expect(dto.parallelism).toBe(1);
     expect(dto.progress).toMatchObject({
@@ -1057,7 +1056,7 @@ describe('P2-S2：buildBatchWordBudget 字数预算接线', () => {
     // 单源字数（正文 'a ' + FAT 的 countText words）；预算取该值 → 两源必分两批
     const { countText } = await import('../src/kb/text-stats.js');
     const perSource = countText(`a ${FAT}`).words;
-    const harness = makeHarness(makeConfig({ buildParallelism: 1, buildBatchWordBudget: perSource }));
+    const harness = makeHarness(makeConfig({ buildConcurrency: 1, buildBatchWordBudget: perSource }));
     const dto = await harness.service.createBuild(store as never, { mode: 'full', confirm: 'BUILD' });
     const row = await waitForTerminal(dto.id);
     expect(String(row.status)).toBe('published');
@@ -1081,7 +1080,7 @@ describe('P2-S2：buildBatchWordBudget 字数预算接线', () => {
     writeRaw('预算零域/b.md', `b ${FAT}`);
     documents.length = 0;
     documents.push(docRecord('tokZA', '预算零域/a.md'), docRecord('tokZB', '预算零域/b.md'));
-    const harness = makeHarness(makeConfig({ buildParallelism: 1 }));
+    const harness = makeHarness(makeConfig({ buildConcurrency: 1 }));
     const dto = await harness.service.createBuild(store as never, { mode: 'full', confirm: 'BUILD' });
     const row = await waitForTerminal(dto.id);
     expect(String(row.status)).toBe('published');
@@ -1101,7 +1100,7 @@ describe('P2-S2：buildBatchWordBudget 字数预算接线', () => {
     // 单元预算 = 3×budget < 两源合计（2×345）→ 目录簇切成 2 个单元 → workerCount=2
     const { countText } = await import('../src/kb/text-stats.js');
     const perSource = countText(`a ${FAT}`).words; // 345
-    const harness = makeHarness(makeConfig({ buildParallelism: 2, buildBatchWordBudget: 200 }));
+    const harness = makeHarness(makeConfig({ buildConcurrency: 2, buildBatchWordBudget: 200 }));
     const dto = await harness.service.createBuild(store as never, { mode: 'full', confirm: 'BUILD' });
     const row = await waitForTerminal(dto.id);
     expect(String(row.status)).toBe('published');

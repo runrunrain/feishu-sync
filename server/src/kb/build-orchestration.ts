@@ -36,7 +36,6 @@ import {
   type BuildRevisionBudget,
   type BuildArtifactState,
   type BuildAcceptanceState,
-  type BuildPublishMode,
   type RoleModelResolver,
   computeBuildSpecHash,
 } from './orchestration-contracts.js';
@@ -128,8 +127,7 @@ function toRoleModelConfig(role: KbBuildRoleConfig | undefined): { modelPresetId
 /**
  * 从 StandardKbConfig 构造冻结 BuildSpec（B 案 §8：开始时固定模型标识/
  * 参数、规范版本、并发与预算、发布方式；角色引用 llm 注册表预设，密钥
- * 不入记录）。resolveBuildConcurrency 语义：buildConcurrency 优先回落
- * buildParallelism，钳制 1..8（T1 已冻结，不在此重复）。
+ * 不入记录）。新构建通过发布校验后自动发布。
  * diting F05：提供 resolveRoleModel 时，把各角色解析后的实际非密钥参数
  * （provider/modelId/baseUrl/protocol/thinking/角色规范版本）冻结进
  * resolvedRoles——specHash 覆盖；后续任务按冻结身份派发、凭据动态取。
@@ -137,15 +135,14 @@ function toRoleModelConfig(role: KbBuildRoleConfig | undefined): { modelPresetId
  * reasoning/thinkingLevels/authHeader）；integrator 未显式配置时冻结
  * writer 冻结结果的显式副本（origin='follows_writer'），三角色全部冻结
  * 不留空——缺省整合者跟随撰写，撰写漂移同样阻断整合派发。
- * diting N01：同时冻结流水模式标记 pipelineMode（T7 启用门：任一角色
- * 显式或 publishMode='confirm' → 'orchestrated'，否则 'legacy'）；
+ * 同时冻结流水模式标记 pipelineMode，任一角色显式配置时启用编排流水。
  * 无标记的旧快照由 reviewPipelineActive 按旧门控语义恢复。
  */
 export function buildSpecFromConfig(input: {
   buildId: string;
   snapshotEntries: RawSourceSnapshotEntry[];
   baseReleaseId: string | null;
-  standardKb: Pick<StandardKbConfig, 'buildRoles' | 'reviewPolicy' | 'publishMode' | 'buildConcurrency' | 'buildParallelism'>;
+  standardKb: Partial<Pick<StandardKbConfig, 'buildRoles' | 'reviewPolicy' | 'buildConcurrency'>>;
   /** 规范指纹（角色提示词/审查规范内容哈希）；缺省 'v1' */
   specVersion?: string;
   /** diting F05：角色实际模型解析器（非密钥）；缺省不冻结 resolvedRoles */
@@ -157,7 +154,6 @@ export function buildSpecFromConfig(input: {
   const reviewerConfig = toRoleModelConfig(roles?.reviewer);
   const integratorConfig = roles?.integrator ? toRoleModelConfig(roles.integrator) : undefined;
   const resolve = input.resolveRoleModel;
-  const publishMode: BuildPublishMode = input.standardKb.publishMode === 'confirm' ? 'confirm' : 'auto';
   const anyExplicit = explicitRoleConfigured(writerConfig) || explicitRoleConfigured(reviewerConfig)
     || (integratorConfig ? explicitRoleConfigured(integratorConfig) : false);
   let resolvedRoles: BuildSpec['resolvedRoles'] | undefined;
@@ -191,12 +187,12 @@ export function buildSpecFromConfig(input: {
     concurrency,
     maxAutoRevisions: clampInt(input.standardKb.reviewPolicy?.maxAutoRevisions, 2, 1, 5),
     maxInterfaceRetries: clampInt(input.standardKb.reviewPolicy?.maxInterfaceRetries, 2, 0, 5),
-    publishMode,
+    publishMode: 'auto',
     // S3 切片 C：机械预检开关随 spec 冻结；仅显式 true 落键（false/缺省
     // 都不落）→ 缺省关闭时 specHash 与旧版一致，旧检查点可恢复
     ...(input.standardKb.reviewPolicy?.mechanicalPrecheck === true ? { mechanicalPrecheck: true } : {}),
     // diting N01：冻结流水模式（T7 启用门），恢复判定优先读标记
-    pipelineMode: anyExplicit || publishMode === 'confirm' ? 'orchestrated' : 'legacy',
+    pipelineMode: anyExplicit ? 'orchestrated' : 'legacy',
   };
   return { ...spec, specHash: computeBuildSpecHash(spec) };
 }

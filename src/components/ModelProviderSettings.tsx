@@ -283,9 +283,6 @@ export function ModelProviderSettings() {
             <Server className="w-4 h-4 mt-0.5 shrink-0 text-seal" />
             <div>
               <h2 className="text-base font-kai font-medium text-ink">模型提供商与预设</h2>
-              <p className="mt-0.5 text-xs text-ink-faint">
-                提供商保存连接与密钥，模型预设保存模型代码与运行参数；Agent、标准库构建与原始文档整理可直接使用。
-              </p>
             </div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -298,17 +295,10 @@ export function ModelProviderSettings() {
       </CardHeader>
 
       <CardBody className="space-y-4">
-        <div className="rounded-md border border-jade/30 bg-jade/5 px-3 py-2.5 text-xs text-ink-soft">
-          <p>
-            配置仅保存在本应用。支持 OpenAI Chat Completions、Responses 和 Anthropic；也可在「Agent 标准库 → 运行时与模型」切换为本地 Pi 配置。
-          </p>
-        </div>
-
         {providers.length === 0 ? (
           <div className="rounded-md border border-dashed border-line px-4 py-6 text-center">
             <Server className="mx-auto h-6 w-6 text-ink-faint" />
             <p className="mt-2 text-sm text-ink-soft">尚未配置远程模型提供商</p>
-            <p className="mt-1 text-xs text-ink-faint">添加后即可为 Agent、标准库构建与原始文档整理选择模型。</p>
             <Button className="mt-4" size="sm" onClick={addProvider}>
               <Plus className="w-3.5 h-3.5" />
               添加第一个提供商
@@ -413,7 +403,7 @@ export function ModelProviderSettings() {
                   const urls = { ...provider.protocolBaseUrls, [previous]: provider.openAiCompatBaseUrl };
                   return { ...provider, openAiProtocol: next, protocol: next, protocolBaseUrls: urls, openAiCompatBaseUrl: urls[next] ?? provider.openAiCompatBaseUrl };
                 });
-              }} helperText="选择 OpenAI 请求使用的协议。" />
+              }} />
               <Input label="OpenAI Base URL" type="url"
                 value={(selectedProvider.protocol ?? 'openai-completions') !== 'anthropic-messages' ? selectedProvider.openAiCompatBaseUrl : selectedProvider.protocolBaseUrls?.[selectedProvider.openAiProtocol ?? 'openai-completions'] ?? selectedProvider.protocolBaseUrls?.['openai-completions'] ?? selectedProvider.protocolBaseUrls?.['openai-responses'] ?? ''}
                 onChange={(event) => {
@@ -423,7 +413,7 @@ export function ModelProviderSettings() {
                     protocolBaseUrls: { ...provider.protocolBaseUrls, 'openai-completions': value, 'openai-responses': value } }));
                 }}
                 placeholder="https://api.openai.com/v1"
-                helperText="供 OpenAI Chat Completions 和 Responses 使用；具体协议由上方选择。" />
+ />
               </div>
               <div className="space-y-3 rounded-md border border-line p-3">
               <h3 className="text-sm font-medium text-ink">Anthropic</h3>
@@ -436,7 +426,7 @@ export function ModelProviderSettings() {
                     protocolBaseUrls: { ...provider.protocolBaseUrls, 'anthropic-messages': value } }));
                 }}
                 placeholder="https://api.anthropic.com"
-                helperText="Claude Code 使用此地址；留空表示不支持该协议。" />
+                helperText="Claude Code 使用此地址。" />
               </div>
 
               <Input
@@ -473,16 +463,13 @@ export function ModelProviderSettings() {
                         : <Eye className="h-4 w-4" />}
                   </button>
                 )}
-                helperText={showKey
-                  ? '已按本次操作显示密钥；再次点击眼睛即可隐藏。'
-                  : '读取设置时会隐藏已保存的密钥；点击眼睛可按需显示。输入空值并保存可清除该提供商的密钥。'}
+                helperText="清空并保存可删除密钥。"
               />
 
               <div className="space-y-3 border-t border-line pt-4">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
                     <p className="text-sm font-medium text-ink-soft font-serif">模型预设</p>
-                    <p className="mt-0.5 text-xs text-ink-faint">新预设默认最大输出 130000 tokens。清空后使用已核实型号的内置上限；未收录型号回落到 32768，手填值优先。</p>
                   </div>
                   <Button variant="secondary" size="sm" onClick={() => addModel(selectedProvider)}>
                     <Plus className="h-3.5 w-3.5" />
@@ -501,7 +488,7 @@ export function ModelProviderSettings() {
                     value: model.id,
                     label: `${model.name || model.id}${model.enabled ? '' : '（已停用）'}`,
                   })) : [{ value: '', label: '尚无模型预设' }]}
-                  helperText="切换到该提供商且未指定其他预设时使用"
+                  helperText="未指定预设时使用。"
                 />
 
                 <div className="space-y-3">
@@ -538,20 +525,20 @@ export function ModelProviderSettings() {
                           onChange={(event) => updateModel(selectedProvider, model.id, { openAiModel: event.target.value, thinkingLevels: undefined })}
                           placeholder="填写服务商的模型代码"
                           helperText={/\bglm-[^\s[]+\[[^\]]+\]/i.test(model.openAiModel)
-                            ? 'GLM API 请填写标准模型代码（例如 glm-5.2）；容量显示后缀会在运行时自动移除。'
+                            ? '请使用标准模型代码，例如 glm-5.2。'
                             : undefined}
                         />
                       </div>
                       <div className="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-2">
                         <Input label="上下文窗口（tokens）" type="number" min={1024} step={1} value={model.contextWindow ?? ''} placeholder="默认 128000"
                           onChange={(e) => updateModel(selectedProvider, model.id, { contextWindow: e.target.value ? Number(e.target.value) : undefined })} />
-                        <Input label="最大输出（tokens）" type="number" min={1} value={model.maxTokens ?? ''} placeholder="未收录模型默认 32768"
+                        <Input label="最大输出（tokens）" type="number" min={1} value={model.maxTokens ?? ''} placeholder="按型号取默认值，未知用 32768"
                           onChange={(e) => updateModel(selectedProvider, model.id, { maxTokens: e.target.value ? Number(e.target.value) : undefined })} />
                         <Toggle label="支持思考模式" checked={model.reasoning ?? false} onChange={(reasoning) => updateModel(selectedProvider, model.id, { reasoning })} />
                       </div>
                       {model.reasoning ? <div className="mt-3">
                         <p className="text-sm text-ink-soft">支持的思考档位</p>
-                        <p className="mt-1 text-xs text-ink-faint">第三方模型未提供可验证的档位信息时，请根据服务商说明选择；关闭始终可用。</p>
+                        <p className="mt-1 text-xs text-ink-faint">按服务商支持的档位勾选。</p>
                         <div className="mt-2 flex flex-wrap gap-3">
                           {(['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const).map((level) => <label key={level} className="flex items-center gap-1 text-xs text-ink-soft">
                             <input type="checkbox" checked={model.thinkingLevels?.includes(level) ?? false} onChange={(event) => updateModel(selectedProvider, model.id, {
