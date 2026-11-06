@@ -57,7 +57,7 @@ function probeInput(root: string, over: Partial<Parameters<typeof runStaticProbe
     amagiVersion: '2.21.31',
     knowledgeBaseRoot: path.join(root, 'raw-lib'),
     outputRoot: path.join(root, 'std-kb'),
-    hasZhipuApiKey: true,
+    hasModelApiKey: true,
     piVersion: '1.4.0',
     ...over,
   };
@@ -117,7 +117,7 @@ describe('runStaticProbes', () => {
 
   it('密钥不可用 → fail（不假通过）', () => {
     installFixture(root);
-    const report = runStaticProbes(probeInput(root, { hasZhipuApiKey: false }));
+    const report = runStaticProbes(probeInput(root, { hasModelApiKey: false }));
     expect(report.checks.find((c) => c.id === 'model-key-present')!.state).toBe('fail');
   });
 

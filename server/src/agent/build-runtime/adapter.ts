@@ -22,9 +22,9 @@ import { freezeGuardConfig } from './dispatch-guard.js';
 import { buildRuntimeIntegrityRefs } from './runtime-integrity.js';
 import { childPolicyContentHash, childPolicyFileName, renderChildPolicySource } from './child-policy.js';
 import {
-  DEFAULT_LEADER_TERMINATE_GRACE_MS, validateBuildRunSpec,
+  BUILD_MODEL_PROVIDER, DEFAULT_LEADER_TERMINATE_GRACE_MS, validateBuildRunSpec,
   type AdapterStartOptions,
-  type BuildCheckpoint, type BuildRunSpec, type BuildRuntimeAdapter, type CancelResult,
+  type BuildCheckpoint, type BuildModelProvider, type BuildRunSpec, type BuildRuntimeAdapter, type CancelResult,
   type CapabilityReport, type ProbeInput, type RuntimeBinding, type RuntimeEvent,
   type TerminationOutcome,
 } from './contracts.js';
@@ -57,8 +57,8 @@ export interface PiAmagiRuntimeDeps {
   bridgeScriptPath: string;
   /** 应用内部 API 回环地址。 */
   agentUrl: string;
-  /** 解析 zhipuai 密钥（只进子进程 env；探测阶段不调用）。 */
-  resolveZhipuApiKey: () => string | undefined;
+  /** 解析对应提供商的密钥，只进入子进程环境。 */
+  resolveModelApiKey: (provider: BuildModelProvider) => string | undefined;
   /** 签发 Leader 运行令牌（每次进程启动新签）。 */
   issueLeaderRunToken: () => string;
   /** 签发子任务 MCP 桥接凭据（绑定 buildId+generation）。 */
@@ -248,8 +248,13 @@ export class PiAmagiBuildRuntime implements BuildRuntimeAdapter {
   }
 
   private async launch(spec: BuildRunSpec, dirs: BuildDirectories, resumeSessionId: string | null): Promise<RuntimeBinding> {
-    const zhipuKey = this.deps.resolveZhipuApiKey();
-    if (!zhipuKey) throw new Error('zhipuai 密钥不可用（构建 Leader 启动前置条件）');
+    const apiKeys: Partial<Record<BuildModelProvider, string>> = {};
+    const providers = new Set(spec.modelDescriptors.map((descriptor) => descriptor.provider ?? BUILD_MODEL_PROVIDER));
+    for (const provider of providers) {
+      const key = this.deps.resolveModelApiKey(provider);
+      if (!key) throw new Error(`构建提供商 ${provider} 的密钥不可用`);
+      apiKeys[provider] = key;
+    }
     const bridge = this.deps.issueMcpBridgeCredentials();
     const epoch = dirs.runtimeEpoch ?? 1;
     // F09：会话 id epoch 唯一——成果级 rebuild 换 epoch 即新会话 id，Pi
@@ -267,7 +272,7 @@ export class PiAmagiBuildRuntime implements BuildRuntimeAdapter {
       parentEnv: process.env,
       spec,
       dirs,
-      zhipuApiKey: zhipuKey,
+      apiKeys,
       agentUrl: this.deps.agentUrl,
       leaderRunToken: this.deps.issueLeaderRunToken(),
       mcpBridgeUrl: bridge.url,

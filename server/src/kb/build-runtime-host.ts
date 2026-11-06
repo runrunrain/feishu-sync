@@ -31,8 +31,10 @@ import {
   DEFAULT_AUTO_ROUNDS,
   DEFAULT_LEADER_TERMINATE_GRACE_MS,
   DEFAULT_ROLE_AGENTS,
+  modelSpecPoolKey,
   validateBuildRunSpec,
   type AmagiPackageRef,
+  type BuildModelProvider,
   type BuildRunSpec,
   type CapabilityReport,
   type CancelResult,
@@ -83,9 +85,10 @@ export const LEADER_TOOL_WHITELIST: readonly string[] = [...AMAGI_TASK_TOOLS, ..
 
 /** 应用侧解析后的角色模型（LeaderBuildInput.models 成员；显式形状，不 any）。 */
 export interface LeaderBuildModel {
+  provider: BuildModelProvider;
   /** 发给 API 的模型 id（不含 provider 前缀）。 */
   modelId: string;
-  /** OpenAI 兼容端点 baseUrl（全角色必须一致——models.json 单 provider 声明）。 */
+  /** 此提供商的 OpenAI 兼容端点。 */
   baseUrl: string;
   /** 冻结思考档位（pi 档位名；须在 thinkingLevels 内）。 */
   thinking?: ThinkingLevel;
@@ -108,8 +111,8 @@ export interface LeaderBuildInput {
   publicationPolicy: 'auto' | 'confirm';
   workflowRevision: string;
   workflowSkillPath: string;
-  /** 全角色共享 provider 的 API key（只进子进程 env，不落盘不进日志）。 */
-  apiKey: string;
+  /** 各提供商密钥只进子进程环境。 */
+  apiKeys: Partial<Record<BuildModelProvider, string>>;
   /** fresh 初始 prompt（Leader 规则 + 本次构建交代）。 */
   leaderBriefing: string;
   /** session/rebuild 续接 prompt（剩余工作交代）。 */
@@ -305,7 +308,7 @@ export class BuildRuntimeHost {
       amagiInstallDir: installDir,
       knowledgeBaseRoot: this.deps.knowledgeBaseRoot(),
       outputRoot: this.deps.outputRoot(),
-      hasZhipuApiKey: apiKeyOverride !== undefined ? apiKeyOverride.trim() !== '' : this.hasActiveApiKey(config),
+      hasModelApiKey: apiKeyOverride !== undefined ? apiKeyOverride.trim() !== '' : this.hasActiveApiKey(config),
       piVersion: facts.piVersion,
     });
   }
@@ -553,13 +556,14 @@ export class BuildRuntimeHost {
 
   /** 应用侧模型 → 运行层模型 spec（provider/model[:thinking]）。 */
   private static modelSpec(model: LeaderBuildModel): string {
-    return `${BUILD_MODEL_PROVIDER}/${model.modelId}${model.thinking ? `:${model.thinking}` : ''}`;
+    return `${model.provider}/${model.modelId}${model.thinking ? `:${model.thinking}` : ''}`;
   }
 
   /** 组装 BuildRunSpec（校验内建；agentDirConfigHash 以同 deps 渲染计算后回填）。 */
   private assembleSpec(input: LeaderBuildInput, amagiPackage: AmagiPackageRef, piVersion: string, bridge: { bridgeCommand: string; bridgeArgs: string[] }): BuildRunSpec {
     const dirs = planBuildDirectories(this.deps.dataRoot, input.buildId);
     const descriptorOf = (model: LeaderBuildModel): BuildRunSpec['modelDescriptors'][number] => ({
+      ...(model.provider === BUILD_MODEL_PROVIDER ? {} : { provider: model.provider }),
       id: model.modelId,
       baseUrl: model.baseUrl,
       api: 'openai-completions',
@@ -571,14 +575,14 @@ export class BuildRuntimeHost {
       ...(model.contextWindow !== undefined ? { contextWindow: model.contextWindow } : {}),
       ...(model.maxTokens !== undefined ? { maxTokens: model.maxTokens } : {}),
     });
-    // 去重 descriptor（同 modelId 只声明一次；首见形状为准）
     const seen = new Map<string, BuildRunSpec['modelDescriptors'][number]>();
     for (const model of [input.models.leader, input.models.writer, input.models.reviewer]) {
-      if (!seen.has(model.modelId)) seen.set(model.modelId, descriptorOf(model));
+      const key = `${model.provider}/${model.modelId}`;
+      if (!seen.has(key)) seen.set(key, descriptorOf(model));
     }
     const max = input.maxConcurrentAgents;
-    const writerPoolKey = BuildRuntimeHost.modelSpec(input.models.writer).split(':')[0];
-    const reviewerPoolKey = BuildRuntimeHost.modelSpec(input.models.reviewer).split(':')[0];
+    const writerPoolKey = modelSpecPoolKey(BuildRuntimeHost.modelSpec(input.models.writer));
+    const reviewerPoolKey = modelSpecPoolKey(BuildRuntimeHost.modelSpec(input.models.reviewer));
     // 同池（同模型）多角色容量必须一致：同模型时均分，不同模型按写作优先
     //（设计 §3.6：写作 4、审查 2；research 复用写作池不重复占容量）。
     const samePool = writerPoolKey === reviewerPoolKey;
@@ -904,7 +908,7 @@ export class BuildRuntimeHost {
     // 1. 探测（fail-closed；密钥以本次构建解析为准）。
     const frozenPackage = input.resumeStrategy === 'session'
       ? input.priorState?.spec.amagiPackage : undefined;
-    const { amagiPackage, piVersion } = await this.probeOrFail(input.apiKey, frozenPackage);
+    const { amagiPackage, piVersion } = await this.probeOrFail(input.apiKeys[input.models.leader.provider] ?? '', frozenPackage);
     // 2. 资产定位（转发扩展/桥接脚本/skill；缺失明确失败）。
     const forwardingExtensionPath = piExtensionPath();
     if (!forwardingExtensionPath) {
@@ -967,10 +971,7 @@ export class BuildRuntimeHost {
       forwardingExtensionPath,
       bridgeScriptPath: bridgeScript,
       agentUrl: this.deps.internalBaseUrl(),
-      resolveZhipuApiKey: (): string => {
-        if (!input.apiKey) throw new ToolError('build_runtime_unavailable', '构建模型密钥不可用', 503);
-        return input.apiKey;
-      },
+      resolveModelApiKey: (provider: BuildModelProvider) => input.apiKeys[provider],
       issueLeaderRunToken: (): string => {
         const token = this.issueLeaderContext(session);
         session.tokens.add(token);

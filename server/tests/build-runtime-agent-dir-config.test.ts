@@ -18,6 +18,7 @@ import {
   writeAgentDirConfig, agentDirConfigMatchesSpec,
 } from '../src/agent/build-runtime/agent-dir-config.js';
 import { childPolicyFileName, renderChildPolicySource } from '../src/agent/build-runtime/child-policy.js';
+import { validateBuildRunSpec } from '../src/agent/build-runtime/contracts.js';
 import { makeSpec } from './build-runtime-contracts.test.js';
 
 const tmpDirs: string[] = [];
@@ -75,6 +76,26 @@ describe('renderAgentDirConfigFiles', () => {
     const ids = provider.models.map((m: { id: string }) => m.id).sort();
     expect(ids).toEqual(['glm-5.3', 'glm-5.3-flash']);
     expect(JSON.stringify(models)).not.toMatch(/[0-9a-zA-Z]{32}\./); // 无密钥形值
+  });
+
+  it('同名模型可分别绑定三家提供商的端点、密钥和准入池', () => {
+    const spec = makeSpec({
+      models: { leader: 'deepseek/shared', writer: 'zhipuai/shared', reviewer: 'openai/shared', research: 'zhipuai/shared' },
+      modelDescriptors: [
+        { id: 'shared', baseUrl: 'https://writer.example/v1', api: 'openai-completions' },
+        { id: 'shared', provider: 'openai', baseUrl: 'https://reviewer.example/v1', api: 'openai-completions' },
+        { id: 'shared', provider: 'deepseek', baseUrl: 'https://leader.example/v1', api: 'openai-completions' },
+      ],
+    });
+    expect(validateBuildRunSpec(spec)).toEqual([]);
+    const { files, dirs } = renderedFor(spec);
+    expect(validateRenderedConfig(files, spec, dirs)).toEqual([]);
+    expect(JSON.parse(files.models).providers).toMatchObject({
+      zhipuai: { baseUrl: 'https://writer.example/v1', apiKey: '$ZHIPU_API_KEY', models: [{ id: 'shared' }] },
+      openai: { baseUrl: 'https://reviewer.example/v1', apiKey: '$OPENAI_API_KEY', models: [{ id: 'shared' }] },
+      deepseek: { baseUrl: 'https://leader.example/v1', apiKey: '$DEEPSEEK_API_KEY', models: [{ id: 'shared' }] },
+    });
+    expect(JSON.parse(files.amagi).concurrency.models).toEqual({ 'zhipuai/shared': 4, 'openai/shared': 2 });
   });
 
   it('mcp.json：只登记桥接、env 用 ${VAR} 引用、autoEnableCodemode:false', () => {

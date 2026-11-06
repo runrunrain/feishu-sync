@@ -13,7 +13,7 @@
  * - amagi.json：agents.<role>.model/skills、concurrency.models 分池、mcp 路由
  *   （leader=[] 显式、default=[] 显式、agents.<role>=[桥接]）。形状依据 amagi-pi
  *   schemas/amagi-config.json（2.21.31）与 mcp-config.ts loadMcpRouting。
- * - models.json：zhipuai provider 静态声明，apiKey 只写 "$ZHIPU_API_KEY" 环境引用
+ * - models.json：按提供商声明模型、端点与密钥环境变量
  *   （pi models-configuration.md："$NAME" 插值），文件中不出现密钥值。
  * - mcp.json：mcpServers 只登记应用桥接（command=应用 Node 绝对路径、env 用
  *   ${VAR} 引用两个桥接变量），autoEnableCodemode:false（pi docs mcp.md——设在
@@ -33,8 +33,8 @@ import {
 import { settingsFrozenSurfaceIssues } from './runtime-integrity.js';
 import {
   BUILD_MCP_SERVER_NAME, BUILD_MCP_TOKEN_ENV, BUILD_MCP_URL_ENV,
-  BUILD_MODEL_PROVIDER, ZHIPU_API_KEY_ENV,
-  modelSpecPoolKey, type BuildRunSpec, type ThinkingLevel,
+  BUILD_MODEL_PROVIDER, BUILD_MODEL_KEY_ENVS,
+  modelSpecPoolKey, type BuildModelProvider, type BuildRunSpec, type ThinkingLevel,
 } from './contracts.js';
 
 export class AgentDirConfigError extends Error {
@@ -176,20 +176,27 @@ export function renderAgentDirConfigFiles(spec: BuildRunSpec, _dirs: BuildDirect
     },
   };
 
-  // ── models.json：zhipuai 静态声明（apiKey=环境引用，不落密钥值） ──
-  const seen = new Map<string, BuildRunSpec['modelDescriptors'][number]>();
-  for (const descriptor of spec.modelDescriptors) seen.set(descriptor.id, descriptor);
-  const firstDescriptor = seen.values().next().value;
-  const baseUrl = firstDescriptor?.baseUrl ?? spec.modelDescriptors[0]?.baseUrl ?? '';
+  // 每个别名绑定自己的端点和密钥变量，模型 ID 保留提供商要求的原值。
+  const groups = new Map<BuildModelProvider, Map<string, BuildRunSpec['modelDescriptors'][number]>>();
+  for (const descriptor of spec.modelDescriptors) {
+    const provider = descriptor.provider ?? BUILD_MODEL_PROVIDER;
+    let group = groups.get(provider);
+    if (!group) {
+      group = new Map();
+      groups.set(provider, group);
+    }
+    group.set(descriptor.id, descriptor);
+  }
   const models = {
     $schema: 'https://pi.dev/schemas/models.schema.json',
-    providers: {
-      [BUILD_MODEL_PROVIDER]: {
-        name: 'GLM (zhipuai, 构建静态声明)',
-        baseUrl,
+    providers: Object.fromEntries([...groups].map(([provider, group]) => {
+      const descriptors = [...group.values()];
+      return [provider, {
+        name: provider === BUILD_MODEL_PROVIDER ? 'GLM (zhipuai, 构建静态声明)' : provider,
+        baseUrl: descriptors[0].baseUrl,
         api: 'openai-completions',
-        apiKey: `$${ZHIPU_API_KEY_ENV}`,
-        models: [...seen.values()].map((descriptor) => ({
+        apiKey: `$${BUILD_MODEL_KEY_ENVS[provider]}`,
+        models: descriptors.map((descriptor) => ({
           id: descriptor.id,
           name: descriptor.id,
           ...(descriptor.reasoning !== undefined ? { reasoning: descriptor.reasoning } : {}),
@@ -197,8 +204,8 @@ export function renderAgentDirConfigFiles(spec: BuildRunSpec, _dirs: BuildDirect
           ...(descriptor.contextWindow ? { contextWindow: descriptor.contextWindow } : {}),
           ...(descriptor.maxTokens ? { maxTokens: descriptor.maxTokens } : {}),
         })),
-      },
-    },
+      }];
+    })),
   };
 
   // ── mcp.json：只登记应用桥接；env 只用变量引用；关闭 codemode 自动启用 ──
@@ -311,10 +318,10 @@ export function validateRenderedConfig(
       if (!Array.isArray(agents[agent]?.skills) || (agents[agent].skills as unknown[]).length !== 1) {
         issues.push(`amagi.json agents.${agent}.skills 应只含构建 skill 路径`);
       }
-      const model = agents[agent]?.model;
-      if (model !== undefined && (typeof model !== 'string' || !model.startsWith(`${BUILD_MODEL_PROVIDER}/`))) {
-        issues.push(`amagi.json agents.${agent}.model 未指向 ${BUILD_MODEL_PROVIDER}`);
-      }
+    }
+    for (const role of Object.keys(spec.roles) as Array<keyof typeof spec.roles>) {
+      const agent = spec.roles[role];
+      if (agents[agent]?.model !== spec.models[role]) issues.push(`amagi.json agents.${agent}.model 与冻结模型不一致`);
     }
     const concurrency = (amagi.concurrency ?? {}) as Record<string, unknown>;
     if (!concurrency.models || typeof concurrency.models !== 'object') issues.push('amagi.json 缺 concurrency.models');
@@ -333,20 +340,21 @@ export function validateRenderedConfig(
   const models = parse(files.models, 'models.json');
   if (models) {
     const providers = (models.providers ?? {}) as Record<string, Record<string, unknown>>;
-    const provider = providers[BUILD_MODEL_PROVIDER];
-    if (!provider) issues.push(`models.json 缺 ${BUILD_MODEL_PROVIDER} provider`);
-    else {
-      if (provider.apiKey !== `$${ZHIPU_API_KEY_ENV}`) issues.push('models.json apiKey 必须是环境引用（不得含密钥值）');
-      if (!Array.isArray(provider.models) || (provider.models as unknown[]).length === 0) issues.push('models.json 无模型声明');
-      const declaredIds = new Set(((provider.models ?? []) as Array<{ id?: string }>).map((m) => m.id));
-      for (const roleKey of Object.keys(spec.roles) as Array<keyof typeof spec.roles>) {
-        const model = spec.models[roleKey];
-        if (!model) continue;
-        const id = model.slice(model.indexOf('/') + 1).split(':')[0];
-        if (!declaredIds.has(id)) issues.push(`models.json 未声明 ${roleKey} 模型 ${id}`);
+    const expected = new Set(spec.modelDescriptors.map((descriptor) => descriptor.provider ?? BUILD_MODEL_PROVIDER));
+    for (const provider of Object.keys(providers)) {
+      if (!expected.has(provider as BuildModelProvider)) issues.push(`models.json 出现未冻结的 provider：${provider}`);
+    }
+    for (const descriptor of spec.modelDescriptors) {
+      const alias = descriptor.provider ?? BUILD_MODEL_PROVIDER;
+      const provider = providers[alias];
+      if (provider?.baseUrl !== descriptor.baseUrl || provider?.api !== descriptor.api) {
+        issues.push(`models.json provider ${alias} 端点或协议与冻结配置不一致`);
+      }
+      if (provider?.apiKey !== `$${BUILD_MODEL_KEY_ENVS[alias]}`) issues.push(`models.json provider ${alias} apiKey 必须引用对应环境变量`);
+      if (!Array.isArray(provider?.models) || !provider.models.some((model) => model?.id === descriptor.id)) {
+        issues.push(`models.json 未声明模型 ${alias}/${descriptor.id}`);
       }
     }
-    if (Object.keys(providers).length !== 1) issues.push('models.json 只应声明一个 provider');
   }
   const mcp = parse(files.mcp, 'mcp.json');
   if (mcp) {

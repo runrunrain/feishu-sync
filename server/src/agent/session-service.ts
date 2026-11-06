@@ -532,13 +532,6 @@ export class SessionService extends EventEmitter {
       this.sessionStates.set(sessionId, 'streaming');
       this.emitSessionState(sessionId, localMapStore);
 
-      if (images.length && config.agent.runtime.backend !== 'claude-code') {
-        const state = await process.sendCommand<{ model?: { input?: string[] } }>('get_state');
-        if (state.data?.model?.input && !state.data.model.input.includes('image')) {
-          throw new ToolError('model_image_unsupported', '当前 Pi 模型不支持图片输入，请选择支持视觉的模型后重试', 400);
-        }
-      }
-
       const attachForwarders = (rpc: PiRpcProcess) => {
         const currentRunId = () => this.runs.get(sessionId)?.runId ?? runId;
         if (mode === 'work' && config.agent.runtime.backend !== 'claude-code') {

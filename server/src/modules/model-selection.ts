@@ -7,6 +7,7 @@ export interface ResolvedProviderModel {
   baseUrl: string; apiKey: string; protocol: LlmProtocol;
   anthropicAuthType?: 'api-key' | 'auth-token';
   contextWindow?: number; maxTokens?: number; reasoning?: boolean;
+  supportsImages?: boolean;
   thinkingLevels?: import('../types/agent-knowledge.js').AgentThinkingLevel[];
 }
 export function resolveProviderModel(llm: Pick<LlmConfig, 'providers' | 'activeProviderId' | 'activeModelId'>, selection: ModelSelection = {}, requiredProtocol?: LlmProtocol): ResolvedProviderModel | null {
@@ -30,7 +31,8 @@ export function resolveProviderModel(llm: Pick<LlmConfig, 'providers' | 'activeP
     openAiModel: /^glm-/i.test(id) ? id.replace(/\s*\[[^\]]+\]$/, '') : id,
     baseUrl, apiKey: provider.apiKey.trim(), protocol,
     ...(protocol === 'anthropic-messages' ? { anthropicAuthType: provider.anthropicAuthType ?? 'api-key' } : {}),
-    contextWindow: preset.contextWindow, maxTokens: preset.maxTokens, reasoning: preset.reasoning, thinkingLevels: preset.thinkingLevels };
+    contextWindow: preset.contextWindow, maxTokens: preset.maxTokens, reasoning: preset.reasoning, thinkingLevels: preset.thinkingLevels,
+    supportsImages: preset.supportsImages };
 }
 
 export function providerModelParameters(

@@ -22,6 +22,9 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { PiRuntimeResolver } from '../src/agent/runtime-resolver.js';
 import { buildDefaultAgentConfig } from '../src/types/agent-knowledge.js';
 import { PiRpcProcess } from '../src/agent/pi-rpc-process.js';
+import { planBuildDirectories, renderAgentDirConfigFiles } from '../src/agent/build-runtime/agent-dir-config.js';
+import { buildLeaderEnv } from '../src/agent/build-runtime/environment.js';
+import { makeSpec } from './build-runtime-contracts.test.js';
 import { computePackageContentHash } from '../src/agent/build-runtime/amagi-package.js';
 import { renderChildPolicySource } from '../src/agent/build-runtime/child-policy.js';
 import { RUNTIME_INTEGRITY_SCHEMA_VERSION, type RuntimeIntegrityRefs } from '../src/agent/build-runtime/runtime-integrity.js';
@@ -554,10 +557,11 @@ afterAll(async () => {
 
 const bPiAvailable = () => Boolean(bRuntime?.nodePath && bRuntime?.piCliPath);
 
-type OpenAiMock = { url: string; close(): Promise<void>; conversations: Record<string, unknown>[] };
+type OpenAiMock = { url: string; close(): Promise<void>; conversations: Record<string, unknown>[]; authorization: Array<string | undefined> };
 
 function startOpenAiMock(script: (payload: { messages?: { role?: string }[] }) => { chunks: unknown[] }): Promise<OpenAiMock> {
   const conversations: Record<string, unknown>[] = [];
+  const authorization: Array<string | undefined> = [];
   const server = http.createServer((req, res) => {
     if (!req.url?.endsWith('/chat/completions')) { res.writeHead(404).end(); return; }
     let body = '';
@@ -565,6 +569,7 @@ function startOpenAiMock(script: (payload: { messages?: { role?: string }[] }) =
     req.on('end', () => {
       const payload = JSON.parse(body);
       conversations.push(payload);
+      authorization.push(req.headers.authorization);
       const { chunks } = script(payload as never);
       res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
       for (const chunk of chunks) res.write(`data: ${JSON.stringify(chunk)}\n\n`);
@@ -575,7 +580,7 @@ function startOpenAiMock(script: (payload: { messages?: { role?: string }[] }) =
   return new Promise((resolve) => {
     server.listen(0, '127.0.0.1', () => {
       const address = server.address() as { port: number };
-      resolve({ url: `http://127.0.0.1:${address.port}`, close: () => new Promise((done) => server.close(() => done())), conversations });
+      resolve({ url: `http://127.0.0.1:${address.port}`, close: () => new Promise((done) => server.close(() => done())), conversations, authorization });
     });
   });
 }
@@ -595,6 +600,39 @@ function textChunks(text: string): unknown[] {
     { ...base, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] },
   ];
 }
+
+it('真实 Pi 将不同提供商的同名模型发送至各自端点并使用对应密钥', async (ctx) => {
+  if (!bRuntime?.nodePath || !bRuntime.piCliPath) { ctx.skip(); return; }
+  const aliases = ['zhipuai', 'openai', 'deepseek'] as const;
+  const endpoints = await Promise.all(aliases.map(() => startOpenAiMock(() => ({ chunks: textChunks('ok') }))));
+  try {
+    const spec = makeSpec({ modelDescriptors: aliases.map((provider, index) => ({
+      provider, id: 'shared', baseUrl: `${endpoints[index].url}/v1`, api: 'openai-completions',
+    })) });
+    const dirs = planBuildDirectories(bRoot, spec.buildId);
+    fs.mkdirSync(dirs.homeDir, { recursive: true });
+    fs.mkdirSync(dirs.workDir, { recursive: true });
+    const files = renderAgentDirConfigFiles(spec, dirs, { bridgeCommand: bRuntime.nodePath, bridgeArgs: [] });
+    fs.writeFileSync(path.join(dirs.homeDir, 'models.json'), files.models);
+    const apiKeys = { zhipuai: 'writer-fixture', openai: 'reviewer-fixture', deepseek: 'leader-fixture' };
+    const env = buildLeaderEnv({ parentEnv: process.env, spec, dirs, apiKeys,
+      agentUrl: '', leaderRunToken: '', mcpBridgeUrl: '', mcpBridgeToken: '' });
+    for (const [index, alias] of aliases.entries()) {
+      const rpc = new PiRpcProcess({ nodePath: bRuntime.nodePath, piCliPath: bRuntime.piCliPath,
+        cwd: dirs.workDir, model: `${alias}/shared`, env, noSession: true, noTools: true });
+      try {
+        await rpc.start();
+        expect((await rpc.prompt('fixture')).outcome).toBe('completed');
+        expect(endpoints[index].conversations.map((request) => request.model)).toEqual(['shared']);
+        expect(endpoints[index].authorization).toEqual([`Bearer ${apiKeys[alias]}`]);
+      } finally {
+        await rpc.terminate();
+      }
+    }
+  } finally {
+    await Promise.all(endpoints.map((endpoint) => endpoint.close()));
+  }
+}, 60_000);
 
 function baseLeaderEnv(bRootDir: string, extra: Record<string, string>): NodeJS.ProcessEnv {
   // 关键：从零构造（不继承 process.env）——本测试进程自身携带 AMAGI_* 身份变量，

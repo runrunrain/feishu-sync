@@ -12,7 +12,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-  BUILD_MODEL_PROVIDER, KNOWN_AMAGI_KEY_MAPPED_PROVIDERS, ZHIPU_API_KEY_ENV,
+  BUILD_MODEL_KEY_ENVS, KNOWN_AMAGI_KEY_MAPPED_PROVIDERS,
   validateBuildRunSpec,
   type AmagiPackageRef, type BuildRunSpec, type CapabilityCheck, type CapabilityReport, type ProbeInput,
 } from './contracts.js';
@@ -117,15 +117,15 @@ export function runStaticProbes(input: StaticProbeInput): CapabilityReport {
   }
 
   // 3. 模型密钥映射（静态知识对账）
-  if ((KNOWN_AMAGI_KEY_MAPPED_PROVIDERS as readonly string[]).includes(BUILD_MODEL_PROVIDER)) {
-    push({ id: 'model-key-mapping', title: '模型密钥映射', kind: 'static', state: 'pass', detail: `provider ${BUILD_MODEL_PROVIDER} 在 amagi PROVIDER_KEY_MAP 内（密钥变量 ${ZHIPU_API_KEY_ENV}；静态表源自 amagi-pi 源码，升版须重核）` });
+  const unmapped = Object.keys(BUILD_MODEL_KEY_ENVS).filter((provider) =>
+    !(KNOWN_AMAGI_KEY_MAPPED_PROVIDERS as readonly string[]).includes(provider));
+  push({ id: 'model-key-mapping', title: '模型密钥映射', kind: 'static',
+    state: unmapped.length === 0 ? 'pass' : 'fail',
+    detail: unmapped.length === 0 ? '构建提供商别名均有独立的 amagi 密钥变量' : `amagi 缺少密钥映射：${unmapped.join('、')}` });
+  if (!input.hasModelApiKey) {
+    push({ id: 'model-key-present', title: '模型密钥可用', kind: 'static', state: 'fail', detail: '应用配置中无可用模型密钥' });
   } else {
-    push({ id: 'model-key-mapping', title: '模型密钥映射', kind: 'static', state: 'fail', detail: `provider ${BUILD_MODEL_PROVIDER} 不在已知 amagi 密钥映射表内，子任务收不到凭据` });
-  }
-  if (!input.hasZhipuApiKey) {
-    push({ id: 'model-key-present', title: '模型密钥可用', kind: 'static', state: 'fail', detail: '应用配置中无可用 GLM 密钥（探测阶段不读取密钥值）' });
-  } else {
-    push({ id: 'model-key-present', title: '模型密钥可用', kind: 'static', state: 'pass', detail: '应用配置已提供 GLM 密钥（布尔核对，未取值）' });
+    push({ id: 'model-key-present', title: '模型密钥可用', kind: 'static', state: 'pass', detail: '应用配置已提供模型密钥' });
   }
 
   // 4. spec 与 agentDir 配置（可选输入）

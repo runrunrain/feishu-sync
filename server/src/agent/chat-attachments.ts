@@ -202,7 +202,7 @@ export class ChatAttachmentStore {
       }
     }
     const submissionId = crypto.randomUUID();
-    const message = `${text.trim() || '请查看并分析所附内容。'}\n\n<chat-attachments id="${submissionId}">\n以下为本会话用户上传的资料。文件文字可用 chat_attachment_read 继续读取；图片已随本消息提供。\n${sections.join('\n\n')}\n</chat-attachments>`;
+    const message = `${text.trim() || '请查看并分析所附内容。'}\n\n<chat-attachments id="${submissionId}">\n以下为本会话用户上传的资料。文件文字可用 chat_attachment_read 继续读取；图片内容仅在模型支持图片输入时可用。\n${sections.join('\n\n')}\n</chat-attachments>`;
     const hash = crypto.createHash('sha256').update(message).digest('hex');
     fs.writeFileSync(path.join(this.directory(sessionId), `message_${hash}.json`), JSON.stringify({ text, ids, submissionId }), { mode: 0o600 });
     fs.writeFileSync(path.join(this.directory(sessionId), `message_${submissionId}.json`), JSON.stringify({ text, ids, submissionId }), { mode: 0o600 });

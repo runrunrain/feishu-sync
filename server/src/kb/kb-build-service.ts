@@ -136,7 +136,7 @@ import {
 } from '../types/agent-knowledge.js';
 import type { LeaderRunOutcome } from './build-leader-supervisor.js';
 import { BuildRuntimeHost, type LeaderBuildInput, type LeaderBuildModel } from './build-runtime-host.js';
-import type { ThinkingLevel } from '../agent/build-runtime/contracts.js';
+import { BUILD_MODEL_KEY_ENVS, type BuildModelProvider, type ThinkingLevel } from '../agent/build-runtime/contracts.js';
 import { serverDistRoot } from '../agent/agent-assets.js';
 import type { Config } from '../types/index.js';
 
@@ -1305,9 +1305,12 @@ export class KbBuildService extends EventEmitter {
     return sections;
   }
 
-  /** 解析 pi-amagi 三角色模型（OpenAI 兼容 + 单端点约束；不可解析显式拒绝）。 */
-  private resolveLeaderModels(config: Config): { models: { leader: LeaderBuildModel; writer: LeaderBuildModel; reviewer: LeaderBuildModel }; apiKey: string } {
+  /** 为每个提供商分配独立的 Pi 别名与凭据。 */
+  private resolveLeaderModels(config: Config): Pick<LeaderBuildInput, 'models' | 'apiKeys'> {
     const roles = config.standardKb.buildRoles ?? { writer: { modelPresetId: '' }, reviewer: { modelPresetId: '' } };
+    const aliases = Object.keys(BUILD_MODEL_KEY_ENVS) as BuildModelProvider[];
+    const providers = new Map<string, BuildModelProvider>();
+    const apiKeys: LeaderBuildInput['apiKeys'] = {};
     const toModel = (role: BuildRoleModelConfig, label: string): LeaderBuildModel => {
       const resolved = this.describeRoleModel(config, role, 'v2-leader');
       if (!resolved) {
@@ -1316,10 +1319,21 @@ export class KbBuildService extends EventEmitter {
       if (resolved.protocol && resolved.protocol !== 'openai-completions') {
         throw new ToolError('build_mode_unavailable', `Pi 编排的角色模型只支持 OpenAI 兼容端点（${label} 当前 ${resolved.protocol}）；请调整角色模型`, 400);
       }
+      if (!resolved.providerId || !resolved.baseUrl) {
+        throw new ToolError('build_mode_unavailable', `Pi 编排需要为${label}角色配置 OpenAI 兼容端点`, 400);
+      }
+      const apiKey = config.llm.providers?.find((provider) => provider.id === resolved.providerId)?.apiKey.trim();
+      if (!apiKey) {
+        throw new ToolError('agent_not_ready', `Pi 编排的${label}角色缺少提供商 API 密钥`, 503);
+      }
+      const provider = providers.get(resolved.providerId) ?? aliases[providers.size];
+      providers.set(resolved.providerId, provider);
+      apiKeys[provider] = apiKey;
       const thinking = isPiThinkingLevel(resolved.thinking) ? resolved.thinking : undefined;
       return {
+        provider,
         modelId: resolved.modelId,
-        baseUrl: resolved.baseUrl ?? '',
+        baseUrl: resolved.baseUrl,
         ...(thinking ? { thinking } : {}),
         ...(resolved.thinkingLevels && resolved.thinkingLevels.length > 0 ? { thinkingLevels: [...resolved.thinkingLevels] } : {}),
         ...(resolved.reasoning !== undefined ? { reasoning: resolved.reasoning } : {}),
@@ -1330,20 +1344,7 @@ export class KbBuildService extends EventEmitter {
     const writer = toModel(roles.writer, '写作');
     const reviewer = toModel(roles.reviewer, '审查');
     const leader = toModel(roles.integrator ?? roles.writer, 'Leader（整合）');
-    const endpoints = new Set([leader.baseUrl, writer.baseUrl, reviewer.baseUrl]);
-    if (endpoints.size !== 1 || ![...endpoints][0]) {
-      throw new ToolError('build_mode_unavailable', `Pi 编排的三角色必须解析到同一 OpenAI 兼容端点（当前 ${endpoints.size} 个）；请统一角色模型的提供商`, 400);
-    }
-    // 密钥：以写作角色的 provider 解析（三角色同端点约束已保证一致）
-    const keyResolution = resolveProviderModel(config.llm, {
-      ...(roles.writer.providerId ? { providerId: roles.writer.providerId } : {}),
-      ...(roles.writer.modelPresetId ? { modelId: roles.writer.modelPresetId } : {}),
-    });
-    const apiKey = keyResolution?.apiKey?.trim();
-    if (!apiKey) {
-      throw new ToolError('agent_not_ready', 'pi-amagi 模式需要角色模型 provider 的 API 密钥（当前缺失或为空）；请先在模型设置中配置（不降级）', 503);
-    }
-    return { models: { leader, writer, reviewer }, apiKey };
+    return { models: { leader, writer, reviewer }, apiKeys };
   }
 
   /** Leader 阶段输入组装（应用侧模型/材料；运行层 spec 由宿主冻结）。 */
@@ -1359,7 +1360,7 @@ export class KbBuildService extends EventEmitter {
     updateKbBuild: (patch: Record<string, unknown>) => void;
   }): LeaderBuildInput {
     const { config } = input;
-    const { models, apiKey } = this.resolveLeaderModels(config);
+    const { models, apiKeys } = this.resolveLeaderModels(config);
     // 构建专用物化冻结 skill（steer #11：物化到 build 专用 home 的独立 skills 目录，
     // 与 policy/config 禁区分开，子任务可真实 read 正文；steer #12：稳定规则全文
     // 经 --append-system-prompt 真系统注入（sha256==workflowRevision），
@@ -1417,7 +1418,7 @@ export class KbBuildService extends EventEmitter {
       publicationPolicy,
       workflowRevision: revision,
       workflowSkillPath: skillPath,
-      apiKey,
+      apiKeys,
       leaderBriefing: briefing,
       resumeBriefing,
       rebuildResume: null,

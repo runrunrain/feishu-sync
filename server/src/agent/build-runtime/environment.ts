@@ -4,22 +4,21 @@
  * 设计来源：设计v2 §3.2/§3.5/§4.1 与核查证据 Q2。
  *
  * 通道事实（amagi-pi 2.21.31 task-run.ts buildMinimalEnv，实测锚点）：
- * - 子任务 env = 硬编码白名单 + PI_* 全量透传 + PROVIDER_KEY_MAP（zhipuai →
- *   ZHIPU_API_KEY，仅发给 provider=zhipuai 的子任务）+ 任务边界与 MCP 凭据。
+ * - 子任务 env = 基础白名单 + PI_* + 对应提供商的密钥变量 + 任务边界与 MCP 凭据。
  * - FEISHU_SYNC_* 不在白名单：Leader 里的应用凭据到不了子任务；桥接变量经
  *   amagi 的 MCP 凭据交付（appendMcpCredentialEnv，按 mcp 配置 envRefs 引用）。
  * - 凭据不得放入 PI_* 命名空间（全量透传）。
  *
  * 因此 Leader env = 最小白名单基础 + PI_CODING_AGENT_DIR（构建 home）+
- * ZHIPU_API_KEY（Leader 模型 + amagi 转发）+ 桥接两变量（供 amagi 引用交付）+
+ * 模型密钥变量（Leader 模型 + amagi 转发）+ 桥接两变量（供 amagi 引用交付）+
  * Leader 转发扩展两变量 + amagi 自动行为开关。
  */
 
 import { existsSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import {
-  BUILD_MCP_TOKEN_ENV, BUILD_MCP_URL_ENV, ZHIPU_API_KEY_ENV,
-  type BuildRunSpec,
+  BUILD_MCP_TOKEN_ENV, BUILD_MCP_URL_ENV, BUILD_MODEL_KEY_ENVS,
+  type BuildModelProvider, type BuildRunSpec,
 } from './contracts.js';
 import type { BuildDirectories } from './agent-dir-config.js';
 import type { FrozenDispatchConfig } from './dispatch-guard.js';
@@ -46,8 +45,7 @@ export interface LeaderEnvInput {
   parentEnv: NodeJS.ProcessEnv;
   spec: BuildRunSpec;
   dirs: BuildDirectories;
-  /** zhipuai 密钥值（由调用方从应用配置解析；只进子进程 env，不落盘）。 */
-  zhipuApiKey: string;
+  apiKeys: Partial<Record<BuildModelProvider, string>>;
   /** 应用内部 API 回环地址与 Leader 运行令牌（转发扩展消费）。 */
   agentUrl: string;
   leaderRunToken: string;
@@ -102,8 +100,11 @@ export function buildLeaderEnv(input: LeaderEnvInput): NodeJS.ProcessEnv {
     env.PI_BUILD_ROLE_SKILL_REQUIRED = '1';
   }
 
-  // 模型密钥（Leader 直接使用；amagi 只转交给 zhipuai 子任务）
-  env[ZHIPU_API_KEY_ENV] = input.zhipuApiKey;
+  // amagi 根据任务模型只转交对应提供商的密钥。
+  for (const provider of Object.keys(BUILD_MODEL_KEY_ENVS) as BuildModelProvider[]) {
+    const key = input.apiKeys[provider];
+    if (key) env[BUILD_MODEL_KEY_ENVS[provider]] = key;
+  }
 
   // Leader 转发扩展（应用工具服务通道）
   env.FEISHU_SYNC_AGENT_URL = input.agentUrl;

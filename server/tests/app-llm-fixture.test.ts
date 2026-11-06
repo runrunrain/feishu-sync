@@ -33,6 +33,7 @@ import { buildDefaultLlmConfigForTest } from './helpers/llm-fixture.js';
 
 const TEST_TIMEOUT_MS = 90_000;
 const SENTINEL_KEY = 'test-sentinel-key-f3r03';
+const FIXTURE_IMAGE = { type: 'image', mimeType: 'image/png', data: 'iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAb0lEQVR4nO3PAQkAAAyEwO9feoshgnABdLep8QUNyPEFDcjxBQ3I8QUNyPEFDcjxBQ3IPanc8OLDQitxAAAAAElFTkSuQmCC' } as const;
 
 let fixtureRoot: string;
 let runtime: Awaited<ReturnType<PiRuntimeResolver['resolveRuntime']>> | null = null;
@@ -122,6 +123,11 @@ beforeAll(async () => {
       try { body = JSON.parse(Buffer.concat(chunks).toString('utf-8')); } catch { body = null; }
       llmRequests.push({ url: String(req.url), auth: req.headers.authorization, headers: { ...req.headers }, body });
       if (req.method === 'POST' && String(req.url).includes('chat/completions')) {
+        if (body?.model === 'fixture-text-only' && JSON.stringify(body.messages).includes('"image_url"')) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ code: '1210', message: "messages.content.type 参数非法，取值范围 ['text']" }));
+          return;
+        }
         if (llmMode === 'quota') {
           res.writeHead(429, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ code: '1113', message: `余额不足或无可用资源包: ${SENTINEL_KEY}` }));
@@ -190,6 +196,7 @@ interface SpawnOptions {
   runKind: 'discuss' | 'work';
   sharedHome?: string;
   anthropicAuth?: 'api-key' | 'auth-token';
+  preset?: { openAiModel: string; supportsImages?: boolean };
 }
 
 async function spawnFixturePi(options: SpawnOptions): Promise<PiRpcProcess> {
@@ -210,14 +217,14 @@ async function spawnFixturePi(options: SpawnOptions): Promise<PiRpcProcess> {
   });
   env.FEISHU_SYNC_AGENT_PI_PACKAGE_ROOT = runtime!.piPackageRoot!;
   if (!options.sharedHome) {
-    if (options.anthropicAuth) {
+    if (options.anthropicAuth || options.preset) {
       const llm = buildDefaultLlmConfigForTest();
       const provider = llm.providers![0];
       provider.apiKey = SENTINEL_KEY;
-      provider.protocol = 'anthropic-messages';
-      provider.openAiCompatBaseUrl = `http://127.0.0.1:${llmPort}`;
+      provider.protocol = options.anthropicAuth ? 'anthropic-messages' : 'openai-completions';
+      provider.openAiCompatBaseUrl = `http://127.0.0.1:${llmPort}${options.anthropicAuth ? '' : '/v1'}`;
       provider.anthropicAuthType = options.anthropicAuth;
-      provider.models[0].openAiModel = 'fixture-model';
+      Object.assign(provider.models[0], options.preset ?? { openAiModel: 'fixture-model' });
       const agent = buildDefaultAgentConfig(fixtureRoot);
       agent.model.source = 'app-llm';
       env.FEISHU_SYNC_AGENT_PROVIDER_JSON = buildAppLlmRunConfig(llm, agent)!.providerJson;
@@ -232,7 +239,7 @@ async function spawnFixturePi(options: SpawnOptions): Promise<PiRpcProcess> {
     ...(piExtensionPath() ? { extensionPath: piExtensionPath()! } : {}),
     tools: options.tools ?? [],
     ...(options.withSession ? { sessionDir: options.withSession.sessionDir, sessionId: options.withSession.sessionId } : { noSession: true }),
-    model: options.sharedHome ? 'fixture-local/fixture-model' : 'feishu-sync-llm/fixture-model',
+    model: options.sharedHome ? 'fixture-local/fixture-model' : `feishu-sync-llm/${options.preset?.openAiModel ?? 'fixture-model'}`,
     thinking: 'off',
     cwd: emptyCwd(),
     env,
@@ -260,6 +267,37 @@ for (const anthropicAuth of ['api-key', 'auth-token'] as const) {
 }
 
 describe('R03：app-llm provider 注入（真实 pi + 本地 OpenAI 兼容 fixture）', () => {
+  it('纯文本模型接受含图片的消息，切换模型时按请求过滤或恢复历史图片', async (ctx) => {
+    if (!piAvailable()) { ctx.skip(); return; }
+    const withSession = { sessionDir: path.join(fixtureRoot, 'vision-switch'), sessionId: 'vision-switch' };
+    const turns = [
+      { preset: { openAiModel: 'fixture-text-only' }, message: '先用纯文本模型上传', images: [FIXTURE_IMAGE], expectImage: false },
+      { preset: { openAiModel: 'fixture-model', supportsImages: true }, message: '切到视觉模型继续并发送图片', images: [FIXTURE_IMAGE], expectImage: true },
+      { preset: { openAiModel: 'fixture-text-only' }, message: '切回纯文本模型继续', expectImage: false },
+    ];
+    for (const { preset, message, images, expectImage } of turns) {
+      const start = llmRequests.length;
+      const rpc = await spawnFixturePi({ runKind: 'discuss', withSession, preset });
+      try {
+        expect((await rpc.prompt(message, { images, timeoutMs: 20_000 })).outcome).toBe('completed');
+        const requests = llmRequests.slice(start).filter((call) => call.body?.model === preset.openAiModel);
+        expect(requests).toHaveLength(expectImage ? 1 : 2);
+        const request = requests.at(-1);
+        const messages = JSON.stringify(request?.body.messages);
+        expect(messages).toContain('先用纯文本模型上传');
+        expect(messages).toContain(message);
+        expect(messages.match(/data:image\/png;base64,/g) ?? []).toHaveLength(expectImage ? 2 : 0);
+        expect(messages.includes('图片未发送给模型')).toBe(!expectImage);
+        if (!expectImage) {
+          const next = llmRequests.length;
+          expect((await rpc.prompt('继续对话')).outcome).toBe('completed');
+          expect(llmRequests.slice(next)).toHaveLength(1);
+          expect(JSON.stringify(llmRequests[next].body.messages)).not.toContain('image_url');
+        }
+      } finally { await rpc.terminate(); }
+    }
+  }, TEST_TIMEOUT_MS);
+
   it('图片实际进入模型请求，不被文本专用模型声明静默丢弃', async (ctx) => {
     if (!piAvailable()) { ctx.skip(); return; }
     llmMode = 'text';

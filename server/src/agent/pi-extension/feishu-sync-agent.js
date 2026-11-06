@@ -52,7 +52,7 @@ import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import { registerConfiguredModels } from './configured-models.js';
 
-/** @typedef {{ registerTool(tool: any): void; registerProvider(name: string, config: any): void; on(event: 'tool_call', handler: (event: any) => any): void; getAllTools(): any[]; }} ExtensionAPI */
+/** @typedef {{ registerTool(tool: any): void; registerProvider(name: string, config: any): void; on(event: string, handler: (event: any, ctx: any) => any): void; getAllTools(): any[]; }} ExtensionAPI */
 
 const AGENT_URL = process.env.FEISHU_SYNC_AGENT_URL || '';
 const RUN_TOKEN = process.env.FEISHU_SYNC_AGENT_RUN_TOKEN || '';
@@ -68,19 +68,62 @@ const AGENT_DIR_AT_LOAD = process.env.PI_CODING_AGENT_DIR || '';
 const APP_TASK_TOOL_FAMILY = new Set(['task_submit', 'task_query', 'task_resume', 'task_cancel']);
 const NATIVE_WORK = process.env.FEISHU_SYNC_AGENT_WORK_MODE === 'native';
 
-// Pi's authHeader adds Authorization but also leaves apiKey set, causing its
-// Anthropic adapter to send x-api-key as well. Delegate to that same adapter
-// with header-owned auth so a Bearer-only gateway sees just one credential.
-async function anthropicBearerStream(piRoot) {
-  if (!piRoot) throw new Error('无法定位 Pi 运行时，不能使用 Anthropic Bearer 认证');
+function withoutImageBlocks(messages) {
+  let changed = false;
+  const filtered = messages.map((message) => {
+    if (!Array.isArray(message.content) || !message.content.some((block) => block.type === 'image')) return message;
+    changed = true;
+    return { ...message, content: [
+      ...message.content.filter((block) => block.type !== 'image'),
+      { type: 'text', text: '[当前模型仅接收文本，本条消息中的图片未发送给模型。]' },
+    ] };
+  });
+  return changed ? filtered : messages;
+}
+
+function rejectsImageInput(message) {
+  return /(?:does not support|unsupported|not supported)[^\n.]{0,80}(?:image|vision)|(?:image|vision)[^\n.]{0,80}(?:not supported|unsupported)|不支持[^\n。]{0,40}(?:图片|图像)|content(?:\[\d+\])?\.type[^\n]{0,120}\[\s*['"]text['"]\s*\]/i.test(message ?? '');
+}
+
+async function appProviderStream(piRoot, api, bearerAuth) {
   const resolver = createRequire(path.join(piRoot, 'package.json'));
-  const searchPaths = resolver.resolve.paths('@earendil-works/pi-ai') ?? [];
-  const entry = searchPaths.map((dir) => path.join(dir, '@earendil-works', 'pi-ai', 'dist', 'api', 'anthropic-messages.js'))
-    .find((file) => fs.existsSync(file));
-  if (!entry) throw new Error('Pi 运行时缺少 Anthropic 适配器');
-  const { streamSimple } = await import(pathToFileURL(entry).href);
-  if (typeof streamSimple !== 'function') throw new Error('Pi 的 Anthropic 适配器不可用');
-  return (model, context, options) => streamSimple(model, context, { ...options, apiKey: undefined });
+  const dist = (resolver.resolve.paths('@earendil-works/pi-ai') ?? [])
+    .map((dir) => path.join(dir, '@earendil-works', 'pi-ai', 'dist'))
+    .find((dir) => fs.existsSync(path.join(dir, 'api', `${api}.js`)));
+  if (!dist) throw new Error('Pi 运行时缺少应用模型适配器');
+  const [{ streamSimple }, { createAssistantMessageEventStream }] = await Promise.all([
+    import(pathToFileURL(path.join(dist, 'api', `${api}.js`)).href),
+    import(pathToFileURL(path.join(dist, 'utils', 'event-stream.js')).href),
+  ]);
+  const textOnly = new Set();
+  return (model, context, options) => {
+    // Anthropic Bearer auth already has Authorization from Pi's authHeader.
+    const requestOptions = bearerAuth ? { ...options, apiKey: undefined } : options;
+    const messages = withoutImageBlocks(context.messages);
+    if (messages === context.messages) return streamSimple(model, context, requestOptions);
+    const textContext = { ...context, messages };
+    if (textOnly.has(model.id)) return streamSimple(model, textContext, requestOptions);
+    const initial = streamSimple(model, context, requestOptions);
+    const output = createAssistantMessageEventStream();
+    void (async () => {
+      let started = false;
+      for await (const event of initial) {
+        if (event.type === 'error' && !started && !options?.signal?.aborted && rejectsImageInput(event.error.errorMessage)) {
+          textOnly.add(model.id);
+          let retry;
+          try { retry = streamSimple(model, textContext, requestOptions); }
+          catch { output.push(event); return; }
+          for await (const retryEvent of retry) output.push(retryEvent);
+          output.end(await retry.result());
+          return;
+        }
+        if (event.type === 'start') started = true;
+        output.push(event);
+      }
+      output.end(await initial.result());
+    })();
+    return output;
+  };
 }
 
 function log(...args) {
@@ -274,8 +317,9 @@ export default async function feishuSyncAgentExtension(/** @type {ExtensionAPI} 
     const descriptor = JSON.parse(PROVIDER_JSON);
     const api = descriptor.api ?? 'openai-completions';
     if (!['openai-completions', 'openai-responses', 'anthropic-messages'].includes(api)) throw new Error('不支持的应用模型协议');
-    const streamSimple = api === 'anthropic-messages' && descriptor.authHeader === true
-      ? await anthropicBearerStream(piRoot) : undefined;
+    const bearerAuth = api === 'anthropic-messages' && descriptor.authHeader === true;
+    if (bearerAuth && !piRoot) throw new Error('无法定位 Pi 运行时，不能使用 Anthropic Bearer 认证');
+    const streamSimple = piRoot ? await appProviderStream(piRoot, api, bearerAuth) : undefined;
     pi.registerProvider('feishu-sync-llm', {
       name: 'feishu-sync LLM',
       baseUrl: descriptor.baseUrl,
@@ -289,7 +333,7 @@ export default async function feishuSyncAgentExtension(/** @type {ExtensionAPI} 
         name: model.name || model.id,
         reasoning: model.reasoning === true,
         ...(model.thinkingLevelMap ? { thinkingLevelMap: model.thinkingLevelMap } : {}),
-        input: ['text', 'image'],
+        input: model.supportsImages === false ? ['text'] : ['text', 'image'],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: model.contextWindow || 128000,
         maxTokens: model.maxTokens || 32768,
@@ -297,6 +341,15 @@ export default async function feishuSyncAgentExtension(/** @type {ExtensionAPI} 
     });
     log(`provider feishu-sync-llm registered (${(descriptor.models || []).length} model(s), baseUrl=${descriptor.baseUrl})`);
   }
+
+  // Pi's context hook changes only this model request. Keep the original image
+  // blocks in the session so switching back to a vision model restores them.
+  pi.on('context', ({ messages }, ctx) => {
+    const input = ctx.model?.input;
+    if (!Array.isArray(input) || input.includes('image')) return;
+    const filtered = withoutImageBlocks(messages);
+    if (filtered !== messages) return { messages: filtered };
+  });
 
   // 拉取本运行的工具规格并注册
   const specs = await apiGet('/api/agent-internal/tools');

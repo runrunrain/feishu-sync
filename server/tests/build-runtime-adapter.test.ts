@@ -131,7 +131,7 @@ async function prepare(root: string): Promise<{
     forwardingExtensionPath: path.join(root, 'forward.js'),
     bridgeScriptPath: bridge.bridgeArgs[0],
     agentUrl: 'http://127.0.0.1:39999',
-    resolveZhipuApiKey: () => 'k',
+    resolveModelApiKey: () => 'k',
     issueLeaderRunToken: () => 't',
     issueMcpBridgeCredentials: () => ({ url: 'http://127.0.0.1:39999/mcp', token: 'b' }),
     revokeGenerationCredentials: () => { revoked.count += 1; return true; },
@@ -296,7 +296,7 @@ describe('PiAmagiBuildRuntime（真实子进程，假 pi CLI fixture）', () => 
       amagiVersion: '2.21.31',
       knowledgeBaseRoot: path.join(root, 'raw'),
       outputRoot: path.join(root, 'std'),
-      hasZhipuApiKey: true,
+      hasModelApiKey: true,
       piVersion: '1.4.0',
     });
     expect(report.staticOk).toBe(true);
@@ -304,7 +304,7 @@ describe('PiAmagiBuildRuntime（真实子进程，假 pi CLI fixture）', () => 
     const failed = await runtime.probeWith({
       dataRoot: root, amagiVersion: '9.9.9',
       knowledgeBaseRoot: path.join(root, 'raw'), outputRoot: path.join(root, 'std'),
-      hasZhipuApiKey: true, piVersion: '1.4.0',
+      hasModelApiKey: true, piVersion: '1.4.0',
     }).catch((error: Error) => error);
     expect(failed).toBeInstanceOf(Error);
     expect((failed as Error).message).toContain('拒绝启用');

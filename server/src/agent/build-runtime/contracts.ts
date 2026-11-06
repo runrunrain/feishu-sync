@@ -11,7 +11,7 @@
  *   运行目录（`.../work`）；子任务经继承的 PI_CODING_AGENT_DIR 加载其中
  *   settings.json 声明的全部包，因此 settings.json 只声明版本化 amagi-pi。
  * - 模型静态声明在 agentDir models.json；provider 仅支持 amagi 密钥映射表
- *   内的 provider（当前构建 = zhipuai / $ZHIPU_API_KEY），凭据不落盘。
+ *   内的 provider 别名，各自引用环境变量中的凭据。
  * - `agentDirConfigHash` 只覆盖四个配置文件的规范 JSON，不含任何密钥值。
  */
 
@@ -52,10 +52,17 @@ export const KNOWN_AMAGI_KEY_MAPPED_PROVIDERS = [
   'kimi-coding', 'tbrouter', 'bailian-coding', 'dashscope', 'bailian',
 ] as const;
 
-/** 当前构建唯一受支持的模型 provider（设计 §3.2）。 */
+/** 旧构建及首个模型提供商使用的 Pi 别名。 */
 export const BUILD_MODEL_PROVIDER = 'zhipuai' as const;
-/** 该 provider 对应的 amagi 密钥环境变量（PROVIDER_KEY_MAP['zhipuai']）。 */
 export const ZHIPU_API_KEY_ENV = 'ZHIPU_API_KEY';
+
+/** Pi 内部别名。amagi 按别名只向子任务传递对应的密钥变量。 */
+export const BUILD_MODEL_KEY_ENVS = {
+  [BUILD_MODEL_PROVIDER]: ZHIPU_API_KEY_ENV,
+  openai: 'OPENAI_API_KEY',
+  deepseek: 'DEEPSEEK_API_KEY',
+} as const;
+export type BuildModelProvider = keyof typeof BUILD_MODEL_KEY_ENVS;
 
 /**
  * 子任务 MCP 桥接 server 名（agentDir mcp.json 登记 + amagi.json 路由引用）。
@@ -76,6 +83,8 @@ export type ThinkingLevel = (typeof VALID_THINKING_LEVELS)[number];
 
 /** models.json 单模型描述（静态声明输入；形状见 pi models-configuration.md）。 */
 export interface BuildModelDescriptor {
+  /** 旧检查点未记录别名时沿用 zhipuai。 */
+  provider?: BuildModelProvider;
   /** 模型 id（发给 API 的模型名，不含 provider 前缀）。 */
   id: string;
   /** OpenAI 兼容端点 baseUrl（来自应用 llm 配置，不含 key）。 */
@@ -346,8 +355,8 @@ export interface ProbeInput {
   /** 应用侧根：原始库、标准库（禁区核对用）。 */
   knowledgeBaseRoot: string;
   outputRoot: string;
-  /** zhipuai key 是否已在应用配置中可用（只传布尔，不传值）。 */
-  hasZhipuApiKey: boolean;
+  /** 模型密钥是否已在应用配置中可用（只传布尔，不传值）。 */
+  hasModelApiKey: boolean;
 }
 
 // ── 纯校验（供 spec 构造方与能力探测共用）────────────────────────────
@@ -399,8 +408,8 @@ export function validateBuildRunSpec(spec: BuildRunSpec): string[] {
   }
   for (const [key, model] of Object.entries(spec.models)) {
     if (!model) continue;
-    if (!model.startsWith(`${BUILD_MODEL_PROVIDER}/`)) {
-      issues.push(`models.${key}=${model} 不在受支持 provider（${BUILD_MODEL_PROVIDER}）下`);
+    if (!Object.hasOwn(BUILD_MODEL_KEY_ENVS, model.split('/')[0])) {
+      issues.push(`models.${key}=${model} 不在受支持 provider 下`);
     }
   }
   // 三角色模型均必填。实测（2026-11-01，真实 pi + amagi 2.21.31）：未写
@@ -412,14 +421,21 @@ export function validateBuildRunSpec(spec: BuildRunSpec): string[] {
     }
   }
   if (spec.modelDescriptors.length === 0) issues.push('modelDescriptors 为空');
-  const endpoints = new Set(spec.modelDescriptors.map((descriptor) => descriptor.baseUrl));
-  if (endpoints.size !== 1 || endpoints.has('')) {
-    issues.push('单一 zhipuai provider 的所有模型必须使用同一非空 baseUrl，不可静默路由到首个端点');
+  const endpoints = new Map<BuildModelProvider, string>();
+  const declaredModels = new Set<string>();
+  for (const descriptor of spec.modelDescriptors) {
+    const provider = descriptor.provider ?? BUILD_MODEL_PROVIDER;
+    if (!Object.hasOwn(BUILD_MODEL_KEY_ENVS, provider)) issues.push(`modelDescriptors 包含不支持的 provider：${provider}`);
+    const previous = endpoints.get(provider);
+    if (!descriptor.baseUrl || (previous !== undefined && previous !== descriptor.baseUrl)) {
+      issues.push(`provider ${provider} 的所有模型必须使用同一非空 baseUrl`);
+    }
+    endpoints.set(provider, descriptor.baseUrl);
+    declaredModels.add(`${provider}/${descriptor.id}`);
   }
-  const declaredModels = new Set(spec.modelDescriptors.map((descriptor) => descriptor.id));
   for (const [role, model] of Object.entries(spec.models)) {
     if (!model) continue;
-    const id = modelSpecPoolKey(model).split('/').slice(1).join('/');
+    const id = modelSpecPoolKey(model);
     if (!declaredModels.has(id)) issues.push(`models.${role} 未在 modelDescriptors 声明：${id}`);
   }
 

@@ -110,9 +110,9 @@ describe('validateBuildRunSpec', () => {
     expect(issues.join()).toContain('models.research');
   });
 
-  it('非 zhipuai provider 模型 → 拒绝（密钥映射限制）', () => {
+  it('未映射密钥的 provider 模型 → 拒绝', () => {
     const spec = makeSpec();
-    spec.models = { leader: 'zhipuai/glm-5.3', writer: 'openai/gpt-5', reviewer: 'zhipuai/glm-5.3' };
+    spec.models = { leader: 'zhipuai/glm-5.3', writer: 'unmapped/gpt-5', reviewer: 'zhipuai/glm-5.3' };
     const issues = validateBuildRunSpec(spec);
     expect(issues.join('\n')).toContain('models.writer');
     expect(issues.join('\n')).toContain('受支持 provider');

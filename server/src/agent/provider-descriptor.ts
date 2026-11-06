@@ -80,11 +80,12 @@ function appLlmRunConfigFromResolution(
 /** provider descriptor 的 models[0] 条目（冻结/实时共用同一构造，
  * diting F05-R：派发用冻结值重建时不与实时解析产生形态漂移）。 */
 function providerModelJsonEntry(
-  preset: Pick<ResolvedProviderModel, 'openAiModel' | 'contextWindow' | 'maxTokens' | 'reasoning' | 'thinkingLevels'>,
+  preset: Pick<ResolvedProviderModel, 'openAiModel' | 'contextWindow' | 'maxTokens' | 'reasoning' | 'thinkingLevels' | 'supportsImages'>,
   thinking: string,
 ): Record<string, unknown> {
   return {
     id: preset.openAiModel,
+    ...(preset.supportsImages === false ? { supportsImages: false } : {}),
     ...providerModelParameters(preset, { thinkingLevel: thinking as AgentConfig['model']['thinkingLevel'] }),
     ...(preset.thinkingLevels ? { thinkingLevelMap: Object.fromEntries(
       ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'].map((level) => [level, preset.thinkingLevels!.includes(level as typeof preset.thinkingLevels[number]) ? level : null]),

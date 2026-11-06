@@ -401,7 +401,7 @@ describe.skipIf(!PI_CLI || !SOURCE_AMAGI || !fs.existsSync(path.join(SOURCE_AMAG
         forwardingExtensionPath: EXTENSION_PATH,
         bridgeScriptPath: bridgeScript,
         agentUrl: 'http://127.0.0.1:9',
-        resolveZhipuApiKey: () => 'fixture-key',
+        resolveModelApiKey: () => 'fixture-key',
         issueLeaderRunToken: () => 'fixture-leader-token',
         issueMcpBridgeCredentials: () => ({ url: 'http://127.0.0.1:9', token: 'fixture-bridge-token' }),
         leaderTools: ['task_submit', 'task_query', 'task_control', 'task_resume', 'amagi_resource', 'kb_build_probe'],

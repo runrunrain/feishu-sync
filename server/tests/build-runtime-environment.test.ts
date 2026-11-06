@@ -24,7 +24,7 @@ function envFor(spec = makeSpec(), parent: NodeJS.ProcessEnv = {}) {
     },
     spec,
     dirs: DIRS,
-    zhipuApiKey: 'sk-test-key',
+    apiKeys: { zhipuai: 'sk-test-key' },
     agentUrl: 'http://127.0.0.1:32100',
     leaderRunToken: 'leader-token',
     mcpBridgeUrl: 'http://127.0.0.1:32100/api/agent-internal/mcp',
@@ -91,7 +91,7 @@ describe('buildLeaderEnv', () => {
     const env = envFor(makeSpec(), {});
     const full = buildLeaderEnv({
       parentEnv: { PATH: '/usr/bin' }, spec: makeSpec(), dirs: DIRS,
-      zhipuApiKey: 'k', agentUrl: 'http://127.0.0.1:1', leaderRunToken: 't',
+      apiKeys: { zhipuai: 'k' }, agentUrl: 'http://127.0.0.1:1', leaderRunToken: 't',
       mcpBridgeUrl: 'http://127.0.0.1:1/mcp', mcpBridgeToken: 'b',
       guardConfig, leaderTools: tools, guardModulePath: '/app/dist/agent/build-runtime/dispatch-guard.js',
     });
