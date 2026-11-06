@@ -330,6 +330,8 @@ export interface CloudNodeObservation {
   observationStatus: 'available' | 'restricted' | 'unavailable';
   /** 本次节点列表遍历直接观察到属于当前同步根；元数据查询不能证明归属。 */
   observedInWatchedTree?: boolean;
+  /** 本次 Wiki 详情查询确认节点仍指向该云文档。Drive 元数据不能证明 Wiki 权限。 */
+  wikiAccessVerified?: boolean;
 }
 
 export interface DocumentRecord {

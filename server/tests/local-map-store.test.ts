@@ -11,7 +11,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { LocalMapStore } from '../src/modules/local-map-store.js';
-import type { DocumentRecord } from '../src/types/index.js';
+import { ChangeDetector } from '../src/modules/change-detector.js';
+import type { LarkCliClient } from '../src/modules/lark-cli-client.js';
+import type { DocumentRecord, LarkCliNodeInfo } from '../src/types/index.js';
 
 const temporaryDirectories: string[] = [];
 
@@ -324,6 +326,70 @@ describe('LocalMapStore runtime schema', () => {
     })).toMatchObject({ syncState: 'synced' });
     expect(store.listFeishuPending()).toHaveLength(0);
     store.close();
+  });
+
+  it.each(['fast', 'full'] as const)('clears a recovered permission error after a cloud move in %s detection', async (mode) => {
+    const store = new LocalMapStore(createDatabasePath());
+    store.initialize();
+    const rootUrl = 'https://tenant.feishu.cn/wiki/root';
+    const node = (nodeToken: string, objToken: string, parentToken: string, hasChild = false): LarkCliNodeInfo => ({
+      node_token: nodeToken, obj_token: objToken, parent_node_token: parentToken, has_child: hasChild,
+      space_id: 'space', obj_type: 'slides', title: objToken, obj_edit_time: 100,
+    });
+    const root = node('root', 'root-object', '', true);
+    const parent = node('new-parent', 'parent-object', 'root', true);
+    const before = node('old-node', 'slides-object', 'root');
+    const after = node('new-node', 'slides-object', 'new-parent');
+    let moved = false;
+    let readable = false;
+    const lark = {
+      async getNode(ref: string) {
+        if (ref.endsWith('/root')) return root;
+        if (ref.endsWith('/new-parent')) return parent;
+        if (moved && readable && ref.endsWith('/new-node')) return after;
+        throw new Error('131006 permission denied');
+      },
+      async getDocumentMetas(requests: Array<{ docToken: string; docType: string }>) {
+        return { metas: requests.map((request) => ({ ...request, latestModifyTime: 100 })), failed: [] };
+      },
+      async listWikiNodes({ parentNodeToken }: { parentNodeToken: string }) {
+        if (parentNodeToken === 'root') return moved ? [parent] : [before];
+        return moved && parentNodeToken === parent.node_token ? [after] : [];
+      },
+    };
+    try {
+      store.upsertDocument(makeDocument({
+        objToken: before.obj_token, objType: 'slides', title: before.title, wikiNodeToken: before.node_token,
+        parentNodeToken: root.node_token, watchedRootId: root.node_token, watchedRootUrl: rootUrl,
+        originalLink: 'https://tenant.feishu.cn/wiki/old-node', spaceId: 'space',
+      }));
+      store.markDocumentSynced({ objToken: before.obj_token, syncedObjEditTime: 100, localMdPath: '/tmp/工作簿.md' });
+      store.recordFeishuPending({
+        objToken: before.obj_token, title: before.title, watchedRootId: root.node_token,
+        reasonCode: 'permission_denied', error: '无权限', suggestedResolution: '授权后重试', repairAction: 'grant_access',
+      });
+      const detector = new ChangeDetector(lark as unknown as LarkCliClient, store);
+      const detect = () => detector.detectChanges(rootUrl, { mode, forceFresh: true, bypassCooldown: true });
+      await detect();
+      expect(store.listFeishuPending()).toHaveLength(1);
+      expect(store.getDocumentByObjToken(before.obj_token)?.syncState).toBe('feishu_pending');
+
+      moved = true;
+      await detect();
+      expect(store.listFeishuPending()).toHaveLength(1);
+      expect(store.getDocumentByObjToken(before.obj_token)?.parentNodeToken).toBe(parent.node_token);
+
+      readable = true;
+      await detect();
+      expect(store.listFeishuPending()).toEqual([]);
+      expect(store.getDocumentByObjToken(before.obj_token)).toMatchObject({
+        wikiNodeToken: after.node_token, parentNodeToken: parent.node_token,
+        originalLink: 'https://tenant.feishu.cn/wiki/new-node', syncState: 'synced',
+        lastSyncErrorCode: null, localMdPath: '/tmp/工作簿.md', syncedObjEditTime: 100,
+      });
+    } finally {
+      store.close();
+    }
   });
 
   it('requeues a legacy millisecond synced baseline instead of hiding it as synced', () => {

@@ -879,14 +879,25 @@ export class LocalMapStore {
   recordCloudObservation(observation: CloudNodeObservation & { lastSeenAt: string }, options: { adoptCustomFolderId?: string } = {}): DocumentRecord {
     const current = this.getDocumentByObjToken(observation.objToken);
     const pending = this.getFeishuPendingByObjToken(observation.objToken);
-    // A Feishu-side repair is opt-in: routine polls keep the queue entry and
-    // its suppression state intact.  After the user clicks “处理后重新检测”,
-    // only a readable observation releases it; permission/unavailable states
-    // stay queued and do not become a fresh pending change again.
-    const keepFeishuPending = !!pending && !(
-      pending.recheckRequestedAt != null && observation.observationStatus === 'available'
-    );
-    if (pending && !keepFeishuPending) this.removeFeishuPending(observation.objToken);
+    const verifiedWiki = observation.observationStatus === 'available'
+      && observation.observedInWatchedTree === true && observation.wikiAccessVerified === true;
+    // Wiki detail can confirm a recovered permission and current location.
+    // Drive timestamps and cached metadata cannot release that failure.
+    const releasePending = pending != null && observation.observationStatus === 'available'
+      && (pending.recheckRequestedAt != null || (pending.reasonCode === 'permission_denied' && verifiedWiki));
+    const keepFeishuPending = pending != null && !releasePending;
+    let confirmedLink: string | null = null;
+    if (verifiedWiki && observation.wikiNodeToken && observation.watchedRootUrl && (
+      !current?.originalLink || current.wikiNodeToken !== observation.wikiNodeToken
+      || current.syncState === 'restricted' || pending?.reasonCode === 'permission_denied'
+    )) {
+      try {
+        const root = new URL(observation.watchedRootUrl);
+        if (root.protocol === 'https:' || root.protocol === 'http:') {
+          confirmedLink = new URL(`/wiki/${encodeURIComponent(observation.wikiNodeToken)}`, root.origin).href;
+        }
+      } catch { /* Keep the existing link when the root URL is invalid. */ }
+    }
     const nextState: SyncState = keepFeishuPending
       ? 'feishu_pending'
       : this.nextStateForObservation(current, observation);
@@ -899,13 +910,15 @@ export class LocalMapStore {
         parent_node_token, space_id, obj_edit_time,
         cloud_deleted, last_seen_at, observed_obj_edit_time,
         sync_state, watched_root_id, watched_root_url,
-        missing_complete_count, last_sync_error_code, has_child
-      ) VALUES (?, ?, ?, ?, '', '', '', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 0, NULL, ?)
+        missing_complete_count, last_sync_error_code, has_child, original_link
+      ) VALUES (?, ?, ?, ?, '', '', '', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 0, NULL, ?, ?)
       ON CONFLICT(obj_token) DO UPDATE SET
         wiki_node_token = COALESCE(excluded.wiki_node_token, documents.wiki_node_token),
         obj_type = COALESCE(excluded.obj_type, documents.obj_type),
         title = CASE WHEN excluded.title <> '' THEN excluded.title ELSE documents.title END,
-        parent_node_token = COALESCE(excluded.parent_node_token, documents.parent_node_token),
+        parent_node_token = CASE WHEN ? THEN excluded.parent_node_token
+          ELSE COALESCE(excluded.parent_node_token, documents.parent_node_token) END,
+        original_link = COALESCE(excluded.original_link, documents.original_link),
         space_id = COALESCE(excluded.space_id, documents.space_id),
         obj_edit_time = COALESCE(excluded.obj_edit_time, documents.obj_edit_time),
         observed_obj_edit_time = COALESCE(excluded.observed_obj_edit_time, documents.observed_obj_edit_time),
@@ -933,7 +946,7 @@ export class LocalMapStore {
     `);
 
     const observed = observation.observedObjEditTime ?? null;
-    stmt.run(
+    const write = () => stmt.run(
       observation.objToken,
       observation.wikiNodeToken || null,
       observation.objType,
@@ -948,8 +961,18 @@ export class LocalMapStore {
       observation.watchedRootId || null,
       observation.watchedRootUrl ?? null,
       observation.hasChild ? 1 : 0,
+      confirmedLink,
+      verifiedWiki ? 1 : 0,
       options.adoptCustomFolderId ?? null,
     );
+    if (releasePending) {
+      this.db.transaction(() => {
+        write();
+        this.removeFeishuPending(observation.objToken);
+      })();
+    } else {
+      write();
+    }
 
     // The row was inserted/updated in the same synchronous connection, so a
     // follow-up lookup is stable and gives callers the exact resulting state.

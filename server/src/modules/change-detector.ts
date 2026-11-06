@@ -237,6 +237,11 @@ const FAST_DETAIL_FALLBACK_MAX = 8;
  */
 const FAST_DETAIL_FALLBACK_RETRY_MS = 6 * 60 * 60 * 1000;
 
+function hasWikiPermissionBlock(record: DocumentRecord | null): boolean {
+  return record?.syncState === 'restricted'
+    || (record?.syncState === 'feishu_pending' && record.lastSyncErrorCode === 'permission_denied');
+}
+
 /**
  * A malformed/partial wiki node-list response may omit an intermediate
  * parent even though a child is visible. Repair only those missing ancestors
@@ -408,8 +413,8 @@ export class ChangeDetector {
     if (inFlight) return inFlight.then((result) => this.withoutBlocked(result));
 
     const detector = mode === 'fast'
-      ? this.detectMappedDocumentChanges(rootUrl, mediaGapScope)
-      : this.detectChangesUncached(rootUrl, mediaGapScope);
+      ? this.detectMappedDocumentChanges(rootUrl, mediaGapScope, forceFresh)
+      : this.detectChangesUncached(rootUrl, mediaGapScope, forceFresh);
     const pending = detector.then((result) => {
       this.detectResultCache.set(cacheKey, {
         result,
@@ -579,6 +584,7 @@ export class ChangeDetector {
   private async detectChangesUncached(
     rootUrl: string,
     mediaGapScope: MediaGapApiScope = 'local-only',
+    recheckPermissions = false,
   ): Promise<ChangeDetectionResult> {
     // 1. Get root node info (space_id + root_token + obj_edit_time)
     const rootInfo = await this.larkCliClient.getNode(rootUrl);
@@ -592,7 +598,7 @@ export class ChangeDetector {
     // obj_edit_time plus an explicit completeness signal). A partial tree is
     // still useful for observational/pending updates, but it is never safe
     // evidence for a deletion candidate.
-    const traversal = await this.traverseWikiSubtree(spaceId, rootToken, rootUrl);
+    const traversal = await this.traverseWikiSubtree(spaceId, rootToken, rootUrl, recheckPermissions);
     const cloudNodes = traversal.nodes;
 
     // 2a. Include the root node itself in the comparison set. The traversal
@@ -614,6 +620,7 @@ export class ChangeDetector {
       watchedRootUrl: rootUrl,
       observationStatus: 'available',
       observedInWatchedTree: true,
+      wikiAccessVerified: true,
     });
 
     // 3. Compare with local SQLite records (three-state)
@@ -672,6 +679,7 @@ export class ChangeDetector {
   private async detectMappedDocumentChanges(
     rootUrl: string,
     mediaGapScope: MediaGapApiScope = 'local-only',
+    recheckPermissions = false,
   ): Promise<ChangeDetectionResult> {
     const rootToken = this.rootTokenFromUrl(rootUrl);
     const tracked = (this.localMapStore.getAllDocuments() as DocumentRecord[])
@@ -684,7 +692,7 @@ export class ChangeDetector {
       console.info(
         '[ChangeDetector] Fast check has no local baseline; using one full topology reconciliation',
       );
-      return this.detectChangesUncached(rootUrl);
+      return this.detectChangesUncached(rootUrl, mediaGapScope, recheckPermissions);
     }
 
     const recordsByToken = new Map<string, DocumentRecord>();
@@ -773,11 +781,15 @@ export class ChangeDetector {
     // failure deliberately does not enter this loop: retrying all 200 nodes
     // individually after a rate-limit/outage would make the incident worse.
     const fallbackNow = Date.now();
-    const fallbackList = Array.from(fallbackTokens).filter((objToken) => {
+    // Permission recovery uses the current Wiki tree below, never the
+    // formerly inaccessible node address from SQLite.
+    const detailCandidates = Array.from(fallbackTokens).filter((objToken) =>
+      !hasWikiPermissionBlock(recordsByToken.get(objToken) ?? null));
+    const fallbackList = detailCandidates.filter((objToken) => {
       const retryAt = this.fastFallbackRetryAt.get(objToken) ?? 0;
       return retryAt <= fallbackNow;
     });
-    const cooldownSkipped = fallbackTokens.size - fallbackList.length;
+    const cooldownSkipped = detailCandidates.length - fallbackList.length;
     if (fallbackList.length > FAST_DETAIL_FALLBACK_MAX) {
       console.warn(
         `[ChangeDetector] Fast check has ${fallbackList.length} metadata exceptions; ` +
@@ -841,8 +853,13 @@ export class ChangeDetector {
     // where "only already-indexed nodes ever update"). Cost: one node-list
     // per parent node, plus one node-get per genuinely new node.
     const refreshedObservations = await this.refreshTopologyObservations(
-      rootUrl, rootToken, tracked, observations,
+      rootUrl, rootToken, tracked, observations, recheckPermissions,
     );
+    for (const observation of refreshedObservations) {
+      if (observation.wikiAccessVerified && observation.observedObjEditTime != null) {
+        failedTokens.delete(observation.objToken);
+      }
+    }
 
     const changedDocuments = await this.compareWithLocalRecords(refreshedObservations, {
       rootToken,
@@ -907,6 +924,7 @@ export class ChangeDetector {
     rootToken: string,
     tracked: DocumentRecord[],
     metadataObservations: CloudNodeObservation[],
+    recheckPermissions: boolean,
   ): Promise<CloudNodeObservation[]> {
     let spaceId = tracked.find((record) => record.spaceId)?.spaceId
       ?? this.spaceIdCache.get(rootUrl)
@@ -982,17 +1000,41 @@ export class ChangeDetector {
     }
 
     let addedCount = 0;
+    let permissionProbes = 0;
     for (const node of raw.nodes) {
       const record = recordsByToken.get(node.obj_token);
       if (record) {
+        const known = knownObservation(record);
+        let evidence: Partial<Pick<CloudNodeObservation, 'observationStatus' | 'observedObjEditTime' | 'wikiAccessVerified'>> = {};
+        if (hasWikiPermissionBlock(record)) {
+          // Retry against the node found at its current path. A failed lookup
+          // on the old node or parent must not suppress a relocated node.
+          const key = `wiki-permission:${rootToken}/${node.node_token}/${node.parent_node_token ?? ''}`;
+          if (permissionProbes < FAST_DETAIL_FALLBACK_MAX && (recheckPermissions || (this.fastFallbackRetryAt.get(key) ?? 0) <= Date.now())) {
+            permissionProbes += 1;
+            const detail = await this.fetchNodeDetail(spaceId, node.node_token, rootUrl);
+            if (detail.node?.obj_token === node.obj_token && detail.node.node_token === node.node_token) {
+              this.fastFallbackRetryAt.delete(key);
+              evidence = { observationStatus: 'available', observedObjEditTime: detail.node.obj_edit_time ?? known.observedObjEditTime, wikiAccessVerified: true };
+            } else {
+              this.fastFallbackRetryAt.set(key, Date.now() + OBJ_EDIT_TIME_REFRESH_TTL_MS);
+              evidence = { observationStatus: detail.observationStatus === 'restricted' ? 'restricted' : 'unavailable', observedObjEditTime: null };
+            }
+          } else {
+            evidence = { observationStatus: 'unavailable', observedObjEditTime: null };
+          }
+        }
         recordTopologyObservation({
-          ...knownObservation(record),
+          ...known,
+          ...evidence,
           wikiNodeToken: node.node_token,
           objType: this.normalizeObjType(node.obj_type),
           cloudObjType: this.cloudObjTypeOf(node.obj_type),
           title: node.title,
           spaceId: node.space_id ?? spaceId,
           parentNodeToken: node.parent_node_token ?? null,
+          watchedRootId: rootToken,
+          watchedRootUrl: rootUrl,
           hasChild: node.has_child,
           observedInWatchedTree: true,
         });
@@ -1017,6 +1059,7 @@ export class ChangeDetector {
           ? 'available'
           : detail.observationStatus,
         observedInWatchedTree: true,
+        wikiAccessVerified: info?.obj_token === node.obj_token && info.node_token === node.node_token,
       });
       addedCount += 1;
     }
@@ -1068,6 +1111,7 @@ export class ChangeDetector {
     spaceId: string,
     rootToken: string,
     watchedRootUrl: string,
+    recheckPermissions = false,
   ): Promise<TraversalResult> {
     const rawTraversal = await this.bfsCollectRawNodes(spaceId, rootToken);
     const enriched: CloudNodeObservation[] = [];
@@ -1082,6 +1126,7 @@ export class ChangeDetector {
       let objEditTime: number | null;
       let parentNodeToken = raw.parent_node_token ?? null;
       let observationStatus: CloudNodeObservation['observationStatus'] = 'available';
+      let wikiAccessVerified = false;
 
       // TTL guard for the fingerprint short-circuit (diagnosis §2.2 根因 A
       // fix). The original short-circuit reused the local obj_edit_time
@@ -1097,12 +1142,13 @@ export class ChangeDetector {
       const ttlExpired = now - lastRefresh > OBJ_EDIT_TIME_REFRESH_TTL_MS;
 
       const observedObjectTime = observedObjectTimes.get(raw.obj_token);
-      if (observedObjectTime !== undefined) {
+      if (observedObjectTime !== undefined && !hasWikiPermissionBlock(cached)) {
         objEditTime = observedObjectTime;
-      } else if (cached?.syncState === 'restricted' && !ttlExpired) {
+      } else if (cached && hasWikiPermissionBlock(cached) && cached.wikiNodeToken === raw.node_token
+        && (cached.parentNodeToken ?? null) === (raw.parent_node_token ?? null) && !ttlExpired && !recheckPermissions) {
         objEditTime = null;
         observationStatus = 'restricted';
-      } else if (fingerprintUnchanged && cached?.objEditTime != null && !ttlExpired) {
+      } else if (fingerprintUnchanged && cached?.objEditTime != null && !hasWikiPermissionBlock(cached) && !ttlExpired) {
         // Fingerprint hit AND TTL fresh: reuse cached obj_edit_time, skip node-get.
         objEditTime = cached.objEditTime;
       } else {
@@ -1116,6 +1162,7 @@ export class ChangeDetector {
         this.lastObjEditTimeRefreshAt.set(raw.obj_token, now);
         if (detail.node) {
           objEditTime = detail.node.obj_edit_time;
+          wikiAccessVerified = detail.node.obj_token === raw.obj_token && detail.node.node_token === raw.node_token;
           // Prefer freshly-fetched parent_node_token (more authoritative
           // than +node-list, in case of recent moves) when present.
           if (detail.node.parent_node_token) {
@@ -1145,6 +1192,7 @@ export class ChangeDetector {
         watchedRootUrl,
         observationStatus,
         observedInWatchedTree: true,
+        wikiAccessVerified,
       });
     }
 
@@ -1289,6 +1337,7 @@ export class ChangeDetector {
     if (!cached) return false;
     if (cached.objEditTime == null) return false;
     if (cached.title !== raw.title) return false;
+    if (cached.wikiNodeToken !== raw.node_token || (cached.parentNodeToken ?? null) !== (raw.parent_node_token ?? null)) return false;
     // has_child not stored on documents table; use obj_token equality
     // + title equality as the fingerprint (obj_token changes imply a
     // different doc entirely).

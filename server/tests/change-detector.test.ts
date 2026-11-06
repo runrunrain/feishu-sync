@@ -1780,14 +1780,19 @@ describe('ChangeDetector fingerprint short-circuit TTL (change-detection-ttl, §
       bypassCooldown: true,
     });
     expect(failingLark.getNodeUrls).toEqual([TTL_ROOT_URL, TTL_CHILD_NODE_GET_URL]);
-    // Failure still recorded → next call within TTL must NOT re-attempt.
+    // Let the result cache expire without expiring the permission retry TTL.
+    // A scheduled scan still checks the root and skips the denied child.
     failingLark.getNodeUrls = [];
-
-    await detector.detectChanges(TTL_ROOT_URL, {
-      forceFresh: true,
-      bypassCooldown: true,
-    });
-    expect(failingLark.getNodeUrls).toEqual([TTL_ROOT_URL]);
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 121_000);
+    try {
+      await detector.detectChanges(TTL_ROOT_URL);
+      expect(failingLark.getNodeUrls).toEqual([TTL_ROOT_URL]);
+      failingLark.getNodeUrls = [];
+      await detector.detectChanges(TTL_ROOT_URL, { forceFresh: true, bypassCooldown: true });
+      expect(failingLark.getNodeUrls).toEqual([TTL_ROOT_URL, TTL_CHILD_NODE_GET_URL]);
+    } finally {
+      clock.mockRestore();
+    }
   });
 });
 
