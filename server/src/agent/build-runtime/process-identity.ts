@@ -28,16 +28,17 @@
  *    前提不可验证（探测失效/sid 不匹配）→ 不封存、零信号。
  *
  * 能力边界（如实）：
- * - Windows 无 ps/libproc/procfs → 全部探测不可用，返回空结果；调用方对
- *   无法证明的个体只能 unconfirmed，绝不发信号（不是沙箱，是能力诚实）。
+ * - Windows 用 CIM 读取 PID 和父 PID。无出生令牌或进程组证明，存活或
+ *   无法证明已退出的个体仍按 unconfirmed 处理。
  * - python3 缺失（未装 CLT）→ darwin 出生令牌不可得 → 同上降级。
  * - 本模块只读探测 + 可注入信号出口；不做任务状态调度。
  */
 
 import { execFile } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import { win32 } from 'node:path';
 
-/** ps 进程表行（POSIX；etime 秒粒度；comm 为可执行名）。 */
+/** 进程表行。Windows 只提供 PID 和父 PID，pgid/uid 为 0。 */
 export interface ProcTableRow {
   pid: number;
   ppid: number;
@@ -70,10 +71,16 @@ export type BirthToken = string;
 
 const PS_TIMEOUT_MS = 5_000;
 const BIRTH_TIMEOUT_MS = 2_000;
+const WINDOWS_PROCESS_TABLE = `
+$ErrorActionPreference = 'Stop'
+$processes = @(Get-CimInstance -ClassName Win32_Process -Property ProcessId,ParentProcessId)
+if ($PID -notin $processes.ProcessId) { throw 'Incomplete process table' }
+foreach ($proc in $processes) { '{0} {1}' -f $proc.ProcessId, $proc.ParentProcessId }
+`;
 
 function defaultExecFile(file: string, args: string[], opts: { timeout: number; maxBuffer: number }): Promise<{ stdout: string }> {
   return new Promise((resolve, reject) => {
-    execFile(file, args, { timeout: opts.timeout, maxBuffer: opts.maxBuffer, encoding: 'utf-8' }, (error, stdout) => {
+    execFile(file, args, { ...opts, encoding: 'utf-8', windowsHide: true }, (error, stdout) => {
       if (error) reject(error);
       else resolve({ stdout: String(stdout) });
     });
@@ -105,10 +112,34 @@ export function parsePsTable(output: string): ProcTableRow[] {
   return rows;
 }
 
-/** 全量进程表快照（POSIX）。不可用 → null（不猜测）。 */
+async function snapshotWindowsProcessTable(deps: ProcessIdentityDeps): Promise<ProcTableRow[] | null> {
+  try {
+    const powerShell = win32.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+    const { stdout } = await (deps.execFileImpl ?? defaultExecFile)(
+      powerShell, ['-NoProfile', '-NonInteractive', '-Command', WINDOWS_PROCESS_TABLE],
+      { timeout: PS_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024 },
+    );
+    const rows: ProcTableRow[] = [];
+    const pids = new Set<number>();
+    for (const line of stdout.trim().split(/\r?\n/)) {
+      const match = /^(\d+) (\d+)$/.exec(line);
+      if (!match) return null;
+      const pid = Number(match[1]);
+      const ppid = Number(match[2]);
+      if (pid > 0xffffffff || ppid > 0xffffffff || pids.has(pid)) return null;
+      pids.add(pid);
+      rows.push({ pid, ppid, pgid: 0, uid: 0 });
+    }
+    return rows;
+  } catch {
+    return null;
+  }
+}
+
+/** 全量进程表快照。不可用 → null（不猜测）。 */
 export async function snapshotProcessTable(deps: ProcessIdentityDeps = {}): Promise<ProcTableRow[] | null> {
   const platform = deps.platform ?? process.platform;
-  if (platform === 'win32') return null;
+  if (platform === 'win32') return snapshotWindowsProcessTable(deps);
   const runPs = deps.runPs ?? (async (): Promise<string | null> => {
     try {
       const { stdout } = await (deps.execFileImpl ?? defaultExecFile)(

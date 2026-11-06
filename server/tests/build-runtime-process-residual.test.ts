@@ -14,7 +14,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { appendProcessLedgerEntry, commandFingerprint, markLedgerExit, patchLedgerBirthToken, readProcessLedger } from '../src/agent/build-runtime/process-ledger.js';
 import { reconcileResidualProcesses, scanLaunchAnchors, listBuildHomeDirs, findAliveLedgerLeaders, type AnchorRun, type ResidualDeps } from '../src/agent/build-runtime/process-residual.js';
-import { readBirthIdentities, type ProcTableRow } from '../src/agent/build-runtime/process-identity.js';
+import { readBirthIdentities, snapshotProcessTable, type ProcTableRow } from '../src/agent/build-runtime/process-identity.js';
 
 function tmpRoot(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'residual-test-'));
@@ -184,14 +184,14 @@ describe('reconcileResidualProcesses 判定矩阵', () => {
     expect(fixture.signals).toHaveLength(0); // 零信号：pgid+可执行名不构成本次启动身份
   });
 
-  it('进程表不可得（ps 失败/Windows）→ 全部 unconfirmed，不发信号', async () => {
+  it('进程表不可得（ps 或 CIM 探测失败）→ 全部 unconfirmed，不发信号', async () => {
     for (const platform of ['win32', 'darwin'] as const) {
       const fixture = makeFixture({ platform });
       writeAnchor(fixture, 't-x', { rootPid: 5006, pgid: 5006, rootIdentityToken: 'darwin:1:1' });
       if (platform === 'darwin') {
         fixture.deps.runPs = async () => null; // ps 失败
       } else {
-        fixture.deps.runPs = async () => { throw new Error('unexpected'); };
+        fixture.deps.execFileImpl = async () => { throw new Error('CIM unavailable'); };
       }
       const outcome = await reconcileResidualProcesses({ homeDir: fixture.homeDir, buildRoot: fixture.buildRoot, leaderPids: LEADER_PIDS() }, { reap: true }, fixture.deps);
       expect(outcome.state).toBe('unconfirmed');
@@ -199,6 +199,29 @@ describe('reconcileResidualProcesses 判定矩阵', () => {
       expect(fixture.signals).toHaveLength(0);
     }
   });
+
+  it.each([
+    { rows: '0 0\r\n4 0\r\n', state: 'confirmed', pending: [] },
+    { rows: '0 0\r\n4 0\r\n5006 4\r\n', state: 'unconfirmed', pending: [5006] },
+    { rows: '0 0\r\n4 0\r\n5008 5006\r\n', state: 'unconfirmed', pending: [5008] },
+    { rows: '0 0\r\n4 0\r\ntruncated', state: 'unconfirmed', pending: [5006] },
+  ])('Windows 进程表对账 $pending', async ({ rows, state, pending }) => {
+    const fixture = makeFixture({ platform: 'win32' });
+    writeAnchor(fixture, 't-windows', { rootPid: 5006 });
+    fixture.deps.execFileImpl = async () => ({ stdout: rows });
+    const outcome = await reconcileResidualProcesses(
+      { homeDir: fixture.homeDir, buildRoot: fixture.buildRoot, leaderPids: LEADER_PIDS() }, { reap: true }, fixture.deps,
+    );
+    expect(outcome.state).toBe(state);
+    expect(outcome.children.filter(item => item.verdict === 'unconfirmed').map(item => item.pid)).toEqual(pending);
+    expect(fixture.signals).toHaveLength(0);
+  });
+
+  it.skipIf(process.platform !== 'win32')('Windows CIM 原生快照包含当前进程', async () => {
+    expect(await snapshotProcessTable()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ pid: process.pid, ppid: process.ppid }),
+    ]));
+  }, 10_000);
 
   it('R2-F10-01：登记集非空时锚点 leaderPid 不属本构建 → 归属不明如实 unconfirmed（不纳入对账与信号集合）', async () => {
     const fixture = makeFixture();

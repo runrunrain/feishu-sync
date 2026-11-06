@@ -900,6 +900,21 @@ export class BuildRuntimeHost {
     };
   }
 
+  private async nudgeLeader(rpc: PiRpcProcess | null, message: string): Promise<void> {
+    if (!rpc || rpc.isExited()) {
+      throw new ToolError('build_runtime_unavailable', 'Leader 进程不可达，无法注入收口提示', 503);
+    }
+    // 空闲时 follow_up 只入队。启动受监督的新轮次，沿用 prompt 的超时与失败处理。
+    // 若后台通知已抢先开启一轮，由 Pi 按实时状态开始 prompt 或排到该轮之后。
+    if (rpc.hasActiveRound()) {
+      const response = await rpc.sendCommand('prompt', { message, streamingBehavior: 'followUp' }, 15_000);
+      if (!response.success) throw new Error(response.error ?? 'Leader 收口提示被拒绝');
+      return;
+    }
+    const outcome = await rpc.prompt(message, { streamingBehavior: 'followUp' });
+    if (outcome.outcome === 'failed') throw new Error(outcome.error?.message ?? 'Leader 收口轮次失败');
+  }
+
   /** Leader 阶段主入口（探测→spec→账本/上下文→启动/续接→监督→收尾）。 */
   async runLeaderPhase(input: LeaderBuildInput): Promise<LeaderRunOutcome> {
     if (this.sessions.has(input.buildId)) {
@@ -1101,13 +1116,7 @@ export class BuildRuntimeHost {
         return session.adapter.cancel(binding ?? session.binding!);
       },
       events: (): AsyncIterable<RuntimeEvent> => asAsyncIterable(queue[Symbol.asyncIterator]()),
-      nudge: async (binding: RuntimeBinding | null, message: string): Promise<void> => {
-        const rpc = binding ? session.adapter.getRpcProcess(binding) : null;
-        if (!rpc || rpc.isExited()) {
-          throw new ToolError('build_runtime_unavailable', 'Leader 进程不可达，无法注入收口提示', 503);
-        }
-        await rpc.sendCommand('follow_up', { message }, 15_000);
-      },
+      nudge: (binding, message) => this.nudgeLeader(binding ? session.adapter.getRpcProcess(binding) : null, message),
       currentRuntimeFreeze: freeze,
       // F10-R3：残留对账回调（prepareResume 一切模式的新鲜对账用）——构建级跨
       // epoch 对账：binding 可空（应用硬崩未落 binding 但账本/旧 epoch 目录

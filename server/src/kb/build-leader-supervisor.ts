@@ -745,13 +745,12 @@ export class BuildLeaderSupervisor {
     if (Date.now() - this.lastActivityAt < this.idleGraceMs) return null;
     if (!this.state.idleRemindedAt) {
       this.state.idleRemindedAt = new Date().toISOString();
-      // 提示只陈述现状，不指定下一项任务（设计 §5.4）。
-      const message = '当前没有运行中的轮次，已知子任务均已收到完成通知，构建尚未完成。请核对候选与阻断项：可申请发布具体候选版本，或经工具报告无法完成的原因。';
+      const message = '构建尚未完成，当前没有运行中的轮次，已知子任务均已收到完成通知。请查看 build_checkpoint(action=status) 和 build_issues_list，处理仍未解决的阻断项。候选与发布条件均未变化时，勿重复提交被拒的发布申请。阻断解除后可申请发布；无法继续时保存检查点并报告原因。';
       this.lastActivityAt = Date.now();
       void this.cb.nudge(this.activeBinding, message).catch((error) => {
-        this.cb.log('warn', `收口提示注入失败：${error instanceof Error ? error.message : String(error)}`);
+        this.cb.log('warn', `Leader 收口轮次失败：${error instanceof Error ? error.message : String(error)}`);
       });
-      this.cb.log('warn', 'Leader 空闲宽限已过，已发送一次收口提示；再次空闲将按 leader_idle 结束');
+      this.cb.log('warn', 'Leader 空闲宽限已过，已请求一次收口轮次；再次空闲将按 leader_idle 结束');
       this.persist(true);
       return null;
     }

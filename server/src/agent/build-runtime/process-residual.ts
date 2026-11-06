@@ -581,7 +581,7 @@ export async function reconcileResidualProcesses(
         findings.push({
           taskId: individual.source === 'anchor' ? individual.anchor!.taskId : individual.ledger?.taskId ?? null,
           pid, source: individual.source, verdict: 'unconfirmed', proof: 'none',
-          detail: '进程表不可得（ps 失败或平台不支持），无法证明退出或归属',
+          detail: '系统进程表探测失败，无法证明退出或归属',
         });
       }
     }
@@ -590,6 +590,19 @@ export async function reconcileResidualProcesses(
   }
   const rowOf = new Map<number, ProcTableRow>();
   for (const row of table) rowOf.set(row.pid, row);
+
+  if ((deps.platform ?? process.platform) === 'win32') {
+    // Windows 保留已退出父进程的 PID。父 PID 只用于发现可能的遗留进程，不能证明归属。
+    for (const row of table) {
+      const parent = claimsByPid.get(row.ppid)?.[0];
+      if (!parent || rowOf.has(row.ppid)) continue;
+      findings.push({
+        taskId: parent.anchor?.taskId ?? parent.ledger?.taskId ?? null,
+        pid: row.pid, source: parent.source, verdict: 'unconfirmed', proof: 'none',
+        detail: `登记进程 pid=${row.ppid} 已退出，但仍有进程引用该父 PID，无法排除任务后代`,
+      });
+    }
+  }
 
   // 只对存活个体探测出生令牌（分类用；此后每个信号前仍会现场重采）
   const tokenCandidates = [...claimsByPid.keys()].filter((pid) => rowOf.has(pid));

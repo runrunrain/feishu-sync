@@ -431,6 +431,24 @@ describe('BuildRuntimeHost 探测门禁', () => {
     });
   }
 
+  it('收口提示在空闲时启动新轮次，已有轮次时交由 Pi 投递，拒绝时报告失败', async () => {
+    const rpc = {
+      isExited: () => false,
+      hasActiveRound: vi.fn().mockReturnValue(false),
+      prompt: vi.fn().mockResolvedValue({ outcome: 'completed' }),
+      sendCommand: vi.fn().mockResolvedValue({ success: false, error: 'prompt rejected' }),
+    };
+    const host = BuildRuntimeHost.prototype as unknown as {
+      nudgeLeader: (process: typeof rpc, message: string) => Promise<void>;
+    };
+    await host.nudgeLeader(rpc, '核对阻断项');
+    expect(rpc.prompt).toHaveBeenCalledWith('核对阻断项', { streamingBehavior: 'followUp' });
+    expect(rpc.sendCommand).not.toHaveBeenCalled();
+    rpc.hasActiveRound.mockReturnValue(true);
+    await expect(host.nudgeLeader(rpc, '核对阻断项')).rejects.toThrow('prompt rejected');
+    expect(rpc.sendCommand).toHaveBeenCalledWith('prompt', { message: '核对阻断项', streamingBehavior: 'followUp' }, 15_000);
+  });
+
   it('statusDto：运行时未就绪如实报告（不 503、不假装可用）', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kb-host-status-'));
     try {
