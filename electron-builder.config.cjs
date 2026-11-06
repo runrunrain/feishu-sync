@@ -177,6 +177,7 @@ module.exports = {
     artifactName: "FeishuSync-Setup-${version}-${arch}.${ext}",
   } : undefined,
   nsis: {
+    include: "build/installer.nsh",
     oneClick: false,
     perMachine: false,
     allowToChangeInstallationDirectory: true,
