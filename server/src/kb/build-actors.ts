@@ -276,6 +276,12 @@ export interface AssignOutputsInput {
   ownerTaskId: string;
   /** 显式转移：撤销 ownerTaskId 对同目标的旧分配（supersedes 链） */
   supersedes?: boolean;
+  revisionFallback?: RevisionFallback;
+}
+
+export interface RevisionFallback {
+  kind: 'session_unavailable' | 'resume_failed' | 'scope_changed';
+  reason: string;
 }
 
 export class BuildActorStore {
@@ -570,6 +576,32 @@ export class BuildActorStore {
   // 输出分配（§4.2：同一目标同时只有一个有效分配）
   // ------------------------------------------------------------------
 
+  /** A fresh, scoped blocking review should go back to the last writer's chain. */
+  revisionContinuationFor(docPath: string): { path: string; authorTaskId: string; reviewId: string } | null {
+    const lastAuthor = this.lastAuthorByPath.get(docPath);
+    if (!lastAuthor) return null;
+    const holder = this.activeAssignmentFor(docPath);
+    // A different holder has already been explicitly given the revision.
+    if (holder && !this.ancestryOf(holder.ownerTaskId).has(lastAuthor)) return null;
+    const authorTaskId = holder?.ownerTaskId ?? lastAuthor;
+    const actor = this.actors.get(authorTaskId);
+    if (actor?.status !== 'confirmed' || actor.generation !== this.generation || !this.roleToolset(actor.role)?.canWriteDocs) return null;
+    const review = [...this.reviews.values()].reverse().find((item) => item.generation === this.generation
+      && item.status === 'valid' && item.scopePaths?.includes(docPath));
+    if (!review || review.scopePaths?.length !== 1 || (review.verdict !== 'needs_revision' && review.verdict !== 'fail')
+      || !review.issues.some((issue) => issue.severity === 'blocking')) return null;
+    return { path: docPath, authorTaskId, reviewId: review.reviewId };
+  }
+
+  private requireRevisionFallback(
+    continuation: NonNullable<ReturnType<BuildActorStore['revisionContinuationFor']>>,
+    fallback?: RevisionFallback,
+  ): void {
+    if (fallback) return;
+    throw new BuildActorError('kb_revision_resume_required',
+      `文档 ${continuation.path} 的审查 ${continuation.reviewId} 要求修订。请用 task_resume 续接作者 ${continuation.authorTaskId}，保留原分配供继承。若原会话不可用、续接失败或必须重拆范围，请提供 revisionFallback.kind 和具体原因。`, 409);
+  }
+
   assignOutputs(input: AssignOutputsInput): OutputAssignment {
     if (!Array.isArray(input.targets) || input.targets.length === 0 || input.targets.length > 200) {
       throw new BuildActorError('invalid_request', 'targets 必须是 1..200 项的数组');
@@ -582,6 +614,16 @@ export class BuildActorStore {
     const owner = this.requireConfirmedActor(input.ownerTaskId, undefined);
     const targetKind = input.targetKind ?? 'doc';
     const normalized = [...new Set(input.targets)];
+    const revisionTransfers: Array<NonNullable<ReturnType<BuildActorStore['revisionContinuationFor']>>> = [];
+    if (targetKind === 'doc') {
+      const ownerChain = this.ancestryOf(owner.nativeTaskId);
+      for (const target of normalized) {
+        const continuation = this.revisionContinuationFor(target);
+        if (!continuation || ownerChain.has(continuation.authorTaskId)) continue;
+        this.requireRevisionFallback(continuation, input.revisionFallback);
+        revisionTransfers.push(continuation);
+      }
+    }
     // 冲突检查：目标已被其他活动任务持有 → 返回冲突与持有者（§4.2）。
     // F03：family 目标统一按 `family:<familyKey>` 归一化探测——targets 存储
     // 已剥前缀，此前用剥前缀 key 探测导致同族分配互相不报冲突（归一化
@@ -621,20 +663,34 @@ export class BuildActorStore {
     };
     this.assignments.set(assignment.assignmentId, assignment);
     this.appendEvent({ source: 'tool-service', type: 'output_assigned', taskId: input.ownerTaskId, payload: { assignmentId: assignment.assignmentId, targets: normalized, targetKind, superseded: supersededIds } });
+    if (input.revisionFallback && revisionTransfers.length) {
+      this.appendEvent({ source: 'tool-service', type: 'revision_reassigned', taskId: owner.nativeTaskId,
+        payload: { targets: revisionTransfers, fallback: input.revisionFallback } });
+    }
     this.persist();
     return assignment;
   }
 
-  revokeOutputs(selector: { assignmentId?: string; ownerTaskId?: string }): number {
+  revokeOutputs(selector: { assignmentId?: string; ownerTaskId?: string; revisionFallback?: RevisionFallback }): number {
+    const matching = [...this.assignments.values()].filter((assignment) => assignment.status === 'active'
+      && (selector.assignmentId ? assignment.assignmentId === selector.assignmentId : assignment.ownerTaskId === selector.ownerTaskId));
+    // Validate all targets before touching any of the assignments.
+    const revisionTransfers = matching.flatMap((assignment) => assignment.targetKind === 'doc'
+      ? assignment.targets.flatMap((target) => {
+        const continuation = this.revisionContinuationFor(target);
+        return continuation ? [continuation] : [];
+      }) : []);
+    for (const continuation of revisionTransfers) this.requireRevisionFallback(continuation, selector.revisionFallback);
     let count = 0;
-    for (const assignment of this.assignments.values()) {
-      if (assignment.status !== 'active') continue;
-      if (selector.assignmentId ? assignment.assignmentId === selector.assignmentId : assignment.ownerTaskId === selector.ownerTaskId) {
-        assignment.status = 'revoked';
-        assignment.revokedAt = nowIso();
-        count += 1;
-        this.appendEvent({ source: 'tool-service', type: 'output_revoked', taskId: assignment.ownerTaskId, payload: { assignmentId: assignment.assignmentId, targets: assignment.targets } });
-      }
+    for (const assignment of matching) {
+      assignment.status = 'revoked';
+      assignment.revokedAt = nowIso();
+      count += 1;
+      this.appendEvent({ source: 'tool-service', type: 'output_revoked', taskId: assignment.ownerTaskId, payload: { assignmentId: assignment.assignmentId, targets: assignment.targets } });
+    }
+    if (selector.revisionFallback && revisionTransfers.length) {
+      this.appendEvent({ source: 'tool-service', type: 'revision_output_revoked',
+        payload: { targets: revisionTransfers, fallback: selector.revisionFallback } });
     }
     if (selector.assignmentId && count === 0) throw new BuildActorError('invalid_request', `分配不存在或已失效: ${selector.assignmentId}`, 404);
     this.persist();

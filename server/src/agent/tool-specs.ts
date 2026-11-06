@@ -1098,16 +1098,28 @@ export const BUILD_MANIFEST_SPEC: AgentToolSpec = {
   },
 };
 
+const revisionFallbackSpec = {
+  type: 'object',
+  description: '同篇阻断修订需要换作者时，记录无法续接或重拆的原因。',
+  properties: {
+    kind: { type: 'string', enum: ['session_unavailable', 'resume_failed', 'scope_changed'] },
+    reason: { type: 'string', minLength: 1, maxLength: 600, description: '原会话不可用、续接失败或必须重拆的具体情况' },
+  },
+  required: ['kind', 'reason'],
+  additionalProperties: false,
+};
+
 export const BUILD_ASSIGN_OUTPUT_SPEC: AgentToolSpec = {
   name: 'build_assign_output',
   label: '分配输出目标',
-  description: '把目标文档（或对象族 family:<familyKey>）的写入资格分配给已确认的子任务。同一目标同时只有一个有效分配；目标被其他活动任务持有时返回冲突与持有者。同任务重复分配同目标幂等更新；supersedes=true 显式转移（先撤销同任务旧分配再生效）。续接产生的新任务 ID 会自动继承分配（父任务资格同步撤销）。',
+  description: '给已确认的子任务分配文档或对象族的写入资格。同一目标只允许一个有效分配。同篇阻断修订优先 task_resume 原作者，新任务 ID 会继承分配。必须重派时，在收回原分配和分配新任务时提供 revisionFallback。',
   parameters: {
     type: 'object',
     properties: {
       ownerTaskId: string('子任务 ID（须已确认：创建事件已到达）'),
       targets: { type: 'array', minItems: 1, maxItems: 200, items: { type: 'string' }, description: '目标列表：文档路径或 family:<familyKey>' },
       supersedes: { type: 'boolean', description: '显式转移同任务旧分配（缺省：同目标重叠时幂等更新）' },
+      revisionFallback: revisionFallbackSpec,
     },
     required: ['ownerTaskId', 'targets'],
     additionalProperties: false,
@@ -1117,12 +1129,13 @@ export const BUILD_ASSIGN_OUTPUT_SPEC: AgentToolSpec = {
 export const BUILD_REVOKE_OUTPUT_SPEC: AgentToolSpec = {
   name: 'build_revoke_output',
   label: '收回输出分配',
-  description: '收回输出分配：按 assignmentId 或按 ownerTaskId 收回其全部活动分配。收回后该任务对相应目标失去写入资格。',
+  description: '按分配或任务收回写入资格。准备续接时保留原分配供继承。同篇阻断修订必须换作者时，提供 revisionFallback 说明原因。',
   parameters: {
     type: 'object',
     properties: {
       assignmentId: string('分配 ID（与 ownerTaskId 二选一）'),
       ownerTaskId: string('任务 ID（与 assignmentId 二选一）'),
+      revisionFallback: revisionFallbackSpec,
     },
     additionalProperties: false,
   },

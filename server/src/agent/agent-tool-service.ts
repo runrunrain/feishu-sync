@@ -142,6 +142,7 @@ import {
   V2_CHILD_READ_TOOLS,
   type CredentialKind,
   type ReviewReceipt,
+  type RevisionFallback,
 } from '../kb/build-actors.js';
 import type { BuildUnit } from '../kb/build-units.js';
 import type { ImageDescription } from './vision/vision-describer.js';
@@ -4466,6 +4467,7 @@ export class AgentToolService {
     pendingRequiredRewrites: string[];
     pendingIndependentReviewPaths: string[];
     reviewedUnpublishedDraftPaths: string[];
+    revisionContinuations: Array<{ path: string; authorTaskId: string; reviewId: string }>;
     stageBlockedPaths: Array<{ path: string; groups: Array<{ code: string; count: number; examples: string[] }> }>;
   } {
     const entries = this.stagingDraftEntries(state);
@@ -4507,8 +4509,14 @@ export class AgentToolService {
         receipts: state.v2.actorStore.listReviews(), subjectOf });
     }
     const needsReview = new Set(pendingIndependentReviewPaths);
+    const actorStore = context.options.orchestration?.actorStore;
+    const revisionContinuations = unpublishedDraftPaths.flatMap((docPath) => {
+      const continuation = actorStore?.revisionContinuationFor(docPath);
+      return continuation ? [continuation] : [];
+    });
     return { carriedPublishedPaths, promotedUnchangedPaths, unpublishedDraftPaths, pendingRequiredRewrites,
       pendingIndependentReviewPaths, reviewedUnpublishedDraftPaths: unpublishedDraftPaths.filter(docPath => !needsReview.has(docPath)),
+      revisionContinuations,
       stageBlockedPaths: [...(state.progressiveBlocked ?? [])].map(([docPath, value]) => ({ path: docPath, groups: value.groups })) };
   }
 
@@ -4727,6 +4735,7 @@ export class AgentToolService {
         targets: normalized,
         targetKind,
         ownerTaskId,
+        revisionFallback: readRevisionFallback(args.revisionFallback),
         ...(args.supersedes === true ? { supersedes: true } : {}),
       });
       return {
@@ -4747,7 +4756,10 @@ export class AgentToolService {
       throw new ToolError('invalid_request', 'assignmentId 与 ownerTaskId 必须二选一');
     }
     try {
-      const count = v2.actorStore.revokeOutputs({ ...(assignmentId ? { assignmentId } : { ownerTaskId: ownerTaskId! }) });
+      const count = v2.actorStore.revokeOutputs({
+        ...(assignmentId ? { assignmentId } : { ownerTaskId: ownerTaskId! }),
+        revisionFallback: readRevisionFallback(args.revisionFallback),
+      });
       return { content: [{ type: 'text', text: `已收回 ${count} 个分配` }], details: { revoked: count } };
     } catch (error) {
       throw wrapActorError(error);
@@ -6111,6 +6123,21 @@ function requireV2Leader(context: InternalRunContext): OrchestrationV2Options {
   if (!v2) throw new ToolError('invalid_request', '本工具仅 v2 编排运行可用（orchestration 未配置）', 400);
   if (v2.credential !== 'leader') throw new ToolError('tool_not_allowed', '本工具仅 Leader 凭据可用（设计 v2 §3.4）', 403);
   return v2;
+}
+
+function readRevisionFallback(raw: unknown): RevisionFallback | undefined {
+  if (raw === undefined) return undefined;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new ToolError('invalid_request', 'revisionFallback 必须包含 kind 和 reason');
+  }
+  const { kind, reason } = raw as Record<string, unknown>;
+  if (kind !== 'session_unavailable' && kind !== 'resume_failed' && kind !== 'scope_changed') {
+    throw new ToolError('invalid_request', 'revisionFallback.kind 须为 session_unavailable、resume_failed 或 scope_changed');
+  }
+  if (typeof reason !== 'string' || reason.trim().length < 1 || reason.trim().length > 600) {
+    throw new ToolError('invalid_request', 'revisionFallback.reason 须说明无法续接或重拆的具体原因（1..600 字符）');
+  }
+  return { kind, reason: reason.trim() };
 }
 
 /** v2 编排上下文（Leader/child 均可的只读工具用）。 */
