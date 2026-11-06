@@ -43,7 +43,14 @@ jobs:
         run: npm run typecheck
 
       - name: Test (frontend + server)
-        run: xvfb-run -a npm run test:all
+        run: |
+          xvfb-run -a npm test
+          xvfb-run -a npm --prefix server test -- --exclude tests/pi-plugin-service.test.ts --exclude tests/pi-native-work.test.ts
+
+      - name: Test Pi integration
+        run: |
+          npm install --prefix "$RUNNER_TEMP/feishu-sync-ci-pi" --no-save --no-package-lock --no-audit --no-fund @earendil-works/pi-coding-agent@1.4.0
+          FEISHU_SYNC_PI_CLI="$RUNNER_TEMP/feishu-sync-ci-pi/node_modules/@earendil-works/pi-coding-agent" xvfb-run -a npm --prefix server test -- tests/pi-plugin-service.test.ts tests/pi-native-work.test.ts
 
       - name: Build smoke (vite + server tsc + electron esbuild)
         run: |
