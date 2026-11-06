@@ -398,10 +398,11 @@ function normalizeStandardKbConfigLoose(value: unknown, dataRoot: string): Stand
     buildParallelism: typeof raw.buildParallelism === 'number'
       ? Math.max(1, Math.min(6, Math.floor(raw.buildParallelism)))
       : base.buildParallelism,
-    // B案 §6：构建名额 N（1..8，全部文本构建角色合计）；非数字保持
+    // B案 §6：构建名额 N（1..6，全部文本构建角色合计；运行时 BuildRunSpec
+    // 上限与 Agent 进程池一致为 6，超过会在构建启动时被拒）；非数字保持
     // undefined → 回落 buildParallelism（resolveBuildConcurrency 统一解析）
     buildConcurrency: typeof raw.buildConcurrency === 'number' && Number.isFinite(raw.buildConcurrency)
-      ? Math.max(1, Math.min(8, Math.floor(raw.buildConcurrency)))
+      ? Math.max(1, Math.min(6, Math.floor(raw.buildConcurrency)))
       : undefined,
     // B案 §3/§8：角色模型（宽容归一；严格校验在 validateAgentAndKbConfig）
     buildRoles: normalizeBuildRolesLoose(raw.buildRoles, base.buildRoles),

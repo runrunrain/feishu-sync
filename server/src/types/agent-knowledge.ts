@@ -115,8 +115,9 @@ export interface StandardKbConfig {
   buildParallelism: number;
   /** B案 §6：构建名额 N 的新语义入口——全部文本构建角色（写/审/修订/
    * 规划/整合/最终复核）合计 N 路，交互等保底名额额外计算，不再被另一
-   * 道应用总上限压低。additive 可选：1..8；**优先于 buildParallelism**，
-   * 未设时回落 buildParallelism（resolveBuildConcurrency 统一解析）。 */
+   * 道应用总上限压低。additive 可选：1..6（与 Agent 进程池/BuildRunSpec
+   * 上限一致）；**优先于 buildParallelism**，未设时回落 buildParallelism
+   * （resolveBuildConcurrency 统一解析）。 */
   buildConcurrency?: number;
   /** B案 §3/§8：角色模型配置（撰写/审查必选，整合缺省跟随撰写，规划者
    * 缺省关闭）。additive 可选：旧配置无此字段 → 跟随活跃预设。 */

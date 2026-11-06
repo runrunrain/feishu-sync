@@ -127,6 +127,10 @@ function str(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined;
 }
 
+function bool(value: unknown): boolean | undefined {
+  return typeof value === 'boolean' ? value : undefined;
+}
+
 function numberOrNull(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
@@ -296,6 +300,14 @@ export const OPS_COMMANDS: readonly OpsCommandDef[] = [
         throw new OpsArgumentError('invalid_args', '参数 value 是必需的');
       }
       assertConfigSetPathAllowed(path);
+      // 点号路径会拼成字面量顶层键（如 "standardKb.buildConcurrency"），
+      // 服务端当未知键静默忽略——这里前置拒绝，避免 ok:true 但未生效。
+      if (path.includes('.')) {
+        throw new OpsArgumentError(
+          'invalid_args',
+          `path 只接受顶层配置键（如 standardKb）；嵌套修改请传整段对象，例如 config.set path=standardKb value={...含修改后的 buildConcurrency...}`,
+        );
+      }
       return [{ method: 'PUT', path: '/api/config', body: { [path]: args.value } }];
     },
   },
@@ -390,7 +402,11 @@ export const OPS_COMMANDS: readonly OpsCommandDef[] = [
     confirm: { field: 'confirm', value: 'BUILD' },
     params: {
       type: 'object',
-      properties: { mode: { type: 'string', description: 'incremental（默认）或 full' } },
+      properties: {
+        mode: { type: 'string', description: 'incremental（默认）或 full' },
+        rebuildSelected: { type: 'boolean', description: '重建当前勾选的源（须 incremental；保留未受影响的现有标准文档）' },
+        refreshImages: { type: 'boolean', description: '重新生成所选源图片描述（须 full 或 rebuildSelected）' },
+      },
     },
     request: (args) => [{
       method: 'POST',
@@ -398,6 +414,8 @@ export const OPS_COMMANDS: readonly OpsCommandDef[] = [
       body: {
         mode: str(args.mode) ?? 'incremental',
         confirm: 'BUILD',
+        ...(bool(args.rebuildSelected) !== undefined ? { rebuildSelected: bool(args.rebuildSelected) } : {}),
+        ...(bool(args.refreshImages) !== undefined ? { refreshImages: bool(args.refreshImages) } : {}),
       },
     }],
   },
