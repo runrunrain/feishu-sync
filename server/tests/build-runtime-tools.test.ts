@@ -573,6 +573,54 @@ describe('写入链（§4.2/§4.4）', () => {
     );
   });
 
+  it.each(['resume', 'fallback'] as const)('同篇阻断修订优先保留原作者分配（%s）', async (strategy) => {
+    const setup = makeV2(`b-revision-${strategy}`);
+    const docPath = 'docs/a.md';
+    const leader = setup.leader.token;
+    setup.store.registerTaskCreation({ nativeTaskId: 'writer', requestedRole: 'luban' });
+    setup.store.registerTaskCreation({ nativeTaskId: 'replacement', requestedRole: 'luban' });
+    setup.store.registerTaskCreation({ nativeTaskId: 'reviewer', requestedRole: 'diting' });
+    await call(leader, 'build_assign_output', { ownerTaskId: 'writer', targets: [docPath] });
+    const draft = { path: docPath, title: '初稿', markdown: '正文', sources: ['tokA'], summary: '摘要' };
+    await call(setup.child.token, 'kb_write_doc', { ...draft, operationId: 'initial' }, meta('writer', 'luban'));
+    const review = setup.store.recordReview({
+      reviewerTaskId: 'reviewer', draftHash: 'draft', scopePaths: [docPath],
+      dependencyHashes: { [`doc:${docPath}`]: 'body' }, ruleVersion: 'kb-review/1', verdict: 'needs_revision',
+      issues: [{ issueId: 'missing-evidence', severity: 'blocking', draftLocation: docPath,
+        sourceLocation: null, description: '补齐正文断言的源证据' }],
+    });
+    const manifest = await call(leader, 'build_manifest', {});
+    expect(JSON.parse(manifest.content[0].text).documentWorkStatus.revisionContinuations).toEqual([
+      { path: docPath, authorTaskId: 'writer', reviewId: review.reviewId },
+    ]);
+    await expectToolError(() => call(leader, 'build_revoke_output', { ownerTaskId: 'writer' }), 'kb_revision_resume_required');
+    await expectToolError(() => call(leader, 'build_assign_output', { ownerTaskId: 'replacement', targets: [docPath] }), 'kb_revision_resume_required');
+    expect(setup.store.activeAssignmentFor(docPath)?.ownerTaskId).toBe('writer');
+
+    if (strategy === 'resume') {
+      setup.store.registerTaskCreation({ nativeTaskId: 'continued', parentTaskId: 'writer', requestedRole: 'luban' });
+      expect(setup.store.activeAssignmentFor(docPath)?.ownerTaskId).toBe('continued');
+      expect(setup.store.revisionContinuationFor(docPath)?.authorTaskId).toBe('continued');
+      expect(setup.store.lookupActor('writer')?.status).toBe('revoked');
+      await call(setup.child.token, 'kb_write_doc', { ...draft, markdown: '修订正文', operationId: 'revision' }, meta('continued', 'luban'));
+      expect(setup.store.listReviews().find((item) => item.reviewId === review.reviewId)?.status).toBe('stale');
+      return;
+    }
+
+    const revisionFallback = { kind: 'resume_failed', reason: '原会话恢复失败，原作者上下文不可用' };
+    await expectToolError(() => call(leader, 'build_revoke_output', { ownerTaskId: 'writer',
+      revisionFallback: { kind: 'resume_failed', reason: ' ' } }), 'invalid_request');
+    await call(leader, 'build_revoke_output', { ownerTaskId: 'writer', revisionFallback });
+    await expectToolError(() => call(leader, 'build_assign_output', { ownerTaskId: 'replacement', targets: [docPath] }), 'kb_revision_resume_required');
+    await call(leader, 'build_assign_output', { ownerTaskId: 'replacement', targets: [docPath], revisionFallback });
+    expect(setup.store.activeAssignmentFor(docPath)?.ownerTaskId).toBe('replacement');
+    expect(setup.store.eventsSince()).toContainEqual(expect.objectContaining({
+      type: 'revision_reassigned', taskId: 'replacement', payload: {
+        targets: [{ path: docPath, authorTaskId: 'writer', reviewId: review.reviewId }], fallback: revisionFallback,
+      },
+    }));
+  });
+
   it('kb_delete_doc 同走写入链（分配+幂等）', async () => {
     const setup = makeV2('b-del');
     setup.store.registerTaskCreation({ nativeTaskId: 'w1', requestedRole: 'luban' });
