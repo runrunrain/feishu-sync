@@ -14,12 +14,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createChatAttachmentFamily } from './tools/chat-attachment-family.js';
 import { isBlankWorkbookPlaceholder, reconcileBlankCsvCoverage } from '../kb/blank-csv-coverage.js';
+import { computePublishReadiness, type PublishReadinessPreview } from '../kb/publish-readiness.js';
 import { sourceChangeBaseline, summarizeSourceChanges, type SourceChangeBaseline } from '../kb/source-change-summary.js';
 import { renderCsvTableImport } from '../kb/csv-table-import.js';
 import { MAX_STANDARD_DOC_BYTES } from '../kb/standard-doc-limits.js';
-import { repairRelativeMdLinks } from '../kb/link-repair.js';
+import { repairRelativeMdLinks, findMissingRelativeMdTargets } from '../kb/link-repair.js';
 import { verifiedEvidenceKey } from '../kb/verified-evidence.js';
 import { annotateRawReadPage, skipBlankCsvContinuation, type BlankCsvSkip } from '../kb/csv-read-compact.js';
+import { checkDraftCountClaims } from '../kb/mechanical-precheck.js';
 import { isPermissionDeniedSourcePlaceholder, isUnresolvedSyncedReferencePlaceholder } from '../kb/source-availability.js';
 import {
   atomicWriteFile,
@@ -101,6 +103,7 @@ import {
 } from '../kb/knowledge-schema.js';
 import {
   contentResourceHash,
+  csvNonEmptyColumnLabels,
   parseCsvRecords,
   resolveSelector,
   verifyEvidence,
@@ -120,6 +123,7 @@ import {
   DOCUMENT_DECLARATION_SCOPE,
   REVIEW_DEP_SOURCE_SNAPSHOT,
   REVIEW_DEP_WORKFLOW_RULES,
+  currentPathCandidateBinding,
   resolveCurrentReviewDependencies,
   scopedReviewDeclarationHash,
   collectAuthorityValidatedReports,
@@ -527,7 +531,7 @@ export interface VisionDescriberLike {
   describeMany(items: Array<{ file: string; src: string }>, opts: { signal: AbortSignal; onProgress: (p: { done: number; total: number; described?: number; cached?: number; unavailable?: number }) => void; refreshCached?: boolean }): Promise<Map<string, ImageDescription>>;
 }
 
-function publishValidationIssues(result: Record<string, unknown> | null): Array<{ path: string; code: string; message: string }> {
+function publishValidationIssues(result: Record<string, unknown> | null): Array<{ path: string; objToken: string; code: string; message: string }> {
   const details = result?.details;
   const raw = details && typeof details === 'object' && !Array.isArray(details)
     ? (details as Record<string, unknown>).issues : null;
@@ -535,6 +539,7 @@ function publishValidationIssues(result: Record<string, unknown> | null): Array<
   return raw.slice(0, 8).filter((item): item is Record<string, unknown> =>
     !!item && typeof item === 'object' && !Array.isArray(item)).map((item) => ({
       path: typeof item.path === 'string' ? item.path : '',
+      objToken: typeof item.objToken === 'string' ? item.objToken : '',
       code: typeof item.code === 'string' ? item.code : 'unknown',
       message: typeof item.message === 'string' ? item.message : '',
     }));
@@ -906,7 +911,12 @@ export class AgentToolService {
     const allowed = context.options.orchestration
       ? this.v2ToolNamesFor(context, { amagiTaskId: meta?.amagiTaskId, amagiAgent: meta?.amagiAgent })
       : context.allowedTools;
-    if (!allowed.includes(name)) throw new ToolError('tool_not_allowed', `工具 ${name} 不在当前角色工具面`, 403);
+    // WP-C（R5/kb_get_plan）：未授权工具直接列出当前角色可用面，避免
+    // 模型按提示词里的旧工具名反复探测（提示词可能提到本角色没有的工具）。
+    if (!allowed.includes(name)) {
+      throw new ToolError('tool_not_allowed',
+        `工具 ${name} 不在当前角色工具面（提示词/示例提到的工具未必已授权）。当前可用：${allowed.join('、')}`, 403);
+    }
     const spec = this.familyTools.get(name)?.spec;
     if (!spec) throw new ToolError('tool_not_allowed', `未知工具: ${name}`, 403);
     return { content: [{ type: 'text', text: JSON.stringify(spec) }] };
@@ -935,18 +945,24 @@ export class AgentToolService {
     if (context.options.orchestration) {
       this.assertV2Access(context, toolName, meta);
     }
-    const effectiveArgs = toolName === 'kb_write_doc' ? this.resolveWriteRetryArgs(context, args, meta) : args;
-    const argsSummary = summarizeArgs(toolName, effectiveArgs);
+    const argsSummary = summarizeArgs(toolName, args);
     context.options.onEvent?.({ phase: 'start', toolName, ...(meta?.toolCallId ? { toolCallId: meta.toolCallId } : {}), argsSummary });
     let writeCommitted = false;
+    // 失败重试缓存需要的是规范化+retry 合并后的完整载荷（retryOf 重提失败时
+    // 仍能再次暂存），不能回退到原始 args。
+    let effectiveArgs: Record<string, unknown> = args;
     try {
+      // WP-C（R5 回合开销）：语义无歧义的别名/形状在服务端规范化并在返回中
+      // 说明；歧义输入报一次可修复的精确错误（写入工具仍严格，只处理枚举过的情形）。
+      const normalized = normalizeToolArguments(toolName, args);
+      effectiveArgs = toolName === 'kb_write_doc' ? this.resolveWriteRetryArgs(context, normalized.args, meta) : normalized.args;
       const result = await tool.execute(context, effectiveArgs, meta);
       writeCommitted = true;
       if (toolName === 'kb_write_doc') this.clearFailedWrites(context, effectiveArgs, meta);
       if (['kb_write_doc', 'kb_delete_doc', 'kb_unit_done', 'kb_finish', 'kb_submit_plan', 'kb_submit_review', 'build_register_migrations'].includes(toolName)) context.options.buildState?.onCheckpoint?.();
       const resultSummary = summarizeResult(result);
       context.options.onEvent?.({ phase: 'end', toolName, ...(meta?.toolCallId ? { toolCallId: meta.toolCallId } : {}), argsSummary, resultSummary, isError: false });
-      return result;
+      return normalized.notes.length > 0 ? appendParamNotesToResult(result, normalized.notes) : result;
     } catch (error) {
       if (toolName === 'kb_write_doc' && !writeCommitted) this.rememberFailedWrite(context, effectiveArgs, meta, error);
       const message = error instanceof Error ? error.message : String(error);
@@ -1141,16 +1157,17 @@ export class AgentToolService {
     return result;
   }
 
-  private toolRawSearch(context: InternalRunContext, args: Record<string, unknown>): ToolResult {
-    const query = requireString(args, 'query', 1, 200);
-    const limit = optionalInt(args, 'limit', 20, 1, 20);
+  /** 单查询打分（raw_search 原（R5 前行为；多查询路径逐个复用本方法后合并）。 */
+  private scoreRawEntries(
+    context: InternalRunContext,
+    entries: Array<{ objToken: string; title: string; relPath: string }>,
+    query: string,
+  ): { hits: Array<{ result: Record<string, unknown>; score: number; relPath: string }>; fallback: Array<{ result: Record<string, unknown>; score: number; relPath: string }> } {
     const units = parseSearchQuery(query);
-    if (!units.length) return { content: [{ type: 'text', text: JSON.stringify({ results: [] }, null, 2) }] };
-    const entries = context.options.buildState
-      ? context.options.buildState.snapshot.entries
-      : this.rawEntriesForDiscuss(context);
     const hits: Array<{ result: Record<string, unknown>; score: number; relPath: string }> = [];
-    const fallback: typeof hits = [], fragments = rawFallbackTerms(query);
+    const fallback: typeof hits = [];
+    if (!units.length) return { hits, fallback };
+    const fragments = rawFallbackTerms(query);
     for (const entry of entries) {
       let content = '';
       try {
@@ -1179,11 +1196,66 @@ export class AgentToolService {
         } });
       }
     }
-    const usingFallback = !hits.length && fallback.length > 0;
-    const ranked = usingFallback ? fallback : hits;
+    return { hits, fallback };
+  }
+
+  private toolRawSearch(context: InternalRunContext, args: Record<string, unknown>): ToolResult {
+    // WP-C（R5）：queries 多查询别名与 objToken 限定单源由 normalizeToolArguments
+    // 规范化后进入本方法；单查询路径保持原逐条打分与返回形状不变。
+    const queryList = Array.isArray(args.queries)
+      ? (args.queries as unknown[]).filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      : [requireString(args, 'query', 1, 200)];
+    const limit = optionalInt(args, 'limit', 20, 1, 20);
+    const scopeToken = typeof args.objToken === 'string' && args.objToken.trim() ? args.objToken : null;
+    const allEntries = context.options.buildState
+      ? context.options.buildState.snapshot.entries
+      : this.rawEntriesForDiscuss(context);
+    const entries = scopeToken ? allEntries.filter((entry) => entry.objToken === scopeToken) : allEntries;
+    if (scopeToken && entries.length === 0) {
+      throw new ToolError('not_found', `原始文档不存在或无成功本地版本: ${scopeToken}`, 404);
+    }
+    if (queryList.length <= 1) {
+      const single = queryList[0] ?? '';
+      const units = parseSearchQuery(single);
+      if (!units.length) return { content: [{ type: 'text', text: JSON.stringify({ results: [] }, null, 2) }] };
+      const { hits, fallback } = this.scoreRawEntries(context, entries, single);
+      const usingFallback = !hits.length && fallback.length > 0;
+      const ranked = usingFallback ? fallback : hits;
+      ranked.sort((a, b) => b.score - a.score || (a.relPath < b.relPath ? -1 : a.relPath > b.relPath ? 1 : 0));
+      const results = ranked.slice(0, limit).map((hit) => hit.result);
+      return { content: [{ type: 'text', text: JSON.stringify({ results, ...(usingFallback ? { warning: '未找到完整关键词；以下为片段回退候选，请继续核对原文。' } : {}) }, null, 2) }] };
+    }
+    // 多查询合并：逐个执行，按 objToken 保留最高分命中（片段取该次命中），
+    // 仅当全部查询都无直接命中时才退回片段候选。
+    const byToken = new Map<string, { result: Record<string, unknown>; score: number; relPath: string; matchedQueries?: number }>();
+    const fallbackByToken = new Map<string, { result: Record<string, unknown>; score: number; relPath: string; matchedQueries?: number }>();
+    for (const query of queryList) {
+      const { hits, fallback } = this.scoreRawEntries(context, entries, query);
+      for (const hit of hits) {
+        const token = String(hit.result.objToken);
+        const existing = byToken.get(token);
+        if (!existing || hit.score > existing.score) {
+          byToken.set(token, { ...hit, matchedQueries: (existing?.matchedQueries ?? 0) + 1 });
+        } else {
+          existing.matchedQueries = (existing.matchedQueries ?? 0) + 1;
+        }
+      }
+      for (const hit of fallback) {
+        const token = String(hit.result.objToken);
+        const existing = fallbackByToken.get(token);
+        if (!existing || hit.score > existing.score) fallbackByToken.set(token, hit);
+      }
+    }
+    const usingFallback = byToken.size === 0 && fallbackByToken.size > 0;
+    const ranked = [...(usingFallback ? fallbackByToken : byToken).values()];
     ranked.sort((a, b) => b.score - a.score || (a.relPath < b.relPath ? -1 : a.relPath > b.relPath ? 1 : 0));
-    const results = ranked.slice(0, limit).map((hit) => hit.result);
-    return { content: [{ type: 'text', text: JSON.stringify({ results, ...(usingFallback ? { warning: '未找到完整关键词；以下为片段回退候选，请继续核对原文。' } : {}) }, null, 2) }] };
+    const results = ranked.slice(0, limit).map((hit) =>
+      hit.matchedQueries ? { ...hit.result, matchedQueries: hit.matchedQueries } : hit.result);
+    return { content: [{ type: 'text', text: JSON.stringify({
+      results,
+      mergedQueries: queryList.length,
+      ...(usingFallback ? { warning: '未找到完整关键词；以下为片段回退候选，请继续核对原文。' } : {}),
+    }, null, 2) }] };
   }
 
   private readRawContent(context: InternalRunContext, objToken: string): string {
@@ -1239,94 +1311,102 @@ export class AgentToolService {
       throw new ToolError('not_found', `原始文档不存在或无成功本地版本: ${objToken}`, 404);
     }
     let lines: string[];
-    let readTrail: {
-      receipts: Array<{ readReceiptId: string; resourceId: string; lineStart: number; lineEnd: number }>;
-      resources: Array<{ resourceId: string; kind: 'text' | 'csv'; label: string; resourceHash: string; totalLines: number; nonEmptyCells?: number }>;
-      imageResources: Array<{ resourceId: string; imageHash: string; derivedFrom: string }>;
-      segmentMap: Array<Record<string, unknown>>;
-    } | null = null;
     if (context.options.buildState) {
       // T3（A 案 §5.3）：build 态逐资源装配 + segmentMap/读取回执。
       // 会话态（discuss/work）保持原行为，不产生回执。
+      // R5（复审）：窗口装配为纯函数（不登记回执）；按最终 content 文本
+      // 字节预算定型窗口后，才登记与实际返回一致的回执。
       const assembled = this.assembleBuildRead(context.options.buildState, entry);
       lines = assembled.lines;
-      const slice = lines.slice(offset, offset + limit);
-      const winStart = offset + 1;
-      const winEnd = offset + slice.length;
-      const truncated = winEnd < lines.length;
-      const segmentMap: Array<Record<string, unknown>> = [];
-      const receipts: ReadReceiptRecord[] = [];
+      const includeBlank = args.includeBlankCsvRows === true;
       const resourceById = new Map(assembled.resources.map((resource) => [resource.resourceId, resource]));
-      for (const segment of assembled.segments) {
-        if (segment.outEnd < winStart || segment.outStart > winEnd) continue;
-        const clippedStart = Math.max(segment.outStart, winStart);
-        const clippedEnd = Math.min(segment.outEnd, winEnd);
-        if (segment.resourceId) {
-          const resource = resourceById.get(segment.resourceId)!;
-          const resStart = segment.resStart! + (clippedStart - segment.outStart);
-          const resEnd = segment.resStart! + (clippedEnd - segment.outStart);
-          const returnedText = resource.lines.slice(resStart - 1, resEnd).join('\n');
-          const readReceiptId = `rr_${crypto.randomBytes(9).toString('hex')}`;
-          receipts.push({
-            readReceiptId,
-            buildId: context.buildId ?? 'unknown',
-            unitId: context.options.worker?.unitId ?? null,
-            toolCallId: meta?.toolCallId ?? 'unknown',
-            sourceSnapshotHash: entry.contentHash,
-            resourceId: segment.resourceId,
-            selector: { kind: 'read_range', lineStart: resStart, lineEnd: resEnd },
-            returnedHash: contentResourceHash(returnedText),
-            truncated,
-          });
-          segmentMap.push({
-            resourceId: segment.resourceId,
-            outStart: clippedStart,
-            outEnd: clippedEnd,
-            resStart,
-            resEnd,
-          });
-        } else {
-          segmentMap.push({
-            derived: segment.derived ?? 'derived',
-            outStart: clippedStart,
-            outEnd: clippedEnd,
-          });
+      const buildWindow = (lineCount: number): RawReadWindow => {
+        const slice = assembled.lines.slice(offset, offset + lineCount);
+        const winStart = offset + 1;
+        const winEnd = offset + slice.length;
+        const truncated = winEnd < assembled.lines.length;
+        const segmentMap: Array<Record<string, unknown>> = [];
+        const receipts: ReadReceiptRecord[] = [];
+        for (const segment of assembled.segments) {
+          if (segment.outEnd < winStart || segment.outStart > winEnd) continue;
+          const clippedStart = Math.max(segment.outStart, winStart);
+          const clippedEnd = Math.min(segment.outEnd, winEnd);
+          if (segment.resourceId) {
+            const resource = resourceById.get(segment.resourceId)!;
+            const resStart = segment.resStart! + (clippedStart - segment.outStart);
+            const resEnd = segment.resStart! + (clippedEnd - segment.outStart);
+            const returnedText = resource.lines.slice(resStart - 1, resEnd).join('\n');
+            const readReceiptId = `rr_${crypto.randomBytes(9).toString('hex')}`;
+            receipts.push({
+              readReceiptId,
+              buildId: context.buildId ?? 'unknown',
+              unitId: context.options.worker?.unitId ?? null,
+              toolCallId: meta?.toolCallId ?? 'unknown',
+              sourceSnapshotHash: entry.contentHash,
+              resourceId: segment.resourceId,
+              selector: { kind: 'read_range', lineStart: resStart, lineEnd: resEnd },
+              returnedHash: contentResourceHash(returnedText),
+              truncated,
+            });
+            segmentMap.push({
+              resourceId: segment.resourceId,
+              outStart: clippedStart,
+              outEnd: clippedEnd,
+              resStart,
+              resEnd,
+            });
+          } else {
+            segmentMap.push({
+              derived: segment.derived ?? 'derived',
+              outStart: clippedStart,
+              outEnd: clippedEnd,
+            });
+          }
         }
-      }
-      this.appendReadReceipts(context.options.buildState, receipts);
-      readTrail = {
-        receipts: receipts.map((receipt) => ({
-          readReceiptId: receipt.readReceiptId,
-          resourceId: receipt.resourceId,
-          lineStart: receipt.selector.lineStart,
-          lineEnd: receipt.selector.lineEnd,
-        })),
-        resources: assembled.resources.map(({ resourceId, kind, label, resourceHash, lines: resourceLines, nonEmptyCells }) => ({
-          resourceId, kind, label, resourceHash, totalLines: resourceLines.length,
-          ...(nonEmptyCells !== undefined ? { nonEmptyCells } : {}),
-        })),
-        imageResources: assembled.imageResources
-          .filter((resource) => slice.some((line) => line.includes(resource.src)))
-          .map(({ resourceId, imageHash, derivedFrom }) => ({ resourceId, imageHash, derivedFrom })),
-        segmentMap,
+        const readTrail = {
+          receipts: receipts.map((receipt) => ({
+            readReceiptId: receipt.readReceiptId,
+            resourceId: receipt.resourceId,
+            lineStart: receipt.selector.lineStart,
+            lineEnd: receipt.selector.lineEnd,
+          })),
+          resources: assembled.resources.map(({ resourceId, kind, label, resourceHash, lines: resourceLines, nonEmptyCells }) => ({
+            resourceId, kind, label, resourceHash, totalLines: resourceLines.length,
+            ...(nonEmptyCells !== undefined ? { nonEmptyCells } : {}),
+          })),
+          imageResources: assembled.imageResources
+            .filter((resource) => slice.some((line) => line.includes(resource.src)))
+            .map(({ resourceId, imageHash, derivedFrom }) => ({ resourceId, imageHash, derivedFrom })),
+          segmentMap,
+        };
+        const displayLines = annotateRawReadPage(
+          slice, offset, assembled.segments, assembled.resources, includeBlank,
+        );
+        const continuation = includeBlank
+          ? { nextOffset: truncated ? offset + slice.length : null, skipped: null }
+          : skipBlankCsvContinuation(offset + slice.length, assembled.lines.length, assembled.segments, assembled.resources);
+        return { slice, displayLines, truncated, continuation, readTrail, receipts };
       };
-      const displayLines = annotateRawReadPage(
-        slice, offset, assembled.segments, assembled.resources, args.includeBlankCsvRows === true,
-      );
-      const continuation = args.includeBlankCsvRows === true
-        ? { nextOffset: truncated ? offset + slice.length : null, skipped: null }
-        : skipBlankCsvContinuation(offset + slice.length, lines.length, assembled.segments, assembled.resources);
-      return this.renderRawReadPage(context, entry, lines, slice, offset, readTrail, truncated, displayLines, continuation);
+      const page = this.renderBudgetedRawReadPage(context, entry, assembled.lines, offset, limit, buildWindow);
+      this.appendReadReceipts(context.options.buildState, page.receipts);
+      return page.result;
     }
-    // S3（§3.5）：会话态原路径（无回执、无 segmentMap）
+    // S3（§3.5）：会话态原路径（无回执、无 segmentMap；同样受最终文本预算约束）
     const content = await this.inlineSessionImageDescriptions(
       context,
       entry,
       this.readRawContent(context, objToken),
     );
     lines = content.split('\n');
-    const slice = lines.slice(offset, offset + limit);
-    return this.renderRawReadPage(context, entry, lines, slice, offset, null, false);
+    const page = this.renderBudgetedRawReadPage(context, entry, lines, offset, limit, (lineCount) => ({
+      slice: lines.slice(offset, offset + lineCount),
+      displayLines: lines.slice(offset, offset + lineCount),
+      truncated: offset + lineCount < lines.length,
+      continuation: null,
+      readTrail: null,
+      receipts: [],
+    }));
+    return page.result;
   }
 
   /** Read exact parsed CSV cells without asking a model to count delimiters.
@@ -1406,8 +1486,9 @@ export class AgentToolService {
     const objToken = requireString(args, 'objToken', 1, 256);
     const resourceId = requireString(args, 'resourceId', 1, 512);
     const queries = requireArray(args, 'queries');
-    if (queries.length < 1 || queries.length > 8 || queries.some((value) => typeof value !== 'string' || value.trim().length < 2 || value.length > 200)) {
-      throw new ToolError('invalid_request', 'queries 须为 1–8 个长度 2–200 的非空短语');
+    // WP-C（R5）：单批上限 8→24（超过 8 项在结果中注明）；>24 报精确错误。
+    if (queries.length < 1 || queries.length > 24 || queries.some((value) => typeof value !== 'string' || value.trim().length < 2 || value.length > 200)) {
+      throw new ToolError('invalid_request', 'queries 须为 1–24 个长度 2–200 的非空短语（>8 项已属超批调用，建议拆分）');
     }
     const entry = state.snapshot.get(objToken);
     if (!entry) throw new ToolError('not_found', `原始文档不存在或无成功本地版本: ${objToken}`, 404);
@@ -1466,79 +1547,138 @@ export class AgentToolService {
       return { query, totalMatches, matches };
     });
     const payload = { objToken, resourceId, resourceHash: resource.resourceHash,
-      totalRecords: parsed.records.length, results };
+      totalRecords: parsed.records.length, results,
+      ...(queries.length > 8 ? { note: `已执行 ${queries.length} 项查询（超过单批建议的 8 项）；后续请拆分调用` } : {}) };
     return { content: [{ type: 'text', text: `<untrusted_source>\n${JSON.stringify(payload)}\n</untrusted_source>` }], details: payload };
   }
 
-  /** raw_read 输出渲染（build 态附 segmentMap/资源表/回执；末页引用块共用）。 */
-  private renderRawReadPage(
+  /** R5（复审）：raw_read 分页渲染——预算对象是**最终 content 文本**字节
+   * （页眉/坐标前缀/回执/空白折叠标记/末页链接块全部计入），不是原文切片。
+   * 窗口经二分定型后才由调用方登记与实际返回一致的回执；next_offset/
+   * 回执/空白折叠/truncated 契约不变。单行+页眉超硬上限时显式跳行
+   * （<oversized_line>，不登记回执、不声称完整读取，用 raw_search/
+   * raw_csv_find 定位短语）；末页链接块超预算时按行截短并注明 raw_links。 */
+  private renderBudgetedRawReadPage(
     context: InternalRunContext,
     entry: RawSourceSnapshotEntry,
     lines: string[],
-    slice: string[],
     offset: number,
-    readTrail: {
-      receipts: Array<{ readReceiptId: string; resourceId: string; lineStart: number; lineEnd: number }>;
-      resources: Array<{ resourceId: string; kind: 'text' | 'csv'; label: string; resourceHash: string; totalLines: number; nonEmptyCells?: number }>;
-      imageResources: Array<{ resourceId: string; imageHash: string; derivedFrom: string }>;
-      segmentMap: Array<Record<string, unknown>>;
-    } | null,
-    truncated: boolean,
-    displayLines: string[] = slice,
-    continuation?: BlankCsvSkip,
-  ): ToolResult {
-    // P1-S4（§2.4）：末页追加 <source_links>（非末页不追加，避免翻页重复）；
-    // 无引用边或未注入引用图时不追加，输出与旧版逐字一致。
-    const nextOffset = continuation ? continuation.nextOffset
-      : offset + slice.length >= lines.length ? null : offset + slice.length;
-    const isLastPage = nextOffset === null;
-    const sourceLinks = isLastPage ? this.buildSourceLinksBlock(context, entry.objToken) : null;
-    // Pi MCP only exposes content blocks to the model. A receipt kept solely in
-    // ToolResult.details is invisible to writers, so evidence declarations cannot
-    // cite it. Put the compact trusted receipt header first, ahead of long source
-    // text that may be truncated by the task tool output budget.
-    const receiptHeader = readTrail
-      ? `<read_receipts source_id="${entry.objToken}">${JSON.stringify(readTrail.receipts)}</read_receipts>\n`
-      : '';
-    const imageHeader = readTrail?.imageResources.length
-      ? `<image_resources>${JSON.stringify(readTrail.imageResources)}</image_resources>\n`
-      : '';
-    const blankCsv = readTrail?.resources.filter((resource) => resource.kind === 'csv' && resource.nonEmptyCells === 0)
-      .map(({ resourceId, label, totalLines }) => ({ resourceId, label, totalLines })) ?? [];
-    const blankCsvHeader = blankCsv.length ? `<blank_csv_resources>${JSON.stringify(blankCsv)}</blank_csv_resources>\n` : '';
-    // MCP exposes content, not ToolResult.details. Give the writer an exact
-    // continuation offset so large sheets do not trigger guessed/repeated reads.
-    const pageHeader = `<raw_page offset="${offset}" returned="${slice.length}" total="${lines.length}" next_offset="${nextOffset ?? 'end'}" />\n`
-      + (readTrail ? '<raw_coordinates O="output-line" R="resource-line" C="csv-record" />\n' : '');
-    const skippedHeader = continuation?.skipped
-      ? `<skipped_blank_csv_rows resource_id="${escapeXml(continuation.skipped.resourceId)}" output_lines="${continuation.skipped.outputStart}-${continuation.skipped.outputEnd}" resource_lines="${continuation.skipped.resourceStart}-${continuation.skipped.resourceEnd}" count="${continuation.skipped.outputEnd - continuation.skipped.outputStart + 1}" />\n`
-      : '';
-    const wrapped = `${receiptHeader}${imageHeader}${blankCsvHeader}${pageHeader}${skippedHeader}<untrusted_source obj_token="${entry.objToken}" title="${escapeXml(entry.title)}">\n${displayLines.join('\n')}\n</untrusted_source>`
-      + (sourceLinks ? `\n${sourceLinks.text}` : '');
+    limit: number,
+    buildWindow: (lineCount: number) => RawReadWindow,
+  ): { result: ToolResult; receipts: ReadReceiptRecord[] } {
+    const linksByLast = new Map<boolean, { text: string; summary: unknown } | null>();
+    const linksFor = (isLast: boolean) => {
+      if (!linksByLast.has(isLast)) {
+        const block = isLast ? this.buildSourceLinksBlock(context, entry.objToken) : null;
+        linksByLast.set(isLast, block ? { text: block.text, summary: block.summary } : null);
+      }
+      return linksByLast.get(isLast)!;
+    };
+    const nextOffsetOf = (window: RawReadWindow): number | null =>
+      window.continuation ? window.continuation.nextOffset
+        : offset + window.slice.length >= lines.length ? null : offset + window.slice.length;
+    const bodyOf = (window: RawReadWindow, nextOffset: number | null, oversized: { line: number; bytes: number } | null): string => {
+      const { slice, displayLines, readTrail, continuation } = window;
+      const receiptHeader = readTrail
+        ? `<read_receipts source_id="${entry.objToken}">${JSON.stringify(readTrail.receipts)}</read_receipts>\n`
+        : '';
+      const imageHeader = readTrail?.imageResources.length
+        ? `<image_resources>${JSON.stringify(readTrail.imageResources)}</image_resources>\n`
+        : '';
+      const blankCsv = readTrail?.resources.filter((resource) => resource.kind === 'csv' && resource.nonEmptyCells === 0)
+        .map(({ resourceId, label, totalLines }) => ({ resourceId, label, totalLines })) ?? [];
+      const blankCsvHeader = blankCsv.length ? `<blank_csv_resources>${JSON.stringify(blankCsv)}</blank_csv_resources>\n` : '';
+      const oversizedHeader = oversized
+        ? `<oversized_line output_line="${oversized.line}" bytes="${oversized.bytes}" />该行超过单页硬上限（${TOOL_PAGE_HARD_CAP_BYTES} 字节），无法在不被客户端截断的前提下整行返回；本页跳过该行且不登记其读取回执，next_offset 已推进。需要该行内容时改用 kb_read_batch（游标支持行内分片续传，可无损拼回整行）；需要精确短语时用 raw_search / raw_csv_find 定位。\n`
+        : '';
+      const pageHeader = `<raw_page offset="${offset}" returned="${slice.length}" total="${lines.length}" next_offset="${nextOffset ?? 'end'}" />\n`
+        + (readTrail ? '<raw_coordinates O="output-line" R="resource-line" C="csv-record" />\n' : '');
+      const skippedHeader = continuation?.skipped
+        ? `<skipped_blank_csv_rows resource_id="${escapeXml(continuation.skipped.resourceId)}" output_lines="${continuation.skipped.outputStart}-${continuation.skipped.outputEnd}" resource_lines="${continuation.skipped.resourceStart}-${continuation.skipped.resourceEnd}" count="${continuation.skipped.outputEnd - continuation.skipped.outputStart + 1}" />\n`
+        : '';
+      return `${receiptHeader}${imageHeader}${blankCsvHeader}${oversizedHeader}${pageHeader}${skippedHeader}<untrusted_source obj_token="${entry.objToken}" title="${escapeXml(entry.title)}">\n${displayLines.join('\n')}\n</untrusted_source>`;
+    };
+    const assemble = (lineCount: number) => {
+      const window = buildWindow(lineCount);
+      const nextOffset = nextOffsetOf(window);
+      const links = nextOffset === null ? linksFor(true) : null;
+      const body = bodyOf(window, nextOffset, null);
+      const text = body + (links ? `\n${links.text}` : '');
+      return { window, nextOffset, body, links, text };
+    };
+    const hi = Math.max(0, Math.min(limit, lines.length - offset));
+    let chosen = assemble(hi);
+    if (textBytes(chosen.text) > TOOL_PAGE_SOFT_BUDGET_BYTES && chosen.window.slice.length > 1) {
+      const fit = fitWindowByBytes(hi, TOOL_PAGE_SOFT_BUDGET_BYTES, (n) => textBytes(assemble(n).text));
+      chosen = assemble(fit);
+      // 空白折叠可能使字节数非严格单调：逐行回退兑底（正确性优先于最优页）
+      while (textBytes(chosen.text) > TOOL_PAGE_SOFT_BUDGET_BYTES && chosen.window.slice.length > 1) {
+        chosen = assemble(chosen.window.slice.length - 1);
+      }
+    }
+    // 末页链接块独大使页超硬上限：优先裁链接行（正文不动），保 closing 标签
+    if (textBytes(chosen.text) > TOOL_PAGE_HARD_CAP_BYTES && chosen.links) {
+      const linkLines = chosen.links.text.split('\n');
+      const note = '<!-- source_links 截断：完整列表用 raw_links 查询 -->';
+      let keep = linkLines.length - 1; // 保留 closing 标签行
+      while (keep > 0 && textBytes(chosen.body) + 1 + textBytes([...linkLines.slice(0, keep), note, linkLines[linkLines.length - 1]!].join('\n')) > TOOL_PAGE_HARD_CAP_BYTES) {
+        keep -= 1;
+      }
+      const dropped = linkLines.length - 1 - keep;
+      const linksText = dropped > 0
+        ? [...linkLines.slice(0, keep), note, linkLines[linkLines.length - 1]!].join('\n')
+        : chosen.links.text;
+      const text = chosen.body + `\n${linksText}`;
+      if (textBytes(text) <= TOOL_PAGE_HARD_CAP_BYTES) {
+        chosen = { ...chosen, text };
+      }
+    }
+    // 单行（含页眉/链接）仍超硬上限 → 显式跳行：不登记回执、不声称完整读取
+    if (textBytes(chosen.text) > TOOL_PAGE_HARD_CAP_BYTES && chosen.window.slice.length <= 1) {
+      const oversizedLine = lines[offset] ?? '';
+      const nextOffset = offset + 1 < lines.length ? offset + 1 : null;
+      const links = nextOffset === null ? linksFor(true) : null;
+      const window: RawReadWindow = {
+        slice: [], displayLines: [], truncated: nextOffset !== null,
+        continuation: { nextOffset, skipped: null }, readTrail: chosen.window.readTrail && {
+          ...chosen.window.readTrail,
+          receipts: [],
+          imageResources: [],
+          segmentMap: [],
+        }, receipts: [],
+      };
+      const body = bodyOf(window, nextOffset, { line: offset + 1, bytes: textBytes(oversizedLine) });
+      const text = body + (links && textBytes(body) + 1 + textBytes(links.text) <= TOOL_PAGE_HARD_CAP_BYTES ? `\n${links.text}` : '');
+      chosen = { window, nextOffset, body, links, text };
+    }
+    const { window, nextOffset, links, text } = chosen;
     return {
-      content: [{ type: 'text', text: wrapped }],
-      details: {
-        objToken: entry.objToken,
-        title: entry.title,
-        relPath: entry.relPath,
-        offset,
-        returnedLines: slice.length,
-        totalLines: lines.length,
-        nextOffset,
-        ...(readTrail
-          ? {
-            // T3（A 案 §5.3）：模型只能引用回执中的范围；quoteHash 复核在
-            // kb_write_doc 证据声明校验时由服务端重新解引用完成。
-            readReceiptId: readTrail.receipts[0]?.readReceiptId ?? null,
-            readReceipts: readTrail.receipts,
-            resources: readTrail.resources,
-            imageResources: readTrail.imageResources,
-            segmentMap: readTrail.segmentMap,
-            truncated,
-          }
-          : {}),
-        ...(sourceLinks ? { sourceLinks: sourceLinks.summary } : {}),
+      result: {
+        content: [{ type: 'text', text }],
+        details: {
+          objToken: entry.objToken,
+          title: entry.title,
+          relPath: entry.relPath,
+          offset,
+          returnedLines: window.slice.length,
+          totalLines: lines.length,
+          nextOffset,
+          ...(window.readTrail
+            ? {
+              // T3（A 案 §5.3）：模型只能引用回执中的范围；quoteHash 复核在
+              // kb_write_doc 证据声明校验时由服务端重新解引用完成。
+              readReceiptId: window.readTrail.receipts[0]?.readReceiptId ?? null,
+              readReceipts: window.readTrail.receipts,
+              resources: window.readTrail.resources,
+              imageResources: window.readTrail.imageResources,
+              segmentMap: window.readTrail.segmentMap,
+              truncated: window.truncated,
+            }
+            : {}),
+          ...(links ? { sourceLinks: links.summary } : {}),
+        },
       },
+      receipts: window.receipts,
     };
   }
 
@@ -1690,6 +1830,37 @@ export class AgentToolService {
       });
     }
     return { lines, segments, resources, imageResources };
+  }
+
+  /** WP-C（R5 自动修复提示）：kb_evidence_unresolved 时附上补读的精确参数。
+   * csv_cells → raw_csv_cells（直接登记覆盖该 record 区间的回执）；
+   * text_span → raw_read（按拼接输出坐标换算资源行窗口，考虑图片描述
+   * 派生行造成的位移）；换算失败退回资源本地行号近似值。只加提示不改判定。 */
+  private evidenceReadHint(state: BuildRunState, sourceId: string, resourceId: string, selector: EvidenceSelector): string {
+    try {
+      if (selector.kind === 'csv_cells') {
+        return `；建议先执行 raw_csv_cells(objToken:"${sourceId}", resourceId:"${resourceId}", recordStart:${selector.recordStart}, recordEnd:${selector.recordEnd}) 登记覆盖该范围的读回执（raw_read 的 R 是物理行、C 是逻辑 record；回执按物理行覆盖所选 record）`;
+      }
+      if (selector.kind === 'text_span') {
+        const spanLines = Math.min(selector.lineEnd - selector.lineStart + 1, 2000);
+        const entry = state.snapshot.get(sourceId);
+        if (entry) {
+          const assembled = this.assembleBuildRead(state, entry);
+          const covering = assembled.segments.filter((segment) => segment.resourceId === resourceId
+            && segment.resStart !== undefined && segment.resEnd !== undefined
+            && segment.resStart <= selector.lineEnd && segment.resEnd >= selector.lineStart);
+          if (covering.length > 0) {
+            const outFrom = Math.min(...covering.map((segment) => segment.outStart));
+            const outTo = Math.max(...covering.map((segment) => segment.outEnd));
+            return `；建议先执行 raw_read(objToken:"${sourceId}", offset:${outFrom - 1}, limit:${Math.min(outTo - outFrom + 1, 2000)}) 读取输出行 ${outFrom}..${outTo} 登记覆盖资源行 ${selector.lineStart}..${selector.lineEnd} 的读回执`;
+          }
+        }
+        return `；建议先执行 raw_read(objToken:"${sourceId}", offset:${selector.lineStart - 1}, limit:${spanLines}) 登记覆盖资源行 ${selector.lineStart}..${selector.lineEnd} 的读回执`;
+      }
+    } catch {
+      /* 提示装配失败不影响原错误语义 */
+    }
+    return '';
   }
 
   /** 追加读取回执到 staging/<buildId>/read-receipts.jsonl 与内存镜像。 */
@@ -2107,11 +2278,15 @@ export class AgentToolService {
   }
 
   private toolDraftSearch(context: InternalRunContext, args: Record<string, unknown>): ToolResult {
-    const query = requireString(args, 'query', 1, 200);
+    // WP-C（R5）：queries 多查询与 path 限定范围由 normalizeToolArguments 规范化。
+    const queryList = Array.isArray(args.queries)
+      ? (args.queries as unknown[]).filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      : [requireString(args, 'query', 1, 200)];
     const limit = optionalInt(args, 'limit', 20, 1, 20);
+    const scopePath = typeof args.path === 'string' && args.path.trim() ? args.path : null;
     const stagingRoot = requireBuildState(context).stagingRoot;
     const docsDir = path.join(stagingRoot, 'docs');
-    const lowerQuery = query.toLowerCase();
+    const lowerQueries = queryList.map((query) => query.toLowerCase());
     const results: Array<Record<string, unknown>> = [];
     const walk = (dir: string, prefix: string) => {
       if (results.length >= limit) return;
@@ -2124,14 +2299,24 @@ export class AgentToolService {
           walk(child, `${prefix}${name}/`);
         } else if (name.endsWith('.md')) {
           const relPath = `${prefix}${name}`;
+          if (scopePath && relPath !== scopePath && !relPath.startsWith(scopePath)) continue;
           try {
             const content = fs.readFileSync(child, 'utf-8');
-            const index = content.toLowerCase().indexOf(lowerQuery);
-            if (index >= 0) {
-              const start = Math.max(0, index - 60);
+            const lowerContent = content.toLowerCase();
+            let matchedIndex = -1;
+            let matchedLength = 0;
+            for (const lowerQuery of lowerQueries) {
+              const index = lowerContent.indexOf(lowerQuery);
+              if (index >= 0 && (matchedIndex < 0 || index < matchedIndex)) {
+                matchedIndex = index;
+                matchedLength = lowerQuery.length;
+              }
+            }
+            if (matchedIndex >= 0) {
+              const start = Math.max(0, matchedIndex - 60);
               results.push({
                 path: relPath,
-                snippet: `${content.slice(start, index + query.length + 100).replace(/\n+/g, ' ')}…`,
+                snippet: `${content.slice(start, matchedIndex + matchedLength + 100).replace(/\n+/g, ' ')}…`,
               });
             }
           } catch {
@@ -2141,7 +2326,7 @@ export class AgentToolService {
       }
     };
     walk(docsDir, '');
-    return { content: [{ type: 'text', text: JSON.stringify({ results }, null, 2) }] };
+    return { content: [{ type: 'text', text: JSON.stringify({ results, ...(queryList.length > 1 ? { mergedQueries: queryList.length } : {}) }, null, 2) }] };
   }
 
   // ------------------------------------------------------------------
@@ -2317,14 +2502,28 @@ export class AgentToolService {
     // csvTableImports expands short model-authored text into verified CSV rows.
     // Edits must also be able to resubmit a previously imported long document.
     const rawMarkdown = requireString(args, 'markdown', 1, MAX_STANDARD_DOC_BYTES);
+    // D2(b)：链接目标存在性的已知集合——草稿 + 已发布基准 + 当前分配。
+    // 严格门禁不重写链接，但同一集合用于写入期提示（发布门 kb_link_invalid
+    // 的前置预警，避免到发布才暴露）。
+    const knownDocPaths = new Set<string>([
+      ...this.stagingDraftEntries(state).map(entry => entry.path),
+      ...(state.baseDocPaths ?? []),
+      ...(state.v2?.actorStore.listAssignments().filter(item => item.status === 'active' && item.targetKind === 'doc').flatMap(item => item.targets) ?? []),
+    ]);
     const repaired = state.gatePolicy?.strict === false
-      ? repairRelativeMdLinks(rawMarkdown, docPath, new Set([
-        ...this.stagingDraftEntries(state).map(entry => entry.path),
-        ...(state.baseDocPaths ?? []),
-        ...(state.v2?.actorStore.listAssignments().filter(item => item.status === 'active' && item.targetKind === 'doc').flatMap(item => item.targets) ?? []),
-      ]))
+      ? repairRelativeMdLinks(rawMarkdown, docPath, knownDocPaths)
       : { markdown: rawMarkdown, repairs: [] };
     const markdown = repaired.markdown;
+    // D2：写入期机械提示（不阻断，附在回执供作者自查）：
+    // (b) 链接目标不在草稿/已发布/分配集合；(c) 编号/计数与紧随枚举不一致；
+    // (a 提示面) 对象正文范围内无内容行却声明了断言（headingPath 指错节）。收
+    // 集在 details.warnings 与回执正文里（MCP 客户端只把 content 交给模型）。
+    const bodyWarnings = [
+      ...findMissingRelativeMdTargets(markdown, docPath, knownDocPaths).map(target =>
+        `正文链接 ${target} 的目标文档不在草稿/已发布/当前分配集合中；发布门禁会拦截无法解析的链接——若目标属并行任务产出请核对分配路径，否则修正链接或改为文字提及`),
+      ...checkDraftCountClaims(markdown),
+      ...collectClaimLocationHints(args.objects, markdown.split('\n')),
+    ];
     const coverageWarnings = state.gatePolicy?.strict === false && Array.isArray(args.coverageUpdates)
       ? args.coverageUpdates.flatMap(raw => {
         const item = asRecord(raw);
@@ -2538,17 +2737,21 @@ export class AgentToolService {
       }
       state.writtenPaths?.add(docPath);
       state.docMeta?.set(docPath, { title, summary, tags, sources: sources as string[] });
+      // D2：覆盖警告与写入期机械提示合并（details.warnings 与回执正文共用）。
+      const writeWarnings = [...coverageWarnings, ...bodyWarnings].slice(0, 8);
       return {
         content: [{
           type: 'text',
           text: `已写入草稿 ${docPath}（docId=${docId}，${full.length} 字节）`
-            + (declaration ? `；知识声明：对象 ${Object.keys(declaration.objectIdMap).length}、证据 ${Object.keys(declaration.evidenceIdMap).length}、draftRevision=${declaration.draftRevision}` : ''),
+            + (declaration ? `；知识声明：对象 ${Object.keys(declaration.objectIdMap).length}、证据 ${Object.keys(declaration.evidenceIdMap).length}、draftRevision=${declaration.draftRevision}` : '')
+            // D2：机械提示进回执正文（MCP 客户端只见 content 块）；封顶 8 条。
+            + (writeWarnings.length ? `\n提示（不阻断，逐条自查）：\n${writeWarnings.map((hint) => `- ${hint}`).join('\n')}` : ''),
         }],
         details: {
           path: docPath,
           docId,
           ...(repaired.repairs.length ? { linkRepairs: repaired.repairs } : {}),
-          ...(coverageWarnings.length ? { warnings: coverageWarnings } : {}),
+          ...(writeWarnings.length ? { warnings: writeWarnings } : {}),
           bytes: Buffer.byteLength(full, 'utf-8'),
           ...(declaration
             ? {
@@ -3287,6 +3490,13 @@ export class AgentToolService {
           if (claimRange.startLine < 1 || claimRange.endLine > markdownLines.length) {
             throw new ToolError('invalid_request', `claim ${claimKey} bodyRange 超出正文范围`);
           }
+          // D2(a) 写入期机械拦截：断言正文必须落在对象正文范围内
+          //（computePayloadHash 的 relRange 以对象起点为原点，发布链路同假设）。
+          // 实测返工样本：对象 bodyRange 落在不含断言正文的小节，审查才暴露。
+          if (claimRange.startLine < bodyRange.startLine || claimRange.endLine > bodyRange.endLine) {
+            throw new ToolError('kb_claim_range_invalid',
+              `claim ${claimKey} 的 bodyRange（${claimRange.startLine}..${claimRange.endLine}）超出对象 ${clientKey} 的正文范围（${bodyRange.startLine}..${bodyRange.endLine}）；断言正文必须位于对象 headingPath/正文范围内，请修正 claims.bodyRange 或对象正文范围`);
+          }
         }
         claims.push({ claimKey, bodyRange: claimRange, riskCategory, evidenceIds: [] });
       }
@@ -3484,11 +3694,12 @@ export class AgentToolService {
     const newEvidence: Evidence[] = [];
     const evidenceIdMap: Record<string, string> = {};
     const submissionEvidenceKeys = new Map<string, string>();
+    // WP-C（R5）：clientKey → 规范化内容指纹（同键重发去重/冲突判定用）。
+    const submissionEvidenceIdentity = new Map<string, string>();
     for (const raw of evidenceInputs) {
       const input = asRecord(raw);
       if (!input) throw new ToolError('invalid_request', 'evidenceClaims 每项必须是对象');
       const clientKey = requireString(input, 'clientKey', 1, 200);
-      if (submissionEvidenceKeys.has(clientKey)) throw new ToolError('invalid_request', `evidenceClaims.clientKey 重复: ${clientKey}`);
       const objectKey = requireString(input, 'objectKey', 1, 200);
       const objectId = resolveObjectRef(objectKey);
       if (!objectId) throw new ToolError('invalid_request', `evidenceClaims.objectKey 无法解析: ${objectKey}`);
@@ -3524,6 +3735,17 @@ export class AgentToolService {
       if (nature === 'machine_description' && selector.kind !== 'media_region') {
         throw new ToolError('kb_evidence_unresolved', 'machine_description 证据必须使用 media_region 和图片资源 ID；正文 text_span 不会包含 raw_read 临时插入的图片描述');
       }
+      // WP-C（R5）：同 clientKey 重发（实测：作者重发服务端自动补齐的
+      // ev_auto_* 键）——内容完全相同的重复声明去重容忍；内容不同才报错。
+      const canonicalIdentity = canonicalPayloadHash(
+        { objectId, claimKey, sourceId, resourceId, selector, role, nature }, []);
+      const priorIdentity = submissionEvidenceIdentity.get(clientKey);
+      if (priorIdentity !== undefined) {
+        if (priorIdentity === canonicalIdentity) continue;
+        throw new ToolError('invalid_request',
+          `evidenceClaims.clientKey 重复且内容不同: ${clientKey}——同键声明的对象/断言/来源/selector/角色/性质须一致；只改已有证据范围请用 kb_edit_doc.evidenceSelectorUpdates，追加新证据请换新 clientKey 或省略由服务端生成`);
+      }
+      submissionEvidenceIdentity.set(clientKey, canonicalIdentity);
       let readReceiptId = optStr(input, 'readReceiptId');
       if (!readReceiptId && selector.kind === 'text_span') {
         readReceiptId = receipts.find((receipt) => receipt.resourceId === resourceId
@@ -3540,14 +3762,19 @@ export class AgentToolService {
         }
       }
       if ((selector.kind === 'text_span' || selector.kind === 'csv_cells') && !readReceiptId) {
-        throw new ToolError('kb_evidence_unresolved', '文本/CSV 证据没有覆盖所选范围的 raw_read 回执；请先读取该资源和行范围，或显式提供有效 readReceiptId（A 案 §5.3）');
+        throw new ToolError('kb_evidence_unresolved',
+          `文本/CSV 证据没有覆盖所选范围的 raw_read 回执；请先读取该资源和行范围，或显式提供有效 readReceiptId（A 案 §5.3）${this.evidenceReadHint(state, sourceId, resourceId, selector)}`);
       }
       // 服务端重新解引用：selector 解析 → hash 对账 + 回执范围 + quoteHash 复核
       const resolution = resolveSelector(resource, selector);
       if (!resolution.ok) throw new ToolError('kb_evidence_unresolved', resolution.message);
       if (selector.kind === 'csv_cells' && role !== 'context' && resolution.nonEmptyCellCount === 0) {
+        // WP-C（R5 自动修复提示）：附上同 record 范围内实际非空的列，
+        // 让作者一次重试即可改选；既有错误前缀保持不变（测试断言兼容）。
+        const nonEmptyColumns = resource.kind === 'csv'
+          ? csvNonEmptyColumnLabels(resource.content, selector.recordStart, selector.recordEnd) : [];
         throw new ToolError('kb_evidence_unresolved',
-          `CSV 证据选中的单元格全为空：逻辑 record ${selector.recordStart}–${selector.recordEnd}，列 ${selector.columns.join(', ')}。raw_read 的 R 是物理行、C 是逻辑 record；请用 raw_csv_cells 核对真实单元格后重选。空白范围只能作为 context，不能直接支撑或反驳断言`);
+          `CSV 证据选中的单元格全为空：逻辑 record ${selector.recordStart}–${selector.recordEnd}，列 ${selector.columns.join(', ')}。raw_read 的 R 是物理行、C 是逻辑 record；请用 raw_csv_cells 核对真实单元格后重选。空白范围只能作为 context，不能直接支撑或反驳断言。该 record 范围实际非空列：${nonEmptyColumns.length ? nonEmptyColumns.join(', ') : '（没有任何非空单元格，整段为空）'}`);
       }
       const verification = verifyEvidence({
         evidence: {
@@ -3559,7 +3786,12 @@ export class AgentToolService {
         resources: pack.resources,
         receipts,
       });
-      if (!verification.ok) throw new ToolError('kb_evidence_unresolved', verification.message);
+      if (!verification.ok) {
+        // WP-C（R5 自动修复提示）：回执范围类失败附上补读的精确参数。
+        const hint = /超出回执范围|不在本构建回执登记/.test(verification.message)
+          ? this.evidenceReadHint(state, sourceId, resourceId, selector) : '';
+        throw new ToolError('kb_evidence_unresolved', verification.message + hint);
+      }
       const evidenceId = draft.evidenceKeys[clientKey] ?? `kev_${crypto.randomBytes(8).toString('hex')}`;
       evidenceIdMap[clientKey] = evidenceId;
       submissionEvidenceKeys.set(clientKey, evidenceId);
@@ -4520,6 +4752,33 @@ export class AgentToolService {
       stageBlockedPaths: [...(state.progressiveBlocked ?? [])].map(([docPath, value]) => ({ path: docPath, groups: value.groups })) };
   }
 
+  /** R3.1/R3.3（kb-build-speedup）：发布就绪预览——与发布门
+   * （validateStagingDocs → uncoveredWorksetTokens）共用同一份覆盖判定，
+   * 区分真遗漏（无人负责/处置了却缺 sources 引用）与在途写作。 */
+  private buildPublishReadiness(context: InternalRunContext, state: BuildRunState,
+    pre?: { identityGapCount?: number; workStatus?: ReturnType<AgentToolService['buildDocumentWorkStatus']> }): PublishReadinessPreview | null {
+    const actorStore = context.options.orchestration?.actorStore ?? state.v2?.actorStore ?? null;
+    if (!actorStore) return null;
+    const workStatus = pre?.workStatus ?? this.buildDocumentWorkStatus(context, state);
+    try {
+      return computePublishReadiness({
+        state,
+        actorStore,
+        coverageSourceIds: new Set(this.loadKnowledgeDraft(state).coverage.map((item) => item.sourceRef.sourceId)),
+        validatePath: validateStdDocPath,
+        counts: {
+          openBlockingIssues: actorStore.openBlockingIssues(),
+          ...(pre?.identityGapCount !== undefined ? { identityGapCount: pre.identityGapCount } : {}),
+          pendingIndependentReviewPaths: workStatus.pendingIndependentReviewPaths.length,
+          stageBlockedPaths: workStatus.stageBlockedPaths.length,
+        },
+      });
+    } catch {
+      // 预览失败不影响清单/状态本体；发布门仍是权威判定
+      return null;
+    }
+  }
+
   // ------------------------------------------------------------------
   // v2 build-runtime 工具（设计 v2 §3.4/§4/§5/§7）
   // ------------------------------------------------------------------
@@ -4650,10 +4909,16 @@ export class AgentToolService {
           note: '上次门禁记录，不是通过凭据，当前结果以再次校验为准。blockingGroups 是已知阻断；warningGroups 仅披露；unknownGroups 是缺少严重级别的旧记录，须用当前门禁重新核验，不可当作警告。' };
       }
     } catch { /* no previous report, or unreadable legacy diagnostics */ }
+    const documentWorkStatus = this.buildDocumentWorkStatus(context, state);
     return {
       content: [{ type: 'text', text: JSON.stringify({ buildId: context.buildId ?? state.v2?.actorStore.buildId ?? null,
         scope, total: entries.length, requiredRewrites: [...(state.requiredRewrites ?? [])].sort(),
-        documentWorkStatus: this.buildDocumentWorkStatus(context, state),
+        documentWorkStatus,
+        // R3.1：工作集首页附带发布就绪预览，让 Leader 在申请发布前就能
+        // 看到真遗漏（分页后续页不重算，保持首轮派发延迟不变）。
+        ...(scope === 'workset' && start === 0
+          ? { publishReadiness: this.buildPublishReadiness(context, state, { identityGapCount: identityGaps.length, workStatus: documentWorkStatus }) }
+          : {}),
         identityGapCount: identityGaps.length, identityGaps: identityGaps.slice(0, 30),
         lastPublicationReport,
         entries: page, nextCursor }, null, 2) }],
@@ -4843,12 +5108,26 @@ export class AgentToolService {
     };
   }
 
-  /** build_issues_submit（Leader，§5.3）：聚合问题清单。 */
+  /** build_issues_submit（Leader，§5.3）：聚合问题清单。
+   *
+   * WP-B1复审 R2/R2-A：登记时记录门禁策略标记（standard/strict）与标准门禁
+   * 下每个 blocking 的起始候选绑定（正文+该文档范围声明哈希）——严格模式
+   * 与无标记清单在 openBlockingIssues 显式保持既有计数，不因 pass 关闭。 */
   private toolBuildIssuesSubmit(context: InternalRunContext, args: Record<string, unknown>): ToolResult {
     const v2 = requireV2Leader(context);
+    const state = requireBuildState(context);
     const summary = typeof args.summary === 'string' ? requireString(args, 'summary', 1, 2000) : null;
     const issueInputs = requireArray(args, 'issues');
     if (issueInputs.length > 500) throw new ToolError('invalid_request', 'issues 至多 500 项');
+    const standard = state.gatePolicy?.strict === false;
+    const originCache = new Map<string, { docHash: string; declarationHash: string } | null>();
+    const originBindingOf = (targetPath: string | null | undefined): { docHash: string; declarationHash: string } | null | undefined => {
+      if (!standard || !targetPath) return undefined;
+      if (!originCache.has(targetPath)) {
+        originCache.set(targetPath, currentPathCandidateBinding(state.stagingRoot, targetPath));
+      }
+      return originCache.get(targetPath) ?? null;
+    };
     const issues = issueInputs.map((raw) => {
       const input = asRecord(raw);
       if (!input) throw new ToolError('invalid_request', 'issues 每项必须是对象');
@@ -4869,9 +5148,11 @@ export class AgentToolService {
         sourceLocation: optStr(input, 'sourceLocation') ?? null,
         description: requireString(input, 'description', 1, 4000),
         fromReviewId: optStr(input, 'fromReviewId') ?? null,
+        ...(severity === 'blocking' ? { originBinding: originBindingOf(targetPath) } : {}),
       };
     });
-    const record = v2.actorStore.recordIssueList({ summary, issues });
+    const record = v2.actorStore.recordIssueList({ summary, issues,
+      gatePolicy: standard ? 'standard' : 'strict' });
     return {
       content: [{ type: 'text', text: `已提交问题清单 ${record.issueListId}（revision=${record.revision}，问题 ${issues.length} 项：blocking ${issues.filter((issue) => issue.severity === 'blocking').length}）` }],
       details: { issueListId: record.issueListId, revision: record.revision, issues: issues.length },
@@ -4900,7 +5181,9 @@ export class AgentToolService {
     const v2 = requireV2Leader(context);
     const action = args.action;
     const store = v2.actorStore;
-    const statusSummary = () => ({
+    const statusSummary = () => {
+      const documentWorkStatus = this.buildDocumentWorkStatus(context, state);
+      return {
       buildId: store.buildId,
       generation: store.activeGeneration,
       actors: store.listActors().length,
@@ -4908,7 +5191,9 @@ export class AgentToolService {
       receipts: store.listReceipts().length,
       reviews: store.listReviews().filter((review) => review.status === 'valid').length,
       openBlockingIssues: store.openBlockingIssues(),
-      documentWorkStatus: this.buildDocumentWorkStatus(context, state),
+      documentWorkStatus,
+      // R3.3：状态对账时同步看到发布就绪预览（与 manifest 首页同形同源）
+      publishReadiness: this.buildPublishReadiness(context, state, { workStatus: documentWorkStatus }),
       publishing: store.publishing?.requestId ?? null,
       lastPublishRejection: (() => {
         const request = store.latestPublishRequest();
@@ -4923,7 +5208,8 @@ export class AgentToolService {
           message: typeof request.result?.message === 'string' ? request.result.message : null,
           issues: publishValidationIssues(request.result) };
       })(),
-    });
+      };
+    };
     if (action === 'status') {
       return { content: [{ type: 'text', text: JSON.stringify(statusSummary(), null, 2) }], details: statusSummary() };
     }
@@ -4992,8 +5278,10 @@ export class AgentToolService {
       v2.actorStore.settlePublishRequest(request.requestId, outcome.accepted ? 'accepted' : 'rejected', outcome.result);
       const reasons = Array.isArray(outcome.result.reasons) ? outcome.result.reasons.map(String) : [];
       const details = Array.isArray(outcome.result.details) ? outcome.result.details.map(String) : [];
+      // R3.3：拒绝文本带 objToken（实测 b_20261105233621 02:12：只报 code
+      // 不报 token，Leader 需再翻 manifest 才能定位未覆盖源）。
       const issues = publishValidationIssues(outcome.result).map((item) =>
-        `${item.code}${item.path ? ` [${item.path}]` : ''}${item.message ? `：${item.message}` : ''}`);
+        `${item.code}${item.objToken ? ` {${item.objToken}}` : ''}${item.path ? ` [${item.path}]` : ''}${item.message ? `：${item.message}` : ''}`);
       const message = typeof outcome.result.message === 'string' ? outcome.result.message : '';
       const rejection = outcome.accepted ? '' : `；原因：${[String(outcome.result.reason ?? 'unknown'), ...reasons, ...details.slice(0, 8), ...issues, ...(message ? [message] : [])].join('；')}`;
       return {
@@ -5014,7 +5302,9 @@ export class AgentToolService {
       throw new ToolError('invalid_request', 'kb_read_batch 仅在构建态可用（会话态请用 raw_read / kb_read）');
     }
     const maxLines = optionalInt(args, 'maxLines', 1200, 1, 4000);
-    type BatchRequest = { kind: 'raw' | 'draft'; objToken?: string; path?: string; offset: number; limit?: number; includeDeclarations?: boolean; declarationClaimKey?: string; declarationObjectKey?: string };
+    // lineCharOffset：R5-B 行内分片续传坐标（仅 kb_read_batch 游标内部使用；
+    // 值为该行内 UTF-8 码点序号，游标不透明回传，不经工具 schema 暴露）。
+    type BatchRequest = { kind: 'raw' | 'draft'; objToken?: string; path?: string; offset: number; limit?: number; includeDeclarations?: boolean; declarationClaimKey?: string; declarationObjectKey?: string; lineCharOffset?: number };
     const normalizeRequest = (raw: unknown, label: string): BatchRequest => {
       const input = asRecord(raw);
       if (!input) throw new ToolError('invalid_request', `${label} 每项必须是对象`);
@@ -5029,13 +5319,13 @@ export class AgentToolService {
         ...(input.includeDeclarations === true ? { includeDeclarations: true } : {}),
         ...(input.declarationClaimKey !== undefined ? { declarationClaimKey: requireString(input, 'declarationClaimKey', 1, 200) } : {}),
         ...(input.declarationObjectKey !== undefined ? { declarationObjectKey: requireString(input, 'declarationObjectKey', 1, 200) } : {}),
+        ...(input.lineCharOffset !== undefined ? { lineCharOffset: optionalInt(input, 'lineCharOffset', 0, 0, 10_000_000) } : {}),
       };
     };
     let queue: BatchRequest[];
     // F05：每请求预算重置——cursor 只携带剩余队列与位置，不携带跨请求
     // linesUsed（此前原样恢复导致续页 while(linesUsed<maxLines) 恒假，返回
     // 空结果与相同 cursor，游标永久死锁）；携带旧版 linesUsed 字段时忽略。
-    let linesUsed = 0;
     if (typeof args.cursor === 'string' && args.cursor) {
       try {
         const decoded = JSON.parse(Buffer.from(args.cursor, 'base64url').toString('utf-8')) as { queue?: unknown };
@@ -5055,107 +5345,291 @@ export class AgentToolService {
     // 每个原始请求在本次调用中最多返回一页。续页放入 nextCursor，不能
     // 在同一调用中反复执行 limit=1 的请求（尤其 includeDeclarations=true
     // 会把整份声明重复序列化数百次，放大为数百万 token）。
+    //
+    // R5（复审）：预算对象是**最终 JSON 文本**字节——JSON 转义（反斜杠/
+    // 引号）、segmentMap/元数据、声明与 cursor 全部计入；采用“候选项 + 投影
+    // 游标”的精确账本（docOf 逐次重序列化当前结果集，n≤50 且单项≤20KB，
+    // 开销可忽略），杜绝“只算原文、放行后膨胀超 20KB 截断线、却登记全额
+    // 回执”的失配。行预算（maxLines/F05 游标重置）语义不变。
+    const cursorOf = (pending: BatchRequest[]): string | null => (pending.length > 0
+      ? Buffer.from(JSON.stringify({ queue: pending }), 'utf-8').toString('base64url')
+      : null);
+    const queueJsonBytes = textBytes(JSON.stringify({ queue }));
+    if (queueJsonBytes > KB_BATCH_QUEUE_JSON_MAX_BYTES) {
+      throw new ToolError('kb_read_batch_queue_too_large',
+        `剩余读取队列编码后 ${queueJsonBytes} 字节，游标（base64 约放大 4/3）会超出单页输出预算；请减少单次 requests 数量或缩小过滤参数，分多次调用`, 400);
+    }
+    const docBytes = (items: unknown[], cursor: string | null, used: number): number =>
+      textBytes(JSON.stringify({ results: items, nextCursor: cursor, linesUsed: used, budget: maxLines }, null, 2));
     const pageRequests = queue.length;
+    let linesUsed = 0;
     for (let requestIndex = 0; requestIndex < pageRequests && queue.length > 0 && linesUsed < maxLines; requestIndex += 1) {
       const request = queue.shift()!;
       const budgetLeft = maxLines - linesUsed;
       const effLimit = Math.min(request.limit ?? 800, budgetLeft, 2000);
+      // 投影游标：当前请求被完整处理后剩余队列（截断项回尾）应产生的 cursor
+      const projectedCursorOf = (lineCount: number, requeued: boolean): string | null => {
+        const pending = [...queue];
+        if (requeued) pending.push({ ...request, offset: request.offset + lineCount, ...(request.kind === 'draft' ? { includeDeclarations: false } : {}) });
+        return cursorOf(pending);
+      };
+      const admit = (item: Record<string, unknown>, lineCount: number, requeued: boolean, nextLinesUsed: number): boolean => {
+        const cursor = projectedCursorOf(lineCount, requeued);
+        return docBytes([...results, item], cursor, nextLinesUsed) <= TOOL_PAGE_SOFT_BUDGET_BYTES
+          || (results.length === 0 && docBytes([item], cursor, nextLinesUsed) <= TOOL_PAGE_HARD_CAP_BYTES);
+      };
       if (request.kind === 'raw') {
         const entry = state.snapshot.get(request.objToken!);
         if (!entry) {
-          results.push({ kind: 'raw', objToken: request.objToken, error: `原始文档不存在或无成功本地版本: ${request.objToken}` });
+          const item = { kind: 'raw', objToken: request.objToken, error: `原始文档不存在或无成功本地版本: ${request.objToken}` };
+          if (!admit(item, 0, false, linesUsed)) { queue.unshift(request); break; }
+          results.push(item);
           continue;
         }
         const assembled = this.assembleBuildRead(state, entry);
-        const slice = assembled.lines.slice(request.offset, request.offset + effLimit);
-        const winStart = request.offset + 1;
-        const winEnd = request.offset + slice.length;
-        const truncated = winEnd < assembled.lines.length;
-        const segmentMap: Array<Record<string, unknown>> = [];
         const resourceById = new Map(assembled.resources.map((resource) => [resource.resourceId, resource]));
-        for (const segment of assembled.segments) {
-          if (segment.outEnd < winStart || segment.outStart > winEnd) continue;
-          const clippedStart = Math.max(segment.outStart, winStart);
-          const clippedEnd = Math.min(segment.outEnd, winEnd);
-          if (segment.resourceId) {
-            const resource = resourceById.get(segment.resourceId)!;
-            const resStart = segment.resStart! + (clippedStart - segment.outStart);
-            const resEnd = segment.resStart! + (clippedEnd - segment.outStart);
-            const returnedText = resource.lines.slice(resStart - 1, resEnd).join('\n');
-            const readReceiptId = `rr_${crypto.randomBytes(9).toString('hex')}`;
-            receipts.push({
-              readReceiptId,
-              buildId: context.buildId ?? 'unknown',
-              unitId: context.options.worker?.unitId ?? null,
-              toolCallId: meta?.toolCallId ?? 'unknown',
-              sourceSnapshotHash: entry.contentHash,
-              resourceId: segment.resourceId,
-              selector: { kind: 'read_range', lineStart: resStart, lineEnd: resEnd },
-              returnedHash: contentResourceHash(returnedText),
+        const buildRawItem = (lineCount: number): { item: Record<string, unknown>; itemReceipts: ReadReceiptRecord[] } => {
+          const slice = assembled.lines.slice(request.offset, request.offset + lineCount);
+          const winStart = request.offset + 1;
+          const winEnd = request.offset + slice.length;
+          const truncated = winEnd < assembled.lines.length;
+          const segmentMap: Array<Record<string, unknown>> = [];
+          const itemReceipts: ReadReceiptRecord[] = [];
+          for (const segment of assembled.segments) {
+            if (segment.outEnd < winStart || segment.outStart > winEnd) continue;
+            const clippedStart = Math.max(segment.outStart, winStart);
+            const clippedEnd = Math.min(segment.outEnd, winEnd);
+            if (segment.resourceId) {
+              const resource = resourceById.get(segment.resourceId)!;
+              const resStart = segment.resStart! + (clippedStart - segment.outStart);
+              const resEnd = segment.resStart! + (clippedEnd - segment.outStart);
+              const returnedText = resource.lines.slice(resStart - 1, resEnd).join('\n');
+              const readReceiptId = `rr_${crypto.randomBytes(9).toString('hex')}`;
+              itemReceipts.push({
+                readReceiptId,
+                buildId: context.buildId ?? 'unknown',
+                unitId: context.options.worker?.unitId ?? null,
+                toolCallId: meta?.toolCallId ?? 'unknown',
+                sourceSnapshotHash: entry.contentHash,
+                resourceId: segment.resourceId,
+                selector: { kind: 'read_range', lineStart: resStart, lineEnd: resEnd },
+                returnedHash: contentResourceHash(returnedText),
+                truncated,
+              });
+              segmentMap.push({ resourceId: segment.resourceId, outStart: clippedStart, outEnd: clippedEnd, resStart, resEnd, readReceiptId });
+            } else {
+              segmentMap.push({ derived: segment.derived ?? 'derived', outStart: clippedStart, outEnd: clippedEnd });
+            }
+          }
+          return {
+            item: {
+              kind: 'raw',
+              objToken: entry.objToken,
+              title: entry.title,
+              relPath: entry.relPath,
+              offset: request.offset,
+              returnedLines: slice.length,
+              totalLines: assembled.lines.length,
               truncated,
-            });
-            segmentMap.push({ resourceId: segment.resourceId, outStart: clippedStart, outEnd: clippedEnd, resStart, resEnd, readReceiptId });
-          } else {
-            segmentMap.push({ derived: segment.derived ?? 'derived', outStart: clippedStart, outEnd: clippedEnd });
+              text: `<untrusted_source obj_token="${entry.objToken}" title="${escapeXml(entry.title)}">\n${slice.join('\n')}\n</untrusted_source>`,
+              segmentMap,
+            },
+            itemReceipts,
+          };
+        };
+        const hi = Math.max(0, Math.min(effLimit, assembled.lines.length - request.offset));
+        let built = buildRawItem(hi);
+        let chosenLines = hi;
+        if (!admit(built.item, chosenLines, built.item.truncated as boolean, linesUsed + chosenLines) && hi > 1) {
+          const fit = fitWindowByBytes(hi, TOOL_PAGE_SOFT_BUDGET_BYTES,
+            (n) => docBytes([...results, buildRawItem(n).item], projectedCursorOf(n, request.offset + n < assembled.lines.length), linesUsed + n));
+          chosenLines = Math.max(1, fit);
+          built = buildRawItem(chosenLines);
+          while (!admit(built.item, chosenLines, built.item.truncated as boolean, linesUsed + chosenLines) && chosenLines > 1) {
+            chosenLines -= 1;
+            built = buildRawItem(chosenLines);
           }
         }
-        linesUsed += slice.length;
-        results.push({
-          kind: 'raw',
-          objToken: entry.objToken,
-          title: entry.title,
-          relPath: entry.relPath,
-          offset: request.offset,
-          returnedLines: slice.length,
-          totalLines: assembled.lines.length,
-          truncated,
-          text: `<untrusted_source obj_token="${entry.objToken}" title="${escapeXml(entry.title)}">\n${slice.join('\n')}\n</untrusted_source>`,
-          segmentMap,
-        });
-        if (truncated) {
-          queue.push({ ...request, offset: request.offset + slice.length });
+        if (!admit(built.item, chosenLines, built.item.truncated as boolean, linesUsed + chosenLines)) {
+          // R5-A：本页放不下但“空页+完整封套”下可读 → defer 到下一页
+          //（nextCursor 续读，不误报超限、不丢行、回执含该行）。
+          const aloneBytes = docBytes([built.item], cursorOf([request, ...queue]), linesUsed + chosenLines);
+          if (chosenLines > 1 || aloneBytes <= TOOL_PAGE_HARD_CAP_BYTES) {
+            queue.unshift(request);
+            break;
+          }
+          // R5-B：空页完整封套下仍超硬上限 → 不可分单行按 UTF-8 码点边界
+          // 行内分片续传：游标携带 lineCharOffset 无损拼回整行；不登记该行
+          // 回执（分片不能作为证据引用，防引用未交付字节），续传必推进。
+          const line = assembled.lines[request.offset] ?? '';
+          const cps = [...line];
+          const from = Math.min(request.lineCharOffset ?? 0, cps.length);
+          const { lineCharOffset: _consumed, ...rest } = request;
+          void _consumed;
+          const contEntry = (end: number): BatchRequest => (end < cps.length
+            ? { ...rest, offset: request.offset, lineCharOffset: end }
+            : { ...rest, offset: request.offset + 1 });
+          const chunkItem = (end: number): Record<string, unknown> => ({
+            kind: 'raw', objToken: entry.objToken, title: entry.title, relPath: entry.relPath,
+            offset: request.offset, returnedLines: 0, totalLines: assembled.lines.length,
+            truncated: true,
+            lineChunk: { line: request.offset + 1, charStart: from, charEnd: end, totalChars: cps.length },
+            note: `该行 ${textBytes(line)} 字节超过单页硬上限（含 JSON 转义与元数据），按 UTF-8 码点边界分片交付，游标自动续传拼回整行；分片不登记该行读取回执、不可作为证据引用——精确短语用 raw_csv_find / raw_csv_cells 定位`,
+            text: cps.slice(from, end).join(''),
+          });
+          const chunkFits = (end: number): boolean => end > from
+            && (docBytes([...results, chunkItem(end)], cursorOf([...queue, contEntry(end)]), linesUsed) <= TOOL_PAGE_SOFT_BUDGET_BYTES
+              || (results.length === 0 && docBytes([chunkItem(end)], cursorOf([...queue, contEntry(end)]), linesUsed) <= TOOL_PAGE_HARD_CAP_BYTES));
+          let end = cps.length;
+          if (!chunkFits(end)) {
+            const span = cps.length - from;
+            const fit = fitWindowByBytes(span, TOOL_PAGE_SOFT_BUDGET_BYTES,
+              (n) => docBytes([...results, chunkItem(from + Math.max(n, 1))], cursorOf([...queue, contEntry(from + Math.max(n, 1))]), linesUsed));
+            end = from + Math.max(1, fit);
+            while (end > from + 1 && !chunkFits(end)) end -= 1;
+          }
+          if (!chunkFits(end)) {
+            if (results.length > 0) { queue.unshift(request); break; }
+            throw new ToolError('kb_read_batch_item_too_large',
+              `raw ${entry.objToken} 第 ${request.offset + 1} 行分片无法装入空页输出预算；请改用 raw_search / raw_csv_find 定位短语`, 409);
+          }
+          results.push(chunkItem(end));
+          if (end < cps.length || request.offset + 1 < assembled.lines.length) {
+            queue.push(contEntry(end));
+          }
+          continue;
+        }
+        results.push(built.item);
+        receipts.push(...built.itemReceipts);
+        linesUsed += chosenLines;
+        if (built.item.truncated) {
+          queue.push({ ...request, offset: request.offset + chosenLines });
         }
       } else {
         const docPath = request.path!;
         try {
           validateStdDocPath(docPath);
         } catch (error) {
-          results.push({ kind: 'draft', path: docPath, error: error instanceof Error ? error.message : String(error) });
+          const item = { kind: 'draft', path: docPath, error: error instanceof Error ? error.message : String(error) };
+          if (!admit(item, 0, false, linesUsed)) { queue.unshift(request); break; }
+          results.push(item);
           continue;
         }
         const target = path.join(state.stagingRoot, 'docs', docPath);
         if (!fs.existsSync(target)) {
-          results.push({ kind: 'draft', path: docPath, error: `草稿不存在: ${docPath}` });
+          const item = { kind: 'draft', path: docPath, error: `草稿不存在: ${docPath}` };
+          if (!admit(item, 0, false, linesUsed)) { queue.unshift(request); break; }
+          results.push(item);
           continue;
         }
         const coordinates = draftEditCoordinates(fs.readFileSync(target, 'utf-8'));
-        const slice = coordinates.paramLines.slice(request.offset, request.offset + effLimit);
-        const truncated = request.offset + slice.length < coordinates.paramLines.length;
-        linesUsed += slice.length;
-        results.push({
-          kind: 'draft',
-          path: docPath,
-          coordinateBasis: 'param',
-          offset: request.offset,
-          returnedLines: slice.length,
-          totalLines: coordinates.paramLines.length,
-          truncated,
-          contentHash: contentResourceHash(coordinates.paramLines.join('\n')),
-          text: slice.join('\n'),
-          ...(request.includeDeclarations ? { declarations: this.renderDraftDeclarations(state, docPath, request.declarationClaimKey ?? null, request.declarationObjectKey ?? null) } : {}),
-        });
-        if (truncated) {
-          queue.push({ ...request, offset: request.offset + slice.length, includeDeclarations: false });
+        const buildDraftItem = (lineCount: number): Record<string, unknown> => {
+          const slice = coordinates.paramLines.slice(request.offset, request.offset + lineCount);
+          return {
+            kind: 'draft',
+            path: docPath,
+            coordinateBasis: 'param',
+            offset: request.offset,
+            returnedLines: slice.length,
+            totalLines: coordinates.paramLines.length,
+            truncated: request.offset + slice.length < coordinates.paramLines.length,
+            contentHash: contentResourceHash(coordinates.paramLines.join('\n')),
+            text: slice.join('\n'),
+            ...(request.includeDeclarations ? { declarations: this.renderDraftDeclarations(state, docPath, request.declarationClaimKey ?? null, request.declarationObjectKey ?? null) } : {}),
+          };
+        };
+        const hi = Math.max(0, Math.min(effLimit, coordinates.paramLines.length - request.offset));
+        let item = buildDraftItem(hi);
+        let chosenLines = hi;
+        if (!admit(item, chosenLines, item.truncated as boolean, linesUsed + chosenLines) && hi > 1) {
+          const fit = fitWindowByBytes(hi, TOOL_PAGE_SOFT_BUDGET_BYTES,
+            (n) => docBytes([...results, buildDraftItem(n)], projectedCursorOf(n, request.offset + n < coordinates.paramLines.length), linesUsed + n));
+          chosenLines = Math.max(1, fit);
+          item = buildDraftItem(chosenLines);
+          while (!admit(item, chosenLines, item.truncated as boolean, linesUsed + chosenLines) && chosenLines > 1) {
+            chosenLines -= 1;
+            item = buildDraftItem(chosenLines);
+          }
+        }
+        if (!admit(item, chosenLines, item.truncated as boolean, linesUsed + chosenLines)) {
+          // R5-A：本页放不下但“空页+完整封套”下可读 → defer 到下一页。
+          const aloneBytes = docBytes([item], cursorOf([request, ...queue]), linesUsed + chosenLines);
+          if (chosenLines > 1 || aloneBytes <= TOOL_PAGE_HARD_CAP_BYTES) {
+            queue.unshift(request);
+            break;
+          }
+          // R5-B：空页完整封套下仍超硬上限。先区分驱动者：空文本+声明仍
+          // 超限 → 声明原子不可分，报精确错误（不截断、不声称完整读取）；
+          // 否则单行正文超限 → 按 UTF-8 码点边界行内分片续传（声明不随
+          // 分片返回，note 引导单独按 declarationClaimKey 取），游标必推进。
+          if (request.includeDeclarations) {
+            const declOnly = buildDraftItem(0);
+            if (docBytes([declOnly], cursorOf([request, ...queue]), linesUsed) > TOOL_PAGE_HARD_CAP_BYTES) {
+              throw new ToolError('kb_read_batch_item_too_large',
+                `draft ${docPath} 的声明（includeDeclarations）超出单页输出预算；请用 declarationClaimKey / declarationObjectKey 只取所需对象，或 draft_read 分页读正文`, 409);
+            }
+          }
+          const line = coordinates.paramLines[request.offset] ?? '';
+          const cps = [...line];
+          const from = Math.min(request.lineCharOffset ?? 0, cps.length);
+          const { lineCharOffset: _consumed, ...rest } = request;
+          void _consumed;
+          const contEntry = (end: number): BatchRequest => (end < cps.length
+            ? { ...rest, offset: request.offset, lineCharOffset: end }
+            : { ...rest, offset: request.offset + 1 });
+          const chunkItem = (end: number): Record<string, unknown> => ({
+            kind: 'draft', path: docPath, coordinateBasis: 'param',
+            offset: request.offset, returnedLines: 0, totalLines: coordinates.paramLines.length,
+            truncated: true,
+            contentHash: contentResourceHash(coordinates.paramLines.join('\n')),
+            lineChunk: { line: request.offset + 1, charStart: from, charEnd: end, totalChars: cps.length },
+            note: `该行 ${textBytes(line)} 字节超过单页硬上限，按 UTF-8 码点边界分片交付，游标自动续传拼回整行${request.includeDeclarations ? '；声明未随分片返回，需要时用 declarationClaimKey / declarationObjectKey 单独读取' : ''}`,
+            text: cps.slice(from, end).join(''),
+          });
+          const chunkFits = (end: number): boolean => end > from
+            && (docBytes([...results, chunkItem(end)], cursorOf([...queue, contEntry(end)]), linesUsed) <= TOOL_PAGE_SOFT_BUDGET_BYTES
+              || (results.length === 0 && docBytes([chunkItem(end)], cursorOf([...queue, contEntry(end)]), linesUsed) <= TOOL_PAGE_HARD_CAP_BYTES));
+          let end = cps.length;
+          if (!chunkFits(end)) {
+            const span = cps.length - from;
+            const fit = fitWindowByBytes(span, TOOL_PAGE_SOFT_BUDGET_BYTES,
+              (n) => docBytes([...results, chunkItem(from + Math.max(n, 1))], cursorOf([...queue, contEntry(from + Math.max(n, 1))]), linesUsed));
+            end = from + Math.max(1, fit);
+            while (end > from + 1 && !chunkFits(end)) end -= 1;
+          }
+          if (!chunkFits(end)) {
+            if (results.length > 0) { queue.unshift(request); break; }
+            throw new ToolError('kb_read_batch_item_too_large',
+              `draft ${docPath} 第 ${request.offset + 1} 行分片无法装入空页输出预算；请缩小读取范围后重试`, 409);
+          }
+          results.push(chunkItem(end));
+          if (end < cps.length || request.offset + 1 < coordinates.paramLines.length) {
+            queue.push(contEntry(end));
+          }
+          continue;
+        }
+        results.push(item);
+        linesUsed += chosenLines;
+        if (item.truncated) {
+          queue.push({ ...request, offset: request.offset + chosenLines, includeDeclarations: false });
         }
       }
     }
+    const nextCursor = cursorOf(queue);
+    const payload = { results, nextCursor, linesUsed, budget: maxLines };
+    const text = JSON.stringify(payload, null, 2);
+    // R5 兑底断言（review-2 风险项：先定型再登记）——正常路径由 admit
+    // 精确账本保证不达此处（唯一未投影增量是 break 时 unshift 回队的一个
+    // 请求项，≤ ~1KB，在 2.5KB SOFT/HARD 裕量内）；若实现漂移到超限，
+    // 先报错不返回，且**不登记回执**（杜绝“有回执而无交付”）。
+    if (textBytes(text) > TOOL_PAGE_HARD_CAP_BYTES) {
+      throw new ToolError('kb_read_batch_output_too_large',
+        `响应最终字节数 ${textBytes(text)} 超出单页硬上限（含游标/封套膨胀）；请减少单次 requests 数量后重试`, 409);
+    }
     if (receipts.length > 0) this.appendReadReceipts(state, receipts);
-    const nextCursor = queue.length > 0
-      ? Buffer.from(JSON.stringify({ queue }), 'utf-8').toString('base64url')
-      : null;
     return {
-      content: [{ type: 'text', text: JSON.stringify({ results, nextCursor, linesUsed, budget: maxLines }, null, 2) }],
-      details: { resources: results.length, linesUsed, nextCursor, receipts: receipts.length },
+      content: [{ type: 'text', text }],
+      details: { resources: results.length, linesUsed, nextCursor, receipts: receipts.length, contentBytes: textBytes(text) },
     };
   }
 
@@ -5455,7 +5929,10 @@ export class AgentToolService {
       ...(inheritedCoverage.length ? { coverageUpdates: inheritedCoverage } : {}),
       ...(args.expectedDraftRevision !== undefined ? { expectedDraftRevision: optionalInt(args, 'expectedDraftRevision', 0, 0, 1_000_000_000) } : {}),
     };
-    const normalizedWriteArgs = normalizeKbWriteDocArgs(writeArgs);
+    const normalizedWriteArgs = normalizeKbWriteDocArgs(
+      writeArgs,
+      new Set(Object.keys(this.loadKnowledgeDraft(state).evidenceKeys)),
+    );
     if (evidenceClaimsAdd.length > 0) {
       const additions = (normalizedWriteArgs.evidenceClaims as Array<Record<string, unknown>>).slice(-evidenceClaimsAdd.length);
       for (const [index, addition] of additions.entries()) {
@@ -5897,6 +6374,256 @@ function requireArray(args: Record<string, unknown>, key: string): unknown[] {
   return value;
 }
 
+// ===========================================================================
+// WP-C（R5 回合开销）：构建工具参数形状容错。
+// 买测问题：模型误填别名（queries/objToken/docPath/paths/listId…）或用对象
+// 形状提交字符串项时，amagi/pi 的 JSON schema 校验（additionalProperties）
+// 会把整次调用拒在校验层，浪费一个完整 LLM 回合。tool-specs 已对只读工具
+// 放开 additionalProperties；本层只做「语义无歧义的形状规范化 + 更好的错误
+// 信息」：规范化成功在返回 paramNotes 说明；歧义输入报一次可修复的精确错误
+// （列出真实参数名），绝不静默吞掉。写入工具除枚举过的情形（build_handoff_
+// submit.openIssues 对象项）外仍由各自执行器严格校验。
+// ===========================================================================
+
+interface NormalizedToolArgs {
+  args: Record<string, unknown>;
+  /** 追加到成功返回中的规范化说明（空 = 未发生任何容忍） */
+  notes: string[];
+}
+
+function unrecognizedParamError(tool: string, realParams: string, received: readonly string[]): ToolError {
+  return new ToolError('invalid_request',
+    `${tool} 只接受 ${realParams}；收到无法识别的参数：${received.join('、')}。请改用上述真实参数名重试，完整契约可用 kb_tool_schema 查询`);
+}
+
+/** 多查询别名（queries）共用校验：非空字符串数组，逐个执行合并。 */
+function normalizeQueriesAlias(args: Record<string, unknown>, notes: string[]): void {
+  if (args.queries === undefined) return;
+  const queries = args.queries;
+  if (!Array.isArray(queries) || queries.length === 0 || queries.length > 8
+    || queries.some((item) => typeof item !== 'string' || !item.trim() || item.length > 200)) {
+    throw new ToolError('invalid_request', 'queries 须为 1..8 个长度 1..200 的非空字符串（多查询逐个执行合并结果）；单查询请用 query 字符串');
+  }
+  if (args.query === undefined) {
+    notes.push(`已把 queries（${queries.length} 项）按多查询执行并合并去重结果`);
+  } else {
+    delete args.queries;
+    notes.push('同时收到 query 与 queries：以 query 为准，已忽略 queries');
+  }
+}
+
+/** build_handoff_submit.openIssues 对象项 → 一句字符串（优先语义字段，兕底 JSON）。 */
+function stringifyOpenIssueItem(item: Record<string, unknown>): string {
+  const mainKeys = ['description', 'text', 'message', 'summary', 'issue', 'reason'];
+  const main = mainKeys
+    .map((key) => (typeof item[key] === 'string' && (item[key] as string).trim() ? item[key] as string : ''))
+    .find((text) => text) ?? JSON.stringify(item);
+  const extras = Object.entries(item)
+    .filter(([key, value]) => !mainKeys.includes(key)
+      && (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean')
+      && String(value).trim())
+    .map(([key, value]) => `${key}=${String(value)}`);
+  const line = extras.length ? `${main}（${extras.join('；')}）` : main;
+  return line.length > 600 ? `${line.slice(0, 597)}…` : line;
+}
+
+/** 各工具的参数形状规范化入口（未列出的工具原样透传）。 */
+export function normalizeToolArguments(toolName: string, input: Record<string, unknown>): NormalizedToolArgs {
+  const args = { ...input };
+  const notes: string[] = [];
+  switch (toolName) {
+    case 'raw_search': {
+      normalizeQueriesAlias(args, notes);
+      const scope = args.objToken !== undefined ? args.objToken : args.sourceId;
+      if (scope !== undefined) {
+        if (typeof scope !== 'string' || !scope.trim()) {
+          throw unrecognizedParamError('raw_search', 'query（字符串）与 limit（可选）', ['objToken']);
+        }
+        args.objToken = scope;
+        delete args.sourceId;
+        notes.push(`已按 objToken=${scope} 限定搜索范围`);
+      }
+      const known = new Set(['query', 'limit', 'queries', 'objToken']);
+      const unknown = Object.keys(args).filter((key) => !known.has(key));
+      if (unknown.length) throw unrecognizedParamError('raw_search', 'query（字符串）、limit（可选）；queries 多查询/objToken 限定单源可容忍', unknown);
+      // R4 复审：schema 已不再 required query（别名入口须能到达服务端），
+      // 缺失时的精确检查由本层承担。
+      if (args.query === undefined && args.queries === undefined) {
+        throw new ToolError('invalid_request', 'raw_search 需要参数 query（1..200 字符搜索关键词，字符串）；多查询可用 queries 字符串数组（逐个执行合并结果）');
+      }
+      return { args, notes };
+    }
+    case 'draft_search': {
+      normalizeQueriesAlias(args, notes);
+      if (args.path !== undefined) {
+        if (typeof args.path !== 'string' || !args.path.trim()) {
+          throw unrecognizedParamError('draft_search', 'query（字符串）与 limit（可选）', ['path']);
+        }
+        notes.push(`已按 path=${args.path} 限定搜索范围（精确路径或目录前缀）`);
+      }
+      if (args.kind !== undefined) {
+        delete args.kind;
+        notes.push('已忽略参数 kind（draft_search 不需要）');
+      }
+      const known = new Set(['query', 'limit', 'queries', 'path']);
+      const unknown = Object.keys(args).filter((key) => !known.has(key));
+      if (unknown.length) throw unrecognizedParamError('draft_search', 'query（字符串）、limit（可选）；queries 多查询/path 限定范围可容忍', unknown);
+      // R4 复审：schema 已不再 required query，缺失时的精确检查由本层承担。
+      if (args.query === undefined && args.queries === undefined) {
+        throw new ToolError('invalid_request', 'draft_search 需要参数 query（1..200 字符搜索关键词，字符串）；多查询可用 queries 字符串数组');
+      }
+      return { args, notes };
+    }
+    case 'draft_read': {
+      if (args.kind !== undefined) {
+        delete args.kind;
+        notes.push('已忽略参数 kind（draft_read 不需要）');
+      }
+      if (args.path === undefined) {
+        if (typeof args.docPath === 'string' && args.docPath.trim()) {
+          args.path = args.docPath;
+          notes.push('已把 docPath 别名按 path 处理');
+        } else if (Array.isArray(args.paths)) {
+          const paths = args.paths.filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
+          if (paths.length === 1) {
+            args.path = paths[0];
+            notes.push('已把 paths（单项）别名按 path 处理');
+          } else {
+            throw new ToolError('invalid_request', 'draft_read 一次只读一篇草稿（参数是 path 字符串）；多资源批量读取请用 kb_read_batch 的 requests');
+          }
+        }
+      }
+      delete args.docPath;
+      delete args.paths;
+      if (args.path === undefined) {
+        throw new ToolError('invalid_request', 'draft_read 需要参数 path（草稿 POSIX 相对路径）；metadataOnly/includeDeclarations 等为可选参数');
+      }
+      const known = new Set(['path', 'offset', 'limit', 'metadataOnly', 'includeDeclarations', 'declarationClaimKey', 'declarationObjectKey']);
+      const unknown = Object.keys(args).filter((key) => !known.has(key));
+      if (unknown.length) throw unrecognizedParamError('draft_read', 'path、offset、limit、metadataOnly、includeDeclarations、declarationClaimKey、declarationObjectKey', unknown);
+      return { args, notes };
+    }
+    case 'draft_list': {
+      const ignored = Object.keys(args);
+      if (ignored.length) notes.push(`已忽略参数 ${ignored.join('、')}（draft_list 无参数，返回全部草稿清单）`);
+      return { args: {}, notes };
+    }
+    case 'raw_csv_cells': {
+      if (args.columns !== undefined) {
+        delete args.columns;
+        notes.push('已忽略参数 columns（raw_csv_cells 返回所选 record 的全部非空单元格；列选择在证据 selector 中表达）');
+      }
+      if (typeof args.recordStart === 'number' && Number.isSafeInteger(args.recordStart)) {
+        if (args.recordStart === 0) {
+          args.recordStart = 1;
+          notes.push('已把 recordStart=0 规范化为 1（逻辑 record 从 1 起始）');
+        } else if (args.recordStart < 0) {
+          throw new ToolError('invalid_request', 'recordStart 须为 ≥1 的整数（逻辑 record 1 基坐标；首条 record 为 1）');
+        }
+      }
+      const known = new Set(['objToken', 'resourceId', 'recordStart', 'recordEnd']);
+      const unknown = Object.keys(args).filter((key) => !known.has(key));
+      if (unknown.length) throw unrecognizedParamError('raw_csv_cells', 'objToken、resourceId、recordStart、recordEnd', unknown);
+      return { args, notes };
+    }
+    case 'raw_csv_find': {
+      const known = new Set(['objToken', 'resourceId', 'queries']);
+      const unknown = Object.keys(args).filter((key) => !known.has(key));
+      if (unknown.length) throw unrecognizedParamError('raw_csv_find', 'objToken、resourceId（完整 #csv: 资源 ID，见 raw_read 资源表）、queries', unknown);
+      if (args.resourceId === undefined) {
+        throw new ToolError('invalid_request', 'raw_csv_find 需要参数 resourceId（完整资源 ID，形如 <objToken>#csv:<文件名>，来自 raw_read 返回的资源表）；objToken 与 queries 不能替代它');
+      }
+      return { args, notes };
+    }
+    case 'kb_read_batch': {
+      if (args.requests === undefined && !(typeof args.cursor === 'string' && args.cursor)) {
+        if (Array.isArray(args.resources)) {
+          args.requests = args.resources;
+          delete args.resources;
+          notes.push('已把 resources 别名按 requests 数组处理');
+        } else if (args.kind === 'raw' || args.kind === 'draft' || typeof args.objToken === 'string' || typeof args.path === 'string') {
+          const item: Record<string, unknown> = {};
+          for (const key of ['kind', 'objToken', 'path', 'offset', 'limit', 'includeDeclarations', 'declarationClaimKey', 'declarationObjectKey']) {
+            if (args[key] !== undefined) { item[key] = args[key]; delete args[key]; }
+          }
+          args.requests = [item];
+          notes.push('已把顶层单请求对象包装为 requests 数组（kb_read_batch 的参数是 requests:[{kind,objToken|path,…}]）');
+        }
+      }
+      const known = new Set(['requests', 'maxLines', 'cursor']);
+      const unknown = Object.keys(args).filter((key) => !known.has(key));
+      if (unknown.length || args.requests === undefined && !(typeof args.cursor === 'string' && args.cursor)) {
+        throw unrecognizedParamError('kb_read_batch', 'requests（1..50 项读取请求，每项 {kind,objToken|path,offset,limit,…}）、maxLines、cursor（续页）', unknown.length ? unknown : ['(缺 requests)']);
+      }
+      return { args, notes };
+    }
+    case 'build_issues_list': {
+      const ignored: string[] = [];
+      for (const key of ['issueListId', 'listId', 'revision']) {
+        if (args[key] !== undefined) { delete args[key]; ignored.push(key); }
+      }
+      if (ignored.length) notes.push(`已忽略参数 ${ignored.join('、')}（build_issues_list 始终返回最新 revision 的问题清单，不支持按 ID/revision 取历史）`);
+      const known = new Set(['targetPath']);
+      const unknown = Object.keys(args).filter((key) => !known.has(key));
+      if (unknown.length) throw unrecognizedParamError('build_issues_list', 'targetPath（可选，按目标路径过滤）', unknown);
+      return { args, notes };
+    }
+    case 'kb_tool_schema': {
+      if (args.name === undefined && typeof args.tool === 'string' && args.tool.trim()) {
+        args.name = args.tool;
+        notes.push('已把 tool 别名按 name 处理');
+      }
+      delete args.tool;
+      const known = new Set(['name']);
+      const unknown = Object.keys(args).filter((key) => !known.has(key));
+      if (unknown.length) throw unrecognizedParamError('kb_tool_schema', 'name（要查看的知识工具名）', unknown);
+      // R4 复审：schema 已不再 required name，缺失时的精确检查由本层承担。
+      if (args.name === undefined) {
+        throw new ToolError('invalid_request', 'kb_tool_schema 需要参数 name（要查看的知识工具名，如 kb_edit_doc）');
+      }
+      return { args, notes };
+    }
+    case 'build_handoff_submit': {
+      if (Array.isArray(args.openIssues)) {
+        const serialized: string[] = [];
+        let converted = 0;
+        for (const item of args.openIssues) {
+          if (typeof item === 'string' && item.length > 0) { serialized.push(item); continue; }
+          const record = asRecord(item);
+          if (record) { serialized.push(stringifyOpenIssueItem(record)); converted += 1; continue; }
+          throw new ToolError('invalid_request', 'openIssues 每项须为非空字符串或对象（对象由服务端序列化为一句描述）');
+        }
+        if (converted > 0) {
+          args.openIssues = serialized;
+          notes.push(`已把 ${converted} 个 openIssues 对象项序列化为字符串（优先 description/text/message 字段）`);
+        }
+      }
+      return { args, notes };
+    }
+    default:
+      return { args, notes };
+  }
+}
+
+/** 把规范化说明追加到成功返回：JSON 载荷写入 paramNotes 字段，纯文本追加一行。 */
+function appendParamNotesToResult(result: ToolResult, notes: string[]): ToolResult {
+  const first = result.content[0];
+  const noteText = notes.join('；');
+  if (first?.type === 'text') {
+    try {
+      const parsed = JSON.parse(first.text) as unknown;
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const enriched = { ...(parsed as Record<string, unknown>), paramNotes: notes };
+        return { ...result, content: [{ type: 'text', text: JSON.stringify(enriched) }] };
+      }
+    } catch {
+      /* 非 JSON 载荷：按文本追加 */
+    }
+    return { ...result, content: [...result.content, { type: 'text', text: `<param_notes>${noteText}</param_notes>` }] };
+  }
+  return result;
+}
+
 function requirePositiveInt(record: Record<string, unknown>, key: string): number {
   const value = record[key];
   if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) {
@@ -6218,13 +6945,45 @@ function summarizeRawSourceShape(input: {
   return { totalLines: input.lines.length, attachmentCount: attachments.length, sectionCount, sections, attachments };
 }
 
+/** csvTableImports 列坐标规范化（WP-C R5：模型常写 "@A"/"A"/"3"）：
+ * 接受 0 起始整数列位，或数字字符串与 1 起始字母坐标（@A/A→0）；
+ * 歧义形式（如 A1 单元格引用）报精确错误，不猜测。 */
+function normalizeCsvColumnCoordinate(value: unknown, index: number): number {
+  if (typeof value === 'number' && Number.isSafeInteger(value)) return value;
+  if (typeof value === 'string' && value.trim()) {
+    const text = value.trim();
+    if (/^\d+$/.test(text)) {
+      const parsed = Number(text);
+      if (Number.isSafeInteger(parsed)) return parsed;
+    }
+    const letters = /^@?([A-Za-z]+)$/.exec(text);
+    if (letters) {
+      let column = 0;
+      for (const ch of letters[1]!.toUpperCase()) column = column * 26 + (ch.charCodeAt(0) - 64);
+      return column - 1;
+    }
+  }
+  throw new ToolError('invalid_request',
+    `csvTableImports.columns[${index}] 无法解析: ${JSON.stringify(value)}（接受 0 起始整数列位，或 "3"/@C/C 字母坐标；单元格引用如 C5 不是列坐标）`);
+}
+
 /** kb_write_doc 的机械参数补全。只使用调用已声明的路径、来源、语义键与
  * selector；不推测对象类型、业务族、适用范围、来源事实或覆盖去向。 */
-function normalizeKbWriteDocArgs(args: Record<string, unknown>): Record<string, unknown> {
+function normalizeKbWriteDocArgs(
+  args: Record<string, unknown>,
+  existingClientKeys?: ReadonlySet<string>,
+): Record<string, unknown> {
   const normalized: Record<string, unknown> = { ...args };
   const docPath = typeof args.path === 'string' ? args.path : '';
   if (normalized.title === undefined && docPath) {
     normalized.title = path.posix.basename(docPath).replace(/\.md$/i, '');
+  }
+  if (Array.isArray(args.csvTableImports)) {
+    normalized.csvTableImports = args.csvTableImports.map((raw) => {
+      const item = asRecord(raw);
+      if (!item || !Array.isArray(item.columns)) return raw;
+      return { ...item, columns: item.columns.map((column, index) => normalizeCsvColumnCoordinate(column, index)) };
+    });
   }
   if (Array.isArray(args.objects)) {
     normalized.objects = args.objects.map((raw) => {
@@ -6263,12 +7022,22 @@ function normalizeKbWriteDocArgs(args: Record<string, unknown>): Record<string, 
       if (copy.nature === undefined) copy.nature = selector?.kind === 'media_region' ? 'machine_description' : 'direct';
       if (copy.clientKey === undefined) {
         const identity = canonicalPayloadHash({ objectKey: copy.objectKey, claimKey: copy.claimKey, sourceRef: copy.sourceRef }, []);
-        const ordinal = (evidenceOrdinal.get(identity) ?? 0) + 1;
-        evidenceOrdinal.set(identity, ordinal);
-        copy.clientKey = `ev_auto_${canonicalPayloadHash({
+        let ordinal = (evidenceOrdinal.get(identity) ?? 0) + 1;
+        let generated = `ev_auto_${canonicalPayloadHash({
           objectKey: copy.objectKey, claimKey: copy.claimKey,
           sourceRef: copy.sourceRef, ordinal,
         }, []).slice(0, 20)}`;
+        // WP-C（R5）：自动键与既有键冲突时递增序号重生成——kb_edit_doc 追加
+        // 同身份新证据时序号从 1 重启，会撞上首次写入生成的同名 ev_auto 键。
+        while (existingClientKeys?.has(generated)) {
+          ordinal += 1;
+          generated = `ev_auto_${canonicalPayloadHash({
+            objectKey: copy.objectKey, claimKey: copy.claimKey,
+            sourceRef: copy.sourceRef, ordinal,
+          }, []).slice(0, 20)}`;
+        }
+        evidenceOrdinal.set(identity, ordinal);
+        copy.clientKey = generated;
       }
       return copy;
     });
@@ -6361,4 +7130,90 @@ function shiftBodyRange(
 
 function escapeXml(value: string): string {
   return value.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/** D1/R5：分页字节预算。预算对象是**最终实际发送的 content 文本**
+ * UTF-8 字节（含 JSON/XML 转义、坐标前缀、回执/资源页眉、segmentMap、
+ * 声明与 cursor），不是原文切片——R5 反例：90 行×120 反斜杠源文 10,889B，
+ * JSON 转义后响应 22,389B，旧只算原文的预算放行并登记全额回执。
+ *
+ * 阈值依据：pi MCP 客户端 `MCP_OUTPUT_MAX_BYTES = 20*1024 = 20480` 起
+ * 对工具输出做中段截断（pi dist/extensions/mcp/tools.js 实核，实测
+ * 7161f7 有 3/456 页被截）。软预算 17,000B 留 ~17% 裕量（封套/分隔符/
+ * 测量误差）；硬上限 19,500B 留 ~5%，仅允许不可再分的原子单元（单行/
+ * 单声明项） riding。超出硬上限的单行页改为显式跳行标记
+ *（`<oversized_line>`），不登记回执、不声称完整读取。 */
+const TOOL_PAGE_SOFT_BUDGET_BYTES = 17_000;
+const TOOL_PAGE_HARD_CAP_BYTES = 19_500;
+/** R5：kb_read_batch 游标内剩余队列 JSON 字节上限——base64 膨胀（约
+ * 4/3）后必须还能装进软预算；超限时报精确错误引导拆分调用。 */
+const KB_BATCH_QUEUE_JSON_MAX_BYTES = 8_000;
+
+/** 最终文本字节（单一真相：与客户端截断同一口径）。 */
+function textBytes(text: string): number {
+  return Buffer.byteLength(text, 'utf8');
+}
+
+/** R5：raw_read 单窗口装配（纯数据，未登记回执；由 renderBudgetedRawReadPage
+ * 定型后由调用方登记 window.receipts）。 */
+interface RawReadWindow {
+  slice: string[];
+  displayLines: string[];
+  truncated: boolean;
+  continuation: BlankCsvSkip | null;
+  readTrail: {
+    receipts: Array<{ readReceiptId: string; resourceId: string; lineStart: number; lineEnd: number }>;
+    resources: Array<{ resourceId: string; kind: 'text' | 'csv'; label: string; resourceHash: string; totalLines: number; nonEmptyCells?: number }>;
+    imageResources: Array<{ resourceId: string; imageHash: string; derivedFrom: string }>;
+    segmentMap: Array<Record<string, unknown>>;
+  } | null;
+  receipts: ReadReceiptRecord[];
+}
+
+/** R5：在 [1, hi] 上二分找最大使 measure(lineCount) ≤ softBudget 的整行
+ * 窗口。measure 随窗口增长基本单调（空白折叠标记可致轻微非单调，只
+ * 影响页体量最优性不影响正确性）；返回值由调用方重新组装并复核。 */
+function fitWindowByBytes(
+  hi: number,
+  softBudget: number,
+  measure: (lineCount: number) => number,
+): number {
+  if (hi <= 1 || measure(hi) <= softBudget) return Math.max(hi, 0);
+  let lo = 1;
+  while (lo < hi) {
+    const mid = Math.floor((lo + hi + 1) / 2);
+    if (measure(mid) <= softBudget) lo = mid; else hi = mid - 1;
+  }
+  return lo;
+}
+
+/** D2(a 提示面)：对象声明了 claims，但其正文范围（headingPath 解析或显式
+ * bodyRange）内没有任何内容行——headingPath/bodyRange 极可能指向了错误
+ * 小节（实测 B3c-B2 返工样本的机械可判子集）。只提示不拦截：csv 导入占
+ * 位行、全文对象等合法场景不命中（占位行/正文行都非空）。 */
+function collectClaimLocationHints(objects: unknown, markdownLines: string[]): string[] {
+  if (!Array.isArray(objects)) return [];
+  const hints: string[] = [];
+  for (const raw of objects) {
+    const input = asRecord(raw);
+    if (!input || !Array.isArray(input.claims) || input.claims.length === 0) continue;
+    const clientKey = typeof input.clientKey === 'string' ? input.clientKey : '?';
+    let range: BodyRange | null = null;
+    const headingPath = Array.isArray(input.headingPath) ? input.headingPath.filter((h): h is string => typeof h === 'string') : [];
+    if (headingPath.length > 0) {
+      range = resolveHeadingBodyRange(markdownLines, headingPath, 1);
+    } else if (asRecord(input.bodyRange)) {
+      range = parseBodyRange(input.bodyRange);
+    }
+    if (!range || range.startLine < 1 || range.endLine > markdownLines.length) continue;
+    // 标题行本身不算内容（headingPath 解析的 startLine 即标题行）；
+    // csvTableImports 占位行非空，不会命中。
+    const hasContent = markdownLines
+      .slice(range.startLine - 1, range.endLine)
+      .some((line) => line.trim().length > 0 && !/^#{1,6}\s/.test(line));
+    if (!hasContent) {
+      hints.push(`对象 ${clientKey} 的正文范围（第 ${range.startLine}..${range.endLine} 行）没有内容行，但其 claims 不为空；核对 headingPath/bodyRange 是否指错小节`);
+    }
+  }
+  return hints.slice(0, 4);
 }

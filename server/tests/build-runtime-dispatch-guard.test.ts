@@ -6,10 +6,10 @@
  * 精确 MCP 名单、workspace 固定、resume 仅校验模型。
  */
 
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 import {
-  DISPATCH_GUARD_SCHEMA_VERSION, freezeGuardConfig, guardTaskResume, guardTaskSubmit,
-  validateGuardConfig, type FrozenDispatchConfig,
+  DISPATCH_GUARD_SCHEMA_VERSION, DISPATCH_INFLIGHT_STALE_MS, DISPATCH_UNACKED_TTL_MS, freezeGuardConfig, guardTaskResume, guardTaskSubmit,
+  resetDispatchGuardAdmissionState, validateGuardConfig, type DispatchInflightSnapshot, type FrozenDispatchConfig,
 } from '../src/agent/build-runtime/dispatch-guard.js';
 import { RUNTIME_INTEGRITY_SCHEMA_VERSION, type RuntimeIntegrityRefs } from '../src/agent/build-runtime/runtime-integrity.js';
 import { createHash } from 'node:crypto';
@@ -59,9 +59,9 @@ describe('validateGuardConfig / freezeGuardConfig', () => {
     })).toThrow('workDir');
   });
 
-  it('schemaVersion 冻结（v2：integrity 必填）', () => {
+  it('schemaVersion 冻结（v3：integrity 必填 + 可选 dispatch 准入段）', () => {
     expect(makeConfig().schemaVersion).toBe(DISPATCH_GUARD_SCHEMA_VERSION);
-    expect(DISPATCH_GUARD_SCHEMA_VERSION).toBe(2);
+    expect(DISPATCH_GUARD_SCHEMA_VERSION).toBe(3);
   });
 
   it('F12：integrity 缺失/形状非法 → 信封整体非法（旧代次信封 fail-closed）', () => {
@@ -363,5 +363,192 @@ describe('guardTaskResume', () => {
 
   it('缺 handle → 阻止', () => {
     expect(guardTaskResume(makeConfig(), { message: 'x' }).decision).toBe('block');
+  });
+});
+
+// ── A2 在途派发准入（R2：新写作不拖后修订/复审）─────────────────────
+
+describe('A2 派发准入（dispatch 段 + 在途快照）', () => {
+  beforeEach(() => resetDispatchGuardAdmissionState());
+
+  const POOLS = {
+    inflightStatePath: '/data/builds/b_demo/epochs/e1/dispatch-inflight.json',
+    rolePoolKeys: { writer: 'zhipuai/glm-5.3-flash', reviewer: 'zhipuai/glm-5.3', research: 'zhipuai/glm-5.3' },
+    poolCapacities: { 'zhipuai/glm-5.3-flash': 4, 'zhipuai/glm-5.3': 2 },
+  };
+  const admitConfig = (): FrozenDispatchConfig => makeConfig({ dispatch: { ...POOLS } });
+  const samePoolConfig = (capacity: number): FrozenDispatchConfig => makeConfig({
+    dispatch: {
+      inflightStatePath: POOLS.inflightStatePath,
+      rolePoolKeys: { writer: 'zhipuai/glm-5.3-flash', reviewer: 'zhipuai/glm-5.3-flash', research: 'zhipuai/glm-5.3-flash' },
+      poolCapacities: { 'zhipuai/glm-5.3-flash': capacity },
+    },
+  });
+  const WRITE_TASK = '【写作】方阵：参考定义 L100；目标规则 L140-L160';
+  const REVIEW_TASK = '【独立审查】审查对象：A.md\nkb_submit_review：coverage.docPaths=["A.md"]';
+
+  function snapshot(partial: Partial<DispatchInflightSnapshot> = {}): DispatchInflightSnapshot {
+    return {
+      schemaVersion: 1,
+      buildId: 'b_demo',
+      generation: 2,
+      seq: 1,
+      updatedAt: new Date().toISOString(),
+      inflight: [],
+      pendingReview: 0,
+      pendingRevision: 0,
+      ...partial,
+    };
+  }
+  const submitWriter = (config: FrozenDispatchConfig, inflight: DispatchInflightSnapshot | null) =>
+    guardTaskSubmit(config, { agent: 'luban', task: WRITE_TASK }, { inflight });
+  const submitReviewer = (config: FrozenDispatchConfig, inflight: DispatchInflightSnapshot | null) =>
+    guardTaskSubmit(config, { agent: 'diting', task: REVIEW_TASK }, { inflight });
+  const resume = (config: FrozenDispatchConfig, inflight: DispatchInflightSnapshot | null) =>
+    guardTaskResume(config, { handle: 'task-123', message: '修订回执 krev_1' }, { inflight });
+
+  it('validateGuardConfig：dispatch 形状校验（相对路径/缺角色池映射/容量非正整数）；freezeGuardConfig 非法即抛', () => {
+    expect(validateGuardConfig(admitConfig())).toEqual([]);
+    // validateGuardConfig 直测（freezeGuardConfig 对非法 dispatch 会先 throw）
+    expect(validateGuardConfig({ ...admitConfig(), dispatch: { ...POOLS, inflightStatePath: 'relative/dispatch.json' } })[0]).toContain('inflightStatePath');
+    const missingRole = { ...POOLS } as never;
+    delete (missingRole as Record<string, unknown>).rolePoolKeys;
+    expect(validateGuardConfig({ ...admitConfig(), dispatch: missingRole }).join('\n')).toContain('池映射');
+    expect(validateGuardConfig({ ...admitConfig(), dispatch: { ...POOLS, poolCapacities: { 'zhipuai/glm-5.3-flash': 0, 'zhipuai/glm-5.3': 2 } } }).join('\n')).toContain('≥1 整数');
+    expect(() => makeConfig({ dispatch: { ...POOLS, inflightStatePath: 'relative/dispatch.json' } })).toThrow('inflightStatePath');
+  });
+
+  it('writer 池满拒新写作；reviewer 池独立且有审查放行（互不挤占）', () => {
+    // baize 与 diting 同模型（research 池键=reviewer 池键）→ 不占 writer 池
+    const full = snapshot({ inflight: [
+      { role: 'luban', state: 'running' }, { role: 'luban', state: 'queued' },
+      { role: 'luban', state: 'running' }, { role: 'luban', state: 'running' },
+    ] });
+    const blocked = submitWriter(admitConfig(), full);
+    expect(blocked.decision).toBe('block');
+    if (blocked.decision === 'block') {
+      expect(blocked.code).toBe('dispatch_inflight_write_exhausted');
+      expect(blocked.message).toContain('完成通知');
+    }
+    expect(submitReviewer(admitConfig(), full).decision).toBe('allow');
+    // reviewer 池（容量 2）满：审查被拒，但 writer 池空 → 新写作仍放行
+    const reviewerFull = snapshot({ inflight: [{ role: 'diting', state: 'running' }, { role: 'diting', state: 'running' }] });
+    const reviewBlocked = submitReviewer(admitConfig(), reviewerFull);
+    expect(reviewBlocked.decision).toBe('block');
+    if (reviewBlocked.decision === 'block') expect(reviewBlocked.code).toBe('dispatch_inflight_pool_saturated');
+    expect(submitWriter(admitConfig(), reviewerFull).decision).toBe('allow');
+  });
+
+  it('存在待审/待修订文档时新写作最多占容量−1；无积压可占满', () => {
+    const config = admitConfig();
+    const threeOfFour = snapshot({ inflight: [
+      { role: 'luban', state: 'running' }, { role: 'luban', state: 'running' }, { role: 'luban', state: 'running' },
+    ] });
+    expect(submitWriter(config, threeOfFour).decision).toBe('allow'); // 无积压：占满第 4 槽
+    resetDispatchGuardAdmissionState();
+    const withBacklog = snapshot({
+      inflight: threeOfFour.inflight,
+      pendingReview: 1,
+    });
+    const blocked = submitWriter(config, withBacklog);
+    expect(blocked.decision).toBe('block');
+    if (blocked.decision === 'block') expect(blocked.message).toContain('保留槽位');
+    expect(submitReviewer(config, withBacklog).decision).toBe('allow'); // 审查优先，不受保留槽限制
+    expect(resume(config, withBacklog).decision).toBe('allow'); // 修订续接优先
+  });
+
+  it('capacity=1：满载全拒；空载+积压 → 拒写作、放行审查与修订；空载无积压 → 放行写作', () => {
+    const config = samePoolConfig(1);
+    const busy = snapshot({ inflight: [{ role: 'luban', state: 'running' }] });
+    expect(submitWriter(config, busy).decision).toBe('block');
+    expect(submitReviewer(config, busy).decision).toBe('block');
+    expect(resume(config, busy).decision).toBe('block'); // 全池满才拒 resume
+    const idleBacklog = snapshot({ pendingRevision: 1 });
+    expect(submitWriter(config, idleBacklog).decision).toBe('block');
+    // 单槽先到先得：同一轮先派审查后修订时修订等下一轮；此处分别独立评价
+    expect(resume(config, idleBacklog).decision).toBe('allow');
+    expect(submitReviewer(config, idleBacklog).decision).toBe('allow');
+    // 空载无积压时写作可占满（seq 前进重置上一轮审查的未入账计数，独立评价）
+    expect(submitWriter(config, snapshot({ seq: 2 })).decision).toBe('allow');
+  });
+
+  it('resume：单池满但另一池空 → 放行；全部池满 → 拒', () => {
+    const config = admitConfig();
+    const writerFullOnly = snapshot({ inflight: [
+      { role: 'luban', state: 'running' }, { role: 'luban', state: 'running' },
+      { role: 'luban', state: 'running' }, { role: 'luban', state: 'running' },
+    ] });
+    expect(resume(config, writerFullOnly).decision).toBe('allow');
+    const allFull = snapshot({ inflight: [...writerFullOnly.inflight, { role: 'diting', state: 'running' }, { role: 'diting', state: 'running' }] });
+    const blocked = resume(config, allFull);
+    expect(blocked.decision).toBe('block');
+    if (blocked.decision === 'block') expect(blocked.code).toBe('dispatch_inflight_pool_saturated');
+  });
+
+  it('同一轮连发：快照未前进时未入账计数累加，超限被拒；快照 seq 前进后重置', () => {
+    const config = samePoolConfig(4);
+    const empty = snapshot();
+    for (let i = 0; i < 4; i += 1) {
+      expect(submitWriter(config, empty).decision, `第 ${i + 1} 个写作应放行`).toBe('allow');
+    }
+    const fifth = submitWriter(config, empty);
+    expect(fifth.decision).toBe('block');
+    // host 已把 4 个写作登记进快照（seq 前进）→ 未入账重置，按文件在途判定
+    const caughtUp = snapshot({ seq: 2, inflight: Array.from({ length: 4 }, () => ({ role: 'luban', state: 'running' })) });
+    expect(submitWriter(config, caughtUp).decision).toBe('block'); // 单池（同模型）4/4：写作与审查都满
+    expect(submitReviewer(config, caughtUp).decision).toBe('block');
+    // 两池配置：writer 池 4/4 满、reviewer 池空 → 写作拒、审查放行（重置后按文件计数）
+    const twoPools = admitConfig();
+    expect(submitWriter(twoPools, caughtUp).decision).toBe('block');
+    expect(submitReviewer(twoPools, caughtUp).decision).toBe('allow');
+  });
+
+  it('R3 反例：错 model 被拒不占额度，修正后重试立即放行（空池不误报满载）', () => {
+    const config = samePoolConfig(1); // capacity=1：任一虚占即满
+    const empty = snapshot();
+    const wrong = guardTaskSubmit(config, { agent: 'luban', task: WRITE_TASK, model: 'zhipuai/glm-5.3' }, { inflight: empty });
+    expect(wrong.decision).toBe('block');
+    if (wrong.decision === 'block') expect(wrong.code).toBe('dispatch_model_not_frozen');
+    // 修正 model 重试：准入判定不受此前拒绝影响
+    const corrected = guardTaskSubmit(config, { agent: 'luban', task: WRITE_TASK, model: 'zhipuai/glm-5.3-flash:low' }, { inflight: empty });
+    expect(corrected.decision).toBe('allow');
+  });
+
+  it('R3：多次参数失败（role/model/taskFile/范围）不耗尽额度，合法派发仍放行', () => {
+    const config = admitConfig();
+    const empty = snapshot();
+    expect(guardTaskSubmit(config, { agent: 'fuxi', task: WRITE_TASK }, { inflight: empty }).decision).toBe('block');
+    expect(guardTaskSubmit(config, { agent: 'luban', task: WRITE_TASK, model: 'zhipuai/glm-5.3' }, { inflight: empty }).decision).toBe('block');
+    expect(guardTaskSubmit(config, { agent: 'luban', taskFile: '../escape.md' }, { inflight: empty }).decision).toBe('block');
+    expect(guardTaskSubmit(config, {
+      agent: 'luban',
+      task: ['【写作】人塔寨综合战术工作表：总输出 3707 行。②Concept 输出 1428–1652；③-1 分析拆解 输出 1655–1858；', '③-2 主流程 输出 1861–2060；④Detail-1 规则与交互 输出 2265–2500；①idea 输出 1226–1425。'].join('\n'),
+    }, { inflight: empty }).decision).toBe('block');
+    expect(submitWriter(config, empty).decision).toBe('allow'); // 4 次拒绝后额度未被虚耗
+  });
+
+  it('R3：放行预留带 TTL——未被 host 确认的预留 60s 后过期释放，不再持续到 staleMs', () => {
+    const config = samePoolConfig(2);
+    let clock = Date.parse('2026-11-06T12:00:00.000Z');
+    const now = () => new Date(clock).toISOString();
+    const empty = snapshot({ updatedAt: now() });
+    expect(guardTaskSubmit(config, { agent: 'luban', task: WRITE_TASK }, { inflight: empty, now }).decision).toBe('allow');
+    expect(guardTaskSubmit(config, { agent: 'luban', task: WRITE_TASK }, { inflight: empty, now }).decision).toBe('allow');
+    // 占满（快照 seq 未前进、TTL 未过）：第 3 个拒绝
+    const third = guardTaskSubmit(config, { agent: 'luban', task: WRITE_TASK }, { inflight: empty, now });
+    expect(third.decision).toBe('block');
+    // 原生派发未创建任务（快照永远不前进）：61s 后 TTL 过期，预留释放
+    clock += DISPATCH_UNACKED_TTL_MS + 1_000;
+    expect(guardTaskSubmit(config, { agent: 'luban', task: WRITE_TASK }, { inflight: empty, now }).decision).toBe('allow');
+  });
+
+  it('fail-open：无 dispatch 段 / buildId 或 generation 不匹配 / 快照过旧 → 跳过准入', () => {
+    const stale = new Date(Date.now() - DISPATCH_INFLIGHT_STALE_MS - 60_000).toISOString();
+    expect(submitWriter(makeConfig(), snapshot()).decision).toBe('allow'); // 无 dispatch 段
+    const config = admitConfig();
+    expect(submitWriter(config, snapshot({ buildId: 'b_other' })).decision).toBe('allow');
+    expect(submitWriter(config, snapshot({ generation: 3 })).decision).toBe('allow');
+    expect(submitWriter(config, snapshot({ updatedAt: stale })).decision).toBe('allow');
+    expect(submitWriter(config, null).decision).toBe('allow'); // 扩展读不到文件
   });
 });

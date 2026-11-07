@@ -255,6 +255,28 @@ function writeBackInPlace(target, next) {
   Object.assign(target, next);
 }
 
+/**
+ * A2 在途快照读取（host 原子写 <epochRoot>/dispatch-inflight.json；扩展
+ * 每次派发前读后交守卫准入）。fail-open：文件缺失/损坏/大小异常/
+ * buildId·generation 与冻结信封不一致 → 返回 null，守卫跳过在途准入
+ * （在途准入是吞吐优化而非安全边界；权限冻结与完整性重核验不受影响）。
+ */
+function readDispatchInflightSnapshot(guard) {
+  const statePath = guard && guard.dispatch && guard.dispatch.inflightStatePath;
+  if (typeof statePath !== 'string' || !path.isAbsolute(statePath)) return null;
+  try {
+    const raw = fs.readFileSync(statePath, 'utf-8');
+    if (raw.length > 256 * 1024) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || parsed.schemaVersion !== 1) return null;
+    if (parsed.buildId !== guard.buildId || parsed.generation !== guard.generation) return null;
+    if (!Array.isArray(parsed.inflight)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
 /** 运行事件：单行 JSON 写 stderr（宿主采集）；审计体为运行时 DispatchGuardAudit，不含任务正文。 */
 function logBuildGuardEvent(event, payload) {
   console.error(`[feishu-sync-agent][build-guard] ${JSON.stringify({ ts: new Date().toISOString(), event, ...payload })}`);
@@ -439,8 +461,12 @@ export default async function feishuSyncAgentExtension(/** @type {ExtensionAPI} 
           return { block: true, reason: `构建派发守卫：${name} 参数必须是对象` };
         }
         const decision = name === 'task_submit'
-          ? buildSpec.guardApi.guardTaskSubmit(buildSpec.guard, input)
-          : buildSpec.guardApi.guardTaskResume(buildSpec.guard, input);
+          ? buildSpec.guardApi.guardTaskSubmit(buildSpec.guard, input, {
+            inflight: readDispatchInflightSnapshot(buildSpec.guard),
+          })
+          : buildSpec.guardApi.guardTaskResume(buildSpec.guard, input, {
+            inflight: readDispatchInflightSnapshot(buildSpec.guard),
+          });
         if (decision.decision === 'block') {
           logBuildGuardEvent('guard_blocked', { tool: name, code: decision.code, reason: decision.message, audit: decision.audit });
           return { block: true, reason: `${decision.message}（${decision.code}）` };

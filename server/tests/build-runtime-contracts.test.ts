@@ -88,6 +88,24 @@ describe('validateBuildRunSpec', () => {
     expect(issues.join('\n')).toContain('超过 maxConcurrentAgents');
   });
 
+  it('R1：同模型多角色共享一池，poolSum 按去重池键计算（不重复累加）', () => {
+    // 同模型 max=1：旧口径 {writer:1,reviewer:1} 被误判 2>1 拒绝启动；去重后单池容量 1 合法。
+    for (const max of [1, 2, 3, 6]) {
+      const spec = makeSpec({
+        models: { leader: 'zhipuai/glm-5.3', writer: 'zhipuai/glm-5.3', reviewer: 'zhipuai/glm-5.3', research: 'zhipuai/glm-5.3' },
+        limits: { maxConcurrentAgents: max, admissionPools: { writer: max, reviewer: max } },
+      });
+      expect(validateBuildRunSpec(spec), `max=${max}`).toEqual([]);
+    }
+    // 去重不改异模型语义：两模型各自计容，超总上限仍拒绝。
+    const cross = validateBuildRunSpec(makeSpec({
+      models: { leader: 'zhipuai/glm-5.3', writer: 'zhipuai/glm-5.3-flash', reviewer: 'zhipuai/glm-5.3' },
+      limits: { maxConcurrentAgents: 5, admissionPools: { writer: 4, reviewer: 2 } },
+    }));
+    expect(cross.join('\n')).toContain('按去重后池键');
+    expect(cross.join('\n')).toContain('超过 maxConcurrentAgents=5');
+  });
+
   it('同模型多角色池容量不一致 → 拒绝', () => {
     const spec = makeSpec();
     spec.models = { leader: 'zhipuai/glm-5.3', writer: 'zhipuai/glm-5.3', reviewer: 'zhipuai/glm-5.3' };

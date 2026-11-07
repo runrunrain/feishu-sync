@@ -77,6 +77,8 @@ export interface LeaderSupervisorCallbacks {
   reconcileResiduals?: (binding: RuntimeBinding | null) => Promise<TerminationOutcome | null>;
   /** 宿主只补齐原生历史中的执行观测，不改变身份/分配权限。 */
   restoreTaskObservations?: (binding: RuntimeBinding | null, actors: LeaderActorRecord[]) => void;
+  /** A2 派发准入：actors 变化（创建/续接/终态/换代）后通知宿主刷新在途快照。 */
+  dispatchStateChanged?: () => void;
   /** 成果账本快照计数（进度 DTO 汇总；真相在 BuildActorStore）。 */
   actorSnapshot: () => { acceptedDocumentCount: number; openBlockingCount: number; activeAssignments: number };
   /** 检查点导出钩子（同步 actorStore 全量载荷进检查点；可选）。 */
@@ -451,6 +453,7 @@ export class BuildLeaderSupervisor {
     options.spec = { ...options.spec, generation };
     this.cb.rotateGeneration?.(generation, '恢复换代（账本/宿主同步 rotate）');
     this.credentialsRevoked = false; // 新代次凭据由宿主在 startLeader 签发
+    this.cb.dispatchStateChanged?.();
   }
 
   /** 监督主循环。终局前撤凭据；任何路径都释放进程池槽位。 */
@@ -612,6 +615,7 @@ export class BuildLeaderSupervisor {
           status: 'confirmed',
           execState: typeof payload.execState === 'string' ? payload.execState : 'running',
         });
+        this.cb.dispatchStateChanged?.();
         return { critical: true, outcome: null };
       }
       case 'task_resumed': {
@@ -630,6 +634,7 @@ export class BuildLeaderSupervisor {
           const parentActor = this.state.actors.find((actor) => actor.nativeTaskId === parent);
           if (parentActor) parentActor.status = 'revoked';
         }
+        this.cb.dispatchStateChanged?.();
         return { critical: true, outcome: null };
       }
       case 'task_state':
@@ -644,6 +649,7 @@ export class BuildLeaderSupervisor {
           // 桥接先于创建事件到达：待确认身份（设计 §4.1；登记真相在账本）。
           this.upsertActor({ nativeTaskId: taskId, role: 'unknown', status: 'pending', execState: status });
         }
+        this.cb.dispatchStateChanged?.();
         const terminal = status === 'done' || status === 'failed' || status === 'cancelled' || status === 'interrupted';
         return { critical: terminal, outcome: null };
       }
@@ -724,6 +730,18 @@ export class BuildLeaderSupervisor {
     }
   }
 
+  /** A2 派发准入：当前在途任务（与空闲判定同口径；含完成通知回读恢复）。 */
+  dispatchInflightActors(): LeaderActorRecord[] {
+    this.cb.restoreTaskObservations?.(this.state.binding, this.state.actors);
+    const currentEpoch = this.state.runtimeEpoch;
+    return this.state.actors.filter(
+      (actor) => actor.status !== 'revoked'
+        && (actor.runtimeEpoch === undefined ? currentEpoch === undefined : actor.runtimeEpoch === currentEpoch)
+        && (actor.generation === undefined || actor.generation === this.state.generation)
+        && ACTIVE_EXEC_STATES.has(actor.execState ?? ''),
+    );
+  }
+
   /** 空闲判定（设计 §5.4）：无运行轮次 + 已知子任务都已收到完成通知 +
    * 桥接无活动，持续超过宽限。首次只提醒一次；再次空闲 → leader_idle。 */
   private evaluateIdle(): LeaderRunOutcome | null {
@@ -733,15 +751,7 @@ export class BuildLeaderSupervisor {
     // F09-R1：与前端 isHistoricalRuntimeTask 同一口径——同 epoch 的旧代次
     // actor（session 续接换代后其完成通知永不再来）同样只作历史，不得挂住
     // 两段空闲收口；历史记录仍在 actors 列表供 DTO/前端展示。
-    this.cb.restoreTaskObservations?.(this.state.binding, this.state.actors);
-    const currentEpoch = this.state.runtimeEpoch;
-    const activeActors = this.state.actors.filter(
-      (actor) => actor.status !== 'revoked'
-        && (actor.runtimeEpoch === undefined ? currentEpoch === undefined : actor.runtimeEpoch === currentEpoch)
-        && (actor.generation === undefined || actor.generation === this.state.generation)
-        && ACTIVE_EXEC_STATES.has(actor.execState ?? ''),
-    );
-    if (activeActors.length > 0) return null;
+    if (this.dispatchInflightActors().length > 0) return null;
     if (Date.now() - this.lastActivityAt < this.idleGraceMs) return null;
     if (!this.state.idleRemindedAt) {
       this.state.idleRemindedAt = new Date().toISOString();

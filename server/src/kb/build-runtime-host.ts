@@ -25,6 +25,7 @@ import { dispatchedTaskState, taskCompletionObservation, restoreTaskCompletionOb
  * 发布管线职责）、监督状态机（build-leader-supervisor 职责）。
  */
 import fs from 'node:fs';
+import path from 'node:path';
 import {
   AMAGI_TASK_TOOLS,
   BUILD_MODEL_PROVIDER,
@@ -64,13 +65,15 @@ import { PiAmagiBuildRuntime } from '../agent/build-runtime/adapter.js';
 import type { PiRpcProcess } from '../agent/pi-rpc-process.js';
 import { BuildActorStore, resolveV2RoleToolset, V2_CHILD_ALL_TOOLS } from './build-actors.js';
 import { V2_LEADER_TOOLS } from '../agent/tool-specs.js';
+import { atomicWriteFile } from '../agent/path-guard.js';
+import type { DispatchInflightSnapshot } from '../agent/build-runtime/dispatch-guard.js';
 import type { AgentProcessPool } from '../agent/agent-process-pool.js';
 import { ToolError, type AgentToolService, type BuildRunState, type V2PublishHandler } from '../agent/agent-tool-service.js';
 import type { PiRuntimeResolver } from '../agent/runtime-resolver.js';
 import { resolveProviderModel } from '../modules/model-selection.js';
 import { claudeBridgePath, piExtensionPath, piWorkbenchPackageRoot } from '../agent/agent-assets.js';
 import type { Config } from '../types/index.js';
-import type { LeaderRunCheckpointState, LeaderRunMaterial } from '../types/agent-knowledge.js';
+import type { LeaderActorRecord, LeaderRunCheckpointState, LeaderRunMaterial } from '../types/agent-knowledge.js';
 import {
   BuildLeaderSupervisor,
   freshLeaderRunState,
@@ -244,13 +247,91 @@ function asAsyncIterable(iterator: AsyncIterator<RuntimeEvent>): AsyncIterable<R
   return { [Symbol.asyncIterator]: () => iterator };
 }
 
+/**
+ * A2 在途快照组装（纯函数；host 写入 <epochRoot>/dispatch-inflight.json，
+ * Leader 转发扩展派发前读后交 dispatch-guard 准入）。actors 为监督器同口径
+ * 过滤后的在途任务（dispatchInflightActors）；roleOf 优先取成果账本登记的
+ * amagi 角色名（创建事件未达时兜底监督器观察值，可能为 'unknown'——
+ * 守卫对未登记角色按全部池保守计数）。
+ */
+export function composeDispatchInflightSnapshot(input: {
+  buildId: string;
+  generation: number;
+  seq: number;
+  now: string;
+  actors: LeaderActorRecord[];
+  roleOf: (nativeTaskId: string) => string;
+  backlog: { pendingReview: number; pendingRevision: number };
+}): DispatchInflightSnapshot {
+  return {
+    schemaVersion: 1,
+    buildId: input.buildId,
+    generation: input.generation,
+    seq: input.seq,
+    updatedAt: input.now,
+    inflight: input.actors.map((actor) => ({
+      role: input.roleOf(actor.nativeTaskId),
+      state: actor.execState ?? '',
+    })),
+    pendingReview: input.backlog.pendingReview,
+    pendingRevision: input.backlog.pendingRevision,
+  };
+}
+
 export class BuildRuntimeHost {
   private readonly sessions = new Map<string, HostSession>();
   private eventSeq = 0;
   /** amagi 安装/校验串行门（同版本并发防护）。 */
   private installInFlight = false;
+  /** A2 在途快照 seq（buildId → 代次+序号；换代后不继承旧序号，跨启动从磁盘旧文件继承）。 */
+  private readonly dispatchInflightSeq = new Map<string, { generation: number; seq: number }>();
 
   constructor(private readonly deps: BuildRuntimeHostDeps) {}
+
+  /** A2 在途快照落盘（原子写；失败仅告警——准入 fail-open 退化，不中断监督）。
+   * epoch 与 adapter.start/resume 同口径（binding 权威，fresh 兼容 legacy=1）；
+   * 换代/换 epoch 后 generation 不匹配即整文件重写，旧代次在途不泄漏。 */
+  private writeDispatchInflightSnapshot(
+    session: HostSession,
+    supervisor: BuildLeaderSupervisor,
+    warn: (message: string) => void,
+  ): void {
+    try {
+      const state = supervisor.state;
+      // epoch 口径与 adapter.start/resume 同源：state.runtimeEpoch 优先（rebuild
+      // 递增后立即可见），legacy 检查点无该字段时回退 binding，再回退 1。
+      const epoch = state.runtimeEpoch ?? state.binding?.runtimeEpoch ?? 1;
+      const dirs = planBuildDirectories(this.deps.dataRoot, session.buildId, epoch);
+      const file = path.join(dirs.epochRoot, 'dispatch-inflight.json');
+      let seq = 0;
+      const cached = this.dispatchInflightSeq.get(session.buildId);
+      if (cached && cached.generation === session.generation) seq = cached.seq;
+      if (seq === 0) {
+        try {
+          const prior = JSON.parse(fs.readFileSync(file, 'utf-8')) as DispatchInflightSnapshot;
+          if (prior && prior.buildId === session.buildId && prior.generation === session.generation
+            && Number.isInteger(prior.seq) && prior.seq > 0) {
+            seq = prior.seq;
+          }
+        } catch { /* 首写或损坏：从 1 起 */ }
+      }
+      seq += 1;
+      this.dispatchInflightSeq.set(session.buildId, { generation: session.generation, seq });
+      const snapshot = composeDispatchInflightSnapshot({
+        buildId: session.buildId,
+        generation: session.generation,
+        seq,
+        now: new Date().toISOString(),
+        actors: supervisor.dispatchInflightActors(),
+        roleOf: (nativeTaskId: string): string => session.actorStore.lookupActor(nativeTaskId)?.role ?? 'unknown',
+        backlog: session.actorStore.dispatchBacklogSignal(),
+      });
+      fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+      atomicWriteFile(file, `${JSON.stringify(snapshot)}\n`);
+    } catch (error) {
+      warn(`在途快照写入失败（派发准入 fail-open）：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
 
   // ------------------------------------------------------------------
   // 运行时事实 / 探测 / 包安装（构建入口与 UI 状态端点共用）
@@ -583,11 +664,14 @@ export class BuildRuntimeHost {
     const max = input.maxConcurrentAgents;
     const writerPoolKey = modelSpecPoolKey(BuildRuntimeHost.modelSpec(input.models.writer));
     const reviewerPoolKey = modelSpecPoolKey(BuildRuntimeHost.modelSpec(input.models.reviewer));
-    // 同池（同模型）多角色容量必须一致：同模型时均分，不同模型按写作优先
-    //（设计 §3.6：写作 4、审查 2；research 复用写作池不重复占容量）。
+    // 同模型时 writer/reviewer/research 共享同一个 amagi 池（agent-dir-config 以
+    // modelSpecPoolKey 为键渲染 concurrency.models），容量必须给满 max——旧实现
+    // 同模型均分 floor(max/2) 使同池两角色实际只得一个半容池（R1：实测
+    // buildConcurrency=6 仅 3 并发）。不同模型时保持「总和 ≤ max、写作优先」
+    //（审查 min(2, max-1)；research 复用写作池不重复占容量）。
     const samePool = writerPoolKey === reviewerPoolKey;
-    const reviewerPool = samePool ? Math.max(1, Math.floor(max / 2)) : Math.min(2, Math.max(1, max - 1));
-    const writerPool = samePool ? reviewerPool : Math.max(1, max - reviewerPool);
+    const reviewerPool = samePool ? max : Math.min(2, Math.max(1, max - 1));
+    const writerPool = samePool ? max : Math.max(1, max - reviewerPool);
     const spec: BuildRunSpec = {
       buildId: input.buildId,
       strictGates: input.buildState.gatePolicy?.strict ?? true,
@@ -1090,6 +1174,9 @@ export class BuildRuntimeHost {
           throw new ToolError('build_runtime_unavailable', 'Leader RPC 句柄不可得（启动异常）', 500);
         }
         this.startEventPump(session, rpc);
+        // A2 初始在途快照：恢复场景凭监督器恢复后的 actors 立即重建
+        //（换代/换 epoch 后旧代次数据不泄漏；fresh 写入空快照开启准入）。
+        this.writeDispatchInflightSnapshot(session, supervisor, (message) => input.log('warn', message));
         // 初始 prompt（fresh=Leader 规则+交代；resume=剩余工作交代）。
         const briefing = resumeMode === 'fresh' ? input.leaderBriefing : input.resumeBriefing;
         void rpc.prompt(briefing).then(
@@ -1131,6 +1218,7 @@ export class BuildRuntimeHost {
         );
       },
       restoreTaskObservations: restoreTaskCompletionObservations,
+      dispatchStateChanged: () => this.writeDispatchInflightSnapshot(session, supervisor, (message) => input.log('warn', message)),
       actorSnapshot: () => BuildRuntimeHost.actorSnapshotOf(session.actorStore),
       exportActorPayload: () => session.actorStore.exportCheckpointPayload(),
     }, state, {});

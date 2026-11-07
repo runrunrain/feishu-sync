@@ -121,7 +121,10 @@ describe('raw_search L1：完整扫描 → 评分 → 排序 → limit', () => {
     for (const spec of [KB_SEARCH_SPEC, RAW_SEARCH_SPEC]) {
       expect(spec.description).toContain('用空格分隔');
       expect(spec.description).toContain('引号');
-      expect(spec.parameters.required).toEqual(['query']);
     }
+    // kb_search 保持严格（required query）；raw_search 的 required 已按 WP-C R4
+    // 移除（queries 别名入口须能到达服务端，缺失由 normalizeToolArguments 报精确错误）。
+    expect(KB_SEARCH_SPEC.parameters.required).toEqual(['query']);
+    expect(RAW_SEARCH_SPEC.parameters.required).toBeUndefined();
   });
 });

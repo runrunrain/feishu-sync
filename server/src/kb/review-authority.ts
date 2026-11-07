@@ -22,6 +22,16 @@
  * 元数据与 workflow 规则不入摘要——它们由写时机械校验与发布结构门禁
  * 保证。携带完整 subject 键的回执在标准模式下按主体比较（另核报告文件
  * 绑定与来源快照）；严格模式与无 subject 键的旧回执完全走上述精确规则。
+ *
+ * WP-B1（kb-build-speedup R3.2）：主体绑定的 needs_revision 回执在
+ * selector/声明-only 修订后被 F01 保留，其 blocking 问题（closureBasis 在
+ * v2 流程无人写入）会永久拦截发布。关闭判定改为回执驱动：问题存在
+ * 「精确绑定当前候选（doc:<path> 正文哈希 + knowledge-declaration 同范围
+ * 声明哈希）且 uncheckedScope 为空的完整独立 pass 复核回执」时，旧阻断
+ * 报告不再入选当前候选的有效报告（canPublish 的 blocking_issue_open 随之
+ * 消除）。作者自述、needs_revision 复核、以及未构成完整复核的 pass（复审
+ * R1-B：uncheckedScope 去除空白/零宽后非空，或 checkedDimensions 为空）、
+ * 候选再变化后的旧 pass 均不构成关闭；每次发布重新判定，不持久化关闭状态。
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -30,7 +40,8 @@ import type { BuildActorStore, ReviewReceipt } from './build-actors.js';
 import type { KnowledgeDraftFile } from '../agent/agent-tool-service.js';
 import type { RawSourceSnapshot } from './raw-source-snapshot.js';
 import { computeSnapshotHash } from './build-orchestration.js';
-import type { ReviewReport } from './orchestration-contracts.js';
+import { isIssueClosed, type ReviewReport, type ReviewIssue } from './orchestration-contracts.js';
+import { contentResourceHash } from './evidence-locator.js';
 import type { GatePolicy } from './gate-policy.js';
 
 /** dependencyHashes 保留键（doc:<path> 前缀键之外的三类聚合依赖）。 */
@@ -367,6 +378,181 @@ export function reviewDependenciesMatch(receipt: ReviewReceipt, current: ReviewD
   return true;
 }
 
+// ============================================================================
+// WP-B1（kb-build-speedup R3.2）：selector/声明-only 修订后的阻断问题关闭
+// ============================================================================
+
+/** 读取 staging 的审查报告文件（回执报告绑定/关闭证据判定共用）。 */
+function readReviewReportFile(reviewsDir: string, unitId: string): ReviewReport | null {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(reviewsDir, `${unitId}.json`), 'utf8')) as ReviewReport;
+    return parsed && typeof parsed.reportId === 'string' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 未关闭 blocking 问题 → 归属路径：draftLocation 内含唯一 scopePath 时归属
+ * 该路径；单路径回执直接归属；无法唯一归属返回 null（fail-closed，不关闭）
+ * ——多路径范围且问题定位不含路径信息时，宁可继续拦截也不模糊放行。 */
+export function blockingIssueTargetPath(
+  issue: Pick<ReviewIssue, 'draftLocation'>, scopePaths: readonly string[] | undefined,
+): string | null {
+  if (!scopePaths || scopePaths.length === 0) return null;
+  const location = issue.draftLocation.trim();
+  if (!location) return scopePaths.length === 1 ? scopePaths[0]! : null;
+  const mentioned = scopePaths.filter((docPath) => location.includes(docPath));
+  if (mentioned.length === 1) return mentioned[0]!;
+  return scopePaths.length === 1 ? scopePaths[0]! : null;
+}
+
+/** 回执的声明依赖是否仍与当前 staging 同范围声明一致（document-v2 记当前
+ * 形态；无范围标记的旧回执兼容旧/新两种哈希形态，任一匹配即视为未漂移）。
+ * 声明不可读/哈希缺失一律 false（缺证明不视为绑定当前候选）。 */
+function receiptDeclarationMatchesCurrentDraft(input: {
+  draft: KnowledgeDraftFile | null;
+  receipt: ReviewReceipt;
+  sourceRefs: readonly string[];
+}): boolean {
+  const expected = input.receipt.dependencyHashes?.[REVIEW_DEP_DECLARATION];
+  const scope = input.receipt.scopePaths;
+  if (typeof expected !== 'string' || !expected || !Array.isArray(scope) || scope.length === 0) return false;
+  const draft = input.draft && input.draft.schemaVersion === 1 ? input.draft : null;
+  if (!draft) return false;
+  const sourceIds = [...input.sourceRefs];
+  if (input.receipt.dependencyHashes?.[REVIEW_DEP_DECLARATION_SCOPE] === DOCUMENT_DECLARATION_SCOPE) {
+    return scopedKnowledgeDeclarationHash(draft, scope, sourceIds) === expected;
+  }
+  return scopedKnowledgeDeclarationHash(draft, scope, sourceIds) === expected
+    || scopedKnowledgeDeclarationHash(draft, scope, sourceIds, true) === expected;
+}
+
+/** 读取当前 staging 的 knowledge-draft（schemaVersion=1；不可读/形状不对 → null）。 */
+function readCurrentKnowledgeDraft(stagingRoot: string): KnowledgeDraftFile | null {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(stagingRoot, 'knowledge-draft.json'), 'utf8')) as KnowledgeDraftFile;
+    return parsed?.schemaVersion === 1 ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 当前路径的候选绑定（正文哈希 + 该文档范围声明哈希，声明范围 = 文档头部
+ * 声明的来源）。不可读/声明缺失 → null（fail-closed，不构成可比较的候选）。 */
+export function currentPathCandidateBinding(stagingRoot: string, docPath: string):
+  { docHash: string; declarationHash: string } | null {
+  try {
+    const docsDir = path.resolve(stagingRoot, 'docs');
+    const file = path.resolve(docsDir, docPath);
+    if (!file.startsWith(`${docsDir}${path.sep}`)) return null;
+    const content = fs.readFileSync(file, 'utf8');
+    const draft = readCurrentKnowledgeDraft(stagingRoot);
+    if (!draft) return null;
+    const sourceIds = normalizeReviewSubjectContent(content).sources;
+    return {
+      docHash: contentResourceHash(content),
+      declarationHash: scopedKnowledgeDeclarationHash(draft, [docPath], sourceIds),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** 回执是否可证明已相对指定路径漂移（WP-B1复审 R2 旧清单 fromReviewId 判定）：
+ * doc:<path> 依赖或同范围声明依赖与当前值可对照且不一致 → true；任一侧
+ * 无法计算/不可证明 → false（fail-closed，不据此允许关闭）。 */
+export function reviewReceiptPathOriginDrifted(input: {
+  stagingRoot: string;
+  receipt: ReviewReceipt;
+  docPath: string;
+}): boolean {
+  const current = currentPathCandidateBinding(input.stagingRoot, input.docPath);
+  if (!current) return false;
+  const deps = input.receipt.dependencyHashes ?? {};
+  const docDep = deps[`doc:${input.docPath}`];
+  if (typeof docDep !== 'string') return false;
+  if (docDep !== current.docHash) return true;
+  const report = input.receipt.reportUnitId
+    ? readReviewReportFile(path.join(input.stagingRoot, 'reviews'), input.receipt.reportUnitId) : null;
+  if (!report || report.reportId !== input.receipt.reportId) return false;
+  const draft = readCurrentKnowledgeDraft(input.stagingRoot);
+  if (!draft) return false;
+  return !receiptDeclarationMatchesCurrentDraft({ draft, receipt: input.receipt,
+    sourceRefs: report.coverage?.sourceRefs ?? [] });
+}
+
+/** 待关闭问题引用（kri 报告问题与 kil 清单问题共用）。 */
+export interface ClosureIssueRef {
+  targetPath: string;
+  draftLocation: string | null;
+}
+
+/** 空白与零宽字符（含 BOM/NBSP）：uncheckedScope 判空前先剔除。 */
+const BLANK_AND_INVISIBLE = /[\s\u00a0\u200b-\u200d\u2060\ufeff]/g;
+
+/** pass 复核报告是否可作为关闭证据（WP-B1复审 R1/R1-A/R1-B）：自然语言的
+ * 未核范围声明无法用有限关键词证明「不涉及本问题」——同义表达
+ * （Everything besides…/Nothing but… 等）总能绕过枚举。因此采用完全
+ * fail-closed 的结构口径：uncheckedScope 去除空白与零宽字符后只要仍有
+ * 任一非空条目，就视为可能涉及本问题，不构成关闭证据；checkedDimensions
+ * 为空（什么都没核）同样不构成。关闭需要 uncheckedScope 为空的完整复核
+ * （reviewer-protocol 已同步提示：泛述未核范围会阻断自动关闭）。 */
+function passReportExcludesIssue(report: ReviewReport): boolean {
+  if (!Array.isArray(report.checkedDimensions) || report.checkedDimensions.length === 0) return true;
+  const unchecked = Array.isArray(report.uncheckedScope) ? report.uncheckedScope : [];
+  return unchecked.some((entry) => typeof entry === 'string'
+    && entry.replace(BLANK_AND_INVISIBLE, '').length > 0);
+}
+
+/** 当前候选（正文+声明哈希精确匹配）的独立 pass 复核对逐个问题的关闭判定。
+ *
+ * 用作阻断问题关闭证据（WP-B1 + 复审 R1/R1-A/R1-B）：作者 selector/覆盖/
+ * 对象声明-only 修订不改正文，主体摘要不变的旧 pass 回执（F01 保留）不代表
+ * 「对推进后候选的复核」；只有 doc:<path> 与 knowledge-declaration 都精确
+ * 匹配当前 staging 的 pass 回执才构成候选绑定，且其报告必须是**完整复核**
+ * ——uncheckedScope 为空或全空白（R1-B：非空一律可能涉及本问题，
+ * 不再尝试自然语言排除判定）且 checkedDimensions 非空。候选再变化即失去
+ * 关闭效力；每次调用重新判定。 */
+export function passReviewClosureForIssues(input: {
+  stagingRoot: string;
+  receipts: readonly ReviewReceipt[];
+  issues: readonly ClosureIssueRef[];
+}): boolean[] {
+  const closed = input.issues.map(() => false);
+  if (input.issues.length === 0) return closed;
+  const draft = readCurrentKnowledgeDraft(input.stagingRoot);
+  if (!draft) return closed;
+  const reviewsDir = path.join(input.stagingRoot, 'reviews');
+  const docsDir = path.resolve(input.stagingRoot, 'docs');
+  const currentDocHash = (docPath: string): string | null => {
+    const file = path.resolve(docsDir, docPath);
+    if (!file.startsWith(`${docsDir}${path.sep}`)) return null;
+    try {
+      return contentResourceHash(fs.readFileSync(file, 'utf8'));
+    } catch {
+      return null;
+    }
+  };
+  for (const receipt of input.receipts) {
+    if (receipt.status !== 'valid' || receipt.verdict !== 'pass' || !receipt.reportId || !receipt.reportUnitId) continue;
+    const report = readReviewReportFile(reviewsDir, receipt.reportUnitId);
+    if (!report || report.reportId !== receipt.reportId || report.draftHash !== receipt.draftHash
+      || report.conclusion !== receipt.verdict) continue;
+    if (!receiptDeclarationMatchesCurrentDraft({ draft, receipt,
+      sourceRefs: report.coverage?.sourceRefs ?? [] })) continue;
+    const deps = receipt.dependencyHashes ?? {};
+    // R1-B：未核范围判定与具体问题无关（任一非空条目都可能涉及），回执级一次判定
+    if (passReportExcludesIssue(report)) continue;
+    for (const [index, issue] of input.issues.entries()) {
+      if (closed[index] || !receipt.scopePaths?.includes(issue.targetPath)) continue;
+      const expectedBody = deps[`doc:${issue.targetPath}`];
+      if (typeof expectedBody !== 'string' || currentDocHash(issue.targetPath) !== expectedBody) continue;
+      closed[index] = true;
+    }
+  }
+  return closed;
+}
+
 export interface AuthorityReviewSelection {
   /** 依赖全匹配且报告文件绑定一致的有效报告（F07 validReportIds 驱动源）。 */
   validReportIds: string[];
@@ -396,17 +582,16 @@ export function collectAuthorityValidatedReports(input: {
   subjectOf?: (docPath: string) => string | null;
 }): AuthorityReviewSelection {
   const reviewsDir = path.join(input.stagingRoot, 'reviews');
-  const readReport = (unitId: string): ReviewReport | null => {
-    try {
-      const parsed = JSON.parse(fs.readFileSync(path.join(reviewsDir, `${unitId}.json`), 'utf8')) as ReviewReport;
-      return parsed && typeof parsed.reportId === 'string' ? parsed : null;
-    } catch {
-      return null;
-    }
-  };
   const skipped: AuthorityReviewSelection['skipped'] = [];
-  const validReportIds: string[] = [];
-  const seenReports = new Set<string>();
+  interface SelectedReview {
+    receipt: ReviewReceipt;
+    report: ReviewReport;
+    subjectBound: boolean;
+    /** WP-B1：未关闭 blocking 问题已被当前候选 pass 复核取代 → 不入选 */
+    superseded: boolean;
+    closureIssues: ClosureIssueRef[] | null;
+  }
+  const selected: SelectedReview[] = [];
   let draft: KnowledgeDraftFile | null = null;
   try { draft = JSON.parse(fs.readFileSync(path.join(input.stagingRoot, 'knowledge-draft.json'), 'utf8')); } catch { /* checked below */ }
   for (const receipt of input.store.listReviews()) {
@@ -418,7 +603,7 @@ export function collectAuthorityValidatedReports(input: {
       skipped.push({ reviewId: receipt.reviewId, reviewerTaskId: receipt.reviewerTaskId, reason: 'receipt_missing_report_binding' });
       continue;
     }
-    const report = readReport(receipt.reportUnitId);
+    const report = readReviewReportFile(reviewsDir, receipt.reportUnitId);
     if (!report || report.reportId !== receipt.reportId || report.draftHash !== receipt.draftHash
       || report.conclusion !== receipt.verdict) {
       skipped.push({ reviewId: receipt.reviewId, reviewerTaskId: receipt.reviewerTaskId, reason: 'report_file_binding_mismatch' });
@@ -432,10 +617,7 @@ export function collectAuthorityValidatedReports(input: {
         skipped.push({ reviewId: receipt.reviewId, reviewerTaskId: receipt.reviewerTaskId, reason: 'subject_stale' });
         continue;
       }
-      if (!seenReports.has(report.reportId)) {
-        seenReports.add(report.reportId);
-        validReportIds.push(report.reportId);
-      }
+      selected.push({ receipt, report, subjectBound: true, superseded: false, closureIssues: null });
       continue;
     }
     const scoped = Array.isArray(receipt.scopePaths) && receipt.scopePaths.length > 0;
@@ -461,9 +643,62 @@ export function collectAuthorityValidatedReports(input: {
       skipped.push({ reviewId: receipt.reviewId, reviewerTaskId: receipt.reviewerTaskId, reason: 'doc_dependency_stale' });
       continue;
     }
-    if (!seenReports.has(report.reportId)) {
-      seenReports.add(report.reportId);
-      validReportIds.push(report.reportId);
+    selected.push({ receipt, report, subjectBound: false, superseded: false, closureIssues: null });
+  }
+  // WP-B1（kb-build-speedup R3.2）：标准模式下主体绑定的 needs_revision 回执在
+  // selector/覆盖/对象声明-only 修订后仍被 F01 保留为有效，但其 blocking 问题
+  // 指向修订前候选（正文未变 → 主体摘要不变 → 旧报告永远「有效」，且
+  // closureBasis 在 v2 流程无人写入 → blocking_issue_open 永不消除，只能靠
+  // 伪造正文改动推进候选哈希——2026-11-06 实测 37 分钟空转的根因）。修复：
+  // 回执声明依赖已漂移（问题指向旧候选）且每个问题都有「精确绑定当前候选
+  // （正文+声明）且为完整复核（uncheckedScope 为空）的独立 pass 复核」时，
+  // 该报告不再作为当前候选的阻断来源。声明未漂移（问题就在当前候选上）、
+  // 无 pass 证据、路径无法归属、或 pass 报告未构成完整复核（复审 R1-B：
+  // uncheckedScope 去除空白/零宽后非空，或 checkedDimensions 为空）时照旧
+  // 拦截——作者自述修复不构成关闭，同候选的 pass 分歧也不能盖掉 blocking
+  // 问题；候选再变化即失去关闭效力（每次发布重新判定，不持久化关闭状态）。
+  interface PendingClosure { entry: SelectedReview; issueRefs: ClosureIssueRef[] }
+  const pending: PendingClosure[] = [];
+  for (const entry of selected) {
+    if (!entry.subjectBound || entry.superseded) continue;
+    const open = entry.report.issues.filter((issue) => issue.severity === 'blocking' && !isIssueClosed(issue));
+    if (open.length === 0) continue;
+    if (receiptDeclarationMatchesCurrentDraft({ draft, receipt: entry.receipt,
+      sourceRefs: entry.report.coverage?.sourceRefs ?? [] })) continue;
+    const issueRefs: ClosureIssueRef[] = [];
+    let attributable = true;
+    for (const issue of open) {
+      const target = blockingIssueTargetPath(issue, entry.receipt.scopePaths);
+      if (!target) { attributable = false; break; }
+      issueRefs.push({ targetPath: target, draftLocation: issue.draftLocation });
+    }
+    if (!attributable || issueRefs.length === 0) continue;
+    entry.closureIssues = issueRefs;
+    pending.push({ entry, issueRefs });
+  }
+  if (pending.length > 0) {
+    const allIssueRefs = pending.flatMap((item) => item.issueRefs);
+    const closedFlags = passReviewClosureForIssues({ stagingRoot: input.stagingRoot,
+      receipts: selected.filter((item) => !item.superseded).map((item) => item.receipt),
+      issues: allIssueRefs });
+    let cursor = 0;
+    for (const item of pending) {
+      const flags = closedFlags.slice(cursor, cursor + item.issueRefs.length);
+      cursor += item.issueRefs.length;
+      if (flags.every((closed) => closed)) {
+        item.entry.superseded = true;
+        skipped.push({ reviewId: item.entry.receipt.reviewId, reviewerTaskId: item.entry.receipt.reviewerTaskId,
+          reason: 'blocking_issues_closed_by_current_pass' });
+      }
+    }
+  }
+  const validReportIds: string[] = [];
+  const seenReports = new Set<string>();
+  for (const entry of selected) {
+    if (entry.superseded) continue;
+    if (!seenReports.has(entry.report.reportId)) {
+      seenReports.add(entry.report.reportId);
+      validReportIds.push(entry.report.reportId);
     }
   }
   return { validReportIds, skipped };

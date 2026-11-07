@@ -87,8 +87,12 @@ export const RAW_SEARCH_SPEC: AgentToolSpec = {
       query: string('搜索关键词（1..200 字符）'),
       limit: integer('返回条数上限', 1, 20),
     },
-    required: ['query'],
-    additionalProperties: false,
+    // R4 复审：不再 required query——否则 queries 别名入口仍在客户端校验层被拒；
+    // 缺失时的精确错误由 normalizeToolArguments 给出。
+    // WP-C（R5 回合开销）：别名（queries 多查询/objToken 限定单源）不在
+    // schema 宣传——additionProperties 放开让它们到达服务端，由
+    // normalizeToolArguments 规范化或报精确错误，不在 amagi/pi 校验层整回合拒绝。
+    additionalProperties: true,
   },
 };
 
@@ -118,11 +122,13 @@ export const RAW_CSV_CELLS_SPEC: AgentToolSpec = {
     properties: {
       objToken: string('源文档 objToken'),
       resourceId: string('raw_read 资源表中的完整 #csv: 资源 ID'),
-      recordStart: integer('起始逻辑 record（1 基）', 1),
-      recordEnd: integer('期望结束的逻辑 record（1 基，闭区间；超过 20 条自动分页）', 1),
+      // WP-C：0 会被服务端规范化为 1（模型常把 1 基坐标写成 0）。
+      recordStart: integer('起始逻辑 record（1 基）', 0),
+      recordEnd: integer('期望结束的逻辑 record（1 基，闭区间；超过 20 条自动分页）', 0),
     },
     required: ['objToken', 'resourceId', 'recordStart', 'recordEnd'],
-    additionalProperties: false,
+    // WP-C：columns 等多余字段服务端忽略并在返回中说明。
+    additionalProperties: true,
   },
 };
 
@@ -135,11 +141,12 @@ export const RAW_CSV_FIND_SPEC: AgentToolSpec = {
     properties: {
       objToken: string('源文档 objToken'),
       resourceId: string('raw_read 资源表中的完整 #csv: 资源 ID'),
-      queries: { type: 'array', items: { type: 'string', minLength: 2, maxLength: 200 }, minItems: 1, maxItems: 8,
+      queries: { type: 'array', items: { type: 'string', minLength: 2, maxLength: 200 }, minItems: 1, maxItems: 24,
         description: '待定位的源文短语，逐格子串匹配；每项最多返回前 5 处' },
     },
     required: ['objToken', 'resourceId', 'queries'],
-    additionalProperties: false,
+    // WP-C：上限 8→24（超过 8 项在结果中注明；>24 服务端报精确错误）。
+    additionalProperties: true,
   },
 };
 
@@ -165,7 +172,8 @@ export const DRAFT_LIST_SPEC: AgentToolSpec = {
   parameters: {
     type: 'object',
     properties: {},
-    additionalProperties: false,
+    // WP-C：多余参数（limit 等）服务端忽略并在返回中说明，不整回合拒绝。
+    additionalProperties: true,
   },
 };
 
@@ -184,8 +192,10 @@ export const DRAFT_READ_SPEC: AgentToolSpec = {
       declarationClaimKey: string('可选：只返回含此 claimKey 的对象、该断言及其证据；自动启用 includeDeclarations，审查单个疑点时避免整篇声明过大'),
       declarationObjectKey: string('可选：includeDeclarations=true 时按稳定 clientKey 或 objectId 只返回此对象的完整声明；先读摘要再按对象读取'),
     },
-    required: ['path'],
-    additionalProperties: false,
+    // R4 复审：不再 required path（docPath/paths 别名须能到达服务端）；
+    // 缺失时的精确错误由 normalizeToolArguments 给出。
+    // WP-C：docPath/paths/kind 等别名由服务端规范化或报精确错误。
+    additionalProperties: true,
   },
 };
 
@@ -199,8 +209,10 @@ export const DRAFT_SEARCH_SPEC: AgentToolSpec = {
       query: string('搜索关键词'),
       limit: integer('返回条数上限', 1, 20),
     },
-    required: ['query'],
-    additionalProperties: false,
+    // R4 复审：不再 required query（queries 别名入口须能到达服务端）；缺失时
+    // 由 normalizeToolArguments 报精确错误。
+    // WP-C：queries 多查询/path 限定范围由服务端规范化；filter 等歧义参数报精确错误。
+    additionalProperties: true,
   },
 };
 
@@ -291,7 +303,10 @@ export const KB_WRITE_DOC_SPEC: AgentToolSpec = {
             key: string('占位键，正文使用 {{kb-csv-table:key}}'),
             sourceId: string('来源 objToken，必须列在 sources 中'),
             csvName: string('CSV 附件文件名，不能包含路径'),
-            columns: { type: 'array', minItems: 1, maxItems: 20, items: integer('0 起始列坐标', 0, 99) },
+            columns: { type: 'array', minItems: 1, maxItems: 20,
+              // WP-C（R5）：模型常写 "@A"/"A"/"3"；服务端规范化为 0 起始整数列位，
+              // 歧义形式（如 A1 单元格引用）报精确错误。
+              items: { anyOf: [{ type: 'integer', minimum: 0, maximum: 99 }, { type: 'string', maxLength: 8 }] } },
             headerRecord: integer('标题所在逻辑记录，1 起始；缺省 1', 1),
             firstRecord: integer('首条数据所在逻辑记录；缺省标题下一条', 1),
             lastRecord: integer('末条数据所在逻辑记录；缺省至末尾；空白行自动跳过', 1),
@@ -952,10 +967,11 @@ export const KB_READ_BATCH_SPEC: AgentToolSpec = {
       maxLines: integer('单次请求（每页）总行数预算（缺省 1200；续页预算重置）', 1, 4000),
       cursor: string('分页游标（上一页返回的 nextCursor；携带时忽略 requests，单独携带 cursor 即可续页）'),
     },
-    // F05：requests 与 cursor 二选一（带 cursor 续页无需重复 requests；
-    // 同时携带时 cursor 优先、requests 被忽略，与服务端解析顺序一致）。
-    anyOf: [{ required: ['requests'] }, { required: ['cursor'] }],
-    additionalProperties: false,
+    // F05 + WP-C（R5）：requests/cursor 二选一不再在 schema 层强制（anyOf 会把
+    // 「顶层单请求对象」形误填整回合拒在 amagi/pi 校验层）——顶层单对象包
+    // 装成 requests、resources 别名与多余字段由服务端 normalizeToolArguments
+    // 规范化或报精确错误；带 cursor 续页无需重复 requests。
+    additionalProperties: true,
   },
 };
 
@@ -1078,8 +1094,10 @@ export const KB_TOOL_SCHEMA_SPEC: AgentToolSpec = {
   parameters: {
     type: 'object',
     properties: { name: string('要查看的知识工具名，如 kb_edit_doc') },
-    required: ['name'],
-    additionalProperties: false,
+    // R4 复审：不再 required name（tool 别名入口须能到达服务端）；缺失时
+    // 由 normalizeToolArguments 报精确错误。
+    // WP-C：tool 别名由服务端规范化（不在 schema 宣传）。
+    additionalProperties: true,
   },
 };
 
@@ -1152,7 +1170,9 @@ export const BUILD_HANDOFF_SUBMIT_SPEC: AgentToolSpec = {
       summary: string('结论摘要（≤2000 字符）'),
       artifactRefs: { type: 'array', maxItems: 200, items: { type: 'string' }, description: '成果引用（路径或路径@revision）' },
       sourceScope: { type: 'array', maxItems: 200, items: { type: 'string' }, description: '覆盖的源 objToken' },
-      openIssues: { type: 'array', maxItems: 200, items: { type: 'string' }, description: '未解决问题（描述+位置）' },
+      // WP-C（R5）：openIssues 对象项由服务端序列化为一句字符串
+      // （取 description/text/message 等字段，兕底 JSON），不再整回合拒绝。
+      openIssues: { type: 'array', maxItems: 200, items: { anyOf: [{ type: 'string' }, { type: 'object' }] }, description: '未解决问题（描述+位置）' },
       nextInfo: { anyOf: [{ type: 'array', maxItems: 200, items: { type: 'string' } }, { type: 'string' }], description: '下一步所需信息/建议；单条可直接填字符串' },
     },
     required: ['summary'],
@@ -1216,7 +1236,9 @@ export const BUILD_ISSUES_LIST_SPEC: AgentToolSpec = {
     properties: {
       targetPath: string('按目标路径过滤（缺省全部）'),
     },
-    additionalProperties: false,
+    // WP-C（R5）：listId/issueListId/revision 等误填参数服务端忽略并说明，
+    // 其余未知参数报精确错误；本工具始终返回最新 revision。
+    additionalProperties: true,
   },
 };
 

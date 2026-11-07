@@ -98,6 +98,17 @@ describe('renderAgentDirConfigFiles', () => {
     expect(JSON.parse(files.amagi).concurrency.models).toEqual({ 'zhipuai/shared': 4, 'openai/shared': 2 });
   });
 
+  it('R1：同模型角色共享单池，容量给满 max（不再均分）', () => {
+    const spec = makeSpec({
+      models: { leader: 'zhipuai/glm-5.3', writer: 'zhipuai/glm-5.3:high', reviewer: 'zhipuai/glm-5.3', research: 'zhipuai/glm-5.3:high' },
+      limits: { maxConcurrentAgents: 6, admissionPools: { writer: 6, reviewer: 6 } },
+    });
+    expect(validateBuildRunSpec(spec)).toEqual([]);
+    const { files, dirs } = renderedFor(spec);
+    expect(validateRenderedConfig(files, spec, dirs)).toEqual([]);
+    expect(JSON.parse(files.amagi).concurrency.models).toEqual({ 'zhipuai/glm-5.3': 6 });
+  });
+
   it('mcp.json：只登记桥接、env 用 ${VAR} 引用、autoEnableCodemode:false', () => {
     const { files } = renderedFor();
     const mcp = JSON.parse(files.mcp);

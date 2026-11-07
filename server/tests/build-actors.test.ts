@@ -77,6 +77,61 @@ describe('身份链（§4.1）', () => {
     expect(store.ancestryOf('w2').has('w1')).toBe(true);
   });
 
+  it('R3.3 实测场景：续接链上较早任务时，分配已转移到后代 → 同链转交继承', () => {
+    // b_20261105233621 02:14：w1 原写 → resume w2（修订，继承分配并完成）；
+    // Leader 再 resume w1 补来源声明 → 直接父继承落空，写入被旧持有者拒绝。
+    const store = freshStore();
+    store.registerTaskCreation({ nativeTaskId: 'w1', requestedRole: 'luban' });
+    store.assignOutputs({ targets: ['系统/buff系统.md'], ownerTaskId: 'w1' });
+    store.registerTaskCreation({ nativeTaskId: 'w2', parentTaskId: 'w1', requestedRole: 'luban' });
+    expect(store.activeAssignmentFor('系统/buff系统.md')!.ownerTaskId).toBe('w2');
+    // Leader 续接原任务 w1（而非最新 w2）
+    const resumed = store.registerTaskCreation({ nativeTaskId: 'w3', parentTaskId: 'w1', requestedRole: 'luban' });
+    expect(resumed.status).toBe('confirmed');
+    // 分配沿作者链转交给 w3；同一目标仍只有一个有效分配
+    expect(store.activeAssignmentFor('系统/buff系统.md')!.ownerTaskId).toBe('w3');
+    expect(store.listAssignments().filter((item) => item.status === 'active'
+      && item.targetKind === 'doc' && item.targets.includes('系统/buff系统.md'))).toHaveLength(1);
+    // 旧持有者 w2 被撤销；写入路径两道拒绝（身份 + 持有者）
+    expect(store.lookupActor('w2')!.status).toBe('revoked');
+    expect(store.lookupActor('w2')!.revokedReason).toBe('superseded_by_lineage_resume');
+    expectActorError(() => store.requireConfirmedActor('w2'), 'actor_revoked');
+    expectActorError(() => store.assertOutputAssignment('w2', '系统/buff系统.md'), 'kb_output_owned_by_other_task');
+    expect(() => store.assertOutputAssignment('w3', '系统/buff系统.md')).not.toThrow();
+    // 事件记录链上转交来源，可审计（w3 的继承事件，非 w2 的直接父继承）
+    const transferred = store.eventsSince().find((event) => event.type === 'actor_inherited' && event.taskId === 'w3');
+    expect((transferred!.payload as { lineageTransferredFrom?: string[] }).lineageTransferredFrom).toContain('w2');
+  });
+
+  it('写权冲突错误自带转交参数（revoke + assign 完整命令）', () => {
+    const store = freshStore();
+    store.registerTaskCreation({ nativeTaskId: 'w1', requestedRole: 'luban' });
+    store.registerTaskCreation({ nativeTaskId: 'w2', requestedRole: 'luban' });
+    store.assignOutputs({ targets: ['docs/a.md'], ownerTaskId: 'w1' });
+    // kb_output_owned_by_other_task：写入侧（子任务可直接转述给 Leader）
+    try {
+      store.assertOutputAssignment('w2', 'docs/a.md');
+      throw new Error('期望抛出 kb_output_owned_by_other_task');
+    } catch (error) {
+      expect(error).toBeInstanceOf(BuildActorError);
+      const message = (error as BuildActorError).message;
+      expect(message).toContain('w1');
+      expect(message).toContain('build_revoke_output({ownerTaskId:"w1"})');
+      expect(message).toContain('build_assign_output({ownerTaskId:"w2",targets:["docs/a.md"]})');
+      expect(message).toContain('task_resume');
+    }
+    // kb_output_assignment_conflict：分配侧（Leader 直接可执行）
+    try {
+      store.assignOutputs({ targets: ['docs/a.md'], ownerTaskId: 'w2' });
+      throw new Error('期望抛出 kb_output_assignment_conflict');
+    } catch (error) {
+      expect(error).toBeInstanceOf(BuildActorError);
+      const message = (error as BuildActorError).message;
+      expect(message).toContain('build_revoke_output({ownerTaskId:"w1"})');
+      expect(message).toContain('revisionFallback');
+    }
+  });
+
   it('父任务未登记 → 拒绝（创建事件必须先有父）', () => {
     const store = freshStore();
     expectActorError(

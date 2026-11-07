@@ -167,7 +167,7 @@ function buildIntegrityFixture(): RuntimeIntegrityRefs {
 
 /** FrozenDispatchConfig fixture（形状=运行时 contracts；角色模型为精确名单，含 thinking 档位）。 */
 const GUARD_CONFIG: FrozenDispatchConfig = {
-  schemaVersion: 2,
+  schemaVersion: 3,
   buildId: 'b_fixture',
   generation: 1,
   workDir: `${os.tmpdir()}/feishu-build-fixture/work`,
@@ -312,6 +312,59 @@ describe('A2 守卫接缝（真实运行时 dispatch-guard 语义经扩展 tool_
     expect('scope' in smuggled).toBe(false);
     expect('workspace' in smuggled).toBe(false);
     expect('profile' in smuggled).toBe(false);
+  });
+});
+
+describe('A2c 在途快照接缝（扩展读 dispatch-inflight.json → 守卫准入）', () => {
+  const guardModule = resolveDispatchGuardModule();
+  beforeAll(() => {
+    if (!guardModule) console.warn('[build-runtime-extension] 未定位到运行时 dispatch-guard 模块，A2c 跳过');
+  });
+
+  it('快照满载拒新写作并给出 dispatch_inflight_* 原因；快照缺失 fail-open；审查优先不受写作占满影响', async () => {
+    if (!guardModule) return;
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wpA-ext-inflight-'));
+    const statePath = path.join(tmp, 'dispatch-inflight.json');
+    const guard: FrozenDispatchConfig = {
+      ...GUARD_CONFIG,
+      dispatch: {
+        inflightStatePath: statePath,
+        rolePoolKeys: { writer: 'zhipuai/glm-5.3-flash', reviewer: 'zhipuai/glm-5.3', research: 'zhipuai/glm-5.3' },
+        poolCapacities: { 'zhipuai/glm-5.3-flash': 2, 'zhipuai/glm-5.3': 2 },
+      },
+    };
+    const writerFull = () => fs.writeFileSync(statePath, JSON.stringify({
+      schemaVersion: 1, buildId: guard.buildId, generation: guard.generation, seq: 1,
+      updatedAt: new Date().toISOString(),
+      inflight: [{ role: 'luban', state: 'running' }, { role: 'luban', state: 'running' }],
+      pendingReview: 0, pendingRevision: 0,
+    }));
+    writerFull();
+    const api = await startMockApi([
+      { name: 'task_submit', label: 'App task', description: '应用 task 工具（构建模式跳过注册）', parameters: { type: 'object' } },
+      { name: 'kb_build_probe', label: '构建', description: '应用构建工具', parameters: { type: 'object' } },
+    ]);
+    try {
+      const mod = await loadBuildFactory(JSON.stringify({ tools: BUILD_TOOLS, guard }), guardModule, api.url);
+      const fake = fakePi();
+      await mod.default(fake.pi);
+      const handler = fake.state.handlers.tool_call[0];
+      const blocked = handler({ toolName: 'task_submit', input: { agent: 'luban', task: '【写作】方阵：参考定义 L100' } }) as { block: boolean; reason: string };
+      expect(blocked.block).toBe(true);
+      expect(blocked.reason).toContain('dispatch_inflight_write_exhausted');
+      expect(blocked.reason).toContain('完成通知');
+      // reviewer 池空：独立审查优先放行（不受写作占满影响）
+      expect(handler({ toolName: 'task_submit', input: { agent: 'diting', task: '【独立审查】审查对象：A.md\nkb_submit_review：coverage.docPaths=["A.md"]' } })).toBeUndefined();
+      // 快照缺失/不可读 → fail-open（在途准入是吞吐优化，不是权限边界）
+      fs.rmSync(statePath);
+      expect(handler({ toolName: 'task_submit', input: { agent: 'luban', task: '【写作】方阵：参考定义 L100' } })).toBeUndefined();
+      // 代次不匹配的陈旧快照同样 fail-open
+      fs.writeFileSync(statePath, JSON.stringify({ schemaVersion: 1, buildId: guard.buildId, generation: 99, seq: 1, updatedAt: new Date().toISOString(), inflight: [{ role: 'luban', state: 'running' }], pendingReview: 0, pendingRevision: 0 }));
+      expect(handler({ toolName: 'task_submit', input: { agent: 'luban', task: '【写作】方阵：参考定义 L100' } })).toBeUndefined();
+    } finally {
+      await api.close();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
 });
 

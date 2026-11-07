@@ -22,7 +22,7 @@ import { freezeGuardConfig } from './dispatch-guard.js';
 import { buildRuntimeIntegrityRefs } from './runtime-integrity.js';
 import { childPolicyContentHash, childPolicyFileName, renderChildPolicySource } from './child-policy.js';
 import {
-  BUILD_MODEL_PROVIDER, DEFAULT_LEADER_TERMINATE_GRACE_MS, validateBuildRunSpec,
+  BUILD_MODEL_PROVIDER, DEFAULT_LEADER_TERMINATE_GRACE_MS, modelSpecPoolKey, validateBuildRunSpec,
   type AdapterStartOptions,
   type BuildCheckpoint, type BuildModelProvider, type BuildRunSpec, type BuildRuntimeAdapter, type CancelResult,
   type CapabilityReport, type ProbeInput, type RuntimeBinding, type RuntimeEvent,
@@ -577,6 +577,7 @@ export class PiAmagiBuildRuntime implements BuildRuntimeAdapter {
     strictGates?: boolean;
     roles: Record<string, { key: string; models: string[]; mcpTools: string[] }>;
     integrity: import('./runtime-integrity.js').RuntimeIntegrityRefs;
+    dispatch: import('./dispatch-guard.js').FrozenDispatchAdmission;
   } {
     const roles: Record<string, { key: string; models: string[]; mcpTools: string[] }> = {};
     for (const roleKey of Object.keys(spec.roles) as Array<keyof typeof spec.roles>) {
@@ -599,6 +600,21 @@ export class PiAmagiBuildRuntime implements BuildRuntimeAdapter {
       amagiPackage: { packageRoot: spec.amagiPackage.packageRoot, contentHash: spec.amagiPackage.contentHash },
       workflowSkill: { path: spec.workflowSkillPath, sha256: spec.workflowRevision },
     });
+    // A2 派发准入：池映射与 amagi.json concurrency.models 同源渲染
+    //（modelSpecPoolKey 为键；同模型角色自然归入同池），在途快照固定在
+    // epoch 根下（rebuild 换 epoch → 新路径新快照，旧代次数据不混入）。
+    const poolCapacities: Record<string, number> = {};
+    for (const roleKey of Object.keys(spec.roles) as Array<keyof typeof spec.roles>) {
+      const cap = spec.limits.admissionPools[roleKey];
+      const model = spec.models[roleKey];
+      if (cap === undefined || !model) continue;
+      poolCapacities[modelSpecPoolKey(model)] = cap;
+    }
+    const rolePoolKeys: Record<string, string> = {};
+    for (const roleKey of Object.keys(spec.roles) as Array<keyof typeof spec.roles>) {
+      const model = spec.models[roleKey];
+      if (model) rolePoolKeys[roleKey] = modelSpecPoolKey(model);
+    }
     return {
       buildId: spec.buildId,
       strictGates: spec.strictGates,
@@ -612,6 +628,11 @@ export class PiAmagiBuildRuntime implements BuildRuntimeAdapter {
       }),
       roles,
       integrity,
+      dispatch: {
+        inflightStatePath: path.join(dirs.epochRoot, 'dispatch-inflight.json'),
+        rolePoolKeys,
+        poolCapacities,
+      },
     };
   }
 

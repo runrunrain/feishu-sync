@@ -19,6 +19,14 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { atomicWriteFile } from '../agent/path-guard.js';
+// WP-B1：阻断问题关闭证据（只引入纯函数；review-authority 对本模块仅
+// type-only 依赖，无运行时环）。
+import {
+  currentPathCandidateBinding,
+  passReviewClosureForIssues,
+  reviewReceiptPathOriginDrifted,
+  type ClosureIssueRef,
+} from './review-authority.js';
 
 // ============================================================================
 // §8 契约类型（成果侧；运行时 BuildRuntimeAdapter/contracts.ts 由另一模块
@@ -143,6 +151,10 @@ export interface IssueListRecord {
   generation: number;
   revision: number;
   summary: string | null;
+  /** 登记时的门禁策略标记（复审 R2-A）：'standard' 才允许 pass 自动关闭；
+   * 'strict' 一律保持既有计数（不因 pass 关闭）；additive 可选，缺省 =
+   * 旧清单/直连 store 登记 → 同样 fail-closed 不关闭。 */
+  gatePolicy?: 'standard' | 'strict';
   issues: Array<{
     issueKey: string;
     severity: 'blocking' | 'suggestion';
@@ -151,6 +163,12 @@ export interface IssueListRecord {
     sourceLocation: string | null;
     description: string;
     fromReviewId: string | null;
+    /** WP-B1复审 R2：首次登记该 issueKey 时 targetPath 的起始候选绑定
+     * （正文哈希 + 该文档范围声明哈希；仅标准门禁由 build_issues_submit 记录）。
+     * additive 可选：缺省 = 旧清单/严格模式/直连 store 登记 → fail-closed，
+     * 不被任何 pass 关闭；null = 登记时不可计算，可经标准模式下的
+     * fromReviewId 漂移回退判定。重登记同 issueKey 继承首次绑定。 */
+    originBinding?: { docHash: string; declarationHash: string } | null;
   }>;
   createdAt: string;
 }
@@ -474,11 +492,22 @@ export class BuildActorStore {
       throw new BuildActorError('actor_role_unknown', `角色不在构建角色表内: ${agent}`, 403);
     }
     this.actors.set(input.nativeTaskId, actor);
-    // 续接继承：父任务的 active 分配转移到新任务 ID，父任务写资格撤销（§4.2）
+    // 续接继承：作者链的 active 分配转移到新任务 ID，链上旧任务写资格撤销（§4.2）
     if (input.parentTaskId) {
+      const parentTaskId: string = input.parentTaskId;
       const inherited: string[] = [];
+      // R3.3 实测（b_20261105233621 02:14）：Leader 从链上较早的任务续接时，
+      // 分配可能已随此前的续接转移到其后代任务名下（父任务自身无 active
+      // 分配），直接父继承会落空，新任务写入被 kb_output_owned_by_other_task
+      // 拒绝。继承按「作者链」判定：持有者是父任务的后代（同链）→ 同样
+      // 转交给新续接任务并撤销持有者身份。不变量不放宽——supersede 旧分配
+      // + 新建 active，同一目标同一时刻仍只有一个有效分配。
+      const inParentLineage = (ownerTaskId: string): boolean =>
+        ownerTaskId === parentTaskId || this.ancestryOf(ownerTaskId).has(parentTaskId);
+      const transferredHolders = new Set<string>();
       for (const assignment of this.assignments.values()) {
-        if (assignment.ownerTaskId === input.parentTaskId && assignment.status === 'active') {
+        if (assignment.status === 'active' && assignment.ownerTaskId !== input.nativeTaskId
+          && inParentLineage(assignment.ownerTaskId)) {
           assignment.status = 'superseded';
           assignment.revokedAt = nowIso();
           const successor: OutputAssignment = {
@@ -494,6 +523,7 @@ export class BuildActorStore {
           };
           this.assignments.set(successor.assignmentId, successor);
           inherited.push(successor.assignmentId);
+          transferredHolders.add(assignment.ownerTaskId);
         }
       }
       const parent = this.actors.get(input.parentTaskId);
@@ -502,7 +532,19 @@ export class BuildActorStore {
         parent.revokedAt = nowIso();
         parent.revokedReason = 'superseded_by_resume';
       }
-      this.appendEvent({ source: 'leader-rpc', type: 'actor_inherited', taskId: input.nativeTaskId, payload: { parentTaskId: input.parentTaskId, assignments: inherited } });
+      // 链上其它持有者（非直接父）同样被本次续接取代
+      for (const holderId of transferredHolders) {
+        if (holderId === input.parentTaskId) continue;
+        const holder = this.actors.get(holderId);
+        if (holder && holder.status === 'confirmed') {
+          holder.status = 'revoked';
+          holder.revokedAt = nowIso();
+          holder.revokedReason = 'superseded_by_lineage_resume';
+        }
+      }
+      this.appendEvent({ source: 'leader-rpc', type: 'actor_inherited', taskId: input.nativeTaskId,
+        payload: { parentTaskId, assignments: inherited,
+          ...(transferredHolders.size > 0 ? { lineageTransferredFrom: [...transferredHolders].sort() } : {}) } });
     }
     this.appendEvent({
       source: 'leader-rpc',
@@ -632,9 +674,11 @@ export class BuildActorStore {
       const probe = targetKind === 'family' ? `family:${target}` : target;
       const holder = this.activeAssignmentFor(probe);
       if (holder && holder.ownerTaskId !== input.ownerTaskId) {
+        // R3.3：带下一步可执行参数，避免 Leader 靠试错发现 revoke+assign 次序
+        //（实测 b_20261105210253 21:26 摩擦）。
         throw new BuildActorError(
           'kb_output_assignment_conflict',
-          `目标 ${target} 已由任务 ${holder.ownerTaskId} 持有（assignmentId=${holder.assignmentId}）；请先收回该分配或等待其完成`,
+          `目标 ${target} 已由任务 ${holder.ownerTaskId} 持有（assignmentId=${holder.assignmentId}）。转交：先 build_revoke_output({ownerTaskId:"${holder.ownerTaskId}"}) 再重新分配；若目标存在未闭环的阻断审查修订，优先 task_resume 持有者同链任务（续接自动继承分配），显式改派需附 revisionFallback`,
           409,
         );
       }
@@ -743,9 +787,12 @@ export class BuildActorStore {
       );
     }
     if (assignment.ownerTaskId !== nativeTaskId) {
+      // R3.3：错误自带处置路径（含完整参数），子任务可直接转述给 Leader
+      //（实测 b_20261105233621 02:13–02:15：buff/天下大势补来源被旧任务
+      // 持有，每处需 Leader 手工推断 revoke+assign 次序）。
       throw new BuildActorError(
         'kb_output_owned_by_other_task',
-        `文档 ${docPath} 由任务 ${assignment.ownerTaskId} 持有；本任务 ${nativeTaskId} 无写入资格`,
+        `文档 ${docPath} 由任务 ${assignment.ownerTaskId} 持有（assignmentId=${assignment.assignmentId}）；本任务 ${nativeTaskId} 无写入资格。处理：Leader 先 build_revoke_output({ownerTaskId:"${assignment.ownerTaskId}"}) 再 build_assign_output({ownerTaskId:"${nativeTaskId}",targets:["${docPath}"]})；或经 task_resume 续接持有者同链任务自动继承写入资格`,
         409,
       );
     }
@@ -895,10 +942,108 @@ export class BuildActorStore {
     return [...this.reviews.values()];
   }
 
-  /** 未解决 blocking 问题计数（发布门禁输入）。 */
+  /** 未解决 blocking 问题计数（发布门禁输入）。
+   *
+   * WP-B1（kb-build-speedup R3.2）+ 复审 R2/R2-A：只有「起源于前一候选」的
+   * blocking 才可能被 pass 复核关闭——问题首次登记时的起始候选绑定
+   * （originBinding，或 fromReviewId 指向报告的依赖）与当前候选不同，
+   * 且存在精确绑定当前候选、覆盖该问题范围的独立 pass 复核时才按已关闭计
+   * （复审 R1/R1-A：pass 报告明确未核或无法证明覆盖该问题范围同样不关闭）。
+   * **门禁策略显式判定（R2-A）**：仅 gatePolicy='standard' 的清单允许 pass
+   * 自动关闭；'strict' 清单一律保持既有计数（不因 pass 关闭，含
+   * fromReviewId 回退）；无标记的旧清单/直连登记 fail-closed 同样不关闭。
+   * 重登记同 issueKey 继承首次起始候选，事故「重登记以触发关闭」路径据此
+   * 立即关闭；同候选新登记/新 issueKey 一律保持开放（pass 不是永久豁免）。
+   * staging 不可读时按原语义计数（不放宽）。 */
   openBlockingIssues(): number {
     const latest = this.issueLists[this.issueLists.length - 1];
-    return latest ? latest.issues.filter((issue) => issue.severity === 'blocking').length : 0;
+    if (!latest) return 0;
+    const blocking = latest.issues.filter((issue) => issue.severity === 'blocking');
+    if (blocking.length === 0) return 0;
+    // R2-A：严格模式与无策略标记的清单显式保持既有计数，不因 pass 自动关闭
+    if (latest.gatePolicy !== 'standard') return blocking.length;
+    const closableIndices: number[] = [];
+    const issueRefs: ClosureIssueRef[] = [];
+    for (const [index, issue] of blocking.entries()) {
+      if (!issue.targetPath || !this.blockingIssueOriginDrifted(issue)) continue;
+      closableIndices.push(index);
+      issueRefs.push({ targetPath: issue.targetPath, draftLocation: issue.draftLocation });
+    }
+    let closedFlags: boolean[] = [];
+    if (issueRefs.length > 0) {
+      try {
+        closedFlags = passReviewClosureForIssues({
+          stagingRoot: this.stagingRoot,
+          receipts: [...this.reviews.values()],
+          issues: issueRefs,
+        });
+      } catch {
+        closedFlags = issueRefs.map(() => false);
+      }
+    }
+    const closedIndices = new Set(closableIndices.filter((_, position) => closedFlags[position]));
+    return blocking.filter((_, index) => !closedIndices.has(index)).length;
+  }
+
+  /** 起始候选是否可证明已漂移（复审 R2）：originBinding 与当前不一致 →
+   * 漂移；无 originBinding 时用 fromReviewId 指向回执的路径依赖判定
+   * （仅标准门禁清单可达——openBlockingIssues 已先行拦截 strict/无标记）；
+   * 两者都不可判定 → false（fail-closed，保持开放）。 */
+  private blockingIssueOriginDrifted(issue: IssueListRecord['issues'][number]): boolean {
+    if (!issue.targetPath) return false;
+    if (issue.originBinding) {
+      const current = currentPathCandidateBinding(this.stagingRoot, issue.targetPath);
+      return !!current && (current.docHash !== issue.originBinding.docHash
+        || current.declarationHash !== issue.originBinding.declarationHash);
+    }
+    if (issue.fromReviewId) {
+      const receipt = [...this.reviews.values()].find((candidate) => candidate.reportId === issue.fromReviewId);
+      if (receipt) {
+        return reviewReceiptPathOriginDrifted({ stagingRoot: this.stagingRoot, receipt, docPath: issue.targetPath });
+      }
+    }
+    return false;
+  }
+
+  /** A2 派发准入积压信号（host 写入在途快照用）：粗粒度推导「当前是否有
+   * 待审/待修订文档」，用于为审查与修订保留至少 1 个派发槽。信号只影响
+   * 新写作能否占满最后一个槽，不影响审查/修订自身放行；偶发偏差代价仅为
+   * 吞吐微降（多保留一槽）或审查稍后（无保留槽），不会死锁——在途计数
+   * 收敛后槽总会释放。
+   * - 待审：本代次 write/edit 回执覆盖的路径中，存在未被任何本代次有效
+   *   审查回执覆盖的路径（独立审查尚未追上写作）。
+   * - 待修订：存在本代次有效 needs_revision/fail 回执，且其覆盖路径在该
+   *   回执之后没有新的写入回执（修订尚未落地）。
+   */
+  dispatchBacklogSignal(): { pendingReview: number; pendingRevision: number } {
+    const lastWriteAt = new Map<string, string>();
+    for (const receipt of this.receipts.values()) {
+      if (receipt.generation !== this.generation) continue;
+      if (receipt.kind !== 'write_doc' && receipt.kind !== 'edit_doc') continue;
+      for (const docPath of Array.isArray(receipt.result?.paths) ? receipt.result.paths : []) {
+        if (typeof docPath !== 'string') continue;
+        const prior = lastWriteAt.get(docPath);
+        if (prior === undefined || receipt.createdAt > prior) lastWriteAt.set(docPath, receipt.createdAt);
+      }
+    }
+    const reviewedPaths = new Set<string>();
+    const revisionPaths = new Set<string>();
+    for (const review of this.reviews.values()) {
+      if (review.generation !== this.generation || review.status !== 'valid') continue;
+      const scopes = Array.isArray(review.scopePaths) ? review.scopePaths : [];
+      for (const docPath of scopes) reviewedPaths.add(docPath);
+      if (review.verdict !== 'needs_revision' && review.verdict !== 'fail') continue;
+      for (const docPath of scopes) {
+        const lastWrite = lastWriteAt.get(docPath);
+        if (lastWrite === undefined || lastWrite < review.createdAt) revisionPaths.add(docPath);
+      }
+    }
+    let pendingReview = 0;
+    for (const docPath of lastWriteAt.keys()) {
+      if (reviewedPaths.has(docPath) || revisionPaths.has(docPath)) continue;
+      pendingReview += 1;
+    }
+    return { pendingReview, pendingRevision: revisionPaths.size };
   }
 
   // ------------------------------------------------------------------
@@ -918,8 +1063,22 @@ export class BuildActorStore {
   }
 
   recordIssueList(input: Omit<IssueListRecord, 'issueListId' | 'buildId' | 'generation' | 'revision' | 'createdAt'>): IssueListRecord {
+    // WP-B1复审 R2：重登记同 issueKey 继承**首次**登记的起始候选绑定——
+    // 问题关闭只认它首次出现时的候选，后续重登记不刷新起源，也不得把
+    // 「登记时刻已有 pass」变成新问题的豁免。
+    const firstOriginByKey = new Map<string, IssueListRecord['issues'][number]>();
+    for (const list of this.issueLists) {
+      for (const issue of list.issues) {
+        if (!firstOriginByKey.has(issue.issueKey)) firstOriginByKey.set(issue.issueKey, issue);
+      }
+    }
+    const issues = input.issues.map((issue) => {
+      const prior = firstOriginByKey.get(issue.issueKey);
+      return prior ? { ...issue, originBinding: prior.originBinding } : issue;
+    });
     const record: IssueListRecord = {
       ...input,
+      issues,
       issueListId: `kil_${crypto.randomBytes(6).toString('hex')}`,
       buildId: this.buildId,
       generation: this.generation,

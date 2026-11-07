@@ -223,6 +223,20 @@ function colLetters(col: number): string {
   return name;
 }
 
+/** WP-C（R5 自动修复提示）：CSV 逻辑 record 区间内实际存在非空单元格的列
+ * （1 起始字母坐标 @A、@B…；用于「选中的单元格全为空」错误引导重选）。 */
+export function csvNonEmptyColumnLabels(content: string, recordStart: number, recordEnd: number): string[] {
+  const { records } = parseCsvRecords(content);
+  const columns = new Set<number>();
+  for (let recordNo = Math.max(1, recordStart); recordNo <= Math.min(recordEnd, records.length); recordNo += 1) {
+    const record = records[recordNo - 1]!;
+    record.forEach((value, index) => {
+      if (value.trim()) columns.add(index);
+    });
+  }
+  return [...columns].sort((a, b) => a - b).map((index) => `@${colLetters(index + 1)}`);
+}
+
 // ============================================================================
 // resolveSelector（A 案 §5.2 定位规范）
 // ============================================================================

@@ -831,6 +831,88 @@ export function precheck(input: PrecheckInput, options: PrecheckOptions = {}): P
 }
 
 // ---------------------------------------------------------------------------
+// D2(c)：编号/计数声明提示（只提示不拦截，宁漏报勿误报）
+// ---------------------------------------------------------------------------
+
+const COUNT_COUNTER_RE = '(?:项|条|类|种|计|大|点|维|步|原则)';
+const CJK_DIGIT: Record<string, number> = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+
+/** 中文数字 ≤99（一～九十九，含十/二十七式）；不匹配返回 null。 */
+function parseCjkSmallNumber(text: string): number | null {
+  if (!/^[一二三四五六七八九]{0,2}$|^[一二三四五六七八九]?十[一二三四五六七八九]?$/.test(text)) return null;
+  const ten = text.indexOf('十');
+  if (ten < 0) {
+    if (text.length !== 1) return null;
+    return CJK_DIGIT[text] ?? null;
+  }
+  const high = ten > 0 ? CJK_DIGIT[text[ten - 1]!] ?? 0 : 1;
+  const low = ten + 1 < text.length ? CJK_DIGIT[text[ten + 1]!] ?? 0 : 0;
+  return high * 10 + low;
+}
+
+const LIST_ITEM_RE = /^ {0,3}(?:[-*+]|\d{1,3}[.)]) +/;
+
+/** 实测返工样本「七计合并成六项」类抄录错误：同一行内声称「N<量词>」，
+ * 且枚举就在可机械定位的位置（同行「、」分隔枚举，或后继行紧跟的列表块
+ * 且计数行以冒号/列举语引出）时，比对枚举数与声称数；不一致输出提示。
+ * 提示不拦截：N=1（不定指用法）、第N（序数）、表格行、围栏内、日期/范围
+ * 上下文以及枚举不在同段的情形全部跳过，接受漏报。 */
+export function checkDraftCountClaims(markdown: string, maxHints = 6): string[] {
+  const hints: string[] = [];
+  const lines = (markdown ?? '').replace(/\r\n?/g, '\n').split('\n');
+  let fence: { char: string; len: number } | null = null;
+  const countClaim = new RegExp(`(?:^|[^\\w一二三四五六七八九十])((?:[一二三四五六七八九]{1,3}|\\d{1,3})${COUNT_COUNTER_RE})(?![\\d%])`, 'g');
+  for (let i = 0; i < lines.length && hints.length < maxHints; i++) {
+    const raw = lines[i]!;
+    if (fence) {
+      const close = /^ {0,3}(`{3,}|~{3,}) *$/.exec(raw);
+      if (close && close[1][0] === fence.char && close[1].length >= fence.len) fence = null;
+      continue;
+    }
+    const open = /^ {0,3}(`{3,}|~{3,})/.exec(raw);
+    if (open) { fence = { char: open[1][0], len: open[1].length }; continue; }
+    if (raw.includes('|') && /\|[\s:-]*$/.test(raw)) continue; // 表格分隔行
+    for (const match of raw.matchAll(countClaim)) {
+      const claimText = match[1]!;
+      const numText = claimText.replace(new RegExp(`${COUNT_COUNTER_RE}$`), '');
+      if (/^\d+$/.test(numText) && numText.length > 1 && numText.startsWith('0')) continue;
+      const claimed = /^\d+$/.test(numText) ? Number.parseInt(numText, 10) : parseCjkSmallNumber(numText);
+      if (claimed === null || claimed < 2 || claimed > 99) continue;
+      // 前缀组消耗了 1 字符：按捕获组真实起点计算后续文本与「第N」序数守卫
+      const claimStart = (match.index ?? 0) + match[0]!.length - claimText.length;
+      if (claimStart > 0 && raw[claimStart - 1] === '第') continue;
+      const after = raw.slice(claimStart + claimText.length);
+      // 同行「、」枚举（≥2 段非空）；末段以「与/和」收尾计一项，「等」收尾不计（无法核实）
+      const segments = after.split('、').map((part) => part.replace(/[。；;，,）)】\s].*$/, '').trim())
+        .filter((part) => part.length > 0);
+      let counted = -1;
+      if (segments.length >= 2) {
+        const last = segments[segments.length - 1]!;
+        if (/(?:^|[^\s])等$/.test(last) || last === '等') counted = -1;
+        else counted = segments.length + (/[与和]/.test(last) && !last.startsWith('与') && !last.startsWith('和') ? 1 : 0);
+      }
+      const introduces = /[:：]\s*$/.test(raw) || /下列|以下|包括/.test(raw);
+      if (counted < 0 && introduces) {
+        const items: string[] = [];
+        for (let j = i + 1; j <= Math.min(lines.length - 1, i + 40); j++) {
+          const candidate = lines[j]!;
+          if (LIST_ITEM_RE.test(candidate)) { items.push(candidate); continue; }
+          if (/^\s*$/.test(candidate)) { if (items.length > 0) break; continue; }
+          if (/^ {2,}\S/.test(candidate) && items.length > 0) continue; // 子项续行
+          break;
+        }
+        if (items.length >= 2) counted = items.length;
+      }
+      if (counted >= 2 && counted !== claimed) {
+        hints.push(`正文第 ${i + 1} 行声称「${claimText}」，但紧随枚举为 ${counted} 项；核对是否与源一致（如源并列项被合并/遗漏）`);
+      }
+      break; // 每行只取首个计数声明
+    }
+  }
+  return hints;
+}
+
+// ---------------------------------------------------------------------------
 // 审查提示词格式化（本切片只交付函数，接线在切片 C）
 
 /** F01 降级信息（可选第三参）：precheck 返回 degraded 时由调用方透传，

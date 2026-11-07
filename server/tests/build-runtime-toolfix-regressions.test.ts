@@ -617,13 +617,15 @@ describe('F05 kb_read_batch 游标预算', () => {
     expect(got).toEqual(sourceLines.filter((line) => line.startsWith('line ') || line === '# 长源'));
   });
 
-  it('cursor 单独续页：schema requests/cursor 二选一，服务端不要求 requests 同时在场', async () => {
+  it('cursor 单独续页：服务端不要求 requests 同时在场（WP-C 后 schema 不再 anyOf 二选一）', async () => {
     const setup = makeV2('f05-schema');
     setup.store.registerTaskCreation({ nativeTaskId: 'w1', requestedRole: 'luban' });
     const schema = KB_READ_BATCH_SPEC.parameters as Record<string, unknown>;
     expect(schema.required).toBeUndefined();
-    const anyOf = schema.anyOf as Array<Record<string, unknown>>;
-    expect(anyOf).toEqual([{ required: ['requests'] }, { required: ['cursor'] }]);
+    // WP-C（R5 回合开销）：anyOf 已移除——顶层单请求对象/别名改由服务端
+    // normalizeToolArguments 规范化或报精确错误；schema 层二选一会把误填
+    // 整回合拒在 amagi/pi 校验层（每次浪费一个完整 LLM 回合）。
+    expect(schema.anyOf).toBeUndefined();
     // 服务端：仅 cursor（无 requests 键）可续页；requests+cursor 同时携带时 cursor 优先
     const first = JSON.parse((await call(setup.child.token, 'kb_read_batch', { requests: [{ kind: 'raw', objToken: 'tok' }], maxLines: 4 }, meta('w1'))).content[0]!.text);
     expect(first.nextCursor).toBeTruthy();

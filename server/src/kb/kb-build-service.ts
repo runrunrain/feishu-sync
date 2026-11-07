@@ -55,6 +55,7 @@ import {
 import { countText } from './text-stats.js';
 import { precheck as mechanicalPrecheckRun, formatFindingsForPrompt, type PrecheckDraftInput, type PrecheckFinding, type PrecheckTerm } from './mechanical-precheck.js';
 import { PathClaims } from './path-claims.js';
+import { computePublishReadiness, coverageSourceIdsOf, uncoveredWorksetTokens, type PublishReadinessPreview } from './publish-readiness.js';
 import { collectWhiteboardTextsForEntries, enrichEntriesWithMedia, hashImageFile, resolveSourceImages, verifyEntryMediaHash, verifyEntryWhiteboardTextHash, type WhiteboardTextMap } from './source-images.js';
 import type { ImageDescription } from '../agent/vision/vision-describer.js';
 import { VisionDescriber } from '../agent/vision/vision-describer.js';
@@ -1932,6 +1933,34 @@ export class KbBuildService extends EventEmitter {
     }
   }
 
+  /** R3.3：发布拒绝时随附的就绪预览（只读；与 agent 层 manifest/checkpoint
+   * 预览共用 publish-readiness 同一计算入口，不重复门禁逻辑）。 */
+  private computeLeaderReadiness(buildState: BuildRunState): PublishReadinessPreview | null {
+    const actorStore = buildState.v2?.actorStore ?? null;
+    let coverageSourceIds: Set<string>;
+    try {
+      const draftFile = path.join(buildState.stagingRoot, 'knowledge-draft.json');
+      const draft = fs.existsSync(draftFile)
+        ? JSON.parse(fs.readFileSync(draftFile, 'utf-8')) as Parameters<typeof coverageSourceIdsOf>[0]
+        : null;
+      coverageSourceIds = coverageSourceIdsOf(draft);
+    } catch {
+      coverageSourceIds = new Set();
+    }
+    try {
+      return computePublishReadiness({
+        state: buildState,
+        actorStore,
+        coverageSourceIds,
+        validatePath: validateStdDocPath,
+        counts: { openBlockingIssues: actorStore?.openBlockingIssues() },
+      });
+    } catch {
+      // 预览失败不改变拒绝语义；发布门本身已是权威判定
+      return null;
+    }
+  }
+
   /** Leader 发布执行器（build_request_publish 工具回调→原发布校验管线）。 */
   private async executeLeaderPublishRequestInner(request: {
     buildId: string;
@@ -1987,7 +2016,11 @@ export class KbBuildService extends EventEmitter {
       if (issues.length > 0) {
         writeReport(outputRoot, request.buildId, [...issues, ...(buildState.validationWarnings ?? [])]);
         this.emitLog(request.buildId, 'error', `Leader 发布前校验失败（${issues.length} 个问题）：${issues.slice(0, 3).map((issue) => issue.code).join(', ')}`);
-        return { accepted: false, result: { reason: 'kb_validation_failed', details: { issues }, reasons: issues.map((issue) => issue.code) } };
+        // R3.3：拒绝随附发布就绪预览（与 manifest/checkpoint 同一计算入口），
+        // Leader 在同一份结果里即可看到真遗漏与在途计数，不必反查清单。
+        const readiness = this.computeLeaderReadiness(buildState);
+        return { accepted: false, result: { reason: 'kb_validation_failed', details: { issues },
+          reasons: issues.map((issue) => issue.code), ...(readiness ? { readiness } : {}) } };
       }
       // 快照完整性 + 源身份复核（主文档 + CSV 附件；模型最后一次 read 之后源被改，不得发布）
       const currentPublishedTokens = new Set(this.deps.publishedTokensProvider?.() ?? []);
@@ -8226,15 +8259,22 @@ export function validateStagingDocs(
 
   // 覆盖检查：工作集内每个源要么被引用，要么在 skipped
   // S4（U8）：skipped 集 = ∪unitDone.skipped ∪ finishInfo.skipped
+  // R3.1/R3.3（kb-build-speedup）：判定收敛到 publish-readiness 的
+  // uncoveredWorksetTokens——构建中途的 manifest/checkpoint 预览与发布门
+  // 共用同一份纯函数，保证「预览=发布时拒绝」，不复制逻辑。
   const skipped = new Set<string>();
   for (const report of state.unitDone?.values() ?? []) {
     for (const item of report.skipped) skipped.add(item.objToken);
   }
   for (const item of state.finishInfo?.skipped ?? []) skipped.add(item.objToken);
-  for (const [token] of state.workset) {
-    if (!referencedSources.has(token) && !skipped.has(token) && !blankWorkbooks.has(token) && !unresolvedReferences.has(token)) {
-      issues.push({ objToken: token, code: 'source_not_covered', message: '源既未被文档引用也未列入 skipped' });
-    }
+  for (const token of uncoveredWorksetTokens({
+    worksetTokens: state.workset.keys(),
+    referenced: referencedSources,
+    skipped,
+    blankWorkbooks,
+    unresolvedReferences,
+  })) {
+    issues.push({ objToken: token, code: 'source_not_covered', message: '源既未被文档引用也未列入 skipped' });
   }
 
   // F3-R07：full 不得发布空库——即使全部源都带理由 skip，full 的语义是

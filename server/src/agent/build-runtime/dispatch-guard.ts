@@ -20,8 +20,47 @@ import { isAbsolute } from 'node:path';
 // 依赖，可被 pi/jiti 单文件加载；运行时核验模块由扩展按同目录路径另行装载）。
 import type { RuntimeIntegrityRefs } from './runtime-integrity.js';
 
-/** 守卫配置 schema 版本；形状变更时递增并保持旧字段兼容或显式拒绝。 */
-export const DISPATCH_GUARD_SCHEMA_VERSION = 2;
+/** 守卫配置 schema 版本；形状变更时递增并保持旧字段兼容或显式拒绝。
+ * v3：新增可选 dispatch 段（A2 应用侧确定性派发准入：在途快照路径 +
+ * 池容量映射）。旧 v2 信封无 dispatch，被显式拒绝（信封由宿主逐次启动
+ * 生成，无跨版本持久化面）。 */
+export const DISPATCH_GUARD_SCHEMA_VERSION = 3;
+
+/** 在途快照（host 原子写；扩展读后经 options.inflight 传入守卫）。
+ *
+ * fail-open 约定：文件缺失/损坏/buildId·generation 不匹配/更新时间过旧
+ * → 扩展不传 inflight，守卫完全跳过在途准入。在途准入是吞吐优化而非
+ * 安全边界（安全边界是 amagi 池容量与本守卫的权限参数冻结），fail-open
+ * 只退化为现状（amagi 排队），不会放宽任何权限。 */
+export interface DispatchInflightSnapshot {
+  schemaVersion: 1;
+  buildId: string;
+  generation: number;
+  /** 单调递增序号（host 每次更新 +1；守卫据此重置本地未入账计数）。 */
+  seq: number;
+  updatedAt: string;
+  /** 在途任务（running/queued/pending/blocked/未知态；host 与空闲判定同口径）：
+ * amagi 角色名（luban/diting/baize；'unknown' = 创建事件未到达的过渡态）。 */
+  inflight: Array<{ role: string; state: string }>;
+  /** 待审/待修订文档计数（槽保留信号；BuildActorStore.dispatchBacklogSignal）。 */
+  pendingReview: number;
+  pendingRevision: number;
+}
+
+/** A2 派发准入冻结参数（可选；缺失 → 在途准入禁用）。 */
+export interface FrozenDispatchAdmission {
+  /** 在途快照文件绝对路径（<epochRoot>/dispatch-inflight.json；host 写、扩展读）。 */
+  inflightStatePath: string;
+  /** roleKey（writer/reviewer/research）→ amagi 池键（与 amagi.json concurrency.models 键同源）。 */
+  rolePoolKeys: Record<string, string>;
+  /** 池键 → 容量（与 amagi.json concurrency.models 值一致）。 */
+  poolCapacities: Record<string, number>;
+  /** 快照最大年龄 ms（超过 → fail-open；防 host 停更导致永久误拒）。 */
+  staleMs?: number;
+}
+
+/** 在途快照默认最大年龄（与子任务长轮次同量级；host 正常时秒级更新）。 */
+export const DISPATCH_INFLIGHT_STALE_MS = 15 * 60_000;
 
 /** 守卫冻结配置（应用在启动 Leader 前生成，注入扩展环境）。 */
 export interface FrozenDispatchConfig {
@@ -51,6 +90,8 @@ export interface FrozenDispatchConfig {
    * 扩展在每次 task_submit/task_resume 前调 verifyRuntimeIntegrity，不 ok 即阻断。
    */
   integrity: RuntimeIntegrityRefs;
+  /** A2 派发准入（可选）：在途快照路径 + 池容量映射；缺失 → 在途准入禁用。 */
+  dispatch?: FrozenDispatchAdmission;
 }
 
 /** 守卫审计记录（作为运行事件上报；不含任务正文，只含哈希）。 */
@@ -125,6 +166,28 @@ export function validateGuardConfig(config: FrozenDispatchConfig): string[] {
     }
     if (!/^[0-9a-f]{64}$/.test(refs.workflowSkill?.sha256 ?? '')) {
       issues.push('integrity.workflowSkill.sha256 须为 hex64（= spec.workflowRevision）');
+    }
+  }
+  // A2 派发准入形状（可选；存在时必须完整：每个角色键都有池映射与容量）。
+  if (config.dispatch !== undefined) {
+    const dispatch = config.dispatch;
+    if (!dispatch.inflightStatePath || !isAbsolute(dispatch.inflightStatePath)) {
+      issues.push('dispatch.inflightStatePath 须为绝对路径');
+    }
+    if (dispatch.staleMs !== undefined && (!Number.isInteger(dispatch.staleMs) || dispatch.staleMs < 1_000)) {
+      issues.push('dispatch.staleMs 须为 ≥1000 整数');
+    }
+    const roleKeySet = new Set<string>();
+    for (const name of roleNames) roleKeySet.add(config.roles[name]?.key ?? '');
+    roleKeySet.delete('');
+    for (const [poolKey, capacity] of Object.entries(dispatch.poolCapacities ?? {})) {
+      if (!Number.isInteger(capacity) || capacity < 1) issues.push(`dispatch.poolCapacities.${poolKey} 须为 ≥1 整数`);
+    }
+    for (const roleKey of roleKeySet) {
+      const poolKey = dispatch.rolePoolKeys?.[roleKey];
+      if (!poolKey || !Object.hasOwn(dispatch.poolCapacities ?? {}, poolKey)) {
+        issues.push(`dispatch 缺少角色键 ${roleKey} 的池映射/容量（rolePoolKeys.poolCapacities）`);
+      }
     }
   }
   return issues;
@@ -255,6 +318,160 @@ function reviewerScopeIssue(task: string): string | null {
   }
   return null;
 }
+// ── A2 在途派发准入（R2：新写作不拖后修订/复审；判定与预留分离）──
+
+/**
+ * 同一轮连发补偿记账（R3 修复：准入只判定不记账，拒绝路径不占额度）：
+ * - 只在**全部守卫校验通过、即将放行**时预留（reserveUnackedSlot）；
+ *   角色白名单/模型冻结/taskFile/范围等任何拒绝都不占额度。
+ * - 派发后到 host 把它登记进在途快照之间（事件流异步，通常亚秒），快照
+ *   滞后于真实在途：按 buildId×池记「自上次见到快照 seq 后的预留数」，
+ *   快照 seq 前进即 host 已追上（至少部分），重置为 0。
+ * - 原生派发后续可能失败（dryRun、参数被 amagi 拒绝等）——这类结果守卫
+ *   不可观测：预留带 TTL（自该池最后一次预留起算，默认 60s）自动过期，
+ *   使误扣不会持续到快照 staleMs；TTL 早于事件流时只低估不高估，偶发
+ *   超放由 amagi 队列兜底，不破坏任何权限面。
+ */
+const unacknowledgedSubmits = new Map<string, {
+  seq: number;
+  byPool: Map<string, { count: number; reservedAt: number }>;
+}>();
+
+/** 未入账预留 TTL（ms）：覆盖「派发→host 登记」窗口；超时视为未发生。 */
+export const DISPATCH_UNACKED_TTL_MS = 60_000;
+
+/** 测试隔离用：清空进程内未入账记账。 */
+export function resetDispatchGuardAdmissionState(): void {
+  unacknowledgedSubmits.clear();
+}
+
+/** 快照有效性（buildId/generation/新鲜度）；无效 → 调用方 fail-open 跳过准入。 */
+function inflightSnapshotUsable(config: FrozenDispatchConfig, snapshot: DispatchInflightSnapshot | null, now: string): boolean {
+  if (!config.dispatch || !snapshot) return false;
+  if (snapshot.buildId !== config.buildId || snapshot.generation !== config.generation) return false;
+  const staleMs = config.dispatch.staleMs ?? DISPATCH_INFLIGHT_STALE_MS;
+  const at = Date.parse(snapshot.updatedAt);
+  if (!Number.isFinite(at) || Date.parse(now) - at > staleMs) return false;
+  return true;
+}
+
+/** 池在途计数：role → roleKey → 池；未登记角色（含 'unknown'）保守计入全部池。 */
+function poolInflightCounts(config: FrozenDispatchConfig, snapshot: DispatchInflightSnapshot): Map<string, number> {
+  const pools = Object.keys(config.dispatch!.poolCapacities);
+  const counts = new Map<string, number>();
+  const bump = (poolKey: string): void => { counts.set(poolKey, (counts.get(poolKey) ?? 0) + 1); };
+  for (const entry of snapshot.inflight) {
+    if (!entry || typeof entry !== 'object' || typeof entry.role !== 'string') continue;
+    const roleKey = config.roles[entry.role]?.key;
+    const poolKey = roleKey ? config.dispatch!.rolePoolKeys[roleKey] : undefined;
+    if (poolKey) bump(poolKey);
+    else for (const key of pools) bump(key);
+  }
+  return counts;
+}
+
+/** 在途准入判定结果（null = 不适用：无 dispatch 段或快照不可用 → fail-open）。 */
+interface AdmissionDecision {
+  allowed: boolean;
+  code?: 'dispatch_inflight_write_exhausted' | 'dispatch_inflight_pool_saturated';
+  message?: string;
+  /** 进 audit.changes 的人可读摘要（不含任务正文）。 */
+  detail?: string;
+  /** submit 放行时需预留的池键（guardTaskSubmit 全部校验通过后经
+ * reserveUnackedSlot 记账；resume 恒无：原任务模型未知，记错池会误伤
+ * 审查/修订优先级，过渡期由 amagi 队列兑底）。 */
+  admitPool?: string;
+}
+
+/**
+ * 确定性派发准入（R2；amagi 队列在外部包内不可重排，只能控制派发）：
+ * - 新写作（task_submit writer/research）：池在途 +1 ≤ 池容量；且当存在
+ *   待审/待修订文档时最多占容量 −1（为审查/修订保留至少 1 槽；无积压
+ *   可占满）。
+ * - 独立审查（task_submit reviewer）与修订/续接（task_resume 一切）：
+ *   优先类，只要池未满即放行，不受保留槽限制。
+ * - 无死锁：准入只影响「派发时机」——任务终态后 host 快照释放槽；快照
+ *   过旧/缺失时 fail-open（退化为准入前行为），不会永久拒绝。
+ */
+function checkDispatchAdmission(input: {
+  config: FrozenDispatchConfig;
+  snapshot: DispatchInflightSnapshot | null;
+  tool: 'task_submit' | 'task_resume';
+  /** submit：白名单后的角色键；resume：null（池归属由 amagi 按原任务模型路由）。 */
+  roleKey: string | null;
+  now: string;
+}): AdmissionDecision | null {
+  const { config, snapshot, tool, roleKey, now } = input;
+  if (!config.dispatch || !inflightSnapshotUsable(config, snapshot, now)) return null;
+  const dispatch = config.dispatch;
+  const counts = poolInflightCounts(config, snapshot!);
+  const entry = unacknowledgedSubmits.get(config.buildId);
+  const nowMs = Date.parse(now);
+  const unackedFor = (poolKey: string): number => {
+    if (!entry || entry.seq !== snapshot!.seq) return 0;
+    const reserved = entry.byPool.get(poolKey);
+    if (!reserved || nowMs - reserved.reservedAt > DISPATCH_UNACKED_TTL_MS) return 0; // TTL 过期
+    return reserved.count;
+  };
+  const effectiveFor = (poolKey: string): number => (counts.get(poolKey) ?? 0) + unackedFor(poolKey);
+  const capacityOf = (poolKey: string): number => dispatch.poolCapacities[poolKey];
+  const backlog = (snapshot!.pendingReview ?? 0) + (snapshot!.pendingRevision ?? 0) > 0;
+  if (tool === 'task_resume') {
+    // resume 池归属派发侧不可知：任一池有空槽即放行，全池满才拒。
+    // 放行不记未入账（原任务模型未知，记错池会误伤审查/修订优先级；
+    // 过渡期由 amagi 队列兜底，host 登记后快照即精确）。
+    const freePool = Object.keys(dispatch.poolCapacities)
+      .find((poolKey) => effectiveFor(poolKey) + 1 <= capacityOf(poolKey));
+    if (freePool) return { allowed: true, detail: `admission: resume 优先（空槽池 ${freePool}）` };
+    const summary = Object.keys(dispatch.poolCapacities)
+      .map((poolKey) => `${poolKey}=${effectiveFor(poolKey)}/${capacityOf(poolKey)}`).join('，');
+    return {
+      allowed: false,
+      code: 'dispatch_inflight_pool_saturated',
+      message: `全部准入池均已满（${summary}）。请等已有任务的完成通知后再派发；修订与审查在池内出现空槽后立即放行。`,
+    };
+  }
+  // task_submit：roleKey 必在（角色白名单先行拒绝）。
+  const poolKey = dispatch.rolePoolKeys[roleKey ?? ''];
+  const capacity = poolKey !== undefined ? capacityOf(poolKey) : undefined;
+  if (poolKey === undefined || capacity === undefined) return null; // 池映射不全：fail-open
+  const priority = roleKey === 'reviewer';
+  const effective = effectiveFor(poolKey);
+  const limit = priority ? capacity : backlog ? capacity - 1 : capacity;
+  const detail = `admission: pool=${poolKey} effective=${effective}/${capacity}${backlog ? '（待审/待修订积压，新写作上限 −1）' : ''}${priority ? '（审查优先）' : ''}`;
+  if (effective + 1 > limit) {
+    const reason = priority
+      ? `本池在途任务已达容量（${effective}/${capacity}）。请等已有任务的完成通知后再派发审查。`
+      : `本模型池在途任务已达派发上限（${effective}/${capacity}${backlog ? '，且存在待审/待修订文档，已为审查与修订保留槽位' : ''}）。请等已有任务的完成通知再派发新写作；修订（task_resume 续接作者）与独立审查派发不受此限。`;
+    return {
+      allowed: false,
+      code: priority ? 'dispatch_inflight_pool_saturated' : 'dispatch_inflight_write_exhausted',
+      message: reason,
+      detail,
+    };
+  }
+  // 判定与记账分离（R3）：这里只判定不记账；admitPool 由 guardTaskSubmit
+  // 在**全部校验通过、即将放行**时经 reserveUnackedSlot 预留，任何拒绝
+  // 路径（模型/taskFile/范围等）都不占额度。
+  return { allowed: true, detail, admitPool: poolKey };
+}
+
+/** 最终放行前预留一个未入账槽（仅 submit 全部校验通过后调用；TTL 见 unacknowledgedSubmits）。 */
+function reserveUnackedSlot(config: FrozenDispatchConfig, snapshot: DispatchInflightSnapshot, poolKey: string, now: string): void {
+  const entry = unacknowledgedSubmits.get(config.buildId);
+  if (!entry || entry.seq !== snapshot.seq) {
+    unacknowledgedSubmits.set(config.buildId, { seq: snapshot.seq, byPool: new Map() });
+  }
+  const current = unacknowledgedSubmits.get(config.buildId)!;
+  const reserved = current.byPool.get(poolKey);
+  const at = Date.parse(now);
+  if (reserved && at - reserved.reservedAt <= DISPATCH_UNACKED_TTL_MS) {
+    reserved.count += 1;
+    reserved.reservedAt = at;
+  } else {
+    current.byPool.set(poolKey, { count: 1, reservedAt: at });
+  }
+}
 
 // ── task_submit 守卫 ───────────────────────────────────────────
 
@@ -267,7 +484,7 @@ function reviewerScopeIssue(task: string): string | null {
 export function guardTaskSubmit(
   config: FrozenDispatchConfig,
   rawArgs: Record<string, unknown>,
-  options: { now?: () => string } = {},
+  options: { now?: () => string; inflight?: DispatchInflightSnapshot | null } = {},
 ): GuardDecision {
   const now = options.now?.() ?? new Date().toISOString();
   const args: Record<string, unknown> = { ...rawArgs };
@@ -308,6 +525,24 @@ export function guardTaskSubmit(
     };
   }
   baseAudit.roleKey = role.key;
+
+  // 1b. A2 在途派发准入（快照缺失/陈旧 → fail-open，仅退化为无准入）。
+  const admission = checkDispatchAdmission({
+    config,
+    snapshot: options.inflight ?? null,
+    tool: 'task_submit',
+    roleKey: role.key,
+    now,
+  });
+  if (admission && !admission.allowed) {
+    return {
+      decision: 'block',
+      code: admission.code!,
+      message: admission.message!,
+      audit: { ...baseAudit, changes: [...changes, admission.detail ?? 'admission 拒绝'] },
+    };
+  }
+  if (admission?.detail) changes.push(admission.detail);
 
   // 2. 模型覆盖冻结
   if (args.model !== undefined) {
@@ -420,6 +655,12 @@ export function guardTaskSubmit(
   // 7. profile 会改变模型解析链，删除
   if (args.profile !== undefined) { delete args.profile; changes.push('删除 profile（模型解析冻结）'); }
 
+  // R3：准入判定与记账分离——全部校验通过、即将放行时才预留未入账槽；
+  // 任何拒绝路径（模型/taskFile/范围/审查范围等）不占额度。
+  if (admission?.admitPool && options.inflight) {
+    reserveUnackedSlot(config, options.inflight, admission.admitPool, now);
+  }
+
   baseAudit.effective = { scope: scope as Record<string, unknown>, workspace: args.workspace as Record<string, unknown> };
   return { decision: 'allow', args, audit: baseAudit };
 }
@@ -435,7 +676,7 @@ export function guardTaskSubmit(
 export function guardTaskResume(
   config: FrozenDispatchConfig,
   rawArgs: Record<string, unknown>,
-  options: { now?: () => string } = {},
+  options: { now?: () => string; inflight?: DispatchInflightSnapshot | null } = {},
 ): GuardDecision {
   const now = options.now?.() ?? new Date().toISOString();
   const args: Record<string, unknown> = { ...rawArgs };
@@ -456,6 +697,23 @@ export function guardTaskResume(
   if (typeof args.handle !== 'string' || !args.handle) {
     return { decision: 'block', code: 'dispatch_resume_handle_missing', message: 'task_resume 缺少 handle', audit };
   }
+  // A2 在途准入：修订/续接为优先类（只受池容量硬上限约束，见 checkDispatchAdmission）。
+  const admission = checkDispatchAdmission({
+    config,
+    snapshot: options.inflight ?? null,
+    tool: 'task_resume',
+    roleKey: null,
+    now,
+  });
+  if (admission && !admission.allowed) {
+    return {
+      decision: 'block',
+      code: admission.code!,
+      message: admission.message!,
+      audit: { ...audit, changes: [...changes, admission.detail ?? 'admission 拒绝'] },
+    };
+  }
+  if (admission?.detail) changes.push(admission.detail);
   if (args.delivery !== 'handle') {
     changes.push(`delivery ${String(args.delivery ?? '(缺省)')} → handle（先登记续接身份）`);
     args.delivery = 'handle';
@@ -489,6 +747,8 @@ export function freezeGuardConfig(input: {
   forbiddenZones: string[];
   roles: Record<string, { key: string; models: string[]; mcpTools: string[] }>;
   integrity: RuntimeIntegrityRefs;
+  /** A2 派发准入（可选；形状非法同样抛错）。 */
+  dispatch?: FrozenDispatchAdmission;
 }): FrozenDispatchConfig {
   const config: FrozenDispatchConfig = {
     schemaVersion: DISPATCH_GUARD_SCHEMA_VERSION,
@@ -500,6 +760,7 @@ export function freezeGuardConfig(input: {
     forbiddenZones: sortedUnique(input.forbiddenZones),
     roles: input.roles,
     integrity: input.integrity,
+    ...(input.dispatch ? { dispatch: input.dispatch } : {}),
   };
   const issues = validateGuardConfig(config);
   if (issues.length > 0) {

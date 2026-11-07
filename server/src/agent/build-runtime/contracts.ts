@@ -443,14 +443,10 @@ export function validateBuildRunSpec(spec: BuildRunSpec): string[] {
   if (!Number.isInteger(limits.maxConcurrentAgents) || limits.maxConcurrentAgents < 1 || limits.maxConcurrentAgents > 6) {
     issues.push('limits.maxConcurrentAgents 须为 1..6');
   }
-  const poolSum = Object.values(limits.admissionPools).reduce((a, b) => a + (b ?? 0), 0);
-  if (poolSum > limits.maxConcurrentAgents) {
-    issues.push(`admissionPools 合计 ${poolSum} 超过 maxConcurrentAgents=${limits.maxConcurrentAgents}`);
-  }
-  for (const [role, cap] of Object.entries(limits.admissionPools)) {
-    if (cap !== undefined && (!Number.isInteger(cap) || cap < 1)) issues.push(`admissionPools.${role} 须为 ≥1 整数`);
-  }
-  // 同池（同模型）多角色容量必须一致，否则 amagi 侧单池取值有歧义。
+  // 同池（同模型）多角色在 amagi 侧合并为一个池（agent-dir-config 以
+  // modelSpecPoolKey 为键渲染 concurrency.models）：容量合计必须按去重后的
+  // 池键计算，同池多角色不得重复累加（R1 修正：旧口径把同池角色各计一次，
+  // assembleSpec 同模型 max=1 时 {writer:1,reviewer:1} 被误判 2>1 拒绝启动）。
   const roleKeys: BuildRoleKey[] = ['writer', 'reviewer', 'research'];
   const byModel = new Map<string, Set<number>>();
   for (const role of roleKeys) {
@@ -461,6 +457,14 @@ export function validateBuildRunSpec(spec: BuildRunSpec): string[] {
     if (!byModel.has(key)) byModel.set(key, new Set());
     byModel.get(key)!.add(cap);
   }
+  const poolSum = [...byModel.values()].reduce((sum, caps) => sum + Math.max(...caps), 0);
+  if (poolSum > limits.maxConcurrentAgents) {
+    issues.push(`admissionPools 合计 ${poolSum}（按去重后池键）超过 maxConcurrentAgents=${limits.maxConcurrentAgents}`);
+  }
+  for (const [role, cap] of Object.entries(limits.admissionPools)) {
+    if (cap !== undefined && (!Number.isInteger(cap) || cap < 1)) issues.push(`admissionPools.${role} 须为 ≥1 整数`);
+  }
+  // 同池（同模型）多角色容量必须一致，否则 amagi 侧单池取值有歧义。
   for (const [model, caps] of byModel) {
     if (caps.size > 1) issues.push(`模型 ${model} 被多个角色共用但池容量不一致（${[...caps].join('/')}）`);
   }

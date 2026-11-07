@@ -1,6 +1,6 @@
 # MCP 桥接调用示例（Pi 子任务）
 
-知识工具经 `mcp_call` 到达应用桥接（server 名固定 `feishu-kb-bridge`）。下方 JSON **就是 `mcp_call` 的参数对象**，直接传入；不要再包一层 `{"tool":"mcp_call","arguments":...}`，也不要把整个示例塞进外层 `arguments`。业务参数只嵌套一次在 `arguments` 中。`mcp_list_tools` 只返回工具名称与简介；需要完整参数契约时调用只读 `kb_tool_schema`，不要靠失败调用猜字段。身份由环境自动附带。本文件示例面向子任务；Leader 的原生工具见文末。
+知识工具经 `mcp_call` 到达应用桥接（server 名固定 `feishu-kb-bridge`）。下方 JSON **就是 `mcp_call` 的参数对象**，直接传入；不要再包一层 `{"tool":"mcp_call","arguments":...}`，也不要把整个示例塞进外层 `arguments`。业务参数只嵌套一次在 `arguments` 中。`mcp_list_tools` 只返回工具名称与简介；本文件示例已含常用工具的完整参数面，按示例直接调用，不要先查 schema。确需示例外字段或报错不明时才调用只读 `kb_tool_schema`，同一工具一次会话不重复查，不靠失败调用猜字段。身份由环境自动附带。本文件示例面向子任务；Leader 的原生工具见文末。
 
 ```json
 {"server":"feishu-kb-bridge","tool":"kb_tool_schema","arguments":{"name":"kb_edit_doc"}}
@@ -11,7 +11,7 @@
 ## 读取
 
 ```json
-{"server": "feishu-kb-bridge", "tool": "raw_read", "arguments": {"objToken": "<token>", "offset": 0, "limit": 120}}
+{"server": "feishu-kb-bridge", "tool": "raw_read", "arguments": {"objToken": "<token>", "offset": 0, "limit": 300}}
 ```
 
 ```json
@@ -22,7 +22,7 @@
 {"server": "feishu-kb-bridge", "tool": "raw_csv_find", "arguments": {"objToken": "<token>", "resourceId": "<token>#csv:表.csv", "queries": ["建造大营", "补给概念"]}}
 ```
 
-`raw_read` 的 `<read_receipts>` 块位于正文前，含 `readReceiptId`、`resourceId` 与该资源本地行范围。单次限制 120 行以免正文被工具输出截断；继续读时增加 `offset`。重要事实在声明中引用实际回执。
+`raw_read` 的 `<read_receipts>` 块位于正文前，含 `readReceiptId`、`resourceId` 与该资源本地行范围。单页同时受行数与字节预算限制（按最终输出计，缺省 800 行，密度高的页自动缩短，`returned` 为实际行数）；继续读用页眉 `next_offset`，不要自行累加。个别超过硬上限的单行会被显式标记并跳过（`<oversized_line>`，不登记回执）；用 `raw_search` / `raw_csv_find` 定位该行内短语。需要通读多段时，可在一次回复内并行发出多个互不重叠 `offset` 的 `raw_read`，每页回执独立登记，能显著减少顺序翻页回合。重要事实在声明中引用实际回执。
 构建态来源正文逐行带有脚本生成的 `[O123/R45]` 或 `[O123/R45/C43]` 前缀：`O` 是拼接输出行，供下一页 `offset` 和任务书跳读；`R` 是资源内物理行，供文本 `text_span.lineStart/lineEnd`；`C` 是 CSV 逻辑记录号，供 `csv_cells.recordStart/recordEnd`。带引号的多行 CSV 单元格可能连续多行共用同一个 `C`。这些前缀只用于定位，不是源正文；直接抄对应的 `R` 或 `C`，不要人工从页首数行或把 `O` 写入证据 selector。
 连续 3 行以上、由服务端核实为全空的 CSV 记录默认缩成 `<blank_csv_rows>`，标记保留源资源行号和输出行号；分页的 `returned` 与读取回执仍按未压缩原文计算。若需要逐字核查空行，原参数加 `"includeBlankCsvRows":true` 重读即可。
 `<raw_page next_offset="N">` 给出下一次读取的精确 `offset`；`next_offset="end"` 表示本源已读到末页，立即写本篇，不重复探测末尾。它的 `offset/returned/total` 是拼接输出的行坐标，证据行号仍用 `<read_receipts>` 中各资源的本地坐标。
@@ -31,10 +31,10 @@
 需要一次读取多份短资源时，`kb_read_batch` 的精确调用为：
 
 ```json
-{"server":"feishu-kb-bridge","tool":"kb_read_batch","arguments":{"requests":[{"kind":"raw","objToken":"<token>","offset":0,"limit":100}],"maxLines":100}}
+{"server":"feishu-kb-bridge","tool":"kb_read_batch","arguments":{"requests":[{"kind":"raw","objToken":"<token>","offset":0,"limit":300},{"kind":"raw","objToken":"<token2>","offset":0,"limit":300}],"maxLines":1200}}
 ```
 
-批量读取请求的字段是 `requests`、`kind`、`objToken`、`offset`、`limit`，不是 `resources`、`type`、`token`。单次总量控制在约 120 行；返回 `nextCursor` 时用 `{"cursor":"<nextCursor>","maxLines":120}` 续页。搜索与清单工具：`raw_list`、`raw_search`、`raw_links`。
+批量读取请求的字段是 `requests`、`kind`、`objToken`、`offset`、`limit`，不是 `resources`、`type`、`token`。单次调用受总行数（缺省 1200）与总字节预算双重限制，超出的请求自动进入 `nextCursor`，用 `{"cursor":"<nextCursor>"}` 续页（预算每页重置）。搜索与清单工具：`raw_list`、`raw_search`、`raw_links`。
 
 ## 写正文与声明（仅写作身份）
 
@@ -148,6 +148,6 @@ Leader 的工具面没有 `mcp_call`——应用构建工具（材料清单/分�
 ## 常见错误
 
 - 未分配目标写入 → 可重试错误：先完成阅读，确认分配后再写。
-- 参数结构不符 → 调用一次 `kb_tool_schema` 读取真实参数契约，再按结构化反馈修正；同类错误连发时交接问题，不盲试。
+- 参数结构不符 → 先按报错字段名与本文示例修正；仍不明才调用一次 `kb_tool_schema` 读真实参数契约，同类错误连发时交接问题，不盲试。
 - `kb_write_doc` 声明校验拒绝并返回 `retryOf` → 原任务调用 `{"server":"feishu-kb-bridge","tool":"kb_write_doc","arguments":{"path":"规则/行动.md","retryOf":"<错误中的 wr_ 令牌>","objects":[{"clientKey":"action","type":"rule","title":"行动次数","familyKey":"action-count","scopeText":"战斗回合","headingPath":["行动次数"]}]}}`；这里只重传报错字段（示例为修正后的完整 `objects` 数组），正文、来源和未变数组由服务端短期复用，提交仍须通过原权限与全部校验。
 - 版本冲突 → 按返回的当前 revision 重读后重试，不覆盖。
