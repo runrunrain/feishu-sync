@@ -6,6 +6,23 @@
 
 ---
 
+## [0.4.25] - 2026-11-07
+
+### Added
+
+- 构建详情：标准库页「进度」侧栏在构建收口后显示只读「构建度量」，含耗时、派发、审查轮数与首审通过率、拒绝原因、并发与首稿到发布耗时、风险告警；采集不可得的字段显示「—」，旧构建显示无编排度量。
+- 命令行：`<命令> --help` 与 `<命令组> --help` 显示参数表、位置参数顺序与示例；必填参数可按位置书写（如 `kb builds 5`）；输入错误时给出「你是不是想输入」建议。
+- 命令行：新增 `completion bash|zsh|fish` 生成 shell 补全，新增全局旗标 `--timeout <秒>`；对象数组默认以对齐表格输出（`--json` 不变）。
+
+### Changed
+
+- 命令行：参数错误与缺少 `--yes` 在本地预检阶段直接返回（退出码 2/4），不依赖应用正在运行；`--version` 报应用版本。
+- `server/scripts/sync-latest.ts`、`retry-slides.ts`、`gate5-live-shadow-canary.ts` 不再内置个人路径，知识库根目录按 `--kb`、`FORMAL_KB`、config.json 顺序解析。
+
+### Removed
+
+- 移除未挂载的前端组件（源库历史/写回/移出/发布设置卡/任务面板等）、服务端未使用的 `polling-scheduler`、失效与一次性脚本、`postcss.config.js`/`tailwind.config.js` 与根包未使用的 `hono` 依赖。
+
 ## [0.4.24] - 2026-11-07
 
 ### Changed
