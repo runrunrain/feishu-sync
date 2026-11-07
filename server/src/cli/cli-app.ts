@@ -1,9 +1,14 @@
 /**
  * CLI 编排层（设计 kb-agent-upgrade §6.1/§6.4，S9）
  *
- * 流程：解析 argv → （必要时）读端点文件 → /api/health 探活 →
- * confirm 预检（destructive/remote_write 无 --yes → 退出码 4，不打扰
- * 服务器）→ POST /api/cli/<command> → 包络输出与退出码映射。
+ * 流程：解析 argv → 本地预检（参数构造 → 表内 request 评估 → confirm
+ * 预检，退出码 2/4，全部先于端点发现/探活——应用未运行时参数错误与缺
+ * --yes 也能就地报错，不依赖服务器）→ 读端点文件 → /api/health 探活
+ * （退出码 3）→ POST /api/cli/<command> → 包络输出与退出码映射。
+ *
+ * 本地路径（不连服务器）：--version / help / 命令组帮助 / completion
+ * 补全脚本生成。--timeout <秒> 覆盖本次命令 HTTP 超时（缺省 120s /
+ * long-poll 15min）。
  *
  * 退出码：0 成功 / 1 业务错误 / 2 参数错误 / 3 应用不可达或未开启 /
  * 4 需要确认（--yes）。业务命令只走运行中的 server（U16：无离线直写、
@@ -14,16 +19,16 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { OpsArgumentError } from '../ops/command-table.js';
 import {
   buildCommandArgs,
-  commandListForHelp,
-  describeParams,
   evaluateRequestSpecs,
   parseInvocation,
-  spacedName,
   UsageError,
 } from './args.js';
+import { renderCompletionScript, renderCompletionUsage } from './completion.js';
+import { renderCommandHelp, renderGroupHelp, renderTopHelp } from './help.js';
 import {
   CLI_TOKEN_HEADER,
   endpointFilePath,
@@ -44,49 +49,6 @@ function usageError(message: string): never {
   throw new UsageError(message);
 }
 
-function printTopHelp(): void {
-  const lines: string[] = [
-    'feishu-sync —— feishu-sync 知识库同步与标准库构建的命令行客户端',
-    '',
-    '用法：feishu-sync [--home <数据根>] [--json] [--yes] <命令> [参数…]',
-    '',
-    '全局旗标：',
-    '  --home <dir>   数据根（默认 FEISHU_SYNC_HOME，再缺省 ~/.feishu-sync）',
-    '  --json         结构化输出（stdout 单个 {ok,data|error} 包络）',
-    '  --yes          确认 destructive/remote_write 命令（注入命令表的 confirm 值）',
-    '  --help / -h    帮助；--version 版本',
-    '',
-    '命令（风险级：read 读取 / mutate 修改 / destructive 破坏性 / remote_write 远端写）：',
-  ];
-  for (const { def, usage } of commandListForHelp()) {
-    lines.push(`  feishu-sync ${usage.padEnd(34)} [${def.risk}] ${def.summary}`);
-  }
-  lines.push('');
-  lines.push('示例：');
-  lines.push('  feishu-sync status --json');
-  lines.push('  feishu-sync config get');
-  lines.push('  feishu-sync config set enableNotifications true');
-  lines.push('  feishu-sync kb build --full --yes');
-  lines.push('  feishu-sync clean orphans           # 预览（dry-run）');
-  lines.push('  feishu-sync clean orphans --apply --yes');
-  lines.push('');
-  lines.push('提示：命令行访问需在应用 设置 → 应用 → 命令行访问 中开启；');
-  lines.push(' destructive/remote_write 命令需 --yes 确认，否则退出码 4。');
-  process.stdout.write(`${lines.join('\n')}\n`);
-}
-
-function printCommandHelp(def: { name: string; summary: string; risk: string; params: Parameters<typeof describeParams>[0]; confirm?: { field: string; value: string } }): void {
-  const lines: string[] = [
-    `feishu-sync ${spacedName(def.name)} —— ${def.summary}`,
-    '',
-    `风险级：${def.risk}${def.confirm ? `；执行需 --yes（注入 ${def.confirm.field}=${def.confirm.value}）` : ''}`,
-    '',
-    '参数：',
-    describeParams(def.params),
-  ];
-  process.stdout.write(`${lines.join('\n')}\n`);
-}
-
 /** 供 main.ts / 单测使用的主入口。 */
 export async function runCli(argv: string[]): Promise<number> {
   // --json 先从 argv 裸探（parseInvocation 抛用法错时 catch 分支也要走 json 输出）
@@ -95,45 +57,42 @@ export async function runCli(argv: string[]): Promise<number> {
     const invocation = parseInvocation(argv);
     json = invocation.flags.json;
 
+    // ---- 本地路径（不连服务器）----
     if (invocation.flags.version) {
       process.stdout.write(`feishu-sync CLI v${readVersion()}（Node ${process.version}）\n`);
       return 0;
     }
+    if (invocation.words[0] === 'completion') {
+      if (invocation.flags.help || !invocation.completionShell) {
+        process.stdout.write(renderCompletionUsage());
+        return invocation.flags.help ? 0 : 2;
+      }
+      process.stdout.write(renderCompletionScript(invocation.completionShell));
+      return 0;
+    }
+    if (invocation.group) {
+      // 只输入到命令组（如 `kb`）：列出组内子命令；--help/help kb 退出 0，
+      // 裸组名退出 2 并同样列出。
+      process.stdout.write(renderGroupHelp(invocation.group));
+      return invocation.flags.help ? 0 : 2;
+    }
     if (invocation.flags.help && invocation.helpTarget) {
-      printCommandHelp(invocation.helpTarget);
+      process.stdout.write(renderCommandHelp(invocation.helpTarget));
+      return 0;
+    }
+    if (invocation.flags.help && invocation.command) {
+      process.stdout.write(renderCommandHelp(invocation.command));
       return 0;
     }
     if (invocation.flags.help || !invocation.command) {
-      printTopHelp();
+      process.stdout.write(renderTopHelp());
       return invocation.flags.help ? 0 : 2;
     }
     const def = invocation.command;
 
-    // ---- 端点发现 + 探活（退出码 3 语义）----
-    const home = resolveHome(invocation.flags.home);
-    const loaded = loadEndpoint(home);
-    if (!loaded.ok) {
-      const code = loaded.code === 'endpoint_invalid' ? 'app_not_running' : loaded.code;
-      printError({ code, message: loaded.message }, { json, hint: HINT_ENABLE });
-      return 3;
-    }
-    const { url, cliToken } = loaded.endpoint;
-    try {
-      const health = await httpJson(`${url}/api/health`, { method: 'GET', timeoutMs: HEALTH_TIMEOUT_MS });
-      if (health.status !== 200) usageError(`探活失败：/api/health 返回 ${health.status}`);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      printError(
-        { code: 'app_not_reachable', message: `应用不可达（${url}）：${message}` },
-        { json, hint: `端点文件 ${endpointFilePath(home)} 可能已过期（应用退出后不自动删除）。请启动应用后重试。` },
-      );
-      return 3;
-    }
-
-    // ---- 参数构造（退出码 2 语义）----
+    // ---- 本地预检（退出码 2/4 语义；先于端点发现/探活）----
     const args = buildCommandArgs(def, invocation.restTokens);
 
-    // ---- confirm 预检（退出码 4 语义；与表内 request 纯函数一致）----
     let specs;
     try {
       specs = evaluateRequestSpecs(def, args);
@@ -164,12 +123,35 @@ export async function runCli(argv: string[]): Promise<number> {
       return 4;
     }
 
+    // ---- 端点发现 + 探活（退出码 3 语义）----
+    const home = resolveHome(invocation.flags.home);
+    const loaded = loadEndpoint(home);
+    if (!loaded.ok) {
+      const code = loaded.code === 'endpoint_invalid' ? 'app_not_running' : loaded.code;
+      printError({ code, message: loaded.message }, { json, hint: HINT_ENABLE });
+      return 3;
+    }
+    const { url, cliToken } = loaded.endpoint;
+    try {
+      const health = await httpJson(`${url}/api/health`, { method: 'GET', timeoutMs: HEALTH_TIMEOUT_MS });
+      if (health.status !== 200) usageError(`探活失败：/api/health 返回 ${health.status}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      printError(
+        { code: 'app_not_reachable', message: `应用不可达（${url}）：${message}` },
+        { json, hint: `端点文件 ${endpointFilePath(home)} 可能已过期（应用退出后不自动删除）。请启动应用后重试。` },
+      );
+      return 3;
+    }
+
     // ---- 执行 ----
     const body: Record<string, unknown> = { args };
     if (confirmRequired && def.confirm) {
       body[def.confirm.field] = def.confirm.value;
     }
-    const timeoutMs = def.stream === 'long-poll' ? LONG_POLL_TIMEOUT_MS : COMMAND_TIMEOUT_MS;
+    const timeoutMs = invocation.flags.timeoutSec !== undefined
+      ? Math.round(invocation.flags.timeoutSec * 1000)
+      : (def.stream === 'long-poll' ? LONG_POLL_TIMEOUT_MS : COMMAND_TIMEOUT_MS);
     let response;
     try {
       response = await httpJson(`${url}/api/cli/${def.name}`, {
@@ -244,13 +226,40 @@ function configPathNote(def: { name: string }, args: Record<string, unknown>, da
   return `（配置中不存在路径 ${args.path}，返回完整配置）`;
 }
 
-/** 版本号：打包产物（dist/cli/*.cjs）与 tsc 产物上溯两级都到 server 根。 */
-function readVersion(): string {
+/** 当前模块目录：cjs（esbuild 单文件产物）用 __filename；ESM（tsx/tsc 产物）用 import.meta.url。 */
+function moduleDirname(): string | undefined {
   try {
-    if (typeof __filename === 'undefined') return 'unknown';
-    const pkgPath = path.join(path.dirname(__filename), '..', '..', 'package.json');
-    return String(JSON.parse(fs.readFileSync(pkgPath, 'utf-8')).version ?? 'unknown');
+    if (typeof __filename === 'string' && __filename.length > 0) return path.dirname(__filename);
   } catch {
-    return 'unknown';
+    // __filename 未定义（ESM）——走 import.meta.url 分支
   }
+  try {
+    return path.dirname(fileURLToPath(import.meta.url));
+  } catch {
+    return undefined;
+  }
+}
+
+/** esbuild define 注入的应用版本（根 package.json）；tsx/tsc 运行时不存在。 */
+declare const __FEISHU_SYNC_APP_VERSION__: string | undefined;
+
+/**
+ * 版本号：打包产物用构建期注入的应用版本；非打包运行（tsx/tsc dist）依次读
+ * 仓库根 package.json（应用版本）、server/package.json（兜底），都读不到报 unknown。
+ */
+function readVersion(): string {
+  if (typeof __FEISHU_SYNC_APP_VERSION__ === 'string' && __FEISHU_SYNC_APP_VERSION__) {
+    return __FEISHU_SYNC_APP_VERSION__;
+  }
+  const dir = moduleDirname();
+  if (!dir) return 'unknown';
+  for (const rel of [['..', '..', '..'], ['..', '..']]) {
+    try {
+      const version = JSON.parse(fs.readFileSync(path.join(dir, ...rel, 'package.json'), 'utf-8')).version;
+      if (typeof version === 'string' && version) return version;
+    } catch {
+      // 继续尝试下一个候选
+    }
+  }
+  return 'unknown';
 }

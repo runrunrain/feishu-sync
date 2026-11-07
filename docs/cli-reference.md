@@ -29,11 +29,15 @@ feishu-sync [--home <dir>] [--json] [--yes] <命令> [参数…]
 | `--home <dir>` | 指定数据根；缺省依次取 `FEISHU_SYNC_HOME`、`~/.feishu-sync` |
 | `--json` | 结构化输出：stdout 单个 `{ok, data\|error}` 包络 |
 | `--yes` / `-y` | 确认执行：注入命令表登记的确认值（见下） |
-| `--help` / `-h` | 帮助；`help <命令>` 或 `<命令> --help` 查看单命令参数 |
+| `--help` / `-h` | 帮助；`help <命令>` / `<命令> --help` 查看单命令用法（用法行、参数表、位置参数顺序与示例），`<组> --help` / `help <组>` / 裸组名列出该组全部子命令 |
+| `--timeout <秒>` | 覆盖本次命令 HTTP 超时（正数秒；缺省 120 秒 / long-poll 15 分钟） |
 | `--version` | 版本 |
 
 - 命令用空格分层（`kb build` ↔ `kb.build`）；参数用 `--kebab-case` 旗标（`--build-id` → `buildId`）或位置参数；object/array 类型传 JSON 字面量（`--sources '[{"objToken":"…"}]'`）；`--` 之后一律按位置参数处理。
-- 风险级四级：`read`（读取）/ `mutate`（修改）/ `destructive`（破坏性）/ `remote_write`（远端写）。destructive 与 remote_write 命令在命令表层强制登记确认值；带确认值的命令缺 `--yes` 时返回退出码 4、不发送业务命令——此前仍会读取端点文件并探活，应用未运行或不可达时先按退出码 3 处理。
+- 位置参数：命令表登记或按必填参数顺序自动推导（如 `config set <path> <value>`、`source edit-status <objToken>`；array 参数收尾位全量收集，如 `kb sources include <tok1> <tok2> …`）。同一参数同时以位置形态与旗标形态给出会被拒绝，需二选一。
+- 风险级四级：`read`（读取）/ `mutate`（修改）/ `destructive`（破坏性）/ `remote_write`（远端写）。destructive 与 remote_write 命令在命令表层强制登记确认值；带确认值的命令缺 `--yes` 时返回退出码 4、不发送业务命令。
+- 参数解析、表内 request 校验与 confirm 预检全部在端点发现与探活**之前**完成：应用未运行时，参数/用法错误仍返回 2、缺 `--yes` 返回 4；本地预检通过后才读取端点文件并探活（失败 3）。
+- 人类可读模式（默认）：列表类数据（对象数组，如 `kb builds`、`clean trash list` 的返回）渲染为对齐表格，单元格截断、嵌套值显示 `{…}`/`[n项]`，末尾提示 `--json` 查看完整字段；其余形态沿用键值缩进渲染。`--json` 输出不受影响。
 - 退出码：
 
 | 退出码 | 含义 |
@@ -44,12 +48,13 @@ feishu-sync [--home <dir>] [--json] [--yes] <命令> [参数…]
 | 3 | 应用不可达、命令行访问未开启或令牌无效 |
 | 4 | 需要确认（补 `--yes` 重试） |
 
-- 超时：探活 5 秒，普通命令 120 秒；long-poll 命令（`auth login complete`、`lark config-init complete`）15 分钟。
+- 超时：探活 5 秒，普通命令 120 秒；long-poll 命令（`auth login complete`、`lark config-init complete`）15 分钟；`--timeout <秒>` 可覆盖本次命令超时（非法值按用法错误返回 2）。
+- 补全：本地命令 `feishu-sync completion bash|zsh|fish` 生成 shell 补全脚本（不经命令表、不连服务器），覆盖命令词分层、各命令 `--参数` 与全局旗标。安装：`source <(feishu-sync completion bash)`（写入 `~/.bashrc`）；zsh 需已加载 compinit 后 `source <(feishu-sync completion zsh)`；fish 写入 `~/.config/fish/completions/feishu-sync.fish`。
 - 常见坑：`kb publish --force --yes` 注入的是升级确认值 `OVERWRITE_PUBLISHED`；若实际计划没有云端冲突，服务端要求 `PUBLISH` 并返回 `confirmation_required`（退出码 4），按提示去掉 `--force` 重试即可。`source push --allow-overwrite` 同理：计划为追加时服务端要求 `PUSH`。`config set` 只接受顶层键，点号路径会被拒绝（见下节）。
 
 ## 命令表
 
-下表与 `server/src/ops/command-table.ts` 一一对应。参数列标 `*` 为必填；仅登记为位置参数的参数可按位置传入（表中以 `<…>` 示意），其余一律用 `--kebab-case` 旗标（如 `--page-token`）；「确认」列为 `--yes` 注入的值。HTTP 路由列是命令的进程内转发目标（路径参数以 `{…}` 表示），供 API 调用方对照；多步命令逐项列出。
+下表与 `server/src/ops/command-table.ts` 一一对应。参数列标 `*` 为必填；必填参数与显式登记的参数可按位置传入（表中以 `<…>` 示意，其余可选参数也可用同名旗标），其余一律用 `--kebab-case` 旗标（如 `--page-token`）；「确认」列为 `--yes` 注入的值。HTTP 路由列是命令的进程内转发目标（路径参数以 `{…}` 表示），供 API 调用方对照；多步命令逐项列出。
 
 ### 状态与读取（read）
 
@@ -60,7 +65,7 @@ feishu-sync [--home <dir>] [--json] [--yes] <命令> [参数…]
 | `config get [path]` | 读取应用配置（已脱敏；path 供输出裁剪） | — | path | GET /api/config |
 | `kb status` | 标准库当前发布与待构建状态 | — | — | GET /api/kb/status |
 | `kb changes` | 相对当前 release 的源变更列表 | — | — | GET /api/kb/changes |
-| `kb builds [--limit N]` | 构建历史（1-100，默认 20） | — | --limit | GET /api/kb/builds |
+| `kb builds [limit]` | 构建历史（1-100，默认 20；limit 可作位置参数） | — | limit | GET /api/kb/builds |
 | `kb versions` | 标准库发布版本列表 | — | — | GET /api/kb/versions |
 | `kb publish-preview` | 预览标准库发布计划（见[反向发布](feishu-publish.md)） | — | --release-id, --kb-paths, --force | POST /api/kb/publish/preview |
 | `kb publications` | 已发布云文档映射与状态 | — | — | GET /api/kb/publications |
@@ -69,8 +74,8 @@ feishu-sync [--home <dir>] [--json] [--yes] <命令> [参数…]
 | `source edit-status <objToken>` | 源文档编辑状态与正文 hash（编辑 OCC baseHash 入口） | — | objToken* | GET /api/sources/{objToken}/edit-status |
 | `source push-preview <objToken>` | 预览写回飞书计划（追加/覆盖/阻止原因） | — | objToken* | POST /api/sources/{objToken}/push/preview |
 | `cloud history_list <objToken>` | 云端历史版本列表（分页聚合，上限 3 页） | — | objToken*, --page-token | GET /api/sources/{objToken}/history |
-| `cloud move_status --move-id <moveId>` | 查询单次移出记录状态（仅人工，不暴露给 Agent） | — | --move-id* | GET /api/sources/moves/{moveId} |
-| `cloud moves` | 移出记录列表（可按文档过滤，缺省 50 条；仅人工） | — | --obj-token, --limit | GET /api/sources/moves |
+| `cloud move_status <moveId>` | 查询单次移出记录状态（仅人工，不暴露给 Agent） | — | moveId* | GET /api/sources/moves/{moveId} |
+| `cloud moves [objToken]` | 移出记录列表（可按文档过滤，缺省 50 条；仅人工） | — | objToken, --limit | GET /api/sources/moves |
 
 ### 修改（mutate）
 

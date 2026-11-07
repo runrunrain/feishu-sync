@@ -7,11 +7,17 @@
  * 语义漂移（U14）。本文件只读消费命令表，不修改它。
  *
  * 全局旗标：--home <dir> / --json / --yes（confirm 确认）/ --help /
- * --version。命令参数旗标用 kebab-case（--build-id → buildId），
- * object/array 类型取 JSON 字面量（--sources '[{"objToken":…}]'）。
+ * --version / --timeout <秒>（覆盖本次命令 HTTP 超时）。命令参数旗标用
+ * kebab-case（--build-id → buildId），object/array 类型取 JSON 字面量
+ * （--sources '[{"objToken":…}]'）。
+ *
+ * 位置参数：POSITIONALS 显式登记最高优先；未登记命令按表内 required
+ * 顺序自动推导（array/object 沿用既有尾位/JSON 规则）。同一参数以位置
+ * 形态与旗标形态同时给出时显式报冲突，绝不静默覆盖。
  */
 
 import { OPS_COMMANDS, type JsonSchemaObject, type OpsCommandDef, type OpsRequestSpec } from '../ops/command-table.js';
+import { suggestClosest } from './suggest.js';
 
 export class UsageError extends Error {
   constructor(message: string) {
@@ -26,6 +32,8 @@ export interface GlobalFlags {
   yes: boolean;
   help: boolean;
   version: boolean;
+  /** --timeout <秒>：覆盖本次命令 HTTP 超时（缺省 120s / long-poll 15min）。 */
+  timeoutSec?: number;
 }
 
 export interface ParsedInvocation {
@@ -38,6 +46,10 @@ export interface ParsedInvocation {
   restTokens: string[];
   /** 前导命令词（诊断用）。 */
   words: string[];
+  /** 命令组前缀（如 `kb` / `kb sources`）：输入只到组、未到具体命令时生效。 */
+  group?: string;
+  /** 本地命令 completion 的目标 shell（不经命令表、不连服务器）。 */
+  completionShell?: 'bash' | 'zsh' | 'fish';
 }
 
 /** 命令名最大层级深度（auth.login.start / lark.config-init.start = 3）。 */
@@ -59,6 +71,11 @@ export function findCommandByWords(words: string[]): OpsCommandDef | null {
 
 function kebabToCamel(name: string): string {
   return name.replace(/-([a-z0-9])/g, (_, ch: string) => ch.toUpperCase());
+}
+
+/** camel 参数名 → kebab 旗标名（buildId → build-id；帮助/补全/错误消息共用）。 */
+export function camelToKebab(name: string): string {
+  return name.replace(/[A-Z]/g, (m) => `-${m.toLowerCase()}`);
 }
 
 /** 命令级旗标别名（设计 §6.3 用法示例的惯用写法 → 表内参数）。 */
@@ -92,7 +109,45 @@ const POSITIONALS: Record<string, string[]> = {
   // P0-S8 登记：docTokens 为尾位 array 参数，多个位置参数全量收集
   //（feishu-sync sync whiteboard-backfill <tok1> <tok2> …）。
   'sync.whiteboard_backfill': ['docTokens'],
+  // 可用性补齐（cli-polish）：列表类命令的常用过滤参数开放位置形态。
+  'kb.builds': ['limit'],
+  'cloud.moves': ['objToken'],
+  'cloud.move_status': ['moveId'],
 };
+
+/** 位置参数绑定计划：显式登记最高优先；未登记命令按 required 顺序自动推导。 */
+export function positionalPlanFor(def: OpsCommandDef): string[] {
+  const explicit = POSITIONALS[def.name];
+  if (explicit) return explicit;
+  const required = def.params.required ?? [];
+  // 必填参数按 schema 属性顺序依次作为位置参数；array/object 类型在
+  // buildCommandArgs 内沿用既有规则（array 尾位全量收集 / object JSON）。
+  return Object.keys(def.params.properties).filter((param) => required.includes(param));
+}
+
+/** 命令组判定：prefix 本身不是命令，但有命令以其为点号前缀（如 kb / auth.login）。 */
+export function isCommandGroup(prefix: string): boolean {
+  if (prefix.length === 0) return false;
+  return OPS_COMMANDS.some((def) => def.name.startsWith(`${prefix}.`));
+}
+
+/** 全部命令的空格分层名（拼写建议候选，按命令全名匹配）。 */
+const ALL_SPACED_NAMES = OPS_COMMANDS.map((def) => spacedName(def.name));
+
+/** 命令可用旗标名（裸 kebab 名，别名在前）——帮助/补全/建议共用；bash/zsh 词表自行加 -- 前缀。 */
+export function commandFlagNames(def: OpsCommandDef): string[] {
+  const aliases = Object.keys(FLAG_ALIASES[def.name] ?? {});
+  const params = Object.keys(def.params.properties).map(camelToKebab);
+  return [...aliases, ...params.filter((param) => !aliases.includes(param))];
+}
+
+function parseTimeoutSeconds(raw: string): number {
+  const num = Number(raw);
+  if (!Number.isFinite(num) || num <= 0) {
+    throw new UsageError(`--timeout 需要正数秒数（如 --timeout 30），收到 "${raw}"`);
+  }
+  return num;
+}
 
 export function parseInvocation(argv: string[]): ParsedInvocation {
   const flags: GlobalFlags = { json: process.env.FEISHU_SYNC_CLI_JSON === '1', yes: false, help: false, version: false };
@@ -119,6 +174,17 @@ export function parseInvocation(argv: string[]): ParsedInvocation {
     if (token === '--yes' || token === '-y') { flags.yes = true; continue; }
     if (token === '--help' || token === '-h') { flags.help = true; continue; }
     if (token === '--version') { flags.version = true; continue; }
+    if (token === '--timeout') {
+      const value = argv[i + 1];
+      if (value === undefined) throw new UsageError('--timeout 需要一个秒数参数（如 --timeout 30）');
+      flags.timeoutSec = parseTimeoutSeconds(value);
+      i += 1;
+      continue;
+    }
+    if (token.startsWith('--timeout=')) {
+      flags.timeoutSec = parseTimeoutSeconds(token.slice('--timeout='.length));
+      continue;
+    }
     rest.push(token);
   }
 
@@ -135,19 +201,46 @@ export function parseInvocation(argv: string[]): ParsedInvocation {
     return { flags, command: null, helpTarget: null, restTokens: rest, words };
   }
 
-  // `help [command…]`：顶层/定向帮助
+  // `completion <shell>`：本地命令（生成 shell 补全脚本），不经命令表、
+  // 不连服务器、不计入命令数。表内无 completion.* 命令，独占该词安全。
+  if (words[0] === 'completion') {
+    if (flags.help) {
+      // `completion --help`：只展示用法，不要求 shell 参数。
+      return { flags, command: null, helpTarget: null, restTokens: [], words };
+    }
+    const shell = words[1];
+    if (words.length > 2 || shell !== 'bash' && shell !== 'zsh' && shell !== 'fish') {
+      throw new UsageError('用法：feishu-sync completion bash|zsh|fish（本地命令，生成 shell 补全脚本）');
+    }
+    return { flags, command: null, helpTarget: null, restTokens: [], words, completionShell: shell };
+  }
+
+  // `help [command…]`：顶层/定向帮助；目标也可以是命令组（help kb）。
   if (words[0] === 'help') {
     const targetWords = rest.slice(1).filter((token) => !token.startsWith('-'));
     const target = findCommandByWords(targetWords);
-    if (targetWords.length > 0 && !target) {
-      throw new UsageError(`未知命令 ${targetWords.join(' ')}（--help 查看全部命令）`);
+    if (target) {
+      return { flags: { ...flags, help: true }, command: null, helpTarget: target, restTokens: [], words };
     }
-    return { flags: { ...flags, help: true }, command: null, helpTarget: target, restTokens: [], words };
+    const groupCandidate = targetWords.join('.');
+    if (targetWords.length > 0 && isCommandGroup(groupCandidate)) {
+      return { flags: { ...flags, help: true }, command: null, helpTarget: null, restTokens: [], words, group: groupCandidate };
+    }
+    if (targetWords.length > 0) {
+      throw unknownCommandError(targetWords);
+    }
+    return { flags: { ...flags, help: true }, command: null, helpTarget: null, restTokens: [], words };
   }
 
   const command = findCommandByWords(words);
   if (!command) {
-    throw new UsageError(`未知命令 ${words.join(' ')}（--help 查看全部命令）`);
+    // 只输入到命令组（如 `kb` / `kb sources`）：进入组帮助路径，退出码由
+    // 是否带 --help 决定（见 cli-app）。
+    const groupCandidate = words.join('.');
+    if (isCommandGroup(groupCandidate)) {
+      return { flags, command: null, helpTarget: null, restTokens: rest, words, group: groupCandidate };
+    }
+    throw unknownCommandError(words);
   }
   const consumed = command.name.split('.').length;
   return {
@@ -157,6 +250,15 @@ export function parseInvocation(argv: string[]): ParsedInvocation {
     restTokens: rest.slice(consumed),
     words: words.slice(0, consumed),
   };
+}
+
+/** 未知命令错误：带拼写建议（最多 3 条，按命令全名匹配；无相近候选则不提）。 */
+function unknownCommandError(words: string[]): UsageError {
+  const suggestions = suggestClosest(words.join(' '), ALL_SPACED_NAMES);
+  const suffix = suggestions.length > 0
+    ? `（你是不是想输入：${suggestions.join('、')}）`
+    : '（--help 查看全部命令）';
+  return new UsageError(`未知命令 ${words.join(' ')}${suffix}`);
 }
 
 function convertFlagValue(def: OpsCommandDef, param: string, raw: string | undefined): unknown {
@@ -209,7 +311,12 @@ export function buildCommandArgs(def: OpsCommandDef, tokens: string[]): Record<s
         continue;
       }
       if (!(param in def.params.properties)) {
-        throw new UsageError(`命令 ${spacedName(def.name)} 不认识参数 --${rawName}（help ${spacedName(def.name)} 查看参数）`);
+        // 拼写建议：与表内参数/别名相近时直接给出候选，减少查表来回。
+        const suggestions = suggestClosest(rawName, commandFlagNames(def));
+        const suffix = suggestions.length > 0
+          ? `（你是不是想输入：${suggestions.map((s) => `--${s}`).join(' ')}）`
+          : `（help ${spacedName(def.name)} 查看参数）`;
+        throw new UsageError(`命令 ${spacedName(def.name)} 不认识参数 --${rawName}${suffix}`);
       }
       let valueToken = inlineValue;
       if (valueToken === undefined) {
@@ -228,19 +335,29 @@ export function buildCommandArgs(def: OpsCommandDef, tokens: string[]): Record<s
     positionalValues.push(token);
   }
 
-  // 位置参数绑定
-  const positionalPlan = POSITIONALS[def.name] ?? [];
+  // 位置参数绑定（显式登记 > required 自动推导）；与同名旗标同时给出时
+  // 显式报冲突，绝不静默覆盖。
+  const positionalPlan = positionalPlanFor(def);
+  const assertNoFlagConflict = (param: string): void => {
+    if (param in args) {
+      throw new UsageError(`参数 ${param} 同时以位置参数与 --${camelToKebab(param)} 旗标提供，请只保留一种形式`);
+    }
+  };
   for (let i = 0; i < positionalPlan.length; i += 1) {
     const param = positionalPlan[i];
     const schemaType = def.params.properties[param]?.type;
     const isLast = i === positionalPlan.length - 1;
     if (schemaType === 'array' && isLast) {
       const values = positionalValues.slice(i);
-      if (values.length > 0) args[param] = values;
+      if (values.length > 0) {
+        assertNoFlagConflict(param);
+        args[param] = values;
+      }
       break;
     }
     const value = positionalValues[i];
     if (value === undefined) break;
+    assertNoFlagConflict(param);
     if (schemaType === 'object' || schemaType === 'array') {
       try {
         args[param] = JSON.parse(value);

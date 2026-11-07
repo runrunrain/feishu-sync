@@ -12,6 +12,8 @@
  * v1 无流式命令（S8 未登记 SSE 命令），NDJSON 输出留待后续切片。
  */
 
+import { tryRenderTable } from './table.js';
+
 export interface CliErrorFace {
   code: string;
   message: string;
@@ -31,7 +33,8 @@ export function printOk(data: unknown, options: PrintOptions): void {
     process.stdout.write(`${JSON.stringify({ ok: true, data })}\n`);
     return;
   }
-  const lines = renderHuman(data, 0);
+  // 列表类数据（对象数组）优先渲染对齐表格，其余沿用递归键值渲染。
+  const lines = tryRenderTable(data) ?? renderHuman(data, 0);
   for (const line of lines) {
     process.stdout.write(`${line}\n`);
   }
