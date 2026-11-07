@@ -32,6 +32,7 @@ npx tsx scripts/sync-latest.ts --skip-index --apply    # 提交KB正文，仅 cr
 ```
 
 - 已有配置只读加载，除非显式 `--persist-config`。
+- 正式知识库根目录解析顺序：`--kb <绝对路径>` → `FORMAL_KB` 环境变量 → 已有 config.json 的 `knowledgeBaseRoot`；首次运行需显式指定其一。
 - move/delete/路径冲突/父链不完整/未知类型/无权限保留为 blocker，绝不自动覆盖。
 - 正式运维还应保留 operation manifest 与备份；恢复时同时还原知识库、SQLite 和配置。
 - 运维 npm 入口（server/）：`npm run audit:corpus` / `backup:state` / `reconcile:dry-run` / `reconcile:apply` / `migrate:v5`。
@@ -47,7 +48,6 @@ npx tsx scripts/sync-latest.ts --skip-index --apply    # 提交KB正文，仅 cr
 | `audit-knowledge-base.ts` | 知识库一致性审计（npm `audit:corpus`） |
 | `debug-path.ts` / `debug-sheet-info.ts` | 路径/sheet 调试探针 |
 | `probe-spawn-stdin-paths.ts` | 子进程 stdin 路径探针 |
-| `llm-channels-connectivity.ts` | LLM 通道连通性检查（会发起真实模型请求） |
 | `build-metrics-report.ts` | pi-amagi 构建度量只读报告：读 `kb_builds`（sqlite readonly）与构建权威落盘记录，打印人读摘要；不写文件、不回填旧构建（见 [build-operations.md](./build-operations.md)） |
 | `kb-eval.ts` | 检索评测 E0 离线评估器：无数据库/模型/API 访问、不写输入 release（见 [kb-evaluation.md](./kb-evaluation.md)） |
 | `preview-sheet-workbook.ts` | 本地起 vite server 预览 xlsx 工作簿渲染；无生产配置/数据库/云端写入 |
@@ -60,9 +60,10 @@ npx tsx scripts/sync-latest.ts --skip-index --apply    # 提交KB正文，仅 cr
 | `reconcile-knowledge-base.ts` / `reconcile-apply.ts` | 映射核对/回填（`--apply` 前不改库） |
 | `kb-lan-bench.ts` | LAN MCP 基准测试：对运行中的 MCP 端点发起真实查询负载（token 仅经 `FEISHU_KB_TOKEN` 等环境变量，不走 argv）；见 [kb-lan-mcp.md](./kb-lan-mcp.md) |
 | `probe-build-runtime.ts` | v2 构建运行时端到端 probe：真实 pi + amagi + 子任务 MCP 桥，默认本地 fixture 模型驱动；`--real-model` 显式可选（真实端点+额度）；默认报告写 `agent-outputs/workflow/build-runtime-v2/live-probe-report.md`（见 [build-operations.md](./build-operations.md)） |
-| `verify-claude-cli-channel-boundary.ts` | ClaudeCliChannel STDIN 硬化验证：对真实 bigmodel 端点发起含特殊字符 prompt 的请求（消耗额度） |
 | `verify-channel-test-timeout.ts` | `/api/llm/test-channel` 超时验证：启动 standalone server（端口 3099）并可能打到真实 provider |
 | `verify-direct-config-fix.ts` | direct-channel 401 修复验证：**直接读取真实 `~/.feishu-sync/config.json`** 走迁移路径并发起真实 LLM 请求——运行前先隔离/备份生产配置 |
+| `verify-media-gap.ts` | media-gap 检测验证：真实 config/DB/lark-cli 跑一次 full detect（会 initialize SQLite、推进 observed 状态），不写知识库文件 |
+| `verify-sheet-workbook.ts` | 工作簿导出只读验证：真实 lark-cli 拉 sheet 并渲染 xlsx，仅写显式指定的 --output 新文件 |
 | `agent-real-model-smoke.ts` | 显式真实模型验证；创建临时raw/config/SQLite/会话与Workspace并触发真实写入/构建、消耗模型额度；必须先给新临时FEISHU_SYNC_HOME，禁止指向生产目录 |
 
 ### L3 直接写数据/高风险操作
@@ -72,7 +73,7 @@ npx tsx scripts/sync-latest.ts --skip-index --apply    # 提交KB正文，仅 cr
 | `backup-operation-state.ts` | 运行状态备份（写备份文件） |
 | `repair-media-gaps.ts` / `resync-one-doc.ts` / `retry-slides.ts` / `sync-troop-unit-cell.ts` / `canary-atomic-commit.ts` | 定向修复/重同步/金丝雀——直接操作知识库与 SQLite，使用前先备份 |
 | `migrate-kb-structure.mjs` | KB 结构迁移（历史） |
-| `verify-*`（历史探针）/ `test-fetch.ts` / `test-sheet-export.ts` / `test-adapter-fallback.ts` | 历史验收探针，不能统一视作只读：部分初始化数据库、加载或迁移用户配置、执行同步或写临时文件；只有逐脚本验证隔离后才运行 |
+| `verify-*`（历史探针）/ `test-fetch.ts` / `test-sheet-export.ts` | 历史验收探针，不能统一视作只读：部分初始化数据库、加载或迁移用户配置、执行同步或写临时文件；只有逐脚本验证隔离后才运行 |
 | `gate2-closeout.ts` / `gate5-live-shadow-canary.ts` | 内含文件/SQLite 写入与 apply，不可假定运行前还有确认门 |
 | `smoke-custom-folders.mjs` | 会创建隔离 home、配置与目录并通过接口操作；先核对隔离参数，不能用于生产目录 |
 

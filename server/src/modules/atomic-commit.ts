@@ -116,38 +116,6 @@ export function stageFileContent(
 }
 
 /**
- * Stage a binary file by copying from an absolute source into staging.
- */
-export function stageFileFromPath(
-  plan: AtomicCommitPlan,
-  relativePath: string,
-  sourceAbsolutePath: string,
-): StagedFileEntry {
-  const content = fs.readFileSync(sourceAbsolutePath);
-  return stageFileContent(plan, relativePath, content);
-}
-
-export function stageDelete(
-  plan: AtomicCommitPlan,
-  relativePath: string,
-): StagedFileEntry {
-  const portable = relativePath.replace(/\\/g, '/');
-  const targetAbsolutePath = toAbsolute(plan.knowledgeBaseRoot, portable);
-  assertInsideRoot(plan.knowledgeBaseRoot, targetAbsolutePath);
-  const exists = fs.existsSync(targetAbsolutePath);
-  const entry: StagedFileEntry = {
-    relativePath: portable,
-    action: 'delete',
-    stagingAbsolutePath: null,
-    targetAbsolutePath,
-    previousSha256: exists ? sha256File(targetAbsolutePath) : null,
-    newSha256: null,
-  };
-  plan.files.push(entry);
-  return entry;
-}
-
-/**
  * Commit all staged files. On any failure, restore prior content for every
  * file already committed in this call and return ok=false.
  */

@@ -9,7 +9,8 @@ npm run check    # lint + typecheck + 前端/server 全部测试
 
 push / PR 会触发 [CI](.github/workflows/ci.yml) 执行同样的检查与构建冒烟（两个 pi 集成测试由 CI 单独安装 pi CLI 运行）；请先本地跑通。
 
-- 环境要求：Node.js 22.19+（22.x）或 24.x LTS（见 [docs/development.md](docs/development.md)）。
+- 环境要求：Node.js 22.19+（22.x）或 24.x LTS（见 [docs/development.md](docs/development.md)；`fnm`/`nvm` 用户可 `fnm use`/`nvm use` 读 `.nvmrc` 对齐 CI 的 22.x）。
+- 仓库基础编辑行为由 `.editorconfig` 统一（utf-8 / lf / 2 空格 / 末行换行；`*.md` 保留行尾空格），格式化细节以 `.prettierrc.json` 为准。
 - lint 违规已清零，新代码保持 0 error；已知多处 `react-hooks/exhaustive-deps` 以行内 disable 注释豁免（以 grep 为准，见 [docs/testing.md](docs/testing.md)）。
 - 格式：prettier 渐进采纳（`.prettierrc.json`），不做全仓一次性 format；新文件建议 `npx prettier --write <file>`。
 

@@ -155,7 +155,7 @@ export function useSyncStatus(options: UseSyncStatusOptions = {}): SyncStatusDat
   }, [refresh]);
 
   // 定时兜底（2026-11 修复「总览待同步数量总是滞后于变更列表」）：
-  // 服务端 PollingScheduler 的定时检测会重写持久化 diff，但运行在主进程
+  // 主进程的定时检测会重写持久化 diff，但运行在主进程
   // 侧、不产生任何客户端事件（见 utils/syncEvents.ts 头注释）；本 hook
   // 此前只依赖 diff-changed（仅前端写路径触发），用户停在总览页时徽标
   // 与 lastSyncTime/nextCheckTime 一直停留在旧值，而同步页变更列表有

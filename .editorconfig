@@ -1,0 +1,14 @@
+# EditorConfig：统一多语言脚本目录的基础编辑行为；格式化以 .prettierrc.json 为准（与 endOfLine=lf 一致）
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+# Markdown 行尾双空格是换行语法，不做行尾裁剪
+[*.md]
+trim_trailing_whitespace = false

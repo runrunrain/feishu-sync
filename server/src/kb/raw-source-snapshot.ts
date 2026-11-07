@@ -246,8 +246,3 @@ export class RawSourceSnapshot {
     return { content: fs.readFileSync(targetReal, 'utf-8'), realPath: targetReal, entry, attachments };
   }
 }
-
-export function hashPath(filePath: string): string {
-  const buffer = fs.readFileSync(filePath);
-  return `sha256:${crypto.createHash('sha256').update(buffer).digest('hex')}`;
-}

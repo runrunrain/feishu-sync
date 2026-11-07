@@ -16,7 +16,7 @@
  * 形态与旗标形态同时给出时显式报冲突，绝不静默覆盖。
  */
 
-import { OPS_COMMANDS, type JsonSchemaObject, type OpsCommandDef, type OpsRequestSpec } from '../ops/command-table.js';
+import { OPS_COMMANDS, type OpsCommandDef, type OpsRequestSpec } from '../ops/command-table.js';
 import { suggestClosest } from './suggest.js';
 
 export class UsageError extends Error {
@@ -383,22 +383,6 @@ export function buildCommandArgs(def: OpsCommandDef, tokens: string[]): Record<s
     }
   }
   return args;
-}
-
-/** 参数 schema → 人类可读摘要（help 输出用）。 */
-export function describeParams(params: JsonSchemaObject): string {
-  const entries = Object.entries(params.properties);
-  if (entries.length === 0) return '（无参数）';
-  return entries.map(([key, schema]) => {
-    const required = (params.required ?? []).includes(key) ? '必填' : '可选';
-    const def = schema.default !== undefined ? `，默认 ${JSON.stringify(schema.default)}` : '';
-    return `  --${key.replace(/([A-Z])/g, (m) => `-${m.toLowerCase()}`)} <${schema.type}>  [${required}]${schema.description ? ` ${schema.description}` : ''}${def}`;
-  }).join('\n');
-}
-
-/** 命令表快照（帮助文本用；与 GET /api/cli/commands 同源）。 */
-export function commandListForHelp(): Array<{ def: OpsCommandDef; usage: string }> {
-  return OPS_COMMANDS.map((def) => ({ def, usage: spacedName(def.name) }));
 }
 
 /** 本地评估请求形态（confirm 预检用；与表内 request 纯函数一致）。 */

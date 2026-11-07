@@ -147,14 +147,6 @@ export const KB_BUILD_WARNING_LABEL: Record<string, string> = {
   sources_added_during_build: '构建期间新增文档',
 };
 
-/** 会话状态 → 中文。 */
-export const AGENT_SESSION_STATE_LABEL: Record<string, string> = {
-  idle: '空闲',
-  starting: '启动中',
-  streaming: '生成中',
-  error: '错误',
-};
-
 /** 来源状态徽标文案（§9.2 sources.state）。 */
 export const KB_SOURCE_STATE_LABEL: Record<string, string> = {
   current: '当前',

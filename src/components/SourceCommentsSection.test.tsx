@@ -1,9 +1,8 @@
 /**
  * SourceCommentsSection 组件测试（P2-S4）
  *
- * SSR + 纯函数锚定（SourceEditControls.test.tsx 同法：effects 不跑，
- * 数据态经纯展示 SourceCommentsList 锚定；容器异步流由 server 侧测试与
- * 真机浏览器验证覆盖）：
+ * SSR + 纯函数锚定（effects 不跑，数据态经纯展示 SourceCommentsList 锚定；容器异步流由
+ * server 侧测试与真机浏览器验证覆盖）：
  *   - commentsHeaderLabel：n 条 / 截断「（可能不完整）」
  *   - 列表渲染：作者/时间/已解决徽章/划词引用/正文/空态
  *   - SSR 初始渲染：effects 不跑 → 容器输出为空（不闪评论区骨架）

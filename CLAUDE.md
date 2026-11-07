@@ -62,6 +62,7 @@ cd server
 npx tsx scripts/sync-latest.ts --skip-index            # 不提交KB正文；仍会写配置/SQLite/报告（dry-run）
 npx tsx scripts/sync-latest.ts --skip-index --apply    # 提交KB正文，仅 create/replace
 # 已有配置默认只读，改写需 --persist-config；缺失配置会首次创建。
+# 正式知识库根目录解析：--kb <绝对路径> > FORMAL_KB 环境变量 > config.json 的 knowledgeBaseRoot；全新机器首次运行需显式指定其一。
 # 即使 --skip-index 且未 --apply，也会初始化/迁移SQLite与推进检测状态，使用真实状态目录前备份。
 ```
 

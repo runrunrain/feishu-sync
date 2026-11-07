@@ -71,7 +71,7 @@ export function SourceCommentsSection({ objToken }: SourceCommentsSectionProps) 
 }
 
 /**
- * 纯展示列表（SSR 可锚定，SourceEditControls.test 同法）：已采集数据 →
+ * 纯展示列表（SSR 可锚定）：已采集数据 →
  * 头部「评论 n 条（可能不完整）」+ 逐条评论（作者/时间/已解决/划词/正文）。
  */
 export function SourceCommentsList({ data, defaultOpen = false }: { data: DocumentComments; defaultOpen?: boolean }) {

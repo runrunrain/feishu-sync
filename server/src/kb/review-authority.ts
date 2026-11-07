@@ -363,21 +363,6 @@ export function resolveCurrentReviewDependencies(input: {
   };
 }
 
-/** 回执依赖与当前值匹配（doc:* 逐路径不在本函数——见 collect 中的正文核验）。
- *
- * F08 补强：v2 权威规则哈希缺失（null）时 fail-closed——回执必须携带
- * workflow-rules 键且与当前冻结值精确匹配；不因集成者未提供而默许。 */
-export function reviewDependenciesMatch(receipt: ReviewReceipt, current: ReviewDependencyValues): boolean {
-  const deps = receipt.dependencyHashes ?? {};
-  if (deps[REVIEW_DEP_DECLARATION] !== current.declarationHash) return false;
-  if (deps[REVIEW_DEP_SOURCE_SNAPSHOT] !== current.sourceSnapshotHash) return false;
-  if (typeof current.workflowRulesHash !== 'string' || !current.workflowRulesHash
-    || deps[REVIEW_DEP_WORKFLOW_RULES] !== current.workflowRulesHash) {
-    return false;
-  }
-  return true;
-}
-
 // ============================================================================
 // WP-B1（kb-build-speedup R3.2）：selector/声明-only 修订后的阻断问题关闭
 // ============================================================================

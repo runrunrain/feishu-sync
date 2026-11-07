@@ -9,7 +9,7 @@
  *   - P0-S6 sync.whiteboardExport { enabled, svgTimeoutMs? }（缺省
  *     enabled=true；svg 旁路失败自动降级 raw，永不阻断同步）。
  *
- * 视觉与交互复用既有设置卡模式（FeishuWriteSettingsCard 同款）：
+ * 视觉与交互复用既有设置卡模式：
  * Toggle 即保存（PUT /api/config），权限状态行 + 徽标；操作链路由
  * server 侧测试与真机浏览器验证覆盖。
  */

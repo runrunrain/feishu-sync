@@ -6,16 +6,18 @@ import { SyncEngine } from '../src/modules/sync-engine.js';
 import { ConfigManager } from '../src/modules/config-manager.js';
 
 async function main() {
-  const cm = new ConfigManager(path.join(os.homedir(), '.feishu-sync', 'config.json'));
+  const configHome = process.env.FEISHU_SYNC_HOME || path.join(os.homedir(), '.feishu-sync');
+  const cm = new ConfigManager(path.join(configHome, 'config.json'));
   const config = await cm.load();
-  config.knowledgeBaseRoot =
-    '/Users/maorun/maorun-workpace/weixiao-database/飞书同步知识库';
-  (config as any).operationManifestDir = path.join(
-    os.homedir(),
-    '.feishu-sync',
-    'operations',
-  );
-  const store = new LocalMapStore(path.join(os.homedir(), '.feishu-sync', 'feishu-sync.db'));
+  const formalKb = process.env.FORMAL_KB || config.knowledgeBaseRoot;
+  if (!formalKb || !formalKb.trim()) {
+    throw new Error(
+      '未指定正式知识库根目录：请用 FORMAL_KB 环境变量指定，或先在 config.json 中配置 knowledgeBaseRoot',
+    );
+  }
+  config.knowledgeBaseRoot = formalKb;
+  (config as any).operationManifestDir = path.join(configHome, 'operations');
+  const store = new LocalMapStore(path.join(configHome, 'feishu-sync.db'));
   store.initialize();
   const lark = new LarkCliClient({
     requiredScopes: config.requiredScopes,

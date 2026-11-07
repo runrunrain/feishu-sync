@@ -68,18 +68,6 @@ import { effectiveHumanReviewOf } from './knowledge-governance-service.js';
  * kb_decision_stale（A 案 §4.3，D1）：决定绑定 payloadHash 与当前对象不
  * 一致（批准不自动继承新载荷）。
  */
-export const KNOWLEDGE_GATE_ISSUE_CODES = [
-  'kb_review_stale',
-  'kb_review_credential_missing',
-  'kb_review_pending',
-  'kb_review_human_missing',
-  'kb_review_human_rejected',
-  'kb_object_registry_stale',
-  'kb_decision_invalid',
-  'kb_decision_stale',
-  'kb_sidecar_invalid',
-  'kb_link_invalid',
-] as const;
 
 // ============================================================================
 // 输入/输出契约

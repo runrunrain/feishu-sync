@@ -19,9 +19,12 @@ import type { ChangedDocument, WatchedRootConfig } from '../src/types/index.js';
 const SCRATCH =
   process.env.SCRATCH ||
   '/var/folders/81/zk31vz7j4bgb0k41z2g_hfgr0000gn/T/grok-goal-d74db4dec1c8/implementer';
-const FORMAL_KB =
-  process.env.FORMAL_KB ||
-  '/Users/maorun/maorun-workpace/weixiao-database/飞书同步知识库';
+const FORMAL_KB = process.env.FORMAL_KB;
+if (!FORMAL_KB) {
+  throw new Error(
+    '需要环境变量 FORMAL_KB 指定正式知识库根目录（只读源，不会写入）；缺少时拒绝运行',
+  );
+}
 const outDir = path.join(SCRATCH, 'gate5-live');
 fs.mkdirSync(outDir, { recursive: true });
 

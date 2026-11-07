@@ -17,7 +17,6 @@
  * 目录行走查找。发布时 relPath 来自 release manifest.sourceSnapshot。
  */
 
-import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { resolveInside } from '../../agent/path-guard.js';
@@ -139,9 +138,4 @@ export function resolveEvidenceCurrency(input: EvidenceCurrencyInput): EvidenceC
     return { currency: 'current', currentRef: { path: candidateRel, resourceHash: currentHash } };
   }
   return { currency: 'stale', currentRef: { path: candidateRel, resourceHash: currentHash } };
-}
-
-/** 供测试与调用方核对公式：sha256(content) 与 evidence-locator 同式。 */
-export function textResourceHash(content: string): string {
-  return `sha256:${crypto.createHash('sha256').update(content, 'utf-8').digest('hex')}`;
 }

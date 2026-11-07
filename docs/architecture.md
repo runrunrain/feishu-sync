@@ -73,7 +73,7 @@ flowchart LR
 - `layout-reconstructor.ts`：A/B/C/D/E 五类块表格重构（块规则注释在文件头）
 - `content-backend*.ts` + `direct-channel.ts`：LLM 单通道（OpenAI SDK → 智谱 GLM 默认）；registry `getFallback()` 恒 null，失败由 B6 确定性结果兜底
 - `lark-cli-client.ts` / `lark-cli-manager.ts`：lark-cli 子进程封装（QPS 节流、错误分类、99991400 指数退避）
-- 其余含 `index-scanner.ts`（header 解析/全量重建）、`atomic-commit.ts`（安全写盘）、`polling-scheduler.ts`（轮询）等，完整清单以目录为准
+- 其余含 `index-scanner.ts`（header 解析/全量重建）、`atomic-commit.ts`（安全写盘）等，完整清单以目录为准
 
 ### routes/（22 个路由文件）与 middleware/（3 个）
 

@@ -424,7 +424,7 @@ export interface DocumentRecord {
  *
  * Each row maps a local directory (relative to knowledgeBaseRoot) to its
  * feishu counterpart (or marks the directory as local-only when no
- * feishu node exists). Used by LocalDirTreeView + NodeDetailCard.
+ * feishu node exists). Used by NodeDetailCard.
  */
 export interface LocalDirRecord {
   localPath: string;          // PK, POSIX-style relative path
@@ -458,21 +458,6 @@ export interface WatchedRoot {
   lastDetectedAt: string | null;
   childCount: number;
   diagnostic?: string;
-}
-
-/**
- * Sub-sheet granularity mapping (sheet_sheets table).
- * A single feishu workbook (sheet) holds multiple sub-sheets, each tracked
- * independently for finer-grained change detection.
- */
-export interface SheetSheetRecord {
-  sheetObjToken: string;
-  sheetId: string;
-  sheetTitle: string;
-  localCsvPath: string;
-  localMdPath?: string | null;
-  lastSyncedModifyTime?: string | null;
-  status: 'synced' | 'changed' | 'error' | 'placeholder';
 }
 
 export interface ChangedDocument {
@@ -921,21 +906,6 @@ export interface LarkCliConfig {
   timeout: number;
 }
 
-// ============================================================================
-// Layout Reconstructor Types (for M3)
-// ============================================================================
-
-export interface BlockType {
-  type: 'metadata' | 'hierarchy' | 'datatable' | 'paragraph' | 'sparse';
-  confidence: number;
-}
-
-export interface ReconstructedBlock {
-  originalRange: { start: number; end: number };
-  type: BlockType;
-  markdown: string;
-}
-
 /**
  * @deprecated v0.2.0 P3: use `AdaptOptions`/`AdaptOutput` from
  * `modules/content-backend.js`. This type is retained only for type
@@ -948,14 +918,6 @@ export interface AdaptOptions {
   temperature?: number;
   enableStreaming?: boolean;
   onProgress?: (chunk: string) => void;
-}
-
-/** @deprecated v0.2.0 P3: use AdaptOutput from content-backend.js. */
-export interface AdaptResult {
-  adaptedMarkdown: string;
-  tokensUsed: number;
-  duration: number;
-  model: string;
 }
 
 // ============================================================================
@@ -1140,12 +1102,4 @@ export interface SourcePushPlanDto {
    * feishu-write-service 的 titleChangeNotPushedMessage（码 title_change_not_pushed）。
    */
   titleChangeNotPushed?: { localTitle: string; syncedTitle: string } | null;
-}
-
-/** 推送执行结果 DTO（POST /api/sources/:objToken/push）。 */
-export interface SourcePushResultDto {
-  state: SourceEditState | 'pushed';
-  mode: 'append' | 'overwrite';
-  revisionId: number | null;
-  pull: { ok: boolean; status: string; message?: string };
 }

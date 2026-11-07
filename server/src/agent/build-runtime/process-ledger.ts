@@ -110,20 +110,6 @@ export function markLedgerExit(
   writeProcessLedger(buildRoot, entries);
 }
 
-/** 追加对账结论（在既有条目上合并；找不到条目则忽略——结论已在 TerminationOutcome 持久化）。 */
-export function markLedgerReconciliation(
-  buildRoot: string,
-  pid: number,
-  verdict: 'exited' | 'reaped' | 'not-ours' | 'unconfirmed',
-  proof: 'birth-token' | 'pgid-invariant' | 'none',
-): void {
-  const { entries } = readProcessLedger(buildRoot);
-  const target = [...entries].reverse().find((entry) => entry.pid === pid);
-  if (!target) return;
-  target.reconciliation = { verdict, proof, at: new Date().toISOString() };
-  writeProcessLedger(buildRoot, entries);
-}
-
 function writeProcessLedger(buildRoot: string, entries: ProcessLedgerEntry[]): void {
   fs.mkdirSync(buildRoot, { recursive: true, mode: 0o700 });
   const file = path.join(buildRoot, 'process-ledger.json');

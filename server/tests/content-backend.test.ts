@@ -7,10 +7,6 @@
  *   - ContentAdapter 编排（单通道：成功路径、失败直返、空内容视为失败）
  *   - DirectChannel 成功/错误分类（OpenAI SDK mocked）
  *   - isSuccess 谓词与 isLegacyLlmConfig 类型守卫
- *
- * Integration layer: real bigmodel connectivity is exercised separately by
- * tests/llm-channels-connectivity.test.ts (gated behind
- * BIGMODEL_INTEGRATION=1 to avoid CI cost).
  */
 
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';

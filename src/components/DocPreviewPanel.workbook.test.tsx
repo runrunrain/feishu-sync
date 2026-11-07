@@ -11,7 +11,6 @@ vi.mock('../api/client', () => ({ ...api, refreshSheet: vi.fn() }));
 vi.mock('../hooks/useConfig', () => ({ useConfig: () => ({ config: null }) }));
 vi.mock('./common/Toast', () => ({ useToast: () => ({ push: vi.fn() }) }));
 vi.mock('./SourceCommentsSection', () => ({ SourceCommentsSection: () => null }));
-vi.mock('./SourceEditControls', () => ({ SourceEditControls: () => null }));
 import { DocPreviewPanel } from './DocPreviewPanel';
 import { WorkbookCanvas, WorkbookView } from './preview/WorkbookView';
 

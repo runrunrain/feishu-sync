@@ -534,7 +534,7 @@ export class MappingService {
       // in NodeTreeView. A non-empty title is the signal that the row has
       // been back-filled with real metadata (synced or a titled restricted
       // node). Note this filter is intentionally feishu-view-only: the
-      // local view must keep every row so LocalDirTreeView can show all
+      // local view must keep every row so the local view can show all
       // on-disk files (placeholder rows have local_path='' and are
       // naturally skipped by splitPath anyway).
       // P2 Gate 2: keep restricted/pending placeholders visible even when

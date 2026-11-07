@@ -10,7 +10,7 @@
  *
  * 关键点：
  *   - 直接 import 源码 .ts（tsx 跑，不依赖 dist）
- *   - 复用 verify-m2a-sync.ts 的依赖初始化模式
+ *   - 依赖初始化模式与其它定向同步脚本一致
  *   - 复用 sync.ts 第 46-63 行的 LayoutReconstructor/ContentAdapter 注入
  *   - enableLLM=true（bigmodel GLM，主上已确认 2 分钟约束例外）
  *   - localMdPath 写绝对路径（已知目录已存在）
@@ -74,7 +74,7 @@ async function main() {
   console.info('[sync-troop-unit-cell] 开始同步 3 个 sheet 文档...');
   console.info(`[sync-troop-unit-cell] 工作目录: ${process.cwd()}`);
 
-  // ===== 1. 初始化依赖（参考 verify-m2a-sync.ts）=====
+  // ===== 1. 初始化依赖 =====
   const dbPath = path.join(os.homedir(), '.feishu-sync', 'feishu-sync.db');
   const localMapStore = new LocalMapStore(dbPath);
   localMapStore.initialize();
@@ -125,7 +125,7 @@ async function main() {
   // ===== 3. 构造 ChangedDocument[] =====
   const nowIso = new Date().toISOString();
   const docs: ChangedDocument[] = TARGET_DOCS.map((d) => {
-    // ChangedDocument 形状参考 verify-m2a-sync.ts 与 sync.ts 用法
+    // ChangedDocument 形状见 src/types/index.ts 定义
     return {
       objToken: d.objToken,
       objType: 'sheet',

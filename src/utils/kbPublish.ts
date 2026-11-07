@@ -52,13 +52,6 @@ export const PUBLISH_ACTION_LABEL: Record<KbPublishPlanItemDto['action'], string
   blocked: '阻断',
 };
 
-export const PUBLISH_BLOCKED_REASON: Record<NonNullable<KbPublishPlanItemDto['blockedReason']>, string> = {
-  publish_cloud_edited: '云端文档在发布后有修改：请核对云端，或以覆盖方式重新发布',
-  cloud_missing: '云端文档不可访问：不会自动重建，确认后可重新发布为新文档',
-  state_unknown: '上次发布结果未知：请先到发布根核对，确认后重新发布为新文档',
-  render_failed: '渲染失败：文档无法转换为可发布内容',
-};
-
 /** 警告 code → 可读文案（缺 text 时兜底；有 text 时优先服务端文案）。 */
 export const PUBLISH_WARNING_TEXT: Record<string, string> = {
   link_target_unpublished: '链接目标尚未发布：链接改为纯文字',
@@ -92,11 +85,6 @@ export function describePublishGates(gates: KbPublishGates): string[] {
   }
   return problems;
 }
-
-export const PUBLISH_CONFIRM_HINT: Record<'PUBLISH' | 'OVERWRITE_PUBLISHED', string> = {
-  PUBLISH: '输入 PUBLISH 确认发布',
-  OVERWRITE_PUBLISHED: '将覆盖云端被他人修改过的文档，输入 OVERWRITE_PUBLISHED 确认',
-};
 
 /** 发布根 kind → 展示名。 */
 export function publishTargetKindLabel(kind: string): string {

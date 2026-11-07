@@ -33,7 +33,6 @@ import {
   PI_SUPPORTED_RANGE,
   type AgentConfig,
   type AgentStatusDto,
-  type ReadinessCode,
 } from '../types/agent-knowledge.js';
 import type { LlmConfig } from '../types/index.js';
 import { inspectClaudeCode, resolveClaudeCodePath, resolveClaudeProvider } from './claude-runtime.js';
@@ -608,8 +607,4 @@ export function resolveAppLlmModel(
   agent: AgentConfig,
 ): AppLlmModelResolution | null {
   return resolveProviderModel(llm, agent.model);
-}
-
-export function readinessCodeOf(status: ReadinessResult): ReadinessCode {
-  return status.code;
 }

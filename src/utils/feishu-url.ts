@@ -60,23 +60,6 @@ export function normalizeFeishuUrl(input: string): NormalizedFeishuUrl {
 }
 
 /**
- * Batch-normalise an array of URLs, deduplicating empty/identical entries.
- * Used when saving watchedRootUrls to ensure the persisted list is clean.
- */
-export function normalizeFeishuUrlList(urls: string[]): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const u of urls) {
-    const { canonical } = normalizeFeishuUrl(u);
-    if (!canonical) continue;
-    if (seen.has(canonical)) continue;
-    seen.add(canonical);
-    out.push(canonical);
-  }
-  return out;
-}
-
-/**
  * 从 canonical wiki URL 提取根节点 token（watchedRoots.id）。
  * 非合法 https://<租户>.feishu.cn/wiki/<token> 形式返回 null。
  */

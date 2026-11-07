@@ -16,7 +16,7 @@
  * 修复：凡是会改变服务端 diff 存储的 API（检测/同步/重建索引/回收站/
  * 归档快捷添加）在 client.ts 成功返回后 emitDiffChanged()；所有持有
  * diff 快照的组件订阅事件并重拉 cached diff（本地 SQLite 读，无云遍历）。
- * 服务端 PollingScheduler 定时检测没有客户端事件，由 SyncView 的
+ * 主进程定时检测没有客户端事件，由 SyncView 的
  * 可见性刷新兜底（切到同步区时重读一次）。
  *
  * 2026-11 追加：跨视图共享的「立即检测」运行态（detect-running，见

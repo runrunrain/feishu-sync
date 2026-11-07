@@ -6,7 +6,6 @@
  * releases/<releaseId> 内。不依赖 SQLite（MCP 复用同一实现）。
  */
 
-import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import {
@@ -224,10 +223,4 @@ export class StandardKbStore {
     } while (cursor && results.length < limit);
     return results.slice(0, limit);
   }
-}
-
-/** 计算 release 目录内全部文档的内容哈希（构建校验用）。 */
-export function hashFile(filePath: string): string {
-  const buffer = fs.readFileSync(filePath);
-  return `sha256:${crypto.createHash('sha256').update(buffer).digest('hex')}`;
 }

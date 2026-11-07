@@ -34,7 +34,7 @@ import { settingsFrozenSurfaceIssues } from './runtime-integrity.js';
 import {
   BUILD_MCP_SERVER_NAME, BUILD_MCP_TOKEN_ENV, BUILD_MCP_URL_ENV,
   BUILD_MODEL_PROVIDER, BUILD_MODEL_KEY_ENVS,
-  modelSpecPoolKey, type BuildModelProvider, type BuildRunSpec, type ThinkingLevel,
+  modelSpecPoolKey, type BuildModelProvider, type BuildRunSpec,
 } from './contracts.js';
 
 export class AgentDirConfigError extends Error {
@@ -428,12 +428,4 @@ export function agentDirConfigMatchesSpec(
   // child-policy 文件本体核验（settings 含 hash 文件名，这里验内容——加载前把关）
   issues.push(...verifyChildPolicyFile(homeDir).issues);
   return { ok: issues.length === 0, issues };
-}
-
-/** 校验冻结 thinking 档位被 descriptor 的 levelMap 支持（缺 map 时警告由探测面报告）。 */
-export function thinkingLevelSupported(descriptor: { thinkingLevelMap?: Record<string, string | null>; thinking?: ThinkingLevel }): boolean {
-  if (!descriptor.thinking) return true;
-  if (!descriptor.thinkingLevelMap) return false;
-  const mapped = descriptor.thinkingLevelMap[descriptor.thinking];
-  return mapped !== null && mapped !== undefined;
 }

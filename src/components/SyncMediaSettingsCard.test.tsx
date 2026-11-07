@@ -1,7 +1,7 @@
 /**
  * SyncMediaSettingsCard 组件测试（P2-S3）
  *
- * SSR + hook 全 mock（FeishuWriteSettingsCard.test.tsx 同法）：锚定两个
+ * SSR + hook 全 mock：锚定两个
  * 开关的渲染与缺省态、slidesScreenshot 的 scope 提示分支、whiteboardExport
  * 的 svgTimeoutMs 高级项显隐。保存链路（config PUT / auth-status）由
  * server 侧测试与真机浏览器验证覆盖。

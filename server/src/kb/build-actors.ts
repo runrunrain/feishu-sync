@@ -252,10 +252,6 @@ export function resolveV2RoleToolset(role: string, extra: Record<string, V2RoleT
 /** 子任务共享凭据的白名单 = 各角色工具面并集（每次调用的角色校验在服务端）。 */
 export const V2_CHILD_ALL_TOOLS = [...new Set<string>([...V2_WRITER_TOOLS, ...V2_REVIEWER_TOOLS, ...V2_RESEARCH_TOOLS])];
 
-export function isReviewerRole(role: string, extra: Record<string, V2RoleToolset> = {}): boolean {
-  return resolveV2RoleToolset(role, extra)?.isReviewer ?? false;
-}
-
 // ============================================================================
 // 工具错误（与 AgentToolService.ToolError 同形；本模块不 import agent 层）
 // ============================================================================

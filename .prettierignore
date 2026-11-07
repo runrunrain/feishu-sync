@@ -7,7 +7,6 @@ release*
 server/dist
 amagi-task
 .amagi-worktrees
-projects-memory
 package-lock.json
 server/package-lock.json
 

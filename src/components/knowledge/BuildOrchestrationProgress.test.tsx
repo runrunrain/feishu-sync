@@ -3,8 +3,8 @@
  * 任务流水按角色分组渲染（三轴徽标/等待原因/修订轮次与预算/阻断计数）、
  * reviewSummary 四计数卡片、spec 摘要（发布方式/N 路/角色模型）、旧式构建
  * 404 降级、awaiting_release 确认面板（候选摘要 + 确认成功回调 + 409
- * kb_confirm_stale 失效提示与刷新引导）。api/client 全 mock（KbPublishModal
- * .mount.test.tsx 同法）；轮询只在非终态进行，初始拉取即可锚定。
+ * kb_confirm_stale 失效提示与刷新引导）。api/client 全 mock；
+ * 轮询只在非终态进行，初始拉取即可锚定。
  */
 
 // @vitest-environment jsdom

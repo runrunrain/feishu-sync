@@ -1,7 +1,6 @@
 /**
  * 任务编排纯函数测试（S7）—— useAgentSessions 的 task_update SSE 合并语义
- * （isAgentTaskDto / mergeTaskIntoList / describeTaskNotice）与
- * useAgentOrchestration 的开关提取（extractOrchestrationEnabled）。
+ * （isAgentTaskDto / mergeTaskIntoList / describeTaskNotice）。
  * SSE 实时链路 = 同一合并函数，浏览器实测见 S7 报告。
  */
 
@@ -11,7 +10,6 @@ import {
   isAgentTaskDto,
   mergeTaskIntoList,
 } from './useAgentSessions';
-import { extractOrchestrationEnabled } from './useAgentOrchestration';
 import type { AgentTaskDto } from '../types/agent';
 
 function makeTask(overrides: Partial<AgentTaskDto> = {}): AgentTaskDto {
@@ -110,17 +108,5 @@ describe('describeTaskNotice（任务态变化 → 消息流提示行）', () =>
       makeTask({ status: 'queued', rounds: 1 }),
     );
     expect(again).toContain('等待作答');
-  });
-});
-
-describe('extractOrchestrationEnabled（编排开关提取）', () => {
-  it('按 id 读取 enabled', () => {
-    expect(extractOrchestrationEnabled([{ id: 'orchestration', enabled: true }])).toBe(true);
-    expect(extractOrchestrationEnabled([{ id: 'orchestration', enabled: false }])).toBe(false);
-  });
-
-  it('条目缺失视为停用（旧数据降级）', () => {
-    expect(extractOrchestrationEnabled([{ id: 'kb-style', enabled: true }])).toBe(false);
-    expect(extractOrchestrationEnabled([])).toBe(false);
   });
 });

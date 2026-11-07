@@ -58,7 +58,7 @@ export function SyncView({ active = true, onJumpToSettings }: SyncViewProps) {
   const feishuRecheckInFlight = useRef(false);
 
   // 可见性刷新（2026-06 跨视图实时修复）：同步区常驻挂载，从总览切回
-  // 来时重读一次后端持久化 diff——服务端 PollingScheduler 的定时检测
+  // 来时重读一次后端持久化 diff——主进程的定时检测
   // 没有客户端事件，变更列表/飞书待处理可能已过期；此前用户必须手动
   // 点本页「立即检测」才能看到最新列表。cached 读不触发云遍历。
   const wasActive = useRef(active);

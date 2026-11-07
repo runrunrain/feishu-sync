@@ -138,10 +138,6 @@ export interface KnowledgeObject {
 
 export type PresentationKind = 'canonical' | 'link' | 'summary' | 'exact';
 
-export const PRESENTATION_KINDS: ReadonlySet<PresentationKind> = new Set([
-  'canonical', 'link', 'summary', 'exact',
-]);
-
 /**
  * A 案 §3.2 受控呈现。canonical 的**真相**在 object.canonical；呈现表中
  * 的 canonical 条目是导航登记（≤1 条/对象，且必须与 object.canonical 一致，

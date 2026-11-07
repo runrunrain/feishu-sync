@@ -35,7 +35,6 @@ import {
 import { QueryError, invalid } from './query-error.js';
 import { KB_COVERAGE_NOTE, sourceVersionWarning, suggestDocPaths } from './query-metadata.js';
 export { QueryError } from './query-error.js';
-export { resolveRelease, readCurrent } from './release-reader.js';
 export type { ResolvedRelease } from './release-reader.js';
 
 export interface PageParams { releaseId?: string; cursor?: string; maxChars?: number }

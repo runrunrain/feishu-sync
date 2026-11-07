@@ -733,7 +733,7 @@ describe('MappingService.getTreeDetailed (v0.2.0 structure-align Phase B)', () =
     expect(placeholders.every((n) => n.title.includes('权限受限') || n.title.length > 0)).toBe(true);
 
     // Local view keeps ALL rows (placeholder rows have local_path=''
-    // and are naturally skipped by LocalDirTreeView's splitPath, so
+    // and are naturally skipped by the local view's splitPath, so
     // keeping them here is correct and does not produce blank UI rows).
     const local = svc.getTreeDetailed({ view: 'local' });
     expect(local.nodes.map((n) => n.obj_token).sort()).toEqual(['GOOD', 'PH1', 'PH2']);

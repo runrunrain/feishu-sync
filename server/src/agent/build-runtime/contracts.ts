@@ -74,9 +74,6 @@ export const BUILD_MCP_SERVER_NAME = 'feishu-kb-bridge';
 export const BUILD_MCP_URL_ENV = 'FEISHU_SYNC_BUILD_MCP_URL';
 export const BUILD_MCP_TOKEN_ENV = 'FEISHU_SYNC_BUILD_MCP_TOKEN';
 
-/** 子任务唯一写面：报告目录（设计 §3.1/§3.4）。 */
-export const REPORT_WRITE_GLOB = 'agent-outputs/**';
-
 /** thinking 档位合法值（amagi model-resolver VALID_THINKING_LEVELS）。 */
 export const VALID_THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
 export type ThinkingLevel = (typeof VALID_THINKING_LEVELS)[number];
@@ -360,12 +357,6 @@ export interface ProbeInput {
 }
 
 // ── 纯校验（供 spec 构造方与能力探测共用）────────────────────────────
-
-export class BuildSpecValidationError extends Error {
-  constructor(message: string, readonly fields: string[]) {
-    super(message);
-  }
-}
 
 function stripThinkingSuffix(spec: string): string {
   const colon = spec.lastIndexOf(':');

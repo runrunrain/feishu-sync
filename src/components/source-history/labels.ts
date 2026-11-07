@@ -1,12 +1,11 @@
 /**
- * 回滚 UI 纯函数（P0-S5）——文案映射与门控判定，供写回记录抽屉 /
- * 云端历史抽屉 / 回滚弹窗共用；独立成文件便于单测锚定（SSR 同法）。
+ * 回滚/写回展示纯函数（P0-S5）——文案映射与门控判定；独立成文件便于单测
+ * 锚定（SSR 同法）。formatTime 供移出记录/节点详情等共用；其余判定函数
+ * 与 cloud history / revert 契约（CLI/HTTP 入口）对齐，经 labels.test 锚定。
  */
 
 import type {
   CloudHistoryEntry,
-  HistoryRevertBlockedReason,
-  HistoryRevertWarning,
   SourcePushLogRecord,
 } from '../../types';
 
@@ -18,18 +17,6 @@ export function deriveRevertConfirmValue(historyVersionId: string): string {
 // ---------------------------------------------------------------------------
 // 写回记录行
 // ---------------------------------------------------------------------------
-
-export const PUSH_MODE_LABEL: Record<string, string> = {
-  append: '追加',
-  overwrite: '覆盖',
-  revert: '回滚',
-};
-
-export const PUSH_ACTOR_LABEL: Record<string, string> = {
-  ui: '界面',
-  cli: '命令行',
-  agent: 'Agent',
-};
 
 /** outcome 四态徽标（任务书）+ started 过渡态。 */
 export function pushOutcomeBadge(outcome: string): { text: string; status: 'success' | 'error' | 'neutral' | 'warning' | 'loading' } {
@@ -132,25 +119,8 @@ export function canRevertHistoryEntry(entry: CloudHistoryEntry, isGlobalLatest: 
 }
 
 // ---------------------------------------------------------------------------
-// 回滚弹窗文案
+// 回滚门控文案
 // ---------------------------------------------------------------------------
-
-export const REVERT_WARNING_TEXT: Record<HistoryRevertWarning, string> = {
-  anchor_inexact: '回滚点早于写前状态：回滚会一并撤销锚点之后、写回之前的云端修改',
-  cloud_changed_since_push: '云端在本次写回之后有新的修改：回滚将丢弃这些修改',
-  cloud_time_unreadable: '云端修改时间不可读：无法判断写回后云端是否又被修改，请先到飞书核对',
-};
-
-export const REVERT_BLOCKED_TEXT: Record<HistoryRevertBlockedReason, string> = {
-  write_disabled: '写回飞书未开启：前往「设置 → 飞书认证 → 飞书写入」开启后再回滚',
-  scope_missing: '缺少写回权限：前往「设置 → 飞书写入 → 授权写入权限」后重试',
-  local_edit_pending: '该文档有未写回的本地修改：请先写回或放弃本地修改，再回滚云端历史',
-  kb_build_active: '标准库构建进行中，暂不能回滚（构建结束或取消后再试）',
-  cloud_revert_running: '该文档有进行中的云端回滚，请等待完成后再操作',
-  anchor_missing: '该写回记录没有可用的回退锚点（写回时未取得云端历史锚点），无法回滚',
-  history_not_found: '目标历史版本不在云端历史前 3 页（60 条）内：版本过旧或已被清理',
-  invalid_target: '最新历史条目不可作回滚目标：请选择更早的历史版本',
-};
 
 /** 时间展示：ISO → 本地可读（失败回落原文）。 */
 export function formatTime(iso: string | null | undefined): string {

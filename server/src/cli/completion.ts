@@ -13,8 +13,6 @@ import { GLOBAL_FLAGS } from './help.js';
 
 export type CompletionShell = 'bash' | 'zsh' | 'fish';
 
-export const COMPLETION_SHELLS: readonly CompletionShell[] = ['bash', 'zsh', 'fish'];
-
 export function renderCompletionUsage(): string {
   return [
     'feishu-sync completion —— 生成 shell 补全脚本（本地命令，不连服务器）',

@@ -19,6 +19,7 @@
  *   npx tsx scripts/sync-latest.ts --apply                 # real write
  *   npx tsx scripts/sync-latest.ts --apply --root designer
  *   npx tsx scripts/sync-latest.ts --persist-config         # explicit config migration
+ *   npx tsx scripts/sync-latest.ts --kb /abs/formal-kb      # first run on a new machine
  */
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
@@ -40,8 +41,23 @@ import type {
   WatchedRootConfig,
 } from '../src/types/index.js';
 
-const DEFAULT_FORMAL_KB =
-  '/Users/maorun/maorun-workpace/weixiao-database/飞书同步知识库';
+/**
+ * 正式知识库根目录不再内建机器相关默认值，按以下顺序解析：
+ * FORMAL_KB 环境变量与 --kb 参数（后者优先）→ 已有 config.json 的 knowledgeBaseRoot。
+ * 三者皆缺（典型为首次运行）时给出明确报错，避免静默指向错误目录。
+ */
+function readConfiguredKbRoot(configPath: string): string | null {
+  if (!fs.existsSync(configPath)) return null;
+  try {
+    const raw: unknown = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    const knowledgeBaseRoot = isRecord(raw) ? raw.knowledgeBaseRoot : undefined;
+    return typeof knowledgeBaseRoot === 'string' && knowledgeBaseRoot.trim().length > 0
+      ? knowledgeBaseRoot
+      : null;
+  } catch {
+    return null;
+  }
+}
 
 export const REQUIRED_SCOPES = [
   'wiki:node:retrieve',
@@ -117,6 +133,7 @@ export interface SyncLatestArgs {
   skipIndex: boolean;
   maxDocs: number;
   persistConfig: boolean;
+  kbRoot: string | null;
   help: boolean;
 }
 
@@ -408,6 +425,7 @@ export function parseArgs(argv: string[]): SyncLatestArgs {
   let skipIndex = false;
   let maxDocs = 0;
   let persistConfig = false;
+  let kbRoot: string | null = null;
   let help = false;
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -415,7 +433,13 @@ export function parseArgs(argv: string[]): SyncLatestArgs {
     if (arg === '--apply') apply = true;
     else if (arg === '--skip-index') skipIndex = true;
     else if (arg === '--persist-config') persistConfig = true;
-    else if (arg === '--root') {
+    else if (arg === '--kb') {
+      const value = argv[++i];
+      if (!value || !path.isAbsolute(value)) {
+        throw new Error('--kb 需要正式知识库根目录的绝对路径');
+      }
+      kbRoot = value;
+    } else if (arg === '--root') {
       const value = argv[++i];
       if (!value) throw new Error('--root 需要 designer|dev|spec|guide 或 root id');
       rootFilter = value;
@@ -431,14 +455,15 @@ export function parseArgs(argv: string[]): SyncLatestArgs {
       throw new Error(`未知参数: ${arg}`);
     }
   }
-  return { apply, rootFilter, skipIndex, maxDocs, persistConfig, help };
+  return { apply, rootFilter, skipIndex, maxDocs, persistConfig, kbRoot, help };
 }
 
 function usage(): string {
   return [
-    'Usage: sync-latest [--apply] [--root designer|dev|spec|guide|<id>] [--max N] [--skip-index] [--persist-config]',
+    'Usage: sync-latest [--apply] [--root designer|dev|spec|guide|<id>] [--max N] [--skip-index] [--persist-config] [--kb <绝对路径>]',
     '  默认只合并运行时配置，不改写已有 config.json。',
     '  --persist-config 显式将正式 KB、四个 roots 和所需 scopes 原子写入现有 config.json。',
+    '  正式知识库根目录解析顺序：FORMAL_KB 环境变量 → --kb → 已有 config.json 的 knowledgeBaseRoot；首次运行需显式指定其一。',
   ].join('\n');
 }
 
@@ -474,19 +499,27 @@ export function selectWritablePlans(
   return { writable, moves, blocked };
 }
 
-function resolveRuntimePaths(): {
+function resolveRuntimePaths(kbRootArg: string | null): {
   formalKb: string;
   configDir: string;
   configPath: string;
   dbPath: string;
   operationsDir: string;
 } {
-  const formalKb = process.env.FORMAL_KB || DEFAULT_FORMAL_KB;
   const configDir = process.env.FEISHU_SYNC_HOME || path.join(os.homedir(), '.feishu-sync');
+  const configPath = path.join(configDir, 'config.json');
+  const formalKb =
+    kbRootArg || process.env.FORMAL_KB || readConfiguredKbRoot(configPath);
+  if (!formalKb) {
+    throw new Error(
+      '未指定正式知识库根目录：请用 --kb <绝对路径> 或 FORMAL_KB 环境变量指定，' +
+        `或先在 ${configPath} 中配置 knowledgeBaseRoot（首次运行需显式指定其一）`,
+    );
+  }
   return {
     formalKb,
     configDir,
-    configPath: path.join(configDir, 'config.json'),
+    configPath,
     dbPath: path.join(configDir, 'feishu-sync.db'),
     operationsDir: path.join(configDir, 'operations'),
   };
@@ -510,7 +543,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     return;
   }
 
-  const paths = resolveRuntimePaths();
+  const paths = resolveRuntimePaths(args.kbRoot);
   const prepared = prepareSyncLatestConfig({
     configPath: paths.configPath,
     operationsDir: paths.operationsDir,

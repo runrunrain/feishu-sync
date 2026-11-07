@@ -44,8 +44,6 @@ import type {
   CloudHistoryListResult,
   HistoryRevertPlan,
   HistoryRevertExecutionResult,
-  MoveOutPreview,
-  MoveOutExecutionResult,
   CloudMoveRecord,
 } from '../types';
 import type {
@@ -1911,41 +1909,8 @@ export function executeHistoryRevert(
 }
 
 // ---------------------------------------------------------------------------
-// P2-S7 移出 UI（消费 P2-S6 四端点：preview / 执行 / moves/:id / moves）
+// 移出记录查询（写入端点已 410 feature_removed；保留只读与核对面）
 // ---------------------------------------------------------------------------
-
-/**
- * POST /api/sources/:objToken/move-to-drive/preview —— 移出预览（只读）。
- * 返回权威 wikiNodeToken（确认值派生源）+ 门控面 + 后果固定文案。
- */
-export function previewMoveToDrive(
-  objToken: string,
-  opts?: { folderToken?: string },
-): Promise<MoveOutPreview> {
-  return request<MoveOutPreview>(`/api/sources/${encodeURIComponent(objToken)}/move-to-drive/preview`, {
-    method: 'POST',
-    body: JSON.stringify({ folderToken: opts?.folderToken ?? null }),
-  });
-}
-
-/**
- * POST /api/sources/:objToken/move-to-drive —— 执行移出（destructive 逐次
- * 确认）。confirm 必须是 `MOVE_OUT:<nodeToken>`（裸 MOVE_OUT 拒 400）；
- * 异步起步返回 202 { state:'moving', moveId, taskId }，同步完成 200。
- */
-export function executeMoveToDrive(
-  objToken: string,
-  confirm: string,
-  opts?: { folderToken?: string },
-): Promise<MoveOutExecutionResult> {
-  return request<MoveOutExecutionResult>(
-    `/api/sources/${encodeURIComponent(objToken)}/move-to-drive`,
-    {
-      method: 'POST',
-      body: JSON.stringify({ folderToken: opts?.folderToken ?? null, confirm, actor: 'ui' }),
-    },
-  );
-}
 
 /** GET /api/sources/moves/:moveId —— 单条移出记录（异步收敛轮询）。 */
 export function getCloudMove(moveId: string): Promise<CloudMoveRecord> {

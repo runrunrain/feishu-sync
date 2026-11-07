@@ -747,11 +747,11 @@ export interface DocumentComments {
 }
 
 /**
- * Local directory tree node used by LocalDirTreeView (D2).
+ * Local directory tree node (D2).
  *
  * Built client-side by splitting `local_path` on '/' and reassembling the
- * directory tree. The shape is intentionally recursive so the React
- * component can render with a single recursive function.
+ * directory tree. The shape is intentionally recursive so a view can render
+ * it with a single recursive function.
  */
 export interface LocalDirTreeNode {
   type: 'dir' | 'file';

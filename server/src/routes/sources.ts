@@ -215,15 +215,4 @@ export function sourcesRoutes(deps: SourcesRoutesDeps) {
   return routes;
 }
 
-/** 供 index.ts 构造服务实例（S12 写回链与 S13 UI 复用同一实例/锁）。 */
-export function createSourceEditService(deps: SourcesRoutesDeps): SourceEditService {
-  return new SourceEditService({
-    config: deps.configManager,
-    store: deps.localMapStore,
-    locks: deps.locks ?? sharedSourceWriteLock,
-    kbBuild: deps.kbBuild,
-    dataRoot: deps.dataRoot,
-  });
-}
-
 export type { SourceEditStateDto };

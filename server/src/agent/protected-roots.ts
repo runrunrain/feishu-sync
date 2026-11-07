@@ -14,7 +14,6 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { serverDistRoot } from './agent-assets.js';
-import { checkRootOverlap } from './path-guard.js';
 import type { PiRuntimeResolver } from './runtime-resolver.js';
 
 export interface ProtectedRootsContext {
@@ -153,50 +152,4 @@ export function collectResolvedRuntimeProtectedRoots(
   resolver: Pick<PiRuntimeResolver, 'getResolvedRuntimes'>,
 ): string[] {
   return [...new Set(resolver.getResolvedRuntimes().flatMap(collectRuntimeProtectedRoots))];
-}
-
-/** 全量受保护根 = 静态 + 运行时（调用方先完成 runtime 发现）。 */
-export function collectAllProtectedRoots(
-  runtime: { nodePath: string | null | undefined; piPackageRoot: string | null | undefined; claudeCliPath?: string | null },
-  context: ProtectedRootsContext = {},
-): string[] {
-  return [...collectStaticProtectedRoots(context), ...collectRuntimeProtectedRoots(runtime)];
-}
-
-export interface WorkspaceConflictDetail {
-  field: string;
-  message: string;
-}
-
-/**
- * R02：已授权 Workspace 与合并后配置的交叉校验。任一 workspace 与
- * knowledgeBaseRoot / outputRoot / dataRoot / 受保护运行资源重叠即返回
- * 冲突明细（保存方拒绝落盘，避免冲突配置导致后续同步启动失败或静默
- * 提权）。只做重叠判定，不要求 workspace 目录仍存在（目录被删不算冲突）。
- */
-export function validateWorkspacesAgainstConfig(input: {
-  workspaces: Array<{ id: string; name: string; path: string }>;
-  knowledgeBaseRoot: string;
-  outputRoot: string;
-  dataRoot: string;
-  extraProtectedRoots?: string[];
-}): WorkspaceConflictDetail[] {
-  const details: WorkspaceConflictDetail[] = [];
-  const staticRoots = collectStaticProtectedRoots();
-  for (const workspace of input.workspaces) {
-    if (!workspace.path) continue;
-    const verdict = checkRootOverlap(workspace.path, {
-      knowledgeBaseRoot: input.knowledgeBaseRoot,
-      outputRoot: input.outputRoot,
-      dataRoot: input.dataRoot,
-      protectedRoots: [...staticRoots, ...(input.extraProtectedRoots ?? [])],
-    });
-    if (!verdict.ok) {
-      details.push({
-        field: `agent.workspaces[${workspace.id}]`,
-        message: `Workspace「${workspace.name}」与新配置冲突：${verdict.message}`,
-      });
-    }
-  }
-  return details;
 }
