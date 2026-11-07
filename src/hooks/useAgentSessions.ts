@@ -72,7 +72,7 @@ export interface WriteRecord {
 }
 
 /** 会话内待裁决的批准请求（S10：app_command 挂起流）。 */
-export function isAgentApprovalDto(value: unknown): value is AgentApprovalDto {
+function isAgentApprovalDto(value: unknown): value is AgentApprovalDto {
   if (!value || typeof value !== 'object') return false;
   const approval = value as Partial<AgentApprovalDto>;
   return typeof approval.id === 'string' && approval.id.length > 0
@@ -243,7 +243,7 @@ export function reconcileMessageSnapshot(previous: AgentMessageDto[], incoming: 
 }
 
 /** argsSummary/resultSummary 内提取首个路径样 token（server 生成，含路径）。导出供单测。 */
-export function extractPath(summary: string): string {
+function extractPath(summary: string): string {
   // 前导允许空白/引号/全角冒号等包围字符，兼容「路径：/x」与 "path": "/x" 摘要风格。
   const m = new RegExp("(?:^|[\\s'\"「：:（(])(\\/[^\\s'\"」（）)]{2,}|[A-Za-z]:\\\\[^\\s'\"」（）)]{2,})").exec(summary);
   return m ? m[1] : '';

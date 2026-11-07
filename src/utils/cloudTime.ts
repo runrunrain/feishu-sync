@@ -7,7 +7,7 @@
  * which is then incorrectly rendered as 1970-01-01. Keep this conversion in
  * one place so every change list renders the same, real cloud timestamp.
  */
-export function toCloudEpochMilliseconds(value: string | number | null | undefined): number | null {
+function toCloudEpochMilliseconds(value: string | number | null | undefined): number | null {
   if (value == null) return null;
 
   const raw = String(value).trim();

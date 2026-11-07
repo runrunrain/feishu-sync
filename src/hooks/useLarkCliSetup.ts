@@ -27,7 +27,7 @@ import {
   type LarkCliToolStatus,
 } from '../api/client';
 
-export type DeviceAuthPhase =
+type DeviceAuthPhase =
   | 'idle'
   | 'starting'
   | 'waiting'
@@ -36,7 +36,7 @@ export type DeviceAuthPhase =
   | 'success'
   | 'failed';
 
-export type ConfigInitPhase =
+type ConfigInitPhase =
   | 'idle'
   | 'starting'
   | 'waiting'
@@ -44,7 +44,7 @@ export type ConfigInitPhase =
   | 'success'
   | 'failed';
 
-export interface ActiveDeviceAuthSession extends DeviceAuthStartResult {
+interface ActiveDeviceAuthSession extends DeviceAuthStartResult {
   /** 本地计算的过期时刻（ms epoch），等待 UI 据此展示剩余时间。 */
   expiresAt: number;
 }
@@ -82,7 +82,7 @@ function openInBrowser(url: string): void {
   window.open(url, '_blank', 'noopener');
 }
 
-export interface UseLarkCliSetupResult {
+interface UseLarkCliSetupResult {
   toolStatus: LarkCliToolStatus | null;
   statusLoading: boolean;
   statusError: string | null;

@@ -24,7 +24,7 @@ export const THINKING_LABELS: Record<AgentThinkingLevel, string> = {
 const THINKING_LEVEL_SET = new Set<string>(Object.keys(THINKING_LABELS));
 
 /** 角色模型下拉中「引用的预设已不存在/未启用」占位 value（不可选中）。 */
-export const MISSING_PRESET_VALUE = '__missing__';
+const MISSING_PRESET_VALUE = '__missing__';
 
 const FALLBACK_STANDARD_KB: StandardKbConfig = {
   outputRoot: '', retainReleases: 3, buildBatchSize: 10, buildBatchWordBudget: 40_000,
@@ -32,7 +32,7 @@ const FALLBACK_STANDARD_KB: StandardKbConfig = {
   orchestrationMode: 'pi-amagi',
 };
 
-export interface BuildOrchestrationIssue {
+interface BuildOrchestrationIssue {
   field: string;
   message: string;
 }

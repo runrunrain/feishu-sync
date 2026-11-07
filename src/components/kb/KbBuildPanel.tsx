@@ -28,6 +28,7 @@ import {
 } from 'lucide-react';
 import { Button } from '../common/Button';
 import { getKbBuild } from '../../api/client';
+import { BuildMetricsPanel } from '../knowledge/BuildMetricsPanel';
 import { BuildOrchestrationProgress } from '../knowledge/BuildOrchestrationProgress';
 import {
   KB_BUILD_ACTIVE_STEPS,
@@ -249,6 +250,10 @@ export function KbBuildPanel({
 
       {/* T5b：编排流水进度（审查/整合/最终复核任务视图 + awaiting_release 确认）。旧式构建降级说明行。 */}
       <BuildOrchestrationProgress build={view} onBuildUpdated={onBuildUpdated} />
+
+      {/* 构建度量（只读）：metrics_json 只在构建收口时写入，非终态不展示；
+          无 orchestration 段的旧采集/非 pi-amagi 构建由面板内降级说明行说明。 */}
+      {isTerminal ? <BuildMetricsPanel build={view} /> : null}
 
       {/* S4/S5 并行进度：单元计数 + worker 列表 + 图片维度（有数据才渲染） */}
       {showParallelStrip ? (

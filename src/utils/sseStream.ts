@@ -143,7 +143,7 @@ async function buildSseRequest(
   });
 }
 
-export interface SseConnectionOptions {
+interface SseConnectionOptions {
   endpoint: string;
   /** 从已加载的状态快照继续，避免重放恢复前的旧终态。 */
   initialLastEventId?: string;

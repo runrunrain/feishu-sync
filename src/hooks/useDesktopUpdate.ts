@@ -25,7 +25,7 @@ import type {
 // 构建时由 vite 注入（package.json version），浏览器及开发环境兜底。
 declare const __APP_VERSION__: string;
 
-export interface DesktopUpdateContextValue {
+interface DesktopUpdateContextValue {
   /** 当前版本号（形如 'v0.3.7'） */
   currentVersion: string;
   /** 最新版本号（形如 'v0.3.8' 或 null） */
@@ -295,7 +295,7 @@ export function useDesktopUpdate(): DesktopUpdateContextValue {
 /**
  * 保持向后兼容：TopBar 等位置使用的轻量徽标 hook
  */
-export interface DesktopUpdateBadge {
+interface DesktopUpdateBadge {
   availableVersion: string | null;
 }
 

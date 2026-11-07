@@ -1,4 +1,4 @@
-export interface SelectionNode { obj_token: string; wiki_node_token: string | null; parent_node_token: string | null }
+interface SelectionNode { obj_token: string; wiki_node_token: string | null; parent_node_token: string | null }
 /** 收起/搜索不改变子树范围；去重并容忍脏父链循环。 */
 export function createSelectionResolver(nodes: SelectionNode[]) {
   const children = new Map<string, SelectionNode[]>(); const records = new Map(nodes.map((node) => [node.obj_token, node]));

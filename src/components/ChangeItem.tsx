@@ -42,7 +42,7 @@ import type { ChangedDocument, SheetSub } from '../types';
 import { formatCloudModifiedTime } from '../utils/cloudTime';
 import { unsupportedCloudTypeText } from '../utils/cloudObjType';
 
-export interface ChangeItemProps {
+interface ChangeItemProps {
   change: ChangedDocument;
   selected: boolean;
   onToggleSelect: (objToken: string) => void;

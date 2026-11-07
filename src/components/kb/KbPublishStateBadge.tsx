@@ -9,7 +9,7 @@
 import { ExternalLink } from 'lucide-react';
 import { publishStateMeta, TREE_BADGE_STATES } from '../../utils/kbPublish';
 
-export interface KbPublishStateBadgeProps {
+interface KbPublishStateBadgeProps {
   state: string;
   /** 窄场景（目录树行内）用短标签。 */
   compact?: boolean;

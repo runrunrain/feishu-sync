@@ -30,7 +30,7 @@ import { APIError } from '../api/client';
 export const SLIDES_SCREENSHOT_SCOPE = 'slides:presentation:screenshot';
 
 /** server 侧 svg 导出超时缺省（P0-S6：缺省回落执行层预算 30s）。 */
-export const WHITEBOARD_SVG_TIMEOUT_DEFAULT_MS = 30_000;
+const WHITEBOARD_SVG_TIMEOUT_DEFAULT_MS = 30_000;
 
 /** svgTimeoutMs 输入即时反馈（null = 合法可直接保存）。导出供单测锚定。 */
 export function describeSvgTimeoutInput(

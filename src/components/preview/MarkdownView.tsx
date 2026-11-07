@@ -699,14 +699,14 @@ type TableAlign = 'left' | 'center' | 'right';
 
 /** 列表项数据：ordered/num 记录逐项标记类型与起始序号（D6/D7），
  *  供渲染层按缩进递归构嵌套树。 */
-export interface ListItemData {
+interface ListItemData {
   indent: number;
   text: string;
   ordered: boolean;
   num?: number;
 }
 
-export type Block =
+type Block =
   | { type: 'heading'; level: number; text: string }
   | { type: 'code'; lang: string; lines: string[] }
   | { type: 'table'; header: string[]; aligns: TableAlign[]; rows: string[][] }
@@ -1448,7 +1448,7 @@ function renderBlock(block: Block, index: number, ctx: InlineContext): ReactNode
 // 组件出口
 // ---------------------------------------------------------------------------
 
-export interface MarkdownViewProps {
+interface MarkdownViewProps {
   content: string;
   /** md 文件所在目录（kbRoot 相对 POSIX 路径），用于解析相对图片路径。 */
   baseDir?: string;

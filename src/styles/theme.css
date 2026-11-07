@@ -57,7 +57,6 @@
   --font-sans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
   --font-mono: "Consolas", "SF Mono", "Source Code Pro", monospace;
   /* 语义字体 token（项目内部分层用，非源码主流引用），同平台分栈 */
-  --font-display: "Kaiti SC", "STKaiti", "Microsoft YaHei", "PingFang SC", sans-serif;
   --font-body: "Noto Serif SC", "Source Han Serif SC", "Songti SC", "Microsoft YaHei", "PingFang SC", sans-serif;
 }
 

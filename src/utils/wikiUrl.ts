@@ -27,7 +27,7 @@ const FEISHU_WIKI_URL_PATTERN =
  * @param url - candidate URL (may be empty / undefined)
  * @returns `true` only when the URL matches the wiki contract.
  */
-export function isValidFeishuWikiUrl(url: string | null | undefined): boolean {
+function isValidFeishuWikiUrl(url: string | null | undefined): boolean {
   if (!url || typeof url !== 'string') return false;
   const trimmed = url.trim();
   if (trimmed.length === 0) return false;

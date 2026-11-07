@@ -8,7 +8,7 @@
 
 import { decodeHtmlEntities } from './html-table';
 
-export interface ParsedCite {
+interface ParsedCite {
   docId: string | null;
   title: string | null;
   fileType: string | null;

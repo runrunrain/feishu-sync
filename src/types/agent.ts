@@ -304,6 +304,128 @@ export interface KbBuildWarning {
   message: string;
 }
 
+// ---------------------------------------------------------------------------
+// 构建度量（S1/S2/WP-F：kb_builds.metrics_json 对象形状）——镜像
+// server/src/types/agent-knowledge.ts 的同名类型（字段一致、只镜像 UI 消费面；
+// 语义与口径注释以 server 侧为准，此处只留指路说明）。
+// ---------------------------------------------------------------------------
+
+/** token 用量累计；运行时事件不携带用量时为 null（如实未采集，不编造）。 */
+export interface KbBuildTokenUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+}
+
+/** 阶段角色：write 首写 / review 独立审查 / revise 定向修订 / integrate 整合 / final 最终复核 / plan 组织规划。 */
+export type KbBuildMetricsPhaseRole = 'write' | 'review' | 'revise' | 'integrate' | 'final' | 'plan';
+
+/** 单元规模条目（words 仅 buildBatchWordBudget>0 时统计，否则为 0）。 */
+export interface KbBuildMetricsUnit {
+  unitId: string;
+  sources: number;
+  words: number;
+  bytes: number;
+}
+
+/** 一轮模型执行的起止与时长。 */
+export interface KbBuildMetricsPhase {
+  unitId: string | null;
+  role: KbBuildMetricsPhaseRole;
+  round: number;
+  startedAt: string;
+  finishedAt: string;
+  ms: number;
+}
+
+/** 单次机械预检的发现计数（每审查主体一条）。 */
+export interface KbBuildMetricsPrecheck {
+  unitId: string | null;
+  scope: 'unit' | 'integration';
+  findingsByKind: { number_missing: number; number_added: number; condition_dropped: number; term_variant: number };
+  truncated: number;
+}
+
+/** S1 构建度量对象（随 kb_builds.metrics_json 持久化）。 */
+export interface KbBuildMetrics {
+  units: { total: number; perUnit: KbBuildMetricsUnit[]; maxWordsShare: number | null };
+  phases: KbBuildMetricsPhase[];
+  /** 超过采集/聚合上限被丢弃的阶段条数（additive 可选：未截断不带此字段） */
+  phasesDropped?: number;
+  queueWaits: { count: number; totalMs: number; maxMs: number };
+  review: { blocking: number; suggestion: number; revisions: number };
+  /** null = 本次构建无用量来源（禁止编造数值） */
+  tokenUsage: KbBuildTokenUsage | null;
+  /** writer/reviewer 同 provider+model；无法判定为 null */
+  reviewerSameModelAsWriter: boolean | null;
+  /** additive 可选：开关关闭的旧 metrics_json 不带此字段。 */
+  precheck?: KbBuildMetricsPrecheck[];
+  /** WP-F：pi-amagi 编排构建度量段。additive 可选：legacy 流水与旧
+   *  metrics_json 不带此字段（无该段 = 旧采集或非 pi-amagi）。 */
+  orchestration?: KbBuildMetricsOrchestration;
+}
+
+/**
+ * WP-F pi-amagi 编排度量（metrics_json 的 orchestration 段）。数据来源全部
+ * 为服务端权威落盘记录；无法推导的字段如实省略或置 null（notes 说明缺口），
+ * 禁止编造数值——前端展示同样不得把 null 冒充 0。
+ */
+export interface KbBuildMetricsOrchestration {
+  /** 构建墙钟（started_at → finished_at；未收口终态按采集时刻，notes 注明）。 */
+  wallClockMs: number;
+  /** 本轮产出文档数（docs_written）与工作集源数（source_total）。 */
+  docsPublished: number;
+  sourcesTotal: number;
+  /** 按角色派发计数（luban 写作 / diting 独立审查 / baize 调研；含 resume
+   *  续接身份）。null = actors.json 不可得；真实空数组 = 0。 */
+  authorDispatches: number | null;
+  reviewDispatches: number | null;
+  researchDispatches: number | null;
+  /** 每篇文档审查轮数分布与首审结论。null = reviews.json 不可得。 */
+  revisionRounds: {
+    /** 收到至少一次（有范围）审查的文档数 */
+    docsReviewed: number;
+    /** 有范围审查回执总数 */
+    totalReviews: number;
+    /** 每篇文档审查次数中位数（无审查 → null） */
+    roundsMedian: number | null;
+    roundsMax: number | null;
+    /** 每篇文档首审（最早回执）结论计数（未识别 verdict 不计入） */
+    firstVerdicts: { pass: number; needs_revision: number; insufficient_material: number; fail: number };
+    /** 首审 pass 的文档占比（docsReviewed=0 → null） */
+    firstPassRate: number | null;
+  } | null;
+  /** 发布门拒绝计数（按 reason 计，缺 reason 计 unknown）。空对象 = 真实
+   *  无拒绝；null = 文件不可得（不冒充「无拒绝」）。 */
+  publishRejections: Record<string, number> | null;
+  /** 派发守卫拒绝计数。additive 可选：记录文件不可得（WP-F 之前的旧构建）
+   *  不带此键，不编造；空对象 = 真实无拒绝。 */
+  dispatchRejections?: Record<string, number>;
+  /** 模型池并发（推导口径见 derivation；无来源 → peak/avg null）。 */
+  pool: {
+    peakInflight: number | null;
+    /** 时间加权平均运行并发（窗口=首个 session → 最后一次 settle） */
+    avgInflight: number | null;
+    /** 推导口径：journal-session=审计 session→settle 区间；actor-events=
+     *  账本事件近似（含排队间隙）；none=无来源 */
+    derivation: 'journal-session' | 'actor-events' | 'none';
+    /** 派发在途（dispatch→最终 settle，含排队）并发峰值/均值。additive
+     *  可选：无 journal 时省略。 */
+    submittedPeakInflight?: number | null;
+    submittedAvgInflight?: number | null;
+  };
+  /** 每篇文档首稿→发布结算耗时分布（nearest-rank 分位）。additive 可选：
+   *  receipts 可读且到达发布才带此键（不可得/未发布省略并在 notes 注明）。 */
+  firstDraftToPublish?: {
+    count: number;
+    p50Ms: number;
+    p90Ms: number;
+    maxMs: number;
+  };
+  /** 数据缺口/口径说明（人读）；无缺口不带键。 */
+  notes?: string[];
+}
+
 export interface KbBuildDto {
   id: string;
   mode: 'incremental' | 'full';
@@ -328,6 +450,9 @@ export interface KbBuildDto {
   parallelism: number;
   /** S4：构建警告（如 images_unavailable） */
   warnings: KbBuildWarning[];
+  /** S1（构建编排优化 §3）：构建度量（可选——旧记录无 metrics_json 时缺省；
+   *  服务端 toDto 解析失败/空值也缺省，不冒充空对象）。 */
+  metrics?: KbBuildMetrics | null;
   error: null | { code: string; message: string };
   createdAt: string;
   startedAt: string | null;

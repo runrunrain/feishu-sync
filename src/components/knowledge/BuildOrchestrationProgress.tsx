@@ -46,29 +46,29 @@ const ORCHESTRATION_POLL_INTERVAL_MS = 2_500;
 
 /** amagi 执行状态已知值中文映射；未知值原样展示（不猜测语义）。
  *  'error' 为真实链路实测出现的 native 状态（子进程/执行异常终态）。 */
-export const LEADER_EXEC_STATE_LABEL: Record<string, string> = {
+const LEADER_EXEC_STATE_LABEL: Record<string, string> = {
   queued: '排队', running: '已派发', done: '完成', failed: '失败', cancelled: '已取消', error: '异常',
 };
 
 /** 任务身份状态（ActorBinding 监督快照）。 */
-export const LEADER_ACTOR_STATUS_LABEL: Record<string, string> = {
+const LEADER_ACTOR_STATUS_LABEL: Record<string, string> = {
   pending: '身份待确认', confirmed: '已确认', revoked: '已撤销',
 };
 
 /** 恢复能力三态（集成侧 resumeCapability：session/artifact/none）。 */
-export const LEADER_RESUME_CAPABILITY_LABEL: Record<string, string> = {
+const LEADER_RESUME_CAPABILITY_LABEL: Record<string, string> = {
   session: '可原会话续接',
   artifact: '成果级恢复（重建剩余工作）',
   none: '不支持恢复',
 };
 
 /** amagi 角色中文名（未知角色原样展示）。 */
-export const LEADER_ROLE_LABEL: Record<string, string> = {
+const LEADER_ROLE_LABEL: Record<string, string> = {
   luban: '鲁班（写作）', diting: '谛听（审查）', baize: '白泽（调研）',
 };
 
 /** 发布申请裁定状态（集成侧 LeaderPublishRequestSnapshot.status）。 */
-export const LEADER_PUBLISH_STATUS_LABEL: Record<string, string> = {
+const LEADER_PUBLISH_STATUS_LABEL: Record<string, string> = {
   pending: '待裁定', accepted: '已接受', rejected: '已拒绝', not_wired: '发布管线未接线',
 };
 
@@ -81,13 +81,13 @@ const ROLE_GROUPS: Array<{ key: string; label: string }> = [
   { key: 'final_review', label: '最终复核' },
 ];
 
-export const ORCH_EXEC_LABEL: Record<string, string> = {
+const ORCH_EXEC_LABEL: Record<string, string> = {
   queued: '排队', running: '执行中', done: '完成', failed: '失败', cancelled: '已取消',
 };
-export const ORCH_ARTIFACT_LABEL: Record<string, string> = {
+const ORCH_ARTIFACT_LABEL: Record<string, string> = {
   pending: '待生成', available: '可用', missing: '缺失', incomplete: '不完整',
 };
-export const ORCH_ACCEPTANCE_LABEL: Record<string, string> = {
+const ORCH_ACCEPTANCE_LABEL: Record<string, string> = {
   unreviewed: '待审', needs_revision: '需修订', passed: '通过', pending_decision: '待裁定',
 };
 
@@ -119,7 +119,7 @@ function acceptanceTone(state: string): BadgeTone {
 }
 
 /** 等待原因三分类（依赖未满足=waitingOn 非空；名额等待=就绪未获槽；等待人工=待裁定）。 */
-export function waitingReasonOf(
+function waitingReasonOf(
   task: Pick<KbBuildOrchestrationTaskDto, 'execState' | 'acceptanceState' | 'waitingOn'>,
 ): { label: string; tone: BadgeTone; kind: 'dependency' | 'capacity' | 'human' } | null {
   if (task.acceptanceState === 'pending_decision') {
@@ -135,7 +135,7 @@ export function waitingReasonOf(
 }
 
 /** 角色模型显示：''=跟随活跃预设；thinking off/缺省不显示。 */
-export function orchModelLabel(model: { modelPresetId: string; thinking?: string }): string {
+function orchModelLabel(model: { modelPresetId: string; thinking?: string }): string {
   const preset = model.modelPresetId === '' ? '跟随活跃预设' : model.modelPresetId;
   const thinking = model.thinking && model.thinking !== 'off'
     ? `（${THINKING_LABELS[model.thinking as keyof typeof THINKING_LABELS] ?? model.thinking}）`
@@ -176,7 +176,7 @@ export function BuildOrchestrationProgress({ build, onBuildUpdated }: BuildOrche
 }
 
 /** v2 Leader 监督运行进度（设计 v2 §12；集成切片真实端点消费）。 */
-export function BuildRuntimeProgress({ build }: { build: KbBuildDto }) {
+function BuildRuntimeProgress({ build }: { build: KbBuildDto }) {
   const [data, setData] = useState<KbLeaderRunProgressDto | null>(null);
   const [unavailable, setUnavailable] = useState(false);
   const terminal = TERMINAL_STATUSES.has(build.status);

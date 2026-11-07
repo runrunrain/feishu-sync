@@ -84,7 +84,7 @@ const INPUT_BASE_CLS =
 const INPUT_CLS = `w-full ${INPUT_BASE_CLS}`;
 
 /** 图片理解默认参数（与服务端 buildDefaultAgentVisionConfig 对齐；仅防御性兜底，保存时服务端仍会归一）。 */
-export const DEFAULT_VISION_CONFIG: AgentVisionConfig = {
+const DEFAULT_VISION_CONFIG: AgentVisionConfig = {
   enabled: false,
   concurrency: 3,
   maxImageBytes: 5 * 1024 * 1024,
@@ -104,9 +104,9 @@ export function canTestVision(visionEnabled: boolean, providerId: string, modelI
 /** 每批字数预算取值域边界（与 server normalizeBuildBatchWordBudget 同源；
  *  PUT 未新增拒绝规则，越界值服务端静默钳到边界，前端按同款逻辑先行钳制，
  *  保证「保存将按 N 生效」提示与实际落盘值一致）。导出供单测锚定。 */
-export const BUILD_BATCH_WORD_BUDGET_MIN = 4000;
-export const BUILD_BATCH_WORD_BUDGET_MAX = 400000;
-export const BUILD_BATCH_WORD_BUDGET_DEFAULT = 40000;
+const BUILD_BATCH_WORD_BUDGET_MIN = 4000;
+const BUILD_BATCH_WORD_BUDGET_MAX = 400000;
+const BUILD_BATCH_WORD_BUDGET_DEFAULT = 40000;
 
 /** 对齐 server 链制语义（normalizeBuildBatchWordBudget）：非数字/非有限数
  *  （含空串）→ 缺省 40000；floor 后 ≤0 → 0（按源数分批）；再链到

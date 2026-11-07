@@ -12,9 +12,9 @@ import type {
 } from '../types/kb-publish';
 
 /** 徽标色调（对齐 StatusBadge 的 status 枚举）。 */
-export type PublishBadgeTone = 'success' | 'warning' | 'error' | 'neutral' | 'loading';
+type PublishBadgeTone = 'success' | 'warning' | 'error' | 'neutral' | 'loading';
 
-export interface PublishStateMeta {
+interface PublishStateMeta {
   label: string;
   /** 侧栏树等窄场景的短标签。 */
   short: string;
@@ -22,7 +22,7 @@ export interface PublishStateMeta {
 }
 
 /** 发布状态 → 展示元数据。未知状态（宽松字符串）回退「状态未知」。 */
-export const PUBLISH_STATE_META: Record<string, PublishStateMeta> = {
+const PUBLISH_STATE_META: Record<string, PublishStateMeta> = {
   published: { label: '已发布', short: '已发布', tone: 'success' },
   published_with_warnings: { label: '已发布 · 有警告', short: '警告', tone: 'warning' },
   conflict: { label: '云端冲突', short: '冲突', tone: 'error' },
@@ -53,7 +53,7 @@ export const PUBLISH_ACTION_LABEL: Record<KbPublishPlanItemDto['action'], string
 };
 
 /** 警告 code → 可读文案（缺 text 时兜底；有 text 时优先服务端文案）。 */
-export const PUBLISH_WARNING_TEXT: Record<string, string> = {
+const PUBLISH_WARNING_TEXT: Record<string, string> = {
   link_target_unpublished: '链接目标尚未发布：链接改为纯文字',
   image_not_published: '本地图片不随发布上传：已替换为「图片未发布」占位',
   publish_verify_mismatch: '回读字符数与本地差异过大：可能存在整段丢失或转换异常',

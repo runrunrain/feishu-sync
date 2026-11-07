@@ -43,7 +43,7 @@ export const MOVE_OUT_UNKNOWN_GUIDE =
 // 移出记录状态徽标（moves 列表 / 弹窗结果共用）
 // ---------------------------------------------------------------------------
 
-export type CloudMoveBadgeStatus = 'success' | 'error' | 'warning' | 'neutral' | 'loading';
+type CloudMoveBadgeStatus = 'success' | 'error' | 'warning' | 'neutral' | 'loading';
 
 /** cloud_moves.state 五态 → 徽标文案与色彩（server 状态机 pending→moving→moved/failed/unknown）。 */
 export function cloudMoveStateBadge(state: string): { text: string; status: CloudMoveBadgeStatus } {

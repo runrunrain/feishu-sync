@@ -19,7 +19,7 @@
 
 const FEISHU_WIKI_TOKEN_RE = /\/wiki\/([A-Za-z0-9]+)/;
 
-export interface NormalizedFeishuUrl {
+interface NormalizedFeishuUrl {
   /** Canonical form stored in watchedRootUrls: https://xxx.feishu.cn/wiki/<token> */
   canonical: string;
   /** True if the input had a query string or trailing slash that we stripped. */

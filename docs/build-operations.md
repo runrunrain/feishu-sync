@@ -67,6 +67,8 @@
 
 另有 legacy 段（`units`/`phases`/`queueWaits`/`review`/`precheck` 等）与 `warnings_json` 风险告警（`oversized_unit`/`reviewer_same_model`/`pool_capacity_high`，均不阻断）。
 
+构建度量也展示在应用内构建详情页：标准库页右侧「进度」侧栏（构建进度面板）在构建收口后追加只读「构建度量」区，同一份 `metrics_json`/`warnings_json` 数据；字段缺失或不可推导时如实显示「—/采集不可得」，无 orchestration 段显示降级说明。
+
 **只读报告脚本** `server/scripts/build-metrics-report.ts`：读 `kb_builds` 与权威落盘记录，复用生产端同一聚合函数现场重算，不写任何文件。用法：
 
 ```bash

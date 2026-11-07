@@ -5,12 +5,12 @@
  * 纯函数实现，不依赖 DOMParser / browser runtime，在 Node.js (vitest) / Vite / Electron 均可运行。
  */
 
-export interface HtmlTableCol {
+interface HtmlTableCol {
   span?: number;
   width?: string;
 }
 
-export interface HtmlTableCell {
+interface HtmlTableCell {
   tag: 'th' | 'td';
   colspan?: number;
   rowspan?: number;
@@ -20,7 +20,7 @@ export interface HtmlTableCell {
   content: string;
 }
 
-export interface HtmlTableRow {
+interface HtmlTableRow {
   cells: HtmlTableCell[];
 }
 
@@ -31,7 +31,7 @@ export interface HtmlTableBlock {
   bodyRows: HtmlTableRow[];
 }
 
-export type HtmlTableSegment =
+type HtmlTableSegment =
   | { type: 'text'; content: string }
   | { type: 'table'; raw: string; block: HtmlTableBlock };
 

@@ -4,7 +4,7 @@ import { getAgentStatus, recheckAgentStatus, APIError } from '../api/client';
 import type { AgentStatusDto } from '../types/agent';
 import { CONFIG_UPDATED_EVENT } from './useConfig';
 
-export interface UseAgentStatusResult {
+interface UseAgentStatusResult {
   status: AgentStatusDto | null;
   loading: boolean;
   unreachable: boolean;

@@ -3,7 +3,7 @@ import { getConfig, saveConfig, type ConfigUpdate } from '../api/client';
 import type { Config } from '../types';
 
 type DraftForm = () => ConfigUpdate | null;
-export interface SettingsDraft {
+interface SettingsDraft {
   config: Config | null;
   loading: boolean;
   error: string | null;
@@ -30,7 +30,7 @@ function isObject(value: unknown): value is Record<string, unknown> {
 }
 
 /** Arrays are authoritative lists; object fields merge independently. */
-export function mergeDraft<T>(base: T, patch: unknown): T {
+function mergeDraft<T>(base: T, patch: unknown): T {
   if (!isObject(base) || !isObject(patch)) return patch as T;
   const result: Record<string, unknown> = { ...base };
   for (const [key, value] of Object.entries(patch)) {

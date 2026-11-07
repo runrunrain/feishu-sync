@@ -55,7 +55,7 @@ export function compareSemver(v1?: string | null, v2?: string | null): number {
   return c1 - c2;
 }
 
-export type UpgradeKind = 'major' | 'minor' | 'patch' | 'same' | 'downgrade';
+type UpgradeKind = 'major' | 'minor' | 'patch' | 'same' | 'downgrade';
 
 /**
  * 推导版本升级类型：
@@ -93,7 +93,7 @@ export function getUpgradeKindLabel(kind: UpgradeKind): string {
   }
 }
 
-export interface VersionTipOptions {
+interface VersionTipOptions {
   currentVersion?: string | null;
   latestVersion?: string | null;
   phase?: DesktopUpdatePhase;

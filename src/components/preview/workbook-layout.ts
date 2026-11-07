@@ -1,12 +1,12 @@
 import type { WorkbookCell, WorkbookSheetLayout } from '../../types/workbook';
 
-export function cumulativeSizes(sizes: number[]): number[] {
+function cumulativeSizes(sizes: number[]): number[] {
   const result = [0];
   for (const size of sizes) result.push(result[result.length - 1] + size);
   return result;
 }
 
-export interface PositionedWorkbookCell {
+interface PositionedWorkbookCell {
   cell: WorkbookCell;
   x: number;
   y: number;

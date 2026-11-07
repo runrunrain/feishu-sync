@@ -10,7 +10,7 @@ import { useMemo } from 'react';
 const MAX_ROWS = 200;
 
 /** RFC 4180 风格的 CSV 解析：支持带引号字段、内嵌逗号/换行、双引号转义。 */
-export function parseCsv(text: string): string[][] {
+function parseCsv(text: string): string[][] {
   const rows: string[][] = [];
   let field = '';
   let row: string[] = [];

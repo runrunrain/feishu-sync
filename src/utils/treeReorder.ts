@@ -1,5 +1,5 @@
 import type { MappingNode } from '../types';
-export const sameOrderGroup = (a: MappingNode, b: MappingNode) =>
+const sameOrderGroup = (a: MappingNode, b: MappingNode) =>
   (a.parent_node_token ?? null) === (b.parent_node_token ?? null) && (a.watched_root_url ?? null) === (b.watched_root_url ?? null);
 /** 命中展开子树时归到同级祖先；始终只产生前/后插入，绝不产生inside/reparent。 */
 export function siblingDropTarget(dragged: MappingNode, hovered: MappingNode, byWiki: Map<string, MappingNode>): MappingNode | null {
