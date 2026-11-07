@@ -26,5 +26,5 @@ pause
 exit /b
 
 :no_node
-echo Error: Node.js not found. Install Node.js 18+ from https://nodejs.org/
+echo Error: Node.js not found. Install Node.js 22.19+ (22.x/24.x LTS) from https://nodejs.org/
 pause

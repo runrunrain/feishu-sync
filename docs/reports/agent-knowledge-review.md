@@ -4,7 +4,7 @@
 
 日期：2026-10-26（America/Los_Angeles）。本轮由用户明确续接，并单独授权只读审查子 Agent `/root/residual_review`。R01 / R04 均关闭；旧增量复审关闭的其余9项保持。该结论不覆盖安装包/跨平台发版验收。
 
-上轮 FIX 原文保存在 [上轮唯一增量复审](agent-knowledge-review-previous-incremental.md)，最初审核在 [初审历史](agent-knowledge-review-initial.md)。未改写历史失败为通过。本轮实施与全量验证见 [残留修复验证](agent-knowledge-residual-validation.md)，全过程见 [集成记录](agent-knowledge-integration.md)。
+上轮 FIX 原文保存在 [上轮唯一增量复审](archive/agent-knowledge-review-previous-incremental.md)，最初审核在 [初审历史](archive/agent-knowledge-review-initial.md)。未改写历史失败为通过。本轮实施与全量验证见 [残留修复验证](archive/agent-knowledge-residual-validation.md)，全过程见 [集成记录](agent-knowledge-integration.md)。
 
 ## 关闭矩阵
 

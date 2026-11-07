@@ -2,7 +2,7 @@
 
 > 本文是 `docs/design/agent-knowledge-design.md`（下称**基线**）的增补演进，不替代基线。只写增量结论、接口、不变量与切片；未提及的契约一律沿用基线。引用写作「基线 §x」。
 > **状态：已实施（S0–S14 合入），基线修订见 `agent-knowledge-design.md` §18。本文保留为实施依据，不删内容。**
-> **实施勘误（以代码为准）**：① §6.2 令牌头名实为 `X-Cli-Token`（非 X-Feishu-Sync-Cli-Token）；② 审计文件实位于 `<dataRoot>/agent/audit/`（cli.jsonl / source-edits.jsonl / source-pushes.jsonl，写回审计独立成文件）；③ CLI 令牌与 desktop token 为完全分离域，desktop auth 中间件不接受 CLI 令牌（严格于本文「或」的表述）；④ §6.5 批准决定路径实为 `POST …/approvals/:approvalId/decide`；⑤ §4.7 池 acquire kind 实现归并为 `'session'|'background'` 两类（后台统一 M−1 配额，key 按用途区分）。
+> **实施勘误（以代码为准）**：① §6.2 令牌头名实为 `X-Cli-Token`（非 X-Feishu-Sync-Cli-Token）；② 审计文件实位于 `<dataRoot>/agent/audit/`（cli.jsonl / source-edits.jsonl / source-pushes.jsonl，写回审计独立成文件）；③ CLI 令牌与 desktop token 为完全分离域，desktop auth 中间件不接受 CLI 令牌（严格于本文「或」的表述）；④ §6.5 批准决定路径实为 `POST …/approvals/:approvalId/decide`；⑤ §4.7 池 acquire kind 现为 `'session'|'background'|'build'` 三通道：非构建后台统一 M−1 配额，构建 worker 走独立 build 通道（容量 = buildConcurrency，不受 M−1 截断，总运行上限 = N + M）。
 > 输入证据：`agent-outputs/workflow/2026-10-27-kb-agent-upgrade/` 下 T0b（lark-cli 写能力）、T0c（amagi-pi 编排机制）、T0d（并行化与模型通道，含 part2）。代码基线 `feat/agent-knowledge-workbench @59a76fa`。预览渲染修复（T2a）不在本文范围。
 
 ## 0. 决策总表
@@ -21,7 +21,7 @@
 | U10 | R3 载体 | 编排作为**内置 knowledge-workbench 包的新配置项「任务编排」**；角色卡与编排提示随包快照冻结；工具由 server 下发、现有转发扩展注册；状态机与队列在 server（`agent_tasks`） | 基线 §17 一包一插件；T0c 冲突面 1/2/6 要求 server 权威 | 可逆 |
 | U11 | R3 v1 面 | 工具 `task_submit/query/resume/cancel`；DONE/BLOCKED marker；blocked→resume；仅 isolated 上下文；不做 steer/fork/接受轴/模板 | T0c §4.4 最小闭环；裁决者错位（冲突面 8）在 GUI 中裁剪 | 可逆 |
 | U12 | R4 形态 | 独立 Node CLI，esbuild 单文件 `server/dist/cli/feishu-sync-cli.cjs`（零原生依赖）；应用内一键生成 shim `<dataRoot>/bin/feishu-sync`；v1 不发 npm | 与 kb-mcp.cjs 同构建链、随应用版本 | 可逆 |
-| U13 | R4 认证 | **专用 CLI 令牌 + 端点文件**：设置中开启「命令行访问」（默认关）后生成独立 `cliToken`，写 `<dataRoot>/run/endpoint.json`（0600）；中间件要求回环 Host + 无 Origin + timing-safe 令牌（复用基线 §9.6 模式）。**不做 localhost 免令牌** | 免令牌会被同机其他用户与 DNS rebinding 利用；desktop token 不落盘；独立令牌可关、可轮换、可审计 | 可逆 |
+| U13 | R4 认证 | **专用 CLI 令牌 + 端点文件**：命令行访问默认开启，可在设置中显式关闭；开启时生成独立 `cliToken`，写 `<dataRoot>/run/endpoint.json`（0600）；中间件要求回环 Host + 无 Origin + timing-safe 令牌（复用基线 §9.6 模式）。**不做 localhost 免令牌** | 免令牌会被同机其他用户与 DNS rebinding 利用；desktop token 不落盘；独立令牌可关、可轮换、可审计 | 可逆 |
 | U14 | R4 命令面 | **单一命令表** `server/src/ops/command-table.ts`：命令 = HTTP 映射 + 参数 Schema + 风险级；CLI 与内部 Agent 工具 `app_command` 共用；HTTP API 仍是唯一业务契约 | Work 无 shell（基线 D5），Agent 不能跑 CLI；共表防语义漂移 | 可逆 |
 | U15 | R4 内部 Agent | `app_command`：`read` 级直接执行；`mutate/destructive/remote_write` 逐次经**会话内用户批准**；含秘密命令不对 Agent 暴露 | 防提示注入借 Agent 改设置/清理/写回 | 可逆 |
 | U16 | R4 离线 | 业务命令**只走运行中的 server**，无离线直写；不可达退出码 3；不自动拉起应用 | SQLite、锁、基线推进由 server 单进程拥有 | 可逆 |
@@ -52,7 +52,7 @@
 ## 2. 架构增量
 
 ```
-内嵌 Hono server
+Hono server（Electron utilityProcess 子进程）
  ├─ agent/
  │   ├─ AgentProcessPool      + acquire(kind) FIFO、后台配额 M−1              [U9]
  │   ├─ AgentToolService      + 工具扩展点 registerToolFamily()              [S1]
@@ -69,7 +69,7 @@
      ├─ SourceWriteLock       按 objToken 进程内互斥（SyncEngine 单文档提交同用）
      └─ FeishuWriteService    push planner + lark-cli docs +update + 回拉      [R5]
 
-外部 feishu-sync CLI ──HTTP + X-Feishu-Sync-Cli-Token──▶ server（读 endpoint.json）
+外部 feishu-sync CLI ──HTTP + X-Cli-Token──▶ server（读 endpoint.json）
 pi 会话进程 ──app_command / task_* ──▶ /api/agent-internal（运行令牌）──▶ 命令表 / TaskService
 ```
 
@@ -257,7 +257,7 @@ class AgentProcessPool {
 name: kb-analyst
 label: 分析员
 description: 只读分析原始库与标准库，给出结构化结论
-tools: [kb_search, kb_read, raw_search, raw_read, raw_read_image]
+tools: [kb_search, kb_grep, kb_read, raw_search, raw_read, raw_links, raw_read_image, raw_comments]
 requiresMode: any        # any | work
 ---
 （正文 = 子任务系统提示；server 在其后追加公共子任务契约）
@@ -265,9 +265,9 @@ requiresMode: any        # any | work
 
 | 角色 | 工具请求 | requiresMode |
 |---|---|---|
-| `kb-analyst` | kb_search kb_read raw_search raw_read raw_read_image | any |
-| `kb-converter` | raw_* kb_search kb_read ws_ls ws_read ws_search ws_write ws_edit ws_mkdir | work |
-| `kb-reviewer` | kb_search kb_read raw_read ws_ls ws_read ws_search | any |
+| `kb-analyst` | kb_search kb_grep kb_read raw_search raw_read raw_links raw_read_image raw_comments | any |
+| `kb-converter` | raw_search raw_read raw_links raw_read_image kb_search kb_grep kb_read ws_ls ws_read ws_search ws_write ws_edit ws_mkdir | work |
+| `kb-reviewer` | kb_search kb_grep kb_read raw_search raw_read raw_links raw_read_image ws_ls ws_read ws_search | any |
 
 - 授予工具 = 角色请求 ∩ 父会话当前模式工具集 ∩ 已知工具；为空或模式不满足 → `task_role_not_allowed_in_mode`。子任务**永不**获得 `task_*`、`app_command`（depth=1）。
 - 公共子任务契约：最终回复末行 `<!--FS:DONE-->`；缺信息时首行 `<!--FS:BLOCKED-->` 后接 `QUESTIONS:`；缺 marker → 一次纠正 nudge → 仍缺 `failed(task_contract_missing)`。
@@ -282,7 +282,7 @@ requiresMode: any        # any | work
 | `task_cancel` | `{ taskId: string }` | `AgentTaskDto` |
 
 - `outputDir`：converter 必填，Workspace 相对路径；该任务 ws 写入根收窄为 `<workspace>/<outputDir>`（PathGuard 以其为根），防并行子任务互写；同会话两个非终态任务 outputDir 不得互为前缀 → `409 task_output_dir_overlap`。
-- 每会话非终态任务 ≤ `orchestration.maxActiveTasksPerSession`（默认 8），超出 `task_queue_full`。
+- 每会话非终态任务 ≤ `orchestration.maxActiveTasksPerSession`（默认 5，可设 1..5），超出 `task_queue_full`。
 - `wait` 在工具内阻塞（受 prompt 超时约束）；不做完成后自动唤醒 Leader（避免未经用户发起的模型调用）。
 
 ### 5.3 状态机与进程
@@ -365,10 +365,10 @@ export class CliEndpoint {
   rotate(): void;
   verify(token: string): boolean; // timing-safe
 }
-// Config 增加 cli: { enabled: boolean }（默认 false）
+// Config 增加 cli: { enabled: boolean }（默认开启；已有配置中显式保存的关闭状态保留）
 ```
 
-- `middleware/cli-auth.ts`：请求带 `X-Feishu-Sync-Cli-Token` 时要求回环 Host、**无 Origin**、令牌通过，标记 `actor='cli'` 放行；不通过 401。与 desktop auth 组合为「desktop token **或** CLI token」。CLI 令牌不被 `/api/agent-internal/*` 接受。
+- `middleware/cli-auth.ts`：请求带 `X-Cli-Token` 时要求回环 Host、**无 Origin**、令牌通过，标记 `actor='cli'` 放行；不通过 401。与 desktop auth 组合为「desktop token **或** CLI token」。CLI 令牌不被 `/api/agent-internal/*` 接受。
 - `POST /api/cli/enable {enabled: boolean}`、`POST /api/cli/token/rotate`、`POST /api/cli/install-shim` **只接受 desktop token**（CLI 不能自授权）。`PUT /api/config` 对 `actor='cli'` 丢弃 `cli.*`。
 - 审计：`actor='cli'` 的非 GET 请求追加 `<dataRoot>/audit/cli.jsonl`（时间、方法、路径、状态码，不记 body）。
 - 安全边界：令牌文件与明文 provider key 的 `config.json` 同属本用户信任域，同 uid 恶意进程两者皆可读——这是既有边界，不宣称更强；令牌阻断同机其他用户、浏览器与 DNS rebinding。Windows ACL 依赖用户目录默认权限（§11）。
@@ -396,19 +396,20 @@ export const OPS_COMMANDS: readonly OpsCommandDef[];
 | `auth status` / `auth login [--switch-account] [--write]` / `auth cancel` | read / mutate / mutate | ✓ | `GET /api/feishu/auth-status`；`POST /api/feishu/auth/device/start`→输出 verificationUrl→`/complete`（long-poll）；`/cancel` |
 | `lark install` / `lark init` | mutate | ✓ | `POST /api/feishu/lark-cli/install`；`/config-init/start` + `/complete` |
 | `config get [path]` / `config set <path> <json>` | read / mutate | ✓ | `GET /api/config`（已脱敏）；`PUT /api/config` 窄 patch（拒 `*.apiKey`、`agent.workspaces`、`cli.*`） |
-| `llm test [--provider --model]` / `vision test` | read | ✓ | `POST /api/llm/test-channel`；`POST /api/agent/vision/test` |
-| `llm set-key <providerId> --key-stdin` | mutate | ✗ | `PUT /api/config`（key 只从 stdin 读） |
+| `llm test [--provider --model]` | read | ✓ | `POST /api/llm/test-channel` |
+| `vision test` / `llm set-key` / `source show` | — | ✗ | 不在命令面：图片理解测试走设置页的 `POST /api/agent/vision/test`；模型密钥修改不在命令面（`config.set` 禁改 `llm.*` 密钥段）；源内容读取走 `GET /api/mapping/content/:objToken` 的 UI/MCP 通道 |
 | `clean orphans [--apply]` | destructive | ✓ | `GET /api/orphan-files`；`POST /api/orphan-files/cleanup` |
 | `clean trash list\|restore\|purge` | read/mutate/destructive | ✓ | `GET /api/trash`；`POST /api/trash/restore`；`DELETE /api/trash/purge` |
 | `clean sources <objToken…>` | destructive | ✓ | `POST /api/kb/sources/cleanup`（沿用其确认字段） |
 | `kb status\|changes\|builds\|versions` | read | ✓ | `/api/kb/status`、`/changes`、`/builds`、`/versions` |
-| `kb build [--full]` / `kb cancel <id>` / `kb events <id> --follow` | mutate / mutate / read | ✓ | `POST /api/kb/builds`；`/builds/:id/cancel`；SSE `/builds/:id/events` |
+| `kb build [--full]` / `kb cancel <id>` | mutate / mutate | ✓ | `POST /api/kb/builds`；`/builds/:id/cancel`。构建事件经 SSE `/builds/:id/events` 与 UI 查看，无独立命令 |
 | `kb sources include\|exclude <objToken…>` | mutate | ✓ | `POST /api/kb/sources/selection` |
-| `source show <objToken>` | read | ✓ | `GET /api/mapping/content/:objToken` |
-| `source state [objToken]` | read | ✓ | `GET /api/sources/edits[/:objToken]`（§7.4） |
+| `source edit-status [objToken]` | read | ✓ | `GET /api/sources/edits[/:objToken]`（§7.4）。源内容读取走 UI 预览/MCP 的 `GET /api/mapping/content/:objToken`，不在命令面 |
 | `source edit <objToken> (--from-file f \| --replace old new) [--base-hash h]` | mutate | ✓ | `POST /api/sources/:objToken/edit` |
 | `source revert <objToken>` | destructive | ✓ | `POST /api/sources/:objToken/revert` |
 | `source push <objToken> [--allow-overwrite] [--force]` | remote_write | ✓ | `POST /api/sources/:objToken/push/preview` → `/push` |
+
+完整命令面以 `ops/command-table.ts`（40 条）为准；上表之外另有 `kb.publish-preview`、`kb.publish`、`kb.publications`（标准库反向发布）、`cloud.history_list`、`cloud.revert`、`cloud.rename_title`、`cloud.move_status`、`cloud.moves`（云端历史与移出管理）、`sync.whiteboard_backfill`、`sources.references-rebuild`、`kb.sources.cleanup` 等条目，命令语义与风险级见 [cli-reference.md](../cli-reference.md)。
 
 - CLI：`destructive/remote_write` 需 `--yes`，否则打印预览并退出码 4。
 - 顺序要求：命令表只引用已存在路由；引用本文新路由的命令在对应切片合入后登记（切片表依赖）。

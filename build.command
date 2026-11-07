@@ -22,7 +22,7 @@ fi
 
 echo "[1/4] 检查 Node.js..."
 if ! command -v node &>/dev/null; then
-    echo "[错误] 未检测到 Node.js, 请安装 Node.js 18+ : https://nodejs.org/"
+    echo "[错误] 未检测到 Node.js, 请安装 Node.js 22.19+ (22.x/24.x LTS) : https://nodejs.org/"
     echo ""
     echo "按 Enter 键退出..."
     read -r

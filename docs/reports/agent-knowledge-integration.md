@@ -1,6 +1,6 @@
 # Agent 标准知识库集成记录
 
-状态：本轮R01/R04残留修复与独立复审PASS，本地开发分支验收通过，按原目标本地提交；未合main、未推送或发版。上一轮 FIX 与现场见本文历史记录和 [上轮增量复审原文](agent-knowledge-review-previous-incremental.md)。本轮证据见 [残留修复验证](agent-knowledge-residual-validation.md)。
+状态：本轮R01/R04残留修复与独立复审PASS，本地开发分支验收通过，按原目标本地提交；未合main、未推送或发版。上一轮 FIX 与现场见本文历史记录和 [上轮增量复审原文](archive/agent-knowledge-review-previous-incremental.md)。本轮证据见 [残留修复验证](archive/agent-knowledge-residual-validation.md)。
 
 ## 基线
 - 工程治理 main：`2c2a6dd`，v0.3.47，不推送、不发版。
@@ -64,7 +64,7 @@
 
 ## 集中修复回流与最终增量验证
 
-- 04a0416b完成R01–R11：18文件净增量回流，经硬化前快照逐项确认主树没有独立冲突再复制；不覆盖前端。新增29例，主树bg-8fbcf795 check/build:all/electron:build通过（server738例、前端92例）。初审原文另存agent-knowledge-review-initial.md。
+- 04a0416b完成R01–R11：18文件净增量回流，经硬化前快照逐项确认主树没有独立冲突再复制；不覆盖前端。新增29例，主树bg-8fbcf795 check/build:all/electron:build通过（server738例、前端92例）。初审原文另存archive/agent-knowledge-review-initial.md。
 - Leader进一步补齐R01应用整棵代码树（含前端和构建配置，不能仅列node_modules子树），真实workspace路由对src、server/node_modules/hono、electron均400，现有独立Workspace仍可用；反向raw-root重叠PUT同样400。
 - Electron CJS打包暴露ConfigManager新依赖链中的import.meta.url问题：增加dist-electron布局专用资产路径分支与构建define，并新增隔离的真实CJS bundle加载/有Workspace配置更新回归。修后server/前端/Electron构建通过，原import.meta警告消失。该CJS格式回归不是Electron GUI运行验证。
 - R08最终复核移到异步staging校验之后、发布点之前；复核当前本地源集合/hash（云端observed变化不误报），主文件再次realpath围栏。新增源加入、主文件symlink越界反例通过；kb-build共30例、CJS1例通过。

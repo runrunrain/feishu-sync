@@ -78,7 +78,7 @@ export interface AgentConfig {
  * `enabled` 开关不在此处：它是 knowledge-workbench 内置包的「任务编排」
  * 插件条目（AppPluginStore，默认停用），随插件快照 revision 生效。 */
 export interface AgentOrchestrationConfig {
-  /** 每会话非终态（queued/running/blocked）任务上限，超出 task_queue_full。1..32，默认 8。 */
+  /** 每会话非终态（queued/running/blocked）任务上限，超出 task_queue_full。1..5，默认 5。 */
   maxActiveTasksPerSession: number;
   /** 子任务单轮（单次 prompt）超时分钟数。1..1440，默认 30。 */
   taskTimeoutMinutes: number;

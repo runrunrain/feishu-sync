@@ -1,9 +1,11 @@
 # 工程治理与 Agent 标准知识库工作流
 
+> 已完成（历史）：本工作流于 2026-10 收口，产物已合入并随 v0.3.50 起随应用发布。本文保留为当时的执行计划与决策记录，不代表当前任务状态；现行文档入口见 [docs/README.md](../README.md)。
+
 ## 授权与基线
 - 自治：unattended。用户全面授权工程整理；保留功能、用户数据、安装包与自动更新兼容。
 - 2026-10-26：已 fetch origin 并 fast-forward 本地 main 到 8e35146（v0.3.47）。版本号保持，不创建 release/tag，不 push（未获远端发布授权）。
-- 上游调查：docs/reports/engineering-baseline-audit.md（调查时基线 0.3.46，版本差异已由本次同步解决）。
+- 上游调查：docs/reports/archive/engineering-baseline-audit.md（调查时基线 0.3.46，版本差异已由本次同步解决）。
 - 最终目标：原始飞书知识库只读保全；pi Agent 生成有来源、可追溯、策划文风的标准知识库；可视化浏览阅读；持久会话支持设计讨论和显式 Work 本地操作；只读 MCP 对外查询。
 
 ## 总验收
@@ -16,7 +18,7 @@
 ## 阶段与任务
 | ID | 完整切片 / 负责人 | 前置与输入 | 产物 | 验收 | 状态 |
 |---|---|---|---|---|---|
-| G1 | 工程治理、文档、验证入口 / luban | v0.3.47、基线调查；隔离 worktree | 工程与文档 diff、docs/reports/engineering-governance.md | check/test/build；保留现有运行契约 | accepted：9281352f；Leader补隔离/排除/事实修正，54+615用例及构建通过 |
+| G1 | 工程治理、文档、验证入口 / luban | v0.3.47、基线调查；隔离 worktree | 工程与文档 diff、docs/reports/archive/engineering-governance.md | check/test/build；保留现有运行契约 | accepted：9281352f；Leader补隔离/排除/事实修正，54+615用例及构建通过 |
 | D1 | trade-wisdom 与 pi 调研、公共方向设计 / fuxi | 用户方向、现有项目和 pi 文档；仅写设计 artifacts | docs/design/agent-knowledge-design.md，公共 API/状态/权限约定 | 真实代码证据，方案可实现，不照搬参考 | accepted：255048cd；公共契约 docs/design/agent-knowledge-design.md，研究证据已落盘 |
 | G2 | main 集成验证与高风险审核 / Leader + diting | G1 | 验证证据、review | 通过后提交 main，不升级版本 | completed：治理main提交 2c2a6dd；8b8c6692 + 9438878e 复审PASS；native运行缺口保留 |
 | F1 | 标准库、pi 会话与 MCP 后端纵向切片 / luban | main 已提交、D1 公共契约 | 代码/测试/运维文档/报告 | 原始库保护、原子发布、只读讨论、显式 Work、MCP 真协议 | accepted（本轮续接）：旧交付rejected历史保留；R01/R04残留及活进程运行根回归修复后独立PASS，既有9项关闭保持 |
@@ -57,7 +59,7 @@
 - Leader实际真实调用：builtin Haiku4.5收到HTTP400（已分类诊断，available不等于可调用）；改选已注册amagi-glm/glm-5.3-flash、关闭retry与thinking，2s内agent_settled/stop并精确回复smoke标记（bg-8ed04bae）。仅临时无敏感内容，无工具，不能冒充应用工具链验证；已通知F1可用路由。
 - F2安全补充：既有MarkdownView的Markdown href缺协议allowlist，HTML链接只拦简单javascript。已要求UI侧统一安全协议/实体与控制字符处理、远程图片不附desktop token；新Agent/标准库入口默认不自动加载任意外部图片，避免模型输出借图片URL外发源内容。与新功能同批实现/测试/阶段审核，不在main治理提交中偷改旧行为。
 - F1安全补充：Work的授权目录不得与应用运行代码/资源、pi安装树及pi-agent-dir凭据目录重叠，防止写扩展或可执行模型配置后被下一侧车加载而间接突破‘无shell’边界。由服务端路径确定保护根并复核，API不变；普通独立文档Workspace可用。不把文件工具围栏说成抵抗同uid外部程序或第三方自动执行的OS沙箱。
-- F2已整合并接受：主树check/electron:build通过；Leader补图片授权绑定具体URL（切文档/换query重新确认）与本地CSV文件名空格保留/反斜杠协议相对拦截，lint/typecheck/前端测试再次通过。F2新端点验证是明确fixture，不计为最终F1联调；报告docs/reports/agent-knowledge-ui.md、截图global artifacts/f2-agent-knowledge-ui-shots。
+- F2已整合并接受：主树check/electron:build通过；Leader补图片授权绑定具体URL（切文档/换query重新确认）与本地CSV文件名空格保留/反斜杠协议相对拦截，lint/typecheck/前端测试再次通过。F2新端点验证是明确fixture，不计为最终F1联调；报告docs/reports/archive/agent-knowledge-ui.md、截图global artifacts/f2-agent-knowledge-ui-shots。
 - F1收口前Leader只读发现并要求修正两项具体接线：状态路由factory捕获旧config导致保存后status/probe仍旧值；raw-source谓词遗漏旧lastSyncedAt成功证据并把cloudDeleted观测标记直接当源删除。HTTP新config由F1修复，源谓词在终稿后由Leader整合修复。
 - F3从主树真实pi/HTTP、浏览器、MCP验证核心闭环；又修复CSV附件围栏、SSE空游标/溢出、完整message_end DTO和工具多轮草稿锚点、停止ACK覆盖新SSE idle的竞态。测试与截图含失败现场而非只留成功图，完整证据在integration报告。
 - 06b9041e独立full审核FIX（1C/10M），已接受报告，不代表接受功能。R01–R11包括完整代码树隔离、配置逆向重叠、默认app-llm注册、插话队列所有权、进程/能力回收、busy/idle、full工作集、源变化阻断、指针后DB对账及清理、JSONL元数据父链。全部一批续接04a0416b。续接前Leader回填5个后端修正到原worktree并比对190文件与主树一致，防止续接覆盖整合。

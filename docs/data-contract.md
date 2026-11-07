@@ -1,12 +1,23 @@
 # 数据契约
 
-> 本文是数据层变更前的检查清单；字段级权威定义在 `server/src/modules/local-map-store.ts`（DDL 与迁移数组）与 `config-manager.ts`。
+> 本文是数据层变更前的检查清单；字段级权威定义在 `server/src/modules/local-map-store.ts`（DDL 与迁移数组）、`config-manager.ts` 与 `server/src/types/agent-knowledge.ts`（Agent/标准库配置默认值）。文件数/表数为 2026-11 实测，以代码为准。
 
 ## SQLite（`~/.feishu-sync/feishu-sync.db`）
 
 - 驱动：better-sqlite3 ^12，同步 API + 预编译语句（`LocalMapStore`）。
-- 主表：`documents` / `sync_log` / `run_log`；辅助表：`local_dirs` / `custom_folders` / `sheet_sheets` / `feishu_pending_items` 等。
-- **迁移策略**：`initialize()` 每次启动跑 `applyAdditiveMigrations()`——每条 `ALTER TABLE ADD COLUMN` 用 `PRAGMA table_info` 守卫，旧库原地升级。新列要同时加到 additive 迁移数组与 `getCreateTablesDDL()` **两处**。
+- 当前 **22 张表**（2026-11 实测 `getCreateTablesDDL()`）：
+
+| 域 | 表 |
+|----|----|
+| 同步主表 | `documents` / `sync_log` / `run_log` |
+| 同步辅助 | `localDirs` / `custom_folders` / `sheet_sheets` / `feishu_pending_items` / `sync_blocklist` / `local_source_deletions` |
+| Agent 会话 | `agent_sessions` / `agent_session_preferences` / `agent_tasks` |
+| 源受控写 | `source_edits` / `source_push_log` / `source_references` / `source_comments` / `source_comment_meta` |
+| 标准库 | `kb_builds` / `kb_publications` / `kb_source_exclusions` |
+| 云端操作 | `cloud_moves` |
+| 内部 | `schema_migrations` |
+
+- **迁移策略**：`initialize()` 每次启动跑 `applyAdditiveMigrations()`——每条 `ALTER TABLE ADD COLUMN` 用 `PRAGMA table_info` 守卫，旧库原地升级。新列/新表要同时加到 additive 迁移数组与 `getCreateTablesDDL()` **两处**。
 - 历史迁移脚本（`server/scripts/migration_v2..v5`、`run-migration-*`）是文件级参考，线上升级只靠 additive 自动迁移，不手工跑。
 - 双身份契约（改动高危区）：
   - `custom_folder_id` 与 `watched_root_url/id` 互斥；归属冲突时结构树所有权优先。
@@ -23,33 +34,64 @@
 
 ## config.json（`~/.feishu-sync/config.json`）
 
-- **`watchedRoots`（`WatchedRootConfig[]`）是真相源**；`watchedRootUrls` 是 ConfigManager 内存派生、不落盘的兼容投影——不要直接改投影。
-- 字段总表见 README「配置说明」；关键字段：`llm.*`（direct 通道，默认智谱 GLM，`timeoutMs` 默认 600_000）、`pollIntervalMinutes`、`knowledgeBaseRoot`、`requiredScopes`（9 项，与 ConfigManager 默认一致）。
-- apiKey 明文存储是**已知架构决策**（含 `_warning` 字段），加密 deferred；正式回填脚本默认只读配置，唯一例外是显式 `--persist-config`。
+**`watchedRoots`（`WatchedRootConfig[]`）是真相源**；`watchedRootUrls` 是 ConfigManager 内存派生、不落盘的兼容投影——不要直接改投影。
 
-## Agent 与标准库（开发分支）
+### 配置段与默认值（2026-11 实测）
+
+| 段 | 默认值要点 | 备注 |
+|----|-----------|------|
+| `llm` | direct 单通道；`timeoutMs` 600_000；temperature 0.2；`contentAdaptationEnabled` false | apiKey 明文（含 `_warning`，加密 deferred） |
+| `agent.runtime` | `{ backend: 'pi' }` | Claude Code 侧车另见 [claude-runtime.md](./claude-runtime.md) |
+| `agent.model` | `maxTokens` 32768 | `LlmModelPreset` 增可选 `supportsImages`（仅 UI 提示） |
+| `agent.vision` | `enabled: false`、concurrency 3、maxImageBytes 5 MiB、maxImagesPerBuild 300 | 以 providerId/modelId 引用 `llm.providers`，不新增密钥字段 |
+| `agent.orchestration` | `maxActiveTasksPerSession: 5`、`taskTimeoutMinutes: 30` | 任务编排 |
+| `agent.maxConcurrentProcesses` | 3（1..6）＝非构建后台容量 M：非构建后台合计 ≤ M−1（M≥2 时为会话保留 1 槽）；标准库构建走独立 `build` 通道，容量 N=`standardKb.buildConcurrency`，不被 M 截断，总运行上限 N+M | 进程池准入（`agent-process-pool.ts`） |
+| `agent.workspaces` | `[]` | 经专用 API 登记；普通 `PUT /api/config` 不接受此字段 |
+| `standardKb.outputRoot` / `retainReleases` | `<dataRoot>/standard-kb` / 3 | |
+| `standardKb.buildConcurrency` | 2（1..6）；**兼容读旧名 `buildParallelism`** | 并行构建 worker 数 |
+| `standardKb.orchestrationMode` | `'pi-amagi'`（当前唯一开放值；legacy/claude-native 加载时统一迁移） | 见 [build-orchestration.md](./build-orchestration.md) |
+| `standardKb` 构建参数 | `buildBatchSize` 10、`buildBatchWordBudget` 40 000（0 或 4000..400000）、`promptTimeoutMinutes` 15、`buildTimeoutMinutes` 180、`strictGates` false（创建时冻结）、`autoBuildAfterSync` false、`evidenceBudgetBytes` 缺省按冻结工作集来源数给默认额度 | `buildRoles`（writer/reviewer `modelPresetId`，plannerEnabled false）、`reviewPolicy`（maxAutoRevisions 2、maxInterfaceRetries 2） |
+| `cli` | **`enabled: true`（默认开启，可显式关闭）** | 0.4.2 起缺省开；保留已保存的显式关闭状态 |
+| `kbLanMcp` | `enabled: false`、bindAddress `auto`、port 47391、maxSessions 16 | 默认值定义在 `kb-lan/network.ts`；见 [kb-lan-mcp.md](./kb-lan-mcp.md) |
+| `feishuWrite` | `enabled: false` | 飞书写回（增量授权 `docx:document:write_only`） |
+| `feishuPublish` | `enabled: false` | 标准库反向发布，见 [feishu-publish.md](./feishu-publish.md) |
+| `sync` | `slidesScreenshot.enabled: false`、`whiteboardExport.enabled: true` | 白板旁路导出失败只告警，md 唯一引用仍是 PNG 预览 |
+| 顶层 | `pollIntervalMinutes` 30、`requiredScopes` 9 项 | `RETIRED_REQUEST_SCOPES`（`docs:document:read`）加载时剔除 |
+
+`cli.*`/`llm.*` 密钥面/`agent.workspaces`/`feishuWrite` 只接受 desktop token 修改，CLI 主体提交的 `PUT /api/config` 会丢弃这些字段。改变原始库、标准库或运行资源根也必须对已有 Workspace 做反向交叉校验，不能只在最初登记时检查。字段总表见 README「配置说明」。
+
+## Agent 与标准库的数据文件
 
 | 数据 | 真相与维护责任 |
 |---|---|
-| `agent_sessions` | 会话标题、模式、Workspace绑定、pi JSONL文件定位与最近错误；正文历史不放SQLite |
+| `agent_sessions` | 会话标题、模式、Workspace绑定、运行时文件定位与最近错误；正文历史不放SQLite |
 | `<dataRoot>/agent/sessions/*.jsonl` | pi v3树形会话历史；沿当前叶回溯全部节点，输出时才筛消息，不能让compaction/model_change父节点截断历史 |
 | `<dataRoot>/agent/audit/<sessionId>.jsonl` | 写入工具/路径/结果元数据，不含写入正文 |
-| `agent_tasks`（2026-10 升级） | 任务编排记录（role/status/output_dir/tools_json/plugin_revision/rounds/result/questions）；状态机 queued/running/done/blocked/failed/cancelled/interrupted；启动时非终态置 interrupted；跨会话访问校验归属 |
-| `source_edits`（2026-10 升级） | 原始库受控编辑登记（state dirty/pushing/pushed/conflict、base/current_body_hash、push_mode/revision）；启动时 pushing 置 conflict（push_interrupted）；SyncEngine/回收站/源清理遇非 pushed 行一律 `local_edit_pending` 拒绝 |
-| `kb_builds` | 构建状态与统计（含增列 parallelism/unit_total/vision_model/warnings_json）；CURRENT提交后的异常以文件发布事实为准启动对账，不可用旧DB状态否认已发布内容 |
+| `agent_tasks` | 任务编排记录（role/status/output_dir/tools_json/plugin_revision/rounds/result/questions）；状态机 queued/running/done/blocked/failed/cancelled/interrupted；启动时非终态置 interrupted；跨会话访问校验归属 |
+| `source_edits` | 原始库受控编辑登记（state dirty/pushing/pushed/conflict、base/current_body_hash、push_mode/revision）；启动时 pushing 置 conflict（push_interrupted）；SyncEngine/回收站/源清理遇非 pushed 行一律 `local_edit_pending` 拒绝 |
+| `kb_builds` | 构建状态与统计（含 parallelism/unit_total/vision_model/warnings_json 增列）；CURRENT提交后的异常以文件发布事实为准启动对账，不可用旧DB状态否认已发布内容 |
+| `kb_publications` | 反向发布状态机（预览/发布/映射） |
 | `<dataRoot>/agent/vision-cache/` | 图片描述内容寻址缓存（`<hash[0:2]>/<imageHash>.<modelKey>.json`，tmp+rename）；v1 无淘汰 |
 | `<dataRoot>/source-edits/<objToken>/` | 源编辑前备份（base.md 同步版正文 + 最近 20 份编辑前版本） |
 | `<dataRoot>/agent/audit/{cli,source-edits,source-pushes}.jsonl` | CLI 命令（非 GET）、源编辑、写回的审计流水；只记时间/方法/路径/hash 等元数据，不记正文 |
-| `<dataRoot>/run/endpoint.json` | CLI 端点发现文件（url/pid/cliToken，0600，tmp+rename）；仅 `cli.enabled` 时发布，pid 匹配才可 revoke |
+| `<dataRoot>/run/endpoint.json` | CLI 端点发现文件（url/pid/cliToken，0600，tmp+rename）；CLI 默认开启时发布，pid 匹配才可 revoke |
 | `<outputRoot>/CURRENT.json` | 当前发布指针；一次读取绑定一个release，不能混读两个版本 |
 | `<outputRoot>/releases/<releaseId>/manifest.json` 与 `docs/` | 完整已发布快照及来源（快照条目含 mediaHash/imageCount）；应用不修改已发布正文，MCP只读此处，不读取SQLite |
 | `.staging/<buildId>` 与 `.builds/<buildId>` | 暂存内容、构建事件和校验报告；不是可对外查询的发布 |
 
-以上新表仍经幂等DDL/additive策略建立（agent_tasks/source_edits 新表与 kb_builds 新列均双登记 additive 数组与 `getCreateTablesDDL()`），不改原`documents`身份及同步基线语义。`dataRoot`与桌面/服务端共用`FEISHU_SYNC_HOME`解析。
+以上新表仍经幂等DDL/additive策略建立（新表与 kb_builds 新列均双登记 additive 数组与 `getCreateTablesDDL()`），不改原`documents`身份及同步基线语义。`dataRoot`与桌面/服务端共用`FEISHU_SYNC_HOME`解析。
 
-配置新增`agent`（runtime/model/**vision**/**orchestration**/maxConcurrentProcesses/workspaces）与`standardKb`段，另有可选段`cli`（命令行访问，默认关）与`feishuWrite`（飞书写回，默认关）；`LlmModelPreset` 增可选 `supportsImages`（仅 UI 提示）。`agent.vision` 以 providerId/modelId 引用 `llm.providers`，不新增密钥字段，缺省 disabled。`standardKb.buildParallelism` 1..6 默认 2，`agent.maxConcurrentProcesses` 1..6 默认 3（后台类合计 ≤ M−1）。`cli`/`feishuWrite` 只接受 desktop token 修改，CLI 主体提交的 `PUT /api/config` 会丢弃这两个字段。Workspace通过专用API登记，普通PUT配置不接受`agent.workspaces`；改变原始库、标准库或运行资源根也必须对已有Workspace做反向交叉校验，不能只在最初登记时检查。
+### `kb_builds.metrics_json` 的 orchestration 段（pi-amagi 编排度量）
 
-标准文档使用独立的`feishu_sync_kb` YAML-in-comment头（`doc_id/build_id/sources`），不要与原始库的`feishu_sync`头混用。改标准头需同时维护构建写入/校验和`StandardKbStore.parseStdHeader/stripStdHeader`，并验证UI/MCP读取。
+pi-amagi 构建完成后聚合写入 `metrics_json.orchestration`（聚合函数 `kb/build-metrics.ts`，磁盘事实由 `kb-build-service.collectLeaderOrchestrationMetricsFromDisk` 采集；运维报告入口 `server/scripts/build-metrics-report.ts`）。口径约束：不可推导的字段省略/置 null 并写入 notes，禁止编造：
+
+- 计数：`wallClockMs`（started_at→finished_at，未收口按采集时刻）、`docsPublished`、`sourcesTotal`；按角色派发数 `authorDispatches`/`reviewDispatches`/`researchDispatches`（luban/diting/baize；来源文件不可得为 null，真实空=0）。
+- 审查：`revisionRounds`（docsReviewed、totalReviews、roundsMedian/roundsMax、首审结论 `firstVerdicts` 与 `firstPassRate`；按 scopePaths 归组，无范围的旧回执单独计数）。
+- 发布门：`publishRejections`（按 reason 计数）、`dispatchRejections`（派发守卫/任务系统拒绝按 code 计数；additive 可选）。
+- 并发：`pool`（peakInflight/avgInflight、推导口径 `derivation`：journal-session | actor-events | none；在途 `submittedPeakInflight`/`submittedAvgInflight` 可选）。
+- 时延：`firstDraftToPublish`（每篇首稿→发布结算 nearest-rank 分位；additive 可选）。
+
+字段级定义见 `types/agent-knowledge.ts` 的 `KbBuildMetricsOrchestration`；度量与运维详见 [build-operations.md](./build-operations.md)。
 
 ## Markdown header 契约（round-trip 必须闭环）
 
@@ -67,6 +109,8 @@ feishu_sync:
 - 兼容 3 种历史格式：`legacy_html_zh` / `blockquote` / `bold_kv`。
 - 改 header 字段必须同步两端，并保证 round-trip（`server/tests/sync-engine.test.ts` (d) 项用例是守护）。
 - 手工放进 `_custom/` 的带 `feishu_sync` 头文件由全量重建兜底纳管：`IndexScanner.reconcileCustomFolders`（注册含 md 的一级子目录，`ScanPolicy` 保留目录除外；`_custom/` 根散档不纳管）+ `LocalMapStore.backfillCustomFolders`（按 `local_rel_path` 最长前缀回填，候选行须 watched_root 为空）。
+
+标准文档使用独立的`feishu_sync_kb` YAML-in-comment头（`doc_id/build_id/sources`），不要与原始库的`feishu_sync`头混用。改标准头需同时维护构建写入/校验和`StandardKbStore.parseStdHeader/stripStdHeader`，并验证UI/MCP读取。
 
 ## 写盘安全（文件层契约）
 

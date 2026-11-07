@@ -64,3 +64,6 @@ amagi-task/
 
 # 本地审查文档（diting 审查报告等，不入库）
 review/
+
+# 子 Agent / 编排工作流的过程产物（一次性）；需长期保留的精选记录用 git add -f 并在 docs 中引用
+agent-outputs/

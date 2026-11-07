@@ -21,9 +21,9 @@
 
 | 约束 | 事实来源 | 推论 |
 |---|---|---|
-| pi 1.4.0 `engines.node >= 22.19.0` | pi `package.json` | Electron 31（Node 20.18）主进程/内嵌 server 不能 import pi |
+| pi 1.4.0 `engines.node >= 22.19.0` | pi `package.json` | Electron 31（Node 20.18）主进程/托管的 server 进程均不能 import pi |
 | 首个内置 Node ≥22.19 的 Electron 为 38.x | Electron 发布表 | 升级会改变 better-sqlite3 ABI、更新器与打包链，风险与本功能不成比例 |
-| server 内嵌在 Electron 主进程（同进程） | `electron/main.ts` 动态 import `server/dist/index.js` | server 的 Node 版本 = Electron 的 Node 版本 |
+| server 由 Electron 托管，运行在 utilityProcess 子进程 | `electron/main.ts` → `server-process.ts`（`utilityProcess.fork`）→ `server-process-entry.ts` 动态 import `server/dist/index.js` 并启动 `startServer`，desktop token 经 IPC 传入 | server 的 Node 版本 = Electron 的 Node 版本（utilityProcess 同用内置 Node） |
 | pi 内置工具无沙箱，cwd 不构成权限围栏 | pi `docs/security.md` | 不得把 pi 内置 read/write/edit/bash/grep/find 暴露给任何会话 |
 | `prompt` 响应 `success:true` 只表示已接受 | 实测：key 存在但端点不可达时 `prompt` 返回 success，随后 `agent_end` + `auto_retry_start` | 完成判定以 `agent_settled` + 最终 assistant `stopReason` 为准 |
 | `agent_end` 不是最终空闲信号 | pi `docs/extensions.md` | 等待 `agent_settled` |
@@ -36,7 +36,7 @@
 
 ```
 Electron main (Node 20)
- └─ 内嵌 Hono server（既有）
+ └─ utilityProcess 子进程：Hono server（既有业务，server-process-entry 启动）
      ├─ 既有：Config / LarkCli / LocalMapStore / ChangeDetector / SyncEngine
      ├─ 新增 agent/
      │   ├─ PiRuntimeResolver   发现外部 Node ≥22.19 与 pi ≥1.4.0 <2，输出就绪诊断
@@ -98,6 +98,9 @@ D 的代价：每个活跃会话一个进程（约百 MB 级内存）；扩展�
 | `pi_missing` | 未找到 pi 包 | 提示 `npm i -g @earendil-works/pi-coding-agent` |
 | `pi_version_unsupported` | pi 版本不在支持范围 | 显示实际版本与支持范围 |
 | `pi_spawn_failed` | RPC 进程启动或探测失败 | 显示 stderr 前 2KB |
+| `claude_missing` | 未找到 Claude Code 可执行文件 | 提示安装或在设置中填写路径 |
+| `claude_spawn_failed` | Claude Code 无法运行或缺少安全运行参数 | 显示实际错误并提示更新 |
+| `claude_protocol_unsupported` | 所选提供商协议非 Anthropic Messages | 提示改配 Anthropic Messages 兼容提供商 |
 | `model_unconfigured` | app-llm 模式下无启用的 provider/preset | 跳转模型设置 |
 | `model_auth_missing` | 探测到模型列表为空（无 key / pi 凭据缺失） | 按来源分别提示 |
 
@@ -157,7 +160,7 @@ auto_retry_start 累计 > 3 次     → abort，failed(model_request_failed)
 
 ### 4.5 进程池
 
-- `agent.maxConcurrentProcesses` 默认 3、范围 1..6（后台类合计 ≤ M−1 为交互会话保留槽，后台任务 FIFO 排队而非立即 409；见 §18 升级增补与基线 §5.2）。
+- 进程池三通道准入：`session`（交互会话）立即语义，池满 409 `agent_busy`；`background`（任务进程、连接探测等非构建后台）合计 ≤ `maxConcurrentProcesses`−1（M≥2 时为交互会话保留 1 槽；默认 M=3、范围 1..6），FIFO 排队而非立即 409；`build`（构建 worker）走独立通道，容量 N = `buildConcurrency` 本身，不受 M−1 截断，总运行上限 = N + M（`agent/agent-process-pool.ts`；见 §18 升级增补与基线 §5.2）。
 - 会话进程空闲 `agent.idleTimeoutMinutes`（默认 10）后 `stdin.end()` + 5s 后 kill；下次发消息用同一 `--session-id` 重新拉起，pi 从 JSONL 恢复上下文。
 - server `close()` 时终止全部子进程（POSIX 发 SIGTERM，3s 后 SIGKILL；Windows `taskkill /T /F`）。
 
@@ -200,17 +203,18 @@ export interface AgentWorkspaceConfig {
 }
 
 export interface AgentConfig {
-  runtime: { nodePath?: string; piCliPath?: string };      // 空 = 自动发现
+  runtime: { backend?: 'pi' | 'claude-code'; nodePath?: string; piCliPath?: string; claudeCliPath?: string };  // backend 选择 Agent 基座；空 = 自动发现
   model: {
     source: 'app-llm' | 'pi-agent-dir';                     // 默认 'app-llm'
     providerId?: string;  modelId?: string;                 // app-llm：缺省取 llm.activeProviderId/activeModelId
     piModel?: string;                                       // pi-agent-dir：'provider/id'
     thinkingLevel: 'off' | 'minimal' | 'low' | 'medium' | 'high';   // 默认 'off'
     contextWindow: number;                                  // app-llm 注册用，默认 128000
-    maxTokens: number;                                      // 默认 8192
+    maxTokens: number;                                      // 默认 32768
   };
   vision: AgentVisionConfig;                                // 图片理解通道，缺省 disabled（见下方 AgentVisionConfig）
-  maxConcurrentProcesses: number;                           // 默认 3，范围 1..6；后台类（构建/任务）合计 ≤ M−1（M>1 时为交互会话保留 1 槽）
+  orchestration: AgentOrchestrationConfig;                 // 任务编排参数（maxActiveTasksPerSession 1..5 默认 5、taskTimeoutMinutes 默认 30）；开关位于内置插件「任务编排」条目
+  maxConcurrentProcesses: number;                           // 默认 3，范围 1..6；非构建后台（任务/探测）合计 ≤ M−1（M>1 时为交互会话保留 1 槽），构建 worker 走独立 build 通道（容量 = buildConcurrency）
   idleTimeoutMinutes: number;                               // 默认 10
   workspaces: AgentWorkspaceConfig[];                       // 默认 []
 }
@@ -229,16 +233,25 @@ export interface StandardKbConfig {
   outputRoot: string;                 // 默认 <dataRoot>/standard-kb
   retainReleases: number;             // 默认 3，范围 1..20
   buildBatchSize: number;             // 单元内每批源数，默认 10（构建按单元划分，见升级增补 §18）
+  buildBatchWordBudget: number;       // 每批有效字数预算，0 = 关闭，4000..400000，默认 40000；full 模式单元字数上限 = 该值×3
   promptTimeoutMinutes: number;       // 默认 15
   buildTimeoutMinutes: number;        // 默认 180
-  buildParallelism: number;           // 并行构建 worker 数，1..6，默认 2；1 = 单 worker 等价旧行为；实际受进程池后台配额约束
+  buildConcurrency: number;           // 并行构建 worker 数，1..6，默认 2；1 = 单 worker 等价旧行为。构建走进程池独立 build 通道，容量即 N 本身，不占非构建后台的 M−1 配额（总运行上限 = N + M）。旧配置的 buildParallelism 字段兼容读取后归一到本字段
+  buildRoles?: KbBuildRolesConfig;    // 撰写/审查/整合/规划者模型预设（writer/reviewer 必选结构，缺省跟随活跃预设）
+  reviewPolicy?: KbReviewPolicyConfig; // 审查闭环预算（maxAutoRevisions/maxInterfaceRetries 缺省 2/2；mechanicalPrecheck 缺省关闭）
+  evidenceBudgetBytes?: number;       // 单 release 证据资源总量上限，缺省 20MB，可设 1MB..2GB；未显式设置时按冻结来源数分配额度
+  strictGates?: boolean;              // 缺省 false；true 恢复严格门禁，构建创建时冻结
   autoBuildAfterSync: false;          // 第一阶段固定 false（字段预留）
+  orchestrationMode?: 'pi-amagi';     // 新配置固定 pi-amagi；legacy/claude-native 仅存于历史构建与检查点，不由配置接口写入
 }
 
 // Config 增加：agent: AgentConfig; standardKb: StandardKbConfig;
 // 另增（additive 可选段，旧配置内存补默认）：
-//   cli?: { enabled: boolean }            // 命令行访问，默认 false，只接受 desktop token 修改
+//   cli?: { enabled: boolean }            // 命令行访问，默认开启，可显式关闭；只接受 desktop token 修改
+//   kbLanMcp?: …                          // 内网 MCP 共享段（默认关）
 //   feishuWrite?: { enabled: boolean }    // 飞书写回，默认 false，只接受 desktop token 修改
+//   feishuPublish?: { enabled: boolean }  // 标准库反向发布，默认 false
+//   sync?: { slidesScreenshot/whiteboardExport } // 同步行为段（截图默认关，白板旁路默认开）
 // LlmModelPreset 增加可选 supportsImages?: boolean（仅 UI 提示，不参与解析）
 ```
 
@@ -350,6 +363,8 @@ header 键为 `feishu_sync_kb`，与原始库 `feishu_sync` 区分；标准库�
 
 ### 6.5 构建流水线与状态
 
+构建编排缺省为 Pi 编排（v2，`orchestrationMode: 'pi-amagi'`）：Leader 派发撰写/审查/整合角色、阶段化发布与断点续跑，协议见 [build-orchestration.md](../build-orchestration.md)。本节描述的单进程批流水线保留为 legacy 兼容路径（旧检查点恢复与等价回退），状态机与发布校验两种编排共用。
+
 ```
 queued → preflight → running → validating → publishing → published
                  ↘            ↘             ↘            ↘
@@ -390,17 +405,24 @@ queued → preflight → running → validating → publishing → published
 | Task（子任务） | 派发时冻结：角色卡请求 ∩ 父会话模式工具集 ∩ 已知工具；永不含 `task_*` 与 `app_command` | 按冻结工具集决定（Workspace 写入收窄至该任务的 outputDir） | 同左 |
 | Probe | 无（`--no-tools`） | 无 | 无 |
 
-工具语义（参数为 JSON Schema，规格由 server `tool-specs.ts` 唯一定义）：
+工具语义（参数为 JSON Schema，规格由 server `tool-specs.ts` 唯一定义，当前全部 46 个工具以该文件为准；下表列会话侧常用工具）：
 
 | 工具 | 参数 | 返回要点 |
 |---|---|---|
 | `kb_search` | `{ query: string, limit?: 1..20 }` | `[{ docId, path, title, summary, snippet }]`，大小写不敏感子串 + 标题/headings 加权 |
+| `kb_grep` | `{ pattern, mode?: 'literal'\|'regex', … }` | 标准库穷举匹配（字面量默认，正则显式），返回全部出现位置 |
 | `kb_read` | `{ docId?: string, path?: string, offset?: int, limit?: 1..2000 }`（行） | 正文分页 + `sources` |
 | `raw_search` | `{ query, limit?: 1..20 }` | `[{ objToken, title, relPath, snippet }]` |
 | `raw_read` / Build 同名 | `{ objToken, offset?, limit? }` | 正文分页，外包 `<untrusted_source obj_token=".." title="..">…</untrusted_source>` |
+| `raw_csv_cells` / `raw_csv_find` | `{ objToken, resourceId, … }` | 冻结 CSV 附件按记录/列定位与逐格阅读（selector 与读取回执） |
 | `raw_list` | `{ filter: 'workset' \| 'all', cursor?: string }` | 每页 50 条快照记录 + 变更类型 |
+| `raw_links` | `{ objToken… }` | 引用关系查询（出链/入链，来自引用索引快照） |
+| `raw_comments` | `{ … }` | 原始库评论读取 |
+| `chat_attachment_read` | `{ … }` | 读取会话消息附件（只读） |
 | `draft_list/read/search` | 同 kb_* | 读本构建 staging |
 | `kb_write_doc` | `{ path, title, markdown, sources: string[], summary, tags?: string[] }` | 写 staging（server 生成 header，覆盖同路径） |
+| `kb_edit_doc` | `{ path, patches/evidenceClaimsAdd/evidenceSelectorUpdates/coverageUpdates/objectMerges… }` | 草稿局部编辑：只提交变化部分，服务端继承未变声明（Pi 编排写作面） |
+| `kb_read_batch` | `{ items… }` | 按字节预算分页批量读取资源 |
 | `kb_delete_doc` | `{ path }` | 删除 staging 中文档 |
 | `kb_finish` | `{ summary: string, skipped: [{ objToken, reason }] }` | 标记完成 |
 | `ws_ls` | `{ path?: string }` | 条目列表（name、type、size），不跟随 symlink |
@@ -416,6 +438,8 @@ queued → preflight → running → validating → publishing → published
 | `task_resume` | `{ taskId, message(1..20000) }` | 任务 DTO（仅 blocked 任务，作答后重新排队） |
 | `task_cancel` | `{ taskId }` | 任务 DTO |
 | `app_command` | `{ command, args? }` | 运维命令表执行结果 JSON（≤20000 字符）。read 级直接执行；mutate/destructive/remote_write 逐次经会话内用户批准（10 分钟无响应或会话中止即不执行）；模型传入的 confirm 字段一律剔除 |
+
+Build 运行还使用 Pi 编排（v2）工具族：`build_manifest`、`build_assign_output`、`build_revoke_output`、`build_handoff_submit`、`build_handoff_list`、`build_issues_submit`、`build_issues_list`、`build_checkpoint`、`build_register_migrations`、`build_request_publish`，以及草稿计划与审查工具 `kb_submit_plan`、`kb_get_plan`、`kb_submit_review` 和规格自查工具 `kb_tool_schema`；派发协议与阶段语义见 [build-orchestration.md](../build-orchestration.md)。`kb_finish`/`kb_unit_done` 仅存在于 legacy 单批编排。
 
 工具结果统一：成功 `{ content: [{type:'text', text}], details }`；失败由扩展抛错，pi 将其作为工具错误结果交给模型，文本为 `"<code>: <message>"`。
 

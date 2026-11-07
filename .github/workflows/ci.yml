@@ -1,7 +1,9 @@
 # 质量门禁工作流（工程治理 G1 引入）。
 #
 # 触发：main push / 所有 PR / 手动 dispatch。
-# 内容：lint → typecheck（根 src + 根配置 + server）→ 双包测试 →
+# 内容：lint → typecheck（根 src + 根配置 + server）→ 双包测试（前端套 xvfb-run；
+#       两个 pi 集成测试拆出：单独安装 @earendil-works/pi-coding-agent 后经
+#       FEISHU_SYNC_PI_CLI 指定运行，避免 pi 包进入依赖树）→
 #       前端/server/electron-main 构建冒烟（不打包安装包，打包链走 release.yml）。
 # Node：22 LTS（开发 engines 为 ^22.19.0 || ^24.0.0；better-sqlite3 12.x 提供 linux prebuilt）。
 # 双包依赖：根（前端 + electron + 工具链）与 server/（业务 + vitest）。

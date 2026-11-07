@@ -8,11 +8,11 @@
 
 **跨平台桌面应用**：自动检测飞书知识库子树变更并选择性同步到本地，保持本地重构后的 Markdown 内容结构（表格布局、层级格式），支持 LLM 驱动的内容适配。
 
-**状态**：v0.4.0。支持飞书同步、自定义归档和智能体标准知识库工作台。变更记录见 [CHANGELOG.md](./CHANGELOG.md)。
+**状态**：持续发版，当前版本与变更记录见 [CHANGELOG.md](./CHANGELOG.md)。支持飞书同步、自定义归档和智能体标准知识库工作台。
 
 ---
 
-> [Agent 标准知识库工作台](./docs/agent-knowledge.md)支持原始库整理、可追溯阅读、Discuss/Work 会话、只读 MCP、图片理解、任务编排和源文档编辑。
+> [Agent 标准知识库工作台](./docs/agent-knowledge.md)支持原始库整理、可追溯阅读、Discuss/Work 会话、MCP 知识接口（本机 stdio 与可信局域网共享）、图片理解、任务编排和源文档编辑。
 
 ## 下载与安装
 
@@ -43,6 +43,10 @@
 - **表格重构**：A/B/C/D/E 五类块自动识别与重构（metadata/hierarchy/datatable/paragraph/sparse）
 - **LLM 适配**：direct 单通道（OpenAI SDK，默认智谱 bigmodel GLM，`glm-4-flash` 免费档起步），风格对齐失败时回退确定性结果
 - **自定义归档**：结构树之外的零散云文档快捷归档到 `_custom/<文件夹>/`，支持云端变更检测；手工放入的文件在全量重建时自动纳管并回填归属
+- **智能体工作台**：标准知识库构建与版本管理（Pi 多角色编排、增量构建、断点恢复、发布门与构建度量），Discuss/Work 会话、任务编排与插件管理
+- **知识库共享**：本机 stdio MCP 与可信局域网 MCP，同一套 20 个只读工具检索、阅读原始库与已发布标准库，见 [docs/kb-lan-mcp.md](./docs/kb-lan-mcp.md)
+- **命令行访问**：默认开启 `feishu-sync` CLI 并生成命令入口，内置 Skill 可安装到 `.agents` / Claude Code / Codex，命令面见 [docs/cli-reference.md](./docs/cli-reference.md)
+- **写回与发布**：源文档本地编辑经确认写回飞书（`feishuWrite`，默认关）；标准库反向发布到飞书知识库（`feishuPublish`，默认关），见 [docs/feishu-publish.md](./docs/feishu-publish.md)
 - **双视图与预览**：节点树支持飞书结构视图 / 本地目录视图；表格优先预览 Excel 画板，保留行列尺寸、合并区域、字体底色和图片位置，支持工作表切换与缩放
 - **系统托盘**：常驻托盘，快捷键（CmdOrCtrl+Shift+F）显示窗口，支持开机自启
 - **自动更新**：electron-updater 集成，支持检查/下载/安装更新流程
@@ -74,7 +78,7 @@ node node_modules/tsx/dist/cli.mjs server/scripts/preview-sheet-workbook.ts <已
 - **数据**：better-sqlite3 12（SQLite，documents/sync_log/run_log 主表 + localDirs/custom_folders 等辅助表，启动时 additive 迁移原地升级）
 - **LLM**：OpenAI SDK → 智谱 bigmodel GLM（OpenAI 兼容端点，默认 `glm-4-flash`）
 - **飞书**：lark-cli（实测 1.0.89；1.0.97 的 config init 双形态 URL 已兼容；认证、变更检测、内容读取、媒体下载与写回统一入口；工具不保存飞书 token）
-- **Agent（开发分支）**：外部 Node ≥22.19 + pi ≥1.4/<2 的 RPC 侧车；独立只读 MCP stdio 产物与 `feishu-sync` CLI（esbuild 单文件 CJS）
+- **Agent**：会话运行时默认外部 Node ≥22.19 + pi ≥1.4/<2 的 RPC 侧车，可选 Claude Code 后端；独立只读 MCP stdio 产物、局域网 MCP 网关与 `feishu-sync` CLI（esbuild 单文件 CJS）
 - **开发**：TypeScript 5 + esbuild 0.28
 
 ---
@@ -90,7 +94,7 @@ node node_modules/tsx/dist/cli.mjs server/scripts/preview-sheet-workbook.ts <已
 - **SyncEngine**：内容分型读取 → 媒体引用解析/下载 → 本地引用重写 → staged 原子提交 → SQLite 基线推进
 - **LayoutReconstructor**：A/B/C/D/E 五类块识别的表格重构引擎
 - **ContentAdapter**：direct 通道（bigmodel GLM）few-shot 风格对齐（temperature 0.2）
-- **LocalMapStore**：SQLite 映射与状态库（首次索引扫描 < 10s；watchedRoot/自定义归档双身份回填）
+- **LocalMapStore**：SQLite 映射与状态库（watchedRoot/自定义归档双身份回填）
 - **TrayService**：系统托盘常驻与变更通知
 - **UpdaterService**：electron-updater 集成（autoDownload=false，autoInstallOnAppQuit=false）
 
@@ -223,9 +227,9 @@ start-dev.bat
 npm run dev:desktop
 
 # 链路说明：
-# 1. 预编译 server/dist + dist-electron/main.cjs
+# 1. 预编译 server/dist + dist-electron/*.cjs
 # 2. concurrently 并行启动 vite（5173）+ electron（内嵌 server）
-# 3. Electron 主进程内跑 server（better-sqlite3 ABI 115 一致，无冲突）
+# 3. server 跑在 Electron utilityProcess 子进程（better-sqlite3 ABI 与 Electron 115 一致，无冲突）
 # 4. 开发态 loadURL localhost:5173，自动打开 DevTools
 ```
 
@@ -279,7 +283,7 @@ export APPLE_API_ISSUER="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 1. **启动应用**：安装 `FeishuSync-Setup-<version>-x64.exe` 后启动
 2. **配置面板**：设置知识库根路径 + 飞书根 URL + LLM API Key（默认 bigmodel GLM）
 3. **认证确认**：检查认证状态是否就绪（lark-cli auth status）
-4. **首次索引**：工具自动扫描本地已有 `.md` 文件（< 10s，35 节点）
+4. **首次索引**：工具自动扫描本地已有 `.md` 文件，建立本地映射与同步基线
 5. **变更检测**：定时轮询（默认 30min），托盘通知变更数量
 6. **选择同步**：GUI 选择文档 → 点击同步 → 本地 Markdown 更新
 
@@ -356,7 +360,14 @@ feishu-sync/
 ## 开发文档导航
 
 - [docs/](./docs/README.md) —— 开发文档宗引（架构 / 开发 / 测试 / 数据契约 / 运维）
-- [Agent 标准知识库工作台](./docs/agent-knowledge.md) —— 开发分支的配置、构建、权限与 MCP 使用说明
+- [Agent 标准知识库工作台](./docs/agent-knowledge.md) —— 配置、构建、权限与 MCP 使用说明
+- [CLI 命令参考](./docs/cli-reference.md) —— `feishu-sync` CLI 命令、风险级与退出码
+- [知识库检索](./docs/kb-retrieval.md) —— 原始库/标准库检索、MCP 工具与评测
+- [构建编排](./docs/build-orchestration.md) —— 标准库构建的 Pi 多角色编排、epoch 与发布门
+- [反向发布](./docs/feishu-publish.md) —— 标准库发布到飞书知识库
+- [源文档云端操作](./docs/source-cloud-operations.md) —— 云端历史、回滚、移出与重命名
+- [故障排查](./docs/troubleshooting.md) —— 常见问题与排查入口
+- [安全模型](./docs/security-model.md) —— 令牌域、批准流与审计
 - [CHANGELOG.md](./CHANGELOG.md) —— 版本化变更记录（Release 说明同源）
 - [CLAUDE.md](./CLAUDE.md) —— 仓库工程约定（架构 gotcha、命令、安全红线、原生模块 ABI）
 - 各模块头部注释 —— 大量「P0-Qx 实测 / 实测 confirmed / 历史教训」标注记录设计动机
@@ -365,7 +376,7 @@ feishu-sync/
 
 ## 当前状态与已知限制
 
-**当前状态**：v0.4.0。支持定时变更检测、分型同步、自定义归档、标准知识库构建与阅读、应用会话、MCP 和自动更新。
+**当前状态**：支持定时变更检测、分型同步、自定义归档、标准知识库构建与阅读、应用会话、MCP（本机与局域网）、CLI 和自动更新。版本与变更记录见 [CHANGELOG.md](./CHANGELOG.md)。
 
 **已知限制**：
 - macOS 打包需 macOS 环境（Windows 上无法生成 macOS DMG）
@@ -385,7 +396,7 @@ npm run typecheck      # 根 src + 根配置 + server 三段类型检查
 npm run test:all       # 前端 (vitest) + server (vitest) 测试
 ```
 
-push/PR 会触发 [CI workflow](.github/workflows/ci.yml) 执行同样的检查，请先本地跑通。
+push/PR 会触发 [CI workflow](.github/workflows/ci.yml) 执行同样的检查（两个 pi 集成测试由 CI 单独安装 pi CLI 运行），请先本地跑通。
 详见 [CONTRIBUTING.md](./CONTRIBUTING.md)。
 
 发布流程：提交合入 `main` 后按 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 在 `CHANGELOG.md` 顶部归档条目，`npm version <patch|minor> --no-git-tag-version` 后打 `v*` 标签推送，[Release workflow](.github/workflows/release.yml) 自动构建三平台产物并发布（Release 说明从 CHANGELOG 同步提取）。

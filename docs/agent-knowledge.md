@@ -1,6 +1,6 @@
 # Agent 标准知识库工作台
 
-> 开发分支功能，尚未发版。R01/R04残留修复已通过[独立安全复审](reports/agent-knowledge-review.md)，本地自动检查与集成证据见[集成记录](reports/agent-knowledge-integration.md)。现有v0.3.47安装包不包含此工作台；Electron本机GUI、Windows/安装包和真实远端app-llm Key等验证边界仍保留，不代表已具备跨平台发版结论。
+> R01/R04 残留修复已通过[独立安全复审](reports/agent-knowledge-review.md)，本地自动检查与集成证据见[集成记录](reports/agent-knowledge-integration.md)。Electron 本机 GUI、Windows/安装包和真实远端 app-llm Key 等验证边界仍保留，不代表已具备跨平台发版结论。
 
 ## 从原始资料到标准库
 
@@ -195,7 +195,7 @@ Excel 可使用 `raw_list_sheets`、`raw_search_sheet` 和 `raw_read_sheet` 获�
 - 普通标准库搜索的 `knowledgeStatus` 是文档级对象状态汇总；章节正文后的 `knowledge_status` 显示相关对象的业务状态、审查状态和证据数。发布、机器审查通过和业务批准是不同状态；需要作为现行规则执行时使用 `usage: operational`，或通过 `get_object` 核对对象及证据。
 - 需要批量登记业务批准时，在标准库“治理”中按标题或文档路径搜索，核对所选对象的正文与来源，勾选后填写共同依据。每项决定独立记录；中途冲突会停止并显示已完成数量。决定在下一次成功发布时进入正式版，人工内容复核仍独立进行。
 - 源标题和对应本地路径的版本标签不一致时，返回 `source_version_label_mismatch`。本地可能保留旧路径名，不能用名称判断正文版本；应用保留原文件，构建时提示核对。
-- 变更清单的 `removed` 只说明本版不再包含原路径。构建明确声明合并时记录 `mergedInto`；历史版本未记录时返回 `null`，不根据共享源或相似标题猜测去向。后续构建可通过 `kb_finish.docMerges` 声明旧路径与目标路径，发布前验证旧路径已移除且目标存在。
+- 变更清单的 `removed` 只说明本版不再包含原路径。构建明确声明合并时记录 `mergedInto`；历史版本未记录时返回 `null`，不根据共享源或相似标题猜测去向。合并去向的声明入口按粒度区分：文档级 `mergedInto` 目前仅由旧批处理（legacy）编排的 `kb_finish.docMerges` 声明；默认的 Pi 编排经 `kb_edit_doc.objectMerges` 与 `build_register_migrations` 登记的是知识对象迁移，属对象级记录，不填充文档级 `mergedInto`。构建编排详见 [build-orchestration.md](build-orchestration.md)，命令行命令见 [cli-reference.md](cli-reference.md)。
 - 路径不存在时，`kb_not_found.suggestions` 返回最多五个近似路径供重试，不会自动替换目标。没有合理候选时仍为空。
 
 在「设置 → Agent 标准库 → 知识库共享 → 本机 MCP 安装」选择 Codex、Claude Code 或 .agents 兼容客户端并安装；也可复制连接片段手动配置。安装后重新启动对应客户端或开启新会话。应用只管理自身创建且未被外部修改的条目。换机器或安装位置后更新配置，不要照搬开发者的绝对路径。

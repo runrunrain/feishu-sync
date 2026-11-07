@@ -1,5 +1,7 @@
 # Agent 标准知识库设计调研报告（D1）
 
+> 历史取舍证据（2026-10 调研时点）。其中「server 运行位置」一项已变化：现由 Electron 托管运行在 utilityProcess 子进程（`electron/server-process.ts`），不再由主进程直接 import；对 pi 接入方式的结论不受影响。
+
 - 任务：D1 公共方向设计（设计态，只写设计 artifact）
 - 产物：`docs/design/agent-knowledge-design.md`（公共契约）、本报告（证据与取舍）
 - 上游输入：`docs/plans/agent-knowledge-workflow.md`、项目 `CLAUDE.md`、pi 1.4.0 安装包文档与类型声明、trade-wisdom 源码（只读）、`~/.agents/skills/planner-doc-style/SKILL.md`

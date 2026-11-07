@@ -10,7 +10,7 @@ echo ""
 
 echo "[1/4] 检查 Node.js..."
 if ! command -v node &> /dev/null; then
-    echo "错误：未找到 Node.js，请安装 Node.js 18+ 后重试"
+    echo "错误：未找到 Node.js，请安装 Node.js 22.19+（22.x/24.x LTS）后重试"
     echo "下载地址：https://nodejs.org/"
     exit 1
 fi

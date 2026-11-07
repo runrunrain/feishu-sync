@@ -12,7 +12,7 @@ cd /d "%~dp0"
 echo [1/4] 检查 Node.js...
 where node >nul 2>&1
 if errorlevel 1 (
-    echo [错误] 未检测到 Node.js, 请安装 Node.js 18+ : https://nodejs.org/
+    echo [错误] 未检测到 Node.js, 请安装 Node.js 22.19+ (22.x/24.x LTS) : https://nodejs.org/
     pause
     exit /b 1
 )

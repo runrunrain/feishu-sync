@@ -2,7 +2,7 @@
 
 ## 环境要求
 
-- Node.js **22.19+（22.x）或 24.x LTS**（实测 v24；CI 用最新22；根 engines 与锁定工具链一致）。此处是开发/打包宿主要求，不改变 Electron31 内置 Node20。
+- Node.js **22.19+（22.x）或 24.x LTS**（`engines: ^22.19.0 || ^24.0.0`；实测 v24；CI 用 22 LTS）。此处是开发/打包宿主要求，不改变 Electron31 内置 Node20。
 - lark-cli 1.0.89+（全局安装 `npm install -g lark-cli`，用于飞书认证/读取，工具本身零 token）
 - 依赖装两份：根目录（前端 + electron + 工具链）和 `server/`（业务 + 测试）
 
@@ -14,8 +14,8 @@ npm install && cd server && npm install && cd ..
 
 | 包 | 职责 | 测试 |
 |----|------|------|
-| 根 | React 前端 `src/`、Electron `electron/`、构建脚本 | vitest（`src/**/*.test.{ts,tsx}`，27 文件） |
-| `server/` | Hono server、业务模块、运维脚本 | vitest（`tests/**/*.test.ts`，90 文件） |
+| 根 | React 前端 `src/`、Electron `electron/`、构建脚本 | vitest（`src/**/*.test.{ts,tsx}`，约 85 个文件，2026-11 实测） |
+| `server/` | Hono server、业务模块、运维脚本 | vitest（`tests/**/*.test.ts`，约 237 个文件，2026-11 实测） |
 
 根 `dependencies` 为空、运行库全在 devDependencies——这是既定结构（打包只收 `server/node_modules/**`，见 `electron-builder.config.cjs` files 列表），不是错误。
 
@@ -28,18 +28,25 @@ npm run server:dev     # 仅 server (tsx watch, :3001, standalone)
 npm run dev:all        # 前端 + server 并行（浏览器调，非 Electron）
 npm run dev:desktop    # 编译 server/dist + dist-electron 后并行 vite + electron
 
-# 质量门禁（CI 同口径，提交前必跑）
+# 质量门禁（提交前必跑；CI 同项目集，pi integration 另行拆分，见 docs/testing.md）
 npm run check          # lint + typecheck + 前端/server 全部测试
 npm run lint           # eslint
 npm run typecheck      # 根 src（含测试）+ 根配置 + server 三段
 npm run test:all       # 双包全部测试
+npm run format:check   # prettier 检查（format 为写入版）
 
 # 构建
-npm run build:all      # vite build + server tsc（含 build-agent-assets：prompts/MCP/CLI 产物）
-npm run electron:build # esbuild main/preload → dist-electron/*.cjs
+npm run build:all      # vite build + server tsc（含 build-agent-assets：prompts/MCP/gateway/CLI/amagi 快照产物）
+npm run electron:build # esbuild → dist-electron/{main,preload,server-process-entry}.cjs 三产物
 ```
 
-`build:all` 中的 server build 会同步生成 Agent 工作台资产：内置 prompts/转发扩展复制、独立 MCP CJS（`server/dist/mcp/kb-mcp.cjs`）与 CLI 客户端（`server/dist/cli/feishu-sync-cli.cjs`，esbuild 单文件、零原生依赖）。CLI 的使用与认证见 [agent-knowledge.md](./agent-knowledge.md)「命令行访问」。
+`build:all` 中的 server build 会同步运行 `server/scripts/build-agent-assets.mjs` 生成 Agent 工作台资产：
+
+- 复制内置 prompts、pi 转发扩展（tsc 不处理非 TS 资产）；
+- esbuild 单文件打包 3 个 CJS bundle：独立 MCP（`dist/mcp/kb-mcp.cjs`）、LAN MCP 网关（`dist/mcp/kb-mcp-gateway.cjs`）、CLI 客户端（`dist/cli/feishu-sync-cli.cjs`，零原生依赖）。
+- 另维护内置 amagi 依赖快照：`scripts/lib/bundled-amagi.mjs` 从 amagi-pi 源码（同级 `../amagi-pi` 或 `AMAGI_PI_SOURCE_DIR`）按 npm 发布清单冻结打包，刷新 `server/bundled/amagi-pi/package.zip` + `manifest.json`（源码/锁/补丁 hash 变化时重建）并安装到 `dist/agent/bundled-amagi`——这是 npm 依赖快照 zip，不是 esbuild 产物；来源/补丁/校验规则见该脚本头注释。
+
+CLI 的使用与认证见 [agent-knowledge.md](./agent-knowledge.md)「命令行访问」，完整命令参考见 [cli-reference.md](./cli-reference.md)。
 
 单跑 server 测试/用例：
 
@@ -48,6 +55,8 @@ cd server
 npx vitest run tests/sync-engine.test.ts   # 单文件
 npx vitest run -t "sheet header"           # 单用例名
 ```
+
+pi 相关的两个测试（`pi-plugin-service` / `pi-native-work`）需要独立安装 pi 包，本地运行方式见 [testing.md](./testing.md)。
 
 ## 原生模块 ABI（better-sqlite3，最大的环境坑）
 
