@@ -109,7 +109,11 @@ export const RAW_READ_SPEC: AgentToolSpec = {
       includeBlankCsvRows: { type: 'boolean', description: '可选；默认折叠连续 3 行以上已验证全空的 CSV 记录，保留原始行号、分页和读回执；需要逐字查看空行时设 true' },
     },
     required: ['objToken'],
-    additionalProperties: false,
+    // WP-E（E4）：实测构建中模型多次多传无害字段 kind（mcp_call 包装泄漏），
+    // additionalProperties:false 在客户端校验层整回合拒绝。与 WP-C 只读工具
+    // 放开清单对齐：kind 由 normalizeToolArguments 忽略并说明，其余未知
+    // 参数仍报精确错误。
+    additionalProperties: true,
   },
 };
 
@@ -140,12 +144,16 @@ export const RAW_CSV_FIND_SPEC: AgentToolSpec = {
     type: 'object',
     properties: {
       objToken: string('源文档 objToken'),
-      resourceId: string('raw_read 资源表中的完整 #csv: 资源 ID'),
+      // WP-E（E5）：resourceId 可缺省——该来源恰有一个 CSV 附件时服务端自动
+      // 选用并在结果中注明；多附件时精确错误列出候选（名称与行数）。
+      resourceId: string('raw_read 资源表中的完整 #csv: 资源 ID；可省略——该来源只有一个 CSV 附件时自动选用'),
       queries: { type: 'array', items: { type: 'string', minLength: 2, maxLength: 200 }, minItems: 1, maxItems: 24,
         description: '待定位的源文短语，逐格子串匹配；每项最多返回前 5 处' },
     },
-    required: ['objToken', 'resourceId', 'queries'],
     // WP-C：上限 8→24（超过 8 项在结果中注明；>24 服务端报精确错误）。
+    // WP-E（E5）：resourceId 移出 required——缺省解析在服务端（唯一附件
+    // 自动选用 / 多附件精确错误），否则客户端校验层先行拒绝。
+    required: ['objToken', 'queries'],
     additionalProperties: true,
   },
 };
@@ -186,7 +194,10 @@ export const DRAFT_READ_SPEC: AgentToolSpec = {
     properties: {
       path: string('草稿 POSIX 相对路径'),
       offset: integer('起始行（0 基）', 0),
-      limit: integer('返回行数上限', 1, 2000),
+      // WP-E（E3）：minimum 1→0——实测构建 11 次 limit:0 被「expected >= 1」
+      // 在客户端校验层整回合拒绝（模型想只读声明）。0 的唯一语义：只返回
+      // 声明/元数据不返回正文行；无声明请求时服务端报精确错误。
+      limit: integer('返回行数上限；0=只读声明不返回正文行（须与 includeDeclarations/declarationClaimKey/declarationObjectKey 或 metadataOnly 同用）', 0, 2000),
       metadataOnly: { type: 'boolean', description: '仅返回小型元数据：sources、coverage itemId/disposition、editContentHash、draftRevision；大草稿修订前先用此项。不能与 includeDeclarations=true、declarationClaimKey 或 declarationObjectKey 同时使用；读取声明时省略 metadataOnly' },
       includeDeclarations: { type: 'boolean', description: '附上此文档的知识对象、稳定 clientKey 与关联声明，供修订时保留对象身份和证据登记' },
       declarationClaimKey: string('可选：只返回含此 claimKey 的对象、该断言及其证据；自动启用 includeDeclarations，审查单个疑点时避免整篇声明过大'),
@@ -327,14 +338,14 @@ export const KB_WRITE_DOC_SPEC: AgentToolSpec = {
         items: {
           type: 'object',
           properties: {
-            clientKey: string('对象临时标识（后续 presentations/relations/evidence 用它引用；构建内稳定）'),
+            clientKey: string('对象临时标识（后续 presentations/relations/evidence 用它引用；构建内稳定；重申既有对象可直接用其 ko_ objectId 作 clientKey，并从 draft_read 声明回传原 familyKey/variantKey/scopeKey）'),
             type: { type: 'string', enum: ['overview', 'concept', 'rule', 'procedure', 'data_structure', 'decision'], description: '对象类型（六类）' },
             title: string('对象展示名'),
             aliases: { type: 'array', items: { type: 'string' }, description: '受控别名（只帮助查找，不自动合并）' },
             domainIds: { type: 'array', items: { type: 'string' }, description: '领域标注' },
             familyKey: string('同一业务问题的聚合键（规划提出）'),
-            variantKey: string('方案区分键；无变体可省略，由 server 填 default'),
-            scopeKey: string('可选；省略时 server 从本文档路径和 scopeText 生成稳定键'),
+            variantKey: string('方案区分键；无变体可省略，由 server 填 default。与 familyKey+scopeKey 共同构成对象身份：重申既有对象时从 draft_read 声明回传原值'),
+            scopeKey: string('可选；省略时 server 从本文档路径和 scopeText 生成稳定键（改写 scopeText 会生成不同键 → 身份不命中）。重申既有对象时从 draft_read 声明回传原值'),
             scopeText: string('可读范围说明'),
             headingPath: { type: 'array', items: { type: 'string' }, description: 'canonical 主位置：markdown 内的标题路径（定位对象章节；与 bodyRange 二选一）' },
             occurrence: integer('headingPath 命中重复标题时的次序（1 起始，缺省 1）', 1),
@@ -1012,7 +1023,11 @@ export const KB_EDIT_DOC_SPEC: AgentToolSpec = {
         },
       },
       evidenceSelectorUpdates: {
-        type: 'array', minItems: 1, maxItems: 20,
+        // WP-E（E2）：上限 20→80——实测增量文档可携带 40+ 条继承证据需要
+        // 批量重定位；>20 在客户端 schema 层整回合拒绝，分批提交又因声明
+        // 原子校验失败。80 与单篇证据规模（evidenceClaimsAdd 50）同量级，
+        // 原子语义不变（writeDocCore 整体校验后一次提交）。
+        type: 'array', minItems: 1, maxItems: 80,
         description: '可选：按现有 evidenceId 替换 selector；其余对象、来源、断言与未改证据由服务端继承。新范围必须有覆盖的读回执。',
         items: {
           type: 'object',
@@ -1060,7 +1075,7 @@ export const KB_EDIT_DOC_SPEC: AgentToolSpec = {
       },
       coverageUpdates: {
         type: 'array', minItems: 1, maxItems: 20,
-        description: '可选：以已有 itemId 更新覆盖项，未列出的覆盖项与对象/证据声明由服务端继承。',
+        description: '可选：以已有 itemId 更新覆盖项（itemId 必填，可用 draft_read(metadataOnly:true) 查询本篇 coverageItems 的 itemId），未列出的覆盖项与对象/证据声明由服务端继承。',
         items: {
           type: 'object',
           properties: {

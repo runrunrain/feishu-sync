@@ -752,6 +752,50 @@ export class BuildRuntimeHost {
     return content.filter((block) => block?.type === 'text' && typeof block.text === 'string').map((block) => block.text).join('\n');
   }
 
+  /**
+   * WP-F：从 task_submit/task_resume 失败结果文本提取拒绝码。扩展层拒绝
+   * 形如 `…消息（dispatch_inflight_write_exhausted）`；任务系统/守卫错误
+   * 常见 `code: 消息` 或 `[code] 消息`；无法识别返回 'unknown'（不猜测）。
+   */
+  static parseDispatchRejectionCode(text: string): string {
+    const trailing = /[（(]([a-z][a-z0-9_]{2,})[)）]\s*$/.exec(text.trim());
+    if (trailing) return trailing[1];
+    const leading = /^([a-z][a-z0-9_]{2,})[:\uff1a]/.exec(text.trim());
+    if (leading) return leading[1];
+    const bracket = /^\[([a-z0-9_.-]{2,})\]/.exec(text.trim());
+    if (bracket) return bracket[1];
+    return 'unknown';
+  }
+
+  /**
+   * WP-F：派发拒绝审计追加（add-only；只影响度量，不影响事件泵/监督语义）。
+   * epoch 口径与 writeDispatchInflightSnapshot 同源；失败静默。
+   */
+  private static appendDispatchRejection(
+    dataRoot: string,
+    session: HostSession,
+    record: { tool: string; agent: string | null; occurredAt: string; result: unknown },
+  ): void {
+    try {
+      const epoch = session.supervisor?.state.runtimeEpoch ?? session.binding?.runtimeEpoch ?? 1;
+      const dirs = planBuildDirectories(dataRoot, session.buildId, epoch);
+      const text = BuildRuntimeHost.resultText(record.result);
+      const line = JSON.stringify({
+        schemaVersion: 1,
+        at: record.occurredAt,
+        tool: record.tool,
+        agent: record.agent,
+        code: BuildRuntimeHost.parseDispatchRejectionCode(text),
+        message: text.slice(0, 300),
+      });
+      const file = path.join(dirs.epochRoot, 'dispatch-rejections.jsonl');
+      fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+      fs.appendFileSync(file, `${line}\n`, 'utf-8');
+    } catch {
+      /* 拒绝审计写入失败不中断事件泵（度量缺口由 notes 如实暴露） */
+    }
+  }
+
   /** task_resume 结果的父任务全量 id（`父会话 <uuid>`；短 id 回解注册表）。 */
   private static parseParentHandle(result: unknown, args: Record<string, unknown> | undefined, actorStore: BuildActorStore): string | null {
     const text = BuildRuntimeHost.resultText(result);
@@ -866,6 +910,18 @@ export class BuildRuntimeHost {
           }, event));
         }
         return;
+      }
+      // WP-F（kb-build-speedup）：派发拒绝审计（add-only 度量采集）——
+      // task_submit/task_resume 执行失败（派发守卫拒绝/任务系统拒绝）时把
+      // 拒绝事件追加到 <epochRoot>/dispatch-rejections.jsonl，供终态度量
+      // dispatchRejections 计数。失败静默（只影响度量，不影响事件泵/监督）。
+      if (isError && stash) {
+        BuildRuntimeHost.appendDispatchRejection(this.deps.dataRoot, session, {
+          tool: toolName,
+          agent: typeof stash.args.agent === 'string' ? stash.args.agent : null,
+          occurredAt: event.occurredAt,
+          result: payload.result,
+        });
       }
       return;
     }

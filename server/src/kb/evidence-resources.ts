@@ -130,6 +130,37 @@ export interface ImageEvidencePayload {
   bytes: Buffer;
 }
 
+/** WP-G：单张图片引用在资源表中的登记状态（kb_write_doc 证据资源错误的
+ * 精确提示用）。registered = 已进资源表；state/reason 来自构建预描述登记
+ * （未尝试过或无登记的图片无该信息）。 */
+export interface ImageResourceStatus {
+  src: string;
+  registered: boolean;
+  state?: ImageDescription['state'];
+  reason?: string;
+}
+
+/** 列出源内全部图片引用的登记状态；与 collectImageEvidenceResources 同一
+ * 枚举面（resolveSourceImages），只读不落盘。 */
+export function imageResourceStatuses(input: {
+  knowledgeBaseRoot: string;
+  entry: RawSourceSnapshotEntry;
+  content: string;
+  descriptions: Map<string, ImageDescription> | undefined;
+  registeredResourceIds: ReadonlySet<string>;
+}): ImageResourceStatus[] {
+  return resolveSourceImages(input.knowledgeBaseRoot, input.entry.relPath, input.content).map((image) => {
+    const description = input.descriptions?.get(image.src);
+    return {
+      src: image.src,
+      registered: input.registeredResourceIds.has(imageResourceId(input.entry.objToken, image.src)),
+      ...(description
+        ? { state: description.state, ...(description.reason ? { reason: description.reason } : {}) }
+        : {}),
+    };
+  });
+}
+
 /**
  * 装配源内被引用图片的证据资源。识图描述与白板旁路文字都可成为
  * caption（参与 quoteHash），并绑定同一图片本体字节 hash。白板旁路

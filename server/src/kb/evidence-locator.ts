@@ -237,6 +237,22 @@ export function csvNonEmptyColumnLabels(content: string, recordStart: number, re
   return [...columns].sort((a, b) => a - b).map((index) => `@${colLetters(index + 1)}`);
 }
 
+/** WP-E 复审（R4-01）：raw_csv_cells 窗口的序列化体量保守估算——该工具
+ * 返回区间内全部非空单元格（JSON 载荷，超过 16000 字符报 raw_csv_cells_
+ * too_large）。估算 ≥ 实际序列化（每格附坐标/引号等开铅），用于保证
+ * 聚合建议「按提示执行后单次可返回、回执可覆盖 selector」。纯函数。 */
+export function csvWindowSerializedEstimate(content: string, recordStart: number, recordEnd: number): number {
+  const { records } = parseCsvRecords(content);
+  let estimate = 220; // 载荷外壳（objToken/resourceId/分页字段）余量
+  for (let recordNo = Math.max(1, recordStart); recordNo <= Math.min(recordEnd, records.length); recordNo += 1) {
+    estimate += 48; // 每条 record 的坐标/包裹字段
+    for (const value of records[recordNo - 1]!) {
+      if (value.trim()) estimate += value.length + 18;
+    }
+  }
+  return estimate;
+}
+
 // ============================================================================
 // resolveSelector（A 案 §5.2 定位规范）
 // ============================================================================
@@ -521,4 +537,24 @@ function selectorWithinReceipt(
 /** 便捷：按内容构造资源哈希（与 raw_read 回执资源表同公式）。 */
 export function contentResourceHash(content: string): string {
   return resourceHashOf(content);
+}
+
+/** WP-E（E1）：selector 规范化身份键——全字段有序序列化，用于「继承证据
+ * 是否本次未修改」的逐字段比对（与 JSON.stringify 的键序无关，存储侧与
+ * 声明侧同构）。纯函数，无 IO。 */
+export function selectorIdentityKey(selector: EvidenceSelector): string {
+  switch (selector.kind) {
+    case 'text_span':
+      return JSON.stringify([selector.kind, selector.lineStart, selector.lineEnd, selector.colStart, selector.colEnd,
+        selector.headingPath, selector.contextHashBefore ?? null, selector.contextHashAfter ?? null]);
+    case 'csv_cells':
+      return JSON.stringify([selector.kind, selector.resourcePath, selector.parserVersion, selector.recordStart,
+        selector.recordEnd, selector.columns, selector.businessKeys ?? null]);
+    case 'workbook_cells':
+      return JSON.stringify([selector.kind, selector.workbookName, selector.sheet, selector.rangeA1,
+        selector.mergedCellAnchors, selector.formulaTexts ?? null, selector.valueNature]);
+    case 'media_region':
+      return JSON.stringify([selector.kind, selector.imageHash ?? null, selector.region ?? null,
+        selector.captionHash ?? null, selector.describerVersion ?? null]);
+  }
 }

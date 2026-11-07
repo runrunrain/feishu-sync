@@ -104,17 +104,23 @@ import {
 import {
   contentResourceHash,
   csvNonEmptyColumnLabels,
+  csvWindowSerializedEstimate,
   parseCsvRecords,
   resolveSelector,
+  selectorIdentityKey,
   verifyEvidence,
   type EvidenceReadReceipt,
   type EvidenceResource,
+  type SelectorResolution,
+  type SelectorResolutionFailure,
 } from '../kb/evidence-locator.js';
 import {
   IMAGE_RESOURCE_PREFIX,
   WORKBOOK_RESOURCE_PREFIX,
   collectImageEvidenceResources,
+  imageResourceStatuses,
   loadWorkbookEvidenceResource,
+  type ImageResourceStatus,
 } from '../kb/evidence-resources.js';
 import { computeCandidateHash, type ReviewIssue, type ReviewReport } from '../kb/orchestration-contracts.js';
 import {
@@ -1212,7 +1218,8 @@ export class AgentToolService {
       : this.rawEntriesForDiscuss(context);
     const entries = scopeToken ? allEntries.filter((entry) => entry.objToken === scopeToken) : allEntries;
     if (scopeToken && entries.length === 0) {
-      throw new ToolError('not_found', `原始文档不存在或无成功本地版本: ${scopeToken}`, 404);
+      const hint = nearestObjTokenHint(context, this.documentsProvider(), scopeToken);
+      throw new ToolError('not_found', `原始文档不存在或无成功本地版本: ${scopeToken}${hint ? `；你是不是想读 ${hint}` : ''}`, 404);
     }
     if (queryList.length <= 1) {
       const single = queryList[0] ?? '';
@@ -1282,7 +1289,8 @@ export class AgentToolService {
     const documents = this.documentsProvider();
     const record = documents.find((doc) => doc.objToken === objToken);
     if (!record || !record.localRelPath || !collectSourceCandidates([record]).length) {
-      throw new ToolError('not_found', `原始文档不存在或无成功本地版本: ${objToken}`, 404);
+      const hint = nearestObjTokenHint(context, documents, objToken);
+      throw new ToolError('not_found', `原始文档不存在或无成功本地版本: ${objToken}${hint ? `；你是不是想读 ${hint}` : ''}`, 404);
     }
     const root = context.options.knowledgeBaseRoot;
     const target = resolveInside(root, record.localRelPath, 'read');
@@ -1308,7 +1316,8 @@ export class AgentToolService {
       ? context.options.buildState.snapshot.get(objToken)
       : this.rawEntriesForDiscuss(context).find((candidate) => candidate.objToken === objToken) ?? null;
     if (!entry) {
-      throw new ToolError('not_found', `原始文档不存在或无成功本地版本: ${objToken}`, 404);
+      const hint = nearestObjTokenHint(context, this.documentsProvider(), objToken);
+      throw new ToolError('not_found', `原始文档不存在或无成功本地版本: ${objToken}${hint ? `；你是不是想读 ${hint}` : ''}`, 404);
     }
     let lines: string[];
     if (context.options.buildState) {
@@ -1425,7 +1434,10 @@ export class AgentToolService {
       throw new ToolError('invalid_request', 'recordStart..recordEnd 须为非空闭区间');
     }
     const entry = state.snapshot.get(objToken);
-    if (!entry) throw new ToolError('not_found', `原始文档不存在或无成功本地版本: ${objToken}`, 404);
+    if (!entry) {
+      const hint = nearestObjTokenHint(context, this.documentsProvider(), objToken);
+      throw new ToolError('not_found', `原始文档不存在或无成功本地版本: ${objToken}${hint ? `；你是不是想读 ${hint}` : ''}`, 404);
+    }
     const assembled = this.assembleBuildRead(state, entry);
     const resource = assembled.resources.find((item) => item.resourceId === resourceId && item.kind === 'csv');
     if (!resource) throw new ToolError('not_found', `冻结源没有该 CSV 资源: ${resourceId}`, 404);
@@ -1484,15 +1496,39 @@ export class AgentToolService {
   private toolRawCsvFind(context: InternalRunContext, args: Record<string, unknown>, meta?: ToolRequestMeta): ToolResult {
     const state = requireBuildState(context);
     const objToken = requireString(args, 'objToken', 1, 256);
-    const resourceId = requireString(args, 'resourceId', 1, 512);
     const queries = requireArray(args, 'queries');
     // WP-C（R5）：单批上限 8→24（超过 8 项在结果中注明）；>24 报精确错误。
     if (queries.length < 1 || queries.length > 24 || queries.some((value) => typeof value !== 'string' || value.trim().length < 2 || value.length > 200)) {
       throw new ToolError('invalid_request', 'queries 须为 1–24 个长度 2–200 的非空短语（>8 项已属超批调用，建议拆分）');
     }
     const entry = state.snapshot.get(objToken);
-    if (!entry) throw new ToolError('not_found', `原始文档不存在或无成功本地版本: ${objToken}`, 404);
+    if (!entry) {
+      const hint = nearestObjTokenHint(context, this.documentsProvider(), objToken);
+      throw new ToolError('not_found', `原始文档不存在或无成功本地版本: ${objToken}${hint ? `；你是不是想读 ${hint}` : ''}`, 404);
+    }
     const assembled = this.assembleBuildRead(state, entry);
+    const csvResources = assembled.resources.filter((item) => item.kind === 'csv');
+    // WP-E（E5）：resourceId 可缺省——实测模型只给 objToken+queries。该来源
+    // 恰有一个 CSV 附件时自动选用并在结果中注明；无附件/多附件给一次可
+    // 修复的精确错误（列出候选名称与行数）。显式传入者仍按原校验拒绝。
+    let resourceNote: string | null = null;
+    let resourceId: string;
+    if (args.resourceId === undefined) {
+      if (csvResources.length === 1) {
+        resourceId = csvResources[0]!.resourceId;
+        resourceNote = `resourceId 缺省：该来源恰有一个 CSV 附件，已自动选用 ${resourceId}`;
+      } else if (csvResources.length === 0) {
+        throw new ToolError('invalid_request',
+          `raw_csv_find 需要参数 resourceId：来源 ${objToken} 没有 CSV 附件资源（完整 #csv: 资源 ID 来自 raw_read 资源表）`);
+      } else {
+        const listing = csvResources.map((item) =>
+          `${item.resourceId}（${item.label}，${parseCsvRecords(item.lines.join('\n')).records.length} 条 record）`).join('；');
+        throw new ToolError('invalid_request',
+          `raw_csv_find 需要参数 resourceId：来源 ${objToken} 有 ${csvResources.length} 个 CSV 附件，须指明其一——${listing}`);
+      }
+    } else {
+      resourceId = requireString(args, 'resourceId', 1, 512);
+    }
     const resource = assembled.resources.find((item) => item.resourceId === resourceId && item.kind === 'csv');
     if (!resource) throw new ToolError('not_found', `冻结源没有该 CSV 资源: ${resourceId}`, 404);
     const parsed = parseCsvRecords(resource.lines.join('\n'));
@@ -1546,9 +1582,13 @@ export class AgentToolService {
       }
       return { query, totalMatches, matches };
     });
+    const payloadNotes = [
+      ...(resourceNote ? [resourceNote] : []),
+      ...(queries.length > 8 ? [`已执行 ${queries.length} 项查询（超过单批建议的 8 项）；后续请拆分调用`] : []),
+    ];
     const payload = { objToken, resourceId, resourceHash: resource.resourceHash,
       totalRecords: parsed.records.length, results,
-      ...(queries.length > 8 ? { note: `已执行 ${queries.length} 项查询（超过单批建议的 8 项）；后续请拆分调用` } : {}) };
+      ...(payloadNotes.length ? { note: payloadNotes.join('；') } : {}) };
     return { content: [{ type: 'text', text: `<untrusted_source>\n${JSON.stringify(payload)}\n</untrusted_source>` }], details: payload };
   }
 
@@ -1839,28 +1879,187 @@ export class AgentToolService {
   private evidenceReadHint(state: BuildRunState, sourceId: string, resourceId: string, selector: EvidenceSelector): string {
     try {
       if (selector.kind === 'csv_cells') {
+        // R4-01：raw_csv_cells 返回区间内全部非空单元格，超过 16000 字符会报
+        // raw_csv_cells_too_large——这类区间同样无法由单张回执覆盖，直接给
+        // 「拆分证据」精确错误，不给无法满足的建议。
+        const csvEntry = state.snapshot.get(sourceId);
+        if (csvEntry) {
+          const csvResource = this.assembleBuildRead(state, csvEntry).resources
+            .find((item) => item.resourceId === resourceId && item.kind === 'csv');
+          if (csvResource
+            && csvWindowSerializedEstimate(csvResource.lines.join('\n'), selector.recordStart, selector.recordEnd) > 15_000) {
+            return `；record ${selector.recordStart}..${selector.recordEnd} 的单元格内容超过 raw_csv_cells 单次 16000 字符上限，单张回执无法完整覆盖；请把该证据拆成更小的 record 区间`;
+          }
+        }
         return `；建议先执行 raw_csv_cells(objToken:"${sourceId}", resourceId:"${resourceId}", recordStart:${selector.recordStart}, recordEnd:${selector.recordEnd}) 登记覆盖该范围的读回执（raw_read 的 R 是物理行、C 是逻辑 record；回执按物理行覆盖所选 record）`;
       }
       if (selector.kind === 'text_span') {
-        const spanLines = Math.min(selector.lineEnd - selector.lineStart + 1, 2000);
-        const entry = state.snapshot.get(sourceId);
-        if (entry) {
-          const assembled = this.assembleBuildRead(state, entry);
-          const covering = assembled.segments.filter((segment) => segment.resourceId === resourceId
-            && segment.resStart !== undefined && segment.resEnd !== undefined
-            && segment.resStart <= selector.lineEnd && segment.resEnd >= selector.lineStart);
-          if (covering.length > 0) {
-            const outFrom = Math.min(...covering.map((segment) => segment.outStart));
-            const outTo = Math.max(...covering.map((segment) => segment.outEnd));
-            return `；建议先执行 raw_read(objToken:"${sourceId}", offset:${outFrom - 1}, limit:${Math.min(outTo - outFrom + 1, 2000)}) 读取输出行 ${outFrom}..${outTo} 登记覆盖资源行 ${selector.lineStart}..${selector.lineEnd} 的读回执`;
-          }
-        }
-        return `；建议先执行 raw_read(objToken:"${sourceId}", offset:${selector.lineStart - 1}, limit:${spanLines}) 登记覆盖资源行 ${selector.lineStart}..${selector.lineEnd} 的读回执`;
+        return this.rawReadHintForRange(state, sourceId, resourceId, selector.lineStart, selector.lineEnd);
       }
     } catch {
       /* 提示装配失败不影响原错误语义 */
     }
     return '';
+  }
+
+  /** R4-02（复审 4）：资源行区间 → raw_read 建议文本。旧实现取覆盖 segment
+   * 的整段 outStart/outEnd（长资源上永远从段首 offset 0 读起，selector 在
+   * 后半段时建议永不命中）；改为按区间与各 segment 的**交集**逐段换算
+   * `outStart + (resourceLine - resStart)`（派生行位移/多段分别换算），
+   * 并按 renderBudgetedRawReadPage 同口径保守估算渲染字节——估算不过
+   * 软预算才保证单次 raw_read 整窗返回、回执可覆盖。被派生内容分隔成
+   * 多段、超行数/字节上限的区间给「拆分证据」精确错误：raw_read 每段/
+   * 每页单独登记回执，单张回执覆盖不了的 selector 靠补读永远无法满足。
+   * 所有调用点（错误提示与 WP-E 缺回执聚合）共用。 */
+  private rawReadHintForRange(
+    state: BuildRunState, sourceId: string, resourceId: string,
+    lineStart: number, lineEnd: number,
+  ): string {
+    const entry = state.snapshot.get(sourceId);
+    let plan: ReturnType<typeof planRawReadWindow> = null;
+    if (entry) {
+      try {
+        plan = planRawReadWindow(this.assembleBuildRead(state, entry), resourceId, lineStart, lineEnd);
+      } catch {
+        plan = null; /* 提示装配失败不影响原错误语义 */
+      }
+    }
+    return `；${rawReadAdvice(sourceId, lineStart, lineEnd, plan).text}`;
+  }
+
+  /** WP-E（E1 + 复审 R4-01）：缺覆盖回执范围的一次性聚合报错——按
+   * (sourceId, resourceId) 分组；覆盖窗按「每个原始 selector 一张初始窗」
+   * 生成，相邻且合并后仍不超单次读取上限（text ≤2000 行且渲染字节过
+   * raw_read 单页软预算、csv ≤20 record 且序列化体量过 raw_csv_cells
+   * 上限）才合并：任何合并/去重都不切断单条 selector——自动选择要求
+   * **单张**回执完整覆盖 selector，盲切/超预算窗口会造成「按全部建议
+   * 补读后仍缺回执」。单个 selector 本身无法由单张回执覆盖时给出
+   * 「拆分证据」的精确错误，不给无法满足的建议。判定条件不变（缺回执
+   * 仍拒绝写入），只是把「逐条首错即拒」改为一次列出全部（实测作者
+   * 逐条补读 10+ 回合仍无法收敛）。 */
+  private missingReceiptScopesError(
+    state: BuildRunState,
+    scopes: ReadonlyArray<{
+      evidenceId: string; clientKey: string; sourceId: string; resourceId: string;
+      selector: EvidenceSelector; inherited: boolean;
+    }>,
+  ): ToolError {
+    const groups = new Map<string, typeof scopes[number][]>();
+    for (const scope of scopes) {
+      const key = `${scope.sourceId}\u0000${scope.resourceId}`;
+      const list = groups.get(key) ?? [];
+      list.push(scope);
+      groups.set(key, list);
+    }
+    const lines: string[] = [];
+    const idListText = (ids: string[]): string => (ids.length > 6
+      ? `${ids.slice(0, 6).join('、')} 等 ${ids.length} 条` : ids.join('、'));
+    const unsatisfiable = (ids: string[], reason: string): string =>
+      `证据 ${idListText(ids)} 的 selector ${reason}，单张回执无法完整覆盖；请用 kb_edit_doc.evidenceSelectorUpdates 把该证据拆成更小区间（单张回执必须完整覆盖 selector，A 案 §5.3）`;
+    // R4-01：覆盖窗生成——初始窗 = 原始 selector 本身（可通过可满足性判定），
+    // 仅在合并后仍满足上限与预算时并入前窗（窗可重叠，绝不产生切断
+    // selector 或超预算的合并）。
+    const coverWindows = (
+      items: Array<{ start: number; end: number; ids: string[] }>,
+      cap: number,
+      fits?: (start: number, end: number) => boolean,
+    ): Array<{ start: number; end: number; ids: string[] }> => {
+      const sorted = [...items].sort((a, b) => a.start - b.start);
+      const windows: Array<{ start: number; end: number; ids: string[] }> = [];
+      for (const item of sorted) {
+        const last = windows[windows.length - 1];
+        const mergeable = last !== undefined
+          && item.start <= last.end + 1
+          && item.end - last.start + 1 <= cap
+          && (!fits || fits(last.start, item.end));
+        if (mergeable && last) {
+          last.end = Math.max(last.end, item.end);
+          last.ids = [...last.ids, ...item.ids];
+        } else {
+          windows.push({ ...item, ids: [...item.ids] });
+        }
+      }
+      return windows;
+    };
+    // R4-02：装配结果按源缓存（窗口计划复用；错误路径专用）。
+    type Assembled = ReturnType<AgentToolService['assembleBuildRead']>;
+    const assembledBySource = new Map<string, Assembled | null>();
+    const assembledFor = (sourceId: string): Assembled | null => {
+      if (!assembledBySource.has(sourceId)) {
+        let assembled: Assembled | null = null;
+        try {
+          const entry = state.snapshot.get(sourceId);
+          assembled = entry ? this.assembleBuildRead(state, entry) : null;
+        } catch {
+          assembled = null;
+        }
+        assembledBySource.set(sourceId, assembled);
+      }
+      return assembledBySource.get(sourceId) ?? null;
+    };
+    for (const [key, group] of groups) {
+      const [sourceId, resourceId] = key.split('\u0000');
+      const textJudged = group.flatMap((scope): Array<{ start: number; end: number; ids: string[]; reason: string | null }> =>
+        scope.selector.kind === 'text_span'
+          ? [{ start: scope.selector.lineStart, end: scope.selector.lineEnd, ids: [scope.evidenceId], reason: null }] : []);
+      for (const item of textJudged) {
+        if (item.end - item.start + 1 > 2000) {
+          item.reason = `资源行 ${item.start}..${item.end}（${item.end - item.start + 1} 行）超过 raw_read 单次 2000 行上限`;
+          continue;
+        }
+        const plan = planRawReadWindow(assembledFor(sourceId), resourceId, item.start, item.end);
+        if (plan) {
+          if (plan.pieces > 1) {
+            item.reason = `资源行 ${item.start}..${item.end} 被派生内容（图片描述/白板文字）分隔成 ${plan.pieces} 段（raw_read 每段单独登记回执）`;
+          } else if (plan.estBytes > TOOL_PAGE_SOFT_BUDGET_BYTES) {
+            item.reason = `资源行 ${item.start}..${item.end} 的输出窗口约 ${(plan.estBytes / 1024).toFixed(1)} KB，超过 raw_read 单页预算（约 ${Math.floor(TOOL_PAGE_SOFT_BUDGET_BYTES / 1024)} KB）`;
+          }
+        }
+      }
+      for (const item of textJudged.filter((entry) => entry.reason !== null)) {
+        lines.push(unsatisfiable(item.ids, item.reason!));
+      }
+      const textFits = (start: number, end: number): boolean => {
+        const plan = planRawReadWindow(assembledFor(sourceId), resourceId, start, end);
+        return plan === null || (plan.pieces <= 1 && plan.estBytes <= TOOL_PAGE_SOFT_BUDGET_BYTES);
+      };
+      for (const range of coverWindows(textJudged.filter((entry) => entry.reason === null), 2000, textFits)) {
+        const advice = rawReadAdvice(sourceId, range.start, range.end,
+          planRawReadWindow(assembledFor(sourceId), resourceId, range.start, range.end));
+        lines.push(`${advice.text}——覆盖证据 ${idListText(range.ids)}`);
+      }
+      const csvJudged = group.flatMap((scope): Array<{ start: number; end: number; ids: string[]; reason: string | null }> =>
+        scope.selector.kind === 'csv_cells'
+          ? [{ start: scope.selector.recordStart, end: scope.selector.recordEnd, ids: [scope.evidenceId], reason: null }] : []);
+      const csvResource = assembledFor(sourceId)?.resources.find((item) => item.resourceId === resourceId && item.kind === 'csv') ?? null;
+      for (const item of csvJudged) {
+        if (item.end - item.start + 1 > 20) {
+          item.reason = `record ${item.start}..${item.end}（${item.end - item.start + 1} 条）超过 raw_csv_cells 单次 20 record 上限`;
+          continue;
+        }
+        if (csvResource
+          && csvWindowSerializedEstimate(csvResource.lines.join('\n'), item.start, item.end) > 15_000) {
+          item.reason = `record ${item.start}..${item.end} 的单元格内容超过 raw_csv_cells 单次 16000 字符上限`;
+        }
+      }
+      for (const item of csvJudged.filter((entry) => entry.reason !== null)) {
+        lines.push(unsatisfiable(item.ids, item.reason!));
+      }
+      const csvFits = (start: number, end: number): boolean => !csvResource
+        || csvWindowSerializedEstimate(csvResource.lines.join('\n'), start, end) <= 15_000;
+      for (const range of coverWindows(csvJudged.filter((entry) => entry.reason === null), 20, csvFits)) {
+        const hint = this.evidenceReadHint(state, sourceId, resourceId, {
+          kind: 'csv_cells', resourcePath: '', parserVersion: '', recordStart: range.start, recordEnd: range.end, columns: [],
+        });
+        lines.push(`${hint.replace(/^；/, '') || `建议先执行 raw_csv_cells(objToken:"${sourceId}", resourceId:"${resourceId}", recordStart:${range.start}, recordEnd:${range.end}) 登记覆盖该 record 区间的读回执`}——覆盖证据 ${idListText(range.ids)}`);
+      }
+    }
+    const hasInherited = scopes.some((scope) => scope.inherited);
+    const header = scopes.length === 1
+      ? '文本/CSV 证据没有覆盖所选范围的 raw_read 回执；请先读取该资源和行范围，或显式提供有效 readReceiptId（A 案 §5.3）'
+      : `文本/CSV 证据没有覆盖所选范围的 raw_read 回执；请先读取该资源和行范围，或显式提供有效 readReceiptId（A 案 §5.3）。本次提交共 ${scopes.length} 条证据在本构建没有覆盖回执，已按资源合并相邻区间一次性列出——补读以下全部范围后原样重试整次提交，不要逐条探测：`;
+    return new ToolError('kb_evidence_unresolved',
+      `${header}\n${lines.map((line, index) => `${index + 1}. ${line}`).join('\n')}${hasInherited ? '\n（其中含继承自旧构建的证据：同样按本构建回执校验，补读后重试即可自动重绑，无需改写证据声明。）' : ''}`);
   }
 
   /** 追加读取回执到 staging/<buildId>/read-receipts.jsonl 与内存镜像。 */
@@ -2107,7 +2306,8 @@ export class AgentToolService {
       ? context.options.buildState.snapshot.get(objToken)
       : this.rawEntriesForDiscuss(context).find((candidate) => candidate.objToken === objToken) ?? null;
     if (!entry || !context.options.knowledgeBaseRoot) {
-      throw new ToolError('not_found', `原始文档不存在或无成功本地版本: ${objToken}`, 404);
+      const hint = nearestObjTokenHint(context, this.documentsProvider(), objToken);
+      throw new ToolError('not_found', `原始文档不存在或无成功本地版本: ${objToken}${hint ? `；你是不是想读 ${hint}` : ''}`, 404);
     }
     const content = this.readRawContent(context, objToken);
     const images = resolveSourceImages(context.options.knowledgeBaseRoot, entry.relPath, content);
@@ -2204,12 +2404,19 @@ export class AgentToolService {
     const docPath = requireString(args, 'path', 1, 600);
     const metadataOnly = args.metadataOnly === true;
     const offset = optionalInt(args, 'offset', 0, 0, 10_000_000);
-    const limit = optionalInt(args, 'limit', 800, 1, 2000);
+    // WP-E（E3）：minimum 放宽到 0——limit:0 语义无歧义：只返回声明/元数据
+    // 不返回正文行；无声明请求时下方报精确错误（实测 11 次 limit expected
+    // >= 1 的客户端层整回合拒绝）。
+    const limit = optionalInt(args, 'limit', 800, 0, 2000);
     const declarationClaimKey = args.declarationClaimKey === undefined ? null : requireString(args, 'declarationClaimKey', 1, 200);
     const declarationObjectKey = args.declarationObjectKey === undefined ? null : requireString(args, 'declarationObjectKey', 1, 200);
     const includeDeclarations = args.includeDeclarations === true || Boolean(declarationClaimKey || declarationObjectKey);
     if (metadataOnly && includeDeclarations) {
       throw new ToolError('invalid_request', 'metadataOnly 与声明筛选不能同时使用');
+    }
+    if (limit === 0 && !includeDeclarations && !metadataOnly) {
+      throw new ToolError('invalid_request',
+        'draft_read 的 limit=0 只在与 includeDeclarations/declarationClaimKey/declarationObjectKey 或 metadataOnly 同用时表示只读声明不返回正文行；只读正文请传 limit ≥ 1');
     }
     const stagingRoot = requireBuildState(context).stagingRoot;
     validateStdDocPath(docPath);
@@ -3400,7 +3607,18 @@ export class AgentToolService {
       // ID：同 clientKey 更新同一身份；另：同 family 三元组命中基线登记
       // 也沿用该 objectId（diting F06：基线对象注册参与增量/full 初始化，
       // 未变对象不重声明、身份不重生成；跨路径迁移保留 objectId，A 案 §2.3）
+      // WP-G（修订轮身份摩擦）：draft_read 声明把无 clientKey 登记的对象
+      // 以 objectId 作为显示 clientKey（renderDraftDeclarations 的回退形态，
+      // 增量携带的已发布对象普遍如此）。修订作者照抄该键整篇重申时，
+      // clientKeys 查找落空、族三元组又因 scopeKey 派生差异不命中 →
+      // 身份漂移成新对象，旧对象被移除而覆盖映射仍引用 → kb_coverage_invalid
+      // （实测 b_20261107061134：3 次整篇重写、每篇 2+ 回合重试均此因）。
+      // ko_ 前缀 + 精确 objectId 是无歧义的对象引用，与三元组命中走同一
+      // 授权链（F03 族排他/跨路径核权、移除守卫照常执行）。
       const priorId = draft.clientKeys[clientKey]
+        ?? (clientKey.startsWith('ko_') && existingById.has(clientKey) && !existingById.get(clientKey)!.tombstone
+          ? clientKey
+          : null)
         ?? draft.objects.find((object) => !object.tombstone
           && object.familyKey === familyKey && object.variantKey === variantKey
           && object.scopeKey === scopeKey)?.objectId
@@ -3582,11 +3800,43 @@ export class AgentToolService {
     }
     // 覆盖映射在收尾轮已经提交。改写正文时若把原对象换成新 ID，旧映射
     // 会一直悬空，直到发布门禁才报错；在写入点拒绝这种身份漂移。
+    // R5-03（review-5）：检查基于「应用本次 coverageUpdates 后的有效覆盖
+    // 状态」——被本次显式重述（同 itemId）的旧项不再计入悬空判定，作者
+    // 可在同一次 kb_write_doc 里改去向并移除对象；未重述的旧项仍引用
+    // 被移除对象则拒绝（静默丢失零容忍不变）。重述项自身指向被移除
+    // 对象的悬空由下方 resolveObjectRef 定义后的守卫在写入点拦下。
+    const restatedItemIds = new Set<string>();
+    if (Array.isArray(args.coverageUpdates)) {
+      for (const raw of args.coverageUpdates) {
+        const item = asRecord(raw);
+        if (item && typeof item.itemId === 'string' && item.itemId) restatedItemIds.add(item.itemId);
+      }
+    }
+    const carriedCoverage = draft.coverage.filter((item) => !restatedItemIds.has(item.itemId));
     const referencedRemovedIds = [...removedIds].filter((id) =>
-      draft.coverage.some((item) => item.disposition === 'mapped' && item.targetObjectIds?.includes(id)));
+      carriedCoverage.some((item) => item.disposition === 'mapped' && item.targetObjectIds?.includes(id)));
     if (referencedRemovedIds.length > 0) {
+      // WP-G（一次性修复参数）：旧错误只说「读原 clientKey 并重申」，但声明
+      // 显示的 clientKey 回退形态（objectId）在 clientKeys 登记中不存在，且
+      // 重申需要精确 familyKey/variantKey/scopeKey 三元组——作者无从得知，
+      // 实测每篇 2+ 回合盲试（b_20261107061134）。改为逐对象给出身份三元组、
+      // 被引用的覆盖项 itemId 与精确读取调用；内容已无来源支撑的对象给出
+      // 「按原 itemId 改去向」的替代路径（可与本次重写同 call 提交，R5-03）。
+      // 门禁本身不变：未重申且未改去向仍然拒绝（静默丢失零容忍）。
+      const detailLines = referencedRemovedIds.map((id) => {
+        const object = existingById.get(id);
+        const items = carriedCoverage
+          .filter((item) => item.disposition === 'mapped' && item.targetObjectIds?.includes(id))
+          .map((item) => `${item.itemId}(${item.category}${item.importance === 'important' ? '/important' : ''})`);
+        const identity = object
+          ? `family=${object.familyKey}/${object.variantKey}/${object.scopeKey}`
+          : '登记缺失';
+        return `- ${id}（${object?.title ?? '对象'}；${identity}）← 覆盖项 ${items.join('、')}`;
+      });
       throw new ToolError('kb_coverage_invalid',
-        `改写 ${docPath} 会移除仍被覆盖映射引用的对象 ${referencedRemovedIds.join('、')}；请用 draft_read(includeDeclarations=true) 读取原 clientKey 并重申原对象`, 409);
+        `改写 ${docPath} 会移除仍被覆盖映射引用的对象 ${referencedRemovedIds.join('、')}：\n${detailLines.join('\n')}\n`
+          + `重申路径：draft_read({path:${JSON.stringify(docPath)},declarationObjectKey:"<上述对象 id>",limit:0}) 读取完整声明，objects 按原 familyKey/variantKey/scopeKey 重申（clientKey 可直接用该 objectId）；`
+          + '对象内容已无来源支撑时不重申对象，在同一提交的 coverageUpdates 里按原 itemId 显式改去向（mapped→承接对象 / excluded_template·excluded_nonknowledge（须 reason）/ unresolved）后移除该对象', 409);
     }
     draft.objects = draft.objects.filter((object) => !touchedIds.has(object.objectId) && !removedIds.has(object.objectId));
     for (const [clientKey, objectId] of Object.entries(draft.clientKeys)) {
@@ -3605,6 +3855,25 @@ export class AgentToolService {
       if (key.startsWith('ko_') && (existingById.has(key) || touchedIds.has(key) || planObjectIdSet.has(key))) return key;
       return null;
     };
+    // R5-03 配套守卫：被本次 coverageUpdates 重述的 mapped 项不得指向本次
+    // 移除的对象——下方覆盖项解析用 existingById（含被移除登记），不拦则
+    // 悬空覆盖会迟到发布门才暴露（旧代码因一刀切移除拒绝不会出现此形态；
+    // R5-03 放开有效覆盖判定后必须在此写入点保证无悬空）。最终无悬空
+    // 覆盖/对象校验链不变。
+    if (Array.isArray(args.coverageUpdates)) {
+      for (const raw of args.coverageUpdates) {
+        const input = asRecord(raw);
+        if (!input || input.disposition !== 'mapped') continue;
+        const targets = optStrArray(input, 'targetKeys') ?? [];
+        const dangling = targets
+          .map((key) => resolveObjectRef(key))
+          .filter((id): id is string => id !== null && removedIds.has(id));
+        if (dangling.length > 0) {
+          throw new ToolError('kb_coverage_invalid',
+            `覆盖项 ${typeof input.itemId === 'string' ? input.itemId : '(coverageUpdates)'} 重述后仍指向本次移除的对象 ${dangling.join('、')}；请改指向承接对象（mapped→新 targetKeys）或改用 excluded_template·excluded_nonknowledge（须 reason）/ unresolved 去向`, 409);
+        }
+      }
+    }
     const receipts: EvidenceReadReceipt[] = this.loadReadReceipts(state).map((receipt) => ({
       readReceiptId: receipt.readReceiptId,
       resourceId: receipt.resourceId,
@@ -3614,11 +3883,11 @@ export class AgentToolService {
     // D3（A 案 §5.2/§5.4）：工作簿/图片资源按引用懒装配（Promise 缓存防重入
     // ——工作簿解析是异步 ExcelJS 路径）；未被引用的源不额外解析，旧式
     // text/csv 行为字节级不变。
-    const resourceCache = new Map<string, Promise<{ resources: EvidenceResource[]; sourceSnapshotHash: string }>>();
-    const resourcesFor = (sourceId: string, referenced: ReadonlySet<string>): Promise<{ resources: EvidenceResource[]; sourceSnapshotHash: string }> => {
+    const resourceCache = new Map<string, Promise<{ resources: EvidenceResource[]; sourceSnapshotHash: string; imageStatusOf?: () => ImageResourceStatus[] }>>();
+    const resourcesFor = (sourceId: string, referenced: ReadonlySet<string>): Promise<{ resources: EvidenceResource[]; sourceSnapshotHash: string; imageStatusOf?: () => ImageResourceStatus[] }> => {
       const cached = resourceCache.get(sourceId);
       if (cached) return cached;
-      const promise = (async (): Promise<{ resources: EvidenceResource[]; sourceSnapshotHash: string }> => {
+      const promise = (async (): Promise<{ resources: EvidenceResource[]; sourceSnapshotHash: string; imageStatusOf?: () => ImageResourceStatus[] }> => {
         const entry = state.snapshot.get(sourceId);
         if (!entry) throw new ToolError('invalid_request', `来源不在快照内: ${sourceId}`);
         let verified;
@@ -3674,7 +3943,22 @@ export class AgentToolService {
           resources.push(payload.resource);
         }
       }
-        const pack = { resources, sourceSnapshotHash: entry.contentHash };
+      // WP-G（图片证据摩擦）：源含图片引用时附带懒求值的图片登记状态目录
+      //（与资源表同一枚举面；仅错误提示用，不改变登记判定），供引用缺失时
+      // 给出「已登记哪些 / 缺描述的怎么补」的精确指引（实测
+      // b_20261107061134：作者只能弃用图片证据）。懒求值：正常路径零开销。
+      const wantsImageStatus = (entry.imageCount ?? 0) > 0
+        || [...referenced].some((id) => id.startsWith(`${sourceId}${IMAGE_RESOURCE_PREFIX}`));
+      const imageStatusOf = wantsImageStatus
+        ? () => imageResourceStatuses({
+          knowledgeBaseRoot: state.knowledgeBaseRoot,
+          entry,
+          content: verified.content,
+          descriptions: state.imageDescriptions?.get(sourceId),
+          registeredResourceIds: new Set(resources.filter((candidate) => candidate.kind === 'image').map((candidate) => candidate.resourceId)),
+        })
+        : undefined;
+        const pack = { resources, sourceSnapshotHash: entry.contentHash, ...(imageStatusOf ? { imageStatusOf } : {}) };
         return pack;
       })();
       resourceCache.set(sourceId, promise);
@@ -3696,6 +3980,27 @@ export class AgentToolService {
     const submissionEvidenceKeys = new Map<string, string>();
     // WP-C（R5）：clientKey → 规范化内容指纹（同键重发去重/冲突判定用）。
     const submissionEvidenceIdentity = new Map<string, string>();
+    // WP-E（E1 继承证据重绑）：按 clientKey 索引既有证据记录。kb_edit_doc 的
+    // 声明继承（inheritDeclarationsForEdit）与 kb_write_doc 的整篇重申都会把
+    // 旧证据原样带回 evidenceClaims——包括上一次构建的 readReceiptId（阶段
+    // 发布改写的 krr_stage_*，progressive-source-snapshot.ts）。旧 id 不在本
+    // 构建回执登记，而下方「省略时按 selector 选覆盖回执」的自动选择只对
+    // 无显式 id 的证据生效：显式旧 id 直达 verifyEvidence 被拒，作者即使已
+    // 重读覆盖范围也整批失败（实测 b_20261107061134：6 次 kb_edit_doc 拒绝、
+    // 被迫整篇重写，局部修订优势失效）。
+    const priorEvidenceByKey = new Map<string, Evidence>();
+    for (const [priorKey, priorId] of Object.entries(draft.evidenceKeys)) {
+      const found = draft.evidence.find((candidate) => candidate.evidenceId === priorId);
+      if (found) priorEvidenceByKey.set(priorKey, found);
+    }
+    const registeredReceiptIds = new Set(receipts.map((receipt) => receipt.readReceiptId));
+    // WP-E（E1）：缺覆盖回执的范围先收集、循环后按资源合并相邻区间一次性
+    // 报出（含精确补读参数），不再第一条即拒——实测作者按提示逐条补读，
+    // 10+ 回合仍无法收敛。
+    const missingReceiptScopes: Array<{
+      evidenceId: string; clientKey: string; sourceId: string; resourceId: string;
+      selector: EvidenceSelector; inherited: boolean;
+    }> = [];
     for (const raw of evidenceInputs) {
       const input = asRecord(raw);
       if (!input) throw new ToolError('invalid_request', 'evidenceClaims 每项必须是对象');
@@ -3711,8 +4016,33 @@ export class AgentToolService {
       const pack = await resourcesFor(sourceId, referencedBySource.get(sourceId) ?? new Set());
       const resource = pack.resources.find((candidate) => candidate.resourceId === resourceId);
       if (!resource) {
+        // WP-G（图片证据摩擦）：图片资源缺失时给出精确判别——该源已登记
+        // 哪些图片资源、未登记图片的真实状态（预飞识图不可用/未覆盖），
+        // 以及 src 不属于本源图片的判别。不给不可达的工具建议：构建内
+        // 任何角色工具面都不含 raw_read_image（识图描述只能由应用侧预飞
+        // 生成）。门禁不变：没有描述/白板文字的图片仍不能充当证据
+        //（实测 b_20261107061134：作者只能弃用图片证据且不知道原因）。
+        let imageHint = '';
+        if (resourceId.startsWith(`${sourceId}${IMAGE_RESOURCE_PREFIX}`)) {
+          const src = resourceId.slice(sourceId.length + IMAGE_RESOURCE_PREFIX.length);
+          const catalog = pack.imageStatusOf?.() ?? [];
+          const registered = catalog.filter((image) => image.registered)
+            .map((image) => `${sourceId}${IMAGE_RESOURCE_PREFIX}${image.src}`);
+          const status = catalog.find((image) => image.src === src);
+          if (status && !status.registered) {
+            const why = status.state === 'unavailable'
+              ? `该图片识图描述不可用（reason=${status.reason ?? 'unknown'}），本构建内不能作为 machine_description 证据；确需该图支撑请在交接记录说明，由应用侧修复识图后重新构建`
+              : '该图片在本构建无识图描述（预飞未覆盖），未登记入资源表，不能作为证据；请引用已登记图片或改用文本证据';
+            imageHint = `；${why}`;
+          } else if (!status) {
+            imageHint = `；src ${JSON.stringify(src)} 不属于该源的本地图片引用（该源图片：${catalog.map((image) => image.src).join('、') || '无'}）`;
+          }
+          if (registered.length > 0) {
+            imageHint += `；该源已登记图片资源：${registered.join('、')}`;
+          }
+        }
         throw new ToolError('kb_evidence_unresolved',
-          `证据资源不在本构建资源表: ${resourceId}（可用：${pack.resources.map((candidate) => candidate.resourceId).join(', ')}；资源表来自 raw_read 回执，工作簿=<objToken>#workbook:<名>、图片=<objToken>#image:<src>，未描述图片不登记）`);
+          `证据资源不在本构建资源表: ${resourceId}（可用：${pack.resources.map((candidate) => candidate.resourceId).join(', ')}；资源表来自 raw_read 回执，工作簿=<objToken>#workbook:<名>、图片=<objToken>#image:<src>，未描述图片不登记${imageHint}）`);
       }
       let selector = parseSelector(input.selector);
       // D3：media_region 的 imageHash 由服务端按资源钉住——图片字节哈希对
@@ -3747,6 +4077,39 @@ export class AgentToolService {
       }
       submissionEvidenceIdentity.set(clientKey, canonicalIdentity);
       let readReceiptId = optStr(input, 'readReceiptId');
+      // WP-E（E1）：继承而来、本次未修改的旧证据（与既有记录的对象/断言/
+      // 来源/selector/角色/性质逐字段一致）携带跨构建旧回执时，解除旧 id，
+      // 走与新证据完全相同的校验链：内容一致性（quoteHash 对旧记录服务端
+      // 重算比对）+ 覆盖回执自动选择/缺回执聚合报错。伪造回执的新证据
+      // （找不到一致的既有记录）不进本分支，仍在 verifyEvidence 被拒。
+      const priorEvidence = priorEvidenceByKey.get(clientKey) ?? null;
+      const inheritedUnchanged = priorEvidence !== null
+        && priorEvidence.objectId === objectId
+        && priorEvidence.claimKey === claimKey
+        && priorEvidence.sourceRef.sourceId === sourceId
+        && priorEvidence.sourceRef.resourceId === resourceId
+        && priorEvidence.role === role
+        && priorEvidence.nature === nature
+        && selectorIdentityKey(priorEvidence.selector) === selectorIdentityKey(selector);
+      let inheritedResolution: SelectorResolution | SelectorResolutionFailure | null = null;
+      if (inheritedUnchanged) {
+        if (readReceiptId && !registeredReceiptIds.has(readReceiptId)) {
+          readReceiptId = undefined; // 旧构建回执：重绑到本构建覆盖回执（下方统一选择）
+        }
+        // E1 红线：内容一致性先行——selector 在当前冻结来源上重新解引用，
+        // quoteHash 与旧证据记录比对（始终由服务端重算，不接受自报）。
+        // 内容已变的继承证据必须显式重读/更新，不允许静默平移。
+        const earlyResolution = resolveSelector(resource, selector);
+        if (!earlyResolution.ok) {
+          throw new ToolError('kb_evidence_unresolved',
+            `继承证据 ${priorEvidence.evidenceId}（clientKey ${clientKey}）在当前冻结来源上无法解引用：${earlyResolution.message}；请重读来源并用 kb_edit_doc.evidenceSelectorUpdates 更新该证据，或整篇重申`);
+        }
+        if (earlyResolution.quoteHash !== priorEvidence.quoteHash) {
+          throw new ToolError('kb_evidence_unresolved',
+            `继承证据 ${priorEvidence.evidenceId}（clientKey ${clientKey}）对应来源内容已变（quoteHash 不符）：证据记录 ${priorEvidence.quoteHash} ≠ 当前复核 ${earlyResolution.quoteHash}；该证据必须重读来源后更新范围（kb_edit_doc.evidenceSelectorUpdates）或整篇重申，不能静默继承`);
+        }
+        inheritedResolution = earlyResolution;
+      }
       if (!readReceiptId && selector.kind === 'text_span') {
         readReceiptId = receipts.find((receipt) => receipt.resourceId === resourceId
           && receipt.lineStart <= selector.lineStart && receipt.lineEnd >= selector.lineEnd)?.readReceiptId;
@@ -3762,11 +4125,18 @@ export class AgentToolService {
         }
       }
       if ((selector.kind === 'text_span' || selector.kind === 'csv_cells') && !readReceiptId) {
-        throw new ToolError('kb_evidence_unresolved',
-          `文本/CSV 证据没有覆盖所选范围的 raw_read 回执；请先读取该资源和行范围，或显式提供有效 readReceiptId（A 案 §5.3）${this.evidenceReadHint(state, sourceId, resourceId, selector)}`);
+        // WP-E（E1）：收集后循环尾一次性合并报出（继承证据与新证据同等待遇：
+        // 补读本构建覆盖回执后重试即可重绑），不再首条即拒。
+        missingReceiptScopes.push({
+          evidenceId: draft.evidenceKeys[clientKey] ?? priorEvidence?.evidenceId ?? clientKey,
+          clientKey, sourceId, resourceId, selector,
+          inherited: inheritedUnchanged,
+        });
+        continue;
       }
       // 服务端重新解引用：selector 解析 → hash 对账 + 回执范围 + quoteHash 复核
-      const resolution = resolveSelector(resource, selector);
+      //（继承证据复用上方已比对过旧记录的一致性结果，避免重复解引用）
+      const resolution = inheritedResolution ?? resolveSelector(resource, selector);
       if (!resolution.ok) throw new ToolError('kb_evidence_unresolved', resolution.message);
       if (selector.kind === 'csv_cells' && role !== 'context' && resolution.nonEmptyCellCount === 0) {
         // WP-C（R5 自动修复提示）：附上同 record 范围内实际非空的列，
@@ -3806,6 +4176,9 @@ export class AgentToolService {
         nature,
         ...(readReceiptId ? { readReceiptId } : {}),
       });
+    }
+    if (missingReceiptScopes.length > 0) {
+      throw this.missingReceiptScopesError(state, missingReceiptScopes);
     }
     // kb_write_doc 是整篇声明替换：被重申对象的证据以本次 evidenceClaims
     // 为准。旧证据即使来源快照未变，也可能指向旧正文的断言或错误坐标；
@@ -5381,7 +5754,8 @@ export class AgentToolService {
       if (request.kind === 'raw') {
         const entry = state.snapshot.get(request.objToken!);
         if (!entry) {
-          const item = { kind: 'raw', objToken: request.objToken, error: `原始文档不存在或无成功本地版本: ${request.objToken}` };
+          const hint = nearestObjTokenHint(context, this.documentsProvider(), request.objToken!);
+          const item = { kind: 'raw', objToken: request.objToken, error: `原始文档不存在或无成功本地版本: ${request.objToken}${hint ? `；你是不是想读 ${hint}` : ''}` };
           if (!admit(item, 0, false, linesUsed)) { queue.unshift(request); break; }
           results.push(item);
           continue;
@@ -5706,9 +6080,11 @@ export class AgentToolService {
     const evidenceSelectorUpdates = args.evidenceSelectorUpdates === undefined ? [] : requireArray(args, 'evidenceSelectorUpdates');
     const coverageUpdates = args.coverageUpdates === undefined ? [] : requireArray(args, 'coverageUpdates');
     const mergeInputs = args.objectMerges === undefined ? [] : requireArray(args, 'objectMerges');
-    if (patchInputs.length > 50 || evidenceClaimsAdd.length > 50 || evidenceSelectorUpdates.length > 20 || coverageUpdates.length > 20 || mergeInputs.length > 20
+    if (patchInputs.length > 50 || evidenceClaimsAdd.length > 50 || evidenceSelectorUpdates.length > 80 || coverageUpdates.length > 20 || mergeInputs.length > 20
       || (patchInputs.length === 0 && evidenceClaimsAdd.length === 0 && evidenceSelectorUpdates.length === 0 && coverageUpdates.length === 0 && mergeInputs.length === 0)) {
-      throw new ToolError('invalid_request', 'patches、evidenceClaimsAdd、evidenceSelectorUpdates、coverageUpdates 与 objectMerges 至少一项非空，且分别不超过 50/50/20/20/20 项');
+      // WP-E（E2）：evidenceSelectorUpdates 上限 20→80（与 spec 同步）——增量
+      // 文档可携带 40+ 条继承证据需批量重定位；原子语义不变。
+      throw new ToolError('invalid_request', 'patches、evidenceClaimsAdd、evidenceSelectorUpdates、coverageUpdates 与 objectMerges 至少一项非空，且分别不超过 50/50/80/20/20 项');
     }
     const objectMerges: Array<{ fromObjectId: string; toObjectId: string; reason: string }> = [];
     if (mergeInputs.length > 0) {
@@ -6402,7 +6778,12 @@ function normalizeQueriesAlias(args: Record<string, unknown>, notes: string[]): 
   const queries = args.queries;
   if (!Array.isArray(queries) || queries.length === 0 || queries.length > 8
     || queries.some((item) => typeof item !== 'string' || !item.trim() || item.length > 200)) {
-    throw new ToolError('invalid_request', 'queries 须为 1..8 个长度 1..200 的非空字符串（多查询逐个执行合并结果）；单查询请用 query 字符串');
+    // WP-G：附带收到的实际形状，作者一次即可修复（实测 12 项被拒后盲猜
+    // 原因重试，b_20261107061134）。仅在含非字符串项时列出类型，避免噪声。
+    const received = Array.isArray(queries)
+      ? `${queries.length} 项${queries.some((item) => typeof item !== 'string') ? `（含非字符串项：${queries.map((item) => typeof item).join('/')}）` : ''}`
+      : typeof queries;
+    throw new ToolError('invalid_request', `queries 须为 1..8 个长度 1..200 的非空字符串（多查询逐个执行合并结果）；单查询请用 query 字符串；收到 ${received}${Array.isArray(queries) && queries.length > 8 ? '，请拆成多批（每批 ≤8）或用 query 单查' : ''}`);
   }
   if (args.query === undefined) {
     notes.push(`已把 queries（${queries.length} 项）按多查询执行并合并去重结果`);
@@ -6500,13 +6881,34 @@ export function normalizeToolArguments(toolName: string, input: Record<string, u
       }
       const known = new Set(['path', 'offset', 'limit', 'metadataOnly', 'includeDeclarations', 'declarationClaimKey', 'declarationObjectKey']);
       const unknown = Object.keys(args).filter((key) => !known.has(key));
-      if (unknown.length) throw unrecognizedParamError('draft_read', 'path、offset、limit、metadataOnly、includeDeclarations、declarationClaimKey、declarationObjectKey', unknown);
+      if (unknown.length) {
+        // WP-G：模型期望的 includeCoverage 不存在——指向真实入口
+        // metadataOnly（返回 coverageItems 的 itemId/sourceId/disposition）。
+        if (unknown.includes('includeCoverage')) {
+          throw new ToolError('invalid_request',
+            'draft_read 无 includeCoverage 参数；覆盖项信息用 metadataOnly:true（返回本篇 sources 的 coverageItems：itemId/sourceId/disposition）或 includeDeclarations（含对象声明）；请改用上述真实参数名重试，完整契约可用 kb_tool_schema 查询');
+        }
+        throw unrecognizedParamError('draft_read', 'path、offset、limit、metadataOnly、includeDeclarations、declarationClaimKey、declarationObjectKey', unknown);
+      }
       return { args, notes };
     }
     case 'draft_list': {
       const ignored = Object.keys(args);
       if (ignored.length) notes.push(`已忽略参数 ${ignored.join('、')}（draft_list 无参数，返回全部草稿清单）`);
       return { args: {}, notes };
+    }
+    case 'raw_read': {
+      // WP-E（E4）：实测构建多次多传无害字段 kind（mcp_call 包装泄漏）。
+      // schema 已放开 additionalProperties（与 WP-C 只读工具清单对齐），
+      // kind 在此忽略并说明；其余未知参数仍报精确错误。
+      if (typeof args.kind === 'string') {
+        delete args.kind;
+        notes.push('已忽略参数 kind（raw_read 不需要；工具名已在调用层给出）');
+      }
+      const known = new Set(['objToken', 'offset', 'limit', 'includeBlankCsvRows']);
+      const unknown = Object.keys(args).filter((key) => !known.has(key));
+      if (unknown.length) throw unrecognizedParamError('raw_read', 'objToken、offset、limit、includeBlankCsvRows', unknown);
+      return { args, notes };
     }
     case 'raw_csv_cells': {
       if (args.columns !== undefined) {
@@ -6529,10 +6931,9 @@ export function normalizeToolArguments(toolName: string, input: Record<string, u
     case 'raw_csv_find': {
       const known = new Set(['objToken', 'resourceId', 'queries']);
       const unknown = Object.keys(args).filter((key) => !known.has(key));
-      if (unknown.length) throw unrecognizedParamError('raw_csv_find', 'objToken、resourceId（完整 #csv: 资源 ID，见 raw_read 资源表）、queries', unknown);
-      if (args.resourceId === undefined) {
-        throw new ToolError('invalid_request', 'raw_csv_find 需要参数 resourceId（完整资源 ID，形如 <objToken>#csv:<文件名>，来自 raw_read 返回的资源表）；objToken 与 queries 不能替代它');
-      }
+      if (unknown.length) throw unrecognizedParamError('raw_csv_find', 'objToken、resourceId（完整 #csv: 资源 ID，见 raw_read 资源表；缺省时服务端按唯一附件解析）、queries', unknown);
+      // WP-E（E5）：resourceId 缺省不再在此报错——服务端按唯一 CSV 附件
+      // 自动选用；无附件/多附件时由 handler 给出候选清单的精确错误。
       return { args, notes };
     }
     case 'kb_read_batch': {
@@ -6642,6 +7043,74 @@ function parseBodyRange(value: unknown): BodyRange {
 }
 
 /** 四类 selector 解析（A 案 §5.2 定位规范；字段非法直接拒绝）。 */
+/** R4-01/R4-02（复审 4）：资源行区间 → raw_read 输出窗口计划。输出坐标按
+ * 区间与各 segment 的交集逐段换算 `outStart + (resourceLine - resStart)`；
+ * estBytes 为渲染字节保守估算（[O/R(/C)] 坐标前缀 + 行内容 + 页眉余量，
+ * 窗口到达输出末行时加 source_links 块余量）——估算 ≥ 实际页文本，
+ * 估算不过 TOOL_PAGE_SOFT_BUDGET_BYTES 即可保证单次 raw_read 整窗返回、
+ * 回执完整覆盖。pieces 为区间命中的同资源 segment 段数（>1 = 被派生
+ * 内容分隔，页回执按段登记，单张回执永远无法覆盖）。纯函数。 */
+function planRawReadWindow(
+  assembled: {
+    lines: string[];
+    segments: ReadonlyArray<{ resourceId?: string; outStart: number; outEnd: number; resStart?: number; resEnd?: number }>;
+  } | null,
+  resourceId: string,
+  lineStart: number,
+  lineEnd: number,
+): { outFrom: number; outTo: number; estBytes: number; pieces: number } | null {
+  if (!assembled) return null;
+  let outFrom = Number.MAX_SAFE_INTEGER;
+  let outTo = -1;
+  let pieces = 0;
+  let estBytes = 700; // 页眉（回执头/raw_page/包裹标签）保守余量
+  for (const segment of assembled.segments) {
+    if (segment.resourceId !== resourceId || segment.resStart === undefined || segment.resEnd === undefined) continue;
+    const resFrom = Math.max(lineStart, segment.resStart);
+    const resTo = Math.min(lineEnd, segment.resEnd);
+    if (resFrom > resTo) continue;
+    pieces += 1;
+    const segOutFrom = segment.outStart + (resFrom - segment.resStart);
+    const segOutTo = segment.outStart + (resTo - segment.resStart);
+    outFrom = Math.min(outFrom, segOutFrom);
+    outTo = Math.max(outTo, segOutTo);
+    for (let out = segOutFrom; out <= segOutTo; out += 1) {
+      const resourceLine = segment.resStart + out - segment.outStart;
+      const line = assembled.lines[out - 1] ?? '';
+      estBytes += Buffer.byteLength(`[O${out}/R${resourceLine}] `, 'utf8')
+        + Buffer.byteLength(line, 'utf8') + 9; // /C record 号与封套余量
+    }
+  }
+  if (outTo < 0) return null;
+  if (outTo >= assembled.lines.length) estBytes += 6_000; // 末页 source_links 块余量
+  return { outFrom, outTo, estBytes, pieces };
+}
+
+/** R4-01/R4-02：计划 → raw_read 建议文本（不含前导'；'）。ok=false 表示该
+ * 区间无法由单张回执覆盖（调用方按「拆分证据」引导呈现，不给无法满足的
+ * 补读建议）。 */
+function rawReadAdvice(
+  sourceId: string,
+  lineStart: number,
+  lineEnd: number,
+  plan: { outFrom: number; outTo: number; estBytes: number; pieces: number } | null,
+): { ok: boolean; text: string } {
+  const resourceLines = lineEnd - lineStart + 1;
+  if (resourceLines > 2000) {
+    return { ok: false, text: `该范围 ${lineStart}..${lineEnd}（${resourceLines} 行）超过 raw_read 单次 2000 行上限，单张回执无法完整覆盖；请把该证据拆成更小的行区间（kb_edit_doc.evidenceSelectorUpdates；单张回执必须完整覆盖 selector，A 案 §5.3）` };
+  }
+  if (plan) {
+    if (plan.pieces > 1) {
+      return { ok: false, text: `该范围 ${lineStart}..${lineEnd} 被派生内容（图片描述/白板文字）分隔成 ${plan.pieces} 段，raw_read 每段单独登记回执，单张回执无法完整覆盖；请把该证据拆成不被派生内容分隔的更小区间` };
+    }
+    if (plan.estBytes > TOOL_PAGE_SOFT_BUDGET_BYTES) {
+      return { ok: false, text: `该范围对应的输出窗口约 ${(plan.estBytes / 1024).toFixed(1)} KB，超过 raw_read 单页预算（约 ${Math.floor(TOOL_PAGE_SOFT_BUDGET_BYTES / 1024)} KB），单张回执无法完整覆盖；请把该证据拆成更小的行区间` };
+    }
+    return { ok: true, text: `建议先执行 raw_read(objToken:"${sourceId}", offset:${plan.outFrom - 1}, limit:${plan.outTo - plan.outFrom + 1}) 读取输出行 ${plan.outFrom}..${plan.outTo} 登记覆盖资源行 ${lineStart}..${lineEnd} 的读回执` };
+  }
+  return { ok: true, text: `建议先执行 raw_read(objToken:"${sourceId}", offset:${lineStart - 1}, limit:${resourceLines}) 登记覆盖资源行 ${lineStart}..${lineEnd} 的读回执` };
+}
+
 function parseSelector(value: unknown): EvidenceSelector {
   const input = asRecord(value);
   if (!input) throw new ToolError('invalid_request', 'selector 必须是对象');
@@ -6879,6 +7348,61 @@ function wrapActorError(error: unknown): ToolError {
   if (error instanceof BuildActorError) return new ToolError(error.code, error.message, error.status);
   if (error instanceof ToolError) return error;
   return new ToolError('v2_actor_error', error instanceof Error ? error.message : String(error), 500);
+}
+
+/** WP-G（token 拼写摩擦）：带上限的编辑距离（超过 maxDistance 提前退出
+ * 返回 maxDistance+1）。仅用于 not_found 提示，不参与解析判定。 */
+function boundedEditDistance(a: string, b: string, maxDistance: number): number {
+  if (Math.abs(a.length - b.length) > maxDistance) return maxDistance + 1;
+  let previous = Array.from({ length: b.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= a.length; i += 1) {
+    const current = [i];
+    let rowMin = i;
+    for (let j = 1; j <= b.length; j += 1) {
+      const cost = a.charCodeAt(i - 1) === b.charCodeAt(j - 1) ? 0 : 1;
+      const value = Math.min(current[j - 1]! + 1, previous[j]! + 1, previous[j - 1]! + cost);
+      current.push(value);
+      rowMin = Math.min(rowMin, value);
+    }
+    if (rowMin > maxDistance) return maxDistance + 1;
+    previous = current;
+  }
+  return previous[b.length]!;
+}
+
+/** WP-G（token 拼写摩擦）：not_found 时按「包含关系（拼接/截断）→ 编辑
+ * 距离」找最接近的 objToken。实测样本：模型把 token 尾部重复拼接
+ *（V3Lc…GUYbnlc → …GUYbnlcGUYbnlc）整回合重试失败（b_20261107061134）。
+ * 只生成提示，不改变解析结果。
+ * R5-01（review-5）：构建态候选严格限定本构建冻结快照（工作集优先）；
+ * 全局 documents 属构建信封外，混入即泄露构建外 objToken（包含关系仅
+ * 需 4 字符前缀即可探测），无合法候选不提示。非构建态才用其可见 documents。 */
+function nearestObjTokenHint(context: { options: { buildState?: BuildRunState | null } }, documents: ReadonlyArray<{ objToken: string }>, wrong: string): string | null {
+  if (!wrong || wrong.length < 4) return null;
+  const scored: Array<{ token: string; score: number }> = [];
+  const consider = (token: string, priority: number) => {
+    if (!token || token === wrong || token.length < 4) return;
+    if (wrong.includes(token) || token.includes(wrong)) {
+      scored.push({ token, score: priority });
+      return;
+    }
+    const limit = Math.max(2, Math.floor(Math.min(wrong.length, token.length) / 6));
+    const distance = boundedEditDistance(wrong, token, limit);
+    if (distance <= limit) scored.push({ token, score: priority + distance });
+  };
+  const state = context.options.buildState;
+  if (state) {
+    // 构建态：仅本构建冻结快照内的源参与建议（工作集优先，快照非工作集
+    // 条目属沿用源，仍在信封内）；documentsProvider 是全局同步表，不参与。
+    for (const entry of state.snapshot.entries) {
+      consider(entry.objToken, state.workset.has(entry.objToken) ? 0 : 1);
+    }
+  } else {
+    // 非构建态（discuss/work）：会话本身可见的 documents。
+    for (const record of documents) consider(record.objToken, 2);
+  }
+  scored.sort((a, b) => a.score - b.score || a.token.length - b.token.length);
+  return scored[0]?.token ?? null;
 }
 
 /** 幂等载荷哈希：键排序的规范化 JSON（剔除并发保护/幂等键字段后的业务载荷）。 */

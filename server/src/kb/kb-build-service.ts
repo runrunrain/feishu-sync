@@ -46,11 +46,13 @@ import { hasEditorialHistory, hasSourceMetadata } from './body-policy.js';
 import { planUnits, packBatches, type BuildUnit } from './build-units.js';
 import {
   aggregateBuildMetrics,
+  aggregateLeaderOrchestrationMetrics,
   computeRiskWarnings,
   sameProviderModel,
   METRICS_PHASES_CAP,
   type BuildMetricsPhaseSpan,
   type BuildMetricsUnitSize,
+  type LeaderSource,
 } from './build-metrics.js';
 import { countText } from './text-stats.js';
 import { precheck as mechanicalPrecheckRun, formatFindingsForPrompt, type PrecheckDraftInput, type PrecheckFinding, type PrecheckTerm } from './mechanical-precheck.js';
@@ -119,6 +121,7 @@ import {
   type KbBuildDto,
   type KbBuildImagesProgress,
   type KbBuildMetrics,
+  type KbBuildMetricsOrchestration,
   type KbBuildMetricsPhaseRole,
   type KbBuildOrchestrationMode,
   type KbBuildProgressDto,
@@ -612,25 +615,43 @@ export class KbBuildService extends EventEmitter {
     return round > 0 ? 'revise' : 'write';
   }
 
-  /** S1：聚合本次构建度量（任何失败 → null，禁止半成品/编造数值）。 */
+  /** S1：聚合本次构建度量（任何失败 → null，禁止半成品/编造数值）。
+   * WP-F：leader 模式下 resolvedRoles 不存在，writer/reviewer 同源改从
+   * 冻结 LeaderRunCheckpointState.spec.models 解析（只读，不改口径）。 */
   private collectBuildMetrics(entry: InMemoryBuild): KbBuildMetrics | null {
     try {
       const summary = entry.orchestration?.summary();
       let revisions = 0;
       for (const count of Object.values(summary?.autoRevisionUsage ?? {})) revisions += Number(count) || 0;
       const resolved = entry.orchestration?.spec.resolvedRoles;
+      const leaderModels = entry.leaderRun?.spec?.models;
       return aggregateBuildMetrics({
         units: entry.metrics.units,
         phaseSpans: entry.metrics.phases,
         phasesDropped: entry.metrics.phasesDropped,
         queueWaits: this.deps.pool.buildAcquireWaitStats(),
         review: { ...entry.metrics.review, revisions },
-        reviewerSameModelAsWriter: resolved ? sameProviderModel(resolved.writer, resolved.reviewer) : null,
+        reviewerSameModelAsWriter: resolved
+          ? sameProviderModel(resolved.writer, resolved.reviewer)
+          : leaderModels
+            ? sameProviderModel(KbBuildService.parseLeaderModelSpec(leaderModels.writer), KbBuildService.parseLeaderModelSpec(leaderModels.reviewer))
+            : null,
         precheck: entry.metrics.precheck,
       });
     } catch {
       return null;
     }
+  }
+
+  /** 运行层模型 spec（`provider/model[:thinking]`）→ sameProviderModel 输入。
+   * 解析失败返回 null（无法判定，不猜测）。 */
+  private static parseLeaderModelSpec(spec: string | undefined): { modelId: string; providerId?: string } | null {
+    if (typeof spec !== 'string' || !spec.includes('/')) return null;
+    const providerId = spec.slice(0, spec.indexOf('/'));
+    const rest = spec.slice(spec.indexOf('/') + 1);
+    const modelId = rest.split(':')[0] ?? '';
+    if (!providerId || !modelId) return null;
+    return { modelId, providerId };
   }
 
   toDto(row: Record<string, unknown>, entry?: InMemoryBuild): KbBuildDto {
@@ -3334,12 +3355,32 @@ export class KbBuildService extends EventEmitter {
         }
       }
       // S1（构建可观测性）：finish 时落 metrics_json——聚合失败降级 null，
-      // 绝不阻断构建终态落地。
+      // 绝不阻断构建终态落地。WP-F：pi-amagi 编排模式追加 orchestration 段
+      //（服务端权威落盘记录推导；只读不回填，采集/写入失败仅告警）。
       try {
-        const metrics = this.collectBuildMetrics(entry);
+        let metrics: KbBuildMetrics | null = null;
+        try {
+          metrics = this.collectBuildMetrics(entry);
+        } catch {
+          metrics = null;
+        }
+        if (entry.orchestrationMode === 'pi-amagi') {
+          const orchestration = collectLeaderOrchestrationMetricsFromDisk({
+            buildId,
+            row: localMapStore.getKbBuild(buildId),
+            outputRoot,
+            dataRoot: this.deps.dataRoot,
+          });
+          if (orchestration) {
+            metrics = { ...(metrics ?? aggregateBuildMetrics({
+              units: [], phaseSpans: [], queueWaits: { count: 0, totalMs: 0, maxMs: 0 },
+              review: { blocking: 0, suggestion: 0, revisions: 0 }, reviewerSameModelAsWriter: null,
+            })), orchestration };
+          }
+        }
         localMapStore.updateKbBuild(buildId, { metricsJson: metrics ? JSON.stringify(metrics) : null });
-      } catch {
-        /* 度量列写入失败不影响构建终态（诊断缓存而已） */
+      } catch (error) {
+        this.emitLog(buildId, 'warn', `度量列写入失败（不影响构建终态）：${error instanceof Error ? error.message : String(error)}`);
       }
       this.running = false;
       if (!entry.cancelRequested) {
@@ -8592,3 +8633,309 @@ function writeReport(outputRoot: string, buildId: string, issues: KbBuildReportI
 }
 
 export type { AgentStatusDto };
+
+// ============================================================================
+// WP-F（kb-build-speedup）：pi-amagi 编排度量磁盘读取（服务终态收口与
+// scripts/build-metrics-report.ts 共用；只读，不回填旧构建）
+// R5-02：所有来源读取返回三态（ok/missing/corrupt），“不可得”与
+// “真实空数组”严格区分，不可得绝不冒充 0。
+// ============================================================================
+
+/** R5-02：单来源文件读取结果（file 为人读文件名，进 notes）。 */
+type SourceRecords<T> = { status: 'ok'; records: T[] } | { status: 'missing' | 'corrupt'; file: string };
+
+function readJsonArraySource<T>(file: string, name: string): SourceRecords<T> {
+  try {
+    if (!fs.existsSync(file)) return { status: 'missing', file: name };
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf-8')) as unknown;
+    if (!Array.isArray(parsed)) return { status: 'corrupt', file: name };
+    return { status: 'ok', records: parsed as T[] };
+  } catch {
+    return { status: 'corrupt', file: name };
+  }
+}
+
+/** JSONL 读取：逐行解析，单行损坏跳过（追加型日志语义）；存在非空行
+ * 但全部不可解析 → corrupt（可用行数为 0 不冒充真实空）。空文件 = ok 空。 */
+function readJsonlSource(file: string, name: string): SourceRecords<Record<string, unknown>> {
+  try {
+    if (!fs.existsSync(file)) return { status: 'missing', file: name };
+    const lines = fs.readFileSync(file, 'utf-8').split('\n');
+    const records: Array<Record<string, unknown>> = [];
+    let nonBlank = 0;
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      nonBlank += 1;
+      try {
+        const parsed = JSON.parse(trimmed) as unknown;
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) records.push(parsed as Record<string, unknown>);
+      } catch { /* 损坏行跳过（追加型日志） */ }
+    }
+    if (nonBlank > 0 && records.length === 0) return { status: 'corrupt', file: name };
+    return { status: 'ok', records };
+  } catch {
+    return { status: 'corrupt', file: name };
+  }
+}
+
+/** 构建 epoch 根列表：epochs/e* 升序；无 epochs 目录时回退旧布局 [buildRoot]。 */
+function listBuildEpochRoots(buildRoot: string): string[] {
+  const epochsDir = path.join(buildRoot, 'epochs');
+  try {
+    if (!fs.existsSync(epochsDir)) return fs.existsSync(buildRoot) ? [buildRoot] : [];
+    return fs.readdirSync(epochsDir)
+      .filter((name) => /^e\d+$/.test(name))
+      .sort((a, b) => Number(a.slice(1)) - Number(b.slice(1)))
+      .map((name) => path.join(epochsDir, name));
+  } catch {
+    return [];
+  }
+}
+
+function safeIsoMs(value: unknown): number | null {
+  if (typeof value !== 'string' || !value) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+/** amagi dispatch 审计 journal（dispatch.jsonl）→ 派发/会话起跑/结算原始事件。 */
+function readDispatchJournalEvents(file: string): SourceRecords<{ kind: 'dispatch' | 'session' | 'settle'; taskId: string; atMs: number }> {
+  const source = readJsonlSource(file, 'dispatch.jsonl（amagi journal）');
+  if (source.status !== 'ok') return source;
+  const events: Array<{ kind: 'dispatch' | 'session' | 'settle'; taskId: string; atMs: number }> = [];
+  for (const record of source.records) {
+    const type = record.type;
+    const taskId = typeof record.taskId === 'string' ? record.taskId : '';
+    const at = typeof record.at === 'number' && Number.isFinite(record.at) ? record.at : null;
+    if (!taskId || at === null) continue;
+    if (type === 'dispatch' || type === 'session' || type === 'settle') events.push({ kind: type, taskId, atMs: at });
+  }
+  return { status: 'ok', records: events };
+}
+
+/**
+ * 从权威落盘记录读取并聚合 pi-amagi 编排度量（WP-F；只读；R5-02 三态）。
+ *
+ * 来源：<outputRoot>/.staging/<buildId>/build-actors/（actors/reviews/receipts/
+ * publish-requests/events.jsonl）、<dataRoot>/agent/builds/<buildId>/ 的各
+ * epoch（amagi dispatch journal + dispatch-rejections.jsonl）、kb_builds 行。
+ * 不解析模型会话 JSONL；任何读取失败降级（对应字段 null/省略 + notes
+ * 注明哪个文件缺/损），全部来源不可得才返回 null（调用方应省略
+ * orchestration 键而不是写空壳）。
+ */
+export function collectLeaderOrchestrationMetricsFromDisk(input: {
+  buildId: string;
+  row: Record<string, unknown> | null;
+  outputRoot: string;
+  dataRoot: string;
+  now?: string;
+}): KbBuildMetricsOrchestration | null {
+  const actorsDir = path.join(input.outputRoot, '.staging', input.buildId, 'build-actors');
+  const actorsSource = readJsonArraySource<{ role?: unknown }>(path.join(actorsDir, 'actors.json'), 'actors.json');
+  const reviewsSource = readJsonArraySource<Record<string, unknown>>(path.join(actorsDir, 'reviews.json'), 'reviews.json');
+  const receiptsSource = readJsonArraySource<Record<string, unknown>>(path.join(actorsDir, 'receipts.json'), 'receipts.json');
+  const publishRequestsSource = readJsonArraySource<Record<string, unknown>>(path.join(actorsDir, 'publish-requests.json'), 'publish-requests.json');
+  const ledgerEventsSource = readJsonlSource(path.join(actorsDir, 'events.jsonl'), 'events.jsonl');
+
+  // ——审查回执（scopePaths 归组；旧无范围回执单独计数；reviews 不可得时整段降级）——
+  let legacyUnscopedReviews = 0;
+  let reviews: LeaderSource<{ scopePaths?: string[] | null; verdict: string; createdAtMs: number }>;
+  if (reviewsSource.status === 'ok') {
+    const records = reviewsSource.records.flatMap((review): Array<{ scopePaths?: string[] | null; verdict: string; createdAtMs: number }> => {
+      const verdict = typeof review.verdict === 'string' ? review.verdict : '';
+      const createdAtMs = safeIsoMs(review.createdAt) ?? 0;
+      const scope = Array.isArray(review.scopePaths)
+        ? review.scopePaths.filter((item): item is string => typeof item === 'string' && item !== '')
+        : undefined;
+      if (scope === undefined || scope.length === 0) {
+        legacyUnscopedReviews += 1;
+        return [];
+      }
+      return [{ scopePaths: scope, verdict, createdAtMs }];
+    });
+    reviews = { status: 'ok', records };
+  } else {
+    reviews = reviewsSource;
+  }
+
+  // ——每篇首稿（write_doc/edit_doc 回执最早时间；receipts 不可得时降级）——
+  let firstDrafts: LeaderSource<{ path: string; atMs: number }>;
+  if (receiptsSource.status === 'ok') {
+    const firstDraftAt = new Map<string, number>();
+    for (const receipt of receiptsSource.records) {
+      if (receipt.kind !== 'write_doc' && receipt.kind !== 'edit_doc') continue;
+      const createdAtMs = safeIsoMs(receipt.createdAt);
+      const result = receipt.result && typeof receipt.result === 'object' && !Array.isArray(receipt.result)
+        ? receipt.result as Record<string, unknown> : null;
+      const paths = result && Array.isArray(result.paths) ? result.paths : [];
+      if (createdAtMs === null) continue;
+      for (const docPath of paths) {
+        if (typeof docPath !== 'string' || !docPath) continue;
+        const prior = firstDraftAt.get(docPath);
+        if (prior === undefined || createdAtMs < prior) firstDraftAt.set(docPath, createdAtMs);
+      }
+    }
+    firstDrafts = { status: 'ok', records: [...firstDraftAt.entries()].map(([docPath, atMs]) => ({ path: docPath, atMs })) };
+  } else {
+    firstDrafts = receiptsSource;
+  }
+
+  // ——发布结算时刻与拒绝原因（publish-requests 不可得时拒绝计数降级）——
+  let rejectedPublishReasons: LeaderSource<string>;
+  let acceptedSettledAtMs: number | null = null;
+  if (publishRequestsSource.status === 'ok') {
+    const reasons: string[] = [];
+    for (const request of publishRequestsSource.records) {
+      const status = request.status;
+      const settledAtMs = safeIsoMs(request.settledAt);
+      const reason = (request.result && typeof request.result === 'object'
+        && typeof (request.result as Record<string, unknown>).reason === 'string')
+        ? (request.result as Record<string, unknown>).reason as string : '';
+      if (status === 'rejected') reasons.push(reason || 'unknown');
+      if (status === 'accepted' && settledAtMs !== null) {
+        acceptedSettledAtMs = Math.max(acceptedSettledAtMs ?? 0, settledAtMs);
+      }
+    }
+    rejectedPublishReasons = { status: 'ok', records: reasons };
+  } else {
+    rejectedPublishReasons = publishRequestsSource;
+  }
+  let publishSettledAtMs = acceptedSettledAtMs;
+  // publish_settled 事件（真回投时刻）优先于申请记录 settledAt
+  if (ledgerEventsSource.status === 'ok') {
+    for (const event of ledgerEventsSource.records) {
+      if (event.type !== 'publish_settled') continue;
+      const payload = event.payload as Record<string, unknown> | undefined;
+      if (!payload || payload.status !== 'accepted') continue;
+      const atMs = safeIsoMs(event.receivedAt) ?? safeIsoMs(event.occurredAt);
+      if (atMs !== null) publishSettledAtMs = Math.max(publishSettledAtMs ?? 0, atMs);
+    }
+  }
+  if (publishSettledAtMs === null && input.row?.status === 'published') {
+    publishSettledAtMs = safeIsoMs(input.row.finished_at);
+  }
+
+  // ——各 epoch：amagi dispatch journal（运行/在途区间）与派发拒绝审计——
+  const buildRoot = path.join(input.dataRoot, 'agent', 'builds', input.buildId);
+  const epochRoots = listBuildEpochRoots(buildRoot);
+  /** taskId → 按时间排序的 session/settle 事件（运行区间推导） */
+  const journalByTask = new Map<string, Array<{ kind: 'session' | 'settle'; atMs: number }>>();
+  const dispatchAt = new Map<string, number>();
+  const settleAt = new Map<string, number>();
+  let journalStatus: 'ok' | 'missing' | 'corrupt' = 'missing';
+  let dispatchRejectionSource: LeaderSource<string> = { status: 'missing', file: 'dispatch-rejections.jsonl' };
+  for (const epochRoot of epochRoots) {
+    const journal = readDispatchJournalEvents(path.join(epochRoot, 'home', 'amagi', 'data', 'journal', 'dispatch.jsonl'));
+    if (journal.status === 'ok') {
+      journalStatus = 'ok';
+      for (const event of journal.records) {
+        if (event.kind === 'dispatch') {
+          const prior = dispatchAt.get(event.taskId);
+          if (prior === undefined || event.atMs < prior) dispatchAt.set(event.taskId, event.atMs);
+        } else {
+          if (event.kind === 'settle') {
+            const prior = settleAt.get(event.taskId);
+            if (prior === undefined || event.atMs > prior) settleAt.set(event.taskId, event.atMs);
+          }
+          const prior = journalByTask.get(event.taskId);
+          if (prior === undefined) journalByTask.set(event.taskId, [{ kind: event.kind, atMs: event.atMs }]);
+          else prior.push({ kind: event.kind, atMs: event.atMs });
+        }
+      }
+    } else if (journal.status === 'corrupt' && journalStatus !== 'ok') {
+      journalStatus = 'corrupt';
+    }
+    const rejections = readJsonlSource(path.join(epochRoot, 'dispatch-rejections.jsonl'), 'dispatch-rejections.jsonl');
+    if (rejections.status === 'ok') {
+      const codes = rejections.records.map((record) =>
+        typeof record.code === 'string' && record.code ? record.code : 'unknown');
+      dispatchRejectionSource = dispatchRejectionSource.status === 'ok'
+        ? { status: 'ok', records: [...dispatchRejectionSource.records, ...codes] }
+        : { status: 'ok', records: codes };
+    } else if (dispatchRejectionSource.status !== 'ok') {
+      dispatchRejectionSource = rejections;
+    }
+  }
+
+  // ——并发区间：journal 优先（session 起跑→同任务下一次 settle = 真实运行）；
+  //    不可得时按账本 actor_confirmed→handoff_submitted 近似（含排队间隙）。——
+  let runningIntervals: Array<{ startMs: number; endMs: number | null }> | null = null;
+  let runningDerivation: 'journal-session' | 'actor-events' | 'none' = 'none';
+  let runningUnterminated = 0;
+  let submittedIntervals: Array<{ startMs: number; endMs: number | null }> | null = null;
+  let submittedUnterminated = 0;
+  let journalHasDispatchWithoutSessions = false;
+  const hasSessionEvents = [...journalByTask.values()].some((events) => events.some((event) => event.kind === 'session'));
+  if (journalStatus === 'ok' && hasSessionEvents) {
+    runningDerivation = 'journal-session';
+    runningIntervals = [];
+    for (const events of journalByTask.values()) {
+      events.sort((a, b) => a.atMs - b.atMs);
+      for (let index = 0; index < events.length; index += 1) {
+        if (events[index].kind !== 'session') continue;
+        const end = events.slice(index + 1).find((later) => later.kind === 'settle');
+        runningIntervals.push({ startMs: events[index].atMs, endMs: end ? end.atMs : null });
+      }
+    }
+    runningUnterminated = runningIntervals.filter((span) => span.endMs === null).length;
+  } else if (journalStatus === 'ok') {
+    // journal 可读但无 session 事件：有派发记录 → 数据缺口（不是 0 并发）；
+    // 完全空 journal（无任何派发）→ 真实零运行区间。
+    journalHasDispatchWithoutSessions = dispatchAt.size > 0;
+    if (!journalHasDispatchWithoutSessions) {
+      runningDerivation = 'journal-session';
+      runningIntervals = [];
+    }
+  } else if (ledgerEventsSource.status === 'ok') {
+    const startByTask = new Map<string, number>();
+    const endByTask = new Map<string, number>();
+    for (const event of ledgerEventsSource.records) {
+      const atMs = safeIsoMs(event.receivedAt) ?? safeIsoMs(event.occurredAt);
+      if (atMs === null || typeof event.taskId !== 'string' || !event.taskId) continue;
+      if (event.type === 'actor_confirmed') {
+        const prior = startByTask.get(event.taskId);
+        if (prior === undefined || atMs < prior) startByTask.set(event.taskId, atMs);
+      } else if (event.type === 'handoff_submitted') {
+        const prior = endByTask.get(event.taskId);
+        if (prior === undefined || atMs > prior) endByTask.set(event.taskId, atMs);
+      }
+    }
+    if (startByTask.size > 0) {
+      runningDerivation = 'actor-events';
+      runningIntervals = [...startByTask.entries()].map(([taskId, startMs]) => ({ startMs, endMs: endByTask.get(taskId) ?? null }));
+      runningUnterminated = runningIntervals.filter((span) => span.endMs === null).length;
+    }
+  }
+  if (journalStatus === 'ok') {
+    // 在途区间：journal 可读即产出（无派发 = 真实空，peak 0）；
+    // submittedUnterminated 仅统计有派发的场景。
+    submittedIntervals = [...dispatchAt.entries()].map(([taskId, startMs]) => ({ startMs, endMs: settleAt.get(taskId) ?? null }));
+    submittedUnterminated = submittedIntervals.filter((span) => span.endMs === null).length;
+  }
+
+  return aggregateLeaderOrchestrationMetrics({
+    startedAtMs: safeIsoMs(input.row?.started_at),
+    finishedAtMs: safeIsoMs(input.row?.finished_at),
+    collectedAtMs: safeIsoMs(input.now ?? new Date().toISOString()) ?? Date.now(),
+    docsWritten: Number(input.row?.docs_written ?? 0) || 0,
+    sourcesTotal: Number(input.row?.source_total ?? 0) || 0,
+    actors: actorsSource.status === 'ok'
+      ? { status: 'ok', records: actorsSource.records.flatMap((actor): Array<{ role: string }> =>
+        typeof actor.role === 'string' ? [{ role: actor.role }] : []) }
+      : actorsSource,
+    reviews,
+    legacyUnscopedReviews,
+    firstDrafts,
+    publishSettledAtMs,
+    rejectedPublishReasons,
+    dispatchRejectionCodes: dispatchRejectionSource,
+    journal: { status: journalStatus, hasDispatchWithoutSessions: journalHasDispatchWithoutSessions },
+    ledgerEvents: { status: ledgerEventsSource.status },
+    runningIntervals,
+    runningDerivation,
+    runningUnterminated,
+    submittedIntervals,
+    submittedUnterminated,
+  });
+}

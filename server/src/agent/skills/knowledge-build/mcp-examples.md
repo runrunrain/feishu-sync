@@ -85,6 +85,7 @@
 `raw_read` 中临时插入的 `<image_description>` 与 `<whiteboard_text>` 不属于原文资源的 `text_span` 行号。由图片描述或白板原始节点文字支撑的事实应指向 `<objToken>#image:<图片 src>`，使用 `selector:{"kind":"media_region"}`、`nature:"machine_description"`；imageHash 由服务端钉住，白板文字及原图一同登记为证据。白板旁路仅支持已提取的节点文字，不能据此推断图形布局或未提取的关系。正文 `text_span` 只能证明实际原文文字，不能用宽泛区间或把性质改成 machine_description 来代替图片证据。
 构建态 `raw_read` 的 `<image_resources>` 会列出本页可引用图片的资源 ID、图片哈希与派生方式；图片 `media_region` 不需要文本行读取回执。该资源表只列有图片描述或白板旁路文字且原图可读的图片，不能把未列出的图片当成证据。
 CSV 证据不能用 `text_span`：在对应 `evidenceClaims` 项使用 `"sourceRef":{"sourceId":"<objToken>","resourceId":"<objToken>#csv:表.csv"}` 与 `"selector":{"kind":"csv_cells","recordStart":2,"recordEnd":2,"columns":["列名"]}`。record 1 通常是表头；列名照 CSV 首条 record 原字填写。飞书 sheet 的导出 CSV 若前几行全空或表头重复，用显式物理列坐标 `"columns":["@C"]`（可多列 `@A/@B/...`）；`recordStart/recordEnd` 仍是从 1 起始的逻辑 record 号。`coverageUpdates` 的 `sourceId` 仍必填，填来源 objToken。
+证据范围必须覆盖断言引用的内容本身：断言某表有三个阶段、六类岗位时，selector 要取到该表所在行（含表体而非仅节标题行或空行）；断言依据 CSV 注释列时，`columns` 须含该列（如 `["@B","@I"]`），只圈数据列会被审查以「selector 不支撑断言」记 blocking。
 `claims[].riskCategory` 只能是 `high` 或 `normal`；`coverageUpdates[].importance` 只能是 `important` 或 `normal`，不能写 `minor`。覆盖排除理由写交接记录或总结，不在 `coverageUpdates` 项里添加 `excludeReason`。
 同一来源、同一分类的覆盖项在修订时若要插入或重排，请显式给各项稳定 `itemId`，避免按序号生成的 ID 改指别的事项。
 当 `coverageUpdates[].disposition` 为 `excluded_template` 或 `excluded_nonknowledge` 时，**该项还必须有非空 `reason` 字段**；不要因缺少理由让整次写入失败。

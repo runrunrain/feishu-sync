@@ -819,6 +819,92 @@ export interface KbBuildMetrics {
   /** S3 切片 C：机械预检发现计数（每审查主体一条）。additive 可选：
    * 开关关闭（无采集）的旧 metrics_json 不带此字段。 */
   precheck?: KbBuildMetricsPrecheck[];
+  /** WP-F（kb-build-speedup）：pi-amagi 编排构建度量段。additive 可选：
+   * legacy 流水与旧 metrics_json 不带此字段。 */
+  orchestration?: KbBuildMetricsOrchestration;
+}
+
+/**
+ * WP-F（kb-build-speedup）：pi-amagi 编排构建度量（kb_builds.metrics_json 的
+ * orchestration 段）。
+ *
+ * 数据来源全部为服务端权威落盘记录，不解析模型会话 JSONL：
+ * - build-actors 账本（<outputRoot>/.staging/<buildId>/build-actors/ 下的
+ *   actors/reviews/receipts/publish-requests/events.jsonl）；
+ * - amagi dispatch 审计 journal（<epochRoot>/home/amagi/data/journal/
+ *   dispatch.jsonl：dispatch→settle 在途区间）；
+ * - <epochRoot>/dispatch-rejections.jsonl（应用侧派发拒绝审计，WP-F 起
+ *   由 BuildRuntimeHost 追加；旧构建无此文件 → dispatchRejections 省略）；
+ * - kb_builds 自身时间戳（started_at/finished_at/docs_written/source_total）。
+ *
+ * 无法推导的字段如实省略或置 null（notes 说明缺口），禁止编造数值。
+ */
+export interface KbBuildMetricsOrchestration {
+  /** 构建墙钟（kb_builds.started_at → finished_at；未收口终态按采集时刻，
+   * notes 注明）。含 preflight/发布，不含队列等待（创建即开始）。 */
+  wallClockMs: number;
+  /** 本轮产出文档数（kb_builds.docs_written）与工作集源数（source_total）。 */
+  docsPublished: number;
+  sourcesTotal: number;
+  /** 派发计数（build-actors/actors.json 按角色；含 task_resume 续接产生的
+   * 新身份）：luban 写作 / diting 独立审查 / baize 调研。null = actors.json
+   * 不可得（缺失/损坏，notes 注明）；真实空数组 = 0（R5-02）。 */
+  authorDispatches: number | null;
+  reviewDispatches: number | null;
+  researchDispatches: number | null;
+  /** 每篇文档审查轮数分布与首审结论（reviews.json 按 scopePaths 归组；
+   * 无 scopePaths 的旧回执不计入每篇口径，notes 注明）。null =
+   * reviews.json 不可得；真实空文件 = docsReviewed 0（R5-02）。 */
+  revisionRounds: {
+    /** 收到至少一次（有范围）审查的文档数 */
+    docsReviewed: number;
+    /** 有范围审查回执总数 */
+    totalReviews: number;
+    /** 每篇文档审查次数中位数（无审查 → null） */
+    roundsMedian: number | null;
+    roundsMax: number | null;
+    /** 每篇文档首审（最早回执）结论计数（未识别 verdict 不计入） */
+    firstVerdicts: { pass: number; needs_revision: number; insufficient_material: number; fail: number };
+    /** 首审 pass 的文档占比（docsReviewed=0 → null） */
+    firstPassRate: number | null;
+  } | null;
+  /** 发布门拒绝计数（publish-requests.json status=rejected 按 result.reason
+   * 计，缺 reason 计 unknown）。空对象 = 真实无拒绝；null = 文件不可得
+   * （R5-02，不冒充“无拒绝”）。 */
+  publishRejections: Record<string, number> | null;
+  /** 派发守卫/任务系统拒绝计数（dispatch-rejections.jsonl 按 code 计；
+   * 空对象 = 真实无拒绝）。additive 可选：记录文件不可得（WP-F 之前的
+   * 旧构建/损坏）不带此键，不编造。 */
+  dispatchRejections?: Record<string, number>;
+  /** 模型池并发（amagi dispatch journal 的 session→settle 区间推导，
+ * 即真实运行中的会话数；journal 缺失时按账本 actor_confirmed→
+   * handoff_submitted 近似并注明 derivation）。
+   * 无任何区间来源 → peak/avg 为 null、derivation='none'；区间不完整时
+   * avgInflight 可能为 null（只给 peak，notes 注明）。 */
+  pool: {
+    peakInflight: number | null;
+    /** 时间加权平均运行并发（窗口=首个 session → 最后一次 settle） */
+    avgInflight: number | null;
+    /** 推导口径：journal-session=审计 session→settle 区间；actor-events=
+     * 账本事件近似（含排队间隙）；none=无来源 */
+    derivation: 'journal-session' | 'actor-events' | 'none';
+    /** 派发在途（dispatch→最终 settle，含排队与待修订间隙）并发峰值/均值
+     * ——R2 排队深度的直接度量。additive 可选：无 journal 时省略。 */
+    submittedPeakInflight?: number | null;
+    submittedAvgInflight?: number | null;
+  };
+  /** 每篇文档首稿→发布结算耗时分布（receipts 首个 write/edit 回执 →
+   * publish_settled/accepted settledAt/finished_at；nearest-rank 分位）。
+   * additive 可选：receipts.json 可读且到达发布才带此键（可读且为空 =
+   * 真实 count 0；不可得/未发布则省略并在 notes 注明，R5-02）。 */
+  firstDraftToPublish?: {
+    count: number;
+    p50Ms: number;
+    p90Ms: number;
+    maxMs: number;
+  };
+  /** 数据缺口/口径说明（人读）；无缺口不带键。 */
+  notes?: string[];
 }
 
 // ============================================================================

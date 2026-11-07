@@ -264,13 +264,16 @@ describe('WP-C：raw_csv_find 批量上限容错', () => {
     const payload = JSON.parse(/\{[\s\S]*\}/.exec(result.content[0]!.text)![0]) as { note?: string };
     expect(payload.note).toContain('9 项查询');
   });
-  it('对照：>24 项与缺 resourceId 报精确错误', async () => {
+  it('对照：>24 项报精确错误；缺 resourceId 时唯一附件自动选用（WP-E E5）', async () => {
     const state = makeBuildState('csv-find-err');
     const tooMany = Array.from({ length: 25 }, (_, i) => `查询词${i}号`);
     await expect(call(tokenFor(state), 'raw_csv_find', { objToken: 'tokB', resourceId: `tokB#csv:${CSV_NAME}`, queries: tooMany }))
       .rejects.toThrow(/1–24/);
-    await expect(call(tokenFor(state), 'raw_csv_find', { objToken: 'tokB', queries: ['短语'] }))
-      .rejects.toThrow(/raw_csv_find 需要参数 resourceId/);
+    // WP-E（E5）：该来源恰有一个 CSV 附件 → 缺省 resourceId 自动选用并注明
+    const auto = await call(tokenFor(state), 'raw_csv_find', { objToken: 'tokB', queries: ['多行'] });
+    const payload = JSON.parse(/\{[\s\S]*\}/.exec(auto.content[0]!.text)![0]) as { resourceId: string; note?: string };
+    expect(payload.resourceId).toBe(`tokB#csv:${CSV_NAME}`);
+    expect(payload.note).toContain('已自动选用');
   });
 });
 
@@ -501,14 +504,14 @@ describe('WP-C：kb_evidence_unresolved 自动修复提示', () => {
       } }],
     })).rejects.toThrow(/选中的单元格全为空.*该 record 范围实际非空列：@A, @B/s);
   });
-  it('(b) 文本证据无回执时附上精确 raw_read 参数（含派生行换算后的输出窗口）', async () => {
+  it('(b) 文本证据无回执时附上精确 raw_read 参数（按 selector 与 segment 交集换算的输出窗口，R4-02）', async () => {
     const state = makeBuildState('hint-text');
     const token = tokenFor(state);
     await expect(call(token, 'kb_write_doc', {
       path: '战斗/无回执.md', markdown: '## 倍率\n倍率 2.0。',
       sources: ['tokA'], summary: '无回执', objects: [BASE_OBJECT],
       evidenceClaims: [{ objectKey: 'damage', claimKey: 'multiplier', selector: { kind: 'text_span', lineStart: 3, lineEnd: 3 } }],
-    })).rejects.toThrow(/没有覆盖所选范围的 raw_read 回执.*raw_read\(objToken:"tokA", offset:0, limit:4\)/s);
+    })).rejects.toThrow(/没有覆盖所选范围的 raw_read 回执.*raw_read\(objToken:"tokA", offset:2, limit:1\).*资源行 3\.\.3/s);
   });
   it('(c) CSV 证据无回执时附上精确 raw_csv_cells 参数', async () => {
     const state = makeBuildState('hint-csv');
@@ -592,7 +595,9 @@ describe('R4 复审：真实下发 schema 接缝（ajv 校验 spec.parameters）
   });
 
   it('required 保留的工具：缺真实必填项仍在 schema 层被拒（列真实参数名的一次可修复错误）', () => {
-    expect(ajv.validate(RAW_CSV_FIND_SPEC.parameters as object, { objToken: 't', queries: ['短语'] })).toBe(false);
+    // WP-E（E5）：raw_csv_find 的 resourceId 已移出 required（缺省时服务端
+    // 按唯一附件解析），此处不再拦截；raw_csv_cells 仍保持 required。
+    expect(ajv.validate(RAW_CSV_FIND_SPEC.parameters as object, { objToken: 't', queries: ['短语'] })).toBe(true);
     expect(ajv.validate(RAW_CSV_CELLS_SPEC.parameters as object, { objToken: 't', resourceId: 'r' })).toBe(false);
   });
 });
