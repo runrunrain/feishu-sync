@@ -6,6 +6,7 @@ import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import JSZip from 'jszip';
+import { resolveAmagiSource } from './amagi-source.mjs';
 
 const serverRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const sha = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex');
@@ -16,27 +17,8 @@ function requiredLocalPatch(version) {
   return { patchPath, sha256: sha(fs.readFileSync(patchPath)) };
 }
 
-function npm(args, cwd) {
-  const cli = [process.env.npm_execpath,
-    path.resolve(path.dirname(process.execPath), '../lib/node_modules/npm/bin/npm-cli.js'),
-    path.resolve(path.dirname(process.execPath), 'node_modules/npm/bin/npm-cli.js'),
-  ].find((candidate) => candidate && fs.existsSync(candidate));
-  if (!cli) throw new Error('Bundling amagi-pi requires npm; run this command with npm run.');
-  return execFileSync(process.execPath, [cli, ...args], { cwd, encoding: 'utf8', timeout: 300_000, maxBuffer: 8 * 1024 * 1024 });
-}
-
-export async function bundleAmagi({ sourceDir = process.env.AMAGI_PI_SOURCE_DIR,
-  bundleDir = path.join(serverRoot, 'bundled', 'amagi-pi'),
-  destination = path.join(serverRoot, 'dist', 'agent', 'bundled-amagi'),
-} = {}) {
-  const sibling = path.resolve(serverRoot, '../../amagi-pi');
-  const source = sourceDir === false || process.env.AMAGI_PI_USE_BUNDLED === '1' ? null
-    : sourceDir ? path.resolve(sourceDir) : fs.existsSync(path.join(sibling, 'package.json')) ? sibling : null;
-  const manifestPath = path.join(bundleDir, 'manifest.json');
-  const archivePath = path.join(bundleDir, 'package.zip');
-  let previous = null;
-  try { previous = JSON.parse(fs.readFileSync(manifestPath, 'utf8')); } catch { /* first bundle */ }
-  if (source) {
+/** 从源目录按 npm 发布允许清单重打包；sourceHash 缓存命中时不重建并原样返回 previous。 */
+async function packSource(source, { bundleDir, manifestPath, archivePath, previous }) {
     const pkg = JSON.parse(fs.readFileSync(path.join(source, 'package.json'), 'utf8'));
     if (pkg.name !== 'amagi-pi' || !/^\d+\.\d+\.\d+$/.test(pkg.version)) throw new Error('AMAGI_PI_SOURCE_DIR must contain a stable amagi-pi package');
     const localPatch = requiredLocalPatch(pkg.version);
@@ -120,8 +102,37 @@ export async function bundleAmagi({ sourceDir = process.env.AMAGI_PI_SOURCE_DIR,
         fs.mkdirSync(bundleDir, { recursive: true });
         fs.writeFileSync(`${archivePath}.tmp`, bytes); fs.renameSync(`${archivePath}.tmp`, archivePath);
         fs.writeFileSync(`${manifestPath}.tmp`, JSON.stringify(manifest, null, 2) + '\n'); fs.renameSync(`${manifestPath}.tmp`, manifestPath);
-        previous = manifest;
+        return manifest;
       } finally { fs.rmSync(stage, { recursive: true, force: true }); }
+    }
+    return previous;
+}
+
+function npm(args, cwd) {
+  const cli = [process.env.npm_execpath,
+    path.resolve(path.dirname(process.execPath), '../lib/node_modules/npm/bin/npm-cli.js'),
+    path.resolve(path.dirname(process.execPath), 'node_modules/npm/bin/npm-cli.js'),
+  ].find((candidate) => candidate && fs.existsSync(candidate));
+  if (!cli) throw new Error('Bundling amagi-pi requires npm; run this command with npm run.');
+  return execFileSync(process.execPath, [cli, ...args], { cwd, encoding: 'utf8', timeout: 300_000, maxBuffer: 8 * 1024 * 1024 });
+}
+
+export async function bundleAmagi({ sourceDir = process.env.AMAGI_PI_SOURCE_DIR,
+  bundleDir = path.join(serverRoot, 'bundled', 'amagi-pi'),
+  destination = path.join(serverRoot, 'dist', 'agent', 'bundled-amagi'),
+} = {}) {
+  const manifestPath = path.join(bundleDir, 'manifest.json');
+  const archivePath = path.join(bundleDir, 'package.zip');
+  let previous = null;
+  try { previous = JSON.parse(fs.readFileSync(manifestPath, 'utf8')); } catch { /* first bundle */ }
+  // 来源链（显式目录 / AMAGI_PI_USE_BUNDLED → AMAGI_PI_LATEST 远端最新 → 同级 ../amagi-pi → 检入冻结包）见 amagi-source.mjs。
+  const resolved = await resolveAmagiSource({ sourceDir, bundleDir });
+  const source = resolved.dir;
+  if (source) {
+    try {
+      previous = await packSource(source, { bundleDir, manifestPath, archivePath, previous });
+    } finally {
+      resolved.cleanup(); // 打包完成、缓存命中或异常后清理远端临时源
     }
   }
   const requiredPatch = previous && requiredLocalPatch(previous.version);
@@ -131,6 +142,6 @@ export async function bundleAmagi({ sourceDir = process.env.AMAGI_PI_SOURCE_DIR,
   fs.mkdirSync(destination, { recursive: true });
   fs.copyFileSync(manifestPath, path.join(destination, 'manifest.json'));
   fs.copyFileSync(archivePath, path.join(destination, 'package.zip'));
-  console.info(`[bundled-amagi] amagi-pi ${previous.version}, ${previous.files} files, ${(previous.archiveBytes / 1024 / 1024).toFixed(1)} MB; ${source ? 'local source verified' : 'using checked-in private bundle'}`);
+  console.info(`[bundled-amagi] amagi-pi ${previous.version}, ${previous.files} files, ${(previous.archiveBytes / 1024 / 1024).toFixed(1)} MB; source=${resolved.origin}, commit=${String(resolved.commit ?? previous.sourceCommit ?? '').slice(0, 8) || 'unknown'}`);
   return previous;
 }

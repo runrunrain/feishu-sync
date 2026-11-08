@@ -6,6 +6,14 @@
 
 推送 `v*` 标签 → [release.yml](../.github/workflows/release.yml) 自动构建 macOS dmg/zip（arm64 + x64 矩阵）+ Windows NSIS exe 并发布 Release（说明从 CHANGELOG 提取；产物存在即跳过上传，支持给既有 release 补产物）。mac 双架构更新通道分离（arm64 走 `latest-arm64-mac.yml`，x64 走 `latest-mac.yml`），产物命名 `FeishuSync-*`；electron-updater generic provider 指向 `releases/latest/download/`。CI 无 Developer ID 证书，走 adhoc 签名（`DESKTOP_MAC_SIGNING=adhoc`，下载安装后需 `xattr -dr com.apple.quarantine` 解除隔离）。
 
+### 内嵌 amagi-pi 版本与访问令牌（release workflow）
+
+- release.yml 首个 job `amagi-ref` 用 `git ls-remote` 解析 amagi-pi 默认分支 HEAD（固定 40 位 sha，tag 停在旧版不能作判据），三个构建 job `needs` 它并共用同一 sha，一次发布内嵌的 amagi-pi 版本一致；构建后各 job summary 回写内嵌版本/commit/来源。
+- 仓库 Settings → Secrets and variables → Actions → Secrets 新增 `AMAGI_PI_TOKEN`：fine-grained PAT，仅授予 `runrunrain/amagi-pi` 的 Contents: Read-only。令牌只经 `GIT_CONFIG_*` 环境变量注入 git，不进命令行与日志。未配置时 `amagi-ref` 发 `::warning::` 并输出空 ref，构建内嵌检入冻结包（见下）。配置了令牌但 ls-remote 失败则发布直接失败，不静默田检入旧版。
+- 可选 Variables 新增 `AMAGI_PI_REQUIRE_LATEST=1`：取不到远端最新时发布构建失败（对「必须内嵌最新」的发布门要求）。
+- 本机构建（`npm run desktop:dist:*`）默认同样自动取远端最新（用本机 git/gh 凭据）：`AMAGI_PI_LATEST=0` 显式关闭，`AMAGI_PI_USE_BUNDLED=1` 强制检入冻结包（离线构建）；其余构建（dev、`server:build`、CI 测试）不联网。
+- 刷新检入冻结包：`cd server && npm run build && npm run amagi:refresh`（远端最新链路、禁止降级与主版本门检见 [build-operations.md](./build-operations.md) §6）。
+
 ### 本地打包命令
 
 ```bash
@@ -83,7 +91,7 @@ npx tsx scripts/sync-latest.ts --skip-index --apply    # 提交KB正文，仅 cr
 
 ## Agent 工作台验证与打包
 
-- `npm run server:build` 除tsc外，还运行`server/scripts/build-agent-assets.mjs`：复制内置prompts/转发扩展/角色卡/skill包，借`server/scripts/lib/`esbuild 打包 3 个 CJS（`dist/mcp/kb-mcp.cjs`、`dist/mcp/kb-mcp-gateway.cjs`、`dist/cli/feishu-sync-cli.cjs`），并维护内置 amagi 依赖快照——`server/bundled/amagi-pi/` 冻结 `package.zip`+`manifest.json`（开发机存在同级 `../amagi-pi` 或设 `AMAGI_PI_SOURCE_DIR` 时按源码/锁/补丁 hash 刷新；来源/补丁/升级路径见 `scripts/lib/bundled-amagi.mjs` 头注释），构建时安装到 `dist/agent/bundled-amagi`。写面为 server/dist/** 与 server/bundled/amagi-pi/，不修改用户资料。
+- `npm run server:build` 除tsc外，还运行`server/scripts/build-agent-assets.mjs`：复制内置prompts/转发扩展/角色卡/skill包，借`server/scripts/lib/`esbuild 打包 3 个 CJS（`dist/mcp/kb-mcp.cjs`、`dist/mcp/kb-mcp-gateway.cjs`、`dist/cli/feishu-sync-cli.cjs`），并维护内置 amagi 依赖快照——`server/bundled/amagi-pi/` 冻结 `package.zip`+`manifest.json`（来源链：`AMAGI_PI_SOURCE_DIR`/`AMAGI_PI_USE_BUNDLED` → `AMAGI_PI_LATEST=1` 远端最新（桌面安装包构建自动启用）→ 同级 `../amagi-pi` → 冻结包，见 `scripts/lib/amagi-source.mjs`；刷新冻结包用 `npm run amagi:refresh`），构建时安装到 `dist/agent/bundled-amagi`。写面为 server/dist/** 与 server/bundled/amagi-pi/，不修改用户资料。
 - 桌面版业务 server 运行在 Electron utilityProcess（见 [architecture.md](./architecture.md) 进程契约）；pi使用外部Node≥22.19。安装包需核对asarUnpack后的扩展/prompts/MCP/CLI路径，以及外部运行时的实际发现结果；原生SQLite ABI构建成功不等于桌面运行验证成功。
 - **CLI 默认开启**（`cli.enabled` 缺省 true，0.4.2 起）：应用运行时自动发布 `<dataRoot>/run/endpoint.json`；设置页可显式关闭（关闭后不再发布端点，CLI 报退出码 3=应用未运行/不可达）。完整命令、风险级与 `--yes` 约定见 [cli-reference.md](./cli-reference.md)。
 - CLI 打包形态：应用内「设置 → 应用 → 命令行访问 → 安装命令行工具」经 `/api/cli/install-shim` 写 `<dataRoot>/bin/feishu-sync`（POSIX 0755）与 `feishu-sync.cmd`（Windows）——打包版 shim 以应用 Electron 可执行文件 + `ELECTRON_RUN_AS_NODE=1` 调起 cli.cjs，开发版用当前 Node。CLI 只调运行中的 server（读 `<dataRoot>/run/endpoint.json`），无离线直写。

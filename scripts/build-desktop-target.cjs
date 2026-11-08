@@ -219,8 +219,20 @@ async function main() {
     }
 
     // Step 1: Build frontend + server
+    //
+    // 桌面安装包默认内嵌远端最新 amagi-pi（AMAGI_PI_LATEST=1，见
+    // server/scripts/lib/amagi-source.mjs 来源链）。用户已显式指定
+    // AMAGI_PI_SOURCE_DIR / AMAGI_PI_USE_BUNDLED / AMAGI_PI_LATEST 之一时
+    // 尊重原值不注入；AMAGI_PI_LATEST=0 为显式关闭（回退冻结包/同级目录），
+    // AMAGI_PI_USE_BUNDLED=1 强制检入冻结包（离线构建）。
+    const amagiExplicitEnv = ['AMAGI_PI_SOURCE_DIR', 'AMAGI_PI_USE_BUNDLED', 'AMAGI_PI_LATEST']
+      .filter((name) => process.env[name] !== undefined && process.env[name] !== '');
+    const amagiLatestEnv = amagiExplicitEnv.length === 0 ? { AMAGI_PI_LATEST: '1' } : {};
+    console.log(`\namagi-pi source: ${amagiExplicitEnv.length === 0
+      ? 'remote latest mode enabled (disable with AMAGI_PI_LATEST=0; force frozen bundle with AMAGI_PI_USE_BUNDLED=1)'
+      : `explicit via env (${amagiExplicitEnv.join(', ')})`}`);
     logStep('Step 1: Build frontend (vite) + server (tsc)');
-    const buildAllResult = run('npm run build:all');
+    const buildAllResult = run('npm run build:all', { env: amagiLatestEnv });
     checkSuccess(buildAllResult, 'Build all');
 
     // Step 2: Build Electron main + preload

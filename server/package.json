@@ -16,6 +16,7 @@
     "reconcile:dry-run": "tsx scripts/reconcile-knowledge-base.ts",
     "reconcile:apply": "tsx scripts/reconcile-apply.ts",
     "migrate:v5": "tsx scripts/run-migration-v5.ts",
+    "amagi:refresh": "node scripts/refresh-amagi.mjs",
     "test:migrations": "vitest run tests/migration-v5.test.ts"
   },
   "dependencies": {

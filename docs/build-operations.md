@@ -147,11 +147,15 @@ npx tsx scripts/build-metrics-report.ts <buildId> [--home <FEISHU_SYNC_HOME>]
 
 应用随包内置私有 amagi-pi 离线分发（离线安装，全部运行安装走既有 Pi 包安装器）：
 
-- **构建脚本** `server/scripts/lib/bundled-amagi.mjs`（`bundleAmagi`，随 `npm run build:all` 经 `build-agent-assets.mjs` 调用）：从 npm 发布允许清单（`npm pack --dry-run` 文件清单）打包，绝不整仓拷贝。流程：源码逐文件哈希 → 按精确 lock 隔离安装生产依赖（不带宿主 Pi/peer/dev 包）→ 应用 2.21.31 background-continue 补丁 → 冻结树内容哈希 → zip（DEFLATE9、固定时间戳）→ 写 `server/bundled/amagi-pi/manifest.json` + `package.zip`，复制到 `server/dist/agent/bundled-amagi/`。
-- **版本钉与缓存键**：manifest 当前为 2.21.36（sourceCommit `48df74b0`、487 文件、内容哈希 `a5883cc0…`、zip sha256 `a1391f69…`）；重打包缓存键 = `bundlerVersion + sourceHash`（源文件哈希 + lock 哈希 + 补丁哈希），一致则跳过重建；2.21.36 强制要求补丁（缺失即构建失败，提示 `AMAGI_PI_SOURCE_DIR`）。
+- **构建脚本** `server/scripts/lib/bundled-amagi.mjs`（`bundleAmagi`，随 `npm run build:all` 经 `build-agent-assets.mjs` 调用）：从 npm 发布允许清单（`npm pack --dry-run` 文件清单）打包，绝不整仓拷贝。流程：源码逐文件哈希 → 按精确 lock 隔离安装生产依赖（不带宿主 Pi/peer/dev 包）→ 按需应用本地补丁 → 冻结树内容哈希 → zip（DEFLATE9、固定时间戳）→ 写 `server/bundled/amagi-pi/manifest.json` + `package.zip`，复制到 `server/dist/agent/bundled-amagi/`。产物确定性：同源同 lock 两次独立构建产物字节一致。
+- **构建期来源链**（`server/scripts/lib/amagi-source.mjs` `resolveAmagiSource`，优先级高→低）：
+  1. `AMAGI_PI_USE_BUNDLED=1` 或 `AMAGI_PI_SOURCE_DIR` 显式目录：直接用检入冻结包/指定源，不联网（显式优先，行为不变）。
+  2. `AMAGI_PI_LATEST=1`：远端最新模式——`git fetch --depth 1 <repo> <AMAGI_PI_REF|HEAD>` 浅取源（支持分支名与 40 位 sha；repo 默认 `https://github.com/runrunrain/amagi-pi.git`，`AMAGI_PI_REPO` 可覆盖）。校验：稳定 semver 的 amagi-pi 包、主版本必须等于 `SUPPORTED_AMAGI_MAJOR`（=2，跨主版本拒绝并给出原因）、不得低于检入冻结包版本（禁止降级）。失败/校验不过时降级：同级 `../amagi-pi`（存在则用）→ 检入冻结包，每步打一行 `[amagi-source] WARN`（原因+采用来源）；`AMAGI_PI_REQUIRE_LATEST=1` 则不降级直接抛错。`AMAGI_PI_TOKEN` 可选访问令牌：只经 `GIT_CONFIG_*` 环境变量注入 git，不进 argv/URL/日志/manifest，输出前统一脱敏；无令牌时用环境既有 git 凭据（本机 gh 登录）。桌面安装包构建（`scripts/build-desktop-target.cjs`）在用户未显式设置上列变量时自动注入 `AMAGI_PI_LATEST=1`（`AMAGI_PI_LATEST=0` 显式关闭）；release.yml 预解析固定 sha 并传 `AMAGI_PI_REF`，三个构建 job 内嵌同一版本（见 docs/operations.md 发布段）。
+  3. 历史默认（dev、`server:build`、CI 测试）：同级 `../amagi-pi` 存在则用，否则检入冻结包，不联网。
+- **版本钉与缓存键**：manifest 当前为 2.22.0（sourceCommit `9b155e0`、488 文件、内容哈希 `2e412ab0…`、zip sha256 `d158f85d…`）；重打包缓存键 = `bundlerVersion + sourceHash`（源文件哈希 + lock 哈希 + 补丁哈希），一致则跳过重建（远端临时源仍会清理）。补丁随版本演进：`requiredLocalPatch` 仅对 2.21.36 生效（background-continue/queued-shutdown 补丁，缺失即构建失败）；2.22.0 起修复已上游化（`task-background.ts` 内置 `shouldAutoContinue`、`task-run.ts` 内置 `cleanupChildrenOnShutdown`），无需本地补丁，manifest 无 `localPatchSha256` 字段。
+- **冻结包升级办法**：`cd server && npm run build && npm run amagi:refresh`（`scripts/refresh-amagi.mjs` 设 `AMAGI_PI_LATEST=1` 走上面第 2 级链路，刷新后 `git status server/bundled/amagi-pi` 查看变更并提交）；或维护者本机放新版源码（或设 `AMAGI_PI_SOURCE_DIR`）后 `npm run build:all`。运行侧用户在 Pi home 配置更新版本的包，下次构建自动优选。
 - **运行时使用**（`server/src/agent/bundled-amagi.ts`）：解包校验（zip sha256、文件数/字节数、内容哈希、路径安全、无 symlink）后经 `installAmagiPackage` 物化到 `<dataRoot>/agent/runtime-packages/amagi-pi@<版本>+<contentHash>` 缓存目录（install-record.json 记录来源），同键并发去重。
-- **来源优先级**（`build-runtime-host.ts` `preferredAmagi`）：Pi home（全局 `~/.pi/agent` 与应用 pi-home）已配置且版本 ≥ 内置 bundle 的候选优先；否则用内置 bundle；再否则回退官方 Git 获取链（repo `https://github.com/runrunrain/amagi-pi.git`、固定 commit `929000ec…`，拒绝 tag/latest）。运行中构建保留自己的冻结包不升级；升级只发生在新构建边界。
-- **升级办法**：维护者本机放新版 amagi-pi 源码（或设 `AMAGI_PI_SOURCE_DIR` 指向），`npm run build:all` 重新打包（bundle 会重算并更新 manifest）；运行侧用户在 Pi home 配置更新版本的包，下次构建自动优选。补丁随版本演进：`requiredLocalPatch` 只对 2.21.36 生效，版本变更后需同步评估补丁去留。`AMAGI_PI_USE_BUNDLED=1` 强制使用已检入 bundle（跳过本地源）。
+- **运行时来源优先级**（`build-runtime-host.ts` `preferredAmagi`）：Pi home（全局 `~/.pi/agent` 与应用 pi-home）已配置且版本 ≥ 内置 bundle 的候选优先；否则用内置 bundle；再否则回退官方 Git 获取链（repo `https://github.com/runrunrain/amagi-pi.git`、固定 commit `929000ec…`，拒绝 tag/latest）。运行中构建保留自己的冻结包不升级；升级只发生在新构建边界。
 - Windows 兼容注意：0.4.0 曾因换行差异导致内置包校验失败，bundle 校验均为字节级，重新打包即可修复。
 
 ## 7. 相关入口

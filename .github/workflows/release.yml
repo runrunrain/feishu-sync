@@ -26,7 +26,42 @@ permissions:
   contents: write
 
 jobs:
+  # 解析 amagi-pi 默认分支 HEAD（40 位 sha）：三个构建 job needs 本 job 并共用同一
+  # sha，保证一次发布内嵌的 amagi-pi 版本一致（仓库 tag 停在旧版，不能以 tag 判定）。
+  # 令牌只经 GIT_CONFIG_* 环境变量注入 git，不写 argv、不 echo。
+  # 未配置令牌：输出空 ref 并告警（构建改用检入冻结包，见各构建步骤的
+  # AMAGI_PI_USE_BUNDLED 条件）；配置了令牌但 ls-remote 失败：直接失败，
+  # 不静默田检入旧版（配 AMAGI_PI_REQUIRE_LATEST=1 可进一步强制取不到最新即失败）。
+  amagi-ref:
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.resolve.outputs.ref }}
+    steps:
+      - name: Resolve amagi-pi latest commit
+        id: resolve
+        env:
+          AMAGI_PI_TOKEN: ${{ secrets.AMAGI_PI_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${AMAGI_PI_TOKEN:-}" ]; then
+            echo "::warning::未配置 Secrets.AMAGI_PI_TOKEN：桌面构建将内嵌检入冻结包。配置：仓库 Settings → Secrets and variables → Actions → Secrets 新增 AMAGI_PI_TOKEN（fine-grained PAT，仅授予 runrunrain/amagi-pi 的 Contents: Read-only）。"
+            echo "ref=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          BASIC="$(printf 'x-access-token:%s' "$AMAGI_PI_TOKEN" | base64 | tr -d '\n')"
+          REF="$(GIT_CONFIG_COUNT=1 \
+            GIT_CONFIG_KEY_0='http.https://github.com/.extraheader' \
+            GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${BASIC}" \
+            GIT_TERMINAL_PROMPT=0 \
+            git ls-remote https://github.com/runrunrain/amagi-pi.git HEAD | cut -f1)"
+          if [[ ! "$REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::git ls-remote 未返回有效的 amagi-pi HEAD sha"
+            exit 1
+          fi
+          echo "ref=${REF}" >> "$GITHUB_OUTPUT"
+
   build-mac:
+    needs: amagi-ref
     runs-on: macos-latest
     strategy:
       fail-fast: false
@@ -76,6 +111,27 @@ jobs:
           DESKTOP_MAC_SIGNING: adhoc
           # CI 无证书，禁止 electron-builder 探测钥匙串
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          # amagi-pi 内嵌来源（见 amagi-ref job）：有令牌时按解析出的固定 sha 取远端
+          # 最新（三 job 同版本）；无令牌（ref 为空）且未设 AMAGI_PI_REQUIRE_LATEST 时
+          # 显式用检入冻结包，避免注定失败的联网取源后才降级。取源/校验/降级链见
+          # server/scripts/lib/amagi-source.mjs。
+          AMAGI_PI_REF: ${{ needs.amagi-ref.outputs.ref }}
+          AMAGI_PI_TOKEN: ${{ secrets.AMAGI_PI_TOKEN }}
+          AMAGI_PI_REQUIRE_LATEST: ${{ vars.AMAGI_PI_REQUIRE_LATEST }}
+          AMAGI_PI_USE_BUNDLED: ${{ needs.amagi-ref.outputs.ref == '' && vars.AMAGI_PI_REQUIRE_LATEST != '1' && '1' || '' }}
+
+      # job summary：内嵌 amagi-pi 版本/commit/来源（读构建产物 manifest）
+      - name: Bundled amagi-pi summary
+        shell: bash
+        env:
+          AMAGI_REF: ${{ needs.amagi-ref.outputs.ref }}
+        run: |
+          node -e '
+            const m = require("./server/dist/agent/bundled-amagi/manifest.json");
+            const commit = m.sourceCommit ? String(m.sourceCommit).slice(0, 8) : "unknown";
+            const origin = process.env.AMAGI_REF && m.sourceCommit === process.env.AMAGI_REF ? "remote-latest" : "frozen bundle";
+            console.log(`内嵌 amagi-pi ${m.version} @ ${commit}（${origin}，${m.files} files）`);
+          ' >> "$GITHUB_STEP_SUMMARY"
 
       # 注意：不上传 workflow artifacts——该账户 Actions artifact 存储配额
       # 已满会阻塞 job；release assets 走独立存储，不受影响。
@@ -155,6 +211,7 @@ jobs:
           done
 
   build-win:
+    needs: amagi-ref
     runs-on: windows-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -189,10 +246,29 @@ jobs:
           npm ci --prefix server --no-audit --no-fund
 
       # 复用本地同一打包脚本：build:all → electron:build → 原生模块按
-      # Electron ABI 重建 → electron-builder（NSIS oneClick=false）
+      # Electron ABI 重建 → electron-builder（NSIS oneClick=false）；
+      # amagi-pi 内嵌来源 env 同 mac job（见 amagi-ref job 与各注释）。
       - name: Build desktop app (Windows x64)
         shell: bash
         run: node scripts/build-desktop-target.cjs --platform win32 --arch x64
+        env:
+          AMAGI_PI_REF: ${{ needs.amagi-ref.outputs.ref }}
+          AMAGI_PI_TOKEN: ${{ secrets.AMAGI_PI_TOKEN }}
+          AMAGI_PI_REQUIRE_LATEST: ${{ vars.AMAGI_PI_REQUIRE_LATEST }}
+          AMAGI_PI_USE_BUNDLED: ${{ needs.amagi-ref.outputs.ref == '' && vars.AMAGI_PI_REQUIRE_LATEST != '1' && '1' || '' }}
+
+      # job summary：内嵌 amagi-pi 版本/commit/来源（读构建产物 manifest）
+      - name: Bundled amagi-pi summary
+        shell: bash
+        env:
+          AMAGI_REF: ${{ needs.amagi-ref.outputs.ref }}
+        run: |
+          node -e '
+            const m = require("./server/dist/agent/bundled-amagi/manifest.json");
+            const commit = m.sourceCommit ? String(m.sourceCommit).slice(0, 8) : "unknown";
+            const origin = process.env.AMAGI_REF && m.sourceCommit === process.env.AMAGI_REF ? "remote-latest" : "frozen bundle";
+            console.log(`内嵌 amagi-pi ${m.version} @ ${commit}（${origin}，${m.files} files）`);
+          ' >> "$GITHUB_STEP_SUMMARY"
 
       # 与 mac job 同一发布口径：tag push 发布、dispatch 补传、仅试构建不上传。
       # Windows 产物 = NSIS exe + latest.yml（+ blockmap，NSIS 差分更新启用时

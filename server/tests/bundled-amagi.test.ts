@@ -94,11 +94,22 @@ it('application builds can reuse the frozen private bundle without a source chec
   expect(readBundledAmagi(destination)?.contentHash).toBe(result.contentHash);
   expect(sha(fs.readFileSync(path.join(destination, 'package.zip')))).toBe(result.archiveSha256);
   expect(result.bundlerVersion).toBe(3);
-  expect(result.localPatchSha256).toBe(sha(fs.readFileSync(path.resolve('patches/amagi-pi-2.21.31-background-continue.patch'))));
   const zip = await JSZip.loadAsync(fs.readFileSync(path.join(destination, 'package.zip')));
-  const shutdown = await zip.file('extensions/amagi-core/task-run.ts')!.async('string');
-  expect(shutdown).toContain('shutdown-never-spawned');
-  expect(shutdown.indexOf('session shutdown before child cleanup')).toBeLessThan(shutdown.indexOf('const running = registry.getRunningChildren();', shutdown.indexOf('export async function cleanupChildrenOnShutdown')));
+  if (result.version === '2.21.36') {
+    // 2.21.36 冻结包强制本地补丁（requiredLocalPatch 仅对该版本生效）。
+    expect(result.localPatchSha256).toBe(sha(fs.readFileSync(path.resolve('patches/amagi-pi-2.21.31-background-continue.patch'))));
+    const shutdown = await zip.file('extensions/amagi-core/task-run.ts')!.async('string');
+    expect(shutdown).toContain('shutdown-never-spawned');
+    expect(shutdown.indexOf('session shutdown before child cleanup')).toBeLessThan(shutdown.indexOf('const running = registry.getRunningChildren();', shutdown.indexOf('export async function cleanupChildrenOnShutdown')));
+  } else {
+    // 2.22.0 起 background-continue/queued-shutdown 修复已上游化：无本地补丁字段，
+    // task-background.ts 内置 shouldAutoContinue，task-run.ts 内置 cleanupChildrenOnShutdown。
+    expect(result.localPatchSha256).toBeUndefined();
+    const background = await zip.file('extensions/amagi-core/task-background.ts')!.async('string');
+    expect(background).toContain('export function shouldAutoContinue');
+    const shutdown = await zip.file('extensions/amagi-core/task-run.ts')!.async('string');
+    expect(shutdown).toContain('export async function cleanupChildrenOnShutdown');
+  }
 });
 
 it('a valid older frozen archive cannot silently bypass required native shutdown fixes', async () => {

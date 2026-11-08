@@ -29,7 +29,9 @@ npm run electron:build   # esbuild main.ts/preload.ts/server-process-entry.ts �
 # knowledge-build 技能包（agent/skills 缺失时 pi-amagi 构建拒绝启动），并 esbuild 打包
 # 独立 MCP（server/dist/mcp/kb-mcp.cjs）、局域网网关（dist/mcp/kb-mcp-gateway.cjs）、
 # CLI 客户端（server/dist/cli/feishu-sync-cli.cjs，随 asarUnpack server/** 解包）
-# 与内置 amagi 包（dist/agent/bundled-amagi）。
+# 与内置 amagi 包（dist/agent/bundled-amagi）。桌面安装包构建（desktop:dist:*）
+# 自动取远端最新 amagi-pi 并回写冻结包（AMAGI_PI_LATEST，降级链与刷新办法见
+# docs/build-operations.md §6）；dev/CI 测试不联网，用同级源或检入冻结包。
 
 # 测试（根目录统一入口；server 测试在 server/ 下，vitest）
 npm run check             # lint + typecheck + 前端/server 全部测试（同 CI 项目集；两个 pi 集成测试由 CI 单独装 pi CLI 拆跑，见 ci.yml）
