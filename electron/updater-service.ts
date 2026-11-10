@@ -64,9 +64,38 @@ function toDesktopProgress(progress: ProgressInfo): DesktopDownloadProgress {
   };
 }
 
+/** 更新检查的瞬时故障重试：GitHub 偶发 502/503/504 或网络抖动，退避重试通常即可恢复。 */
+const CHECK_RETRY_DELAYS_MS = [1_500, 4_000, 8_000];
+
+const TRANSIENT_NETWORK_CODES = [
+  'econnreset', 'etimedout', 'econnrefused', 'enotfound', 'eai_again',
+  'epipe', 'econnaborted', 'err_network_changed', 'err_internet_disconnected',
+  'err_connection_reset', 'err_connection_closed', 'err_connection_timed_out',
+  'err_timed_out', 'err_name_not_resolved', 'err_connection_refused',
+];
+
+/** 5xx / 429 / 超时 / 网络抖动视为瞬时故障；404、认证类不重试。 */
+function isTransientUpdateError(error: unknown) {
+  const raw = (error instanceof Error ? `${error.message} ${(error as { code?: unknown }).code ?? ''}` : String(error)).toLowerCase();
+  if (/\b(404|401|403)\b/.test(raw) && !/\b50[234]\b/.test(raw)) return false;
+  return /\b(429|500|502|503|504)\b/.test(raw)
+    || raw.includes('gateway time-out')
+    || raw.includes('bad gateway')
+    || raw.includes('service unavailable')
+    || raw.includes('timeout')
+    || raw.includes('timed out')
+    || TRANSIENT_NETWORK_CODES.some((code) => raw.includes(code));
+}
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
 function describeUpdaterError(error: unknown, sanitizedError: string) {
   const rawMessage = error instanceof Error ? error.message : String(error);
   const combinedMessage = `${rawMessage}\n${sanitizedError}`.toLowerCase();
+
+  if (isTransientUpdateError(error) && !/\b404\b/.test(combinedMessage)) {
+    return '更新服务器暂时无响应（GitHub 网关超时或网络不稳定），已自动重试仍未成功。请稍后再点「检查更新」，或打开下载页手动下载安装新版本。';
+  }
   const referencesGithubUpdateSource = combinedMessage.includes('github.com')
     || combinedMessage.includes('github')
     || combinedMessage.includes('releases.atom')
@@ -90,6 +119,8 @@ export class DesktopUpdaterService {
   private checkInFlight: Promise<DesktopUpdateCheckResult> | null = null;
   private downloadInFlight: Promise<DesktopActionResult> | null = null;
   private installInFlight: Promise<DesktopActionResult> | null = null;
+  /** 检查更新（含重试）进行中：期间 autoUpdater 的 error 事件由 check() 统一收口，避免 UI 在重试间闪现错误。 */
+  private checkingWithRetry = false;
 
   constructor(private readonly options: DesktopUpdaterServiceOptions) {
     const capabilities = this.options.getCapabilities();
@@ -136,7 +167,7 @@ export class DesktopUpdaterService {
     }
 
     this.setState({ phase: 'checking', currentVersion: capabilities.appVersion, error: undefined });
-    this.checkInFlight = autoUpdater.checkForUpdates()
+    this.checkInFlight = this.checkForUpdatesWithRetry()
       .then((result) => {
         const updateInfo = result?.updateInfo;
         if (!updateInfo) {
@@ -172,6 +203,24 @@ export class DesktopUpdaterService {
       });
 
     return this.checkInFlight;
+  }
+
+  private async checkForUpdatesWithRetry() {
+    this.checkingWithRetry = true;
+    try {
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          return await autoUpdater.checkForUpdates();
+        } catch (error) {
+          const delay = CHECK_RETRY_DELAYS_MS[attempt];
+          if (delay === undefined || !isTransientUpdateError(error)) throw error;
+          console.warn(`[Updater] 检查更新瞬时失败，${delay}ms 后重试（${attempt + 1}/${CHECK_RETRY_DELAYS_MS.length}）：`, this.options.sanitizeError(error));
+          await sleep(delay);
+        }
+      }
+    } finally {
+      this.checkingWithRetry = false;
+    }
   }
 
   async download(): Promise<DesktopActionResult> {
@@ -267,6 +316,7 @@ export class DesktopUpdaterService {
       this.setState({ phase: 'downloaded', latestVersion: updateInfo.version, updateInfo, error: undefined });
     });
     autoUpdater.on('error', (error) => {
+      if (this.checkingWithRetry) return;
       const sanitizedError = describeUpdaterError(error, this.options.sanitizeError(error));
       this.setState({ phase: 'error', error: sanitizedError });
     });

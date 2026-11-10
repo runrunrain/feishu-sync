@@ -502,6 +502,9 @@ export class PiRpcProcess extends EventEmitter {
     if (event.type === 'auto_retry_start') {
       if (run && !run.finished) {
         run.autoRetryCount += 1;
+        // 重试退避与下一次请求都是模型活动：重置静默窗口，避免较短的
+        // promptTimeout 配置在退避期间误杀本可成功的重试。
+        this.armRunTimeout(run);
         if (run.autoRetryCount > (this.options.maxAutoRetries ?? DEFAULT_MAX_AUTO_RETRIES)) {
           run.aborting = true;
           this.sendCommand('abort', {}).catch(() => undefined);
@@ -862,11 +865,39 @@ function extractText(content: unknown): string | null {
   return parts.length > 0 ? parts.join('') : null;
 }
 
-function classifyPromptError(errorText: string): string {
+/** 提供方错误文本 → 错误码（导出仅供测试；超时单独归类便于恢复提示）。 */
+export function classifyPromptError(errorText: string): string {
   if (/insufficient[_ -]?(?:quota|balance|credit)|余额不足|无可用资源包/i.test(errorText)) return 'model_quota_exceeded';
   if (/no api key/i.test(errorText)) return 'model_auth_missing';
   if (/not found/i.test(errorText) && /model/i.test(errorText)) return 'model_unconfigured';
+  // 提供方超时（如 Anthropic SDK 的 "Request timed out."）单独归类，便于
+  // 界面给出针对性的恢复提示，而不是笼统的 model_request_failed。
+  if (/timed?[ _-]?out|timeout|deadline.{0,12}exceeded|etimedout/i.test(errorText)) return 'model_timeout';
   return 'model_request_failed';
+}
+
+/** 见 buildPiProcessEnv 内注释：修复被历史 set_auto_retry{enabled:false} 持久化污染的共享设置。 */
+export function repairPiHomeRetrySetting(piHome: string): void {
+  const settingsFile = path.join(piHome, 'settings.json');
+  let settings: Record<string, unknown>;
+  try {
+    const errors: ParseError[] = [];
+    const parsed = fs.existsSync(settingsFile) ? parseJsonc(fs.readFileSync(settingsFile, 'utf8'), errors) as Record<string, unknown> : {};
+    if (errors.length || !parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
+    settings = parsed;
+  } catch {
+    return; // 读取/解析失败不阻断 spawn；无效设置由 preserveUploadedImages 等既有校验路径报错
+  }
+  const retry = settings.retry;
+  if (!retry || typeof retry !== 'object' || Array.isArray(retry) || (retry as { enabled?: unknown }).enabled !== false) return;
+  const next = { ...settings, retry: { ...(retry as Record<string, unknown>), enabled: true } };
+  const temporary = `${settingsFile}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  try {
+    fs.writeFileSync(temporary, JSON.stringify(next, null, 2), { mode: 0o600 });
+    fs.renameSync(temporary, settingsFile);
+  } catch {
+    try { fs.unlinkSync(temporary); } catch { /* 临时文件可能尚未创建 */ }
+  }
 }
 
 /** 计算子进程环境（§4.2）：app-llm 白名单继承；pi-agent-dir 继承并剔除敏感变量。 */
@@ -936,6 +967,17 @@ export function buildPiProcessEnv(input: {
       fs.writeFileSync(temporary, JSON.stringify({ ...settings, images: { ...images, autoResize: false } }, null, 2), { mode: 0o600 });
       fs.renameSync(temporary, settingsFile);
     }
+  }
+  // 历史遗留修复：宿主曾对非原生会话发送 set_auto_retry{enabled:false}，而 Pi 的
+  // setAutoRetryEnabled 会把该设置持久化进共享 pi-home 的 settings.json（全局设置
+  // 落盘）。一旦发出，后续所有进程——包括原生 Work 会话与本机资源覆盖目录——都读
+  // 到 retry 关闭：瞬时错误（"Request timed out." 等，Pi 判定为可重试）不再自动重试，
+  // 直接以 model_request_failed 终止运行。每次 spawn 前把被写成 false 的
+  // retry.enabled 修复为 true；其余 retry.* 字段（provider.timeoutMs 等）原样保留。
+  // 仅作用于应用自有的 pi-home，不碰 Work 覆盖目录（由 prepareLocalWorkHome 从本
+  // 设置重新生成）与用户本机目录。
+  if (path.resolve(env.PI_CODING_AGENT_DIR) === path.resolve(path.join(input.dataRoot, 'agent', 'pi-home'))) {
+    repairPiHomeRetrySetting(env.PI_CODING_AGENT_DIR);
   }
   if (input.nativeWork) {
     // A desktop session is not a child task of the process that launched the app.

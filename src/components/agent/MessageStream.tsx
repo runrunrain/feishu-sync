@@ -8,7 +8,7 @@
  */
 
 import { memo, useEffect, useMemo, useRef, useState } from 'react';
-import { AlertCircle, Ban, Check, ChevronDown, ListTodo, Loader2, Wrench } from 'lucide-react';
+import { AlertCircle, Ban, Check, ChevronDown, ListTodo, Loader2, Wrench, X } from 'lucide-react';
 import type { RunDraft } from '../../hooks/useAgentSessions';
 import type { AgentApprovalDto, AgentMessageDto, AgentTaskNotice } from '../../types/agent';
 import { MarkdownView } from '../preview/MarkdownView';
@@ -35,9 +35,11 @@ interface MessageStreamProps {
   approvalBusyId?: string | null;
   /** 任务态变化提示行（S7；由 task_update SSE 推导，居中弱化呈现）。 */
   taskNotices?: AgentTaskNotice[];
+  /** 关闭一条错误行（可选；不传则常驻直到切换会话）。 */
+  onDismissStreamError?: (id: string) => void;
 }
 
-export function MessageStream({ workMode = false, sessionId, messages, draft, streamErrors, loading, emptyHint, approvals, onApprovalDecision, approvalBusyId, taskNotices }: MessageStreamProps) {
+export function MessageStream({ workMode = false, sessionId, messages, draft, streamErrors, loading, emptyHint, approvals, onApprovalDecision, approvalBusyId, taskNotices, onDismissStreamError }: MessageStreamProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
   const [historyWindow, setHistoryWindow] = useState({ sessionId, count: HISTORY_PAGE });
@@ -170,7 +172,7 @@ export function MessageStream({ workMode = false, sessionId, messages, draft, st
           </div>
         ) : null}
 
-        {/* 运行级错误行（非助手回复） */}
+        {/* 运行级错误行（非助手回复；可手动关闭，例如主动停止后的 aborted 提示） */}
         {streamErrors.map((e) => (
           <div
             key={e.id}
@@ -182,10 +184,21 @@ export function MessageStream({ workMode = false, sessionId, messages, draft, st
             ) : (
               <AlertCircle className="w-4 h-4 mt-0.5 shrink-0 text-seal-2" />
             )}
-            <div className="min-w-0">
+            <div className="min-w-0 flex-1">
               <p className="text-xs text-seal-2 font-medium">{e.code}</p>
               <p className="text-xs text-ink-soft leading-relaxed break-words">{e.message}</p>
             </div>
+            {onDismissStreamError ? (
+              <button
+                type="button"
+                className="p-0.5 -m-0.5 mt-0.5 shrink-0 rounded text-ink-faint hover:text-ink transition-colors"
+                aria-label="关闭此提示"
+                title="关闭此提示"
+                onClick={() => onDismissStreamError(e.id)}
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            ) : null}
           </div>
         ))}
       </div>

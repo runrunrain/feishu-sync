@@ -169,6 +169,7 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
           messages={sessions.messages}
           draft={sessions.draft}
           streamErrors={sessions.streamErrors}
+          onDismissStreamError={sessions.dismissStreamError}
           loading={sessions.messagesLoading}
           approvals={sessions.approvals}
           onApprovalDecision={(id, decision) => { void sessions.decideApproval(id, decision); }}

@@ -142,6 +142,8 @@ export interface UseAgentSessionsResult {
   draft: RunDraft | null;
   /** 本地错误行（发送失败 / run 失败且无消息承载时展示）。 */
   streamErrors: Array<{ id: string; code: string; message: string }>;
+  /** 关闭一条本地错误行（用户已知晓，例如手动停止后的 aborted 提示）。 */
+  dismissStreamError: (id: string) => void;
   /** 会话内待裁决批准（S10）。 */
   approvals: AgentApprovalDto[];
   /** 正在提交裁决的批准 id。 */
@@ -747,6 +749,11 @@ export function useAgentSessions(active: boolean): UseAgentSessionsResult {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active, activeId]);
 
+  /** 关闭一条本地错误行（用户已知晓，例如手动停止后的 aborted 提示）。 */
+  const dismissStreamError = useCallback((id: string) => {
+    setStreamErrors((prev) => prev.filter((item) => item.id !== id));
+  }, []);
+
   const writeRecords = useMemo(() => {
     const fromHistory = extractWriteRecords(messages);
     // 实时 tool 事件中已 end 的写入（draft 内）补充在最近端。
@@ -772,6 +779,7 @@ export function useAgentSessions(active: boolean): UseAgentSessionsResult {
     messagesLoading,
     draft,
     streamErrors,
+    dismissStreamError,
     approvals,
     approvalBusyId,
     decideApproval,

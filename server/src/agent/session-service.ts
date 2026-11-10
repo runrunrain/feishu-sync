@@ -653,8 +653,13 @@ export class SessionService extends EventEmitter {
       } else {
         const errorCode = outcome.error?.code ?? 'model_request_failed';
         const errorMessage = outcome.error?.message ?? '模型请求失败';
-        localMapStore.updateAgentSession(sessionId, { lastErrorCode: errorCode, lastErrorMessage: errorMessage.slice(0, 500) });
-        this.emitSse(sessionId, 'run_end', { runId, outcome: 'failed', error: { code: errorCode, message: errorMessage.slice(0, 500) } });
+        // 瞬时模型失败不毁会话：历史与上下文都在，重发即可续跑——把恢复方式写进
+        // 错误提示，避免用户误以为会话已终止而放弃。已含恢复指引的提示不再叠加。
+        const withHint = (errorCode === 'model_request_failed' || errorCode === 'model_timeout' || errorCode === 'model_output_truncated')
+          && !errorMessage.includes('可重发') && !errorMessage.includes('可重新发送')
+          ? `${errorMessage}。会话已保留，可重发消息继续` : errorMessage;
+        localMapStore.updateAgentSession(sessionId, { lastErrorCode: errorCode, lastErrorMessage: withHint.slice(0, 500) });
+        this.emitSse(sessionId, 'run_end', { runId, outcome: 'failed', error: { code: errorCode, message: withHint.slice(0, 500) } });
       }
       // 回填 pi_session_file
       try {
@@ -866,8 +871,11 @@ export class SessionService extends EventEmitter {
     rpc.once('exit', () => this.deps.toolService.revokeToken(token));
     try {
       await rpc.start();
-      // 自动重试交由宿主判定（§4.4 auto_retry 上限）
-      if (!nativeWork) await rpc.sendCommand('set_auto_retry', { enabled: false }).catch(() => undefined);
+      // 不发送 set_auto_retry{enabled:false}：Pi 的 setAutoRetryEnabled 会把该设置
+      // 持久化进共享 pi-home 的 settings.json，一旦发出，后续所有进程（包括原生
+      // Work 会话）都读到 retry 关闭，瞬时错误（Request timed out. 等）不经重试直接
+      // 终止运行。保持 Pi 默认自动重试（maxRetries=3 + 指数退避），宿主仍按 §4.4
+      // 以 auto_retry_start 累计上限兑底；历史污染由 buildPiProcessEnv 在 spawn 前修复。
       this.deps.pool.register(sessionId, rpc, 'session', slot);
       this.modelRevisions.set(rpc, revision);
       if (nativeOptions?.pluginRevision) this.pluginRevisions.set(rpc, nativeOptions.pluginRevision);

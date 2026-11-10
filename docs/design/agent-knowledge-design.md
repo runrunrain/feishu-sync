@@ -158,6 +158,16 @@ auto_retry_start 累计 > 3 次     → abort，failed(model_request_failed)
 进程 exit 非 0 / 意外退出        → failed(pi_process_exited)，附 stderr 尾部 4KB
 ```
 
+**实测陷阱（2026-11）：会话进程不得发送 `set_auto_retry{enabled:false}`。** Pi 的
+`setAutoRetryEnabled` 会把 `retry.enabled` **持久化**进共享 pi-home 的
+`settings.json`（全局设置落盘），而非仅作用于当次进程。一旦发出，后续所有进程——
+包括原生 Work 会话与本机资源覆盖目录——都读到 retry 关闭，瞬时错误（如
+Anthropic SDK 的 `Request timed out.`，Pi 判定为可重试）不再自动重试而直接终止
+运行。修复：会话保持 Pi 默认重试（maxRetries=3 + 指数退避，宿主仍按上表累计上限
+兜底）；`buildPiProcessEnv` 在每次 spawn 前把被写成 false 的 `retry.enabled` 修复
+为 true（其余 retry.* 字段保留）。构建/任务进程仍可发送该命令，但它们使用独立
+agent 目录或依赖 spawn 前修复，不会污染会话。
+
 ### 4.5 进程池
 
 - 进程池三通道准入：`session`（交互会话）立即语义，池满 409 `agent_busy`；`background`（任务进程、连接探测等非构建后台）合计 ≤ `maxConcurrentProcesses`−1（M≥2 时为交互会话保留 1 槽；默认 M=3、范围 1..6），FIFO 排队而非立即 409；`build`（构建 worker）走独立通道，容量 N = `buildConcurrency` 本身，不受 M−1 截断，总运行上限 = N + M（`agent/agent-process-pool.ts`；见 §18 升级增补与基线 §5.2）。
