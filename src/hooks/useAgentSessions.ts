@@ -20,6 +20,7 @@ import {
   createAgentSession,
   decideAgentApproval,
   deleteAgentSession,
+  forkAgentSession,
   getAgentSessionMessages,
   getAgentSession,
   getSseAuth,
@@ -167,6 +168,8 @@ export interface UseAgentSessionsResult {
   createSession: (backend?: AgentBackend, workspaceId?: string) => Promise<AgentSessionDto | null>;
   renameSession: (id: string, title: string) => Promise<boolean>;
   removeSession: (id: string) => Promise<boolean>;
+  /** 从当前会话某条历史消息所在轮次末尾分叉出新会话并切换过去；失败返回 null（错误写入 sessionsError）。 */
+  forkSession: (messageId: string) => Promise<AgentSessionDto | null>;
   send: (text: string, delivery?: 'steer' | 'followUp', attachments?: AgentAttachmentDto[]) => Promise<boolean>;
   stop: () => Promise<void>;
   switchMode: (
@@ -628,6 +631,22 @@ export function useAgentSessions(active: boolean): UseAgentSessionsResult {
     }
   }, []);
 
+  const forkSession = useCallback(async (messageId: string) => {
+    const sourceId = activeIdRef.current;
+    if (!sourceId) return null;
+    setSessionsError(null);
+    try {
+      const forked = await forkAgentSession(sourceId, messageId);
+      setSessions((prev) => [forked, ...prev.filter((s) => s.id !== forked.id)]);
+      setActiveId(forked.id);
+      setMessages([]);
+      return forked;
+    } catch (err) {
+      setSessionsError(err instanceof APIError ? err.message : '分叉会话失败');
+      return null;
+    }
+  }, []);
+
   const renameSession = useCallback(async (id: string, title: string) => {
     try {
       const updated = await renameAgentSession(id, title);
@@ -795,6 +814,7 @@ export function useAgentSessions(active: boolean): UseAgentSessionsResult {
     createSession,
     renameSession,
     removeSession,
+    forkSession,
     send,
     stop,
     switchMode,

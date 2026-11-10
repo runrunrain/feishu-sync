@@ -53,6 +53,7 @@ function makeStore() {
       if ('lastErrorMessage' in patch) mapped.last_error_message = patch.lastErrorMessage;
       if ('updatedAt' in patch) mapped.updated_at = patch.updatedAt;
       if ('deletedAt' in patch) mapped.deleted_at = patch.deletedAt;
+      if ('localResources' in patch) mapped.local_resources = patch.localResources ? 1 : 0;
       rows.set(id, { ...row, ...mapped });
     },
     listSessionsByWorkspace: (workspaceId: string) =>
@@ -380,5 +381,111 @@ describe('R11：JSONL 回溯索引全部带 id/parentId 节点（不截断、不
     const result = parseSessionJsonl(jsonl);
     expect(result.map((item) => item.id)).toEqual(['m1', 'a1', 'm3']);
     expect(result.some((item) => item.id === 'a2')).toBe(false);
+  });
+});
+
+describe('会话分叉（fork）', () => {
+  const userEntry = (id: string, parentId: string | null, text: string) => ({ type: 'message', id, parentId, timestamp: '2026-01-01T00:00:00.000Z', message: { role: 'user', content: [{ type: 'text', text }] } });
+  const assistantEntry = (id: string, parentId: string | null, text: string) => ({ type: 'message', id, parentId, timestamp: '2026-01-01T00:00:01.000Z', message: { role: 'assistant', content: [{ type: 'text', text }] } });
+  const modelChange = (id: string, parentId: string | null) => ({ type: 'model_change', id, parentId, timestamp: '2026-01-01T00:00:02.000Z', provider: 'p', modelId: 'm' });
+
+  function seed(entries: unknown[]) {
+    const { service, store } = makeService(makeConfig());
+    const source = service.create(store, { workspaceId: 'ws_test1' });
+    store.updateAgentSession(source.id, { mode: 'work', workspaceId: 'ws_test1', approvalMode: 'auto', localResources: true });
+    const dir = path.join((service as any).deps.dataRoot, 'agent', 'sessions');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `2026_${source.id}.jsonl`);
+    const header = { type: 'session', version: 3, id: source.id, timestamp: '2026-01-01T00:00:00.000Z', cwd: '/tmp/ws-test' };
+    fs.writeFileSync(file, [header, ...entries].map((entry) => JSON.stringify(entry)).join('\n') + '\n');
+    store.updateAgentSession(source.id, { piSessionFile: file });
+    return { service, store, source, file };
+  }
+  const tree = () => [
+    userEntry('u1', null, '第一问'), assistantEntry('a1', 'u1', '第一答'),
+    modelChange('m1', 'a1'),
+    userEntry('u2', 'm1', '第二问'), assistantEntry('a2', 'u2', '第二答'),
+    userEntry('u3', 'a2', '第三问'), assistantEntry('a3', 'u3', '第三答'),
+  ];
+
+  it('从中间轮次分叉：保留到该轮末尾，继承 Work 配置，header 指向新会话并记录父会话', async () => {
+    const { service, store, source, file } = seed(tree());
+    const fork = await service.fork(store, source.id, { messageId: 'u2' });
+    expect(fork.id).not.toBe(source.id);
+    expect(fork).toMatchObject({ mode: 'work', approvalMode: 'auto', workspace: { id: 'ws_test1' }, title: expect.stringContaining('分叉') });
+    const row = store.getAgentSession(fork.id)!;
+    expect(row.local_resources).toBe(1);
+    const lines = fs.readFileSync(String(row.pi_session_file), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    expect(lines[0]).toMatchObject({ type: 'session', id: fork.id, cwd: '/tmp/ws-test', parentSession: file });
+    expect(lines.slice(1).map((entry) => entry.id)).toEqual(['u1', 'a1', 'm1', 'u2', 'a2']);
+    const messages = await service.messagesAsync(store, fork.id);
+    expect(messages.map((m) => m.text)).toEqual(['第一问', '第一答', '第二问', '第二答']);
+    // 源会话与源文件不受影响
+    expect((await service.messagesAsync(store, source.id)).map((m) => m.text)).toHaveLength(6);
+    expect(store.getAgentSession(source.id)!.pi_session_file).toBe(file);
+  });
+
+  it('锚点落在轮次中的助手消息时仍取整轮；尾部非消息节点不带入', async () => {
+    const entries = [userEntry('u1', null, 'q1'), assistantEntry('a1', 'u1', 'r1'), modelChange('m1', 'a1'), userEntry('u2', 'm1', 'q2')];
+    const { service, store, source } = seed(entries);
+    const fork = await service.fork(store, source.id, { messageId: 'a1', title: '自定义' });
+    expect(fork.title).toBe('自定义');
+    const ids = fs.readFileSync(String(store.getAgentSession(fork.id)!.pi_session_file), 'utf8').trim().split('\n').slice(1).map((l) => JSON.parse(l).id);
+    expect(ids).toEqual(['u1', 'a1']);
+  });
+
+  it('只沿当前分支分叉；分叉点不在当前分支/非消息/live id 一律拒绝', async () => {
+    const entries = [...tree(), userEntry('ub', 'a1', '另一分支'), assistantEntry('ab', 'ub', '另一答')];
+    const { service, store, source } = seed(entries);
+    const fork = await service.fork(store, source.id, { messageId: 'ub' });
+    const ids = fs.readFileSync(String(store.getAgentSession(fork.id)!.pi_session_file), 'utf8').trim().split('\n').slice(1).map((l) => JSON.parse(l).id);
+    expect(ids).toEqual(['u1', 'a1', 'ub', 'ab']);
+    await expect(service.fork(store, source.id, { messageId: 'u2' })).rejects.toMatchObject({ code: 'fork_point_invalid' }); // 非当前分支
+    await expect(service.fork(store, source.id, { messageId: 'm1' })).rejects.toMatchObject({ code: 'fork_point_invalid' }); // 非消息节点
+    await expect(service.fork(store, source.id, { messageId: 'live_run_x' })).rejects.toMatchObject({ code: 'fork_point_invalid' });
+    await expect(service.fork(store, source.id, { messageId: 'attachment_x' })).rejects.toMatchObject({ code: 'fork_point_invalid' });
+    await expect(service.fork(store, 'missing', { messageId: 'u1' })).rejects.toMatchObject({ code: 'session_not_found' });
+  });
+
+  it('运行中的末尾轮次拒绝，已完成的更早轮次允许', async () => {
+    const { service, store, source } = seed(tree());
+    (service as any).runs.set(source.id, { runId: 'r', sessionId: source.id, phase: 'running' });
+    await expect(service.fork(store, source.id, { messageId: 'u3' })).rejects.toMatchObject({ code: 'session_busy' });
+    await expect(service.fork(store, source.id, { messageId: 'u1' })).resolves.toMatchObject({ mode: 'work' });
+  });
+
+  it('没有历史文件或为 Claude Code 会话时拒绝', async () => {
+    const { service, store } = makeService(makeConfig());
+    const empty = service.create(store, {});
+    await expect(service.fork(store, empty.id, { messageId: 'u1' })).rejects.toMatchObject({ code: 'fork_source_missing' });
+    store.rows.get(empty.id)!.runtime_backend = 'claude-code';
+    await expect(service.fork(store, empty.id, { messageId: 'u1' })).rejects.toMatchObject({ code: 'fork_unsupported' });
+  });
+
+  it('附件只带入被保留用户消息引用的提交', async () => {
+    const submission1 = '11111111-1111-1111-1111-111111111111';
+    const submission2 = '22222222-2222-2222-2222-222222222222';
+    const wrap = (text: string, id: string) => `${text}\n\n<chat-attachments id="${id}">x</chat-attachments>`;
+    const { service, store, source } = seed([
+      userEntry('u1', null, wrap('看文档', submission1)), assistantEntry('a1', 'u1', 'ok'),
+      userEntry('u2', 'a1', wrap('再看一个', submission2)), assistantEntry('a2', 'u2', 'ok2'),
+    ]);
+    const root = (service as any).deps.dataRoot as string;
+    const dirOf = (id: string) => path.join(root, 'agent', 'attachments', require('node:crypto').createHash('sha256').update(id).digest('hex'));
+    const sourceDir = dirOf(source.id); fs.mkdirSync(sourceDir, { recursive: true });
+    const attachment = (n: number) => `att_${String(n).repeat(32)}`;
+    const meta = (id: string) => JSON.stringify({ id, name: `${id}.txt`, size: 1, mimeType: 'text/plain', kind: 'document', textLength: 1, lineCount: 1, sha256: 'x', submitted: true });
+    for (const [n, submission] of [[1, submission1], [2, submission2]] as const) {
+      fs.writeFileSync(path.join(sourceDir, `${attachment(n)}.json`), meta(attachment(n)));
+      fs.writeFileSync(path.join(sourceDir, `${attachment(n)}.txt`), 'content');
+      fs.writeFileSync(path.join(sourceDir, `message_${submission}.json`), JSON.stringify({ text: `文本${n}`, ids: [attachment(n)], submissionId: submission }));
+    }
+    fs.writeFileSync(path.join(sourceDir, 'submitted.jsonl'), [[1, submission1], [2, submission2]].map(([n, s]) => JSON.stringify({ submissionId: s, text: `文本${n}`, ids: [attachment(Number(n))], at: '2026-01-01T00:00:00.000Z' })).join('\n') + '\n');
+    const fork = await service.fork(store, source.id, { messageId: 'u1' });
+    const messages = await service.messagesAsync(store, fork.id);
+    const users = messages.filter((m) => m.role === 'user');
+    expect(users).toHaveLength(1);
+    expect(users[0]).toMatchObject({ text: '文本1', attachments: [{ id: attachment(1) }] });
+    expect(fs.existsSync(path.join(dirOf(fork.id), `${attachment(2)}.json`))).toBe(false);
   });
 });

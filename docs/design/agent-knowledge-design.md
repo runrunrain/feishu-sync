@@ -626,6 +626,7 @@ interface AgentMessageDto {
 | GET | `/api/agent/sessions/:id/messages` | — | `{ messages: AgentMessageDto[] }` |
 | POST | `/api/agent/sessions/:id/messages` | `{ text: string (1..20000), delivery?: 'steer' \| 'followUp' }` | 202 `{ accepted: true, runId: string }`；失败见 §8 |
 | POST | `/api/agent/sessions/:id/abort` | — | 200 `AgentSessionDto` |
+| POST | `/api/agent/sessions/:id/fork` | `{ messageId: string, title?: string }`（messageId = 已落盘历史消息 id，取其所在轮次末尾；仅 Pi 后端） | 201 `AgentSessionDto`（新会话，继承模式/Workspace/审批/模型；源会话不变）；`fork_point_invalid` 400 / `fork_source_missing`·`fork_unsupported`·`session_busy` 409 |
 | POST | `/api/agent/sessions/:id/mode` | `{ mode: 'discuss' }` 或 `{ mode: 'work', workspaceId: string, confirm: 'WORK' }` | 200 `AgentSessionDto` |
 | GET | `/api/agent/sessions/:id/events` | SSE | 见下 |
 

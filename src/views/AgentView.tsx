@@ -39,6 +39,8 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
   const sessions = useAgentSessions(active);
   const [creatingSession, setCreatingSession] = useState(false);
   const createLock = useRef(false);
+  const [forking, setForking] = useState(false);
+  const forkLock = useRef(false);
   const [workspaces, setWorkspaces] = useState<AgentWorkspaceConfig[]>([]);
   const [createWorkspace, setCreateWorkspace] = useState(false);
   const [workspaceName, setWorkspaceName] = useState('');
@@ -63,6 +65,16 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
     try {
       await sessions.createSession('pi', workspaceId);
     } finally { createLock.current = false; setCreatingSession(false); }
+  };
+
+  const handleFork = async (messageId: string) => {
+    if (forkLock.current) return;
+    forkLock.current = true; setForking(true);
+    try {
+      const forked = await sessions.forkSession(messageId);
+      if (forked) toast.push({ type: 'success', message: '已分叉为新会话，可从这里继续' });
+      else toast.push({ type: 'warning', message: '分叉失败，详见会话区错误提示' });
+    } finally { forkLock.current = false; setForking(false); }
   };
 
   const handleSend = async (text: string, delivery?: 'steer' | 'followUp', attachments?: AgentAttachmentDto[]) => {
@@ -175,6 +187,8 @@ export function AgentView({ active = true, onJumpToSettings }: AgentViewProps) {
           onApprovalDecision={(id, decision) => { void sessions.decideApproval(id, decision); }}
           approvalBusyId={sessions.approvalBusyId}
           taskNotices={sessions.taskNotices}
+          onFork={isWork && session?.backend !== 'claude-code' ? (messageId) => { void handleFork(messageId); } : undefined}
+          forkBusy={forking}
           emptyHint={
             <div className="py-8">
               <p className="text-sm text-ink-soft">开始一段新的讨论</p>

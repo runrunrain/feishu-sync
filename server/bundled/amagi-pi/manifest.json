@@ -2,12 +2,12 @@
   "schemaVersion": 1,
   "bundlerVersion": 3,
   "package": "amagi-pi",
-  "version": "2.22.0",
-  "sourceHash": "1a0003f416d31914bb2c4168418a283b42d753a98430c622ed223a5cfa8db78e",
-  "sourceCommit": "9b155e0e77b3ac559f1920988076ef90c7687df6",
-  "contentHash": "2e412ab0cc396ecf7d4e545439d3d2e873058b3c422b54f38ee660806de14ce7",
-  "files": 488,
-  "bytes": 33886774,
-  "archiveSha256": "d158f85dd4d811b5472b3aba96ab1eda87d206d396c471af74875a28d71f1eb8",
-  "archiveBytes": 7733084
+  "version": "2.23.2",
+  "sourceHash": "7adf0ec4e1e75a3568da2032a7747b7333ab3f637fe20c6f1ac67962a074b89b",
+  "sourceCommit": "653bbdca2814f9849ff74c54cd86a9e3c28b0982",
+  "contentHash": "a0eb0663bf57a9571ee3631bb3342583861da4d01988f129571d1989c09f7949",
+  "files": 515,
+  "bytes": 34075245,
+  "archiveSha256": "9ae0cdb855f245c827859153f5f18059099f670c15bdb613aa710b9cad2bb95f",
+  "archiveBytes": 7802034
 }

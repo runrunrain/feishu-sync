@@ -1456,6 +1456,14 @@ export async function renameAgentSession(id: string, title: string): Promise<Age
   });
 }
 
+/** POST /api/agent/sessions/:id/fork —— 从某条已落盘历史消息所在轮次的末尾分叉出新会话。 */
+export async function forkAgentSession(id: string, messageId: string): Promise<AgentSessionDto> {
+  return request<AgentSessionDto>(`/api/agent/sessions/${encodeURIComponent(id)}/fork`, {
+    method: 'POST',
+    body: JSON.stringify({ messageId }),
+  });
+}
+
 /** DELETE /api/agent/sessions/:id —— 停进程 + JSONL 归档 + DB 软删。 */
 export async function deleteAgentSession(id: string): Promise<{ ok: true }> {
   return request<{ ok: true }>(`/api/agent/sessions/${encodeURIComponent(id)}`, {

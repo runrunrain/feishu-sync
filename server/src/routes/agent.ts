@@ -260,6 +260,17 @@ export async function agentRoutes(deps: AgentRouteDeps): Promise<Hono> {
     }
   });
 
+  // 从任意已完成轮次分叉出新会话（新建的是独立会话，源会话不受影响）
+  routes.post('/api/agent/sessions/:id/fork', async (c) => {
+    try {
+      const body = await c.req.json().catch(() => null) as { messageId?: unknown; title?: unknown } | null;
+      if (!body || typeof body !== 'object' || Array.isArray(body)) throw new ToolError('invalid_request', '分叉请求无效');
+      return c.json(await sessionService.fork(localMapStore, c.req.param('id'), body), 201);
+    } catch (error) {
+      return errorResponse(c, error);
+    }
+  });
+
   routes.put('/api/agent/sessions/:id/approval-mode', async (c) => {
     try {
       const body = await c.req.json().catch(() => null) as { mode?: unknown } | null;

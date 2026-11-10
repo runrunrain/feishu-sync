@@ -230,6 +230,122 @@ export class SessionService extends EventEmitter {
     return this.get(localMapStore, this.currentConfig(), id);
   }
 
+  /**
+   * 从任意已完成轮次分叉出新会话（Pi 后端，Discuss/Work 通用）。
+   *
+   * 「轮次」= 一条用户消息及其后到下一条用户消息之前的全部回复/工具往返。messageId 指向
+   * 轮次内任一条历史消息（JSONL entry id），新会话保留从根到该轮次末尾的当前分支，
+   * 之后的内容不带入。实现是宿主侧文件级复制——pi RPC 的 fork/clone 命令按设计被白名单
+   * 禁用（会改变宿主会话 ↔ pi 进程的一一绑定）：新 JSONL 以新会话 id 作 header id，
+   * 下次发消息时 `--session-id` 经 pi 的按 header id 查找原样恢复上下文。
+   * 源会话、源 JSONL 与其运行状态完全不受影响（可在源会话运行中分叉历史轮次）。
+   */
+  async fork(
+    store: SessionStoreApi & Pick<LocalMapStore, 'createAgentSession'>,
+    id: string,
+    body: { messageId?: unknown; title?: unknown },
+  ): Promise<AgentSessionDto> {
+    const row = store.getAgentSession(id);
+    if (!row) throw new ToolError('session_not_found', '会话不存在', 404);
+    if (row.runtime_backend === 'claude-code') {
+      throw new ToolError('fork_unsupported', 'Claude Code 会话暂不支持分叉，请使用 Pi 会话', 409);
+    }
+    const messageId = body.messageId;
+    if (typeof messageId !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(messageId) || /^(live_|attachment_)/.test(messageId)) {
+      throw new ToolError('fork_point_invalid', '请选择一条已落盘的历史消息作为分叉点', 400);
+    }
+    let title: string | undefined;
+    if (body.title !== undefined) {
+      if (typeof body.title !== 'string' || body.title.trim().length < 1 || body.title.trim().length > 80) {
+        throw new ToolError('invalid_request', '标题长度必须在 1..80');
+      }
+      title = body.title.trim();
+    }
+    const sourceFile = row.pi_session_file ? String(row.pi_session_file) : null;
+    if (!sourceFile) throw new ToolError('fork_source_missing', '该会话还没有可分叉的历史', 409);
+    let raw: string;
+    try { raw = await fs.promises.readFile(sourceFile, 'utf8'); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new ToolError('fork_source_missing', '会话历史文件不存在，无法分叉', 409);
+      throw error;
+    }
+
+    interface ForkEntry { type?: string; id?: string; parentId?: string | null; message?: { role?: string; content?: unknown } }
+    let header: { version?: number; cwd?: string } | null = null;
+    const entries: ForkEntry[] = [];
+    for (const line of raw.split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const parsed = JSON.parse(line) as ForkEntry & { version?: number; cwd?: string };
+        if (parsed.type === 'session') { header ??= parsed; continue; }
+        if (typeof parsed.id === 'string') entries.push(parsed);
+      } catch { /* 损坏行/进行中的半行不影响更早的有效历史（与历史读取同口径） */ }
+    }
+    if (!header || typeof header.cwd !== 'string' || entries.length === 0) {
+      throw new ToolError('fork_source_missing', '会话历史为空或已损坏，无法分叉', 409);
+    }
+    // 与 SessionHistoryCache 同口径：文件顺序最后一个节点是当前叶子，沿 parentId 回溯当前分支。
+    const byId = new Map(entries.map((entry) => [entry.id!, entry]));
+    const branch: ForkEntry[] = [];
+    const visited = new Set<string>();
+    for (let cursor: ForkEntry | undefined = entries[entries.length - 1]; cursor && !visited.has(cursor.id!);
+      cursor = cursor.parentId ? byId.get(cursor.parentId) : undefined) {
+      visited.add(cursor.id!); branch.push(cursor);
+    }
+    branch.reverse();
+    const pointIndex = branch.findIndex((entry) => entry.id === messageId);
+    if (pointIndex < 0 || branch[pointIndex].type !== 'message') {
+      throw new ToolError('fork_point_invalid', '分叉点不在当前会话分支上，请刷新后重试', 400);
+    }
+    const isUser = (entry: ForkEntry) => entry.type === 'message' && entry.message?.role === 'user';
+    let end = pointIndex;
+    while (end + 1 < branch.length && !isUser(branch[end + 1])) end++;
+    // 轮次尾部的非消息节点（模型/思考档位切换等）属于下一轮的上下文，不带入。
+    while (end > pointIndex && branch[end].type !== 'message') end--;
+    if (end === branch.length - 1 && this.runs.has(id)) {
+      throw new ToolError('session_busy', '该轮次仍在运行，请等待完成或停止后再分叉', 409);
+    }
+    const kept = branch.slice(0, end + 1);
+
+    const newId = `s_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`;
+    const now = new Date().toISOString();
+    const dir = this.sessionDir();
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `${now.replace(/[:.]/g, '-')}_${newId}.jsonl`);
+    const lines = [JSON.stringify({ type: 'session', version: header.version ?? 3, id: newId, timestamp: now, cwd: header.cwd, parentSession: sourceFile }),
+      ...kept.map((entry, index) => JSON.stringify(index === 0 ? { ...entry, parentId: null } : entry))];
+    const temporary = `${file}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+    let registered = false;
+    try {
+      await fs.promises.writeFile(temporary, lines.join('\n') + '\n', { flag: 'wx', mode: 0o600 });
+      await fs.promises.rename(temporary, file);
+      const texts = kept.filter(isUser).map((entry) => {
+        const content = entry.message?.content;
+        return typeof content === 'string' ? content : Array.isArray(content)
+          ? content.map((block) => (block && typeof block === 'object' && (block as { type?: string }).type === 'text' ? String((block as { text?: string }).text ?? '') : '')).join('') : '';
+      });
+      this.attachments.cloneForFork(id, newId, texts);
+      const sourceTitle = String(row.title);
+      store.createAgentSession({
+        id: newId, title: title ?? `${sourceTitle.slice(0, 70)}（分叉）`, mode: row.mode === 'work' ? 'work' : 'discuss',
+        workspaceId: row.workspace_id ? String(row.workspace_id) : null, backend: 'pi',
+        approvalMode: this.readApprovalMode(row), modelConfig: typeof row.model_config_json === 'string' ? row.model_config_json : null,
+        createdAt: now, updatedAt: now,
+      });
+      registered = true;
+      store.updateAgentSession(newId, { piSessionFile: file, localResources: row.local_resources === 1 });
+    } catch (error) {
+      // 部分失败不留半成品：未登记的 JSONL 与附件副本一并清掉（已登记则由会话删除流程接管）。
+      if (!registered) {
+        await fs.promises.rm(temporary, { force: true }).catch(() => undefined);
+        await fs.promises.rm(file, { force: true }).catch(() => undefined);
+        this.attachments.discard(newId);
+      }
+      throw error;
+    }
+    return this.get(store, this.currentConfig(), newId)!;
+  }
+
   private readSessionModel(row: Record<string, unknown>): SessionModelConfig | null {
     if (typeof row.model_config_json !== 'string' || !row.model_config_json) return null;
     try { return JSON.parse(row.model_config_json) as SessionModelConfig; } catch { throw new ToolError('invalid_request', '会话模型配置损坏'); }

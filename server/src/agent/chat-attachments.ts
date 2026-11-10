@@ -219,6 +219,56 @@ export class ChatAttachmentStore {
     // its own first history entry (unsupported model, missing credentials, etc.).
     fs.appendFileSync(path.join(this.directory(sessionId), 'submitted.jsonl'), JSON.stringify({ ...record, at: new Date().toISOString() }) + '\n', { mode: 0o600 });
   }
+  /**
+   * 会话分叉：把被保留的用户消息所引用的附件复制到新会话目录。
+   * 只复制 texts（分叉后保留的用户消息原文）实际引用的提交记录与附件文件，
+   * 并只回放这些提交的 submitted.jsonl 行——decorate() 会把日志里「未在消息中出现」
+   * 的提交补成独立用户气泡，整本复制会把分叉点之后的附件带进新会话。
+   */
+  cloneForFork(sourceId: string, targetId: string, texts: string[]): void {
+    const source = this.directory(sourceId);
+    const target = this.directory(targetId);
+    const recordKeys = new Set<string>();
+    for (const text of texts) {
+      recordKeys.add(crypto.createHash('sha256').update(text).digest('hex'));
+      for (const match of text.matchAll(/<chat-attachments id="([a-f0-9-]{36})">/g)) recordKeys.add(match[1]);
+    }
+    const copyFile = (name: string): boolean => {
+      const from = path.join(source, name);
+      if (!fs.existsSync(from) || fs.lstatSync(from).isSymbolicLink()) return false;
+      fs.copyFileSync(from, path.join(target, name), fs.constants.COPYFILE_EXCL);
+      fs.chmodSync(path.join(target, name), 0o600);
+      return true;
+    };
+    const copiedIds = new Set<string>();
+    const submissions = new Set<string>();
+    for (const key of recordKeys) {
+      let record: { ids?: unknown; submissionId?: unknown };
+      try { record = JSON.parse(fs.readFileSync(path.join(source, `message_${key}.json`), 'utf8')); } catch { continue; }
+      if (!Array.isArray(record.ids)) continue;
+      try { copyFile(`message_${key}.json`); } catch { /* 目标已存在（hash 与 submission 记录同源）时忽略 */ }
+      if (typeof record.submissionId === 'string' && /^[a-f0-9-]{36}$/.test(record.submissionId)) {
+        submissions.add(record.submissionId);
+        try { copyFile(`message_${record.submissionId}.json`); } catch { /* 同上 */ }
+      }
+      for (const id of record.ids) {
+        if (typeof id !== 'string' || !ID_PATTERN.test(id) || copiedIds.has(id)) continue;
+        copiedIds.add(id);
+        for (const suffix of ['.bin', '.txt', '.json']) copyFile(id + suffix);
+      }
+    }
+    const journal = path.join(source, 'submitted.jsonl');
+    if (submissions.size && fs.existsSync(journal)) {
+      const kept = fs.readFileSync(journal, 'utf8').split('\n').filter((line) => {
+        try { return submissions.has((JSON.parse(line) as { submissionId?: string }).submissionId ?? ''); } catch { return false; }
+      });
+      if (kept.length) fs.writeFileSync(path.join(target, 'submitted.jsonl'), kept.join('\n') + '\n', { mode: 0o600 });
+    }
+  }
+  /** 丢弃某会话的附件目录（分叉半途失败时回收副本；不碰其它会话）。 */
+  discard(sessionId: string): void {
+    fs.rmSync(this.directory(sessionId), { recursive: true, force: true });
+  }
   decorate(sessionId: string, messages: AgentMessageDto[]): AgentMessageDto[] {
     const seen = new Set<string>();
     const decorated = messages.map((message) => {

@@ -7,8 +7,8 @@
  * 自动滚底：接近底部时新内容贴底；用户上翻阅读时不打扰。
  */
 
-import { memo, useEffect, useMemo, useRef, useState } from 'react';
-import { AlertCircle, Ban, Check, ChevronDown, ListTodo, Loader2, Wrench, X } from 'lucide-react';
+import { Fragment, memo, useEffect, useMemo, useRef, useState } from 'react';
+import { AlertCircle, Ban, Check, ChevronDown, GitFork, ListTodo, Loader2, Wrench, X } from 'lucide-react';
 import type { RunDraft } from '../../hooks/useAgentSessions';
 import type { AgentApprovalDto, AgentMessageDto, AgentTaskNotice } from '../../types/agent';
 import { MarkdownView } from '../preview/MarkdownView';
@@ -37,9 +37,13 @@ interface MessageStreamProps {
   taskNotices?: AgentTaskNotice[];
   /** 关闭一条错误行（可选；不传则常驻直到切换会话）。 */
   onDismissStreamError?: (id: string) => void;
+  /** 从某轮次末尾分叉新会话（传入该轮次内已落盘消息 id）；不传则不显示分叉入口。 */
+  onFork?: (messageId: string) => void;
+  /** 分叉请求进行中（禁用所有分叉按钮，防重复创建）。 */
+  forkBusy?: boolean;
 }
 
-export function MessageStream({ workMode = false, sessionId, messages, draft, streamErrors, loading, emptyHint, approvals, onApprovalDecision, approvalBusyId, taskNotices, onDismissStreamError }: MessageStreamProps) {
+export function MessageStream({ workMode = false, sessionId, messages, draft, streamErrors, loading, emptyHint, approvals, onApprovalDecision, approvalBusyId, taskNotices, onDismissStreamError, onFork, forkBusy = false }: MessageStreamProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
   const [historyWindow, setHistoryWindow] = useState({ sessionId, count: HISTORY_PAGE });
@@ -63,6 +67,21 @@ export function MessageStream({ workMode = false, sessionId, messages, draft, st
     for (const tool of draft?.tools ?? []) { const owner = latest.get(tool.callId); if (owner) hide(owner); }
     return { hidden, args };
   }, [messages, draft?.tools]);
+
+  // 分叉入口：每个轮次（用户消息起，到下一条用户消息前）末尾一个；锚点取该轮最后一条已落盘消息。
+  // live_/attachment_ 前缀是尚未落盘的占位 id，服务端无法定位；进行中的末轮（有草稿）不提供。
+  const forkAnchors = useMemo(() => {
+    const anchors = new Map<number, string>();
+    if (!onFork) return anchors;
+    let anchor: string | null = null;
+    messages.forEach((message, index) => {
+      if (!/^(live_|attachment_)/.test(message.id)) anchor = message.id;
+      const last = index === messages.length - 1;
+      if ((last || messages[index + 1].role === 'user') && anchor && !(last && draft)) anchors.set(index, anchor);
+      if (last || messages[index + 1].role === 'user') anchor = null;
+    });
+    return anchors;
+  }, [messages, draft, onFork]);
 
   useEffect(() => {
     if (previousSession.current !== sessionId) {
@@ -107,12 +126,21 @@ export function MessageStream({ workMode = false, sessionId, messages, draft, st
               previousHeight.current = scrollRef.current?.scrollHeight ?? null;
               setHistoryWindow({ sessionId, count: visibleCount + HISTORY_PAGE });
             }}>加载更早的消息（{messages.length - visibleCount}）</button> : null}
-            {visibleMessages.map((m) => {
+            {visibleMessages.map((m, offset) => {
               const toolVisibility = m.toolCalls?.map((_tool, index) => toolDisplay.hidden.get(m.id)?.has(index) ? '0' : '1').join('') ?? '';
+              const forkAnchor = forkAnchors.get(messages.length - visibleMessages.length + offset);
+              const forkRow = forkAnchor && onFork ? <div className="agent-turn-fork" data-testid="agent-turn-fork">
+                <button type="button" disabled={forkBusy} title="以此轮及之前的对话创建一个新会话，原会话保持不变" aria-label="从此轮分叉新会话" onClick={() => onFork(forkAnchor)}>
+                  <GitFork className="h-3 w-3" />{forkBusy ? '分叉中…' : '从此轮分叉'}
+                </button>
+              </div> : null;
               // Merged tool invocations must not leave empty rows between the prose and result card.
-              if (workMode && m.role === 'assistant' && !m.text && !m.thinking && !m.error && !m.model && !toolVisibility.includes('1')) return null;
-              return <div className="agent-message-item" data-message-role={m.role} key={m.id} style={{ contentVisibility: 'auto', containIntrinsicSize: 'auto 80px' }}><MessageRow workMode={workMode} message={m} sessionId={sessionId}
-                toolArgs={toolDisplay.args.get(m.id)} toolVisibility={toolVisibility} /></div>;
+              const hidden = workMode && m.role === 'assistant' && !m.text && !m.thinking && !m.error && !m.model && !toolVisibility.includes('1');
+              return <Fragment key={m.id}>
+                {hidden ? null : <div className="agent-message-item" data-message-role={m.role} style={{ contentVisibility: 'auto', containIntrinsicSize: 'auto 80px' }}><MessageRow workMode={workMode} message={m} sessionId={sessionId}
+                  toolArgs={toolDisplay.args.get(m.id)} toolVisibility={toolVisibility} /></div>}
+                {forkRow}
+              </Fragment>;
             })}
           </>
         )}

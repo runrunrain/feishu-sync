@@ -173,3 +173,14 @@
 .agent-work-thinking[open] summary > svg { transform: rotate(0); }
 .agent-work-thinking-body { margin: 6px 0 8px; padding-left: 10px; border-left: 2px solid var(--line); max-height: 240px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.6; }
 .agent-work-thinking summary:focus-visible { outline: 2px solid var(--seal); outline-offset: 2px; }
+
+/* 轮次末尾的分叉入口：平时弱化，悬停/聚焦时显现，不挤占消息流节奏。 */
+.agent-turn-fork { display: flex; justify-content: flex-start; margin-top: 2px; }
+.agent-turn-fork button {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 6px; border-radius: 4px; font-size: 11px; line-height: 16px;
+  color: var(--ink-faint, #8a8f98); opacity: 0.55; background: transparent;
+}
+.agent-turn-fork:hover button, .agent-turn-fork button:focus-visible { opacity: 1; color: var(--ink); background: color-mix(in srgb, var(--ink) 6%, transparent); }
+.agent-turn-fork button:disabled { cursor: not-allowed; opacity: 0.4; }
+[data-session-mode='work'] .agent-message-column > .agent-turn-fork { margin-top: 2px; }

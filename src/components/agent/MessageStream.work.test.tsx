@@ -57,3 +57,30 @@ it('renders native thinking as a collapsed row without merging it into the respo
     expect(host.querySelector('.agent-reply')?.textContent).not.toContain('检查目录');
   } finally { await act(async () => root.unmount()); }
 });
+
+it('offers one fork entry per finished turn, anchored on persisted messages only', async () => {
+  const host = document.createElement('div'); const root = createRoot(host);
+  const onFork = vi.fn();
+  const messages: AgentMessageDto[] = [
+    { id: 'u1', role: 'user', at: '', text: '第一问' },
+    { id: 'a1', role: 'assistant', at: '', text: '第一答' },
+    { id: 't1', role: 'tool', at: '', tool: { callId: 'c', name: 'bash', isError: false, resultSummary: 'ok' } },
+    { id: 'u2', role: 'user', at: '', text: '第二问' },
+    { id: 'a2', role: 'assistant', at: '', text: '第二答' },
+    { id: 'live_run_x', role: 'assistant', at: '', text: '尚未落盘' },
+  ];
+  try {
+    await act(async () => root.render(<MessageStream workMode messages={messages} draft={null} streamErrors={[]} loading={false} onFork={onFork} />));
+    const buttons = [...host.querySelectorAll<HTMLButtonElement>('[data-testid="agent-turn-fork"] button')];
+    expect(buttons).toHaveLength(2);
+    await act(async () => buttons[0].click());
+    expect(onFork).toHaveBeenLastCalledWith('t1');
+    await act(async () => buttons[1].click());
+    expect(onFork).toHaveBeenLastCalledWith('a2'); // live_ 占位消息不能作锚点
+    // 进行中的末轮（有草稿）不提供入口；不传 onFork 时完全不渲染
+    await act(async () => root.render(<MessageStream workMode messages={messages} draft={{ runId: 'r', text: 'x', tools: [] }} streamErrors={[]} loading={false} onFork={onFork} />));
+    expect(host.querySelectorAll('[data-testid="agent-turn-fork"]')).toHaveLength(1);
+    await act(async () => root.render(<MessageStream workMode messages={messages} draft={null} streamErrors={[]} loading={false} />));
+    expect(host.querySelectorAll('[data-testid="agent-turn-fork"]')).toHaveLength(0);
+  } finally { await act(async () => root.unmount()); }
+});
