@@ -345,7 +345,9 @@ export class PiPluginService {
       settings[type] = [...current, ...paths, ...(fs.existsSync(dir) ? [dir] : [])];
     }
     const root = resolveInside(this.deps.dataRoot, 'agent/pi-home-local', 'mkdir');
-    fs.chmodSync(root, 0o700);
+    // Windows uses inherited ACLs. Node's mode bits cannot represent those permissions.
+    const supportsPosixModes = process.platform !== 'win32';
+    if (supportsPosixModes) fs.chmodSync(root, 0o700);
     // 进程池无法可靠识别所有仍在使用某目录的外部/退出竞态进程；保守不清理。
     const normalizedCwd = fs.realpathSync.native(cwd ?? os.homedir());
     const key = crypto.createHash('sha256').update(JSON.stringify([normalizedCwd, revision])).digest('hex');
@@ -354,7 +356,8 @@ export class PiPluginService {
     const links = ['mcp.json', 'mcp-auth.json'].filter((name) => fs.existsSync(path.join(agentDir, name)));
     const valid = (dir: string) => {
       try {
-        if (!fs.lstatSync(dir).isDirectory() || (fs.statSync(dir).mode & 0o777) !== 0o700) return false;
+        const stat = fs.lstatSync(dir);
+        if (!stat.isDirectory() || (supportsPosixModes && (stat.mode & 0o777) !== 0o700)) return false;
         const file = path.join(dir, 'settings.json');
         if (!fs.lstatSync(file).isFile() || fs.readFileSync(file, 'utf8') !== contents) return false;
         return ['mcp.json', 'mcp-auth.json'].every((name) => {
@@ -373,7 +376,7 @@ export class PiPluginService {
     }
     const temp = fs.mkdtempSync(path.join(root, '.tmp-'));
     try {
-      fs.chmodSync(temp, 0o700);
+      if (supportsPosixModes) fs.chmodSync(temp, 0o700);
       fs.writeFileSync(path.join(temp, 'settings.json'), contents, { mode: 0o600 });
       for (const name of links) fs.symlinkSync(path.join(agentDir, name), path.join(temp, name));
       if (!valid(temp)) throw new ToolError('pi_settings_invalid', 'Pi 覆盖目录校验失败', 409);

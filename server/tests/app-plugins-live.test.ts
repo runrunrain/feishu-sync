@@ -23,6 +23,7 @@ afterAll(() => fs.rmSync(root, { recursive: true, force: true }));
 
 it('真实Pi插件快照进入system；运行中编辑不改变当前任务，后续运行重启且停用不残留，未变则复用', async (ctx) => {
   const localHome = path.join(root, 'local-pi'); fs.mkdirSync(localHome, { recursive: true });
+  fs.writeFileSync(path.join(root, 'workspace-marker.txt'), 'NATIVE_WORKSPACE_MARKER');
   vi.stubEnv('HOME', root); vi.stubEnv('PI_CODING_AGENT_DIR', localHome);
   const manager = new ConfigManager(path.join(root, 'config.json')); const config = await manager.load();
   const resolver = new PiRuntimeResolver(); const runtime = await resolver.resolveRuntime(config.agent);
@@ -52,7 +53,7 @@ it('真实Pi插件快照进入system；运行中编辑不改变当前任务，�
         const frame = (delta: unknown, finish_reason: string | null) => `data: ${JSON.stringify({ id: 'plugin-local', object: 'chat.completion.chunk', created: 1, model: 'fixture', choices: [{ index: 0, delta, finish_reason }] })}\n\n`;
         res.writeHead(200, { 'Content-Type': 'text/event-stream' });
         res.end(requests.length === 8
-          ? frame({role:'assistant',tool_calls:[{index:0,id:'work_bash_1',type:'function',function:{name:'bash',arguments:'{"command":"pwd","timeout":5}'}}]},null)+frame({},'tool_calls')+'data: [DONE]\n\n'
+          ? frame({role:'assistant',tool_calls:[{index:0,id:'work_bash_1',type:'function',function:{name:'bash',arguments:'{"command":"cat workspace-marker.txt","timeout":5}'}}]},null)+frame({},'tool_calls')+'data: [DONE]\n\n'
           : requests.length === 4
           ? frame({role:'assistant',tool_calls:[{index:0,id:'native_tool_1',type:'function',function:{name:'plugin_echo',arguments:'{"message":"NATIVE_TOOL_PAYLOAD"}'}}]},null)+frame({},'tool_calls')+'data: [DONE]\n\n'
           : frame({ role: 'assistant', content: 'PLUGIN_FIXTURE_OK' }, null) + frame({}, 'stop') + 'data: [DONE]\n\n');
@@ -141,7 +142,7 @@ it('真实Pi插件快照进入system；运行中编辑不改变当前任务，�
     expect(systems(7).split('NATIVE_EXTERNAL_CONTEXT')).toHaveLength(2);
     expect(systems(7)).not.toContain('子任务是受限执行者');
     expect(workBashElapsed).toBeLessThan(5000);
-    expect(JSON.stringify(requests[8].messages)).toContain(root);
+    expect(JSON.stringify(requests[8].messages)).toContain('NATIVE_WORKSPACE_MARKER');
     const state = await pool.get(session.id)!.sendCommand('get_state');
     expect((state.data as { cwd?: string }).cwd ?? root).toBe(root);
     service.setLocalResources(store, session.id, true);
@@ -156,6 +157,7 @@ it('真实Pi插件快照进入system；运行中编辑不改变当前任务，�
     expect(requests[12].tools.map((tool: any) => tool.function.name)).not.toContain('bash');
   } finally {
     releaseFirst?.(); await pool.closeAll();
+    store.close();
     await new Promise<void>((resolve) => internal.close(() => resolve()));
     await new Promise<void>((resolve) => llm.close(() => resolve()));
     vi.unstubAllEnvs();

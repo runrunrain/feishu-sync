@@ -85,12 +85,13 @@ it('缺失项目包放行，安装后 revision 变化并让同名用户包自动
   const service = new PiPluginService({ dataRoot: app, resolver, agentConfig: () => config, running: () => false, retireIdle: async () => {}, bundledAmagi: null });
   await service.refresh();
   const before = await service.localWorkRevision(user, cwd); const first = await service.prepareLocalWorkHome(user, cwd);
-  const firstBytes = fs.readFileSync(path.join(first, 'settings.json'), 'utf8'); expect(firstBytes).toContain(path.join(user, 'copy'));
+  const firstBytes = fs.readFileSync(path.join(first, 'settings.json'), 'utf8');
+  expect(JSON.parse(firstBytes).packages).toContain(path.join(user, 'copy'));
   const installed = path.join(cwd, '.pi/npm/node_modules/fixture-package'); fs.mkdirSync(installed, { recursive: true });
   fs.writeFileSync(path.join(installed, 'package.json'), JSON.stringify({ name: 'fixture-package' }));
   const after = await service.localWorkRevision(user, cwd); expect(after).not.toBe(before);
   const second = await service.prepareLocalWorkHome(user, cwd); expect(second).not.toBe(first);
-  expect(fs.readFileSync(path.join(second, 'settings.json'), 'utf8')).not.toContain(path.join(user, 'copy'));
+  expect(JSON.parse(fs.readFileSync(path.join(second, 'settings.json'), 'utf8')).packages).not.toContain(path.join(user, 'copy'));
   expect(fs.readFileSync(path.join(first, 'settings.json'), 'utf8')).toBe(firstBytes);
 });
 
@@ -106,7 +107,8 @@ it('并发工作区与同工作区多 revision 使用独立、可复用的完整
   const [a1, b1, a1Again] = await Promise.all([service.prepareLocalWorkHome(user, a), service.prepareLocalWorkHome(user, b), service.prepareLocalWorkHome(user, a)]);
   expect(a1Again).toBe(a1); expect(a1).not.toBe(b1);
   const bytes = fs.readFileSync(path.join(a1, 'settings.json'), 'utf8');
-  expect(fs.statSync(a1).mode & 0o777).toBe(0o700); expect(fs.readlinkSync(path.join(a1, 'mcp.json'))).toBe(path.join(user, 'mcp.json'));
+  if (process.platform !== 'win32') expect(fs.statSync(a1).mode & 0o777).toBe(0o700);
+  expect(fs.readlinkSync(path.join(a1, 'mcp.json'))).toBe(path.join(user, 'mcp.json'));
   expect(fs.readlinkSync(path.join(a1, 'mcp-auth.json'))).toBe(path.join(user, 'mcp-auth.json'));
   fs.writeFileSync(path.join(a, '.pi/settings.json'), JSON.stringify({ extensions: ['-builtin:mcp'] }));
   const [a2, bAgain] = await Promise.all([service.prepareLocalWorkHome(user, a), service.prepareLocalWorkHome(user, b)]);
@@ -237,7 +239,7 @@ it('生成私有本机覆盖目录，改写资源路径并按名称去重', asyn
   expect(fs.readlinkSync(path.join(overlay, 'mcp.json'))).toBe(path.join(user, 'mcp.json'));
   expect(fs.readlinkSync(path.join(overlay, 'mcp-auth.json'))).toBe(path.join(user, 'mcp-auth.json'));
   expect(snapshot(user)).toEqual(before);
-  expect(fs.statSync(overlay).mode & 0o777).toBe(0o700);
+  if (process.platform !== 'win32') expect(fs.statSync(overlay).mode & 0o777).toBe(0o700);
   fs.writeFileSync(path.join(user, 'mcp.json'), '{"changed":true}');
   expect(await service.localWorkRevision(user)).not.toBe(revision);
   const cwd = path.join(root, 'workspace'); fs.mkdirSync(path.join(cwd, '.pi'), { recursive: true });
