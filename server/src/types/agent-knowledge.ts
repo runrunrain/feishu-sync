@@ -968,7 +968,7 @@ export interface AgentMessageDto {
   model?: string;
 }
 
-export interface KbMcpInfoDto {
+export interface KbMcpStdioInfo {
   available: boolean;
   command: string;
   args: string[];
@@ -976,6 +976,15 @@ export interface KbMcpInfoDto {
   alternative: { command: string; args: string[]; note: string };
   snippet: string;
 }
+
+export interface KbMcpHttpInfo {
+  available: boolean;
+  url: string;
+  headers: Record<string, string>;
+  snippet: string;
+}
+
+export type KbMcpInfoDto = KbMcpStdioInfo | KbMcpHttpInfo;
 
 // ============================================================================
 // 任务编排（S6，设计 kb-agent-upgrade §5.4）

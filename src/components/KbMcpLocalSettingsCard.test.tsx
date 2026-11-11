@@ -4,10 +4,11 @@ import { createRoot } from 'react-dom/client';
 import { beforeEach, expect, it, vi } from 'vitest';
 import type { McpInstallStatus } from '../types/kb-mcp-install';
 
-const api = vi.hoisted(() => ({ info: vi.fn(), status: vi.fn(), install: vi.fn(), remove: vi.fn() }));
-vi.mock('../api/client', () => ({ getKbMcpInfo: api.info, getKbMcpInstallStatus: api.status, installKbMcp: api.install, removeKbMcp: api.remove }));
+const api = vi.hoisted(() => ({ info: vi.fn(), status: vi.fn(), install: vi.fn(), remove: vi.fn(), getConfig: vi.fn(), saveConfig: vi.fn() }));
+vi.mock('../api/client', () => ({ getKbMcpInfo: api.info, getKbMcpInstallStatus: api.status, installKbMcp: api.install, removeKbMcp: api.remove, getConfig: api.getConfig, saveConfig: api.saveConfig }));
 vi.mock('../utils/clipboard', () => ({ writeClipboardText: vi.fn() }));
 import { KbMcpLocalSettingsCard } from './KbMcpLocalSettingsCard';
+import { SettingsDraftProvider, useSettingsDraft } from '../hooks/settingsDraft';
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 const targets: McpInstallStatus[] = [
@@ -34,6 +35,28 @@ it('可选择 Codex 并安装到其用户配置', async () => {
     const install = [...container.querySelectorAll('button')].find((item) => item.textContent === '一键安装')!;
     await act(async () => install.click());
     expect(api.install).toHaveBeenCalledWith('codex');
+  } finally { act(() => root.unmount()); container.remove(); }
+});
+
+it('独立运行开关随设置草稿保存', async () => {
+  api.getConfig.mockResolvedValue({ allowStandaloneKbMcp: true });
+  api.saveConfig.mockResolvedValue({ allowStandaloneKbMcp: false });
+  function SaveButton() {
+    const draft = useSettingsDraft()!;
+    return <button type="button" onClick={() => void draft.save()}>保存设置</button>;
+  }
+  const container = document.createElement('div'); document.body.append(container);
+  const root = createRoot(container);
+  try {
+    await act(async () => root.render(<SettingsDraftProvider><KbMcpLocalSettingsCard /><SaveButton /></SettingsDraftProvider>));
+    const toggle = container.querySelector<HTMLButtonElement>('[role="switch"]')!;
+    expect(toggle.getAttribute('aria-checked')).toBe('true');
+    await act(async () => toggle.click());
+    expect(toggle.getAttribute('aria-checked')).toBe('false');
+    expect(api.saveConfig).not.toHaveBeenCalled();
+    const save = [...container.querySelectorAll('button')].find((button) => button.textContent === '保存设置')!;
+    await act(async () => save.click());
+    expect(api.saveConfig).toHaveBeenCalledWith({ allowStandaloneKbMcp: false });
   } finally { act(() => root.unmount()); container.remove(); }
 });
 

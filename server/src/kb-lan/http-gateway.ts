@@ -12,6 +12,7 @@ export interface HttpGatewayOptions {
   host: string; port: number; maxSessions: number; allowCidrs: string[]; digests: string[];
   register: (server: Server, sessionState: { lastServedCurrent?: string }) => void;
   instructions?: string;
+  localProbe?: string;
   emit?: (message: Record<string, unknown>) => void;
   now?: () => number;
   sessionTtlMs?: number; evictIdleMs?: number;
@@ -102,6 +103,10 @@ export function createHttpGateway(options: HttpGatewayOptions) {
       const ip = normalizeRemote(req.socket.remoteAddress ?? '');
       if (!allowedSource(ip, options.allowCidrs)) { audit('forbidden_source', { remote: ip }); send(res, 403, 'kb_lan_forbidden_source'); return; }
       if (req.headers.origin !== undefined) { audit('browser_forbidden', { remote: ip }); send(res, 403, 'kb_lan_browser_forbidden'); return; }
+      if (options.localProbe && req.method === 'HEAD') {
+        res.writeHead(204, { 'X-Feishu-Kb-Local': options.localProbe, 'Cache-Control': 'no-store' }).end();
+        return;
+      }
       collect();
       const failed = failures.get(ip);
       if (failed && failed.blockedUntil > now()) { audit('rate_limited', { remote: ip }); send(res, 429, 'kb_lan_rate_limited'); return; }

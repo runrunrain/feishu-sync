@@ -48,6 +48,7 @@ export interface KbRouteDeps {
   /** 重构 v2：构建运行宿主（能力探测/包安装状态端点；未接线时不性 503
    * 而是如实报告未接线）。 */
   buildRuntime?: import('../kb/build-runtime-host.js').BuildRuntimeHost;
+  localMcpInfo?: () => import('../types/agent-knowledge.js').KbMcpInfoDto;
 }
 
 function errorResponse(c: Context, error: unknown): Response {
@@ -908,6 +909,8 @@ export function kbRoutes(deps: KbRouteDeps): Hono {
   // ------------------------------------------------------------------
 
   routes.get('/api/kb/mcp', async (c) => {
+    c.header('Cache-Control', 'no-store');
+    if (deps.localMcpInfo) return c.json(deps.localMcpInfo());
     const config = await configManager.load();
     return c.json(kbMcpInfo(config.standardKb.outputRoot, rawCatalogPath(resolveDataRoot())));
   });

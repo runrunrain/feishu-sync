@@ -181,7 +181,7 @@ Pi Work 使用内置 amagi-pi 的原生任务工具与角色，以下应用任�
 
 ## 给其他工具连接只读 MCP
 
-本机与内网 MCP 的资料范围统一为已发布标准库与已同步原始库。`search_all_knowledge` 可同时查询两者并分别返回结果；标准库未收录时，也可使用 `raw_list`（目录路径浏览）、`raw_search`（标题、路径、正文和 CSV 检索）、`raw_read`（原文与 CSV 分页阅读）。原始库返回 `sourceKind: raw`，与标准库的发布版本引用区分。无需为了查询原文而先构建标准库。两端使用应用维护的同一份原始库清单，运行期间约每 10 秒刷新，应用关闭后本机使用最后清单。安装过旧版 MCP 时，更新本机安装配置并重启客户端以启用新增工具。
+本机与内网 MCP 的资料范围统一为已发布标准库与已同步原始库。`search_all_knowledge` 可同时查询两者并分别返回结果。标准库未收录时，也可使用 `raw_list`（目录路径浏览）、`raw_search`（标题、路径、正文和 CSV 检索）、`raw_read`（原文与 CSV 分页阅读）。原始库返回 `sourceKind: raw`，与标准库的发布版本引用区分。应用运行时约每 10 秒刷新原始库清单。允许本机 MCP 独立运行时，应用退出后服务使用最后一份清单。
 
 Excel 可使用 `raw_list_sheets`、`raw_search_sheet` 和 `raw_read_sheet` 获取实际工作表与单元格；公式不重新计算，按单元格坐标引用。图片可用 `raw_search_images`、`raw_list_images`、`raw_read_image` 查找或读取，包括工作簿内嵌图片；优先复用本地已识图缓存，不触发新识别。源文档之间的出链与入链可用 `raw_links` 获取，结果来自应用的引用索引快照；索引缺失时明确报错，不能当成无引用。具体分页、文件大小限制和格式说明见 [内网 MCP 使用说明](kb-lan-mcp.md)。
 
@@ -198,7 +198,7 @@ Excel 可使用 `raw_list_sheets`、`raw_search_sheet` 和 `raw_read_sheet` 获�
 - 变更清单的 `removed` 只说明本版不再包含原路径。构建明确声明合并时记录 `mergedInto`；历史版本未记录时返回 `null`，不根据共享源或相似标题猜测去向。合并去向的声明入口按粒度区分：文档级 `mergedInto` 目前仅由旧批处理（legacy）编排的 `kb_finish.docMerges` 声明；默认的 Pi 编排经 `kb_edit_doc.objectMerges` 与 `build_register_migrations` 登记的是知识对象迁移，属对象级记录，不填充文档级 `mergedInto`。构建编排详见 [build-orchestration.md](build-orchestration.md)，命令行命令见 [cli-reference.md](cli-reference.md)。
 - 路径不存在时，`kb_not_found.suggestions` 返回最多五个近似路径供重试，不会自动替换目标。没有合理候选时仍为空。
 
-在「设置 → Agent 标准库 → 知识库共享 → 本机 MCP 安装」选择 Codex、Claude Code 或 .agents 兼容客户端并安装；也可复制连接片段手动配置。安装后重新启动对应客户端或开启新会话。应用只管理自身创建且未被外部修改的条目。换机器或安装位置后更新配置，不要照搬开发者的绝对路径。
+在「设置 → Agent 标准库 → 知识库共享 → 本机 MCP 安装」选择 Codex、Claude Code 或 .agents 兼容客户端并安装，也可复制连接片段手动配置。应用会迁移自身安装且未被修改的旧条目。安装或迁移后，重新启动对应客户端以加载新配置。
 
 | 工具 | 用途 |
 |---|---|
@@ -222,9 +222,9 @@ Excel 可使用 `raw_list_sheets`、`raw_search_sheet` 和 `raw_read_sheet` 获�
 
 v2 保留旧四个工具名与输入参数；search 的旧字段仍在。get/list 的输出从无界 JSON 改为分页文本，不适合继续用旧 JSON 解析器处理。离线检索评测与 10/30MiB 合成基准见 [评测说明](kb-evaluation.md)。
 
-MCP 不提供 Workspace 写入、任意原始文件读取或会话操作。它直接读取发布目录，不打开 SQLite，也不需要桌面 HTTP Token；未发布时会返回明确错误。连接片段可能使用 Electron 的 Node 模式，也可使用外部 Node ≥20 运行独立 CJS 产物。
+MCP 提供知识库只读工具，直接读取发布目录与同步清单。连接使用独立的 Bearer 令牌。未发布标准库时，查询标准库会返回明确错误。
 
-stdio MCP 是可信本地进程间连接。需要让其他设备查询时，在「设置 → Agent 标准库 → 知识库共享」显式开启独立内网 HTTP 网关；默认关闭，主应用仍只监听回环地址。使用独立 Bearer，只读标准库与原始库，与本机范围一致，不接受 desktop/CLI 令牌。HTTP 未加密，只在可信网络使用；公网暴露、自动端口映射与系统防火墙修改均不提供。接入配置、轮换与排障见 [内网共享说明](kb-lan-mcp.md)。不要把“只读”理解成操作系统级隔离。
+本机 MCP 固定监听 `http://127.0.0.1:47392/mcp`。需要让其他设备查询时，在「设置 → Agent 标准库 → 知识库共享」开启独立的内网 HTTP 网关。内网网关默认关闭，使用独立令牌，资料范围与本机一致。HTTP 未加密，仅在可信网络使用。接入配置、令牌轮换和排障见 [内网共享说明](kb-lan-mcp.md)。
 
 ## 命令行访问
 

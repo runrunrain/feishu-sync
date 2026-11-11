@@ -35,6 +35,60 @@ async function connect(url: string, token: string) {
   await client.connect(transport); closers.push(() => client.close()); return { client, transport };
 }
 
+it('local HTTP MCP keeps the same address across both desktop exit policies', async () => {
+  const root = temporary(), kb = path.join(root, 'standard');
+  vi.stubEnv('FEISHU_SYNC_HOME', root);
+  publish(kb, 'r1');
+  const configPath = path.join(root, 'config.json');
+  fs.writeFileSync(configPath, JSON.stringify({ standardKb: { outputRoot: kb }, cli: { enabled: false } }));
+  const { startServer } = await import('../src/index.js');
+  const token = 'standalone-policy-desktop';
+  const localMcpPort = await freePort();
+  const initialize = vi.spyOn(LocalMapStore.prototype, 'initialize');
+  const openDesktop = async () => startServer({ configPath, desktopMode: true, desktopToken: token, port: 0, localMcpPort });
+  closers.push(async () => {
+    const stores = [...initialize.mock.contexts];
+    initialize.mockRestore();
+    for (const store of stores) (store as LocalMapStore).close();
+  });
+  // Ensure the detached fixture exits even if an assertion fails.
+  const endpoint = `http://127.0.0.1:${localMcpPort}/mcp`;
+  closers.push(async () => {
+    const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    fs.writeFileSync(configPath, JSON.stringify({ ...config, allowStandaloneKbMcp: false }));
+    await vi.waitFor(async () => await expect(fetch(endpoint, { method: 'HEAD' })).rejects.toThrow(), { timeout: 4000 });
+  });
+  const first = await openDesktop();
+  closers.push(first.close);
+  const info = async (url: string) => (await fetch(url + '/api/kb/mcp', { headers: { 'X-Desktop-Token': token } })).json();
+  await vi.waitFor(async () => expect((await info(first.url)).available).toBe(true), { timeout: 8000 });
+  const settings = await info(first.url);
+  expect(settings.url).toBe(endpoint);
+  const localToken = settings.headers.Authorization.split(' ')[1];
+  const local = await connect(endpoint, localToken);
+  expect((await local.client.listTools()).tools.length).toBeGreaterThan(0);
+  await first.close();
+  const offline = await connect(endpoint, localToken);
+  expect((await offline.client.listTools()).tools.length).toBeGreaterThan(0);
+
+  const main = await openDesktop();
+  closers.push(main.close);
+  const save = async (allowStandaloneKbMcp: unknown) => fetch(main.url + '/api/config', {
+    method: 'PUT', headers: { 'X-Desktop-Token': token, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ allowStandaloneKbMcp }),
+  });
+  expect((await save('false')).status).toBe(400);
+  const saved = await save(false);
+  expect(saved.status).toBe(200);
+  expect((await saved.json()).config.allowStandaloneKbMcp).toBe(false);
+  expect(JSON.parse(fs.readFileSync(configPath, 'utf8')).allowStandaloneKbMcp).toBe(false);
+  const desktopOnly = await connect(endpoint, localToken);
+  expect((await desktopOnly.client.listTools()).tools.length).toBeGreaterThan(0);
+  await main.close();
+  await expect(desktopOnly.client.listTools()).rejects.toThrow();
+  await expect(connect(endpoint, localToken)).rejects.toThrow();
+}, 30000);
+
 it('application startup snapshots actual indexed outgoing and incoming references for MCP', async () => {
   const root = temporary(), raw = path.join(root, 'raw'); fs.mkdirSync(raw); vi.stubEnv('FEISHU_SYNC_HOME', root);
   fs.writeFileSync(path.join(raw, '来源.md'), '# 来源'); fs.writeFileSync(path.join(raw, '目标.md'), '# 目标');

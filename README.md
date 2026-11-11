@@ -44,7 +44,7 @@
 - **LLM 适配**：direct 单通道（OpenAI SDK，默认智谱 bigmodel GLM，`glm-4-flash` 免费档起步），风格对齐失败时回退确定性结果
 - **自定义归档**：结构树之外的零散云文档快捷归档到 `_custom/<文件夹>/`，支持云端变更检测；手工放入的文件在全量重建时自动纳管并回填归属
 - **智能体工作台**：标准知识库构建与版本管理（Pi 多角色编排、增量构建、断点恢复、发布门与构建度量），Discuss/Work 会话、任务编排与插件管理
-- **知识库共享**：本机 stdio MCP 与可信局域网 MCP，同一套 20 个只读工具检索、阅读原始库与已发布标准库，见 [docs/kb-lan-mcp.md](./docs/kb-lan-mcp.md)
+- **知识库共享**：本机 HTTP MCP 与可信局域网 MCP，共用 20 个只读工具检索、阅读原始库与已发布标准库，见 [docs/kb-lan-mcp.md](./docs/kb-lan-mcp.md)
 - **命令行访问**：默认开启 `feishu-sync` CLI 并生成命令入口，内置 Skill 可安装到 `.agents` / Claude Code / Codex，命令面见 [docs/cli-reference.md](./docs/cli-reference.md)
 - **写回与发布**：源文档本地编辑经确认写回飞书（`feishuWrite`，默认关）；标准库反向发布到飞书知识库（`feishuPublish`，默认关），见 [docs/feishu-publish.md](./docs/feishu-publish.md)
 - **双视图与预览**：节点树支持飞书结构视图 / 本地目录视图；表格优先预览 Excel 画板，保留行列尺寸、合并区域、字体底色和图片位置，支持工作表切换与缩放

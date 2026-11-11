@@ -36,6 +36,8 @@ import { kbLanMcpRoutes } from './routes/kb-lan-mcp.js';
 import { kbMcpInstallRoutes } from './routes/kb-mcp-install.js';
 import { McpClientInstaller } from './kb/mcp-client-installer.js';
 import { kbMcpInfo } from './kb/mcp-info.js';
+import { createDesktopMcpPresence, KB_MCP_INSTANCE_HEADER } from './kb/local-mcp-policy.js';
+import { LocalMcpService } from './kb/local-mcp-service.js';
 import { rawCatalogPath, writeRawCatalog } from './kb/raw-mcp-catalog.js';
 import { cliAdminRoutes } from './routes/cli-admin.js';
 import { CliLocalInstaller } from './cli/local-install.js';
@@ -89,6 +91,8 @@ export interface CreateServerOptions {
   desktopMode?: boolean;
   desktopToken?: string;
   configPath?: string;
+  /** An isolated port for embedded applications and integration tests. */
+  localMcpPort?: number;
   /** Desktop bootstrap enables defaults. Embedded callers can supply an isolated home. */
   cliLocalInstall?: { defaults?: boolean; homeDir?: string };
   /**
@@ -238,6 +242,13 @@ export async function buildServer(options: CreateServerOptions = {}) {
   // ===========================================================================
   console.info('[server] Initializing Agent knowledge modules');
   const agentDataRoot = resolveDataRoot();
+  const desktopMcpPresence = desktopMode ? createDesktopMcpPresence(agentDataRoot) : undefined;
+  const localMcp = desktopMode && (!process.env.VITEST || options.localMcpPort !== undefined)
+    ? new LocalMcpService(agentDataRoot, () => configManager.getConfig()!.standardKb.outputRoot, options.localMcpPort)
+    : undefined;
+  const localMcpInfo = () => localMcp?.info()
+    ?? kbMcpInfo(configManager.getConfig()!.standardKb.outputRoot, rawCatalogPath(agentDataRoot));
+  const mcpInstaller = new McpClientInstaller({ dataRoot: agentDataRoot, info: localMcpInfo });
 
   const runtimeResolver = new PiRuntimeResolver();
   const agentPool = new AgentProcessPool({
@@ -601,6 +612,16 @@ export async function buildServer(options: CreateServerOptions = {}) {
   // Register Public Routes (no auth required)
   // ============================================================================
 
+  if (desktopMcpPresence) {
+    app.use('/api/health', async (c, next) => {
+      await next();
+      const candidate = c.req.header(KB_MCP_INSTANCE_HEADER);
+      if (candidate && desktopMcpPresence.matches(candidate)) {
+        c.header(KB_MCP_INSTANCE_HEADER, candidate);
+        c.header('Cache-Control', 'no-store');
+      }
+    });
+  }
   app.route('/', healthRoutes); // Health check is always public (must be before auth middleware)
   console.info('[server] Health routes registered');
 
@@ -651,7 +672,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
 
   app.route('/', kbLanMcpRoutes({ manager: kbLanGateway, desktopToken }));
   app.route('/', kbMcpInstallRoutes({
-    installer: new McpClientInstaller({ dataRoot: agentDataRoot, info: () => kbMcpInfo(configManager.getConfig()!.standardKb.outputRoot, rawCatalogPath(agentDataRoot)) }),
+    installer: mcpInstaller,
     desktopToken,
   }));
   app.route('/', configRoutes);
@@ -696,6 +717,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
     documentsProvider: knowledgeDocuments,
     sheetCsvPaths,
     buildRuntime: buildRuntimeHost,
+    localMcpInfo,
   }));
   // P1-S8（设计 P1 §4.6）：反向发布 API（计划/执行/列表/详情/发布根）。
   app.route('/', kbPublicationsRoutes({
@@ -730,6 +752,9 @@ export async function buildServer(options: CreateServerOptions = {}) {
   (app as any).__agentPool = agentPool;
   (app as any).__agentToolService = agentToolService;
   (app as any).__cliEndpoint = cliEndpoint;
+  (app as any).__desktopMcpPresence = desktopMcpPresence;
+  (app as any).__startLocalMcp = () => localMcp?.start(() => mcpInstaller.migrateManaged());
+  (app as any).__closeLocalMcp = () => localMcp?.close(configManager.getConfig()?.allowStandaloneKbMcp !== false);
   (app as any).__kbLanGateway = kbLanGateway;
   // F10/ENOTEMPTY：服务级关闭链（与 startServer.close 同一实现；裸 buildServer
   // 的测试/嵌入方必须调 __shutdownServices 而不是只关 HTTP——否则活动构建的
@@ -805,6 +830,13 @@ export async function startServer(options: CreateServerOptions & {
   const setPort = (app as any).__setAgentInternalPort as ((port: number) => void) | undefined;
   setPort?.(actualPort);
 
+  const desktopMcpPresence = (app as any).__desktopMcpPresence as ReturnType<typeof createDesktopMcpPresence> | undefined;
+  try {
+    desktopMcpPresence?.publish(actualPort);
+  } catch (error) {
+    console.warn('[server] Local MCP desktop presence publish failed:', error);
+  }
+
   // S8：记录服务 URL 并在 cli.enabled 时发布 CLI 端点文件
   const cliEndpoint = (app as any).__cliEndpoint as
     { onServerStarted: (url: string) => void } | undefined;
@@ -821,6 +853,11 @@ export async function startServer(options: CreateServerOptions & {
     catch { console.warn('[server] raw MCP catalog refresh failed'); }
   };
   refreshRawCatalog();
+  try {
+    (app as any).__startLocalMcp?.();
+  } catch {
+    console.warn('[server] Local MCP initialization failed');
+  }
   const rawCatalogTimer = setInterval(refreshRawCatalog, 10_000);
   rawCatalogTimer.unref();
   void kbLanGateway.start().catch(() => console.warn('[server] LAN MCP gateway startup failed'));
@@ -829,10 +866,18 @@ export async function startServer(options: CreateServerOptions & {
   const close = async () => {
     if (closed) return;
     closed = true;
+    try {
+      desktopMcpPresence?.clear();
+    } catch (error) {
+      console.warn('[server] Local MCP desktop presence cleanup failed:', error);
+    }
+    const closeLocalMcp = ((app as any).__closeLocalMcp?.() as Promise<void> | undefined)
+      ?.catch(() => console.warn('[server] Local MCP shutdown failed'));
     clearInterval(rawCatalogTimer);
     // S12/F10：服务级关闭统一链（取消知识构建并等 OS 级收口 → 批准/轮询器
     // → agent 池 → LAN 网关）；HTTP 随后关闭，CLI 端点最后撤销。
     const shutdownReport = await shutdownServices(app);
+    await closeLocalMcp;
     if (shutdownReport && !shutdownReport.quiesced) {
       // 修正轮：未 OS 级收口如实暴露——不删任何运行目录、不发裸 PID 信号，
       // 保留现场交重启 reconcileOnStartup 对账。

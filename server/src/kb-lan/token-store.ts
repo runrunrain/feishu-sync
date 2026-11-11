@@ -16,11 +16,11 @@ interface TokenFile { v: 1; tokens: Array<{ id: string; token: string; createdAt
 export class LanTokenStore {
   readonly directory: string;
   readonly file: string;
-  constructor(readonly dataRoot: string) {
+  constructor(readonly dataRoot: string, filename = 'kb-lan-mcp.json') {
     // Canonicalize the intentionally selected data root (macOS /var and /tmp
     // themselves are system symlinks); secrets and descendants may not redirect.
     this.directory = path.join(fs.realpathSync(dataRoot), 'secrets');
-    this.file = path.join(this.directory, 'kb-lan-mcp.json');
+    this.file = path.join(this.directory, filename);
   }
   private guard(): void {
     // Reject symlink ancestors, including a redirected secrets directory. No

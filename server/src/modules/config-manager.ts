@@ -861,6 +861,7 @@ const DEFAULT_CONFIG: Config = {
   // S12（additive）：飞书写回默认关闭（设计 §7.6）。
   cli: { enabled: true },
   kbLanMcp: defaultLanConfig(),
+  allowStandaloneKbMcp: true,
   // S12（additive）：飞书写回默认关闭；旧配置无此段时内存补默认。
   feishuWrite: { enabled: false },
   // P1-S8（additive）：反向发布默认关闭；旧配置无此段时内存补默认。
@@ -1242,6 +1243,9 @@ export class ConfigManager {
     // S8：cli 段严格校验（缺失不报错，非法类型拒绝）。
     validateCliConfig(partial.cli);
     if (partial.kbLanMcp !== undefined) validateLanConfig(partial.kbLanMcp);
+    if (partial.allowStandaloneKbMcp !== undefined && typeof partial.allowStandaloneKbMcp !== 'boolean') {
+      throw new InvalidConfigError([{ field: 'allowStandaloneKbMcp', code: 'invalid_type' }]);
+    }
     // S12：feishuWrite 段严格校验（同 S8 cli 模式；缺失不报错）。
     validateFeishuWriteConfig(partial.feishuWrite);
     // P1-S8：feishuPublish 段严格校验（同 S12 feishuWrite 模式；缺失不报错）。
@@ -1554,6 +1558,7 @@ export class ConfigManager {
       cli: normalizeCliConfigLoose(raw.cli),
       // Missing LAN settings are memory defaults only; never a migration trigger.
       kbLanMcp: normalizeLanConfig(raw.kbLanMcp),
+      allowStandaloneKbMcp: raw.allowStandaloneKbMcp === undefined || raw.allowStandaloneKbMcp === true,
       // S12（additive）：feishuWrite 段宽容归一——缺失/非法 → 默认关闭；
       // 同样不参与 _migrated 回写判定。
       feishuWrite: normalizeFeishuWriteConfigLoose(raw.feishuWrite),

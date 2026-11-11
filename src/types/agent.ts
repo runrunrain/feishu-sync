@@ -704,11 +704,8 @@ export interface KbBuildRuntimeInstallResultDto {
 /** §9.5 GET /api/kb/mcp */
 export interface KbMcpInfoDto {
   available: boolean;
-  command: string;
-  args: string[];
-  env: Record<string, string>;
-  alternative: { command: string; args: string[]; note: string };
   snippet: string;
+  url?: string;
 }
 
 // ---------------------------------------------------------------------------

@@ -22,6 +22,26 @@ function fixture() {
 function read(file: string) { return JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '')); }
 
 describe('用户级 MCP 安装与清理', () => {
+  it('migrates managed stdio entries to HTTP while preserving other client configuration', () => {
+    const f = fixture();
+    fs.mkdirSync(path.dirname(f.codex));
+    fs.writeFileSync(f.codex, '[mcp_servers.other]\ncommand = "another-tool"\n');
+    for (const target of ['agents', 'claude', 'codex'] as const) f.installer.install(target);
+    const url = 'http://127.0.0.1:47392/mcp';
+    const headers = { Authorization: 'Bearer fixture-only' };
+    const installer = new McpClientInstaller({
+      homeDir: f.home, dataRoot: f.dataRoot, info: () => ({ available: true, url, headers, snippet: '' }),
+    });
+    installer.migrateManaged();
+    expect(installer.status().map(({ state }) => state)).toEqual(['installed', 'installed', 'installed']);
+    for (const file of [f.agents, f.claude]) {
+      expect(read(file).mcpServers['feishu-kb']).toEqual({ type: 'http', url, headers });
+    }
+    const config = parseToml(fs.readFileSync(f.codex, 'utf8')) as any;
+    expect(config.mcp_servers['feishu-kb']).toEqual({ url, http_headers: headers });
+    expect(config.mcp_servers.other.command).toBe('another-tool');
+  });
+
   it('合并到 .agents 并只清理本应用条目，保留其他配置和换行格式', () => {
     const f = fixture(); fs.mkdirSync(path.dirname(f.agents));
     const original = '\uFEFF{\r\n  "notes": "keep exactly",\r\n  "mcpServers": {\r\n    "existing": { "command": "other", "args": ["a"] }\r\n  },\r\n  "unknown": {"x": 42}\r\n}\r\n';

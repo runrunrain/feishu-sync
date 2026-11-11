@@ -5,7 +5,9 @@ import type { KbMcpInfoDto } from '../types/agent';
 import type { McpClientTarget, McpInstallState, McpInstallStatus } from '../types/kb-mcp-install';
 import { writeClipboardText } from '../utils/clipboard';
 import { Button } from './common/Button';
+import { Toggle } from './common/Input';
 import { StatusBadge } from './common/StatusBadge';
+import { useSettingsDraft } from '../hooks/settingsDraft';
 
 const STATE_LABELS: Record<McpInstallState, string> = {
   not_installed: '未安装', installed: '已安装', needs_update: '需要更新',
@@ -14,6 +16,7 @@ const STATE_LABELS: Record<McpInstallState, string> = {
 
 /** Immediate local installation is separate from the general settings draft. */
 export function KbMcpLocalSettingsCard() {
+  const settings = useSettingsDraft();
   const [info, setInfo] = useState<KbMcpInfoDto | null>(null);
   const [targets, setTargets] = useState<McpInstallStatus[]>([]);
   const [target, setTarget] = useState<McpClientTarget>('agents');
@@ -60,6 +63,14 @@ export function KbMcpLocalSettingsCard() {
         </div>
       </header>
       <div className="p-4 space-y-3 text-xs text-ink-soft">
+        <Toggle
+          label="允许本机 MCP 独立运行"
+          ariaLabel="允许本机 MCP 独立运行"
+          checked={settings?.config?.allowStandaloneKbMcp ?? true}
+          disabled={!settings?.config || settings.saving}
+          onChange={(checked) => { void settings?.updateConfig({ allowStandaloneKbMcp: checked }); }}
+          helperText="开启后，从托盘退出仍保留本机 HTTP 服务。关闭后，退出应用会停止服务。"
+        />
         <div className="flex flex-wrap items-end gap-2">
           <label className="block min-w-44 space-y-1">
             <span>安装目标</span>
@@ -81,17 +92,16 @@ export function KbMcpLocalSettingsCard() {
             <span className="break-all font-mono select-text">{selected.path}</span>
           </div>
           {selected.message ? <p role="note" className="text-seal">{selected.message}</p> : null}
-          {info && !info.available ? <p role="note" className="text-seal">MCP 程序未就绪，暂无法安装。</p> : null}
+          {info && !info.available ? <p role="note" className="text-seal">本机 MCP 尚未开始监听，请稍后刷新。</p> : null}
         </div> : null}
-        <p>操作立即生效。清理仅删除本应用安装且未修改的条目。</p>
+        <p>已有受管理的配置会迁移到本机 HTTP。迁移或安装后，请重新启动对应客户端。</p>
         {feedback ? <p role={feedback.error ? 'alert' : 'status'} className={feedback.error ? 'text-seal-2' : 'text-jade'}>{feedback.text}</p> : null}
-        {info ? <details className="border-t border-line/60 pt-3">
+        {info?.snippet ? <details className="border-t border-line/60 pt-3">
           <summary className="cursor-pointer font-medium text-ink">手动配置</summary>
           <div className="relative mt-2">
             <pre aria-label="本地 MCP 配置" className="max-h-48 overflow-auto scrollbar-thin rounded border border-line bg-paper/50 p-3 text-[11px] leading-relaxed select-text">{info.snippet}</pre>
             <Button size="sm" variant="secondary" className="absolute right-2 top-2" onClick={() => void copy()}><Copy className="w-3.5 h-3.5" />复制</Button>
           </div>
-          <p className="mt-2">应用关闭后，客户端使用上次刷新时的源文档清单。</p>
         </details> : null}
       </div>
     </section>

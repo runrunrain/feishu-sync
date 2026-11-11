@@ -36,6 +36,7 @@ export interface Config {
   /** F2 Agent 标准知识库（设计 §5.2；旧配置缺省时由服务端补默认值）。 */
   agent?: AgentConfig;
   standardKb?: StandardKbConfig;
+  allowStandaloneKbMcp?: boolean;
   /** S12 飞书写回开关段（默认关；服务端校验，缺省视为 false）。 */
   feishuWrite?: { enabled: boolean };
   /** P1-S8/S9 反向发布段（默认关；与 feishuWrite 同只接受 desktop 链路修改，

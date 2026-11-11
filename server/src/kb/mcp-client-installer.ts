@@ -157,14 +157,22 @@ function codexBlockRange(text: string, installId: string): { start: number; end:
 }
 
 function codexBlock(entry: Record<string, unknown>, installId: string, newline: string): string {
-  const env = entry.env as Record<string, string>;
+  const transport = typeof entry.url === 'string'
+    ? [
+      `url = ${JSON.stringify(entry.url)}`,
+      '[mcp_servers."feishu-kb".http_headers]',
+      ...Object.entries(entry.http_headers as Record<string, string>).map(([key, value]) => `${JSON.stringify(key)} = ${JSON.stringify(value)}`),
+    ]
+    : [
+      `command = ${JSON.stringify(entry.command)}`,
+      `args = ${JSON.stringify(entry.args)}`,
+      '[mcp_servers."feishu-kb".env]',
+      ...Object.entries(entry.env as Record<string, string>).map(([key, value]) => `${JSON.stringify(key)} = ${JSON.stringify(value)}`),
+    ];
   return [
     `# feishu-sync-mcp begin ${installId}`,
     '[mcp_servers."feishu-kb"]',
-    `command = ${JSON.stringify(entry.command)}`,
-    `args = ${JSON.stringify(entry.args)}`,
-    '[mcp_servers."feishu-kb".env]',
-    ...Object.entries(env).map(([key, value]) => `${JSON.stringify(key)} = ${JSON.stringify(value)}`),
+    ...transport,
     `# feishu-sync-mcp end ${installId}`,
     '',
   ].join(newline);
@@ -226,7 +234,12 @@ export class McpClientInstaller {
     }
     return { before, data: data as unknown as Registry };
   }
-  private entry(info: KbMcpInfoDto, installId: string): Record<string, unknown> {
+  private entry(target: McpClientTarget, info: KbMcpInfoDto, installId: string): Record<string, unknown> {
+    if ('url' in info) {
+      return target === 'codex'
+        ? { url: info.url, http_headers: info.headers }
+        : { type: 'http', url: info.url, headers: info.headers };
+    }
     // Per-install marker prevents an old registry record claiming a new user entry.
     return { command: info.command, args: info.args, env: { ...info.env, FEISHU_SYNC_MCP_INSTALL_ID: installId } };
   }
@@ -241,7 +254,7 @@ export class McpClientInstaller {
       if (!owned || owned.path !== file) return { target, path: file, state: 'conflict', message: '已有同名配置，应用不会覆盖或清理。' };
       if (digest(current) !== owned.digest) return { target, path: file, state: 'modified', message: '配置已被其他程序或用户修改，应用不会覆盖或清理。' };
       if (target === 'codex' && !codexBlockRange(parsed.text, owned.installId)) return { target, path: file, state: 'modified', message: 'Codex 安装标记已被修改，应用不会覆盖或清理。' };
-      return { target, path: file, state: digest(current) === digest(this.entry(info, owned.installId)) ? 'installed' : 'needs_update' };
+      return { target, path: file, state: digest(current) === digest(this.entry(target, info, owned.installId)) ? 'installed' : 'needs_update' };
     } catch (error) {
       return { target, path: file, state: 'invalid', message: error instanceof McpInstallError ? error.message : '无法读取配置文件。' };
     }
@@ -250,6 +263,13 @@ export class McpClientInstaller {
     const { data } = this.registry();
     const info = this.options.info();
     return (['agents', 'claude', 'codex'] as const).map((target) => this.inspect(target, data, info));
+  }
+  migrateManaged(): void {
+    for (const { target, state } of this.status()) {
+      if (state !== 'needs_update') continue;
+      try { this.install(target); }
+      catch { console.warn(`[local MCP] Could not update the managed ${target} configuration`); }
+    }
   }
   install(target: McpClientTarget): McpInstallStatus {
     const file = this.targetPath(target);
@@ -269,7 +289,7 @@ export class McpClientInstaller {
     if (present !== undefined && (!owned || owned.path !== file || digest(present) !== owned.digest)) return problem('concurrent_change', '配置刚刚发生变化，请刷新后重试。');
     const stillOwned = present !== undefined && owned?.path === file;
     const installId = stillOwned ? owned.installId : crypto.randomUUID();
-    const entry = this.entry(info, installId);
+    const entry = this.entry(target, info, installId);
     const nextText = target === 'codex' ? patchCodex(parsed.text, entry, installId, stillOwned) : ('bom' in parsed ? parsed.bom : '') + patchConfig(parsed.text, entry);
     const next: Registry = { version: 1, entries: { ...registry.data.entries, [target]: { path: file, digest: digest(entry), installId, createdServers: stillOwned ? owned.createdServers : target === 'codex' ? false : (parsed as ReturnType<typeof parseConfig>).data.mcpServers === undefined } } };
     this.commit(file, before, nextText, registry.before, next);

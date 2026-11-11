@@ -90,6 +90,8 @@ export interface Config {
   cli?: CliConfig;
   /** 内网只读 MCP，共享开关仅走 desktop 专用管理路由。 */
   kbLanMcp?: KbLanMcpConfig;
+  /** 允许本机 stdio MCP 在应用退出后独立运行，旧配置默认为开启。 */
+  allowStandaloneKbMcp?: boolean;
   /** 飞书写回（S12，additive，可选：旧配置内存补默认 enabled=false）。 */
   feishuWrite?: FeishuWriteConfig;
   /** 反向发布（P1-S8，additive，可选：旧配置内存补默认 enabled=false）。 */
