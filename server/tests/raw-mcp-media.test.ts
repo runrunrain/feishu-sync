@@ -166,7 +166,7 @@ it('keeps Pi worksheet pages within its byte budget while returning every reques
   await wb.xlsx.writeFile(workbook);
   const client = new Client({ name: 'pi', version: '1' });
   try {
-    await client.connect(new StdioClientTransport({ command: process.execPath, args: [path.resolve('dist/mcp/kb-mcp.cjs'), '--kb-root', path.join(root, 'standard'), '--raw-catalog', catalog], stderr: 'pipe' }));
+    await client.connect(new StdioClientTransport({ command: process.execPath, args: [path.resolve('dist/mcp/kb-mcp.cjs'), '--data-root', root, '--kb-root', path.join(root, 'standard'), '--raw-catalog', catalog], stderr: 'pipe' }));
     let offset = 0, contentHash: string | undefined, pages = 0; const addresses: string[] = [];
     do {
       const result = await client.callTool({ name: 'raw_read_sheet', arguments: { objToken: 'src', sheet: '设计', startRow: 10, endRow: 69,
@@ -195,7 +195,7 @@ it('real bundled stdio and LAN gateway return identical workbooks, images and re
       const start = Date.now(); const tick = () => { if (logs.includes('"type":"ready"')) resolve();
         else if (gateway.exitCode !== null || Date.now() - start > 8000) reject(new Error('gateway failed to start')); else setTimeout(tick, 25); }; tick();
     });
-    await local.connect(new StdioClientTransport({ command: process.execPath, args: [path.resolve('dist/mcp/kb-mcp.cjs'), '--kb-root', path.join(root, 'standard'), '--raw-catalog', catalog], stderr: 'pipe' }));
+    await local.connect(new StdioClientTransport({ command: process.execPath, args: [path.resolve('dist/mcp/kb-mcp.cjs'), '--data-root', root, '--kb-root', path.join(root, 'standard'), '--raw-catalog', catalog], stderr: 'pipe' }));
     await remote.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`), { requestInit: { headers: { Authorization: `Bearer ${token}` } } }));
     expect((await local.listTools()).tools).toEqual((await remote.listTools()).tools);
     for (const [name, args] of [

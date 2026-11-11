@@ -116,7 +116,7 @@ it('real stdio and authenticated HTTP expose identical raw tools/results, matchi
   const local = new Client({ name: 'raw-test', version: '1' }), remote = new Client({ name: 'raw-test', version: '1' });
   try {
     await gateway.listen();
-    await local.connect(new StdioClientTransport({ command: process.execPath, args: [path.resolve('dist/mcp/kb-mcp.cjs'), '--kb-root', standard.kbRoot, '--raw-catalog', catalog], stderr: 'pipe' }));
+    await local.connect(new StdioClientTransport({ command: process.execPath, args: [path.resolve('dist/mcp/kb-mcp.cjs'), '--data-root', root, '--kb-root', standard.kbRoot, '--raw-catalog', catalog], stderr: 'pipe' }));
     await remote.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${(gateway.server.address() as AddressInfo).port}/mcp`), { requestInit: { headers: { Authorization: `Bearer ${token}` } } }));
     expect((await local.listTools()).tools).toEqual((await remote.listTools()).tools);
     expect((await local.listTools()).tools).toHaveLength(20);
@@ -147,7 +147,7 @@ it('combined search preserves both sources and independent pagination', async ()
   writeSearchRelease(standard, 'r_test', [{ path: '规则甲.md', body: '# 战斗规则甲\n战斗规则甲' }, { path: '规则乙.md', body: '# 战斗规则乙\n战斗规则乙' }]);
   const client = new Client({ name: 'combined-test', version: '1' });
   try {
-    await client.connect(new StdioClientTransport({ command: process.execPath, args: [path.resolve('dist/mcp/kb-mcp.cjs'), '--kb-root', standard, '--raw-catalog', catalog], stderr: 'pipe' }));
+    await client.connect(new StdioClientTransport({ command: process.execPath, args: [path.resolve('dist/mcp/kb-mcp.cjs'), '--data-root', root, '--kb-root', standard, '--raw-catalog', catalog], stderr: 'pipe' }));
     const tool = (await client.listTools()).tools.find((item) => item.name === 'search_all_knowledge');
     expect(tool?.outputSchema).toBeDefined();
     const call = async (args: Record<string, unknown>) => {
