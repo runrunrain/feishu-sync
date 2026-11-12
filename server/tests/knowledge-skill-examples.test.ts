@@ -75,7 +75,7 @@ function validateAgainstSchema(value: unknown, schema: JsonSchemaLike, pathLabel
 /** 提取 md 中全部 ```json 代码块。 */
 function extractJsonBlocks(markdown: string): string[] {
   const blocks: string[] = [];
-  for (const match of markdown.matchAll(/```json\n([\s\S]*?)```/g)) {
+  for (const match of markdown.matchAll(/```json\r?\n([\s\S]*?)```/g)) {
     blocks.push(match[1]!.trim());
   }
   return blocks;

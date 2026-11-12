@@ -75,7 +75,7 @@ export async function runCli(options: CliOptions): Promise<void> {
       missing.unshift(path.basename(ancestor));
       ancestor = path.dirname(ancestor);
     }
-    const plannedOut = path.join(fs.realpathSync(ancestor), ...missing);
+    const plannedOut = path.join(fs.realpathSync.native(ancestor), ...missing);
     if (isPathInside(release.dir, plannedOut)) throw new Error('out_inside_release: input is immutable');
     ranker = options.ranker === 'lex-v1' ? await createLexRanker(release) : createBaselineRanker(options.ranker, release);
     const preparationMs = performance.now() - start;
@@ -90,7 +90,7 @@ export async function runCli(options: CliOptions): Promise<void> {
     // Reports cannot be placed inside a release; preserve previous evidence on reruns.
     if (fs.existsSync(options.out) && fs.readdirSync(options.out).length) throw new Error('out_not_empty: choose a new report directory');
     fs.mkdirSync(options.out, { recursive: true });
-    const outReal = fs.realpathSync(options.out);
+    const outReal = fs.realpathSync.native(options.out);
     if (isPathInside(release.dir, outReal)) throw new Error('out_inside_release: input is immutable');
     fs.writeFileSync(path.join(outReal, 'report.json'), JSON.stringify(report, null, 2) + '\n', { flag: 'wx' });
     fs.writeFileSync(path.join(outReal, 'report.md'), reportMarkdown(report), { flag: 'wx' });

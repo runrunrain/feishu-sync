@@ -59,6 +59,8 @@ import { agentInternalRoutes } from './routes/agent-internal.js';
 import { VisionDescriber } from './agent/vision/vision-describer.js';
 import { agentRoutes } from './routes/agent.js';
 import { kbRoutes } from './routes/kb.js';
+import { kbDistributionRoutes } from './routes/kb-distribution.js';
+import { WebShareService } from './kb/web-share.js';
 import { PiRuntimeResolver } from './agent/runtime-resolver.js';
 import { AgentProcessPool } from './agent/agent-process-pool.js';
 import { AgentToolService } from './agent/agent-tool-service.js';
@@ -93,6 +95,8 @@ export interface CreateServerOptions {
   configPath?: string;
   /** An isolated port for embedded applications and integration tests. */
   localMcpPort?: number;
+  /** Isolate the read-only sharing listener in embedded servers and tests. */
+  webShare?: { port: number; hostname: string };
   /** Desktop bootstrap enables defaults. Embedded callers can supply an isolated home. */
   cliLocalInstall?: { defaults?: boolean; homeDir?: string };
   /**
@@ -512,6 +516,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
   });
 
   const kbLanGateway = new KbLanGatewayManager({ dataRoot: agentDataRoot, config: configManager });
+  const kbWebShares = new WebShareService(path.join(agentDataRoot, 'web-shares'), options.webShare?.port, options.webShare?.hostname);
 
   // Create Hono app
   console.info('[server] Creating Hono app');
@@ -710,6 +715,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
     approvalService,
     ...(tasks.service ? { taskService: tasks.service } : {}),
   }));
+  app.route('/', kbDistributionRoutes(configManager, kbWebShares));
   app.route('/', kbRoutes({
     buildService: kbBuildService,
     configManager,
@@ -756,6 +762,7 @@ export async function buildServer(options: CreateServerOptions = {}) {
   (app as any).__startLocalMcp = () => localMcp?.start(() => mcpInstaller.migrateManaged());
   (app as any).__closeLocalMcp = () => localMcp?.close(configManager.getConfig()?.allowStandaloneKbMcp !== false);
   (app as any).__kbLanGateway = kbLanGateway;
+  (app as any).__kbWebShares = kbWebShares;
   // F10/ENOTEMPTY：服务级关闭链（与 startServer.close 同一实现；裸 buildServer
   // 的测试/嵌入方必须调 __shutdownServices 而不是只关 HTTP——否则活动构建的
   // Leader/子任务/桥被孤儿化，异步写者在删目录/退进程期间继续写盘）。
@@ -861,6 +868,7 @@ export async function startServer(options: CreateServerOptions & {
   const rawCatalogTimer = setInterval(refreshRawCatalog, 10_000);
   rawCatalogTimer.unref();
   void kbLanGateway.start().catch(() => console.warn('[server] LAN MCP gateway startup failed'));
+  void ((app as any).__kbWebShares as WebShareService).resume().catch(() => console.warn('[server] Web sharing startup failed'));
 
   let closed = false;
   const close = async () => {
@@ -933,6 +941,11 @@ export async function startServer(options: CreateServerOptions & {
     } catch (error) {
       console.warn('[server] CLI endpoint revoke failed:', error);
     }
+    // Embedded servers remain in the same process after close(). Release the
+    // database handle only after services and HTTP consumers have quiesced.
+    if (shutdownReport?.quiesced !== false) {
+      ((app as any).__localMapStore as LocalMapStore | undefined)?.close();
+    }
   };
 
   return {
@@ -957,6 +970,7 @@ export async function startServer(options: CreateServerOptions & {
  * buildServer 消费方自行关 HTTP）。
  */
 export async function shutdownServices(app: Hono): Promise<KbShutdownReport | null> {
+  await ((app as any).__kbWebShares as WebShareService | undefined)?.close();
   const kbBuild = (app as any).__kbBuildService as
     | { shutdown: (store: unknown, options?: { timeoutMs?: number }) => Promise<KbShutdownReport> }
     | undefined;

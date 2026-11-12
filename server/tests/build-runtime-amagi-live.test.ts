@@ -77,7 +77,10 @@ it('真实 Git 获取→冻结安装→状态已装→重复完整校验（官�
   // 真实执行：官方 31 冻结包的 LSP CLI 必须能跑通（相对 package.json 定位不漂移）。
   // 前一版字节拷贝实测 ENOENT exit 1（Leader 真机 + /tmp 复现）；转发 shim 后应为 6.0.0。
   const { execFileSync } = await import('node:child_process');
-  const versionOut = execFileSync(lspBin, ['--version'], { encoding: 'utf-8', timeout: 60_000 }).trim();
+  const { requireBash, shellPath } = await import('./helpers/shell.js');
+  const versionOut = (process.platform === 'win32'
+    ? execFileSync(requireBash(), [shellPath(lspBin), '--version'], { encoding: 'utf-8', timeout: 60_000 })
+    : execFileSync(lspBin, ['--version'], { encoding: 'utf-8', timeout: 60_000 })).trim();
   expect(versionOut).toBe('6.0.0');
   expect(record.hashedFiles).toBeGreaterThan(1000); // 真实包（含依赖）量级锚点
   expect(record.hashedBytes).toBeGreaterThan(10 * 1024 * 1024);

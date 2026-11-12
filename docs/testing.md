@@ -13,8 +13,10 @@
 ## 环境注意
 
 1. **自动隔离数据目录**：`server/vitest.config.ts` 的 globalSetup 在测试模块装载前创建临时 `FEISHU_SYNC_HOME`，结束后清理；普通 `npm test` 与 `npx vitest run` 均不会使用真实 `~/.feishu-sync`。由 `test-environment.test.ts` 守护，单个测试另建 fixture 时也必须只用临时目录。
-2. **ABI 切换**：跑过桌面构建（`@electron/rebuild`）后需 `cd server && npm rebuild better-sqlite3` 恢复 Node ABI，否则直连 better-sqlite3 的用例报 `NODE_MODULE_VERSION` 不匹配。
+2. **ABI 切换**：`npm test` 和 `npm test --prefix server` 在运行前探测 SQLite；若桌面构建把原生模块切成 Electron ABI，会自动按当前 Node 重建对应副本并再次验证。直接运行 `npx vitest` 时不经过该钩子，需要自行 `npm rebuild better-sqlite3`（server 测试加 `--prefix server`）。安装包中的原生模块不受测试重建影响。
 3. **Node 24**：better-sqlite3 必须 ^12（11.x 在 Node 24 worker teardown 时崩溃，见 docs/development.md）。
+4. **并发与清理**：后端默认最多 4 个测试 worker，避免多核 Windows 同时启动大量子进程导致心跳误超时。真实服务器 fixture 必须等待关闭数据库与子进程；Windows 临时目录删除可用有上限的异步重试，不忽略删除失败。POSIX mode 断言仅适用于 POSIX 系统，链接隔离与令牌轮换在 Windows 仍照常验证。
+5. **Windows 脚本与路径**：Bash 语法及 npm POSIX shim 测试使用 Git for Windows 的 Bash，避免误选 `System32/bash.exe`（WSL）。真实 Pi fixture 保留 `ProgramFiles`，让其按正式发现规则找到 Git Bash。测试使用平台路径、支持 CRLF 的 Markdown 解析；评测 CLI 与产品检索统一使用 `realpathSync.native`，防止 Windows 8.3 路径别名被误判为版本漂移。
 
 ## 编写约定（既有模式，沿用）
 

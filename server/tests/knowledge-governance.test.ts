@@ -131,8 +131,11 @@ describe('决定：追加 / supersede / 并发 / 语义校验', () => {
     expect(decision.businessStatus).toBe('approved');
     expect(revision).toBe(1);
     const dir = path.join(service.outputRoot, '.governance');
-    expect((fs.statSync(dir).mode & 0o777).toString(8)).toBe('700');
-    expect((fs.statSync(path.join(dir, 'decisions.jsonl')).mode & 0o777).toString(8)).toBe('600');
+    // Windows chmod does not implement POSIX owner/group permission bits.
+    if (process.platform !== 'win32') {
+      expect((fs.statSync(dir).mode & 0o777).toString(8)).toBe('700');
+      expect((fs.statSync(path.join(dir, 'decisions.jsonl')).mode & 0o777).toString(8)).toBe('600');
+    }
     const view = service.listDecisions();
     expect(view.records).toHaveLength(1);
     expect(view.effective.map((item) => item.decisionId)).toEqual([decision.decisionId]);
@@ -263,7 +266,9 @@ describe('人工复核 / 快照 / 待治理联查', () => {
     const review = service.recordHumanReview({ objectId: 'ko_objA', reviewSubjectHash: objA.reviewSubjectHash, passed: true, reviewerId: '主上' });
     expect(review.reviewId).toMatch(/^kbr_[0-9a-f-]{36}$/);
     expect(service.humanReviews('ko_objA')).toHaveLength(1);
-    expect((fs.statSync(path.join(service.outputRoot, '.governance', 'human-reviews.jsonl')).mode & 0o777).toString(8)).toBe('600');
+    if (process.platform !== 'win32') {
+      expect((fs.statSync(path.join(service.outputRoot, '.governance', 'human-reviews.jsonl')).mode & 0o777).toString(8)).toBe('600');
+    }
     expect(() => service.recordHumanReview({ objectId: 'ko_objA', reviewSubjectHash: '', passed: true })).toThrow(ToolError);
   });
 

@@ -263,30 +263,30 @@ describe('writeAgentDirConfig / 哈希', () => {
 describe('buildForbiddenZones', () => {
   it('覆盖工作目录配置面 + 构建 agentDir home + 数据根敏感文件 + 原始库/标准库 + 用户 .pi', () => {
     const zones = buildForbiddenZones({
-      workDir: '/data/builds/b_x/work',
-      dataRoot: '/data',
-      knowledgeBaseRoot: '/kb/raw',
-      outputRoot: '/kb/std',
-      userHome: '/home/u',
+      workDir: path.resolve('/data/builds/b_x/work'),
+      dataRoot: path.resolve('/data'),
+      knowledgeBaseRoot: path.resolve('/kb/raw'),
+      outputRoot: path.resolve('/kb/std'),
+      userHome: path.resolve('/home/u'),
     });
-    expect(zones).toContain('/data/builds/b_x/work/amagi.json');
-    expect(zones).toContain('/data/builds/b_x/work/.pi');
-    expect(zones).toContain('/data/builds/b_x/work/.mcp.json');
-    expect(zones).toContain('/data/builds/b_x/work/AGENTS.md');
-    expect(zones).toContain('/data/builds/b_x/work/CLAUDE.md');
+    expect(zones).toContain(path.resolve('/data/builds/b_x/work/amagi.json'));
+    expect(zones).toContain(path.resolve('/data/builds/b_x/work/.pi'));
+    expect(zones).toContain(path.resolve('/data/builds/b_x/work/.mcp.json'));
+    expect(zones).toContain(path.resolve('/data/builds/b_x/work/AGENTS.md'));
+    expect(zones).toContain(path.resolve('/data/builds/b_x/work/CLAUDE.md'));
     // 构建 agentDir 配置/policy 精确禁区（不整目录禁 home：skill 正文须可读）
-    expect(zones).toContain('/data/builds/b_x/home/settings.json');
-    expect(zones).toContain('/data/builds/b_x/home/amagi.json');
-    expect(zones).toContain('/data/builds/b_x/home/models.json');
-    expect(zones).toContain('/data/builds/b_x/home/mcp.json');
-    expect(zones).toContain(`/data/builds/b_x/home/${childPolicyFileName()}`);
-    expect(zones).not.toContain('/data/builds/b_x/home');
-    expect(zones).toContain('/data/config.json');
-    expect(zones).toContain('/data/feishu-sync.db');
-    expect(zones).toContain('/data/run');
-    expect(zones).toContain('/kb/raw');
-    expect(zones).toContain('/kb/std');
-    expect(zones).toContain('/home/u/.pi');
+    expect(zones).toContain(path.resolve('/data/builds/b_x/home/settings.json'));
+    expect(zones).toContain(path.resolve('/data/builds/b_x/home/amagi.json'));
+    expect(zones).toContain(path.resolve('/data/builds/b_x/home/models.json'));
+    expect(zones).toContain(path.resolve('/data/builds/b_x/home/mcp.json'));
+    expect(zones).toContain(path.resolve(`/data/builds/b_x/home/${childPolicyFileName()}`));
+    expect(zones).not.toContain(path.resolve('/data/builds/b_x/home'));
+    expect(zones).toContain(path.resolve('/data/config.json'));
+    expect(zones).toContain(path.resolve('/data/feishu-sync.db'));
+    expect(zones).toContain(path.resolve('/data/run'));
+    expect(zones).toContain(path.resolve('/kb/raw'));
+    expect(zones).toContain(path.resolve('/kb/std'));
+    expect(zones).toContain(path.resolve('/home/u/.pi'));
     expect(new Set(zones).size).toBe(zones.length); // 去重有序
   });
 });

@@ -19,9 +19,9 @@ function temp(): string {
   tempRoots.push(dir);
   return dir;
 }
-afterEach(() => {
+afterEach(async () => {
   vi.restoreAllMocks();
-  for (const dir of tempRoots.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+  for (const dir of tempRoots.splice(0)) await fs.promises.rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 function sourceFixture() {

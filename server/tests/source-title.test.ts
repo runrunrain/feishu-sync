@@ -203,6 +203,7 @@ function makeFixture(opts: {
   return {
     kbRoot, dataRoot, store, lark, editService, titleService, writeService, pulls, kbActive, absPath,
     cleanup: () => {
+      store.close();
       fs.rmSync(kbRoot, { recursive: true, force: true });
       fs.rmSync(dataRoot, { recursive: true, force: true });
     },

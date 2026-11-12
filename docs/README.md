@@ -26,6 +26,7 @@
 | [kb-evaluation.md](./kb-evaluation.md) | 检索评测方法与 `kb-eval` 脚本 |
 | [cli-reference.md](./cli-reference.md) | CLI 命令全表、风险级、退出码与启用方式 |
 | [feishu-publish.md](./feishu-publish.md) | 标准库反向发布到飞书 |
+| [kb-document-sharing.md](./kb-document-sharing.md) | 指定标准库文档导出 Markdown、内网静态网页分享、链接跳转与返回基准文档 |
 | [source-cloud-operations.md](./source-cloud-operations.md) | 原始源的云端操作：历史回滚、移出、重命名与写回 |
 | [troubleshooting.md](./troubleshooting.md) | 故障排查 FAQ |
 

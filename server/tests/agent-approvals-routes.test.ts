@@ -18,8 +18,9 @@ import { buildServer } from '../src/index.js';
 import type { ApprovalService } from '../src/agent/approvals/approval-service.js';
 import type { SessionService } from '../src/agent/session-service.js';
 import type { Hono } from 'hono';
+import type { LocalMapStore } from '../src/modules/local-map-store.js';
 
-let app: Hono;
+let app: Hono & { __shutdownServices: () => Promise<unknown>; __localMapStore: LocalMapStore };
 let approvals: ApprovalService;
 let sessions: SessionService;
 let home: string;
@@ -55,7 +56,7 @@ function sseEvents(sid: string, event?: string): Array<{ id: number; event: stri
 
 beforeAll(async () => {
   home = isolateHome();
-  app = await buildServer({ desktopMode: false }) as unknown as Hono;
+  app = await buildServer({ desktopMode: false }) as typeof app;
   approvals = (app as unknown as { __approvalService: ApprovalService }).__approvalService;
   sessions = (app as unknown as { __agentSessionService: SessionService }).__agentSessionService;
   const created = await call('POST', '/api/agent/sessions', { title: '批准流测试' });
@@ -63,9 +64,11 @@ beforeAll(async () => {
   sessionId = created.json.id;
 });
 
-afterAll(() => {
-  approvals.close();
-  process.env.FEISHU_SYNC_HOME = previousHome;
+afterAll(async () => {
+  await app?.__shutdownServices();
+  app?.__localMapStore.close();
+  if (previousHome === undefined) delete process.env.FEISHU_SYNC_HOME;
+  else process.env.FEISHU_SYNC_HOME = previousHome;
   fs.rmSync(home, { recursive: true, force: true });
 });
 

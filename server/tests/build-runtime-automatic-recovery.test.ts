@@ -36,7 +36,7 @@ describe('application automatic orphan recovery', () => {
     expect(parseScopedProcesses('invalid output', ['/private/build/home'], 501)).toBeNull();
     // macOS pi process.title makes ps omit argv and environment entirely.
     expect(parseScopedProcesses('21 1 501 pi\n22 1 501 pi', ['/private/build/epochs/e2/home'], 501,
-      new Map([[21, '/private/build/epochs/e2/work'], [22, '/private/build-other/epochs/e2/work']])))
+      new Map([[21, path.resolve('/private/build/epochs/e2/work')], [22, path.resolve('/private/build-other/epochs/e2/work')]])))
       .toEqual([{ pid: 21, ppid: 1, uid: 501 }]);
   });
 

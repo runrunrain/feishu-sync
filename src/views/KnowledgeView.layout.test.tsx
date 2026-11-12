@@ -30,6 +30,7 @@ vi.mock('../components/preview/MarkdownView', () => ({ MarkdownView: ({ content,
   <p>{content}{content.startsWith('first') ? <a href="第二篇.md" onClick={(event) => { if (onNavigateDoc?.('第二篇.md')) event.preventDefault(); }}>阅读第二篇</a> : null}</p> }));
 vi.mock('../components/kb/RawSourceDrawer', () => ({ RawSourceDrawer: () => null }));
 vi.mock('../components/kb/KbTransferPanel', () => ({ KbTransferPanel: () => <p data-testid="kb-transfer-panel">本地共享与迁移</p> }));
+vi.mock('../components/kb/KbDocumentSharePanel', () => ({ KbDocumentSharePanel: () => <p>文档导出与内网分享</p> }));
 vi.mock('../api/client', () => {
   const changes = [{ key: 'a', title: '来源 A', path: '来源 A.md', kind: 'changed', beforeAvailable: true, patch: '-旧\n+新', additions: 1, deletions: 1, truncated: false }];
   const build = {

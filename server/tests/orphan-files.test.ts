@@ -21,6 +21,7 @@ import { scanOrphanFiles, cleanupOrphanFiles, type OrphanItem } from '../src/mod
 import type { WatchedRootConfig } from '../src/types/index.js';
 
 const temporaryDirectories: string[] = [];
+const stores: LocalMapStore[] = [];
 
 function createTempDir(prefix: string): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -29,6 +30,7 @@ function createTempDir(prefix: string): string {
 }
 
 afterEach(() => {
+  while (stores.length) stores.pop()!.close();
   while (temporaryDirectories.length > 0) {
     const dir = temporaryDirectories.pop();
     if (dir) fs.rmSync(dir, { recursive: true, force: true });
@@ -42,6 +44,7 @@ describe('purgeWatchedRootData', () => {
   it('级联清理目标根的 documents/sheets/pending/localDirs，其他根不受影响', () => {
     const dbPath = path.join(createTempDir('feishu-purge-'), 'db.sqlite');
     const store = new LocalMapStore(dbPath);
+    stores.push(store);
     store.initialize();
 
     const upsert = (objToken: string, watchedRootUrl: string) => {

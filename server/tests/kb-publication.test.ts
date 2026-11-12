@@ -17,6 +17,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Hono } from 'hono';
 import { describe, expect, it } from 'vitest';
 import Database from 'better-sqlite3';
@@ -1003,7 +1004,7 @@ describe('LocalMapStore — kb_publications 迁移与行方法', () => {
 
   it('双登记一致：applyAdditiveMigrations exec 与 getCreateTablesDDL 两处登记（源码级防漂移）', () => {
     const source = fs.readFileSync(
-      path.resolve(path.dirname(new URL(import.meta.url).pathname), '../src/modules/local-map-store.ts'),
+      fileURLToPath(new URL('../src/modules/local-map-store.ts', import.meta.url)),
       'utf-8',
     );
     const occurrences = source.match(/CREATE TABLE IF NOT EXISTS kb_publications/g) ?? [];

@@ -4,6 +4,7 @@
 // （node_modules 被 @electron/rebuild 重编译为 Electron ABI 后会报
 // NODE_MODULE_VERSION 不匹配，见根 CLAUDE.md「原生模块 ABI」）。
 import { defineConfig } from 'vitest/config'
+import { availableParallelism } from 'node:os'
 
 export default defineConfig({
   // Server tests do not transform CSS. Avoid loading the desktop root's
@@ -12,6 +13,10 @@ export default defineConfig({
   test: {
     include: ['tests/**/*.test.ts'],
     environment: 'node',
+    // Real process/socket fixtures must not compete with dozens of workers on
+    // high-core Windows hosts and miss their deliberately short heartbeats.
+    maxWorkers: Math.min(4, availableParallelism()),
+    minWorkers: 1,
     globalSetup: ['./tests/global-setup.ts'],
   },
 })

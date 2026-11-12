@@ -434,6 +434,11 @@ function unescapeInline(s: string): string {
 
 interface InlineContext {
   baseDir: string;
+  staticMode?: boolean;
+  headingIds?: Map<string, number>;
+  /** Static publishing resolves links and images without desktop credentials. */
+  resolveHref?: (href: string) => string | null;
+  resolveImage?: (src: string) => string | null;
   onNavigateCsv?: (href: string) => boolean;
   onNavigateDoc?: (href: string) => boolean;
   feishuHost?: string;
@@ -458,6 +463,12 @@ export function renderInline(text: string, keyPrefix: string, ctx: InlineContext
       const close = token.indexOf('](');
       const alt = unescapeInline(token.slice(2, close));
       const src = stripMdTitle(token.slice(close + 2, -1));
+      if (ctx.resolveImage) {
+        const resolved = ctx.resolveImage(src);
+        out.push(resolved ? <img key={key} src={resolved} alt={alt} loading="lazy" /> : <span key={key}>[图片不可用：{alt || src}]</span>);
+        last = idx + token.length;
+        continue;
+      }
       out.push(
         <AuthImage
           key={key}
@@ -473,7 +484,8 @@ export function renderInline(text: string, keyPrefix: string, ctx: InlineContext
       const close = token.indexOf('](');
       const label = unescapeInline(token.slice(1, close));
       const rawHref = stripMdTitle(token.slice(close + 2, -1));
-      const safeHref = sanitizeHref(rawHref);
+      const sanitized = sanitizeHref(rawHref);
+      const safeHref = sanitized && ctx.resolveHref ? ctx.resolveHref(sanitized) : sanitized;
       if (!safeHref) {
         out.push(<BlockedLink key={key} label={label} />);
       } else {
@@ -485,7 +497,7 @@ export function renderInline(text: string, keyPrefix: string, ctx: InlineContext
           <a
             key={key}
             href={safeHref}
-            target={isCsv || (isDoc && ctx.onNavigateDoc) ? undefined : '_blank'}
+            target={ctx.resolveHref && !isRemoteUrl(safeHref) || isCsv || (isDoc && ctx.onNavigateDoc) ? undefined : '_blank'}
             rel={isCsv || (isDoc && ctx.onNavigateDoc) ? undefined : 'noopener noreferrer'}
             onClick={(e) => {
               const handled = isCsv ? ctx.onNavigateCsv?.(safeHref) : isDoc ? ctx.onNavigateDoc?.(safeHref) : false;
@@ -596,7 +608,8 @@ export function renderInline(text: string, keyPrefix: string, ctx: InlineContext
       //     `https://…` 在首个 s 截断）
       const hrefM = token.match(/\bhref=(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i);
       const rawHref = hrefM ? hrefM[1] ?? hrefM[2] ?? hrefM[3] ?? '' : '';
-      const safeHref = sanitizeHref(rawHref);
+      const sanitized = sanitizeHref(rawHref);
+      const safeHref = sanitized && ctx.resolveHref ? ctx.resolveHref(sanitized) : sanitized;
       const inner = token.replace(/^<a\b[^>]*>/i, '').replace(/<\/a>$/i, '');
       // 标准库编译器插入的空锚点是定位标记，不是可点击链接。
       const anchorId = !hrefM && inner.trim() === ''
@@ -615,7 +628,7 @@ export function renderInline(text: string, keyPrefix: string, ctx: InlineContext
           <a
             key={key}
             href={safeHref}
-            target={isCsv || (isDoc && ctx.onNavigateDoc) ? undefined : '_blank'}
+            target={ctx.resolveHref && !isRemoteUrl(safeHref) || isCsv || (isDoc && ctx.onNavigateDoc) ? undefined : '_blank'}
             rel={isCsv || (isDoc && ctx.onNavigateDoc) ? undefined : 'noopener noreferrer'}
             onClick={(e) => {
               const handled = isCsv ? ctx.onNavigateCsv?.(safeHref) : isDoc ? ctx.onNavigateDoc?.(safeHref) : false;
@@ -1246,7 +1259,7 @@ function PagedMarkdownTable({ block, tableKey, ctx }: {
   const pageCount = Math.max(1, Math.ceil(total / TABLE_PAGE_SIZE));
   const currentPage = Math.min(page, pageCount - 1);
   const start = currentPage * TABLE_PAGE_SIZE;
-  const visibleRows = total > TABLE_PAGE_SIZE
+  const visibleRows = !ctx.staticMode && total > TABLE_PAGE_SIZE
     ? block.rows.slice(start, start + TABLE_PAGE_SIZE)
     : block.rows;
   return (
@@ -1278,7 +1291,7 @@ function PagedMarkdownTable({ block, tableKey, ctx }: {
           </tbody>
         </table>
       </div>
-      {total > TABLE_PAGE_SIZE && (
+      {!ctx.staticMode && total > TABLE_PAGE_SIZE && (
         <nav className="markdown-table-pagination" aria-label="表格分页">
           <span aria-live="polite">第 {currentPage + 1}/{pageCount} 页 · 第 {start + 1}–{Math.min(start + TABLE_PAGE_SIZE, total)} 行，共 {total} 行</span>
           <button type="button" disabled={currentPage === 0} onClick={() => setPage(currentPage - 1)}>上一页</button>
@@ -1293,11 +1306,18 @@ function renderBlock(block: Block, index: number, ctx: InlineContext): ReactNode
   const key = `b-${index}`;
   switch (block.type) {
     case 'synced_reference':
+      if (ctx.staticMode) return <p key={key}>引用内容未包含在分享中，请查看原文。</p>;
       return <SyncedReference key={`${key}-${block.token}-${block.blockId}`} token={block.token} blockId={block.blockId} feishuHost={ctx.feishuHost} autoLoad={ctx.resolveSyncedReferences} />;
     case 'heading': {
       const Heading = `h${block.level}` as 'h1' | 'h2' | 'h3' | 'h4' | 'h5' | 'h6';
+      const slug = unescapeInline(block.text).replace(/<[^>]*>/g, '').replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+        .toLowerCase().replace(/[^\p{L}\p{N}\p{M}_\s-]/gu, '').trim().replace(/\s/g, '-') || 'section';
+      let id = slug;
+      let suffix = 0;
+      while (ctx.headingIds?.has(id)) id = `${slug}-${++suffix}`;
+      ctx.headingIds?.set(id, 1);
       return (
-        <Heading key={key} className={HEADING_CLASS[block.level] ?? HEADING_CLASS[6]}>
+        <Heading key={key} id={id} className={HEADING_CLASS[block.level] ?? HEADING_CLASS[6]}>
           {renderInline(block.text, key, ctx)}
         </Heading>
       );
@@ -1449,6 +1469,9 @@ function renderBlock(block: Block, index: number, ctx: InlineContext): ReactNode
 // ---------------------------------------------------------------------------
 
 interface MarkdownViewProps {
+  staticMode?: boolean;
+  resolveHref?: (href: string) => string | null;
+  resolveImage?: (src: string) => string | null;
   content: string;
   /** md 文件所在目录（kbRoot 相对 POSIX 路径），用于解析相对图片路径。 */
   baseDir?: string;
@@ -1473,6 +1496,9 @@ interface MarkdownViewProps {
 
 export function MarkdownView({
   content,
+  staticMode = false,
+  resolveHref,
+  resolveImage,
   baseDir = '',
   onNavigateCsv,
   onNavigateDoc,
@@ -1482,7 +1508,7 @@ export function MarkdownView({
   variant = 'preview',
 }: MarkdownViewProps) {
   const blocks = useMemo(() => parseBlocks(preprocess(content)), [content]);
-  const ctx: InlineContext = { baseDir, onNavigateCsv, onNavigateDoc, feishuHost, remoteImages, resolveSyncedReferences };
+  const ctx: InlineContext = { baseDir, onNavigateCsv, onNavigateDoc, feishuHost, remoteImages, resolveSyncedReferences, resolveHref, resolveImage, staticMode, headingIds: new Map() };
   return (
     <div className={`markdown-body ${variant === 'reading' ? 'markdown-reading' : 'markdown-preview'}`}>
       {blocks.map((b, i) => (

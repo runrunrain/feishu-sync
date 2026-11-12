@@ -19,7 +19,8 @@ export interface LoadedRelease extends EvalCorpus {
 }
 
 export function loadRelease(dir: string): LoadedRelease {
-  dir = fs.realpathSync(dir);
+  // Match the product query facade's canonical path, including Windows 8.3 aliases.
+  dir = fs.realpathSync.native(dir);
   const manifestBytes = fs.readFileSync(resolveInside(dir, 'manifest.json', 'read'));
   const manifest = JSON.parse(manifestBytes.toString('utf8')) as KbManifest & { synthetic?: boolean };
   if (manifest.schemaVersion !== 1 || typeof manifest.releaseId !== 'string' || !manifest.releaseId || !Array.isArray(manifest.docs)) {

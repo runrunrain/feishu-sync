@@ -1,7 +1,7 @@
 {
   "name": "feishu-sync",
   "private": true,
-  "version": "0.4.27",
+  "version": "0.4.28",
   "type": "module",
   "main": "dist-electron/main.cjs",
   "scripts": {
@@ -9,6 +9,7 @@
     "dev:all": "concurrently \"npm run server:dev\" \"npm run dev\"",
     "build": "vite build",
     "build:all": "npm run build && npm run server:build",
+    "pretest": "node scripts/ensure-node-sqlite.cjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:server": "npm test --prefix server",
@@ -18,7 +19,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "check": "npm run lint && npm run typecheck && npm run test:all",
-    "server:dev": "node node_modules/tsx/dist/cli.mjs watch server/src/index.ts",
+    "server:dev": "node server/scripts/build-share-render.mjs && node node_modules/tsx/dist/cli.mjs watch server/src/index.ts",
     "server:build": "npm run build --prefix server",
     "server:start": "node server/dist/index.js",
     "electron:build": "npm run electron:build:main && npm run electron:build:preload && npm run electron:build:server",

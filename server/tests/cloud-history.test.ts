@@ -180,7 +180,10 @@ function makeFixture(larkOpts: Parameters<typeof makeLarkStub>[0] = {}, configOp
   });
   return {
     dataRoot, store, lark, pulls, clock, service,
-    cleanup: () => fs.rmSync(dataRoot, { recursive: true, force: true }),
+    cleanup: () => {
+      store.close();
+      fs.rmSync(dataRoot, { recursive: true, force: true });
+    },
   };
 }
 

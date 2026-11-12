@@ -129,8 +129,8 @@ describe('isPathInside containment（POSIX 精确比较）', () => {
     expect(isPathInside('/a/b', '/a')).toBe(false);
   });
 
-  it('大小写变体在 POSIX 不折叠（/A/B ≠ /a/b）', () => {
-    expect(isPathInside('/a/b', '/A/B/c')).toBe(false);
+  it('大小写按平台比较：Windows 折叠，POSIX 精确匹配', () => {
+    expect(isPathInside('/a/b', '/A/B/c')).toBe(process.platform === 'win32');
   });
 });
 

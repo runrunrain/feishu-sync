@@ -94,7 +94,7 @@ describe('LarkCliClient output parsing and classification', () => {
       });
 
       expect(resolved).toBe(executable);
-      expect(buildLarkCliEnvironment(resolved, { PATH: '/usr/bin:/bin' }).PATH)
+      expect(buildLarkCliEnvironment(resolved, { PATH: ['/usr/bin', '/bin'].join(path.delimiter) }).PATH)
         .toBe(`${binDir}${path.delimiter}/usr/bin${path.delimiter}/bin`);
     } finally {
       fs.rmSync(homeDir, { recursive: true, force: true });
@@ -355,8 +355,15 @@ describe('LarkCliClient output parsing and classification', () => {
   it('normalizes a Drive metadata batch without fetching document content', async () => {
     const client = createClient();
     const calls: Array<{ args: string[]; apiType: string }> = [];
+    let payloadFile: string | undefined;
     (client as any).execute = async (args: string[], apiType: string) => {
-      calls.push({ args, apiType });
+      const dataIndex = args.indexOf('--data') + 1;
+      const normalizedArgs = [...args];
+      if (args[dataIndex]?.startsWith('@')) {
+        payloadFile = args[dataIndex].slice(1);
+        normalizedArgs[dataIndex] = fs.readFileSync(payloadFile, 'utf8');
+      }
+      calls.push({ args: normalizedArgs, apiType });
       return {
         data: {
           metas: [{
@@ -382,6 +389,10 @@ describe('LarkCliClient output parsing and classification', () => {
       }],
       failed: [{ docToken: 'docx-B', code: 970005 }],
     });
+    if (process.platform === 'win32') {
+      expect(payloadFile).toBeDefined();
+      expect(fs.existsSync(payloadFile!)).toBe(false);
+    }
     expect(calls).toEqual([{
       apiType: 'drive',
       args: [
@@ -398,7 +409,7 @@ describe('LarkCliClient output parsing and classification', () => {
 
   it('turns an absolute staging path into relative media output with a controlled cwd', async () => {
     const client = createClient();
-    const stagingDirectory = path.join('/tmp', 'feishu-sync-media-test');
+    const stagingDirectory = path.resolve('/tmp', 'feishu-sync-media-test');
     const requested = path.join(stagingDirectory, 'image-stem');
     const calls: Array<{ args: string[]; options: unknown }> = [];
     (client as any).execute = async (args: string[], _apiType: string, options: unknown) => {
@@ -427,9 +438,9 @@ describe('LarkCliClient output parsing and classification', () => {
       client.previewMedia('MediaToken1234567890', '/tmp/inside/preview-stem'),
     ).rejects.toThrow('输出目录外');
     expect(resolveMediaOutputTarget('/tmp/inside/preview-stem')).toEqual({
-      directory: '/tmp/inside',
+      directory: path.resolve('/tmp/inside'),
       outputName: 'preview-stem',
-      requestedPath: '/tmp/inside/preview-stem',
+      requestedPath: path.resolve('/tmp/inside/preview-stem'),
     });
   });
 });

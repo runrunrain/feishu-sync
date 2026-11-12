@@ -481,6 +481,7 @@ function makeFixture(opts: {
       });
     },
     cleanup: () => {
+      store.close();
       fs.rmSync(kbRoot, { recursive: true, force: true });
       fs.rmSync(dataRoot, { recursive: true, force: true });
     },

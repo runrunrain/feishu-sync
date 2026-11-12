@@ -349,8 +349,8 @@ describe('发布原子性与对账（§6.5 publishing / §5.3）', () => {
     const skill = (service as unknown as { materializeWorkflowSkill(id: string): { skillPath: string; revision: string } })
       .materializeWorkflowSkill('b-skill-discovery');
     const content = fs.readFileSync(skill.skillPath, 'utf-8');
-    expect(skill.skillPath).toMatch(/\/skills\/knowledge-build\/SKILL\.md$/);
-    expect(content).toMatch(/^---\nname: knowledge-build\ndescription: .+\n---\n/);
+    expect(skill.skillPath).toMatch(/[\\/]skills[\\/]knowledge-build[\\/]SKILL\.md$/);
+    expect(content).toMatch(/^---\r?\nname: knowledge-build\r?\ndescription: .+\r?\n---\r?\n/);
     expect(content).toContain('mcp-examples.md');
     expect(skill.revision).toMatch(/^[0-9a-f]{64}$/);
   });

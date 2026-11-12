@@ -39,8 +39,13 @@ describe('persistent secret isolation', () => {
     expect(first).toMatch(/^fskb_[A-Za-z0-9_-]{43}$/);
     expect(new LanTokenStore(root).reveal()).toBe(first);
     expect(tokens.masked()).not.toContain(first);
-    expect(fs.statSync(tokens.directory).mode & 0o777).toBe(0o700); expect(fs.statSync(tokens.file).mode & 0o777).toBe(0o600);
-    fs.chmodSync(tokens.file, 0o644); tokens.reveal(); expect(fs.statSync(tokens.file).mode & 0o777).toBe(0o600);
+    // Windows stat reports DOS writable bits, not POSIX owner/group permissions.
+    if (process.platform !== 'win32') {
+      expect(fs.statSync(tokens.directory).mode & 0o777).toBe(0o700);
+      expect(fs.statSync(tokens.file).mode & 0o777).toBe(0o600);
+    }
+    fs.chmodSync(tokens.file, 0o644); tokens.reveal();
+    if (process.platform !== 'win32') expect(fs.statSync(tokens.file).mode & 0o777).toBe(0o600);
     expect(fs.readdirSync(tokens.directory)).toEqual(['kb-lan-mcp.json']);
     tokens.rotate(); expect(tokens.reveal()).not.toBe(first);
     tokens.revoke(); expect(tokens.digests()).toEqual([]); tokens.ensure(); expect(tokens.reveal()).not.toBe(first);
@@ -51,8 +56,9 @@ describe('persistent secret isolation', () => {
     expect(() => new LanTokenStore(root).ensure()).toThrow('unsafe_path');
     fs.unlinkSync(path.join(root, 'secrets')); fs.mkdirSync(path.join(root, 'secrets'));
     const target = path.join(outside, 'secret.json'); fs.writeFileSync(target, '{}', { mode: 0o644 });
+    const originalMode = fs.statSync(target).mode;
     const store = new LanTokenStore(root); fs.symlinkSync(target, store.file);
-    expect(() => store.ensure()).toThrow(); expect(fs.statSync(target).mode & 0o777).toBe(0o644);
+    expect(() => store.ensure()).toThrow(); expect(fs.statSync(target).mode).toBe(originalMode);
     fs.unlinkSync(store.file); fs.linkSync(target, store.file); expect(() => store.rotate()).toThrow('unsafe_file');
   });
   it('compares every equal-length digest, never accepts other domains', () => {

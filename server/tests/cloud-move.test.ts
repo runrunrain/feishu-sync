@@ -145,7 +145,11 @@ function makeFixture(
   });
   return {
     dataRoot, store, lark, clock, detects, service, absPath,
-    cleanup: () => fs.rmSync(dataRoot, { recursive: true, force: true }),
+    cleanup: () => {
+      service.stopPoller();
+      store.close();
+      fs.rmSync(dataRoot, { recursive: true, force: true });
+    },
   };
 }
 

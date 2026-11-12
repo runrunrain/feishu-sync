@@ -373,13 +373,13 @@ describe('编排模式冻结与服务门禁', () => {
 
   it('createBuild：默认 Pi 且宿主未接线时拒绝，不回落旧流水', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kb-gate-'));
+    const store = new LocalMapStore(path.join(root, 'db.sqlite'));
     const raw = path.join(root, 'raw');
     fs.mkdirSync(raw);
     try {
       const manager = new ConfigManager(path.join(root, 'config.json'));
       await manager.load();
       await manager.updateConfig({ knowledgeBaseRoot: raw, standardKb: { outputRoot: path.join(root, 'standard') } } as never);
-      const store = new LocalMapStore(path.join(root, 'db.sqlite'));
       store.initialize();
       const resolver = new PiRuntimeResolver();
       vi.spyOn(resolver, 'checkReadiness').mockResolvedValue({ code: 'ready', model: { model: 'fixture' } } as never);
@@ -393,6 +393,7 @@ describe('编排模式冻结与服务门禁', () => {
       await expect(service.createBuild(store, { mode: 'full', confirm: 'BUILD' })).rejects.toMatchObject({ code: 'build_runtime_unavailable' });
       expect(store.getActiveKbBuild()).toBeNull();
     } finally {
+      store.close();
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
@@ -479,6 +480,7 @@ void isPidAlive;
 describe('executeLeaderPublishRequest 门禁', () => {
   it('候选漂移与代次不符 → 拒绝（不进入发布管线）；缺有效审查 → 阻断', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kb-leader-pub-'));
+    const store = new LocalMapStore(path.join(root, 'db.sqlite'));
     const raw = path.join(root, 'raw');
     const outputRoot = path.join(root, 'standard');
     fs.mkdirSync(path.join(raw, 'docs'), { recursive: true });
@@ -487,7 +489,6 @@ describe('executeLeaderPublishRequest 门禁', () => {
       const manager = new ConfigManager(path.join(root, 'config.json'));
       await manager.load();
       await manager.updateConfig({ knowledgeBaseRoot: raw, standardKb: { outputRoot, orchestrationMode: 'pi-amagi' } } as never);
-      const store = new LocalMapStore(path.join(root, 'db.sqlite'));
       store.initialize();
       const documents = [{
         wikiNodeToken: null, objType: 'docx', objToken: 'tok1', title: '源文档',
@@ -563,6 +564,7 @@ describe('executeLeaderPublishRequest 门禁', () => {
       expect(fs.existsSync(path.join(outputRoot, 'CURRENT'))).toBe(false);
       internal.active.delete(buildId);
     } finally {
+      store.close();
       fs.rmSync(root, { recursive: true, force: true });
     }
   }, 20000);

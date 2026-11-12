@@ -157,13 +157,17 @@ it('builtin 解析不扫描祖先 .agents，应用 builtin 排除规则仍生效
   const ancestor = path.join(root, '.agents/skills/fixture'); fs.mkdirSync(ancestor, { recursive: true }); fs.writeFileSync(path.join(ancestor, 'SKILL.md'), 'fixture');
   const trace = path.join(root, 'trace'); const preload = path.join(root, 'trace.cjs');
   fs.writeFileSync(preload, `const fs=require('node:fs'),m=require('node:module'),out=${JSON.stringify(trace)},prefix=${JSON.stringify(path.join(root, '.agents'))};for(const key of ['readdirSync','readFileSync','statSync','existsSync']){const orig=fs[key];fs[key]=function(p,...args){if(String(p).startsWith(prefix))fs.appendFileSync(out,key+' '+String(p)+'\\n');return orig.call(this,p,...args)}}m.syncBuiltinESMExports();`);
-  const resolver = new PiRuntimeResolver(); const config = buildDefaultAgentConfig(app); const runtime = await resolver.resolveRuntime(config);
+  const resolver = new PiRuntimeResolver(); const config = buildDefaultAgentConfig(app);
   const service = new PiPluginService({ dataRoot: app, resolver, agentConfig: () => config, running: () => false, retireIdle: async () => {}, bundledAmagi: null });
   await service.refresh();
   const settingsPath = path.join(service.agentDir, 'settings.json'); const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
   fs.writeFileSync(settingsPath, JSON.stringify({ ...settings, extensions: ['-builtin:codemode', '!builtin:mcp'] }));
-  const wrapper = path.join(root, 'node-wrapper'); fs.writeFileSync(wrapper, `#!/bin/sh\nexec ${JSON.stringify(runtime.nodePath)} --require ${JSON.stringify(preload)} "$@"\n`, { mode: 0o700 });
-  const spy = vi.spyOn(resolver, 'resolveRuntime').mockResolvedValue({ ...runtime, nodePath: wrapper });
+  // Instrument the real Node subprocess on all platforms, without a POSIX-only executable wrapper.
+  const internals = service as unknown as { env(): NodeJS.ProcessEnv };
+  const originalEnv = internals.env.bind(service);
+  const spy = vi.spyOn(internals, 'env').mockImplementation(() => ({
+    ...originalEnv(), NODE_OPTIONS: `--require ${JSON.stringify(preload)}`,
+  }));
   try {
     const builtins = await service.enabledWorkBuiltins();
     expect(builtins).not.toContain('builtin:codemode'); expect(builtins).not.toContain('builtin:mcp'); expect(builtins).toContain('builtin:tool-search');

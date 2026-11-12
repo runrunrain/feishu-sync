@@ -186,7 +186,7 @@ describe('scanAmagiHome（只读发现）', () => {
 describe('home 解析与 SDK 可用性', () => {
   it('resolveGlobalPiAgentDir：PI_CODING_AGENT_DIR 覆盖优先，缺省 ~/.pi/agent（官方语义）', () => {
     expect(resolveGlobalPiAgentDir({} as NodeJS.ProcessEnv)).toBe(path.join(os.homedir(), '.pi', 'agent'));
-    expect(resolveGlobalPiAgentDir({ PI_CODING_AGENT_DIR: '/x/y' } as NodeJS.ProcessEnv)).toBe('/x/y');
+    expect(resolveGlobalPiAgentDir({ PI_CODING_AGENT_DIR: '/x/y' } as NodeJS.ProcessEnv)).toBe(path.resolve('/x/y'));
     expect(resolveGlobalPiAgentDir({ PI_CODING_AGENT_DIR: '~' })).toBe(os.homedir());
     expect(resolveGlobalPiAgentDir({ PI_CODING_AGENT_DIR: '~/.pi/agent' })).toBe(path.join(os.homedir(), '.pi', 'agent'));
   });

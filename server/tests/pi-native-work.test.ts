@@ -169,7 +169,7 @@ it('real Pi loads project context/skills/extensions/MCP and executes native tool
     { name: 'write', args: { path: outside, content: 'native-initial' } },
     { name: 'read', args: { path: outside } },
     { name: 'edit', args: { path: outside, oldText: 'native-initial', newText: 'native-edited' } },
-    { name: 'bash', args: { command: `cat '${outside}'`, timeout: 10 } },
+    { name: 'bash', args: { command: `cat '${outside.replaceAll('\\', '/').replaceAll("'", "'\\''")}'`, timeout: 10 } },
     { name: 'future_native_tool', args: {} },
     { name: 'kb_search', args: { query: 'fixture' } },
     { name: 'mcp__fixture__echo', args: {} },
@@ -207,7 +207,11 @@ it('real Pi loads project context/skills/extensions/MCP and executes native tool
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-  const env = buildPiProcessEnv({ mode: 'app-llm', parentEnv: { PATH: process.env.PATH, HOME: root, USERPROFILE: root, SystemRoot: process.env.SystemRoot }, dataRoot: root, agentUrl: url, runToken: 'fixture-token', apiKey: 'fixture-key', nativeWork: true });
+  // Pi discovers Git Bash using ProgramFiles before PATH (which may start with WSL bash.exe).
+  const env = buildPiProcessEnv({ mode: 'app-llm', parentEnv: {
+    PATH: process.env.PATH, HOME: root, USERPROFILE: root, SystemRoot: process.env.SystemRoot,
+    ProgramFiles: process.env.ProgramFiles, 'ProgramFiles(x86)': process.env['ProgramFiles(x86)'],
+  }, dataRoot: root, agentUrl: url, runToken: 'fixture-token', apiKey: 'fixture-key', nativeWork: true });
   env.FEISHU_SYNC_AGENT_PROVIDER_JSON = JSON.stringify({ baseUrl: `${url}/v1`, models: [{ id: 'fixture', contextWindow: 128000, maxTokens: 2048 }] });
   env.FEISHU_SYNC_AGENT_PI_PACKAGE_ROOT = runtime.piPackageRoot!;
   const rpc = new PiRpcProcess({ nodePath: runtime.nodePath, piCliPath: runtime.piCliPath, extensionPath: piExtensionPath()!, nativeWork: true, localResources: true, selfTriggeredRounds: true, tools: ['kb_search'], model: 'feishu-sync-llm/fixture', thinking: 'off', cwd, env, noSession: true, promptTimeoutMs: 20000 });

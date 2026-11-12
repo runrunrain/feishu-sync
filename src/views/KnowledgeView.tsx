@@ -17,6 +17,7 @@ import { KbSourcePanel } from '../components/kb/KbSourcePanel';
 import { KbChangesPanel, type KbChangeTab } from '../components/kb/KbChangesPanel';
 import { KbBuildPanel, type BuildLogLine } from '../components/kb/KbBuildPanel';
 import { KbTransferPanel } from '../components/kb/KbTransferPanel';
+import { KbDocumentSharePanel } from '../components/kb/KbDocumentSharePanel';
 import { KbGovernancePanel } from '../components/kb/KbGovernancePanel';
 import { RawSourceDrawer } from '../components/kb/RawSourceDrawer';
 import { MarkdownView } from '../components/preview/MarkdownView';
@@ -552,6 +553,7 @@ export function KnowledgeView({ active = true, onJumpToSettings }: KnowledgeView
           </div> : <p className="p-4 text-xs text-ink-faint">选择文档后查看来源与文档信息。</p>
           : sidebar === 'governance' ? <KbGovernancePanel onOpenDoc={openGovernanceDoc} />
           : sidebar === 'share' ? <div className="flex-1 min-h-0 overflow-auto scrollbar-thin p-4 text-xs text-ink-soft">
+            <KbDocumentSharePanel releaseId={tree?.releaseId ?? null} nodes={tree?.nodes ?? []} selectedDocId={selectedDocId} />
             <KbTransferPanel
               releaseId={kbStatus?.current?.releaseId ?? null}
               activeBuild={running}

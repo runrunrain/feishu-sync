@@ -89,7 +89,7 @@ describe('sync-latest configuration ownership', () => {
     expect(persisted.requiredScopes).toEqual([...REQUIRED_SCOPES]);
     expect(persisted.llm.apiKey).toBe('');
     expect(fs.existsSync(paths.operationsDir)).toBe(true);
-    expect(fs.statSync(paths.configPath).mode & 0o777).toBe(0o600);
+    if (process.platform !== 'win32') expect(fs.statSync(paths.configPath).mode & 0o777).toBe(0o600);
   });
 
   it('keeps an existing config byte-for-byte unchanged while using a formal runtime merge', () => {
@@ -192,7 +192,7 @@ describe('sync-latest configuration ownership', () => {
     expect(persistedUnrelated).toEqual(unrelatedRoot);
     expect(persisted.watchedRoots).toHaveLength(ALL_ROOTS.length + 1);
     expect(fs.readdirSync(path.dirname(paths.configPath)).some((name) => name.endsWith('.tmp'))).toBe(false);
-    expect(fs.statSync(paths.configPath).mode & 0o777).toBe(0o600);
+    if (process.platform !== 'win32') expect(fs.statSync(paths.configPath).mode & 0o777).toBe(0o600);
   });
 
   it('rejects malformed existing JSON instead of overwriting it', () => {

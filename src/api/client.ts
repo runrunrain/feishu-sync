@@ -88,6 +88,34 @@ class APIError extends Error {
   }
 }
 
+export interface KbDocumentSelection { releaseId: string; docIds: string[] }
+export interface KbWebShareStatus {
+  running: boolean; port: number;
+  shares: Array<{ id: string; title: string; releaseId: string; createdAt: string; baseDocId: string; docCount: number; urls: string[] }>;
+}
+export function getKbWebShares(): Promise<KbWebShareStatus> { return request('/api/kb/distribution/shares'); }
+export function createKbWebShare(body: KbDocumentSelection & { baseDocId: string }): Promise<KbWebShareStatus> {
+  return request('/api/kb/distribution/shares', { method: 'POST', body: JSON.stringify(body), timeoutMs: 120_000 });
+}
+export function revokeKbWebShare(id: string): Promise<KbWebShareStatus> {
+  return request(`/api/kb/distribution/shares/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+export function resumeKbWebShares(): Promise<KbWebShareStatus> {
+  return request('/api/kb/distribution/resume', { method: 'POST' });
+}
+export async function downloadKbDocuments(body: KbDocumentSelection & { format: 'md' | 'zip' }): Promise<Blob> {
+  const [headers, base] = await Promise.all([getApiHeaders(), getBaseUrl()]);
+  const response = await fetch(`${base}/api/kb/distribution/export`, {
+    method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    signal: AbortSignal.timeout(120_000),
+  });
+  if (!response.ok) {
+    const data = await response.json().catch(() => null) as { message?: string } | null;
+    throw new APIError(data?.message ?? 'Markdown 导出失败', response.status);
+  }
+  return response.blob();
+}
+
 /**
  * Get API headers including X-Desktop-Token
  */

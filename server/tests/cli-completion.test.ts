@@ -14,23 +14,20 @@ import path from 'node:path';
 import { OPS_COMMANDS } from '../src/ops/command-table.js';
 import { renderCompletionScript, renderCompletionUsage } from '../src/cli/completion.js';
 import { runCli } from '../src/cli/cli-app.js';
+import { findShell, shellPath } from './helpers/shell.js';
 
 function shellSyntaxOk(shell: 'bash' | 'zsh' | 'fish', script: string): boolean {
-  const binary = shell === 'fish' ? 'fish' : shell;
-  let binPath: string | undefined;
-  try {
-    binPath = execFileSync('which', [binary], { encoding: 'utf-8' }).trim() || undefined;
-  } catch {
-    binPath = undefined;
-  }
+  const binPath = findShell(shell);
   if (!binPath) return false; // 目标 shell 不在本机：跳过（测试断言仅 bash 必装）
   const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-sync-comp-')), `comp.${shell}`);
   fs.writeFileSync(file, script, 'utf-8');
   try {
-    execFileSync(binPath, ['-n', file], { stdio: 'pipe' });
+    execFileSync(binPath, ['-n', shellPath(file)], { stdio: 'pipe' });
     return true;
   } catch {
     return false;
+  } finally {
+    fs.rmSync(path.dirname(file), { recursive: true, force: true });
   }
 }
 
@@ -114,7 +111,7 @@ describe('语法检查（真实 shell -n）', () => {
   });
 
   it('zsh -n 通过（本机无 zsh 时跳过并注明）', () => {
-    const hasZsh = (() => { try { execFileSync('which', ['zsh']); return true; } catch { return false; } })();
+    const hasZsh = !!findShell('zsh');
     if (!hasZsh) {
       expect(shellSyntaxOk('zsh', renderCompletionScript('zsh'))).toBe(false);
       return;
@@ -123,7 +120,7 @@ describe('语法检查（真实 shell -n）', () => {
   });
 
   it('fish -n 通过（本机无 fish 时跳过并注明）', () => {
-    const hasFish = (() => { try { execFileSync('which', ['fish']); return true; } catch { return false; } })();
+    const hasFish = !!findShell('fish');
     if (!hasFish) {
       expect(shellSyntaxOk('fish', renderCompletionScript('fish'))).toBe(false);
       return;

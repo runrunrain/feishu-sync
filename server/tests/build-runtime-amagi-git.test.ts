@@ -15,6 +15,7 @@ import { promisify } from 'node:util';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { requireBash, shellPath } from './helpers/shell.js';
 import {
   AMAGI_PI_GIT_COMMIT, INSTALL_RECORD_FILENAME, amagiInstallDir,
   installAmagiFromGit, verifyAmagiPackage,
@@ -27,7 +28,10 @@ import { PiRuntimeResolver } from '../src/agent/runtime-resolver.js';
 import { ConfigManager } from '../src/modules/config-manager.js';
 import { piWorkbenchPackageRoot } from '../src/agent/agent-assets.js';
 
-const runCli = promisify(execFile);
+const execAsync = promisify(execFile);
+const runCli = (bin: string, args: string[]) => process.platform === 'win32'
+  ? execAsync(requireBash(), [shellPath(bin), ...args])
+  : execAsync(bin, args);
 
 const tmpDirs: string[] = [];
 function tmpRoot(): string {
@@ -139,7 +143,7 @@ describe('installAmagiFromGit（默认 Git 获取链）', () => {
     const bin = path.join(result.packageRoot, 'node_modules', '.bin', 'typescript-language-server');
     expect(fs.existsSync(bin)).toBe(true);
     expect(fs.lstatSync(bin).isSymbolicLink()).toBe(false);
-    expect(fs.statSync(bin).mode & 0o111).not.toBe(0);
+    if (process.platform !== 'win32') expect(fs.statSync(bin).mode & 0o111).not.toBe(0);
     const shim = fs.readFileSync(bin, 'utf-8');
     expect(shim.startsWith('#!/bin/sh')).toBe(true);
     expect(shim).toContain('exec "$(dirname "$0")/../typescript-language-server/lib/cli.mjs" "$@"');
@@ -295,7 +299,7 @@ process.exit(1);
     needsGit(ctx);
     // 新临时 root + 敌意目录名（空格、双引号、反引号、$ 变量名——未转义即注入/断链）
     const hostile = tmpRoot();
-    const weird = path.join(hostile, 'weird dir "q" $HOME `x`');
+    const weird = path.join(hostile, process.platform === 'win32' ? "weird dir 'q' $HOME `x` &" : 'weird dir "q" $HOME `x`');
     fs.mkdirSync(weird, { recursive: true });
     const template = makeGitFixtureRepo(weird, { version: '2.21.31' });
     const sdkRoot = makeFakePiSdk(hostile);

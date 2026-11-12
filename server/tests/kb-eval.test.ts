@@ -236,13 +236,13 @@ describe('runner and real CLI', () => {
     });
     expect(pinnedRun.stderr).toBe(''); expect(pinnedRun.status).toBe(0);
     const pinnedReport = JSON.parse(fs.readFileSync(path.join(root, 'pinned/report.json'), 'utf8'));
-    expect(pinnedReport.inputs.releaseDir).toBe(fs.realpathSync(pinned));
+    expect(pinnedReport.inputs.releaseDir).toBe(fs.realpathSync.native(pinned));
     expect(pinnedReport.rows[0].provenance.kind).toBe('synthetic');
     expect(pinnedReport.comparison.ranker).toBe('l0');
     // Refuse overwriting report evidence.
     expect(run('l0').stderr).toContain('out_not_empty');
     const lexical = run('lex-v1');
-    expect(lexical.status).toBe(0); expect(lexical.stderr).toBe('');
+    expect(lexical.status, lexical.stderr).toBe(0); expect(lexical.stderr).toBe('');
     const lexicalReport = JSON.parse(fs.readFileSync(path.join(root, 'lex-v1/report.json'), 'utf8'));
     expect(lexicalReport.implementation).toBe('product-KbQueryService/lex-v1');
     expect(lexicalReport.overall.grepCompleteness).toEqual({ mean: 1, count: 2 });

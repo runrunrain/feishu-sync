@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { bundleMcp, bundleGateway } from './lib/mcp-bundle.mjs';
 import { bundleCli } from './lib/cli-bundle.mjs';
 import { bundleAmagi } from './lib/bundled-amagi.mjs';
+import './build-share-render.mjs';
 
 const serverRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const srcRoot = path.join(serverRoot, 'src');
