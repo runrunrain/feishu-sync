@@ -86,6 +86,7 @@ export function KbDocumentSharePanel({ releaseId, nodes, selectedDocId }: Props)
     {status?.shares.map(share => <div key={share.id} className="border border-line rounded p-2 space-y-2">
       <p className="text-ink font-medium break-words">{share.title}</p>
       <p className="text-ink-faint">{share.docCount} 篇 · {new Date(share.createdAt).toLocaleString()}</p>
+      {!share.urls.length ? <p className="text-ink-faint">未检测到可分享的局域网地址，请连接有线网络或 Wi-Fi 后刷新。</p> : null}
       {share.urls.map(url => <div key={url} className="space-y-1">
         <input aria-label={`${share.title} 的分享链接`} readOnly value={url} className="w-full border border-line rounded bg-paper p-1 text-[10px]" onFocus={e => e.currentTarget.select()} />
         <button type="button" disabled={busy || !status.running} className="text-jade underline" onClick={() => void run(async () => { await writeClipboardText(url); push({ type: 'success', message: '分享链接已复制' }); })}>复制链接</button>

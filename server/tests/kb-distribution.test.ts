@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -10,6 +10,7 @@ import { StandardKbStore } from '../src/kb/standard-kb-store.js';
 import { LocalMcpService } from '../src/kb/local-mcp-service.js';
 import { WebShareService } from '../src/kb/web-share.js';
 import { kbDistributionRoutes } from '../src/routes/kb-distribution.js';
+import { shareLanAddresses } from '../src/kb-lan/network.js';
 import type { ConfigManager } from '../src/modules/config-manager.js';
 
 const roots: string[] = [];
@@ -34,8 +35,52 @@ function fixture() {
   return { root, service, directory, input: { releaseId: 'r_share', docIds: ['base', 'second'], baseDocId: 'base' } };
 }
 afterEach(async () => {
+  vi.restoreAllMocks();
   for (const service of services.splice(0)) await service.close();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+const ipv4 = (address: string, internal = false): os.NetworkInterfaceInfo => ({
+  address, internal, family: 'IPv4', netmask: '255.255.255.0', mac: '00:11:22:33:44:55', cidr: `${address}/24`,
+});
+
+describe('share link addresses', () => {
+  it('keeps physical LAN ranges, deduplicates aliases and excludes virtual interfaces', () => {
+    expect(shareLanAddresses({
+      Ethernet: [ipv4('192.168.10.63')], 'Ethernet alias': [ipv4('192.168.10.63')],
+      'Wi-Fi': [ipv4('172.19.1.20')], en0: [ipv4('10.0.1.20')],
+      'vEthernet (Default Switch)': [ipv4('172.19.160.1')],
+      'vEthernet (WSL (Hyper-V firewall))': [ipv4('172.31.144.1')],
+      'VMware Network Adapter VMnet8': [ipv4('192.168.80.1')],
+      'Corporate VPN': [ipv4('10.9.0.1')], docker0: [ipv4('172.17.0.1')],
+      'br-ab123': [ipv4('172.18.0.1')], vboxnet0: [ipv4('192.168.56.1')],
+      utun0: [ipv4('10.10.0.1')], tun0: [ipv4('10.11.0.1')], wg0: [ipv4('10.12.0.1')],
+    }).sort()).toEqual(['10.0.1.20', '172.19.1.20', '192.168.10.63']);
+  });
+
+  it('never advertises loopback, public, link-local or virtual-only addresses as LAN links', () => {
+    expect(shareLanAddresses({
+      lo: [ipv4('127.0.0.1', true)], Ethernet: [ipv4('169.254.1.2'), ipv4('8.8.8.8')],
+      tailscale0: [ipv4('100.64.0.2')], 'vEthernet (WSL)': [ipv4('172.31.144.1')],
+      offline: undefined,
+    })).toEqual([]);
+    expect(shareLanAddresses({})).toEqual([]);
+  });
+
+  it('returns only the real LAN share URL and refreshes it after a network change', async () => {
+    const interfaces = vi.spyOn(os, 'networkInterfaces').mockReturnValue({
+      以太网: [ipv4('192.168.10.63')],
+      'vEthernet (Default Switch)': [ipv4('172.19.160.1')],
+      'vEthernet (WSL (Hyper-V firewall))': [ipv4('172.31.144.1')],
+    });
+    const f = fixture(); const status = await f.service.create(f.root, f.input);
+    const share = status.shares[0];
+    expect(share.urls).toEqual([`http://192.168.10.63:${status.port}/s/${share.id}/0.html`]);
+    interfaces.mockReturnValue({ 'vEthernet (WSL)': [ipv4('172.31.144.1')] });
+    expect(f.service.status().shares[0].urls).toEqual([]);
+    interfaces.mockReturnValue({ 'Wi-Fi': [ipv4('10.0.0.8')] });
+    expect(f.service.status().shares[0].urls).toEqual([`http://10.0.0.8:${status.port}/s/${share.id}/0.html`]);
+  });
 });
 
 describe('Markdown export', () => {

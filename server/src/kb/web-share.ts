@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http';
-import { allowedSource, privateInterfaces } from '../kb-lan/network.js';
+import { allowedSource, shareLanAddresses } from '../kb-lan/network.js';
 import { resolveInside } from '../agent/path-guard.js';
 import { DistributionError, readImage, relativeTarget, renderDocument, selectDocuments, type DocumentSelection } from './document-distribution.js';
 
@@ -41,8 +41,7 @@ export class WebShareService {
     }
   }
   status() {
-    const addresses = privateInterfaces().filter(i => !i.address.includes(':')).map(i => i.address);
-    const hosts = [...new Set(addresses.length ? addresses : ['127.0.0.1'])];
+    const hosts = shareLanAddresses();
     return { running: !!this.server?.listening, port: this.port, shares: [...this.shares.values()].map(s => ({
       id: s.id, title: s.title, releaseId: s.releaseId, createdAt: s.createdAt, baseDocId: s.baseDocId, docCount: s.docs.length,
       urls: hosts.map(host => `http://${host}:${this.port}/s/${s.id}/${s.docs.find(d => d.docId === s.baseDocId)!.file}`),

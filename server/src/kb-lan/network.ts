@@ -76,6 +76,18 @@ export function privateInterfaces(source = os.networkInterfaces()): Array<{ name
   return Object.entries(source).flatMap(([name, entries]) => (entries ?? []).filter((e) => !e.internal && allowedSource(e.address)).map((e) => ({ name, address: e.address })))
     .sort((a, b) => (a.name === 'en0' ? -1 : b.name === 'en0' ? 1 : a.name.localeCompare(b.name)) || a.address.localeCompare(b.address));
 }
+
+/** Addresses advertised to browser readers, excluding common virtual adapters.
+ * Keep this separate from MCP binding and peer authorization: VPN/VM peers may
+ * still be allowed to connect, but their host-only addresses are not share links.
+ * Do not exclude whole 10/172 ranges: real LANs also use those networks. */
+export function shareLanAddresses(source = os.networkInterfaces()): string[] {
+  const virtual = /^(?:vEthernet|vSwitch|docker|br-|virbr|vnet|veth|vmnet|vboxnet|utun|tun\d|tap\d|wg\d|tailscale|zt[a-z0-9]|awdl|llw|p2p|ipsec|ppp)|(?:hyper-v|\bwsl\b|vmware|virtualbox|virtual|vpn|wireguard|openvpn|zerotier|虚拟)/i;
+  return [...new Set(privateInterfaces(source)
+    .filter(i => isIP(i.address) === 4 && !virtual.test(i.name)
+      && allowedSource(i.address, ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16']))
+    .map(i => i.address))];
+}
 export function resolveBind(bind: string, interfaces = privateInterfaces()): string | null {
   if (bind === 'auto') return interfaces.find((i) => isIP(i.address) === 4 && allowedSource(i.address, ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16']))?.address ?? null;
   if (['0.0.0.0', '::', '127.0.0.1', '::1'].includes(bind)) return bind;

@@ -66,3 +66,12 @@ it('shows failures and allows retrying', async () => {
   expect(host.querySelector('[role="alert"]')?.textContent).toContain('分享端口已被占用');
   expect((button('创建内网分享') as HTMLButtonElement).disabled).toBe(false);
 });
+
+it('shows a network hint instead of a copyable link when no LAN address is available', async () => {
+  api.getKbWebShares.mockResolvedValue({ ...status, shares: [{ ...status.shares[0], urls: [] }] });
+  await render();
+  expect(host.textContent).toContain('未检测到可分享的局域网地址');
+  expect(host.querySelector('input[readonly]')).toBeNull();
+  expect(button('复制链接')).toBeUndefined();
+  expect(button('停止分享')).toBeDefined();
+});

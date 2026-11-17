@@ -22,8 +22,8 @@
 
 - `docs`：主题分组建议。给出每篇计划文档的 path、title、summary（覆盖说明）。
   - 一篇文档一个主题，并承担一类主要职责：概念定位、模型与数据结构、系统规则、配置表、表现体验或规划管线。
-  - 同一规则只规划一个主位置。
-  - path 与 title 用名词性业务短语，沿用源文档的系统名与术语；不用问句、口语、计数锚定名（如「补给三态」）或生造词。
+  - 同一完整定义或字段规格（含取值与空值约定）只规划一个主位置；功能规则文档只承载使用条件、生成、展示与查阅规则，不重复建字段字典。区分业务分类、结构组成、业务处理与展示查阅，不把公共字段与业务类别混成同级子类。
+  - path 与 title 用名词性业务短语，沿用源文档的系统名与术语；不用问句、口语、临时计数名（如「补给三态」；源中正式专名或数量具设计含义的除外）或生造词。
 - `objectCandidates`：对象候选——clientKey、type、title、familyKey/variantKey/scopeKey/scopeText、canonicalPath（主位置必须在计划文档内）。
 - `dependencies`：对象间依赖建议（fromKey/toKey/reason）。
 - `migrations`：对象迁移建议（merge/split/remove + 后继 + reason）。
