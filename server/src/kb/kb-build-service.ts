@@ -806,6 +806,16 @@ export class KbBuildService extends EventEmitter {
     }
     if (this.running || localMapStore.getActiveKbBuild()) throw new ToolError('kb_build_running', '已有构建正在进行', 409);
 
+    // 构建角色模型前置预检（readiness 不限协议，Pi 编排只接受
+    // openai-completions）：创建即拒绝并给出修正指引，不等到异步流水线内
+    // buildLeaderInput 才失败（那时 kb_builds 已入库，用户看到的是「构建
+    // 启动后阻断」）。只读校验，无 DB/active/staging 副作用；legacy 检查点
+    // 流水不经 Leader 派发，不适用此契约。
+    if (orchestrationMode === 'pi-amagi') {
+      const precheck = this.precheckLeaderModels(config);
+      if (!precheck.ok) throw new ToolError(precheck.code, precheck.message, precheck.status);
+    }
+
     // outputRoot 校验
     const outputRoot = config.standardKb.outputRoot;
     validateOutputRoot(outputRoot, {
@@ -936,6 +946,14 @@ export class KbBuildService extends EventEmitter {
       }
       if (resumeStrategy === 'session' && !checkpoint.leaderRun) {
         throw new ToolError('kb_resume_not_ready', '尚无冻结Leader会话；只能选择成果级重新构建，不能冒充同会话续接', 409);
+      }
+      // 与 createBuild 同源的构建角色模型前置预检（Leader 检查点无
+      // orchestration 冻结面，frozenRoleMismatches 不覆盖）：当前配置不
+      // 满足 Pi 编排契约时 409 拒绝恢复，检查点保持 interrupted 不动，
+      // 不再等流水线内 buildLeaderInput 失败后把 queued 又打回 failed。
+      const precheck = this.precheckLeaderModels(config);
+      if (!precheck.ok) {
+        throw new ToolError(precheck.code, `恢复构建的模型配置不满足 Pi 编排要求：${precheck.message}`, 409);
       }
       entry.leaderRun = checkpoint.leaderRun;
       // 恢复策略显式化（会话级/成果级；缺省按绑定能力自动选择，冻结
@@ -1327,6 +1345,56 @@ export class KbBuildService extends EventEmitter {
     return sections;
   }
 
+  /** 单角色解析+校验（只读）：describeRoleModel 解析后做协议/端点/密钥契约
+   * 检查。resolveLeaderModels（流水线派发）与 precheckLeaderModels
+   * （createBuild/resumeBuild 前置预检）共用同一实现，避免两份校验漂移。
+   * 协议契约见 build-runtime/contracts.ts：Pi 编排仅支持 OpenAI Chat
+   * Completions 兼容端点（readiness 对 app-llm 不限协议，此处是构建侧
+   * 唯一裁决点）。pi-agent-dir 本机模型无 providerId/baseUrl，同样在此
+   * 被拒（Leader 派发需要应用侧端点与密钥）。 */
+  private resolveLeaderRoleModel(config: Config, role: BuildRoleModelConfig, label: string): { resolved: ResolvedRoleModel & { providerId: string; baseUrl: string }; apiKey: string } | { error: ToolError } {
+    const resolved = this.describeRoleModel(config, role, 'v2-leader');
+    if (!resolved) {
+      return { error: new ToolError('agent_not_ready', `pi-amagi 模式需要 ${label} 角色模型可解析（当前配置缺失或无可用密钥）；请修正 buildRoles 后重试（不降级）`, 503) };
+    }
+    if (resolved.protocol && resolved.protocol !== 'openai-completions') {
+      return { error: new ToolError('build_mode_unavailable', `Pi 编排的角色模型只支持 OpenAI Chat Completions 兼容端点（${label} 当前 ${resolved.protocol}）；请在「设置→模型提供商」中调整协议，或为构建角色指定 openai-completions 预设`, 400) };
+    }
+    if (!resolved.providerId || !resolved.baseUrl) {
+      return { error: new ToolError('build_mode_unavailable', `Pi 编排需要为${label}角色配置 OpenAI 兼容端点`, 400) };
+    }
+    const { providerId, baseUrl } = resolved;
+    const apiKey = config.llm.providers?.find((provider) => provider.id === providerId)?.apiKey.trim();
+    if (!apiKey) {
+      return { error: new ToolError('agent_not_ready', `Pi 编排的${label}角色缺少提供商 API 密钥`, 503) };
+    }
+    // 守卫后重申非空字段：让派发方拿到 providerId/baseUrl 必填的类型面
+    return { resolved: { ...resolved, providerId, baseUrl }, apiKey };
+  }
+
+  /** 构建角色模型前置预检（只读、无副作用）：createBuild 在 checkReadiness
+   * 通过后、createKbBuild 入库前调用；resumeBuild 在置 queued 前调用。
+   * 动机（新用户默认模型阻断根因）：checkReadiness 对 app-llm 源不限协议
+   * （openai-responses/anthropic-messages 均判 ready），而 Pi 编排构建只
+   * 接受 openai-completions——此前该契约要到异步流水线内 buildLeaderInput
+   * → resolveLeaderModels 才失败，kb_builds 已入库、用户看到的是「Agent
+   * 就绪、构建启动后阻断」。前置后创建即拒绝并给出修正指引，不留
+   * DB/active/staging 副作用。与 resolveLeaderModels 同源（共用
+   * resolveLeaderRoleModel）；恢复路径的 frozenRoleMismatches 只覆盖 legacy
+   * 检查点的 orchestration 冻结面，Leader 检查点无该面可比对，故恢复同样
+   * 预检（409 风格：检查点保持 interrupted 不动，可改配置后再续）。 */
+  private precheckLeaderModels(config: Config): { ok: true } | { ok: false; code: string; message: string; status: number } {
+    const roles = config.standardKb.buildRoles ?? { writer: { modelPresetId: '' }, reviewer: { modelPresetId: '' } };
+    const check = (role: BuildRoleModelConfig, label: string): true | { code: string; message: string; status: number } => {
+      const outcome = this.resolveLeaderRoleModel(config, role, label);
+      return 'error' in outcome ? { code: outcome.error.code, message: outcome.error.message, status: outcome.error.status } : true;
+    };
+    for (const failure of [check(roles.writer, '写作'), check(roles.reviewer, '审查'), check(roles.integrator ?? roles.writer, 'Leader（整合）')]) {
+      if (failure !== true) return { ok: false, ...failure };
+    }
+    return { ok: true };
+  }
+
   /** 为每个提供商分配独立的 Pi 别名与凭据。 */
   private resolveLeaderModels(config: Config): Pick<LeaderBuildInput, 'models' | 'apiKeys'> {
     const roles = config.standardKb.buildRoles ?? { writer: { modelPresetId: '' }, reviewer: { modelPresetId: '' } };
@@ -1334,20 +1402,10 @@ export class KbBuildService extends EventEmitter {
     const providers = new Map<string, BuildModelProvider>();
     const apiKeys: LeaderBuildInput['apiKeys'] = {};
     const toModel = (role: BuildRoleModelConfig, label: string): LeaderBuildModel => {
-      const resolved = this.describeRoleModel(config, role, 'v2-leader');
-      if (!resolved) {
-        throw new ToolError('agent_not_ready', `pi-amagi 模式需要 ${label} 角色模型可解析（当前配置缺失或无可用密钥）；请修正 buildRoles 后重试（不降级）`, 503);
-      }
-      if (resolved.protocol && resolved.protocol !== 'openai-completions') {
-        throw new ToolError('build_mode_unavailable', `Pi 编排的角色模型只支持 OpenAI 兼容端点（${label} 当前 ${resolved.protocol}）；请调整角色模型`, 400);
-      }
-      if (!resolved.providerId || !resolved.baseUrl) {
-        throw new ToolError('build_mode_unavailable', `Pi 编排需要为${label}角色配置 OpenAI 兼容端点`, 400);
-      }
-      const apiKey = config.llm.providers?.find((provider) => provider.id === resolved.providerId)?.apiKey.trim();
-      if (!apiKey) {
-        throw new ToolError('agent_not_ready', `Pi 编排的${label}角色缺少提供商 API 密钥`, 503);
-      }
+      // 校验与 precheckLeaderModels（创建/恢复前置预检）同源，不两份漂移
+      const outcome = this.resolveLeaderRoleModel(config, role, label);
+      if ('error' in outcome) throw outcome.error;
+      const { resolved, apiKey } = outcome;
       const provider = providers.get(resolved.providerId) ?? aliases[providers.size];
       providers.set(resolved.providerId, provider);
       apiKeys[provider] = apiKey;

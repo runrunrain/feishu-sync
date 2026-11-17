@@ -97,7 +97,18 @@ function makeAdmissionWorld(options: { pauseReadiness: boolean }) {
     knowledgeBaseRoot: kb,
     agent: { ...buildDefaultAgentConfig(root), runtime: { backend: 'pi' as const } },
     standardKb: { ...buildDefaultStandardKbConfig(root), orchestrationMode: 'pi-amagi' as const },
-    llm: { providers: [] },
+    // 模型契约准入（precheckLeaderModels）：pi-amagi 创建需可解析的
+    // openai-completions 角色（readiness 为受控替身，与此处配置无关；
+    // 旧空 providers 在创建时即被拒，准入正例需要一个真实可过预检的
+    // 提供商 fixture）。
+    llm: {
+      providers: [{
+        id: 'p-fixture', name: 'Fixture', enabled: true, apiKey: 'fixture-key',
+        protocol: 'openai-completions' as const, openAiCompatBaseUrl: 'https://example.invalid/v1',
+        defaultModelId: 'm-fixture',
+        models: [{ id: 'm-fixture', name: 'Fixture 模型', enabled: true, openAiModel: 'fixture-model' }],
+      }],
+    },
   };
   let signalEntered: (() => void) | null = null;
   let releaseGate: (() => void) | null = null;

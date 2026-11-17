@@ -36,6 +36,14 @@ export function ModelDefaultsSettings() {
   const agentProvider = providers.find((item) => item.id === (agent?.model.providerId || config.llm.activeProviderId));
   const agentPresetId = agent?.model.modelId || (agentProvider?.id === config.llm.activeProviderId ? config.llm.activeModelId : agentProvider?.defaultModelId);
   const agentPreset = agentProvider?.models.find((item) => item.id === agentPresetId);
+  // 标准库构建（Pi 编排）仅支持 OpenAI Chat Completions 兼容端点（与服务端
+  // resolveLeaderModels/precheckLeaderModels 同一契约）。readiness 对 app-llm
+  // 不限协议，这里用与 resolveProviderModel 等价的提供商选择回落（显式
+  // providerId > activeProviderId）在前端提前提示，避免用户点构建才被拒。
+  const buildModelProtocol = agentProvider?.protocol ?? 'openai-completions';
+  const buildProtocolWarning = agent?.model.source === 'app-llm' && buildModelProtocol !== 'openai-completions'
+    ? `当前默认模型协议为 ${buildModelProtocol === 'anthropic-messages' ? 'Anthropic' : 'OpenAI Responses'}，标准库构建仅支持 OpenAI Chat Completions 兼容端点。`
+    : '';
 
   return (
     <Card variant="elevated">
@@ -54,6 +62,7 @@ export function ModelDefaultsSettings() {
           标准库构建设置：{agent.model.source === 'pi-agent-dir' && agent.runtime.backend !== 'claude-code'
             ? `本地 Pi · ${agent.model.piModel || '未选择模型'}`
             : `${agentProvider?.name || '未选择提供商'} · ${agentPreset?.name || '未选择模型'}${agent.model.providerId || agent.model.modelId ? '（Agent 单独指定）' : '（跟随应用默认）'}`}。
+          {buildProtocolWarning ? <span className="text-amber-700">{buildProtocolWarning}</span> : null}
           {draft?.dirty ? '草稿保存后生效。' : ''}
         </p> : null}
         {providers.length === 0 ? (
