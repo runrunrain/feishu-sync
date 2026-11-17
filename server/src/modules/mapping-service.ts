@@ -25,6 +25,7 @@
 import { filterDeletedLocalDocuments, reconcileLocalIndex } from './local-index-reconcile.js';
 import { recoverLocalDocument } from './recover-local-document.js';
 import { localPathState } from './local-path-state.js';
+import { canonicalizeWatchedRootUrl } from './config-manager.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { workbookPathForMarkdown } from './workbook-source.js';
@@ -126,7 +127,12 @@ export class MappingService {
     // diff is about whether known mapped files changed, not a request to
     // rediscover the entire Wiki topology. Full reconciliation remains an
     // explicit detect route mode.
-    const result = await this.changeDetector.detectChanges(rootUrl, { mode: 'fast' });
+    //
+    // dashboard-root-missing fix (2026-11): canonicalize the caller-supplied
+    // URL before it enters ChangeDetector, so query-string/host variants
+    // cannot persist as documents.watched_root_url and split the frontend's
+    // URL-exact grouping away from the id-joined envelope.
+    const result = await this.changeDetector.detectChanges(this.canonicalRootUrlInput(rootUrl), { mode: 'fast' });
     const changed = result.changedDocuments;
 
     const added = changed.filter((c) => c.changeType === 'added');
@@ -154,6 +160,25 @@ export class MappingService {
       totalLocal,
       checkedAt: result.checkedAt,
     };
+  }
+
+  /**
+   * Canonicalize a caller-supplied detect/diff root URL (dashboard-root-
+   * missing fix, 2026-11). Raw route inputs used to flow into
+   * ChangeDetector → documents.watched_root_url with query strings / host
+   * variants, while the watched_roots envelope joined by watched_root_id —
+   * the id/URL ownership asymmetry made synced roots disappear from the
+   * overview grouping. When the canonical id hits a configured watchedRoot,
+   * adopt that root's current canonical url (double safety against
+   * tenant-host drift); unmatched URLs keep the detect-any-subtree
+   * semantics but are written in canonical form. Raw tokens and
+   * structurally non-canonical inputs pass through unchanged.
+   */
+  private canonicalRootUrlInput(rootUrl: string): string {
+    const canonical = canonicalizeWatchedRootUrl(rootUrl);
+    if (!canonical) return rootUrl;
+    const configured = this.configManager?.getConfig()?.watchedRoots?.find((root) => root.id === canonical.id);
+    return configured?.url ?? canonical.url;
   }
 
   /**
@@ -478,7 +503,16 @@ export class MappingService {
       if (d.parentNodeToken) parentSet.add(d.parentNodeToken);
     }
 
-    return live.map((d) => this.projectNode(this.withRecoveredPath(d), parentSet, blocked.has(d.objToken)));
+    // dashboard-root-missing fix (2026-11): project the CONFIGURED root's
+    // current canonical URL when the row's watched_root_id hits
+    // configuredRoots (same ownership key the watched_roots envelope joins
+    // by); rows whose id no longer matches any configured root keep the
+    // stored URL column as a legacy fallback.
+    const canonicalRootUrlById = new Map(
+      (this.configManager?.getConfig()?.watchedRoots ?? []).map((root) => [root.id, root.url]),
+    );
+
+    return live.map((d) => this.projectNode(this.withRecoveredPath(d), parentSet, blocked.has(d.objToken), canonicalRootUrlById));
   }
 
   /**
@@ -524,6 +558,18 @@ export class MappingService {
     }
 
     let nodes: MappingNode[];
+    // dashboard-root-missing fix (2026-11): the watched_roots envelope joins
+    // documents by watched_root_id (authoritative), but projectNode used to
+    // emit the raw documents.watched_root_url column. Historical detect
+    // inputs persisted query-string/host variants there, so the frontend's
+    // URL-exact grouping dropped synced roots and ALL their documents even
+    // though the envelope reported them synced. Normalize at the read model:
+    // when a row's watched_root_id hits configuredRoots, emit that root's
+    // CURRENT canonical URL; unmatched ids keep the stored column value
+    // (legacy rows for roots that are no longer configured). Applies to both
+    // feishu and local views — same projection path, same ownership rule.
+    const configuredRoots = this.configManager?.getConfig()?.watchedRoots ?? [];
+    const canonicalRootUrlById = new Map(configuredRoots.map((root) => [root.id, root.url]));
     if (view === 'feishu') {
       // Cloud view: only rows with a feishu node identity.
       // The second filter drops placeholder nodes — rows with a non-empty
@@ -552,7 +598,7 @@ export class MappingService {
             d.customFolderId == null,
         )
         .map((d) => {
-          const node = this.projectNode(this.withRecoveredPath(d), parentSet, blocked.has(d.objToken));
+          const node = this.projectNode(this.withRecoveredPath(d), parentSet, blocked.has(d.objToken), canonicalRootUrlById);
           if (!(d.title ?? '').trim()) {
             const state = d.syncState ?? d.status;
             if (state === 'restricted' || d.cloudMatch === 'restricted' || d.status === 'placeholder') {
@@ -572,11 +618,10 @@ export class MappingService {
         });
     } else {
       // Local view: all rows (including local-only README/index).
-      nodes = live.map((d) => this.projectNode(this.withRecoveredPath(d), parentSet, blocked.has(d.objToken)));
+      nodes = live.map((d) => this.projectNode(this.withRecoveredPath(d), parentSet, blocked.has(d.objToken), canonicalRootUrlById));
     }
 
     // watched_roots envelope (always present).
-    const configuredRoots = this.configManager?.getConfig()?.watchedRoots ?? [];
     const watchedRoots: WatchedRoot[] =
       typeof (this.localMapStore as any).getWatchedRoots === 'function'
         ? (this.localMapStore as any).getWatchedRoots(configuredRoots)
@@ -625,7 +670,7 @@ export class MappingService {
    * watched_root_url to the projection so the frontend can group
    * top-level entries.
    */
-  private projectNode(d: any, parentSet: Set<string>, blocked = false): MappingNode {
+  private projectNode(d: any, parentSet: Set<string>, blocked = false, canonicalRootUrlById?: Map<string, string>): MappingNode {
     const wikiNodeToken = d.wikiNodeToken ?? null;
     const hasChild = wikiNodeToken != null && parentSet.has(wikiNodeToken);
     return {
@@ -656,7 +701,11 @@ export class MappingService {
         | 'unknown',
       // v0.2.0 structure-align Phase B: surface the watchedRoot that owns
       // this node so the frontend can group top-level entries.
-      watched_root_url: d.watchedRootUrl ?? null,
+      // dashboard-root-missing fix (2026-11): rows whose watched_root_id hits
+      // a configured root emit that root's CURRENT canonical URL (the same
+      // ownership key the envelope joins by); only legacy rows with an
+      // unconfigured id fall back to the stored URL column.
+      watched_root_url: canonicalRootUrlById?.get(d.watchedRootId ?? '') ?? d.watchedRootUrl ?? null,
     } satisfies MappingNode;
   }
 

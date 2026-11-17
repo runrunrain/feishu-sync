@@ -243,6 +243,18 @@ function hasWikiPermissionBlock(record: DocumentRecord | null): boolean {
 }
 
 /**
+ * Review F02 (2026-11): only URL-shaped traversal inputs may overwrite a
+ * row's stored watched_root_url during fast-check self-heal. Raw node/obj
+ * tokens are a supported detect input that routes/detect passes through
+ * unchanged; they are NOT canonical URLs, so overwriting with them would
+ * corrupt healthy canonical URLs and break the config-removal cascade
+ * cleanup (purgeWatchedRootData compares by canonical URL).
+ */
+function isUrlShapedRootUrl(rootUrl: string): boolean {
+  return /^https?:\/\//i.test(rootUrl);
+}
+
+/**
  * A malformed/partial wiki node-list response may omit an intermediate
  * parent even though a child is visible. Repair only those missing ancestors
  * with node-get; never fall back to stale SQLite topology. The hard cap keeps
@@ -745,7 +757,17 @@ export class ChangeDetector {
             spaceId: record.spaceId ?? null,
             parentNodeToken: record.parentNodeToken ?? null,
             watchedRootId: record.watchedRootId || rootToken,
-            watchedRootUrl: record.watchedRootUrl ?? rootUrl,
+            // dashboard-root-missing self-heal (2026-11, review F02 收紧):
+            // rows already owned by THIS root (watched_root_id === rootToken)
+            // adopt the traversal's canonical rootUrl ONLY when the input is
+            // URL-shaped — overwriting legacy query/host variants in one
+            // pass while never clobbering a healthy canonical URL with a
+            // passthrough raw token. Rows owned by a different root id keep
+            // their own URL so a cross-root traversal can never re-assign
+            // ownership.
+            watchedRootUrl: record.watchedRootId === rootToken && isUrlShapedRootUrl(rootUrl)
+              ? rootUrl
+              : (record.watchedRootUrl ?? rootUrl),
             observedObjEditTime: meta.latestModifyTime,
             hasChild: record.hasChild === true,
             observationStatus: 'available',
@@ -816,7 +838,10 @@ export class ChangeDetector {
             wikiNodeToken: record.wikiNodeToken ?? '', objToken: record.objToken,
             objType: record.objType, title: record.title, spaceId: record.spaceId ?? null,
             parentNodeToken: record.parentNodeToken ?? null, watchedRootId: record.watchedRootId || rootToken,
-            watchedRootUrl: record.watchedRootUrl ?? rootUrl, observedObjEditTime: null,
+            // 同上（含 F02 收紧）：仅 URL 形输入覆盖本根行 canonical URL；裸 token 保留原值，跨根行永不接管。
+            watchedRootUrl: record.watchedRootId === rootToken && isUrlShapedRootUrl(rootUrl)
+              ? rootUrl
+              : (record.watchedRootUrl ?? rootUrl), observedObjEditTime: null,
             hasChild: record.hasChild === true, observationStatus: 'restricted',
           });
         }
@@ -833,7 +858,10 @@ export class ChangeDetector {
         spaceId: detail.node.space_id ?? record.spaceId ?? null,
         parentNodeToken: detail.node.parent_node_token ?? record.parentNodeToken ?? null,
         watchedRootId: record.watchedRootId || rootToken,
-        watchedRootUrl: record.watchedRootUrl ?? rootUrl,
+        // 同上（含 F02 收紧）：仅 URL 形输入覆盖本根行 canonical URL；裸 token 保留原值，跨根行永不接管。
+        watchedRootUrl: record.watchedRootId === rootToken && isUrlShapedRootUrl(rootUrl)
+          ? rootUrl
+          : (record.watchedRootUrl ?? rootUrl),
         observedObjEditTime,
         hasChild: detail.node.has_child ?? (record.hasChild === true),
         observationStatus: observedObjEditTime == null ? 'unavailable' : 'available',

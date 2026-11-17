@@ -965,3 +965,133 @@ describe('MappingService.updateSortOrder', () => {
   });
 
 });
+
+// ---------------------------------------------------------------------------
+// dashboard-root-missing fix (2026-11): watched_root_url canonical projection
+// ---------------------------------------------------------------------------
+// 服务端读模型统一：envelope 按 watched_root_id 主键统计，而节点投影过去直出
+// documents.watched_root_url 原始列。历史 detect 入口把 query/域名变体写进该列，
+// 与前端 URL 精确分组叠加后，已同步根及其全部文档从总览消失。现在投影时 id
+// 命中 configuredRoots 就输出该配置根的当前 canonical URL（与 envelope 同一
+// 归属键），未命中才保留行 URL 兑底。
+describe('MappingService watched_root_url canonical projection (dashboard-root-missing 2026-11)', () => {
+  const ROOT_TOKEN = 'Wramw1XxRihIgnkCrhqcdEbRnHb';
+  const CANONICAL = `https://qcnbafdrjx7n.feishu.cn/wiki/${ROOT_TOKEN}`;
+
+  function makeFixture() {
+    const store = new MockLocalMapStoreV4();
+    const detector = new MockChangeDetector();
+    const cfg = new MockConfigManager({
+      watchedRoots: [
+        {
+          id: ROOT_TOKEN,
+          url: CANONICAL,
+          localDir: '根目录',
+          layoutProfile: 'mirror-title-file',
+          enabled: true,
+        },
+      ],
+      knowledgeBaseRoot: '/tmp/kb',
+    });
+    const svc = new MappingService(detector as any, store as any, new MockSnapshotService() as any, cfg as any);
+    store.watchedRootsResult = [
+      {
+        url: CANONICAL,
+        nodeToken: ROOT_TOKEN,
+        title: '根目录',
+        displayName: '根目录',
+        localDir: '根目录',
+        trackMode: 'tracked',
+        status: 'synced',
+        lastDetectedAt: null,
+        childCount: 1,
+      },
+    ];
+    return { store, detector, svc };
+  }
+
+  it('四矩阵：行 URL 为 canonical/NULL/query 变体/域名变体（id 均命中配置）时全部投影为配置 canonical URL', () => {
+    const cases = [
+      ['same-config', CANONICAL],
+      ['null', null],
+      ['query-variant', `${CANONICAL}?from=from_copylink`],
+      ['host-variant', CANONICAL.replace('qcnbafdrjx7n.', 'other-tenant.')],
+    ] as const;
+    for (const [name, rowUrl] of cases) {
+      const { store, svc } = makeFixture();
+      store.rows.set(
+        'DOC',
+        makeDoc({
+          objToken: 'DOC',
+          wikiNodeToken: ROOT_TOKEN,
+          title: '文档',
+          watchedRootId: ROOT_TOKEN,
+          watchedRootUrl: rowUrl,
+        }),
+      );
+
+      const feishu = svc.getTreeDetailed({ view: 'feishu' });
+      expect(feishu.nodes, name).toHaveLength(1);
+      expect(feishu.nodes[0].watched_root_url, name).toBe(CANONICAL);
+      // envelope 照常物化，不受行 URL 变体影响（id 是权威归属键）
+      expect(feishu.watched_roots, name).toMatchObject([
+        { url: CANONICAL, nodeToken: ROOT_TOKEN, status: 'synced', childCount: 1 },
+      ]);
+      // local 视图同一投影路径，行为一致
+      const local = svc.getTreeDetailed({ view: 'local', includeOrphans: false });
+      expect(local.nodes[0].watched_root_url, name).toBe(CANONICAL);
+      // legacy getTree() 同样归一
+      expect(svc.getTree()[0].watched_root_url, name).toBe(CANONICAL);
+    }
+  });
+
+  it('id 未命中配置的行保持行 URL 列值兑底（不虚构归属）', () => {
+    const { store, svc } = makeFixture();
+    const legacyUrl = 'https://old-tenant.feishu.cn/wiki/UnconfiguredRoot00000000';
+    store.rows.set(
+      'LEGACY',
+      makeDoc({
+        objToken: 'LEGACY',
+        wikiNodeToken: 'legacy-node',
+        title: '旧根行',
+        watchedRootId: 'UnconfiguredRoot00000000',
+        watchedRootUrl: legacyUrl,
+      }),
+    );
+
+    expect(svc.getTreeDetailed({ view: 'feishu' }).nodes[0].watched_root_url).toBe(legacyUrl);
+  });
+
+  it('watchedRootId 为 NULL 的行保持行 URL 列值（无 id 可归一）', () => {
+    const { store, svc } = makeFixture();
+    const variantUrl = `${CANONICAL}?x=1`;
+    store.rows.set(
+      'URLONLY',
+      makeDoc({
+        objToken: 'URLONLY',
+        wikiNodeToken: 'url-only-node',
+        title: '仅 URL 行',
+        watchedRootUrl: variantUrl,
+      }),
+    );
+
+    expect(svc.getTreeDetailed({ view: 'feishu' }).nodes[0].watched_root_url).toBe(variantUrl);
+  });
+
+  it('computeDiff 把变体 rootUrl 归一后交给 detector：命中配置采用配置 url，未命中写规范化形式，raw token 透传', async () => {
+    const { detector, svc } = makeFixture();
+
+    // 端到端：带 query 输入时 detector 收到的是配置 canonical URL
+    await svc.computeDiff(`${CANONICAL}?from=from_copylink`);
+    expect(detector.lastRootUrl).toBe(CANONICAL);
+    // 域名变体（id 命中配置）同样采用配置 url（双保险）
+    await svc.computeDiff(CANONICAL.replace('qcnbafdrjx7n.', 'other-tenant.'));
+    expect(detector.lastRootUrl).toBe(CANONICAL);
+    // 未命中配置：保持「检测任意子树」语义，但写入规范化形式
+    await svc.computeDiff('https://other.feishu.cn/wiki/OtherRoot1234567890ABCDE/');
+    expect(detector.lastRootUrl).toBe('https://other.feishu.cn/wiki/OtherRoot1234567890ABCDE');
+    // raw token / 非法结构透传（无法 canonicalize）
+    await svc.computeDiff('OtherRoot1234567890ABCDE');
+    expect(detector.lastRootUrl).toBe('OtherRoot1234567890ABCDE');
+  });
+});

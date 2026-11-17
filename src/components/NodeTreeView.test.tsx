@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { findRenderableRoots } from './NodeTreeView';
+import { findRenderableRoots, groupRootsByWatchedRoot, NodeTreeView } from './NodeTreeView';
 import { recoverDisplayHierarchy } from '../utils/displayHierarchy';
-import type { MappingNode } from '../types';
+import type { MappingNode, WatchedRoot } from '../types';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { TreeNode } from './TreeNode';
+import { ToastProvider } from './common/Toast';
 
 function makeNode(overrides: Partial<MappingNode>): MappingNode {
   return {
@@ -87,4 +88,130 @@ it('在节点树中标记本地保留但暂无云文档访问权限的文档', (
     onDragStart={() => {}} onDragOver={() => {}} onDragLeave={() => {}} onDrop={() => {}} onDragEnd={() => {}} />);
   expect(html).toContain('保留文档');
   expect(html).toContain('暂无云文档访问权限');
+});
+
+function makeWatchedRoot(overrides: Partial<WatchedRoot>): WatchedRoot {
+  return {
+    url: 'https://example.feishu.cn/wiki/root',
+    nodeToken: 'root',
+    title: '根目录',
+    displayName: '根目录',
+    localDir: '根目录',
+    trackMode: 'tracked',
+    status: 'synced',
+    lastDetectedAt: null,
+    childCount: 1,
+    ...overrides,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// dashboard-root-missing 纵深防御（2026-11）：未匹配配置 URL 的非空 bucket
+// 不再静默消失；配置根无成员时组头常驻 + 空态提示。
+// ---------------------------------------------------------------------------
+describe('groupRootsByWatchedRoot（dashboard-root-missing 纵深防御）', () => {
+  const configuredUrl = 'https://example.feishu.cn/wiki/root';
+
+  it('未匹配任何配置 URL 的非空 bucket 节点进入「未分类」而不是消失', () => {
+    const watchedRoots = [makeWatchedRoot({})];
+    const variant = makeNode({
+      obj_token: 'variant',
+      wiki_node_token: 'variant-node',
+      watched_root_url: `${configuredUrl}?from=from_copylink`,
+    });
+    const hostVariant = makeNode({
+      obj_token: 'host-variant',
+      wiki_node_token: 'host-variant-node',
+      watched_root_url: configuredUrl.replace('example.', 'other-tenant.'),
+    });
+    const nullUrl = makeNode({ obj_token: 'nourl', wiki_node_token: 'nourl-node', watched_root_url: null });
+
+    const grouped = groupRootsByWatchedRoot([variant, hostVariant, nullUrl], watchedRoots, { childrenByParent: new Map() } as never);
+
+    expect(grouped).not.toBeNull();
+    // 未匹配配置 URL 的节点与 NULL URL 一致：并入未分类，不丢数据
+    expect(grouped!.unclassified.map((n) => n.obj_token)).toEqual(['variant', 'host-variant', 'nourl']);
+    expect(grouped!.groups[0].nodes).toEqual([]);
+  });
+
+  it('配置根无成员节点时保留分组（组头常驻，displayNodes 为空）', () => {
+    const watchedRoots = [makeWatchedRoot({}), makeWatchedRoot({ url: 'https://example.feishu.cn/wiki/rootB', nodeToken: 'rootB', displayName: '根 B', localDir: '根B', title: '根 B' })];
+
+    const grouped = groupRootsByWatchedRoot([], watchedRoots, { childrenByParent: new Map() } as never);
+
+    expect(grouped!.groups).toHaveLength(2);
+    expect(grouped!.groups.every((g) => g.displayNodes.length === 0)).toBe(true);
+    expect(grouped!.unclassified).toEqual([]);
+  });
+
+  it('匹配配置 URL 的节点仍按根分组，根层级折叠行为不变', () => {
+    const watchedRoots = [makeWatchedRoot({})];
+    const rootNode = makeNode({
+      obj_token: 'root-doc', wiki_node_token: 'root', watched_root_url: configuredUrl, has_child: true,
+    });
+    const child = makeNode({
+      obj_token: 'child', wiki_node_token: 'child-node', parent_node_token: 'root', watched_root_url: configuredUrl,
+    });
+    const tree = { childrenByParent: new Map([['root', [child]]]) } as never;
+
+    // 真实组件传入的是 findRenderableRoots 结果（子节点不在顶层集合内）
+    const grouped = groupRootsByWatchedRoot([rootNode], watchedRoots, tree);
+
+    // 根节点自身有子节点 → 分组内提升子节点为顶层（2026-08 需求保持）
+    expect(grouped!.groups[0].nodes.map((n) => n.obj_token)).toEqual(['root-doc']);
+    expect(grouped!.groups[0].displayNodes.map((n) => n.obj_token)).toEqual(['child']);
+  });
+
+  it('空配置根渲染组头与空态提示行，未知 URL 节点落入未分类（静态标记渲染）', () => {
+    const watchedRoots = [makeWatchedRoot({ displayName: '策划根目录' })];
+    const loose = makeNode({
+      obj_token: 'loose', wiki_node_token: 'loose-node', title: '散档顶层节点',
+      watched_root_url: 'https://other.feishu.cn/wiki/other-root',
+    });
+
+    const html = renderToStaticMarkup(
+      <ToastProvider>
+        <NodeTreeView nodes={[loose]} selectedToken={null} onSelect={() => {}} watchedRoots={watchedRoots} />
+      </ToastProvider>,
+    );
+
+    // 空配置根：组头仍在 + 空态提示
+    expect(html).toContain('策划根目录');
+    expect(html).toContain('尚无文档（未检测或未同步）');
+    // 未知 URL 非空 bucket：节点进入未分类，不再消失
+    expect(html).toContain('未分类');
+    expect(html).toContain('散档顶层节点');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Review F01 (2026-11)：全空数据集（nodes=[]、无归档）+ 配置根存在时，不得
+// 走全局「知识库尚未索引」空态——首次安装已配置根但未检测正是新用户场景，
+// 应渲染根组头与空态提示。仅无配置根时保留全局空态。
+// ---------------------------------------------------------------------------
+describe('NodeTreeView 全空数据集与配置根（review F01）', () => {
+  it('nodes=[] + 配置根存在：渲染根组头与「尚无文档」提示，不走全局空态', () => {
+    const watchedRoots = [makeWatchedRoot({ displayName: '空根目录' })];
+
+    const html = renderToStaticMarkup(
+      <ToastProvider>
+        <NodeTreeView nodes={[]} selectedToken={null} onSelect={() => {}} watchedRoots={watchedRoots} />
+      </ToastProvider>,
+    );
+
+    expect(html).toContain('空根目录');
+    expect(html).toContain('data-group-header="https://example.feishu.cn/wiki/root"');
+    expect(html).toContain('尚无文档（未检测或未同步）');
+    expect(html).not.toContain('知识库尚未索引');
+  });
+
+  it('nodes=[] 且无配置根：保留全局「尚未索引」空态（修复不改变无根语义）', () => {
+    const html = renderToStaticMarkup(
+      <ToastProvider>
+        <NodeTreeView nodes={[]} selectedToken={null} onSelect={() => {}} />
+      </ToastProvider>,
+    );
+
+    expect(html).toContain('知识库尚未索引');
+  });
 });

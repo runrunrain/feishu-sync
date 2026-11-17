@@ -25,6 +25,7 @@ import os from 'node:os';
 import { ChangeDetector } from '../src/modules/change-detector.js';
 import { MappingService } from '../src/modules/mapping-service.js';
 import { LarkCliClient } from '../src/modules/lark-cli-client.js';
+import { LocalMapStore } from '../src/modules/local-map-store.js';
 import type {
   CloudNodeObservation,
   LarkCliNodeInfo,
@@ -2311,5 +2312,142 @@ feishu_sync:
     expect(gapDoc).toBeDefined();
     expect(gapDoc?.mediaGapReason).toBe('local_placeholder_tags');
     expect(store.mediaGapMarkCalls).toContain('tok_custom_docx');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// dashboard-root-missing self-heal (2026-11): fast 检测对已配置根的行用当前
+// canonical rootUrl 覆盖旧 URL 变体（此前 `record.watchedRootUrl ?? rootUrl`
+// 优先保留旧值，一次检测无法收敛历史漂移）；id 不同的行保留原值，防止跨根
+// 误接管。
+// ---------------------------------------------------------------------------
+describe('ChangeDetector fast-check canonical rootUrl self-heal (dashboard-root-missing 2026-11)', () => {
+  it('overwrites legacy URL variants on rows owned by the traversed root, without adopting foreign-id rows', async () => {
+    const store = new MockLocalMapStore();
+    const rootUrl = 'https://example.feishu.cn/wiki/rootA';
+    const variantUrl = `${rootUrl}?from=from_copylink`;
+    store.rows.set('root-doc', makeLocal({
+      objToken: 'root-doc', wikiNodeToken: 'rootA', parentNodeToken: null,
+      watchedRootId: 'rootA', watchedRootUrl: variantUrl, hasChild: true,
+    }));
+    store.rows.set('doc-A', makeLocal({
+      objToken: 'doc-A', wikiNodeToken: 'node-A', parentNodeToken: 'rootA',
+      watchedRootId: 'rootA', watchedRootUrl: variantUrl,
+    }));
+    // id 不同（rootB）但 URL 恰等于本次 canonical：可被 URL 匹配进 tracked，
+    // 但云端真实挂在 rootB 子树下（不进入本根 BFS）；仅凭 URL 匹配不得改写
+    // 归属 id（拓扑观测的真实接管是另一套机制，不在本例）。
+    store.rows.set('foreign-doc', makeLocal({
+      objToken: 'foreign-doc', wikiNodeToken: 'node-B', parentNodeToken: 'rootB',
+      watchedRootId: 'rootB', watchedRootUrl: rootUrl,
+    }));
+    const getNode = vi.fn(async () => { throw new Error('known nodes need no detail lookup'); });
+    const lark = {
+      getNode,
+      async getDocumentMetas(requests: Array<{ docToken: string; docType: string }>) {
+        return {
+          metas: requests.map((r) => ({ ...r, latestModifyTime: 1000, title: 't-' + r.docToken })),
+          failed: [],
+        };
+      },
+      async listWikiNodes(opts: { parentNodeToken: string }) {
+        return [...store.rows.values()]
+          .filter((row) => row.wikiNodeToken !== 'rootA')
+          .map((row) => makeCloud({
+            obj_token: row.objToken, node_token: row.wikiNodeToken!,
+            parent_node_token: row.parentNodeToken ?? undefined, has_child: false,
+          }))
+          .filter((node) => node.parent_node_token === opts.parentNodeToken);
+      },
+    };
+    const detector = new ChangeDetector(lark as any, store as any);
+
+    const result = await detector.detectChanges(rootUrl, {
+      mode: 'fast', forceFresh: true, bypassCooldown: true,
+    });
+
+    expect(result.changedDocuments).toEqual([]);
+    // 本根（id === rootToken）行：旧 query 变体被 canonical 覆盖（一次检测自愈）
+    expect(store.rows.get('root-doc')).toMatchObject({ watchedRootId: 'rootA', watchedRootUrl: rootUrl });
+    expect(store.rows.get('doc-A')).toMatchObject({ watchedRootId: 'rootA', watchedRootUrl: rootUrl });
+    // 跨根行：id/URL 保持原值，不被本次遍历接管
+    expect(store.rows.get('foreign-doc')).toMatchObject({ watchedRootId: 'rootB', watchedRootUrl: rootUrl });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Review F02 (2026-11)：raw token 快速检测不得把本根行已有的 canonical URL
+// 改写成裸 token——那会让移除配置根时的级联清理（purgeWatchedRootData 按
+// canonical URL 比较）删不到任何行，文档残留。真实 SQLite + 真实 detector，
+// 飞书响应为人工 fixture（参照 agent-outputs/review-two-fixes-raw-token.mjs
+// 取证手法），临时目录运行后清理。
+// ---------------------------------------------------------------------------
+describe('ChangeDetector raw-token fast check must not corrupt canonical URLs (review F02)', () => {
+  it('keeps the healthy canonical watched_root_url and lets root-removal cascade purge the rows', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-sync-f02-'));
+    try {
+      const store = new LocalMapStore(path.join(directory, 'fixture.db'));
+      store.initialize();
+      const token = 'FixtureRoot123456789012345';
+      const canonical = `https://example.feishu.cn/wiki/${token}`;
+      store.recordCloudObservation({
+        wikiNodeToken: token, objToken: 'fixture-doc', objType: 'docx', title: 'Fixture leaf root',
+        spaceId: 'fixture-space', parentNodeToken: null, watchedRootId: token, watchedRootUrl: canonical,
+        observedObjEditTime: 1000, hasChild: false, observationStatus: 'available',
+        lastSeenAt: new Date().toISOString(),
+      });
+      const upstream = {
+        async getDocumentMetas(requests: Array<{ docToken: string; docType: string }>) {
+          return { metas: requests.map((r) => ({ ...r, latestModifyTime: 1000, title: 'Fixture leaf root' })), failed: [] };
+        },
+        async listWikiNodes() { return []; },
+        async getNode() { throw new Error('fixture forbids unexpected lookup'); },
+      };
+      const detector = new ChangeDetector(upstream as any, store);
+
+      // 裸 token 是受支持的 detect 输入（入口 canonicalize 返回 null 原样透传）
+      await detector.detectChanges(token, { mode: 'fast', forceFresh: true, bypassCooldown: true });
+
+      // 修复点：raw token 不得覆盖本根行已有的 canonical URL
+      expect(store.getDocumentByObjToken('fixture-doc')!.watchedRootUrl).toBe(canonical);
+
+      // 连带契约：移除配置根的级联清理按 canonical URL 比较，应能删净本根行
+      const purged = store.purgeWatchedRootData(canonical, token);
+      expect(purged.documents).toBe(1);
+      expect(store.getAllDocuments()).toHaveLength(0);
+      store.close();
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('mock 层复核：raw token 输入下本根行保留原值，URL 形输入下自愈不回退', async () => {
+    const store = new MockLocalMapStore();
+    const token = 'RawRoot12345678901234567';
+    const canonical = `https://example.feishu.cn/wiki/${token}`;
+    store.rows.set('doc-A', makeLocal({
+      objToken: 'doc-A', wikiNodeToken: 'node-A', parentNodeToken: token,
+      watchedRootId: token, watchedRootUrl: canonical,
+    }));
+    const lark = {
+      async getNode() { throw new Error('not used'); },
+      async getDocumentMetas(requests: Array<{ docToken: string; docType: string }>) {
+        return { metas: requests.map((r) => ({ ...r, latestModifyTime: 1000, title: 't-' + r.docToken })), failed: [] };
+      },
+      async listWikiNodes() { return []; },
+    };
+    const detector = new ChangeDetector(lark as any, store as any);
+
+    // raw token：canonical 保留（旧 `?? rootUrl` 兜底行为）
+    await detector.detectChanges(token, { mode: 'fast', forceFresh: true, bypassCooldown: true });
+    expect(store.rows.get('doc-A')).toMatchObject({ watchedRootId: token, watchedRootUrl: canonical });
+
+    // URL 形：变体仍被 canonical 覆盖（F02 收紧不回退自愈）
+    store.rows.set('doc-A', makeLocal({
+      objToken: 'doc-A', wikiNodeToken: 'node-A', parentNodeToken: token,
+      watchedRootId: token, watchedRootUrl: `${canonical}?from=copy`,
+    }));
+    await detector.detectChanges(canonical, { mode: 'fast', forceFresh: true, bypassCooldown: true });
+    expect(store.rows.get('doc-A')).toMatchObject({ watchedRootId: token, watchedRootUrl: canonical });
   });
 });

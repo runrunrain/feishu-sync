@@ -306,6 +306,64 @@ describe('POST /api/detect/changes', () => {
     expect(body.error).toBe('Change detection failed');
     expect(body.message).toBe('stub failure');
   });
+
+  // -------------------------------------------------------------------------
+  // dashboard-root-missing fix (2026-11): rootUrl canonicalization at the
+  // write boundary. The route used to pass query/host variants through
+  // verbatim into ChangeDetector → documents.watched_root_url, which then
+  // failed the frontend's URL-exact grouping even though the envelope
+  // joined the same rows as synced by watched_root_id.
+  // -------------------------------------------------------------------------
+  it('canonicalizes query-string variants and adopts the configured root url when the id matches', async () => {
+    const stub = makeStubDetector({ changed: false, changedDocuments: [], totalNodes: 0, checkedAt: 't' });
+    const app = buildApp({ changeDetector: stub.instance, configManager: makeStubConfig([FEISHU_URL]) });
+
+    const res = await app.fetch(
+      new Request('http://x/api/detect/changes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rootUrl: `${FEISHU_URL}?from=from_copylink` }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    expect(stub.calls.length).toBe(1);
+    // 命中已配置 watchedRoot（按 id）→ 直接采用配置的 canonical url
+    expect(stub.calls[0].rootUrl).toBe(FEISHU_URL);
+  });
+
+  it('canonicalizes host variants back to the configured root url (double safety)', async () => {
+    const stub = makeStubDetector({ changed: false, changedDocuments: [], totalNodes: 0, checkedAt: 't' });
+    const app = buildApp({ changeDetector: stub.instance, configManager: makeStubConfig([FEISHU_URL]) });
+    const hostVariant = FEISHU_URL.replace('qcnbafdrjx7n.', 'other-tenant.');
+
+    const res = await app.fetch(
+      new Request('http://x/api/detect/changes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rootUrl: hostVariant }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    expect(stub.calls[0].rootUrl).toBe(FEISHU_URL);
+  });
+
+  it('canonicalizes trailing slashes even when no configured root (or configManager) is present', async () => {
+    // 未命中配置：保持「检测任意子树」语义，但交给 detector 的是规范化形式；
+    // 不注入 configManager 也要能工作（老部署/部分测试装配方式）。
+    const stub = makeStubDetector({ changed: false, changedDocuments: [], totalNodes: 0, checkedAt: 't' });
+    const app = buildApp({ changeDetector: stub.instance });
+    const unconfigured = 'https://some-tenant.feishu.cn/wiki/UnknownToken1234567890AB/';
+
+    const res = await app.fetch(
+      new Request('http://x/api/detect/changes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rootUrl: `${unconfigured}?x=1` }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    expect(stub.calls[0].rootUrl).toBe('https://some-tenant.feishu.cn/wiki/UnknownToken1234567890AB');
+  });
 });
 
 // ---------------------------------------------------------------------------

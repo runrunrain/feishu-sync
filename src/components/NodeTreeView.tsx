@@ -112,7 +112,7 @@ interface NodeTreeViewProps {
   focusRequest?: (TreeNavTarget & { nonce: number }) | null;
 }
 
-interface TreeBucket {
+export interface TreeBucket {
   // parent_node_token (wiki_node_token form) → children sorted by sortOrder/title.
   // 飞书节点的 parent_node_token 指向父节点的 wiki_node_token（非 obj_token），
   // 因此 childrenByParent 的 key 必须按 parent_node_token 聚合，renderNode
@@ -178,6 +178,64 @@ export function findRenderableRoots(nodes: MappingNode[]): MappingNode[] {
       return !parentToken || !knownWikiNodeTokens.has(parentToken);
     })
     .sort(compareTreeNodes);
+}
+
+/** watchedRoot 分组结果（groupRootsByWatchedRoot 输出）。 */
+export interface WatchedRootGroup {
+  watchedRoot: WatchedRoot;
+  /** 分组内按 URL 匹配到的顶层节点（未做根层级折叠）。 */
+  nodes: MappingNode[];
+  /** 实际渲染的顶层节点（根节点自身有子节点时提升其子节点）。 */
+  displayNodes: MappingNode[];
+}
+
+/**
+ * v0.2.0 structure-align Phase D (D1)：顶层节点按 watchedRoot 分组。
+ * dashboard-root-missing 纵深防御（2026-11）：
+ *   - 未匹配任何配置根 URL 的非空 watched_root_url（历史漂移/旧客户端输出）
+ *     一律并入「未分类」，不再从树上静默消失；NULL URL 行为不变。
+ *   - 配置根即使暂时没有成员节点也保留分组（空组由渲染层显示空态
+ *     提示），不再被 filter 丢弃——「已启用但未检测/未同步」是配置事实，
+ *     不是应当抹掉的展示噪音。
+ * 抽成独立纯函数供组件与单测共用（逻辑与原 useMemo 体一致）。
+ */
+export function groupRootsByWatchedRoot(
+  roots: MappingNode[],
+  watchedRoots: WatchedRoot[] | undefined,
+  tree: TreeBucket,
+): { groups: WatchedRootGroup[]; unclassified: MappingNode[] } | null {
+  if (!watchedRoots || watchedRoots.length === 0) {
+    return null;
+  }
+  const configuredUrls = new Set(watchedRoots.map((wr) => wr.url));
+  const byUrl = new Map<string, MappingNode[]>();
+  const unclassified: MappingNode[] = [];
+  for (const r of roots) {
+    const url = r.watched_root_url;
+    if (url && configuredUrls.has(url)) {
+      const arr = byUrl.get(url) ?? [];
+      arr.push(r);
+      byUrl.set(url, arr);
+    } else {
+      unclassified.push(r);
+    }
+  }
+  const groups = watchedRoots.map((wr) => {
+    const raw = byUrl.get(wr.url) ?? [];
+    // 根 URL 层级不显示（2026-08 需求）：分组内若含 watched root 节点自身
+    // （wiki_node_token === wr.nodeToken，与分组头同名重复）且其有子节点，
+    // 隐藏该层级、把子节点提升为分组顶层；无子节点的根节点本身就是文档
+    // （如 [必读] 研发规范 README），保留显示，否则分组会空。
+    const displayNodes = raw.flatMap((n) => {
+      if (n.wiki_node_token && n.wiki_node_token === wr.nodeToken) {
+        const kids = tree.childrenByParent.get(n.wiki_node_token) ?? [];
+        if (kids.length > 0) return kids;
+      }
+      return [n];
+    });
+    return { watchedRoot: wr, nodes: raw, displayNodes };
+  });
+  return { groups, unclassified };
 }
 
 export function NodeTreeView({
@@ -540,41 +598,12 @@ export function NodeTreeView({
   // watchedRoots are provided. Roots that have a watched_root_url are
   // rendered under their watchedRoot's display_name header; roots without
   // a watched_root_url fall through to an "未分类" group at the end.
-  const groupedRoots = useMemo(() => {
-    if (!watchedRoots || watchedRoots.length === 0) {
-      return null;
-    }
-    const byUrl = new Map<string, MappingNode[]>();
-    const unclassified: MappingNode[] = [];
-    for (const r of roots) {
-      const url = (r as MappingNode & { watched_root_url?: string | null }).watched_root_url;
-      if (url) {
-        const arr = byUrl.get(url) ?? [];
-        arr.push(r);
-        byUrl.set(url, arr);
-      } else {
-        unclassified.push(r);
-      }
-    }
-    const groups = watchedRoots
-      .map((wr) => {
-        const raw = byUrl.get(wr.url) ?? [];
-        // 根 URL 层级不显示（2026-08 需求）：分组内若含 watched root 节点自身
-        // （wiki_node_token === wr.nodeToken，与分组头同名重复）且其有子节点，
-        // 隐藏该层级、把子节点提升为分组顶层；无子节点的根节点本身就是文档
-        // （如 [必读] 研发规范 README），保留显示，否则分组会空。
-        const displayNodes = raw.flatMap((n) => {
-          if (n.wiki_node_token && n.wiki_node_token === wr.nodeToken) {
-            const kids = tree.childrenByParent.get(n.wiki_node_token) ?? [];
-            if (kids.length > 0) return kids;
-          }
-          return [n];
-        });
-        return { watchedRoot: wr, nodes: raw, displayNodes };
-      })
-      .filter((g) => g.nodes.length > 0);
-    return { groups, unclassified };
-  }, [roots, watchedRoots, tree]);
+  // dashboard-root-missing (2026-11)：未匹配配置 URL 的非空 bucket 同样进
+  // 「未分类」；空分组保留组头（详见 groupRootsByWatchedRoot 注释）。
+  const groupedRoots = useMemo(
+    () => groupRootsByWatchedRoot(roots, watchedRoots, tree),
+    [roots, watchedRoots, tree],
+  );
 
   const selectionCandidates = useMemo(() => {
     const output = new Set<string>();
@@ -919,7 +948,15 @@ export function NodeTreeView({
         action={{ label: '重试', onClick: fetchTree }}
       />
     );
-  } else if (roots.length === 0 && (!customFolders || customFolders.length === 0)) {
+  } else if (
+    roots.length === 0 &&
+    (!customFolders || customFolders.length === 0) &&
+    // Review F01 (2026-11)：存在配置根（watchedRoots 非空）时全空数据集
+    // 不再走全局「尚未索引」空态——首次安装已配置根但未检测/未同步正是
+    // 新用户场景，应进入分组渲染展示根组头与空态提示；仅无任何配置根、
+    // 无节点且无归档时才提示用户去配置。
+    (!watchedRoots || watchedRoots.length === 0)
+  ) {
     body = (
       <EmptyState
         icon={<AlertTriangle className="w-8 h-8 text-ink-faint" />}
@@ -957,13 +994,16 @@ export function NodeTreeView({
               ).map((g) => {
                 const groupKey = g.watchedRoot.url;
                 const groupCollapsed = collapsedGroups.has(groupKey);
-                // 过滤态下只保留可见根节点（匹配节点 + 祖先链）；
-                // 无任何可见节点的分组整体隐藏，避免空分组误导。
+                // 过滤态下只保留可见根节点（匹配节点 + 祖先链）；无任何
+                // 可见节点的分组整体隐藏，避免空分组误导。
+                // 非过滤态保留组头（dashboard-root-missing 2026-11）：配置根
+                // 已存在但未检测/未同步是配置事实，空组显示空态提示行，
+                // 不再从总览上消失。
                 const visibleGroupNodes =
                   visibleTokens === null
                     ? g.displayNodes
                     : g.displayNodes.filter((r) => visibleTokens.has(r.obj_token));
-                if (visibleGroupNodes.length === 0) return null;
+                if (visibleTokens !== null && visibleGroupNodes.length === 0) return null;
                 return (
                   <div key={groupKey} className="mb-2">
                     <div
@@ -995,7 +1035,17 @@ export function NodeTreeView({
                         {visibleGroupNodes.length} 项
                       </span>
                     </div>
-                    {!groupCollapsed && visibleGroupNodes.map((r) => renderNode(r, 0))}
+                    {!groupCollapsed &&
+                      (visibleGroupNodes.length === 0 ? (
+                        <div
+                          className="px-6 py-2 text-[11px] text-ink-faint font-sans-ui select-none"
+                          data-empty-root-group="true"
+                        >
+                          尚无文档（未检测或未同步）
+                        </div>
+                      ) : (
+                        visibleGroupNodes.map((r) => renderNode(r, 0))
+                      ))}
                   </div>
                 );
               })}
@@ -1019,7 +1069,7 @@ export function NodeTreeView({
                     <ChevronRight
                       className={`w-3 h-3 text-ink-faint shrink-0 transition-transform ${collapsedGroups.has(UNCLASSIFIED_KEY) ? '' : 'rotate-90'}`}
                     />
-                    未分类（未绑定 watchedRoot）
+                    未分类（未绑定/未匹配 watchedRoot）
                   </div>
                   {!collapsedGroups.has(UNCLASSIFIED_KEY) &&
                     visibleUnclassified.map((r) => renderNode(r, 0))}

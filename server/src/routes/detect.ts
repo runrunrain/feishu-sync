@@ -39,6 +39,7 @@
 import { Hono } from 'hono';
 import type { ChangeDetector } from '../modules/change-detector.js';
 import type { ConfigManager } from '../modules/config-manager.js';
+import { canonicalizeWatchedRootUrl } from '../modules/config-manager.js';
 import type {
   ChangeDetectionResult,
   ChangedDocument,
@@ -94,13 +95,29 @@ detectRoutes.post('/api/detect/changes', async (c) => {
     return c.json({ error: 'ChangeDetector not initialized' }, 500);
   }
 
+  // dashboard-root-missing fix (2026-11): canonicalize the input URL BEFORE
+  // it enters ChangeDetector → documents.watched_root_url. The route used to
+  // pass copy-link variants (query strings, trailing slashes, host variants)
+  // through verbatim; those rows then failed the frontend's URL-exact
+  // grouping even though the watched_roots envelope joined them by
+  // watched_root_id as synced, making the root AND all its documents vanish
+  // from the overview. When the canonical id hits a configured watchedRoot,
+  // adopt that root's current canonical url (double safety against
+  // tenant-host drift); unmatched URLs keep the detect-any-subtree semantics
+  // but are written in canonical form. Raw tokens pass through unchanged.
+  const canonicalRoot = canonicalizeWatchedRootUrl(rootUrl);
+  const canonicalRootUrl = canonicalRoot
+    ? ((((c as any).configManager as ConfigManager | undefined)?.getConfig()?.watchedRoots ?? [])
+        .find((root) => root.id === canonicalRoot.id)?.url) ?? canonicalRoot.url
+    : rootUrl;
+
   try {
     // The normal detect action checks already-mapped cloud files via Drive
     // metadata batches and discovers brand-new wiki nodes via one raw
     // node-list BFS (fast-added-fix). It does not download content or fetch
     // every node detail; full topology reconciliation remains opt-in through
     // body.mode. 媒体核对与 changes-all 同策略：主动检测默认全量。
-    const result = await changeDetector.detectChanges(rootUrl, {
+    const result = await changeDetector.detectChanges(canonicalRootUrl, {
       forceFresh: true,
       mode,
       mediaGapScope: body?.mediaGapScope === 'local-only' ? 'local-only' : 'full',
