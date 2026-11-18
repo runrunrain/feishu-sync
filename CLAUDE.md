@@ -120,7 +120,7 @@ npx tsx scripts/sync-latest.ts --skip-index --apply    # 提交KB正文，仅 cr
 
 - 0.3.50 起随安装包发布，0.4.0 起标准库构建默认 Pi 编排。先读 `docs/design/agent-knowledge-design.md`（基线）与 `docs/design/kb-agent-upgrade-design.md`（2026-10 升级增补），使用说明在 `docs/agent-knowledge.md`；`server/src/agent/`、`kb/`、`mcp/`、`sources/`、`ops/`、`cli/` 独立于既有同步/整理流水线。不要把 pi 接入 ContentBackend registry，也不为 pi 升级 Electron。
 - **构建编排 v2（pi-amagi）**：Leader/作者/审查者多角色派发，运行时在 `agent/build-runtime/`（dispatch-guard/process-ledger/process-residual/runtime-integrity 等）+ `kb/build-orchestration.ts`、`build-actors.ts`、`build-leader-supervisor.ts`。契约要点：epoch 换代与进程残留对账未确认即拒绝启动（换 epoch 或 rebuild 不能绕过旧残留）；发布走 publish-readiness 门（不可变 release + 原子切 CURRENT）；构建度量记入 `kb_builds.metrics_json`。详见 `docs/build-orchestration.md`。
-- 会话运行时 `agent.runtime.backend: 'pi' | 'claude-code'`：默认 pi 侧车，可选 Claude Code 后端（`agent/claude-runtime.ts`、`claude-code-process.ts` 等，runtime-resolver 解析），见 `docs/claude-runtime.md`。
+- 应用设置将 `agent.runtime.backend` 归一为 `pi`。会话继续使用保存在 `agent_sessions.runtime_backend` 的基座，Claude Code 兼容接口见 `docs/claude-runtime.md`。
 - pi 经外部 Node≥22.19、pi≥1.4/<2 的 JSONL RPC 启动。应用自身的转发扩展只调用回环内部API；服务端裁决工具集与能力令牌。应用自带的Discuss工具只读，Work不提供shell。显式添加的原生Pi插件是受用户信任的Node代码，以当前用户权限运行；不能用宿主工具围栏宣称它们具备OS沙箱。
 - Workspace 与原始库、标准库、数据根、完整应用代码/依赖、Node/pi运行资源和凭据根隔离；配置变更要做反向交叉验证，不能只在登记目录时校验。文件围栏不是同uid/外部自动执行器的OS沙箱。
 - 原始源以成功本地版本和hash为准，不能仅筛status=synced，也不能因cloudDeleted观测而删仍存在的源；CSV附件与主文档同围栏，源变化须阻断构建，模型skip不能绕过。

@@ -244,7 +244,61 @@ describe('native workbook source and authorized read reconstruction', () => {
     expect(saved.worksheets[0].getCell('B2').formula).toBe('2+2');
   });
 
-  it.each([-1, Number.NaN, Number.POSITIVE_INFINITY])('still rejects invalid dimension %s', async (size) => {
+  it('preserves automatic row heights alongside custom heights, hidden rows and cell content', async () => {
+    const { client } = readClient();
+    const info = client.getWorkbookInfo, layout = client.getSheetLayout;
+    client.getWorkbookInfo = async (token) => {
+      const result = await info(token);
+      result.data.sheets[0].row_count = 7;
+      return result;
+    };
+    client.getSheetLayout = async (options) => {
+      const result = await layout(options);
+      result.data.row_heights = [
+        { rows: '1:2', type: 'custom', height: 24 },
+        { rows: '3:7', type: 'auto' },
+      ];
+      result.data.row_groups = [{ rows: '7', level: 1 }];
+      return result;
+    };
+    const directory = temporary();
+    const source = await stageSourceWorkbook(client, 'token', directory, path.join(directory, '画板.md'));
+    const saved = new ExcelJS.Workbook();
+    await saved.xlsx.readFile(source.absolutePath);
+    const sheet = saved.worksheets[0];
+    expect(sheet.getRow(1).height).toBe(18);
+    expect(sheet.getRow(3).height).toBeUndefined();
+    expect(sheet.getRow(6).hidden).toBe(true);
+    expect(sheet.getRow(6).height).toBeUndefined();
+    expect(sheet.getCell('A6').value).toBeNull();
+    expect(sheet.getRow(7).outlineLevel).toBe(1);
+    expect(sheet.getRow(7).height).toBeUndefined();
+    expect(sheet.getCell('A7').value).toBeNull();
+    expect(sheet.getCell('B3').value).toBe('上行\n下行');
+    expect(sheet.getCell('B3').alignment.wrapText).toBe(true);
+    expect(JSON.parse(fs.readFileSync(source.metadataPath, 'utf-8')).approximations).toContainEqual({
+      sheet: '画板', kind: 'auto-row-height', detail: { rows: '3:7' },
+    });
+    expect((await readWorkbookPreview(source.absolutePath, 0)).sheet.warnings)
+      .toContain('预览对自动行高使用默认行高。');
+  });
+
+  it.each([
+    ['out of bounds', '3:7', '行高信息不完整或越界'],
+    ['incomplete coverage', '4:6', '行高或列宽未覆盖完整范围'],
+  ])('rejects automatic row heights with %s', async (_reason, rows, message) => {
+    const { client } = readClient(), layout = client.getSheetLayout;
+    client.getSheetLayout = async (options) => {
+      const result = await layout(options);
+      result.data.row_heights[1] = { rows, type: 'auto' };
+      return result;
+    };
+    const output = path.join(temporary(), 'invalid.xlsx');
+    await expect(reconstructWorkbookFromReads(client, 'token', output)).rejects.toThrow(message);
+    expect(fs.existsSync(output)).toBe(false);
+  });
+
+  it.each([undefined, -1, Number.NaN, Number.POSITIVE_INFINITY])('still rejects invalid dimension %s', async (size) => {
     const { client } = readClient(), layout = client.getSheetLayout;
     client.getSheetLayout = async (options) => { const result = await layout(options); result.data.row_heights[0].height = size; return result; };
     await expect(reconstructWorkbookFromReads(client, 'token', path.join(temporary(), 'invalid.xlsx'))).rejects.toThrow('行高信息');

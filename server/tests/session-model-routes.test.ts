@@ -122,7 +122,7 @@ it('rejects missing/disabled/unconfigured models, invalid levels and busy switch
   expect(f.store.getAgentSession(f.session.id)?.model_config_json).toBeNull();
 });
 
-it('new conversations choose their own backend without changing the application backend or existing sessions', async () => {
+it('defaults new conversations to Pi and keeps the backend of existing sessions', async () => {
   const f = await fixture();
   const historyPath = path.join(path.dirname((f.manager as unknown as { configPath: string }).configPath), 'existing.jsonl');
   fs.writeFileSync(historyPath, JSON.stringify({ type: 'message', id: 'prior', parentId: null, timestamp: '2026-01-01T00:00:00Z', message: { role: 'user', content: '旧会话内容' } }));
@@ -143,12 +143,12 @@ it('new conversations choose their own backend without changing the application 
   expect(f.service.configForSession(f.store, pi.id).agent.runtime.backend).toBe('pi');
 
   await f.manager.updateConfig({ agent: { ...f.manager.getConfig().agent, runtime: { ...f.manager.getConfig().agent.runtime, backend: 'claude-code' } } });
-  expect(f.manager.getConfig().agent.runtime.backend).toBe('claude-code');
+  expect(f.manager.getConfig().agent.runtime.backend).toBe('pi');
   expect(f.service.get(f.store, f.manager.getConfig(), pi.id)?.backend).toBe('pi');
   expect(f.service.get(f.store, f.manager.getConfig(), claude.id)?.backend).toBe('claude-code');
   expect(f.service.get(f.store, f.manager.getConfig(), f.session.id)?.backend).toBe('pi');
   expect(f.service.messages(f.store, f.session.id)).toMatchObject([{ id: 'prior', role: 'user', text: '旧会话内容' }]);
-  expect((await (await create({ mode: 'discuss' })).json()).backend).toBe('claude-code');
+  expect((await (await create({ mode: 'discuss' })).json()).backend).toBe('pi');
   for (const backend of ['other', null, 123]) {
     expect((await create({ backend })).status).toBe(400);
   }

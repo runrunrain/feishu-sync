@@ -120,40 +120,29 @@ beforeEach(() => {
   visionStatusMock.mockReset();
 });
 
-describe('Agent 基座选择', () => {
-  it('Claude Code 显示应用提供商，并标明原 Pi 选择不可用', () => {
-    const anthropic = { ...PROVIDERS[0], id: 'anthropic', name: '兼容 Anthropic', protocol: 'anthropic-messages' as const };
+describe('Pi 运行时设置', () => {
+  it('旧基座配置仍显示 Pi 的路径、更新入口与本地模型', () => {
     const agent = makeConfig().agent!;
     setup(makeConfig({ agent: { ...agent, runtime: { backend: 'claude-code' },
-      model: { ...agent.model, source: 'pi-agent-dir', piModel: 'pi/model' } }, llm: { providers: [...PROVIDERS, anthropic] } }));
+      model: { ...agent.model, source: 'pi-agent-dir', piModel: 'pi/model' } } }));
+
     const html = renderToStaticMarkup(<AgentRuntimeSettingsCard />);
-    expect(html).toContain('应用基础能力的 Agent 基座');
-    expect(html).toContain('新对话使用 Pi');
-    expect(html).toContain('Claude Code 路径覆盖');
+    expect(html).not.toContain('应用基础能力的 Agent 基座');
+    expect(html).not.toContain('Claude Code');
+    expect(html).toContain('Node 路径覆盖');
     expect(html).toContain('pi 路径覆盖');
     expect(html).toContain('更新 Pi');
-    expect(html).toContain('更新 Claude Code');
-    expect(html).toContain('Claude Code 需要 Anthropic Messages 兼容提供商');
-    expect(html).not.toContain('本地 Agent 配置（Pi）');
-    const providerSelect = html.match(/<select[^>]*aria-label="选择提供商"[^>]*>[\s\S]*?<\/select>/)?.[0] ?? '';
-    expect(providerSelect).toContain('兼容 Anthropic');
-    expect(providerSelect).toContain('原提供商不可用或协议不兼容');
-    expect(providerSelect).not.toContain('示例智谱');
-    expect(html).not.toContain('aria-label="pi 模型"');
+    expect(html).toContain('本地 Agent 配置（Pi）');
+    expect(html).toContain('aria-label="pi 模型"');
   });
 
-  it('Pi 基座仍可选择本地 Agent 配置', () => {
-    setup(makeConfig());
-    expect(renderToStaticMarkup(<AgentRuntimeSettingsCard />)).toContain('本地 Agent 配置（Pi）');
-  });
-
-  it('Claude Code accepts an Anthropic endpoint on an OpenAI-default provider', () => {
-    const dual = { ...PROVIDERS[0], protocolBaseUrls: { 'anthropic-messages': 'https://example.com/anthropic' } };
-    setup(makeConfig({ agent: { ...makeConfig().agent!, runtime: { backend: 'claude-code' } }, llm: { providers: [dual] } }));
+  it('Pi 的应用内模型保留各协议的可用提供商', () => {
+    const anthropic = { ...PROVIDERS[0], id: 'anthropic', name: '兼容 Anthropic', protocol: 'anthropic-messages' as const };
+    setup(makeConfig({ llm: { providers: [...PROVIDERS, anthropic] } }));
     const html = renderToStaticMarkup(<AgentRuntimeSettingsCard />);
     const select = html.match(/<select[^>]*aria-label="选择提供商"[^>]*>[\s\S]*?<\/select>/)?.[0] ?? '';
+    expect(select).toContain('兼容 Anthropic');
     expect(select).toContain('示例智谱');
-    expect(select).not.toContain('协议不兼容');
   });
 });
 

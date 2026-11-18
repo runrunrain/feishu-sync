@@ -246,8 +246,11 @@ export function verifyAmagiPackage(input: {
   let record: AmagiPackageInstallRecord;
   try {
     record = JSON.parse(fs.readFileSync(recordPath, 'utf-8'));
-  } catch {
-    throw new AmagiPackageError('amagi_record_missing', `缺少安装记录 ${recordPath}（目录可能被外部改动，删除后重装）`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new AmagiPackageError('amagi_record_missing', `缺少安装记录 ${recordPath}`);
+    }
+    throw new AmagiPackageError('amagi_record_invalid', `无法读取安装记录 ${recordPath}`);
   }
   const packageRoot = locatePackageRoot(installDir, record.layout ?? 'npm');
   if (input.contentHash && record.contentHash !== input.contentHash) {

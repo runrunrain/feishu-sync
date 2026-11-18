@@ -35,12 +35,10 @@ import {
   listAgentWorkspaces,
   listConversationModels,
   testAgentVision,
-  testClaudeConnection,
 } from '../../api/client';
 import { describeReadinessCode as describeReadiness } from '../../utils/agentReadiness';
 import type {
   AgentConfig,
-  ClaudeConnectionTestResult,
   AgentVisionConfig,
   AgentVisionStatusDto,
   AgentVisionTestResult,
@@ -176,12 +174,8 @@ export function AgentRuntimeSettingsCard() {
   const agent = config?.agent;
   const [nodePath, setNodePath] = useState('');
   const [piCliPath, setPiCliPath] = useState('');
-  const [claudeCliPath, setClaudeCliPath] = useState('');
   const [saving, setSaving] = useState(false);
-  const [updatingRuntime, setUpdatingRuntime] = useState<'pi' | 'claude-code' | null>(null);
-  const [testingConnection, setTestingConnection] = useState(false);
-  const [connectionTest, setConnectionTest] = useState<ClaudeConnectionTestResult | null>(null);
-  const [configBackend, setConfigBackend] = useState<'pi' | 'claude-code' | null>(null);
+  const [updatingPi, setUpdatingPi] = useState(false);
   const [localModels, setLocalModels] = useState<Awaited<ReturnType<typeof listConversationModels>>['items']>([]);
   const [localModelsLoading, setLocalModelsLoading] = useState(false);
   const [localModelsError, setLocalModelsError] = useState(false);
@@ -236,8 +230,7 @@ export function AgentRuntimeSettingsCard() {
   useEffect(() => {
     setNodePath(agent?.runtime?.nodePath ?? '');
     setPiCliPath(agent?.runtime?.piCliPath ?? '');
-    setClaudeCliPath(agent?.runtime?.claudeCliPath ?? '');
-  }, [agent?.runtime?.nodePath, agent?.runtime?.piCliPath, agent?.runtime?.claudeCliPath]);
+  }, [agent?.runtime?.nodePath, agent?.runtime?.piCliPath]);
 
   const readiness = agentStatus.status
     ? describeReadiness(agentStatus.status.code, agentStatus.status)
@@ -245,26 +238,23 @@ export function AgentRuntimeSettingsCard() {
   const ready = agentStatus.status?.code === 'ready' && !agentStatus.unreachable;
 
   const providers = useMemo(() => (config?.llm.providers ?? []).filter((p) => p.enabled && p.apiKey?.trim() && (/^https?:\/\//i.test(p.openAiCompatBaseUrl) || Object.values(p.protocolBaseUrls ?? {}).some((url) => /^https?:\/\//i.test(url ?? ''))) && p.models.some((m) => m.enabled && m.openAiModel.trim())), [config?.llm.providers]);
-  const supportsClaude = (p: typeof providers[number]) => /^https?:\/\//i.test(p.protocolBaseUrls?.['anthropic-messages'] || (p.protocol === 'anthropic-messages' ? p.openAiCompatBaseUrl : ''));
   const visionSelectedProvider = providers.find((p) => p.id === visionProviderId);
   const providerOverride = agent?.model?.providerId || '';
   const modelOverride = agent?.model?.modelId || '';
   const currentProviderId = providerOverride || config?.llm.activeProviderId || '';
   const selectedProvider = providers.find((p) => p.id === currentProviderId);
   const currentModelId = agent?.model?.modelId || (currentProviderId === config?.llm.activeProviderId ? config?.llm.activeModelId : '') || selectedProvider?.defaultModelId || '';
-  const appBackend = agent?.runtime?.backend ?? 'pi';
-  const backend = configBackend ?? appBackend;
-  const source = backend === 'claude-code' ? 'app-llm' : agent?.model?.source ?? 'app-llm';
+  const source = agent?.model?.source ?? 'app-llm';
   const [modelsRefresh, setModelsRefresh] = useState(0);
   useEffect(() => {
-    if (backend !== 'pi' || source !== 'pi-agent-dir') return;
+    if (source !== 'pi-agent-dir') return;
     let cancelled = false;
     setLocalModelsLoading(true); setLocalModelsError(false);
     listConversationModels('pi-agent-dir', modelsRefresh > 0).then((result) => { if (!cancelled) setLocalModels(result.items); })
       .catch(() => { if (!cancelled) setLocalModelsError(true); })
       .finally(() => { if (!cancelled) setLocalModelsLoading(false); });
     return () => { cancelled = true; };
-  }, [backend, source, modelsRefresh]);
+  }, [source, modelsRefresh]);
   const piModel = agent?.model?.piModel ?? '';
   const piModels = useMemo(() => {
     return [...new Set(localModels.flatMap((model) => model.piModel ? [model.piModel] : []))].sort((a, b) => a.localeCompare(b));
@@ -285,17 +275,16 @@ export function AgentRuntimeSettingsCard() {
   const manualPiLevels = agent?.model?.piThinkingLevels?.[piModel];
   const knownLevels = source === 'pi-agent-dir'
     ? detectedPiLevels ?? (manualPiLevels ? ['off' as const, ...manualPiLevels.filter((level) => level !== 'off')] : undefined)
-    : selectedPreset?.reasoning ? (selectedPreset.thinkingLevels ? ['off' as const, ...selectedPreset.thinkingLevels.filter((level) => level !== 'off' && (backend !== 'claude-code' || level !== 'minimal'))] : undefined) : ['off' as const];
+    : selectedPreset?.reasoning ? (selectedPreset.thinkingLevels ? ['off' as const, ...selectedPreset.thinkingLevels.filter((level) => level !== 'off')] : undefined) : ['off' as const];
 
   useSettingsForm('agent-runtime', () => {
     if (!agent) return null;
-    const paths = { nodePath: nodePath.trim() || undefined, piCliPath: piCliPath.trim() || undefined, claudeCliPath: claudeCliPath.trim() || undefined };
-    if (paths.nodePath === agent.runtime.nodePath && paths.piCliPath === agent.runtime.piCliPath && paths.claudeCliPath === agent.runtime.claudeCliPath) return null;
+    const paths = { nodePath: nodePath.trim() || undefined, piCliPath: piCliPath.trim() || undefined };
+    if (paths.nodePath === agent.runtime.nodePath && paths.piCliPath === agent.runtime.piCliPath) return null;
     return { agent: { ...agent, runtime: { ...agent.runtime, ...paths } } };
   });
 
   const saveAgent = async (patch: {
-    runtime?: Partial<AgentConfig['runtime']>;
     model?: Partial<AgentConfig['model']>;
     vision?: Partial<AgentVisionConfig>;
   }) => {
@@ -316,7 +305,6 @@ export function AgentRuntimeSettingsCard() {
         };
       const next: AgentConfig = {
         ...baseAgent,
-        runtime: { ...baseAgent.runtime, ...(patch.runtime ?? {}) },
         model: { ...baseAgent.model, ...(patch.model ?? {}) },
         ...(patch.vision ? { vision: { ...DEFAULT_VISION_CONFIG, ...baseAgent.vision, ...patch.vision } } : {}),
       };
@@ -334,23 +322,6 @@ export function AgentRuntimeSettingsCard() {
       icon={<Bot className="w-4 h-4" />}
       title="Agent 运行时与模型"
     >
-      <div>
-        <FieldLabel>应用基础能力的 Agent 基座</FieldLabel>
-        <select aria-label="应用基础能力的 Agent 基座" className={`w-auto max-w-full ${INPUT_BASE_CLS}`} value={appBackend} disabled={saving}
-          onChange={(e) => { setConfigBackend(backend); void saveAgent({ runtime: { backend: e.target.value as 'pi' | 'claude-code' } }); }}>
-          <option value="pi">Pi</option><option value="claude-code">Claude Code</option>
-        </select>
-        <p className="mt-1 text-[11px] text-ink-faint">用于标准库构建。新对话使用 Pi。</p>
-      </div>
-      <div>
-        <FieldLabel>查看基座配置</FieldLabel>
-        <div className="flex gap-2">
-          <Button size="sm" variant={backend === 'pi' ? 'primary' : 'secondary'} onClick={() => setConfigBackend('pi')}>Pi 配置</Button>
-          <Button size="sm" variant={backend === 'claude-code' ? 'primary' : 'secondary'} onClick={() => setConfigBackend('claude-code')}>Claude Code 配置</Button>
-        </div>
-        <p className="mt-1 text-[11px] text-ink-faint">此处仅切换配置视图。</p>
-        {backend === 'claude-code' && <p className="mt-1 text-[11px] text-ink-faint">Claude Code 需要 Anthropic Messages 兼容提供商。Pi 插件仅适用于 Pi。</p>}
-      </div>
       {/* 就绪状态 */}
       <div className="flex items-center gap-3 flex-wrap px-3 py-2.5 rounded-md border border-line bg-paper/40">
         {agentStatus.loading ? (
@@ -365,20 +336,20 @@ export function AgentRuntimeSettingsCard() {
         <Button size="sm" variant="secondary" onClick={() => void agentStatus.recheck()} loading={agentStatus.rechecking}>
           <RefreshCw className="w-3.5 h-3.5" /> 重新检测
         </Button>
-        {(['pi', 'claude-code'] as const).map((runtimeBackend) => <Button key={runtimeBackend} size="sm" variant="secondary"
-          loading={updatingRuntime === runtimeBackend} disabled={saving || updatingRuntime !== null} onClick={() => {
-            setUpdatingRuntime(runtimeBackend);
-            void updateAgentRuntime(runtimeBackend).then(() => { toast.push({ type: 'success', message: `${runtimeBackend === 'pi' ? 'Pi' : 'Claude Code'} 已更新` }); agentStatus.refresh(); })
-              .catch((error) => toast.push({ type: 'error', message: error instanceof Error ? error.message : 'Agent 更新失败' }))
-              .finally(() => setUpdatingRuntime(null));
-          }}>更新 {runtimeBackend === 'pi' ? 'Pi' : 'Claude Code'}</Button>)}
+        <Button size="sm" variant="secondary" loading={updatingPi} disabled={saving || updatingPi} onClick={() => {
+          setUpdatingPi(true);
+          void updateAgentRuntime('pi')
+            .then(() => { toast.push({ type: 'success', message: 'Pi 已更新' }); agentStatus.refresh(); })
+            .catch((error) => toast.push({ type: 'error', message: error instanceof Error ? error.message : 'Pi 更新失败' }))
+            .finally(() => setUpdatingPi(false));
+        }}>更新 Pi</Button>
         <div className="min-w-0 text-[11px] text-ink-faint leading-relaxed">
           {agentStatus.status?.runtime.nodeVersion ? (
             <span className="font-mono">node {agentStatus.status.runtime.nodeVersion}</span>
           ) : (
             <span>未发现 Node</span>
           )}
-          {appBackend === 'claude-code' ? (agentStatus.status?.runtime.claudeVersion ? ` · Claude Code ${agentStatus.status.runtime.claudeVersion}` : ' · 未发现 Claude Code') : agentStatus.status?.runtime.piVersion ? (
+          {agentStatus.status?.runtime.piVersion ? (
             <>
               {' · '}
               <span className="font-mono">pi {agentStatus.status.runtime.piVersion}</span>
@@ -398,21 +369,6 @@ export function AgentRuntimeSettingsCard() {
         </div>
       </div>
       {draft?.dirty ? <p className="text-[11px] text-ink-faint">保存后可检测新配置。</p> : null}
-      <div className="space-y-2">
-        <div className="flex flex-wrap items-center gap-2">
-          <Button size="sm" variant="secondary" loading={testingConnection} disabled={saving || Boolean(draft?.dirty)} onClick={() => {
-            setTestingConnection(true); setConnectionTest(null);
-            void testClaudeConnection().then(setConnectionTest).catch((error) => setConnectionTest({ ok: false, providerName: '', model: '', latencyMs: 0,
-              errorMessage: error instanceof Error ? error.message : '连接测试失败' })).finally(() => setTestingConnection(false));
-          }}>测试 Claude Code 连接</Button>
-          <span className="text-[11px] text-ink-faint">测试使用已保存的模型，会消耗额度。</span>
-        </div>
-        {connectionTest ? <p role={connectionTest.ok ? 'status' : 'alert'} className={`text-xs ${connectionTest.ok ? 'text-jade' : 'text-seal-2'}`}>
-          {connectionTest.ok ? `连接成功 · ${connectionTest.providerName} / ${connectionTest.model} · ${(connectionTest.latencyMs / 1000).toFixed(1)} 秒`
-            : `连接失败：${connectionTest.errorMessage}`}
-        </p> : null}
-      </div>
-
       {/* 路径覆盖 */}
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <div>
@@ -435,24 +391,12 @@ export function AgentRuntimeSettingsCard() {
             aria-label="pi 路径覆盖"
           />
         </div>
-        <div>
-          <FieldLabel hint="留空自动发现">Claude Code 可执行文件路径</FieldLabel>
-          <input
-            className={`${INPUT_CLS} font-mono text-xs`}
-            value={claudeCliPath}
-            onChange={(e) => setClaudeCliPath(e.target.value)}
-            placeholder="自动发现 Claude Code"
-            aria-label="Claude Code 路径覆盖"
-          />
-        </div>
       </div>
 
       {/* 模型来源 */}
       <div>
         <FieldLabel>模型来源</FieldLabel>
-        {backend === 'claude-code' ? (
-          <p className="rounded-md border border-line px-3 py-2 text-xs text-ink">应用内服务提供商</p>
-        ) : <div className="grid grid-cols-2 gap-2">
+        <div className="grid grid-cols-2 gap-2">
           <label
             className={`flex items-center gap-2 px-3 py-2 rounded-md border cursor-pointer text-xs ${
               source === 'app-llm' ? 'border-seal/50 bg-[rgba(158,43,37,0.05)] text-ink' : 'border-line text-ink-soft hover:bg-paper'
@@ -483,7 +427,7 @@ export function AgentRuntimeSettingsCard() {
             />
             本地 Agent 配置（Pi）
           </label>
-        </div>}
+        </div>
       </div>
 
       {source === 'app-llm' ? (
@@ -497,15 +441,15 @@ export function AgentRuntimeSettingsCard() {
               aria-label="选择提供商"
             >
               <option value="">跟随应用默认{!providerOverride && selectedProvider ? `（当前：${selectedProvider.name}）` : ''}</option>
-              {providerOverride && (!selectedProvider || (backend === 'claude-code' && !supportsClaude(selectedProvider))) ? <option value={providerOverride} disabled>原提供商不可用或协议不兼容，请重新选择</option> : null}
-              {providers.filter((p) => backend !== 'claude-code' || supportsClaude(p)).map((p) => (
+              {providerOverride && !selectedProvider ? <option value={providerOverride} disabled>原提供商不可用，请重新选择</option> : null}
+              {providers.map((p) => (
                 <option key={p.id} value={p.id}>
-                  {p.name} · {backend === 'claude-code' || p.protocol === 'anthropic-messages' ? 'Anthropic' : p.protocol === 'openai-responses' ? 'Responses' : 'Chat Completions'}
+                  {p.name} · {p.protocol === 'anthropic-messages' ? 'Anthropic' : p.protocol === 'openai-responses' ? 'Responses' : 'Chat Completions'}
                 </option>
               ))}
             </select>
-            {providers.filter((p) => backend !== 'claude-code' || supportsClaude(p)).length === 0 ? (
-              <p className="mt-1 text-[11px] text-ink-faint">{backend === 'claude-code' ? '请配置 Anthropic Messages 兼容的提供商、API Key 和模型。' : '尚无可用提供商，请在「服务提供商与模型」中配置端点、API Key 并启用模型。'}</p>
+            {providers.length === 0 ? (
+              <p className="mt-1 text-[11px] text-ink-faint">尚无可用提供商，请在「服务提供商与模型」中配置端点、API Key 并启用模型。</p>
             ) : null}
           </div>
           <div>

@@ -12,6 +12,7 @@ import { buildPiProcessEnv, PiRpcProcess } from '../src/agent/pi-rpc-process.js'
 import { buildDefaultAgentConfig } from '../src/types/agent-knowledge.js';
 import { BuildRuntimeHost } from '../src/kb/build-runtime-host.js';
 import { ConfigManager } from '../src/modules/config-manager.js';
+import { makeFakePiSdk } from './helpers/fake-pi-git-sdk.js';
 
 const roots: string[] = [];
 const temp = () => { const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bundled-amagi-test-')); roots.push(root); return root; };
@@ -136,6 +137,38 @@ it('next application version replaces only the managed declaration and keeps old
   expect(JSON.parse(fs.readFileSync(settingsPath, 'utf8'))).toMatchObject({ images: { autoResize: false }, defaultThinkingLevel: 'high' });
   expect(computePackageContentHash(first.installPath).contentHash).toBe(previous.contentHash);
 }, 30_000);
+
+it('prepares a newer configured Amagi for builds after Pi becomes ready', async () => {
+  const root = temp();
+  const bundle = await fixture();
+  const upgrade = await fixture('2.23.5');
+  const source = path.join(path.dirname(upgrade.archivePath), 'source');
+  const piCliPath = fakeCli(root);
+  const piPackageRoot = makeFakePiSdk(root);
+  const appHome = path.join(root, 'agent', 'pi-home');
+  fs.mkdirSync(appHome, { recursive: true });
+  fs.writeFileSync(path.join(appHome, 'settings.json'), JSON.stringify({ packages: [source] }));
+  const manager = new ConfigManager(path.join(root, 'config.json'));
+  const config = await manager.load();
+  const resolver = { resolveRuntime: async () => ({
+    nodePath: process.execPath, nodeVersion: process.version,
+    piCliPath, piPackageRoot, piVersion: '1.5.2',
+  }) } as PiRuntimeResolver;
+  await installBundledAmagi({ dataRoot: root, nodePath: process.execPath, piCliPath, bundle });
+  const host = new BuildRuntimeHost({ dataRoot: root, resolver, toolService: null as never, pool: null as never,
+    configProvider: () => config, internalBaseUrl: () => '', knowledgeBaseRoot: () => '', outputRoot: () => '', bundledAmagi: () => bundle });
+
+  const before = await host.statusDto();
+  expect(before.amagi).toMatchObject({ pinnedVersion: '2.23.5', installState: 'missing' });
+  const preparation = host.ensureConfiguredAmagi();
+  expect(host.ensureConfiguredAmagi()).toBe(preparation);
+  const [status] = await Promise.all([host.statusDto(), preparation]);
+  await host.ensureConfiguredAmagi();
+  expect(status.amagi).toMatchObject({ version: '2.23.5', distribution: 'configured', installed: true });
+  const installed = verifyAmagiPackage({ dataRoot: root, version: '2.23.5' });
+  expect(installed.record.installedVia.sourceDir).toBe(source);
+  expect(fs.readFileSync(path.join(root, 'calls.jsonl'), 'utf8').trim().split('\n')).toHaveLength(2);
+}, 15_000);
 
 it('shipped private bundle installs with real Pi, is reported as builtin, loads native commands, and is selected by the build host', async (ctx) => {
   const bundle = readBundledAmagi(); expect(bundle).not.toBeNull();

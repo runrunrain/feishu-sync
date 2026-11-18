@@ -59,7 +59,7 @@ export function ModelDefaultsSettings() {
       </CardHeader>
       <CardBody className="space-y-4">
         {agent ? <p className="text-xs text-ink-soft" role="status">
-          标准库构建设置：{agent.model.source === 'pi-agent-dir' && agent.runtime.backend !== 'claude-code'
+          标准库构建设置：{agent.model.source === 'pi-agent-dir'
             ? `本地 Pi · ${agent.model.piModel || '未选择模型'}`
             : `${agentProvider?.name || '未选择提供商'} · ${agentPreset?.name || '未选择模型'}${agent.model.providerId || agent.model.modelId ? '（Agent 单独指定）' : '（跟随应用默认）'}`}。
           {buildProtocolWarning ? <span className="text-amber-700">{buildProtocolWarning}</span> : null}

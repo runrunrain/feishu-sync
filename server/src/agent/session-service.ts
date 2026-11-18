@@ -190,10 +190,8 @@ export class SessionService extends EventEmitter {
     const id = `s_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`;
     const title = (input.title ?? '新会话').trim().slice(0, 80) || '新会话';
     const now = new Date().toISOString();
-    // The explicit choice belongs to this conversation. Older callers that
-    // omit it retain the configured application backend as their default.
     const config = this.currentConfig();
-    const backend = input.backend ?? (config?.agent.runtime.backend === 'claude-code' ? 'claude-code' : 'pi');
+    const backend = input.backend ?? 'pi';
     const workspace = input.workspaceId ? this.workspaceOf(config, input.workspaceId) : null;
     if (input.workspaceId && !workspace) throw new ToolError('workspace_not_found', 'Workspace 不存在或未绑定', 404);
     const defaults = localMapStore.getAgentSessionDefaults(backend, workspace?.id ?? null);

@@ -31,15 +31,7 @@
 
 在「设置 → Agent 标准库」检查运行时状态；自动发现失败时，填写 Node 可执行文件路径和 pi 包路径，再点击重新检测。发现过程只读取常见安装目录和 PATH 上 pi 入口的真实路径，不执行 npm。自定义 npm prefix 未在 PATH 暴露 pi 时，需要显式填写 pi 包根或 `dist/cli.js` 路径。
 
-### Claude Code 使用应用配置
-
-新建会话时选择 Pi 或 Claude Code；已有会话保留原基座和历史。「运行时与模型」中的「应用基础能力的 Agent 基座」控制标准库构建等应用功能，修改后通过设置顶部的「保存」生效，构建期间不会中途更换基座。
-
-在「服务提供商与模型」的 Anthropic 区块配置 Messages Base URL 和认证方式。`API Key` 对应 `x-api-key`，`Bearer Token` 对应 `Authorization: Bearer`；两种方式共用该提供商的 API Key。旧配置保留 API Key 方式，智谱等网关请按服务商文档选择 Bearer Token。OpenAI 与 Anthropic 地址可以同时配置；Claude Code 始终读取 Anthropic 区块，即使常规请求默认选择 OpenAI。
-
-Claude Code 按所选模型预设读取模型代码、上下文窗口、输出上限和思考强度。凭据只进入应用启动的子进程环境，使用独立的 Claude 配置目录，不改写通用 Claude Code 的设置或登录信息；原生辅助模型别名也指向同一预设。
-
-保存后可点击「测试 Claude Code 连接」。测试会通过真实 Claude Code 进程发送固定的简短消息，不加载知识库工具，也不创建可见会话；它会产生少量模型用量，并显示提供商、模型、耗时或实际错误。若仍返回 401，请核对认证方式及该接口所需的账号密钥，应用不会自动切换到其他提供商。
+应用内新会话与标准库构建使用 Pi。已有会话使用各自保存的基座，历史消息随原会话保留。
 
 ### 输入框切换会话模型
 

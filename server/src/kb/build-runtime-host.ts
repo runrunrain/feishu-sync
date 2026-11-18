@@ -283,6 +283,7 @@ export class BuildRuntimeHost {
   private eventSeq = 0;
   /** amagi 安装/校验串行门（同版本并发防护）。 */
   private installInFlight = false;
+  private configuredPreparation: Promise<void> | null = null;
   /** A2 在途快照 seq（buildId → 代次+序号；换代后不继承旧序号，跨启动从磁盘旧文件继承）。 */
   private readonly dispatchInflightSeq = new Map<string, { generation: number; seq: number }>();
 
@@ -378,6 +379,19 @@ export class BuildRuntimeHost {
     };
   }
 
+  /** Provision the configured upgrade with Pi ready, before the first build or status refresh. */
+  ensureConfiguredAmagi(): Promise<void> {
+    if (this.configuredPreparation) return this.configuredPreparation;
+    this.configuredPreparation = (async () => {
+      const facts = await this.deps.resolver.resolveRuntime(this.config().agent);
+      if (!facts.nodePath || !facts.piCliPath) return;
+      const selected = await this.preferredAmagi({ nodePath: facts.nodePath, piPackageRoot: facts.piPackageRoot });
+      if (selected.bundle || !selected.sourceDir || this.installedFact(selected.version).state !== 'missing') return;
+      await this.installAmagi({ sourceDir: selected.sourceDir });
+    })().finally(() => { this.configuredPreparation = null; });
+    return this.configuredPreparation;
+  }
+
   private bundle(): BundledAmagi | null { return (this.deps.bundledAmagi ?? readBundledAmagi)(); }
 
   private staticReport(facts: { piVersion: string }, version: string, apiKeyOverride?: string, contentHash?: string, installDir?: string): CapabilityReport {
@@ -407,6 +421,7 @@ export class BuildRuntimeHost {
 
   /** 探测并 fail-closed 断言（构建路径；静态 fail → 明确 503，不降级）。 */
   private async probeOrFail(apiKeyOverride?: string, frozenPackage?: Pick<AmagiPackageRef, 'version' | 'contentHash'> & { installDir?: string }): Promise<{ report: CapabilityReport; amagiPackage: AmagiPackageRef; piVersion: string }> {
+    if (!frozenPackage) await this.configuredPreparation?.catch(() => {});
     const probed = frozenPackage
       ? { facts: await this.runtimeFacts(), selected: { version: frozenPackage.version, contentHash: frozenPackage.contentHash, sourceDir: null, installDir: frozenPackage.installDir } }
       : await this.probeReport(apiKeyOverride);
@@ -500,6 +515,7 @@ export class BuildRuntimeHost {
   /** 状态 DTO（UI：能力探测/包安装/运行状态；探测失败如实带回错误，但已装事实
    * 与发现结果不因探测失败被抹成「未安装」——plugin-install-fix 核心修正）。 */
   async statusDto(): Promise<BuildRuntimeStatusDto> {
+    await this.configuredPreparation?.catch(() => {});
     const mode = this.config().standardKb.orchestrationMode ?? 'pi-amagi';
     const bundle = this.bundle();
     let fact = this.installedFact(bundle?.version, bundle?.contentHash);

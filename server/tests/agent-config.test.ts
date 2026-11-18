@@ -78,6 +78,20 @@ describe('旧配置兼容（additive 默认合并）', () => {
     expect(secondWrite).toBe(firstWrite);
   });
 
+  it('启动时把旧的应用级 Claude Code 基座迁移为 Pi 并持久化', async () => {
+    const configPath = newConfigPath();
+    await new ConfigManager(configPath).load();
+    const stored = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    stored.agent.runtime = { backend: 'claude-code', claudeCliPath: 'C:/tools/claude.exe' };
+    stored.agent.model = { ...stored.agent.model, source: 'pi-agent-dir', piModel: 'example/model' };
+    fs.writeFileSync(configPath, JSON.stringify(stored));
+
+    const migrated = await new ConfigManager(configPath).load();
+    expect(migrated.agent.runtime).toMatchObject({ backend: 'pi', claudeCliPath: 'C:/tools/claude.exe' });
+    expect(migrated.agent.model).toMatchObject({ source: 'pi-agent-dir', piModel: 'example/model' });
+    expect(JSON.parse(fs.readFileSync(configPath, 'utf8')).agent.runtime.backend).toBe('pi');
+  });
+
   it('已有 agent 段缺字段 → 宽容归一补默认', async () => {
     const configPath = newConfigPath();
     fs.writeFileSync(configPath, JSON.stringify({
@@ -118,11 +132,11 @@ describe('updateConfig 校验', () => {
     await expect(manager.updateConfig({ llm: { providers: [{ ...provider!, anthropicAuthType: 'unsupported' as never }] } })).rejects.toThrow(/anthropicAuthType/);
   });
 
-  it('切换 Claude 基座时保留 Pi 模型来源，拒绝未知基座', async () => {
+  it('旧客户端提交的 Claude 基座归一为 Pi，拒绝未知基座', async () => {
     const base = (await manager.load()).agent;
     const updated = await manager.updateConfig({ agent: { ...base, runtime: { backend: 'claude-code', claudeCliPath: 'C:/tools/claude.exe' },
       model: { ...base.model, source: 'pi-agent-dir', piModel: 'example/model' } } });
-    expect(updated.agent.runtime).toMatchObject({ backend: 'claude-code', claudeCliPath: 'C:/tools/claude.exe' });
+    expect(updated.agent.runtime).toMatchObject({ backend: 'pi', claudeCliPath: 'C:/tools/claude.exe' });
     expect(updated.agent.model).toMatchObject({ source: 'pi-agent-dir', piModel: 'example/model' });
     await expect(manager.updateConfig({ agent: { ...updated.agent, runtime: { backend: 'unknown' as never } } })).rejects.toThrow(/agent.runtime.backend/);
   });

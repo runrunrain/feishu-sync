@@ -1044,7 +1044,7 @@ export function NodeTreeView({
                           尚无文档（未检测或未同步）
                         </div>
                       ) : (
-                        visibleGroupNodes.map((r) => renderNode(r, 0))
+                        visibleGroupNodes.map((r) => renderNode(r, 1))
                       ))}
                   </div>
                 );
@@ -1072,7 +1072,7 @@ export function NodeTreeView({
                     未分类（未绑定/未匹配 watchedRoot）
                   </div>
                   {!collapsedGroups.has(UNCLASSIFIED_KEY) &&
-                    visibleUnclassified.map((r) => renderNode(r, 0))}
+                    visibleUnclassified.map((r) => renderNode(r, 1))}
                 </div>
               )}
             </>

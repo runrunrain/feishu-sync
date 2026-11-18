@@ -324,6 +324,9 @@ export async function readWorkbookPreview(absolutePath: string, sheetIndex: numb
       if (notes.some((entry: { kind?: string }) => entry.kind === 'attachment-json-preview')) {
         warnings.push('部分 JSON 附件保存为云端预览副本，非原件字节副本；请在 Markdown 的“表格附件”中查看。');
       }
+      if (notes.some((entry: { kind?: string }) => entry.kind === 'auto-row-height')) {
+        warnings.push('预览对自动行高使用默认行高。');
+      }
     }
   } catch { /* Native or historical workbooks may have no readable sidecar. */ }
   const images = sheet.getImages().map((image) => ({ ...image, range: image.range as NativeImageRange }));

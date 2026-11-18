@@ -301,7 +301,7 @@ function normalizeAgentConfigLoose(value: unknown, dataRoot: string): AgentConfi
   const runtimeRaw: Partial<AgentConfig['runtime']> = raw.runtime && typeof raw.runtime === 'object' ? raw.runtime : {};
   return {
     runtime: {
-      backend: runtimeRaw.backend === 'claude-code' ? 'claude-code' : 'pi',
+      backend: 'pi',
       nodePath: typeof runtimeRaw.nodePath === 'string' && runtimeRaw.nodePath.trim() ? runtimeRaw.nodePath.trim() : undefined,
       piCliPath: typeof runtimeRaw.piCliPath === 'string' && runtimeRaw.piCliPath.trim() ? runtimeRaw.piCliPath.trim() : undefined,
       claudeCliPath: typeof runtimeRaw.claudeCliPath === 'string' && runtimeRaw.claudeCliPath.trim() ? runtimeRaw.claudeCliPath.trim() : undefined,
@@ -1146,10 +1146,7 @@ export class ConfigManager {
         if (migrated._migrated) {
           const { _migrated, ...persisted } = migrated;
           await this.save(persisted);
-          console.info(
-            '[ConfigManager] config migration applied and persisted ' +
-              '(LLM shape upgrade and/or legacy larkCliPath cleanup).'
-          );
+          console.info('[ConfigManager] config migration applied and persisted');
         } else {
           console.info(`[ConfigManager] Loaded config from ${this.configPath}`);
         }
@@ -1533,6 +1530,7 @@ export class ConfigManager {
 
     // F1 additive：旧配置缺 agent/standardKb 段时补默认并写回一次。
     migrated = migrated || raw.agent === undefined || raw.standardKb === undefined;
+    migrated = migrated || raw.agent?.runtime?.backend === 'claude-code';
 
     // 退役两种旧编排模式：启动时归一且一次性落盘，避免重启后回退。
     migrated = migrated || raw.standardKb?.orchestrationMode !== 'pi-amagi';

@@ -98,7 +98,7 @@ interface PiCandidateCheck {
   nameOk: boolean;
 }
 
-function checkPiPackageRoot(packageRoot: string): PiCandidateCheck {
+export function checkPiPackageRoot(packageRoot: string): PiCandidateCheck {
   try {
     const pkgJsonPath = path.join(packageRoot, 'package.json');
     if (!fs.existsSync(pkgJsonPath)) {

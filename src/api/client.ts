@@ -48,7 +48,6 @@ import type {
 } from '../types';
 import type {
   AgentBackend,
-  ClaudeConnectionTestResult,
   AgentApprovalDto,
   AgentAttachmentDto,
   AgentMessageDto,
@@ -641,10 +640,6 @@ export async function refreshSheet(objToken: string): Promise<SyncResult> {
 
 export async function updateAgentRuntime(backend: 'pi' | 'claude-code'): Promise<void> {
   await request('/api/agent/runtime/update', { method: 'POST', body: JSON.stringify({ backend }) });
-}
-
-export function testClaudeConnection(): Promise<ClaudeConnectionTestResult> {
-  return request('/api/agent/claude/connection-test', { method: 'POST', body: '{}', timeoutMs: 90_000 });
 }
 
 /** Read durable issues that must be repaired in Feishu before syncing can continue. */

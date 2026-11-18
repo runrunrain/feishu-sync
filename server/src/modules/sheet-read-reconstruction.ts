@@ -241,7 +241,10 @@ async function readWindow(
   return nonEmpty;
 }
 
-function applyLayout(worksheet: ExcelJS.Worksheet, layout: JsonObject, rows: number, columns: number) {
+function applyLayout(
+  worksheet: ExcelJS.Worksheet, layout: JsonObject, rows: number, columns: number,
+  approximations: NonNullable<WorkbookReadManifest['approximations']>,
+) {
   const rowCoverage = new Set<number>(), colCoverage = new Set<number>();
   if (!Array.isArray(layout.row_heights) || !Array.isArray(layout.column_widths)
     || !Array.isArray(layout.hidden_rows) || !Array.isArray(layout.hidden_columns) || !Array.isArray(layout.merged_cells)) {
@@ -249,13 +252,22 @@ function applyLayout(worksheet: ExcelJS.Worksheet, layout: JsonObject, rows: num
   }
   for (const band of layout.row_heights) {
     const [start, end] = dimensions(band.rows);
-    if (!Number.isFinite(band.height) || band.height < 0 || end > rows) throw new Error('行高信息不完整或越界');
+    const automatic = band.type === 'auto' && band.height === undefined;
+    if (end > rows || (!automatic && (!Number.isFinite(band.height) || band.height < 0))) {
+      throw new Error('行高信息不完整或越界');
+    }
+    if (automatic) {
+      // Feishu reports the automatic setting without a measured height. Leave
+      // the XLSX row height unset so Excel can size it from the cell content.
+      approximations.push({ sheet: worksheet.name, kind: 'auto-row-height', detail: { rows: band.rows } });
+    }
     for (let row = start; row <= end; row++) {
-      // Feishu uses a zero dimension for collapsed/hidden rows and columns.
-      // ExcelJS serializes zero height as default, so also set the hidden flag.
-      worksheet.getRow(row).height = band.height * 0.75;
-      if (band.height === 0) worksheet.getRow(row).hidden = true;
       rowCoverage.add(row);
+      if (automatic) continue;
+      const target = worksheet.getRow(row);
+      target.height = band.height * 0.75;
+      // ExcelJS serializes zero height as default, so also set the hidden flag.
+      if (band.height === 0) target.hidden = true;
     }
   }
   for (const band of layout.column_widths) {
@@ -276,7 +288,12 @@ function applyLayout(worksheet: ExcelJS.Worksheet, layout: JsonObject, rows: num
     const [start, end] = typeof hidden === 'number' ? dimensions(String(hidden + 1))
       : dimensions(typeof hidden === 'string' ? hidden : hidden.rows);
     if (end > rows) throw new Error('隐藏行范围越界');
-    for (let row = start; row <= end; row++) worksheet.getRow(row).hidden = true;
+    for (let row = start; row <= end; row++) {
+      const target = worksheet.getRow(row);
+      target.hidden = true;
+      // ExcelJS omits rows with neither a height nor a cell, even when hidden.
+      target.getCell(1);
+    }
   }
   for (const hidden of layout.hidden_columns) {
     const [start, end] = typeof hidden === 'number' ? dimensions(String(hidden + 1))
@@ -290,7 +307,11 @@ function applyLayout(worksheet: ExcelJS.Worksheet, layout: JsonObject, rows: num
   for (const group of layout.row_groups ?? []) {
     const [start, end] = dimensions(group.rows ?? group.range);
     if (end > rows) throw new Error('行分组范围越界');
-    for (let row = start; row <= end; row++) worksheet.getRow(row).outlineLevel = Number(group.level ?? 1);
+    for (let row = start; row <= end; row++) {
+      const target = worksheet.getRow(row);
+      target.outlineLevel = Number(group.level ?? 1);
+      target.getCell(1);
+    }
   }
   for (const group of layout.column_groups ?? []) {
     const [start, end] = dimensions(group.cols ?? group.range, true);
@@ -340,7 +361,7 @@ export async function reconstructWorkbookFromReads(
     assertRevision(layout, info.revision);
     const worksheet = workbook.addWorksheet(String(source.sheet_name));
     worksheet.state = source.is_hidden ? 'hidden' : 'visible';
-    applyLayout(worksheet, layout, rows, columns);
+    applyLayout(worksheet, layout, rows, columns, manifest.approximations!);
     let cells = 0;
     const sizing = { rows: 256, columns: 32 };
     const embeddedImages: EmbeddedCellImage[] = [];

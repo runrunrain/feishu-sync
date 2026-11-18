@@ -1,11 +1,11 @@
 # Claude Code 运行时
 
-Claude Code 是 Agent 基座的第二选项（`agent.runtime.backend = 'claude-code'`，缺省 `'pi'`），与 pi 运行时并列驱动对话、Work、任务子进程与 legacy 构建 worker。实现集中在 `server/src/agent/` 下五个文件：`claude-runtime.ts`（发现与提供商解析）、`claude-code-process.ts`（进程适配）、`claude-process-factory.ts`（组装）、`claude-connection-test.ts`（连接测试）、`claude-bridge.cjs`（stdio 工具桥），以及 `runtime-resolver.ts` / `session-service.ts` 的接入段。
+应用的运行时设置、新会话默认和标准库构建使用 Pi。Claude Code 运行时用于已有 Claude Code 会话及显式指定基座的 API 会话。实现集中在 `server/src/agent/` 下五个文件：`claude-runtime.ts`（发现与提供商解析）、`claude-code-process.ts`（进程适配）、`claude-process-factory.ts`（组装）、`claude-connection-test.ts`（连接测试）、`claude-bridge.cjs`（stdio 工具桥），以及 `runtime-resolver.ts` / `session-service.ts` 的接入段。
 
 ## 适用范围
 
-- 会话可逐个选基座（`agent_sessions.runtime_backend`；新建会话不指定则跟随应用配置，`server/src/agent/session-service.ts:196`）。
-- pi-amagi 构建编排**不支持** Claude Code：`orchestrationMode='pi-amagi'` 需要 pi 基座，Claude Code 下创建即 400（`server/src/kb/kb-build-service.ts:791`）；`claude-native` 编排模式已废弃、显式传入即 400（`:786`）。legacy 编排的 worker 可用 Claude Code（`:4125`、`:4348`，ephemeral 进程）。
+- 会话从 `agent_sessions.runtime_backend` 读取自己的基座。创建会话的 API 可通过 `backend` 显式传入 Claude Code。
+- 标准库构建使用 `pi-amagi` 编排。旧版构建的运行时记录由兼容代码处理。
 
 ## 发现、校验与安装
 
@@ -13,7 +13,7 @@ Claude Code 是 Agent 基座的第二选项（`agent.runtime.backend = 'claude-c
 
 可用性校验 `inspectClaudeCode`：`--version` 取版本，`--help` 必须包含 `--bare`、`--strict-mcp-config`、`--tools`、`--permission-mode`、`--output-format`、`--mcp-config`、`--system-prompt-snapshot` 与 `--append-system-prompt-file`——缺任一判定不支持，提示更新。
 
-安装走 `RuntimeInstaller.install('claude-code')`（`server/src/agent/runtime-installer.ts`）：应用自管 npm 前缀安装 `@anthropic-ai/claude-code@latest`（`--ignore-scripts`，装后执行包内 `install.cjs` 完成收尾，再校验 supported），不改用户全局包；配置了自定义路径时拒绝代为更新。选择 Claude 基座后启动 `ensureMissing` 会同时确保 pi（构建插件仍依赖 pi）与 claude。手动触发：`POST /api/agent/runtime/update {backend}`（`server/src/routes/agent.ts`）。
+安装走 `RuntimeInstaller.install('claude-code')`（`server/src/agent/runtime-installer.ts`）：应用自管 npm 前缀安装 `@anthropic-ai/claude-code@latest`（`--ignore-scripts`，装后执行包内 `install.cjs` 完成收尾，再校验 supported），不改用户全局包；配置了自定义路径时拒绝代为更新。兼容接口：`POST /api/agent/runtime/update {backend}`（`server/src/routes/agent.ts`）。
 
 ## 模型要求
 

@@ -12,7 +12,7 @@ import { PiRuntimeResolver } from '../src/agent/runtime-resolver.js';
 const cleanups: Array<() => void> = [];
 afterEach(() => { vi.restoreAllMocks(); for (const cleanup of cleanups.splice(0)) cleanup(); });
 
-it('基础能力基座在创建构建时固定，设置更改只影响后续构建', async () => {
+it('旧客户端提交 Claude 基座后，已有构建和新构建仍使用 Pi', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kb-backend-'));
   const raw = path.join(root, 'raw'); fs.mkdirSync(raw);
   const manager = new ConfigManager(path.join(root, 'config.json')); await manager.load();
@@ -43,5 +43,5 @@ it('基础能力基座在创建构建时固定，设置更改只影响后续构�
   store.updateKbBuild(first.id, { status: 'cancelled' });
   const second = await service.createBuild(store, { mode: 'full', confirm: 'BUILD' });
   await expect(internal.spawnBuildProcess(second.id, {} as BuildRunState)).rejects.toThrow('停止在运行时探测');
-  expect(resolve).toHaveBeenLastCalledWith(expect.objectContaining({ runtime: expect.objectContaining({ backend: 'claude-code' }) }));
+  expect(resolve).toHaveBeenLastCalledWith(expect.objectContaining({ runtime: expect.objectContaining({ backend: 'pi' }) }));
 });

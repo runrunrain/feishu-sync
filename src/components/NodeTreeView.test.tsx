@@ -162,6 +162,18 @@ describe('groupRootsByWatchedRoot（dashboard-root-missing 纵深防御）', () 
     expect(grouped!.groups[0].displayNodes.map((n) => n.obj_token)).toEqual(['child']);
   });
 
+  it('有分组标题时首行缩进一级，无分组时保持顶层缩进', () => {
+    const node = makeNode({ obj_token: 'entry', watched_root_url: configuredUrl });
+    const render = (watchedRoots?: WatchedRoot[]) => renderToStaticMarkup(
+      <ToastProvider>
+        <NodeTreeView nodes={[node]} selectedToken={null} onSelect={() => {}} watchedRoots={watchedRoots} />
+      </ToastProvider>,
+    );
+
+    expect(render([makeWatchedRoot({})])).toMatch(/data-node-token="entry"[^>]*style="padding-left:16px"/);
+    expect(render()).toMatch(/data-node-token="entry"[^>]*style="padding-left:8px"/);
+  });
+
   it('空配置根渲染组头与空态提示行，未知 URL 节点落入未分类（静态标记渲染）', () => {
     const watchedRoots = [makeWatchedRoot({ displayName: '策划根目录' })];
     const loose = makeNode({
