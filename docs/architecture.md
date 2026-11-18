@@ -102,7 +102,7 @@ flowchart LR
 ### 其他目录
 
 - **kb-lan/**（6 文件）：局域网 MCP 网关（http-gateway/token-store/call-queue/gateway-manager/audit/network）；默认关闭，开启后 Bearer 鉴权，见 [kb-lan-mcp.md](./kb-lan-mcp.md)
-- **mcp/**（4 文件）：只读 stdio MCP（`kb-mcp-server.ts` + `kb-mcp-gateway.ts` + tools/output）；构建为无 SQLite 原生依赖的独立 CJS
+- **mcp/**：只读 stdio MCP、HTTP 网关与工具注册；WSL 桥接将 stdio 转发到现有 Windows 本机 HTTP 服务。各入口构建为无 SQLite 原生依赖的独立 CJS。
 - **sources/**（8 文件）：原始库受控写与写回飞书——`source-edit-service.ts`（header 字节保全 + baseHash OCC + 备份/审计）、`feishu-write-service.ts`（三段式写回 + 回拉收敛）、`push-planner.ts`（append/overwrite 纯函数）、`source-write-lock.ts`（按 objToken 进程内互斥）、`cloud-history-service.ts`/`cloud-move-service.ts`（云端历史/回滚/移出）、`reference-rebuild.ts`、`source-title-service.ts`
 - **ops/**：`command-table.ts` 40 条命令表（风险级 read/mutate/destructive/remote_write），CLI 与 `app_command` 工具共用；HTTP API 仍是唯一业务契约
 - **cli/**：CLI 客户端源码（esbuild 产物 `server/dist/cli/feishu-sync-cli.cjs`，含 skills/ 内置 Skill 安装）；配套 `server/src/cli-endpoint.ts`（`<dataRoot>/run/endpoint.json` 发布/轮换）与 CLI 默认开启（`cli.enabled` 缺省 true，可显式关闭）

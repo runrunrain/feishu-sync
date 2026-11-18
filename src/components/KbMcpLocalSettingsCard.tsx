@@ -78,6 +78,8 @@ export function KbMcpLocalSettingsCard() {
               <option value="agents">.agents（兼容客户端）</option>
               <option value="claude">Claude Code（用户级）</option>
               <option value="codex">Codex（用户级）</option>
+              {targets.some((item) => item.target === 'codex-wsl') ? <option value="codex-wsl">Codex（WSL 默认环境配置）</option> : null}
+              {targets.some((item) => item.target === 'codex-wsl-shared') ? <option value="codex-wsl-shared">Codex（WSL 与 Windows 共用配置）</option> : null}
             </select>
           </label>
           <Button size="sm" disabled={loading || busy || !canInstall} onClick={() => void apply('install')}>
@@ -94,9 +96,9 @@ export function KbMcpLocalSettingsCard() {
           {selected.message ? <p role="note" className="text-seal">{selected.message}</p> : null}
           {info && !info.available ? <p role="note" className="text-seal">本机 MCP 尚未开始监听，请稍后刷新。</p> : null}
         </div> : null}
-        <p>已有受管理的配置会迁移到本机 HTTP。迁移或安装后，请重新启动对应客户端。</p>
+        <p>{target === 'codex-wsl' || target === 'codex-wsl-shared' ? '通过 Windows 桥接复用本机 HTTP；需启用 WSL 互操作与 Windows PATH。不会覆盖 Windows 或内网 MCP 配置。' : '已有受管理的配置会迁移到本机 HTTP。'}迁移或安装后，请重新启动对应客户端。</p>
         {feedback ? <p role={feedback.error ? 'alert' : 'status'} className={feedback.error ? 'text-seal-2' : 'text-jade'}>{feedback.text}</p> : null}
-        {info?.snippet ? <details className="border-t border-line/60 pt-3">
+        {target !== 'codex-wsl' && target !== 'codex-wsl-shared' && info?.snippet ? <details className="border-t border-line/60 pt-3">
           <summary className="cursor-pointer font-medium text-ink">手动配置</summary>
           <div className="relative mt-2">
             <pre aria-label="本地 MCP 配置" className="max-h-48 overflow-auto scrollbar-thin rounded border border-line bg-paper/50 p-3 text-[11px] leading-relaxed select-text">{info.snippet}</pre>

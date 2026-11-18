@@ -8,6 +8,7 @@ import { Hono } from 'hono';
 import { McpClientInstaller } from '../src/kb/mcp-client-installer.js';
 import { kbMcpInstallRoutes } from '../src/routes/kb-mcp-install.js';
 import type { KbMcpInfoDto } from '../src/types/agent-knowledge.js';
+import type { WslMcpSupport } from '../src/kb/wsl-mcp-install.js';
 
 const roots: string[] = [];
 afterEach(() => { vi.restoreAllMocks(); for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
@@ -20,8 +21,97 @@ function fixture() {
   return { root, home, dataRoot, info, installer, agents: path.join(home, '.agents', '.mcp.json'), claude: path.join(home, '.claude.json'), codex: path.join(home, '.codex', 'config.toml') };
 }
 function read(file: string) { return JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '')); }
+function wslFixture() {
+  const f = fixture();
+  const httpInfo: KbMcpInfoDto = { available: true, url: 'http://127.0.0.1:47392/mcp', headers: { Authorization: 'Bearer fixture-only' }, snippet: '' };
+  const wsl: WslMcpSupport = {
+    resolve: () => ({ path: f.codex, distro: 'Ubuntu-Fixture', linuxPath: '/home/fixture/.codex/config.toml' }),
+    entry: () => ({ command: 'cmd.exe', args: ['/d', '/v:on', '/c', '!FEISHU_SYNC_BRIDGE_SHIM!'], env: { FEISHU_SYNC_BRIDGE_SHIM: 'C:\\app path\\kb-mcp-wsl.cmd', FEISHU_SYNC_BRIDGE_PORT: '47392', WSLENV: 'FEISHU_SYNC_BRIDGE_SHIM:FEISHU_SYNC_BRIDGE_PORT' } }),
+  };
+  const installer = new McpClientInstaller({ homeDir: f.home, dataRoot: f.dataRoot, info: () => httpInfo, wsl });
+  return { ...f, installer, wsl, httpInfo };
+}
 
 describe('用户级 MCP 安装与清理', () => {
+  it('WSL 一键安装保留共用文件中的 Windows 和内网配置，迁移与清理只作用于 WSL 条目', () => {
+    const f = wslFixture(); fs.mkdirSync(path.dirname(f.codex));
+    fs.writeFileSync(f.codex, '[mcp_servers.lan]\nurl = "http://192.168.1.10:47391/mcp"\n');
+    expect(f.installer.install('codex').state).toBe('installed');
+    const before = fs.readFileSync(f.codex, 'utf8');
+    expect(f.installer.install('codex-wsl')).toMatchObject({ path: f.codex, state: 'installed' });
+    let config: any = parseToml(fs.readFileSync(f.codex, 'utf8'));
+    expect(config.mcp_servers['feishu-kb'].url).toBe('http://127.0.0.1:47392/mcp');
+    expect(config.mcp_servers.lan.url).toBe('http://192.168.1.10:47391/mcp');
+    expect(config.mcp_servers['feishu-kb-wsl']).toMatchObject({ command: 'cmd.exe', args: ['/d', '/v:on', '/c', '!FEISHU_SYNC_BRIDGE_SHIM!'] });
+    expect(JSON.stringify(config.mcp_servers['feishu-kb-wsl'])).not.toContain('fixture-only');
+    f.installer.migrateManaged();
+    config = parseToml(fs.readFileSync(f.codex, 'utf8'));
+    expect(config.mcp_servers['feishu-kb-wsl'].command).toBe('cmd.exe');
+    expect(f.installer.remove('codex-wsl').state).toBe('not_installed');
+    expect(fs.readFileSync(f.codex, 'utf8')).toBe(before);
+    expect(f.installer.status().find((item) => item.target === 'codex')?.state).toBe('installed');
+  });
+
+  it('WSL 独立用户目录的安装不更改 Windows 配置，且未安装时后台迁移不会启动 WSL', () => {
+    const f = wslFixture(); fs.mkdirSync(path.dirname(f.codex));
+    fs.writeFileSync(f.codex, '[mcp_servers.windows]\ncommand = "keep"\n');
+    const before = fs.readFileSync(f.codex, 'utf8');
+    const separate = path.join(f.root, 'wsl-home', '.codex', 'config.toml');
+    fs.mkdirSync(path.dirname(separate), { recursive: true });
+    const resolve = vi.fn(() => ({ path: separate, distro: 'Ubuntu-Fixture', linuxPath: '/home/fixture/.codex/config.toml' }));
+    f.wsl.resolve = resolve;
+    f.installer.migrateManaged();
+    expect(resolve).not.toHaveBeenCalled();
+    expect(f.installer.install('codex-wsl')).toMatchObject({ state: 'installed', path: separate });
+    expect((parseToml(fs.readFileSync(separate, 'utf8')) as any).mcp_servers['feishu-kb-wsl'].command).toBe('cmd.exe');
+    expect(fs.readFileSync(f.codex, 'utf8')).toBe(before);
+    f.installer.remove('codex-wsl');
+    expect(fs.readFileSync(f.codex, 'utf8')).toBe(before);
+  });
+
+  it('WSL 与 Windows 共用配置时安装到 Windows 用户配置，不依赖 WSL 默认环境变量', () => {
+    const f = wslFixture(); fs.mkdirSync(path.dirname(f.codex));
+    const original = '[mcp_servers."feishu-kb"]\nurl = "http://127.0.0.1:47392/mcp"\n';
+    fs.writeFileSync(f.codex, original);
+    f.wsl.resolve = () => { throw new Error('WSL environment should not be inspected'); };
+    expect(f.installer.install('codex-wsl-shared')).toMatchObject({ state: 'installed', path: f.codex });
+    const parsed: any = parseToml(fs.readFileSync(f.codex, 'utf8'));
+    expect(parsed.mcp_servers['feishu-kb'].url).toBe('http://127.0.0.1:47392/mcp');
+    expect(parsed.mcp_servers['feishu-kb-wsl'].command).toBe('cmd.exe');
+    const oldBridge = f.wsl.entry(f.httpInfo);
+    f.wsl.entry = () => ({ ...oldBridge, env: { ...oldBridge.env, FEISHU_SYNC_BRIDGE_SHIM: 'C:\\updated app\\kb-mcp-wsl.cmd' } });
+    expect(f.installer.status().find((item) => item.target === 'codex-wsl-shared')?.state).toBe('needs_update');
+    f.installer.migrateManaged();
+    const migrated: any = parseToml(fs.readFileSync(f.codex, 'utf8'));
+    expect(migrated.mcp_servers['feishu-kb-wsl'].env.FEISHU_SYNC_BRIDGE_SHIM).toBe('C:\\updated app\\kb-mcp-wsl.cmd');
+    expect(migrated.mcp_servers['feishu-kb'].url).toBe('http://127.0.0.1:47392/mcp');
+    f.installer.remove('codex-wsl-shared');
+    expect(fs.readFileSync(f.codex, 'utf8')).toBe(original);
+  });
+
+  it('拒绝接管 WSL 同名配置，且拒绝删除安装标记内新增的其他服务', () => {
+    const f = wslFixture(); fs.mkdirSync(path.dirname(f.codex));
+    const foreign = '[mcp_servers."feishu-kb-wsl"]\ncommand = "user-owned"\n'; fs.writeFileSync(f.codex, foreign);
+    expect(f.installer.status().find((item) => item.target === 'codex-wsl')?.state).toBe('conflict');
+    expect(() => f.installer.install('codex-wsl')).toThrow(/已有同名配置/);
+    expect(fs.readFileSync(f.codex, 'utf8')).toBe(foreign);
+    fs.writeFileSync(f.codex, 'model = "fixture"\n'); f.installer.install('codex-wsl');
+    const edited = fs.readFileSync(f.codex, 'utf8').replace('# feishu-sync-mcp end ', '[mcp_servers.keep]\ncommand = "user-owned"\n# feishu-sync-mcp end ');
+    fs.writeFileSync(f.codex, edited);
+    expect(f.installer.status().find((item) => item.target === 'codex-wsl')?.state).toBe('modified');
+    expect(() => f.installer.remove('codex-wsl')).toThrow(/范围已被修改/);
+    expect(fs.readFileSync(f.codex, 'utf8')).toBe(edited);
+  });
+
+  it('WSL 不可用时返回诊断，不更改 Windows 配置', () => {
+    const f = wslFixture(); fs.mkdirSync(path.dirname(f.codex));
+    fs.writeFileSync(f.codex, 'model = "preserve"\n');
+    f.wsl.resolve = () => { throw new Error('wsl unavailable'); };
+    expect(f.installer.status().find((item) => item.target === 'codex-wsl')).toMatchObject({ state: 'invalid', message: expect.stringMatching(/WSL 默认发行版/) });
+    expect(() => f.installer.install('codex-wsl')).toThrow(/WSL 默认发行版/);
+    expect(fs.readFileSync(f.codex, 'utf8')).toBe('model = "preserve"\n');
+  });
+
   it('migrates managed stdio entries to HTTP while preserving other client configuration', () => {
     const f = fixture();
     fs.mkdirSync(path.dirname(f.codex));
@@ -263,6 +353,17 @@ describe('用户级 MCP 安装与清理', () => {
 });
 
 describe('MCP 安装路由权限', () => {
+  it('桌面令牌可安装 WSL 目标，不能提供自定义路径', async () => {
+    const f = wslFixture(); fs.mkdirSync(path.dirname(f.codex));
+    const app = new Hono(); app.route('/', kbMcpInstallRoutes({ installer: f.installer, desktopToken: 'desktop-secret' }));
+    const post = (body: unknown) => app.request('/api/kb-mcp-install/install', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Desktop-Token': 'desktop-secret' }, body: JSON.stringify(body) });
+    expect((await post({ target: 'codex-wsl', path: f.codex })).status).toBe(400);
+    const response = await post({ target: 'codex-wsl' });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ target: 'codex-wsl', state: 'installed' });
+    expect((parseToml(fs.readFileSync(f.codex, 'utf8')) as any).mcp_servers['feishu-kb-wsl'].command).toBe('cmd.exe');
+  });
+
   it('只接受桌面令牌和固定目标，不接受 CLI 身份或自定义路径', async () => {
     const f = fixture(); const app = new Hono();
     app.route('/', kbMcpInstallRoutes({ installer: f.installer, desktopToken: 'desktop-secret' }));

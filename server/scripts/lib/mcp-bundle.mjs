@@ -24,6 +24,14 @@ export async function bundleGateway(outfile = gatewayOutDefault) {
   return bundleReadOnlyMcp(path.join(serverRoot, 'src', 'mcp', 'kb-mcp-gateway.ts'), outfile);
 }
 
+export const wslBridgeOutDefault = path.join(serverRoot, 'dist', 'mcp', 'kb-mcp-http-bridge.cjs');
+export async function bundleWslBridge(outfile = wslBridgeOutDefault) {
+  const result = await bundleReadOnlyMcp(path.join(serverRoot, 'src', 'mcp', 'kb-mcp-http-bridge-entry.ts'), outfile);
+  const shim = fs.readFileSync(path.join(serverRoot, 'src', 'mcp', 'kb-mcp-wsl.cmd'), 'utf8').replace(/\r?\n/g, '\r\n');
+  fs.writeFileSync(path.join(path.dirname(outfile), 'kb-mcp-wsl.cmd'), shim);
+  return result;
+}
+
 async function bundleReadOnlyMcp(entry, outfile) {
   const result = await build({
     entryPoints: [entry],

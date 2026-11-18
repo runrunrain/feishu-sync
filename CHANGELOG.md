@@ -6,6 +6,12 @@
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- 本机 MCP 安装新增 WSL 默认发行版目标，通过 Windows 桥接复用本机 HTTP 服务，并保留 Windows 和内网配置。
+
 ## [0.4.31] - 2026-11-18
 
 本次提供 Windows x64、macOS Intel 和 Apple Silicon 安装包。

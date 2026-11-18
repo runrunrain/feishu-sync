@@ -35,6 +35,7 @@ import { KbLanGatewayManager } from './kb-lan/gateway-manager.js';
 import { kbLanMcpRoutes } from './routes/kb-lan-mcp.js';
 import { kbMcpInstallRoutes } from './routes/kb-mcp-install.js';
 import { McpClientInstaller } from './kb/mcp-client-installer.js';
+import { createWslMcpSupport } from './kb/wsl-mcp-install.js';
 import { kbMcpInfo } from './kb/mcp-info.js';
 import { createDesktopMcpPresence, KB_MCP_INSTANCE_HEADER } from './kb/local-mcp-policy.js';
 import { LocalMcpService } from './kb/local-mcp-service.js';
@@ -253,7 +254,9 @@ export async function buildServer(options: CreateServerOptions = {}) {
     : undefined;
   const localMcpInfo = () => localMcp?.info()
     ?? kbMcpInfo(configManager.getConfig()!.standardKb.outputRoot, rawCatalogPath(agentDataRoot));
-  const mcpInstaller = new McpClientInstaller({ dataRoot: agentDataRoot, info: localMcpInfo });
+  const mcpInstaller = new McpClientInstaller({ dataRoot: agentDataRoot, info: localMcpInfo,
+    ...(desktopMode && process.platform === 'win32' && !process.env.VITEST ? { wsl: createWslMcpSupport(agentDataRoot) } : {}),
+  });
 
   const runtimeResolver = new PiRuntimeResolver();
   const agentPool = new AgentProcessPool({

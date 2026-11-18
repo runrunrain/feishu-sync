@@ -12,7 +12,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { bundleMcp, bundleGateway } from './lib/mcp-bundle.mjs';
+import { bundleMcp, bundleGateway, bundleWslBridge } from './lib/mcp-bundle.mjs';
 import { bundleCli } from './lib/cli-bundle.mjs';
 import { bundleAmagi } from './lib/bundled-amagi.mjs';
 import './build-share-render.mjs';
@@ -80,6 +80,9 @@ console.info(`[build-agent-assets] bundled ${path.basename(outfile)} (${(size / 
 
 const gateway = await bundleGateway();
 console.info(`[build-agent-assets] bundled ${path.basename(gateway.outfile)} (${(gateway.size / 1024).toFixed(1)} KB)`);
+
+const wslBridge = await bundleWslBridge();
+console.info(`[build-agent-assets] bundled ${path.basename(wslBridge.outfile)} (${(wslBridge.size / 1024).toFixed(1)} KB)`);
 
 // 3. CLI 单文件打包（S9，设计 kb-agent-upgrade §6.1/U12；共享入口见
 //    lib/cli-bundle.mjs）——产物 shim 与 Electron RunAsNode 均直接调起。

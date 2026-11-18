@@ -73,9 +73,10 @@ window.fetch = async (input, init) => {
     })
   if (path === '/api/kb/mcp')
     return json({ available: true, command: '/synthetic/feishu-sync', args: ['kb-mcp.cjs'], env: {}, snippet: '{"mcpServers":{"feishu-kb":{"command":"/synthetic/feishu-sync"}}}', alternative: { command: 'node', args: [], note: '' } })
-  const localTargets = () => ['agents', 'claude'].map((target) => ({
+  const localTargets = () => ['agents', 'claude', 'codex', 'codex-wsl', 'codex-wsl-shared'].map((target) => ({
     target,
-    path: target === 'agents' ? '/home/demo/.agents/.mcp.json' : '/home/demo/.claude.json',
+    path: target === 'agents' ? '/home/demo/.agents/.mcp.json'
+      : target === 'claude' ? '/home/demo/.claude.json' : '/home/demo/.codex/config.toml',
     state: localInstalls.has(target) ? 'installed' : 'not_installed',
   }))
   if (path === '/api/kb-mcp-install/status') return json({ targets: localTargets() })
