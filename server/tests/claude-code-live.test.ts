@@ -171,7 +171,7 @@ describe('Claude Code with an app-configured Anthropic provider', () => {
       internalBaseUrl: () => `http://127.0.0.1:${internalPort}`, extensionPath: () => null, pluginStore,
       workspaceGuards: () => ({ knowledgeBaseRoot: dataRoot, outputRoot: config.standardKb.outputRoot, dataRoot }) });
     try {
-      const session = service.create(store, { title: 'Claude fixture' });
+      const session = service.create(store, { title: 'Claude fixture', backend: 'claude-code' });
       expect(session.backend).toBe('claude-code');
       const ready = await resolver.checkReadiness({ agentConfig: config.agent, llmConfig: config.llm, runningProcesses: 0 });
       expect(ready).toMatchObject({ code: 'ready', runtime: { backend: 'claude-code' }, model: { model: 'fixture-model' } });
@@ -256,7 +256,7 @@ describe('Claude Code with an app-configured Anthropic provider', () => {
       try {
         const workspace = path.join(root, 'workspace'); fs.mkdirSync(workspace, { recursive: true });
         config.agent.workspaces = [{ id: 'ws_fixture', name: 'Fixture', path: workspace, createdAt: new Date().toISOString() }];
-        const workSession = service.create(store, { title: 'Work fixture' });
+        const workSession = service.create(store, { title: 'Work fixture', backend: 'claude-code' });
         await service.switchMode(store, workSession.id, { mode: 'work', workspaceId: 'ws_fixture', confirm: 'WORK' });
         fixtureTool = 'app_command'; fixtureArgs = { command: 'kb.build', args: { mode: 'full' } };
         await service.sendMessage(store, workSession.id, { text: 'Build the test library' });
