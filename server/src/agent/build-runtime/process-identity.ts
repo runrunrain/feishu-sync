@@ -28,8 +28,8 @@
  *    前提不可验证（探测失效/sid 不匹配）→ 不封存、零信号。
  *
  * 能力边界（如实）：
- * - Windows 用 CIM 读取 PID 和父 PID。无出生令牌或进程组证明，存活或
- *   无法证明已退出的个体仍按 unconfirmed 处理。
+ * - Windows 用同一份 CIM 快照读取 PID、父 PID 与出生时间。出生时间可与
+ *   amagi 锚点比较以排除 PID 复用，不能提供稳定句柄或进程组证明。
  * - python3 缺失（未装 CLT）→ darwin 出生令牌不可得 → 同上降级。
  * - 本模块只读探测 + 可注入信号出口；不做任务状态调度。
  */
@@ -38,12 +38,14 @@ import { execFile } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { win32 } from 'node:path';
 
-/** 进程表行。Windows 只提供 PID 和父 PID，pgid/uid 为 0。 */
+/** 进程表行。Windows 的 pgid/uid 为 0。 */
 export interface ProcTableRow {
   pid: number;
   ppid: number;
   pgid: number;
   uid: number;
+  /** CIM CreationDate 的 UTC .NET ticks，与 amagi 的 win32 出生令牌同源。 */
+  windowsCreationTicks?: bigint;
   /** 已运行秒数（ps etime；不可解析时缺省）。 */
   elapsedSec?: number;
   /** 可执行名（不含参数；诊断与指纹用）。 */
@@ -73,9 +75,12 @@ const PS_TIMEOUT_MS = 5_000;
 const BIRTH_TIMEOUT_MS = 2_000;
 const WINDOWS_PROCESS_TABLE = `
 $ErrorActionPreference = 'Stop'
-$processes = @(Get-CimInstance -ClassName Win32_Process -Property ProcessId,ParentProcessId)
+$processes = @(Get-CimInstance -ClassName Win32_Process -Property ProcessId,ParentProcessId,CreationDate)
 if ($PID -notin $processes.ProcessId) { throw 'Incomplete process table' }
-foreach ($proc in $processes) { '{0} {1}' -f $proc.ProcessId, $proc.ParentProcessId }
+foreach ($proc in $processes) {
+  $ticks = if ($proc.CreationDate) { $proc.CreationDate.ToUniversalTime().Ticks } else { '-' }
+  '{0} {1} {2}' -f $proc.ProcessId, $proc.ParentProcessId, $ticks
+}
 `;
 
 function defaultExecFile(file: string, args: string[], opts: { timeout: number; maxBuffer: number }): Promise<{ stdout: string }> {
@@ -122,13 +127,16 @@ async function snapshotWindowsProcessTable(deps: ProcessIdentityDeps): Promise<P
     const rows: ProcTableRow[] = [];
     const pids = new Set<number>();
     for (const line of stdout.trim().split(/\r?\n/)) {
-      const match = /^(\d+) (\d+)$/.exec(line);
+      const match = /^(\d+) (\d+) (-|[1-9]\d{0,18})$/.exec(line);
       if (!match) return null;
       const pid = Number(match[1]);
       const ppid = Number(match[2]);
       if (pid > 0xffffffff || ppid > 0xffffffff || pids.has(pid)) return null;
       pids.add(pid);
-      rows.push({ pid, ppid, pgid: 0, uid: 0 });
+      const windowsCreationTicks = match[3] === '-' ? undefined : BigInt(match[3]);
+      // DateTime.MaxValue, so a malformed CIM time cannot prove PID reuse.
+      if (windowsCreationTicks !== undefined && windowsCreationTicks > 3155378975999999999n) return null;
+      rows.push({ pid, ppid, pgid: 0, uid: 0, windowsCreationTicks });
     }
     return rows;
   } catch {

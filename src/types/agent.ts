@@ -541,6 +541,7 @@ export interface KbLeaderRunTaskDto {
   status: 'pending' | 'confirmed' | 'revoked';
   /** amagi 执行三轴状态（queued/running/done/failed/cancelled…；未知值原样展示）。 */
   execState: string | null;
+  rateLimitedModel?: string;
   lastEventAt: string;
   /** 历史DTO可能缺省；已知时用于区分历史任务与当前运行。 */
   runtimeEpoch?: number | null;

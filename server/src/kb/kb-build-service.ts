@@ -1,4 +1,4 @@
-import { restoreTaskCompletionObservations } from './amagi-task-observations.js';
+import { projectLeaderTasks, restoreTaskCompletionObservations } from './amagi-task-observations.js';
 /**
  * KbBuildService — 标准库构建流水线（设计 §6.5）
  *
@@ -1458,6 +1458,7 @@ export class KbBuildService extends EventEmitter {
     const skipBriefing = automaticSkips.length > 0
       ? `- 程序已核验以下来源没有可转换正文，发布校验会自动登记跳过：${automaticSkips.join('、')}。不要派写作、不要把它们挂入任何文档 sources；旧草稿若误引，请移除后重新审查。`
       : '';
+    const rateLimitRecovery = '模型返回 HTTP 429 或模型冷却时，按运行时提示等待。冷却结束后同一模型先只续接一个失败任务，等结果再派其余任务。若再次限流，优先用本次冻结模型中已成功运行的备用模型，经 task_resume 仅完成原任务的剩余工作。';
     const briefing = [
       '# Leader 运行交代',
       '',
@@ -1473,6 +1474,7 @@ export class KbBuildService extends EventEmitter {
       ...(skipBriefing ? [skipBriefing] : []),
       '',
       '从 build_manifest 工作集开始，读到首页即可派发，按 nextCursor 读完；每篇明确来源与目标并分配完整路径，写入后尽快派独立审查。规则密集材料按可交付主题拆分，纯明细表可用 csvTableImports 导入。最终以应用发布结果为准。',
+      rateLimitRecovery,
     ].join('\n');
     const resumeBriefing = [
       '# Leader 运行交代（续接）',
@@ -1487,6 +1489,7 @@ export class KbBuildService extends EventEmitter {
       '恢复派发前读取 build_handoff_list：来源、正文与声明未变的取证结论应复用；仅具体依赖变化或交接明确缺证时定向补查。审查权限以应用当前有效回执为准。',
       '发布报告按 blockingGroups 定向处理，warningGroups、范围外提示和 normal 级未解决覆盖项仅披露，不扩大调查或改写。旧报告缺严重级别时重跑当前校验，不凭旧文本猜测阻断。',
       '核对 identityGaps 后再登记有实际依据的迁移；来源不再支持的对象可登记 remove，不删除有效知识、不虚构后继，不重复申请未变化的失败候选。',
+      rateLimitRecovery,
       ...(skipBriefing ? [skipBriefing] : []),
     ].join('\n');
     return {
@@ -2340,11 +2343,7 @@ export class KbBuildService extends EventEmitter {
       leader: leaderRun.binding
         ? { sessionId: leaderRun.binding.leaderSessionId, pid: leaderRun.binding.leaderPid, resumeCapability: resumeLevel }
         : null,
-      tasks: leaderRun.actors.map((actor) => ({
-        nativeTaskId: actor.nativeTaskId, role: actor.role, parentTaskId: actor.parentTaskId,
-        status: actor.status, execState: actor.execState, lastEventAt: actor.lastEventAt,
-        runtimeEpoch: actor.runtimeEpoch ?? null, generation: actor.generation,
-      })),
+      tasks: projectLeaderTasks(leaderRun.binding, leaderRun.actors),
       // F15 后端：轮次计数来自检查点持久化；旧状态缺字段 → null（未知），
       // 不得回退为看似实测的 0/0（DTO 契约：rounds 可空，前端按未知展示）。
       rounds: leaderRun.rounds ?? null,

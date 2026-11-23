@@ -2,6 +2,46 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { RuntimeBinding } from '../agent/build-runtime/contracts.js';
+import type { LeaderActorRecord, LeaderRunProgressDto } from '../types/agent-knowledge.js';
+
+function readRateLimitedModel(binding: RuntimeBinding | null, actor: LeaderActorRecord): string | undefined {
+  if (!binding?.agentDir || (actor.execState !== 'error' && actor.execState !== 'failed')) return undefined;
+  if (actor.runtimeEpoch != null && actor.runtimeEpoch !== binding.runtimeEpoch) return undefined;
+  if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(actor.nativeTaskId)) return undefined;
+
+  try {
+    const file = path.join(fs.realpathSync(binding.agentDir), 'amagi', 'artifacts', actor.nativeTaskId, 'metadata.json');
+    if (path.relative(file, fs.realpathSync(file)) !== '') return undefined;
+    const stat = fs.statSync(file);
+    if (!stat.isFile() || stat.size > 64 * 1024) return undefined;
+    const metadata = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const diagnostic = metadata?.providerDiagnostic?.latest;
+    if (metadata?.taskId !== actor.nativeTaskId || diagnostic?.category !== 'rate-limit') return undefined;
+    const model = diagnostic.model?.id;
+    if (typeof model === 'string' && /^[\w][\w./:-]{0,127}$/.test(model)) return model;
+  } catch {
+    // 旧版本可能没有诊断，任务收尾时归档也可能尚未可读。
+  }
+  return undefined;
+}
+
+/** 只投影可展示的限流模型，原始上游响应与运行路径留在运行时归档。 */
+export function projectLeaderTasks(binding: RuntimeBinding | null, actors: LeaderActorRecord[]): LeaderRunProgressDto['tasks'] {
+  return actors.map((actor) => {
+    const rateLimitedModel = readRateLimitedModel(binding, actor);
+    return {
+      nativeTaskId: actor.nativeTaskId,
+      role: actor.role,
+      parentTaskId: actor.parentTaskId,
+      status: actor.status,
+      execState: actor.execState,
+      ...(rateLimitedModel ? { rateLimitedModel } : {}),
+      lastEventAt: actor.lastEventAt,
+      runtimeEpoch: actor.runtimeEpoch ?? null,
+      generation: actor.generation,
+    };
+  });
+}
 
 interface TaskIdentity { nativeTaskId: string; role: string }
 const STATES = new Set(['queued', 'running', 'done', 'failed', 'error', 'cancelled', 'interrupted', 'blocked']);

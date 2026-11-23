@@ -390,6 +390,9 @@ function RuntimeTaskRow({ task, successor, terminal, queueReason, historical = f
           {LEADER_ROLE_LABEL[task.role] ?? task.role}
           <span className="ml-1.5">· 子任务用量不经 Leader 事件（未知）</span>
         </span>
+        {(exec === 'error' || exec === 'failed') && task.rateLimitedModel ? (
+          <span className="break-all text-seal-2">模型限流 · {task.rateLimitedModel}</span>
+        ) : null}
         <span className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
           {successor ? <span title={`续接任务 ${successor.nativeTaskId}`}>由 {shortId(successor.nativeTaskId)} 继续处理</span> : null}
           {task.parentTaskId ? (

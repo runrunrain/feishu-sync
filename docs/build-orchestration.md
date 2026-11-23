@@ -139,6 +139,7 @@ kb 侧 `server/src/kb/`：
 - 发布终局只认真实工具回执：Leader 经 `build_request_publish` 触发应用发布校验管线 → 宿主转 `publish_completed` 事件。accepted → `publish-accepted` 终局（publication.status = published / awaiting_release）；rejected → 监督继续，Leader 修订后重试。
 - 发布窗口（`build-actors.ts` `beginPublishWindow`）：校验期间到达的新写入被 `build_publishing`（409）拒绝；窗口随结算关闭。
 - 取消顺序：撤代次凭据（写入立即停止）→ 关闭 Leader stdin 宽限终止（默认 10s）→ 残留核实。终止对账结果（`TerminationOutcome`）随检查点持久化；`unconfirmed` 阻断第二个 Leader，换 epoch 也不能绕过。
+- Windows 终止对账在同一份 CIM 快照中读取 PID、父 PID 和进程创建时间。新版锚点按出生令牌区分 PID 复用。缺令牌的旧锚点须核对同一原生运行的退出记录，以及当前占用者在退出后才创建。仍可能属于旧任务的子进程继续阻断恢复。
 - 恢复三态（必须显式）：`fresh`（无恢复语义，但带旧运行事实时仍先取新鲜残留对账）；`session`（原 leaderSessionId 同 agentDir 续接，先过四项冻结比对）；`rebuild`（成果级重建：epoch+1、全新 agentDir/会话/amagi 内部库、凭应用回执重组，不依赖会话记忆）。恢复守卫：旧 Leader 存活 → `kb_leader_alive`（409）；残留对账 unconfirmed 在 15s 期限内每 2s 重试，仍不确认 → `kb_termination_unconfirmed`（409）；不支持会话续接 → `kb_resume_unsupported`；冻结漂移 → `kb_resume_runtime_changed`。
 - 中断自动续跑（`kb-build-service.ts` `scheduleAutoResume`）：可恢复中断后 10s/30s 自动从检查点 rebuild，最多 2 次。
 

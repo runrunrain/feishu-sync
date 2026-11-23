@@ -77,6 +77,7 @@ import { readProcessLedger, type ProcessLedgerEntry } from './process-ledger.js'
 export interface AnchorRun {
   taskId: string;
   anchorFile: string;
+  backendRunId?: string;
   rootPid: number;
   pgid?: number;
   rootIdentityToken?: string;
@@ -178,6 +179,7 @@ export function scanLaunchAnchors(homeDir: string): AnchorScanResult {
         runs.push({
           taskId: parsed.taskId,
           anchorFile,
+          ...(typeof candidate.backendRunId === 'string' && candidate.backendRunId ? { backendRunId: candidate.backendRunId } : {}),
           rootPid: candidate.rootPid,
           ...(typeof candidate.pgid === 'number' && candidate.pgid > 0 ? { pgid: candidate.pgid } : {}),
           ...(typeof candidate.rootIdentityToken === 'string' && candidate.rootIdentityToken ? { rootIdentityToken: candidate.rootIdentityToken } : {}),
@@ -433,6 +435,25 @@ interface PidClaim {
   ledger?: ProcessLedgerEntry;
 }
 
+/** 旧 Windows 锚点缺出生令牌。只有同一次原生 JSON 运行已登记退出，
+ * 且当前占用者在退出记录之后出生，才排除该旧 PID。 */
+function windowsOccupantStartedAfterExit(homeDir: string, anchor: AnchorRun, creationTicks: bigint): boolean {
+  const taskKey = anchor.taskId.replace(/[^a-zA-Z0-9_-]/g, '_');
+  if (!anchor.backendRunId || !/^[A-Za-z0-9_-]{1,64}$/.test(taskKey)) return false;
+  try {
+    const current = JSON.parse(fs.readFileSync(path.join(homeDir, 'amagi', 'v2-store', taskKey, 'current.json'), 'utf-8'));
+    if (current?.version !== 1 || current.taskId !== anchor.taskId || current.specId !== anchor.taskId
+      || current.backend !== 'json' || current.backendRunId !== anchor.backendRunId || current.processState !== 'exited'
+      || !Number.isSafeInteger(current.startedAt) || current.startedAt <= 0
+      || !Number.isSafeInteger(current.exitedAt) || current.exitedAt < Math.max(anchor.at, current.startedAt)) return false;
+    // Unix ms 精度低于 CIM ticks，留出整个退出记录所在的毫秒。
+    const exitTicks = 621355968000000000n + (BigInt(current.exitedAt) + 1n) * 10_000n;
+    return creationTicks >= exitTicks;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * 残留核对。reap=true 时对已证明个体执行回收；任何无法证明的个体不发信号，
  * 并使整体 state=unconfirmed（阻断第二 Leader，换 epoch 也不能绕过）。
@@ -444,6 +465,7 @@ export async function reconcileResidualProcesses(
 ): Promise<TerminationOutcome> {
   const now = deps.now ?? Date.now;
   const at = new Date(now()).toISOString();
+  const windows = (deps.platform ?? process.platform) === 'win32';
   const ctx: ReapContext = {
     kill: deps.kill,
     isAlive: deps.isAlive ?? defaultIsAlive,
@@ -539,6 +561,7 @@ export async function reconcileResidualProcesses(
     const claims = claimsByPid.get(run.rootPid) ?? [];
     const duplicate = claims.some((claim) => claim.source === 'anchor' && claim.anchor
       && claim.anchor.taskId === run.taskId
+      && (!windows || run.rootIdentityToken !== undefined || claim.anchor.backendRunId === run.backendRunId)
       && claim.anchor.leaderPid === run.leaderPid
       && claim.anchor.pgid === run.pgid
       && claim.anchor.bootId === run.bootId && claim.anchor.bootTimeMs === run.bootTimeMs
@@ -591,22 +614,42 @@ export async function reconcileResidualProcesses(
   const rowOf = new Map<number, ProcTableRow>();
   for (const row of table) rowOf.set(row.pid, row);
 
-  if ((deps.platform ?? process.platform) === 'win32') {
-    // Windows 保留已退出父进程的 PID。父 PID 只用于发现可能的遗留进程，不能证明归属。
+  // 分类只探测存活个体。Windows 使用同一份快照，避免 PID 在分次查询间换人。
+  const birthTokens = windows ? new Map<number, string>()
+    : await readBirthIdentities([...claimsByPid.keys()].filter((pid) => rowOf.has(pid)), deps);
+  const windowsReusedClaims = new Map<PidClaim, ChildProcessFinding['proof']>();
+  if (windows) {
+    for (const [pid, claims] of claimsByPid) {
+      const ticks = rowOf.get(pid)?.windowsCreationTicks;
+      if (ticks === undefined) continue;
+      const observed = `win32:${ticks}`;
+      birthTokens.set(pid, observed);
+      for (const claim of claims) {
+        const expected = claim.anchor?.rootIdentityToken ?? claim.ledger?.birthToken;
+        if (expected && /^win32:[1-9]\d{0,18}$/.test(expected) && expected !== observed
+          && BigInt(expected.slice('win32:'.length)) <= 3155378975999999999n) {
+          windowsReusedClaims.set(claim, 'birth-token');
+        } else if (!expected && claim.anchor && windowsOccupantStartedAfterExit(input.homeDir, claim.anchor, ticks)) {
+          windowsReusedClaims.set(claim, 'none');
+        }
+      }
+    }
+    // Windows 保留已退出进程的父 PID；即使父 PID 被复用，更早出生的子进程仍可能是遗留。
     for (const row of table) {
-      const parent = claimsByPid.get(row.ppid)?.[0];
-      if (!parent || rowOf.has(row.ppid)) continue;
+      const parentClaims = claimsByPid.get(row.ppid);
+      if (!parentClaims) continue;
+      const parentRow = rowOf.get(row.ppid);
+      if (parentRow && (!parentClaims.every((claim) => windowsReusedClaims.has(claim))
+        || (row.windowsCreationTicks !== undefined && parentRow.windowsCreationTicks !== undefined
+          && row.windowsCreationTicks > parentRow.windowsCreationTicks))) continue;
+      const [parent] = parentClaims;
       findings.push({
         taskId: parent.anchor?.taskId ?? parent.ledger?.taskId ?? null,
         pid: row.pid, source: parent.source, verdict: 'unconfirmed', proof: 'none',
-        detail: `登记进程 pid=${row.ppid} 已退出，但仍有进程引用该父 PID，无法排除任务后代`,
+        detail: `登记进程 pid=${row.ppid} 已退出或 PID 已复用，但仍有进程引用该父 PID，无法排除任务后代`,
       });
     }
   }
-
-  // 只对存活个体探测出生令牌（分类用；此后每个信号前仍会现场重采）
-  const tokenCandidates = [...claimsByPid.keys()].filter((pid) => rowOf.has(pid));
-  const birthTokens = await readBirthIdentities(tokenCandidates, deps);
 
   for (const [pid, claims] of claimsByPid) {
     if (claims.length > 1) {
@@ -653,12 +696,16 @@ export async function reconcileResidualProcesses(
       const freshOccupant = birthTokens.get(pid);
       for (const claim of claims) {
         const claimedToken = claim.source === 'anchor' ? claim.anchor?.rootIdentityToken : claim.ledger?.birthToken;
-        if (claimedToken && freshOccupant !== undefined && claimedToken === freshOccupant) {
+        const windowsReuse = windowsReusedClaims.get(claim);
+        if (windowsReuse) {
+          findings.push({ taskId: claimTaskId(claim), pid, source: claim.source, verdict: 'exited', proof: windowsReuse,
+            detail: 'Windows 进程快照与运行记录确认该声称的进程已退出，PID 已被复用' });
+        } else if (claimedToken && freshOccupant !== undefined && claimedToken === freshOccupant) {
           findings.push({
             taskId: claimTaskId(claim), pid, source: claim.source, verdict: 'unconfirmed', proof: 'birth-token',
             detail: `PID 冲突（去重后 ${claims.length} 份运行身份声称同 pid）：当前占用者出生令牌与该声称匹配（即该 run 的进程存活），冲突个体保守零信号、不纳入回收`,
           });
-        } else if (claimedToken && freshOccupant !== undefined) {
+        } else if (!windows && claimedToken && freshOccupant !== undefined) {
           findings.push({
             taskId: claimTaskId(claim), pid, source: claim.source, verdict: 'exited', proof: 'none',
             detail: 'PID 冲突：该声称的出生令牌与当前占用者不一致——声称的进程已结束（pid 现由另一出生占用，可能为同构建新 run 或无关复用）',
@@ -714,9 +761,17 @@ export async function reconcileResidualProcesses(
     }
     const anchor = individual.source === 'anchor' ? individual.anchor : undefined;
     const expectedToken = anchor ? anchor.rootIdentityToken : individual.ledger?.birthToken;
+    const windowsReuse = windowsReusedClaims.get(individual);
+    if (windowsReuse) {
+      findings.push({ taskId, pid, source: individual.source, verdict: 'not-ours', proof: windowsReuse,
+        detail: windowsReuse === 'birth-token'
+          ? 'Windows 出生令牌不匹配，PID 已被复用'
+          : '该运行已登记退出，当前 Windows 进程在退出后创建，PID 已被复用' });
+      continue;
+    }
     // 分类快照：令牌不匹配（pid 已被复用）→ not-ours（绝不发信号；
     // 匹配与否的最终执法仍以每个信号前的 fresh 重采为准）
-    if (expectedToken && birthTokens.get(pid) !== undefined && birthTokens.get(pid) !== expectedToken) {
+    if (!windows && expectedToken && birthTokens.get(pid) !== undefined && birthTokens.get(pid) !== expectedToken) {
       findings.push({
         taskId, pid, source: individual.source, verdict: 'not-ours', proof: 'birth-token',
         detail: `出生令牌不匹配（期望 ${expectedToken} → 当前 ${birthTokens.get(pid)}）：pid 已被无关进程复用，绝不发信号`,
@@ -732,6 +787,11 @@ export async function reconcileResidualProcesses(
           ? '锚点无出生令牌：无法证明该 pid 仍是本任务进程（不按 pgid/可执行名降级），不发信号'
           : '账本 Leader 条目无出生令牌可比对，归属无法证明，不发信号',
       });
+      continue;
+    }
+    if (windows && birthTokens.get(pid) !== expectedToken) {
+      findings.push({ taskId, pid, source: individual.source, verdict: 'unconfirmed', proof: 'none',
+        detail: 'Windows 出生令牌无法核验，保留未确认项' });
       continue;
     }
     if (!options.reap) {
@@ -777,9 +837,10 @@ export async function reconcileResidualProcesses(
   }
 
   const unconfirmed = findings.filter((finding) => finding.verdict === 'unconfirmed');
+  const unknownPidCount = unconfirmed.filter((finding) => finding.pid === 0).length;
   const note = `${gapsPrefix}${
     unconfirmed.length > 0
-      ? `存在 ${unconfirmed.length} 个未确认项（含 pid 未知项），阻断新 Leader`
+      ? `存在 ${unconfirmed.length} 个未确认项${unknownPidCount ? `（${unknownPidCount} 个 PID 未知）` : ''}，阻断新 Leader`
       : '全部已知个体已证明退出或排除归属'}`;
   return {
     state: unconfirmed.length > 0 ? 'unconfirmed' : 'confirmed',

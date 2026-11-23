@@ -696,6 +696,7 @@ export interface LeaderRunProgressDto {
     parentTaskId: string | null;
     status: LeaderActorRecord['status'];
     execState: string | null;
+    rateLimitedModel?: string;
     lastEventAt: string;
     /** F09：登记时 epoch/generation（历史任务 ≠ 当前 runtimeEpoch，前端不得计入当前并发）。 */
     runtimeEpoch: number | null;

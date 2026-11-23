@@ -1,183 +1,115 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+本文件面向 Claude Code（`claude.ai/code`），提供在本仓库开发、排查与交付时的直接契约。完整协作规范与详细边界与 [AGENTS.md](./AGENTS.md) 保持一致；细则见 [docs/README.md](./docs/README.md)，设计动机以各模块头部注释为准。
 
-## What this is
+## 项目概览
 
-跨平台桌面应用，定时检测飞书知识库子树变更并选择性同步到本地，把飞书导出内容重构为本地偏好的 Markdown 结构（表格 A/B/C/D/E 分型、层级格式），可选 LLM 风格对齐。结构树之外的零散云文档可快捷归档到 `_custom/<文件夹>/`（自定义归档，见下）。详见 `README.md`。
+`feishu-sync` 是跨平台桌面应用，把飞书知识库子树定时检测并选择性同步为本地 Markdown 与 Excel 原件，同时承载自定义归档（`_custom/<文件夹>/`）、Agent 标准知识库工作台、只读 MCP 服务（本机 HTTP / WSL 桥接 / 局域网）、标准库文档导出与内网网页分享，以及 `feishu-sync` CLI。
 
-架构分层：**Electron 经 utilityProcess 子进程承载 Hono server**（`electron/server-process.ts` `utilityProcess.fork`，HTTP/SQLite 等重活不占主进程 UI 线程，随应用生命周期管理）→ 业务模块 → SQLite，React 前端通过 preload bridge 调 server。better-sqlite3 是原生模块，其 ABI 必须与运行它的 Electron/Node ABI 一致（见下「原生模块 ABI」）。
+- **桌面架构**：Electron 主进程经 `utilityProcess.fork` 运行 Hono 后端（`electron/server-process.ts`），业务负载不占主进程 UI 线程；仅 `vision` 图片裁剪因 `utilityProcess` 无 `nativeImage` 而经消息通道回调主进程。独立模式（`dev:all` / `node server/dist`）直接运行同一 Hono 后端。
+- **双包结构**：根目录负责前端（`src/`）、Electron（`electron/`）与构建脚本；`server/` 负责后端业务与测试。打包只收 `server/node_modules/**`，根目录运行库留在 `devDependencies`。
 
-## Commands
-
-依赖装两份：根目录（前端 + electron + 打包）和 `server/`（业务 + 测试）。
+## 命令速查
 
 ```bash
-npm install                       # 根目录
-cd server && npm install && cd .. # server 子包
+# 双包安装
+npm install && cd server && npm install && cd ..
 
 # 开发
-npm run dev          # 仅前端 (vite, :5173)
-npm run server:dev   # 仅 server (tsx watch, :3001, standalone)
-npm run dev:all      # 前端 + server 并行（浏览器调，非 Electron）
-npm run dev:desktop  # 编译 server/dist + dist-electron 后并行 vite + electron（内嵌 server）
+npm run dev          # 仅前端（Vite :5173）
+npm run server:dev   # 仅后端（先打 share-render.cjs，再 tsx watch :3001）
+npm run dev:all      # 前端 + 后端并行（浏览器联调，须同终端设 FEISHU_SYNC_DEV_TOKEN）
+npm run dev:desktop  # 编译 server/dist + dist-electron 后并行启动 Vite + Electron
 
 # 构建
-npm run build:all     # vite build + server tsc
-npm run electron:build   # esbuild main.ts/preload.ts/server-process-entry.ts → dist-electron/*.cjs
-# 注：server build 同时运行 build-agent-assets.mjs —— 复制 prompts/角色卡/转发扩展/
-# knowledge-build 技能包（agent/skills 缺失时 pi-amagi 构建拒绝启动），并 esbuild 打包
-# 独立 MCP（server/dist/mcp/kb-mcp.cjs）、局域网网关（dist/mcp/kb-mcp-gateway.cjs）、
-# CLI 客户端（server/dist/cli/feishu-sync-cli.cjs，随 asarUnpack server/** 解包）
-# 与内置 amagi 包（dist/agent/bundled-amagi）。桌面安装包构建（desktop:dist:*）
-# 自动取远端最新 amagi-pi 并回写冻结包（AMAGI_PI_LATEST，降级链与刷新办法见
-# docs/build-operations.md §6）；dev/CI 测试不联网，用同级源或检入冻结包。
+npm run build:all       # vite build + server tsc + build-agent-assets
+npm run electron:build  # esbuild → dist-electron/{main,preload,server-process-entry}.cjs
 
-# 测试（根目录统一入口；server 测试在 server/ 下，vitest）
-npm run check             # lint + typecheck + 前端/server 全部测试（同 CI 项目集；两个 pi 集成测试由 CI 单独装 pi CLI 拆跑，见 ci.yml）
-npm test                  # 前端测试（根目录 vitest，src/**/*.test.*）
-npm run test:all          # 前端 + server 全部测试
-npm run typecheck         # 根 src + 根配置文件 + server 三段 tsc --noEmit
-npm run lint              # eslint（flat config，遗留问题已清零）
+# 质量门禁（提交前必跑，CI 同口径）
+npm run check           # lint + typecheck + 前端与服务端全部测试
+npm run lint            # eslint（保持 0 error）
+npm run typecheck       # 根 src + 根配置 + server 三段 tsc --noEmit
+npm test                # 前端 vitest
+npm run test:all        # 前端 + 服务端全部测试
 
-# 单独跑 server 测试
+# 服务端单测（server/ 目录下）
 cd server
-npm test                       # 全量
-npm run test:watch
-npx vitest run tests/sync-engine.test.ts          # 单文件
-npx vitest run -t "sheet header"                   # 单用例名
-npm run test:migrations        # migration-v5 专项
-npm run typecheck              # tsc --noEmit
+npm test
+npx vitest run tests/sync-engine.test.ts
+npx vitest run -t "sheet header"
+npm run test:migrations
+npm run typecheck
 
-# 打包桌面安装包（electron-builder，需目标平台环境）
+# 桌面打包（需对应平台环境；macOS 正式签名公证加 :release 后缀，本机一键脚本 ./build.command）
 npm run desktop:dist:win:x64
-npm run desktop:dist:mac:arm64   # Apple Silicon
-npm run desktop:dist:mac:x64     # Intel
-# 对外分发的 macOS 正式包（Developer ID 签名 + Apple 公证）：同名命令加 :release 后缀
-# macOS 一键脚本（按本机架构自动选 arch）：./build.command
+npm run desktop:dist:mac:arm64
+npm run desktop:dist:mac:x64
 ```
 
-**正式知识库回填**（独立脚本，不走 GUI）：
+`server:build` 同时执行 `server/scripts/build-agent-assets.mjs`：复制 `prompts/`、`roles/`、`pi-extension/`、`claude-bridge.cjs`、`patches/`、`cli/skills/` 与 `agent/skills/knowledge-build/`（缺失时 `pi-amagi` 构建拒绝启动），生成 `share-render.cjs`，用 esbuild 打包 4 个零原生依赖单文件 CJS（`kb-mcp.cjs`、`kb-mcp-gateway.cjs`、`kb-mcp-http-bridge.cjs` 配 `kb-mcp-wsl.cmd`、`feishu-sync-cli.cjs`），并装配内置 `amagi-pi` 快照至 `dist/agent/bundled-amagi`（`desktop:dist:*` 会拉取远端最新 `amagi-pi` 并回写 `server/bundled/amagi-pi/`；开发与 CI 不联网）。
+
+**正式知识库回填（独立脚本，不走 GUI）**：
 
 ```bash
 cd server
-npx tsx scripts/sync-latest.ts --skip-index            # 不提交KB正文；仍会写配置/SQLite/报告（dry-run）
-npx tsx scripts/sync-latest.ts --skip-index --apply    # 提交KB正文，仅 create/replace
-# 已有配置默认只读，改写需 --persist-config；缺失配置会首次创建。
-# 正式知识库根目录解析：--kb <绝对路径> > FORMAL_KB 环境变量 > config.json 的 knowledgeBaseRoot；全新机器首次运行需显式指定其一。
-# 即使 --skip-index 且未 --apply，也会初始化/迁移SQLite与推进检测状态，使用真实状态目录前备份。
+npx tsx scripts/sync-latest.ts --skip-index          # dry-run：不提交 KB 正文，仍写配置/SQLite/报告
+npx tsx scripts/sync-latest.ts --skip-index --apply  # 提交 KB 正文，仅 create / replace
 ```
 
-## Architecture
+已有配置默认只读，改写需 `--persist-config`；根目录按 `--kb` → `FORMAL_KB` → `config.json` 的 `knowledgeBaseRoot` 解析。未加 `--apply` 也会初始化或迁移 SQLite 并推进 `observed` 状态，操作真实数据目录前须备份。
 
-### 进程与启动契约
+## 架构与关键坑点
 
-- `electron/main.ts` 是入口：生成 desktop token → 经 `electron/server-process.ts` 用 **utilityProcess 子进程**承载 server（fork `dist-electron/server-process-entry.cjs`，子进程内动态 `import()` server 的 `startServer()`）→ 健康检查 → 开窗口。**生产**从 `app.asar.unpacked/server/dist/index.js` 加载 server；**开发**从 `../server/dist/index.js`。
-- Electron 下 server 端口传 `0`（系统自动分配），主进程拿到 `startedServer.url` 再注入前端；**standalone** 模式（`npm run dev:all` / 直接 `node server/dist`）固定 `127.0.0.1:3001`。
-- 前端通过 preload（`window.desktop.getApiHeaders()`）取 `X-Desktop-Token`，而非硬编码。`src/api/client.ts` 是唯一出口。
+### 启动、端口与前端出口
 
-### 鉴权与 CORS（两处关键 gotcha）
+- `electron/main.ts` 生成 `X-Desktop-Token` 后 fork `dist-electron/server-process-entry.cjs` 动态加载 `server/dist/index.js`（生产取 `app.asar.unpacked/server/dist/index.js`，开发取 `../server/dist/index.js`），健康检查通过后开窗。
+- 端口分工：Electron 内嵌后端传 `0` 自动分配；standalone 后端固定 `127.0.0.1:3001`；本机 HTTP MCP 固定 `127.0.0.1:47392/mcp`（WSL 桥接复用此端口，`allowStandaloneKbMcp` 默认开启，退出托盘后继续监听）；局域网只读 MCP 默认 `47391`（默认关）；内网静态网页分享固定 `47393`。
+- 前端唯一 API 出口是 `src/api/client.ts`，经 preload `window.desktop.getApiHeaders()` 取桌面令牌，禁止硬编码。
 
-- `X-Desktop-Token`（`crypto.randomBytes(32)`）+ Origin/Referer 校验，仅 `desktopMode=true` 时挂 `authMiddleware`；`/api/health` 永远 public 且必须先注册。
-- **CORS dev gate 不由 `desktopMode` 决定**。`dev:all`（vite `:5173` 跨域调 `:3001`）和真 Electron 生产**都** `desktopMode=true`，但只有前者需要放行 `localhost:5173`。因此用显式 `corsDevMode` 参数驱动（`server/src/index.ts` `CreateServerOptions.corsDevMode`）。改 CORS 逻辑前先读该字段的注释。
+### 鉴权、CORS 与 Hono 注入顺序
 
-- 维护 scope 集时注意 `RETIRED_REQUEST_SCOPES`（`config-manager.ts`）：`docs:document:read` 已在上游失效，出现在 `auth login --scope` 请求集会让整单 device authorization 被拒；加载迁移与 device flow 发起前都会剔除。
+- **四令牌域双向隔离**：Desktop（`X-Desktop-Token`）、CLI（`X-Cli-Token`）、Agent 运行（`X-Agent-Run-Token`）与 LAN MCP（`Authorization: Bearer`）互不接受对方令牌。
+- **挂载顺序不可变**（`server/src/index.ts`）：`app.use('*')` 依赖注入（将模块挂到 context 同名属性 `(c as any).configManager`，非 `c.env`；路由不得自行 `new`）→ `/api/health`（永远公开）→ `agentInternalRoutes` → `cliAdminRoutes` → `cliRoutes` → `authMiddleware`（仅 `desktopMode=true`）→ 其余受保护业务路由（共 23 个路由文件）。
+- **CORS 开发放行由 `CreateServerOptions.corsDevMode` 显式驱动**，不看 `desktopMode`。`dev:all` 与 Electron 生产态都是 `desktopMode=true`，只有前者放行 `localhost:5173`。改 CORS 前先读该字段注释。
+- **`RETIRED_REQUEST_SCOPES`**（`config-manager.ts`）：`docs:document:read` 在上游已失效，加载迁移与 device flow 发起前均会剔除，防止整单授权被拒。
 
-### Hono 依赖注入
+## 不可破业务契约
 
-`server/src/index.ts` `buildServer()` 实例化所有模块后，用一个 `app.use('*')` 中间件把它们挂到 Hono context 本身（当前写法为 `(c as any).configManager` 等，并非 `c.env`）（`configManager` / `larkCliClient` / `localMapStore` / `changeDetector`，以及 `desktopToken`）。**该中间件必须挂在 auth 之前**。路由文件（`routes/*.ts`）从 context 上的同名属性取依赖，不要 `new` 新实例。路由用 `app.route('/', xxxRoutes)` 挂载（前缀在路由文件内写死）。
+### 同步引擎、安全写盘与双身份归档
 
-### 核心同步流水线
+- **检测/同步解耦**：`ChangeDetector` 只推进 `observed_obj_edit_time`；`SyncEngine` 只有在 `库外 staging → 校验 → rename → DB 事务` 全部成功后才推进 `synced_obj_edit_time` 并置 `synced`。任何资源缺失、下载失败或提交异常均不推进基线。
+- **dry-run 默认**：`SyncOptions.apply` 默认 `false`，写盘须同时传入 `apply: true` 与 `confirmation: 'APPLY'`。`move`、`delete`、路径冲突、父链不完整、未知类型、无权限与未写回源编辑一律生成带 `reasonCode` 的 blocker，不自动覆盖。文件落盘后 DB 失败须经 `atomic-commit.ts` 快照回滚并用 `SyncEngineTestHooks` 验证。
+- **双身份互斥**：`custom_folder_id` 与 `watched_root_*` 互斥，冲突时结构树所有权优先。全量重建自动纳管 `_custom/<子目录>/` 下带头 `.md`（根散档除外），回填**不清 `wiki_node_token`**；飞书树两处出口（`getTreeDetailed` 飞书视图与 legacy `getTree`）必须按 `customFolderId IS NULL` 过滤归档行。归档变更检测仅报 `modified`。
+- **同步并发与表格原件**：批量同步并发上限为 2；只读 XLSX 重建保留自动行高与样式，单元格页缓存在 `<dataRoot>/sync-cache/`，性能流水记入 `sync-performance.jsonl`。
 
-变更检测与同步是两条独立链路，都围绕 `obj_edit_time`：
+### LLM 多协议与 direct 通道
 
-- **检测** `ChangeDetector`（`server/src/modules/change-detector.ts`）：遍历 wiki 子树，对比本地 SQLite 的 `observed_obj_edit_time`。检测**只推进 observed 字段**。
-- **同步** `SyncEngine`（`sync-engine.ts`，~2700 行核心模块，改前先读模块头注释）：`分型读取(docx/sheet/slides) → 媒体引用解析/下载 → 本地引用重写 → staged 原子提交 → 推进 synced 基线`。**只有原子提交成功才推进 `synced_obj_edit_time` 并置 `synced`**——这是不可破的契约，资源缺失/下载失败/提交异常一律不推进。
+- `direct-channel.ts` 为 `direct` 单通道，按所选提供商协议分别支持 `openai-completions`、`openai-responses` 与 `anthropic-messages`（OpenAI SDK + Anthropic SDK），初始配置不预置提供商或密钥，`contentAdaptationEnabled` 默认关闭。
+- `getFallback()` 恒为 `null`，风格对齐失败不抛异常，返回 `finishReason='error'|'timeout'` 并由确定性重构结果兜底；默认超时 `600_000` ms。
 
-### 自定义归档与双身份契约
+### Agent 工作台、Pi 编排与源受控写
 
-文档归属有两条**互斥**身份通道，`custom_folder_id` 与 `watched_root_*` 不得并存，归属冲突时结构树所有权优先：
+- **运行时与独立边界**：设置页仅提供 Pi 运行时，`agent.runtime.backend` 归一为 `pi`（启动自动迁移旧应用级 Claude Code 配置；已有会话按 `agent_sessions.runtime_backend` 继续，见 `docs/claude-runtime.md`）。`server/src/agent/`、`kb/`、`mcp/`、`kb-lan/`、`sources/`、`ops/`、`cli/` 独立于同步流水线，不把 Pi 接入 `ContentBackend` registry，也不为 Pi 升级 Electron。
+- **Pi 侧车与插件**：经外部 Node ≥ 22.19、Pi ≥ 1.4/< 2 以 JSONL RPC 启动。内置转发扩展只调回环内部 API，工具集与能力令牌由服务端单点裁决；Discuss 只读，Work 仅在授权 Workspace 内操作且无内置 shell（原生 Pi 插件为受信任 Node 代码，非 OS 沙箱），支持按会话切换本机插件资源与「从此轮分叉」。Workspace 与原始库、标准库、数据根及受保护运行根双向隔离，改配置须反向交叉校验。
+- **构建编排 v2（`pi-amagi`）**：`standardKb.orchestrationMode` 唯一开放值为 `'pi-amagi'`；角色（`luban` / `diting` / `baize`）当前要求 `openai-completions` 协议并在创建/恢复构建前预检。epoch 换代与残留进程对账未确认即拒绝启动；标准库走 `staging 校验 → 不可变 release → 原子切 CURRENT.json`，提交后 DB 异常按文件指针对账、清理异常不得删当前 release，**不可沿用原同步引擎“DB 失败回滚文件”的逻辑**。编排度量记入 `kb_builds.metrics_json`。
+- **进程池三通道**（`agent-process-pool.ts`）：`session` 立即准入（满返 409 `agent_busy`，M ≥ 2 至少留 1 槽）；`background` 合计 ≤ `M - 1`（`agent.maxConcurrentProcesses`，1–6 默认 3）；`build` 独立通道容量 `N = standardKb.buildConcurrency`（1–6 默认 2，兼容读 `buildParallelism`），总上限 `N + M`。
+- **CLI、批准流与三写者**：`ops/command-table.ts` 40 条命令表供 CLI（默认开启）与 `app_command` 共用。`app_command` 的非 `read` 命令逐次经会话批准，模型传入的 `confirm`/`confirmation` 一律剔除，批准绑定服务端轮次。原始库正文只由 `SyncEngine`、源生命周期操作（只移删）、`SourceEditService` 三者修改，`feishu_sync` 头只由 `SyncEngine` 生成；非 `pushed` 的 `source_edits` 行令同步与清理以 `local_edit_pending` 拒绝。写回飞书（`feishuWrite` 默认关）三段式执行，**不推进任何 `synced` 基线**，成功后单文档回拉收敛。
 
-- **结构树成员**：`watched_root_url/id` 绑定 watchedRoot，走检测→同步全链路。
-- **归档文档**：`custom_folder_id` 绑定 `custom_folders` 表，本地文件在 `_custom/<文件夹名>/`；常规写入点是快捷添加 API（`POST /api/custom-folders/:id/docs` → `setDocumentCustomFolder`，带结构树竞态守卫）。
-- **动态纳管**：手工放进 `_custom/` 的带 `feishu_sync` 头文件由全量重建兜底——`IndexScanner.reconcileCustomFolders` 自动注册含 md 的一级子目录（`ScanPolicy` 保留目录除外；`_custom/` 根下散档不纳管），`LocalMapStore.backfillCustomFolders` 按 `local_rel_path` 最长前缀回填 `custom_folder_id`（候选行须 watched_root 为空；与 `backfillWatchedRoots` 对称）。
-- **契约细节**：回填**不清** `wiki_node_token`——upsert 的 COALESCE 会把头部解析出的 wiki 身份写回，且 `detectCustomFolderChanges` 依赖它做云端身份校验；因此飞书树两个出口（`getTreeDetailed` feishu 视图 + legacy `getTree`）都必须按 `customFolderId IS NULL` 过滤归档行，wiki 身份单独不能作为排除依据。归档变更检测只报 modified（无新增/删除语义）。
+### 数据层与 Header round-trip
 
-### 安全写盘：dry-run 默认 + 原子提交
+- 数据根默认 `~/.feishu-sync/`（`feishu-sync.db` + `config.json`），`FEISHU_SYNC_HOME` 可整体覆盖（服务端与桌面共享，非 Electron `userData`）。
+- SQLite 现含 **22 张表**（清单见 `docs/data-contract.md`）。启动自动跑 `applyAdditiveMigrations()`，**新增表或列必须双登记到 additive 迁移数组与 `getCreateTablesDDL()`**。`watchedRoots` 是真相源，`watchedRootUrls` 仅内存派生投影。
+- 原始库头 `feishu_sync`（YAML-in-HTML-comment，兼 3 种历史格式）由 `SyncEngine.generateHtmlHeader` 写、`IndexScanner.parseMetadata` 读；标准库头 `feishu_sync_kb` 独立维护，互不混用。改字段须同步两端并验证 round-trip。
 
-- `SyncOptions.apply` 默认 false（dry-run）；提交知识库文件需要 `apply:true` + `confirmation:'APPLY'`。move/delete/路径冲突/父链不完整/未知类型/无权限 → 保留为带 `reasonCode` 的 **blocker**，绝不自动覆盖。
-- `atomic-commit.ts`：所有写入先进**库外** staging 目录，校验后 rename 入位；失败从 rollback 快照恢复；`assertInsideRoot` 拒绝路径逃逸。改写盘逻辑必须保持「staging → 校验 → rename → DB 事务」顺序，文件已提交但 DB 失败时用 `SyncEngineTestHooks` 验证回滚。
+## 安全红线、原生 ABI 与代码约定
 
-### LLM 通道（direct 单通道）
+- **安全红线**：代码零飞书 token/`app_id`/`app_secret`（`larkCliPath` 已废弃，仅留环境变量 `LARK_CLI_PATH`）；不提交含明文 API Key 的 `config.json`；前端改动必须真机浏览器或 Electron 实测。
+- **better-sqlite3 ABI**：Electron 打包由 `scripts/build-desktop-target.cjs` 执行 `@electron/rebuild` 并经 `scripts/verify-abi.cjs` 校验。运行 `npm test` 时，`pretest` 会自动调用 `scripts/ensure-node-sqlite.cjs` 探测并修复 Electron/Node ABI 差异；如需手动切回系统 Node ABI，执行 `cd server && npm rebuild better-sqlite3`。依赖已锁定 `better-sqlite3 ^12` 以规避 Node 24 worker teardown 崩溃。
+- **代码约定**：全仓 TypeScript + ESM（`"type": "module"`），`server/` 内 import 使用 `.js` 扩展名（`moduleResolution: bundler`）；`electron/` 打包为 CJS。改动前必读目标模块头注释；后端测试优先算法层 + 内存 mock。已知技术债：`server/scripts/e2e-integration-test.ts` 端口硬编码 `4123`；`electron-builder.config.cjs` 的 `appId` 不可轻改。
 
-`content-backend.ts` + `content-backend-registry.ts` + `direct-channel.ts`：
+## 交付前核对
 
-- **单 channel 注册**（`ChannelName = 'direct'`）：OpenAI SDK 打 OpenAI 兼容远程端点（默认智谱 bigmodel GLM），无本地 CLI 通道。
-- Registry 的 `getFallback()` 恒为 null——整理失败由 sync-engine 的确定性 B6 结果兜底。channel 失败不抛异常，返回 `finishReason='error'/'timeout'`。
-- 默认超时 `timeoutMs = 600_000`（10 分钟）——远程模型过载时 SDK 内部重试，旧 60s 会误判超时。
-
-### Agent 标准知识库工作台（已发版）
-
-- 0.3.50 起随安装包发布，0.4.0 起标准库构建默认 Pi 编排。先读 `docs/design/agent-knowledge-design.md`（基线）与 `docs/design/kb-agent-upgrade-design.md`（2026-10 升级增补），使用说明在 `docs/agent-knowledge.md`；`server/src/agent/`、`kb/`、`mcp/`、`sources/`、`ops/`、`cli/` 独立于既有同步/整理流水线。不要把 pi 接入 ContentBackend registry，也不为 pi 升级 Electron。
-- **构建编排 v2（pi-amagi）**：Leader/作者/审查者多角色派发，运行时在 `agent/build-runtime/`（dispatch-guard/process-ledger/process-residual/runtime-integrity 等）+ `kb/build-orchestration.ts`、`build-actors.ts`、`build-leader-supervisor.ts`。契约要点：epoch 换代与进程残留对账未确认即拒绝启动（换 epoch 或 rebuild 不能绕过旧残留）；发布走 publish-readiness 门（不可变 release + 原子切 CURRENT）；构建度量记入 `kb_builds.metrics_json`。详见 `docs/build-orchestration.md`。
-- 应用设置将 `agent.runtime.backend` 归一为 `pi`。会话继续使用保存在 `agent_sessions.runtime_backend` 的基座，Claude Code 兼容接口见 `docs/claude-runtime.md`。
-- pi 经外部 Node≥22.19、pi≥1.4/<2 的 JSONL RPC 启动。应用自身的转发扩展只调用回环内部API；服务端裁决工具集与能力令牌。应用自带的Discuss工具只读，Work不提供shell。显式添加的原生Pi插件是受用户信任的Node代码，以当前用户权限运行；不能用宿主工具围栏宣称它们具备OS沙箱。
-- Workspace 与原始库、标准库、数据根、完整应用代码/依赖、Node/pi运行资源和凭据根隔离；配置变更要做反向交叉验证，不能只在登记目录时校验。文件围栏不是同uid/外部自动执行器的OS沙箱。
-- 原始源以成功本地版本和hash为准，不能仅筛status=synced，也不能因cloudDeleted观测而删仍存在的源；CSV附件与主文档同围栏，源变化须阻断构建，模型skip不能绕过。
-- 标准库先staging校验，再生成不可变release、原子切CURRENT；提交后DB异常按指针对账，清理异常不得删除current release。不要把原同步引擎的“DB失败回滚文件”套在此处。
-- 会话历史真相在pi JSONL树，元数据节点不能截断回溯；SSE message_end必须是完整DTO，初始0游标、溢出resync、工具多轮与停止ACK竞态都需实际流回归。状态只能按权威事件推进，不用“请求停止”冒充完成。
-- Pi插件以原生package为单位，由正式CLI安装/更新/移除，SDK解析manifest与资源；仅管理应用agent/pi-home。knowledge-workbench内置包包含对话/Work/构建/文风/任务编排配置项。运行期只显式加载应用启用的资源，通用Pi认证经Pi只读存储复用，不复制密钥。插件包变更须拒绝活跃任务并回收空闲进程，本地插件源码也受Workspace保护。
-- `server/scripts/build-agent-assets.mjs` 随server build复制prompts/转发扩展并生成独立MCP CJS；MCP只读已发布文件，不导入SQLite。测试一律临时FEISHU_SYNC_HOME；真实模型fixture与真实生产资料严格分开记录。
-
-#### 2026-10 升级增补（kb-agent-upgrade S0–S14 已合入）
-
-- **双模型与并行构建**：`agent/vision/`（VisionChannel/VisionDescriber，内容寻址缓存 `<dataRoot>/agent/vision-cache/`；配置 `agent.vision` 缺省 disabled，失败不阻断构建、图片标 unavailable + 构建警告）。`kb/build-units.ts` + `kb/path-claims.ts` + `kb/source-images.ts` 支撑多 worker 并行构建：`standardKb.buildConcurrency` 1..6 默认 2（=1 等价旧行为；兼容读旧名 buildParallelism）；单元内 `kb_unit_done` 上报，`kb_finish` 仅收尾轮可用；worker 写他单元路径被 `kb_path_owned_by_other_unit` 拒绝；快照条目新增 `mediaHash`（`contentHash` 公式不变，旧 manifest 视为未变）。
-- **进程池准入**（`agent-process-pool.ts`）：`acquire('session'|'background'|'build')` 三通道——会话立即语义（满 → 409 agent_busy，至少保留 1 槽）；非构建后台（任务进程、连接探测）合计 ≤ M−1（`agent.maxConcurrentProcesses` 1..6 默认 3，语义为非构建后台容量）；构建走独立通道，容量 N = `standardKb.buildConcurrency`，不被 M 截断（总运行上限 = N + M）。background/build 均 FIFO 排队。
-- **任务编排**（`agent/tasks/` + `agent/roles/`）：`task_submit/query/resume/cancel` 工具与 `agent_tasks` 表；三张内置角色卡（kb-analyst/kb-converter/kb-reviewer）；子任务工具集 = 角色请求 ∩ 父会话模式工具集，永不获得 `task_*`/`app_command`；跨会话任务归属校验；开关是 knowledge-workbench 内置插件的「任务编排」条目（默认启用；插件管理中保存的关闭状态仍生效）。
-- **CLI 与运维命令面**：`ops/command-table.ts` 40 条命令表，CLI 与内部 Agent 工具 `app_command` 共用（HTTP API 仍是唯一业务契约）。CLI 源码 `server/src/cli/`，产物 `server/dist/cli/feishu-sync-cli.cjs`；应用内一键生成 shim `<dataRoot>/bin/feishu-sync`。cli 默认开启（可显式关闭，0.4.2 起），`cli-endpoint.ts` 发布 `<dataRoot>/run/endpoint.json`（0700/0600，tmp+rename）与独立 CLI 令牌；`middleware/cli-auth.ts` 三重校验（回环 Host + 无 Origin + `X-Cli-Token` timing-safe）。**CLI 令牌与 desktop token 双向隔离**：`/api/cli/enable|token/rotate|info|install-shim` 只接受 desktop token；CLI 令牌不进 `/api/agent-internal/*`，desktop auth 域也不接受 CLI 令牌。命令表 `config.set` 对 CLI/app_command 主体禁改 `cli.*`/`llm.*` 密钥面/`agent.workspaces`/`feishuWrite`；`PUT /api/config` 对 CLI 主体（内部转发 actor 标记）丢弃 `feishuWrite`。CLI 退出码 0/1/2/3/4；destructive/remote_write 需 `--yes`。
-- **app_command 批准流**（`agent/approvals/` + `agent/tools/app-command-family.ts`，工具族经 `AgentToolService.registerToolFamily()` 注册）：read 级直通；mutate/destructive/remote_write 逐次经会话内用户批准（`/api/agent/sessions/:id/approvals*` + SSE `approval_request`）；模型传入的 confirm 字段一律剔除，批准执行绑定服务端运行轮次（会话停止即取消待执行复核、拒绝跨轮操作）。
-- **源库受控写与写回飞书**（`sources/`）：SourceEditService 是原始库正文第三写者（用户或经批准的 `app_command source.*`）：原 header 字节保全（写后 `parseMetadata` 逐字段复核）+ baseHash OCC + 编辑前备份 `<dataRoot>/source-edits/<objToken>/` + 审计 `agent/audit/source-edits.jsonl`；`source_edits` 表登记 dirty/pushing/pushed/conflict。**SyncEngine/回收站/源清理/孤立清理遇非 pushed 行一律 `local_edit_pending` 拒绝（blocker），绝不覆盖**。FeishuWriteService 经 lark-cli `docs +update` 三段式写回（fetch → 同流程立即写 → 写后回读校验，转义归一化层比对；stale overwrite 会静默损坏正文，绝不重试旧 revision）；写回**不推进任何 synced 基线**，成功后立即单文档回拉收敛。写权限走 `scopeSet:'write'` 增量授权（`WRITE_SCOPES=['docx:document:write_only']`，`feishuWrite.enabled` 默认关）。
-- **原始库写者不变量已修订**（基线 §13.1）：正文只由登记在册的受控写者修改——SyncEngine（云端→本地）、源生命周期操作（回收站 restore/purge、源清理、孤立清理，只移动/删除不改正文）、SourceEditService；`feishu_sync` 头部字节只由 SyncEngine 生成；Agent 工具对原始库仍只有读路径，唯一写入口是经用户逐次批准的 `app_command source.*`。
-
-### 数据层
-
-- SQLite 在 `~/.feishu-sync/feishu-sync.db`，config 在 `~/.feishu-sync/config.json`；环境变量 `FEISHU_SYNC_HOME` 可整体改根目录（server 与 desktop 共享，**不是** Electron userData）。除 documents/sync_log/run_log 主表外还有 localDirs/custom_folders/sheet_sheets/feishu_pending_items 等辅助表；工作台表含 kb_builds（parallelism/orchestration_mode/metrics_json 等增列）/agent_sessions/agent_tasks/agent_session_preferences/source_edits/source_push_log/source_references/source_comments/source_comment_meta/kb_publications/cloud_moves/sync_blocklist/local_source_deletions/kb_source_exclusions（全表清单见 `docs/data-contract.md`），全部经 additive 迁移演进（新表/新列双登记 additive 数组 + `getCreateTablesDDL()`）。config 工作台段：`agent`（runtime/model/vision/orchestration/maxConcurrentProcesses/workspaces）、`standardKb`（`buildConcurrency` 兼容读旧名 buildParallelism；`orchestrationMode` 缺省 'pi-amagi'，另有 buildRoles/reviewPolicy/evidenceBudgetBytes/buildBatchWordBudget）、`cli`（默认开）、`kbLanMcp`（默认关，端口 47391）、`feishuWrite`（默认关）、`feishuPublish`（默认关）、`sync`（slidesScreenshot 默认关/whiteboardExport 默认开）。
-- `LocalMapStore`（`local-map-store.ts`）用 better-sqlite3 **同步** API + 预编译语句。`initialize()` 每次启动跑 `applyAdditiveMigrations()`：每条 `ALTER TABLE ADD COLUMN` 用 `PRAGMA table_info` 守卫，旧库原地升级。新列加到该数组 + `getCreateTablesDDL()` 两处。
-- 历史迁移脚本（`server/scripts/migration_v2..v5`）是文件级参考；线上升级靠上面的 additive 自动迁移，不再手工跑。
-- **`watchedRoots`（`WatchedRootConfig[]`）是真相源**，`watchedRootUrls` 是 ConfigManager 内存派生、不落盘的兼容投影。
-
-### Markdown header 契约（round-trip 必须闭环）
-
-`SyncEngine.generateHtmlHeader` 写、`IndexScanner.parseMetadata` 读。当前规范是文件首部 YAML-in-HTML-comment：
-
-```
-<!--
-feishu_sync:
-  obj_token: ...
-  obj_type: docx
-  ...
--->
-```
-
-`IndexScanner` 还兼容 3 种历史格式（`legacy_html_zh` / `blockquote` / `bold_kv`）。改 header 字段必须同步两端，并保证 round-trip（参考 `tests/sync-engine.test.ts` 的 (d) 项用例）。
-
-## 安全红线（不可妥协）
-
-- **零飞书 token**：代码中不得出现任何飞书 token/app_id/app_secret 变量；全部委托 `lark-cli` user 认证态。`LarkCliClient` 是 lark-cli 子进程封装（QPS 节流 + 错误分类，`99991400` 指数退避）。
-- bigmodel apiKey 当前**明文**存 config.json（架构决策，含 `_warning` 字段提醒勿提交），加密 deferred。
-- 前端改动必须真机浏览器/Electron 交互验证，不能只靠 API 测试。
-
-## 原生模块 ABI（better-sqlite3）
-
-打包/跑 Electron 时 better-sqlite3 的 `.node` 二进制必须匹配 Electron ABI，否则启动崩。`scripts/build-desktop-target.cjs` 在 `build:all → electron:build` 后会跑 `@electron/rebuild`。验证用 `scripts/verify-abi.cjs`。开发态 `dev:desktop` 与 standalone server 用同一份 server/dist，ABI 必须一致。
-
-**实测坑**：node_modules 被 `@electron/rebuild` 编译成 Electron ABI 后，直接用系统 Node 跑 vitest 会报 `NODE_MODULE_VERSION` 不匹配，横跨所有直连 better-sqlite3 的测试（20+ 用例）。切回系统 Node ABI：`cd server && npm rebuild better-sqlite3`。跑桌面构建后再跑测试时按此切换。
-
-**Node 24 teardown 崩溃（2026-10 实测）**：better-sqlite3 11.x 在 Node 24 上存在 worker teardown 时序缺陷——GC 弱回调触发 `Statement::~Statement` 时 Environment 已销毁，`RemoveEnvironmentCleanupHook` 断言 `env != nullptr` 崩溃（表现为 custom-folders.test.ts 等 worker 静默退出、49 用例丢失）。已升级 better-sqlite3 ^12 修复（12.4.1+ 含修复）；如再遇类似 worker 崩溃先查原生模块版本矩阵。
-
-## 代码约定
-
-- 模块/路由/类型注释密度很高，大量「P0-Qx 实测 / 实测 confirmed / 历史教训」标注记录了为什么这样写。改动前读模块头注释，不要凭直觉重写。
-- TypeScript，ESM（`"type": "module"`），server 源码用 `.js` 扩展名 import（`moduleResolution: bundler`，非 NodeNext）；electron 经 esbuild 打成 CJS（`dist-electron/*.cjs`）。
-- 后端测试在 `server/tests/`（vitest），倾向算法层 + in-memory mock（避免 better-sqlite3 ABI 依赖，参考 `change-detector.test.ts` / `sync-engine.test.ts` 的模式）。
-- 已知技术债：`server/scripts/e2e-integration-test.ts` 端口硬编码（应为环境变量读取）。
+1. 本地跑通 `npm run check`；涉及前端/桌面交互的改动完成真机实测。
+2. 新增数据表或列已完成 `applyAdditiveMigrations()` 与 `getCreateTablesDDL()` 双登记。
+3. 改动契约、路由、端口或配置段时同步更新 `AGENTS.md`、`CLAUDE.md` 与对应 `docs/` 文档。
+4. 确认提交中无真实凭据、临时日志或未清理测试产物。

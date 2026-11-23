@@ -48,6 +48,7 @@ import type {
 } from '../types/agent-knowledge.js';
 import type { AgentProcessPool, PoolSlot } from '../agent/agent-process-pool.js';
 import { ToolError } from '../agent/agent-tool-service.js';
+import { projectLeaderTasks } from './amagi-task-observations.js';
 
 /** 宿主回调（build-runtime-host 提供；全部真实实现，无脚本假件语义）。 */
 export interface LeaderSupervisorCallbacks {
@@ -237,16 +238,7 @@ export class BuildLeaderSupervisor {
           resumeCapability: BuildLeaderSupervisor.resumeLevelOf(this.state.binding),
         }
         : null,
-      tasks: this.state.actors.map((actor) => ({
-        nativeTaskId: actor.nativeTaskId,
-        role: actor.role,
-        parentTaskId: actor.parentTaskId,
-        status: actor.status,
-        execState: actor.execState,
-        lastEventAt: actor.lastEventAt,
-        runtimeEpoch: actor.runtimeEpoch ?? null,
-        generation: actor.generation,
-      })),
+      tasks: projectLeaderTasks(this.state.binding, this.state.actors),
       rounds: { started: this.roundsStarted, ended: this.roundsEnded },
       idle: { remindedAt: this.state.idleRemindedAt, lastActivityAt: new Date(this.lastActivityAt).toISOString() },
       publishRequest: this.state.publishRequest,
@@ -650,7 +642,7 @@ export class BuildLeaderSupervisor {
           this.upsertActor({ nativeTaskId: taskId, role: 'unknown', status: 'pending', execState: status });
         }
         this.cb.dispatchStateChanged?.();
-        const terminal = status === 'done' || status === 'failed' || status === 'cancelled' || status === 'interrupted';
+        const terminal = status === 'done' || status === 'failed' || status === 'error' || status === 'cancelled' || status === 'interrupted';
         return { critical: terminal, outcome: null };
       }
       case 'publish_window_opened': {

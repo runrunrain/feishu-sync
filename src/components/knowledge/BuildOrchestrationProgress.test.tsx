@@ -477,7 +477,9 @@ describe('v2 Leader 监督运行进度（真实契约 GET /api/kb/builds/:id/lea
         makeLeaderTask({ nativeTaskId: 'task-w-01', execState: 'running', status: 'confirmed' }),
         makeLeaderTask({ nativeTaskId: 'task-w-02', role: 'luban', execState: 'queued', status: 'pending' }),
         makeLeaderTask({ nativeTaskId: 'task-r-01', role: 'diting', execState: 'done', status: 'confirmed' }),
-        makeLeaderTask({ nativeTaskId: 'task-err', execState: 'error', status: 'confirmed' }),
+        makeLeaderTask({
+          nativeTaskId: 'task-err', execState: 'error', status: 'confirmed', rateLimitedModel: 'gemini-3.8-flash',
+        }),
         makeLeaderTask({ nativeTaskId: 'task-w-03', execState: 'running', parentTaskId: 'task-w-01' }),
         makeLeaderTask({ nativeTaskId: 'task-gone', execState: null, status: 'revoked' }),
       ],
@@ -492,6 +494,7 @@ describe('v2 Leader 监督运行进度（真实契约 GET /api/kb/builds/:id/lea
     // native execState=error（真实链路实测）：中文标签 + 语气与 failed 同级（异常终态）。
     const errored = host.querySelector('[data-task-id="task-err"]');
     expect(errored?.textContent).toContain('异常');
+    expect(errored?.textContent).toContain('模型限流 · gemini-3.8-flash');
     expect(errored?.querySelector('.text-seal-2')?.textContent).toContain('异常'); // bad tone（与 failed 同级）
     const running = host.querySelector('[data-task-id="task-w-01"]');
     expect(running?.getAttribute('data-exec')).toBe('running');

@@ -101,6 +101,7 @@ function writeAnchor(fixture: Fixture, taskId: string, run: Partial<AnchorRun> &
 }
 
 const LEADER_PIDS = () => new Set<number>([4100]);
+const windowsTicks = (unixMs: number) => 621355968000000000n + BigInt(unixMs) * 10_000n;
 
 describe('scanLaunchAnchors', () => {
   it('解析真实形状锚点；目录缺失 → 空（旧版 amagi 如实无线索）', () => {
@@ -201,10 +202,10 @@ describe('reconcileResidualProcesses 判定矩阵', () => {
   });
 
   it.each([
-    { rows: '0 0\r\n4 0\r\n', state: 'confirmed', pending: [] },
-    { rows: '0 0\r\n4 0\r\n5006 4\r\n', state: 'unconfirmed', pending: [5006] },
-    { rows: '0 0\r\n4 0\r\n5008 5006\r\n', state: 'unconfirmed', pending: [5008] },
-    { rows: '0 0\r\n4 0\r\ntruncated', state: 'unconfirmed', pending: [5006] },
+    { rows: '0 0 -\r\n4 0 -\r\n', state: 'confirmed', pending: [] },
+    { rows: '0 0 -\r\n4 0 -\r\n5006 4 -\r\n', state: 'unconfirmed', pending: [5006] },
+    { rows: '0 0 -\r\n4 0 -\r\n5008 5006 -\r\n', state: 'unconfirmed', pending: [5008] },
+    { rows: '0 0 -\r\n4 0 -\r\ntruncated', state: 'unconfirmed', pending: [5006] },
   ])('Windows 进程表对账 $pending', async ({ rows, state, pending }) => {
     const fixture = makeFixture({ platform: 'win32' });
     writeAnchor(fixture, 't-windows', { rootPid: 5006 });
@@ -217,9 +218,53 @@ describe('reconcileResidualProcesses 判定矩阵', () => {
     expect(fixture.signals).toHaveLength(0);
   });
 
+  it.each([
+    { caseName: '原生退出记录与当前出生时间证明复用', runId: 'run_t-windows', elapsed: 1_000, state: 'confirmed' },
+    { caseName: '同一 PID 仍可能属于原任务', runId: 'run_t-windows', elapsed: -1, state: 'unconfirmed' },
+    { caseName: '另一轮的退出记录不能覆盖当前运行', runId: 'run_other', elapsed: 1_000, state: 'unconfirmed' },
+  ])('Windows 旧锚点：$caseName', async ({ runId, elapsed, state }) => {
+    const fixture = makeFixture({ platform: 'win32' });
+    const anchorAt = 1_699_999_000_000;
+    const exitedAt = anchorAt + 10_000;
+    writeAnchor(fixture, 't-windows', { rootPid: 5006, at: anchorAt });
+    const taskDir = path.join(fixture.homeDir, 'amagi', 'v2-store', 't-windows');
+    fs.mkdirSync(taskDir, { recursive: true });
+    fs.writeFileSync(path.join(taskDir, 'current.json'), JSON.stringify({
+      version: 1, taskId: 't-windows', specId: 't-windows', execution: 'done', backend: 'json',
+      backendRunId: runId, processState: 'exited', startedAt: anchorAt + 5, exitedAt,
+    }));
+    fixture.deps.execFileImpl = async () => ({ stdout: `0 0 -\r\n5006 4 ${windowsTicks(exitedAt + elapsed)}\r\n` });
+    const outcome = await reconcileResidualProcesses(
+      { homeDir: fixture.homeDir, buildRoot: fixture.buildRoot, leaderPids: LEADER_PIDS() }, { reap: true }, fixture.deps,
+    );
+    expect(outcome.state).toBe(state);
+    expect(outcome.children[0]).toMatchObject({ pid: 5006, verdict: state === 'confirmed' ? 'not-ours' : 'unconfirmed' });
+    expect(outcome.note).not.toContain('PID 未知');
+    expect(fixture.signals).toHaveLength(0);
+  });
+
+  it.each([
+    { caseName: '新占用者的子进程', rootAge: 200, childAge: 300, pending: [] },
+    { caseName: '旧任务可能遗留的子进程', rootAge: 200, childAge: 100, pending: [5008] },
+    { caseName: '缺出生时间的可能遗留进程', rootAge: 200, childAge: null, pending: [5008] },
+    { caseName: '出生令牌与原任务匹配', rootAge: 0, childAge: 100, pending: [5006] },
+  ])('Windows 出生令牌：$caseName', async ({ rootAge, childAge, pending }) => {
+    const fixture = makeFixture({ platform: 'win32' });
+    const startedAt = 1_699_999_000_000;
+    writeAnchor(fixture, 't-windows', { rootPid: 5006, rootIdentityToken: `win32:${windowsTicks(startedAt)}` });
+    const childTicks = childAge === null ? '-' : windowsTicks(startedAt + childAge);
+    fixture.deps.execFileImpl = async () => ({ stdout: `0 0 -\r\n5006 4 ${windowsTicks(startedAt + rootAge)}\r\n5008 5006 ${childTicks}\r\n` });
+    const outcome = await reconcileResidualProcesses(
+      { homeDir: fixture.homeDir, buildRoot: fixture.buildRoot, leaderPids: LEADER_PIDS() }, { reap: true }, fixture.deps,
+    );
+    expect(outcome.state).toBe(pending.length ? 'unconfirmed' : 'confirmed');
+    expect(outcome.children.filter(item => item.verdict === 'unconfirmed').map(item => item.pid)).toEqual(pending);
+    expect(fixture.signals).toHaveLength(0);
+  });
+
   it.skipIf(process.platform !== 'win32')('Windows CIM 原生快照包含当前进程', async () => {
     expect(await snapshotProcessTable()).toEqual(expect.arrayContaining([
-      expect.objectContaining({ pid: process.pid, ppid: process.ppid }),
+      expect.objectContaining({ pid: process.pid, ppid: process.ppid, windowsCreationTicks: expect.any(BigInt) }),
     ]));
   }, 10_000);
 
