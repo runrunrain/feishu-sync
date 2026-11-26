@@ -6,6 +6,7 @@ import { execFileSync } from 'node:child_process';
 import { parse as parseToml } from 'smol-toml';
 import { Hono } from 'hono';
 import { McpClientInstaller } from '../src/kb/mcp-client-installer.js';
+import * as localBridge from '../src/kb/local-mcp-bridge-entry.js';
 import { kbMcpInstallRoutes } from '../src/routes/kb-mcp-install.js';
 import type { KbMcpInfoDto } from '../src/types/agent-knowledge.js';
 import type { WslMcpSupport } from '../src/kb/wsl-mcp-install.js';
@@ -112,21 +113,32 @@ describe('用户级 MCP 安装与清理', () => {
     expect(fs.readFileSync(f.codex, 'utf8')).toBe('model = "preserve"\n');
   });
 
-  it('migrates managed stdio entries to HTTP while preserving other client configuration', () => {
+  it('migrates the managed shared entry to the bridge and native entries to HTTP', () => {
     const f = fixture();
     fs.mkdirSync(path.dirname(f.codex));
     fs.writeFileSync(f.codex, '[mcp_servers.other]\ncommand = "another-tool"\n');
     for (const target of ['agents', 'claude', 'codex'] as const) f.installer.install(target);
     const url = 'http://127.0.0.1:47392/mcp';
     const headers = { Authorization: 'Bearer fixture-only' };
+    const info = { available: true, url, headers, snippet: '' };
+    const oldInstaller = new McpClientInstaller({ homeDir: f.home, dataRoot: f.dataRoot, info: () => info });
+    // Build a managed HTTP entry with the same JSON format as the previous shared target.
+    oldInstaller.install('claude');
+    const registryFile = path.join(f.dataRoot, 'mcp-client-installs.json');
+    const registry = read(registryFile);
+    registry.entries.agents = { ...registry.entries.claude, path: f.agents };
+    fs.writeFileSync(registryFile, JSON.stringify(registry));
+    fs.copyFileSync(f.claude, f.agents);
+    vi.spyOn(localBridge, 'localMcpBridgeEntry').mockReturnValue({ command: 'bridge', args: ['fixture.cjs'], env: {} });
     const installer = new McpClientInstaller({
-      homeDir: f.home, dataRoot: f.dataRoot, info: () => ({ available: true, url, headers, snippet: '' }),
+      homeDir: f.home, dataRoot: f.dataRoot, info: () => info,
     });
     installer.migrateManaged();
     expect(installer.status().map(({ state }) => state)).toEqual(['installed', 'installed', 'installed']);
-    for (const file of [f.agents, f.claude]) {
-      expect(read(file).mcpServers['feishu-kb']).toEqual({ type: 'http', url, headers });
-    }
+    expect(read(f.agents).mcpServers['feishu-kb']).toEqual({
+      type: 'stdio', command: 'bridge', args: ['fixture.cjs'], env: { FEISHU_SYNC_MCP_INSTALL_ID: expect.any(String) },
+    });
+    expect(read(f.claude).mcpServers['feishu-kb']).toEqual({ type: 'http', url, headers });
     const config = parseToml(fs.readFileSync(f.codex, 'utf8')) as any;
     expect(config.mcp_servers['feishu-kb']).toEqual({ url, http_headers: headers });
     expect(config.mcp_servers.other.command).toBe('another-tool');

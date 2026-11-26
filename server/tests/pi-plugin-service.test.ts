@@ -93,7 +93,7 @@ it('缺失项目包放行，安装后 revision 变化并让同名用户包自动
   const second = await service.prepareLocalWorkHome(user, cwd); expect(second).not.toBe(first);
   expect(JSON.parse(fs.readFileSync(path.join(second, 'settings.json'), 'utf8')).packages).not.toContain(path.join(user, 'copy'));
   expect(fs.readFileSync(path.join(first, 'settings.json'), 'utf8')).toBe(firstBytes);
-});
+}, 20_000); // Several real Pi inspection subprocesses can exceed the default on Windows.
 
 it('并发工作区与同工作区多 revision 使用独立、可复用的完整覆盖目录', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-overlay-concurrent-')); roots.push(root);

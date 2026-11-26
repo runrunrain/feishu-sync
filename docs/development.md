@@ -43,7 +43,7 @@ npm run electron:build # esbuild → dist-electron/{main,preload,server-process-
 `build:all` 中的 server build 会同步运行 `server/scripts/build-agent-assets.mjs` 生成 Agent 工作台资产：
 
 - 复制内置 prompts、pi 转发扩展（tsc 不处理非 TS 资产）；
-- esbuild 单文件打包 4 个 CJS bundle：独立 MCP（`dist/mcp/kb-mcp.cjs`）、HTTP MCP 网关（`dist/mcp/kb-mcp-gateway.cjs`）、WSL 到本机 HTTP 的桥接（`dist/mcp/kb-mcp-http-bridge.cjs`）及 CLI 客户端（`dist/cli/feishu-sync-cli.cjs`，零原生依赖）。WSL 桥接同时复制 Windows 启动脚本 `dist/mcp/kb-mcp-wsl.cmd`。
+- esbuild 单文件打包 4 个 CJS bundle：独立 MCP（`dist/mcp/kb-mcp.cjs`）、HTTP MCP 网关（`dist/mcp/kb-mcp-gateway.cjs`）、供 `.agents` 和 WSL 使用的本机 HTTP 桥接（`dist/mcp/kb-mcp-http-bridge.cjs`）及 CLI 客户端（`dist/cli/feishu-sync-cli.cjs`，零原生依赖）。桥接同时复制 Windows 启动脚本 `dist/mcp/kb-mcp-wsl.cmd`。
 - 另维护内置 amagi 依赖快照：`scripts/lib/bundled-amagi.mjs` 从 amagi-pi 源码（同级 `../amagi-pi` 或 `AMAGI_PI_SOURCE_DIR`）按 npm 发布清单冻结打包，刷新 `server/bundled/amagi-pi/package.zip` + `manifest.json`（源码/锁/补丁 hash 变化时重建）并安装到 `dist/agent/bundled-amagi`——这是 npm 依赖快照 zip，不是 esbuild 产物；来源/补丁/校验规则见该脚本头注释。
 
 CLI 的使用与认证见 [agent-knowledge.md](./agent-knowledge.md)「命令行访问」，完整命令参考见 [cli-reference.md](./cli-reference.md)。

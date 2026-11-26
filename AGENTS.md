@@ -100,7 +100,7 @@ npx tsx scripts/sync-latest.ts --skip-index --apply  # 提交 KB 正文，仅执
 | Electron 内嵌后端 | `127.0.0.1:0`（系统分配） | 主进程拿到 `startedServer.url` 后经 preload 注入前端；前端唯一请求出口是 `src/api/client.ts` |
 | Standalone 后端 | `127.0.0.1:3001` | `npm run server:dev` / `dev:all` / `server:start` |
 | Vite 开发前端 | `localhost:5173` | 仅开发态 |
-| 本机 HTTP MCP | `127.0.0.1:47392/mcp` | 桌面态启动；`allowStandaloneKbMcp`（默认开）决定退出托盘后是否保持独立监听；WSL 桥接复用此端口 |
+| 本机 HTTP MCP | `127.0.0.1:47392/mcp` | 桌面态启动；`allowStandaloneKbMcp`（默认开）决定退出托盘后是否保持独立监听；`.agents` 与 WSL 的 stdio 桥接复用此端口，旧 HTTP 会话失效时重新握手并重试只读调用一次 |
 | 局域网只读 MCP | `47391`（可配） | `kbLanMcp.enabled` 默认关；仅限可信私网，明文 HTTP |
 | 标准库内网网页分享 | `47393` | 独立端口，排除 Hyper-V / WSL / Docker / VPN 等虚拟网卡 |
 

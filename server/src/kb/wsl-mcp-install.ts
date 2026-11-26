@@ -1,17 +1,14 @@
 /** Resolve the default WSL user's Codex configuration without accepting renderer paths. */
 import crypto from 'node:crypto';
-import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { serverDistRoot } from '../agent/agent-assets.js';
-import { runtimeExecutable } from '../modules/runtime-executable.js';
 import type { KbMcpInfoDto } from '../types/agent-knowledge.js';
+import { localMcpBridgeEntry, type LocalMcpBridgeEntry } from './local-mcp-bridge-entry.js';
 
 export interface WslCodexLocation { path: string; linuxPath: string; distro: string }
-export interface WslBridgeEntry { command: string; args: string[]; env: Record<string, string> }
 export interface WslMcpSupport {
   resolve(): WslCodexLocation;
-  entry(info: KbMcpInfoDto): WslBridgeEntry;
+  entry(info: KbMcpInfoDto): LocalMcpBridgeEntry;
   replace?(location: WslCodexLocation, before: { exists: boolean; text: string }, text: string | null): void;
 }
 
@@ -77,27 +74,6 @@ export function createWslMcpSupport(dataRoot: string): WslMcpSupport {
   return {
     resolve: resolveDefaultWslCodex,
     replace: replaceWslCodex,
-    entry(info) {
-      if (!('url' in info)) throw new Error('local_http_required');
-      const url = new URL(info.url);
-      if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || url.pathname !== '/mcp' || url.username || url.password || url.search || url.hash) {
-        throw new Error('invalid_local_http_endpoint');
-      }
-      const root = serverDistRoot();
-      const dist = path.basename(root) === 'src' ? path.join(root, '..', 'dist') : root;
-      const shim = path.join(dist, 'mcp', 'kb-mcp-wsl.cmd');
-      const bundle = path.join(dist, 'mcp', 'kb-mcp-http-bridge.cjs');
-      if (!fs.existsSync(shim) || !fs.existsSync(bundle)) throw new Error('wsl_bridge_not_built');
-      return {
-        // Delayed expansion happens after cmd.exe parses metacharacters, so
-        // spaces, &, %, ! and parentheses in the installation path stay literal.
-        command: 'cmd.exe', args: ['/d', '/v:on', '/c', '!FEISHU_SYNC_BRIDGE_SHIM!'],
-        env: {
-          FEISHU_SYNC_BRIDGE_SHIM: shim, FEISHU_SYNC_BRIDGE_APP: runtimeExecutable(), FEISHU_SYNC_BRIDGE_BUNDLE: bundle,
-          FEISHU_SYNC_BRIDGE_HOME: path.resolve(dataRoot), FEISHU_SYNC_BRIDGE_PORT: url.port || '80',
-          WSLENV: 'FEISHU_SYNC_BRIDGE_SHIM:FEISHU_SYNC_BRIDGE_APP:FEISHU_SYNC_BRIDGE_BUNDLE:FEISHU_SYNC_BRIDGE_HOME:FEISHU_SYNC_BRIDGE_PORT',
-        },
-      };
-    },
+    entry: (info) => localMcpBridgeEntry(info, dataRoot),
   };
 }

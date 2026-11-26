@@ -63,7 +63,7 @@ npx tsx scripts/sync-latest.ts --skip-index --apply  # 提交 KB 正文，仅 cr
 ### 启动、端口与前端出口
 
 - `electron/main.ts` 生成 `X-Desktop-Token` 后 fork `dist-electron/server-process-entry.cjs` 动态加载 `server/dist/index.js`（生产取 `app.asar.unpacked/server/dist/index.js`，开发取 `../server/dist/index.js`），健康检查通过后开窗。
-- 端口分工：Electron 内嵌后端传 `0` 自动分配；standalone 后端固定 `127.0.0.1:3001`；本机 HTTP MCP 固定 `127.0.0.1:47392/mcp`（WSL 桥接复用此端口，`allowStandaloneKbMcp` 默认开启，退出托盘后继续监听）；局域网只读 MCP 默认 `47391`（默认关）；内网静态网页分享固定 `47393`。
+- 端口分工：Electron 内嵌后端传 `0` 自动分配；standalone 后端固定 `127.0.0.1:3001`；本机 HTTP MCP 固定 `127.0.0.1:47392/mcp`（`.agents` 与 WSL 的 stdio 桥接复用此端口，旧会话失效时重新握手并重试只读调用一次；`allowStandaloneKbMcp` 默认开启）；局域网只读 MCP 默认 `47391`（默认关）；内网静态网页分享固定 `47393`。
 - 前端唯一 API 出口是 `src/api/client.ts`，经 preload `window.desktop.getApiHeaders()` 取桌面令牌，禁止硬编码。
 
 ### 鉴权、CORS 与 Hono 注入顺序

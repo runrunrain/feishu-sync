@@ -1,4 +1,4 @@
-/** Windows-side entry used by the WSL stdio launcher; never exposes the token. */
+/** Local stdio launcher entry for shared Agent config and WSL; never exposes the token. */
 import { LanTokenStore } from '../kb-lan/token-store.js';
 import { startHttpStdioBridge } from './kb-mcp-http-bridge.js';
 

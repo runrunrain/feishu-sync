@@ -7,6 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { applyEdits, findNodeAtLocation, modify, parseTree, type Node as JsonNode } from 'jsonc-parser';
 import { parse as parseToml } from 'smol-toml';
 import type { KbMcpInfoDto } from '../types/agent-knowledge.js';
+import { localMcpBridgeEntry, sharedBridgeHotfixEntry } from './local-mcp-bridge-entry.js';
 import type { WslCodexLocation, WslMcpSupport } from './wsl-mcp-install.js';
 
 export type McpClientTarget = 'agents' | 'claude' | 'codex' | 'codex-wsl' | 'codex-wsl-shared';
@@ -276,12 +277,30 @@ export class McpClientInstaller {
       }
     }
     if ('url' in info) {
+      if (target === 'agents') {
+        try {
+          const bridge = localMcpBridgeEntry(info, this.options.dataRoot);
+          return { type: 'stdio', ...bridge, env: { ...bridge.env, FEISHU_SYNC_MCP_INSTALL_ID: installId } };
+        } catch {
+          return problem('local_bridge_unavailable', '本机 MCP 桥接程序不可用，请更新或重新构建应用。');
+        }
+      }
       return target === 'codex'
         ? { url: info.url, http_headers: info.headers }
         : { type: 'http', url: info.url, headers: info.headers };
     }
     // Per-install marker prevents an old registry record claiming a new user entry.
     return { command: info.command, args: info.args, env: { ...info.env, FEISHU_SYNC_MCP_INSTALL_ID: installId } };
+  }
+  private matchesOwnedEntry(target: McpClientTarget, current: unknown, owned: OwnedEntry, info: KbMcpInfoDto): boolean {
+    const currentDigest = digest(current);
+    if (currentDigest === owned.digest) return true;
+    if (target !== 'agents' || !info.available || !('url' in info)) return false;
+    // Require both the original installed HTTP receipt and the exact interim
+    // launcher. Entries without our receipt or with user edits remain protected.
+    if (owned.digest !== digest({ type: 'http', url: info.url, headers: info.headers })) return false;
+    const hotfix = sharedBridgeHotfixEntry(this.options.dataRoot, new URL(info.url).port || '80');
+    return !!hotfix && currentDigest === digest({ type: 'stdio', ...hotfix });
   }
   private inspect(target: McpClientTarget, registry: Registry, info: KbMcpInfoDto, location?: { file: string; wsl?: WslCodexLocation }): McpInstallStatus {
     let file = '';
@@ -293,7 +312,7 @@ export class McpClientInstaller {
       if (current === undefined) return { target, path: file, state: 'not_installed' };
       const owned = registry.entries[target];
       if (!owned || owned.path !== file) return { target, path: file, state: 'conflict', message: '已有同名配置，应用不会覆盖或清理。' };
-      if (digest(current) !== owned.digest) return { target, path: file, state: 'modified', message: '配置已被其他程序或用户修改，应用不会覆盖或清理。' };
+      if (!this.matchesOwnedEntry(target, current, owned, info)) return { target, path: file, state: 'modified', message: '配置已被其他程序或用户修改，应用不会覆盖或清理。' };
       if (isCodex(target) && !codexBlockRange(parsed.text, owned.installId, serverName(target))) return { target, path: file, state: 'modified', message: 'Codex 安装标记或其范围已被修改，应用不会覆盖或清理。' };
       return { target, path: file, state: digest(current) === digest(this.entry(target, info, owned.installId)) ? 'installed' : 'needs_update' };
     } catch (error) {
@@ -336,7 +355,7 @@ export class McpClientInstaller {
     // Recheck after directory creation so a newly created user entry is never overwritten.
     const present = parsed.servers[serverName(target)];
     const owned = registry.data.entries[target];
-    if (present !== undefined && (!owned || owned.path !== file || digest(present) !== owned.digest)) return problem('concurrent_change', '配置刚刚发生变化，请刷新后重试。');
+    if (present !== undefined && (!owned || owned.path !== file || !this.matchesOwnedEntry(target, present, owned, info))) return problem('concurrent_change', '配置刚刚发生变化，请刷新后重试。');
     const stillOwned = present !== undefined && owned?.path === file;
     const installId = stillOwned ? owned.installId : crypto.randomUUID();
     const entry = this.entry(target, info, installId);
@@ -357,7 +376,7 @@ export class McpClientInstaller {
     const before = snapshot(file);
     const parsed = isCodex(target) ? parseCodex(before) : parseConfig(before);
     const current = parsed.servers[serverName(target)];
-    if (current !== undefined && digest(current) !== owned.digest) return problem('concurrent_change', '配置刚刚发生变化，请刷新后重试。');
+    if (current !== undefined && !this.matchesOwnedEntry(target, current, owned, info)) return problem('concurrent_change', '配置刚刚发生变化，请刷新后重试。');
     let nextText = before.text;
     if (current !== undefined) {
       const removeContainer = owned.createdServers && Object.keys(parsed.servers).length === 1;
