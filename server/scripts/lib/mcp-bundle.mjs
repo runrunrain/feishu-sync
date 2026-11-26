@@ -4,6 +4,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
 
@@ -28,7 +29,7 @@ export const wslBridgeOutDefault = path.join(serverRoot, 'dist', 'mcp', 'kb-mcp-
 export async function bundleWslBridge(outfile = wslBridgeOutDefault) {
   const result = await bundleReadOnlyMcp(path.join(serverRoot, 'src', 'mcp', 'kb-mcp-http-bridge-entry.ts'), outfile);
   const shim = fs.readFileSync(path.join(serverRoot, 'src', 'mcp', 'kb-mcp-wsl.cmd'), 'utf8').replace(/\r?\n/g, '\r\n');
-  fs.writeFileSync(path.join(path.dirname(outfile), 'kb-mcp-wsl.cmd'), shim);
+  publishArtifact(path.join(path.dirname(outfile), 'kb-mcp-wsl.cmd'), shim);
   return result;
 }
 
@@ -37,6 +38,7 @@ async function bundleReadOnlyMcp(entry, outfile) {
     entryPoints: [entry],
     outfile,
     bundle: true,
+    write: false,
     metafile: true,
     platform: 'node',
     format: 'cjs',
@@ -49,10 +51,24 @@ async function bundleReadOnlyMcp(entry, outfile) {
   if (result.errors.length > 0) {
     throw new Error(`esbuild 打包失败: ${result.errors.map((error) => error.text).join('; ')}`);
   }
-  const code = fs.readFileSync(outfile, 'utf8');
+  const [output] = result.outputFiles;
+  if (!output || result.outputFiles.length !== 1) throw new Error('只读 MCP 必须生成一个 bundle');
   if (Object.keys(result.metafile.inputs).some((input) => /better-sqlite3|\.node$/.test(input))
-    || /better-sqlite3|\.node["'`]/.test(code)) {
+    || /better-sqlite3|\.node["'`]/.test(output.text)) {
     throw new Error('只读 MCP bundle 不得包含原生模块引用');
   }
-  return { outfile, size: fs.statSync(outfile).size };
+  publishArtifact(outfile, output.contents);
+  return { outfile, size: output.contents.byteLength };
+}
+
+/** Parallel fixture builders must never expose a partial bundle to a launching client. */
+function publishArtifact(outfile, contents) {
+  fs.mkdirSync(path.dirname(outfile), { recursive: true });
+  const temporary = outfile + '.' + randomUUID() + '.tmp';
+  try {
+    fs.writeFileSync(temporary, contents, { flag: 'wx' });
+    fs.renameSync(temporary, outfile);
+  } finally {
+    fs.rmSync(temporary, { force: true });
+  }
 }
