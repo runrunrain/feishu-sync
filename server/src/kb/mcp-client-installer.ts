@@ -8,20 +8,23 @@ import { applyEdits, findNodeAtLocation, modify, parseTree, type Node as JsonNod
 import { parse as parseToml } from 'smol-toml';
 import type { KbMcpInfoDto } from '../types/agent-knowledge.js';
 import { localMcpBridgeEntry, sharedBridgeHotfixEntry } from './local-mcp-bridge-entry.js';
-import type { WslCodexLocation, WslMcpSupport } from './wsl-mcp-install.js';
+import { WSL_CONFIG_FILES, type WslMcpClient, type WslMcpLocation, type WslMcpSupport } from './wsl-mcp-install.js';
 
-export type McpClientTarget = 'agents' | 'claude' | 'codex' | 'codex-wsl' | 'codex-wsl-shared';
-export type McpInstallState = 'not_installed' | 'installed' | 'needs_update' | 'conflict' | 'modified' | 'invalid';
+export const MCP_CLIENT_TARGETS = ['agents', 'claude', 'codex', 'claude-wsl', 'codex-wsl', 'codex-wsl-shared'] as const;
+export type McpClientTarget = typeof MCP_CLIENT_TARGETS[number];
+export type McpInstallState = 'not_installed' | 'installed' | 'needs_update' | 'adoptable' | 'conflict' | 'modified' | 'invalid';
 export interface McpInstallStatus { target: McpClientTarget; path: string; state: McpInstallState; message?: string }
-type OwnedEntry = { path: string; digest: string; createdServers: boolean; installId: string; wsl?: WslCodexLocation };
+type OwnedEntry = { path: string; digest: string; createdServers: boolean; installId: string; wsl?: WslMcpLocation };
 type Registry = { version: 1; entries: Partial<Record<McpClientTarget, OwnedEntry>> };
 type Snapshot = { exists: boolean; text: string; mode: number };
 const SERVER_NAME = 'feishu-kb';
 const WSL_SERVER_NAME = 'feishu-kb-wsl';
 const MAX_CONFIG_BYTES = 32 * 1024 * 1024;
-const isWsl = (target: McpClientTarget): boolean => target === 'codex-wsl' || target === 'codex-wsl-shared';
-const isCodex = (target: McpClientTarget): boolean => target === 'codex' || isWsl(target);
-const serverName = (target: McpClientTarget): string => isWsl(target) ? WSL_SERVER_NAME : SERVER_NAME;
+const isWslCodex = (target: McpClientTarget): boolean => target === 'codex-wsl' || target === 'codex-wsl-shared';
+const isCodex = (target: McpClientTarget): boolean => target === 'codex' || isWslCodex(target);
+const serverName = (target: McpClientTarget): string => isWslCodex(target) ? WSL_SERVER_NAME : SERVER_NAME;
+const wslClient = (target: string): WslMcpClient | undefined => target === 'claude-wsl' ? 'claude' : target === 'codex-wsl' ? 'codex' : undefined;
+const isWslUnc = (file: string): boolean => /^\\\\wsl(?:\.localhost|\$)\\/i.test(file);
 
 export class McpInstallError extends Error {
   constructor(readonly code: string, message: string) { super(message); }
@@ -210,20 +213,24 @@ export class McpClientInstaller {
     try { this.home = fs.realpathSync(home); } catch { this.home = path.resolve(home); }
     this.registryFile = path.join(options.dataRoot, 'mcp-client-installs.json');
   }
-  private targetLocation(target: McpClientTarget, owned?: OwnedEntry): { file: string; wsl?: WslCodexLocation } {
+  private targetLocation(target: McpClientTarget, owned?: OwnedEntry): { file: string; wsl?: WslMcpLocation } {
     if (target === 'codex-wsl-shared') {
       if (!this.options.wsl) return problem('wsl_unavailable', 'WSL 安装仅在 Windows 上可用。');
       return { file: path.join(this.home, '.codex', 'config.toml') };
     }
-    if (target === 'codex-wsl') {
+    const client = wslClient(target);
+    if (client) {
       if (!this.options.wsl) return problem('wsl_unavailable', 'WSL 安装仅在 Windows 上可用。');
       try {
-        const wsl = owned?.wsl ?? this.options.wsl.resolve();
+        const wsl = owned?.wsl ?? this.options.wsl.resolve(client);
         if (owned && (!owned.wsl || owned.path !== wsl.path)) return problem('registry_invalid', 'WSL 安装记录无效，未修改客户端配置。');
+        if (client === 'claude' && path.win32.normalize(wsl.path).toLowerCase() === path.win32.join(this.home, '.claude.json').toLowerCase()) {
+          return problem('wsl_shared_claude_config', 'WSL 与 Windows 使用同一份 Claude Code 配置。请为 WSL 设置独立的 CLAUDE_CONFIG_DIR。');
+        }
         return { file: wsl.path, wsl };
       } catch (error) {
         if (error instanceof McpInstallError) throw error;
-        return problem('wsl_unavailable', '无法读取 WSL 默认发行版的 Codex 配置，请检查 WSL 和互操作功能。');
+        return problem('wsl_unavailable', `无法读取 WSL 默认发行版的 ${client === 'claude' ? 'Claude Code' : 'Codex'} 配置，请检查 WSL 和互操作功能。`);
       }
     }
     if (target === 'agents') return { file: path.join(this.home, '.agents', '.mcp.json') };
@@ -258,8 +265,9 @@ export class McpClientInstaller {
       if (!object(entry) || typeof entry.path !== 'string' || typeof entry.digest !== 'string' || !/^[0-9a-f]{64}$/.test(entry.digest) || typeof entry.createdServers !== 'boolean' || typeof entry.installId !== 'string' || !/^[0-9a-f-]{36}$/.test(entry.installId)) {
         return problem('registry_invalid', '安装记录无效，未修改客户端配置。');
       }
-      if (target === 'codex-wsl' && (!object(entry.wsl) || typeof entry.wsl.path !== 'string' || entry.wsl.path !== entry.path
-        || typeof entry.wsl.linuxPath !== 'string' || !entry.wsl.linuxPath.startsWith('/') || !entry.wsl.linuxPath.endsWith('/config.toml')
+      const client = wslClient(target);
+      if (client && (!object(entry.wsl) || typeof entry.wsl.path !== 'string' || entry.wsl.path !== entry.path
+        || typeof entry.wsl.linuxPath !== 'string' || !entry.wsl.linuxPath.startsWith('/') || !entry.wsl.linuxPath.endsWith('/' + WSL_CONFIG_FILES[client])
         || typeof entry.wsl.distro !== 'string' || !entry.wsl.distro || /[\0\r\n]/.test(entry.wsl.distro))) {
         return problem('registry_invalid', 'WSL 安装记录无效，未修改客户端配置。');
       }
@@ -267,11 +275,11 @@ export class McpClientInstaller {
     return { before, data: data as unknown as Registry };
   }
   private entry(target: McpClientTarget, info: KbMcpInfoDto, installId: string): Record<string, unknown> {
-    if (isWsl(target)) {
+    if (wslClient(target) || target === 'codex-wsl-shared') {
       if (!this.options.wsl) return problem('wsl_unavailable', 'WSL 安装仅在 Windows 上可用。');
       try {
         const bridge = this.options.wsl.entry(info);
-        return { ...bridge, env: { ...bridge.env, FEISHU_SYNC_MCP_INSTALL_ID: installId } };
+        return { ...(target === 'claude-wsl' ? { type: 'stdio' } : {}), ...bridge, env: { ...bridge.env, FEISHU_SYNC_MCP_INSTALL_ID: installId } };
       } catch {
         return problem('wsl_bridge_unavailable', 'WSL 桥接程序不可用，请更新或重新构建应用。');
       }
@@ -302,7 +310,13 @@ export class McpClientInstaller {
     const hotfix = sharedBridgeHotfixEntry(this.options.dataRoot, new URL(info.url).port || '80');
     return !!hotfix && currentDigest === digest({ type: 'stdio', ...hotfix });
   }
-  private inspect(target: McpClientTarget, registry: Registry, info: KbMcpInfoDto, location?: { file: string; wsl?: WslCodexLocation }): McpInstallStatus {
+  private canAdopt(target: McpClientTarget, current: unknown, info: KbMcpInfoDto): boolean {
+    if (target !== 'claude-wsl' || !this.options.wsl || !info.available || !('url' in info)) return false;
+    const currentDigest = digest(current);
+    return currentDigest === digest({ type: 'http', url: info.url, headers: info.headers })
+      || currentDigest === digest({ type: 'stdio', ...this.options.wsl.entry(info) });
+  }
+  private inspect(target: McpClientTarget, registry: Registry, info: KbMcpInfoDto, location?: { file: string; wsl?: WslMcpLocation }): McpInstallStatus {
     let file = '';
     try {
       file = (location ?? this.targetLocation(target, registry.entries[target])).file;
@@ -311,6 +325,7 @@ export class McpClientInstaller {
       const current = parsed.servers[serverName(target)];
       if (current === undefined) return { target, path: file, state: 'not_installed' };
       const owned = registry.entries[target];
+      if (!owned && this.canAdopt(target, current, info)) return { target, path: file, state: 'adoptable', message: '已识别现有飞书同步连接。纳入管理后可由应用更新和清理。' };
       if (!owned || owned.path !== file) return { target, path: file, state: 'conflict', message: '已有同名配置，应用不会覆盖或清理。' };
       if (!this.matchesOwnedEntry(target, current, owned, info)) return { target, path: file, state: 'modified', message: '配置已被其他程序或用户修改，应用不会覆盖或清理。' };
       if (isCodex(target) && !codexBlockRange(parsed.text, owned.installId, serverName(target))) return { target, path: file, state: 'modified', message: 'Codex 安装标记或其范围已被修改，应用不会覆盖或清理。' };
@@ -322,8 +337,7 @@ export class McpClientInstaller {
   status(): McpInstallStatus[] {
     const { data } = this.registry();
     const info = this.options.info();
-    const targets: McpClientTarget[] = ['agents', 'claude', 'codex'];
-    if (this.options.wsl) targets.push('codex-wsl', 'codex-wsl-shared');
+    const targets = this.options.wsl ? MCP_CLIENT_TARGETS : MCP_CLIENT_TARGETS.filter((target) => !wslClient(target) && target !== 'codex-wsl-shared');
     return targets.map((target) => this.inspect(target, data, info));
   }
   migrateManaged(): void {
@@ -331,8 +345,11 @@ export class McpClientInstaller {
     const info = this.options.info();
     const targets: McpClientTarget[] = ['agents', 'claude', 'codex'];
     // Merely starting the desktop app must not start an unused WSL distribution.
-    if (this.options.wsl && registry.entries['codex-wsl']) targets.push('codex-wsl');
-    if (this.options.wsl && registry.entries['codex-wsl-shared']) targets.push('codex-wsl-shared');
+    if (this.options.wsl) {
+      for (const target of ['claude-wsl', 'codex-wsl', 'codex-wsl-shared'] as const) {
+        if (registry.entries[target]) targets.push(target);
+      }
+    }
     for (const { target, state } of targets.map((item) => this.inspect(item, registry, info))) {
       if (state !== 'needs_update') continue;
       try { this.install(target); }
@@ -349,13 +366,14 @@ export class McpClientInstaller {
     if (currentStatus.state === 'conflict' || currentStatus.state === 'modified' || currentStatus.state === 'invalid') {
       return problem(currentStatus.state, currentStatus.message ?? '配置不可修改。');
     }
-    this.checkTargetDirectory(target, true, file);
+    this.checkTargetDirectory(target, !(location.wsl && isWslUnc(file) && this.options.wsl?.replace), file);
     const before = snapshot(file);
     const parsed = isCodex(target) ? parseCodex(before) : parseConfig(before);
     // Recheck after directory creation so a newly created user entry is never overwritten.
     const present = parsed.servers[serverName(target)];
     const owned = registry.data.entries[target];
-    if (present !== undefined && (!owned || owned.path !== file || !this.matchesOwnedEntry(target, present, owned, info))) return problem('concurrent_change', '配置刚刚发生变化，请刷新后重试。');
+    if (present !== undefined && !(owned ? owned.path === file && this.matchesOwnedEntry(target, present, owned, info)
+      : currentStatus.state === 'adoptable' && this.canAdopt(target, present, info))) return problem('concurrent_change', '配置刚刚发生变化，请刷新后重试。');
     const stillOwned = present !== undefined && owned?.path === file;
     const installId = stillOwned ? owned.installId : crypto.randomUUID();
     const entry = this.entry(target, info, installId);
@@ -370,6 +388,7 @@ export class McpClientInstaller {
     const file = location.file;
     const info = this.options.info();
     const state = this.inspect(target, registry.data, info);
+    if (state.state === 'adoptable') return problem('not_managed', '请先将该连接纳入管理。');
     if (state.state === 'conflict' || state.state === 'modified' || state.state === 'invalid') return problem(state.state, state.message ?? '配置不可清理。');
     const owned = registry.data.entries[target];
     if (!owned || owned.path !== file) return state;
@@ -387,9 +406,9 @@ export class McpClientInstaller {
     this.commit(file, before, current === undefined ? null : nextText, registry.before, next, current === undefined, location.wsl);
     return { target, path: file, state: 'not_installed' };
   }
-  private commit(file: string, before: Snapshot, text: string | null, registryBefore: Snapshot, registry: Registry, skipTarget = false, wsl?: WslCodexLocation): void {
+  private commit(file: string, before: Snapshot, text: string | null, registryBefore: Snapshot, registry: Registry, skipTarget = false, wsl?: WslMcpLocation): void {
     const replaceTarget = (old: Snapshot, value: string | null) => {
-      if (wsl && /^\\\\wsl(?:\.localhost|\$)\\/i.test(file) && this.options.wsl?.replace) {
+      if (wsl && isWslUnc(file) && this.options.wsl?.replace) {
         try { this.options.wsl.replace(wsl, old, value); }
         catch (error) {
           if ((error as { status?: number }).status === 73) return problem('concurrent_change', '配置刚刚被其他程序修改，请刷新后重试。');

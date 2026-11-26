@@ -14,6 +14,7 @@ import { SettingsDraftProvider, useSettingsDraft } from '../hooks/settingsDraft'
 const targets: McpInstallStatus[] = [
   { target: 'agents', path: '/home/user/.agents/.mcp.json', state: 'not_installed' },
   { target: 'claude', path: '/home/user/.claude.json', state: 'not_installed' },
+  { target: 'claude-wsl', path: '/home/wsl/.claude.json', state: 'adoptable' },
   { target: 'codex', path: '/home/user/.codex/config.toml', state: 'not_installed' },
   { target: 'codex-wsl', path: '/home/wsl/.codex/config.toml', state: 'not_installed' },
   { target: 'codex-wsl-shared', path: 'C:\\Users\\demo\\.codex\\config.toml', state: 'not_installed' },
@@ -24,6 +25,26 @@ beforeEach(() => {
   api.status.mockResolvedValue({ targets });
   api.install.mockImplementation(async (target: string) => ({ ...targets.find((item) => item.target === target), state: 'installed' }));
   api.remove.mockImplementation(async (target: string) => ({ ...targets.find((item) => item.target === target), state: 'not_installed' }));
+});
+
+it('可纳入管理 WSL Claude 的现有桥接，接管前不能清理', async () => {
+  const container = document.createElement('div'); document.body.append(container);
+  const root = createRoot(container);
+  const button = (label: string) => [...container.querySelectorAll('button')].find((item) => item.textContent === label)!;
+  try {
+    await act(async () => root.render(<KbMcpLocalSettingsCard />));
+    const select = container.querySelector<HTMLSelectElement>('[aria-label="MCP 安装目标"]')!;
+    await act(async () => { select.value = 'claude-wsl'; select.dispatchEvent(new Event('change', { bubbles: true })); });
+    expect(container.textContent).toContain('/home/wsl/.claude.json');
+    expect(container.textContent).toContain('可纳入管理');
+    expect(container.textContent).not.toContain('手动配置');
+    expect(button('清理').disabled).toBe(true);
+    await act(async () => button('纳入管理').click());
+    expect(api.install).toHaveBeenCalledWith('claude-wsl');
+    expect(container.textContent).toContain('已安装');
+    await act(async () => button('清理').click());
+    expect(api.remove).toHaveBeenCalledWith('claude-wsl');
+  } finally { act(() => root.unmount()); container.remove(); }
 });
 
 it('可选择 WSL 并安装桥接，避免展示不可用的 Windows 回环手动配置', async () => {

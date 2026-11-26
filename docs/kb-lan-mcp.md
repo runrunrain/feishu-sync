@@ -14,6 +14,10 @@ Excel 原件和只读重建的工作簿可用 `raw_list_sheets` 列工作表、`
 
 本机 MCP 固定监听 `http://127.0.0.1:47392/mcp`。「本机 MCP 安装」为 `.agents` 配置安装 stdio 桥接，令牌由桥接进程从本机安全存储读取。旧 HTTP 会话返回 404 时，桥接复用现有 stdio 连接，重新握手，再重试原只读调用一次。应用升级后会迁移仍由它管理的条目。有原安装记录且内容仍与已部署的临时桥接一致的 Windows 条目也会迁移。迁移后请重新加载客户端。若客户端通过共用 MCP 管理器读取分发副本，请先重新分发该条目。需要直接连接 HTTP 的客户端可使用「手动配置」中的连接信息。
 
+在 WSL 使用 Claude Code 时，选择 **Claude Code（WSL 默认环境）**。应用写入默认发行版用户的 `~/.claude.json`。如果该发行版的登录环境设置了 `CLAUDE_CONFIG_DIR`，则写入该目录下的 `.claude.json`，请以界面显示的路径为准。安装使用原工具名 `feishu-kb`，由 Windows 桥接连接本机 MCP，适用于 WSL NAT。WSL 需要启用 Windows 互操作并能从 PATH 启动 `cmd.exe`。
+
+已有配置与飞书同步的桥接或本机 HTTP 连接完全匹配时，可点击「纳入管理」。管理范围是该配置文件的用户级 `feishu-kb`。应用可更新或清理它，保留项目配置与其他服务器。若切换了 WSL 默认发行版或 Claude Code 配置目录，先清理旧目标再安装到新环境。安装或接管后重新打开 Claude Code 会话。
+
 Windows 上的 Codex 在 WSL 中运行时，可在「本机 MCP 安装」选择 **Codex（WSL 默认环境配置）**或 **Codex（WSL 与 Windows 共用配置）**。前者读取默认发行版环境中的 `CODEX_HOME`（未设置时使用 `~/.codex`），后者使用 Windows 用户的 `.codex/config.toml`，适合 Codex 桌面会话共用该文件的情况。请以界面显示的目标路径和 Codex 实际使用的配置为准。安装器添加独立的 `feishu-kb-wsl` 条目，通过 Windows 桥接进程访问既有本机 HTTP 服务，不新增监听端口，也不使用内网共享令牌。安装后重启 Codex；WSL 须启用 Windows 互操作，且能通过 PATH 找到 `cmd.exe`。
 
 如果 Windows 与 WSL 共用同一份 Codex 配置，WSL 条目和已有 Windows `feishu-kb` 条目会同时存在；安装和清理只修改各自的受管理条目。两种 WSL 目标若指向同一文件，只需选择其一；另一项会提示已有同名配置。默认环境目标一次管理一个发行版，切换发行版前需先清理该条目。WSL 和 `.agents` 使用同一个桥接程序。如果本机 HTTP 服务尚未恢复，桥接会返回连接错误，服务恢复后可以再次调用。

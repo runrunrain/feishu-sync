@@ -11,7 +11,7 @@ import { useSettingsDraft } from '../hooks/settingsDraft';
 
 const STATE_LABELS: Record<McpInstallState, string> = {
   not_installed: '未安装', installed: '已安装', needs_update: '需要更新',
-  conflict: '存在同名配置', modified: '配置已被修改', invalid: '配置不可用',
+  adoptable: '可纳入管理', conflict: '存在同名配置', modified: '配置已被修改', invalid: '配置不可用',
 };
 
 /** Immediate local installation is separate from the general settings draft. */
@@ -37,7 +37,8 @@ export function KbMcpLocalSettingsCard() {
   useEffect(() => { void refresh(); }, []);
   const selected = targets.find((item) => item.target === target);
   const manageable = selected?.state === 'installed' || selected?.state === 'needs_update';
-  const canInstall = selected && ['not_installed', 'installed', 'needs_update'].includes(selected.state) && info?.available;
+  const canInstall = selected && ['not_installed', 'installed', 'needs_update', 'adoptable'].includes(selected.state) && info?.available;
+  const usesWslBridge = target === 'claude-wsl' || target === 'codex-wsl' || target === 'codex-wsl-shared';
   const apply = async (action: 'install' | 'remove') => {
     setBusy(true); setFeedback(null);
     try {
@@ -77,13 +78,14 @@ export function KbMcpLocalSettingsCard() {
             <select aria-label="MCP 安装目标" value={target} disabled={busy} onChange={(event) => { setTarget(event.target.value as McpClientTarget); setFeedback(null); }} className="w-full rounded border border-line bg-paper px-2 py-2 text-sm text-ink">
               <option value="agents">.agents（兼容客户端）</option>
               <option value="claude">Claude Code（用户级）</option>
+              {targets.some((item) => item.target === 'claude-wsl') ? <option value="claude-wsl">Claude Code（WSL 默认环境）</option> : null}
               <option value="codex">Codex（用户级）</option>
               {targets.some((item) => item.target === 'codex-wsl') ? <option value="codex-wsl">Codex（WSL 默认环境配置）</option> : null}
               {targets.some((item) => item.target === 'codex-wsl-shared') ? <option value="codex-wsl-shared">Codex（WSL 与 Windows 共用配置）</option> : null}
             </select>
           </label>
           <Button size="sm" disabled={loading || busy || !canInstall} onClick={() => void apply('install')}>
-            {selected?.state === 'needs_update' ? '更新配置' : selected?.state === 'installed' ? '重新安装' : '一键安装'}
+            {selected?.state === 'needs_update' ? '更新配置' : selected?.state === 'installed' ? '重新安装' : selected?.state === 'adoptable' ? '纳入管理' : '一键安装'}
           </Button>
           <Button size="sm" variant="secondary" disabled={loading || busy || !manageable} onClick={() => void apply('remove')}>清理</Button>
           <Button size="sm" variant="secondary" disabled={busy || loading} onClick={() => { setFeedback(null); void refresh(); }}><RefreshCw className="w-3.5 h-3.5" />刷新</Button>
@@ -96,9 +98,9 @@ export function KbMcpLocalSettingsCard() {
           {selected.message ? <p role="note" className="text-seal">{selected.message}</p> : null}
           {info && !info.available ? <p role="note" className="text-seal">本机 MCP 尚未开始监听，请稍后刷新。</p> : null}
         </div> : null}
-        <p>{target === 'agents' ? '通过本机桥接连接知识库。HTTP 会话过期后自动重连并重试一次。' : target === 'codex-wsl' || target === 'codex-wsl-shared' ? '通过 Windows 桥接复用本机 HTTP。需启用 WSL 互操作与 Windows PATH。' : '已有受管理的配置会迁移到本机 HTTP。'}迁移或安装后，请重新启动对应客户端。</p>
+        <p>{target === 'agents' ? '通过本机桥接连接知识库。HTTP 会话过期后自动重连并重试一次。' : usesWslBridge ? '通过 Windows 桥接复用本机 HTTP。需启用 WSL 互操作与 Windows PATH。' : '已有受管理的配置会迁移到本机 HTTP。'}迁移或安装后，请重新启动对应客户端。</p>
         {feedback ? <p role={feedback.error ? 'alert' : 'status'} className={feedback.error ? 'text-seal-2' : 'text-jade'}>{feedback.text}</p> : null}
-        {target !== 'codex-wsl' && target !== 'codex-wsl-shared' && info?.snippet ? <details className="border-t border-line/60 pt-3">
+        {!usesWslBridge && info?.snippet ? <details className="border-t border-line/60 pt-3">
           <summary className="cursor-pointer font-medium text-ink">手动配置</summary>
           <div className="relative mt-2">
             <pre aria-label="本地 MCP 配置" className="max-h-48 overflow-auto scrollbar-thin rounded border border-line bg-paper/50 p-3 text-[11px] leading-relaxed select-text">{info.snippet}</pre>

@@ -6,6 +6,10 @@ import { pathToFileURL } from 'node:url';
 import { PiPluginService } from '../src/agent/pi-plugin-service.js';
 import { PiRuntimeResolver } from '../src/agent/runtime-resolver.js';
 import { buildDefaultAgentConfig } from '../src/types/agent-knowledge.js';
+
+// These integration tests launch real Pi and npm subprocesses.
+if (process.platform === 'win32') vi.setConfig({ testTimeout: 20_000 });
+
 const roots: string[] = [];
 afterAll(() => { vi.unstubAllEnvs(); roots.forEach((root) => fs.rmSync(root, { recursive: true, force: true })); });
 

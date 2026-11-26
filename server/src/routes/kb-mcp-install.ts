@@ -1,7 +1,7 @@
 /** Only a local desktop user may edit external Agent configuration. */
 import crypto from 'node:crypto';
 import { Hono } from 'hono';
-import { McpClientInstaller, McpInstallError, type McpClientTarget } from '../kb/mcp-client-installer.js';
+import { MCP_CLIENT_TARGETS, McpClientInstaller, McpInstallError, type McpClientTarget } from '../kb/mcp-client-installer.js';
 
 export function kbMcpInstallRoutes(deps: { installer: McpClientInstaller; desktopToken: string }): Hono {
   const routes = new Hono();
@@ -20,8 +20,9 @@ export function kbMcpInstallRoutes(deps: { installer: McpClientInstaller; deskto
   routes.get('/api/kb-mcp-install/status', (c) => c.json({ targets: deps.installer.status() }));
   const parseTarget = async (c: any): Promise<McpClientTarget> => {
     const body: unknown = await c.req.json();
-    if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some((key) => key !== 'target') || !('target' in body) || !['agents', 'claude', 'codex', 'codex-wsl', 'codex-wsl-shared'].includes(String(body.target))) {
-      throw new McpInstallError('invalid_target', '请选择 .agents、Claude Code、Codex 或 WSL Codex。');
+    if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some((key) => key !== 'target') || !('target' in body)
+      || !MCP_CLIENT_TARGETS.some((target) => target === body.target)) {
+      throw new McpInstallError('invalid_target', '请选择支持的 MCP 安装目标。');
     }
     return body.target as McpClientTarget;
   };

@@ -24,16 +24,68 @@ function fixture() {
 function read(file: string) { return JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '')); }
 function wslFixture() {
   const f = fixture();
+  const wslClaude = path.join(f.root, 'wsl-home', '.claude.json');
   const httpInfo: KbMcpInfoDto = { available: true, url: 'http://127.0.0.1:47392/mcp', headers: { Authorization: 'Bearer fixture-only' }, snippet: '' };
   const wsl: WslMcpSupport = {
-    resolve: () => ({ path: f.codex, distro: 'Ubuntu-Fixture', linuxPath: '/home/fixture/.codex/config.toml' }),
+    resolve: (client) => client === 'claude'
+      ? { path: wslClaude, distro: 'Ubuntu-Fixture', linuxPath: '/home/fixture/.claude.json' }
+      : { path: f.codex, distro: 'Ubuntu-Fixture', linuxPath: '/home/fixture/.codex/config.toml' },
     entry: () => ({ command: 'cmd.exe', args: ['/d', '/v:on', '/c', '!FEISHU_SYNC_BRIDGE_SHIM!'], env: { FEISHU_SYNC_BRIDGE_SHIM: 'C:\\app path\\kb-mcp-wsl.cmd', FEISHU_SYNC_BRIDGE_PORT: '47392', WSLENV: 'FEISHU_SYNC_BRIDGE_SHIM:FEISHU_SYNC_BRIDGE_PORT' } }),
   };
   const installer = new McpClientInstaller({ homeDir: f.home, dataRoot: f.dataRoot, info: () => httpInfo, wsl });
-  return { ...f, installer, wsl, httpInfo };
+  return { ...f, installer, wsl, httpInfo, wslClaude };
 }
 
 describe('用户级 MCP 安装与清理', () => {
+  it('显式接管 WSL Claude 已有桥接，随后按安装记录更新和清理', () => {
+    const f = wslFixture();
+    fs.mkdirSync(path.dirname(f.wslClaude));
+    const bridge = { type: 'stdio', ...f.wsl.entry(f.httpInfo) };
+    const profile = { projects: { '/game': { mcpServers: { 'feishu-kb': { command: 'project-server' } } } }, mcpServers: { other: { command: 'keep' } } };
+    fs.writeFileSync(f.claude, '{"mcpServers":{"feishu-kb":{"command":"windows-only"}}}');
+    const windowsBefore = fs.readFileSync(f.claude, 'utf8');
+    const write = (entry: object) => fs.writeFileSync(f.wslClaude, JSON.stringify({ ...profile, mcpServers: { ...profile.mcpServers, 'feishu-kb': entry } }));
+    const status = () => f.installer.status().find(({ target }) => target === 'claude-wsl');
+    write({ ...bridge, args: ['foreign-script'] });
+    expect(status()?.state).toBe('conflict');
+    expect(() => f.installer.install('claude-wsl')).toThrow(/同名配置/);
+    write({ type: 'http', url: f.httpInfo.url, headers: { Authorization: 'Bearer custom' } });
+    expect(status()?.state).toBe('conflict');
+    write({ type: 'http', url: f.httpInfo.url, headers: f.httpInfo.headers });
+    expect(status()?.state).toBe('adoptable');
+    write(bridge);
+    expect(status()?.state).toBe('adoptable');
+    f.installer.migrateManaged();
+    expect(() => f.installer.remove('claude-wsl')).toThrow(/先将该连接纳入管理/);
+    expect(f.installer.install('claude-wsl')).toMatchObject({ state: 'installed', path: f.wslClaude });
+    const installed = read(f.wslClaude).mcpServers['feishu-kb'];
+    expect(installed).toEqual({ ...bridge, env: { ...bridge.env, FEISHU_SYNC_MCP_INSTALL_ID: expect.any(String) } });
+    expect(JSON.stringify(installed)).not.toContain('fixture-only');
+    const updatedEnv = { ...bridge.env, FEISHU_SYNC_BRIDGE_SHIM: 'updated-shim.cmd' };
+    const resolve = vi.fn(() => { throw new Error('must use the recorded WSL profile'); });
+    f.wsl.resolve = resolve;
+    f.wsl.entry = () => ({ command: bridge.command, args: bridge.args, env: updatedEnv });
+    expect(status()?.state).toBe('needs_update');
+    f.installer.migrateManaged();
+    expect(status()?.state).toBe('installed');
+    expect(read(f.wslClaude).mcpServers['feishu-kb'].env).toEqual({ ...updatedEnv, FEISHU_SYNC_MCP_INSTALL_ID: installed.env.FEISHU_SYNC_MCP_INSTALL_ID });
+    expect(f.installer.remove('claude-wsl').state).toBe('not_installed');
+    expect(resolve).not.toHaveBeenCalledWith('claude');
+    expect(read(f.wslClaude)).toEqual(profile);
+    expect(fs.readFileSync(f.claude, 'utf8')).toBe(windowsBefore);
+  });
+
+  it('WSL Claude 新装时创建用户配置，并拒绝写入与 Windows 共用的 Claude 配置', () => {
+    const f = wslFixture();
+    expect(f.installer.install('claude-wsl').state).toBe('installed');
+    expect(Object.keys(read(f.wslClaude).mcpServers)).toEqual(['feishu-kb']);
+    expect(f.installer.remove('claude-wsl').state).toBe('not_installed');
+    expect(read(f.wslClaude)).toEqual({});
+    f.wsl.resolve = () => ({ path: f.claude, distro: 'Ubuntu-Fixture', linuxPath: '/mnt/c/profile/.claude.json' });
+    expect(() => f.installer.install('claude-wsl')).toThrow(/同一份 Claude Code 配置/);
+    expect(fs.existsSync(f.claude)).toBe(false);
+  });
+
   it('WSL 一键安装保留共用文件中的 Windows 和内网配置，迁移与清理只作用于 WSL 条目', () => {
     const f = wslFixture(); fs.mkdirSync(path.dirname(f.codex));
     fs.writeFileSync(f.codex, '[mcp_servers.lan]\nurl = "http://192.168.1.10:47391/mcp"\n');
